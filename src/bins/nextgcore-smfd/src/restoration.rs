@@ -78,13 +78,17 @@ const RESOURCE_STATUS_RELEASED: &str = "RELEASED";
 /// Read under both locks and returned as owned data, because the caller then
 /// awaits an HTTP POST per entry and `std::sync::RwLock` guards must not be held
 /// across an await.
-fn notifiable_sessions() -> (Vec<(String, String)>, usize) {
+fn notifiable_sessions(scope: Option<&SessionScope>) -> (Vec<(String, String)>, usize) {
     let global = smf_self();
     let Ok(ctx) = global.read() else {
         return (Vec::new(), 0);
     };
     let refs: Vec<String> = match ctx.pfcp_sessions.read() {
-        Ok(sessions) => sessions.keys().cloned().collect(),
+        Ok(sessions) => sessions
+            .keys()
+            .filter(|r| scope.is_none_or(|sc| sc.refs.contains(*r)))
+            .cloned()
+            .collect(),
         Err(_) => return (Vec::new(), 0),
     };
     let bindings = match ctx.policy_bindings.read() {
@@ -159,7 +163,23 @@ fn sm_context_refs_for_seid(upf_seid: u64) -> Vec<String> {
 /// local flush is the caller's job and happens regardless — a session the UPF has
 /// dropped is gone whether or not the AMF can be reached.
 pub async fn notify_sessions_unrecoverable(reason: &str) -> usize {
-    let (notifiable, silent) = notifiable_sessions();
+    notify_sessions_unrecoverable_in(reason, None).await
+}
+
+/// The sessions one UPF's teardown concerns (#720): the 5G SM context references
+/// and EPC session ids whose PFCP session lives on that UPF. `None` in the
+/// functions below means every session.
+#[derive(Debug, Default, Clone)]
+pub struct SessionScope {
+    pub refs: std::collections::HashSet<String>,
+    pub epc_sess_ids: std::collections::HashSet<u64>,
+    /// The SMF-side N4 SEIDs of all of them, whose UPF bindings the teardown drops.
+    pub seids: std::collections::HashSet<u64>,
+}
+
+/// [`notify_sessions_unrecoverable`] for the sessions in `scope` only (#720).
+pub async fn notify_sessions_unrecoverable_in(reason: &str, scope: Option<&SessionScope>) -> usize {
+    let (notifiable, silent) = notifiable_sessions(scope);
     if notifiable.is_empty() && silent == 0 {
         return 0;
     }
@@ -171,34 +191,65 @@ pub async fn notify_sessions_unrecoverable(reason: &str) -> usize {
         notifiable.len(),
         silent
     );
-    for (sm_context_ref, uri) in &notifiable {
-        // #667: release the session through the UE, asking it to come back (#39),
-        // so the user plane is rebuilt on the restarted UPF. A binding without the
-        // UE's identity cannot be addressed that way, and gets the bare RELEASED
-        // status the AMF was sent before #667.
-        let ue = lookup_ue(sm_context_ref);
-        match ue {
-            Some((supi, psi)) => {
-                log::warn!(
-                    "releasing sm_context_ref={sm_context_ref} after {reason}: PDU Session \
-                     Release Command #39 (reactivation requested) to {supi} PSI {psi} via {uri}"
-                );
-                crate::release_for_reactivation(sm_context_ref, uri, &supi, psi).await;
-            }
-            None => {
-                log::warn!(
-                    "releasing sm_context_ref={sm_context_ref} after {reason}; notifying {uri}"
-                );
-                crate::send_sm_context_status_notification(
-                    Some(uri),
-                    RESOURCE_STATUS_RELEASED,
-                    Some(reason),
-                )
-                .await;
-            }
+    // #718 review m2: a bounded parallel fan-out. One sequential POST per session
+    // could not finish inside a pod's termination grace period with many UEs, and
+    // the UEs after the SIGKILL heard nothing. Progress is logged, so an operator
+    // can see how many were left if it is cut short anyway.
+    let total = notifiable.len();
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(RELEASE_FANOUT));
+    let mut releases = tokio::task::JoinSet::new();
+    for (sm_context_ref, uri) in notifiable {
+        let Ok(permit) = permits.clone().acquire_owned().await else {
+            break;
+        };
+        let reason = reason.to_string();
+        releases.spawn(async move {
+            let _permit = permit;
+            release_one_unrecoverable(&sm_context_ref, &uri, &reason).await;
+        });
+    }
+    let mut done = 0usize;
+    while releases.join_next().await.is_some() {
+        done += 1;
+        if done.is_multiple_of(100) || done == total {
+            log::info!(
+                "PFCP restoration ({reason}): {done}/{total} PDU session release(s) sent, \
+                 {} remaining",
+                total - done
+            );
         }
     }
-    notifiable.len()
+    total
+}
+
+/// How many PDU session releases [`notify_sessions_unrecoverable`] has in flight at
+/// once (#718 review m2).
+const RELEASE_FANOUT: usize = 16;
+
+/// Release one PDU session that can no longer be honoured.
+async fn release_one_unrecoverable(sm_context_ref: &str, uri: &str, reason: &str) {
+    // #667: release the session through the UE, asking it to come back (#39),
+    // so the user plane is rebuilt on the restarted UPF. A binding without the
+    // UE's identity cannot be addressed that way, and gets the bare RELEASED
+    // status the AMF was sent before #667.
+    match lookup_ue(sm_context_ref) {
+        Some((supi, psi)) => {
+            log::warn!(
+                "releasing sm_context_ref={sm_context_ref} after {reason}: PDU Session \
+                 Release Command #39 (reactivation requested) to {supi} PSI {psi} via {uri}"
+            );
+            crate::release_for_reactivation(sm_context_ref, uri, &supi, psi).await;
+        }
+        None => {
+            log::warn!("releasing sm_context_ref={sm_context_ref} after {reason}; notifying {uri}");
+            crate::send_sm_context_status_notification(
+                Some(uri),
+                RESOURCE_STATUS_RELEASED,
+                Some(reason),
+            )
+            .await;
+        }
+    }
 }
 
 /// #687: release every EPC PDN connection after its PGW-U restarted or released
@@ -221,10 +272,15 @@ pub async fn notify_sessions_unrecoverable(reason: &str) -> usize {
 /// can be kept for it: the user plane is already gone, and a late or missing answer
 /// must not hold the UE's address out of the pool.
 pub async fn release_epc_pdn_connections(reason: &str) -> usize {
+    release_epc_pdn_connections_in(reason, None).await
+}
+
+/// [`release_epc_pdn_connections`] for the PDN connections in `scope` only (#720).
+pub async fn release_epc_pdn_connections_in(reason: &str, scope: Option<&SessionScope>) -> usize {
     let Some(server) = crate::gtp_path::s5s8_server() else {
         return 0;
     };
-    release_epc_pdn_connections_via(server, crate::gtp_path::GTPC_PORT, reason).await
+    release_epc_pdn_connections_scoped(server, crate::gtp_path::GTPC_PORT, reason, scope).await
 }
 
 /// [`release_epc_pdn_connections`] through `server`, addressing each SGW-C at
@@ -234,11 +290,26 @@ pub async fn release_epc_pdn_connections_via(
     sgw_port: u16,
     reason: &str,
 ) -> usize {
+    release_epc_pdn_connections_scoped(server, sgw_port, reason, None).await
+}
+
+/// [`release_epc_pdn_connections_via`] for the PDN connections in `scope` (#720).
+pub async fn release_epc_pdn_connections_scoped(
+    server: &crate::gtp_path::S5S8Server,
+    sgw_port: u16,
+    reason: &str,
+    scope: Option<&SessionScope>,
+) -> usize {
     let global = smf_self();
     // Owned data, so no guard is held across the sends below.
     let targets: Vec<(crate::context::SmfSess, u8)> = match global.read() {
         Ok(ctx) => ctx
-            .sess_find_all_by(|s| s.epc && s.sgw_s5c_teid != 0 && s.sgw_s5c_ip.ipv4.is_some())
+            .sess_find_all_by(|s| {
+                s.epc
+                    && s.sgw_s5c_teid != 0
+                    && s.sgw_s5c_ip.ipv4.is_some()
+                    && scope.is_none_or(|sc| sc.epc_sess_ids.contains(&s.id))
+            })
             .into_iter()
             .filter_map(|sess| {
                 // The default bearer is the one the Create Session Request created,

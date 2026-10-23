@@ -75,6 +75,10 @@ const CONTENT_NGAP: &str = "application/vnd.3gpp.ngap";
 const CONTENT_S1AP: &str = "application/vnd.3gpp.s1ap";
 
 const NOTIFY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// How often write-behind state is flushed to the state file (#786). A crash
+/// loses at most this much of the most recent changes; IDs are never reissued
+/// (see `Ucmf::reserve_ids`).
+const STATE_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 const NOTIFY_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 
 // ---------------------------------------------------------------------------
@@ -107,6 +111,15 @@ struct UcmfSection {
     state_file: Option<String>,
     /// Delete PLMN-assigned IDs under older Version IDs at startup.
     purge_outdated_ids: Option<bool>,
+    /// Capacity limits (#786).
+    limits: Option<LimitsYaml>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct LimitsYaml {
+    max_dic_entries: Option<usize>,
+    max_subscriptions: Option<usize>,
+    max_subscriptions_per_consumer: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -160,6 +173,7 @@ struct Settings {
     state_file: Option<String>,
     purge_outdated_ids: bool,
     require_oauth2: bool,
+    limits: context::Limits,
 }
 
 fn parse_version_id(s: &str) -> Result<u8> {
@@ -206,6 +220,17 @@ fn settle(args: &Args, yaml: Option<&str>) -> Result<Settings> {
         mode: parse_mode(mode)?,
         state_file: args.state_file.clone().or(section.state_file),
         purge_outdated_ids: section.purge_outdated_ids.unwrap_or(false),
+        limits: {
+            let d = context::Limits::default();
+            let l = section.limits.unwrap_or_default();
+            context::Limits {
+                max_dic_entries: l.max_dic_entries.unwrap_or(d.max_dic_entries),
+                max_subscriptions: l.max_subscriptions.unwrap_or(d.max_subscriptions),
+                max_subscriptions_per_consumer: l
+                    .max_subscriptions_per_consumer
+                    .unwrap_or(d.max_subscriptions_per_consumer),
+            }
+        },
         require_oauth2: args.oauth2_require.unwrap_or_else(|| {
             section
                 .sbi
@@ -253,6 +278,8 @@ async fn main() -> Result<()> {
     // Load the snapshot under the stored Version ID, then apply the configured
     // one so restored subscribers hear about a change.
     let mut ucmf = Ucmf::new(settings.version_id, settings.mode);
+    ucmf.set_limits(settings.limits);
+    log::info!("Capacity limits: {:?}", settings.limits);
     match ucmf.attach_store(settings.state_file.as_ref().map(PathBuf::from)) {
         Ok(true) => log::info!("Restored {} dictionary entries", ucmf.entry_count()),
         Ok(false) => {}
@@ -263,7 +290,22 @@ async fn main() -> Result<()> {
     if settings.purge_outdated_ids {
         startup_notes.extend(ucmf.purge_outdated_plmn_ids(Utc::now()));
     }
+    // #786: with a state file, changes are written behind, by the flusher below,
+    // instead of each one rewriting the whole snapshot under the state lock.
+    if settings.state_file.is_some() {
+        ucmf.set_write_behind(true);
+    }
     let _ = UCMF.set(Arc::new(RwLock::new(ucmf)));
+    if let Some(ucmf) = UCMF.get() {
+        let ucmf = ucmf.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(STATE_FLUSH_INTERVAL);
+            loop {
+                tick.tick().await;
+                flush_state(&ucmf).await;
+            }
+        });
+    }
 
     let nf_instance_id = nextgcore_sbi::nf_instance_id::nf_instance_id(NfType::Ucmf).to_string();
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -330,12 +372,18 @@ async fn main() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     log::info!("Shutting down...");
-    // Deregister before the listener goes away (TS 29.510 §5.2.2.4).
+    // Deregister before the listener goes away (TS 29.510 §5.2.2.4), stop
+    // serving, and only then write the final snapshot, so no request served
+    // after it is lost on a clean shutdown (#843 review).
     nextgcore_sbi::heartbeat::deregister_self().await;
-    sbi_server
+    let stopped = sbi_server
         .stop()
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {e}"));
+    if let Some(ucmf) = UCMF.get() {
+        flush_state(ucmf).await;
+    }
+    stopped?;
     log::info!("UCMF shutdown complete");
     Ok(())
 }
@@ -418,6 +466,19 @@ fn split_uri(uri: &str) -> Option<(String, u16, String)> {
     match host_port.rsplit_once(':') {
         Some((host, port)) => Some((host.to_string(), port.parse().ok()?, path)),
         None => Some((host_port.to_string(), default_port, path)),
+    }
+}
+
+/// Write the pending snapshot, if any (#786). The snapshot is taken under the
+/// state lock; the file is written after the lock is released, on a blocking
+/// thread, so requests are not held up by the disk.
+async fn flush_state(ucmf: &Arc<RwLock<Ucmf>>) {
+    let pending = write_state(ucmf).take_pending_write();
+    if let Some((persister, generation, source)) = pending {
+        // Serialised and written off the state lock (#843 review). A failed write
+        // is logged by the persister; the next reservation retries it.
+        let _ = tokio::task::spawn_blocking(move || persister.write(generation, &source.to_json()))
+            .await;
     }
 }
 
@@ -815,12 +876,32 @@ fn assign(
             ),
             Vec::new(),
         ),
+        // TS 29.500 Table 5.2.7.2-1: INSUFFICIENT_RESOURCES is a 500 (#786).
+        Err(AssignError::DictionaryFull) => (
+            send_error(
+                500,
+                "Internal Server Error",
+                "The UE radio capability dictionary is full",
+                Some("INSUFFICIENT_RESOURCES"),
+            ),
+            Vec::new(),
+        ),
         Err(AssignError::IdSpaceExhausted) => (
             send_error(
                 500,
                 "Internal Server Error",
                 "No RCI left under the current Version ID",
                 Some("INSUFFICIENT_RESOURCES"),
+            ),
+            Vec::new(),
+        ),
+        // #843 review: no ID is handed out that the state file does not cover.
+        Err(AssignError::StateNotPersisted) => (
+            send_error(
+                500,
+                "Internal Server Error",
+                "The UCMF state could not be written, so no ID can be assigned safely",
+                Some("SYSTEM_FAILURE"),
             ),
             Vec::new(),
         ),
@@ -857,7 +938,28 @@ fn subscribe(u: &mut Ucmf, request: &SbiRequest, now: DateTime<Utc>) -> SbiRespo
         },
     };
     let nf_id = json.get("nfId").and_then(Value::as_str).map(str::to_string);
-    let sub = u.subscribe(nf_id, uri.to_string(), suggested, now);
+    let sub = match u.subscribe(nf_id, uri.to_string(), suggested, now) {
+        Ok(sub) => sub,
+        // TS 29.500 Table 5.2.7.2-1: INSUFFICIENT_RESOURCES is a 500 (#786).
+        Err(e) => {
+            let (detail, cause) = match e {
+                context::SubscribeError::TooManySubscriptions => (
+                    "The UCMF holds its maximum number of subscriptions",
+                    "INSUFFICIENT_RESOURCES",
+                ),
+                context::SubscribeError::TooManyForConsumer => (
+                    "This consumer holds its maximum number of subscriptions",
+                    "INSUFFICIENT_RESOURCES",
+                ),
+                context::SubscribeError::StateNotPersisted => (
+                    "The UCMF state could not be written, so no subscription ID can be \
+                     assigned safely",
+                    "SYSTEM_FAILURE",
+                ),
+            };
+            return send_error(500, "Internal Server Error", detail, Some(cause));
+        }
+    };
     let mut body = json!({ "dicEntryId": u.highest_entry_id() });
     if let Some(e) = sub.expires {
         body["confirmedExpires"] = json!(e.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
@@ -1773,6 +1875,59 @@ mod tests {
                 prop_assert!(!u.is_poisoned());
             }
         }
+    }
+
+    /// #786: past the caps, Assign and Subscribe answer 500
+    /// INSUFFICIENT_RESOURCES (TS 29.500 Table 5.2.7.2-1).
+    #[test]
+    fn past_the_caps_assign_and_subscribe_are_insufficient_resources() {
+        let u = ucmf();
+        u.write().unwrap().set_limits(context::Limits {
+            max_dic_entries: 1,
+            max_subscriptions: 1,
+            max_subscriptions_per_consumer: 1,
+        });
+        assert_eq!(
+            handle(&u, &assign_request("35123456", &[1]), now())
+                .0
+                .status,
+            201
+        );
+        let (r, _) = handle(&u, &assign_request("35123456", &[2]), now());
+        assert_eq!(
+            (r.status, cause(&r)),
+            (500, json!("INSUFFICIENT_RESOURCES"))
+        );
+        let sub = || {
+            with_json(
+                req("POST", "/nucmf-uecm/v1/subscriptions"),
+                json!({"ucmfNotificationUri": "http://amf:7777/racs-notify"}),
+            )
+        };
+        assert_eq!(handle(&u, &sub(), now()).0.status, 201);
+        let (r, _) = handle(&u, &sub(), now());
+        assert_eq!(
+            (r.status, cause(&r)),
+            (500, json!("INSUFFICIENT_RESOURCES"))
+        );
+    }
+
+    #[test]
+    fn the_limits_are_configurable() {
+        let args = Args::parse_from(["nextgcore-ucmfd"]);
+        let s = settle(&args, None).unwrap();
+        assert_eq!(s.limits, context::Limits::default());
+        let yaml =
+            "ucmf:\n  limits:\n    max_dic_entries: 5\n    max_subscriptions_per_consumer: 2\n";
+        let s = settle(&args, Some(yaml)).unwrap();
+        assert_eq!(
+            s.limits,
+            context::Limits {
+                max_dic_entries: 5,
+                max_subscriptions: context::Limits::default().max_subscriptions,
+                max_subscriptions_per_consumer: 2,
+            }
+        );
     }
 
     #[test]
