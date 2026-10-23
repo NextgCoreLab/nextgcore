@@ -60,8 +60,6 @@ pub const GTPU_IE_RECOVERY: u8 = 14;
 /// Per-peer GTP-U path state (TS 29.281 §7.2, TS 23.007).
 #[derive(Debug, Clone, Default)]
 pub struct GtpuPeerState {
-    /// Last Recovery counter seen from this peer; None = no response yet.
-    pub last_recovery: Option<u8>,
     /// Sequence number of the most recently sent (unanswered) Echo Request.
     pub pending_seq: Option<u16>,
     /// Consecutive missed responses (no reply before next tick).
@@ -116,26 +114,20 @@ impl GtpuPathTable {
         self.peers.remove(peer);
     }
 
-    /// Called on receiving an Echo Response from `peer` with `recovery` counter.
-    /// Returns `true` if the peer's Recovery counter changed (= peer restarted,
-    /// its tunnels are stale, TS 29.281 §7.2.2).
-    pub fn on_echo_response(&mut self, peer: SocketAddr, recovery: u8) -> bool {
+    /// Called on receiving an Echo Response from `peer`: the path is alive.
+    ///
+    /// The Recovery IE it carries says nothing about a restart. TS 29.281 §8.2:
+    /// "The value of the restart counter shall be set to 0 by the sending entity
+    /// and ignored by the receiving entity" (#798 review). GTP-U restarts are
+    /// learnt through the control plane (TS 23.007), not from this counter, so
+    /// before #798's follow-up a peer sending a non-zero value was misread as
+    /// restarting on every change.
+    pub fn on_echo_response(&mut self, peer: SocketAddr) {
         let state = self.peers.entry(peer).or_default();
         state.pending_seq = None;
         state.miss_count = 0;
         state.last_success = Some(std::time::Instant::now());
         state.path_failed = false;
-        match state.last_recovery {
-            Some(prev) if prev != recovery => {
-                state.last_recovery = Some(recovery);
-                true // peer restarted
-            }
-            None => {
-                state.last_recovery = Some(recovery);
-                false
-            }
-            _ => false,
-        }
     }
 
     /// Advance the state machine by one echo interval tick.
@@ -1629,10 +1621,10 @@ pub struct DataPlaneSession {
     pub ue_ipv4: Option<Ipv4Addr>,
     /// Uplink TEID (UPF receives on this TEID)
     pub ul_teid: u32,
-    /// Downlink TEID (UPF sends with this TEID)
-    pub dl_teid: u32,
-    /// gNB/eNB address for downlink
-    pub gnb_addr: SocketAddr,
+    /// The downlink tunnel -- (DL TEID the UPF sends with, gNB/eNB address) -- as ONE
+    /// value behind a lock, so a Session Modification moves it IN PLACE (#822) and a
+    /// packet never sees a TEID from one tunnel and an address from the other.
+    dl_tunnel: RwLock<(u32, SocketAddr)>,
     /// PDU Session ID
     pub pdu_session_id: Option<u8>,
     /// QoS Flow Identifier
@@ -1664,6 +1656,26 @@ pub struct DataPlaneSession {
 }
 
 impl DataPlaneSession {
+    /// The downlink tunnel `(DL TEID, gNB address)`, copied out of its lock.
+    pub fn dl_tunnel(&self) -> (u32, SocketAddr) {
+        *self.dl_tunnel.read().unwrap()
+    }
+
+    /// The DL TEID the UPF sends with.
+    pub fn dl_teid(&self) -> u32 {
+        self.dl_tunnel().0
+    }
+
+    /// The gNB/eNB address for downlink.
+    pub fn gnb_addr(&self) -> SocketAddr {
+        self.dl_tunnel().1
+    }
+
+    /// Move the downlink tunnel in place (#822).
+    pub fn set_dl_tunnel(&self, dl_teid: u32, gnb_addr: SocketAddr) {
+        *self.dl_tunnel.write().unwrap() = (dl_teid, gnb_addr);
+    }
+
     /// Construct a session with empty rule sets (helper to keep the many
     /// construction sites consistent as new per-session state is added).
     #[allow(clippy::too_many_arguments)]
@@ -1682,8 +1694,7 @@ impl DataPlaneSession {
             smf_seid,
             ue_ipv4,
             ul_teid,
-            dl_teid,
-            gnb_addr,
+            dl_tunnel: RwLock::new((dl_teid, gnb_addr)),
             pdu_session_id,
             qfi,
             ul_packets: AtomicU64::new(0),
@@ -1809,9 +1820,9 @@ impl SessionManager {
             "Session added: SEID={:#x}, UL_TEID={:#x}, DL_TEID={:#x}, UE_IP={:?}, gNB={}",
             session.upf_seid,
             session.ul_teid,
-            session.dl_teid,
+            session.dl_teid(),
             session.ue_ipv4,
-            session.gnb_addr
+            session.gnb_addr()
         );
 
         session
@@ -2654,7 +2665,7 @@ impl DataPlane {
                         // Find the session whose downlink tunnel matches
                         let session = {
                             let map = self.sessions.seid_map.read().unwrap();
-                            map.values().find(|s| s.dl_teid == teid).cloned()
+                            map.values().find(|s| s.dl_teid() == teid).cloned()
                         };
                         if let Some(sess) = session {
                             self.send_report_event(UpfReportEvent::ErrorIndicationReport {
@@ -2671,26 +2682,18 @@ impl DataPlane {
                 return;
             }
             gtpu_msg_type::ECHO_RESPONSE => {
-                // TS 29.281 §7.2.2: response to our outgoing Echo Request.
-                // Parse the Recovery IE and update the N3 path table.
+                // TS 29.281 §7.2.2: response to our outgoing Echo Request; the
+                // path is alive. Its Recovery value is ignored (§8.2).
                 let recovery = if pkt.len() > header.header_len {
                     parse_gtpu_recovery_ie(&pkt[header.header_len..])
                 } else {
                     None
                 };
-                let counter = recovery.unwrap_or(0);
-                log::debug!("GTP-U Echo Response from {from}, Recovery={counter}");
-                let restarted = self
-                    .path_table
-                    .write()
-                    .unwrap()
-                    .on_echo_response(from, counter);
-                if restarted {
-                    log::warn!(
-                        "GTP-U peer {from} restarted (Recovery counter changed to {counter}) \
-                         — tunnels may be stale"
-                    );
-                }
+                log::debug!(
+                    "GTP-U Echo Response from {from}, Recovery={recovery:?} (ignored, TS 29.281 \
+                     §8.2)"
+                );
+                self.path_table.write().unwrap().on_echo_response(from);
                 return;
             }
             gtpu_msg_type::END_MARKER => {
@@ -3066,10 +3069,10 @@ impl DataPlane {
         let (dl_teid, gnb_addr) = match far_id {
             Some(fid) => match session.apply_far(fid) {
                 FarDecision::Forward { ohc_teid, ohc_addr } => {
-                    let teid = ohc_teid.unwrap_or(session.dl_teid);
+                    let teid = ohc_teid.unwrap_or(session.dl_teid());
                     let addr = ohc_addr
                         .map(|ip| SocketAddr::new(IpAddr::V4(ip), GTPU_PORT))
-                        .unwrap_or(session.gnb_addr);
+                        .unwrap_or(session.gnb_addr());
                     (teid, addr)
                 }
                 FarDecision::Drop => {
@@ -3114,7 +3117,7 @@ impl DataPlane {
                     return;
                 }
             },
-            None => (session.dl_teid, session.gnb_addr),
+            None => (session.dl_teid(), session.gnb_addr()),
         };
 
         // Record URR usage AND honour its verdict (#80, TS 29.244 §5.2.2.2.2).
@@ -3216,10 +3219,10 @@ impl DataPlane {
             Some(s) => s.clone(),
             None => return 0,
         };
-        let teid = ohc_teid.unwrap_or(session.dl_teid);
+        let teid = ohc_teid.unwrap_or(session.dl_teid());
         let addr = ohc_addr
             .map(|ip| SocketAddr::new(IpAddr::V4(ip), GTPU_PORT))
-            .unwrap_or(session.gnb_addr);
+            .unwrap_or(session.gnb_addr());
         let qfi = session.qfi;
         // Buffered packets are flushed against the SESSION's QFI rather than a
         // per-packet PDR/QER match (pre-existing behaviour of this path), so the
@@ -3369,8 +3372,9 @@ impl DataPlane {
         gnb_addr: Option<SocketAddr>,
     ) {
         if let Some(session) = self.sessions.find_by_seid(upf_seid) {
-            let new_dl_teid = dl_teid.unwrap_or(session.dl_teid);
-            let new_gnb_addr = gnb_addr.unwrap_or(session.gnb_addr);
+            let (old_teid, old_addr) = session.dl_tunnel();
+            let new_dl_teid = dl_teid.unwrap_or(old_teid);
+            let new_gnb_addr = gnb_addr.unwrap_or(old_addr);
 
             // Update the downlink FAR's outer header creation if present
             if dl_teid.is_some() || gnb_addr.is_some() {
@@ -3402,54 +3406,12 @@ impl DataPlane {
                 }
             }
 
-            // Remove and re-add to update the immutable fields
-            let pdrs = std::mem::take(&mut *session.pdrs.write().unwrap());
-            let fars_map = std::mem::take(&mut *session.fars.write().unwrap());
-            let qers_map = std::mem::take(&mut *session.qers.write().unwrap());
-            let urrs_map = std::mem::take(&mut *session.urrs.write().unwrap());
-            let bars_map = std::mem::take(&mut *session.bars.write().unwrap());
-            let buffered: std::collections::VecDeque<Vec<u8>> =
-                std::mem::take(&mut *session.dl_buffer.lock().unwrap());
-            let pdr_teids = std::mem::take(&mut *session.pdr_teids.write().unwrap());
-
-            self.sessions.remove_session_by_seid(upf_seid);
-
-            let new_session = DataPlaneSession::new_empty(
-                session.upf_seid,
-                session.smf_seid,
-                session.ue_ipv4,
-                session.ul_teid,
-                new_dl_teid,
-                new_gnb_addr,
-                session.pdu_session_id,
-                session.qfi,
-            );
-            new_session.ul_packets.store(
-                session.ul_packets.load(Ordering::Relaxed),
-                Ordering::Relaxed,
-            );
-            new_session.dl_packets.store(
-                session.dl_packets.load(Ordering::Relaxed),
-                Ordering::Relaxed,
-            );
-            new_session
-                .ul_bytes
-                .store(session.ul_bytes.load(Ordering::Relaxed), Ordering::Relaxed);
-            new_session
-                .dl_bytes
-                .store(session.dl_bytes.load(Ordering::Relaxed), Ordering::Relaxed);
-            *new_session.pdrs.write().unwrap() = pdrs;
-            *new_session.fars.write().unwrap() = fars_map;
-            *new_session.qers.write().unwrap() = qers_map;
-            *new_session.urrs.write().unwrap() = urrs_map;
-            *new_session.bars.write().unwrap() = bars_map;
-            *new_session.dl_buffer.lock().unwrap() = buffered;
-            *new_session.pdr_teids.write().unwrap() = pdr_teids;
-            new_session
-                .ddn_sent
-                .store(session.ddn_sent.load(Ordering::SeqCst), Ordering::SeqCst);
-
-            self.sessions.add_session(new_session);
+            // #822: moved IN PLACE. This used to `mem::take` the PDRs, FARs, QERs, URRs,
+            // BARs and DL buffer out of the live session and re-add a rebuilt one, so a
+            // packet already holding the old `Arc` found no rules (dropped, or forwarded
+            // unmeasured) and a concurrent TERMR/QAURR found no session -- on every
+            // DL-tunnel modification (handover, Service Request) under traffic.
+            session.set_dl_tunnel(new_dl_teid, new_gnb_addr);
             log::info!(
                 "Updated data plane session: SEID={upf_seid:#x}, DL_TEID=0x{new_dl_teid:x}, gNB={new_gnb_addr}"
             );
@@ -3633,7 +3595,7 @@ impl DataPlane {
             // stale peers with miss_count > 0 age out naturally via tick()).
             let active_peers: HashSet<SocketAddr> = {
                 let map = self.sessions.seid_map.read().unwrap();
-                map.values().map(|s| s.gnb_addr).collect()
+                map.values().map(|s| s.gnb_addr()).collect()
             };
 
             if active_peers.is_empty() {
@@ -3659,7 +3621,7 @@ impl DataPlane {
                 let affected: Vec<u64> = {
                     let map = self.sessions.seid_map.read().unwrap();
                     map.values()
-                        .filter(|s| &s.gnb_addr == peer)
+                        .filter(|s| &s.gnb_addr() == peer)
                         .map(|s| s.upf_seid)
                         .collect()
                 };
@@ -4558,9 +4520,10 @@ mod tests {
 
         // 2. FAR resolves to Forward with the gNB DL tunnel
         let (teid, addr) = match session.apply_far(far_id.unwrap()) {
-            FarDecision::Forward { ohc_teid, ohc_addr } => {
-                (ohc_teid.unwrap_or(session.dl_teid), ohc_addr.unwrap_or(gnb))
-            }
+            FarDecision::Forward { ohc_teid, ohc_addr } => (
+                ohc_teid.unwrap_or(session.dl_teid()),
+                ohc_addr.unwrap_or(gnb),
+            ),
             other => panic!("expected Forward, got {other:?}"),
         };
         assert_eq!(teid, dl_teid);
@@ -5774,6 +5737,59 @@ mod tests {
         assert!(next[0].ur_seqn > lost[0].ur_seqn);
     }
 
+    /// #822: a DL-tunnel modification moves the tunnel IN PLACE. A packet that already
+    /// holds the session's `Arc` (as the forwarding path does across the update) keeps
+    /// seeing its rules and is measured on the same URR, and the session in the table
+    /// is the same object. Before, the update `mem::take`d every rule out of that `Arc`
+    /// and re-added a rebuilt session, so the in-flight packet found no PDR and its
+    /// usage reached no report.
+    #[test]
+    fn a_dl_tunnel_modification_updates_the_live_session_in_place() {
+        let dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        dp.add_session_from_pfcp(
+            0x822,
+            0x1822,
+            Ipv4Addr::new(10, 45, 8, 22),
+            0x8221,
+            0x8222,
+            "127.0.0.1:2152".parse().unwrap(),
+            Some(5),
+            Some(9),
+        );
+        let held = dp.sessions.find_by_seid(0x822).expect("session");
+        let urr = Arc::new(DataPlaneUrr::new(1));
+        held.urrs.write().unwrap().insert(1, Arc::clone(&urr));
+        for pdr in held.pdrs.write().unwrap().iter_mut() {
+            pdr.urr_ids = vec![1];
+        }
+
+        let new_gnb: SocketAddr = "127.0.0.2:2152".parse().unwrap();
+        dp.update_session_from_pfcp(0x822, Some(0xBEEF), Some(new_gnb));
+
+        assert!(
+            Arc::ptr_eq(&held, &dp.sessions.find_by_seid(0x822).unwrap()),
+            "the session is updated in place, not replaced"
+        );
+        assert_eq!(held.dl_tunnel(), (0xBEEF, new_gnb), "the tunnel moved");
+        assert!(
+            held.match_pdr_with_packet(SRC_INTF_CORE, None, None)
+                .is_some(),
+            "a packet holding the session still finds its downlink PDR"
+        );
+        held.record_urrs(&[1], 100, false);
+        assert_eq!(
+            urr.usage().dl_bytes,
+            100,
+            "and is measured on the URR a final report reads"
+        );
+        assert_eq!(
+            dp.sessions
+                .find_by_ue_ip(Ipv4Addr::new(10, 45, 8, 22))
+                .map(|s| s.upf_seid),
+            Some(0x822)
+        );
+    }
+
     /// Run `f` on a thread of its own and hand back a receiver for its result, so a
     /// test can wait on it with `recv_timeout` -- the only way to observe a deadlock
     /// as a failure instead of a hung test binary. A thread that does hang is leaked,
@@ -6383,9 +6399,7 @@ mod tests {
         assert_eq!(to_send.len(), 1);
         assert!(failed.is_empty());
 
-        // Simulate a response with recovery=0 (first time → not a restart).
-        let restarted = pt.on_echo_response(peer, 0);
-        assert!(!restarted, "first response must not flag a restart");
+        pt.on_echo_response(peer);
 
         // After response the peer must not be failed.
         let state = pt.peers.get(&peer).unwrap();
@@ -6419,20 +6433,21 @@ mod tests {
         assert!(state.path_failed);
     }
 
-    /// A changed Recovery counter on a response must return `true` (peer restart).
+    /// #798 review, TS 29.281 §8.2: the GTP-U Recovery value is ignored, so
+    /// Echo Responses with changing values keep the path alive and are not a
+    /// restart.
     #[test]
-    fn test_path_table_changed_recovery_detects_restart() {
+    fn a_gtpu_recovery_value_is_ignored() {
         let peer: SocketAddr = "10.0.0.2:2152".parse().unwrap();
         let mut pt = GtpuPathTable::default();
         pt.add_peer(peer);
-
-        // First response: recovery=5, not a restart.
-        let r = pt.on_echo_response(peer, 5);
-        assert!(!r, "first response is never a restart");
-
-        // Second response: recovery=6 (counter incremented = peer restarted).
-        let r = pt.on_echo_response(peer, 6);
-        assert!(r, "changed Recovery counter must signal peer restart");
+        let _ = pt.tick();
+        pt.on_echo_response(peer);
+        let _ = pt.tick();
+        pt.on_echo_response(peer);
+        let state = pt.peers.get(&peer).unwrap();
+        assert_eq!(state.miss_count, 0);
+        assert!(!state.path_failed);
     }
 
     /// Recovery IE parser: finds IE type 14 in a 2-byte TV payload.

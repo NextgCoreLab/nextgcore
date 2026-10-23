@@ -318,6 +318,49 @@ pub fn build_modify_bearer_response(
     Ok(msg)
 }
 
+/// Build a Modify Bearer Response (TS 29.274 Table 7.2.8-1) that answers each
+/// bearer of the request on its own (#766):
+/// - `modified`: the bearers switched, each a "Bearer Context modified"
+///   (instance 0) with Cause Request accepted and the S1-U SGW F-TEID;
+/// - `marked_for_removal`: (EBI, cause) of the bearers the SGW does not hold,
+///   each a "Bearer Context marked for removal" (instance 1).
+pub fn build_modify_bearer_response_per_bearer(
+    mme_s11_teid: u32,
+    sequence_number: u32,
+    cause: u8,
+    modified: &[u64],
+    marked_for_removal: &[(u8, u8)],
+) -> Gtp2Message {
+    let ctx = sgwc_self();
+    let mut msg = new_message(
+        Gtp2MessageType::ModifyBearerResponse,
+        mme_s11_teid,
+        sequence_number,
+    );
+    msg.add_ie(Gtp2CauseIe::new(cause).to_ie(0));
+    for bearer_id in modified {
+        let Some(bearer) = ctx.bearer_find_by_id(*bearer_id) else {
+            continue;
+        };
+        let mut bc = Gtp2BearerContextIe::new();
+        bc.set_ebi(bearer.ebi);
+        bc.set_cause(&Gtp2CauseIe::new(gtp_cause::REQUEST_ACCEPTED));
+        if let Some(ul_tunnel) = ctx.ul_tunnel_in_bearer(bearer.id) {
+            if let Ok(ft) = fteid_from_tunnel(f_teid_interface::S1_U_SGW_GTP_U, &ul_tunnel) {
+                bc.set_fteid(0, &ft);
+            }
+        }
+        msg.add_bearer_context(0, &bc);
+    }
+    for (ebi, bearer_cause) in marked_for_removal {
+        let mut bc = Gtp2BearerContextIe::new();
+        bc.set_ebi(*ebi);
+        bc.set_cause(&Gtp2CauseIe::new(*bearer_cause));
+        msg.add_bearer_context(1, &bc);
+    }
+    msg
+}
+
 /// Build Delete Session Response (TS 29.274 Section 7.2.10)
 pub fn build_delete_session_response(
     mme_s11_teid: u32,
