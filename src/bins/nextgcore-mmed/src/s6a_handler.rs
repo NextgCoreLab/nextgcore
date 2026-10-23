@@ -361,9 +361,50 @@ pub fn mme_s6a_process_inbound(inbound: &crate::fd_path::InboundS6aRequest) -> S
             Ok(())
         }
         S6aMessage::Idr(idr) => {
-            let mut pool = ctx.mme_ue_pool.write().unwrap();
-            let mme_ue = pool.get_mut(&ue_id).ok_or(S6aError::UeNotFound)?;
-            mme_s6a_handle_idr(mme_ue, idr)
+            let (before, after, enb_ue_id) = {
+                let mut pool = ctx.mme_ue_pool.write().unwrap();
+                let mme_ue = pool.get_mut(&ue_id).ok_or(S6aError::UeNotFound)?;
+                let before = crate::s1ap_build::ue_ambr_of(ctx, mme_ue);
+                mme_s6a_handle_idr(mme_ue, idr)?;
+                (
+                    before,
+                    crate::s1ap_build::ue_ambr_of(ctx, mme_ue),
+                    mme_ue.enb_ue_id,
+                )
+            };
+            // #811, TS 23.401 §5.4.2.2: when the subscribed UE-AMBR changes for
+            // an ECM-CONNECTED UE, the eNB is told the new UE-AMBR with UE
+            // CONTEXT MODIFICATION (TS 36.413 §8.3.4). An ECM-IDLE UE gets it
+            // in its next Initial Context Setup.
+            if after != before {
+                if let Some(enb_ue) = ctx
+                    .enb_ue_find_by_id(enb_ue_id)
+                    .filter(|e| e.mme_ue_id == ue_id)
+                {
+                    match crate::s1ap_build::build_ue_context_modification_for_ue_ambr(
+                        &enb_ue, after,
+                    ) {
+                        Ok(pdu) => {
+                            log::info!(
+                                "[{}] subscribed UE-AMBR changed: UE CONTEXT MODIFICATION \
+                                 REQUEST with UE-AMBR {}/{} bit/s (TS 23.401 §5.4.2.2)",
+                                inbound.imsi_bcd,
+                                after.dl,
+                                after.ul
+                            );
+                            crate::s1ap_path::s1ap_send(crate::s1ap_handler::S1apSend {
+                                enb_id: enb_ue.enb_id,
+                                pdu,
+                            });
+                        }
+                        Err(e) => log::error!(
+                            "[{}] UE Context Modification Request not built: {e}",
+                            inbound.imsi_bcd
+                        ),
+                    }
+                }
+            }
+            Ok(())
         }
         _ => Err(S6aError::InvalidMessage),
     }
@@ -835,6 +876,81 @@ mod tests {
         ctx.enb_ue_associate_mme_ue(enb_ue_id, mme_ue_id);
         ctx.mme_ue_set_imsi(mme_ue_id, imsi);
         mme_ue_id
+    }
+
+    /// #869 review MAJOR, TS 23.401 §5.4.2.2: an Insert Subscriber Data that
+    /// changes the subscribed UE-AMBR of an ECM-CONNECTED UE reaches the eNB in
+    /// a UE CONTEXT MODIFICATION REQUEST carrying the recomputed UE-AMBR; one
+    /// that leaves it unchanged sends nothing.
+    #[test]
+    fn a_subscribed_ue_ambr_change_is_signalled_to_the_enb() {
+        use nextgcore_s1ap_gen::generated as g;
+        let _guard = crate::gtp_path::lock_s11();
+        const IMSI: &str = "999990000000811";
+        let mme_ue_id = seed_connected_ue(IMSI, 811);
+        let ctx = crate::context::mme_self();
+        let enb_ue_id = ctx.mme_ue_find_by_id(mme_ue_id).unwrap().enb_ue_id;
+        let enb_id = ctx.enb_ue_find_by_id(enb_ue_id).unwrap().enb_id;
+        // One active APN of 1 Gbit/s; subscribed UE-AMBR 1 Gbit/s.
+        let sess_id = ctx.sess_add(mme_ue_id, 1);
+        let bearer_id = ctx.bearer_add(sess_id, mme_ue_id);
+        {
+            let mut pool = ctx.bearer_pool.write().unwrap();
+            let b = pool.get_mut(&bearer_id).unwrap();
+            b.ebi = 5;
+            b.sgw_s1u_teid = 0x811;
+        }
+        {
+            let mut pool = ctx.sess_pool.write().unwrap();
+            let s = pool.get_mut(&sess_id).unwrap();
+            s.bearer_list.push(bearer_id);
+            s.ambr.downlink = 1_000_000_000;
+            s.ambr.uplink = 1_000_000_000;
+        }
+        {
+            let mut pool = ctx.mme_ue_pool.write().unwrap();
+            let ue = pool.get_mut(&mme_ue_id).unwrap();
+            ue.sess_list.push(sess_id);
+            ue.ambr.downlink = 1_000_000_000;
+            ue.ambr.uplink = 1_000_000_000;
+        }
+        crate::s1ap_path::tap_enb_for_test(enb_id);
+        let _ = crate::s1ap_path::take_tapped_for_test(enb_id);
+        let isd = |dl: u64, ul: u64| crate::fd_path::InboundS6aRequest {
+            imsi_bcd: IMSI.to_string(),
+            message: crate::fd_path::S6aMessage::Idr(crate::fd_path::IdrMessage {
+                idr_flags: 0,
+                subscription_data: crate::fd_path::SubscriptionData {
+                    ambr_downlink: dl,
+                    ambr_uplink: ul,
+                    ..Default::default()
+                },
+            }),
+        };
+        let ue_ctx_mods = || -> Vec<(u64, u64)> {
+            crate::s1ap_path::take_tapped_for_test(enb_id)
+                .into_iter()
+                .filter_map(|pdu| match nextgcore_s1ap_gen::decode(&pdu) {
+                    Ok(g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+                        value: g::InitiatingMessageValue::Id_UEContextModification(req),
+                        ..
+                    })) => req.protocol_i_es.0.into_iter().find_map(|ie| match ie.value {
+                        g::UEContextModificationRequestProtocolIEs_EntryValue::Id_uEaggregateMaximumBitrate(a) => {
+                            Some((a.u_eaggregate_maximum_bit_rate_dl.0, a.u_eaggregate_maximum_bit_rate_ul.0))
+                        }
+                        _ => None,
+                    }),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Lowered to 10 / 5 Mbit/s: the eNB is told.
+        mme_s6a_process_inbound(&isd(10_000_000, 5_000_000)).unwrap();
+        assert_eq!(ue_ctx_mods(), vec![(10_000_000, 5_000_000)]);
+        // The same value again: nothing to tell.
+        mme_s6a_process_inbound(&isd(10_000_000, 5_000_000)).unwrap();
+        assert!(ue_ctx_mods().is_empty());
+        ctx.mme_ue_remove(mme_ue_id);
     }
 
     fn clr(imsi: &str, cancellation_type: u32) -> crate::fd_path::InboundS6aRequest {
