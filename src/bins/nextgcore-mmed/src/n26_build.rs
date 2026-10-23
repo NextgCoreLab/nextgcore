@@ -66,6 +66,14 @@ pub const CAUSE_REQUEST_ACCEPTED: u8 = 16;
 /// Response.
 pub const CAUSE_IMSI_IMEI_NOT_KNOWN: u8 = 96;
 
+/// GTPv2-C cause `Context Not Found` (TS 29.274 Table 8.4-1: 64, `29274-j60.txt:25444`).
+///
+/// §5.5.2 (`29274-j60.txt:2189-2192`): a node receiving a message whose header TEID-C is not
+/// known "shall respond with "Context not found" Cause in the corresponding response message
+/// to the sender, the TEID used in the GTPv2-C header in the response message shall be then
+/// set to zero."
+pub const CAUSE_CONTEXT_NOT_FOUND: u8 = 64;
+
 /// GTPv2-C cause `Request rejected` (TS 29.274 Table 8.4-1).
 pub const CAUSE_REQUEST_REJECTED: u8 = 94;
 
