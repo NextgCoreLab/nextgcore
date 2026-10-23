@@ -111,6 +111,11 @@ struct Args {
     #[arg(long, default_value = "2152")]
     gtpu_port: u16,
 
+    /// IPv6 GTP-U address (N3 over IPv6, #918). Optional: without it, downlink to an
+    /// IPv6 gNB is dropped and counted.
+    #[arg(long)]
+    gtpu_addr6: Option<std::net::Ipv6Addr>,
+
     /// TUN interface name
     #[arg(long, default_value = "ogstun")]
     tun_ifname: String,
@@ -332,6 +337,12 @@ async fn main() -> Result<()> {
             .init(&args.tun_ifname, tun_ip, args.tun_prefix, gtpu_addr)
             .await
             .context("Failed to initialize data plane")?;
+        if let Some(addr6) = args.gtpu_addr6 {
+            data_plane
+                .bind_gtpu6(SocketAddr::new(std::net::IpAddr::V6(addr6), args.gtpu_port))
+                .await
+                .context("Failed to bind the IPv6 GTP-U socket")?;
+        }
     } else {
         log::warn!("Data plane disabled (--no-dataplane flag set)");
         log::warn!("UPF running in control plane only mode - no user traffic forwarding");
@@ -941,7 +952,12 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                                 fp.outer_header_creation.as_ref().map(|ohc| ohc.teid)
                             });
                             let ohc_addr = f.forwarding_parameters.as_ref().and_then(|fp| {
-                                fp.outer_header_creation.as_ref().and_then(|ohc| ohc.ipv4)
+                                fp.outer_header_creation.as_ref().and_then(|ohc| {
+                                    // #918: IPv4, else IPv6 (§8.2.56).
+                                    ohc.ipv4
+                                        .map(std::net::IpAddr::V4)
+                                        .or(ohc.ipv6.map(std::net::IpAddr::V6))
+                                })
                             });
                             let dest_if = f
                                 .forwarding_parameters
@@ -1258,7 +1274,12 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                             .as_ref()
                             .and_then(|fp| fp.outer_header_creation.as_ref().map(|ohc| ohc.teid));
                         let ohc_addr = f.forwarding_parameters.as_ref().and_then(|fp| {
-                            fp.outer_header_creation.as_ref().and_then(|ohc| ohc.ipv4)
+                            fp.outer_header_creation.as_ref().and_then(|ohc| {
+                                // #918: IPv4, else IPv6 (§8.2.56).
+                                ohc.ipv4
+                                    .map(std::net::IpAddr::V4)
+                                    .or(ohc.ipv6.map(std::net::IpAddr::V6))
+                            })
                         });
                         let dest_if = f
                             .forwarding_parameters
