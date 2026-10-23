@@ -2466,7 +2466,8 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
             // #310: the reported subscribed session-AMBR, which the `SE_AMBR_CH` arm
             // bounds its authorisation by. Before #310 this field was written only by
             // `npcf_handler::pcf_npcf_smpolicycontrol_handle_create`, a dead C port
-            // with no callers, so on the live path it was neither written nor read.
+            // with no callers (deleted by #655), so on the live path it was
+            // neither written nor read.
             sess.subscribed_sess_ambr = subs_sess_ambr.clone();
             if let Ok(context) = ctx.read() {
                 context.sess_update(&sess);
@@ -2699,16 +2700,87 @@ pub async fn handle_sm_policy_delete(sm_policy_id: &str) -> SbiResponse {
             // Deregister the BSF binding (best-effort) before dropping the session.
             let binding_id = sess.binding.id.clone().unwrap_or_default();
             sbi_path::pcf_sess_deregister_bsf_binding(binding_id);
+            // TS 29.514 §4.2.5.3: the AF application session contexts bound to
+            // this PDU session are no longer valid. Tell each AF (TerminationInfo,
+            // termCause PDU_SESSION_TERMINATION) before the contexts go with the
+            // session (#767). The sender reads the app under its own lock; no
+            // guard is held here. The AF then deletes the context (§4.2.4.2),
+            // which is answered from the tombstone below.
+            let app_session_ids: Vec<String> = match ctx.read() {
+                Ok(context) => sess
+                    .app_ids
+                    .iter()
+                    .filter_map(|id| context.app_find_by_id(*id))
+                    .map(|app| app.app_session_id)
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            for app_id in &sess.app_ids {
+                pcf_sbi_send_policyauthorization_terminate_notify(*app_id);
+            }
+            remember_terminated_app_sessions(&app_session_ids);
             if let Ok(context) = ctx.read() {
                 context.sess_remove(sess.id);
             }
-            log::info!("SM Policy {sm_policy_id} deleted");
+            log::info!(
+                "SM Policy {sm_policy_id} deleted ({} AF app session(s) terminated)",
+                app_session_ids.len()
+            );
             SbiResponse::with_status(204)
         }
         None => send_not_found(
             &format!("SM Policy {sm_policy_id} not found"),
             Some("POLICY_NOT_FOUND"),
         ),
+    }
+}
+
+/// AF application session contexts the PCF terminated with its SM policy
+/// (#767), so the AF's follow-up `Npcf_PolicyAuthorization_Delete`
+/// (TS 29.514 §4.2.5.3 -> §4.2.4.2) gets its `204 No Content` rather than a
+/// 404 for a context the PCF itself removed. Bounded in time and size: an AF
+/// that never deletes leaves nothing behind for long.
+static TERMINATED_APP_SESSIONS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+> = std::sync::LazyLock::new(Default::default);
+/// How long a terminated app session's DELETE is still answered with 204.
+const TERMINATED_APP_SESSION_TTL: Duration = Duration::from_secs(300);
+/// Cap on remembered terminated app sessions; the oldest go first.
+const TERMINATED_APP_SESSION_CAP: usize = 4096;
+
+fn remember_terminated_app_sessions(ids: &[String]) {
+    if ids.is_empty() {
+        return;
+    }
+    let now = std::time::Instant::now();
+    let mut map = TERMINATED_APP_SESSIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    map.retain(|_, at| now.duration_since(*at) < TERMINATED_APP_SESSION_TTL);
+    for id in ids {
+        map.insert(id.clone(), now);
+    }
+    while map.len() > TERMINATED_APP_SESSION_CAP {
+        let Some(oldest) = map
+            .iter()
+            .min_by_key(|(_, at)| **at)
+            .map(|(k, _)| k.clone())
+        else {
+            break;
+        };
+        map.remove(&oldest);
+    }
+}
+
+/// Whether `app_session_id` was terminated with its SM policy within the TTL;
+/// consumes the entry, so a repeated DELETE is a 404 as for any gone context.
+fn take_terminated_app_session(app_session_id: &str) -> bool {
+    let mut map = TERMINATED_APP_SESSIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match map.remove(app_session_id) {
+        Some(at) => at.elapsed() < TERMINATED_APP_SESSION_TTL,
+        None => false,
     }
 }
 
@@ -3873,6 +3945,12 @@ pub async fn handle_app_session_delete(app_session_id: &str) -> SbiResponse {
             log::info!("App Session {app_session_id} deleted");
             SbiResponse::with_status(204)
         }
+        // The PCF terminated this context with its PDU session and told the AF
+        // (§4.2.5.3); the AF's Delete completes that procedure (#767).
+        None if take_terminated_app_session(app_session_id) => {
+            log::info!("App Session {app_session_id} delete after PCF-initiated termination");
+            SbiResponse::with_status(204)
+        }
         None => send_not_found(
             &format!("App Session {app_session_id} not found"),
             Some("SESSION_NOT_FOUND"),
@@ -4565,7 +4643,7 @@ mod tests {
     ///
     /// Before #310 the field's only writer was
     /// `npcf_handler::pcf_npcf_smpolicycontrol_handle_create`, a dead C port with no
-    /// callers, so on the live path it was neither written nor read.
+    /// callers (deleted by #655), so on the live path it was neither written nor read.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
     async fn a_create_stores_the_reported_subscribed_ambr_and_a_later_update_bounds_by_it() {
@@ -6995,6 +7073,122 @@ mod tests {
             resp.status, 403,
             "an address outside the prefix must not bind"
         );
+    }
+
+    /// #767, TS 29.514 §4.2.5.3: deleting the SM policy terminates the AF
+    /// application session bound to it. The AF receives `POST {notifUri}/terminate`
+    /// with the context's `resUri` and `termCause` PDU_SESSION_TERMINATION, and
+    /// its follow-up Delete (§4.2.4.2) is answered 204, once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn sm_policy_delete_terminates_the_af_app_session() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        use std::sync::Mutex as StdMutex;
+
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        pcf_context_init(64, 64);
+        provision_session_with_ipv4("imsi-001010000000767", 7, "10.45.0.167").await;
+        let sm_policy_id = pcf_self()
+            .read()
+            .unwrap()
+            .sess_find_by_ipv4addr("10.45.0.167")
+            .expect("the SM policy is stored")
+            .sm_policy_id;
+
+        let seen: Arc<StdMutex<Vec<(String, serde_json::Value)>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let af = SbiServer::on_listener(SbiServerConfig::new(addr), port_listener);
+        af.start(move |req: SbiRequest| {
+            let sink = Arc::clone(&sink);
+            async move {
+                let body = req
+                    .http
+                    .content
+                    .as_deref()
+                    .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+                    .unwrap_or(serde_json::Value::Null);
+                sink.lock()
+                    .expect("sink")
+                    .push((req.header.uri.clone(), body));
+                SbiResponse::with_status(204)
+            }
+        })
+        .await
+        .expect("AF listener starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let notif_uri = format!("http://127.0.0.1:{port}/af-notif-767");
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions",
+            Some(af_create_body(&notif_uri, ("ueIpv4", "10.45.0.167"))),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let app_session_id = body["appSessionId"].as_str().unwrap().to_string();
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            &format!("/npcf-smpolicycontrol/v1/sm-policies/{sm_policy_id}/delete"),
+            Some(serde_json::json!({})),
+        ))
+        .await;
+        assert_eq!(resp.status, 204);
+
+        let terminate = {
+            let mut found = None;
+            for _ in 0..200 {
+                found = seen
+                    .lock()
+                    .expect("sink")
+                    .iter()
+                    .find(|(uri, _)| uri.ends_with("/terminate"))
+                    .cloned();
+                if found.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            found
+        };
+        let (uri, body) = terminate
+            .unwrap_or_else(|| panic!("no TerminationInfo delivered: {:?}", seen.lock().unwrap()));
+        assert!(
+            uri.ends_with("/af-notif-767/terminate"),
+            "delivered to {uri}"
+        );
+        assert_eq!(body["termCause"], "PDU_SESSION_TERMINATION", "{body}");
+        assert_eq!(
+            body["resUri"],
+            format!("/npcf-policyauthorization/v1/app-sessions/{app_session_id}"),
+            "{body}"
+        );
+
+        // The AF's Delete completes the termination with 204, once.
+        let app_path = format!("/npcf-policyauthorization/v1/app-sessions/{app_session_id}/delete");
+        let resp = pcf_sbi_request_handler(make_request("POST", &app_path, None)).await;
+        assert_eq!(
+            resp.status, 204,
+            "the AF's Delete after termination is a 204"
+        );
+        let resp = pcf_sbi_request_handler(make_request("POST", &app_path, None)).await;
+        assert_eq!(resp.status, 404, "a repeated Delete finds nothing");
+
+        af.stop().await.expect("stop AF");
     }
 
     /// `PUT .../events-subscription` stores the subscription, and a resource

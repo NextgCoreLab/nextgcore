@@ -332,28 +332,26 @@ fn registration_request_ue_status_holds_one_octet() {
     let msg = fiveg::RegistrationRequest::decode(&mut b(&ok)).unwrap();
     assert_eq!(msg.ue_status, Some(0x03));
 
-    body.extend_from_slice(&[0x2b, 0x02, 0x03, 0x00]);
-    assert_eq!(
-        len_err(fiveg::RegistrationRequest::decode(&mut b(&body))),
-        (1, 2)
-    );
+    // Length 2 is an erroneous IE. It is optional, so it is treated as not
+    // present (§7.7.1, #630) and the PDU session status after it is decoded.
+    body.extend_from_slice(&[0x2b, 0x02, 0x03, 0x00, 0x50, 0x02, 0x02, 0x00]);
+    let msg = fiveg::RegistrationRequest::decode(&mut b(&body)).unwrap();
+    assert_eq!(msg.ue_status, None);
+    assert_eq!(msg.pdu_session_status.map(|s| s.psi), Some(0x0002));
 }
 
 #[test]
 fn authentication_failure_parameter_is_the_14_octet_auts() {
     // TS 24.008 §10.5.3.2.2: "a length of 16 octets". 5GMM cause #21, then
     // the IE (0x30) one octet short.
+    // Optional, so the short IE is not present (§7.7.1, #630).
     let mut body = vec![0x15, 0x30, 13];
     body.extend_from_slice(&[0u8; 13]);
-    assert_eq!(
-        len_err(fiveg::AuthenticationFailure::decode(&mut b(&body))),
-        (14, 13)
-    );
+    let msg = fiveg::AuthenticationFailure::decode(&mut b(&body)).unwrap();
+    assert_eq!(msg.authentication_failure_parameter, None);
     // The EPS message, same IE (TS 24.301 §9.9.3.1).
-    assert_eq!(
-        len_err(eps::EpsAuthenticationFailure::decode(&mut b(&body))),
-        (14, 13)
-    );
+    let msg = eps::EpsAuthenticationFailure::decode(&mut b(&body)).unwrap();
+    assert_eq!(msg.authentication_failure_parameter, None);
 
     let mut ok = vec![0x15, 0x30, 14];
     ok.extend_from_slice(&[0xab; 14]);
@@ -374,26 +372,33 @@ fn eps_attach_accept_plmn_list_is_decoded_inside_its_length() {
     assert_eq!(msg.equivalent_plmns.as_ref().map(Vec::len), Some(1));
     assert_eq!(msg.emm_cause, Some(0x0a));
 
-    // TS 24.008 §10.5.1.13: at least one PLMN.
-    let body = [0x01, 0x21, 0x00, 0x00, 0x00, 0x4a, 0x02, 0x00, 0xf1];
-    assert_eq!(len_err(eps::AttachAccept::decode(&mut b(&body))), (3, 2));
+    // TS 24.008 §10.5.1.13: at least one PLMN. Length 2 is syntactically
+    // incorrect, so the optional list is absent (TS 24.301 §7.7.1, #630) and
+    // the EMM cause after it still decodes.
+    let body = [
+        0x01, 0x21, 0x00, 0x00, 0x00, 0x4a, 0x02, 0x00, 0xf1, 0x53, 0x0a,
+    ];
+    let msg = eps::AttachAccept::decode(&mut b(&body)).unwrap();
+    assert_eq!(msg.equivalent_plmns, None);
+    assert_eq!(msg.emm_cause, Some(0x0a));
 }
 
 #[test]
 fn eps_bearer_context_status_holds_two_octets() {
     // Extended Service Request: service type + KSI, the M-TMSI (TS 24.008
     // Mobile identity, type 4), then EPS bearer context status (0x57) with
-    // length 1 (TS 24.301 §9.9.2.1: "4 octets length"). It used to be skipped
-    // silently.
+    // length 1 (TS 24.301 §9.9.2.1: "4 octets length").
     let mut body = vec![0x01, 5, 0xf4, 1, 2, 3, 4];
     let mut ok = body.clone();
     ok.extend_from_slice(&[0x57, 0x02, 0x20, 0x00]);
     let msg = eps::ExtendedServiceRequest::decode(&mut b(&ok)).unwrap();
     assert_eq!(msg.eps_bearer_context_status, Some(0x2000));
 
-    body.extend_from_slice(&[0x57, 0x01, 0x20]);
-    assert_eq!(
-        len_err(eps::ExtendedServiceRequest::decode(&mut b(&body))),
-        (2, 1)
-    );
+    // Length 1 is syntactically incorrect. The IE is optional, so it is
+    // absent (TS 24.301 §7.7.1, #630), and the CSFB response after it still
+    // decodes.
+    body.extend_from_slice(&[0x57, 0x01, 0x20, 0xB1]);
+    let msg = eps::ExtendedServiceRequest::decode(&mut b(&body)).unwrap();
+    assert_eq!(msg.eps_bearer_context_status, None);
+    assert_eq!(msg.csfb_response, Some(1));
 }
