@@ -1184,6 +1184,9 @@ impl PfcpClient {
 /// Flush all stored PFCP sessions (UPF restarted / association lost).
 /// Returns the number of sessions removed.
 pub fn clear_pfcp_sessions() -> usize {
+    // #779: the flush empties the process-wide map, whatever the caller.
+    #[cfg(test)]
+    assert_teardown_is_serialised();
     if let Ok(ctx) = smf_self().read() {
         let n = {
             match ctx.pfcp_sessions.write() {

@@ -10805,6 +10805,9 @@ mod tests {
     /// PDU_RES_SETUP_RSP marks it ACTIVATED again.
     #[tokio::test]
     async fn an_up_deactivation_is_recorded_for_the_downlink_data_report() {
+        // #779: `seed_registered_session` / `start_server` call `smf_context_init`, the
+        // process-wide context wipe, which PROCESS_STATE_TEST_LOCK guards.
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let reference = seed_registered_session("imsi-999700000540001", 1, "internet");
         let req = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts/x/modify").with_body(
             serde_json::json!({ "upCnxState": "DEACTIVATED" }).to_string(),
@@ -11924,6 +11927,9 @@ mod tests {
     /// by `retrieve_answers_200_with_ue_eps_pdn_connection`, which fails without it.
     #[tokio::test]
     async fn the_sm_context_lifecycle_round_trips_through_the_router() {
+        // #779: `seed_registered_session` / `start_server` call `smf_context_init`, the
+        // process-wide context wipe, which PROCESS_STATE_TEST_LOCK guards.
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let reference = seed_registered_session("imsi-001010000000083", 4, "internet");
 
         // Retrieve
@@ -12262,6 +12268,9 @@ mod oauth2_h8_tests {
 
     #[tokio::test]
     async fn test_oauth2_missing_token_rejected_401() {
+        // #779: `seed_registered_session` / `start_server` call `smf_context_init`, the
+        // process-wide context wipe, which PROCESS_STATE_TEST_LOCK guards.
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let sk = p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
         let (server, port) = start_server(jwks_for(&sk, "nrf-es256")).await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
@@ -12278,6 +12287,9 @@ mod oauth2_h8_tests {
 
     #[tokio::test]
     async fn test_oauth2_wrong_audience_rejected_401() {
+        // #779: `seed_registered_session` / `start_server` call `smf_context_init`, the
+        // process-wide context wipe, which PROCESS_STATE_TEST_LOCK guards.
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let sk = p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
         let (server, port) = start_server(jwks_for(&sk, "nrf-es256")).await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
@@ -12294,6 +12306,9 @@ mod oauth2_h8_tests {
 
     #[tokio::test]
     async fn test_oauth2_valid_token_reaches_handler() {
+        // #779: `seed_registered_session` / `start_server` call `smf_context_init`, the
+        // process-wide context wipe, which PROCESS_STATE_TEST_LOCK guards.
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let sk = p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
         let (server, port) = start_server(jwks_for(&sk, "nrf-es256")).await;
         let client = SbiClient::with_host_port("127.0.0.1", port);

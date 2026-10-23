@@ -3261,6 +3261,14 @@ pub fn smf_self() -> Arc<RwLock<SmfContext>> {
 
 /// Initialize the global SMF context
 pub fn smf_context_init(max_ue: usize, max_sess: usize, max_bearer: usize) {
+    // #779: the wipe is process-wide (see PROCESS_STATE_TEST_LOCK), so a test that
+    // reaches it without the ambient lock clears a sibling's sessions mid-assertion.
+    #[cfg(test)]
+    require_test_lock(
+        &PROCESS_STATE_TEST_LOCK,
+        "PROCESS_STATE_TEST_LOCK",
+        "smf_context_init (the process-wide context wipe)",
+    );
     let ctx = smf_self();
     if let Ok(mut context) = ctx.write() {
         context.init(max_ue, max_sess, max_bearer);
