@@ -108,7 +108,9 @@ pub enum PositioningMethodKind {
     Ecid,
     /// Multi-RTT trilateration (>=3 ranges).
     MultiRtt,
-    /// Time-Difference-of-Arrival hyperbolic multilateration (>=3 TRPs).
+    /// NR DL-TDOA hyperbolic multilateration on UE-measured RSTDs (>=3 TRPs).
+    /// The only TDOA this LMF solves, so it reports `DL_TDOA` (TS 29.572
+    /// `PositioningMethod`); it reported `UL_TDOA` before #714.
     Tdoa,
     /// Angle-of-Arrival / Angle-of-Departure bearing intersection (>=2 TRPs).
     AngleOfArrival,
@@ -120,7 +122,7 @@ impl PositioningMethodKind {
         match self {
             PositioningMethodKind::Ecid => "NR_ECID",
             PositioningMethodKind::MultiRtt => "MULTI-RTT",
-            PositioningMethodKind::Tdoa => "UL_TDOA",
+            PositioningMethodKind::Tdoa => "DL_TDOA",
             PositioningMethodKind::AngleOfArrival => "UL_AOA",
         }
     }
@@ -1452,7 +1454,7 @@ mod tests {
     #[test]
     fn test_method_spec_strings() {
         assert_eq!(PositioningMethodKind::MultiRtt.as_spec_str(), "MULTI-RTT");
-        assert_eq!(PositioningMethodKind::Tdoa.as_spec_str(), "UL_TDOA");
+        assert_eq!(PositioningMethodKind::Tdoa.as_spec_str(), "DL_TDOA");
         assert_eq!(
             PositioningMethodKind::AngleOfArrival.as_spec_str(),
             "UL_AOA"

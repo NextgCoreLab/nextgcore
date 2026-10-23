@@ -744,11 +744,11 @@ pub struct NgapServer {
     #[cfg(test)]
     forced_amf_ue_ngap_id: Option<u64>,
     /// Test seam: when `Some`, every NGAP PDU `send_to_association` would put on the
-    /// wire is recorded here as `(association_id, pdu)` instead, and the send
-    /// succeeds. Lets a handler test assert what amfd SENDS, and to whom, without a
+    /// wire is recorded here as `(association_id, sctp_stream_id, pdu)` instead, and
+    /// the send succeeds. Lets a handler test assert what amfd SENDS, and to whom, without a
     /// live SCTP association. `None` (the default) keeps the real transport.
     #[cfg(test)]
-    sent_ngap: Option<Vec<(u64, Vec<u8>)>>,
+    sent_ngap: Option<Vec<(u64, u16, Vec<u8>)>>,
     /// Test seam: the next this-many NGAP sends fail as an SCTP send error would,
     /// so a test can drive a handler's send-failure branch (#760).
     #[cfg(test)]
@@ -12898,15 +12898,16 @@ impl NgapServer {
             self.fail_next_sends -= 1;
             return Err(anyhow::anyhow!("SCTP send error: injected by a test"));
         }
+        // Use stream 0 for NGAP signaling
+        let stream_id = 0u16;
         #[cfg(test)]
         if let Some(sent) = self.sent_ngap.as_mut() {
-            sent.push((association_id, data.to_vec()));
+            sent.push((association_id, stream_id, data.to_vec()));
             return Ok(());
         }
 
-        // Use stream 0 for NGAP signaling
         self.transport
-            .send(association_id, 0, data)
+            .send(association_id, stream_id, data)
             .await
             .map_err(|e| anyhow::anyhow!("SCTP send error: {e}"))
     }
@@ -14647,15 +14648,6 @@ impl NgapServerHandle {
     pub async fn num_gnbs(&self) -> usize {
         let server = self.inner.lock().await;
         server.num_gnbs().await
-    }
-
-    pub async fn send(&self, association_id: u64, stream_id: u16, data: &[u8]) -> Result<()> {
-        let mut server = self.inner.lock().await;
-        server
-            .transport
-            .send(association_id, stream_id, data)
-            .await
-            .map_err(|e| anyhow::anyhow!("SCTP send error: {e}"))
     }
 }
 
@@ -21108,8 +21100,16 @@ mod tests {
         server
     }
 
-    /// Everything sent since the last call, in send order.
+    /// Everything sent since the last call, in send order, as `(association_id, pdu)`.
     fn take_sent_ngap(server: &mut NgapServer) -> Vec<(u64, Vec<u8>)> {
+        take_sent_ngap_with_streams(server)
+            .into_iter()
+            .map(|(assoc, _stream, pdu)| (assoc, pdu))
+            .collect()
+    }
+
+    /// [`take_sent_ngap`] with the SCTP stream id each PDU went out on.
+    fn take_sent_ngap_with_streams(server: &mut NgapServer) -> Vec<(u64, u16, Vec<u8>)> {
         std::mem::take(server.sent_ngap.as_mut().expect("capture enabled"))
     }
 
@@ -21162,7 +21162,21 @@ mod tests {
             .expect("handled");
 
         assert!(report.source_release_sent, "the captured send succeeds");
-        let sent = take_sent_ngap(&mut server);
+        let with_streams = take_sent_ngap_with_streams(&mut server);
+        // The capture records the SCTP stream the transport would be given. Stream 0
+        // for this UE-associated PDU is today's behaviour, not the target: TS 38.412 §7
+        // reserves separate streams for UE-associated signalling (#813).
+        assert_eq!(
+            with_streams
+                .iter()
+                .map(|(_, stream, _)| *stream)
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+        let sent: Vec<(u64, Vec<u8>)> = with_streams
+            .into_iter()
+            .map(|(assoc, _, pdu)| (assoc, pdu))
+            .collect();
         assert_eq!(sent.len(), 1, "exactly the source release: {sent:?}");
         assert_eq!(sent[0].0, source, "sent to the SOURCE association");
         assert_eq!(
