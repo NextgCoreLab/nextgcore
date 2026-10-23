@@ -5134,15 +5134,21 @@ struct GsmProcedureTimer {
 /// mean the SMF had started a procedure it should have queued.
 ///
 /// Tests: guarded by [`crate::context::PROCESS_STATE_TEST_LOCK`], not a lock of its
-/// own (#723). The tests that arm a timer through a real procedure already hold it,
-/// and `expire_gsm_timers` walks EVERY entry: a test that drives it to exhaustion
-/// without the lock drops a sibling's T3592 mid-assertion.
+/// own (#723, #761). `expire_gsm_timers` walks EVERY entry, so a test that drives it
+/// to exhaustion drops any sibling's T3591/T3592 armed in that window. Every access
+/// goes through [`gsm_procedure_timers`], which checks the lock under `cfg(test)`.
 static GSM_PROCEDURE_TIMERS: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, GsmProcedureTimer>>,
 > = std::sync::OnceLock::new();
 
 fn gsm_procedure_timers(
 ) -> &'static std::sync::Mutex<std::collections::HashMap<String, GsmProcedureTimer>> {
+    #[cfg(test)]
+    crate::context::require_test_lock(
+        &crate::context::PROCESS_STATE_TEST_LOCK,
+        "PROCESS_STATE_TEST_LOCK",
+        "GSM_PROCEDURE_TIMERS",
+    );
     GSM_PROCEDURE_TIMERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -10393,6 +10399,8 @@ mod tests {
 
     #[tokio::test]
     async fn modification_request_arms_t3591_and_complete_stops_it() {
+        // #761: arms T3591 in GSM_PROCEDURE_TIMERS and seeds `policy_bindings`.
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let reference = "n77-modify";
         seed_binding(reference, 7);
 
@@ -10536,6 +10544,8 @@ mod tests {
 
     #[test]
     fn cancelling_the_wrong_timer_id_does_not_stop_the_armed_one() {
+        // #761: arms a T3592 in GSM_PROCEDURE_TIMERS, which the exhaust test sweeps.
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.blocking_lock();
         let reference = "n77-timer-mismatch";
         gsm_procedure_timers()
             .lock()

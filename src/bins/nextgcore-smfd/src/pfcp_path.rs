@@ -1243,25 +1243,23 @@ pub(crate) static N4_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::con
 /// #723: a test that reaches [`PfcpClient::teardown_association`] must hold BOTH
 /// [`crate::context::PROCESS_STATE_TEST_LOCK`] and [`N4_TEST_LOCK`].
 ///
-/// The teardown is process-wide: it POSTs to every seeded session's AMF callback
-/// (the policy bindings, under the ambient lock), deletes every EPC PDN connection,
-/// and empties the global `pfcp_sessions` map (under this one). The #665 hostname
-/// test reached it holding neither, and wiped the #672 restoration test's session
-/// mid-assertion 20 runs out of 20.
-///
-/// A lock cannot say WHO holds it, so this catches the omission whenever the
-/// offending test runs with nobody else holding the locks — always under
-/// `--test-threads=1`, and when the test is run on its own — rather than leaving it
-/// to show up as a sibling's flake.
+/// The teardown is process-wide: it releases every seeded session through its AMF
+/// callback (the policy bindings, under the ambient lock), deletes every EPC PDN
+/// connection, and empties the global `pfcp_sessions` map (under this one). The #665
+/// hostname test reached it holding neither, and wiped the #672 restoration test's
+/// session mid-assertion 20 runs out of 20. See
+/// [`crate::context::require_test_lock`] for what the check can and cannot see.
 #[cfg(test)]
 fn assert_teardown_is_serialised() {
-    assert!(
-        crate::context::PROCESS_STATE_TEST_LOCK.try_lock().is_err(),
-        "a test reached teardown_association without PROCESS_STATE_TEST_LOCK (#723)"
+    crate::context::require_test_lock(
+        &crate::context::PROCESS_STATE_TEST_LOCK,
+        "PROCESS_STATE_TEST_LOCK",
+        "PfcpClient::teardown_association",
     );
-    assert!(
-        N4_TEST_LOCK.try_lock().is_err(),
-        "a test reached teardown_association without N4_TEST_LOCK (#723)"
+    crate::context::require_test_lock(
+        &N4_TEST_LOCK,
+        "N4_TEST_LOCK",
+        "PfcpClient::teardown_association",
     );
 }
 
