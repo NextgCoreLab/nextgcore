@@ -293,33 +293,41 @@ pub fn mme_s6a_process_inbound(inbound: &crate::fd_path::InboundS6aRequest) -> S
             };
             match action {
                 ClrAction::DetachUe { reattach_required } => {
+                    // TS 29.272 §7.3.152 / TS 23.401 §5.3.8.4 (#733): the detach
+                    // type follows the CLR-Flags Reattach-Required bit, and the
+                    // detach is the supervised one (T3422, TS 24.301 §5.5.2.3).
+                    let detach_type = if reattach_required {
+                        crate::emm_build::DetachTypeToUe::ReAttachRequired
+                    } else {
+                        crate::emm_build::DetachTypeToUe::ReAttachNotRequired
+                    };
+                    let _ = enb_ue_id;
+                    // §5.3.8.4 step 3: the PDN connections still exist at the
+                    // gateways, so each is deleted there before the local
+                    // contexts go.
+                    if let Err(e) = crate::gtp_path::send_delete_all_sessions(
+                        ctx,
+                        None,
+                        ue_id,
+                        crate::s11_build::GtpDeleteAction::NoAction,
+                    ) {
+                        log::warn!(
+                            "[{}] HSS-initiated detach: Delete Session Requests not all sent: {e}",
+                            inbound.imsi_bcd
+                        );
+                    }
+                    let outcome = crate::network_detach::mme_initiated_detach(
+                        ctx,
+                        ue_id,
+                        detach_type,
+                        "a Cancel Location (subscription withdrawal) from the HSS",
+                    );
                     log::info!(
-                        "[{}] Network-initiated detach (reattach_required={})",
+                        "[{}] HSS-initiated detach ({detach_type:?}, Reattach-Required={}): \
+                         {outcome:?}",
                         inbound.imsi_bcd,
                         reattach_required
                     );
-                    let enb_ue = ctx.enb_ue_find_by_id(enb_ue_id);
-                    if let Some(enb_ue) = enb_ue {
-                        let mut pool = ctx.mme_ue_pool.write().unwrap();
-                        if let Some(mme_ue) = pool.get_mut(&ue_id) {
-                            crate::nas_path::nas_eps_send_detach_request(
-                                mme_ue,
-                                &enb_ue,
-                                crate::emm_build::DetachTypeToUe::ReAttachRequired,
-                            )
-                            .map_err(|e| {
-                                log::error!(
-                                    "[{}] Detach Request send failed: {e:?}",
-                                    inbound.imsi_bcd
-                                );
-                                S6aError::NetworkFailure
-                            })?;
-                        }
-                    } else {
-                        // UE not connected: implicit detach, remove context
-                        log::info!("[{}] UE not connected; implicit detach", inbound.imsi_bcd);
-                        ctx.mme_ue_remove(ue_id);
-                    }
                 }
                 ClrAction::RemoveContext => {
                     ctx.mme_ue_remove(ue_id);
@@ -843,6 +851,69 @@ mod tests {
             detach.get(7).copied(),
             Some(crate::emm_build::NasEpsMessageType::DetachRequest as u8)
         );
+    }
+
+    /// #733, TS 29.272 §7.3.152 / TS 23.401 §5.3.8.4: the detach type of the
+    /// DETACH REQUEST follows the CLR-Flags Reattach-Required bit, and the
+    /// detach is the supervised one: T3422 armed, the UE in the network-detach
+    /// state, so DETACH ACCEPT completes it. Before #733 the type was always
+    /// "re-attach required" and T3422 never ran.
+    #[test]
+    fn a_cancel_location_detach_follows_reattach_required_and_arms_t3422() {
+        for (imsi, enb_ue_s1ap_id, flags, expected) in [
+            (
+                "999990000000733",
+                733,
+                0,
+                crate::emm_build::DetachTypeToUe::ReAttachNotRequired,
+            ),
+            (
+                "999990000000734",
+                734,
+                nextgcore_diameter::s6a::clr_flags::REATTACH_REQUIRED,
+                crate::emm_build::DetachTypeToUe::ReAttachRequired,
+            ),
+        ] {
+            let mme_ue_id = seed_connected_ue(imsi, enb_ue_s1ap_id);
+            let ctx = crate::context::mme_self();
+            let inbound = crate::fd_path::InboundS6aRequest {
+                imsi_bcd: imsi.to_string(),
+                message: crate::fd_path::S6aMessage::Clr(ClrMessage {
+                    cancellation_type: cancellation_type::SUBSCRIPTION_WITHDRAWAL,
+                    clr_flags: flags,
+                }),
+            };
+            mme_s6a_process_inbound(&inbound).expect("a known UE must be applied");
+
+            let ue = ctx
+                .mme_ue_find_by_id(mme_ue_id)
+                .expect("waits for DETACH ACCEPT");
+            assert!(ue.t3422.is_running(), "T3422 supervises the detach");
+            assert_eq!(
+                ue.nas_eps.type_,
+                crate::context::MmeEpsType::DetachRequestToUe
+            );
+            assert_eq!(ue.network_detach_type, Some(expected));
+            let detach = ue
+                .t3422
+                .pkbuf
+                .as_ref()
+                .expect("the DETACH REQUEST is stored");
+            assert_eq!(
+                detach.get(7).copied(),
+                Some(crate::emm_build::NasEpsMessageType::DetachRequest as u8)
+            );
+            assert_eq!(
+                detach.get(8).map(|o| o & 0x07),
+                Some(expected as u8),
+                "detach type on the wire (TS 24.301 §9.9.3.7)"
+            );
+            // DETACH ACCEPT now completes it and the context goes.
+            assert!(crate::network_detach::complete_mme_initiated_detach(
+                ctx, mme_ue_id
+            ));
+            assert!(ctx.mme_ue_find_by_id(mme_ue_id).is_none());
+        }
     }
 
     #[test]

@@ -27,6 +27,7 @@
 
 use std::time::{Duration, Instant};
 
+use crate::context::MmeEpsType;
 use crate::context::{EnbUe, MmeContext, MmeUe, NEXTGCORE_INVALID_POOL_ID};
 use crate::nas_path;
 
@@ -173,6 +174,20 @@ fn handle_expiry(ctx: &MmeContext, mme_ue_id: u64, timer: NasTimer) {
             return;
         };
 
+        // #732: T3422 supervises the network-initiated detach only while that
+        // detach is the UE's procedure. An ATTACH that aborted it (TS 24.301
+        // §5.5.2.3.5 d) stops the timer; this catches any path that did not, so
+        // a stale DETACH REQUEST is never resent and a re-attaching UE is never
+        // released by the fifth expiry.
+        if timer == NasTimer::T3422 && mme_ue.nas_eps.type_ != MmeEpsType::DetachRequestToUe {
+            timer.on(mme_ue).stop();
+            log::info!(
+                "[{}] T3422 expired, but no network-initiated detach is in progress; stopped",
+                mme_ue.imsi_bcd
+            );
+            return;
+        }
+
         let state = timer.on(mme_ue);
         // Re-check under the write lock against a fresh instant: an uplink
         // message may have stopped or re-armed this timer between the sweep's
@@ -236,8 +251,11 @@ fn handle_expiry(ctx: &MmeContext, mme_ue_id: u64, timer: NasTimer) {
             "T3422 exhausted its {MAX_RETRANSMISSIONS} retransmissions for UE {mme_ue_id}; \
              detaching it locally and releasing the S1 connection"
         );
-        crate::network_detach::complete_mme_initiated_detach(ctx, mme_ue_id);
-        crate::nas_dispatch::release_ue_context(ctx, &enb_ue);
+        // Only a detach that is still the procedure releases: the UE may have
+        // started another one in the meantime (#732).
+        if crate::network_detach::complete_mme_initiated_detach(ctx, mme_ue_id) {
+            crate::nas_dispatch::release_ue_context(ctx, &enb_ue);
+        }
         return;
     }
 
@@ -335,6 +353,53 @@ mod tests {
         force_expiry(&ctx, mme_ue_id, NasTimer::T3422);
         expire_nas_timers(&ctx, Instant::now());
         assert!(ctx.mme_ue_find_by_id(mme_ue_id).is_none());
+    }
+
+    /// #732: once the detach is no longer the UE's procedure, T3422 neither
+    /// resends the stale DETACH REQUEST nor, on its fifth expiry, releases the
+    /// UE. Before #732 the fifth expiry released a re-attaching UE.
+    #[test]
+    fn t3422_is_inert_once_the_detach_is_not_the_procedure() {
+        let ctx = test_ctx();
+        let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+        let enb_ue_id = ctx.enb_ue_add(enb_id, 100);
+        let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
+        ctx.enb_ue_associate_mme_ue(enb_ue_id, mme_ue_id);
+        crate::network_detach::mme_initiated_detach(
+            &ctx,
+            mme_ue_id,
+            crate::emm_build::DetachTypeToUe::ReAttachRequired,
+            "test",
+        );
+        // Another procedure took over without stopping the timer.
+        ctx.mme_ue_pool
+            .write()
+            .unwrap()
+            .get_mut(&mme_ue_id)
+            .unwrap()
+            .nas_eps
+            .type_ = MmeEpsType::AttachRequest;
+        force_expiry(&ctx, mme_ue_id, NasTimer::T3422);
+        expire_nas_timers(&ctx, Instant::now());
+        let ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert_eq!(
+            ue.t3422.retry_count, 0,
+            "the stale DETACH REQUEST is not resent"
+        );
+        assert!(!ue.t3422.is_running(), "T3422 stopped at its first expiry");
+        for _ in 0..MAX_RETRANSMISSIONS {
+            force_expiry(&ctx, mme_ue_id, NasTimer::T3422);
+            expire_nas_timers(&ctx, Instant::now());
+        }
+        let ue = ctx
+            .mme_ue_find_by_id(mme_ue_id)
+            .expect("the UE is not released");
+        assert_eq!(ue.t3422.retry_count, 0, "nothing was retransmitted");
+        assert!(!ue.t3422.is_running());
+        assert!(
+            ctx.enb_ue_find_by_id(enb_ue_id).is_some(),
+            "S1 not released"
+        );
     }
 
     #[test]

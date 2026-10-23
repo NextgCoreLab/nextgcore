@@ -84,6 +84,7 @@ pub fn mme_initiated_detach(
         let mut pool = ctx.mme_ue_pool.write().unwrap();
         if let Some(ue) = pool.get_mut(&mme_ue_id) {
             ue.nas_eps.type_ = MmeEpsType::DetachRequestToUe;
+            ue.network_detach_type = Some(detach_type);
             // A fresh procedure: a stale buffer would be resent instead.
             ue.t3422.stop();
             match crate::nas_path::nas_eps_send_detach_request(ue, &enb_ue, detach_type) {
@@ -115,6 +116,92 @@ pub fn mme_initiated_detach(
     );
     ctx.mme_ue_remove(mme_ue_id);
     DetachOutcome::ImplicitlyDetached
+}
+
+/// A UE-initiated EMM procedure that can collide with a network-initiated
+/// detach (TS 24.301 §5.5.2.3.5 d-f).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollidingProcedure {
+    /// ATTACH REQUEST (case d).
+    Attach,
+    /// TRACKING AREA UPDATE REQUEST (case e).
+    TrackingAreaUpdate,
+    /// SERVICE REQUEST, or EXTENDED SERVICE REQUEST for packet services (case f).
+    ServiceRequest,
+}
+
+/// What to do with a UE-initiated procedure that arrives while a network-initiated
+/// detach is pending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Collision {
+    /// No detach is pending, or the detach was aborted: process the message.
+    Proceed,
+    /// The detach is progressed: the message is ignored.
+    Ignore,
+}
+
+/// TS 24.301 §5.5.2.3.5 d-f (#732), for the detach types this MME sends
+/// ("re-attach required", "re-attach not required" without EMM cause #2; and
+/// "IMSI detach" for completeness):
+/// - ATTACH REQUEST: re-attach required, the detach is aborted (T3422 stopped)
+///   and the attach progressed; the EPS bearer contexts were already deleted by
+///   [`mme_initiated_detach`]. Re-attach not required: the ATTACH is ignored.
+///   IMSI detach: aborted, attach progressed.
+/// - TAU REQUEST: ignored, the detach progressed (IMSI detach: aborted, TAU
+///   progressed).
+/// - SERVICE REQUEST: the detach is progressed, so the request is ignored (IMSI
+///   detach: both progress).
+///
+/// Before #732 every one of them overwrote `nas_eps.type_` and left T3422
+/// running, so its fifth expiry released a UE that was re-attaching.
+pub fn on_colliding_procedure(
+    ctx: &MmeContext,
+    mme_ue_id: u64,
+    procedure: CollidingProcedure,
+) -> Collision {
+    use crate::emm_build::DetachTypeToUe as T;
+    let mut pool = ctx.mme_ue_pool.write().unwrap();
+    let Some(ue) = pool.get_mut(&mme_ue_id) else {
+        return Collision::Proceed;
+    };
+    if ue.nas_eps.type_ != MmeEpsType::DetachRequestToUe {
+        return Collision::Proceed;
+    }
+    let detach_type = ue.network_detach_type.unwrap_or(T::ReAttachRequired);
+    let abort = match (procedure, detach_type) {
+        (CollidingProcedure::Attach, T::ReAttachRequired | T::ImsiDetach) => true,
+        (CollidingProcedure::Attach, T::ReAttachNotRequired) => false,
+        (CollidingProcedure::TrackingAreaUpdate, T::ImsiDetach) => true,
+        (CollidingProcedure::TrackingAreaUpdate, _) => false,
+        (CollidingProcedure::ServiceRequest, T::ImsiDetach) => {
+            log::info!(
+                "[{}] {procedure:?} during an IMSI detach: both procedures progress \
+                 (TS 24.301 §5.5.2.3.5 f)",
+                ue.imsi_bcd
+            );
+            return Collision::Proceed;
+        }
+        (CollidingProcedure::ServiceRequest, _) => false,
+    };
+    if abort {
+        ue.t3422.stop();
+        ue.nas_eps.type_ = MmeEpsType::None;
+        ue.network_detach_type = None;
+        log::info!(
+            "[{}] {procedure:?} during a network-initiated detach ({detach_type:?}): the detach \
+             is aborted, T3422 stopped, and the {procedure:?} progressed (TS 24.301 \
+             §5.5.2.3.5)",
+            ue.imsi_bcd
+        );
+        Collision::Proceed
+    } else {
+        log::info!(
+            "[{}] {procedure:?} during a network-initiated detach ({detach_type:?}): ignored, \
+             the detach is progressed (TS 24.301 §5.5.2.3.5)",
+            ue.imsi_bcd
+        );
+        Collision::Ignore
+    }
 }
 
 /// The network side of a completed MME-initiated detach: DETACH ACCEPT arrived,
