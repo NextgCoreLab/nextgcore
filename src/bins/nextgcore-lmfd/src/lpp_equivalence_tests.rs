@@ -109,6 +109,7 @@ fn without_new_fields(
             assert_eq!(c.remove(k).as_deref(), Some("None"), "{what}: {k}");
         }
         check_dl_prs_id(c, what);
+        check_rstd_reference(c, what);
     }
     new
 }
@@ -123,6 +124,17 @@ fn check_dl_prs_id(c: &mut std::collections::BTreeMap<String, String>, what: &st
         assert_eq!(id, format!("Some({prs})"), "{what}");
     } else {
         assert!(id.starts_with("Some("), "{what}: {id}");
+    }
+}
+
+/// Remove `rstd_reference` (#824 review): only DL-TDOA cells carry one, and all
+/// cells of one DL-TDOA report carry the same.
+fn check_rstd_reference(c: &mut std::collections::BTreeMap<String, String>, what: &str) {
+    let r = c.remove("rstd_reference").expect("rstd_reference");
+    if what == "DL-TDOA" {
+        assert!(r.starts_with("Some("), "{what}: {r}");
+    } else {
+        assert_eq!(r, "None", "{what}");
     }
 }
 
@@ -190,6 +202,7 @@ fn every_report_adapts_as_the_old_adapters_did() {
             assert_eq!(new.remove("rtt_ns").as_deref(), Some("None"));
             assert_eq!(new.remove("gnb_rx_tx_ns").as_deref(), Some("None"));
             check_dl_prs_id(&mut new, "Multi-RTT");
+            check_rstd_reference(&mut new, "Multi-RTT");
             let mut old = old;
             old.remove("rtt_ns");
             assert_eq!(new, old, "Multi-RTT {}", f[0]);
@@ -199,12 +212,23 @@ fn every_report_adapts_as_the_old_adapters_did() {
             "{:?}",
             codec_glue::lpp_dl_tdoa_provide_to_measurements(&g)
         ));
-        assert_eq!(
-            without_new_fields(tdoa, "DL-TDOA"),
-            cells_of(f[3]),
-            "DL-TDOA {}",
-            f[0]
-        );
+        // An open-ended RSTD report value (TS 38.133 §10.1.23.3) is no longer
+        // decoded: where the new adapter gives None, the captured value must be
+        // a first or last bin, ≈ ±501009 ns.
+        let mut captured = cells_of(f[3]);
+        let new = without_new_fields(tdoa, "DL-TDOA");
+        for (n_cell, c_cell) in new.iter().zip(captured.iter_mut()) {
+            if n_cell["rstd_ns"] == "None" && c_cell["rstd_ns"] != "None" {
+                let x = some_f64(&c_cell["rstd_ns"]);
+                assert!(
+                    x.abs() >= 501_009.0,
+                    "DL-TDOA {}: {x} is not an open-ended bin",
+                    f[0]
+                );
+                c_cell.insert("rstd_ns".into(), "None".into());
+            }
+        }
+        assert_eq!(new, captured, "DL-TDOA {}", f[0]);
         let (id, _) = codec_glue::decode_lpp_provide_report(&bytes).unwrap();
         assert_eq!(Some(id), codec_glue::extract_lpp_request_id(&g));
         n += 1;

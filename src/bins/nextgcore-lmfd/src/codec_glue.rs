@@ -591,7 +591,8 @@ fn arm_max(k: i8) -> u32 {
     }
 }
 
-/// TS 38.133 §10.1.25.3: the first and last report values are open-ended bins
+/// TS 38.133 §10.1.25.3 (UE Rx–Tx) and §10.1.23.3 (NR-RSTD), which share the
+/// arms: the first and last report values are open-ended bins
 /// (`T ≤ −985024·T_c` and `T > 985024·T_c`), not measurements. A saturated half
 /// is not a usable RTT half, so it is not decoded (#812 review).
 fn is_open_ended(r: TimeReport) -> bool {
@@ -704,6 +705,7 @@ fn measured_results_element_to_cell(elem: &lpp::MeasuredResultsElement) -> CellM
         rtt_ns: None,
         rstd_ns: None,
         ue_rx_tx_ns: None,
+        rstd_reference: None,
         gnb_rx_tx_ns: None,
         dl_prs_id: None,
     }
@@ -798,6 +800,7 @@ pub fn lpp_multi_rtt_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<Cell
                 rstd_ns: None,
                 // None for a saturated (open-ended) report value.
                 ue_rx_tx_ns: ue_rx_tx_to_signed_ns(rx_tx_report(&elem.nr_ue_rx_tx_time_diff_r16)),
+                rstd_reference: None,
                 gnb_rx_tx_ns: None,
                 dl_prs_id: Some(elem.dl_prs_id_r16.0),
             }
@@ -856,6 +859,7 @@ pub fn lpp_dl_tdoa_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<CellMe
         return vec![];
     };
     let mut out = Vec::with_capacity(sig.nr_dl_tdoa_meas_list_r16.0.len() + 1);
+    let reference = sig.dl_prs_reference_info_r16.dl_prs_id_r16.0;
     // Reference TRP: RSTD ≡ 0 by definition.
     out.push(CellMeasurement {
         nr_cgi: format!("prs-{}", sig.dl_prs_reference_info_r16.dl_prs_id_r16.0),
@@ -866,6 +870,7 @@ pub fn lpp_dl_tdoa_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<CellMe
         rtt_ns: None,
         rstd_ns: Some(0.0),
         ue_rx_tx_ns: None,
+        rstd_reference: Some(reference),
         gnb_rx_tx_ns: None,
         dl_prs_id: Some(sig.dl_prs_reference_info_r16.dl_prs_id_r16.0),
     });
@@ -885,8 +890,13 @@ pub fn lpp_dl_tdoa_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<CellMe
             timing_advance: None,
             aoa: None,
             rtt_ns: None,
-            rstd_ns: Some(nrrstd_to_signed_ns(rstd_report(&elem.nr_rstd_r16))),
+            // TS 38.133 §10.1.23.3: the first and last report values are
+            // open-ended bins, not measurements, so they are not decoded.
+            rstd_ns: Some(rstd_report(&elem.nr_rstd_r16))
+                .filter(|r| !is_open_ended(*r))
+                .map(nrrstd_to_signed_ns),
             ue_rx_tx_ns: None,
+            rstd_reference: Some(reference),
             gnb_rx_tx_ns: None,
             dl_prs_id: Some(elem.dl_prs_id_r16.0),
         });

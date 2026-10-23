@@ -2480,6 +2480,7 @@ async fn handle_nrppa_report(request: &SbiRequest) -> SbiResponse {
                     rtt_ns: c.get("rttNs").and_then(|v| v.as_u64()),
                     rstd_ns: c.get("rstdNs").and_then(|v| v.as_f64()),
                     ue_rx_tx_ns: c.get("ueRxTxNs").and_then(|v| v.as_f64()),
+                    rstd_reference: None,
                     gnb_rx_tx_ns: c.get("gnbRxTxNs").and_then(|v| v.as_f64()),
                     dl_prs_id: None,
                 })
@@ -3976,6 +3977,7 @@ mod tests {
                     rtt_ns: None,
                     rstd_ns: None,
                     ue_rx_tx_ns: None,
+                    rstd_reference: None,
                     gnb_rx_tx_ns: None,
                     dl_prs_id: None,
                 }],
@@ -4864,6 +4866,7 @@ lmf:
                     rtt_ns: None,
                     rstd_ns: None,
                     ue_rx_tx_ns: None,
+                    rstd_reference: None,
                     gnb_rx_tx_ns: None,
                     dl_prs_id: None,
                 }],
