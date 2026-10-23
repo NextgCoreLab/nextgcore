@@ -1,146 +1,16 @@
-//! NUDM UEAU Request Builders
+//! NUDM UEAU request helpers
 //!
-//! Port of src/ausf/nudm-build.c - NUDM UEAU request builders
+//! Port of src/ausf/nudm-build.c. The live Nudm_UEAuthentication requests
+//! are built and sent by `app` (`send_udm_generate_auth_data` /
+//! `send_udm_auth_result`). The C port's synchronous request builders were
+//! only reachable from the deleted per-UE FSM (#654); what is left here is
+//! shared with the live path.
 
-use crate::context::{ausf_self, AuthResult, AuthType};
-
-/// Resynchronization info for authentication
+/// Resynchronization info for authentication (TS 29.503 ResynchronizationInfo)
 #[derive(Debug, Clone)]
 pub struct ResynchronizationInfo {
     pub rand: String,
     pub auts: String,
-}
-
-/// Authentication info request
-#[derive(Debug, Clone)]
-pub struct AuthenticationInfoRequest {
-    pub serving_network_name: String,
-    pub ausf_instance_id: String,
-    pub resynchronization_info: Option<ResynchronizationInfo>,
-}
-
-/// Auth event for result confirmation
-#[derive(Debug, Clone)]
-pub struct AuthEvent {
-    pub time_stamp: String,
-    pub nf_instance_id: String,
-    pub success: bool,
-    pub auth_type: AuthType,
-    pub serving_network_name: String,
-    pub auth_removal_ind: Option<bool>,
-}
-
-/// SBI request representation
-#[derive(Debug, Clone)]
-pub struct SbiRequest {
-    pub method: String,
-    pub service_name: String,
-    pub api_version: String,
-    pub resource_components: Vec<String>,
-    pub body: Option<String>,
-}
-
-/// Build NUDM UEAU get request (POST /{suci}/security-information/generate-auth-data)
-///
-/// Port of ausf_nudm_ueau_build_get()
-pub fn ausf_nudm_ueau_build_get(
-    ausf_ue_id: u64,
-    resync_info: Option<&ResynchronizationInfo>,
-) -> Option<SbiRequest> {
-    let ctx = ausf_self();
-    let context = ctx.read().unwrap();
-
-    let ausf_ue = context.ue_find_by_id(ausf_ue_id)?;
-
-    let serving_network_name = ausf_ue.serving_network_name.as_ref()?;
-
-    // Build AuthenticationInfoRequest
-    let auth_info_request = AuthenticationInfoRequest {
-        serving_network_name: serving_network_name.clone(),
-        ausf_instance_id: get_nf_instance_id(),
-        resynchronization_info: resync_info.cloned(),
-    };
-
-    // Serialize to JSON
-    let body = serde_json::to_string(&auth_info_request_to_json(&auth_info_request)).ok();
-
-    Some(SbiRequest {
-        method: "POST".to_string(),
-        service_name: "nudm-ueau".to_string(),
-        api_version: "v1".to_string(),
-        resource_components: vec![
-            ausf_ue.suci.clone(),
-            "security-information".to_string(),
-            "generate-auth-data".to_string(),
-        ],
-        body,
-    })
-}
-
-/// Build NUDM UEAU result confirmation inform request (POST /{supi}/auth-events)
-///
-/// Port of ausf_nudm_ueau_build_result_confirmation_inform()
-pub fn ausf_nudm_ueau_build_result_confirmation_inform(ausf_ue_id: u64) -> Option<SbiRequest> {
-    let ctx = ausf_self();
-    let context = ctx.read().unwrap();
-
-    let ausf_ue = context.ue_find_by_id(ausf_ue_id)?;
-    let supi = ausf_ue.supi.as_ref()?;
-    let serving_network_name = ausf_ue.serving_network_name.as_ref()?;
-
-    // Build AuthEvent
-    let auth_event = AuthEvent {
-        time_stamp: get_current_timestamp(),
-        nf_instance_id: get_nf_instance_id(),
-        success: ausf_ue.auth_result == AuthResult::AuthenticationSuccess,
-        auth_type: ausf_ue.auth_type,
-        serving_network_name: serving_network_name.clone(),
-        auth_removal_ind: None,
-    };
-
-    // Serialize to JSON
-    let body = serde_json::to_string(&auth_event_to_json(&auth_event)).ok();
-
-    Some(SbiRequest {
-        method: "POST".to_string(),
-        service_name: "nudm-ueau".to_string(),
-        api_version: "v1".to_string(),
-        resource_components: vec![supi.clone(), "auth-events".to_string()],
-        body,
-    })
-}
-
-/// Build NUDM UEAU auth removal indication request (PUT /{supi}/auth-events)
-///
-/// Port of ausf_nudm_ueau_build_auth_removal_ind()
-pub fn ausf_nudm_ueau_build_auth_removal_ind(ausf_ue_id: u64) -> Option<SbiRequest> {
-    let ctx = ausf_self();
-    let context = ctx.read().unwrap();
-
-    let ausf_ue = context.ue_find_by_id(ausf_ue_id)?;
-    let supi = ausf_ue.supi.as_ref()?;
-    let serving_network_name = ausf_ue.serving_network_name.as_ref()?;
-
-    // Build AuthEvent with auth_removal_ind = true
-    let auth_event = AuthEvent {
-        time_stamp: get_current_timestamp(),
-        nf_instance_id: get_nf_instance_id(),
-        success: true,
-        auth_type: ausf_ue.auth_type,
-        serving_network_name: serving_network_name.clone(),
-        auth_removal_ind: Some(true),
-    };
-
-    // Serialize to JSON
-    let body = serde_json::to_string(&auth_event_to_json(&auth_event)).ok();
-
-    Some(SbiRequest {
-        method: "PUT".to_string(),
-        service_name: "nudm-ueau".to_string(),
-        api_version: "v1".to_string(),
-        resource_components: vec![supi.clone(), "auth-events".to_string()],
-        body,
-    })
 }
 
 /// Get current timestamp in ISO 8601 format
@@ -203,57 +73,6 @@ fn is_leap_year(year: u64) -> bool {
     (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
-/// Get the AUSF NF instance ID for the inert FSM-path request builders.
-///
-/// ausfd-09: the LIVE Nudm request path (`send_udm_generate_auth_data` in
-/// main.rs) resolves the real registered NF instance id from the SBI context
-/// (`get_self_instance().await`). These synchronous builders are the legacy
-/// state-machine path and cannot await the async accessor, so they retain the
-/// static fallback used when no self instance has been registered yet.
-fn get_nf_instance_id() -> String {
-    "ausf-instance-id".to_string()
-}
-
-/// Convert AuthenticationInfoRequest to JSON value
-fn auth_info_request_to_json(req: &AuthenticationInfoRequest) -> serde_json::Value {
-    let mut json = serde_json::json!({
-        "servingNetworkName": req.serving_network_name,
-        "ausfInstanceId": req.ausf_instance_id,
-    });
-
-    if let Some(ref resync) = req.resynchronization_info {
-        json["resynchronizationInfo"] = serde_json::json!({
-            "rand": resync.rand,
-            "auts": resync.auts,
-        });
-    }
-
-    json
-}
-
-/// Convert AuthEvent to JSON value
-fn auth_event_to_json(event: &AuthEvent) -> serde_json::Value {
-    let auth_type_str = match event.auth_type {
-        AuthType::FiveGAka => "5G_AKA",
-        AuthType::EapAkaPrime => "EAP_AKA_PRIME",
-        AuthType::EapTls => "EAP_TLS",
-    };
-
-    let mut json = serde_json::json!({
-        "timeStamp": event.time_stamp,
-        "nfInstanceId": event.nf_instance_id,
-        "success": event.success,
-        "authType": auth_type_str,
-        "servingNetworkName": event.serving_network_name,
-    });
-
-    if let Some(auth_removal_ind) = event.auth_removal_ind {
-        json["authRemovalInd"] = serde_json::json!(auth_removal_ind);
-    }
-
-    json
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,71 +101,5 @@ mod tests {
         assert!(is_leap_year(2000));
         assert!(!is_leap_year(1900));
         assert!(is_leap_year(2024));
-    }
-
-    #[test]
-    fn test_auth_info_request_to_json() {
-        let req = AuthenticationInfoRequest {
-            serving_network_name: "5G:mnc001.mcc001.3gppnetwork.org".to_string(),
-            ausf_instance_id: "test-ausf".to_string(),
-            resynchronization_info: None,
-        };
-
-        let json = auth_info_request_to_json(&req);
-        assert_eq!(
-            json["servingNetworkName"],
-            "5G:mnc001.mcc001.3gppnetwork.org"
-        );
-        assert_eq!(json["ausfInstanceId"], "test-ausf");
-    }
-
-    #[test]
-    fn test_auth_info_request_with_resync() {
-        let req = AuthenticationInfoRequest {
-            serving_network_name: "5G:mnc001.mcc001.3gppnetwork.org".to_string(),
-            ausf_instance_id: "test-ausf".to_string(),
-            resynchronization_info: Some(ResynchronizationInfo {
-                rand: "0123456789abcdef0123456789abcdef".to_string(),
-                auts: "fedcba9876543210fedcba9876543210".to_string(),
-            }),
-        };
-
-        let json = auth_info_request_to_json(&req);
-        assert!(json["resynchronizationInfo"].is_object());
-        assert_eq!(
-            json["resynchronizationInfo"]["rand"],
-            "0123456789abcdef0123456789abcdef"
-        );
-    }
-
-    #[test]
-    fn test_auth_event_to_json() {
-        let event = AuthEvent {
-            time_stamp: "2024-01-01T00:00:00Z".to_string(),
-            nf_instance_id: "test-ausf".to_string(),
-            success: true,
-            auth_type: AuthType::FiveGAka,
-            serving_network_name: "5G:mnc001.mcc001.3gppnetwork.org".to_string(),
-            auth_removal_ind: None,
-        };
-
-        let json = auth_event_to_json(&event);
-        assert_eq!(json["success"], true);
-        assert_eq!(json["authType"], "5G_AKA");
-    }
-
-    #[test]
-    fn test_auth_event_with_removal_ind() {
-        let event = AuthEvent {
-            time_stamp: "2024-01-01T00:00:00Z".to_string(),
-            nf_instance_id: "test-ausf".to_string(),
-            success: true,
-            auth_type: AuthType::FiveGAka,
-            serving_network_name: "5G:mnc001.mcc001.3gppnetwork.org".to_string(),
-            auth_removal_ind: Some(true),
-        };
-
-        let json = auth_event_to_json(&event);
-        assert_eq!(json["authRemovalInd"], true);
     }
 }

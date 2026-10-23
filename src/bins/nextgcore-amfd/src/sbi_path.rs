@@ -2755,13 +2755,19 @@ pub fn sm_context_status_uri(supi: &str, psi: u8) -> String {
 }
 
 /// The absolute Nudm_UECM `deregCallbackUri` the AMF registers for `supi`
-/// (WSB-4, TS 29.503 §5.3.2.3.2). Routed by `namf_server` at
-/// `POST /namf-callback/v1/{supi}/dereg-notify`.
-pub fn dereg_callback_uri(supi: &str) -> String {
+/// (WSB-4, TS 29.503 §5.3.2.3.2), carrying the registration's `token` (#753).
+/// Routed by `namf_server` at `POST /namf-callback/v1/{supi}/dereg-notify/{token}`.
+/// The URI is opaque to the UDM, which POSTs to it verbatim.
+pub fn dereg_callback_uri(supi: &str, token: &str) -> String {
     format!(
-        "{}/namf-callback/v1/{supi}/dereg-notify",
+        "{}/namf-callback/v1/{supi}/dereg-notify/{token}",
         advertised_sbi_base()
     )
+}
+
+/// A fresh `deregCallbackUri` token for one Nudm_UECM registration (#753).
+pub fn new_dereg_callback_token() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 /// This AMF's configured GUAMIs as a TS 29.571 `Guami` JSON array, for the
@@ -2844,6 +2850,7 @@ pub async fn call_udm_uecm_registration(
     udm_port: u16,
     supi: &str,
     amf_instance_id: &str,
+    dereg_token: &str,
     guami_plmn_mcc: &str,
     guami_plmn_mnc: &str,
     amf_id_hex: &str,
@@ -2857,7 +2864,7 @@ pub async fn call_udm_uecm_registration(
         "amfInstanceId": amf_instance_id,
         // WSB-4: absolute URI (was relative) so udmd can POST the
         // DeregistrationNotification back (TS 29.503 §5.3.2.3.2).
-        "deregCallbackUri": dereg_callback_uri(supi),
+        "deregCallbackUri": dereg_callback_uri(supi, dereg_token),
         "guami": {
             "plmnId": { "mcc": guami_plmn_mcc, "mnc": guami_plmn_mnc },
             "amfId": amf_id_hex,
@@ -4345,6 +4352,88 @@ mod tests {
             "namf-comm",
             "the service the AMF both serves and consumes (TS 29.518 §6.1)"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // #753: the Nudm_UECM registration names this AMF by its pinnable
+    // nfInstanceId, and its deregCallbackUri carries the registration's token.
+    // ------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_uecm_registration_carries_the_nf_instance_id_and_the_dereg_token() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>> =
+            Default::default();
+        let sink = std::sync::Arc::clone(&seen);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        server
+            .start(move |req: nextgcore_sbi::message::SbiRequest| {
+                let sink = std::sync::Arc::clone(&sink);
+                async move {
+                    let body = req
+                        .http
+                        .content
+                        .as_deref()
+                        .and_then(|c| serde_json::from_str(c).ok())
+                        .unwrap_or_default();
+                    sink.lock()
+                        .expect("sink")
+                        .push((req.header.uri.clone(), body));
+                    nextgcore_sbi::message::SbiResponse::with_status(201)
+                }
+            })
+            .await
+            .expect("stand-in UDM starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let token = new_dereg_callback_token();
+        assert_ne!(
+            token,
+            new_dereg_callback_token(),
+            "one token per registration"
+        );
+        let nf_id =
+            nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf);
+        call_udm_uecm_registration(
+            "127.0.0.1",
+            addr.port(),
+            "imsi-001010000075302",
+            &crate::ngap_path::amf_instance_id_for_tests(),
+            &token,
+            "001",
+            "01",
+            "020040",
+        )
+        .await
+        .expect("registered");
+        let seen = seen.lock().expect("seen").clone();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0]
+            .0
+            .ends_with("/nudm-uecm/v1/imsi-001010000075302/registrations/amf-3gpp-access"));
+        assert_eq!(
+            seen[0].1["amfInstanceId"], nf_id,
+            "the pinnable nfInstanceId, the one the NRF knows"
+        );
+        let cb = seen[0].1["deregCallbackUri"]
+            .as_str()
+            .expect("deregCallbackUri");
+        assert!(
+            cb.ends_with(&format!(
+                "/namf-callback/v1/imsi-001010000075302/dereg-notify/{token}"
+            )),
+            "{cb}"
+        );
+        server.stop().await.expect("stop");
     }
 
     // ------------------------------------------------------------------

@@ -2855,6 +2855,7 @@ name = "nextgcore-nas"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "log",
  "nextgcore-core",
  "nextgcore-crypt",
  "proptest",
