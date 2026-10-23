@@ -5,9 +5,16 @@
 # k8s/monitoring/. Rationale in specs/fix-helm-chart-control-plane.md.
 
 global:
-  # A site/cluster identifier salted into derived NF instance ids (#753). Leave
-  # empty to use the kube-system namespace UID; set it for `helm template`, or
-  # when several clusters share one UDM/NRF.
+  # A site/cluster identifier salted into derived NF instance ids (#753). SET
+  # IT: it is the first choice. The fallback when it is empty reads the
+  # kube-system namespace UID with `lookup`, which:
+  #   - needs cluster-wide read on Namespaces (a namespace-scoped installer
+  #     cannot do it);
+  #   - always yields an empty salt under `helm template` and GitOps renderers
+  #     (ArgoCD, `helm template | kubectl apply`), so their ids differ from what
+  #     `helm install` derives for the same release.
+  # Use a value unique per cluster and stable for its life. Required when
+  # several clusters share one UDM/NRF.
   siteId: ""
   image:
     registry: ""
