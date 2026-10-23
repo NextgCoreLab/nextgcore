@@ -650,3 +650,164 @@ async fn a_setup_whose_send_fails_hands_the_accept_to_the_next_setup() {
     );
     assert_protected_service_accept(nas_pdu.as_deref().expect("PSI 2's setup carries it"));
 }
+
+// ---------------------------------------------------------------------------
+// #796: a PDU session establishment while no SMF is reachable (SMF restart)
+// ---------------------------------------------------------------------------
+
+/// A stand-in SMF that answers CreateSMContext 201 (`smContextRef` "est-796",
+/// an N1 and an N2 transfer), started on `listener`, recording each URI.
+async fn creating_smf_on(
+    listener: std::net::TcpListener,
+) -> (
+    nextgcore_sbi::server::SbiServer,
+    Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
+    let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+    let sink = Arc::clone(&seen);
+    let addr = listener.local_addr().expect("addr");
+    let server = nextgcore_sbi::server::SbiServer::on_listener(
+        nextgcore_sbi::server::SbiServerConfig::new(addr),
+        listener,
+    );
+    server
+        .start(move |req: SReq| {
+            let sink = Arc::clone(&sink);
+            async move {
+                sink.lock().expect("sink").push(req.header.uri.clone());
+                let body = serde_json::json!({
+                    "smContextRef": "est-796",
+                    "n1SmMsg": base64::engine::general_purpose::STANDARD
+                        .encode([0x2E, 0x05, 0x01, 0xC2]),
+                    "n2SmInfo": base64::engine::general_purpose::STANDARD
+                        .encode(transfer_for("est-796")),
+                });
+                SResp::with_status(201).with_body(body.to_string(), "application/json")
+            }
+        })
+        .await
+        .expect("stand-in SMF starts");
+    (server, seen)
+}
+
+/// A connected, registered UE whose UE context is up at the gNB, so a session
+/// setup is sent as soon as the SMF answers.
+fn ue_ready_for_sessions(server: &mut NgapServer, ue: u64, ran: u32) {
+    secured_registered_ue(server, ue, ran);
+    server.ue_auth_state.with_mut(ue, |s| {
+        s.initial_context_setup_response_received = true;
+    });
+}
+
+/// Make every waiting establishment due now.
+fn make_establishments_due(server: &mut NgapServer) {
+    let now = std::time::Instant::now();
+    for p in server.pending_establishments.values_mut() {
+        p.next_attempt = now;
+    }
+}
+
+/// #796, TS 23.502 §4.3.2.2.1. The UE asks for a PDU session while its only
+/// SMF is restarting (nothing listens). The AMF does not reject at once. It
+/// waits, sending nothing to the UE, then retries; the restarted SMF answers;
+/// the session is established: a PDU SESSION RESOURCE SETUP REQUEST reaches
+/// the gNB.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn an_establishment_while_the_smf_restarts_is_retried_and_succeeds() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    drop(listener); // the SMF is down: connection refused
+    let _env = super::SmfEnvGuard::set(port);
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_796_001u64, 96);
+    ue_ready_for_sessions(&mut server, ue, ran);
+
+    let request = [0x2E, 0x05, 0x01, 0xC1, 0xFF, 0xFF];
+    server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &request))
+        .await
+        .expect("handled");
+    assert!(
+        take_sent_ngap(&mut server).is_empty(),
+        "nothing to the UE yet: no 5GSM reject, no DL NAS Transport"
+    );
+    assert!(server.pending_establishments.contains_key(&(ue, 5)));
+
+    // The SMF comes back on the same address.
+    let (_smf, seen) =
+        creating_smf_on(std::net::TcpListener::bind(("127.0.0.1", port)).expect("rebind")).await;
+    make_establishments_due(&mut server);
+    server.process_pending_establishments().await;
+
+    assert_eq!(
+        seen.lock().expect("seen").len(),
+        1,
+        "the retry reached the restarted SMF"
+    );
+    assert!(server.pending_establishments.is_empty());
+    let sent: Vec<Sent> = take_sent_ngap(&mut server)
+        .into_iter()
+        .map(|(_, p)| decode_sent(&p))
+        .collect();
+    assert!(
+        sent.iter()
+            .any(|s| matches!(s, Sent::SetupRequest { items, .. }
+            if items.first().map(|i| i.psi) == Some(5))),
+        "the session is set up at the gNB: {sent:?}"
+    );
+    server.forget_ue(ue);
+}
+
+/// When no SMF comes back within the window, the UE is answered as TS 24.501
+/// prescribes for a routing failure (§5.4.5.2.5 a) 1), §5.4.5.3.1 e)): a DL NAS
+/// TRANSPORT carrying its own 5GSM message back, with 5GMM #90. The AMF does
+/// not fabricate a 5GSM reject. A UE retransmission does not extend the window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn an_establishment_with_no_smf_back_in_the_window_gets_payload_not_forwarded() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    drop(listener);
+    let _env = super::SmfEnvGuard::set(port);
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_796_002u64, 97);
+    ue_ready_for_sessions(&mut server, ue, ran);
+
+    let request = [0x2E, 0x05, 0x01, 0xC1, 0xFF, 0xFF];
+    server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &request))
+        .await
+        .expect("handled");
+    // The window started a while ago (the first failure is what counts).
+    let started = server.pending_establishments[&(ue, 5)].first_failure;
+    server
+        .pending_establishments
+        .get_mut(&(ue, 5))
+        .expect("waiting")
+        .first_failure = started - ESTABLISHMENT_RETRY_WINDOW;
+    // A UE retransmission meanwhile keeps that original start.
+    server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &request))
+        .await
+        .expect("handled");
+
+    assert!(server.pending_establishments.is_empty());
+    let sent: Vec<Sent> = take_sent_ngap(&mut server)
+        .into_iter()
+        .map(|(_, p)| decode_sent(&p))
+        .collect();
+    let [Sent::DownlinkNas { nas_pdu, .. }] = sent.as_slice() else {
+        panic!("one DL NAS Transport: {sent:?}");
+    };
+    use nextgcore_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
+    let Ok(FiveGmmMessage::DlNasTransport(dl)) =
+        parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&nas_pdu[7..]))
+    else {
+        panic!("a DL NAS TRANSPORT: {nas_pdu:02x?}");
+    };
+    assert_eq!(dl.gmm_cause, Some(90));
+    assert_eq!(dl.payload_container.data.to_vec(), request.to_vec());
+    server.forget_ue(ue);
+}
