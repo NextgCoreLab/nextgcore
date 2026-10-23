@@ -9479,39 +9479,23 @@ impl NgapServer {
             return Ok(());
         };
 
-        // The Target Identification the MME needs, built from the TargetID the gNB chose --
-        // relayed, not invented, because a target this AMF picked would route the preparation
-        // to an eNB the gNB did not select. TS 29.274 §8.51 Target Type 1 is `eNodeB ID`.
-        let target_identification = match &required.target_id {
-            nextgcore_ngap::types::TargetId::TargetGlobalNgEnbId {
-                plmn_identity,
-                ng_enb_id,
-                ..
-            } => crate::n26_build::encode_target_identification(
-                crate::n26_build::TARGET_TYPE_ENODEB,
-                plmn_identity,
-                &ng_enb_id.to_be_bytes(),
-            ),
-            // A `TargetRanNodeId` in a `fivegs-to-eps` preparation is what a gNB sends when it
-            // names the target by its Global RAN Node ID rather than as an ng-eNB. The PLMN and
-            // the node id are still what the MME needs, so the identification is built from
-            // them rather than the preparation being refused over an encoding preference.
-            nextgcore_ngap::types::TargetId::TargetRanNodeId {
-                global_ran_node_id,
-                selected_tai,
-                ..
-            } => {
-                let node_id = match global_ran_node_id {
-                    nextgcore_ngap::types::GlobalRanNodeId::GlobalGnbId { gnb_id, .. } => *gnb_id,
-                    nextgcore_ngap::types::GlobalRanNodeId::GlobalNgEnbId { ng_enb_id, .. } => {
-                        *ng_enb_id
-                    }
-                };
-                crate::n26_build::encode_target_identification(
-                    crate::n26_build::TARGET_TYPE_ENODEB,
-                    &selected_tai.tai_plmn,
-                    &node_id.to_be_bytes(),
+        let target_identification = eps_target_identification(&required.target_id);
+        let target_identification = match target_identification {
+            Ok(body) => body,
+            Err(why) => {
+                log::warn!(
+                    "HandoverRequired (fivegs-to-eps) for UE {}: {why}; answering Handover \
+                     Preparation Failure (ho-target-not-allowed) rather than sending the MME a \
+                     Target Identification for an eNB the gNB did not name",
+                    required.amf_ue_ngap_id
+                );
+                self.refuse_inter_system_preparation(
+                    association_id,
+                    required,
+                    nextgcore_ngap::types::CauseRadioNetwork::HoTargetNotAllowed,
                 )
+                .await?;
+                return Ok(());
             }
         };
 
@@ -14643,6 +14627,36 @@ pub async fn amf_ngap_poll() -> Result<bool> {
 // Tests
 // ============================================================================
 
+/// The TS 29.274 §8.51 Target Identification body for a `fivegs-to-eps` HandoverRequired's
+/// TargetID, or why there is none (#741).
+fn eps_target_identification(
+    target_id: &nextgcore_ngap::types::TargetId,
+) -> std::result::Result<bytes::Bytes, String> {
+    // The Target Identification the MME needs, built from the TargetID the gNB chose --
+    // relayed, not invented, because a target this AMF picked would route the preparation
+    // to an eNB the gNB did not select. TS 29.274 §8.51: a macro id is Target Type 1
+    // (Figure 8.51-2), a short or long macro id Target Type 4 (Figure 8.51-4), each with
+    // the selected EPS TAC (#741).
+    match target_id {
+        nextgcore_ngap::types::TargetId::TargetGlobalNgEnbId {
+            plmn_identity,
+            ng_enb_id,
+            selected_eps_tai,
+        } => crate::n26_build::encode_enb_target_identification(
+            plmn_identity,
+            *ng_enb_id,
+            selected_eps_tai.tac,
+        ),
+        // TS 38.413 §9.3.1.25: an NG-RAN target is a gNB or ng-eNB in 5GS, which an EPS
+        // handover cannot reach; the E-UTRAN alternative is the one that names an eNB and
+        // an EPS TAI. Building a Target Identification from a gNB id would ask the MME for
+        // an eNB that does not exist.
+        nextgcore_ngap::types::TargetId::TargetRanNodeId { .. } => Err(
+            "a fivegs-to-eps HandoverRequired names an NG-RAN node, not an E-UTRAN eNB".to_string(),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// Handler-level tests asserting what amfd SENDS (#760, ...), in their own file.
@@ -14651,6 +14665,88 @@ mod tests {
     use super::*;
     use crate::context::AmfContext;
     use tokio::sync::mpsc;
+
+    /// **#741.** From the gNB's HANDOVER REQUIRED octets to the TS 29.274 §8.51 Target
+    /// Identification the MME receives: each ngENB-ID length, through the production NGAP
+    /// decoder, becomes the body Figures 8.51-2 / 8.51-4 prescribe (golden octets written from
+    /// the figures), with the selected EPS TAC. An NG-RAN TargetID is refused.
+    ///
+    /// REVERT-VERIFIED: the pre-#741 body (Target Type 1, four raw id octets, no TAC) fails
+    /// every arm.
+    #[test]
+    fn a_fivegs_to_eps_target_becomes_the_figure_8_51_target_identification() {
+        use nextgcore_ngap::types::{EpsTai, HandoverType, NgEnbId, TargetId};
+        let plmn = [0x00, 0xF1, 0x10];
+        let cases: [(NgEnbId, [u8; 9]); 3] = [
+            (
+                NgEnbId::Macro(0x1_2345),
+                [0x01, 0x00, 0xF1, 0x10, 0x01, 0x23, 0x45, 0x00, 0x07],
+            ),
+            (
+                NgEnbId::LongMacro(0x1A_BCDE),
+                [0x04, 0x00, 0xF1, 0x10, 0x1A, 0xBC, 0xDE, 0x00, 0x07],
+            ),
+            (
+                NgEnbId::ShortMacro(0x2_ABCD),
+                [0x04, 0x00, 0xF1, 0x10, 0x82, 0xAB, 0xCD, 0x00, 0x07],
+            ),
+        ];
+        let required = |target_id: TargetId| nextgcore_ngap::types::HandoverRequired {
+            amf_ue_ngap_id: 7_741_001,
+            ran_ue_ngap_id: 9,
+            handover_type: HandoverType::FivegsToEps,
+            cause: nextgcore_ngap::types::Cause::RadioNetwork(
+                nextgcore_ngap::types::CauseRadioNetwork::HandoverDesirableForRadioReason,
+            ),
+            target_id,
+            pdu_session_list: vec![nextgcore_ngap::types::PduSessionResourceItemHoRqd {
+                pdu_session_id: 1,
+                transfer: vec![0x00],
+            }],
+            source_to_target_container: vec![0xAB; 4],
+            direct_forwarding_path_availability: None,
+        };
+        for (id, golden) in cases {
+            let bytes = nextgcore_ngap::builder::build_handover_required(&required(
+                TargetId::TargetGlobalNgEnbId {
+                    plmn_identity: plmn,
+                    ng_enb_id: id,
+                    selected_eps_tai: EpsTai {
+                        plmn_identity: plmn,
+                        tac: [0x00, 0x07],
+                    },
+                },
+            ))
+            .expect("build");
+            let crate::ngap_asn1::NasTransportDecode::Proceed { message, .. } =
+                crate::ngap_asn1::decode_handover_required_asn1(&bytes)
+            else {
+                panic!("{id:?} decodes");
+            };
+            assert_eq!(
+                eps_target_identification(&message.target_id)
+                    .expect("an eNB target")
+                    .as_ref(),
+                &golden,
+                "{id:?}"
+            );
+        }
+        let gnb = TargetId::TargetRanNodeId {
+            global_ran_node_id: nextgcore_ngap::types::GlobalRanNodeId::GlobalGnbId {
+                plmn_identity: plmn,
+                gnb_id: 0x7_4101,
+                gnb_id_len: 22,
+            },
+            selected_tai: nextgcore_ngap::types::TaiListItem {
+                tai_plmn: plmn,
+                tai_tac: [0, 0, 7],
+            },
+        };
+        assert!(
+            eps_target_identification(&gnb).is_err(),
+            "an NG-RAN node is not an EPS handover target"
+        );
+    }
 
     /// **#341's acceptance criterion.** A UE that the NGAP path registers must be
     /// resolvable by the Namf surface, through the same `find_ue_by_context_id`

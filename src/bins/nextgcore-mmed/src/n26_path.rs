@@ -932,23 +932,58 @@ fn handle_forward_relocation_request(
 
     let amf_teid = data.sender_fteid.as_ref().map(|f| f.teid).unwrap_or(0);
 
-    // A UE context to install into. The connected-mode case has no prior eNB UE context for this
-    // UE -- the UE is arriving from NG-RAN -- so one is allocated here, the same way
-    // `s1ap_handler::handle_handover_required` allocates a target context for an intra-LTE move.
+    // The target eNB is the one the Target Identification names (TS 29.274 §8.51, #741):
+    // Table 7.3.1-1 makes the IE conditional on, among others, a 5GS to EPS handover, and the
+    // source gNB chose that eNB. Admitting the UE onto any other connected eNB would prepare
+    // resources where the UE is not going.
     let ctx = mme_self();
-    let enb_id = match ctx
-        .enb_pool
-        .read()
-        .ok()
-        .and_then(|p| p.keys().copied().min())
-    {
+    let target_ie = nextgcore_gtp::v2::Gtp2IeType::TargetIdentification as u8;
+    let target = match data.target_identification.as_deref() {
+        None => {
+            log::error!(
+                "N26 Forward Relocation Request from {peer} (seq={seq}) has no Target \
+                 Identification, which Table 7.3.1-1 requires for a 5GS to EPS handover \
+                 (29274-j60.txt:18029); answering 'Conditional IE missing'"
+            );
+            let reject = n26_build::build_forward_relocation_rejection(
+                seq,
+                amf_teid,
+                n26_build::CAUSE_CONDITIONAL_IE_MISSING,
+                target_ie,
+                0,
+            );
+            send_response_from(inner, peer, &reject);
+            return;
+        }
+        Some(body) => match n26_build::parse_enb_target_identification(body) {
+            Ok(target) => target,
+            Err(why) => {
+                log::error!(
+                    "N26 Forward Relocation Request from {peer} (seq={seq}): {why}; answering \
+                     'Mandatory IE incorrect' (§7.7.8) naming the Target Identification"
+                );
+                let reject = n26_build::build_forward_relocation_rejection(
+                    seq,
+                    amf_teid,
+                    n26_build::CAUSE_MANDATORY_IE_INCORRECT,
+                    target_ie,
+                    0,
+                );
+                send_response_from(inner, peer, &reject);
+                return;
+            }
+        },
+    };
+    let enb_id = match select_target_enb(ctx, &target) {
         Some(id) => id,
         None => {
             log::warn!(
-                "N26 Forward Relocation Request from {peer}: no eNB is connected to this MME, so \
-                 there is no target to admit the UE onto. Answering 'Relocation failure' -- the \
-                 alternative is installing a context for a UE that can never be reached, which \
-                 would leak on every refused handover."
+                "N26 Forward Relocation Request from {peer}: target eNB {:#x} ({}-bit id) of \
+                 the named PLMN is not S1-connected to this MME, so there is no target to admit \
+                 the UE onto. Answering 'Relocation failure' -- installing a context for a UE \
+                 that can never be reached would leak on every refused handover.",
+                target.enb_id,
+                target.enb_id_bits
             );
             let reject = n26_build::build_forward_relocation_response(
                 seq,
@@ -1093,6 +1128,38 @@ fn handle_forward_relocation_request(
     // a record left behind would have a later intra-LTE handover for a recycled UE id send a
     // Forward Relocation Complete Notification to an AMF that is not expecting one.
     record_forward_relocation_source(mme_ue_id, ForwardRelocationSource { peer, amf_teid });
+}
+
+/// The S1-connected eNB a Target Identification names: same eNB id and PLMN, S1 Setup
+/// complete (#741). The eNB's S1AP Global eNB ID records only the id value, not which length
+/// it was sent with, so the match is on the value and the PLMN. A selected TAI the eNB did not
+/// announce in its S1 Setup is logged, not refused: the TAI does not address the eNB, and the
+/// eNB id and PLMN already do.
+fn select_target_enb(
+    ctx: &crate::context::MmeContext,
+    target: &n26_build::EnbTarget,
+) -> Option<u64> {
+    let pool = ctx.enb_pool.read().ok()?;
+    let (id, enb) = pool.iter().find(|(_, enb)| {
+        enb.state.s1_setup_success
+            && enb.enb_id_presence
+            && enb.enb_id == target.enb_id
+            && enb.plmn_id == target.plmn_id
+    })?;
+    if !enb.supported_ta_list.is_empty()
+        && !enb
+            .supported_ta_list
+            .iter()
+            .any(|tai| tai.tac == target.tac && tai.plmn_id == target.plmn_id)
+    {
+        log::warn!(
+            "N26 Forward Relocation target eNB {:#x} did not announce the selected EPS TAC \
+             {:#06x} in its S1 Setup; relocating to it anyway, as the eNB id names it",
+            target.enb_id,
+            target.tac
+        );
+    }
+    Some(*id)
 }
 
 /// Send a triggered message from the receive thread, caching it for retransmission.
@@ -1955,6 +2022,191 @@ mod tests {
         );
     }
 
+    /// **#741.** A Forward Relocation Request is answered according to the eNB its Target
+    /// Identification names, on the real N26 socket: no Target Identification is
+    /// 'Conditional IE missing' and a non-eNB Target Type is 'Mandatory IE incorrect', each
+    /// naming IE type 121 as the offending IE (§7.7.8); an eNB this MME has no S1 with is
+    /// 'Relocation failure'. Before #741 every one of them was admitted onto whichever
+    /// connected eNB had the lowest pool id.
+    #[test]
+    fn a_forward_relocation_request_is_answered_per_its_target_identification() {
+        use nextgcore_gtp::v2::{Gtp2FTeidIe, Gtp2IeType, Gtp2Message};
+        let _guard = lock_s11();
+        let ctx = mme_self();
+        ctx.init();
+        // A connected eNB that is NOT the target: before #741 the request would land on it.
+        let bystander = ctx.enb_add("127.0.0.1:47411".parse().unwrap());
+        ctx.enb_set_enb_id(bystander, 0x7_4101);
+        if let Some(enb) = ctx.enb_pool.write().unwrap().get_mut(&bystander) {
+            enb.plmn_id = crate::s11_build::decode_plmn_bcd(&[0x00, 0xF1, 0x10]).unwrap();
+            enb.state.s1_setup_success = true;
+        }
+
+        let amf = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        amf.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let server =
+            N26Server::open("127.0.0.1:0".parse().unwrap(), Gtp2XactConfig::default(), 3).unwrap();
+        let mme_addr = server.local_addr();
+        let mm = nextgcore_gtp::v2::Gtp2MmContextIe {
+            kasme: [0x41; 32],
+            ..Default::default()
+        };
+        // An installable PDN connection, so a request admitted onto the WRONG eNB would be
+        // ACCEPTED rather than fail for an unrelated reason.
+        let mut pdn = nextgcore_gtp::v2::Gtp2PdnConnectionIe::new();
+        pdn.add_ie(nextgcore_gtp::v2::Gtp2ApnIe::from_string("n26t741").to_ie(0));
+        pdn.add_ie(nextgcore_gtp::v2::Gtp2EbiIe::new(9).to_ie(0));
+        pdn.add_ie(Gtp2FTeidIe::new_ipv4(7, 0x0741_0BC1, [10, 7, 4, 1]).to_ie(0));
+        let mut bearer = nextgcore_gtp::v2::Gtp2BearerContextIe::new();
+        bearer.set_ebi(9);
+        bearer.set_bearer_qos(&nextgcore_gtp::v2::Gtp2BearerQosIe::new(9, 0, 0, 0, 0));
+        pdn.add_ie(bearer.to_ie(0));
+        pdn.add_ie(nextgcore_gtp::v2::Gtp2AmbrIe::new(1_000, 2_000).to_ie(0));
+        let ask = |seq: u32, target: &[u8]| -> (u8, Option<(u8, u8)>) {
+            let request = nextgcore_amfd::n26_build::build_forward_relocation_request(
+                seq,
+                Some("001010000000741"),
+                &Gtp2FTeidIe::new_ipv4(
+                    nextgcore_amfd::n26_path::N26_AMF_GTP_C,
+                    0x741,
+                    [127, 0, 0, 1],
+                ),
+                &mm,
+                std::slice::from_ref(&pdn),
+                &[0xA7, 0x41],
+                target,
+                &[0x00, 0xF1, 0x10],
+            );
+            amf.send_to(&request.encode(), mme_addr).unwrap();
+            let mut buf = [0u8; 2048];
+            let (n, _) = amf.recv_from(&mut buf).unwrap();
+            let mut bytes = bytes::Bytes::copy_from_slice(&buf[..n]);
+            let rsp = Gtp2Message::decode(&mut bytes).expect("a GTPv2-C response");
+            assert_eq!(
+                rsp.header.message_type, 134,
+                "a Forward Relocation Response"
+            );
+            assert_eq!(rsp.header.sequence_number, seq);
+            let cause = rsp.get_ie(Gtp2IeType::Cause as u8, 0).expect("Cause");
+            let offending = (cause.value.len() >= 6).then(|| (cause.value[2], cause.value[5]));
+            (cause.value[0], offending)
+        };
+
+        assert_eq!(
+            ask(0x7_4101, &[]),
+            (
+                crate::n26_build::CAUSE_CONDITIONAL_IE_MISSING,
+                Some((Gtp2IeType::TargetIdentification as u8, 0))
+            ),
+            "no Target Identification"
+        );
+        // Target Type 5 (gNodeB ID) names no eNB.
+        let gnb =
+            crate::n26_build::encode_gnb_target_identification(&crate::n26_build::GnbTarget {
+                plmn: [0x00, 0xF1, 0x10],
+                gnb_id: 0x7_4101,
+                gnb_id_len: 22,
+                tac: [0, 0, 1],
+            });
+        assert_eq!(
+            ask(0x7_4102, &gnb.value),
+            (
+                crate::n26_build::CAUSE_MANDATORY_IE_INCORRECT,
+                Some((Gtp2IeType::TargetIdentification as u8, 0))
+            ),
+            "a gNodeB Target Type"
+        );
+        // A truncated Type 1 body.
+        assert_eq!(
+            ask(0x7_4103, &[0x01, 0x00, 0xF1, 0x10, 0x07]).0,
+            crate::n26_build::CAUSE_MANDATORY_IE_INCORRECT,
+            "a truncated Target Identification"
+        );
+        // A well-formed eNB this MME has no S1 with.
+        let elsewhere = nextgcore_amfd::n26_build::encode_enb_target_identification(
+            &[0x00, 0xF1, 0x10],
+            nextgcore_ngap::types::NgEnbId::Macro(0x7_4199),
+            [0x00, 0x01],
+        )
+        .unwrap();
+        assert_eq!(
+            ask(0x7_4104, &elsewhere).0,
+            crate::n26_build::CAUSE_RELOCATION_FAILURE,
+            "an eNB that is not connected is a relocation failure, not the bystander"
+        );
+        // Positive control: the bystander itself, named, is admitted.
+        let named = nextgcore_amfd::n26_build::encode_enb_target_identification(
+            &[0x00, 0xF1, 0x10],
+            nextgcore_ngap::types::NgEnbId::Macro(0x7_4101),
+            [0x00, 0x01],
+        )
+        .unwrap();
+        assert_eq!(
+            ask(0x7_4105, &named).0,
+            crate::n26_build::CAUSE_REQUEST_ACCEPTED,
+            "the named, connected eNB admits the UE"
+        );
+        server.close();
+        ctx.enb_remove(bystander);
+    }
+
+    /// **#741.** The target is the S1-connected eNB with the named id and PLMN, whichever
+    /// pool id it has; a short or long macro id resolves the same way, and an eNB whose S1
+    /// Setup has not completed, or of another PLMN, is not a target.
+    #[test]
+    fn the_relocation_target_is_the_enb_the_target_identification_names() {
+        let _guard = lock_s11();
+        let ctx = mme_self();
+        ctx.init();
+        let plmn = crate::s11_build::decode_plmn_bcd(&[0x00, 0xF1, 0x10]).unwrap();
+        let other_plmn = crate::s11_build::decode_plmn_bcd(&[0x00, 0xF2, 0x20]).unwrap();
+        let add = |addr: &str, enb_id: u32, plmn: &crate::context::PlmnId, up: bool| {
+            let id = ctx.enb_add(addr.parse().unwrap());
+            ctx.enb_set_enb_id(id, enb_id);
+            if let Some(enb) = ctx.enb_pool.write().unwrap().get_mut(&id) {
+                enb.plmn_id = plmn.clone();
+                enb.state.s1_setup_success = up;
+            }
+            id
+        };
+        // Lower pool ids first, so a "lowest connected eNB" choice picks the wrong one.
+        let bystander = add("127.0.0.1:47421", 0x7_4201, &plmn, true);
+        let not_set_up = add("127.0.0.1:47422", 0x7_4202, &plmn, false);
+        let wrong_plmn = add("127.0.0.1:47423", 0x7_4203, &other_plmn, true);
+        let macro_target = add("127.0.0.1:47424", 0x7_4204, &plmn, true);
+        let short_target = add("127.0.0.1:47425", 0x2_4205, &plmn, true);
+        let long_target = add("127.0.0.1:47426", 0x1A_4206, &plmn, true);
+        let target = |id: nextgcore_ngap::types::NgEnbId| {
+            let body = nextgcore_amfd::n26_build::encode_enb_target_identification(
+                &[0x00, 0xF1, 0x10],
+                id,
+                [0x00, 0x01],
+            )
+            .unwrap();
+            select_target_enb(
+                ctx,
+                &crate::n26_build::parse_enb_target_identification(&body).unwrap(),
+            )
+        };
+        use nextgcore_ngap::types::NgEnbId;
+        assert_eq!(target(NgEnbId::Macro(0x7_4204)), Some(macro_target));
+        assert_eq!(target(NgEnbId::ShortMacro(0x2_4205)), Some(short_target));
+        assert_eq!(target(NgEnbId::LongMacro(0x1A_4206)), Some(long_target));
+        assert_eq!(target(NgEnbId::Macro(0x7_4202)), None, "S1 Setup not done");
+        assert_eq!(target(NgEnbId::Macro(0x7_4203)), None, "another PLMN");
+        for id in [
+            bystander,
+            not_set_up,
+            wrong_plmn,
+            macro_target,
+            short_target,
+            long_target,
+        ] {
+            ctx.enb_remove(id);
+        }
+    }
+
     /// **#408 criterion 8**: a connected-mode inter-system handover transfers the bearer
     /// contexts and tunnel endpoints across BOTH daemons, and they are readable from the MME's
     /// store afterwards.
@@ -2050,11 +2302,12 @@ mod tests {
             &mm_context,
             std::slice::from_ref(&pdn),
             &[0xA4, 0x08],
-            &nextgcore_amfd::n26_build::encode_target_identification(
-                nextgcore_amfd::n26_build::TARGET_TYPE_ENODEB,
+            &nextgcore_amfd::n26_build::encode_enb_target_identification(
                 &[0x00, 0xF1, 0x10],
-                &[0, 0, 4, 8],
-            ),
+                nextgcore_ngap::types::NgEnbId::Macro(0x408),
+                [0x04, 0x08],
+            )
+            .expect("fits"),
             &[0x00, 0xF1, 0x10],
         );
 
@@ -2086,6 +2339,17 @@ mod tests {
             Some(&[0xA4, 0x08][..]),
             "the gNB's Source-to-Target container must reach the MME byte-for-byte: it goes \
              straight into the S1AP HANDOVER REQUEST the target eNB decodes"
+        );
+        // #741: the AMF's Target Identification is the eNB and TAC the MME reads back.
+        let target = crate::n26_build::parse_enb_target_identification(
+            data.target_identification
+                .as_deref()
+                .expect("the Target Identification crossed"),
+        )
+        .expect("the MME parses the AMF's Target Identification");
+        assert_eq!(
+            (target.enb_id, target.enb_id_bits, target.tac),
+            (0x408, 20, 0x0408)
         );
 
         // Project onto the shape the production installer takes -- the same projection

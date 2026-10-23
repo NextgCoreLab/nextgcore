@@ -84,6 +84,103 @@ pub const CAUSE_REQUEST_REJECTED: u8 = 94;
 /// constant had it (#401's lesson).
 pub const CAUSE_RELOCATION_FAILURE: u8 = 81;
 
+/// GTPv2-C cause `Mandatory IE incorrect` (TS 29.274 Table 8.4-1: 69, `29274-j60.txt:25456`).
+///
+/// §7.7.8 (`29274-j60.txt:23425-23432`): a request with a mandatory or verifiable
+/// conditional IE carrying a semantically invalid value is answered with this cause and the
+/// type and instance of the offending IE.
+pub const CAUSE_MANDATORY_IE_INCORRECT: u8 = 69;
+
+/// GTPv2-C cause `Conditional IE missing` (TS 29.274 Table 8.4-1: 103, `29274-j60.txt:25525`).
+pub const CAUSE_CONDITIONAL_IE_MISSING: u8 = 103;
+
+/// `Target Type` = `Macro eNodeB ID` (TS 29.274 Table 8.51-1).
+pub const TARGET_TYPE_MACRO_ENODEB: u8 = 1;
+
+/// `Target Type` = `Extended Macro eNodeB ID` (TS 29.274 Table 8.51-1).
+pub const TARGET_TYPE_EXTENDED_MACRO_ENODEB: u8 = 4;
+
+/// The target eNB a 5GS to EPS Forward Relocation Request names (#741).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnbTarget {
+    /// The eNB's PLMN, from octets 6-8.
+    pub plmn_id: crate::context::PlmnId,
+    /// The eNB id, right-aligned.
+    pub enb_id: u32,
+    /// The id's length in bits: 20 (macro), 18 (short macro) or 21 (long macro).
+    pub enb_id_bits: u8,
+    /// The selected EPS TAC, from octets 12-13.
+    pub tac: u16,
+}
+
+/// Parse a Target Identification body (TS 29.274 §8.51, from octet 5) naming an eNB (#741).
+///
+/// | Target Type | octet 9 | figure |
+/// |---|---|---|
+/// | 1 Macro eNodeB ID | spare(4), id bits 20..17 | 8.51-2 |
+/// | 4 Extended Macro eNodeB ID, SMeNB clear | SMeNB, spare(2), id bits 21..17 | 8.51-4 |
+/// | 4 Extended Macro eNodeB ID, SMeNB set | SMeNB, spare(2), 000, id bits 18..17 | 8.51-4 |
+///
+/// Spare bits, and bits 5-3 of octet 9 for a short macro id, are ignored as the figures
+/// require of a receiver. Any other Target Type is refused: it names no eNB, so there is
+/// nothing in EPS to relocate the UE to.
+pub fn parse_enb_target_identification(body: &[u8]) -> Result<EnbTarget, String> {
+    if body.len() < 9 {
+        return Err(format!(
+            "Target Identification is {} octets; Target Types 1 and 4 need 9 (octets 5-13)",
+            body.len()
+        ));
+    }
+    let plmn_id = crate::s11_build::decode_plmn_bcd(&body[1..4])
+        .ok_or_else(|| "Target Identification carries an undecodable PLMN".to_string())?;
+    let low = u32::from(u16::from_be_bytes([body[5], body[6]]));
+    let (enb_id, enb_id_bits) = match body[0] {
+        TARGET_TYPE_MACRO_ENODEB => ((u32::from(body[4] & 0x0F) << 16) | low, 20),
+        TARGET_TYPE_EXTENDED_MACRO_ENODEB if body[4] & 0x80 != 0 => {
+            ((u32::from(body[4] & 0x03) << 16) | low, 18)
+        }
+        TARGET_TYPE_EXTENDED_MACRO_ENODEB => ((u32::from(body[4] & 0x1F) << 16) | low, 21),
+        other => {
+            return Err(format!(
+                "Target Type {other} names no eNB (Table 8.51-1); a 5GS to EPS handover \
+                 targets a Macro (1) or Extended Macro (4) eNodeB"
+            ))
+        }
+    };
+    Ok(EnbTarget {
+        plmn_id,
+        enb_id,
+        enb_id_bits,
+        tac: u16::from_be_bytes([body[7], body[8]]),
+    })
+}
+
+/// A **Forward Relocation Response** refusing a request over one of its IEs (TS 29.274
+/// §7.3.2, §7.7.8): the Cause carries the offending IE's type and instance (§8.4, Figure
+/// 8.4-1 octets 7-10, with its Length set to 0).
+pub fn build_forward_relocation_rejection(
+    sequence_number: u32,
+    amf_teid: u32,
+    cause: u8,
+    offending_ie_type: u8,
+    offending_ie_instance: u8,
+) -> Gtp2Message {
+    let header = Gtp2Header::new(
+        Gtp2MessageType::ForwardRelocationResponse as u8,
+        amf_teid,
+        sequence_number,
+    );
+    let mut msg = Gtp2Message::new(header);
+    let mut cause_body = BytesMut::with_capacity(6);
+    cause_body.put_u8(cause);
+    cause_body.put_u8(0); // spare | PCE | BCE | CS
+    cause_body.put_u8(offending_ie_type);
+    cause_body.put_u16(0); // the offending IE's Length is set to 0
+    cause_body.put_u8(offending_ie_instance & 0x0F);
+    msg.add_ie(Gtp2Ie::new(Gtp2IeType::Cause as u8, 0, cause_body.freeze()));
+    msg
+}
+
 /// Build a **Context Request** (TS 29.274 §7.3.5, message type 130).
 ///
 /// Sent by the new MME to the old AMF over N26 *"as a part of an 5GS to EPS Idle mode

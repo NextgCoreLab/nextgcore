@@ -3981,6 +3981,19 @@ fn ng_enb_id_value(id: &ngap_gen::NgENB_ID) -> Option<u32> {
     })
 }
 
+/// A generated NgENB-ID as the hand-written CHOICE, keeping which length the
+/// gNB named (TS 38.413 §9.3.1.8); `None` for a choice extension.
+fn ng_enb_id_variant(id: &ngap_gen::NgENB_ID) -> Option<nextgcore_ngap::types::NgEnbId> {
+    use nextgcore_ngap::types::NgEnbId;
+    Some(match id {
+        ngap_gen::NgENB_ID::MacroNgENB_ID(b) => NgEnbId::Macro(bits_value(&b.0)),
+        ngap_gen::NgENB_ID::ShortMacroNgENB_ID(b) => NgEnbId::ShortMacro(bits_value(&b.0)),
+        ngap_gen::NgENB_ID::LongMacroNgENB_ID(b) => NgEnbId::LongMacro(bits_value(&b.0)),
+        #[allow(unreachable_patterns)]
+        _ => return None,
+    })
+}
+
 /// The hand-written GlobalRanNodeId a generated GlobalRANNodeID maps to: a gNB or
 /// an ng-eNB; `None` for an N3IWF or a choice extension, which a handover target
 /// cannot be.
@@ -4015,7 +4028,9 @@ fn hand_written_global_ran_node_id(id: &ngap_gen::GlobalRANNodeID) -> Option<Glo
 /// EPS-TAI has a 2-octet one. So a 5GS-to-EPS HANDOVER REQUIRED naming its
 /// target as an eNB decoded to a garbage PLMN and eNB id, which the AMF then
 /// relayed to the MME in the Forward Relocation's Target Identification. The
-/// EPS TAC goes into the low two octets of `tai_tac`.
+/// ngENB-ID keeps which of the three lengths the gNB named (#741), because TS
+/// 29.274 §8.51 encodes a macro id under Target Type 1 and a short or long macro
+/// id under Target Type 4.
 fn hand_written_target_id(target: &ngap_gen::TargetID) -> Option<TargetId> {
     match target {
         ngap_gen::TargetID::TargetRANNodeID(t) => Some(TargetId::TargetRanNodeId {
@@ -4025,23 +4040,20 @@ fn hand_written_target_id(target: &ngap_gen::TargetID) -> Option<TargetId> {
                 tai_tac: t.selected_tai.tac.0.as_slice().try_into().ok()?,
             },
         }),
-        ngap_gen::TargetID::TargeteNB_ID(t) => {
-            let tac: [u8; 2] = t.selected_eps_tai.eps_tac.0.as_slice().try_into().ok()?;
-            Some(TargetId::TargetGlobalNgEnbId {
-                plmn_identity: t.global_enb_id.plmn_identity.0.as_slice().try_into().ok()?,
-                ng_enb_id: ng_enb_id_value(&t.global_enb_id.ng_enb_id)?,
-                selected_tai: TaiListItem {
-                    tai_plmn: t
-                        .selected_eps_tai
-                        .plmn_identity
-                        .0
-                        .as_slice()
-                        .try_into()
-                        .ok()?,
-                    tai_tac: [0, tac[0], tac[1]],
-                },
-            })
-        }
+        ngap_gen::TargetID::TargeteNB_ID(t) => Some(TargetId::TargetGlobalNgEnbId {
+            plmn_identity: t.global_enb_id.plmn_identity.0.as_slice().try_into().ok()?,
+            ng_enb_id: ng_enb_id_variant(&t.global_enb_id.ng_enb_id)?,
+            selected_eps_tai: nextgcore_ngap::types::EpsTai {
+                plmn_identity: t
+                    .selected_eps_tai
+                    .plmn_identity
+                    .0
+                    .as_slice()
+                    .try_into()
+                    .ok()?,
+                tac: t.selected_eps_tai.eps_tac.0.as_slice().try_into().ok()?,
+            },
+        }),
         #[allow(unreachable_patterns)]
         _ => None,
     }
@@ -13951,31 +13963,90 @@ mod handover_required_tests {
         let TargetId::TargetGlobalNgEnbId {
             plmn_identity,
             ng_enb_id,
-            selected_tai,
+            selected_eps_tai,
         } = generated(&bytes).target_id
         else {
             panic!("an eNB target");
         };
         assert_eq!(plmn_identity, [0x99, 0xF9, 0x07]);
-        assert_eq!(ng_enb_id, 0x12345);
-        assert_eq!(selected_tai.tai_plmn, [0x99, 0xF9, 0x07]);
-        assert_eq!(selected_tai.tai_tac, [0x00, 0x00, 0x07]);
-        // The hand-written parser misreads this conformant encoding.
-        let misread = match parser::decode_ngap_pdu(&bytes) {
-            Ok(NgapMessage::HandoverRequired(old)) => match old.target_id {
-                TargetId::TargetGlobalNgEnbId {
-                    plmn_identity,
-                    ng_enb_id,
-                    ..
-                } => plmn_identity != [0x99, 0xF9, 0x07] || ng_enb_id != 0x12345,
-                _ => true,
-            },
-            _ => true,
-        };
-        assert!(
-            misread,
-            "the hand-written TargetID decoder was expected to misread"
+        assert_eq!(ng_enb_id, nextgcore_ngap::types::NgEnbId::Macro(0x12345));
+        assert_eq!(
+            selected_eps_tai,
+            nextgcore_ngap::types::EpsTai {
+                plmn_identity: [0x99, 0xF9, 0x07],
+                tac: [0x00, 0x07],
+            }
         );
+        // #741: the hand-written parser now reads the conformant encoding the same way.
+        let Ok(NgapMessage::HandoverRequired(old)) = parser::decode_ngap_pdu(&bytes) else {
+            panic!("the hand-written parser refused a conformant targeteNB-ID");
+        };
+        let TargetId::TargetGlobalNgEnbId {
+            plmn_identity,
+            ng_enb_id,
+            selected_eps_tai,
+        } = old.target_id
+        else {
+            panic!("an eNB target");
+        };
+        assert_eq!(plmn_identity, [0x99, 0xF9, 0x07]);
+        assert_eq!(ng_enb_id, nextgcore_ngap::types::NgEnbId::Macro(0x12345));
+        assert_eq!(selected_eps_tai.tac, [0x00, 0x07]);
+    }
+
+    /// #741: every ngENB-ID length survives the generated decode with its kind, and the
+    /// hand-written builder's targeteNB-ID is the octets the generated codec produces
+    /// (the GOLDEN above for the macro case), so the two codecs cannot drift.
+    #[test]
+    fn every_ng_enb_id_length_round_trips_through_both_codecs() {
+        use nextgcore_ngap::types::{EpsTai, NgEnbId};
+        let golden_target = |id: NgEnbId| TargetId::TargetGlobalNgEnbId {
+            plmn_identity: [0x99, 0xF9, 0x07],
+            ng_enb_id: id,
+            selected_eps_tai: EpsTai {
+                plmn_identity: [0x99, 0xF9, 0x07],
+                tac: [0x00, 0x07],
+            },
+        };
+        for id in [
+            NgEnbId::Macro(0x12345),
+            NgEnbId::Macro(0xF_FFFF),
+            NgEnbId::ShortMacro(0x2_ABCD),
+            NgEnbId::ShortMacro(0x3_FFFF),
+            NgEnbId::LongMacro(0x1A_BCDE),
+            NgEnbId::LongMacro(0x1F_FFFF),
+            NgEnbId::LongMacro(0),
+        ] {
+            let mut msg = required(golden_target(id), 1, false);
+            msg.handover_type = HandoverType::FivegsToEps;
+            let bytes = builder::build_handover_required(&msg).expect("build");
+            let TargetId::TargetGlobalNgEnbId { ng_enb_id, .. } = generated(&bytes).target_id
+            else {
+                panic!("an eNB target for {id:?}");
+            };
+            assert_eq!(ng_enb_id, id, "the generated decode keeps the kind");
+            if id == NgEnbId::Macro(0x12345) {
+                // The hand-derived octets of `an_enb_target_decodes_to_its_plmn_enb_id_and_eps_tac`.
+                const GOLDEN: [u8; 13] = [
+                    0x40, 0x99, 0xF9, 0x07, 0x00, 0x12, 0x34, 0x50, 0x99, 0xF9, 0x07, 0x00, 0x07,
+                ];
+                assert!(
+                    bytes.windows(GOLDEN.len()).any(|w| w == GOLDEN),
+                    "the hand-written builder writes the X.691 octets"
+                );
+            }
+            let Ok(NgapMessage::HandoverRequired(old)) = parser::decode_ngap_pdu(&bytes) else {
+                panic!("hand-written parse of {id:?}");
+            };
+            let TargetId::TargetGlobalNgEnbId { ng_enb_id, .. } = old.target_id else {
+                panic!("an eNB target for {id:?}");
+            };
+            assert_eq!(ng_enb_id, id, "the hand-written decode keeps the kind");
+        }
+        // A value too wide for its alternative is refused, not truncated.
+        let mut msg = required(golden_target(NgEnbId::ShortMacro(0x4_0000)), 1, false);
+        msg.handover_type = HandoverType::FivegsToEps;
+        assert!(builder::build_handover_required(&msg).is_err());
     }
 
     fn without(bytes: &[u8], id: u16) -> Vec<u8> {
