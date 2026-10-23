@@ -923,7 +923,8 @@ fn notify_unrestorable_associations(
 /// (TS 29.514 §4.2.5.3: POST {notifUri}/terminate with TerminationInfo).
 ///
 /// Its only caller was the dead C-port SM policy delete handler, deleted by
-/// #655. The live `app::handle_sm_policy_delete` does not call it yet (#767).
+/// #655. The live `app::handle_sm_policy_delete` calls it for every app
+/// session bound to the deleted SM policy (#767).
 pub fn pcf_sbi_send_policyauthorization_terminate_notify(app_id: u64) -> bool {
     let info = crate::context::pcf_self().read().ok().and_then(|ctx| {
         ctx.app_find_by_id(app_id)

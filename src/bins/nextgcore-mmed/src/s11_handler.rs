@@ -150,7 +150,12 @@ pub struct BearerContextCreated {
 #[derive(Debug, Clone, Default)]
 pub struct ModifyBearerResponseData {
     pub cause: u8,
+    /// Bearer Contexts modified (instance 0, Table 7.2.8-1), each with its own
+    /// Cause (#730).
     pub bearer_contexts: Vec<BearerContextModified>,
+    /// Bearer Contexts marked for removal (instance 1): the SGW does not hold
+    /// these bearers, so they were not switched (#730).
+    pub bearers_marked_for_removal: Vec<u8>,
     /// Change Reporting Action (TS 29.274 Table 7.2.8-1, §8.61), when the PDN
     /// GW starts or stops location change reporting here (#593).
     pub change_reporting_action: Option<u8>,
@@ -168,7 +173,32 @@ pub struct ChangeNotificationResponseData {
 #[derive(Debug, Clone, Default)]
 pub struct BearerContextModified {
     pub ebi: u8,
-    pub cause: u8,
+    /// The bearer's own Cause; `None` when the context carries none.
+    pub cause: Option<u8>,
+}
+
+/// The EBI and Cause of a grouped Bearer Context IE's `value`.
+fn parse_bearer_context_ebi_cause(value: &[u8]) -> Option<BearerContextModified> {
+    let mut bearer = BearerContextModified::default();
+    let mut have_ebi = false;
+    let mut offset = 0;
+    while offset < value.len() {
+        let Some((ie_t, length, _, inner)) = parse_ie_header(&value[offset..]) else {
+            break;
+        };
+        match ie_t {
+            ie_type::EBI => {
+                if let Some(ebi) = parse_ebi(inner) {
+                    bearer.ebi = ebi;
+                    have_ebi = true;
+                }
+            }
+            ie_type::CAUSE => bearer.cause = parse_cause(inner),
+            _ => {}
+        }
+        offset += 4 + length as usize;
+    }
+    have_ebi.then_some(bearer)
 }
 
 /// Parsed Delete Session Response
@@ -286,14 +316,27 @@ pub fn dispatch_triggered(raw: &[u8], msg_type: u8, sequence_number: u32, peer: 
                     "S11 Modify Bearer Response from {peer} (seq={sequence_number}) cause={}",
                     data.cause
                 );
+                // #730: a Path Switch Request (or a completed S1 handover)
+                // waits on this response (TS 23.401 §5.5.1.1.2 step 5).
+                if let Some(pending) =
+                    crate::gtp_path::take_pending_handover_modification(sequence_number)
+                {
+                    crate::handover_switch::on_modify_bearer_response(
+                        crate::context::mme_self(),
+                        pending,
+                        &data,
+                    );
+                }
                 // #584: an E-UTRAN initiated E-RAB modification waits on this
                 // response for its confirm (TS 23.401 §5.4.7 step 5).
                 if let Some(pending) =
                     crate::gtp_path::take_pending_erab_modification(sequence_number)
                 {
-                    if let Some(send) =
-                        crate::s1ap_handler::erab_modification_confirm(pending, data.cause)
-                    {
+                    if let Some(send) = crate::s1ap_handler::erab_modification_confirm(
+                        crate::context::mme_self(),
+                        pending,
+                        &data,
+                    ) {
                         crate::s1ap_path::s1ap_send(send);
                     }
                 }
@@ -900,7 +943,9 @@ fn continue_attach(
         return;
     }
 
-    match crate::nas_path::nas_eps_send_attach_accept(mme_ue, &enb_ue, &sess, &bearer) {
+    // #811: the UE-AMBR of the active APNs (TS 23.401 §4.7.3).
+    let ue_ambr = crate::s1ap_build::ue_ambr_of(ctx, mme_ue);
+    match crate::nas_path::nas_eps_send_attach_accept(mme_ue, &enb_ue, &sess, &bearer, ue_ambr) {
         Ok(()) => log::info!(
             "[{}] Attach Accept sent in an Initial Context Setup Request (EBI {})",
             mme_ue.imsi_bcd,
@@ -1683,13 +1728,21 @@ pub fn handle_modify_bearer_response(data: &[u8]) -> S11Result<ModifyBearerRespo
     let mut offset = 0;
 
     while offset < payload.len() {
-        if let Some((ie_t, length, _, value)) = parse_ie_header(&payload[offset..]) {
+        if let Some((ie_t, length, instance, value)) = parse_ie_header(&payload[offset..]) {
             if ie_t == ie_type::CAUSE {
                 if let Some(cause) = parse_cause(value) {
                     result.cause = cause;
                 }
             } else if ie_t == ie_type::CHANGE_REPORTING_ACTION {
                 result.change_reporting_action = value.first().copied();
+            } else if ie_t == ie_type::BEARER_CONTEXT {
+                if let Some(bc) = parse_bearer_context_ebi_cause(value) {
+                    match instance {
+                        0 => result.bearer_contexts.push(bc),
+                        1 => result.bearers_marked_for_removal.push(bc.ebi),
+                        _ => {}
+                    }
+                }
             }
             offset += 4 + length as usize;
         } else {
@@ -2922,6 +2975,77 @@ mod tests {
             bearer.ebi
         );
 
+        release_global_ue(mme_ue_id, sess_id, bearer_id);
+        crate::gtp_path::clear_pending_creates_for_test();
+    }
+
+    /// #811, TS 23.401 §4.7.3: the Initial Context Setup Request that carries
+    /// the Attach Accept signals the UE-AMBR as the sum of the ACTIVE APNs'
+    /// APN-AMBRs up to the subscribed UE-AMBR, not the subscribed value as such.
+    /// A subscribed APN that is not connected (no S1-U endpoint) does not count.
+    #[test]
+    fn the_attach_initial_context_setup_carries_the_ue_ambr_of_the_active_apns() {
+        use nextgcore_s1ap_gen::generated as g;
+        let _guard = crate::gtp_path::lock_s11();
+        crate::gtp_path::clear_pending_creates_for_test();
+        let (mme_ue_id, enb_ue_id, sess_id, bearer_id, local_teid) = seed_global_ue(5);
+        let ctx = crate::context::mme_self();
+        let enb_id = ctx.enb_ue_find_by_id(enb_ue_id).unwrap().enb_id;
+        // Subscribed UE-AMBR 1 Gbit/s; the APN 10 / 5 Mbit/s; a second,
+        // not connected subscribed APN of 50 Mbit/s.
+        let idle_sess = ctx.sess_add(mme_ue_id, 0);
+        {
+            let mut pool = ctx.mme_ue_pool.write().unwrap();
+            let ue = pool.get_mut(&mme_ue_id).unwrap();
+            ue.ambr.downlink = 1_000_000_000;
+            ue.ambr.uplink = 1_000_000_000;
+            ue.sess_list.push(idle_sess);
+        }
+        {
+            let mut pool = ctx.sess_pool.write().unwrap();
+            let s = pool.get_mut(&sess_id).unwrap();
+            s.ambr.downlink = 10_000_000;
+            s.ambr.uplink = 5_000_000;
+            let i = pool.get_mut(&idle_sess).unwrap();
+            i.ambr.downlink = 50_000_000;
+            i.ambr.uplink = 50_000_000;
+        }
+        crate::s1ap_path::tap_enb_for_test(enb_id);
+        crate::gtp_path::record_pending_create_for_test(
+            4811,
+            crate::gtp_path::PendingCreate {
+                create_action: GtpCreateAction::AttachRequest,
+                enb_ue_id,
+                sess_id,
+            },
+        );
+        apply_create_session_response(
+            &accepted_response(5, [10, 45, 0, 11]),
+            local_teid,
+            4811,
+            "127.0.0.1:2123".parse().unwrap(),
+        );
+        let ambr = crate::s1ap_path::take_tapped_for_test(enb_id)
+            .into_iter()
+            .find_map(|pdu| match nextgcore_s1ap_gen::decode(&pdu) {
+                Ok(g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+                    value: g::InitiatingMessageValue::Id_InitialContextSetup(req),
+                    ..
+                })) => req.protocol_i_es.0.into_iter().find_map(|ie| match ie.value {
+                    g::InitialContextSetupRequestProtocolIEs_EntryValue::Id_uEaggregateMaximumBitrate(a) => {
+                        Some((a.u_eaggregate_maximum_bit_rate_dl.0, a.u_eaggregate_maximum_bit_rate_ul.0))
+                    }
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("an Initial Context Setup Request with a UE-AMBR");
+        assert_eq!(
+            ambr,
+            (10_000_000, 5_000_000),
+            "min(subscribed, sum of active APN-AMBRs)"
+        );
+        ctx.sess_remove(idle_sess);
         release_global_ue(mme_ue_id, sess_id, bearer_id);
         crate::gtp_path::clear_pending_creates_for_test();
     }

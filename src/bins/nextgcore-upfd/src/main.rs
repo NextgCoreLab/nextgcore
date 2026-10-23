@@ -1185,7 +1185,11 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                     for u in &updated_urrs {
                         match dp_urrs.get(&u.urr_id) {
                             Some(urr) => {
-                                urr.set_reporting(
+                                // #842 review (TS 29.244 §7.5.4): only the IEs the Update
+                                // URR CARRIES change; an absent one is unchanged. Applying
+                                // it through the Create setters turned every absent IE
+                                // into "unprovisioned".
+                                urr.update_reporting(
                                     u.volume_threshold_total,
                                     u.volume_threshold_ul,
                                     u.volume_threshold_dl,
@@ -1198,7 +1202,7 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                                 // forwarding. That is what makes a quota a quota rather
                                 // than a teardown, and it is the reason the latch lives
                                 // where a re-provision can reach it.
-                                urr.set_quotas(
+                                urr.update_quotas(
                                     u.volume_quota_total,
                                     u.volume_quota_ul,
                                     u.volume_quota_dl,

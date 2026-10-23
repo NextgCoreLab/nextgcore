@@ -182,6 +182,28 @@ jobs:
       - name: cargo fmt
         run: cd src && cargo fmt --all -- --check
 
+  helm:
+    # #753 review: `helm lint` reports a template `fail` only at [INFO] and exits
+    # 0, so it cannot catch the chart's refusal of amf.replicas > 1. The render
+    # is checked with `helm template`, both ways.
+    name: Helm chart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: helm lint
+        run: helm lint deploy/helm/nextgcore --set global.siteId=ci
+      - name: helm template renders
+        run: helm template t deploy/helm/nextgcore --set global.siteId=ci > /dev/null
+      - name: helm template refuses amf.replicas=2
+        run: |
+          if out=$(helm template t deploy/helm/nextgcore --set global.siteId=ci \
+              --set amf.replicas=2 2>&1); then
+            echo "amf.replicas=2 rendered; it must fail (#753)"; exit 1
+          fi
+          echo "$out" | grep -q 'amf.replicas > 1 is not supported' \
+            || { echo "failed for another reason: $out"; exit 1; }
+
   fuzz-build:
     name: Fuzz targets build
     # #587: `src/fuzz` is its own workspace (the cargo-fuzz layout), so neither

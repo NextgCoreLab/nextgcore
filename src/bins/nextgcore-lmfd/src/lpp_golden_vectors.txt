@@ -1,9 +1,18 @@
-REQ ecid 0 9000200870
-REQ ecid 1 9002200870
-REQ ecid 7 900E200870
-REQ ecid 127 90FE200870
-REQ ecid 128 9100200870
-REQ ecid 255 91FE200870
+# #715: the REQ ecid lines (E-UTRA E-CID, now with ueRxTxReq) and the REQ nrecid lines
+# (NR E-CID) are hand-derived from X.691 (see lpp_equivalence_tests::*_matches_x691),
+# not captured: the captured E-CID request asked for rsrpReq and rsrqReq only.
+REQ ecid 0 90002008B8
+REQ ecid 1 90022008B8
+REQ ecid 7 900E2008B8
+REQ ecid 127 90FE2008B8
+REQ ecid 128 91002008B8
+REQ ecid 255 91FE2008B8
+REQ nrecid 0 90002080120281C0
+REQ nrecid 1 90022080120281C0
+REQ nrecid 7 900E2080120281C0
+REQ nrecid 127 90FE2080120281C0
+REQ nrecid 128 91002080120281C0
+REQ nrecid 255 91FE2080120281C0
 REQ rtt 0 900020801202442B
 REQ rtt 1 900220801202442B
 REQ rtt 127 90FE20801202442B
