@@ -2559,6 +2559,14 @@ impl NgapServer {
                         );
                     }
                 });
+                // #746: a UE radio capability ID that arrived while this command was in
+                // flight was deferred; it goes now, in a command of its own.
+                self.send_racs_configuration_update(
+                    association_id,
+                    ul_nas.amf_ue_ngap_id,
+                    ul_nas.ran_ue_ngap_id,
+                )
+                .await?;
             }
             message_type::SERVICE_REQUEST => {
                 self.handle_service_request_nas(
@@ -6306,6 +6314,23 @@ impl NgapServer {
             .ue_auth_state
             .with_mut(amf_ue_ngap_id, |s| {
                 if !s.registered || !s.amf_ue.security_context_available {
+                    return None;
+                }
+                // #746: `retx` is the UE's one NAS retransmission slot, so arming T3555
+                // here would silently replace the procedure in flight: a Registration
+                // Accept (T3550) would never be retransmitted, and a network-initiated
+                // deregistration (T3522) would lose its retransmission and its
+                // exhaustion teardown. TS 24.501 §5.4.4.6 has the network abort a UE
+                // configuration update that collides with a de-registration, and the
+                // registration procedure delivers RACS IEs itself. So the command waits:
+                // nothing is consumed from the context, and the Registration Complete
+                // and Configuration Update Complete handlers call again.
+                if let Some(pending) = &s.retx {
+                    log::info!(
+                        "UE {amf_ue_ngap_id}: UE radio capability ID update deferred, \
+                         {:?} is pending (TS 24.501 §5.4.4.6)",
+                        pending.timer
+                    );
                     return None;
                 }
                 let ies = crate::racs::nas_ies_for(
@@ -14864,6 +14889,7 @@ pub async fn amf_ngap_poll() -> Result<bool> {
 mod tests {
     /// Handler-level tests asserting what amfd SENDS (#760, ...), in their own file.
     mod handler_tests;
+    mod racs_handler_tests;
 
     use super::*;
     use crate::context::AmfContext;
