@@ -194,7 +194,9 @@ fn split_zone(rest: &str) -> Option<(&str, i64)> {
 /// fields.
 pub fn rfc3339_to_epoch_signed(text: &str) -> Option<i64> {
     let t = text.trim();
-    let (date, rest) = t.split_once('T').or_else(|| t.split_once(' '))?;
+    // RFC 3339 §5.6 NOTE: "T" and "Z" may be lower case; a space separator is
+    // also allowed there "for the sake of readability".
+    let (date, rest) = t.split_once(['T', 't']).or_else(|| t.split_once(' '))?;
     // Every field is fixed-width ASCII digits (RFC 3339 §5.6): no sign, no
     // other width. That keeps every value small, so the day and second
     // arithmetic below cannot overflow: an 18-digit year or a
@@ -224,6 +226,9 @@ pub fn rfc3339_to_epoch_signed(text: &str) -> Option<i64> {
     let mut tparts = time.split(':');
     let hour = digits(tparts.next()?, 2)?;
     let minute = digits(tparts.next()?, 2)?;
+    // RFC 3339 `partial-time` requires seconds; a missing seconds field is
+    // accepted as :00 on purpose, for the peers that send `hh:mm` (it cannot
+    // move a deadline by more than a minute, and it is never an overflow).
     let second = match tparts.next() {
         Some(s) => digits(s, 2)?,
         None => 0,
@@ -302,6 +307,11 @@ mod tests {
         assert!(
             rfc3339_to_epoch_signed("2024-02-29T00:00:00Z").is_some(),
             "leap day"
+        );
+        assert_eq!(
+            rfc3339_to_epoch_signed("2024-01-01t00:00:00z"),
+            rfc3339_to_epoch_signed("2024-01-01T00:00:00Z"),
+            "lower-case t and z (RFC 3339 §5.6 NOTE)"
         );
         assert!(
             rfc3339_to_epoch_signed("2000-02-29T00:00:00Z").is_some(),
