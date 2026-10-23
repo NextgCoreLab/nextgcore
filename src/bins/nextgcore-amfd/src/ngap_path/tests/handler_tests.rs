@@ -650,3 +650,145 @@ async fn a_setup_whose_send_fails_hands_the_accept_to_the_next_setup() {
     );
     assert_protected_service_accept(nas_pdu.as_deref().expect("PSI 2's setup carries it"));
 }
+
+// ---------------------------------------------------------------------------
+// #756: per-session state is pruned when the UE or the session goes away
+// ---------------------------------------------------------------------------
+
+/// What the AMF still holds for `ue`: `(sm_context_refs, sm_context_smfs, sess_list)`.
+fn session_state_of(server: &NgapServer, ue: u64) -> (usize, usize, usize) {
+    let refs = server
+        .sm_context_refs
+        .keys()
+        .filter(|(u, _)| *u == ue)
+        .count();
+    let smfs = server
+        .sm_context_smfs
+        .keys()
+        .filter(|(u, _)| *u == ue)
+        .count();
+    let sess = crate::context::amf_self()
+        .read()
+        .unwrap()
+        .sess_list_for_ue(ue)
+        .len();
+    (refs, smfs, sess)
+}
+
+/// A UE-initiated (switch-off) DEREGISTRATION REQUEST, TS 24.501 §8.2.12.
+fn switch_off_deregistration_request() -> Vec<u8> {
+    vec![
+        0x7E,
+        security_header::PLAIN_NAS_MESSAGE,
+        message_type::DEREGISTRATION_REQUEST_FROM_UE,
+        0x09, // switch off, 3GPP access; ngKSI 0
+        0x00,
+        0x0B,
+        0xF2, // 5G-GUTI
+        0x00,
+        0xF1,
+        0x10,
+        0x02,
+        0x00,
+        0x40,
+        0x11,
+        0x22,
+        0x33,
+        0x44,
+    ]
+}
+
+/// #756: register, open two sessions, deregister. All three stores are empty for
+/// the UE afterwards, and both sessions were released at the SMF.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deregistered_ue_leaves_no_session_state_behind() {
+    let (_smf, port, calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_756_001u64, 56);
+    secured_registered_ue(&mut server, ue, ran);
+    hold_session(&mut server, ue, 1, "prune-756-1", port);
+    hold_session(&mut server, ue, 2, "prune-756-2", port);
+    assert_eq!(session_state_of(&server, ue), (2, 2, 2));
+
+    let dereg = ue_protect(&switch_off_deregistration_request(), 0);
+    server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &dereg))
+        .await
+        .expect("handled");
+
+    let released: Vec<String> = calls
+        .lock()
+        .expect("calls")
+        .iter()
+        .map(|(u, _)| u.clone())
+        .filter(|u| u.ends_with("/release"))
+        .collect();
+    assert_eq!(
+        released.len(),
+        2,
+        "both sessions released at the SMF: {released:?}"
+    );
+    assert_eq!(
+        session_state_of(&server, ue),
+        (0, 0, 0),
+        "no sm_context_refs, sm_context_smfs or sess_list entry survives the UE"
+    );
+    assert!(!server.ue_auth_state.contains(ue));
+}
+
+/// The UE-requested PDU Session Release (0xD1) forgets that PSI and only that PSI.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_released_pdu_session_is_forgotten_and_its_sibling_kept() {
+    let (_smf, port, _calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_756_002u64, 57);
+    secured_registered_ue(&mut server, ue, ran);
+    hold_session(&mut server, ue, 1, "prune-756-rel-1", port);
+    hold_session(&mut server, ue, 2, "prune-756-rel-2", port);
+
+    // A raw 5GSM PDU SESSION RELEASE REQUEST for PSI 1 (the legacy 0x2E path).
+    let release_request = [0x2E, 0x01, 0x07, 0xD1];
+    server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &release_request))
+        .await
+        .expect("handled");
+    assert_eq!(session_state_of(&server, ue), (1, 1, 1));
+    assert!(
+        server.sm_context_refs.contains_key(&(ue, 2)),
+        "PSI 2 is untouched"
+    );
+    assert!(!server.sm_context_refs.contains_key(&(ue, 1)));
+}
+
+/// The orphan sweep drops refs whose session the SBI task removed (the SMF's
+/// RELEASED notify) or whose UE is gone, and keeps live ones.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sweep_drops_orphaned_session_state_and_keeps_live_state() {
+    let mut server = capturing_ngap_server().await;
+    let (live, gone) = (7_756_003u64, 7_756_004u64);
+    secured_registered_ue(&mut server, live, 58);
+    hold_session(&mut server, live, 1, "sweep-756-live", 7777);
+    hold_session(&mut server, live, 2, "sweep-756-released", 7777);
+    secured_registered_ue(&mut server, gone, 59);
+    hold_session(&mut server, gone, 1, "sweep-756-gone", 7777);
+
+    // RELEASED for live/PSI 2 arrives on the SBI task: only sess_list loses it.
+    {
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap();
+        let s = guard.sess_find_by_psi(live, 2).expect("held");
+        guard.sess_remove(s.id);
+    }
+    // The other UE's NAS context disappears without forget_ue.
+    server.ue_auth_state.remove(gone);
+
+    server.sweep_orphaned_session_state();
+    assert!(server.sm_context_refs.contains_key(&(live, 1)));
+    assert!(server.sm_context_smfs.contains_key(&(live, 1)));
+    assert!(!server.sm_context_refs.contains_key(&(live, 2)));
+    assert!(!server.sm_context_smfs.contains_key(&(live, 2)));
+    assert!(!server.sm_context_refs.contains_key(&(gone, 1)));
+    assert!(!server.sm_context_smfs.contains_key(&(gone, 1)));
+    // Tidy the global table for the UE whose NAS context the test removed.
+    server.forget_ue_sessions(gone);
+}
