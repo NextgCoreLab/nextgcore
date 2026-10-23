@@ -9126,6 +9126,20 @@ impl NgapServer {
     /// is cross-gNB state. When the target cannot be resolved on this AMF the
     /// preparation is rejected with HandoverPreparationFailure carrying the
     /// spec cause (TS 38.413 Section 9.2.3.6), rather than being dropped.
+    /// Drop everything an N2 handover preparation of `amf_ue_ngap_id` left behind: the
+    /// relay target and every per-session target transfer (#742).
+    ///
+    /// Called whenever a preparation ends without a HandoverNotify (Cancel, Failure, a
+    /// refusal) and before a new one starts. Leaving the transfers was not a leak only:
+    /// the next handover's Notify relays EVERY stored transfer of the UE to the SMF as
+    /// HANDOVER_COMPLETE, so a session the new target did not admit was switched to the
+    /// DL tunnel of a target the UE never reached.
+    fn forget_handover_preparation(&mut self, amf_ue_ngap_id: u64) {
+        self.handover_target_assoc.remove(&amf_ue_ngap_id);
+        self.handover_target_transfers
+            .retain(|(ue, _psi), _| *ue != amf_ue_ngap_id);
+    }
+
     async fn handle_handover_required(&mut self, association_id: u64, data: &[u8]) -> Result<()> {
         // #417: the GENERATED codec, applying TS 38.413 §10.3.4.2 / §10.3.5.
         let required = match crate::ngap_asn1::decode_handover_required_asn1(data) {
@@ -9238,9 +9252,7 @@ impl NgapServer {
             // Dropped BEFORE the failure is sent, so a failed send cannot leave a
             // stale relay target that a later Uplink RAN Status Transfer would follow
             // to a gNB this UE is not moving to.
-            self.handover_target_assoc.remove(&required.amf_ue_ngap_id);
-            self.handover_target_transfers
-                .retain(|(ue, _psi), _| *ue != required.amf_ue_ngap_id);
+            self.forget_handover_preparation(required.amf_ue_ngap_id);
             if let Some(bytes) = crate::ngap_asn1::build_handover_preparation_failure_asn1(&failure)
             {
                 self.send_to_association(association_id, &bytes).await?;
@@ -9396,6 +9408,10 @@ impl NgapServer {
                 amf_pointer,
             },
         };
+
+        // #742: a new preparation starts from nothing. An earlier one that ended without
+        // a Notify must not contribute a session transfer the new target never admitted.
+        self.forget_handover_preparation(required.amf_ue_ngap_id);
 
         // #417: the GENERATED codec.
         let (racs_id, _) = self.racs_ies_for(required.amf_ue_ngap_id);
@@ -9588,9 +9604,7 @@ impl NgapServer {
             cause: nextgcore_ngap::types::Cause::RadioNetwork(cause),
             criticality_diagnostics: None,
         };
-        self.handover_target_assoc.remove(&required.amf_ue_ngap_id);
-        self.handover_target_transfers
-            .retain(|(ue, _psi), _| *ue != required.amf_ue_ngap_id);
+        self.forget_handover_preparation(required.amf_ue_ngap_id);
         if let Some(bytes) = crate::ngap_asn1::build_handover_preparation_failure_asn1(&failure) {
             self.send_to_association(association_id, &bytes).await?;
         }
@@ -9866,8 +9880,9 @@ impl NgapServer {
         // status transfer to. Dropped first and unconditionally: a stale entry
         // would misroute the NEXT handover's status transfer for this UE to a gNB
         // that already rejected it, and that must not hinge on whether the
-        // preparation failure reached the source.
-        self.handover_target_assoc.remove(&failure.amf_ue_ngap_id);
+        // preparation failure reached the source. The per-session transfers go with
+        // it (#742).
+        self.forget_handover_preparation(failure.amf_ue_ngap_id);
         let source = self
             .ue_auth_state
             .get(failure.amf_ue_ngap_id)
@@ -10361,9 +10376,7 @@ impl NgapServer {
         };
         // The relay target and any per-session transfers of the preparation are done with
         // either way.
-        self.handover_target_assoc.remove(&answer.amf_ue_ngap_id);
-        self.handover_target_transfers
-            .retain(|(ue, _psi), _| *ue != answer.amf_ue_ngap_id);
+        self.forget_handover_preparation(answer.amf_ue_ngap_id);
         match inter_system_handover_command(&answer.outcome) {
             Some(command) => {
                 let pdu = crate::ngap_asn1::build_fivegs_to_eps_handover_command_asn1(
@@ -11080,8 +11093,8 @@ impl NgapServer {
         );
         // The source abandoned the handover; nothing further will be relayed.
         // Dropped BEFORE the acknowledgement is sent, so a failed ack cannot leave
-        // a stale relay target behind.
-        self.handover_target_assoc.remove(&cancel.amf_ue_ngap_id);
+        // a stale relay target behind. The per-session transfers go with it (#742).
+        self.forget_handover_preparation(cancel.amf_ue_ngap_id);
         match crate::ngap_asn1::build_handover_cancel_acknowledge_asn1(
             cancel.amf_ue_ngap_id,
             cancel.ran_ue_ngap_id,
@@ -19759,6 +19772,243 @@ mod tests {
                 .expect("handled"),
             None
         );
+    }
+
+    /// A HANDOVER REQUIRED (intra-5GS) toward the gNB with `target_gnb_id`, listing
+    /// `psis` with a one-octet Handover Required Transfer each.
+    fn handover_required_pdu(
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        target_gnb_id: u32,
+        psis: &[u8],
+    ) -> Vec<u8> {
+        nextgcore_ngap::builder::build_handover_required(&nextgcore_ngap::types::HandoverRequired {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            handover_type: nextgcore_ngap::types::HandoverType::Intra5gs,
+            cause: nextgcore_ngap::types::Cause::RadioNetwork(
+                nextgcore_ngap::types::CauseRadioNetwork::HandoverDesirableForRadioReason,
+            ),
+            target_id: nextgcore_ngap::types::TargetId::TargetRanNodeId {
+                global_ran_node_id: nextgcore_ngap::types::GlobalRanNodeId::GlobalGnbId {
+                    plmn_identity: plmn_id_to_ngap_bytes(&PlmnId::new("001", "01")),
+                    gnb_id: target_gnb_id,
+                    gnb_id_len: 22,
+                },
+                selected_tai: nextgcore_ngap::types::TaiListItem {
+                    tai_plmn: plmn_id_to_ngap_bytes(&PlmnId::new("001", "01")),
+                    tai_tac: [0x00, 0x00, 0x01],
+                },
+            },
+            pdu_session_list: psis
+                .iter()
+                .map(|&psi| nextgcore_ngap::types::PduSessionResourceItemHoRqd {
+                    pdu_session_id: psi,
+                    transfer: vec![0x00],
+                })
+                .collect(),
+            source_to_target_container: vec![0xAB; 4],
+            direct_forwarding_path_availability: None,
+        })
+        .expect("build HandoverRequired")
+    }
+
+    /// A HANDOVER REQUEST ACKNOWLEDGE admitting `admitted` as `(psi, transfer)`.
+    fn handover_ack_pdu(
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        admitted: &[(u8, Vec<u8>)],
+    ) -> Vec<u8> {
+        nextgcore_ngap::builder::build_handover_request_acknowledge(
+            &nextgcore_ngap::types::HandoverRequestAcknowledge {
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                admitted_list: admitted
+                    .iter()
+                    .map(|(psi, transfer)| {
+                        nextgcore_ngap::types::PduSessionResourceAdmittedItemHoAck {
+                            pdu_session_id: *psi,
+                            transfer: transfer.clone(),
+                        }
+                    })
+                    .collect(),
+                failed_list: None,
+                target_to_source_container: vec![0xC0, 0xFE],
+            },
+        )
+        .expect("build HandoverRequestAcknowledge")
+    }
+
+    /// Seed a gNB session whose Global gNB ID is `gnb_id`, so a HandoverRequired
+    /// can name it as the target.
+    async fn seed_gnb_session_with_id(server: &NgapServer, association_id: u64, gnb_id: u32) {
+        seed_gnb_session(server, association_id).await;
+        server
+            .sessions
+            .write()
+            .await
+            .get_mut(&association_id)
+            .expect("seeded")
+            .gnb
+            .gnb_id = gnb_id;
+    }
+
+    /// **#742.** A handover preparation that ends without a HandoverNotify -- Cancel
+    /// from the source, Failure from the target, or simply a new HandoverRequired --
+    /// leaves no per-session target transfer behind. Before, only the relay target was
+    /// dropped: the next handover's Notify relayed every stored transfer as
+    /// HANDOVER_COMPLETE, so PSI 2, which the second target never admitted, was
+    /// switched to the FIRST target's DL tunnel (TS 23.502 §4.9.1.3.3 step 12 names
+    /// only the sessions the target accepted).
+    ///
+    /// Driven through the handlers with the sent NGAP captured and a fake SMF recording
+    /// each relay's ref, type and N2 octets. REVERT-VERIFIED per arm: without the
+    /// cleanup in that handler (or at the start of a new preparation) the SMF also
+    /// receives `ref-2` with target A's transfer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_abandoned_preparation_leaves_no_session_transfer_for_the_next_handover() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (_smf, smf_port, seen) = fake_smf_typed().await;
+        let mut server = capturing_ngap_server().await;
+        let (source, target_a, target_b) = (97_421u64, 97_422u64, 97_423u64);
+        let (gnb_a, gnb_b) = (0x7_4201u32, 0x7_4202u32);
+        seed_gnb_session_with_id(&server, source, 0x7_4200).await;
+        seed_gnb_session_with_id(&server, target_a, gnb_a).await;
+        seed_gnb_session_with_id(&server, target_b, gnb_b).await;
+
+        enum Abandon {
+            Cancel,
+            Failure,
+            NewPreparation,
+        }
+        for (n, abandon) in [Abandon::Cancel, Abandon::Failure, Abandon::NewPreparation]
+            .into_iter()
+            .enumerate()
+        {
+            let ue = 7_742_001u64 + n as u64;
+            let source_ran = 42u32;
+            let mut state = UeNasContext::new(ue, source_ran, source, false);
+            state.registered = true;
+            // The HandoverRequest's Allowed NSSAI is SIZE(1..8): one slice to send.
+            state.amf_ue.allowed_nssai = vec![SNssai { sst: 1, sd: None }];
+            server.ue_auth_state.insert(ue, state);
+            for (psi, r) in [(1u8, "ref-1"), (2, "ref-2")] {
+                server.sm_context_refs.insert((ue, psi), format!("{r}-{n}"));
+                server
+                    .sm_context_smfs
+                    .insert((ue, psi), ("127.0.0.1".to_string(), smf_port));
+            }
+
+            // Preparation toward A, which admits both sessions.
+            server
+                .handle_handover_required(
+                    source,
+                    &handover_required_pdu(ue, source_ran, gnb_a, &[1, 2]),
+                )
+                .await
+                .expect("handled");
+            server
+                .handle_handover_request_acknowledge(
+                    target_a,
+                    &handover_ack_pdu(ue, 501, &[(1, vec![0xA1]), (2, vec![0xA2])]),
+                )
+                .await
+                .expect("handled");
+            let sent = take_sent_ngap(&mut server);
+            assert_eq!(
+                sent.iter().map(|(a, _)| *a).collect::<Vec<_>>(),
+                vec![target_a, source],
+                "HandoverRequest to A, HandoverCommand to the source"
+            );
+
+            match abandon {
+                Abandon::Cancel => {
+                    let cancel = nextgcore_ngap::builder::build_handover_cancel(
+                        &nextgcore_ngap::types::HandoverCancel {
+                            amf_ue_ngap_id: ue,
+                            ran_ue_ngap_id: source_ran,
+                            cause: nextgcore_ngap::types::Cause::RadioNetwork(
+                                nextgcore_ngap::types::CauseRadioNetwork::HandoverCancelled,
+                            ),
+                        },
+                    )
+                    .expect("build HandoverCancel");
+                    server
+                        .handle_handover_cancel(source, &cancel)
+                        .await
+                        .expect("handled");
+                }
+                Abandon::Failure => {
+                    let failure = nextgcore_ngap::builder::build_handover_failure(
+                        &nextgcore_ngap::types::HandoverFailure {
+                            amf_ue_ngap_id: ue,
+                            cause: nextgcore_ngap::types::Cause::RadioNetwork(
+                                nextgcore_ngap::types::CauseRadioNetwork::Unspecified,
+                            ),
+                            criticality_diagnostics: None,
+                        },
+                    )
+                    .expect("build HandoverFailure");
+                    server
+                        .handle_handover_failure(target_a, &failure)
+                        .await
+                        .expect("handled");
+                }
+                Abandon::NewPreparation => {}
+            }
+            take_sent_ngap(&mut server);
+            // A Cancel or a Failure ends the preparation by itself: nothing of it may
+            // be left even before another one starts.
+            let left: Vec<u8> = server
+                .handover_target_transfers
+                .keys()
+                .filter(|(u, _)| *u == ue)
+                .map(|(_, psi)| *psi)
+                .collect();
+            let expected: Vec<u8> = match abandon {
+                Abandon::NewPreparation => vec![1, 2],
+                _ => vec![],
+            };
+            let mut left = left;
+            left.sort_unstable();
+            assert_eq!(left, expected, "arm {n}: transfers left after the abandon");
+
+            // The next handover, toward B, admits PSI 1 only; the UE arrives at B.
+            server
+                .handle_handover_required(
+                    source,
+                    &handover_required_pdu(ue, source_ran, gnb_b, &[1, 2]),
+                )
+                .await
+                .expect("handled");
+            server
+                .handle_handover_request_acknowledge(
+                    target_b,
+                    &handover_ack_pdu(ue, 502, &[(1, vec![0xB1])]),
+                )
+                .await
+                .expect("handled");
+            server
+                .handle_handover_notify(target_b, &handover_notify_pdu(ue, 502))
+                .await
+                .expect("handled");
+
+            let relays: Vec<TypedRelay> = std::mem::take(&mut *seen.lock().expect("sink"));
+            assert_eq!(
+                relays,
+                vec![(
+                    format!("ref-1-{n}"),
+                    "HANDOVER_COMPLETE".to_string(),
+                    vec![0xB1]
+                )],
+                "arm {n}: only the session B admitted is switched, to B's tunnel"
+            );
+            assert!(!server
+                .handover_target_transfers
+                .keys()
+                .any(|(u, _)| *u == ue));
+            take_sent_ngap(&mut server);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
