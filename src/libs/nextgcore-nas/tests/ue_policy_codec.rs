@@ -390,6 +390,28 @@ mod ue_policy_golden {
     }
 
     #[test]
+    fn ue_state_indication_keeps_the_first_well_formed_os_id_and_refuses_a_cr_ie() {
+        // #835 review: D.8.7.1 with D.8.6.3. A malformed first UE OS Id
+        // (length 15) is not present, so the well-formed second one is the
+        // first instance and is kept.
+        let mut usi = VEC_UE_STATE_INDICATION.to_vec();
+        usi.extend_from_slice(&[0x41, 15]);
+        usi.extend_from_slice(&[0x11; 15]);
+        usi.extend_from_slice(&[0x41, 16]);
+        usi.extend_from_slice(&[0x22; 16]);
+        assert_eq!(
+            UeStateIndication::decode(&usi).unwrap().os_ids,
+            vec![[0x22; 16]]
+        );
+
+        // An unknown comprehension-required IE (bits 8-5 = 0000) at message
+        // level is an error (D.8.5.1).
+        let mut cr = VEC_UE_STATE_INDICATION.to_vec();
+        cr.extend_from_slice(&[0x0e, 0x01, 0x00]);
+        assert!(UeStateIndication::decode(&cr).is_err());
+    }
+
+    #[test]
     fn upds_network_side_messages_ignore_unknown_trailing_ies() {
         // D.8.6.1 (#763): MANAGE UE POLICY COMPLETE / COMMAND REJECT and
         // UE STATE INDICATION as received by the PCF.
