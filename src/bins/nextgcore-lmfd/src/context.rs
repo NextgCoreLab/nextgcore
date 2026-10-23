@@ -117,8 +117,22 @@ pub struct CellMeasurement {
     pub rsrp: Option<i16>,
     /// Reference Signal Received Quality (dB)
     pub rsrq: Option<i16>,
-    /// Timing advance
+    /// Timing advance, as an NR Timing Advance command `T_A` (TS 38.213
+    /// §4.2, ranged at μ = 1). Only the debug JSON route fills it; the wire
+    /// adapters fill `ecid_rtt_ns`.
     pub timing_advance: Option<u32>,
+    /// The E-CID timing term as a round trip, in ns (#832). It is decoded from its
+    /// own report mapping, where the old code passed the raw report value on as
+    /// an NR TA command:
+    /// - E-UTRA TADV Type 1 or Type 2 (NRPPa, TS 36.133 §10.3);
+    /// - the E-UTRA UE Rx–Tx (LPP, TS 36.133 §9.1.9.3).
+    ///
+    /// It is the serving cell's round trip only, never a Multi-RTT range.
+    pub ecid_rtt_ns: Option<f64>,
+    /// The width of the report bin `ecid_rtt_ns` is the midpoint of, in ns, from the
+    /// same mapping call (#865 review). `None` from the debug route, whose value
+    /// is exact.
+    pub ecid_rtt_width_ns: Option<f64>,
     /// Angle of Arrival (degrees)
     pub aoa: Option<f64>,
     /// Round-trip time (nanoseconds)
@@ -1383,7 +1397,8 @@ impl LmfContext {
 ///    `ue_rx_tx_ns + gnb_rx_tx_ns` (TS 38.305 §8.10, #713).
 /// 2. **NR DL-TDOA** — if ≥ 3 cells report `rstd_ns` and are in the registry.
 /// 3. **AoA** — if ≥ 2 cells report `aoa` and are in the registry.
-/// 4. **ECID** — if the best-RSRP cell has `timing_advance` and is in the registry.
+/// 4. **ECID** — if the best-RSRP cell has a timing term (`ecid_rtt_ns`, or a
+///    debug-route `timing_advance`) and is in the registry.
 ///
 /// On any solver failure or when the registry is empty / has no matching
 /// cells, falls back to the heuristic placeholder (lat/lon 0.0, method-based
@@ -1491,13 +1506,27 @@ fn try_real_solve(
         }
     }
 
-    // --- ECID (serving cell = best RSRP; needs timing_advance + registry hit) -
+    // --- ECID (serving cell = best RSRP; needs a timing term + registry hit) -
     let serving = measurements
         .iter()
-        .filter(|m| m.timing_advance.is_some() && registry.lookup(&m.nr_cgi).is_some())
+        .filter(|m| {
+            (m.ecid_rtt_ns.is_some() || m.timing_advance.is_some())
+                && registry.lookup(&m.nr_cgi).is_some()
+        })
         .max_by_key(|m| m.rsrp.unwrap_or(i16::MIN))?;
 
-    match solve_ecid(registry, &serving.nr_cgi, serving.timing_advance, 1) {
+    // #832: a decoded round trip when the wire gave one, ranged with its own bin
+    // width; a raw NR TA command only from the debug JSON route.
+    let solved = match serving.ecid_rtt_ns {
+        Some(rtt) => crate::positioning::solve_ecid_round_trip(
+            registry,
+            &serving.nr_cgi,
+            rtt,
+            serving.ecid_rtt_width_ns.unwrap_or(0.0),
+        ),
+        None => solve_ecid(registry, &serving.nr_cgi, serving.timing_advance, 1),
+    };
+    match solved {
         Ok(est) => Some(LocationEstimate {
             latitude: est.lat_deg,
             longitude: est.lon_deg,
@@ -1981,6 +2010,8 @@ mod tests {
             rstd_ns: None,
             ue_rx_tx_ns: None,
             rstd_reference: None,
+            ecid_rtt_ns: None,
+            ecid_rtt_width_ns: None,
             gnb_rx_tx_ns: None,
             dl_prs_id: None,
             eutra: false,
@@ -2027,6 +2058,8 @@ mod tests {
                 rstd_ns: None,
                 ue_rx_tx_ns: None,
                 rstd_reference: None,
+                ecid_rtt_ns: None,
+                ecid_rtt_width_ns: None,
                 gnb_rx_tx_ns: None,
                 dl_prs_id: None,
                 eutra: false,
@@ -2041,6 +2074,8 @@ mod tests {
                 rstd_ns: None,
                 ue_rx_tx_ns: None,
                 rstd_reference: None,
+                ecid_rtt_ns: None,
+                ecid_rtt_width_ns: None,
                 gnb_rx_tx_ns: None,
                 dl_prs_id: None,
                 eutra: false,
@@ -2163,6 +2198,8 @@ mod tests {
             rstd_ns: None,
             ue_rx_tx_ns: None,
             rstd_reference: None,
+            ecid_rtt_ns: None,
+            ecid_rtt_width_ns: None,
             gnb_rx_tx_ns: None,
             dl_prs_id: None,
             eutra: false,
@@ -2187,6 +2224,8 @@ mod tests {
             rstd_ns: None,
             ue_rx_tx_ns: None,
             rstd_reference: None,
+            ecid_rtt_ns: None,
+            ecid_rtt_width_ns: None,
             gnb_rx_tx_ns: None,
             dl_prs_id: None,
             eutra: false,
@@ -2314,6 +2353,8 @@ mod tests_real_solve {
                     rstd_ns: None,
                     ue_rx_tx_ns: None,
                     rstd_reference: None,
+                    ecid_rtt_ns: None,
+                    ecid_rtt_width_ns: None,
                     gnb_rx_tx_ns: None,
                     dl_prs_id: None,
                     eutra: false,
@@ -2356,6 +2397,8 @@ mod tests_real_solve {
                     rstd_ns: Some(rstd_ns),
                     ue_rx_tx_ns: None,
                     rstd_reference: None,
+                    ecid_rtt_ns: None,
+                    ecid_rtt_width_ns: None,
                     gnb_rx_tx_ns: None,
                     dl_prs_id: None,
                     eutra: false,
@@ -2398,6 +2441,8 @@ mod tests_real_solve {
             rstd_ns: None,
             ue_rx_tx_ns: None,
             rstd_reference: None,
+            ecid_rtt_ns: None,
+            ecid_rtt_width_ns: None,
             gnb_rx_tx_ns: None,
             dl_prs_id: None,
             eutra: false,
@@ -2445,6 +2490,8 @@ mod tests_real_solve {
                     rstd_ns: None,
                     ue_rx_tx_ns: None,
                     rstd_reference: None,
+                    ecid_rtt_ns: None,
+                    ecid_rtt_width_ns: None,
                     gnb_rx_tx_ns: None,
                     dl_prs_id: None,
                     eutra: false,
@@ -2485,6 +2532,8 @@ mod tests_real_solve {
                     rstd_ns: None,
                     ue_rx_tx_ns: None,
                     rstd_reference: None,
+                    ecid_rtt_ns: None,
+                    ecid_rtt_width_ns: None,
                     gnb_rx_tx_ns: None,
                     dl_prs_id: None,
                     eutra: false,
@@ -2514,6 +2563,8 @@ mod tests_real_solve {
             rstd_ns: None,
             ue_rx_tx_ns: None,
             rstd_reference: None,
+            ecid_rtt_ns: None,
+            ecid_rtt_width_ns: None,
             gnb_rx_tx_ns: None,
             dl_prs_id: None,
             eutra: false,
@@ -2560,6 +2611,8 @@ mod tests_real_solve {
             rstd_ns: None,
             ue_rx_tx_ns: None,
             rstd_reference: None,
+            ecid_rtt_ns: None,
+            ecid_rtt_width_ns: None,
             gnb_rx_tx_ns: None,
             dl_prs_id: None,
             eutra: false,
@@ -2731,6 +2784,8 @@ mod tests_real_solve {
             rstd_ns: None,
             ue_rx_tx_ns: None,
             rstd_reference: None,
+            ecid_rtt_ns: None,
+            ecid_rtt_width_ns: None,
             gnb_rx_tx_ns: None,
             dl_prs_id: None,
             eutra: false,
@@ -2849,6 +2904,8 @@ mod tests_multi_rtt_two_sided {
                 rstd_ns: None,
                 ue_rx_tx_ns: None,
                 rstd_reference: None,
+                ecid_rtt_ns: None,
+                ecid_rtt_width_ns: None,
                 gnb_rx_tx_ns: Some(propagation_ns(*e, *n) - UE_CLOCK_OFFSET_NS + SRS_AFTER_PRS_NS),
                 dl_prs_id: None,
                 eutra: false,
@@ -3307,6 +3364,8 @@ mod tests_dl_tdoa_reference {
             rstd_ns: Some(1234.0),
             ue_rx_tx_ns: None,
             rstd_reference: Some(7),
+            ecid_rtt_ns: None,
+            ecid_rtt_width_ns: None,
             gnb_rx_tx_ns: None,
             dl_prs_id: Some(3),
             eutra: false,
@@ -3395,6 +3454,8 @@ mod tests_ecid_label {
             rtt_ns: None,
             rstd_ns: None,
             ue_rx_tx_ns: None,
+            ecid_rtt_ns: None,
+            ecid_rtt_width_ns: None,
             gnb_rx_tx_ns: None,
             rstd_reference: None,
             dl_prs_id: None,
@@ -3408,6 +3469,148 @@ mod tests_ecid_label {
         let label = |eutra| try_real_solve(&[serving(eutra)], &reg).unwrap().method_used;
         assert_eq!(label(true).as_deref(), Some("ECID"));
         assert_eq!(label(false).as_deref(), Some("NR_ECID"));
+    }
+}
+
+/// #832: the E-CID timing term is decoded from its own report mapping. An NRPPa
+/// TADV of 500 is [1000, 1002) T_s (TS 36.133 §10.3.1), a 1001 T_s round trip,
+/// so the ring is c·1001·T_s/2 ≈ 4884.5 m plus half the one-way bin width. The
+/// old code read 500 as an NR TA command (512 T_c each), a ring of ≈ 19.5 km.
+#[cfg(test)]
+mod tests_ecid_timing_units {
+    use super::*;
+    use crate::nrppa_uplink::test_support::{ecid_report, nr_cgi, rsrp, ta1};
+    use crate::positioning::SPEED_OF_LIGHT_M_S;
+
+    #[test]
+    fn an_nrppa_tadv_is_ranged_in_e_utra_t_s_not_as_an_nr_ta_command() {
+        let bytes = ecid_report(
+            1,
+            42,
+            7,
+            nr_cgi([0x02, 0xF8, 0x39], 1),
+            [0, 0x12, 0x34],
+            Some(vec![ta1(500), rsrp(&[60])]),
+        );
+        let (_, cells) = crate::codec_glue::decode_nrppa_ecid_report(&bytes).unwrap();
+        let reg =
+            TrpRegistry::from_entries([(cells[0].nr_cgi.clone(), TrpCoord::new(40.0, -74.0, 0.0))]);
+        let fix = try_real_solve(&cells, &reg).expect("an E-CID fix");
+        // By hand: T_s = 1/(15000·2048) s.
+        let ts = 1.0 / (15_000.0 * 2_048.0);
+        let want = SPEED_OF_LIGHT_M_S * 1001.0 * ts / 2.0 + SPEED_OF_LIGHT_M_S * 2.0 * ts / 4.0;
+        assert!(
+            (fix.horizontal_accuracy - want).abs() < 0.01,
+            "{} vs {want}",
+            fix.horizontal_accuracy
+        );
+        assert!(
+            fix.horizontal_accuracy < 5_000.0,
+            "not the ≈19.5 km of an NR TA reading"
+        );
+        assert_eq!((fix.latitude, fix.longitude), (40.0, -74.0));
+    }
+
+    /// #865 review MINOR 1: on a TDD cell (EARFCN 38000, band 38) the UE Rx–Tx
+    /// includes N_TA,offset = 624 T_s (TS 36.211 §8.1), which is removed. On an FDD
+    /// cell (EARFCN 1850) nothing is. Value 700 is [1400, 1402) T_s.
+    #[test]
+    fn the_tdd_timing_offset_is_not_ranged() {
+        use crate::lpp_fixtures::{ecid_provide, measured_results_element};
+        let ts = 1e9 / (15_000.0 * 2_048.0);
+        let rtt_on = |earfcn: u16| {
+            let bytes = ecid_provide(
+                1,
+                vec![measured_results_element(
+                    7,
+                    earfcn,
+                    Some(60),
+                    None,
+                    Some(700),
+                )],
+            );
+            let (_, cells) = crate::codec_glue::decode_lpp_ecid_report(&bytes).unwrap();
+            (
+                cells[0].ecid_rtt_ns.unwrap(),
+                cells[0].ecid_rtt_width_ns.unwrap(),
+            )
+        };
+        let (fdd, w_fdd) = rtt_on(1850);
+        let (tdd, w_tdd) = rtt_on(38_000);
+        assert!((fdd - 1401.0 * ts).abs() < 1e-9, "{fdd}");
+        assert!((tdd - (1401.0 - 624.0) * ts).abs() < 1e-9, "{tdd}");
+        assert!((w_fdd - 2.0 * ts).abs() < 1e-9 && (w_tdd - w_fdd).abs() < 1e-12);
+        // Band edges: 35999 is FDD (band 32 ends below); 36000 and 60304 (the top
+        // of band 54) are TDD; 60305 is not a TDD EARFCN.
+        assert!((rtt_on(35_999).0 - fdd).abs() < 1e-9);
+        assert!((rtt_on(36_000).0 - tdd).abs() < 1e-9);
+        assert!((rtt_on(60_255).0 - tdd).abs() < 1e-9, "band 54 is TDD");
+        assert!((rtt_on(60_304).0 - tdd).abs() < 1e-9);
+        assert!((rtt_on(60_305).0 - fdd).abs() < 1e-9);
+    }
+
+    /// #865 review MINOR 4: with both TADV types present, Type 1 is used whatever
+    /// the IE order (TS 36.305 §8.3).
+    #[test]
+    fn tadv_type_1_is_preferred_over_type_2() {
+        use crate::nrppa_uplink::test_support::ta2;
+        let ts = 1e9 / (15_000.0 * 2_048.0);
+        for measured in [vec![ta2(900), ta1(500)], vec![ta1(500), ta2(900)]] {
+            let bytes = ecid_report(
+                1,
+                42,
+                7,
+                nr_cgi([0x02, 0xF8, 0x39], 1),
+                [0, 0x12, 0x34],
+                Some(measured),
+            );
+            let (_, cells) = crate::codec_glue::decode_nrppa_ecid_report(&bytes).unwrap();
+            assert!((cells[0].ecid_rtt_ns.unwrap() - 1001.0 * ts).abs() < 1e-9);
+        }
+    }
+
+    /// #865 review MINOR 2: the solver ranges with the width the mapping returned,
+    /// not a second copy of the table. An 8 T_s bin (value 2048) widens the ring.
+    #[test]
+    fn the_solver_uses_the_bin_width_it_was_given() {
+        let bytes = ecid_report(
+            1,
+            42,
+            7,
+            nr_cgi([0x02, 0xF8, 0x39], 1),
+            [0, 0x12, 0x34],
+            Some(vec![ta1(2048), rsrp(&[60])]),
+        );
+        let (_, mut cells) = crate::codec_glue::decode_nrppa_ecid_report(&bytes).unwrap();
+        let ts = 1e9 / (15_000.0 * 2_048.0);
+        assert!((cells[0].ecid_rtt_width_ns.unwrap() - 8.0 * ts).abs() < 1e-9);
+        let reg =
+            TrpRegistry::from_entries([(cells[0].nr_cgi.clone(), TrpCoord::new(40.0, -74.0, 0.0))]);
+        let wide = try_real_solve(&cells, &reg).unwrap().horizontal_accuracy;
+        cells[0].ecid_rtt_width_ns = Some(0.0);
+        let exact = try_real_solve(&cells, &reg).unwrap().horizontal_accuracy;
+        let c = SPEED_OF_LIGHT_M_S * 1e-9;
+        assert!(
+            (wide - exact - c * 8.0 * ts / 4.0).abs() < 0.01,
+            "{wide} {exact}"
+        );
+    }
+
+    #[test]
+    fn an_open_ended_tadv_gives_no_timing_term() {
+        let bytes = ecid_report(
+            1,
+            42,
+            7,
+            nr_cgi([0x02, 0xF8, 0x39], 1),
+            [0, 0x12, 0x34],
+            Some(vec![ta1(7690)]),
+        );
+        let (_, cells) = crate::codec_glue::decode_nrppa_ecid_report(&bytes).unwrap();
+        assert_eq!(cells[0].ecid_rtt_ns, None);
+        let reg =
+            TrpRegistry::from_entries([(cells[0].nr_cgi.clone(), TrpCoord::new(40.0, -74.0, 0.0))]);
+        assert!(try_real_solve(&cells, &reg).is_none());
     }
 }
 
@@ -3445,6 +3648,8 @@ mod tests_session_legs {
             rstd_ns: None,
             rstd_reference: None,
             ue_rx_tx_ns: None,
+            ecid_rtt_ns: None,
+            ecid_rtt_width_ns: None,
             gnb_rx_tx_ns: None,
             dl_prs_id: None,
             eutra: false,
