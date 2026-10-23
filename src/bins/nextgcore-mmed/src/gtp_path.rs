@@ -592,23 +592,39 @@ fn echo_interval() -> Option<Duration> {
     }
 }
 
-/// Note a peer's Recovery counter, logging a restart (TS 23.007 §18).
+/// Note a peer's Recovery counter (TS 23.007 §18). Returns `true` when it
+/// differs from the one last seen from that peer: the peer restarted.
 ///
-/// Recorded and logged rather than acted on: deleting this MME's contexts because the
-/// SGW restarted is a decision about UE state that #51 does not own, and doing it
-/// silently would detach every attached UE on a counter change that a reordered
-/// datagram can also produce.
-fn note_peer_recovery(inner: &Arc<GtpcInner>, peer: SocketAddr, counter: u8) {
+/// The first counter seen from a peer is only recorded. TS 23.007 §18 makes "a
+/// value different from the one stored" the restart signal, so this is a
+/// comparison with the stored value and not an ordering. A reordered datagram
+/// from one incarnation carries that incarnation's counter, so it cannot fake a
+/// change.
+fn note_peer_recovery(inner: &Arc<GtpcInner>, peer: SocketAddr, counter: u8) -> bool {
     let Ok(mut seen) = inner.peer_restart.lock() else {
-        return;
+        return false;
     };
     match seen.insert(peer.ip(), counter) {
-        Some(previous) if previous != counter => log::warn!(
-            "S11 peer {peer} restarted: Recovery {previous} -> {counter}; its S11 contexts are \
-             stale (TS 23.007 §18)"
-        ),
-        _ => log::debug!("S11 peer {peer} Recovery counter {counter}"),
+        Some(previous) if previous != counter => {
+            log::warn!(
+                "S11 peer {peer} restarted: Recovery {previous} -> {counter}; the PDN \
+                 connections this MME held with it are gone (TS 23.007 §18)"
+            );
+            true
+        }
+        _ => {
+            log::debug!("S11 peer {peer} Recovery counter {counter}");
+            false
+        }
     }
+}
+
+/// TS 23.007 §15 (#689): a Serving GW restart lost every PDN connection the MME
+/// had through it. The UEs on it are detached, re-attach required.
+fn on_s11_peer_restart(peer: SocketAddr) {
+    let ctx = crate::context::mme_self();
+    let n = crate::network_detach::sgw_restarted(ctx, ctx.sgwc_list.first().copied(), peer.ip());
+    log::warn!("S11 peer {peer} restart: {n} UE(s) detached, re-attach required");
 }
 
 /// Dispatch one received datagram.
@@ -624,7 +640,12 @@ fn handle_datagram(inner: &Arc<GtpcInner>, data: &[u8], peer: SocketAddr) {
 
     if let Some(rec_ie) = msg.get_ie(Gtp2IeType::Recovery as u8, 0) {
         if let Ok(rec) = Gtp2RecoveryIe::decode(&rec_ie.value) {
-            note_peer_recovery(inner, peer, rec.restart_counter);
+            // Acted on BEFORE the message is dispatched: a Create Session Response
+            // from the new incarnation then lands on a UE whose S11 session is not
+            // yet recorded, so its fresh PDN connection is not mistaken for a lost one.
+            if note_peer_recovery(inner, peer, rec.restart_counter) {
+                on_s11_peer_restart(peer);
+            }
         }
     }
 
@@ -2015,6 +2036,24 @@ mod tests {
             .expect("Recovery is mandatory in an Echo Response");
         assert_eq!(recovery.value.first().copied(), Some(7));
 
+        server.close();
+    }
+
+    /// #689: only a CHANGED counter from a known peer is a restart.
+    #[test]
+    fn a_changed_recovery_counter_is_a_restart() {
+        let _guard = lock_s11();
+        let (server, _peer, peer_addr) = spawn_server_and_peer(Gtp2XactConfig::default());
+        assert!(
+            !note_peer_recovery(&server.inner, peer_addr, 3),
+            "first sighting"
+        );
+        assert!(
+            !note_peer_recovery(&server.inner, peer_addr, 3),
+            "same incarnation"
+        );
+        assert!(note_peer_recovery(&server.inner, peer_addr, 4), "restarted");
+        assert!(!note_peer_recovery(&server.inner, peer_addr, 4));
         server.close();
     }
 }

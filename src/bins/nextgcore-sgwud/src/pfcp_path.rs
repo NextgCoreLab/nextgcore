@@ -1176,7 +1176,13 @@ impl SxaNode {
         let node_id = self.peers.read().await.get(&from).map(|p| p.node_id);
         let cp_f_seid = f_seid_from_lib(&req.cp_f_seid);
         let ctx = sgwu_self();
-        let sess = match ctx.sess_find_by_sgwc_sxa_seid(cp_f_seid.seid) {
+        // #700: by the whole CP F-SEID, not its SEID. A SEID is unique only within the
+        // CP function that allocated it (TS 29.244 §5.6.1: the F-SEID, SEID plus IP
+        // address, identifies the session). A restarted SGW-C at a new address numbers
+        // its sessions from 1 again; matched by SEID alone, its first Establishment was
+        // answered from the OLD SGW-C's session, still tagged with the old node, and
+        // that node's restoration then deleted the new UE's rules.
+        let sess = match ctx.sess_find_by_sgwc_sxa_f_seid(&cp_f_seid) {
             // A repeated Establishment for a CP F-SEID we already hold is the CP
             // retransmitting: answer from the existing session rather than allocating a
             // second one for the same UE.
@@ -2171,6 +2177,92 @@ mod tests {
         assert_eq!(peers[0].state, PfcpNodeState::Associated);
         assert_eq!(peers[0].recovery_time_stamp, Some(999));
         assert!(node.is_associated().await, "the health probe's question");
+    }
+
+    /// #700: two SGW-Cs using the same CP SEID get two sessions, and the old one's
+    /// restoration leaves the new one's rules alone.
+    ///
+    /// What devtest1 showed when the sgwc pod was replaced: the new SGW-C (new
+    /// address, new PFCP node) numbered its first session 0x1, as the old one had.
+    /// Matched by SEID alone, the Establishment reused the old SGW-C's session,
+    /// which stayed tagged with the old node, and the old node's teardown deleted it:
+    /// every uplink packet after that was "No PDR for TEID".
+    #[tokio::test]
+    async fn a_restarted_sgwc_reusing_a_cp_seid_gets_its_own_session() {
+        let (_guard, node, old_peer) = node_and_peer().await;
+        let new_peer = UdpSocket::bind("127.0.0.1:0").await.expect("bind new peer");
+
+        let associate = |node_ip: [u8; 4]| {
+            let mut assoc = BytesMut::new();
+            PfcpLibMessage::AssociationSetupRequest(AssociationSetupRequest::new(
+                NodeId::new_ipv4(node_ip),
+                1000,
+            ))
+            .encode_body(&mut assoc);
+            wire(pfcp_msg_type::ASSOCIATION_SETUP_REQUEST, None, 1, &assoc)
+        };
+        let establish = |node_ip: [u8; 4]| {
+            let mut req = LibSessionEstablishmentRequest::new(
+                NodeId::new_ipv4(node_ip),
+                LibFSeid::new_ipv4(0x1, node_ip),
+            );
+            let mut pdi = Pdi::new(SourceInterface::Access);
+            let mut f_teid = FTeid::new_ipv4(0, [127, 0, 0, 1]);
+            f_teid.ch = true;
+            pdi.local_f_teid = Some(f_teid);
+            let mut pdr = CreatePdr::new(1, 100, pdi);
+            pdr.far_id = Some(1);
+            req.create_pdrs.push(pdr);
+            let mut far = CreateFar::new(1, ApplyAction::forward());
+            far.forwarding_parameters = Some(ForwardingParameters::new(DestinationInterface::Core));
+            req.create_fars.push(far);
+            let mut body = BytesMut::new();
+            req.encode(&mut body);
+            wire(
+                pfcp_msg_type::SESSION_ESTABLISHMENT_REQUEST,
+                Some(0),
+                9,
+                &body,
+            )
+        };
+        const OLD: [u8; 4] = [127, 0, 0, 9];
+        const NEW: [u8; 4] = [127, 0, 0, 8];
+
+        deliver(&node, &old_peer, &associate(OLD)).await;
+        let _ = recv_decoded(&old_peer).await;
+        deliver(&node, &old_peer, &establish(OLD)).await;
+        let _ = recv_decoded(&old_peer).await;
+        deliver(&node, &new_peer, &associate(NEW)).await;
+        let _ = recv_decoded(&new_peer).await;
+        deliver(&node, &new_peer, &establish(NEW)).await;
+        let (header, body) = recv_decoded(&new_peer).await;
+        assert_eq!(
+            find_cause(&body),
+            Some(sxa_build::pfcp_cause::REQUEST_ACCEPTED)
+        );
+        assert_eq!(header.seid, Some(0x1));
+
+        let ctx = sgwu_self();
+        let old = ctx
+            .sess_find_by_sgwc_sxa_f_seid(&FSeid::with_ipv4(0x1, Ipv4Addr::from(OLD)))
+            .expect("the old SGW-C's session");
+        let new = ctx
+            .sess_find_by_sgwc_sxa_f_seid(&FSeid::with_ipv4(0x1, Ipv4Addr::from(NEW)))
+            .expect("the new SGW-C's Establishment must create a session of its own");
+        assert_ne!(old.id, new.id, "one session per CP F-SEID, not per CP SEID");
+        assert_ne!(
+            old.pfcp_node_id, new.pfcp_node_id,
+            "each session is tagged with the node that established it"
+        );
+
+        // The old SGW-C is gone: its node's sessions go, the new UE's rules stay.
+        node.declare_peer_failure(old_peer.local_addr().unwrap(), "test: old SGW-C gone")
+            .await;
+        assert!(ctx.sess_find_by_id(old.id).is_none());
+        assert!(
+            ctx.sess_find_by_id(new.id).is_some() && ctx.pdr_find(new.id, 1).is_some(),
+            "the new SGW-C's session and its PDR survive the old node's restoration"
+        );
     }
 
     /// #59 criterion 3, second half: a Session Establishment Request is decoded down
