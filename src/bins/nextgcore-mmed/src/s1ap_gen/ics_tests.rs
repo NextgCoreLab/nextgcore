@@ -301,3 +301,49 @@ fn through_the_handler_a_failure_for_an_unknown_ue_still_gets_an_error_indicatio
         S1apMessage::ErrorIndication(_)
     ));
 }
+
+/// #869 review: a UE-AMBR above 10 Gbit/s is not lost. The legacy Bit Rate is
+/// at its maximum and the Rel-15 Extended UE-AMBR (id 259 DL / 260 UL,
+/// criticality ignore, TS 36.413 §9.2.1.20) carries the value, for that
+/// direction only. The encode runs the criticality oracle under test, so a wrong
+/// criticality on the extension fails here too.
+#[test]
+fn a_ue_ambr_above_10_gbits_travels_in_the_extended_ie() {
+    use nextgcore_s1ap_gen::generated as g;
+    let mut req = golden_request();
+    req.ue_ambr = UeAmbr {
+        dl: 15_000_000_000,
+        ul: 2_000,
+    };
+    let bytes = build_initial_context_setup_request(&req).unwrap();
+    let pdu = nextgcore_s1ap_gen::decode(&bytes).unwrap();
+    let g::S1AP_PDU::InitiatingMessage(m) = pdu else {
+        panic!("an initiating message")
+    };
+    let g::InitiatingMessageValue::Id_InitialContextSetup(r) = m.value else {
+        panic!("an Initial Context Setup Request")
+    };
+    let a = r
+        .protocol_i_es
+        .0
+        .iter()
+        .find_map(|ie| match &ie.value {
+            g::InitialContextSetupRequestProtocolIEs_EntryValue::Id_uEaggregateMaximumBitrate(
+                a,
+            ) => Some(a.clone()),
+            _ => None,
+        })
+        .expect("the UE-AMBR IE");
+    assert_eq!(a.u_eaggregate_maximum_bit_rate_dl.0, 10_000_000_000);
+    assert_eq!(a.u_eaggregate_maximum_bit_rate_ul.0, 2_000);
+    let ext = a.ie_extensions.expect("the extension container").0;
+    assert_eq!(ext.len(), 1, "DL only");
+    assert_eq!(ext[0].id.0, 259);
+    assert_eq!(ext[0].criticality.0, g::Criticality::IGNORE);
+    assert!(matches!(
+        ext[0].extension_value,
+        g::UEAggregateMaximumBitrateIE_Extensions_EntryExtensionValue::Id_extended_uEaggregateMaximumBitRateDL(
+            g::ExtendedBitRate(15_000_000_000)
+        )
+    ));
+}

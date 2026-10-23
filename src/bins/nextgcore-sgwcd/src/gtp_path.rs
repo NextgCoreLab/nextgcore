@@ -3834,9 +3834,11 @@ mod tests {
 
     /// #792 review: a legacy MME's Command with the MSB clear whose number this
     /// node already uses for its own outstanding S11 request to that MME is
-    /// refused with its Failure Indication (cause Request rejected) instead of
-    /// being relayed, so the triggered Request cannot replace that transaction;
-    /// and this node's own initial requests skip numbers in use towards a peer.
+    /// dropped, neither answered (a Failure Indication on that number would
+    /// close the own request at the MME) nor relayed, so the triggered Request
+    /// cannot replace that transaction; the MME's retransmission is relayed once
+    /// the own request is answered. And this node's own initial requests skip
+    /// numbers in use towards a peer.
     #[test]
     fn a_legacy_command_number_cannot_clash_with_an_own_request() {
         let ambient = crate::pfcp_path::process_state_test_guard_blocking();

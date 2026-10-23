@@ -310,6 +310,10 @@ impl MmeApp {
             for send in s1ap_handler::expire_handover_preparations(ctx, std::time::Instant::now()) {
                 s1ap_path::s1ap_send(send);
             }
+            // A UE-AMBR change deferred behind a handover that just expired (#869).
+            for send in s6a_handler::deferred_ue_ambr_sends(ctx) {
+                s1ap_path::s1ap_send(send);
+            }
 
             // Signal or lift S1AP overload if the attached-UE count crossed the
             // configured threshold (TS 36.413 §8.7.6). A no-op unless
@@ -443,7 +447,7 @@ async fn main() -> Result<()> {
     // address on purpose (or scrapes through a sidecar).
     match nextgcore_metrics::nes_energy::serve_metrics(
         metrics_addr(),
-        Arc::new(handover_switch::render_metrics),
+        Arc::new(|| handover_switch::render_metrics() + &s1ap_handler::render_metrics()),
     )
     .await
     {

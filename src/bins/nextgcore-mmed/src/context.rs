@@ -1056,6 +1056,16 @@ pub struct MmeUe {
     /// ATTACH, TAU or SERVICE REQUEST colliding with it is treated
     /// (§5.5.2.3.5 d-f, #732).
     pub network_detach_type: Option<crate::emm_build::DetachTypeToUe>,
+    /// The eNB UE context an INITIAL CONTEXT SETUP REQUEST was sent on and not
+    /// yet answered (0: none). Keyed by the S1 connection so a later connection
+    /// is not mistaken for one still being set up (#869 review).
+    pub ics_pending_on: u64,
+    /// A UE-AMBR change (TS 23.401 §5.4.2.2) waits for the Initial Context Setup
+    /// or S1 handover in progress, which carries a value computed earlier; it is
+    /// signalled when that procedure ends (#869 review).
+    pub ue_ambr_deferred: bool,
+    /// A UE CONTEXT MODIFICATION REQUEST carrying a UE-AMBR is outstanding.
+    pub ue_ambr_modification_pending: bool,
 
     // UE Identity
     /// IMSI
