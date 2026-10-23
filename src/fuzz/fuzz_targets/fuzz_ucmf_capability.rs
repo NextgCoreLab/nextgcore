@@ -20,6 +20,9 @@
 
 use libfuzzer_sys::fuzz_target;
 
+// rustfmt would follow rac.rs into its `#[cfg(test)] mod tests` and fail to
+// resolve it from here; rac.rs is formatted as part of nextgcore-ucmfd.
+#[rustfmt::skip]
 #[allow(dead_code)]
 #[path = "../../bins/nextgcore-ucmfd/src/rac.rs"]
 mod rac;
