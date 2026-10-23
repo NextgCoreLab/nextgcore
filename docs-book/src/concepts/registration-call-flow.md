@@ -376,6 +376,13 @@ registration:
   `dereg-notify`, `ue-policy-notify`, `sm-context-status` and `ucmf-notify`
   callbacks (`namf_server.rs`), but not the `am-policy-notify` URI it hands the
   PCF in `Npcf_AMPolicyControl_Create`.
+- **UECM identity is the NF instance id.** The AMF registers with the UDM
+  (`Nudm_UECM_Registration`) under its `nfInstanceId`. Pin it with
+  `NEXTGCORE_AMF_INSTANCE_ID`, as the Helm chart, the k8s manifest and compose
+  do: a restarted AMF is then the same AMF to the UDM. Each registration's
+  `deregCallbackUri` ends in a per-registration token. A dereg-notify naming
+  any other token concerns a registration the AMF no longer holds, so it is
+  answered 204 and tears nothing down (#753).
 - **Config loading is lenient.** An unreadable/unparsable `amf.yaml` logs a
   warning and continues with built-in defaults (`load_config` in
   `lib.rs`) — a running AMF is not proof your config was applied. See the

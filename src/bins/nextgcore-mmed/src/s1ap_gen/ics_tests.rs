@@ -1,5 +1,11 @@
 //! #514 stage 4: Initial Context Setup on the generated codec.
 //!
+//! #737: since the hand-written encoder was deleted (#560), the
+//! `*_with_schema_criticalities` tests below compare the production encoder
+//! with itself and check it decodes back; what pins each IE criticality is
+//! `criticality_oracle`, which checks every PDU a production builder encodes
+//! against the TS 36.413 §9.3 object sets.
+//!
 //! Oracle: the pre-change hand-written builders and parser
 //! (`test_codec::builder`, `decode_s1ap_pdu`: since #514 stage 13b the generated codec with an independently written domain mapping, and builders for messages mmed sends check that their output decodes back to their input). Golden: nextgcore-s1ap's
 //! `golden_x691.rs` Initial Context Setup Request (derived by hand from X.691
@@ -114,7 +120,7 @@ fn requests() -> Vec<InitialContextSetupRequest> {
 }
 
 #[test]
-fn the_request_matches_the_hand_written_encoder() {
+fn the_request_round_trips_with_schema_criticalities() {
     let reqs = requests();
     assert_eq!(reqs.len(), 4 * 2 * 3 * 3 * 2);
     for req in &reqs {

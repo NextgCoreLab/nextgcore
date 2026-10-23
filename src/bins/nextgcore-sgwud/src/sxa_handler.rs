@@ -858,6 +858,7 @@ fn process_create_far(sess: &SgwuSess, req: &CreateFarRequest) -> Result<(), u8>
         destination_interface,
         outer_header_creation,
         buffered: Vec::new(),
+        flushing: false,
     }) {
         return Err(pfcp_cause::SYSTEM_FAILURE);
     }
@@ -1124,6 +1125,29 @@ fn process_update_far(sess: &SgwuSess, req: &UpdateFarRequest) -> Result<(), u8>
 
     ctx.far_update_with(sess.id, req.far_id, |far| {
         if let Some(action) = req.apply_action {
+            let was_buff = far.apply_action & crate::context::apply_action::BUFF != 0;
+            let now_buff = action & crate::context::apply_action::BUFF != 0;
+            let now_forw = action & crate::context::apply_action::FORW != 0;
+            if was_buff && !now_buff {
+                if now_forw && !far.buffered.is_empty() {
+                    // #831 review: mark the flush in the SAME critical section that
+                    // switches the action, so a packet that decided "buffer" against
+                    // the old action queues behind the buffered ones instead of
+                    // overtaking them.
+                    far.flushing = true;
+                } else if !now_forw {
+                    // #831 review: BUFF -> DROP (or any non-forwarding action) discards
+                    // the queue; nothing will ever flush it otherwise.
+                    if !far.buffered.is_empty() {
+                        log::debug!(
+                            "FAR {}: leaving BUFF without FORW, discarding {} buffered packets",
+                            far.far_id,
+                            far.buffered.len()
+                        );
+                    }
+                    far.buffered.clear();
+                }
+            }
             far.apply_action = action;
         }
         if let Some(ref fp) = req.update_forwarding_parameters {
@@ -1268,6 +1292,43 @@ mod tests {
         let (result, created_pdrs) = handle_session_establishment_request(Some(&sess), 1, &req);
         assert!(matches!(result, HandlerResult::Ok));
         assert_eq!(created_pdrs.len(), 1);
+    }
+
+    /// #831 review: an Update FAR leaving BUFF empties the queue either way -- flushed
+    /// (BUFF -> FORW, the flush ends) or DISCARDED (BUFF -> DROP, which used to leave
+    /// the packets buffered until the FAR or session was removed).
+    #[test]
+    fn an_update_far_leaving_buff_empties_the_queue() {
+        let sess = SgwuSess {
+            id: 0x8310,
+            ..Default::default()
+        };
+        let ctx = sgwu_self();
+        for (far_id, action) in [
+            (1u32, crate::context::apply_action::FORW),
+            (2, crate::context::apply_action::DROP),
+        ] {
+            ctx.far_install(SgwuFar {
+                sess_id: sess.id,
+                far_id,
+                apply_action: crate::context::apply_action::BUFF,
+                ..Default::default()
+            });
+            ctx.far_buffer_packet(sess.id, far_id, vec![9], 8);
+            process_update_far(
+                &sess,
+                &UpdateFarRequest {
+                    far_id,
+                    apply_action: Some(action),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let far = ctx.far_find(sess.id, far_id).unwrap();
+            assert!(far.buffered.is_empty(), "FAR {far_id}: queue emptied");
+            assert!(!far.flushing, "FAR {far_id}: no flush left running");
+        }
+        ctx.sess_remove(sess.id);
     }
 
     #[test]
