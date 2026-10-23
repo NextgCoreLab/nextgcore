@@ -1811,4 +1811,33 @@ mod tests {
              TAU path reject the UE as implicitly detached (nas_dispatch.rs)"
         );
     }
+
+    /// #741 (review of #858, MINOR 1): Figures 8.51-2 and 8.51-4 have the receiver IGNORE
+    /// the spare bits, and for a short macro id bits 5-3 of octet 9. Every one of them set
+    /// to 1 still yields the same id.
+    #[test]
+    fn the_target_identification_parse_ignores_the_spare_bits() {
+        let parse = |body: &[u8]| {
+            let t = parse_enb_target_identification(body).expect("parses");
+            (t.enb_id, t.enb_id_bits, t.tac)
+        };
+        // Type 1: spare nibble 1111 above id bits 20-17 = 0x1.
+        assert_eq!(
+            parse(&[0x01, 0x00, 0xF1, 0x10, 0xF1, 0x23, 0x45, 0x12, 0x34]),
+            (0x1_2345, 20, 0x1234)
+        );
+        // Type 4, SMeNB clear: spare bits 7-6 set above id bits 21-17 = 0x1A.
+        assert_eq!(
+            parse(&[0x04, 0x00, 0xF1, 0x10, 0x7A, 0xBC, 0xDE, 0x12, 0x34]),
+            (0x1A_BCDE, 21, 0x1234)
+        );
+        // Type 4, SMeNB set: spare bits 7-6 and bits 5-3 set above id bits 18-17 = 0x2.
+        assert_eq!(
+            parse(&[0x04, 0x00, 0xF1, 0x10, 0xFE, 0xAB, 0xCD, 0x12, 0x34]),
+            (0x2_ABCD, 18, 0x1234)
+        );
+        // Another Target Type, and a body too short for Types 1 and 4, are refused.
+        assert!(parse_enb_target_identification(&[0x05, 0, 0xF1, 0x10, 0, 0, 0, 0, 0]).is_err());
+        assert!(parse_enb_target_identification(&[0x01, 0, 0xF1, 0x10, 0, 0, 0, 0]).is_err());
+    }
 }

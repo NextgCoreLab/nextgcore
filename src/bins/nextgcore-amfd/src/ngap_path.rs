@@ -9479,7 +9479,7 @@ impl NgapServer {
             return Ok(());
         };
 
-        let target_identification = eps_target_identification(&required.target_id);
+        let target_identification = Self::eps_target_identification(&required.target_id);
         let target_identification = match target_identification {
             Ok(body) => body,
             Err(why) => {
@@ -9563,6 +9563,37 @@ impl NgapServer {
                 )
                 .await
             }
+        }
+    }
+
+    /// The TS 29.274 §8.51 Target Identification body for a `fivegs-to-eps` HandoverRequired's
+    /// TargetID, or why there is none (#741).
+    fn eps_target_identification(
+        target_id: &nextgcore_ngap::types::TargetId,
+    ) -> std::result::Result<bytes::Bytes, String> {
+        // The Target Identification the MME needs, built from the TargetID the gNB chose --
+        // relayed, not invented, because a target this AMF picked would route the preparation
+        // to an eNB the gNB did not select. TS 29.274 §8.51: a macro id is Target Type 1
+        // (Figure 8.51-2), a short or long macro id Target Type 4 (Figure 8.51-4), each with
+        // the selected EPS TAC (#741).
+        match target_id {
+            nextgcore_ngap::types::TargetId::TargetGlobalNgEnbId {
+                plmn_identity,
+                ng_enb_id,
+                selected_eps_tai,
+            } => crate::n26_build::encode_enb_target_identification(
+                plmn_identity,
+                *ng_enb_id,
+                selected_eps_tai.tac,
+            ),
+            // TS 38.413 §9.3.1.25: an NG-RAN target is a gNB or ng-eNB in 5GS, which an EPS
+            // handover cannot reach; the E-UTRAN alternative is the one that names an eNB and
+            // an EPS TAI. Building a Target Identification from a gNB id would ask the MME for
+            // an eNB that does not exist.
+            nextgcore_ngap::types::TargetId::TargetRanNodeId { .. } => Err(
+                "a fivegs-to-eps HandoverRequired names an NG-RAN node, not an E-UTRAN eNB"
+                    .to_string(),
+            ),
         }
     }
 
@@ -14627,36 +14658,6 @@ pub async fn amf_ngap_poll() -> Result<bool> {
 // Tests
 // ============================================================================
 
-/// The TS 29.274 §8.51 Target Identification body for a `fivegs-to-eps` HandoverRequired's
-/// TargetID, or why there is none (#741).
-fn eps_target_identification(
-    target_id: &nextgcore_ngap::types::TargetId,
-) -> std::result::Result<bytes::Bytes, String> {
-    // The Target Identification the MME needs, built from the TargetID the gNB chose --
-    // relayed, not invented, because a target this AMF picked would route the preparation
-    // to an eNB the gNB did not select. TS 29.274 §8.51: a macro id is Target Type 1
-    // (Figure 8.51-2), a short or long macro id Target Type 4 (Figure 8.51-4), each with
-    // the selected EPS TAC (#741).
-    match target_id {
-        nextgcore_ngap::types::TargetId::TargetGlobalNgEnbId {
-            plmn_identity,
-            ng_enb_id,
-            selected_eps_tai,
-        } => crate::n26_build::encode_enb_target_identification(
-            plmn_identity,
-            *ng_enb_id,
-            selected_eps_tai.tac,
-        ),
-        // TS 38.413 §9.3.1.25: an NG-RAN target is a gNB or ng-eNB in 5GS, which an EPS
-        // handover cannot reach; the E-UTRAN alternative is the one that names an eNB and
-        // an EPS TAI. Building a Target Identification from a gNB id would ask the MME for
-        // an eNB that does not exist.
-        nextgcore_ngap::types::TargetId::TargetRanNodeId { .. } => Err(
-            "a fivegs-to-eps HandoverRequired names an NG-RAN node, not an E-UTRAN eNB".to_string(),
-        ),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     /// Handler-level tests asserting what amfd SENDS (#760, ...), in their own file.
@@ -14724,7 +14725,7 @@ mod tests {
                 panic!("{id:?} decodes");
             };
             assert_eq!(
-                eps_target_identification(&message.target_id)
+                NgapServer::eps_target_identification(&message.target_id)
                     .expect("an eNB target")
                     .as_ref(),
                 &golden,
@@ -14743,7 +14744,7 @@ mod tests {
             },
         };
         assert!(
-            eps_target_identification(&gnb).is_err(),
+            NgapServer::eps_target_identification(&gnb).is_err(),
             "an NG-RAN node is not an EPS handover target"
         );
     }

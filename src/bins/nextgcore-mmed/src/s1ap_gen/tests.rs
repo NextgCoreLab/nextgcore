@@ -144,6 +144,9 @@ fn requests() -> Vec<S1SetupRequest> {
         EnbId::Macro(0xF_FFFF),
         EnbId::Home(0),
         EnbId::Home(0xFFF_FFFF),
+        // #741: the Rel-15 extension alternatives (TS 36.413 §9.2.1.37).
+        EnbId::ShortMacro(0x3_FFFF),
+        EnbId::LongMacro(0x1F_FFFF),
     ] {
         for name in [None, Some("e".to_string()), Some("e".repeat(150))] {
             for tas in [1usize, 2, 256] {
@@ -181,7 +184,7 @@ fn same_request(a: &S1SetupRequest, b: &S1SetupRequest) -> bool {
 #[test]
 fn the_request_decodes_as_the_hand_written_parser_reads_it() {
     let reqs = requests();
-    assert_eq!(reqs.len(), 180);
+    assert_eq!(reqs.len(), 252);
     for req in &reqs {
         // Both encoders agree on the request, and both decoders read it back.
         let hand = builder::build_s1_setup_request(req).unwrap();

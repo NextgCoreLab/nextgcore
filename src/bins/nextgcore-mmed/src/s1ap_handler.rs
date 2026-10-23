@@ -18,15 +18,15 @@ use crate::s1ap_build::{
 };
 use nextgcore_s1ap::{
     BroadcastCancelledAreaList, BroadcastCompletedAreaList, Cause, CauseRadioNetwork,
-    CriticalityDiagnostics, EnbConfigurationUpdate, EnbId, EnbStatusTransfer,
-    ErabDataForwardingItem, ErabToBeSetupItemHoReq, ErrorIndication, HandoverCancel,
-    HandoverCancelAcknowledge, HandoverCommand, HandoverFailure, HandoverNotify,
-    HandoverPreparationFailure, HandoverRequest, HandoverRequestAcknowledge, HandoverRequired,
-    HandoverType as S1apHandoverType, InitialContextSetupFailure, InitialContextSetupResponse,
-    InitialUeMessage, KillResponse, MmeStatusTransfer, NasNonDeliveryIndication, PathSwitchRequest,
-    PathSwitchRequestFailure, Reset, ResetAcknowledge, ResetType, S1SetupRequest, S1apMessage,
-    SecurityContext, TargetId, TimeToWait, UeAmbr, UeCapabilityInfoIndication,
-    UeContextReleaseComplete, UeContextReleaseRequest, UlNasTransport, WriteReplaceWarningResponse,
+    CriticalityDiagnostics, EnbConfigurationUpdate, EnbStatusTransfer, ErabDataForwardingItem,
+    ErabToBeSetupItemHoReq, ErrorIndication, HandoverCancel, HandoverCancelAcknowledge,
+    HandoverCommand, HandoverFailure, HandoverNotify, HandoverPreparationFailure, HandoverRequest,
+    HandoverRequestAcknowledge, HandoverRequired, HandoverType as S1apHandoverType,
+    InitialContextSetupFailure, InitialContextSetupResponse, InitialUeMessage, KillResponse,
+    MmeStatusTransfer, NasNonDeliveryIndication, PathSwitchRequest, PathSwitchRequestFailure,
+    Reset, ResetAcknowledge, ResetType, S1SetupRequest, S1apMessage, SecurityContext, TargetId,
+    TimeToWait, UeAmbr, UeCapabilityInfoIndication, UeContextReleaseComplete,
+    UeContextReleaseRequest, UlNasTransport, WriteReplaceWarningResponse,
 };
 
 // ============================================================================
@@ -1430,10 +1430,10 @@ pub fn handle_s1_setup_request_reporting(
     msg: &S1SetupRequest,
     notify: &[crate::s1ap_gen::DiagnosedIe],
 ) -> Vec<S1apSend> {
-    let enb_id_value = match msg.global_enb_id.enb_id {
-        EnbId::Macro(id) => id,
-        EnbId::Home(id) => id,
-    };
+    let (enb_id_value, enb_id_bits) = (
+        msg.global_enb_id.enb_id.value(),
+        msg.global_enb_id.enb_id.bit_len(),
+    );
 
     // Convert the supported TA list into context TAIs
     let mut supported_tais = Vec::new();
@@ -1500,6 +1500,7 @@ pub fn handle_s1_setup_request_reporting(
     ctx.enb_set_enb_id(enb_id, enb_id_value);
     if let Some(enb) = ctx.enb_pool.write().unwrap().get_mut(&enb_id) {
         enb.plmn_id = decode_plmn_id(&msg.global_enb_id.plmn_identity);
+        enb.enb_id_bits = enb_id_bits;
         enb.supported_ta_list = supported_tais;
         enb.state.s1_setup_success = true;
     }
@@ -2220,13 +2221,12 @@ pub fn handle_handover_required_reporting(
 
     // Resolve the target eNB (only intra-LTE targets are supported)
     let target_enb_pool_id = match &msg.target_id {
-        TargetId::TargetEnbId { global_enb_id, .. } => {
-            let id = match global_enb_id.enb_id {
-                EnbId::Macro(id) => id,
-                EnbId::Home(id) => id,
-            };
-            ctx.enb_find_by_enb_id(id)
-        }
+        // #741/#882: by the whole Global eNB ID -- PLMN, ENB-ID alternative and value --
+        // because a macro and a home eNB, or eNBs of two PLMNs, can share an id value.
+        TargetId::TargetEnbId { global_enb_id, .. } => ctx.enb_find_by_global_enb_id(
+            &decode_plmn_id(&global_enb_id.plmn_identity),
+            global_enb_id.enb_id,
+        ),
         TargetId::TargetRncId { .. } | TargetId::Cgi { .. } => None,
     };
     let Some(target_enb_pool_id) = target_enb_pool_id else {
@@ -4513,6 +4513,28 @@ mod tests {
             other => panic!("expected S1SetupResponse, got {other:?}"),
         }
         assert!(ctx.enb_find_by_id(enb_id).unwrap().state.s1_setup_success);
+        assert_eq!(
+            ctx.enb_find_by_id(enb_id).unwrap().enb_id_bits,
+            20,
+            "#741: a macro eNB's id is recorded as 20 bits"
+        );
+
+        // #741: a home eNB's id is recorded as 28 bits, so an N26 target lookup by a
+        // macro id of equal value cannot land on it.
+        let home_enb = ctx.enb_add("127.0.0.3:36412".parse().unwrap());
+        let home = S1SetupRequest {
+            global_enb_id: GlobalEnbId {
+                plmn_identity: s1ap_build::encode_plmn_id(&plmn),
+                enb_id: nextgcore_s1ap::EnbId::Home(0x1234),
+            },
+            ..request.clone()
+        };
+        handle_s1ap_message(
+            &ctx,
+            home_enb,
+            &builder::build_s1_setup_request(&home).unwrap(),
+        );
+        assert_eq!(ctx.enb_find_by_id(home_enb).unwrap().enb_id_bits, 28);
 
         // An eNB in a tracking area the file does not declare is still rejected.
         let other_enb = ctx.enb_add("127.0.0.2:36412".parse().unwrap());
@@ -4744,7 +4766,26 @@ mod tests {
 
         // Target eNB registered with eNB ID 0x2222
         let target_enb_id = ctx.enb_add("127.0.0.8:36412".parse().unwrap());
-        ctx.enb_set_enb_id(target_enb_id, 0x2222);
+        ctx.enb_set_s1_connected_for_test(
+            target_enb_id,
+            &s1ap_build::encode_plmn_id(&PlmnId::new("310", "410")),
+            nextgcore_s1ap::EnbId::Macro(0x2222),
+        );
+        // #882: a home eNB and an eNB of another PLMN with the same id value, set up
+        // AFTER the target, so a lookup by value alone (the old `enb_id_hash`) finds one
+        // of them instead.
+        let home_twin = ctx.enb_add("127.0.0.9:36412".parse().unwrap());
+        ctx.enb_set_s1_connected_for_test(
+            home_twin,
+            &s1ap_build::encode_plmn_id(&PlmnId::new("310", "410")),
+            nextgcore_s1ap::EnbId::Home(0x2222),
+        );
+        let plmn_twin = ctx.enb_add("127.0.0.10:36412".parse().unwrap());
+        ctx.enb_set_s1_connected_for_test(
+            plmn_twin,
+            &s1ap_build::encode_plmn_id(&PlmnId::new("001", "01")),
+            nextgcore_s1ap::EnbId::Macro(0x2222),
+        );
 
         let ho = HandoverRequired {
             mme_ue_s1ap_id,
@@ -4840,7 +4881,11 @@ mod tests {
             bearer.qos.arp.priority_level = 8;
         }
         let target_enb_id = ctx.enb_add("127.0.0.8:36412".parse().unwrap());
-        ctx.enb_set_enb_id(target_enb_id, 0x2222);
+        ctx.enb_set_s1_connected_for_test(
+            target_enb_id,
+            &s1ap_build::encode_plmn_id(&PlmnId::new("310", "410")),
+            nextgcore_s1ap::EnbId::Macro(0x2222),
+        );
 
         // Run the preparation phase to create the target context
         let ho = HandoverRequired {
@@ -4974,7 +5019,11 @@ mod tests {
             bearer.qos.arp.priority_level = 8;
         }
         let target_enb_id = ctx.enb_add("127.0.0.8:36412".parse().unwrap());
-        ctx.enb_set_enb_id(target_enb_id, 0x2222);
+        ctx.enb_set_s1_connected_for_test(
+            target_enb_id,
+            &s1ap_build::encode_plmn_id(&PlmnId::new("310", "410")),
+            nextgcore_s1ap::EnbId::Macro(0x2222),
+        );
 
         let ho = HandoverRequired {
             mme_ue_s1ap_id,

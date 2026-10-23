@@ -1130,28 +1130,37 @@ fn handle_forward_relocation_request(
     record_forward_relocation_source(mme_ue_id, ForwardRelocationSource { peer, amf_teid });
 }
 
-/// The S1-connected eNB a Target Identification names: same eNB id and PLMN, S1 Setup
-/// complete (#741). The eNB's S1AP Global eNB ID records only the id value, not which length
-/// it was sent with, so the match is on the value and the PLMN. A selected TAI the eNB did not
-/// announce in its S1 Setup is logged, not refused: the TAI does not address the eNB, and the
-/// eNB id and PLMN already do.
+/// The S1-connected eNB a Target Identification names: same eNB id KIND (its length in bits),
+/// value and PLMN, S1 Setup complete (#741). The kind matters: a macro eNB `0x12345` and a
+/// home eNB `0x0012345` are different eNBs, and a home eNB is never a Type 1 or Type 4 target
+/// (§8.51.4 is Type 3). A selected TAI the eNB did not announce in its S1 Setup is logged and
+/// counted, not refused: the TAI does not address the eNB, and the eNB id and PLMN already do.
+/// Forward Relocations admitted onto an eNB that did not announce the selected EPS TAC in
+/// its S1 Setup (#741): a non-zero count points an operator at a misconfigured neighbour
+/// table on the source side or a stale S1 Setup on the target.
+pub static FORWARD_RELOCATION_TAC_NOT_ANNOUNCED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 fn select_target_enb(
     ctx: &crate::context::MmeContext,
     target: &n26_build::EnbTarget,
 ) -> Option<u64> {
-    let pool = ctx.enb_pool.read().ok()?;
-    let (id, enb) = pool.iter().find(|(_, enb)| {
-        enb.state.s1_setup_success
-            && enb.enb_id_presence
-            && enb.enb_id == target.enb_id
-            && enb.plmn_id == target.plmn_id
-    })?;
-    if !enb.supported_ta_list.is_empty()
-        && !enb
-            .supported_ta_list
-            .iter()
-            .any(|tai| tai.tac == target.tac && tai.plmn_id == target.plmn_id)
-    {
+    let enb_id = match target.enb_id_bits {
+        20 => nextgcore_s1ap::EnbId::Macro(target.enb_id),
+        18 => nextgcore_s1ap::EnbId::ShortMacro(target.enb_id),
+        21 => nextgcore_s1ap::EnbId::LongMacro(target.enb_id),
+        _ => return None,
+    };
+    let id = ctx.enb_find_by_global_enb_id(&target.plmn_id, enb_id)?;
+    let announced = ctx.enb_find_by_id(id).is_some_and(|enb| {
+        enb.supported_ta_list.is_empty()
+            || enb
+                .supported_ta_list
+                .iter()
+                .any(|tai| tai.tac == target.tac && tai.plmn_id == target.plmn_id)
+    });
+    if !announced {
+        FORWARD_RELOCATION_TAC_NOT_ANNOUNCED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         log::warn!(
             "N26 Forward Relocation target eNB {:#x} did not announce the selected EPS TAC \
              {:#06x} in its S1 Setup; relocating to it anyway, as the eNB id names it",
@@ -1159,7 +1168,7 @@ fn select_target_enb(
             target.tac
         );
     }
-    Some(*id)
+    Some(id)
 }
 
 /// Send a triggered message from the receive thread, caching it for retransmission.
@@ -2039,6 +2048,7 @@ mod tests {
         ctx.enb_set_enb_id(bystander, 0x7_4101);
         if let Some(enb) = ctx.enb_pool.write().unwrap().get_mut(&bystander) {
             enb.plmn_id = crate::s11_build::decode_plmn_bcd(&[0x00, 0xF1, 0x10]).unwrap();
+            enb.enb_id_bits = 20;
             enb.state.s1_setup_success = true;
         }
 
@@ -2151,60 +2161,110 @@ mod tests {
         ctx.enb_remove(bystander);
     }
 
-    /// **#741.** The target is the S1-connected eNB with the named id and PLMN, whichever
-    /// pool id it has; a short or long macro id resolves the same way, and an eNB whose S1
-    /// Setup has not completed, or of another PLMN, is not a target.
+    /// **#741.** The target is the S1-connected eNB with the named PLMN, ENB-ID alternative
+    /// and value, whichever pool id it has. Every eNB here comes up through the REAL S1
+    /// Setup handler, including the Rel-15 short and long macro eNB IDs (TS 36.413
+    /// §9.2.1.37). A home eNB, an eNB of another kind with an equal value, one of another
+    /// PLMN and one whose S1 Setup failed are never targets.
     #[test]
     fn the_relocation_target_is_the_enb_the_target_identification_names() {
-        let _guard = lock_s11();
-        let ctx = mme_self();
-        ctx.init();
-        let plmn = crate::s11_build::decode_plmn_bcd(&[0x00, 0xF1, 0x10]).unwrap();
-        let other_plmn = crate::s11_build::decode_plmn_bcd(&[0x00, 0xF2, 0x20]).unwrap();
-        let add = |addr: &str, enb_id: u32, plmn: &crate::context::PlmnId, up: bool| {
-            let id = ctx.enb_add(addr.parse().unwrap());
-            ctx.enb_set_enb_id(id, enb_id);
-            if let Some(enb) = ctx.enb_pool.write().unwrap().get_mut(&id) {
-                enb.plmn_id = plmn.clone();
-                enb.state.s1_setup_success = up;
-            }
-            id
+        use crate::context::PlmnId;
+        use nextgcore_ngap::types::NgEnbId;
+        use nextgcore_s1ap::EnbId;
+        let mut ctx = MmeContext::new();
+        assert!(crate::config::load_config(
+            &mut ctx,
+            "../../../docker/rust/configs/epc/mme.yaml"
+        ));
+        let served = PlmnId::new("999", "70");
+        let set_up = |addr: &str, plmn: &PlmnId, enb_id: EnbId| -> (u64, bool) {
+            let pool_id = ctx.enb_add(addr.parse().unwrap());
+            let request = nextgcore_s1ap::S1SetupRequest {
+                global_enb_id: nextgcore_s1ap::GlobalEnbId {
+                    plmn_identity: crate::s1ap_build::encode_plmn_id(plmn),
+                    enb_id,
+                },
+                enb_name: None,
+                supported_tas: vec![nextgcore_s1ap::SupportedTaItem {
+                    tac: 1,
+                    broadcast_plmns: vec![crate::s1ap_build::encode_plmn_id(&served)],
+                }],
+                default_paging_drx: nextgcore_s1ap::PagingDrx::V64,
+            };
+            crate::s1ap_handler::handle_s1ap_message(
+                &ctx,
+                pool_id,
+                &crate::s1ap_gen::build_s1_setup_request(&request).unwrap(),
+            );
+            let up = ctx
+                .enb_find_by_id(pool_id)
+                .is_some_and(|enb| enb.state.s1_setup_success);
+            (pool_id, up)
         };
-        // Lower pool ids first, so a "lowest connected eNB" choice picks the wrong one.
-        let bystander = add("127.0.0.1:47421", 0x7_4201, &plmn, true);
-        let not_set_up = add("127.0.0.1:47422", 0x7_4202, &plmn, false);
-        let wrong_plmn = add("127.0.0.1:47423", 0x7_4203, &other_plmn, true);
-        let macro_target = add("127.0.0.1:47424", 0x7_4204, &plmn, true);
-        let short_target = add("127.0.0.1:47425", 0x2_4205, &plmn, true);
-        let long_target = add("127.0.0.1:47426", 0x1A_4206, &plmn, true);
-        let target = |id: nextgcore_ngap::types::NgEnbId| {
+        let (bystander, _) = set_up("127.0.0.1:47421", &served, EnbId::Macro(0x7_4201));
+        // A HOME eNB whose 28-bit id has the macro target's value, set up FIRST.
+        let (home_twin, _) = set_up("127.0.0.1:47427", &served, EnbId::Home(0x7_4204));
+        let (home_only, _) = set_up("127.0.0.1:47428", &served, EnbId::Home(0x7_4208));
+        let (macro_target, _) = set_up("127.0.0.1:47424", &served, EnbId::Macro(0x7_4204));
+        let (short_target, short_up) =
+            set_up("127.0.0.1:47425", &served, EnbId::ShortMacro(0x2_4205));
+        let (long_target, long_up) =
+            set_up("127.0.0.1:47426", &served, EnbId::LongMacro(0x1A_4206));
+        assert!(
+            short_up && long_up,
+            "S1 Setup accepts the Rel-15 short and long macro eNB IDs"
+        );
+        // An association whose S1 Setup has not completed.
+        let not_set_up = ctx.enb_add("127.0.0.1:47422".parse().unwrap());
+        ctx.enb_set_enb_id(not_set_up, 0x7_4202);
+        let other_plmn = PlmnId::new("001", "01");
+        let target = |plmn: &PlmnId, id: NgEnbId| {
             let body = nextgcore_amfd::n26_build::encode_enb_target_identification(
-                &[0x00, 0xF1, 0x10],
+                &crate::s1ap_build::encode_plmn_id(plmn),
                 id,
                 [0x00, 0x01],
             )
             .unwrap();
             select_target_enb(
-                ctx,
+                &ctx,
                 &crate::n26_build::parse_enb_target_identification(&body).unwrap(),
             )
         };
-        use nextgcore_ngap::types::NgEnbId;
-        assert_eq!(target(NgEnbId::Macro(0x7_4204)), Some(macro_target));
-        assert_eq!(target(NgEnbId::ShortMacro(0x2_4205)), Some(short_target));
-        assert_eq!(target(NgEnbId::LongMacro(0x1A_4206)), Some(long_target));
-        assert_eq!(target(NgEnbId::Macro(0x7_4202)), None, "S1 Setup not done");
-        assert_eq!(target(NgEnbId::Macro(0x7_4203)), None, "another PLMN");
-        for id in [
-            bystander,
-            not_set_up,
-            wrong_plmn,
-            macro_target,
-            short_target,
-            long_target,
-        ] {
-            ctx.enb_remove(id);
-        }
+        assert_eq!(
+            target(&served, NgEnbId::Macro(0x7_4204)),
+            Some(macro_target),
+            "the macro eNB, never its home-eNB twin"
+        );
+        assert_eq!(
+            target(&served, NgEnbId::Macro(0x7_4208)),
+            None,
+            "a home eNB is never a Macro eNodeB target, even with the named value"
+        );
+        assert_eq!(
+            target(&served, NgEnbId::ShortMacro(0x2_4205)),
+            Some(short_target)
+        );
+        assert_eq!(
+            target(&served, NgEnbId::LongMacro(0x1A_4206)),
+            Some(long_target)
+        );
+        assert_eq!(
+            target(&served, NgEnbId::Macro(0x2_4205)),
+            None,
+            "a macro id never matches the short-macro eNB of equal value"
+        );
+        assert_eq!(
+            target(&served, NgEnbId::Macro(0x7_4202)),
+            None,
+            "S1 Setup not complete"
+        );
+        assert_eq!(
+            target(&other_plmn, NgEnbId::Macro(0x7_4201)),
+            None,
+            "another PLMN"
+        );
+        assert_eq!(target(&served, NgEnbId::Macro(0x7_4201)), Some(bystander));
+        let _ = (home_twin, home_only);
     }
 
     /// **#408 criterion 8**: a connected-mode inter-system handover transfers the bearer

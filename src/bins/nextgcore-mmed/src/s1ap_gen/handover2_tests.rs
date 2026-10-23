@@ -552,7 +552,7 @@ fn handover_ctx() -> (MmeContext, u64, u64, u32) {
         b.qos.arp.priority_level = 8;
     }
     let target = ctx.enb_add("127.0.0.8:36412".parse().unwrap());
-    ctx.enb_set_enb_id(target, 0x2222);
+    ctx.enb_set_s1_connected_for_test(target, &[0x13, 0x00, 0x14], EnbId::Macro(0x2222));
     (ctx, source, target, mme)
 }
 
