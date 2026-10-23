@@ -1059,6 +1059,9 @@ fn handle_delete_bearer_request(raw: &[u8], sequence_number: u32, peer: SocketAd
                 lbi,
                 detach_type,
             } => {
+                // A deactivation still waiting for the UE goes with the detach:
+                // its PDN connection is deleted locally and its request answered.
+                crate::bearer_deactivation::settle_all_for_ue(ctx, mme_ue_id, "the UE is detached");
                 crate::network_detach::mme_initiated_detach(
                     ctx,
                     mme_ue_id,
@@ -1080,6 +1083,48 @@ fn handle_delete_bearer_request(raw: &[u8], sequence_number: u32, peer: SocketAd
                 ebis: to_deactivate,
                 reactivation,
             } => {
+                // #863 review: bearers already being deactivated (by an earlier
+                // request, or with their PDN connection) are not deactivated a
+                // second time; a request naming only such bearers is answered
+                // at once, and they go when the first deactivation settles.
+                let to_deactivate: Vec<u8> = to_deactivate
+                    .into_iter()
+                    .filter(|ebi| {
+                        !crate::bearer_deactivation::already_deactivating(ctx, mme_ue_id, *ebi)
+                    })
+                    .collect();
+                if to_deactivate.is_empty() {
+                    log::info!(
+                        "Delete Bearer Request seq={sequence_number}: its bearers are already \
+                         being deactivated; answered at once"
+                    );
+                    return match answer {
+                        crate::bearer_deactivation::DeleteBearerAnswer::Lbi(lbi) => {
+                            crate::s11_build::build_delete_bearer_response_for_lbi(
+                                sgw_teid,
+                                lbi,
+                                GtpCause::RequestAccepted,
+                                sequence_number,
+                            )
+                        }
+                        crate::bearer_deactivation::DeleteBearerAnswer::Ebis(ebis) => {
+                            crate::s11_build::build_delete_bearer_response_for_ebis(
+                                sgw_teid,
+                                &ebis,
+                                GtpCause::RequestAccepted,
+                                sequence_number,
+                            )
+                        }
+                    }
+                    .map_or_else(
+                        |e| log::error!("Delete Bearer Response build failed: {e}"),
+                        |rsp| {
+                            if let Err(e) = crate::gtp_path::send_response_to_sgwc(peer, &rsp) {
+                                log::error!("S11 Delete Bearer Response to {peer} failed: {e}");
+                            }
+                        },
+                    );
+                }
                 if crate::bearer_deactivation::start(
                     ctx,
                     mme_ue_id,
@@ -1290,7 +1335,26 @@ pub fn network_initiated_bearer_deletion(
                 lbi: Some(lbi),
             };
         };
-        if mme_ue.sess_list.len() <= 1 {
+        // #863 review: "the last PDN connection" counts the ACTIVE ones (a
+        // bearer with a Serving GW S1-U endpoint: `sess_list` also holds the
+        // unconnected sessions materialised from the subscription) that are not
+        // already being deactivated. Two deletions in quick succession must
+        // still end in a detach, not in a registered UE with no PDN connection.
+        let pending = crate::bearer_deactivation::pending_pdn_sessions(mme_ue_id);
+        let remaining = mme_ue
+            .sess_list
+            .iter()
+            .filter(|id| !pending.contains(id))
+            .filter(|id| {
+                ctx.sess_find_by_id(**id).is_some_and(|s| {
+                    s.bearer_list
+                        .iter()
+                        .filter_map(|b| ctx.bearer_find_by_id(*b))
+                        .any(|b| b.sgw_s1u_teid != 0)
+                })
+            })
+            .count();
+        if remaining <= 1 {
             let cause = message_cause(raw);
             let detach_type = if cause == Some(GTP_CAUSE_REACTIVATION_REQUESTED) {
                 crate::emm_build::DetachTypeToUe::ReAttachRequired
@@ -1329,12 +1393,21 @@ pub fn network_initiated_bearer_deletion(
         if let Some(ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&mme_ue_id) {
             ue.sess_list.retain(|id| *id != sess_id);
         }
-        log::info!(
-            "[{}] PDN connection LBI {lbi} deleted by the gateway; the UE is ECM-IDLE, so it is \
-             deleted here and synchronised at the next ECM-CONNECTED transition (TS 23.401 \
-             §5.4.4.1 condition (i))",
-            mme_ue.imsi_bcd
-        );
+        if reactivation {
+            log::warn!(
+                "[{}] PDN connection LBI {lbi} deleted with cause reactivation requested while \
+                 the UE is ECM-IDLE: deleted here, but the UE is not told to reactivate; step 4b \
+                 paging is #862",
+                mme_ue.imsi_bcd
+            );
+        } else {
+            log::info!(
+                "[{}] PDN connection LBI {lbi} deleted by the gateway; the UE is ECM-IDLE, so it \
+                 is deleted here and synchronised at the next ECM-CONNECTED transition (TS \
+                 23.401 §5.4.4.1 condition (i))",
+                mme_ue.imsi_bcd
+            );
+        }
         return DeleteBearerAction::PdnDeletedLocally { sgw_teid, lbi };
     }
 
@@ -1378,12 +1451,20 @@ pub fn network_initiated_bearer_deletion(
             lbi: None,
         };
     }
-    log::info!(
-        "[{}] dedicated bearers {deleted:?} deleted by the gateway; the UE is ECM-IDLE, so they \
-         are deleted here and synchronised at the next ECM-CONNECTED transition (TS 23.401 \
-         §5.4.4.1 condition (i))",
-        mme_ue.imsi_bcd
-    );
+    if reactivation {
+        log::warn!(
+            "[{}] dedicated bearers {deleted:?} deleted with cause reactivation requested while \
+             the UE is ECM-IDLE: deleted here without paging (step 4b is #862)",
+            mme_ue.imsi_bcd
+        );
+    } else {
+        log::info!(
+            "[{}] dedicated bearers {deleted:?} deleted by the gateway; the UE is ECM-IDLE, so \
+             they are deleted here and synchronised at the next ECM-CONNECTED transition (TS \
+             23.401 §5.4.4.1 condition (i))",
+            mme_ue.imsi_bcd
+        );
+    }
     DeleteBearerAction::BearersDeletedLocally {
         sgw_teid,
         ebis: deleted,
@@ -3282,12 +3363,13 @@ mod pgw_initiated_delete_bearer_tests {
         for (pti, ebi) in default_ebis.iter().enumerate() {
             let sess_id = ctx.sess_add(mme_ue_id, pti as u8 + 1);
             let bearer_id = ctx.bearer_add(sess_id, mme_ue_id);
-            ctx.bearer_pool
-                .write()
-                .unwrap()
-                .get_mut(&bearer_id)
-                .unwrap()
-                .ebi = *ebi;
+            {
+                // An active PDN connection: its Create Session completed.
+                let mut pool = ctx.bearer_pool.write().unwrap();
+                let b = pool.get_mut(&bearer_id).unwrap();
+                b.ebi = *ebi;
+                b.sgw_s1u_teid = 0x5000 + u32::from(*ebi);
+            }
             ctx.sess_pool
                 .write()
                 .unwrap()
@@ -3705,6 +3787,106 @@ mod pgw_initiated_delete_bearer_tests {
         assert!(ctx.bearer_find_by_ebi(mme_ue_id, 7).is_none());
         assert!(ctx.bearer_find_by_ebi(mme_ue_id, 8).is_none());
         assert!(ctx.bearer_find_by_ebi(mme_ue_id, 5).is_some());
+        ctx.mme_ue_remove(mme_ue_id);
+    }
+
+    /// #863 review MAJOR: two Delete Bearer Requests in quick succession for a
+    /// connected UE's two PDN connections. The first is being deactivated; the
+    /// second is then for the last PDN connection, so the UE is detached
+    /// (TS 23.401 §5.4.4.1), and the first deactivation is settled with it.
+    /// Before the fix both were deactivated and the UE stayed registered with
+    /// no PDN connection.
+    #[test]
+    fn a_second_deletion_while_the_first_is_pending_detaches() {
+        let _guard = crate::gtp_path::lock_s11();
+        crate::bearer_deactivation::clear_for_test();
+        let (sgw, _route) = sgw_route();
+        let ctx = crate::context::mme_self();
+        let (mme_ue_id, teid) = ue(ctx, &[5, 6]);
+        let peer = sgw.local_addr().unwrap();
+        let t = crate::s11_build::message_type::DELETE_BEARER_REQUEST;
+        dispatch_initial(&dbr_lbi(teid, 6, Some(16)), t, 0x100, peer);
+        assert_eq!(crate::bearer_deactivation::pending_count(), 1);
+        assert!(delete_bearer_responses(&sgw).is_empty());
+        dispatch_initial(&dbr_lbi(teid, 5, Some(16)), t, 0x101, peer);
+        let mut rsps = delete_bearer_responses(&sgw);
+        rsps.sort();
+        assert_eq!(
+            rsps,
+            vec![(0x100, 16, Some(6)), (0x101, 16, Some(5))],
+            "both answered: the pending one settled by the detach"
+        );
+        assert_eq!(crate::bearer_deactivation::pending_count(), 0);
+        let ue = ctx
+            .mme_ue_find_by_id(mme_ue_id)
+            .expect("kept until DETACH ACCEPT");
+        assert_eq!(
+            ue.nas_eps.type_,
+            crate::context::MmeEpsType::DetachRequestToUe,
+            "detached, not left registered without a PDN connection"
+        );
+        assert!(ue.sess_list.is_empty());
+        ctx.mme_ue_remove(mme_ue_id);
+    }
+
+    /// #863 review MAJOR (related): an unconnected session materialised from
+    /// the subscription does not count as a PDN connection, so deleting the
+    /// only connected one detaches.
+    #[test]
+    fn an_unconnected_subscribed_session_does_not_count_as_a_pdn() {
+        let ctx = ctx();
+        let (mme_ue_id, teid) = ue(&ctx, &[5, 6]);
+        // EBI 6's session never connected: no S1-U endpoint.
+        let b6 = ctx.bearer_find_by_ebi(mme_ue_id, 6).unwrap();
+        ctx.bearer_pool
+            .write()
+            .unwrap()
+            .get_mut(&b6)
+            .unwrap()
+            .sgw_s1u_teid = 0;
+        assert!(matches!(
+            network_initiated_bearer_deletion(&ctx, teid, &dbr_lbi(teid, 5, Some(16))),
+            DeleteBearerAction::DetachUe { lbi: 5, .. }
+        ));
+    }
+
+    /// #863 review MINOR 5: a new Delete Bearer Request (new seq) for a bearer
+    /// whose PDN connection is already being deactivated is answered at once and
+    /// not deactivated a second time.
+    #[test]
+    fn a_request_for_a_bearer_already_being_deactivated_is_answered_at_once() {
+        let _guard = crate::gtp_path::lock_s11();
+        crate::bearer_deactivation::clear_for_test();
+        let (sgw, _route) = sgw_route();
+        let ctx = crate::context::mme_self();
+        let (mme_ue_id, teid) = ue(ctx, &[5, 6]);
+        let sess6 = ctx
+            .bearer_find_by_id(ctx.bearer_find_by_ebi(mme_ue_id, 6).unwrap())
+            .unwrap()
+            .sess_id;
+        let id7 = ctx.bearer_add(sess6, mme_ue_id);
+        ctx.bearer_pool.write().unwrap().get_mut(&id7).unwrap().ebi = 7;
+        ctx.sess_pool
+            .write()
+            .unwrap()
+            .get_mut(&sess6)
+            .unwrap()
+            .bearer_list
+            .push(id7);
+        let peer = sgw.local_addr().unwrap();
+        let t = crate::s11_build::message_type::DELETE_BEARER_REQUEST;
+        dispatch_initial(&dbr_lbi(teid, 6, Some(16)), t, 0x200, peer);
+        // Dedicated bearer 7 of the PDN being deleted, by a new request.
+        let mut m = Gtp2Message::new(Gtp2Header::new(t, teid, 0x201));
+        m.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Ebi as u8, 1, &[7]));
+        dispatch_initial(&m.encode(), t, 0x201, peer);
+        assert_eq!(delete_bearer_responses(&sgw), vec![(0x201, 16, None)]);
+        assert_eq!(
+            crate::bearer_deactivation::pending_count(),
+            1,
+            "no second deactivation"
+        );
+        crate::bearer_deactivation::clear_for_test();
         ctx.mme_ue_remove(mme_ue_id);
     }
 }

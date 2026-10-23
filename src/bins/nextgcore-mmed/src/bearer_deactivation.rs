@@ -19,6 +19,17 @@
 //!    contexts, and once every bearer is done answers the Serving GW with the
 //!    Delete Bearer Response, Request accepted (step 8).
 //!
+//! The Delete Bearer Response waits for the UE's DEACTIVATE EPS BEARER CONTEXT
+//! ACCEPT (step 7) only; the E-RAB RELEASE RESPONSE (step 5) is diagnosed in
+//! `s1ap_handler` and not waited for. That is deliberate: step 8 needs the
+//! bearer deactivated in the UE, which only the NAS accept proves, and an eNB
+//! that loses its response must not hold the Serving GW (Open5GS keys on the
+//! NAS accept too).
+//!
+//! Lock order: [`PENDING`] is taken before any context pool lock and never
+//! under one ([`settle`] takes pool write locks while holding it; no path takes
+//! `PENDING` while holding a pool lock).
+//!
 //! An ECM-IDLE UE whose last PDN connection is not being deleted is handled by
 //! condition (i) of §5.4.4.1: steps 4-7 are skipped and the bearer state is
 //! synchronised at the next transition to ECM-CONNECTED. With cause
@@ -153,9 +164,12 @@ pub fn start(
         );
         let Ok(esm) = crate::nas_path::protect_esm(ctx, mme_ue_id, &plain) else {
             log::error!(
-                "[{}] DEACTIVATE EPS BEARER CONTEXT REQUEST not protected",
+                "[{}] DEACTIVATE EPS BEARER CONTEXT REQUEST for EBI {ebi} not protected; the \
+                 bearer is deactivated locally",
                 mme_ue.imsi_bcd
             );
+            // #863 review: answered accepted with the others, so it must go.
+            delete_locally(ctx, mme_ue_id, *ebi, sess_id);
             continue;
         };
         let erabs = if sess_id.is_some() && !pdn_erabs.is_empty() {
@@ -184,7 +198,12 @@ pub fn start(
                 });
             }
             Err(e) => {
-                log::error!("[{}] E-RAB Release Command not built: {e}", mme_ue.imsi_bcd);
+                log::error!(
+                    "[{}] E-RAB Release Command for EBI {ebi} not built: {e}; the bearer is \
+                     deactivated locally",
+                    mme_ue.imsi_bcd
+                );
+                delete_locally(ctx, mme_ue_id, *ebi, sess_id);
                 continue;
             }
         }
@@ -325,6 +344,45 @@ fn settle(ctx: &MmeContext, mme_ue_id: u64, ebi: u8, why: &str) -> bool {
         answer(&p);
     }
     true
+}
+
+/// The PDN connections of `mme_ue_id` a deactivation is deleting whole.
+pub fn pending_pdn_sessions(mme_ue_id: u64) -> Vec<u64> {
+    pending()
+        .iter()
+        .filter(|p| p.mme_ue_id == mme_ue_id)
+        .filter_map(|p| p.sess_id)
+        .collect()
+}
+
+/// Whether bearer `ebi` of `mme_ue_id` is already being deactivated: it is
+/// waited for, or it belongs to a PDN connection being deleted whole.
+pub fn already_deactivating(ctx: &MmeContext, mme_ue_id: u64, ebi: u8) -> bool {
+    let list = pending();
+    list.iter().filter(|p| p.mme_ue_id == mme_ue_id).any(|p| {
+        p.waiting.iter().any(|w| w.ebi == ebi)
+            || p.sess_id.is_some_and(|sess_id| {
+                ctx.sess_find_by_id(sess_id).is_some_and(|sess| {
+                    sess.bearer_list
+                        .iter()
+                        .filter_map(|b| ctx.bearer_find_by_id(*b))
+                        .any(|b| b.ebi == ebi)
+                })
+            })
+    })
+}
+
+/// Settle every deactivation of `mme_ue_id` at once (the UE is being
+/// detached): its bearers are deleted locally and each request answered.
+pub fn settle_all_for_ue(ctx: &MmeContext, mme_ue_id: u64, why: &str) {
+    let ebis: Vec<u8> = pending()
+        .iter()
+        .filter(|p| p.mme_ue_id == mme_ue_id)
+        .flat_map(|p| p.waiting.iter().map(|w| w.ebi))
+        .collect();
+    for ebi in ebis {
+        settle(ctx, mme_ue_id, ebi, why);
+    }
 }
 
 /// DEACTIVATE EPS BEARER CONTEXT ACCEPT for `ebi` (TS 23.401 §5.4.4.1 step 7,
