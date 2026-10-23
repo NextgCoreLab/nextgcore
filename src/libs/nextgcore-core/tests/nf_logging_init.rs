@@ -34,15 +34,109 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// The file's code with `//` comment lines dropped, so prose can name the
-/// forbidden calls.
+/// The file's production code: comments, string and char literals blanked
+/// out, and everything from the first inline `#[cfg(test)]` module on dropped.
+/// So a call that appears only in prose, in a string, or in test code does not
+/// count as the daemon building its logger (#788 review).
 fn code(path: &Path) -> String {
-    fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-        .lines()
-        .filter(|l| !l.trim_start().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n")
+    let text = fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    production_code(&text)
+}
+
+fn production_code(text: &str) -> String {
+    let stripped = strip_comments_and_literals(text);
+    let lines: Vec<&str> = stripped.lines().collect();
+    let mut end = lines.len();
+    for (i, pair) in lines.windows(2).enumerate() {
+        let next = pair[1].trim_start();
+        if pair[0].trim() == "#[cfg(test)]" && next.starts_with("mod ") && next.ends_with('{') {
+            end = i;
+            break;
+        }
+    }
+    lines[..end].join("\n")
+}
+
+/// Replace comments and string/char literals with spaces, keeping newlines.
+fn strip_comments_and_literals(src: &str) -> String {
+    let b = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    let blank = |out: &mut String, s: &[u8]| {
+        for &c in s {
+            out.push(if c == b'\n' { '\n' } else { ' ' });
+        }
+    };
+    while i < b.len() {
+        match b[i] {
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                let end = src[i..].find('\n').map_or(b.len(), |e| i + e);
+                blank(&mut out, &b[i..end]);
+                i = end;
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                let end = src[i + 2..].find("*/").map_or(b.len(), |e| i + 2 + e + 2);
+                blank(&mut out, &b[i..end]);
+                i = end;
+            }
+            b'r' if matches!(b.get(i + 1), Some(b'"') | Some(b'#'))
+                && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_')) =>
+            {
+                // Raw string r"..." / r#"..."#.
+                let mut j = i + 1;
+                let mut hashes = 0;
+                while b.get(j) == Some(&b'#') {
+                    hashes += 1;
+                    j += 1;
+                }
+                if b.get(j) != Some(&b'"') {
+                    out.push('r');
+                    i += 1;
+                    continue;
+                }
+                let close = format!("\"{}", "#".repeat(hashes));
+                let end = src[j + 1..]
+                    .find(&close)
+                    .map_or(b.len(), |e| j + 1 + e + close.len());
+                blank(&mut out, &b[i..end]);
+                i = end;
+            }
+            b'"' => {
+                let mut j = i + 1;
+                while j < b.len() && b[j] != b'"' {
+                    if b[j] == b'\\' {
+                        j += 1;
+                    }
+                    j += 1;
+                }
+                let end = (j + 1).min(b.len());
+                blank(&mut out, &b[i..end]);
+                i = end;
+            }
+            b'\'' if b.get(i + 2) == Some(&b'\'') || (b.get(i + 1) == Some(&b'\\')) => {
+                // A char literal ('x' or '\n'); a lifetime has no closing quote.
+                let end = src[i + 1..].find('\'').map_or(b.len(), |e| i + 1 + e + 1);
+                blank(&mut out, &b[i..end]);
+                i = end;
+            }
+            _ => {
+                let ch = src[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn the_scan_ignores_strings_comments_and_test_code() {
+    let src = "fn main() {\n    let s = \"nf_log_builder(\";\n    // nf_log_builder(\n    let r = r#\"env_logger::Builder::new()\"#;\n}\n#[cfg(test)]\nmod tests {\n    fn t() { nf_log_builder(\"info\"); }\n}\n";
+    let stripped = production_code(src);
+    assert!(!stripped.contains("nf_log_builder("), "{stripped}");
+    assert!(!stripped.contains("Builder::new("), "{stripped}");
+    let real = strip_comments_and_literals("let b = nextgcore_core::log::nf_log_builder(&l);");
+    assert!(real.contains("nf_log_builder("));
 }
 
 #[test]

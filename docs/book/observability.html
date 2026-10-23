@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-50a6a473.js";
+            window.path_to_searchindex_js = "searchindex-df495bb2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-be5dca41.js"></script>
@@ -293,7 +293,8 @@
 </table>
 </div>
 <p><code>nextgcore-smfd</code> and <code>nextgcore-sgwud</code> have no clap parser. smfd — scans <code>std::env::args()</code> only for <code>-c &lt;config&gt;</code> (and <code>--state-file</code>) and takes its log level purely from <code>RUST_LOG</code> (default <code>info</code>); sgwud scans for <code>-c</code> and <code>-l/--log-level</code>.</p>
-<p><strong><code>RUST_LOG</code> precedence is the same in every NF.</strong> Every NF builds its logger with <code>nextgcore_core::log::nf_log_builder</code> (#691): <code>RUST_LOG</code>, when set, is the filter; otherwise the <code>--log-level</code> flag applies (an unknown value means <code>info</code>). <code>RUST_LOG_STYLE</code> sets the colour style; <code>--no-color</code> overrides it. <code>src/libs/nextgcore-core/tests/nf_logging_init.rs</code> fails if a daemon builds its own logger.</p>
+<p><strong><code>RUST_LOG</code> precedence is the same in every NF.</strong> Every NF builds its logger with <code>nextgcore_core::log::nf_log_builder</code> (#691): <code>RUST_LOG</code>, when set, is the filter; otherwise the <code>--log-level</code> flag applies (an unknown value means <code>info</code>). <code>RUST_LOG_STYLE</code> sets the colour style; <code>--no-color</code> overrides it.</p>
+<p>Precedence, in full: a set, non-blank <code>RUST_LOG</code> <strong>replaces</strong> <code>--log-level</code>; the two are not merged. So <code>RUST_LOG=nextgcore_amfd=debug</code> alone logs only amfd’s own targets (at debug) and silences every other target. Include a default level, as the compose files do (<code>info,nextgcore_amfd=debug</code>), to keep the rest at <code>info</code>. A blank <code>RUST_LOG=</code> counts as unset. <code>src/libs/nextgcore-core/tests/nf_logging_init.rs</code> fails if a daemon builds its own logger.</p>
 <p><strong><code>--log-file</code> is accepted but not wired.</strong> 22 binary crates (ausfd, bsfd, dccfd, easdfd, eesd, hssd, lmfd, mbsmfd, nefd, nrfd, nsacfd, nssfd, nwdafd, pcfd, pcrfd, pind, scpd, seppd, tsctsf, udmd, udrd, upfd — <code>grep -rl log_file src/bins/*/src/*.rs</code>) declare a <code>log_file</code> CLI arg, but in none of them is the parsed value ever consumed by the logging setup — e.g. nrfd’s <code>init_logging()</code> never references <code>args.log_file</code>. Logs always go to stdout/stderr; rely on <code>docker logs</code> or shell redirection.</p>
 <h2 id="troubleshooting"><a class="header" href="#troubleshooting">Troubleshooting</a></h2>
 <p>Every row below is grounded in a specific file in this repo.</p>

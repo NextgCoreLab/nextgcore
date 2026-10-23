@@ -111,7 +111,9 @@ All NFs log to **stdout/stderr** via `env_logger`. Every NF binary uses millisec
 
 `nextgcore-smfd` and `nextgcore-sgwud` have no clap parser. smfd — scans `std::env::args()` only for `-c <config>` (and `--state-file`) and takes its log level purely from `RUST_LOG` (default `info`); sgwud scans for `-c` and `-l/--log-level`.
 
-**`RUST_LOG` precedence is the same in every NF.** Every NF builds its logger with `nextgcore_core::log::nf_log_builder` (#691): `RUST_LOG`, when set, is the filter; otherwise the `--log-level` flag applies (an unknown value means `info`). `RUST_LOG_STYLE` sets the colour style; `--no-color` overrides it. `src/libs/nextgcore-core/tests/nf_logging_init.rs` fails if a daemon builds its own logger.
+**`RUST_LOG` precedence is the same in every NF.** Every NF builds its logger with `nextgcore_core::log::nf_log_builder` (#691): `RUST_LOG`, when set, is the filter; otherwise the `--log-level` flag applies (an unknown value means `info`). `RUST_LOG_STYLE` sets the colour style; `--no-color` overrides it.
+
+Precedence, in full: a set, non-blank `RUST_LOG` **replaces** `--log-level`; the two are not merged. So `RUST_LOG=nextgcore_amfd=debug` alone logs only amfd's own targets (at debug) and silences every other target. Include a default level, as the compose files do (`info,nextgcore_amfd=debug`), to keep the rest at `info`. A blank `RUST_LOG=` counts as unset. `src/libs/nextgcore-core/tests/nf_logging_init.rs` fails if a daemon builds its own logger.
 
 **`--log-file` is accepted but not wired.** 22 binary crates (ausfd, bsfd, dccfd, easdfd, eesd, hssd, lmfd, mbsmfd, nefd, nrfd, nsacfd, nssfd, nwdafd, pcfd, pcrfd, pind, scpd, seppd, tsctsf, udmd, udrd, upfd — `grep -rl log_file src/bins/*/src/*.rs`) declare a `log_file` CLI arg, but in none of them is the parsed value ever consumed by the logging setup — e.g. nrfd's `init_logging()` never references `args.log_file`. Logs always go to stdout/stderr; rely on `docker logs` or shell redirection.
 
