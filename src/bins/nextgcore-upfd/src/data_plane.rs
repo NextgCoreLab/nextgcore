@@ -60,8 +60,6 @@ pub const GTPU_IE_RECOVERY: u8 = 14;
 /// Per-peer GTP-U path state (TS 29.281 §7.2, TS 23.007).
 #[derive(Debug, Clone, Default)]
 pub struct GtpuPeerState {
-    /// Last Recovery counter seen from this peer; None = no response yet.
-    pub last_recovery: Option<u8>,
     /// Sequence number of the most recently sent (unanswered) Echo Request.
     pub pending_seq: Option<u16>,
     /// Consecutive missed responses (no reply before next tick).
@@ -75,9 +73,8 @@ pub struct GtpuPeerState {
 /// What an Echo Response meant to the [`GtpuPathTable`] (#887).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EchoResponse {
-    /// It answered our outstanding request; `restarted` when the peer's Recovery
-    /// counter changed (its tunnels are stale, TS 29.281 §7.2.2).
-    Answered { restarted: bool },
+    /// It answered our outstanding request: the path is alive.
+    Answered,
     /// Not an answer to anything we sent (unknown peer, no outstanding request, or a
     /// sequence number that does not match). Ignored.
     Unsolicited,
@@ -123,8 +120,20 @@ impl GtpuPathTable {
         self.peers.remove(peer);
     }
 
-    /// Called on receiving an Echo Response from `peer` carrying sequence number `seq`
-    /// and Recovery counter `recovery`.
+    /// Track exactly the paths IN USE (#887 review, TS 29.281 §7.2.1: "Echo Request
+    /// messages may be sent for each path in use ... if at least one ... PDU Session
+    /// ... uses the path"): add the peers of `in_use` and DROP every other one. Before,
+    /// a peer was only ever added, so the table kept every gNB address ever used --
+    /// and now that a failed path keeps being probed (to see it recover), a gNB that
+    /// left would otherwise be probed for the life of the process.
+    pub fn sync_peers(&mut self, in_use: &HashSet<SocketAddr>) {
+        self.peers.retain(|peer, _| in_use.contains(peer));
+        for &peer in in_use {
+            self.add_peer(peer);
+        }
+    }
+
+    /// Called on receiving an Echo Response from `peer` carrying sequence number `seq`.
     ///
     /// #887: only an ANSWER is accepted -- a response from a peer this table probes,
     /// whose sequence number matches the Echo Request outstanding to it (TS 29.281
@@ -133,12 +142,10 @@ impl GtpuPathTable {
     /// address, so a spoofed response grew the table without bound -- and every entry
     /// it created was then PROBED, making the UPF send Echo Requests to addresses of
     /// the sender's choosing.
-    pub fn on_echo_response(
-        &mut self,
-        peer: SocketAddr,
-        seq: Option<u16>,
-        recovery: u8,
-    ) -> EchoResponse {
+    ///
+    /// The Recovery IE an answer carries says nothing about a restart (#873, TS 29.281
+    /// §8.2: "set to 0 by the sending entity and ignored by the receiving entity").
+    pub fn on_echo_response(&mut self, peer: SocketAddr, seq: Option<u16>) -> EchoResponse {
         let Some(state) = self.peers.get_mut(&peer) else {
             return EchoResponse::Unsolicited;
         };
@@ -149,18 +156,7 @@ impl GtpuPathTable {
         state.miss_count = 0;
         state.last_success = Some(std::time::Instant::now());
         state.path_failed = false;
-        let restarted = match state.last_recovery {
-            Some(prev) if prev != recovery => {
-                state.last_recovery = Some(recovery);
-                true // peer restarted
-            }
-            None => {
-                state.last_recovery = Some(recovery);
-                false
-            }
-            _ => false,
-        };
-        EchoResponse::Answered { restarted }
+        EchoResponse::Answered
     }
 
     /// Advance the state machine by one echo interval tick.
@@ -2712,28 +2708,25 @@ impl DataPlane {
                 return;
             }
             gtpu_msg_type::ECHO_RESPONSE => {
-                // TS 29.281 §7.2.2: response to our outgoing Echo Request.
-                // Parse the Recovery IE and update the N3 path table.
+                // TS 29.281 §7.2.2: response to our outgoing Echo Request; the
+                // path is alive. Its Recovery value is ignored (§8.2).
                 let recovery = if pkt.len() > header.header_len {
                     parse_gtpu_recovery_ie(&pkt[header.header_len..])
                 } else {
                     None
                 };
-                let counter = recovery.unwrap_or(0);
-                let outcome = self.path_table.write().unwrap().on_echo_response(
-                    from,
-                    header.seq_num,
-                    counter,
-                );
                 log::debug!(
-                    "GTP-U Echo Response from {from}, seq={:?}, Recovery={counter}: {outcome:?}",
+                    "GTP-U Echo Response from {from}, seq={:?}, Recovery={recovery:?} \
+                     (ignored, TS 29.281 §8.2)",
                     header.seq_num
                 );
-                if outcome == (EchoResponse::Answered { restarted: true }) {
-                    log::warn!(
-                        "GTP-U peer {from} restarted (Recovery counter changed to {counter}) \
-                         — tunnels may be stale"
-                    );
+                let outcome = self
+                    .path_table
+                    .write()
+                    .unwrap()
+                    .on_echo_response(from, header.seq_num);
+                if outcome == EchoResponse::Unsolicited {
+                    log::debug!("GTP-U Echo Response from {from} answers nothing we sent: ignored");
                 }
                 return;
             }
@@ -3632,22 +3625,17 @@ impl DataPlane {
                 break;
             }
 
-            // Derive current N3 peer set from active sessions (additive only:
-            // stale peers with miss_count > 0 age out naturally via tick()).
+            // The N3 peer set in use, derived from the live sessions.
             let active_peers: HashSet<SocketAddr> = {
                 let map = self.sessions.seid_map.read().unwrap();
                 map.values().map(|s| s.gnb_addr()).collect()
             };
 
+            // #887 review: the table tracks exactly the paths in use; a peer whose last
+            // session went is dropped, not probed forever.
+            self.path_table.write().unwrap().sync_peers(&active_peers);
             if active_peers.is_empty() {
                 continue;
-            }
-
-            {
-                let mut pt = self.path_table.write().unwrap();
-                for &peer in &active_peers {
-                    pt.add_peer(peer);
-                }
             }
 
             let miss_threshold = self.path_table.read().unwrap().miss_threshold;
@@ -6442,12 +6430,7 @@ mod tests {
         assert!(failed.is_empty());
         let seq = to_send[0].1;
 
-        // The answer, with recovery=0 (first time → not a restart).
-        assert_eq!(
-            pt.on_echo_response(peer, Some(seq), 0),
-            EchoResponse::Answered { restarted: false },
-            "first response must not flag a restart"
-        );
+        assert_eq!(pt.on_echo_response(peer, Some(seq)), EchoResponse::Answered);
 
         // After response the peer must not be failed.
         let state = pt.peers.get(&peer).unwrap();
@@ -6481,28 +6464,23 @@ mod tests {
         assert!(state.path_failed);
     }
 
-    /// A changed Recovery counter on a response must return `true` (peer restart).
+    /// #798 review, TS 29.281 §8.2: the GTP-U Recovery value is ignored, so
+    /// Echo Responses with changing values keep the path alive and are not a
+    /// restart.
     #[test]
-    fn test_path_table_changed_recovery_detects_restart() {
+    fn a_gtpu_recovery_value_is_ignored() {
         let peer: SocketAddr = "10.0.0.2:2152".parse().unwrap();
         let mut pt = GtpuPathTable::default();
         pt.add_peer(peer);
-
-        // First answer: recovery=5, not a restart.
+        // Answers carrying any Recovery value keep the path alive: the value is not
+        // even read (#873, §8.2), only the sequence number matters (#887).
         let seq = pt.tick().0[0].1;
-        assert_eq!(
-            pt.on_echo_response(peer, Some(seq), 5),
-            EchoResponse::Answered { restarted: false },
-            "first response is never a restart"
-        );
-
-        // Second answer: recovery=6 (counter incremented = peer restarted).
+        assert_eq!(pt.on_echo_response(peer, Some(seq)), EchoResponse::Answered);
         let seq = pt.tick().0[0].1;
-        assert_eq!(
-            pt.on_echo_response(peer, Some(seq), 6),
-            EchoResponse::Answered { restarted: true },
-            "changed Recovery counter must signal peer restart"
-        );
+        assert_eq!(pt.on_echo_response(peer, Some(seq)), EchoResponse::Answered);
+        let state = pt.peers.get(&peer).unwrap();
+        assert_eq!(state.miss_count, 0);
+        assert!(!state.path_failed);
     }
 
     /// #887: an Echo Response that answers nothing we sent changes nothing. 1000
@@ -6515,7 +6493,7 @@ mod tests {
         for i in 0..1000u32 {
             let spoofed = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(0x0A_88_00_00 | i)), 2152);
             assert_eq!(
-                pt.on_echo_response(spoofed, Some(1), 0),
+                pt.on_echo_response(spoofed, Some(1)),
                 EchoResponse::Unsolicited
             );
         }
@@ -6532,21 +6510,46 @@ mod tests {
         pt.tick(); // that request missed; a new one is outstanding
         let outstanding = pt.peers[&peer].pending_seq;
         assert_eq!(
-            pt.on_echo_response(peer, Some(seq), 0),
+            pt.on_echo_response(peer, Some(seq)),
             EchoResponse::Unsolicited,
             "a stale seq"
         );
         assert_eq!(
-            pt.on_echo_response(peer, None, 0),
+            pt.on_echo_response(peer, None),
             EchoResponse::Unsolicited,
             "no seq"
         );
         assert_eq!(pt.peers[&peer].miss_count, 1, "the miss stands");
         assert_eq!(
-            pt.on_echo_response(peer, outstanding, 0),
-            EchoResponse::Answered { restarted: false }
+            pt.on_echo_response(peer, outstanding),
+            EchoResponse::Answered
         );
         assert_eq!(pt.peers[&peer].miss_count, 0);
+    }
+
+    /// #887 review: only paths IN USE are tracked and probed (TS 29.281 §7.2.1). A
+    /// peer whose last session went -- failed or not -- is dropped from the table and
+    /// no longer probed; a failed peer still in use keeps being probed.
+    #[test]
+    fn a_peer_that_loses_its_last_session_is_no_longer_probed() {
+        let a: SocketAddr = "10.88.3.1:2152".parse().unwrap();
+        let b: SocketAddr = "10.88.3.2:2152".parse().unwrap();
+        let mut pt = GtpuPathTable::default();
+        pt.miss_threshold = 1;
+        pt.sync_peers(&HashSet::from([a, b]));
+        pt.tick();
+        let (_, failed) = pt.tick();
+        assert_eq!(failed.len(), 2, "both paths failed");
+
+        // b's sessions are gone.
+        pt.sync_peers(&HashSet::from([a]));
+        assert_eq!(pt.peer_count(), 1, "b is dropped from the table");
+        let (probed, _) = pt.tick();
+        assert_eq!(
+            probed.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+            vec![a],
+            "only the failed path still in use is probed"
+        );
     }
 
     /// #887: a failed path is still probed, so a matching answer can recover it.
@@ -6565,8 +6568,8 @@ mod tests {
         assert_eq!(again.len(), 1, "the failed peer is probed again");
         assert!(refailed.is_empty(), "declared failed only once");
         assert_eq!(
-            pt.on_echo_response(peer, Some(again[0].1), 0),
-            EchoResponse::Answered { restarted: false }
+            pt.on_echo_response(peer, Some(again[0].1)),
+            EchoResponse::Answered
         );
         assert!(!pt.peers[&peer].path_failed, "the answer recovers the path");
     }
