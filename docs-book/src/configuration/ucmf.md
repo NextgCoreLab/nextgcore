@@ -39,7 +39,7 @@ Parsed by `UcmfYaml` / `UcmfSection` in `src/bins/nextgcore-ucmfd/src/main.rs`. 
 | `ucmf.mode` | `A` or `B` | `B` | TS 23.501 §5.4.4.1a mode of operation. B (the RAN sends the TS 38.331 format only) is the only mode allowed when RACS is used in 5GS alone. `--mode` overrides it. |
 | `ucmf.purge_outdated_ids` | bool | `false` | Delete PLMN-assigned IDs under older Version IDs at startup. |
 | `ucmf.state_file` | path | unset | JSON snapshot of the dictionary, subscriptions and provisionings. Unset: memory only. `--state-file` overrides it. Written behind (#786): changes are flushed every 500 ms and at shutdown, not on every request, so a crash can lose up to the last 500 ms of changes. IDs are never reissued after such a crash: the snapshot reserves 1024 IDs of each kind ahead, written synchronously, so a restart continues above every ID handed out. |
-| `ucmf.limits.max_dic_entries` | integer | `10000` | Most dictionary entries, assigned plus provisioned (#786). Past it Assign answers `500 INSUFFICIENT_RESOURCES` and Provisioning reports the RACS ID `OTHER_REASON`. |
+| `ucmf.limits.max_dic_entries` | integer | `10000` | Most dictionary entries, assigned plus provisioned (#786). Past it Assign answers `500 INSUFFICIENT_RESOURCES` and Provisioning reports the RACS ID `OTHER_REASON`. An ID counter (entry, subscription, provisioning) that reaches the top of its range refuses the same way rather than reissue an ID. |
 | `ucmf.limits.max_subscriptions` | integer | `10000` | Most Nucmf_UECapabilityManagement subscriptions; past it Subscribe answers `500 INSUFFICIENT_RESOURCES`. |
 | `ucmf.limits.max_subscriptions_per_consumer` | integer | `16` | Most subscriptions per consumer (its `nfId`, else the notification URI's `host:port`). |
 | `ucmf.sbi.oauth2.require` | bool | `false` | Require an OAuth2 token on the SBI. `--oauth2-require` overrides it. |
@@ -66,6 +66,7 @@ Parsed by `UcmfYaml` / `UcmfSection` in `src/bins/nextgcore-ucmfd/src/main.rs`. 
 |---|---|---|
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://jaeger:4317` | OpenTelemetry OTLP exporter. |
 | `RUST_LOG` | unset | Overrides the log level. |
+| `UCMF_METRICS_ADDR` | `127.0.0.1:9090` | Where `GET /metrics` (Prometheus text) listens. It is unauthenticated, so it defaults to loopback; set a private address deliberately to scrape it from another host. Series: `ucmf_state_lock_poison_recoveries_total` (a request panicked while holding the state lock; a defect to report), `ucmf_dictionary_full_refusals_total`, `ucmf_subscription_limit_refusals_total`, `ucmf_dictionary_entries`, `ucmf_subscriptions`. |
 
 ## How the AMF reaches it
 
