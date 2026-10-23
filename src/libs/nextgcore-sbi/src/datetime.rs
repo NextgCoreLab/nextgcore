@@ -226,13 +226,9 @@ pub fn rfc3339_to_epoch_signed(text: &str) -> Option<i64> {
     let mut tparts = time.split(':');
     let hour = digits(tparts.next()?, 2)?;
     let minute = digits(tparts.next()?, 2)?;
-    // RFC 3339 `partial-time` requires seconds; a missing seconds field is
-    // accepted as :00 on purpose, for the peers that send `hh:mm` (it cannot
-    // move a deadline by more than a minute, and it is never an overflow).
-    let second = match tparts.next() {
-        Some(s) => digits(s, 2)?,
-        None => 0,
-    };
+    // RFC 3339 `partial-time` requires seconds (`time-hour ":" time-minute ":"
+    // time-second`), so `hh:mm` is refused.
+    let second = digits(tparts.next()?, 2)?;
     if tparts.next().is_some() || hour > 23 || minute > 59 || second > 60 {
         return None;
     }
@@ -296,6 +292,7 @@ mod tests {
             "2023-02-29T00:00:00Z",
             "2024-04-31T00:00:00Z",
             "2024-01-01T00:00:00.Z",
+            "2024-01-01T12:00Z",
             "2024-01-01T00:00:00.1aZ",
         ] {
             assert_eq!(rfc3339_to_epoch_signed(bad), None, "{bad:?}");
