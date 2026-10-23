@@ -953,9 +953,11 @@ pub fn send_modify_bearer_request(
     let bearer_refs: Vec<&crate::context::MmeBearer> = bearers.iter().collect();
 
     let seq = sequence()?;
-    let msg =
-        s11_build::build_modify_bearer_request(&mme_ue, &sgw_ue, &bearer_refs, uli_presence, seq)
-            .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
+    // `uli_presence` is not acted on: the builder does not encode ULI (a stated
+    // ceiling of #730).
+    let _ = uli_presence;
+    let msg = s11_build::build_modify_bearer_request(&mme_ue, &sgw_ue, &bearer_refs, &[], seq)
+        .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
     let xact_id = ctx.next_pool_id();
     send_to_sgwc(ctx, &msg, xact_id)?;
 
@@ -1399,7 +1401,7 @@ pub fn send_modify_bearer_request_for_erab_modification(
         .collect();
     let bearer_refs: Vec<&crate::context::MmeBearer> = bearers.iter().collect();
     let seq = sequence()?;
-    let msg = s11_build::build_modify_bearer_request(&mme_ue, &sgw_ue, &bearer_refs, true, seq)
+    let msg = s11_build::build_modify_bearer_request(&mme_ue, &sgw_ue, &bearer_refs, &[], seq)
         .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
     // Recorded before the send (the #359 lesson): a response can race the
     // return of `send_to`.
@@ -1534,8 +1536,16 @@ pub fn send_modify_bearer_request_for_handover(
         .collect();
     let bearer_refs: Vec<&crate::context::MmeBearer> = bearers.iter().collect();
     let seq = sequence()?;
-    let msg = s11_build::build_modify_bearer_request(&mme_ue, &sgw_ue, &bearer_refs, true, seq)
-        .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
+    // The omitted bearers go as "Bearer Contexts to be removed" (Table 7.2.7-1,
+    // NOTE 3): the SGW learns that the MME removes them by a separate procedure.
+    let msg = s11_build::build_modify_bearer_request(
+        &mme_ue,
+        &sgw_ue,
+        &bearer_refs,
+        &pending.omitted,
+        seq,
+    )
+    .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
     // Recorded before the send (the #359 lesson): a response can race the
     // return of `send_to`.
     pending_handover_modifications()

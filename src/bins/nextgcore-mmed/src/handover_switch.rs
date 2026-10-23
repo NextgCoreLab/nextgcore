@@ -48,12 +48,113 @@ fn default_bearers(ctx: &MmeContext, mme_ue_id: u64) -> Vec<(u64, u8)> {
         .collect()
 }
 
-/// Whether at least one PDN connection of `mme_ue_id` keeps its default bearer
-/// when the bearers in `lost` go.
-pub fn a_default_bearer_survives(ctx: &MmeContext, mme_ue_id: u64, lost: &[u8]) -> bool {
+/// Whether at least one PDN connection of `mme_ue_id` has its default bearer
+/// among `switched` (TS 23.401 §5.5.1.1.2: "If none of the default EPS bearers
+/// have been switched successfully ... the MME shall send a Path Switch Request
+/// Failure"). A default bearer that is merely not lost, for example one of a PDN
+/// connection whose E-RAB setup has not completed, does not count (#730 review m5).
+pub fn a_default_bearer_switched(ctx: &MmeContext, mme_ue_id: u64, switched: &[u8]) -> bool {
     default_bearers(ctx, mme_ue_id)
         .iter()
-        .any(|(_, ebi)| !lost.contains(ebi))
+        .any(|(_, ebi)| switched.contains(ebi))
+}
+
+/// TS 23.401 §5.5.1.1.2 step 2: the Modify Bearer Request is sent "for each PDN
+/// connection where the default bearer has been accepted". A dedicated bearer of
+/// a PDN connection whose default bearer is not switched leaves the request and
+/// joins the omitted (lost) bearers; that connection is then released whole
+/// (#730 review m4). Returns the (switched, omitted) pair to send.
+pub fn only_pdns_with_a_switched_default(
+    ctx: &MmeContext,
+    mme_ue_id: u64,
+    switched: Vec<SwitchedBearer>,
+    mut omitted: Vec<u8>,
+) -> (Vec<SwitchedBearer>, Vec<u8>) {
+    let defaults = default_bearers(ctx, mme_ue_id);
+    let switched_ebis: Vec<u8> = switched.iter().map(|s| s.ebi).collect();
+    let session_of = |ebi: u8| -> Option<u64> {
+        let bearer_id = ctx.bearer_find_by_ebi(mme_ue_id, ebi)?;
+        Some(ctx.bearer_find_by_id(bearer_id)?.sess_id)
+    };
+    let mut kept = Vec::new();
+    for bearer in switched {
+        let default_switched = session_of(bearer.ebi)
+            .and_then(|sess_id| defaults.iter().find(|(id, _)| *id == sess_id))
+            .is_some_and(|(_, default)| switched_ebis.contains(default));
+        if default_switched {
+            kept.push(bearer);
+        } else if !omitted.contains(&bearer.ebi) {
+            omitted.push(bearer.ebi);
+        }
+    }
+    (kept, omitted)
+}
+
+/// The UE-AMBR the MME signals for `mme_ue_id`: the sum of the APN-AMBRs of its
+/// active PDN connections, up to the subscribed UE-AMBR (TS 23.401 §4.7.3). A
+/// zero APN-AMBR sum (not known) falls back to the subscribed value.
+pub fn ue_ambr(ctx: &MmeContext, mme_ue_id: u64) -> Option<nextgcore_s1ap::UeAmbr> {
+    let ue = ctx.mme_ue_find_by_id(mme_ue_id)?;
+    let (mut dl, mut ul) = (0u64, 0u64);
+    for sess in ue
+        .sess_list
+        .iter()
+        .filter_map(|id| ctx.sess_find_by_id(*id))
+    {
+        dl = dl.saturating_add(sess.ambr.downlink);
+        ul = ul.saturating_add(sess.ambr.uplink);
+    }
+    let cap = |sum: u64, subscribed: u64| match (sum, subscribed) {
+        (0, s) => s,
+        (s, 0) => s,
+        (s, sub) => s.min(sub),
+    };
+    Some(nextgcore_s1ap::UeAmbr {
+        dl: cap(dl, ue.ambr.downlink),
+        ul: cap(ul, ue.ambr.uplink),
+    })
+}
+
+/// Handover failures in the core, by reason, for operators (#730 review m7).
+/// Exported through [`handover_failures`].
+static HANDOVER_FAILURES: std::sync::Mutex<Vec<(&'static str, u64)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Count one handover the core could not complete, by `reason`.
+pub fn count_handover_failure(reason: &'static str) {
+    let mut counts = HANDOVER_FAILURES.lock().unwrap_or_else(|e| e.into_inner());
+    match counts.iter_mut().find(|(r, _)| *r == reason) {
+        Some((_, n)) => *n += 1,
+        None => counts.push((reason, 1)),
+    }
+    log::warn!(
+        "metric mme_handover_core_failures_total{{reason=\"{reason}\"}} incremented (TS 23.401 \
+         §5.5.1.1.2 / §5.5.1.2.2)"
+    );
+}
+
+/// The handover failures counted so far: (reason, count).
+pub fn handover_failures() -> Vec<(&'static str, u64)> {
+    HANDOVER_FAILURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Reasons [`count_handover_failure`] is called with.
+pub mod failure_reason {
+    /// The handover switched no default bearer.
+    pub const NO_DEFAULT_BEARER: &str = "no_default_bearer";
+    /// The Serving GW refused the Modify Bearer Request.
+    pub const SGW_REFUSED: &str = "sgw_refused";
+    /// The Serving GW never answered it (N3 exhausted).
+    pub const SGW_NO_ANSWER: &str = "sgw_no_answer";
+    /// The Modify Bearer Request could not be sent.
+    pub const NOT_SENT: &str = "not_sent";
+    /// A second Path Switch Request while one is outstanding.
+    pub const ALREADY_PENDING: &str = "already_pending";
+    /// The request named one E-RAB twice (TS 36.413 §8.4.4.4).
+    pub const DUPLICATE_ERAB: &str = "duplicate_erab";
 }
 
 /// Split the request's bearers into those the Serving GW switched and those it
@@ -257,6 +358,7 @@ fn fail(ctx: &MmeContext, pending: &PendingHandoverModification, why: &str) {
 /// N3 exhaustion of a handover's Modify Bearer Request: the Serving GW never
 /// answered (TS 29.274 §7.6), so nothing was switched.
 pub fn on_modify_bearer_unanswered(ctx: &MmeContext, pending: PendingHandoverModification) {
+    count_handover_failure(failure_reason::SGW_NO_ANSWER);
     log::error!(
         "UE {}: the Serving GW did not answer the handover's Modify Bearer Request; failing \
          the handover and detaching the UE (TS 23.401 §5.5.1.1.2)",
@@ -267,6 +369,37 @@ pub fn on_modify_bearer_unanswered(ctx: &MmeContext, pending: PendingHandoverMod
         &pending,
         "a handover whose Modify Bearer Request the Serving GW never answered",
     );
+}
+
+/// Whether the S1 association a pending handover answers on still exists and
+/// still serves the UE: the eNB UE context with the recorded (eNB, MME UE S1AP
+/// ID, eNB UE S1AP ID), which the UE context points at.
+fn association_alive(ctx: &MmeContext, pending: &PendingHandoverModification) -> bool {
+    let (enb_id, mme_ue_s1ap_id, enb_ue_s1ap_id) = match &pending.kind {
+        HandoverModifyKind::PathSwitch {
+            enb_id,
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id,
+            ..
+        }
+        | HandoverModifyKind::HandoverNotify {
+            enb_id,
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id,
+        } => (*enb_id, *mme_ue_s1ap_id, *enb_ue_s1ap_id),
+    };
+    let Some(enb_ue_id) = ctx.enb_ue_find_by_mme_ue_s1ap_id(mme_ue_s1ap_id) else {
+        return false;
+    };
+    let Some(enb_ue) = ctx.enb_ue_find_by_id(enb_ue_id) else {
+        return false;
+    };
+    enb_ue.enb_id == enb_id
+        && enb_ue.enb_ue_s1ap_id == enb_ue_s1ap_id
+        && enb_ue.mme_ue_id == pending.mme_ue_id
+        && ctx
+            .mme_ue_find_by_id(pending.mme_ue_id)
+            .is_some_and(|ue| ue.enb_ue_id == enb_ue_id)
 }
 
 /// The Modify Bearer Response a handover waited on (TS 23.401 §5.5.1.1.2 step 4
@@ -301,6 +434,7 @@ pub fn on_modify_bearer_response(
         return;
     }
     if !message_accepted(data.cause) {
+        count_handover_failure(failure_reason::SGW_REFUSED);
         log::error!(
             "UE {mme_ue_id}: the Serving GW refused the handover's Modify Bearer Request (cause \
              {}); failing the handover and detaching the UE (TS 23.401 §5.5.1.1.2)",
@@ -319,7 +453,9 @@ pub fn on_modify_bearer_response(
     let (switched, failed) = split_by_response(&pending.switched, data);
     let mut lost = pending.omitted.clone();
     lost.extend_from_slice(&failed);
-    if !a_default_bearer_survives(ctx, mme_ue_id, &lost) {
+    let accepted: Vec<u8> = switched.iter().map(|s| s.ebi).collect();
+    if !a_default_bearer_switched(ctx, mme_ue_id, &accepted) {
+        count_handover_failure(failure_reason::NO_DEFAULT_BEARER);
         log::error!(
             "UE {mme_ue_id}: the Serving GW switched no default bearer (not switched: \
              {failed:?}); failing the handover and detaching the UE (TS 23.401 §5.5.1.1.2)"
@@ -331,8 +467,29 @@ pub fn on_modify_bearer_response(
         );
         return;
     }
-    apply_switched(ctx, mme_ue_id, &switched);
+    // #730 review m1: the S1 association the answer is for may have been released
+    // while the request was outstanding (a UE CONTEXT RELEASE REQUEST racing the
+    // response). Then there is no eNB to answer, and the endpoints it named are
+    // not the UE's any more: the bearers are not switched and nothing is sent on
+    // S1. The lost bearers are still released in the core.
+    let association = association_alive(ctx, &pending);
+    if association {
+        apply_switched(ctx, mme_ue_id, &switched);
+    }
+    let sessions_before = ctx
+        .mme_ue_find_by_id(mme_ue_id)
+        .map_or(0, |ue| ue.sess_list.len());
     let released = release_lost_bearers(ctx, mme_ue_id, &lost);
+    let sessions_after = ctx
+        .mme_ue_find_by_id(mme_ue_id)
+        .map_or(0, |ue| ue.sess_list.len());
+    if !association {
+        log::warn!(
+            "UE {mme_ue_id}: the S1 association of the handover is gone; the Modify Bearer \
+             Response is not acted on towards the eNB (released in the core: {released:?})"
+        );
+        return;
+    }
     log::info!(
         "UE {mme_ue_id}: Serving GW switched EBIs {:?} to the target eNB (TS 23.401 \
          §5.5.1.1.2 / §5.5.1.2.2); released {released:?}",
@@ -382,6 +539,11 @@ pub fn on_modify_bearer_response(
                     })
                 })
                 .collect();
+            // TS 23.401 §5.5.1.1.2 step 6: a released PDN connection changes
+            // the UE-AMBR, which the acknowledge then carries.
+            let new_ambr = (sessions_after < sessions_before)
+                .then(|| ue_ambr(ctx, mme_ue_id))
+                .flatten();
             let ack = nextgcore_s1ap::PathSwitchRequestAcknowledge {
                 mme_ue_s1ap_id,
                 enb_ue_s1ap_id,
@@ -393,6 +555,7 @@ pub fn on_modify_bearer_response(
             };
             match crate::s1ap_gen::build_path_switch_request_acknowledge_releasing(
                 &ack,
+                new_ambr.as_ref(),
                 &to_release,
                 &notify,
             ) {
@@ -413,7 +576,11 @@ pub fn on_modify_bearer_response(
             let cmd = nextgcore_s1ap::ErabReleaseCommand {
                 mme_ue_s1ap_id,
                 enb_ue_s1ap_id,
-                ue_ambr: None,
+                // TS 36.413 §8.2.3.2: the eNB applies a UE-AMBR carried here; a
+                // released PDN connection changes it (TS 23.401 §4.7.3).
+                ue_ambr: (sessions_after < sessions_before)
+                    .then(|| ue_ambr(ctx, mme_ue_id))
+                    .flatten(),
                 erab_list: held_by_enb_released,
                 nas_pdu: None,
             };
@@ -873,6 +1040,8 @@ mod tests {
             let t = pool.get_mut(&target_ue_id).unwrap();
             t.mme_ue_id = ue.mme_ue_id;
             t.source_ue_id = ue.source_ue_id;
+            // Armed by HANDOVER REQUIRED: the preparation is outstanding.
+            t.handover_prep_deadline = Some(Instant::now() + Duration::from_secs(10));
         }
         for ebi in admitted {
             let bearer_id = ctx.bearer_find_by_ebi(ue.mme_ue_id, *ebi).unwrap();
@@ -987,6 +1156,479 @@ mod tests {
             ue.mme_ue_id
         ));
         ctx.enb_ue_remove(target_ue_id);
+        release(&ue);
+    }
+
+    /// The message types the stand-in SGW receives within `window`.
+    fn drain(sgw: &UdpSocket, window: Duration) -> Vec<Gtp2Message> {
+        let mut out = Vec::new();
+        let deadline = Instant::now() + window;
+        let mut buf = [0u8; 4096];
+        sgw.set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        while Instant::now() < deadline {
+            if let Ok((len, _)) = sgw.recv_from(&mut buf) {
+                let mut bytes = bytes::Bytes::copy_from_slice(&buf[..len]);
+                if let Ok(msg) = Gtp2Message::decode(&mut bytes) {
+                    out.push(msg);
+                }
+            }
+        }
+        sgw.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        out
+    }
+
+    fn types(msgs: &[Gtp2Message]) -> Vec<u8> {
+        msgs.iter().map(|m| m.header.message_type).collect()
+    }
+
+    /// EBIs of the instance-`instance` Bearer Contexts of `msg`.
+    fn bearer_context_ebis(msg: &Gtp2Message, instance: u8) -> Vec<u8> {
+        msg.get_ies(Gtp2IeType::BearerContext as u8)
+            .into_iter()
+            .filter(|ie| ie.instance == instance)
+            .filter_map(|ie| Gtp2BearerContextIe::decode(&ie.value).ok()?.ebi().ok())
+            .collect()
+    }
+
+    /// A Modify Bearer Response that also marks `removed` for removal (instance 1).
+    fn mbr_response_removing(
+        local_teid: u32,
+        seq: u32,
+        cause: u8,
+        bearers: &[(u8, u8)],
+        removed: &[u8],
+    ) -> Vec<u8> {
+        let mut bytes = bytes::Bytes::from(mbr_response(local_teid, seq, cause, bearers));
+        let mut rsp = Gtp2Message::decode(&mut bytes).unwrap();
+        for ebi in removed {
+            let mut bc = Gtp2BearerContextIe::new();
+            bc.set_ebi(*ebi);
+            bc.set_cause(&Gtp2CauseIe::new(16));
+            rsp.add_bearer_context(1, &bc);
+        }
+        rsp.encode().to_vec()
+    }
+
+    fn detach_pending(ue: &Ue) -> bool {
+        crate::context::mme_self()
+            .mme_ue_find_by_id(ue.mme_ue_id)
+            .is_some_and(|u| u.nas_eps.type_ == crate::context::MmeEpsType::DetachRequestToUe)
+    }
+
+    fn send_notify(enb_id: u64, mme_ue_s1ap_id: u32, enb_ue_s1ap_id: u32) -> Vec<S1apSend> {
+        let notify = HandoverNotify {
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id,
+            eutran_cgi: EutranCgi {
+                plmn_identity: [0x13, 0x00, 0x14],
+                cell_identity: 0x77,
+            },
+            tai: Tai {
+                plmn_identity: [0x13, 0x00, 0x14],
+                tac: 7,
+            },
+        };
+        crate::s1ap_handler::handle_s1ap_message(
+            crate::context::mme_self(),
+            enb_id,
+            &builder::build_handover_notify(&notify).unwrap(),
+        )
+    }
+
+    fn is_error_indication(send: &S1apSend) -> bool {
+        matches!(
+            nextgcore_s1ap_gen::decode(&send.pdu),
+            Ok(g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+                value: g::InitiatingMessageValue::Id_ErrorIndication(_),
+                ..
+            }))
+        )
+    }
+
+    /// #730 review B1: a HANDOVER NOTIFY from an eNB the UE is not on, naming
+    /// an attached UE's MME UE S1AP ID, is answered with ERROR INDICATION and
+    /// changes nothing: no Modify Bearer or Delete Session Request, no detach.
+    /// A notify from the UE's own eNB when no handover is in progress only
+    /// updates the location.
+    #[test]
+    fn a_stray_handover_notify_detaches_nobody() {
+        let _guard = lock_s11();
+        let (sgw, _route) = sgw(Gtp2XactConfig::default());
+        let ue = seed(&[5]);
+        let ctx = crate::context::mme_self();
+        let intruder = ctx.enb_add(enb_addr());
+
+        let out = send_notify(intruder, ue.mme_ue_s1ap_id, 100);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].enb_id, intruder);
+        assert!(
+            is_error_indication(&out[0]),
+            "ERROR INDICATION to the sender"
+        );
+
+        // The UE's own eNB and pair, but no handover in progress.
+        let out = send_notify(ue.source_enb_id, ue.mme_ue_s1ap_id, 100);
+        assert!(out.is_empty(), "{out:?}");
+        assert_eq!(
+            ctx.mme_ue_find_by_id(ue.mme_ue_id).unwrap().e_cgi.cell_id,
+            0x77,
+            "the location is updated, as before #730"
+        );
+
+        assert!(
+            drain(&sgw, Duration::from_millis(400)).is_empty(),
+            "nothing reaches the SGW"
+        );
+        assert!(!detach_pending(&ue));
+        assert_eq!(bearer(&ue, 5).unwrap().enb_s1u_teid, 0x1005);
+        assert_eq!(
+            ctx.mme_ue_find_by_id(ue.mme_ue_id).unwrap().enb_ue_id,
+            ue.source_ue_id
+        );
+        release(&ue);
+    }
+
+    /// #730 review B1: the target's HANDOVER NOTIFY repeated while its Modify
+    /// Bearer Request is outstanding, and again after it is answered, sends no
+    /// second request and detaches nobody.
+    #[test]
+    fn a_duplicate_handover_notify_is_ignored() {
+        let _guard = lock_s11();
+        let (sgw, _route) = sgw(Gtp2XactConfig::default());
+        let ue = seed(&[5]);
+        let ctx = crate::context::mme_self();
+        let (target_enb, target_ue_id) = notify_handover(&ue, &[5]);
+        let target_mme_ue_s1ap_id = ctx.enb_ue_find_by_id(target_ue_id).unwrap().mme_ue_s1ap_id;
+        let (mbr, from) = recv(&sgw, 34);
+
+        // Repeated while the request is outstanding.
+        assert!(send_notify(target_enb, target_mme_ue_s1ap_id, 300).is_empty());
+        assert!(drain(&sgw, Duration::from_millis(300)).is_empty());
+
+        sgw.send_to(
+            &mbr_response(ue.local_teid, mbr.header.sequence_number, 16, &[(5, 16)]),
+            from,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while crate::gtp_path::handover_modification_pending(ue.mme_ue_id)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Repeated after it completed.
+        assert!(send_notify(target_enb, target_mme_ue_s1ap_id, 300).is_empty());
+        assert!(drain(&sgw, Duration::from_millis(300)).is_empty());
+        assert!(!detach_pending(&ue));
+        assert_eq!(bearer(&ue, 5).unwrap().enb_s1u_teid, 0x8805);
+        ctx.enb_ue_remove(target_ue_id);
+        release(&ue);
+    }
+
+    /// #730 review M1, TS 29.274 Table 7.2.7-1 NOTE 3: a bearer the target left
+    /// out of the DL list goes in the Modify Bearer Request as a Bearer Context
+    /// to be removed (instance 1); it is not in the To Be Released List (TS
+    /// 36.413 §8.4.4.2: it is already implicitly released).
+    #[test]
+    fn an_omitted_bearer_is_a_bearer_context_to_be_removed() {
+        let _guard = lock_s11();
+        let (sgw, _route) = sgw(Gtp2XactConfig::default());
+        let ue = seed(&[5, 6]);
+        let target = crate::context::mme_self().enb_add(enb_addr());
+        crate::s1ap_path::tap_enb_for_test(target);
+
+        assert!(path_switch(&ue, target, &[5]).is_empty());
+        let (mbr, from) = recv(&sgw, 34);
+        assert_eq!(bearer_context_ebis(&mbr, 0), vec![5]);
+        assert_eq!(
+            bearer_context_ebis(&mbr, 1),
+            vec![6],
+            "Bearer Contexts to be removed"
+        );
+        sgw.send_to(
+            &mbr_response(ue.local_teid, mbr.header.sequence_number, 16, &[(5, 16)]),
+            from,
+        )
+        .unwrap();
+        let ack = wait_pdu(target, path_switch_ack);
+        assert_eq!(ack_lists(&ack), (vec![(5, SGW_S1U_TEID + 5)], vec![]));
+        let (dbc, _) = recv(&sgw, 66);
+        assert_eq!(bearer_context_ebis(&dbc, 0), vec![6]);
+        release(&ue);
+    }
+
+    /// #730 review M2(a), TS 36.413 §8.4.4.4: an E-RAB ID twice in the DL list is
+    /// answered with PATH SWITCH REQUEST FAILURE before any state changes.
+    #[test]
+    fn a_duplicate_erab_id_fails_the_path_switch_unchanged() {
+        let _guard = lock_s11();
+        let (sgw, _route) = sgw(Gtp2XactConfig::default());
+        let ue = seed(&[5]);
+        let ctx = crate::context::mme_self();
+        let target = ctx.enb_add(enb_addr());
+
+        let out = path_switch(&ue, target, &[5, 5]);
+        assert_eq!(out.len(), 1);
+        let cause = path_switch_failure_cause(&nextgcore_s1ap_gen::decode(&out[0].pdu).unwrap())
+            .expect("PATH SWITCH REQUEST FAILURE");
+        // CauseRadioNetwork multiple-E-RAB-ID-instances.
+        assert!(
+            matches!(&cause, g::Cause::RadioNetwork(r) if r.0 == 31),
+            "{cause:?}"
+        );
+        let enb_ue = ctx.enb_ue_find_by_id(ue.source_ue_id).unwrap();
+        assert_eq!(enb_ue.enb_id, ue.source_enb_id, "not re-anchored");
+        assert_eq!(enb_ue.enb_ue_s1ap_id, 100);
+        assert_eq!(bearer(&ue, 5).unwrap().enb_s1u_teid, 0x1005);
+        assert!(drain(&sgw, Duration::from_millis(300)).is_empty());
+        assert!(!detach_pending(&ue));
+        release(&ue);
+    }
+
+    /// #730 review M2(b): a second PATH SWITCH REQUEST while the first one's
+    /// Modify Bearer Request is outstanding is refused, and the first is still
+    /// acknowledged.
+    #[test]
+    fn a_second_path_switch_while_one_is_pending_is_refused() {
+        let _guard = lock_s11();
+        let (sgw, _route) = sgw(Gtp2XactConfig::default());
+        let ue = seed(&[5]);
+        let target = crate::context::mme_self().enb_add(enb_addr());
+        crate::s1ap_path::tap_enb_for_test(target);
+
+        assert!(path_switch(&ue, target, &[5]).is_empty());
+        let (mbr, from) = recv(&sgw, 34);
+        let second = path_switch(&ue, target, &[5]);
+        assert_eq!(second.len(), 1);
+        assert!(
+            path_switch_failure_cause(&nextgcore_s1ap_gen::decode(&second[0].pdu).unwrap())
+                .is_some(),
+            "the second request is refused"
+        );
+        assert!(
+            !types(&drain(&sgw, Duration::from_millis(300))).contains(&34),
+            "no second Modify Bearer Request"
+        );
+        sgw.send_to(
+            &mbr_response(ue.local_teid, mbr.header.sequence_number, 16, &[(5, 16)]),
+            from,
+        )
+        .unwrap();
+        let ack = wait_pdu(target, path_switch_ack);
+        assert_eq!(ack_lists(&ack).0, vec![(5, SGW_S1U_TEID + 5)]);
+        assert!(!detach_pending(&ue));
+        release(&ue);
+    }
+
+    /// #730 review M2(c), TS 23.401 §5.5.1.1.2: a DL list without the default
+    /// bearer gets PATH SWITCH REQUEST FAILURE and an explicit detach, and no
+    /// Modify Bearer Request is sent.
+    #[test]
+    fn a_path_switch_without_the_default_bearer_fails_before_any_mbr() {
+        let _guard = lock_s11();
+        let (sgw, _route) = sgw(Gtp2XactConfig::default());
+        let ue = seed(&[5, 6]);
+        let target = crate::context::mme_self().enb_add(enb_addr());
+
+        let count = || {
+            handover_failures()
+                .iter()
+                .find(|(r, _)| *r == failure_reason::NO_DEFAULT_BEARER)
+                .map_or(0, |(_, n)| *n)
+        };
+        let before = count();
+        let out = path_switch(&ue, target, &[6]);
+        assert_eq!(out.len(), 1);
+        let cause = path_switch_failure_cause(&nextgcore_s1ap_gen::decode(&out[0].pdu).unwrap())
+            .expect("PATH SWITCH REQUEST FAILURE");
+        assert!(
+            matches!(&cause, g::Cause::RadioNetwork(r) if r.0 == 0),
+            "radio network unspecified, the no-default-bearer refusal: {cause:?}"
+        );
+        assert_eq!(
+            count(),
+            before + 1,
+            "counted as a no-default-bearer failure"
+        );
+        let seen = types(&drain(&sgw, Duration::from_millis(500)));
+        assert!(seen.contains(&36), "Delete Session Request: {seen:?}");
+        assert!(!seen.contains(&34), "no Modify Bearer Request: {seen:?}");
+        assert!(detach_pending(&ue), "explicit detach (§5.3.8.3)");
+        release(&ue);
+    }
+
+    /// Path switch for `ebis`, then answer the MBR with `rsp`; expect a
+    /// failure at the target plus the explicit detach.
+    fn expect_failure_and_detach(ue: &Ue, ebis: &[u8], rsp: impl Fn(u32) -> Vec<u8>) {
+        let (sgw, _route) = sgw(Gtp2XactConfig::default());
+        let target = crate::context::mme_self().enb_add(enb_addr());
+        crate::s1ap_path::tap_enb_for_test(target);
+        assert!(path_switch(ue, target, ebis).is_empty());
+        let (mbr, from) = recv(&sgw, 34);
+        sgw.send_to(&rsp(mbr.header.sequence_number), from).unwrap();
+        let cause = wait_pdu(target, path_switch_failure_cause);
+        assert!(is_transport_resource_unavailable(&cause), "{cause:?}");
+        let (dsr, _) = recv(&sgw, 36);
+        assert_eq!(dsr.header.teid, Some(SGW_S11_TEID));
+        assert!(detach_pending(ue));
+        assert!(bearer(ue, 5).is_none_or(|b| b.enb_s1u_teid != 0x9005));
+    }
+
+    /// #730 review M2(d): Request accepted, but the default bearer is marked for
+    /// removal (Table 7.2.8-1 instance 1): the handover fails and the UE is
+    /// detached.
+    #[test]
+    fn a_default_bearer_marked_for_removal_fails_the_path_switch() {
+        let _guard = lock_s11();
+        let ue = seed(&[5, 6]);
+        expect_failure_and_detach(&ue, &[5, 6], |seq| {
+            mbr_response_removing(ue.local_teid, seq, 16, &[(6, 16)], &[5])
+        });
+        release(&ue);
+    }
+
+    /// #730 review M2(e): Request accepted partially, with the default bearer's
+    /// own cause a refusal: failure and detach.
+    #[test]
+    fn a_refused_default_bearer_under_partial_acceptance_fails_the_path_switch() {
+        let _guard = lock_s11();
+        let ue = seed(&[5, 6]);
+        expect_failure_and_detach(&ue, &[5, 6], |seq| {
+            mbr_response(ue.local_teid, seq, 17, &[(5, 73), (6, 16)])
+        });
+        release(&ue);
+    }
+
+    /// #730 review M2(f), m2, m3, m4: two PDN connections, and the target omits
+    /// the default bearer (6) of the second, naming its dedicated bearer (7).
+    /// The MBR carries only the first PDN's bearer, with 6 and 7 to be removed;
+    /// the second PDN gets a Delete Session Request; the acknowledge lists 7
+    /// (named, not switched) To Be Released but not 6 (implicitly released),
+    /// and carries the UE-AMBR of the remaining PDN (TS 23.401 §5.5.1.1.2 step
+    /// 6, §4.7.3).
+    #[test]
+    fn a_pdn_whose_default_bearer_is_omitted_is_released_and_the_rest_acknowledged() {
+        let _guard = lock_s11();
+        let (sgw, _route) = sgw(Gtp2XactConfig::default());
+        let ue = seed(&[5]);
+        let ctx = crate::context::mme_self();
+        let sess2 = ctx.sess_add(ue.mme_ue_id, 10);
+        {
+            let mut pool = ctx.mme_ue_pool.write().unwrap();
+            let u = pool.get_mut(&ue.mme_ue_id).unwrap();
+            u.sess_list.push(sess2);
+            u.ambr.downlink = 10_000;
+            u.ambr.uplink = 10_000;
+        }
+        {
+            let mut pool = ctx.sess_pool.write().unwrap();
+            let s1 = pool.get_mut(&ue.sess_id).unwrap();
+            s1.ambr.downlink = 1_000;
+            s1.ambr.uplink = 500;
+            let s2 = pool.get_mut(&sess2).unwrap();
+            s2.ambr.downlink = 2_000;
+            s2.ambr.uplink = 1_000;
+        }
+        for ebi in [6u8, 7] {
+            let bearer_id = ctx.bearer_add(sess2, ue.mme_ue_id);
+            let mut pool = ctx.bearer_pool.write().unwrap();
+            let b = pool.get_mut(&bearer_id).unwrap();
+            b.ebi = ebi;
+            b.enb_s1u_teid = 0x1000 + u32::from(ebi);
+            b.enb_s1u_ip.ipv4 = Some([10, 0, 0, 1]);
+            b.sgw_s1u_teid = SGW_S1U_TEID + u32::from(ebi);
+            b.sgw_s1u_ip.ipv4 = Some([10, 0, 0, 2]);
+            drop(pool);
+            ctx.sess_pool
+                .write()
+                .unwrap()
+                .get_mut(&sess2)
+                .unwrap()
+                .bearer_list
+                .push(bearer_id);
+        }
+        let target = ctx.enb_add(enb_addr());
+        crate::s1ap_path::tap_enb_for_test(target);
+
+        assert!(path_switch(&ue, target, &[5, 7]).is_empty());
+        let (mbr, from) = recv(&sgw, 34);
+        assert_eq!(bearer_context_ebis(&mbr, 0), vec![5]);
+        let mut removed = bearer_context_ebis(&mbr, 1);
+        removed.sort();
+        assert_eq!(removed, vec![6, 7]);
+        sgw.send_to(
+            &mbr_response(ue.local_teid, mbr.header.sequence_number, 16, &[(5, 16)]),
+            from,
+        )
+        .unwrap();
+        let ack = wait_pdu(target, path_switch_ack);
+        assert_eq!(ack_lists(&ack), (vec![(5, SGW_S1U_TEID + 5)], vec![7]));
+        let ambr = ack
+            .protocol_i_es
+            .0
+            .iter()
+            .find_map(|ie| match &ie.value {
+                g::PathSwitchRequestAcknowledgeProtocolIEs_EntryValue::Id_uEaggregateMaximumBitrate(a) => {
+                    Some(a.clone())
+                }
+                _ => None,
+            })
+            .expect("the UE-AMBR changed, so the acknowledge carries it");
+        assert_eq!(ambr.u_eaggregate_maximum_bit_rate_dl.0, 1_000);
+        assert_eq!(ambr.u_eaggregate_maximum_bit_rate_ul.0, 500);
+        let (dsr, _) = recv(&sgw, 36);
+        let lbi = dsr
+            .get_ie(Gtp2IeType::Ebi as u8, 0)
+            .and_then(|ie| ie.value.first().copied());
+        assert_eq!(
+            lbi,
+            Some(6),
+            "the Delete Session Request is for the second PDN"
+        );
+        assert!(ctx.sess_find_by_id(sess2).is_none());
+        assert!(!detach_pending(&ue));
+        ctx.bearer_pool
+            .write()
+            .unwrap()
+            .retain(|_, b| b.mme_ue_id != ue.mme_ue_id);
+        release(&ue);
+    }
+
+    /// #730 review m1: the S1 association is released while the Modify Bearer
+    /// Request is outstanding. The late response sends no acknowledge to the
+    /// released association and does not write the target endpoints.
+    #[test]
+    fn a_response_after_the_s1_release_does_not_acknowledge() {
+        let _guard = lock_s11();
+        let (sgw, _route) = sgw(Gtp2XactConfig::default());
+        let ue = seed(&[5]);
+        let ctx = crate::context::mme_self();
+        let target = ctx.enb_add(enb_addr());
+        crate::s1ap_path::tap_enb_for_test(target);
+
+        assert!(path_switch(&ue, target, &[5]).is_empty());
+        let (mbr, from) = recv(&sgw, 34);
+        // UE CONTEXT RELEASE: the eNB UE context goes, the UE keeps its EMM state.
+        ctx.enb_ue_deassociate_mme_ue(ue.source_ue_id, ue.mme_ue_id);
+        ctx.enb_ue_remove(ue.source_ue_id);
+        sgw.send_to(
+            &mbr_response(ue.local_teid, mbr.header.sequence_number, 16, &[(5, 16)]),
+            from,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while crate::gtp_path::handover_modification_pending(ue.mme_ue_id)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            crate::s1ap_path::take_tapped_for_test(target).is_empty(),
+            "no acknowledge to a released association"
+        );
+        assert_eq!(bearer(&ue, 5).unwrap().enb_s1u_teid, 0x1005);
         release(&ue);
     }
 }

@@ -3228,15 +3228,21 @@ pub fn build_path_switch_request_acknowledge(
     msg: &nextgcore_s1ap::PathSwitchRequestAcknowledge,
     notify: &[DiagnosedIe],
 ) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
-    build_path_switch_request_acknowledge_releasing(msg, &[], notify)
+    build_path_switch_request_acknowledge_releasing(msg, None, &[], notify)
 }
 
 /// [`build_path_switch_request_acknowledge`] with an E-RAB To Be Released List
 /// (TS 36.413 §9.1.5.9, criticality ignore) naming `released`, when non-empty:
 /// E-RABs the core did not switch, which the eNB then considers released
 /// (§8.4.4.2, #730).
+///
+/// `ue_ambr`, when present, is the UE Aggregate Maximum Bit Rate (criticality
+/// ignore): TS 23.401 §5.5.1.1.2 step 6, "If the UE-AMBR has changed, e.g. all the
+/// bearers for an APN have been released, the MME shall provide the updated value
+/// of the UE-AMBR to the target eNodeB".
 pub fn build_path_switch_request_acknowledge_releasing(
     msg: &nextgcore_s1ap::PathSwitchRequestAcknowledge,
+    ue_ambr: Option<&nextgcore_s1ap::UeAmbr>,
     released: &[nextgcore_s1ap::ErabItem],
     notify: &[DiagnosedIe],
 ) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
@@ -3259,6 +3265,13 @@ pub fn build_path_switch_request_acknowledge_releasing(
             V::Id_eNB_UE_S1AP_ID(g::ENB_UE_S1AP_ID(msg.enb_ue_s1ap_id)),
         ),
     ];
+    if let Some(a) = ue_ambr {
+        ies.push(ie(
+            ID_UE_AMBR,
+            IGNORE,
+            V::Id_uEaggregateMaximumBitrate(ambr(a)),
+        ));
+    }
     if !msg.erab_switched_ul_list.is_empty() {
         ies.push(ie(
             ID_ERAB_TO_BE_SWITCHED_UL_LIST,
