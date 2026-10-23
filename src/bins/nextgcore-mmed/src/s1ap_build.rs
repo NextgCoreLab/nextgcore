@@ -463,15 +463,19 @@ pub fn ue_ambr(
     let cap = |sum: u64, sub: u64| match (sum, sub) {
         // Neither known: 0 would tell the eNB to allow nothing (the IE is
         // mandatory in Initial Context Setup and Handover Request), so the
-        // maximum the IE can carry (TS 36.413 §9.2.1.20, 10 Tbit/s) is sent and
+        // maximum the IE can carry (TS 36.413 §9.2.1.20, 10 Gbit/s) is sent and
         // enforcement is left to the gateways' APN-AMBR (#869 review).
         (0, 0) => UE_AMBR_UNKNOWN,
         (0, s) | (s, 0) => s,
         (s, sub) => s.min(sub),
     };
+    // BitRate is INTEGER (0..10000000000) (TS 36.413 §9.2.1.20); a higher value
+    // needs the Extended UE-AMBR IEs, which are not sent, so it is clamped
+    // rather than failing the whole message's encode.
+    let clamp = |v: u64| v.min(UE_AMBR_UNKNOWN);
     let ambr = UeAmbr {
-        dl: cap(dl, subscribed.downlink),
-        ul: cap(ul, subscribed.uplink),
+        dl: clamp(cap(dl, subscribed.downlink)),
+        ul: clamp(cap(ul, subscribed.uplink)),
     };
     if ambr.dl == UE_AMBR_UNKNOWN || ambr.ul == UE_AMBR_UNKNOWN {
         log::warn!(
@@ -483,8 +487,9 @@ pub fn ue_ambr(
 }
 
 /// The UE-AMBR signalled when neither the subscription nor any APN-AMBR gives
-/// one: the largest Bit Rate (TS 36.413 §9.2.1.20, 0..10,000,000,000,000).
-pub const UE_AMBR_UNKNOWN: u64 = 10_000_000_000_000;
+/// one, and the ceiling of any UE-AMBR this MME signals: the largest Bit Rate
+/// (TS 36.413 §9.2.1.20, BitRate ::= INTEGER (0..10000000000)).
+pub const UE_AMBR_UNKNOWN: u64 = 10_000_000_000;
 
 /// [`ue_ambr`] for `mme_ue`'s ACTIVE PDN connections: those whose bearers have a
 /// Serving GW S1-U endpoint (a Create Session completed). `sess_list` also holds
@@ -1070,10 +1075,10 @@ mod tests {
         assert_eq!(
             ue_ambr(&b(u64::MAX, u64::MAX), [b(u64::MAX, 1), b(1, 1)]),
             UeAmbr {
-                dl: u64::MAX,
+                dl: UE_AMBR_UNKNOWN,
                 ul: 2
             },
-            "no overflow"
+            "no overflow, and clamped to the BitRate range"
         );
     }
 
