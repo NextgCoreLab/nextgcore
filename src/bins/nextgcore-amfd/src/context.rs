@@ -3326,6 +3326,13 @@ pub const EBI_ASSIGNABLE: std::ops::RangeInclusive<u8> = 5..=15;
 pub struct AmfUe {
     /// Unique pool ID
     pub id: u64,
+    /// The token in the `deregCallbackUri` of this UE's CURRENT Nudm_UECM
+    /// registration (#753). A random value per registration, so a
+    /// DeregistrationNotification can say which registration it is about. A
+    /// notification naming another token concerns a registration this AMF no
+    /// longer holds (one made before a restart, under a different
+    /// `amfInstanceId`). Acting on it would tear down the UE's new registration.
+    pub uecm_dereg_token: Option<String>,
     /// NAS state
     pub nas: NasState,
     /// SUCI (Subscription Concealed Identifier)
@@ -3988,6 +3995,7 @@ impl AmfUe {
     pub fn new(id: u64, ran_ue_id: u64) -> Self {
         Self {
             id,
+            uecm_dereg_token: None,
             nas: NasState::default(),
             suci: None,
             supi: None,

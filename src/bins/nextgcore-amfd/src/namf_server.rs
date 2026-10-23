@@ -251,8 +251,15 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
         "namf-callback" if parts.len() == 3 && parts[2] == "ucmf-notify" && method == "POST" => {
             handle_ucmf_notify_callback(&request)
         }
-        "namf-callback" if parts.len() == 4 && parts[3] == "dereg-notify" && method == "POST" => {
-            handle_dereg_notify_callback(parts[2], &request)
+        //   POST /namf-callback/v1/{supi}/dereg-notify/{token}   (#753)
+        //   POST /namf-callback/v1/{supi}/dereg-notify           (registrations
+        //                                                        made before #753)
+        "namf-callback"
+            if (parts.len() == 4 || parts.len() == 5)
+                && parts[3] == "dereg-notify"
+                && method == "POST" =>
+        {
+            handle_dereg_notify_callback(parts[2], parts.get(4).copied(), &request)
         }
 
         // Namf_Callback: Nsmf_PDUSession SmContextStatusNotification (#540,
@@ -482,7 +489,19 @@ fn handle_ucmf_notify_callback(request: &SbiRequest) -> SbiResponse {
 /// INVALID_MSG_FORMAT; a missing/unknown mandatory member is 400
 /// MANDATORY_IE_MISSING / MANDATORY_IE_INCORRECT; an unknown SUPI is 404
 /// CONTEXT_NOT_FOUND. On success the AMF answers 204 No Content.
-fn handle_dereg_notify_callback(supi: &str, request: &SbiRequest) -> SbiResponse {
+///
+/// #753: `token` is the `deregCallbackUri` token of the registration the UDM is
+/// notifying about. Only a notification for the UE's CURRENT registration acts.
+/// Any other token means a registration this AMF no longer holds, typically one it
+/// made before a restart: the restarted AMF registered the UE again, and the UDM
+/// is telling the "old AMF" about it. That notification is acknowledged (204) and
+/// changes nothing. Acting on it was a silent local deregistration of the UE's
+/// new registration.
+fn handle_dereg_notify_callback(
+    supi: &str,
+    token: Option<&str>,
+    request: &SbiRequest,
+) -> SbiResponse {
     let Some(body) = parse_json_body(request) else {
         return malformed_body();
     };
@@ -512,6 +531,17 @@ fn handle_dereg_notify_callback(supi: &str, request: &SbiRequest) -> SbiResponse
     let Some(ue) = find_ue_by_context_id(supi) else {
         return context_not_found(supi);
     };
+    if ue.uecm_dereg_token.as_deref().is_none() || ue.uecm_dereg_token.as_deref() != token {
+        // The UE's CURRENT token is never logged: with it, anyone who reads the
+        // log and reaches the SBI could forge a notification that acts.
+        log::info!(
+            "[{supi}] dereg-notify ({reason_str}) names UECM registration {} which is not \
+             the UE's current one: it concerns a registration this AMF no longer holds; \
+             acknowledged, nothing torn down",
+            token.unwrap_or("<untokened>")
+        );
+        return SbiResponse::no_content();
+    }
 
     let data = DeregistrationData {
         dereg_reason,
@@ -6316,6 +6346,8 @@ mod tests {
         ue.security_context_available = security;
         ue.nr_tai.tac = 100;
         ue.nr_cgi.cell_id = 0x12345;
+        // #753: the token of this UE's (stand-in) UECM registration.
+        ue.uecm_dereg_token = Some(format!("tok-{supi}"));
         if connected {
             guard.amf_ue_associate_ran_ue(ue.id, ran_ue.id);
             ue.ran_ue_id = ran_ue.id;
@@ -8117,7 +8149,7 @@ mod tests {
         let ue = setup_ue(supi, true, true);
 
         let body = json!({ "deregReason": "UE_INITIAL_REGISTRATION", "accessType": "3GPP_ACCESS" });
-        let req = SbiRequest::post(format!("/namf-callback/v1/{supi}/dereg-notify"))
+        let req = SbiRequest::post(format!("/namf-callback/v1/{supi}/dereg-notify/tok-{supi}"))
             .with_json_body(&body)
             .expect("json");
         let resp = namf_request_handler(req).await;
@@ -8134,6 +8166,44 @@ mod tests {
         assert_eq!(queued[0].gmm_cause, None);
     }
 
+    /// #753: after an AMF restart the UE registers again (new UECM registration,
+    /// new token), and the UDM sends a UE_INITIAL_REGISTRATION notification to
+    /// the callback of the registration made BEFORE the restart. It names the old
+    /// token, so it is acknowledged (204) and the UE's new registration survives:
+    /// nothing is enqueued, and the context is still resolvable. A notification
+    /// to a pre-#753 URI (no token) is the same case.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dereg_notify_for_a_registration_made_before_a_restart_leaves_the_ue_alone() {
+        let _serial = dereg_queue_test_lock().lock().await;
+        let supi = "imsi-001010000075301";
+        let ue = setup_ue(supi, true, true);
+        let body = json!({ "deregReason": "UE_INITIAL_REGISTRATION", "accessType": "3GPP_ACCESS" });
+        for uri in [
+            format!("/namf-callback/v1/{supi}/dereg-notify/tok-before-restart"),
+            format!("/namf-callback/v1/{supi}/dereg-notify"),
+        ] {
+            let req = SbiRequest::post(uri.clone())
+                .with_json_body(&body)
+                .expect("json");
+            assert_eq!(namf_request_handler(req).await.status, 204, "{uri}");
+        }
+        assert!(
+            drain_network_deregs_for(ue.id).is_empty(),
+            "the new registration is not torn down"
+        );
+        assert!(
+            find_ue_by_context_id(supi).is_some(),
+            "the context survives"
+        );
+
+        // The notification for the CURRENT registration still acts.
+        let req = SbiRequest::post(format!("/namf-callback/v1/{supi}/dereg-notify/tok-{supi}"))
+            .with_json_body(&body)
+            .expect("json");
+        assert_eq!(namf_request_handler(req).await.status, 204);
+        assert_eq!(drain_network_deregs_for(ue.id).len(), 1);
+    }
+
     /// SUBSCRIPTION_WITHDRAWN -> reregistration_required=false, and signalled.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_dereg_notify_callback_subscription_withdrawn_no_rereg() {
@@ -8142,7 +8212,7 @@ mod tests {
         let ue = setup_ue(supi, true, true);
 
         let body = json!({ "deregReason": "SUBSCRIPTION_WITHDRAWN", "accessType": "3GPP_ACCESS" });
-        let req = SbiRequest::post(format!("/namf-callback/v1/{supi}/dereg-notify"))
+        let req = SbiRequest::post(format!("/namf-callback/v1/{supi}/dereg-notify/tok-{supi}"))
             .with_json_body(&body)
             .expect("json");
         assert_eq!(namf_request_handler(req).await.status, 204);
@@ -8165,7 +8235,7 @@ mod tests {
         let ue = setup_ue(supi, true, true);
 
         let body = json!({ "deregReason": "REREGISTRATION_REQUIRED", "accessType": "3GPP_ACCESS" });
-        let req = SbiRequest::post(format!("/namf-callback/v1/{supi}/dereg-notify"))
+        let req = SbiRequest::post(format!("/namf-callback/v1/{supi}/dereg-notify/tok-{supi}"))
             .with_json_body(&body)
             .expect("json");
         assert_eq!(namf_request_handler(req).await.status, 204);
