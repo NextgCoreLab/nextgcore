@@ -251,6 +251,15 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
         "namf-callback" if parts.len() == 3 && parts[2] == "ucmf-notify" && method == "POST" => {
             handle_ucmf_notify_callback(&request)
         }
+        // Namf_Callback: Nnrf_NFManagement NFStatusNotify (#668, TS 29.510
+        // §5.2.2.6), POSTed to the nfStatusNotificationUri of the AMF's
+        // NF status subscriptions (`nrf_subscription`).
+        //   POST /namf-callback/v1/nf-status-notify
+        "namf-callback"
+            if parts.len() == 3 && parts[2] == "nf-status-notify" && method == "POST" =>
+        {
+            handle_nf_status_notify_callback(&request).await
+        }
         //   POST /namf-callback/v1/{supi}/dereg-notify/{token}   (#753)
         //   POST /namf-callback/v1/{supi}/dereg-notify           (registrations
         //                                                        made before #753)
@@ -474,6 +483,27 @@ fn handle_ucmf_notify_callback(request: &SbiRequest) -> SbiResponse {
         retired.len()
     );
     SbiResponse::no_content()
+}
+
+/// NFStatusNotify callback (#668, TS 29.510 §5.2.2.6).
+///
+/// Drops the named NF instance from the discovery cache when it deregistered
+/// or an attribute the cache uses changed. The body's `nfProfile` is never
+/// read: the next request re-discovers (see `nrf_subscription`). 204 on
+/// success, 400 for a body without `event` or `nfInstanceUri`.
+async fn handle_nf_status_notify_callback(request: &SbiRequest) -> SbiResponse {
+    use crate::nrf_subscription::{apply_notification, classify_notification, NotifyError};
+    let Some(body) = parse_json_body(request) else {
+        return malformed_body();
+    };
+    match classify_notification(&body) {
+        Ok(action) => {
+            apply_notification(&action).await;
+            SbiResponse::no_content()
+        }
+        Err(NotifyError::Missing(attr)) => mandatory_ie_missing(attr),
+        Err(NotifyError::Incorrect(attr, detail)) => mandatory_ie_incorrect(attr, &detail),
+    }
 }
 
 /// Nudm_UECM DeregistrationNotification callback (WSB-4, TS 29.503 §5.3.2.3.2).
