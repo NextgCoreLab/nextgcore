@@ -920,7 +920,10 @@ fn notify_unrestorable_associations(
 }
 
 /// Send policy authorization terminate notify to the AF over HTTP
-/// (TS 29.514 §4.2.5.2: POST {notifUri}/terminate with TerminationInfo).
+/// (TS 29.514 §4.2.5.3: POST {notifUri}/terminate with TerminationInfo).
+///
+/// Its only caller was the dead C-port SM policy delete handler, deleted by
+/// #655. The live `app::handle_sm_policy_delete` does not call it yet (#767).
 pub fn pcf_sbi_send_policyauthorization_terminate_notify(app_id: u64) -> bool {
     let info = crate::context::pcf_self().read().ok().and_then(|ctx| {
         ctx.app_find_by_id(app_id)
@@ -975,44 +978,6 @@ pub fn pcf_sbi_send_policyauthorization_events_notify(app_id: u64, events: &[&st
             .collect::<Vec<_>>(),
     });
     spawn_notification(uri, "/notify", body, "AF events")
-}
-
-/// Discover and send request to UDR for UE AM
-/// Port of pcf_ue_am_sbi_discover_and_send() from sbi-path.c
-pub fn pcf_ue_am_sbi_discover_and_send(
-    pcf_ue_am_id: u64,
-    stream_id: u64,
-    service_type: &str,
-) -> Result<(), String> {
-    log::debug!(
-        "[ue_am_id={pcf_ue_am_id}, stream_id={stream_id}] Discover and send to {service_type}"
-    );
-
-    // In C implementation:
-    // 1. Create SBI transaction
-    // 2. Set associated stream ID
-    // 3. Call nextgcore_sbi_discover_and_send()
-
-    // Note: Discovery and sending requires NRF integration
-    Ok(())
-}
-
-/// Discover and send request for session
-/// Port of pcf_sess_sbi_discover_and_send() from sbi-path.c
-pub fn pcf_sess_sbi_discover_and_send(
-    sess_id: u64,
-    stream_id: u64,
-    service_type: &str,
-) -> Result<(), String> {
-    log::debug!("[sess_id={sess_id}, stream_id={stream_id}] Discover and send to {service_type}");
-
-    // In C implementation:
-    // 1. Create SBI transaction
-    // 2. Set associated stream ID
-    // 3. Call nextgcore_sbi_discover_and_send()
-
-    // Note: Discovery and sending requires NRF integration
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
