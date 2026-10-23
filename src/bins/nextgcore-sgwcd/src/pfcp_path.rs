@@ -791,7 +791,7 @@ pub async fn pfcp_open() -> Result<Arc<SxaNode>, String> {
 ///
 /// `SGWC_PFCP_NODE_IP` first — the test escape hatch, and the way a multi-homed host
 /// overrides the file — then the configured `sgwc.pfcp.server` address, then loopback.
-fn configured_node_ip() -> Result<Ipv4Addr, String> {
+pub(crate) fn configured_node_ip() -> Result<Ipv4Addr, String> {
     if let Ok(value) = std::env::var("SGWC_PFCP_NODE_IP") {
         return value
             .parse()
@@ -1138,6 +1138,41 @@ mod tests {
             configured_node_ip().expect("the configured node id parses"),
             Ipv4Addr::new(172, 24, 0, 3),
             "the UP function stores the CP function's Node ID as the association identifier"
+        );
+    }
+
+    /// #703: the Session Establishment's Node ID and CP F-SEID carry the CONFIGURED
+    /// address, the same one the association advertises, not loopback.
+    ///
+    /// Equality against 172.24.0.3, reachable only by reading the compose config,
+    /// decoded with the library the SGW-U uses. Before #703 both carried 127.0.0.1
+    /// unless `SGWC_PFCP_NODE_IP` was set, which no deployment does.
+    #[tokio::test]
+    async fn the_session_establishment_names_the_configured_node_ip() {
+        let _guard = process_state_test_guard().await;
+        std::env::remove_var("SGWC_PFCP_NODE_IP");
+        let config = crate::config::load_config("../../../docker/rust/configs/epc/sgwc.yaml");
+        crate::config::apply(&sgwc_self(), &config);
+
+        let sess = crate::context::SgwcSess {
+            id: 1,
+            sgwc_sxa_seid: 0x1,
+            ..Default::default()
+        };
+        let msg = crate::sxa_build::build_session_establishment_request(&sess).expect("built");
+        let mut body = bytes::Bytes::copy_from_slice(&msg.data);
+        let req = nextgcore_pfcp::message::SessionEstablishmentRequest::decode(&mut body)
+            .expect("decodable");
+        assert_eq!(
+            req.cp_f_seid.ipv4_addr,
+            Some([172, 24, 0, 3]),
+            "the CP F-SEID is where the SGW-U sends its Session Reports"
+        );
+        assert_eq!(req.cp_f_seid.seid, 0x1);
+        assert_eq!(
+            req.node_id,
+            nextgcore_pfcp::types::NodeId::new_ipv4([172, 24, 0, 3]),
+            "the session-level Node ID agrees with the association's"
         );
     }
 

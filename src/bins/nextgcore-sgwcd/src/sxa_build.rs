@@ -184,14 +184,17 @@ pub fn build_session_establishment_request(sess: &SgwcSess) -> Option<PfcpMessag
     // SEID is 0 for establishment request (peer SEID not known yet)
     let mut msg = PfcpMessage::new(pfcp_type::SESSION_ESTABLISHMENT_REQUEST, 0);
 
-    // The Node ID and the CP F-SEID both name THIS SGW-C on Sxa. `SGWC_PFCP_NODE_IP` is
-    // the same override `pfcp_open` binds with, so the address we advertise is the address
-    // we listen on -- a Node ID naming an interface we do not serve makes the SGW-U send
-    // its Session Report somewhere else.
-    let node_ip: std::net::Ipv4Addr = std::env::var("SGWC_PFCP_NODE_IP")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(std::net::Ipv4Addr::LOCALHOST);
+    // The Node ID and the CP F-SEID both name THIS SGW-C on Sxa, with the address the
+    // association advertises (`configured_node_ip`: `SGWC_PFCP_NODE_IP`, then
+    // `sgwc.pfcp.server[0].address`, then loopback). #703: this read the env override
+    // only, so a configured SGW-C put 127.0.0.1 in every CP F-SEID. The SGW-U then sent
+    // its Session Reports to its own loopback, and two SGW-C instances' sessions shared
+    // one F-SEID (TS 29.244 §5.6.1), which is what let a restarted one inherit the old
+    // one's session (#700).
+    let node_ip = crate::pfcp_path::configured_node_ip().unwrap_or_else(|e| {
+        log::warn!("{e}; advertising loopback in the Session Establishment");
+        std::net::Ipv4Addr::LOCALHOST
+    });
     let mut req = LibSessionEstablishmentRequest::new(
         NodeId::new_ipv4(node_ip.octets()),
         FSeid::new_ipv4(sess.sgwc_sxa_seid, node_ip.octets()),
