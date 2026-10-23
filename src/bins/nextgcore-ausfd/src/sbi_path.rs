@@ -3,13 +3,11 @@
 //! Port of src/ausf/sbi-path.c - SBI server and client path functions.
 //!
 //! NOTE (ausfd-10): the live SBI server is the HTTP/2 `nextgcore_sbi::server::SbiServer`
-//! started in `main.rs`, and live Nudm client requests are issued directly from
-//! `main.rs` (`send_udm_generate_auth_data` / `send_udm_auth_result`). The
-//! `ausf_sbi_discover_and_send_*` functions here are the inert FSM-path
-//! shims retained for the state-machine; they build the request shape but do not
-//! perform network I/O.
+//! started in `app`, and live Nudm client requests are issued directly from
+//! `app` (`send_udm_generate_auth_data` / `send_udm_auth_result`). The C
+//! port's inert `ausf_sbi_discover_and_send_*` shims were only reachable from
+//! the deleted per-UE FSM (#654).
 
-use crate::nudm_build::{self, ResynchronizationInfo};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// SBI server configuration
@@ -101,123 +99,6 @@ pub fn ausf_sbi_is_running() -> bool {
     SBI_RUNNING.load(Ordering::SeqCst)
 }
 
-/// Send SBI request to NF instance
-///
-/// Port of ausf_sbi_send_request()
-pub fn ausf_sbi_send_request(nf_instance_id: &str, xact_id: u64) -> bool {
-    log::debug!("Sending SBI request to NF instance [{nf_instance_id}] xact [{xact_id}]");
-
-    // In C: nextgcore_sbi_send_request_to_nf_instance(nf_instance, xact)
-    // This would send the request through the SBI client
-
-    true
-}
-
-/// Discover and send NUDM UEAU get request
-///
-/// Port of ausf_sbi_discover_and_send() with ausf_nudm_ueau_build_get
-pub fn ausf_sbi_discover_and_send_nudm_ueau_get(
-    ausf_ue_id: u64,
-    stream_id: u64,
-    resync_info: Option<&ResynchronizationInfo>,
-) -> Result<(), String> {
-    log::debug!("Discover and send NUDM UEAU get for UE [{ausf_ue_id}] stream [{stream_id}]");
-
-    // Build the request
-    let request = nudm_build::ausf_nudm_ueau_build_get(ausf_ue_id, resync_info)
-        .ok_or("Failed to build NUDM UEAU get request")?;
-
-    // In C code:
-    // 1. Create SBI xact with ausf_ue->id, service_type, discovery_option, build function
-    // 2. Set xact->assoc_stream_id = stream_id
-    // 3. Call nextgcore_sbi_discover_and_send(xact)
-
-    // For now, log the request details
-    log::debug!(
-        "NUDM UEAU request: {} /{}/{}",
-        request.method,
-        request.service_name,
-        request.resource_components.join("/")
-    );
-
-    Ok(())
-}
-
-/// Discover and send NUDM UEAU result confirmation request
-///
-/// Port of ausf_sbi_discover_and_send() with ausf_nudm_ueau_build_result_confirmation_inform
-pub fn ausf_sbi_discover_and_send_nudm_ueau_result_confirmation(
-    ausf_ue_id: u64,
-    stream_id: u64,
-) -> Result<(), String> {
-    log::debug!(
-        "Discover and send NUDM UEAU result confirmation for UE [{ausf_ue_id}] stream [{stream_id}]"
-    );
-
-    // Build the request
-    let request = nudm_build::ausf_nudm_ueau_build_result_confirmation_inform(ausf_ue_id)
-        .ok_or("Failed to build NUDM UEAU result confirmation request")?;
-
-    log::debug!(
-        "NUDM UEAU request: {} /{}/{}",
-        request.method,
-        request.service_name,
-        request.resource_components.join("/")
-    );
-
-    Ok(())
-}
-
-/// Discover and send NUDM UEAU auth removal request
-///
-/// Port of ausf_sbi_discover_and_send() with ausf_nudm_ueau_build_auth_removal_ind
-pub fn ausf_sbi_discover_and_send_nudm_ueau_auth_removal(
-    ausf_ue_id: u64,
-    stream_id: u64,
-) -> Result<(), String> {
-    log::debug!(
-        "Discover and send NUDM UEAU auth removal for UE [{ausf_ue_id}] stream [{stream_id}]"
-    );
-
-    // Build the request
-    let request = nudm_build::ausf_nudm_ueau_build_auth_removal_ind(ausf_ue_id)
-        .ok_or("Failed to build NUDM UEAU auth removal request")?;
-
-    log::debug!(
-        "NUDM UEAU request: {} /{}/{}",
-        request.method,
-        request.service_name,
-        request.resource_components.join("/")
-    );
-
-    Ok(())
-}
-
-/// SBI transaction for tracking requests
-#[derive(Debug, Clone)]
-pub struct SbiXact {
-    /// Transaction ID
-    pub id: u64,
-    /// Associated SBI object ID (e.g., ausf_ue_id)
-    pub sbi_object_id: u64,
-    /// Associated stream ID for response
-    pub assoc_stream_id: u64,
-    /// Service type
-    pub service_type: String,
-}
-
-impl SbiXact {
-    /// Create a new SBI transaction
-    pub fn new(id: u64, sbi_object_id: u64, service_type: &str) -> Self {
-        Self {
-            id,
-            sbi_object_id,
-            assoc_stream_id: 0,
-            service_type: service_type.to_string(),
-        }
-    }
-}
-
 /// SBI server handle (placeholder)
 pub struct SbiServer {
     config: SbiServerConfig,
@@ -287,13 +168,5 @@ mod tests {
         };
         let server = SbiServer::new(config);
         assert_eq!(server.uri(), "https://192.168.1.1:8443");
-    }
-
-    #[test]
-    fn test_sbi_xact() {
-        let xact = SbiXact::new(1, 100, "nudm-ueau");
-        assert_eq!(xact.id, 1);
-        assert_eq!(xact.sbi_object_id, 100);
-        assert_eq!(xact.service_type, "nudm-ueau");
     }
 }
