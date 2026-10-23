@@ -1140,7 +1140,13 @@ fn emm_tau_request(
                 .collect::<Vec<_>>()
         })
         .collect();
-    if let Err(e) = nas_path::nas_eps_send_tau_accept(mme_ue, enb_ue, false, &bearers) {
+    if let Err(e) = nas_path::nas_eps_send_tau_accept(
+        mme_ue,
+        enb_ue,
+        false,
+        &bearers,
+        s1ap_build::ue_ambr_of(ctx, mme_ue),
+    ) {
         log::error!("[{}] TAU Accept send failed: {e}", mme_ue.imsi_bcd);
     }
 }
@@ -1224,7 +1230,13 @@ pub fn continue_inter_system_tau(ctx: &MmeContext, mme_ue_id: u64, enb_ue_id: u6
     let Some(mme_ue) = pool.get_mut(&mme_ue_id) else {
         return;
     };
-    if let Err(e) = nas_path::nas_eps_send_tau_accept(mme_ue, &enb_ue, false, &bearers) {
+    if let Err(e) = nas_path::nas_eps_send_tau_accept(
+        mme_ue,
+        &enb_ue,
+        false,
+        &bearers,
+        s1ap_build::ue_ambr_of(ctx, mme_ue),
+    ) {
         log::error!("[{}] TAU Accept send failed: {e}", mme_ue.imsi_bcd);
     } else {
         log::info!(

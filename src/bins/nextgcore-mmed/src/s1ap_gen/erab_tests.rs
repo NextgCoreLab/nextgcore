@@ -401,6 +401,7 @@ fn the_production_builders_send_the_generated_bytes() {
         S1apCauseGroup::Nas,
         crate::s1ap_build::nas_cause::DETACH,
         None,
+        None,
     )
     .unwrap();
     let expected = build_erab_release_command(&ErabReleaseCommand {

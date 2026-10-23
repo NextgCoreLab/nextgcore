@@ -268,6 +268,7 @@ pub fn nas_eps_send_attach_accept(
     enb_ue: &EnbUe,
     sess: &MmeSess,
     default_bearer: &MmeBearer,
+    ue_ambr: nextgcore_s1ap::UeAmbr,
 ) -> NasResult<()> {
     if mme_ue.id == 0 {
         log::error!("UE(mme-ue) context has already been removed");
@@ -317,6 +318,7 @@ pub fn nas_eps_send_attach_accept(
         enb_ue,
         std::slice::from_ref(default_bearer),
         Some(&secured_message),
+        ue_ambr,
     )
     .map_err(|e| {
         log::error!(
@@ -654,6 +656,7 @@ pub fn nas_eps_send_tau_accept(
     enb_ue: &EnbUe,
     use_initial_context_setup: bool,
     bearers: &[MmeBearer],
+    ue_ambr: nextgcore_s1ap::UeAmbr,
 ) -> NasResult<()> {
     if mme_ue.id == 0 {
         log::error!("UE(mme-ue) context has already been removed");
@@ -695,6 +698,7 @@ pub fn nas_eps_send_tau_accept(
             enb_ue,
             bearers,
             Some(&emm_message),
+            ue_ambr,
         )
         .map_err(|_| NasError::BuildFailed)?;
         nas_eps_send_to_enb(mme_ue, enb_ue, s1ap_message)
@@ -961,8 +965,14 @@ pub fn nas_eps_send_activate_default_bearer_context_request(
 
     // Build S1AP E-RAB setup request (APER via nextgcore-s1ap). The ESM message
     // is carried inside it, so transmit the PDU (issue #42).
-    let s1ap_message = s1ap_build::build_e_rab_setup_request(enb_ue, bearer, &esm_message)
-        .map_err(|_| NasError::BuildFailed)?;
+    // A new PDN connection changes the UE-AMBR (TS 23.401 §5.10.2 step 9, #811).
+    let s1ap_message = s1ap_build::build_e_rab_setup_request(
+        enb_ue,
+        bearer,
+        &esm_message,
+        Some(s1ap_build::ue_ambr_of(ctx, mme_ue)),
+    )
+    .map_err(|_| NasError::BuildFailed)?;
 
     nas_eps_send_to_enb(mme_ue, enb_ue, s1ap_message)
 }
@@ -1001,7 +1011,7 @@ pub fn nas_eps_send_activate_dedicated_bearer_context_request(
 
     // Build S1AP E-RAB setup request (APER via nextgcore-s1ap). The ESM message
     // is carried inside it, so transmit the PDU (issue #42).
-    let s1ap_message = s1ap_build::build_e_rab_setup_request(enb_ue, bearer, &esm_message)
+    let s1ap_message = s1ap_build::build_e_rab_setup_request(enb_ue, bearer, &esm_message, None)
         .map_err(|_| NasError::BuildFailed)?;
 
     nas_eps_send_to_enb(mme_ue, enb_ue, s1ap_message)
@@ -1094,6 +1104,7 @@ pub fn nas_eps_send_deactivate_bearer_context_request(
         S1apCauseGroup::Nas,
         s1ap_build::nas_cause::NORMAL_RELEASE,
         Some(&esm_message),
+        None,
     )
     .map_err(|_| NasError::BuildFailed)?;
 
