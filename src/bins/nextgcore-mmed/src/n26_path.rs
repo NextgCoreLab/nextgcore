@@ -782,8 +782,9 @@ fn handle_datagram(inner: &Arc<N26Inner>, data: &[u8], peer: SocketAddr) {
         return;
     }
 
+    // Only a request sent to `peer` can be closed by what `peer` sends (#735).
     let matched = match inner.xact.lock() {
-        Ok(mut xact) => xact.match_response(seq, msg_type),
+        Ok(mut xact) => xact.match_response_from(peer, seq, msg_type),
         Err(_) => None,
     };
 
@@ -826,6 +827,23 @@ fn handle_datagram(inner: &Arc<N26Inner>, data: &[u8], peer: SocketAddr) {
                 "N26 triggered message type={msg_type} seq={seq} from {peer} correlated but \
                  not acted on: this MME has no handler for it"
             );
+        }
+        return;
+    }
+
+    // #735, TS 29.274 §7.6: a retransmitted initial message (the peer lost the
+    // response) is answered with the response already sent, not processed again.
+    // Before #735 the cached Forward Relocation Complete Acknowledge was never
+    // read, so a lost Acknowledge left the AMF retransmitting into "matches no
+    // relocation in flight" until its N3 ran out; and a retransmitted Forward
+    // Relocation Request would have installed a second context.
+    if let Some(cached) = cached_response_for(inner, peer, seq, msg_type) {
+        log::info!(
+            "N26 retransmitted message type={msg_type} seq={seq} from {peer}: answered with the \
+             cached response (TS 29.274 §7.6)"
+        );
+        if let Err(e) = inner.socket.send_to(&cached, peer) {
+            log::error!("N26 cached response to {peer} failed: {e}");
         }
         return;
     }
@@ -1091,6 +1109,21 @@ fn handle_forward_relocation_request(
 /// send [`N26Server::send_response`] performs, reached from where the datagram was decoded. One
 /// function rather than two spellings of "cache then send", because a cached response that
 /// differs from the sent one is how a retransmitted request gets a different answer.
+/// The response this MME already sent for initial message `msg_type` at
+/// (`peer`, `seq`), if one is cached and it answers that message type: a
+/// sequence number alone does not name one transaction (the S11 rule,
+/// `gtp_path::cached_response_for`).
+fn cached_response_for(
+    inner: &Arc<N26Inner>,
+    peer: SocketAddr,
+    seq: u32,
+    msg_type: u8,
+) -> Option<Bytes> {
+    let expected = nextgcore_gtp::v2::xact::triggered_message_type(msg_type)?;
+    let cached = inner.xact.lock().ok()?.lookup_cached_response(peer, seq)?;
+    (cached.get(1) == Some(&expected)).then_some(cached)
+}
+
 fn send_response_from(inner: &Arc<N26Inner>, peer: SocketAddr, msg: &Gtp2Message) {
     let encoded = Bytes::from(msg.encode().to_vec());
     if let Ok(mut xact) = inner.xact.lock() {
