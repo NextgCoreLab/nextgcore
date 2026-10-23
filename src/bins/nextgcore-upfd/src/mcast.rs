@@ -164,8 +164,18 @@ impl McastContext {
     /// Returns the list of (gnb_addr, gnb_teid) destinations for a given ingress TEID
     /// This function handles PDR matching for source interface = N3mb
     pub fn forward_lookup(&self, ingress_teid: u32) -> Vec<(Ipv4Addr, u32)> {
-        let teid_index = match self.teid_index.read().ok() {
-            Some(idx) => idx,
+        // #770: copy the SEID out and RELEASE `teid_index` before taking `sessions`.
+        // `session_activate`/`session_deactivate` take `sessions` then `teid_index`;
+        // holding `teid_index` while waiting for `sessions` here was the reverse
+        // order, so a lookup racing an activation deadlocked both. No call in this
+        // type now holds `teid_index` while acquiring `sessions`.
+        let seid = match self
+            .teid_index
+            .read()
+            .ok()
+            .and_then(|idx| idx.get(&ingress_teid).copied())
+        {
+            Some(s) => s,
             None => return vec![],
         };
         let sessions = match self.sessions.read().ok() {
@@ -173,13 +183,11 @@ impl McastContext {
             None => return vec![],
         };
 
-        let seid = match teid_index.get(&ingress_teid) {
-            Some(&s) => s,
-            None => return vec![],
-        };
-
+        // The index is no longer held, so re-check that the session still owns this
+        // TEID: it may have been deactivated (and its SEID re-activated on a new
+        // TEID) in between, and a stale TEID must not reach the new tree.
         let session = match sessions.get(&seid) {
-            Some(s) if s.active => s,
+            Some(s) if s.active && s.ingress_teid == ingress_teid => s,
             _ => return vec![],
         };
 
@@ -299,6 +307,62 @@ mod tests {
 
         let destinations = ctx.forward_lookup(session.ingress_teid);
         assert_eq!(destinations.len(), 3);
+    }
+
+    /// #770: a forwarding lookup racing session activation/deactivation must not
+    /// deadlock. Before the fix `forward_lookup` held `teid_index` while taking
+    /// `sessions`, the reverse of activate/deactivate's order. Both loops run on their
+    /// own threads under a deadline so a deadlock is a failure, not a hung suite.
+    #[test]
+    fn forward_lookup_racing_activation_does_not_deadlock() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let ctx = Arc::new(McastContext::new());
+        let s = ctx
+            .session_activate(0x770, 1, 1, Ipv4Addr::new(10, 0, 0, 1))
+            .unwrap();
+        ctx.add_gnb_endpoint(0x770, Ipv4Addr::new(10, 0, 1, 1), 0x4001, "gnb-770");
+        let teid = s.ingress_teid;
+        let run_for = Duration::from_secs(2);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let c = Arc::clone(&ctx);
+        let tx1 = tx.clone();
+        std::thread::spawn(move || {
+            let t0 = Instant::now();
+            let mut hits = 0u64;
+            while t0.elapsed() < run_for {
+                hits += c.forward_lookup(teid).len() as u64;
+            }
+            let _ = tx1.send(("lookup", hits));
+        });
+        let c = Arc::clone(&ctx);
+        std::thread::spawn(move || {
+            let t0 = Instant::now();
+            let mut n = 0u64;
+            while t0.elapsed() < run_for {
+                c.session_activate(0x771, 2, 2, Ipv4Addr::new(10, 0, 0, 2));
+                c.session_deactivate(0x771);
+                n += 1;
+            }
+            let _ = tx.send(("churn", n));
+        });
+
+        let mut lookups = None;
+        for _ in 0..2 {
+            let (who, n) = rx
+                .recv_timeout(run_for + Duration::from_secs(8))
+                .expect("forward_lookup vs session_activate deadlocked (#770)");
+            if who == "lookup" {
+                lookups = Some(n);
+            }
+        }
+        // Positive: the lookup kept resolving the untouched session throughout.
+        assert!(lookups.expect("lookup finished") > 0);
+        assert_eq!(
+            ctx.forward_lookup(teid),
+            vec![(Ipv4Addr::new(10, 0, 1, 1), 0x4001)]
+        );
     }
 
     #[test]
