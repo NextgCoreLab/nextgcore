@@ -189,6 +189,11 @@ pub enum S11Continuation {
         teid: u32,
         sgwc_ue_id: u64,
     },
+    /// One session's share of a Modify Bearer Request (#838): the MME is answered
+    /// once every session's PFCP Session Modification has (TS 23.401 §5.5.1.1.2
+    /// steps 3-4: the SGW answers after switching the downlink path). `join`
+    /// names the pending answer in `sxa_response`.
+    ModifyBearer { join: u64, sess_id: u64 },
 }
 
 /// An outbound PFCP request queued by a synchronous caller.
@@ -958,6 +963,19 @@ pub fn send_bearer_to_modify_list(
         flags
     );
     enqueue(&msg, sess.id, S11Continuation::None)
+}
+
+/// [`send_bearer_to_modify_list`] for a modification that gates an S11 answer:
+/// `continuation` is run when the SGW-U responds, or the transaction fails (#838).
+pub fn send_bearer_to_modify_list_gating(
+    sess: &SgwcSess,
+    bearer_ids: &[u64],
+    flags: u64,
+    continuation: S11Continuation,
+) -> Result<(), String> {
+    let msg = sxa_build::build_bearer_to_modify_list(sess, flags, bearer_ids)
+        .ok_or_else(|| "Failed to build Bearer to Modify List".to_string())?;
+    enqueue(&msg, sess.id, continuation)
 }
 
 /// Install the indirect data-forwarding rules on the SGW-U (#48).
