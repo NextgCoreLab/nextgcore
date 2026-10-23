@@ -831,8 +831,10 @@ impl SgwuContext {
             // #773: the MBR token buckets are keyed by session in a process-global
             // map, so they must go with the session or the map grows by one entry per
             // policed bearer forever. Called AFTER every context guard is released:
-            // the bucket mutex is a leaf lock and must not gain an edge from the
-            // session/rule locks.
+            // the bucket mutex is ordered BEFORE `qer_list` (see `MBR_BUCKETS`), so it
+            // must never be taken while a context lock is held. Forgetting after the
+            // QERs are gone is also what lets `mbr_allows` refuse to re-create a bucket
+            // for a packet that raced this removal.
             crate::gtp_path::mbr_forget_session(id);
         }
         removed
