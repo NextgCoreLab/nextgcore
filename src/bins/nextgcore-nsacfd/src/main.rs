@@ -4702,6 +4702,58 @@ nsacf:
         assert!(invalid_expiry(&ok).is_none());
     }
 
+    /// #856 follow-up: the CREATE handler itself refuses an unreadable `expiry`.
+    /// `an_unreadable_expiry_is_refused` pins the helper and the modify
+    /// validator, but not that `handle_slice_ee_subscribe` calls it, so dropping
+    /// that call (and storing a subscription that would then never expire) went
+    /// unnoticed.
+    ///
+    /// Revert-verified: without the `invalid_expiry` call in the create handler,
+    /// a bad expiry gets 201.
+    #[tokio::test]
+    async fn subscribe_refuses_an_unreadable_expiry() {
+        let _ctx_guard = GLOBAL_CTX_TEST_LOCK.lock().await;
+        nsacf_context_init(64);
+        let post = |doc: &serde_json::Value| {
+            SbiRequest::post("/nnsacf-slice-ee/v1/subscriptions")
+                .with_body(doc.to_string(), "application/json")
+        };
+        for bad in [
+            json!("2026-6-1T00:00:00Z"),
+            json!("+2026-01-01T00:00:00Z"),
+            json!("2026-01-01T00:00Z"),
+            json!(1),
+        ] {
+            let doc =
+                subscription_doc("http://127.0.0.1:9/cb", json!({}), json!({ "expiry": bad }));
+            let resp = handle_slice_ee_subscribe(&post(&doc)).await;
+            assert_eq!(
+                resp.status, 400,
+                "{bad}: a create with this expiry was accepted"
+            );
+            assert!(
+                resp.http
+                    .content
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("MANDATORY_IE_INCORRECT"),
+                "{bad}"
+            );
+            assert!(
+                !resp.http.headers.contains_key("Location"),
+                "{bad}: no subscription resource for a refused create"
+            );
+        }
+        // The positive control: the same document with a valid expiry is created,
+        // so the 400s above are the expiry check and not some other refusal.
+        let ok = subscription_doc(
+            "http://127.0.0.1:9/cb",
+            json!({}),
+            json!({ "expiry": "2030-01-01T00:00:00+02:00" }),
+        );
+        assert_eq!(handle_slice_ee_subscribe(&post(&ok)).await.status, 201);
+    }
+
     /// Every trigger field is parsed, and from the RIGHT object: `eventTrigger`,
     /// `notifThreshold`, `notificationPeriod` and `immediateFlag` live on the
     /// nested `event`, while `notifyCorrelationId`, `maxReports` and `expiry` are
