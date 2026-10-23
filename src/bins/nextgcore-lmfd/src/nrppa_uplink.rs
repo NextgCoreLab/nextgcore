@@ -197,6 +197,7 @@ fn to_cell(result: &nrppa::E_CID_MeasurementResult) -> CellMeasurement {
         rstd_ns: None,
         ue_rx_tx_ns: None,
         gnb_rx_tx_ns: None,
+        dl_prs_id: None,
     }
 }
 

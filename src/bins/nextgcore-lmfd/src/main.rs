@@ -2481,6 +2481,7 @@ async fn handle_nrppa_report(request: &SbiRequest) -> SbiResponse {
                     rstd_ns: c.get("rstdNs").and_then(|v| v.as_f64()),
                     ue_rx_tx_ns: c.get("ueRxTxNs").and_then(|v| v.as_f64()),
                     gnb_rx_tx_ns: c.get("gnbRxTxNs").and_then(|v| v.as_f64()),
+                    dl_prs_id: None,
                 })
                 .collect()
         })
@@ -3976,6 +3977,7 @@ mod tests {
                     rstd_ns: None,
                     ue_rx_tx_ns: None,
                     gnb_rx_tx_ns: None,
+                    dl_prs_id: None,
                 }],
             );
             req.request_id
@@ -4863,6 +4865,7 @@ lmf:
                     rstd_ns: None,
                     ue_rx_tx_ns: None,
                     gnb_rx_tx_ns: None,
+                    dl_prs_id: None,
                 }],
             )
             .expect(
@@ -5397,6 +5400,8 @@ lmf:
             "lat={lat} (placeholder leaked?)"
         );
         assert!((-123.0..-122.0).contains(&lon), "lon={lon}");
+        // #714: a DL-TDOA fix says so (TS 29.572 PositioningMethod), not UL_TDOA.
+        assert_eq!(v["positioningDataList"][0]["method"], "DL_TDOA");
     }
 
     /// #713: a UE's Multi-RTT report on its own carries UE Rx-Tx halves only. With

@@ -98,8 +98,9 @@ fn cells_of(debug: &str) -> Vec<std::collections::BTreeMap<String, String>> {
         .collect()
 }
 
-/// `new` minus the Rx–Tx fields #713 added, which must be absent here.
-fn without_rx_tx(
+/// `new` minus the fields #713 and #714 added: the Rx–Tx halves, which must be
+/// absent here, and `dl_prs_id`, which must agree with a `prs-<id>` key.
+fn without_new_fields(
     mut new: Vec<std::collections::BTreeMap<String, String>>,
     what: &str,
 ) -> Vec<std::collections::BTreeMap<String, String>> {
@@ -107,8 +108,22 @@ fn without_rx_tx(
         for k in ["ue_rx_tx_ns", "gnb_rx_tx_ns"] {
             assert_eq!(c.remove(k).as_deref(), Some("None"), "{what}: {k}");
         }
+        check_dl_prs_id(c, what);
     }
     new
+}
+
+/// Remove `dl_prs_id`, checking it against the key: an E-CID cell has none,
+/// and an LPP NR cell keyed `prs-<id>` carries that id.
+fn check_dl_prs_id(c: &mut std::collections::BTreeMap<String, String>, what: &str) {
+    let id = c.remove("dl_prs_id").expect("dl_prs_id");
+    if what == "E-CID" {
+        assert_eq!(id, "None", "{what}");
+    } else if let Some(prs) = c["nr_cgi"].trim_matches('"').strip_prefix("prs-") {
+        assert_eq!(id, format!("Some({prs})"), "{what}");
+    } else {
+        assert!(id.starts_with("Some("), "{what}: {id}");
+    }
 }
 
 fn some_f64(v: &str) -> f64 {
@@ -139,7 +154,7 @@ fn every_report_adapts_as_the_old_adapters_did() {
             codec_glue::lpp_ecid_provide_to_measurements(&g)
         ));
         assert_eq!(
-            without_rx_tx(ecid, "E-CID"),
+            without_new_fields(ecid, "E-CID"),
             cells_of(f[1]),
             "E-CID {}",
             f[0]
@@ -162,6 +177,7 @@ fn every_report_adapts_as_the_old_adapters_did() {
             );
             assert_eq!(new.remove("rtt_ns").as_deref(), Some("None"));
             assert_eq!(new.remove("gnb_rx_tx_ns").as_deref(), Some("None"));
+            check_dl_prs_id(&mut new, "Multi-RTT");
             let mut old = old;
             old.remove("rtt_ns");
             assert_eq!(new, old, "Multi-RTT {}", f[0]);
@@ -172,7 +188,7 @@ fn every_report_adapts_as_the_old_adapters_did() {
             codec_glue::lpp_dl_tdoa_provide_to_measurements(&g)
         ));
         assert_eq!(
-            without_rx_tx(tdoa, "DL-TDOA"),
+            without_new_fields(tdoa, "DL-TDOA"),
             cells_of(f[3]),
             "DL-TDOA {}",
             f[0]

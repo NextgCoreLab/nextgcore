@@ -680,6 +680,7 @@ fn measured_results_element_to_cell(elem: &lpp::MeasuredResultsElement) -> CellM
         rstd_ns: None,
         ue_rx_tx_ns: None,
         gnb_rx_tx_ns: None,
+        dl_prs_id: None,
     }
 }
 
@@ -774,6 +775,7 @@ pub fn lpp_multi_rtt_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<Cell
                     &elem.nr_ue_rx_tx_time_diff_r16,
                 ))),
                 gnb_rx_tx_ns: None,
+                dl_prs_id: Some(elem.dl_prs_id_r16.0),
             }
         })
         .collect()
@@ -806,8 +808,15 @@ pub fn decode_lpp_multi_rtt_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasure
 /// The reference TRP (`dl-PRS-ReferenceInfo`) is emitted first with `rstd_ns = 0`
 /// (RSTD is defined relative to it); each `NR-DL-TDOA-MeasElement` then contributes
 /// one entry whose `rstd_ns` is the SIGNED time difference vs that reference (see
-/// [`nrrstd_to_signed_ns`]). The CGI key is `"pci-<n>"` (NR PCI) when present, else
-/// `"prs-<id>"` (DL-PRS-ID).
+/// [`nrrstd_to_signed_ns`]).
+///
+/// Keys (#714): a neighbour is `"pci-<n>"` when the UE gave its NR PCI, else
+/// `"prs-<id>"`, as in the Multi-RTT adapter. The reference can only be
+/// `"prs-<id>"`: `DL-PRS-ID-Info-r16` carries the DL-PRS ID and resource IDs and
+/// no PCI. Every entry also carries `dl_prs_id`, so the solver can fall back to
+/// `prs-<id>` for a neighbour whose PCI the registry does not hold, and can
+/// rebase the RSTDs when the reference itself is not in the registry
+/// (`context::tdoa_observations`).
 ///
 /// Returns an empty `Vec` when the message is not a `ProvideLocationInformation` or
 /// carries no `nr-DL-TDOA` signal-measurement information.
@@ -834,6 +843,7 @@ pub fn lpp_dl_tdoa_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<CellMe
         rstd_ns: Some(0.0),
         ue_rx_tx_ns: None,
         gnb_rx_tx_ns: None,
+        dl_prs_id: Some(sig.dl_prs_reference_info_r16.dl_prs_id_r16.0),
     });
     for elem in &sig.nr_dl_tdoa_meas_list_r16.0 {
         let nr_cgi = match &elem.nr_phys_cell_id_r16 {
@@ -854,6 +864,7 @@ pub fn lpp_dl_tdoa_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<CellMe
             rstd_ns: Some(nrrstd_to_signed_ns(rstd_report(&elem.nr_rstd_r16))),
             ue_rx_tx_ns: None,
             gnb_rx_tx_ns: None,
+            dl_prs_id: Some(elem.dl_prs_id_r16.0),
         });
     }
     out
