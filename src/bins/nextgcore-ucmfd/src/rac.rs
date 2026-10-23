@@ -62,6 +62,11 @@ pub enum RacError {
     NoPagingSource,
     /// Encoding the result failed.
     Encode(&'static str),
+    /// The generated codec panicked on these bytes. That is a codec defect, but
+    /// the bytes come from an SBI peer and the caller holds the UCMF state lock,
+    /// so it is contained here and reported like any other undecodable input
+    /// (#725).
+    CodecFault(&'static str),
 }
 
 impl std::fmt::Display for RacError {
@@ -71,6 +76,7 @@ impl std::fmt::Display for RacError {
             Self::NoTranscodableRat => write!(f, "no RAT container the other format can carry"),
             Self::NoPagingSource => write!(f, "no RAT container to derive paging capability from"),
             Self::Encode(what) => write!(f, "could not encode {what}"),
+            Self::CodecFault(what) => write!(f, "the codec faulted while handling {what}"),
         }
     }
 }
@@ -261,8 +267,8 @@ fn build_eps(containers: &[(Rat, Vec<u8>)]) -> Result<Vec<u8>, RacError> {
     lte::encode(&info).map_err(|_| RacError::Encode("TS 36.331 UERadioAccessCapabilityInformation"))
 }
 
-/// Transcode a 5GS-format capability (TS 38.331) to the EPS format (TS 36.331).
-pub fn transcode_5gs_to_eps(cap_5gs: &[u8]) -> Result<Vec<u8>, RacError> {
+/// [`transcode_5gs_to_eps`] without the panic guard.
+pub(crate) fn transcode_5gs_to_eps_unguarded(cap_5gs: &[u8]) -> Result<Vec<u8>, RacError> {
     let parsed = parse_5gs(cap_5gs)?;
     if parsed.containers.is_empty() {
         return Err(RacError::NoTranscodableRat);
@@ -270,8 +276,8 @@ pub fn transcode_5gs_to_eps(cap_5gs: &[u8]) -> Result<Vec<u8>, RacError> {
     build_eps(&parsed.containers)
 }
 
-/// Transcode an EPS-format capability (TS 36.331) to the 5GS format (TS 38.331).
-pub fn transcode_eps_to_5gs(cap_eps: &[u8]) -> Result<Vec<u8>, RacError> {
+/// [`transcode_eps_to_5gs`] without the panic guard.
+pub(crate) fn transcode_eps_to_5gs_unguarded(cap_eps: &[u8]) -> Result<Vec<u8>, RacError> {
     let parsed = parse_eps(cap_eps)?;
     if parsed.containers.is_empty() {
         return Err(RacError::NoTranscodableRat);
@@ -363,9 +369,8 @@ fn eutra_paging_information(
     lte::encode(&info).map_err(|_| RacError::Encode("TS 36.331 UERadioPagingInformation"))
 }
 
-/// The 5GS UE Radio Capability for Paging (NGAP `UERadioCapabilityForPaging`, APER)
-/// derived from a 5GS-format capability.
-pub fn derive_paging_5gs(cap_5gs: &[u8]) -> Result<Vec<u8>, RacError> {
+/// [`derive_paging_5gs`] without the panic guard.
+pub(crate) fn derive_paging_5gs_unguarded(cap_5gs: &[u8]) -> Result<Vec<u8>, RacError> {
     let parsed = parse_5gs(cap_5gs)?;
     let of_nr = container(&parsed, Rat::Nr)
         .map(nr_paging_information)
@@ -384,12 +389,62 @@ pub fn derive_paging_5gs(cap_5gs: &[u8]) -> Result<Vec<u8>, RacError> {
     ngap::encode_contained(&paging).map_err(|_| RacError::Encode("NGAP UERadioCapabilityForPaging"))
 }
 
-/// The EPS UE Radio Capability for Paging (S1AP: a TS 36.331
-/// `UERadioPagingInformation`) derived from an EPS-format capability.
-pub fn derive_paging_eps(cap_eps: &[u8]) -> Result<Vec<u8>, RacError> {
+/// [`derive_paging_eps`] without the panic guard.
+pub(crate) fn derive_paging_eps_unguarded(cap_eps: &[u8]) -> Result<Vec<u8>, RacError> {
     let parsed = parse_eps(cap_eps)?;
     let eutra = container(&parsed, Rat::Eutra).ok_or(RacError::NoPagingSource)?;
     eutra_paging_information(eutra, parsed.eutra_paging_info.clone())
+}
+
+/// Run `f` and turn a panic in it into [`RacError::CodecFault`].
+///
+/// Every public function here decodes bytes an SBI peer sent, and the UCMF calls
+/// them while it holds its state write lock (`Capabilities::complete`). Fuzzing
+/// found no panic in the generated codecs (#725), but a codec bump could bring
+/// one, and a panic there would abort a dictionary update half-way. The work
+/// is pure: it reads the input slice and builds owned values, so nothing a
+/// caller can observe is left half-changed by an unwind, which is what makes
+/// `AssertUnwindSafe` sound.
+fn guarded<T>(what: &'static str, f: impl FnOnce() -> Result<T, RacError>) -> Result<T, RacError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|panic| {
+        let detail = panic
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        log::error!("UE radio capability codec panicked on {what}: {detail}");
+        Err(RacError::CodecFault(what))
+    })
+}
+
+/// Transcode a 5GS-format capability (TS 38.331) to the EPS format (TS 36.331).
+pub fn transcode_5gs_to_eps(cap_5gs: &[u8]) -> Result<Vec<u8>, RacError> {
+    guarded("a 5GS-format capability", || {
+        transcode_5gs_to_eps_unguarded(cap_5gs)
+    })
+}
+
+/// Transcode an EPS-format capability (TS 36.331) to the 5GS format (TS 38.331).
+pub fn transcode_eps_to_5gs(cap_eps: &[u8]) -> Result<Vec<u8>, RacError> {
+    guarded("an EPS-format capability", || {
+        transcode_eps_to_5gs_unguarded(cap_eps)
+    })
+}
+
+/// The 5GS UE Radio Capability for Paging (NGAP `UERadioCapabilityForPaging`, APER)
+/// derived from a 5GS-format capability.
+pub fn derive_paging_5gs(cap_5gs: &[u8]) -> Result<Vec<u8>, RacError> {
+    guarded("a 5GS-format capability", || {
+        derive_paging_5gs_unguarded(cap_5gs)
+    })
+}
+
+/// The EPS UE Radio Capability for Paging (S1AP: a TS 36.331
+/// `UERadioPagingInformation`) derived from an EPS-format capability.
+pub fn derive_paging_eps(cap_eps: &[u8]) -> Result<Vec<u8>, RacError> {
+    guarded("an EPS-format capability", || {
+        derive_paging_eps_unguarded(cap_eps)
+    })
 }
 
 #[cfg(test)]
