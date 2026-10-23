@@ -1248,6 +1248,12 @@ pub struct DataPlaneUrr {
     thr_used_total: AtomicU64,
     thr_used_ul: AtomicU64,
     thr_used_dl: AtomicU64,
+    /// Start of the TIME-threshold measurement (#842 review): re-based only by a
+    /// threshold-triggered report or a changed Time Threshold, NOT by every report.
+    /// Measuring it from `last_report_time` let each PERIO/query/quota report postpone
+    /// the time threshold, so with a Measurement Period shorter than it, TIMTH never
+    /// fired at all.
+    thr_time_start: std::sync::Mutex<std::time::Instant>,
     /// Timestamp of first packet in this measurement period
     pub first_pkt_time: RwLock<Option<std::time::Instant>>,
     /// Timestamp of last report.
@@ -1368,16 +1374,79 @@ impl DataPlaneUrr {
             time_quota_secs.unwrap_or(NO_TIME_THRESHOLD),
             Ordering::Relaxed,
         );
-        // #842 review: a (re-)granted quota is measured from now.
-        for c in [
-            &self.quota_used_total,
-            &self.quota_used_ul,
-            &self.quota_used_dl,
-        ] {
-            c.store(0, Ordering::Relaxed);
-        }
-        *self.quota_first_pkt_time.write().unwrap() = None;
+        self.rebase_quota_to_ongoing();
         self.quota_exhausted.store(false, Ordering::Relaxed);
+    }
+
+    /// Apply an Update URR's quota IEs (#842 review, TS 29.244 §7.5.4): an IE that is
+    /// ABSENT (`None`) leaves its value unchanged. Before, an Update URR was applied
+    /// through [`Self::set_quotas`] with the absent IEs as `None`, so a threshold-only
+    /// modification deleted the quota and lifted an exhausted subscriber's latch.
+    /// Only a modification that actually carries a quota re-grants (clears the latch).
+    pub fn update_quotas(
+        &self,
+        volume_total: Option<u64>,
+        volume_ul: Option<u64>,
+        volume_dl: Option<u64>,
+        time_quota_secs: Option<u32>,
+    ) {
+        if volume_total.is_none()
+            && volume_ul.is_none()
+            && volume_dl.is_none()
+            && time_quota_secs.is_none()
+        {
+            return;
+        }
+        for (slot, v) in [
+            (&self.volume_quota_total_raw, volume_total),
+            (&self.volume_quota_ul_raw, volume_ul),
+            (&self.volume_quota_dl_raw, volume_dl),
+        ] {
+            if let Some(v) = v {
+                slot.store(v, Ordering::Relaxed);
+            }
+        }
+        if let Some(t) = time_quota_secs {
+            self.time_quota_secs_raw.store(t, Ordering::Relaxed);
+        }
+        self.rebase_quota_to_ongoing();
+        self.quota_exhausted.store(false, Ordering::Relaxed);
+    }
+
+    /// A newly received quota is measured against the ONGOING (not yet reported) usage
+    /// (#842 review, TS 29.244 §5.2.2.3.1: "consider its ongoing measurements counts
+    /// ... against the new ... quota ... i.e. ... discard any remaining quota"): the old
+    /// remaining allowance is dropped, but what was measured since the last report
+    /// still counts. Re-basing to zero let that usage pass free.
+    fn rebase_quota_to_ongoing(&self) {
+        for (dst, src) in [
+            (&self.quota_used_total, &self.acc_total_bytes),
+            (&self.quota_used_ul, &self.acc_ul_bytes),
+            (&self.quota_used_dl, &self.acc_dl_bytes),
+        ] {
+            dst.store(src.load(Ordering::Acquire), Ordering::Relaxed);
+        }
+        *self.quota_first_pkt_time.write().unwrap() = *self.first_pkt_time.read().unwrap();
+    }
+
+    /// The same for a newly received volume threshold.
+    fn rebase_volume_threshold_to_ongoing(&self) {
+        for (dst, src) in [
+            (&self.thr_used_total, &self.acc_total_bytes),
+            (&self.thr_used_ul, &self.acc_ul_bytes),
+            (&self.thr_used_dl, &self.acc_dl_bytes),
+        ] {
+            dst.store(src.load(Ordering::Acquire), Ordering::Relaxed);
+        }
+    }
+
+    /// The same for a newly received time threshold: measured from the start of the
+    /// ongoing measurement (the last report).
+    fn rebase_time_threshold_to_ongoing(&self) {
+        let start = self
+            .last_report_time()
+            .unwrap_or_else(std::time::Instant::now);
+        *self.thr_time_start.lock().unwrap() = start;
     }
 
     fn volume(slot: &AtomicU64) -> Option<u64> {
@@ -1423,17 +1492,55 @@ impl DataPlaneUrr {
                 != vol(volume_dl),
         ]
         .contains(&true);
-        // #842 review: a NEW volume threshold is applied from now (§5.2.2.3.1: "re-apply
-        // the threshold received in the request"); an unchanged one keeps counting.
+        // #842 review: a NEW volume threshold counts the ongoing measurement
+        // (§5.2.2.3.1); an unchanged one keeps counting where it was.
         if changed {
-            for c in [&self.thr_used_total, &self.thr_used_ul, &self.thr_used_dl] {
-                c.store(0, Ordering::Relaxed);
-            }
+            self.rebase_volume_threshold_to_ongoing();
         }
-        self.time_threshold_secs_raw
-            .store(sec(time_threshold_secs), Ordering::Relaxed);
+        if self
+            .time_threshold_secs_raw
+            .swap(sec(time_threshold_secs), Ordering::Relaxed)
+            != sec(time_threshold_secs)
+        {
+            self.rebase_time_threshold_to_ongoing();
+        }
         self.measurement_period_secs_raw
             .store(sec(measurement_period_secs), Ordering::Relaxed);
+    }
+
+    /// Apply an Update URR's reporting IEs (#842 review, TS 29.244 §7.5.4): an ABSENT
+    /// IE (`None`) leaves its value unchanged, so a quota-only modification no longer
+    /// deletes the thresholds and the Measurement Period. A present one replaces the
+    /// value and, when it changed, is measured against the ongoing counts.
+    pub fn update_reporting(
+        &self,
+        volume_total: Option<u64>,
+        volume_ul: Option<u64>,
+        volume_dl: Option<u64>,
+        time_threshold_secs: Option<u32>,
+        measurement_period_secs: Option<u32>,
+    ) {
+        let mut volume_changed = false;
+        for (slot, v) in [
+            (&self.volume_threshold_total_raw, volume_total),
+            (&self.volume_threshold_ul_raw, volume_ul),
+            (&self.volume_threshold_dl_raw, volume_dl),
+        ] {
+            if let Some(v) = v {
+                volume_changed |= slot.swap(v, Ordering::Relaxed) != v;
+            }
+        }
+        if volume_changed {
+            self.rebase_volume_threshold_to_ongoing();
+        }
+        if let Some(t) = time_threshold_secs {
+            if self.time_threshold_secs_raw.swap(t, Ordering::Relaxed) != t {
+                self.rebase_time_threshold_to_ongoing();
+            }
+        }
+        if let Some(p) = measurement_period_secs {
+            self.measurement_period_secs_raw.store(p, Ordering::Relaxed);
+        }
     }
 
     pub fn new(urr_id: u32) -> Self {
@@ -1462,6 +1569,7 @@ impl DataPlaneUrr {
             thr_used_total: AtomicU64::new(0),
             thr_used_ul: AtomicU64::new(0),
             thr_used_dl: AtomicU64::new(0),
+            thr_time_start: std::sync::Mutex::new(std::time::Instant::now()),
             first_pkt_time: RwLock::new(None),
             last_report_time: RwLock::new(Some(std::time::Instant::now())),
             threshold_exceeded: AtomicBool::new(false),
@@ -1500,6 +1608,13 @@ impl DataPlaneUrr {
     /// to be dropped: §5.2.2 has the UP function measure the traffic matching the PDR,
     /// and the volume that exhausted the quota is part of the usage being reported.
     pub fn record(&self, bytes: u64, is_uplink: bool) -> UrrOutcome {
+        // #842 review (decision): a packet dropped because the quota is ALREADY
+        // exhausted is not usage -- it is never forwarded, so it is neither measured
+        // nor billed. The packet that exhausts the quota is measured (below): it is
+        // the usage that crossed the limit.
+        if self.quota_exhausted.load(Ordering::Relaxed) {
+            return UrrOutcome::QuotaAlreadyExhausted;
+        }
         self.acc_total_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.acc_total_pkts.fetch_add(1, Ordering::Relaxed);
         // #842 review: the quota and the thresholds are measured on their OWN counters,
@@ -1602,11 +1717,10 @@ impl DataPlaneUrr {
 
         // Check time threshold
         if let Some(time_thresh) = self.time_threshold_secs() {
-            if let Some(last) = self.last_report_time() {
-                if last.elapsed().as_secs() >= time_thresh as u64 {
-                    self.threshold_exceeded.store(true, Ordering::Relaxed);
-                    outcome = UrrOutcome::ThresholdExceeded;
-                }
+            let start = *self.thr_time_start.lock().unwrap();
+            if start.elapsed() >= std::time::Duration::from_secs(time_thresh as u64) {
+                self.threshold_exceeded.store(true, Ordering::Relaxed);
+                outcome = UrrOutcome::ThresholdExceeded;
             }
         }
 
@@ -1660,6 +1774,7 @@ impl DataPlaneUrr {
         self.acc_total_pkts
             .fetch_sub(usage.total_pkts(), Ordering::AcqRel);
         if threshold_report {
+            *self.thr_time_start.lock().unwrap() = std::time::Instant::now();
             // Read AFTER the swaps: a packet whose bytes this report took has already
             // added to these counters, so it is subtracted; one recorded after the read
             // stays, counting toward the re-applied threshold.
@@ -6017,9 +6132,69 @@ mod tests {
             Some(UrrReportReason::VolumeThreshold),
             "the threshold was not postponed by the query"
         );
-        // A re-grant does restart the quota.
+        // A re-grant drops the old remaining quota but COUNTS THE ONGOING usage
+        // (§5.2.2.3.1): 900 B unreported since the query, so 100 B more exhausts it.
         quota.set_quotas(Some(1000), None, None, None);
-        assert_eq!(quota.record(900, true), UrrOutcome::Continue);
+        assert_eq!(quota.record(50, true), UrrOutcome::Continue);
+        assert_eq!(quota.record(100, true), UrrOutcome::QuotaJustExhausted);
+    }
+
+    /// #842 review MAJOR 2 (TS 29.244 §5.2.2.3.1): a quota or threshold received for a
+    /// measurement already under way is measured against the ONGOING counts -- "the UP
+    /// function shall discard any remaining quota" but not the unreported usage.
+    /// 600 B unreported, a new 1000 B quota, then 500 B: exhausted. The same for a new
+    /// volume threshold.
+    #[test]
+    fn a_new_quota_or_threshold_counts_the_ongoing_measurement() {
+        let urr = DataPlaneUrr::new(1);
+        urr.set_quotas(Some(1000), None, None, None);
+        assert_eq!(urr.record(600, true), UrrOutcome::Continue);
+        urr.update_quotas(Some(1000), None, None, None);
+        assert_eq!(urr.record(500, true), UrrOutcome::QuotaJustExhausted);
+
+        let thr = DataPlaneUrr::new(2);
+        thr.set_reporting(Some(5000), None, None, None, None);
+        assert_eq!(thr.record(600, true), UrrOutcome::Continue);
+        thr.update_reporting(Some(1000), None, None, None, None);
+        assert_eq!(thr.record(500, true), UrrOutcome::ThresholdExceeded);
+    }
+
+    /// #842 review MAJOR 1: the TIME threshold is not postponed by a non-threshold
+    /// report. 2 s TIMTH; a query at 1.5 s; at 2.3 s the threshold is crossed. Before,
+    /// it was measured from the last report of any kind, so it fired only at 3.5 s --
+    /// and never, with a Measurement Period shorter than the time threshold.
+    #[test]
+    fn a_query_does_not_postpone_the_time_threshold() {
+        let urr = DataPlaneUrr::new(1);
+        urr.set_reporting(None, None, None, Some(2), None);
+        // Move the time-threshold clock 1.5 s back instead of sleeping.
+        *urr.thr_time_start.lock().unwrap() -= std::time::Duration::from_millis(1500);
+        assert_eq!(urr.record(10, true), UrrOutcome::Continue);
+        let _ = urr.take_usage(); // the query (a non-threshold report)
+        *urr.thr_time_start.lock().unwrap() -= std::time::Duration::from_millis(800);
+        assert_eq!(
+            urr.record(10, true),
+            UrrOutcome::ThresholdExceeded,
+            "2.3 s since the threshold was applied: TIMTH is crossed"
+        );
+        // A threshold report re-applies it.
+        let _ = urr.take_usage_for_threshold();
+        assert_eq!(urr.record(10, true), UrrOutcome::Continue);
+    }
+
+    /// #842 review (decision): a packet dropped because the quota is ALREADY exhausted
+    /// is not measured -- it was never forwarded, so it is not usage to bill.
+    #[test]
+    fn packets_dropped_after_the_quota_latch_are_not_usage() {
+        let urr = DataPlaneUrr::new(1);
+        urr.set_quotas(Some(100), None, None, None);
+        assert_eq!(urr.record(150, true), UrrOutcome::QuotaJustExhausted);
+        assert_eq!(urr.record(1000, true), UrrOutcome::QuotaAlreadyExhausted);
+        assert_eq!(
+            urr.usage().ul_bytes,
+            150,
+            "the exhausting packet is usage; the dropped one is not"
+        );
     }
 
     /// #842 review: a THRESHOLD-triggered report re-applies the threshold (§5.2.2.3.1):

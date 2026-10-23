@@ -3342,11 +3342,77 @@ mod tests {
             "an Update URR must NOT reset the volume measured so far"
         );
         assert_eq!(urr.acc_ul_bytes.load(Ordering::Relaxed), 4096);
+        // #842 review (TS 29.244 §7.5.4): an IE the Update URR does not carry is
+        // UNCHANGED. This used to assert the period was withdrawn -- which is how a
+        // quota top-up silently stopped periodic reporting.
         assert_eq!(
             urr.measurement_period_secs(),
-            None,
-            "a period the update omits is withdrawn, not silently retained"
+            Some(30),
+            "a period the update omits is kept"
         );
+    }
+
+    /// An Update URR body carrying ONLY a total Volume Quota (§8.2.50).
+    fn quota_only_update(id: u32, quota: u64) -> Vec<u8> {
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_u32(pfcp_ie::URR_ID, id);
+        let mut v = vec![0x01u8];
+        v.extend_from_slice(&quota.to_be_bytes());
+        b.add_tlv(crate::n4_build::pfcp_ie::VOLUME_QUOTA, &v);
+        b.build()
+    }
+
+    /// #842 review MAJOR 3 (TS 29.244 §7.5.4): a THRESHOLD-only Update URR leaves the
+    /// quota -- and an exhausted subscriber's latch -- alone; a QUOTA-only one leaves
+    /// the thresholds and the Measurement Period alone (and re-grants). Before, both
+    /// went through the Create setters, so each deleted what it did not carry.
+    #[tokio::test]
+    async fn an_update_urr_changes_only_the_ies_it_carries() {
+        let (_server, smf, addr, mut rx, dp, upf_seid) = established_session().await;
+        let urr = urr1(&dp, upf_seid);
+        urr.set_quotas(Some(1000), None, None, None);
+        assert_eq!(
+            urr.record(1500, true),
+            crate::data_plane::UrrOutcome::QuotaJustExhausted
+        );
+
+        // Threshold-only.
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(pfcp_ie::UPDATE_URR, &{
+            let mut u = crate::n4_build::PfcpMessageBuilder::new();
+            u.add_u32(pfcp_ie::URR_ID, 1);
+            let mut v = vec![0x01u8];
+            v.extend_from_slice(&5_000_000u64.to_be_bytes());
+            u.add_tlv(pfcp_ie::VOLUME_THRESHOLD, &v);
+            u.build()
+        });
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+        assert_eq!(urr.volume_threshold_total(), Some(5_000_000));
+        assert_eq!(
+            urr.volume_quota_total(),
+            Some(1000),
+            "the quota is unchanged"
+        );
+        assert!(urr.is_quota_exhausted(), "and the subscriber stays gated");
+        assert_eq!(urr.measurement_period_secs(), Some(30));
+
+        // Quota-only: a top-up.
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(pfcp_ie::UPDATE_URR, &quota_only_update(1, 1_000_000));
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 4, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+        assert_eq!(urr.volume_quota_total(), Some(1_000_000));
+        assert!(!urr.is_quota_exhausted(), "a quota top-up re-grants");
+        assert_eq!(
+            urr.volume_threshold_total(),
+            Some(5_000_000),
+            "thresholds kept"
+        );
+        assert_eq!(urr.time_threshold_secs(), Some(60));
+        assert_eq!(urr.measurement_period_secs(), Some(30), "period kept");
     }
 
     /// Criterion 3 plus the leak the issue names: a removed URR must report what it
