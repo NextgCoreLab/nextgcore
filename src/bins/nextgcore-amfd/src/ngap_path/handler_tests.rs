@@ -506,3 +506,319 @@ async fn two_activated_sessions_carry_the_accept_exactly_once() {
     assert_eq!(psis, vec![1, 2]);
     assert_eq!(accepts, 1, "exactly one Service Accept: {sent:?}");
 }
+
+// ---------------------------------------------------------------------------
+// #757: N1N2MessageTransfer PDU_RES_SETUP_REQ / PDU_RES_MOD_REQ to a UE
+// ---------------------------------------------------------------------------
+
+/// Give the UE a SUPI, so the Namf surface resolves it.
+fn with_supi(server: &mut NgapServer, amf_ue_ngap_id: u64, supi: &str) {
+    server.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
+        s.amf_ue.supi = Some(supi.to_string());
+    });
+}
+
+/// An N1N2MessageTransfer through the live Namf request handler. `n2` is the
+/// `ngapIeType` and the transfer octets (absent: no `ngapData`, as smfd's
+/// downlink-data request sends it). `n1` is the N1 SM message.
+async fn n1n2_transfer(
+    supi: &str,
+    psi: u8,
+    n2: Option<(&str, Option<&[u8]>)>,
+    n1: Option<&[u8]>,
+) -> nextgcore_sbi::SbiResponse {
+    use nextgcore_sbi::message::SbiPart;
+    let mut body = serde_json::json!({ "pduSessionId": psi });
+    if let Some((ie_type, data)) = n2 {
+        body["n2InfoContainer"] = serde_json::json!({
+            "n2InformationClass": "SM",
+            "smInfo": {
+                "pduSessionId": psi,
+                "n2InfoContent": { "ngapIeType": ie_type },
+            },
+        });
+        if data.is_some() {
+            body["n2InfoContainer"]["smInfo"]["n2InfoContent"]["ngapData"] =
+                serde_json::json!({ "contentId": "ngap-sm" });
+        }
+    }
+    if n1.is_some() {
+        body["n1MessageContainer"] = serde_json::json!({
+            "n1MessageClass": "SM",
+            "n1MessageContent": { "contentId": "5gnas-sm" },
+        });
+    }
+    let mut req =
+        nextgcore_sbi::SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"))
+            .with_json_body(&body)
+            .expect("json");
+    if let Some((_, Some(data))) = n2 {
+        req = req.with_part(SbiPart::with_content(
+            "ngap-sm",
+            "application/vnd.3gpp.ngap",
+            bytes::Bytes::copy_from_slice(data),
+        ));
+    }
+    if let Some(n1) = n1 {
+        req = req.with_part(SbiPart::with_content(
+            "5gnas-sm",
+            "application/vnd.3gpp.5gnas",
+            bytes::Bytes::copy_from_slice(n1),
+        ));
+    }
+    crate::namf_request_handler(req).await
+}
+
+fn cause_of(resp: &nextgcore_sbi::SbiResponse) -> String {
+    let body: serde_json::Value =
+        serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).unwrap_or_default();
+    body["cause"].as_str().unwrap_or_default().to_string()
+}
+
+/// The captured PDUs that concern `ue`, decoded. Other tests may enqueue
+/// transfers for their own UEs on the shared queue, and the pump delivers those too.
+fn sent_to(server: &mut NgapServer, ue: u64) -> Vec<Sent> {
+    take_sent(server)
+        .into_iter()
+        .map(|(_, p)| decode_sent(&p))
+        .filter(|s| match s {
+            Sent::SetupRequest { amf_ue_ngap_id, .. }
+            | Sent::ModifyRequest { amf_ue_ngap_id, .. }
+            | Sent::ReleaseCommand { amf_ue_ngap_id, .. }
+            | Sent::DownlinkNas { amf_ue_ngap_id, .. } => *amf_ue_ngap_id == ue,
+            _ => false,
+        })
+        .collect()
+}
+
+const MOD_CMD: [u8; 5] = [0x2E, 0x02, 0x01, 0xCB, 0x59]; // PDU SESSION MODIFICATION COMMAND
+const MOD_TRANSFER: [u8; 4] = [0x00, 0x00, 0x01, 0x7E];
+
+/// #757 scenario 1: a CM-CONNECTED UE whose PSI 2 user plane is deactivated gets
+/// smfd's downlink-data N1N2 (`PDU_RES_SETUP_REQ`, no N1, no transfer). The AMF
+/// answers 200 N1_N2_TRANSFER_INITIATED and DELIVERS it: UpdateSMContext
+/// ACTIVATING for PSI 2, then a PDU SESSION RESOURCE SETUP REQUEST with the
+/// SMF's transfer (TS 23.502 §4.2.3.3 steps 4-5, TS 38.413 §8.2.1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_downlink_data_setup_request_for_a_connected_ue_activates_and_reaches_the_gnb() {
+    let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
+    let (_smf, port, calls) = activating_smf().await;
+    let mut server = capturing_server().await;
+    let (ue, ran, supi) = (7_757_001u64, 57, "imsi-001010007570001");
+    secured_registered_ue(&mut server, ue, ran);
+    with_supi(&mut server, ue, supi);
+    hold_session(&mut server, ue, 2, "n1n2-757-setup", port);
+
+    let resp = n1n2_transfer(supi, 2, Some(("PDU_RES_SETUP_REQ", None)), None).await;
+    assert_eq!(resp.status, 200);
+    assert_eq!(cause_of(&resp), "N1_N2_TRANSFER_INITIATED");
+
+    server.process_connected_downlinks().await;
+    let calls = calls.lock().expect("calls").clone();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert!(calls[0].0.ends_with("/sm-contexts/n1n2-757-setup/modify"));
+    assert_eq!(calls[0].1["upCnxState"], "ACTIVATING");
+    assert_eq!(
+        sent_to(&mut server, ue),
+        vec![Sent::SetupRequest {
+            amf_ue_ngap_id: ue,
+            nas_pdu: None,
+            items: vec![(2, transfer_for("n1n2-757-setup"))],
+        }]
+    );
+}
+
+/// A `PDU_RES_SETUP_REQ` that carries its transfer goes to the gNB as is, with no
+/// N11 round trip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_setup_request_with_a_transfer_is_sent_without_asking_the_smf() {
+    let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
+    let (_smf, port, calls) = activating_smf().await;
+    let mut server = capturing_server().await;
+    let (ue, ran, supi) = (7_757_002u64, 58, "imsi-001010007570002");
+    secured_registered_ue(&mut server, ue, ran);
+    with_supi(&mut server, ue, supi);
+    hold_session(&mut server, ue, 3, "n1n2-757-setup-t", port);
+
+    let transfer = [0x00, 0x04, 0xAB, 0xCD];
+    let resp = n1n2_transfer(supi, 3, Some(("PDU_RES_SETUP_REQ", Some(&transfer))), None).await;
+    assert_eq!(resp.status, 200);
+    server.process_connected_downlinks().await;
+    assert!(calls.lock().expect("calls").is_empty());
+    assert_eq!(
+        sent_to(&mut server, ue),
+        vec![Sent::SetupRequest {
+            amf_ue_ngap_id: ue,
+            nas_pdu: None,
+            items: vec![(3, transfer.to_vec())],
+        }]
+    );
+}
+
+/// #757 scenario 2, TS 23.502 §4.3.3.2 step 4: a network-requested PDU Session
+/// Modification (`PDU_RES_MOD_REQ` + N1 PDU SESSION MODIFICATION COMMAND) to a
+/// connected UE is ONE PDU SESSION RESOURCE MODIFY REQUEST. Its item carries the
+/// transfer, and the N1 as a protected DL NAS Transport NAS-PDU.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_network_requested_modification_reaches_a_connected_ue_as_a_modify_request() {
+    let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
+    let (_smf, port, _calls) = activating_smf().await;
+    let mut server = capturing_server().await;
+    let (ue, ran, supi) = (7_757_003u64, 59, "imsi-001010007570003");
+    secured_registered_ue(&mut server, ue, ran);
+    with_supi(&mut server, ue, supi);
+    hold_session(&mut server, ue, 1, "n1n2-757-mod", port);
+
+    let resp = n1n2_transfer(
+        supi,
+        1,
+        Some(("PDU_RES_MOD_REQ", Some(&MOD_TRANSFER))),
+        Some(&MOD_CMD),
+    )
+    .await;
+    assert_eq!(resp.status, 200);
+    assert_eq!(cause_of(&resp), "N1_N2_TRANSFER_INITIATED");
+    server.process_connected_downlinks().await;
+
+    let sent = sent_to(&mut server, ue);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    let Sent::ModifyRequest { items, .. } = &sent[0] else {
+        panic!("a PDU SESSION RESOURCE MODIFY REQUEST, got {:?}", sent[0]);
+    };
+    assert_eq!(items.len(), 1);
+    let (psi, nas, transfer) = &items[0];
+    assert_eq!(*psi, 1);
+    assert_eq!(transfer, &MOD_TRANSFER.to_vec());
+    let nas = nas.as_deref().expect("the N1 rides the item's NAS-PDU");
+    assert_eq!(
+        dl_nas_message_type(nas),
+        Some(message_type::DL_NAS_TRANSPORT)
+    );
+    assert!(
+        nas.windows(MOD_CMD.len()).any(|w| w == MOD_CMD),
+        "the DL NAS Transport carries the Modification Command: {nas:02x?}"
+    );
+}
+
+/// A `PDU_RES_MOD_REQ` without an N1 or without its transfer is refused (400),
+/// not acknowledged and dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_modify_request_missing_its_n1_or_transfer_is_refused() {
+    let (_smf, port, _calls) = activating_smf().await;
+    let mut server = capturing_server().await;
+    let (ue, ran, supi) = (7_757_004u64, 60, "imsi-001010007570004");
+    secured_registered_ue(&mut server, ue, ran);
+    with_supi(&mut server, ue, supi);
+    hold_session(&mut server, ue, 1, "n1n2-757-mod-bad", port);
+    let no_n1 = n1n2_transfer(
+        supi,
+        1,
+        Some(("PDU_RES_MOD_REQ", Some(&MOD_TRANSFER))),
+        None,
+    )
+    .await;
+    assert_eq!(no_n1.status, 400);
+    let no_transfer = n1n2_transfer(supi, 1, Some(("PDU_RES_MOD_REQ", None)), Some(&MOD_CMD)).await;
+    assert_eq!(no_transfer.status, 400);
+}
+
+/// #757 for a CM-IDLE UE: a modification is paged for (202 ATTEMPTING_TO_REACH_UE)
+/// and kept as a MODIFY in the paging context, not answered 200 and dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_modification_for_an_idle_ue_pages_it() {
+    let (_smf, port, _calls) = activating_smf().await;
+    let mut server = capturing_server().await;
+    let (ue, ran, supi) = (7_757_005u64, 61, "imsi-001010007570005");
+    secured_registered_ue(&mut server, ue, ran);
+    with_supi(&mut server, ue, supi);
+    server.ue_auth_state.with_mut(ue, |s| s.cm_idle = true);
+    hold_session(&mut server, ue, 1, "n1n2-757-mod-idle", port);
+
+    let resp = n1n2_transfer(
+        supi,
+        1,
+        Some(("PDU_RES_MOD_REQ", Some(&MOD_TRANSFER))),
+        Some(&MOD_CMD),
+    )
+    .await;
+    assert_eq!(resp.status, 202);
+    assert_eq!(cause_of(&resp), "ATTEMPTING_TO_REACH_UE");
+    let paged = crate::context::amf_self()
+        .read()
+        .unwrap()
+        .paging_find(ue)
+        .expect("paging queued");
+    crate::context::amf_self().read().unwrap().paging_remove(ue);
+    assert!(paged.pending_n2_modify && !paged.pending_n2_release);
+    assert_eq!(paged.pending_n2.as_deref(), Some(&MOD_TRANSFER[..]));
+    assert_eq!(paged.pending_n1.as_deref(), Some(&MOD_CMD[..]));
+    assert_eq!(paged.pdu_session_id, Some(1));
+}
+
+/// #757's drain-time race: a transfer queued while the UE was connected, for a UE
+/// that went CM-IDLE before the pump ran, is paged for. It is NOT sent to the
+/// released NG connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transfer_queued_before_the_ue_went_idle_pages_it_instead_of_sending() {
+    let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
+    let (_smf, port, _calls) = activating_smf().await;
+    let mut server = capturing_server().await;
+    let (ue, ran, supi) = (7_757_006u64, 62, "imsi-001010007570006");
+    secured_registered_ue(&mut server, ue, ran);
+    with_supi(&mut server, ue, supi);
+    hold_session(&mut server, ue, 1, "n1n2-757-race", port);
+
+    let resp = n1n2_transfer(
+        supi,
+        1,
+        Some(("PDU_RES_MOD_REQ", Some(&MOD_TRANSFER))),
+        Some(&MOD_CMD),
+    )
+    .await;
+    assert_eq!(resp.status, 200);
+    server.ue_auth_state.with_mut(ue, |s| s.cm_idle = true);
+    server.process_connected_downlinks().await;
+
+    assert!(
+        sent_to(&mut server, ue).is_empty(),
+        "nothing on the released connection"
+    );
+    let paged = crate::context::amf_self()
+        .read()
+        .unwrap()
+        .paging_find(ue)
+        .expect("the UE is paged instead");
+    crate::context::amf_self().read().unwrap().paging_remove(ue);
+    assert!(paged.pending_n2_modify);
+    assert_eq!(paged.pending_n2.as_deref(), Some(&MOD_TRANSFER[..]));
+    assert_eq!(paged.pending_n1.as_deref(), Some(&MOD_CMD[..]));
+}
+
+/// A paged modification is delivered after the Service Request as its own
+/// MODIFY REQUEST. Delivering it as a bare DL NAS Transport would lose the N2 half.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_paged_modification_is_delivered_as_a_modify_request_after_the_service_request() {
+    let mut server = capturing_server().await;
+    let (ue, ran) = (7_757_007u64, 63);
+    secured_registered_ue(&mut server, ue, ran);
+    let paging = crate::context::PagingContext {
+        amf_ue_ngap_id: ue,
+        pending_n1: Some(MOD_CMD.to_vec()),
+        pending_n2: Some(MOD_TRANSFER.to_vec()),
+        pending_n2_modify: true,
+        pdu_session_id: Some(4),
+        ..Default::default()
+    };
+    server
+        .deliver_paged_after_service_request(ASSOC, ue, ran, &paging)
+        .await
+        .expect("delivered");
+    let sent = sent_to(&mut server, ue);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    let Sent::ModifyRequest { items, .. } = &sent[0] else {
+        panic!("a MODIFY REQUEST, got {:?}", sent[0]);
+    };
+    assert_eq!(items[0].0, 4);
+    assert_eq!(items[0].2, MOD_TRANSFER.to_vec());
+    assert!(items[0].1.is_some());
+}

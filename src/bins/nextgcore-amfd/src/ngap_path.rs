@@ -5424,8 +5424,9 @@ impl NgapServer {
         let mut sessions = Vec::new();
         if let Some(p) = &paging {
             clear_session_paging(p);
-            if p.pending_n2_release {
-                // A paged release is sent after the ICS as its own Release Command.
+            if p.pending_n2_release || p.pending_n2_modify {
+                // A paged release or modification is sent after the ICS as its own
+                // Release Command / Modify Request (#518, #757).
             } else if let (Some(psi), Some(transfer)) = (p.pdu_session_id, p.pending_n2.clone()) {
                 let s_nssai = {
                     let ctx = crate::context::amf_self();
@@ -5640,6 +5641,20 @@ impl NgapServer {
         ran_ue_ngap_id: u32,
         paging: &crate::context::PagingContext,
     ) -> Result<()> {
+        if paging.pending_n2_modify {
+            if let (Some(psi), Some(transfer)) = (paging.pdu_session_id, &paging.pending_n2) {
+                return self
+                    .send_pdu_session_modify(
+                        association_id,
+                        amf_ue_ngap_id,
+                        ran_ue_ngap_id,
+                        psi,
+                        paging.pending_n1.as_deref(),
+                        transfer,
+                    )
+                    .await;
+            }
+        }
         self.deliver_n1_n2(
             association_id,
             amf_ue_ngap_id,
@@ -7457,42 +7472,225 @@ impl NgapServer {
             guard.connected_downlink_drain()
         };
         for item in pending {
-            let Some(state) = self.ue_auth_state.get(item.amf_ue_ngap_id) else {
-                log::warn!(
-                    "N1N2 transfer for UE {} (PSI {}) dropped: no NG context",
-                    item.amf_ue_ngap_id,
-                    item.pdu_session_id
-                );
-                continue;
-            };
-            let (association_id, ran_ue_ngap_id) = (state.association_id, state.ran_ue_ngap_id);
-            if let Err(e) = self
-                .deliver_n1_n2(
+            self.deliver_connected_downlink(item).await;
+        }
+    }
+
+    /// Deliver one queued N1N2MessageTransfer to its UE (#666, #757).
+    ///
+    /// The UE's NG connection is read NOW, not when the transfer was queued. A UE
+    /// that went CM-IDLE in between is paged rather than having the PDU sent to its
+    /// released connection (TS 23.502 §4.2.3.3 step 3a).
+    async fn deliver_connected_downlink(&mut self, item: crate::context::PendingConnectedDownlink) {
+        use crate::context::ConnectedN2;
+        let (amf_ue_ngap_id, psi) = (item.amf_ue_ngap_id, item.pdu_session_id);
+        let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) else {
+            log::warn!("N1N2 transfer for UE {amf_ue_ngap_id} (PSI {psi}) dropped: no NG context");
+            return;
+        };
+        if state.is_cm_idle() {
+            self.page_for_queued_downlink(&state.amf_ue, item);
+            return;
+        }
+        let (association_id, ran_ue_ngap_id) = (state.association_id, state.ran_ue_ngap_id);
+        let result = match &item.n2 {
+            ConnectedN2::None | ConnectedN2::Release => {
+                self.deliver_n1_n2(
                     association_id,
-                    item.amf_ue_ngap_id,
+                    amf_ue_ngap_id,
                     ran_ue_ngap_id,
-                    Some(item.pdu_session_id),
-                    item.n2_release,
+                    Some(psi),
+                    item.n2 == ConnectedN2::Release,
                     item.n1.as_deref(),
                     crate::gmm_handler::payload_container_type::N1_SM_INFORMATION,
                 )
                 .await
-            {
-                log::warn!(
-                    "N1N2 transfer for UE {} (PSI {}) not sent: {e}",
-                    item.amf_ue_ngap_id,
-                    item.pdu_session_id
-                );
-            } else {
-                log::info!(
-                    "UE {}: N1N2 transfer for PSI {} delivered (release command: {}, N1: {})",
-                    item.amf_ue_ngap_id,
-                    item.pdu_session_id,
-                    item.n2_release,
-                    item.n1.is_some()
-                );
+            }
+            ConnectedN2::Setup(transfer) => {
+                self.send_pdu_session_setup(
+                    association_id,
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    psi,
+                    item.n1.as_deref(),
+                    transfer.clone(),
+                )
+                .await
+            }
+            ConnectedN2::Modify(transfer) => {
+                self.send_pdu_session_modify(
+                    association_id,
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    psi,
+                    item.n1.as_deref(),
+                    transfer,
+                )
+                .await
+            }
+        };
+        match result {
+            Ok(()) => log::info!(
+                "UE {amf_ue_ngap_id}: N1N2 transfer for PSI {psi} delivered (N2: {}, N1: {})",
+                item.n2.label(),
+                item.n1.is_some()
+            ),
+            Err(e) => {
+                log::warn!("N1N2 transfer for UE {amf_ue_ngap_id} (PSI {psi}) not sent: {e}")
             }
         }
+    }
+
+    /// Page a UE whose queued N1N2 transfer found it CM-IDLE (#757). The transfer
+    /// is kept in the paging context and delivered after the Service Request, as if
+    /// the SMF's request had arrived while the UE was idle.
+    fn page_for_queued_downlink(
+        &mut self,
+        amf_ue: &AmfUe,
+        item: crate::context::PendingConnectedDownlink,
+    ) {
+        use crate::context::ConnectedN2;
+        use crate::namf_handler::PagedN2;
+        let (n2, paged) = match item.n2 {
+            ConnectedN2::None => (None, PagedN2::Setup),
+            ConnectedN2::Release => (None, PagedN2::Release),
+            ConnectedN2::Setup(t) => (t, PagedN2::Setup),
+            ConnectedN2::Modify(t) => (Some(t), PagedN2::Modify),
+        };
+        let mut sess = {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.sess_find_by_psi(item.amf_ue_ngap_id, item.pdu_session_id)
+        };
+        crate::namf_handler::initiate_paging_for_idle_ue(
+            amf_ue,
+            sess.as_mut(),
+            item.n1,
+            n2,
+            paged,
+            Some(item.pdu_session_id),
+            item.failure_notify_uri.as_deref(),
+        );
+        if let Some(sess) = &sess {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.sess_update(sess);
+        }
+        log::info!(
+            "UE {}: went CM-IDLE before its N1N2 transfer for PSI {} was sent; paging it",
+            item.amf_ue_ngap_id,
+            item.pdu_session_id
+        );
+    }
+
+    /// The N1 SM message `n1` for `psi`, in a DOWNLINK NAS TRANSPORT protected
+    /// under the UE's NAS security context (TS 24.501 §8.2.11). `None` without
+    /// a security context.
+    fn protected_dl_nas_transport(
+        &mut self,
+        amf_ue_ngap_id: u64,
+        psi: u8,
+        n1: &[u8],
+    ) -> Option<Vec<u8>> {
+        let plain = gmm_build::build_dl_nas_transport(
+            Some(psi),
+            crate::gmm_handler::payload_container_type::N1_SM_INFORMATION,
+            n1,
+            None,
+            None,
+        )?;
+        self.protect_nas(amf_ue_ngap_id, &plain)
+    }
+
+    /// PDU SESSION RESOURCE SETUP REQUEST for a CM-CONNECTED UE (TS 38.413
+    /// §8.2.1) from an N1N2MessageTransfer `PDU_RES_SETUP_REQ` (#757).
+    ///
+    /// Without a transfer (smfd's downlink-data request names only the session),
+    /// the user plane is activated at the SMF first (upCnxState ACTIVATING,
+    /// TS 23.502 §4.2.3.3 step 4) and its answer is the transfer. The N1, if any,
+    /// is the message's NAS-PDU.
+    async fn send_pdu_session_setup(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        psi: u8,
+        n1: Option<&[u8]>,
+        transfer: Option<Vec<u8>>,
+    ) -> Result<()> {
+        let sess = {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.sess_find_by_psi(amf_ue_ngap_id, psi)
+        };
+        let Some(sess) = sess else {
+            anyhow::bail!("PSI {psi} has no PDU session at the AMF");
+        };
+        let transfer = match transfer {
+            Some(t) => t,
+            None => {
+                let Some(sm_ref) = self
+                    .sm_context_refs
+                    .get(&(amf_ue_ngap_id, psi))
+                    .cloned()
+                    .or(sess.sm_context_ref.clone())
+                else {
+                    anyhow::bail!("PSI {psi} has no SM context to activate");
+                };
+                let (smf_host, smf_port) = self.smf_target_for(amf_ue_ngap_id, psi);
+                crate::sbi_path::call_smf_activate_up_connection(&smf_host, smf_port, &sm_ref)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("PSI {psi} UP activation failed: {e}"))?
+            }
+        };
+        let nas = match n1 {
+            Some(n1) => Some(
+                self.protected_dl_nas_transport(amf_ue_ngap_id, psi, n1)
+                    .ok_or_else(|| anyhow::anyhow!("no NAS security context for the N1"))?,
+            ),
+            None => None,
+        };
+        let pdu = crate::ngap_asn1::build_pdu_session_resource_setup_request_asn1(
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            psi,
+            sess.s_nssai.sst,
+            sess.s_nssai.sd,
+            nas.as_deref(),
+            &transfer,
+        )
+        .ok_or_else(|| anyhow::anyhow!("PSI {psi} PDU Session Resource Setup did not encode"))?;
+        self.send_to_association(association_id, &pdu).await
+    }
+
+    /// PDU SESSION RESOURCE MODIFY REQUEST (TS 38.413 §8.2.3) for a network-
+    /// requested PDU Session Modification (TS 23.502 §4.3.3.2 step 4, #757). The
+    /// N1 PDU SESSION MODIFICATION COMMAND is the item's NAS-PDU.
+    async fn send_pdu_session_modify(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        psi: u8,
+        n1: Option<&[u8]>,
+        transfer: &[u8],
+    ) -> Result<()> {
+        let nas = match n1 {
+            Some(n1) => Some(
+                self.protected_dl_nas_transport(amf_ue_ngap_id, psi, n1)
+                    .ok_or_else(|| anyhow::anyhow!("no NAS security context for the N1"))?,
+            ),
+            None => None,
+        };
+        let pdu = crate::ngap_asn1::build_pdu_session_resource_modify_request_asn1(
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            psi,
+            nas.as_deref(),
+            transfer,
+        )
+        .ok_or_else(|| anyhow::anyhow!("PSI {psi} PDU Session Resource Modify did not encode"))?;
+        self.send_to_association(association_id, &pdu).await
     }
 
     async fn process_network_deregs(&mut self) {
