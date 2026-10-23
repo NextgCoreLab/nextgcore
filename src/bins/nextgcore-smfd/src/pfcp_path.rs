@@ -1039,6 +1039,8 @@ impl PfcpClient {
     /// Previously this cleared the map, logged a count, and left every AMF
     /// believing in contexts that could not carry a packet.
     async fn teardown_association(&self, reason: &str) {
+        #[cfg(test)]
+        assert_teardown_is_serialised();
         let notified = crate::restoration::notify_sessions_unrecoverable(reason).await;
         // #687: the EPC PDN connections on this PGW-U, which have no SM context.
         let epc_released = crate::restoration::release_epc_pdn_connections(reason).await;
@@ -1237,6 +1239,31 @@ pub fn clear_pfcp_sessions() -> usize {
 /// that wants both must take the ambient one itself and let the stand-in take this.
 #[cfg(test)]
 pub(crate) static N4_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// #723: a test that reaches [`PfcpClient::teardown_association`] must hold BOTH
+/// [`crate::context::PROCESS_STATE_TEST_LOCK`] and [`N4_TEST_LOCK`].
+///
+/// The teardown is process-wide: it POSTs to every seeded session's AMF callback
+/// (the policy bindings, under the ambient lock), deletes every EPC PDN connection,
+/// and empties the global `pfcp_sessions` map (under this one). The #665 hostname
+/// test reached it holding neither, and wiped the #672 restoration test's session
+/// mid-assertion 20 runs out of 20.
+///
+/// A lock cannot say WHO holds it, so this catches the omission whenever the
+/// offending test runs with nobody else holding the locks — always under
+/// `--test-threads=1`, and when the test is run on its own — rather than leaving it
+/// to show up as a sibling's flake.
+#[cfg(test)]
+fn assert_teardown_is_serialised() {
+    assert!(
+        crate::context::PROCESS_STATE_TEST_LOCK.try_lock().is_err(),
+        "a test reached teardown_association without PROCESS_STATE_TEST_LOCK (#723)"
+    );
+    assert!(
+        N4_TEST_LOCK.try_lock().is_err(),
+        "a test reached teardown_association without N4_TEST_LOCK (#723)"
+    );
+}
 
 /// A PFCP-answering UPF stand-in for tests (issue #289).
 ///
@@ -1895,6 +1922,11 @@ mod tests {
     /// went to the dead address forever.
     #[tokio::test]
     async fn a_upf_named_by_hostname_is_found_again_at_its_new_address() {
+        // #723: reaches `teardown_association`, which is process-wide (AMF
+        // callbacks, EPC PDN connections, the `pfcp_sessions` map). Documented
+        // order: ambient state first, N4 second.
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
         // The old UPF incarnation: associates once, then dies.
         let old_upf = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let old_addr = old_upf.local_addr().unwrap();
@@ -2067,8 +2099,10 @@ mod tests {
     /// Time Stamp must tear the association down (peer restarted).
     #[tokio::test]
     async fn test_heartbeat_detects_peer_restart() {
-        // Serialised: this test can reach a teardown, which flushes the
-        // process-global session map (see N4_TEST_LOCK).
+        // #723: reaches `teardown_association`, which is process-wide (AMF
+        // callbacks, EPC PDN connections, the `pfcp_sessions` map). Documented
+        // order: ambient state first, N4 second.
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _map_guard = N4_TEST_LOCK.lock().await;
         let (client, upf) = make_client_with_peer().await;
         {
@@ -2129,8 +2163,10 @@ mod tests {
     /// the association.
     #[tokio::test]
     async fn test_inbound_association_release() {
-        // Serialised: this test can reach a teardown, which flushes the
-        // process-global session map (see N4_TEST_LOCK).
+        // #723: reaches `teardown_association`, which is process-wide (AMF
+        // callbacks, EPC PDN connections, the `pfcp_sessions` map). Documented
+        // order: ambient state first, N4 second.
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _map_guard = N4_TEST_LOCK.lock().await;
         let (client, upf) = make_client_with_peer().await;
         client.assoc.write().await.associated = true;
@@ -2332,9 +2368,10 @@ mod tests {
     /// itself proves nothing.
     #[tokio::test]
     async fn the_sync_association_gauge_follows_the_wire_association() {
-        // `install_stand_in_upf` already holds `N4_TEST_LOCK` for the life of `upf`,
-        // which is the serialisation `teardown_association` below needs (it flushes the
-        // process-global session map). Taking a second guard here would deadlock.
+        // #723: `teardown_association` below is process-wide, so the ambient lock is
+        // taken first; `install_stand_in_upf` then takes `N4_TEST_LOCK` for the life
+        // of `upf`. Taking N4 here as well would deadlock.
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let upf = stand_in::install_stand_in_upf().await;
         // Before Association Setup: honestly zero, which is what makes the gate fail on
         // a PGW-C whose Sxb never came up rather than pass it.
@@ -2369,8 +2406,10 @@ mod tests {
     /// from 1) is not stuck behind the old high-watermark.
     #[tokio::test]
     async fn test_teardown_clears_load_state() {
-        // Serialised: this test can reach a teardown, which flushes the
-        // process-global session map (see N4_TEST_LOCK).
+        // #723: reaches `teardown_association`, which is process-wide (AMF
+        // callbacks, EPC PDN connections, the `pfcp_sessions` map). Documented
+        // order: ambient state first, N4 second.
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _map_guard = N4_TEST_LOCK.lock().await;
         let (client, _upf) = make_client_with_peer().await;
         client

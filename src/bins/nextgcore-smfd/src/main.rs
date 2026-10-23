@@ -5132,6 +5132,11 @@ struct GsmProcedureTimer {
 /// One per context: TS 24.501 runs at most one network-requested 5GSM procedure
 /// per PDU session at a time, so a second armed timer for the same context would
 /// mean the SMF had started a procedure it should have queued.
+///
+/// Tests: guarded by [`crate::context::PROCESS_STATE_TEST_LOCK`], not a lock of its
+/// own (#723). The tests that arm a timer through a real procedure already hold it,
+/// and `expire_gsm_timers` walks EVERY entry: a test that drives it to exhaustion
+/// without the lock drops a sibling's T3592 mid-assertion.
 static GSM_PROCEDURE_TIMERS: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, GsmProcedureTimer>>,
 > = std::sync::OnceLock::new();
@@ -10470,6 +10475,9 @@ mod tests {
 
     #[test]
     fn gsm_timers_retransmit_then_exhaust() {
+        // #723: the far-future expiry passes below exhaust EVERY armed timer in the
+        // process, not just this one -- a sibling's T3592 included.
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.blocking_lock();
         let reference = "n77-timer";
         // Clear any residue from another test using the same key.
         gsm_procedure_timers()
@@ -10493,7 +10501,9 @@ mod tests {
         );
 
         // Nothing is due before the deadline.
-        assert!(expire_gsm_timers(std::time::Instant::now()).is_empty());
+        assert!(!expire_gsm_timers(std::time::Instant::now())
+            .iter()
+            .any(|(r, _, _)| r == reference));
 
         // TS 24.501 Table 10.3.2: 4 retransmissions, then the procedure is
         // abandoned. Driven by advancing the clock rather than by sleeping 16 s
