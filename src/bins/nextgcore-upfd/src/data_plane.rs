@@ -1174,6 +1174,91 @@ impl UrrOutcome {
     }
 }
 
+/// The time-based measurement of one URR (#820, TS 29.244 §5.2.2.2).
+///
+/// Measured time runs from the first packet -- or from provisioning, when the CP
+/// function set ISTM (Immediate Start Time Metering, §8.2.68) -- and, when an
+/// Inactivity Detection Time (§8.2.18) is provisioned, is suspended once no packet
+/// has been received for that long (the inactivity time itself counts), and resumes
+/// with the next packet. Without one (or with zero), it runs continuously.
+///
+/// The time threshold, time quota and usage reports each count from their own point
+/// on this ONE measured clock, so a report re-bases its anchor without disturbing the
+/// others (TS 29.244 §5.2.2.3.1).
+#[derive(Debug, Default)]
+pub struct TimeMeter {
+    /// Inactivity Detection Time; `None` (or zero) = measure continuously.
+    idt: Option<std::time::Duration>,
+    /// Start of the current metering segment, while metering.
+    running_since: Option<std::time::Instant>,
+    /// Last packet while metering.
+    last_pkt: Option<std::time::Instant>,
+    /// Measured time of the closed segments.
+    accumulated: std::time::Duration,
+    /// Measured time at which the time THRESHOLD count starts.
+    thr_anchor: std::time::Duration,
+    /// Measured time at which the time QUOTA count starts.
+    quota_anchor: std::time::Duration,
+    /// Measured time at the last usage report (the ongoing measurement's start).
+    report_anchor: std::time::Duration,
+}
+
+impl TimeMeter {
+    /// Measured time up to `now`.
+    fn measured(&self, now: std::time::Instant) -> std::time::Duration {
+        let running = self
+            .running_since
+            .map_or(std::time::Duration::ZERO, |start| {
+                let end = match (self.idt, self.last_pkt) {
+                    (Some(idt), Some(last)) if !idt.is_zero() => (last + idt).min(now),
+                    _ => now,
+                };
+                end.saturating_duration_since(start)
+            });
+        self.accumulated + running
+    }
+
+    /// A packet at `now`: start metering, or resume it after an inactivity gap.
+    fn on_packet(&mut self, now: std::time::Instant) {
+        match (self.running_since, self.idt, self.last_pkt) {
+            (None, _, _) => self.running_since = Some(now),
+            (Some(start), Some(idt), Some(last)) if !idt.is_zero() && now > last + idt => {
+                // The gap suspended metering at last + IDT; close that segment and open
+                // a new one at this packet.
+                self.accumulated += (last + idt).saturating_duration_since(start);
+                self.running_since = Some(now);
+            }
+            _ => {}
+        }
+        self.last_pkt = Some(now);
+    }
+
+    /// ISTM: start metering now, without waiting for a packet.
+    fn start_now(&mut self, now: std::time::Instant) {
+        if self.running_since.is_none() {
+            self.running_since = Some(now);
+            self.last_pkt = Some(now);
+        }
+    }
+
+    /// Re-provision the Inactivity Detection Time, closing the segment measured so
+    /// far under the old one first.
+    fn set_idt(&mut self, idt: Option<std::time::Duration>, now: std::time::Instant) {
+        if self.running_since.is_some() {
+            let suspended = matches!(
+                (self.idt, self.last_pkt),
+                (Some(i), Some(last)) if !i.is_zero() && now > last + i
+            );
+            self.accumulated = self.measured(now);
+            // A suspended meter stays suspended (the next packet resumes it); a running
+            // one continues from now under the new IDT.
+            self.running_since = (!suspended).then_some(now);
+            self.last_pkt = (!suspended).then_some(now);
+        }
+        self.idt = idt;
+    }
+}
+
 /// Lightweight URR for usage reporting in the data plane
 #[derive(Debug)]
 pub struct DataPlaneUrr {
@@ -1229,9 +1314,6 @@ pub struct DataPlaneUrr {
     quota_used_total: AtomicU64,
     quota_used_ul: AtomicU64,
     quota_used_dl: AtomicU64,
-    /// First packet since the quota was provisioned, for the Time Quota (§8.2.41) --
-    /// separate from `first_pkt_time`, which every report resets.
-    quota_first_pkt_time: RwLock<Option<std::time::Instant>>,
     /// Volume counted toward the volume THRESHOLDS: since the last threshold-triggered
     /// report or the last (re-)provisioning of a threshold. A non-threshold report
     /// (PERIO, query, quota) leaves it running -- §5.2.2.3.1's "adjust the thresholds
@@ -1240,12 +1322,12 @@ pub struct DataPlaneUrr {
     thr_used_total: AtomicU64,
     thr_used_ul: AtomicU64,
     thr_used_dl: AtomicU64,
-    /// Start of the TIME-threshold measurement (#842 review): re-based only by a
-    /// threshold-triggered report or a changed Time Threshold, NOT by every report.
-    /// Measuring it from `last_report_time` let each PERIO/query/quota report postpone
-    /// the time threshold, so with a Measurement Period shorter than it, TIMTH never
-    /// fired at all.
-    thr_time_start: std::sync::Mutex<std::time::Instant>,
+    /// The MEASURED time of this URR (#820, TS 29.244 §5.2.2.2) and the points on it
+    /// the time threshold, the time quota and the last report are counted from. Time
+    /// thresholds and quotas compare against measured time, not wall time since some
+    /// event: metering starts at the first packet (or at once, with ISTM), and is
+    /// suspended after an Inactivity Detection Time with no packets.
+    meter: std::sync::Mutex<TimeMeter>,
     /// Raised by `record()` when the TIME threshold is crossed, so the report says
     /// TIMTH (#842 review); cleared by every report.
     time_threshold_hit: AtomicBool,
@@ -1372,10 +1454,10 @@ impl DataPlaneUrr {
             return Some(UrrReportReason::VolumeQuota);
         }
         let time = self.time_quota_secs().is_some_and(|q| {
-            self.quota_first_pkt_time
-                .read()
-                .unwrap()
-                .is_some_and(|first| first.elapsed().as_secs() >= q as u64)
+            let m = self.meter.lock().unwrap();
+            m.measured(std::time::Instant::now())
+                .saturating_sub(m.quota_anchor)
+                >= std::time::Duration::from_secs(q as u64)
         });
         time.then_some(UrrReportReason::TimeQuota)
     }
@@ -1480,7 +1562,8 @@ impl DataPlaneUrr {
     }
 
     fn rebase_time_quota_to_ongoing(&self) {
-        *self.quota_first_pkt_time.write().unwrap() = *self.first_pkt_time.read().unwrap();
+        let mut m = self.meter.lock().unwrap();
+        m.quota_anchor = m.report_anchor;
     }
 
     /// The same for a newly received volume threshold.
@@ -1497,10 +1580,8 @@ impl DataPlaneUrr {
     /// The same for a newly received time threshold: measured from the start of the
     /// ongoing measurement (the last report).
     fn rebase_time_threshold_to_ongoing(&self) {
-        let start = self
-            .last_report_time()
-            .unwrap_or_else(std::time::Instant::now);
-        *self.thr_time_start.lock().unwrap() = start;
+        let mut m = self.meter.lock().unwrap();
+        m.thr_anchor = m.report_anchor;
     }
 
     fn volume(slot: &AtomicU64) -> Option<u64> {
@@ -1662,11 +1743,10 @@ impl DataPlaneUrr {
             quota_used_total: AtomicU64::new(0),
             quota_used_ul: AtomicU64::new(0),
             quota_used_dl: AtomicU64::new(0),
-            quota_first_pkt_time: RwLock::new(None),
             thr_used_total: AtomicU64::new(0),
             thr_used_ul: AtomicU64::new(0),
             thr_used_dl: AtomicU64::new(0),
-            thr_time_start: std::sync::Mutex::new(std::time::Instant::now()),
+            meter: std::sync::Mutex::new(TimeMeter::default()),
             time_threshold_hit: AtomicBool::new(false),
             first_pkt_time: RwLock::new(None),
             last_report_time: RwLock::new(Some(std::time::Instant::now())),
@@ -1764,23 +1844,22 @@ impl DataPlaneUrr {
         // first packet is recorded even for a session whose very first packet crosses
         // something -- a usage report with no Time of First Packet is a report the CP
         // function cannot place in a billing window.
-        for slot in [&self.first_pkt_time, &self.quota_first_pkt_time] {
-            let mut fpt = slot.write().unwrap();
+        {
+            let mut fpt = self.first_pkt_time.write().unwrap();
             if fpt.is_none() {
                 *fpt = Some(std::time::Instant::now());
             }
         }
+        self.meter
+            .lock()
+            .unwrap()
+            .on_packet(std::time::Instant::now());
 
         // ---- Volume quotas: per direction, then total (§8.2.40) ----
         let volume_quota_hit = dir_quota.is_some_and(|q| directional >= q)
             || self.volume_quota_total().is_some_and(|q| total >= q);
-        // ---- Time quota (§8.2.41): measured duration since the first packet ----
-        let time_quota_hit = self.time_quota_secs().is_some_and(|q| {
-            self.quota_first_pkt_time
-                .read()
-                .unwrap()
-                .is_some_and(|first| first.elapsed().as_secs() >= q as u64)
-        });
+        // ---- Time quota (§8.2.41): MEASURED time since the grant (#820) ----
+        let time_quota_hit = self.time_quota_used().is_some_and(|(used, q)| used >= q);
 
         if already_exhausted {
             // Latched by an earlier packet: dropped, not re-reported. Checked BEFORE
@@ -1815,13 +1894,10 @@ impl DataPlaneUrr {
         }
 
         // Check time threshold
-        if let Some(time_thresh) = self.time_threshold_secs() {
-            let start = *self.thr_time_start.lock().unwrap();
-            if start.elapsed() >= std::time::Duration::from_secs(time_thresh as u64) {
-                self.time_threshold_hit.store(true, Ordering::Relaxed);
-                self.threshold_exceeded.store(true, Ordering::Relaxed);
-                outcome = UrrOutcome::ThresholdExceeded;
-            }
+        if self.time_threshold_crossed() {
+            self.time_threshold_hit.store(true, Ordering::Relaxed);
+            self.threshold_exceeded.store(true, Ordering::Relaxed);
+            outcome = UrrOutcome::ThresholdExceeded;
         }
 
         outcome
@@ -1874,8 +1950,17 @@ impl DataPlaneUrr {
             .fetch_sub(usage.total_bytes(), Ordering::AcqRel);
         self.acc_total_pkts
             .fetch_sub(usage.total_pkts(), Ordering::AcqRel);
+        {
+            // #820: the next report's measurement starts here on the measured clock; a
+            // threshold report re-applies the time threshold from here too.
+            let mut m = self.meter.lock().unwrap();
+            let now = m.measured(std::time::Instant::now());
+            m.report_anchor = now;
+            if threshold_report {
+                m.thr_anchor = now;
+            }
+        }
         if threshold_report {
-            *self.thr_time_start.lock().unwrap() = std::time::Instant::now();
             // Read AFTER the swaps: a packet whose bytes this report took has already
             // added to these counters, so it is subtracted; one recorded after the read
             // stays, counting toward the re-applied threshold.
@@ -1890,7 +1975,96 @@ impl DataPlaneUrr {
     /// Why this URR must report now, or `None` (#821): a crossed threshold or quota
     /// (the flag `record()` raises), else an elapsed Measurement Period with usage
     /// counted (PERIO).
+    /// `(measured time since the time quota was granted, the quota)`, if one is
+    /// provisioned (#820).
+    fn time_quota_used(&self) -> Option<(std::time::Duration, std::time::Duration)> {
+        let q = std::time::Duration::from_secs(self.time_quota_secs()? as u64);
+        let m = self.meter.lock().unwrap();
+        Some((
+            m.measured(std::time::Instant::now())
+                .saturating_sub(m.quota_anchor),
+            q,
+        ))
+    }
+
+    /// Whether the measured time since the time threshold was (re-)applied has
+    /// reached it (#820).
+    fn time_threshold_crossed(&self) -> bool {
+        let Some(t) = self.time_threshold_secs() else {
+            return false;
+        };
+        let m = self.meter.lock().unwrap();
+        m.measured(std::time::Instant::now())
+            .saturating_sub(m.thr_anchor)
+            >= std::time::Duration::from_secs(t as u64)
+    }
+
+    /// Evaluate the TIME limits now, without waiting for a packet (#820): measured time
+    /// keeps running between packets (continuously, or until the Inactivity Detection
+    /// Time), so a time threshold or quota can be reached by a UE that sends nothing.
+    /// Before, both were checked only in `record()`, so an idle UE's TIMTH never fired
+    /// and its time quota was enforced only when its next packet arrived. Run on every
+    /// harvest tick (1 s).
+    fn evaluate_time_limits(&self) {
+        if !self.is_quota_exhausted() && self.time_quota_used().is_some_and(|(used, q)| used >= q) {
+            self.quota_exhausted.store(true, Ordering::Relaxed);
+            self.threshold_exceeded.store(true, Ordering::Relaxed);
+            log::info!(
+                "URR {} time quota exhausted on the measured clock: matching traffic stops \
+                 being forwarded (TS 29.244 §5.2.2.2)",
+                self.urr_id
+            );
+        }
+        if self.time_threshold_crossed() {
+            self.time_threshold_hit.store(true, Ordering::Relaxed);
+            self.threshold_exceeded.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Provision the time metering (#820): the Inactivity Detection Time (§8.2.18;
+    /// `None` or 0 = continuous) and ISTM (Immediate Start Time Metering, §8.2.68: start
+    /// metering now instead of at the first packet).
+    pub fn set_time_metering(&self, inactivity_detection_secs: Option<u32>, immediate_start: bool) {
+        let now = std::time::Instant::now();
+        let mut m = self.meter.lock().unwrap();
+        m.set_idt(
+            inactivity_detection_secs.map(|s| std::time::Duration::from_secs(s as u64)),
+            now,
+        );
+        if immediate_start {
+            m.start_now(now);
+        }
+    }
+
+    /// Apply an Update URR's time-metering IEs (#820, §7.5.4): an absent Inactivity
+    /// Detection Time is unchanged; ISTM starts metering now.
+    pub fn update_time_metering(
+        &self,
+        inactivity_detection_secs: Option<u32>,
+        immediate_start: bool,
+    ) {
+        let now = std::time::Instant::now();
+        let mut m = self.meter.lock().unwrap();
+        if let Some(s) = inactivity_detection_secs {
+            m.set_idt(Some(std::time::Duration::from_secs(s as u64)), now);
+        }
+        if immediate_start {
+            m.start_now(now);
+        }
+    }
+
+    /// Move measured time on by `by`, as if it had been metered (tests).
+    #[cfg(test)]
+    pub(crate) fn advance_measured(&self, by: std::time::Duration) {
+        let mut m = self.meter.lock().unwrap();
+        if m.running_since.is_none() {
+            m.running_since = Some(std::time::Instant::now());
+        }
+        m.accumulated += by;
+    }
+
     pub fn report_due(&self) -> Option<UrrReportReason> {
+        self.evaluate_time_limits();
         // #80: an exhausted quota is reported as a QUOTA report, not as a threshold
         // report -- that is what tells the CP function the subscriber is being DROPPED.
         if self.threshold_exceeded.load(Ordering::SeqCst) {
@@ -1907,6 +2081,7 @@ impl DataPlaneUrr {
     /// Like [`Self::report_due`], but CLAIMS a periodic report (advancing the period
     /// schedule), for the path that is about to take the usage (#772).
     pub fn claim_report(&self) -> Option<UrrReportReason> {
+        self.evaluate_time_limits();
         if self.threshold_exceeded.load(Ordering::SeqCst) {
             return Some(self.report_reason());
         }
@@ -5969,9 +6144,8 @@ mod tests {
         urr.set_quotas(None, None, None, Some(1));
         // Not yet: no time has passed.
         assert_eq!(urr.record(10, true), UrrOutcome::Continue);
-        // Backdate the first packet since the quota was granted past the quota.
-        *urr.quota_first_pkt_time.write().unwrap() =
-            Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
+        // 5 s of measured time pass (instead of sleeping through them).
+        urr.advance_measured(std::time::Duration::from_secs(5));
         assert_eq!(urr.record(10, true), UrrOutcome::QuotaJustExhausted);
         assert_eq!(
             urr.report_reason(),
@@ -6223,14 +6397,14 @@ mod tests {
 
         assert_eq!(quota.record(900, true), UrrOutcome::Continue);
         assert_eq!(threshold.record(900, true), UrrOutcome::Continue);
-        let first_pkt = *quota.quota_first_pkt_time.read().unwrap();
+        let quota_anchor = quota.meter.lock().unwrap().quota_anchor;
         // The query: both URRs report and reset their measurement.
         let queried = dp.take_urr_reports(0x842, None);
         assert_eq!(queried.iter().map(|r| r.total_bytes).sum::<u64>(), 1800);
         assert_eq!(
-            *quota.quota_first_pkt_time.read().unwrap(),
-            first_pkt,
-            "the time quota keeps measuring from the first packet since the grant"
+            quota.meter.lock().unwrap().quota_anchor,
+            quota_anchor,
+            "the time quota keeps measuring from its grant, not from the query"
         );
 
         assert_eq!(
@@ -6279,11 +6453,11 @@ mod tests {
     fn a_query_does_not_postpone_the_time_threshold() {
         let urr = DataPlaneUrr::new(1);
         urr.set_reporting(None, None, None, Some(2), None);
-        // Move the time-threshold clock 1.5 s back instead of sleeping.
-        *urr.thr_time_start.lock().unwrap() -= std::time::Duration::from_millis(1500);
+        // 1.5 s of measured time instead of sleeping.
         assert_eq!(urr.record(10, true), UrrOutcome::Continue);
+        urr.advance_measured(std::time::Duration::from_millis(1500));
         let _ = urr.take_usage(); // the query (a non-threshold report)
-        *urr.thr_time_start.lock().unwrap() -= std::time::Duration::from_millis(800);
+        urr.advance_measured(std::time::Duration::from_millis(800));
         assert_eq!(
             urr.record(10, true),
             UrrOutcome::ThresholdExceeded,
@@ -6319,18 +6493,10 @@ mod tests {
         t.set_quotas(None, None, None, Some(2));
         assert_eq!(t.record(10, true), UrrOutcome::Continue);
         // 1 s of the 2 s used, then a report.
-        *t.quota_first_pkt_time.write().unwrap() =
-            Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        t.advance_measured(std::time::Duration::from_secs(1));
         let _ = t.take_usage();
         t.update_quotas(Some(1_000_000), None, None, None);
-        // Value first, in its own statement: a read guard alive across the write
-        // would self-deadlock (the #724 class).
-        let earlier = t
-            .quota_first_pkt_time
-            .read()
-            .unwrap()
-            .map(|f| f - std::time::Duration::from_millis(1100));
-        *t.quota_first_pkt_time.write().unwrap() = earlier;
+        t.advance_measured(std::time::Duration::from_millis(1100));
         assert_eq!(
             t.record(10, true),
             UrrOutcome::QuotaJustExhausted,
@@ -6345,7 +6511,7 @@ mod tests {
     fn a_crossed_time_threshold_reports_as_timth() {
         let urr = DataPlaneUrr::new(1);
         urr.set_reporting(Some(1_000_000), None, None, Some(2), None);
-        *urr.thr_time_start.lock().unwrap() -= std::time::Duration::from_secs(3);
+        urr.advance_measured(std::time::Duration::from_secs(3));
         assert_eq!(urr.record(10, true), UrrOutcome::ThresholdExceeded);
         assert_eq!(urr.report_due(), Some(UrrReportReason::TimeThreshold));
         let _ = urr.take_usage_for_threshold();
@@ -6369,6 +6535,110 @@ mod tests {
         assert_eq!(urr.volume_quota_ul(), None);
         assert_eq!(urr.time_threshold_secs(), Some(60), "absent IE unchanged");
         assert_eq!(urr.measurement_period_secs(), Some(30));
+    }
+
+    fn dp_with_urr(seid: u64, urr: &Arc<DataPlaneUrr>) -> DataPlane {
+        let dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        dp.add_session_from_pfcp(
+            seid,
+            seid + 0x1000,
+            Ipv4Addr::new(10, 45, 8, (seid & 0xff) as u8),
+            (seid as u32) << 4,
+            ((seid as u32) << 4) + 1,
+            "127.0.0.1:2152".parse().unwrap(),
+            Some(5),
+            Some(9),
+        );
+        dp.sessions
+            .find_by_seid(seid)
+            .unwrap()
+            .urrs
+            .write()
+            .unwrap()
+            .insert(urr.urr_id, Arc::clone(urr));
+        dp
+    }
+
+    /// #820: an IDLE UE's time threshold and time quota are evaluated on the harvest
+    /// tick. Measured time runs between packets (continuously, without an Inactivity
+    /// Detection Time), so a UE that sends nothing still reaches them; before, both were
+    /// checked only when a packet arrived, so TIMTH never fired for an idle UE and its
+    /// time quota was enforced only by its next packet.
+    #[test]
+    fn time_limits_are_reached_by_an_idle_ue_on_the_harvest_tick() {
+        let thr = Arc::new(DataPlaneUrr::new(1));
+        thr.set_reporting(None, None, None, Some(2), None);
+        let dp = dp_with_urr(0x820, &thr);
+        assert_eq!(thr.record(10, true), UrrOutcome::Continue);
+        thr.advance_measured(std::time::Duration::from_secs(3)); // no packet since
+        assert_eq!(dp.due_urr_sessions().len(), 1, "due without a packet");
+        let reports = dp.collect_urr_reports();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].trigger, UrrReportReason::TimeThreshold);
+
+        let quota = Arc::new(DataPlaneUrr::new(2));
+        quota.set_quotas(None, None, None, Some(2));
+        let dp = dp_with_urr(0x821, &quota);
+        assert_eq!(quota.record(10, true), UrrOutcome::Continue);
+        quota.advance_measured(std::time::Duration::from_secs(3));
+        let reports = dp.collect_urr_reports();
+        assert_eq!(reports.len(), 1, "the exhaustion is reported on the tick");
+        assert_eq!(reports[0].trigger, UrrReportReason::TimeQuota);
+        assert!(quota.is_quota_exhausted(), "and gates the next packet");
+        assert_eq!(quota.record(10, true), UrrOutcome::QuotaAlreadyExhausted);
+    }
+
+    /// #820 (TS 29.244 §5.2.2.2): with an Inactivity Detection Time, measured time stops
+    /// once no packet has arrived for that long (the IDT itself counts) and resumes with
+    /// the next packet. 10 s of silence under a 2 s IDT is 2 s of measured time.
+    #[test]
+    fn an_inactivity_detection_time_suspends_time_measurement() {
+        let urr = DataPlaneUrr::new(1);
+        urr.set_time_metering(Some(2), false);
+        urr.set_quotas(None, None, None, Some(5));
+        assert_eq!(urr.record(10, true), UrrOutcome::Continue);
+        {
+            let mut m = urr.meter.lock().unwrap();
+            let ten_ago = std::time::Instant::now() - std::time::Duration::from_secs(10);
+            m.running_since = Some(ten_ago);
+            m.last_pkt = Some(ten_ago);
+        }
+        let measured = urr
+            .meter
+            .lock()
+            .unwrap()
+            .measured(std::time::Instant::now());
+        assert!(
+            measured >= std::time::Duration::from_secs(2)
+                && measured < std::time::Duration::from_millis(2100),
+            "metering suspended after the IDT: {measured:?}"
+        );
+        assert_eq!(
+            urr.record(10, true),
+            UrrOutcome::Continue,
+            "2 s measured, under the 5 s time quota (10 s of wall time would have exhausted it)"
+        );
+    }
+
+    /// #820 (§5.2.2.2): time metering starts at the FIRST PACKET -- unless the CP
+    /// function set ISTM (Immediate Start Time Metering), which starts it at once.
+    #[test]
+    fn time_metering_starts_at_the_first_packet_or_immediately_with_istm() {
+        let lazy = DataPlaneUrr::new(1);
+        lazy.set_time_metering(None, false);
+        assert!(
+            lazy.meter.lock().unwrap().running_since.is_none(),
+            "not before a packet"
+        );
+        lazy.record(10, true);
+        assert!(lazy.meter.lock().unwrap().running_since.is_some());
+
+        let eager = DataPlaneUrr::new(2);
+        eager.set_time_metering(None, true);
+        assert!(
+            eager.meter.lock().unwrap().running_since.is_some(),
+            "ISTM starts metering without a packet"
+        );
     }
 
     /// #842 review (decision): a packet dropped because the quota is ALREADY exhausted

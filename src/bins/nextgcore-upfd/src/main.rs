@@ -1014,6 +1014,11 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                                 u.volume_quota_dl,
                                 u.time_quota_secs,
                             );
+                            // #820: how TIME is measured (§5.2.2.2).
+                            urr.set_time_metering(
+                                u.inactivity_detection_secs,
+                                u.immediate_start_time_metering,
+                            );
                             dp_urrs.insert(u.urr_id, Arc::new(urr));
                         }
                         *session.urrs.write().unwrap() = dp_urrs;
@@ -1170,6 +1175,11 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                             u.volume_quota_dl,
                             u.time_quota_secs,
                         );
+                        // #820: how TIME is measured (§5.2.2.2).
+                        urr.set_time_metering(
+                            u.inactivity_detection_secs,
+                            u.immediate_start_time_metering,
+                        );
                         dp_urrs.insert(u.urr_id, Arc::new(urr));
                     }
                     log::info!(
@@ -1202,6 +1212,10 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                                 // forwarding. That is what makes a quota a quota rather
                                 // than a teardown, and it is the reason the latch lives
                                 // where a re-provision can reach it.
+                                urr.update_time_metering(
+                                    u.inactivity_detection_secs,
+                                    u.immediate_start_time_metering,
+                                );
                                 urr.update_quotas(
                                     u.volume_quota_total,
                                     u.volume_quota_ul,

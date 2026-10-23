@@ -136,6 +136,10 @@ pub mod pfcp_ie {
     /// no cadence and `DataPlaneUrr::measurement_period_secs`'s only reader could
     /// never fire.
     pub const MEASUREMENT_PERIOD: u16 = 64;
+    /// Inactivity Detection Time (§8.2.18), u32 seconds.
+    pub const INACTIVITY_DETECTION_TIME: u16 = 36;
+    /// Measurement Information (§8.2.68); bit 4 of octet 5 is ISTM.
+    pub const MEASUREMENT_INFORMATION: u16 = 100;
     pub const VOLUME_MEASUREMENT: u16 = 66;
     pub const DURATION_MEASUREMENT: u16 = 67;
     pub const TIME_OF_FIRST_PACKET: u16 = 69;
@@ -1691,6 +1695,22 @@ pub fn parse_create_urr(data: &[u8]) -> Result<ParsedCreateUrr, &'static str> {
         }
     }
 
+    // #820: Inactivity Detection Time (§8.2.18) and ISTM (Measurement Information
+    // §8.2.68 octet 5 bit 4), which define how TIME is measured (§5.2.2.2).
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::INACTIVITY_DETECTION_TIME) {
+        if ie.value.len() >= 4 {
+            urr.inactivity_detection_secs = Some(u32::from_be_bytes([
+                ie.value[0],
+                ie.value[1],
+                ie.value[2],
+                ie.value[3],
+            ]));
+        }
+    }
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::MEASUREMENT_INFORMATION) {
+        urr.immediate_start_time_metering = ie.value.first().is_some_and(|b| b & 0x08 != 0);
+    }
+
     // Volume Threshold (IE type 31, TS 29.244 §8.2.13) - flags + values.
     // #80: through the shared `parse_volume_ie`, which Volume Quota also uses — the
     // two IEs have the same body and differ only in what the UP function does at the
@@ -1804,6 +1824,10 @@ pub struct ParsedCreateUrr {
     pub time_threshold_secs: Option<u32>,
     /// Measurement Period (IE type 64), the PERIO trigger's cadence.
     pub measurement_period_secs: Option<u32>,
+    /// Inactivity Detection Time (IE 36, §8.2.18), seconds (#820).
+    pub inactivity_detection_secs: Option<u32>,
+    /// ISTM, Immediate Start Time Metering (Measurement Information IE 100) (#820).
+    pub immediate_start_time_metering: bool,
     /// Volume Quota (IE type 73, TS 29.244 §8.2.40) — the volume at which the UP
     /// function STOPS FORWARDING the matching traffic, as distinct from the
     /// threshold at which it merely reports (#80, §5.2.2.2.2).
@@ -2852,5 +2876,26 @@ mod tests {
         // the bit to 0 to turn reflective QoS off for the flow).
         let explicit_off = parse_create_qer(&qer_ies(&[ie(123, &[0x00])])).expect("QER parses");
         assert!(!explicit_off.rqi);
+    }
+
+    /// #820: the time-metering IEs of a Create/Update URR are parsed: Inactivity
+    /// Detection Time (IE 36, §8.2.18) and ISTM (Measurement Information IE 100,
+    /// octet 5 bit 4, §8.2.68).
+    #[test]
+    fn a_urr_carries_its_inactivity_detection_time_and_istm() {
+        let mut b = PfcpMessageBuilder::new();
+        b.add_u32(pfcp_ie::URR_ID, 9);
+        b.add_u32(pfcp_ie::INACTIVITY_DETECTION_TIME, 45);
+        b.add_u8(pfcp_ie::MEASUREMENT_INFORMATION, 0x08);
+        let urr = parse_create_urr(&b.build()).expect("parses");
+        assert_eq!(urr.inactivity_detection_secs, Some(45));
+        assert!(urr.immediate_start_time_metering);
+
+        let mut b = PfcpMessageBuilder::new();
+        b.add_u32(pfcp_ie::URR_ID, 9);
+        b.add_u8(pfcp_ie::MEASUREMENT_INFORMATION, 0x02); // INAM only
+        let urr = parse_create_urr(&b.build()).expect("parses");
+        assert_eq!(urr.inactivity_detection_secs, None);
+        assert!(!urr.immediate_start_time_metering);
     }
 }
