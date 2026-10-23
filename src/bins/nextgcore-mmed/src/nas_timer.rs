@@ -113,6 +113,8 @@ const ALL_TIMERS: [NasTimer; 5] = [
 /// retransmission path can take the write lock and reach `nas_path` without the
 /// non-reentrant `RwLock` deadlocking against itself.
 pub fn expire_nas_timers(ctx: &MmeContext, now: Instant) {
+    // #734: T3495 of the PDN GW initiated bearer deactivations.
+    crate::bearer_deactivation::sweep(ctx, now);
     let expired: Vec<(u64, NasTimer)> = {
         let pool = ctx.mme_ue_pool.read().unwrap();
         pool.iter()

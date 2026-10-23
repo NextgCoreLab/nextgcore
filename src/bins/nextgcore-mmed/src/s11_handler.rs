@@ -1035,6 +1035,12 @@ fn handle_delete_bearer_request(raw: &[u8], sequence_number: u32, peer: SocketAd
         .map(|(_, teid, _, _)| teid)
         .unwrap_or(0);
     let ctx = crate::context::mme_self();
+    // #734: a retransmission of a request whose deactivation is running is
+    // answered when the UE has answered, not acted on again.
+    if crate::bearer_deactivation::in_flight(peer, sequence_number) {
+        log::debug!("S11 Delete Bearer Request seq={sequence_number} from {peer} in progress");
+        return;
+    }
     let ebis = delete_bearer_request_ebis(raw);
     use crate::s11_build::GtpCause;
     let rsp = if let Some((sgw_teid, deleted)) = delete_enb_released_bearers(ctx, local_teid, &ebis)
@@ -1065,6 +1071,53 @@ fn handle_delete_bearer_request(raw: &[u8], sequence_number: u32, peer: SocketAd
                     GtpCause::RequestAccepted,
                     sequence_number,
                 )
+            }
+            DeleteBearerAction::Deactivate {
+                mme_ue_id,
+                sgw_teid,
+                answer,
+                sess_id,
+                ebis: to_deactivate,
+                reactivation,
+            } => {
+                if crate::bearer_deactivation::start(
+                    ctx,
+                    mme_ue_id,
+                    peer,
+                    sequence_number,
+                    sgw_teid,
+                    answer.clone(),
+                    sess_id,
+                    &to_deactivate,
+                    reactivation,
+                ) {
+                    // Answered when the UE has (step 8).
+                    return;
+                }
+                // Nothing could be sent to the eNB: the bearers go locally.
+                log::warn!(
+                    "Delete Bearer Request: the deactivation could not be signalled; deleting \
+                     EBIs {to_deactivate:?} locally"
+                );
+                crate::bearer_deactivation::delete_now(ctx, mme_ue_id, &to_deactivate, sess_id);
+                match answer {
+                    crate::bearer_deactivation::DeleteBearerAnswer::Lbi(lbi) => {
+                        crate::s11_build::build_delete_bearer_response_for_lbi(
+                            sgw_teid,
+                            lbi,
+                            GtpCause::RequestAccepted,
+                            sequence_number,
+                        )
+                    }
+                    crate::bearer_deactivation::DeleteBearerAnswer::Ebis(ebis) => {
+                        crate::s11_build::build_delete_bearer_response_for_ebis(
+                            sgw_teid,
+                            &ebis,
+                            GtpCause::RequestAccepted,
+                            sequence_number,
+                        )
+                    }
+                }
             }
             DeleteBearerAction::PdnDeletedLocally { sgw_teid, lbi } => {
                 crate::s11_build::build_delete_bearer_response_for_lbi(
@@ -1151,6 +1204,20 @@ pub enum DeleteBearerAction {
         /// The EBIs found and deleted.
         ebis: Vec<u8>,
     },
+    /// #734: an ECM-CONNECTED UE. The bearers are deactivated towards the eNB
+    /// and the UE first (E-RAB RELEASE COMMAND with DEACTIVATE EPS BEARER
+    /// CONTEXT REQUEST, TS 23.401 §5.4.4.1 step 4c); nothing is deleted yet.
+    Deactivate {
+        mme_ue_id: u64,
+        sgw_teid: u32,
+        answer: crate::bearer_deactivation::DeleteBearerAnswer,
+        /// The PDN connection deleted whole (LBI case).
+        sess_id: Option<u64>,
+        /// The EBIs to deactivate: the default bearer, or the dedicated ones.
+        ebis: Vec<u8>,
+        /// Cause "reactivation requested": ESM cause #39.
+        reactivation: bool,
+    },
     /// No such UE, PDN connection or bearer.
     NoContext {
         /// The Serving GW's S11 TEID, when the UE is known (else 0).
@@ -1201,6 +1268,13 @@ pub fn network_initiated_bearer_deletion(
         .sgw_ue_find_by_id(mme_ue.sgw_ue_id)
         .map(|s| s.sgw_s11_teid)
         .unwrap_or(0);
+    // #734, TS 23.401 §5.4.4.1: for an ECM-CONNECTED UE steps 4c-7 run (the
+    // eNB and the UE are told); for an ECM-IDLE one, condition (i) skips them
+    // and the bearer state is synchronised at the next ECM-CONNECTED transition.
+    let connected = ctx
+        .enb_ue_find_by_id(mme_ue.enb_ue_id)
+        .is_some_and(|e| e.mme_ue_id == mme_ue_id);
+    let reactivation = message_cause(raw) == Some(GTP_CAUSE_REACTIVATION_REQUESTED);
 
     if let Some(lbi) = lbi {
         // The PDN connection whose default (first) bearer is the LBI.
@@ -1236,6 +1310,16 @@ pub fn network_initiated_bearer_deletion(
                 detach_type,
             };
         }
+        if connected {
+            return DeleteBearerAction::Deactivate {
+                mme_ue_id,
+                sgw_teid,
+                answer: crate::bearer_deactivation::DeleteBearerAnswer::Lbi(lbi),
+                sess_id: Some(sess_id),
+                ebis: vec![lbi],
+                reactivation,
+            };
+        }
         if let Some(sess) = ctx.sess_find_by_id(sess_id) {
             for b in &sess.bearer_list {
                 ctx.bearer_remove(*b);
@@ -1245,14 +1329,36 @@ pub fn network_initiated_bearer_deletion(
         if let Some(ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&mme_ue_id) {
             ue.sess_list.retain(|id| *id != sess_id);
         }
-        log::warn!(
-            "[{}] PDN connection LBI {lbi} deleted by the gateway and in this MME; the UE is not \
-             told: ESM DEACTIVATE EPS BEARER CONTEXT REQUEST is not implemented here",
+        log::info!(
+            "[{}] PDN connection LBI {lbi} deleted by the gateway; the UE is ECM-IDLE, so it is \
+             deleted here and synchronised at the next ECM-CONNECTED transition (TS 23.401 \
+             §5.4.4.1 condition (i))",
             mme_ue.imsi_bcd
         );
         return DeleteBearerAction::PdnDeletedLocally { sgw_teid, lbi };
     }
 
+    if connected {
+        let held: Vec<u8> = ebis
+            .iter()
+            .copied()
+            .filter(|ebi| ctx.bearer_find_by_ebi(mme_ue_id, *ebi).is_some())
+            .collect();
+        if held.is_empty() {
+            return DeleteBearerAction::NoContext {
+                sgw_teid,
+                lbi: None,
+            };
+        }
+        return DeleteBearerAction::Deactivate {
+            mme_ue_id,
+            sgw_teid,
+            answer: crate::bearer_deactivation::DeleteBearerAnswer::Ebis(held.clone()),
+            sess_id: None,
+            ebis: held,
+            reactivation,
+        };
+    }
     let mut deleted = Vec::new();
     for ebi in &ebis {
         let Some(bearer_id) = ctx.bearer_find_by_ebi(mme_ue_id, *ebi) else {
@@ -1272,9 +1378,10 @@ pub fn network_initiated_bearer_deletion(
             lbi: None,
         };
     }
-    log::warn!(
-        "[{}] dedicated bearers {deleted:?} deleted by the gateway and in this MME; the UE is \
-         not told: ESM DEACTIVATE EPS BEARER CONTEXT REQUEST is not implemented here",
+    log::info!(
+        "[{}] dedicated bearers {deleted:?} deleted by the gateway; the UE is ECM-IDLE, so they \
+         are deleted here and synchronised at the next ECM-CONNECTED transition (TS 23.401 \
+         §5.4.4.1 condition (i))",
         mme_ue.imsi_bcd
     );
     DeleteBearerAction::BearersDeletedLocally {
@@ -3249,10 +3356,50 @@ mod pgw_initiated_delete_bearer_tests {
         ));
     }
 
+    /// Make the UE of `ue` ECM-IDLE: its S1 connection is gone.
+    fn idle(ctx: &MmeContext, mme_ue_id: u64) {
+        let enb_ue_id = ctx.mme_ue_find_by_id(mme_ue_id).unwrap().enb_ue_id;
+        ctx.enb_ue_deassociate_mme_ue(enb_ue_id, mme_ue_id);
+        ctx.enb_ue_remove(enb_ue_id);
+    }
+
+    /// #734: for an ECM-CONNECTED UE a non-last PDN connection is deactivated
+    /// towards the eNB and the UE first (TS 23.401 §5.4.4.1 step 4c), so
+    /// nothing is deleted when the request is decided.
+    #[test]
+    fn a_pdn_that_is_not_the_last_is_deactivated_when_connected() {
+        let ctx = ctx();
+        let (mme_ue_id, teid) = ue(&ctx, &[5, 6]);
+        let action = network_initiated_bearer_deletion(&ctx, teid, &dbr_lbi(teid, 6, Some(8)));
+        let sess_id = ctx
+            .sess_find_by_id(
+                ctx.bearer_find_by_id(ctx.bearer_find_by_ebi(mme_ue_id, 6).unwrap())
+                    .unwrap()
+                    .sess_id,
+            )
+            .unwrap()
+            .id;
+        assert_eq!(
+            action,
+            DeleteBearerAction::Deactivate {
+                mme_ue_id,
+                sgw_teid: 0x5ca1,
+                answer: crate::bearer_deactivation::DeleteBearerAnswer::Lbi(6),
+                sess_id: Some(sess_id),
+                ebis: vec![6],
+                reactivation: true,
+            }
+        );
+        assert_eq!(ctx.mme_ue_find_by_id(mme_ue_id).unwrap().sess_list.len(), 2);
+    }
+
+    /// TS 23.401 §5.4.4.1 condition (i): an ECM-IDLE UE's non-last PDN
+    /// connection is deleted locally at once.
     #[test]
     fn a_pdn_that_is_not_the_last_is_deleted_without_a_detach() {
         let ctx = ctx();
         let (mme_ue_id, teid) = ue(&ctx, &[5, 6]);
+        idle(&ctx, mme_ue_id);
         let action = network_initiated_bearer_deletion(&ctx, teid, &dbr_lbi(teid, 6, Some(8)));
         assert_eq!(
             action,
@@ -3300,6 +3447,21 @@ mod pgw_initiated_delete_bearer_tests {
             1,
         ));
         m.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Ebi as u8, 1, &[7]));
+        // Connected: deactivated towards the UE first.
+        assert_eq!(
+            network_initiated_bearer_deletion(&ctx, teid, &m.encode()),
+            DeleteBearerAction::Deactivate {
+                mme_ue_id,
+                sgw_teid: 0x5ca1,
+                answer: crate::bearer_deactivation::DeleteBearerAnswer::Ebis(vec![7]),
+                sess_id: None,
+                ebis: vec![7],
+                reactivation: false,
+            }
+        );
+        assert!(ctx.bearer_find_by_ebi(mme_ue_id, 7).is_some());
+        // Idle: deleted locally (condition (i)).
+        idle(&ctx, mme_ue_id);
         assert_eq!(
             network_initiated_bearer_deletion(&ctx, teid, &m.encode()),
             DeleteBearerAction::BearersDeletedLocally {
@@ -3348,6 +3510,201 @@ mod pgw_initiated_delete_bearer_tests {
         assert!(ue.t3422.is_running());
         let nas = ue.t3422.pkbuf.clone().unwrap();
         assert_eq!(&nas[nas.len() - 5..nas.len() - 2], &[0x07, 0x45, 0x01]);
+        ctx.mme_ue_remove(mme_ue_id);
+    }
+
+    /// A stand-in SGW for the process-global context, and the eNB tap.
+    fn sgw_route() -> (std::net::UdpSocket, crate::gtp_path::S11TestRoute) {
+        let sgw = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sgw.set_read_timeout(Some(std::time::Duration::from_millis(400)))
+            .unwrap();
+        let server = crate::gtp_path::GtpcServer::open(
+            "127.0.0.1:0",
+            nextgcore_gtp::v2::xact::Gtp2XactConfig::default(),
+            7,
+        )
+        .unwrap();
+        let route = crate::gtp_path::route_s11_for_test(server, sgw.local_addr().unwrap());
+        (sgw, route)
+    }
+
+    /// The Delete Bearer Responses the stand-in SGW receives: (seq, cause, LBI).
+    fn delete_bearer_responses(sgw: &std::net::UdpSocket) -> Vec<(u32, u8, Option<u8>)> {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        while let Ok((len, _)) = sgw.recv_from(&mut buf) {
+            let msg = Gtp2Message::decode(&mut bytes::Bytes::copy_from_slice(&buf[..len])).unwrap();
+            if msg.header.message_type == crate::s11_build::message_type::DELETE_BEARER_RESPONSE {
+                out.push((
+                    msg.header.sequence_number,
+                    msg.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value[0],
+                    msg.get_ie(Gtp2IeType::Ebi as u8, 0).map(|i| i.value[0]),
+                ));
+            }
+        }
+        out
+    }
+
+    /// The E-RAB RELEASE COMMANDs tapped for `enb_id`: (E-RAB IDs, the ESM
+    /// message type and EBI and cause of the NAS PDU).
+    fn erab_release_commands(enb_id: u64) -> Vec<(Vec<u8>, Option<(u8, u8, u8)>)> {
+        use nextgcore_s1ap_gen::generated as g;
+        crate::s1ap_path::take_tapped_for_test(enb_id)
+            .into_iter()
+            .filter_map(|pdu| match nextgcore_s1ap_gen::decode(&pdu) {
+                Ok(g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+                    value: g::InitiatingMessageValue::Id_E_RABRelease(cmd),
+                    ..
+                })) => {
+                    let mut erabs = Vec::new();
+                    let mut nas = None;
+                    for ie in cmd.protocol_i_es.0 {
+                        match ie.value {
+                            g::E_RABReleaseCommandProtocolIEs_EntryValue::Id_E_RABToBeReleasedList(l) => {
+                                for e in l.0 {
+                                    let g::E_RABList_EntryValue::Id_E_RABItem(i) = e.value;
+                                    erabs.push(i.e_rab_id.0);
+                                }
+                            }
+                            g::E_RABReleaseCommandProtocolIEs_EntryValue::Id_NAS_PDU(n) => {
+                                // Security header (6 octets), then the ESM message:
+                                // EBI|PD, PTI, type, cause.
+                                let m = &n.0;
+                                nas = (m.len() >= 10).then(|| (m[8], m[6] >> 4, m[9]));
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some((erabs, nas))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// #734, TS 23.401 §5.4.4.1 steps 4c-8 end to end on the process-global
+    /// context: a connected UE with two PDN connections; the PGW deletes the
+    /// second (reactivation requested). The eNB gets an E-RAB RELEASE COMMAND
+    /// carrying DEACTIVATE EPS BEARER CONTEXT REQUEST (EBI 6, ESM cause #39);
+    /// the Serving GW is answered only after the UE's DEACTIVATE EPS BEARER
+    /// CONTEXT ACCEPT, which removes the PDN connection. A retransmitted Delete
+    /// Bearer Request meanwhile is not acted on twice.
+    #[test]
+    fn a_non_last_pdn_is_deactivated_at_the_enb_and_ue_before_the_answer() {
+        let _guard = crate::gtp_path::lock_s11();
+        crate::bearer_deactivation::clear_for_test();
+        let (sgw, _route) = sgw_route();
+        let ctx = crate::context::mme_self();
+        let (mme_ue_id, teid) = ue(ctx, &[5, 6]);
+        let enb_id = ctx
+            .enb_ue_find_by_id(ctx.mme_ue_find_by_id(mme_ue_id).unwrap().enb_ue_id)
+            .unwrap()
+            .enb_id;
+        // The PDN's bearer has a radio bearer.
+        let b6 = ctx.bearer_find_by_ebi(mme_ue_id, 6).unwrap();
+        ctx.bearer_pool
+            .write()
+            .unwrap()
+            .get_mut(&b6)
+            .unwrap()
+            .enb_s1u_teid = 0x6060;
+        crate::s1ap_path::tap_enb_for_test(enb_id);
+        let peer = sgw.local_addr().unwrap();
+        let dbr = dbr_lbi(teid, 6, Some(GTP_CAUSE_REACTIVATION_REQUESTED));
+        let dbr_type = crate::s11_build::message_type::DELETE_BEARER_REQUEST;
+
+        dispatch_initial(&dbr, dbr_type, 0x734, peer);
+        let cmds = erab_release_commands(enb_id);
+        assert_eq!(cmds.len(), 1, "{cmds:?}");
+        assert_eq!(cmds[0].0, vec![6], "the PDN connection's E-RAB");
+        assert_eq!(
+            cmds[0].1,
+            Some((0xcd, 6, 39)),
+            "DEACTIVATE EPS BEARER CONTEXT REQUEST, EBI 6, ESM cause #39"
+        );
+        assert!(delete_bearer_responses(&sgw).is_empty(), "the answer waits");
+        assert_eq!(ctx.mme_ue_find_by_id(mme_ue_id).unwrap().sess_list.len(), 2);
+
+        // The SGW retransmits: no second command.
+        dispatch_initial(&dbr, dbr_type, 0x734, peer);
+        assert!(erab_release_commands(enb_id).is_empty());
+
+        assert!(crate::bearer_deactivation::on_accept(ctx, mme_ue_id, 6));
+        assert_eq!(delete_bearer_responses(&sgw), vec![(0x734, 16, Some(6))]);
+        assert_eq!(ctx.mme_ue_find_by_id(mme_ue_id).unwrap().sess_list.len(), 1);
+        assert!(ctx.bearer_find_by_ebi(mme_ue_id, 6).is_none());
+        assert_eq!(crate::bearer_deactivation::pending_count(), 0);
+        ctx.mme_ue_remove(mme_ue_id);
+    }
+
+    /// #734, TS 24.301 §6.4.4.5 a: two dedicated bearers; T3495 retransmits
+    /// each DEACTIVATE EPS BEARER CONTEXT REQUEST four times in DOWNLINK NAS
+    /// TRANSPORT, and the fifth expiry deactivates locally. The Serving GW is
+    /// answered once both are settled (one by the UE, one by T3495).
+    #[test]
+    fn dedicated_bearers_are_answered_when_every_one_is_settled() {
+        let _guard = crate::gtp_path::lock_s11();
+        crate::bearer_deactivation::clear_for_test();
+        let (sgw, _route) = sgw_route();
+        let ctx = crate::context::mme_self();
+        let (mme_ue_id, teid) = ue(ctx, &[5]);
+        let sess_id = ctx.mme_ue_find_by_id(mme_ue_id).unwrap().sess_list[0];
+        for ebi in [7u8, 8] {
+            let id = ctx.bearer_add(sess_id, mme_ue_id);
+            ctx.bearer_pool.write().unwrap().get_mut(&id).unwrap().ebi = ebi;
+            ctx.sess_pool
+                .write()
+                .unwrap()
+                .get_mut(&sess_id)
+                .unwrap()
+                .bearer_list
+                .push(id);
+        }
+        let enb_id = ctx
+            .enb_ue_find_by_id(ctx.mme_ue_find_by_id(mme_ue_id).unwrap().enb_ue_id)
+            .unwrap()
+            .enb_id;
+        crate::s1ap_path::tap_enb_for_test(enb_id);
+        let mut m = Gtp2Message::new(Gtp2Header::new(
+            crate::s11_build::message_type::DELETE_BEARER_REQUEST,
+            teid,
+            0x7341,
+        ));
+        m.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Ebi as u8, 1, &[7]));
+        m.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Ebi as u8, 1, &[8]));
+        dispatch_initial(
+            &m.encode(),
+            crate::s11_build::message_type::DELETE_BEARER_REQUEST,
+            0x7341,
+            sgw.local_addr().unwrap(),
+        );
+        let cmds = erab_release_commands(enb_id);
+        assert_eq!(
+            cmds.iter().map(|c| c.0.clone()).collect::<Vec<_>>(),
+            vec![vec![7], vec![8]],
+            "one E-RAB RELEASE COMMAND per dedicated bearer"
+        );
+        assert_eq!(cmds[0].1, Some((0xcd, 7, 36)), "regular deactivation");
+
+        assert!(crate::bearer_deactivation::on_accept(ctx, mme_ue_id, 7));
+        assert!(
+            delete_bearer_responses(&sgw).is_empty(),
+            "EBI 8 still waits"
+        );
+        for _ in 0..4 {
+            crate::bearer_deactivation::expire_for_test(mme_ue_id);
+            crate::nas_timer::expire_nas_timers(ctx, std::time::Instant::now());
+        }
+        let resent = crate::s1ap_path::take_tapped_for_test(enb_id).len();
+        assert_eq!(resent, 4, "four T3495 retransmissions");
+        crate::bearer_deactivation::expire_for_test(mme_ue_id);
+        crate::nas_timer::expire_nas_timers(ctx, std::time::Instant::now());
+        let rsp = delete_bearer_responses(&sgw);
+        assert_eq!(rsp.len(), 1, "{rsp:?}");
+        assert_eq!((rsp[0].0, rsp[0].1), (0x7341, 16));
+        assert!(ctx.bearer_find_by_ebi(mme_ue_id, 7).is_none());
+        assert!(ctx.bearer_find_by_ebi(mme_ue_id, 8).is_none());
+        assert!(ctx.bearer_find_by_ebi(mme_ue_id, 5).is_some());
         ctx.mme_ue_remove(mme_ue_id);
     }
 }
