@@ -128,3 +128,36 @@ fn an_unknown_eps_type_1_ie_is_one_octet() {
     let msg = eps::AttachRequest::decode(&mut b(&wire)).unwrap();
     assert_eq!(msg.last_visited_tai.map(|t| t.tac), Some(0x002a));
 }
+
+#[test]
+fn the_other_unmodelled_tv_ies_are_skipped_by_their_fixed_length() {
+    // #829 review: one case per added arm.
+    // PDU SESSION ESTABLISHMENT REQUEST: integrity max data rate (V 2), then
+    // Maximum number of supported packet filters (0x55, TV 3), then Extended PCO.
+    let wire = [0xff, 0xff, 0x55, 0x00, 0x10, 0x7b, 0x00, 0x01, 0xaa];
+    let msg = fiveg::PduSessionEstablishmentRequest::decode(&mut b(&wire)).unwrap();
+    assert_eq!(msg.extended_pco, Some(vec![0xaa]));
+
+    // PDU SESSION ESTABLISHMENT ACCEPT: RQ timer value (0x56, TV 2) before DNN.
+    let mut wire = vec![0x11, 0x00, 0x06, 0x01, 0x00, 0x06, 0x31, 0x31, 0x01];
+    wire.extend_from_slice(&[0x06, 0x06, 0x00, 0x64, 0x06, 0x00, 0x32]);
+    wire.extend_from_slice(&[0x56, 0x21]);
+    wire.extend_from_slice(&[0x25, 0x04, 0x03, b'i', b'n', b't']);
+    let msg = fiveg::PduSessionEstablishmentAccept::decode(&mut b(&wire)).unwrap();
+    assert!(
+        msg.dnn.is_some(),
+        "the DNN after the RQ timer still decodes"
+    );
+
+    // PDU SESSION MODIFICATION COMMAND: RQ timer value (0x56, TV 2) before the
+    // 5GSM cause.
+    let wire = [0x56, 0x21, 0x59, 0x1a];
+    let msg = fiveg::PduSessionModificationCommand::decode(&mut b(&wire)).unwrap();
+    assert_eq!(msg.gsm_cause, Some(0x1a));
+
+    // CONTROL PLANE SERVICE REQUEST: ngKSI + type, PDU session ID (0x12, TV 2),
+    // then PDU session status (0x50).
+    let wire = [0x01, 0x12, 0x05, 0x50, 0x02, 0x02, 0x00];
+    let msg = fiveg::ControlPlaneServiceRequest::decode(&mut b(&wire)).unwrap();
+    assert_eq!(msg.pdu_session_status.map(|s| s.psi), Some(0x0002));
+}
