@@ -1056,6 +1056,11 @@ pub struct MmeUe {
     pub tracking_area_update_accept_proc: i64,
     /// Detach type
     pub detach_type: DetachType,
+    /// The detach type of the network-initiated detach in progress (TS 24.301
+    /// §5.5.2.3), set with `nas_eps.type_ = DetachRequestToUe`. It decides how an
+    /// ATTACH, TAU or SERVICE REQUEST colliding with it is treated
+    /// (§5.5.2.3.5 d-f, #732).
+    pub network_detach_type: Option<crate::emm_build::DetachTypeToUe>,
 
     // UE Identity
     /// IMSI

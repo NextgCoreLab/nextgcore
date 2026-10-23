@@ -2600,6 +2600,7 @@ dependencies = [
  "async-trait",
  "bitflags 2.10.0",
  "bytes",
+ "libc",
  "log",
  "nextgcore-core",
  "nextgcore-crypt",
