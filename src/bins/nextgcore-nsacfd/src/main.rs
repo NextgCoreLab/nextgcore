@@ -1752,6 +1752,10 @@ async fn handle_slice_ee_subscribe(request: &SbiRequest) -> SbiResponse {
         );
     }
 
+    if let Some(resp) = invalid_expiry(&data) {
+        return resp;
+    }
+
     // TS 29.536 §6.2.6.3.3 SACEventType: only the two count events are supported.
     let event_type = event_type.expect("checked above");
     if event_type != "NUM_OF_REGD_UES" && event_type != "NUM_OF_ESTD_PDU_SESSIONS" {
@@ -1861,6 +1865,24 @@ fn build_subscription(
 /// and S-NSSAI filter or a ProblemDetails response.
 ///
 /// The same validation create performs, shared with PUT.
+/// `expiry` (TS 29.536 SACEventSubscription, a TS 29.571 DateTime) must be a
+/// valid RFC 3339 DateTime when present (#856 review). Stored unvalidated, an
+/// unparseable value meant "no deadline", so the subscription never expired.
+fn invalid_expiry(data: &serde_json::Value) -> Option<SbiResponse> {
+    let e = data.get("expiry")?;
+    let ok = e
+        .as_str()
+        .is_some_and(|s| nextgcore_sbi::datetime::rfc3339_to_epoch(s).is_some());
+    (!ok).then(|| {
+        problem_details(
+            400,
+            "Bad Request",
+            &format!("expiry is not a valid RFC 3339 DateTime: {e}"),
+            Some("MANDATORY_IE_INCORRECT"),
+        )
+    })
+}
+
 fn validate_subscription_doc(
     data: &serde_json::Value,
 ) -> Result<(String, Vec<SNssai>), Box<SbiResponse>> {
@@ -1895,6 +1917,9 @@ fn validate_subscription_doc(
             &format!("Missing mandatory attribute(s): {}", missing.join(", ")),
             Some("MANDATORY_IE_MISSING"),
         )));
+    }
+    if let Some(resp) = invalid_expiry(data) {
+        return Err(Box::new(resp));
     }
     let event_type = event_type.expect("checked above");
     if event_type != "NUM_OF_REGD_UES" && event_type != "NUM_OF_ESTD_PDU_SESSIONS" {
@@ -4631,6 +4656,48 @@ nsacf:
             live.report_decision(0, 0, 0, 0, 1_000),
             ReportDecision::Emit
         );
+        // #856 review: an expiry that cannot be read ends the subscription
+        // (fail closed) rather than making it immortal.
+        for unreadable in ["2026-6-1T00:00:00Z", "2026-02-30T00:00:00Z", "not a date"] {
+            let mut bad = base.clone();
+            bad.expiry = Some(unreadable.to_string());
+            assert_eq!(
+                bad.report_decision(0, 0, 0, 0, 1_000),
+                ReportDecision::Exhausted,
+                "{unreadable}"
+            );
+        }
+    }
+
+    /// #856 review: a create or modify whose `expiry` is not an RFC 3339
+    /// DateTime is refused with 400 MANDATORY_IE_INCORRECT.
+    #[test]
+    fn an_unreadable_expiry_is_refused() {
+        for bad in [
+            json!("2026-6-1T00:00:00Z"),
+            json!("+2026-01-01T00:00:00Z"),
+            json!(1),
+        ] {
+            let doc =
+                subscription_doc("http://127.0.0.1:9/cb", json!({}), json!({ "expiry": bad }));
+            let resp = invalid_expiry(&doc).unwrap_or_else(|| panic!("{bad} accepted"));
+            assert_eq!(resp.status, 400);
+            assert!(
+                resp.http
+                    .content
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("MANDATORY_IE_INCORRECT"),
+                "{bad}"
+            );
+            assert!(validate_subscription_doc(&doc).is_err(), "{bad} via modify");
+        }
+        let ok = subscription_doc(
+            "http://127.0.0.1:9/cb",
+            json!({}),
+            json!({ "expiry": "2030-01-01T00:00:00+02:00" }),
+        );
+        assert!(invalid_expiry(&ok).is_none());
     }
 
     /// Every trigger field is parsed, and from the RIGHT object: `eventTrigger`,
