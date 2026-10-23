@@ -1335,15 +1335,34 @@ pub fn network_initiated_bearer_deletion(
                 lbi: Some(lbi),
             };
         };
-        // #863 review: "the last PDN connection" counts the ACTIVE ones (a
-        // bearer with a Serving GW S1-U endpoint: `sess_list` also holds the
-        // unconnected sessions materialised from the subscription) that are not
-        // already being deactivated. Two deletions in quick succession must
-        // still end in a detach, not in a registered UE with no PDN connection.
         let pending = crate::bearer_deactivation::pending_pdn_sessions(mme_ue_id);
-        let remaining = mme_ue
+        // #863 review round 2: the target first. A request for a PDN connection
+        // already being deactivated (the gateway gave up on the first request,
+        // which can wait 5 x T3495, and re-initiated with a new sequence number)
+        // changes nothing: it is answered at once by the Deactivate arm's
+        // `already_deactivating` filter, and the PDN goes when the first
+        // deactivation settles. Counting it as "the last PDN" would detach the
+        // UE and drop a PDN connection nobody asked to delete.
+        if pending.contains(&sess_id) {
+            return DeleteBearerAction::Deactivate {
+                mme_ue_id,
+                sgw_teid,
+                answer: crate::bearer_deactivation::DeleteBearerAnswer::Lbi(lbi),
+                sess_id: Some(sess_id),
+                ebis: vec![lbi],
+                reactivation,
+            };
+        }
+        // #863 review: "the last PDN connection" means no OTHER PDN connection
+        // stays: none that is ACTIVE (a bearer with a Serving GW S1-U endpoint:
+        // `sess_list` also holds the unconnected sessions materialised from the
+        // subscription) and not already being deactivated. Two deletions in
+        // quick succession must still end in a detach, not in a registered UE
+        // with no PDN connection.
+        let others_remaining = mme_ue
             .sess_list
             .iter()
+            .filter(|id| **id != sess_id)
             .filter(|id| !pending.contains(id))
             .filter(|id| {
                 ctx.sess_find_by_id(**id).is_some_and(|s| {
@@ -1354,7 +1373,7 @@ pub fn network_initiated_bearer_deletion(
                 })
             })
             .count();
-        if remaining <= 1 {
+        if others_remaining == 0 {
             let cause = message_cause(raw);
             let detach_type = if cause == Some(GTP_CAUSE_REACTIVATION_REQUESTED) {
                 crate::emm_build::DetachTypeToUe::ReAttachRequired
@@ -3848,6 +3867,63 @@ mod pgw_initiated_delete_bearer_tests {
             network_initiated_bearer_deletion(&ctx, teid, &dbr_lbi(teid, 5, Some(16))),
             DeleteBearerAction::DetachUe { lbi: 5, .. }
         ));
+    }
+
+    /// #863 review round 2 MAJOR: a gateway that re-initiates the deletion of a
+    /// PDN connection already being deactivated (new sequence number, while the
+    /// first request waits out T3495) is answered at once. It is not "the last
+    /// PDN": the UE is not detached and PDN 5, which nobody asked to delete, stays.
+    #[test]
+    fn a_repeated_deletion_of_a_pending_pdn_is_answered_and_keeps_the_other_pdn() {
+        let _guard = crate::gtp_path::lock_s11();
+        crate::bearer_deactivation::clear_for_test();
+        let (sgw, _route) = sgw_route();
+        let ctx = crate::context::mme_self();
+        let (mme_ue_id, teid) = ue(ctx, &[5, 6]);
+        let peer = sgw.local_addr().unwrap();
+        let t = crate::s11_build::message_type::DELETE_BEARER_REQUEST;
+        dispatch_initial(&dbr_lbi(teid, 6, Some(16)), t, 0x300, peer);
+        assert_eq!(crate::bearer_deactivation::pending_count(), 1);
+        dispatch_initial(&dbr_lbi(teid, 6, Some(16)), t, 0x301, peer);
+        assert_eq!(
+            delete_bearer_responses(&sgw),
+            vec![(0x301, 16, Some(6))],
+            "the repeat is answered at once; the first waits for the UE"
+        );
+        assert_eq!(
+            crate::bearer_deactivation::pending_count(),
+            1,
+            "no second deactivation"
+        );
+        let ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert_ne!(
+            ue.nas_eps.type_,
+            crate::context::MmeEpsType::DetachRequestToUe,
+            "not detached"
+        );
+        assert_eq!(ue.sess_list.len(), 2, "PDN 5 is kept");
+        crate::bearer_deactivation::clear_for_test();
+        ctx.mme_ue_remove(mme_ue_id);
+    }
+
+    /// #863 review round 2: "the last PDN" is judged by the OTHER PDN connections.
+    /// Deleting one that never connected, while another is active, does not detach.
+    #[test]
+    fn deleting_an_unconnected_pdn_beside_an_active_one_does_not_detach() {
+        let ctx = ctx();
+        let (mme_ue_id, teid) = ue(&ctx, &[5, 6]);
+        let b6 = ctx.bearer_find_by_ebi(mme_ue_id, 6).unwrap();
+        ctx.bearer_pool
+            .write()
+            .unwrap()
+            .get_mut(&b6)
+            .unwrap()
+            .sgw_s1u_teid = 0;
+        let action = network_initiated_bearer_deletion(&ctx, teid, &dbr_lbi(teid, 6, Some(16)));
+        assert!(
+            !matches!(action, DeleteBearerAction::DetachUe { .. }),
+            "{action:?}"
+        );
     }
 
     /// #863 review MINOR 5: a new Delete Bearer Request (new seq) for a bearer
