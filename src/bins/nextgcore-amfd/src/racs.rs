@@ -61,6 +61,12 @@ const CONTENT_NGAP: &str = "application/vnd.3gpp.ngap";
 /// Bound of the AMF's ID → capability cache. The UCMF is the authority; the cache
 /// only saves a round trip per mapping request, so a modest bound is enough.
 const CACHE_CAPACITY: usize = 1024;
+/// Bound of the set of retired IDs (#747). Its entries come from the UCMF's
+/// deletion notifications and from Resolve answers of 404, and the latter are
+/// driven by whatever IDs a gNB or a UE presents, so the set is a FIFO like the
+/// cache rather than unbounded. Four times the cache: a UE can still hold an ID
+/// the cache has long forgotten, and the entry is what tells it to delete it.
+const DELETED_CAPACITY: usize = 4 * CACHE_CAPACITY;
 
 // ---------------------------------------------------------------------------
 // ID forms
@@ -138,6 +144,8 @@ struct Cache {
     /// ID change: a UE still holding one gets the deletion indication, and the ID is
     /// no longer put in NGAP.
     deleted: HashSet<Vec<u8>>,
+    /// Insertion order of `deleted`, for its FIFO bound (#747).
+    deleted_order: VecDeque<Vec<u8>>,
     /// The UCMF's current Version ID, when a NEW_VERSION_ID notification told us.
     current_version: Option<u8>,
 }
@@ -166,9 +174,43 @@ pub fn cache_put(id: &[u8], capability: &[u8]) {
                 }
             }
         }
-        c.deleted.remove(id);
+        if c.deleted.remove(id) {
+            c.deleted_order.retain(|o| o != id);
+        }
     });
 }
+
+impl Cache {
+    /// Retire `id`, evicting the oldest retired ID past [`DELETED_CAPACITY`] (#747).
+    fn retire(&mut self, id: &[u8]) {
+        if self.deleted.insert(id.to_vec()) {
+            self.deleted_order.push_back(id.to_vec());
+            while self.deleted_order.len() > DELETED_CAPACITY {
+                if let Some(old) = self.deleted_order.pop_front() {
+                    self.deleted.remove(&old);
+                }
+            }
+        }
+    }
+}
+
+/// Whether `id` is one the AMF has recorded as deleted (a UCMF notification or a
+/// Resolve that found no entry), so asking the UCMF again would find nothing either.
+/// Unlike [`is_retired`], an ID under an old Version ID is not included: the UCMF may
+/// still map it until it purges.
+pub fn is_known_deleted(id: &[u8]) -> bool {
+    with_cache(|c| c.deleted.contains(id))
+}
+
+/// How many retired IDs are held (#747: bounded by [`DELETED_CAPACITY`]).
+#[cfg(test)]
+pub(crate) fn deleted_len() -> usize {
+    with_cache(|c| c.deleted.len())
+}
+
+/// The bound of the retired-ID set, for tests.
+#[cfg(test)]
+pub(crate) const DELETED_CAPACITY_FOR_TESTS: usize = DELETED_CAPACITY;
 
 /// Whether the AMF must no longer use `id` (deleted at the UCMF, or a PLMN-assigned
 /// ID under a Version ID other than the current one).
@@ -201,7 +243,7 @@ pub fn apply_notification(body: &serde_json::Value) -> Vec<Vec<u8>> {
                 for id in &ids {
                     c.entries.remove(id);
                     c.order.retain(|o| o != id);
-                    c.deleted.insert(id.clone());
+                    c.retire(id);
                 }
             });
             ids
@@ -224,6 +266,11 @@ pub fn apply_notification(body: &serde_json::Value) -> Vec<Vec<u8>> {
                     c.entries.remove(id);
                     c.order.retain(|o| o != id);
                 }
+                // #747: a retired ID under an older Version ID needs no entry of its
+                // own any more: `is_retired` retires the whole Version ID.
+                c.deleted.retain(|id| version_id(id).is_none_or(|x| x == v));
+                let deleted = &c.deleted;
+                c.deleted_order.retain(|id| deleted.contains(id));
                 stale
             })
         }
@@ -574,9 +621,7 @@ pub async fn ucmf_resolve(id: &[u8]) -> Result<Option<Vec<u8>>, String> {
             Ok(Some(cap))
         }
         404 => {
-            with_cache(|c| {
-                c.deleted.insert(id.to_vec());
-            });
+            with_cache(|c| c.retire(id));
             Ok(None)
         }
         s => Err(format!("Resolve at the UCMF returned {s}")),

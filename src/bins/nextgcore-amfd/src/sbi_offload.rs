@@ -40,6 +40,9 @@ use tokio::task::JoinHandle;
 pub(crate) enum SbiOutcome {
     /// #796: a re-selection attempt for a waiting PDU Session Establishment.
     Establishment(crate::ngap_path::EstablishmentAttempt),
+    /// #747: a UE RADIO CAPABILITY ID MAPPING RESPONSE resolved at the UCMF,
+    /// for the association that asked.
+    MappingResponse { association_id: u64, pdu: Vec<u8> },
 }
 
 /// What keyed work is serialised on: (AMF UE NGAP ID, PDU session ID).

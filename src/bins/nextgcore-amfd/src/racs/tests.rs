@@ -377,3 +377,66 @@ fn a_new_version_id_retires_the_old_ones_and_purges_the_cache() {
     assert!(is_retired(&ID));
     assert!(!is_retired(&newer));
 }
+
+/// A distinct PLMN-assigned ID under Version ID `version` for each `n`.
+fn nth_id(version: u8, n: u32) -> Vec<u8> {
+    let mut id = vec![0x01, version, 0x00];
+    id.extend_from_slice(&n.to_be_bytes());
+    id
+}
+
+/// #747: the retired-ID set is bounded however many unknown IDs are presented,
+/// and evicts the oldest first.
+#[test]
+fn the_retired_set_is_bounded_and_evicts_the_oldest() {
+    let _g = guard();
+    let over = DELETED_CAPACITY_FOR_TESTS + 100;
+    for n in 0..over as u32 {
+        with_cache(|c| c.retire(&nth_id(0x05, n)));
+    }
+    assert_eq!(deleted_len(), DELETED_CAPACITY_FOR_TESTS);
+    assert!(!is_known_deleted(&nth_id(0x05, 0)), "the oldest is evicted");
+    assert!(!is_known_deleted(&nth_id(0x05, 99)));
+    assert!(is_known_deleted(&nth_id(0x05, 100)));
+    assert!(is_known_deleted(&nth_id(0x05, over as u32 - 1)));
+    // Retiring an ID already held moves nothing.
+    with_cache(|c| c.retire(&nth_id(0x05, over as u32 - 1)));
+    assert!(is_known_deleted(&nth_id(0x05, 100)));
+    // A notification's deletions go through the same bound.
+    let ids: Vec<String> = (0..10u32)
+        .map(|n| to_nucmf(&nth_id(0x07, n)).unwrap())
+        .collect();
+    apply_notification(&serde_json::json!({
+        "eventType": "DELETION_OF_PLMN_ASSIGNED_IDS",
+        "manAssOpRequestlist": { "plmnAssiUeRadioCapId": ids },
+    }));
+    assert_eq!(deleted_len(), DELETED_CAPACITY_FOR_TESTS);
+    assert!(is_known_deleted(&nth_id(0x07, 9)));
+}
+
+/// #747: a new Version ID drops the retired entries under older ones, which
+/// `is_retired` now covers by the Version ID alone.
+#[test]
+fn a_new_version_id_drops_the_retired_entries_it_covers() {
+    let _g = guard();
+    with_cache(|c| {
+        c.retire(&nth_id(0x05, 1));
+        c.retire(&nth_id(0x06, 2));
+        // Manufacturer-assigned: no Version ID, so kept.
+        c.retire(&[0x00, 0x00, 0x70, 0xDE, 0x09, 0x00, 0x00, 0x00, 0xA0, 0xCB]);
+    });
+    apply_notification(&serde_json::json!({
+        "eventType": "NEW_VERSION_ID_OF_PLMN_ASSIGNED_IDs",
+        "versionId": 6,
+    }));
+    assert_eq!(deleted_len(), 2);
+    assert!(!is_known_deleted(&nth_id(0x05, 1)));
+    assert!(
+        is_retired(&nth_id(0x05, 1)),
+        "still retired, by its Version ID"
+    );
+    assert!(is_known_deleted(&nth_id(0x06, 2)));
+    // The FIFO order follows the set, so a later eviction cannot resurrect a
+    // dropped entry or skip a live one.
+    assert_eq!(with_cache(|c| c.deleted_order.len()), 2);
+}

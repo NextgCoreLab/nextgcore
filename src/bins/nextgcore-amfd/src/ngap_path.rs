@@ -269,6 +269,11 @@ impl GnbSession {
     }
 }
 
+/// #747: the most UE RADIO CAPABILITY ID MAPPING Resolves at the UCMF that run at
+/// once. Each is one SBI request; more than this means a gNB is presenting IDs
+/// faster than any capability enquiry could produce them.
+const MAX_MAPPING_RESOLVES_IN_FLIGHT: usize = 16;
+
 /// GMM procedure timers with retransmission (TS 24.501 Table 10.2.1)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NasProcTimer {
@@ -785,6 +790,10 @@ pub struct NgapServer {
     /// so the downlink FAR (gNB TEID) was installed on a stale session and
     /// downlink user traffic was silently black-holed.
     sm_context_refs: HashMap<(u64, u8), String>,
+    /// #747: how many UE RADIO CAPABILITY ID MAPPING Resolves are running off
+    /// this task (through `sbi_offload`); capped at
+    /// [`MAX_MAPPING_RESOLVES_IN_FLIGHT`].
+    mapping_resolves_in_flight: Arc<std::sync::atomic::AtomicUsize>,
     /// The SMF that holds each SM context, as (host, port) (#669). Written beside
     /// `sm_context_refs` at Create; Update/Release go here rather than to
     /// `SMF_SBI_ADDR`, which after an SMF restart may still route to the old pod
@@ -980,6 +989,7 @@ impl NgapServer {
             server_event_rx,
             ue_auth_state,
             sm_context_refs: HashMap::new(),
+            mapping_resolves_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             sm_context_smfs: HashMap::new(),
             handover_target_assoc: HashMap::new(),
             handover_target_transfers: HashMap::new(),
@@ -6271,32 +6281,82 @@ impl NgapServer {
             );
             return Ok(());
         };
-        let capability = match crate::racs::cache_get(&id) {
-            Some(cap) if !crate::racs::is_retired(&id) => Some(cap),
-            _ => match crate::racs::ucmf_resolve(&id).await {
+        // Answered at once from the cache.
+        if let Some(cap) = crate::racs::cache_get(&id).filter(|_| !crate::racs::is_retired(&id)) {
+            if let Some(pdu) = crate::racs::build_mapping_response(&id, &cap) {
+                self.send_to_association(association_id, &pdu).await?;
+                log::info!(
+                    "UE Radio Capability ID Mapping Response sent to association \
+                     {association_id}: {} octets for ID {id:02x?}",
+                    cap.len()
+                );
+            }
+            return Ok(());
+        }
+        // #747: an ID the UCMF already said it has no entry for is not asked again.
+        if crate::racs::is_known_deleted(&id) {
+            log::info!(
+                "UE radio capability ID {id:02x?} is deleted at the UCMF; no mapping \
+                 response (TS 38.413 §8.14.3.3: no unsuccessful outcome)"
+            );
+            return Ok(());
+        }
+        // #747: the Resolve runs off this task, which serves every gNB and must not
+        // wait on the UCMF (up to the SBI timeout, plus NRF discovery). The number in
+        // flight is capped, so a gNB flooding the procedure with random IDs gets the
+        // excess unanswered, which §8.14.3.3 allows: the NG-RAN node then retrieves
+        // the capability from the UE.
+        let in_flight = Arc::clone(&self.mapping_resolves_in_flight);
+        if in_flight.fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            >= MAX_MAPPING_RESOLVES_IN_FLIGHT
+        {
+            in_flight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            log::warn!(
+                "UE Radio Capability ID Mapping Request from association {association_id} \
+                 not resolved: {MAX_MAPPING_RESOLVES_IN_FLIGHT} UCMF lookups already \
+                 running; no mapping response"
+            );
+            return Ok(());
+        }
+        self.sbi_offload.spawn(async move {
+            let capability = match crate::racs::ucmf_resolve(&id).await {
                 Ok(cap) => cap,
                 Err(e) => {
                     log::warn!("UE radio capability ID {id:02x?} not resolved: {e}");
                     None
                 }
-            },
-        };
-        let Some(capability) = capability else {
-            log::warn!(
-                "UE radio capability ID {id:02x?} maps to no capability; no mapping \
-                 response (TS 38.413 §8.14.3.3: no unsuccessful outcome)"
-            );
-            return Ok(());
-        };
-        if let Some(pdu) = crate::racs::build_mapping_response(&id, &capability) {
-            self.send_to_association(association_id, &pdu).await?;
-            log::info!(
-                "UE Radio Capability ID Mapping Response sent to association \
-                 {association_id}: {} octets for ID {id:02x?}",
-                capability.len()
-            );
-        }
+            };
+            in_flight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            match capability.and_then(|cap| crate::racs::build_mapping_response(&id, &cap)) {
+                Some(pdu) => Some(crate::sbi_offload::SbiOutcome::MappingResponse {
+                    association_id,
+                    pdu,
+                }),
+                None => {
+                    log::warn!(
+                        "UE radio capability ID {id:02x?} maps to no capability; no mapping \
+                         response (TS 38.413 §8.14.3.3: no unsuccessful outcome)"
+                    );
+                    None
+                }
+            }
+        });
         Ok(())
+    }
+
+    /// #747: send a UE Radio Capability ID Mapping Response an off-task UCMF
+    /// lookup produced. An association that closed meanwhile fails the send,
+    /// which is logged: the gNB that asked is gone.
+    async fn send_mapping_response(&mut self, association_id: u64, pdu: &[u8]) {
+        match self.send_to_association(association_id, pdu).await {
+            Ok(()) => log::info!(
+                "UE Radio Capability ID Mapping Response sent to association {association_id}"
+            ),
+            Err(e) => log::warn!(
+                "UE Radio Capability ID Mapping Response for association {association_id} \
+                 not sent: {e}"
+            ),
+        }
     }
 
     /// Assign a fresh 5G-GUTI and build the CONFIGURATION UPDATE COMMAND that carries it.
@@ -7906,6 +7966,10 @@ impl NgapServer {
                         log::warn!("Establishment retry outcome not applied: {e}");
                     }
                 }
+                crate::sbi_offload::SbiOutcome::MappingResponse {
+                    association_id,
+                    pdu,
+                } => self.send_mapping_response(association_id, &pdu).await,
             }
         }
     }
@@ -15195,6 +15259,7 @@ pub async fn amf_ngap_poll() -> Result<bool> {
 mod tests {
     /// Handler-level tests asserting what amfd SENDS (#760, ...), in their own file.
     mod handler_tests;
+    mod racs_mapping_tests;
 
     use super::*;
     use crate::context::AmfContext;
