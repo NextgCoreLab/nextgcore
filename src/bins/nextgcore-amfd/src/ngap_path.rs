@@ -5256,6 +5256,7 @@ impl NgapServer {
     /// to the one its new N2 connection was given. A UE coming back from CM-IDLE
     /// arrives under a fresh id (#518, #609).
     fn rekey_ue_sessions(&mut self, old_id: u64, new_id: u64) {
+        self.sbi_offload.rekey_ue(old_id, new_id);
         {
             let ctx = crate::context::amf_self();
             let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
@@ -7070,6 +7071,10 @@ impl NgapServer {
             // PDU Session Establishment Request
             0xC1 => {
                 log::info!("PDU Session Establishment Request from UE: PSI={psi}, PTI={pti}");
+                // #877 m1: the re-selection window runs from the request's arrival,
+                // so a first attempt that takes the connect timeout to fail does not
+                // push the #90 past the UE's T3580.
+                let arrived = std::time::Instant::now();
 
                 // #796: a UE retransmission (T3580) of a request already waiting for
                 // an SMF is not a new attempt. Sending it on the NGAP task would hold
@@ -7234,6 +7239,7 @@ impl NgapServer {
                             ran_ue_ngap_id,
                             sm_pdu,
                             dnn_override,
+                            arrived,
                             &e,
                         )
                         .await?;
@@ -7667,6 +7673,7 @@ impl NgapServer {
     /// waiting, the UE is answered instead: a DL NAS TRANSPORT carrying its 5GSM
     /// message back with 5GMM #90 "payload was not forwarded" (TS 24.501
     /// §5.4.5.2.5 a) 1), §5.4.5.3.1 case e): routing failure).
+    #[allow(clippy::too_many_arguments)]
     async fn defer_establishment(
         &mut self,
         association_id: u64,
@@ -7674,6 +7681,7 @@ impl NgapServer {
         ran_ue_ngap_id: u32,
         sm_pdu: &[u8],
         dnn_override: Option<&str>,
+        arrived: std::time::Instant,
         error: &crate::sbi_path::SbiError,
     ) -> Result<()> {
         let psi = sm_pdu[1];
@@ -7683,7 +7691,7 @@ impl NgapServer {
         let (first_failure, generation) = self.pending_establishments.get(&key).map_or_else(
             || {
                 (
-                    now,
+                    arrived,
                     ESTABLISHMENT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 )
             },
@@ -7826,7 +7834,7 @@ impl NgapServer {
     /// Start one off-task re-selection attempt (#796): SMF selection (NRF discovery
     /// on a cache miss) and CreateSMContext, bounded by what is left of the window.
     fn spawn_establishment_attempt(
-        &self,
+        &mut self,
         amf_ue_ngap_id: u64,
         p: &PendingEstablishment,
         state: &UeNasContext,
@@ -7848,42 +7856,45 @@ impl NgapServer {
         };
         let sm_pdu = p.sm_pdu.clone();
         let dnn = p.dnn_override.clone();
-        let budget = ESTABLISHMENT_RETRY_WINDOW.saturating_sub(p.first_failure.elapsed());
         let generation = p.generation;
         log::info!("UE {amf_ue_ngap_id}: retrying PDU session establishment PSI={psi} (#796)");
-        self.sbi_offload.spawn(async move {
-            let smf = crate::sbi_path::resolve_nf_endpoint_async(
-                crate::sbi_path::SbiServiceType::NsmfPdusession,
-            )
-            .await
-            .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777));
-            let call = crate::sbi_path::call_smf_create_sm_context(
-                &smf.0,
-                smf.1,
-                psi,
-                sst,
-                sd,
-                dnn.as_deref(),
-                &sm_pdu,
-                redcap_indication,
-                &identity,
-            );
-            let result = tokio::time::timeout(budget, call)
+        // Keyed on the session, so it is ordered with any other exchange for it
+        // (the release of an abandoned context below), and `forget_ue` cancels it.
+        // Not cut short at the window's end (#877 m4): the window is enforced by
+        // the supervision, and a CreateSMContext that does complete late is
+        // released rather than lost. The SBI client's own timeout bounds it.
+        self.sbi_offload
+            .spawn_keyed((amf_ue_ngap_id, psi), move || async move {
+                let smf = crate::sbi_path::resolve_nf_endpoint_async(
+                    crate::sbi_path::SbiServiceType::NsmfPdusession,
+                )
                 .await
-                .unwrap_or(Err(crate::sbi_path::SbiError::Timeout));
-            Some(crate::sbi_offload::SbiOutcome::Establishment(
-                EstablishmentAttempt {
-                    amf_ue_ngap_id,
+                .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777));
+                let result = crate::sbi_path::call_smf_create_sm_context(
+                    &smf.0,
+                    smf.1,
                     psi,
-                    generation,
                     sst,
                     sd,
-                    dnn,
-                    smf,
-                    result,
-                },
-            ))
-        });
+                    dnn.as_deref(),
+                    &sm_pdu,
+                    redcap_indication,
+                    &identity,
+                )
+                .await;
+                Some(crate::sbi_offload::SbiOutcome::Establishment(
+                    EstablishmentAttempt {
+                        amf_ue_ngap_id,
+                        psi,
+                        generation,
+                        sst,
+                        sd,
+                        dnn,
+                        smf,
+                        result,
+                    },
+                ))
+            });
     }
 
     /// Apply every outcome the off-task SBI work produced, on the NGAP task.
@@ -7942,7 +7953,9 @@ impl NgapServer {
                     .and_then(split_authority)
                     .unwrap_or(a.smf);
                 let sm_ref = resp.sm_context_ref;
-                self.sbi_offload.spawn(async move {
+                // Keyed on the session, so it reaches the SMF before any later
+                // CreateSMContext for the same PSI.
+                self.sbi_offload.spawn_keyed(key, move || async move {
                     if let Err(e) =
                         crate::sbi_path::call_smf_release_sm_context(&host, port, &sm_ref).await
                     {
@@ -9373,6 +9386,9 @@ impl NgapServer {
     /// `handle_handover_notify` documents why it must not use `release_ue` either.
     fn forget_ue(&mut self, amf_ue_ngap_id: u64) {
         self.ue_auth_state.remove(amf_ue_ngap_id);
+        // #877 re-review M1: the UE's off-task SBI work is aborted, which frees
+        // the permits it held for other UEs.
+        self.sbi_offload.cancel_ue(amf_ue_ngap_id);
         // #796: nothing waits for an SMF on behalf of a UE that is gone.
         self.pending_establishments
             .retain(|(ue, _), _| *ue != amf_ue_ngap_id);

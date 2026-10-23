@@ -871,6 +871,7 @@ async fn an_unanswering_smf_does_not_hold_the_ngap_task() {
             ran,
             &request,
             None,
+            std::time::Instant::now(),
             &crate::sbi_path::SbiError::Timeout,
         )
         .await
@@ -920,6 +921,7 @@ async fn the_window_ends_on_time_while_an_attempt_hangs() {
             ran,
             &request,
             None,
+            std::time::Instant::now(),
             &crate::sbi_path::SbiError::Timeout,
         )
         .await
@@ -951,11 +953,13 @@ async fn the_window_ends_on_time_while_an_attempt_hangs() {
         matches!(sent.as_slice(), [Sent::DownlinkNas { .. }]),
         "the #90 DL NAS Transport at the end of the window: {sent:?}"
     );
-    // The attempt gives up within what was left of the window; its outcome
-    // changes nothing.
-    settle_establishments(&mut server).await;
+    // The attempt is still waiting on the SMF (its own SBI timeout bounds it);
+    // whatever it returns later is matched against a request that no longer
+    // waits (`a_late_success_for_an_earlier_request_is_released_not_applied`).
+    server.process_sbi_outcomes().await;
     assert!(take_sent_ngap(&mut server).is_empty());
     server.forget_ue(ue);
+    until_in_flight(&server, 0).await;
 }
 
 /// #796 review m1: a UE that goes CM-IDLE during the window is dropped without
@@ -973,6 +977,7 @@ async fn a_ue_that_went_idle_is_dropped_from_the_window() {
             ran,
             &request,
             None,
+            std::time::Instant::now(),
             &crate::sbi_path::SbiError::Timeout,
         )
         .await
@@ -986,4 +991,129 @@ async fn a_ue_that_went_idle_is_dropped_from_the_window() {
     assert_eq!(server.sbi_offload.in_flight(), 0);
     assert!(take_sent_ngap(&mut server).is_empty());
     server.forget_ue(ue);
+}
+
+/// #877 m1: the window runs from the request's arrival, not from the first
+/// failure, which an unanswering SMF reports only after the connect timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_window_runs_from_the_request_arrival() {
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_796_014u64, 101);
+    ue_ready_for_sessions(&mut server, ue, ran);
+    let arrived = std::time::Instant::now() - Duration::from_secs(5);
+    server
+        .defer_establishment(
+            ASSOC,
+            ue,
+            ran,
+            &[0x2E, 0x05, 0x01, 0xC1, 0xFF, 0xFF],
+            None,
+            arrived,
+            &crate::sbi_path::SbiError::Timeout,
+        )
+        .await
+        .expect("deferred");
+    assert_eq!(
+        server.pending_establishments[&(ue, 5)].first_failure,
+        arrived
+    );
+    server.forget_ue(ue);
+}
+
+/// #877 m2: an attempt's late success for an EARLIER request of the same PSI
+/// (that one was answered #90 and the UE asked again) is not applied to the new
+/// request: nothing is set up, the new request keeps waiting, and the context
+/// the late success created is released at its SMF.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_success_for_an_earlier_request_is_released_not_applied() {
+    let (_smf, smf_port, seen) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_796_015u64, 102);
+    ue_ready_for_sessions(&mut server, ue, ran);
+    let request = [0x2E, 0x05, 0x01, 0xC1, 0xFF, 0xFF];
+    defer_request(&mut server, ue, ran, &request).await;
+    let earlier = server.pending_establishments[&(ue, 5)].generation;
+    // That request was answered #90; the UE asked again.
+    server.pending_establishments.remove(&(ue, 5));
+    defer_request(&mut server, ue, ran, &request).await;
+    assert_ne!(server.pending_establishments[&(ue, 5)].generation, earlier);
+
+    server
+        .apply_establishment_attempt(EstablishmentAttempt {
+            amf_ue_ngap_id: ue,
+            psi: 5,
+            generation: earlier,
+            sst: 1,
+            sd: None,
+            dnn: None,
+            smf: ("127.0.0.1".to_string(), smf_port),
+            result: Ok(crate::sbi_path::SmContextCreateResponse {
+                n1_sm_msg: vec![0x2E, 0x05, 0x01, 0xC2],
+                n2_sm_info: transfer_for("late-796"),
+                sm_context_ref: "late-796".to_string(),
+                smf_authority: Some(format!("127.0.0.1:{smf_port}")),
+            }),
+        })
+        .await
+        .expect("applied");
+    server.sbi_offload.settle().await;
+
+    assert!(take_sent_ngap(&mut server).is_empty(), "nothing set up");
+    assert!(server.pending_establishments.contains_key(&(ue, 5)));
+    assert!(!server.sm_context_refs.contains_key(&(ue, 5)));
+    assert!(
+        seen.lock()
+            .expect("seen")
+            .iter()
+            .any(|(uri, _)| uri.ends_with("/sm-contexts/late-796/release")),
+        "the late context is released: {:?}",
+        seen.lock().expect("seen")
+    );
+    server.forget_ue(ue);
+}
+
+/// #877 re-review M1: a departed UE's attempt stops holding a permit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn forgetting_a_ue_frees_its_attempt_permit() {
+    let (_hang, port) = hanging_smf();
+    let _env = super::SmfEnvGuard::set(port);
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_796_016u64, 103);
+    ue_ready_for_sessions(&mut server, ue, ran);
+    server
+        .defer_establishment(
+            ASSOC,
+            ue,
+            ran,
+            &[0x2E, 0x05, 0x01, 0xC1, 0xFF, 0xFF],
+            None,
+            std::time::Instant::now(),
+            &crate::sbi_path::SbiError::Timeout,
+        )
+        .await
+        .expect("deferred");
+    make_establishments_due(&mut server);
+    server.process_pending_establishments().await;
+    until_in_flight(&server, 1).await;
+
+    server.forget_ue(ue);
+
+    until_in_flight(&server, 0).await;
+    assert!(!server.sbi_offload.key_busy((ue, 5)));
+}
+
+async fn defer_request(server: &mut NgapServer, ue: u64, ran: u32, request: &[u8]) {
+    server
+        .defer_establishment(
+            ASSOC,
+            ue,
+            ran,
+            request,
+            None,
+            std::time::Instant::now(),
+            &crate::sbi_path::SbiError::Timeout,
+        )
+        .await
+        .expect("deferred");
 }
