@@ -451,10 +451,14 @@ impl Ucmf {
     ) -> Subscription {
         self.purge_expired(now);
         let seq = self.next_sub_seq;
-        self.next_sub_seq += 1;
+        // The counter is restored from the state file, so it is not trusted not
+        // to be near the top of its range.
+        self.next_sub_seq = self.next_sub_seq.saturating_add(1);
         // Deterministic per-subscription spread, so consecutive subscriptions
-        // never share an expiry.
-        let spread = ChronoDuration::seconds(((seq as i64) * 37) % EXPIRY_SPREAD_SECS);
+        // never share an expiry. `(seq mod m)·37 mod m` is `seq·37 mod m`
+        // without the multiplication overflowing.
+        let m = EXPIRY_SPREAD_SECS as u64;
+        let spread = ChronoDuration::seconds((((seq % m) * 37) % m) as i64);
         let ceiling = now + ChronoDuration::seconds(MAX_SUBSCRIPTION_LIFETIME_SECS) - spread;
         let expires = match suggested {
             Some(s) if s < ceiling => s,
@@ -521,7 +525,7 @@ impl Ucmf {
         if ok.is_empty() {
             return (None, failed, None);
         }
-        self.next_prov_seq += 1;
+        self.next_prov_seq = self.next_prov_seq.saturating_add(1);
         let prov = Provisioning {
             id: prov_id,
             configs: ok,
@@ -926,13 +930,28 @@ fn parse_racs_configuration(config: &Value) -> Option<(Vec<String>, Capabilities
     caps.has_any().then_some((tacs, caps))
 }
 
+/// A non-empty, even-length string of ASCII hexadecimal digits as octets, or
+/// `None`.
+///
+/// Works on the bytes, never on `&str` slices: `racsParamEps` / `racsParam5Gs`
+/// arrive from any SBI peer, and slicing a `&str` at a byte offset that is not
+/// a char boundary panics (#725). Any byte outside `[0-9A-Fa-f]`, which
+/// includes every byte of a multi-byte UTF-8 character, is refused.
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    if s.is_empty() || !s.len().is_multiple_of(2) {
+    let b = s.as_bytes();
+    if b.is_empty() || !b.len().is_multiple_of(2) {
         return None;
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+    let nibble = |c: u8| -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    };
+    b.chunks_exact(2)
+        .map(|p| Some((nibble(p[0])? << 4) | nibble(p[1])?))
         .collect()
 }
 
@@ -1331,6 +1350,114 @@ mod tests {
             notes[0].body["manAssOpRequestlist"]["plmnAssiUeRadioCapId"],
             json!([plmn.to_nucmf()])
         );
+    }
+
+    // ----------------------------------------------------------------- #725
+
+    /// `"aéa"` is four bytes, so it passed the even-length check and then
+    /// panicked slicing `s[0..2]` across the `é`. Each of these lands a
+    /// multi-byte character on an even byte offset, or is otherwise not hex.
+    #[test]
+    fn a_racs_param_that_is_not_ascii_hex_is_other_reason_not_a_panic() {
+        for bad in [
+            "aéa", "éé", "0é0", "€0", "0g", " 0a", "0a ", "+1", "0x0a", "a", "",
+        ] {
+            for member in ["racsParam5Gs", "racsParamEps"] {
+                let mut u = Ucmf::new(1, ModeOfOperation::B);
+                let mut m = Map::new();
+                m.insert(MAN.into(), json!({"imeiTacs": ["35123456"], member: bad}));
+                let (prov, failed, _) = u.create_provisioning(&m, None, now());
+                assert!(prov.is_none(), "{member}={bad:?} must not provision");
+                assert_eq!(
+                    failed,
+                    [(MAN.to_string(), RACS_OTHER_REASON)],
+                    "{member}={bad:?}"
+                );
+                assert_eq!(u.entry_count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn decode_hex_takes_either_case_and_refuses_odd_or_empty() {
+        assert_eq!(decode_hex("00aAfF19"), Some(vec![0x00, 0xAA, 0xFF, 0x19]));
+        assert_eq!(decode_hex("abc"), None);
+        assert_eq!(decode_hex(""), None);
+    }
+
+    /// The provisioning and subscription counters are restored from the state
+    /// file. At the top of their range they used to overflow (`+= 1`, and
+    /// `seq * 37` in the expiry spread), which panics under the state lock.
+    #[test]
+    fn counters_at_the_top_of_their_range_do_not_overflow() {
+        let mut u = Ucmf::new(1, ModeOfOperation::B);
+        u.restore(&json!({"nextSubSeq": u64::MAX, "nextProvSeq": u64::MAX}));
+        let a = u.subscribe(None, "http://amf/n".into(), None, now());
+        assert_eq!(a.id, u64::MAX.to_string());
+        let ceiling = now() + ChronoDuration::seconds(MAX_SUBSCRIPTION_LIFETIME_SECS);
+        assert!(a.expires.unwrap() <= ceiling);
+        u.subscribe(None, "http://amf/m".into(), None, now());
+        let (prov, _, _) = u.create_provisioning(&racs(MAN, "0a"), None, now());
+        assert_eq!(prov.unwrap().id, u64::MAX.to_string());
+    }
+
+    mod fuzz {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// The reference: what a hex octet string is, written the obvious way.
+        fn reference(s: &str) -> Option<Vec<u8>> {
+            let ok = !s.is_empty()
+                && s.len().is_multiple_of(2)
+                && s.chars().all(|c| c.is_ascii_hexdigit());
+            ok.then(|| {
+                (0..s.len() / 2)
+                    .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
+                    .collect()
+            })
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(2000))]
+
+            /// Any string at all, multi-byte characters included.
+            #[test]
+            fn decode_hex_never_panics_and_agrees_with_the_reference(s in any::<String>()) {
+                prop_assert_eq!(decode_hex(&s), reference(&s));
+            }
+
+            /// Strings drawn mostly from hex digits, with the odd non-ASCII
+            /// character, so the even-length, mostly-valid cases are reached.
+            #[test]
+            fn near_hex_strings_agree_with_the_reference(s in "[0-9a-fA-Fé€ g]{0,24}") {
+                prop_assert_eq!(decode_hex(&s), reference(&s));
+            }
+
+            #[test]
+            fn hex_of_any_octets_round_trips(b in proptest::collection::vec(any::<u8>(), 1..64)) {
+                prop_assert_eq!(decode_hex(&hex(&b)), Some(b.clone()));
+                prop_assert_eq!(decode_hex(&hex(&b).to_uppercase()), Some(b));
+            }
+
+            /// Whole `RacsConfiguration`s from arbitrary JSON-ish members.
+            #[test]
+            fn any_racs_configuration_is_provisioned_or_refused(
+                key in "[0-9a-f]{0,22}|.{0,22}",
+                tac in "[0-9]{8}|.{0,10}",
+                p5 in proptest::option::of(any::<String>()),
+                peps in proptest::option::of("[0-9a-f]{0,40}|.{0,40}"),
+            ) {
+                let mut u = Ucmf::new(1, ModeOfOperation::B);
+                let mut cfg = json!({"imeiTacs": [tac]});
+                if let Some(p) = p5 { cfg["racsParam5Gs"] = json!(p); }
+                if let Some(p) = peps { cfg["racsParamEps"] = json!(p); }
+                let mut m = Map::new();
+                m.insert(key.clone(), cfg);
+                let (prov, failed, _) = u.create_provisioning(&m, None, now());
+                prop_assert!(prov.is_some() == failed.is_empty());
+                prop_assert_eq!(u.entry_count(), usize::from(prov.is_some()));
+            }
+        }
     }
 
     #[test]

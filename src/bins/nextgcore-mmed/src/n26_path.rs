@@ -227,6 +227,16 @@ fn record_forward_relocation_source(mme_ue_id: u64, source: ForwardRelocationSou
     }
 }
 
+/// Whether `mme_ue_id` is arriving over N26 from a source AMF: its Forward
+/// Relocation is recorded and not yet completed. Read, not taken (#730 review B1:
+/// the Handover Notify checks it before completing the handover).
+pub fn forward_relocation_in_flight(mme_ue_id: u64) -> bool {
+    forward_relocation_sources()
+        .lock()
+        .map(|m| m.contains_key(&mme_ue_id))
+        .unwrap_or(false)
+}
+
 /// Take this UE's N26 arrival record, if it has one — the decision half of
 /// [`notify_forward_relocation_complete`] (#408).
 ///

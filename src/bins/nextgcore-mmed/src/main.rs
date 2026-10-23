@@ -15,6 +15,7 @@ pub mod esm_build;
 pub mod esm_handler;
 pub mod fd_path;
 pub mod gtp_path;
+pub mod handover_switch;
 pub mod n26_build;
 pub mod n26_path;
 pub mod nas_dispatch;
@@ -368,6 +369,19 @@ impl Default for MmeApp {
     }
 }
 
+/// The `/metrics` listen address: `MME_METRICS_ADDR` (`ip:port`), default
+/// `127.0.0.1:9090`. Private by default: nothing is published beyond the host
+/// unless an operator chooses an address.
+fn metrics_addr() -> std::net::SocketAddr {
+    parse_metrics_addr(std::env::var("MME_METRICS_ADDR").ok().as_deref())
+}
+
+fn parse_metrics_addr(value: Option<&str>) -> std::net::SocketAddr {
+    value
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| std::net::SocketAddr::from(([127, 0, 0, 1], 9090)))
+}
+
 /// The MME runs on a tokio runtime.
 ///
 /// Required by the S1-MME SCTP transport (issue #42), which is `AsyncFd`-driven.
@@ -416,6 +430,20 @@ async fn main() -> Result<()> {
         running.store(false, Ordering::SeqCst);
     })?;
 
+    // Prometheus /metrics (#730 review m-b): the handover failure counter.
+    // Loopback by default: the endpoint is unauthenticated, so an operator who
+    // wants it scraped from another host sets MME_METRICS_ADDR to a private
+    // address on purpose (or scrapes through a sidecar).
+    match nextgcore_metrics::nes_energy::serve_metrics(
+        metrics_addr(),
+        Arc::new(handover_switch::render_metrics),
+    )
+    .await
+    {
+        Ok((bound, _handle)) => log::info!("MME metrics on http://{bound}/metrics"),
+        Err(e) => log::warn!("MME metrics endpoint not started: {e}"),
+    }
+
     // Initialize
     app.init(&args.config).await?;
 
@@ -436,6 +464,20 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The metrics endpoint is loopback unless configured otherwise.
+    #[test]
+    fn the_metrics_endpoint_defaults_to_loopback() {
+        assert_eq!(parse_metrics_addr(None), "127.0.0.1:9090".parse().unwrap());
+        assert_eq!(
+            parse_metrics_addr(Some("not an address")),
+            "127.0.0.1:9090".parse().unwrap()
+        );
+        assert_eq!(
+            parse_metrics_addr(Some("10.0.0.5:9191")),
+            "10.0.0.5:9191".parse().unwrap()
+        );
+    }
 
     #[test]
     fn test_mme_app_creation() {
