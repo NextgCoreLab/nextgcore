@@ -299,13 +299,13 @@ impl<T: crate::transport::DiameterTransportIo> DiameterPeer<T> {
         }
     }
 
-    /// Send a Diameter message through this peer
     /// Set the transport's TCP_USER_TIMEOUT (see
     /// [`crate::transport::DiameterTransportIo::set_user_timeout`]).
     pub fn set_user_timeout(&self, timeout: Duration) -> std::io::Result<()> {
         self.transport.set_user_timeout(timeout)
     }
 
+    /// Send a Diameter message through this peer
     pub async fn send_message(&mut self, msg: &DiameterMessage) -> DiameterResult<()> {
         if self.state != PeerState::Open {
             return Err(DiameterError::Protocol(format!(
