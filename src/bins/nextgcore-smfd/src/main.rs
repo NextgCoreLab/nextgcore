@@ -5284,7 +5284,7 @@ async fn abandon_gsm_procedure(sm_context_ref: &str, timer_id: timer::SmfTimerId
     if timer_id != timer::SmfTimerId::T3592 {
         return;
     }
-    let status_uri = release_sm_context_locally(sm_context_ref);
+    let status_uri = complete_sm_context_release(sm_context_ref).await;
     log::warn!("ref={sm_context_ref}: released locally after T3592 exhaustion");
     send_sm_context_status_notification(status_uri.as_deref(), "RELEASED", None).await;
 }
@@ -5309,6 +5309,47 @@ pub(crate) fn lookup_policy_binding_for_test(sm_context_ref: &str) -> bool {
 #[cfg(test)]
 pub(crate) async fn abandon_gsm_procedure_for_test(sm_context_ref: &str) {
     abandon_gsm_procedure(sm_context_ref, timer::SmfTimerId::T3592).await;
+}
+
+/// SM Policy Association Termination (TS 23.502 §4.16.6) for `sm_context_ref`:
+/// Npcf_SMPolicyControl_Delete at the PCF.
+///
+/// The policy id is TAKEN out of the binding before the request is sent, so a
+/// release path that reaches this twice (the UE-requested release deletes it at
+/// step 2 and the RELEASE COMPLETE that follows finishes the context) sends one
+/// DELETE, not two. A PCF that cannot be reached or refuses is logged, and the
+/// release continues: keeping the SM context alive for the PCF's sake would leak
+/// the session instead.
+async fn terminate_sm_policy_association(sm_context_ref: &str) {
+    let pol_id = smf_self().read().ok().and_then(|ctx| {
+        ctx.policy_bindings.write().ok().and_then(|mut b| {
+            b.get_mut(sm_context_ref)
+                .and_then(|b| b.sm_policy_id.take())
+        })
+    });
+    let Some(pol_id) = pol_id else {
+        return;
+    };
+    match policy::resolve_pcf_endpoint().await {
+        Some(pcf) => match policy::sm_policy_delete(&pcf, &pol_id).await {
+            Ok(()) => log::info!("SM policy association {pol_id} deleted at PCF"),
+            Err(e) => log::warn!("SM policy delete failed: {e} (continuing release)"),
+        },
+        None => log::warn!("PCF unresolved — skipping SM policy delete for {pol_id}"),
+    }
+}
+
+/// Finish a network-initiated release that the SMF completes on its own: the UE's
+/// PDU SESSION RELEASE COMPLETE, or T3592 exhaustion. Terminates the SM Policy
+/// Association (TS 23.502 §4.3.4.2 step 12, #719), then drops the context; returns
+/// the AMF's `smContextStatusUri` for the RELEASED notification.
+///
+/// #719: the UPF-restart reactivation release (#667/#672) reaches the end of the
+/// release only through here, and before this it never told the PCF: every UPF
+/// restart left one dead SM policy association, and its BSF binding, per session.
+async fn complete_sm_context_release(sm_context_ref: &str) -> Option<String> {
+    terminate_sm_policy_association(sm_context_ref).await;
+    release_sm_context_locally(sm_context_ref)
 }
 
 /// Drop an SM context and its policy binding, returning the AMF's
@@ -5814,7 +5855,7 @@ async fn handle_n1_sm_message(sm_context_ref: &str, n1: &[u8]) -> SbiResponse {
             cancel_gsm_timer(sm_context_ref, timer::SmfTimerId::T3592);
             // The release procedure is finished: drop the context and tell the
             // AMF, which is what the SMF-initiated release path also does.
-            let status_uri = release_sm_context_locally(sm_context_ref);
+            let status_uri = complete_sm_context_release(sm_context_ref).await;
             send_sm_context_status_notification(status_uri.as_deref(), "RELEASED", None).await;
             SbiResponse::with_status(204)
         }
@@ -5898,17 +5939,7 @@ async fn ran_released_session(sm_context_ref: &str, n2: Option<&[u8]>) -> SbiRes
 /// Shared by the UE-initiated release path and reachable independently of the
 /// full `/release` handler, which additionally drops the context.
 async fn release_user_plane(sm_context_ref: &str) {
-    if let Some(binding) = lookup_policy_binding(sm_context_ref) {
-        if let Some(ref pol_id) = binding.sm_policy_id {
-            match policy::resolve_pcf_endpoint().await {
-                Some(pcf) => match policy::sm_policy_delete(&pcf, pol_id).await {
-                    Ok(()) => log::info!("SM policy association {pol_id} deleted at PCF"),
-                    Err(e) => log::warn!("SM policy delete failed: {e} (continuing release)"),
-                },
-                None => log::warn!("PCF unresolved — skipping SM policy delete"),
-            }
-        }
-    }
+    terminate_sm_policy_association(sm_context_ref).await;
     if let Some(seid) = lookup_upf_seid(sm_context_ref) {
         match pfcp_session_delete(smf_n4_seid_for(sm_context_ref), seid).await {
             Ok(()) => {
@@ -9755,6 +9786,121 @@ mod tests {
         for k in ["SMF_URR_VOLUME_QUOTA", "SMF_URR_TIME_QUOTA"] {
             std::env::remove_var(k);
         }
+    }
+
+    // ---- #719: a reactivation release terminates the SM Policy Association ----
+
+    /// The DELETEs a recording PCF received for `pol_id`.
+    fn policy_deletes(
+        seen: &std::sync::Mutex<Vec<(String, serde_json::Value)>>,
+        pol_id: &str,
+    ) -> usize {
+        let path = format!("/npcf-smpolicycontrol/v1/sm-policies/{pol_id}/delete");
+        seen.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(uri, _)| *uri == path)
+            .count()
+    }
+
+    /// A session with a PCF policy association, released through the UE for
+    /// reactivation the way a UPF restart releases it (#667/#672).
+    async fn reactivation_released_session(reference: &str, pol_id: &str) {
+        seed_binding(reference, 5);
+        if let Ok(ctx) = smf_self().read() {
+            if let Some(b) = ctx.policy_bindings.write().unwrap().get_mut(reference) {
+                b.sm_policy_id = Some(pol_id.to_string());
+            }
+        }
+        // The AMF is unreachable: the release command is still sent and T3592 armed.
+        release_for_reactivation(reference, "http://127.0.0.1:1", "imsi-001010000000001", 5).await;
+        assert!(
+            gsm_procedure_timers()
+                .lock()
+                .expect("timers")
+                .contains_key(reference),
+            "T3592 guards the release command"
+        );
+    }
+
+    /// #719, TS 23.502 §4.3.4.2 step 12: the UE's PDU SESSION RELEASE COMPLETE ends a
+    /// reactivation release, and the SMF terminates the SM Policy Association at the
+    /// PCF (§4.16.6) as every other release path does. Before #719 this path dropped
+    /// the context and left the association at the PCF for good.
+    #[tokio::test]
+    async fn a_reactivation_release_completed_by_the_ue_deletes_the_sm_policy() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (pcf_srv, pcf_seen) = spawn_recording_pcf(Ok((1, 1))).await;
+        let reference = "n719-complete";
+        reactivation_released_session(reference, "pol-719-complete").await;
+        assert_eq!(
+            policy_deletes(&pcf_seen, "pol-719-complete"),
+            0,
+            "not before the release completes (step 12 follows the UE's answer)"
+        );
+
+        let complete = n1(
+            5,
+            0,
+            gsm_build::message_type::PDU_SESSION_RELEASE_COMPLETE,
+            &[],
+        );
+        let status = handle_n1_sm_message(reference, &complete).await.status;
+        let deletes = policy_deletes(&pcf_seen, "pol-719-complete");
+        pcf_srv.stop().await.ok();
+        std::env::remove_var("PCF_URI");
+
+        assert_eq!(status, 204);
+        assert_eq!(deletes, 1, "one Npcf_SMPolicyControl_Delete, on the wire");
+        assert!(
+            lookup_policy_binding(reference).is_none(),
+            "the SM context is gone"
+        );
+    }
+
+    /// #719: the same when the UE never answers and T3592 is exhausted.
+    #[tokio::test]
+    async fn a_reactivation_release_abandoned_on_t3592_deletes_the_sm_policy() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (pcf_srv, pcf_seen) = spawn_recording_pcf(Ok((1, 1))).await;
+        let reference = "n719-t3592";
+        reactivation_released_session(reference, "pol-719-t3592").await;
+        cancel_gsm_timer(reference, timer::SmfTimerId::T3592);
+
+        abandon_gsm_procedure(reference, timer::SmfTimerId::T3592).await;
+        let deletes = policy_deletes(&pcf_seen, "pol-719-t3592");
+        pcf_srv.stop().await.ok();
+        std::env::remove_var("PCF_URI");
+
+        assert_eq!(deletes, 1, "one Npcf_SMPolicyControl_Delete, on the wire");
+        assert!(lookup_policy_binding(reference).is_none());
+    }
+
+    /// #719: a release path that reaches the termination twice (the UE-requested
+    /// release deletes at step 2, and its RELEASE COMPLETE finishes the context)
+    /// sends ONE delete: the policy id is taken out of the binding by the first.
+    #[tokio::test]
+    async fn the_sm_policy_is_deleted_once_however_many_steps_reach_it() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (pcf_srv, pcf_seen) = spawn_recording_pcf(Ok((1, 1))).await;
+        let reference = "n719-once";
+        seed_binding(reference, 5);
+        if let Ok(ctx) = smf_self().read() {
+            if let Some(b) = ctx.policy_bindings.write().unwrap().get_mut(reference) {
+                b.sm_policy_id = Some("pol-719-once".to_string());
+            }
+        }
+        release_user_plane(reference).await;
+        let status_uri = complete_sm_context_release(reference).await;
+        let deletes = policy_deletes(&pcf_seen, "pol-719-once");
+        pcf_srv.stop().await.ok();
+        std::env::remove_var("PCF_URI");
+
+        assert_eq!(status_uri, None);
+        assert_eq!(deletes, 1);
     }
 
     /// A loopback PCF that records every `/update` body and answers with the
