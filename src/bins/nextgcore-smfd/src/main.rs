@@ -793,7 +793,6 @@ async fn main() -> Result<()> {
         log::error!("Failed to bind the S5/S8 GTP-C socket: {e}");
         return Err(anyhow::anyhow!("S5/S8 bind failed: {e}"));
     }
-    let pfcp_client = pfcp_clients[0].clone();
 
     // #191: hand each client the Recovery Time Stamp the durable snapshot recorded
     // for its peer, BEFORE the association loop is spawned. This is what turns the
@@ -933,27 +932,39 @@ async fn main() -> Result<()> {
 
     pfcp_assoc_handle.abort();
 
-    // Graceful shutdown. #677: the N4 association is NOT released by default. A
-    // UPF answers an Association Release by deleting every session of the
-    // association (TS 29.244 §6.2.9), so releasing on a mere restart cut every
-    // UE's traffic; left in place, the UPF keeps forwarding while the next SMF
-    // incarnation associates (TS 23.527). An SMF being removed for good opts in
-    // with SMF_PFCP_RELEASE_ON_SHUTDOWN=true.
+    // Graceful shutdown. #677/#718: the N4 association is kept only when durable
+    // state will hand its sessions to the next incarnation, which then asks the UPF
+    // to retain them (PFCP Session Retention Information, TS 29.244 §6.2.6.2.1).
+    // Without durable state the next incarnation knows none of these sessions, so
+    // keeping the association left them orphaned in the UPF, under CP SEIDs the
+    // next incarnation reuses. Releasing deletes them (TS 29.244 §6.2.9).
+    // SMF_PFCP_RELEASE_ON_SHUTDOWN=true/false overrides the default either way.
+    let durable = smf_self()
+        .read()
+        .map(|ctx| ctx.state_is_enabled())
+        .unwrap_or(false);
     let release_on_shutdown = release_association_on_shutdown(
         std::env::var("SMF_PFCP_RELEASE_ON_SHUTDOWN")
             .ok()
             .as_deref(),
+        durable,
     );
     if !release_on_shutdown {
         log::info!(
-            "PFCP association kept on shutdown: the UPF keeps forwarding the PDU sessions \
+            "PFCP association kept on shutdown: durable state hands its sessions to the next \
+             SMF incarnation, which asks the UPF to retain them \
              (SMF_PFCP_RELEASE_ON_SHUTDOWN=true releases it)"
         );
     }
-    if release_on_shutdown && pfcp_client.is_associated().await {
-        match pfcp_client.release_association().await {
-            Ok(()) => log::info!("PFCP association released"),
-            Err(e) => log::warn!("PFCP Association Release failed: {e}"),
+    if release_on_shutdown {
+        for client in pfcp_clients.iter() {
+            if !client.is_associated().await {
+                continue;
+            }
+            match client.release_association().await {
+                Ok(()) => log::info!("PFCP association with {} released", client.peer()),
+                Err(e) => log::warn!("PFCP Association Release to {} failed: {e}", client.peer()),
+            }
         }
     }
     pfcp_listener_handle.abort();
@@ -5607,13 +5618,18 @@ async fn send_n1_n2_paging_request(amf_uri: &str, supi: &str, psi: u8, qfi: Opti
     }
 }
 
-/// Whether a graceful shutdown releases the PFCP association (#677), from
-/// `SMF_PFCP_RELEASE_ON_SHUTDOWN`. Off unless set to `true`/`1`/`yes`.
-fn release_association_on_shutdown(value: Option<&str>) -> bool {
-    matches!(
-        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
-        Some("true" | "1" | "yes")
-    )
+/// Whether a graceful shutdown releases the PFCP association (#677, #718).
+///
+/// `SMF_PFCP_RELEASE_ON_SHUTDOWN` decides when it is set to `true`/`1`/`yes` or
+/// `false`/`0`/`no`. Otherwise the association is released unless `durable` state
+/// is armed: only then does the next incarnation know the sessions it would take
+/// over.
+fn release_association_on_shutdown(value: Option<&str>, durable: bool) -> bool {
+    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("true" | "1" | "yes") => true,
+        Some("false" | "0" | "no") => false,
+        _ => !durable,
+    }
 }
 
 /// Send a 5GSM message to the UE via the AMF (Namf_Communication
@@ -7081,16 +7097,22 @@ async fn handle_amf_status_change(sm_context_ref: &str) -> SbiResponse {
 mod tests {
     use super::*;
 
-    /// #677: a graceful shutdown keeps the PFCP association unless the operator
-    /// opts in, because a UPF deletes every session of a released association.
+    /// #718 (revising #677): a graceful shutdown keeps the PFCP association only
+    /// when durable state hands the sessions on. Without it the next incarnation
+    /// knows none of them, and a kept association left them orphaned in the UPF.
     #[test]
-    fn a_shutdown_keeps_the_pfcp_association_unless_told_otherwise() {
-        assert!(!release_association_on_shutdown(None));
-        assert!(!release_association_on_shutdown(Some("")));
-        assert!(!release_association_on_shutdown(Some("false")));
-        assert!(release_association_on_shutdown(Some("true")));
-        assert!(release_association_on_shutdown(Some(" TRUE ")));
-        assert!(release_association_on_shutdown(Some("1")));
+    fn a_shutdown_keeps_the_pfcp_association_only_with_durable_state() {
+        // Default, no durable state: released.
+        assert!(release_association_on_shutdown(None, false));
+        assert!(release_association_on_shutdown(Some(""), false));
+        // Durable state: kept.
+        assert!(!release_association_on_shutdown(None, true));
+        assert!(!release_association_on_shutdown(Some("  "), true));
+        // The operator's explicit choice wins either way.
+        assert!(release_association_on_shutdown(Some(" TRUE "), true));
+        assert!(release_association_on_shutdown(Some("1"), true));
+        assert!(!release_association_on_shutdown(Some("false"), false));
+        assert!(!release_association_on_shutdown(Some("No"), false));
     }
 
     // ------------------------------------------------------------------

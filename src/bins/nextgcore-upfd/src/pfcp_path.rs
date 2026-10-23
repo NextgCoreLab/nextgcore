@@ -457,6 +457,13 @@ pub enum PfcpSessionEvent {
 #[derive(Debug, Clone)]
 pub struct PfcpAssociation {
     pub peer_addr: SocketAddr,
+    /// The CP function's Node ID IE value, the identifier of the association
+    /// (TS 29.244 §6.2.6.2.2), kept as the raw IE value so an FQDN Node ID compares
+    /// exactly as an IPv4 or IPv6 one does (#718).
+    ///
+    /// The source address does NOT identify the association: a restarted SMF pod
+    /// comes back with the same Node ID at a new IP.
+    pub node_id: Vec<u8>,
     /// The peer's Recovery Time Stamp from Association Setup / Heartbeat —
     /// a change means the peer restarted and all its sessions are stale
     pub recovery_time_stamp: u32,
@@ -635,6 +642,10 @@ pub struct PfcpSessionInfo {
     pub upf_seid: u64,
     pub smf_seid: u64,
     pub smf_addr: SocketAddr,
+    /// The IPv4 and IPv6 addresses of the CP F-SEID. They name the CP PFCP entity
+    /// that a PFCP Session Retention Information IE lists (TS 29.244 §8.2.135, #718).
+    pub cp_f_seid_ipv4: Option<Ipv4Addr>,
+    pub cp_f_seid_ipv6: Option<std::net::Ipv6Addr>,
     pub ue_ipv4: Option<Ipv4Addr>,
     pub ul_teid: u32,
     pub dl_teid: u32,
@@ -799,6 +810,15 @@ impl PfcpServer {
             *association = None;
             self.publish_associated(&association);
         }
+        self.delete_association_sessions(peer, reason).await;
+    }
+
+    /// Delete every PFCP session of the association with `peer`, here and in the
+    /// data plane.
+    ///
+    /// This UPF holds one association at a time, so "the association's sessions" is
+    /// all of them.
+    async fn delete_association_sessions(&self, peer: SocketAddr, reason: &str) {
         let count = {
             let mut sessions = self.sessions.write().await;
             let n = sessions.len();
@@ -806,11 +826,66 @@ impl PfcpServer {
             self.publish_session_count(&sessions);
             n
         };
-        log::warn!("Cleared {count} PFCP sessions after peer failure");
+        log::warn!("Cleared {count} PFCP sessions of the association with {peer} ({reason})");
         let _ = self
             .session_tx
             .send(PfcpSessionEvent::PeerFailure { peer })
             .await;
+    }
+
+    /// Keep the sessions a PFCP Session Retention Information IE asks for, delete the
+    /// rest, and re-address the kept ones to the association's new peer (#718,
+    /// TS 29.244 §6.2.6.2.2).
+    ///
+    /// `entities` empty means keep every session (Table 7.4.4.1-2). Otherwise a
+    /// session is kept when its CP F-SEID address, or the address it was established
+    /// from, is one of the listed CP PFCP entities. Kept sessions now report to
+    /// `new_peer`: the association is the same CP function at a new address, and the
+    /// old address may be dead. Returns how many sessions were kept.
+    async fn retain_association_sessions(
+        &self,
+        entities: &[std::net::IpAddr],
+        new_peer: SocketAddr,
+    ) -> usize {
+        let wanted = |info: &PfcpSessionInfo| {
+            entities.is_empty()
+                || entities.iter().any(|ip| {
+                    *ip == info.smf_addr.ip()
+                        || info.cp_f_seid_ipv4.map(std::net::IpAddr::V4) == Some(*ip)
+                        || info.cp_f_seid_ipv6.map(std::net::IpAddr::V6) == Some(*ip)
+                })
+        };
+        let (kept, dropped) = {
+            let mut sessions = self.sessions.write().await;
+            let dropped: Vec<(u64, Option<Ipv4Addr>)> = sessions
+                .values()
+                .filter(|info| !wanted(info))
+                .map(|info| (info.upf_seid, info.ue_ipv4))
+                .collect();
+            for (seid, _) in &dropped {
+                sessions.remove(seid);
+            }
+            for info in sessions.values_mut() {
+                info.smf_addr = new_peer;
+            }
+            self.publish_session_count(&sessions);
+            (sessions.len(), dropped)
+        };
+        for (upf_seid, ue_ipv4) in &dropped {
+            let event = PfcpSessionEvent::SessionDeleted {
+                upf_seid: *upf_seid,
+                ue_ipv4: *ue_ipv4,
+            };
+            if let Err(e) = self.session_tx.send(event).await {
+                log::error!("Failed to send session event: {e}");
+            }
+        }
+        log::info!(
+            "PFCP Session Retention Information from {new_peer}: kept {kept} session(s), \
+             deleted {} not requested",
+            dropped.len()
+        );
+        kept
     }
 
     /// Run the PFCP server main loop
@@ -1029,15 +1104,55 @@ impl PfcpServer {
             return Ok(());
         }
         let rts = rts.unwrap();
+        let node_id = ParsedIe::find_ie(&ies, pfcp_ie::NODE_ID)
+            .map(|ie| ie.value.clone())
+            .unwrap_or_default();
+        let retention = crate::n4_build::parse_session_retention_information(payload);
 
-        // If we already had an association with a different recovery
-        // timestamp, the peer restarted — flush stale sessions first
-        self.check_peer_recovery(src_addr, rts).await;
+        // #718, TS 29.244 §6.2.6.2.2: a request from a Node ID that already has an
+        // association overwrites it "regardless of the Recovery Timestamp", and the
+        // existing association's sessions are deleted unless the request asks for them
+        // to be retained. Keyed by Node ID, not source address: a restarted SMF pod
+        // keeps its Node ID and comes back at a new IP, and keying by address left
+        // every session of the previous incarnation here with no CP function able to
+        // modify or release it, while the new incarnation reused its CP SEIDs.
+        //
+        // A request from a DIFFERENT Node ID also replaces the association, because
+        // this UPF holds one at a time. The replaced CP function can no longer
+        // control its sessions, so they are deleted too; retention is defined only
+        // for the same Node ID.
+        let previous = self.association.read().await.clone();
+        let mut sessions_retained = false;
+        if let Some(prev) = previous {
+            let same_node = prev.node_id == node_id;
+            match (&retention, same_node) {
+                (Some(entities), true) => {
+                    self.retain_association_sessions(entities, src_addr).await;
+                    sessions_retained = true;
+                }
+                _ => {
+                    let reason = if same_node {
+                        "the same Node ID set up a new association without session retention"
+                    } else {
+                        "a different CP function replaced the association"
+                    };
+                    log::warn!(
+                        "Association Setup from {src_addr} replaces the association with {} \
+                         (peer RTS {} -> {rts}): {reason}",
+                        prev.peer_addr,
+                        prev.recovery_time_stamp
+                    );
+                    self.delete_association_sessions(prev.peer_addr, reason)
+                        .await;
+                }
+            }
+        }
 
         {
             let mut association = self.association.write().await;
             *association = Some(PfcpAssociation {
                 peer_addr: src_addr,
+                node_id,
                 recovery_time_stamp: rts,
             });
             self.publish_associated(&association);
@@ -1047,6 +1162,7 @@ impl PfcpServer {
             &self.local_node_id,
             self.recovery_time_stamp,
             PfcpCause::RequestAccepted,
+            sessions_retained,
         );
 
         let response = self.build_response(
@@ -1257,10 +1373,11 @@ impl PfcpServer {
 
         // Parse CP F-SEID (SMF's SEID) — presence checked above
         let f_seid_ie = ParsedIe::find_ie(&ies, pfcp_ie::F_SEID).unwrap();
-        let smf_seid = match ParsedFSeid::parse(&f_seid_ie.value) {
+        let (smf_seid, cp_f_seid_ipv4, cp_f_seid_ipv6) = match ParsedFSeid::parse(&f_seid_ie.value)
+        {
             Ok(f_seid) => {
                 log::debug!("SMF F-SEID: {:#x}", f_seid.seid);
-                f_seid.seid
+                (f_seid.seid, f_seid.ipv4, f_seid.ipv6)
             }
             Err(e) => {
                 log::warn!("Malformed CP F-SEID from {src_addr}: {e}");
@@ -1484,6 +1601,8 @@ impl PfcpServer {
             upf_seid,
             smf_seid,
             smf_addr: src_addr,
+            cp_f_seid_ipv4,
+            cp_f_seid_ipv6,
             ue_ipv4,
             ul_teid,
             dl_teid,
@@ -4312,6 +4431,258 @@ mod tests {
         assert!(matches!(evt, PfcpSessionEvent::PeerFailure { .. }));
     }
 
+    // ── #718: the association is identified by the CP function's Node ID ──
+
+    /// The Node ID every SMF incarnation in these tests advertises. On k8s smfd's
+    /// Node ID comes from `SMF_PFCP_ADDR`, so it is the same across pod restarts
+    /// while the pod IP is not.
+    const SMF_NODE: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 9);
+
+    /// The CP SEID every incarnation hands its first session: smfd derives it from
+    /// the SM context reference, which restarts at 1 (`1 | 0x1000`).
+    const FIRST_CP_SEID: u64 = 0x1001;
+
+    /// An Association Setup Request body: Node ID, Recovery Time Stamp and, when
+    /// `retain` is `Some`, a PFCP Session Retention Information IE listing those
+    /// CP PFCP entities (empty = keep every session).
+    fn association_setup(node: Ipv4Addr, rts: u32, retain: Option<&[Ipv4Addr]>) -> Vec<u8> {
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_node_id(&NodeId::Ipv4(node));
+        b.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, rts);
+        if let Some(entities) = retain {
+            let mut inner = crate::n4_build::PfcpMessageBuilder::new();
+            for ip in entities {
+                let mut v = vec![0x02]; // V4
+                v.extend_from_slice(&ip.octets());
+                inner.add_tlv(pfcp_ie::CP_PFCP_ENTITY_IP_ADDRESS, &v);
+            }
+            b.add_tlv(pfcp_ie::PFCP_SESSION_RETENTION_INFORMATION, &inner.build());
+        }
+        b.build()
+    }
+
+    /// Associate `smf` and return the Association Setup Response.
+    async fn associate(
+        smf: &UdpSocket,
+        upf: SocketAddr,
+        node: Ipv4Addr,
+        rts: u32,
+        retain: Option<&[Ipv4Addr]>,
+    ) -> Vec<u8> {
+        let resp = exchange(
+            smf,
+            upf,
+            &encode_pfcp(5, None, rts, &association_setup(node, rts, retain)),
+        )
+        .await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        resp
+    }
+
+    /// Whether an Association Setup Response sets PSREI (TS 29.244 §8.2.134).
+    fn psrei(resp: &[u8]) -> bool {
+        let (_, body) = ParsedPfcpHeader::parse(resp).unwrap();
+        let ies = ParsedIe::parse_all(body);
+        ParsedIe::find_ie(&ies, pfcp_ie::PFCPASRSP_FLAGS)
+            .and_then(|ie| ie.value.first().copied())
+            .is_some_and(|f| f & 0x01 != 0)
+    }
+
+    /// Establish one session with CP F-SEID `cp_seid` from `smf`; returns its UPF SEID.
+    async fn establish(server: &PfcpServer, smf: &UdpSocket, upf: SocketAddr, cp_seid: u64) -> u64 {
+        let before: std::collections::HashSet<u64> =
+            server.sessions.read().await.keys().copied().collect();
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_node_id(&NodeId::Ipv4(SMF_NODE));
+        b.add_f_seid(&crate::n4_build::FSeid {
+            seid: cp_seid,
+            ipv4: Some(SMF_NODE),
+            ipv6: None,
+        });
+        b.add_tlv(pfcp_ie::CREATE_PDR, &pdr_body(1, 100, 1, 1, 1));
+        b.add_tlv(pfcp_ie::CREATE_FAR, &far_body(1, 0x02));
+        let resp = exchange(smf, upf, &encode_pfcp(50, Some(0), 50, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        let after = server.sessions.read().await;
+        *after
+            .keys()
+            .find(|k| !before.contains(k))
+            .expect("the accepted establishment must be held")
+    }
+
+    /// The UPF's sessions as (UPF SEID, CP SEID, address it reports to).
+    async fn held(server: &PfcpServer) -> Vec<(u64, u64, SocketAddr)> {
+        let mut v: Vec<_> = server
+            .sessions
+            .read()
+            .await
+            .values()
+            .map(|s| (s.upf_seid, s.smf_seid, s.smf_addr))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// The first Session Report Request that reaches `smf`, as (CP SEID in the
+    /// header, PDR ID in its Downlink Data Report).
+    async fn first_report(smf: &UdpSocket) -> (u64, u16) {
+        let pkt = recv_report(smf).await;
+        let (header, body) = ParsedPfcpHeader::parse(&pkt).unwrap();
+        assert_eq!(header.msg_type, pfcp_type::SESSION_REPORT_REQUEST);
+        let ies = ParsedIe::parse_all(body);
+        let dldr = ParsedIe::find_ie(&ies, 83).expect("Downlink Data Report (IE 83)");
+        let inner = ParsedIe::parse_all(&dldr.value);
+        let pdr = ParsedIe::find_ie(&inner, pfcp_ie::PDR_ID).expect("PDR ID");
+        (
+            header.seid,
+            u16::from_be_bytes([pdr.value[0], pdr.value[1]]),
+        )
+    }
+
+    /// #718: the cross-UE Session Report. Three SMF incarnations with one Node ID:
+    /// the first at address A, the second at a new pod IP B, the third back at A
+    /// (pod IPs are recycled). Each one starts from an empty context, so each gives
+    /// its first UE the same CP SEID.
+    ///
+    /// On main, upfd keyed the association by source address, so neither
+    /// re-association deleted anything. Incarnation 1's session survived, still
+    /// reporting to A, and its Session Reports reached incarnation 3 carrying
+    /// incarnation 3's own UE's CP SEID. Incarnation 3 then pages, or charges, the
+    /// wrong subscriber. TS 29.244 §6.2.6.2.2: an Association Setup Request from a
+    /// Node ID that already has an association overwrites it "regardless of the
+    /// Recovery Timestamp" and deletes the existing association's sessions.
+    #[tokio::test]
+    async fn a_restarted_smf_at_a_new_address_does_not_inherit_its_predecessors_sessions() {
+        let (server, smf_a, upf, mut rx) = spawn_test_server().await;
+        let smf_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (a, b) = (smf_a.local_addr().unwrap(), smf_b.local_addr().unwrap());
+
+        // Incarnation 1 at A: UE X.
+        let resp = associate(&smf_a, upf, SMF_NODE, 100, None).await;
+        assert!(!psrei(&resp), "nothing to retain on a first association");
+        let x = establish(&server, &smf_a, upf, FIRST_CP_SEID).await;
+
+        // Incarnation 2 at B: the restarted pod, empty context, UE Y.
+        associate(&smf_b, upf, SMF_NODE, 200, None).await;
+        let y = establish(&server, &smf_b, upf, FIRST_CP_SEID).await;
+
+        // Incarnation 3, back at A: UE Z.
+        associate(&smf_a, upf, SMF_NODE, 300, None).await;
+        let z = establish(&server, &smf_a, upf, FIRST_CP_SEID).await;
+
+        // Every session the UPF still holds reports downlink data: Z's with PDR 7,
+        // any survivor with PDR 1. Survivors go first, so the first report A receives
+        // is a survivor's whenever one reports to A.
+        for (seid, cp_seid, _) in held(&server).await {
+            if seid != z {
+                server
+                    .send_downlink_data_report(seid, cp_seid, 1, None)
+                    .await
+                    .unwrap();
+            }
+        }
+        server
+            .send_downlink_data_report(z, FIRST_CP_SEID, 7, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            first_report(&smf_a).await,
+            (FIRST_CP_SEID, 7),
+            "incarnation 3 must receive only its own UE's report; a PDR 1 report under its UE's \
+             CP SEID is incarnation 1's session (UPF SEID {x:#x}) reaching the wrong subscriber"
+        );
+        // And the UPF holds exactly the sessions the live SMF knows about.
+        assert_eq!(
+            held(&server).await,
+            vec![(z, FIRST_CP_SEID, a)],
+            "the sessions of incarnations 1 ({x:#x}) and 2 ({y:#x}, at {b}) must be gone"
+        );
+        // The data plane was told about each deletion.
+        let mut failures = 0;
+        while let Ok(evt) = rx.try_recv() {
+            if matches!(evt, PfcpSessionEvent::PeerFailure { .. }) {
+                failures += 1;
+            }
+        }
+        assert_eq!(failures, 2, "one data-plane flush per replaced association");
+    }
+
+    /// #718: a CP function that restored its sessions (durable state) asks for them
+    /// to be kept with a PFCP Session Retention Information IE. With no CP PFCP
+    /// Entity IP Address in it, every session is kept (TS 29.244 Table 7.4.4.1-2) and
+    /// PSREI says so. The kept session now reports to the new address, because the
+    /// old pod IP is dead.
+    #[tokio::test]
+    async fn a_retention_request_from_the_same_node_keeps_the_sessions_and_says_so() {
+        let (server, smf_a, upf, _rx) = spawn_test_server().await;
+        let smf_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        associate(&smf_a, upf, SMF_NODE, 100, None).await;
+        let x = establish(&server, &smf_a, upf, FIRST_CP_SEID).await;
+
+        let resp = associate(&smf_b, upf, SMF_NODE, 200, Some(&[])).await;
+        assert!(psrei(&resp), "PSREI: the requested sessions were retained");
+        assert_eq!(
+            held(&server).await,
+            vec![(x, FIRST_CP_SEID, smf_b.local_addr().unwrap())]
+        );
+        server
+            .send_downlink_data_report(x, FIRST_CP_SEID, 1, None)
+            .await
+            .unwrap();
+        assert_eq!(first_report(&smf_b).await, (FIRST_CP_SEID, 1));
+    }
+
+    /// #718: a retention request naming CP PFCP entities keeps only those
+    /// entities' sessions. This session's CP F-SEID is 127.0.0.9, which the
+    /// request does not list.
+    #[tokio::test]
+    async fn a_retention_request_keeps_only_the_listed_cp_entities_sessions() {
+        let (server, smf_a, upf, _rx) = spawn_test_server().await;
+        associate(&smf_a, upf, SMF_NODE, 100, None).await;
+        let x = establish(&server, &smf_a, upf, FIRST_CP_SEID).await;
+
+        let resp = associate(
+            &smf_a,
+            upf,
+            SMF_NODE,
+            100,
+            Some(&[Ipv4Addr::new(10, 9, 9, 9)]),
+        )
+        .await;
+        assert!(
+            psrei(&resp),
+            "the request was honoured, for the entities it named"
+        );
+        assert!(held(&server).await.is_empty(), "{x:#x} was not requested");
+
+        let y = establish(&server, &smf_a, upf, FIRST_CP_SEID).await;
+        let resp = associate(&smf_a, upf, SMF_NODE, 100, Some(&[SMF_NODE])).await;
+        assert!(psrei(&resp));
+        assert_eq!(
+            held(&server).await,
+            vec![(y, FIRST_CP_SEID, smf_a.local_addr().unwrap())],
+            "the listed entity's session is kept"
+        );
+    }
+
+    /// #718: retention is defined for the SAME Node ID only. A different CP function
+    /// replacing this UPF's one association cannot adopt the previous one's sessions,
+    /// and the replaced CP function can no longer control them, so they go.
+    #[tokio::test]
+    async fn a_different_cp_function_cannot_retain_the_previous_ones_sessions() {
+        let (server, smf_a, upf, _rx) = spawn_test_server().await;
+        let smf_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        associate(&smf_a, upf, SMF_NODE, 100, None).await;
+        establish(&server, &smf_a, upf, FIRST_CP_SEID).await;
+
+        let resp = associate(&smf_b, upf, Ipv4Addr::new(127, 0, 0, 10), 100, Some(&[])).await;
+        assert!(
+            !psrei(&resp),
+            "nothing was retained for a different Node ID"
+        );
+        assert!(held(&server).await.is_empty());
+    }
+
     #[test]
     fn test_parse_create_bar_roundtrip() {
         let mut b = crate::n4_build::PfcpMessageBuilder::new();
@@ -4591,6 +4962,8 @@ mod tests {
                 upf_seid,
                 smf_seid,
                 smf_addr,
+                cp_f_seid_ipv4: None,
+                cp_f_seid_ipv6: None,
                 ue_ipv4: Some(Ipv4Addr::new(10, 45, 0, 7)),
                 ul_teid: 0x100,
                 dl_teid: 0x200,

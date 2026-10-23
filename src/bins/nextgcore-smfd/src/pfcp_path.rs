@@ -19,7 +19,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes};
 use nextgcore_pfcp::message::{
     build_message, AssociationReleaseRequest, AssociationSetupRequest, AssociationSetupResponse,
     HeartbeatRequest, HeartbeatResponse, PfcpMessage,
@@ -1012,6 +1012,12 @@ impl PfcpClient {
     /// Compare a peer Recovery Time Stamp with the stored value; a change
     /// means the UPF restarted: all sessions on it are gone (TS 23.527 4.2).
     pub async fn check_peer_restart(&self, rts: u32) {
+        self.detect_peer_restart(rts).await;
+    }
+
+    /// [`Self::check_peer_restart`], reporting whether a restart was detected (and
+    /// the association torn down).
+    async fn detect_peer_restart(&self, rts: u32) -> bool {
         let restarted = {
             let assoc = self.assoc.read().await;
             matches!(assoc.peer_recovery_time_stamp, Some(stored) if stored != rts)
@@ -1028,6 +1034,7 @@ impl PfcpClient {
             // re-detected (or worse, missed) after an SMF restart.
             self.record_peer_recovery_time_stamp(rts);
         }
+        restarted
     }
 
     /// Mark the association down and flush all PFCP session state.
@@ -1073,6 +1080,19 @@ impl PfcpClient {
         let msg = PfcpMessage::AssociationSetupRequest(req);
         let mut buf = bytes::BytesMut::new();
         msg.encode_body(&mut buf);
+        // #718, TS 29.244 §6.2.6.2.1: a CP function that holds PFCP sessions asks
+        // the UP function to keep them. Without the IE a conformant UP function
+        // deletes every session of an existing association for this Node ID
+        // (§6.2.6.2.2). That is right for a fresh incarnation, which knows none of
+        // them, and wrong for one that restored them from durable state, or for this
+        // same incarnation re-associating after a lost heartbeat. Empty, so every
+        // session is kept (Table 7.4.4.1-2): the IE's CP PFCP Entity IP Addresses
+        // name CP F-SEID addresses, and every session here carries this one node's.
+        let retention_requested = holds_pfcp_sessions();
+        if retention_requested {
+            buf.put_u16(PFCP_SESSION_RETENTION_INFORMATION);
+            buf.put_u16(0);
+        }
 
         let (resp_type, resp_body) = self
             .request(pfcp_message_type::ASSOCIATION_SETUP_REQUEST, None, &buf)
@@ -1095,7 +1115,20 @@ impl PfcpClient {
         }
 
         // Restart detection against any previously stored timestamp
-        self.check_peer_restart(resp.recovery_time_stamp).await;
+        let restarted = self.detect_peer_restart(resp.recovery_time_stamp).await;
+        // #718: retention was asked for and the UP function did not confirm it
+        // (PSREI, TS 29.244 §8.2.134). The sessions are gone there: it deleted them,
+        // or it never had them. Believing them anyway would leave every one dead
+        // until the UE noticed, so release them as a restart would.
+        if retention_requested && !restarted && !sessions_retained(&resp_body) {
+            log::warn!(
+                "UPF {} did not retain the PFCP sessions this SMF holds (no PSREI in the \
+                 Association Setup Response)",
+                self.peer()
+            );
+            self.teardown_association("UPF did not retain the sessions")
+                .await;
+        }
 
         {
             let mut assoc = self.assoc.write().await;
@@ -1179,6 +1212,35 @@ impl PfcpClient {
         }
         Ok(true)
     }
+}
+
+/// PFCP Session Retention Information (TS 29.244 Table 7.4.4.1-2), grouped (#718).
+const PFCP_SESSION_RETENTION_INFORMATION: u16 = 183;
+/// PFCPASRsp-Flags (TS 29.244 §8.2.134); bit 1 is PSREI (#718).
+const PFCPASRSP_FLAGS: u16 = 184;
+
+/// Whether an Association Setup Response body says the UP function retained the
+/// sessions (PSREI, TS 29.244 §8.2.134).
+fn sessions_retained(body: &[u8]) -> bool {
+    find_ie(body, PFCPASRSP_FLAGS)
+        .and_then(|v| v.first().copied())
+        .is_some_and(|flags| flags & 0x01 != 0)
+}
+
+/// Whether this SMF holds any PFCP session it expects a UPF to still have (#718):
+/// a 5G PDU session in `pfcp_sessions`, or an EPC PDN connection (which has no
+/// `pfcp_sessions` entry, #687).
+fn holds_pfcp_sessions() -> bool {
+    let global = smf_self();
+    let Ok(ctx) = global.read() else {
+        return false;
+    };
+    let five_g = ctx
+        .pfcp_sessions
+        .read()
+        .map(|m| !m.is_empty())
+        .unwrap_or(false);
+    five_g || ctx.sess_find_by(|s| s.epc && s.upf_n4_seid != 0).is_some()
 }
 
 /// Flush all stored PFCP sessions (UPF restarted / association lost).
@@ -1549,11 +1611,23 @@ pub(crate) mod stand_in {
                             rts,
                         );
                         resp.up_function_features = Some(features);
-                        Some(Vec::from(build_message(
-                            &PfcpMessage::AssociationSetupResponse(resp),
-                            h.sequence_number,
+                        let mut body = bytes::BytesMut::new();
+                        PfcpMessage::AssociationSetupResponse(resp).encode_body(&mut body);
+                        // #718: a conformant UPF that holds the sessions the test seeded
+                        // retains them when asked, and says so with PSREI.
+                        if find_ie(&buf[h.body_offset..len], PFCP_SESSION_RETENTION_INFORMATION)
+                            .is_some()
+                        {
+                            body.put_u16(PFCPASRSP_FLAGS);
+                            body.put_u16(1);
+                            body.put_u8(0x01);
+                        }
+                        Some(encode_wire_message(
+                            pfcp_message_type::ASSOCIATION_SETUP_RESPONSE,
                             None,
-                        )))
+                            h.sequence_number,
+                            &body,
+                        ))
                     }
                     pfcp_message_type::HEARTBEAT_REQUEST => Some(Vec::from(build_message(
                         &PfcpMessage::HeartbeatResponse(HeartbeatResponse::new(rts)),
@@ -1805,6 +1879,11 @@ mod tests {
     /// UP Function Features).
     #[tokio::test]
     async fn test_association_setup_roundtrip() {
+        // #718: `associate` asks for session retention when this process holds
+        // sessions, and tears them down when the peer does not confirm it, so it
+        // reads (and may flush) process-global session state.
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
         let (client, upf) = make_client_with_peer().await;
 
         tokio::spawn(async move {
@@ -1962,6 +2041,152 @@ mod tests {
         );
     }
 
+    /// Answer one Association Setup Request on `upf` with Request Accepted, the
+    /// Recovery Time Stamp `rts`, and PSREI when `psrei`; returns the request body.
+    async fn answer_association_setup(upf: UdpSocket, rts: u32, psrei: bool) -> Vec<u8> {
+        let mut buf = vec![0u8; 4096];
+        let (len, from) = upf.recv_from(&mut buf).await.unwrap();
+        let h = parse_wire_header(&buf[..len]).unwrap();
+        assert_eq!(h.msg_type, pfcp_message_type::ASSOCIATION_SETUP_REQUEST);
+        let request = buf[h.body_offset..len].to_vec();
+        let resp = AssociationSetupResponse::new(
+            NodeId::new_ipv4([127, 0, 0, 4]),
+            nextgcore_pfcp::types::PfcpCause::RequestAccepted,
+            rts,
+        );
+        let mut body = bytes::BytesMut::new();
+        PfcpMessage::AssociationSetupResponse(resp).encode_body(&mut body);
+        if psrei {
+            body.put_u16(PFCPASRSP_FLAGS);
+            body.put_u16(1);
+            body.put_u8(0x01);
+        }
+        let pkt = encode_wire_message(
+            pfcp_message_type::ASSOCIATION_SETUP_RESPONSE,
+            None,
+            h.sequence_number,
+            &body,
+        );
+        upf.send_to(&pkt, from).await.unwrap();
+        request
+    }
+
+    fn seed_pfcp_session(sm_context_ref: &str, upf_seid: u64) {
+        smf_self()
+            .read()
+            .unwrap()
+            .pfcp_sessions
+            .write()
+            .unwrap()
+            .insert(sm_context_ref.to_string(), upf_seid);
+    }
+
+    fn pfcp_session_present(sm_context_ref: &str) -> bool {
+        smf_self()
+            .read()
+            .unwrap()
+            .pfcp_sessions
+            .read()
+            .unwrap()
+            .contains_key(sm_context_ref)
+    }
+
+    /// #718: an SMF with no sessions (a fresh incarnation without durable state)
+    /// does not ask the UPF to retain anything, so a conformant UPF deletes whatever
+    /// the previous incarnation left under this Node ID (TS 29.244 §6.2.6.2.2).
+    #[tokio::test]
+    async fn an_smf_holding_no_sessions_asks_the_upf_to_retain_nothing() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
+        // Leftovers of earlier tests in this process; both locks are held, so they
+        // belong to nobody running now.
+        clear_pfcp_sessions();
+        if let Ok(ctx) = smf_self().read() {
+            for sess in ctx.sess_find_all_by(|s| s.epc && s.upf_n4_seid != 0) {
+                ctx.sess_remove(sess.id);
+            }
+        }
+        assert!(
+            !holds_pfcp_sessions(),
+            "precondition: no 5G or EPC session is held"
+        );
+        let (client, upf) = make_client_with_peer().await;
+        let answered = tokio::spawn(answer_association_setup(upf, 500, false));
+        client.associate().await.expect("association");
+        let request = answered.await.unwrap();
+        assert!(
+            find_ie(&request, 60).is_some(),
+            "the request is the real one"
+        );
+        assert!(
+            find_ie(&request, PFCP_SESSION_RETENTION_INFORMATION).is_none(),
+            "no PFCP Session Retention Information without sessions to keep"
+        );
+    }
+
+    /// #718: an SMF that holds sessions (restored from durable state, or kept
+    /// across a lost heartbeat) asks for all of them to be retained, and keeps them
+    /// when the UPF confirms with PSREI.
+    #[tokio::test]
+    async fn an_smf_holding_sessions_asks_for_them_and_keeps_them_when_retained() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
+        seed_pfcp_session("retain-718-kept", 0x718a);
+        let (client, upf) = make_client_with_peer().await;
+        client.seed_peer_recovery_time_stamp(600).await;
+        let answered = tokio::spawn(answer_association_setup(upf, 600, true));
+        client.associate().await.expect("association");
+        let request = answered.await.unwrap();
+        let kept = pfcp_session_present("retain-718-kept");
+        forget_pfcp_session("retain-718-kept");
+
+        assert_eq!(
+            find_ie(&request, PFCP_SESSION_RETENTION_INFORMATION),
+            Some(&[][..]),
+            "an empty retention IE: keep every session (TS 29.244 Table 7.4.4.1-2)"
+        );
+        assert!(
+            kept,
+            "PSREI: the UPF retained the session, so the SMF keeps it"
+        );
+        assert!(client.is_associated().await);
+    }
+
+    /// #718: retention was asked for and the UPF did not confirm it. Its sessions
+    /// are gone there, so the SMF must not keep believing in them: it releases them,
+    /// as it would after a UPF restart.
+    #[tokio::test]
+    async fn sessions_the_upf_did_not_retain_are_released() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
+        seed_pfcp_session("retain-718-lost", 0x718b);
+        let (client, upf) = make_client_with_peer().await;
+        // The same UPF incarnation: no restart, so only PSREI can tell.
+        client.seed_peer_recovery_time_stamp(700).await;
+        let answered = tokio::spawn(answer_association_setup(upf, 700, false));
+        client.associate().await.expect("association");
+        let request = answered.await.unwrap();
+        let kept = pfcp_session_present("retain-718-lost");
+        forget_pfcp_session("retain-718-lost");
+
+        assert!(find_ie(&request, PFCP_SESSION_RETENTION_INFORMATION).is_some());
+        assert!(!kept, "no PSREI: the session is released, not believed");
+        assert!(
+            client.is_associated().await,
+            "the association itself stands; only the sessions were lost"
+        );
+    }
+
+    fn forget_pfcp_session(sm_context_ref: &str) {
+        smf_self()
+            .read()
+            .unwrap()
+            .pfcp_sessions
+            .write()
+            .unwrap()
+            .remove(sm_context_ref);
+    }
+
     /// #658: a hostname that does not resolve at startup is not fatal and is
     /// never dialled as 0.0.0.0; the request fails locally instead.
     #[tokio::test]
@@ -1983,6 +2208,11 @@ mod tests {
     /// A rejected Association Setup must surface the real cause value.
     #[tokio::test]
     async fn test_association_setup_rejected_cause() {
+        // #718: `associate` asks for session retention when this process holds
+        // sessions, and tears them down when the peer does not confirm it, so it
+        // reads (and may flush) process-global session state.
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
         let (client, upf) = make_client_with_peer().await;
 
         tokio::spawn(async move {
