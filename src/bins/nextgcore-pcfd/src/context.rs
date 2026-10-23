@@ -2081,7 +2081,17 @@ impl PcfContext {
         Some(ue_sm)
     }
 
-    pub fn ue_sm_remove(&self, id: u64) -> Option<PcfUeSm> {
+    /// Remove a UE's SM-policy context, dropping its AF app sessions without
+    /// telling their AFs. Production code uses `app::remove_ue_sm`.
+    pub(crate) fn ue_sm_remove(&self, id: u64) -> Option<PcfUeSm> {
+        self.ue_sm_remove_with_apps(id).map(|(ue_sm, _apps)| ue_sm)
+    }
+
+    /// [`Self::ue_sm_remove`], also returning the AF app sessions of the UE's
+    /// sessions, which the caller must terminate toward their AFs (TS 29.514
+    /// §4.2.5.3; `app::remove_ue_sm`).
+    #[must_use = "the removed app sessions must be terminated toward their AFs (TS 29.514 §4.2.5.3)"]
+    pub fn ue_sm_remove_with_apps(&self, id: u64) -> Option<(PcfUeSm, Vec<PcfApp>)> {
         // Remove the UE-SM under the ue_sm_list/supi_sm_hash guards, then DROP
         // them before touching sess_list. Holding ue_sm_list while acquiring
         // sess_list (via sess_remove_all_for_ue) inverts the canonical
@@ -2098,13 +2108,13 @@ impl PcfContext {
             ue_sm
         };
         // Guards released: safe to take sess_list in the canonical order.
-        self.sess_remove_all_for_ue(id);
+        let apps = self.sess_remove_all_for_ue(id);
         log::debug!("[{}] PCF UE SM removed (id={})", ue_sm.supi, id);
         // Persisted once, after the cascade: sess_remove_all_for_ue drops the
         // UE's sessions too, so a persist before it would snapshot sessions whose
         // parent is already gone.
         self.persist();
-        Some(ue_sm)
+        Some((ue_sm, apps))
     }
 
     pub fn ue_sm_remove_all(&self) {
@@ -2208,7 +2218,30 @@ impl PcfContext {
         Some(sess)
     }
 
-    pub fn sess_remove(&self, id: u64) -> Option<PcfSess> {
+    /// Remove a session, dropping its AF app sessions without telling their AFs.
+    /// Only for a session that cannot have any (the UAV-refusal path removes a
+    /// session it has just created); otherwise use
+    /// [`Self::sess_remove_with_apps`] and `app::terminate_af_app_sessions`.
+    pub(crate) fn sess_remove(&self, id: u64) -> Option<PcfSess> {
+        self.sess_remove_with_apps(id).map(|(sess, _apps)| sess)
+    }
+
+    /// [`Self::sess_remove`], also returning the AF app sessions removed with
+    /// it. Only the caller whose removal succeeded gets them, so two concurrent
+    /// removals of one session cannot both notify its AFs (#767 review).
+    #[must_use = "the removed app sessions must be terminated toward their AFs (TS 29.514 §4.2.5.3)"]
+    pub fn sess_remove_with_apps(&self, id: u64) -> Option<(PcfSess, Vec<PcfApp>)> {
+        let removed = self.sess_remove_inner(id);
+        if removed.is_some() {
+            // Persisted after the app cascade, so the snapshot cannot contain app
+            // sessions whose parent session is already gone.
+            self.persist();
+        }
+        removed
+    }
+
+    /// The removal without the persist, for cascades that persist once at the end.
+    fn sess_remove_inner(&self, id: u64) -> Option<(PcfSess, Vec<PcfApp>)> {
         // The five guards are scoped so they DROP before persisting: persist ->
         // snapshot read-locks sess_list and ue_sm_list, and std RwLock is not
         // reentrant, so persisting inside this block deadlocks (issue #66/#192).
@@ -2242,27 +2275,30 @@ impl PcfContext {
         // and the canonical order is sess_list before app_list -- which held here
         // would be an inversion the moment app_remove_all_for_sess grew a
         // sess_list access.
-        self.app_remove_all_for_sess(id);
+        let apps = self.app_remove_all_for_sess(id);
         log::debug!("[psi={}] PCF session removed (id={})", sess.psi, id);
-        // Persisted after the app cascade, so the snapshot cannot contain app
-        // sessions whose parent session is already gone.
-        self.persist();
-        Some(sess)
+        Some((sess, apps))
     }
 
-    fn sess_remove_all_for_ue(&self, pcf_ue_sm_id: u64) {
+    /// Remove every session of a UE through the full session removal, so the
+    /// sm_policy_id / UE-address indexes and the AF app sessions go with them,
+    /// and return those app sessions for the caller to terminate (#767 review:
+    /// this used to drop the sessions from `sess_list` only, leaking the index
+    /// entries and leaving the apps orphaned with no AF told).
+    fn sess_remove_all_for_ue(&self, pcf_ue_sm_id: u64) -> Vec<PcfApp> {
         // Through the poison (#344): this is the cascade `ue_sm_remove` relies on,
         // and `ue_sm_remove` is already poison-tolerant (#338). Giving up here
         // stranded every session of a UE whose removal had just succeeded.
-        let mut sess_list = write_through_poison(&self.sess_list);
-        let sess_ids: Vec<u64> = sess_list
+        let sess_ids: Vec<u64> = read_through_poison(&self.sess_list)
             .values()
             .filter(|s| s.pcf_ue_sm_id == pcf_ue_sm_id)
             .map(|s| s.id)
             .collect();
-        for id in sess_ids {
-            sess_list.remove(&id);
-        }
+        sess_ids
+            .into_iter()
+            .filter_map(|id| self.sess_remove_inner(id))
+            .flat_map(|(_sess, apps)| apps)
+            .collect()
     }
 
     pub fn sess_find_by_id(&self, id: u64) -> Option<PcfSess> {
@@ -2447,18 +2483,26 @@ impl PcfContext {
         None
     }
 
-    fn app_remove_all_for_sess(&self, sess_id: u64) {
+    /// Remove a session's apps and return them. The `app_session_id_hash`
+    /// entries go too (#767 review: they used to be left behind forever).
+    fn app_remove_all_for_sess(&self, sess_id: u64) -> Vec<PcfApp> {
         // Through the poison (#344): the cascade `sess_remove` (already
         // poison-tolerant, #338) relies on. See sess_remove_all_for_ue.
+        // Canonical order: app_list before app_session_id_hash (see app_remove).
         let mut app_list = write_through_poison(&self.app_list);
+        let mut app_session_id_hash = write_through_poison(&self.app_session_id_hash);
         let app_ids: Vec<u64> = app_list
             .values()
             .filter(|a| a.sess_id == sess_id)
             .map(|a| a.id)
             .collect();
-        for id in app_ids {
-            app_list.remove(&id);
-        }
+        app_ids
+            .into_iter()
+            .filter_map(|id| app_list.remove(&id))
+            .inspect(|app| {
+                app_session_id_hash.remove(&app.app_session_id);
+            })
+            .collect()
     }
 
     pub fn app_find_by_id(&self, id: u64) -> Option<PcfApp> {
@@ -2577,6 +2621,40 @@ pub fn pcf_instance_get_load() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #767 review: removing a session returns its apps to the one caller that
+    /// removed it and clears their app_session_id index; removing a UE goes
+    /// through the full session removal, so its sessions' indexes and apps go
+    /// too, and the apps come back for the AF to be told.
+    #[test]
+    fn session_and_ue_removal_hand_back_their_apps_and_leave_no_index() {
+        let mut ctx = PcfContext::new();
+        ctx.init(64, 64);
+        let ue = ctx.ue_sm_add("imsi-001010000000767").expect("ue_sm");
+        let s1 = ctx.sess_add(ue.id, 5).expect("sess 1");
+        let s2 = ctx.sess_add(ue.id, 6).expect("sess 2");
+        let a1 = ctx.app_add(s1.id).expect("app 1");
+        let a2 = ctx.app_add(s2.id).expect("app 2");
+        let s2_policy = ctx.sess_find_by_id(s2.id).unwrap().sm_policy_id;
+
+        let (_, apps) = ctx
+            .sess_remove_with_apps(s1.id)
+            .expect("first removal wins");
+        assert_eq!(apps.iter().map(|a| a.id).collect::<Vec<_>>(), vec![a1.id]);
+        assert!(
+            ctx.sess_remove_with_apps(s1.id).is_none(),
+            "a second removal gets nothing"
+        );
+        assert!(!read_through_poison(&ctx.app_session_id_hash).contains_key(&a1.app_session_id));
+
+        let (_, apps) = ctx.ue_sm_remove_with_apps(ue.id).expect("ue removal");
+        assert_eq!(apps.iter().map(|a| a.id).collect::<Vec<_>>(), vec![a2.id]);
+        assert_eq!(ctx.sess_count(), 0);
+        assert_eq!(ctx.app_count(), 0);
+        assert!(read_through_poison(&ctx.app_session_id_hash).is_empty());
+        assert!(ctx.sess_find_by_sm_policy_id(&s2_policy).is_none());
+        assert!(read_through_poison(&ctx.sm_policy_id_hash).is_empty());
+    }
 
     /// #338: a poisoned auxiliary index must not turn a removal into a silent no-op.
     ///

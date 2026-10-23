@@ -361,9 +361,36 @@ static GTPU_PATHS: OnceLock<std::sync::Mutex<HashMap<IpAddr, GtpuPathState>>> = 
 /// list, and the symptom is an assertion about peer B reporting peer A — which reads
 /// as a per-peer bug in the code under test rather than as test interference. `N3` is
 /// worse: it is a process-wide env var, so one test lowering it changes how many
-/// unanswered Echoes another test needs.
+/// unanswered Echoes another test needs. `SGWU_GTPU_ECHO_INTERVAL_SECS` is covered
+/// too: it decides whether an open GTP-U server's probe thread writes the table.
+///
+/// Every test that writes the table holds it, the async `pfcp_path` Node Report
+/// tests included (#827: they held only `SXA_TEST_LOCK`, so their failed peer
+/// showed up in `path_state_is_per_peer`'s whole-table assertion). It is a tokio
+/// mutex so those tests can hold it across `.await`; the sync tests take it with
+/// `blocking_lock()`. Lock order: `SXA_TEST_LOCK` first, then this.
+///
+/// Two production paths also write the table and cannot take a test lock: the
+/// probe thread of every open `GtpuServer` (after `SGWU_GTPU_ECHO_INTERVAL_SECS`,
+/// default 60 s) and the Echo Response receive arm. No test today runs a server
+/// long enough to probe or sends one an Echo Response (#841 review). A test that
+/// lowers the interval, or sends an Echo Response to a test server, must hold
+/// this lock for its whole run.
 #[cfg(test)]
-static GTPU_PATH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static GTPU_PATH_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Forgets a test's peer when the test ends, pass or fail, so a later test's
+/// whole-table assertion does not see it (#827). Declare it after taking
+/// [`GTPU_PATH_TEST_LOCK`] so it drops while the lock is still held.
+#[cfg(test)]
+pub(crate) struct ForgetPathOnDrop(pub(crate) IpAddr);
+
+#[cfg(test)]
+impl Drop for ForgetPathOnDrop {
+    fn drop(&mut self) {
+        forget_gtpu_path(self.0);
+    }
+}
 
 fn gtpu_paths() -> &'static std::sync::Mutex<HashMap<IpAddr, GtpuPathState>> {
     GTPU_PATHS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
@@ -688,6 +715,19 @@ fn qer_enforcement_enabled() -> bool {
         "1" | "true" | "yes"
     )
 }
+
+/// Serialises the tests that toggle `SGWU_QER_ENFORCEMENT`.
+///
+/// The variable is PROCESS-GLOBAL. Until #215 only one test touched it, so there
+/// was nothing to race with; adding a second made
+/// `closed_qer_gate_drops_when_enforcement_is_enabled` fail intermittently with
+/// "a CLOSED gate must drop, got Forwarded" — one test's `remove_var` landing
+/// while the other had it set. Reproduced in 1 of 6 runs before the lock, then
+/// 30 of 30 green after. Same shape as the carried `gtp_path` race over
+/// `SGWU_GTPU_N3_REQUESTS`. Declared beside the reader it guards (#841 review),
+/// not in `mod tests`.
+#[cfg(test)]
+pub(crate) static QER_ENFORCEMENT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Per-(session, QER, direction) token buckets for MBR policing.
 ///
@@ -1061,17 +1101,6 @@ fn send_error_indication(server: &GtpuServer, teid: u32, peer: SocketAddr) -> Gt
 mod tests {
     use super::*;
     use crate::context::{FSeid, SgwuFar, SgwuPdr};
-
-    /// Serialises the tests that toggle `SGWU_QER_ENFORCEMENT`.
-    ///
-    /// The variable is PROCESS-GLOBAL. Until #215 only one test touched it, so there
-    /// was nothing to race with; adding a second made
-    /// `closed_qer_gate_drops_when_enforcement_is_enabled` fail intermittently with
-    /// "a CLOSED gate must drop, got Forwarded" — one test's `remove_var` landing
-    /// while the other had it set. Reproduced in 1 of 6 runs before the lock, then
-    /// 30 of 30 green after. Same shape as the carried `gtp_path` race over
-    /// `SGWU_GTPU_N3_REQUESTS`.
-    static QER_ENFORCEMENT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn test_server(peer_port: u16) -> GtpuServer {
         GtpuServer::open("127.0.0.1:0", peer_port).unwrap()
@@ -1893,6 +1922,54 @@ mod tests {
         (ctx, s.id)
     }
 
+    /// #866: the DATA PATH honours a flush in progress. A packet that reads a FAR
+    /// already switched to FORW while its buffer is still being flushed is queued
+    /// BEHIND the buffered packets (the flusher sends it, in order), not forwarded
+    /// past them; once the flush has ended it is forwarded directly.
+    #[test]
+    fn a_packet_on_a_forwarding_far_mid_flush_queues_behind_the_buffer() {
+        let ctx = sgwu_self();
+        let server = test_server(GTPV1_U_UDP_PORT);
+        let sess = ctx
+            .sess_add(&FSeid::with_ipv4(0x8660, Ipv4Addr::new(10, 86, 6, 1)))
+            .unwrap();
+        ctx.far_install(SgwuFar {
+            sess_id: sess.id,
+            far_id: 1,
+            apply_action: apply_action::FORW,
+            outer_header_creation: Some((0x866, Some(Ipv4Addr::new(127, 0, 0, 1)), None)),
+            buffered: vec![b"first".to_vec()],
+            flushing: true,
+            ..Default::default()
+        });
+        let pdr = SgwuPdr {
+            sess_id: sess.id,
+            pdr_id: 1,
+            source_interface: crate::sxa_handler::pfcp_interface::CORE,
+            local_teid: 0x8661,
+            far_id: Some(1),
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            apply_far(&server, &pdr, b"second"),
+            GtpuRecvResult::Buffered
+        ));
+        assert_eq!(
+            ctx.far_find(sess.id, 1).unwrap().buffered,
+            vec![b"first".to_vec(), b"second".to_vec()],
+            "queued behind the buffered packet, in order"
+        );
+        // The flusher drains (and ends the flush); a later packet forwards directly.
+        assert_eq!(ctx.far_flush_step(sess.id, 1).len(), 2);
+        assert!(ctx.far_flush_step(sess.id, 1).is_empty());
+        assert!(matches!(
+            apply_far(&server, &pdr, b"third"),
+            GtpuRecvResult::Forwarded
+        ));
+        ctx.sess_remove(sess.id);
+    }
+
     /// The MBR token bucket: the first packet fits within one second of credit,
     /// and a packet far larger than the whole per-second allowance cannot.
     #[test]
@@ -2032,9 +2109,7 @@ mod tests {
     /// a path down one probe early.
     #[test]
     fn path_fails_only_after_exceeding_n3_requests() {
-        let _paths = GTPU_PATH_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _paths = GTPU_PATH_TEST_LOCK.blocking_lock();
         let peer = IpAddr::V4(Ipv4Addr::new(10, 61, 0, 1));
         forget_gtpu_path(peer);
         std::env::set_var("SGWU_GTPU_N3_REQUESTS", "3");
@@ -2062,9 +2137,7 @@ mod tests {
     /// (`forget_gtpu_path` had only test callers, so nothing ever shrank it.)
     #[test]
     fn the_path_table_is_pruned_to_the_live_peers() {
-        let _paths = GTPU_PATH_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _paths = GTPU_PATH_TEST_LOCK.blocking_lock();
         let live = IpAddr::V4(Ipv4Addr::new(10, 82, 3, 1));
         let gone = IpAddr::V4(Ipv4Addr::new(10, 82, 3, 2));
         note_echo_unanswered(live);
@@ -2088,9 +2161,7 @@ mod tests {
     /// of them, as a spoofing sender would produce -- inserts nothing.
     #[test]
     fn echo_responses_from_unknown_peers_do_not_grow_the_path_table() {
-        let _paths = GTPU_PATH_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _paths = GTPU_PATH_TEST_LOCK.blocking_lock();
         let unknown = |i: u32| IpAddr::V4(Ipv4Addr::from(0x0A_83_00_00 | i));
         for i in 0..1000 {
             note_echo_answered(unknown(i));
@@ -2110,9 +2181,7 @@ mod tests {
     /// kept (its Recovery must still be reported, TS 23.007 §20.3.4).
     #[test]
     fn an_echo_round_prunes_stale_peers_and_probes_live_ones() {
-        let _paths = GTPU_PATH_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _paths = GTPU_PATH_TEST_LOCK.blocking_lock();
         let ctx = sgwu_self();
         let live_ip = Ipv4Addr::new(10, 83, 1, 1);
         let live = IpAddr::V4(live_ip);
@@ -2162,9 +2231,7 @@ mod tests {
     /// discarded Echo Responses entirely, so nothing could ever recover.
     #[test]
     fn echo_response_clears_the_path_failure() {
-        let _paths = GTPU_PATH_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _paths = GTPU_PATH_TEST_LOCK.blocking_lock();
         let peer = IpAddr::V4(Ipv4Addr::new(10, 61, 0, 2));
         forget_gtpu_path(peer);
         std::env::set_var("SGWU_GTPU_N3_REQUESTS", "1");
@@ -2188,9 +2255,7 @@ mod tests {
     /// Paths are tracked per peer: one dead eNB must not mark another down.
     #[test]
     fn path_state_is_per_peer() {
-        let _paths = GTPU_PATH_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _paths = GTPU_PATH_TEST_LOCK.blocking_lock();
         let dead = IpAddr::V4(Ipv4Addr::new(10, 61, 0, 3));
         let alive = IpAddr::V4(Ipv4Addr::new(10, 61, 0, 4));
         forget_gtpu_path(dead);
@@ -2214,6 +2279,7 @@ mod tests {
     /// choice; Section 20.3.1 mandates the detection, not the interval).
     #[test]
     fn echo_interval_is_configurable_and_disablable() {
+        let _paths = GTPU_PATH_TEST_LOCK.blocking_lock();
         std::env::set_var("SGWU_GTPU_ECHO_INTERVAL_SECS", "0");
         assert_eq!(gtpu_echo_interval(), None, "0 disables probing");
         std::env::set_var("SGWU_GTPU_ECHO_INTERVAL_SECS", "5");

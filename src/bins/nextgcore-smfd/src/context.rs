@@ -1641,6 +1641,30 @@ impl PolicyBinding {
     }
 }
 
+/// The base of every 5G SM context's PFCP CP SEID (#718 review M2).
+///
+/// EPC sessions take their CP SEID from `n4_seid_generator`, which counts from 1,
+/// so 5G SEIDs live above 2^48 and the two can never meet.
+pub const FIVE_G_CP_SEID_BASE: u64 = 1 << 48;
+
+/// The PFCP CP SEID of a 5G SM context with no recorded one in `cp_n4_seids`
+/// (#718 review M2).
+///
+/// Injective on the numeric references the SMF mints. The legacy `ref | 0x1000`
+/// was not: ref 1 and ref 4097 both gave 0x1001, so two live sessions shared a CP
+/// SEID and the UPF's Session Reports for one were applied to the other. It also
+/// overlapped the EPC SEIDs from `n4_seid_generator`.
+pub fn derive_cp_n4_seid(sm_context_ref: &str) -> u64 {
+    let index = sm_context_ref.parse::<u64>().unwrap_or(0);
+    FIVE_G_CP_SEID_BASE | (index & (FIVE_G_CP_SEID_BASE - 1))
+}
+
+/// The derivation snapshot version 1 used: the SEID a version-1 session was
+/// established under, and that the UPF still holds it under.
+pub fn legacy_cp_n4_seid(sm_context_ref: &str) -> u64 {
+    sm_context_ref.parse::<u64>().unwrap_or(1) | 0x1000
+}
+
 pub struct SmfContext {
     /// CTF configuration
     pub ctf_config: CtfConfig,
@@ -1702,6 +1726,13 @@ pub struct SmfContext {
     sess_index: AtomicU64,
     /// N4 SEID generator
     n4_seid_generator: AtomicU64,
+    /// This incarnation's boot epoch, with durable state (#718 review n3): one more
+    /// than the snapshot's, written back at once. The EPC SEIDs of this
+    /// incarnation start at `epoch << 32`, so they cannot meet those of an earlier
+    /// incarnation that crashed and left its EPC sessions in the PGW-U (EPC sessions
+    /// are not in the snapshot, so nothing else records how far it counted). 0
+    /// without durable state, where every SEID counts from 1 as before.
+    boot_epoch: AtomicU64,
     /// Next MBS session ID
     next_mbs_sess_id: AtomicUsize,
 
@@ -1869,6 +1900,7 @@ impl SmfContext {
             next_pf_id: AtomicUsize::new(1),
             sess_index: AtomicU64::new(1),
             n4_seid_generator: AtomicU64::new(1),
+            boot_epoch: AtomicU64::new(0),
             next_mbs_sess_id: AtomicUsize::new(1),
             max_num_of_ue: 0,
             max_num_of_sess: 0,
@@ -1931,8 +1963,14 @@ impl SmfContext {
     // ── durable state (issue #191) ───────────────────────────────────────────
 
     /// Snapshot document version. Bump ONLY for a change no `#[serde(default)]`
-    /// can absorb; a bump makes every older snapshot unreadable.
-    pub const SNAPSHOT_VERSION: u64 = 1;
+    /// can absorb. A newer snapshot is refused (a downgrade must not misread it);
+    /// an older one is migrated by [`restore_from`](Self::restore_from).
+    ///
+    /// - 1: the 5G CP SEID of an SM context was derived as `ref | 0x1000`.
+    /// - 2 (#718 review M2): it is [`derive_cp_n4_seid`]. A version-1 session is
+    ///   restored under its legacy SEID, recorded in `cp_n4_seids`, because that is
+    ///   the SEID the UPF holds it under.
+    pub const SNAPSHOT_VERSION: u64 = 2;
 
     /// Point this context at a snapshot file and restore any prior state,
     /// returning how many records were installed.
@@ -1948,7 +1986,7 @@ impl SmfContext {
     pub fn set_state_file(&mut self, path: std::path::PathBuf) -> Result<usize, SmfStateError> {
         use nextgcore_core::state_store::{Loaded, StateStore};
         self.state = StateStore::new(Some(path.clone()));
-        match self.state.load()? {
+        let restored = match self.state.load()? {
             Loaded::Snapshot(doc) => {
                 let restored = self.restore_from(&doc, &path);
                 if restored.is_err() {
@@ -1956,11 +1994,37 @@ impl SmfContext {
                     // caller that logged and carried on could otherwise overwrite a
                     // snapshot this build cannot fully read. Disable instead.
                     self.state = StateStore::disabled();
+                    return restored;
                 }
+                let previous = doc.get("bootEpoch").and_then(|v| v.as_u64()).unwrap_or(0);
+                self.begin_boot_epoch(previous);
                 restored
             }
-            Loaded::Absent => Ok(0),
-        }
+            Loaded::Absent => {
+                self.begin_boot_epoch(0);
+                Ok(0)
+            }
+        };
+        // Written now, not at the first mutation: a crash before any would
+        // otherwise let the next incarnation reuse this one's epoch.
+        self.persist();
+        restored
+    }
+
+    /// The largest boot epoch; EPC SEIDs stay below the 5G base (2^48).
+    const MAX_BOOT_EPOCH: u64 = 0xFFFF;
+
+    /// Start this incarnation's boot epoch after `previous` (#718 review n3) and
+    /// move the EPC SEID counter into it.
+    fn begin_boot_epoch(&self, previous: u64) {
+        let epoch = if previous >= Self::MAX_BOOT_EPOCH {
+            1
+        } else {
+            previous + 1
+        };
+        self.boot_epoch.store(epoch, Ordering::SeqCst);
+        self.n4_seid_generator
+            .fetch_max(epoch << 32, Ordering::SeqCst);
     }
 
     /// Whether durable state is armed. `false` is the shipped default.
@@ -2022,6 +2086,7 @@ impl SmfContext {
             "ipv4Allocations": ipv4_allocations,
             "upfRecoveryTimeStamps": upf_rts,
             "cpN4Seids": cp_n4_seids,
+            "bootEpoch": self.boot_epoch.load(Ordering::SeqCst),
         })
     }
 
@@ -2055,7 +2120,9 @@ impl SmfContext {
         let found = doc
             .get("version")
             .and_then(|v| v.as_u64())
-            .unwrap_or(Self::SNAPSHOT_VERSION);
+            // Every snapshot ever written carries a version; one without is from
+            // before versions existed, which is version 1.
+            .unwrap_or(1);
         if found > Self::SNAPSHOT_VERSION {
             return Err(SmfStateError::UnsupportedVersion {
                 path: path.to_path_buf(),
@@ -2131,10 +2198,45 @@ impl SmfContext {
 
         // #475: absent in every snapshot written before it existed, which is exactly the
         // set with no EPS→5GS-migrated contexts in it, so an empty default is correct.
-        let cp_n4_seids: HashMap<String, u64> = doc
+        let mut cp_n4_seids: HashMap<String, u64> = doc
             .get("cpN4Seids")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
+        // #718 review M2: a version-1 session was established under the legacy
+        // derivation. The UPF holds it under that SEID, so it keeps it, recorded
+        // explicitly; only new sessions use the collision-free derivation.
+        if found < 2 {
+            for r in pfcp_sessions.keys() {
+                cp_n4_seids
+                    .entry(r.clone())
+                    .or_insert_with(|| legacy_cp_n4_seid(r));
+            }
+        }
+        // ...and no new SM context, N4 SEID or EPC session may reuse an identifier a
+        // restored session still holds. `sess_index` restarts at 1 in every process,
+        // so without this the first new SM context after a restart was minted ref
+        // "1" again: it overwrote the restored `pfcp_sessions["1"]` and was
+        // established under the same CP SEID the UPF had retained for the old one,
+        // so the old session's Session Reports reached the new UE.
+        let max_ref = pfcp_sessions
+            .keys()
+            .chain(policy_bindings.keys())
+            .chain(cp_n4_seids.keys())
+            .filter_map(|r| r.parse::<u64>().ok())
+            .max();
+        if let Some(max_ref) = max_ref {
+            self.sess_index
+                .fetch_max(max_ref.saturating_add(1), Ordering::SeqCst);
+        }
+        let max_seid = cp_n4_seids
+            .values()
+            .copied()
+            .filter(|seid| *seid < FIVE_G_CP_SEID_BASE)
+            .max();
+        if let Some(max_seid) = max_seid {
+            self.n4_seid_generator
+                .fetch_max(max_seid.saturating_add(1), Ordering::SeqCst);
+        }
 
         let n_sessions = pfcp_sessions.len();
         let n_bindings = policy_bindings.len();
@@ -3264,6 +3366,16 @@ pub fn smf_self() -> Arc<RwLock<SmfContext>> {
 
 /// Initialize the global SMF context
 pub fn smf_context_init(max_ue: usize, max_sess: usize, max_bearer: usize) {
+    // #779: not a wipe (`SmfContext::init` is idempotent; only `fini` clears), but
+    // every test that calls this goes on to read or write the process-wide context,
+    // and under the #308 rule those readers and writers hold the ambient lock. This
+    // makes the serial CI run name a test that forgets it.
+    #[cfg(test)]
+    require_test_lock(
+        &PROCESS_STATE_TEST_LOCK,
+        "PROCESS_STATE_TEST_LOCK",
+        "smf_context_init (a test that then uses the process-wide SMF context)",
+    );
     let ctx = smf_self();
     if let Ok(mut context) = ctx.write() {
         context.init(max_ue, max_sess, max_bearer);
@@ -3274,9 +3386,11 @@ pub fn smf_context_init(max_ue: usize, max_sess: usize, max_bearer: usize) {
 ///
 /// Four globals are involved and they cannot be guarded separately, because the
 /// production paths under test read all four together:
-/// - [`GLOBAL_SMF_CONTEXT`] — [`smf_context_init`] calls `SmfContext::init`, which
-///   clears the UE, session, bearer, policy-binding and PFCP-session maps for the
-///   WHOLE process rather than for the test that asked;
+/// - [`GLOBAL_SMF_CONTEXT`] — its UE, session, bearer, policy-binding and PFCP-session
+///   maps are shared by every test in the process. (`SmfContext::init`, which
+///   [`smf_context_init`] calls, is idempotent and clears nothing; the bulk removers
+///   are `fini` and `pfcp_path::clear_pfcp_sessions`, the latter reached through the
+///   PFCP teardown, #762/#779);
 /// - `udm::UDM_ENABLED`, `easdf`'s config slot and `eps_iwk::EPS_IWK_ENABLED` — the
 ///   feature switches `handle_sm_context_create` / `_release` consult, so a sibling
 ///   that turns one ON changes what a create does in a test that never mentions it;
@@ -3586,6 +3700,112 @@ mod tests {
         b.fsm.state = state;
         b.easdf_dns_context_id = Some("dns-ctx-9".to_string());
         b
+    }
+
+    // ── #718 review M2: identifiers a restored session holds are never re-issued ──
+
+    /// After a restart the next SM context gets a fresh reference and a fresh CP
+    /// SEID. Before, `sess_index` restarted at 1, so the first new SM context was
+    /// minted ref "1" again: it overwrote the restored session and was established
+    /// under the CP SEID the UPF had retained for it.
+    #[test]
+    fn a_restored_session_s_reference_and_seids_are_never_reissued() {
+        let path = temp_state_path("m2-fresh-ids");
+        let doc = serde_json::json!({
+            "version": SmfContext::SNAPSHOT_VERSION,
+            "pfcpSessions": { "1": 0x11u64, "7": 0x17u64 },
+            "policyBindings": { "9": binding("imsi-001010000000009", 1, [10, 45, 0, 9],
+                crate::gsm_sm::GsmState::Initial) },
+            "ipv4Allocations": [],
+            "upfRecoveryTimeStamps": {},
+            "cpN4Seids": { "7": 0x40u64 }
+        });
+        std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
+        let ctx = ctx_with_state(&path);
+
+        let ue = ctx.ue_add_by_supi("imsi-001010000000718").expect("ue");
+        let sess = ctx.sess_add_by_psi(ue.id, 5).expect("sess");
+        let r: u64 = sess.sm_context_ref.as_deref().unwrap().parse().unwrap();
+        assert!(r > 9, "the new reference {r} is past every restored one");
+        assert_ne!(derive_cp_n4_seid(&r.to_string()), derive_cp_n4_seid("1"));
+        // An EPC session's SEID is past the inherited one restored for ref 7.
+        let epc = ctx.sess_add_by_apn(ue.id, "internet", 6).expect("epc");
+        assert!(epc.smf_n4_seid > 0x40, "EPC SEID {:#x}", epc.smf_n4_seid);
+    }
+
+    /// #718 review n3: EPC sessions are not in the snapshot, so after a crash with
+    /// durable state the PGW-U can still hold the previous incarnation's. Each boot
+    /// takes a new epoch, written at once, and its EPC SEIDs start inside it, so
+    /// they never meet the previous incarnation's.
+    #[test]
+    fn each_boot_with_durable_state_mints_epc_seids_in_a_new_epoch() {
+        let path = temp_state_path("n3-epoch");
+        let first = ctx_with_state(&path);
+        let ue = first.ue_add_by_imsi(b"001010000071830").expect("ue");
+        let a = first
+            .sess_add_by_apn(ue.id, "internet", 6)
+            .expect("sess")
+            .smf_n4_seid;
+        // A crash: nothing else was persisted after the boot.
+        drop(first);
+        let second = ctx_with_state(&path);
+        let ue = second.ue_add_by_imsi(b"001010000071830").expect("ue");
+        let b = second
+            .sess_add_by_apn(ue.id, "internet", 6)
+            .expect("sess")
+            .smf_n4_seid;
+        assert_eq!(a >> 32, 1, "first boot, epoch 1: {a:#x}");
+        assert_eq!(b >> 32, 2, "second boot, epoch 2: {b:#x}");
+        assert!(b < FIVE_G_CP_SEID_BASE, "EPC SEIDs stay below the 5G range");
+    }
+
+    /// A version-1 snapshot's sessions keep the legacy CP SEID (`ref | 0x1000`): the
+    /// UPF holds them under it. Only new sessions use the new derivation.
+    #[test]
+    fn a_version_1_session_keeps_its_legacy_cp_seid() {
+        let path = temp_state_path("m2-legacy");
+        let doc = serde_json::json!({
+            "version": 1,
+            "pfcpSessions": { "1": 0x11u64, "3": 0x13u64 },
+            "policyBindings": {},
+            "ipv4Allocations": [],
+            "upfRecoveryTimeStamps": {},
+            "cpN4Seids": { "3": 0x99u64 }
+        });
+        std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
+        let ctx = ctx_with_state(&path);
+        let seids = ctx.cp_n4_seids.read().unwrap().clone();
+        assert_eq!(seids.get("1"), Some(&0x1001), "legacy derivation recorded");
+        assert_eq!(
+            seids.get("3"),
+            Some(&0x99),
+            "an inherited SEID is kept as it was"
+        );
+        // And a version-2 snapshot is NOT migrated: its sessions use the new one.
+        let path2 = temp_state_path("m2-current");
+        let doc2 = serde_json::json!({
+            "version": SmfContext::SNAPSHOT_VERSION,
+            "pfcpSessions": { "1": 0x11u64 },
+            "policyBindings": {},
+            "ipv4Allocations": [],
+            "upfRecoveryTimeStamps": {}
+        });
+        std::fs::write(&path2, serde_json::to_string(&doc2).unwrap()).unwrap();
+        let ctx2 = ctx_with_state(&path2);
+        assert!(ctx2.cp_n4_seids.read().unwrap().get("1").is_none());
+    }
+
+    /// The new derivation is injective: ref 1 and ref 4097 collided under the legacy
+    /// `ref | 0x1000` (both 0x1001), within one incarnation.
+    #[test]
+    fn distinct_references_never_share_a_cp_seid() {
+        assert_eq!(legacy_cp_n4_seid("1"), legacy_cp_n4_seid("4097"));
+        assert_ne!(derive_cp_n4_seid("1"), derive_cp_n4_seid("4097"));
+        let seids: std::collections::HashSet<u64> = (1..=10_000u64)
+            .map(|r| derive_cp_n4_seid(&r.to_string()))
+            .collect();
+        assert_eq!(seids.len(), 10_000);
+        assert!(seids.iter().all(|s| *s >= FIVE_G_CP_SEID_BASE));
     }
 
     // ── #193: a session whose binding record did not survive ──

@@ -1092,6 +1092,10 @@ pub struct MmeUe {
     /// ATTACH, TAU or SERVICE REQUEST colliding with it is treated
     /// (§5.5.2.3.5 d-f, #732).
     pub network_detach_type: Option<crate::emm_build::DetachTypeToUe>,
+    /// The network-initiated detach in progress was started by an HSS Cancel Location
+    /// (subscription withdrawal). Only then is a further CLR a retransmission of the one
+    /// being served; a CLR during any other detach is the HSS's own instruction (#828).
+    pub network_detach_by_clr: bool,
 
     // UE Identity
     /// IMSI

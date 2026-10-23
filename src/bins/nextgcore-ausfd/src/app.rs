@@ -2940,6 +2940,19 @@ mod tests {
                 "bad-hex resStar must return 400 (ausfd-03)"
             );
 
+            // #765: an odd length and a multi-byte character used to panic the
+            // handler in hex_to_bytes (a slice past the end / off a char
+            // boundary). Both are a 400 like any other bad hex, and the AUSF
+            // still answers afterwards.
+            for bad in ["abc", "a\u{e9}b", "0".repeat(31).as_str()] {
+                let (href, _rand) = initiate_5g_aka(&client, SUCI_AKA, TEST_SNN).await;
+                let resp = client
+                    .put_json(&href, &serde_json::json!({ "resStar": bad }))
+                    .await
+                    .unwrap_or_else(|e| panic!("PUT resStar:{bad:?} got no answer: {e}"));
+                assert_eq!(resp.status, 400, "resStar {bad:?} must return 400 (#765)");
+            }
+
             ausf_server.stop().await.expect("stop ausf");
             udm_server.stop().await.expect("stop udm");
         })

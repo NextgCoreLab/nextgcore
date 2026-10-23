@@ -540,13 +540,7 @@ pub fn parse_suci(suci: &str) -> Option<ParsedSuci> {
 
 /// Strict hex decode: rejects odd length and non-hex characters.
 fn hex_str_to_bytes(hex: &str) -> Option<Vec<u8>> {
-    if !hex.len().is_multiple_of(2) {
-        return None;
-    }
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
-        .collect()
+    nextgcore_core::conv::hex_decode(hex)
 }
 
 /// Decode an MSIN plaintext block (TBCD, swapped nibbles, 0xF filler) into digits.
@@ -1479,6 +1473,14 @@ pub fn get_ue_load() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hex_str_to_bytes_refuses_a_multi_byte_character_without_panicking() {
+        // The SUCI scheme output reaches this from the AMF (#765).
+        assert_eq!(hex_str_to_bytes("a\u{e9}b"), None);
+        assert_eq!(hex_str_to_bytes("abc"), None);
+        assert_eq!(hex_str_to_bytes("0aFF"), Some(vec![0x0a, 0xff]));
+    }
 
     #[test]
     fn test_udm_context_new() {

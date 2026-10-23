@@ -108,7 +108,9 @@ pub enum PositioningMethodKind {
     Ecid,
     /// Multi-RTT trilateration (>=3 ranges).
     MultiRtt,
-    /// Time-Difference-of-Arrival hyperbolic multilateration (>=3 TRPs).
+    /// NR DL-TDOA hyperbolic multilateration on UE-measured RSTDs (>=3 TRPs).
+    /// The only TDOA this LMF solves, so it reports `DL_TDOA` (TS 29.572
+    /// `PositioningMethod`); it reported `UL_TDOA` before #714.
     Tdoa,
     /// Angle-of-Arrival / Angle-of-Departure bearing intersection (>=2 TRPs).
     AngleOfArrival,
@@ -120,7 +122,7 @@ impl PositioningMethodKind {
         match self {
             PositioningMethodKind::Ecid => "NR_ECID",
             PositioningMethodKind::MultiRtt => "MULTI-RTT",
-            PositioningMethodKind::Tdoa => "UL_TDOA",
+            PositioningMethodKind::Tdoa => "DL_TDOA",
             PositioningMethodKind::AngleOfArrival => "UL_AOA",
         }
     }
@@ -526,6 +528,63 @@ pub fn solve_ecid(
     let d = nr_ta_to_range_m(ta, scs_mu);
     let quant = nr_ta_to_range_m(1, scs_mu); // one-step distance
     let radius = d + quant / 2.0;
+    Ok(PositioningEstimate {
+        lat_deg: cell.lat_deg,
+        lon_deg: cell.lon_deg,
+        height_m: Some(cell.height_m),
+        uncertainty: UncertaintyEllipse {
+            semi_major_m: radius,
+            semi_minor_m: radius,
+            orientation_deg: 0.0,
+        },
+        method: PositioningMethodKind::Ecid,
+        confidence: DEFAULT_CONFIDENCE,
+    })
+}
+
+/// E-UTRA basic time unit T_s = 1/(15000·2048) s, in ns (TS 36.211 §4).
+pub const TS_NS: f64 = 1e9 / (15_000.0 * 2_048.0);
+
+/// The E-UTRA time-report mapping shared by TADV (TS 36.133 §10.3.1, range
+/// 0..7690) and the UE Rx–Tx time difference (TS 36.133 §9.1.9.3, range
+/// 0..4095): steps of 2 T_s up to 4096 T_s, then steps of 8 T_s. The last report
+/// value, `max`, is the open-ended bin `T ≥ 4096 + 8·(max − 2048)` T_s and gives
+/// `None`. Otherwise returns (bin midpoint, bin width), both in ns (#832).
+pub fn eutra_time_report_to_ns(v: u32, max: u32) -> Option<(f64, f64)> {
+    if v >= max {
+        return None;
+    }
+    let (lower, width) = if v < 2048 {
+        (2.0 * f64::from(v), 2.0)
+    } else {
+        (4096.0 + 8.0 * f64::from(v - 2048), 8.0)
+    };
+    Some(((lower + width / 2.0) * TS_NS, width * TS_NS))
+}
+
+/// TS 36.133 §10.3.1: E-UTRA TADV report values 0..7690.
+pub const EUTRA_TADV_MAX: u32 = 7690;
+/// TS 36.133 §9.1.9.3: E-UTRA UE Rx–Tx report values 0..4095.
+pub const EUTRA_UE_RX_TX_MAX: u32 = 4095;
+
+/// E-CID from a round-trip time (#832): the fix is at the serving cell, and the
+/// uncertainty radius is the one-way range `c·rtt/2` plus half the one-way
+/// width of the report bin.
+pub fn solve_ecid_round_trip(
+    registry: &TrpRegistry,
+    serving_trp: &str,
+    rtt_ns: f64,
+    bin_ns: f64,
+) -> Result<PositioningEstimate, PositioningError> {
+    let cell = registry
+        .lookup(serving_trp)
+        .ok_or_else(|| PositioningError::UnknownTrp(serving_trp.to_string()))?;
+    if !(rtt_ns.is_finite() && rtt_ns >= 0.0 && bin_ns.is_finite() && bin_ns >= 0.0) {
+        return Err(PositioningError::InvalidMeasurement(format!(
+            "E-CID round trip {rtt_ns} ns is not a non-negative finite number"
+        )));
+    }
+    let radius = rtt_ns_to_range_m(rtt_ns) + rtt_ns_to_range_m(bin_ns) / 2.0;
     Ok(PositioningEstimate {
         lat_deg: cell.lat_deg,
         lon_deg: cell.lon_deg,
@@ -1452,7 +1511,7 @@ mod tests {
     #[test]
     fn test_method_spec_strings() {
         assert_eq!(PositioningMethodKind::MultiRtt.as_spec_str(), "MULTI-RTT");
-        assert_eq!(PositioningMethodKind::Tdoa.as_spec_str(), "UL_TDOA");
+        assert_eq!(PositioningMethodKind::Tdoa.as_spec_str(), "DL_TDOA");
         assert_eq!(
             PositioningMethodKind::AngleOfArrival.as_spec_str(),
             "UL_AOA"
