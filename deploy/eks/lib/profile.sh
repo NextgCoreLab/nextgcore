@@ -52,8 +52,9 @@ nextg_load_profile() {
   profile_summary() { :; }
   # shellcheck disable=SC2317
   profile_postrender() { :; }
-  # Prints how to build the profile's binaries; build-and-push.sh calls it
-  # when some are missing. Reads CORE_DIR, SIM_DIR and CORE_BIN_DIR.
+  # Prints how to build the profile's missing binaries; build-and-push.sh
+  # calls it when some are missing. Reads CORE_DIR, SIM_DIR, CORE_BIN_DIR and
+  # the MISSING_CORE_BINS / MISSING_SIM_BINS arrays (bare binary names).
   # shellcheck disable=SC2317
   profile_build_hint() { :; }
 

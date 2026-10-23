@@ -178,7 +178,8 @@ it as it is and nothing is re-seeded. On a gp3 PVC the data survives.
 usage report. smfd provisions a 3600 s Measurement Period by default, so a
 PGW-U (or 5G UPF) that has carried traffic stops answering PFCP about an hour
 later. Every new attach then fails (S5 cause 106). Until a build with #724's fix
-is deployed, delete the pgwu pod to recover.
+is deployed, delete the pgwu pod (PROFILE=epc) or the upf pod in `nextg-system`
+(PROFILE=5g) to recover.
 
 "On the UE's next uplink": an MME restart loses the UE contexts, and the UE
 stays EMM-REGISTERED and idle until it has data to send. No paging or periodic
@@ -292,7 +293,8 @@ aws sts get-caller-identity          # must succeed
 
 The binaries must be built first. They are not committed: `nextgcore/binaries/`
 and `nextgsim/docker/binaries/` are gitignored, and `build-and-push.sh` fails
-listing whatever is missing (once its AWS STS check has passed; #716).
+listing whatever is missing, with the commands to build it, before any AWS
+call (#716).
 
 - `nextgcore/binaries/`: `cd src && cargo build --release`, then copy the
   daemons from `src/target/release/`. The workspace builds all 28 NF daemons

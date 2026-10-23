@@ -91,12 +91,17 @@ done
 # which binaries are missing. They are build artifacts and no longer tracked in
 # git, so a fresh clone has none until you build.
 MISSING=()
+# Bare binary names, for profile_build_hint (it prints only their steps).
+MISSING_CORE_BINS=()
+MISSING_SIM_BINS=()
 for entry in "${CORE_NFS[@]}"; do
   bin="${entry#*:}"
+  [[ -f "${CORE_BIN_DIR}/${bin}" ]] && continue
+  MISSING_CORE_BINS+=("${bin}")
   if [[ "${CORE_BIN_DIR}" == "${DEFAULT_CORE_BIN_DIR}" ]]; then
-    [[ -f "${CORE_BIN_DIR}/${bin}" ]] || MISSING+=("nextgcore/binaries/${bin}")
+    MISSING+=("nextgcore/binaries/${bin}")
   else
-    [[ -f "${CORE_BIN_DIR}/${bin}" ]] || MISSING+=("${CORE_BIN_DIR}/${bin}")
+    MISSING+=("${CORE_BIN_DIR}/${bin}")
   fi
 done
 for entry in "${PROFILE_SIM_IMAGES[@]}"; do
@@ -104,10 +109,13 @@ for entry in "${PROFILE_SIM_IMAGES[@]}"; do
   IFS=, read -r -a _bins <<<"${bins}"
   for bin in "${_bins[@]}"; do
     if [[ "${ctx}" == . ]]; then
-      [[ -f "${SIM_DIR}/binaries/${bin}" ]] || MISSING+=("nextgsim/binaries/${bin}")
+      [[ -f "${SIM_DIR}/binaries/${bin}" ]] && continue
+      MISSING+=("nextgsim/binaries/${bin}")
     else
-      [[ -f "${SIM_DIR}/${ctx}/binaries/${bin}" ]] || MISSING+=("nextgsim/${ctx}/binaries/${bin}")
+      [[ -f "${SIM_DIR}/${ctx}/binaries/${bin}" ]] && continue
+      MISSING+=("nextgsim/${ctx}/binaries/${bin}")
     fi
+    MISSING_SIM_BINS+=("${bin}")
   done
 done
 if (( ${#MISSING[@]} )); then
