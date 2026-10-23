@@ -1047,9 +1047,11 @@ impl LmfContext {
     /// resolves the session before reporting a leg (#834 review).
     ///
     /// Bounded: a session holds at most [`MAX_SESSION_MEASUREMENTS`]; more are
-    /// dropped and logged. And an E-UTRA E-CID fix from the LPP leg alone (its
-    /// UE Rx–Tx is a timing term) completes the session at once, so a silent gNB
-    /// does not cost the whole budget; the NRPPa leg would only refine it.
+    /// dropped and logged. And for a BestEffort or LowLatency request, an E-UTRA
+    /// E-CID fix from the LPP leg alone (its UE Rx–Tx is a timing term) completes
+    /// the session at once, so a silent gNB does not cost the whole budget; the
+    /// NRPPa leg would only refine it. That trial solve runs outside the sessions
+    /// lock.
     pub fn measurement_leg_report(
         &self,
         request_id: u64,
@@ -1066,6 +1068,15 @@ impl LmfContext {
         };
         // Taken before the sessions lock, which is held alone.
         let registry = self.build_trp_registry();
+        // #907 review: the early E-UTRA E-CID solve trades the gNB's refinement
+        // for latency, which a high-accuracy or emergency request does not want.
+        let early_solve_allowed = self.measurement_find(request_id).is_some_and(|m| {
+            matches!(
+                m.qos_class,
+                PositioningQos::BestEffort | PositioningQos::LowLatency
+            )
+        });
+        let mut early: Option<Vec<CellMeasurement>> = None;
         let ready = {
             let Ok(mut sessions) = self.positioning_sessions.write() else {
                 return LegProgress::NoSession;
@@ -1085,10 +1096,12 @@ impl LmfContext {
             if !s.reported_legs.contains(&leg) {
                 s.reported_legs.push(leg);
             }
-            if Self::all_legs_in(s)
-                || (leg == MeasurementLeg::Lpp && eutra_ecid_fix(&s.accumulated, &registry))
-            {
+            if Self::all_legs_in(s) {
                 Some(s.accumulated.clone())
+            } else if leg == MeasurementLeg::Lpp && early_solve_allowed {
+                // Tried below, outside the sessions lock (#907 review).
+                early = Some(s.accumulated.clone());
+                None
             } else {
                 log::info!(
                     "Positioning session {corr}: {leg:?} reported; waiting for {:?}",
@@ -1100,6 +1113,16 @@ impl LmfContext {
                 None
             }
         };
+        if ready.is_none() {
+            if let Some(cells) = early {
+                if eutra_ecid_fix(&cells, &registry) {
+                    return LegProgress::Completed(self.measurement_report(request_id, cells));
+                }
+                log::info!(
+                    "Positioning session {corr}: {leg:?} reported; waiting for the other legs"
+                );
+            }
+        }
         match ready {
             Some(cells) => LegProgress::Completed(self.measurement_report(request_id, cells)),
             None => LegProgress::Waiting,
@@ -3773,7 +3796,9 @@ mod tests_session_bounds {
             nr_cgi: "pci-7".to_string(),
             rsrp: Some(-80),
             rsrq: None,
-            timing_advance: ta.map(|t| t as u32),
+            timing_advance: None,
+            ecid_rtt_ns: ta,
+            ecid_rtt_width_ns: ta.map(|_| 65.1),
             aoa: None,
             rtt_ns: None,
             rstd_ns: None,
@@ -3815,12 +3840,38 @@ mod tests_session_bounds {
         let LegProgress::Completed(Some(fix)) = c.measurement_leg_report(
             request_id,
             MeasurementLeg::Lpp,
-            vec![cell(true, Some(500.0))],
+            vec![cell(true, Some(5_000.0))],
         ) else {
             panic!("solved without waiting for the NRPPa leg");
         };
         assert_eq!(fix.method_used.as_deref(), Some("ECID"));
         assert!(matches!(rx.try_recv(), Ok(PositioningOutcome::Fix(_))));
+    }
+
+    /// #907 review MINOR: the early solve is gated on QoS. A high-accuracy request
+    /// waits for the gNB's refinement even when the LPP leg alone solves.
+    #[test]
+    fn a_high_accuracy_session_is_not_solved_early() {
+        let c = ctx();
+        let req = c
+            .measurement_request(
+                0,
+                PositioningMethod::Ecid,
+                None,
+                None,
+                PositioningQos::HighAccuracy,
+            )
+            .unwrap();
+        let (corr, _rx) = c.positioning_session_register(Some("imsi-2".into()), 5, req.request_id);
+        c.positioning_session_expect_leg(&corr, MeasurementLeg::NrppaEcid);
+        assert!(matches!(
+            c.measurement_leg_report(
+                req.request_id,
+                MeasurementLeg::Lpp,
+                vec![cell(true, Some(5_000.0))]
+            ),
+            LegProgress::Waiting
+        ));
     }
 
     /// An NR E-CID LPP report (no timing term) still waits for the NRPPa leg.

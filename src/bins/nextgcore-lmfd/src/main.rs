@@ -2920,6 +2920,10 @@ async fn handle_n1_message_notify(request: &SbiRequest) -> SbiResponse {
                  (lcsCorrelationId={lcs_correlation_id:?})"
             ),
         }
+        // #907 review: a capability report is not a measurement report. Counted
+        // as the session's LPP leg, an unsolicited one completed the session as a
+        // 500 and the real report then found no session (404).
+        return SbiResponse::no_content();
     }
 
     let Some(request_id) = resolve_notify_session(lcs_correlation_id, lpp_txn) else {
@@ -7347,6 +7351,62 @@ mod positioning_chain_strict_peer {
 
         let _ = amf_server.stop().await;
         let _ = nrf_server.stop().await;
+    }
+
+    /// #907 review MAJOR: an unsolicited ProvideCapabilities during a session is
+    /// recorded and answered 204, and it is not the session's LPP leg: the session
+    /// stays pending, and the real report still completes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_capability_report_is_recorded_and_is_not_the_lpp_leg() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _serial = chain_lock().lock().await;
+        lmf_context_init(1024);
+        let supi = "imsi-001010000000907";
+        let (corr, mut rx, request_id) = {
+            let g = lmf_self();
+            let g = g.read().unwrap();
+            g.set_cell_coord("pci-7", crate::positioning::TrpCoord::new(40.0, -74.0, 0.0));
+            let req = g
+                .measurement_request(
+                    0,
+                    PositioningMethod::Ecid,
+                    None,
+                    None,
+                    PositioningQos::BestEffort,
+                )
+                .unwrap();
+            let (corr, rx) = g.positioning_session_register(Some(supi.into()), 3, req.request_id);
+            (corr, rx, req.request_id)
+        };
+        let caps = crate::lpp_equivalence_tests::unhex("9203084858");
+        assert_eq!(
+            handle_n1_message_notify(&amfd_notify_request(&corr, supi, &caps))
+                .await
+                .status,
+            204
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the capability report did not complete the session"
+        );
+        assert!(lmf_self()
+            .read()
+            .unwrap()
+            .positioning_session_find(&corr)
+            .is_some());
+        assert_eq!(
+            lmf_self().read().unwrap().ue_lpp_capability(supi),
+            crate::codec_glue::UeLppCapability::EcidOnly
+        );
+        let report = crate::lpp_fixtures::ecid_lpp(7, 60, 500, 3);
+        assert_eq!(
+            handle_n1_message_notify(&amfd_notify_request(&corr, supi, &report))
+                .await
+                .status,
+            204
+        );
+        assert!(matches!(rx.try_recv(), Ok(PositioningOutcome::Fix(_))));
+        let _ = request_id;
     }
 
     /// Negative leg (WS-A §A9 step 3): amfd accepts the transfer but the UE stays
