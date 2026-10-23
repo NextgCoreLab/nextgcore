@@ -102,7 +102,12 @@ impl GtpuServer {
                         if let Some(interval) = gtpu_echo_interval() {
                             if last_probe.elapsed() >= interval {
                                 last_probe = Instant::now();
-                                for ip in gtpu_peer_addresses() {
+                                let peers = gtpu_peer_addresses();
+                                // #823: a peer no FAR references any more is not a
+                                // path we are "in contact with" (§20.3.1); its entry
+                                // goes, or the table keeps every peer ever seen.
+                                prune_gtpu_paths(&peers);
+                                for ip in peers {
                                     // Count the PREVIOUS round's probe as missed
                                     // before sending the next: a response since
                                     // then has already cleared it.
@@ -500,6 +505,15 @@ pub fn failed_gtpu_paths() -> Vec<IpAddr> {
     failed
 }
 
+/// Drop the path state of every peer not in `current` -- the peers some FAR still
+/// forwards to (#823). Run before each Echo round, so the table is bounded by the
+/// live peer set instead of by every peer this process has ever forwarded to.
+pub fn prune_gtpu_paths(current: &[IpAddr]) {
+    if let Ok(mut paths) = gtpu_paths().lock() {
+        paths.retain(|ip, _| current.contains(ip));
+    }
+}
+
 /// Forget a peer's path state (used when no FAR references it any more, so the
 /// table does not grow without bound).
 pub fn forget_gtpu_path(peer: IpAddr) {
@@ -711,6 +725,19 @@ pub fn mbr_forget_session(sess_id: u64) {
 
 /// Apply the FAR linked to a PDR to a received payload
 fn apply_far(server: &GtpuServer, pdr: &SgwuPdr, payload: &[u8]) -> GtpuRecvResult {
+    apply_far_once(server, pdr, payload, false)
+}
+
+/// One application of the PDR's FAR. `retried` is set when a BUFF decision was
+/// overtaken by an Update FAR (#823) and the packet is re-dispatched against the
+/// FAR's new action: QER policing already ran (and consumed MBR tokens) for it, and
+/// a second overtake in a row drops the packet rather than looping.
+fn apply_far_once(
+    server: &GtpuServer,
+    pdr: &SgwuPdr,
+    payload: &[u8],
+    retried: bool,
+) -> GtpuRecvResult {
     let ctx = sgwu_self();
     let Some(far_id) = pdr.far_id else {
         log::warn!("[DROP] PDR {} has no FAR", pdr.pdr_id);
@@ -733,7 +760,7 @@ fn apply_far(server: &GtpuServer, pdr: &SgwuPdr, payload: &[u8]) -> GtpuRecvResu
     // Gated off by default: enforcement changes forwarding behaviour, and a
     // mis-provisioned QER would black-hole traffic that flows today. Enable with
     // SGWU_QER_ENFORCEMENT=1.
-    if qer_enforcement_enabled() {
+    if !retried && qer_enforcement_enabled() {
         if let Some(qer) = pdr.qer_id.and_then(|qid| ctx.qer_find(pdr.sess_id, qid)) {
             // Direction from the PDI: ACCESS-sourced traffic is uplink.
             let uplink = pdr.source_interface == crate::sxa_handler::pfcp_interface::ACCESS;
@@ -762,6 +789,13 @@ fn apply_far(server: &GtpuServer, pdr: &SgwuPdr, payload: &[u8]) -> GtpuRecvResu
                 .and_then(|b| b.dl_buffering_suggested_packet_count),
         );
         let outcome = ctx.far_buffer_packet(pdr.sess_id, far_id, payload.to_vec(), capacity);
+        if matches!(outcome, Some(crate::context::BufferOutcome::NotBuffering)) {
+            if retried {
+                return GtpuRecvResult::Dropped("FAR action changed twice".to_string());
+            }
+            log::debug!("FAR {far_id} left BUFF while this packet was in flight: re-applying");
+            return apply_far_once(server, pdr, payload, true);
+        }
         let count = outcome.map(|o| o.buffered()).unwrap_or(0);
         let accepted = outcome.is_some_and(|o| o.accepted());
         log::debug!("BUFF per FAR {far_id} (buffered={count}/{capacity}, accepted={accepted})");
@@ -1833,6 +1867,33 @@ mod tests {
 
         std::env::remove_var("SGWU_GTPU_N3_REQUESTS");
         forget_gtpu_path(peer);
+    }
+
+    /// #823: the path table is pruned to the peers some FAR still forwards to, so it
+    /// is bounded by the live peer set rather than by every peer ever seen.
+    /// (`forget_gtpu_path` had only test callers, so nothing ever shrank it.)
+    #[test]
+    fn the_path_table_is_pruned_to_the_live_peers() {
+        let _paths = GTPU_PATH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let live = IpAddr::V4(Ipv4Addr::new(10, 82, 3, 1));
+        let gone = IpAddr::V4(Ipv4Addr::new(10, 82, 3, 2));
+        note_echo_unanswered(live);
+        note_echo_unanswered(gone);
+        assert_eq!(gtpu_path_state(gone).unanswered, 1);
+
+        prune_gtpu_paths(&[live]);
+        assert_eq!(
+            gtpu_path_state(live).unanswered,
+            1,
+            "a live peer keeps its state"
+        );
+        assert!(
+            !gtpu_paths().lock().unwrap().contains_key(&gone),
+            "a peer no FAR references is dropped from the table"
+        );
+        forget_gtpu_path(live);
     }
 
     /// An Echo Response confirms the path and clears the counter. The old code
