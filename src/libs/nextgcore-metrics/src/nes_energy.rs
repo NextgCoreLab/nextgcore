@@ -338,11 +338,17 @@ mod tests {
         )
         .await;
         assert!(closed.is_ok(), "the server must close an idle connection");
-        assert!(sink.is_empty(), "nothing is sent to a client that asked nothing");
+        assert!(
+            sink.is_empty(),
+            "nothing is sent to a client that asked nothing"
+        );
 
         // A real request is still answered.
         let mut client = tokio::net::TcpStream::connect(bound).await.unwrap();
-        client.write_all(b"GET /metrics HTTP/1.0\r\n\r\n").await.unwrap();
+        client
+            .write_all(b"GET /metrics HTTP/1.0\r\n\r\n")
+            .await
+            .unwrap();
         let mut reply = String::new();
         client.read_to_string(&mut reply).await.unwrap();
         assert!(reply.starts_with("HTTP/1.1 200 OK"), "{reply}");

@@ -79,13 +79,24 @@ fn every_nf_metrics_listener_uses_the_loopback_default() {
             serves |= serves_here;
             uses_helper |= code.contains("metrics_bind_addr(");
             if serves_here || code.contains("metrics_bind_addr(") {
-                for bad in ["([0, 0, 0, 0]", "\"0.0.0.0:", "Ipv4Addr::UNSPECIFIED"] {
-                    if code.contains(bad) {
-                        problems.push(format!(
-                            "{}: `{bad}` in a file that serves /metrics; bind through \
-                             nes_energy::metrics_bind_addr",
-                            file.strip_prefix(&bins).unwrap_or(file).display()
-                        ));
+                // A wildcard near metrics code. Protocol listeners in the same
+                // file (S1AP, SBI, PFCP) must accept peers and are out of scope.
+                let lines: Vec<&str> = code.lines().collect();
+                for (i, line) in lines.iter().enumerate() {
+                    let near_metrics = lines[i.saturating_sub(6)..(i + 7).min(lines.len())]
+                        .iter()
+                        .any(|l| l.to_ascii_lowercase().contains("metric"));
+                    if !near_metrics {
+                        continue;
+                    }
+                    for bad in ["([0, 0, 0, 0]", "\"0.0.0.0:", "Ipv4Addr::UNSPECIFIED"] {
+                        if line.contains(bad) {
+                            problems.push(format!(
+                                "{}: `{bad}` next to metrics code; bind through \
+                                 nes_energy::metrics_bind_addr",
+                                file.strip_prefix(&bins).unwrap_or(file).display()
+                            ));
+                        }
                     }
                 }
             }
@@ -101,6 +112,7 @@ fn every_nf_metrics_listener_uses_the_loopback_default() {
     }
     // The five that serve one today; a new one is fine as long as it passes.
     for nf in [
+        "nextgcore-mmed",
         "nextgcore-nsacfd",
         "nextgcore-sgwud",
         "nextgcore-smfd",

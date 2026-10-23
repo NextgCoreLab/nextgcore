@@ -369,17 +369,19 @@ impl Default for MmeApp {
     }
 }
 
-/// The `/metrics` listen address: `MME_METRICS_ADDR` (`ip:port`), default
-/// `127.0.0.1:9090`. Private by default: nothing is published beyond the host
+/// The `/metrics` listen address: `MME_METRICS_ADDR` (`ip:port`), else
+/// `NEXTGCORE_METRICS_BIND` (host) on port 9090, else `127.0.0.1:9090`. Private by default: nothing is published beyond the host
 /// unless an operator chooses an address.
 fn metrics_addr() -> std::net::SocketAddr {
     parse_metrics_addr(std::env::var("MME_METRICS_ADDR").ok().as_deref())
 }
 
 fn parse_metrics_addr(value: Option<&str>) -> std::net::SocketAddr {
+    // Otherwise the shared default every NF uses (#837): 127.0.0.1 unless
+    // NEXTGCORE_METRICS_BIND names the host, port 9090.
     value
         .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| std::net::SocketAddr::from(([127, 0, 0, 1], 9090)))
+        .unwrap_or_else(|| nextgcore_metrics::nes_energy::metrics_bind_addr(9090))
 }
 
 /// The MME runs on a tokio runtime.
