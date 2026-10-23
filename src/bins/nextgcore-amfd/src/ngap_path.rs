@@ -4561,12 +4561,19 @@ impl NgapServer {
                 .await
                 .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777));
 
-        // 1) Nudm_UECM_Registration (amf-3gpp-access)
+        // 1) Nudm_UECM_Registration (amf-3gpp-access), under this AMF's pinnable
+        // nfInstanceId and a fresh deregCallbackUri token (#753). The token is
+        // recorded on the UE before the PUT, so a DeregistrationNotification the
+        // PUT provokes for an OLDER registration of this SUPI (one made before a
+        // restart) names a different token and is ignored.
+        let dereg_token = crate::sbi_path::new_dereg_callback_token();
+        state.amf_ue.uecm_dereg_token = Some(dereg_token.clone());
         if let Err(e) = crate::sbi_path::call_udm_uecm_registration(
             &udm_host,
             udm_port,
             &supi,
             &amf_instance_id(),
+            &dereg_token,
             &guami_mcc,
             &guami_mnc,
             &amf_id_hex,
@@ -12841,11 +12848,20 @@ impl NgapServer {
 // NAS parsing / helper functions (TS 24.501)
 // ============================================================================
 
-/// Stable AMF NF instance ID for SBI registrations/subscriptions
+/// This AMF's `nfInstanceId`, the one it registers with the NRF and the UDM.
+///
+/// #753: this used to be a SECOND random UUID per process, so it could not be
+/// pinned (`NEXTGCORE_AMF_INSTANCE_ID` did not reach it). After every restart the
+/// UDM therefore saw a "new AMF" and sent the restarted AMF a
+/// UE_INITIAL_REGISTRATION dereg-notify for each re-registering UE.
 fn amf_instance_id() -> String {
-    static ID: once_cell::sync::Lazy<String> =
-        once_cell::sync::Lazy::new(|| uuid::Uuid::new_v4().to_string());
-    ID.clone()
+    nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf).to_string()
+}
+
+/// [`amf_instance_id`], for the UECM wire test in `sbi_path`.
+#[cfg(test)]
+pub(crate) fn amf_instance_id_for_tests() -> String {
+    amf_instance_id()
 }
 
 /// Parsed Registration Request (TS 24.501 Section 8.2.6)
@@ -18421,12 +18437,13 @@ mod tests {
         ue_ctx.registered = true;
         ue_ctx.cm_idle = true;
         ue_ctx.amf_ue.supi = Some(supi.to_string());
+        ue_ctx.amf_ue.uecm_dereg_token = Some("tok-602".to_string());
         ue_ctx.policy_association_id = Some("am-pol-602".to_string());
         ngap.ue_auth_state.insert(key, ue_ctx);
 
         let resp = crate::namf_server::namf_request_handler(
             nextgcore_sbi::message::SbiRequest::post(format!(
-                "/namf-callback/v1/{supi}/dereg-notify"
+                "/namf-callback/v1/{supi}/dereg-notify/tok-602"
             ))
             .with_json_body(&serde_json::json!({
                 "deregReason": "UE_INITIAL_REGISTRATION",

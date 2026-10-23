@@ -108,6 +108,9 @@ nrf:
 amf:
   enabled: true
   replicas: 1
+  # The AMF's nfInstanceId (#753). Empty: a UUID derived from the release, which is
+  # stable across restarts. Pin explicitly when an NRF trust store keys on it.
+  nfInstanceId: ""
   image:
     repository: nextgcore-rust/amf
     tag: latest
