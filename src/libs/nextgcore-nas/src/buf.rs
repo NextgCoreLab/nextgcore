@@ -208,19 +208,20 @@ pub(crate) fn set_first<T>(slot: &mut Option<T>, ie: Option<T>) {
 /// protocols, i.e. one whose length field is 2 octets rather than 1
 /// (TS 24.007 §11.2.5).
 ///
-/// These are the TLV-E IEIs of the TS 24.501 / TS 24.301 message tables: NAS
-/// message container (0x71), Additional GUTI (0x77), EAP message (0x78), LADN
-/// information (0x79), Payload container / Extended PCO (0x7B), and the other
-/// container-style IEs in the 0x70..=0x7F band (SOR transparent container 0x73,
-/// ciphering key data 0x74, CAG information list 0x75, operator-defined access
-/// category definitions 0x76, extended emergency number list 0x7A, mapped/EPS
-/// bearer contexts 0x7C). Consuming the correct number of length octets keeps
-/// the IE loop in sync when such an IE is not modelled.
+/// The whole 0x70..=0x7F band. Every optional IE with an IEI there in the
+/// TS 24.501 and TS 24.301 clause 8 tables is TLV-E, and none is TLV: EPS NAS
+/// message container / Requested MBS container (0x70), NAS message container
+/// (0x71), Service-level-AA container (0x72), SOR transparent container
+/// (0x73), ciphering key data (0x74), CAG information list (0x75),
+/// operator-defined access category definitions (0x76), Additional GUTI
+/// (0x77), EAP message / ESM message container (0x78), LADN information
+/// (0x79), extended emergency number list (0x7A), Payload container /
+/// Extended PCO (0x7B), mapped EPS bearer contexts / ciphering key data
+/// (0x7C) and 0x7D. Consuming the right number of length octets keeps the
+/// walk in sync when such an IE is not modelled. Before #784 review the list
+/// missed 0x70 and 0x72, which UEs send in REGISTRATION REQUEST.
 pub(crate) fn is_tlv_e_iei(iei: u8) -> bool {
-    matches!(
-        iei,
-        0x71 | 0x73 | 0x74 | 0x75 | 0x76 | 0x77 | 0x78 | 0x79 | 0x7A | 0x7B | 0x7C
-    )
+    (0x70..=0x7F).contains(&iei)
 }
 
 /// Skip an unknown / unhandled optional IE in a default IE-loop arm, per
@@ -235,19 +236,39 @@ pub(crate) fn is_tlv_e_iei(iei: u8) -> bool {
 ///   value. Unknown type-3 (fixed-length TV) IEs cannot be told apart, but all
 ///   *known* ones are matched explicitly, so this only affects unknown ones.
 ///
-/// An IE whose length (or length octets) runs past the message is an error
-/// (#784): the message is truncated, so there is nothing to skip by. Before
-/// #784 the skip was clamped to what was left, hiding the truncation.
+/// An unknown IE whose length (or its length octets) runs past the message
+/// ends the walk: the rest of the message is consumed and the IE is treated as
+/// not present (§7.6.1 ignores unknown IEs; §7.7.1 treats a syntactically
+/// incorrect optional one as absent). It does not fail the message, because an
+/// unknown IE's format is a guess: an unmodelled type 3 (TV) IE read as TLV
+/// overruns on perfectly valid input (#784 review). Known IEs that overrun
+/// (`optional_tlv`, `opaque_tlv`) remain an error.
 pub(crate) fn skip_unknown_ie(buf: &mut Bytes, iei: u8) -> NasResult<()> {
     buf.skip(1)?; // consume the IEI octet (peeked, not yet advanced by caller)
     if iei >= 0x80 {
         return Ok(());
     }
     let len = if is_tlv_e_iei(iei) {
+        if buf.remaining() < 2 {
+            buf.advance(buf.remaining());
+            return Ok(());
+        }
         buf.read_u16()? as usize
     } else {
+        if buf.remaining() < 1 {
+            return Ok(());
+        }
         buf.read_u8()? as usize
     };
+    if len > buf.remaining() {
+        log::debug!(
+            "NAS: unknown IE {iei:#04x} declares {len} octets with {} left; \
+             treated as not present and the walk ends",
+            buf.remaining()
+        );
+        buf.advance(buf.remaining());
+        return Ok(());
+    }
     buf.skip(len)
 }
 

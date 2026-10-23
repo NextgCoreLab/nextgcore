@@ -156,6 +156,12 @@ impl AttachRequest {
                         msg.drx_parameter = Some(drx);
                     }
                 }
+                // Old location area identification (TV 6): not modelled. Type 3, so skipped by its fixed
+                // length; read as TLV its value octet would be taken as a length (#784).
+                0x13 => buf.skip(6)?,
+                // Additional information requested (TV 2): not modelled. Type 3, so skipped by its fixed
+                // length; read as TLV its value octet would be taken as a length (#784).
+                0x17 => buf.skip(2)?,
                 _ => skip_unknown_ie(buf, iei)?,
             }
         }

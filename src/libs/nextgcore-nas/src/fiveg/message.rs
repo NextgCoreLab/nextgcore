@@ -2021,6 +2021,9 @@ impl ControlPlaneServiceRequest {
                         optional_tlv_e(buf, NasMessageContainer::decode)?,
                     );
                 }
+                // PDU session ID (TV 2): not modelled. Type 3, so skipped by its fixed
+                // length; read as TLV its value octet would be taken as a length (#784).
+                0x12 => buf.skip(2)?,
                 _ => skip_unknown_ie(buf, iei)?,
             }
         }
@@ -2473,6 +2476,9 @@ impl PduSessionEstablishmentRequest {
                     buf.skip(1)?;
                     set_first(&mut msg.extended_pco, Some(opaque_tlv_e(buf)?));
                 }
+                // Maximum number of supported packet filters (TV 3): not modelled. Type 3, so skipped by its fixed
+                // length; read as TLV its value octet would be taken as a length (#784).
+                0x55 => buf.skip(3)?,
                 _ => skip_unknown_ie(buf, iei)?,
             }
         }
@@ -2578,6 +2584,9 @@ impl PduSessionEstablishmentAccept {
                     buf.skip(1)?;
                     set_first(&mut msg.dnn, optional_tlv(buf, Dnn::decode)?);
                 }
+                // RQ timer value (TV 2): not modelled. Type 3, so skipped by its fixed
+                // length; read as TLV its value octet would be taken as a length (#784).
+                0x56 => buf.skip(2)?,
                 _ => skip_unknown_ie(buf, iei)?,
             }
         }
@@ -2694,6 +2703,15 @@ impl PduSessionModificationRequest {
                     buf.skip(1)?;
                     set_first(&mut msg.extended_pco, Some(opaque_tlv_e(buf)?));
                 }
+                // 5GSM cause (TV 2): not modelled. Type 3, so skipped by its fixed
+                // length; read as TLV its value octet would be taken as a length (#784).
+                0x59 => buf.skip(2)?,
+                // Maximum number of supported packet filters (TV 3): not modelled. Type 3, so skipped by its fixed
+                // length; read as TLV its value octet would be taken as a length (#784).
+                0x55 => buf.skip(3)?,
+                // Integrity protection maximum data rate (TV 3): not modelled. Type 3, so skipped by its fixed
+                // length; read as TLV its value octet would be taken as a length (#784).
+                0x13 => buf.skip(3)?,
                 _ => skip_unknown_ie(buf, iei)?,
             }
         }
@@ -2766,6 +2784,9 @@ impl PduSessionModificationCommand {
                         optional_tlv_e(buf, QosFlowDescriptions::decode)?,
                     );
                 }
+                // RQ timer value (TV 2): not modelled. Type 3, so skipped by its fixed
+                // length; read as TLV its value octet would be taken as a length (#784).
+                0x56 => buf.skip(2)?,
                 _ => skip_unknown_ie(buf, iei)?,
             }
         }
@@ -3478,16 +3499,15 @@ mod nas05_tests {
     }
 
     #[test]
-    fn test_skip_unknown_ie_truncated_tlv_is_an_error() {
-        // Malformed length > remaining: the message is truncated, so it is an
-        // error, not a silent clamp (#784). No panic either way.
+    fn test_skip_unknown_ie_overrun_ends_the_walk() {
+        // An unknown IE whose length runs past the message is not present and
+        // ends the walk, without failing the message (#784 review). No panic.
         let mut buf = Bytes::from(vec![0x4A, 0x05, 0xAA]);
-        assert!(skip_unknown_ie(&mut buf, 0x4A).is_err());
+        skip_unknown_ie(&mut buf, 0x4A).unwrap();
+        assert_eq!(buf.remaining(), 0);
         let mut buf = Bytes::from(vec![0x7B, 0x00]);
-        assert!(
-            skip_unknown_ie(&mut buf, 0x7B).is_err(),
-            "half a TLV-E length"
-        );
+        skip_unknown_ie(&mut buf, 0x7B).unwrap();
+        assert_eq!(buf.remaining(), 0, "half a TLV-E length");
     }
 
     #[test]
@@ -3715,7 +3735,7 @@ mod tlv_e_skip_tests {
 
     #[test]
     fn test_is_tlv_e_iei_classification() {
-        for iei in [0x71u8, 0x77, 0x78, 0x79, 0x7B, 0x7C] {
+        for iei in [0x70u8, 0x71, 0x72, 0x77, 0x78, 0x79, 0x7B, 0x7C, 0x7D, 0x7F] {
             assert!(is_tlv_e_iei(iei), "0x{iei:02x} is a TLV-E IEI");
         }
         for iei in [0x40u8, 0x50, 0x2E, 0x2B, 0x80, 0xC0] {
