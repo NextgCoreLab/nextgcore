@@ -1266,21 +1266,36 @@ fn multi_rtt_observations(
     measurements: &[CellMeasurement],
     registry: &TrpRegistry,
 ) -> Vec<RttObservation> {
-    let mut obs: Vec<RttObservation> = Vec::new();
-    let mut unpaired: Vec<&str> = Vec::new();
+    // One pass: the first value of each quantity per TRP, in first-seen order.
+    #[derive(Default)]
+    struct Halves {
+        rtt_ns: Option<f64>,
+        ue: Option<f64>,
+        gnb: Option<f64>,
+    }
+    let mut order: Vec<&str> = Vec::new();
+    let mut by_trp: HashMap<&str, Halves> = HashMap::new();
     for m in measurements {
         let key = m.nr_cgi.as_str();
-        if registry.lookup(key).is_none() || obs.iter().any(|o| o.trp_id == key) {
+        if m.rtt_ns.is_none() && m.ue_rx_tx_ns.is_none() && m.gnb_rx_tx_ns.is_none() {
             continue;
         }
-        let same_trp = || measurements.iter().filter(move |o| o.nr_cgi == key);
-        let rtt_ns = same_trp()
-            .find_map(|o| o.rtt_ns.map(|r| r as f64))
-            .or_else(|| {
-                let ue = same_trp().find_map(|o| o.ue_rx_tx_ns)?;
-                let gnb = same_trp().find_map(|o| o.gnb_rx_tx_ns)?;
-                Some(ue + gnb)
-            });
+        if registry.lookup(key).is_none() {
+            continue;
+        }
+        let h = by_trp.entry(key).or_insert_with(|| {
+            order.push(key);
+            Halves::default()
+        });
+        h.rtt_ns = h.rtt_ns.or(m.rtt_ns.map(|r| r as f64));
+        h.ue = h.ue.or(m.ue_rx_tx_ns);
+        h.gnb = h.gnb.or(m.gnb_rx_tx_ns);
+    }
+    let mut obs: Vec<RttObservation> = Vec::new();
+    let mut unpaired: Vec<&str> = Vec::new();
+    for key in order {
+        let h = &by_trp[key];
+        let rtt_ns = h.rtt_ns.or_else(|| Some(h.ue? + h.gnb?));
         match rtt_ns {
             Some(rtt) if rtt.is_finite() && rtt >= 0.0 => obs.push(RttObservation {
                 trp_id: key.to_string(),
@@ -1289,12 +1304,7 @@ fn multi_rtt_observations(
             Some(rtt) => log::warn!(
                 "Multi-RTT: TRP {key} has a negative or non-finite RTT ({rtt} ns); dropped"
             ),
-            None if m.ue_rx_tx_ns.is_some() || m.gnb_rx_tx_ns.is_some() => {
-                if !unpaired.contains(&key) {
-                    unpaired.push(key);
-                }
-            }
-            None => {}
+            None => unpaired.push(key),
         }
     }
     if !unpaired.is_empty() {
@@ -2389,6 +2399,36 @@ mod tests_multi_rtt_two_sided {
         let cells = ue_report();
         assert!(multi_rtt_observations(&cells, &registry()).is_empty());
         assert!(try_real_solve(&cells, &registry()).is_none());
+    }
+
+    /// Two TRPs paired and two with the UE half only: two ranges, fewer than
+    /// trilateration needs, so no Multi-RTT fix.
+    #[test]
+    fn two_paired_and_two_ue_only_trps_give_no_fix() {
+        let mut cells = ue_report();
+        cells.extend(
+            gnb_report()
+                .into_iter()
+                .filter(|c| c.nr_cgi == "pci-201" || c.nr_cgi == "pci-202"),
+        );
+        let obs = multi_rtt_observations(&cells, &registry());
+        assert_eq!(
+            obs.iter().map(|o| o.trp_id.as_str()).collect::<Vec<_>>(),
+            ["pci-201", "pci-202"]
+        );
+        assert!(try_real_solve(&cells, &registry()).is_none());
+    }
+
+    /// A TRP reported many times is aggregated in one pass (#812 review: the
+    /// old per-key rescan was quadratic).
+    #[test]
+    fn repeated_reports_of_one_trp_count_once() {
+        let mut cells = Vec::new();
+        for _ in 0..1000 {
+            cells.extend(ue_report());
+        }
+        cells.extend(gnb_report());
+        assert_eq!(multi_rtt_observations(&cells, &registry()).len(), 4);
     }
 
     #[test]

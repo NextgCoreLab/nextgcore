@@ -16,8 +16,11 @@
 //!   nanoseconds, TS 38.133 §10.1.25.3); `nr_phys_cell_id` → `nr_cgi`. That is the
 //!   UE half of an RTT only (#713).
 //!
-//! NR-DL-TDOA is **DEFERRED**: `CellMeasurement` carries no TDOA/RSTD field,
-//! and the `solve_tdoa` solver remains unwired.
+//! - [`lpp_dl_tdoa_provide_to_measurements`] — ProvideLocationInformation →
+//!   nr-DL-TDOA list: the reference TRP with RSTD 0, then each neighbour's signed
+//!   `nr-RSTD-r16` → `rstd_ns`. `context::try_real_solve` solves it with
+//!   `solve_tdoa`; it is the high-accuracy method while Multi-RTT lacks the gNB
+//!   half (#713, #807). Its reference keying is fixed by #714.
 //!
 //! Two combined decode+adapt helpers — [`decode_nrppa_ecid_report`] and
 //! [`decode_lpp_multi_rtt_report`] — are used by the inbound SBI handlers in
@@ -411,7 +414,9 @@ pub const MULTI_RTT_GNB_HALF_AVAILABLE: bool = false;
 ///    when the gNB Rx–Tx half can be obtained ([`MULTI_RTT_GNB_HALF_AVAILABLE`]),
 ///    because its two-sided measurement cancels the clock offset. Otherwise
 ///    NR DL-TDOA (TS 38.305 §8.12), whose RSTDs the UE measures alone and which
-///    needs no gNB measurement (#713).
+///    needs no gNB measurement (#713). This depends on #714, the DL-TDOA
+///    reference keying and RSTD rebasing; without it a PCI-keyed registry gives
+///    wrong DL-TDOA fixes, so #713 is merged only together with or after #714.
 /// 4. **Low-latency QoS ⇒ E-CID**, deliberately: one serving-cell measurement with
 ///    no PRS scheduling is the fastest thing available, and `LOW_DELAY` is a
 ///    statement about time rather than accuracy.
@@ -569,8 +574,28 @@ fn pow2(k: i8) -> f64 {
 /// This is one half of an RTT only. TS 38.305 §8.10 defines the Multi-RTT
 /// observable as UE Rx–Tx plus the gNB Rx–Tx of the same TRP; see
 /// `context::try_real_solve`, which never ranges on this half alone.
-pub(crate) fn ue_rx_tx_to_signed_ns(r: TimeReport) -> f64 {
-    nrrstd_to_signed_ns(r)
+pub(crate) fn ue_rx_tx_to_signed_ns(r: TimeReport) -> Option<f64> {
+    (!is_open_ended(r)).then(|| nrrstd_to_signed_ns(r))
+}
+
+/// The largest report value of the k arm (`INTEGER (0..max)` in TS 37.355): k0
+/// `1970049`, k1 `985025`, …, k5 `61565`, and the Rel-18 kMinus arms
+/// `1970048·2^|k| + 1`.
+fn arm_max(k: i8) -> u32 {
+    if k >= 0 {
+        // ⌈1970049 / 2^k⌉
+        let d = 1u32 << k;
+        1_970_049u32.div_ceil(d)
+    } else {
+        1_970_048u32 * (1u32 << k.unsigned_abs()) + 1
+    }
+}
+
+/// TS 38.133 §10.1.25.3: the first and last report values are open-ended bins
+/// (`T ≤ −985024·T_c` and `T > 985024·T_c`), not measurements. A saturated half
+/// is not a usable RTT half, so it is not decoded (#812 review).
+fn is_open_ended(r: TimeReport) -> bool {
+    r.v == 0 || r.v >= arm_max(r.k)
 }
 
 /// Convert an NR-RSTD report to SIGNED nanoseconds (TS 37.355 §6.5.10, mapping
@@ -770,9 +795,8 @@ pub fn lpp_multi_rtt_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<Cell
                 // The UE half of the RTT only: never an RTT by itself (#713).
                 rtt_ns: None,
                 rstd_ns: None,
-                ue_rx_tx_ns: Some(ue_rx_tx_to_signed_ns(rx_tx_report(
-                    &elem.nr_ue_rx_tx_time_diff_r16,
-                ))),
+                // None for a saturated (open-ended) report value.
+                ue_rx_tx_ns: ue_rx_tx_to_signed_ns(rx_tx_report(&elem.nr_ue_rx_tx_time_diff_r16)),
                 gnb_rx_tx_ns: None,
             }
         })
@@ -1082,32 +1106,40 @@ mod tests {
     /// which is ≈ 0 ns, not the ≈ 501 µs an unsigned reading gives.
     #[test]
     fn ue_rx_tx_decodes_signed_around_the_midpoint() {
+        let at = |v: u32, k: i8| ue_rx_tx_to_signed_ns(TimeReport { v, k });
         for k in 0..=5i8 {
             let zero = 985_024u32 >> k;
-            assert_eq!(
-                ue_rx_tx_to_signed_ns(TimeReport { v: zero, k }),
-                0.0,
-                "k{k}"
-            );
+            assert_eq!(at(zero, k), Some(0.0), "k{k}");
             // One step either side is ±2^k·T_c.
             let step = f64::from(1u32 << k) * TC_NS;
-            assert!((ue_rx_tx_to_signed_ns(TimeReport { v: zero + 1, k }) - step).abs() < 1e-9);
-            assert!((ue_rx_tx_to_signed_ns(TimeReport { v: zero - 1, k }) + step).abs() < 1e-9);
+            assert!((at(zero + 1, k).unwrap() - step).abs() < 1e-9);
+            assert!((at(zero - 1, k).unwrap() + step).abs() < 1e-9);
         }
         // The issue's value: v = 985024 + δ is δ·T_c, a few ns, not 501 µs.
-        let near_zero = ue_rx_tx_to_signed_ns(TimeReport {
-            v: 985_024 + 7,
-            k: 0,
-        });
+        let near_zero = at(985_024 + 7, 0).unwrap();
         assert!((near_zero - 7.0 * TC_NS).abs() < 1e-9, "{near_zero}");
-        // The k0 endpoints are ≈ ±501 µs.
-        assert!(
-            (ue_rx_tx_to_signed_ns(TimeReport { v: 0, k: 0 }) + 985_024.0 * TC_NS).abs() < 1e-6
+        // The first and last values are open-ended bins (TS 38.133 §10.1.25.3),
+        // not measurements: not decoded. The values just inside are ≈ ±501 µs.
+        for k in [0i8, 1, 2, 3, 4, 5, -1, -6] {
+            assert_eq!(at(0, k), None, "k{k}");
+            assert_eq!(at(super::arm_max(k), k), None, "k{k}");
+            assert!(at(super::arm_max(k) - 1, k).is_some(), "k{k}");
+        }
+        assert_eq!(
+            [0i8, 1, 2, 3, 4, 5, -6, -1].map(super::arm_max),
+            [
+                1_970_049,
+                985_025,
+                492_513,
+                246_257,
+                123_129,
+                61_565,
+                126_083_073,
+                3_940_097
+            ],
+            "the TS 37.355 nr-UE-RxTxTimeDiff-r16 ranges"
         );
-        assert!(
-            (ue_rx_tx_to_signed_ns(TimeReport { v: 1_970_049, k: 0 }) - 985_025.0 * TC_NS).abs()
-                < 1e-6
-        );
+        assert!((at(1, 0).unwrap() + 985_023.0 * TC_NS).abs() < 1e-6);
     }
 
     /// NRPPa E-CID: generated encode → `decode_nrppa_ecid_report` → adapt.
