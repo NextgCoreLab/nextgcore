@@ -3908,6 +3908,42 @@ mod tests {
         );
         assert_eq!(pending.enb_ue_id, enb_ue_id);
 
+        // #727, TS 29.274 §7.6: an initial Request that is not a Command has the
+        // sequence number's MSB clear, and both Commands this MME sends have it set
+        // (so the SGW's own initial Requests can never close them). Asserted here
+        // because this is the only test that may install the process-wide socket.
+        assert!(
+            !nextgcore_gtp::v2::is_command_sequence(received.header.sequence_number),
+            "the Create Session Request is not a Command: {:#x}",
+            received.header.sequence_number
+        );
+        let mut recv_command = |expected: u8| {
+            let (len, _) = peer.recv_from(&mut buf).expect("the Command must be sent");
+            let mut bytes = bytes::Bytes::copy_from_slice(&buf[..len]);
+            let msg = Gtp2Message::decode(&mut bytes).expect("the Command must decode");
+            assert_eq!(msg.header.message_type, expected);
+            msg.header.sequence_number
+        };
+        let dbc_seq = crate::gtp_path::send_delete_bearer_command(&ctx, mme_ue_id, &[5])
+            .expect("Delete Bearer Command sent");
+        let wire = recv_command(nextgcore_gtp::v2::Gtp2MessageType::DeleteBearerCommand as u8);
+        assert_eq!(wire, dbc_seq);
+        assert!(
+            nextgcore_gtp::v2::is_command_sequence(wire),
+            "the Delete Bearer Command's number has the MSB set: {wire:#x}"
+        );
+        let bearer_id = crate::gtp_path::bearers_of_ue(&ctx, mme_ue_id)
+            .first()
+            .expect("the attach created the default bearer")
+            .id;
+        crate::gtp_path::send_bearer_resource_command(&ctx, bearer_id, 5, 9, &[0x01], None)
+            .expect("Bearer Resource Command sent");
+        let wire = recv_command(nextgcore_gtp::v2::Gtp2MessageType::BearerResourceCommand as u8);
+        assert!(
+            nextgcore_gtp::v2::is_command_sequence(wire),
+            "the Bearer Resource Command's number has the MSB set: {wire:#x}"
+        );
+
         crate::gtp_path::clear_pending_creates_for_test();
     }
 

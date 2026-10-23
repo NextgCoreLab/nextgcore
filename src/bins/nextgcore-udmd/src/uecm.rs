@@ -1819,6 +1819,9 @@ mod tests {
         let ue = guard.amf_ue_add(ran.id).expect("amf_ue_add");
         let mut ue = ue;
         ue.supi = Some(supi.to_string());
+        // amfd #753: the token in this UE's UECM deregCallbackUri; a notification
+        // for any other registration is acknowledged without action.
+        ue.uecm_dereg_token = Some(format!("tok-{supi}"));
         // #341: publish into amfd's LIVE UE store, which is what its Namf handlers
         // resolve against now. `amf_ue_set_supi` wrote a SUPI index nothing in
         // production ever wrote -- the defect #341 removed.
@@ -1887,7 +1890,7 @@ mod tests {
 
         // Drive udmd's REAL body through amfd's REAL Namf SBI handler at the
         // path amfd itself registers as its absolute deregCallbackUri.
-        let path = format!("/namf-callback/v1/{supi}/dereg-notify");
+        let path = format!("/namf-callback/v1/{supi}/dereg-notify/tok-{supi}");
         let req = SbiRequest::post(path).with_json_body(&body).expect("json");
         let resp = nextgcore_amfd::namf_request_handler(req).await;
         assert_eq!(
@@ -1927,7 +1930,7 @@ mod tests {
         let ue_id = seed_amf_ue(supi, 60_101);
         let body =
             json!({ "deregReason": "UE_INITIAL_REGISTRATION", "accessType": "NON_3GPP_ACCESS" });
-        let path = format!("/namf-callback/v1/{supi}/dereg-notify");
+        let path = format!("/namf-callback/v1/{supi}/dereg-notify/tok-{supi}");
         let req = SbiRequest::post(path).with_json_body(&body).expect("json");
         let resp = nextgcore_amfd::namf_request_handler(req).await;
         assert_eq!(resp.status, 204, "non-3GPP dereg is accepted");
@@ -1952,7 +1955,7 @@ mod tests {
 
         // 400: mandatory accessType absent (WSB-4 fail-closed).
         let missing = json!({ "deregReason": "UE_INITIAL_REGISTRATION" });
-        let path = format!("/namf-callback/v1/{supi}/dereg-notify");
+        let path = format!("/namf-callback/v1/{supi}/dereg-notify/tok-{supi}");
         let resp = nextgcore_amfd::namf_request_handler(
             SbiRequest::post(path)
                 .with_json_body(&missing)
@@ -2060,7 +2063,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         nextgcore_amfd::test_support::init_context();
         let ue_id = seed_amf_ue(supi, 60_103);
-        let path = format!("/namf-callback/v1/{supi}/dereg-notify");
+        let path = format!("/namf-callback/v1/{supi}/dereg-notify/tok-{supi}");
         let req = SbiRequest::post(path)
             .with_json_body(&build_dereg_notification_body(UecmAccess::ThreeGpp))
             .expect("json");
@@ -2091,7 +2094,7 @@ mod tests {
         nextgcore_amfd::test_support::init_context();
         let ue_id = seed_amf_ue(supi, 60_104);
         let body = json!({ "deregReason": "SUBSCRIPTION_WITHDRAWN", "accessType": "3GPP_ACCESS" });
-        let path = format!("/namf-callback/v1/{supi}/dereg-notify");
+        let path = format!("/namf-callback/v1/{supi}/dereg-notify/tok-{supi}");
         let resp = nextgcore_amfd::namf_request_handler(
             SbiRequest::post(path).with_json_body(&body).expect("json"),
         )
@@ -2123,7 +2126,7 @@ mod tests {
         nextgcore_amfd::test_support::init_context();
         let ue_id = seed_amf_ue(supi, 60_105);
         let body = json!({ "deregReason": "NOT_A_REAL_REASON", "accessType": "3GPP_ACCESS" });
-        let path = format!("/namf-callback/v1/{supi}/dereg-notify");
+        let path = format!("/namf-callback/v1/{supi}/dereg-notify/tok-{supi}");
         let resp = nextgcore_amfd::namf_request_handler(
             SbiRequest::post(path).with_json_body(&body).expect("json"),
         )
