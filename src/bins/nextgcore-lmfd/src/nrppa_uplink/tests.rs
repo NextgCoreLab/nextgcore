@@ -61,7 +61,7 @@ fn the_report_encodes_to_the_hand_derived_octets_and_decodes() {
     assert_eq!(cells[0].nr_cgi, "02f839-000000001");
     assert_eq!(cells[0].rsrp, Some(-80), "value 60 -> 60 - 140 dBm");
     assert_eq!(
-        (cells[0].rsrq, cells[0].timing_advance, cells[0].aoa),
+        (cells[0].rsrq, cells[0].ecid_rtt_ns, cells[0].aoa),
         (None, None, None)
     );
 }
@@ -85,10 +85,19 @@ fn measured_results_map_to_cell_measurements() {
         "02f839-efffffff"
     );
 
+    // #832: TADV is decoded per TS 36.133 §10.3.1 into a round trip (bin
+    // midpoint): 2 T_s bins up to 4096 T_s, 8 T_s above, and the last value open.
+    let ts = crate::positioning::TS_NS;
     let c = cell(nr_cgi(PLMN, 1), Some(vec![ta1(0)]));
-    assert_eq!(c.timing_advance, Some(0));
+    assert_eq!((c.timing_advance, c.ecid_rtt_ns), (None, Some(ts)));
+    let c = cell(nr_cgi(PLMN, 1), Some(vec![ta2(2047)]));
+    assert_eq!(c.ecid_rtt_ns, Some(4095.0 * ts));
+    let c = cell(nr_cgi(PLMN, 1), Some(vec![ta2(2048)]));
+    assert_eq!(c.ecid_rtt_ns, Some(4100.0 * ts));
+    let c = cell(nr_cgi(PLMN, 1), Some(vec![ta1(7689)]));
+    assert_eq!(c.ecid_rtt_ns, Some((4096.0 + 8.0 * 5641.0 + 4.0) * ts));
     let c = cell(nr_cgi(PLMN, 1), Some(vec![ta2(7690)]));
-    assert_eq!(c.timing_advance, Some(7690));
+    assert_eq!(c.ecid_rtt_ns, None, "TADV_7690 is open-ended");
     let c = cell(nr_cgi(PLMN, 1), Some(vec![aoa(719)]));
     assert_eq!(c.aoa, Some(719.0));
     // RSRP: strongest item of each list, strongest list wins; 0..97 -> -140..-43.
@@ -109,8 +118,13 @@ fn measured_results_map_to_cell_measurements() {
         ]),
     );
     assert_eq!(
-        (c.timing_advance, c.aoa, c.rsrp, c.rsrq),
-        (Some(500), Some(90.0), Some(-80), Some(10))
+        (c.ecid_rtt_ns, c.aoa, c.rsrp, c.rsrq),
+        (
+            Some(1001.0 * crate::positioning::TS_NS),
+            Some(90.0),
+            Some(-80),
+            Some(10)
+        )
     );
 }
 

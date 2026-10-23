@@ -149,10 +149,17 @@ pub fn decode_ecid_report(bytes: &[u8]) -> Result<EcidReportOutcome, String> {
 }
 
 /// The same `CellMeasurement` the pre-#515 adapter produced from a decoded result.
+/// An E-UTRA TADV report value as a round trip in ns (bin midpoint), or `None`
+/// for the open-ended last value (TS 36.133 §10.3.1, #832).
+fn tadv_ns(v: u16) -> Option<f64> {
+    crate::positioning::eutra_time_report_to_ns(u32::from(v), crate::positioning::EUTRA_TADV_MAX)
+        .map(|(mid, _)| mid)
+}
+
 fn to_cell(result: &nrppa::E_CID_MeasurementResult) -> CellMeasurement {
     let mut rsrp: Option<i16> = None;
     let mut rsrq: Option<i16> = None;
-    let mut timing_advance: Option<u32> = None;
+    let mut ecid_rtt_ns: Option<f64> = None;
     let mut aoa: Option<f64> = None;
     if let Some(measured) = &result.measured_results {
         for value in &measured.0 {
@@ -161,11 +168,14 @@ fn to_cell(result: &nrppa::E_CID_MeasurementResult) -> CellMeasurement {
                 M::ValueAngleOfArrival_EUTRA(deg) => {
                     aoa.get_or_insert(f64::from(deg.0));
                 }
+                // TS 36.133 §10.3.1: TADV Type 1 (eNB Rx–Tx + UE Rx–Tx) and
+                // Type 2 (eNB Rx–Tx with the UE's TA applied) are both the round
+                // trip, in T_s bins (#832). The open-ended last value is dropped.
                 M::ValueTimingAdvanceType1_EUTRA(ta) => {
-                    timing_advance.get_or_insert(u32::from(ta.0));
+                    ecid_rtt_ns = ecid_rtt_ns.or_else(|| tadv_ns(ta.0));
                 }
                 M::ValueTimingAdvanceType2_EUTRA(ta) => {
-                    timing_advance.get_or_insert(u32::from(ta.0));
+                    ecid_rtt_ns = ecid_rtt_ns.or_else(|| tadv_ns(ta.0));
                 }
                 M::ResultRSRP_EUTRA(items) => {
                     // value_rsrp_eutra 0..97 -> -140..-43 dBm; the strongest item wins.
@@ -191,12 +201,13 @@ fn to_cell(result: &nrppa::E_CID_MeasurementResult) -> CellMeasurement {
         nr_cgi: cgi_to_string(&result.serving_cell_id),
         rsrp,
         rsrq,
-        timing_advance,
+        timing_advance: None,
         aoa,
         rtt_ns: None,
         rstd_ns: None,
         ue_rx_tx_ns: None,
         rstd_reference: None,
+        ecid_rtt_ns,
         gnb_rx_tx_ns: None,
         dl_prs_id: None,
         eutra: matches!(
