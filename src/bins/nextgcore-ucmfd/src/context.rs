@@ -225,7 +225,10 @@ const EXPIRY_SPREAD_SECS: i64 = 600;
 /// [`Dictionary::set_plmn_id`], which keep the indexes in step with the entries.
 #[derive(Default)]
 struct Dictionary {
-    entries: BTreeMap<u32, DicEntry>,
+    /// Shared, so a snapshot takes a pointer per entry under the state lock
+    /// rather than a copy of every capability (#843 review); a change copies
+    /// only the entry it changes, and only while a snapshot still holds it.
+    entries: BTreeMap<u32, Arc<DicEntry>>,
     by_racs_id: HashMap<RacsId, u32>,
     by_tac: HashMap<String, Vec<u32>>,
 }
@@ -236,15 +239,18 @@ impl Dictionary {
     }
 
     fn get(&self, id: u32) -> Option<&DicEntry> {
-        self.entries.get(&id)
+        self.entries.get(&id).map(|e| &**e)
     }
 
     fn values(&self) -> impl Iterator<Item = &DicEntry> {
-        self.entries.values()
+        self.entries.values().map(|e| &**e)
     }
 
     fn by_racs_id(&self, id: &RacsId) -> Option<&DicEntry> {
-        self.by_racs_id.get(id).and_then(|e| self.entries.get(e))
+        self.by_racs_id
+            .get(id)
+            .and_then(|e| self.entries.get(e))
+            .map(|e| &**e)
     }
 
     fn with_tac<'a>(&'a self, tac: &str) -> impl Iterator<Item = &'a DicEntry> + 'a {
@@ -252,7 +258,7 @@ impl Dictionary {
             .get(tac)
             .into_iter()
             .flatten()
-            .filter_map(|e| self.entries.get(e))
+            .filter_map(|e| self.entries.get(e).map(|e| &**e))
     }
 
     fn insert(&mut self, entry: DicEntry) {
@@ -268,11 +274,11 @@ impl Dictionary {
                 ids.push(entry.id);
             }
         }
-        self.entries.insert(entry.id, entry);
+        self.entries.insert(entry.id, Arc::new(entry));
     }
 
     fn remove(&mut self, id: u32) -> Option<DicEntry> {
-        let entry = self.entries.remove(&id)?;
+        let entry = Arc::unwrap_or_clone(self.entries.remove(&id)?);
         for racs in entry.plmn_id.iter().chain(entry.man_id.iter()) {
             if self.by_racs_id.get(racs) == Some(&id) {
                 self.by_racs_id.remove(racs);
@@ -291,7 +297,7 @@ impl Dictionary {
 
     /// Replace (or clear) an entry's PLMN-assigned ID, and its index.
     fn set_plmn_id(&mut self, id: u32, plmn_id: Option<RacsId>) {
-        let Some(e) = self.entries.get_mut(&id) else {
+        let Some(e) = self.entries.get_mut(&id).map(Arc::make_mut) else {
             return;
         };
         if let Some(old) = e.plmn_id.take() {
@@ -311,7 +317,7 @@ impl Dictionary {
     fn assert_consistent(&self) {
         let mut ids = 0;
         let mut tacs = 0;
-        for e in self.entries.values() {
+        for e in self.entries.values().map(|e| &**e) {
             for id in e.plmn_id.iter().chain(e.man_id.iter()) {
                 assert_eq!(self.by_racs_id.get(id), Some(&e.id), "{id:?}");
                 ids += 1;
@@ -331,7 +337,14 @@ impl Dictionary {
 
     /// The entry's capabilities, for changes that touch no indexed field.
     fn caps_mut(&mut self, id: u32) -> Option<&mut Capabilities> {
-        self.entries.get_mut(&id).map(|e| &mut e.caps)
+        self.entries
+            .get_mut(&id)
+            .map(|e| &mut Arc::make_mut(e).caps)
+    }
+
+    /// The entries as shared pointers, for a snapshot (#843 review).
+    fn shared(&self) -> Vec<Arc<DicEntry>> {
+        self.entries.values().cloned().collect()
     }
 }
 
@@ -407,7 +420,7 @@ const ID_RESERVATION: u64 = 1024;
 pub struct SnapshotSource {
     version_id: u8,
     counters: Counters,
-    entries: Vec<DicEntry>,
+    entries: Vec<Arc<DicEntry>>,
     subscriptions: Vec<Subscription>,
     provisionings: Vec<Provisioning>,
 }
@@ -1214,7 +1227,7 @@ impl Ucmf {
             } else {
                 self.counters()
             },
-            entries: self.entries.values().cloned().collect(),
+            entries: self.entries.shared(),
             subscriptions: self.subscriptions.values().cloned().collect(),
             provisionings: self.provisionings.values().cloned().collect(),
         }
@@ -2119,6 +2132,30 @@ mod tests {
 
     /// A crash loses the unflushed tail, but a restarted UCMF never hands out an
     /// ID it handed out before: the written snapshot claims the reservation.
+    /// #843 review MINOR 1: the snapshot taken under the lock shares the entries
+    /// (a pointer each, no capability copied), and a change made after it was
+    /// taken copies only the entry it changes, so the snapshot still says what the
+    /// state was when it was taken.
+    #[test]
+    fn the_snapshot_shares_entries_and_a_later_change_does_not_reach_it() {
+        let mut u = Ucmf::new(3, ModeOfOperation::B);
+        u.set_write_behind(true);
+        let (entry, _, _) = u.assign("35123456", caps(&[1]), now()).unwrap();
+        let (_, _, source) = u.take_pending_write().expect("dirty");
+        assert!(
+            Arc::ptr_eq(&source.entries[0], u.entries.entries.get(&entry).unwrap()),
+            "shared, not copied"
+        );
+        let before = source.to_json();
+        u.entries.set_plmn_id(entry, None);
+        assert!(!Arc::ptr_eq(
+            &source.entries[0],
+            u.entries.entries.get(&entry).unwrap()
+        ));
+        assert_eq!(source.to_json(), before, "the snapshot is what it was");
+        assert!(u.entries.get(entry).unwrap().plmn_id.is_none());
+    }
+
     #[test]
     fn a_crash_before_the_flush_never_reissues_an_id() {
         let dir = std::env::temp_dir().join(format!("ucmf-crash-{}", std::process::id()));
