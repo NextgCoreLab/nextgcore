@@ -359,6 +359,24 @@ static S6A_CLIENT: OnceLock<Mutex<Option<S6aClientState>>> = OnceLock::new();
 #[cfg(test)]
 pub(crate) static S6A_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// A watchdog interval Tw for tests, below RFC 3539's 6-second floor, so a silent
+/// HSS is detected in milliseconds (#729). `None` in production: the session
+/// takes Tw from `DiameterConfig::timer_tw`. Guarded by [`S6A_TEST_LOCK`].
+#[cfg(test)]
+pub(crate) static S6A_TEST_TW: std::sync::Mutex<Option<std::time::Duration>> =
+    std::sync::Mutex::new(None);
+
+/// Start the S6a session on a connected client, with the watchdog (#729).
+fn start_s6a_session(
+    client: DiameterClient,
+) -> nextgcore_diameter::error::DiameterResult<(DiameterSession, tokio::task::JoinHandle<()>)> {
+    #[cfg(test)]
+    if let Some(tw) = *S6A_TEST_TW.lock().unwrap_or_else(|e| e.into_inner()) {
+        return DiameterSession::start_with_watchdog(client, tw);
+    }
+    DiameterSession::start(client)
+}
+
 fn s6a_client() -> &'static Mutex<Option<S6aClientState>> {
     S6A_CLIENT.get_or_init(|| Mutex::new(None))
 }
@@ -453,7 +471,10 @@ async fn mme_fd_connect_attempts(attempts: u32) -> DiameterResult<()> {
         DiameterError::ConnectionFailed
     })?;
 
-    let (session, reader) = DiameterSession::start(client)?;
+    // The session runs the Device-Watchdog (RFC 6733 §5.5): an HSS that goes
+    // silent without closing ends the reader within about 2 x Tw, and the
+    // supervisor below then redials (#729).
+    let (session, reader) = start_s6a_session(client)?;
 
     let mut guard = s6a_client().lock().await;
     // Replacing an existing session: stop its reader so two tasks never own
@@ -1678,6 +1699,101 @@ mod tests {
         // Leave the globals as the "without init" tests expect them.
         mme_fd_final_async().await;
         *s6a_config().lock().await = None;
+    }
+
+    /// #729: an HSS that completes CER/CEA and then goes silent WITHOUT closing
+    /// (a crashed node, a partition: no FIN, no RST) is detected by the
+    /// Device-Watchdog, and the supervisor redials it within about 2 x Tw. Before
+    /// #729 the reader stayed alive on the half-open connection and nothing
+    /// redialled until TCP gave up, around 15 minutes.
+    #[tokio::test]
+    async fn test_a_silent_hss_is_detected_and_redialled() {
+        use nextgcore_diameter::peer::DiameterPeer;
+        use nextgcore_diameter::transport::DiameterListener;
+        let _s6a = S6A_TEST_LOCK.lock().await;
+        let tw = std::time::Duration::from_millis(200);
+        *S6A_TEST_TW.lock().unwrap() = Some(tw);
+
+        let listener = DiameterListener::bind(([127, 0, 0, 1], 0).into())
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hss_cfg = DiameterConfig {
+            diameter_id: "hss.localdomain".to_string(),
+            diameter_realm: "localdomain".to_string(),
+            ..Default::default()
+        };
+        let (silent_tx, silent_rx) = tokio::sync::oneshot::channel::<()>();
+        // CER/CEA, then read and answer nothing, holding the connection open.
+        let silent = {
+            let cfg = hss_cfg.clone();
+            tokio::spawn(async move {
+                let transport = listener.accept().await.unwrap();
+                let mut peer = DiameterPeer::new_responder(transport, &cfg);
+                peer.start().await.unwrap();
+                let _cer = peer.next_event().await.unwrap();
+                let read_forever = async { while peer.recv_raw().await.is_ok() {} };
+                tokio::select! {
+                    _ = read_forever => {}
+                    _ = silent_rx => {}
+                }
+                (listener, peer)
+            })
+        };
+
+        let mme_cfg = DiameterConfig {
+            diameter_id: "mme.localdomain".to_string(),
+            diameter_realm: "localdomain".to_string(),
+            timer_tc: 1,
+            ..Default::default()
+        };
+        mme_fd_init_async(mme_cfg, addr).await.unwrap();
+        mme_fd_connect().await.expect("the first dial succeeds");
+        let started = std::time::Instant::now();
+
+        let mut down = false;
+        for _ in 0..100 {
+            if s6a_needs_connect().await {
+                down = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            down,
+            "a silent HSS must be seen as down by the watchdog (RFC 6733 §5.5)"
+        );
+        assert!(
+            started.elapsed() < tw * 2 + std::time::Duration::from_millis(500),
+            "within about 2 x Tw: {:?}",
+            started.elapsed()
+        );
+
+        // The old connection is still open on the HSS side; the HSS now
+        // accepts again on the same listener, and the supervisor redials.
+        let _ = silent_tx.send(());
+        let (listener, old_peer) = silent.await.unwrap();
+        let second = tokio::spawn(async move {
+            let transport = listener.accept().await.unwrap();
+            let mut peer = DiameterPeer::new_responder(transport, &hss_cfg);
+            peer.start().await.unwrap();
+            let _cer = peer.next_event().await.unwrap();
+            peer
+        });
+        assert_eq!(
+            mme_fd_supervise_once().await,
+            Some(Ok(())),
+            "the supervisor redials the HSS"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(3), second)
+            .await
+            .expect("the HSS must see a second CER")
+            .unwrap();
+        drop(old_peer);
+
+        mme_fd_final_async().await;
+        *s6a_config().lock().await = None;
+        *S6A_TEST_TW.lock().unwrap() = None;
     }
 
     #[tokio::test]

@@ -26,6 +26,16 @@
 //!
 //! # What is deliberately NOT here
 //!
+//! # Watchdog (RFC 6733 §5.5, RFC 3539 §3.4.1)
+//!
+//! The reader runs the Device-Watchdog algorithm: when nothing has been received
+//! for Tw it sends a DWR; when nothing at all arrives within the next Tw it
+//! closes the session (RFC 3539's SUSPECT state, whose action is failover: for a
+//! single-peer client, failover IS the application's redial). Without it a peer
+//! that vanishes without a FIN or RST (a crashed node, a partition) leaves a
+//! half-open connection, every request times out, and the session stays "up"
+//! until the kernel gives up retransmitting, around 15 minutes (#729).
+//!
 //! - Reconnection. [`DiameterSession::start`] takes an already-connected
 //!   [`DiameterClient`]. When the reader sees the peer go away it fails every
 //!   waiter and stops; deciding whether to redial is the application's business
@@ -74,6 +84,18 @@ impl DiameterSession {
     /// dropping it detaches, and aborting it tears the session down. The client
     /// must already be connected — `start` does not perform CER/CEA.
     pub fn start(client: DiameterClient) -> DiameterResult<(Self, tokio::task::JoinHandle<()>)> {
+        // RFC 3539 §3.4.1: "Tw MUST NOT be set lower than 6 seconds".
+        let tw = Duration::from_secs(u64::from(client.config().timer_tw.max(MIN_TW_SECS)));
+        Self::start_with_watchdog(client, tw)
+    }
+
+    /// [`Self::start`] with an explicit watchdog interval Tw, not floored at the
+    /// RFC's 6 seconds and not jittered when below it. For tests that need a
+    /// silent peer detected in milliseconds; production callers use `start`.
+    pub fn start_with_watchdog(
+        client: DiameterClient,
+        tw: Duration,
+    ) -> DiameterResult<(Self, tokio::task::JoinHandle<()>)> {
         let request_timeout = Duration::from_secs(client.config().request_timeout as u64);
         let (hop_seed, end_seed) = client.identifier_seeds();
         let peer = client
@@ -86,7 +108,7 @@ impl DiameterSession {
         let (inbound_tx, inbound_rx) = mpsc::channel::<DiameterMessage>(64);
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
 
-        let handle = tokio::spawn(run_session(peer, rx, inbound_tx, Arc::clone(&pending)));
+        let handle = tokio::spawn(run_session(peer, rx, inbound_tx, Arc::clone(&pending), tw));
 
         Ok((
             Self {
@@ -206,9 +228,30 @@ async fn run_session(
     mut outbound: mpsc::Receiver<DiameterMessage>,
     inbound: mpsc::Sender<DiameterMessage>,
     pending: PendingMap,
+    tw: Duration,
 ) {
+    let mut watchdog = Watchdog::new(tw);
     loop {
         tokio::select! {
+            // RFC 3539 §3.4.1: Tw with nothing received.
+            _ = tokio::time::sleep_until(watchdog.deadline) => {
+                if watchdog.dwr_outstanding {
+                    log::warn!(
+                        "Diameter peer {:?} did not answer the Device-Watchdog-Request within \
+                         Tw ({:?}): closing the connection (RFC 3539 §3.4.1, RFC 6733 §5.5)",
+                        peer.remote_host(),
+                        watchdog.tw
+                    );
+                    break;
+                }
+                if let Err(e) = peer.send_watchdog().await {
+                    log::warn!("Diameter Device-Watchdog-Request not sent: {e}");
+                    break;
+                }
+                log::debug!("Diameter Device-Watchdog-Request sent to {:?}", peer.remote_host());
+                watchdog.sent();
+            }
+
             // `recv_raw` is cancel-safe (it only awaits a buffered read), which
             // is why this branch is sound. `next_event` would NOT be: it can
             // await a DWA/DPA write, and losing that race mid-write would leave
@@ -221,6 +264,20 @@ async fn run_session(
                         break;
                     }
                 };
+                // Any message from the peer shows it is alive (RFC 3539 §3.4.1:
+                // the timer restarts on every receipt, and a DWA clears the
+                // outstanding watchdog).
+                watchdog.received();
+
+                // A DWA is the reader's own, numbered from the peer state
+                // machine's identifier space, which can overlap the session's:
+                // it must never be handed to an application waiter.
+                if msg.header.is_answer()
+                    && msg.header.command_code == crate::message::base_cmd::DEVICE_WATCHDOG
+                {
+                    log::debug!("Diameter Device-Watchdog-Answer received");
+                    continue;
+                }
 
                 // Answers are routed here rather than through the state machine:
                 // an application answer carries no base-protocol meaning, and
@@ -277,6 +334,51 @@ async fn run_session(
     // Without this, a connection loss would stall every in-flight request for
     // the full request_timeout.
     pending.lock().await.clear();
+}
+
+/// RFC 3539 §3.4.1: "Tw MUST NOT be set lower than 6 seconds".
+const MIN_TW_SECS: u32 = 6;
+
+/// The Device-Watchdog timer of one connection (RFC 3539 §3.4.1).
+struct Watchdog {
+    tw: Duration,
+    deadline: tokio::time::Instant,
+    dwr_outstanding: bool,
+}
+
+impl Watchdog {
+    fn new(tw: Duration) -> Self {
+        Self {
+            tw,
+            deadline: tokio::time::Instant::now() + jittered(tw),
+            dwr_outstanding: false,
+        }
+    }
+
+    fn received(&mut self) {
+        self.dwr_outstanding = false;
+        self.deadline = tokio::time::Instant::now() + jittered(self.tw);
+    }
+
+    fn sent(&mut self) {
+        self.dwr_outstanding = true;
+        self.deadline = tokio::time::Instant::now() + jittered(self.tw);
+    }
+}
+
+/// Tw with the ±2 s jitter RFC 3539 §3.4.1 asks for, so peers that started
+/// together do not send their watchdogs in lockstep. Not jittered below the
+/// RFC's 6-second floor (test intervals), where ±2 s would swamp the value.
+fn jittered(tw: Duration) -> Duration {
+    if tw < Duration::from_secs(u64::from(MIN_TW_SECS)) {
+        return tw;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    // 0..=4000 ms, centred on Tw.
+    let offset_ms = u64::from(nanos % 4001);
+    (tw + Duration::from_millis(offset_ms)).saturating_sub(Duration::from_secs(2))
 }
 
 #[cfg(test)]
@@ -623,5 +725,137 @@ mod tests {
         assert_eq!(inbound.session_id(), Some("clr-session"));
         reader.abort();
         hss.abort();
+    }
+
+    /// An HSS that completes CER/CEA and then, if `answer_watchdogs`, answers
+    /// each DWR (through the peer state machine), or else reads and never
+    /// answers anything: a half-open peer. Reports each DWR it sees.
+    async fn spawn_watchdog_hss(
+        listener: DiameterListener,
+        answer_watchdogs: bool,
+        dwr_seen: mpsc::UnboundedSender<()>,
+    ) -> tokio::task::JoinHandle<()> {
+        let cfg = config("hss.example.com", 30);
+        tokio::spawn(async move {
+            let transport = listener.accept().await.unwrap();
+            let mut peer = DiameterPeer::new_responder(transport, &cfg);
+            peer.start().await.unwrap();
+            let _cer = peer.next_event().await.unwrap();
+            loop {
+                let Ok(msg) = peer.recv_raw().await else {
+                    break;
+                };
+                if msg.header.command_code == crate::message::base_cmd::DEVICE_WATCHDOG
+                    && msg.header.is_request()
+                {
+                    let _ = dwr_seen.send(());
+                    if answer_watchdogs && peer.handle_message(msg).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            // Hold the connection open until the client closes it.
+            drop(peer);
+        })
+    }
+
+    async fn watchdog_session(
+        answer_watchdogs: bool,
+        tw: Duration,
+    ) -> (
+        DiameterSession,
+        tokio::task::JoinHandle<()>,
+        mpsc::UnboundedReceiver<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = DiameterListener::bind(([127, 0, 0, 1], 0).into())
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (dwr_tx, dwr_rx) = mpsc::unbounded_channel();
+        let hss = spawn_watchdog_hss(listener, answer_watchdogs, dwr_tx).await;
+        let mut client = DiameterClient::new(config("mme.example.com", 30), addr);
+        client.connect().await.unwrap();
+        let (session, reader) = DiameterSession::start_with_watchdog(client, tw).unwrap();
+        (session, reader, dwr_rx, hss)
+    }
+
+    /// #729, RFC 3539 §3.4.1 / RFC 6733 §5.5: a peer that goes silent without
+    /// closing (no FIN, no RST) is sent a DWR after Tw, and when that is not
+    /// answered within another Tw the session ends, failing the in-flight
+    /// request at once instead of after request_timeout (30 s here).
+    #[tokio::test]
+    async fn a_silent_peer_ends_the_session_within_two_tw() {
+        let tw = Duration::from_millis(200);
+        let (session, reader, mut dwr_rx, _hss) = watchdog_session(false, tw).await;
+        let started = std::time::Instant::now();
+        let in_flight = {
+            let session = session.clone();
+            tokio::spawn(async move {
+                let air = DiameterMessage::new_request(AIR, S6A_APP);
+                session.send_request(&air).await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), dwr_rx.recv())
+            .await
+            .expect("a Device-Watchdog-Request is sent after Tw")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), reader)
+            .await
+            .expect("the session ends when the DWR is not answered")
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < tw * 2 + Duration::from_millis(400),
+            "detected in about 2 x Tw, took {elapsed:?}"
+        );
+        let result = tokio::time::timeout(Duration::from_secs(1), in_flight)
+            .await
+            .expect("the in-flight request fails promptly")
+            .unwrap();
+        assert!(
+            matches!(result, Err(DiameterError::Protocol(_))),
+            "{result:?}"
+        );
+    }
+
+    /// #729: a peer that answers its watchdogs keeps the session up across many
+    /// Tw, and a DWA is never handed to an application waiter.
+    #[tokio::test]
+    async fn a_peer_answering_watchdogs_stays_up() {
+        let tw = Duration::from_millis(150);
+        let (session, reader, mut dwr_rx, _hss) = watchdog_session(true, tw).await;
+        tokio::time::sleep(tw * 8).await;
+        assert!(!reader.is_finished(), "an answering peer is not dropped");
+        let mut dwrs = 0;
+        while dwr_rx.try_recv().is_ok() {
+            dwrs += 1;
+        }
+        assert!(dwrs >= 3, "a DWR every Tw of silence, saw {dwrs}");
+        assert_eq!(session.pending_count().await, 0);
+        reader.abort();
+    }
+
+    /// RFC 3539 §3.4.1: Tw is never below 6 s in production, and is jittered
+    /// by at most ±2 s.
+    #[test]
+    fn tw_is_floored_and_jittered_within_two_seconds() {
+        let tw = Duration::from_secs(30);
+        for _ in 0..100 {
+            let j = jittered(tw);
+            assert!(
+                j >= Duration::from_secs(28) && j <= Duration::from_secs(32),
+                "{j:?}"
+            );
+        }
+        assert_eq!(
+            jittered(Duration::from_millis(200)),
+            Duration::from_millis(200)
+        );
+        let cfg = DiameterConfig {
+            timer_tw: 1,
+            ..Default::default()
+        };
+        assert_eq!(cfg.timer_tw.max(MIN_TW_SECS), 6);
     }
 }
