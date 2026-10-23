@@ -52,6 +52,10 @@ nextg_load_profile() {
   profile_summary() { :; }
   # shellcheck disable=SC2317
   profile_postrender() { :; }
+  # Prints how to build the profile's binaries; build-and-push.sh calls it
+  # when some are missing. Reads CORE_DIR, SIM_DIR and CORE_BIN_DIR.
+  # shellcheck disable=SC2317
+  profile_build_hint() { :; }
 
   # shellcheck source=/dev/null
   source "${PROFILE_DIR}/profile.env"

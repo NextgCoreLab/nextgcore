@@ -57,6 +57,7 @@ Both scripts take `PROFILE=<name>` (default `5g`) and read
 | `PROFILE_DATAPLANE_DEPLOYMENT` / `_PATCH` | what `ENABLE_DATAPLANE=true` swaps in |
 | `profile_postrender <file>` | in-place transform of the rendered manifests (before the generic rewrites) |
 | `profile_rollout()` / `profile_summary()` | rollout waits after apply; closing summary |
+| `profile_build_hint()` | build commands `build-and-push.sh` prints when binaries are missing (checked before any AWS call) |
 
 `CORE_BIN_DIR=<dir>` makes `build-and-push.sh` package core binaries from a
 directory other than `nextgcore/binaries/`, e.g. a feature build's own output.
@@ -167,9 +168,11 @@ The hss, pcrf and lte-ue rows were measured later, on the same images.
 
 **mongodb-0 is not in the table.** With `EPHEMERAL_STORAGE=true` (as above) its
 emptyDir goes with the pod, so the subscriber the one-shot `mongodb-init` Job
-seeded is lost and the next attach fails authentication at the HSS. Recover by
-re-running `deploy-eks.sh`, which runs the `mongodb-init` Job again. On a gp3
-PVC the data survives.
+seeded is lost and the next attach fails authentication at the HSS. Recover with
+`kubectl -n <ns> delete job mongodb-init` first, then re-run `deploy-eks.sh`,
+which runs the Job again. The delete is needed because the finished Job lingers
+for 300 s (`ttlSecondsAfterFinished`); within that window `kubectl apply` leaves
+it as it is and nothing is re-seeded. On a gp3 PVC the data survives.
 
 **A long-lived deployment hangs (#724).** upfd deadlocks at its first periodic
 usage report. smfd provisions a 3600 s Measurement Period by default, so a
@@ -423,6 +426,8 @@ Workload:
   validated and is not expected to work.
 - PROFILE=5g deploys 10 of nextgcore's 28 NFs (the 5G control + user
   plane). The EPC tier, with nextgsim's LTE eNB/UE, is PROFILE=epc (see above).
+- A long-lived deployment hangs at upfd's first periodic usage report, in
+  both profiles (#724; see "A long-lived deployment hangs" above).
 - All 6G/AI features are off. That is the validated configuration: the
   nightly gate (`docker-build`, `docker-e2e`, `docker-e2e-epc` in
   `.github/workflows/ci.yml`) runs with every 6G flag disabled, and

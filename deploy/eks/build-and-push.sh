@@ -83,24 +83,12 @@ for repo_tag in "nextgcore:${CORE_TAG}" "nextgsim:${SIM_TAG}"; do
   fi
 done
 
-# --- preflight -------------------------------------------------------------
-
-for c in aws docker; do
-  command -v "$c" >/dev/null || die "$c not found"
-done
-
-log "verifying AWS credentials..."
-if ! ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text 2>/dev/null)"; then
-  die "AWS credentials invalid or expired. Refresh them and retry."
-fi
-
-REGISTRY="${REGISTRY:-${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com}"
-[[ "${PROFILE_NAME}" == 5g ]] || log "profile:  ${PROFILE_NAME} (cargo features: ${PROFILE_CARGO_FEATURES:-none})"
-log "registry: ${REGISTRY}"
-log "prefix:   ${REPO_PREFIX}    core tag: ${CORE_TAG}    gnb/ue tag: ${SIM_TAG}"
+# --- binaries --------------------------------------------------------------
 
 # Fail early and loudly if the binaries are missing, rather than producing
-# images that crash on start. They are build artifacts and no longer tracked in
+# images that crash on start. This runs before any AWS call (#716): with
+# expired credentials the STS check below would otherwise fail first and hide
+# which binaries are missing. They are build artifacts and no longer tracked in
 # git, so a fresh clone has none until you build.
 MISSING=()
 for entry in "${CORE_NFS[@]}"; do
@@ -124,13 +112,26 @@ for entry in "${PROFILE_SIM_IMAGES[@]}"; do
 done
 if (( ${#MISSING[@]} )); then
   printf 'missing prebuilt binaries:\n'; printf '  %s\n' "${MISSING[@]}"
-  printf 'build them with:\n'
-  printf '  cd %s/src && cargo build --release && \\\n' "${CORE_DIR}"
-  printf '    cp target/release/nextgcore-*d ../binaries/\n'
-  printf '  cd %s && cargo build --release && \\\n' "${SIM_DIR}"
-  printf '    cp target/release/nr-gnb target/release/nr-ue docker/binaries/\n'
+  printf 'build them with (PROFILE=%s):\n' "${PROFILE_NAME}"
+  profile_build_hint
   die "no binaries to package"
 fi
+
+# --- preflight -------------------------------------------------------------
+
+for c in aws docker; do
+  command -v "$c" >/dev/null || die "$c not found"
+done
+
+log "verifying AWS credentials..."
+if ! ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text 2>/dev/null)"; then
+  die "AWS credentials invalid or expired. Refresh them and retry."
+fi
+
+REGISTRY="${REGISTRY:-${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com}"
+[[ "${PROFILE_NAME}" == 5g ]] || log "profile:  ${PROFILE_NAME} (cargo features: ${PROFILE_CARGO_FEATURES:-none})"
+log "registry: ${REGISTRY}"
+log "prefix:   ${REPO_PREFIX}    core tag: ${CORE_TAG}    gnb/ue tag: ${SIM_TAG}"
 
 # --- ECR login + repos -----------------------------------------------------
 
