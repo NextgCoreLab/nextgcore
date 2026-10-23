@@ -97,3 +97,57 @@ if [ -z "$ul" ] || [ -z "$dl" ] || [ "$ul" -lt "$COUNT" ] || [ "$dl" -lt "$COUNT
     exit 1
 fi
 echo "OK: PGW-U counted the ping on its TUN path (UL=${ul}, DL=${dl})"
+
+# 5-6. Idle mode (#956, TS 23.401 §5.3.5 / §5.3.4.1 / §5.3.4.3). Off until the
+#    simulator can idle an LTE UE and page it (nextgsim #350, #351): set
+#    EPC_IDLE_MODE=1 with an eNB configured for a user-inactivity release.
+#    Each step asserts a line only that step prints, never the absence of an
+#    error.
+if [ "${EPC_IDLE_MODE:-0}" = "1" ]; then
+    IDLE_TIMEOUT="${EPC_IDLE_TIMEOUT:-60}"
+    # mme_lines <regex>: how many lines of the MME log match, so a second
+    # occurrence can be told from the first.
+    mme_lines() { docker logs "$MME" 2>&1 | grep -Ec "$1" || true; }
+    wait_more() {
+        local re="$1" before="$2" what="$3" i
+        for i in $(seq 1 "$IDLE_TIMEOUT"); do
+            if [ "$(mme_lines "$re")" -gt "$before" ]; then
+                echo "OK: $what (after ${i}s)"
+                return 0
+            fi
+            sleep 1
+        done
+        echo "FAIL: $what -- no new /$re/ in $MME within ${IDLE_TIMEOUT}s"
+        return 1
+    }
+    IDLE_RE='the UE goes ECM-IDLE'
+    SR_RE='SERVICE REQUEST accepted: Initial Context Setup Request'
+    UP_RE='SERVICE REQUEST user plane up; Modify Bearer Request'
+    PAGED_RE='paged on [0-9]+ eNB'
+
+    # 5. Mobile-originated: the eNB releases the idle UE (S1 release with
+    #    Release Access Bearers), then an uplink packet makes the UE send a
+    #    SERVICE REQUEST; the MME's Initial Context Setup and Modify Bearer
+    #    Request bring the user plane back, and the ping recovers.
+    idle=$(mme_lines "$IDLE_RE"); sr=$(mme_lines "$SR_RE"); up=$(mme_lines "$UP_RE")
+    wait_more "$IDLE_RE" "$idle" "S1 release: the MME took the UE to ECM-IDLE"
+    echo "Uplink from the idle UE..."
+    docker exec "$UE" lte-ue-ping-check "$TARGET" "$COUNT" || true
+    wait_more "$SR_RE" "$sr" "mobile-originated SERVICE REQUEST answered with Initial Context Setup"
+    wait_more "$UP_RE" "$up" "Serving GW given the new eNB S1-U endpoints"
+    docker exec "$UE" lte-ue-ping-check "$TARGET" "$COUNT"
+    echo "OK: ${COUNT}/${COUNT} echo replies after the mobile-originated SERVICE REQUEST"
+
+    # 6. Network-triggered: idle again, then downlink to the UE's PDN address
+    #    from the PGW-U side. The Serving GW buffers it and sends a Downlink Data
+    #    Notification, the MME pages, the UE answers with a SERVICE REQUEST, and
+    #    the user plane comes back.
+    idle=$(mme_lines "$IDLE_RE"); sr=$(mme_lines "$SR_RE"); paged=$(mme_lines "$PAGED_RE")
+    wait_more "$IDLE_RE" "$idle" "S1 release again"
+    echo "Downlink to the idle UE (${pdn})..."
+    docker exec "$PGWU" ping -c 5 -W 2 "$pdn" || true
+    wait_more "$PAGED_RE" "$paged" "Downlink Data Notification paged the UE"
+    wait_more "$SR_RE" "$sr" "network-triggered SERVICE REQUEST answered with Initial Context Setup"
+    docker exec "$PGWU" ping -c "$COUNT" -W 2 "$pdn"
+    echo "OK: downlink reaches the UE after paging (network-triggered SERVICE REQUEST)"
+fi

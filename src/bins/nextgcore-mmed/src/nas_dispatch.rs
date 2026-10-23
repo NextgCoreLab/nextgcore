@@ -1370,12 +1370,65 @@ fn emm_service_request(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, pdu: &[
         return;
     }
 
-    // Re-establishing the radio bearers is the Initial Context Setup path (#47).
-    log::info!(
-        "[{}] SERVICE REQUEST accepted; Initial Context Setup for the active bearers is not \
-         implemented (#47)",
-        mme_ue.imsi_bcd
-    );
+    drop(pool);
+    service_request_initial_context_setup(ctx, enb_ue, mme_ue_id);
+}
+
+/// SERVICE REQUEST accepted (TS 23.401 §5.3.4.1 step 4, #956): the radio and
+/// S1 bearers of every active EPS bearer are set up again with an INITIAL
+/// CONTEXT SETUP REQUEST, with no NAS-PDU (a SERVICE REQUEST has no NAS
+/// answer; the AS security mode is its acceptance, TS 24.301 §5.6.1.4).
+///
+/// K_eNB is derived afresh from K_ASME and the uplink NAS COUNT of the SERVICE
+/// REQUEST (TS 33.401 §7.2.8.1, Annex A.3), and the NH chain restarts from it.
+/// A paging the UE answered stops (TS 24.301 §5.6.2.2.1).
+fn service_request_initial_context_setup(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64) {
+    let was_paged = ctx.mme_ue_find_by_id(mme_ue_id).is_some_and(|ue| {
+        ue.t3413.is_running() || ue.paging.type_ != crate::context::PagingType::None
+    });
+    if was_paged {
+        crate::paging::stop_paging(ctx, mme_ue_id);
+    }
+    // The bearers established at the Serving GW (an S1-U SGW TEID): the ones a
+    // never-connected subscription session lacks.
+    let bearers: Vec<crate::context::MmeBearer> = crate::gtp_path::bearers_of_ue(ctx, mme_ue_id)
+        .into_iter()
+        .filter(|b| b.sgw_s1u_teid != 0)
+        .collect();
+    let mut pool = ctx.mme_ue_pool.write().unwrap();
+    let Some(mme_ue) = pool.get_mut(&mme_ue_id) else {
+        return;
+    };
+    mme_ue.kenb = nextgcore_crypt::kdf::nextgcore_kdf_kenb(&mme_ue.kasme, mme_ue.ul_count);
+    mme_ue.nhcc = 0;
+    mme_ue.nh = [0; 32];
+    let ue_ambr = crate::s1ap_build::ue_ambr_of(ctx, mme_ue);
+    match crate::s1ap_build::build_initial_context_setup_request(
+        mme_ue, enb_ue, &bearers, None, ue_ambr,
+    ) {
+        Ok(pdu) => {
+            mme_ue.service_request_ics_pending = true;
+            if let Err(e) = nas_path::nas_eps_send_to_enb(mme_ue, enb_ue, pdu) {
+                mme_ue.service_request_ics_pending = false;
+                log::error!(
+                    "[{}] SERVICE REQUEST: Initial Context Setup not sent: {e}",
+                    mme_ue.imsi_bcd
+                );
+                return;
+            }
+            log::info!(
+                "[{}] SERVICE REQUEST accepted: Initial Context Setup Request for E-RABs {:?} \
+                 (TS 23.401 §5.3.4.1 step 4){}",
+                mme_ue.imsi_bcd,
+                bearers.iter().map(|b| b.ebi).collect::<Vec<_>>(),
+                if was_paged { "; paging stopped" } else { "" }
+            );
+        }
+        Err(e) => log::error!(
+            "[{}] SERVICE REQUEST: Initial Context Setup Request not built: {e:?}",
+            mme_ue.imsi_bcd
+        ),
+    }
 }
 
 fn emm_extended_service_request(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, body: &[u8]) {
@@ -1395,6 +1448,31 @@ fn emm_extended_service_request(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64
             return;
         }
     };
+
+    // #956, TS 24.301 §5.6.1.1 / Table 9.9.3.27.1: service type "packet
+    // services via S1" (8, and the unused 9-11 read as it) is a SERVICE REQUEST
+    // in all but the message: the user plane is set up again. It was refused
+    // as a CS fallback with no SGs association.
+    if service_type >= 8 {
+        drop(pool);
+        if !ctx.mme_ue_have_active_eps_bearers(mme_ue_id) {
+            let mut pool = ctx.mme_ue_pool.write().unwrap();
+            if let Some(mme_ue) = pool.get_mut(&mme_ue_id) {
+                if let Err(e) = nas_path::nas_eps_send_service_reject(
+                    enb_ue,
+                    mme_ue,
+                    EmmCause::NoEpsBearerContextActivated,
+                ) {
+                    log::error!("Service Reject send failed: {e}");
+                }
+            }
+            drop(pool);
+            release_after_service_reject(ctx, enb_ue);
+            return;
+        }
+        service_request_initial_context_setup(ctx, enb_ue, mme_ue_id);
+        return;
+    }
 
     if mme_ue.csmap_id == NEXTGCORE_INVALID_POOL_ID {
         // TS 24.301 §5.6.1.5: CSFB needs an SGs association with a VLR.

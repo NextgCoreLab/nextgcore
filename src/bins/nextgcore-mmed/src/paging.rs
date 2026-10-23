@@ -74,6 +74,19 @@ pub fn page_ue(ctx: &MmeContext, mme_ue_id: u64, paging_type: PagingType) -> usi
     targets.len()
 }
 
+/// Repeat a PAGING (`pdu`, as T3413 stored it) on every eNB serving the UE's
+/// tracking area (#956). Returns how many eNBs it went to.
+pub fn repeat(ctx: &MmeContext, mme_ue_id: u64, pdu: Vec<u8>) -> usize {
+    let Some(mme_ue) = ctx.mme_ue_find_by_id(mme_ue_id) else {
+        return 0;
+    };
+    let targets = enbs_serving(ctx, &mme_ue);
+    for enb_id in &targets {
+        s1ap_path::s1ap_send_pdu(*enb_id, pdu.clone());
+    }
+    targets.len()
+}
+
 /// Stop paging: the UE answered, or the procedure was abandoned.
 pub fn stop_paging(ctx: &MmeContext, mme_ue_id: u64) {
     if let Some(mme_ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&mme_ue_id) {

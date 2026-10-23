@@ -1056,6 +1056,10 @@ pub struct MmeUe {
     /// ATTACH, TAU or SERVICE REQUEST colliding with it is treated
     /// (§5.5.2.3.5 d-f, #732).
     pub network_detach_type: Option<crate::emm_build::DetachTypeToUe>,
+    /// An INITIAL CONTEXT SETUP REQUEST answering a SERVICE REQUEST is
+    /// outstanding: its response continues with the Modify Bearer Request of
+    /// TS 23.401 §5.3.4.1 step 8 (#956).
+    pub service_request_ics_pending: bool,
     /// The network-initiated detach in progress was started by an HSS Cancel Location
     /// (subscription withdrawal). Only then is a further CLR a retransmission of the one
     /// being served; a CLR during any other detach is the HSS's own instruction (#828).
@@ -2486,14 +2490,17 @@ impl MmeContext {
         false
     }
 
-    /// Check if UE has active EPS bearers
+    /// Check if UE has active EPS bearers: established at the Serving GW (an
+    /// S1-U SGW TEID). An ECM-IDLE UE has no eNB endpoint, and its bearers are
+    /// still active (TS 24.301 §5.6.1.4; #956: keyed on the eNB TEID, every
+    /// SERVICE REQUEST of an idle UE was rejected with #40).
     pub fn mme_ue_have_active_eps_bearers(&self, mme_ue_id: u64) -> bool {
         if let Some(mme_ue) = self.mme_ue_find_by_id(mme_ue_id) {
             for sess_id in &mme_ue.sess_list {
                 if let Some(sess) = self.sess_find_by_id(*sess_id) {
                     for bearer_id in &sess.bearer_list {
                         if let Some(bearer) = self.bearer_find_by_id(*bearer_id) {
-                            if bearer.enb_s1u_teid != 0 {
+                            if bearer.sgw_s1u_teid != 0 {
                                 return true;
                             }
                         }

@@ -262,6 +262,12 @@ pub fn send_response_to_sgwc(peer: SocketAddr, msg: &Gtp2Message) -> GtpPathResu
 
 /// Send `msg` as a triggered message, echoing the request's sequence number.
 fn send_response_to(peer: SocketAddr, msg: &Gtp2Message) -> GtpPathResult<()> {
+    #[cfg(test)]
+    if let Some((server, _)) = test_route(None) {
+        return server
+            .send_response(peer, msg)
+            .map_err(GtpPathError::SocketError);
+    }
     let server = server().ok_or_else(|| {
         GtpPathError::SocketError("no S11 socket bound: cannot answer".to_string())
     })?;
@@ -434,6 +440,22 @@ impl GtpcServer {
                                 == s11_build::message_type::CHANGE_NOTIFICATION_REQUEST
                             {
                                 take_pending_change_notification(xact.sequence_number);
+                            }
+                            // #956: an S1 release still completes when the Serving
+                            // GW does not answer its Release Access Bearers Request.
+                            if xact.message_type
+                                == s11_build::message_type::RELEASE_ACCESS_BEARERS_REQUEST
+                            {
+                                if let Some(enb_ue_id) =
+                                    take_pending_s1_release(xact.sequence_number)
+                                {
+                                    for send in crate::s1ap_handler::s1_release_command(
+                                        crate::context::mme_self(),
+                                        enb_ue_id,
+                                    ) {
+                                        crate::s1ap_path::s1ap_send(send);
+                                    }
+                                }
                             }
                         }
 
@@ -1237,6 +1259,134 @@ pub fn send_release_access_bearers_request(
         enb_ue_id,
         ..Default::default()
     })
+}
+
+/// The S1 releases (TS 23.401 §5.3.5) waiting for their Release Access Bearers
+/// Response before the UE CONTEXT RELEASE COMMAND goes (step 5), by sequence
+/// number: the eNB UE context to release (#956).
+static PENDING_S1_RELEASES: OnceLock<Mutex<HashMap<u32, u64>>> = OnceLock::new();
+
+fn pending_s1_releases() -> &'static Mutex<HashMap<u32, u64>> {
+    PENDING_S1_RELEASES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Take the eNB UE context the Release Access Bearers Request at `seq` was for.
+pub fn take_pending_s1_release(seq: u32) -> Option<u64> {
+    pending_s1_releases().lock().ok()?.remove(&seq)
+}
+
+/// S1 release, TS 23.401 §5.3.5 step 2 (#956): the MME tells the Serving GW to
+/// release the UE's S1-U bearers (it then buffers downlink and sends a Downlink
+/// Data Notification), and forgets the eNB's S1-U endpoints itself, the UE going
+/// ECM-IDLE. The UE CONTEXT RELEASE COMMAND for `enb_ue_id` waits for the
+/// response (step 5, `take_pending_s1_release`). Returns the sequence number.
+pub fn release_access_bearers_for_s1_release(
+    ctx: &MmeContext,
+    enb_ue_id: u64,
+    mme_ue_id: u64,
+) -> GtpPathResult<u32> {
+    let mme_ue = ctx
+        .mme_ue_find_by_id(mme_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let sgw_ue = ctx
+        .sgw_ue_find_by_id(mme_ue.sgw_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    if sgw_ue.sgw_s11_teid == 0 {
+        return Err(GtpPathError::InvalidState(
+            "no S11 session at the Serving GW".to_string(),
+        ));
+    }
+    let seq = sequence()?;
+    let msg = s11_build::build_release_access_bearers_request(sgw_ue.sgw_s11_teid, seq);
+    // Recorded before the send (#359): the response can race `send_to`.
+    if let Ok(mut map) = pending_s1_releases().lock() {
+        map.insert(seq, enb_ue_id);
+    }
+    if let Err(e) = send_to_sgwc(ctx, &msg, enb_ue_id) {
+        take_pending_s1_release(seq);
+        return Err(e);
+    }
+    clear_enb_endpoints(ctx, mme_ue_id);
+    Ok(seq)
+}
+
+/// Forget the eNB S1-U endpoints of every bearer of `mme_ue_id`: the S1-U
+/// bearers are released (TS 23.401 §5.3.5) and the next Initial Context Setup
+/// brings new ones.
+pub fn clear_enb_endpoints(ctx: &MmeContext, mme_ue_id: u64) {
+    let mut pool = ctx.bearer_pool.write().unwrap();
+    for b in pool.values_mut().filter(|b| b.mme_ue_id == mme_ue_id) {
+        b.enb_s1u_teid = 0;
+        b.enb_s1u_ip = Default::default();
+    }
+}
+
+/// Downlink Data Notification Failure Indication to the Serving GW of
+/// `mme_ue_id` (TS 29.274 §7.2.11.3, TS 23.401 §5.3.4.3 step 3a, #956). An
+/// initial message with no response, so it is sent once and not retransmitted.
+pub fn send_downlink_data_notification_failure_indication(
+    ctx: &MmeContext,
+    mme_ue_id: u64,
+    cause: GtpCause,
+) -> GtpPathResult<()> {
+    let mme_ue = ctx
+        .mme_ue_find_by_id(mme_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let sgw_ue = ctx
+        .sgw_ue_find_by_id(mme_ue.sgw_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let seq = sequence()?;
+    let msg = s11_build::build_downlink_data_notification_failure_indication(
+        sgw_ue.sgw_s11_teid,
+        seq,
+        cause,
+    )
+    .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
+    #[cfg(test)]
+    if let Some((server, peer)) = test_route(Some(ctx)) {
+        return server
+            .send_response(peer, &msg)
+            .map_err(GtpPathError::SocketError);
+    }
+    let server =
+        server().ok_or_else(|| GtpPathError::SocketError("no S11 socket bound".to_string()))?;
+    let peer = *ctx
+        .sgwc_list
+        .first()
+        .ok_or_else(|| GtpPathError::InvalidState("no Serving GW configured".to_string()))?;
+    server
+        .send_response(peer, &msg)
+        .map_err(GtpPathError::SocketError)
+}
+
+/// Modify Bearer Request for the bearers of `mme_ue_id` the eNB set up (a
+/// non-zero eNB S1-U TEID), after the Initial Context Setup of a SERVICE
+/// REQUEST (TS 23.401 §5.3.4.1 step 8, #956). Returns the sequence number.
+pub fn send_modify_bearer_request_for_service_request(
+    ctx: &MmeContext,
+    mme_ue_id: u64,
+) -> GtpPathResult<u32> {
+    let mme_ue = ctx
+        .mme_ue_find_by_id(mme_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let sgw_ue = ctx
+        .sgw_ue_find_by_id(mme_ue.sgw_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let bearers: Vec<crate::context::MmeBearer> = bearers_of_ue(ctx, mme_ue_id)
+        .into_iter()
+        .filter(|b| b.enb_s1u_teid != 0)
+        .collect();
+    if bearers.is_empty() {
+        return Err(GtpPathError::InvalidState(
+            "no bearer was set up by the eNB".to_string(),
+        ));
+    }
+    let refs: Vec<&crate::context::MmeBearer> = bearers.iter().collect();
+    let seq = sequence()?;
+    let msg = s11_build::build_modify_bearer_request(&mme_ue, &sgw_ue, &refs, &[], seq)
+        .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
+    send_to_sgwc(ctx, &msg, mme_ue_id)?;
+    Ok(seq)
 }
 
 pub fn send_release_all_ue_in_enb(

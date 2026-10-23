@@ -32,6 +32,8 @@ pub mod message_type {
     pub const RELEASE_ACCESS_BEARERS_RESPONSE: u8 = 171;
     pub const DOWNLINK_DATA_NOTIFICATION: u8 = 176;
     pub const DOWNLINK_DATA_NOTIFICATION_ACK: u8 = 177;
+    /// TS 29.274 §7.2.11.3 (#956).
+    pub const DOWNLINK_DATA_NOTIFICATION_FAILURE_INDICATION: u8 = 70;
     pub const DELETE_BEARER_COMMAND: u8 = 66;
     pub const BEARER_RESOURCE_COMMAND: u8 = 68;
     pub const BEARER_RESOURCE_FAILURE_INDICATION: u8 = 69;
@@ -108,6 +110,11 @@ pub enum GtpCause {
     SemanticErrorsInPacketFilter = 76,
     SyntacticErrorsInPacketFilter = 77,
     MissingOrUnknownApn = 78,
+    /// TS 29.274 Table 8.4-1: the UE did not answer paging (DDN Failure
+    /// Indication, #956).
+    UeNotResponding = 87,
+    /// TS 29.274 Table 8.4-1: the MME cannot page the UE (DDN Acknowledge).
+    UnableToPageUe = 90,
     RequestRejected = 94,
     ConditionalIeMissing = 103,
 }
@@ -141,6 +148,8 @@ impl From<u8> for GtpCause {
             76 => GtpCause::SemanticErrorsInPacketFilter,
             77 => GtpCause::SyntacticErrorsInPacketFilter,
             78 => GtpCause::MissingOrUnknownApn,
+            87 => GtpCause::UeNotResponding,
+            90 => GtpCause::UnableToPageUe,
             94 => GtpCause::RequestRejected,
             103 => GtpCause::ConditionalIeMissing,
             // Anything else really is unmapped. `Reserved` is honest for a value
@@ -924,6 +933,26 @@ pub fn build_release_access_bearers_request(teid: u32, sequence_number: u32) -> 
         teid,
         sequence_number,
     )
+}
+
+/// Build a Downlink Data Notification Failure Indication (TS 29.274 §7.2.11.3,
+/// #956): the UE did not answer the paging a Downlink Data Notification started.
+/// Cause (M); Originating Node and IMSI are conditional on ISR and restoration,
+/// neither of which this MME runs, so they are absent.
+pub fn build_downlink_data_notification_failure_indication(
+    sgw_s11_teid: u32,
+    sequence_number: u32,
+    cause: GtpCause,
+) -> S11BuildResult<Gtp2Message> {
+    let mut msg = new_message(
+        message_type::DOWNLINK_DATA_NOTIFICATION_FAILURE_INDICATION,
+        sgw_s11_teid,
+        sequence_number,
+    );
+    msg.add_ie(typed_ie(|buf| {
+        Gtp2CauseIe::new(cause as u8).encode(buf, 0)
+    })?);
+    Ok(msg)
 }
 
 /// Build Downlink Data Notification Acknowledge (TS 29.274 §7.2.11)
