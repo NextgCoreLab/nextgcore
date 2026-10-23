@@ -33,9 +33,10 @@ spec:
     spec:
       containers:
         - name: amf
-          # NGAP transport is userspace SCTP over UDP. Stated explicitly here
-          # because the Helm chart declares protocol: SCTP for the same port,
-          # which does not work with the shipped binaries.
+          # NGAP transport is userspace SCTP over UDP, as in the Helm chart
+          # (deploy/helm/nextgcore/templates/amf.yaml declares 38412/UDP).
+          # Stated explicitly so the Deployment does not depend on the
+          # binary's --sctp-backend default.
           args:
             - "-c"
             - "/etc/nextgcore/amf.yaml"

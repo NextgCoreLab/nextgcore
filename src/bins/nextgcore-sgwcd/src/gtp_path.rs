@@ -288,6 +288,17 @@ impl GtpcServer {
             .unwrap_or(1)
     }
 
+    /// Allocate a GTPv2-C sequence number for a Command relayed on S5/S8: most
+    /// significant bit set (TS 29.274 §7.6, #727). The PGW's triggered Request
+    /// echoes it, and the PGW's own initial Requests, MSB clear, cannot collide.
+    pub fn alloc_command_sequence(&self) -> u32 {
+        self.inner
+            .xact
+            .lock()
+            .map(|mut x| x.alloc_command_sequence())
+            .unwrap_or(nextgcore_gtp::v2::GTP2_COMMAND_SEQUENCE_FLAG | 1)
+    }
+
     /// Remember a Command relayed to `pgw_peer` at S5-C sequence `s5c_seq` (#591).
     fn record_command_relay(&self, pgw_peer: SocketAddr, s5c_seq: u32, relay: CommandRelay) {
         if let Ok(mut relays) = self.inner.command_relays.lock() {
@@ -2118,7 +2129,8 @@ fn relay_command_to_pgw(
     }
     let mut relayed = msg.clone();
     relayed.header.teid = Some(pgw_teid);
-    let s5c_seq = server.alloc_sequence();
+    // A Command keeps the MSB set on every leg (TS 29.274 §7.6, #727).
+    let s5c_seq = server.alloc_command_sequence();
     relayed.header.sequence_number = s5c_seq;
     log::info!("Relaying {name} to PGW {pgw_peer} (S5-C TEID {pgw_teid:#x}, seq {s5c_seq})");
     // Remembered before the send, so a triggered message that races the return of
@@ -3735,7 +3747,8 @@ mod tests {
                 Gtp2MessageType::ModifyBearerFailureIndication,
             ),
         ] {
-            let mme_seq = 0x0006_0600 + ebi as u32;
+            // MSB set: a Command's number (TS 29.274 §7.6).
+            let mme_seq = 0x0086_0600 + ebi as u32;
             let cmd = bearer_command(command, s11_teid, mme_seq, ebi);
             mme.send_to(&cmd.encode(), server.local_addr()).unwrap();
             let relayed = recv_msg(&pgw);
@@ -3746,6 +3759,10 @@ mod tests {
                 "addressed to the PDN connection's PGW S5/S8-C TEID"
             );
             let s5c_seq = relayed.header.sequence_number;
+            assert!(
+                nextgcore_gtp::v2::is_command_sequence(s5c_seq),
+                "#727: the S5-C Command's number has the MSB set (TS 29.274 §7.6): {s5c_seq:#x}"
+            );
             // The MME retransmits before the PGW answers: not relayed again.
             mme.send_to(&cmd.encode(), server.local_addr()).unwrap();
             pgw.set_read_timeout(Some(Duration::from_millis(250)))
@@ -3840,7 +3857,7 @@ mod tests {
             let imsi = format!("00101059100000{n}");
             let (ue_id, s11_teid, s5c_teid) =
                 ue_with_pgw_session(mme.local_addr().unwrap(), imsi.as_bytes());
-            let mme_seq = 0x0005_9100 + n as u32;
+            let mme_seq = 0x0085_9100 + n as u32;
             let mut brc = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
                 Gtp2MessageType::BearerResourceCommand as u8,
                 s11_teid,
@@ -3856,6 +3873,10 @@ mod tests {
             );
             assert_eq!(relayed.header.teid, Some(0x0000_5c5c));
             let s5c_seq = relayed.header.sequence_number;
+            assert!(
+                nextgcore_gtp::v2::is_command_sequence(s5c_seq),
+                "#727: TS 29.274 §7.6 MSB on the S5-C Command: {s5c_seq:#x}"
+            );
 
             // The PGW answers with the triggered message under the S5-C number.
             let mut answer = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(

@@ -437,6 +437,17 @@ impl GtpcServer {
             .unwrap_or(1)
     }
 
+    /// Allocate a GTPv2-C sequence number for a Command: most significant bit set
+    /// (TS 29.274 §7.6, #727), so the SGW's own initial Requests, which have it
+    /// clear, can never close one.
+    pub fn alloc_command_sequence(&self) -> u32 {
+        self.inner
+            .xact
+            .lock()
+            .map(|mut x| x.alloc_command_sequence())
+            .unwrap_or(nextgcore_gtp::v2::GTP2_COMMAND_SEQUENCE_FLAG | 1)
+    }
+
     /// Send an initial (request) message and arm T3/N3 retransmission.
     pub fn send_request(
         &self,
@@ -1263,7 +1274,7 @@ pub fn send_bearer_resource_command(
         .sgw_ue_find_by_id(mme_ue.sgw_ue_id)
         .ok_or(GtpPathError::ContextNotFound)?;
 
-    let seq = sequence()?;
+    let seq = command_sequence()?;
     let msg = s11_build::build_bearer_resource_command(
         &bearer,
         &mme_ue,
@@ -1488,7 +1499,7 @@ pub fn send_delete_bearer_command(
     let sgw_ue = ctx
         .sgw_ue_find_by_id(mme_ue.sgw_ue_id)
         .ok_or(GtpPathError::ContextNotFound)?;
-    let seq = sequence()?;
+    let seq = command_sequence()?;
     let msg = s11_build::build_delete_bearer_command(&mme_ue, &sgw_ue, ebis, seq)
         .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
     send_to_sgwc(ctx, &msg, ctx.next_pool_id() | GTP_CMD_XACT_ID_FLAG)
@@ -1502,6 +1513,15 @@ pub fn send_delete_bearer_command(
 /// correlation impossible.
 fn sequence() -> GtpPathResult<u32> {
     server().map(|s| s.alloc_sequence()).ok_or_else(|| {
+        GtpPathError::SocketError("no S11 socket bound: cannot allocate a sequence".to_string())
+    })
+}
+
+/// A sequence number for a Command (Bearer Resource / Delete Bearer Command): the
+/// most significant bit is set, TS 29.274 §7.6 (#727). [`sequence`] numbers never
+/// have it.
+fn command_sequence() -> GtpPathResult<u32> {
+    server().map(|s| s.alloc_command_sequence()).ok_or_else(|| {
         GtpPathError::SocketError("no S11 socket bound: cannot allocate a sequence".to_string())
     })
 }
