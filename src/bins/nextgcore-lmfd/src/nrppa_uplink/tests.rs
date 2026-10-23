@@ -273,11 +273,8 @@ fn the_initiation_response_carries_the_results_of_an_on_demand_request() {
     assert_eq!(from_response.1.len(), 1);
     assert_eq!(from_response.1[0].nr_cgi, from_report.1[0].nr_cgi);
     assert_eq!(from_response.1[0].rsrp, from_report.1[0].rsrp);
-    assert_eq!(
-        from_response.1[0].timing_advance,
-        from_report.1[0].timing_advance
-    );
-    assert!(from_response.1[0].timing_advance.is_some());
+    assert_eq!(from_response.1[0].ecid_rtt_ns, from_report.1[0].ecid_rtt_ns);
+    assert!(from_response.1[0].ecid_rtt_ns.is_some());
 }
 
 /// The response's error handling names the procedure it belongs to: an unknown

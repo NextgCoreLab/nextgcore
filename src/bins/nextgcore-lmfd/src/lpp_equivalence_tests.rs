@@ -113,6 +113,11 @@ fn without_new_fields(
         check_eutra(c, what);
         if what != "E-CID" {
             assert_eq!(c.remove("ecid_rtt_ns").as_deref(), Some("None"), "{what}");
+            assert_eq!(
+                c.remove("ecid_rtt_width_ns").as_deref(),
+                Some("None"),
+                "{what}"
+            );
         }
         check_rstd_reference(c, what);
     }
@@ -177,7 +182,7 @@ fn every_report_adapts_as_the_old_adapters_did() {
             codec_glue::lpp_ecid_provide_to_measurements(&g)
         ));
         // #832: the captured raw `timing_advance` (the UE Rx-Tx report value) is
-        // now decoded per TS 36.133 §9.1.9.2 into `ecid_rtt_ns`.
+        // now decoded per TS 36.133 §9.1.9.3 into `ecid_rtt_ns`.
         let mut captured = cells_of(f[1]);
         let mut new = without_new_fields(ecid, "E-CID");
         for (n_cell, c_cell) in new.iter_mut().zip(captured.iter_mut()) {
@@ -187,13 +192,20 @@ fn every_report_adapts_as_the_old_adapters_did() {
                 v => crate::positioning::eutra_time_report_to_ns(
                     some_f64(v) as u32,
                     crate::positioning::EUTRA_UE_RX_TX_MAX,
-                )
-                .map(|(mid, _)| mid),
+                ),
             };
             assert_eq!(n_cell.remove("timing_advance").as_deref(), Some("None"));
             assert_eq!(
                 n_cell.remove("ecid_rtt_ns").expect("ecid_rtt_ns"),
-                format!("{want:?}"),
+                format!("{:?}", want.map(|(mid, _)| mid)),
+                "E-CID {} (the captured cells are FDD: no N_TA,offset)",
+                f[0]
+            );
+            assert_eq!(
+                n_cell
+                    .remove("ecid_rtt_width_ns")
+                    .expect("ecid_rtt_width_ns"),
+                format!("{:?}", want.map(|(_, width)| width)),
                 "E-CID {}",
                 f[0]
             );
@@ -232,6 +244,7 @@ fn every_report_adapts_as_the_old_adapters_did() {
             check_dl_prs_id(&mut new, "Multi-RTT");
             check_eutra(&mut new, "Multi-RTT");
             assert_eq!(new.remove("ecid_rtt_ns").as_deref(), Some("None"));
+            assert_eq!(new.remove("ecid_rtt_width_ns").as_deref(), Some("None"));
             check_rstd_reference(&mut new, "Multi-RTT");
             let mut old = old;
             old.remove("rtt_ns");

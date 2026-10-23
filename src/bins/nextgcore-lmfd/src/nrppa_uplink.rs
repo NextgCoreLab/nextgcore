@@ -189,15 +189,15 @@ pub fn decode_ecid_report(bytes: &[u8]) -> Result<EcidReportOutcome, String> {
 /// The same `CellMeasurement` the pre-#515 adapter produced from a decoded result.
 /// An E-UTRA TADV report value as a round trip in ns (bin midpoint), or `None`
 /// for the open-ended last value (TS 36.133 §10.3.1, #832).
-fn tadv_ns(v: u16) -> Option<f64> {
+fn tadv_ns(v: u16) -> Option<(f64, f64)> {
     crate::positioning::eutra_time_report_to_ns(u32::from(v), crate::positioning::EUTRA_TADV_MAX)
-        .map(|(mid, _)| mid)
 }
 
 fn to_cell(result: &nrppa::E_CID_MeasurementResult) -> CellMeasurement {
     let mut rsrp: Option<i16> = None;
     let mut rsrq: Option<i16> = None;
-    let mut ecid_rtt_ns: Option<f64> = None;
+    let mut tadv1: Option<(f64, f64)> = None;
+    let mut tadv2: Option<(f64, f64)> = None;
     let mut aoa: Option<f64> = None;
     if let Some(measured) = &result.measured_results {
         for value in &measured.0 {
@@ -210,10 +210,10 @@ fn to_cell(result: &nrppa::E_CID_MeasurementResult) -> CellMeasurement {
                 // Type 2 (eNB Rx–Tx with the UE's TA applied) are both the round
                 // trip, in T_s bins (#832). The open-ended last value is dropped.
                 M::ValueTimingAdvanceType1_EUTRA(ta) => {
-                    ecid_rtt_ns = ecid_rtt_ns.or_else(|| tadv_ns(ta.0));
+                    tadv1 = tadv1.or_else(|| tadv_ns(ta.0));
                 }
                 M::ValueTimingAdvanceType2_EUTRA(ta) => {
-                    ecid_rtt_ns = ecid_rtt_ns.or_else(|| tadv_ns(ta.0));
+                    tadv2 = tadv2.or_else(|| tadv_ns(ta.0));
                 }
                 M::ResultRSRP_EUTRA(items) => {
                     // value_rsrp_eutra 0..97 -> -140..-43 dBm; the strongest item wins.
@@ -235,6 +235,10 @@ fn to_cell(result: &nrppa::E_CID_MeasurementResult) -> CellMeasurement {
             }
         }
     }
+    // #865 review: Type 1 (eNB Rx–Tx + UE Rx–Tx, both measured) is the more
+    // accurate (TS 36.305 §8.3), so it is used whenever it is present, whatever
+    // the order of the IEs.
+    let tadv = tadv1.or(tadv2);
     CellMeasurement {
         nr_cgi: cgi_to_string(&result.serving_cell_id),
         rsrp,
@@ -245,7 +249,8 @@ fn to_cell(result: &nrppa::E_CID_MeasurementResult) -> CellMeasurement {
         rstd_ns: None,
         ue_rx_tx_ns: None,
         rstd_reference: None,
-        ecid_rtt_ns,
+        ecid_rtt_ns: tadv.map(|(mid, _)| mid),
+        ecid_rtt_width_ns: tadv.map(|(_, width)| width),
         gnb_rx_tx_ns: None,
         dl_prs_id: None,
         eutra: matches!(

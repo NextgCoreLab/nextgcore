@@ -546,7 +546,7 @@ pub fn solve_ecid(
 pub const TS_NS: f64 = 1e9 / (15_000.0 * 2_048.0);
 
 /// The E-UTRA time-report mapping shared by TADV (TS 36.133 §10.3.1, range
-/// 0..7690) and the UE Rx–Tx time difference (TS 36.133 §9.1.9.2, range
+/// 0..7690) and the UE Rx–Tx time difference (TS 36.133 §9.1.9.3, range
 /// 0..4095): steps of 2 T_s up to 4096 T_s, then steps of 8 T_s. The last report
 /// value, `max`, is the open-ended bin `T ≥ 4096 + 8·(max − 2048)` T_s and gives
 /// `None`. Otherwise returns (bin midpoint, bin width), both in ns (#832).
@@ -564,7 +564,7 @@ pub fn eutra_time_report_to_ns(v: u32, max: u32) -> Option<(f64, f64)> {
 
 /// TS 36.133 §10.3.1: E-UTRA TADV report values 0..7690.
 pub const EUTRA_TADV_MAX: u32 = 7690;
-/// TS 36.133 §9.1.9.2: E-UTRA UE Rx–Tx report values 0..4095.
+/// TS 36.133 §9.1.9.3: E-UTRA UE Rx–Tx report values 0..4095.
 pub const EUTRA_UE_RX_TX_MAX: u32 = 4095;
 
 /// E-CID from a round-trip time (#832): the fix is at the serving cell, and the
