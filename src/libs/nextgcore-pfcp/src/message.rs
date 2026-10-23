@@ -1364,7 +1364,11 @@ impl SessionReportResponse {
 pub struct NodeReportRequest {
     pub node_id: NodeId,
     pub node_report_type: NodeReportType,
+    /// User Plane Path Failure Report (IE 102), with UPFR.
     pub user_plane_path_failure_report: Option<UserPlanePathFailureReport>,
+    /// User Plane Path Recovery Report (IE 187, Table 7.4.5.1.3-1), with UPRR (#957).
+    /// Same body as the failure report: the Remote GTP-U Peers it names.
+    pub user_plane_path_recovery_report: Option<UserPlanePathFailureReport>,
 }
 
 impl NodeReportRequest {
@@ -1389,12 +1393,23 @@ impl NodeReportRequest {
             .encode(buf);
             buf.put_slice(&report_buf);
         }
+        if let Some(report) = &self.user_plane_path_recovery_report {
+            let mut report_buf = BytesMut::new();
+            report.encode(&mut report_buf);
+            IeHeader::new(
+                IeType::UserPlanePathRecoveryReport as u16,
+                report_buf.len() as u16,
+            )
+            .encode(buf);
+            buf.put_slice(&report_buf);
+        }
     }
 
     pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
         let mut node_id = None;
         let mut node_report_type = None;
         let mut user_plane_path_failure_report = None;
+        let mut user_plane_path_recovery_report = None;
 
         while buf.remaining() >= IeHeader::LEN {
             let ie = RawIe::decode(buf)?;
@@ -1410,6 +1425,10 @@ impl NodeReportRequest {
                     user_plane_path_failure_report =
                         Some(UserPlanePathFailureReport::decode(&ie.data)?);
                 }
+                t if t == IeType::UserPlanePathRecoveryReport as u16 => {
+                    user_plane_path_recovery_report =
+                        Some(UserPlanePathFailureReport::decode(&ie.data)?);
+                }
                 _ => {}
             }
         }
@@ -1419,6 +1438,7 @@ impl NodeReportRequest {
             node_report_type: node_report_type
                 .ok_or_else(|| PfcpError::MissingMandatoryIe("Node Report Type".to_string()))?,
             user_plane_path_failure_report,
+            user_plane_path_recovery_report,
         })
     }
 }
@@ -2306,7 +2326,7 @@ mod tests {
                     ipv4: Some([10, 45, 0, 7]),
                     ipv6: None,
                 }],
-            }),
+            }),            user_plane_path_recovery_report: None,
         };
         let mut buf = BytesMut::new();
         msg.encode(&mut buf);
