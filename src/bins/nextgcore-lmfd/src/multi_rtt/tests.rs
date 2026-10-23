@@ -189,16 +189,23 @@ impl NrppaTransport for FakeNgRan {
 
 /// The UE's LPP halves: UE Rx-Tx_i = (t_i + offset) - gap, as k0 codes.
 fn ue_halves() -> Vec<CellMeasurement> {
-    let cells: Vec<(u16, u32)> = TRPS
+    ue_halves_of(&TRPS)
+}
+
+/// The UE's LPP halves for `trps`, each with its own DL-PRS ID (its TRP id).
+fn ue_halves_of(trps: &[(u16, u16, f64, f64)]) -> Vec<CellMeasurement> {
+    let cells: Vec<(u8, u16, u32)> = trps
         .iter()
-        .map(|(_, pci, e, n)| {
+        .map(|(id, pci, e, n)| {
             let t = propagation_ns(*e, *n) + UE_CLOCK_OFFSET_NS - SRS_AFTER_PRS_NS;
-            (*pci, (t / TC_NS + 985_024.0).round() as u32)
+            (*id as u8, *pci, (t / TC_NS + 985_024.0).round() as u32)
         })
         .collect();
-    crate::codec_glue::decode_lpp_provide_report(&crate::lpp_fixtures::multi_rtt_lpp(&cells, 7))
-        .expect("decodes")
-        .1
+    crate::codec_glue::decode_lpp_provide_report(&crate::lpp_fixtures::multi_rtt_lpp_with_prs(
+        &cells, 7,
+    ))
+    .expect("decodes")
+    .1
 }
 
 fn setup() {
@@ -415,11 +422,11 @@ async fn no_srs_configuration_means_no_gnb_half() {
 
 /// The UE's answer to the Multi-RTT + DL-TDOA request: both sets.
 fn ue_halves_and_rstds() -> Vec<CellMeasurement> {
-    let cells: Vec<(u16, u32)> = TRPS
+    let cells: Vec<(u8, u16, u32)> = TRPS
         .iter()
-        .map(|(_, pci, e, n)| {
+        .map(|(id, pci, e, n)| {
             let t = propagation_ns(*e, *n) + UE_CLOCK_OFFSET_NS - SRS_AFTER_PRS_NS;
-            (*pci, (t / TC_NS + 985_024.0).round() as u32)
+            (*id as u8, *pci, (t / TC_NS + 985_024.0).round() as u32)
         })
         .collect();
     // RSTDs relative to TRP 1 (DL-PRS 0), neighbours by DL-PRS and PCI.
@@ -520,9 +527,12 @@ async fn a_pci_on_two_trps_is_not_ranged() {
     );
     let (request_id, _corr, _rx) = register();
     let ctx = lmf_self();
-    ctx.read()
-        .unwrap()
-        .measurement_leg_report(request_id, MeasurementLeg::Lpp, ue_halves());
+    ctx.read().unwrap().measurement_leg_report(
+        request_id,
+        MeasurementLeg::Lpp,
+        // The UE measures TRP 5 too, under the same PCI 201 (its own DL-PRS ID).
+        ue_halves_of(&[TRPS[0], TRPS[1], TRPS[2], TRPS[3], (5, 201, 2000.0, 300.0)]),
+    );
     let cells = collect(&ran, prepared, Duration::from_secs(1)).await;
     assert_eq!(cells.len(), 3);
     let LegProgress::Completed(Some(fix)) =
@@ -532,10 +542,13 @@ async fn a_pci_on_two_trps_is_not_ranged() {
     else {
         panic!("three unambiguous TRPs solve");
     };
-    // Three TRPs remain, which the Multi-RTT solver ranges (its 3-D solve is not
-    // pinned by three ranges, so the position itself is not asserted here; the
-    // four-TRP test does that).
     assert_eq!(fix.method_used.as_deref(), Some("MULTI-RTT"));
+    let got = geodetic_to_enu(TrpCoord::new(fix.latitude, fix.longitude, 0.0), origin());
+    let err = (got.e - UE.0).hypot(got.n - UE.1);
+    assert!(
+        err < 1.0,
+        "the true position from the three unambiguous TRPs: {err:.2} m off"
+    );
 }
 
 /// #903 review MINOR 1: a node that does not answer TRP Information is not asked

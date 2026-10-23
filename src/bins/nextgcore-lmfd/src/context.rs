@@ -1877,14 +1877,39 @@ fn multi_rtt_observations(
         ue: Vec<(f64, Stamp)>,
         gnb: Vec<(f64, Stamp)>,
     }
-    let mut by_prs: HashMap<u8, String> = HashMap::new();
+    // A DL-PRS ID seen with one resolvable key tells which TRP a half reported
+    // only by that DL-PRS ID is. A DL-PRS ID seen with two keys names no single
+    // TRP (#903 re-review) and aliases nothing.
+    let mut keys_of_prs: HashMap<u8, Vec<String>> = HashMap::new();
     for m in measurements {
         if let (Some(prs), Some(key)) = (m.dl_prs_id, resolve_trp(m, registry)) {
-            by_prs.entry(prs).or_insert(key);
+            let keys = keys_of_prs.entry(prs).or_default();
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
         }
     }
+    let by_prs: HashMap<u8, String> = keys_of_prs
+        .into_iter()
+        .filter_map(|(prs, keys)| match keys.as_slice() {
+            [one] => Some((prs, one.clone())),
+            _ => {
+                log::warn!("Multi-RTT: DL-PRS ID {prs} is seen with {keys:?}; it aliases nothing");
+                None
+            }
+        })
+        .collect();
+    // #903 re-review: only a half the UE named by DL-PRS ID alone is aliased. A
+    // half that carries a PCI whose key the registry lacks is not moved onto
+    // another TRP's key.
     let resolve = |m: &CellMeasurement| {
-        resolve_trp(m, registry).or_else(|| m.dl_prs_id.and_then(|p| by_prs.get(&p).cloned()))
+        resolve_trp(m, registry).or_else(|| {
+            if m.nr_cgi.starts_with("prs-") {
+                m.dl_prs_id.and_then(|p| by_prs.get(&p).cloned())
+            } else {
+                None
+            }
+        })
     };
     // #903 review: a key reached by UE halves of two DL-PRS IDs is two TRPs under
     // one key (a multi-TRP cell, or a reused PCI). Its gNB halves cannot be told
@@ -3973,6 +3998,98 @@ mod tests_multi_rtt_shared_pci {
         assert!(
             multi_rtt_observations(&two, &reg).is_empty(),
             "two TRPs under pci-201: not ranged"
+        );
+    }
+}
+
+/// #903 re-review: which UE halves may be aliased through a DL-PRS ID.
+#[cfg(test)]
+mod tests_multi_rtt_aliasing {
+    use super::*;
+    use crate::nrppa_positioning::SlotTime;
+
+    const T: SlotTime = SlotTime {
+        sfn: 700,
+        slot: 11,
+        slots_per_frame: 20,
+    };
+
+    fn half(key: &str, prs: Option<u8>, ue: Option<f64>, gnb: Option<f64>) -> CellMeasurement {
+        CellMeasurement {
+            nr_cgi: key.into(),
+            rsrp: None,
+            rsrq: None,
+            timing_advance: None,
+            ecid_rtt_ns: None,
+            ecid_rtt_width_ns: None,
+            aoa: None,
+            rtt_ns: None,
+            rstd_ns: None,
+            rstd_reference: None,
+            ue_rx_tx_ns: ue,
+            gnb_rx_tx_ns: gnb,
+            meas_time: Some(T),
+            dl_prs_id: prs,
+            eutra: false,
+        }
+    }
+
+    fn reg() -> TrpRegistry {
+        TrpRegistry::from_entries([
+            ("pci-202".to_string(), TrpCoord::new(51.0, 0.0, 0.0)),
+            ("pci-203".to_string(), TrpCoord::new(51.01, 0.0, 0.0)),
+        ])
+    }
+
+    fn range_of(obs: &[RttObservation], key: &str) -> Option<f64> {
+        obs.iter().find(|o| o.trp_id == key).map(|o| o.range_m)
+    }
+
+    /// A half that carries a PCI the registry lacks (pci-201) is not moved onto
+    /// pci-202 through a shared DL-PRS ID: pci-202 is ranged on its own halves.
+    #[test]
+    fn a_half_with_a_pci_is_never_aliased() {
+        let cells = [
+            half("pci-201", Some(2), Some(9_000.0), None),
+            half("pci-202", Some(2), Some(1_000.0), None),
+            half("pci-202", None, None, Some(1_000.0)),
+        ];
+        let want = rtt_ns_to_range_m(2_000.0);
+        assert_eq!(
+            range_of(&multi_rtt_observations(&cells, &reg()), "pci-202"),
+            Some(want)
+        );
+    }
+
+    /// A DL-PRS ID seen with two keys names no single TRP: a half reported only
+    /// by it is not aliased to either.
+    #[test]
+    fn a_dl_prs_id_seen_with_two_pcis_aliases_nothing() {
+        let cells = [
+            half("prs-3", Some(3), Some(9_000.0), None),
+            half("pci-202", Some(3), Some(1_000.0), None),
+            half("pci-203", Some(3), Some(1_000.0), None),
+            half("pci-202", None, None, Some(1_000.0)),
+        ];
+        let want = rtt_ns_to_range_m(2_000.0);
+        assert_eq!(
+            range_of(&multi_rtt_observations(&cells, &reg()), "pci-202"),
+            Some(want)
+        );
+    }
+
+    /// The legitimate alias still works: a reference-style half named only by
+    /// DL-PRS ID finds its TRP through a half that carries both.
+    #[test]
+    fn a_half_named_only_by_dl_prs_id_is_aliased_once_unambiguous() {
+        let cells = [
+            half("pci-203", Some(4), None, Some(1_000.0)),
+            half("prs-4", Some(4), Some(1_000.0), None),
+        ];
+        let want = rtt_ns_to_range_m(2_000.0);
+        assert_eq!(
+            range_of(&multi_rtt_observations(&cells, &reg()), "pci-203"),
+            Some(want)
         );
     }
 }
