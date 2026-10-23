@@ -556,11 +556,15 @@ async fn main() -> Result<()> {
                     "Sending {} URR reports for SEID={upf_seid:#x}",
                     session_reports.len()
                 );
+                // The usage in these reports was TAKEN from the URRs (#771); a report
+                // that cannot be sent hands it back, so the next report carries it
+                // instead of it being lost (#780 review m2).
                 if let Err(e) = pfcp_for_urr
-                    .send_urr_report(upf_seid, smf_seid, session_reports)
+                    .send_urr_report(upf_seid, smf_seid, session_reports.clone())
                     .await
                 {
                     log::error!("Failed to send URR report: {e}");
+                    dp_for_urr.restore_urr_usage(&session_reports);
                 }
             }
         }

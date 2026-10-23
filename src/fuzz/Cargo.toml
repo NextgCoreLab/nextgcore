@@ -29,6 +29,10 @@ nextgcore-s1ap-gen = { path = "../libs/nextgcore-s1ap-gen" }
 nextgcore-nrppa-gen = { path = "../libs/nextgcore-nrppa-gen" }
 nextgcore-lpp-gen = { path = "../libs/nextgcore-lpp-gen" }
 nextgcore-diameter = { path = "../libs/nextgcore-diameter" }
+# #725: the UCMF's capability transcoding (`fuzz_ucmf_capability`).
+nextgcore-nr-rrc-gen = { path = "../libs/nextgcore-nr-rrc-gen" }
+nextgcore-lte-rrc-gen = { path = "../libs/nextgcore-lte-rrc-gen" }
+log = "0.4"
 
 # Workspace members used for fuzzing
 bytes = "1"
@@ -90,6 +94,13 @@ bench = false
 [[bin]]
 name = "fuzz_lpp_message"
 path = "fuzz_targets/fuzz_lpp_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_ucmf_capability"
+path = "fuzz_targets/fuzz_ucmf_capability.rs"
 test = false
 doc = false
 bench = false
