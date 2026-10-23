@@ -376,15 +376,18 @@ async fn main() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     log::info!("Shutting down...");
+    // Deregister before the listener goes away (TS 29.510 §5.2.2.4), stop
+    // serving, and only then write the final snapshot, so no request served
+    // after it is lost on a clean shutdown (#843 review).
+    nextgcore_sbi::heartbeat::deregister_self().await;
+    let stopped = sbi_server
+        .stop()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {e}"));
     if let Some(ucmf) = UCMF.get() {
         flush_state(ucmf).await;
     }
-    // Deregister before the listener goes away (TS 29.510 §5.2.2.4).
-    nextgcore_sbi::heartbeat::deregister_self().await;
-    sbi_server
-        .stop()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {e}"))?;
+    stopped?;
     log::info!("UCMF shutdown complete");
     Ok(())
 }
@@ -475,8 +478,11 @@ fn split_uri(uri: &str) -> Option<(String, u16, String)> {
 /// thread, so requests are not held up by the disk.
 async fn flush_state(ucmf: &Arc<RwLock<Ucmf>>) {
     let pending = write_state(ucmf).take_pending_write();
-    if let Some((persister, generation, doc)) = pending {
-        let _ = tokio::task::spawn_blocking(move || persister.write(generation, &doc)).await;
+    if let Some((persister, generation, source)) = pending {
+        // Serialised and written off the state lock (#843 review). A failed write
+        // is logged by the persister; the next reservation retries it.
+        let _ = tokio::task::spawn_blocking(move || persister.write(generation, &source.to_json()))
+            .await;
     }
 }
 
@@ -893,6 +899,16 @@ fn assign(
             ),
             Vec::new(),
         ),
+        // #843 review: no ID is handed out that the state file does not cover.
+        Err(AssignError::StateNotPersisted) => (
+            send_error(
+                500,
+                "Internal Server Error",
+                "The UCMF state could not be written, so no ID can be assigned safely",
+                Some("SYSTEM_FAILURE"),
+            ),
+            Vec::new(),
+        ),
     }
 }
 
@@ -930,20 +946,22 @@ fn subscribe(u: &mut Ucmf, request: &SbiRequest, now: DateTime<Utc>) -> SbiRespo
         Ok(sub) => sub,
         // TS 29.500 Table 5.2.7.2-1: INSUFFICIENT_RESOURCES is a 500 (#786).
         Err(e) => {
-            let detail = match e {
-                context::SubscribeError::TooManySubscriptions => {
-                    "The UCMF holds its maximum number of subscriptions"
-                }
-                context::SubscribeError::TooManyForConsumer => {
-                    "This consumer holds its maximum number of subscriptions"
-                }
+            let (detail, cause) = match e {
+                context::SubscribeError::TooManySubscriptions => (
+                    "The UCMF holds its maximum number of subscriptions",
+                    "INSUFFICIENT_RESOURCES",
+                ),
+                context::SubscribeError::TooManyForConsumer => (
+                    "This consumer holds its maximum number of subscriptions",
+                    "INSUFFICIENT_RESOURCES",
+                ),
+                context::SubscribeError::StateNotPersisted => (
+                    "The UCMF state could not be written, so no subscription ID can be \
+                     assigned safely",
+                    "SYSTEM_FAILURE",
+                ),
             };
-            return send_error(
-                500,
-                "Internal Server Error",
-                detail,
-                Some("INSUFFICIENT_RESOURCES"),
-            );
+            return send_error(500, "Internal Server Error", detail, Some(cause));
         }
     };
     let mut body = json!({ "dicEntryId": u.highest_entry_id() });
