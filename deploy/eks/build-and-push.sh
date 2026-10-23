@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# Build the NextG workload images (12 for PROFILE=5g) and push them to ECR.
+# Build the NextG workload images (12 for PROFILE=5g, 9 for epc) and push them to ECR.
 #
 # Replaces the `kind load docker-image` step in nextgcore/k8s/deploy.sh, which
 # has no equivalent on EKS - without a registry every pod lands in
 # ErrImagePull.
 #
-# Uses the prebuilt binaries committed in the repo:
-#   nextgcore/binaries/nextgcore-*d       (17 NF binaries, 10 used here)
-#   nextgsim/docker/binaries/nr-gnb,nr-ue
+# Packages prebuilt binaries. They are NOT committed (both binaries/ dirs are
+# gitignored); build them first (README "Prerequisites"):
+#   nextgcore/binaries/nextgcore-*         (the workspace builds 28 NF daemons
+#                                          plus webui; 5g packages 10, epc 7)
+#   nextgsim/docker/binaries/nr-gnb,nr-ue  (5g)
+#   nextgsim/binaries/lte-enb,lte-ue       (epc)
 #
 # Images are tagged by the git SHA of the repository they are built from, not
 # :latest. See lib/image-tag.sh for why a mutable tag makes the deploy a silent
