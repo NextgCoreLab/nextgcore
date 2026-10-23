@@ -241,28 +241,34 @@ pub async fn serve_metrics(
     addr: SocketAddr,
     render: Arc<dyn Fn() -> String + Send + Sync>,
 ) -> std::io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
-    serve_metrics_with(addr, render, METRICS_IO_TIMEOUT).await
+    serve_metrics_with(addr, render, METRICS_IO_TIMEOUT, MAX_METRICS_CONNECTIONS).await
 }
 
-/// How long one metrics connection may take to send its request and to
-/// receive the response (#837). An idle or slow client is dropped after this
-/// rather than holding a task open.
+/// How long a metrics client has to send its request (#837). Short, so an idle
+/// client gives its slot back quickly: a scraper sends the request at once.
+pub const METRICS_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long one metrics connection may take to receive the response (#837).
 pub const METRICS_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Connections served at once; further ones are closed immediately (#837), so
 /// a burst of idle clients cannot pile up tasks and sockets.
 pub const MAX_METRICS_CONNECTIONS: usize = 64;
 
-/// [`serve_metrics`] with the per-connection I/O timeout passed in.
+/// [`serve_metrics`] with the response timeout and the connection cap passed
+/// in. The request must still arrive within the smaller of `io_timeout` and
+/// [`METRICS_REQUEST_TIMEOUT`].
 pub async fn serve_metrics_with(
     addr: SocketAddr,
     render: Arc<dyn Fn() -> String + Send + Sync>,
     io_timeout: std::time::Duration,
+    max_connections: usize,
 ) -> std::io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let listener = TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
     log::info!("metrics endpoint listening on http://{bound}/metrics");
-    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_METRICS_CONNECTIONS));
+    let slots = Arc::new(tokio::sync::Semaphore::new(max_connections));
+    let request_timeout = io_timeout.min(METRICS_REQUEST_TIMEOUT);
 
     let handle = tokio::spawn(async move {
         loop {
@@ -278,7 +284,7 @@ pub async fn serve_metrics_with(
             tokio::spawn(async move {
                 let _slot = slot;
                 let mut buf = vec![0u8; 4096];
-                let n = match tokio::time::timeout(io_timeout, stream.read(&mut buf)).await {
+                let n = match tokio::time::timeout(request_timeout, stream.read(&mut buf)).await {
                     Ok(Ok(n)) => n,
                     // Read error, or no request within the timeout: drop it.
                     _ => return,
@@ -320,6 +326,53 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn connections_over_the_cap_are_closed_and_a_freed_slot_serves_again() {
+        // #837 review: the cap is the DoS guard against a burst of idle clients.
+        const CAP: usize = 4;
+        let (bound, handle) = serve_metrics_with(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(|| "x 1\n".to_string()),
+            std::time::Duration::from_secs(30),
+            CAP,
+        )
+        .await
+        .unwrap();
+        // CAP idle clients take every slot (their 1 s request timeout has not
+        // run out yet when the next one arrives).
+        let mut idle = Vec::new();
+        for _ in 0..CAP {
+            idle.push(tokio::net::TcpStream::connect(bound).await.unwrap());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut over = tokio::net::TcpStream::connect(bound).await.unwrap();
+        let _ = over.write_all(b"GET /metrics HTTP/1.0\r\n\r\n").await;
+        let mut sink = Vec::new();
+        let closed = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            over.read_to_end(&mut sink),
+        )
+        .await;
+        assert!(
+            closed.is_ok(),
+            "a connection over the cap is closed at once"
+        );
+        assert!(sink.is_empty(), "and is answered nothing: {sink:?}");
+
+        // Free one slot; a real request is answered again.
+        drop(idle.pop());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut client = tokio::net::TcpStream::connect(bound).await.unwrap();
+        client
+            .write_all(b"GET /metrics HTTP/1.0\r\n\r\n")
+            .await
+            .unwrap();
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.unwrap();
+        assert!(reply.starts_with("HTTP/1.1 200 OK"), "{reply}");
+        handle.abort();
+    }
+
+    #[tokio::test]
     async fn an_idle_metrics_client_is_dropped_after_the_io_timeout() {
         // #837: a client that connects and sends nothing used to hold its task
         // forever. With the timeout the server closes it.
@@ -327,6 +380,7 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             Arc::new(|| "x 1\n".to_string()),
             std::time::Duration::from_millis(200),
+            MAX_METRICS_CONNECTIONS,
         )
         .await
         .unwrap();

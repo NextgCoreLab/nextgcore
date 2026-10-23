@@ -65,8 +65,16 @@ spec:
           env:
             - name: GF_SECURITY_ADMIN_USER
               value: admin
+            # No credential in the manifest (#837 review). Create the Secret
+            # with `kubectl -n nextg-system create secret generic grafana-admin
+            # --from-literal=password=...`; without it Grafana starts with
+            # admin/admin and forces a new password at the first login.
             - name: GF_SECURITY_ADMIN_PASSWORD
-              value: nextgcore
+              valueFrom:
+                secretKeyRef:
+                  name: grafana-admin
+                  key: password
+                  optional: true
           resources:
             requests:
               cpu: 50m

@@ -370,8 +370,9 @@ impl Default for MmeApp {
 }
 
 /// The `/metrics` listen address: `MME_METRICS_ADDR` (`ip:port`), else
-/// `NEXTGCORE_METRICS_BIND` (host) on port 9090, else `127.0.0.1:9090`. Private by default: nothing is published beyond the host
-/// unless an operator chooses an address.
+/// `NEXTGCORE_METRICS_BIND` (host) on port 9090, else `127.0.0.1:9090`.
+/// Private by default: nothing is published beyond the host unless an
+/// operator chooses an address.
 fn metrics_addr() -> std::net::SocketAddr {
     parse_metrics_addr(std::env::var("MME_METRICS_ADDR").ok().as_deref())
 }

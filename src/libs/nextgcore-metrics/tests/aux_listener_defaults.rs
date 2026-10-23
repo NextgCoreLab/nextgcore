@@ -75,7 +75,8 @@ fn every_nf_metrics_listener_uses_the_loopback_default() {
         let mut uses_helper = false;
         for file in &files {
             let code = production_code(file);
-            let serves_here = code.contains("serve_metrics(");
+            let serves_here =
+                code.contains("serve_metrics(") || code.contains("serve_metrics_with(");
             serves |= serves_here;
             uses_helper |= code.contains("metrics_bind_addr(");
             if serves_here || code.contains("metrics_bind_addr(") {
@@ -89,7 +90,14 @@ fn every_nf_metrics_listener_uses_the_loopback_default() {
                     if !near_metrics {
                         continue;
                     }
-                    for bad in ["([0, 0, 0, 0]", "\"0.0.0.0:", "Ipv4Addr::UNSPECIFIED"] {
+                    for bad in [
+                        "([0, 0, 0, 0]",
+                        "\"0.0.0.0:",
+                        "Ipv4Addr::UNSPECIFIED",
+                        "Ipv6Addr::UNSPECIFIED",
+                        "\"[::]:",
+                        "([0u16; 8]",
+                    ] {
                         if line.contains(bad) {
                             problems.push(format!(
                                 "{}: `{bad}` next to metrics code; bind through \

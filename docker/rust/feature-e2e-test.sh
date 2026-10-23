@@ -23,6 +23,12 @@
 # Exit codes: 0 all asserted, 1 one or more assertions failed, 2 stack not up.
 
 set -uo pipefail
+# docker-compose.yml requires GRAFANA_ADMIN_PASSWORD (#837). Taken from the
+# environment or docker/rust/.env; a throwaway value is used when neither sets it
+# (the test does not log in to Grafana).
+if [[ -z "${GRAFANA_ADMIN_PASSWORD:-}" ]] && ! grep -qs '^GRAFANA_ADMIN_PASSWORD=' "$(dirname "${BASH_SOURCE[0]}")/.env"; then
+  export GRAFANA_ADMIN_PASSWORD="unused-$RANDOM$RANDOM"
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 COMPOSE=(docker compose -f "$SCRIPT_DIR/docker-compose.yml" -f "$SCRIPT_DIR/docker-compose.features.yml")

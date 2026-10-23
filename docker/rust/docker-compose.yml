@@ -612,7 +612,10 @@ services:
     <<: *common
     environment:
       GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: nextgcore
+      # No credential in this file (#837 review). Set GRAFANA_ADMIN_PASSWORD in
+      # docker/rust/.env (gitignored) or the shell; compose refuses to start
+      # without it rather than ship a default.
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in docker/rust/.env}"
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/overview.json
     volumes:

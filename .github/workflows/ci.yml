@@ -371,6 +371,10 @@ jobs:
     name: Docker E2E
     runs-on: ubuntu-latest
     needs: docker-build
+    env:
+      # docker-compose.yml fails fast without it (#837): no Grafana credential
+      # is committed. A per-run throwaway value; Grafana is not started here.
+      GRAFANA_ADMIN_PASSWORD: ci-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Checkout nextgcore
         uses: actions/checkout@v4
