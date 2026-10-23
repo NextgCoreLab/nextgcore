@@ -15,6 +15,7 @@ pub mod esm_build;
 pub mod esm_handler;
 pub mod fd_path;
 pub mod gtp_path;
+pub mod handover_switch;
 pub mod n26_build;
 pub mod n26_path;
 pub mod nas_dispatch;

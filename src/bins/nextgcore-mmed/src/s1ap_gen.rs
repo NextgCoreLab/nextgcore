@@ -3228,6 +3228,18 @@ pub fn build_path_switch_request_acknowledge(
     msg: &nextgcore_s1ap::PathSwitchRequestAcknowledge,
     notify: &[DiagnosedIe],
 ) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
+    build_path_switch_request_acknowledge_releasing(msg, &[], notify)
+}
+
+/// [`build_path_switch_request_acknowledge`] with an E-RAB To Be Released List
+/// (TS 36.413 §9.1.5.9, criticality ignore) naming `released`, when non-empty:
+/// E-RABs the core did not switch, which the eNB then considers released
+/// (§8.4.4.2, #730).
+pub fn build_path_switch_request_acknowledge_releasing(
+    msg: &nextgcore_s1ap::PathSwitchRequestAcknowledge,
+    released: &[nextgcore_s1ap::ErabItem],
+    notify: &[DiagnosedIe],
+) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
     use g::PathSwitchRequestAcknowledgeProtocolIEs_EntryValue as V;
     let ie =
         |id: u16, criticality: u8, value: V| g::PathSwitchRequestAcknowledgeProtocolIEs_Entry {
@@ -3270,6 +3282,13 @@ pub fn build_path_switch_request_acknowledge(
                     })
                     .collect(),
             )),
+        ));
+    }
+    if !released.is_empty() {
+        ies.push(ie(
+            ID_ERAB_TO_BE_RELEASED_LIST,
+            IGNORE,
+            V::Id_E_RABToBeReleasedList(erab_list(released)),
         ));
     }
     ies.push(ie(
