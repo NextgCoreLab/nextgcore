@@ -284,6 +284,10 @@ services:
   smf:
     image: nextgcore-rust/smf:latest
     container_name: nextgcore-smf
+    # #718/#809: a graceful shutdown tells the UEs (#39, at most 20 s) and the SGWs
+    # (Delete Bearer, retransmitted up to 12 s), and releases the UPF association
+    # (up to 12 s). Docker's default 10 s cut that off with SIGKILL.
+    stop_grace_period: 45s
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env

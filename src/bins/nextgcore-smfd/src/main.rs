@@ -5752,7 +5752,7 @@ async fn send_n1_n2_paging_request(amf_uri: &str, supi: &str, psi: u8, qfi: Opti
 /// Stopped only by aborting the handle. #718 review N1: it used to break as soon
 /// as SHUTDOWN was set, which the signal handler does first, so the shutdown's own
 /// PFCP requests (each pool member's Association Release, every EPC Session
-/// Deletion) got no responses and waited out T1 x N1 each, serially, until the
+/// Deletion) got no responses and waited out T1 x (N1+1) = 12 s each, serially, until the
 /// orchestrator's SIGKILL. [`graceful_shutdown`] aborts it after its last request.
 fn spawn_pfcp_listener(
     socket: Arc<tokio::net::UdpSocket>,
@@ -5811,7 +5811,10 @@ async fn graceful_shutdown(
                 if !client.is_associated().await {
                     return;
                 }
-                match client.release_association().await {
+                match client
+                    .release_association_within(Some(SHUTDOWN_RELEASE_BUDGET))
+                    .await
+                {
                     Ok(()) => log::info!("PFCP association with {} released", client.peer()),
                     Err(e) => {
                         log::warn!("PFCP Association Release to {} failed: {e}", client.peer())
@@ -5948,6 +5951,12 @@ async fn shutdown_epc_pdn_connections_via(
     }
     (deleted, told)
 }
+
+/// How long a shutdown spends releasing sessions through their UEs (#39) before it
+/// sends each Association Release regardless (#809 follow-up). With the Association
+/// Release (up to T1 x (N1+1) = 12 s) and the S5/S8 drain (12 s) this keeps the
+/// sequence inside the shipped 45 s grace period.
+const SHUTDOWN_RELEASE_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// How long a shutdown keeps retransmitting its own S5/S8 requests (#718 review
 /// m2): T3-RESPONSE x (N3-REQUESTS + 1) with the defaults, 3 s x 4. The SGW gets
@@ -7563,7 +7572,7 @@ mod tests {
     /// sessions through the REAL N4 listener, which is still running: both Session
     /// Deletions are answered on the first transmission, concurrently, well inside
     /// one T1. Before, the listener stopped at SIGTERM, so each deletion waited out
-    /// T1 x N1 (about 9 s), serially, and the SGW was told only after all of them.
+    /// T1 x (N1+1) (12 s), serially, and the SGW was told only after all of them.
     #[tokio::test]
     async fn the_shutdown_deletes_epc_sessions_through_the_live_listener_without_retransmitting() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;

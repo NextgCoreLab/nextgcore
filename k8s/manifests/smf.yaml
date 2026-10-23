@@ -49,7 +49,7 @@ spec:
         app.kubernetes.io/part-of: nextgcore
     spec:
       # #718: a graceful SMF shutdown releases each UPF association (up to
-      # T1 x N1 = 9 s when a UPF is gone), sends every UE #39 and keeps
+      # T1 x (N1+1) = 12 s when a UPF is gone), sends every UE #39 and keeps
       # retransmitting its S5/S8 Delete Bearer Requests for up to 12 s.
       terminationGracePeriodSeconds: 45
       initContainers:
