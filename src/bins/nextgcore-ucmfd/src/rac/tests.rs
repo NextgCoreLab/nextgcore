@@ -4,6 +4,9 @@
 
 use super::*;
 
+/// #726: X.691 golden bytes, derived without the generated codecs.
+mod golden;
+
 /// A minimal valid `UE-NR-Capability` supporting `bands`.
 pub(crate) fn ue_nr_capability(bands: &[u16]) -> Vec<u8> {
     use n::*;
