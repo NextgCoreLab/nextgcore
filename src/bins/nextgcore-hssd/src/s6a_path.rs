@@ -420,7 +420,20 @@ pub struct PendingRequest {
     /// True while the peer is disconnected: the request waits for reconnection
     /// rather than counting down its retries against a socket that does not exist.
     pub awaiting_peer: bool,
+    /// When the request was first recorded: bounds its total lifetime
+    /// ([`HSS_INITIATED_MAX_AGE`]) once "busy" answers no longer spend attempts.
+    pub created: std::time::Instant,
+    /// DIAMETER_TOO_BUSY / UNABLE_TO_DELIVER answers received (#899 review).
+    pub busy_answers: u32,
 }
+
+/// The longest an HSS-initiated request is kept, whatever its answers (#899
+/// review). A 3004/3002 answer (an MME whose re-established connection is still
+/// in RFC 3539 REOPEN) does not spend one of the [`HSS_INITIATED_MAX_ATTEMPTS`],
+/// so this is what bounds a peer that is busy forever. Five minutes covers
+/// several REOPEN periods of the MME's default Tw (30 s), including a lost
+/// watchdog answer, with room to spare.
+pub const HSS_INITIATED_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(300);
 
 type PendingTable = HashMap<String, PendingRequest>;
 
@@ -471,6 +484,8 @@ fn send_tracked(dest_host: &str, msg: DiameterMessage) -> Result<(), String> {
                 attempts: if awaiting_peer { 0 } else { 1 },
                 last_sent: std::time::Instant::now(),
                 awaiting_peer,
+                created: std::time::Instant::now(),
+                busy_answers: 0,
             },
         );
     }
@@ -569,14 +584,19 @@ pub fn sweep_pending_requests() -> (usize, usize) {
         pending
             .values()
             .map(|req| {
-                let action = decide_pending_action(
-                    req.attempts,
-                    now.saturating_duration_since(req.last_sent),
-                    peer_connected(&req.dest_host),
-                    req.awaiting_peer,
-                    period,
-                    HSS_INITIATED_MAX_ATTEMPTS,
-                );
+                let action = if now.saturating_duration_since(req.created) >= HSS_INITIATED_MAX_AGE
+                {
+                    PendingAction::Abandon
+                } else {
+                    decide_pending_action(
+                        req.attempts,
+                        now.saturating_duration_since(req.last_sent),
+                        peer_connected(&req.dest_host),
+                        req.awaiting_peer,
+                        period,
+                        HSS_INITIATED_MAX_ATTEMPTS,
+                    )
+                };
                 (req.session_id.clone(), action)
             })
             .collect()
@@ -624,6 +644,19 @@ pub fn sweep_pending_requests() -> (usize, usize) {
             PendingAction::Abandon => {
                 if let Some(req) = complete_pending(&session_id) {
                     abandoned += 1;
+                    if req.busy_answers > 0 {
+                        log::error!(
+                            "S6a request (cmd={}) to {} abandoned after {} DIAMETER_TOO_BUSY / \
+                             UNABLE_TO_DELIVER answer(s) over {:?}: the MME's connection never \
+                             left RFC 3539 REOPEN for it. MME subscriber state may now diverge \
+                             from the HSS",
+                            req.command_code,
+                            req.dest_host,
+                            req.busy_answers,
+                            req.created.elapsed()
+                        );
+                        continue;
+                    }
                     log::error!(
                         "S6a request (cmd={}) to {} abandoned after {} attempts with no answer: \
                          MME subscriber state may now diverge from the HSS",
@@ -1426,6 +1459,17 @@ pub fn handle_s6a_answer(answer: &DiameterMessage) {
              retransmitted in {HSS_INITIATED_RETRANSMIT_SECS} s",
             answer.header.command_code
         );
+        // Not an attempt spent: the request was not served. It is retransmitted
+        // at the next period, and HSS_INITIATED_MAX_AGE bounds a peer that stays
+        // busy.
+        if let Some(sid) = message_session_id(answer) {
+            if let Ok(mut pending) = pending_requests().write() {
+                if let Some(req) = pending.get_mut(&sid) {
+                    req.attempts = req.attempts.saturating_sub(1);
+                    req.busy_answers += 1;
+                }
+            }
+        }
         return;
     }
     let correlated = message_session_id(answer).and_then(|sid| complete_pending(&sid));
@@ -3212,6 +3256,24 @@ mod tests {
                 1,
                 "{code}: kept for retransmission"
             );
+            let req = pending_requests()
+                .read()
+                .unwrap()
+                .values()
+                .next()
+                .cloned()
+                .unwrap();
+            assert_eq!(
+                req.attempts, 0,
+                "{code}: not an attempt spent (#899 review)"
+            );
+            assert_eq!(req.busy_answers, 1);
+            // Past the age cap, the sweep abandons it whatever its attempts.
+            if let Some(r) = pending_requests().write().unwrap().values_mut().next() {
+                r.created = std::time::Instant::now() - HSS_INITIATED_MAX_AGE;
+            }
+            let (_, abandoned) = sweep_pending_requests();
+            assert_eq!(abandoned, 1, "{code}: bounded by age");
             unregister_mme_peer(host);
         }
         clear_pending_requests();
