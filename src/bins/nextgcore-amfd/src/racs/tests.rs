@@ -440,3 +440,70 @@ fn a_new_version_id_drops_the_retired_entries_it_covers() {
     // dropped entry or skip a live one.
     assert_eq!(with_cache(|c| c.deleted_order.len()), 2);
 }
+
+/// #925 review MINOR 1: the two sources of a negative are bounded separately, so
+/// a flood of 404s on random IDs cannot evict the UCMF's genuine deletions — and
+/// those are what make a UE holding a deleted ID get the deletion indication.
+#[test]
+fn a_flood_of_404s_cannot_evict_a_notified_deletion() {
+    let _g = guard();
+    reset_for_tests();
+    let notified = nth_id(0x05, 1);
+    apply_notification(&serde_json::json!({
+        "eventType": "DELETION_OF_PLMN_ASSIGNED_IDS",
+        "manAssOpRequestlist": { "plmnAssiUeRadioCapId": [to_nucmf(&notified).unwrap()] },
+    }));
+    assert!(is_retired(&notified));
+
+    // Far more manufacturer-assigned 404s than either bound.
+    for n in 0..(UNRESOLVED_CAPACITY_FOR_TESTS + 500) as u32 {
+        let mut id = nth_id(0x05, n);
+        id[0] = 0x02; // manufacturer-assigned
+        note_unresolved_for_tests(&id);
+    }
+
+    assert_eq!(unresolved_len(), UNRESOLVED_CAPACITY_FOR_TESTS);
+    assert!(
+        is_retired(&notified),
+        "the notified deletion survives the flood"
+    );
+    assert_eq!(deleted_len(), 1, "and the retired set holds only it");
+}
+
+/// A manufacturer-assigned ID's 404 is a negative CACHE, not a retirement: the UE
+/// is not told to delete an ID the UCMF may yet be provisioned with
+/// (TS 29.675, TS 23.501 §5.4.4.1a NOTE 3).
+#[test]
+fn a_manufacturer_ids_404_retires_nothing() {
+    let _g = guard();
+    reset_for_tests();
+    let mut man = nth_id(0x05, 7);
+    man[0] = 0x02;
+    note_unresolved_for_tests(&man);
+
+    assert!(
+        is_known_deleted(&man),
+        "it is not asked about again for now"
+    );
+    assert!(!is_retired(&man), "but nothing is told to delete it");
+    assert_eq!(deleted_len(), 0);
+
+    expire_unresolved_for_tests();
+    assert!(!is_known_deleted(&man), "and the negative expires");
+}
+
+/// A cached mapping clears a stale negative (a Resolve that later succeeds).
+#[test]
+fn caching_a_mapping_clears_its_negative() {
+    let _g = guard();
+    reset_for_tests();
+    let mut man = nth_id(0x05, 8);
+    man[0] = 0x02;
+    note_unresolved_for_tests(&man);
+    assert!(is_known_deleted(&man));
+
+    cache_put(&man, &[0x01, 0x02]);
+
+    assert!(!is_known_deleted(&man));
+    assert_eq!(unresolved_len(), 0);
+}

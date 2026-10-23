@@ -274,6 +274,20 @@ impl GnbSession {
 /// faster than any capability enquiry could produce them.
 const MAX_MAPPING_RESOLVES_IN_FLIGHT: usize = 16;
 
+/// A mapping Resolve older than this has its slot released even though its job
+/// never reported, so a job that was aborted or panicked cannot hold a slot for
+/// the life of the process (#925 review MINOR 2). Comfortably past the SBI
+/// client's own request timeout.
+const STALE_MAPPING_RESOLVE: Duration = Duration::from_secs(60);
+
+/// One UE radio capability ID being resolved at the UCMF off the NGAP task.
+#[derive(Debug)]
+pub(crate) struct MappingResolve {
+    /// Every association that asked for this ID and has not been answered.
+    pub(crate) waiting: Vec<u64>,
+    pub(crate) started: Instant,
+}
+
 /// GMM procedure timers with retransmission (TS 24.501 Table 10.2.1)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NasProcTimer {
@@ -790,10 +804,17 @@ pub struct NgapServer {
     /// so the downlink FAR (gNB TEID) was installed on a stale session and
     /// downlink user traffic was silently black-holed.
     sm_context_refs: HashMap<(u64, u8), String>,
-    /// #747: how many UE RADIO CAPABILITY ID MAPPING Resolves are running off
-    /// this task (through `sbi_offload`); capped at
-    /// [`MAX_MAPPING_RESOLVES_IN_FLIGHT`].
-    mapping_resolves_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    /// #747: the UE RADIO CAPABILITY ID MAPPING Resolves running off this task
+    /// (through `sbi_offload`), by the ID being resolved, each with the
+    /// associations waiting for that ID's answer and when the lookup started.
+    /// Capped at [`MAX_MAPPING_RESOLVES_IN_FLIGHT`] IDs.
+    ///
+    /// Keyed by ID rather than counted (#925 review MINOR 2 and 3): many gNBs
+    /// asking for one popular ID start ONE Resolve and all get its answer, and
+    /// the slot is released by the outcome the job always reports, so no counter
+    /// can be left incremented. [`STALE_MAPPING_RESOLVE`] bounds a slot whose
+    /// job never reports at all.
+    pub(crate) mapping_resolves: HashMap<Vec<u8>, MappingResolve>,
     /// The SMF that holds each SM context, as (host, port) (#669). Written beside
     /// `sm_context_refs` at Create; Update/Release go here rather than to
     /// `SMF_SBI_ADDR`, which after an SMF restart may still route to the old pod
@@ -989,7 +1010,7 @@ impl NgapServer {
             server_event_rx,
             ue_auth_state,
             sm_context_refs: HashMap::new(),
-            mapping_resolves_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            mapping_resolves: HashMap::new(),
             sm_context_smfs: HashMap::new(),
             handover_target_assoc: HashMap::new(),
             handover_target_transfers: HashMap::new(),
@@ -6293,24 +6314,41 @@ impl NgapServer {
             }
             return Ok(());
         }
-        // #747: an ID the UCMF already said it has no entry for is not asked again.
+        // #747: an ID the UCMF has already said it has no entry for is not asked
+        // about again — permanently for a PLMN-assigned ID the UCMF deleted,
+        // and for the negative cache's TTL for a manufacturer-assigned one
+        // (#925 review MAJOR 1).
         if crate::racs::is_known_deleted(&id) {
             log::info!(
-                "UE radio capability ID {id:02x?} is deleted at the UCMF; no mapping \
-                 response (TS 38.413 §8.14.3.3: no unsuccessful outcome)"
+                "UE radio capability ID {id:02x?} has no entry at the UCMF; no mapping \
+                 response (TS 38.413 §8.14.3 defines no unsuccessful outcome)"
+            );
+            return Ok(());
+        }
+        // #925 review MINOR 2: release the slot of any lookup that never
+        // reported, so an aborted or panicking job cannot hold one for ever.
+        self.mapping_resolves
+            .retain(|_, r| r.started.elapsed() < STALE_MAPPING_RESOLVE);
+        // #925 review MINOR 3: one Resolve per ID. A second association asking
+        // for an ID already being resolved joins its answer instead of starting
+        // another lookup.
+        if let Some(resolve) = self.mapping_resolves.get_mut(&id) {
+            if !resolve.waiting.contains(&association_id) {
+                resolve.waiting.push(association_id);
+            }
+            log::debug!(
+                "UE radio capability ID {id:02x?} is already being resolved; association \
+                 {association_id} waits for that answer"
             );
             return Ok(());
         }
         // #747: the Resolve runs off this task, which serves every gNB and must not
         // wait on the UCMF (up to the SBI timeout, plus NRF discovery). The number in
         // flight is capped, so a gNB flooding the procedure with random IDs gets the
-        // excess unanswered, which §8.14.3.3 allows: the NG-RAN node then retrieves
-        // the capability from the UE.
-        let in_flight = Arc::clone(&self.mapping_resolves_in_flight);
-        if in_flight.fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-            >= MAX_MAPPING_RESOLVES_IN_FLIGHT
-        {
-            in_flight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        // excess unanswered, which TS 38.413 §8.14.3 allows: with no unsuccessful
+        // outcome defined, the NG-RAN node is left to obtain the capability from the
+        // UE as it would for a UE that presented no ID.
+        if self.mapping_resolves.len() >= MAX_MAPPING_RESOLVES_IN_FLIGHT {
             log::warn!(
                 "UE Radio Capability ID Mapping Request from association {association_id} \
                  not resolved: {MAX_MAPPING_RESOLVES_IN_FLIGHT} UCMF lookups already \
@@ -6318,28 +6356,28 @@ impl NgapServer {
             );
             return Ok(());
         }
+        self.mapping_resolves.insert(
+            id.clone(),
+            MappingResolve {
+                waiting: vec![association_id],
+                started: Instant::now(),
+            },
+        );
+        let lookup_id = id.clone();
+        // The job ALWAYS reports, so the slot is released whether the UCMF
+        // answered, refused or could not be reached.
         self.sbi_offload.spawn(async move {
-            let capability = match crate::racs::ucmf_resolve(&id).await {
+            let capability = match crate::racs::ucmf_resolve(&lookup_id).await {
                 Ok(cap) => cap,
                 Err(e) => {
-                    log::warn!("UE radio capability ID {id:02x?} not resolved: {e}");
+                    log::warn!("UE radio capability ID {lookup_id:02x?} not resolved: {e}");
                     None
                 }
             };
-            in_flight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-            match capability.and_then(|cap| crate::racs::build_mapping_response(&id, &cap)) {
-                Some(pdu) => Some(crate::sbi_offload::SbiOutcome::MappingResponse {
-                    association_id,
-                    pdu,
-                }),
-                None => {
-                    log::warn!(
-                        "UE radio capability ID {id:02x?} maps to no capability; no mapping \
-                         response (TS 38.413 §8.14.3.3: no unsuccessful outcome)"
-                    );
-                    None
-                }
-            }
+            Some(crate::sbi_offload::SbiOutcome::MappingResponse {
+                id: lookup_id,
+                capability,
+            })
         });
         Ok(())
     }
@@ -6347,15 +6385,34 @@ impl NgapServer {
     /// #747: send a UE Radio Capability ID Mapping Response an off-task UCMF
     /// lookup produced. An association that closed meanwhile fails the send,
     /// which is logged: the gNB that asked is gone.
-    async fn send_mapping_response(&mut self, association_id: u64, pdu: &[u8]) {
-        match self.send_to_association(association_id, pdu).await {
-            Ok(()) => log::info!(
-                "UE Radio Capability ID Mapping Response sent to association {association_id}"
-            ),
-            Err(e) => log::warn!(
-                "UE Radio Capability ID Mapping Response for association {association_id} \
-                 not sent: {e}"
-            ),
+    async fn send_mapping_response(&mut self, id: &[u8], capability: Option<Vec<u8>>) {
+        // Releasing the slot here, and not in the job, is what makes the cap
+        // leak-proof (#925 review MINOR 2).
+        let Some(resolve) = self.mapping_resolves.remove(id) else {
+            return;
+        };
+        let Some(pdu) = capability
+            .as_deref()
+            .and_then(|cap| crate::racs::build_mapping_response(id, cap))
+        else {
+            log::warn!(
+                "UE radio capability ID {id:02x?} maps to no capability; no mapping response \
+                 to {} association(s) (TS 38.413 §8.14.3 defines no unsuccessful outcome)",
+                resolve.waiting.len()
+            );
+            return;
+        };
+        for association_id in resolve.waiting {
+            match self.send_to_association(association_id, &pdu).await {
+                Ok(()) => log::info!(
+                    "UE Radio Capability ID Mapping Response sent to association \
+                     {association_id} for ID {id:02x?}"
+                ),
+                Err(e) => log::warn!(
+                    "UE Radio Capability ID Mapping Response for association \
+                     {association_id} not sent: {e}"
+                ),
+            }
         }
     }
 
@@ -7966,10 +8023,9 @@ impl NgapServer {
                         log::warn!("Establishment retry outcome not applied: {e}");
                     }
                 }
-                crate::sbi_offload::SbiOutcome::MappingResponse {
-                    association_id,
-                    pdu,
-                } => self.send_mapping_response(association_id, &pdu).await,
+                crate::sbi_offload::SbiOutcome::MappingResponse { id, capability } => {
+                    self.send_mapping_response(&id, capability).await
+                }
             }
         }
     }
