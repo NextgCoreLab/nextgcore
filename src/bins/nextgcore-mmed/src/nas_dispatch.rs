@@ -343,11 +343,13 @@ fn dispatch_emm(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, pdu: &[u8]) {
         emm_type::TAU_REQUEST => {
             Some(crate::network_detach::CollidingProcedure::TrackingAreaUpdate)
         }
-        // §9.9.3.27: service type, low nibble of the first octet; 8 and above
-        // are the packet-services values (CS fallback is 0-2).
-        emm_type::EXTENDED_SERVICE_REQUEST if body.first().is_some_and(|o| (o & 0x0f) >= 8) => {
-            Some(crate::network_detach::CollidingProcedure::ServiceRequest)
-        }
+        // §9.9.3.27: service type, low nibble of the first octet. 8-11 are
+        // packet services; 0-4 (and the unused 5-7) are CS fallback, which also
+        // must not take over the UE while it is being detached (#828).
+        emm_type::EXTENDED_SERVICE_REQUEST => Some(match body.first() {
+            Some(o) if (o & 0x0f) >= 8 => crate::network_detach::CollidingProcedure::ServiceRequest,
+            _ => crate::network_detach::CollidingProcedure::CsFallbackServiceRequest,
+        }),
         _ => None,
     };
     if let Some(procedure) = colliding {
@@ -2712,6 +2714,59 @@ mod tests {
         assert!(ctx.mme_ue_find_by_id(mme_ue_id).is_none());
     }
 
+    /// #828: a CS fallback EXTENDED SERVICE REQUEST (service type 0) during a
+    /// re-attach-required detach does not take over the UE: the detach is
+    /// progressed (T3422 running, state DetachRequestToUe). Before #828 only
+    /// packet-services ESRs reached the collision hook, so this one overwrote
+    /// the state and the detach was silently dropped.
+    #[test]
+    fn a_cs_fallback_extended_service_request_during_a_detach_is_ignored() {
+        let ctx = test_ctx();
+        let enb_ue_id = enb_with_connection(&ctx);
+        let mme_ue_id = ue_with_vector(&ctx, enb_ue_id);
+        // A NAS security context, so the protected ESR is accepted.
+        nas_eps_handle_uplink(
+            &ctx,
+            uplink(enb_ue_id, &attach_request(&imsi_identity(), &[])),
+        );
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &authentication_response()));
+        assert!(
+            ctx.mme_ue_find_by_id(mme_ue_id)
+                .unwrap()
+                .security_context_available
+        );
+        assert_eq!(
+            crate::network_detach::mme_initiated_detach(
+                &ctx,
+                mme_ue_id,
+                crate::emm_build::DetachTypeToUe::ReAttachRequired,
+                "test"
+            ),
+            crate::network_detach::DetachOutcome::DetachRequestSent
+        );
+        let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        let esr = [
+            NAS_PROTOCOL_DISCRIMINATOR_EMM,
+            emm_type::EXTENDED_SERVICE_REQUEST,
+            0x00, // service type 0: mobile originating CS fallback
+            0x05,
+            0xf4,
+            0x00,
+            0x00,
+            0x00,
+            0x01,
+        ];
+        let protected = protect_uplink(&mme_ue, 2, &esr);
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &protected));
+        let ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert_eq!(
+            ue.nas_eps.type_,
+            MmeEpsType::DetachRequestToUe,
+            "ESR ignored"
+        );
+        assert!(ue.t3422.is_running(), "the detach is progressed");
+    }
+
     /// The decision table of §5.5.2.3.5 d-f, including the EXTENDED SERVICE
     /// REQUEST and IMSI detach rows the dispatch tests do not reach.
     #[test]
@@ -2735,7 +2790,17 @@ mod tests {
             (T::ImsiDetach, P::TrackingAreaUpdate, Collision::Proceed),
             (T::ReAttachRequired, P::ServiceRequest, Collision::Ignore),
             (T::ReAttachNotRequired, P::ServiceRequest, Collision::Ignore),
-            (T::ImsiDetach, P::ServiceRequest, Collision::Proceed),
+            (T::ImsiDetach, P::ServiceRequest, Collision::Ignore),
+            (
+                T::ReAttachRequired,
+                P::CsFallbackServiceRequest,
+                Collision::Ignore,
+            ),
+            (
+                T::ReAttachNotRequired,
+                P::CsFallbackServiceRequest,
+                Collision::Ignore,
+            ),
         ] {
             let ctx = test_ctx();
             let (_, mme_ue_id) = ue_in_network_detach(&ctx, detach);
@@ -2746,8 +2811,7 @@ mod tests {
             );
             let ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
             let aborted = !ue.t3422.is_running();
-            let expect_aborted = expected == Collision::Proceed && detach != T::ImsiDetach
-                || (detach == T::ImsiDetach && procedure != P::ServiceRequest);
+            let expect_aborted = expected == Collision::Proceed;
             assert_eq!(aborted, expect_aborted, "{detach:?} x {procedure:?}");
         }
         // No detach pending: everything proceeds.

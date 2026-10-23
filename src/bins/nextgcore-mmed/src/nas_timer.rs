@@ -181,10 +181,27 @@ fn handle_expiry(ctx: &MmeContext, mme_ue_id: u64, timer: NasTimer) {
         // released by the fifth expiry.
         if timer == NasTimer::T3422 && mme_ue.nas_eps.type_ != MmeEpsType::DetachRequestToUe {
             timer.on(mme_ue).stop();
-            log::info!(
-                "[{}] T3422 expired, but no network-initiated detach is in progress; stopped",
-                mme_ue.imsi_bcd
+            if mme_ue.network_detach_type.is_none() {
+                // The detach was aborted (an ATTACH, §5.5.2.3.5 d): nothing to do.
+                log::info!(
+                    "[{}] T3422 expired, but no network-initiated detach is in progress; stopped",
+                    mme_ue.imsi_bcd
+                );
+                return;
+            }
+            // #828: the detach was never aborted, yet another procedure took the
+            // UE's EMM state. Its bearers are already gone, so leaving it would
+            // keep a registered UE with no PDN connection that is never told.
+            // The detach is completed: EMM-DEREGISTERED (§5.5.2.3.5 a).
+            log::warn!(
+                "[{}] T3422 expired with the network-initiated detach overtaken by {:?}; \
+                 completing the detach (TS 24.301 §5.5.2.3.5 a)",
+                mme_ue.imsi_bcd,
+                mme_ue.nas_eps.type_
             );
+            drop(pool);
+            ctx.mme_ue_remove(mme_ue_id);
+            crate::nas_dispatch::release_ue_context(ctx, &enb_ue);
             return;
         }
 
@@ -371,14 +388,14 @@ mod tests {
             crate::emm_build::DetachTypeToUe::ReAttachRequired,
             "test",
         );
-        // Another procedure took over without stopping the timer.
-        ctx.mme_ue_pool
-            .write()
-            .unwrap()
-            .get_mut(&mme_ue_id)
-            .unwrap()
-            .nas_eps
-            .type_ = MmeEpsType::AttachRequest;
+        // An ATTACH aborted the detach (§5.5.2.3.5 d) but, on some path, left
+        // the timer armed.
+        {
+            let mut pool = ctx.mme_ue_pool.write().unwrap();
+            let ue = pool.get_mut(&mme_ue_id).unwrap();
+            ue.nas_eps.type_ = MmeEpsType::AttachRequest;
+            ue.network_detach_type = None;
+        }
         force_expiry(&ctx, mme_ue_id, NasTimer::T3422);
         expire_nas_timers(&ctx, Instant::now());
         let ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
@@ -399,6 +416,38 @@ mod tests {
         assert!(
             ctx.enb_ue_find_by_id(enb_ue_id).is_some(),
             "S1 not released"
+        );
+    }
+
+    /// #828: a detach that was never aborted but whose EMM state another
+    /// procedure took (a CS fallback ESR before #828 routed it) is completed at
+    /// the next T3422 expiry: the bearer-less UE is deregistered and S1
+    /// released, not left registered and never told.
+    #[test]
+    fn t3422_completes_a_detach_another_procedure_overtook() {
+        let ctx = test_ctx();
+        let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+        let enb_ue_id = ctx.enb_ue_add(enb_id, 100);
+        let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
+        ctx.enb_ue_associate_mme_ue(enb_ue_id, mme_ue_id);
+        crate::network_detach::mme_initiated_detach(
+            &ctx,
+            mme_ue_id,
+            crate::emm_build::DetachTypeToUe::ReAttachRequired,
+            "test",
+        );
+        ctx.mme_ue_pool
+            .write()
+            .unwrap()
+            .get_mut(&mme_ue_id)
+            .unwrap()
+            .nas_eps
+            .type_ = MmeEpsType::ExtendedServiceRequest;
+        force_expiry(&ctx, mme_ue_id, NasTimer::T3422);
+        expire_nas_timers(&ctx, Instant::now());
+        assert!(
+            ctx.mme_ue_find_by_id(mme_ue_id).is_none(),
+            "the detach is completed: EMM-DEREGISTERED"
         );
     }
 
