@@ -368,12 +368,75 @@ mod ue_policy_golden {
     }
 
     #[test]
-    fn mutation_13_trailing_optional_ie_rejected() {
-        // The optional IEs 0x42/0x70 of Table D.5.1.1.1 are unsupported; any
-        // trailing octets after the LV-E list must be rejected (fail-closed).
+    fn mutation_13_trailing_optional_ies_follow_d_8_6() {
+        // TS 24.501 D.8.6 (#763): the unsupported optional IEs 0x42 (TLV) and
+        // 0x70 (TLV-E) of Table D.5.1.1.1, and an unknown IE that is not
+        // comprehension required, are skipped by their length.
+        let golden = ManageUePolicyCommand::decode(VEC_F_MANAGE_UE_POLICY_COMMAND).unwrap();
         let mut v = VEC_F_MANAGE_UE_POLICY_COMMAND.to_vec();
         v.extend_from_slice(&[0x42, 0x01, 0x00]);
-        assert!(ManageUePolicyCommand::decode(&v).is_err());
+        v.extend_from_slice(&[0x70, 0x00, 0x02, 0xaa, 0xbb]);
+        v.extend_from_slice(&[0x5e, 0x01, 0x01, 0xa1]);
+        assert_eq!(ManageUePolicyCommand::decode(&v).unwrap(), golden);
+
+        // An unknown comprehension-required IEI (bits 8-5 = 0000) is an error
+        // (D.8.5.1), and so is a trailing IE running past the message.
+        let mut cr = VEC_F_MANAGE_UE_POLICY_COMMAND.to_vec();
+        cr.extend_from_slice(&[0x05, 0x01, 0x00]);
+        assert!(ManageUePolicyCommand::decode(&cr).is_err());
+        let mut short = VEC_F_MANAGE_UE_POLICY_COMMAND.to_vec();
+        short.extend_from_slice(&[0x42, 0x02, 0x00]);
+        assert!(ManageUePolicyCommand::decode(&short).is_err());
+    }
+
+    #[test]
+    fn ue_state_indication_keeps_the_first_well_formed_os_id_and_refuses_a_cr_ie() {
+        // #835 review: D.8.7.1 with D.8.6.3. A malformed first UE OS Id
+        // (length 15) is not present, so the well-formed second one is the
+        // first instance and is kept.
+        let mut usi = VEC_UE_STATE_INDICATION.to_vec();
+        usi.extend_from_slice(&[0x41, 15]);
+        usi.extend_from_slice(&[0x11; 15]);
+        usi.extend_from_slice(&[0x41, 16]);
+        usi.extend_from_slice(&[0x22; 16]);
+        assert_eq!(
+            UeStateIndication::decode(&usi).unwrap().os_ids,
+            vec![[0x22; 16]]
+        );
+
+        // An unknown comprehension-required IE (bits 8-5 = 0000) at message
+        // level is an error (D.8.5.1).
+        let mut cr = VEC_UE_STATE_INDICATION.to_vec();
+        cr.extend_from_slice(&[0x0e, 0x01, 0x00]);
+        assert!(UeStateIndication::decode(&cr).is_err());
+    }
+
+    #[test]
+    fn upds_network_side_messages_ignore_unknown_trailing_ies() {
+        // D.8.6.1 (#763): MANAGE UE POLICY COMPLETE / COMMAND REJECT and
+        // UE STATE INDICATION as received by the PCF.
+        let complete = [0x81, 0x02, 0x5e, 0x01, 0x01];
+        assert_eq!(ManageUePolicyComplete::decode(&complete).unwrap().pti, 0x81);
+        assert!(ManageUePolicyComplete::decode(&[0x81, 0x02, 0x0e, 0x00]).is_err());
+
+        let mut reject = VEC_REJECT.to_vec();
+        reject.extend_from_slice(&[0x7e, 0x00, 0x00]);
+        assert_eq!(
+            ManageUePolicyCommandReject::decode(&reject).unwrap(),
+            ManageUePolicyCommandReject::decode(VEC_REJECT).unwrap()
+        );
+
+        let mut usi = VEC_UE_STATE_INDICATION.to_vec();
+        usi.extend_from_slice(&[0x5e, 0x01, 0x01]);
+        let mut os_id = vec![0x41, 16];
+        os_id.extend_from_slice(&[0x11; 16]);
+        usi.extend_from_slice(&os_id);
+        // A repetition is ignored (D.8.6.3): the first OS Id wins.
+        let mut second = vec![0x41, 16];
+        second.extend_from_slice(&[0x22; 16]);
+        usi.extend_from_slice(&second);
+        let decoded = UeStateIndication::decode(&usi).unwrap();
+        assert_eq!(decoded.os_ids, vec![[0x11; 16]]);
     }
 
     #[test]
