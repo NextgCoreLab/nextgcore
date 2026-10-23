@@ -323,14 +323,13 @@ impl NodeId {
             }
             NodeIdType::Fqdn => {
                 if let Some(fqdn) = &self.fqdn {
-                    // Encode FQDN as RFC 1035 length-prefixed labels followed
-                    // by the zero-length root label terminator (TS 29.244
-                    // Section 8.2.38)
+                    // RFC 1035 §3.1 length-prefixed labels "but excluding the
+                    // trailing zero byte" (TS 29.244 §8.2.38): the IE length ends
+                    // the name, so the root label is not encoded (#797).
                     for label in fqdn.split('.').filter(|l| !l.is_empty()) {
                         buf.put_u8(label.len() as u8);
                         buf.put_slice(label.as_bytes());
                     }
-                    buf.put_u8(0);
                 }
             }
         }
@@ -4969,12 +4968,13 @@ mod tests {
         let node_id = NodeId::new_fqdn("smf.example.com".to_string());
         let mut buf = BytesMut::new();
         node_id.encode(&mut buf);
-        // Type octet + RFC 1035 labels + zero-length root label terminator
+        // Type octet + RFC 1035 labels, excluding the trailing zero byte
+        // (TS 29.244 §8.2.38)
         assert_eq!(
             buf.as_ref(),
             &[
                 0x02, 3, b's', b'm', b'f', 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c',
-                b'o', b'm', 0,
+                b'o', b'm',
             ]
         );
         let mut bytes = buf.freeze();
