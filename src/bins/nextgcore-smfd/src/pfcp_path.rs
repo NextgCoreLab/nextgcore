@@ -1186,10 +1186,40 @@ impl PfcpClient {
     /// Store the peer's Recovery Time Stamp in the SMF context so it reaches the
     /// durable snapshot (issue #191). A no-op when persistence is disabled.
     fn record_peer_recovery_time_stamp(&self, rts: u32) {
-        let peer = self.peer().to_string();
+        let key = self.recovery_time_stamp_key();
         if let Ok(ctx) = smf_self().read() {
-            ctx.note_upf_recovery_time_stamp(&peer, rts);
+            ctx.note_upf_recovery_time_stamp(&key, rts);
         }
+    }
+
+    /// The key of this UPF's durable Recovery Time Stamp (#722): the configured
+    /// `host:port` for a UPF named by hostname, the address otherwise.
+    ///
+    /// Keyed by the resolved address, a UPF that moved while the SMF was down (a pod
+    /// rescheduled in the same node drain), or whose name did not resolve yet at
+    /// startup (`0.0.0.0:8805`), found no seed. Without one the first Association
+    /// Setup could not detect the restart, and the restored sessions it no longer held
+    /// were believed in.
+    pub fn recovery_time_stamp_key(&self) -> String {
+        match &self.peer_host {
+            Some((host, port)) => format!("{host}:{port}"),
+            None => self.peer().to_string(),
+        }
+    }
+
+    /// This UPF's durable Recovery Time Stamp, if the snapshot has one (#722). A
+    /// hostname UPF's stamp written before #722 is under its address then; that key
+    /// is tried second, so an upgrade keeps the seed when the address is unchanged.
+    pub fn stored_recovery_time_stamp(&self) -> Option<u32> {
+        let ctx = smf_self();
+        let ctx = ctx.read().ok()?;
+        ctx.upf_recovery_time_stamp(&self.recovery_time_stamp_key())
+            .or_else(|| {
+                self.peer_host
+                    .is_some()
+                    .then(|| ctx.upf_recovery_time_stamp(&self.peer().to_string()))
+                    .flatten()
+            })
     }
 
     /// Run the PFCP Association Release procedure (TS 29.244 6.2.9).
@@ -2342,6 +2372,68 @@ mod tests {
             Some(2000),
             "the new incarnation's stamp replaces the old one"
         );
+    }
+
+    /// #722: a UPF named by hostname moved while the SMF was down. Its durable
+    /// Recovery Time Stamp is keyed by the configured name, so the restarted SMF still
+    /// finds the seed although the name now resolves elsewhere, detects the UPF's new
+    /// incarnation at the first Association Setup, and flushes and releases (#39) the
+    /// restored session. Keyed by the address, the lookup missed and the restart went
+    /// undetected.
+    #[tokio::test]
+    async fn a_hostname_upfs_stamp_survives_the_upf_moving_while_the_smf_was_down() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
+        // UPF B, the new incarnation, is where "localhost" now points.
+        let upf_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port_b = upf_b.local_addr().unwrap().port();
+        let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let unresolved = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), port_b);
+        let client = pumped_client(
+            PfcpClient::new(local, unresolved, [127, 0, 0, 1])
+                .with_peer_hostname("localhost", port_b),
+        )
+        .await;
+        let _pool = InstalledPool::new(vec![client.clone()]);
+        let key = format!("localhost:{port_b}");
+        assert_eq!(client.recovery_time_stamp_key(), key);
+        // What the previous SMF incarnation recorded, when the UPF was at A.
+        smf_self()
+            .read()
+            .unwrap()
+            .note_upf_recovery_time_stamp(&key, 100);
+        let seed = client.stored_recovery_time_stamp();
+        if let Some(rts) = seed {
+            client.seed_peer_recovery_time_stamp(rts).await;
+        }
+        // A restored session (no recorded UPF), with a UE to release it through.
+        seed_pfcp_session("72201", 0x722);
+        let mut b = crate::context::PolicyBinding::snapshot_default();
+        b.supi = "imsi-001010000000722".to_string();
+        b.psi = 5;
+        b.sm_context_status_uri = Some("http://127.0.0.1:1/sm-status".to_string());
+        smf_self()
+            .read()
+            .unwrap()
+            .policy_bindings
+            .write()
+            .unwrap()
+            .insert("72201".to_string(), b);
+
+        let answered = tokio::spawn(answer_association_setup(upf_b, 200, false));
+        try_associate(&client).await.expect("association with B");
+        let _ = answered.await;
+        let kept = pfcp_session_present("72201");
+        let released = crate::cancel_gsm_timer_for_test("72201");
+        forget_pfcp_session("72201");
+        if let Ok(ctx) = smf_self().read() {
+            ctx.policy_bindings.write().unwrap().remove("72201");
+        }
+
+        assert_eq!(seed, Some(100), "the seed is found by name");
+        assert!(!kept, "the restored session is flushed");
+        assert!(released, "and released through the UE (#39)");
+        assert_eq!(client.peer().port(), port_b);
     }
 
     /// Answer one Association Setup Request on `upf` with Request Accepted, the
