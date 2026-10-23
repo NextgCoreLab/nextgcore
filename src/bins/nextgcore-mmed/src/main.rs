@@ -469,7 +469,18 @@ async fn main() -> Result<()> {
     // address on purpose (or scrapes through a sidecar).
     match nextgcore_metrics::nes_energy::serve_metrics(
         metrics_addr(),
-        Arc::new(handover_switch::render_metrics),
+        Arc::new(|| {
+            // #899 review: S6a messages not delivered because they arrived while a
+            // re-established connection was in RFC 3539 REOPEN.
+            format!(
+                "{}# HELP mme_diameter_reopen_discards_total Diameter application messages \
+                 received in RFC 3539 REOPEN and not delivered (requests answered 3004)\n\
+                 # TYPE mme_diameter_reopen_discards_total counter\n\
+                 mme_diameter_reopen_discards_total {}\n",
+                handover_switch::render_metrics(),
+                nextgcore_diameter::session::reopen_discards()
+            )
+        }),
     )
     .await
     {

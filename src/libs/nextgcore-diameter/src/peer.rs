@@ -305,6 +305,37 @@ impl<T: crate::transport::DiameterTransportIo> DiameterPeer<T> {
         self.transport.set_user_timeout(timeout)
     }
 
+    /// A protocol-error answer to `request` (RFC 6733 §7.1.3, §7.2): the E bit
+    /// set, `<Session-Id>` first when the request had one, this node's
+    /// Origin-Host and Origin-Realm, and `result_code`.
+    pub fn protocol_error_answer(
+        &self,
+        request: &DiameterMessage,
+        result_code: u32,
+    ) -> DiameterMessage {
+        let mut answer = DiameterMessage::new_answer(request);
+        answer.header.set_error();
+        if let Some(session_id) = request.session_id() {
+            answer.add_avp(Avp::mandatory(
+                avp_code::SESSION_ID,
+                AvpData::Utf8String(session_id.to_string()),
+            ));
+        }
+        answer.add_avp(Avp::mandatory(
+            avp_code::ORIGIN_HOST,
+            AvpData::DiameterIdentity(self.local_host.clone()),
+        ));
+        answer.add_avp(Avp::mandatory(
+            avp_code::ORIGIN_REALM,
+            AvpData::DiameterIdentity(self.local_realm.clone()),
+        ));
+        answer.add_avp(Avp::mandatory(
+            avp_code::RESULT_CODE,
+            AvpData::Unsigned32(result_code),
+        ));
+        answer
+    }
+
     /// Send a Diameter message through this peer
     pub async fn send_message(&mut self, msg: &DiameterMessage) -> DiameterResult<()> {
         if self.state != PeerState::Open {
