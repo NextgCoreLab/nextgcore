@@ -2121,9 +2121,7 @@ mod tests {
     /// MME would hold a key this AMF still uses for its own NAS.
     #[test]
     fn the_mm_context_carries_a_derived_kasme_not_the_kamf() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.blocking_lock();
 
         let mut ue = AmfUe::new(0x347_0001, 1);
         ue.kamf = [0x5A; 32];
@@ -2215,9 +2213,7 @@ mod tests {
     /// An accepted Context Response carries every Table 7.3.6-1 IE the AMF can supply.
     #[test]
     fn an_accepted_context_response_carries_its_table_7_3_6_1_ies() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.blocking_lock();
 
         let mut ue = AmfUe::new(0x347_0002, 2);
         ue.supi = Some("imsi-001010000000002".to_string());
@@ -2281,9 +2277,7 @@ mod tests {
     /// Several PDN connections share instance 0 (TS 29.274 §8.39).
     #[test]
     fn several_pdn_connections_are_all_carried_at_instance_zero() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.blocking_lock();
 
         let ue = AmfUe::new(0x347_0003, 3);
         let pdns: Vec<Gtp2PdnConnectionIe> = [5u8, 6]
@@ -2348,9 +2342,7 @@ mod tests {
     /// procedure would answer "IMSI/IMEI not known" for every UE.
     #[test]
     fn a_natively_registered_ue_is_found_by_the_guti_an_mme_maps_from_its_5g_guti() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.blocking_lock();
         crate::test_support::init_context();
 
         // A distinct 5G-TMSI, so this test cannot collide with a sibling's UE: the AMF
@@ -2436,9 +2428,7 @@ mod tests {
     /// The switch reads back in both directions, and nothing is bound when it is off.
     #[test]
     fn the_n26_switch_reads_back_in_both_directions() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.blocking_lock();
         set_for_test(true);
         assert!(enabled());
         set_for_test(false);

@@ -1545,9 +1545,7 @@ mod tests {
     async fn an_eps_to_5gs_handover_runs_end_to_end_against_the_real_amf() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let upf = crate::pfcp_path::stand_in::associated_upf().await;
-        let _amf_guard = nextgcore_amfd::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _amf_guard = nextgcore_amfd::test_support::CONTEXT_GUARD.lock().await;
         nextgcore_amfd::test_support::init_context();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         crate::context::smf_context_init(64, 256, 512);

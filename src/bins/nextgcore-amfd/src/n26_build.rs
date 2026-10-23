@@ -585,9 +585,7 @@ mod tests {
     /// instances, with the right message type — and **no Indication IE**.
     #[test]
     fn forward_relocation_request_carries_its_table_7_3_1_1_ies() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.blocking_lock();
 
         let mut ue = AmfUe::new(0x408_0001, 1);
         ue.supi = Some("imsi-001010000000408".to_string());
@@ -975,9 +973,7 @@ mod tests {
     /// with a MAC failure pointing nowhere near here.
     #[test]
     fn the_handover_kasme_is_bound_to_the_downlink_count_before_the_increment() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.blocking_lock();
 
         const KAMF: [u8; 32] = [0x74; 32];
         const DL_BEFORE: u32 = 0x0408_00AA;

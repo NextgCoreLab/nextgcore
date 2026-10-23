@@ -14385,8 +14385,8 @@ mod handover_3b_ii_tests {
 
     /// The whole DOWNLINK RAN STATUS TRANSFER for AMF UE NGAP ID 1, RAN UE NGAP
     /// ID 2 and that container, derived by hand: CHOICE initiatingMessage `000`
-    /// + pad; procedure code 7; criticality ignore `01` + pad; open type length
-    /// 31; SEQUENCE ext bit + pad; IE count 3 (two-octet aligned); then each
+    /// plus pad; procedure code 7; criticality ignore `01` plus pad; open type
+    /// length 31; SEQUENCE ext bit plus pad; IE count 3 (two-octet aligned); then each
     /// ProtocolIE-Field: id (two octets), criticality reject `00` + pad, open
     /// type length, value -- AMF-UE-NGAP-ID 1 (3-bit octet count 0, pad, `01`),
     /// RAN-UE-NGAP-ID 2 (2-bit octet count 0, pad, `02`), the container.

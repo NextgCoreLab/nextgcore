@@ -612,20 +612,23 @@ async fn main() -> Result<()> {
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty());
     if let Some(path) = state_file {
-        let ctx = smf_self();
-        let mut guard = ctx
-            .write()
-            .map_err(|_| anyhow::anyhow!("SMF context lock poisoned"))?;
         // Fail STARTUP on a snapshot that cannot be read or is from a newer build.
         // Coming up with an empty IPv4 pool is the one failure mode here that is
         // worse than not starting: it re-issues addresses live UEs still hold, and
         // nothing logs the collision. The store would then also refuse every later
         // write to protect the file, so the run would be silently non-durable too.
-        let restored = guard.set_state_file(std::path::PathBuf::from(&path))?;
+        //
+        // The context lock is scoped to this block: the notifier below takes its
+        // own read guard, `std::sync::RwLock` is not reentrant, and a guard must
+        // not live across the `.await` (#643).
+        let restored = {
+            let ctx = smf_self();
+            let mut guard = ctx
+                .write()
+                .map_err(|_| anyhow::anyhow!("SMF context lock poisoned"))?;
+            guard.set_state_file(std::path::PathBuf::from(&path))?
+        };
         log::info!("SMF durable state: {path} ({restored} record(s) restored)");
-        // The context lock must be released before the notifier runs: it takes its
-        // own read guard, and `std::sync::RwLock` is not reentrant.
-        drop(guard);
         // #193: a restored session whose policy binding did not survive is unusable
         // and its consumer still believes in it. This is the ONE restoration signal
         // that belongs at boot -- it needs no evidence from the UPF -- and it runs
@@ -11363,21 +11366,21 @@ mod tests {
         );
     }
 
-    /// #289 acceptance: the whole tail after the PFCP block, which no test could
-    /// reach before the stand-in UPF existed.
-    ///
-    /// Four claims, each of which was "verified by inspection" until now:
-    /// 1. the create answers `201` with a resolvable `smContextRef`;
-    /// 2. the session fill-in ran — `upCnxState` is ACTIVATED and the authorised
-    ///    session AMBR is stored on the session (#78, #191);
-    /// 3. the `PolicyBinding` was inserted — the release, update and notify paths
-    ///    all key off it, so a create that skipped it produces a session none of
-    ///    them can act on;
-    /// 4. the N4 exchange really happened, asserted from the stand-in's own
-    ///    record rather than from the SMF's report of it.
-    ///
-    /// Positive assertions throughout: each reads a value only reachable by
-    /// executing the step it names, so no early return can satisfy them.
+    // #289 acceptance: the whole tail after the PFCP block, which no test could
+    // reach before the stand-in UPF existed.
+    //
+    // Four claims, each of which was "verified by inspection" until now:
+    // 1. the create answers `201` with a resolvable `smContextRef`;
+    // 2. the session fill-in ran — `upCnxState` is ACTIVATED and the authorised
+    //    session AMBR is stored on the session (#78, #191);
+    // 3. the `PolicyBinding` was inserted — the release, update and notify paths
+    //    all key off it, so a create that skipped it produces a session none of
+    //    them can act on;
+    // 4. the N4 exchange really happened, asserted from the stand-in's own
+    //    record rather than from the SMF's report of it.
+    //
+    // Positive assertions throughout: each reads a value only reachable by
+    // executing the step it names, so no early return can satisfy them.
     // ── #193: the SMF stops believing a session the UPF says it does not have ──
 
     /// Criterion 3 driven over a REAL N4 round trip, from the production entry
@@ -11456,8 +11459,7 @@ mod tests {
             let global = smf_self();
             let ctx = global.read().expect("context");
             let sessions = ctx.pfcp_sessions.read().expect("sessions");
-            let present = sessions.contains_key(sm_context_ref);
-            present
+            sessions.contains_key(sm_context_ref)
         };
         {
             let global = smf_self();
