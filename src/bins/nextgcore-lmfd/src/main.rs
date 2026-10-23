@@ -858,10 +858,12 @@ async fn initiate_positioning(
         (Some(supi), Ok(context)) => context.ue_lpp_capability(supi),
         _ => crate::codec_glue::UeLppCapability::Unknown,
     };
-    let method = crate::codec_glue::select_lpp_method(qos, reference_points, capability);
+    let access =
+        crate::codec_glue::AccessRat::from_serving_cell(input.ncgi.is_some(), input.ecgi.is_some());
+    let method = crate::codec_glue::select_lpp_method(qos, reference_points, capability, access);
     log::info!(
         "DetermineLocation: selected LPP method {} (qos={qos:?}, {reference_points} reference \
-         point(s), UE capability {capability:?})",
+         point(s), UE capability {capability:?}, access {access:?})",
         method.as_spec_str()
     );
 
@@ -885,7 +887,9 @@ async fn initiate_positioning(
     // `LppMethod`, which is what the request body and the response's
     // `positioningMethod` are built from.
     let stored_method = match method {
-        crate::codec_glue::LppMethod::Ecid => PositioningMethod::Ecid,
+        crate::codec_glue::LppMethod::Ecid | crate::codec_glue::LppMethod::NrEcid => {
+            PositioningMethod::Ecid
+        }
         crate::codec_glue::LppMethod::MultiRtt | crate::codec_glue::LppMethod::DlTdoa => {
             PositioningMethod::NrBased
         }
@@ -2482,6 +2486,7 @@ async fn handle_nrppa_report(request: &SbiRequest) -> SbiResponse {
                     ue_rx_tx_ns: c.get("ueRxTxNs").and_then(|v| v.as_f64()),
                     gnb_rx_tx_ns: c.get("gnbRxTxNs").and_then(|v| v.as_f64()),
                     dl_prs_id: None,
+                    eutra: false,
                 })
                 .collect()
         })
@@ -3978,6 +3983,7 @@ mod tests {
                     ue_rx_tx_ns: None,
                     gnb_rx_tx_ns: None,
                     dl_prs_id: None,
+                    eutra: false,
                 }],
             );
             req.request_id
@@ -4866,6 +4872,7 @@ lmf:
                     ue_rx_tx_ns: None,
                     gnb_rx_tx_ns: None,
                     dl_prs_id: None,
+                    eutra: false,
                 }],
             )
             .expect(
@@ -4948,20 +4955,28 @@ lmf:
     /// another branch's work.
     #[test]
     fn the_positioning_method_follows_qos_capability_and_the_registry() {
-        use crate::codec_glue::{select_lpp_method, LppMethod, UeLppCapability};
+        use crate::codec_glue::{select_lpp_method, AccessRat, LppMethod, UeLppCapability};
+        let nr = AccessRat::Nr;
 
         // High accuracy, enough reference points, capability unknown -> a
         // multilateration method. DL-TDOA, not Multi-RTT: this LMF cannot obtain
         // the gNB Rx-Tx half a Multi-RTT range needs (TS 38.305 §8.10, #713).
         const { assert!(!crate::codec_glue::MULTI_RTT_GNB_HALF_AVAILABLE) };
+        for access in [AccessRat::Nr, AccessRat::Eutra] {
+            assert_eq!(
+                select_lpp_method(
+                    PositioningQos::HighAccuracy,
+                    3,
+                    UeLppCapability::Unknown,
+                    access
+                ),
+                LppMethod::DlTdoa,
+                "answering a <=10 m request with E-CID commits to an accuracy a TA ring cannot \
+                 deliver, and Multi-RTT without the gNB half cannot range at all"
+            );
+        }
         assert_eq!(
-            select_lpp_method(PositioningQos::HighAccuracy, 3, UeLppCapability::Unknown),
-            LppMethod::DlTdoa,
-            "answering a <=10 m request with E-CID commits to an accuracy a TA ring cannot \
-             deliver, and Multi-RTT without the gNB half cannot range at all"
-        );
-        assert_eq!(
-            select_lpp_method(PositioningQos::Emergency, 5, UeLppCapability::Unknown),
+            select_lpp_method(PositioningQos::Emergency, 5, UeLppCapability::Unknown, nr),
             LppMethod::DlTdoa,
             "an emergency fix is a high-accuracy fix"
         );
@@ -4969,40 +4984,77 @@ lmf:
             select_lpp_method(
                 PositioningQos::HighAccuracy,
                 3,
-                UeLppCapability::AdvancedMethods
+                UeLppCapability::AdvancedMethods,
+                nr
             ),
             LppMethod::DlTdoa
         );
 
-        // Same QoS, TOO FEW reference points -> E-CID fallback. The registry is the
-        // sole difference.
+        // Same QoS, TOO FEW reference points -> E-CID fallback, of the UE's access
+        // (#715): NR E-CID on NR, E-UTRA E-CID on an ng-eNB.
         assert_eq!(
-            select_lpp_method(PositioningQos::HighAccuracy, 2, UeLppCapability::Unknown),
-            LppMethod::Ecid,
+            select_lpp_method(
+                PositioningQos::HighAccuracy,
+                2,
+                UeLppCapability::Unknown,
+                nr
+            ),
+            LppMethod::NrEcid,
             "two known positions cannot be multilaterated against, whatever the QoS asks"
+        );
+        assert_eq!(
+            select_lpp_method(
+                PositioningQos::HighAccuracy,
+                2,
+                UeLppCapability::Unknown,
+                AccessRat::Eutra
+            ),
+            LppMethod::Ecid
         );
 
         // Same QoS, enough points, UE says E-CID only -> E-CID. Capability is the sole
         // difference.
         assert_eq!(
-            select_lpp_method(PositioningQos::HighAccuracy, 3, UeLppCapability::EcidOnly),
-            LppMethod::Ecid,
+            select_lpp_method(
+                PositioningQos::HighAccuracy,
+                3,
+                UeLppCapability::EcidOnly,
+                nr
+            ),
+            LppMethod::NrEcid,
             "asking a UE for a method it has said it cannot perform gets an empty report"
         );
 
         // Low latency prefers the cheapest measurement, not the most accurate.
         assert_eq!(
-            select_lpp_method(PositioningQos::LowLatency, 9, UeLppCapability::Unknown),
-            LppMethod::Ecid,
+            select_lpp_method(PositioningQos::LowLatency, 9, UeLppCapability::Unknown, nr),
+            LppMethod::NrEcid,
             "LOW_DELAY is a statement about time, and PRS scheduling is not fast"
         );
         assert_eq!(
-            select_lpp_method(PositioningQos::BestEffort, 9, UeLppCapability::Unknown),
+            select_lpp_method(PositioningQos::BestEffort, 9, UeLppCapability::Unknown, nr),
+            LppMethod::NrEcid
+        );
+        assert_eq!(
+            select_lpp_method(
+                PositioningQos::BestEffort,
+                9,
+                UeLppCapability::Unknown,
+                AccessRat::Eutra
+            ),
             LppMethod::Ecid
         );
 
+        // The serving cell in InputData decides the access.
+        assert_eq!(AccessRat::from_serving_cell(true, false), AccessRat::Nr);
+        assert_eq!(AccessRat::from_serving_cell(true, true), AccessRat::Nr);
+        assert_eq!(AccessRat::from_serving_cell(false, true), AccessRat::Eutra);
+        assert_eq!(AccessRat::from_serving_cell(false, false), AccessRat::Nr);
+
         // The selected method changes the ENCODED REQUEST, not just a log line.
         let ecid = crate::codec_glue::build_lpp_request(LppMethod::Ecid, 1).expect("encode");
+        let nr_ecid = crate::codec_glue::build_lpp_request(LppMethod::NrEcid, 1).expect("encode");
+        assert_ne!(ecid, nr_ecid, "NR E-CID must not encode as E-UTRA E-CID");
         let multi = crate::codec_glue::build_lpp_request(LppMethod::MultiRtt, 1).expect("encode");
         let tdoa = crate::codec_glue::build_lpp_request(LppMethod::DlTdoa, 1).expect("encode");
         assert_ne!(ecid, multi, "a Multi-RTT request must not encode as E-CID");
@@ -6876,8 +6928,12 @@ mod positioning_chain_strict_peer {
         // Drive lmfd's REAL DetermineLocation handler (no stored fix for this
         // SUPI → the live 5GC-MT-LR procedure). Spawned: it blocks awaiting the
         // session completion the notify leg will deliver.
-        let body =
-            format!(r#"{{"supi":"{supi}","supportedGADShapes":["POINT_UNCERTAINTY_CIRCLE"]}}"#);
+        // The UE is served by an ng-eNB (ecgi, TS 29.572 InputData), so lmfd asks
+        // for E-UTRA E-CID, whose UE Rx-Tx is the timing term (#715).
+        let body = format!(
+            r#"{{"supi":"{supi}","supportedGADShapes":["POINT_UNCERTAINTY_CIRCLE"],
+                "ecgi":{{"plmnId":{{"mcc":"001","mnc":"01"}},"eutraCellId":"0000001"}}}}"#
+        );
         let req =
             SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json");
         let det = tokio::spawn(async move { handle_determine_location(&req).await });
@@ -6933,9 +6989,72 @@ mod positioning_chain_strict_peer {
             (-75.0..-74.0).contains(&lon),
             "fix longitude {lon} must be near the seeded serving cell (-74.5)"
         );
-        // E-CID method + honest freshly-computed age.
-        assert_eq!(v["positioningDataList"][0]["method"], "NR_ECID");
+        // E-UTRA E-CID (TS 29.572 ECID, #715) + honest freshly-computed age.
+        assert_eq!(v["positioningDataList"][0]["method"], "ECID");
         assert_eq!(v["ageOfLocationEstimate"], 0);
+
+        let _ = amf_server.stop().await;
+        let _ = nrf_server.stop().await;
+    }
+
+    /// #715 over both real NFs: a UE on NR access (`ncgi`) is asked for NR E-CID
+    /// (`nr-ECID-RequestLocationInformation-r16`), not E-UTRA E-CID. Its NR E-CID
+    /// report carries no UE timing quantity, so without the NRPPa leg there is no
+    /// E-CID timing term and no fix: 500 POSITIONING_FAILED, never a guess.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_positioning_chain_nr_access_asks_for_nr_ecid() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _serial = chain_lock().lock().await;
+        let supi = "imsi-001010000000709".to_string();
+
+        lmf_context_init(1024);
+        prime_lmf_self();
+        {
+            let ctx = lmf_self();
+            let g = ctx.read().unwrap();
+            g.set_cell_coord(
+                "pci-77".to_string(),
+                crate::positioning::TrpCoord::new(40.1, -74.5, 0.0),
+            );
+        }
+        seed_amf_connected_ue(&supi);
+        let (amf_server, nrf_server, mut tap_rx) = start_positioning_harness(supi.clone()).await;
+
+        let body = format!(
+            r#"{{"supi":"{supi}","supportedGADShapes":["POINT_UNCERTAINTY_CIRCLE"],
+                "ncgi":{{"plmnId":{{"mcc":"001","mnc":"01"}},"nrCellId":"000000001"}}}}"#
+        );
+        let req =
+            SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json");
+        let det = tokio::spawn(async move { handle_determine_location(&req).await });
+
+        let (corr, dl_lpp) = tokio::time::timeout(Duration::from_secs(5), tap_rx.recv())
+            .await
+            .expect("amfd accepted the N1N2MessageTransfer within budget")
+            .expect("harness captured the correlation + downlink LPP");
+        let dl_msg = nextgcore_lpp_gen::decode(&dl_lpp).expect("DL LPP decodes");
+        let txn = dl_msg
+            .transaction_id
+            .as_ref()
+            .expect("txn")
+            .transaction_number
+            .0;
+        assert_eq!(
+            dl_lpp,
+            codec_glue::build_lpp_request(codec_glue::LppMethod::NrEcid, txn).expect("encode"),
+            "an NR UE is asked for NR E-CID"
+        );
+
+        let ul_lpp = crate::lpp_fixtures::nr_ecid_lpp(77, 80, 60, &[], txn);
+        let notify = amfd_notify_request(&corr, &supi, &ul_lpp);
+        assert_eq!(handle_n1_message_notify(&notify).await.status, 204);
+        let resp = tokio::time::timeout(Duration::from_secs(10), det)
+            .await
+            .expect("DetermineLocation did not hang")
+            .expect("DetermineLocation task did not panic");
+        assert_eq!(resp.status, 500);
+        assert_eq!(body_json(&resp)["cause"], "POSITIONING_FAILED");
 
         let _ = amf_server.stop().await;
         let _ = nrf_server.stop().await;

@@ -39,6 +39,7 @@ fn requests_are_byte_identical_to_the_captured_builders() {
         let txn: u8 = f[1].parse().unwrap();
         let method = match f[0] {
             "ecid" => LppMethod::Ecid,
+            "nrecid" => LppMethod::NrEcid,
             "rtt" => LppMethod::MultiRtt,
             "tdoa" => LppMethod::DlTdoa,
             other => panic!("{other}"),
@@ -57,7 +58,7 @@ fn requests_are_byte_identical_to_the_captured_builders() {
         }
         n += 1;
     }
-    assert_eq!(n, 6 + 4 + 4);
+    assert_eq!(n, 6 + 6 + 4 + 4);
 }
 
 #[test]
@@ -109,6 +110,7 @@ fn without_new_fields(
             assert_eq!(c.remove(k).as_deref(), Some("None"), "{what}: {k}");
         }
         check_dl_prs_id(c, what);
+        check_eutra(c, what);
     }
     new
 }
@@ -124,6 +126,12 @@ fn check_dl_prs_id(c: &mut std::collections::BTreeMap<String, String>, what: &st
     } else {
         assert!(id.starts_with("Some("), "{what}: {id}");
     }
+}
+
+/// Remove `eutra` (#715): only the E-UTRA E-CID adapter's cells are E-UTRA.
+fn check_eutra(c: &mut std::collections::BTreeMap<String, String>, what: &str) {
+    let want = if what == "E-CID" { "true" } else { "false" };
+    assert_eq!(c.remove("eutra").as_deref(), Some(want), "{what}");
 }
 
 fn some_f64(v: &str) -> f64 {
@@ -178,6 +186,7 @@ fn every_report_adapts_as_the_old_adapters_did() {
             assert_eq!(new.remove("rtt_ns").as_deref(), Some("None"));
             assert_eq!(new.remove("gnb_rx_tx_ns").as_deref(), Some("None"));
             check_dl_prs_id(&mut new, "Multi-RTT");
+            check_eutra(&mut new, "Multi-RTT");
             let mut old = old;
             old.remove("rtt_ns");
             assert_eq!(new, old, "Multi-RTT {}", f[0]);
@@ -259,13 +268,42 @@ fn capability_classification_reads_the_generated_report() {
 /// | `0 0100` | lpp-MessageBody c1; c1 index 4 = requestLocationInformation (4 bits) |
 /// | `0 00` | criticalExtensions c1; requestLocationInformation-r9 (2 bits) |
 /// | `0 00010` | r9-IEs ext bit; optional bitmap: only ecid-RequestLocationInformation |
-/// | `0 001 11` | ECID ext bit; BIT STRING SIZE(1..8) length 2 as 3 bits; rsrpReq, rsrqReq |
+/// | `0 010 111` | ECID ext bit; BIT STRING SIZE(1..8) length 3 as `3 − 1` in 3 bits; rsrpReq, rsrqReq, ueRxTxReq (#715) |
 ///
-/// 36 bits, padded: `90 00 20 08 70`.
+/// 37 bits, padded: `90 00 20 08 B8`. (Before #715, length 2 and no ueRxTxReq:
+/// `0 001 11`, 36 bits, `90 00 20 08 70`.)
 #[test]
 fn ecid_request_matches_x691() {
     assert_eq!(
         codec_glue::build_lpp_ecid_request(0).unwrap(),
-        vec![0x90, 0x00, 0x20, 0x08, 0x70]
+        vec![0x90, 0x00, 0x20, 0x08, 0xB8]
+    );
+    assert_eq!(
+        codec_glue::build_lpp_request(LppMethod::Ecid, 0).unwrap(),
+        vec![0x90, 0x00, 0x20, 0x08, 0xB8]
+    );
+}
+
+/// `build_lpp_request(NrEcid, 0)` derived by hand from X.691 (UPER, TS 37.355
+/// Rel-16, #715). The first 26 bits are as in [`ecid_request_matches_x691`]
+/// (`1001 000 00000000 0 0 0100 0 00`), then:
+///
+/// | bits | field |
+/// |------|-------|
+/// | `1` | r9-IEs extension bit: extension additions present |
+/// | `00000` | root optional bitmap: none of the five root members |
+/// | `0 000010` | X.691 §19.8: extension-addition bitmap length, normally small, `3 − 1` (three groups: r13, r16, r19) |
+/// | `010` | only the Rel-16 group is present |
+/// | `00000010` | X.691 §19.9: the group as an open type, length 2 octets |
+/// | `1000` | the group's presence bitmap: nr-ECID present, nr-Multi-RTT, nr-DL-AoD, nr-DL-TDOA absent |
+/// | `0 001 11` | NR-ECID-RequestLocationInformation-r16: ext bit; BIT STRING SIZE(1..8) length 2; ssrsrpReq, ssrsrqReq |
+/// | `000000` | padding of the open type to an octet |
+///
+/// `90 00 20 80 12 02 81 C0`.
+#[test]
+fn nr_ecid_request_matches_x691() {
+    assert_eq!(
+        codec_glue::build_lpp_request(LppMethod::NrEcid, 0).unwrap(),
+        vec![0x90, 0x00, 0x20, 0x80, 0x12, 0x02, 0x81, 0xC0]
     );
 }

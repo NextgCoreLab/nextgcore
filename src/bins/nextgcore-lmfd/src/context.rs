@@ -139,6 +139,10 @@ pub struct CellMeasurement {
     /// on, when it is an LPP NR measurement. `nr_cgi` keys by PCI when the UE gave
     /// one; this is the fallback key `prs-<id>` a registry may hold instead (#714).
     pub dl_prs_id: Option<u8>,
+    /// The measurement is of an E-UTRA cell (LPP `ECID-SignalMeasurementInformation`,
+    /// or an NRPPa E-CID report whose serving cell is an E-UTRA CGI). It decides
+    /// whether an E-CID fix is reported as `ECID` or `NR_ECID` (TS 29.572, #715).
+    pub eutra: bool,
 }
 
 /// Positioning QoS requirements
@@ -1223,7 +1227,16 @@ fn try_real_solve(
             altitude: est.height_m,
             horizontal_accuracy: est.horizontal_uncertainty_m(),
             vertical_accuracy: None,
-            method_used: Some(est.method.as_spec_str().to_string()),
+            // TS 29.572 PositioningMethod: E-CID of an E-UTRA serving cell is
+            // ECID, of an NR one NR_ECID (#715).
+            method_used: Some(
+                if serving.eutra {
+                    crate::nlmf::positioning_method::ECID
+                } else {
+                    est.method.as_spec_str()
+                }
+                .to_string(),
+            ),
             timestamp: 0,
         }),
         Err(e) => {
@@ -1573,6 +1586,7 @@ mod tests {
             ue_rx_tx_ns: None,
             gnb_rx_tx_ns: None,
             dl_prs_id: None,
+            eutra: false,
         }];
 
         // A7 (lmfd-11): with no TRP registry configured the report cannot be
@@ -1617,6 +1631,7 @@ mod tests {
                 ue_rx_tx_ns: None,
                 gnb_rx_tx_ns: None,
                 dl_prs_id: None,
+                eutra: false,
             },
             CellMeasurement {
                 nr_cgi: "001-01-0002-02".to_string(),
@@ -1629,6 +1644,7 @@ mod tests {
                 ue_rx_tx_ns: None,
                 gnb_rx_tx_ns: None,
                 dl_prs_id: None,
+                eutra: false,
             },
         ];
 
@@ -1749,6 +1765,7 @@ mod tests {
             ue_rx_tx_ns: None,
             gnb_rx_tx_ns: None,
             dl_prs_id: None,
+            eutra: false,
         }];
         let loc = compute_location(&PositioningMethod::Ecid, &cells, &registry);
         assert!(loc.horizontal_accuracy > 50.0); // ECID is coarse
@@ -1771,6 +1788,7 @@ mod tests {
             ue_rx_tx_ns: None,
             gnb_rx_tx_ns: None,
             dl_prs_id: None,
+            eutra: false,
         }];
         let loc = compute_location(&PositioningMethod::Gnss, &cells, &registry);
         assert!(loc.horizontal_accuracy <= 5.0); // GNSS is accurate
@@ -1896,6 +1914,7 @@ mod tests_real_solve {
                     ue_rx_tx_ns: None,
                     gnb_rx_tx_ns: None,
                     dl_prs_id: None,
+                    eutra: false,
                 }
             })
             .collect();
@@ -1936,6 +1955,7 @@ mod tests_real_solve {
                     ue_rx_tx_ns: None,
                     gnb_rx_tx_ns: None,
                     dl_prs_id: None,
+                    eutra: false,
                 }
             })
             .collect();
@@ -1976,6 +1996,7 @@ mod tests_real_solve {
             ue_rx_tx_ns: None,
             gnb_rx_tx_ns: None,
             dl_prs_id: None,
+            eutra: false,
         }];
 
         let loc = compute_location(&PositioningMethod::Ecid, &cells, &registry);
@@ -2021,6 +2042,7 @@ mod tests_real_solve {
                     ue_rx_tx_ns: None,
                     gnb_rx_tx_ns: None,
                     dl_prs_id: None,
+                    eutra: false,
                 }
             })
             .collect();
@@ -2059,6 +2081,7 @@ mod tests_real_solve {
                     ue_rx_tx_ns: None,
                     gnb_rx_tx_ns: None,
                     dl_prs_id: None,
+                    eutra: false,
                 }
             })
             .collect();
@@ -2086,6 +2109,7 @@ mod tests_real_solve {
             ue_rx_tx_ns: None,
             gnb_rx_tx_ns: None,
             dl_prs_id: None,
+            eutra: false,
         }];
         let loc = compute_location(&PositioningMethod::Ecid, &cells, &registry);
         // Placeholder: origin 0/0 with heuristic accuracy.
@@ -2130,6 +2154,7 @@ mod tests_real_solve {
             ue_rx_tx_ns: None,
             gnb_rx_tx_ns: None,
             dl_prs_id: None,
+            eutra: false,
         }];
         ctx.measurement_report(req.request_id, cells).unwrap();
         match rx.try_recv() {
@@ -2301,6 +2326,7 @@ mod tests_real_solve {
             ue_rx_tx_ns: None,
             gnb_rx_tx_ns: None,
             dl_prs_id: None,
+            eutra: false,
         }];
         // A7: no fabricated placeholder — an unsolvable report yields None.
         let no_fix = ctx.measurement_report(req.request_id, cells);
@@ -2417,6 +2443,7 @@ mod tests_multi_rtt_two_sided {
                 ue_rx_tx_ns: None,
                 gnb_rx_tx_ns: Some(propagation_ns(*e, *n) - UE_CLOCK_OFFSET_NS + SRS_AFTER_PRS_NS),
                 dl_prs_id: None,
+                eutra: false,
             })
             .collect()
     }
@@ -2648,5 +2675,35 @@ mod tests_dl_tdoa_reference {
         let dup = cells[1].clone();
         cells.push(dup);
         assert_eq!(tdoa_observations(&cells, &reg).len(), 3);
+    }
+}
+
+/// #715: an E-CID fix names the RAT it was measured on (TS 29.572).
+#[cfg(test)]
+mod tests_ecid_label {
+    use super::*;
+
+    fn serving(eutra: bool) -> CellMeasurement {
+        CellMeasurement {
+            nr_cgi: "cell-1".into(),
+            rsrp: Some(-80),
+            rsrq: None,
+            timing_advance: Some(10),
+            aoa: None,
+            rtt_ns: None,
+            rstd_ns: None,
+            ue_rx_tx_ns: None,
+            gnb_rx_tx_ns: None,
+            dl_prs_id: None,
+            eutra,
+        }
+    }
+
+    #[test]
+    fn an_eutra_serving_cell_is_ecid_and_an_nr_one_nr_ecid() {
+        let reg = TrpRegistry::from_entries([("cell-1".to_string(), TrpCoord::new(1.0, 2.0, 0.0))]);
+        let label = |eutra| try_real_solve(&[serving(eutra)], &reg).unwrap().method_used;
+        assert_eq!(label(true).as_deref(), Some("ECID"));
+        assert_eq!(label(false).as_deref(), Some("NR_ECID"));
     }
 }

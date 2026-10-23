@@ -198,6 +198,10 @@ fn to_cell(result: &nrppa::E_CID_MeasurementResult) -> CellMeasurement {
         ue_rx_tx_ns: None,
         gnb_rx_tx_ns: None,
         dl_prs_id: None,
+        eutra: matches!(
+            result.serving_cell_id.ng_ra_ncell,
+            nrppa::NG_RANCell::EUTRA_CellID(_)
+        ),
     }
 }
 

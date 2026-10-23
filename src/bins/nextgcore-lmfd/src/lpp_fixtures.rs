@@ -215,3 +215,49 @@ pub(crate) fn dl_tdoa_lpp(
         });
     provide_location_information(transaction_number, ies)
 }
+
+/// An NR E-CID `ProvideLocationInformation` (TS 37.355 Rel-16): the primary cell
+/// `pci` with SS-RSRP `ss_rsrp` and SS-RSRQ `ss_rsrq` (report values), and one
+/// neighbour per `(pci, ss_rsrp)` with only an SS-RSRP.
+pub(crate) fn nr_ecid_lpp(
+    pci: u16,
+    ss_rsrp: u8,
+    ss_rsrq: u8,
+    neighbours: &[(u16, u8)],
+    transaction_number: u8,
+) -> Vec<u8> {
+    let element = |pci: u16, rsrp: u8, rsrq: Option<u8>| lpp::NR_MeasuredResultsElement_r16 {
+        nr_phys_cell_id_r16: lpp::NR_PhysCellID_r16(pci),
+        nr_arfcn_r16: lpp::NR_MeasuredResultsElement_r16Nr_ARFCN_r16::Ssb_ARFCN_r16(
+            lpp::ARFCN_ValueNR_r15(632_628),
+        ),
+        nr_cell_global_id_r16: None,
+        system_frame_number_r16: None,
+        results_ssb_cell_r16: Some(lpp::MeasQuantityResults_r16 {
+            nr_rsrp_r16: Some(lpp::MeasQuantityResults_r16Nr_RSRP_r16(rsrp)),
+            nr_rsrq_r16: rsrq.map(lpp::MeasQuantityResults_r16Nr_RSRQ_r16),
+        }),
+        results_csi_rs_cell_r16: None,
+        results_ssb_indexes_r16: None,
+        results_csi_rs_indexes_r16: None,
+    };
+    let mut ies = empty_ies();
+    ies.extensions.nr_ecid_provide_location_information_r16 =
+        Some(lpp::NR_ECID_ProvideLocationInformation_r16 {
+            nr_ecid_signal_measurement_information_r16: Some(
+                lpp::NR_ECID_SignalMeasurementInformation_r16 {
+                    nr_primary_cell_measured_results_r16: element(pci, ss_rsrp, Some(ss_rsrq)),
+                    nr_measured_results_list_r16: (!neighbours.is_empty()).then(|| {
+                        lpp::NR_MeasuredResultsList_r16(
+                            neighbours
+                                .iter()
+                                .map(|(p, r)| element(*p, *r, None))
+                                .collect(),
+                        )
+                    }),
+                },
+            ),
+            nr_ecid_error_r16: None,
+        });
+    provide_location_information(transaction_number, ies)
+}
