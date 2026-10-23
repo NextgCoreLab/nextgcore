@@ -48,6 +48,7 @@ pub mod mbs_session; // Rel-17: MBS multicast/broadcast session
 mod n2_transfer; // #417: the N2 SM transfers, on the generated NGAP codec
 mod n4_build;
 mod n4_handler;
+mod n4_identity; // #797: the PFCP Node ID and CP F-SEID address
 mod pfcp_path;
 mod pfcp_sm;
 mod policy;
@@ -746,15 +747,56 @@ async fn main() -> Result<()> {
         anyhow::ensure!(!peers.is_empty(), "UPF_PFCP_ADDR contains no usable peer");
         peers
     };
-    let smf_node_ip: [u8; 4] = {
-        let s = std::env::var("SMF_PFCP_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
-        let parts: Vec<u8> = s.split('.').filter_map(|p| p.parse().ok()).collect();
-        if parts.len() == 4 {
-            [parts[0], parts[1], parts[2], parts[3]]
-        } else {
-            [127, 0, 0, 1]
-        }
+    // #797: the Node ID and the CP F-SEID address, resolved separately so a wildcard
+    // bind never signals 0.0.0.0 and a k8s Service FQDN keeps the Node ID stable
+    // across pod restarts (TS 29.244 §5.8.1). See `n4_identity.rs`.
+    let n4_identity = {
+        let env = |k: &str| {
+            std::env::var(k)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        let (bind, node_id, advertise) = (
+            env("SMF_PFCP_ADDR"),
+            env("SMF_PFCP_NODE_ID"),
+            env("SMF_PFCP_ADVERTISE_ADDR"),
+        );
+        // Only consulted when nothing configured names a routable address: the local
+        // address that routes toward the first UPF.
+        let first_peer = match &upf_pfcp_peers[0] {
+            pfcp_path::UpfPeerSpec::Literal(sa) => Some(*sa),
+            pfcp_path::UpfPeerSpec::Hostname(host, port) => {
+                tokio::net::lookup_host((host.as_str(), *port))
+                    .await
+                    .ok()
+                    .and_then(|mut it| it.find(SocketAddr::is_ipv4))
+            }
+        };
+        n4_identity::resolve_n4_identity(
+            &n4_identity::N4IdentityConfig {
+                bind_addr: bind.as_deref(),
+                node_id: node_id.as_deref(),
+                advertise_addr: advertise.as_deref(),
+            },
+            || first_peer.and_then(n4_identity::local_ipv4_toward),
+        )
+        .map_err(|e| anyhow::anyhow!("Invalid SMF N4 identity: {e}"))?
     };
+    log::info!(
+        "SMF N4 identity: Node ID {}, CP F-SEID address {}",
+        n4_identity::display_node_id(&n4_identity.node_id),
+        std::net::Ipv4Addr::from(n4_identity.f_seid_ipv4)
+    );
+    if !n4_identity.node_id_explicit {
+        log::warn!(
+            "SMF_PFCP_NODE_ID is unset and SMF_PFCP_ADDR is the wildcard, so the PFCP Node ID \
+             is the routed address {}. If that address changes across a restart (a k8s pod \
+             IP), the UPF sees a different CP function; set SMF_PFCP_NODE_ID to a stable \
+             FQDN or IP (TS 29.244 §5.8.1)",
+            std::net::Ipv4Addr::from(n4_identity.f_seid_ipv4)
+        );
+    }
 
     let pfcp_socket = Arc::new(
         tokio::net::UdpSocket::bind(pfcp_bind_addr)
@@ -779,7 +821,7 @@ async fn main() -> Result<()> {
     let mut pfcp_clients: Vec<Arc<pfcp_path::PfcpClient>> = Vec::new();
     for spec in &upf_pfcp_peers {
         pfcp_clients.push(Arc::new(
-            pfcp_path::client_for_peer(pfcp_socket.clone(), spec, smf_node_ip).await,
+            pfcp_path::client_for_peer(pfcp_socket.clone(), spec, &n4_identity).await,
         ));
     }
     // Installs the whole pool and pool slot 0 as the process-wide default
@@ -932,13 +974,24 @@ async fn main() -> Result<()> {
 
     pfcp_assoc_handle.abort();
 
-    // Graceful shutdown. #677/#718: the N4 association is kept only when durable
-    // state will hand its sessions to the next incarnation, which then asks the UPF
-    // to retain them (PFCP Session Retention Information, TS 29.244 §6.2.6.2.1).
-    // Without durable state the next incarnation knows none of these sessions, so
-    // keeping the association left them orphaned in the UPF, under CP SEIDs the
-    // next incarnation reuses. Releasing deletes them (TS 29.244 §6.2.9).
-    // SMF_PFCP_RELEASE_ON_SHUTDOWN=true/false overrides the default either way.
+    // Graceful shutdown (#677, #718).
+    //
+    // #718 review M3: first stop being found. NFDeregister (TS 29.510 §5.2.2.2.3)
+    // and the SHUTDOWN flag (set by the signal handler; SM Context Create answers
+    // NF_FAILOVER from then on) come BEFORE any session is released. Releasing first
+    // told each UE to re-establish (#39) while the NRF still advertised this SMF and
+    // its SBI still accepted creates, so a prompt UE was steered straight back here,
+    // to an SMF whose association was already gone, and rejected.
+    log::info!("Shutting down...");
+    nextgcore_sbi::heartbeat::deregister_self().await;
+
+    // The N4 association is kept only when durable state hands its sessions to the
+    // next incarnation, which then asks the UPF to retain them (PFCP Session
+    // Retention Information, TS 29.244 §6.2.6.2.1). Without durable state the next
+    // incarnation knows none of these sessions, so keeping the association left them
+    // orphaned in the UPF, under CP SEIDs the next incarnation reuses. Releasing
+    // deletes them (TS 29.244 §6.2.9). SMF_PFCP_RELEASE_ON_SHUTDOWN=true/false
+    // overrides the default either way.
     let durable = smf_self()
         .read()
         .map(|ctx| ctx.state_is_enabled())
@@ -949,13 +1002,6 @@ async fn main() -> Result<()> {
             .as_deref(),
         durable,
     );
-    if !release_on_shutdown {
-        log::info!(
-            "PFCP association kept on shutdown: durable state hands its sessions to the next \
-             SMF incarnation, which asks the UPF to retain them \
-             (SMF_PFCP_RELEASE_ON_SHUTDOWN=true releases it)"
-        );
-    }
     if release_on_shutdown {
         for client in pfcp_clients.iter() {
             if !client.is_associated().await {
@@ -966,16 +1012,28 @@ async fn main() -> Result<()> {
                 Err(e) => log::warn!("PFCP Association Release to {} failed: {e}", client.peer()),
             }
         }
+    } else {
+        log::info!(
+            "PFCP association kept on shutdown: durable state hands its 5G sessions to the \
+             next SMF incarnation, which asks the UPF to retain them \
+             (SMF_PFCP_RELEASE_ON_SHUTDOWN=true releases it)"
+        );
+        // #718 review M4: the EPC PDN connections are NOT durable (the snapshot has
+        // no session list, #687). The next incarnation cannot ask for them, and its
+        // retention request keeps every session of the association, so left alone
+        // they would be orphaned in the PGW-U while the SGW, MME and UE kept
+        // believing in them. Delete each one at the PGW-U and toward its SGW with
+        // "Reactivation requested", as a PGW-U restart would (TS 23.007 §16).
+        let (deleted, told) = shutdown_epc_pdn_connections().await;
+        if deleted + told > 0 {
+            log::warn!(
+                "Shutdown: {deleted} EPC PFCP session(s) deleted at the PGW-U, {told} \
+                 PDN connection(s) deleted toward the SGW; EPC sessions do not survive a \
+                 PGW-C restart"
+            );
+        }
     }
     pfcp_listener_handle.abort();
-
-    log::info!("Shutting down...");
-
-    // #235: NFDeregister (TS 29.510 5.2.2.2.3) BEFORE the listener goes
-    // away, so the NRF stops handing this profile to consumers instead of
-    // waiting out its supervision timer. Stopping the server first would
-    // open the bad window: not serving, but still advertised.
-    nextgcore_sbi::heartbeat::deregister_self().await;
 
     // Stop SBI server
     sbi_server
@@ -2140,8 +2198,11 @@ async fn pfcp_session_establish(
     let smf_ip = client.node_ip();
     let mut builder = PfcpMessageBuilder::new();
 
-    // Node ID (IPv4, with the mandatory Node ID Type octet — TS 29.244 8.2.38)
-    builder.add_node_id_ipv4(smf_ip);
+    // Node ID (TS 29.244 §8.2.38): the CP function's identity, which since #797 may
+    // be an FQDN and is not necessarily the F-SEID address below.
+    let mut node_id_ie = bytes::BytesMut::new();
+    client.node_id().encode(&mut node_id_ie);
+    builder.add_node_id(&node_id_ie);
 
     // F-SEID (SMF's SEID)
     builder.add_f_seid(smf_n4_seid, Some(smf_ip), None);
@@ -3257,6 +3318,14 @@ fn validate_sm_context_create_data(body: &serde_json::Value) -> Option<&'static 
 async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     log::info!("SM Context Create request received");
 
+    // #718 review M3: a shutting-down SMF takes no new SM context. Its N4
+    // association is about to be released or handed to the next incarnation, so a
+    // session created now would be torn down immediately or never reach the UPF.
+    // NF_FAILOVER (TS 29.500 Table 5.2.7.2-1) lets the AMF re-select an SMF at once.
+    if let Some(refusal) = refuse_create_while_shutting_down(SHUTDOWN.load(Ordering::SeqCst)) {
+        return refusal;
+    }
+
     // Parse request body
     let req_body: serde_json::Value = match &request.http.content {
         Some(content) => match serde_json::from_str(content) {
@@ -4332,7 +4401,7 @@ fn smf_n4_seid_for(sm_context_ref: &str) -> u64 {
             .ok()
             .and_then(|m| m.get(sm_context_ref).copied())
     });
-    inherited.unwrap_or_else(|| (sm_context_ref.parse::<u64>().unwrap_or(1)) | 0x1000)
+    inherited.unwrap_or_else(|| context::derive_cp_n4_seid(sm_context_ref))
 }
 
 /// Record a session's user-plane connection state (#540). The Downlink Data
@@ -5505,7 +5574,7 @@ async fn trigger_network_initiated_service_request(seid: u64, qfi: Option<u8>) {
                 inherited
                     .get(r)
                     .copied()
-                    .unwrap_or_else(|| r.parse::<u64>().unwrap_or(1) | 0x1000)
+                    .unwrap_or_else(|| context::derive_cp_n4_seid(r))
             };
             let sess = ctx.sess_find_by_seid(seid).or_else(|| {
                 ctx.sess_find_by(|s| {
@@ -5630,6 +5699,52 @@ fn release_association_on_shutdown(value: Option<&str>, durable: bool) -> bool {
         Some("false" | "0" | "no") => false,
         _ => !durable,
     }
+}
+
+/// The answer to an SM Context Create while the SMF shuts down (#718 review M3):
+/// 500 NF_FAILOVER, "the requester may trigger an immediate re-selection of an
+/// alternative NF" (TS 29.500 Table 5.2.7.2-1). `None` while running.
+fn refuse_create_while_shutting_down(shutting_down: bool) -> Option<SbiResponse> {
+    if !shutting_down {
+        return None;
+    }
+    log::warn!("SM Context Create refused: the SMF is shutting down");
+    Some(problem_response(
+        500,
+        "NF_FAILOVER",
+        "the SMF is shutting down",
+    ))
+}
+
+/// Delete every EPC PDN connection on a shutdown that keeps the N4 association
+/// (#718 review M4). Returns `(PFCP sessions deleted at the PGW-U, PDN connections
+/// deleted toward the SGW)`.
+///
+/// The PFCP sessions are deleted first, one Session Deletion each, so the PGW-U
+/// does not keep them under an association the next incarnation asks it to retain
+/// whole. Then each PDN connection is deleted toward its SGW-C with "Reactivation
+/// requested", exactly as after a PGW-U restart (#687).
+async fn shutdown_epc_pdn_connections() -> (usize, usize) {
+    let epc: Vec<(u64, u64)> = smf_self()
+        .read()
+        .map(|ctx| {
+            ctx.sess_find_all_by(|s| s.epc && s.upf_n4_seid != 0)
+                .into_iter()
+                .map(|s| (s.smf_n4_seid, s.upf_n4_seid))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut deleted = 0;
+    for (smf_n4_seid, upf_seid) in epc {
+        match pfcp_session_delete(smf_n4_seid, upf_seid).await {
+            Ok(()) => deleted += 1,
+            Err(e) => log::warn!(
+                "Shutdown: PFCP Session Deletion of EPC session {smf_n4_seid:#x} failed: {e}"
+            ),
+        }
+    }
+    let told = restoration::release_epc_pdn_connections("PGW-C shutting down").await;
+    (deleted, told)
 }
 
 /// Send a 5GSM message to the UE via the AMF (Namf_Communication
@@ -7113,6 +7228,54 @@ mod tests {
         assert!(release_association_on_shutdown(Some("1"), true));
         assert!(!release_association_on_shutdown(Some("false"), false));
         assert!(!release_association_on_shutdown(Some("No"), false));
+    }
+
+    /// #718 review M3: a shutting-down SMF refuses a new SM context with
+    /// NF_FAILOVER, so the AMF re-selects at once instead of creating a session on an
+    /// SMF whose association is about to go.
+    #[test]
+    fn a_shutting_down_smf_refuses_new_sm_contexts_with_nf_failover() {
+        assert!(refuse_create_while_shutting_down(false).is_none());
+        let refusal = refuse_create_while_shutting_down(true).expect("refused");
+        assert_eq!(refusal.status, 500);
+        let body: serde_json::Value =
+            serde_json::from_str(refusal.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["cause"], "NF_FAILOVER");
+    }
+
+    /// #718 review M4: a shutdown that keeps the N4 association for durable state
+    /// still deletes every EPC PFCP session at the PGW-U. EPC PDN connections are not
+    /// in the snapshot, so the next incarnation could not ask for them, and its
+    /// retention request would keep them in the PGW-U with nobody owning them.
+    #[tokio::test]
+    async fn a_shutdown_that_keeps_the_association_deletes_the_epc_sessions() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        smf_context_init(64, 256, 512);
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        let sess_id = {
+            let ctx = smf_self();
+            let ctx = ctx.read().unwrap();
+            // Leftovers of earlier tests; the state lock is held, so they belong to
+            // nobody running now.
+            for sess in ctx.sess_find_all_by(|s| s.epc && s.upf_n4_seid != 0) {
+                ctx.sess_remove(sess.id);
+            }
+            let ue = ctx.ue_add_by_imsi(b"001010000071804").expect("ue");
+            let mut sess = ctx.sess_add_by_apn(ue.id, "internet", 6).expect("sess");
+            sess.upf_n4_seid = 0x7184;
+            ctx.sess_update(&sess);
+            sess.id
+        };
+        let (deleted, _told) = shutdown_epc_pdn_connections().await;
+        let seen = upf.seen();
+        if let Ok(ctx) = smf_self().read() {
+            ctx.sess_remove(sess_id);
+        }
+        assert_eq!(deleted, 1, "the EPC session was deleted at the PGW-U");
+        assert!(
+            seen.contains(&pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST),
+            "a Session Deletion Request reached the PGW-U: {seen:?}"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -9552,6 +9715,53 @@ mod tests {
             rest = &rest[4 + len..];
         }
         out
+    }
+
+    /// #797: the Session Establishment Request carries the configured Node ID (the
+    /// Service FQDN on k8s) and a CP F-SEID with the routable F-SEID address. Before
+    /// #797 both were `SMF_PFCP_ADDR`, so a wildcard bind put 0.0.0.0 in both and the
+    /// UPF had no address for this CP function.
+    #[tokio::test]
+    async fn the_establishment_carries_the_node_id_and_a_routable_f_seid() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let identity = n4_identity::N4Identity {
+            node_id: nextgcore_pfcp::types::NodeId::new_fqdn(
+                "smf.nextg-system.svc.cluster.local".into(),
+            ),
+            f_seid_ipv4: [10, 1, 2, 3],
+            node_id_explicit: true,
+        };
+        let upf = pfcp_path::stand_in::associated_upf_as(&identity).await;
+        let qos = SessionQos {
+            qfi: 9,
+            ambr_ul_bps: 100_000_000,
+            ambr_dl_bps: 100_000_000,
+            xr_flow: None,
+        };
+        pfcp_session_establish(0x0797, [10, 45, 7, 97], "internet", 1, &qos)
+            .await
+            .expect("the stand-in UPF must accept the establishment");
+
+        let bodies = upf.establishment_bodies();
+        assert_eq!(bodies.len(), 1);
+        let ies = flat_ies(&bodies[0]);
+        let ie = |ty: u16| -> Vec<u8> {
+            ies.iter()
+                .find(|(t, _)| *t == ty)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("IE {ty} missing"))
+        };
+        let mut want_node_id = vec![2u8];
+        for label in ["smf", "nextg-system", "svc", "cluster", "local"] {
+            want_node_id.push(label.len() as u8);
+            want_node_id.extend_from_slice(label.as_bytes());
+        }
+        assert_eq!(ie(n4_build::pfcp_ie::NODE_ID), want_node_id);
+        // F-SEID (§8.2.37): flags (V4 = bit 2), SEID, IPv4.
+        let f_seid = ie(n4_build::pfcp_ie::F_SEID);
+        assert_eq!(f_seid[0] & 0x02, 0x02, "V4 set");
+        assert_eq!(u64::from_be_bytes(f_seid[1..9].try_into().unwrap()), 0x0797);
+        assert_eq!(&f_seid[9..13], &[10, 1, 2, 3]);
     }
 
     /// #80 criterion 1: the LIVE establishment path provisions a Create URR, and both

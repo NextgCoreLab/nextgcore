@@ -843,8 +843,11 @@ impl PfcpServer {
     /// TS 29.244 §6.2.6.2.2).
     ///
     /// `entities` empty means keep every session (Table 7.4.4.1-2). Otherwise a
-    /// session is kept when its CP F-SEID address, or the address it was established
-    /// from, is one of the listed CP PFCP entities. Kept sessions now report to
+    /// session is kept when its CP F-SEID address is one of the listed CP PFCP
+    /// entities (§8.2.135), or, as an extension the spec does not define, when the
+    /// address the session was established from is: a CP function that put an
+    /// unroutable address in its F-SEID (smfd before #797 sent 0.0.0.0) is still
+    /// matched by the address it actually used. Kept sessions now report to
     /// `new_peer`: the association is the same CP function at a new address, and the
     /// old address may be dead. Returns how many sessions were kept.
     async fn retain_association_sessions(
@@ -4461,8 +4464,10 @@ mod tests {
     /// while the pod IP is not.
     const SMF_NODE: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 9);
 
-    /// The CP SEID every incarnation hands its first session: smfd derives it from
-    /// the SM context reference, which restarts at 1 (`1 | 0x1000`).
+    /// The CP SEID every incarnation hands its first session: smfd without durable
+    /// state derives it from the SM context reference, which restarts at 1 in every
+    /// process (`1 | 0x1000` before the #718 review, `1 << 48 | 1` since). The value
+    /// is arbitrary here; what matters is that each incarnation reuses it.
     const FIRST_CP_SEID: u64 = 0x1001;
 
     /// An Association Setup Request body: Node ID, Recovery Time Stamp and, when

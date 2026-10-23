@@ -171,34 +171,65 @@ pub async fn notify_sessions_unrecoverable(reason: &str) -> usize {
         notifiable.len(),
         silent
     );
-    for (sm_context_ref, uri) in &notifiable {
-        // #667: release the session through the UE, asking it to come back (#39),
-        // so the user plane is rebuilt on the restarted UPF. A binding without the
-        // UE's identity cannot be addressed that way, and gets the bare RELEASED
-        // status the AMF was sent before #667.
-        let ue = lookup_ue(sm_context_ref);
-        match ue {
-            Some((supi, psi)) => {
-                log::warn!(
-                    "releasing sm_context_ref={sm_context_ref} after {reason}: PDU Session \
-                     Release Command #39 (reactivation requested) to {supi} PSI {psi} via {uri}"
-                );
-                crate::release_for_reactivation(sm_context_ref, uri, &supi, psi).await;
-            }
-            None => {
-                log::warn!(
-                    "releasing sm_context_ref={sm_context_ref} after {reason}; notifying {uri}"
-                );
-                crate::send_sm_context_status_notification(
-                    Some(uri),
-                    RESOURCE_STATUS_RELEASED,
-                    Some(reason),
-                )
-                .await;
-            }
+    // #718 review m2: a bounded parallel fan-out. One sequential POST per session
+    // could not finish inside a pod's termination grace period with many UEs, and
+    // the UEs after the SIGKILL heard nothing. Progress is logged, so an operator
+    // can see how many were left if it is cut short anyway.
+    let total = notifiable.len();
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(RELEASE_FANOUT));
+    let mut releases = tokio::task::JoinSet::new();
+    for (sm_context_ref, uri) in notifiable {
+        let Ok(permit) = permits.clone().acquire_owned().await else {
+            break;
+        };
+        let reason = reason.to_string();
+        releases.spawn(async move {
+            let _permit = permit;
+            release_one_unrecoverable(&sm_context_ref, &uri, &reason).await;
+        });
+    }
+    let mut done = 0usize;
+    while releases.join_next().await.is_some() {
+        done += 1;
+        if done.is_multiple_of(100) || done == total {
+            log::info!(
+                "PFCP restoration ({reason}): {done}/{total} PDU session release(s) sent, \
+                 {} remaining",
+                total - done
+            );
         }
     }
-    notifiable.len()
+    total
+}
+
+/// How many PDU session releases [`notify_sessions_unrecoverable`] has in flight at
+/// once (#718 review m2).
+const RELEASE_FANOUT: usize = 16;
+
+/// Release one PDU session that can no longer be honoured.
+async fn release_one_unrecoverable(sm_context_ref: &str, uri: &str, reason: &str) {
+    // #667: release the session through the UE, asking it to come back (#39),
+    // so the user plane is rebuilt on the restarted UPF. A binding without the
+    // UE's identity cannot be addressed that way, and gets the bare RELEASED
+    // status the AMF was sent before #667.
+    match lookup_ue(sm_context_ref) {
+        Some((supi, psi)) => {
+            log::warn!(
+                "releasing sm_context_ref={sm_context_ref} after {reason}: PDU Session \
+                 Release Command #39 (reactivation requested) to {supi} PSI {psi} via {uri}"
+            );
+            crate::release_for_reactivation(sm_context_ref, uri, &supi, psi).await;
+        }
+        None => {
+            log::warn!("releasing sm_context_ref={sm_context_ref} after {reason}; notifying {uri}");
+            crate::send_sm_context_status_notification(
+                Some(uri),
+                RESOURCE_STATUS_RELEASED,
+                Some(reason),
+            )
+            .await;
+        }
+    }
 }
 
 /// #687: release every EPC PDN connection after its PGW-U restarted or released
