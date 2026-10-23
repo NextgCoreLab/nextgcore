@@ -48,6 +48,7 @@ pub mod mbs_session; // Rel-17: MBS multicast/broadcast session
 mod n2_transfer; // #417: the N2 SM transfers, on the generated NGAP codec
 mod n4_build;
 mod n4_handler;
+mod n4_identity; // #797: the PFCP Node ID and CP F-SEID address
 mod pfcp_path;
 mod pfcp_sm;
 mod policy;
@@ -750,15 +751,56 @@ async fn main() -> Result<()> {
         anyhow::ensure!(!peers.is_empty(), "UPF_PFCP_ADDR contains no usable peer");
         peers
     };
-    let smf_node_ip: [u8; 4] = {
-        let s = std::env::var("SMF_PFCP_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
-        let parts: Vec<u8> = s.split('.').filter_map(|p| p.parse().ok()).collect();
-        if parts.len() == 4 {
-            [parts[0], parts[1], parts[2], parts[3]]
-        } else {
-            [127, 0, 0, 1]
-        }
+    // #797: the Node ID and the CP F-SEID address, resolved separately so a wildcard
+    // bind never signals 0.0.0.0 and a k8s Service FQDN keeps the Node ID stable
+    // across pod restarts (TS 29.244 §5.8.1). See `n4_identity.rs`.
+    let n4_identity = {
+        let env = |k: &str| {
+            std::env::var(k)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        let (bind, node_id, advertise) = (
+            env("SMF_PFCP_ADDR"),
+            env("SMF_PFCP_NODE_ID"),
+            env("SMF_PFCP_ADVERTISE_ADDR"),
+        );
+        // Only consulted when nothing configured names a routable address: the local
+        // address that routes toward the first UPF.
+        let first_peer = match &upf_pfcp_peers[0] {
+            pfcp_path::UpfPeerSpec::Literal(sa) => Some(*sa),
+            pfcp_path::UpfPeerSpec::Hostname(host, port) => {
+                tokio::net::lookup_host((host.as_str(), *port))
+                    .await
+                    .ok()
+                    .and_then(|mut it| it.find(SocketAddr::is_ipv4))
+            }
+        };
+        n4_identity::resolve_n4_identity(
+            &n4_identity::N4IdentityConfig {
+                bind_addr: bind.as_deref(),
+                node_id: node_id.as_deref(),
+                advertise_addr: advertise.as_deref(),
+            },
+            || first_peer.and_then(n4_identity::local_ipv4_toward),
+        )
+        .map_err(|e| anyhow::anyhow!("Invalid SMF N4 identity: {e}"))?
     };
+    log::info!(
+        "SMF N4 identity: Node ID {}, CP F-SEID address {}",
+        n4_identity::display_node_id(&n4_identity.node_id),
+        std::net::Ipv4Addr::from(n4_identity.f_seid_ipv4)
+    );
+    if !n4_identity.node_id_explicit {
+        log::warn!(
+            "SMF_PFCP_NODE_ID is unset and SMF_PFCP_ADDR is the wildcard, so the PFCP Node ID \
+             is the routed address {}. If that address changes across a restart (a k8s pod \
+             IP), the UPF sees a different CP function; set SMF_PFCP_NODE_ID to a stable \
+             FQDN or IP (TS 29.244 §5.8.1)",
+            std::net::Ipv4Addr::from(n4_identity.f_seid_ipv4)
+        );
+    }
 
     let pfcp_socket = Arc::new(
         tokio::net::UdpSocket::bind(pfcp_bind_addr)
@@ -783,7 +825,7 @@ async fn main() -> Result<()> {
     let mut pfcp_clients: Vec<Arc<pfcp_path::PfcpClient>> = Vec::new();
     for spec in &upf_pfcp_peers {
         pfcp_clients.push(Arc::new(
-            pfcp_path::client_for_peer(pfcp_socket.clone(), spec, smf_node_ip).await,
+            pfcp_path::client_for_peer(pfcp_socket.clone(), spec, &n4_identity).await,
         ));
     }
     // Installs the whole pool and pool slot 0 as the process-wide default
@@ -797,7 +839,6 @@ async fn main() -> Result<()> {
         log::error!("Failed to bind the S5/S8 GTP-C socket: {e}");
         return Err(anyhow::anyhow!("S5/S8 bind failed: {e}"));
     }
-    let pfcp_client = pfcp_clients[0].clone();
 
     // #191: hand each client the Recovery Time Stamp the durable snapshot recorded
     // for its peer, BEFORE the association loop is spawned. This is what turns the
@@ -818,41 +859,7 @@ async fn main() -> Result<()> {
     // PFCP receive/dispatch loop: responses complete pending transactions;
     // node-level requests (heartbeat, association release) are answered by
     // the engine; Session Report Requests are handled here.
-    let shutdown_pfcp = shutdown.clone();
-    let clients_rx = pfcp_clients.clone();
-    let sock_rx = pfcp_socket.clone();
-    let pfcp_listener_handle = tokio::spawn(async move {
-        let mut buf = vec![0u8; 8192];
-        loop {
-            if shutdown_pfcp.load(Ordering::SeqCst) || SHUTDOWN.load(Ordering::SeqCst) {
-                break;
-            }
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(1),
-                sock_rx.recv_from(&mut buf),
-            )
-            .await
-            {
-                Ok(Ok((len, peer))) => {
-                    let pkt = buf[..len].to_vec();
-                    // Route the datagram to the client owning this peer so
-                    // transaction matching and association state stay
-                    // per-UPF. Unknown sources fall back to pool slot 0,
-                    // preserving the single-UPF behavior.
-                    let client = clients_rx
-                        .iter()
-                        .find(|c| c.peer() == peer)
-                        .unwrap_or(&clients_rx[0]);
-                    if !client.on_datagram(&pkt, peer).await {
-                        handle_pfcp_incoming(&sock_rx, &pkt, peer).await;
-                    }
-                }
-                Ok(Err(e)) => log::warn!("PFCP listener recv error: {e}"),
-                Err(_) => {} // timeout — loop and re-check shutdown
-            }
-        }
-        log::info!("SMF N4 PFCP listener stopped");
-    });
+    let pfcp_listener_handle = spawn_pfcp_listener(pfcp_socket.clone(), pfcp_clients.clone());
 
     // N4 association maintenance: establish the PFCP association at startup
     // (Node ID + Recovery Time Stamp, TS 29.244 6.2.6) and keep it alive
@@ -937,38 +944,34 @@ async fn main() -> Result<()> {
 
     pfcp_assoc_handle.abort();
 
-    // Graceful shutdown. #677: the N4 association is NOT released by default. A
-    // UPF answers an Association Release by deleting every session of the
-    // association (TS 29.244 §6.2.9), so releasing on a mere restart cut every
-    // UE's traffic; left in place, the UPF keeps forwarding while the next SMF
-    // incarnation associates (TS 23.527). An SMF being removed for good opts in
-    // with SMF_PFCP_RELEASE_ON_SHUTDOWN=true.
+    // Graceful shutdown (#677, #718).
+    //
+    // #718 review M3: first stop being found. NFDeregister (TS 29.510 §5.2.2.2.3)
+    // and the SHUTDOWN flag (set by the signal handler; SM Context Create answers
+    // NF_FAILOVER from then on) come BEFORE any session is released. Releasing first
+    // told each UE to re-establish (#39) while the NRF still advertised this SMF and
+    // its SBI still accepted creates, so a prompt UE was steered straight back here,
+    // to an SMF whose association was already gone, and rejected.
+    log::info!("Shutting down...");
+    let durable = smf_self()
+        .read()
+        .map(|ctx| ctx.state_is_enabled())
+        .unwrap_or(false);
     let release_on_shutdown = release_association_on_shutdown(
         std::env::var("SMF_PFCP_RELEASE_ON_SHUTDOWN")
             .ok()
             .as_deref(),
+        durable,
     );
-    if !release_on_shutdown {
-        log::info!(
-            "PFCP association kept on shutdown: the UPF keeps forwarding the PDU sessions \
-             (SMF_PFCP_RELEASE_ON_SHUTDOWN=true releases it)"
-        );
-    }
-    if release_on_shutdown && pfcp_client.is_associated().await {
-        match pfcp_client.release_association().await {
-            Ok(()) => log::info!("PFCP association released"),
-            Err(e) => log::warn!("PFCP Association Release failed: {e}"),
-        }
-    }
-    pfcp_listener_handle.abort();
-
-    log::info!("Shutting down...");
-
-    // #235: NFDeregister (TS 29.510 5.2.2.2.3) BEFORE the listener goes
-    // away, so the NRF stops handing this profile to consumers instead of
-    // waiting out its supervision timer. Stopping the server first would
-    // open the bad window: not serving, but still advertised.
-    nextgcore_sbi::heartbeat::deregister_self().await;
+    graceful_shutdown(
+        async {
+            nextgcore_sbi::heartbeat::deregister_self().await;
+        },
+        &pfcp_clients,
+        release_on_shutdown,
+        pfcp_listener_handle,
+    )
+    .await;
 
     // Stop SBI server
     sbi_server
@@ -2133,8 +2136,11 @@ async fn pfcp_session_establish(
     let smf_ip = client.node_ip();
     let mut builder = PfcpMessageBuilder::new();
 
-    // Node ID (IPv4, with the mandatory Node ID Type octet — TS 29.244 8.2.38)
-    builder.add_node_id_ipv4(smf_ip);
+    // Node ID (TS 29.244 §8.2.38): the CP function's identity, which since #797 may
+    // be an FQDN and is not necessarily the F-SEID address below.
+    let mut node_id_ie = bytes::BytesMut::new();
+    client.node_id().encode(&mut node_id_ie);
+    builder.add_node_id(&node_id_ie);
 
     // F-SEID (SMF's SEID)
     builder.add_f_seid(smf_n4_seid, Some(smf_ip), None);
@@ -3250,6 +3256,14 @@ fn validate_sm_context_create_data(body: &serde_json::Value) -> Option<&'static 
 async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     log::info!("SM Context Create request received");
 
+    // #718 review M3: a shutting-down SMF takes no new SM context. Its N4
+    // association is about to be released or handed to the next incarnation, so a
+    // session created now would be torn down immediately or never reach the UPF.
+    // NF_FAILOVER (TS 29.500 Table 5.2.7.2-1) lets the AMF re-select an SMF at once.
+    if let Some(refusal) = refuse_create_while_shutting_down(SHUTDOWN.load(Ordering::SeqCst)) {
+        return refusal;
+    }
+
     // Parse request body
     let req_body: serde_json::Value = match &request.http.content {
         Some(content) => match serde_json::from_str(content) {
@@ -4325,7 +4339,7 @@ fn smf_n4_seid_for(sm_context_ref: &str) -> u64 {
             .ok()
             .and_then(|m| m.get(sm_context_ref).copied())
     });
-    inherited.unwrap_or_else(|| (sm_context_ref.parse::<u64>().unwrap_or(1)) | 0x1000)
+    inherited.unwrap_or_else(|| context::derive_cp_n4_seid(sm_context_ref))
 }
 
 /// Record a session's user-plane connection state (#540). The Downlink Data
@@ -5620,7 +5634,7 @@ async fn trigger_network_initiated_service_request(seid: u64, qfi: Option<u8>) {
                 inherited
                     .get(r)
                     .copied()
-                    .unwrap_or_else(|| r.parse::<u64>().unwrap_or(1) | 0x1000)
+                    .unwrap_or_else(|| context::derive_cp_n4_seid(r))
             };
             let sess = ctx.sess_find_by_seid(seid).or_else(|| {
                 ctx.sess_find_by(|s| {
@@ -5733,13 +5747,235 @@ async fn send_n1_n2_paging_request(amf_uri: &str, supi: &str, psi: u8, qfi: Opti
     }
 }
 
-/// Whether a graceful shutdown releases the PFCP association (#677), from
-/// `SMF_PFCP_RELEASE_ON_SHUTDOWN`. Off unless set to `true`/`1`/`yes`.
-fn release_association_on_shutdown(value: Option<&str>) -> bool {
-    matches!(
-        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
-        Some("true" | "1" | "yes")
+/// The N4 receive/dispatch loop over the one PFCP socket.
+///
+/// Stopped only by aborting the handle. #718 review N1: it used to break as soon
+/// as SHUTDOWN was set, which the signal handler does first, so the shutdown's own
+/// PFCP requests (each pool member's Association Release, every EPC Session
+/// Deletion) got no responses and waited out T1 x N1 each, serially, until the
+/// orchestrator's SIGKILL. [`graceful_shutdown`] aborts it after its last request.
+fn spawn_pfcp_listener(
+    socket: Arc<tokio::net::UdpSocket>,
+    clients: Vec<Arc<pfcp_path::PfcpClient>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            match socket.recv_from(&mut buf).await {
+                Ok((len, peer)) => {
+                    let pkt = buf[..len].to_vec();
+                    // Route the datagram to the client owning this peer so
+                    // transaction matching and association state stay
+                    // per-UPF. Unknown sources fall back to pool slot 0,
+                    // preserving the single-UPF behavior.
+                    let Some(client) = clients
+                        .iter()
+                        .find(|c| c.peer() == peer)
+                        .or_else(|| clients.first())
+                    else {
+                        continue;
+                    };
+                    if !client.on_datagram(&pkt, peer).await {
+                        handle_pfcp_incoming(&socket, &pkt, peer).await;
+                    }
+                }
+                Err(e) => log::warn!("PFCP listener recv error: {e}"),
+            }
+        }
+    })
+}
+
+/// The graceful-shutdown sequence after the main loop exits (#677, #718).
+///
+/// #718 review M3: first stop being found. `deregister` (NFDeregister, TS 29.510
+/// §5.2.2.2.3) runs BEFORE any session is released, and SM Context Create has
+/// answered NF_FAILOVER since the signal handler set SHUTDOWN. Releasing first told
+/// each UE to re-establish (#39) while the NRF still advertised this SMF.
+///
+/// Then the N4 side, with the PFCP listener still running (#718 review N1). With
+/// `release` every pool member's association is released, concurrently. Without
+/// it (durable state) the association is kept for the next incarnation, and only
+/// the EPC PDN connections, which are not durable, are deleted. The listener is
+/// aborted last.
+async fn graceful_shutdown(
+    deregister: impl std::future::Future<Output = ()>,
+    pfcp_clients: &[Arc<pfcp_path::PfcpClient>],
+    release: bool,
+    pfcp_listener: tokio::task::JoinHandle<()>,
+) {
+    deregister.await;
+    if release {
+        let mut releases = tokio::task::JoinSet::new();
+        for client in pfcp_clients.iter().map(Arc::clone) {
+            releases.spawn(async move {
+                if !client.is_associated().await {
+                    return;
+                }
+                match client.release_association().await {
+                    Ok(()) => log::info!("PFCP association with {} released", client.peer()),
+                    Err(e) => {
+                        log::warn!("PFCP Association Release to {} failed: {e}", client.peer())
+                    }
+                }
+            });
+        }
+        while releases.join_next().await.is_some() {}
+    } else {
+        log::info!(
+            "PFCP association kept on shutdown: durable state hands its 5G sessions to the \
+             next SMF incarnation, which asks the UPF to retain them \
+             (SMF_PFCP_RELEASE_ON_SHUTDOWN=true releases it)"
+        );
+        // #718 review M4: the EPC PDN connections are NOT durable (the snapshot has
+        // no session list, #687). The next incarnation cannot ask for them, and its
+        // retention request keeps every session of the association, so left alone
+        // they would be orphaned in the PGW-U while the SGW, MME and UE kept
+        // believing in them.
+        let (deleted, told) = shutdown_epc_pdn_connections().await;
+        if deleted + told > 0 {
+            log::warn!(
+                "Shutdown: {told} EPC PDN connection(s) deleted toward the SGW, {deleted} \
+                 EPC PFCP session(s) deleted at the PGW-U; EPC sessions do not survive a \
+                 PGW-C restart"
+            );
+        }
+    }
+    pfcp_listener.abort();
+    log::info!("SMF N4 PFCP listener stopped");
+    // #718 review m2: the Delete Bearer Requests sent above, on either path, are
+    // retransmitted until answered or N3 is exhausted.
+    drain_s5s8_requests(gtp_path::s5s8_server().map(|s| s.as_ref())).await;
+}
+
+/// Whether a graceful shutdown releases the PFCP association (#677, #718).
+///
+/// `SMF_PFCP_RELEASE_ON_SHUTDOWN` decides when it is set to `true`/`1`/`yes` or
+/// `false`/`0`/`no`. Otherwise the association is released unless `durable` state
+/// is armed: only then does the next incarnation know the sessions it would take
+/// over.
+fn release_association_on_shutdown(value: Option<&str>, durable: bool) -> bool {
+    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("true" | "1" | "yes") => true,
+        Some("false" | "0" | "no") => false,
+        _ => !durable,
+    }
+}
+
+/// The answer to an SM Context Create while the SMF shuts down (#718 review M3):
+/// 500 NF_FAILOVER, "the requester may trigger an immediate re-selection of an
+/// alternative NF" (TS 29.500 Table 5.2.7.2-1). `None` while running.
+fn refuse_create_while_shutting_down(shutting_down: bool) -> Option<SbiResponse> {
+    if !shutting_down {
+        return None;
+    }
+    log::warn!("SM Context Create refused: the SMF is shutting down");
+    Some(problem_response(
+        500,
+        "NF_FAILOVER",
+        "the SMF is shutting down",
+    ))
+}
+
+/// Delete every EPC PDN connection on a shutdown that keeps the N4 association
+/// (#718 review M4). Returns `(PFCP sessions deleted at the PGW-U, PDN connections
+/// deleted toward the SGW)`.
+async fn shutdown_epc_pdn_connections() -> (usize, usize) {
+    shutdown_epc_pdn_connections_via(
+        gtp_path::s5s8_server().map(|s| s.as_ref()),
+        gtp_path::GTPC_PORT,
     )
+    .await
+}
+
+/// How many EPC PFCP Session Deletions a shutdown has in flight at once (#718
+/// review m3), as for the 5G releases.
+const SHUTDOWN_EPC_FANOUT: usize = 16;
+
+/// [`shutdown_epc_pdn_connections`] through `server`, addressing each SGW-C at
+/// `sgw_port` (tests bind an ephemeral one).
+///
+/// #718 review N1/m1: the SGW first. The Delete Bearer Request, with "Reactivation
+/// requested", is what reaches the MME and the UE, so it must not queue behind the
+/// PFCP round trips. The PFCP targets are collected before, because the release
+/// drops the sessions from the context. Then the Session Deletions, at most
+/// [`SHUTDOWN_EPC_FANOUT`] at once, so the PGW-U does not keep them under an
+/// association the next incarnation asks it to retain whole.
+async fn shutdown_epc_pdn_connections_via(
+    server: Option<&gtp_path::S5S8Server>,
+    sgw_port: u16,
+) -> (usize, usize) {
+    let epc: Vec<(u64, u64)> = smf_self()
+        .read()
+        .map(|ctx| {
+            ctx.sess_find_all_by(|s| s.epc && s.upf_n4_seid != 0)
+                .into_iter()
+                .map(|s| (s.smf_n4_seid, s.upf_n4_seid))
+                .collect()
+        })
+        .unwrap_or_default();
+    let told = match server {
+        Some(server) => {
+            restoration::release_epc_pdn_connections_via(server, sgw_port, "PGW-C shutting down")
+                .await
+        }
+        None => 0,
+    };
+    let permits = Arc::new(tokio::sync::Semaphore::new(SHUTDOWN_EPC_FANOUT));
+    let mut deletions = tokio::task::JoinSet::new();
+    for (smf_n4_seid, upf_seid) in epc {
+        let Ok(permit) = permits.clone().acquire_owned().await else {
+            break;
+        };
+        deletions.spawn(async move {
+            let _permit = permit;
+            match pfcp_session_delete(smf_n4_seid, upf_seid).await {
+                Ok(()) => true,
+                Err(e) => {
+                    log::warn!(
+                        "Shutdown: PFCP Session Deletion of EPC session {smf_n4_seid:#x} \
+                         failed: {e}"
+                    );
+                    false
+                }
+            }
+        });
+    }
+    let mut deleted = 0;
+    while let Some(done) = deletions.join_next().await {
+        if matches!(done, Ok(true)) {
+            deleted += 1;
+        }
+    }
+    (deleted, told)
+}
+
+/// How long a shutdown keeps retransmitting its own S5/S8 requests (#718 review
+/// m2): T3-RESPONSE x (N3-REQUESTS + 1) with the defaults, 3 s x 4. The SGW gets
+/// the Delete Bearer Requests' retransmissions instead of losing them to a lost
+/// datagram when the process exits.
+const SHUTDOWN_GTP_DRAIN: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// Wait, at most [`SHUTDOWN_GTP_DRAIN`], until no S5/S8 request this node sent is
+/// still awaiting its answer: the T3/N3 task retransmits them meanwhile.
+async fn drain_s5s8_requests(server: Option<&gtp_path::S5S8Server>) {
+    let Some(server) = server else {
+        return;
+    };
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_GTP_DRAIN;
+    loop {
+        let outstanding = server.outstanding().await;
+        if outstanding == 0 {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            log::warn!(
+                "Shutdown: {outstanding} S5/S8 request(s) still unanswered after {:?}",
+                SHUTDOWN_GTP_DRAIN
+            );
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 /// Send a 5GSM message to the UE via the AMF (Namf_Communication
@@ -7192,16 +7428,438 @@ async fn handle_amf_status_change(sm_context_ref: &str) -> SbiResponse {
 mod tests {
     use super::*;
 
-    /// #677: a graceful shutdown keeps the PFCP association unless the operator
-    /// opts in, because a UPF deletes every session of a released association.
+    /// #718 (revising #677): a graceful shutdown keeps the PFCP association only
+    /// when durable state hands the sessions on. Without it the next incarnation
+    /// knows none of them, and a kept association left them orphaned in the UPF.
     #[test]
-    fn a_shutdown_keeps_the_pfcp_association_unless_told_otherwise() {
-        assert!(!release_association_on_shutdown(None));
-        assert!(!release_association_on_shutdown(Some("")));
-        assert!(!release_association_on_shutdown(Some("false")));
-        assert!(release_association_on_shutdown(Some("true")));
-        assert!(release_association_on_shutdown(Some(" TRUE ")));
-        assert!(release_association_on_shutdown(Some("1")));
+    fn a_shutdown_keeps_the_pfcp_association_only_with_durable_state() {
+        // Default, no durable state: released.
+        assert!(release_association_on_shutdown(None, false));
+        assert!(release_association_on_shutdown(Some(""), false));
+        // Durable state: kept.
+        assert!(!release_association_on_shutdown(None, true));
+        assert!(!release_association_on_shutdown(Some("  "), true));
+        // The operator's explicit choice wins either way.
+        assert!(release_association_on_shutdown(Some(" TRUE "), true));
+        assert!(release_association_on_shutdown(Some("1"), true));
+        assert!(!release_association_on_shutdown(Some("false"), false));
+        assert!(!release_association_on_shutdown(Some("No"), false));
+    }
+
+    /// #718 review M3: a shutting-down SMF refuses a new SM context with
+    /// NF_FAILOVER, so the AMF re-selects at once instead of creating a session on an
+    /// SMF whose association is about to go.
+    #[test]
+    fn a_shutting_down_smf_refuses_new_sm_contexts_with_nf_failover() {
+        assert!(refuse_create_while_shutting_down(false).is_none());
+        let refusal = refuse_create_while_shutting_down(true).expect("refused");
+        assert_eq!(refusal.status, 500);
+        let body: serde_json::Value =
+            serde_json::from_str(refusal.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["cause"], "NF_FAILOVER");
+    }
+
+    /// A raw UPF on loopback for the shutdown tests (#718 review N1): answers
+    /// Session Deletion and Association Release with Request Accepted, and records
+    /// every request as `(message type, sequence number)`, retransmissions included.
+    async fn raw_upf(
+        order: Option<std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>>,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::Mutex<Vec<(u8, u32)>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        raw_upf_delayed(order, std::time::Duration::ZERO, None).await
+    }
+
+    /// [`raw_upf`] answering each Session Deletion after `delay`, each on its own
+    /// task (so answers to concurrent requests overlap), and stamping the arrival of
+    /// each deletion into `arrivals` when given.
+    async fn raw_upf_delayed(
+        order: Option<std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>>,
+        delay: std::time::Duration,
+        arrivals: Option<std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>>,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::Mutex<Vec<(u8, u32)>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use pfcp_path::pfcp_message_type as t;
+        let upf = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = upf.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let tlv = |ty: u16, v: &[u8]| {
+            let mut o = ty.to_be_bytes().to_vec();
+            o.extend_from_slice(&(v.len() as u16).to_be_bytes());
+            o.extend_from_slice(v);
+            o
+        };
+        let upf = Arc::new(upf);
+        let task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            while let Ok((len, from)) = upf.recv_from(&mut buf).await {
+                let Some(h) = pfcp_path::parse_wire_header(&buf[..len]) else {
+                    continue;
+                };
+                sink.lock().unwrap().push((h.msg_type, h.sequence_number));
+                let reply = match h.msg_type {
+                    t::SESSION_DELETION_REQUEST => {
+                        if let Some(a) = &arrivals {
+                            a.lock().unwrap().push(std::time::Instant::now());
+                        }
+                        let reply = pfcp_path::encode_wire_message(
+                            t::SESSION_DELETION_RESPONSE,
+                            Some(h.seid),
+                            h.sequence_number,
+                            &tlv(19, &[1]),
+                        );
+                        let upf = upf.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            let _ = upf.send_to(&reply, from).await;
+                        });
+                        continue;
+                    }
+                    t::ASSOCIATION_RELEASE_REQUEST => {
+                        if let Some(o) = &order {
+                            o.lock().unwrap().push("association release");
+                        }
+                        let mut body = tlv(60, &[0, 127, 0, 0, 4]);
+                        body.extend_from_slice(&tlv(19, &[1]));
+                        pfcp_path::encode_wire_message(
+                            t::ASSOCIATION_RELEASE_RESPONSE,
+                            None,
+                            h.sequence_number,
+                            &body,
+                        )
+                    }
+                    _ => continue,
+                };
+                let _ = upf.send_to(&reply, from).await;
+            }
+        });
+        (addr, seen, task)
+    }
+
+    /// A client on its own socket toward `upf`, associated, installed as the pool,
+    /// with the REAL N4 listener reading its socket (not a test pump).
+    async fn client_behind_the_real_listener(
+        upf: std::net::SocketAddr,
+    ) -> (Arc<pfcp_path::PfcpClient>, tokio::task::JoinHandle<()>) {
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client = Arc::new(pfcp_path::PfcpClient::new(
+            sock.clone(),
+            upf,
+            [127, 0, 0, 1],
+        ));
+        client.set_assoc_state_for_test(true, None, None).await;
+        pfcp_path::set_global_pool(vec![client.clone()]);
+        let listener = spawn_pfcp_listener(sock, vec![client.clone()]);
+        (client, listener)
+    }
+
+    /// #718 review N1: the shutdown that keeps the association deletes the EPC
+    /// sessions through the REAL N4 listener, which is still running: both Session
+    /// Deletions are answered on the first transmission, concurrently, well inside
+    /// one T1. Before, the listener stopped at SIGTERM, so each deletion waited out
+    /// T1 x N1 (about 9 s), serially, and the SGW was told only after all of them.
+    #[tokio::test]
+    async fn the_shutdown_deletes_epc_sessions_through_the_live_listener_without_retransmitting() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        smf_context_init(64, 256, 512);
+        let (upf, seen, upf_task) = raw_upf(None).await;
+        let (client, listener) = client_behind_the_real_listener(upf).await;
+        let mut ids = Vec::new();
+        if let Ok(ctx) = smf_self().read() {
+            for sess in ctx.sess_find_all_by(|s| s.epc && s.upf_n4_seid != 0) {
+                ctx.sess_remove(sess.id);
+            }
+            for (i, imsi) in [b"001010000071811", b"001010000071812"].iter().enumerate() {
+                let ue = ctx.ue_add_by_imsi(&imsi[..]).expect("ue");
+                let mut sess = ctx.sess_add_by_apn(ue.id, "internet", 6).expect("sess");
+                sess.upf_n4_seid = 0x7181 + i as u64;
+                ctx.sess_update(&sess);
+                pfcp_path::record_session_peer(sess.smf_n4_seid, client.peer());
+                ids.push((sess.id, sess.smf_n4_seid));
+            }
+        }
+
+        let started = std::time::Instant::now();
+        graceful_shutdown(async {}, std::slice::from_ref(&client), false, listener).await;
+        let took = started.elapsed();
+        let requests = seen.lock().unwrap().clone();
+        upf_task.abort();
+        if let Ok(ctx) = smf_self().read() {
+            for (id, seid) in &ids {
+                ctx.sess_remove(*id);
+                pfcp_path::forget_session_peer(*seid);
+            }
+        }
+        pfcp_path::clear_global_upf_for_test();
+
+        let deletions: Vec<u32> = requests
+            .iter()
+            .filter(|(ty, _)| *ty == pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST)
+            .map(|(_, seq)| *seq)
+            .collect();
+        assert_eq!(
+            deletions.len(),
+            2,
+            "one Session Deletion per EPC session, no retransmission: {requests:?}"
+        );
+        assert_ne!(deletions[0], deletions[1]);
+        assert!(
+            took < std::time::Duration::from_secs(2),
+            "answered on the first transmission, well inside T1: {took:?}"
+        );
+    }
+
+    /// #718 review M3/n4: the shutdown deregisters from the NRF BEFORE it releases
+    /// the association (and with it sends each UE #39), and the release itself goes
+    /// through the live listener and is answered.
+    #[tokio::test]
+    async fn the_shutdown_deregisters_before_it_releases() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (upf, seen, upf_task) = raw_upf(Some(order.clone())).await;
+        let (client, listener) = client_behind_the_real_listener(upf).await;
+        let dereg_order = order.clone();
+
+        let started = std::time::Instant::now();
+        graceful_shutdown(
+            async move {
+                dereg_order.lock().unwrap().push("deregister");
+            },
+            std::slice::from_ref(&client),
+            true,
+            listener,
+        )
+        .await;
+        let took = started.elapsed();
+        let releases = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(ty, _)| *ty == pfcp_path::pfcp_message_type::ASSOCIATION_RELEASE_REQUEST)
+            .count();
+        upf_task.abort();
+        pfcp_path::clear_global_upf_for_test();
+
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["deregister", "association release"]
+        );
+        assert_eq!(releases, 1, "answered on the first transmission");
+        assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+        assert!(!client.is_associated().await);
+    }
+
+    /// #718 review R1: with a UPF pool the shutdown releases every association
+    /// concurrently, through the real listener on one shared N4 socket, and each
+    /// session is torn down ONCE: by the teardown of the association it lives on
+    /// (TS 29.244 §6.2.8.2, per association). Before, every concurrent teardown
+    /// snapshotted every session in the process, and each UE got one PDU Session
+    /// Release Command per pool member.
+    #[tokio::test]
+    async fn a_pool_shutdown_releases_each_session_once() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let (amf_srv, amf_uri, amf_seen) = spawn_recording_amf().await;
+        let (upf_a, seen_a, task_a) = raw_upf(None).await;
+        let (upf_b, seen_b, task_b) = raw_upf(None).await;
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let a = Arc::new(pfcp_path::PfcpClient::new(
+            sock.clone(),
+            upf_a,
+            [127, 0, 0, 1],
+        ));
+        let b = Arc::new(pfcp_path::PfcpClient::new(
+            sock.clone(),
+            upf_b,
+            [127, 0, 0, 1],
+        ));
+        for c in [&a, &b] {
+            c.set_assoc_state_for_test(true, None, None).await;
+        }
+        pfcp_path::set_global_pool(vec![a.clone(), b.clone()]);
+        let listener = spawn_pfcp_listener(sock, vec![a.clone(), b.clone()]);
+        // One session, on UPF A.
+        let reference = "71899";
+        seed_binding(reference, 5);
+        if let Ok(ctx) = smf_self().read() {
+            if let Some(b) = ctx.policy_bindings.write().unwrap().get_mut(reference) {
+                b.sm_context_status_uri = Some(format!("{amf_uri}/namf-callback/v1/sm-status"));
+            }
+        }
+        let seid = context::derive_cp_n4_seid(reference);
+        if let Ok(ctx) = smf_self().read() {
+            ctx.pfcp_sessions
+                .write()
+                .unwrap()
+                .insert(reference.to_string(), 0x7189);
+        }
+        pfcp_path::record_session_peer(seid, a.peer());
+
+        graceful_shutdown(async {}, &[a.clone(), b.clone()], true, listener).await;
+        let release_commands = amf_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(_, uri, _)| uri.ends_with("/n1-n2-messages"))
+            .count();
+        let released = |seen: &std::sync::Mutex<Vec<(u8, u32)>>| {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|(ty, _)| *ty == pfcp_path::pfcp_message_type::ASSOCIATION_RELEASE_REQUEST)
+                .count()
+        };
+        let (rel_a, rel_b) = (released(&seen_a), released(&seen_b));
+        cancel_gsm_timer(reference, timer::SmfTimerId::T3592);
+        if let Ok(ctx) = smf_self().read() {
+            ctx.policy_bindings.write().unwrap().remove(reference);
+        }
+        pfcp_path::forget_session_peer(seid);
+        task_a.abort();
+        task_b.abort();
+        amf_srv.stop().await.ok();
+        pfcp_path::clear_global_upf_for_test();
+
+        assert_eq!(
+            release_commands, 1,
+            "one PDU Session Release Command (#39) per session"
+        );
+        assert_eq!(
+            (rel_a, rel_b),
+            (1, 1),
+            "both associations released, each answered once"
+        );
+    }
+
+    /// #718 review m1: the EPC shutdown tells the SGW before it deletes anything at
+    /// the PGW-U, and the PGW-U deletions run concurrently: two deletions the PGW-U
+    /// answers 400 ms each finish in well under 800 ms.
+    #[tokio::test]
+    async fn the_epc_shutdown_tells_the_sgw_first_and_deletes_in_parallel() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        smf_context_init(64, 256, 512);
+        let arrivals = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (upf, _seen, upf_task) = raw_upf_delayed(
+            None,
+            std::time::Duration::from_millis(400),
+            Some(arrivals.clone()),
+        )
+        .await;
+        let (client, listener) = client_behind_the_real_listener(upf).await;
+        let server = gtp_path::S5S8Server::open("127.0.0.1:0".parse().unwrap(), 3)
+            .await
+            .expect("S5/S8");
+        let sgw = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sgw_port = sgw.local_addr().unwrap().port();
+        let mut ids = Vec::new();
+        if let Ok(ctx) = smf_self().read() {
+            for sess in ctx.sess_find_all_by(|s| s.epc) {
+                ctx.sess_remove(sess.id);
+            }
+            for (i, imsi) in [b"001010000071821", b"001010000071822"].iter().enumerate() {
+                let ue = ctx.ue_add_by_imsi(&imsi[..]).expect("ue");
+                let sess = ctx.sess_add_by_apn(ue.id, "internet", 6).expect("sess");
+                ctx.bearer_add(sess.id).expect("default bearer");
+                let mut sess = ctx.sess_find_by_seid(sess.smf_n4_seid).expect("sess");
+                sess.upf_n4_seid = 0x7182 + i as u64;
+                sess.sgw_s5c_teid = 0x7182_0000 + i as u32;
+                sess.sgw_s5c_ip.ipv4 = Some(std::net::Ipv4Addr::LOCALHOST);
+                ctx.sess_update(&sess);
+                pfcp_path::record_session_peer(sess.smf_n4_seid, client.peer());
+                ids.push(sess.smf_n4_seid);
+            }
+        }
+
+        let started = std::time::Instant::now();
+        let sgw_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let mut first = None;
+            let mut n = 0;
+            while n < 2 {
+                let Ok(Ok((_len, _))) = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    sgw.recv_from(&mut buf),
+                )
+                .await
+                else {
+                    break;
+                };
+                first.get_or_insert_with(std::time::Instant::now);
+                n += 1;
+            }
+            (first, n)
+        });
+        let (deleted, told) = shutdown_epc_pdn_connections_via(Some(&server), sgw_port).await;
+        let took = started.elapsed();
+        let (sgw_first, dbrs) = sgw_task.await.unwrap();
+        let pfcp_first = arrivals.lock().unwrap().first().copied();
+        listener.abort();
+        upf_task.abort();
+        for seid in &ids {
+            pfcp_path::forget_session_peer(*seid);
+        }
+        pfcp_path::clear_global_upf_for_test();
+
+        assert_eq!(
+            (told, dbrs),
+            (2, 2),
+            "a Delete Bearer Request per PDN connection"
+        );
+        assert_eq!(deleted, 2, "both PFCP sessions deleted at the PGW-U");
+        assert!(
+            sgw_first.expect("the SGW heard") <= pfcp_first.expect("the PGW-U heard"),
+            "the SGW is told before the PGW-U"
+        );
+        assert!(
+            took < std::time::Duration::from_millis(750),
+            "the deletions overlapped: {took:?}"
+        );
+    }
+
+    /// #718 review M4: a shutdown that keeps the N4 association for durable state
+    /// still deletes every EPC PFCP session at the PGW-U. EPC PDN connections are not
+    /// in the snapshot, so the next incarnation could not ask for them, and its
+    /// retention request would keep them in the PGW-U with nobody owning them.
+    #[tokio::test]
+    async fn a_shutdown_that_keeps_the_association_deletes_the_epc_sessions() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        smf_context_init(64, 256, 512);
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        let sess_id = {
+            let ctx = smf_self();
+            let ctx = ctx.read().unwrap();
+            // Leftovers of earlier tests; the state lock is held, so they belong to
+            // nobody running now.
+            for sess in ctx.sess_find_all_by(|s| s.epc && s.upf_n4_seid != 0) {
+                ctx.sess_remove(sess.id);
+            }
+            let ue = ctx.ue_add_by_imsi(b"001010000071804").expect("ue");
+            let mut sess = ctx.sess_add_by_apn(ue.id, "internet", 6).expect("sess");
+            sess.upf_n4_seid = 0x7184;
+            ctx.sess_update(&sess);
+            sess.id
+        };
+        let (deleted, _told) = shutdown_epc_pdn_connections().await;
+        let seen = upf.seen();
+        if let Ok(ctx) = smf_self().read() {
+            ctx.sess_remove(sess_id);
+        }
+        assert_eq!(deleted, 1, "the EPC session was deleted at the PGW-U");
+        assert!(
+            seen.contains(&pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST),
+            "a Session Deletion Request reached the PGW-U: {seen:?}"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -9645,6 +10303,53 @@ mod tests {
             rest = &rest[4 + len..];
         }
         out
+    }
+
+    /// #797: the Session Establishment Request carries the configured Node ID (the
+    /// Service FQDN on k8s) and a CP F-SEID with the routable F-SEID address. Before
+    /// #797 both were `SMF_PFCP_ADDR`, so a wildcard bind put 0.0.0.0 in both and the
+    /// UPF had no address for this CP function.
+    #[tokio::test]
+    async fn the_establishment_carries_the_node_id_and_a_routable_f_seid() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let identity = n4_identity::N4Identity {
+            node_id: nextgcore_pfcp::types::NodeId::new_fqdn(
+                "smf.nextg-system.svc.cluster.local".into(),
+            ),
+            f_seid_ipv4: [10, 1, 2, 3],
+            node_id_explicit: true,
+        };
+        let upf = pfcp_path::stand_in::associated_upf_as(&identity).await;
+        let qos = SessionQos {
+            qfi: 9,
+            ambr_ul_bps: 100_000_000,
+            ambr_dl_bps: 100_000_000,
+            xr_flow: None,
+        };
+        pfcp_session_establish(0x0797, [10, 45, 7, 97], "internet", 1, &qos)
+            .await
+            .expect("the stand-in UPF must accept the establishment");
+
+        let bodies = upf.establishment_bodies();
+        assert_eq!(bodies.len(), 1);
+        let ies = flat_ies(&bodies[0]);
+        let ie = |ty: u16| -> Vec<u8> {
+            ies.iter()
+                .find(|(t, _)| *t == ty)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("IE {ty} missing"))
+        };
+        let mut want_node_id = vec![2u8];
+        for label in ["smf", "nextg-system", "svc", "cluster", "local"] {
+            want_node_id.push(label.len() as u8);
+            want_node_id.extend_from_slice(label.as_bytes());
+        }
+        assert_eq!(ie(n4_build::pfcp_ie::NODE_ID), want_node_id);
+        // F-SEID (§8.2.37): flags (V4 = bit 2), SEID, IPv4.
+        let f_seid = ie(n4_build::pfcp_ie::F_SEID);
+        assert_eq!(f_seid[0] & 0x02, 0x02, "V4 set");
+        assert_eq!(u64::from_be_bytes(f_seid[1..9].try_into().unwrap()), 0x0797);
+        assert_eq!(&f_seid[9..13], &[10, 1, 2, 3]);
     }
 
     /// #80 criterion 1: the LIVE establishment path provisions a Create URR, and both
