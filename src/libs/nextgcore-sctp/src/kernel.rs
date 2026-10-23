@@ -301,7 +301,7 @@ impl KernelSctpSocket {
             )
         };
         if result < 0 {
-            return Err(SctpError::ReceiveFailed(io::Error::last_os_error()));
+            return Err(SctpError::SockoptFailed(io::Error::last_os_error()));
         }
         Ok((status.sstat_instrms, status.sstat_outstrms))
     }
@@ -620,6 +620,22 @@ fn sockaddr_to_socketaddr(storage: &libc::sockaddr_storage, len: socklen_t) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #813 (review of #870, MINOR 5): `negotiated_streams` reads the kernel's
+    /// `SCTP_STATUS` on a real loopback association. Both ends offer 10 / 10, so the
+    /// accepted socket reports 10 outbound streams. Ignored by default: it needs the SCTP
+    /// kernel module and libsctp; run with `--features kernel -- --ignored`.
+    #[test]
+    #[ignore = "needs the SCTP kernel module and libsctp"]
+    fn negotiated_streams_reads_sctp_status_on_a_live_association() {
+        let server = KernelSctpSocket::server("127.0.0.1:0".parse().unwrap()).expect("server");
+        let _client = KernelSctpSocket::client(server.local_addr(), None).expect("client");
+        let (accepted, _) = server.accept().expect("accept");
+        assert_eq!(
+            accepted.negotiated_streams().expect("SCTP_STATUS"),
+            (10, 10)
+        );
+    }
 
     /// `SctpEventSubscribe` is the one SCTP struct `libc` lacks, so it is still
     /// transcribed and handed to `setsockopt` by size: a dropped, reordered or

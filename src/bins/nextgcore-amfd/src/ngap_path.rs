@@ -758,6 +758,9 @@ pub struct NgapServer {
     /// live SCTP association. `None` (the default) keeps the real transport.
     #[cfg(test)]
     sent_ngap: Option<Vec<(u64, u16, Vec<u8>)>>,
+    /// Each association's negotiated outbound stream count, asked of the transport once
+    /// (#813); removed when the association closes.
+    outbound_streams: std::collections::HashMap<u64, Option<u16>>,
     /// Test seam: the negotiated outbound stream count the capture reports for every
     /// association (a captured send has no SCTP association to ask). Default 2, amfd's
     /// configured count (#813).
@@ -913,6 +916,7 @@ impl NgapServer {
             sent_ngap: None,
             #[cfg(test)]
             test_outbound_streams: 2,
+            outbound_streams: std::collections::HashMap::new(),
             #[cfg(test)]
             fail_next_sends: 0,
             event_tx,
@@ -1045,6 +1049,7 @@ impl NgapServer {
                 association_id,
                 reason,
             } => {
+                self.outbound_streams.remove(&association_id);
                 self.handle_association_closed(association_id, &reason)
                     .await?;
             }
@@ -12927,24 +12932,52 @@ impl NgapServer {
     ///
     /// With fewer than two negotiated streams the peer left no second pair, and stream 0
     /// is the only valid identifier.
-    fn ngap_stream_for(&self, association_id: u64, pdu: &[u8]) -> u16 {
-        let Some(key) = crate::ngap_asn1::ue_association_key(pdu) else {
+    fn ngap_stream_for(&mut self, association_id: u64, pdu: &[u8]) -> u16 {
+        let Some(ue) = crate::ngap_asn1::ue_association_key(pdu) else {
             return 0;
         };
+        let Some(outbound) = self.outbound_streams_of(association_id) else {
+            return 0;
+        };
+        let key = match ue {
+            crate::ngap_asn1::UeAssociation::Amf(id) => id,
+            // Only the RAN UE NGAP ID (e.g. an Error Indication): resolve the UE it names
+            // on THIS association, so its PDUs stay on the one stream §7 asks for. With
+            // two streams there is only stream 1, so the lookup is skipped.
+            crate::ngap_asn1::UeAssociation::Ran(ran) if outbound > 2 => self
+                .ue_auth_state
+                .snapshot()
+                .into_iter()
+                .find(|(_, s)| s.association_id == association_id && s.ran_ue_ngap_id == ran)
+                .map(|(amf_ue_ngap_id, _)| amf_ue_ngap_id)
+                .unwrap_or(u64::from(ran)),
+            crate::ngap_asn1::UeAssociation::Ran(ran) => u64::from(ran),
+        };
+        ue_associated_stream(key, outbound)
+    }
+
+    /// The negotiated outbound stream count of `association_id`, asked of the transport
+    /// once per association and cached (#813, review of #870): the kernel backend answers
+    /// with a `getsockopt`, which must not run per PDU, and an association whose count is
+    /// unknown is warned about once, not at signalling rate. The entry goes when the
+    /// association closes. `None` sends everything on stream 0.
+    fn outbound_streams_of(&mut self, association_id: u64) -> Option<u16> {
         #[cfg(test)]
         if self.sent_ngap.is_some() {
-            return ue_associated_stream(key, self.test_outbound_streams);
+            return Some(self.test_outbound_streams);
         }
-        match self.transport.outbound_streams(association_id) {
-            Some(outbound) => ue_associated_stream(key, outbound),
-            None => {
-                log::warn!(
-                    "association {association_id}: negotiated outbound stream count unknown; \
-                     UE-associated NGAP goes on stream 0"
-                );
-                0
-            }
+        if let Some(cached) = self.outbound_streams.get(&association_id) {
+            return *cached;
         }
+        let count = self.transport.outbound_streams(association_id);
+        if count.is_none() {
+            log::warn!(
+                "association {association_id}: negotiated outbound stream count unknown; \
+                 its UE-associated NGAP goes on stream 0"
+            );
+        }
+        self.outbound_streams.insert(association_id, count);
+        count
     }
 
     /// Send message to a gNB by ID
@@ -14735,10 +14768,6 @@ pub async fn amf_ngap_poll() -> Result<bool> {
     }
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
 /// The stream of a UE-associated NGAP PDU keyed by `key` on an association with
 /// `outbound` negotiated outbound streams (TS 38.412 §7, #813): `1..outbound`, spread by
 /// key, or 0 when the peer allowed no second stream.
@@ -14748,6 +14777,10 @@ fn ue_associated_stream(key: u64, outbound: u16) -> u16 {
     }
     1 + (key % u64::from(outbound - 1)) as u16
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -21204,6 +21237,42 @@ mod tests {
             "each UE keeps one stream in 1..5 for all its PDUs; Overload Start is on 0"
         );
 
+        // An Error Indication naming the UE by its RAN UE NGAP ID alone stays on the UE's
+        // stream (review of #870): AMF UE NGAP ID 8131 is on 1 + 8131 % 4 = 4, while its
+        // RAN id 9 by itself would be on 1 + 9 % 4 = 2.
+        server
+            .ue_auth_state
+            .insert(8_131, UeNasContext::new(8_131, 9, assoc, false));
+        let ran_only = crate::ngap_asn1::build_error_indication_generated(
+            None,
+            Some(9),
+            ngap_gen::Cause::Protocol(ngap_gen::CauseProtocol(
+                ngap_gen::CauseProtocol::UNSPECIFIED,
+            )),
+        )
+        .unwrap();
+        server
+            .send_to_association(assoc, &ran_only)
+            .await
+            .expect("sent");
+        // The same RAN id on ANOTHER association is not this UE: keyed by the RAN id.
+        let other = 98_133u64;
+        seed_gnb_session(&server, other).await;
+        server
+            .send_to_association(other, &ran_only)
+            .await
+            .expect("sent");
+        let streams: Vec<(u64, u16)> = take_sent_ngap_with_streams(&mut server)
+            .into_iter()
+            .map(|(a, stream, _)| (a, stream))
+            .collect();
+        server.ue_auth_state.remove(8_131);
+        assert_eq!(
+            streams,
+            vec![(assoc, 4), (other, 2)],
+            "a RAN-id-only PDU goes on its UE's stream; unknown on another gNB, by RAN id"
+        );
+
         // Two negotiated streams leave stream 1 as the only UE-associated one.
         server.test_outbound_streams = 2;
         let gnb = 98_132u64;
@@ -21222,6 +21291,37 @@ mod tests {
             take_sent_ngap_with_streams(&mut server)[0].1,
             0,
             "a peer that allowed one stream gets everything on stream 0"
+        );
+    }
+
+    /// Review of #870, MINOR 2: the transport is asked for an association's stream count
+    /// once, the answer (here "unknown": the association has no SCTP state) is cached,
+    /// and the entry goes when the association closes.
+    ///
+    /// REVERT-VERIFIED: without the cache insert the first assertion fails; without the
+    /// removal at AssociationClosed the last one does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_outbound_stream_count_is_asked_once_per_association() {
+        let mut server = test_ngap_server().await;
+        let assoc = 98_141u64;
+        seed_gnb_session(&server, assoc).await;
+        assert_eq!(server.outbound_streams_of(assoc), None);
+        assert_eq!(
+            server.outbound_streams.get(&assoc),
+            Some(&None),
+            "the unknown count is remembered, not re-asked per PDU"
+        );
+        assert_eq!(server.outbound_streams_of(assoc), None);
+        server
+            .handle_server_event(ServerEvent::AssociationClosed {
+                association_id: assoc,
+                reason: "test".to_string(),
+            })
+            .await
+            .expect("handled");
+        assert!(
+            !server.outbound_streams.contains_key(&assoc),
+            "a closed association's count is forgotten"
         );
     }
 
