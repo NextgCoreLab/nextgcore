@@ -253,3 +253,74 @@ fn a_pdu_that_is_not_an_ecid_report_is_an_error() {
     assert!(decode_ecid_report(&request).is_err());
     assert!(decode_ecid_report(&[0xff, 0x00]).is_err());
 }
+
+/// #834 review: an on-demand E-CID request is answered in the E-CID MEASUREMENT
+/// INITIATION RESPONSE (TS 38.455 §8.2.1.2), which a real gNB (and nextgsim) sends.
+/// It is read exactly like the report it replaces.
+#[test]
+fn the_initiation_response_carries_the_results_of_an_on_demand_request() {
+    let measured = Some(vec![rsrp(&[60]), ta1(500)]);
+    let from_response = accepted(&ecid_initiation_response(
+        9,
+        3,
+        5,
+        nr_cgi(PLMN, 1),
+        TAC,
+        measured.clone(),
+    ));
+    let from_report = accepted(&ecid_report(9, 3, 5, nr_cgi(PLMN, 1), TAC, measured));
+    assert_eq!(from_response.0, 3, "LMF-UE-Measurement-ID");
+    assert_eq!(from_response.1.len(), 1);
+    assert_eq!(from_response.1[0].nr_cgi, from_report.1[0].nr_cgi);
+    assert_eq!(from_response.1[0].rsrp, from_report.1[0].rsrp);
+    assert_eq!(
+        from_response.1[0].timing_advance,
+        from_report.1[0].timing_advance
+    );
+    assert!(from_response.1[0].timing_advance.is_some());
+}
+
+/// The response's error handling names the procedure it belongs to: an unknown
+/// reject IE in an E-CID Measurement Initiation Response is reported against
+/// procedure 2, successful outcome.
+#[test]
+fn a_rejected_initiation_response_is_diagnosed_against_procedure_2() {
+    let bytes = splice_ie(
+        &ecid_initiation_response(9, 3, 5, nr_cgi(PLMN, 1), TAC, None),
+        9999,
+        0,
+    );
+    let EcidReportOutcome::Rejected {
+        error_indication, ..
+    } = decode_ecid_report(&bytes).expect("decodes")
+    else {
+        panic!("an unknown reject IE rejects the response");
+    };
+    let nrppa::NRPPA_PDU::InitiatingMessage(m) =
+        nextgcore_nrppa_gen::decode(&error_indication).unwrap()
+    else {
+        panic!("an ERROR INDICATION is an initiating message");
+    };
+    let nrppa::InitiatingMessageValue::Id_errorIndication(ei) = m.value else {
+        panic!("not an ERROR INDICATION");
+    };
+    let diag = ei
+        .protocol_i_es
+        .0
+        .iter()
+        .find_map(|ie| match &ie.value {
+            nrppa::ErrorIndicationProtocolIEs_EntryValue::Id_CriticalityDiagnostics(d) => {
+                Some(d.clone())
+            }
+            _ => None,
+        })
+        .expect("criticality diagnostics");
+    assert_eq!(
+        diag.procedure_code.map(|p| p.0),
+        Some(nrppa::ID_E_CID_MEASUREMENT_INITIATION)
+    );
+    assert_eq!(
+        diag.triggering_message.map(|t| t.0),
+        Some(nrppa::TriggeringMessage::SUCCESSFUL_OUTCOME)
+    );
+}
