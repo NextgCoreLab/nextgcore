@@ -19,15 +19,14 @@ use crate::s1ap_build::{
 use nextgcore_s1ap::{
     BroadcastCancelledAreaList, BroadcastCompletedAreaList, Cause, CauseRadioNetwork,
     CriticalityDiagnostics, EnbConfigurationUpdate, EnbId, EnbStatusTransfer,
-    ErabDataForwardingItem, ErabSwitchedItem, ErabToBeSetupItemHoReq, ErrorIndication,
-    HandoverCancel, HandoverCancelAcknowledge, HandoverCommand, HandoverFailure, HandoverNotify,
+    ErabDataForwardingItem, ErabToBeSetupItemHoReq, ErrorIndication, HandoverCancel,
+    HandoverCancelAcknowledge, HandoverCommand, HandoverFailure, HandoverNotify,
     HandoverPreparationFailure, HandoverRequest, HandoverRequestAcknowledge, HandoverRequired,
     HandoverType as S1apHandoverType, InitialContextSetupFailure, InitialContextSetupResponse,
     InitialUeMessage, KillResponse, MmeStatusTransfer, NasNonDeliveryIndication, PathSwitchRequest,
-    PathSwitchRequestAcknowledge, PathSwitchRequestFailure, Reset, ResetAcknowledge, ResetType,
-    S1SetupRequest, S1apMessage, SecurityContext, TargetId, TimeToWait, UeAmbr,
-    UeCapabilityInfoIndication, UeContextReleaseComplete, UeContextReleaseRequest, UlNasTransport,
-    WriteReplaceWarningResponse,
+    PathSwitchRequestFailure, Reset, ResetAcknowledge, ResetType, S1SetupRequest, S1apMessage,
+    SecurityContext, TargetId, TimeToWait, UeAmbr, UeCapabilityInfoIndication,
+    UeContextReleaseComplete, UeContextReleaseRequest, UlNasTransport, WriteReplaceWarningResponse,
 };
 
 // ============================================================================
@@ -472,6 +471,7 @@ pub fn handle_s1ap_message(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<S1
                         ctx,
                         enb_id,
                         msg.mme_ue_s1ap_id,
+                        msg.enb_ue_s1ap_id,
                         msg.location.as_ref().map(|(t, c)| (t, c)),
                     ));
                     return out;
@@ -2249,6 +2249,26 @@ pub fn handle_handover_required_reporting(
         );
     };
 
+    // #730 review m-a: one mobility procedure at a time. While the Serving GW
+    // switch of a previous handover (its Modify Bearer Request) is outstanding,
+    // the core has not completed it (TS 23.401 §5.5.1.1.2 step 4, §5.5.1.2.2
+    // step 17), so a new preparation is refused (TS 36.413 §8.4.1.4,
+    // interaction-with-other-procedure).
+    if crate::gtp_path::handover_modification_pending(source_ue.mme_ue_id) {
+        log::warn!(
+            "Handover Required for mme_ue_s1ap_id={} while a handover's Modify Bearer Request \
+             is outstanding; refused",
+            msg.mme_ue_s1ap_id
+        );
+        return handover_preparation_failure(
+            enb_id,
+            msg.mme_ue_s1ap_id,
+            msg.enb_ue_s1ap_id,
+            radio_network_cause::INTERACTION_WITH_OTHER_PROCEDURE,
+            notify,
+        );
+    }
+
     // Allocate the target eNB UE context (eNB UE S1AP ID arrives in the Ack)
     let target_ue_id = ctx.enb_ue_add(target_enb_pool_id, INVALID_UE_S1AP_ID);
     // #48: the source eNB's own statement about its transport to the target
@@ -3030,6 +3050,7 @@ pub fn handle_handover_notify(
         ctx,
         enb_id,
         msg.mme_ue_s1ap_id,
+        msg.enb_ue_s1ap_id,
         Some((&msg.tai, &msg.eutran_cgi)),
     )
 }
@@ -3039,17 +3060,45 @@ pub fn handle_handover_notify(
 /// UE's stored location is left as it is (#514 stage 8a).
 pub fn handle_handover_notify_at(
     ctx: &MmeContext,
-    _enb_id: u64,
+    enb_id: u64,
     mme_ue_s1ap_id: u32,
+    enb_ue_s1ap_id: u32,
     location: Option<(&nextgcore_s1ap::Tai, &nextgcore_s1ap::EutranCgi)>,
 ) -> Vec<S1apSend> {
     let Some(target_ue_id) = ctx.enb_ue_find_by_mme_ue_s1ap_id(mme_ue_s1ap_id) else {
         log::error!("Handover Notify for unknown mme_ue_s1ap_id={mme_ue_s1ap_id}");
-        return Vec::new();
+        return error_indication(
+            enb_id,
+            Some(enb_ue_s1ap_id),
+            Some(mme_ue_s1ap_id),
+            S1apCauseGroup::RadioNetwork,
+            radio_network_cause::UNKNOWN_MME_UE_S1AP_ID,
+        );
     };
     let Some(target_ue) = ctx.enb_ue_find_by_id(target_ue_id) else {
         return Vec::new();
     };
+
+    // #730 review B1: the notify must come from the eNB the context lives on,
+    // under the pair it holds (TS 36.413 §10.6: an inconsistent pair is answered
+    // with ERROR INDICATION, unknown-pair-ue-s1ap-id, and nothing changes). Any
+    // other eNB naming this MME UE S1AP ID reaches a UE it does not serve.
+    if target_ue.enb_id != enb_id || target_ue.enb_ue_s1ap_id != enb_ue_s1ap_id {
+        log::warn!(
+            "Handover Notify from eNB {enb_id} for mme_ue_s1ap_id={mme_ue_s1ap_id}, \
+             enb_ue_s1ap_id={enb_ue_s1ap_id}: the context belongs to eNB {} with \
+             enb_ue_s1ap_id={}; ignored",
+            target_ue.enb_id,
+            target_ue.enb_ue_s1ap_id
+        );
+        return error_indication(
+            enb_id,
+            Some(enb_ue_s1ap_id),
+            Some(mme_ue_s1ap_id),
+            S1apCauseGroup::RadioNetwork,
+            radio_network_cause::UNKNOWN_PAIR_UE_S1AP_ID,
+        );
+    }
 
     if let Some((tai, cgi)) = location {
         let tai = tai_from_s1ap(tai);
@@ -3057,15 +3106,49 @@ pub fn handle_handover_notify_at(
         update_ue_location(ctx, target_ue.mme_ue_id, &tai, &e_cgi);
     }
 
-    // Switch the bearers onto the target eNB endpoints
-    for bearer_id in ue_bearers(ctx, target_ue.mme_ue_id).iter().map(|b| b.id) {
-        if let Some(bearer) = ctx.bearer_pool.write().unwrap().get_mut(&bearer_id) {
-            if bearer.target_s1u_teid != 0 {
-                bearer.enb_s1u_teid = bearer.target_s1u_teid;
-                bearer.enb_s1u_ip = bearer.target_s1u_ip.clone();
-                bearer.target_s1u_teid = 0;
-                bearer.target_s1u_ip = Default::default();
-            }
+    // #730 review B1: only the TARGET of a handover in progress completes one:
+    // an S1 target whose preparation is outstanding (armed by HANDOVER REQUIRED,
+    // cleared by the first notify), or a 5GS-to-EPS arrival whose N26 relocation
+    // is recorded. A duplicate notify, or one for a UE that is not handing over,
+    // only updates the location, as before #730: running the Serving GW switch
+    // for it would detach a UE that is not moving.
+    let s1_target = target_ue.handover_prep_deadline.is_some()
+        && ctx
+            .enb_ue_find_by_id(target_ue.source_ue_id)
+            .is_some_and(|source| source.mme_ue_id == target_ue.mme_ue_id);
+    let n26_arrival = crate::n26_path::forward_relocation_in_flight(target_ue.mme_ue_id);
+    // A Serving GW switch of another procedure cannot be pending here: HANDOVER
+    // REQUIRED is refused while one is (and a PATH SWITCH REQUEST while an S1
+    // preparation is outstanding), so one UE never has two (#730 review m-a).
+    if !(s1_target || n26_arrival) {
+        log::warn!(
+            "Handover Notify for mme_ue_s1ap_id={mme_ue_s1ap_id}: no handover to this eNB is in \
+             progress (a duplicate, or a UE that is not handing over); only the location is \
+             updated"
+        );
+        return Vec::new();
+    }
+
+    // The endpoints the target admitted (HANDOVER REQUEST ACKNOWLEDGE). They move
+    // out of the bearers' target fields into the Modify Bearer Request below and
+    // become the bearers' eNB endpoints once the Serving GW accepts them (#730).
+    let mut switched = Vec::new();
+    let mut omitted = Vec::new();
+    for bearer in ue_bearers(ctx, target_ue.mme_ue_id) {
+        if bearer.target_s1u_teid != 0 && bearer.target_s1u_ip.ipv4.is_some() {
+            switched.push(crate::gtp_path::SwitchedBearer {
+                ebi: bearer.ebi,
+                teid: bearer.target_s1u_teid,
+                ip: bearer.target_s1u_ip.clone(),
+            });
+        } else if bearer.enb_s1u_teid != 0 {
+            // Active on the source and not admitted by the target (it was in
+            // the Handover Command's E-RABs To Release List).
+            omitted.push(bearer.ebi);
+        }
+        if let Some(b) = ctx.bearer_pool.write().unwrap().get_mut(&bearer.id) {
+            b.target_s1u_teid = 0;
+            b.target_s1u_ip = Default::default();
         }
     }
 
@@ -3113,6 +3196,10 @@ pub fn handle_handover_notify_at(
         );
     }
 
+    // TS 23.401 §5.5.1.2.2 step 16: tell the Serving GW the target eNB's S1-U
+    // F-TEIDs (#730). Without this the SGW keeps sending downlink to the source.
+    switch_serving_gw_after_handover_notify(ctx, &target_ue, switched, omitted);
+
     // Release the source eNB context (TS 36.413 §8.4.3: successful handover)
     let Some(source_ue) = ctx.enb_ue_find_by_id(target_ue.source_ue_id) else {
         return Vec::new();
@@ -3133,6 +3220,73 @@ pub fn handle_handover_notify_at(
         Err(e) => {
             log::error!("Failed to build UE Context Release Command: {e}");
             Vec::new()
+        }
+    }
+}
+
+/// Send the Modify Bearer Request of an S1 handover (TS 23.401 §5.5.1.2.2 step
+/// 16) for the bearers the target admitted. No default bearer admitted, or a
+/// request that cannot be sent, ends in the explicit detach a failed X2 handover
+/// gets (§5.5.1.1.2), because the UE would otherwise have no downlink.
+fn switch_serving_gw_after_handover_notify(
+    ctx: &MmeContext,
+    target_ue: &crate::context::EnbUe,
+    switched: Vec<crate::gtp_path::SwitchedBearer>,
+    omitted: Vec<u8>,
+) {
+    let mme_ue_id = target_ue.mme_ue_id;
+    if ctx.mme_ue_find_by_id(mme_ue_id).is_none() {
+        return;
+    }
+    let admitted: Vec<u8> = switched.iter().map(|b| b.ebi).collect();
+    let (switched, omitted) = crate::handover_switch::only_pdns_with_a_switched_default(
+        ctx, mme_ue_id, switched, omitted,
+    );
+    let switched_ebis: Vec<u8> = switched.iter().map(|b| b.ebi).collect();
+    if !crate::handover_switch::a_default_bearer_switched(ctx, mme_ue_id, &switched_ebis) {
+        crate::handover_switch::count_handover_failure(
+            crate::handover_switch::failure_reason::NO_DEFAULT_BEARER,
+        );
+        log::error!(
+            "UE {mme_ue_id}: the S1 handover target admitted no default bearer; detaching the \
+             UE"
+        );
+        crate::handover_switch::detach_after_failed_handover(
+            ctx,
+            mme_ue_id,
+            "an S1 handover whose target admitted no default bearer",
+        );
+        return;
+    }
+    let pending = crate::gtp_path::PendingHandoverModification {
+        mme_ue_id,
+        switched,
+        omitted,
+        kind: crate::gtp_path::HandoverModifyKind::HandoverNotify {
+            enb_id: target_ue.enb_id,
+            mme_ue_s1ap_id: target_ue.mme_ue_s1ap_id,
+            enb_ue_s1ap_id: target_ue.enb_ue_s1ap_id,
+            admitted,
+        },
+    };
+    match crate::gtp_path::send_modify_bearer_request_for_handover(ctx, pending) {
+        Ok(seq) => log::info!(
+            "UE {mme_ue_id}: Handover Notify: Modify Bearer Request (seq={seq}) sent with the \
+             target eNB's S1-U F-TEIDs (TS 23.401 §5.5.1.2.2 step 16)"
+        ),
+        Err(e) => {
+            crate::handover_switch::count_handover_failure(
+                crate::handover_switch::failure_reason::NOT_SENT,
+            );
+            log::error!(
+                "UE {mme_ue_id}: Handover Notify: Modify Bearer Request not sent ({e}); \
+                 detaching the UE"
+            );
+            crate::handover_switch::detach_after_failed_handover(
+                ctx,
+                mme_ue_id,
+                "an S1 handover whose Modify Bearer Request could not be sent",
+            );
         }
     }
 }
@@ -3382,6 +3536,69 @@ pub fn handle_path_switch_request_reporting(
         );
     };
 
+    // TS 36.413 §8.4.4.4: the same E-RAB ID twice in the E-RAB To Be Switched DL
+    // List is answered with a failure. Checked before anything changes.
+    let mut seen = std::collections::HashSet::new();
+    if !msg
+        .erab_switched_dl_list
+        .iter()
+        .all(|item| seen.insert(item.erab_id))
+    {
+        crate::handover_switch::count_handover_failure(
+            crate::handover_switch::failure_reason::DUPLICATE_ERAB,
+        );
+        return path_switch_failure(
+            enb_id,
+            msg.source_mme_ue_s1ap_id,
+            msg.enb_ue_s1ap_id,
+            radio_network_cause::MULTIPLE_E_RAB_ID_INSTANCES,
+        );
+    }
+    // #730: one handover at a time. A second Path Switch Request while the first
+    // one's Modify Bearer Request is outstanding would race it for the bearers.
+    if let Some(ue) = ctx.enb_ue_find_by_id(enb_ue_id) {
+        // #730 review m-a: and not while an S1 handover preparation of the same
+        // UE is outstanding (a target context armed by HANDOVER REQUIRED).
+        let s1_preparation = ctx
+            .enb_ue_pool
+            .read()
+            .unwrap()
+            .values()
+            .any(|t| t.mme_ue_id == ue.mme_ue_id && t.handover_prep_deadline.is_some());
+        if s1_preparation {
+            log::warn!(
+                "Path Switch Request for mme_ue_s1ap_id={} while an S1 handover preparation \
+                 is outstanding; refused",
+                msg.source_mme_ue_s1ap_id
+            );
+            crate::handover_switch::count_handover_failure(
+                crate::handover_switch::failure_reason::ALREADY_PENDING,
+            );
+            return path_switch_failure(
+                enb_id,
+                msg.source_mme_ue_s1ap_id,
+                msg.enb_ue_s1ap_id,
+                radio_network_cause::INTERACTION_WITH_OTHER_PROCEDURE,
+            );
+        }
+        if crate::gtp_path::handover_modification_pending(ue.mme_ue_id) {
+            log::warn!(
+                "Path Switch Request for mme_ue_s1ap_id={} while a handover's Modify Bearer \
+                 Request is outstanding; refused",
+                msg.source_mme_ue_s1ap_id
+            );
+            crate::handover_switch::count_handover_failure(
+                crate::handover_switch::failure_reason::ALREADY_PENDING,
+            );
+            return path_switch_failure(
+                enb_id,
+                msg.source_mme_ue_s1ap_id,
+                msg.enb_ue_s1ap_id,
+                radio_network_cause::UNSPECIFIED,
+            );
+        }
+    }
+
     let tai = msg.tai.as_ref().map(tai_from_s1ap);
     let e_cgi = msg.eutran_cgi.as_ref().map(ecgi_from_s1ap);
 
@@ -3452,20 +3669,105 @@ pub fn handle_path_switch_request_reporting(
         }
     }
 
-    // Switch the downlink endpoints to the new eNB
+    // TS 23.401 §5.5.1.1.2 step 2: the Serving GW is told the new eNB's S1-U
+    // F-TEIDs by a Modify Bearer Request, and the acknowledge waits for its
+    // response (step 5). The bearers keep their old endpoints until the SGW
+    // accepts the new ones (#730).
+    let bearers = ue_bearers(ctx, mme_ue_id);
+    let mut switched = Vec::new();
+    let mut released = Vec::new();
     for item in &msg.erab_switched_dl_list {
-        if let Some(bearer_id) = ctx.bearer_find_by_ebi(mme_ue_id, item.erab_id) {
-            if let Some(bearer) = ctx.bearer_pool.write().unwrap().get_mut(&bearer_id) {
-                bearer.enb_s1u_teid = item.gtp_teid;
-                bearer.enb_s1u_ip = transport_address_to_ip(&item.transport_layer_address);
-            }
-        } else {
+        let ip = transport_address_to_ip(&item.transport_layer_address);
+        if !bearers.iter().any(|b| b.ebi == item.erab_id) {
             log::warn!(
                 "[{}] Path Switch Request for unknown E-RAB {}",
                 mme_ue.imsi_bcd,
                 item.erab_id
             );
+            released.push(nextgcore_s1ap::ErabItem {
+                erab_id: item.erab_id,
+                cause: Cause::RadioNetwork(CauseRadioNetwork::UnknownERabId),
+            });
+        } else if item.gtp_teid == 0 || ip.ipv4.is_none() {
+            // The S11 builder carries an IPv4 S1-U F-TEID only; a bearer it
+            // cannot describe to the SGW cannot be switched.
+            log::warn!(
+                "[{}] Path Switch Request: E-RAB {} has no usable IPv4 S1-U endpoint; it is \
+                 released",
+                mme_ue.imsi_bcd,
+                item.erab_id
+            );
+            released.push(nextgcore_s1ap::ErabItem {
+                erab_id: item.erab_id,
+                cause: crate::handover_switch::CORE_NOT_SWITCHED,
+            });
+        } else {
+            switched.push(crate::gtp_path::SwitchedBearer {
+                ebi: item.erab_id,
+                teid: item.gtp_teid,
+                ip,
+            });
         }
+    }
+    // TS 36.413 §8.4.4.2: E-RABs of the UE context missing from the list are
+    // implicitly released by the eNB. Bearers never set up on the radio side
+    // (no eNB endpoint yet) are not E-RABs of the context and stay as they are.
+    let mut omitted: Vec<u8> = bearers
+        .iter()
+        .filter(|b| b.enb_s1u_teid != 0 && !switched.iter().any(|s| s.ebi == b.ebi))
+        .map(|b| b.ebi)
+        .collect();
+    for item in &released {
+        if bearers.iter().any(|b| b.ebi == item.erab_id) && !omitted.contains(&item.erab_id) {
+            omitted.push(item.erab_id);
+        }
+    }
+    // §5.5.1.1.2 step 2: only PDN connections whose default bearer is switched
+    // are in the Modify Bearer Request; their other bearers are lost with them.
+    let named_in_dl_list: Vec<u8> = msg
+        .erab_switched_dl_list
+        .iter()
+        .map(|item| item.erab_id)
+        .collect();
+    let (switched, omitted) = crate::handover_switch::only_pdns_with_a_switched_default(
+        ctx, mme_ue_id, switched, omitted,
+    );
+    // TS 36.413 §8.4.4.2: the To Be Released List names E-RABs that WERE in the
+    // DL list and are not switched. Those absent from it are already implicitly
+    // released by the eNB (#730 review m3).
+    for ebi in &omitted {
+        if named_in_dl_list.contains(ebi) && !released.iter().any(|r| r.erab_id == *ebi) {
+            released.push(nextgcore_s1ap::ErabItem {
+                erab_id: *ebi,
+                cause: crate::handover_switch::CORE_NOT_SWITCHED,
+            });
+        }
+    }
+
+    // TS 23.401 §5.5.1.1.2: no default bearer switched means failure and an
+    // explicit detach.
+    let switched_ebis: Vec<u8> = switched.iter().map(|b| b.ebi).collect();
+    if !crate::handover_switch::a_default_bearer_switched(ctx, mme_ue_id, &switched_ebis) {
+        crate::handover_switch::count_handover_failure(
+            crate::handover_switch::failure_reason::NO_DEFAULT_BEARER,
+        );
+        log::error!(
+            "[{}] Path Switch Request switches no default bearer; failing it and detaching the \
+             UE (TS 23.401 §5.5.1.1.2)",
+            mme_ue.imsi_bcd
+        );
+        let out = path_switch_failure(
+            enb_id,
+            msg.source_mme_ue_s1ap_id,
+            msg.enb_ue_s1ap_id,
+            radio_network_cause::UNSPECIFIED,
+        );
+        crate::handover_switch::detach_after_failed_handover(
+            ctx,
+            mme_ue_id,
+            "a Path Switch Request that switched no default bearer",
+        );
+        return out;
     }
 
     // Fresh {NCC, NH} pair (TS 33.401 §7.2.8.4.4)
@@ -3477,34 +3779,63 @@ pub fn handle_path_switch_request_reporting(
             radio_network_cause::UNSPECIFIED,
         );
     };
-
-    let erab_switched_ul_list: Vec<ErabSwitchedItem> = ue_bearers(ctx, mme_ue_id)
-        .iter()
-        .filter(|bearer| bearer.sgw_s1u_teid != 0)
-        .map(|bearer| ErabSwitchedItem {
-            erab_id: bearer.ebi,
-            transport_layer_address: s1ap_build::ip_to_transport_address(&bearer.sgw_s1u_ip),
-            gtp_teid: bearer.sgw_s1u_teid,
-        })
-        .collect();
-
-    let ack = PathSwitchRequestAcknowledge {
-        mme_ue_s1ap_id: msg.source_mme_ue_s1ap_id,
-        enb_ue_s1ap_id: msg.enb_ue_s1ap_id,
-        erab_switched_ul_list,
-        security_context: SecurityContext {
-            next_hop_chaining_count: ncc,
-            next_hop_parameter: nh,
+    let pending = crate::gtp_path::PendingHandoverModification {
+        mme_ue_id,
+        switched,
+        omitted,
+        kind: crate::gtp_path::HandoverModifyKind::PathSwitch {
+            enb_id,
+            mme_ue_s1ap_id: msg.source_mme_ue_s1ap_id,
+            enb_ue_s1ap_id: msg.enb_ue_s1ap_id,
+            ncc,
+            nh,
+            released,
+            notify: notify.to_vec(),
         },
     };
-
-    match crate::s1ap_gen::build_path_switch_request_acknowledge(&ack, notify) {
-        Ok(pdu) => S1apSend::to_origin(enb_id, pdu),
-        Err(e) => {
-            log::error!("Failed to build Path Switch Request Acknowledge: {e}");
+    match crate::gtp_path::send_modify_bearer_request_for_handover(ctx, pending) {
+        Ok(seq) => {
+            log::info!(
+                "[{}] Path Switch Request: Modify Bearer Request (seq={seq}) sent; the \
+                 acknowledge waits for its response (TS 23.401 §5.5.1.1.2 steps 2-5)",
+                mme_ue.imsi_bcd
+            );
             Vec::new()
         }
+        Err(e) => {
+            crate::handover_switch::count_handover_failure(
+                crate::handover_switch::failure_reason::NOT_SENT,
+            );
+            log::error!(
+                "[{}] Path Switch Request: Modify Bearer Request not sent ({e}); failing it and \
+                 detaching the UE",
+                mme_ue.imsi_bcd
+            );
+            let out = path_switch_failure_with(
+                enb_id,
+                msg.source_mme_ue_s1ap_id,
+                msg.enb_ue_s1ap_id,
+                crate::handover_switch::CORE_NOT_SWITCHED,
+            );
+            crate::handover_switch::detach_after_failed_handover(
+                ctx,
+                mme_ue_id,
+                "a Path Switch Request whose Modify Bearer Request could not be sent",
+            );
+            out
+        }
     }
+}
+
+fn path_switch_failure_with(
+    enb_id: u64,
+    mme_ue_s1ap_id: u32,
+    enb_ue_s1ap_id: u32,
+    cause: Cause,
+) -> Vec<S1apSend> {
+    crate::handover_switch::path_switch_failure(enb_id, mme_ue_s1ap_id, enb_ue_s1ap_id, cause)
+        .into_iter()
+        .collect()
 }
 
 fn path_switch_failure(
@@ -4088,8 +4419,8 @@ mod tests {
     use crate::context::{Bitrate, MmeUe, PlmnId, ServedGummei};
     use crate::s1ap_gen::test_codec::{builder, decode_s1ap_pdu};
     use nextgcore_s1ap::{
-        CauseRadioNetwork, GlobalEnbId, STmsi, SupportedTaItem, UeAssociatedLogicalS1Connection,
-        UeSecurityCapabilities,
+        CauseRadioNetwork, ErabSwitchedItem, GlobalEnbId, STmsi, SupportedTaItem,
+        UeAssociatedLogicalS1Connection, UeSecurityCapabilities,
     };
 
     fn test_ctx() -> MmeContext {
@@ -4351,77 +4682,9 @@ mod tests {
         assert!(mme_ue.paging.failed);
     }
 
-    #[test]
-    fn test_path_switch_request_acknowledged_with_fresh_security_context() {
-        let ctx = ctx_with_gummei();
-        let (_, _, mme_ue_id, mme_ue_s1ap_id) = add_ue(&ctx);
-        // Provision one bearer with the SGW UL endpoint
-        let bearer_id = ctx.bearer_add(0, mme_ue_id);
-        {
-            let mut pool = ctx.bearer_pool.write().unwrap();
-            let bearer = pool.get_mut(&bearer_id).unwrap();
-            bearer.ebi = 5;
-            bearer.sgw_s1u_teid = 0x5555;
-            bearer.sgw_s1u_ip.ipv4 = Some([10, 0, 0, 2]);
-        }
-        // The UE moved to a new eNB via X2
-        let new_enb_id = ctx.enb_add("127.0.0.9:36412".parse().unwrap());
-
-        let psr = PathSwitchRequest {
-            enb_ue_s1ap_id: 200,
-            erab_switched_dl_list: vec![ErabSwitchedItem {
-                erab_id: 5,
-                transport_layer_address: vec![10, 0, 0, 9],
-                gtp_teid: 0x9999,
-            }],
-            source_mme_ue_s1ap_id: mme_ue_s1ap_id,
-            eutran_cgi: nextgcore_s1ap::EutranCgi {
-                plmn_identity: s1ap_build::encode_plmn_id(&PlmnId::new("310", "410")),
-                cell_identity: 0x42,
-            },
-            tai: nextgcore_s1ap::Tai {
-                plmn_identity: s1ap_build::encode_plmn_id(&PlmnId::new("310", "410")),
-                tac: 2,
-            },
-            ue_security_capabilities: UeSecurityCapabilities {
-                encryption_algorithms: 0xE000,
-                integrity_algorithms: 0xE000,
-            },
-        };
-        let bytes = builder::build_path_switch_request(&psr).unwrap();
-
-        let out = handle_s1ap_message(&ctx, new_enb_id, &bytes);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].enb_id, new_enb_id);
-        match decode_s1ap_pdu(&out[0].pdu).unwrap() {
-            S1apMessage::PathSwitchRequestAcknowledge(ack) => {
-                assert_eq!(ack.mme_ue_s1ap_id, mme_ue_s1ap_id);
-                assert_eq!(ack.enb_ue_s1ap_id, 200);
-                // Fresh security context: NCC advanced from 0 to 1, NH
-                // derived from KeNB per TS 33.401 Annex A.4
-                assert_eq!(ack.security_context.next_hop_chaining_count, 1);
-                let expected_nh =
-                    nextgcore_crypt::kdf::nextgcore_kdf_nh_enb(&[0x11; 32], &[0x22; 32]);
-                assert_eq!(ack.security_context.next_hop_parameter, expected_nh);
-                assert_eq!(ack.erab_switched_ul_list.len(), 1);
-                assert_eq!(ack.erab_switched_ul_list[0].gtp_teid, 0x5555);
-            }
-            other => panic!("expected PathSwitchRequestAcknowledge, got {other:?}"),
-        }
-
-        // DL bearer switched onto the new eNB endpoint
-        let bearer = ctx.bearer_find_by_id(bearer_id).unwrap();
-        assert_eq!(bearer.enb_s1u_teid, 0x9999);
-        assert_eq!(bearer.enb_s1u_ip.ipv4, Some([10, 0, 0, 9]));
-
-        // NCC state persisted on the UE context
-        let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
-        assert_eq!(mme_ue.nhcc, 1);
-
-        // Location updated
-        assert_eq!(mme_ue.tai.tac, 2);
-        assert_eq!(mme_ue.e_cgi.cell_id, 0x42);
-    }
+    // The acknowledged Path Switch is in `handover_switch`'s tests (#730): it
+    // waits for the Serving GW, so it needs the global context and a real S11
+    // socket.
 
     #[test]
     fn test_path_switch_request_unknown_ue_fails() {
@@ -4671,15 +4934,19 @@ mod tests {
             other => panic!("expected UeContextReleaseCommand, got {other:?}"),
         }
 
-        // Bearer switched onto the admitted target endpoint
-        let bearer = ctx.bearer_find_by_id(bearer_id).unwrap();
-        assert_eq!(bearer.enb_s1u_teid, 0x8888);
-        assert_eq!(bearer.enb_s1u_ip.ipv4, Some([10, 0, 0, 8]));
-        assert_eq!(bearer.target_s1u_teid, 0);
-
-        // The UE now lives on the target connection
-        let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
-        assert_ne!(mme_ue.enb_ue_id, source_ue_id);
+        // #730: the admitted endpoint becomes the bearer's only once the Serving
+        // GW accepts it (`handover_switch`'s tests drive that with a real S11
+        // socket). This context has no PDN connection and no S11 path, so the
+        // core cannot complete the handover and the UE is detached rather than
+        // left without downlink (TS 23.401 §5.5.1.1.2).
+        assert_eq!(
+            ctx.bearer_find_by_id(bearer_id).map(|b| b.target_s1u_teid),
+            None
+        );
+        assert!(ctx.mme_ue_find_by_id(mme_ue_id).is_none_or(|ue| {
+            ue.enb_ue_id != source_ue_id
+                && ue.nas_eps.type_ == crate::context::MmeEpsType::DetachRequestToUe
+        }));
         // Source release action recorded for the release procedure
         let source_ue = ctx.enb_ue_find_by_id(source_ue_id).unwrap();
         assert_eq!(
