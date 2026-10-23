@@ -7827,6 +7827,134 @@ mod tests {
         );
     }
 
+    /// #721: a UPF restart seen on a Heartbeat Request is answered at once, and the
+    /// N4 receive task stays live while the per-session releases run. The AMF takes
+    /// 2 s per N1N2MessageTransfer. Before, the receive task ran the whole release
+    /// fan-out before it sent the Heartbeat Response, so no PFCP message from ANY
+    /// UPF was processed meanwhile, and the restarted UPF could declare the SMF dead.
+    #[tokio::test]
+    async fn a_restart_on_a_heartbeat_does_not_stall_the_n4_receive_task() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink = posts.clone();
+        let (amf, amf_addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |_req: SbiRequest| {
+                let sink = sink.clone();
+                async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    sink.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await;
+        // UPF A restarts; UPF B is healthy and answers a deletion.
+        let upf_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (upf_b, _seen_b, task_b) = raw_upf(None).await;
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let smf_addr = sock.local_addr().unwrap();
+        let a = Arc::new(pfcp_path::PfcpClient::new(
+            sock.clone(),
+            upf_a.local_addr().unwrap(),
+            [127, 0, 0, 1],
+        ));
+        let b = Arc::new(pfcp_path::PfcpClient::new(
+            sock.clone(),
+            upf_b,
+            [127, 0, 0, 1],
+        ));
+        for c in [&a, &b] {
+            c.set_assoc_state_for_test(true, None, None).await;
+        }
+        a.seed_peer_recovery_time_stamp(100).await;
+        pfcp_path::set_global_pool(vec![a.clone(), b.clone()]);
+        let listener = spawn_pfcp_listener(sock, vec![a.clone(), b.clone()]);
+        let reference = "72101";
+        seed_binding(reference, 5);
+        set_status_uri(
+            reference,
+            &format!(
+                "http://127.0.0.1:{}/namf-callback/v1/sm-status",
+                amf_addr.port()
+            ),
+        );
+        let seid = context::derive_cp_n4_seid(reference);
+        if let Ok(ctx) = smf_self().read() {
+            ctx.pfcp_sessions
+                .write()
+                .unwrap()
+                .insert(reference.to_string(), 0x721);
+        }
+        pfcp_path::record_session_peer(seid, a.peer());
+
+        // UPF A's Heartbeat Request, carrying its NEW Recovery Time Stamp.
+        let mut rts = 96u16.to_be_bytes().to_vec();
+        rts.extend_from_slice(&4u16.to_be_bytes());
+        rts.extend_from_slice(&200u32.to_be_bytes());
+        let hb = pfcp_path::encode_wire_message(
+            pfcp_path::pfcp_message_type::HEARTBEAT_REQUEST,
+            None,
+            0x721,
+            &rts,
+        );
+        let started = std::time::Instant::now();
+        upf_a.send_to(&hb, smf_addr).await.unwrap();
+        let mut buf = vec![0u8; 512];
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), upf_a.recv_from(&mut buf))
+                .await
+                .expect("a Heartbeat Response")
+                .unwrap();
+        let answered_in = started.elapsed();
+        let h = pfcp_path::parse_wire_header(&buf[..len]).unwrap();
+        // And the receive task still serves UPF B while A's release is in flight.
+        let b_started = std::time::Instant::now();
+        let b_result = b
+            .request(
+                pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST,
+                Some(0x721b),
+                &[],
+            )
+            .await;
+        let b_in = b_started.elapsed();
+        let in_flight = posts.load(std::sync::atomic::Ordering::SeqCst);
+        // Let the release finish before tearing the fixture down.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while posts.load(std::sync::atomic::Ordering::SeqCst) == 0
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let released = posts.load(std::sync::atomic::Ordering::SeqCst);
+        cancel_gsm_timer(reference, timer::SmfTimerId::T3592);
+        if let Ok(ctx) = smf_self().read() {
+            ctx.policy_bindings.write().unwrap().remove(reference);
+        }
+        pfcp_path::forget_session_peer(seid);
+        listener.abort();
+        task_b.abort();
+        amf.stop().await.ok();
+        pfcp_path::clear_global_upf_for_test();
+
+        assert_eq!(h.msg_type, pfcp_path::pfcp_message_type::HEARTBEAT_RESPONSE);
+        assert!(
+            answered_in < std::time::Duration::from_millis(500),
+            "the heartbeat is answered before the releases: {answered_in:?}"
+        );
+        assert!(
+            b_result.is_ok(),
+            "UPF B's transaction completes: {b_result:?}"
+        );
+        assert!(
+            b_in < std::time::Duration::from_millis(500),
+            "while A's release is in flight: {b_in:?}"
+        );
+        assert_eq!(in_flight, 0, "A's release was still in flight then");
+        assert_eq!(released, 1, "and A's session is released (#39) after all");
+    }
+
     /// #718 review M4: a shutdown that keeps the N4 association for durable state
     /// still deletes every EPC PFCP session at the PGW-U. EPC PDN connections are not
     /// in the snapshot, so the next incarnation could not ask for them, and its

@@ -976,13 +976,6 @@ impl PfcpClient {
         // Node-level requests handled by the engine
         match header.msg_type {
             pfcp_message_type::HEARTBEAT_REQUEST => {
-                // Staleness detection on the peer's Recovery Time Stamp
-                if let Some(rts) = find_ie(body, 96)
-                    .filter(|v| v.len() >= 4)
-                    .map(|v| u32::from_be_bytes([v[0], v[1], v[2], v[3]]))
-                {
-                    self.check_peer_restart(rts).await;
-                }
                 // Issue #20: the UPF may piggy-back its load metric (Load
                 // Control Information) on the heartbeat. Store it for
                 // load-aware selection, discarding stale sequence numbers.
@@ -1011,6 +1004,16 @@ impl PfcpClient {
                 } else {
                     log::debug!("Heartbeat Response sent to {from}");
                 }
+                // #721: staleness detection on the peer's Recovery Time Stamp, AFTER
+                // the response: the restarted UPF must not declare this SMF dead
+                // while its sessions are released, and the releases themselves run
+                // off this task.
+                if let Some(rts) = find_ie(body, 96)
+                    .filter(|v| v.len() >= 4)
+                    .map(|v| u32::from_be_bytes([v[0], v[1], v[2], v[3]]))
+                {
+                    self.check_peer_restart_detached(rts).await;
+                }
                 true
             }
             pfcp_message_type::ASSOCIATION_RELEASE_REQUEST => {
@@ -1024,8 +1027,8 @@ impl PfcpClient {
                 );
                 let resp = build_message(&msg, header.sequence_number, None);
                 let _ = self.socket.send_to(&resp, from).await;
-                self.teardown_association("association released by peer")
-                    .await;
+                // #721: the per-session releases run off the receive task.
+                drop(self.begin_teardown("association released by peer").await);
                 true
             }
             _ => false, // e.g. Session Report Request — handled by main.rs
@@ -1035,29 +1038,40 @@ impl PfcpClient {
     /// Compare a peer Recovery Time Stamp with the stored value; a change
     /// means the UPF restarted: all sessions on it are gone (TS 23.527 4.2).
     pub async fn check_peer_restart(&self, rts: u32) {
-        self.detect_peer_restart(rts).await;
+        if let Some(releases) = self.detect_peer_restart(rts).await {
+            let _ = releases.await;
+        }
     }
 
-    /// [`Self::check_peer_restart`], reporting whether a restart was detected (and
-    /// the association torn down).
-    async fn detect_peer_restart(&self, rts: u32) -> bool {
+    /// [`Self::check_peer_restart`] for the N4 receive task (#721): the teardown
+    /// itself (association down, this UPF's sessions flushed) is done when this
+    /// returns, but the per-session releases run on in their own task. Awaiting them
+    /// here stalled every PFCP message from every UPF for the whole fan-out.
+    async fn check_peer_restart_detached(&self, rts: u32) {
+        let _ = self.detect_peer_restart(rts).await;
+    }
+
+    /// Detect a peer restart and tear the association down. `Some(fan-out)` when a
+    /// restart was detected, the per-session releases still running in it.
+    async fn detect_peer_restart(&self, rts: u32) -> Option<tokio::task::JoinHandle<()>> {
         let restarted = {
             let assoc = self.assoc.read().await;
             matches!(assoc.peer_recovery_time_stamp, Some(stored) if stored != rts)
         };
-        if restarted {
-            log::error!(
-                "UPF {} restarted (recovery time stamp changed to {rts})",
-                self.peer()
-            );
-            self.teardown_association("peer restarted").await;
-            // Remember the new incarnation so re-association succeeds
-            self.assoc.write().await.peer_recovery_time_stamp = Some(rts);
-            // Issue #191: durably too, so a restart detected on a heartbeat is not
-            // re-detected (or worse, missed) after an SMF restart.
-            self.record_peer_recovery_time_stamp(rts);
+        if !restarted {
+            return None;
         }
-        restarted
+        log::error!(
+            "UPF {} restarted (recovery time stamp changed to {rts})",
+            self.peer()
+        );
+        let releases = self.begin_teardown("peer restarted").await;
+        // Remember the new incarnation so re-association succeeds
+        self.assoc.write().await.peer_recovery_time_stamp = Some(rts);
+        // Issue #191: durably too, so a restart detected on a heartbeat is not
+        // re-detected (or worse, missed) after an SMF restart.
+        self.record_peer_recovery_time_stamp(rts);
+        Some(releases)
     }
 
     /// Mark the association down and flush all PFCP session state.
@@ -1069,6 +1083,13 @@ impl PfcpClient {
     /// Previously this cleared the map, logged a count, and left every AMF
     /// believing in contexts that could not carry a packet.
     async fn teardown_association(&self, reason: &str) {
+        let releases = self.begin_teardown(reason).await;
+        let _ = releases.await;
+    }
+
+    /// [`Self::teardown_association`] up to the per-session releases, which are
+    /// returned still running (#721).
+    async fn begin_teardown(&self, reason: &str) -> tokio::task::JoinHandle<()> {
         #[cfg(test)]
         assert_teardown_is_serialised();
         // #720: only the sessions on THIS UPF. A pool member's restart, release or
@@ -1076,8 +1097,8 @@ impl PfcpClient {
         // are alive; releasing them sent every UE in the pool a #39 and orphaned
         // their sessions on the healthy UPFs.
         let scope = self.session_scope();
-        let notified =
-            crate::restoration::notify_sessions_unrecoverable_in(reason, Some(&scope)).await;
+        let (notified, releases) =
+            crate::restoration::begin_unrecoverable_release(reason, Some(&scope));
         // #687: the EPC PDN connections on this PGW-U, which have no SM context.
         let epc_released =
             crate::restoration::release_epc_pdn_connections_in(reason, Some(&scope)).await;
@@ -1099,6 +1120,7 @@ impl PfcpClient {
              connection(s) deleted toward the SGW",
             self.peer()
         );
+        releases
     }
 
     /// Run the PFCP Association Setup procedure (TS 29.244 6.2.6).
@@ -1145,7 +1167,13 @@ impl PfcpClient {
         }
 
         // Restart detection against any previously stored timestamp
-        let restarted = self.detect_peer_restart(resp.recovery_time_stamp).await;
+        let restarted = match self.detect_peer_restart(resp.recovery_time_stamp).await {
+            Some(releases) => {
+                let _ = releases.await;
+                true
+            }
+            None => false,
+        };
         // #718: retention was asked for and the UP function did not confirm it
         // (PSREI, TS 29.244 §8.2.134). The sessions are gone there: it deleted them,
         // or it never had them. Believing them anyway would leave every one dead
