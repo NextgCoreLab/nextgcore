@@ -491,7 +491,7 @@ async fn pfcp_create_indirect_forwarding(
     upf_seid: u64,
     target: (u32, [u8; 4]),
     ebis: &[u8],
-) -> anyhow::Result<Vec<(u8, (u32, [u8; 4]))>> {
+) -> Result<Vec<(u8, (u32, [u8; 4]))>, ForwardingError> {
     use crate::n4_build::{FarParams, PdrParams, QerParams, SessionModificationParams};
     let params = SessionModificationParams {
         create_fars: vec![FarParams {
@@ -526,7 +526,9 @@ async fn pfcp_create_indirect_forwarding(
             .collect(),
         ..Default::default()
     };
-    let body = crate::pfcp_modify_with(smf_n4_seid, upf_seid, &params).await?;
+    let body = crate::pfcp_modify_with(smf_n4_seid, upf_seid, &params)
+        .await
+        .map_err(ForwardingError::NotAccepted)?;
     let created = created_pdr_fteids(&body);
     ebis.iter()
         .map(|&ebi| {
@@ -534,11 +536,31 @@ async fn pfcp_create_indirect_forwarding(
                 .iter()
                 .find(|(id, ..)| *id == u16::from(FORWARDING_RULE_BASE + ebi))
                 .map(|&(_, teid, addr)| (ebi, (teid, addr)))
-                .ok_or_else(|| {
-                    anyhow::anyhow!("the UPF allocated no forwarding F-TEID for EBI {ebi}")
-                })
+                .ok_or(ForwardingError::Incomplete(ebi))
         })
         .collect()
+}
+
+/// Why the indirect-forwarding modification gave no tunnels (#751).
+#[derive(Debug)]
+enum ForwardingError {
+    /// The UPF accepted the modification but allocated no F-TEID for this EBI. The
+    /// FAR, PDRs and QERs are installed all the same.
+    Incomplete(u8),
+    /// No accepted answer: refused (nothing installed), or no answer at all (the
+    /// request may or may not have been applied).
+    NotAccepted(anyhow::Error),
+}
+
+impl std::fmt::Display for ForwardingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Incomplete(ebi) => {
+                write!(f, "the UPF allocated no forwarding F-TEID for EBI {ebi}")
+            }
+            Self::NotAccepted(e) => write!(f, "{e}"),
+        }
+    }
 }
 
 /// The N4 rules that remove the indirect forwarding tunnels of `ebis`.
@@ -557,17 +579,49 @@ fn remove_forwarding(params: &mut crate::n4_build::SessionModificationParams, eb
 
 /// Execution step 14: release the indirect forwarding tunnels once the timer started at
 /// step 7 expires.
-async fn pfcp_release_forwarding(smf_n4_seid: u64, upf_seid: u64, ebis: &[u8]) {
+async fn pfcp_release_forwarding(smf_n4_seid: u64, upf_seid: u64, ebis: &[u8], why: &str) {
     let mut params = crate::n4_build::SessionModificationParams::default();
     remove_forwarding(&mut params, ebis);
     match crate::pfcp_modify_with(smf_n4_seid, upf_seid, &params).await {
         Ok(_) => log::info!(
-            "EPS→5GS step 14: indirect forwarding tunnels for EBIs {ebis:?} released at the UPF"
+            "EPS→5GS ({why}): indirect forwarding tunnels for EBIs {ebis:?} released at the UPF"
         ),
         Err(e) => log::warn!(
-            "EPS→5GS step 14: the indirect forwarding tunnels for EBIs {ebis:?} were not \
+            "EPS→5GS ({why}): the indirect forwarding tunnels for EBIs {ebis:?} were not \
              released: {e}"
         ),
+    }
+}
+
+/// Whether `sm_context_ref` names a live SM context: a policy binding, or a session
+/// that still carries the reference. `sess_find_by_sm_context_ref` resolves a
+/// reference by session index alone, so it also finds an EPS PDN connection whose
+/// handover was CANCELLED (its `sm_context_ref` cleared); that is not an SM context.
+fn is_live_sm_context(sm_context_ref: &str) -> bool {
+    let handle = smf_self();
+    let Ok(ctx) = handle.read() else {
+        return false;
+    };
+    ctx.policy_bindings
+        .read()
+        .map(|b| b.contains_key(sm_context_ref))
+        .unwrap_or(false)
+        || ctx
+            .sess_find_by_sm_context_ref(sm_context_ref)
+            .is_some_and(|s| s.sm_context_ref.as_deref() == Some(sm_context_ref))
+}
+
+/// Record PREPARED's forwarding EBIs on the session as it is now (#894 review B1).
+fn record_forwarding_intent(sm_context_ref: &str, sess_id: u64, ebis: &[u8]) {
+    if let Ok(ctx) = smf_self().read() {
+        if let Some(mut fresh) = ctx
+            .sess_find_by_sm_context_ref(sm_context_ref)
+            .filter(|f| f.sm_context_ref.as_deref() == Some(sm_context_ref))
+            .filter(|f| f.id == sess_id)
+        {
+            fresh.handover.forwarding_ebis = ebis.to_vec();
+            ctx.sess_update(&fresh);
+        }
     }
 }
 
@@ -623,6 +677,32 @@ impl Drop for HandoverLock {
 
 /// TS 29.502 §5.2.2.2.3: the SMF's answer to an EPS→5GS handover preparation.
 pub(crate) async fn handle_create(body: &serde_json::Value) -> SbiResponse {
+    let body = body.clone();
+    detached(async move { handle_create_inner(&body).await }).await
+}
+
+/// Run a handover handler to completion whatever happens to its caller (#894 review
+/// B1).
+///
+/// The SBI server runs a handler inline in the HTTP/2 stream's service future. When
+/// the AMF's request times out it resets the stream, and hyper drops that future at
+/// whatever await it had reached: a PREPARED dropped mid-modification left the UPF's
+/// new forwarding rules recorded nowhere, and released the handover lock to a
+/// CANCELLED that then had nothing to remove. Spawned, the handler finishes and leaves
+/// the session consistent; only its answer is lost.
+async fn detached(
+    handler: impl std::future::Future<Output = SbiResponse> + Send + 'static,
+) -> SbiResponse {
+    match tokio::spawn(handler).await {
+        Ok(response) => response,
+        Err(e) => {
+            log::error!("EPS→5GS handover handler failed: {e}");
+            crate::problem_response(500, "SYSTEM_FAILURE", "the handover handler failed")
+        }
+    }
+}
+
+async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
     let Some(supi) = body["supi"].as_str().filter(|s| !s.is_empty()) else {
         return crate::problem_400(
             "MANDATORY_IE_MISSING",
@@ -706,6 +786,16 @@ pub(crate) async fn handle_create(body: &serde_json::Value) -> SbiResponse {
     };
 
     let sm_context_ref = format!("{}", sess.index);
+    // #894 review m1: serialised with PREPARED, COMPLETED and CANCELLED of the same SM
+    // context, and the session re-read under the lock.
+    let _procedure = handover_lock(&sm_context_ref).await;
+    if let Some(fresh) = smf_self()
+        .read()
+        .ok()
+        .and_then(|ctx| ctx.sess_find_by_id(sess.id))
+    {
+        sess = fresh;
+    }
     let (smf_n4_seid, upf_seid) = (sess.smf_n4_seid, sess.upf_n4_seid);
 
     // Step 6. NOTE 2 of §5.2.2.2.3: a POST colliding with an existing SM context for the same
@@ -790,13 +880,33 @@ pub(crate) async fn handle_create(body: &serde_json::Value) -> SbiResponse {
     sess.sm_context_status_uri = body["smContextStatusUri"].as_str().map(str::to_string);
     sess.full_dnn = sess.session_name.clone();
     sess.handover.eps_to_5gs = true;
-    sess.handover.prepared = false;
-    sess.handover.target_dl_known = false;
+    if existing.is_none() {
+        // A new preparation. A repeated one (NOTE 2 of §5.2.2.2.3) keeps what PREPARED
+        // already recorded: clearing `forwarding_ebis` forgot FAR 0x50, so no later
+        // CANCELLED or step 14 removed it (#894 review m1).
+        sess.handover.prepared = false;
+        sess.handover.target_dl_known = false;
+        sess.handover.forwarding_ebis.clear();
+    }
     sess.handover.n3_ul_pdr_id = Some(N3_UL_PDR_ID);
     sess.handover.data_forwarding_not_possible = forwarding.not_possible();
     sess.handover.indirect_data_forwarding = forwarding.indirect;
     sess.handover.direct_data_forwarding = forwarding.direct;
-    sess.handover.forwarding_ebis.clear();
+    // #894 review m1: onto the session as it is after the step-6 round trips, so an
+    // S5/S11-side change made meanwhile is not overwritten by the copy read before.
+    if let Some(mut fresh) = smf_self()
+        .read()
+        .ok()
+        .and_then(|ctx| ctx.sess_find_by_id(sess.id))
+    {
+        fresh.psi = sess.psi;
+        fresh.sm_context_ref = sess.sm_context_ref.clone();
+        fresh.pdu_session_ref = sess.pdu_session_ref.clone();
+        fresh.sm_context_status_uri = sess.sm_context_status_uri.clone();
+        fresh.full_dnn = sess.full_dnn.clone();
+        fresh.handover = sess.handover.clone();
+        sess = fresh;
+    }
     let dnn = sess.session_name.clone().unwrap_or_default();
     let sd_hex = sess.s_nssai.sd.map(|sd| format!("{sd:06x}"));
     {
@@ -907,6 +1017,11 @@ pub(crate) async fn handle_create(body: &serde_json::Value) -> SbiResponse {
 /// - **indirect** (`indirectForwardingFlag`): step 12's UPF tunnel, one per bearer, which the
 ///   UPF relays to the target's per-session DL Forwarding UP TNL Information, adding the QFI.
 pub(crate) async fn handle_prepared(sm_context_ref: &str, transfer: &[u8]) -> SbiResponse {
+    let (reference, transfer) = (sm_context_ref.to_string(), transfer.to_vec());
+    detached(async move { handle_prepared_inner(&reference, &transfer).await }).await
+}
+
+async fn handle_prepared_inner(sm_context_ref: &str, transfer: &[u8]) -> SbiResponse {
     let _procedure = handover_lock(sm_context_ref).await;
     let ack = match crate::n2_transfer::parse_handover_request_acknowledge_transfer(transfer) {
         Ok(ack) => ack,
@@ -985,6 +1100,11 @@ pub(crate) async fn handle_prepared(sm_context_ref: &str, transfer: &[u8]) -> Sb
         if sess.handover.indirect_data_forwarding && !indirect.is_empty() {
             match (target_forwarding, crate::lookup_upf_seid(sm_context_ref)) {
                 (Some(target), Some(upf_seid)) => {
+                    // #894 review B1: the intent is recorded BEFORE the request, so a
+                    // PREPARED that never resumes (or whose answer is lost) still leaves
+                    // CANCELLED and step 14 the rules to remove.
+                    sess.handover.forwarding_ebis = indirect.clone();
+                    record_forwarding_intent(sm_context_ref, sess.id, &indirect);
                     match pfcp_create_indirect_forwarding(
                         crate::smf_n4_seid_for(sm_context_ref),
                         upf_seid,
@@ -1005,15 +1125,27 @@ pub(crate) async fn handle_prepared(sm_context_ref: &str, transfer: &[u8]) -> Sb
                                  indirect forwarding for EBIs {indirect:?} ({e}); the bearers \
                                  hand over without it and their in-flight downlink is lost"
                             );
-                            // #751: an incomplete answer (or none) does not mean nothing was
-                            // installed: the UPF may hold the FAR and the PDRs/QERs. Nothing
-                            // records them for step 14 or CANCELLED, so remove them now.
-                            pfcp_release_forwarding(
-                                crate::smf_n4_seid_for(sm_context_ref),
-                                upf_seid,
-                                &indirect,
-                            )
-                            .await;
+                            match e {
+                                // #751: an accepted but incomplete answer means the FAR,
+                                // PDRs and QERs ARE installed and no tunnel will ever use
+                                // them: remove them now.
+                                ForwardingError::Incomplete(_) => {
+                                    pfcp_release_forwarding(
+                                        crate::smf_n4_seid_for(sm_context_ref),
+                                        upf_seid,
+                                        &indirect,
+                                        "incomplete forwarding answer",
+                                    )
+                                    .await;
+                                    sess.handover.forwarding_ebis.clear();
+                                }
+                                // Refused (nothing installed) or unanswered (a dead UPF
+                                // would time a removal out the same way, holding the lock
+                                // for another T1 x (N1+1)). The recorded intent stays, so
+                                // CANCELLED or step 14 removes whatever did land
+                                // (#894 review m6).
+                                ForwardingError::NotAccepted(_) => {}
+                            }
                         }
                     }
                 }
@@ -1052,6 +1184,7 @@ pub(crate) async fn handle_prepared(sm_context_ref: &str, transfer: &[u8]) -> Sb
     let applied = smf_self().read().ok().and_then(|ctx| {
         let mut fresh = ctx
             .sess_find_by_sm_context_ref(sm_context_ref)
+            .filter(|f| f.sm_context_ref.as_deref() == Some(sm_context_ref))
             .filter(|f| f.id == sess.id)?;
         fresh.handover.gnb_n3_teid = sess.handover.gnb_n3_teid;
         fresh.handover.gnb_n3_ip = sess.handover.gnb_n3_ip.clone();
@@ -1068,8 +1201,13 @@ pub(crate) async fn handle_prepared(sm_context_ref: &str, transfer: &[u8]) -> Sb
         );
         if !sess.handover.forwarding_ebis.is_empty() {
             if let Some(upf_seid) = (sess.upf_n4_seid != 0).then_some(sess.upf_n4_seid) {
-                pfcp_release_forwarding(sess.smf_n4_seid, upf_seid, &sess.handover.forwarding_ebis)
-                    .await;
+                pfcp_release_forwarding(
+                    sess.smf_n4_seid,
+                    upf_seid,
+                    &sess.handover.forwarding_ebis,
+                    "context gone during PREPARED",
+                )
+                .await;
             }
         }
         return crate::problem_response(
@@ -1091,7 +1229,24 @@ pub(crate) async fn handle_completed(
     sm_context_ref: &str,
     transfer_endpoint: Option<(u32, [u8; 4])>,
 ) -> SbiResponse {
+    let reference = sm_context_ref.to_string();
+    detached(async move { handle_completed_inner(&reference, transfer_endpoint).await }).await
+}
+
+async fn handle_completed_inner(
+    sm_context_ref: &str,
+    transfer_endpoint: Option<(u32, [u8; 4])>,
+) -> SbiResponse {
     let _procedure = handover_lock(sm_context_ref).await;
+    // #894 review m2: the caller checked the context before the lock wait; a
+    // CANCELLED that held the lock may have released it meanwhile.
+    if !is_live_sm_context(sm_context_ref) {
+        return crate::problem_response(
+            404,
+            "CONTEXT_NOT_FOUND",
+            "the SM context was released before the handover completed",
+        );
+    }
     let completed = || {
         SbiResponse::with_status(200).with_body(
             serde_json::json!({ "hoState": "COMPLETED" }).to_string(),
@@ -1172,6 +1327,7 @@ pub(crate) async fn handle_completed(
             .read()
             .ok()
             .and_then(|ctx| ctx.sess_find_by_sm_context_ref(sm_context_ref))
+            .filter(|f| f.sm_context_ref.as_deref() == Some(sm_context_ref))
             .filter(|f| f.id == old.id)
     });
     if let Some(sess) = sess.as_mut() {
@@ -1219,7 +1375,7 @@ pub(crate) async fn handle_completed(
             let timer = indirect_forwarding_timer();
             tokio::spawn(async move {
                 tokio::time::sleep(timer).await;
-                pfcp_release_forwarding(smf_n4_seid, upf_seid, &forwarding_ebis).await;
+                pfcp_release_forwarding(smf_n4_seid, upf_seid, &forwarding_ebis, "step 14").await;
             });
         }
         log::info!(
@@ -1237,6 +1393,11 @@ pub(crate) async fn handle_completed(
 /// Neither PREPARING nor PREPARED touched the downlink, so a 5GS-internal handover has
 /// nothing to undo; an EPS→5GS one releases the N3 uplink step 6 created.
 pub(crate) async fn handle_cancelled(sm_context_ref: &str) -> SbiResponse {
+    let reference = sm_context_ref.to_string();
+    detached(async move { handle_cancelled_inner(&reference).await }).await
+}
+
+async fn handle_cancelled_inner(sm_context_ref: &str) -> SbiResponse {
     let _procedure = handover_lock(sm_context_ref).await;
     let sess = smf_self()
         .read()
@@ -1265,6 +1426,7 @@ pub(crate) async fn handle_cancelled(sm_context_ref: &str) -> SbiResponse {
                 .read()
                 .ok()
                 .and_then(|ctx| ctx.sess_find_by_sm_context_ref(sm_context_ref))
+                .filter(|f| f.sm_context_ref.as_deref() == Some(sm_context_ref))
                 .filter(|f| f.id == sess.id)
             {
                 sess = fresh;
@@ -2745,6 +2907,21 @@ mod tests {
         s5.close();
     }
 
+    /// The stand-in's modification bodies once `done` holds for them, at most 5 s.
+    async fn wait_for_modifications(
+        upf: &crate::pfcp_path::stand_in::StandInUpf,
+        done: impl Fn(&[Vec<u8>]) -> bool,
+    ) -> Vec<Vec<u8>> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let mods = upf.modification_bodies();
+            if done(&mods) || std::time::Instant::now() >= deadline {
+                return mods;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// The `smContextRef` of a PREPARING create's 201.
     fn created_reference(created: &SbiResponse) -> String {
         serde_json::from_str::<serde_json::Value>(created.http.content.as_deref().expect("body"))
@@ -2804,7 +2981,7 @@ mod tests {
         s5.close();
 
         assert_eq!(cancelled.status, 200);
-        assert!(prepared.status == 200 || prepared.status == 404);
+        assert_eq!(prepared.status, 200, "PREPARED ran first, under the lock");
         assert!(!resurrected, "the cancelled SM context stays gone");
         assert!(!forwarding_left);
         assert!(
@@ -2812,6 +2989,94 @@ mod tests {
             "the forwarding FAR 0x50 PREPARED installed is removed: {} modification(s)",
             mods.len()
         );
+    }
+
+    /// #894 review B1: the AMF's SBI timeout resets the stream, and the server drops
+    /// the PREPARED handler future mid-modification. The handler runs on regardless
+    /// (detached), so the CANCELLED that follows finds the forwarding EBIs it recorded
+    /// and removes FAR 0x50. Before, the dropped future released the lock to a
+    /// CANCELLED with nothing to remove, and the rules leaked.
+    #[tokio::test]
+    async fn a_prepared_dropped_by_its_caller_still_leaves_nothing_behind() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        crate::context::smf_context_init(64, 256, 512);
+        let (s5, pgw_c, _) = establish_pdn(Some(&pco_with_psi(5))).await;
+        let reference = prepare_eps_to_5gs_with_forwarding(pgw_c).await;
+        upf.clear_seen();
+        upf.delay_modifications(400);
+
+        let transfer = ho_ack_transfer_with_forwarding();
+        // The caller gives up after 100 ms, as the AMF's SBI timeout does.
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(100),
+            handle_prepared(&reference, &transfer),
+        )
+        .await;
+        let cancelled = handle_cancelled(&reference).await;
+        upf.delay_modifications(0);
+        let removed_far = wait_for_modifications(&upf, |m| {
+            m.iter()
+                .any(|b| n4_has(b, 16, &[0x00, 0x6C, 0x00, 0x04, 0, 0, 0, 0x50]))
+        })
+        .await
+        .iter()
+        .any(|b| n4_has(b, 16, &[0x00, 0x6C, 0x00, 0x04, 0, 0, 0, 0x50]));
+        s5.close();
+
+        assert!(dropped.is_err(), "the caller gave up on PREPARED");
+        assert_eq!(cancelled.status, 200);
+        assert!(removed_far, "Remove FAR 0x50 reached the UPF");
+    }
+
+    /// #894 review m4: the SM context goes away during PREPARED's UPF round trip by
+    /// another path than CANCELLED (here its reference is simply dropped, as a Delete
+    /// Session would). PREPARED answers 404 and removes the forwarding it installed.
+    #[tokio::test]
+    async fn a_context_gone_during_prepared_is_answered_404_and_its_forwarding_removed() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        crate::context::smf_context_init(64, 256, 512);
+        let (s5, pgw_c, _) = establish_pdn(Some(&pco_with_psi(5))).await;
+        let reference = prepare_eps_to_5gs_with_forwarding(pgw_c).await;
+        upf.clear_seen();
+        upf.delay_modifications(300);
+
+        let transfer = ho_ack_transfer_with_forwarding();
+        let (prepared, ()) = tokio::join!(handle_prepared(&reference, &transfer), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if let Ok(ctx) = smf_self().read() {
+                let mut sess = ctx.sess_find_by_teid(pgw_c.0).unwrap();
+                sess.sm_context_ref = None;
+                ctx.sess_update(&sess);
+            }
+        });
+        upf.delay_modifications(0);
+        let mods = upf.modification_bodies();
+        s5.close();
+
+        assert_eq!(prepared.status, 404);
+        assert!(
+            mods.iter()
+                .any(|b| n4_has(b, 16, &[0x00, 0x6C, 0x00, 0x04, 0, 0, 0, 0x50])),
+            "Remove FAR 0x50: {} modification(s)",
+            mods.len()
+        );
+    }
+
+    /// #894 review m2: COMPLETED after the handover was CANCELLED is a 404, not a 200
+    /// for a context that no longer exists.
+    #[tokio::test]
+    async fn completed_after_cancelled_is_context_not_found() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _upf = crate::pfcp_path::stand_in::associated_upf().await;
+        crate::context::smf_context_init(64, 256, 512);
+        let (s5, pgw_c, _) = establish_pdn(Some(&pco_with_psi(5))).await;
+        let reference = prepare_eps_to_5gs_with_forwarding(pgw_c).await;
+        assert_eq!(handle_cancelled(&reference).await.status, 200);
+        let completed = handle_completed(&reference, None).await;
+        s5.close();
+        assert_eq!(completed.status, 404);
     }
 
     /// #751: the UPF answers the indirect-forwarding modification without the Created
