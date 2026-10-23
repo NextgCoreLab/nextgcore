@@ -1,0 +1,10 @@
+# Privileged: the SGW-U, PGW-U and LTE UE create TUN devices and the PGW-U
+# NATs UE traffic out to the internet (same level as nextg-system with
+# ENABLE_DATAPLANE=true). deploy-eks.sh also (re)applies the label.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nextg-epc
+  labels:
+    app.kubernetes.io/part-of: nextg
+    pod-security.kubernetes.io/enforce: privileged

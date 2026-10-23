@@ -1,0 +1,1118 @@
+# PROFILE=epc: nextgcore's standalone EPC plus nextgsim's LTE eNB and UE,
+# translated from docker/rust/docker-compose-epc.yml (the nightly EPC stage).
+#
+# The nine pods are deliberately uniform; keep them so when editing.
+#
+# Every pod starts through scripts/epc-run.sh, which rewrites the compose
+# addresses (172.24.0.N) to pod IPs and records them for the
+# epc-peers-check.sh liveness probe. Services are headless with
+# publishNotReadyAddresses, so a peer resolves to its pod IP as soon as it has
+# one. S1-MME is kernel SCTP (mmed and lte-enb built with kernel-sctp, as
+# Dockerfile.builder does for the nightly); profile.env's postrender rewrites
+# the mme Service's s1ap port protocol when S1AP_PROTOCOL says otherwise.
+#
+# Every pod is pinned to the nextg.io/dataplane=true node(s), the same nodes the
+# 5G profile's privileged UPF uses (CloudFormation EnableDataPlanePrivileges):
+# SGW-U, PGW-U and the UE are privileged, and the MME and eNB need the node's
+# `sctp` kernel module, so one node set has to provide both.
+apiVersion: v1
+kind: Service
+metadata:
+  name: hss
+  namespace: nextg-epc
+  labels:
+    app.kubernetes.io/name: hss
+    app.kubernetes.io/part-of: nextg-epc
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: hss
+  ports:
+  - name: diameter
+    port: 3868
+    targetPort: 3868
+    protocol: TCP
+  - name: metrics
+    port: 9090
+    targetPort: 9090
+    protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hss
+  namespace: nextg-epc
+  labels: &id001
+    app.kubernetes.io/name: hss
+    app.kubernetes.io/part-of: nextg-epc
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hss
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: hss
+        image: nextgcore-rust/hss:latest
+        imagePullPolicy: IfNotPresent
+        command:
+        - sh
+        - /epc/scripts/epc-run.sh
+        - hss
+        - nf-binary
+        - -c
+        - /run/epc/cfg/hss.yaml
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: RUST_LOG
+          value: info
+        - name: RUST_BACKTRACE
+          value: '1'
+        # The MME dials the HSS (S6a), and the HSS answers and sends CLR/IDR over
+        # that connection, so the HSS has no use for the MME's address at start.
+        # Tracking it made the HSS restart whenever the MME moved, which dropped
+        # the new MME's S6a connection right after it was set up.
+        - name: EPC_UNTRACKED
+          value: mme
+        volumeMounts:
+        - name: templates
+          mountPath: /epc/templates
+          readOnly: true
+        - name: scripts
+          mountPath: /epc/scripts
+          readOnly: true
+        - name: run
+          mountPath: /run/epc
+        livenessProbe:
+          exec:
+            command:
+            - sh
+            - /epc/scripts/epc-peers-check.sh
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          failureThreshold: 2
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            memory: 512Mi
+      volumes:
+      - name: templates
+        configMap:
+          name: epc-configs
+          items:
+          - key: hss.yaml
+            path: hss.yaml
+          - key: hss.conf
+            path: hss.conf
+      - name: scripts
+        configMap:
+          name: epc-scripts
+          defaultMode: 493
+      - name: run
+        emptyDir: {}
+      terminationGracePeriodSeconds: 5
+      nodeSelector:
+        nextg.io/dataplane: 'true'
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pcrf
+  namespace: nextg-epc
+  labels:
+    app.kubernetes.io/name: pcrf
+    app.kubernetes.io/part-of: nextg-epc
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: pcrf
+  ports:
+  - name: diameter
+    port: 3868
+    targetPort: 3868
+    protocol: TCP
+  - name: metrics
+    port: 9090
+    targetPort: 9090
+    protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pcrf
+  namespace: nextg-epc
+  labels: &id001
+    app.kubernetes.io/name: pcrf
+    app.kubernetes.io/part-of: nextg-epc
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pcrf
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: pcrf
+        image: nextgcore-rust/pcrf:latest
+        imagePullPolicy: IfNotPresent
+        command:
+        - sh
+        - /epc/scripts/epc-run.sh
+        - pcrf
+        - nf-binary
+        - -c
+        - /run/epc/cfg/pcrf.yaml
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: RUST_LOG
+          value: info
+        - name: RUST_BACKTRACE
+          value: '1'
+        volumeMounts:
+        - name: templates
+          mountPath: /epc/templates
+          readOnly: true
+        - name: scripts
+          mountPath: /epc/scripts
+          readOnly: true
+        - name: run
+          mountPath: /run/epc
+        livenessProbe:
+          exec:
+            command:
+            - sh
+            - /epc/scripts/epc-peers-check.sh
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          failureThreshold: 2
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            memory: 512Mi
+      volumes:
+      - name: templates
+        configMap:
+          name: epc-configs
+          items:
+          - key: pcrf.yaml
+            path: pcrf.yaml
+          - key: pcrf.conf
+            path: pcrf.conf
+      - name: scripts
+        configMap:
+          name: epc-scripts
+          defaultMode: 493
+      - name: run
+        emptyDir: {}
+      terminationGracePeriodSeconds: 5
+      nodeSelector:
+        nextg.io/dataplane: 'true'
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sgwc
+  namespace: nextg-epc
+  labels:
+    app.kubernetes.io/name: sgwc
+    app.kubernetes.io/part-of: nextg-epc
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: sgwc
+  ports:
+  - name: gtpc
+    port: 2123
+    targetPort: 2123
+    protocol: UDP
+  - name: pfcp
+    port: 8805
+    targetPort: 8805
+    protocol: UDP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sgwc
+  namespace: nextg-epc
+  labels: &id001
+    app.kubernetes.io/name: sgwc
+    app.kubernetes.io/part-of: nextg-epc
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sgwc
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: sgwc
+        image: nextgcore-rust/sgwc:latest
+        imagePullPolicy: IfNotPresent
+        command:
+        - sh
+        - /epc/scripts/epc-run.sh
+        - sgwc
+        - nf-binary
+        - -c
+        - /run/epc/cfg/sgwc.yaml
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: RUST_LOG
+          value: info
+        - name: RUST_BACKTRACE
+          value: '1'
+        - name: EPC_EXPORT
+          value: SGWC_PGW_S5C=pgwc SGWC_GTPU_ADVERTISE=sgwu
+        # TS 23.007 §18: the GTP-C restart counter must survive the restart it
+        # signals. The image's /var/lib/nextgcore is the container's writable
+        # layer, which a container restart (the liveness probe's remedy) discards,
+        # so every restart advertised Recovery 1 again and no peer could see it.
+        # /run/epc is the pod's emptyDir, which outlives container restarts.
+        - name: SGWC_RESTART_COUNTER_FILE
+          value: /run/epc/sgwc-restart-counter
+        volumeMounts:
+        - name: templates
+          mountPath: /epc/templates
+          readOnly: true
+        - name: scripts
+          mountPath: /epc/scripts
+          readOnly: true
+        - name: run
+          mountPath: /run/epc
+        livenessProbe:
+          exec:
+            command:
+            - sh
+            - /epc/scripts/epc-peers-check.sh
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          failureThreshold: 2
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            memory: 512Mi
+      volumes:
+      - name: templates
+        configMap:
+          name: epc-configs
+          items:
+          - key: sgwc.yaml
+            path: sgwc.yaml
+      - name: scripts
+        configMap:
+          name: epc-scripts
+          defaultMode: 493
+      - name: run
+        emptyDir: {}
+      terminationGracePeriodSeconds: 5
+      nodeSelector:
+        nextg.io/dataplane: 'true'
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pgwc
+  namespace: nextg-epc
+  labels:
+    app.kubernetes.io/name: pgwc
+    app.kubernetes.io/part-of: nextg-epc
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: pgwc
+  ports:
+  - name: gtpc
+    port: 2123
+    targetPort: 2123
+    protocol: UDP
+  - name: pfcp
+    port: 8805
+    targetPort: 8805
+    protocol: UDP
+  - name: gtpu
+    port: 2152
+    targetPort: 2152
+    protocol: UDP
+  - name: sbi
+    port: 7777
+    targetPort: 7777
+    protocol: TCP
+  - name: metrics
+    port: 9090
+    targetPort: 9090
+    protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgwc
+  namespace: nextg-epc
+  labels: &id001
+    app.kubernetes.io/name: pgwc
+    app.kubernetes.io/part-of: nextg-epc
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pgwc
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: pgwc
+        image: nextgcore-rust/smf:latest
+        imagePullPolicy: IfNotPresent
+        command:
+        - sh
+        - /epc/scripts/epc-run.sh
+        - pgwc
+        - nf-binary
+        - -c
+        - /run/epc/cfg/pgwc.yaml
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: RUST_LOG
+          value: info
+        - name: RUST_BACKTRACE
+          value: '1'
+        - name: UPF_PFCP_PORT
+          value: '8805'
+        - name: NEXTGCORE_SBI_PROFILE
+          value: dev
+        # smfd re-resolves a hostname UPF_PFCP_ADDR on every PFCP association
+        # attempt (#658), so the PGW-U is named by its Service and is not a
+        # liveness-tracked peer: a restarted PGW-U is found again without
+        # restarting the PGW-C.
+        - name: EPC_EXPORT
+          value: SMF_PFCP_ADDR=self UPF_PFCP_ADDR=dns:pgwu
+        - name: EPC_UNTRACKED
+          value: pgwu
+        volumeMounts:
+        - name: templates
+          mountPath: /epc/templates
+          readOnly: true
+        - name: scripts
+          mountPath: /epc/scripts
+          readOnly: true
+        - name: run
+          mountPath: /run/epc
+        livenessProbe:
+          exec:
+            command:
+            - sh
+            - /epc/scripts/epc-peers-check.sh
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          failureThreshold: 2
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            memory: 512Mi
+        readinessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - curl -fsS http://localhost:9090/metrics | grep -q '^smf_up 1$'
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          failureThreshold: 6
+      volumes:
+      - name: templates
+        configMap:
+          name: epc-configs
+          items:
+          - key: pgwc.yaml
+            path: pgwc.yaml
+      - name: scripts
+        configMap:
+          name: epc-scripts
+          defaultMode: 493
+      - name: run
+        emptyDir: {}
+      terminationGracePeriodSeconds: 5
+      nodeSelector:
+        nextg.io/dataplane: 'true'
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pgwu
+  namespace: nextg-epc
+  labels:
+    app.kubernetes.io/name: pgwu
+    app.kubernetes.io/part-of: nextg-epc
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: pgwu
+  ports:
+  - name: pfcp
+    port: 8805
+    targetPort: 8805
+    protocol: UDP
+  - name: gtpu
+    port: 2152
+    targetPort: 2152
+    protocol: UDP
+  - name: metrics
+    port: 9090
+    targetPort: 9090
+    protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgwu
+  namespace: nextg-epc
+  labels: &id001
+    app.kubernetes.io/name: pgwu
+    app.kubernetes.io/part-of: nextg-epc
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pgwu
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: pgwu
+        image: nextgcore-rust/upf:latest
+        imagePullPolicy: IfNotPresent
+        command:
+        - sh
+        - /epc/scripts/epc-run.sh
+        - pgwu
+        - nf-binary
+        - -c
+        - /run/epc/cfg/pgwu.yaml
+        - --pfcp-addr
+        - $(POD_IP)
+        - --gtpu-addr
+        - $(POD_IP)
+        - --tun-ip
+        - 10.45.0.1
+        - --tun-prefix
+        - '16'
+        - --tun-ifname
+        - epctun
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: RUST_LOG
+          value: info
+        - name: RUST_BACKTRACE
+          value: '1'
+        volumeMounts:
+        - name: templates
+          mountPath: /epc/templates
+          readOnly: true
+        - name: scripts
+          mountPath: /epc/scripts
+          readOnly: true
+        - name: run
+          mountPath: /run/epc
+        - name: dev-tun
+          mountPath: /dev/net/tun
+        livenessProbe:
+          exec:
+            command:
+            - sh
+            - /epc/scripts/epc-peers-check.sh
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          failureThreshold: 2
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            memory: 512Mi
+        readinessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - curl -fsS http://localhost:9090/metrics | grep -q '^upf_up 1$'
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          failureThreshold: 6
+        securityContext:
+          privileged: true
+          runAsUser: 0
+          allowPrivilegeEscalation: true
+          capabilities:
+            add:
+            - NET_ADMIN
+            - SYS_ADMIN
+      volumes:
+      - name: templates
+        configMap:
+          name: epc-configs
+          items:
+          - key: pgwu.yaml
+            path: pgwu.yaml
+      - name: scripts
+        configMap:
+          name: epc-scripts
+          defaultMode: 493
+      - name: run
+        emptyDir: {}
+      - name: dev-tun
+        hostPath:
+          path: /dev/net/tun
+          type: CharDevice
+      terminationGracePeriodSeconds: 5
+      initContainers:
+      - name: sysctls
+        image: busybox:1.36
+        command:
+        - sh
+        - -c
+        - set -e; for kv in net.ipv4.ip_forward=1; do sysctl -w "$kv"; done
+        securityContext:
+          privileged: true
+          runAsUser: 0
+      nodeSelector:
+        nextg.io/dataplane: 'true'
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sgwu
+  namespace: nextg-epc
+  labels:
+    app.kubernetes.io/name: sgwu
+    app.kubernetes.io/part-of: nextg-epc
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: sgwu
+  ports:
+  - name: pfcp
+    port: 8805
+    targetPort: 8805
+    protocol: UDP
+  - name: gtpu
+    port: 2152
+    targetPort: 2152
+    protocol: UDP
+  - name: metrics
+    port: 9090
+    targetPort: 9090
+    protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sgwu
+  namespace: nextg-epc
+  labels: &id001
+    app.kubernetes.io/name: sgwu
+    app.kubernetes.io/part-of: nextg-epc
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sgwu
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: sgwu
+        image: nextgcore-rust/sgwu:latest
+        imagePullPolicy: IfNotPresent
+        command:
+        - sh
+        - /epc/scripts/epc-run.sh
+        - sgwu
+        - nf-binary
+        - -c
+        - /run/epc/cfg/sgwu.yaml
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: RUST_LOG
+          value: info
+        - name: RUST_BACKTRACE
+          value: '1'
+        volumeMounts:
+        - name: templates
+          mountPath: /epc/templates
+          readOnly: true
+        - name: scripts
+          mountPath: /epc/scripts
+          readOnly: true
+        - name: run
+          mountPath: /run/epc
+        - name: dev-tun
+          mountPath: /dev/net/tun
+        livenessProbe:
+          exec:
+            command:
+            - sh
+            - /epc/scripts/epc-peers-check.sh
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          failureThreshold: 2
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            memory: 512Mi
+        readinessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - curl -fsS http://localhost:9090/metrics | grep -q '^sgwu_up 1$'
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          failureThreshold: 6
+        securityContext:
+          privileged: true
+          runAsUser: 0
+          allowPrivilegeEscalation: true
+          capabilities:
+            add:
+            - NET_ADMIN
+            - SYS_ADMIN
+      volumes:
+      - name: templates
+        configMap:
+          name: epc-configs
+          items:
+          - key: sgwu.yaml
+            path: sgwu.yaml
+      - name: scripts
+        configMap:
+          name: epc-scripts
+          defaultMode: 493
+      - name: run
+        emptyDir: {}
+      - name: dev-tun
+        hostPath:
+          path: /dev/net/tun
+          type: CharDevice
+      terminationGracePeriodSeconds: 5
+      initContainers:
+      - name: sysctls
+        image: busybox:1.36
+        command:
+        - sh
+        - -c
+        - set -e; for kv in net.ipv4.ip_forward=1; do sysctl -w "$kv"; done
+        securityContext:
+          privileged: true
+          runAsUser: 0
+      nodeSelector:
+        nextg.io/dataplane: 'true'
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mme
+  namespace: nextg-epc
+  labels:
+    app.kubernetes.io/name: mme
+    app.kubernetes.io/part-of: nextg-epc
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: mme
+  ports:
+  - name: s1ap
+    port: 36412
+    targetPort: 36412
+    protocol: SCTP
+  - name: gtpc
+    port: 2123
+    targetPort: 2123
+    protocol: UDP
+  - name: diameter
+    port: 3868
+    targetPort: 3868
+    protocol: TCP
+  - name: metrics
+    port: 9090
+    targetPort: 9090
+    protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mme
+  namespace: nextg-epc
+  labels: &id001
+    app.kubernetes.io/name: mme
+    app.kubernetes.io/part-of: nextg-epc
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mme
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: mme
+        image: nextgcore-rust/mme:latest
+        imagePullPolicy: IfNotPresent
+        command:
+        - sh
+        - /epc/scripts/epc-run.sh
+        - mme
+        - nf-binary
+        - -c
+        - /run/epc/cfg/mme.yaml
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: RUST_LOG
+          value: info
+        - name: RUST_BACKTRACE
+          value: '1'
+        # TS 23.007 §18: see sgwc; the counter outlives a container restart.
+        - name: MME_RESTART_COUNTER_FILE
+          value: /run/epc/mme-restart-counter
+        volumeMounts:
+        - name: templates
+          mountPath: /epc/templates
+          readOnly: true
+        - name: scripts
+          mountPath: /epc/scripts
+          readOnly: true
+        - name: run
+          mountPath: /run/epc
+        livenessProbe:
+          exec:
+            command:
+            - sh
+            - /epc/scripts/epc-peers-check.sh
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          failureThreshold: 2
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            memory: 512Mi
+      volumes:
+      - name: templates
+        configMap:
+          name: epc-configs
+          items:
+          - key: mme.yaml
+            path: mme.yaml
+          - key: mme.conf
+            path: mme.conf
+      - name: scripts
+        configMap:
+          name: epc-scripts
+          defaultMode: 493
+      - name: run
+        emptyDir: {}
+      terminationGracePeriodSeconds: 5
+      nodeSelector:
+        nextg.io/dataplane: 'true'
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: enb
+  namespace: nextg-epc
+  labels:
+    app.kubernetes.io/name: enb
+    app.kubernetes.io/part-of: nextg-epc
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: enb
+  ports:
+  - name: rls
+    port: 4997
+    targetPort: 4997
+    protocol: UDP
+  - name: gtpu
+    port: 2152
+    targetPort: 2152
+    protocol: UDP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: enb
+  namespace: nextg-epc
+  labels: &id001
+    app.kubernetes.io/name: enb
+    app.kubernetes.io/part-of: nextg-epc
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: enb
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: enb
+        image: nextgsim-lte-enb:latest
+        imagePullPolicy: IfNotPresent
+        command:
+        - sh
+        - /epc/scripts/epc-run.sh
+        - enb
+        - lte-enb
+        - -c
+        - /run/epc/cfg/enb.yaml
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: RUST_LOG
+          value: info
+        - name: RUST_BACKTRACE
+          value: '1'
+        volumeMounts:
+        - name: templates
+          mountPath: /epc/templates
+          readOnly: true
+        - name: scripts
+          mountPath: /epc/scripts
+          readOnly: true
+        - name: run
+          mountPath: /run/epc
+        livenessProbe:
+          exec:
+            command:
+            - sh
+            - /epc/scripts/epc-peers-check.sh
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          failureThreshold: 2
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            memory: 512Mi
+      volumes:
+      - name: templates
+        configMap:
+          name: epc-configs
+          items:
+          - key: enb.yaml
+            path: enb.yaml
+      - name: scripts
+        configMap:
+          name: epc-scripts
+          defaultMode: 493
+      - name: run
+        emptyDir: {}
+      terminationGracePeriodSeconds: 5
+      nodeSelector:
+        nextg.io/dataplane: 'true'
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lte-ue
+  namespace: nextg-epc
+  labels: &id001
+    app.kubernetes.io/name: lte-ue
+    app.kubernetes.io/part-of: nextg-epc
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: lte-ue
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      containers:
+      - name: lte-ue
+        image: nextgsim-lte-ue:latest
+        imagePullPolicy: IfNotPresent
+        command:
+        - sh
+        - /epc/scripts/epc-run.sh
+        - lte-ue
+        - lte-ue
+        - -c
+        - /run/epc/cfg/lte-ue.yaml
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: RUST_LOG
+          value: info
+        - name: RUST_BACKTRACE
+          value: '1'
+        volumeMounts:
+        - name: templates
+          mountPath: /epc/templates
+          readOnly: true
+        - name: scripts
+          mountPath: /epc/scripts
+          readOnly: true
+        - name: run
+          mountPath: /run/epc
+        - name: dev-tun
+          mountPath: /dev/net/tun
+        livenessProbe:
+          exec:
+            command:
+            - sh
+            - /epc/scripts/epc-peers-check.sh
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          failureThreshold: 2
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            memory: 512Mi
+        securityContext:
+          runAsUser: 0
+          capabilities:
+            add:
+            - NET_ADMIN
+      volumes:
+      - name: templates
+        configMap:
+          name: epc-configs
+          items:
+          - key: lte-ue.yaml
+            path: lte-ue.yaml
+      - name: scripts
+        configMap:
+          name: epc-scripts
+          defaultMode: 493
+      - name: run
+        emptyDir: {}
+      - name: dev-tun
+        hostPath:
+          path: /dev/net/tun
+          type: CharDevice
+      terminationGracePeriodSeconds: 5
+      initContainers:
+      - name: sysctls
+        image: busybox:1.36
+        command:
+        - sh
+        - -c
+        - set -e; for kv in net.ipv4.conf.all.rp_filter=2 net.ipv4.conf.default.rp_filter=2;
+          do sysctl -w "$kv"; done
+        securityContext:
+          privileged: true
+          runAsUser: 0
+      nodeSelector:
+        nextg.io/dataplane: 'true'
