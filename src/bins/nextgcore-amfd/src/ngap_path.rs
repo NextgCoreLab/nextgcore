@@ -2134,6 +2134,13 @@ impl NgapServer {
                 log::warn!(
                     "Service Request in Initial UE Message without stored context: rejecting (#9)"
                 );
+                // #758: allocated to this connection with no NAS context, as in
+                // `reject_idle_service_request`.
+                self.remember_contextless_ue_id(
+                    association_id,
+                    amf_ue_ngap_id,
+                    initial_ue.ran_ue_ngap_id,
+                );
                 let reject = gmm_build::build_service_reject(
                     &AmfUe::default(),
                     GmmCause::UeIdentityCannotBeDerivedByTheNetwork,
