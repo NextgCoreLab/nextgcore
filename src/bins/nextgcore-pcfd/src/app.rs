@@ -2466,7 +2466,8 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
             // #310: the reported subscribed session-AMBR, which the `SE_AMBR_CH` arm
             // bounds its authorisation by. Before #310 this field was written only by
             // `npcf_handler::pcf_npcf_smpolicycontrol_handle_create`, a dead C port
-            // with no callers, so on the live path it was neither written nor read.
+            // with no callers (deleted by #655), so on the live path it was
+            // neither written nor read.
             sess.subscribed_sess_ambr = subs_sess_ambr.clone();
             if let Ok(context) = ctx.read() {
                 context.sess_update(&sess);
@@ -4578,7 +4579,7 @@ mod tests {
     ///
     /// Before #310 the field's only writer was
     /// `npcf_handler::pcf_npcf_smpolicycontrol_handle_create`, a dead C port with no
-    /// callers, so on the live path it was neither written nor read.
+    /// callers (deleted by #655), so on the live path it was neither written nor read.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
     async fn a_create_stores_the_reported_subscribed_ambr_and_a_later_update_bounds_by_it() {
