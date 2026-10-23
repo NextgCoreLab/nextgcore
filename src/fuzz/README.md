@@ -28,6 +28,7 @@ rustup install nightly
 | `fuzz_s1ap_message` | S1AP | S1-MME: generated codec (`nextgcore-s1ap-gen`) |
 | `fuzz_nrppa_message` | NRPPa | NG-RAN positioning: generated codec (`nextgcore-nrppa-gen`) |
 | `fuzz_lpp_message` | LPP | UE positioning: generated codec (`nextgcore-lpp-gen`) |
+| `fuzz_ucmf_capability` | TS 38.331 / TS 36.331 UE radio capability | The UCMF's transcoding and paging derivation (`nextgcore-ucmfd/src/rac.rs`) |
 
 Every target calls the real library decoders (the PFCP/GTP/NAS/Diameter targets
 pick one decoder per input from its first byte). This directory is its own cargo

@@ -173,35 +173,53 @@ pub fn parse_create_session_request(
 
 #[derive(Debug, Clone)]
 pub struct ParsedModifyBearerRequest {
-    /// Bearer Context to be modified: (EBI, S1 eNodeB F-TEID)
-    pub bearer: Option<(u8, Option<Gtp2FTeidIe>)>,
+    /// Every "Bearer Context to be modified" (instance 0, TS 29.274 Table
+    /// 7.2.7-1, which allows several): (EBI, S1 eNodeB F-TEID). Empty when the
+    /// request modifies no bearer (e.g. a TAU without bearer change).
+    pub bearers: Vec<(u8, Option<Gtp2FTeidIe>)>,
+    /// EBIs of the "Bearer Contexts to be removed" (instance 1): bearers the MME
+    /// removes by a separate procedure (Table 7.2.7-1 NOTE 3). Not modified.
+    pub to_remove: Vec<u8>,
     pub indication: Option<Gtp2IndicationIe>,
 }
 
 pub fn parse_modify_bearer_request(
     msg: &Gtp2Message,
 ) -> Result<ParsedModifyBearerRequest, IeError> {
-    let bearer = match msg.get_ie(Gtp2IeType::BearerContext as u8, 0) {
-        Some(bc_ie) => {
-            let bc = Gtp2BearerContextIe::decode(&bc_ie.value)
-                .map_err(|_| IeError::incorrect_mandatory(Gtp2IeType::BearerContext))?;
-            // EBI is mandatory inside a Bearer Context grouped IE
-            let ebi = bc
-                .ebi()
-                .map_err(|_| IeError::missing_mandatory(Gtp2IeType::Ebi))?;
-            let enb_fteid = bc
-                .fteid(0)
-                .map_err(|_| IeError::incorrect_mandatory(Gtp2IeType::FTeid))?;
-            Some((ebi, enb_fteid))
+    let mut bearers = Vec::new();
+    let mut to_remove = Vec::new();
+    for bc_ie in msg.get_ies(Gtp2IeType::BearerContext as u8) {
+        let bc = Gtp2BearerContextIe::decode(&bc_ie.value)
+            .map_err(|_| IeError::incorrect_mandatory(Gtp2IeType::BearerContext))?;
+        // EBI is mandatory inside a Bearer Context grouped IE
+        let ebi = bc
+            .ebi()
+            .map_err(|_| IeError::missing_mandatory(Gtp2IeType::Ebi))?;
+        match bc_ie.instance {
+            0 => {
+                let enb_fteid = bc
+                    .fteid(0)
+                    .map_err(|_| IeError::incorrect_mandatory(Gtp2IeType::FTeid))?;
+                if bearers.iter().any(|(e, _)| *e == ebi) {
+                    // One EBI twice: which F-TEID applies is undefined.
+                    return Err(IeError::incorrect_mandatory(Gtp2IeType::BearerContext));
+                }
+                bearers.push((ebi, enb_fteid));
+            }
+            1 => to_remove.push(ebi),
+            _ => {}
         }
-        None => None,
-    };
+    }
 
     let indication = msg
         .get_ie(Gtp2IeType::Indication as u8, 0)
         .and_then(|ie| Gtp2IndicationIe::decode(&ie.value).ok());
 
-    Ok(ParsedModifyBearerRequest { bearer, indication })
+    Ok(ParsedModifyBearerRequest {
+        bearers,
+        to_remove,
+        indication,
+    })
 }
 
 // ============================================================================
@@ -423,7 +441,8 @@ mod tests {
         msg.add_bearer_context(0, &bc);
 
         let parsed = parse_modify_bearer_request(&msg).unwrap();
-        let (ebi, fteid) = parsed.bearer.unwrap();
+        let (ebi, fteid) = parsed.bearers[0].clone();
+        assert_eq!(parsed.bearers.len(), 1);
         assert_eq!(ebi, 5);
         assert_eq!(fteid.unwrap().teid, 0x2222);
 
@@ -433,7 +452,45 @@ mod tests {
             1,
             3,
         ));
-        assert!(parse_modify_bearer_request(&msg).unwrap().bearer.is_none());
+        assert!(parse_modify_bearer_request(&msg)
+            .unwrap()
+            .bearers
+            .is_empty());
+    }
+
+    /// #766, TS 29.274 Table 7.2.7-1: every Bearer Context to be modified is
+    /// read, and the Bearer Contexts to be removed (instance 1) apart.
+    #[test]
+    fn every_bearer_context_to_be_modified_is_parsed() {
+        let mut msg = Gtp2Message::new(Gtp2Header::new(
+            Gtp2MessageType::ModifyBearerRequest as u8,
+            1,
+            5,
+        ));
+        for (ebi, teid) in [(5u8, 0x5555u32), (6, 0x6666)] {
+            let mut bc = Gtp2BearerContextIe::new();
+            bc.set_ebi(ebi);
+            bc.set_fteid(0, &Gtp2FTeidIe::new_ipv4(0, teid, [10, 0, 0, ebi]));
+            msg.add_bearer_context(0, &bc);
+        }
+        let mut removed = Gtp2BearerContextIe::new();
+        removed.set_ebi(7);
+        msg.add_bearer_context(1, &removed);
+
+        let parsed = parse_modify_bearer_request(&msg).unwrap();
+        let got: Vec<(u8, u32)> = parsed
+            .bearers
+            .iter()
+            .map(|(e, f)| (*e, f.as_ref().unwrap().teid))
+            .collect();
+        assert_eq!(got, vec![(5, 0x5555), (6, 0x6666)]);
+        assert_eq!(parsed.to_remove, vec![7]);
+
+        // The same EBI twice is refused.
+        let mut bc = Gtp2BearerContextIe::new();
+        bc.set_ebi(5);
+        msg.add_bearer_context(0, &bc);
+        assert!(parse_modify_bearer_request(&msg).is_err());
     }
 
     #[test]

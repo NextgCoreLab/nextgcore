@@ -1230,8 +1230,10 @@ pub struct DataPlaneUrr {
     pub acc_dl_pkts: AtomicU64,
     /// Timestamp of first packet in this measurement period
     pub first_pkt_time: RwLock<Option<std::time::Instant>>,
-    /// Timestamp of last report
-    pub last_report_time: RwLock<Option<std::time::Instant>>,
+    /// Timestamp of last report.
+    /// Private (#724): read it through [`Self::last_report_time`], which copies the
+    /// value out, so no guard on it can outlive a [`Self::reset_counters`] call.
+    last_report_time: RwLock<Option<std::time::Instant>>,
     /// Whether a threshold has been exceeded (needs reporting)
     pub threshold_exceeded: AtomicBool,
     /// Monotonic UR-SEQN per URR (TS 29.244 8.2.60) — incremented for every
@@ -1418,6 +1420,14 @@ impl DataPlaneUrr {
         }
     }
 
+    /// When this URR last reported (or was created), copied out of its lock.
+    ///
+    /// #724: returns the VALUE, never the guard, so no caller can hold
+    /// `last_report_time` across [`Self::reset_counters`], which writes it.
+    pub fn last_report_time(&self) -> Option<std::time::Instant> {
+        *self.last_report_time.read().unwrap()
+    }
+
     /// Allocate the next monotonic UR-SEQN for a usage report from this URR.
     pub fn next_ur_seqn(&self) -> u32 {
         self.ur_seqn.fetch_add(1, Ordering::SeqCst)
@@ -1451,12 +1461,15 @@ impl DataPlaneUrr {
         let already_exhausted = self.quota_exhausted.load(Ordering::Relaxed);
 
         let (directional, dir_threshold, dir_quota) = if is_uplink {
-            let ul = self.acc_ul_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
-            self.acc_ul_pkts.fetch_add(1, Ordering::Relaxed);
+            // AcqRel (#771): pairs with `take_usage`'s Acquire swap, so a harvest that
+            // takes this packet also sees the total-counter add sequenced before it,
+            // and its `fetch_sub` on the total can never run ahead of that add.
+            let ul = self.acc_ul_bytes.fetch_add(bytes, Ordering::AcqRel) + bytes;
+            self.acc_ul_pkts.fetch_add(1, Ordering::AcqRel);
             (ul, self.volume_threshold_ul(), self.volume_quota_ul())
         } else {
-            let dl = self.acc_dl_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
-            self.acc_dl_pkts.fetch_add(1, Ordering::Relaxed);
+            let dl = self.acc_dl_bytes.fetch_add(bytes, Ordering::AcqRel) + bytes;
+            self.acc_dl_pkts.fetch_add(1, Ordering::AcqRel);
             (dl, self.volume_threshold_dl(), self.volume_quota_dl())
         };
 
@@ -1514,8 +1527,7 @@ impl DataPlaneUrr {
 
         // Check time threshold
         if let Some(time_thresh) = self.time_threshold_secs() {
-            let report_time = self.last_report_time.read().unwrap();
-            if let Some(last) = *report_time {
+            if let Some(last) = self.last_report_time() {
                 if last.elapsed().as_secs() >= time_thresh as u64 {
                     self.threshold_exceeded.store(true, Ordering::Relaxed);
                     outcome = UrrOutcome::ThresholdExceeded;
@@ -1526,17 +1538,71 @@ impl DataPlaneUrr {
         outcome
     }
 
-    /// Reset counters after generating a report
-    pub fn reset_counters(&self) {
-        self.acc_total_bytes.store(0, Ordering::Relaxed);
-        self.acc_ul_bytes.store(0, Ordering::Relaxed);
-        self.acc_dl_bytes.store(0, Ordering::Relaxed);
-        self.acc_total_pkts.store(0, Ordering::Relaxed);
-        self.acc_ul_pkts.store(0, Ordering::Relaxed);
-        self.acc_dl_pkts.store(0, Ordering::Relaxed);
+    /// Take this URR's usage for a report and restart its measurement, atomically
+    /// with respect to concurrent [`Self::record`] calls (#771, TS 29.244 §5.2.2.3.1:
+    /// "reset its ongoing measurement counts ... report ... the usage since the last
+    /// usage report").
+    ///
+    /// Each per-direction counter is taken with ONE `swap(0)`, so a packet recorded
+    /// concurrently lands either in this report or in the next one -- never in
+    /// neither (the old load-then-`store(0)` dropped it) and never in both. The
+    /// report's total is `ul + dl` of what was taken, so the Volume Measurement IE is
+    /// internally consistent by construction (§8.2.44), and exactly that amount is
+    /// subtracted from the running totals that drive the threshold/quota checks,
+    /// rather than zeroing them and discarding a racing packet's share.
+    ///
+    /// A packet's bytes and its packet count are separate counters, so a packet that
+    /// races the swap can have its bytes in one report and its count in the next;
+    /// both are still counted exactly once.
+    ///
+    /// The flag and timestamps are reset BEFORE the counters are taken: a threshold
+    /// crossed by a packet recorded after the swap re-sets `threshold_exceeded` and
+    /// is reported next time, instead of being cleared by this reset.
+    pub fn take_usage(&self) -> UrrUsage {
+        self.threshold_exceeded.store(false, Ordering::SeqCst);
         *self.first_pkt_time.write().unwrap() = None;
         *self.last_report_time.write().unwrap() = Some(std::time::Instant::now());
-        self.threshold_exceeded.store(false, Ordering::Relaxed);
+        let usage = UrrUsage {
+            ul_bytes: self.acc_ul_bytes.swap(0, Ordering::AcqRel),
+            dl_bytes: self.acc_dl_bytes.swap(0, Ordering::AcqRel),
+            ul_pkts: self.acc_ul_pkts.swap(0, Ordering::AcqRel),
+            dl_pkts: self.acc_dl_pkts.swap(0, Ordering::AcqRel),
+        };
+        self.acc_total_bytes
+            .fetch_sub(usage.total_bytes(), Ordering::AcqRel);
+        self.acc_total_pkts
+            .fetch_sub(usage.total_pkts(), Ordering::AcqRel);
+        usage
+    }
+
+    /// A non-resetting read of the usage counted since the last report.
+    pub fn usage(&self) -> UrrUsage {
+        UrrUsage {
+            ul_bytes: self.acc_ul_bytes.load(Ordering::Acquire),
+            dl_bytes: self.acc_dl_bytes.load(Ordering::Acquire),
+            ul_pkts: self.acc_ul_pkts.load(Ordering::Acquire),
+            dl_pkts: self.acc_dl_pkts.load(Ordering::Acquire),
+        }
+    }
+
+    /// Put back usage that was taken for a report which was never delivered (#780
+    /// review m2), so it is carried by the next report instead of being lost.
+    pub fn restore_usage(&self, usage: &UrrUsage) {
+        self.acc_total_bytes
+            .fetch_add(usage.total_bytes(), Ordering::AcqRel);
+        self.acc_total_pkts
+            .fetch_add(usage.total_pkts(), Ordering::AcqRel);
+        self.acc_ul_bytes
+            .fetch_add(usage.ul_bytes, Ordering::AcqRel);
+        self.acc_dl_bytes
+            .fetch_add(usage.dl_bytes, Ordering::AcqRel);
+        self.acc_ul_pkts.fetch_add(usage.ul_pkts, Ordering::AcqRel);
+        self.acc_dl_pkts.fetch_add(usage.dl_pkts, Ordering::AcqRel);
+    }
+
+    /// Reset counters after generating a report, discarding the usage.
+    pub fn reset_counters(&self) {
+        let _ = self.take_usage();
         // #80: the exhaustion latch DELIBERATELY SURVIVES a counter reset.
         //
         // This function runs every time a usage report is harvested, including the
@@ -1563,10 +1629,10 @@ pub struct DataPlaneSession {
     pub ue_ipv4: Option<Ipv4Addr>,
     /// Uplink TEID (UPF receives on this TEID)
     pub ul_teid: u32,
-    /// Downlink TEID (UPF sends with this TEID)
-    pub dl_teid: u32,
-    /// gNB/eNB address for downlink
-    pub gnb_addr: SocketAddr,
+    /// The downlink tunnel -- (DL TEID the UPF sends with, gNB/eNB address) -- as ONE
+    /// value behind a lock, so a Session Modification moves it IN PLACE (#822) and a
+    /// packet never sees a TEID from one tunnel and an address from the other.
+    dl_tunnel: RwLock<(u32, SocketAddr)>,
     /// PDU Session ID
     pub pdu_session_id: Option<u8>,
     /// QoS Flow Identifier
@@ -1598,6 +1664,26 @@ pub struct DataPlaneSession {
 }
 
 impl DataPlaneSession {
+    /// The downlink tunnel `(DL TEID, gNB address)`, copied out of its lock.
+    pub fn dl_tunnel(&self) -> (u32, SocketAddr) {
+        *self.dl_tunnel.read().unwrap()
+    }
+
+    /// The DL TEID the UPF sends with.
+    pub fn dl_teid(&self) -> u32 {
+        self.dl_tunnel().0
+    }
+
+    /// The gNB/eNB address for downlink.
+    pub fn gnb_addr(&self) -> SocketAddr {
+        self.dl_tunnel().1
+    }
+
+    /// Move the downlink tunnel in place (#822).
+    pub fn set_dl_tunnel(&self, dl_teid: u32, gnb_addr: SocketAddr) {
+        *self.dl_tunnel.write().unwrap() = (dl_teid, gnb_addr);
+    }
+
     /// Construct a session with empty rule sets (helper to keep the many
     /// construction sites consistent as new per-session state is added).
     #[allow(clippy::too_many_arguments)]
@@ -1616,8 +1702,7 @@ impl DataPlaneSession {
             smf_seid,
             ue_ipv4,
             ul_teid,
-            dl_teid,
-            gnb_addr,
+            dl_tunnel: RwLock::new((dl_teid, gnb_addr)),
             pdu_session_id,
             qfi,
             ul_packets: AtomicU64::new(0),
@@ -1743,9 +1828,9 @@ impl SessionManager {
             "Session added: SEID={:#x}, UL_TEID={:#x}, DL_TEID={:#x}, UE_IP={:?}, gNB={}",
             session.upf_seid,
             session.ul_teid,
-            session.dl_teid,
+            session.dl_teid(),
             session.ue_ipv4,
-            session.gnb_addr
+            session.gnb_addr()
         );
 
         session
@@ -2588,7 +2673,7 @@ impl DataPlane {
                         // Find the session whose downlink tunnel matches
                         let session = {
                             let map = self.sessions.seid_map.read().unwrap();
-                            map.values().find(|s| s.dl_teid == teid).cloned()
+                            map.values().find(|s| s.dl_teid() == teid).cloned()
                         };
                         if let Some(sess) = session {
                             self.send_report_event(UpfReportEvent::ErrorIndicationReport {
@@ -3000,10 +3085,10 @@ impl DataPlane {
         let (dl_teid, gnb_addr) = match far_id {
             Some(fid) => match session.apply_far(fid) {
                 FarDecision::Forward { ohc_teid, ohc_addr } => {
-                    let teid = ohc_teid.unwrap_or(session.dl_teid);
+                    let teid = ohc_teid.unwrap_or(session.dl_teid());
                     let addr = ohc_addr
                         .map(|ip| SocketAddr::new(IpAddr::V4(ip), GTPU_PORT))
-                        .unwrap_or(session.gnb_addr);
+                        .unwrap_or(session.gnb_addr());
                     (teid, addr)
                 }
                 FarDecision::Drop => {
@@ -3048,7 +3133,7 @@ impl DataPlane {
                     return;
                 }
             },
-            None => (session.dl_teid, session.gnb_addr),
+            None => (session.dl_teid(), session.gnb_addr()),
         };
 
         // Record URR usage AND honour its verdict (#80, TS 29.244 §5.2.2.2.2).
@@ -3150,10 +3235,10 @@ impl DataPlane {
             Some(s) => s.clone(),
             None => return 0,
         };
-        let teid = ohc_teid.unwrap_or(session.dl_teid);
+        let teid = ohc_teid.unwrap_or(session.dl_teid());
         let addr = ohc_addr
             .map(|ip| SocketAddr::new(IpAddr::V4(ip), GTPU_PORT))
-            .unwrap_or(session.gnb_addr);
+            .unwrap_or(session.gnb_addr());
         let qfi = session.qfi;
         // Buffered packets are flushed against the SESSION's QFI rather than a
         // per-packet PDR/QER match (pre-existing behaviour of this path), so the
@@ -3303,8 +3388,9 @@ impl DataPlane {
         gnb_addr: Option<SocketAddr>,
     ) {
         if let Some(session) = self.sessions.find_by_seid(upf_seid) {
-            let new_dl_teid = dl_teid.unwrap_or(session.dl_teid);
-            let new_gnb_addr = gnb_addr.unwrap_or(session.gnb_addr);
+            let (old_teid, old_addr) = session.dl_tunnel();
+            let new_dl_teid = dl_teid.unwrap_or(old_teid);
+            let new_gnb_addr = gnb_addr.unwrap_or(old_addr);
 
             // Update the downlink FAR's outer header creation if present
             if dl_teid.is_some() || gnb_addr.is_some() {
@@ -3336,54 +3422,12 @@ impl DataPlane {
                 }
             }
 
-            // Remove and re-add to update the immutable fields
-            let pdrs = std::mem::take(&mut *session.pdrs.write().unwrap());
-            let fars_map = std::mem::take(&mut *session.fars.write().unwrap());
-            let qers_map = std::mem::take(&mut *session.qers.write().unwrap());
-            let urrs_map = std::mem::take(&mut *session.urrs.write().unwrap());
-            let bars_map = std::mem::take(&mut *session.bars.write().unwrap());
-            let buffered: std::collections::VecDeque<Vec<u8>> =
-                std::mem::take(&mut *session.dl_buffer.lock().unwrap());
-            let pdr_teids = std::mem::take(&mut *session.pdr_teids.write().unwrap());
-
-            self.sessions.remove_session_by_seid(upf_seid);
-
-            let new_session = DataPlaneSession::new_empty(
-                session.upf_seid,
-                session.smf_seid,
-                session.ue_ipv4,
-                session.ul_teid,
-                new_dl_teid,
-                new_gnb_addr,
-                session.pdu_session_id,
-                session.qfi,
-            );
-            new_session.ul_packets.store(
-                session.ul_packets.load(Ordering::Relaxed),
-                Ordering::Relaxed,
-            );
-            new_session.dl_packets.store(
-                session.dl_packets.load(Ordering::Relaxed),
-                Ordering::Relaxed,
-            );
-            new_session
-                .ul_bytes
-                .store(session.ul_bytes.load(Ordering::Relaxed), Ordering::Relaxed);
-            new_session
-                .dl_bytes
-                .store(session.dl_bytes.load(Ordering::Relaxed), Ordering::Relaxed);
-            *new_session.pdrs.write().unwrap() = pdrs;
-            *new_session.fars.write().unwrap() = fars_map;
-            *new_session.qers.write().unwrap() = qers_map;
-            *new_session.urrs.write().unwrap() = urrs_map;
-            *new_session.bars.write().unwrap() = bars_map;
-            *new_session.dl_buffer.lock().unwrap() = buffered;
-            *new_session.pdr_teids.write().unwrap() = pdr_teids;
-            new_session
-                .ddn_sent
-                .store(session.ddn_sent.load(Ordering::SeqCst), Ordering::SeqCst);
-
-            self.sessions.add_session(new_session);
+            // #822: moved IN PLACE. This used to `mem::take` the PDRs, FARs, QERs, URRs,
+            // BARs and DL buffer out of the live session and re-add a rebuilt one, so a
+            // packet already holding the old `Arc` found no rules (dropped, or forwarded
+            // unmeasured) and a concurrent TERMR/QAURR found no session -- on every
+            // DL-tunnel modification (handover, Service Request) under traffic.
+            session.set_dl_tunnel(new_dl_teid, new_gnb_addr);
             log::info!(
                 "Updated data plane session: SEID={upf_seid:#x}, DL_TEID=0x{new_dl_teid:x}, gNB={new_gnb_addr}"
             );
@@ -3433,91 +3477,99 @@ impl DataPlane {
         let session = seid_map.get(&upf_seid)?;
         let urrs = session.urrs.read().unwrap();
         let urr = urrs.get(&urr_id)?;
-        Some(UrrReportEntry {
-            upf_seid: session.upf_seid,
-            smf_seid: session.smf_seid,
+        Some(UrrReportEntry::new(
+            session,
             urr_id,
-            ur_seqn: urr.next_ur_seqn(),
-            total_bytes: urr.acc_total_bytes.load(Ordering::Relaxed),
-            ul_bytes: urr.acc_ul_bytes.load(Ordering::Relaxed),
-            dl_bytes: urr.acc_dl_bytes.load(Ordering::Relaxed),
-            total_pkts: urr.acc_total_pkts.load(Ordering::Relaxed),
-            ul_pkts: urr.acc_ul_pkts.load(Ordering::Relaxed),
-            dl_pkts: urr.acc_dl_pkts.load(Ordering::Relaxed),
-            trigger: urr.report_reason(),
-        })
+            urr.next_ur_seqn(),
+            urr.usage(),
+            urr.report_reason(),
+        ))
     }
 
-    /// Check all sessions for URR threshold exceedances.
-    /// Returns a list of (upf_seid, smf_seid, urr_id, total_bytes, ul_bytes, dl_bytes, total_pkts)
-    /// for each URR that has a threshold exceeded. Resets counters after collection.
+    /// Harvest the usage reports that are due: every URR whose threshold/quota was
+    /// crossed, and every URR whose Measurement Period has elapsed with usage counted.
+    /// Each report's usage is TAKEN from its URR atomically ([`DataPlaneUrr::take_usage`],
+    /// #771), so traffic racing the harvest is neither lost nor counted twice.
+    ///
+    /// No lock is held while the URRs are examined (#780 review m1): the session and
+    /// URR `Arc`s are snapshotted and every map guard is released first, so a slow
+    /// harvest can never stall Session Establishment, the forwarding path or
+    /// `/metrics` behind `seid_map` again -- which is how #724's hang spread.
     pub fn collect_urr_reports(&self) -> Vec<UrrReportEntry> {
+        let sessions: Vec<Arc<DataPlaneSession>> = self
+            .sessions
+            .seid_map
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+
         let mut reports = Vec::new();
-        let seid_map = self.sessions.seid_map.read().unwrap();
-
-        for session in seid_map.values() {
-            let urrs = session.urrs.read().unwrap();
-            for (urr_id, urr) in urrs.iter() {
-                if urr.threshold_exceeded.load(Ordering::Relaxed) {
-                    let entry = UrrReportEntry {
-                        upf_seid: session.upf_seid,
-                        smf_seid: session.smf_seid,
-                        urr_id: *urr_id,
-                        ur_seqn: urr.next_ur_seqn(),
-                        total_bytes: urr.acc_total_bytes.load(Ordering::Relaxed),
-                        ul_bytes: urr.acc_ul_bytes.load(Ordering::Relaxed),
-                        dl_bytes: urr.acc_dl_bytes.load(Ordering::Relaxed),
-                        total_pkts: urr.acc_total_pkts.load(Ordering::Relaxed),
-                        ul_pkts: urr.acc_ul_pkts.load(Ordering::Relaxed),
-                        dl_pkts: urr.acc_dl_pkts.load(Ordering::Relaxed),
-                        // #80: the report says why it exists. An exhausted quota is
-                        // reported as a QUOTA report, not as a threshold report -- that
-                        // distinction is what tells the CP function the subscriber is
-                        // currently being DROPPED rather than merely approaching a limit.
-                        trigger: urr.report_reason(),
-                    };
-                    urr.reset_counters();
-                    reports.push(entry);
-                }
-            }
-
-            // Also check time-based thresholds (measurement period)
-            for (urr_id, urr) in urrs.iter() {
-                if !urr.threshold_exceeded.load(Ordering::Relaxed) {
-                    if let Some(period) = urr.measurement_period_secs() {
-                        let last_report = urr.last_report_time.read().unwrap();
-                        if let Some(last) = *last_report {
-                            if last.elapsed().as_secs() >= period as u64 {
-                                let total = urr.acc_total_bytes.load(Ordering::Relaxed);
-                                if total > 0 {
-                                    let entry = UrrReportEntry {
-                                        upf_seid: session.upf_seid,
-                                        smf_seid: session.smf_seid,
-                                        urr_id: *urr_id,
-                                        ur_seqn: urr.next_ur_seqn(),
-                                        total_bytes: total,
-                                        ul_bytes: urr.acc_ul_bytes.load(Ordering::Relaxed),
-                                        dl_bytes: urr.acc_dl_bytes.load(Ordering::Relaxed),
-                                        total_pkts: urr.acc_total_pkts.load(Ordering::Relaxed),
-                                        ul_pkts: urr.acc_ul_pkts.load(Ordering::Relaxed),
-                                        dl_pkts: urr.acc_dl_pkts.load(Ordering::Relaxed),
-                                        // #80: PERIO, because that is what this arm is.
-                                        // It used to go out labelled VOLTH -- a
-                                        // pre-existing wire defect, reachable since
-                                        // #306 made periodic reports fire at all.
-                                        trigger: UrrReportReason::Periodic,
-                                    };
-                                    urr.reset_counters();
-                                    reports.push(entry);
-                                }
-                            }
-                        }
-                    }
-                }
+        for session in sessions {
+            let urrs: Vec<(u32, Arc<DataPlaneUrr>)> = session
+                .urrs
+                .read()
+                .unwrap()
+                .iter()
+                .map(|(id, urr)| (*id, Arc::clone(urr)))
+                .collect();
+            for (urr_id, urr) in urrs {
+                // #80: the report says why it exists. An exhausted quota is reported as
+                // a QUOTA report, not as a threshold report -- that distinction is what
+                // tells the CP function the subscriber is currently being DROPPED
+                // rather than merely approaching a limit.
+                let trigger = if urr.threshold_exceeded.load(Ordering::SeqCst) {
+                    urr.report_reason()
+                } else if urr.measurement_period_secs().is_some_and(|period| {
+                    // #724: the instant is COPIED out (`last_report_time()` returns the
+                    // value), so no guard on it is alive across `take_usage`, which
+                    // writes it -- std's RwLock is not re-entrant, and holding it here
+                    // parked the harvest forever.
+                    urr.last_report_time()
+                        .is_some_and(|last| last.elapsed().as_secs() >= period as u64)
+                }) && urr.acc_total_bytes.load(Ordering::Acquire) > 0
+                {
+                    // #80: PERIO, because that is what this arm is.
+                    UrrReportReason::Periodic
+                } else {
+                    continue;
+                };
+                let usage = urr.take_usage();
+                reports.push(UrrReportEntry::new(
+                    &session,
+                    urr_id,
+                    urr.next_ur_seqn(),
+                    usage,
+                    trigger,
+                ));
             }
         }
 
         reports
+    }
+
+    /// Return the usage of reports that could not be delivered to their URRs, so
+    /// the next report carries it (#780 review m2). A URR that has since been
+    /// removed is skipped: its usage left with the rule's own final report.
+    pub fn restore_urr_usage(&self, reports: &[UrrReportEntry]) {
+        for r in reports {
+            let Some(session) = self.sessions.find_by_seid(r.upf_seid) else {
+                continue;
+            };
+            let urr = session.urrs.read().unwrap().get(&r.urr_id).cloned();
+            if let Some(urr) = urr {
+                urr.restore_usage(&r.usage());
+                log::warn!(
+                    "URR {} on SEID {:#x}: report UR-SEQN {} was not delivered; its {}B \
+                     will be carried by the next report",
+                    r.urr_id,
+                    r.upf_seid,
+                    r.ur_seqn,
+                    r.total_bytes
+                );
+            }
+        }
     }
 
     /// GTP-U N3 path management periodic task (upfd-04).
@@ -3559,7 +3611,7 @@ impl DataPlane {
             // stale peers with miss_count > 0 age out naturally via tick()).
             let active_peers: HashSet<SocketAddr> = {
                 let map = self.sessions.seid_map.read().unwrap();
-                map.values().map(|s| s.gnb_addr).collect()
+                map.values().map(|s| s.gnb_addr()).collect()
             };
 
             if active_peers.is_empty() {
@@ -3585,7 +3637,7 @@ impl DataPlane {
                 let affected: Vec<u64> = {
                     let map = self.sessions.seid_map.read().unwrap();
                     map.values()
-                        .filter(|s| &s.gnb_addr == peer)
+                        .filter(|s| &s.gnb_addr() == peer)
                         .map(|s| s.upf_seid)
                         .collect()
                 };
@@ -3615,6 +3667,26 @@ impl DataPlane {
     }
 }
 
+/// The usage taken from a URR for one report (#771): per-direction volumes and
+/// packet counts, with the totals DERIVED so they cannot disagree with them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UrrUsage {
+    pub ul_bytes: u64,
+    pub dl_bytes: u64,
+    pub ul_pkts: u64,
+    pub dl_pkts: u64,
+}
+
+impl UrrUsage {
+    pub fn total_bytes(&self) -> u64 {
+        self.ul_bytes + self.dl_bytes
+    }
+
+    pub fn total_pkts(&self) -> u64 {
+        self.ul_pkts + self.dl_pkts
+    }
+}
+
 /// Entry for a URR usage report that needs to be sent as Session Report Request
 #[derive(Debug, Clone)]
 pub struct UrrReportEntry {
@@ -3639,6 +3711,41 @@ pub struct UrrReportEntry {
     /// function reading the trigger to decide whether to top a subscriber up was being
     /// told the wrong thing.
     pub trigger: UrrReportReason,
+}
+
+impl UrrReportEntry {
+    /// A report carrying `usage` taken from URR `urr_id` of `session`.
+    pub fn new(
+        session: &DataPlaneSession,
+        urr_id: u32,
+        ur_seqn: u32,
+        usage: UrrUsage,
+        trigger: UrrReportReason,
+    ) -> Self {
+        Self {
+            upf_seid: session.upf_seid,
+            smf_seid: session.smf_seid,
+            urr_id,
+            ur_seqn,
+            total_bytes: usage.total_bytes(),
+            ul_bytes: usage.ul_bytes,
+            dl_bytes: usage.dl_bytes,
+            total_pkts: usage.total_pkts(),
+            ul_pkts: usage.ul_pkts,
+            dl_pkts: usage.dl_pkts,
+            trigger,
+        }
+    }
+
+    /// The per-direction usage this report carries.
+    pub fn usage(&self) -> UrrUsage {
+        UrrUsage {
+            ul_bytes: self.ul_bytes,
+            dl_bytes: self.dl_bytes,
+            ul_pkts: self.ul_pkts,
+            dl_pkts: self.dl_pkts,
+        }
+    }
 }
 
 /// Why a usage report was generated (TS 29.244 §8.2.19) — #80.
@@ -4429,9 +4536,10 @@ mod tests {
 
         // 2. FAR resolves to Forward with the gNB DL tunnel
         let (teid, addr) = match session.apply_far(far_id.unwrap()) {
-            FarDecision::Forward { ohc_teid, ohc_addr } => {
-                (ohc_teid.unwrap_or(session.dl_teid), ohc_addr.unwrap_or(gnb))
-            }
+            FarDecision::Forward { ohc_teid, ohc_addr } => (
+                ohc_teid.unwrap_or(session.dl_teid()),
+                ohc_addr.unwrap_or(gnb),
+            ),
             other => panic!("expected Forward, got {other:?}"),
         };
         assert_eq!(teid, dl_teid);
@@ -5460,6 +5568,354 @@ mod tests {
             UrrReportReason::TimeQuota,
             "a time-quota exhaustion is reported as TIMQU, not as a volume trigger"
         );
+    }
+
+    /// #771: a harvest racing live traffic neither loses nor double-counts usage, and
+    /// every report's Volume Measurement is internally consistent (ul + dl == total).
+    ///
+    /// One thread records a known volume as fast as it can into two URRs on one
+    /// session, as `record_urrs` does for a PDR with two rules: URR 1 has a 1-byte
+    /// volume threshold, so the THRESHOLD arm fires on every harvest; URR 2 has only a
+    /// Measurement Period, back-dated before every harvest, so the PERIO arm fires on
+    /// every harvest. Another thread harvests continuously. Conservation is then
+    /// checked exactly per URR: everything recorded is in a report or still counted.
+    ///
+    /// On the old load-then-`store(0)` harvest this lost tens of kilobytes per run.
+    /// Both threads run under a deadline.
+    #[test]
+    fn a_harvest_racing_traffic_neither_loses_nor_double_counts_usage() {
+        let dp = Arc::new(DataPlane::new(Arc::new(AtomicBool::new(false))));
+        dp.add_session_from_pfcp(
+            0x771,
+            0x1771,
+            Ipv4Addr::new(10, 45, 7, 71),
+            0x7711,
+            0x7712,
+            "127.0.0.1:2152".parse().unwrap(),
+            Some(5),
+            Some(9),
+        );
+        let session = dp.sessions.find_by_seid(0x771).expect("session");
+        let threshold_urr = Arc::new(DataPlaneUrr::new(1));
+        threshold_urr.set_reporting(Some(1), None, None, None, None);
+        let periodic_urr = Arc::new(DataPlaneUrr::new(2));
+        periodic_urr.set_reporting(None, None, None, None, Some(1));
+        {
+            let mut urrs = session.urrs.write().unwrap();
+            urrs.insert(1, Arc::clone(&threshold_urr));
+            urrs.insert(2, Arc::clone(&periodic_urr));
+        }
+
+        const PACKETS: u64 = 200_000;
+        let recorder = {
+            let session = Arc::clone(&session);
+            on_thread("recorder", move || {
+                let (mut ul, mut dl) = (0u64, 0u64);
+                for i in 0..PACKETS {
+                    let bytes = 40 + (i % 1400);
+                    let uplink = i % 2 == 0;
+                    session.record_urrs(&[1, 2], bytes, uplink);
+                    if uplink {
+                        ul += bytes;
+                    } else {
+                        dl += bytes;
+                    }
+                }
+                (ul, dl)
+            })
+        };
+        let done = Arc::new(AtomicBool::new(false));
+        let harvester = {
+            let (dp, urr, done) = (
+                Arc::clone(&dp),
+                Arc::clone(&periodic_urr),
+                Arc::clone(&done),
+            );
+            on_thread("harvester", move || {
+                let mut reports = Vec::new();
+                loop {
+                    // Read BEFORE the harvest so the final pass runs after the
+                    // recorder finished and every pass is a real race until then.
+                    let last = done.load(Ordering::SeqCst);
+                    *urr.last_report_time.write().unwrap() =
+                        Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
+                    reports.extend(dp.collect_urr_reports());
+                    if last {
+                        break reports;
+                    }
+                }
+            })
+        };
+        let deadline = std::time::Duration::from_secs(30);
+        let (ul_sent, dl_sent) = recorder
+            .recv_timeout(deadline)
+            .expect("the recorder must finish");
+        done.store(true, Ordering::SeqCst);
+        let reports = harvester
+            .recv_timeout(deadline)
+            .expect("the harvester must finish");
+
+        for (urr_id, urr, trigger) in [
+            (1, &threshold_urr, UrrReportReason::VolumeThreshold),
+            (2, &periodic_urr, UrrReportReason::Periodic),
+        ] {
+            let mine: Vec<&UrrReportEntry> =
+                reports.iter().filter(|r| r.urr_id == urr_id).collect();
+            assert!(
+                mine.len() > 10,
+                "URR {urr_id}: the race was exercised: {}",
+                mine.len()
+            );
+            assert!(
+                mine.iter().all(|r| r.trigger == trigger),
+                "URR {urr_id}: {trigger:?}"
+            );
+            let inconsistent = mine
+                .iter()
+                .filter(|r| {
+                    r.ul_bytes + r.dl_bytes != r.total_bytes
+                        || r.ul_pkts + r.dl_pkts != r.total_pkts
+                })
+                .count();
+            assert_eq!(
+                inconsistent, 0,
+                "URR {urr_id}: every report has ul + dl == total"
+            );
+
+            let residual = urr.usage();
+            let sum = |f: fn(&UrrReportEntry) -> u64| mine.iter().map(|r| f(r)).sum::<u64>();
+            assert_eq!(
+                sum(|r| r.ul_bytes) + residual.ul_bytes,
+                ul_sent,
+                "URR {urr_id}: UL bytes"
+            );
+            assert_eq!(
+                sum(|r| r.dl_bytes) + residual.dl_bytes,
+                dl_sent,
+                "URR {urr_id}: DL bytes"
+            );
+            assert_eq!(
+                sum(|r| r.total_pkts) + residual.total_pkts(),
+                PACKETS,
+                "URR {urr_id}: packets"
+            );
+            // The running totals that drive thresholds/quotas agree with the residual.
+            assert_eq!(
+                urr.acc_total_bytes.load(Ordering::SeqCst),
+                residual.total_bytes()
+            );
+            assert_eq!(
+                urr.acc_total_pkts.load(Ordering::SeqCst),
+                residual.total_pkts()
+            );
+        }
+    }
+
+    /// #780 review m2: usage taken for a report that was never delivered is handed
+    /// back, and the NEXT report carries it, together with what arrived since.
+    #[test]
+    fn usage_of_an_undelivered_report_is_carried_by_the_next_one() {
+        let dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        dp.add_session_from_pfcp(
+            0x772,
+            0x1772,
+            Ipv4Addr::new(10, 45, 7, 72),
+            0x7721,
+            0x7722,
+            "127.0.0.1:2152".parse().unwrap(),
+            Some(5),
+            Some(9),
+        );
+        let session = dp.sessions.find_by_seid(0x772).expect("session");
+        let urr = Arc::new(DataPlaneUrr::new(1));
+        urr.set_reporting(Some(1), None, None, None, None);
+        session.urrs.write().unwrap().insert(1, Arc::clone(&urr));
+
+        urr.record(300, true);
+        let lost = dp.collect_urr_reports();
+        assert_eq!(lost.len(), 1);
+        assert_eq!(urr.usage().total_bytes(), 0, "the harvest took the usage");
+        dp.restore_urr_usage(&lost);
+
+        urr.record(200, false);
+        let next = dp.collect_urr_reports();
+        assert_eq!(next.len(), 1);
+        assert_eq!(
+            (
+                next[0].ul_bytes,
+                next[0].dl_bytes,
+                next[0].total_bytes,
+                next[0].total_pkts
+            ),
+            (300, 200, 500, 2),
+            "the next report carries the undelivered usage plus the new"
+        );
+        assert!(next[0].ur_seqn > lost[0].ur_seqn);
+    }
+
+    /// #822: a DL-tunnel modification moves the tunnel IN PLACE. A packet that already
+    /// holds the session's `Arc` (as the forwarding path does across the update) keeps
+    /// seeing its rules and is measured on the same URR, and the session in the table
+    /// is the same object. Before, the update `mem::take`d every rule out of that `Arc`
+    /// and re-added a rebuilt session, so the in-flight packet found no PDR and its
+    /// usage reached no report.
+    #[test]
+    fn a_dl_tunnel_modification_updates_the_live_session_in_place() {
+        let dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        dp.add_session_from_pfcp(
+            0x822,
+            0x1822,
+            Ipv4Addr::new(10, 45, 8, 22),
+            0x8221,
+            0x8222,
+            "127.0.0.1:2152".parse().unwrap(),
+            Some(5),
+            Some(9),
+        );
+        let held = dp.sessions.find_by_seid(0x822).expect("session");
+        let urr = Arc::new(DataPlaneUrr::new(1));
+        held.urrs.write().unwrap().insert(1, Arc::clone(&urr));
+        for pdr in held.pdrs.write().unwrap().iter_mut() {
+            pdr.urr_ids = vec![1];
+        }
+
+        let new_gnb: SocketAddr = "127.0.0.2:2152".parse().unwrap();
+        dp.update_session_from_pfcp(0x822, Some(0xBEEF), Some(new_gnb));
+
+        assert!(
+            Arc::ptr_eq(&held, &dp.sessions.find_by_seid(0x822).unwrap()),
+            "the session is updated in place, not replaced"
+        );
+        assert_eq!(held.dl_tunnel(), (0xBEEF, new_gnb), "the tunnel moved");
+        assert!(
+            held.match_pdr_with_packet(SRC_INTF_CORE, None, None)
+                .is_some(),
+            "a packet holding the session still finds its downlink PDR"
+        );
+        held.record_urrs(&[1], 100, false);
+        assert_eq!(
+            urr.usage().dl_bytes,
+            100,
+            "and is measured on the URR a final report reads"
+        );
+        assert_eq!(
+            dp.sessions
+                .find_by_ue_ip(Ipv4Addr::new(10, 45, 8, 22))
+                .map(|s| s.upf_seid),
+            Some(0x822)
+        );
+    }
+
+    /// Run `f` on a thread of its own and hand back a receiver for its result, so a
+    /// test can wait on it with `recv_timeout` -- the only way to observe a deadlock
+    /// as a failure instead of a hung test binary. A thread that does hang is leaked,
+    /// which is acceptable: the test has already failed.
+    fn on_thread<T: Send + 'static>(
+        name: &str,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> std::sync::mpsc::Receiver<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name(name.to_string())
+            .spawn(move || {
+                let _ = tx.send(f());
+            })
+            .expect("spawn");
+        rx
+    }
+
+    /// #724: the periodic (PERIO) harvest of a URR whose Measurement Period has elapsed
+    /// with traffic counted must RETURN, and a PFCP Session Establishment racing it
+    /// must complete.
+    ///
+    /// On cc8f97a this deadlocked: `collect_urr_reports` held
+    /// `urr.last_report_time.read()` across `reset_counters()`, which takes
+    /// `last_report_time.write()` on the same thread (std's RwLock is not re-entrant),
+    /// while also holding `seid_map.read()` -- so the Session Establishment's
+    /// `seid_map.write()` blocked behind it forever and the UPF stopped taking
+    /// sessions. smfd provisions a 3600 s period on every session, so every UPF that
+    /// had carried traffic hung about an hour in.
+    ///
+    /// Both calls run on their own threads under a deadline, so the regression shows up
+    /// as a failure rather than as a hung test binary. The assertions are positive: the
+    /// report exists, is PERIO, carries the measured volume, and the counters and the
+    /// period restart after it (the reporting semantics the fix must not change).
+    #[test]
+    fn a_periodic_urr_harvest_returns_and_does_not_block_session_establishment() {
+        let dp = Arc::new(DataPlane::new(Arc::new(AtomicBool::new(false))));
+        let gnb: SocketAddr = "127.0.0.1:2152".parse().unwrap();
+        dp.add_session_from_pfcp(
+            0x724,
+            0x1724,
+            Ipv4Addr::new(10, 45, 7, 24),
+            0x7241,
+            0x7242,
+            gnb,
+            Some(5),
+            Some(9),
+        );
+        let session = dp.sessions.find_by_seid(0x724).expect("session");
+        let urr = Arc::new(DataPlaneUrr::new(1));
+        // The smfd default shape: no thresholds, a Measurement Period only.
+        urr.set_reporting(None, None, None, None, Some(1));
+        session.urrs.write().unwrap().insert(1, Arc::clone(&urr));
+        assert_eq!(urr.record(600, true), UrrOutcome::Continue);
+        assert_eq!(urr.record(400, false), UrrOutcome::Continue);
+        // Back-date the last report past the period instead of sleeping through it.
+        let backdated = std::time::Instant::now() - std::time::Duration::from_secs(5);
+        *urr.last_report_time.write().unwrap() = Some(backdated);
+
+        let deadline = std::time::Duration::from_secs(5);
+        let dp_h = Arc::clone(&dp);
+        let harvest = on_thread("urr-harvest", move || dp_h.collect_urr_reports());
+        let dp_e = Arc::clone(&dp);
+        let establish = on_thread("session-establishment", move || {
+            dp_e.add_session_from_pfcp(
+                0x725,
+                0x1725,
+                Ipv4Addr::new(10, 45, 7, 25),
+                0x7251,
+                0x7252,
+                gnb,
+                Some(6),
+                Some(9),
+            );
+            dp_e.sessions.find_by_seid(0x725).is_some()
+        });
+
+        let reports = harvest.recv_timeout(deadline).unwrap_or_else(|_| {
+            panic!(
+                "collect_urr_reports did not return within {deadline:?}: the PERIO \
+                 harvest deadlocked on its own last_report_time guard (#724)"
+            )
+        });
+        let established = establish.recv_timeout(deadline).unwrap_or_else(|_| {
+            panic!(
+                "a Session Establishment racing the PERIO harvest did not complete \
+                 within {deadline:?}: seid_map stayed read-locked by a hung harvest (#724)"
+            )
+        });
+        assert!(established, "the racing session must be installed");
+
+        assert_eq!(reports.len(), 1, "exactly one periodic report: {reports:?}");
+        let r = &reports[0];
+        assert_eq!((r.upf_seid, r.smf_seid, r.urr_id), (0x724, 0x1724, 1));
+        assert_eq!(r.trigger, UrrReportReason::Periodic);
+        assert_eq!((r.total_bytes, r.ul_bytes, r.dl_bytes), (1000, 600, 400));
+        assert_eq!((r.total_pkts, r.ul_pkts, r.dl_pkts), (2, 1, 1));
+
+        // The report restarted the measurement: counters zeroed, period re-armed.
+        assert_eq!(urr.acc_total_bytes.load(Ordering::Relaxed), 0);
+        assert!(
+            urr.last_report_time().expect("set by the reset") > backdated,
+            "the reset must restart the measurement period"
+        );
+        // So the very next harvest has nothing to say -- and also returns.
+        let dp_h = Arc::clone(&dp);
+        let again = on_thread("urr-harvest-2", move || dp_h.collect_urr_reports())
+            .recv_timeout(deadline)
+            .expect("second harvest must return");
+        assert!(again.is_empty(), "the period was just restarted: {again:?}");
     }
 
     /// An uplink G-PDU whose inner source IP does not match the session's UE
