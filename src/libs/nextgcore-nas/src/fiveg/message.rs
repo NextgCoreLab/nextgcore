@@ -384,6 +384,9 @@ pub struct RegistrationAccept {
     pub network_feature_support: Option<crate::interworking::FiveGsNetworkFeatureSupport>,
     /// PDU session status
     pub pdu_session_status: Option<PduSessionStatus>,
+    /// PDU session reactivation result (IEI 0x26, TS 24.501 §9.11.3.42): bit n
+    /// set = re-establishing the user plane of PSI n failed (§5.5.1.3.4).
+    pub pdu_session_reactivation_result: Option<u16>,
     /// T3512 value
     pub t3512_value: Option<GprsTimer3>,
     /// T3502 value
@@ -431,6 +434,12 @@ impl RegistrationAccept {
         if let Some(ref pss) = self.pdu_session_status {
             buf.put_u8(0x50); // IEI
             pss.encode(buf);
+        }
+        if let Some(result) = self.pdu_session_reactivation_result {
+            // §8.2.7: after PDU session status (0x50), before T3512 (0x5E).
+            buf.put_u8(0x26); // IEI
+            buf.put_u8(2); // Length
+            buf.put_u16_le(result); // PSI(0)-PSI(7) in octet 3 (§9.11.3.42)
         }
         if let Some(ref t3512) = self.t3512_value {
             buf.put_u8(0x5E); // IEI
@@ -534,6 +543,13 @@ impl RegistrationAccept {
                     set_first(
                         &mut msg.pdu_session_status,
                         optional_tlv(buf, PduSessionStatus::decode)?,
+                    );
+                }
+                0x26 => {
+                    buf.skip(1)?;
+                    set_first(
+                        &mut msg.pdu_session_reactivation_result,
+                        optional_tlv(buf, |b| b.read_lv(IeLen::AtLeast(2))?.read_u16_le())?,
                     );
                 }
                 0x5E => {

@@ -650,3 +650,178 @@ async fn a_setup_whose_send_fails_hands_the_accept_to_the_next_setup() {
     );
     assert_protected_service_accept(nas_pdu.as_deref().expect("PSI 2's setup carries it"));
 }
+
+// ---------------------------------------------------------------------------
+// #759: mobility / periodic Registration with PDU session status and Uplink
+// data status (TS 24.501 §5.5.1.3.4)
+// ---------------------------------------------------------------------------
+
+/// A plain mobility (or periodic) REGISTRATION REQUEST under the UE's 5G-GUTI,
+/// with Uplink data status (0x40) and PDU session status (0x50) when given.
+fn update_registration_request(reg_type: u8, uds: Option<u16>, pss: Option<u16>) -> Vec<u8> {
+    let mut rr = super::guti_registration_request(reg_type, 0x0759_0001);
+    if let Some(b) = uds {
+        rr.extend_from_slice(&[0x40, 0x02, b as u8, (b >> 8) as u8]);
+    }
+    if let Some(b) = pss {
+        rr.extend_from_slice(&[0x50, 0x02, b as u8, (b >> 8) as u8]);
+    }
+    rr
+}
+
+/// A registered, connected UE whose current 5G-GUTI is the one
+/// [`update_registration_request`] names.
+fn registered_ue_with_guti(server: &mut NgapServer, ue: u64, ran: u32) {
+    secured_registered_ue(server, ue, ran);
+    let guti = parse_registration_request_pdu(&update_registration_request(
+        crate::gmm_build::registration_type::MOBILITY_UPDATING,
+        None,
+        None,
+    ))
+    .and_then(|r| r.guti)
+    .expect("GUTI");
+    server.ue_auth_state.with_mut(ue, |s| {
+        s.amf_ue.current_guti = guti;
+        s.initial_context_setup_request_sent = true;
+    });
+}
+
+/// The decoded REGISTRATION ACCEPT inside a protected DL NAS PDU (NEA0).
+fn registration_accept_of(nas: &[u8]) -> nextgcore_nas::fiveg::message::RegistrationAccept {
+    use nextgcore_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
+    match parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&nas[7..])) {
+        Ok(FiveGmmMessage::RegistrationAccept(a)) => a,
+        other => panic!("a REGISTRATION ACCEPT, got {other:?}"),
+    }
+}
+
+/// #759: a connected UE's mobility update says PSI 1 is active and has uplink
+/// data, and PSI 2 is inactive. The AMF does the following:
+/// - releases PSI 2 at the SMF;
+/// - activates PSI 1 (ACTIVATING), then sends a PDU SESSION RESOURCE SETUP
+///   REQUEST whose NAS-PDU is the REGISTRATION ACCEPT;
+/// - in the Accept, reports PDU session status {1} and reactivation result
+///   "no failure".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mobility_update_releases_inactive_and_reactivates_uplink_sessions() {
+    let (_smf, port, calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_759_001u64, 59);
+    registered_ue_with_guti(&mut server, ue, ran);
+    hold_session(&mut server, ue, 1, "reg759-1", port);
+    hold_session(&mut server, ue, 2, "reg759-2", port);
+
+    let rr = ue_protect(
+        &update_registration_request(
+            crate::gmm_build::registration_type::MOBILITY_UPDATING,
+            Some(1 << 1),
+            Some(1 << 1),
+        ),
+        0,
+    );
+    let _ = server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &rr))
+        .await;
+
+    let calls = calls.lock().expect("calls").clone();
+    assert!(
+        calls
+            .iter()
+            .any(|(u, _)| u.ends_with("/sm-contexts/reg759-2/release")),
+        "PSI 2, inactive at the UE, is released at the SMF: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|(u, b)| u.ends_with("/sm-contexts/reg759-1/modify")
+                && b["upCnxState"] == "ACTIVATING"),
+        "PSI 1's user plane is re-activated: {calls:?}"
+    );
+    assert!(crate::context::amf_self()
+        .read()
+        .unwrap()
+        .sess_find_by_psi(ue, 2)
+        .is_none());
+
+    let sent: Vec<Sent> = take_sent_ngap(&mut server)
+        .into_iter()
+        .map(|(_, p)| decode_sent(&p))
+        .collect();
+    let Some(Sent::SetupRequest { items, nas_pdu, .. }) = sent.first() else {
+        panic!("a PDU SESSION RESOURCE SETUP REQUEST first, got {sent:?}");
+    };
+    assert_eq!(items, &vec![setup_item(1, transfer_for("reg759-1"))]);
+    let accept = registration_accept_of(nas_pdu.as_deref().expect("the Accept rides it"));
+    assert_eq!(accept.pdu_session_status.map(|p| p.psi), Some(1 << 1));
+    assert_eq!(accept.pdu_session_reactivation_result, Some(0));
+    assert!(
+        !sent.iter().any(|s| matches!(s, Sent::DownlinkNas { .. })),
+        "the Accept goes once, in the setup: {sent:?}"
+    );
+}
+
+/// A failed re-activation is reported in the Accept (bit n = PSI n failed), and
+/// the Accept then goes on its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_reactivation_is_reported_in_a_standalone_accept() {
+    let (_smf, port, _calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_759_002u64, 60);
+    registered_ue_with_guti(&mut server, ue, ran);
+    hold_session(&mut server, ue, 1, "fail-reg759-1", port);
+
+    let rr = ue_protect(
+        &update_registration_request(
+            crate::gmm_build::registration_type::PERIODIC_UPDATING,
+            Some(1 << 1),
+            None,
+        ),
+        0,
+    );
+    let _ = server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &rr))
+        .await;
+    let sent: Vec<Sent> = take_sent_ngap(&mut server)
+        .into_iter()
+        .map(|(_, p)| decode_sent(&p))
+        .collect();
+    let Some(Sent::DownlinkNas { nas_pdu, .. }) = sent.first() else {
+        panic!("a standalone DL NAS Transport, got {sent:?}");
+    };
+    let accept = registration_accept_of(nas_pdu);
+    assert_eq!(accept.pdu_session_reactivation_result, Some(1 << 1));
+    assert_eq!(accept.pdu_session_status, None, "the UE sent none");
+}
+
+/// An update without either IE behaves as before: no N11 call, and a standalone
+/// Accept without the session IEs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_update_without_session_ies_touches_no_session() {
+    let (_smf, port, calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_759_003u64, 61);
+    registered_ue_with_guti(&mut server, ue, ran);
+    hold_session(&mut server, ue, 1, "reg759-none-1", port);
+    let rr = ue_protect(
+        &update_registration_request(
+            crate::gmm_build::registration_type::PERIODIC_UPDATING,
+            None,
+            None,
+        ),
+        0,
+    );
+    let _ = server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &rr))
+        .await;
+    assert!(calls.lock().expect("calls").is_empty());
+    let sent: Vec<Sent> = take_sent_ngap(&mut server)
+        .into_iter()
+        .map(|(_, p)| decode_sent(&p))
+        .collect();
+    let Some(Sent::DownlinkNas { nas_pdu, .. }) = sent.first() else {
+        panic!("a DL NAS Transport, got {sent:?}");
+    };
+    let accept = registration_accept_of(nas_pdu);
+    assert_eq!(accept.pdu_session_status, None);
+    assert_eq!(accept.pdu_session_reactivation_result, None);
+}
