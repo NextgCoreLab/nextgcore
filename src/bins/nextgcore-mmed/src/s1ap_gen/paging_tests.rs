@@ -1,5 +1,11 @@
 //! #514 stage 7: Paging on the generated codec.
 //!
+//! #737: since the hand-written encoder was deleted (#560), the
+//! `*_with_schema_criticalities` tests below compare the production encoder
+//! with itself and check it decodes back; what pins each IE criticality is
+//! `criticality_oracle`, which checks every PDU a production builder encodes
+//! against the TS 36.413 §9.3 object sets.
+//!
 //! Oracle: `test_codec::builder::build_paging`, which since #514 stage 13b checks that the production encode decodes back to its input through an independently written mapping.
 //! Golden: octets derived by hand from X.691 (APER) for TS 36.413 §9.1.6.
 
@@ -57,7 +63,7 @@ fn the_paging_is_the_x691_golden() {
 }
 
 #[test]
-fn the_paging_matches_the_hand_written_encoder() {
+fn the_paging_round_trips_with_schema_criticalities() {
     let mut cases = 0;
     let ids = [
         UePagingId::STmsi(STmsi { mmec: 0, m_tmsi: 0 }),

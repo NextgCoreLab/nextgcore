@@ -348,7 +348,7 @@ pub fn build_s1_setup_response(
             V::Id_CriticalityDiagnostics(diagnostics(notify)),
         );
     }
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
+    encode_pdu(&g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
         procedure_code: g::ProcedureCode(PROC_S1_SETUP),
         criticality: g::Criticality(REJECT),
         value: g::SuccessfulOutcomeValue::Id_S1Setup(g::S1SetupResponse {
@@ -398,7 +398,7 @@ pub fn build_s1_setup_failure(
             value: V::Id_CriticalityDiagnostics(diagnostics(reject)),
         });
     }
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::UnsuccessfulOutcome(g::UnsuccessfulOutcome {
+    encode_pdu(&g::S1AP_PDU::UnsuccessfulOutcome(g::UnsuccessfulOutcome {
         procedure_code: g::ProcedureCode(PROC_S1_SETUP),
         criticality: g::Criticality(REJECT),
         value: g::UnsuccessfulOutcomeValue::Id_S1Setup(g::S1SetupFailure {
@@ -456,7 +456,7 @@ pub fn build_s1_setup_request(req: &S1SetupRequest) -> Result<Vec<u8>, asn1_code
         criticality: g::Criticality(IGNORE),
         value: V::Id_DefaultPagingDRX(g::PagingDRX(req.default_paging_drx as u8)),
     });
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_S1_SETUP),
         criticality: g::Criticality(REJECT),
         value: g::InitiatingMessageValue::Id_S1Setup(g::S1SetupRequest {
@@ -766,7 +766,7 @@ pub fn build_downlink_nas_transport(
         criticality: g::Criticality(REJECT),
         value,
     };
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_DOWNLINK_NAS_TRANSPORT),
         criticality: g::Criticality(IGNORE),
         value: g::InitiatingMessageValue::Id_downlinkNASTransport(g::DownlinkNASTransport {
@@ -868,7 +868,7 @@ pub fn build_initial_context_setup_request(
             ),
         })
         .collect();
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_INITIAL_CONTEXT_SETUP),
         criticality: g::Criticality(REJECT),
         value: g::InitiatingMessageValue::Id_InitialContextSetup(g::InitialContextSetupRequest {
@@ -1259,7 +1259,7 @@ pub fn build_ue_context_release_command(
             g::UE_S1AP_IDs::MME_UE_S1AP_ID(g::MME_UE_S1AP_ID(mme_ue_s1ap_id))
         }
     };
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_UE_CONTEXT_RELEASE),
         criticality: g::Criticality(REJECT),
         value: g::InitiatingMessageValue::Id_UEContextRelease(g::UEContextReleaseCommand {
@@ -1473,7 +1473,7 @@ pub fn build_erab_setup_request(
         ID_ERAB_TO_BE_SETUP_LIST_BEARER_SU_REQ,
         V::Id_E_RABToBeSetupListBearerSUReq(g::E_RABToBeSetupListBearerSUReq(items)),
     ));
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_E_RAB_SETUP),
         criticality: g::Criticality(REJECT),
         value: g::InitiatingMessageValue::Id_E_RABSetup(g::E_RABSetupRequest {
@@ -1527,7 +1527,7 @@ pub fn build_erab_modify_request(
         ID_ERAB_TO_BE_MODIFIED_LIST_BEARER_MOD_REQ,
         V::Id_E_RABToBeModifiedListBearerModReq(g::E_RABToBeModifiedListBearerModReq(items)),
     ));
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_E_RAB_MODIFY),
         criticality: g::Criticality(REJECT),
         value: g::InitiatingMessageValue::Id_E_RABModify(g::E_RABModifyRequest {
@@ -1579,7 +1579,7 @@ pub fn build_erab_release_command(
             V::Id_NAS_PDU(g::NAS_PDU(nas.clone())),
         ));
     }
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_E_RAB_RELEASE),
         criticality: g::Criticality(REJECT),
         value: g::InitiatingMessageValue::Id_E_RABRelease(g::E_RABReleaseCommand {
@@ -1836,7 +1836,7 @@ pub fn build_paging(msg: &nextgcore_s1ap::Paging) -> Result<Vec<u8>, asn1_codecs
         V::Id_CNDomain(g::CNDomain(msg.cn_domain as u8)),
     ));
     ies.push(ie(ID_TAI_LIST, V::Id_TAIList(g::TAIList(tais))));
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_PAGING),
         criticality: g::Criticality(IGNORE),
         value: g::InitiatingMessageValue::Id_Paging(g::Paging {
@@ -1906,7 +1906,7 @@ pub fn build_handover_cancel_acknowledge(
             )),
         ));
     }
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
+    encode_pdu(&g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
         procedure_code: g::ProcedureCode(PROC_HANDOVER_CANCEL),
         criticality: g::Criticality(REJECT),
         value: g::SuccessfulOutcomeValue::Id_HandoverCancel(g::HandoverCancelAcknowledge {
@@ -1945,7 +1945,7 @@ pub fn build_mme_status_transfer(
         value,
     };
     let container = status_container_from(&msg.status_transfer_container)?;
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_MME_STATUS_TRANSFER),
         criticality: g::Criticality(IGNORE),
         value: g::InitiatingMessageValue::Id_MMEStatusTransfer(g::MMEStatusTransfer {
@@ -2507,7 +2507,7 @@ pub fn build_handover_preparation_failure_with_diagnostics(
             )),
         ));
     }
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::UnsuccessfulOutcome(g::UnsuccessfulOutcome {
+    encode_pdu(&g::S1AP_PDU::UnsuccessfulOutcome(g::UnsuccessfulOutcome {
         procedure_code: g::ProcedureCode(PROC_HANDOVER_PREPARATION),
         criticality: g::Criticality(REJECT),
         value: g::UnsuccessfulOutcomeValue::Id_HandoverPreparation(g::HandoverPreparationFailure {
@@ -2558,7 +2558,7 @@ pub fn build_handover_request(
         })
         .collect();
     let sec = &msg.ue_security_capabilities;
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_HANDOVER_RESOURCE_ALLOCATION),
         criticality: g::Criticality(REJECT),
         value: g::InitiatingMessageValue::Id_HandoverResourceAllocation(g::HandoverRequest {
@@ -2805,7 +2805,7 @@ pub fn build_handover_command(
             )),
         ));
     }
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
+    encode_pdu(&g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
         procedure_code: g::ProcedureCode(PROC_HANDOVER_PREPARATION),
         criticality: g::Criticality(REJECT),
         value: g::SuccessfulOutcomeValue::Id_HandoverPreparation(g::HandoverCommand {
@@ -2893,7 +2893,7 @@ pub fn build_error_indication(
             V::Id_CriticalityDiagnostics(diagnostics_from(d)),
         ));
     }
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_ERROR_INDICATION),
         criticality: g::Criticality(IGNORE),
         value: g::InitiatingMessageValue::Id_ErrorIndication(g::ErrorIndication {
@@ -3077,7 +3077,7 @@ pub fn build_reset_acknowledge(
             )),
         ));
     }
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
+    encode_pdu(&g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
         procedure_code: g::ProcedureCode(PROC_RESET),
         criticality: g::Criticality(REJECT),
         value: g::SuccessfulOutcomeValue::Id_Reset(g::ResetAcknowledge {
@@ -3329,7 +3329,7 @@ pub fn build_path_switch_request_acknowledge_releasing(
             )),
         ));
     }
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
+    encode_pdu(&g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
         procedure_code: g::ProcedureCode(PROC_PATH_SWITCH_REQUEST),
         criticality: g::Criticality(REJECT),
         value: g::SuccessfulOutcomeValue::Id_PathSwitchRequest(g::PathSwitchRequestAcknowledge {
@@ -3373,7 +3373,7 @@ pub fn build_path_switch_request_failure(
             )),
         ));
     }
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::UnsuccessfulOutcome(g::UnsuccessfulOutcome {
+    encode_pdu(&g::S1AP_PDU::UnsuccessfulOutcome(g::UnsuccessfulOutcome {
         procedure_code: g::ProcedureCode(PROC_PATH_SWITCH_REQUEST),
         criticality: g::Criticality(REJECT),
         value: g::UnsuccessfulOutcomeValue::Id_PathSwitchRequest(g::PathSwitchRequestFailure {
@@ -3440,7 +3440,7 @@ pub fn build_enb_configuration_update_acknowledge(
             )),
         });
     }
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
+    encode_pdu(&g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
         procedure_code: g::ProcedureCode(PROC_ENB_CONFIGURATION_UPDATE),
         criticality: g::Criticality(REJECT),
         value: g::SuccessfulOutcomeValue::Id_ENBConfigurationUpdate(
@@ -3482,7 +3482,7 @@ pub fn build_enb_configuration_update_failure(
             )),
         ));
     }
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::UnsuccessfulOutcome(g::UnsuccessfulOutcome {
+    encode_pdu(&g::S1AP_PDU::UnsuccessfulOutcome(g::UnsuccessfulOutcome {
         procedure_code: g::ProcedureCode(PROC_ENB_CONFIGURATION_UPDATE),
         criticality: g::Criticality(REJECT),
         value: g::UnsuccessfulOutcomeValue::Id_ENBConfigurationUpdate(
@@ -3647,7 +3647,7 @@ pub fn build_ue_context_modification_request(
             }),
         ));
     }
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_UE_CONTEXT_MODIFICATION),
         criticality: g::Criticality(REJECT),
         value: g::InitiatingMessageValue::Id_UEContextModification(
@@ -3663,7 +3663,7 @@ pub fn build_ue_context_modification_request(
 pub fn build_overload_start(
     action: nextgcore_s1ap::OverloadAction,
 ) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_OVERLOAD_START),
         criticality: g::Criticality(IGNORE),
         value: g::InitiatingMessageValue::Id_OverloadStart(g::OverloadStart {
@@ -3681,7 +3681,7 @@ pub fn build_overload_start(
 /// Encode an OVERLOAD STOP (TS 36.413 §9.1.8.14): no IEs; procedure
 /// criticality reject.
 pub fn build_overload_stop() -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_OVERLOAD_STOP),
         criticality: g::Criticality(REJECT),
         value: g::InitiatingMessageValue::Id_OverloadStop(g::OverloadStop {
@@ -3805,7 +3805,7 @@ pub fn build_write_replace_warning_request(
             )),
         ));
     }
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_WRITE_REPLACE_WARNING),
         criticality: g::Criticality(REJECT),
         value: g::InitiatingMessageValue::Id_WriteReplaceWarning(g::WriteReplaceWarningRequest {
@@ -3853,7 +3853,7 @@ pub fn build_kill_request(
             )),
         ));
     }
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_KILL),
         criticality: g::Criticality(REJECT),
         value: g::InitiatingMessageValue::Id_Kill(g::KillRequest {
@@ -4624,7 +4624,7 @@ pub fn build_erab_modification_confirm(
             )),
         ));
     }
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
+    encode_pdu(&g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
         procedure_code: g::ProcedureCode(PROC_E_RAB_MODIFICATION_INDICATION),
         criticality: g::Criticality(REJECT),
         value: g::SuccessfulOutcomeValue::Id_E_RABModificationIndication(
@@ -4672,7 +4672,7 @@ pub fn build_location_reporting_control(
             }),
         ),
     ];
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_LOCATION_REPORTING_CONTROL),
         criticality: g::Criticality(IGNORE),
         value: g::InitiatingMessageValue::Id_LocationReportingControl(
@@ -4807,6 +4807,18 @@ pub fn decode_location_reporting_failure_indication(
 
 #[cfg(test)]
 pub(crate) mod test_codec;
+
+/// Encode a PDU a production builder made. Under `cfg(test)` every one is
+/// first checked against the TS 36.413 object sets (#737): the criticality of
+/// each IE must be the schema's.
+fn encode_pdu(pdu: &g::S1AP_PDU) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
+    #[cfg(test)]
+    criticality_oracle::assert_matches_ts_36_413(pdu);
+    nextgcore_s1ap_gen::encode(pdu)
+}
+
+#[cfg(test)]
+pub(crate) mod criticality_oracle;
 
 #[cfg(test)]
 mod golden_x691_tests;

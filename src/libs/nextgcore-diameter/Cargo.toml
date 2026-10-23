@@ -31,6 +31,7 @@ bitflags.workspace = true
 log.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "sync", "time"] }
 async-trait.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
