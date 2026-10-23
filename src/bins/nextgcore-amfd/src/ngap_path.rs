@@ -11187,6 +11187,9 @@ impl NgapServer {
         // generating the Path Switch Request Unsuccessful Transfer itself. Checked before
         // ANY state change: no NH/NCC advance, no relocation, no N11 call. Each session
         // is listed once in the Released List, cause multiple-PDU-session-ID-instances.
+        // Checked before the unknown-UE check below, so a duplicated list for an unknown
+        // UE is answered with this cause: §8.4.4.4 does not order the two abnormal
+        // conditions, and either answer releases every named session.
         let mut distinct = requested.clone();
         distinct.sort_unstable();
         distinct.dedup();
@@ -21006,8 +21009,10 @@ mod tests {
     /// source with its NH chain where it was, and no SMF is called (none is reachable
     /// here, so a relay attempt would show up as a switched session in an Acknowledge).
     ///
-    /// REVERT-VERIFIED: without the duplicate check the handler relocates the UE and the
-    /// captured PDU is not a Failure.
+    /// REVERT-VERIFIED: without the duplicate check the handler relocates the UE and still
+    /// answers a Failure (no session switches, §8.4.4.3), but one listing `[5, 6, 5]` with
+    /// the nothing-switched Unsuccessful Transfer; the Released List assertion fails first.
+    /// That the SMF is not called is asserted in `a_duplicated_psi_reaches_no_smf`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_path_switch_request_with_a_duplicated_psi_is_failed_and_changes_nothing() {
         crate::context::amf_context_init(64, 1024, 4096);

@@ -650,3 +650,244 @@ async fn a_setup_whose_send_fails_hands_the_accept_to_the_next_setup() {
     );
     assert_protected_service_accept(nas_pdu.as_deref().expect("PSI 2's setup carries it"));
 }
+
+// ---- #745 follow-ups (review of #830): Path Switch with SM contexts held at an SMF ----
+
+/// A stand-in SMF for Path Switch: records `(ref, n2SmInfoType)` of every update and
+/// answers `PATH_SWITCH_REQ` with 200 and `n2SmInfo` = `transfer_for(ref)` (the
+/// acknowledge transfer the AMF relays), except a `fail-*` ref, which gets 500.
+async fn path_switch_smf() -> (
+    nextgcore_sbi::server::SbiServer,
+    u16,
+    Arc<std::sync::Mutex<Vec<(String, String)>>>,
+) {
+    use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    let seen: Arc<std::sync::Mutex<Vec<(String, String)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+    let server = nextgcore_sbi::server::SbiServer::on_listener(
+        nextgcore_sbi::server::SbiServerConfig::new(addr),
+        listener,
+    );
+    server
+        .start(move |req: SReq| {
+            let sink = Arc::clone(&sink);
+            async move {
+                let sm_ref = req
+                    .header
+                    .uri
+                    .split("/sm-contexts/")
+                    .nth(1)
+                    .and_then(|rest| rest.split('/').next())
+                    .unwrap_or_default()
+                    .to_string();
+                let body: serde_json::Value = req
+                    .http
+                    .content
+                    .as_deref()
+                    .and_then(|c| serde_json::from_str(c).ok())
+                    .unwrap_or_default();
+                let n2_type = body["n2SmInfoType"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                sink.lock()
+                    .expect("sink")
+                    .push((sm_ref.clone(), n2_type.clone()));
+                if n2_type != "PATH_SWITCH_REQ" {
+                    return SResp::no_content();
+                }
+                if sm_ref.starts_with("fail-") {
+                    return SResp::with_status(500);
+                }
+                let answer = serde_json::json!({
+                    "n2SmInfoType": "PATH_SWITCH_REQ_ACK",
+                    "n2SmInfo": base64::engine::general_purpose::STANDARD
+                        .encode(transfer_for(&sm_ref)),
+                });
+                SResp::with_status(200).with_body(answer.to_string(), "application/json")
+            }
+        })
+        .await
+        .expect("stand-in SMF starts");
+    for _ in 0..200 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    (server, addr.port(), seen)
+}
+
+/// A PATH SWITCH REQUEST ACKNOWLEDGE's switched `[(psi, transfer)]` and released
+/// `[(psi, unsuccessful transfer)]` lists, decoded with the generated codec.
+#[allow(clippy::type_complexity)]
+fn decoded_path_switch_ack(pdu: &[u8]) -> Option<(Vec<(u8, Vec<u8>)>, Vec<(u8, Vec<u8>)>)> {
+    let g::NGAP_PDU::SuccessfulOutcome(m) = nextgcore_ngap_gen::decode(pdu).ok()? else {
+        return None;
+    };
+    let g::SuccessfulOutcomeValue::Id_PathSwitchRequest(ack) = m.value else {
+        return None;
+    };
+    let (mut switched, mut released) = (Vec::new(), Vec::new());
+    for ie in ack.protocol_i_es.0 {
+        use g::PathSwitchRequestAcknowledgeProtocolIEs_EntryValue as Ie;
+        match ie.value {
+            Ie::Id_PDUSessionResourceSwitchedList(list) => {
+                switched = list
+                    .0
+                    .into_iter()
+                    .map(|i| {
+                        (
+                            i.pdu_session_id.0,
+                            i.path_switch_request_acknowledge_transfer.0,
+                        )
+                    })
+                    .collect()
+            }
+            Ie::Id_PDUSessionResourceReleasedListPSAck(list) => {
+                released = list
+                    .0
+                    .into_iter()
+                    .map(|i| {
+                        (
+                            i.pdu_session_id.0,
+                            i.path_switch_request_unsuccessful_transfer.0,
+                        )
+                    })
+                    .collect()
+            }
+            _ => {}
+        }
+    }
+    Some((switched, released))
+}
+
+fn forget_amf_sessions(ue: u64) {
+    let ctx = crate::context::amf_self();
+    let guard = ctx.read().unwrap();
+    for sess in guard.sess_list_for_ue(ue) {
+        guard.sess_remove(sess.id);
+    }
+}
+
+/// #745 follow-up (review of #830, MINOR 2): the duplicate check runs before ANY SMF
+/// call. The UE's sessions 5 and 6 are held at a recording SMF that would switch them;
+/// a request naming PSI 5 twice is failed, the SMF sees no request at all, and the UE
+/// stays on the source.
+///
+/// REVERT-VERIFIED: without the duplicate check the SMF receives three
+/// PATH_SWITCH_REQ updates (PSIs 5, 6, 5) and the gNB gets an Acknowledge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_duplicated_psi_reaches_no_smf() {
+    crate::context::amf_context_init(64, 1024, 4096);
+    let (_smf, port, calls) = path_switch_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (source, target) = (97_461u64, 97_462u64);
+    seed_gnb_session(&server, source).await;
+    seed_gnb_session(&server, target).await;
+    let ue = 7_745_011u64;
+    let mut state = UeNasContext::new(ue, 11, source, false);
+    state.registered = true;
+    server.ue_auth_state.insert(ue, state);
+    hold_session(&mut server, ue, 5, "ps745-dup-5", port);
+    hold_session(&mut server, ue, 6, "ps745-dup-6", port);
+
+    server
+        .handle_path_switch_request(target, &path_switch_request_pdu(ue, 67, &[5, 6, 5]))
+        .await
+        .expect("handled");
+
+    let sent = take_sent_ngap(&mut server);
+    forget_amf_sessions(ue);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    let (_, _, released) =
+        decoded_path_switch_failure(&sent[0].1).expect("a PATH SWITCH REQUEST FAILURE");
+    assert_eq!(
+        released.iter().map(|(psi, _)| *psi).collect::<Vec<_>>(),
+        vec![5, 6]
+    );
+    assert!(
+        calls.lock().expect("calls").is_empty(),
+        "no SMF is called for a failed request: {:?}",
+        calls.lock().expect("calls")
+    );
+    let after = server.ue_auth_state.get(ue).expect("UE");
+    assert_eq!((after.association_id, after.ran_ue_ngap_id), (source, 11));
+}
+
+/// #745 follow-up (review of #830, MINOR 3), TS 38.413 §8.4.4.2: a session the SMF does
+/// not switch is listed in the Acknowledge's PDU Session Resource Released List, with an
+/// AMF-generated Path Switch Request Unsuccessful Transfer, while the switched one
+/// carries the SMF's own acknowledge transfer. When no session switches, §8.4.4.3: a
+/// PATH SWITCH REQUEST FAILURE releasing every requested session.
+///
+/// REVERT-VERIFIED: with `released_list: Vec::new()` in the Acknowledge, PSI 6 is
+/// missing from the Released List.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_the_smf_does_not_switch_is_released_in_the_acknowledge() {
+    crate::context::amf_context_init(64, 1024, 4096);
+    let (_smf, port, calls) = path_switch_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (source, target) = (97_463u64, 97_464u64);
+    seed_gnb_session(&server, source).await;
+    seed_gnb_session(&server, target).await;
+    let unswitched = crate::ngap_asn1::path_switch_unsuccessful_transfer(
+        nextgcore_ngap::types::Cause::Misc(nextgcore_ngap::types::CauseMisc::Unspecified),
+    )
+    .expect("encode");
+
+    // One switched, one not.
+    let ue = 7_745_012u64;
+    let mut state = UeNasContext::new(ue, 12, source, false);
+    state.registered = true;
+    server.ue_auth_state.insert(ue, state);
+    hold_session(&mut server, ue, 5, "ps745-ok-5", port);
+    hold_session(&mut server, ue, 6, "fail-ps745-6", port);
+    server
+        .handle_path_switch_request(target, &path_switch_request_pdu(ue, 68, &[5, 6]))
+        .await
+        .expect("handled");
+    let sent = take_sent_ngap(&mut server);
+    forget_amf_sessions(ue);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].0, target);
+    let (switched, released) =
+        decoded_path_switch_ack(&sent[0].1).expect("a PATH SWITCH REQUEST ACKNOWLEDGE");
+    assert_eq!(switched, vec![(5, transfer_for("ps745-ok-5"))]);
+    assert_eq!(released, vec![(6, unswitched.clone())]);
+    assert_eq!(
+        calls.lock().expect("calls").clone(),
+        vec![
+            ("ps745-ok-5".to_string(), "PATH_SWITCH_REQ".to_string()),
+            ("fail-ps745-6".to_string(), "PATH_SWITCH_REQ".to_string())
+        ]
+    );
+    let after = server.ue_auth_state.get(ue).expect("UE");
+    assert_eq!(
+        (after.association_id, after.ran_ue_ngap_id),
+        (target, 68),
+        "an acknowledged switch relocates the UE"
+    );
+
+    // Nothing switched: the Failure releases both.
+    let ue = 7_745_013u64;
+    let mut state = UeNasContext::new(ue, 13, source, false);
+    state.registered = true;
+    server.ue_auth_state.insert(ue, state);
+    hold_session(&mut server, ue, 5, "fail-ps745-n5", port);
+    hold_session(&mut server, ue, 6, "fail-ps745-n6", port);
+    server
+        .handle_path_switch_request(target, &path_switch_request_pdu(ue, 69, &[5, 6]))
+        .await
+        .expect("handled");
+    let sent = take_sent_ngap(&mut server);
+    forget_amf_sessions(ue);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    let (amf, ran, released) =
+        decoded_path_switch_failure(&sent[0].1).expect("a PATH SWITCH REQUEST FAILURE");
+    assert_eq!((amf, ran), (ue, 69));
+    assert_eq!(released, vec![(5, unswitched.clone()), (6, unswitched)]);
+}
