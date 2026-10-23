@@ -437,9 +437,11 @@ spec:
         # smfd re-resolves a hostname UPF_PFCP_ADDR on every PFCP association
         # attempt (#658), so the PGW-U is named by its Service and is not a
         # liveness-tracked peer: a restarted PGW-U is found again without
-        # restarting the PGW-C.
+        # restarting the PGW-C. The PFCP Node ID is the PGW-C's Service FQDN
+        # (#797): the pod IP it binds changes on every restart, and a new Node ID
+        # looks like a different CP function to the PGW-U (TS 29.244 §5.8.1).
         - name: EPC_EXPORT
-          value: SMF_PFCP_ADDR=self UPF_PFCP_ADDR=dns:pgwu
+          value: SMF_PFCP_ADDR=self SMF_PFCP_NODE_ID=dns:pgwc UPF_PFCP_ADDR=dns:pgwu
         - name: EPC_UNTRACKED
           value: pgwu
         volumeMounts:
@@ -487,7 +489,10 @@ spec:
           defaultMode: 493
       - name: run
         emptyDir: {}
-      terminationGracePeriodSeconds: 5
+      # #718: a PGW-C shutdown tells the SGW (Delete Bearer, retransmitted for up to
+      # T3 x (N3+1) = 12 s) and the PGW-U (Association Release, up to T1 x N1 = 9 s
+      # when the PGW-U is gone) before it exits; 5 s cut that off.
+      terminationGracePeriodSeconds: 45
       nodeSelector:
         nextg.io/dataplane: 'true'
 ---
