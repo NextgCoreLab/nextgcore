@@ -410,6 +410,30 @@ impl GtpcServer {
                                         pending,
                                     );
                                 }
+                                // #736: an E-UTRAN initiated E-RAB modification
+                                // waits on it too. Its confirm says every E-RAB
+                                // failed, rather than never coming (TS 36.413
+                                // §8.2.4), and the record does not leak.
+                                if let Some(pending) =
+                                    take_pending_erab_modification(xact.sequence_number)
+                                {
+                                    if let Some(send) =
+                                        crate::s1ap_handler::erab_modification_unanswered(
+                                            crate::context::mme_self(),
+                                            pending,
+                                        )
+                                    {
+                                        crate::s1ap_path::s1ap_send(send);
+                                    }
+                                }
+                            }
+                            // #736 (and #616's record): nobody waits on an
+                            // unanswered Change Notification, but its record
+                            // must not stay forever.
+                            if xact.message_type
+                                == s11_build::message_type::CHANGE_NOTIFICATION_REQUEST
+                            {
+                                take_pending_change_notification(xact.sequence_number);
                             }
                         }
 
@@ -1363,6 +1387,11 @@ pub struct PendingErabModification {
     pub confirm: crate::s1ap_gen::ErabModificationConfirm,
     /// `notify` IEs of the indication, for the confirm's diagnostics.
     pub notify: Vec<crate::s1ap_gen::DiagnosedIe>,
+    /// The UE, and the new eNB endpoint of each E-RAB to modify: written to
+    /// the bearer contexts only for the bearers the Serving GW accepts (#736),
+    /// so the MME never names an endpoint the SGW does not use.
+    pub mme_ue_id: u64,
+    pub switched: Vec<SwitchedBearer>,
 }
 
 static PENDING_ERAB_MODIFICATIONS: OnceLock<Mutex<HashMap<u32, PendingErabModification>>> =
@@ -1396,19 +1425,25 @@ pub(crate) fn record_pending_erab_modification_for_test(
 /// response arrives. Returns the request's sequence number.
 pub fn send_modify_bearer_request_for_erab_modification(
     ctx: &MmeContext,
-    mme_ue_id: u64,
-    ebis: &[u8],
     pending: PendingErabModification,
 ) -> GtpPathResult<u32> {
+    let mme_ue_id = pending.mme_ue_id;
     let mme_ue = ctx
         .mme_ue_find_by_id(mme_ue_id)
         .ok_or(GtpPathError::ContextNotFound)?;
     let sgw_ue = ctx
         .sgw_ue_find_by_id(mme_ue.sgw_ue_id)
         .ok_or(GtpPathError::ContextNotFound)?;
+    // Copies carrying the new endpoints: the bearer contexts keep the old ones
+    // until the Serving GW accepts (#736).
     let bearers: Vec<crate::context::MmeBearer> = bearers_of_ue(ctx, mme_ue_id)
         .into_iter()
-        .filter(|b| ebis.contains(&b.ebi))
+        .filter_map(|mut b| {
+            let new = pending.switched.iter().find(|s| s.ebi == b.ebi)?;
+            b.enb_s1u_teid = new.teid;
+            b.enb_s1u_ip = new.ip.clone();
+            Some(b)
+        })
         .collect();
     let bearer_refs: Vec<&crate::context::MmeBearer> = bearers.iter().collect();
     let seq = sequence()?;
