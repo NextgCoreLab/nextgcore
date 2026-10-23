@@ -326,6 +326,28 @@ async fn pfcp_remove_n3_uplink(
         .map(|_| ())
 }
 
+/// Remove the dedicated bearers' uplink PDRs and QERs a failed step 6 may have
+/// left at the UPF (#751). Best effort: logged, not returned.
+async fn remove_dedicated_uplinks(smf_n4_seid: u64, upf_seid: u64, ebis: &[u8]) {
+    if ebis.is_empty() {
+        return;
+    }
+    let params = crate::n4_build::SessionModificationParams {
+        remove_pdr_ids: ebis
+            .iter()
+            .map(|&e| u16::from(DEDICATED_RULE_BASE + e))
+            .collect(),
+        remove_qer_ids: ebis
+            .iter()
+            .map(|&e| u32::from(DEDICATED_RULE_BASE + e))
+            .collect(),
+        ..Default::default()
+    };
+    if let Err(e) = crate::pfcp_modify_with(smf_n4_seid, upf_seid, &params).await {
+        log::warn!("EPS→5GS: the dedicated bearers' rules {ebis:?} were not removed: {e}");
+    }
+}
+
 /// A data-forwarding tunnel for one EPS bearer, as the MME receives it in the Forward
 /// Relocation Response's Bearer Context (TS 29.274 Table 7.3.2-2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -549,6 +571,56 @@ async fn pfcp_release_forwarding(smf_n4_seid: u64, upf_seid: u64, ebis: &[u8]) {
     }
 }
 
+/// The handover procedure lock of one SM context (#750).
+///
+/// PREPARED, COMPLETED and CANCELLED each read the session, await the UPF, and
+/// write back. Run concurrently for one SM context (an AMF whose PREPARED call
+/// timed out sends CANCELLED while the SMF still awaits the UPF), the later writer
+/// replaced the earlier one's outcome: a cancelled context came back, and the
+/// forwarding rules PREPARED installed were never removed. Holding this lock for
+/// the whole handler serialises them; the entry is dropped when the last holder
+/// or waiter goes.
+struct HandoverLock {
+    key: String,
+    lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+fn handover_locks() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
+> {
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+async fn handover_lock(sm_context_ref: &str) -> HandoverLock {
+    let lock = handover_locks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(sm_context_ref.to_string())
+        .or_default()
+        .clone();
+    let guard = lock.clone().lock_owned().await;
+    HandoverLock {
+        key: sm_context_ref.to_string(),
+        lock,
+        guard: Some(guard),
+    }
+}
+
+impl Drop for HandoverLock {
+    fn drop(&mut self) {
+        self.guard.take();
+        let mut locks = handover_locks().lock().unwrap_or_else(|e| e.into_inner());
+        // The map's reference and this one: nobody else holds or awaits it.
+        if std::sync::Arc::strong_count(&self.lock) == 2 {
+            locks.remove(&self.key);
+        }
+    }
+}
+
 /// TS 29.502 §5.2.2.2.3: the SMF's answer to an EPS→5GS handover preparation.
 pub(crate) async fn handle_create(body: &serde_json::Value) -> SbiResponse {
     let Some(supi) = body["supi"].as_str().filter(|s| !s.is_empty()) else {
@@ -678,6 +750,11 @@ pub(crate) async fn handle_create(body: &serde_json::Value) -> SbiResponse {
             if let Err(e) = pfcp_remove_n3_uplink(smf_n4_seid, upf_seid, &[], &[]).await {
                 log::warn!("[{supi}] and the N3 uplink PDR was not removed: {e}");
             }
+            // #751: the failed request may still have installed some of them. Separate
+            // from the N3 uplink's removal, so a UPF refusing an unknown rule id cannot
+            // keep the N3 uplink PDR in place too.
+            let ebis: Vec<u8> = dedicated.iter().map(|b| b.ebi).collect();
+            remove_dedicated_uplinks(smf_n4_seid, upf_seid, &ebis).await;
             return crate::problem_response(
                 504,
                 "UPF_NOT_RESPONDING",
@@ -690,6 +767,14 @@ pub(crate) async fn handle_create(body: &serde_json::Value) -> SbiResponse {
         Ok(bytes) => bytes,
         Err(e) => {
             log::error!("[{supi}] EPS→5GS: PDUSessionResourceSetupRequestTransfer: {e:?}");
+            // #751: step 6 installed the N3 uplink PDR and the dedicated bearers' rules
+            // for a preparation that now fails; nothing would ever remove them.
+            if existing.is_none() {
+                let ebis: Vec<u8> = dedicated.iter().map(|b| b.ebi).collect();
+                if let Err(e) = pfcp_remove_n3_uplink(smf_n4_seid, upf_seid, &ebis, &[]).await {
+                    log::warn!("[{supi}] and the step-6 rules were not removed: {e}");
+                }
+            }
             return crate::problem_response(
                 500,
                 "SYSTEM_FAILURE",
@@ -822,6 +907,7 @@ pub(crate) async fn handle_create(body: &serde_json::Value) -> SbiResponse {
 /// - **indirect** (`indirectForwardingFlag`): step 12's UPF tunnel, one per bearer, which the
 ///   UPF relays to the target's per-session DL Forwarding UP TNL Information, adding the QFI.
 pub(crate) async fn handle_prepared(sm_context_ref: &str, transfer: &[u8]) -> SbiResponse {
+    let _procedure = handover_lock(sm_context_ref).await;
     let ack = match crate::n2_transfer::parse_handover_request_acknowledge_transfer(transfer) {
         Ok(ack) => ack,
         Err(e) => {
@@ -913,11 +999,22 @@ pub(crate) async fn handle_prepared(sm_context_ref: &str, transfer: &[u8]) -> Sb
                                 tunnels.push((ebi, BearerForwarding::Indirect(teid, addr)));
                             }
                         }
-                        Err(e) => log::warn!(
-                            "PREPARED for ref={sm_context_ref}: the UPF did not set up indirect \
-                             forwarding for EBIs {indirect:?} ({e}); the bearers hand over \
-                             without it and their in-flight downlink is lost"
-                        ),
+                        Err(e) => {
+                            log::warn!(
+                                "PREPARED for ref={sm_context_ref}: the UPF did not set up \
+                                 indirect forwarding for EBIs {indirect:?} ({e}); the bearers \
+                                 hand over without it and their in-flight downlink is lost"
+                            );
+                            // #751: an incomplete answer (or none) does not mean nothing was
+                            // installed: the UPF may hold the FAR and the PDRs/QERs. Nothing
+                            // records them for step 14 or CANCELLED, so remove them now.
+                            pfcp_release_forwarding(
+                                crate::smf_n4_seid_for(sm_context_ref),
+                                upf_seid,
+                                &indirect,
+                            )
+                            .await;
+                        }
                     }
                 }
                 (None, _) => log::info!(
@@ -949,8 +1046,37 @@ pub(crate) async fn handle_prepared(sm_context_ref: &str, transfer: &[u8]) -> Sb
         );
         root["epsBearerSetup"] = serde_json::json!(elements);
     }
-    if let Ok(ctx) = smf_self().read() {
-        ctx.sess_update(&sess);
+    // #750: write back only what PREPARED decided, onto the session as it is NOW,
+    // and only if it is still this SM context. The copy read above predates the UPF
+    // round trip; writing it whole replaced whatever happened meanwhile.
+    let applied = smf_self().read().ok().and_then(|ctx| {
+        let mut fresh = ctx
+            .sess_find_by_sm_context_ref(sm_context_ref)
+            .filter(|f| f.id == sess.id)?;
+        fresh.handover.gnb_n3_teid = sess.handover.gnb_n3_teid;
+        fresh.handover.gnb_n3_ip = sess.handover.gnb_n3_ip.clone();
+        fresh.handover.target_dl_known = true;
+        fresh.handover.prepared = true;
+        fresh.handover.forwarding_ebis = sess.handover.forwarding_ebis.clone();
+        ctx.sess_update(&fresh);
+        Some(())
+    });
+    if applied.is_none() {
+        log::warn!(
+            "SM Context Update (PREPARED) for ref={sm_context_ref}: the SM context went away \
+             during the UPF round trip; nothing kept"
+        );
+        if !sess.handover.forwarding_ebis.is_empty() {
+            if let Some(upf_seid) = (sess.upf_n4_seid != 0).then_some(sess.upf_n4_seid) {
+                pfcp_release_forwarding(sess.smf_n4_seid, upf_seid, &sess.handover.forwarding_ebis)
+                    .await;
+            }
+        }
+        return crate::problem_response(
+            404,
+            "CONTEXT_NOT_FOUND",
+            "the SM context was released during the handover preparation",
+        );
     }
     SbiResponse::with_status(200).with_body(root.to_string(), "application/json")
 }
@@ -965,13 +1091,14 @@ pub(crate) async fn handle_completed(
     sm_context_ref: &str,
     transfer_endpoint: Option<(u32, [u8; 4])>,
 ) -> SbiResponse {
+    let _procedure = handover_lock(sm_context_ref).await;
     let completed = || {
         SbiResponse::with_status(200).with_body(
             serde_json::json!({ "hoState": "COMPLETED" }).to_string(),
             "application/json",
         )
     };
-    let mut sess = smf_self()
+    let sess = smf_self()
         .read()
         .ok()
         .and_then(|ctx| ctx.sess_find_by_sm_context_ref(sm_context_ref));
@@ -1039,6 +1166,14 @@ pub(crate) async fn handle_completed(
         log::warn!("SM Context Update (COMPLETED) for ref={sm_context_ref}: DL switch failed: {e}");
         return SbiResponse::with_status(504);
     }
+    // #750: onto the session as it is now, not the copy read before the UPF round trip.
+    let mut sess = sess.and_then(|old| {
+        smf_self()
+            .read()
+            .ok()
+            .and_then(|ctx| ctx.sess_find_by_sm_context_ref(sm_context_ref))
+            .filter(|f| f.id == old.id)
+    });
     if let Some(sess) = sess.as_mut() {
         // §5.2.2.3.4.3: "set the hoState to NONE".
         sess.handover.prepared = false;
@@ -1102,6 +1237,7 @@ pub(crate) async fn handle_completed(
 /// Neither PREPARING nor PREPARED touched the downlink, so a 5GS-internal handover has
 /// nothing to undo; an EPS→5GS one releases the N3 uplink step 6 created.
 pub(crate) async fn handle_cancelled(sm_context_ref: &str) -> SbiResponse {
+    let _procedure = handover_lock(sm_context_ref).await;
     let sess = smf_self()
         .read()
         .ok()
@@ -1123,6 +1259,15 @@ pub(crate) async fn handle_cancelled(sm_context_ref: &str) -> SbiResponse {
                         "EPS→5GS cancel for ref={sm_context_ref}: N3 uplink PDR not removed: {e}"
                     );
                 }
+            }
+            // #750: the session as it is now, not as read before the UPF round trip.
+            if let Some(fresh) = smf_self()
+                .read()
+                .ok()
+                .and_then(|ctx| ctx.sess_find_by_sm_context_ref(sm_context_ref))
+                .filter(|f| f.id == sess.id)
+            {
+                sess = fresh;
             }
             // The PDN connection is left exactly as EPS was using it: it never became a PDU
             // session, so the SM context the preparation created goes away.
@@ -2598,6 +2743,159 @@ mod tests {
             "PDR 0x36 back on FAR 2, no tunnel FAR created"
         );
         s5.close();
+    }
+
+    /// The `smContextRef` of a PREPARING create's 201.
+    fn created_reference(created: &SbiResponse) -> String {
+        serde_json::from_str::<serde_json::Value>(created.http.content.as_deref().expect("body"))
+            .unwrap()["smContextRef"]
+            .as_str()
+            .expect("smContextRef")
+            .to_string()
+    }
+
+    /// A PREPARING create for the EPS PDN connection with indirect forwarding.
+    async fn prepare_eps_to_5gs_with_forwarding(pgw_c: (u32, [u8; 4])) -> String {
+        use base64::Engine as _;
+        let body = serde_json::json!({
+            "supi": format!("imsi-{IMSI}"),
+            "hoState": "PREPARING",
+            "ueEpsPdnConnection": base64::engine::general_purpose::STANDARD.encode(pdn_connection(pgw_c)),
+            "indirectForwardingFlag": true,
+        });
+        let created = handle_create(&body).await;
+        assert_eq!(created.status, 201);
+        created_reference(&created)
+    }
+
+    /// #750: the AMF's PREPARED call times out while the UPF is slow, and it sends
+    /// CANCELLED. The SMF finishes PREPARED (installing the forwarding tunnels), then
+    /// runs CANCELLED against the session as PREPARED left it: the forwarding FAR is
+    /// removed with the rest, and the SM context stays gone. Before, CANCELLED ran
+    /// during PREPARED's UPF round trip with no forwarding to remove, and PREPARED
+    /// then wrote back its stale copy: the cancelled context came back, and FAR 0x50
+    /// with its PDRs and QERs leaked on the live EPS session.
+    #[tokio::test]
+    async fn a_cancel_during_a_slow_prepared_leaves_no_context_and_no_forwarding() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        crate::context::smf_context_init(64, 256, 512);
+        let (s5, pgw_c, _) = establish_pdn(Some(&pco_with_psi(5))).await;
+        let reference = prepare_eps_to_5gs_with_forwarding(pgw_c).await;
+        upf.clear_seen();
+        upf.delay_modifications(400);
+
+        let transfer = ho_ack_transfer_with_forwarding();
+        let (prepared, cancelled) = tokio::join!(handle_prepared(&reference, &transfer), async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            handle_cancelled(&reference).await
+        });
+        upf.delay_modifications(0);
+        let mods = upf.modification_bodies();
+        let removed_far = mods
+            .iter()
+            .any(|m| n4_has(m, 16, &[0x00, 0x6C, 0x00, 0x04, 0, 0, 0, 0x50]));
+        let ctx = smf_self();
+        let ctx = ctx.read().unwrap();
+        let sess = ctx.sess_find_by_teid(pgw_c.0).unwrap();
+        let resurrected = sess.sm_context_ref.is_some() || sess.handover.prepared;
+        let forwarding_left = !sess.handover.forwarding_ebis.is_empty();
+        drop(ctx);
+        s5.close();
+
+        assert_eq!(cancelled.status, 200);
+        assert!(prepared.status == 200 || prepared.status == 404);
+        assert!(!resurrected, "the cancelled SM context stays gone");
+        assert!(!forwarding_left);
+        assert!(
+            removed_far,
+            "the forwarding FAR 0x50 PREPARED installed is removed: {} modification(s)",
+            mods.len()
+        );
+    }
+
+    /// #751: the UPF answers the indirect-forwarding modification without the Created
+    /// PDRs. Its FAR, PDRs and QERs may be installed all the same, and nothing records
+    /// them for step 14 or CANCELLED, so the SMF removes them at once.
+    #[tokio::test]
+    async fn an_incomplete_forwarding_answer_removes_what_was_requested() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        crate::context::smf_context_init(64, 256, 512);
+        let (s5, pgw_c, _) = establish_pdn(Some(&pco_with_psi(5))).await;
+        let reference = prepare_eps_to_5gs_with_forwarding(pgw_c).await;
+        upf.clear_seen();
+        upf.omit_created_pdrs(true);
+
+        let prepared = handle_prepared(&reference, &ho_ack_transfer_with_forwarding()).await;
+        upf.omit_created_pdrs(false);
+        let mods = upf.modification_bodies();
+        let forwarding_ebis = smf_self()
+            .read()
+            .unwrap()
+            .sess_find_by_teid(pgw_c.0)
+            .unwrap()
+            .handover
+            .forwarding_ebis;
+        s5.close();
+
+        assert_eq!(
+            prepared.status, 200,
+            "the handover goes on without forwarding"
+        );
+        assert_eq!(mods.len(), 2, "the create, then its removal");
+        assert!(n4_has(
+            &mods[0],
+            3,
+            &[0x00, 0x6C, 0x00, 0x04, 0, 0, 0, 0x50]
+        ));
+        assert!(
+            n4_has(&mods[1], 16, &[0x00, 0x6C, 0x00, 0x04, 0, 0, 0, 0x50]),
+            "Remove FAR 0x50"
+        );
+        assert!(forwarding_ebis.is_empty());
+    }
+
+    /// #751, step 6: the UPF refuses the dedicated bearers' rules after it created the
+    /// N3 uplink PDR. The SMF removes the N3 uplink PDR and, separately, the dedicated
+    /// bearers' PDRs and QERs the failed request may have left.
+    #[tokio::test]
+    async fn a_failed_step_6_removes_the_dedicated_rules_too() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        crate::context::smf_context_init(64, 256, 512);
+        let (s5, pgw_c, _) = establish_pdn(Some(&pco_with_psi(5))).await;
+        seed_dedicated_gbr_bearer(pgw_c.0);
+        upf.clear_seen();
+        // The first modification (the N3 uplink) is accepted, the second (the
+        // dedicated bearers) refused.
+        upf.reject_modification(2);
+        use base64::Engine as _;
+        let body = serde_json::json!({
+            "supi": format!("imsi-{IMSI}"),
+            "hoState": "PREPARING",
+            "ueEpsPdnConnection": base64::engine::general_purpose::STANDARD.encode(pdn_connection(pgw_c)),
+        });
+        let created = handle_create(&body).await;
+        upf.reject_modification(0);
+        let mods = upf.modification_bodies();
+        s5.close();
+
+        assert_eq!(created.status, 504);
+        assert_eq!(
+            mods.len(),
+            4,
+            "create N3, create dedicated, remove N3, remove dedicated"
+        );
+        assert!(
+            n4_has(&mods[2], 15, &[0x00, 0x38, 0x00, 0x02, 0x00, 0x03]),
+            "Remove PDR 3"
+        );
+        assert!(
+            n4_has(&mods[3], 15, &[0x00, 0x38, 0x00, 0x02, 0x00, 0x16])
+                && n4_has(&mods[3], 18, &[0x00, 0x6D, 0x00, 0x04, 0, 0, 0, 0x16]),
+            "Remove the dedicated UL PDR 0x16 and QER 0x16"
+        );
     }
 
     /// TS 29.502 §5.2.2.3.4.4: CANCELLED releases the N3 uplink step 6 created and forgets
