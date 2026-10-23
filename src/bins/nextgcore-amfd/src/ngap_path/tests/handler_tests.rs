@@ -1,10 +1,11 @@
 //! Handler-level tests that assert what amfd SENDS (#760).
 //!
-//! A child module of `ngap_path`, so it reaches `NgapServer`'s private state and
-//! handlers. Each test drives a real handler entry point (the Uplink NAS Transport
-//! dispatch, the N1N2 pump), with the NGAP egress captured by the `sent_ngap` seam
-//! and N11 answered by a stand-in SMF on loopback, then decodes the captured PDUs
-//! with the generated NGAP codec.
+//! A child of `ngap_path::tests`, so it reaches `NgapServer`'s private state and
+//! handlers, and the shared capture helpers (`capturing_ngap_server`,
+//! `take_sent_ngap`). Each test drives a real handler entry point (for example
+//! the Uplink NAS Transport dispatch), with the NGAP egress captured by the
+//! `sent_ngap` seam and N11 answered by a stand-in SMF on loopback. It then
+//! decodes the captured PDUs with the generated NGAP codec.
 
 use super::*;
 use base64::Engine as _;
@@ -12,25 +13,6 @@ use nextgcore_ngap_gen::generated as g;
 
 /// The association every UE in this module is served on.
 pub(super) const ASSOC: u64 = 1;
-
-/// An NgapServer whose `send_to_association` records each NGAP PDU as
-/// `(association_id, pdu)` instead of writing it to SCTP (see `sent_ngap`).
-pub(super) async fn capturing_server() -> NgapServer {
-    crate::context::amf_context_init(64, 1024, 4096);
-    let (etx, erx) = mpsc::channel(64);
-    // Leak the receiver so spawned event sends never error the test.
-    std::mem::forget(erx);
-    let mut server = NgapServer::new("127.0.0.1:0".parse().unwrap(), SctpBackend::Userspace, etx)
-        .await
-        .expect("NGAP test server");
-    server.sent_ngap = Some(Vec::new());
-    server
-}
-
-/// Everything sent since the last call, in send order.
-pub(super) fn take_sent(server: &mut NgapServer) -> Vec<(u64, Vec<u8>)> {
-    std::mem::take(server.sent_ngap.as_mut().expect("capture enabled"))
-}
 
 /// The NAS keys every UE here shares with "its" UE side: NIA2 integrity, NEA0.
 const KNAS_INT: [u8; 16] = [0x11; 16];
@@ -42,6 +24,8 @@ pub(super) fn secured_registered_ue(
     amf_ue_ngap_id: u64,
     ran_ue_ngap_id: u32,
 ) {
+    // The global context holds the UE's sessions (`sess_list`).
+    crate::context::amf_context_init(64, 1024, 4096);
     let mut ue = UeNasContext::new(amf_ue_ngap_id, ran_ue_ngap_id, ASSOC, false);
     ue.registered = true;
     ue.amf_ue.security_context_available = true;
@@ -192,6 +176,9 @@ pub(super) fn transfer_for(sm_ref: &str) -> Vec<u8> {
     t
 }
 
+/// The S-NSSAI every held session here is on, as (SST, SD).
+pub(super) const SLICE: (u8, Option<u32>) = (1, Some(0x0A_0B_0C));
+
 /// Give `amf_ue_ngap_id` an SM context for `psi` held at the stand-in SMF.
 pub(super) fn hold_session(
     server: &mut NgapServer,
@@ -200,13 +187,22 @@ pub(super) fn hold_session(
     sm_ref: &str,
     smf_port: u16,
 ) {
-    record_amf_session(amf_ue_ngap_id, psi, sm_ref, 1, None);
+    record_amf_session(amf_ue_ngap_id, psi, sm_ref, SLICE.0, SLICE.1);
     server
         .sm_context_refs
         .insert((amf_ue_ngap_id, psi), sm_ref.to_string());
     server
         .sm_context_smfs
         .insert((amf_ue_ngap_id, psi), ("127.0.0.1".to_string(), smf_port));
+}
+
+/// One PDU SESSION RESOURCE SETUP REQUEST item: PSI, S-NSSAI (SST, SD), transfer.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct SetupItem {
+    pub psi: u8,
+    pub sst: u8,
+    pub sd: Option<u32>,
+    pub transfer: Vec<u8>,
 }
 
 /// A decoded outbound NGAP PDU, reduced to what the tests here assert on.
@@ -216,8 +212,9 @@ pub(super) enum Sent {
     /// `(psi, transfer)`.
     SetupRequest {
         amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
         nas_pdu: Option<Vec<u8>>,
-        items: Vec<(u8, Vec<u8>)>,
+        items: Vec<SetupItem>,
     },
     /// PDU SESSION RESOURCE MODIFY REQUEST: per item `(psi, nas, transfer)`.
     ModifyRequest {
@@ -245,21 +242,28 @@ pub(super) fn decode_sent(pdu: &[u8]) -> Sent {
     let code = m.procedure_code.0 as u16;
     match m.value {
         g::InitiatingMessageValue::Id_PDUSessionResourceSetup(req) => {
-            let (mut amf, mut nas, mut items) = (0, None, Vec::new());
+            let (mut amf, mut ran, mut nas, mut items) = (0, 0, None, Vec::new());
             for ie in req.protocol_i_es.0 {
                 match ie.value {
                     g::PDUSessionResourceSetupRequestProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(
                         id,
                     ) => amf = id.0,
+                    g::PDUSessionResourceSetupRequestProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(
+                        id,
+                    ) => ran = id.0,
                     g::PDUSessionResourceSetupRequestProtocolIEs_EntryValue::Id_NAS_PDU(n) => {
                         nas = Some(n.0)
                     }
                     g::PDUSessionResourceSetupRequestProtocolIEs_EntryValue::Id_PDUSessionResourceSetupListSUReq(l) => {
                         for it in l.0 {
-                            items.push((
-                                it.pdu_session_id.0,
-                                it.pdu_session_resource_setup_request_transfer.0,
-                            ));
+                            items.push(SetupItem {
+                                psi: it.pdu_session_id.0,
+                                sst: it.s_nssai.sst.0.first().copied().unwrap_or_default(),
+                                sd: it.s_nssai.sd.map(|sd| {
+                                    sd.0.iter().fold(0u32, |acc, b| (acc << 8) | u32::from(*b))
+                                }),
+                                transfer: it.pdu_session_resource_setup_request_transfer.0,
+                            });
                         }
                     }
                     _ => {}
@@ -267,6 +271,7 @@ pub(super) fn decode_sent(pdu: &[u8]) -> Sent {
             }
             Sent::SetupRequest {
                 amf_ue_ngap_id: amf,
+                ran_ue_ngap_id: ran,
                 nas_pdu: nas,
                 items,
             }
@@ -347,6 +352,42 @@ pub(super) fn decode_sent(pdu: &[u8]) -> Sent {
     }
 }
 
+/// A setup item for `psi` on [`SLICE`] carrying `transfer`.
+pub(super) fn setup_item(psi: u8, transfer: Vec<u8>) -> SetupItem {
+    SetupItem {
+        psi,
+        sst: SLICE.0,
+        sd: SLICE.1,
+        transfer,
+    }
+}
+
+/// Assert `nas` is a SERVICE ACCEPT, integrity-protected and ciphered under the
+/// UE's context (TS 24.501 §4.4.4: the UE discards an unprotected one), with a
+/// MAC that verifies under [`KNAS_INT`] for its sequence number (NIA2, NEA0).
+pub(super) fn assert_protected_service_accept(nas: &[u8]) {
+    assert_eq!(
+        nas.get(1),
+        Some(&security_header::INTEGRITY_PROTECTED_AND_CIPHERED),
+        "the Service Accept is protected: {nas:02x?}"
+    );
+    assert!(nas.len() > 9, "{nas:02x?}");
+    let mac = nas_security::nas_mac_calculate(
+        2,
+        &KNAS_INT,
+        u32::from(nas[6]),
+        ACCESS_TYPE_3GPP,
+        nas_security::direction::DOWNLINK,
+        &nas[6..],
+    );
+    assert_eq!(&nas[2..6], &mac, "the downlink MAC verifies: {nas:02x?}");
+    assert_eq!(
+        dl_nas_message_type(nas),
+        Some(message_type::SERVICE_ACCEPT),
+        "{nas:02x?}"
+    );
+}
+
 /// The plain 5GMM message type inside a downlink protected NAS PDU (NEA0, so
 /// the plain message follows the 7-octet security header).
 pub(super) fn dl_nas_message_type(protected: &[u8]) -> Option<u8> {
@@ -367,29 +408,69 @@ pub(super) fn dl_nas_message_type(protected: &[u8]) -> Option<u8> {
 fn the_built_service_request_carries_the_uplink_data_status_it_names() {
     let ies = service_request_session_ies(&service_request(Some(0b110)), &|_| {});
     assert_eq!(ies.uplink_data_status, Some(0b110));
+    let ies = service_request_session_ies(&service_request(None), &|_| {});
+    assert_eq!(ies.uplink_data_status, None);
 }
 
-/// #683 + #685, TS 23.502 §4.2.3.2 steps 4-12: a CM-CONNECTED UE's protected
-/// Service Request with Uplink data status for a held PSI gets exactly one
-/// UpdateSMContext ACTIVATING for that session, then exactly one PDU SESSION
-/// RESOURCE SETUP REQUEST carrying the SMF's transfer AND, as its message-level
-/// NAS-PDU, the Service Accept. No separate Downlink NAS Transport.
+/// Drive a connected UE's protected Service Request through the Uplink NAS
+/// Transport dispatch, and return the decoded NGAP it caused.
+async fn connected_service_request(
+    server: &mut NgapServer,
+    ue: u64,
+    ran: u32,
+    uplink_psis: Option<u16>,
+) -> Vec<(u64, Sent)> {
+    let sr = ue_protect(&service_request(uplink_psis), 0);
+    server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &sr))
+        .await
+        .expect("the Service Request is handled");
+    take_sent_ngap(server)
+        .into_iter()
+        .map(|(a, p)| (a, decode_sent(&p)))
+        .collect()
+}
+
+/// The single standalone Accept in `sent`: exactly one PDU, a DL NAS Transport
+/// to `ue` on [`ASSOC`] carrying a protected SERVICE ACCEPT.
+fn assert_only_a_standalone_accept(sent: &[(u64, Sent)], ue: u64) {
+    assert_eq!(
+        sent.len(),
+        1,
+        "one NGAP PDU, the DL NAS Transport: {sent:?}"
+    );
+    assert_eq!(sent[0].0, ASSOC);
+    let Sent::DownlinkNas {
+        amf_ue_ngap_id,
+        nas_pdu,
+    } = &sent[0].1
+    else {
+        panic!("a DOWNLINK NAS TRANSPORT, got {:?}", sent[0].1);
+    };
+    assert_eq!(*amf_ue_ngap_id, ue);
+    assert_protected_service_accept(nas_pdu);
+}
+
+/// #683 + #685, TS 23.502 §4.2.3.2 steps 4-12. A CM-CONNECTED UE sends a
+/// protected Service Request with Uplink data status for a held PSI. It gets:
+/// - exactly one UpdateSMContext ACTIVATING, for that session;
+/// - then exactly one PDU SESSION RESOURCE SETUP REQUEST. That request carries
+///   the SMF's transfer on the session's S-NSSAI, and, as its message-level
+///   NAS-PDU, the protected Service Accept.
+///
+/// No separate Downlink NAS Transport is sent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_connected_service_request_activates_the_user_plane_and_carries_the_accept_in_the_setup()
 {
     let (_smf, port, calls) = activating_smf().await;
-    let mut server = capturing_server().await;
+    let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_760_001u64, 76);
     secured_registered_ue(&mut server, ue, ran);
     hold_session(&mut server, ue, 1, "sr760-ok-1", port);
     // A second held session the Uplink data status does NOT name stays as it is.
     hold_session(&mut server, ue, 2, "sr760-ok-2", port);
 
-    let sr = ue_protect(&service_request(Some(1 << 1)), 0);
-    server
-        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &sr))
-        .await
-        .expect("the Service Request is handled");
+    let sent = connected_service_request(&mut server, ue, ran, Some(1 << 1)).await;
 
     let calls = calls.lock().expect("calls").clone();
     assert_eq!(calls.len(), 1, "one N11 call, for PSI 1 only: {calls:?}");
@@ -400,29 +481,23 @@ async fn a_connected_service_request_activates_the_user_plane_and_carries_the_ac
     );
     assert_eq!(calls[0].1["upCnxState"], "ACTIVATING");
 
-    let sent: Vec<(u64, Sent)> = take_sent(&mut server)
-        .into_iter()
-        .map(|(a, p)| (a, decode_sent(&p)))
-        .collect();
     assert_eq!(sent.len(), 1, "one NGAP PDU, the setup request: {sent:?}");
     assert_eq!(sent[0].0, ASSOC);
     let Sent::SetupRequest {
         amf_ue_ngap_id,
+        ran_ue_ngap_id,
         nas_pdu,
         items,
     } = &sent[0].1
     else {
         panic!("a PDU SESSION RESOURCE SETUP REQUEST, got {:?}", sent[0].1);
     };
-    assert_eq!(*amf_ue_ngap_id, ue);
-    assert_eq!(items, &vec![(1u8, transfer_for("sr760-ok-1"))]);
-    let accept = nas_pdu
-        .as_deref()
-        .expect("the Service Accept rides in the setup (#685)");
-    assert_eq!(
-        dl_nas_message_type(accept),
-        Some(message_type::SERVICE_ACCEPT),
-        "the message-level NAS-PDU is the SERVICE ACCEPT: {accept:02x?}"
+    assert_eq!((*amf_ue_ngap_id, *ran_ue_ngap_id), (ue, ran));
+    assert_eq!(items, &vec![setup_item(1, transfer_for("sr760-ok-1"))]);
+    assert_protected_service_accept(
+        nas_pdu
+            .as_deref()
+            .expect("the Service Accept rides in the setup (#685)"),
     );
 }
 
@@ -432,39 +507,18 @@ async fn a_connected_service_request_activates_the_user_plane_and_carries_the_ac
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_connected_service_request_whose_activation_fails_gets_a_standalone_accept() {
     let (_smf, port, calls) = activating_smf().await;
-    let mut server = capturing_server().await;
+    let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_760_002u64, 77);
     secured_registered_ue(&mut server, ue, ran);
     hold_session(&mut server, ue, 1, "fail-sr760-1", port);
 
-    let sr = ue_protect(&service_request(Some(1 << 1)), 0);
-    server
-        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &sr))
-        .await
-        .expect("the Service Request is handled");
-
+    let sent = connected_service_request(&mut server, ue, ran, Some(1 << 1)).await;
     assert_eq!(
         calls.lock().expect("calls").len(),
         1,
         "the activation was attempted"
     );
-    let sent: Vec<Sent> = take_sent(&mut server)
-        .into_iter()
-        .map(|(_, p)| decode_sent(&p))
-        .collect();
-    assert_eq!(sent.len(), 1, "one NGAP PDU: {sent:?}");
-    let Sent::DownlinkNas {
-        amf_ue_ngap_id,
-        nas_pdu,
-    } = &sent[0]
-    else {
-        panic!("a DOWNLINK NAS TRANSPORT, got {:?}", sent[0]);
-    };
-    assert_eq!(*amf_ue_ngap_id, ue);
-    assert_eq!(
-        dl_nas_message_type(nas_pdu),
-        Some(message_type::SERVICE_ACCEPT)
-    );
+    assert_only_a_standalone_accept(&sent, ue);
 }
 
 /// With two sessions to activate, the Accept rides in the FIRST setup request
@@ -472,30 +526,23 @@ async fn a_connected_service_request_whose_activation_fails_gets_a_standalone_ac
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_activated_sessions_carry_the_accept_exactly_once() {
     let (_smf, port, calls) = activating_smf().await;
-    let mut server = capturing_server().await;
+    let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_760_003u64, 78);
     secured_registered_ue(&mut server, ue, ran);
     hold_session(&mut server, ue, 1, "sr760-two-1", port);
     hold_session(&mut server, ue, 2, "sr760-two-2", port);
 
-    let sr = ue_protect(&service_request(Some((1 << 1) | (1 << 2))), 0);
-    server
-        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &sr))
-        .await
-        .expect("the Service Request is handled");
+    let sent = connected_service_request(&mut server, ue, ran, Some((1 << 1) | (1 << 2))).await;
 
     assert_eq!(calls.lock().expect("calls").len(), 2);
-    let sent: Vec<Sent> = take_sent(&mut server)
-        .into_iter()
-        .map(|(_, p)| decode_sent(&p))
-        .collect();
     let mut psis = Vec::new();
     let mut accepts = 0;
-    for s in &sent {
+    for (_, s) in &sent {
         match s {
             Sent::SetupRequest { items, nas_pdu, .. } => {
-                psis.extend(items.iter().map(|(p, _)| *p));
-                if nas_pdu.is_some() {
+                psis.extend(items.iter().map(|i| i.psi));
+                if let Some(nas) = nas_pdu {
+                    assert_protected_service_accept(nas);
                     accepts += 1;
                 }
             }
@@ -505,6 +552,103 @@ async fn two_activated_sessions_carry_the_accept_exactly_once() {
     psis.sort_unstable();
     assert_eq!(psis, vec![1, 2]);
     assert_eq!(accepts, 1, "exactly one Service Accept: {sent:?}");
+}
+
+/// Review of #768, MAJOR-1. The SMF refuses PSI 1 and accepts PSI 2. The Accept
+/// must ride the first setup request that actually goes out, which is PSI 2's.
+/// If it were tied to the first PLANNED PSI, PSI 2's setup would go out bare,
+/// no standalone Accept would follow, and the UE would never be answered
+/// (T3517 expires).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_accept_rides_the_first_setup_sent_when_an_earlier_session_is_refused() {
+    let (_smf, port, calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_760_004u64, 79);
+    secured_registered_ue(&mut server, ue, ran);
+    hold_session(&mut server, ue, 1, "fail-sr760-mixed-1", port);
+    hold_session(&mut server, ue, 2, "sr760-mixed-2", port);
+
+    let sent = connected_service_request(&mut server, ue, ran, Some((1 << 1) | (1 << 2))).await;
+
+    assert_eq!(calls.lock().expect("calls").len(), 2, "both were attempted");
+    assert_eq!(
+        sent.len(),
+        1,
+        "one setup request and no DL NAS Transport: {sent:?}"
+    );
+    let Sent::SetupRequest { items, nas_pdu, .. } = &sent[0].1 else {
+        panic!("a PDU SESSION RESOURCE SETUP REQUEST, got {:?}", sent[0].1);
+    };
+    assert_eq!(items, &vec![setup_item(2, transfer_for("sr760-mixed-2"))]);
+    assert_protected_service_accept(nas_pdu.as_deref().expect("PSI 2's setup carries it"));
+}
+
+/// Review of #768, MAJOR-2 (TS 24.501 §5.6.1.2, TS 23.502 §4.2.3.2). A
+/// connected Service Request with no Uplink data status activates nothing: no
+/// N11 call, and one standalone Accept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connected_service_request_without_uplink_data_status_activates_nothing() {
+    let (_smf, port, calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_760_005u64, 80);
+    secured_registered_ue(&mut server, ue, ran);
+    hold_session(&mut server, ue, 1, "sr760-none-1", port);
+    hold_session(&mut server, ue, 2, "sr760-none-2", port);
+
+    let sent = connected_service_request(&mut server, ue, ran, None).await;
+    assert!(
+        calls.lock().expect("calls").is_empty(),
+        "no session activated"
+    );
+    assert_only_a_standalone_accept(&sent, ue);
+}
+
+/// An Uplink data status naming a PSI the AMF holds no SM context for causes no
+/// N11 call, and the Accept goes standalone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_uplink_data_status_for_an_unknown_session_gets_a_standalone_accept() {
+    let (_smf, port, calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_760_006u64, 81);
+    secured_registered_ue(&mut server, ue, ran);
+    hold_session(&mut server, ue, 1, "sr760-known-1", port);
+
+    let sent = connected_service_request(&mut server, ue, ran, Some(1 << 3)).await;
+    assert!(
+        calls.lock().expect("calls").is_empty(),
+        "PSI 3 has no SM context"
+    );
+    assert_only_a_standalone_accept(&sent, ue);
+}
+
+/// The send-failure branch: PSI 1's setup request is encoded but its SCTP send
+/// fails. The Accept is not lost: it rides PSI 2's setup, which is the next one
+/// to go out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_setup_whose_send_fails_hands_the_accept_to_the_next_setup() {
+    let (_smf, port, calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_760_007u64, 82);
+    secured_registered_ue(&mut server, ue, ran);
+    hold_session(&mut server, ue, 1, "sr760-sendfail-1", port);
+    hold_session(&mut server, ue, 2, "sr760-sendfail-2", port);
+    server.fail_next_sends = 1;
+
+    let sent = connected_service_request(&mut server, ue, ran, Some((1 << 1) | (1 << 2))).await;
+    assert_eq!(calls.lock().expect("calls").len(), 2);
+    assert_eq!(
+        sent.len(),
+        1,
+        "PSI 1's setup was lost on the wire: {sent:?}"
+    );
+    let Sent::SetupRequest { items, nas_pdu, .. } = &sent[0].1 else {
+        panic!("a PDU SESSION RESOURCE SETUP REQUEST, got {:?}", sent[0].1);
+    };
+    assert_eq!(
+        items,
+        &vec![setup_item(2, transfer_for("sr760-sendfail-2"))]
+    );
+    assert_protected_service_accept(nas_pdu.as_deref().expect("PSI 2's setup carries it"));
 }
 
 // ---------------------------------------------------------------------------
@@ -578,7 +722,7 @@ fn cause_of(resp: &nextgcore_sbi::SbiResponse) -> String {
 /// The captured PDUs that concern `ue`, decoded. Other tests may enqueue
 /// transfers for their own UEs on the shared queue, and the pump delivers those too.
 fn sent_to(server: &mut NgapServer, ue: u64) -> Vec<Sent> {
-    take_sent(server)
+    take_sent_ngap(server)
         .into_iter()
         .map(|(_, p)| decode_sent(&p))
         .filter(|s| match s {
@@ -603,7 +747,7 @@ const MOD_TRANSFER: [u8; 4] = [0x00, 0x00, 0x01, 0x7E];
 async fn a_downlink_data_setup_request_for_a_connected_ue_activates_and_reaches_the_gnb() {
     let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
     let (_smf, port, calls) = activating_smf().await;
-    let mut server = capturing_server().await;
+    let mut server = capturing_ngap_server().await;
     let (ue, ran, supi) = (7_757_001u64, 57, "imsi-001010007570001");
     secured_registered_ue(&mut server, ue, ran);
     with_supi(&mut server, ue, supi);
@@ -622,8 +766,9 @@ async fn a_downlink_data_setup_request_for_a_connected_ue_activates_and_reaches_
         sent_to(&mut server, ue),
         vec![Sent::SetupRequest {
             amf_ue_ngap_id: ue,
+            ran_ue_ngap_id: ran,
             nas_pdu: None,
-            items: vec![(2, transfer_for("n1n2-757-setup"))],
+            items: vec![setup_item(2, transfer_for("n1n2-757-setup"))],
         }]
     );
 }
@@ -634,7 +779,7 @@ async fn a_downlink_data_setup_request_for_a_connected_ue_activates_and_reaches_
 async fn a_setup_request_with_a_transfer_is_sent_without_asking_the_smf() {
     let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
     let (_smf, port, calls) = activating_smf().await;
-    let mut server = capturing_server().await;
+    let mut server = capturing_ngap_server().await;
     let (ue, ran, supi) = (7_757_002u64, 58, "imsi-001010007570002");
     secured_registered_ue(&mut server, ue, ran);
     with_supi(&mut server, ue, supi);
@@ -649,8 +794,9 @@ async fn a_setup_request_with_a_transfer_is_sent_without_asking_the_smf() {
         sent_to(&mut server, ue),
         vec![Sent::SetupRequest {
             amf_ue_ngap_id: ue,
+            ran_ue_ngap_id: ran,
             nas_pdu: None,
-            items: vec![(3, transfer.to_vec())],
+            items: vec![setup_item(3, transfer.to_vec())],
         }]
     );
 }
@@ -663,7 +809,7 @@ async fn a_setup_request_with_a_transfer_is_sent_without_asking_the_smf() {
 async fn a_network_requested_modification_reaches_a_connected_ue_as_a_modify_request() {
     let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
     let (_smf, port, _calls) = activating_smf().await;
-    let mut server = capturing_server().await;
+    let mut server = capturing_ngap_server().await;
     let (ue, ran, supi) = (7_757_003u64, 59, "imsi-001010007570003");
     secured_registered_ue(&mut server, ue, ran);
     with_supi(&mut server, ue, supi);
@@ -705,7 +851,7 @@ async fn a_network_requested_modification_reaches_a_connected_ue_as_a_modify_req
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_modify_request_missing_its_n1_or_transfer_is_refused() {
     let (_smf, port, _calls) = activating_smf().await;
-    let mut server = capturing_server().await;
+    let mut server = capturing_ngap_server().await;
     let (ue, ran, supi) = (7_757_004u64, 60, "imsi-001010007570004");
     secured_registered_ue(&mut server, ue, ran);
     with_supi(&mut server, ue, supi);
@@ -727,7 +873,7 @@ async fn a_modify_request_missing_its_n1_or_transfer_is_refused() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_modification_for_an_idle_ue_pages_it() {
     let (_smf, port, _calls) = activating_smf().await;
-    let mut server = capturing_server().await;
+    let mut server = capturing_ngap_server().await;
     let (ue, ran, supi) = (7_757_005u64, 61, "imsi-001010007570005");
     secured_registered_ue(&mut server, ue, ran);
     with_supi(&mut server, ue, supi);
@@ -762,7 +908,7 @@ async fn a_modification_for_an_idle_ue_pages_it() {
 async fn a_transfer_queued_before_the_ue_went_idle_pages_it_instead_of_sending() {
     let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
     let (_smf, port, _calls) = activating_smf().await;
-    let mut server = capturing_server().await;
+    let mut server = capturing_ngap_server().await;
     let (ue, ran, supi) = (7_757_006u64, 62, "imsi-001010007570006");
     secured_registered_ue(&mut server, ue, ran);
     with_supi(&mut server, ue, supi);
@@ -798,7 +944,7 @@ async fn a_transfer_queued_before_the_ue_went_idle_pages_it_instead_of_sending()
 /// MODIFY REQUEST. Delivering it as a bare DL NAS Transport would lose the N2 half.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_paged_modification_is_delivered_as_a_modify_request_after_the_service_request() {
-    let mut server = capturing_server().await;
+    let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_757_007u64, 63);
     secured_registered_ue(&mut server, ue, ran);
     let paging = crate::context::PagingContext {
