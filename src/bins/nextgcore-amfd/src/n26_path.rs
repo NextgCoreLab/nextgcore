@@ -594,13 +594,24 @@ fn preparations_in_progress(
         .unwrap_or_else(|e| e.into_inner())
 }
 
+/// TS 29.274 §8.4 cause 110, "Temporarily rejected due to handover/TAU/RAU procedure in
+/// progress" (#755).
+const CAUSE_TEMPORARILY_REJECTED_HANDOVER_IN_PROGRESS: u8 = 110;
+
 /// Removes a preparation's in-progress record on every exit of the N26 leg.
 pub(crate) struct PreparationGuard(Option<String>);
 
 impl PreparationGuard {
-    pub(crate) fn start(supi: Option<&String>, mme_teid: u32) -> Self {
+    /// `None` when a preparation for `supi` is already in progress (#755): a second one
+    /// must not overwrite its record -- that un-cancelled a cancelled preparation and let
+    /// whichever guard dropped first remove the other's -- and the caller refuses it.
+    pub(crate) fn start(supi: Option<&String>, mme_teid: u32) -> Option<Self> {
         if let Some(supi) = supi {
-            preparations_in_progress().insert(
+            let mut in_progress = preparations_in_progress();
+            if in_progress.contains_key(supi) {
+                return None;
+            }
+            in_progress.insert(
                 supi.clone(),
                 PreparationInProgress {
                     mme_teid,
@@ -608,7 +619,7 @@ impl PreparationGuard {
                 },
             );
         }
-        Self(supi.cloned())
+        Some(Self(supi.cloned()))
     }
 }
 
@@ -705,7 +716,18 @@ pub struct N26Server {
     local_addr: SocketAddr,
     restart_counter: u8,
     xact: Mutex<Gtp2XactMgr>,
+    /// Requests being handled, keyed by `(peer, sequence number)`, with when each arrived
+    /// (#755). A retransmission of one of these is dropped: its first copy is still
+    /// awaiting the SMF or the target gNB, and processing it again would start a second
+    /// preparation. Removed when the response is sent; an entry whose request never got
+    /// one expires after [`N26_IN_FLIGHT_TTL`].
+    in_flight: std::sync::Mutex<std::collections::HashMap<(SocketAddr, u32), std::time::Instant>>,
 }
+
+/// How long an N26 request with no response yet still counts as in flight (#755). Past
+/// the MME's whole retransmission window (TS 29.274 §7.6: T3-RESPONSE x N3-REQUESTS,
+/// 3 s x 5 by default), so a retransmission within it is never processed twice.
+const N26_IN_FLIGHT_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The process-wide N26 server, installed at startup.
 static N26_SERVER: OnceLock<Arc<N26Server>> = OnceLock::new();
@@ -727,6 +749,7 @@ impl N26Server {
             local_addr,
             restart_counter,
             xact: Mutex::new(Gtp2XactMgr::new(Gtp2XactConfig::default())),
+            in_flight: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
 
         // The receive loop. Spawned here, and `n26_open` is called from `run` at startup,
@@ -774,8 +797,24 @@ impl N26Server {
 
     async fn send(&self, peer: SocketAddr, msg: &Gtp2Message) {
         let encoded = msg.encode();
-        if let Ok(mut xact) = self.xact.try_lock() {
-            xact.cache_response(peer, msg.header.sequence_number, encoded.clone().freeze());
+        let msg_type = msg.header.message_type;
+        let seq = msg.header.sequence_number;
+        // #755: only a RESPONSE (a message that is not itself an initial request) is
+        // cached for retransmission answering, and its arrival ends the request's
+        // in-flight record. An AMF-initiated request (Forward Relocation Request, Complete
+        // Notification) shares no sequence space with the MME's requests, so caching it
+        // could answer an MME retransmission with the AMF's own request. Awaited, not
+        // `try_lock`: a response that missed the cache under contention would leave its
+        // request's retransmission to be processed again.
+        if nextgcore_gtp::v2::xact::triggered_message_type(msg_type).is_none() {
+            self.xact
+                .lock()
+                .await
+                .cache_response(peer, seq, encoded.clone().freeze());
+            self.in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&(peer, seq));
         }
         if let Err(e) = self.socket.send_to(&encoded, peer).await {
             log::error!("N26 send to {peer} failed: {e}");
@@ -793,6 +832,38 @@ impl N26Server {
         };
         let msg_type = msg.header.message_type;
         let seq = msg.header.sequence_number;
+
+        // #755, TS 29.274 §7.6: a retransmitted REQUEST is answered from the response cache
+        // -- the same octets as the first answer -- and never processed again. One whose
+        // first copy is still being handled is dropped: the answer is on its way. Before,
+        // every datagram was handled afresh, so a retransmitted Forward Relocation Request
+        // started a second preparation (and un-cancelled a cancelled one), and a
+        // retransmitted Relocation Cancel whose first copy had already released the
+        // preparation was answered "IMSI/IMEI not known".
+        if let Some(expected) = nextgcore_gtp::v2::xact::triggered_message_type(msg_type) {
+            let cached = self.xact.lock().await.lookup_cached_response(peer, seq);
+            if let Some(cached) = cached.filter(|c| c.get(1) == Some(&expected)) {
+                log::info!(
+                    "N26 retransmission from {peer} (type={msg_type}, seq={seq}): answered \
+                     from the response cache"
+                );
+                if let Err(e) = self.socket.send_to(&cached, peer).await {
+                    log::error!("N26 send to {peer} failed: {e}");
+                }
+                return;
+            }
+            let mut in_flight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+            let now = std::time::Instant::now();
+            in_flight.retain(|_, since| now.duration_since(*since) < N26_IN_FLIGHT_TTL);
+            if in_flight.contains_key(&(peer, seq)) {
+                log::info!(
+                    "N26 retransmission from {peer} (type={msg_type}, seq={seq}) while its \
+                     first copy is still being handled; dropped"
+                );
+                return;
+            }
+            in_flight.insert((peer, seq), now);
+        }
 
         // Echo: path management, no UE state (TS 29.274 §7.1.1).
         if msg_type == Gtp2MessageType::EchoRequest as u8 {
@@ -941,7 +1012,23 @@ impl N26Server {
             |cause: u8| eps::build_forward_relocation_response_refusal(seq, mme_teid, cause);
         // #592: a Relocation Cancel Request may arrive while this task waits on the SMFs.
         let in_progress_supi = request.imsi.as_ref().map(|d| format!("imsi-{d}"));
-        let _in_progress = PreparationGuard::start(in_progress_supi.as_ref(), mme_teid);
+        let Some(_in_progress) = PreparationGuard::start(in_progress_supi.as_ref(), mme_teid)
+        else {
+            // #755: a second Forward Relocation Request for a UE whose preparation is still
+            // running (not a retransmission: that is answered or dropped above). TS 29.274
+            // cause 110, "Temporarily rejected due to handover/TAU/RAU procedure in
+            // progress".
+            log::warn!(
+                "N26 Forward Relocation Request from MME {peer} (seq={seq}) for \
+                 {in_progress_supi:?} while a preparation for it is in progress; refused"
+            );
+            self.send(
+                peer,
+                &refuse(CAUSE_TEMPORARILY_REJECTED_HANDOVER_IN_PROGRESS),
+            )
+            .await;
+            return;
+        };
 
         // Step 3: the mapped 5G security context, with the AMF's configured algorithm
         // preference -- the same masks the Security Mode Command path selects from.
