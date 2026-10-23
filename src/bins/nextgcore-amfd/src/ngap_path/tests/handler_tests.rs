@@ -1182,3 +1182,213 @@ async fn an_update_from_cm_idle_whose_initial_context_setup_cannot_encode_still_
     drop(resumed);
     server.ue_auth_state.remove(new_id);
 }
+
+// ---------------------------------------------------------------------------
+// #826 review: ICS Failure for a registered UE; the §4.4.6 gate for the session
+// IEs; the IEs are always overwritten
+// ---------------------------------------------------------------------------
+
+/// #826 review M1, TS 38.413 §8.3.1.3. The gNB refuses the Initial Context Setup
+/// that carried a CM-IDLE mobility update's Accept and re-activated PSI 1. The
+/// UE was registered before this ICS, so only the NG connection ends:
+/// - the UE stays in the store, registered and CM-IDLE;
+/// - the Accept is not counted as delivered;
+/// - PSI 1, re-activated by this ICS, is DEACTIVATED at its SMF, so it is not
+///   left in ACTIVATING;
+/// - a UE Context Release Command (normal release) goes to the gNB.
+///
+/// The Release Complete that follows does not deactivate a second time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn an_ics_failure_after_an_idle_update_keeps_the_ue_registered_and_idle() {
+    let _guard = crate::test_support::CONTEXT_GUARD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    crate::context::amf_context_init(64, 1024, 4096);
+    let _guami = ServeFixtureGuami::install();
+    let (_smf, port, calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (old_id, new_id, tmsi) = (7_759_401u64, 7_759_402u64, 0x0759_0401u32);
+    let stored = idle_ue_for_update(old_id, tmsi);
+    let ue_keys = stored.amf_ue.clone();
+    server.ue_auth_state.insert(old_id, stored);
+    hold_session(&mut server, old_id, 1, "icsfail-759-1", port);
+    server.forced_amf_ue_ngap_id = Some(new_id);
+    let cleartext = super::guti_registration_request(
+        crate::gmm_build::registration_type::MOBILITY_UPDATING,
+        tmsi,
+    );
+    let mut full = cleartext.clone();
+    full.extend_from_slice(&[0x40, 0x02, 1 << 1, 0x00]);
+    let nas = super::protected_initial_registration(&ue_keys, &cleartext, &full, 5);
+    server
+        .handle_initial_ue_message(ASSOC, &super::service_request_initial_ue(nas))
+        .await
+        .expect("the update is handled");
+    let sent = take_sent_ngap(&mut server);
+    assert!(decode_ics(&sent[0].1).is_some(), "the ICS went out");
+
+    let failure = nextgcore_ngap::builder::build_initial_context_setup_failure(
+        &nextgcore_ngap::types::InitialContextSetupFailure {
+            amf_ue_ngap_id: new_id,
+            ran_ue_ngap_id: 512,
+            cause: nextgcore_ngap::types::Cause::RadioNetwork(
+                nextgcore_ngap::types::CauseRadioNetwork::Unspecified,
+            ),
+        },
+    )
+    .expect("encode an Initial Context Setup Failure");
+    server
+        .handle_initial_context_setup_failure(ASSOC, &failure)
+        .await
+        .expect("handled");
+
+    let ue = server
+        .ue_auth_state
+        .get(new_id)
+        .expect("the NAS context is kept: the UE stays registered");
+    assert!(ue.registered && ue.cm_idle, "registered and CM-IDLE");
+    assert!(!ue.registration_accept_sent, "the Accept was not delivered");
+    assert!(!ue.initial_context_setup_request_sent);
+    drop(ue);
+    let states = |calls: &[SmfCall]| -> Vec<String> {
+        calls
+            .iter()
+            .filter(|(u, _)| u.ends_with("/sm-contexts/icsfail-759-1/modify"))
+            .filter_map(|(_, b)| b["upCnxState"].as_str().map(str::to_string))
+            .collect()
+    };
+    assert_eq!(
+        states(&calls.lock().expect("calls")),
+        vec!["ACTIVATING".to_string(), "DEACTIVATED".to_string()],
+        "the re-activated user plane is rolled back at the SMF"
+    );
+    let released: Vec<_> = take_sent_ngap(&mut server)
+        .into_iter()
+        .filter_map(|(_, p)| super::decoded_release_command(&p))
+        .collect();
+    assert_eq!(released.len(), 1, "one UE Context Release Command");
+    assert_eq!(released[0].0, new_id);
+
+    let complete = nextgcore_ngap::builder::build_ue_context_release_complete(
+        &nextgcore_ngap::types::UeContextReleaseComplete {
+            amf_ue_ngap_id: new_id,
+            ran_ue_ngap_id: 512,
+        },
+    )
+    .expect("encode a UE Context Release Complete");
+    server
+        .handle_ue_context_release_complete(ASSOC, &complete)
+        .await
+        .expect("handled");
+    assert_eq!(
+        states(&calls.lock().expect("calls")).len(),
+        2,
+        "no second DEACTIVATED on the Release Complete"
+    );
+    assert!(server.ue_auth_state.contains(new_id));
+    {
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(sess) = guard.sess_find_by_psi(new_id, 1) {
+            guard.sess_remove(sess.id);
+        }
+    }
+    server.forget_ue(new_id);
+}
+
+/// #826 review m1. Uplink data status (0x40) and PDU session status (0x50) are
+/// non-cleartext (TS 24.501 §4.4.6). An unprotected initial Registration
+/// Request carrying either is refused with 5GMM #95, the same as Requested NSSAI.
+#[test]
+fn the_session_ies_are_non_cleartext() {
+    for iei in [0x40u8, 0x50] {
+        let mut rr = super::guti_registration_request(
+            crate::gmm_build::registration_type::MOBILITY_UPDATING,
+            0x0759_0501,
+        );
+        rr.extend_from_slice(&[iei, 0x02, 0x02, 0x00]);
+        let parsed = parse_registration_request_pdu(&rr).expect("parses");
+        assert_eq!(
+            validate_initial_registration_cleartext(&parsed, false),
+            Some(GmmCause::SemanticallyIncorrectMessage),
+            "IEI {iei:#04x} in the clear"
+        );
+        assert_eq!(validate_initial_registration_cleartext(&parsed, true), None);
+    }
+}
+
+/// #826 review m1: the session IEs of a request that is not integrity-verified
+/// are never recorded, whatever happens to the request afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unverified_session_ies_are_not_recorded() {
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_759_601u64, 66);
+    registered_ue_with_guti(&mut server, ue, ran);
+    let rr = update_registration_request(
+        crate::gmm_build::registration_type::MOBILITY_UPDATING,
+        Some(1 << 1),
+        Some(1 << 1),
+    );
+    let _ = server
+        .handle_registration_request_nas(ASSOC, ue, ran, &rr, false)
+        .await;
+    assert_eq!(
+        server
+            .ue_auth_state
+            .get(ue)
+            .expect("ue")
+            .registration_session_ies,
+        None
+    );
+    server.ue_auth_state.remove(ue);
+}
+
+/// #826 review m1, the always-overwritten rule. IEs left on the context by an
+/// earlier request (one that never reached an Accept) must not be applied to
+/// the Accept of a later request that carries none. The later request
+/// overwrites them with nothing: no N11 call, and no session IEs in its Accept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_later_update_without_session_ies_clears_earlier_ones() {
+    let (_smf, port, calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_759_701u64, 67);
+    registered_ue_with_guti(&mut server, ue, ran);
+    hold_session(&mut server, ue, 1, "stale-759-1", port);
+    server.ue_auth_state.with_mut(ue, |s| {
+        s.registration_session_ies = Some(ServiceRequestSessionIes {
+            uplink_data_status: Some(1 << 1),
+            pdu_session_status: Some(0),
+        });
+    });
+    let rr = ue_protect(
+        &update_registration_request(
+            crate::gmm_build::registration_type::PERIODIC_UPDATING,
+            None,
+            None,
+        ),
+        0,
+    );
+    let _ = server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &rr))
+        .await;
+    assert!(
+        calls.lock().expect("calls").is_empty(),
+        "the stale IEs neither released nor re-activated anything"
+    );
+    let sent: Vec<Sent> = take_sent_ngap(&mut server)
+        .into_iter()
+        .map(|(_, p)| decode_sent(&p))
+        .collect();
+    let Some(Sent::DownlinkNas { nas_pdu, .. }) = sent.first() else {
+        panic!("a DL NAS Transport, got {sent:?}");
+    };
+    let accept = registration_accept_of(nas_pdu);
+    assert_eq!(accept.pdu_session_status, None);
+    assert_eq!(accept.pdu_session_reactivation_result, None);
+    let ctx = crate::context::amf_self();
+    let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+    if let Some(sess) = guard.sess_find_by_psi(ue, 1) {
+        guard.sess_remove(sess.id);
+    }
+}

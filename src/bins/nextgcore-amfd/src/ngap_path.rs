@@ -2690,7 +2690,12 @@ impl NgapServer {
         // once the request has passed the §4.4.6 and congestion gates, and always
         // overwritten, so a rejected or earlier request never leaves IEs behind for
         // a later Accept.
-        let session_ies = registration_update_session_ies(nas);
+        // Only from an integrity-verified request: an unprotected one, including a
+        // request whose MAC failed (re-authenticated afterwards, with no replay of
+        // the full request), must not release or re-activate anyone's sessions.
+        let session_ies = integrity_protected
+            .then(|| registration_update_session_ies(nas))
+            .flatten();
         self.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
             s.registration_session_ies = session_ies;
         });
@@ -8722,13 +8727,17 @@ impl NgapServer {
         // is what makes a later N1N2 transfer page it (#512). Marked whether or not
         // the mobile reachable timer below is enabled.
         if let Some(id) = amf_ue_ngap_id {
+            // A transition only: a UE already CM-IDLE (an Initial Context Setup
+            // Failure released it and deactivated its user planes, #826) is not
+            // deactivated a second time.
             let went_idle = self
                 .ue_auth_state
                 .with_mut(id, |s| {
+                    let went = s.registered && !s.cm_idle;
                     if s.registered {
                         s.cm_idle = true;
                     }
-                    s.registered
+                    went
                 })
                 .unwrap_or(false);
             // #540 / TS 23.502 §4.2.6 step 5: the AN release ends the user plane of
@@ -11828,6 +11837,44 @@ impl NgapServer {
              releasing UE"
         );
 
+        // #826 review M1, TS 38.413 §8.3.1.3: the gNB could not set up THIS UE
+        // context. For a UE that was already registered (the ICS answered a
+        // registration update or a Service Request from CM-IDLE), that ends only
+        // the NG connection. The UE stays registered and goes CM-IDLE:
+        // - the Accept the ICS carried is not counted as delivered;
+        // - the user planes this ICS re-activated are deactivated at their SMFs,
+        //   so none is left in ACTIVATING;
+        // - the NG connection is released with a normal release.
+        // Deleting the NAS context instead would deregister the UE locally on
+        // every periodic update a gNB refuses.
+        let registered = self
+            .ue_auth_state
+            .with_mut(amf_ue_ngap_id, |s| s.registered)
+            .unwrap_or(false);
+        if registered {
+            self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
+                state.retx = None;
+                state.registration_accept_sent = false;
+                state.initial_context_setup_request_sent = false;
+                state.initial_context_setup_response_received = false;
+                state.cm_idle = true;
+            });
+            self.deactivate_up_connections(amf_ue_ngap_id).await;
+            if let Some(cmd) = crate::ngap_asn1::build_ue_context_release_command_asn1(
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                ngap_handler::cause_group::NAS,
+                0, // CauseNas normal-release
+            ) {
+                self.send_to_association(association_id, &cmd).await?;
+            }
+            log::warn!(
+                "UE {amf_ue_ngap_id}: Initial Context Setup failed; the UE stays registered, \
+                 CM-IDLE, its re-activated user planes deactivated (TS 38.413 §8.3.1.3)"
+            );
+            return Ok(());
+        }
+
         // Drop any pending ICS retransmission, then release the NG context.
         self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
             state.retx = None;
@@ -13296,6 +13343,10 @@ mod reg_present {
     pub const REQUESTED_NSSAI: u64 = 1 << 2;
     /// Last visited registered TAI (IEI 0x52) — NOT cleartext.
     pub const LAST_VISITED_TAI: u64 = 1 << 3;
+    /// Uplink data status (IEI 0x40) — NOT cleartext (#759).
+    pub const UPLINK_DATA_STATUS: u64 = 1 << 4;
+    /// PDU session status (IEI 0x50) — NOT cleartext (#759).
+    pub const PDU_SESSION_STATUS: u64 = 1 << 5;
 }
 
 /// IEs permitted in an unprotected initial NAS message per TS 24.501 §4.4.6.
@@ -14230,9 +14281,17 @@ fn parse_registration_request_pdu(nas: &[u8]) -> Option<ParsedRegistrationReques
                 pos += 1;
             }
             // Default: assume TLV
-            _ => {
+            iei => {
                 if pos + 1 >= nas.len() {
                     break;
+                }
+                // #759: the session IEs are non-cleartext (TS 24.501 §4.4.6), so
+                // their presence feeds the cleartext gate. Read elsewhere, by
+                // `registration_update_session_ies`.
+                match iei {
+                    0x40 => req.presencemask |= reg_present::UPLINK_DATA_STATUS,
+                    0x50 => req.presencemask |= reg_present::PDU_SESSION_STATUS,
+                    _ => {}
                 }
                 let len = nas[pos + 1] as usize;
                 pos += 2 + len;
