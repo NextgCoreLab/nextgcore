@@ -18,6 +18,23 @@ use super::header::Gtp2MessageType;
 /// Maximum GTPv2-C sequence number (24 bits)
 pub const GTP2_MAX_SEQUENCE: u32 = 0x00FF_FFFF;
 
+/// The most significant bit of the 24-bit sequence number. TS 29.274 §7.6: "A
+/// Sequence Number used for a Command message shall have the most significant bit
+/// set to 1", the message it triggers (and that message's reply) carries the same
+/// number, and "A Sequence Number used for a Request message, which was not
+/// triggered by a Command message shall have the most significant bit set to 0".
+pub const GTP2_COMMAND_SEQUENCE_FLAG: u32 = 0x0080_0000;
+
+/// Largest sequence number an initial message that is not a Command may carry
+/// (the MSB is clear, TS 29.274 §7.6).
+pub const GTP2_MAX_INITIAL_SEQUENCE: u32 = GTP2_COMMAND_SEQUENCE_FLAG - 1;
+
+/// Whether `sequence_number` belongs to a Command exchange: a Command, the
+/// message it triggered, or that message's reply (MSB set, TS 29.274 §7.6).
+pub fn is_command_sequence(sequence_number: u32) -> bool {
+    sequence_number & GTP2_COMMAND_SEQUENCE_FLAG != 0
+}
+
 /// Retransmission configuration (TS 29.274 Section 7.6: T3-RESPONSE / N3-REQUESTS)
 #[derive(Debug, Clone, Copy)]
 pub struct Gtp2XactConfig {
@@ -211,14 +228,28 @@ impl Gtp2XactMgr {
         }
     }
 
-    /// Allocate a monotonically increasing 24-bit sequence number
+    /// Allocate a sequence number for an initial message that is NOT a Command:
+    /// monotonically increasing in 1..=[`GTP2_MAX_INITIAL_SEQUENCE`], so the most
+    /// significant bit is always clear (TS 29.274 §7.6, #727). It wraps back to 1.
     pub fn alloc_sequence(&mut self) -> u32 {
         let seq = self.next_sequence;
-        self.next_sequence = (self.next_sequence + 1) & GTP2_MAX_SEQUENCE;
-        if self.next_sequence == 0 {
-            self.next_sequence = 1;
-        }
+        self.next_sequence = if self.next_sequence >= GTP2_MAX_INITIAL_SEQUENCE {
+            1
+        } else {
+            self.next_sequence + 1
+        };
         seq
+    }
+
+    /// Allocate a sequence number for a Command (Modify / Delete Bearer Command,
+    /// Bearer Resource Command): the next number of [`Self::alloc_sequence`] with the
+    /// most significant bit set (TS 29.274 §7.6, #727).
+    ///
+    /// The two spaces cannot overlap, so a peer's own initial Request (MSB clear)
+    /// can never close a Command this node sent, and a peer that tells triggered
+    /// from initial Requests by the MSB sees the Command's triggered Request as one.
+    pub fn alloc_command_sequence(&mut self) -> u32 {
+        self.alloc_sequence() | GTP2_COMMAND_SEQUENCE_FLAG
     }
 
     /// Register a locally originated request for retransmission tracking.
@@ -356,11 +387,60 @@ mod tests {
         let b = mgr.alloc_sequence();
         assert_eq!(b, a + 1);
 
-        // Force wrap
-        mgr.next_sequence = GTP2_MAX_SEQUENCE;
-        assert_eq!(mgr.alloc_sequence(), GTP2_MAX_SEQUENCE);
-        // 0 is skipped after wrap
+        // Force wrap: the initial space ends below the Command MSB (#727)
+        mgr.next_sequence = GTP2_MAX_INITIAL_SEQUENCE;
+        assert_eq!(mgr.alloc_sequence(), GTP2_MAX_INITIAL_SEQUENCE);
+        // 0 is skipped after wrap, and 0x800000 is never handed out
         assert_eq!(mgr.alloc_sequence(), 1);
+    }
+
+    /// #727, TS 29.274 §7.6: a Command's number has the MSB set, every other
+    /// initial message's number has it clear, across the whole allocator cycle.
+    #[test]
+    fn command_sequences_set_the_msb_and_initial_sequences_never_do() {
+        let mut mgr = Gtp2XactMgr::default();
+        for start in [1, 0x7F_FFF0, GTP2_MAX_INITIAL_SEQUENCE] {
+            mgr.next_sequence = start;
+            for _ in 0..64 {
+                let initial = mgr.alloc_sequence();
+                assert!(
+                    (1..=GTP2_MAX_INITIAL_SEQUENCE).contains(&initial),
+                    "{initial:#x}"
+                );
+                assert!(!is_command_sequence(initial), "{initial:#x}");
+                let command = mgr.alloc_command_sequence();
+                assert!(is_command_sequence(command), "{command:#x}");
+                assert!(command <= GTP2_MAX_SEQUENCE, "{command:#x}");
+                assert_ne!(command & GTP2_MAX_INITIAL_SEQUENCE, 0, "{command:#x}");
+            }
+        }
+    }
+
+    /// #727 scenario 1: the peer's own initial Create Bearer Request reuses the low
+    /// 23 bits of a Command this node sent. It must not close the Command.
+    #[test]
+    fn a_peers_initial_request_cannot_close_a_command() {
+        let mut mgr = Gtp2XactMgr::default();
+        let cmd_seq = mgr.alloc_command_sequence();
+        mgr.register_request(
+            cmd_seq,
+            Gtp2MessageType::BearerResourceCommand as u8,
+            peer(),
+            Bytes::from_static(b"brc"),
+            7,
+        );
+        let peer_initial = cmd_seq & GTP2_MAX_INITIAL_SEQUENCE;
+        assert!(mgr
+            .match_response_from(
+                peer(),
+                peer_initial,
+                Gtp2MessageType::CreateBearerRequest as u8
+            )
+            .is_none());
+        let closed = mgr
+            .match_response_from(peer(), cmd_seq, Gtp2MessageType::CreateBearerRequest as u8)
+            .expect("the triggered Request carries the Command's number");
+        assert_eq!(closed.data, 7);
     }
 
     #[test]
