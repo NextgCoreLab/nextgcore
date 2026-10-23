@@ -1593,6 +1593,26 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         };
+        // #934: the receive thread closes the transaction BEFORE it dispatches
+        // the response to the procedure (`handle_datagram`), so `outstanding()`
+        // reaching 0 does not mean the procedure has run. Under a loaded full
+        // suite the thread can be descheduled between the two, and asserting the
+        // procedure's effect right after `wait_idle` then fails. The effect is
+        // waited for instead (bounded), and asserted after.
+        let wait_for = |done: &dyn Fn() -> bool| {
+            for _ in 0..500 {
+                if done() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        let pending_context_request = |seq: u32| {
+            pending_context_requests()
+                .lock()
+                .map(|m| m.contains_key(&seq))
+                .unwrap_or(false)
+        };
         let request = |t: Gtp2MessageType, teid: u32| {
             let seq = server.alloc_sequence();
             let msg = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(t as u8, teid, seq));
@@ -1625,6 +1645,7 @@ mod tests {
             0,
             "the Context Response closes the request"
         );
+        wait_for(&|| !pending_context_request(seq));
         assert!(
             take_pending_context_request(seq).is_none(),
             "the Context Response reached the TAU continuation"
@@ -1653,6 +1674,7 @@ mod tests {
             0,
             "the Forward Relocation Response closes the request"
         );
+        wait_for(&|| eps_to_5gs_relocation(mme_ue_id).is_none());
         assert!(
             eps_to_5gs_relocation(mme_ue_id).is_none(),
             "the refusal reached the handover, which abandoned it"
