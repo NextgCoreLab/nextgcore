@@ -8499,9 +8499,12 @@ impl NgapServer {
     /// Start mobile-reachable supervision for every registered UE whose N1 connection
     /// this release complete ended (TS 24.501 §5.3.7).
     ///
-    /// `amf_ue_ngap_id` is the UE the Release Complete names, when it could be used; a
-    /// Release Complete that cannot falls back to the association's UEs, because the
-    /// alternative -- supervising nobody -- is the defect being fixed.
+    /// `amf_ue_ngap_id` is the UE the Release Complete names, when it could be used. A
+    /// Release Complete that cannot (undecodable, or a not-comprehended reject IE, which
+    /// TS 38.413 §10.3.4.2 has handled locally) names nobody, so it falls back to the
+    /// association's UEs that are ALREADY CM-IDLE and unsupervised -- never a CONNECTED
+    /// one (#802). Arming every registered UE of the association put the connected UEs
+    /// on the gNB on the path to implicit deregistration on one malformed PDU.
     async fn start_reachability_supervision(
         &mut self,
         association_id: u64,
@@ -8520,7 +8523,12 @@ impl NgapServer {
                 .ue_auth_state
                 .snapshot()
                 .into_iter()
-                .filter(|(_, s)| s.association_id == association_id)
+                .filter(|(_, s)| {
+                    s.association_id == association_id
+                        && s.registered
+                        && s.cm_idle
+                        && s.reachability.is_none()
+                })
                 .map(|(id, _)| id)
                 .collect(),
         };
@@ -24917,6 +24925,64 @@ mod tests {
             guard.event_subscription_remove("sub-417-s4-release");
         }
         sink.stop().await.expect("sink stop");
+    }
+
+    /// **#802.** A UE Context Release Complete that names no usable UE -- undecodable,
+    /// or carrying a not-comprehended IE marked reject (TS 38.413 §10.3.4.2) -- must not
+    /// arm the mobile reachable timer for a CONNECTED UE of the sending gNB. Before, the
+    /// fallback armed every registered UE of the association, so one malformed PDU put
+    /// every connected UE on the gNB on the path to implicit deregistration. An idle,
+    /// unsupervised UE there is still supervised (the reason the fallback exists).
+    ///
+    /// REVERT-VERIFIED: with the fallback's old association-only filter the connected
+    /// UE is armed and this fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unusable_release_complete_never_supervises_a_connected_ue() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let assoc = 98_021u64;
+        let valid = nextgcore_ngap::builder::build_ue_context_release_complete(
+            &nextgcore_ngap::types::UeContextReleaseComplete {
+                amf_ue_ngap_id: 7_802_999,
+                ran_ue_ngap_id: 9,
+            },
+        )
+        .expect("encode");
+        let reject_ie = crate::ngap_asn1::tests::with_unknown_ie(&valid, 9_999, 0x00);
+        for (n, pdu) in [vec![0x20, 0x29, 0x00], reject_ie].into_iter().enumerate() {
+            let (connected, idle) = (7_802_001u64 + 10 * n as u64, 7_802_002u64 + 10 * n as u64);
+            let mut c = UeNasContext::new(connected, 1, assoc, false);
+            c.registered = true;
+            ngap.ue_auth_state.insert(connected, c);
+            let mut i = UeNasContext::new(idle, 2, assoc, false);
+            i.registered = true;
+            i.cm_idle = true;
+            ngap.ue_auth_state.insert(idle, i);
+
+            ngap.handle_ue_context_release_complete(assoc, &pdu)
+                .await
+                .expect("handled");
+
+            let phase = |id| {
+                ngap.ue_auth_state
+                    .get(id)
+                    .and_then(|s| s.reachability)
+                    .map(|r| r.phase)
+            };
+            assert_eq!(
+                phase(connected),
+                None,
+                "case {n}: a CONNECTED UE is not supervised"
+            );
+            assert!(!ngap.ue_auth_state.get(connected).unwrap().is_cm_idle());
+            assert_eq!(
+                phase(idle),
+                Some(ReachabilityPhase::MobileReachable),
+                "case {n}: the idle, unsupervised UE of the association is"
+            );
+            ngap.ue_auth_state.remove(connected);
+            ngap.ue_auth_state.remove(idle);
+        }
     }
 
     /// **#417 stage 4.** A UE Context Release Complete listing its released PDU
