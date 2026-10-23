@@ -357,9 +357,29 @@ static GTPU_PATHS: OnceLock<std::sync::Mutex<HashMap<IpAddr, GtpuPathState>>> = 
 /// list, and the symptom is an assertion about peer B reporting peer A — which reads
 /// as a per-peer bug in the code under test rather than as test interference. `N3` is
 /// worse: it is a process-wide env var, so one test lowering it changes how many
-/// unanswered Echoes another test needs.
+/// unanswered Echoes another test needs. `SGWU_GTPU_ECHO_INTERVAL_SECS` is covered
+/// too: it decides whether an open GTP-U server's probe thread writes the table.
+///
+/// Every test that writes the table holds it, the async `pfcp_path` Node Report
+/// tests included (#827: they held only `SXA_TEST_LOCK`, so their failed peer
+/// showed up in `path_state_is_per_peer`'s whole-table assertion). It is a tokio
+/// mutex so those tests can hold it across `.await`; the sync tests take it with
+/// `blocking_lock()`. Lock order: `SXA_TEST_LOCK` first, then this.
 #[cfg(test)]
-static GTPU_PATH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static GTPU_PATH_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Forgets a test's peer when the test ends, pass or fail, so a later test's
+/// whole-table assertion does not see it (#827). Declare it after taking
+/// [`GTPU_PATH_TEST_LOCK`] so it drops while the lock is still held.
+#[cfg(test)]
+pub(crate) struct ForgetPathOnDrop(pub(crate) IpAddr);
+
+#[cfg(test)]
+impl Drop for ForgetPathOnDrop {
+    fn drop(&mut self) {
+        forget_gtpu_path(self.0);
+    }
+}
 
 fn gtpu_paths() -> &'static std::sync::Mutex<HashMap<IpAddr, GtpuPathState>> {
     GTPU_PATHS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
@@ -1810,9 +1830,7 @@ mod tests {
     /// a path down one probe early.
     #[test]
     fn path_fails_only_after_exceeding_n3_requests() {
-        let _paths = GTPU_PATH_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _paths = GTPU_PATH_TEST_LOCK.blocking_lock();
         let peer = IpAddr::V4(Ipv4Addr::new(10, 61, 0, 1));
         forget_gtpu_path(peer);
         std::env::set_var("SGWU_GTPU_N3_REQUESTS", "3");
@@ -1839,9 +1857,7 @@ mod tests {
     /// discarded Echo Responses entirely, so nothing could ever recover.
     #[test]
     fn echo_response_clears_the_path_failure() {
-        let _paths = GTPU_PATH_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _paths = GTPU_PATH_TEST_LOCK.blocking_lock();
         let peer = IpAddr::V4(Ipv4Addr::new(10, 61, 0, 2));
         forget_gtpu_path(peer);
         std::env::set_var("SGWU_GTPU_N3_REQUESTS", "1");
@@ -1865,9 +1881,7 @@ mod tests {
     /// Paths are tracked per peer: one dead eNB must not mark another down.
     #[test]
     fn path_state_is_per_peer() {
-        let _paths = GTPU_PATH_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _paths = GTPU_PATH_TEST_LOCK.blocking_lock();
         let dead = IpAddr::V4(Ipv4Addr::new(10, 61, 0, 3));
         let alive = IpAddr::V4(Ipv4Addr::new(10, 61, 0, 4));
         forget_gtpu_path(dead);
@@ -1891,6 +1905,7 @@ mod tests {
     /// choice; Section 20.3.1 mandates the detection, not the interval).
     #[test]
     fn echo_interval_is_configurable_and_disablable() {
+        let _paths = GTPU_PATH_TEST_LOCK.blocking_lock();
         std::env::set_var("SGWU_GTPU_ECHO_INTERVAL_SECS", "0");
         assert_eq!(gtpu_echo_interval(), None, "0 disables probing");
         std::env::set_var("SGWU_GTPU_ECHO_INTERVAL_SECS", "5");

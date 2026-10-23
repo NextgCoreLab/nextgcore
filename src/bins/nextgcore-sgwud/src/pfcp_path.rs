@@ -2900,10 +2900,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_failed_gtpu_path_is_reported_once_over_the_wire() {
         let (_guard, node, peer) = node_and_peer().await;
+        // #827 (after SXA_TEST_LOCK, the documented order): this test writes the
+        // process-global GTP-U path table.
+        let _paths = crate::gtp_path::GTPU_PATH_TEST_LOCK.lock().await;
         let _shutdown = associate_and_run(&node, &peer).await;
 
         let failed = IpAddr::V4(Ipv4Addr::new(10, 217, 0, 1));
         crate::gtp_path::forget_gtpu_path(failed);
+        let _forget = crate::gtp_path::ForgetPathOnDrop(failed);
 
         // Four unanswered Echoes EXCEED the default N3-REQUESTS of 3, which is the
         // transition (TS 23.007 §20.3.1).
@@ -2946,10 +2950,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_recovered_gtpu_path_is_reported_with_uprr() {
         let (_guard, node, peer) = node_and_peer().await;
+        // #827 (after SXA_TEST_LOCK, the documented order): this test writes the
+        // process-global GTP-U path table.
+        let _paths = crate::gtp_path::GTPU_PATH_TEST_LOCK.lock().await;
         let _shutdown = associate_and_run(&node, &peer).await;
 
         let path = IpAddr::V4(Ipv4Addr::new(10, 217, 0, 2));
         crate::gtp_path::forget_gtpu_path(path);
+        let _forget = crate::gtp_path::ForgetPathOnDrop(path);
 
         // An answered Echo on a HEALTHY path is not a transition and reports nothing.
         crate::gtp_path::note_echo_answered(path);
@@ -2991,6 +2999,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_path_failure_with_no_associated_peer_reports_to_nobody_and_says_so() {
         let (_guard, node, peer) = node_and_peer().await;
+        // #827 (after SXA_TEST_LOCK, the documented order): this test writes the
+        // process-global GTP-U path table.
+        let _paths = crate::gtp_path::GTPU_PATH_TEST_LOCK.lock().await;
         let (_tx, rx) = tokio::sync::watch::channel(false);
         let pump = node.clone();
         tokio::spawn(async move { pump.run(rx).await });
@@ -3016,6 +3027,7 @@ mod tests {
         );
 
         crate::gtp_path::forget_gtpu_path(failed);
+        let _forget = crate::gtp_path::ForgetPathOnDrop(failed);
         for _ in 0..4 {
             crate::gtp_path::note_echo_unanswered(failed);
         }
