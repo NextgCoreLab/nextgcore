@@ -4792,7 +4792,7 @@ mod tests {
                 target_id: TargetId::TargetEnbId {
                     global_enb_id: GlobalEnbId {
                         plmn_identity: [0x13, 0x00, 0x14],
-                        enb_id: EnbId::Macro(0x731),
+                        enb_id: nextgcore_s1ap::EnbId::Macro(0x731),
                     },
                     selected_tai: nextgcore_s1ap::Tai {
                         plmn_identity: [0x13, 0x00, 0x14],
