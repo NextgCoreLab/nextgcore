@@ -29,6 +29,8 @@ set -euo pipefail
 # environment or docker/rust/.env; a throwaway value is used when neither sets it
 # (the test does not log in to Grafana).
 if [[ -z "${GRAFANA_ADMIN_PASSWORD:-}" ]] && ! grep -qs '^GRAFANA_ADMIN_PASSWORD=' "$(dirname "${BASH_SOURCE[0]}")/.env"; then
+  # Never used to log in, and Grafana is published on 127.0.0.1 only, so a
+  # throwaway value is enough; it only satisfies compose's fail-fast check.
   export GRAFANA_ADMIN_PASSWORD="unused-$RANDOM$RANDOM"
 fi
 

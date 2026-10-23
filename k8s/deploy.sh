@@ -155,6 +155,13 @@ kubectl rollout status deployment/upf -n "${NAMESPACE}" --timeout=120s
 echo ""
 echo "[8/9] Deploying Monitoring Stack (Prometheus, Grafana, Jaeger)"
 kubectl apply -f "${SCRIPT_DIR}/monitoring/prometheus.yaml"
+# Grafana's admin password lives in a Secret, never in a manifest (#837). Create
+# it with a generated value the first time; an existing one is kept.
+if ! kubectl get secret grafana-admin -n "${NAMESPACE}" >/dev/null 2>&1; then
+  kubectl create secret generic grafana-admin -n "${NAMESPACE}" \
+    --from-literal=password="$(openssl rand -base64 24)" >/dev/null
+  echo "  Created Secret grafana-admin with a generated Grafana admin password"
+fi
 kubectl apply -f "${SCRIPT_DIR}/monitoring/grafana.yaml"
 kubectl apply -f "${SCRIPT_DIR}/monitoring/jaeger.yaml"
 
@@ -197,7 +204,7 @@ echo "  kubectl logs -f deployment/ue -n ${NAMESPACE}       # UE logs"
 echo "  kubectl exec deployment/ue -n ${NAMESPACE} -- ping -c 3 10.45.0.1  # Test data plane"
 echo ""
 echo "Monitoring:"
-echo "  Grafana:    http://localhost:3000   (admin; password from Secret grafana-admin, else admin/admin then set one)"
+echo "  Grafana:    http://localhost:3000   (user admin; password: kubectl -n ${NAMESPACE} get secret grafana-admin -o jsonpath='{.data.password}' | base64 -d)"
 echo "  Prometheus: http://localhost:9090"
 echo "  Jaeger:     http://localhost:16686"
 echo ""

@@ -65,16 +65,15 @@ spec:
           env:
             - name: GF_SECURITY_ADMIN_USER
               value: admin
-            # No credential in the manifest (#837 review). Create the Secret
-            # with `kubectl -n nextg-system create secret generic grafana-admin
-            # --from-literal=password=...`; without it Grafana starts with
-            # admin/admin and forces a new password at the first login.
+            # No credential in the manifest (#837 review). The Secret is
+            # required: without it the pod does not start (fail closed), rather
+            # than come up with Grafana's built-in admin/admin. k8s/deploy.sh
+            # creates it with a generated password when it is absent.
             - name: GF_SECURITY_ADMIN_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: grafana-admin
                   key: password
-                  optional: true
           resources:
             requests:
               cpu: 50m
