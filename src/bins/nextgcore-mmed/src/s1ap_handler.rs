@@ -4240,22 +4240,33 @@ pub fn handle_erab_modification_indication(
         enb_ue_s1ap_id: msg.enb_ue_s1ap_id,
         ..Default::default()
     };
-    let mut ebis = Vec::new();
+    // #736: the new endpoints travel in the pending record and reach the
+    // bearer contexts only once the Serving GW accepts them.
+    let mut switched = Vec::new();
     for item in &msg.to_be_modified {
+        let ip = transport_address_to_ip(&item.transport_layer_address);
         match ctx.bearer_find_by_ebi(mme_ue_id, item.erab_id) {
-            Some(bearer_id) => {
-                if let Some(b) = ctx.bearer_pool.write().unwrap().get_mut(&bearer_id) {
-                    b.enb_s1u_teid = item.gtp_teid;
-                    b.enb_s1u_ip = transport_address_to_ip(&item.transport_layer_address);
-                }
-                ebis.push(item.erab_id);
+            Some(_) if item.gtp_teid == 0 || ip.ipv4.is_none() => {
+                // The S11 builder carries IPv4 S1-U F-TEIDs only.
+                confirm.failed.push(nextgcore_s1ap::ErabItem {
+                    erab_id: item.erab_id,
+                    cause: Cause::Transport(
+                        nextgcore_s1ap::CauseTransport::TransportResourceUnavailable,
+                    ),
+                });
             }
+            Some(_) => switched.push(crate::gtp_path::SwitchedBearer {
+                ebi: item.erab_id,
+                teid: item.gtp_teid,
+                ip,
+            }),
             None => confirm.failed.push(nextgcore_s1ap::ErabItem {
                 erab_id: item.erab_id,
                 cause: Cause::RadioNetwork(CauseRadioNetwork::UnknownERabId),
             }),
         }
     }
+    let ebis: Vec<u8> = switched.iter().map(|s| s.ebi).collect();
     confirm.modified = ebis.clone();
     if ebis.is_empty() {
         return erab_modification_confirm_now(enb_id, &confirm, notify);
@@ -4264,10 +4275,10 @@ pub fn handle_erab_modification_indication(
         enb_id,
         confirm: confirm.clone(),
         notify: notify.to_vec(),
+        mme_ue_id,
+        switched,
     };
-    match crate::gtp_path::send_modify_bearer_request_for_erab_modification(
-        ctx, mme_ue_id, &ebis, pending,
-    ) {
+    match crate::gtp_path::send_modify_bearer_request_for_erab_modification(ctx, pending) {
         Ok(seq) => {
             log::info!(
                 "E-RAB Modification Indication: Modify Bearer Request (seq={seq}) for EBIs \
@@ -4320,25 +4331,96 @@ fn erab_modification_confirm_now(
 }
 
 /// The E-RAB MODIFICATION CONFIRM a parked modification gets once the Modify
-/// Bearer Response arrives with GTP `cause` (TS 23.401 §5.4.7 step 5): the
-/// E-RABs as modified on "Request accepted" (16), else all failed.
+/// Bearer Response arrives (TS 23.401 §5.4.7 step 5, TS 36.413 §8.2.4.2).
+///
+/// Each E-RAB is decided by the Serving GW's answer for its bearer (Table
+/// 7.2.8-1, the rule the handover path uses): on Request accepted or accepted
+/// partially, a bearer the SGW accepted is written with its new eNB endpoint
+/// and listed modified, and every other one is listed failed; any other
+/// message cause fails them all. Nothing is written for a failed one (#736),
+/// and nothing is sent when the S1 association is gone.
 pub fn erab_modification_confirm(
+    ctx: &MmeContext,
     pending: crate::gtp_path::PendingErabModification,
-    cause: u8,
+    data: &crate::s11_handler::ModifyBearerResponseData,
 ) -> Option<S1apSend> {
-    let confirm = if cause == crate::s11_build::GtpCause::RequestAccepted as u8 {
-        pending.confirm
+    use crate::s11_build::GtpCause;
+    let accepted_at_all = data.cause == GtpCause::RequestAccepted as u8
+        || data.cause == GtpCause::RequestAcceptedPartially as u8;
+    let (accepted, refused) = if accepted_at_all {
+        crate::handover_switch::split_by_response(&pending.switched, data)
     } else {
         log::warn!(
-            "Modify Bearer Response cause {cause} refused the E-RAB modification; the confirm \
-             lists every E-RAB as failed to modify"
+            "Modify Bearer Response cause {} refused the E-RAB modification; the confirm lists \
+             every E-RAB as failed to modify",
+            data.cause
         );
-        switch_failed(
-            pending.confirm,
-            Cause::Misc(nextgcore_s1ap::CauseMisc::Unspecified),
+        (
+            Vec::new(),
+            pending.switched.iter().map(|s| s.ebi).collect::<Vec<_>>(),
         )
     };
-    erab_modification_confirm_now(pending.enb_id, &confirm, &pending.notify)
+    for s in &accepted {
+        if let Some(bearer_id) = ctx.bearer_find_by_ebi(pending.mme_ue_id, s.ebi) {
+            if let Some(b) = ctx.bearer_pool.write().unwrap().get_mut(&bearer_id) {
+                b.enb_s1u_teid = s.teid;
+                b.enb_s1u_ip = s.ip.clone();
+            }
+        }
+    }
+    let mut confirm = pending.confirm.clone();
+    confirm.modified = accepted.iter().map(|s| s.ebi).collect();
+    for erab_id in refused {
+        confirm.failed.push(nextgcore_s1ap::ErabItem {
+            erab_id,
+            cause: Cause::Transport(nextgcore_s1ap::CauseTransport::TransportResourceUnavailable),
+        });
+    }
+    confirm_on_live_association(ctx, &pending, &confirm)
+}
+
+/// N3 exhaustion of the Modify Bearer Request of an E-RAB modification: the
+/// Serving GW never answered, so nothing was switched. The eNB gets its
+/// E-RAB MODIFICATION CONFIRM with every E-RAB failed (#736, TS 36.413
+/// §8.2.4.2), and no endpoint is written.
+pub fn erab_modification_unanswered(
+    ctx: &MmeContext,
+    pending: crate::gtp_path::PendingErabModification,
+) -> Option<S1apSend> {
+    log::error!(
+        "UE {}: the Serving GW never answered the E-RAB modification's Modify Bearer Request; \
+         confirming every E-RAB as failed",
+        pending.mme_ue_id
+    );
+    let confirm = switch_failed(
+        pending.confirm.clone(),
+        Cause::Transport(nextgcore_s1ap::CauseTransport::TransportResourceUnavailable),
+    );
+    confirm_on_live_association(ctx, &pending, &confirm)
+}
+
+/// Send `confirm` only if the S1 association it answers still serves the UE.
+fn confirm_on_live_association(
+    ctx: &MmeContext,
+    pending: &crate::gtp_path::PendingErabModification,
+    confirm: &crate::s1ap_gen::ErabModificationConfirm,
+) -> Option<S1apSend> {
+    let live = ctx
+        .enb_ue_find_by_mme_ue_s1ap_id(confirm.mme_ue_s1ap_id)
+        .and_then(|id| ctx.enb_ue_find_by_id(id))
+        .is_some_and(|ue| {
+            ue.enb_id == pending.enb_id
+                && ue.enb_ue_s1ap_id == confirm.enb_ue_s1ap_id
+                && ue.mme_ue_id == pending.mme_ue_id
+        });
+    if !live {
+        log::warn!(
+            "UE {}: the S1 association of the E-RAB modification is gone; no confirm sent",
+            pending.mme_ue_id
+        );
+        return None;
+    }
+    erab_modification_confirm_now(pending.enb_id, confirm, &pending.notify)
         .into_iter()
         .next()
 }
