@@ -650,3 +650,123 @@ async fn a_setup_whose_send_fails_hands_the_accept_to_the_next_setup() {
     );
     assert_protected_service_accept(nas_pdu.as_deref().expect("PSI 2's setup carries it"));
 }
+
+// ---------------------------------------------------------------------------
+// #758: an Uplink NAS Transport for an AMF UE NGAP ID never allocated here
+// ---------------------------------------------------------------------------
+
+/// The radio-network causes of the Error Indications in `sent`.
+fn error_indication_causes(sent: Vec<(u64, Vec<u8>)>) -> Vec<Option<u8>> {
+    sent.into_iter()
+        .filter_map(|(_, p)| match decode_sent(&p) {
+            Sent::ErrorIndication {
+                radio_network_cause,
+            } => Some(radio_network_cause),
+            _ => None,
+        })
+        .collect()
+}
+
+fn plain_initial_registration(amf_ue_ngap_id: u64, ran: u32) -> Vec<u8> {
+    uplink_nas_transport(amf_ue_ngap_id, ran, &super::sample_registration_request())
+}
+
+/// #758: a gNB names an AMF UE NGAP ID this AMF never allocated, with a plain
+/// initial Registration Request. No NAS context is created (the ID could later be
+/// allocated to another UE). The AMF answers an Error Indication "Unknown local UE
+/// NGAP ID" (TS 38.413 §10.6), and nothing else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_initial_registration_under_an_unallocated_id_gets_an_error_indication() {
+    let mut server = capturing_ngap_server().await;
+    let invented = 7_758_001u64;
+    server
+        .handle_uplink_nas_transport(ASSOC, &plain_initial_registration(invented, 58))
+        .await
+        .expect("handled");
+    assert!(
+        !server.ue_auth_state.contains(invented),
+        "no context for an invented ID"
+    );
+    let sent = take_sent_ngap(&mut server);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].0, ASSOC);
+    assert_eq!(
+        error_indication_causes(sent),
+        vec![Some(g::CauseRadioNetwork::UNKNOWN_LOCAL_UE_NGAP_ID)]
+    );
+}
+
+/// The ID IS allocated with no context (a Service Request rejected #9), but the
+/// Uplink NAS Transport names another RAN UE NGAP ID. That is "Inconsistent remote
+/// UE NGAP ID", and no context is created. The genuine connection keeps its
+/// allocation and is taken up afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_initial_registration_on_another_connection_than_the_allocation_is_refused() {
+    let mut server = capturing_ngap_server().await;
+    let id = 7_758_002u64;
+    server.forced_amf_ue_ngap_id = Some(id);
+    server
+        .handle_initial_ue_message(
+            ASSOC,
+            &super::service_request_initial_ue(service_request(None)),
+        )
+        .await
+        .expect("rejected #9");
+    take_sent_ngap(&mut server);
+    assert!(!server.ue_auth_state.contains(id));
+
+    // Wrong RAN UE NGAP ID (the allocation is for 512).
+    server
+        .handle_uplink_nas_transport(ASSOC, &plain_initial_registration(id, 513))
+        .await
+        .expect("handled");
+    assert!(!server.ue_auth_state.contains(id));
+    assert_eq!(
+        error_indication_causes(take_sent_ngap(&mut server)),
+        vec![Some(g::CauseRadioNetwork::INCONSISTENT_REMOTE_UE_NGAP_ID)]
+    );
+    // Wrong association.
+    server
+        .handle_uplink_nas_transport(ASSOC + 1, &plain_initial_registration(id, 512))
+        .await
+        .expect("handled");
+    assert!(!server.ue_auth_state.contains(id));
+    assert_eq!(
+        error_indication_causes(take_sent_ngap(&mut server)),
+        vec![Some(g::CauseRadioNetwork::INCONSISTENT_REMOTE_UE_NGAP_ID)]
+    );
+
+    // The genuine connection's registration is taken up, once.
+    let _ = server
+        .handle_uplink_nas_transport(ASSOC, &plain_initial_registration(id, 512))
+        .await;
+    assert!(
+        server.ue_auth_state.contains(id),
+        "the allocated connection registers"
+    );
+    server.ue_auth_state.remove(id);
+    take_sent_ngap(&mut server);
+    let _ = server
+        .handle_uplink_nas_transport(ASSOC, &plain_initial_registration(id, 512))
+        .await;
+    assert!(
+        !server.ue_auth_state.contains(id),
+        "the allocation is consumed: a second context is not minted under it"
+    );
+}
+
+/// A gNB inventing IDs cannot grow the allocation record without bound: it is
+/// capped, oldest first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_contextless_allocation_record_is_bounded() {
+    let mut server = capturing_ngap_server().await;
+    for i in 0..(MAX_CONTEXTLESS_UE_IDS as u64 + 10) {
+        server.remember_contextless_ue_id(ASSOC, 9_000_000 + i, 1);
+    }
+    assert_eq!(server.contextless_ue_ids.len(), MAX_CONTEXTLESS_UE_IDS);
+    assert_eq!(
+        server.take_contextless_ue_id(ASSOC, 9_000_000, 1),
+        ContextlessLookup::Unknown,
+        "the oldest went first"
+    );
+}
