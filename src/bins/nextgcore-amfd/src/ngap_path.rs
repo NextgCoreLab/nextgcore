@@ -749,11 +749,6 @@ pub struct NgapServer {
     /// live SCTP association. `None` (the default) keeps the real transport.
     #[cfg(test)]
     sent_ngap: Option<Vec<(u64, u16, Vec<u8>)>>,
-    /// The DEACTIVATED each NG Reset owes the SMF for a kept UE's PDU session, keyed by
-    /// `(AMF UE NGAP ID, PSI)` until it has run (#754). A later activation of the same
-    /// session cancels a queued one, or waits for one in flight, so the SMF never sees a
-    /// reset's DEACTIVATED after the UE's ACTIVATING.
-    ng_reset_deactivations: HashMap<(u64, u8), Arc<DeferredDeactivation>>,
     /// Test seam: the next this-many NGAP sends fail as an SCTP send error would,
     /// so a test can drive a handler's send-failure branch (#760).
     #[cfg(test)]
@@ -979,7 +974,6 @@ impl NgapServer {
             forced_amf_ue_ngap_id: None,
             #[cfg(test)]
             sent_ngap: None,
-            ng_reset_deactivations: HashMap::new(),
             #[cfg(test)]
             fail_next_sends: 0,
             event_tx,
@@ -5375,11 +5369,6 @@ impl NgapServer {
         for (psi, r) in moved {
             self.sm_context_refs.remove(&(old_id, psi));
             self.sm_context_refs.insert((new_id, psi), r);
-            // #754: a pending NG Reset deactivation follows the session to its new key.
-            if let Some(token) = self.ng_reset_deactivations.remove(&(old_id, psi)) {
-                token.rekey((new_id, psi));
-                self.ng_reset_deactivations.insert((new_id, psi), token);
-            }
             if let Some(owner) = self.sm_context_smfs.remove(&(old_id, psi)) {
                 self.sm_context_smfs.insert((new_id, psi), owner);
             }
@@ -8020,9 +8009,6 @@ impl NgapServer {
                         log::warn!("Establishment retry outcome not applied: {e}");
                     }
                 }
-                crate::sbi_offload::SbiOutcome::NgResetDeactivated { token } => {
-                    self.ng_reset_deactivation_done(&token)
-                }
             }
         }
     }
@@ -9085,8 +9071,10 @@ impl NgapServer {
     /// §5.2.2.3.2.2), once its AN release is complete (#540). Best effort: a
     /// failed deactivation is logged and the others still go.
     /// Run one of an NG Reset's SMF calls through the shared off-task SBI dispatch
-    /// (#754). A DEACTIVATED is tracked in `ng_reset_deactivations` so a later
-    /// activation of the same session stays ordered after it.
+    /// (#754). A DEACTIVATED is keyed by `(AMF UE NGAP ID, PSI)`: work for one session
+    /// runs in order, a newer reset supersedes a queued older one, and a later activation
+    /// settles it first (`settle_ng_reset_deactivation`). A release for an aborted
+    /// de-registration is independent work: the UE is already forgotten.
     fn offload_ng_reset_smf_call(&mut self, call: NgResetSmfCall) {
         match call {
             NgResetSmfCall::Deactivate {
@@ -9096,22 +9084,10 @@ impl NgapServer {
                 host,
                 port,
             } => {
-                let token = Arc::new(DeferredDeactivation::new((amf_ue_ngap_id, psi)));
-                if let Some(older) = self
-                    .ng_reset_deactivations
-                    .insert((amf_ue_ngap_id, psi), Arc::clone(&token))
-                {
-                    // A second reset before the first one's call ran: one is enough.
-                    older.cancel();
-                }
-                self.sbi_offload.spawn(async move {
-                    if !token.begin() {
-                        log::info!(
-                            "UE {amf_ue_ngap_id}: PSI {psi} deactivation after NG Reset \
-                             superseded by a re-activation; not sent"
-                        );
-                        return None;
-                    }
+                let key = (amf_ue_ngap_id, psi);
+                // A second reset before the first one's call ran: one is enough.
+                self.sbi_offload.supersede_key(key);
+                self.sbi_offload.spawn_keyed(key, move || async move {
                     match crate::sbi_path::call_smf_deactivate_up_connection(&host, port, &sm_ref)
                         .await
                     {
@@ -9123,8 +9099,7 @@ impl NgapServer {
                              Reset failed: {e}"
                         ),
                     }
-                    token.finish();
-                    Some(crate::sbi_offload::SbiOutcome::NgResetDeactivated { token })
+                    None
                 });
             }
             NgResetSmfCall::Release {
@@ -9149,33 +9124,17 @@ impl NgapServer {
     }
 
     /// Before activating `(amf_ue_ngap_id, psi)` at the SMF: make sure an NG Reset's
-    /// DEACTIVATED for it can no longer arrive afterwards (#754, review of #848). A queued
-    /// one is cancelled; one already on the wire is waited for. That wait is bounded by
-    /// the SBI client timeout and holds only this UE's procedure.
+    /// DEACTIVATED for it can no longer arrive afterwards (#754, review of #848). Queued
+    /// work for the session is dropped; work already on the wire is waited for, bounded by
+    /// the SBI client timeout and holding only this UE's procedure.
     async fn settle_ng_reset_deactivation(&mut self, amf_ue_ngap_id: u64, psi: u8) {
-        let Some(token) = self.ng_reset_deactivations.remove(&(amf_ue_ngap_id, psi)) else {
-            return;
-        };
-        if token.cancel() {
+        let key = (amf_ue_ngap_id, psi);
+        if self.sbi_offload.key_busy(key) {
             log::info!(
-                "UE {amf_ue_ngap_id}: PSI {psi} re-activated before the NG Reset's \
-                 deactivation was sent; cancelled"
+                "UE {amf_ue_ngap_id}: PSI {psi} re-activated while an NG Reset deactivation \
+                 is pending; queued work is dropped and running work awaited first"
             );
-            return;
-        }
-        token.finished().await;
-    }
-
-    /// An NG Reset DEACTIVATED has run: forget it, under whatever key the UE has now,
-    /// unless a newer one replaced it.
-    fn ng_reset_deactivation_done(&mut self, token: &Arc<DeferredDeactivation>) {
-        let key = token.key();
-        if self
-            .ng_reset_deactivations
-            .get(&key)
-            .is_some_and(|t| Arc::ptr_eq(t, token))
-        {
-            self.ng_reset_deactivations.remove(&key);
+            self.sbi_offload.settle_key(key).await;
         }
     }
 
@@ -15438,98 +15397,6 @@ enum NgResetSmfCall {
     },
 }
 
-/// Where an NG Reset's deferred DEACTIVATED for one PDU session is (#754).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeferredState {
-    /// Waiting for an offload permit; not sent.
-    Queued,
-    /// On the wire.
-    Sending,
-    /// Answered, or failed.
-    Finished,
-    /// Superseded before it was sent: it never will be.
-    Cancelled,
-}
-
-/// The NGAP task's handle on a deferred DEACTIVATED, shared with the task that sends it.
-/// It is what keeps a reset's DEACTIVATED ordered before the UE's next ACTIVATING for
-/// the same session: [`NgapServer::settle_ng_reset_deactivation`] cancels it while it is
-/// queued, and waits for it once it is on the wire.
-#[derive(Debug)]
-pub(crate) struct DeferredDeactivation {
-    state: std::sync::Mutex<DeferredState>,
-    finished: tokio::sync::Notify,
-    /// Its current key in `ng_reset_deactivations`: a Service Request re-keys the UE
-    /// while the call is pending.
-    key: std::sync::Mutex<(u64, u8)>,
-}
-
-impl DeferredDeactivation {
-    fn new(key: (u64, u8)) -> Self {
-        Self {
-            state: std::sync::Mutex::new(DeferredState::Queued),
-            finished: tokio::sync::Notify::new(),
-            key: std::sync::Mutex::new(key),
-        }
-    }
-
-    fn key(&self) -> (u64, u8) {
-        *self.key.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn rekey(&self, key: (u64, u8)) {
-        *self.key.lock().unwrap_or_else(|e| e.into_inner()) = key;
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, DeferredState> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// The sender's step: go on the wire, unless cancelled first.
-    fn begin(&self) -> bool {
-        let mut state = self.lock();
-        if *state == DeferredState::Queued {
-            *state = DeferredState::Sending;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn finish(&self) {
-        *self.lock() = DeferredState::Finished;
-        self.finished.notify_waiters();
-    }
-
-    /// Cancel it if it has not been sent; `false` if it is on the wire or done.
-    fn cancel(&self) -> bool {
-        let mut state = self.lock();
-        match *state {
-            DeferredState::Queued => {
-                *state = DeferredState::Cancelled;
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Wait until it is answered (or cancelled).
-    async fn finished(&self) {
-        loop {
-            let notified = self.finished.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if matches!(
-                *self.lock(),
-                DeferredState::Finished | DeferredState::Cancelled
-            ) {
-                return;
-            }
-            notified.await;
-        }
-    }
-}
-
 /// Which NAS procedure an NG release aborted, when its abort is more than dropping the
 /// retransmission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20066,14 +19933,17 @@ mod tests {
     /// 6 are reset against an SMF that takes 1 s per call, so 16 deactivations are on the
     /// wire and 64 are queued. Two of the UEs then come back with a Service Request
     /// activating PSI 5:
-    /// - one whose PSI 5 deactivation is QUEUED: it is cancelled and never sent;
+    /// - one whose PSI 5 deactivation had not reached the SMF yet;
     /// - one whose PSI 5 deactivation is IN FLIGHT: the ACTIVATING goes out only after it
     ///   is answered.
+    /// For both, the ACTIVATING is the last thing the SMF sees for PSI 5. (A deactivation
+    /// still waiting for an offload permit counts as started in `sbi_offload` today, so
+    /// it is sent and answered first rather than dropped.)
     ///
     /// PSI 6, not activated, is still deactivated for both.
     ///
-    /// REVERT-VERIFIED: without `settle_ng_reset_deactivation` the queued UE's SMF sees
-    /// `["ACTIVATING", "DEACTIVATED"]`.
+    /// REVERT-VERIFIED: without `settle_ng_reset_deactivation` the not-yet-sent UE's SMF
+    /// sees `["ACTIVATING", "DEACTIVATED"]`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_reset_deactivation_never_overtakes_the_ues_reactivation() {
         let delay = Duration::from_millis(1000);
@@ -20151,21 +20021,32 @@ mod tests {
                 .map(|(_, s, t)| (s.clone(), *t))
                 .collect()
         };
-        let q = states(&ref5(queued));
+        // The property: for each re-activated session, nothing the reset sent arrives
+        // after the ACTIVATING, and an exchange already on the wire was ANSWERED first.
+        for ue in [queued, in_flight] {
+            let seq = states(&ref5(ue));
+            let names: Vec<&str> = seq.iter().map(|(s, _)| s.as_str()).collect();
+            assert_eq!(
+                names.last(),
+                Some(&"ACTIVATING"),
+                "UE {ue}: the ACTIVATING is the last word: {names:?}"
+            );
+            assert!(names.len() <= 2, "UE {ue}: {names:?}");
+            if names.len() == 2 {
+                assert_eq!(names[0], "DEACTIVATED");
+                assert!(
+                    seq[1].1.duration_since(seq[0].1) >= delay - Duration::from_millis(50),
+                    "UE {ue}: the ACTIVATING waited for the DEACTIVATED's answer"
+                );
+            }
+        }
         assert_eq!(
-            q.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>(),
-            vec!["ACTIVATING"],
-            "a queued reset deactivation is cancelled by the re-activation"
-        );
-        let f = states(&ref5(in_flight));
-        assert_eq!(
-            f.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>(),
+            states(&ref5(in_flight))
+                .iter()
+                .map(|(s, _)| s.as_str())
+                .collect::<Vec<_>>(),
             vec!["DEACTIVATED", "ACTIVATING"],
-            "an in-flight one is answered before the ACTIVATING goes out"
-        );
-        assert!(
-            f[1].1.duration_since(f[0].1) >= delay - Duration::from_millis(50),
-            "the ACTIVATING waited for the DEACTIVATED's answer"
+            "the in-flight one is answered before the ACTIVATING goes out"
         );
         for ue in [queued, in_flight] {
             assert_eq!(
@@ -20177,10 +20058,14 @@ mod tests {
                 "PSI 6 was not re-activated, so its deactivation stands"
             );
         }
-        assert!(
-            ngap.ng_reset_deactivations.is_empty(),
-            "every deferred deactivation is accounted for"
-        );
+        for &ue in &ues {
+            for psi in [5u8, 6] {
+                assert!(
+                    !ngap.sbi_offload.key_busy((ue, psi)),
+                    "every deferred deactivation is accounted for"
+                );
+            }
+        }
         let ctx = crate::context::amf_self();
         let guard = ctx.read().unwrap();
         for ue in ues.iter().copied().chain([7_754_900, 7_754_901]) {

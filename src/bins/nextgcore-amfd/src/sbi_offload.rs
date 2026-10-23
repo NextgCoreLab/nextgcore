@@ -40,10 +40,6 @@ use tokio::task::JoinHandle;
 pub(crate) enum SbiOutcome {
     /// #796: a re-selection attempt for a waiting PDU Session Establishment.
     Establishment(crate::ngap_path::EstablishmentAttempt),
-    /// #754: an NG Reset's deferred DEACTIVATED for one PDU session has run.
-    NgResetDeactivated {
-        token: std::sync::Arc<crate::ngap_path::DeferredDeactivation>,
-    },
 }
 
 /// What keyed work is serialised on: (AMF UE NGAP ID, PDU session ID).
