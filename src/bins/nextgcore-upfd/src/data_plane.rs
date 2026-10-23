@@ -1461,12 +1461,15 @@ impl DataPlaneUrr {
         let already_exhausted = self.quota_exhausted.load(Ordering::Relaxed);
 
         let (directional, dir_threshold, dir_quota) = if is_uplink {
-            let ul = self.acc_ul_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
-            self.acc_ul_pkts.fetch_add(1, Ordering::Relaxed);
+            // AcqRel (#771): pairs with `take_usage`'s Acquire swap, so a harvest that
+            // takes this packet also sees the total-counter add sequenced before it,
+            // and its `fetch_sub` on the total can never run ahead of that add.
+            let ul = self.acc_ul_bytes.fetch_add(bytes, Ordering::AcqRel) + bytes;
+            self.acc_ul_pkts.fetch_add(1, Ordering::AcqRel);
             (ul, self.volume_threshold_ul(), self.volume_quota_ul())
         } else {
-            let dl = self.acc_dl_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
-            self.acc_dl_pkts.fetch_add(1, Ordering::Relaxed);
+            let dl = self.acc_dl_bytes.fetch_add(bytes, Ordering::AcqRel) + bytes;
+            self.acc_dl_pkts.fetch_add(1, Ordering::AcqRel);
             (dl, self.volume_threshold_dl(), self.volume_quota_dl())
         };
 
@@ -1535,17 +1538,71 @@ impl DataPlaneUrr {
         outcome
     }
 
-    /// Reset counters after generating a report
-    pub fn reset_counters(&self) {
-        self.acc_total_bytes.store(0, Ordering::Relaxed);
-        self.acc_ul_bytes.store(0, Ordering::Relaxed);
-        self.acc_dl_bytes.store(0, Ordering::Relaxed);
-        self.acc_total_pkts.store(0, Ordering::Relaxed);
-        self.acc_ul_pkts.store(0, Ordering::Relaxed);
-        self.acc_dl_pkts.store(0, Ordering::Relaxed);
+    /// Take this URR's usage for a report and restart its measurement, atomically
+    /// with respect to concurrent [`Self::record`] calls (#771, TS 29.244 §5.2.2.3.1:
+    /// "reset its ongoing measurement counts ... report ... the usage since the last
+    /// usage report").
+    ///
+    /// Each per-direction counter is taken with ONE `swap(0)`, so a packet recorded
+    /// concurrently lands either in this report or in the next one -- never in
+    /// neither (the old load-then-`store(0)` dropped it) and never in both. The
+    /// report's total is `ul + dl` of what was taken, so the Volume Measurement IE is
+    /// internally consistent by construction (§8.2.44), and exactly that amount is
+    /// subtracted from the running totals that drive the threshold/quota checks,
+    /// rather than zeroing them and discarding a racing packet's share.
+    ///
+    /// A packet's bytes and its packet count are separate counters, so a packet that
+    /// races the swap can have its bytes in one report and its count in the next;
+    /// both are still counted exactly once.
+    ///
+    /// The flag and timestamps are reset BEFORE the counters are taken: a threshold
+    /// crossed by a packet recorded after the swap re-sets `threshold_exceeded` and
+    /// is reported next time, instead of being cleared by this reset.
+    pub fn take_usage(&self) -> UrrUsage {
+        self.threshold_exceeded.store(false, Ordering::SeqCst);
         *self.first_pkt_time.write().unwrap() = None;
         *self.last_report_time.write().unwrap() = Some(std::time::Instant::now());
-        self.threshold_exceeded.store(false, Ordering::Relaxed);
+        let usage = UrrUsage {
+            ul_bytes: self.acc_ul_bytes.swap(0, Ordering::AcqRel),
+            dl_bytes: self.acc_dl_bytes.swap(0, Ordering::AcqRel),
+            ul_pkts: self.acc_ul_pkts.swap(0, Ordering::AcqRel),
+            dl_pkts: self.acc_dl_pkts.swap(0, Ordering::AcqRel),
+        };
+        self.acc_total_bytes
+            .fetch_sub(usage.total_bytes(), Ordering::AcqRel);
+        self.acc_total_pkts
+            .fetch_sub(usage.total_pkts(), Ordering::AcqRel);
+        usage
+    }
+
+    /// A non-resetting read of the usage counted since the last report.
+    pub fn usage(&self) -> UrrUsage {
+        UrrUsage {
+            ul_bytes: self.acc_ul_bytes.load(Ordering::Acquire),
+            dl_bytes: self.acc_dl_bytes.load(Ordering::Acquire),
+            ul_pkts: self.acc_ul_pkts.load(Ordering::Acquire),
+            dl_pkts: self.acc_dl_pkts.load(Ordering::Acquire),
+        }
+    }
+
+    /// Put back usage that was taken for a report which was never delivered (#780
+    /// review m2), so it is carried by the next report instead of being lost.
+    pub fn restore_usage(&self, usage: &UrrUsage) {
+        self.acc_total_bytes
+            .fetch_add(usage.total_bytes(), Ordering::AcqRel);
+        self.acc_total_pkts
+            .fetch_add(usage.total_pkts(), Ordering::AcqRel);
+        self.acc_ul_bytes
+            .fetch_add(usage.ul_bytes, Ordering::AcqRel);
+        self.acc_dl_bytes
+            .fetch_add(usage.dl_bytes, Ordering::AcqRel);
+        self.acc_ul_pkts.fetch_add(usage.ul_pkts, Ordering::AcqRel);
+        self.acc_dl_pkts.fetch_add(usage.dl_pkts, Ordering::AcqRel);
+    }
+
+    /// Reset counters after generating a report, discarding the usage.
+    pub fn reset_counters(&self) {
+        let _ = self.take_usage();
         // #80: the exhaustion latch DELIBERATELY SURVIVES a counter reset.
         //
         // This function runs every time a usage report is harvested, including the
@@ -3442,96 +3499,99 @@ impl DataPlane {
         let session = seid_map.get(&upf_seid)?;
         let urrs = session.urrs.read().unwrap();
         let urr = urrs.get(&urr_id)?;
-        Some(UrrReportEntry {
-            upf_seid: session.upf_seid,
-            smf_seid: session.smf_seid,
+        Some(UrrReportEntry::new(
+            session,
             urr_id,
-            ur_seqn: urr.next_ur_seqn(),
-            total_bytes: urr.acc_total_bytes.load(Ordering::Relaxed),
-            ul_bytes: urr.acc_ul_bytes.load(Ordering::Relaxed),
-            dl_bytes: urr.acc_dl_bytes.load(Ordering::Relaxed),
-            total_pkts: urr.acc_total_pkts.load(Ordering::Relaxed),
-            ul_pkts: urr.acc_ul_pkts.load(Ordering::Relaxed),
-            dl_pkts: urr.acc_dl_pkts.load(Ordering::Relaxed),
-            trigger: urr.report_reason(),
-        })
+            urr.next_ur_seqn(),
+            urr.usage(),
+            urr.report_reason(),
+        ))
     }
 
-    /// Check all sessions for URR threshold exceedances.
-    /// Returns a list of (upf_seid, smf_seid, urr_id, total_bytes, ul_bytes, dl_bytes, total_pkts)
-    /// for each URR that has a threshold exceeded. Resets counters after collection.
+    /// Harvest the usage reports that are due: every URR whose threshold/quota was
+    /// crossed, and every URR whose Measurement Period has elapsed with usage counted.
+    /// Each report's usage is TAKEN from its URR atomically ([`DataPlaneUrr::take_usage`],
+    /// #771), so traffic racing the harvest is neither lost nor counted twice.
+    ///
+    /// No lock is held while the URRs are examined (#780 review m1): the session and
+    /// URR `Arc`s are snapshotted and every map guard is released first, so a slow
+    /// harvest can never stall Session Establishment, the forwarding path or
+    /// `/metrics` behind `seid_map` again -- which is how #724's hang spread.
     pub fn collect_urr_reports(&self) -> Vec<UrrReportEntry> {
+        let sessions: Vec<Arc<DataPlaneSession>> = self
+            .sessions
+            .seid_map
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+
         let mut reports = Vec::new();
-        let seid_map = self.sessions.seid_map.read().unwrap();
-
-        for session in seid_map.values() {
-            let urrs = session.urrs.read().unwrap();
-            for (urr_id, urr) in urrs.iter() {
-                if urr.threshold_exceeded.load(Ordering::Relaxed) {
-                    let entry = UrrReportEntry {
-                        upf_seid: session.upf_seid,
-                        smf_seid: session.smf_seid,
-                        urr_id: *urr_id,
-                        ur_seqn: urr.next_ur_seqn(),
-                        total_bytes: urr.acc_total_bytes.load(Ordering::Relaxed),
-                        ul_bytes: urr.acc_ul_bytes.load(Ordering::Relaxed),
-                        dl_bytes: urr.acc_dl_bytes.load(Ordering::Relaxed),
-                        total_pkts: urr.acc_total_pkts.load(Ordering::Relaxed),
-                        ul_pkts: urr.acc_ul_pkts.load(Ordering::Relaxed),
-                        dl_pkts: urr.acc_dl_pkts.load(Ordering::Relaxed),
-                        // #80: the report says why it exists. An exhausted quota is
-                        // reported as a QUOTA report, not as a threshold report -- that
-                        // distinction is what tells the CP function the subscriber is
-                        // currently being DROPPED rather than merely approaching a limit.
-                        trigger: urr.report_reason(),
-                    };
-                    urr.reset_counters();
-                    reports.push(entry);
-                }
-            }
-
-            // Also check time-based thresholds (measurement period)
-            for (urr_id, urr) in urrs.iter() {
-                if !urr.threshold_exceeded.load(Ordering::Relaxed) {
-                    if let Some(period) = urr.measurement_period_secs() {
-                        // #724: COPY the instant out; never bind the guard. The guard
-                        // used to live to the end of this block, and `reset_counters`
-                        // below takes `last_report_time.write()` -- std's RwLock is not
-                        // re-entrant, so the harvest parked on its own read guard
-                        // forever while still holding `seid_map.read()`, which then
-                        // hung every Session Establishment, the stats loop and /metrics.
-                        if let Some(last) = urr.last_report_time() {
-                            if last.elapsed().as_secs() >= period as u64 {
-                                let total = urr.acc_total_bytes.load(Ordering::Relaxed);
-                                if total > 0 {
-                                    let entry = UrrReportEntry {
-                                        upf_seid: session.upf_seid,
-                                        smf_seid: session.smf_seid,
-                                        urr_id: *urr_id,
-                                        ur_seqn: urr.next_ur_seqn(),
-                                        total_bytes: total,
-                                        ul_bytes: urr.acc_ul_bytes.load(Ordering::Relaxed),
-                                        dl_bytes: urr.acc_dl_bytes.load(Ordering::Relaxed),
-                                        total_pkts: urr.acc_total_pkts.load(Ordering::Relaxed),
-                                        ul_pkts: urr.acc_ul_pkts.load(Ordering::Relaxed),
-                                        dl_pkts: urr.acc_dl_pkts.load(Ordering::Relaxed),
-                                        // #80: PERIO, because that is what this arm is.
-                                        // It used to go out labelled VOLTH -- a
-                                        // pre-existing wire defect, reachable since
-                                        // #306 made periodic reports fire at all.
-                                        trigger: UrrReportReason::Periodic,
-                                    };
-                                    urr.reset_counters();
-                                    reports.push(entry);
-                                }
-                            }
-                        }
-                    }
-                }
+        for session in sessions {
+            let urrs: Vec<(u32, Arc<DataPlaneUrr>)> = session
+                .urrs
+                .read()
+                .unwrap()
+                .iter()
+                .map(|(id, urr)| (*id, Arc::clone(urr)))
+                .collect();
+            for (urr_id, urr) in urrs {
+                // #80: the report says why it exists. An exhausted quota is reported as
+                // a QUOTA report, not as a threshold report -- that distinction is what
+                // tells the CP function the subscriber is currently being DROPPED
+                // rather than merely approaching a limit.
+                let trigger = if urr.threshold_exceeded.load(Ordering::SeqCst) {
+                    urr.report_reason()
+                } else if urr.measurement_period_secs().is_some_and(|period| {
+                    // #724: the instant is COPIED out (`last_report_time()` returns the
+                    // value), so no guard on it is alive across `take_usage`, which
+                    // writes it -- std's RwLock is not re-entrant, and holding it here
+                    // parked the harvest forever.
+                    urr.last_report_time()
+                        .is_some_and(|last| last.elapsed().as_secs() >= period as u64)
+                }) && urr.acc_total_bytes.load(Ordering::Acquire) > 0
+                {
+                    // #80: PERIO, because that is what this arm is.
+                    UrrReportReason::Periodic
+                } else {
+                    continue;
+                };
+                let usage = urr.take_usage();
+                reports.push(UrrReportEntry::new(
+                    &session,
+                    urr_id,
+                    urr.next_ur_seqn(),
+                    usage,
+                    trigger,
+                ));
             }
         }
 
         reports
+    }
+
+    /// Return the usage of reports that could not be delivered to their URRs, so
+    /// the next report carries it (#780 review m2). A URR that has since been
+    /// removed is skipped: its usage left with the rule's own final report.
+    pub fn restore_urr_usage(&self, reports: &[UrrReportEntry]) {
+        for r in reports {
+            let Some(session) = self.sessions.find_by_seid(r.upf_seid) else {
+                continue;
+            };
+            let urr = session.urrs.read().unwrap().get(&r.urr_id).cloned();
+            if let Some(urr) = urr {
+                urr.restore_usage(&r.usage());
+                log::warn!(
+                    "URR {} on SEID {:#x}: report UR-SEQN {} was not delivered; its {}B \
+                     will be carried by the next report",
+                    r.urr_id,
+                    r.upf_seid,
+                    r.ur_seqn,
+                    r.total_bytes
+                );
+            }
+        }
     }
 
     /// GTP-U N3 path management periodic task (upfd-04).
@@ -3629,6 +3689,26 @@ impl DataPlane {
     }
 }
 
+/// The usage taken from a URR for one report (#771): per-direction volumes and
+/// packet counts, with the totals DERIVED so they cannot disagree with them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UrrUsage {
+    pub ul_bytes: u64,
+    pub dl_bytes: u64,
+    pub ul_pkts: u64,
+    pub dl_pkts: u64,
+}
+
+impl UrrUsage {
+    pub fn total_bytes(&self) -> u64 {
+        self.ul_bytes + self.dl_bytes
+    }
+
+    pub fn total_pkts(&self) -> u64 {
+        self.ul_pkts + self.dl_pkts
+    }
+}
+
 /// Entry for a URR usage report that needs to be sent as Session Report Request
 #[derive(Debug, Clone)]
 pub struct UrrReportEntry {
@@ -3653,6 +3733,41 @@ pub struct UrrReportEntry {
     /// function reading the trigger to decide whether to top a subscriber up was being
     /// told the wrong thing.
     pub trigger: UrrReportReason,
+}
+
+impl UrrReportEntry {
+    /// A report carrying `usage` taken from URR `urr_id` of `session`.
+    pub fn new(
+        session: &DataPlaneSession,
+        urr_id: u32,
+        ur_seqn: u32,
+        usage: UrrUsage,
+        trigger: UrrReportReason,
+    ) -> Self {
+        Self {
+            upf_seid: session.upf_seid,
+            smf_seid: session.smf_seid,
+            urr_id,
+            ur_seqn,
+            total_bytes: usage.total_bytes(),
+            ul_bytes: usage.ul_bytes,
+            dl_bytes: usage.dl_bytes,
+            total_pkts: usage.total_pkts(),
+            ul_pkts: usage.ul_pkts,
+            dl_pkts: usage.dl_pkts,
+            trigger,
+        }
+    }
+
+    /// The per-direction usage this report carries.
+    pub fn usage(&self) -> UrrUsage {
+        UrrUsage {
+            ul_bytes: self.ul_bytes,
+            dl_bytes: self.dl_bytes,
+            ul_pkts: self.ul_pkts,
+            dl_pkts: self.dl_pkts,
+        }
+    }
 }
 
 /// Why a usage report was generated (TS 29.244 §8.2.19) — #80.
@@ -5474,6 +5589,189 @@ mod tests {
             UrrReportReason::TimeQuota,
             "a time-quota exhaustion is reported as TIMQU, not as a volume trigger"
         );
+    }
+
+    /// #771: a harvest racing live traffic neither loses nor double-counts usage, and
+    /// every report's Volume Measurement is internally consistent (ul + dl == total).
+    ///
+    /// One thread records a known volume as fast as it can into two URRs on one
+    /// session, as `record_urrs` does for a PDR with two rules: URR 1 has a 1-byte
+    /// volume threshold, so the THRESHOLD arm fires on every harvest; URR 2 has only a
+    /// Measurement Period, back-dated before every harvest, so the PERIO arm fires on
+    /// every harvest. Another thread harvests continuously. Conservation is then
+    /// checked exactly per URR: everything recorded is in a report or still counted.
+    ///
+    /// On the old load-then-`store(0)` harvest this lost tens of kilobytes per run.
+    /// Both threads run under a deadline.
+    #[test]
+    fn a_harvest_racing_traffic_neither_loses_nor_double_counts_usage() {
+        let dp = Arc::new(DataPlane::new(Arc::new(AtomicBool::new(false))));
+        dp.add_session_from_pfcp(
+            0x771,
+            0x1771,
+            Ipv4Addr::new(10, 45, 7, 71),
+            0x7711,
+            0x7712,
+            "127.0.0.1:2152".parse().unwrap(),
+            Some(5),
+            Some(9),
+        );
+        let session = dp.sessions.find_by_seid(0x771).expect("session");
+        let threshold_urr = Arc::new(DataPlaneUrr::new(1));
+        threshold_urr.set_reporting(Some(1), None, None, None, None);
+        let periodic_urr = Arc::new(DataPlaneUrr::new(2));
+        periodic_urr.set_reporting(None, None, None, None, Some(1));
+        {
+            let mut urrs = session.urrs.write().unwrap();
+            urrs.insert(1, Arc::clone(&threshold_urr));
+            urrs.insert(2, Arc::clone(&periodic_urr));
+        }
+
+        const PACKETS: u64 = 200_000;
+        let recorder = {
+            let session = Arc::clone(&session);
+            on_thread("recorder", move || {
+                let (mut ul, mut dl) = (0u64, 0u64);
+                for i in 0..PACKETS {
+                    let bytes = 40 + (i % 1400);
+                    let uplink = i % 2 == 0;
+                    session.record_urrs(&[1, 2], bytes, uplink);
+                    if uplink {
+                        ul += bytes;
+                    } else {
+                        dl += bytes;
+                    }
+                }
+                (ul, dl)
+            })
+        };
+        let done = Arc::new(AtomicBool::new(false));
+        let harvester = {
+            let (dp, urr, done) = (
+                Arc::clone(&dp),
+                Arc::clone(&periodic_urr),
+                Arc::clone(&done),
+            );
+            on_thread("harvester", move || {
+                let mut reports = Vec::new();
+                loop {
+                    // Read BEFORE the harvest so the final pass runs after the
+                    // recorder finished and every pass is a real race until then.
+                    let last = done.load(Ordering::SeqCst);
+                    *urr.last_report_time.write().unwrap() =
+                        Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
+                    reports.extend(dp.collect_urr_reports());
+                    if last {
+                        break reports;
+                    }
+                }
+            })
+        };
+        let deadline = std::time::Duration::from_secs(30);
+        let (ul_sent, dl_sent) = recorder
+            .recv_timeout(deadline)
+            .expect("the recorder must finish");
+        done.store(true, Ordering::SeqCst);
+        let reports = harvester
+            .recv_timeout(deadline)
+            .expect("the harvester must finish");
+
+        for (urr_id, urr, trigger) in [
+            (1, &threshold_urr, UrrReportReason::VolumeThreshold),
+            (2, &periodic_urr, UrrReportReason::Periodic),
+        ] {
+            let mine: Vec<&UrrReportEntry> =
+                reports.iter().filter(|r| r.urr_id == urr_id).collect();
+            assert!(
+                mine.len() > 10,
+                "URR {urr_id}: the race was exercised: {}",
+                mine.len()
+            );
+            assert!(
+                mine.iter().all(|r| r.trigger == trigger),
+                "URR {urr_id}: {trigger:?}"
+            );
+            let inconsistent = mine
+                .iter()
+                .filter(|r| {
+                    r.ul_bytes + r.dl_bytes != r.total_bytes
+                        || r.ul_pkts + r.dl_pkts != r.total_pkts
+                })
+                .count();
+            assert_eq!(
+                inconsistent, 0,
+                "URR {urr_id}: every report has ul + dl == total"
+            );
+
+            let residual = urr.usage();
+            let sum = |f: fn(&UrrReportEntry) -> u64| mine.iter().map(|r| f(r)).sum::<u64>();
+            assert_eq!(
+                sum(|r| r.ul_bytes) + residual.ul_bytes,
+                ul_sent,
+                "URR {urr_id}: UL bytes"
+            );
+            assert_eq!(
+                sum(|r| r.dl_bytes) + residual.dl_bytes,
+                dl_sent,
+                "URR {urr_id}: DL bytes"
+            );
+            assert_eq!(
+                sum(|r| r.total_pkts) + residual.total_pkts(),
+                PACKETS,
+                "URR {urr_id}: packets"
+            );
+            // The running totals that drive thresholds/quotas agree with the residual.
+            assert_eq!(
+                urr.acc_total_bytes.load(Ordering::SeqCst),
+                residual.total_bytes()
+            );
+            assert_eq!(
+                urr.acc_total_pkts.load(Ordering::SeqCst),
+                residual.total_pkts()
+            );
+        }
+    }
+
+    /// #780 review m2: usage taken for a report that was never delivered is handed
+    /// back, and the NEXT report carries it, together with what arrived since.
+    #[test]
+    fn usage_of_an_undelivered_report_is_carried_by_the_next_one() {
+        let dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        dp.add_session_from_pfcp(
+            0x772,
+            0x1772,
+            Ipv4Addr::new(10, 45, 7, 72),
+            0x7721,
+            0x7722,
+            "127.0.0.1:2152".parse().unwrap(),
+            Some(5),
+            Some(9),
+        );
+        let session = dp.sessions.find_by_seid(0x772).expect("session");
+        let urr = Arc::new(DataPlaneUrr::new(1));
+        urr.set_reporting(Some(1), None, None, None, None);
+        session.urrs.write().unwrap().insert(1, Arc::clone(&urr));
+
+        urr.record(300, true);
+        let lost = dp.collect_urr_reports();
+        assert_eq!(lost.len(), 1);
+        assert_eq!(urr.usage().total_bytes(), 0, "the harvest took the usage");
+        dp.restore_urr_usage(&lost);
+
+        urr.record(200, false);
+        let next = dp.collect_urr_reports();
+        assert_eq!(next.len(), 1);
+        assert_eq!(
+            (
+                next[0].ul_bytes,
+                next[0].dl_bytes,
+                next[0].total_bytes,
+                next[0].total_pkts
+            ),
+            (300, 200, 500, 2),
+            "the next report carries the undelivered usage plus the new"
+        );
+        assert!(next[0].ur_seqn > lost[0].ur_seqn);
     }
 
     /// Run `f` on a thread of its own and hand back a receiver for its result, so a
