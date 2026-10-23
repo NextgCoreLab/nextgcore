@@ -749,6 +749,10 @@ pub struct NgapServer {
     /// live SCTP association. `None` (the default) keeps the real transport.
     #[cfg(test)]
     sent_ngap: Option<Vec<(u64, Vec<u8>)>>,
+    /// Test seam: when `Some`, the handle of the task running an NG Reset's SMF calls is
+    /// sent here, so a test can wait for it to finish (#754).
+    #[cfg(test)]
+    ng_reset_smf_done: Option<tokio::sync::mpsc::UnboundedSender<tokio::task::JoinHandle<()>>>,
     /// Test seam: the next this-many NGAP sends fail as an SCTP send error would,
     /// so a test can drive a handler's send-failure branch (#760).
     #[cfg(test)]
@@ -897,6 +901,8 @@ impl NgapServer {
             forced_amf_ue_ngap_id: None,
             #[cfg(test)]
             sent_ngap: None,
+            #[cfg(test)]
+            ng_reset_smf_done: None,
             #[cfg(test)]
             fail_next_sends: 0,
             event_tx,
@@ -1760,7 +1766,7 @@ impl NgapServer {
 
         // #754: the UE-associated logical NG-connections the reset names, resolved on the
         // LIVE store (`ue_auth_state`), and only those served by THIS association: TS
-        // 38.413 §8.7.4.2.1 scopes a reset to the sending NG-RAN node's connections, so a
+        // 38.413 §8.7.4.2.2 scopes a reset to the sending NG-RAN node's connections, so a
         // gNB cannot list another gNB's UE (the NG Reset site of #739). When an item
         // carries both ids the pair must match.
         let affected: Vec<u64> = match &reset.reset_type {
@@ -1807,7 +1813,7 @@ impl NgapServer {
             }
         };
 
-        // #754: an NG Reset releases the NG resources only (TS 38.413 §8.7.4.2.1). A
+        // #754: an NG Reset releases the NG resources only (TS 38.413 §8.7.4.2.2). A
         // REGISTERED UE goes CM-IDLE exactly as at a UE Context Release Complete: it keeps
         // its registration, NAS security context and PDU sessions; each session's user
         // plane is deactivated at its owning SMF (TS 23.502 §4.2.6 step 5), so the UPF
@@ -1817,37 +1823,94 @@ impl NgapServer {
         // forwarding to the dead tunnels, and the PCF/UDM records leaked. A UE whose
         // registration had not completed has nothing to keep and is still dropped
         // (`forget_ue`, which also frees an emergency context, #356).
+        //
+        // §8.7.4.2.2 also has "any other ongoing procedure ... related to a UE association
+        // ... indicated ... in the NG RESET message" ABORTED: see `abort_on_ng_release`.
+        //
+        // The SMF calls are NOT made here. This handler runs on the one NGAP task that
+        // serves every gNB, and a whole-interface reset can name hundreds of UEs: serial
+        // SMF round trips would stall N2 for all of them, and hold the Acknowledge, which
+        // §8.7.4.2.2 gates on the NG resources alone. They are collected and run after the
+        // Acknowledge, off this task, at most `NG_RESET_SMF_CONCURRENCY` at a time.
+        let mut smf_work: Vec<NgResetSmfCall> = Vec::new();
+        let mut idled = 0usize;
         for amf_ue_ngap_id in affected {
-            let registered_went_idle = self
+            let outcome = self
                 .ue_auth_state
                 .with_mut(amf_ue_ngap_id, |s| {
                     s.registered.then(|| {
                         let went_idle = !s.cm_idle;
                         s.cm_idle = true;
-                        went_idle
+                        (went_idle, abort_on_ng_release(amf_ue_ngap_id, s))
                     })
                 })
                 .flatten();
-            match registered_went_idle {
-                Some(true) => {
-                    self.deactivate_up_connections(amf_ue_ngap_id).await;
+            // The handover relay state of a preparation the reset ended (§8.7.4.2.2).
+            self.handover_target_assoc.remove(&amf_ue_ngap_id);
+            self.handover_target_transfers
+                .retain(|(ue, _), _| *ue != amf_ue_ngap_id);
+            match outcome {
+                // TS 24.501 §5.5.2.3.5 b): a lower layer failure during a network-initiated
+                // de-registration aborts it and the network enters 5GMM-DEREGISTERED. The
+                // NG connection is gone, so no UE Context Release Command either.
+                Some((_, AbortedProcedure::Deregistration)) => {
+                    smf_work.extend(self.ue_sm_contexts(amf_ue_ngap_id).into_iter().map(
+                        |(psi, sm_ref, host, port)| NgResetSmfCall::Release {
+                            amf_ue_ngap_id,
+                            psi,
+                            sm_ref,
+                            host,
+                            port,
+                        },
+                    ));
+                    self.terminate_policy_associations(amf_ue_ngap_id);
+                    self.forget_ue(amf_ue_ngap_id);
+                }
+                Some((true, _)) => {
+                    idled += 1;
+                    smf_work.extend(self.ue_sm_contexts(amf_ue_ngap_id).into_iter().map(
+                        |(psi, sm_ref, host, port)| NgResetSmfCall::Deactivate {
+                            amf_ue_ngap_id,
+                            psi,
+                            sm_ref,
+                            host,
+                            port,
+                        },
+                    ));
                     self.start_reachability_supervision(association_id, Some(amf_ue_ngap_id))
                         .await;
                 }
                 // Already CM-IDLE (and supervised since): nothing more to release.
-                Some(false) => {}
+                Some((false, _)) => {}
                 None => self.forget_ue(amf_ue_ngap_id),
             }
         }
+        NG_RESET_UES_IDLED.fetch_add(idled as u64, std::sync::atomic::Ordering::Relaxed);
 
         // Release the affected UE contexts and get the list to echo in the Ack
         let ack_connections = ngap_handler::handle_ng_reset(gnb_pool_id, &reset);
 
         if let Some(ack) = ngap_asn1::build_ng_reset_acknowledge_asn1(ack_connections, &notify) {
             self.send_to_association(association_id, &ack).await?;
-            log::info!("NG Reset Acknowledge sent to association {association_id}");
+            log::info!(
+                "NG Reset Acknowledge sent to association {association_id} ({idled} UE(s) \
+                 moved to CM-IDLE, {} SMF update(s) to follow)",
+                smf_work.len()
+            );
         } else {
             log::error!("Failed to build NG Reset Acknowledge");
+        }
+
+        if !smf_work.is_empty() {
+            #[cfg(test)]
+            let done = self.ng_reset_smf_done.clone();
+            let work = tokio::spawn(run_ng_reset_smf_calls(smf_work));
+            #[cfg(test)]
+            if let Some(done) = done {
+                let _ = done.send(work);
+            }
+            #[cfg(not(test))]
+            drop(work);
         }
 
         Ok(())
@@ -8519,6 +8582,19 @@ impl NgapServer {
     /// PDU session of `amf_ue_ngap_id` (TS 23.502 §4.2.6 step 5, TS 29.502
     /// §5.2.2.3.2.2), once its AN release is complete (#540). Best effort: a
     /// failed deactivation is logged and the others still go.
+    /// Every SM context of a UE as `(psi, smContextRef, SMF host, SMF port)`: the copy a
+    /// task off the NGAP loop needs to address each session at the SMF that holds it.
+    fn ue_sm_contexts(&self, amf_ue_ngap_id: u64) -> Vec<(u8, String, String, u16)> {
+        self.sm_context_refs
+            .iter()
+            .filter(|((ue, _), _)| *ue == amf_ue_ngap_id)
+            .map(|((_, psi), r)| {
+                let (host, port) = self.smf_target_for(amf_ue_ngap_id, *psi);
+                (*psi, r.clone(), host, port)
+            })
+            .collect()
+    }
+
     async fn deactivate_up_connections(&mut self, amf_ue_ngap_id: u64) {
         let refs: Vec<(u8, String)> = self
             .sm_context_refs
@@ -14745,6 +14821,132 @@ pub async fn amf_ngap_poll() -> Result<bool> {
 // Tests
 // ============================================================================
 
+/// UEs an NG Reset moved to CM-IDLE, for operators: a jump is a gNB that reset with
+/// connected UEs on it (#754).
+pub static NG_RESET_UES_IDLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// At most this many SMF calls of one NG Reset run at once (#754, review of #848).
+const NG_RESET_SMF_CONCURRENCY: usize = 16;
+
+/// One SMF call an NG Reset owes, run after its Acknowledge (#754).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NgResetSmfCall {
+    /// `upCnxState: DEACTIVATED` for a UE kept in CM-IDLE (TS 23.502 §4.2.6 step 5).
+    Deactivate {
+        amf_ue_ngap_id: u64,
+        psi: u8,
+        sm_ref: String,
+        host: String,
+        port: u16,
+    },
+    /// Release for a UE whose network-initiated de-registration the reset aborted
+    /// (TS 24.501 §5.5.2.3.5 b)).
+    Release {
+        amf_ue_ngap_id: u64,
+        psi: u8,
+        sm_ref: String,
+        host: String,
+        port: u16,
+    },
+}
+
+/// Run an NG Reset's SMF calls, `NG_RESET_SMF_CONCURRENCY` at a time.
+async fn run_ng_reset_smf_calls(calls: Vec<NgResetSmfCall>) {
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(NG_RESET_SMF_CONCURRENCY));
+    let mut tasks = tokio::task::JoinSet::new();
+    for call in calls {
+        let Ok(permit) = permits.clone().acquire_owned().await else {
+            break;
+        };
+        tasks.spawn(async move {
+            let _permit = permit;
+            match call {
+                NgResetSmfCall::Deactivate {
+                    amf_ue_ngap_id,
+                    psi,
+                    sm_ref,
+                    host,
+                    port,
+                } => match crate::sbi_path::call_smf_deactivate_up_connection(&host, port, &sm_ref)
+                    .await
+                {
+                    Ok(()) => log::info!(
+                        "UE {amf_ue_ngap_id}: PSI {psi} user plane deactivated (NG Reset)"
+                    ),
+                    Err(e) => log::warn!(
+                        "UE {amf_ue_ngap_id}: PSI {psi} user-plane deactivation after NG Reset \
+                         failed: {e}"
+                    ),
+                },
+                NgResetSmfCall::Release {
+                    amf_ue_ngap_id,
+                    psi,
+                    sm_ref,
+                    host,
+                    port,
+                } => match crate::sbi_path::call_smf_release_sm_context(&host, port, &sm_ref).await
+                {
+                    Ok(()) => log::info!(
+                        "UE {amf_ue_ngap_id}: PSI {psi} released (de-registration aborted by NG \
+                         Reset)"
+                    ),
+                    Err(e) => log::warn!(
+                        "UE {amf_ue_ngap_id}: PSI {psi} release after NG Reset failed: {e}"
+                    ),
+                },
+            }
+        });
+    }
+    while tasks.join_next().await.is_some() {}
+}
+
+/// Which NAS procedure an NG release aborted, when its abort is more than dropping the
+/// retransmission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AbortedProcedure {
+    /// Nothing ran, or the abort needs nothing further.
+    None,
+    /// A network-initiated de-registration (T3522): TS 24.501 §5.5.2.3.5 b) puts the UE in
+    /// 5GMM-DEREGISTERED.
+    Deregistration,
+}
+
+/// Abort the NAS procedure in progress for a UE whose NG connection was released by an
+/// NG Reset (TS 38.413 §8.7.4.2.2: "any other ongoing procedure ... related to a UE
+/// association ... shall be aborted"). To the NAS layer that is a lower layer failure, and
+/// TS 24.501 says what each procedure does on one:
+///
+/// | timer | procedure | lower layer failure (network side) |
+/// |---|---|---|
+/// | T3550 | registration | §5.5.1.2.8 / §5.5.1.3.8 a): abort, do not resend the ACCEPT; a new 5G-GUTI and the old one both stay valid |
+/// | T3555 | configuration update | §5.4.4.6 b): abort; both 5G-GUTIs stay valid |
+/// | T3560 | authentication / security mode | §5.4.1.3.7 a) / §5.4.2.7 a): abort |
+/// | T3570 | identification | §5.4.3.6 a): abort any ongoing 5GMM procedure |
+/// | T3522 | network-initiated de-registration | §5.5.2.3.5 b): abort, enter 5GMM-DEREGISTERED |
+///
+/// The retransmission is dropped in every case: its NGAP PDU carries the reset RAN UE
+/// NGAP ID, which the gNB may already have given to another UE. Both GUTIs stay valid by
+/// leaving `current_guti` and `next_guti` as they are; `resolve_registration_by_guti`
+/// accepts either (see the T3555 exhaustion arm). Await-free, for `UeStore::with_mut`.
+fn abort_on_ng_release(amf_ue_ngap_id: u64, state: &mut UeNasContext) -> AbortedProcedure {
+    let Some(retx) = state.retx.take() else {
+        return AbortedProcedure::None;
+    };
+    log::info!(
+        "UE {amf_ue_ngap_id}: {:?} procedure aborted by NG Reset (lower layer failure, TS \
+         38.413 §8.7.4.2.2); its retransmission is dropped",
+        retx.timer
+    );
+    match retx.timer {
+        NasProcTimer::T3522 => AbortedProcedure::Deregistration,
+        NasProcTimer::T3570 => {
+            state.pei_requested = false;
+            AbortedProcedure::None
+        }
+        NasProcTimer::T3550 | NasProcTimer::T3555 | NasProcTimer::T3560 => AbortedProcedure::None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// Handler-level tests asserting what amfd SENDS (#760, ...), in their own file.
@@ -18948,7 +19150,7 @@ mod tests {
     /// instead of forgetting it. Nothing is released at the SMF (the old #637 path
     /// Nsmf-released sessions found through a `RanUe` list production never builds).
     /// Both reset types; a partial reset from ANOTHER gNB listing this UE's AMF UE NGAP
-    /// ID touches nothing (TS 38.413 §8.7.4.2.1 scopes it to the sender, #739).
+    /// ID touches nothing (TS 38.413 §8.7.4.2.2 scopes it to the sender, #739).
     ///
     /// REVERT-VERIFIED: with the old `forget_ue` loop the UE is gone; without the
     /// association scoping the other gNB's partial reset idles it.
@@ -18958,6 +19160,8 @@ mod tests {
         let _env = SmfEnvGuard::set(port);
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = capturing_ngap_server().await;
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel();
+        ngap.ng_reset_smf_done = Some(done_tx);
         let (assoc, other_assoc) = (754_001u64, 754_002u64);
         seed_gnb_session(&ngap, assoc).await;
         seed_gnb_session(&ngap, other_assoc).await;
@@ -19014,6 +19218,13 @@ mod tests {
                 ]))
             };
             ngap.handle_ng_reset(assoc, &pdu).await.expect("handled");
+            // The SMF calls run after the Acknowledge, off the NGAP task.
+            done_rx
+                .recv()
+                .await
+                .expect("SMF work spawned")
+                .await
+                .expect("SMF work ran");
 
             let state = ngap
                 .ue_auth_state
@@ -19040,6 +19251,350 @@ mod tests {
                 "case {n}: the NG Reset Acknowledge: {sent:?}"
             );
             assert_eq!(sent[0].0, assoc);
+            ngap.ue_auth_state.remove(ue);
+        }
+    }
+
+    /// An NF stand-in that waits `delay` before answering 204, and records `"METHOD uri"`
+    /// as each request ARRIVES.
+    async fn slow_recording_nf(
+        delay: Duration,
+    ) -> (
+        nextgcore_sbi::server::SbiServer,
+        u16,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
+        use nextgcore_sbi::server::{SbiServer as NSbiServer, SbiServerConfig as NSbiCfg};
+
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let (addr_listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = NSbiServer::on_listener(NSbiCfg::new(addr), addr_listener);
+        server
+            .start(move |req: SReq| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    sink.lock()
+                        .expect("sink")
+                        .push(format!("{} {}", req.header.method, req.header.uri));
+                    tokio::time::sleep(delay).await;
+                    SResp::no_content()
+                }
+            })
+            .await
+            .expect("stand-in NF starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (server, addr.port(), seen)
+    }
+
+    fn ng_reset_pdu(reset_type: nextgcore_ngap::types::ResetType) -> Vec<u8> {
+        nextgcore_ngap::builder::build_ng_reset(&nextgcore_ngap::types::NgReset {
+            cause: nextgcore_ngap::types::Cause::Transport(
+                nextgcore_ngap::types::CauseTransport::TransportResourceUnavailable,
+            ),
+            reset_type,
+        })
+        .expect("build NG Reset")
+    }
+
+    /// **#754, review of #848 (M1).** A whole-interface NG Reset with many connected UEs
+    /// answers the gNB at once: the Acknowledge does not wait for the SMF, and the
+    /// deactivations run off the NGAP task, at most `NG_RESET_SMF_CONCURRENCY` at a time.
+    /// The stand-in SMF takes 1.5 s per call; 40 UEs with two sessions each would hold the
+    /// Ack for two minutes if the calls ran serially before it.
+    ///
+    /// REVERT-VERIFIED: awaiting the SMF work before the Ack makes the handler take
+    /// longer than the bound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_ng_reset_is_acknowledged_before_the_smf_answers() {
+        let (_nf, port, seen) = slow_recording_nf(Duration::from_millis(1500)).await;
+        let _env = SmfEnvGuard::set(port);
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = capturing_ngap_server().await;
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel();
+        ngap.ng_reset_smf_done = Some(done_tx);
+        let assoc = 754_011u64;
+        seed_gnb_session(&ngap, assoc).await;
+        let ues: Vec<u64> = (0..40).map(|i| 7_754_100 + i).collect();
+        for (i, &ue) in ues.iter().enumerate() {
+            let mut state = UeNasContext::new(ue, 100 + i as u32, assoc, false);
+            state.registered = true;
+            ngap.ue_auth_state.insert(ue, state);
+            for psi in [5u8, 6] {
+                ngap.sm_context_refs
+                    .insert((ue, psi), format!("smctx-754-slow-{ue}-{psi}"));
+                ngap.sm_context_smfs
+                    .insert((ue, psi), ("127.0.0.1".to_string(), port));
+            }
+        }
+
+        let started = Instant::now();
+        ngap.handle_ng_reset(
+            assoc,
+            &ng_reset_pdu(nextgcore_ngap::types::ResetType::NgInterface),
+        )
+        .await
+        .expect("handled");
+        let took = started.elapsed();
+        let sent = take_sent_ngap(&mut ngap);
+        assert!(
+            took < Duration::from_millis(1000),
+            "the handler returned after {took:?}, i.e. it waited for the SMF"
+        );
+        assert_eq!(sent.len(), 1, "the NG Reset Acknowledge: {sent:?}");
+        assert_eq!(sent[0].0, assoc);
+        for &ue in &ues {
+            assert!(ngap.ue_auth_state.get(ue).expect("kept").is_cm_idle());
+        }
+
+        // Bounded concurrency: 80 calls at 16 at a time is five waves of 1.5 s.
+        let work = done_rx.recv().await.expect("SMF work spawned");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let in_first_wave = seen.lock().expect("seen").len();
+        assert!(
+            (1..=NG_RESET_SMF_CONCURRENCY).contains(&in_first_wave),
+            "{in_first_wave} calls in flight at once"
+        );
+        work.await.expect("SMF work ran");
+        assert_eq!(
+            seen.lock().expect("seen").len(),
+            80,
+            "every session deactivated"
+        );
+        for &ue in &ues {
+            ngap.ue_auth_state.remove(ue);
+        }
+    }
+
+    /// **#754, review of #848 (M1), blackholed SMF.** An SMF that accepts the connection
+    /// and never answers does not stop the NGAP task. The reset is acknowledged, and while
+    /// its SMF calls hang, the same task goes on to serve a second gNB's NG Reset and a
+    /// third gNB's reset of a UE with no SMF context.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_blackholed_smf_does_not_stop_the_ngap_task() {
+        // Accepts and holds every connection, answers nothing.
+        let hole = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = hole.local_addr().expect("addr").port();
+        let holder = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = hole.accept().await {
+                held.push(sock);
+            }
+        });
+        let _env = SmfEnvGuard::set(port);
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = capturing_ngap_server().await;
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel();
+        ngap.ng_reset_smf_done = Some(done_tx);
+        let (first, second) = (754_041u64, 754_042u64);
+        seed_gnb_session(&ngap, first).await;
+        seed_gnb_session(&ngap, second).await;
+        let ue = |ngap: &mut NgapServer, id: u64, assoc: u64, held: bool| {
+            let mut state = UeNasContext::new(id, 41, assoc, false);
+            state.registered = true;
+            ngap.ue_auth_state.insert(id, state);
+            if held {
+                ngap.sm_context_refs
+                    .insert((id, 5), format!("smctx-754-hole-{id}"));
+                ngap.sm_context_smfs
+                    .insert((id, 5), ("127.0.0.1".to_string(), port));
+            }
+        };
+        let (a, b) = (7_754_401u64, 7_754_402u64);
+        ue(&mut ngap, a, first, true);
+        ue(&mut ngap, b, second, false);
+
+        let whole = ng_reset_pdu(nextgcore_ngap::types::ResetType::NgInterface);
+        let started = Instant::now();
+        ngap.handle_ng_reset(first, &whole).await.expect("handled");
+        let hanging = done_rx.recv().await.expect("SMF work spawned");
+        // The task is free: the next gNB's reset is served at once.
+        ngap.handle_ng_reset(second, &whole).await.expect("handled");
+        assert!(
+            started.elapsed() < Duration::from_millis(1000),
+            "both resets served in {:?}",
+            started.elapsed()
+        );
+        let sent = take_sent_ngap(&mut ngap);
+        assert_eq!(
+            sent.iter().map(|(assoc, _)| *assoc).collect::<Vec<_>>(),
+            vec![first, second],
+            "both Acknowledges"
+        );
+        assert!(ngap.ue_auth_state.get(b).expect("kept").is_cm_idle());
+        assert!(!hanging.is_finished(), "the SMF call is still hanging");
+        hanging.abort();
+        holder.abort();
+        for id in [a, b] {
+            ngap.ue_auth_state.remove(id);
+        }
+    }
+
+    /// **#754, review of #848 (M2).** TS 38.413 §8.7.4.2.2: an NG Reset aborts every
+    /// ongoing procedure of the UE associations it names. To NAS that is a lower layer
+    /// failure (TS 24.501):
+    /// - T3555 (configuration update) and T3560 (authentication): the UE is KEPT, CM-IDLE,
+    ///   and nothing is retransmitted with the reset RAN UE NGAP ID afterwards; before,
+    ///   T3560 exhaustion `release_ue`d (forgot) the UE the reset had just kept;
+    /// - T3522 (network-initiated de-registration): §5.5.2.3.5 b), the UE is
+    ///   DEREGISTERED -- forgotten, its sessions released at the SMF -- with no UE Context
+    ///   Release Command for the connection the reset already ended.
+    ///
+    /// The UE's handover relay state is dropped too.
+    ///
+    /// REVERT-VERIFIED: without `abort_on_ng_release` the T3555 UE's Configuration Update
+    /// Command is retransmitted on the reset association.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ng_reset_aborts_the_kept_ues_procedures() {
+        let (_nf, port, seen) = recording_nf().await;
+        let _env = SmfEnvGuard::set(port);
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = capturing_ngap_server().await;
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel();
+        ngap.ng_reset_smf_done = Some(done_tx);
+        let (assoc, target) = (754_021u64, 754_022u64);
+        seed_gnb_session(&ngap, assoc).await;
+        seed_gnb_session(&ngap, target).await;
+        let arm = |ngap: &mut NgapServer, ue: u64, ran: u32, timer: NasProcTimer| {
+            let mut state = UeNasContext::new(ue, ran, assoc, false);
+            state.registered = true;
+            state.retx = Some(NasRetx {
+                timer,
+                deadline: Instant::now() + Duration::from_millis(50),
+                retries: 0,
+                ngap_pdu: vec![0x00, 0x04, 0x40, ran as u8],
+            });
+            ngap.ue_auth_state.insert(ue, state);
+        };
+        let (cuc, auth, dereg) = (7_754_201u64, 7_754_202u64, 7_754_203u64);
+        arm(&mut ngap, cuc, 21, NasProcTimer::T3555);
+        arm(&mut ngap, auth, 22, NasProcTimer::T3560);
+        arm(&mut ngap, dereg, 23, NasProcTimer::T3522);
+        ngap.sm_context_refs
+            .insert((dereg, 5), "smctx-754-dereg".to_string());
+        ngap.sm_context_smfs
+            .insert((dereg, 5), ("127.0.0.1".to_string(), port));
+        ngap.handover_target_assoc.insert(cuc, (target, 99));
+        ngap.handover_target_transfers.insert((cuc, 5), vec![0xB1]);
+
+        ngap.handle_ng_reset(
+            assoc,
+            &ng_reset_pdu(nextgcore_ngap::types::ResetType::NgInterface),
+        )
+        .await
+        .expect("handled");
+        done_rx
+            .recv()
+            .await
+            .expect("SMF work spawned")
+            .await
+            .expect("SMF work ran");
+        let sent = take_sent_ngap(&mut ngap);
+        assert_eq!(
+            sent.len(),
+            1,
+            "only the Acknowledge, no Release Command: {sent:?}"
+        );
+
+        // Past every retransmission deadline: nothing goes out for the reset connections.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        ngap.process_nas_timers().await.expect("timers");
+        assert!(
+            take_sent_ngap(&mut ngap).is_empty(),
+            "no retransmission with a reset RAN UE NGAP ID"
+        );
+        for ue in [cuc, auth] {
+            let state = ngap.ue_auth_state.get(ue).expect("kept, not released");
+            assert!(state.is_cm_idle() && state.registered && state.retx.is_none());
+        }
+        assert!(
+            !ngap.ue_auth_state.contains(dereg),
+            "TS 24.501 §5.5.2.3.5 b): 5GMM-DEREGISTERED"
+        );
+        assert_eq!(
+            seen.lock().expect("seen").clone(),
+            vec!["POST /nsmf-pdusession/v1/sm-contexts/smctx-754-dereg/release".to_string()],
+            "the deregistered UE's session is released; nothing else is called"
+        );
+        assert!(!ngap.handover_target_assoc.contains_key(&cuc));
+        assert!(!ngap.handover_target_transfers.contains_key(&(cuc, 5)));
+        for ue in [cuc, auth] {
+            ngap.ue_auth_state.remove(ue);
+        }
+    }
+
+    /// **#754, review of #848 (MINORs 1 and 4).** A partial reset item whose AMF UE NGAP
+    /// ID is this gNB's UE but whose RAN UE NGAP ID is not touches nothing; a UE whose
+    /// registration had not completed is dropped; an already CM-IDLE UE is left alone
+    /// and its SMF is not called again.
+    ///
+    /// REVERT-VERIFIED: matching on the AMF UE NGAP ID alone idles the first UE.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ng_reset_matches_the_id_pair_and_spares_idle_and_unregistered_ues() {
+        let (_nf, port, seen) = recording_nf().await;
+        let _env = SmfEnvGuard::set(port);
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = capturing_ngap_server().await;
+        let assoc = 754_031u64;
+        seed_gnb_session(&ngap, assoc).await;
+        let item =
+            |amf: u64, ran: u32| nextgcore_ngap::types::UeAssociatedLogicalNgConnectionItem {
+                amf_ue_ngap_id: Some(amf),
+                ran_ue_ngap_id: Some(ran),
+            };
+        let (paired, unregistered, idle) = (7_754_301u64, 7_754_302u64, 7_754_303u64);
+        let mut state = UeNasContext::new(paired, 31, assoc, false);
+        state.registered = true;
+        ngap.ue_auth_state.insert(paired, state);
+        ngap.ue_auth_state.insert(
+            unregistered,
+            UeNasContext::new(unregistered, 32, assoc, false),
+        );
+        let mut state = UeNasContext::new(idle, 33, assoc, false);
+        state.registered = true;
+        state.cm_idle = true;
+        ngap.ue_auth_state.insert(idle, state);
+        for ue in [paired, idle] {
+            ngap.sm_context_refs
+                .insert((ue, 5), format!("smctx-754-{ue}"));
+            ngap.sm_context_smfs
+                .insert((ue, 5), ("127.0.0.1".to_string(), port));
+        }
+
+        ngap.handle_ng_reset(
+            assoc,
+            &ng_reset_pdu(nextgcore_ngap::types::ResetType::PartOfNgInterface(vec![
+                item(paired, 999),
+                item(unregistered, 32),
+                item(idle, 33),
+            ])),
+        )
+        .await
+        .expect("handled");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let kept = ngap.ue_auth_state.get(paired).expect("untouched");
+        assert!(
+            !kept.is_cm_idle(),
+            "the AMF id matched but the RAN id did not"
+        );
+        assert!(!ngap.ue_auth_state.contains(unregistered), "dropped");
+        assert!(ngap.ue_auth_state.get(idle).expect("kept").is_cm_idle());
+        assert!(
+            seen.lock().expect("seen").is_empty(),
+            "no SMF call: one UE was not reset and the other was already idle"
+        );
+        let sent = take_sent_ngap(&mut ngap);
+        assert_eq!(sent.len(), 1, "the Acknowledge: {sent:?}");
+        for ue in [paired, idle] {
             ngap.ue_auth_state.remove(ue);
         }
     }
