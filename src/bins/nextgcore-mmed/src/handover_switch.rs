@@ -122,15 +122,38 @@ static HANDOVER_FAILURES: std::sync::Mutex<Vec<(&'static str, u64)>> =
 
 /// Count one handover the core could not complete, by `reason`.
 pub fn count_handover_failure(reason: &'static str) {
-    let mut counts = HANDOVER_FAILURES.lock().unwrap_or_else(|e| e.into_inner());
-    match counts.iter_mut().find(|(r, _)| *r == reason) {
-        Some((_, n)) => *n += 1,
-        None => counts.push((reason, 1)),
+    {
+        let mut counts = HANDOVER_FAILURES.lock().unwrap_or_else(|e| e.into_inner());
+        match counts.iter_mut().find(|(r, _)| *r == reason) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((reason, 1)),
+        }
     }
     log::warn!(
         "metric mme_handover_core_failures_total{{reason=\"{reason}\"}} incremented (TS 23.401 \
          §5.5.1.1.2 / §5.5.1.2.2)"
     );
+}
+
+/// The handover failure counter in Prometheus text format, one sample per
+/// reason (every reason present, zero until counted), for mmed's `/metrics`.
+pub fn render_metrics() -> String {
+    let counts = handover_failures();
+    let mut out = String::from(
+        "# HELP mme_handover_core_failures_total Handovers the core could not complete, by \
+         reason (TS 23.401 5.5.1.1.2 / 5.5.1.2.2)\n\
+         # TYPE mme_handover_core_failures_total counter\n",
+    );
+    for reason in failure_reason::ALL {
+        let n = counts
+            .iter()
+            .find(|(r, _)| r == reason)
+            .map_or(0, |(_, n)| *n);
+        out.push_str(&format!(
+            "mme_handover_core_failures_total{{reason=\"{reason}\"}} {n}\n"
+        ));
+    }
+    out
 }
 
 /// The handover failures counted so far: (reason, count).
@@ -155,6 +178,15 @@ pub mod failure_reason {
     pub const ALREADY_PENDING: &str = "already_pending";
     /// The request named one E-RAB twice (TS 36.413 §8.4.4.4).
     pub const DUPLICATE_ERAB: &str = "duplicate_erab";
+    /// Every reason, in the order `/metrics` lists them.
+    pub const ALL: &[&str] = &[
+        NO_DEFAULT_BEARER,
+        SGW_REFUSED,
+        SGW_NO_ANSWER,
+        NOT_SENT,
+        ALREADY_PENDING,
+        DUPLICATE_ERAB,
+    ];
 }
 
 /// Split the request's bearers into those the Serving GW switched and those it
@@ -386,6 +418,7 @@ fn association_alive(ctx: &MmeContext, pending: &PendingHandoverModification) ->
             enb_id,
             mme_ue_s1ap_id,
             enb_ue_s1ap_id,
+            ..
         } => (*enb_id, *mme_ue_s1ap_id, *enb_ue_s1ap_id),
     };
     let Some(enb_ue_id) = ctx.enb_ue_find_by_mme_ue_s1ap_id(mme_ue_s1ap_id) else {
@@ -498,10 +531,16 @@ pub fn on_modify_bearer_response(
     // E-RABs the target eNB holds (it named or admitted them) that the core has
     // now released: for the eNB to release too. A dedicated bearer of a released
     // PDN connection counts, even if the Serving GW switched it.
-    let held_by_enb_released: Vec<ErabItem> = pending
-        .switched
-        .iter()
-        .map(|s| s.ebi)
+    // On S1 that is every E-RAB the target admitted, including a dedicated
+    // bearer dropped from the request with its PDN connection (N1); on X2 the
+    // bearers named and switched (the dropped ones are already in the To Be
+    // Released List).
+    let held_by_enb: Vec<u8> = match &pending.kind {
+        HandoverModifyKind::HandoverNotify { admitted, .. } => admitted.clone(),
+        HandoverModifyKind::PathSwitch { .. } => pending.switched.iter().map(|s| s.ebi).collect(),
+    };
+    let held_by_enb_released: Vec<ErabItem> = held_by_enb
+        .into_iter()
         .filter(|ebi| released.contains(ebi))
         .map(|erab_id| ErabItem {
             erab_id,
@@ -569,6 +608,7 @@ pub fn on_modify_bearer_response(
             enb_id,
             mme_ue_s1ap_id,
             enb_ue_s1ap_id,
+            ..
         } => {
             if held_by_enb_released.is_empty() {
                 return;
@@ -1355,6 +1395,10 @@ mod tests {
         assert_eq!(ack_lists(&ack), (vec![(5, SGW_S1U_TEID + 5)], vec![]));
         let (dbc, _) = recv(&sgw, 66);
         assert_eq!(bearer_context_ebis(&dbc, 0), vec![6]);
+        assert!(
+            nextgcore_gtp::v2::is_command_sequence(dbc.header.sequence_number),
+            "a Command's number has the MSB set (TS 29.274 §7.6, #727)"
+        );
         release(&ue);
     }
 
@@ -1630,5 +1674,204 @@ mod tests {
         );
         assert_eq!(bearer(&ue, 5).unwrap().enb_s1u_teid, 0x1005);
         release(&ue);
+    }
+
+    /// Add a second PDN connection to `ue`: default bearer `ebis[0]`, then
+    /// dedicated ones, all active on the source eNB.
+    fn add_pdn(ue: &Ue, ebis: &[u8]) -> u64 {
+        let ctx = crate::context::mme_self();
+        let sess = ctx.sess_add(ue.mme_ue_id, 10);
+        ctx.mme_ue_pool
+            .write()
+            .unwrap()
+            .get_mut(&ue.mme_ue_id)
+            .unwrap()
+            .sess_list
+            .push(sess);
+        for ebi in ebis {
+            let bearer_id = ctx.bearer_add(sess, ue.mme_ue_id);
+            let mut pool = ctx.bearer_pool.write().unwrap();
+            let b = pool.get_mut(&bearer_id).unwrap();
+            b.ebi = *ebi;
+            b.enb_s1u_teid = 0x1000 + u32::from(*ebi);
+            b.enb_s1u_ip.ipv4 = Some([10, 0, 0, 1]);
+            b.sgw_s1u_teid = SGW_S1U_TEID + u32::from(*ebi);
+            b.sgw_s1u_ip.ipv4 = Some([10, 0, 0, 2]);
+            drop(pool);
+            ctx.sess_pool
+                .write()
+                .unwrap()
+                .get_mut(&sess)
+                .unwrap()
+                .bearer_list
+                .push(bearer_id);
+        }
+        sess
+    }
+
+    /// #730 re-review N1, TS 23.401 §5.5.1.2.2 step 16: on S1, the target admits
+    /// the first PDN's default bearer (5) and the second PDN's dedicated bearer
+    /// (7) but not its default bearer (6). The second PDN is released, and the
+    /// target is told to release E-RAB 7, which it holds for a deleted bearer.
+    #[test]
+    fn s1_a_dedicated_bearer_admitted_with_its_pdn_dropped_is_released_at_the_target() {
+        let _guard = lock_s11();
+        let (sgw, _route) = sgw(Gtp2XactConfig::default());
+        let ue = seed(&[5]);
+        let sess2 = add_pdn(&ue, &[6, 7]);
+        let ctx = crate::context::mme_self();
+        let (target_enb, target_ue_id) = notify_handover(&ue, &[5, 7]);
+
+        let (mbr, from) = recv(&sgw, 34);
+        assert_eq!(bearer_context_ebis(&mbr, 0), vec![5]);
+        let mut removed = bearer_context_ebis(&mbr, 1);
+        removed.sort();
+        assert_eq!(removed, vec![6, 7]);
+        sgw.send_to(
+            &mbr_response(ue.local_teid, mbr.header.sequence_number, 16, &[(5, 16)]),
+            from,
+        )
+        .unwrap();
+        let released = wait_pdu(target_enb, |pdu| match pdu {
+            g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+                value: g::InitiatingMessageValue::Id_E_RABRelease(cmd),
+                ..
+            }) => cmd.protocol_i_es.0.iter().find_map(|ie| match &ie.value {
+                g::E_RABReleaseCommandProtocolIEs_EntryValue::Id_E_RABToBeReleasedList(l) => Some(
+                    l.0.iter()
+                        .map(|e| {
+                            let g::E_RABList_EntryValue::Id_E_RABItem(i) = &e.value;
+                            i.e_rab_id.0
+                        })
+                        .collect::<Vec<u8>>(),
+                ),
+                _ => None,
+            }),
+            _ => None,
+        });
+        assert_eq!(released, vec![7], "E-RAB 7 is released at the target");
+        let (dsr, _) = recv(&sgw, 36);
+        assert_eq!(
+            dsr.get_ie(Gtp2IeType::Ebi as u8, 0)
+                .and_then(|ie| ie.value.first().copied()),
+            Some(6)
+        );
+        assert!(ctx.sess_find_by_id(sess2).is_none());
+        ctx.enb_ue_remove(target_ue_id);
+        release(&ue);
+    }
+
+    /// #730 re-review m-a: one mobility procedure at a time. HANDOVER REQUIRED
+    /// while a Path Switch's Modify Bearer Request is outstanding gets HANDOVER
+    /// PREPARATION FAILURE (interaction with other procedure), and a PATH SWITCH
+    /// REQUEST while an S1 preparation is outstanding gets PATH SWITCH REQUEST
+    /// FAILURE, so one UE never has two Serving GW switches in flight.
+    #[test]
+    fn a_second_mobility_procedure_is_refused_while_one_is_in_flight() {
+        let _guard = lock_s11();
+        let (sgw, _route) = sgw(Gtp2XactConfig::default());
+        let ue = seed(&[5]);
+        let ctx = crate::context::mme_self();
+        let target = ctx.enb_add(enb_addr());
+        ctx.enb_set_enb_id(target, 0x7301);
+        crate::s1ap_path::tap_enb_for_test(target);
+
+        // X2 first: its MBR is outstanding.
+        assert!(path_switch(&ue, target, &[5]).is_empty());
+        let (mbr, from) = recv(&sgw, 34);
+        let required = nextgcore_s1ap::HandoverRequired {
+            mme_ue_s1ap_id: ue.mme_ue_s1ap_id,
+            enb_ue_s1ap_id: 200,
+            handover_type: nextgcore_s1ap::HandoverType::IntraLte,
+            cause: Cause::RadioNetwork(CauseRadioNetwork::Unspecified),
+            target_id: nextgcore_s1ap::TargetId::TargetEnbId {
+                global_enb_id: nextgcore_s1ap::GlobalEnbId {
+                    plmn_identity: [0x13, 0x00, 0x14],
+                    enb_id: nextgcore_s1ap::EnbId::Macro(0x7301),
+                },
+                selected_tai: Tai {
+                    plmn_identity: [0x13, 0x00, 0x14],
+                    tac: 2,
+                },
+            },
+            direct_forwarding_path_availability: None,
+            source_to_target_container: vec![0x00],
+        };
+        let out =
+            crate::s1ap_handler::handle_handover_required_reporting(ctx, target, &required, &[]);
+        assert_eq!(out.len(), 1);
+        let refused = matches!(
+            nextgcore_s1ap_gen::decode(&out[0].pdu),
+            Ok(g::S1AP_PDU::UnsuccessfulOutcome(g::UnsuccessfulOutcome {
+                value: g::UnsuccessfulOutcomeValue::Id_HandoverPreparation(_),
+                ..
+            }))
+        );
+        assert!(
+            refused,
+            "HANDOVER PREPARATION FAILURE: {:?}",
+            nextgcore_s1ap_gen::decode(&out[0].pdu)
+        );
+        assert!(
+            !ctx.enb_ue_pool
+                .read()
+                .unwrap()
+                .values()
+                .any(|t| t.mme_ue_id == ue.mme_ue_id && t.handover_prep_deadline.is_some()),
+            "no S1 preparation was started"
+        );
+        // The Path Switch still completes.
+        sgw.send_to(
+            &mbr_response(ue.local_teid, mbr.header.sequence_number, 16, &[(5, 16)]),
+            from,
+        )
+        .unwrap();
+        wait_pdu(target, path_switch_ack);
+
+        // The other order: an S1 preparation outstanding refuses a Path Switch.
+        let prep_target = ctx.enb_ue_add(target, 400);
+        {
+            let mut pool = ctx.enb_ue_pool.write().unwrap();
+            let t = pool.get_mut(&prep_target).unwrap();
+            t.mme_ue_id = ue.mme_ue_id;
+            t.source_ue_id = ue.source_ue_id;
+            t.handover_prep_deadline = Some(Instant::now() + Duration::from_secs(10));
+        }
+        let out = path_switch(&ue, target, &[5]);
+        assert_eq!(out.len(), 1);
+        let cause = path_switch_failure_cause(&nextgcore_s1ap_gen::decode(&out[0].pdu).unwrap())
+            .expect("PATH SWITCH REQUEST FAILURE");
+        assert!(
+            matches!(&cause, g::Cause::RadioNetwork(r) if r.0 == 29),
+            "interaction-with-other-procedure: {cause:?}"
+        );
+        assert!(!types(&drain(&sgw, Duration::from_millis(300))).contains(&34));
+        ctx.enb_ue_remove(prep_target);
+        release(&ue);
+    }
+
+    /// #730 re-review m-b: the failure counter is rendered for `/metrics` with
+    /// every reason present.
+    #[test]
+    fn the_failure_counter_is_rendered_for_prometheus() {
+        let _guard = lock_s11();
+        count_handover_failure(failure_reason::SGW_NO_ANSWER);
+        let text = render_metrics();
+        assert!(text.contains("# TYPE mme_handover_core_failures_total counter"));
+        for reason in failure_reason::ALL {
+            assert!(
+                text.contains(&format!(
+                    "mme_handover_core_failures_total{{reason=\"{reason}\"}}"
+                )),
+                "{reason}"
+            );
+        }
+        let n: u64 = text
+            .lines()
+            .find(|l| l.contains("reason=\"sgw_no_answer\""))
+            .and_then(|l| l.rsplit(' ').next())
+            .and_then(|v| v.parse().ok())
+            .unwrap();
+        assert!(n >= 1);
     }
 }

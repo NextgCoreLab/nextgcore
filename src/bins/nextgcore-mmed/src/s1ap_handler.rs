@@ -2249,6 +2249,26 @@ pub fn handle_handover_required_reporting(
         );
     };
 
+    // #730 review m-a: one mobility procedure at a time. While the Serving GW
+    // switch of a previous handover (its Modify Bearer Request) is outstanding,
+    // the core has not completed it (TS 23.401 §5.5.1.1.2 step 4, §5.5.1.2.2
+    // step 17), so a new preparation is refused (TS 36.413 §8.4.1.4,
+    // interaction-with-other-procedure).
+    if crate::gtp_path::handover_modification_pending(source_ue.mme_ue_id) {
+        log::warn!(
+            "Handover Required for mme_ue_s1ap_id={} while a handover's Modify Bearer Request \
+             is outstanding; refused",
+            msg.mme_ue_s1ap_id
+        );
+        return handover_preparation_failure(
+            enb_id,
+            msg.mme_ue_s1ap_id,
+            msg.enb_ue_s1ap_id,
+            radio_network_cause::INTERACTION_WITH_OTHER_PROCEDURE,
+            notify,
+        );
+    }
+
     // Allocate the target eNB UE context (eNB UE S1AP ID arrives in the Ack)
     let target_ue_id = ctx.enb_ue_add(target_enb_pool_id, INVALID_UE_S1AP_ID);
     // #48: the source eNB's own statement about its transport to the target
@@ -3097,9 +3117,10 @@ pub fn handle_handover_notify_at(
             .enb_ue_find_by_id(target_ue.source_ue_id)
             .is_some_and(|source| source.mme_ue_id == target_ue.mme_ue_id);
     let n26_arrival = crate::n26_path::forward_relocation_in_flight(target_ue.mme_ue_id);
-    if !(s1_target || n26_arrival)
-        || crate::gtp_path::handover_modification_pending(target_ue.mme_ue_id)
-    {
+    // A Serving GW switch of another procedure cannot be pending here: HANDOVER
+    // REQUIRED is refused while one is (and a PATH SWITCH REQUEST while an S1
+    // preparation is outstanding), so one UE never has two (#730 review m-a).
+    if !(s1_target || n26_arrival) {
         log::warn!(
             "Handover Notify for mme_ue_s1ap_id={mme_ue_s1ap_id}: no handover to this eNB is in \
              progress (a duplicate, or a UE that is not handing over); only the location is \
@@ -3217,6 +3238,7 @@ fn switch_serving_gw_after_handover_notify(
     if ctx.mme_ue_find_by_id(mme_ue_id).is_none() {
         return;
     }
+    let admitted: Vec<u8> = switched.iter().map(|b| b.ebi).collect();
     let (switched, omitted) = crate::handover_switch::only_pdns_with_a_switched_default(
         ctx, mme_ue_id, switched, omitted,
     );
@@ -3244,6 +3266,7 @@ fn switch_serving_gw_after_handover_notify(
             enb_id: target_ue.enb_id,
             mme_ue_s1ap_id: target_ue.mme_ue_s1ap_id,
             enb_ue_s1ap_id: target_ue.enb_ue_s1ap_id,
+            admitted,
         },
     };
     match crate::gtp_path::send_modify_bearer_request_for_handover(ctx, pending) {
@@ -3534,6 +3557,30 @@ pub fn handle_path_switch_request_reporting(
     // #730: one handover at a time. A second Path Switch Request while the first
     // one's Modify Bearer Request is outstanding would race it for the bearers.
     if let Some(ue) = ctx.enb_ue_find_by_id(enb_ue_id) {
+        // #730 review m-a: and not while an S1 handover preparation of the same
+        // UE is outstanding (a target context armed by HANDOVER REQUIRED).
+        let s1_preparation = ctx
+            .enb_ue_pool
+            .read()
+            .unwrap()
+            .values()
+            .any(|t| t.mme_ue_id == ue.mme_ue_id && t.handover_prep_deadline.is_some());
+        if s1_preparation {
+            log::warn!(
+                "Path Switch Request for mme_ue_s1ap_id={} while an S1 handover preparation \
+                 is outstanding; refused",
+                msg.source_mme_ue_s1ap_id
+            );
+            crate::handover_switch::count_handover_failure(
+                crate::handover_switch::failure_reason::ALREADY_PENDING,
+            );
+            return path_switch_failure(
+                enb_id,
+                msg.source_mme_ue_s1ap_id,
+                msg.enb_ue_s1ap_id,
+                radio_network_cause::INTERACTION_WITH_OTHER_PROCEDURE,
+            );
+        }
         if crate::gtp_path::handover_modification_pending(ue.mme_ue_id) {
             log::warn!(
                 "Path Switch Request for mme_ue_s1ap_id={} while a handover's Modify Bearer \

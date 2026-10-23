@@ -1468,6 +1468,12 @@ pub enum HandoverModifyKind {
         enb_id: u64,
         mme_ue_s1ap_id: u32,
         enb_ue_s1ap_id: u32,
+        /// Every E-RAB the target admitted (HANDOVER REQUEST ACKNOWLEDGE),
+        /// before the bearers of PDN connections whose default bearer it did
+        /// not admit were dropped from the request: the target holds a radio
+        /// bearer for each, so any the core releases goes in the E-RAB RELEASE
+        /// COMMAND (#730 review N1).
+        admitted: Vec<u8>,
     },
 }
 
@@ -1717,6 +1723,10 @@ fn sequence() -> GtpPathResult<u32> {
 /// most significant bit is set, TS 29.274 §7.6 (#727). [`sequence`] numbers never
 /// have it.
 fn command_sequence() -> GtpPathResult<u32> {
+    #[cfg(test)]
+    if let Some((server, _)) = test_route(None) {
+        return Ok(server.alloc_command_sequence());
+    }
     server().map(|s| s.alloc_command_sequence()).ok_or_else(|| {
         GtpPathError::SocketError("no S11 socket bound: cannot allocate a sequence".to_string())
     })
