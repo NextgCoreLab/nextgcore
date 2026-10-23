@@ -9390,7 +9390,12 @@ impl NgapServer {
                             p.pdu_session_id
                         );
                     }
-                    sess.map(|sess| (p.pdu_session_id, sess.s_nssai))
+                    // SST 0 is no slice: TS 23.501 §5.15.2.2 standardises SST values from
+                    // 1, and 0 is what a record whose writer had no S-NSSAI holds
+                    // (`SNssai::default()`). It falls back like a missing record rather
+                    // than going to the target as a slice it cannot admit.
+                    sess.filter(|sess| sess.s_nssai.sst != 0)
+                        .map(|sess| (p.pdu_session_id, sess.s_nssai))
                 })
                 .collect()
         };
@@ -10776,19 +10781,26 @@ impl NgapServer {
         };
 
         // The UE and its sessions exist from here on: the target gNB may answer at once.
+        // Each session is recorded under the S-NSSAI its HandoverRequest item carried,
+        // the default one included when the SMF named none (#743 follow-up), so a later
+        // N2 handover hands it over under the same slice.
         for sess in &prep.sessions {
             self.sm_context_refs.insert(
                 (amf_ue_ngap_id, sess.created.pdu_session_id),
                 sess.created.sm_context_ref.clone(),
             );
+            let used = request
+                .sessions
+                .iter()
+                .find(|s| s.pdu_session_id == sess.created.pdu_session_id)
+                .map(|s| s.s_nssai.clone());
             let ctx = crate::context::amf_self();
             let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
             if let Some(mut amf_sess) = guard.sess_add(amf_ue_ngap_id, sess.created.pdu_session_id)
             {
                 amf_sess.sm_context_ref = Some(sess.created.sm_context_ref.clone());
-                if let Some((sst, sd)) = sess.created.s_nssai {
-                    amf_sess.s_nssai.sst = sst;
-                    amf_sess.s_nssai.sd = sd;
+                if let Some(s_nssai) = used {
+                    amf_sess.s_nssai = s_nssai;
                 }
                 guard.sess_update(&amf_sess);
             }
@@ -20024,7 +20036,9 @@ mod tests {
         let ue = 7_743_001u64;
         let mut state = UeNasContext::new(ue, 9, source, false);
         state.registered = true;
+        // The FIRST allowed S-NSSAI (SST 3) is on no session, so the fallback shows.
         state.amf_ue.allowed_nssai = vec![
+            SNssai { sst: 3, sd: None },
             SNssai { sst: 1, sd: None },
             SNssai {
                 sst: 2,
@@ -20032,8 +20046,23 @@ mod tests {
             },
         ];
         server.ue_auth_state.insert(ue, state);
+        // Cleanup even when an assertion fails: the session list is process-global.
+        struct ForgetSessions(u64);
+        impl Drop for ForgetSessions {
+            fn drop(&mut self) {
+                let ctx = crate::context::amf_self();
+                let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+                for sess in guard.sess_list_for_ue(self.0) {
+                    guard.sess_remove(sess.id);
+                }
+            }
+        }
+        let _forget = ForgetSessions(ue);
         record_amf_session(ue, 1, "ref-743-1", 1, None);
         record_amf_session(ue, 2, "ref-743-2", 2, Some(0x01_0203));
+        // #743 follow-up: PSI 3 has no record; PSI 4's record holds no slice (SST 0, what
+        // a writer that had none leaves). Both fall back to the first allowed S-NSSAI.
+        record_amf_session(ue, 4, "ref-743-4", 0, None);
 
         let plmn = plmn_id_to_ngap_bytes(&PlmnId::new("001", "01"));
         let required = nextgcore_ngap::builder::build_handover_required(
@@ -20055,7 +20084,7 @@ mod tests {
                         tai_tac: [0x00, 0x00, 0x01],
                     },
                 },
-                pdu_session_list: [1u8, 2]
+                pdu_session_list: [1u8, 2, 3, 4]
                     .iter()
                     .map(|&psi| nextgcore_ngap::types::PduSessionResourceItemHoRqd {
                         pdu_session_id: psi,
@@ -20107,15 +20136,13 @@ mod tests {
             slices,
             vec![
                 (1, vec![1], None),
-                (2, vec![2], Some(vec![0x01, 0x02, 0x03]))
+                (2, vec![2], Some(vec![0x01, 0x02, 0x03])),
+                (3, vec![3], None),
+                (4, vec![3], None)
             ],
-            "each session under its own S-NSSAI"
+            "each session under its own S-NSSAI; no record, or SST 0, falls back to the \
+             first allowed one"
         );
-        let ctx = crate::context::amf_self();
-        let guard = ctx.read().unwrap();
-        for sess in guard.sess_list_for_ue(ue) {
-            guard.sess_remove(sess.id);
-        }
     }
 
     /// The `(amf_ue_ngap_id, ran_ue_ngap_id)` a DOWNLINK RAN STATUS TRANSFER carries,
