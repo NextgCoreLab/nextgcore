@@ -6742,6 +6742,61 @@ mod tests {
         );
     }
 
+    /// #818 (TS 29.244 Table 7.5.8.3-1): every report carries the times of the
+    /// measurement it covers -- Start Time (the previous report, or the URR's creation),
+    /// End Time (now), a Duration Measurement of MEASURED time when the URR measures
+    /// DURAT, and the times of its first and last packet -- and the next report starts
+    /// where this one ended.
+    #[test]
+    fn a_report_carries_the_times_of_its_measurement() {
+        let urr = DataPlaneUrr::new(1);
+        urr.set_measure_duration(true);
+        let created = std::time::SystemTime::now();
+        assert_eq!(urr.record(100, true), UrrOutcome::Continue);
+        urr.advance_measured(std::time::Duration::from_secs(7));
+        let (_, t) = urr.take_report(false);
+        assert!(t.start <= created + std::time::Duration::from_millis(50));
+        assert!(t.end >= t.start);
+        assert_eq!(
+            t.duration.map(|d| d.as_secs()),
+            Some(7),
+            "measured time, DURAT"
+        );
+        assert!(
+            t.first_pkt.is_some() && t.last_pkt.is_some(),
+            "traffic was seen"
+        );
+
+        let (_, t2) = urr.take_report(false);
+        assert_eq!(
+            t2.start, t.end,
+            "the next measurement starts where this ended"
+        );
+        assert_eq!(t2.first_pkt, None, "no traffic in it");
+
+        let plain = DataPlaneUrr::new(2);
+        let (_, t) = plain.take_report(false);
+        assert_eq!(t.duration, None, "no Duration Measurement without DURAT");
+    }
+
+    /// #818: a report that was not delivered gives its time back with its usage: the
+    /// next report's Start Time and Duration reach back over it.
+    #[test]
+    fn an_undelivered_reports_times_are_carried_by_the_next_one() {
+        let urr = DataPlaneUrr::new(1);
+        urr.set_measure_duration(true);
+        urr.record(10, true);
+        urr.advance_measured(std::time::Duration::from_secs(4));
+        let (usage, lost) = urr.take_report(false);
+        urr.restore_usage(&usage);
+        urr.restore_times(&lost);
+        urr.advance_measured(std::time::Duration::from_secs(3));
+        let (_, next) = urr.take_report(false);
+        assert_eq!(next.start, lost.start);
+        assert_eq!(next.duration.map(|d| d.as_secs()), Some(7));
+        assert_eq!(next.first_pkt, lost.first_pkt);
+    }
+
     /// #842 review (decision): a packet dropped because the quota is ALREADY exhausted
     /// is not measured -- it was never forwarded, so it is not usage to bill.
     #[test]

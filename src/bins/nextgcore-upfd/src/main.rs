@@ -1015,6 +1015,8 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                                 u.time_quota_secs,
                             );
                             // #820: how TIME is measured (§5.2.2.2).
+                            // #818: a URR measuring time reports a Duration Measurement.
+                            urr.set_measure_duration(u.measure_duration);
                             urr.set_time_metering(
                                 u.inactivity_detection_secs,
                                 u.immediate_start_time_metering,
@@ -1176,6 +1178,8 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                             u.time_quota_secs,
                         );
                         // #820: how TIME is measured (§5.2.2.2).
+                        // #818: a URR measuring time reports a Duration Measurement.
+                        urr.set_measure_duration(u.measure_duration);
                         urr.set_time_metering(
                             u.inactivity_detection_secs,
                             u.immediate_start_time_metering,
