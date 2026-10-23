@@ -972,6 +972,9 @@ async fn main() -> Result<()> {
         pfcp_listener_handle,
     )
     .await;
+    // #912 review m5: the releases the UEs completed during the shutdown are still
+    // telling the UDM, the AMF and the EASDF; the runtime would cut them.
+    drain_release_side_effects(std::time::Duration::from_secs(3)).await;
 
     // Stop SBI server
     sbi_server
@@ -3724,6 +3727,11 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
             );
         }
     }
+    // #912 review M2: a release of this (SUPI, PSI) still in flight would otherwise
+    // land after this session's UECM registration and EBI assignment, and delete the
+    // live session's serving-SMF record and free its EBI. A #39 reactivation is
+    // re-established at once with the same PSI, so this is the common case.
+    await_release_in_flight(&supi, pdu_session_id).await;
     udm::register_as_serving_smf(
         &supi,
         pdu_session_id,
@@ -5445,53 +5453,223 @@ fn complete_sm_context_release(sm_context_ref: &str) -> Option<String> {
     status_uri
 }
 
-/// Drop an SM context and its policy binding, returning the AMF's
-/// `smContextStatusUri` for the RELEASED notification.
+/// Serialises [`take_sm_context`] (#912 review B1, M1): whichever release path takes
+/// an SM context does all of the taking, with no await, before another can look.
+static SM_CONTEXT_TAKE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take an SM context out of this SMF, once (#912 review B1, M1): its policy
+/// binding, its session, its PFCP map entries, any 5GSM procedure timer, and its UE
+/// IPv4 address, freed exactly once. Returns the binding, or `None` when there was
+/// nothing left to take (another release path took it first).
 ///
-/// #853: everything the AMF-driven release (`handle_sm_context_release`) does for
-/// the context, not only the local drop. The UE's IPv4 address goes back to the pool,
-/// any PFCP session map entry goes, and the release's effects at other NFs are sent
-/// from their own task ([`release_side_effects`]): UDM deregistration and SDM
-/// unsubscribe, the EBI back to the AMF, the EASDF DNS context, and the PDU_SES_REL
-/// event. Before, a release completed through the UE (#39 reactivation after a UPF
-/// restart, a UE-requested or RAN-released session) left one serving-SMF registration
-/// and SDM subscription per session at the UDM, and held the address.
-fn release_sm_context_locally(sm_context_ref: &str) -> Option<String> {
-    let removed = smf_self().read().ok().and_then(|ctx| {
-        ctx.policy_bindings
-            .write()
-            .ok()
-            .and_then(|mut b| b.remove(sm_context_ref))
-    });
-    if let Ok(context) = smf_self().read() {
-        if let Some(sess) = context.sess_find_by_sm_context_ref(sm_context_ref) {
-            context.sess_remove(sess.id);
+/// The address has one owner. An established session holds it as `sess.ipv4_addr`,
+/// and `sess_remove` frees that; the binding's `ue_ip` is freed only when there is
+/// no session to free it (a binding restored from durable state has no `SmfSess`).
+/// Freeing both put the address back twice, and between the two frees another UE
+/// could be given it, and then a third.
+///
+/// A session counts only while it still carries the reference:
+/// `sess_find_by_sm_context_ref` resolves a reference by session index alone, and so
+/// also finds an EPS PDN connection that was never, or is no longer, this context.
+pub(crate) fn take_sm_context(sm_context_ref: &str) -> Option<Option<context::PolicyBinding>> {
+    let _take = SM_CONTEXT_TAKE.lock().unwrap_or_else(|e| e.into_inner());
+    let handle = smf_self();
+    let ctx = handle.read().ok()?;
+    let binding = ctx
+        .policy_bindings
+        .write()
+        .ok()
+        .and_then(|mut b| b.remove(sm_context_ref));
+    let sess = ctx
+        .sess_find_by_sm_context_ref(sm_context_ref)
+        .filter(|s| s.sm_context_ref.as_deref() == Some(sm_context_ref));
+    if binding.is_none() && sess.is_none() {
+        return None;
+    }
+    for map in [&ctx.pfcp_sessions, &ctx.cp_n4_seids] {
+        if let Ok(mut m) = map.write() {
+            m.remove(sm_context_ref);
         }
-        for map in [&context.pfcp_sessions, &context.cp_n4_seids] {
-            if let Ok(mut m) = map.write() {
-                m.remove(sm_context_ref);
+    }
+    if let Ok(mut m) = ctx.upf_ul_endpoints.write() {
+        m.remove(sm_context_ref);
+    }
+    if let Ok(mut timers) = gsm_procedure_timers().lock() {
+        timers.remove(sm_context_ref);
+    }
+    let binding_ip = binding
+        .as_ref()
+        .map(|b| b.ue_ip)
+        .filter(|ip| *ip != [0; 4])
+        .map(std::net::Ipv4Addr::from);
+    match sess {
+        Some(sess) => {
+            let sess_ip = sess.ipv4_addr;
+            // Frees `sess.ipv4_addr` and persists.
+            ctx.sess_remove(sess.id);
+            if sess_ip.is_none() {
+                if let Some(ip) = binding_ip {
+                    ctx.ipv4_pool.release(ip);
+                    ctx.persist();
+                }
             }
         }
-        if let Some(b) = removed.as_ref().filter(|b| b.ue_ip != [0; 4]) {
-            context.ipv4_pool.release(std::net::Ipv4Addr::from(b.ue_ip));
+        None => {
+            if let Some(ip) = binding_ip {
+                ctx.ipv4_pool.release(ip);
+            }
+            // Issue #191: once, after every write guard above has dropped.
+            ctx.persist();
         }
-        // Issue #191: after every write guard above has dropped.
-        context.persist();
     }
-    let status_uri = removed
-        .as_ref()
-        .and_then(|b| b.sm_context_status_uri.clone());
-    if let Some(binding) = removed {
-        let reference = sm_context_ref.to_string();
-        tokio::spawn(async move { release_side_effects(&reference, &binding).await });
-    }
+    Some(binding)
+}
+
+/// Drop an SM context, returning the AMF's `smContextStatusUri` for the RELEASED
+/// notification (#853).
+///
+/// Everything the AMF-driven release (`handle_sm_context_release`) does for the
+/// context, not only the local drop: [`take_sm_context`] (binding, session, address,
+/// PFCP map entries, timers), then the release's effects at other NFs in their own
+/// task ([`spawn_release_side_effects`]). Before #853 a release completed through
+/// the UE (#39 reactivation after a UPF restart, a UE-requested or RAN-released
+/// session) left one serving-SMF registration and SDM subscription per session at the
+/// UDM.
+fn release_sm_context_locally(sm_context_ref: &str) -> Option<String> {
+    let binding = take_sm_context(sm_context_ref)??;
+    let status_uri = binding.sm_context_status_uri.clone();
+    spawn_release_side_effects(sm_context_ref, binding);
     status_uri
 }
 
+/// How many [`release_side_effects`] run at once (#912 review m4): a UPF restart
+/// completes N releases together, and each one talks to the UDM, the EASDF and the
+/// AMF.
+const RELEASE_SIDE_EFFECTS_FANOUT: usize = 16;
+
+fn release_side_effect_permits() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static PERMITS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| {
+        std::sync::Arc::new(tokio::sync::Semaphore::new(RELEASE_SIDE_EFFECTS_FANOUT))
+    })
+}
+
+/// The releases whose effects at other NFs are still running, per (SUPI, PSI)
+/// (#912 review M2). Each entry's semaphore is closed, waking every waiter, when the
+/// release finishes.
+fn releases_in_flight() -> &'static std::sync::Mutex<
+    std::collections::HashMap<(String, u8), std::sync::Arc<tokio::sync::Semaphore>>,
+> {
+    static IN_FLIGHT: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<(String, u8), std::sync::Arc<tokio::sync::Semaphore>>,
+        >,
+    > = std::sync::OnceLock::new();
+    IN_FLIGHT.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Marks one release of (SUPI, PSI) in flight until dropped.
+struct ReleaseInFlight {
+    key: (String, u8),
+    done: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+impl ReleaseInFlight {
+    fn begin(supi: &str, psi: u8) -> Self {
+        let key = (supi.to_string(), psi);
+        let done = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        releases_in_flight()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone(), done.clone());
+        Self { key, done }
+    }
+}
+
+impl Drop for ReleaseInFlight {
+    fn drop(&mut self) {
+        let mut map = releases_in_flight()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if map
+            .get(&self.key)
+            .is_some_and(|d| std::sync::Arc::ptr_eq(d, &self.done))
+        {
+            map.remove(&self.key);
+        }
+        self.done.close();
+    }
+}
+
+/// How long a new session for a (SUPI, PSI) waits for that pair's release to finish.
+const RELEASE_IN_FLIGHT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Wait, at most [`RELEASE_IN_FLIGHT_WAIT`], for a release of (SUPI, PSI) to finish
+/// (#912 review M2).
+async fn await_release_in_flight(supi: &str, psi: u8) {
+    let pending = releases_in_flight()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(supi.to_string(), psi))
+        .cloned();
+    if let Some(done) = pending {
+        log::info!("[{supi}] PSI {psi}: waiting for the previous release of this PSI to finish");
+        if tokio::time::timeout(RELEASE_IN_FLIGHT_WAIT, done.acquire())
+            .await
+            .is_err()
+        {
+            log::warn!(
+                "[{supi}] PSI {psi}: the previous release is still running after {:?}; \
+                 registering anyway",
+                RELEASE_IN_FLIGHT_WAIT
+            );
+        }
+    }
+}
+
+/// Wait, at most `budget`, until no release side effects are running (#912 review
+/// m5): a graceful shutdown would otherwise cut them when the runtime goes.
+async fn drain_release_side_effects(budget: std::time::Duration) {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let left = releases_in_flight().lock().map(|m| m.len()).unwrap_or(0);
+        if left == 0 {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            log::warn!(
+                "Shutdown: {left} release(s) still telling the UDM/AMF/EASDF after {budget:?}; \
+                 their records stay there"
+            );
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// Run [`release_side_effects`] in its own task, bounded and marked in flight.
+fn spawn_release_side_effects(sm_context_ref: &str, binding: context::PolicyBinding) {
+    let reference = sm_context_ref.to_string();
+    let in_flight = ReleaseInFlight::begin(&binding.supi, binding.psi);
+    tokio::spawn(async move {
+        let _in_flight = in_flight;
+        let Ok(_permit) = release_side_effect_permits().clone().acquire_owned().await else {
+            return;
+        };
+        release_side_effects(&reference, &binding).await;
+    });
+}
+
 /// A released SM context's effects at other NFs, each best-effort (#853): its EASDF
-/// DNS context (#114), its UDM serving-SMF registration and SDM subscription (#293),
+/// DNS context (#114), its SDM subscription and UDM serving-SMF registration (#293),
 /// its EPS bearer identity at the AMF (#291), and the PDU_SES_REL event (#79). Shared
 /// by every release path so none can skip one.
+///
+/// TS 23.502 §4.3.4.2 order: step 14 (Nudm_SDM_Unsubscribe) before step 15
+/// (Nudm_UECM_Deregistration). Step 14 is conditioned on the last PDU session for the
+/// (DNN, S-NSSAI); this SMF subscribes per PDU session (the subscription id is on the
+/// binding), so each session's own subscription is the one to remove.
 async fn release_side_effects(sm_context_ref: &str, binding: &context::PolicyBinding) {
     // #114: a failure leaves an orphan the EASDF's own capacity cap bounds, whereas
     // failing the release would leave this SMF's session state inconsistent with
@@ -5499,14 +5677,14 @@ async fn release_side_effects(sm_context_ref: &str, binding: &context::PolicyBin
     if let Some(ctx_id) = &binding.easdf_dns_context_id {
         easdf::delete_dns_context(&binding.supi, ctx_id).await;
     }
-    // #293: without the deregistration a UDM accumulates serving-SMF records for
-    // released sessions, so a procedure resolving the serving SMF through the UDM
-    // resolves a released session to this SMF. Without the unsubscribe the UDM keeps
-    // notifying a callback URI whose smContextRef no longer resolves.
-    udm::deregister_serving_smf(&binding.supi, binding.psi).await;
+    // #293: without the unsubscribe the UDM keeps notifying a callback URI whose
+    // smContextRef no longer resolves; without the deregistration it accumulates
+    // serving-SMF records for released sessions, so a procedure resolving the serving
+    // SMF through the UDM resolves a released session to this SMF.
     if let Some(sub_id) = &binding.sdm_subscription_id {
         udm::unsubscribe_sm_data(&binding.supi, sub_id).await;
     }
+    udm::deregister_serving_smf(&binding.supi, binding.psi).await;
     // #291: the eleven-wide per-UE EBI space (TS 24.301 §9.3.2) otherwise leaks one
     // identity per session lifetime. The AMF's authority is the same
     // `smContextStatusUri` callback root the assignment used.
@@ -6551,21 +6729,19 @@ async fn handle_sm_context_release(
         );
     }
 
-    // Take the policy binding (copy out, drop guards before any await)
-    let binding = smf_self().read().ok().and_then(|ctx| {
-        ctx.policy_bindings
-            .write()
-            .ok()
-            .and_then(|mut bindings| bindings.remove(sm_context_ref))
-    });
-
-    // #114, #293, #291, #79: the release's effects at the EASDF, the UDM, the AMF
-    // (EBI) and event-exposure subscribers, shared with every other release path
-    // (#853). Read off the binding taken above; each is best-effort, because the
-    // session is leaving either way.
-    if let Some(binding) = &binding {
-        release_side_effects(sm_context_ref, binding).await;
-    }
+    // #912 review B1/M1: take the whole context first, with no await, so a T3592
+    // abandon or a RELEASE COMPLETE racing this release finds nothing to take and
+    // cannot free the address a second time. What the N4 deletion needs is read
+    // before the take removes it.
+    let upf_seid = lookup_upf_seid(sm_context_ref);
+    let smf_n4_seid = smf_n4_seid_for(sm_context_ref);
+    let Some(binding) = take_sm_context(sm_context_ref) else {
+        log::warn!("SM Context Release ref={sm_context_ref}: already released by another path");
+        return SbiResponse::with_status(204);
+    };
+    let _in_flight = binding
+        .as_ref()
+        .map(|b| ReleaseInFlight::begin(&b.supi, b.psi));
 
     // Drive the GSM FSM: Operational → WaitPfcpDeletion
     let mut fsm = binding.as_ref().map(|b| b.fsm.clone());
@@ -6592,20 +6768,9 @@ async fn handle_sm_context_release(
         f.dispatch(&ev);
     }
 
-    // N7: delete the SM policy association at the PCF. The binding was removed
-    // whole above, so this is the only DELETE; it runs in its own task, with the
-    // same bounded retry and failure metric as every other release path (#719
-    // review m6).
-    if let Some(pol_id) = binding.as_ref().and_then(|b| b.sm_policy_id.clone()) {
-        spawn_sm_policy_delete(pol_id);
-    }
-
-    // Look up UPF SEID for this session (from SmfContext, not a global)
-    let upf_seid = lookup_upf_seid(sm_context_ref);
-
+    // Step 2: N4 Session Release.
     if let Some(seid) = upf_seid {
-        // Send PFCP Session Deletion Request to UPF (with retransmission)
-        match pfcp_session_delete(smf_n4_seid_for(sm_context_ref), seid).await {
+        match pfcp_session_delete(smf_n4_seid, seid).await {
             Ok(()) => {
                 log::info!("PFCP Session Deleted: UPF SEID=0x{seid:016x} for ref={sm_context_ref}");
                 if let Some(ref mut f) = fsm {
@@ -6614,53 +6779,35 @@ async fn handle_sm_context_release(
                 }
             }
             Err(e) => {
-                // The local context is removed anyway: keeping it would leak
-                // resources for a session the peer may no longer have
+                // The local context is already gone: keeping it would leak resources
+                // for a session the peer may no longer have
                 log::warn!("PFCP Session Deletion failed: {e} (continuing with release)");
             }
-        }
-
-        // Remove from PFCP sessions map
-        if let Ok(ctx) = smf_self().read() {
-            if let Ok(mut sessions) = ctx.pfcp_sessions.write() {
-                sessions.remove(sm_context_ref);
-            }
-            // #475: and the inherited N4 SEID, if this context came from EPS.
-            if let Ok(mut seids) = ctx.cp_n4_seids.write() {
-                seids.remove(sm_context_ref);
-            }
-            // Issue #191: after the write guards drop (see `SmfContext::persist`).
-            ctx.persist();
         }
     } else {
         log::warn!("No PFCP session found for sm_context_ref={sm_context_ref}");
     }
 
-    // Release the UE IP allocated for this session
-    if let Some(ref b) = binding {
-        if let Ok(ctx) = smf_self().read() {
-            ctx.ipv4_pool.release(std::net::Ipv4Addr::from(b.ue_ip));
-            // Issue #191: a release that is not persisted leaves the address held
-            // in the snapshot forever -- a pool leak across restarts, which is the
-            // mirror of the double-assignment the snapshot exists to prevent.
-            ctx.persist();
-        }
-    }
-
-    // Remove from SMF context
-    let ctx = smf_self();
-    if let Ok(context) = ctx.read() {
-        if let Some(sess) = context.sess_find_by_sm_context_ref(sm_context_ref) {
-            context.sess_remove(sess.id);
-        }
-    }
-
-    // Notify the AMF the SM context is RELEASED (TS 29.502 §5.2.2.8). No-op
-    // when the AMF supplied no smContextStatusUri (the matched-sim AMF). smfd-07.
+    // Step 11: tell the AMF the SM context is RELEASED (TS 29.502 §5.2.2.8). No-op when
+    // the AMF supplied no smContextStatusUri (the matched-sim AMF). smfd-07.
     let status_uri = binding
         .as_ref()
         .and_then(|b| b.sm_context_status_uri.clone());
     send_sm_context_status_notification(status_uri.as_deref(), "RELEASED", None).await;
+
+    // Step 12: SM Policy Association Termination, in its own task with the bounded
+    // retry and failure metric every release path uses (#719 review m6).
+    if let Some(pol_id) = binding.as_ref().and_then(|b| b.sm_policy_id.clone()) {
+        spawn_sm_policy_delete(pol_id);
+    }
+
+    // Steps 14-15 and the rest at other NFs (EASDF, UDM, the EBI at the AMF, the
+    // PDU_SES_REL event), shared with every other release path (#853), awaited here as
+    // before #853 so the AMF's 204 still follows them.
+    if let Some(binding) = &binding {
+        let _permit = release_side_effect_permits().clone().acquire_owned().await;
+        release_side_effects(sm_context_ref, binding).await;
+    }
 
     SbiResponse::with_status(204)
 }
@@ -10651,6 +10798,345 @@ mod tests {
         assert!(freed, "the address is back in the pool");
     }
 
+    // ---- #853 / #912 review: one owner per release; every path cleans up ----
+
+    /// A loopback UDM that answers every request after `delay`, and records
+    /// `(method, uri)` (#912 review M2). Points the UDM leg at itself.
+    async fn spawn_slow_udm(
+        delay: std::time::Duration,
+    ) -> (
+        nextgcore_sbi::server::SbiServer,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    ) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let (srv, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let sink = sink.clone();
+                async move {
+                    tokio::time::sleep(delay).await;
+                    sink.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push((req.header.method.clone(), req.header.uri.clone()));
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await;
+        std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("UDM_SBI_PORT", addr.port().to_string());
+        udm::set_for_test(true);
+        (srv, seen)
+    }
+
+    fn stop_udm_leg() {
+        udm::set_for_test(false);
+        std::env::remove_var("UDM_SBI_ADDR");
+        std::env::remove_var("UDM_SBI_PORT");
+    }
+
+    /// An ESTABLISHED SM context: a registered session holding `ue_ip` as
+    /// `sess.ipv4_addr`, and a binding naming the same address, as a create leaves
+    /// them. Returns the reference.
+    fn seed_established_session(supi: &str, psi: u8, ue_ip: std::net::Ipv4Addr) -> String {
+        let ctx = smf_self();
+        let context = ctx.read().expect("context");
+        assert!(
+            context.ipv4_pool.reserve(ue_ip),
+            "precondition: {ue_ip} free"
+        );
+        let (reference, sess_id) = register_sm_context(&context, supi, psi).expect("register");
+        let mut sess = context.sess_find_by_id(sess_id).expect("session");
+        sess.ipv4_addr = Some(ue_ip);
+        context.sess_update(&sess);
+        let mut b = context::PolicyBinding::snapshot_default();
+        b.supi = supi.to_string();
+        b.psi = psi;
+        b.ue_ip = ue_ip.octets();
+        b.sdm_subscription_id = Some(format!("sub-{psi}"));
+        context
+            .policy_bindings
+            .write()
+            .unwrap()
+            .insert(reference.clone(), b);
+        context
+            .pfcp_sessions
+            .write()
+            .unwrap()
+            .insert(reference.clone(), 0x0912);
+        reference
+    }
+
+    /// Wait until no release side effects run (all spawned tasks done).
+    async fn side_effects_settled() {
+        drain_release_side_effects(std::time::Duration::from_secs(5)).await;
+    }
+
+    /// #912 review B1: an established session's address is freed ONCE. After the
+    /// release, "UE B" is given the address; it must still be B's when every release
+    /// step has run. Before, the session's removal freed it and the binding freed it
+    /// again, so B's allocation was released under it.
+    #[tokio::test]
+    async fn an_established_sessions_address_is_freed_once() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        smf_context_init(64, 256, 512);
+        let ip = std::net::Ipv4Addr::new(10, 45, 9, 12);
+        let reference = seed_established_session("imsi-001010000009121", 5, ip);
+
+        let _ = release_sm_context_locally(&reference);
+        let pool = |f: &dyn Fn(&context::SmfContext) -> bool| f(&smf_self().read().unwrap());
+        let free_after_release = pool(&|c| c.ipv4_pool.reserve(ip)); // UE B takes it
+        side_effects_settled().await;
+        let still_bs = !pool(&|c| c.ipv4_pool.reserve(ip));
+        let map_entry_gone = smf_self()
+            .read()
+            .unwrap()
+            .pfcp_sessions
+            .read()
+            .unwrap()
+            .get(&reference)
+            .is_none();
+        smf_self().read().unwrap().ipv4_pool.release(ip);
+
+        assert!(free_after_release, "the release freed the address");
+        assert!(still_bs, "and only once: B still holds it");
+        assert!(map_entry_gone, "the PFCP session map entry is gone");
+    }
+
+    /// #912 review B1, deterministically: the session owns the address. A binding
+    /// whose `ue_ip` names ANOTHER address (here UE B's) must not free it. Before,
+    /// both were freed, which is the double free that, interleaved with a create,
+    /// handed one address to two UEs.
+    #[tokio::test]
+    async fn a_release_frees_only_the_sessions_address() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        smf_context_init(64, 256, 512);
+        let a_ip = std::net::Ipv4Addr::new(10, 45, 9, 17);
+        let b_ip = std::net::Ipv4Addr::new(10, 45, 9, 18);
+        let reference = seed_established_session("imsi-001010000009126", 11, a_ip);
+        assert!(
+            smf_self().read().unwrap().ipv4_pool.reserve(b_ip),
+            "UE B holds b_ip"
+        );
+        if let Ok(ctx) = smf_self().read() {
+            ctx.policy_bindings
+                .write()
+                .unwrap()
+                .get_mut(&reference)
+                .unwrap()
+                .ue_ip = b_ip.octets();
+        }
+        let _ = release_sm_context_locally(&reference);
+        side_effects_settled().await;
+        let ctx = smf_self();
+        let ctx = ctx.read().unwrap();
+        let a_free = ctx.ipv4_pool.reserve(a_ip);
+        let b_still_held = !ctx.ipv4_pool.reserve(b_ip);
+        ctx.ipv4_pool.release(a_ip);
+        ctx.ipv4_pool.release(b_ip);
+        assert!(a_free, "the session's address is freed");
+        assert!(b_still_held, "and nothing else");
+    }
+
+    /// #912 review M3: a UPF answering cause 65 ("session not found") releases the
+    /// context completely: binding, session and address. Before, only the PFCP map
+    /// entry went, and the half-live context answered every later request.
+    #[tokio::test]
+    async fn a_session_the_upf_does_not_know_is_released_completely() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        smf_context_init(64, 256, 512);
+        let ip = std::net::Ipv4Addr::new(10, 45, 9, 19);
+        let reference = seed_established_session("imsi-001010000009127", 12, ip);
+        if let Ok(ctx) = smf_self().read() {
+            ctx.pfcp_sessions
+                .write()
+                .unwrap()
+                .insert(reference.clone(), 0x0912_0065);
+        }
+        assert!(restoration::reconcile_session_not_found(0x0912_0065).await);
+        side_effects_settled().await;
+        let gone = lookup_policy_binding(&reference).is_none();
+        let freed = smf_self().read().unwrap().ipv4_pool.reserve(ip);
+        smf_self().read().unwrap().ipv4_pool.release(ip);
+        assert!(gone, "the binding is released");
+        assert!(freed, "and the address");
+    }
+
+    /// #854: a UPF restart releases a session whose binding names no UE completely,
+    /// rather than only notifying RELEASED and keeping the binding for good.
+    #[tokio::test]
+    async fn an_identity_less_session_is_released_completely_on_a_upf_restart() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        smf_context_init(64, 256, 512);
+        let ip = std::net::Ipv4Addr::new(10, 45, 9, 20);
+        let reference = seed_established_session("imsi-001010000009128", 13, ip);
+        if let Ok(ctx) = smf_self().read() {
+            let mut bindings = ctx.policy_bindings.write().unwrap();
+            let b = bindings.get_mut(&reference).unwrap();
+            b.supi.clear(); // no UE to release it through
+            b.sm_context_status_uri = Some("http://127.0.0.1:1/sm-status".to_string());
+        }
+        let notified = restoration::notify_sessions_unrecoverable("peer restarted").await;
+        side_effects_settled().await;
+        let gone = lookup_policy_binding(&reference).is_none();
+        let freed = smf_self().read().unwrap().ipv4_pool.reserve(ip);
+        smf_self().read().unwrap().ipv4_pool.release(ip);
+        if let Ok(ctx) = smf_self().read() {
+            ctx.pfcp_sessions.write().unwrap().remove(&reference);
+        }
+        assert!(notified >= 1);
+        assert!(gone, "the binding is released");
+        assert!(freed, "and the address");
+    }
+
+    /// #912 review M1: an AMF /release (slow UDM) racing a T3592 abandon for the same
+    /// context. Whichever takes the context frees the address, once; the other finds
+    /// nothing. Before, the abandon freed it during the AMF path's UDM await, it went
+    /// to UE B, and the AMF path then freed B's address.
+    #[tokio::test]
+    async fn an_amf_release_racing_t3592_frees_the_address_once() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let (udm_srv, _seen) = spawn_slow_udm(std::time::Duration::from_millis(800)).await;
+        let ip = std::net::Ipv4Addr::new(10, 45, 9, 13);
+        let reference = seed_established_session("imsi-001010000009122", 6, ip);
+
+        let r = reference.clone();
+        let amf = tokio::spawn(async move {
+            handle_sm_context_release(
+                &r,
+                Some(&SbiRequest::post(format!(
+                    "/nsmf-pdusession/v1/sm-contexts/{r}/release"
+                ))),
+            )
+            .await
+            .status
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        abandon_gsm_procedure(&reference, timer::SmfTimerId::T3592).await;
+        let given_to_b = smf_self().read().unwrap().ipv4_pool.reserve(ip);
+        let status = amf.await.unwrap();
+        side_effects_settled().await;
+        let still_bs = !smf_self().read().unwrap().ipv4_pool.reserve(ip);
+        smf_self().read().unwrap().ipv4_pool.release(ip);
+        stop_udm_leg();
+        udm_srv.stop().await.ok();
+
+        assert_eq!(status, 204);
+        assert!(given_to_b, "the AMF path freed it at its take");
+        assert!(still_bs, "and nobody freed it again under B");
+    }
+
+    /// #912 review M2: a new session for the same (SUPI, PSI) waits for the previous
+    /// release's effects at the UDM. A #39 reactivation re-establishes at once; its
+    /// UECM registration must not be overtaken by the old release's deregistration.
+    #[tokio::test]
+    async fn a_new_session_waits_for_the_previous_release_of_its_psi() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let (udm_srv, seen) = spawn_slow_udm(std::time::Duration::from_millis(400)).await;
+        let supi = "imsi-001010000009123";
+        let reference = seed_established_session(supi, 7, std::net::Ipv4Addr::new(10, 45, 9, 14));
+
+        let _ = release_sm_context_locally(&reference);
+        let started = std::time::Instant::now();
+        await_release_in_flight(supi, 7).await;
+        let waited = started.elapsed();
+        let deregistered_before = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(m, u)| m == "DELETE" && u.contains("/smf-registrations/7"));
+        // A different PSI does not wait.
+        let other = std::time::Instant::now();
+        await_release_in_flight(supi, 8).await;
+        let other_waited = other.elapsed();
+        stop_udm_leg();
+        udm_srv.stop().await.ok();
+
+        assert!(
+            deregistered_before,
+            "the old deregistration landed before the new session may register"
+        );
+        assert!(
+            waited >= std::time::Duration::from_millis(400),
+            "{waited:?}"
+        );
+        assert!(other_waited < std::time::Duration::from_millis(50));
+    }
+
+    /// #912 review M4: the UE-requested release (PDU SESSION RELEASE REQUEST, then
+    /// COMPLETE) and the T3592 abandon each tell the UDM.
+    #[tokio::test]
+    async fn ue_requested_and_t3592_releases_tell_the_udm() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let (udm_srv, seen) = spawn_slow_udm(std::time::Duration::ZERO).await;
+        let requested = seed_established_session(
+            "imsi-001010000009124",
+            9,
+            std::net::Ipv4Addr::new(10, 45, 9, 15),
+        );
+        let abandoned = seed_established_session(
+            "imsi-001010000009125",
+            10,
+            std::net::Ipv4Addr::new(10, 45, 9, 16),
+        );
+
+        let req = n1(
+            9,
+            4,
+            gsm_build::message_type::PDU_SESSION_RELEASE_REQUEST,
+            &[],
+        );
+        let _ = handle_n1_sm_message(&requested, &req).await;
+        let complete = n1(
+            9,
+            4,
+            gsm_build::message_type::PDU_SESSION_RELEASE_COMPLETE,
+            &[],
+        );
+        let completed = handle_n1_sm_message(&requested, &complete).await.status;
+        abandon_gsm_procedure(&abandoned, timer::SmfTimerId::T3592).await;
+        side_effects_settled().await;
+        let deletes: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, _)| m == "DELETE")
+            .map(|(_, u)| u.clone())
+            .collect();
+        for ip in [15u8, 16] {
+            smf_self()
+                .read()
+                .unwrap()
+                .ipv4_pool
+                .release(std::net::Ipv4Addr::new(10, 45, 9, ip));
+        }
+        stop_udm_leg();
+        udm_srv.stop().await.ok();
+
+        assert_eq!(completed, 204);
+        for (supi, psi) in [("imsi-001010000009124", 9), ("imsi-001010000009125", 10)] {
+            assert!(
+                deletes
+                    .iter()
+                    .any(|u| u.contains(supi) && u.ends_with(&format!("/smf-registrations/{psi}"))),
+                "UECM deregistration for {supi}/{psi}: {deletes:?}"
+            );
+            assert!(
+                deletes
+                    .iter()
+                    .any(|u| u.contains(supi)
+                        && u.ends_with(&format!("/sdm-subscriptions/sub-{psi}"))),
+                "SDM unsubscribe for {supi}/{psi}: {deletes:?}"
+            );
+        }
+    }
+
     // ---- #719: a reactivation release terminates the SM Policy Association ----
 
     /// The DELETEs a recording PCF received for `pol_id`.
@@ -13167,6 +13653,8 @@ mod tests {
     /// by `retrieve_answers_200_with_ue_eps_pdn_connection`, which fails without it.
     #[tokio::test]
     async fn the_sm_context_lifecycle_round_trips_through_the_router() {
+        // The release takes the context out of the process-global state (#912).
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let reference = seed_registered_session("imsi-001010000000083", 4, "internet");
 
         // Retrieve

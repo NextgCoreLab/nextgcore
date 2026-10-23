@@ -1846,6 +1846,9 @@ pub struct UnrestorableSession {
     pub status_uri: Option<String>,
     /// What went wrong, for the operator-facing log and the notification cause.
     pub reason: String,
+    /// The UE's IPv4 address, if it could be salvaged from the raw record: the
+    /// restored allocation that boot must free (#912 review M3).
+    pub ue_ip: Option<[u8; 4]>,
 }
 
 /// Why smfd durable state could not be loaded (issue #191).
@@ -2156,6 +2159,10 @@ impl SmfContext {
                             .get("smContextStatusUri")
                             .and_then(|u| u.as_str())
                             .map(str::to_string);
+                        let salvaged_ip: Option<[u8; 4]> = v
+                            .get("ueIp")
+                            .and_then(|ip| serde_json::from_value::<[u8; 4]>(ip.clone()).ok())
+                            .filter(|ip| *ip != [0; 4]);
                         match serde_json::from_value::<PolicyBinding>(v) {
                             Ok(b) => Some((k, b)),
                             Err(e) => {
@@ -2163,6 +2170,7 @@ impl SmfContext {
                                 unrestorable.push(UnrestorableSession {
                                     sm_context_ref: k,
                                     status_uri: salvaged,
+                                    ue_ip: salvaged_ip,
                                     reason: format!("policy binding could not be restored: {e}"),
                                 });
                                 None
