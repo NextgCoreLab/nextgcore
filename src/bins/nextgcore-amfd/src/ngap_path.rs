@@ -1842,21 +1842,23 @@ impl NgapServer {
                 return Ok(());
             }
             crate::ngap_asn1::RanConfigurationUpdateDecode::Undecodable => {
+                // #752: TS 38.413 §10.2, a Transfer Syntax Error is reported with the
+                // Error Indication procedure, not with the procedure's own failure
+                // message: an undecodable message has no procedure the AMF could
+                // say it failed.
                 log::warn!(
                     "Undecodable RAN Configuration Update from association {association_id}; \
-                     sending RAN CONFIGURATION UPDATE FAILURE"
+                     sending Error Indication (transfer-syntax-error, TS 38.413 §10.2)"
                 );
-                if let Some(failure) =
-                    crate::ngap_asn1::build_ran_configuration_update_failure_generated(
-                        nextgcore_ngap::types::Cause::Protocol(
-                            nextgcore_ngap::types::CauseProtocol::TransferSyntaxError,
-                        ),
-                        None,
-                        &[],
-                    )
-                {
-                    self.send_to_association(association_id, &failure).await?;
-                }
+                self.send_error_indication(
+                    association_id,
+                    None,
+                    None,
+                    ngap_gen::Cause::Protocol(ngap_gen::CauseProtocol(
+                        ngap_gen::CauseProtocol::TRANSFER_SYNTAX_ERROR,
+                    )),
+                )
+                .await?;
                 return Ok(());
             }
         };
@@ -12395,9 +12397,20 @@ impl NgapServer {
                 return Ok(());
             }
             crate::ngap_asn1::NasTransportDecode::Undecodable => {
+                // #752: TS 38.413 §10.2.
                 log::warn!(
-                    "Failed to decode PDU Session Resource Notify from association {association_id}"
+                    "Failed to decode PDU Session Resource Notify from association \
+                     {association_id}; sending Error Indication (transfer-syntax-error)"
                 );
+                self.send_error_indication(
+                    association_id,
+                    None,
+                    None,
+                    ngap_gen::Cause::Protocol(ngap_gen::CauseProtocol(
+                        ngap_gen::CauseProtocol::TRANSFER_SYNTAX_ERROR,
+                    )),
+                )
+                .await?;
                 return Ok(());
             }
         };
@@ -14693,6 +14706,7 @@ pub async fn amf_ngap_poll() -> Result<bool> {
 mod tests {
     /// Handler-level tests asserting what amfd SENDS (#760, ...), in their own file.
     mod handler_tests;
+    mod reject_path_tests;
 
     use super::*;
     use crate::context::AmfContext;
@@ -19233,7 +19247,11 @@ mod tests {
         );
 
         // Each accepted gNB-initiated procedure returns Ok (no Error Indication).
-        for pc in [19u8, 27, 30, 44, 48, 49, 52] {
+        // Not 30 (PDU Session Resource Notify) any more: these three octets do not
+        // decode, and since #752 an undecodable Notify gets the TS 38.413 §10.2
+        // Error Indication. `reject_path_tests::a_well_formed_notify_gets_no_answer`
+        // keeps #71's point for it.
+        for pc in [19u8, 27, 44, 48, 49, 52] {
             ngap.process_ngap_message(1, &[0x00u8, pc, 0x00])
                 .await
                 .unwrap_or_else(|e| {
