@@ -83,6 +83,53 @@ pub fn server() -> Option<&'static GtpcServer> {
     S11_SERVER.get()
 }
 
+/// A test's own S11 server and stand-in Serving GW, used instead of [`S11_SERVER`]
+/// and `sgwc_list` for requests sent on behalf of the GLOBAL context (#730).
+///
+/// The handover tests have to drive the real S1AP handler against `mme_self()`,
+/// because the Modify Bearer Response is dispatched to that context from the S11
+/// receive thread. `mme_self()`'s `sgwc_list` is fixed at first use and empty in a
+/// test, and `S11_SERVER` is a `OnceLock` owned by one `nas_dispatch` test, so
+/// neither can be pointed at a stand-in. A local context is never routed here, so a
+/// test that expects "no S11 socket" from one is unaffected. Declared beside the
+/// global it shadows; callers hold [`S11_TEST_LOCK`].
+#[cfg(test)]
+static S11_TEST_ROUTE: Mutex<Option<(&'static GtpcServer, SocketAddr)>> = Mutex::new(None);
+
+/// Route the global context's S11 requests through `server` to `peer` until the
+/// returned guard drops. The server is leaked (a test-lifetime `'static`) and
+/// closed by the guard. Callers hold [`S11_TEST_LOCK`].
+#[cfg(test)]
+pub(crate) fn route_s11_for_test(server: GtpcServer, peer: SocketAddr) -> S11TestRoute {
+    let server: &'static GtpcServer = Box::leak(Box::new(server));
+    *S11_TEST_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) = Some((server, peer));
+    S11TestRoute { server }
+}
+
+/// Clears [`S11_TEST_ROUTE`] and closes its server on drop.
+#[cfg(test)]
+pub(crate) struct S11TestRoute {
+    pub(crate) server: &'static GtpcServer,
+}
+
+#[cfg(test)]
+impl Drop for S11TestRoute {
+    fn drop(&mut self) {
+        *S11_TEST_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.server.close();
+    }
+}
+
+#[cfg(test)]
+fn test_route(ctx: Option<&MmeContext>) -> Option<(&'static GtpcServer, SocketAddr)> {
+    if let Some(ctx) = ctx {
+        if !std::ptr::eq(ctx, crate::context::mme_self()) {
+            return None;
+        }
+    }
+    *S11_TEST_ROUTE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// What a sent Create Session Request was for, so its response can continue the
 /// procedure that started it (#329).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,6 +233,12 @@ pub fn clear_pending_creates_for_test() {
 /// reaches the wire — no socket, or no configured SGW-C — so the twelve senders do
 /// not each grow their own version of that reporting.
 fn send_to_sgwc(ctx: &MmeContext, msg: &Gtp2Message, data: u64) -> GtpPathResult<u32> {
+    #[cfg(test)]
+    if let Some((server, peer)) = test_route(Some(ctx)) {
+        return server
+            .send_request(peer, msg, data)
+            .map_err(GtpPathError::SocketError);
+    }
     let server = server().ok_or_else(|| {
         GtpPathError::SocketError(
             "no S11 socket bound: mme.gtpc.server is unset or the bind failed".to_string(),
@@ -345,6 +398,18 @@ impl GtpcServer {
                             );
                             if let Ok(mut states) = inner.peer_state.lock() {
                                 states.insert(xact.peer, GtpPeerState::Failed);
+                            }
+                            // #730: a handover waits on this Modify Bearer Request.
+                            // Without this the Path Switch Request is never answered.
+                            if xact.message_type == s11_build::message_type::MODIFY_BEARER_REQUEST {
+                                if let Some(pending) =
+                                    take_pending_handover_modification(xact.sequence_number)
+                                {
+                                    crate::handover_switch::on_modify_bearer_unanswered(
+                                        crate::context::mme_self(),
+                                        pending,
+                                    );
+                                }
                             }
                         }
 
@@ -918,9 +983,11 @@ pub fn send_modify_bearer_request(
     let bearer_refs: Vec<&crate::context::MmeBearer> = bearers.iter().collect();
 
     let seq = sequence()?;
-    let msg =
-        s11_build::build_modify_bearer_request(&mme_ue, &sgw_ue, &bearer_refs, uli_presence, seq)
-            .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
+    // `uli_presence` is not acted on: the builder does not encode ULI (a stated
+    // ceiling of #730).
+    let _ = uli_presence;
+    let msg = s11_build::build_modify_bearer_request(&mme_ue, &sgw_ue, &bearer_refs, &[], seq)
+        .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
     let xact_id = ctx.next_pool_id();
     send_to_sgwc(ctx, &msg, xact_id)?;
 
@@ -1364,7 +1431,7 @@ pub fn send_modify_bearer_request_for_erab_modification(
         .collect();
     let bearer_refs: Vec<&crate::context::MmeBearer> = bearers.iter().collect();
     let seq = sequence()?;
-    let msg = s11_build::build_modify_bearer_request(&mme_ue, &sgw_ue, &bearer_refs, true, seq)
+    let msg = s11_build::build_modify_bearer_request(&mme_ue, &sgw_ue, &bearer_refs, &[], seq)
         .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
     // Recorded before the send (the #359 lesson): a response can race the
     // return of `send_to`.
@@ -1373,6 +1440,156 @@ pub fn send_modify_bearer_request_for_erab_modification(
     }
     if let Err(e) = send_to_sgwc(ctx, &msg, ctx.next_pool_id()) {
         take_pending_erab_modification(seq);
+        return Err(e);
+    }
+    Ok(seq)
+}
+
+// ============================================================================
+// Handover completion: Path Switch and Handover Notify (#730, TS 23.401
+// §5.5.1.1.2 steps 2-5, §5.5.1.2.2 steps 16-17)
+// ============================================================================
+
+/// The new downlink endpoint the target eNB gave one bearer.
+#[derive(Debug, Clone, Default)]
+pub struct SwitchedBearer {
+    /// EPS Bearer ID (= E-RAB ID).
+    pub ebi: u8,
+    /// The target eNB's S1-U TEID.
+    pub teid: u32,
+    /// The target eNB's S1-U address.
+    pub ip: crate::context::IpAddr,
+}
+
+/// What a handover's Modify Bearer Request was for.
+#[derive(Debug, Clone)]
+pub enum HandoverModifyKind {
+    /// X2 handover: the PATH SWITCH REQUEST ACKNOWLEDGE (or FAILURE) waits on
+    /// the response (TS 23.401 §5.5.1.1.2 step 5).
+    PathSwitch {
+        /// eNB pool id the answer goes to (the target eNB).
+        enb_id: u64,
+        mme_ue_s1ap_id: u32,
+        enb_ue_s1ap_id: u32,
+        /// The {NCC, NH} pair derived for the acknowledge (TS 33.401 §7.2.8.4.4).
+        ncc: u8,
+        nh: [u8; 32],
+        /// E-RABs already known to be released when the request went out: absent
+        /// from, or unknown in, the E-RAB To Be Switched DL List.
+        released: Vec<nextgcore_s1ap::ErabItem>,
+        /// `notify` IEs of the request, for the acknowledge's diagnostics.
+        notify: Vec<crate::s1ap_gen::DiagnosedIe>,
+    },
+    /// S1 handover: HANDOVER NOTIFY has completed the radio side and nothing on
+    /// S1 waits, but bearers the SGW refuses are still released (step 16).
+    HandoverNotify {
+        /// The target eNB, for an E-RAB RELEASE COMMAND naming refused bearers.
+        enb_id: u64,
+        mme_ue_s1ap_id: u32,
+        enb_ue_s1ap_id: u32,
+        /// Every E-RAB the target admitted (HANDOVER REQUEST ACKNOWLEDGE),
+        /// before the bearers of PDN connections whose default bearer it did
+        /// not admit were dropped from the request: the target holds a radio
+        /// bearer for each, so any the core releases goes in the E-RAB RELEASE
+        /// COMMAND (#730 review N1).
+        admitted: Vec<u8>,
+    },
+}
+
+/// A handover's Modify Bearer Request waiting for its response, keyed by the
+/// request's sequence number and TAKEN by the response or by N3 exhaustion: the
+/// shape `PENDING_ERAB_MODIFICATIONS` has.
+#[derive(Debug, Clone)]
+pub struct PendingHandoverModification {
+    pub mme_ue_id: u64,
+    /// The bearers the request asked the SGW to switch. Written to the MME's
+    /// bearer contexts only for those the SGW accepts.
+    pub switched: Vec<SwitchedBearer>,
+    /// EBIs of bearers the handover already lost when the request went out: an
+    /// X2 target left them out of its E-RAB To Be Switched DL List (implicitly
+    /// released, TS 36.413 §8.4.4.2), or an S1 target did not admit them.
+    pub omitted: Vec<u8>,
+    pub kind: HandoverModifyKind,
+}
+
+static PENDING_HANDOVER_MODIFICATIONS: OnceLock<Mutex<HashMap<u32, PendingHandoverModification>>> =
+    OnceLock::new();
+
+fn pending_handover_modifications() -> &'static Mutex<HashMap<u32, PendingHandoverModification>> {
+    PENDING_HANDOVER_MODIFICATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Take the handover the Modify Bearer Request at `seq` was sent for, if any.
+pub fn take_pending_handover_modification(seq: u32) -> Option<PendingHandoverModification> {
+    pending_handover_modifications()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&seq)
+}
+
+/// Whether a handover's Modify Bearer Request is outstanding for `mme_ue_id`.
+pub fn handover_modification_pending(mme_ue_id: u64) -> bool {
+    pending_handover_modifications()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .any(|p| p.mme_ue_id == mme_ue_id)
+}
+
+/// Pending handover modifications. Test-only; declared beside the map, callers
+/// hold [`S11_TEST_LOCK`].
+#[cfg(test)]
+pub(crate) fn pending_handover_modifications_for_test() -> usize {
+    pending_handover_modifications()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len()
+}
+
+/// Send the Modify Bearer Request that tells the Serving GW the target eNB's
+/// S1-U F-TEIDs after a handover (TS 23.401 §5.5.1.1.2 step 2, §5.5.1.2.2 step
+/// 16), and park `pending` until the response. The MME's bearer contexts are
+/// NOT changed here: the request carries copies with the new endpoints.
+/// Returns the request's sequence number.
+pub fn send_modify_bearer_request_for_handover(
+    ctx: &MmeContext,
+    pending: PendingHandoverModification,
+) -> GtpPathResult<u32> {
+    let mme_ue = ctx
+        .mme_ue_find_by_id(pending.mme_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let sgw_ue = ctx
+        .sgw_ue_find_by_id(mme_ue.sgw_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let bearers: Vec<crate::context::MmeBearer> = bearers_of_ue(ctx, pending.mme_ue_id)
+        .into_iter()
+        .filter_map(|mut b| {
+            let new = pending.switched.iter().find(|s| s.ebi == b.ebi)?;
+            b.enb_s1u_teid = new.teid;
+            b.enb_s1u_ip = new.ip.clone();
+            Some(b)
+        })
+        .collect();
+    let bearer_refs: Vec<&crate::context::MmeBearer> = bearers.iter().collect();
+    let seq = sequence()?;
+    // The omitted bearers go as "Bearer Contexts to be removed" (Table 7.2.7-1,
+    // NOTE 3): the SGW learns that the MME removes them by a separate procedure.
+    let msg = s11_build::build_modify_bearer_request(
+        &mme_ue,
+        &sgw_ue,
+        &bearer_refs,
+        &pending.omitted,
+        seq,
+    )
+    .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
+    // Recorded before the send (the #359 lesson): a response can race the
+    // return of `send_to`.
+    pending_handover_modifications()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(seq, pending);
+    if let Err(e) = send_to_sgwc(ctx, &msg, ctx.next_pool_id()) {
+        take_pending_handover_modification(seq);
         return Err(e);
     }
     Ok(seq)
@@ -1512,6 +1729,10 @@ pub fn send_delete_bearer_command(
 /// per outstanding initial message, echoed in the response, so both spellings made
 /// correlation impossible.
 fn sequence() -> GtpPathResult<u32> {
+    #[cfg(test)]
+    if let Some((server, _)) = test_route(None) {
+        return Ok(server.alloc_sequence());
+    }
     server().map(|s| s.alloc_sequence()).ok_or_else(|| {
         GtpPathError::SocketError("no S11 socket bound: cannot allocate a sequence".to_string())
     })
@@ -1521,6 +1742,10 @@ fn sequence() -> GtpPathResult<u32> {
 /// most significant bit is set, TS 29.274 §7.6 (#727). [`sequence`] numbers never
 /// have it.
 fn command_sequence() -> GtpPathResult<u32> {
+    #[cfg(test)]
+    if let Some((server, _)) = test_route(None) {
+        return Ok(server.alloc_command_sequence());
+    }
     server().map(|s| s.alloc_command_sequence()).ok_or_else(|| {
         GtpPathError::SocketError("no S11 socket bound: cannot allocate a sequence".to_string())
     })
