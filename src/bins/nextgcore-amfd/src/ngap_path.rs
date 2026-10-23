@@ -9178,6 +9178,34 @@ impl NgapServer {
                 return Ok(());
             }
             crate::ngap_asn1::NasTransportDecode::Undecodable => {
+                // #744: a well-formed HANDOVER REQUIRED for a handover type or target this
+                // AMF cannot represent is a preparation it cannot carry out, not a
+                // transfer-syntax error: answer HANDOVER PREPARATION FAILURE with
+                // ho-target-not-allowed, so the source stops waiting for TNGRELOCprep
+                // (TS 38.413 §8.4.1.3) and the cause names the real reason.
+                if let Some((amf_ue_ngap_id, ran_ue_ngap_id)) =
+                    crate::ngap_asn1::handover_required_unsupported_target(data)
+                {
+                    log::warn!(
+                        "HandoverRequired from association {association_id} for UE \
+                         {amf_ue_ngap_id} asks for a handover type or target this AMF \
+                         cannot represent; HandoverPreparationFailure ho-target-not-allowed"
+                    );
+                    let failure = nextgcore_ngap::types::HandoverPreparationFailure {
+                        amf_ue_ngap_id,
+                        ran_ue_ngap_id,
+                        cause: nextgcore_ngap::types::Cause::RadioNetwork(
+                            nextgcore_ngap::types::CauseRadioNetwork::HoTargetNotAllowed,
+                        ),
+                        criticality_diagnostics: None,
+                    };
+                    if let Some(bytes) =
+                        crate::ngap_asn1::build_handover_preparation_failure_asn1(&failure)
+                    {
+                        self.send_to_association(association_id, &bytes).await?;
+                    }
+                    return Ok(());
+                }
                 self.send_error_indication(
                     association_id,
                     None,
@@ -19772,6 +19800,137 @@ mod tests {
                 .await
                 .expect("handled"),
             None
+        );
+    }
+
+    /// **#744.** A well-formed HANDOVER REQUIRED this AMF cannot carry out -- HandoverType
+    /// fivegs-to-utran (past the extension marker) or a TargetID choice extension
+    /// (targetRNC-ID) -- is answered with HANDOVER PREPARATION FAILURE, cause
+    /// radioNetwork ho-target-not-allowed, naming the UE, so the source stops waiting
+    /// for TNGRELOCprep (TS 38.413 §8.4.1.3). It used to get an Error Indication with
+    /// transfer-syntax-error. A PDU that really does not decode still does.
+    ///
+    /// REVERT-VERIFIED: without the unsupported-target branch both arms get the Error
+    /// Indication and this fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unsupported_handover_type_or_target_gets_a_preparation_failure() {
+        use nextgcore_ngap_gen::generated as g;
+        let mut server = capturing_ngap_server().await;
+        let source = 97_441u64;
+        seed_gnb_session(&server, source).await;
+        let plmn = plmn_id_to_ngap_bytes(&PlmnId::new("001", "01"));
+        let base = nextgcore_ngap::builder::build_handover_required(
+            &nextgcore_ngap::types::HandoverRequired {
+                amf_ue_ngap_id: 7_744_001,
+                ran_ue_ngap_id: 44,
+                handover_type: nextgcore_ngap::types::HandoverType::Intra5gs,
+                cause: nextgcore_ngap::types::Cause::RadioNetwork(
+                    nextgcore_ngap::types::CauseRadioNetwork::HandoverDesirableForRadioReason,
+                ),
+                target_id: nextgcore_ngap::types::TargetId::TargetRanNodeId {
+                    global_ran_node_id: nextgcore_ngap::types::GlobalRanNodeId::GlobalGnbId {
+                        plmn_identity: plmn,
+                        gnb_id: 0x7_4402,
+                        gnb_id_len: 22,
+                    },
+                    selected_tai: nextgcore_ngap::types::TaiListItem {
+                        tai_plmn: plmn,
+                        tai_tac: [0x00, 0x00, 0x01],
+                    },
+                },
+                pdu_session_list: vec![nextgcore_ngap::types::PduSessionResourceItemHoRqd {
+                    pdu_session_id: 1,
+                    transfer: vec![0x00],
+                }],
+                source_to_target_container: vec![0xAB; 4],
+                direct_forwarding_path_availability: None,
+            },
+        )
+        .expect("build HandoverRequired");
+        // Re-encode the base PDU with one IE value replaced.
+        let mutate = |f: &dyn Fn(&mut g::HandoverRequiredProtocolIEs_EntryValue)| {
+            let mut pdu = nextgcore_ngap_gen::decode(&base).expect("decodes");
+            let g::NGAP_PDU::InitiatingMessage(m) = &mut pdu else {
+                unreachable!()
+            };
+            let g::InitiatingMessageValue::Id_HandoverPreparation(r) = &mut m.value else {
+                unreachable!()
+            };
+            for ie in r.protocol_i_es.0.iter_mut() {
+                f(&mut ie.value);
+            }
+            nextgcore_ngap_gen::encode(&pdu).expect("re-encodes")
+        };
+        use g::HandoverRequiredProtocolIEs_EntryValue as Ie;
+        let to_utran = mutate(&|v| {
+            if let Ie::Id_HandoverType(t) = v {
+                t.0 = g::HandoverType::FIVEGS_TO_UTRAN;
+            }
+        });
+        let to_rnc = mutate(&|v| {
+            if let Ie::Id_TargetID(t) = v {
+                *t = g::TargetID::Choice_Extensions(g::TargetID_choice_Extensions {
+                    id: g::ProtocolIE_ID(g::ID_TARGET_RNC_ID),
+                    criticality: g::Criticality(g::Criticality::REJECT),
+                    value: g::TargetID_choice_ExtensionsValue::Id_TargetRNC_ID(g::TargetRNC_ID {
+                        lai: g::LAI {
+                            plm_nidentity: g::PLMNIdentity(plmn.to_vec()),
+                            lac: g::LAC(vec![0x00, 0x01]),
+                            ie_extensions: None,
+                        },
+                        rnc_id: g::RNC_ID(42),
+                        extended_rnc_id: None,
+                        ie_extensions: None,
+                    }),
+                });
+            }
+        });
+
+        for (name, pdu) in [("fivegs-to-utran", to_utran), ("targetRNC-ID", to_rnc)] {
+            server
+                .handle_handover_required(source, &pdu)
+                .await
+                .expect("handled");
+            let sent = take_sent_ngap(&mut server);
+            assert_eq!(sent.len(), 1, "{name}: {sent:?}");
+            assert_eq!(sent[0].0, source);
+            let g::NGAP_PDU::UnsuccessfulOutcome(m) =
+                nextgcore_ngap_gen::decode(&sent[0].1).expect("decodes")
+            else {
+                panic!("{name}: not an unsuccessful outcome (an Error Indication?)");
+            };
+            let g::UnsuccessfulOutcomeValue::Id_HandoverPreparation(failure) = m.value else {
+                panic!("{name}: not a HANDOVER PREPARATION FAILURE");
+            };
+            let (mut ids, mut cause) = ((None, None), None);
+            for ie in failure.protocol_i_es.0 {
+                use g::HandoverPreparationFailureProtocolIEs_EntryValue as F;
+                match ie.value {
+                    F::Id_AMF_UE_NGAP_ID(v) => ids.0 = Some(v.0),
+                    F::Id_RAN_UE_NGAP_ID(v) => ids.1 = Some(v.0),
+                    F::Id_Cause(g::Cause::RadioNetwork(c)) => cause = Some(c.0),
+                    _ => {}
+                }
+            }
+            assert_eq!(ids, (Some(7_744_001), Some(44)), "{name}: names the UE");
+            assert_eq!(
+                cause,
+                Some(g::CauseRadioNetwork::HO_TARGET_NOT_ALLOWED),
+                "{name}: ho-target-not-allowed"
+            );
+        }
+
+        // Negative control: bytes that do not decode still get the Error Indication.
+        server
+            .handle_handover_required(source, &[0x00, 0x0C, 0x00])
+            .await
+            .expect("handled");
+        let sent = take_sent_ngap(&mut server);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].1[1],
+            nextgcore_ngap_gen::generated::ID_ERROR_INDICATION,
+            "an undecodable PDU is still a transfer-syntax error"
         );
     }
 

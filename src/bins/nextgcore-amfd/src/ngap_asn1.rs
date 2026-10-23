@@ -4084,6 +4084,45 @@ pub fn hand_written_diagnostics(report: &CriticalityErrorIndication) -> Critical
 /// Path Availability are criticality ignore: a missing Cause is
 /// misc/unspecified. A TargetID this AMF cannot represent (an N3IWF, a
 /// choice extension) is `Undecodable`, as the hand-written parser had it.
+/// The UE ids of a HANDOVER REQUIRED that is well formed but asks for a handover this
+/// AMF cannot represent (#744): a HandoverType past the extension marker
+/// (fivegs-to-utran) or a TargetID it has no value for (the choice extensions
+/// targetRNC-ID / targetHomeENB-ID). `None` for anything else, including a PDU that
+/// does not decode or does not name both UE ids.
+///
+/// [`decode_handover_required_asn1`] answers such a PDU `Undecodable`, which used to
+/// produce an Error Indication with transfer-syntax-error: the wrong cause for a message
+/// that decoded, and no HANDOVER PREPARATION FAILURE, so the source waited for
+/// TNGRELOCprep (TS 38.413 §8.4.1.3). The handler uses this to answer the Failure.
+pub fn handover_required_unsupported_target(data: &[u8]) -> Option<(u64, u32)> {
+    use ngap_gen::HandoverRequiredProtocolIEs_EntryValue as Ie;
+    let (pdu, _unknown) = nextgcore_ngap_gen::decode_with_unknown_ies(data).ok()?;
+    let ngap_gen::NGAP_PDU::InitiatingMessage(m) = pdu else {
+        return None;
+    };
+    let ngap_gen::InitiatingMessageValue::Id_HandoverPreparation(required) = m.value else {
+        return None;
+    };
+    let (mut amf, mut ran, mut unsupported) = (None, None, false);
+    for entry in required.protocol_i_es.0 {
+        match entry.value {
+            Ie::Id_AMF_UE_NGAP_ID(v) => amf = Some(v.0),
+            Ie::Id_RAN_UE_NGAP_ID(v) => ran = Some(v.0),
+            Ie::Id_HandoverType(v) => {
+                unsupported |= !matches!(
+                    v.0,
+                    ngap_gen::HandoverType::INTRA5GS
+                        | ngap_gen::HandoverType::FIVEGS_TO_EPS
+                        | ngap_gen::HandoverType::EPS_TO_5GS
+                )
+            }
+            Ie::Id_TargetID(v) => unsupported |= hand_written_target_id(&v).is_none(),
+            _ => {}
+        }
+    }
+    unsupported.then_some((amf?, ran?))
+}
+
 pub fn decode_handover_required_asn1(data: &[u8]) -> NasTransportDecode<HandoverRequired> {
     use ngap_gen::HandoverRequiredProtocolIEs_EntryValue as Ie;
     let Some((criticality, ies, mut reject, notify)) =
