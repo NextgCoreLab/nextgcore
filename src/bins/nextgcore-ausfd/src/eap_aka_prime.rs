@@ -559,7 +559,7 @@ pub fn negotiate_kdf(
 }
 
 /// EAP-AKA' session context held at the AUSF.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EapAkaSession {
     /// Session state
     pub state: EapAkaState,
@@ -588,6 +588,29 @@ pub struct EapAkaSession {
     /// Whether an AT_KDF renegotiation round has already been issued (bounds the
     /// renegotiation to a single round per RFC 9048 §3.2).
     pub kdf_renegotiated: bool,
+}
+
+/// Manual `Debug` (no-auth-material-in-logs): the authentication material in
+/// this type (rand, autn, xres, ck_prime, ik_prime, kausf, k_aut) prints as `<redacted>`, so a future
+/// `{:?}` in a log line cannot leak it.
+impl std::fmt::Debug for EapAkaSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("EapAkaSession");
+        d.field("state", &self.state);
+        d.field("identifier", &self.identifier);
+        d.field("rand", &"<redacted>");
+        d.field("autn", &"<redacted>");
+        d.field("xres", &"<redacted>");
+        d.field("ck_prime", &"<redacted>");
+        d.field("ik_prime", &"<redacted>");
+        d.field("kausf", &"<redacted>");
+        d.field("k_aut", &"<redacted>");
+        d.field("identity", &self.identity);
+        d.field("serving_network_name", &self.serving_network_name);
+        d.field("offered_kdf", &self.offered_kdf);
+        d.field("kdf_renegotiated", &self.kdf_renegotiated);
+        d.finish()
+    }
 }
 
 impl EapAkaSession {

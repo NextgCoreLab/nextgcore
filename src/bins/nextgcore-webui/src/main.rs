@@ -179,7 +179,7 @@ pub struct Subscriber {
     pub status: i32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SecurityContext {
     pub k: String,
     #[serde(default)]
@@ -203,6 +203,21 @@ pub struct SecurityContext {
     /// build still load instead of failing the whole read.
     #[serde(default, deserialize_with = "deserialize_sqn")]
     pub sqn: i64,
+}
+
+/// Manual `Debug` (no-auth-material-in-logs): the authentication material in
+/// this type (k, opc, op, sqn) prints as `<redacted>`, so a future
+/// `{:?}` in a log line cannot leak it.
+impl std::fmt::Debug for SecurityContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("SecurityContext");
+        d.field("k", &"<redacted>");
+        d.field("opc", &"<redacted>");
+        d.field("op", &"<redacted>");
+        d.field("amf", &self.amf);
+        d.field("sqn", &"<redacted>");
+        d.finish()
+    }
 }
 
 /// Accept Int64, Int32 or String for `sqn`.

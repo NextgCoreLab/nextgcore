@@ -11,7 +11,7 @@ use crate::mongoc::{get_subscriber_collection, DbiError, DbiResult};
 use crate::types::*;
 
 /// Authentication information from database
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct NextgcoreDbiAuthInfo {
     pub k: [u8; NEXTGCORE_KEY_LEN],
     pub use_opc: bool,
@@ -38,6 +38,28 @@ pub struct NextgcoreDbiAuthInfo {
     /// tell "no TUAK operator field provisioned" from "an all-zero one", because the
     /// second would silently authenticate against the wrong key rather than failing.
     pub use_topc: bool,
+}
+
+/// Manual `Debug` (no-auth-material-in-logs): the authentication material in
+/// this type (k, opc, op, rand, sqn, topc, top) prints as `<redacted>`, so a future
+/// `{:?}` in a log line cannot leak it.
+impl std::fmt::Debug for NextgcoreDbiAuthInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("NextgcoreDbiAuthInfo");
+        d.field("k", &"<redacted>");
+        d.field("use_opc", &self.use_opc);
+        d.field("opc", &"<redacted>");
+        d.field("op", &"<redacted>");
+        d.field("amf", &self.amf);
+        d.field("rand", &"<redacted>");
+        d.field("sqn", &"<redacted>");
+        d.field("authentication_method", &self.authentication_method);
+        d.field("algorithm_id", &self.algorithm_id);
+        d.field("topc", &"<redacted>");
+        d.field("top", &"<redacted>");
+        d.field("use_topc", &self.use_topc);
+        d.finish()
+    }
 }
 
 /// Get authentication info for a subscriber
