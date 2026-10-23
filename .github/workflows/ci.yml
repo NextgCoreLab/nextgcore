@@ -182,6 +182,11 @@ jobs:
       - name: cargo fmt
         run: cd src && cargo fmt --all -- --check
 
+      - name: webui session key fails closed
+        # #913: the provisioning UI refuses to start without a real SECRET_KEY;
+        # this pins the check without installing the UI's dependencies.
+        run: node webui/server/lib/session-key.check.js
+
   fuzz-build:
     name: Fuzz targets build
     # #587: `src/fuzz` is its own workspace (the cargo-fuzz layout), so neither

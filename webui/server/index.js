@@ -33,7 +33,8 @@ const passport = require('passport');
 const LocalStrategy = require('passport-local').Strategy;
 
 const csrf = require('lusca').csrf();
-const secret = process.env.SECRET_KEY || 'change-me';
+// No fallback key (#913): refuse to start without a real SECRET_KEY.
+const secret = require('./lib/session-key').sessionKey(process.env);
 
 const api = require('./routes');
 
