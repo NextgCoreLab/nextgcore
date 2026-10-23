@@ -73,8 +73,9 @@ pub struct GtpuPeerState {
 /// What an Echo Response meant to the [`GtpuPathTable`] (#887).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EchoResponse {
-    /// It answered our outstanding request: the path is alive.
-    Answered,
+    /// It answered our outstanding request: the path is alive. `recovered` when the
+    /// path had been declared FAILED, so the CP function is told it recovered (#935).
+    Answered { recovered: bool },
     /// Not an answer to anything we sent (unknown peer, no outstanding request, or a
     /// sequence number that does not match). Ignored.
     Unsolicited,
@@ -155,8 +156,8 @@ impl GtpuPathTable {
         state.pending_seq = None;
         state.miss_count = 0;
         state.last_success = Some(std::time::Instant::now());
-        state.path_failed = false;
-        EchoResponse::Answered
+        let recovered = std::mem::replace(&mut state.path_failed, false);
+        EchoResponse::Answered { recovered }
     }
 
     /// Advance the state machine by one echo interval tick.
@@ -2299,6 +2300,13 @@ pub enum UpfReportEvent {
         smf_seid: u64,
         urr_id: u32,
     },
+    /// N3 user-plane paths declared FAILED (`failure`) or RECOVERED, to be reported
+    /// to the CP function in a PFCP Node Report (#935, TS 29.244 §7.4.5.1). They used
+    /// to be only logged, so the SMF never learnt a gNB path was down or back.
+    PathReport {
+        failure: bool,
+        peers: Vec<std::net::IpAddr>,
+    },
 }
 
 /// Data plane runtime context
@@ -2725,8 +2733,18 @@ impl DataPlane {
                     .write()
                     .unwrap()
                     .on_echo_response(from, header.seq_num);
-                if outcome == EchoResponse::Unsolicited {
-                    log::debug!("GTP-U Echo Response from {from} answers nothing we sent: ignored");
+                match outcome {
+                    EchoResponse::Unsolicited => log::debug!(
+                        "GTP-U Echo Response from {from} answers nothing we sent: ignored"
+                    ),
+                    EchoResponse::Answered { recovered: true } => {
+                        log::warn!("GTP-U path to {from} RECOVERED");
+                        self.send_report_event(UpfReportEvent::PathReport {
+                            failure: false,
+                            peers: vec![from.ip()],
+                        });
+                    }
+                    EchoResponse::Answered { recovered: false } => {}
                 }
                 return;
             }
@@ -3590,6 +3608,39 @@ impl DataPlane {
         }
     }
 
+    /// Newly FAILED N3 paths: log them with the sessions they carry, and report them
+    /// to the CP function in one Node Report (#935, TS 29.244 §7.4.5.1).
+    fn on_paths_failed(&self, failed: &[SocketAddr], miss_threshold: u32) {
+        for peer in failed {
+            log::warn!(
+                "GTP-U path to {peer} declared failed after {miss_threshold} missed responses"
+            );
+            let affected: Vec<u64> = {
+                let map = self.sessions.seid_map.read().unwrap();
+                map.values()
+                    .filter(|s| &s.gnb_addr() == peer)
+                    .map(|s| s.upf_seid)
+                    .collect()
+            };
+            if !affected.is_empty() {
+                log::warn!(
+                    "  {} session(s) affected (SEIDs: {:x?}); the SMF is told by a \
+                     Node Report (User Plane Path Failure Report)",
+                    affected.len(),
+                    affected
+                );
+            }
+        }
+        // #935 (TS 29.244 §7.4.5.1): tell the CP function, in ONE Node Report for
+        // every path that failed in this round.
+        if !failed.is_empty() {
+            self.send_report_event(UpfReportEvent::PathReport {
+                failure: true,
+                peers: failed.iter().map(|p| p.ip()).collect(),
+            });
+        }
+    }
+
     /// GTP-U N3 path management periodic task (upfd-04).
     ///
     /// Sends Echo Requests to all active gNB addresses at `echo_interval_secs`
@@ -3642,26 +3693,7 @@ impl DataPlane {
             let (to_send, failed) = self.path_table.write().unwrap().tick();
 
             // Handle newly-failed paths
-            for peer in &failed {
-                log::warn!(
-                    "GTP-U path to {peer} declared failed after {miss_threshold} missed responses"
-                );
-                let affected: Vec<u64> = {
-                    let map = self.sessions.seid_map.read().unwrap();
-                    map.values()
-                        .filter(|s| &s.gnb_addr() == peer)
-                        .map(|s| s.upf_seid)
-                        .collect()
-                };
-                if !affected.is_empty() {
-                    log::warn!(
-                        "  {} session(s) affected (SEIDs: {:x?}) — flagged; \
-                         SMF teardown deferred pending E2E validation",
-                        affected.len(),
-                        affected
-                    );
-                }
-            }
+            self.on_paths_failed(&failed, miss_threshold);
 
             // Send Echo Requests
             if let Some(sock) = &self.gtpu_socket {
@@ -6430,7 +6462,10 @@ mod tests {
         assert!(failed.is_empty());
         let seq = to_send[0].1;
 
-        assert_eq!(pt.on_echo_response(peer, Some(seq)), EchoResponse::Answered);
+        assert_eq!(
+            pt.on_echo_response(peer, Some(seq)),
+            EchoResponse::Answered { recovered: false }
+        );
 
         // After response the peer must not be failed.
         let state = pt.peers.get(&peer).unwrap();
@@ -6475,9 +6510,15 @@ mod tests {
         // Answers carrying any Recovery value keep the path alive: the value is not
         // even read (#873, §8.2), only the sequence number matters (#887).
         let seq = pt.tick().0[0].1;
-        assert_eq!(pt.on_echo_response(peer, Some(seq)), EchoResponse::Answered);
+        assert_eq!(
+            pt.on_echo_response(peer, Some(seq)),
+            EchoResponse::Answered { recovered: false }
+        );
         let seq = pt.tick().0[0].1;
-        assert_eq!(pt.on_echo_response(peer, Some(seq)), EchoResponse::Answered);
+        assert_eq!(
+            pt.on_echo_response(peer, Some(seq)),
+            EchoResponse::Answered { recovered: false }
+        );
         let state = pt.peers.get(&peer).unwrap();
         assert_eq!(state.miss_count, 0);
         assert!(!state.path_failed);
@@ -6522,9 +6563,52 @@ mod tests {
         assert_eq!(pt.peers[&peer].miss_count, 1, "the miss stands");
         assert_eq!(
             pt.on_echo_response(peer, outstanding),
-            EchoResponse::Answered
+            EchoResponse::Answered { recovered: false }
         );
         assert_eq!(pt.peers[&peer].miss_count, 0);
+    }
+
+    /// #935 (TS 29.244 §7.4.5.1): a path FAILURE and a path RECOVERY each raise a
+    /// path report toward the PFCP layer (which sends the Node Report). Before, both
+    /// were only logged and the SMF never learnt that a gNB path was down or back.
+    #[tokio::test]
+    async fn path_failure_and_recovery_raise_node_reports() {
+        let dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        let (tx, mut rx) = mpsc::channel(8);
+        dp.set_report_channel(tx);
+        let gnb: SocketAddr = "127.0.0.1:2152".parse().unwrap();
+
+        dp.on_paths_failed(&[gnb], 3);
+        match rx.try_recv() {
+            Ok(UpfReportEvent::PathReport {
+                failure: true,
+                peers,
+            }) => {
+                assert_eq!(peers, vec![gnb.ip()])
+            }
+            other => panic!("expected a failure path report, got {other:?}"),
+        }
+
+        // The failed peer answers an outstanding probe: a recovery report.
+        let seq = {
+            let mut pt = dp.path_table.write().unwrap();
+            pt.sync_peers(&HashSet::from([gnb]));
+            pt.miss_threshold = 1;
+            pt.tick();
+            let _ = pt.tick(); // failed
+            pt.tick().0[0].1 // still probed
+        };
+        dp.handle_uplink_packet(&build_gtpu_echo_response(Some(seq)), gnb, -1)
+            .await;
+        match rx.try_recv() {
+            Ok(UpfReportEvent::PathReport {
+                failure: false,
+                peers,
+            }) => {
+                assert_eq!(peers, vec![gnb.ip()])
+            }
+            other => panic!("expected a recovery path report, got {other:?}"),
+        }
     }
 
     /// #887 review: only paths IN USE are tracked and probed (TS 29.281 §7.2.1). A
@@ -6569,7 +6653,8 @@ mod tests {
         assert!(refailed.is_empty(), "declared failed only once");
         assert_eq!(
             pt.on_echo_response(peer, Some(again[0].1)),
-            EchoResponse::Answered
+            EchoResponse::Answered { recovered: true },
+            "#935: the answer reports the recovery"
         );
         assert!(!pt.peers[&peer].path_failed, "the answer recovers the path");
     }

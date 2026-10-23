@@ -986,6 +986,20 @@ impl PfcpServer {
                 self.handle_session_deletion_request(&header, payload, src_addr)
                     .await?;
             }
+            pfcp_type::NODE_REPORT_RESPONSE => {
+                // #935: the CP function acknowledged a path Node Report; stop T1/N1.
+                let removed = self
+                    .pending_reports
+                    .lock()
+                    .await
+                    .remove(&header.sequence_number)
+                    .is_some();
+                log::debug!(
+                    "Node Report Response (seq={}, tracked={removed})",
+                    header.sequence_number
+                );
+                return Ok(());
+            }
             pfcp_type::SESSION_REPORT_RESPONSE => {
                 // Response to a UPF-initiated Session Report Request: clear the
                 // matching pending request so T1/N1 retransmission stops
@@ -2430,6 +2444,47 @@ impl PfcpServer {
 
     /// Send a Session Report Request carrying a Downlink Data Report
     /// (TS 29.244 7.5.8.2) when the first DL packet is buffered under a
+    /// Report N3/N9 user-plane path FAILURE or RECOVERY for `peers` to the CP
+    /// function in a PFCP Node Report Request (#935, TS 29.244 §7.4.5.1), tracked for
+    /// T1/N1 retransmission like a Session Report Request until its Node Report
+    /// Response arrives. Without an association there is nobody to report to.
+    pub async fn send_node_report(
+        &self,
+        failure: bool,
+        peers: &[std::net::IpAddr],
+    ) -> Result<(), String> {
+        if peers.is_empty() {
+            return Err("no peers to report".to_string());
+        }
+        let Some(peer) = self.association.read().await.as_ref().map(|a| a.peer_addr) else {
+            return Err("no PFCP association: no CP function to report the path to".to_string());
+        };
+        let payload =
+            crate::n4_build::build_node_report_request(&self.local_node_id, failure, peers);
+        let seq = self.alloc_seq();
+        let message = self.build_response(pfcp_type::NODE_REPORT_REQUEST, 0, seq, &payload, false);
+        self.pending_reports.lock().await.insert(
+            seq,
+            PendingReport {
+                message: message.clone(),
+                dest: peer,
+                upf_seid: 0,
+                attempts: 0,
+                last_sent: std::time::Instant::now(),
+                usage: Vec::new(),
+            },
+        );
+        if let Err(e) = self.socket.send_to(&message, peer).await {
+            self.pending_reports.lock().await.remove(&seq);
+            return Err(format!("Failed to send Node Report Request: {e}"));
+        }
+        log::info!(
+            "Sent Node Report Request to {peer}: user-plane path {} for {peers:?}",
+            if failure { "FAILURE" } else { "RECOVERY" }
+        );
+        Ok(())
+    }
+
     /// BUFF+NOCP FAR.
     pub async fn send_downlink_data_report(
         &self,
@@ -3008,6 +3063,81 @@ mod tests {
         // Recovery Time Stamp must be present and non-zero
         let rts = crate::n4_build::parse_recovery_time_stamp(body).unwrap();
         assert!(rts > 0, "recovery time stamp must be real, not hardcoded 0");
+    }
+
+    /// #935 (TS 29.244 §7.4.5.1, Tables 7.4.5.1.2-1/7.4.5.1.3-1) on the wire: a path
+    /// failure goes out as a Node Report Request with UPFR and a User Plane Path Failure
+    /// Report naming the peer; a recovery with UPRR and a User Plane Path Recovery
+    /// Report; the Node Report Response stops T1/N1; without an association nothing
+    /// is sent.
+    #[tokio::test]
+    async fn path_reports_go_out_as_node_reports() {
+        let (server, smf, addr, _rx) = spawn_test_server().await;
+        assert!(server
+            .send_node_report(true, &["10.0.0.1".parse().unwrap()])
+            .await
+            .is_err());
+
+        let payload = build_association_setup_request_payload(Some(0x5000_0000));
+        let resp = exchange(&smf, addr, &encode_pfcp(5, None, 1, &payload)).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+
+        for (failure, nrt, ie) in [
+            (
+                true,
+                0x01u8,
+                crate::n4_build::pfcp_ie::USER_PLANE_PATH_FAILURE_REPORT,
+            ),
+            (
+                false,
+                0x02u8,
+                crate::n4_build::pfcp_ie::USER_PLANE_PATH_RECOVERY_REPORT,
+            ),
+        ] {
+            server
+                .send_node_report(failure, &["10.0.0.1".parse().unwrap()])
+                .await
+                .expect("sent");
+            let mut buf = vec![0u8; 2048];
+            let (len, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), smf.recv_from(&mut buf))
+                    .await
+                    .expect("a Node Report arrives")
+                    .expect("recv");
+            let (hdr, body) = ParsedPfcpHeader::parse(&buf[..len]).unwrap();
+            assert_eq!(buf[1], pfcp_type::NODE_REPORT_REQUEST);
+            let ies = ParsedIe::parse_all(body);
+            let t = ParsedIe::find_ie(&ies, crate::n4_build::pfcp_ie::NODE_REPORT_TYPE).unwrap();
+            assert_eq!(t.value[0], nrt);
+            let report = ParsedIe::find_ie(&ies, ie).expect("the path report IE");
+            let inner = ParsedIe::parse_all(&report.value);
+            let peer =
+                ParsedIe::find_ie(&inner, crate::n4_build::pfcp_ie::REMOTE_GTP_U_PEER).unwrap();
+            assert_eq!(peer.value, vec![0x02, 10, 0, 0, 1], "V4 flag + 10.0.0.1");
+            assert_eq!(server.pending_report_count().await, 1, "tracked for T1/N1");
+
+            // The SMF answers; the request stops being tracked.
+            let mut ok = crate::n4_build::PfcpMessageBuilder::new();
+            ok.add_u8(pfcp_ie::CAUSE, PfcpCause::RequestAccepted as u8);
+            smf.send_to(
+                &encode_pfcp(
+                    pfcp_type::NODE_REPORT_RESPONSE,
+                    None,
+                    hdr.sequence_number,
+                    &ok.build(),
+                ),
+                addr,
+            )
+            .await
+            .unwrap();
+            for _ in 0..50 {
+                if server.pending_report_count().await == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(server.pending_report_count().await, 0, "acknowledged");
+        }
     }
 
     #[tokio::test]
