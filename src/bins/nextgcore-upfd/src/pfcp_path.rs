@@ -2488,6 +2488,10 @@ impl PfcpServer {
                         volume_threshold: true,
                         ..Default::default()
                     },
+                    UrrReportReason::TimeThreshold => crate::n4_build::UsageReportTrigger {
+                        time_threshold: true,
+                        ..Default::default()
+                    },
                     UrrReportReason::Periodic => crate::n4_build::UsageReportTrigger {
                         periodic_reporting: true,
                         ..Default::default()
@@ -3677,6 +3681,24 @@ mod tests {
                 .expect("arrives")
                 .expect("recv");
         assert_eq!(report_triggers_in(&buf[..len])[0][1] & 0x02, 0x02, "TIMQU");
+
+        // ---- TIMTH (#842 review: it used to go out as VOLTH) ----
+        server
+            .send_urr_report(
+                upf_seid,
+                0x4242,
+                vec![entry(crate::data_plane::UrrReportReason::TimeThreshold)],
+            )
+            .await
+            .expect("sent");
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), smf.recv_from(&mut buf))
+                .await
+                .expect("arrives")
+                .expect("recv");
+        let t = &report_triggers_in(&buf[..len])[0];
+        assert_eq!(t[0] & 0x04, 0x04, "TIMTH");
+        assert_eq!(t[0] & 0x02, 0x00, "and not VOLTH");
     }
 
     /// #80 criterion 5 (wire half): the event-driven quota report reaches the SMF with
