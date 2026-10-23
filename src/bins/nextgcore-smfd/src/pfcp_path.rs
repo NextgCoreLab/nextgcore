@@ -822,7 +822,7 @@ impl PfcpClient {
         log::info!(
             "PFCP {}: seeded peer Recovery Time Stamp {rts} from durable state; a different \
              stamp at Association Setup will flush the restored sessions",
-            self.peer()
+            self.recovery_time_stamp_key()
         );
     }
 
@@ -1190,6 +1190,7 @@ impl PfcpClient {
         if let Ok(ctx) = smf_self().read() {
             ctx.note_upf_recovery_time_stamp(&key, rts);
         }
+        self.retire_address_key();
     }
 
     /// The key of this UPF's durable Recovery Time Stamp (#722): the configured
@@ -1199,27 +1200,73 @@ impl PfcpClient {
     /// rescheduled in the same node drain), or whose name did not resolve yet at
     /// startup (`0.0.0.0:8805`), found no seed. Without one the first Association
     /// Setup could not detect the restart, and the restored sessions it no longer held
-    /// were believed in.
+    /// were believed in. The name is lower-cased and loses a trailing root dot, so a
+    /// cosmetic configuration edit does not drop the seed (#930 review m2).
+    ///
+    /// A hostname must name exactly one UPF: TS 23.007 §19A ties a remote stamp to one
+    /// PFCP entity, and a name resolving to several pods would share one durable seed.
     pub fn recovery_time_stamp_key(&self) -> String {
         match &self.peer_host {
-            Some((host, port)) => format!("{host}:{port}"),
+            Some((host, port)) => {
+                let host = host.trim_end_matches('.').to_ascii_lowercase();
+                format!("{host}:{port}")
+            }
             None => self.peer().to_string(),
         }
     }
 
-    /// This UPF's durable Recovery Time Stamp, if the snapshot has one (#722). A
-    /// hostname UPF's stamp written before #722 is under its address then; that key
-    /// is tried second, so an upgrade keeps the seed when the address is unchanged.
+    /// The address key a pre-#722 snapshot kept a hostname UPF's stamp under.
+    /// `None` for a literal UPF, whose key is the address, and when a literal pool
+    /// member owns that address (its key, not a legacy one).
+    fn legacy_address_key(&self) -> Option<String> {
+        self.peer_host.as_ref()?;
+        let addr = self.peer();
+        if addr.ip().is_unspecified() {
+            return None;
+        }
+        let owned_by_literal = global_pool()
+            .iter()
+            .any(|c| c.peer_host.is_none() && c.peer() == addr);
+        (!owned_by_literal).then(|| addr.to_string())
+    }
+
+    /// Remove the legacy address key once the name key is authoritative (#930 review
+    /// M3). Left in place, a stale stamp there declared a false restart, releasing
+    /// every UE on the UPF, after a rollback or a switch to the literal address.
+    fn retire_address_key(&self) {
+        if let Some(key) = self.legacy_address_key() {
+            if let Ok(ctx) = smf_self().read() {
+                ctx.forget_upf_recovery_time_stamp(&key);
+            }
+        }
+    }
+
+    /// This UPF's durable Recovery Time Stamp, if the snapshot has one (#722).
+    ///
+    /// A hostname UPF's stamp written before #722 is under its address. That key is
+    /// tried second, and on a hit migrated to the name key (#930 review M3). On the
+    /// first boot after the upgrade this can seed a stamp from another UPF that took
+    /// the old address meanwhile: no worse than the address keying it replaces.
     pub fn stored_recovery_time_stamp(&self) -> Option<u32> {
-        let ctx = smf_self();
-        let ctx = ctx.read().ok()?;
-        ctx.upf_recovery_time_stamp(&self.recovery_time_stamp_key())
-            .or_else(|| {
-                self.peer_host
-                    .is_some()
-                    .then(|| ctx.upf_recovery_time_stamp(&self.peer().to_string()))
-                    .flatten()
-            })
+        let key = self.recovery_time_stamp_key();
+        let (found, legacy) = {
+            let ctx = smf_self();
+            let ctx = ctx.read().ok()?;
+            match ctx.upf_recovery_time_stamp(&key) {
+                Some(rts) => (Some(rts), false),
+                None => match self.legacy_address_key() {
+                    Some(old) => (ctx.upf_recovery_time_stamp(&old), true),
+                    None => (None, false),
+                },
+            }
+        };
+        if let (Some(rts), true) = (found, legacy) {
+            if let Ok(ctx) = smf_self().read() {
+                ctx.note_upf_recovery_time_stamp(&key, rts);
+            }
+            self.retire_address_key();
+        }
+        found
     }
 
     /// Run the PFCP Association Release procedure (TS 29.244 6.2.9).
@@ -2383,6 +2430,89 @@ mod tests {
         );
     }
 
+    /// #930 review M1: the SMF itself records a hostname UPF's stamp under the name,
+    /// and writes no address key. The seed test above plants the name key by hand.
+    #[tokio::test]
+    async fn a_hostname_upfs_stamp_is_recorded_under_its_name() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
+        let upf = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = upf.local_addr().unwrap().port();
+        let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let unresolved = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), port);
+        let client = pumped_client(
+            PfcpClient::new(local, unresolved, [127, 0, 0, 1])
+                .with_peer_hostname("LocalHost.", port),
+        )
+        .await;
+        let answered = tokio::spawn(answer_association_setup(upf, 321, false));
+        try_associate(&client).await.expect("association");
+        let _ = answered.await;
+        let name = format!("localhost:{port}");
+        let address = format!("127.0.0.1:{port}");
+        let (by_name, by_address) = {
+            let ctx = smf_self();
+            let ctx = ctx.read().unwrap();
+            (
+                ctx.upf_recovery_time_stamp(&name),
+                ctx.upf_recovery_time_stamp(&address),
+            )
+        };
+        if let Ok(ctx) = smf_self().read() {
+            ctx.forget_upf_recovery_time_stamp(&name);
+        }
+        assert_eq!(by_name, Some(321), "recorded under the normalised name");
+        assert_eq!(by_address, None, "and not under the address");
+    }
+
+    /// #930 review M2, M3: a pre-#722 snapshot keeps a hostname UPF's stamp under its
+    /// address. It still seeds, and it is migrated: the name key gets it and the
+    /// address key goes, so a stale entry cannot later declare a false restart. A
+    /// literal UPF never reads a name key.
+    #[tokio::test]
+    async fn a_legacy_address_keyed_stamp_seeds_once_and_is_migrated() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
+        let port = 47_922u16;
+        let address = format!("127.0.0.1:{port}");
+        let name = format!("localhost:{port}");
+        let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let resolved: SocketAddr = address.parse().unwrap();
+        let hostname = PfcpClient::new(local.clone(), resolved, [127, 0, 0, 1])
+            .with_peer_hostname("localhost", port);
+        smf_self()
+            .read()
+            .unwrap()
+            .note_upf_recovery_time_stamp(&address, 100);
+
+        let seeded = hostname.stored_recovery_time_stamp();
+        let (by_name, by_address) = {
+            let ctx = smf_self();
+            let ctx = ctx.read().unwrap();
+            (
+                ctx.upf_recovery_time_stamp(&name),
+                ctx.upf_recovery_time_stamp(&address),
+            )
+        };
+        // A literal client at another address does not read the name key.
+        let literal = PfcpClient::new(local, "127.0.0.1:47923".parse().unwrap(), [127, 0, 0, 1]);
+        smf_self()
+            .read()
+            .unwrap()
+            .note_upf_recovery_time_stamp("localhost:47923", 555);
+        let literal_seed = literal.stored_recovery_time_stamp();
+        if let Ok(ctx) = smf_self().read() {
+            for k in [name.as_str(), address.as_str(), "localhost:47923"] {
+                ctx.forget_upf_recovery_time_stamp(k);
+            }
+        }
+
+        assert_eq!(seeded, Some(100), "the legacy address key still seeds");
+        assert_eq!(by_name, Some(100), "migrated to the name key");
+        assert_eq!(by_address, None, "and the address key removed");
+        assert_eq!(literal_seed, None, "a literal UPF never reads a name key");
+    }
+
     /// #722: a UPF named by hostname moved while the SMF was down. Its durable
     /// Recovery Time Stamp is keyed by the configured name, so the restarted SMF still
     /// finds the seed although the name now resolves elsewhere, detects the UPF's new
@@ -2439,6 +2569,9 @@ mod tests {
             ctx.policy_bindings.write().unwrap().remove("72201");
         }
 
+        if let Ok(ctx) = smf_self().read() {
+            ctx.forget_upf_recovery_time_stamp(&key);
+        }
         assert_eq!(seed, Some(100), "the seed is found by name");
         assert!(!kept, "the restored session is flushed");
         assert!(released, "and released through the UE (#39)");
