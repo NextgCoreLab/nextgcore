@@ -209,7 +209,7 @@ services:
   lmf:
     environment:
       - NEXTGCORE_SBI_OAUTH2_REQUIRE=1
-      - NEXTGCORE_LMF_INSTANCE_ID=6b1d7e3c-0000-4000-8000-000000000cf0
+      - NEXTGCORE_LMF_INSTANCE_ID=6b1d7e3c-0000-4000-8000-0000000001f0
       - NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE=/var/lib/nextgcore/cca/lmf-cca.key
       - NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR=/etc/nextgcore/cca-public
     volumes: *cca-volumes
