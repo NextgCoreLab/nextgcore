@@ -1750,12 +1750,9 @@ fn parse_uuid_bytes(s: &str) -> Result<[u8; 16], String> {
             hex.len()
         ));
     }
-    let mut out = [0u8; 16];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
-            .map_err(|_| format!("osId '{s}' is not hexadecimal"))?;
-    }
-    Ok(out)
+    nextgcore_core::conv::hex_decode(&hex)
+        .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
+        .ok_or_else(|| format!("osId '{s}' is not hexadecimal"))
 }
 
 /// Parse a dotted-quad into four octets. Used for both address and mask, since
@@ -1831,6 +1828,17 @@ fn parse_rsd(v: &serde_json::Value) -> Result<RouteSelectionDescriptor, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_uuid_bytes_refuses_a_multi_byte_character_without_panicking() {
+        // osId comes from the AMF / UDR (#765): 32 octets, cut inside the e-acute.
+        let bad = format!("a\u{e9}{}", "0".repeat(29));
+        assert!(parse_uuid_bytes(&bad).is_err());
+        assert_eq!(
+            parse_uuid_bytes("00112233-4455-6677-8899-aabbccddeeff").unwrap()[15],
+            0xff
+        );
+    }
 
     #[test]
     fn test_traffic_descriptor_for_dnn() {
