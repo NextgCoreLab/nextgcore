@@ -144,17 +144,18 @@ and the same default-bearer EBI on the UE and the MME, then the same ping / DNS 
 HTTPS / PGW-U counter steps as the 5G profile, on `lteuetun5`.
 
 **Restarting a pod.** Deleting any single EPC pod recovers with no manual
-restart; the next `e2e-internet.sh` passes. Validated on devtest1, one deletion
-at a time:
+restart; the next `e2e-internet.sh` passes. Measured on devtest1 (nextgcore
+cc8f97a, nextgsim 4a35c79), one deletion at a time; the time runs from the
+delete to the first e2e PASS, retrying every e2e run plus 10 s:
 
-| deleted | recovers | how |
-|---|---|---|
-| pgwu | on its own | the PGW-C's PFCP heartbeat sees the new Recovery Time Stamp, sends a Delete Bearer Request; the MME detaches the UE (re-attach required) and the UE re-attaches |
-| sgwu | on its own | sgwc liveness-restarts; the MME sees the SGW-C restart counter change on Echo, detaches (re-attach required), and the UE re-attaches |
-| pgwc | on the UE's next uplink | sgwc and mme liveness-restart; the UE's Service Request is rejected #9, the eNB releases the UE, and the UE re-attaches |
-| sgwc | on the UE's next uplink | mme liveness-restarts; then as for pgwc |
-| mme | on the UE's next uplink | enb liveness-restarts, the UE loses the radio link and camps again idle; then as for pgwc |
-| enb | on its own | lte-ue liveness-restarts and attaches afresh |
+| deleted | PASS after | recovers | how |
+|---|---|---|---|
+| pgwu | 124 s | on its own | the PGW-C's PFCP heartbeat sees the new Recovery Time Stamp, sends a Delete Bearer Request (cause 8); the MME detaches the UE (re-attach required) and the UE re-attaches |
+| sgwu | 124 s | on its own | sgwc liveness-restarts; the MME sees the SGW-C restart counter change on Echo, detaches (re-attach required), and the UE re-attaches |
+| pgwc | 73 s | on the UE's next uplink | the pods that track pgwc (sgwc, pcrf) liveness-restart; the UE's Service Request is rejected #9, the eNB releases the UE, and the UE re-attaches |
+| sgwc | 39 s | on the UE's next uplink | mme liveness-restarts; then as for pgwc |
+| mme | 130 s | on the UE's next uplink | enb liveness-restarts, the UE loses the radio link and camps again idle; then as for pgwc |
+| enb | 113 s | on its own | lte-ue liveness-restarts and attaches afresh |
 
 "On the UE's next uplink": an MME restart loses the UE contexts, and the UE
 stays EMM-REGISTERED and idle until it has data to send. No paging or periodic
