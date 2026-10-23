@@ -1424,6 +1424,10 @@ impl PfcpClient {
 /// Flush the stored PFCP sessions in `scope` (#720): one UPF's sessions, after it
 /// restarted or its association was lost. Returns the number removed.
 pub fn clear_pfcp_sessions_in(scope: &crate::restoration::SessionScope) -> usize {
+    // #779 (review of #879, m2): the production flush, scoped since #809, removes from
+    // the process-wide map too, so a test reaching it holds both locks.
+    #[cfg(test)]
+    assert_teardown_is_serialised();
     let n = match smf_self().read() {
         Ok(ctx) => {
             let n = match ctx.pfcp_sessions.write() {
@@ -1453,6 +1457,11 @@ pub fn clear_pfcp_sessions_in(scope: &crate::restoration::SessionScope) -> usize
 /// Returns the number of sessions removed.
 #[cfg(test)]
 pub fn clear_pfcp_sessions() -> usize {
+    // #779: the flush empties the process-wide map, whatever the caller. An unlocked
+    // teardown reaching it (the #665 hostname test, fixed by #762) is what made the
+    // eps_to_5gs end-to-end test lose its N4 session.
+    #[cfg(test)]
+    assert_teardown_is_serialised();
     if let Ok(ctx) = smf_self().read() {
         let n = {
             match ctx.pfcp_sessions.write() {
