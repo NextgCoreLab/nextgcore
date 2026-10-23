@@ -2404,6 +2404,20 @@ impl PfcpServer {
         smf_seid: u64,
     ) -> Result<usize, String> {
         let sessions = self.sessions.read().await;
+        self.send_due_urr_reports_held(&sessions, upf_seid, smf_seid)
+            .await
+    }
+
+    /// The body of [`Self::send_due_urr_reports`], run while the caller holds the
+    /// session table: the take, the send and -- on failure -- the restore all complete
+    /// before the guard can be released (#842 review). Restoring after the release let
+    /// a deletion waiting on the table build its TERMR in between and miss the bytes.
+    async fn send_due_urr_reports_held(
+        &self,
+        sessions: &HashMap<u64, PfcpSessionInfo>,
+        upf_seid: u64,
+        smf_seid: u64,
+    ) -> Result<usize, String> {
         let Some(smf_addr) = sessions.get(&upf_seid).map(|s| s.smf_addr) else {
             return Ok(0);
         };
@@ -2416,11 +2430,10 @@ impl PfcpServer {
             return Ok(0);
         }
         let n = reports.len();
-        let sent = self
+        match self
             .send_urr_report_to(upf_seid, smf_seid, smf_addr, reports.clone())
-            .await;
-        drop(sessions);
-        match sent {
+            .await
+        {
             Ok(()) => Ok(n),
             Err(e) => {
                 dp.restore_urr_usage(&reports);
@@ -2539,11 +2552,14 @@ impl PfcpServer {
     /// (#80, TS 29.244 §5.2.2.2.2, §8.2.19).
     ///
     /// Distinct from [`Self::send_urr_report`] because it is driven by a data-plane
-    /// EVENT rather than by the harvest: it reads the URR's live counters and builds one
-    /// report for one rule, and it deliberately does **not** reset those counters. The
-    /// harvest owns the reset, and resetting here would make the volume this report
-    /// carries disappear from the next one — under-reporting the very usage the quota
-    /// was measuring.
+    /// EVENT rather than by the harvest. It TAKES the URR's usage, as every usage report
+    /// must (§5.2.2.3.1, #821), so the next report does not carry the same bytes again.
+    ///
+    /// The take and the send happen while the session is held in the PFCP table (#842
+    /// review), as in [`Self::send_due_urr_reports`]: a Session Deletion either ran
+    /// first -- nothing is taken and its TERMR carries everything -- or runs after this
+    /// report is on the wire. Releasing the table before the take let a deletion's TERMR
+    /// miss the bytes this report then sent for a session the SMF had already deleted.
     ///
     /// It also does not clear the exhaustion latch: a report is an announcement, not a
     /// grant. Only the CP function provisioning more quota (an Update URR) resumes
@@ -2554,13 +2570,11 @@ impl PfcpServer {
         smf_seid: u64,
         urr_id: u32,
     ) -> Result<(), String> {
-        let smf_addr = {
-            let sessions = self.sessions.read().await;
-            sessions
-                .get(&upf_seid)
-                .map(|s| s.smf_addr)
-                .ok_or_else(|| format!("Session {upf_seid:#x} not found for quota report"))?
-        };
+        let sessions = self.sessions.read().await;
+        let smf_addr = sessions
+            .get(&upf_seid)
+            .map(|s| s.smf_addr)
+            .ok_or_else(|| format!("Session {upf_seid:#x} not found for quota report"))?;
 
         // The live counters and the trigger, read off the URR that latched. Without the
         // data plane attached there is nothing to read, which is not an error: a UPF
@@ -2644,6 +2658,7 @@ impl PfcpServer {
              ({}B total) — matching traffic is being dropped (TS 29.244 §5.2.2.2.2)",
             report.total_bytes
         );
+        drop(sessions);
         Ok(())
     }
 
@@ -3708,6 +3723,104 @@ mod tests {
             "the TERMR carries the usage the harvest did not take"
         );
         assert_eq!(urr.usage().total_bytes(), 0, "and a final report takes it");
+    }
+
+    /// #842 review MAJOR: the quota-exhausted report holds the session table from its
+    /// lookup through the take AND the send, so a Session Deletion cannot run between
+    /// the take and the send (its TERMR would miss the bytes, and the report would then
+    /// go out for a session the SMF had deleted). Deterministic: the send is parked on
+    /// the pending-report lock, and while it is parked the table must refuse a writer.
+    /// The harvest's send path is checked the same way.
+    #[tokio::test]
+    async fn reports_hold_the_session_table_from_take_to_send() {
+        let (server, smf, _addr, _rx, dp, upf_seid) = established_session().await;
+        let urr = urr1(&dp, upf_seid);
+        urr.set_quotas(Some(100), None, None, None);
+        assert_eq!(
+            urr.record(500, true),
+            crate::data_plane::UrrOutcome::QuotaJustExhausted
+        );
+
+        for path in ["quota", "harvest"] {
+            if path == "harvest" {
+                urr.set_quotas(None, None, None, None);
+                urr.set_reporting(Some(1), None, None, None, None);
+                urr.record(300, true);
+            }
+            let parked = server.pending_reports.lock().await;
+            let task = {
+                let server = Arc::clone(&server);
+                tokio::spawn(async move {
+                    if path == "quota" {
+                        server
+                            .send_quota_exhausted_report(upf_seid, 0x4242, 1)
+                            .await
+                            .map(|_| 1)
+                    } else {
+                        server.send_due_urr_reports(upf_seid, 0x4242).await
+                    }
+                })
+            };
+            // Let the task run up to the parked send.
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(urr.usage().total_bytes(), 0, "{path}: the usage was taken");
+            assert!(
+                server.sessions.try_write().is_err(),
+                "{path}: a deletion must not get the table between the take and the send"
+            );
+            drop(parked);
+            assert_eq!(task.await.unwrap(), Ok(1), "{path}: sent");
+            let mut buf = vec![0u8; 4096];
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(2), smf.recv_from(&mut buf))
+                    .await
+                    .expect("the report reaches the SMF");
+            assert!(
+                server.sessions.try_write().is_ok(),
+                "{path}: released after the send"
+            );
+        }
+    }
+
+    /// #842 review minor: a failed harvest send restores the usage while the session
+    /// table is STILL HELD, so a Session Deletion waiting on the table cannot build its
+    /// TERMR in between and miss the restored bytes. Deterministic: the test holds the
+    /// table itself and checks the usage is back before it lets go.
+    #[tokio::test]
+    async fn a_failed_harvest_send_restores_before_the_table_is_released() {
+        let (server, _smf, _addr, _rx, dp, upf_seid) = established_session().await;
+        let urr = urr1(&dp, upf_seid);
+        urr.set_reporting(Some(1), None, None, None, None);
+        server
+            .sessions
+            .write()
+            .await
+            .get_mut(&upf_seid)
+            .unwrap()
+            .smf_addr = "[::1]:8805".parse().unwrap();
+        urr.record(600, true);
+
+        let table = server.sessions.read().await;
+        assert!(server
+            .send_due_urr_reports_held(&table, upf_seid, 0x4242)
+            .await
+            .is_err());
+        assert_eq!(
+            urr.usage().ul_bytes,
+            600,
+            "restored while the table is held, so a waiting deletion's TERMR sees it"
+        );
+        drop(table);
+        let termr = server.collect_final_usage_reports(upf_seid);
+        assert_eq!(
+            termr
+                .iter()
+                .filter_map(|r| r.volume_measurement.as_ref()?.total_volume)
+                .sum::<u64>(),
+            600
+        );
     }
 
     /// #821 + #780 re-review: the harvest's send path end to end. A due report is
