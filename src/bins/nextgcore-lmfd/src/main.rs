@@ -5348,7 +5348,8 @@ lmf:
 
     /// Seed the global TRP registry with a solvable 4-TRP NR DL-TDOA scene and build
     /// the matching UE LPP ProvideLocationInformation: DL-PRS ID 1 is the
-    /// reference, and three neighbours report their PCI. Each RSTD is the true
+    /// reference, and three neighbours report their PCI. The registry is keyed by
+    /// PCI throughout, so the reference is not found by its key (#714). Each RSTD is the true
     /// range difference over c, as a k0 code `(RSTD/T_c) + 985024`
     /// (TS 38.133 §10.1.23.3).
     ///
@@ -5361,7 +5362,12 @@ lmf:
         let origin = TrpCoord::new(37.7749, -122.4194, 0.0);
         // (registry key, DL-PRS ID, PCI, east, north)
         let trps = [
-            ("prs-1", 1u8, None, 0.0f64, 0.0f64),
+            // The registry keys every TRP by PCI, the reference included, as
+            // operators do. The UE can only name the reference by its DL-PRS ID
+            // (`DL-PRS-ID-Info-r16` has no PCI), so it is found only through the
+            // #714 rebase on a neighbour: this pins #713's DL-TDOA selection
+            // together with #714 (#812 review).
+            ("pci-201", 1u8, None, 0.0f64, 0.0f64),
             ("pci-202", 2, Some(202u16), 1000.0, 0.0),
             ("pci-203", 3, Some(203), 0.0, 1000.0),
             ("pci-204", 4, Some(204), 1000.0, 1000.0),
@@ -5452,6 +5458,14 @@ lmf:
             "lat={lat} (placeholder leaked?)"
         );
         assert!((-123.0..-122.0).contains(&lon), "lon={lon}");
+        // And at the UE, (350, 600) m from the scene origin, to within a metre:
+        // a wrong reference would still land in the box above.
+        let p = crate::positioning::geodetic_to_enu(
+            crate::positioning::TrpCoord::new(lat, lon, 0.0),
+            crate::positioning::TrpCoord::new(37.7749, -122.4194, 0.0),
+        );
+        let err = (p.e - 350.0).hypot(p.n - 600.0);
+        assert!(err < 1.0, "DL-TDOA fix is {err:.2} m from the UE");
         // #714: a DL-TDOA fix says so (TS 29.572 PositioningMethod), not UL_TDOA.
         assert_eq!(v["positioningDataList"][0]["method"], "DL_TDOA");
     }

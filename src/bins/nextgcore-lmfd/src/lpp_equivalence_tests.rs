@@ -176,13 +176,25 @@ fn every_report_adapts_as_the_old_adapters_did() {
         assert_eq!(rtt.len(), captured.len(), "Multi-RTT {}", f[0]);
         for (mut new, old) in rtt.into_iter().zip(captured) {
             let r = some_f64(&old["rtt_ns"]);
-            let ue = some_f64(&new.remove("ue_rx_tx_ns").expect("ue_rx_tx_ns"));
-            let unsigned = ue + 985_024.0 * tc;
-            assert!(
-                r <= unsigned + 1e-6 && unsigned < r + 1.0,
-                "Multi-RTT {}: captured rtt_ns {r}, new ue_rx_tx_ns {ue}",
-                f[0]
-            );
+            match new.remove("ue_rx_tx_ns").expect("ue_rx_tx_ns").as_str() {
+                // An open-ended report value (TS 38.133 §10.1.25.3) is not decoded:
+                // the captured value was the first bin (0) or the last (≈ 1002018 ns
+                // at k0 and above).
+                "None" => assert!(
+                    r == 0.0 || r >= 1_002_017.0,
+                    "Multi-RTT {}: captured rtt_ns {r} is not an open-ended bin",
+                    f[0]
+                ),
+                v => {
+                    let ue = some_f64(v);
+                    let unsigned = ue + 985_024.0 * tc;
+                    assert!(
+                        r <= unsigned + 1e-6 && unsigned < r + 1.0,
+                        "Multi-RTT {}: captured rtt_ns {r}, new ue_rx_tx_ns {ue}",
+                        f[0]
+                    );
+                }
+            }
             assert_eq!(new.remove("rtt_ns").as_deref(), Some("None"));
             assert_eq!(new.remove("gnb_rx_tx_ns").as_deref(), Some("None"));
             check_dl_prs_id(&mut new, "Multi-RTT");
@@ -233,7 +245,9 @@ fn rel18_fine_granularity_arms_convert() {
     );
     // #713: the UE Rx–Tx keeps the same midpoint at the finer step.
     assert!(
-        (ue_rx_tx_to_signed_ns(TimeReport { v: 2_000, k: -1 }) - (1_000.0 - 985_024.0) * tc).abs()
+        (ue_rx_tx_to_signed_ns(TimeReport { v: 2_000, k: -1 }).unwrap()
+            - (1_000.0 - 985_024.0) * tc)
+            .abs()
             < 1e-6
     );
 }
