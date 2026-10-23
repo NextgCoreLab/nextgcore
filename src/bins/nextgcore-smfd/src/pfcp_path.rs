@@ -1396,6 +1396,10 @@ impl PfcpClient {
 /// Flush the stored PFCP sessions in `scope` (#720): one UPF's sessions, after it
 /// restarted or its association was lost. Returns the number removed.
 pub fn clear_pfcp_sessions_in(scope: &crate::restoration::SessionScope) -> usize {
+    // #779 (review of #879, m2): the production flush, scoped since #809, removes from
+    // the process-wide map too, so a test reaching it holds both locks.
+    #[cfg(test)]
+    assert_teardown_is_serialised();
     let n = match smf_self().read() {
         Ok(ctx) => {
             let n = match ctx.pfcp_sessions.write() {
