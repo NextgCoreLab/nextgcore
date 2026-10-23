@@ -5680,7 +5680,7 @@ async fn graceful_shutdown(
     deregister.await;
     if release {
         let mut releases = tokio::task::JoinSet::new();
-        for client in pfcp_clients.to_vec() {
+        for client in pfcp_clients.iter().map(Arc::clone) {
             releases.spawn(async move {
                 if !client.is_associated().await {
                     return;
@@ -5716,6 +5716,9 @@ async fn graceful_shutdown(
     }
     pfcp_listener.abort();
     log::info!("SMF N4 PFCP listener stopped");
+    // #718 review m2: the Delete Bearer Requests sent above, on either path, are
+    // retransmitted until answered or N3 is exhausted.
+    drain_s5s8_requests(gtp_path::s5s8_server().map(|s| s.as_ref())).await;
 }
 
 /// Whether a graceful shutdown releases the PFCP association (#677, #718).
@@ -5750,12 +5753,31 @@ fn refuse_create_while_shutting_down(shutting_down: bool) -> Option<SbiResponse>
 /// Delete every EPC PDN connection on a shutdown that keeps the N4 association
 /// (#718 review M4). Returns `(PFCP sessions deleted at the PGW-U, PDN connections
 /// deleted toward the SGW)`.
-///
-/// The PFCP sessions are deleted first, one Session Deletion each, so the PGW-U
-/// does not keep them under an association the next incarnation asks it to retain
-/// whole. Then each PDN connection is deleted toward its SGW-C with "Reactivation
-/// requested", exactly as after a PGW-U restart (#687).
 async fn shutdown_epc_pdn_connections() -> (usize, usize) {
+    shutdown_epc_pdn_connections_via(
+        gtp_path::s5s8_server().map(|s| s.as_ref()),
+        gtp_path::GTPC_PORT,
+    )
+    .await
+}
+
+/// How many EPC PFCP Session Deletions a shutdown has in flight at once (#718
+/// review m3), as for the 5G releases.
+const SHUTDOWN_EPC_FANOUT: usize = 16;
+
+/// [`shutdown_epc_pdn_connections`] through `server`, addressing each SGW-C at
+/// `sgw_port` (tests bind an ephemeral one).
+///
+/// #718 review N1/m1: the SGW first. The Delete Bearer Request, with "Reactivation
+/// requested", is what reaches the MME and the UE, so it must not queue behind the
+/// PFCP round trips. The PFCP targets are collected before, because the release
+/// drops the sessions from the context. Then the Session Deletions, at most
+/// [`SHUTDOWN_EPC_FANOUT`] at once, so the PGW-U does not keep them under an
+/// association the next incarnation asks it to retain whole.
+async fn shutdown_epc_pdn_connections_via(
+    server: Option<&gtp_path::S5S8Server>,
+    sgw_port: u16,
+) -> (usize, usize) {
     let epc: Vec<(u64, u64)> = smf_self()
         .read()
         .map(|ctx| {
@@ -5765,16 +5787,21 @@ async fn shutdown_epc_pdn_connections() -> (usize, usize) {
                 .collect()
         })
         .unwrap_or_default();
-    // #718 review N1: the SGW first. The Delete Bearer Request is what reaches the
-    // MME and the UE, so it must not queue behind the PFCP round trips; it does not
-    // wait for an answer, and the PFCP targets were collected above because it drops
-    // the sessions from the context.
-    let told = restoration::release_epc_pdn_connections("PGW-C shutting down").await;
-    // Then every PFCP Session Deletion at once: each is bounded by T1 x N1, and the
-    // termination grace period must cover the slowest, not their sum.
+    let told = match server {
+        Some(server) => {
+            restoration::release_epc_pdn_connections_via(server, sgw_port, "PGW-C shutting down")
+                .await
+        }
+        None => 0,
+    };
+    let permits = Arc::new(tokio::sync::Semaphore::new(SHUTDOWN_EPC_FANOUT));
     let mut deletions = tokio::task::JoinSet::new();
     for (smf_n4_seid, upf_seid) in epc {
+        let Ok(permit) = permits.clone().acquire_owned().await else {
+            break;
+        };
         deletions.spawn(async move {
+            let _permit = permit;
             match pfcp_session_delete(smf_n4_seid, upf_seid).await {
                 Ok(()) => true,
                 Err(e) => {
@@ -5794,6 +5821,35 @@ async fn shutdown_epc_pdn_connections() -> (usize, usize) {
         }
     }
     (deleted, told)
+}
+
+/// How long a shutdown keeps retransmitting its own S5/S8 requests (#718 review
+/// m2): T3-RESPONSE x (N3-REQUESTS + 1) with the defaults, 3 s x 4. The SGW gets
+/// the Delete Bearer Requests' retransmissions instead of losing them to a lost
+/// datagram when the process exits.
+const SHUTDOWN_GTP_DRAIN: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// Wait, at most [`SHUTDOWN_GTP_DRAIN`], until no S5/S8 request this node sent is
+/// still awaiting its answer: the T3/N3 task retransmits them meanwhile.
+async fn drain_s5s8_requests(server: Option<&gtp_path::S5S8Server>) {
+    let Some(server) = server else {
+        return;
+    };
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_GTP_DRAIN;
+    loop {
+        let outstanding = server.outstanding().await;
+        if outstanding == 0 {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            log::warn!(
+                "Shutdown: {outstanding} S5/S8 request(s) still unanswered after {:?}",
+                SHUTDOWN_GTP_DRAIN
+            );
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 /// Send a 5GSM message to the UE via the AMF (Namf_Communication
@@ -7302,6 +7358,21 @@ mod tests {
         std::sync::Arc<std::sync::Mutex<Vec<(u8, u32)>>>,
         tokio::task::JoinHandle<()>,
     ) {
+        raw_upf_delayed(order, std::time::Duration::ZERO, None).await
+    }
+
+    /// [`raw_upf`] answering each Session Deletion after `delay`, each on its own
+    /// task (so answers to concurrent requests overlap), and stamping the arrival of
+    /// each deletion into `arrivals` when given.
+    async fn raw_upf_delayed(
+        order: Option<std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>>,
+        delay: std::time::Duration,
+        arrivals: Option<std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>>,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::Mutex<Vec<(u8, u32)>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
         use pfcp_path::pfcp_message_type as t;
         let upf = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = upf.local_addr().unwrap();
@@ -7313,6 +7384,7 @@ mod tests {
             o.extend_from_slice(v);
             o
         };
+        let upf = Arc::new(upf);
         let task = tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
             while let Ok((len, from)) = upf.recv_from(&mut buf).await {
@@ -7321,12 +7393,23 @@ mod tests {
                 };
                 sink.lock().unwrap().push((h.msg_type, h.sequence_number));
                 let reply = match h.msg_type {
-                    t::SESSION_DELETION_REQUEST => pfcp_path::encode_wire_message(
-                        t::SESSION_DELETION_RESPONSE,
-                        Some(h.seid),
-                        h.sequence_number,
-                        &tlv(19, &[1]),
-                    ),
+                    t::SESSION_DELETION_REQUEST => {
+                        if let Some(a) = &arrivals {
+                            a.lock().unwrap().push(std::time::Instant::now());
+                        }
+                        let reply = pfcp_path::encode_wire_message(
+                            t::SESSION_DELETION_RESPONSE,
+                            Some(h.seid),
+                            h.sequence_number,
+                            &tlv(19, &[1]),
+                        );
+                        let upf = upf.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            let _ = upf.send_to(&reply, from).await;
+                        });
+                        continue;
+                    }
                     t::ASSOCIATION_RELEASE_REQUEST => {
                         if let Some(o) = &order {
                             o.lock().unwrap().push("association release");
@@ -7461,6 +7544,176 @@ mod tests {
         assert_eq!(releases, 1, "answered on the first transmission");
         assert!(took < std::time::Duration::from_secs(2), "{took:?}");
         assert!(!client.is_associated().await);
+    }
+
+    /// #718 review R1: with a UPF pool the shutdown releases every association
+    /// concurrently, through the real listener on one shared N4 socket, and each
+    /// session is torn down ONCE: by the teardown of the association it lives on
+    /// (TS 29.244 §6.2.8.2, per association). Before, every concurrent teardown
+    /// snapshotted every session in the process, and each UE got one PDU Session
+    /// Release Command per pool member.
+    #[tokio::test]
+    async fn a_pool_shutdown_releases_each_session_once() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let (amf_srv, amf_uri, amf_seen) = spawn_recording_amf().await;
+        let (upf_a, seen_a, task_a) = raw_upf(None).await;
+        let (upf_b, seen_b, task_b) = raw_upf(None).await;
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let a = Arc::new(pfcp_path::PfcpClient::new(
+            sock.clone(),
+            upf_a,
+            [127, 0, 0, 1],
+        ));
+        let b = Arc::new(pfcp_path::PfcpClient::new(
+            sock.clone(),
+            upf_b,
+            [127, 0, 0, 1],
+        ));
+        for c in [&a, &b] {
+            c.set_assoc_state_for_test(true, None, None).await;
+        }
+        pfcp_path::set_global_pool(vec![a.clone(), b.clone()]);
+        let listener = spawn_pfcp_listener(sock, vec![a.clone(), b.clone()]);
+        // One session, on UPF A.
+        let reference = "71899";
+        seed_binding(reference, 5);
+        if let Ok(ctx) = smf_self().read() {
+            if let Some(b) = ctx.policy_bindings.write().unwrap().get_mut(reference) {
+                b.sm_context_status_uri = Some(format!("{amf_uri}/namf-callback/v1/sm-status"));
+            }
+        }
+        let seid = context::derive_cp_n4_seid(reference);
+        if let Ok(ctx) = smf_self().read() {
+            ctx.pfcp_sessions
+                .write()
+                .unwrap()
+                .insert(reference.to_string(), 0x7189);
+        }
+        pfcp_path::record_session_peer(seid, a.peer());
+
+        graceful_shutdown(async {}, &[a.clone(), b.clone()], true, listener).await;
+        let release_commands = amf_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(_, uri, _)| uri.ends_with("/n1-n2-messages"))
+            .count();
+        let released = |seen: &std::sync::Mutex<Vec<(u8, u32)>>| {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|(ty, _)| *ty == pfcp_path::pfcp_message_type::ASSOCIATION_RELEASE_REQUEST)
+                .count()
+        };
+        let (rel_a, rel_b) = (released(&seen_a), released(&seen_b));
+        cancel_gsm_timer(reference, timer::SmfTimerId::T3592);
+        if let Ok(ctx) = smf_self().read() {
+            ctx.policy_bindings.write().unwrap().remove(reference);
+        }
+        pfcp_path::forget_session_peer(seid);
+        task_a.abort();
+        task_b.abort();
+        amf_srv.stop().await.ok();
+        pfcp_path::clear_global_upf_for_test();
+
+        assert_eq!(
+            release_commands, 1,
+            "one PDU Session Release Command (#39) per session"
+        );
+        assert_eq!(
+            (rel_a, rel_b),
+            (1, 1),
+            "both associations released, each answered once"
+        );
+    }
+
+    /// #718 review m1: the EPC shutdown tells the SGW before it deletes anything at
+    /// the PGW-U, and the PGW-U deletions run concurrently: two deletions the PGW-U
+    /// answers 400 ms each finish in well under 800 ms.
+    #[tokio::test]
+    async fn the_epc_shutdown_tells_the_sgw_first_and_deletes_in_parallel() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        smf_context_init(64, 256, 512);
+        let arrivals = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (upf, _seen, upf_task) = raw_upf_delayed(
+            None,
+            std::time::Duration::from_millis(400),
+            Some(arrivals.clone()),
+        )
+        .await;
+        let (client, listener) = client_behind_the_real_listener(upf).await;
+        let server = gtp_path::S5S8Server::open("127.0.0.1:0".parse().unwrap(), 3)
+            .await
+            .expect("S5/S8");
+        let sgw = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sgw_port = sgw.local_addr().unwrap().port();
+        let mut ids = Vec::new();
+        if let Ok(ctx) = smf_self().read() {
+            for sess in ctx.sess_find_all_by(|s| s.epc) {
+                ctx.sess_remove(sess.id);
+            }
+            for (i, imsi) in [b"001010000071821", b"001010000071822"].iter().enumerate() {
+                let ue = ctx.ue_add_by_imsi(&imsi[..]).expect("ue");
+                let sess = ctx.sess_add_by_apn(ue.id, "internet", 6).expect("sess");
+                ctx.bearer_add(sess.id).expect("default bearer");
+                let mut sess = ctx.sess_find_by_seid(sess.smf_n4_seid).expect("sess");
+                sess.upf_n4_seid = 0x7182 + i as u64;
+                sess.sgw_s5c_teid = 0x7182_0000 + i as u32;
+                sess.sgw_s5c_ip.ipv4 = Some(std::net::Ipv4Addr::LOCALHOST);
+                ctx.sess_update(&sess);
+                pfcp_path::record_session_peer(sess.smf_n4_seid, client.peer());
+                ids.push(sess.smf_n4_seid);
+            }
+        }
+
+        let started = std::time::Instant::now();
+        let sgw_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let mut first = None;
+            let mut n = 0;
+            while n < 2 {
+                let Ok(Ok((_len, _))) = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    sgw.recv_from(&mut buf),
+                )
+                .await
+                else {
+                    break;
+                };
+                first.get_or_insert_with(std::time::Instant::now);
+                n += 1;
+            }
+            (first, n)
+        });
+        let (deleted, told) = shutdown_epc_pdn_connections_via(Some(&server), sgw_port).await;
+        let took = started.elapsed();
+        let (sgw_first, dbrs) = sgw_task.await.unwrap();
+        let pfcp_first = arrivals.lock().unwrap().first().copied();
+        listener.abort();
+        upf_task.abort();
+        for seid in &ids {
+            pfcp_path::forget_session_peer(*seid);
+        }
+        pfcp_path::clear_global_upf_for_test();
+
+        assert_eq!(
+            (told, dbrs),
+            (2, 2),
+            "a Delete Bearer Request per PDN connection"
+        );
+        assert_eq!(deleted, 2, "both PFCP sessions deleted at the PGW-U");
+        assert!(
+            sgw_first.expect("the SGW heard") <= pfcp_first.expect("the PGW-U heard"),
+            "the SGW is told before the PGW-U"
+        );
+        assert!(
+            took < std::time::Duration::from_millis(750),
+            "the deletions overlapped: {took:?}"
+        );
     }
 
     /// #718 review M4: a shutdown that keeps the N4 association for durable state

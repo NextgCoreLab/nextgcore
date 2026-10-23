@@ -1197,6 +1197,13 @@ impl PfcpClient {
         if !self.is_associated().await {
             return Ok(());
         }
+        // The association's sessions are deleted locally FIRST (TS 29.244 §6.2.9):
+        // the UEs (#39) and the SGWs (Delete Bearer) are told before the request
+        // waits on the UPF, which can take T1 x N1 when the UPF is gone (#718 review
+        // m5). Before, they were told only after that wait, and a short termination
+        // grace period cut them off.
+        self.teardown_association("association release requested locally")
+            .await;
         let msg = PfcpMessage::AssociationReleaseRequest(AssociationReleaseRequest::new(
             self.node_id.clone(),
         ));
@@ -1205,10 +1212,6 @@ impl PfcpClient {
 
         let result = self
             .request(pfcp_message_type::ASSOCIATION_RELEASE_REQUEST, None, &buf)
-            .await;
-
-        // Whether the peer answered or not, the association is gone locally
-        self.teardown_association("association release requested locally")
             .await;
 
         match result {
