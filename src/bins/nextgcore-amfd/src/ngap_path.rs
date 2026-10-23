@@ -8436,7 +8436,9 @@ impl NgapServer {
         // an N2 handover `handle_handover_notify` has moved the UE to the target and
         // released the source with a successful-handover Release Command carrying the
         // same AMF UE NGAP ID; the source's Release Complete ends that old leg only
-        // (TS 38.413 §8.4.3, TS 23.502 §4.9.1.3.3 step 14a). Applying it to the UE
+        // (TS 23.502 §4.9.1.3.3 step 14a, the release of the S-RAN's resources; TS 38.413
+        // §8.3.3.2, the Complete ends THAT UE-associated logical NG-connection). Applying
+        // it to the UE
         // marked a connected UE idle, deactivated its user plane and armed the mobile
         // reachable timer. The check and the idle marking share one store access, so
         // nothing can move the UE between them.
@@ -8449,10 +8451,14 @@ impl NgapServer {
                 {
                     return Err(serving);
                 }
+                // Only the CONNECTED -> IDLE transition deactivates the user plane and
+                // arms the timer: a duplicate Complete for a UE already idle must not
+                // re-send DEACTIVATED or push the reachability deadline back.
+                let went_idle = s.registered && !s.cm_idle;
                 if s.registered {
                     s.cm_idle = true;
                 }
-                Ok(s.registered)
+                Ok((s.registered, went_idle))
             });
             let went_idle = match leg {
                 Some(Err((serving_assoc, serving_ran))) => {
@@ -8465,7 +8471,13 @@ impl NgapServer {
                     );
                     return Ok(());
                 }
-                Some(Ok(registered)) => registered,
+                Some(Ok((true, false))) => {
+                    log::debug!(
+                        "Duplicate UE Context Release Complete for UE {id}: already CM-IDLE"
+                    );
+                    return Ok(());
+                }
+                Some(Ok((_, went_idle))) => went_idle,
                 None => false,
             };
             // #540 / TS 23.502 §4.2.6 step 5: the AN release ends the user plane of
@@ -9978,6 +9990,14 @@ impl NgapServer {
             // target now that the UE has arrived (TS 23.502 Section 4.9.1.3).
             state.association_id = association_id;
             state.ran_ue_ngap_id = notify.ran_ue_ngap_id;
+            // #738 review: the UE has ARRIVED on the target, so it is CM-CONNECTED
+            // whatever happened to the source leg meanwhile. A source Release Complete
+            // that came BEFORE this Notify (a source-raised release mid-execution) was
+            // the serving leg at the time and idled the UE and armed the mobile
+            // reachable timer; left in place, a connected UE would be paged and later
+            // implicitly deregistered.
+            state.cm_idle = false;
+            state.reachability = None;
             // #406: was this same unpacking written out inline. Shared with the Uplink NAS
             // Transport and PathSwitchRequest sites now, so the three cannot reassemble the
             // big-endian TAC differently. Behaviour here is unchanged — this was the one
@@ -20708,12 +20728,64 @@ mod tests {
     /// idle, a `DEACTIVATED` update reaches the SMF and the timer is armed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_source_release_complete_after_a_handover_leaves_the_ue_connected() {
+        // (source RAN UE NGAP ID, target RAN UE NGAP ID, does the source's Complete
+        // carry its RAN UE NGAP ID). The SAME id on both gNBs is the common case --
+        // each gNB allocates from its own small counter -- and is what isolates the
+        // ASSOCIATION half of the serving check; the absent id (mandatory, criticality
+        // ignore, §9.2.2.6) leaves the association as the only discriminator.
+        for (case, (source_ran, target_ran, ran_in_complete)) in
+            [(31u32, 732u32, true), (31, 31, true), (31, 31, false)]
+                .into_iter()
+                .enumerate()
+        {
+            source_release_after_handover_case(
+                case as u64,
+                source_ran,
+                target_ran,
+                ran_in_complete,
+            )
+            .await;
+        }
+    }
+
+    /// A UE Context Release Complete naming `amf_ue_ngap_id`, with the RAN UE NGAP ID
+    /// IE only when `ran_ue_ngap_id` is `Some` (generated codec).
+    fn release_complete_pdu(amf_ue_ngap_id: u64, ran_ue_ngap_id: Option<u32>) -> Vec<u8> {
+        use g::UEContextReleaseCompleteProtocolIEs_EntryValue as Ie;
+        use nextgcore_ngap_gen::generated as g;
+        let mut ies = vec![g::UEContextReleaseCompleteProtocolIEs_Entry {
+            id: g::ProtocolIE_ID(g::ID_AMF_UE_NGAP_ID),
+            criticality: g::Criticality(g::Criticality::IGNORE),
+            value: Ie::Id_AMF_UE_NGAP_ID(g::AMF_UE_NGAP_ID(amf_ue_ngap_id)),
+        }];
+        if let Some(ran) = ran_ue_ngap_id {
+            ies.push(g::UEContextReleaseCompleteProtocolIEs_Entry {
+                id: g::ProtocolIE_ID(g::ID_RAN_UE_NGAP_ID),
+                criticality: g::Criticality(g::Criticality::IGNORE),
+                value: Ie::Id_RAN_UE_NGAP_ID(g::RAN_UE_NGAP_ID(ran)),
+            });
+        }
+        nextgcore_ngap_gen::encode(&g::NGAP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
+            procedure_code: g::ProcedureCode(g::ID_UE_CONTEXT_RELEASE),
+            criticality: g::Criticality(g::Criticality::REJECT),
+            value: g::SuccessfulOutcomeValue::Id_UEContextRelease(g::UEContextReleaseComplete {
+                protocol_i_es: g::UEContextReleaseCompleteProtocolIEs(ies),
+            }),
+        }))
+        .expect("encode UEContextReleaseComplete")
+    }
+
+    async fn source_release_after_handover_case(
+        case: u64,
+        source_ran: u32,
+        target_ran: u32,
+        ran_in_complete: bool,
+    ) {
         crate::context::amf_context_init(64, 1024, 4096);
         let (_smf, smf_port, smf_seen) = recording_smf().await;
         let mut server = capturing_ngap_server().await;
-        let (source, target) = (97_381u64, 97_382u64);
-        let amf_ue_ngap_id = 7_738_001u64;
-        let (source_ran, target_ran) = (31u32, 732u32);
+        let (source, target) = (97_381u64 + 10 * case, 97_382u64 + 10 * case);
+        let amf_ue_ngap_id = 7_738_001u64 + 100 * case;
         let (psi, sm_ref) = (5u8, "ref-738");
         seed_gnb_session(&server, source).await;
         seed_gnb_session(&server, target).await;
@@ -20769,13 +20841,8 @@ mod tests {
         assert!(after_notify[0].contains("HANDOVER_COMPLETE"));
 
         // The source answers its Release Command.
-        let source_complete = nextgcore_ngap::builder::build_ue_context_release_complete(
-            &nextgcore_ngap::types::UeContextReleaseComplete {
-                amf_ue_ngap_id,
-                ran_ue_ngap_id: source_ran,
-            },
-        )
-        .expect("encode");
+        let source_complete =
+            release_complete_pdu(amf_ue_ngap_id, ran_in_complete.then_some(source_ran));
         server
             .handle_ue_context_release_complete(source, &source_complete)
             .await
@@ -20830,6 +20897,76 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&calls[1].1).expect("json")["upCnxState"],
             "DEACTIVATED",
             "TS 23.502 §4.2.6 step 5: the AN release deactivates the session's user plane"
+        );
+
+        // A duplicate of the serving leg's Complete is idempotent: no second
+        // DEACTIVATED, and the reachability deadline is not pushed back.
+        let deadline = ue.reachability.map(|r| r.deadline);
+        server
+            .handle_ue_context_release_complete(target, &target_complete)
+            .await
+            .expect("handled");
+        assert_eq!(
+            smf_seen.lock().expect("sink").len(),
+            2,
+            "no second N11 call"
+        );
+        assert_eq!(
+            server
+                .ue_auth_state
+                .get(amf_ue_ngap_id)
+                .and_then(|u| u.reachability)
+                .map(|r| r.deadline),
+            deadline,
+            "the timer is not re-armed"
+        );
+    }
+
+    /// **#738 review, MAJOR-2.** A source Release Complete that arrives BEFORE the
+    /// HandoverNotify (the source raised a release mid-execution) is the serving leg at
+    /// that moment and idles the UE. The Notify then says the UE has ARRIVED on the
+    /// target: it must leave the UE CM-CONNECTED with no mobile reachable timer, or a
+    /// connected UE is paged and later implicitly deregistered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_handover_notify_after_the_source_release_leaves_the_ue_connected() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut server = capturing_ngap_server().await;
+        let (source, target) = (97_391u64, 97_392u64);
+        let amf_ue_ngap_id = 7_738_020u64;
+        seed_gnb_session(&server, source).await;
+        seed_gnb_session(&server, target).await;
+        let mut state = UeNasContext::new(amf_ue_ngap_id, 7, source, false);
+        state.registered = true;
+        server.ue_auth_state.insert(amf_ue_ngap_id, state);
+
+        server
+            .handle_ue_context_release_complete(
+                source,
+                &release_complete_pdu(amf_ue_ngap_id, Some(7)),
+            )
+            .await
+            .expect("handled");
+        let ue = server.ue_auth_state.get(amf_ue_ngap_id).expect("UE kept");
+        assert!(
+            ue.is_cm_idle(),
+            "precondition: the serving leg's release idled it"
+        );
+        assert!(
+            ue.reachability.is_some(),
+            "precondition: the timer is armed"
+        );
+
+        server
+            .handle_handover_notify(target, &handover_notify_pdu(amf_ue_ngap_id, 8))
+            .await
+            .expect("handled");
+        let ue = server.ue_auth_state.get(amf_ue_ngap_id).expect("UE kept");
+        assert_eq!((ue.association_id, ue.ran_ue_ngap_id), (target, 8));
+        assert!(!ue.is_cm_idle(), "arrived on the target: CM-CONNECTED");
+        assert_eq!(
+            ue.reachability.map(|r| r.phase),
+            None,
+            "no reachability timer"
         );
     }
 
