@@ -268,6 +268,7 @@ pub fn nas_eps_send_attach_accept(
     enb_ue: &EnbUe,
     sess: &MmeSess,
     default_bearer: &MmeBearer,
+    ue_ambr: nextgcore_s1ap::UeAmbr,
 ) -> NasResult<()> {
     if mme_ue.id == 0 {
         log::error!("UE(mme-ue) context has already been removed");
@@ -317,6 +318,7 @@ pub fn nas_eps_send_attach_accept(
         enb_ue,
         std::slice::from_ref(default_bearer),
         Some(&secured_message),
+        ue_ambr,
     )
     .map_err(|e| {
         log::error!(
@@ -654,6 +656,7 @@ pub fn nas_eps_send_tau_accept(
     enb_ue: &EnbUe,
     use_initial_context_setup: bool,
     bearers: &[MmeBearer],
+    ue_ambr: nextgcore_s1ap::UeAmbr,
 ) -> NasResult<()> {
     if mme_ue.id == 0 {
         log::error!("UE(mme-ue) context has already been removed");
@@ -695,6 +698,7 @@ pub fn nas_eps_send_tau_accept(
             enb_ue,
             bearers,
             Some(&emm_message),
+            ue_ambr,
         )
         .map_err(|_| NasError::BuildFailed)?;
         nas_eps_send_to_enb(mme_ue, enb_ue, s1ap_message)
@@ -961,8 +965,14 @@ pub fn nas_eps_send_activate_default_bearer_context_request(
 
     // Build S1AP E-RAB setup request (APER via nextgcore-s1ap). The ESM message
     // is carried inside it, so transmit the PDU (issue #42).
-    let s1ap_message = s1ap_build::build_e_rab_setup_request(enb_ue, bearer, &esm_message)
-        .map_err(|_| NasError::BuildFailed)?;
+    // A new PDN connection changes the UE-AMBR (TS 23.401 §5.10.2 step 9, #811).
+    let s1ap_message = s1ap_build::build_e_rab_setup_request(
+        enb_ue,
+        bearer,
+        &esm_message,
+        Some(s1ap_build::ue_ambr_of(ctx, mme_ue)),
+    )
+    .map_err(|_| NasError::BuildFailed)?;
 
     nas_eps_send_to_enb(mme_ue, enb_ue, s1ap_message)
 }
@@ -1001,7 +1011,7 @@ pub fn nas_eps_send_activate_dedicated_bearer_context_request(
 
     // Build S1AP E-RAB setup request (APER via nextgcore-s1ap). The ESM message
     // is carried inside it, so transmit the PDU (issue #42).
-    let s1ap_message = s1ap_build::build_e_rab_setup_request(enb_ue, bearer, &esm_message)
+    let s1ap_message = s1ap_build::build_e_rab_setup_request(enb_ue, bearer, &esm_message, None)
         .map_err(|_| NasError::BuildFailed)?;
 
     nas_eps_send_to_enb(mme_ue, enb_ue, s1ap_message)
@@ -1094,6 +1104,7 @@ pub fn nas_eps_send_deactivate_bearer_context_request(
         S1apCauseGroup::Nas,
         s1ap_build::nas_cause::NORMAL_RELEASE,
         Some(&esm_message),
+        None,
     )
     .map_err(|_| NasError::BuildFailed)?;
 
@@ -1237,6 +1248,80 @@ pub fn nas_eps_send_downlink_nas_transport(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #869 review MINOR 1, TS 23.401 §5.10.2 step 9: the E-RAB SETUP REQUEST
+    /// of a new PDN connection's default bearer carries the UE-AMBR of the
+    /// active APNs, the new one included.
+    #[test]
+    fn the_new_pdn_e_rab_setup_carries_the_ue_ambr() {
+        use nextgcore_s1ap_gen::generated as g;
+        let _guard = crate::gtp_path::lock_s11();
+        let ctx = MmeContext::new();
+        ctx.init();
+        let enb_id = ctx.enb_add("127.0.0.1:36869".parse().unwrap());
+        let enb_ue_id = ctx.enb_ue_add(enb_id, 869);
+        let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
+        ctx.enb_ue_associate_mme_ue(enb_ue_id, mme_ue_id);
+        let mut sessions = Vec::new();
+        for (ebi, dl, ul) in [(5u8, 3_000_000u64, 1_000_000u64), (6, 4_000_000, 2_000_000)] {
+            let sess_id = ctx.sess_add(mme_ue_id, ebi);
+            let bearer_id = ctx.bearer_add(sess_id, mme_ue_id);
+            {
+                let mut pool = ctx.bearer_pool.write().unwrap();
+                let b = pool.get_mut(&bearer_id).unwrap();
+                b.ebi = ebi;
+                b.sgw_s1u_teid = 0x8690 + u32::from(ebi);
+                b.sgw_s1u_ip.ipv4 = Some([10, 0, 0, 2]);
+            }
+            {
+                let mut pool = ctx.sess_pool.write().unwrap();
+                let s = pool.get_mut(&sess_id).unwrap();
+                s.bearer_list.push(bearer_id);
+                s.ambr.downlink = dl;
+                s.ambr.uplink = ul;
+            }
+            sessions.push((sess_id, bearer_id));
+        }
+        {
+            let mut pool = ctx.mme_ue_pool.write().unwrap();
+            let ue = pool.get_mut(&mme_ue_id).unwrap();
+            ue.sess_list = sessions.iter().map(|(s, _)| *s).collect();
+            ue.ambr.downlink = 100_000_000;
+            ue.ambr.uplink = 100_000_000;
+        }
+        crate::s1ap_path::tap_enb_for_test(enb_id);
+        let _ = crate::s1ap_path::take_tapped_for_test(enb_id);
+        let (sess_id, bearer_id) = sessions[1];
+        nas_eps_send_activate_default_bearer_context_request(
+            &ctx,
+            &ctx.bearer_find_by_id(bearer_id).unwrap(),
+            &ctx.sess_find_by_id(sess_id).unwrap(),
+            &ctx.mme_ue_find_by_id(mme_ue_id).unwrap(),
+            &ctx.enb_ue_find_by_id(enb_ue_id).unwrap(),
+            GtpCreateAction::InPdnConnectivity,
+        )
+        .expect("sent");
+        let ambr = crate::s1ap_path::take_tapped_for_test(enb_id)
+            .into_iter()
+            .find_map(|pdu| match nextgcore_s1ap_gen::decode(&pdu) {
+                Ok(g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+                    value: g::InitiatingMessageValue::Id_E_RABSetup(req),
+                    ..
+                })) => req.protocol_i_es.0.into_iter().find_map(|ie| match ie.value {
+                    g::E_RABSetupRequestProtocolIEs_EntryValue::Id_uEaggregateMaximumBitrate(a) => {
+                        Some((a.u_eaggregate_maximum_bit_rate_dl.0, a.u_eaggregate_maximum_bit_rate_ul.0))
+                    }
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("an E-RAB SETUP REQUEST with a UE-AMBR");
+        assert_eq!(
+            ambr,
+            (7_000_000, 3_000_000),
+            "the sum of both active APN-AMBRs"
+        );
+    }
 
     /// #46 criterion 3: the SUBSCRIPTION wins, then the configured value, then the
     /// 3600 that used to be hardcoded.
