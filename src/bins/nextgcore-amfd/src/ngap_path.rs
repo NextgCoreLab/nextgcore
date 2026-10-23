@@ -1753,37 +1753,85 @@ impl NgapServer {
             return Ok(());
         };
 
-        // Drop pending authentication state for the affected UEs.
-        //
-        // Via `forget_ue` rather than `ue_auth_state` directly (#356): an NG Reset means
-        // those UEs are gone, so their emergency contexts go with them. The whole-interface
-        // arm collects the ids first because `retain` cannot call `&mut self`; the set is
-        // the same one `retain` matched.
-        match &reset.reset_type {
-            ResetType::NgInterface => {
-                let affected: Vec<u64> = self
+        // #754: the UE-associated logical NG-connections the reset names, resolved on the
+        // LIVE store (`ue_auth_state`), and only those served by THIS association: TS
+        // 38.413 §8.7.4.2.1 scopes a reset to the sending NG-RAN node's connections, so a
+        // gNB cannot list another gNB's UE (the NG Reset site of #739). When an item
+        // carries both ids the pair must match.
+        let affected: Vec<u64> = match &reset.reset_type {
+            // `snapshot` and not `iter`: the loop below re-enters the store, so a live
+            // guard here would DEADLOCK. See `ue_store`'s module docs.
+            ResetType::NgInterface => self
+                .ue_auth_state
+                .snapshot()
+                .into_iter()
+                .filter(|(_, state)| state.association_id == association_id)
+                .map(|(amf_ue_ngap_id, _)| amf_ue_ngap_id)
+                .collect(),
+            ResetType::PartOfNgInterface(connections) => {
+                let on_this_gnb: Vec<(u64, u32)> = self
                     .ue_auth_state
-                    // `snapshot` and not `iter`: the loop below calls `forget_ue`,
-                    // which re-enters the store, so a live guard here would
-                    // DEADLOCK -- and unlike a guard crossing an `.await`, that
-                    // does not fail to compile. See `ue_store`'s module docs.
                     .snapshot()
                     .into_iter()
                     .filter(|(_, state)| state.association_id == association_id)
-                    .map(|(amf_ue_ngap_id, _)| amf_ue_ngap_id)
+                    .map(|(id, state)| (id, state.ran_ue_ngap_id))
                     .collect();
-                for amf_ue_ngap_id in affected {
-                    self.forget_ue(amf_ue_ngap_id);
-                }
-            }
-            ResetType::PartOfNgInterface(connections) => {
-                let affected: Vec<u64> = connections
+                connections
                     .iter()
-                    .filter_map(|item| item.amf_ue_ngap_id)
-                    .collect();
-                for amf_ue_ngap_id in affected {
-                    self.forget_ue(amf_ue_ngap_id);
+                    .filter_map(|item| {
+                        let found = on_this_gnb.iter().find(|(id, ran)| {
+                            match (item.amf_ue_ngap_id, item.ran_ue_ngap_id) {
+                                (Some(amf), Some(r)) => *id == amf && *ran == r,
+                                (Some(amf), None) => *id == amf,
+                                (None, Some(r)) => *ran == r,
+                                (None, None) => false,
+                            }
+                        });
+                        if found.is_none() {
+                            log::warn!(
+                                "NG Reset from association {association_id}: no connection of \
+                                 this gNB matches AMF-UE-NGAP-ID={:?}, RAN-UE-NGAP-ID={:?}; \
+                                 ignored",
+                                item.amf_ue_ngap_id,
+                                item.ran_ue_ngap_id
+                            );
+                        }
+                        found.map(|(id, _)| *id)
+                    })
+                    .collect()
+            }
+        };
+
+        // #754: an NG Reset releases the NG resources only (TS 38.413 §8.7.4.2.1). A
+        // REGISTERED UE goes CM-IDLE exactly as at a UE Context Release Complete: it keeps
+        // its registration, NAS security context and PDU sessions; each session's user
+        // plane is deactivated at its owning SMF (TS 23.502 §4.2.6 step 5), so the UPF
+        // buffers downlink data and pages instead of forwarding to the reset gNB's dead
+        // tunnels; and the mobile reachable timer starts (TS 24.501 §5.3.7). Before, every
+        // affected UE was FORGOTTEN: its next Service Request got #9, the SMF kept
+        // forwarding to the dead tunnels, and the PCF/UDM records leaked. A UE whose
+        // registration had not completed has nothing to keep and is still dropped
+        // (`forget_ue`, which also frees an emergency context, #356).
+        for amf_ue_ngap_id in affected {
+            let registered_went_idle = self
+                .ue_auth_state
+                .with_mut(amf_ue_ngap_id, |s| {
+                    s.registered.then(|| {
+                        let went_idle = !s.cm_idle;
+                        s.cm_idle = true;
+                        went_idle
+                    })
+                })
+                .flatten();
+            match registered_went_idle {
+                Some(true) => {
+                    self.deactivate_up_connections(amf_ue_ngap_id).await;
+                    self.start_reachability_supervision(association_id, Some(amf_ue_ngap_id))
+                        .await;
                 }
+                // Already CM-IDLE (and supervised since): nothing more to release.
+                Some(false) => {}
+                None => self.forget_ue(amf_ue_ngap_id),
             }
         }
 
@@ -18826,59 +18874,106 @@ mod tests {
         assert!(ue, "and the UE Policy Association; saw {seen:?}");
     }
 
-    /// #637: an NG Reset through the live NGAP task releases the SM context of every
-    /// UE it drops at the SMF. The release used to resolve the SMF with the sync
-    /// resolver, whose `Handle::block_on` panics inside the runtime, so a reset that
-    /// dropped a UE with a PDU session panicked the NGAP task instead.
+    /// **#754.** An NG Reset through the live NGAP handler moves a UE registered over N2
+    /// to CM-IDLE -- it keeps its registration and PDU sessions, each session's user
+    /// plane is DEACTIVATED at its owning SMF, and the mobile reachable timer starts --
+    /// instead of forgetting it. Nothing is released at the SMF (the old #637 path
+    /// Nsmf-released sessions found through a `RanUe` list production never builds).
+    /// Both reset types; a partial reset from ANOTHER gNB listing this UE's AMF UE NGAP
+    /// ID touches nothing (TS 38.413 §8.7.4.2.1 scopes it to the sender, #739).
+    ///
+    /// REVERT-VERIFIED: with the old `forget_ue` loop the UE is gone; without the
+    /// association scoping the other gNB's partial reset idles it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_ng_reset_releases_the_dropped_ues_sessions_at_the_smf() {
+    async fn an_ng_reset_moves_its_registered_ues_to_cm_idle_with_the_user_plane_deactivated() {
         let (_nf, port, seen) = recording_nf().await;
         let _env = SmfEnvGuard::set(port);
         crate::context::amf_context_init(64, 1024, 4096);
-        let mut ngap = test_ngap_server().await;
-        let assoc = 637_001u64;
+        let mut ngap = capturing_ngap_server().await;
+        let (assoc, other_assoc) = (754_001u64, 754_002u64);
         seed_gnb_session(&ngap, assoc).await;
-        {
-            let ctx = crate::context::amf_self();
-            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
-            // `seed_gnb_session` makes the session's gNB pool id its association id.
-            let ran_ue = guard.ran_ue_add(assoc, 637).expect("ran_ue_add");
-            let amf_ue = guard.amf_ue_add(ran_ue.id).expect("amf_ue_add");
-            guard.amf_ue_associate_ran_ue(amf_ue.id, ran_ue.id);
-            let mut sess = guard.sess_add(amf_ue.id, 5).expect("sess_add");
-            sess.sm_context_ref = Some("smctx-637".to_string());
-            guard.sess_update(&sess);
-        }
+        seed_gnb_session(&ngap, other_assoc).await;
+        let reset = |reset_type| {
+            nextgcore_ngap::builder::build_ng_reset(&nextgcore_ngap::types::NgReset {
+                cause: nextgcore_ngap::types::Cause::Transport(
+                    nextgcore_ngap::types::CauseTransport::TransportResourceUnavailable,
+                ),
+                reset_type,
+            })
+            .expect("build NG Reset")
+        };
+        let item =
+            |amf: u64, ran: u32| nextgcore_ngap::types::UeAssociatedLogicalNgConnectionItem {
+                amf_ue_ngap_id: Some(amf),
+                ran_ue_ngap_id: Some(ran),
+            };
 
-        let whole = nextgcore_ngap::builder::build_ng_reset(&nextgcore_ngap::types::NgReset {
-            cause: nextgcore_ngap::types::Cause::Transport(
-                nextgcore_ngap::types::CauseTransport::TransportResourceUnavailable,
-            ),
-            reset_type: nextgcore_ngap::types::ResetType::NgInterface,
-        })
-        .expect("build NG Reset");
-        // Result discarded: the NG Reset Acknowledge cannot be sent over this fixture's
-        // transport; the release is spawned before that send.
-        let _ = ngap.handle_ng_reset(assoc, &whole).await;
+        for (n, whole) in [true, false].into_iter().enumerate() {
+            let ue = 7_754_001u64 + n as u64;
+            let sm_ref = format!("smctx-754-{n}");
+            let mut state = UeNasContext::new(ue, 75, assoc, false);
+            state.registered = true;
+            ngap.ue_auth_state.insert(ue, state);
+            ngap.sm_context_refs.insert((ue, 5), sm_ref.clone());
+            ngap.sm_context_smfs
+                .insert((ue, 5), ("127.0.0.1".to_string(), port));
 
-        let mut released = false;
-        for _ in 0..200 {
-            if seen
-                .lock()
-                .expect("seen")
-                .iter()
-                .any(|s| s == "POST /nsmf-pdusession/v1/sm-contexts/smctx-637/release")
-            {
-                released = true;
-                break;
+            if !whole {
+                // Another gNB lists this UE: ignored.
+                ngap.handle_ng_reset(
+                    other_assoc,
+                    &reset(nextgcore_ngap::types::ResetType::PartOfNgInterface(vec![
+                        item(ue, 75),
+                    ])),
+                )
+                .await
+                .expect("handled");
+                let kept = ngap.ue_auth_state.get(ue).expect("untouched");
+                assert!(
+                    !kept.is_cm_idle(),
+                    "another gNB's reset leaves the UE alone"
+                );
+                assert!(kept.reachability.is_none());
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            take_sent_ngap(&mut ngap);
+            seen.lock().expect("seen").clear();
+
+            let pdu = if whole {
+                reset(nextgcore_ngap::types::ResetType::NgInterface)
+            } else {
+                reset(nextgcore_ngap::types::ResetType::PartOfNgInterface(vec![
+                    item(ue, 75),
+                ]))
+            };
+            ngap.handle_ng_reset(assoc, &pdu).await.expect("handled");
+
+            let state = ngap
+                .ue_auth_state
+                .get(ue)
+                .expect("the registered UE is KEPT");
+            assert!(state.is_cm_idle(), "case {n}: CM-IDLE");
+            assert_eq!(
+                state.reachability.map(|r| r.phase),
+                Some(ReachabilityPhase::MobileReachable),
+                "case {n}: the mobile reachable timer starts"
+            );
+            let calls = seen.lock().expect("seen").clone();
+            assert_eq!(
+                calls,
+                vec![format!(
+                    "POST /nsmf-pdusession/v1/sm-contexts/{sm_ref}/modify"
+                )],
+                "case {n}: one UpdateSMContext (DEACTIVATED), and no release"
+            );
+            let sent = take_sent_ngap(&mut ngap);
+            assert_eq!(
+                sent.len(),
+                1,
+                "case {n}: the NG Reset Acknowledge: {sent:?}"
+            );
+            assert_eq!(sent[0].0, assoc);
+            ngap.ue_auth_state.remove(ue);
         }
-        let seen = seen.lock().expect("seen").clone();
-        assert!(
-            released,
-            "the reset UE's SM context must be released at the SMF; saw {seen:?}"
-        );
     }
 
     /// An NF stand-in that answers 204 to everything and records `"METHOD uri"`.

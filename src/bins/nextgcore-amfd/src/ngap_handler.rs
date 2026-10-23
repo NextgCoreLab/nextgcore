@@ -6,7 +6,6 @@ use crate::context::{
     AmfContext, AmfGnb, NgapCause, NrCgi, PlmnId, SNssai, SupportedTa, Tai5gs,
     UavAuthorizationContext,
 };
-use crate::sbi_path;
 use nextgcore_ngap::types::{NgReset, ResetType, UeAssociatedLogicalNgConnectionItem};
 
 // ============================================================================
@@ -433,12 +432,14 @@ pub fn handle_ng_reset(
         reset.cause
     );
 
-    // The SMF release is collected under the read guard and sent after it is
-    // dropped. Calling anything that takes the AMF context lock while this guard is
-    // held is a recursive read: std's RwLock queues new readers behind a waiting
-    // writer, so it deadlocks the AMF as soon as any writer arrives in between.
+    // #754: no SMF call from here. This used to Nsmf_PDUSession_Release every SM
+    // context of the reset UEs, found through the `RanUe` list, which the live N2 path
+    // never populates -- so it never ran for a real UE, and had it run it would have
+    // DELETED PDU sessions the UE still has. The live handler
+    // (`NgapServer::handle_ng_reset`) moves the UEs to CM-IDLE and deactivates their
+    // user plane instead; what remains here is the `RanUe` bookkeeping and the Ack.
     let amf_ctx = crate::context::amf_self();
-    let (sm_context_refs, ack) = {
+    let ack = {
         let Ok(context) = amf_ctx.read() else {
             log::error!("AMF context lock poisoned while handling NG Reset");
             return None;
@@ -452,19 +453,14 @@ pub fn handle_ng_reset(
                     "NG Reset (NG interface): releasing {} UE context(s)",
                     affected.len()
                 );
-                let refs: Vec<String> = affected
-                    .iter()
-                    .flat_map(|ran_ue| sm_context_refs_for_ue(&context, ran_ue.amf_ue_id))
-                    .collect();
                 context.ran_ue_remove_all_for_gnb(gnb_pool_id);
-                (refs, None)
+                None
             }
             ResetType::PartOfNgInterface(connections) => {
                 log::info!(
                     "NG Reset (part of NG interface): {} connection(s) listed",
                     connections.len()
                 );
-                let mut refs = Vec::new();
                 for item in connections {
                     let ran_ue = item
                         .amf_ue_ngap_id
@@ -474,8 +470,7 @@ pub fn handle_ng_reset(
                                 context.ran_ue_find_by_ran_ue_ngap_id(gnb_pool_id, id as u64)
                             })
                         });
-                    if let Some(ran_ue) = ran_ue {
-                        refs.extend(sm_context_refs_for_ue(&context, ran_ue.amf_ue_id));
+                    if let Some(ran_ue) = ran_ue.filter(|r| r.gnb_id == gnb_pool_id) {
                         context.ran_ue_remove(ran_ue.id);
                     } else {
                         log::warn!(
@@ -486,12 +481,10 @@ pub fn handle_ng_reset(
                     }
                 }
                 // Echo the received list in the acknowledge (Section 8.7.4.2.2)
-                (refs, Some(connections.clone()))
+                Some(connections.clone())
             }
         }
     };
-
-    release_smf_sm_contexts(sm_context_refs);
     ack
 }
 
@@ -584,51 +577,6 @@ pub fn parse_cause(group: u8, value: i64) -> NgapCause {
         group,
         cause: value,
     }
-}
-
-/// The SMF SM context refs of the AMF UE's sessions that have a live SMF context.
-///
-/// Reads through the caller's guard: it must not take the AMF context lock itself
-/// (see `handle_ng_reset`).
-fn sm_context_refs_for_ue(ctx: &crate::context::AmfContext, amf_ue_id: u64) -> Vec<String> {
-    ctx.sess_list_for_ue(amf_ue_id)
-        .into_iter()
-        .filter_map(|sess| sess.sm_context_ref)
-        .collect()
-}
-
-/// Fire-and-forget: release the given SMF SM contexts (Nsmf_PDUSession_Release).
-///
-/// Called after a UE context release to clean up its Nsmf_PDUSession contexts.
-/// Called with no AMF context guard held.
-///
-/// The SMF is resolved inside the spawned task, with the async resolver. The sync
-/// `resolve_smf_endpoint` blocks on the runtime with `Handle::block_on`, which
-/// panics when called from async code, and the live caller of `handle_ng_reset`
-/// is the NGAP task (#637).
-fn release_smf_sm_contexts(sm_context_refs: Vec<String>) {
-    if sm_context_refs.is_empty() {
-        return;
-    }
-    tokio::spawn(async move {
-        let (smf_host, smf_port) =
-            match sbi_path::resolve_nf_endpoint_async(sbi_path::SbiServiceType::NsmfPdusession)
-                .await
-            {
-                Ok(ep) => ep,
-                Err(e) => {
-                    log::debug!("SMF endpoint not resolved, skipping session cleanup: {e}");
-                    return;
-                }
-            };
-        for sm_context_ref in sm_context_refs {
-            if let Err(e) =
-                sbi_path::call_smf_release_sm_context(&smf_host, smf_port, &sm_context_ref).await
-            {
-                log::warn!("SMF SM Context Release failed for ref={sm_context_ref}: {e}");
-            }
-        }
-    });
 }
 
 // ============================================================================
