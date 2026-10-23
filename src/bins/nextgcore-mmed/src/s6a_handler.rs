@@ -286,40 +286,60 @@ pub fn mme_s6a_process_inbound(inbound: &crate::fd_path::InboundS6aRequest) -> S
 
     match &inbound.message {
         S6aMessage::Clr(clr) => {
-            let (action, enb_ue_id) = {
+            let action = {
                 let mut pool = ctx.mme_ue_pool.write().unwrap();
                 let mme_ue = pool.get_mut(&ue_id).ok_or(S6aError::UeNotFound)?;
-                (mme_s6a_handle_clr(mme_ue, clr)?, mme_ue.enb_ue_id)
+                mme_s6a_handle_clr(mme_ue, clr)?
             };
             match action {
                 ClrAction::DetachUe { reattach_required } => {
+                    // TS 29.272 §7.3.152 / TS 23.401 §5.3.8.4 (#733): the detach
+                    // type follows the CLR-Flags Reattach-Required bit, and the
+                    // detach is the supervised one (T3422, TS 24.301 §5.5.2.3).
+                    let detach_type = if reattach_required {
+                        crate::emm_build::DetachTypeToUe::ReAttachRequired
+                    } else {
+                        crate::emm_build::DetachTypeToUe::ReAttachNotRequired
+                    };
+                    // A retransmitted CLR while the detach it started is
+                    // running changes nothing: it would resend DETACH
+                    // REQUEST and reset T3422's count (#828).
+                    let detaching = ctx.mme_ue_find_by_id(ue_id).is_some_and(|ue| {
+                        ue.nas_eps.type_ == crate::context::MmeEpsType::DetachRequestToUe
+                    });
+                    if detaching {
+                        log::info!(
+                            "[{}] Cancel Location while its detach is already running; ignored",
+                            inbound.imsi_bcd
+                        );
+                        return Ok(());
+                    }
+                    // §5.3.8.4 step 3: the PDN connections still exist at the
+                    // gateways, so each is deleted there before the local
+                    // contexts go.
+                    if let Err(e) = crate::gtp_path::send_delete_all_sessions(
+                        ctx,
+                        None,
+                        ue_id,
+                        crate::s11_build::GtpDeleteAction::NoAction,
+                    ) {
+                        log::warn!(
+                            "[{}] HSS-initiated detach: Delete Session Requests not all sent: {e}",
+                            inbound.imsi_bcd
+                        );
+                    }
+                    let outcome = crate::network_detach::mme_initiated_detach(
+                        ctx,
+                        ue_id,
+                        detach_type,
+                        "a Cancel Location (subscription withdrawal) from the HSS",
+                    );
                     log::info!(
-                        "[{}] Network-initiated detach (reattach_required={})",
+                        "[{}] HSS-initiated detach ({detach_type:?}, Reattach-Required={}): \
+                         {outcome:?}",
                         inbound.imsi_bcd,
                         reattach_required
                     );
-                    let enb_ue = ctx.enb_ue_find_by_id(enb_ue_id);
-                    if let Some(enb_ue) = enb_ue {
-                        let mut pool = ctx.mme_ue_pool.write().unwrap();
-                        if let Some(mme_ue) = pool.get_mut(&ue_id) {
-                            crate::nas_path::nas_eps_send_detach_request(
-                                mme_ue,
-                                &enb_ue,
-                                crate::emm_build::DetachTypeToUe::ReAttachRequired,
-                            )
-                            .map_err(|e| {
-                                log::error!(
-                                    "[{}] Detach Request send failed: {e:?}",
-                                    inbound.imsi_bcd
-                                );
-                                S6aError::NetworkFailure
-                            })?;
-                        }
-                    } else {
-                        // UE not connected: implicit detach, remove context
-                        log::info!("[{}] UE not connected; implicit detach", inbound.imsi_bcd);
-                        ctx.mme_ue_remove(ue_id);
-                    }
                 }
                 ClrAction::RemoveContext => {
                     ctx.mme_ue_remove(ue_id);
@@ -843,6 +863,170 @@ mod tests {
             detach.get(7).copied(),
             Some(crate::emm_build::NasEpsMessageType::DetachRequest as u8)
         );
+    }
+
+    /// #733, TS 29.272 §7.3.152 / TS 23.401 §5.3.8.4: the detach type of the
+    /// DETACH REQUEST follows the CLR-Flags Reattach-Required bit, and the
+    /// detach is the supervised one: T3422 armed, the UE in the network-detach
+    /// state, so DETACH ACCEPT completes it. Before #733 the type was always
+    /// "re-attach required" and T3422 never ran.
+    #[test]
+    fn a_cancel_location_detach_follows_reattach_required_and_arms_t3422() {
+        for (imsi, enb_ue_s1ap_id, flags, expected) in [
+            (
+                "999990000000733",
+                733,
+                0,
+                crate::emm_build::DetachTypeToUe::ReAttachNotRequired,
+            ),
+            (
+                "999990000000734",
+                734,
+                nextgcore_diameter::s6a::clr_flags::REATTACH_REQUIRED,
+                crate::emm_build::DetachTypeToUe::ReAttachRequired,
+            ),
+        ] {
+            let mme_ue_id = seed_connected_ue(imsi, enb_ue_s1ap_id);
+            let ctx = crate::context::mme_self();
+            let inbound = crate::fd_path::InboundS6aRequest {
+                imsi_bcd: imsi.to_string(),
+                message: crate::fd_path::S6aMessage::Clr(ClrMessage {
+                    cancellation_type: cancellation_type::SUBSCRIPTION_WITHDRAWAL,
+                    clr_flags: flags,
+                }),
+            };
+            mme_s6a_process_inbound(&inbound).expect("a known UE must be applied");
+
+            let ue = ctx
+                .mme_ue_find_by_id(mme_ue_id)
+                .expect("waits for DETACH ACCEPT");
+            assert!(ue.t3422.is_running(), "T3422 supervises the detach");
+            assert_eq!(
+                ue.nas_eps.type_,
+                crate::context::MmeEpsType::DetachRequestToUe
+            );
+            assert_eq!(ue.network_detach_type, Some(expected));
+            let detach = ue
+                .t3422
+                .pkbuf
+                .as_ref()
+                .expect("the DETACH REQUEST is stored");
+            assert_eq!(
+                detach.get(7).copied(),
+                Some(crate::emm_build::NasEpsMessageType::DetachRequest as u8)
+            );
+            assert_eq!(
+                detach.get(8).map(|o| o & 0x07),
+                Some(expected as u8),
+                "detach type on the wire (TS 24.301 §9.9.3.7)"
+            );
+            // DETACH ACCEPT now completes it and the context goes.
+            assert!(crate::network_detach::complete_mme_initiated_detach(
+                ctx, mme_ue_id
+            ));
+            assert!(ctx.mme_ue_find_by_id(mme_ue_id).is_none());
+        }
+    }
+
+    /// #828 (review MINOR 1, 2), TS 23.401 §5.3.8.4 step 3: the HSS-initiated
+    /// detach deletes every PDN connection at the Serving GW BEFORE the local
+    /// contexts go, and one PDN that cannot be deleted (no default bearer) does
+    /// not stop the others' Delete Session Requests. A retransmitted CLR while
+    /// the detach runs sends nothing more.
+    #[test]
+    fn a_cancel_location_deletes_every_pdn_at_the_sgw_first() {
+        use nextgcore_gtp::v2::{Gtp2IeType, Gtp2Message};
+        let _guard = crate::gtp_path::lock_s11();
+        let sgw = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sgw.set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .unwrap();
+        let server = crate::gtp_path::GtpcServer::open(
+            "127.0.0.1:0",
+            nextgcore_gtp::v2::xact::Gtp2XactConfig::default(),
+            7,
+        )
+        .unwrap();
+        let _route = crate::gtp_path::route_s11_for_test(server, sgw.local_addr().unwrap());
+
+        const IMSI: &str = "999990000000828";
+        let mme_ue_id = seed_connected_ue(IMSI, 828);
+        let ctx = crate::context::mme_self();
+        let sgw_ue_id = ctx.sgw_ue_add(mme_ue_id);
+        ctx.sgw_ue_pool
+            .write()
+            .unwrap()
+            .get_mut(&sgw_ue_id)
+            .unwrap()
+            .sgw_s11_teid = 0x0828_0001;
+        // Three PDN connections: default bearers 5 and 7, and one with none.
+        let mut sessions = Vec::new();
+        for ebis in [&[5u8, 6][..], &[7u8][..], &[][..]] {
+            let sess_id = ctx.sess_add(mme_ue_id, 1);
+            for ebi in ebis {
+                let bearer_id = ctx.bearer_add(sess_id, mme_ue_id);
+                ctx.bearer_pool
+                    .write()
+                    .unwrap()
+                    .get_mut(&bearer_id)
+                    .unwrap()
+                    .ebi = *ebi;
+                ctx.sess_pool
+                    .write()
+                    .unwrap()
+                    .get_mut(&sess_id)
+                    .unwrap()
+                    .bearer_list
+                    .push(bearer_id);
+            }
+            sessions.push(sess_id);
+        }
+        {
+            let mut pool = ctx.mme_ue_pool.write().unwrap();
+            let ue = pool.get_mut(&mme_ue_id).unwrap();
+            ue.sgw_ue_id = sgw_ue_id;
+            // The empty one first: its failure must not stop the others.
+            ue.sess_list = vec![sessions[2], sessions[0], sessions[1]];
+        }
+
+        mme_s6a_process_inbound(&clr(IMSI, cancellation_type::SUBSCRIPTION_WITHDRAWAL))
+            .expect("applied");
+
+        let mut lbis = Vec::new();
+        let mut buf = [0u8; 4096];
+        while let Ok((len, _)) = sgw.recv_from(&mut buf) {
+            let msg = Gtp2Message::decode(&mut bytes::Bytes::copy_from_slice(&buf[..len])).unwrap();
+            if msg.header.message_type == 36 {
+                assert_eq!(msg.header.teid, Some(0x0828_0001));
+                lbis.push(msg.get_ie(Gtp2IeType::Ebi as u8, 0).unwrap().value[0]);
+            }
+        }
+        lbis.sort();
+        assert_eq!(
+            lbis,
+            vec![5, 7],
+            "a Delete Session Request per deletable PDN"
+        );
+        let ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert!(ue.sess_list.is_empty(), "then deleted locally");
+        assert_eq!(
+            ctx.sgw_ue_find_by_id(sgw_ue_id).unwrap().sgw_s11_teid,
+            0,
+            "the Serving GW's TEID is not reused by the next attach (#828)"
+        );
+        let retries = ue.t3422.retry_count;
+        let stored = ue.t3422.pkbuf.clone();
+
+        // The HSS retransmits the CLR: nothing more is sent or reset.
+        mme_s6a_process_inbound(&clr(IMSI, cancellation_type::SUBSCRIPTION_WITHDRAWAL))
+            .expect("applied");
+        assert!(
+            sgw.recv_from(&mut buf).is_err(),
+            "no second Delete Session Request"
+        );
+        let ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert_eq!(ue.t3422.retry_count, retries);
+        assert_eq!(ue.t3422.pkbuf, stored);
+        crate::network_detach::complete_mme_initiated_detach(ctx, mme_ue_id);
     }
 
     #[test]

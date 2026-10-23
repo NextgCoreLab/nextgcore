@@ -227,6 +227,13 @@ impl MmeApp {
                 .clone()
                 .filter(|addr| addr != "0.0.0.0" && addr != "::"),
             applications,
+            // Watchdog interval Tw (RFC 3539 §3.4.1, #729): MME_DIAMETER_TW_SECS,
+            // default 30, floored at 6. Keep it below 3 x the HSS's Tc, which
+            // is where hssd drops a connection it has heard nothing on.
+            timer_tw: std::env::var("MME_DIAMETER_TW_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30),
             ..Default::default()
         };
 
