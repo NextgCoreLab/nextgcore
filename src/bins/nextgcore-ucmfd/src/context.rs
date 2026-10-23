@@ -1413,21 +1413,10 @@ fn parse_racs_configuration(config: &Value) -> Option<(Vec<String>, Capabilities
 /// a char boundary panics (#725). Any byte outside `[0-9A-Fa-f]`, which
 /// includes every byte of a multi-byte UTF-8 character, is refused.
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    let b = s.as_bytes();
-    if b.is_empty() || !b.len().is_multiple_of(2) {
+    if s.is_empty() {
         return None;
     }
-    let nibble = |c: u8| -> Option<u8> {
-        match c {
-            b'0'..=b'9' => Some(c - b'0'),
-            b'a'..=b'f' => Some(c - b'a' + 10),
-            b'A'..=b'F' => Some(c - b'A' + 10),
-            _ => None,
-        }
-    };
-    b.chunks_exact(2)
-        .map(|p| Some((nibble(p[0])? << 4) | nibble(p[1])?))
-        .collect()
+    nextgcore_core::conv::hex_decode(s)
 }
 
 /// RFC 7396 JSON merge patch.
