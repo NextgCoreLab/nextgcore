@@ -3908,6 +3908,79 @@ pub async fn call_smf_cancel_sm_context_handover(
     .await
 }
 
+/// One step of an intra-5GS N2 handover at the SMF (TS 29.502 §5.2.2.3.4,
+/// TS 23.502 §4.9.1.3), answered with the SMF's N2 SM information when it has any
+/// (#964):
+/// - `PREPARING` with the source's Handover Required Transfer (`HANDOVER_REQUIRED`) and
+///   the target's `targetId`: answered with `PDU_RES_SETUP_REQ`, the target's Handover
+///   Request Transfer (§5.2.2.3.4.2);
+/// - `PREPARED` with the target's Handover Request Acknowledge Transfer
+///   (`HANDOVER_REQ_ACK`): answered with `HANDOVER_CMD`, the source's Handover Command
+///   Transfer;
+/// - `PREPARED` with a Handover Resource Allocation Unsuccessful Transfer
+///   (`HANDOVER_RES_ALLOC_FAIL`) for a session the target refused;
+/// - `COMPLETED` (§5.2.2.3.4.3) and `CANCELLED` with a cause (§5.2.2.3.4.4), bare.
+///
+/// `Ok(None)` is a success with no N2 SM information in the answer.
+pub async fn call_smf_n2_handover(
+    smf_host: &str,
+    smf_port: u16,
+    sm_context_ref: &str,
+    ho_state: &str,
+    n2: Option<(&str, &[u8])>,
+    target_id: Option<&serde_json::Value>,
+    cause: Option<&str>,
+) -> Result<Option<(String, Vec<u8>)>, String> {
+    let client = crate::attach_oauth2(
+        SbiClient::for_peer(smf_host, smf_port),
+        nextgcore_sbi::types::NfType::Smf,
+    );
+    let mut body = serde_json::json!({ "hoState": ho_state });
+    if let Some(target_id) = target_id {
+        body["targetId"] = target_id.clone();
+    }
+    if let Some(cause) = cause {
+        body["cause"] = serde_json::json!(cause);
+    }
+    let path = format!("/nsmf-pdusession/v1/sm-contexts/{sm_context_ref}/modify");
+    let mut request = SbiRequest::post(&path);
+    if let Some((info_type, transfer)) = n2 {
+        body["n2SmInfo"] = serde_json::json!({ "contentId": "n2SmInfo" });
+        body["n2SmInfoType"] = serde_json::json!(info_type);
+        request = request
+            .with_body(body.to_string(), content_type::APPLICATION_JSON)
+            .with_part(SbiPart::with_content(
+                "n2SmInfo",
+                content_type::APPLICATION_NGAP,
+                bytes::Bytes::copy_from_slice(transfer),
+            ));
+    } else {
+        request = request.with_body(body.to_string(), content_type::APPLICATION_JSON);
+    }
+    let response = client
+        .send_request(request)
+        .await
+        .map_err(|e| format!("UpdateSMContext ({ho_state}) failed: {e}"))?;
+    if !response.is_success() {
+        return Err(format!(
+            "UpdateSMContext ({ho_state}) answered {}",
+            response.status
+        ));
+    }
+    let root: serde_json::Value = response
+        .http
+        .content
+        .as_deref()
+        .and_then(|c| serde_json::from_str(c).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let n2_type = root["n2SmInfoType"].as_str().map(str::to_owned);
+    let n2 = extract_binary_ref(&response, &root, "n2SmInfo").filter(|b| !b.is_empty());
+    Ok(match (n2_type, n2) {
+        (Some(t), Some(b)) => Some((t, b)),
+        _ => None,
+    })
+}
+
 async fn update_sm_context_ho_state(
     smf_host: &str,
     smf_port: u16,
