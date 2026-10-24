@@ -698,6 +698,8 @@ async fn convert_request(
     // Read body under a size cap. multipart/related bodies (N1/N2 binary
     // containers, TS 29.500 §6.1.2.3) are decoded into the JSON root + binary
     // parts before any UTF-8 conversion so binary content survives byte-exact.
+    // #940: the path may carry a callback token; the log lines below show it redacted.
+    let logged_uri = crate::log_redact::redact_callback_tokens(&uri);
     let limited = Limited::new(req.into_body(), max_body_size);
     match limited.collect().await {
         Ok(body) => {
@@ -718,7 +720,7 @@ async fn convert_request(
                         Err(e) => {
                             log::warn!(
                                 "cid={correlation_id} Failed to decode multipart request body \
-                                 on {uri}: {e}"
+                                 on {logged_uri}: {e}"
                             );
                             http.set_content(String::from_utf8_lossy(&bytes).to_string());
                         }
@@ -734,13 +736,13 @@ async fn convert_request(
                 .is_some()
             {
                 log::warn!(
-                    "cid={correlation_id} method={method} path={uri} \
+                    "cid={correlation_id} method={method} path={logged_uri} \
                      reason=PAYLOAD_TOO_LARGE: body exceeds {max_body_size}-byte limit"
                 );
                 return Err(ConvertRequestError::BodyTooLarge);
             }
             log::warn!(
-                "cid={correlation_id} method={method} path={uri} \
+                "cid={correlation_id} method={method} path={logged_uri} \
                  reason=BODY_READ_ERROR: {e}"
             );
         }

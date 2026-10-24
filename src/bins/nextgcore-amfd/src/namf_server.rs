@@ -45,7 +45,10 @@ const NOTIFY_REQUEST_TIMEOUT_SECS: u64 = 3;
 pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.clone();
     let uri = request.header.uri.clone();
-    log::debug!("AMF SBI request: {method} {uri}");
+    log::debug!(
+        "AMF SBI request: {method} {}",
+        nextgcore_sbi::log_redact::redact_callback_tokens(&uri)
+    );
 
     let path = uri.split('?').next().unwrap_or(&uri);
     let parts: Vec<&str> = path
