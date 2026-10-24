@@ -529,9 +529,13 @@ pub enum NsacAdmission {
     /// PDU session rejected (HTTP 403, or 200 with this SUPI in acuFailureList)
     /// — reject with 5GSM cause #67.
     Rejected,
-    /// NSACF could not be reached / returned an unexpected status. The caller
-    /// decides the fail-open vs fail-closed policy.
+    /// NSACF returned an unexpected status, or the request provably never left
+    /// (no connection). The caller decides the fail-open vs fail-closed policy.
     Unavailable,
+    /// No answer came (#1072 review m2): the NSACF may still have applied the
+    /// INCREASE. Fail-open as [`NsacAdmission::Unavailable`], and reconciled with a
+    /// precautionary DECREASE.
+    NoAnswer,
 }
 
 /// Query the NSACF whether a new PDU session may be established on `s_nssai`
@@ -574,7 +578,16 @@ pub async fn nsac_pdu_session_admit(
         Err(e) => {
             log::warn!("NSACF PDU-session admission query failed: {e}");
             client.close().await;
-            return NsacAdmission::Unavailable;
+            // #1072 review m2: a request that provably never left (the connect
+            // or the TLS handshake failed, #664) changed no count. Anything
+            // later may have reached the NSACF and been applied.
+            return match e {
+                nextgcore_sbi::SbiError::ConnectionError(_)
+                | nextgcore_sbi::SbiError::TlsError(_)
+                | nextgcore_sbi::SbiError::InvalidUri(_)
+                | nextgcore_sbi::SbiError::SerializationError(_) => NsacAdmission::Unavailable,
+                _ => NsacAdmission::NoAnswer,
+            };
         }
     };
     client.close().await;
@@ -619,8 +632,18 @@ pub async fn nsac_pdu_session_admit(
     }
 }
 
-/// Release a NSACF PDU-session count (DECREASE) for rollback when a later
-/// establishment step fails after the slot was admitted. Best-effort.
+/// NSACF DECREASEs that failed (#1072 review M3): a transport error, or an answer
+/// that is not 2xx. Each one leaves a PDU session counted at the NSACF.
+/// Exported as `smf_nsac_decrease_failures_total`.
+pub static NSAC_DECREASE_FAILURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Count a PDU session out at the NSACF: Nnsacf_NSAC_NumOfPDUsUpdate with DECREASE
+/// (TS 29.536 §5.2.2.2, TS 23.502 §4.2.11.4), at a release or a create rollback.
+/// Best-effort; returns whether the NSACF accepted it. A failure is logged and
+/// counted (#1072 review M3), unless `precautionary` (a DECREASE for an INCREASE
+/// whose answer never came, #1072 review m2, which the NSACF treats as a no-op
+/// when it never applied the INCREASE).
 pub async fn nsac_pdu_session_release(
     nsacf: &NsacfEndpoint,
     nf_id: &str,
@@ -628,7 +651,31 @@ pub async fn nsac_pdu_session_release(
     psi: u8,
     sst: u8,
     sd: Option<&str>,
-) {
+) -> bool {
+    nsac_decrease(nsacf, nf_id, supi, psi, sst, sd, false).await
+}
+
+/// [`nsac_pdu_session_release`] with failures logged at debug and not counted.
+pub async fn nsac_pdu_session_release_precautionary(
+    nsacf: &NsacfEndpoint,
+    nf_id: &str,
+    supi: &str,
+    psi: u8,
+    sst: u8,
+    sd: Option<&str>,
+) -> bool {
+    nsac_decrease(nsacf, nf_id, supi, psi, sst, sd, true).await
+}
+
+async fn nsac_decrease(
+    nsacf: &NsacfEndpoint,
+    nf_id: &str,
+    supi: &str,
+    psi: u8,
+    sst: u8,
+    sd: Option<&str>,
+    precautionary: bool,
+) -> bool {
     let mut snssai = serde_json::json!({ "sst": sst });
     if let Some(sd) = sd {
         snssai["sd"] = serde_json::json!(sd);
@@ -645,10 +692,30 @@ pub async fn nsac_pdu_session_release(
         }],
     });
     let client = nsacf.client();
-    if let Err(e) = client.post_json("/nnsacf-nsac/v1/slices/pdus", &body).await {
-        log::warn!("NSACF PDU-session release (rollback) failed: {e}");
-    }
+    let result = client.post_json("/nnsacf-nsac/v1/slices/pdus", &body).await;
     client.close().await;
+    let failure = match result {
+        Ok(resp) if (200..300).contains(&resp.status) => return true,
+        Ok(resp) => format!(
+            "HTTP {} {}",
+            resp.status,
+            resp.http.content.clone().unwrap_or_default()
+        ),
+        Err(e) => e.to_string(),
+    };
+    if precautionary {
+        log::debug!(
+            "[{supi}] precautionary NSACF DECREASE for PSI {psi} S-NSSAI[SST:{sst} SD:{sd:?}] \
+             failed: {failure}"
+        );
+    } else {
+        NSAC_DECREASE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        log::warn!(
+            "[{supi}] NSACF DECREASE for PSI {psi} S-NSSAI[SST:{sst} SD:{sd:?}] failed: \
+             {failure}; the session stays counted at the NSACF"
+        );
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
