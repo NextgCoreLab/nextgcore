@@ -1077,6 +1077,8 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                                 u.time_quota_secs,
                             );
                             // #820: how TIME is measured (§5.2.2.2).
+                            // #818: a URR measuring time reports a Duration Measurement.
+                            urr.set_measure_duration(u.measure_duration);
                             urr.set_time_metering(
                                 u.inactivity_detection_secs,
                                 u.immediate_start_time_metering,
@@ -1238,6 +1240,8 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                             u.time_quota_secs,
                         );
                         // #820: how TIME is measured (§5.2.2.2).
+                        // #818: a URR measuring time reports a Duration Measurement.
+                        urr.set_measure_duration(u.measure_duration);
                         urr.set_time_metering(
                             u.inactivity_detection_secs,
                             u.immediate_start_time_metering,
@@ -1274,6 +1278,10 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                                 // forwarding. That is what makes a quota a quota rather
                                 // than a teardown, and it is the reason the latch lives
                                 // where a re-provision can reach it.
+                                // #953 review: a Measurement Method in the Update URR changes DURAT.
+                                if u.measurement_method_present {
+                                    urr.set_measure_duration(u.measure_duration);
+                                }
                                 urr.update_time_metering(
                                     u.inactivity_detection_secs,
                                     u.immediate_start_time_metering,
@@ -1521,6 +1529,74 @@ mod tests {
             Some(IpAddr::V4(v4)),
             "Update FAR, dual OHC: IPv4 wins"
         );
+    }
+
+    /// #953 review (minor): an Update URR that CARRIES a Measurement Method changes
+    /// whether the URR measures time (DURAT, TS 29.244 Table 7.5.4.4-1); one that does
+    /// not leaves it as it was. An absent IE parses as `measure_duration == false`, so
+    /// applying it unconditionally would switch Duration reporting off.
+    #[tokio::test]
+    async fn an_update_urr_changes_durat_only_when_it_carries_a_measurement_method() {
+        let dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        let seid = 0x818;
+        let urr = |present: bool, durat: bool| crate::n4_build::ParsedCreateUrr {
+            urr_id: 1,
+            measurement_method_present: present,
+            measure_duration: durat,
+            measure_volume: true,
+            ..Default::default()
+        };
+        handle_pfcp_session_event(
+            &dp,
+            PfcpSessionEvent::SessionEstablished {
+                upf_seid: seid,
+                smf_seid: 0x1818,
+                ue_ipv4: Some(Ipv4Addr::new(10, 45, 8, 18)),
+                ul_teid: 0x100,
+                dl_teid: 0x200,
+                gnb_addr: None,
+                pdrs: Vec::new(),
+                fars: Vec::new(),
+                qers: Vec::new(),
+                urrs: vec![urr(true, true)],
+                bars: Vec::new(),
+            },
+        )
+        .await;
+        let session = dp.sessions.find_by_seid(seid).expect("installed");
+        let durat = || session.urrs.read().unwrap()[&1].measures_duration();
+        assert!(durat(), "created with DURAT");
+
+        let modify = |u| PfcpSessionEvent::SessionModified {
+            upf_seid: seid,
+            dl_teid: None,
+            gnb_addr: None,
+            removed_pdr_ids: Vec::new(),
+            removed_far_ids: Vec::new(),
+            removed_qer_ids: Vec::new(),
+            removed_urr_ids: Vec::new(),
+            created_pdrs: Vec::new(),
+            created_fars: Vec::new(),
+            created_qers: Vec::new(),
+            created_urrs: Vec::new(),
+            updated_pdrs: Vec::new(),
+            updated_fars: Vec::new(),
+            updated_qers: Vec::new(),
+            updated_urrs: vec![u],
+            updated_bars: Vec::new(),
+            send_end_marker: false,
+            drop_buffered: false,
+            old_dl_tunnel: None,
+        };
+        handle_pfcp_session_event(&dp, modify(urr(false, false))).await;
+        assert!(
+            durat(),
+            "no Measurement Method in the Update URR: DURAT unchanged"
+        );
+        handle_pfcp_session_event(&dp, modify(urr(true, false))).await;
+        assert!(!durat(), "a volume-only Measurement Method turns DURAT off");
+        handle_pfcp_session_event(&dp, modify(urr(true, true))).await;
+        assert!(durat(), "and DURAT back on");
     }
 
     #[test]
