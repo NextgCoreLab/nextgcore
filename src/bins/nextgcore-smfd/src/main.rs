@@ -3795,6 +3795,12 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
             decision
         }
         Some(pcf) => {
+            let origination = policy::origination_timestamp_for_create(
+                request
+                    .http
+                    .get_header(policy::ORIGINATION_TIMESTAMP_HEADER)
+                    .map(String::as_str),
+            );
             let create_ctx = policy::SmPolicyCreateContext {
                 supi: &supi,
                 psi: pdu_session_id,
@@ -3809,6 +3815,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                 // create that omits it leaves the PCF with nothing to bound its
                 // authorisation by -- which is what this leg did before #310.
                 subs_sess_ambr: subscribed.as_ref(),
+                origination_timestamp: Some(&origination),
             };
             match policy::sm_policy_create(&pcf, &create_ctx).await {
                 Ok(decision) => {
@@ -12041,6 +12048,77 @@ mod tests {
     /// association is deliberately down, not because no UPF exists. The
     /// REGISTRATION half its old comment asked for is
     /// `a_successful_create_registers_an_activated_session_and_its_binding` below.
+    /// #980 review, end to end: the CreateSMContext handler sends the AMF's
+    /// `3gpp-Sbi-Origination-Timestamp` on the SM policy create unchanged
+    /// (TS 29.512 §4.2.2.2). The PCF's collision rule (§4.2.7) then sees the
+    /// same value on a retried create, and reuses the association.
+    ///
+    /// Revert-verified: with the handler passing no timestamp, this test fails.
+    #[tokio::test]
+    async fn the_sm_policy_create_forwards_the_amfs_origination_timestamp() {
+        use nextgcore_sbi::message::SbiResponse;
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _upf = pfcp_path::stand_in::unassociated_upf().await;
+        smf_context_init(64, 256, 512);
+
+        let stamps: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>> = Default::default();
+        let sink = stamps.clone();
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
+        let pcf = SbiServer::on_listener(
+            SbiServerConfig::new(std::net::SocketAddr::from(([127, 0, 0, 1], port))),
+            port_listener,
+        );
+        pcf.start(move |req: SbiRequest| {
+            let sink = sink.clone();
+            async move {
+                if req.header.uri.ends_with("/sm-policies") {
+                    sink.lock().unwrap_or_else(|e| e.into_inner()).push(
+                        req.http
+                            .get_header(policy::ORIGINATION_TIMESTAMP_HEADER)
+                            .cloned(),
+                    );
+                    return SbiResponse::with_status(201)
+                        .with_header("Location", "/npcf-smpolicycontrol/v1/sm-policies/pol-980")
+                        .with_body(
+                            serde_json::json!({
+                                "sessRules": {}, "pccRules": {}, "qosDecs": {},
+                                "chgDecs": {}, "traffContDecs": {},
+                            })
+                            .to_string(),
+                            "application/json",
+                        );
+                }
+                SbiResponse::with_status(204)
+            }
+        })
+        .await
+        .expect("stub PCF starts");
+        std::env::set_var("PCF_URI", format!("http://127.0.0.1:{port}"));
+
+        let amf_stamp = "Fri, 23 Oct 2026 10:00:00.980 GMT";
+        let psi = 12u8;
+        let n1_msg = n1(
+            psi,
+            1,
+            gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+            &[0x91, 0x00],
+        );
+        let request = create_request("imsi-001010000000980", psi, &n1_msg)
+            .with_header(policy::ORIGINATION_TIMESTAMP_HEADER, amf_stamp);
+        let _ = handle_sm_context_create(&request).await;
+        std::env::remove_var("PCF_URI");
+        pcf.stop().await.ok();
+
+        assert_eq!(
+            *stamps.lock().unwrap(),
+            vec![Some(amf_stamp.to_string())],
+            "the SM policy create carries the AMF's origination timestamp"
+        );
+    }
+
     #[tokio::test]
     async fn a_failed_create_leaves_no_registered_sm_context() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;

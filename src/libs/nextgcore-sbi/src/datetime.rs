@@ -251,6 +251,38 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+/// Format milliseconds since the epoch as a `3gpp-Sbi-Origination-Timestamp`
+/// header value (TS 29.502 §6.1.2.3.2), e.g. `Sun, 06 Nov 1994 08:49:37.123 GMT`;
+/// the inverse of [`origination_timestamp_to_epoch_ms`].
+pub fn epoch_ms_to_origination_timestamp(ms: i64) -> String {
+    const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let secs = ms.div_euclid(1000);
+    let millis = ms.rem_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    format!(
+        "{}, {d:02} {} {y:04} {:02}:{:02}:{:02}.{millis:03} GMT",
+        DAYS[days.rem_euclid(7) as usize],
+        MONTHS[(m - 1) as usize],
+        tod / 3600,
+        tod % 3600 / 60,
+        tod % 60
+    )
+}
+
+/// The current time as a `3gpp-Sbi-Origination-Timestamp` header value.
+pub fn now_origination_timestamp() -> String {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0);
+    epoch_ms_to_origination_timestamp(ms)
+}
+
 /// Parse a `3gpp-Sbi-Origination-Timestamp` header value into milliseconds
 /// since the Unix epoch.
 ///
@@ -322,6 +354,21 @@ pub fn now_epoch_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// The formatter is the parser's inverse, across a leap day, the epoch and
+    /// a millisecond boundary.
+    #[test]
+    fn origination_timestamp_round_trips() {
+        assert_eq!(
+            epoch_ms_to_origination_timestamp(784_111_777_123),
+            "Sun, 06 Nov 1994 08:49:37.123 GMT"
+        );
+        for ms in [0, 1, 999, 1_000, 1_709_251_199_999, 1_792_771_200_000] {
+            let text = epoch_ms_to_origination_timestamp(ms);
+            assert_eq!(origination_timestamp_to_epoch_ms(&text), Some(ms), "{text}");
+        }
+        assert!(origination_timestamp_to_epoch_ms(&now_origination_timestamp()).is_some());
+    }
 
     /// TS 29.502 §6.1.2.3.2: the ABNF's example shape, OWS, and every refusal.
     #[test]

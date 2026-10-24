@@ -464,6 +464,18 @@ pub struct SessCreated {
     pub reused: bool,
 }
 
+/// The parts of an `SmPolicyContextData` that [`PcfContext::sess_create_for_supi`]
+/// decides a collision on (TS 29.512 §4.2.7).
+#[derive(Debug, Clone)]
+pub struct SessCreateRequest<'a> {
+    pub supi: &'a str,
+    pub psi: u8,
+    pub dnn: &'a str,
+    pub s_nssai: SNssai,
+    /// `3gpp-Sbi-Origination-Timestamp`, in ms since the epoch.
+    pub origination_ms: Option<i64>,
+}
+
 /// Why [`PcfContext::sess_create_for_supi`] refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessCreateError {
@@ -2296,20 +2308,37 @@ impl PcfContext {
     ///   existing association is then deleted locally (NOTE 2) and returned in
     ///   [`SessCreated::replaced`] with its AF app sessions, for the caller to
     ///   deregister and terminate;
-    /// - a less recent one is refused ([`LateOverlappingRequest`], 403
-    ///   LATE_OVERLAPPING_REQUEST);
-    /// - an EQUAL timestamp is neither: it is the same request again (an SMF
-    ///   retransmission after a lost answer), so the existing association is
-    ///   returned unchanged rather than replaced or refused.
+    /// - a less recent one is refused ([`SessCreateError::LateOverlapping`],
+    ///   403 LATE_OVERLAPPING_REQUEST);
+    /// - an EQUAL timestamp, with the same DNN and S-NSSAI, is the same request
+    ///   again: the existing association is returned unchanged.
+    ///
+    /// The equal case is an implementation choice (#980 review): §4.2.7 defines
+    /// only "more recent" (accept) and "less recent" (reject). The origination
+    /// timestamp is set once by the originating entity and is unchanged on a
+    /// retransmission (TS 29.502 §6.1.2.3.2), so an equal stamp is the same
+    /// request re-sent after a lost answer, e.g. the SMF's SBI client retrying a
+    /// timeout. Replacing it would hand the SMF a second association and
+    /// terminate the first one's AF sessions; refusing it would fail the PDU
+    /// session. An equal stamp with a DIFFERENT DNN or S-NSSAI is not a
+    /// retransmission and is treated as a new request (replace).
     ///
     /// The decision and the replacement happen under the session guards, so two
     /// colliding creates cannot both win, and a delete cannot run in between.
+    /// The new session's DNN and S-NSSAI are recorded under the same guards, so
+    /// a retransmission racing the first create's later update still compares
+    /// against them.
     pub fn sess_create_for_supi(
         &self,
-        supi: &str,
-        psi: u8,
-        origination_ms: Option<i64>,
+        req: &SessCreateRequest<'_>,
     ) -> Result<SessCreated, SessCreateError> {
+        let SessCreateRequest {
+            supi,
+            psi,
+            dnn,
+            ref s_nssai,
+            origination_ms,
+        } = *req;
         // The order of `sess_remove_inner`.
         let mut sess_list = write_through_poison(&self.sess_list);
         let mut sm_policy_id_hash = write_through_poison(&self.sm_policy_id_hash);
@@ -2352,7 +2381,11 @@ impl PcfContext {
                     );
                     return Err(SessCreateError::LateOverlapping);
                 }
-                (Some(new), Some(stored)) if new == stored => {
+                (Some(new), Some(stored))
+                    if new == stored
+                        && old.dnn.as_deref() == Some(dnn)
+                        && old.s_nssai == *s_nssai =>
+                {
                     return Ok(SessCreated {
                         sess: old,
                         replaced: None,
@@ -2402,8 +2435,12 @@ impl PcfContext {
             return Err(SessCreateError::Limit);
         };
         sess.origination_ms = origination_ms;
+        sess.dnn = Some(dnn.to_string());
+        sess.s_nssai = s_nssai.clone();
         if let Some(stored) = sess_list.get_mut(&sess.id) {
             stored.origination_ms = origination_ms;
+            stored.dnn = sess.dnn.clone();
+            stored.s_nssai = sess.s_nssai.clone();
         }
         drop((
             sess_list,
@@ -3562,6 +3599,17 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A create request for the collision tests: DNN `internet`, S-NSSAI 1.
+    fn req(supi: &str, psi: u8, origination_ms: Option<i64>) -> SessCreateRequest<'_> {
+        SessCreateRequest {
+            supi,
+            psi,
+            dnn: "internet",
+            s_nssai: SNssai { sst: 1, sd: None },
+            origination_ms,
+        }
+    }
+
     /// TS 29.512 §4.2.7: a create colliding with an existing association for the
     /// same SUPI and PDU session id is accepted only if more recent (or if
     /// either has no origination timestamp), replacing the old one locally with
@@ -3575,7 +3623,7 @@ mod tests {
         ctx.init(64, 64);
         let supi = "imsi-001010000000742";
         let first = ctx
-            .sess_create_for_supi(supi, 5, Some(1_000))
+            .sess_create_for_supi(&req(supi, 5, Some(1_000)))
             .expect("first");
         assert!(first.replaced.is_none() && !first.reused);
         let first = first.sess;
@@ -3583,7 +3631,8 @@ mod tests {
 
         // Older: refused, and the existing association is untouched.
         assert_eq!(
-            ctx.sess_create_for_supi(supi, 5, Some(999)).unwrap_err(),
+            ctx.sess_create_for_supi(&req(supi, 5, Some(999)))
+                .unwrap_err(),
             SessCreateError::LateOverlapping
         );
         assert_eq!(
@@ -3595,14 +3644,14 @@ mod tests {
 
         // Equal: the same request again; the same association, nothing replaced.
         let again = ctx
-            .sess_create_for_supi(supi, 5, Some(1_000))
+            .sess_create_for_supi(&req(supi, 5, Some(1_000)))
             .expect("equal");
         assert!(again.reused && again.replaced.is_none());
         assert_eq!(again.sess.id, first.id);
 
         // Newer: accepted, and the old one is gone with its app session.
         let newer = ctx
-            .sess_create_for_supi(supi, 5, Some(1_001))
+            .sess_create_for_supi(&req(supi, 5, Some(1_001)))
             .expect("newer");
         let (old, apps) = newer.replaced.expect("replaced");
         assert_eq!(old.id, first.id);
@@ -3619,18 +3668,60 @@ mod tests {
         );
 
         // Either timestamp absent: accepted as more recent, both ways round.
-        let no_new = ctx.sess_create_for_supi(supi, 5, None).expect("no new ts");
+        let no_new = ctx
+            .sess_create_for_supi(&req(supi, 5, None))
+            .expect("no new ts");
         assert_eq!(no_new.replaced.map(|(o, _)| o.id), Some(newer.sess.id));
         let no_old = ctx
-            .sess_create_for_supi(supi, 5, Some(1))
+            .sess_create_for_supi(&req(supi, 5, Some(1)))
             .expect("no stored ts");
         assert_eq!(no_old.replaced.map(|(o, _)| o.id), Some(no_new.sess.id));
         assert_eq!(ctx.sess_count(), 1);
 
         // Another PDU session id of the same UE never collides.
-        let other = ctx.sess_create_for_supi(supi, 6, Some(0)).expect("psi 6");
+        let other = ctx
+            .sess_create_for_supi(&req(supi, 6, Some(0)))
+            .expect("psi 6");
         assert!(other.replaced.is_none());
         assert_eq!(ctx.sess_count(), 2);
+    }
+
+    /// #980 review: an equal timestamp is a retransmission only when the request
+    /// is the same session: a different DNN or S-NSSAI is a new request, and
+    /// replaces the association like a more recent one.
+    #[test]
+    fn an_equal_timestamp_with_a_different_body_is_a_new_request() {
+        let mut ctx = PcfContext::new();
+        ctx.init(64, 64);
+        let supi = "imsi-001010000000745";
+        let first = ctx
+            .sess_create_for_supi(&req(supi, 5, Some(7)))
+            .expect("first")
+            .sess;
+        assert_eq!(first.dnn.as_deref(), Some("internet"), "recorded at create");
+
+        let other_dnn = SessCreateRequest {
+            dnn: "ims",
+            ..req(supi, 5, Some(7))
+        };
+        let created = ctx.sess_create_for_supi(&other_dnn).expect("other dnn");
+        assert!(!created.reused);
+        assert_eq!(created.replaced.map(|(o, _)| o.id), Some(first.id));
+
+        let other_slice = SessCreateRequest {
+            s_nssai: SNssai {
+                sst: 1,
+                sd: Some(0x010203),
+            },
+            ..other_dnn.clone()
+        };
+        let again = ctx.sess_create_for_supi(&other_slice).expect("other slice");
+        assert!(!again.reused);
+        assert_eq!(again.replaced.map(|(o, _)| o.id), Some(created.sess.id));
+
+        let same = ctx.sess_create_for_supi(&other_slice).expect("same again");
+        assert!(same.reused && same.replaced.is_none());
+        assert_eq!(same.sess.id, again.sess.id);
     }
 
     /// §4.2.7 race-safety: concurrent colliding creates with distinct
@@ -3649,7 +3740,7 @@ mod tests {
                 std::thread::spawn(move || {
                     for _ in 0..200 {
                         let ts = clock.fetch_add(1, Ordering::SeqCst);
-                        match ctx.sess_create_for_supi(supi, 5, Some(ts)) {
+                        match ctx.sess_create_for_supi(&req(supi, 5, Some(ts))) {
                             Ok(_) | Err(SessCreateError::LateOverlapping) => {}
                             Err(e) => panic!("{e:?}"),
                         }

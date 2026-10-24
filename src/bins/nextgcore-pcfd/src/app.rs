@@ -2450,7 +2450,13 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
     // Resolve the UE SM, apply the collision rule and add the session in one
     // step (#892, TS 29.512 §4.2.7).
     let created = match ctx.read() {
-        Ok(context) => context.sess_create_for_supi(supi, pdu_session_id, origination_ms),
+        Ok(context) => context.sess_create_for_supi(&crate::context::SessCreateRequest {
+            supi,
+            psi: pdu_session_id,
+            dnn,
+            s_nssai: SNssai { sst, sd },
+            origination_ms,
+        }),
         Err(_) => Err(crate::context::SessCreateError::Limit),
     };
     let sess = match created {
@@ -7107,6 +7113,120 @@ mod tests {
     /// A `ueIpv6` binds the session whose PREFIX contains it — the AF sends a full
     /// address while the session holds a prefix, so an exact-string lookup would
     /// never match.
+    /// #980 review: replacing an association does what deleting it does. The
+    /// old association's AF app session gets `POST {notifUri}/terminate`
+    /// (TS 29.514 §4.2.5.3), and its BSF binding is deregistered.
+    ///
+    /// Revert-verified: without either follow-up in the create handler's replace
+    /// branch, this test fails.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn a_replaced_association_terminates_its_af_sessions_and_deregisters_its_binding() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        use std::sync::Mutex as StdMutex;
+
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        pcf_context_init(64, 64);
+        let supi = "imsi-001010000000980";
+        let create = |ts: &str| {
+            let mut body = full_create_body(supi, 5);
+            body["ipv4Address"] = serde_json::json!("10.45.0.198");
+            make_request("POST", "/npcf-smpolicycontrol/v1/sm-policies", Some(body))
+                .with_header(ORIGINATION_TIMESTAMP_HEADER, ts)
+        };
+        let resp = pcf_sbi_request_handler(create("Fri, 23 Oct 2026 10:00:00.100 GMT")).await;
+        assert_eq!(resp.status, 201);
+        let first = pcf_self()
+            .read()
+            .unwrap()
+            .sess_find_by_ipv4addr("10.45.0.198")
+            .expect("stored");
+        // As a BSF that answered the registration would have left it.
+        let mut bound = first.clone();
+        bound.binding.id = Some("bind-980".to_string());
+        pcf_self().read().unwrap().sess_update(&bound);
+
+        let seen: Arc<StdMutex<Vec<(String, serde_json::Value)>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let af = SbiServer::on_listener(SbiServerConfig::new(addr), port_listener);
+        af.start(move |req: SbiRequest| {
+            let sink = Arc::clone(&sink);
+            async move {
+                let body = req
+                    .http
+                    .content
+                    .as_deref()
+                    .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+                    .unwrap_or(serde_json::Value::Null);
+                sink.lock()
+                    .expect("sink")
+                    .push((req.header.uri.clone(), body));
+                SbiResponse::with_status(204)
+            }
+        })
+        .await
+        .expect("AF listener starts");
+        let notif_uri = format!("http://127.0.0.1:{port}/af-notif-980");
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions",
+            Some(af_create_body(&notif_uri, ("ueIpv4", "10.45.0.198"))),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let app_session_id = body["appSessionId"].as_str().unwrap().to_string();
+
+        let resp = pcf_sbi_request_handler(create("Fri, 23 Oct 2026 10:00:00.200 GMT")).await;
+        assert_eq!(resp.status, 201, "the more recent create replaces");
+        assert!(pcf_self()
+            .read()
+            .unwrap()
+            .sess_find_by_sm_policy_id(&first.sm_policy_id)
+            .is_none());
+
+        let mut terminate = None;
+        for _ in 0..200 {
+            terminate = seen
+                .lock()
+                .expect("sink")
+                .iter()
+                .find(|(uri, _)| uri.ends_with("/af-notif-980/terminate"))
+                .cloned();
+            if terminate.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let (_, body) = terminate.unwrap_or_else(|| {
+            panic!(
+                "the replaced association's AF got no terminate: {:?}",
+                seen.lock().unwrap()
+            )
+        });
+        assert_eq!(body["termCause"], "PDU_SESSION_TERMINATION");
+        assert_eq!(
+            body["resUri"],
+            format!("/npcf-policyauthorization/v1/app-sessions/{app_session_id}")
+        );
+        assert!(
+            crate::sbi_path::BSF_DEREGISTRATIONS_FOR_TEST
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|b| b == "bind-980"),
+            "the replaced association's BSF binding was not deregistered"
+        );
+    }
+
     /// TS 29.512 §4.2.7 through the SBI handler: a create carrying an older
     /// `3gpp-Sbi-Origination-Timestamp` than the existing association gets 403
     /// LATE_OVERLAPPING_REQUEST, a newer one replaces it (201, new id, the old
