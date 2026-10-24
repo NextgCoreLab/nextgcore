@@ -18,15 +18,15 @@ use crate::s1ap_build::{
 };
 use nextgcore_s1ap::{
     BroadcastCancelledAreaList, BroadcastCompletedAreaList, Cause, CauseRadioNetwork,
-    CriticalityDiagnostics, EnbConfigurationUpdate, EnbId, EnbStatusTransfer,
-    ErabDataForwardingItem, ErabToBeSetupItemHoReq, ErrorIndication, HandoverCancel,
-    HandoverCancelAcknowledge, HandoverCommand, HandoverFailure, HandoverNotify,
-    HandoverPreparationFailure, HandoverRequest, HandoverRequestAcknowledge, HandoverRequired,
-    HandoverType as S1apHandoverType, InitialContextSetupFailure, InitialContextSetupResponse,
-    InitialUeMessage, KillResponse, MmeStatusTransfer, NasNonDeliveryIndication, PathSwitchRequest,
-    PathSwitchRequestFailure, Reset, ResetAcknowledge, ResetType, S1SetupRequest, S1apMessage,
-    SecurityContext, TargetId, TimeToWait, UeCapabilityInfoIndication, UeContextReleaseComplete,
-    UeContextReleaseRequest, UlNasTransport, WriteReplaceWarningResponse,
+    CriticalityDiagnostics, EnbConfigurationUpdate, EnbStatusTransfer, ErabDataForwardingItem,
+    ErabToBeSetupItemHoReq, ErrorIndication, HandoverCancel, HandoverCancelAcknowledge,
+    HandoverCommand, HandoverFailure, HandoverNotify, HandoverPreparationFailure, HandoverRequest,
+    HandoverRequestAcknowledge, HandoverRequired, HandoverType as S1apHandoverType,
+    InitialContextSetupFailure, InitialContextSetupResponse, InitialUeMessage, KillResponse,
+    MmeStatusTransfer, NasNonDeliveryIndication, PathSwitchRequest, PathSwitchRequestFailure,
+    Reset, ResetAcknowledge, ResetType, S1SetupRequest, S1apMessage, SecurityContext, TargetId,
+    TimeToWait, UeCapabilityInfoIndication, UeContextReleaseComplete, UeContextReleaseRequest,
+    UlNasTransport, WriteReplaceWarningResponse,
 };
 
 // ============================================================================
@@ -5032,6 +5032,7 @@ mod tests {
     use super::*;
     use crate::context::{Bitrate, MmeUe, PlmnId, ServedGummei};
     use crate::s1ap_gen::test_codec::{builder, decode_s1ap_pdu};
+    use nextgcore_s1ap::EnbId;
     use nextgcore_s1ap::{
         CauseRadioNetwork, ErabSwitchedItem, GlobalEnbId, STmsi, SupportedTaItem,
         UeAssociatedLogicalS1Connection, UeSecurityCapabilities,
