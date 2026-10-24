@@ -297,3 +297,32 @@ async fn an_unhandled_n1_class_for_a_connected_ue_is_not_refused_unreachable() {
     assert_eq!(resp.status, 200, "{}", json_of(&resp));
     server.forget_ue(ue);
 }
+
+/// #1089 review: a UE context created over Namf for a UE no gNB has signalled for
+/// yet (CreateUEContext publishes it with association 0) has no NG connection. It
+/// is neither CM-CONNECTED nor pageable, so a positioning transfer gets 504, and
+/// nothing is ever sent "on association 0".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unbound_ue_context_is_not_connected() {
+    let _q = crate::test_support::POSITIONING_DL_LOCK.lock().await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, supi) = (7_108_709u64, "imsi-001010010870009");
+    let mut amf_ue = AmfUe::default();
+    amf_ue.id = ue;
+    amf_ue.supi = Some(supi.to_string());
+    amf_ue.security_context_available = true;
+    // As CreateUEContext leaves it: a pool RAN UE, no NG association.
+    amf_ue.ran_ue_id = 1;
+    server
+        .ue_auth_state
+        .insert(ue, UeNasContext::published(amf_ue, 0, 0));
+
+    let resp = crate::namf_request_handler(positioning_transfer(supi)).await;
+    assert_eq!(resp.status, 504, "{}", cause_of(&resp));
+    server.process_positioning_downlinks().await;
+    assert!(
+        take_sent_ngap(&mut server).is_empty(),
+        "nothing is sent for an unbound UE"
+    );
+    server.forget_ue(ue);
+}

@@ -7398,10 +7398,12 @@ mod positioning_chain_strict_peer {
         let _ = g.positioning_dl_drain();
         let mut ue = g.amf_ue_add(NEXTGCORE_INVALID_POOL_ID).expect("amf_ue_add");
         // #341: see `seed_amf_connected_ue`. `ran_ue_id` stays invalid, which is
-        // what makes this UE CM-IDLE and the relay fail closed with 504.
+        // what makes this UE CM-IDLE. Published on the association its last NG
+        // connection was on, as a released UE's record is: that is what makes it
+        // pageable (#1087; a record with no association is not).
         ue.supi = Some(supi.to_string());
         ue.ran_ue_id = NEXTGCORE_INVALID_POOL_ID;
-        g.amf_ue_publish(&ue, 0, 0);
+        g.amf_ue_publish(&ue, 0, 1);
         g.amf_ue_update(&ue);
         ue.id
     }

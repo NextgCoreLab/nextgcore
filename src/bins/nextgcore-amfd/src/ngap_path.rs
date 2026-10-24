@@ -745,8 +745,11 @@ impl UeNasContext {
             amf_ue.use_nextgcore_nas_security,
         );
         ctx.suci = amf_ue.suci.clone().unwrap_or_default();
-        // A record published without a RAN UE context has no N1 connection.
-        ctx.cm_idle = amf_ue.ran_ue_id == crate::context::NEXTGCORE_INVALID_POOL_ID;
+        // A record published without a RAN UE context has no N1 connection, and
+        // neither has one published with no association (#1089 review: a
+        // CreateUEContext target, which no gNB has signalled for yet).
+        ctx.cm_idle =
+            amf_ue.ran_ue_id == crate::context::NEXTGCORE_INVALID_POOL_ID || association_id == 0;
         ctx.amf_ue = amf_ue;
         ctx.registered = true;
         ctx
@@ -773,6 +776,13 @@ impl UeNasContext {
     /// Whether the UE is registered: the record a CM-IDLE UE is paged by (#1087).
     pub(crate) fn is_registered(&self) -> bool {
         self.registered
+    }
+
+    /// Whether the record names an NG association at all (#1089 review). A context
+    /// created over Namf for a UE no gNB has signalled for yet has none: it is
+    /// neither connected nor pageable.
+    pub(crate) fn is_bound(&self) -> bool {
+        self.association_id != 0
     }
 
     /// Create a per-UE NAS context. `use_nextgcore_nas_security` is the Wave-6

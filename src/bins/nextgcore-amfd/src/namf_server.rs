@@ -465,7 +465,7 @@ fn ue_ng_connected(ue: &AmfUe) -> bool {
         return false;
     };
     match guard.ue_store().get(ue.id) {
-        Some(state) => !state.is_cm_idle(),
+        Some(state) => !state.is_cm_idle() && state.is_bound(),
         None => {
             drop(guard);
             ue_ran_context(ue).is_some()
@@ -480,7 +480,7 @@ fn ue_pageable(ue: &AmfUe) -> bool {
         .read()
         .ok()
         .and_then(|g| g.ue_store().get(ue.id))
-        .is_some_and(|state| state.is_registered() && state.is_cm_idle())
+        .is_some_and(|state| state.is_registered() && state.is_cm_idle() && state.is_bound())
 }
 
 /// The pool's RAN UE context of a UE with no live NGAP record (see

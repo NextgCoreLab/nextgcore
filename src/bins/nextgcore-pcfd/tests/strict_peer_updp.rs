@@ -37,7 +37,9 @@ fn pcfd_updp_pdu() -> Vec<u8> {
 }
 
 /// Seed a UE in amfd's process-global context; `connected` => CM-CONNECTED
-/// (a live RAN UE context, required for an N1 downlink). Returns the AMF-UE id.
+/// (a live RAN UE context, required for an N1 downlink). Otherwise the UE is not
+/// reachable at all: no RAN UE context and no NG association to page it on, so
+/// amfd cannot page it (TS 29.518 §5.2.2.3.1, #1087). Returns the AMF-UE id.
 fn seed_ue(supi: &str, connected: bool) -> u64 {
     amf::amf_context_init(64, 1024, 4096);
     let ctx = amf::amf_self();
@@ -50,7 +52,6 @@ fn seed_ue(supi: &str, connected: bool) -> u64 {
     // #341: publish into amfd's LIVE UE store, which is what its Namf handlers
     // resolve against now. `amf_ue_set_supi` wrote a SUPI index nothing in
     // production ever wrote -- the defect #341 removed.
-    guard.amf_ue_publish(&ue, ngap_id as u32, 900_200);
     ue.security_context_available = true;
     if connected {
         guard.amf_ue_associate_ran_ue(ue.id, ran_ue.id);
@@ -59,6 +60,9 @@ fn seed_ue(supi: &str, connected: bool) -> u64 {
         ue.ran_ue_id = amf::NEXTGCORE_INVALID_POOL_ID;
     }
     guard.amf_ue_update(&ue);
+    // Published once its CM state is set (#1087: amfd reads it from the live
+    // record), so an idle seed is CM-IDLE there too.
+    guard.amf_ue_publish(&ue, ngap_id as u32, if connected { 900_200 } else { 0 });
     ue.id
 }
 
@@ -132,9 +136,11 @@ fn pcfd_updp_accepted_by_real_amfd_and_enqueued_verbatim() {
     }
 }
 
-/// E4 fail-closed leg: the same pcfd request against a CM-IDLE UE gets 504
-/// UE_NOT_REACHABLE from amfd's REAL handler (never a fake 200-and-drop) — the
-/// non-2xx that pcfd's delivery path records as `DeliveryState::Failed`.
+/// E4 fail-closed leg: the same pcfd request against a UE that is not reachable
+/// (CM-IDLE with nothing to page it by) gets 504 UE_NOT_REACHABLE from amfd's
+/// REAL handler (never a fake 200-and-drop) — the non-2xx that pcfd's delivery
+/// path records as `DeliveryState::Failed`. A pageable CM-IDLE UE is paged
+/// instead (202, #540 / #1087).
 #[test]
 fn pcfd_updp_to_idle_ue_rejected_504_by_real_amfd() {
     // Drives production peer-call code against a loopback PLAINTEXT peer, i.e. a
