@@ -131,6 +131,8 @@ Every refused datagram increments `smf_pfcp_unauthorized_messages_total`. This i
 | `NEXTGCORE_SMF_STATE_FILE` | unset | JSON snapshot file for PFCP sessions, policy bindings and IPv4-pool allocations (#191). Read only when `--state-file` is absent — the flag wins; an empty value is treated as unset. With neither set the SMF is memory-only, which is the shipped default. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://jaeger:4317` | OpenTelemetry OTLP trace exporter endpoint. |
 
+> **Clock:** this NF refuses to start when the local clock reads before 2020-01-01, because its PFCP Recovery Time Stamp would be wrong. See [A set clock is required](overview.md#a-set-clock-is-required-pfcp-nfs) for the remedy on RTC-less hosts.
+
 ## Command-line flags
 
 `smfd` has no `clap` argument parser; it scans `argv` for the two flags it

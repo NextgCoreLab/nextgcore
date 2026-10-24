@@ -1384,6 +1384,25 @@ impl PfcpClient {
                         assoc.peer_recovery_time_stamp = Some(rts);
                         true
                     }
+                    // #1004 review: a stored start time in the FUTURE came from a wrong
+                    // clock (an RTC-less UPF that booted at 1970, its stamp read in the
+                    // Unix branch, ~2040). No real earlier incarnation can be newer than
+                    // it, so the reorder rule below would mask every later restart: a
+                    // differing stamp is a restart.
+                    StampSource::Request
+                        if nextgcore_pfcp::recovery_time::is_in_the_future(
+                            stored,
+                            nextgcore_pfcp::recovery_time::now(),
+                        ) =>
+                    {
+                        log::warn!(
+                            "UPF {}: stored Recovery Time Stamp {stored} is in the future (a \
+                             clock that was not set); {rts} is taken as a restart",
+                            self.peer()
+                        );
+                        assoc.peer_recovery_time_stamp = Some(rts);
+                        true
+                    }
                     StampSource::Request => {
                         log::error!(
                             "UPF {}: Recovery Time Stamp {rts} in a Heartbeat Request is older \
@@ -4083,6 +4102,62 @@ mod tests {
             client.association().await.peer_recovery_time_stamp,
             Some(upgraded)
         );
+    }
+
+    /// #1004 review: an RTC-less UPF booted at 1970; its stamp was read in the Unix
+    /// branch and stored as ~2040. After a restart with a synced clock its 2026 stamp
+    /// is "older" than that, and a Heartbeat Request carrying it was discarded as
+    /// reordered -- the restart masked. A stored start time in the future is not a
+    /// reference: a differing stamp is a restart.
+    #[tokio::test]
+    async fn a_future_stored_stamp_does_not_mask_a_restart() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
+        let (client, _upf) = make_client_with_peer().await;
+        let _pool = InstalledPool::new(vec![client.clone()]);
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let bogus = nextgcore_pfcp::recovery_time::from_unix_secs(now_unix + 86_400 * 365 * 14);
+        client.seed_peer_recovery_time_stamp(bogus).await;
+        client.set_assoc_state_for_test(true, None, None).await;
+
+        let synced = nextgcore_pfcp::recovery_time::from_unix_secs(now_unix - 60);
+        let fanout = client
+            .detect_peer_restart(synced, StampSource::Request)
+            .await;
+        assert!(fanout.is_some(), "the restart is not masked");
+        if let Some(f) = fanout {
+            let _ = f.await;
+        }
+        assert_eq!(
+            client.association().await.peer_recovery_time_stamp,
+            Some(synced)
+        );
+    }
+
+    /// A genuinely reordered (older) stamp is still discarded when the stored one is
+    /// a plausible, past start time.
+    #[tokio::test]
+    async fn a_reordered_older_stamp_is_still_discarded() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
+        let (client, _upf) = make_client_with_peer().await;
+        let _pool = InstalledPool::new(vec![client.clone()]);
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let current = nextgcore_pfcp::recovery_time::from_unix_secs(now_unix - 60);
+        client.seed_peer_recovery_time_stamp(current).await;
+        client.set_assoc_state_for_test(true, None, None).await;
+        let previous = nextgcore_pfcp::recovery_time::from_unix_secs(now_unix - 86_400);
+        assert!(client
+            .detect_peer_restart(previous, StampSource::Request)
+            .await
+            .is_none());
+        assert!(client.is_associated().await);
     }
 
     /// #995: this SMF's own stamp is NTP-era seconds (TS 29.244 §8.2.65).
