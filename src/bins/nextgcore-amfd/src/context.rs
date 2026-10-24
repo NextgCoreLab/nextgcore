@@ -4264,6 +4264,16 @@ impl AmfUe {
     ///
     /// Returns `(ncc, nh)` in the order the NGAP `SecurityContext` fields are
     /// written, so a caller cannot transpose them.
+    /// The `{NCC, NH}` [`Self::advance_next_hop`] would produce, without advancing: for a
+    /// procedure that commits the pair only once its outcome is decided (#1009 review,
+    /// the Path Switch Acknowledge).
+    pub fn next_hop_preview(&self) -> (u8, [u8; NEXTGCORE_SHA256_DIGEST_SIZE]) {
+        (
+            self.nhcc.wrapping_add(1) & 0x07,
+            nextgcore_crypt::kdf::nextgcore_kdf_nh_gnb(&self.kamf, &self.nh),
+        )
+    }
+
     pub fn advance_next_hop(&mut self) -> (u8, [u8; NEXTGCORE_SHA256_DIGEST_SIZE]) {
         self.nh = nextgcore_crypt::kdf::nextgcore_kdf_nh_gnb(&self.kamf, &self.nh);
         self.nhcc = self.nhcc.wrapping_add(1) & 0x07;
