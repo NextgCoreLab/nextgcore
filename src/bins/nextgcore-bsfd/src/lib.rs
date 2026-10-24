@@ -1308,7 +1308,10 @@ fn spawn_bsf_notifications(
         let sub_id = sub.sub_id.clone();
         tokio::spawn(async move {
             let Some((host, port, path)) = split_notify_uri(&uri) else {
-                log::warn!("subscription {sub_id}: unusable notifUri {uri}");
+                log::warn!(
+                    "subscription {sub_id}: unusable notifUri {uri}",
+                    uri = nextgcore_sbi::log_redact::redact_last_segment(&uri)
+                );
                 return;
             };
             let client = nextgcore_sbi::client::SbiClient::new(
@@ -1319,9 +1322,13 @@ fn spawn_bsf_notifications(
             match client.post_json(&path, &body).await {
                 Ok(resp) => log::debug!(
                     "BsfNotification delivered to {uri} for {sub_id} (status {})",
-                    resp.status
+                    resp.status,
+                    uri = nextgcore_sbi::log_redact::redact_last_segment(&uri)
                 ),
-                Err(e) => log::warn!("BsfNotification to {uri} for {sub_id} failed: {e}"),
+                Err(e) => log::warn!(
+                    "BsfNotification to {uri} for {sub_id} failed: {e}",
+                    uri = nextgcore_sbi::log_redact::redact_last_segment(&uri)
+                ),
             }
         });
     }

@@ -60,7 +60,9 @@ pub struct SbiNotifyRequest {
     /// HTTP method
     pub method: String,
     /// URI
-    pub uri: String,
+    /// The subscriber's callback URI (`nfStatusNotificationUri`); logged only
+    /// redacted (#940, #1047 review).
+    pub callback_uri: String,
     /// Content type
     pub content_type: String,
     /// Accept header
@@ -129,7 +131,7 @@ fn build_nf_status_notify_inner(
 
     Some(SbiNotifyRequest {
         method: "POST".to_string(),
-        uri: subscription_data.notification_uri.clone(),
+        callback_uri: subscription_data.notification_uri.clone(),
         content_type: "application/json".to_string(),
         accept: "application/problem+json".to_string(),
         callback: "Nnrf_NFManagement_NFStatusNotify".to_string(),
@@ -321,7 +323,7 @@ mod tests {
         let request = request.unwrap();
 
         assert_eq!(request.method, "POST");
-        assert_eq!(request.uri, "http://smf.example.com/notify");
+        assert_eq!(request.callback_uri, "http://smf.example.com/notify");
         assert_eq!(request.content_type, "application/json");
         assert!(request.body.contains("NF_REGISTERED"));
         assert!(request.body.contains("test-nf-123"));

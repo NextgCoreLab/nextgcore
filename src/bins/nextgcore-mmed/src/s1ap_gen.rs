@@ -97,8 +97,16 @@ fn bits_to_u32(bits: &BitVec<u8, Msb0>) -> u32 {
     bits.iter().fold(0u32, |acc, b| (acc << 1) | u32::from(*b))
 }
 
-/// The low `width` bits of `value`, most significant first.
+/// `value` as a `width`-bit BIT STRING, most significant bit first. `value` must fit
+/// (#858 review, MINOR C): the bits above `width` are not encoded, so a wider value
+/// would name a different identity on the wire. Every caller builds the S1AP the MME
+/// sends from identities it already validated, so this is an invariant, checked in
+/// debug builds and tests.
 fn u32_to_bits(value: u32, width: usize) -> BitVec<u8, Msb0> {
+    debug_assert!(
+        width >= 32 || value >> width == 0,
+        "{value:#x} does not fit in {width} bits"
+    );
     (0..width).rev().map(|i| (value >> i) & 1 == 1).collect()
 }
 
@@ -795,6 +803,91 @@ pub fn build_downlink_nas_transport(
             ]),
         }),
     }))
+}
+
+/// PWS Restart Indication (TS 36.413 §8.12.3, §9.1.13.5), procedure code 49.
+pub const PROC_PWS_RESTART_INDICATION: u8 = 49;
+const ID_ECGI_LIST_FOR_RESTART: u16 = 182;
+const ID_TAI_LIST_FOR_RESTART: u16 = 188;
+
+/// A decoded PWS RESTART INDICATION (#1068).
+#[derive(Debug, Clone)]
+pub struct PwsRestartIndication {
+    /// The restarted eNB.
+    pub global_enb_id: GlobalEnbId,
+    /// The cells whose PWS information may be lost.
+    pub ecgi_list: Vec<EutranCgi>,
+    /// The tracking areas of those cells.
+    pub tai_list: Vec<Tai>,
+    /// The Emergency Area IDs, when the eNB reports them (each 3 octets).
+    pub emergency_area_ids: Vec<Vec<u8>>,
+}
+
+/// Decode a PWS RESTART INDICATION (#1068), a non-UE-associated Class 2
+/// message (TS 36.413 §8.12.3). Its three mandatory IEs are `reject`
+/// (§9.1.13.5): missing or not understood, the procedure is not run
+/// (§10.3.4.2 / §10.3.5).
+pub fn decode_pws_restart_indication(bytes: &[u8]) -> Class2Decode<PwsRestartIndication> {
+    let Ok((pdu, unknown)) = nextgcore_s1ap_gen::decode_with_unknown_ies(bytes) else {
+        return Class2Decode::Undecodable;
+    };
+    let g::S1AP_PDU::InitiatingMessage(msg) = pdu else {
+        return Class2Decode::Undecodable;
+    };
+    let g::InitiatingMessageValue::Id_PWSRestartIndication(m) = msg.value else {
+        return Class2Decode::Undecodable;
+    };
+    let (mut reject, notify) = classify_unknown(&unknown);
+    let (mut global, mut ecgis, mut tais, mut areas) = (None, None, None, Vec::new());
+    use g::PWSRestartIndicationProtocolIEs_EntryValue as V;
+    for ie in m.protocol_i_es.0 {
+        match ie.value {
+            V::Id_Global_ENB_ID(v) => match plmn(&v.plm_nidentity.0) {
+                Some(plmn_identity) => {
+                    global = Some(GlobalEnbId {
+                        plmn_identity,
+                        enb_id: enb_id_from(&v.enb_id),
+                    })
+                }
+                None => reject.push(DiagnosedIe {
+                    criticality: REJECT,
+                    id: ID_GLOBAL_ENB_ID,
+                    type_of_error: g::TypeOfError::NOT_UNDERSTOOD,
+                }),
+            },
+            V::Id_ECGIListForRestart(v) => {
+                ecgis = Some(v.0.iter().filter_map(cgi_from).collect::<Vec<_>>())
+            }
+            V::Id_TAIListForRestart(v) => {
+                tais = Some(v.0.iter().filter_map(tai_from).collect::<Vec<_>>())
+            }
+            V::Id_EmergencyAreaIDListForRestart(v) => {
+                areas = v.0.into_iter().map(|a| a.0).collect()
+            }
+        }
+    }
+    missing(&mut reject, ecgis.is_some(), ID_ECGI_LIST_FOR_RESTART);
+    missing(&mut reject, global.is_some(), ID_GLOBAL_ENB_ID);
+    missing(&mut reject, tais.is_some(), ID_TAI_LIST_FOR_RESTART);
+    if !reject.is_empty() {
+        return Class2Decode::Reject {
+            ies: reject,
+            enb_ue_s1ap_id: None,
+            mme_ue_s1ap_id: None,
+        };
+    }
+    let (Some(global_enb_id), Some(ecgi_list), Some(tai_list)) = (global, ecgis, tais) else {
+        return Class2Decode::Undecodable;
+    };
+    Class2Decode::Proceed {
+        msg: PwsRestartIndication {
+            global_enb_id,
+            ecgi_list,
+            tai_list,
+            emergency_area_ids: areas,
+        },
+        notify,
+    }
 }
 
 /// Whether `bytes` is an initiating message of `procedure_code`.

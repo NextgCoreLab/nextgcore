@@ -142,9 +142,14 @@ pub fn render_metrics() -> String {
          FAILUREs received, by what the request carried (TS 36.413 8.3.4.3)\n\
          # TYPE mme_s1ap_ue_context_modification_failures_total counter\n\
          mme_s1ap_ue_context_modification_failures_total{{carried=\"ue_ambr\"}} {}\n\
-         mme_s1ap_ue_context_modification_failures_total{{carried=\"other\"}} {}\n",
+         mme_s1ap_ue_context_modification_failures_total{{carried=\"other\"}} {}\n\
+         # HELP mme_s1ap_pws_restart_indications_total PWS RESTART INDICATIONs accepted from \
+         an eNB (TS 36.413 8.12.3)\n\
+         # TYPE mme_s1ap_pws_restart_indications_total counter\n\
+         mme_s1ap_pws_restart_indications_total {}\n",
         n(0),
-        n(1)
+        n(1),
+        PWS_RESTART_INDICATIONS.load(std::sync::atomic::Ordering::Relaxed)
     )
 }
 
@@ -315,6 +320,34 @@ fn handle_s1ap_message_inner(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<
                 }
                 ResponseDecode::Undecodable => {}
             }
+        }
+    }
+    // #1068, TS 36.413 §8.12.3: a restarted eNB's PWS RESTART INDICATION
+    // (Class 2, no response): validated, counted and logged (#1069 review).
+    if crate::s1ap_gen::is_initiating(data, crate::s1ap_gen::PROC_PWS_RESTART_INDICATION) {
+        use crate::s1ap_gen::Class2Decode;
+        match crate::s1ap_gen::decode_pws_restart_indication(data) {
+            Class2Decode::Proceed { msg, notify } => {
+                let out = class2_notify(
+                    enb_id,
+                    crate::s1ap_gen::PROC_PWS_RESTART_INDICATION,
+                    None,
+                    None,
+                    &notify,
+                );
+                handle_pws_restart(ctx, enb_id, &msg);
+                return out;
+            }
+            Class2Decode::Reject { ies, .. } => {
+                return class2_reject(
+                    enb_id,
+                    crate::s1ap_gen::PROC_PWS_RESTART_INDICATION,
+                    None,
+                    None,
+                    &ies,
+                );
+            }
+            Class2Decode::Undecodable => {}
         }
     }
     if crate::s1ap_gen::is_initiating(data, crate::s1ap_gen::PROC_UPLINK_NAS_TRANSPORT) {
@@ -1418,6 +1451,51 @@ fn class2_notify(
     )
 }
 
+/// PWS RESTART INDICATIONs accepted from an eNB (TS 36.413 §8.12.3, #1068).
+pub static PWS_RESTART_INDICATIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// A PWS RESTART INDICATION from the eNB `enb_id` (TS 36.413 §8.12.3, #1068).
+///
+/// The indication tells the CBC that the restarted cells' warnings are lost and
+/// may be reloaded *from the CBC* (TS 23.007 §15A.1.2): the MME's job is to
+/// propagate it over SBc-AP (TS 29.168), and to forward the CBC's reload, which
+/// names the restarted cells and the broadcasts still owed. mmed has no SBc-AP
+/// transport yet (#1071), so the indication is validated, counted and logged; the
+/// MME does not replay its own copy of the warnings (that would re-broadcast with
+/// the original area and repetition count, #1069 review).
+///
+/// The Global eNB ID must be the sending association's own. mmed connects eNBs
+/// directly and does not serve a HeNB GW (TS 36.300 §4.6.2), behind which the
+/// association is the GW's and the HeNBs' identities are not checked this way.
+/// Returns whether the indication was accepted.
+pub fn handle_pws_restart(
+    ctx: &MmeContext,
+    enb_id: u64,
+    msg: &crate::s1ap_gen::PwsRestartIndication,
+) -> bool {
+    let plmn = s1ap_build::decode_plmn_id(&msg.global_enb_id.plmn_identity);
+    if ctx.enb_find_by_global_enb_id(&plmn, msg.global_enb_id.enb_id) != Some(enb_id) {
+        log::warn!(
+            "PWS RESTART INDICATION from eNB {enb_id} names Global eNB ID {:?}, which is not \
+             its own; not acted on",
+            msg.global_enb_id
+        );
+        return false;
+    }
+    PWS_RESTART_INDICATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    log::warn!(
+        "PWS RESTART INDICATION from eNB {enb_id} ({:?}): {} cell(s), {} TAI(s), {} \
+         emergency area(s) lost their warnings; the CBC reloads them (TS 23.007 §15A.1.2), \
+         and this MME has no SBc-AP association to tell it (#1071)",
+        msg.global_enb_id,
+        msg.ecgi_list.len(),
+        msg.tai_list.len(),
+        msg.emergency_area_ids.len()
+    );
+    true
+}
+
 /// TS 36.413 §10.3.4.2 / §10.3.5 for an initiating message of a Class 2
 /// procedure: the procedure is not run, and the offending IEs are reported in
 /// an ERROR INDICATION.
@@ -2117,11 +2195,18 @@ pub fn handle_ue_context_release_request(
         enb_ue.mme_ue_id
     };
 
-    // #956, TS 23.401 §5.3.5 step 2: a UE with PDN connections at a Serving GW
-    // goes ECM-IDLE. Its S1-U bearers are released at the Serving GW first, so
-    // downlink is buffered and notified (§5.3.4.3) rather than tunnelled to an
-    // eNB that has dropped the UE. The UE CONTEXT RELEASE COMMAND (step 5)
-    // follows the Release Access Bearers Response.
+    log::info!("UE Context Release Request (cause {:?})", msg.cause);
+    release_to_ecm_idle(ctx, enb_ue_id, mme_ue_id)
+}
+
+/// The S1 release of `enb_ue_id` once its cause and `S1ContextRemove` are
+/// recorded (TS 23.401 §5.3.5). A UE with PDN connections at a Serving GW
+/// goes ECM-IDLE: its S1-U bearers are released at the Serving GW first
+/// (step 2), so downlink is buffered and notified (§5.3.4.3) rather than
+/// tunnelled to an eNB that has dropped the UE, and the UE CONTEXT RELEASE
+/// COMMAND (step 5) follows the Release Access Bearers Response (#956).
+/// Otherwise, or when that request cannot be sent, the command is returned now.
+fn release_to_ecm_idle(ctx: &MmeContext, enb_ue_id: u64, mme_ue_id: u64) -> Vec<S1apSend> {
     let has_session = ctx
         .mme_ue_find_by_id(mme_ue_id)
         .filter(|ue| ue.enb_ue_id == enb_ue_id)
@@ -2131,19 +2216,45 @@ pub fn handle_ue_context_release_request(
         match crate::gtp_path::release_access_bearers_for_s1_release(ctx, enb_ue_id, mme_ue_id) {
             Ok(seq) => {
                 log::info!(
-                    "UE Context Release Request (cause {:?}): Release Access Bearers Request \
-                     (seq={seq}) to the Serving GW; the UE goes ECM-IDLE (TS 23.401 §5.3.5)",
-                    msg.cause
+                    "S1 release of enb_ue_id={enb_ue_id}: Release Access Bearers Request \
+                     (seq={seq}) to the Serving GW; the UE goes ECM-IDLE (TS 23.401 §5.3.5)"
                 );
                 return Vec::new();
             }
             Err(e) => log::error!(
-                "UE Context Release Request: Release Access Bearers Request not sent ({e}); \
-                 releasing S1 now"
+                "S1 release of enb_ue_id={enb_ue_id}: Release Access Bearers Request not sent \
+                 ({e}); releasing S1 now"
             ),
         }
     }
     s1_release_command(ctx, enb_ue_id)
+}
+
+/// MME-initiated S1 release (TS 23.401 §5.3.5) of the ECM-CONNECTED UE
+/// `mme_ue_id` on `enb_ue_id` whose S1-U the Serving GW released while S1-MME
+/// stayed up (#1015): a Downlink Data Notification came for a bearer whose eNB
+/// F-TEID the Serving GW held, as after an S1-U path failure (TS 23.007
+/// §20.3.4). The UE CONTEXT RELEASE COMMAND carries Transport cause
+/// transport-resource-unavailable (TS 36.413 §9.2.1.3), and the UE is paged
+/// when the release completes (`ddn_pending_after_release`): its SERVICE
+/// REQUEST then sets up fresh S1-U bearers.
+pub fn release_for_released_s1u(ctx: &MmeContext, enb_ue_id: u64, mme_ue_id: u64) -> Vec<S1apSend> {
+    {
+        let mut pool = ctx.enb_ue_pool.write().unwrap();
+        let Some(enb_ue) = pool
+            .get_mut(&enb_ue_id)
+            .filter(|e| e.mme_ue_id == mme_ue_id)
+        else {
+            return Vec::new();
+        };
+        enb_ue.relcause.group = S1apCauseGroup::Transport;
+        enb_ue.relcause.cause = s1ap_build::transport_cause::TRANSPORT_RESOURCE_UNAVAILABLE;
+        enb_ue.ue_ctx_rel_action = UeCtxRelAction::S1ContextRemove;
+    }
+    if let Some(ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&mme_ue_id) {
+        ue.ddn_pending_after_release = true;
+    }
+    release_to_ecm_idle(ctx, enb_ue_id, mme_ue_id)
 }
 
 /// The UE CONTEXT RELEASE COMMAND of an S1 release for `enb_ue_id`, with the
