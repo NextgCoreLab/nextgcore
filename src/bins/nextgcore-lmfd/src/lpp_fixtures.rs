@@ -153,3 +153,111 @@ pub(crate) fn multi_rtt_lpp(cells: &[(u16, u32)], transaction_number: u8) -> Vec
         });
     provide_location_information(transaction_number, ies)
 }
+
+/// One NR-DL-TDOA measurement element: DL-PRS ID `prs_id`, PCI `pci` when given,
+/// RSTD k0 code `k0`, the same time stamp and quality as [`multi_rtt_element`].
+pub(crate) fn dl_tdoa_element(
+    prs_id: u8,
+    pci: Option<u16>,
+    k0: u32,
+) -> lpp::NR_DL_TDOA_MeasElement_r16 {
+    let template = multi_rtt_element(0, 0);
+    lpp::NR_DL_TDOA_MeasElement_r16 {
+        dl_prs_id_r16: lpp::NR_DL_TDOA_MeasElement_r16Dl_PRS_ID_r16(prs_id),
+        nr_phys_cell_id_r16: pci.map(lpp::NR_PhysCellID_r16),
+        nr_cell_global_id_r16: None,
+        nr_arfcn_r16: None,
+        nr_dl_prs_resource_id_r16: None,
+        nr_dl_prs_resource_set_id_r16: None,
+        nr_time_stamp_r16: template.nr_time_stamp_r16,
+        nr_rstd_r16: lpp::NR_DL_TDOA_MeasElement_r16Nr_RSTD_r16::K0_r16(
+            lpp::NR_DL_TDOA_MeasElement_r16Nr_RSTD_r16_k0_r16(k0),
+        ),
+        nr_additional_path_list_r16: None,
+        nr_timing_quality_r16: template.nr_timing_quality_r16,
+        nr_dl_prs_rsrp_result_r16: Some(lpp::NR_DL_TDOA_MeasElement_r16Nr_DL_PRS_RSRP_Result_r16(
+            90,
+        )),
+        nr_dl_tdoa_additional_measurements_r16: None,
+        extensions: Default::default(),
+    }
+}
+
+/// An NR-DL-TDOA `ProvideLocationInformation`: the reference DL-PRS ID, then one
+/// element per `(prs_id, pci, k0)`.
+pub(crate) fn dl_tdoa_lpp(
+    reference_prs_id: u8,
+    neighbours: &[(u8, Option<u16>, u32)],
+    transaction_number: u8,
+) -> Vec<u8> {
+    let mut ies = empty_ies();
+    ies.extensions.nr_dl_tdoa_provide_location_information_r16 =
+        Some(lpp::NR_DL_TDOA_ProvideLocationInformation_r16 {
+            nr_dl_tdoa_signal_measurement_information_r16: Some(
+                lpp::NR_DL_TDOA_SignalMeasurementInformation_r16 {
+                    dl_prs_reference_info_r16: lpp::DL_PRS_ID_Info_r16 {
+                        dl_prs_id_r16: lpp::DL_PRS_ID_Info_r16Dl_PRS_ID_r16(reference_prs_id),
+                        nr_dl_prs_resource_id_list_r16: None,
+                        nr_dl_prs_resource_set_id_r16: None,
+                    },
+                    nr_dl_tdoa_meas_list_r16: lpp::NR_DL_TDOA_MeasList_r16(
+                        neighbours
+                            .iter()
+                            .map(|(prs, pci, k0)| dl_tdoa_element(*prs, *pci, *k0))
+                            .collect(),
+                    ),
+                    extensions: Default::default(),
+                },
+            ),
+            nr_dl_tdoa_location_information_r16: None,
+            nr_dl_tdoa_error_r16: None,
+            extensions: Default::default(),
+        });
+    provide_location_information(transaction_number, ies)
+}
+
+/// An NR E-CID `ProvideLocationInformation` (TS 37.355 Rel-16): the primary cell
+/// `pci` with SS-RSRP `ss_rsrp` and SS-RSRQ `ss_rsrq` (report values), and one
+/// neighbour per `(pci, ss_rsrp)` with only an SS-RSRP.
+pub(crate) fn nr_ecid_lpp(
+    pci: u16,
+    ss_rsrp: u8,
+    ss_rsrq: u8,
+    neighbours: &[(u16, u8)],
+    transaction_number: u8,
+) -> Vec<u8> {
+    let element = |pci: u16, rsrp: u8, rsrq: Option<u8>| lpp::NR_MeasuredResultsElement_r16 {
+        nr_phys_cell_id_r16: lpp::NR_PhysCellID_r16(pci),
+        nr_arfcn_r16: lpp::NR_MeasuredResultsElement_r16Nr_ARFCN_r16::Ssb_ARFCN_r16(
+            lpp::ARFCN_ValueNR_r15(632_628),
+        ),
+        nr_cell_global_id_r16: None,
+        system_frame_number_r16: None,
+        results_ssb_cell_r16: Some(lpp::MeasQuantityResults_r16 {
+            nr_rsrp_r16: Some(lpp::MeasQuantityResults_r16Nr_RSRP_r16(rsrp)),
+            nr_rsrq_r16: rsrq.map(lpp::MeasQuantityResults_r16Nr_RSRQ_r16),
+        }),
+        results_csi_rs_cell_r16: None,
+        results_ssb_indexes_r16: None,
+        results_csi_rs_indexes_r16: None,
+    };
+    let mut ies = empty_ies();
+    ies.extensions.nr_ecid_provide_location_information_r16 =
+        Some(lpp::NR_ECID_ProvideLocationInformation_r16 {
+            nr_ecid_signal_measurement_information_r16: Some(
+                lpp::NR_ECID_SignalMeasurementInformation_r16 {
+                    nr_primary_cell_measured_results_r16: element(pci, ss_rsrp, Some(ss_rsrq)),
+                    nr_measured_results_list_r16: (!neighbours.is_empty()).then(|| {
+                        lpp::NR_MeasuredResultsList_r16(
+                            neighbours
+                                .iter()
+                                .map(|(p, r)| element(*p, *r, None))
+                                .collect(),
+                        )
+                    }),
+                },
+            ),
+            nr_ecid_error_r16: None,
+        });
+    provide_location_information(transaction_number, ies)
+}

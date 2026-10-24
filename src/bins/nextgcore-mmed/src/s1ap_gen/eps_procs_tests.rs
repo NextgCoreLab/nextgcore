@@ -479,6 +479,14 @@ fn an_erab_modification_indication_switches_known_erabs_and_fails_unknown_ones()
     let _guard = crate::gtp_path::lock_s11();
     let (ctx, enb_id) = setup();
     let (_, _, mme, enb, ids) = ue_with_bearers(&ctx, enb_id);
+    // E-RAB 6 is not set up at the eNB, so leaving it out of the indication is
+    // not the §8.2.4.4 "does not contain all the E-RABs" case.
+    ctx.bearer_pool
+        .write()
+        .unwrap()
+        .get_mut(&ids[1])
+        .unwrap()
+        .enb_s1u_teid = 0;
     let bytes = erab_modification_indication(mme, enb, Some(&[(5, 0x5151), (9, 0x9191)]));
 
     // This unit context has no Serving GW path, so the Modify Bearer Request
@@ -492,10 +500,11 @@ fn an_erab_modification_indication_switches_known_erabs_and_fails_unknown_ones()
     assert!(failed
         .iter()
         .any(|(e, c)| *e == 5 && matches!(c, g::Cause::Transport(_))));
-    // The new downlink endpoint is stored for the Modify Bearer Request.
-    assert_eq!(ctx.bearer_find_by_id(ids[0]).unwrap().enb_s1u_teid, 0x5151);
+    // #736: an endpoint the Serving GW never accepted is not written.
+    assert_ne!(ctx.bearer_find_by_id(ids[0]).unwrap().enb_s1u_teid, 0x5151);
 
-    // With the Serving GW's answer: accepted, E-RAB 5 is modified ...
+    // With the Serving GW's answer: accepted, E-RAB 5 is modified and its new
+    // endpoint written ...
     let pending = crate::gtp_path::PendingErabModification {
         enb_id,
         confirm: crate::s1ap_gen::ErabModificationConfirm {
@@ -506,20 +515,194 @@ fn an_erab_modification_indication_switches_known_erabs_and_fails_unknown_ones()
             to_be_released: vec![],
         },
         notify: vec![],
+        mme_ue_id: ctx.bearer_find_by_id(ids[0]).unwrap().mme_ue_id,
+        switched: vec![crate::gtp_path::SwitchedBearer {
+            ebi: 5,
+            teid: 0x5151,
+            ip: crate::context::IpAddr {
+                ipv4: Some([10, 0, 0, 51]),
+                ..Default::default()
+            },
+        }],
     };
-    let send = crate::s1ap_handler::erab_modification_confirm(pending.clone(), 16).unwrap();
-    assert_eq!(send.enb_id, enb_id);
-    assert_eq!(confirm_lists(&send.pdu), (vec![5], vec![]));
-    // ... refused, it failed.
-    let send = crate::s1ap_handler::erab_modification_confirm(pending.clone(), 64).unwrap();
+    let response =
+        |cause: u8, per_bearer: Option<u8>| crate::s11_handler::ModifyBearerResponseData {
+            cause,
+            bearer_contexts: per_bearer
+                .map(|c| {
+                    vec![crate::s11_handler::BearerContextModified {
+                        ebi: 5,
+                        cause: Some(c),
+                    }]
+                })
+                .unwrap_or_default(),
+            ..Default::default()
+        };
+    // ... refused (message cause), it failed, and nothing is written ...
+    let send =
+        crate::s1ap_handler::erab_modification_confirm(&ctx, pending.clone(), &response(64, None))
+            .unwrap();
     let (modified, failed) = confirm_lists(&send.pdu);
     assert!(modified.is_empty());
     assert_eq!(failed.iter().map(|f| f.0).collect::<Vec<_>>(), vec![5]);
+    assert_ne!(ctx.bearer_find_by_id(ids[0]).unwrap().enb_s1u_teid, 0x5151);
+    // ... accepted partially with the bearer's own cause a refusal: failed ...
+    let send = crate::s1ap_handler::erab_modification_confirm(
+        &ctx,
+        pending.clone(),
+        &response(17, Some(73)),
+    )
+    .unwrap();
+    assert_eq!(confirm_lists(&send.pdu).0, Vec::<u8>::new());
+    assert_ne!(ctx.bearer_find_by_id(ids[0]).unwrap().enb_s1u_teid, 0x5151);
+    // ... and accepted: modified, with the endpoint written.
+    let send = crate::s1ap_handler::erab_modification_confirm(
+        &ctx,
+        pending.clone(),
+        &response(16, Some(16)),
+    )
+    .unwrap();
+    assert_eq!(send.enb_id, enb_id);
+    assert_eq!(confirm_lists(&send.pdu), (vec![5], vec![]));
+    let b = ctx.bearer_find_by_id(ids[0]).unwrap();
+    assert_eq!(b.enb_s1u_teid, 0x5151);
+    assert_eq!(b.enb_s1u_ip.ipv4, Some([10, 0, 0, 51]));
+
+    // #736: the Serving GW never answers: every E-RAB failed, transport cause.
+    let send = crate::s1ap_handler::erab_modification_unanswered(&ctx, pending.clone()).unwrap();
+    let (modified, failed) = confirm_lists(&send.pdu);
+    assert!(modified.is_empty());
+    assert!(failed
+        .iter()
+        .any(|(e, c)| *e == 5 && matches!(c, g::Cause::Transport(_))));
 
     // The S11 response path takes the parked record by sequence number.
     crate::gtp_path::record_pending_erab_modification_for_test(0x5_84, pending);
     assert!(crate::gtp_path::take_pending_erab_modification(0x5_84).is_some());
     assert!(crate::gtp_path::take_pending_erab_modification(0x5_84).is_none());
+}
+
+/// #852 review: a late Modify Bearer Response writes nothing for an S1
+/// association that no longer serves the UE, and does not revive an E-RAB the
+/// eNB released meanwhile (it is confirmed failed instead).
+#[test]
+fn a_late_modify_bearer_response_does_not_overwrite_newer_state() {
+    let (ctx, enb_id) = setup();
+    let (enb_ue_id, _, mme, enb, ids) = ue_with_bearers(&ctx, enb_id);
+    let pending = crate::gtp_path::PendingErabModification {
+        enb_id,
+        confirm: crate::s1ap_gen::ErabModificationConfirm {
+            mme_ue_s1ap_id: mme,
+            enb_ue_s1ap_id: enb,
+            modified: vec![5, 6],
+            failed: vec![],
+            to_be_released: vec![],
+        },
+        notify: vec![],
+        mme_ue_id: ctx.bearer_find_by_id(ids[0]).unwrap().mme_ue_id,
+        switched: [5u8, 6]
+            .into_iter()
+            .map(|ebi| crate::gtp_path::SwitchedBearer {
+                ebi,
+                teid: 0x7700 + u32::from(ebi),
+                ip: crate::context::IpAddr {
+                    ipv4: Some([10, 0, 0, 77]),
+                    ..Default::default()
+                },
+            })
+            .collect(),
+    };
+    let accepted = crate::s11_handler::ModifyBearerResponseData {
+        cause: 16,
+        bearer_contexts: [5u8, 6]
+            .into_iter()
+            .map(|ebi| crate::s11_handler::BearerContextModified {
+                ebi,
+                cause: Some(16),
+            })
+            .collect(),
+        ..Default::default()
+    };
+    // E-RAB 6 was released by the eNB while the request was pending.
+    {
+        let mut pool = ctx.bearer_pool.write().unwrap();
+        let b = pool.get_mut(&ids[1]).unwrap();
+        b.released_by_enb = true;
+        b.enb_s1u_teid = 0;
+    }
+    let send =
+        crate::s1ap_handler::erab_modification_confirm(&ctx, pending.clone(), &accepted).unwrap();
+    let (modified, failed) = confirm_lists(&send.pdu);
+    assert_eq!(modified, vec![5]);
+    assert_eq!(failed.iter().map(|f| f.0).collect::<Vec<_>>(), vec![6]);
+    assert_eq!(
+        ctx.bearer_find_by_id(ids[1]).unwrap().enb_s1u_teid,
+        0,
+        "not revived"
+    );
+    assert_eq!(ctx.bearer_find_by_id(ids[0]).unwrap().enb_s1u_teid, 0x7705);
+
+    // The UE moved to another S1 connection (an X2 path switch completed): the
+    // late answer writes nothing and confirms nothing.
+    ctx.bearer_pool
+        .write()
+        .unwrap()
+        .get_mut(&ids[0])
+        .unwrap()
+        .enb_s1u_teid = 0x9905;
+    ctx.enb_ue_pool
+        .write()
+        .unwrap()
+        .get_mut(&enb_ue_id)
+        .unwrap()
+        .enb_ue_s1ap_id = enb + 1;
+    assert!(crate::s1ap_handler::erab_modification_confirm(&ctx, pending, &accepted).is_none());
+    assert_eq!(
+        ctx.bearer_find_by_id(ids[0]).unwrap().enb_s1u_teid,
+        0x9905,
+        "the newer endpoint stays"
+    );
+}
+
+/// #852 review, TS 36.413 §8.2.4.4: an E-RAB MODIFICATION INDICATION naming an
+/// E-RAB ID twice, or leaving out an E-RAB of the UE context, triggers the UE
+/// Context Release procedure (cause multiple-E-RAB-ID-instances, resp.
+/// unspecified); nothing is switched.
+#[test]
+fn an_abnormal_erab_modification_indication_releases_the_ue_context() {
+    let _guard = crate::gtp_path::lock_s11();
+    for (erabs, cause) in [
+        (&[(5u8, 0x5151u32), (6, 0x6161), (5, 0x5252)][..], 31u8),
+        (&[(5u8, 0x5151u32)][..], 0),
+    ] {
+        let (ctx, enb_id) = setup();
+        let (_, _, mme, enb, ids) = ue_with_bearers(&ctx, enb_id);
+        let out = handle_s1ap_message(
+            &ctx,
+            enb_id,
+            &erab_modification_indication(mme, enb, Some(erabs)),
+        );
+        assert_eq!(out.len(), 1, "{erabs:?}");
+        let Ok(g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+            value: g::InitiatingMessageValue::Id_UEContextRelease(cmd),
+            ..
+        })) = nextgcore_s1ap_gen::decode(&out[0].pdu)
+        else {
+            panic!("UE CONTEXT RELEASE COMMAND expected for {erabs:?}");
+        };
+        let got = cmd.protocol_i_es.0.iter().find_map(|ie| match &ie.value {
+            g::UEContextReleaseCommandProtocolIEs_EntryValue::Id_Cause(g::Cause::RadioNetwork(
+                c,
+            )) => Some(c.0),
+            _ => None,
+        });
+        assert_eq!(got, Some(cause), "{erabs:?}");
+        assert_eq!(
+            ctx.bearer_find_by_id(ids[0]).unwrap().enb_s1u_teid,
+            0x205,
+            "nothing switched"
+        );
+    }
 }
 
 #[test]
