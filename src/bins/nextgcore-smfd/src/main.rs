@@ -5863,7 +5863,10 @@ async fn graceful_shutdown(
         // retention request keeps every session of the association, so left alone
         // they would be orphaned in the PGW-U while the SGW, MME and UE kept
         // believing in them.
-        let (deleted, told) = shutdown_epc_pdn_connections().await;
+        let (deleted, told) = shutdown_epc_pdn_connections(
+            tokio::time::Instant::now() + left().saturating_sub(SHUTDOWN_GTP_DRAIN),
+        )
+        .await;
         if deleted + told > 0 {
             log::warn!(
                 "Shutdown: {told} EPC PDN connection(s) deleted toward the SGW, {deleted} \
@@ -5915,10 +5918,11 @@ fn refuse_create_while_shutting_down(shutting_down: bool) -> Option<SbiResponse>
 /// Delete every EPC PDN connection on a shutdown that keeps the N4 association
 /// (#718 review M4). Returns `(PFCP sessions deleted at the PGW-U, PDN connections
 /// deleted toward the SGW)`.
-async fn shutdown_epc_pdn_connections() -> (usize, usize) {
+async fn shutdown_epc_pdn_connections(deadline: tokio::time::Instant) -> (usize, usize) {
     shutdown_epc_pdn_connections_via(
         gtp_path::s5s8_server().map(|s| s.as_ref()),
         gtp_path::GTPC_PORT,
+        deadline,
     )
     .await
 }
@@ -5939,6 +5943,7 @@ const SHUTDOWN_EPC_FANOUT: usize = 16;
 async fn shutdown_epc_pdn_connections_via(
     server: Option<&gtp_path::S5S8Server>,
     sgw_port: u16,
+    deadline: tokio::time::Instant,
 ) -> (usize, usize) {
     let epc: Vec<(u64, u64)> = smf_self()
         .read()
@@ -5956,11 +5961,23 @@ async fn shutdown_epc_pdn_connections_via(
         }
         None => 0,
     };
+    // #941 round 2, M1: the PGW-U deletions are bounded by `deadline` too. With a dead
+    // PGW-U each one waits out T1 x (N1+1) = 12 s, so 64 sessions at 16 in flight took
+    // about 51 s, past the SIGKILL. What is not deleted by then the next incarnation's
+    // association handles.
+    let total = epc.len();
     let permits = Arc::new(tokio::sync::Semaphore::new(SHUTDOWN_EPC_FANOUT));
     let mut deletions = tokio::task::JoinSet::new();
+    let mut out_of_time = false;
     for (smf_n4_seid, upf_seid) in epc {
-        let Ok(permit) = permits.clone().acquire_owned().await else {
-            break;
+        let permit = match tokio::time::timeout_at(deadline, permits.clone().acquire_owned()).await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => break,
+            Err(_) => {
+                out_of_time = true;
+                break;
+            }
         };
         deletions.spawn(async move {
             let _permit = permit;
@@ -5977,10 +5994,23 @@ async fn shutdown_epc_pdn_connections_via(
         });
     }
     let mut deleted = 0;
-    while let Some(done) = deletions.join_next().await {
-        if matches!(done, Ok(true)) {
-            deleted += 1;
+    while !out_of_time {
+        match tokio::time::timeout_at(deadline, deletions.join_next()).await {
+            Ok(Some(done)) => {
+                if matches!(done, Ok(true)) {
+                    deleted += 1;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => out_of_time = true,
         }
+    }
+    if out_of_time {
+        deletions.abort_all();
+        log::warn!(
+            "Shutdown: out of time with {deleted}/{total} EPC PFCP session(s) deleted at the \
+             PGW-U"
+        );
     }
     (deleted, told)
 }
@@ -5993,11 +6023,40 @@ const SHUTDOWN_BUDGET_DEFAULT: std::time::Duration = std::time::Duration::from_s
 
 /// The shutdown budget in force: `SMF_SHUTDOWN_BUDGET_SECS`, else the default.
 fn shutdown_budget() -> std::time::Duration {
-    std::env::var("SMF_SHUTDOWN_BUDGET_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .map(std::time::Duration::from_secs)
-        .unwrap_or(SHUTDOWN_BUDGET_DEFAULT)
+    parse_shutdown_budget(std::env::var("SMF_SHUTDOWN_BUDGET_SECS").ok().as_deref())
+}
+
+/// The bounds of `SMF_SHUTDOWN_BUDGET_SECS` (#941 round 2, M2). Below the minimum no
+/// UE would be told anything (the Association Release and the S5/S8 drain reserve
+/// 24 s, and NFDeregister 3 s); above the maximum the deadline arithmetic is not
+/// meaningful for any grace period a pod gets.
+const SHUTDOWN_BUDGET_MIN: std::time::Duration = std::time::Duration::from_secs(30);
+const SHUTDOWN_BUDGET_MAX: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Parse and clamp `SMF_SHUTDOWN_BUDGET_SECS`, warning on a value it does not take as
+/// given. Unset or empty: the default.
+fn parse_shutdown_budget(value: Option<&str>) -> std::time::Duration {
+    let Some(raw) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return SHUTDOWN_BUDGET_DEFAULT;
+    };
+    let Ok(secs) = raw.parse::<u64>() else {
+        log::warn!(
+            "SMF_SHUTDOWN_BUDGET_SECS={raw:?} is not a number of seconds; using {:?}",
+            SHUTDOWN_BUDGET_DEFAULT
+        );
+        return SHUTDOWN_BUDGET_DEFAULT;
+    };
+    let asked = std::time::Duration::from_secs(secs.min(SHUTDOWN_BUDGET_MAX.as_secs() + 1));
+    let budget = asked.clamp(SHUTDOWN_BUDGET_MIN, SHUTDOWN_BUDGET_MAX);
+    if budget != asked {
+        log::warn!(
+            "SMF_SHUTDOWN_BUDGET_SECS={secs} is outside {:?}..={:?}; using {budget:?}. Set it \
+             a little under the pod's termination grace period",
+            SHUTDOWN_BUDGET_MIN,
+            SHUTDOWN_BUDGET_MAX
+        );
+    }
+    budget
 }
 
 /// At most this long for NFDeregister (#941 review M2).
@@ -7877,7 +7936,12 @@ mod tests {
             }
             (first, n)
         });
-        let (deleted, told) = shutdown_epc_pdn_connections_via(Some(&server), sgw_port).await;
+        let (deleted, told) = shutdown_epc_pdn_connections_via(
+            Some(&server),
+            sgw_port,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .await;
         let took = started.elapsed();
         let (sgw_first, dbrs) = sgw_task.await.unwrap();
         let pfcp_first = arrivals.lock().unwrap().first().copied();
@@ -8024,6 +8088,83 @@ mod tests {
         assert_eq!(released, 1);
     }
 
+    /// #941 round 2, M2: `SMF_SHUTDOWN_BUDGET_SECS` is clamped, never trusted as is: 0
+    /// would tell no UE anything, and u64::MAX overflowed the deadline arithmetic.
+    #[test]
+    fn the_shutdown_budget_is_validated() {
+        let s = std::time::Duration::from_secs;
+        assert_eq!(parse_shutdown_budget(None), SHUTDOWN_BUDGET_DEFAULT);
+        assert_eq!(parse_shutdown_budget(Some("  ")), SHUTDOWN_BUDGET_DEFAULT);
+        assert_eq!(parse_shutdown_budget(Some("abc")), SHUTDOWN_BUDGET_DEFAULT);
+        assert_eq!(parse_shutdown_budget(Some("88")), s(88));
+        assert_eq!(parse_shutdown_budget(Some("0")), SHUTDOWN_BUDGET_MIN);
+        assert_eq!(
+            parse_shutdown_budget(Some("18446744073709551615")),
+            SHUTDOWN_BUDGET_MAX
+        );
+        // And the deadline built from the maximum does not overflow.
+        let _ = tokio::time::Instant::now() + parse_shutdown_budget(Some("18446744073709551615"));
+    }
+
+    /// #941 round 2, M3: on the durable path the EPC PFCP deletions are bounded by the
+    /// deadline. A PGW-U that never answers holds each deletion for T1 x (N1+1); with
+    /// 20 EPC sessions (more than the 16 in flight) and 0.5 s left, the shutdown
+    /// still returns at once.
+    #[tokio::test]
+    async fn the_epc_shutdown_keeps_its_deadline_with_a_dead_pgw_u() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        smf_context_init(64, 256, 512);
+        // A PGW-U that reads and never answers.
+        let dead = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        let sink = tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            while dead.recv_from(&mut buf).await.is_ok() {}
+        });
+        let (client, listener) = client_behind_the_real_listener(dead_addr).await;
+        let mut ids = Vec::new();
+        if let Ok(ctx) = smf_self().read() {
+            for sess in ctx.sess_find_all_by(|s| s.epc) {
+                ctx.sess_remove(sess.id);
+            }
+            for i in 0..20u64 {
+                let imsi = format!("0010100000941{i:02}");
+                let ue = ctx.ue_add_by_imsi(imsi.as_bytes()).expect("ue");
+                let mut sess = ctx.sess_add_by_apn(ue.id, "internet", 6).expect("sess");
+                sess.upf_n4_seid = 0x9410 + i;
+                ctx.sess_update(&sess);
+                pfcp_path::record_session_peer(sess.smf_n4_seid, client.peer());
+                ids.push((sess.id, sess.smf_n4_seid));
+            }
+        }
+        let deadline = tokio::time::Instant::now()
+            + SHUTDOWN_GTP_DRAIN
+            + std::time::Duration::from_millis(500);
+        let started = std::time::Instant::now();
+        graceful_shutdown(
+            async {},
+            std::slice::from_ref(&client),
+            false,
+            listener,
+            deadline,
+        )
+        .await;
+        let took = started.elapsed();
+        sink.abort();
+        if let Ok(ctx) = smf_self().read() {
+            for (id, seid) in &ids {
+                ctx.sess_remove(*id);
+                pfcp_path::forget_session_peer(*seid);
+            }
+        }
+        pfcp_path::clear_global_upf_for_test();
+        assert!(
+            took < std::time::Duration::from_secs(3),
+            "bounded: {took:?}"
+        );
+    }
+
     /// #718 review M4: a shutdown that keeps the N4 association for durable state
     /// still deletes every EPC PFCP session at the PGW-U. EPC PDN connections are not
     /// in the snapshot, so the next incarnation could not ask for them, and its
@@ -8047,7 +8188,10 @@ mod tests {
             ctx.sess_update(&sess);
             sess.id
         };
-        let (deleted, _told) = shutdown_epc_pdn_connections().await;
+        let (deleted, _told) = shutdown_epc_pdn_connections(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .await;
         let seen = upf.seen();
         if let Ok(ctx) = smf_self().read() {
             ctx.sess_remove(sess_id);

@@ -118,6 +118,10 @@ spec:
               value: info
             - name: RUST_BACKTRACE
               value: "1"
+            # The shutdown's own deadline: terminationGracePeriodSeconds (45) less 2 s
+            # for the exit (#941). Keep the two in step.
+            - name: SMF_SHUTDOWN_BUDGET_SECS
+              value: "43"
             - name: SMF_PFCP_ADDR
               value: "0.0.0.0"
             # #797: the PFCP Node ID identifies this CP function (TS 29.244

@@ -154,6 +154,9 @@ amf:
 smf:
   enabled: true
   replicas: 1
+  # A graceful SMF shutdown tells every UE (#39) and every SGW and releases each UPF
+  # association; SMF_SHUTDOWN_BUDGET_SECS is derived from this (less 2 s).
+  terminationGracePeriodSeconds: 45
   image:
     repository: nextgcore-rust/smf
     tag: latest

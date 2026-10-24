@@ -294,6 +294,8 @@ services:
       UPF_PFCP_ADDR: 172.23.0.7
       UPF_PFCP_PORT: "8805"
       SMF_PFCP_ADDR: 172.23.0.4
+      # The shutdown's own deadline: stop_grace_period (45 s) less 2 s (#941).
+      SMF_SHUTDOWN_BUDGET_SECS: "43"
       # Issue #204: the SMF resolves the SUBSCRIBED DEFAULT DNN from
       # Nudm_SDM_Get(smf-select-data) when SmContextCreateData carries no `dnn`.
       # NRF discovery is tried first; this is the fallback for a deployment with no

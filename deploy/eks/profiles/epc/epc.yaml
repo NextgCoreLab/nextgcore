@@ -440,6 +440,9 @@ spec:
         # restarting the PGW-C. The PFCP Node ID is the PGW-C's Service FQDN
         # (#797): the pod IP it binds changes on every restart, and a new Node ID
         # looks like a different CP function to the PGW-U (TS 29.244 §5.8.1).
+        # The shutdown's own deadline: terminationGracePeriodSeconds (45) less 2 s.
+        - name: SMF_SHUTDOWN_BUDGET_SECS
+          value: '43'
         - name: EPC_EXPORT
           value: SMF_PFCP_ADDR=self SMF_PFCP_NODE_ID=dns:pgwc UPF_PFCP_ADDR=dns:pgwu
         - name: EPC_UNTRACKED

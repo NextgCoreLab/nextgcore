@@ -207,6 +207,8 @@ services:
       # The N4/Sxb peer. `smfd` reads these from the environment rather than
       # from YAML (see `main.rs`), so they belong here and not in pgwc.yaml.
       SMF_PFCP_ADDR: 172.24.0.4
+      # The shutdown's own deadline: stop_grace_period (45 s) less 2 s (#941).
+      SMF_SHUTDOWN_BUDGET_SECS: "43"
       UPF_PFCP_ADDR: 172.24.0.7
       UPF_PFCP_PORT: "8805"
       # This deployment has no NRF and serves cleartext, so the PRODUCTION SBI

@@ -36,7 +36,7 @@ spec:
       # #718: a graceful SMF shutdown releases each UPF association (up to
       # T1 x (N1+1) = 12 s when a UPF is gone), sends every UE #39 and keeps
       # retransmitting its S5/S8 Delete Bearer Requests for up to 12 s.
-      terminationGracePeriodSeconds: 45
+      terminationGracePeriodSeconds: {{ .Values.smf.terminationGracePeriodSeconds }}
       initContainers:
         {{- include "nextgcore.advertiseInit" (dict "nf" "smf") | nindent 8 }}
         {{- include "nextgcore.waitForNrf" . | nindent 8 }}
@@ -72,6 +72,9 @@ spec:
               value: {{ .Values.global.logLevel }}
             - name: RUST_BACKTRACE
               value: "1"
+            # The shutdown's own deadline, derived from the grace period (#941).
+            - name: SMF_SHUTDOWN_BUDGET_SECS
+              value: "{{ sub (int .Values.smf.terminationGracePeriodSeconds) 2 }}"
             - name: SMF_PFCP_ADDR
               value: "0.0.0.0"
             # #797: the PFCP Node ID identifies this CP function (TS 29.244
