@@ -94,7 +94,35 @@ pub fn epoch_to_rfc3339_signed(epoch: i64) -> String {
 /// requires the colon), but the shared parser already accepted `+0000` and
 /// `eesd`'s parser accepts `±HHMM` generally. Accepting both spellings uniformly
 /// is easier to explain than accepting `+0000` while refusing `+0200`.
+/// A field of exactly `n` ASCII digits (RFC 3339 §5.6 `2DIGIT` / `4DIGIT`).
+/// No sign and no other width, so no field can be negative or large enough to
+/// overflow the seconds arithmetic (#856 review).
+fn digits(s: &str, n: usize) -> Option<i64> {
+    if s.len() == n && s.bytes().all(|b| b.is_ascii_digit()) {
+        s.parse().ok()
+    } else {
+        None
+    }
+}
+
+/// Days in `month` of `year` (proleptic Gregorian), for RFC 3339 §5.7's
+/// "date-mday ... based on month/year".
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        2 if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
 fn split_zone(rest: &str) -> Option<(&str, i64)> {
+    // RFC 3339 is ASCII. The byte-offset `split_at` and slices below would panic
+    // if a cut landed inside a multi-byte character, and the text comes from a
+    // peer's JSON.
+    if !rest.is_ascii() {
+        return None;
+    }
     if let Some(time) = rest.strip_suffix('Z').or_else(|| rest.strip_suffix('z')) {
         return Some((time, 0));
     }
@@ -119,13 +147,11 @@ fn split_zone(rest: &str) -> Option<(&str, i64)> {
         } else {
             (&zone[1..3], &zone[3..5])
         };
-        let hours: i64 = match hh.parse() {
-            Ok(v) => v,
-            Err(_) => continue,
+        let Some(hours) = digits(hh, 2) else {
+            continue;
         };
-        let minutes: i64 = match mm.parse() {
-            Ok(v) => v,
-            Err(_) => continue,
+        let Some(minutes) = digits(mm, 2) else {
+            continue;
         };
         if hours > 23 || minutes > 59 {
             return None;
@@ -168,23 +194,41 @@ fn split_zone(rest: &str) -> Option<(&str, i64)> {
 /// fields.
 pub fn rfc3339_to_epoch_signed(text: &str) -> Option<i64> {
     let t = text.trim();
-    let (date, rest) = t.split_once('T').or_else(|| t.split_once(' '))?;
+    // RFC 3339 §5.6 NOTE: "T" and "Z" may be lower case; a space separator is
+    // also allowed there "for the sake of readability".
+    let (date, rest) = t.split_once(['T', 't']).or_else(|| t.split_once(' '))?;
+    // Every field is fixed-width ASCII digits (RFC 3339 §5.6): no sign, no
+    // other width. That keeps every value small, so the day and second
+    // arithmetic below cannot overflow: an 18-digit year or a
+    // `-9223372036854775808` hour from a peer used to (a panic with overflow
+    // checks, a wrapped instant without), and `+2024` or `T-1:00:00` were
+    // accepted (#856 review).
     let mut parts = date.split('-');
-    let year: i64 = parts.next()?.parse().ok()?;
-    let month: i64 = parts.next()?.parse().ok()?;
-    let day: i64 = parts.next()?.parse().ok()?;
-    if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    let year = digits(parts.next()?, 4)?;
+    let month = digits(parts.next()?, 2)?;
+    let day = digits(parts.next()?, 2)?;
+    if parts.next().is_some() || !(1..=12).contains(&month) {
+        return None;
+    }
+    // §5.7: the day must exist in that month, so 2024-02-31 is refused rather
+    // than silently becoming 2 March.
+    if !(1..=days_in_month(year, month)).contains(&day) {
         return None;
     }
 
     let (time, offset_secs) = split_zone(rest)?;
-    // Drop any fractional seconds.
-    let time = time.split('.').next()?;
+    // Fractional seconds: digits only, and dropped.
+    let (time, frac) = time.split_once('.').unwrap_or((time, "0"));
+    if frac.is_empty() || !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
 
     let mut tparts = time.split(':');
-    let hour: i64 = tparts.next()?.parse().ok()?;
-    let minute: i64 = tparts.next()?.parse().ok()?;
-    let second: i64 = tparts.next().unwrap_or("0").parse().ok()?;
+    let hour = digits(tparts.next()?, 2)?;
+    let minute = digits(tparts.next()?, 2)?;
+    // RFC 3339 `partial-time` requires seconds (`time-hour ":" time-minute ":"
+    // time-second`), so `hh:mm` is refused.
+    let second = digits(tparts.next()?, 2)?;
     if tparts.next().is_some() || hour > 23 || minute > 59 || second > 60 {
         return None;
     }
@@ -221,6 +265,60 @@ pub fn now_epoch_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hostile_date_times_are_refused_without_panicking() {
+        // A peer's TS 29.571 DateTime: a multi-byte character where the zone
+        // split cuts used to panic `split_at`, and an oversized year overflowed
+        // the seconds arithmetic.
+        for bad in [
+            "2024-01-01T0\u{e9}00000",
+            "2024-01-01T00:00:0\u{e9}0",
+            "2024-01-01T\u{e9}\u{e9}\u{e9}",
+            "999999999999999-01-01T00:00:00Z",
+            "-1-01-01T00:00:00Z",
+            "10000-01-01T00:00:00Z",
+            // #856 review: signed or over-wide H/M/S, a signed year, a doubly
+            // signed zone, and dates that do not exist.
+            "2024-01-01T-9223372036854775808:00:00Z",
+            "2024-01-01T00:-9223372036854775808:00Z",
+            "2024-01-01T00:00:-9223372036854775808Z",
+            "2024-01-01T-1:00:00Z",
+            "2024-01-01T00:00:00-+1:00",
+            "+2024-01-01T00:00:00Z",
+            "2024-1-01T00:00:00Z",
+            "2024-01-01T0:00:00Z",
+            "2024-02-31T00:00:00Z",
+            "2023-02-29T00:00:00Z",
+            "2024-04-31T00:00:00Z",
+            "2024-01-01T00:00:00.Z",
+            "2024-01-01T12:00Z",
+            "2024-01-01T00:00:00.1aZ",
+        ] {
+            assert_eq!(rfc3339_to_epoch_signed(bad), None, "{bad:?}");
+            assert_eq!(rfc3339_to_epoch(bad), None, "{bad:?}");
+        }
+        // The edges of the 4-digit range still parse.
+        assert!(rfc3339_to_epoch_signed("0000-01-01T00:00:00Z").is_some());
+        assert!(rfc3339_to_epoch_signed("9999-12-31T23:59:59+01:00").is_some());
+        assert!(
+            rfc3339_to_epoch_signed("2024-02-29T00:00:00Z").is_some(),
+            "leap day"
+        );
+        assert_eq!(
+            rfc3339_to_epoch_signed("2024-01-01t00:00:00z"),
+            rfc3339_to_epoch_signed("2024-01-01T00:00:00Z"),
+            "lower-case t and z (RFC 3339 §5.6 NOTE)"
+        );
+        assert!(
+            rfc3339_to_epoch_signed("2000-02-29T00:00:00Z").is_some(),
+            "400-year leap"
+        );
+        assert!(
+            rfc3339_to_epoch_signed("1900-02-29T00:00:00Z").is_none(),
+            "100-year non-leap"
+        );
+    }
 
     #[test]
     fn known_instants_round_trip() {

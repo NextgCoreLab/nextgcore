@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-c2411517.js";
+            window.path_to_searchindex_js = "../searchindex-df495bb2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -563,6 +563,13 @@ can be disabled, restoring the pre-Wave-6 byte flow. The AMF serves the
 <code>dereg-notify</code>, <code>ue-policy-notify</code>, <code>sm-context-status</code> and <code>ucmf-notify</code>
 callbacks (<code>namf_server.rs</code>), but not the <code>am-policy-notify</code> URI it hands the
 PCF in <code>Npcf_AMPolicyControl_Create</code>.</li>
+<li><strong>UECM identity is the NF instance id.</strong> The AMF registers with the UDM
+(<code>Nudm_UECM_Registration</code>) under its <code>nfInstanceId</code>. Pin it with
+<code>NEXTGCORE_AMF_INSTANCE_ID</code>, as the Helm chart, the k8s manifest and compose
+do: a restarted AMF is then the same AMF to the UDM. Each registration’s
+<code>deregCallbackUri</code> ends in a per-registration token. A dereg-notify naming
+any other token concerns a registration the AMF no longer holds, so it is
+answered 204 and tears nothing down (#753).</li>
 <li><strong>Config loading is lenient.</strong> An unreadable/unparsable <code>amf.yaml</code> logs a
 warning and continues with built-in defaults (<code>load_config</code> in
 <code>lib.rs</code>) — a running AMF is not proof your config was applied. See the

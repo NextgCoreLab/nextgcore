@@ -2444,6 +2444,113 @@ mod tests {
         );
     }
 
+    /// #871 review: Update FAR leaving BUFF, end to end over the Sxa socket. A buffering
+    /// downlink FAR switched to FORW is accepted, forwards, and its buffer is emptied
+    /// with no flush left running; switched back to BUFF and then to DROP, the buffer
+    /// is discarded rather than kept until the session goes.
+    #[tokio::test]
+    async fn an_update_far_leaving_buff_over_the_wire_empties_the_buffer() {
+        let (_guard, node, peer) = node_and_peer().await;
+        let mut assoc = BytesMut::new();
+        PfcpLibMessage::AssociationSetupRequest(AssociationSetupRequest::new(
+            NodeId::new_ipv4([127, 0, 0, 9]),
+            3000,
+        ))
+        .encode_body(&mut assoc);
+        deliver(
+            &node,
+            &peer,
+            &wire(pfcp_msg_type::ASSOCIATION_SETUP_REQUEST, None, 1, &assoc),
+        )
+        .await;
+        let _ = recv_decoded(&peer).await;
+
+        let cp_seid = 0x0000_0000_0000_0871u64;
+        let mut req = LibSessionEstablishmentRequest::new(
+            NodeId::new_ipv4([127, 0, 0, 9]),
+            LibFSeid::new_ipv4(cp_seid, [127, 0, 0, 9]),
+        );
+        let mut pdi = Pdi::new(SourceInterface::Core);
+        let mut f_teid = FTeid::new_ipv4(0, [127, 0, 0, 1]);
+        f_teid.ch = true;
+        pdi.local_f_teid = Some(f_teid);
+        let mut pdr = CreatePdr::new(1, 100, pdi);
+        pdr.far_id = Some(1);
+        req.create_pdrs.push(pdr);
+        let mut far = CreateFar::new(1, ApplyAction::buffer());
+        far.forwarding_parameters = Some(ForwardingParameters::new(DestinationInterface::Access));
+        req.create_fars.push(far);
+        let mut body = BytesMut::new();
+        req.encode(&mut body);
+        deliver(
+            &node,
+            &peer,
+            &wire(
+                pfcp_msg_type::SESSION_ESTABLISHMENT_REQUEST,
+                Some(0),
+                2,
+                &body,
+            ),
+        )
+        .await;
+        let _ = recv_decoded(&peer).await;
+        let ctx = sgwu_self();
+        let sess = ctx
+            .sess_find_by_sgwc_sxa_seid(cp_seid)
+            .expect("established");
+        let buff = crate::context::apply_action::BUFF;
+        assert_eq!(ctx.far_find(sess.id, 1).unwrap().apply_action & buff, buff);
+
+        let update = |seq: u32, action: ApplyAction| {
+            let mut m = LibSessionModificationRequest::new();
+            let mut u = nextgcore_pfcp::types::UpdateFar::new(1);
+            u.apply_action = Some(action);
+            m.update_fars.push(u);
+            let mut b = BytesMut::new();
+            m.encode(&mut b);
+            wire(
+                pfcp_msg_type::SESSION_MODIFICATION_REQUEST,
+                Some(sess.sgwu_sxa_seid),
+                seq,
+                &b,
+            )
+        };
+
+        // BUFF -> FORW: accepted, forwarding, buffer emptied, no flush left running.
+        ctx.far_buffer_packet(sess.id, 1, b"buffered".to_vec(), 8);
+        deliver(&node, &peer, &update(3, ApplyAction::forward())).await;
+        let (_, resp) = recv_decoded(&peer).await;
+        assert_eq!(
+            find_cause(&resp),
+            Some(sxa_build::pfcp_cause::REQUEST_ACCEPTED)
+        );
+        let far = ctx.far_find(sess.id, 1).unwrap();
+        assert_ne!(far.apply_action & crate::context::apply_action::FORW, 0);
+        assert!(
+            far.buffered.is_empty() && !far.flushing,
+            "flushed (or dropped), not left"
+        );
+
+        // Back to BUFF, buffer, then BUFF -> DROP: the buffer is discarded.
+        deliver(&node, &peer, &update(4, ApplyAction::buffer())).await;
+        let _ = recv_decoded(&peer).await;
+        ctx.far_buffer_packet(sess.id, 1, b"doomed".to_vec(), 8);
+        assert_eq!(ctx.far_find(sess.id, 1).unwrap().buffered.len(), 1);
+        let mut drop = ApplyAction::default();
+        drop.drop = true;
+        deliver(&node, &peer, &update(5, drop)).await;
+        let (_, resp) = recv_decoded(&peer).await;
+        assert_eq!(
+            find_cause(&resp),
+            Some(sxa_build::pfcp_cause::REQUEST_ACCEPTED)
+        );
+        assert!(
+            ctx.far_find(sess.id, 1).unwrap().buffered.is_empty(),
+            "BUFF -> DROP discards the buffer"
+        );
+        ctx.sess_remove(sess.id);
+    }
+
     /// #304: an Update QER closing a gate and a Remove URR arrive OVER THE WIRE and
     /// reach the rule store.
     ///
@@ -2987,10 +3094,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_failed_gtpu_path_is_reported_once_over_the_wire() {
         let (_guard, node, peer) = node_and_peer().await;
+        // #827 (after SXA_TEST_LOCK, the documented order): this test writes the
+        // process-global GTP-U path table.
+        let _paths = crate::gtp_path::GTPU_PATH_TEST_LOCK.lock().await;
         let _shutdown = associate_and_run(&node, &peer).await;
 
         let failed = IpAddr::V4(Ipv4Addr::new(10, 217, 0, 1));
         crate::gtp_path::forget_gtpu_path(failed);
+        let _forget = crate::gtp_path::ForgetPathOnDrop(failed);
 
         // Four unanswered Echoes EXCEED the default N3-REQUESTS of 3, which is the
         // transition (TS 23.007 §20.3.1).
@@ -3033,10 +3144,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_recovered_gtpu_path_is_reported_with_uprr() {
         let (_guard, node, peer) = node_and_peer().await;
+        // #827 (after SXA_TEST_LOCK, the documented order): this test writes the
+        // process-global GTP-U path table.
+        let _paths = crate::gtp_path::GTPU_PATH_TEST_LOCK.lock().await;
         let _shutdown = associate_and_run(&node, &peer).await;
 
         let path = IpAddr::V4(Ipv4Addr::new(10, 217, 0, 2));
         crate::gtp_path::forget_gtpu_path(path);
+        let _forget = crate::gtp_path::ForgetPathOnDrop(path);
 
         // An answered Echo on a HEALTHY path is not a transition and reports nothing.
         crate::gtp_path::note_echo_answered(path);
@@ -3078,6 +3193,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_path_failure_with_no_associated_peer_reports_to_nobody_and_says_so() {
         let (_guard, node, peer) = node_and_peer().await;
+        // #827 (after SXA_TEST_LOCK, the documented order): this test writes the
+        // process-global GTP-U path table.
+        let _paths = crate::gtp_path::GTPU_PATH_TEST_LOCK.lock().await;
         let (_tx, rx) = tokio::sync::watch::channel(false);
         let pump = node.clone();
         tokio::spawn(async move { pump.run(rx).await });
@@ -3103,6 +3221,7 @@ mod tests {
         );
 
         crate::gtp_path::forget_gtpu_path(failed);
+        let _forget = crate::gtp_path::ForgetPathOnDrop(failed);
         for _ in 0..4 {
             crate::gtp_path::note_echo_unanswered(failed);
         }
