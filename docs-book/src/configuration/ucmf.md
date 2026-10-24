@@ -44,14 +44,14 @@ Parsed by `UcmfYaml` / `UcmfSection` in `src/bins/nextgcore-ucmfd/src/main.rs`. 
 | `ucmf.limits.max_subscriptions_per_consumer` | integer | `16` | Most subscriptions per consumer. A subscription counts against its `nfId` and against its notification URI's `host:port`, and either reaching the limit refuses, so a consumer cannot sidestep it by varying the self-declared `nfId` (#843 review). |
 | `ucmf.sbi.oauth2.require` | bool | `false` | Require an OAuth2 token on the SBI. `--oauth2-require` overrides it. |
 
-`logger.level` is not read; use `-e/--log-level` or `RUST_LOG`.
+The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691).
 
 ## Command-line flags
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `-c, --config` | path | `/etc/nextgcore/ucmf.yaml` | Configuration file path. |
-| `-e, --log-level` | string | `info` | Log level; `RUST_LOG` overrides it. |
+| `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `--sbi-addr` / `--sbi-port` | string / u16 | `0.0.0.0` / `7777` | SBI bind address and port. |
 | `--tls`, `--tls-cert`, `--tls-key` | flag, path, path | off | TLS on the SBI listener. |
 | `--nrf-uri` | string | `http://127.0.0.1:7777` | NRF base URI, used when the YAML names none. |

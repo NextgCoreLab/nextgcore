@@ -91,7 +91,7 @@ From the clap `Args` struct in `src/bins/nextgcore-mmed/src/main.rs`:
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `-c, --config` | path | `/etc/nextgcore/mme.yaml` | Configuration file path. |
-| `-l, --log-level` | string | `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`); unrecognized values fall back to `info`. |
+| `-l, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `--no-color` | flag | off | Disable colored output. |
 | `-d, --daemon` | flag | off | Daemon mode. |
 

@@ -73,7 +73,7 @@ Neither file is mounted by any compose file. The shipped `docker-compose.yml` ru
 
 Everything in the shipped example YAML is inert. The functional equivalents, where they exist, are CLI flags:
 
-- **`logger.level` / `logger.file.path`** — inert. Log level comes only from `-e/--log-level` (default `info`); there is no working log-file output (`--log-file` is declared in the `Args` struct but never referenced again).
+- **`logger.level` is read; `logger.file.path` is inert.** The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691). There is no working log-file output (`--log-file` is declared in the `Args` struct but never referenced again).
 - **`sepp.sbi.server[]` (address/port)** — inert. The consumer SBI bind comes from `--sbi-addr`/`--sbi-port`.
 - **`sepp.n32.server[]` (sender/scheme/address/port/n32f)** — inert. Use `--n32-addr`/`--n32-port` (single listener; the separate n32f port in the YAML has no equivalent — N32-c and N32-f share one listener) and `--sender` for the FQDN.
 - **`sepp.n32.client.sepp[]` (receiver/uri/resolve)** — inert. Peers come from repeatable `--peer-sepp fqdn=apiroot` flags; there is no `resolve` (DNS-override) equivalent.
@@ -88,7 +88,7 @@ From the clap `Args` struct in `src/bins/nextgcore-seppd/src/main.rs`:
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `-c, --config` | path | `/etc/nextgcore/sepp.yaml` | Configuration file path (read but not parsed — see above). |
-| `-e, --log-level` | string | `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`); unrecognized values fall back to `info`. |
+| `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-l, --log-file` | path | unset | Declared but **never used** — no file logging is wired up. |
 | `-m, --no-color` | flag | off | Disable color output. |
 | `-k, --kill` | flag | off | Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor. |

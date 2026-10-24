@@ -189,7 +189,7 @@ Common ones:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `GRAFANA_ADMIN_PASSWORD` | Grafana `admin` password. **Required**: `docker compose` refuses to start without it (#837); put `GRAFANA_ADMIN_PASSWORD=...` in `docker/rust/.env` (gitignored) | none |
-| `RUST_LOG` | Log filter for every NF (env_logger syntax, e.g. `info,nextgcore_amfd=debug`). When set and not blank it replaces the NF's `--log-level` entirely; unset, `--log-level` applies to all targets (#691) | `info` |
+| `RUST_LOG` | Log filter for every NF (env_logger syntax, e.g. `info,nextgcore_amfd=debug`). When set and not blank it replaces the NF's level entirely; unset, the level is `--log-level`, else the config's `logger.level`, else `info`, for all targets (#691) | `info` |
 | `NEXTGCORE_SBI_PROFILE` | SBI security profile for amf/smf/ausf/udm; the compose files set `dev` (h2c, no mTLS) | `production` when unset |
 | `NEXTGCORE_SBI_OAUTH2_REQUIRE` | Force OAuth2 enforcement on an NF's SBI server (the `oauth2` overlay sets it) | unset |
 
