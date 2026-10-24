@@ -250,13 +250,12 @@ async fn assigning_ucmf() -> (
 }
 
 /// Points the AMF's UCMF calls at `port` while held.
-struct UcmfEnvGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+struct UcmfEnvGuard(#[allow(dead_code)] tokio::sync::MutexGuard<'static, ()>);
 
 impl UcmfEnvGuard {
-    fn set(port: u16) -> Self {
-        let guard = crate::test_support::UCMF_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+    /// Async: the lock is a tokio mutex (#643), held across the test's awaits.
+    async fn acquire(port: u16) -> Self {
+        let guard = crate::test_support::UCMF_ENV_LOCK.lock().await;
         std::env::set_var("UCMF_SBI_ADDR", "127.0.0.1");
         std::env::set_var("UCMF_SBI_PORT", port.to_string());
         Self(guard)
@@ -307,7 +306,7 @@ async fn reassign(server: &mut NgapServer) {
 async fn a_new_version_id_reassigns_the_id_by_a_configuration_update() {
     let _racs = crate::racs::tests::guard();
     let (_ucmf, port, assigns) = assigning_ucmf().await;
-    let _env = UcmfEnvGuard::set(port);
+    let _env = UcmfEnvGuard::acquire(port).await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_748_001u64, 51);
     racs_ue_holding_id(&mut server, ue, ran, false);
@@ -341,7 +340,7 @@ async fn a_new_version_id_reassigns_the_id_by_a_configuration_update() {
 async fn a_deletion_by_tac_reassigns_a_ue_held_id() {
     let _racs = crate::racs::tests::guard();
     let (_ucmf, port, assigns) = assigning_ucmf().await;
-    let _env = UcmfEnvGuard::set(port);
+    let _env = UcmfEnvGuard::acquire(port).await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_748_002u64, 52);
     racs_ue_holding_id(&mut server, ue, ran, false);
@@ -367,7 +366,7 @@ async fn a_deletion_by_tac_reassigns_a_ue_held_id() {
 async fn a_deletion_by_another_tac_leaves_the_ue_alone() {
     let _racs = crate::racs::tests::guard();
     let (_ucmf, port, assigns) = assigning_ucmf().await;
-    let _env = UcmfEnvGuard::set(port);
+    let _env = UcmfEnvGuard::acquire(port).await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_748_003u64, 53);
     racs_ue_holding_id(&mut server, ue, ran, false);
@@ -394,7 +393,7 @@ async fn a_deletion_by_another_tac_leaves_the_ue_alone() {
 async fn an_idle_ue_gets_the_new_id_at_its_next_registration() {
     let _racs = crate::racs::tests::guard();
     let (_ucmf, port, _assigns) = assigning_ucmf().await;
-    let _env = UcmfEnvGuard::set(port);
+    let _env = UcmfEnvGuard::acquire(port).await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_748_004u64, 54);
     racs_ue_holding_id(&mut server, ue, ran, true);
@@ -429,7 +428,7 @@ async fn an_idle_ue_gets_the_new_id_at_its_next_registration() {
 async fn ues_of_one_model_share_one_assign_and_a_second_notice_adds_none() {
     let _racs = crate::racs::tests::guard();
     let (_ucmf, port, assigns) = assigning_ucmf().await;
-    let _env = UcmfEnvGuard::set(port);
+    let _env = UcmfEnvGuard::acquire(port).await;
     let mut server = capturing_ngap_server().await;
     let (a, b) = (7_748_011u64, 7_748_012u64);
     racs_ue_holding_id(&mut server, a, 61, false);
