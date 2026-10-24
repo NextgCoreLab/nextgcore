@@ -3575,7 +3575,11 @@ fn try_positioning_relay(
         // Paged. The downlinks are enqueued as usual, and the NGAP task holds them
         // while the UE is being paged, then delivers them once its Service Request
         // has connected it. A page already running (for another transfer) is not
-        // replaced: it brings the UE back just the same.
+        // replaced: it brings the UE back just the same. This differs on purpose from
+        // #749's 409 HIGHER_PRIORITY_REQUEST_ONGOING for an SM transfer during a page:
+        // that rule protects the one SM N2 the paging context holds, and these
+        // downlinks are held by the NGAP task, not in the paging context, so they
+        // can ride a page in progress.
         let paging = amf_self()
             .read()
             .ok()

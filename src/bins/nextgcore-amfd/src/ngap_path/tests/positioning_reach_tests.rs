@@ -200,3 +200,100 @@ async fn a_downlink_for_a_ue_that_went_idle_is_not_sent_to_its_old_connection() 
     );
     server.forget_ue(ue);
 }
+
+fn json_of(resp: &nextgcore_sbi::SbiResponse) -> serde_json::Value {
+    serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).unwrap_or_default()
+}
+
+/// #1087: the immediate REACHABILITY_REPORT and CONNECTIVITY_STATE_REPORT of a
+/// CM-CONNECTED UE say REACHABLE and CONNECTED (TS 29.518 §5.3.2.2.2: delivered
+/// in the subscribe response's `reportList`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connected_ues_immediate_reports_say_reachable_and_connected() {
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran, supi) = (7_108_706u64, 92, "imsi-001010010870006");
+    live_ue(&mut server, ue, ran, supi);
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    let req = nextgcore_sbi::SbiRequest::post("/namf-evts/v1/subscriptions")
+        .with_json_body(&serde_json::json!({
+            "subscription": {
+                "eventList": [
+                    { "type": "REACHABILITY_REPORT", "immediateFlag": true },
+                    { "type": "CONNECTIVITY_STATE_REPORT", "immediateFlag": true }
+                ],
+                "eventNotifyUri": "http://127.0.0.1:9/notify/1087",
+                "notifyCorrelationId": "corr-1087",
+                "nfId": "3fa85f64-5717-4562-b3fc-2c963f661087",
+                "supi": supi,
+            }
+        }))
+        .expect("json");
+    let resp = crate::namf_request_handler(req).await;
+    assert_eq!(resp.status, 201, "{}", json_of(&resp));
+    let body = json_of(&resp);
+    let reports = body["reportList"].as_array().cloned().unwrap_or_default();
+    let of = |t: &str| reports.iter().find(|r| r["type"] == t).cloned();
+    assert_eq!(
+        of("REACHABILITY_REPORT").expect("reachability report")["reachability"],
+        "REACHABLE"
+    );
+    assert_eq!(
+        of("CONNECTIVITY_STATE_REPORT").expect("connectivity report")["cmInfoList"][0]["cmState"],
+        "CONNECTED"
+    );
+    server.forget_ue(ue);
+}
+
+/// #1087: Namf_Location ProvideLocationInfo reports `ratType` NR for a UE that is
+/// attached now, and Namf_MT ProvideDomainSelectionInfo its `lastActTime`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connected_ues_location_and_domain_selection_info_say_it_is_attached() {
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran, supi) = (7_108_707u64, 93, "imsi-001010010870007");
+    live_ue(&mut server, ue, ran, supi);
+    server
+        .ue_auth_state
+        .with_mut(ue, |s| s.amf_ue.ue_location_timestamp = 1_700_000_000);
+
+    let req = nextgcore_sbi::SbiRequest::post(format!("/namf-loc/v1/{supi}/provide-loc-info"));
+    let resp = crate::namf_request_handler(req).await;
+    assert_eq!(resp.status, 200, "{}", json_of(&resp));
+    assert_eq!(json_of(&resp)["ratType"], "NR");
+
+    let req = nextgcore_sbi::SbiRequest::get(format!("/namf-mt/v1/ue-contexts/{supi}"))
+        .with_param("info-class", "TADS");
+    let resp = crate::namf_request_handler(req).await;
+    assert_eq!(resp.status, 200, "{}", json_of(&resp));
+    assert!(
+        json_of(&resp).get("lastActTime").is_some(),
+        "{}",
+        json_of(&resp)
+    );
+    server.forget_ue(ue);
+}
+
+/// #1087: a pure-N1 transfer of a class the AMF has no relay for is acknowledged
+/// for a CM-CONNECTED UE (logged as not forwarded), not refused 504.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unhandled_n1_class_for_a_connected_ue_is_not_refused_unreachable() {
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran, supi) = (7_108_708u64, 94, "imsi-001010010870008");
+    live_ue(&mut server, ue, ran, supi);
+    let req =
+        nextgcore_sbi::SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"))
+            .with_json_body(&serde_json::json!({
+                "n1MessageContainer": {
+                    "n1MessageClass": "SMS",
+                    "n1MessageContent": { "contentId": "sms" }
+                }
+            }))
+            .expect("json")
+            .with_part(SbiPart::with_content(
+                "sms",
+                "application/vnd.3gpp.sms",
+                bytes::Bytes::from_static(&[0x01]),
+            ));
+    let resp = crate::namf_request_handler(req).await;
+    assert_eq!(resp.status, 200, "{}", json_of(&resp));
+    server.forget_ue(ue);
+}
