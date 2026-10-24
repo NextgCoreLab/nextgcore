@@ -954,3 +954,279 @@ async fn an_implicit_deregistration_releases_at_the_smf_then_prunes() {
     assert_eq!(session_state_of(&server, ue), (0, 0, 0));
     assert!(!server.ue_auth_state.contains(ue));
 }
+
+// ---------------------------------------------------------------------------
+// #758: an Uplink NAS Transport for an AMF UE NGAP ID never allocated here
+// ---------------------------------------------------------------------------
+
+/// The radio-network causes of the Error Indications in `sent`.
+fn error_indication_causes(sent: Vec<(u64, Vec<u8>)>) -> Vec<Option<u8>> {
+    sent.into_iter()
+        .filter_map(|(_, p)| match decode_sent(&p) {
+            Sent::ErrorIndication {
+                radio_network_cause,
+            } => Some(radio_network_cause),
+            _ => None,
+        })
+        .collect()
+}
+
+fn plain_initial_registration(amf_ue_ngap_id: u64, ran: u32) -> Vec<u8> {
+    uplink_nas_transport(amf_ue_ngap_id, ran, &super::sample_registration_request())
+}
+
+/// #758: a gNB names an AMF UE NGAP ID this AMF never allocated, with a plain
+/// initial Registration Request. No NAS context is created (the ID could later be
+/// allocated to another UE). The AMF answers an Error Indication "Unknown local UE
+/// NGAP ID" (TS 38.413 §10.6), and nothing else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_initial_registration_under_an_unallocated_id_gets_an_error_indication() {
+    let mut server = capturing_ngap_server().await;
+    let invented = 7_758_001u64;
+    server
+        .handle_uplink_nas_transport(ASSOC, &plain_initial_registration(invented, 58))
+        .await
+        .expect("handled");
+    assert!(
+        !server.ue_auth_state.contains(invented),
+        "no context for an invented ID"
+    );
+    let sent = take_sent_ngap(&mut server);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].0, ASSOC);
+    assert_eq!(
+        error_indication_causes(sent),
+        vec![Some(g::CauseRadioNetwork::UNKNOWN_LOCAL_UE_NGAP_ID)]
+    );
+}
+
+/// The ID IS allocated with no context (a Service Request rejected #9), but the
+/// Uplink NAS Transport names another RAN UE NGAP ID on the same association. That
+/// is "Inconsistent remote UE NGAP ID"; on another association it is "Unknown
+/// local UE NGAP ID". No context is created either way. The genuine connection keeps its
+/// allocation and is taken up afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_initial_registration_on_another_connection_than_the_allocation_is_refused() {
+    let mut server = capturing_ngap_server().await;
+    let id = 7_758_002u64;
+    server.forced_amf_ue_ngap_id = Some(id);
+    server
+        .handle_initial_ue_message(
+            ASSOC,
+            &super::service_request_initial_ue(service_request(None)),
+        )
+        .await
+        .expect("rejected #9");
+    take_sent_ngap(&mut server);
+    assert!(!server.ue_auth_state.contains(id));
+
+    // Wrong RAN UE NGAP ID (the allocation is for 512).
+    server
+        .handle_uplink_nas_transport(ASSOC, &plain_initial_registration(id, 513))
+        .await
+        .expect("handled");
+    assert!(!server.ue_auth_state.contains(id));
+    assert_eq!(
+        error_indication_causes(take_sent_ngap(&mut server)),
+        vec![Some(g::CauseRadioNetwork::INCONSISTENT_REMOTE_UE_NGAP_ID)]
+    );
+    // Wrong association: there the ID names no logical connection at all, so it
+    // is an unknown LOCAL ID (TS 38.413 §10.6), and the answer does not tell that
+    // gNB the ID is live elsewhere.
+    server
+        .handle_uplink_nas_transport(ASSOC + 1, &plain_initial_registration(id, 512))
+        .await
+        .expect("handled");
+    assert!(!server.ue_auth_state.contains(id));
+    assert_eq!(
+        error_indication_causes(take_sent_ngap(&mut server)),
+        vec![Some(g::CauseRadioNetwork::UNKNOWN_LOCAL_UE_NGAP_ID)]
+    );
+
+    // The genuine connection's registration is taken up, once.
+    let _ = server
+        .handle_uplink_nas_transport(ASSOC, &plain_initial_registration(id, 512))
+        .await;
+    assert!(
+        server.ue_auth_state.contains(id),
+        "the allocated connection registers"
+    );
+    server.ue_auth_state.remove(id);
+    take_sent_ngap(&mut server);
+    let _ = server
+        .handle_uplink_nas_transport(ASSOC, &plain_initial_registration(id, 512))
+        .await;
+    assert!(
+        !server.ue_auth_state.contains(id),
+        "the allocation is consumed: a second context is not minted under it"
+    );
+}
+
+/// A gNB inventing IDs cannot grow the allocation record without bound: it is
+/// capped, oldest first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_contextless_allocation_record_is_bounded() {
+    let mut server = capturing_ngap_server().await;
+    for i in 0..(MAX_CONTEXTLESS_UE_IDS as u64 + 10) {
+        server.remember_contextless_ue_id(ASSOC, 9_000_000 + i, 1);
+    }
+    assert_eq!(server.contextless_ue_ids.len(), MAX_CONTEXTLESS_UE_IDS);
+    assert_eq!(
+        server.take_contextless_ue_id(ASSOC, 9_000_000, 1),
+        ContextlessLookup::Unknown,
+        "the oldest went first"
+    );
+}
+
+/// The plain-dispatch SERVICE REQUEST arm of the Initial UE Message: a message
+/// whose third octet is 0x4C but which is neither a plain nor a type-1 Service
+/// Request (here security header type 3, so octet 3 is a MAC octet). It is
+/// answered SERVICE REJECT #9 like the others, and the ID it allocated is
+/// recorded, so the UE's re-registration on that connection is taken up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_plain_dispatch_service_request_arm_records_its_allocation() {
+    let mut server = capturing_ngap_server().await;
+    let id = 7_758_011u64;
+    server.forced_amf_ue_ngap_id = Some(id);
+    let odd = vec![
+        0x7E,
+        0x03,
+        message_type::SERVICE_REQUEST,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ];
+    server
+        .handle_initial_ue_message(ASSOC, &super::service_request_initial_ue(odd))
+        .await
+        .expect("rejected #9");
+    let sent: Vec<Sent> = take_sent_ngap(&mut server)
+        .into_iter()
+        .map(|(_, p)| decode_sent(&p))
+        .collect();
+    let [Sent::DownlinkNas { nas_pdu, .. }] = sent.as_slice() else {
+        panic!("one DL NAS Transport, the Service Reject: {sent:?}");
+    };
+    assert_eq!(nas_pdu.get(2), Some(&message_type::SERVICE_REJECT));
+    assert!(!server.ue_auth_state.contains(id));
+
+    let _ = server
+        .handle_uplink_nas_transport(ASSOC, &plain_initial_registration(id, 512))
+        .await;
+    assert!(
+        server.ue_auth_state.contains(id),
+        "the re-registration on the allocated connection is taken up"
+    );
+    server.ue_auth_state.remove(id);
+}
+
+/// A released NG connection loses its contextless allocation: after the UE
+/// Context Release Complete for the ID, the same gNB cannot mint a context under
+/// it. It gets an Error Indication "Unknown local UE NGAP ID".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_released_connection_loses_its_contextless_allocation() {
+    let mut server = capturing_ngap_server().await;
+    let id = 7_758_021u64;
+    server.forced_amf_ue_ngap_id = Some(id);
+    server
+        .handle_initial_ue_message(
+            ASSOC,
+            &super::service_request_initial_ue(service_request(None)),
+        )
+        .await
+        .expect("rejected #9");
+    take_sent_ngap(&mut server);
+
+    let complete = nextgcore_ngap::builder::build_ue_context_release_complete(
+        &nextgcore_ngap::types::UeContextReleaseComplete {
+            amf_ue_ngap_id: id,
+            ran_ue_ngap_id: 512,
+        },
+    )
+    .expect("encode a UE Context Release Complete");
+    server
+        .handle_ue_context_release_complete(ASSOC, &complete)
+        .await
+        .expect("handled");
+    take_sent_ngap(&mut server);
+
+    server
+        .handle_uplink_nas_transport(ASSOC, &plain_initial_registration(id, 512))
+        .await
+        .expect("handled");
+    assert!(!server.ue_auth_state.contains(id));
+    assert_eq!(
+        error_indication_causes(take_sent_ngap(&mut server)),
+        vec![Some(g::CauseRadioNetwork::UNKNOWN_LOCAL_UE_NGAP_ID)]
+    );
+}
+
+/// An NG Reset drops the contextless allocations of the connections it resets:
+/// a partial reset only those its items name (by either ID) on the resetting
+/// association, a whole reset every one on that association. Another
+/// association's allocation is untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ng_reset_drops_the_contextless_allocations_it_resets() {
+    use nextgcore_ngap::types::{
+        Cause, CauseTransport, NgReset, ResetType, UeAssociatedLogicalNgConnectionItem,
+    };
+    let mut server = capturing_ngap_server().await;
+    // Its own association (and so gNB pool id): an NG Reset also resets the
+    // process-global RAN UE bookkeeping of that gNB, which the other tests here
+    // share on [`ASSOC`].
+    let assoc = 758_041u64;
+    super::seed_gnb_session(&server, assoc).await;
+    let other = assoc + 7;
+    server.remember_contextless_ue_id(assoc, 7_758_031, 31);
+    server.remember_contextless_ue_id(assoc, 7_758_032, 32);
+    server.remember_contextless_ue_id(assoc, 7_758_033, 33);
+    server.remember_contextless_ue_id(other, 7_758_034, 31);
+    let reset = |reset_type| {
+        nextgcore_ngap::builder::build_ng_reset(&NgReset {
+            cause: Cause::Transport(CauseTransport::TransportResourceUnavailable),
+            reset_type,
+        })
+        .expect("encode an NG Reset")
+    };
+
+    let partial = reset(ResetType::PartOfNgInterface(vec![
+        UeAssociatedLogicalNgConnectionItem {
+            amf_ue_ngap_id: Some(7_758_031),
+            ran_ue_ngap_id: None,
+        },
+        UeAssociatedLogicalNgConnectionItem {
+            amf_ue_ngap_id: None,
+            ran_ue_ngap_id: Some(32),
+        },
+    ]));
+    let _ = server.handle_ng_reset(assoc, &partial).await;
+    let held: Vec<u64> = server
+        .contextless_ue_ids
+        .iter()
+        .map(|c| c.amf_ue_ngap_id)
+        .collect();
+    assert_eq!(
+        held,
+        vec![7_758_033, 7_758_034],
+        "the two named connections are dropped, by AMF and by RAN UE NGAP ID"
+    );
+
+    let _ = server
+        .handle_ng_reset(assoc, &reset(ResetType::NgInterface))
+        .await;
+    let held: Vec<u64> = server
+        .contextless_ue_ids
+        .iter()
+        .map(|c| c.amf_ue_ngap_id)
+        .collect();
+    assert_eq!(
+        held,
+        vec![7_758_034],
+        "only the other association's is left"
+    );
+    take_sent_ngap(&mut server);
+}
