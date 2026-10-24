@@ -2883,6 +2883,8 @@ mod tests {
         let answered = tokio::spawn(answer_association_setup(upf_b, 200, false));
         try_associate(&client).await.expect("association with B");
         let _ = answered.await;
+        // #928: the restart's #39 fan-out runs off the association task; wait for it.
+        drain_restart_fanouts(Duration::from_secs(5)).await;
         let kept = pfcp_session_present("72201");
         let released = crate::cancel_gsm_timer_for_test("72201");
         forget_pfcp_session("72201");
