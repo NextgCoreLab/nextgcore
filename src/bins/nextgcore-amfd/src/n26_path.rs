@@ -49,19 +49,19 @@ use tokio::sync::Mutex;
 pub const N26_AMF_GTP_C: u8 = 40;
 
 /// GTPv2-C cause `Request accepted` (TS 29.274 Table 8.4-1).
-pub const CAUSE_REQUEST_ACCEPTED: u8 = 16;
+pub use nextgcore_gtp::v2::cause::REQUEST_ACCEPTED as CAUSE_REQUEST_ACCEPTED;
 
 /// GTPv2-C cause `IMSI/IMEI not known` (TS 29.274 Table 8.4-1).
 ///
 /// One of the four message-specific causes §7.3.6 names (`29274-j60.txt:19878`), and the
 /// right one when the 4G-GUTI an MME sent does not reverse-map to any UE this AMF serves.
-pub const CAUSE_IMSI_IMEI_NOT_KNOWN: u8 = 96;
+pub use nextgcore_gtp::v2::cause::IMSI_IMEI_NOT_KNOWN as CAUSE_IMSI_IMEI_NOT_KNOWN;
 
 /// GTPv2-C cause `Request rejected` (TS 29.274 Table 8.4-1).
 ///
 /// §7.3.6 requires it *"if the UE is registered to the source AMF without any PDU
 /// session"* (`29274-j60.txt:19935-19936`).
-pub const CAUSE_REQUEST_REJECTED: u8 = 94;
+pub use nextgcore_gtp::v2::cause::REQUEST_REJECTED_REASON_NOT_SPECIFIED as CAUSE_REQUEST_REJECTED;
 
 /// `Used NAS integrity protection algorithm` / `Used NAS Cipher` in the MM Context are
 /// EPS algorithm identifiers, and the AMF's are 5GS ones.

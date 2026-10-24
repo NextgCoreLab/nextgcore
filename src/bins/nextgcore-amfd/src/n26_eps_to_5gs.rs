@@ -39,19 +39,19 @@ use nextgcore_gtp::v2::{
     Gtp2IndicationIe, Gtp2Message, Gtp2MessageType, Gtp2PdnConnectionIe,
 };
 
-/// GTPv2-C cause `Request accepted` (TS 29.274 Table 8.4-1).
-pub const CAUSE_REQUEST_ACCEPTED: u8 = 16;
+/// GTPv2-C cause `Conditional IE missing` (Table 8.4-1, value 103).
+pub use nextgcore_gtp::v2::cause::CONDITIONAL_IE_MISSING as CAUSE_CONDITIONAL_IE_MISSING;
 /// GTPv2-C cause `Mandatory IE incorrect` (Table 8.4-1, value 69).
-pub const CAUSE_MANDATORY_IE_INCORRECT: u8 = 69;
+pub use nextgcore_gtp::v2::cause::MANDATORY_IE_INCORRECT as CAUSE_MANDATORY_IE_INCORRECT;
 /// GTPv2-C cause `Mandatory IE missing` (Table 8.4-1, value 70).
-pub const CAUSE_MANDATORY_IE_MISSING: u8 = 70;
-/// GTPv2-C cause `System failure` (Table 8.4-1, value 72).
-pub const CAUSE_SYSTEM_FAILURE: u8 = 72;
+pub use nextgcore_gtp::v2::cause::MANDATORY_IE_MISSING as CAUSE_MANDATORY_IE_MISSING;
 /// GTPv2-C cause `Relocation failure` (Table 8.4-1, value 81) — §7.3.2's message-specific
 /// cause for a Forward Relocation Response that refuses.
-pub const CAUSE_RELOCATION_FAILURE: u8 = 81;
-/// GTPv2-C cause `Conditional IE missing` (Table 8.4-1, value 103).
-pub const CAUSE_CONDITIONAL_IE_MISSING: u8 = 103;
+pub use nextgcore_gtp::v2::cause::RELOCATION_FAILURE as CAUSE_RELOCATION_FAILURE;
+/// GTPv2-C cause `Request accepted` (TS 29.274 Table 8.4-1).
+pub use nextgcore_gtp::v2::cause::REQUEST_ACCEPTED as CAUSE_REQUEST_ACCEPTED;
+/// GTPv2-C cause `System failure` (Table 8.4-1, value 72).
+pub use nextgcore_gtp::v2::cause::SYSTEM_FAILURE as CAUSE_SYSTEM_FAILURE;
 
 /// F-TEID interface type `N26 AMF GTP-C` (TS 29.274 Table 8.22-1).
 pub const N26_AMF_GTP_C: u8 = 40;

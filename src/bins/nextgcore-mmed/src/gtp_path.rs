@@ -867,9 +867,16 @@ fn note_peer_recovery(inner: &Arc<GtpcInner>, peer: SocketAddr, counter: u8) -> 
 /// TS 23.007 §15 (#689): a Serving GW restart lost every PDN connection the MME
 /// had through it. The UEs on it are detached, re-attach required.
 fn on_s11_peer_restart(peer: SocketAddr) {
-    let ctx = crate::context::mme_self();
+    on_s11_peer_restart_in(crate::context::mme_self(), peer);
+}
+
+/// The effect of an S11 peer restart on `ctx`: the UEs with PDN connections
+/// through it are detached, re-attach required (TS 23.007 §15). Returns how
+/// many.
+fn on_s11_peer_restart_in(ctx: &MmeContext, peer: SocketAddr) -> usize {
     let n = crate::network_detach::sgw_restarted(ctx, ctx.sgwc_list.first().copied(), peer.ip());
     log::warn!("S11 peer {peer} restart: {n} UE(s) detached, re-attach required");
+    n
 }
 
 /// Dispatch one received datagram.
@@ -2843,5 +2850,49 @@ mod tests {
             "the next restart is caught"
         );
         server.close();
+    }
+
+    /// #987 review: what a confirmed restart (`confirm_stale_recovery`, a lost
+    /// counter) does: the UEs whose PDN connections go through that Serving GW
+    /// are detached, re-attach required, and a UE of another gateway is not. On
+    /// its own context, so the process-wide one's UEs are untouched.
+    #[test]
+    fn a_confirmed_restart_detaches_the_ues_of_that_serving_gw() {
+        let mut ctx = MmeContext::new();
+        ctx.sgwc_list = vec!["127.0.0.1:2123".parse().unwrap()];
+        let ctx = ctx;
+        ctx.init();
+        let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+        let enb_ue_id = ctx.enb_ue_add(enb_id, 987);
+        let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
+        ctx.enb_ue_associate_mme_ue(enb_ue_id, mme_ue_id);
+        let sgw_ue_id = ctx.sgw_ue_add(mme_ue_id);
+        ctx.sgw_ue_pool
+            .write()
+            .unwrap()
+            .get_mut(&sgw_ue_id)
+            .unwrap()
+            .sgw_s11_teid = 0x987;
+        ctx.mme_ue_pool
+            .write()
+            .unwrap()
+            .get_mut(&mme_ue_id)
+            .unwrap()
+            .sgw_ue_id = sgw_ue_id;
+        assert_eq!(
+            on_s11_peer_restart_in(&ctx, "10.9.8.7:2123".parse().unwrap()),
+            0,
+            "another gateway's restart"
+        );
+        assert_eq!(
+            on_s11_peer_restart_in(&ctx, "127.0.0.1:2123".parse().unwrap()),
+            1
+        );
+        let detached = ctx.mme_ue_find_by_id(mme_ue_id).is_none_or(|ue| {
+            ue.nas_eps.type_ == crate::context::MmeEpsType::DetachRequestToUe
+                && ue.network_detach_type
+                    == Some(crate::emm_build::DetachTypeToUe::ReAttachRequired)
+        });
+        assert!(detached, "detached, re-attach required (or implicitly)");
     }
 }
