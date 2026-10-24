@@ -391,6 +391,11 @@ fn send_to_mme(dest_host: &str, msg: DiameterMessage) -> Result<(), String> {
 /// that is already struggling.
 pub const HSS_INITIATED_RETRANSMIT_SECS: u64 = 30;
 
+/// RFC 6733 §7.1.3 DIAMETER_UNABLE_TO_DELIVER and DIAMETER_TOO_BUSY: the request
+/// was not served and may be retried (#899 review).
+const RESULT_UNABLE_TO_DELIVER: u32 = 3002;
+const RESULT_TOO_BUSY: u32 = 3004;
+
 /// Maximum transmissions of one HSS-initiated request (the first send plus
 /// retries). Bounded because an MME that never answers must not be retried
 /// forever: TS 29.272 gives the HSS no obligation beyond a reasonable attempt, and
@@ -1407,6 +1412,23 @@ pub fn handle_s6a_answer(answer: &DiameterMessage) {
     // (RFC 6733 §8.8) and CLEAR it, so it is not retransmitted. Before this the
     // function only incremented counters, so nothing could tell an answered
     // request from a lost one and no retransmission was possible.
+    // #899 review: DIAMETER_TOO_BUSY (3004) and DIAMETER_UNABLE_TO_DELIVER (3002)
+    // are protocol errors that say "not now" (RFC 6733 §7.1.3): an MME whose
+    // re-established connection is still proving itself (RFC 3539 §3.4.1 REOPEN)
+    // answers 3004. The request stays outstanding and the sweep retransmits it
+    // at the next period, within the same attempt budget, rather than being
+    // closed as answered and lost.
+    if matches!(
+        result_code,
+        Some(RESULT_TOO_BUSY | RESULT_UNABLE_TO_DELIVER)
+    ) {
+        log::warn!(
+            "S6a answer (cmd={}) is {result_code:?}: the request stays outstanding and is \
+             retransmitted in {HSS_INITIATED_RETRANSMIT_SECS} s",
+            answer.header.command_code
+        );
+        return;
+    }
     let correlated = message_session_id(answer).and_then(|sid| complete_pending(&sid));
     match &correlated {
         Some(req) => log::debug!(
@@ -3151,6 +3173,48 @@ mod tests {
         );
 
         unregister_mme_peer(host);
+        clear_pending_requests();
+    }
+
+    /// #899 review: a DIAMETER_TOO_BUSY (3004) or DIAMETER_UNABLE_TO_DELIVER
+    /// (3002) answer, which an MME in RFC 3539 REOPEN sends, leaves the request
+    /// outstanding, so the sweep retransmits it; it is not closed as answered.
+    #[tokio::test]
+    async fn a_too_busy_answer_keeps_the_request_for_retransmission() {
+        let _guard = PEER_TEST_LOCK.lock().expect("peer test lock");
+        disarm_restart_reset();
+        for code in [3004u32, 3002] {
+            clear_pending_requests();
+            let host = "mme-busy.epc.example.org";
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            register_mme_peer(host, tx);
+            let clr = build_clr_request(
+                "001010000000899",
+                host,
+                "epc.example.org",
+                CancellationType::SubscriptionWithdrawal,
+                None,
+            );
+            send_tracked(host, clr).expect("send");
+            let sent = rx.try_recv().expect("CLR sent");
+            let mut busy = DiameterMessage::new_answer(&sent);
+            busy.header.set_error();
+            busy.add_avp(Avp::mandatory(
+                avp_code::SESSION_ID,
+                AvpData::Utf8String(sent.session_id().unwrap().to_string()),
+            ));
+            busy.add_avp(Avp::mandatory(
+                avp_code::RESULT_CODE,
+                AvpData::Unsigned32(code),
+            ));
+            handle_s6a_answer(&busy);
+            assert_eq!(
+                pending_request_count(),
+                1,
+                "{code}: kept for retransmission"
+            );
+            unregister_mme_peer(host);
+        }
         clear_pending_requests();
     }
 
