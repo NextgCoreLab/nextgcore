@@ -331,7 +331,11 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
         }
 
         _ => {
-            log::warn!("Unknown AMF SBI request: {method} {uri}");
+            // The path may be one of this AMF's token-bearing callbacks (#940).
+            log::warn!(
+                "Unknown AMF SBI request: {method} {}",
+                nextgcore_sbi::log_redact::redact_callback_tokens(&uri)
+            );
             send_not_found(
                 &format!("No resource for {method} {path}"),
                 Some("RESOURCE_URI_STRUCTURE_NOT_FOUND"),
@@ -1545,7 +1549,8 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
 
     log::info!(
         "Event subscription created: id={subscription_id}, events={:?}, notifyUri={notify_uri}",
-        sub.event_types
+        sub.event_types,
+        notify_uri = nextgcore_sbi::log_redact::redact_last_segment(notify_uri)
     );
 
     let mut response_body = json!({
@@ -2956,7 +2961,10 @@ pub fn send_n1n2_failure_notification(notify_uri: String, cause: &str, n1n2_msg_
     };
     handle.spawn(async move {
         let Some((host, port, path)) = parse_http_uri(&notify_uri) else {
-            log::warn!("Invalid n1n2FailureTxfNotifURI: {notify_uri}");
+            log::warn!(
+                "Invalid n1n2FailureTxfNotifURI: {notify_uri}",
+                notify_uri = nextgcore_sbi::log_redact::redact_last_segment(&notify_uri)
+            );
             return;
         };
         let body = json!({
@@ -2966,15 +2974,22 @@ pub fn send_n1n2_failure_notification(notify_uri: String, cause: &str, n1n2_msg_
         let client = notify_client(&host, port);
         match client.post_json(&path, &body).await {
             Ok(resp) if resp.is_success() => {
-                log::info!("N1N2 failure notification delivered to {notify_uri}");
+                log::info!(
+                    "N1N2 failure notification delivered to {notify_uri}",
+                    notify_uri = nextgcore_sbi::log_redact::redact_last_segment(&notify_uri)
+                );
             }
             Ok(resp) => {
                 log::warn!(
                     "N1N2 failure notification to {notify_uri} returned {}",
-                    resp.status
+                    resp.status,
+                    notify_uri = nextgcore_sbi::log_redact::redact_last_segment(&notify_uri)
                 );
             }
-            Err(e) => log::warn!("N1N2 failure notification to {notify_uri} failed: {e}"),
+            Err(e) => log::warn!(
+                "N1N2 failure notification to {notify_uri} failed: {e}",
+                notify_uri = nextgcore_sbi::log_redact::redact_last_segment(&notify_uri)
+            ),
         }
     });
 }
@@ -3084,7 +3099,10 @@ pub fn send_non_ue_nrppa_info_notify(
     };
     handle.spawn(async move {
         let Some((host, port, path)) = parse_http_uri(&callback_uri) else {
-            log::warn!("Invalid n2NotifyCallbackUri: {callback_uri}");
+            log::warn!(
+                "Invalid n2NotifyCallbackUri: {callback_uri}",
+                callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
+            );
             return;
         };
         let request = match build_non_ue_nrppa_info_notify_request(
@@ -3103,13 +3121,18 @@ pub fn send_non_ue_nrppa_info_notify(
         match notify_client(&host, port).send_request(request).await {
             Ok(resp) if resp.is_success() => log::info!(
                 "NonUeN2InfoNotify (NRPPa) delivered to {callback_uri} \
-                 (sub={n2_notify_subscription_id})"
+                 (sub={n2_notify_subscription_id})",
+                callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
             ),
             Ok(resp) => log::warn!(
                 "NonUeN2InfoNotify (NRPPa) to {callback_uri} returned {}",
-                resp.status
+                resp.status,
+                callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
             ),
-            Err(e) => log::warn!("NonUeN2InfoNotify (NRPPa) to {callback_uri} failed: {e}"),
+            Err(e) => log::warn!(
+                "NonUeN2InfoNotify (NRPPa) to {callback_uri} failed: {e}",
+                callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
+            ),
         }
     });
 }
@@ -3132,7 +3155,10 @@ pub fn send_n2_info_notify(
     };
     handle.spawn(async move {
         let Some((host, port, path)) = parse_http_uri(&callback_uri) else {
-            log::warn!("Invalid n2NotifyCallbackUri: {callback_uri}");
+            log::warn!(
+                "Invalid n2NotifyCallbackUri: {callback_uri}",
+                callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
+            );
             return;
         };
         let request = match build_n2_info_notify_request(
@@ -3153,17 +3179,22 @@ pub fn send_n2_info_notify(
             Ok(resp) if resp.is_success() => {
                 log::info!(
                     "N2InfoNotify delivered to {callback_uri} \
-                     (sub={n2_notify_subscription_id})"
+                     (sub={n2_notify_subscription_id})",
+                    callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
                 );
             }
             Ok(resp) => {
                 log::warn!(
                     "N2InfoNotify to {callback_uri} returned {} \
                      (sub={n2_notify_subscription_id})",
-                    resp.status
+                    resp.status,
+                    callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
                 );
             }
-            Err(e) => log::warn!("N2InfoNotify to {callback_uri} failed: {e}"),
+            Err(e) => log::warn!(
+                "N2InfoNotify to {callback_uri} failed: {e}",
+                callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
+            ),
         }
     });
 }
@@ -3283,7 +3314,10 @@ pub fn send_non_ue_n2_info_notify(
     };
     handle.spawn(async move {
         let Some((host, port, path)) = parse_http_uri(&callback_uri) else {
-            log::warn!("Invalid n2NotifyCallbackUri: {callback_uri}");
+            log::warn!(
+                "Invalid n2NotifyCallbackUri: {callback_uri}",
+                callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
+            );
             return;
         };
         let request = match build_non_ue_n2_info_notify_request(
@@ -3311,17 +3345,22 @@ pub fn send_non_ue_n2_info_notify(
                     "NonUeN2InfoNotify ({n2_information_class}) delivered to {callback_uri} \
                      (sub={n2_notify_subscription_id} \
                      messageIdentifier={message_identifier:#06x} \
-                     serialNumber={serial_number:#06x})"
+                     serialNumber={serial_number:#06x})",
+                    callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
                 );
             }
             Ok(resp) => {
                 log::warn!(
                     "NonUeN2InfoNotify to {callback_uri} returned {} \
                      (sub={n2_notify_subscription_id})",
-                    resp.status
+                    resp.status,
+                    callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
                 );
             }
-            Err(e) => log::warn!("NonUeN2InfoNotify to {callback_uri} failed: {e}"),
+            Err(e) => log::warn!(
+                "NonUeN2InfoNotify to {callback_uri} failed: {e}",
+                callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
+            ),
         }
     });
 }
@@ -3420,7 +3459,10 @@ pub fn send_n1_message_notify(
     };
     handle.spawn(async move {
         let Some((host, port, path)) = parse_http_uri(&callback_uri) else {
-            log::warn!("Invalid n1NotifyCallbackUri: {callback_uri}");
+            log::warn!(
+                "Invalid n1NotifyCallbackUri: {callback_uri}",
+                callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
+            );
             return;
         };
         let request = match build_n1_message_notify_request(
@@ -3440,12 +3482,22 @@ pub fn send_n1_message_notify(
         let client = notify_client(&host, port);
         match client.send_request(request).await {
             Ok(resp) if resp.is_success() => {
-                log::info!("N1MessageNotify delivered to {callback_uri}");
+                log::info!(
+                    "N1MessageNotify delivered to {callback_uri}",
+                    callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
+                );
             }
             Ok(resp) => {
-                log::warn!("N1MessageNotify to {callback_uri} returned {}", resp.status)
+                log::warn!(
+                    "N1MessageNotify to {callback_uri} returned {}",
+                    resp.status,
+                    callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
+                )
             }
-            Err(e) => log::warn!("N1MessageNotify to {callback_uri} failed: {e}"),
+            Err(e) => log::warn!(
+                "N1MessageNotify to {callback_uri} failed: {e}",
+                callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
+            ),
         }
     });
 }
@@ -4725,39 +4777,32 @@ fn record_transferred_sessions(ue_id: u64, ue_context: &Value, ue_context_id: &s
         if let Some(dnn) = session.get("dnn").and_then(Value::as_str) {
             sess.dnn = Some(dnn.to_string());
         }
-        match session
+        let named = session
             .pointer("/sNssai/sst")
             .and_then(Value::as_u64)
             .and_then(|v| u8::try_from(v).ok())
-        {
-            Some(sst) => {
-                sess.s_nssai.sst = sst;
-                sess.s_nssai.sd = session
+            .map(|sst| crate::context::SNssai {
+                sst,
+                sd: session
                     .pointer("/sNssai/sd")
                     .and_then(Value::as_str)
-                    .and_then(|s| u32::from_str_radix(s, 16).ok());
-            }
-            // TS 29.518 §6.1.6.2.19: PduSessionContext.sNssai is mandatory. A peer that
-            // omits it still names a session the UE holds, so it is recorded under this
-            // AMF's default S-NSSAI rather than as SST 0, which no target admits
-            // (#743 follow-up).
-            None => {
-                let default = ctx.read().ok().and_then(|guard| {
-                    guard
-                        .plmn_support
-                        .first()
-                        .and_then(|p| p.s_nssai.first().cloned())
-                });
-                log::warn!(
-                    "UE context {ue_context_id}: PDU session {psi} has no (valid) sNssai, \
-                     which TS 29.518 makes mandatory; recorded under the default S-NSSAI \
-                     {default:?}"
-                );
-                if let Some(default) = default {
-                    sess.s_nssai = default;
-                }
-            }
+                    .and_then(|s| u32::from_str_radix(s, 16).ok()),
+            });
+        // TS 29.518 §6.1.6.2.19: PduSessionContext.sNssai is mandatory. A peer that omits
+        // it, or names SST 0 (schema-valid, TS 29.571, but no slice), still names a session
+        // the UE holds, so it is recorded under this AMF's default S-NSSAI rather than as
+        // SST 0, which no target admits (#743 follow-up; #920 follow-up for SST 0).
+        if named.as_ref().is_none_or(|s| s.sst == 0) {
+            log::warn!(
+                "UE context {ue_context_id}: PDU session {psi} has no usable sNssai \
+                 ({named:?}), which TS 29.518 makes mandatory; recorded under the default \
+                 S-NSSAI"
+            );
         }
+        sess.s_nssai = ctx
+            .read()
+            .map(|guard| guard.usable_s_nssai(named.clone()))
+            .unwrap_or_else(|_| named.unwrap_or_default());
         if let Ok(guard) = ctx.read() {
             guard.sess_update(&sess);
         }
@@ -5267,7 +5312,8 @@ fn handle_amf_status_subscription_create(request: &SbiRequest) -> SbiResponse {
     log::info!(
         "AMFStatusChange subscription created: id={subscription_id}, \
          amfStatusUri={amf_status_uri}, {} guami(s)",
-        sub.guami_list.len()
+        sub.guami_list.len(),
+        amf_status_uri = nextgcore_sbi::log_redact::redact_last_segment(&amf_status_uri)
     );
     let location = format!("/namf-comm/v1/subscriptions/{subscription_id}");
     match SbiResponse::with_status(201).with_json_body(&amf_status_subscription_json(&sub)) {
@@ -5336,7 +5382,8 @@ fn handle_amf_status_subscription_replace(
 
     log::info!(
         "AMFStatusChange subscription replaced: id={subscription_id}, \
-         amfStatusUri={amf_status_uri}"
+         amfStatusUri={amf_status_uri}",
+        amf_status_uri = nextgcore_sbi::log_redact::redact_last_segment(&amf_status_uri)
     );
     match SbiResponse::ok().with_json_body(&amf_status_subscription_json(&sub)) {
         Ok(resp) => resp,
@@ -6026,7 +6073,9 @@ fn handle_non_ue_n2_info_subscribe(request: &SbiRequest) -> SbiResponse {
 
     log::info!(
         "NonUeN2InfoSubscribe: id={subscription_id} class={n2_information_class} \
-         callback={n2_notify_callback_uri} nfId={nf_id:?}"
+         callback={n2_notify_callback_uri} nfId={nf_id:?}",
+        n2_notify_callback_uri =
+            nextgcore_sbi::log_redact::redact_last_segment(n2_notify_callback_uri)
     );
 
     // `NonUeN2InfoSubscriptionCreatedData` (`yaml:2597-2607`):
@@ -9612,6 +9661,14 @@ mod tests {
                     "smContextRef": "smctx-relocate-740031",
                     "dnn": "internet",
                     "accessType": "3GPP_ACCESS",
+                }, {
+                    // #920 follow-up: a peer that names SST 0 (schema-valid, TS 29.571,
+                    // but no slice).
+                    "pduSessionId": 9,
+                    "smContextRef": "smctx-relocate-740032",
+                    "sNssai": { "sst": 0, "sd": "000920" },
+                    "dnn": "internet",
+                    "accessType": "3GPP_ACCESS",
                 }],
             },
             "targetId": {
@@ -9635,20 +9692,36 @@ mod tests {
             sst: 2,
             sd: Some(0x02_0202),
         };
-        let saved_plmn_support = {
+        // #920 review, MINOR 3: the substitute PLMN support is put back by a drop guard,
+        // count included, even if the handler panics.
+        struct RestorePlmnSupport(Vec<crate::context::PlmnSupport>, usize);
+        impl Drop for RestorePlmnSupport {
+            fn drop(&mut self) {
+                let ctx = amf_self();
+                let mut guard = ctx.write().unwrap_or_else(|e| e.into_inner());
+                guard.plmn_support = std::mem::take(&mut self.0);
+                guard.num_of_plmn_support = self.1;
+            }
+        }
+        let restore = {
             let ctx = amf_self();
             let mut guard = ctx.write().expect("ctx lock");
-            std::mem::replace(
-                &mut guard.plmn_support,
-                vec![crate::context::PlmnSupport {
-                    plmn_id: PlmnId::new("001", "01"),
-                    num_of_s_nssai: 1,
-                    s_nssai: vec![default_slice.clone()],
-                }],
-            )
+            let saved = RestorePlmnSupport(
+                std::mem::replace(
+                    &mut guard.plmn_support,
+                    vec![crate::context::PlmnSupport {
+                        plmn_id: PlmnId::new("001", "01"),
+                        num_of_s_nssai: 1,
+                        s_nssai: vec![default_slice.clone()],
+                    }],
+                ),
+                guard.num_of_plmn_support,
+            );
+            guard.num_of_plmn_support = 1;
+            saved
         };
         let resp = namf_request_handler(req).await;
-        amf_self().write().expect("ctx lock").plmn_support = saved_plmn_support;
+        drop(restore);
 
         assert_eq!(
             resp.status, 201,
@@ -9670,7 +9743,7 @@ mod tests {
         let sessions = ctx.read().expect("ctx lock").sess_list_for_ue(resolved.id);
         assert_eq!(
             sessions.len(),
-            2,
+            3,
             "the transferred sessionContextList must be RECORDED against the created \
              context -- the gap PR #390 named"
         );
@@ -9685,6 +9758,15 @@ mod tests {
             (8, default_slice.sst, default_slice.sd),
             "#743 follow-up: a session without sNssai is recorded under the default S-NSSAI, \
              not SST 0"
+        );
+        assert_eq!(
+            (
+                sessions[2].psi,
+                sessions[2].s_nssai.sst,
+                sessions[2].s_nssai.sd
+            ),
+            (9, default_slice.sst, default_slice.sd),
+            "#920 follow-up: a peer's explicit SST 0 is recorded under the default S-NSSAI"
         );
         assert_eq!(sessions[0].psi, 7);
         assert_eq!(

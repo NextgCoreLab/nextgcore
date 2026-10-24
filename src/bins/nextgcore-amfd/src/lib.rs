@@ -687,13 +687,24 @@ impl AmfApp {
     /// Build a runtime PlmnSupport from its typed YAML representation
     fn resolve_plmn_support(entry: PlmnSupportYaml) -> Option<context::PlmnSupport> {
         let plmn_id = Self::resolve_plmn_id(entry.plmn_id?)?;
+        // #920 follow-up: SST 0 is not a slice (TS 23.501 §5.15.2.2 standardises SST
+        // values from 1). A configured SST 0 is refused -- logged and left out -- rather
+        // than advertised in NG Setup and handed out as the default S-NSSAI.
         let s_nssai_list: Vec<context::SNssai> = entry
             .s_nssai
             .unwrap_or_default()
             .into_iter()
-            .map(|n| context::SNssai {
-                sst: n.sst.unwrap_or(1),
-                sd: n.sd,
+            .filter_map(|n| {
+                let sst = n.sst.unwrap_or(1);
+                if sst == 0 {
+                    log::error!(
+                        "amf.plmn_support: S-NSSAI with SST 0 (sd {:?}) is not a slice \
+                         (TS 23.501 §5.15.2.2); ignored",
+                        n.sd
+                    );
+                    return None;
+                }
+                Some(context::SNssai { sst, sd: n.sd })
             })
             .collect();
         let num_of_s_nssai = s_nssai_list.len();
@@ -1162,6 +1173,27 @@ pub async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **#920 follow-up.** A configured S-NSSAI with SST 0 -- not a slice, TS 23.501
+    /// §5.15.2.2 -- is refused at load and left out, so it is neither advertised nor handed
+    /// out as the default; the other S-NSSAIs of the entry, and a missing SST (SST 1), stay.
+    #[test]
+    fn a_configured_sst_0_is_refused() {
+        let entry: PlmnSupportYaml = serde_yaml::from_str(
+            "plmn_id: { mcc: 001, mnc: 01 }\ns_nssai:\n  - sst: 0\n    sd: 9\n  - sst: 2\n  - sd: 5\n",
+        )
+        .expect("yaml");
+        let resolved = AmfApp::resolve_plmn_support(entry).expect("the PLMN resolves");
+        assert_eq!(
+            resolved
+                .s_nssai
+                .iter()
+                .map(|s| (s.sst, s.sd))
+                .collect::<Vec<_>>(),
+            vec![(2, None), (1, Some(5))]
+        );
+        assert_eq!(resolved.num_of_s_nssai, 2);
+    }
 
     /// A fixture path inside a directory nothing else touches (#601).
     ///

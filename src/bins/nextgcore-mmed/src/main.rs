@@ -483,6 +483,7 @@ async fn main() -> Result<()> {
                  mme_diameter_reopen_discards_total {}\n",
                 handover_switch::render_metrics()
                     + &s1ap_handler::render_metrics()
+                    + &n26_path::render_metrics()
                     + &s11_handler::render_metrics(),
                 nextgcore_diameter::session::reopen_discards()
             )

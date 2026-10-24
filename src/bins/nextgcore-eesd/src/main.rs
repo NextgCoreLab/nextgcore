@@ -5428,7 +5428,7 @@ mod tests {
             .collect();
         assert_eq!(mine.len(), 1, "exactly one TARGET_INFORMATION notification");
         let q = &mine[0];
-        assert_eq!(q.uri, "http://eec-d5/acr-cb");
+        assert_eq!(q.callback_uri, "http://eec-d5/acr-cb");
         assert_eq!(q.kind, "ACRInfoNotification");
         // The body deserializes as a spec ACRInfoNotification.
         let notif: ACRInfoNotification = serde_json::from_value(q.body.clone()).unwrap();
@@ -5534,7 +5534,8 @@ mod tests {
             .drain()
             .into_iter()
             .filter(|q| {
-                q.uri == "http://eec-d5neg/acr-cb" || q.body["easId"] == "d5neg-s.example.com"
+                q.callback_uri == "http://eec-d5neg/acr-cb"
+                    || q.body["easId"] == "d5neg-s.example.com"
             })
             .collect();
         assert!(fired.is_empty(), "no subscription ⇒ no notification");
@@ -5573,7 +5574,7 @@ mod tests {
             1,
             "requestTestNotification ⇒ one test notification"
         );
-        assert_eq!(mine[0].uri, "http://eec-d5t/acr-cb");
+        assert_eq!(mine[0].callback_uri, "http://eec-d5t/acr-cb");
         let notif: ACRInfoNotification = serde_json::from_value(mine[0].body.clone()).unwrap();
         assert_eq!(notif.sub_id, id);
         assert_eq!(notif.event_id, "TARGET_INFORMATION");
@@ -5972,7 +5973,7 @@ mod tests {
         let mine = |n: &notifier::QueueNotifier| -> Vec<notifier::QueuedNotification> {
             n.drain()
                 .into_iter()
-                .filter(|q| q.kind == "ACTStatusNotif" && q.uri.starts_with(CB))
+                .filter(|q| q.kind == "ACTStatusNotif" && q.callback_uri.starts_with(CB))
                 .collect()
         };
 
@@ -5996,7 +5997,7 @@ mod tests {
         );
         let acts = mine(&n);
         assert_eq!(acts.len(), 1, "exactly one ACTStatusNotif, got {acts:?}");
-        assert_eq!(acts[0].uri, format!("{CB}/act-status"));
+        assert_eq!(acts[0].callback_uri, format!("{CB}/act-status"));
         let notif: acr::ACTStatusNotif = serde_json::from_value(acts[0].body.clone()).unwrap();
         assert_eq!(notif.act_status, "SUCCESSFUL");
 
@@ -6078,7 +6079,7 @@ mod tests {
             1,
             "the registration must produce exactly one ACInfoNotification, got {queued:?}"
         );
-        assert_eq!(ac_infos[0].uri, "http://eas/ac-info");
+        assert_eq!(ac_infos[0].callback_uri, "http://eas/ac-info");
 
         notifier::set_notifier(std::sync::Arc::new(notifier::QueueNotifier::default()));
         auth::clear_auth_jwks();
