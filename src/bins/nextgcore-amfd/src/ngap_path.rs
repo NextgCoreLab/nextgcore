@@ -963,6 +963,10 @@ struct PendingEstablishment {
     /// Identifies this waiting request, so a late outcome of an attempt for an
     /// earlier one (answered #90, then requested again) is not applied to it.
     generation: u64,
+    /// The establishment's `3gpp-Sbi-Origination-Timestamp`, stamped when its
+    /// first CreateSMContext went out and sent unchanged on every retry (#980
+    /// review, TS 29.502 §6.1.2.3.2).
+    origination_timestamp: String,
 }
 
 /// Source of [`PendingEstablishment::generation`].
@@ -7521,16 +7525,23 @@ impl NgapServer {
                 // (TS 29.502 6.1.6.2.2). Previously none of this was sent, so the
                 // SMF fabricated `imsi-unknown` and every subscriber looked
                 // identical to policy, charging and NSAC.
+                // #980 review: this establishment's origination timestamp, taken
+                // once here and kept with the request if it has to wait (#796), so
+                // every retry of it carries the same value.
+                let origination = nextgcore_sbi::datetime::now_origination_timestamp();
                 let identity = {
                     let ctx = crate::context::amf_self();
                     let guard = ctx.read().ok();
                     // Bound first: the store returns an owned clone, and the
                     // builder borrows it (#341).
                     let ue = self.ue_auth_state.get(amf_ue_ngap_id);
-                    build_sm_context_identity(
-                        ue.as_ref(),
-                        guard.as_ref().and_then(|c| c.served_guami.first()),
-                    )
+                    crate::sbi_path::SmContextIdentity {
+                        origination_timestamp: Some(origination.clone()),
+                        ..build_sm_context_identity(
+                            ue.as_ref(),
+                            guard.as_ref().and_then(|c| c.served_guami.first()),
+                        )
+                    }
                 };
 
                 match crate::sbi_path::call_smf_create_sm_context(
@@ -7572,6 +7583,7 @@ impl NgapServer {
                             sm_pdu,
                             dnn_override,
                             arrived,
+                            &origination,
                             &e,
                         )
                         .await?;
@@ -8014,21 +8026,31 @@ impl NgapServer {
         sm_pdu: &[u8],
         dnn_override: Option<&str>,
         arrived: std::time::Instant,
+        origination_timestamp: &str,
         error: &crate::sbi_path::SbiError,
     ) -> Result<()> {
         let psi = sm_pdu[1];
         let now = std::time::Instant::now();
         let key = (amf_ue_ngap_id, psi);
-        // A UE retransmission of the same request keeps the original window.
-        let (first_failure, generation) = self.pending_establishments.get(&key).map_or_else(
-            || {
-                (
-                    arrived,
-                    ESTABLISHMENT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                )
-            },
-            |p| (p.first_failure, p.generation),
-        );
+        // A UE retransmission of the same request keeps the original window, and
+        // the original origination timestamp (#980 review).
+        let (first_failure, generation, origination_timestamp) =
+            self.pending_establishments.get(&key).map_or_else(
+                || {
+                    (
+                        arrived,
+                        ESTABLISHMENT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                        origination_timestamp.to_string(),
+                    )
+                },
+                |p| {
+                    (
+                        p.first_failure,
+                        p.generation,
+                        p.origination_timestamp.clone(),
+                    )
+                },
+            );
         let full = !self.pending_establishments.contains_key(&key)
             && self.pending_establishments.len() >= MAX_PENDING_ESTABLISHMENTS;
         if full || now.duration_since(first_failure) >= ESTABLISHMENT_RETRY_WINDOW {
@@ -8066,6 +8088,7 @@ impl NgapServer {
                 next_attempt: now + ESTABLISHMENT_RETRY_INTERVAL,
                 in_flight: false,
                 generation,
+                origination_timestamp,
             },
         );
         Ok(())
@@ -8188,10 +8211,15 @@ impl NgapServer {
         let identity = {
             let ctx = crate::context::amf_self();
             let guard = ctx.read().ok();
-            build_sm_context_identity(
-                Some(state),
-                guard.as_ref().and_then(|c| c.served_guami.first()),
-            )
+            crate::sbi_path::SmContextIdentity {
+                // The establishment's own stamp, not a new one: a retry is the
+                // same request (#980 review).
+                origination_timestamp: Some(p.origination_timestamp.clone()),
+                ..build_sm_context_identity(
+                    Some(state),
+                    guard.as_ref().and_then(|c| c.served_guami.first()),
+                )
+            }
         };
         let sm_pdu = p.sm_pdu.clone();
         let dnn = p.dnn_override.clone();
@@ -15365,6 +15393,8 @@ fn build_sm_context_identity(
         // Issue #205: the UE's EXTERNAL identity, stored on the UE context from
         // the `gpsis` array of the `am-data` the AMF retrieves at registration.
         gpsi: state.and_then(|s| s.amf_ue.gpsi.clone()),
+        // Set by the establishment that sends it (#980 review).
+        origination_timestamp: None,
     }
 }
 
