@@ -38,6 +38,8 @@ pub use ie::{
 pub use ie::Gtp2CauseIe;
 
 // Re-export types
+/// TS 29.274 Table 8.4-1 cause octets, derived from [`Gtp2Cause`] (#1024, #1037).
+pub use types::cause;
 pub use types::{
     Gtp2Ambr, Gtp2ApnRestriction, Gtp2Arp, Gtp2Cause, Gtp2DaylightSavingTime,
     Gtp2ExtensionHeaderType, Gtp2FTeid, Gtp2FTeidInterfaceType, Gtp2NodeType, Gtp2PduType,

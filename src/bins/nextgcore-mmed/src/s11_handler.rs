@@ -1295,7 +1295,7 @@ fn handle_delete_bearer_request(raw: &[u8], sequence_number: u32, peer: SocketAd
 }
 
 /// GTPv2 cause "Reactivation requested" (TS 29.274 Table 8.4-1, value 8).
-pub const GTP_CAUSE_REACTIVATION_REQUESTED: u8 = 8;
+pub use nextgcore_gtp::v2::cause::REACTIVATION_REQUESTED as GTP_CAUSE_REACTIVATION_REQUESTED;
 
 /// What a PGW-initiated Delete Bearer Request asks of this MME (#688).
 #[derive(Debug, Clone, PartialEq, Eq)]

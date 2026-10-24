@@ -108,7 +108,8 @@ pub(super) type SmfCall = (String, serde_json::Value);
 
 /// A stand-in SMF: records every request, and answers an `upCnxState: ACTIVATING`
 /// update for any ref except `fail-*` with 200 and `n2SmInfo` = `transfer_for(ref)`.
-/// A `fail-*` ref gets 500. Everything else gets 204. Keep the server alive.
+/// A `fail-*` ref gets 500. A CreateSMContext gets 201 with SM context `est-<psi>`.
+/// Everything else gets 204. Keep the server alive.
 pub(super) async fn activating_smf() -> (
     nextgcore_sbi::server::SbiServer,
     u16,
@@ -142,6 +143,20 @@ pub(super) async fn activating_smf() -> (
                     .and_then(|rest| rest.split('/').next())
                     .unwrap_or_default()
                     .to_string();
+                // #756: a CreateSMContext (POST .../sm-contexts) is answered 201 with
+                // SM context `est-<psi>`, a recognisable N1 and an N2 transfer.
+                if uri.ends_with("/nsmf-pdusession/v1/sm-contexts") {
+                    let psi = body["pduSessionId"].as_u64().unwrap_or_default();
+                    let created = serde_json::json!({
+                        "smContextRef": format!("est-{psi}"),
+                        "n1SmMsg": base64::engine::general_purpose::STANDARD
+                            .encode([0x2E, psi as u8, 0x01, 0xC2]),
+                        "n2SmInfo": base64::engine::general_purpose::STANDARD
+                            .encode(transfer_for(&format!("est-{psi}"))),
+                    });
+                    return SResp::with_status(201)
+                        .with_body(created.to_string(), "application/json");
+                }
                 if body["upCnxState"] != "ACTIVATING" {
                     return SResp::no_content();
                 }
@@ -976,7 +991,7 @@ async fn an_establishment_while_the_smf_restarts_is_retried_and_succeeds() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
     drop(listener); // the SMF is down: connection refused
-    let _env = super::SmfEnvGuard::set(port);
+    let _env = super::SmfEnvGuard::acquire(port).await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_796_001u64, 96);
     ue_ready_for_sessions(&mut server, ue, ran);
@@ -1017,6 +1032,91 @@ async fn an_establishment_while_the_smf_restarts_is_retried_and_succeeds() {
     server.forget_ue(ue);
 }
 
+/// #980 review: an establishment's `3gpp-Sbi-Origination-Timestamp` is taken
+/// once, when its first CreateSMContext goes out. It is kept with the waiting
+/// request (a UE retransmission does not change it) and sent unchanged on the
+/// retry, so the PCF sees the retried create as the same request
+/// (TS 29.512 §4.2.7) and does not replace the association.
+///
+/// Revert-verified: stamping each attempt afresh fails this test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn a_retried_establishment_carries_its_first_origination_timestamp() {
+    use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    drop(listener); // the SMF is down
+    let _env = super::SmfEnvGuard::acquire(port).await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_980_001u64, 98);
+    ue_ready_for_sessions(&mut server, ue, ran);
+
+    let request = [0x2E, 0x05, 0x01, 0xC1, 0xFF, 0xFF];
+    server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &request))
+        .await
+        .expect("handled");
+    let first = server
+        .pending_establishments
+        .get(&(ue, 5))
+        .expect("waiting")
+        .origination_timestamp
+        .clone();
+    assert!(
+        nextgcore_sbi::datetime::origination_timestamp_to_epoch_ms(&first).is_some(),
+        "{first}"
+    );
+    // The UE retransmits (T3580) a little later: the same establishment.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &request))
+        .await
+        .expect("handled");
+    assert_eq!(
+        server.pending_establishments[&(ue, 5)].origination_timestamp,
+        first
+    );
+
+    // The SMF comes back and records the header of what it receives.
+    let stamps: Arc<std::sync::Mutex<Vec<Option<String>>>> = Arc::default();
+    let sink = Arc::clone(&stamps);
+    let rebound = std::net::TcpListener::bind(("127.0.0.1", port)).expect("rebind");
+    let addr = rebound.local_addr().expect("addr");
+    let smf = nextgcore_sbi::server::SbiServer::on_listener(
+        nextgcore_sbi::server::SbiServerConfig::new(addr),
+        rebound,
+    );
+    smf.start(move |req: SReq| {
+        let sink = Arc::clone(&sink);
+        async move {
+            sink.lock().expect("sink").push(
+                req.http
+                    .get_header(crate::sbi_path::ORIGINATION_TIMESTAMP_HEADER)
+                    .cloned(),
+            );
+            let body = serde_json::json!({
+                "smContextRef": "est-980",
+                "n1SmMsg": base64::engine::general_purpose::STANDARD
+                    .encode([0x2E, 0x05, 0x01, 0xC2]),
+                "n2SmInfo": base64::engine::general_purpose::STANDARD
+                    .encode(transfer_for("est-980")),
+            });
+            SResp::with_status(201).with_body(body.to_string(), "application/json")
+        }
+    })
+    .await
+    .expect("stand-in SMF starts");
+    make_establishments_due(&mut server);
+    settle_establishments(&mut server).await;
+
+    assert_eq!(
+        *stamps.lock().expect("stamps"),
+        vec![Some(first)],
+        "the retry carries the establishment's first stamp"
+    );
+    server.forget_ue(ue);
+}
+
 /// When no SMF comes back within the window, the UE is answered as TS 24.501
 /// prescribes for a routing failure (§5.4.5.2.5 a) 1), §5.4.5.3.1 e)): a DL NAS
 /// TRANSPORT carrying its own 5GSM message back, with 5GMM #90. The AMF does
@@ -1027,7 +1127,7 @@ async fn an_establishment_with_no_smf_back_in_the_window_gets_payload_not_forwar
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
     drop(listener);
-    let _env = super::SmfEnvGuard::set(port);
+    let _env = super::SmfEnvGuard::acquire(port).await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_796_002u64, 97);
     ue_ready_for_sessions(&mut server, ue, ran);
@@ -1099,7 +1199,7 @@ async fn until_in_flight(server: &NgapServer, n: usize) {
 #[allow(clippy::await_holding_lock)]
 async fn an_unanswering_smf_does_not_hold_the_ngap_task() {
     let (_hang, port) = hanging_smf();
-    let _env = super::SmfEnvGuard::set(port);
+    let _env = super::SmfEnvGuard::acquire(port).await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_796_011u64, 98);
     ue_ready_for_sessions(&mut server, ue, ran);
@@ -1113,6 +1213,7 @@ async fn an_unanswering_smf_does_not_hold_the_ngap_task() {
             &request,
             None,
             std::time::Instant::now(),
+            "Fri, 23 Oct 2026 10:00:00.000 GMT",
             &crate::sbi_path::SbiError::Timeout,
         )
         .await
@@ -1150,7 +1251,7 @@ async fn an_unanswering_smf_does_not_hold_the_ngap_task() {
 #[allow(clippy::await_holding_lock)]
 async fn the_window_ends_on_time_while_an_attempt_hangs() {
     let (_hang, port) = hanging_smf();
-    let _env = super::SmfEnvGuard::set(port);
+    let _env = super::SmfEnvGuard::acquire(port).await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_796_012u64, 99);
     ue_ready_for_sessions(&mut server, ue, ran);
@@ -1163,6 +1264,7 @@ async fn the_window_ends_on_time_while_an_attempt_hangs() {
             &request,
             None,
             std::time::Instant::now(),
+            "Fri, 23 Oct 2026 10:00:00.000 GMT",
             &crate::sbi_path::SbiError::Timeout,
         )
         .await
@@ -1219,6 +1321,7 @@ async fn a_ue_that_went_idle_is_dropped_from_the_window() {
             &request,
             None,
             std::time::Instant::now(),
+            "Fri, 23 Oct 2026 10:00:00.000 GMT",
             &crate::sbi_path::SbiError::Timeout,
         )
         .await
@@ -1250,6 +1353,7 @@ async fn the_window_runs_from_the_request_arrival() {
             &[0x2E, 0x05, 0x01, 0xC1, 0xFF, 0xFF],
             None,
             arrived,
+            "Fri, 23 Oct 2026 10:00:00.000 GMT",
             &crate::sbi_path::SbiError::Timeout,
         )
         .await
@@ -1322,7 +1426,7 @@ async fn a_late_success_for_an_earlier_request_is_released_not_applied() {
 #[allow(clippy::await_holding_lock)]
 async fn forgetting_a_ue_frees_its_attempt_permit() {
     let (_hang, port) = hanging_smf();
-    let _env = super::SmfEnvGuard::set(port);
+    let _env = super::SmfEnvGuard::acquire(port).await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_796_016u64, 103);
     ue_ready_for_sessions(&mut server, ue, ran);
@@ -1334,6 +1438,7 @@ async fn forgetting_a_ue_frees_its_attempt_permit() {
             &[0x2E, 0x05, 0x01, 0xC1, 0xFF, 0xFF],
             None,
             std::time::Instant::now(),
+            "Fri, 23 Oct 2026 10:00:00.000 GMT",
             &crate::sbi_path::SbiError::Timeout,
         )
         .await
@@ -1357,6 +1462,7 @@ async fn defer_request(server: &mut NgapServer, ue: u64, ran: u32, request: &[u8
             request,
             None,
             std::time::Instant::now(),
+            "Fri, 23 Oct 2026 10:00:00.000 GMT",
             &crate::sbi_path::SbiError::Timeout,
         )
         .await
@@ -1402,7 +1508,7 @@ async fn slow_to_fail_smf(hold: Duration) -> (u16, Arc<std::sync::atomic::Atomic
 async fn the_window_runs_from_arrival_through_the_uplink_nas_handler() {
     const HOLD: Duration = Duration::from_millis(400);
     let (port, stop) = slow_to_fail_smf(HOLD).await;
-    let _env = super::SmfEnvGuard::set(port);
+    let _env = super::SmfEnvGuard::acquire(port).await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_796_020u64, 105);
     ue_ready_for_sessions(&mut server, ue, ran);
@@ -1442,7 +1548,7 @@ async fn going_cm_idle_cancels_an_attempt_that_never_started() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
     drop(listener);
-    let _env = super::SmfEnvGuard::set(port);
+    let _env = super::SmfEnvGuard::acquire(port).await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_796_021u64, 106);
     ue_ready_for_sessions(&mut server, ue, ran);
@@ -1478,6 +1584,297 @@ async fn going_cm_idle_cancels_an_attempt_that_never_started() {
         server.forget_ue(7_796_900 + other);
     }
     server.forget_ue(ue);
+}
+
+// ---------------------------------------------------------------------------
+// #756: per-session state is pruned when the UE or the session goes away
+// ---------------------------------------------------------------------------
+
+/// What the AMF still holds for `ue`: `(sm_context_refs, sm_context_smfs, sess_list)`.
+fn session_state_of(server: &NgapServer, ue: u64) -> (usize, usize, usize) {
+    let refs = server
+        .sm_context_refs
+        .keys()
+        .filter(|(u, _)| *u == ue)
+        .count();
+    let smfs = server
+        .sm_context_smfs
+        .keys()
+        .filter(|(u, _)| *u == ue)
+        .count();
+    let sess = crate::context::amf_self()
+        .read()
+        .unwrap()
+        .sess_list_for_ue(ue)
+        .len();
+    (refs, smfs, sess)
+}
+
+/// A UE-initiated (switch-off) DEREGISTRATION REQUEST, TS 24.501 §8.2.12.
+fn switch_off_deregistration_request() -> Vec<u8> {
+    vec![
+        0x7E,
+        security_header::PLAIN_NAS_MESSAGE,
+        message_type::DEREGISTRATION_REQUEST_FROM_UE,
+        0x09, // switch off, 3GPP access; ngKSI 0
+        0x00,
+        0x0B,
+        0xF2, // 5G-GUTI
+        0x00,
+        0xF1,
+        0x10,
+        0x02,
+        0x00,
+        0x40,
+        0x11,
+        0x22,
+        0x33,
+        0x44,
+    ]
+}
+
+/// #756: register, open two sessions, deregister. All three stores are empty for
+/// the UE afterwards, and both sessions were released at the SMF.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deregistered_ue_leaves_no_session_state_behind() {
+    let (_smf, port, calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_756_001u64, 56);
+    secured_registered_ue(&mut server, ue, ran);
+    hold_session(&mut server, ue, 1, "prune-756-1", port);
+    hold_session(&mut server, ue, 2, "prune-756-2", port);
+    assert_eq!(session_state_of(&server, ue), (2, 2, 2));
+
+    let dereg = ue_protect(&switch_off_deregistration_request(), 0);
+    server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &dereg))
+        .await
+        .expect("handled");
+
+    let released: Vec<String> = calls
+        .lock()
+        .expect("calls")
+        .iter()
+        .map(|(u, _)| u.clone())
+        .filter(|u| u.ends_with("/release"))
+        .collect();
+    assert_eq!(
+        released.len(),
+        2,
+        "both sessions released at the SMF: {released:?}"
+    );
+    assert_eq!(
+        session_state_of(&server, ue),
+        (0, 0, 0),
+        "no sm_context_refs, sm_context_smfs or sess_list entry survives the UE"
+    );
+    assert!(!server.ue_auth_state.contains(ue));
+}
+
+/// The UE-requested PDU Session Release (0xD1) forgets that PSI and only that PSI.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_released_pdu_session_is_forgotten_and_its_sibling_kept() {
+    let (_smf, port, _calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_756_002u64, 57);
+    secured_registered_ue(&mut server, ue, ran);
+    hold_session(&mut server, ue, 1, "prune-756-rel-1", port);
+    hold_session(&mut server, ue, 2, "prune-756-rel-2", port);
+
+    // A raw 5GSM PDU SESSION RELEASE REQUEST for PSI 1 (the legacy 0x2E path).
+    let release_request = [0x2E, 0x01, 0x07, 0xD1];
+    server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &release_request))
+        .await
+        .expect("handled");
+    assert_eq!(session_state_of(&server, ue), (1, 1, 1));
+    assert!(
+        server.sm_context_refs.contains_key(&(ue, 2)),
+        "PSI 2 is untouched"
+    );
+    assert!(!server.sm_context_refs.contains_key(&(ue, 1)));
+}
+
+/// The orphan sweep drops refs whose session the SBI task removed (the SMF's
+/// RELEASED notify) or whose UE is gone, and keeps live ones.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sweep_drops_orphaned_session_state_and_keeps_live_state() {
+    let mut server = capturing_ngap_server().await;
+    let (live, gone) = (7_756_003u64, 7_756_004u64);
+    secured_registered_ue(&mut server, live, 58);
+    hold_session(&mut server, live, 1, "sweep-756-live", 7777);
+    hold_session(&mut server, live, 2, "sweep-756-released", 7777);
+    secured_registered_ue(&mut server, gone, 59);
+    hold_session(&mut server, gone, 1, "sweep-756-gone", 7777);
+
+    // RELEASED for live/PSI 2 arrives on the SBI task: only sess_list loses it.
+    {
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap();
+        let s = guard.sess_find_by_psi(live, 2).expect("held");
+        guard.sess_remove(s.id);
+    }
+    // The other UE's NAS context disappears without forget_ue.
+    server.ue_auth_state.remove(gone);
+
+    server.sweep_orphaned_session_state();
+    assert!(server.sm_context_refs.contains_key(&(live, 1)));
+    assert!(server.sm_context_smfs.contains_key(&(live, 1)));
+    assert!(!server.sm_context_refs.contains_key(&(live, 2)));
+    assert!(!server.sm_context_smfs.contains_key(&(live, 2)));
+    assert!(!server.sm_context_refs.contains_key(&(gone, 1)));
+    assert!(!server.sm_context_smfs.contains_key(&(gone, 1)));
+    // Tidy the global table for the UE whose NAS context the test removed.
+    server.forget_ue_sessions(gone);
+}
+
+/// A raw 5GSM PDU SESSION ESTABLISHMENT REQUEST for `psi` (the legacy 0x2E
+/// path): PTI 1, integrity protection maximum data rate full.
+fn establishment_request(psi: u8) -> Vec<u8> {
+    vec![0x2E, psi, 0x01, 0xC1, 0xFF, 0xFF]
+}
+
+/// Establish PSI 5 for a connected `ue` through the Uplink NAS Transport dispatch,
+/// with `fail_record` forcing the session record to fail as a full table would.
+/// Returns the SMF calls and the decoded NGAP.
+// `SmfEnvGuard` is held across the awaits on purpose: the SMF address is a
+// process environment variable, read during the establishment.
+#[allow(clippy::await_holding_lock)]
+async fn establish_psi_5(
+    fail_record: bool,
+    ue: u64,
+    ran: u32,
+) -> (Vec<SmfCall>, Vec<Sent>, (usize, usize, usize)) {
+    let (_smf, port, calls) = activating_smf().await;
+    let _env = super::SmfEnvGuard::set(port);
+    let mut server = capturing_ngap_server().await;
+    secured_registered_ue(&mut server, ue, ran);
+    server.ue_auth_state.with_mut(ue, |s| {
+        s.initial_context_setup_response_received = true;
+    });
+    server.fail_next_session_record = fail_record;
+    server
+        .handle_uplink_nas_transport(
+            ASSOC,
+            &uplink_nas_transport(ue, ran, &establishment_request(5)),
+        )
+        .await
+        .expect("handled");
+    // The unrecorded session's SMF release runs off the NGAP task.
+    server.sbi_offload.settle().await;
+    let sent = take_sent_ngap(&mut server)
+        .into_iter()
+        .map(|(_, p)| decode_sent(&p))
+        .collect();
+    let state = session_state_of(&server, ue);
+    server.forget_ue_sessions(ue);
+    server.ue_auth_state.remove(ue);
+    let calls = calls.lock().expect("calls").clone();
+    (calls, sent, state)
+}
+
+/// #756 review m1. A session the AMF cannot record (its session table is full)
+/// is not established. Otherwise the AMF could never page, modify, re-activate
+/// or release it, and the sweep would drop its refs within 10 s, leaking it at
+/// the SMF and UPF. The AMF releases it at the SMF, does not relay the SMF's
+/// Accept, and sends the 5GSM message back to the UE in a DL NAS Transport with
+/// 5GMM #90 "payload was not forwarded" (TS 24.501 §5.4.5.2.5, §5.4.5.3.1 e)).
+/// Nothing is left for the UE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_the_amf_cannot_record_is_released_and_refused() {
+    let (calls, sent, state) = establish_psi_5(true, 7_756_011, 61).await;
+    let uris: Vec<&str> = calls.iter().map(|(u, _)| u.as_str()).collect();
+    assert_eq!(
+        uris.iter()
+            .filter(|u| u.ends_with("/nsmf-pdusession/v1/sm-contexts"))
+            .count(),
+        1,
+        "{uris:?}"
+    );
+    assert!(
+        uris.iter()
+            .any(|u| u.ends_with("/sm-contexts/est-5/release")),
+        "the unrecorded session is released at the SMF: {uris:?}"
+    );
+    let [Sent::DownlinkNas { nas_pdu, .. }] = sent.as_slice() else {
+        panic!("one DL NAS Transport and no setup request: {sent:?}");
+    };
+    use nextgcore_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
+    let Ok(FiveGmmMessage::DlNasTransport(dl)) =
+        parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&nas_pdu[7..]))
+    else {
+        panic!("a DL NAS TRANSPORT: {nas_pdu:02x?}");
+    };
+    assert_eq!(dl.gmm_cause, Some(90), "5GMM #90 payload was not forwarded");
+    assert_eq!(
+        dl.payload_container.data.first(),
+        Some(&0x2E),
+        "the UE's own 5GSM message comes back, not the SMF's Accept"
+    );
+    assert_eq!(dl.payload_container.data.get(3), Some(&0xC1));
+    assert_eq!(state, (0, 0, 0), "nothing is left for the UE");
+}
+
+/// The positive control for the test above: with the record succeeding, the
+/// same establishment is recorded in all three stores and nothing is released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recorded_session_is_established() {
+    let (calls, _sent, state) = establish_psi_5(false, 7_756_012, 62).await;
+    assert!(
+        !calls.iter().any(|(u, _)| u.ends_with("/release")),
+        "{calls:?}"
+    );
+    assert_eq!(state, (1, 1, 1));
+}
+
+/// #756 review m4. Implicit deregistration (TS 24.501 §5.3.7) releases every
+/// session at its SMF BEFORE the UE's per-session state is pruned: two
+/// `/release` calls, then nothing left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// The reachability sweep lock is held across the awaits on purpose: the sweep
+// walks the shared store, and no sibling sweep may run in between.
+#[allow(clippy::await_holding_lock)]
+async fn an_implicit_deregistration_releases_at_the_smf_then_prunes() {
+    let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let (_smf, port, calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_756_021u64, 63);
+    secured_registered_ue(&mut server, ue, ran);
+    hold_session(&mut server, ue, 1, "implicit-756-1", port);
+    hold_session(&mut server, ue, 2, "implicit-756-2", port);
+    server.ue_auth_state.with_mut(ue, |s| {
+        s.cm_idle = true;
+        s.reachability = Some(Reachability {
+            phase: ReachabilityPhase::ImplicitDeregistration,
+            deadline: Instant::now() - Duration::from_secs(1),
+        });
+    });
+
+    server
+        .process_reachability_timers()
+        .await
+        .expect("implicit deregistration");
+
+    let mut released: Vec<String> = calls
+        .lock()
+        .expect("calls")
+        .iter()
+        .map(|(u, _)| u.clone())
+        .filter(|u| u.ends_with("/release"))
+        .collect();
+    released.sort();
+    assert_eq!(
+        released
+            .iter()
+            .map(|u| u.rsplit("/sm-contexts/").next().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec!["implicit-756-1/release", "implicit-756-2/release"],
+        "each session is released at the SMF holding it"
+    );
+    assert_eq!(session_state_of(&server, ue), (0, 0, 0));
+    assert!(!server.ue_auth_state.contains(ue));
 }
 
 // ---------------------------------------------------------------------------

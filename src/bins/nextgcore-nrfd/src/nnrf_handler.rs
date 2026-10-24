@@ -435,20 +435,52 @@ impl NotifCondition {
         serde_json::Value::Object(map)
     }
 
-    /// Does a change to `attribute` (a top-level NFProfile attribute name)
-    /// warrant a notification under this condition?
+    /// Does a change at `path` (an RFC 6902 `ChangeItem.path`, i.e. an RFC 6901
+    /// JSON Pointer into the NFProfile) warrant a notification under this
+    /// condition?
     ///
     /// `monitoredAttributes` is an allowlist, `unmonitoredAttributes` a
     /// denylist; exactly one of the two is populated (see [`Self::from_json`]).
-    pub fn notifies_attribute(&self, attribute: &str) -> bool {
+    /// TS 29.510 §6.1.6.2.43 makes both lists of JSON Pointers (its example is
+    /// `"/nfStatus"`), so an entry covers the change at its own location and
+    /// everything below it; a monitored entry also matches a change to one of
+    /// its ancestors (a replaced `/nfServices` changes `/nfServices/0/fqdn`).
+    /// A bare attribute name (`"nfStatus"`, what nextgcore's AMF sent before
+    /// #940) is read as the pointer to that top-level attribute.
+    pub fn notifies_attribute(&self, path: &str) -> bool {
+        let path = as_pointer(path);
         if let Some(ref monitored) = self.monitored_attributes {
-            return monitored.iter().any(|a| a == attribute);
+            return monitored.iter().any(|m| {
+                let m = as_pointer(m);
+                pointer_covers(&m, &path) || pointer_covers(&path, &m)
+            });
         }
         if let Some(ref unmonitored) = self.unmonitored_attributes {
-            return !unmonitored.iter().any(|a| a == attribute);
+            return !unmonitored
+                .iter()
+                .any(|m| pointer_covers(&as_pointer(m), &path));
         }
         true
     }
+}
+
+/// `p` as an RFC 6901 pointer: a bare name gains its leading `/`.
+fn as_pointer(p: &str) -> String {
+    if p.is_empty() || p.starts_with('/') {
+        p.to_string()
+    } else {
+        format!("/{p}")
+    }
+}
+
+/// Whether the location `outer` is `inner` or one of its ancestors, on whole
+/// reference tokens (`/nfStatus` covers `/nfStatus` but not `/nfStatusX`).
+fn pointer_covers(outer: &str, inner: &str) -> bool {
+    inner == outer
+        || outer.is_empty()
+        || inner
+            .strip_prefix(outer)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// The `SubscrCond` discriminator a subscription's condition was recognised as.

@@ -49,19 +49,19 @@ use tokio::sync::Mutex;
 pub const N26_AMF_GTP_C: u8 = 40;
 
 /// GTPv2-C cause `Request accepted` (TS 29.274 Table 8.4-1).
-pub const CAUSE_REQUEST_ACCEPTED: u8 = 16;
+pub use nextgcore_gtp::v2::cause::REQUEST_ACCEPTED as CAUSE_REQUEST_ACCEPTED;
 
 /// GTPv2-C cause `IMSI/IMEI not known` (TS 29.274 Table 8.4-1).
 ///
 /// One of the four message-specific causes §7.3.6 names (`29274-j60.txt:19878`), and the
 /// right one when the 4G-GUTI an MME sent does not reverse-map to any UE this AMF serves.
-pub const CAUSE_IMSI_IMEI_NOT_KNOWN: u8 = 96;
+pub use nextgcore_gtp::v2::cause::IMSI_IMEI_NOT_KNOWN as CAUSE_IMSI_IMEI_NOT_KNOWN;
 
 /// GTPv2-C cause `Request rejected` (TS 29.274 Table 8.4-1).
 ///
 /// §7.3.6 requires it *"if the UE is registered to the source AMF without any PDU
 /// session"* (`29274-j60.txt:19935-19936`).
-pub const CAUSE_REQUEST_REJECTED: u8 = 94;
+pub use nextgcore_gtp::v2::cause::REQUEST_REJECTED_REASON_NOT_SPECIFIED as CAUSE_REQUEST_REJECTED;
 
 /// `Used NAS integrity protection algorithm` / `Used NAS Cipher` in the MM Context are
 /// EPS algorithm identifiers, and the AMF's are 5GS ones.
@@ -2271,9 +2271,7 @@ mod tests {
     /// MME would hold a key this AMF still uses for its own NAS.
     #[test]
     fn the_mm_context_carries_a_derived_kasme_not_the_kamf() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.blocking_lock();
 
         let mut ue = AmfUe::new(0x347_0001, 1);
         ue.kamf = [0x5A; 32];
@@ -2365,9 +2363,7 @@ mod tests {
     /// An accepted Context Response carries every Table 7.3.6-1 IE the AMF can supply.
     #[test]
     fn an_accepted_context_response_carries_its_table_7_3_6_1_ies() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.blocking_lock();
 
         let mut ue = AmfUe::new(0x347_0002, 2);
         ue.supi = Some("imsi-001010000000002".to_string());
@@ -2431,9 +2427,7 @@ mod tests {
     /// Several PDN connections share instance 0 (TS 29.274 §8.39).
     #[test]
     fn several_pdn_connections_are_all_carried_at_instance_zero() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.blocking_lock();
 
         let ue = AmfUe::new(0x347_0003, 3);
         let pdns: Vec<Gtp2PdnConnectionIe> = [5u8, 6]
@@ -2498,9 +2492,7 @@ mod tests {
     /// procedure would answer "IMSI/IMEI not known" for every UE.
     #[test]
     fn a_natively_registered_ue_is_found_by_the_guti_an_mme_maps_from_its_5g_guti() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.blocking_lock();
         crate::test_support::init_context();
 
         // A distinct 5G-TMSI, so this test cannot collide with a sibling's UE: the AMF
@@ -2586,9 +2578,7 @@ mod tests {
     /// The switch reads back in both directions, and nothing is bound when it is off.
     #[test]
     fn the_n26_switch_reads_back_in_both_directions() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.blocking_lock();
         set_for_test(true);
         assert!(enabled());
         set_for_test(false);

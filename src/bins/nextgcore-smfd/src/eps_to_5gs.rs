@@ -1177,6 +1177,57 @@ async fn handle_prepared_inner(sm_context_ref: &str, transfer: &[u8]) -> SbiResp
             gnb_addr[3],
         );
         root["epsBearerSetup"] = serde_json::json!(elements);
+    } else {
+        // #964, TS 29.502 §5.2.2.3.4.2, TS 23.502 §4.9.1.3.2 step 11: an intra-5GS
+        // handover's PREPARED answer carries the source's Handover Command Transfer
+        // (`HANDOVER_CMD`). With a direct forwarding path (the source's Handover Required
+        // Transfer said so at PREPARING) and a forwarding tunnel from the target, it names
+        // that tunnel and the QoS flows the target accepted for forwarding; otherwise the
+        // source forwards nothing.
+        let forwarding = sess
+            .handover
+            .direct_data_forwarding
+            .then_some(ack.dl_forwarding.as_ref())
+            .flatten()
+            .and_then(|t| t.ipv4().map(|addr| (t.teid, addr)));
+        let command = match crate::n2_transfer::handover_command_transfer(
+            forwarding.map(|tunnel| (tunnel, ack.forwarding_accepted_qfis.as_slice())),
+        ) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                log::error!(
+                    "SM Context Update (PREPARED) for ref={sm_context_ref}: \
+                     HandoverCommandTransfer encode failed: {e:?}"
+                );
+                return crate::problem_response(
+                    500,
+                    "SYSTEM_FAILURE",
+                    "N2 SM information encode failed",
+                );
+            }
+        };
+        log::info!(
+            "SM Context Update (PREPARED) for ref={sm_context_ref}: target DL N3 \
+             {}.{}.{}.{} TEID 0x{gnb_teid:08x}, accepted QFIs {accepted:?}, direct \
+             forwarding {forwarding:?} for QFIs {:?}; DL still on the source until COMPLETED",
+            gnb_addr[0],
+            gnb_addr[1],
+            gnb_addr[2],
+            gnb_addr[3],
+            ack.forwarding_accepted_qfis,
+        );
+        if let Ok(ctx) = smf_self().read() {
+            ctx.sess_update(&sess);
+        }
+        root["n2SmInfoType"] = serde_json::json!("HANDOVER_CMD");
+        root["n2SmInfo"] = serde_json::json!({ "contentId": "n2SmInfo" });
+        return SbiResponse::with_status(200)
+            .with_body(root.to_string(), "application/json")
+            .with_part(nextgcore_sbi::message::SbiPart::with_content(
+                "n2SmInfo",
+                nextgcore_sbi::constants::content_type::APPLICATION_NGAP,
+                bytes::Bytes::from(command),
+            ));
     }
     // #750: write back only what PREPARED decided, onto the session as it is NOW,
     // and only if it is still this SM context. The copy read above predates the UPF
@@ -1282,7 +1333,13 @@ async fn handle_completed_inner(
             target.is_some(),
             upf_seid.is_some()
         );
-        return completed();
+        // #964 review: an error, not `200 COMPLETED`, so the AMF sees that the downlink was
+        // not switched (it retries once and logs), rather than a success that did nothing.
+        return crate::problem_response(
+            500,
+            "SYSTEM_FAILURE",
+            "The handover cannot complete: no target DL endpoint or no N4 session",
+        );
     };
     let smf_n4_seid = crate::smf_n4_seid_for(sm_context_ref);
     let forwarding_ebis = sess
@@ -1337,10 +1394,14 @@ async fn handle_completed_inner(
         sess.handover.eps_to_5gs = false;
         sess.handover.n3_ul_pdr_id = None;
         sess.handover.forwarding_ebis.clear();
+        // The UE is CONNECTED on the target and the downlink FAR forwards to it, so the
+        // user plane is ACTIVATED whatever it was before -- including after the source's
+        // AN release DEACTIVATED it mid-handover (#805, the #738 ordering). Left
+        // DEACTIVATED, a Downlink Data Report would page a connected UE.
+        sess.up_cnx_state = context::UpCnxState::Activated;
         if was_eps {
             // The PDN connection is a PDU session now; its S5/S8 leg was released above.
             sess.epc = false;
-            sess.up_cnx_state = context::UpCnxState::Activated;
             sess.establishment_accept_sent = true;
         }
         if let Ok(ctx) = smf_self().read() {
@@ -1870,9 +1931,7 @@ mod tests {
     async fn an_eps_to_5gs_handover_runs_end_to_end_against_the_real_amf() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let upf = crate::pfcp_path::stand_in::associated_upf().await;
-        let _amf_guard = nextgcore_amfd::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _amf_guard = nextgcore_amfd::test_support::CONTEXT_GUARD.lock().await;
         nextgcore_amfd::test_support::init_context();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         crate::context::smf_context_init(64, 256, 512);
@@ -2202,12 +2261,19 @@ mod tests {
             "Forward Relocation Complete Notification"
         );
 
-        // Execution step 8 at the UPF: DL FAR 2 → the target gNB, PDR 1 removed. Read once:
-        // the AMF sends the FRCN only after the SMF answered COMPLETED, and the SMF answers
-        // after the switch reached the UPF. #791's `left: 0` was the SMF finding no N4
-        // session (an unlocked sibling had wiped `pfcp_sessions`, closed by #762), which no
-        // wait would recover; the diagnostics say which state it was in.
-        let mods = upf.modification_bodies();
+        // Execution step 8 at the UPF: DL FAR 2 → the target gNB, PDR 1 removed. #945: the
+        // AMF sends the FRCN first (TS 23.502 §4.11.1.2.2.3 step 5) and COMPLETED (step 7)
+        // off its NGAP task after it, so the switch is waited for here, up to 5 s. #791's
+        // `left: 0` was the SMF finding no N4 session (an unlocked sibling had wiped
+        // `pfcp_sessions`, closed by #762); the diagnostics say which state it was in.
+        let mut mods = upf.modification_bodies();
+        for _ in 0..100 {
+            if !mods.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            mods = upf.modification_bodies();
+        }
         assert_eq!(
             mods.len(),
             1,

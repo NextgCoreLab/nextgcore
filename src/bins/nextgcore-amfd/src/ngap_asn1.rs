@@ -4122,16 +4122,6 @@ pub fn hand_written_diagnostics(report: &CriticalityErrorIndication) -> Critical
     }
 }
 
-/// Decode a HANDOVER REQUIRED (TS 38.413 §9.2.3.1) with the GENERATED codec
-/// (#417), applying §10.3.4.2 and §10.3.5. Handover Preparation is a Class 1
-/// procedure whose unsuccessful outcome is HANDOVER PREPARATION FAILURE, so a
-/// not-comprehended "reject" IE, or a missing one of the six mandatory
-/// criticality-reject IEs, comes back as `Reject` for the caller to answer
-/// with that failure (or an Error Indication when the UE cannot be named); a
-/// "notify" IE comes back in `error_indication`. Cause and Direct Forwarding
-/// Path Availability are criticality ignore: a missing Cause is
-/// misc/unspecified. A TargetID this AMF cannot represent (an N3IWF, a
-/// choice extension) is `Undecodable`, as the hand-written parser had it.
 /// The UE ids of a HANDOVER REQUIRED that is well formed but asks for a handover this
 /// AMF cannot represent (#744): a HandoverType past the extension marker
 /// (fivegs-to-utran) or a TargetID it has no value for (the choice extensions
@@ -4171,6 +4161,18 @@ pub fn handover_required_unsupported_target(data: &[u8]) -> Option<(u64, u32)> {
     unsupported.then_some((amf?, ran?))
 }
 
+/// Decode a HANDOVER REQUIRED (TS 38.413 §9.2.3.1) with the GENERATED codec
+/// (#417), applying §10.3.4.2 and §10.3.5. Handover Preparation is a Class 1
+/// procedure whose unsuccessful outcome is HANDOVER PREPARATION FAILURE, so a
+/// not-comprehended "reject" IE, or a missing one of the six mandatory
+/// criticality-reject IEs, comes back as `Reject` for the caller to answer
+/// with that failure (or an Error Indication when the UE cannot be named); a
+/// "notify" IE comes back in `error_indication`. Cause and Direct Forwarding
+/// Path Availability are criticality ignore: a missing Cause is
+/// misc/unspecified. A HandoverType or TargetID this AMF cannot represent (an N3IWF, a
+/// choice extension) is `Undecodable` -- but only once the PDU has passed the
+/// §10.3.4.2 / §10.3.5 checks, so a missing mandatory IE or a not-comprehended reject
+/// IE is answered with abstract-syntax-error whatever the type or target (#844 review).
 pub fn decode_handover_required_asn1(data: &[u8]) -> NasTransportDecode<HandoverRequired> {
     use ngap_gen::HandoverRequiredProtocolIEs_EntryValue as Ie;
     let Some((criticality, ies, mut reject, notify)) =
@@ -4183,30 +4185,37 @@ pub fn decode_handover_required_asn1(data: &[u8]) -> NasTransportDecode<Handover
     };
     let (mut amf, mut ran, mut ho_type, mut cause, mut target) = (None, None, None, None, None);
     let (mut sessions, mut container, mut direct) = (None, None, None);
+    // Present but not representable here (#744): decided after the abstract-syntax checks.
+    let (mut ho_type_present, mut target_present, mut unsupported) = (false, false, false);
     for entry in ies {
         match entry.value {
             Ie::Id_AMF_UE_NGAP_ID(v) => amf = Some(v.0),
             Ie::Id_RAN_UE_NGAP_ID(v) => ran = Some(v.0),
             Ie::Id_HandoverType(v) => {
-                ho_type = Some(match v.0 {
-                    ngap_gen::HandoverType::INTRA5GS => HandoverType::Intra5gs,
-                    ngap_gen::HandoverType::FIVEGS_TO_EPS => HandoverType::FivegsToEps,
-                    ngap_gen::HandoverType::EPS_TO_5GS => HandoverType::EpsTo5gs,
+                ho_type_present = true;
+                ho_type = match v.0 {
+                    ngap_gen::HandoverType::INTRA5GS => Some(HandoverType::Intra5gs),
+                    ngap_gen::HandoverType::FIVEGS_TO_EPS => Some(HandoverType::FivegsToEps),
+                    ngap_gen::HandoverType::EPS_TO_5GS => Some(HandoverType::EpsTo5gs),
                     other => {
                         // 5GS-to-UTRAN and later: no hand-written value, as before.
                         log::warn!("Handover Required with an unsupported HandoverType {other}");
-                        return NasTransportDecode::Undecodable;
+                        unsupported = true;
+                        None
                     }
-                })
+                }
             }
             Ie::Id_Cause(v) => cause = Some(hand_written_cause(&v)),
-            Ie::Id_TargetID(v) => match hand_written_target_id(&v) {
-                Some(t) => target = Some(t),
-                None => {
-                    log::warn!("Handover Required names a target this AMF cannot represent");
-                    return NasTransportDecode::Undecodable;
+            Ie::Id_TargetID(v) => {
+                target_present = true;
+                match hand_written_target_id(&v) {
+                    Some(t) => target = Some(t),
+                    None => {
+                        log::warn!("Handover Required names a target this AMF cannot represent");
+                        unsupported = true;
+                    }
                 }
-            },
+            }
             Ie::Id_DirectForwardingPathAvailability(_) => {
                 direct = Some(
                     nextgcore_ngap::types::DirectForwardingPathAvailability::DirectPathAvailable,
@@ -4228,8 +4237,8 @@ pub fn decode_handover_required_asn1(data: &[u8]) -> NasTransportDecode<Handover
     for (present, id) in [
         (amf.is_some(), ngap_gen::ID_AMF_UE_NGAP_ID),
         (ran.is_some(), ngap_gen::ID_RAN_UE_NGAP_ID),
-        (ho_type.is_some(), ngap_gen::ID_HANDOVER_TYPE),
-        (target.is_some(), ngap_gen::ID_TARGET_ID),
+        (ho_type_present, ngap_gen::ID_HANDOVER_TYPE),
+        (target_present, ngap_gen::ID_TARGET_ID),
         (
             sessions.is_some(),
             ngap_gen::ID_PDU_SESSION_RESOURCE_LIST_HO_RQD,
@@ -4253,6 +4262,9 @@ pub fn decode_handover_required_asn1(data: &[u8]) -> NasTransportDecode<Handover
             diagnostics,
         )
     };
+    if unsupported && reject.is_empty() {
+        return NasTransportDecode::Undecodable;
+    }
     let (
         Some(amf_ue_ngap_id),
         Some(ran_ue_ngap_id),
@@ -5075,6 +5087,17 @@ pub fn decode_path_switch_request_asn1(data: &[u8]) -> PathSwitchRequestDecode {
 /// released lists.
 pub fn path_switch_unsuccessful_transfer(cause: Cause) -> Option<Vec<u8>> {
     nextgcore_ngap_gen::encode_contained(&ngap_gen::PathSwitchRequestUnsuccessfulTransfer {
+        cause: generated_cause(cause),
+        ie_extensions: None,
+    })
+    .ok()
+}
+
+/// A HandoverPreparationUnsuccessfulTransfer (TS 38.413 §9.3.4.18) carrying `cause`:
+/// the per-session content of a HANDOVER COMMAND's PDU Session Resource to Release List
+/// (§9.2.3.2), for a session the source offered that is not handed over (#964).
+pub fn handover_preparation_unsuccessful_transfer(cause: Cause) -> Option<Vec<u8>> {
+    nextgcore_ngap_gen::encode_contained(&ngap_gen::HandoverPreparationUnsuccessfulTransfer {
         cause: generated_cause(cause),
         ie_extensions: None,
     })
@@ -14531,8 +14554,8 @@ mod handover_3b_ii_tests {
 
     /// The whole DOWNLINK RAN STATUS TRANSFER for AMF UE NGAP ID 1, RAN UE NGAP
     /// ID 2 and that container, derived by hand: CHOICE initiatingMessage `000`
-    /// + pad; procedure code 7; criticality ignore `01` + pad; open type length
-    /// 31; SEQUENCE ext bit + pad; IE count 3 (two-octet aligned); then each
+    /// plus pad; procedure code 7; criticality ignore `01` plus pad; open type
+    /// length 31; SEQUENCE ext bit plus pad; IE count 3 (two-octet aligned); then each
     /// ProtocolIE-Field: id (two octets), criticality reject `00` + pad, open
     /// type length, value -- AMF-UE-NGAP-ID 1 (3-bit octet count 0, pad, `01`),
     /// RAN-UE-NGAP-ID 2 (2-bit octet count 0, pad, `02`), the container.

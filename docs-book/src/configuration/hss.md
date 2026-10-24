@@ -51,7 +51,7 @@ The `--diameter-id`/`--diameter-realm`/`--diameter-addr`/`--diameter-port` flags
 
 ### Parsed-but-inert / decorative YAML fields
 
-- **`logger.file.path` and `logger.level` are inert.** Log level comes only from the CLI flag `-e/--log-level` (default `info`); `-l/--log-file` is accepted by clap but `init_logging()` never uses it, so logs always go to stderr.
+- **`logger.level` is read; `logger.file.path` is inert.** The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691). `-l/--log-file` is accepted by clap but never used, so logs always go to stderr.
 - **`global.max.ue` and `global.max.peer` are inert.** The identity-pool size comes from the CLI flag `--max-ue` (default `1024`); there is no peer cap in the code.
 - **`hss.freeDiameter` and the `--diameter-config` flag** point at `docker/rust/configs/epc/freeDiameter/hss.conf`, which no code reads.
 - **`hss.metrics.server` is inert.** The daemon starts no metrics HTTP server; its only telemetry export is OpenTelemetry OTLP tracing (`nextgcore_metrics::otel::init_otel` in `main.rs`).
@@ -64,7 +64,7 @@ From the clap `Args` struct in `src/bins/nextgcore-hssd/src/main.rs`:
 |---|---|---|---|
 | `-c, --config` | string | `/etc/nextgcore/hss.yaml` | Configuration file path. Unreadable or invalid YAML stops startup. |
 | `-l, --log-file` | string | unset | **Accepted but unused** — `init_logging()` never opens it; logging always goes to stderr. |
-| `-e, --log-level` | string | `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`); any other value silently falls back to `info`. |
+| `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-m, --no-color` | flag | off | Disable color output. |
 | `-k, --kill` | flag | off | Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor. |
 | `--diameter-config` | string | `/etc/nextgcore/freeDiameter/hss.conf` | **Accepted but unused** — no code reads freeDiameter config files. |

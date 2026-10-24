@@ -25,8 +25,17 @@ struct ServerList {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct PfcpSection {
+    server: Option<Vec<AddrEntry>>,
+    /// The SGW-C addresses (IPs, CIDR prefixes or host names) allowed to associate.
+    allowed_peers: Option<Vec<String>>,
+    /// The most sessions one SGW-C may hold (#968).
+    max_sessions_per_peer: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct SgwuSection {
-    pfcp: Option<ServerList>,
+    pfcp: Option<PfcpSection>,
     gtpu: Option<ServerList>,
 }
 
@@ -50,6 +59,12 @@ pub struct SgwuConfig {
     pub gtpu_ip: Option<Ipv4Addr>,
     /// `logger.level`: the default log filter when `RUST_LOG` is unset (#500).
     pub log_level: Option<String>,
+    /// `sgwu.pfcp.allowed_peers`: the SGW-C addresses (IPs, CIDR prefixes or host
+    /// names) an Association Setup is accepted from (security, #968), as written. Parsed by
+    /// `pfcp_open`, which refuses to start on a bad entry.
+    pub pfcp_allowed_peers: Vec<String>,
+    /// `sgwu.pfcp.max_sessions_per_peer`: the per-SGW-C session cap (#968).
+    pub pfcp_max_sessions_per_peer: Option<usize>,
 }
 
 static CONFIG: OnceLock<SgwuConfig> = OnceLock::new();
@@ -96,15 +111,10 @@ pub fn log_level_from_args<I: IntoIterator<Item = String>>(args: I) -> Option<St
 /// then `info` -- the level every other NF starts at. `RUST_LOG`, when set, still
 /// overrides it (`env_logger`'s `default_filter_or`). Read silently, because it
 /// runs before the logger exists; [`load`] reports any problem with the file.
+///
+/// The shared resolution every NF uses (#691 follow-up).
 pub fn default_log_level(cli: Option<String>, path: Option<&str>) -> String {
-    cli.or_else(|| {
-        let content = std::fs::read_to_string(path?).ok()?;
-        serde_yaml::from_str::<SgwuYaml>(&content)
-            .ok()?
-            .logger?
-            .level
-    })
-    .unwrap_or_else(|| "info".to_string())
+    nextgcore_core::log::nf_log_level(cli.as_deref(), path)
 }
 
 /// Parse `path`. A missing or unparsable file yields the default and a warning
@@ -142,10 +152,18 @@ fn parse(content: &str) -> Result<SgwuConfig, serde_yaml::Error> {
         }
     };
     let section = yaml.sgwu.unwrap_or_default();
+    let pfcp = section.pfcp.unwrap_or_default();
     Ok(SgwuConfig {
-        pfcp_ip: first_ipv4(section.pfcp, "pfcp"),
+        pfcp_ip: first_ipv4(
+            Some(ServerList {
+                server: pfcp.server,
+            }),
+            "pfcp",
+        ),
         gtpu_ip: first_ipv4(section.gtpu, "gtpu"),
         log_level: yaml.logger.and_then(|l| l.level),
+        pfcp_allowed_peers: pfcp.allowed_peers.unwrap_or_default(),
+        pfcp_max_sessions_per_peer: pfcp.max_sessions_per_peer,
     })
 }
 
@@ -178,6 +196,20 @@ mod tests {
         assert_eq!(config.pfcp_ip, Some(Ipv4Addr::new(172, 24, 0, 6)));
         assert_eq!(config.gtpu_ip, Some(Ipv4Addr::new(172, 24, 0, 6)));
         assert_eq!(config.log_level.as_deref(), Some("info"));
+        assert!(config.pfcp_allowed_peers.is_empty());
+    }
+
+    /// #968: `sgwu.pfcp.allowed_peers` is read as written.
+    #[test]
+    fn the_pfcp_allowed_peers_are_read() {
+        let config = parse(
+            "sgwu:\n  pfcp:\n    server:\n      - address: 172.24.0.6\n    allowed_peers:\n      \
+             - 172.24.0.5\n      - 10.0.0.0/8\n    max_sessions_per_peer: 300\n",
+        )
+        .unwrap();
+        assert_eq!(config.pfcp_ip, Some(Ipv4Addr::new(172, 24, 0, 6)));
+        assert_eq!(config.pfcp_allowed_peers, vec!["172.24.0.5", "10.0.0.0/8"]);
+        assert_eq!(config.pfcp_max_sessions_per_peer, Some(300));
     }
 
     /// #500: with no RUST_LOG, sgwud starts at `--log-level`, else the file's
