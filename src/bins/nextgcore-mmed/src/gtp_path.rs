@@ -265,6 +265,12 @@ pub fn send_response_to_sgwc(peer: SocketAddr, msg: &Gtp2Message) -> GtpPathResu
 
 /// Send `msg` as a triggered message, echoing the request's sequence number.
 fn send_response_to(peer: SocketAddr, msg: &Gtp2Message) -> GtpPathResult<()> {
+    #[cfg(test)]
+    if let Some((server, _)) = test_route(None) {
+        return server
+            .send_response(peer, msg)
+            .map_err(GtpPathError::SocketError);
+    }
     let server = server().ok_or_else(|| {
         GtpPathError::SocketError("no S11 socket bound: cannot answer".to_string())
     })?;
@@ -1566,8 +1572,9 @@ pub(crate) fn record_pending_erab_modification_for_test(
 }
 
 /// Send the Modify Bearer Request of an E-UTRAN initiated E-RAB modification
-/// (TS 23.401 §5.4.7 step 2) for the bearers `ebis` of `mme_ue_id`, whose eNB
-/// endpoints the caller has already stored, and park `pending` until the
+/// (TS 23.401 §5.4.7 step 2) for the bearers of `pending.switched`, carrying
+/// their NEW eNB endpoints from that list (the bearer contexts are written only
+/// when the Serving GW accepts them, #736), and park `pending` until the
 /// response arrives. Returns the request's sequence number.
 pub fn send_modify_bearer_request_for_erab_modification(
     ctx: &MmeContext,
@@ -1623,8 +1630,9 @@ pub struct SwitchedBearer {
     pub ip: crate::context::IpAddr,
 }
 
-/// What a handover's Modify Bearer Request was for.
-#[derive(Debug, Clone)]
+/// What a handover's Modify Bearer Request was for. `Debug` is manual: the
+/// X2 variant carries the derived NH key, which must never reach a log (#861).
+#[derive(Clone)]
 pub enum HandoverModifyKind {
     /// X2 handover: the PATH SWITCH REQUEST ACKNOWLEDGE (or FAILURE) waits on
     /// the response (TS 23.401 §5.5.1.1.2 step 5).
@@ -1656,6 +1664,43 @@ pub enum HandoverModifyKind {
         /// COMMAND (#730 review N1).
         admitted: Vec<u8>,
     },
+}
+
+impl std::fmt::Debug for HandoverModifyKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PathSwitch {
+                enb_id,
+                mme_ue_s1ap_id,
+                enb_ue_s1ap_id,
+                ncc,
+                nh: _,
+                released,
+                notify,
+            } => f
+                .debug_struct("PathSwitch")
+                .field("enb_id", enb_id)
+                .field("mme_ue_s1ap_id", mme_ue_s1ap_id)
+                .field("enb_ue_s1ap_id", enb_ue_s1ap_id)
+                .field("ncc", ncc)
+                .field("nh", &"<redacted>")
+                .field("released", released)
+                .field("notify", notify)
+                .finish(),
+            Self::HandoverNotify {
+                enb_id,
+                mme_ue_s1ap_id,
+                enb_ue_s1ap_id,
+                admitted,
+            } => f
+                .debug_struct("HandoverNotify")
+                .field("enb_id", enb_id)
+                .field("mme_ue_s1ap_id", mme_ue_s1ap_id)
+                .field("enb_ue_s1ap_id", enb_ue_s1ap_id)
+                .field("admitted", admitted)
+                .finish(),
+        }
+    }
 }
 
 /// A handover's Modify Bearer Request waiting for its response, keyed by the
@@ -1772,6 +1817,15 @@ fn pending_change_notifications() -> &'static Mutex<HashMap<u32, u64>> {
 }
 
 /// Take the session the Change Notification Request at `seq` reported.
+/// Whether a Change Notification at `seq` is still parked. Test/diagnostic.
+#[cfg(test)]
+pub fn change_notification_pending(seq: u32) -> bool {
+    pending_change_notifications()
+        .lock()
+        .map(|m| m.contains_key(&seq))
+        .unwrap_or(false)
+}
+
 pub fn take_pending_change_notification(seq: u32) -> Option<u64> {
     pending_change_notifications().lock().ok()?.remove(&seq)
 }
