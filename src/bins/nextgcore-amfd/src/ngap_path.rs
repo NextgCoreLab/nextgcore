@@ -22812,7 +22812,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_ng_reset_is_acknowledged_before_the_smf_answers() {
         let (_nf, port, seen) = slow_recording_nf(Duration::from_millis(1000)).await;
-        let _env = SmfEnvGuard::set(port);
+        let _env = SmfEnvGuard::acquire(port).await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = capturing_ngap_server().await;
         let assoc = 754_011u64;
@@ -22956,7 +22956,7 @@ mod tests {
     async fn a_reset_deactivation_never_overtakes_the_ues_reactivation() {
         let delay = Duration::from_millis(1000);
         let (_smf, port, seen) = slow_up_cnx_smf(delay).await;
-        let _env = SmfEnvGuard::set(port);
+        let _env = SmfEnvGuard::acquire(port).await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = capturing_ngap_server().await;
         let assoc = 754_051u64;
@@ -23101,7 +23101,7 @@ mod tests {
                 held.push(sock);
             }
         });
-        let _env = SmfEnvGuard::set(port);
+        let _env = SmfEnvGuard::acquire(port).await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = capturing_ngap_server().await;
         let (first, second) = (754_041u64, 754_042u64);
@@ -23167,7 +23167,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_ng_reset_aborts_the_kept_ues_procedures() {
         let (_nf, port, seen) = recording_nf().await;
-        let _env = SmfEnvGuard::set(port);
+        let _env = SmfEnvGuard::acquire(port).await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = capturing_ngap_server().await;
         let (assoc, target) = (754_021u64, 754_022u64);
@@ -23245,7 +23245,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_ng_reset_matches_the_id_pair_and_spares_idle_and_unregistered_ues() {
         let (_nf, port, seen) = recording_nf().await;
-        let _env = SmfEnvGuard::set(port);
+        let _env = SmfEnvGuard::acquire(port).await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = capturing_ngap_server().await;
         let assoc = 754_031u64;
