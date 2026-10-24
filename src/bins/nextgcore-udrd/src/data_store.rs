@@ -1026,7 +1026,10 @@ pub fn uri_covers(monitored: &str, changed_path: &str) -> bool {
 /// connect/request timeouts. Failures are logged, never propagated.
 pub fn post_notification(notify_uri: String, payload: Value) {
     let Some((host, port, path)) = parse_notify_uri(&notify_uri) else {
-        log::warn!("Invalid notification URI, dropping notification: {notify_uri}");
+        log::warn!(
+            "Invalid notification URI, dropping notification: {notify_uri}",
+            notify_uri = nextgcore_sbi::log_redact::redact_last_segment(&notify_uri)
+        );
         return;
     };
     tokio::spawn(async move {
@@ -1037,13 +1040,24 @@ pub fn post_notification(notify_uri: String, payload: Value) {
         );
         match client.post_json(&path, &payload).await {
             Ok(resp) if (200..300).contains(&resp.status) => {
-                log::debug!("Notification delivered to {notify_uri} ({})", resp.status);
+                log::debug!(
+                    "Notification delivered to {notify_uri} ({})",
+                    resp.status,
+                    notify_uri = nextgcore_sbi::log_redact::redact_last_segment(&notify_uri)
+                );
             }
             Ok(resp) => {
-                log::warn!("Notification to {notify_uri} rejected: {}", resp.status);
+                log::warn!(
+                    "Notification to {notify_uri} rejected: {}",
+                    resp.status,
+                    notify_uri = nextgcore_sbi::log_redact::redact_last_segment(&notify_uri)
+                );
             }
             Err(e) => {
-                log::warn!("Notification to {notify_uri} failed: {e}");
+                log::warn!(
+                    "Notification to {notify_uri} failed: {e}",
+                    notify_uri = nextgcore_sbi::log_redact::redact_last_segment(&notify_uri)
+                );
             }
         }
         client.close().await;

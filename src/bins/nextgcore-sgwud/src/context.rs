@@ -293,7 +293,8 @@ pub struct SgwuFar {
 /// QoS Enforcement Rule (TS 29.244 §5.2.5.1, §8.2.7).
 ///
 /// `gate_status` packs both directions: bits 1-2 are the UL gate and bits 3-4
-/// the DL gate, each `0` = OPEN and `1` = CLOSED.
+/// the DL gate, each `0` = OPEN and `1` = CLOSED. An internal packing, the reverse of
+/// the §8.2.7 wire octet (DL bits 1-2, UL bits 3-4): see `gate_status_octet`.
 #[derive(Debug, Clone, Default)]
 pub struct SgwuQer {
     pub sess_id: u64,
@@ -757,6 +758,13 @@ impl SgwuContext {
         }
     }
 
+    /// A context whose session capacity is `max_sess` (0 = unlimited).
+    pub fn with_capacity(max_sess: usize) -> Self {
+        let mut ctx = Self::new();
+        ctx.init(max_sess);
+        ctx
+    }
+
     /// Initialize the SGWU context
     pub fn init(&mut self, max_sess: usize) {
         if self.initialized.load(Ordering::SeqCst) {
@@ -821,7 +829,33 @@ impl SgwuContext {
         cp_f_seid: &FSeid,
         pfcp_node_id: Option<u64>,
     ) -> Option<SgwuSess> {
+        self.sess_add_for_node_capped(cp_f_seid, pfcp_node_id, 0)
+    }
+
+    /// [`Self::sess_add_for_node`], refusing (`None`) when the node already holds
+    /// `per_node_cap` sessions (#968 re-review: one CP peer cannot take every session
+    /// slot from the others). `0` means no per-node cap. Checked under the same write
+    /// lock that adds the session, so concurrent adds cannot overshoot it.
+    pub fn sess_add_for_node_capped(
+        &self,
+        cp_f_seid: &FSeid,
+        pfcp_node_id: Option<u64>,
+        per_node_cap: usize,
+    ) -> Option<SgwuSess> {
         let mut sess_list = self.sess_list.write().ok()?;
+        if let (Some(node), true) = (pfcp_node_id, per_node_cap > 0) {
+            let held = sess_list
+                .values()
+                .filter(|s| s.pfcp_node_id == Some(node))
+                .count();
+            if held >= per_node_cap {
+                log::warn!(
+                    "PFCP node {node} already holds {held} session(s), its cap: no session \
+                     added"
+                );
+                return None;
+            }
+        }
         let mut sgwu_sxa_seid_hash = self.sgwu_sxa_seid_hash.write().ok()?;
         let mut sgwc_sxa_seid_hash = self.sgwc_sxa_seid_hash.write().ok()?;
         let mut sgwc_sxa_f_seid_hash = self.sgwc_sxa_f_seid_hash.write().ok()?;
@@ -970,6 +1004,11 @@ impl SgwuContext {
     pub fn sess_find_by_id(&self, id: u64) -> Option<SgwuSess> {
         let sess_list = self.sess_list.read().ok()?;
         sess_list.get(&id).cloned()
+    }
+
+    /// The configured session capacity (0 = unlimited).
+    pub fn sess_capacity(&self) -> usize {
+        self.max_num_of_sess
     }
 
     /// Get session count
@@ -1228,6 +1267,23 @@ impl SgwuContext {
         Some(BufferOutcome::Accepted {
             buffered: far.buffered.len(),
         })
+    }
+
+    /// DROBU (TS 29.244 §8.2.31, #1041): discard every packet buffered on any FAR of
+    /// the session, ending any flush. Returns how many were dropped.
+    pub fn sess_drop_buffered(&self, sess_id: u64) -> usize {
+        let Ok(mut fars) = self.far_list.write() else {
+            return 0;
+        };
+        let mut dropped = 0;
+        for ((sid, _), far) in fars.iter_mut() {
+            if *sid == sess_id {
+                far.flushing = false;
+                dropped += far.buffered.len();
+                far.buffered.clear();
+            }
+        }
+        dropped
     }
 
     /// Take all buffered packets from a FAR, discarding the queue (no GTP-U server to
@@ -1643,8 +1699,17 @@ pub fn sgwu_self() -> &'static SgwuContext {
 
 /// Initialize the global SGWU context
 pub fn sgwu_context_init(max_sess: usize) {
-    let _ctx = SGWU_CONTEXT.get_or_init(SgwuContext::new);
-    log::info!("SGWU context initialized with max {max_sess} sessions");
+    // #968 round 3: the capacity is APPLIED. This used to build the context with
+    // `SgwuContext::new` and only log `max_sess`, so the session capacity was 0
+    // (unlimited) and nothing derived from it held.
+    let ctx = SGWU_CONTEXT.get_or_init(|| SgwuContext::with_capacity(max_sess));
+    if ctx.sess_capacity() != max_sess {
+        log::warn!(
+            "SGWU context was created before sgwu_context_init({max_sess}); its session \
+             capacity stays {}",
+            ctx.sess_capacity()
+        );
+    }
 }
 
 /// Finalize the global SGWU context

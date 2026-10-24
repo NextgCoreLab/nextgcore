@@ -1076,7 +1076,18 @@ pub struct SmContextIdentity {
     /// the subscription carries none, in which case the member is omitted
     /// (issue #205).
     pub gpsi: Option<String>,
+    /// `3gpp-Sbi-Origination-Timestamp` (TS 29.502 §6.1.2.3.2): the AMF is the
+    /// originating entity of a PDU session establishment's CreateSMContext. It
+    /// is set ONCE per establishment attempt and sent unchanged on every
+    /// retransmission of that request, so the PCF's collision rule
+    /// (TS 29.512 §4.2.7, after the SMF forwards it per §4.2.2.2) sees a
+    /// retried create as the same request and reuses its association (#980
+    /// review). `None` omits the header.
+    pub origination_timestamp: Option<String>,
 }
+
+/// TS 29.502 §6.1.2.3.2 custom header.
+pub const ORIGINATION_TIMESTAMP_HEADER: &str = "3gpp-Sbi-Origination-Timestamp";
 
 fn build_create_sm_context_request(
     pdu_session_id: u8,
@@ -1156,13 +1167,17 @@ fn build_create_sm_context_request(
     if let Some(gpsi) = &identity.gpsi {
         obj.insert("gpsi".to_string(), serde_json::json!(gpsi));
     }
-    SbiRequest::post("/nsmf-pdusession/v1/sm-contexts")
+    let request = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts")
         .with_body(body.to_string(), content_type::APPLICATION_JSON)
         .with_part(SbiPart::with_content(
             "n1SmMsg",
             content_type::APPLICATION_5GNAS,
             bytes::Bytes::copy_from_slice(n1_sm_msg_from_ue),
-        ))
+        ));
+    match &identity.origination_timestamp {
+        Some(ts) => request.with_header(ORIGINATION_TIMESTAMP_HEADER, ts.as_str()),
+        None => request,
+    }
 }
 
 /// Call SMF to create SM context (POST /nsmf-pdusession/v1/sm-contexts)
@@ -2670,7 +2685,7 @@ pub async fn notify_amf_status_change(status_change: &str) {
         let Some((host, port, path)) = split_absolute_uri(&sub.amf_status_uri) else {
             log::warn!(
                 "AMFStatusChangeNotify: cannot address amfStatusUri {}",
-                sub.amf_status_uri
+                nextgcore_sbi::log_redact::redact_last_segment(&sub.amf_status_uri)
             );
             continue;
         };
@@ -2686,20 +2701,20 @@ pub async fn notify_amf_status_change(status_change: &str) {
         {
             Ok(Ok(resp)) if resp.is_success() => log::info!(
                 "AMFStatusChangeNotify({status_change}) delivered to {}",
-                sub.amf_status_uri
+                nextgcore_sbi::log_redact::redact_last_segment(&sub.amf_status_uri)
             ),
             Ok(Ok(resp)) => log::warn!(
                 "AMFStatusChangeNotify to {} returned {}",
-                sub.amf_status_uri,
+                nextgcore_sbi::log_redact::redact_last_segment(&sub.amf_status_uri),
                 resp.status
             ),
             Ok(Err(e)) => log::warn!(
                 "AMFStatusChangeNotify to {} failed: {e}",
-                sub.amf_status_uri
+                nextgcore_sbi::log_redact::redact_last_segment(&sub.amf_status_uri)
             ),
             Err(_) => log::warn!(
                 "AMFStatusChangeNotify to {} timed out; the shutdown path will not wait longer",
-                sub.amf_status_uri
+                nextgcore_sbi::log_redact::redact_last_segment(&sub.amf_status_uri)
             ),
         }
     }
@@ -4763,6 +4778,36 @@ mod tests {
     ];
 
     /// A populated identity, as the AMF now builds it from the UE context.
+    /// #980 review: the CreateSMContext carries the identity's origination
+    /// timestamp verbatim, and no header without one.
+    #[test]
+    fn the_create_sm_context_request_carries_the_origination_timestamp() {
+        let with =
+            build_create_sm_context_request(5, 1, None, None, &[0x2E], false, &test_identity());
+        assert_eq!(
+            with.http
+                .get_header(ORIGINATION_TIMESTAMP_HEADER)
+                .map(String::as_str),
+            Some("Fri, 23 Oct 2026 10:00:00.980 GMT")
+        );
+        let without = build_create_sm_context_request(
+            5,
+            1,
+            None,
+            None,
+            &[0x2E],
+            false,
+            &SmContextIdentity {
+                origination_timestamp: None,
+                ..test_identity()
+            },
+        );
+        assert!(without
+            .http
+            .get_header(ORIGINATION_TIMESTAMP_HEADER)
+            .is_none());
+    }
+
     fn test_identity() -> SmContextIdentity {
         SmContextIdentity {
             supi: Some("imsi-262011234567890".to_string()),
@@ -4779,6 +4824,7 @@ mod tests {
                 }
             })),
             gpsi: Some("msisdn-491234567890".to_string()),
+            origination_timestamp: Some("Fri, 23 Oct 2026 10:00:00.980 GMT".to_string()),
         }
     }
 

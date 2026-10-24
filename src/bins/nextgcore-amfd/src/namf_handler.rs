@@ -334,7 +334,9 @@ pub type NamfHandlerResult<T> = Result<T, NamfHandlerError>;
 pub fn handle_n1_n2_message_transfer(
     amf_ue: &AmfUe,
     sess: &mut AmfSess,
-    ran_ue: Option<&RanUe>,
+    // Kept for the callers' signature; the CM state comes from `cm_idle`, and the
+    // NGAP task resolves the UE's NG connection when it delivers (#757).
+    _ran_ue: Option<&RanUe>,
     cm_idle: bool,
     req_data: &N1N2MessageTransferReqData,
 ) -> NamfHandlerResult<N1N2MessageTransferRspData> {
@@ -355,44 +357,50 @@ pub fn handle_n1_n2_message_transfer(
     if let Some(n2_info) = &req_data.n2_info {
         match n2_info.ngap_ie_type {
             NgapIeType::PduResSetupReq => {
-                // PDU session establishment
-                if req_data.n1_message.is_some() {
-                    // Has N1 message - send DL NAS transport with PDU session setup
-                    if ran_ue.is_some() {
-                        // UE is connected, send immediately
-                        log::debug!("Sending PDU session resource setup request");
-                    } else {
-                        log::warn!("RAN-NG context not available");
-                    }
-                } else {
-                    // No N1 message - network triggered service request
-                    // CM-IDLE (TS 23.501 §5.3.3.2.2), as the NGAP layer tracks it --
-                    // NOT the security flag, which a registered idle UE still has (its
-                    // NAS security context outlives the N1 connection).
-                    if cm_idle {
-                        // UE is idle, need to page (TS 23.502 4.2.3.3)
-                        cause = N1N2MessageTransferCause::AttemptingToReachUe;
-                        initiate_paging_for_idle_ue(
-                            amf_ue,
-                            Some(sess),
-                            req_data.n1_message.clone(),
-                            n2_info.ngap_data.clone(),
-                            false,
-                            req_data.pdu_session_id,
-                            req_data.n1n2_failure_txf_notif_uri.as_deref(),
-                        );
-                    } else {
-                        // UE is connected
-                        log::debug!("Sending PDU session setup request");
-                    }
+                // A CM-CONNECTED UE gets the PDU SESSION RESOURCE SETUP REQUEST now
+                // (`connected_downlink_for`, #757). A CM-IDLE one is paged (TS 23.502
+                // §4.2.3.3 step 3a) and the session rides the Service Request's Initial
+                // Context Setup. CM-IDLE here is as the NGAP layer tracks it
+                // (TS 23.501 §5.3.3.2.2), NOT the security flag, which a registered
+                // idle UE still has.
+                if cm_idle {
+                    cause = N1N2MessageTransferCause::AttemptingToReachUe;
+                    initiate_paging_for_idle_ue(
+                        amf_ue,
+                        Some(sess),
+                        req_data.n1_message.clone(),
+                        n2_info.ngap_data.clone(),
+                        PagedN2::Setup,
+                        req_data.pdu_session_id,
+                        req_data.n1n2_failure_txf_notif_uri.as_deref(),
+                    );
                 }
             }
             NgapIeType::PduResModReq => {
-                // PDU session modification
+                // Network-requested PDU Session Modification (TS 23.502 §4.3.3.2
+                // step 3b): the N2 transfer and the N1 PDU SESSION MODIFICATION
+                // COMMAND both go in one PDU SESSION RESOURCE MODIFY REQUEST
+                // (TS 38.413 §8.2.3), so both are mandatory.
                 if req_data.n1_message.is_none() {
                     return Err(NamfHandlerError::MissingField("n1_message".to_string()));
                 }
-                log::debug!("Sending PDU session modification command");
+                if n2_info.ngap_data.is_none() {
+                    return Err(NamfHandlerError::MissingField(
+                        "n2InfoContainer.smInfo.n2InfoContent.ngapData".to_string(),
+                    ));
+                }
+                if cm_idle {
+                    cause = N1N2MessageTransferCause::AttemptingToReachUe;
+                    initiate_paging_for_idle_ue(
+                        amf_ue,
+                        Some(sess),
+                        req_data.n1_message.clone(),
+                        n2_info.ngap_data.clone(),
+                        PagedN2::Modify,
+                        req_data.pdu_session_id,
+                        req_data.n1n2_failure_txf_notif_uri.as_deref(),
+                    );
+                }
             }
             NgapIeType::PduResRelCmd => {
                 // PDU session release
@@ -406,7 +414,7 @@ pub fn handle_n1_n2_message_transfer(
                             Some(sess),
                             req_data.n1_message.clone(),
                             n2_info.ngap_data.clone(),
-                            true,
+                            PagedN2::Release,
                             req_data.pdu_session_id,
                             req_data.n1n2_failure_txf_notif_uri.as_deref(),
                         );
@@ -442,7 +450,7 @@ pub fn handle_n1_n2_message_transfer(
                 Some(sess),
                 req_data.n1_message.clone(),
                 None,
-                false,
+                PagedN2::Setup,
                 req_data.pdu_session_id,
                 req_data.n1n2_failure_txf_notif_uri.as_deref(),
             );
@@ -479,23 +487,40 @@ pub fn connected_downlink_for(
     cm_idle: bool,
     req_data: &N1N2MessageTransferReqData,
 ) -> Option<crate::context::PendingConnectedDownlink> {
+    use crate::context::ConnectedN2;
     if cm_idle {
         return None;
     }
     let psi = req_data.pdu_session_id?;
-    let n2_release = match req_data.n2_info.as_ref().map(|n2| &n2.ngap_ie_type) {
-        None => false,
-        Some(NgapIeType::PduResRelCmd) => true,
-        Some(_) => return None,
+    let n2 = match req_data.n2_info.as_ref() {
+        None => ConnectedN2::None,
+        Some(n2) => match n2.ngap_ie_type {
+            NgapIeType::PduResRelCmd => ConnectedN2::Release,
+            NgapIeType::PduResSetupReq => ConnectedN2::Setup(n2.ngap_data.clone()),
+            NgapIeType::PduResModReq => ConnectedN2::Modify(n2.ngap_data.clone()?),
+            // Null (an N1-only rejection carried with an empty N2 container) is
+            // the N1 alone.
+            NgapIeType::Null => ConnectedN2::None,
+            _ => {
+                log::warn!(
+                    "UE {}: N1N2 transfer with ngapIeType {:?} for PSI {psi} has no NGAP \
+                     procedure toward the gNB; only its N1 (if any) is delivered",
+                    amf_ue.id,
+                    n2.ngap_ie_type
+                );
+                ConnectedN2::None
+            }
+        },
     };
-    if req_data.n1_message.is_none() && !n2_release {
+    if req_data.n1_message.is_none() && n2 == ConnectedN2::None {
         return None;
     }
     Some(crate::context::PendingConnectedDownlink {
         amf_ue_ngap_id: amf_ue.id,
         pdu_session_id: psi,
         n1: req_data.n1_message.clone(),
-        n2_release,
+        n2,
+        failure_notify_uri: req_data.n1n2_failure_txf_notif_uri.clone(),
     })
 }
 
@@ -639,7 +664,7 @@ pub fn handle_event_subscribe(
     log::info!(
         "Event subscription request: event={:?}, callback={}",
         subscription.event_type,
-        callback_uri
+        nextgcore_sbi::log_redact::redact_last_segment(callback_uri)
     );
 
     // Validate subscription
@@ -770,18 +795,29 @@ pub fn send_event_notification(
 // Paging Trigger (TS 23.502 4.2.3.3)
 // ============================================================================
 
+/// What a paged N2 SM transfer is, for its delivery after the Service Request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PagedN2 {
+    /// A setup transfer (or none): rides the Initial Context Setup.
+    Setup,
+    /// A release transfer: its own Release Command after the ICS (#518).
+    Release,
+    /// A modify transfer: its own Modify Request after the ICS (#757).
+    Modify,
+}
+
 /// Initiate paging for an idle UE when DL data arrives
 ///
 /// Creates a PagingContext, stores it in the AMF context paging map,
 /// and marks the session paging as ongoing. The NGAP Paging message
 /// will be sent by the event loop timer when it processes paging entries.
 #[allow(clippy::too_many_arguments)]
-fn initiate_paging_for_idle_ue(
+pub(crate) fn initiate_paging_for_idle_ue(
     amf_ue: &AmfUe,
     sess: Option<&mut AmfSess>,
     pending_n1: Option<Vec<u8>>,
     pending_n2: Option<Vec<u8>>,
-    pending_n2_release: bool,
+    paged_n2: PagedN2,
     pdu_session_id: Option<u8>,
     failure_notify_uri: Option<&str>,
 ) {
@@ -807,7 +843,8 @@ fn initiate_paging_for_idle_ue(
         pending_n1,
         pending_n1_container_type: crate::gmm_handler::payload_container_type::N1_SM_INFORMATION,
         pending_n2,
-        pending_n2_release,
+        pending_n2_release: paged_n2 == PagedN2::Release,
+        pending_n2_modify: paged_n2 == PagedN2::Modify,
         pdu_session_id,
         // The registration area this AMF assigned: the single TAI the
         // Registration Accept's TAI list carries (`gmm_build`, list type 00).
@@ -859,7 +896,7 @@ pub fn page_idle_ue_for_n1(
         None,
         Some(n1),
         None,
-        false,
+        PagedN2::Setup,
         None,
         failure_notify_uri,
     );
@@ -1006,7 +1043,8 @@ mod tests {
                 amf_ue_ngap_id: 6_660_001,
                 pdu_session_id: 1,
                 n1: Some(release_cmd.clone()),
-                n2_release: false,
+                n2: crate::context::ConnectedN2::None,
+                failure_notify_uri: None,
             })
         );
 
@@ -1021,7 +1059,7 @@ mod tests {
         };
         let rsp = handle_n1_n2_message_transfer(&ue, &mut sess, None, false, &release).expect("ok");
         let item = rsp.deliver_now.expect("the release is delivered");
-        assert!(item.n2_release);
+        assert_eq!(item.n2, crate::context::ConnectedN2::Release);
         assert_eq!(item.n1, Some(release_cmd));
 
         // CM-IDLE is the paging path, not this one.

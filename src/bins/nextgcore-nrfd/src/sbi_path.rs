@@ -195,20 +195,20 @@ async fn dispatch_notify_request_async(
     event_str: &str,
 ) -> NotifySendResult {
     // #940: the subscriber's callback URI may carry a bearer token (the AMF's does),
-    // so it is logged with its last segment redacted, never whole.
-    let notification_uri = &nextgcore_sbi::log_redact::redact_last_segment(notification_uri);
+    // so it is logged with its last segment redacted, never whole. Every use below
+    // is a log line or a logged error; named `logged_uri` so the #1018 scan sees it
+    // is not the raw URI.
+    let logged_uri = &nextgcore_sbi::log_redact::redact_last_segment(notification_uri);
     log::debug!(
-        "Sending NF status notify to {notification_uri} (event={event_str}, \
+        "Sending NF status notify to {logged_uri} (event={event_str}, \
          nf_instance={nf_instance_id})"
     );
 
-    let (host, port, path, scheme) = match parse_notification_uri(&notify_request.uri) {
+    let (host, port, path, scheme) = match parse_notification_uri(&notify_request.callback_uri) {
         Some(parts) => parts,
         None => {
-            log::error!("Failed to parse notification URI: {notification_uri}");
-            return NotifySendResult::Failed(format!(
-                "Invalid notification URI: {notification_uri}"
-            ));
+            log::error!("Failed to parse notification URI: {logged_uri}");
+            return NotifySendResult::Failed(format!("Invalid notification URI: {logged_uri}"));
         }
     };
 
@@ -236,7 +236,7 @@ async fn dispatch_notify_request_async(
             Some(target) => attach_oauth2(client, target),
             None => {
                 log::warn!(
-                    "NF status notify to {notification_uri}: unrecognised subscriber NFType \
+                    "NF status notify to {logged_uri}: unrecognised subscriber NFType \
                      '{raw}' (TS 29.510 NFType); sending WITHOUT an OAuth2 token rather than \
                      minting one for the wrong audience"
                 );
@@ -247,7 +247,7 @@ async fn dispatch_notify_request_async(
             // No reqNfType on the subscription: nothing identifies the audience,
             // so there is no correct token to mint.
             log::debug!(
-                "NF status notify to {notification_uri}: subscription carries no reqNfType; \
+                "NF status notify to {logged_uri}: subscription carries no reqNfType; \
                  sending without an OAuth2 token"
             );
             client
@@ -266,7 +266,7 @@ async fn dispatch_notify_request_async(
                 log::info!(
                     "NF status notify delivered: {} -> {} ({}) [HTTP {}]",
                     nf_instance_id,
-                    notification_uri,
+                    logged_uri,
                     event_str,
                     status
                 );
@@ -275,7 +275,7 @@ async fn dispatch_notify_request_async(
                 log::warn!(
                     "NF status notify rejected: {} -> {} ({}) [HTTP {}]",
                     nf_instance_id,
-                    notification_uri,
+                    logged_uri,
                     event_str,
                     status
                 );
@@ -284,7 +284,7 @@ async fn dispatch_notify_request_async(
         }
         Err(e) => {
             let e = nextgcore_sbi::log_redact::redact_callback_tokens(&e.to_string());
-            log::error!("Failed to deliver NF status notify to {notification_uri}: {e}");
+            log::error!("Failed to deliver NF status notify to {logged_uri}: {e}");
             NotifySendResult::Failed(e)
         }
     }
@@ -379,9 +379,11 @@ pub fn nrf_nnrf_nfm_send_nf_status_notify(
         }
     };
 
+    // The subscriber's callback URI may carry its bearer token (#940): logged
+    // with the last segment redacted, as the queued line below (#1026 review).
     log::debug!(
         "Sending NF status notify to {} (event={:?}, nf_instance={})",
-        request.uri,
+        nextgcore_sbi::log_redact::redact_last_segment(&request.callback_uri),
         event,
         nf_instance.nf_instance_id
     );
@@ -1369,6 +1371,46 @@ mod tests {
             NotifySendResult::Success => {}
             _ => panic!("Expected success"),
         }
+    }
+
+    /// #1026 review: the subscriber's notification URI (here carrying an AMF
+    /// NF status token, #940) never reaches a log line whole. The positive
+    /// half (both lines were captured for this NF instance) comes first.
+    ///
+    /// Revert-verified: logging `request.uri` whole fails this test.
+    #[test]
+    fn the_status_notify_callback_token_is_not_logged() {
+        assert!(
+            nextgcore_core::test_log::init(),
+            "the capture logger is installed"
+        );
+        let token = "nf-status-tok-1026";
+        let mut subscription = create_test_subscription(Some("AMF"));
+        subscription.notification_uri =
+            format!("http://10.0.0.7:7777/namf-callback/v1/nf-status-notify/{token}");
+        let mut profile = create_test_profile();
+        profile.nf_instance_id = "nf-1026-capture".to_string();
+
+        let _ = nrf_nnrf_nfm_send_nf_status_notify(
+            &subscription,
+            NotificationEventType::NfRegistered,
+            &profile,
+            "http://nrf.example.com",
+        );
+
+        let lines = nextgcore_core::test_log::captured("nf-1026-capture");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Sending NF status notify to")
+                    && l.contains("nf-status-notify/<redacted>")),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("NF status notify queued")),
+            "{lines:#?}"
+        );
+        assert!(lines.iter().all(|l| !l.contains(token)), "{lines:#?}");
     }
 
     #[test]

@@ -291,12 +291,18 @@ services:
   smf:
     image: nextgcore-rust/smf:latest
     container_name: nextgcore-smf
+    # #718/#809: a graceful shutdown tells the UEs (#39, at most 20 s) and the SGWs
+    # (Delete Bearer, retransmitted up to 12 s), and releases the UPF association
+    # (up to 12 s). Docker's default 10 s cut that off with SIGKILL.
+    stop_grace_period: 45s
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
       UPF_PFCP_ADDR: 172.23.0.7
       UPF_PFCP_PORT: "8805"
       SMF_PFCP_ADDR: 172.23.0.4
+      # The shutdown's own deadline: stop_grace_period (45 s) less 2 s (#941).
+      SMF_SHUTDOWN_BUDGET_SECS: "43"
       # Issue #204: the SMF resolves the SUBSCRIBED DEFAULT DNN from
       # Nudm_SDM_Get(smf-select-data) when SmContextCreateData carries no `dnn`.
       # NRF discovery is tried first; this is the fallback for a deployment with no
@@ -346,7 +352,8 @@ services:
       TLS_CERT: /etc/nextgcore/certs/upf.crt
       TLS_KEY: /etc/nextgcore/certs/upf.key
       TLS_CA: /etc/nextgcore/certs/ca.crt
-    command: ["-c", "/etc/nextgcore/upf.yaml", "--pfcp-addr", "172.23.0.7", "--gtpu-addr", "172.23.0.7", "--tun-ip", "10.45.0.1", "--tun-prefix", "16"]
+    # --pfcp-allowed-peers: only the SMF (172.23.0.4) may set up the N4 association (#968).
+    command: ["-c", "/etc/nextgcore/upf.yaml", "--pfcp-addr", "172.23.0.7", "--gtpu-addr", "172.23.0.7", "--tun-ip", "10.45.0.1", "--tun-prefix", "16", "--pfcp-allowed-peers", "172.23.0.4"]
     volumes:
       - ./configs/5gc/upf.yaml:/etc/nextgcore/upf.yaml:ro
       - ./certs:/etc/nextgcore/certs:ro

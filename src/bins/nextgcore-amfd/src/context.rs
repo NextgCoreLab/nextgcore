@@ -731,13 +731,42 @@ pub enum PositioningDlKind {
     UePolicyToUe { updp_pdu: Vec<u8> },
 }
 
-/// A network-initiated deregistration the Nudm_UECM DeregistrationNotification
-/// callback (TS 29.503 §5.3.2.3.2) asked the AMF to execute (WSB-4), enqueued
-/// by the Namf SBI handler task and carried out by the NGAP server task
-/// (TS 23.502 §4.2.2.3.3 → DEREGISTRATION REQUEST, TS 24.501 §5.5.2.3).
-/// A Namf N1N2MessageTransfer for a CM-CONNECTED UE (#666): the N1 and/or the
-/// PDU Session Resource Release the SMF asked the AMF to deliver now. Enqueued by
-/// the Namf SBI handler task and sent by the NGAP server task, which owns the SCTP
+/// The NGAP procedure an N1N2MessageTransfer's N2 SM information asks for
+/// (TS 29.518 §6.1.6.3.x `NgapIeType`), as the NGAP task delivers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectedN2 {
+    /// No N2 SM information: the N1 goes alone in a DOWNLINK NAS TRANSPORT.
+    None,
+    /// `PDU_RES_REL_CMD`: a PDU SESSION RESOURCE RELEASE COMMAND, then the N1.
+    Release,
+    /// `PDU_RES_SETUP_REQ` (TS 38.413 §8.2.1): a PDU SESSION RESOURCE SETUP
+    /// REQUEST carrying the transfer, with the N1 (if any) as its NAS-PDU. `None`
+    /// is smfd's downlink-data request, which names the session but carries no
+    /// transfer (#757). The AMF then activates the user plane at the SMF
+    /// (upCnxState ACTIVATING, TS 23.502 §4.2.3.3 step 4) and sends the transfer
+    /// the SMF answers with.
+    Setup(Option<Vec<u8>>),
+    /// `PDU_RES_MOD_REQ` (TS 38.413 §8.2.3, TS 23.502 §4.3.3.2 step 3b): a PDU
+    /// SESSION RESOURCE MODIFY REQUEST carrying the transfer, with the N1 PDU
+    /// SESSION MODIFICATION COMMAND as the item's NAS-PDU.
+    Modify(Vec<u8>),
+}
+
+impl ConnectedN2 {
+    /// The NGAP procedure, for log lines.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Release => "PDU Session Resource Release Command",
+            Self::Setup(_) => "PDU Session Resource Setup Request",
+            Self::Modify(_) => "PDU Session Resource Modify Request",
+        }
+    }
+}
+
+/// A Namf N1N2MessageTransfer for a CM-CONNECTED UE (#666, #757): the N1 and/or
+/// the N2 SM information the SMF asked the AMF to deliver now. Enqueued by the
+/// Namf SBI handler task and sent by the NGAP server task, which owns the SCTP
 /// associations, exactly as a paged transfer is sent after the Service Request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingConnectedDownlink {
@@ -746,13 +775,19 @@ pub struct PendingConnectedDownlink {
     pub amf_ue_ngap_id: u64,
     /// The PDU session the transfer is about.
     pub pdu_session_id: u8,
-    /// The 5GSM message, delivered in a DOWNLINK NAS TRANSPORT.
+    /// The 5GSM message.
     pub n1: Option<Vec<u8>>,
-    /// Whether to send a PDU SESSION RESOURCE RELEASE COMMAND for the session
-    /// (`ngapIeType` PDU_RES_REL_CMD) before the N1.
-    pub n2_release: bool,
+    /// What the N2 SM information asks for.
+    pub n2: ConnectedN2,
+    /// The consumer's n1n2FailureTxfNotifURI. The NGAP task needs it when the UE
+    /// turns out to be CM-IDLE at delivery time and has to be paged instead.
+    pub failure_notify_uri: Option<String>,
 }
 
+/// A network-initiated deregistration the Nudm_UECM DeregistrationNotification
+/// callback (TS 29.503 §5.3.2.3.2) asked the AMF to execute (WSB-4), enqueued
+/// by the Namf SBI handler task and carried out by the NGAP server task
+/// (TS 23.502 §4.2.2.3.3 → DEREGISTRATION REQUEST, TS 24.501 §5.5.2.3).
 #[derive(Debug, Clone)]
 pub struct PendingNetworkDereg {
     /// Target UE (AMF-UE-NGAP-ID). The NGAP task resolves the serving SCTP
@@ -2052,6 +2087,14 @@ impl AmfContext {
             }
         }
         moved
+    }
+
+    /// Every session in the table (#756's orphan sweep).
+    pub fn sess_list_snapshot(&self) -> Vec<AmfSess> {
+        match self.sess_list.read() {
+            Ok(l) => l.values().cloned().collect(),
+            Err(e) => e.into_inner().values().cloned().collect(),
+        }
     }
 
     /// Get sessions for an AMF UE
@@ -4221,6 +4264,16 @@ impl AmfUe {
     ///
     /// Returns `(ncc, nh)` in the order the NGAP `SecurityContext` fields are
     /// written, so a caller cannot transpose them.
+    /// The `{NCC, NH}` [`Self::advance_next_hop`] would produce, without advancing: for a
+    /// procedure that commits the pair only once its outcome is decided (#1009 review,
+    /// the Path Switch Acknowledge).
+    pub fn next_hop_preview(&self) -> (u8, [u8; NEXTGCORE_SHA256_DIGEST_SIZE]) {
+        (
+            self.nhcc.wrapping_add(1) & 0x07,
+            nextgcore_crypt::kdf::nextgcore_kdf_nh_gnb(&self.kamf, &self.nh),
+        )
+    }
+
     pub fn advance_next_hop(&mut self) -> (u8, [u8; NEXTGCORE_SHA256_DIGEST_SIZE]) {
         self.nh = nextgcore_crypt::kdf::nextgcore_kdf_nh_gnb(&self.kamf, &self.nh);
         self.nhcc = self.nhcc.wrapping_add(1) & 0x07;
@@ -4564,6 +4617,11 @@ pub struct PagingContext {
     /// Service Request's Initial Context Setup (TS 38.413 §9.2.2.1); a paged
     /// release is answered after it with its own Release Command (#518).
     pub pending_n2_release: bool,
+    /// Whether `pending_n2` is a PDU Session Resource Modify Request transfer
+    /// (`PDU_RES_MOD_REQ`, #757). Like a release, it does not ride the Initial
+    /// Context Setup. It is sent after it as its own PDU SESSION RESOURCE MODIFY
+    /// REQUEST, with `pending_n1` as the item's NAS-PDU.
+    pub pending_n2_modify: bool,
     /// PDU session ID that triggered paging
     pub pdu_session_id: Option<u8>,
     /// The UE's registration area as (PLMN, TAC) pairs: the TAIs PAGING is sent
@@ -4608,6 +4666,7 @@ impl Default for PagingContext {
                 crate::gmm_handler::payload_container_type::N1_SM_INFORMATION,
             pending_n2: None,
             pending_n2_release: false,
+            pending_n2_modify: false,
             pdu_session_id: None,
             tai_list: Vec::new(),
             last_sent: None,
@@ -4873,7 +4932,8 @@ static GLOBAL_AMF_CONTEXT: std::sync::OnceLock<Arc<RwLock<AmfContext>>> =
 /// and the sibling's UE was never deregistered. Declared beside the global it guards, so
 /// there is one lock for it rather than one per test module.
 #[cfg(test)]
-pub(crate) static REACHABILITY_SWEEP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static REACHABILITY_SWEEP_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
 
 /// Get the global AMF context
 pub fn amf_self() -> Arc<RwLock<AmfContext>> {
@@ -5732,9 +5792,7 @@ mod tests {
     /// bleeds.
     #[test]
     fn test_nas_security_canary_knob_seeds_new_ue() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.blocking_lock();
 
         // Default: OFF -> legacy UE.
         set_nas_security_canary(false);

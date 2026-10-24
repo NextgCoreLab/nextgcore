@@ -597,7 +597,8 @@ impl PduSessionContainer {
     }
 }
 
-/// GTPv1 Cause Values (TS 29.060 Table 38)
+/// GTPv1 Cause Values (TS 29.060 §7.7.1): the one GTPv1 cause table every
+/// nextgcore node uses (#1053), pinned in `cause_tests`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Cause {
@@ -661,6 +662,85 @@ pub enum Cause {
     TgtAccRestrictedSubscriber = 231,
     UeTmpNotReachablePowerSaving = 232,
     RelocationFailureNasMsgRedir = 233,
+}
+
+/// The [`Cause`] values as octets (TS 29.060 §7.7.1), for match patterns and code
+/// that carries the cause as a `u8` (#1053). Derived from the enum, so the two
+/// cannot disagree; nodes import this rather than keeping their own table.
+pub mod cause {
+    use super::Cause;
+
+    pub const REQUEST_IMSI: u8 = Cause::RequestImsi as u8;
+    pub const REQUEST_IMEI: u8 = Cause::RequestImei as u8;
+    pub const REQUEST_IMSI_IMEI: u8 = Cause::RequestImsiImei as u8;
+    pub const NO_ID_NEEDED: u8 = Cause::NoIdNeeded as u8;
+    pub const MS_REFUSES: u8 = Cause::MsRefuses as u8;
+    pub const MS_NOT_GPRS_RESPONDING: u8 = Cause::MsNotGprsResponding as u8;
+    pub const REACTIVATION_REQUESTED: u8 = Cause::ReactivationRequested as u8;
+    pub const PDP_ADDRESS_INACTIVITY_TIMER_EXP: u8 = Cause::PdpAddressInactivityTimerExp as u8;
+    pub const NETWORK_FAILURE: u8 = Cause::NetworkFailure as u8;
+    pub const QOS_PARAMETER_MISMATCH: u8 = Cause::QosParameterMismatch as u8;
+    pub const REQUEST_ACCEPTED: u8 = Cause::RequestAccepted as u8;
+    pub const NEW_PDP_TYPE_DUE_TO_NETWORK_PREFERENCE: u8 =
+        Cause::NewPdpTypeDueToNetworkPreference as u8;
+    pub const NEW_PDP_TYPE_DUE_TO_SINGLE_ADDRESS_BEARER_ONLY: u8 =
+        Cause::NewPdpTypeDueToSingleAddressBearerOnly as u8;
+    pub const NON_EXISTENT: u8 = Cause::NonExistent as u8;
+    pub const INVALID_MESSAGE_FORMAT: u8 = Cause::InvalidMessageFormat as u8;
+    pub const IMSI_IMEI_NOT_KNOWN: u8 = Cause::ImsiImeiNotKnown as u8;
+    pub const MS_GPRS_DETACHED: u8 = Cause::MsGprsDetached as u8;
+    pub const REJ_MS_NOT_GPRS_RESPONDING: u8 = Cause::RejMsNotGprsResponding as u8;
+    pub const REJ_MS_REFUSES: u8 = Cause::RejMsRefuses as u8;
+    pub const VERSION_NOT_SUPPORTED: u8 = Cause::VersionNotSupported as u8;
+    pub const NO_RESOURCES_AVAILABLE: u8 = Cause::NoResourcesAvailable as u8;
+    pub const SERVICE_NOT_SUPPORTED: u8 = Cause::ServiceNotSupported as u8;
+    pub const MANDATORY_IE_INCORRECT: u8 = Cause::MandatoryIeIncorrect as u8;
+    pub const MANDATORY_IE_MISSING: u8 = Cause::MandatoryIeMissing as u8;
+    pub const OPTIONAL_IE_INCORRECT: u8 = Cause::OptionalIeIncorrect as u8;
+    pub const SYSTEM_FAILURE: u8 = Cause::SystemFailure as u8;
+    pub const ROAMING_RESTRICTION: u8 = Cause::RoamingRestriction as u8;
+    pub const P_TMSI_SIGNATURE_MISMATCH: u8 = Cause::PTmsiSignatureMismatch as u8;
+    pub const GPRS_CONN_SUSPENDED: u8 = Cause::GprsConnSuspended as u8;
+    pub const AUTHENTICATION_FAILURE: u8 = Cause::AuthenticationFailure as u8;
+    pub const USER_AUTHENTICATION_FAILED: u8 = Cause::UserAuthenticationFailed as u8;
+    pub const CONTEXT_NOT_FOUND: u8 = Cause::ContextNotFound as u8;
+    pub const ALL_DYNAMIC_PDP_ADDRS_OCCUPIED: u8 = Cause::AllDynamicPdpAddrsOccupied as u8;
+    pub const NO_MEMORY_AVAILABLE: u8 = Cause::NoMemoryAvailable as u8;
+    pub const RELOCATION_FAILURE: u8 = Cause::RelocationFailure as u8;
+    pub const UNKNOWN_MANDATORY_EXTENSION_HEADER: u8 = Cause::UnknownMandatoryExtensionHeader as u8;
+    pub const SEMANTIC_ERR_TFT_OPERATION: u8 = Cause::SemanticErrTftOperation as u8;
+    pub const SYNTACTIC_ERR_TFT_OPERATION: u8 = Cause::SyntacticErrTftOperation as u8;
+    pub const SEMANTIC_ERR_PKT_FILTER: u8 = Cause::SemanticErrPktFilter as u8;
+    pub const SYNTACTIC_ERR_PKT_FILTER: u8 = Cause::SyntacticErrPktFilter as u8;
+    pub const MISSING_OR_UNKNOWN_APN: u8 = Cause::MissingOrUnknownApn as u8;
+    pub const UNKNOWN_PDP_ADDR_OR_TYPE: u8 = Cause::UnknownPdpAddrOrType as u8;
+    pub const PDP_CONTEXT_WITHOUT_TFT_ACTIVATED: u8 = Cause::PdpContextWithoutTftActivated as u8;
+    pub const APN_ACCESS_DENIED: u8 = Cause::ApnAccessDenied as u8;
+    pub const APN_INCOMPATIBLE_WITH_ACTIVE_PDP_CONTEXTS: u8 =
+        Cause::ApnIncompatibleWithActivePdpContexts as u8;
+    pub const MS_MBMS_CAP_INSUFFICIENT: u8 = Cause::MsMbmsCapInsufficient as u8;
+    pub const INVALID_CORRELATION_ID: u8 = Cause::InvalidCorrelationId as u8;
+    pub const MBMS_BEARER_CONTEXT_SUPERSEDED: u8 = Cause::MbmsBearerContextSuperseded as u8;
+    pub const BEARER_CONTROL_MODE_VIOLATION: u8 = Cause::BearerControlModeViolation as u8;
+    pub const COLLISION_WITH_NET_INITIATED_REQ: u8 = Cause::CollisionWithNetInitiatedReq as u8;
+    pub const APN_CONGESTION: u8 = Cause::ApnCongestion as u8;
+    pub const BEARER_HANDLING_NOT_SUPPORTED: u8 = Cause::BearerHandlingNotSupported as u8;
+    pub const TGT_ACC_RESTRICTED_SUBSCRIBER: u8 = Cause::TgtAccRestrictedSubscriber as u8;
+    pub const UE_TMP_NOT_REACHABLE_POWER_SAVING: u8 = Cause::UeTmpNotReachablePowerSaving as u8;
+    pub const RELOCATION_FAILURE_NAS_MSG_REDIR: u8 = Cause::RelocationFailureNasMsgRedir as u8;
+}
+
+impl Cause {
+    /// The cause a received octet names, or `None` for a value TS 29.060 leaves
+    /// spare.
+    pub fn from_wire(value: u8) -> Option<Self> {
+        Self::try_from(value).ok()
+    }
+
+    /// The octet this cause is sent as.
+    pub const fn value(self) -> u8 {
+        self as u8
+    }
 }
 
 impl TryFrom<u8> for Cause {
@@ -1333,5 +1413,80 @@ mod tests {
         let not_req = Gtp1ExtHeader::new(0x44, &[0x00, 0x00]);
         assert!(!not_req.requires_comprehension(true));
         assert!(!not_req.requires_comprehension(false));
+    }
+}
+
+#[cfg(test)]
+mod cause_tests {
+    use super::Cause as C;
+
+    /// #1053: every GTPv1 cause against TS 29.060 §7.7.1, as the literal octet the
+    /// table gives it, both ways; spare values decode to nothing.
+    #[test]
+    fn every_cause_is_its_ts_29_060_value() {
+        let table: &[(C, u8)] = &[
+            (C::RequestImsi, 0),
+            (C::RequestImei, 1),
+            (C::RequestImsiImei, 2),
+            (C::NoIdNeeded, 3),
+            (C::MsRefuses, 4),
+            (C::MsNotGprsResponding, 5),
+            (C::ReactivationRequested, 6),
+            (C::PdpAddressInactivityTimerExp, 7),
+            (C::NetworkFailure, 8),
+            (C::QosParameterMismatch, 9),
+            (C::RequestAccepted, 128),
+            (C::NewPdpTypeDueToNetworkPreference, 129),
+            (C::NewPdpTypeDueToSingleAddressBearerOnly, 130),
+            (C::NonExistent, 192),
+            (C::InvalidMessageFormat, 193),
+            (C::ImsiImeiNotKnown, 194),
+            (C::MsGprsDetached, 195),
+            (C::RejMsNotGprsResponding, 196),
+            (C::RejMsRefuses, 197),
+            (C::VersionNotSupported, 198),
+            (C::NoResourcesAvailable, 199),
+            (C::ServiceNotSupported, 200),
+            (C::MandatoryIeIncorrect, 201),
+            (C::MandatoryIeMissing, 202),
+            (C::OptionalIeIncorrect, 203),
+            (C::SystemFailure, 204),
+            (C::RoamingRestriction, 205),
+            (C::PTmsiSignatureMismatch, 206),
+            (C::GprsConnSuspended, 207),
+            (C::AuthenticationFailure, 208),
+            (C::UserAuthenticationFailed, 209),
+            (C::ContextNotFound, 210),
+            (C::AllDynamicPdpAddrsOccupied, 211),
+            (C::NoMemoryAvailable, 212),
+            (C::RelocationFailure, 213),
+            (C::UnknownMandatoryExtensionHeader, 214),
+            (C::SemanticErrTftOperation, 215),
+            (C::SyntacticErrTftOperation, 216),
+            (C::SemanticErrPktFilter, 217),
+            (C::SyntacticErrPktFilter, 218),
+            (C::MissingOrUnknownApn, 219),
+            (C::UnknownPdpAddrOrType, 220),
+            (C::PdpContextWithoutTftActivated, 221),
+            (C::ApnAccessDenied, 222),
+            (C::ApnIncompatibleWithActivePdpContexts, 223),
+            (C::MsMbmsCapInsufficient, 224),
+            (C::InvalidCorrelationId, 225),
+            (C::MbmsBearerContextSuperseded, 226),
+            (C::BearerControlModeViolation, 227),
+            (C::CollisionWithNetInitiatedReq, 228),
+            (C::ApnCongestion, 229),
+            (C::BearerHandlingNotSupported, 230),
+            (C::TgtAccRestrictedSubscriber, 231),
+            (C::UeTmpNotReachablePowerSaving, 232),
+            (C::RelocationFailureNasMsgRedir, 233),
+        ];
+        for (cause, octet) in table {
+            assert_eq!(cause.value(), *octet, "{cause:?}");
+            assert_eq!(C::from_wire(*octet), Some(*cause), "octet {octet}");
+        }
+        for spare in [10u8, 127, 131, 191, 234, 255] {
+            assert_eq!(C::from_wire(spare), None, "octet {spare}");
+        }
     }
 }

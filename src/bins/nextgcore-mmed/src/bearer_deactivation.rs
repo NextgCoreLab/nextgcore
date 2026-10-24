@@ -77,6 +77,14 @@ pub struct PendingDeactivation {
     /// The PDN connection being deleted whole (the LBI case).
     sess_id: Option<u64>,
     waiting: Vec<Waiting>,
+    /// #862: EBIs to deactivate once the ECM-IDLE UE answers its paging (TS
+    /// 23.401 §5.4.4.1 step 4b); empty when the request is signalled already.
+    parked: Vec<u8>,
+    /// ESM cause #39 (reactivation requested) rather than #36.
+    reactivation: bool,
+    /// The UE went ECM-IDLE during this deactivation and was paged again for
+    /// it (once).
+    repaged: bool,
 }
 
 /// The deactivations waiting for the UE. Process-global like the S11 pending
@@ -123,7 +131,16 @@ pub fn start(
         .and_then(|id| ctx.enb_ue_find_by_id(id))
         .filter(|e| e.mme_ue_id == mme_ue_id)
     else {
-        return false;
+        // #862, TS 23.401 §5.4.4.1 step 4b: an ECM-IDLE UE whose PDN
+        // connection or bearers go with cause "reactivation requested" is
+        // paged first, so it is told (ESM cause #39) and re-establishes the
+        // APN; steps 4c-8 run once it is ECM-CONNECTED (`on_connected`).
+        // Without that cause condition (i) applies and the caller deletes
+        // locally.
+        if !reactivation {
+            return false;
+        }
+        return park_and_page(ctx, mme_ue_id, peer, seq, sgw_teid, answer, sess_id, ebis);
     };
     let cause = if reactivation {
         crate::esm_build::EsmCause::ReactivationRequested
@@ -144,7 +161,7 @@ pub fn start(
         })
         .unwrap_or_default();
     // The UE-AMBR without this PDN connection (TS 23.401 §4.7.3).
-    let ue_ambr = sess_id.and_then(|id| {
+    let ue_ambr = sess_id.map(|id| {
         let remaining: Vec<u64> = mme_ue
             .sess_list
             .iter()
@@ -153,7 +170,9 @@ pub fn start(
             .collect();
         let mut probe = mme_ue.clone();
         probe.sess_list = remaining;
-        ue_ambr_of(ctx, &probe)
+        // #811: the UE-AMBR of the remaining ACTIVE PDN connections, capped by
+        // the subscription (TS 23.401 §4.7.3), computed as everywhere else.
+        crate::s1ap_build::ue_ambr_of(ctx, &probe)
     });
     let mut waiting = Vec::new();
     for ebi in ebis {
@@ -232,29 +251,101 @@ pub fn start(
         answer,
         sess_id,
         waiting,
+        parked: Vec::new(),
+        reactivation,
+        repaged: false,
     });
     true
 }
 
-fn ue_ambr_of(ctx: &MmeContext, ue: &crate::context::MmeUe) -> Option<nextgcore_s1ap::UeAmbr> {
-    let (mut dl, mut ul) = (0u64, 0u64);
-    for sess in ue
-        .sess_list
-        .iter()
-        .filter_map(|id| ctx.sess_find_by_id(*id))
+/// Park a deactivation of `ebis` for ECM-IDLE `mme_ue_id` and page the UE
+/// (`PagingType::DeleteBearer`), unless a paging is already running, which the
+/// UE answers just the same. `false` when the UE cannot be paged (no eNB serves
+/// its tracking area): the caller then deletes locally and answers.
+#[allow(clippy::too_many_arguments)]
+fn park_and_page(
+    ctx: &MmeContext,
+    mme_ue_id: u64,
+    peer: SocketAddr,
+    seq: u32,
+    sgw_teid: u32,
+    answer: DeleteBearerAnswer,
+    sess_id: Option<u64>,
+    ebis: &[u8],
+) -> bool {
+    let paging = ctx
+        .mme_ue_find_by_id(mme_ue_id)
+        .is_some_and(|ue| ue.t3413.is_running());
+    if !paging
+        && crate::paging::page_ue(ctx, mme_ue_id, crate::context::PagingType::DeleteBearer) == 0
     {
-        dl = dl.saturating_add(sess.ambr.downlink);
-        ul = ul.saturating_add(sess.ambr.uplink);
+        return false;
     }
-    let cap = |sum: u64, sub: u64| match (sum, sub) {
-        (0, s) | (s, 0) => s,
-        (s, sub) => s.min(sub),
-    };
-    let ambr = nextgcore_s1ap::UeAmbr {
-        dl: cap(dl, ue.ambr.downlink),
-        ul: cap(ul, ue.ambr.uplink),
-    };
-    (ambr.dl != 0 || ambr.ul != 0).then_some(ambr)
+    log::info!(
+        "UE {mme_ue_id}: Delete Bearer Request with cause reactivation requested while ECM-IDLE: \
+         paged; EBIs {ebis:?} are deactivated once it answers (TS 23.401 §5.4.4.1 step 4b)"
+    );
+    pending().push(PendingDeactivation {
+        mme_ue_id,
+        peer,
+        seq,
+        sgw_teid,
+        answer,
+        sess_id,
+        waiting: Vec::new(),
+        parked: ebis.to_vec(),
+        reactivation: true,
+        repaged: false,
+    });
+    true
+}
+
+/// Take the deactivations of `mme_ue_id` that wait for its paging.
+fn take_parked(mme_ue_id: u64) -> Vec<PendingDeactivation> {
+    let mut list = pending();
+    let (taken, kept): (Vec<_>, Vec<_>) = list
+        .drain(..)
+        .partition(|p| p.mme_ue_id == mme_ue_id && !p.parked.is_empty());
+    *list = kept;
+    taken
+}
+
+/// `mme_ue_id` is ECM-CONNECTED again (the user plane of its SERVICE REQUEST,
+/// or of a TAU answering paging, is up): the deactivations parked for it run
+/// steps 4c-8 now (#862).
+pub fn on_connected(ctx: &MmeContext, mme_ue_id: u64) {
+    let parked = take_parked(mme_ue_id);
+    for p in parked {
+        if !start(
+            ctx,
+            mme_ue_id,
+            p.peer,
+            p.seq,
+            p.sgw_teid,
+            p.answer.clone(),
+            p.sess_id,
+            &p.parked,
+            true,
+        ) {
+            delete_now(ctx, mme_ue_id, &p.parked, p.sess_id);
+            answer(&p);
+        }
+    }
+}
+
+/// The paging of `mme_ue_id` failed, or its answer was rejected: the parked
+/// deactivations are completed in the MME and answered (the gateway asked for
+/// the deletion; the UE's bearer state is synchronised when it next connects).
+pub fn on_paging_failed(ctx: &MmeContext, mme_ue_id: u64) {
+    let parked = take_parked(mme_ue_id);
+    for p in parked {
+        log::warn!(
+            "UE {mme_ue_id}: not reached by paging; EBIs {:?} deactivated locally",
+            p.parked
+        );
+        delete_now(ctx, mme_ue_id, &p.parked, p.sess_id);
+        answer(&p);
+    }
 }
 
 /// Delete, in the MME, the bearer `ebi` of `mme_ue_id`, or the whole PDN
@@ -361,6 +452,7 @@ pub fn already_deactivating(ctx: &MmeContext, mme_ue_id: u64, ebi: u8) -> bool {
     let list = pending();
     list.iter().filter(|p| p.mme_ue_id == mme_ue_id).any(|p| {
         p.waiting.iter().any(|w| w.ebi == ebi)
+            || p.parked.contains(&ebi)
             || p.sess_id.is_some_and(|sess_id| {
                 ctx.sess_find_by_id(sess_id).is_some_and(|sess| {
                     sess.bearer_list
@@ -375,6 +467,7 @@ pub fn already_deactivating(ctx: &MmeContext, mme_ue_id: u64, ebi: u8) -> bool {
 /// Settle every deactivation of `mme_ue_id` at once (the UE is being
 /// detached): its bearers are deleted locally and each request answered.
 pub fn settle_all_for_ue(ctx: &MmeContext, mme_ue_id: u64, why: &str) {
+    on_paging_failed(ctx, mme_ue_id);
     let ebis: Vec<u8> = pending()
         .iter()
         .filter(|p| p.mme_ue_id == mme_ue_id)
@@ -403,6 +496,7 @@ pub fn sweep(ctx: &MmeContext, now: Instant) {
     }
     let mut settle_now: Vec<(u64, u8, &'static str)> = Vec::new();
     let mut resend: Vec<(u64, Vec<u8>)> = Vec::new();
+    let mut repage: Vec<u64> = Vec::new();
     {
         let mut list = pending();
         for p in list.iter_mut() {
@@ -410,6 +504,16 @@ pub fn sweep(ctx: &MmeContext, now: Instant) {
                 ctx.enb_ue_find_by_id(ue.enb_ue_id)
                     .is_some_and(|e| e.mme_ue_id == p.mme_ue_id)
             });
+            // #862 (#863 review MINOR 3): the UE went ECM-IDLE before it
+            // accepted a "reactivation requested" deactivation. It has not
+            // been told, so it is paged again (once) and the deactivation
+            // resumes when it answers, instead of settling locally.
+            if !connected && p.reactivation && !p.repaged && !p.waiting.is_empty() {
+                p.repaged = true;
+                p.parked = p.waiting.drain(..).map(|w| w.ebi).collect();
+                repage.push(p.mme_ue_id);
+                continue;
+            }
             for w in p.waiting.iter_mut() {
                 if !connected {
                     settle_now.push((p.mme_ue_id, w.ebi, "no S1 connection, deactivated locally"));
@@ -443,6 +547,16 @@ pub fn sweep(ctx: &MmeContext, now: Instant) {
     }
     for (mme_ue_id, ebi, why) in settle_now {
         settle(ctx, mme_ue_id, ebi, why);
+    }
+    for mme_ue_id in repage {
+        let paging = ctx
+            .mme_ue_find_by_id(mme_ue_id)
+            .is_some_and(|ue| ue.t3413.is_running());
+        if !paging
+            && crate::paging::page_ue(ctx, mme_ue_id, crate::context::PagingType::DeleteBearer) == 0
+        {
+            on_paging_failed(ctx, mme_ue_id);
+        }
     }
 }
 

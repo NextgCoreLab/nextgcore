@@ -21,6 +21,28 @@ spec:
       port: 9090
       targetPort: 9090
 ---
+# #968/#983: the name the UPF's PFCP peer allowlist resolves. Headless, so it
+# resolves to the SMF pod's own IP (its PFCP source address), not a ClusterIP;
+# publishNotReadyAddresses so the SMF can associate before it is Ready.
+apiVersion: v1
+kind: Service
+metadata:
+  name: smf-pfcp
+  namespace: nextg-system
+  labels:
+    app.kubernetes.io/name: smf
+    app.kubernetes.io/part-of: nextgcore
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: smf
+  ports:
+    - name: pfcp
+      port: 8805
+      targetPort: 8805
+      protocol: UDP
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -49,7 +71,7 @@ spec:
         app.kubernetes.io/part-of: nextgcore
     spec:
       # #718: a graceful SMF shutdown releases each UPF association (up to
-      # T1 x N1 = 9 s when a UPF is gone), sends every UE #39 and keeps
+      # T1 x (N1+1) = 12 s when a UPF is gone), sends every UE #39 and keeps
       # retransmitting its S5/S8 Delete Bearer Requests for up to 12 s.
       terminationGracePeriodSeconds: 45
       initContainers:
@@ -118,6 +140,10 @@ spec:
               value: info
             - name: RUST_BACKTRACE
               value: "1"
+            # The shutdown's own deadline: terminationGracePeriodSeconds (45) less 2 s
+            # for the exit (#941). Keep the two in step.
+            - name: SMF_SHUTDOWN_BUDGET_SECS
+              value: "43"
             # /metrics defaults to 127.0.0.1 (#837); in the pod it must accept the
             # pod IP for Prometheus and the kubelet. Not exposed beyond the cluster.
             - name: NEXTGCORE_METRICS_BIND

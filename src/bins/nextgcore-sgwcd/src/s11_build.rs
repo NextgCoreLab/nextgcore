@@ -705,17 +705,32 @@ pub fn build_s5c_delete_session_request(
 ) -> Result<Gtp2Message, String> {
     let ctx = sgwc_self();
 
-    let mut msg = new_message(
-        Gtp2MessageType::DeleteSessionRequest,
-        sess.pgw_s5c_teid,
-        sequence_number,
-    );
-
     // Linked EPS Bearer ID (C, instance 0): default bearer
     let default_bearer = ctx
         .default_bearer_in_sess(sess.id)
         .ok_or_else(|| "Session has no default bearer".to_string())?;
-    msg.add_ie(Gtp2EbiIe::new(default_bearer.ebi).to_ie(0));
+    Ok(build_s5c_delete_session_request_to(
+        sess.pgw_s5c_teid,
+        default_bearer.ebi,
+        sequence_number,
+    ))
+}
+
+/// Delete Session Request toward the PGW's S5/S8-C `pgw_s5c_teid` for the PDN
+/// connection whose default bearer is `lbi` (TS 29.274 §7.2.9.1): the Linked EBI
+/// and Indication (OI). Also used where the SGW-C has no session left to build
+/// from (#1032 review: a session abandoned after the PGW anchored it).
+pub fn build_s5c_delete_session_request_to(
+    pgw_s5c_teid: u32,
+    lbi: u8,
+    sequence_number: u32,
+) -> Gtp2Message {
+    let mut msg = new_message(
+        Gtp2MessageType::DeleteSessionRequest,
+        pgw_s5c_teid,
+        sequence_number,
+    );
+    msg.add_ie(Gtp2EbiIe::new(lbi).to_ie(0));
 
     // Indication flags: Operation Indication (C)
     msg.add_ie(
@@ -726,7 +741,7 @@ pub fn build_s5c_delete_session_request(
         .to_ie(0),
     );
 
-    Ok(msg)
+    msg
 }
 
 /// Build Create Bearer Response toward the PGW (TS 29.274 Section 7.2.4)
@@ -796,6 +811,69 @@ mod tests {
         );
     }
     use super::*;
+
+    /// #1024, TS 29.274 §5.5.1 / §8.4 / Table 8.4-1: a refused Create Session
+    /// Response, golden bytes. "No resources available" is octet 73 (0x49): it
+    /// was sent as 76, "Semantic errors in packet filter(s)".
+    #[test]
+    fn a_no_resources_refusal_is_cause_73_on_the_wire() {
+        let msg = build_error_response(
+            Gtp2MessageType::CreateSessionResponse as u8,
+            0x0102_0304,
+            0x0000_0A0B,
+            gtp_cause::NO_RESOURCES_AVAILABLE,
+            None,
+        );
+        assert_eq!(
+            msg.encode().to_vec(),
+            vec![
+                0x48, 0x21, 0x00, 0x0E, // v2, T=1; Create Session Response; length 14
+                0x01, 0x02, 0x03, 0x04, // TEID
+                0x00, 0x0A, 0x0B, 0x00, // sequence number, spare
+                0x02, 0x00, 0x02, 0x00, // Cause IE: type 2, length 2, instance 0
+                0x49, 0x00, // cause 73, PCE/BCE/CS clear
+            ]
+        );
+    }
+
+    /// #1024: "Mandatory IE incorrect" (69, 0x45) with the offending IE, golden
+    /// bytes (§8.4 octets 7-10: its type, length 0, instance). It was sent as 73.
+    #[test]
+    fn a_mandatory_ie_incorrect_refusal_is_cause_69_with_the_offending_ie() {
+        let msg = build_error_response(
+            Gtp2MessageType::CreateSessionResponse as u8,
+            0x0102_0304,
+            0x0000_0A0B,
+            gtp_cause::MANDATORY_IE_INCORRECT,
+            Some(87),
+        );
+        assert_eq!(
+            msg.encode().to_vec(),
+            vec![
+                0x48, 0x21, 0x00, 0x12, // length 18
+                0x01, 0x02, 0x03, 0x04, //
+                0x00, 0x0A, 0x0B, 0x00, //
+                0x02, 0x00, 0x06, 0x00, // Cause IE, length 6
+                0x45, 0x00, // cause 69
+                0x57, 0x00, 0x00, 0x00, // offending IE: F-TEID (87), length 0, instance 0
+            ]
+        );
+    }
+
+    /// #1024: "System failure" is 72 (0x48) on the wire; it was sent as 75, "Syntactic
+    /// error in the TFT operation".
+    #[test]
+    fn a_system_failure_is_cause_72_on_the_wire() {
+        let msg = build_error_response(
+            Gtp2MessageType::DeleteSessionResponse as u8,
+            0x0102_0304,
+            1,
+            gtp_cause::SYSTEM_FAILURE,
+            None,
+        );
+        let bytes = msg.encode().to_vec();
+        assert_eq!(&bytes[12..], &[0x02, 0x00, 0x02, 0x00, 0x48, 0x00]);
+    }
     use bytes::Bytes;
 
     /// Create a UE + session + bearer in the global context with realistic
@@ -1016,7 +1094,7 @@ mod tests {
         let msg = build_downlink_data_notification(
             &bearer,
             7,
-            Some(gtp_cause::ERROR_INDICATION_FROM_RNC_ENODEB),
+            Some(gtp_cause::ERROR_INDICATION_RECEIVED),
         )
         .unwrap();
         let decoded = round_trip(&msg);

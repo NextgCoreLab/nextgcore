@@ -2477,7 +2477,7 @@ async fn send_availability_notification(
         log::warn!(
             "Subscription {}: invalid nfNssaiAvailabilityUri '{}'",
             sub.subscription_id,
-            sub.nf_nssai_availability_uri
+            nextgcore_sbi::log_redact::redact_last_segment(&sub.nf_nssai_availability_uri)
         );
         return;
     };
@@ -2500,21 +2500,21 @@ async fn send_availability_notification(
         Ok(resp) if resp.status == 204 || resp.is_success() => {
             log::debug!(
                 "Availability notification delivered to {} (sub {})",
-                sub.nf_nssai_availability_uri,
+                nextgcore_sbi::log_redact::redact_last_segment(&sub.nf_nssai_availability_uri),
                 sub.subscription_id
             );
         }
         Ok(resp) => {
             log::warn!(
                 "Availability notification to {} returned {}",
-                sub.nf_nssai_availability_uri,
+                nextgcore_sbi::log_redact::redact_last_segment(&sub.nf_nssai_availability_uri),
                 resp.status
             );
         }
         Err(e) => {
             log::warn!(
                 "Availability notification to {} failed: {e}",
-                sub.nf_nssai_availability_uri
+                nextgcore_sbi::log_redact::redact_last_segment(&sub.nf_nssai_availability_uri)
             );
         }
     }

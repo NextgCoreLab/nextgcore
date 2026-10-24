@@ -178,3 +178,41 @@ if [ "${EPC_IDLE_MODE:-0}" = "1" ]; then
     fi
     echo "OK: ${COUNT}/${COUNT} downlink packets reach the UE after the network-triggered SERVICE REQUEST"
 fi
+
+# 7. Detach (#1032 review, TS 23.401 §5.3.8.2.1): the UE detaches; the MME's
+#    Delete Session Request (OI set) is relayed by the SGW-C to the PGW over
+#    S5/S8 (#1025), and the PGW's answer is what lets the SGW-U's session go.
+#    Off until the simulator can detach an LTE UE on command (nextgsim #365):
+#    set EPC_DETACH=1 once its image ships `lte-ue-detach`.
+if [ "${EPC_DETACH:-0}" = "1" ]; then
+    SGWC="${EPC_SGWC_CONTAINER:-nextgcore-sgwc}"
+    # The SGW-C's own counters (#1052 review), not its log text: relays sent to
+    # the PGW, and PGW answers with Request accepted.
+    sgwc_metric() {
+        docker exec "$SGWC" curl -fsS http://localhost:9090/metrics 2>/dev/null \
+            | awk -v m="$1" '$1 == m { print $2 }'
+    }
+    relayed0=$(sgwc_metric sgwc_s5_delete_session_relayed_total)
+    accepted0=$(sgwc_metric sgwc_s5_delete_session_accepted_total)
+    if [ -z "$relayed0" ] || [ -z "$accepted0" ]; then
+        echo "FAIL: the SGW-C does not export the S5/S8 Delete Session counters"
+        exit 1
+    fi
+    echo "Detaching the UE..."
+    docker exec "$UE" lte-ue-detach
+    for i in $(seq 1 "$TIMEOUT"); do
+        relayed=$(sgwc_metric sgwc_s5_delete_session_relayed_total)
+        accepted=$(sgwc_metric sgwc_s5_delete_session_accepted_total)
+        if [ "${relayed:-0}" -gt "$relayed0" ] && [ "${accepted:-0}" -gt "$accepted0" ]; then
+            echo "OK: the detach's Delete Session crossed S5/S8 and the PGW accepted it (after ${i}s)"
+            break
+        fi
+        if [ "$i" -eq "$TIMEOUT" ]; then
+            echo "FAIL: no Delete Session relayed to and accepted by the PGW within ${TIMEOUT}s" \
+                "(relayed ${relayed0} -> ${relayed:-?}, accepted ${accepted0} -> ${accepted:-?})"
+            docker logs --tail 60 "$SGWC" 2>&1 || true
+            exit 1
+        fi
+        sleep 1
+    done
+fi

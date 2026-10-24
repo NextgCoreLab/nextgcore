@@ -53,9 +53,30 @@ use tokio::task::JoinHandle;
 pub(crate) enum SbiOutcome {
     /// #796: a re-selection attempt for a waiting PDU Session Establishment.
     Establishment(crate::ngap_path::EstablishmentAttempt),
+    /// #747: the outcome of a UE radio capability ID Resolve at the UCMF, to be
+    /// answered to every association waiting for that ID.
+    MappingResponse {
+        /// The UE radio capability ID that was resolved, which is the key of the
+        /// in-flight slot and of the associations waiting for the answer.
+        id: Vec<u8>,
+        /// The capability the UCMF mapped it to, or `None` when it mapped none
+        /// (404, or a failure). Reported either way, so the slot is released.
+        capability: Option<Vec<u8>>,
+    },
     /// #964: the SMF's answer to an N2 handover step (PREPARING or PREPARED) for one
     /// PDU session.
     N2Handover(crate::ngap_path::N2HandoverAnswer),
+    /// #748: the UCMF's Assign for a UE whose UE radio capability ID it retired.
+    /// Coalesced: one Assign per (TAC, capability), whose answer serves every UE
+    /// waiting on that pair (#1046 review).
+    RacsAssigned {
+        tac: String,
+        capability: Vec<u8>,
+        result: Result<Vec<u8>, String>,
+    },
+    /// #774: one ReleaseSMContext of a superseded registration has reported back
+    /// (whatever its result), for the barrier with this id.
+    SupersedeReleased { barrier: u64 },
 }
 
 /// What keyed work is serialised on: (AMF UE NGAP ID, PDU session ID).

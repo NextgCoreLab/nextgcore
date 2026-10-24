@@ -456,6 +456,9 @@ spec:
         # restarting the PGW-C. The PFCP Node ID is the PGW-C's Service FQDN
         # (#797): the pod IP it binds changes on every restart, and a new Node ID
         # looks like a different CP function to the PGW-U (TS 29.244 §5.8.1).
+        # The shutdown's own deadline: terminationGracePeriodSeconds (45) less 2 s.
+        - name: SMF_SHUTDOWN_BUDGET_SECS
+          value: '43'
         - name: EPC_EXPORT
           value: SMF_PFCP_ADDR=self SMF_PFCP_NODE_ID=dns:pgwc UPF_PFCP_ADDR=dns:pgwu
         - name: EPC_UNTRACKED
@@ -506,7 +509,7 @@ spec:
       - name: run
         emptyDir: {}
       # #718: a PGW-C shutdown tells the SGW (Delete Bearer, retransmitted for up to
-      # T3 x (N3+1) = 12 s) and the PGW-U (Association Release, up to T1 x N1 = 9 s
+      # T3 x (N3+1) = 12 s) and the PGW-U (Association Release, up to T1 x (N1+1) = 12 s
       # when the PGW-U is gone) before it exits; 5 s cut that off.
       terminationGracePeriodSeconds: 45
       nodeSelector:
@@ -584,6 +587,11 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: status.podIP
+        # #968/#983: only the PGW-C may set up the Sxb association. The headless
+        # Service name resolves to the PGW-C pod's current IP (re-resolved every 10 s),
+        # so a PGW-C restart at a new IP is admitted.
+        - name: UPF_PFCP_ALLOWED_PEERS
+          value: pgwc.nextg-epc.svc.cluster.local
         - name: POD_NAMESPACE
           valueFrom:
             fieldRef:
@@ -731,6 +739,10 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: status.podIP
+        # #968/#983: only the SGW-C may set up the Sxa association (overrides the
+        # rendered sgwu.yaml's literal address with the headless Service name).
+        - name: SGWU_PFCP_ALLOWED_PEERS
+          value: sgwc.nextg-epc.svc.cluster.local
         - name: POD_NAMESPACE
           valueFrom:
             fieldRef:

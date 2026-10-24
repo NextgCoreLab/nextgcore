@@ -3,6 +3,7 @@
 //! Port of src/mme/mme-s11-handler.c - GTP-C message handling for S11 interface
 
 use crate::s11_build::{ie_type, message_type};
+use nextgcore_gtp::v2::cause as gtp2_cause;
 use std::net::SocketAddr;
 
 // ============================================================================
@@ -68,20 +69,30 @@ pub mod esm_cause {
 /// UE can do something different for knowing it.
 pub fn esm_cause_from_gtp(gtp_cause: u8) -> u8 {
     match gtp_cause {
-        64 => esm_cause::INVALID_EPS_BEARER_IDENTITY,
-        68 => esm_cause::SERVICE_OPTION_NOT_SUPPORTED,
+        gtp2_cause::CONTEXT_NOT_FOUND => esm_cause::INVALID_EPS_BEARER_IDENTITY,
+        gtp2_cause::SERVICE_NOT_SUPPORTED => esm_cause::SERVICE_OPTION_NOT_SUPPORTED,
         // TS 29.274 §8.4 cause 73 "No resources available" is a capacity refusal, and
         // §9.9.4.4 cause 26 says exactly that to the UE.
-        73 => esm_cause::INSUFFICIENT_RESOURCES,
-        74 => esm_cause::SEMANTIC_ERROR_IN_THE_TFT_OPERATION,
-        75 => esm_cause::SYNTACTICAL_ERROR_IN_THE_TFT_OPERATION,
-        76 => esm_cause::SEMANTIC_ERRORS_IN_PACKET_FILTERS,
-        77 => esm_cause::SYNTACTICAL_ERROR_IN_PACKET_FILTERS,
+        gtp2_cause::NO_RESOURCES_AVAILABLE => esm_cause::INSUFFICIENT_RESOURCES,
+        gtp2_cause::SEMANTIC_ERROR_IN_THE_TFT_OPERATION => {
+            esm_cause::SEMANTIC_ERROR_IN_THE_TFT_OPERATION
+        }
+        gtp2_cause::SYNTACTIC_ERROR_IN_THE_TFT_OPERATION => {
+            esm_cause::SYNTACTICAL_ERROR_IN_THE_TFT_OPERATION
+        }
+        gtp2_cause::SEMANTIC_ERRORS_IN_PACKET_FILTER => {
+            esm_cause::SEMANTIC_ERRORS_IN_PACKET_FILTERS
+        }
+        gtp2_cause::SYNTACTIC_ERRORS_IN_PACKET_FILTER => {
+            esm_cause::SYNTACTICAL_ERROR_IN_PACKET_FILTERS
+        }
         // The one the issue names.
-        78 => esm_cause::MISSING_OR_UNKNOWN_APN,
+        gtp2_cause::MISSING_OR_UNKNOWN_APN => esm_cause::MISSING_OR_UNKNOWN_APN,
         // A refusal by the SGW/PGW that names no more specific reason. Distinct from
         // NETWORK_FAILURE, which claims the network broke rather than declined.
-        94 => esm_cause::REQUEST_REJECTED_BY_SERVING_GW_OR_PDN_GW,
+        gtp2_cause::REQUEST_REJECTED_REASON_NOT_SPECIFIED => {
+            esm_cause::REQUEST_REJECTED_BY_SERVING_GW_OR_PDN_GW
+        }
         _ => esm_cause::NETWORK_FAILURE,
     }
 }
@@ -316,6 +327,12 @@ pub fn dispatch_triggered(raw: &[u8], msg_type: u8, sequence_number: u32, peer: 
                     "S11 Modify Bearer Response from {peer} (seq={sequence_number}) cause={}",
                     data.cause
                 );
+                // #1015: what the Serving GW now holds of the eNB's S1-U.
+                crate::gtp_path::confirm_mbr_endpoints(
+                    crate::context::mme_self(),
+                    sequence_number,
+                    &data,
+                );
                 // #730: a Path Switch Request (or a completed S1 handover)
                 // waits on this response (TS 23.401 §5.5.1.1.2 step 5).
                 if let Some(pending) =
@@ -460,7 +477,7 @@ fn apply_create_session_response(
 ) {
     let ctx = crate::context::mme_self();
 
-    if data.cause != 16 {
+    if data.cause != gtp2_cause::REQUEST_ACCEPTED {
         // TS 29.274 §8.4: 16 is "Request accepted". Anything else means no bearer
         // was created, and the UE is owed the mapped ESM cause rather than a wait.
         log::warn!(
@@ -494,7 +511,7 @@ fn apply_create_session_response(
     for bearer in &data.bearer_contexts {
         // TS 29.274 §8.4 / Table 7.2.2-2: a bearer context's own Cause says whether
         // THAT bearer was created. One that was not has no usable S1-U endpoint.
-        if bearer.cause != 16 {
+        if bearer.cause != gtp2_cause::REQUEST_ACCEPTED {
             log::warn!(
                 "S11 Create Session Response: EBI {} not created (bearer cause {})",
                 bearer.ebi,
@@ -715,7 +732,7 @@ fn apply_change_notification_response(
         );
         return;
     };
-    if data.cause != 16 {
+    if data.cause != gtp2_cause::REQUEST_ACCEPTED {
         log::warn!(
             "S11 Change Notification Response from {peer} (seq={sequence_number}) refused the \
              location change for session {sess_id}: cause {}",
@@ -1019,8 +1036,11 @@ pub fn dispatch_initial(raw: &[u8], msg_type: u8, sequence_number: u32, peer: So
                     .unwrap_or(0);
                 // #956, TS 23.401 §5.3.4.3: an ECM-IDLE UE is paged. The Ack is
                 // addressed to the Serving GW's TEID, not echoed back with ours.
-                let (sgw_teid, cause) =
-                    downlink_data_notification(crate::context::mme_self(), local_teid);
+                let (sgw_teid, cause) = downlink_data_notification_for_bearer(
+                    crate::context::mme_self(),
+                    local_teid,
+                    (data.ebi != 0).then_some(data.ebi),
+                );
                 if let Err(e) = crate::gtp_path::send_downlink_data_notification_ack_to(
                     peer,
                     sgw_teid,
@@ -1040,16 +1060,35 @@ pub fn dispatch_initial(raw: &[u8], msg_type: u8, sequence_number: u32, peer: So
     }
 }
 
-/// Act on a Downlink Data Notification for the UE whose S11 TEID is
-/// `mme_s11_teid` (TS 23.401 §5.3.4.3 steps 2-3, #956). Returns the Serving GW
-/// TEID and the cause of the Acknowledge:
-/// - no such UE: Context not found, TEID 0 (TS 29.274 §5.5.2);
-/// - ECM-CONNECTED, or already being paged: Request accepted, nothing more;
-/// - ECM-IDLE: paged on every eNB serving its tracking area (TS 36.413 §8.5),
-///   Request accepted, or Unable to page UE when no eNB serves it.
+/// [`downlink_data_notification_for_bearer`] for a notification that names no
+/// bearer: every bearer of the UE stands for it.
 pub fn downlink_data_notification(
     ctx: &crate::context::MmeContext,
     mme_s11_teid: u32,
+) -> (u32, crate::s11_build::GtpCause) {
+    downlink_data_notification_for_bearer(ctx, mme_s11_teid, None)
+}
+
+/// Act on a Downlink Data Notification for the UE whose S11 TEID is
+/// `mme_s11_teid`, for the bearer `ebi` when the notification names one
+/// (TS 23.401 §5.3.4.3 steps 2-3, #956). Returns the Serving GW TEID and the
+/// cause of the Acknowledge:
+/// - no such UE: Context not found, TEID 0 (TS 29.274 §5.5.2);
+/// - ECM-CONNECTED, and the Serving GW held the eNB's S1-U F-TEID for the
+///   bearer (#1015): the Serving GW has released the S1-U bearers (an S1-U
+///   path failure, TS 23.007 §20.3.4) while S1-MME is up. The S1 connection
+///   is released as for an S1 release (TS 23.401 §5.3.5, cause Transport
+///   resource unavailable) and the UE is paged when it completes; Request
+///   accepted;
+/// - ECM-CONNECTED otherwise (S1-U still being set up, a Modify Bearer Request
+///   unanswered, a handover or release running), or already being paged:
+///   Request accepted, nothing more;
+/// - ECM-IDLE: paged on every eNB serving its tracking area (TS 36.413 §8.5),
+///   Request accepted, or Unable to page UE when no eNB serves it.
+pub fn downlink_data_notification_for_bearer(
+    ctx: &crate::context::MmeContext,
+    mme_s11_teid: u32,
+    ebi: Option<u8>,
 ) -> (u32, crate::s11_build::GtpCause) {
     use crate::s11_build::GtpCause;
     let Some(mme_ue) = ctx
@@ -1078,6 +1117,33 @@ pub fn downlink_data_notification(
                 "[{}] Downlink Data Notification during the S1 release: paging when it completes",
                 mme_ue.imsi_bcd
             );
+        } else if s1u_released_at_sgw(ctx, &mme_ue, &enb_ue, ebi) {
+            if stale_s1u_release_allowed(ctx, mme_ue.id) {
+                log::warn!(
+                    "[{}] Downlink Data Notification (EBI {ebi:?}) for an ECM-CONNECTED UE \
+                     whose S1-U the Serving GW held: its S1-U is released; releasing the S1 \
+                     connection and paging (TS 23.401 §5.3.5, §5.3.4.3)",
+                    mme_ue.imsi_bcd
+                );
+                for send in crate::s1ap_handler::release_for_released_s1u(ctx, enb_ue.id, mme_ue.id)
+                {
+                    crate::s1ap_path::s1ap_send(send);
+                }
+            } else {
+                // #1049 review: the UE will not be paged for this data, so the
+                // Serving GW is told so (TS 29.274 §7.2.11.2, Table 8.4-1 cause
+                // 90) rather than left buffering for a page that never comes.
+                DDN_RELEASES_CAPPED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                log::error!(
+                    "[{}] Downlink Data Notification for an ECM-CONNECTED UE whose S1-U was \
+                     released again: {STALE_S1U_RELEASES_PER_WINDOW} S1 releases in {}s did \
+                     not restore it (a user plane path that stays failed); not releasing or \
+                     paging again until the window passes: Unable to page UE",
+                    mme_ue.imsi_bcd,
+                    STALE_S1U_WINDOW.as_secs()
+                );
+                return (sgw_teid, GtpCause::UnableToPageUe);
+            }
         }
         return (sgw_teid, GtpCause::RequestAccepted);
     }
@@ -1098,6 +1164,100 @@ pub fn downlink_data_notification(
     } else {
         (sgw_teid, GtpCause::RequestAccepted)
     }
+}
+
+/// At most this many S1 releases for a released S1-U per UE in
+/// [`STALE_S1U_WINDOW`] (#1023 review). Each release pages the UE, whose
+/// SERVICE REQUEST sets up S1-U toward the same eNB; while the path to it stays
+/// failed the Serving GW releases that S1-U again (sgwcd #1014), and without a
+/// bound the UE would cycle release, paging, SERVICE REQUEST for as long as the
+/// failure lasts.
+const STALE_S1U_RELEASES_PER_WINDOW: usize = 2;
+
+/// Downlink Data Notifications answered Unable to page UE because the UE hit
+/// [`STALE_S1U_RELEASES_PER_WINDOW`] (#1049 review).
+pub static DDN_RELEASES_CAPPED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Prometheus lines for this module's counters.
+pub fn render_metrics() -> String {
+    format!(
+        "# HELP mme_ddn_released_s1u_capped_total Downlink Data Notifications for a \
+         connected UE whose S1-U the Serving GW released, answered Unable to page UE because \
+         the UE already had its S1 releases for the window\n\
+         # TYPE mme_ddn_released_s1u_capped_total counter\n\
+         mme_ddn_released_s1u_capped_total {}\n",
+        DDN_RELEASES_CAPPED_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+    )
+}
+const STALE_S1U_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether another S1 release for a released S1-U is allowed for `mme_ue_id`
+/// now, recording it when it is.
+fn stale_s1u_release_allowed(ctx: &crate::context::MmeContext, mme_ue_id: u64) -> bool {
+    let now = std::time::Instant::now();
+    let mut pool = ctx.mme_ue_pool.write().unwrap();
+    let Some(ue) = pool.get_mut(&mme_ue_id) else {
+        return false;
+    };
+    ue.stale_s1u_releases
+        .retain(|t| now.saturating_duration_since(*t) < STALE_S1U_WINDOW);
+    if ue.stale_s1u_releases.len() >= STALE_S1U_RELEASES_PER_WINDOW {
+        return false;
+    }
+    ue.stale_s1u_releases.push(now);
+    true
+}
+
+/// Whether a Downlink Data Notification for the ECM-CONNECTED `mme_ue` on
+/// `enb_ue` says the Serving GW released S1-U it held (#1015), rather than that
+/// S1-U is still being set up. True only when no procedure that legitimately
+/// leaves the Serving GW without the eNB's F-TEIDs is running:
+/// - no S1 release or other UE context release ([`UeCtxRelAction`] unset);
+/// - no Initial Context Setup outstanding (attach, SERVICE REQUEST);
+/// - no Modify Bearer Request unanswered (attach step 23, SERVICE REQUEST
+///   step 8, E-RAB modification, handover);
+/// - no S1 handover in preparation or execution;
+///
+/// and the Serving GW did hold them: every bearer the notification is for
+/// (`ebi`, else every bearer of the UE) has an eNB S1-U F-TEID that an
+/// accepted Modify Bearer or Create Bearer Response gave the Serving GW.
+///
+/// [`UeCtxRelAction`]: crate::context::UeCtxRelAction
+fn s1u_released_at_sgw(
+    ctx: &crate::context::MmeContext,
+    mme_ue: &crate::context::MmeUe,
+    enb_ue: &crate::context::EnbUe,
+    ebi: Option<u8>,
+) -> bool {
+    use crate::context::{UeCtxRelAction, NEXTGCORE_INVALID_POOL_ID};
+    if enb_ue.ue_ctx_rel_action != UeCtxRelAction::Invalid
+        || mme_ue.ics_pending_on != 0
+        || mme_ue.service_request_ics_pending
+        || enb_ue.target_ue_id != NEXTGCORE_INVALID_POOL_ID
+        || enb_ue.handover_prep_deadline.is_some()
+        || enb_ue.pending_handover_command.is_some()
+        || crate::gtp_path::modify_bearer_in_flight(mme_ue.id)
+    {
+        return false;
+    }
+    let handover_target = ctx.enb_ue_pool.read().unwrap().values().any(|t| {
+        t.mme_ue_id == mme_ue.id
+            && t.id != enb_ue.id
+            && (t.handover_prep_deadline.is_some() || t.pending_handover_command.is_some())
+    });
+    if handover_target {
+        return false;
+    }
+    let bearers: Vec<crate::context::MmeBearer> = crate::gtp_path::bearers_of_ue(ctx, mme_ue.id)
+        .into_iter()
+        .filter(|b| ebi.is_none_or(|e| b.ebi == e))
+        .collect();
+    !bearers.is_empty()
+        && bearers.iter().all(|b| {
+            b.enb_s1u_teid != 0
+                && b.enb_s1u_at_sgw.as_ref() == Some(&(b.enb_s1u_teid, b.enb_s1u_ip.clone()))
+        })
 }
 
 /// A Delete Bearer Request from the Serving GW (TS 29.274 §7.2.9.2).
@@ -1295,7 +1455,7 @@ fn handle_delete_bearer_request(raw: &[u8], sequence_number: u32, peer: SocketAd
 }
 
 /// GTPv2 cause "Reactivation requested" (TS 29.274 Table 8.4-1, value 8).
-pub const GTP_CAUSE_REACTIVATION_REQUESTED: u8 = 8;
+pub use nextgcore_gtp::v2::cause::REACTIVATION_REQUESTED as GTP_CAUSE_REACTIVATION_REQUESTED;
 
 /// What a PGW-initiated Delete Bearer Request asks of this MME (#688).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1474,7 +1634,10 @@ pub fn network_initiated_bearer_deletion(
                 detach_type,
             };
         }
-        if connected {
+        // #862: an ECM-IDLE UE with cause "reactivation requested" is paged
+        // first (TS 23.401 §5.4.4.1 step 4b): `bearer_deactivation::start`
+        // parks the deactivation until it answers.
+        if connected || reactivation {
             return DeleteBearerAction::Deactivate {
                 mme_ue_id,
                 sgw_teid,
@@ -1493,14 +1656,7 @@ pub fn network_initiated_bearer_deletion(
         if let Some(ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&mme_ue_id) {
             ue.sess_list.retain(|id| *id != sess_id);
         }
-        if reactivation {
-            log::warn!(
-                "[{}] PDN connection LBI {lbi} deleted with cause reactivation requested while \
-                 the UE is ECM-IDLE: deleted here, but the UE is not told to reactivate; step 4b \
-                 paging is #862",
-                mme_ue.imsi_bcd
-            );
-        } else {
+        {
             log::info!(
                 "[{}] PDN connection LBI {lbi} deleted by the gateway; the UE is ECM-IDLE, so it \
                  is deleted here and synchronised at the next ECM-CONNECTED transition (TS \
@@ -1511,7 +1667,7 @@ pub fn network_initiated_bearer_deletion(
         return DeleteBearerAction::PdnDeletedLocally { sgw_teid, lbi };
     }
 
-    if connected {
+    if connected || reactivation {
         let held: Vec<u8> = ebis
             .iter()
             .copied()
@@ -1551,13 +1707,7 @@ pub fn network_initiated_bearer_deletion(
             lbi: None,
         };
     }
-    if reactivation {
-        log::warn!(
-            "[{}] dedicated bearers {deleted:?} deleted with cause reactivation requested while \
-             the UE is ECM-IDLE: deleted here without paging (step 4b is #862)",
-            mme_ue.imsi_bcd
-        );
-    } else {
+    {
         log::info!(
             "[{}] dedicated bearers {deleted:?} deleted by the gateway; the UE is ECM-IDLE, so \
              they are deleted here and synchronised at the next ECM-CONNECTED transition (TS \
@@ -2222,7 +2372,7 @@ fn apply_indirect_forwarding_response(
     // buffered downlink data forwarded is better off attached to the target than stuck
     // between cells. So the command goes out with an EMPTY forwarding list, and the
     // loss is logged rather than hidden.
-    if data.cause != 16 {
+    if data.cause != gtp2_cause::REQUEST_ACCEPTED {
         log::error!(
             "SGW refused indirect forwarding tunnels (cause={}); completing the handover WITHOUT \
              data forwarding, so buffered downlink data is lost",
@@ -2273,7 +2423,7 @@ fn apply_indirect_forwarding_response(
         return;
     }
 
-    let forwarding_list = if data.cause == 16 {
+    let forwarding_list = if data.cause == gtp2_cause::REQUEST_ACCEPTED {
         crate::s1ap_handler::sgw_forwarding_list(ctx, mme_ue_id)
     } else {
         Vec::new()
@@ -3688,13 +3838,14 @@ mod pgw_initiated_delete_bearer_tests {
     }
 
     /// TS 23.401 §5.4.4.1 condition (i): an ECM-IDLE UE's non-last PDN
-    /// connection is deleted locally at once.
+    /// connection is deleted locally at once, when the cause is not
+    /// "reactivation requested" (#862: that one pages first).
     #[test]
     fn a_pdn_that_is_not_the_last_is_deleted_without_a_detach() {
         let ctx = ctx();
         let (mme_ue_id, teid) = ue(&ctx, &[5, 6]);
         idle(&ctx, mme_ue_id);
-        let action = network_initiated_bearer_deletion(&ctx, teid, &dbr_lbi(teid, 6, Some(8)));
+        let action = network_initiated_bearer_deletion(&ctx, teid, &dbr_lbi(teid, 6, None));
         assert_eq!(
             action,
             DeleteBearerAction::PdnDeletedLocally {

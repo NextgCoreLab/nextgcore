@@ -188,12 +188,16 @@ pub async fn notify_ue_context_change(supi: &str, event: UeContextEvent) -> (usi
         match crate::sbi_path::udm_sbi_send_callback_notification(callback, &body).await {
             Ok(resp) => {
                 log::info!(
-                    "SDM ModificationNotification for {supi} ({changed}) -> {callback}: status={}",
+                    "SDM ModificationNotification for {supi} ({changed}) -> {}: status={}",
+                    nextgcore_sbi::log_redact::redact_last_segment(callback),
                     resp.status
                 );
                 sdm_delivered += 1;
             }
-            Err(e) => log::warn!("SDM ModificationNotification to {callback} failed: {e}"),
+            Err(e) => log::warn!(
+                "SDM ModificationNotification to {} failed: {e}",
+                nextgcore_sbi::log_redact::redact_last_segment(callback)
+            ),
         }
     }
 
@@ -212,14 +216,14 @@ pub async fn notify_ue_context_change(supi: &str, event: UeContextEvent) -> (usi
                 log::info!(
                     "EE MonitoringReport ({}) for {supi} -> {}: status={}",
                     event.ee_event_type(),
-                    sub.callback_reference,
+                    nextgcore_sbi::log_redact::redact_last_segment(&sub.callback_reference),
                     resp.status
                 );
                 ee_delivered += 1;
             }
             Err(e) => log::warn!(
                 "EE MonitoringReport to {} failed: {e}",
-                sub.callback_reference
+                nextgcore_sbi::log_redact::redact_last_segment(&sub.callback_reference)
             ),
         }
     }

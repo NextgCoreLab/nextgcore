@@ -2117,11 +2117,18 @@ pub fn handle_ue_context_release_request(
         enb_ue.mme_ue_id
     };
 
-    // #956, TS 23.401 §5.3.5 step 2: a UE with PDN connections at a Serving GW
-    // goes ECM-IDLE. Its S1-U bearers are released at the Serving GW first, so
-    // downlink is buffered and notified (§5.3.4.3) rather than tunnelled to an
-    // eNB that has dropped the UE. The UE CONTEXT RELEASE COMMAND (step 5)
-    // follows the Release Access Bearers Response.
+    log::info!("UE Context Release Request (cause {:?})", msg.cause);
+    release_to_ecm_idle(ctx, enb_ue_id, mme_ue_id)
+}
+
+/// The S1 release of `enb_ue_id` once its cause and `S1ContextRemove` are
+/// recorded (TS 23.401 §5.3.5). A UE with PDN connections at a Serving GW
+/// goes ECM-IDLE: its S1-U bearers are released at the Serving GW first
+/// (step 2), so downlink is buffered and notified (§5.3.4.3) rather than
+/// tunnelled to an eNB that has dropped the UE, and the UE CONTEXT RELEASE
+/// COMMAND (step 5) follows the Release Access Bearers Response (#956).
+/// Otherwise, or when that request cannot be sent, the command is returned now.
+fn release_to_ecm_idle(ctx: &MmeContext, enb_ue_id: u64, mme_ue_id: u64) -> Vec<S1apSend> {
     let has_session = ctx
         .mme_ue_find_by_id(mme_ue_id)
         .filter(|ue| ue.enb_ue_id == enb_ue_id)
@@ -2131,19 +2138,45 @@ pub fn handle_ue_context_release_request(
         match crate::gtp_path::release_access_bearers_for_s1_release(ctx, enb_ue_id, mme_ue_id) {
             Ok(seq) => {
                 log::info!(
-                    "UE Context Release Request (cause {:?}): Release Access Bearers Request \
-                     (seq={seq}) to the Serving GW; the UE goes ECM-IDLE (TS 23.401 §5.3.5)",
-                    msg.cause
+                    "S1 release of enb_ue_id={enb_ue_id}: Release Access Bearers Request \
+                     (seq={seq}) to the Serving GW; the UE goes ECM-IDLE (TS 23.401 §5.3.5)"
                 );
                 return Vec::new();
             }
             Err(e) => log::error!(
-                "UE Context Release Request: Release Access Bearers Request not sent ({e}); \
-                 releasing S1 now"
+                "S1 release of enb_ue_id={enb_ue_id}: Release Access Bearers Request not sent \
+                 ({e}); releasing S1 now"
             ),
         }
     }
     s1_release_command(ctx, enb_ue_id)
+}
+
+/// MME-initiated S1 release (TS 23.401 §5.3.5) of the ECM-CONNECTED UE
+/// `mme_ue_id` on `enb_ue_id` whose S1-U the Serving GW released while S1-MME
+/// stayed up (#1015): a Downlink Data Notification came for a bearer whose eNB
+/// F-TEID the Serving GW held, as after an S1-U path failure (TS 23.007
+/// §20.3.4). The UE CONTEXT RELEASE COMMAND carries Transport cause
+/// transport-resource-unavailable (TS 36.413 §9.2.1.3), and the UE is paged
+/// when the release completes (`ddn_pending_after_release`): its SERVICE
+/// REQUEST then sets up fresh S1-U bearers.
+pub fn release_for_released_s1u(ctx: &MmeContext, enb_ue_id: u64, mme_ue_id: u64) -> Vec<S1apSend> {
+    {
+        let mut pool = ctx.enb_ue_pool.write().unwrap();
+        let Some(enb_ue) = pool
+            .get_mut(&enb_ue_id)
+            .filter(|e| e.mme_ue_id == mme_ue_id)
+        else {
+            return Vec::new();
+        };
+        enb_ue.relcause.group = S1apCauseGroup::Transport;
+        enb_ue.relcause.cause = s1ap_build::transport_cause::TRANSPORT_RESOURCE_UNAVAILABLE;
+        enb_ue.ue_ctx_rel_action = UeCtxRelAction::S1ContextRemove;
+    }
+    if let Some(ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&mme_ue_id) {
+        ue.ddn_pending_after_release = true;
+    }
+    release_to_ecm_idle(ctx, enb_ue_id, mme_ue_id)
 }
 
 /// The UE CONTEXT RELEASE COMMAND of an S1 release for `enb_ue_id`, with the
@@ -4899,6 +4932,8 @@ fn service_request_context_set_up(
              GW keeps buffering downlink"
         ),
     }
+    // #862: deactivations parked while the UE was ECM-IDLE run now.
+    crate::bearer_deactivation::on_connected(ctx, mme_ue_id);
 }
 
 fn handle_erab_setup_response(
@@ -7425,6 +7460,56 @@ mod tests {
             !take_ue_ambr_modification(&ctx, enb_id + 1, mme_ue_s1ap_id),
             "only from the eNB serving the UE"
         );
+    }
+    /// #961 review: the "setup in progress" also ends with an INITIAL CONTEXT
+    /// SETUP FAILURE and with the S1 release (UE CONTEXT RELEASE COMPLETE), so a
+    /// UE-AMBR change is not deferred behind a setup that will never be answered.
+    #[test]
+    fn an_ics_failure_or_an_s1_release_ends_the_setup_in_progress() {
+        let ctx = MmeContext::new();
+        ctx.init();
+        let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+        let connect = |s1ap_id: u32, mme_ue_id: Option<u64>| {
+            let enb_ue_id = ctx.enb_ue_add(enb_id, s1ap_id);
+            let mme_ue_id = mme_ue_id.unwrap_or_else(|| ctx.mme_ue_add(enb_ue_id));
+            ctx.enb_ue_associate_mme_ue(enb_ue_id, mme_ue_id);
+            ctx.mme_ue_pool
+                .write()
+                .unwrap()
+                .get_mut(&mme_ue_id)
+                .unwrap()
+                .ics_pending_on = enb_ue_id;
+            let mme_ue_s1ap_id = ctx.enb_ue_find_by_id(enb_ue_id).unwrap().mme_ue_s1ap_id;
+            (enb_ue_id, mme_ue_id, mme_ue_s1ap_id)
+        };
+        let (_, mme_ue_id, mme_ue_s1ap_id) = connect(9612, None);
+        let _ = handle_initial_context_setup_failure(
+            &ctx,
+            enb_id,
+            &nextgcore_s1ap::InitialContextSetupFailure {
+                mme_ue_s1ap_id,
+                enb_ue_s1ap_id: 9612,
+                cause: Cause::RadioNetwork(CauseRadioNetwork::Unspecified),
+            },
+        );
+        assert_eq!(
+            ctx.mme_ue_find_by_id(mme_ue_id).unwrap().ics_pending_on,
+            0,
+            "cleared by the failure"
+        );
+
+        let (_, mme_ue_id, mme_ue_s1ap_id) = connect(9613, Some(mme_ue_id));
+        handle_ue_context_release_complete(
+            &ctx,
+            enb_id,
+            &nextgcore_s1ap::UeContextReleaseComplete {
+                mme_ue_s1ap_id,
+                enb_ue_s1ap_id: 9613,
+            },
+        );
+        let ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert_eq!(ue.enb_ue_id, NEXTGCORE_INVALID_POOL_ID, "ECM-IDLE");
+        assert_eq!(ue.ics_pending_on, 0, "cleared by the release");
     }
     /// #869 review: the Initial Context Setup Response ends the "setup in
     /// progress" that defers a UE-AMBR change.

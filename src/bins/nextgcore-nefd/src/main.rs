@@ -1814,22 +1814,32 @@ fn build_monitoring_notification(
 /// (best-effort, bounded timeouts; failures are logged, no retry).
 async fn forward_notification_to_af(destination: String, notification: serde_json::Value) {
     let Some((host, port, path)) = parse_http_uri(&destination) else {
-        log::warn!("invalid notificationDestination '{destination}'; notification dropped");
+        log::warn!(
+            "invalid notificationDestination '{destination}'; notification dropped",
+            destination = nextgcore_sbi::log_redact::redact_last_segment(&destination)
+        );
         return;
     };
     let client = bounded_client(&host, port);
     match client.post_json(&path, &notification).await {
         Ok(response) if response.is_success() => {
-            log::debug!("monitoring notification delivered to {destination}");
+            log::debug!(
+                "monitoring notification delivered to {destination}",
+                destination = nextgcore_sbi::log_redact::redact_last_segment(&destination)
+            );
         }
         Ok(response) => {
             log::warn!(
                 "monitoring notification to {destination} returned {}",
-                response.status
+                response.status,
+                destination = nextgcore_sbi::log_redact::redact_last_segment(&destination)
             );
         }
         Err(e) => {
-            log::warn!("monitoring notification to {destination} failed: {e}");
+            log::warn!(
+                "monitoring notification to {destination} failed: {e}",
+                destination = nextgcore_sbi::log_redact::redact_last_segment(&destination)
+            );
         }
     }
 }

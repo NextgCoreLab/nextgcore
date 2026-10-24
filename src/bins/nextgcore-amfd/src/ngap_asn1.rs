@@ -791,6 +791,33 @@ pub fn build_pdu_session_resource_setup_request_asn1(
     nas_pdu: Option<&[u8]>,
     n2_sm_transfer: &[u8],
 ) -> Option<Vec<u8>> {
+    build_pdu_session_resource_setup_request_with_nas_asn1(
+        amf_ue_ngap_id,
+        ran_ue_ngap_id,
+        pdu_session_id,
+        s_nssai_sst,
+        s_nssai_sd,
+        nas_pdu,
+        None,
+        n2_sm_transfer,
+    )
+}
+
+/// [`build_pdu_session_resource_setup_request_asn1`] with the item's own
+/// PDU Session NAS-PDU (TS 38.413 §9.2.1.1): the place for a 5GSM message about
+/// that session (TS 23.502 §4.3.2.2.1 step 12), tied to the session's outcome at
+/// the gNB. `nas_pdu` is the message-level NAS-PDU, for a 5GMM message.
+#[allow(clippy::too_many_arguments)]
+pub fn build_pdu_session_resource_setup_request_with_nas_asn1(
+    amf_ue_ngap_id: u64,
+    ran_ue_ngap_id: u32,
+    pdu_session_id: u8,
+    s_nssai_sst: u8,
+    s_nssai_sd: Option<u32>,
+    nas_pdu: Option<&[u8]>,
+    pdu_session_nas_pdu: Option<&[u8]>,
+    n2_sm_transfer: &[u8],
+) -> Option<Vec<u8>> {
     use ngap_gen::{
         PDUSessionResourceSetupItemSUReq,
         PDUSessionResourceSetupItemSUReqPDUSessionResourceSetupRequestTransfer as Transfer,
@@ -801,7 +828,7 @@ pub fn build_pdu_session_resource_setup_request_asn1(
 
     let item = PDUSessionResourceSetupItemSUReq {
         pdu_session_id: ngap_gen::PDUSessionID(pdu_session_id),
-        pdu_session_nas_pdu: None,
+        pdu_session_nas_pdu: pdu_session_nas_pdu.map(|n| ngap_gen::NAS_PDU(n.to_vec())),
         s_nssai: generated_s_nssai(&crate::context::SNssai {
             sst: s_nssai_sst,
             sd: s_nssai_sd,
@@ -1435,6 +1462,10 @@ pub enum InitialContextSetupOutcomeDecode {
         /// its PDUSessionResourceSetupResponseTransfer, which the SMF needs to
         /// point the downlink at the gNB (#540). Empty for a Failure.
         setup_sessions: Vec<(u8, Vec<u8>)>,
+        /// The Response's PDU Session Resource Failed to Setup List: each session's ID
+        /// and its PDUSessionResourceSetupUnsuccessfulTransfer (#778 follow-up). Empty for
+        /// a Failure.
+        failed_sessions: Vec<(u8, Vec<u8>)>,
     },
     /// A not-comprehended IE was marked "reject": the procedure is
     /// "unsuccessfully terminated" and handled locally (§10.3.4.2), with no
@@ -1485,6 +1516,7 @@ pub fn decode_initial_context_setup_response_asn1(data: &[u8]) -> InitialContext
     let mut amf_ue_ngap_id = None;
     let mut ran_ue_ngap_id = None;
     let mut setup_sessions = Vec::new();
+    let mut failed_sessions = Vec::new();
     for entry in response.protocol_i_es.0 {
         match entry.value {
             Ie::Id_AMF_UE_NGAP_ID(v) => amf_ue_ngap_id = Some(v.0),
@@ -1503,8 +1535,19 @@ pub fn decode_initial_context_setup_response_asn1(data: &[u8]) -> InitialContext
                     })
                     .collect();
             }
-            Ie::Id_PDUSessionResourceFailedToSetupListCxtRes(_)
-            | Ie::Id_CriticalityDiagnostics(_) => {}
+            Ie::Id_PDUSessionResourceFailedToSetupListCxtRes(list) => {
+                failed_sessions = list
+                    .0
+                    .into_iter()
+                    .map(|item| {
+                        (
+                            item.pdu_session_id.0,
+                            item.pdu_session_resource_setup_unsuccessful_transfer.0,
+                        )
+                    })
+                    .collect();
+            }
+            Ie::Id_CriticalityDiagnostics(_) => {}
         }
     }
     Decoded {
@@ -1512,6 +1555,7 @@ pub fn decode_initial_context_setup_response_asn1(data: &[u8]) -> InitialContext
         ran_ue_ngap_id,
         cause: None,
         setup_sessions,
+        failed_sessions,
         error_indication: ics_error_indication(
             amf_ue_ngap_id,
             ran_ue_ngap_id,
@@ -1579,6 +1623,7 @@ pub fn decode_initial_context_setup_failure_asn1(data: &[u8]) -> InitialContextS
         ran_ue_ngap_id,
         cause,
         setup_sessions: Vec::new(),
+        failed_sessions: Vec::new(),
         error_indication: ics_error_indication(
             amf_ue_ngap_id,
             ran_ue_ngap_id,
@@ -4122,16 +4167,6 @@ pub fn hand_written_diagnostics(report: &CriticalityErrorIndication) -> Critical
     }
 }
 
-/// Decode a HANDOVER REQUIRED (TS 38.413 §9.2.3.1) with the GENERATED codec
-/// (#417), applying §10.3.4.2 and §10.3.5. Handover Preparation is a Class 1
-/// procedure whose unsuccessful outcome is HANDOVER PREPARATION FAILURE, so a
-/// not-comprehended "reject" IE, or a missing one of the six mandatory
-/// criticality-reject IEs, comes back as `Reject` for the caller to answer
-/// with that failure (or an Error Indication when the UE cannot be named); a
-/// "notify" IE comes back in `error_indication`. Cause and Direct Forwarding
-/// Path Availability are criticality ignore: a missing Cause is
-/// misc/unspecified. A TargetID this AMF cannot represent (an N3IWF, a
-/// choice extension) is `Undecodable`, as the hand-written parser had it.
 /// The UE ids of a HANDOVER REQUIRED that is well formed but asks for a handover this
 /// AMF cannot represent (#744): a HandoverType past the extension marker
 /// (fivegs-to-utran) or a TargetID it has no value for (the choice extensions
@@ -4171,6 +4206,18 @@ pub fn handover_required_unsupported_target(data: &[u8]) -> Option<(u64, u32)> {
     unsupported.then_some((amf?, ran?))
 }
 
+/// Decode a HANDOVER REQUIRED (TS 38.413 §9.2.3.1) with the GENERATED codec
+/// (#417), applying §10.3.4.2 and §10.3.5. Handover Preparation is a Class 1
+/// procedure whose unsuccessful outcome is HANDOVER PREPARATION FAILURE, so a
+/// not-comprehended "reject" IE, or a missing one of the six mandatory
+/// criticality-reject IEs, comes back as `Reject` for the caller to answer
+/// with that failure (or an Error Indication when the UE cannot be named); a
+/// "notify" IE comes back in `error_indication`. Cause and Direct Forwarding
+/// Path Availability are criticality ignore: a missing Cause is
+/// misc/unspecified. A HandoverType or TargetID this AMF cannot represent (an N3IWF, a
+/// choice extension) is `Undecodable` -- but only once the PDU has passed the
+/// §10.3.4.2 / §10.3.5 checks, so a missing mandatory IE or a not-comprehended reject
+/// IE is answered with abstract-syntax-error whatever the type or target (#844 review).
 pub fn decode_handover_required_asn1(data: &[u8]) -> NasTransportDecode<HandoverRequired> {
     use ngap_gen::HandoverRequiredProtocolIEs_EntryValue as Ie;
     let Some((criticality, ies, mut reject, notify)) =
@@ -4183,30 +4230,37 @@ pub fn decode_handover_required_asn1(data: &[u8]) -> NasTransportDecode<Handover
     };
     let (mut amf, mut ran, mut ho_type, mut cause, mut target) = (None, None, None, None, None);
     let (mut sessions, mut container, mut direct) = (None, None, None);
+    // Present but not representable here (#744): decided after the abstract-syntax checks.
+    let (mut ho_type_present, mut target_present, mut unsupported) = (false, false, false);
     for entry in ies {
         match entry.value {
             Ie::Id_AMF_UE_NGAP_ID(v) => amf = Some(v.0),
             Ie::Id_RAN_UE_NGAP_ID(v) => ran = Some(v.0),
             Ie::Id_HandoverType(v) => {
-                ho_type = Some(match v.0 {
-                    ngap_gen::HandoverType::INTRA5GS => HandoverType::Intra5gs,
-                    ngap_gen::HandoverType::FIVEGS_TO_EPS => HandoverType::FivegsToEps,
-                    ngap_gen::HandoverType::EPS_TO_5GS => HandoverType::EpsTo5gs,
+                ho_type_present = true;
+                ho_type = match v.0 {
+                    ngap_gen::HandoverType::INTRA5GS => Some(HandoverType::Intra5gs),
+                    ngap_gen::HandoverType::FIVEGS_TO_EPS => Some(HandoverType::FivegsToEps),
+                    ngap_gen::HandoverType::EPS_TO_5GS => Some(HandoverType::EpsTo5gs),
                     other => {
                         // 5GS-to-UTRAN and later: no hand-written value, as before.
                         log::warn!("Handover Required with an unsupported HandoverType {other}");
-                        return NasTransportDecode::Undecodable;
+                        unsupported = true;
+                        None
                     }
-                })
+                }
             }
             Ie::Id_Cause(v) => cause = Some(hand_written_cause(&v)),
-            Ie::Id_TargetID(v) => match hand_written_target_id(&v) {
-                Some(t) => target = Some(t),
-                None => {
-                    log::warn!("Handover Required names a target this AMF cannot represent");
-                    return NasTransportDecode::Undecodable;
+            Ie::Id_TargetID(v) => {
+                target_present = true;
+                match hand_written_target_id(&v) {
+                    Some(t) => target = Some(t),
+                    None => {
+                        log::warn!("Handover Required names a target this AMF cannot represent");
+                        unsupported = true;
+                    }
                 }
-            },
+            }
             Ie::Id_DirectForwardingPathAvailability(_) => {
                 direct = Some(
                     nextgcore_ngap::types::DirectForwardingPathAvailability::DirectPathAvailable,
@@ -4228,8 +4282,8 @@ pub fn decode_handover_required_asn1(data: &[u8]) -> NasTransportDecode<Handover
     for (present, id) in [
         (amf.is_some(), ngap_gen::ID_AMF_UE_NGAP_ID),
         (ran.is_some(), ngap_gen::ID_RAN_UE_NGAP_ID),
-        (ho_type.is_some(), ngap_gen::ID_HANDOVER_TYPE),
-        (target.is_some(), ngap_gen::ID_TARGET_ID),
+        (ho_type_present, ngap_gen::ID_HANDOVER_TYPE),
+        (target_present, ngap_gen::ID_TARGET_ID),
         (
             sessions.is_some(),
             ngap_gen::ID_PDU_SESSION_RESOURCE_LIST_HO_RQD,
@@ -4253,6 +4307,9 @@ pub fn decode_handover_required_asn1(data: &[u8]) -> NasTransportDecode<Handover
             diagnostics,
         )
     };
+    if unsupported && reject.is_empty() {
+        return NasTransportDecode::Undecodable;
+    }
     let (
         Some(amf_ue_ngap_id),
         Some(ran_ue_ngap_id),
@@ -12495,6 +12552,7 @@ pub(crate) mod tests {
                         cause: None,
                         error_indication: None,
                         setup_sessions: Vec::new(),
+                        failed_sessions: Vec::new(),
                     }
                 );
                 compared += 1;
@@ -12547,6 +12605,7 @@ pub(crate) mod tests {
                             cause: Some(expected_cause),
                             error_indication: None,
                             setup_sessions: Vec::new(),
+                            failed_sessions: Vec::new(),
                         },
                         "group {group} value {value}"
                     );
@@ -12608,6 +12667,7 @@ pub(crate) mod tests {
                     cause,
                     error_indication: None,
                     setup_sessions: Vec::new(),
+                    failed_sessions: Vec::new(),
                 }
             );
             assert_eq!(
@@ -12629,6 +12689,7 @@ pub(crate) mod tests {
                         diagnostics: vec![diag(ngap_gen::Criticality::NOTIFY)],
                     }),
                     setup_sessions: Vec::new(),
+                    failed_sessions: Vec::new(),
                 }
             );
             assert_eq!(
@@ -14542,8 +14603,8 @@ mod handover_3b_ii_tests {
 
     /// The whole DOWNLINK RAN STATUS TRANSFER for AMF UE NGAP ID 1, RAN UE NGAP
     /// ID 2 and that container, derived by hand: CHOICE initiatingMessage `000`
-    /// + pad; procedure code 7; criticality ignore `01` + pad; open type length
-    /// 31; SEQUENCE ext bit + pad; IE count 3 (two-octet aligned); then each
+    /// plus pad; procedure code 7; criticality ignore `01` plus pad; open type
+    /// length 31; SEQUENCE ext bit plus pad; IE count 3 (two-octet aligned); then each
     /// ProtocolIE-Field: id (two octets), criticality reject `00` + pad, open
     /// type length, value -- AMF-UE-NGAP-ID 1 (3-bit octet count 0, pad, `01`),
     /// RAN-UE-NGAP-ID 2 (2-bit octet count 0, pad, `02`), the container.

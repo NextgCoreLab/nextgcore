@@ -1273,7 +1273,7 @@ impl EesContext {
         log::info!(
             "ACR management event subscription created: subscriptionId={id} easId={} notificationDestination={}",
             sub.eas_id,
-            sub.notification_destination
+            nextgcore_sbi::log_redact::redact_last_segment(&sub.notification_destination)
         );
         Some(sub)
     }
@@ -1396,7 +1396,7 @@ impl EesContext {
         log::info!(
             "ACTStatusSubsc created: subscriptionId={id} easId={} notificationUri={}",
             sub.eas_id,
-            sub.notification_uri
+            nextgcore_sbi::log_redact::redact_last_segment(&sub.notification_uri)
         );
         Some(id)
     }
@@ -1907,7 +1907,7 @@ mod tests {
         // Exactly one spec-shaped EasDiscoveryNotification was enqueued.
         let queued = n.drain();
         assert_eq!(queued.len(), 1);
-        assert_eq!(queued[0].uri, "http://eec/callback");
+        assert_eq!(queued[0].callback_uri, "http://eec/callback");
         assert_eq!(queued[0].kind, "EasDiscoveryNotification");
         let notif: EasDiscoveryNotification =
             serde_json::from_value(queued[0].body.clone()).unwrap();
@@ -2019,7 +2019,10 @@ mod tests {
         let queued = n.drain();
         assert_eq!(queued.len(), 2);
         assert!(queued.iter().all(|q| q.kind == "AcrMgntEventsNotification"));
-        let a = queued.iter().find(|q| q.uri == "http://eec-a/cb").unwrap();
+        let a = queued
+            .iter()
+            .find(|q| q.callback_uri == "http://eec-a/cb")
+            .unwrap();
         let notif: AcrMgntEventsNotification = serde_json::from_value(a.body.clone()).unwrap();
         assert!(!notif.subp_id.is_empty());
         assert_eq!(notif.event_reports.len(), 1);
@@ -2105,7 +2108,7 @@ mod tests {
 
         let queued = n.drain();
         assert_eq!(queued.len(), 1, "exactly one notification");
-        assert_eq!(queued[0].uri, "http://eas/ac-info");
+        assert_eq!(queued[0].callback_uri, "http://eas/ac-info");
         assert_eq!(
             queued[0].kind, "ACInfoNotification",
             "the production emit must be tagged as an ACInfoNotification"
@@ -2284,7 +2287,7 @@ mod tests {
         let queued = n.drain();
         assert_eq!(queued.len(), 1, "the other easId must not be notified");
         assert_eq!(
-            queued[0].uri, "http://eas/cb/act-status",
+            queued[0].callback_uri, "http://eas/cb/act-status",
             "the yaml appends /act-status to notificationUri, with no doubled slash"
         );
         assert_eq!(queued[0].kind, "ACTStatusNotif");

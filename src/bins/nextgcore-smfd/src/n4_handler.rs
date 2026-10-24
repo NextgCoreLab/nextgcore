@@ -13,39 +13,15 @@ use crate::n4_build::PfcpCause;
 // GTP Cause Codes (for conversion)
 // ============================================================================
 
-/// GTPv1 Cause codes
-pub mod gtp1_cause {
-    pub const REQUEST_ACCEPTED: u8 = 128;
-    pub const REJ_MS_NOT_GPRS_RESPONDING: u8 = 202;
-    pub const CONTEXT_NOT_FOUND: u8 = 201;
-    pub const MANDATORY_IE_MISSING: u8 = 193;
-    pub const INVALID_MESSAGE_FORMAT: u8 = 194;
-    pub const NO_RESOURCES_AVAILABLE: u8 = 199;
-    pub const SEMANTIC_ERR_TFT_OPERATION: u8 = 177;
-    pub const APN_CONGESTION: u8 = 174;
-    pub const SERVICE_NOT_SUPPORTED: u8 = 200;
-    pub const SYSTEM_FAILURE: u8 = 204;
-    pub const ALL_DYNAMIC_PDP_ADDRS_OCCUPIED: u8 = 205;
-}
+/// GTPv1 cause octets: the shared TS 29.060 §7.7.1 table (#1053). This node's
+/// own copy had seven wrong values (Context not found sent as 201, Mandatory IE
+/// incorrect; Mandatory IE missing as 193, Invalid message format; ...).
+pub use nextgcore_gtp::v1::cause as gtp1_cause;
 
-/// GTPv2 Cause codes
-pub mod gtp2_cause {
-    pub const REQUEST_ACCEPTED: u8 = 16;
-    pub const REQUEST_REJECTED_REASON_NOT_SPECIFIED: u8 = 17;
-    pub const CONTEXT_NOT_FOUND: u8 = 64;
-    pub const MANDATORY_IE_MISSING: u8 = 70;
-    pub const CONDITIONAL_IE_MISSING: u8 = 71;
-    pub const INVALID_LENGTH: u8 = 72;
-    pub const MANDATORY_IE_INCORRECT: u8 = 73;
-    pub const INVALID_MESSAGE_FORMAT: u8 = 74;
-    pub const REMOTE_PEER_NOT_RESPONDING: u8 = 100;
-    pub const SEMANTIC_ERROR_IN_THE_TFT_OPERATION: u8 = 81;
-    pub const GTP_C_ENTITY_CONGESTION: u8 = 101;
-    pub const NO_RESOURCES_AVAILABLE: u8 = 73;
-    pub const SERVICE_NOT_SUPPORTED: u8 = 68;
-    pub const SYSTEM_FAILURE: u8 = 72;
-    pub const ALL_DYNAMIC_ADDRESSES_ARE_OCCUPIED: u8 = 84;
-}
+/// GTPv2 cause octets: the shared TS 29.274 Table 8.4-1 table (#1037). This
+/// node's own copy had seven wrong values, Request rejected among them as 17
+/// (Request accepted partially).
+pub use nextgcore_gtp::v2::cause as gtp2_cause;
 
 // ============================================================================
 // SBI HTTP Status Codes
@@ -72,12 +48,16 @@ pub fn gtp_cause_from_pfcp(pfcp_cause: u8, gtp_version: u8) -> u8 {
     match gtp_version {
         1 => match pfcp_cause {
             c if c == PfcpCause::RequestAccepted as u8 => gtp1_cause::REQUEST_ACCEPTED,
-            c if c == PfcpCause::RequestRejected as u8 => gtp1_cause::REJ_MS_NOT_GPRS_RESPONDING,
+            // #1055 review: GTPv1 has no "request rejected, reason not specified"
+            // (TS 29.060 §7.7.1); 196 says the MS is not GPRS-responding, which is
+            // false. A UP function's unspecified refusal is a system failure (204).
+            c if c == PfcpCause::RequestRejected as u8 => gtp1_cause::SYSTEM_FAILURE,
             c if c == PfcpCause::SessionContextNotFound as u8 => gtp1_cause::CONTEXT_NOT_FOUND,
             c if c == PfcpCause::MandatoryIeMissing as u8 => gtp1_cause::MANDATORY_IE_MISSING,
             c if c == PfcpCause::ConditionalIeMissing as u8 => gtp1_cause::MANDATORY_IE_MISSING,
             c if c == PfcpCause::InvalidLength as u8 => gtp1_cause::INVALID_MESSAGE_FORMAT,
-            c if c == PfcpCause::MandatoryIeIncorrect as u8 => gtp1_cause::MANDATORY_IE_MISSING,
+            // GTPv1 has the cause itself (TS 29.060 §7.7.1, 201).
+            c if c == PfcpCause::MandatoryIeIncorrect as u8 => gtp1_cause::MANDATORY_IE_INCORRECT,
             c if c == PfcpCause::InvalidForwardingPolicy as u8 => {
                 gtp1_cause::INVALID_MESSAGE_FORMAT
             }
@@ -87,6 +67,9 @@ pub fn gtp_cause_from_pfcp(pfcp_cause: u8, gtp_version: u8) -> u8 {
             c if c == PfcpCause::NoEstablishedPfcpAssociation as u8 => {
                 gtp1_cause::NO_RESOURCES_AVAILABLE
             }
+            // The rules the UP function failed to create are the PDP context's
+            // packet filters (its TFT), so 215 Semantic error in the TFT operation,
+            // as the GTPv2 mapping below gives (TS 29.274 cause 74).
             c if c == PfcpCause::RuleCreationModificationFailure as u8 => {
                 gtp1_cause::SEMANTIC_ERR_TFT_OPERATION
             }
@@ -780,6 +763,46 @@ pub fn usage_report_trigger_to_gy_reporting_reason(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1053, TS 29.060 §7.7.1: the GTPv1 cause octets a PFCP outcome maps to,
+    /// as literals. Before, Context not found went out as 201 (Mandatory IE
+    /// incorrect), Mandatory IE missing as 193 (Invalid message format), the TFT
+    /// error as 177 and APN congestion as 174 (both undefined).
+    #[test]
+    fn pfcp_causes_map_to_their_ts_29_060_octets() {
+        for (pfcp, octet) in [
+            (PfcpCause::RequestAccepted, 128u8),
+            // 204 System failure: not 196 "MS is not GPRS Responding" (#1055 review).
+            (PfcpCause::RequestRejected, 204),
+            (PfcpCause::SessionContextNotFound, 210),
+            (PfcpCause::MandatoryIeMissing, 202),
+            (PfcpCause::MandatoryIeIncorrect, 201),
+            (PfcpCause::InvalidLength, 193),
+            (PfcpCause::NoResourcesAvailable, 199),
+            // 215 Semantic error in the TFT operation, as GTPv2's 74.
+            (PfcpCause::RuleCreationModificationFailure, 215),
+            (PfcpCause::PfcpEntityInCongestion, 229),
+            (PfcpCause::ServiceNotSupported, 200),
+            (PfcpCause::SystemFailure, 204),
+            (PfcpCause::AllDynamicAddressAreOccupied, 211),
+        ] {
+            assert_eq!(gtp_cause_from_pfcp(pfcp as u8, 1), octet, "{pfcp:?}");
+        }
+        // The TFT mapping matches GTPv2's (TS 29.274 Table 8.4-1, 74).
+        assert_eq!(
+            gtp_cause_from_pfcp(PfcpCause::RuleCreationModificationFailure as u8, 2),
+            74
+        );
+        // On the wire: a Delete PDP Context Response refusing for a missing
+        // context carries the Cause IE (TV, type 1) with 210.
+        assert_eq!(
+            crate::gn_build::build_delete_pdp_context_response(gtp_cause_from_pfcp(
+                PfcpCause::SessionContextNotFound as u8,
+                1
+            )),
+            vec![0x01, 0xd2]
+        );
+    }
 
     #[test]
     fn test_gtp_cause_from_pfcp_v1() {

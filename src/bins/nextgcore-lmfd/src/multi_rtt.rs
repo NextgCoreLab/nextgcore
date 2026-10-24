@@ -92,9 +92,16 @@ pub async fn prepare_assistance<T: NrppaTransport>(
                     .filter(|p| !ambiguous.contains(p))
                     .and_then(|p| registry.lookup(&format!("pci-{p}")))
             });
+        // #990 review: a position NG-RAN corrects later replaces the one learned
+        // before. The key is this LMF's own, never configured.
         if let Some(coord) = coord {
-            if registry.lookup(&key).is_none() {
-                c.set_cell_coord(key.clone(), coord);
+            match registry.lookup(&key) {
+                Some(old) if old == coord => {}
+                Some(old) => {
+                    log::info!("DL-PRS assistance: {key} moved from {old:?} to {coord:?}");
+                    c.set_cell_coord(key.clone(), coord);
+                }
+                None => c.set_cell_coord(key.clone(), coord),
             }
         }
         trps.push(TrpPrs {
@@ -235,14 +242,19 @@ async fn exchange(
     }
 }
 
-/// Learn the TRPs of every configured node that has not told us yet.
+/// Learn the TRPs of every configured node that has not told us yet, or told us
+/// more than [`crate::context::TRP_INFORMATION_MAX_AGE`] ago.
 pub async fn ensure_trp_information<T: NrppaTransport>(t: &T, timeout: Duration) {
     let (nodes, known) = match lmf_self().read() {
         Ok(c) => (c.ng_ran_nodes(), c.trp_information()),
         Err(_) => return,
     };
     for node in nodes {
-        if known.iter().any(|(n, _)| *n == node) {
+        // #990 review: asked again once its answer is TRP_INFORMATION_MAX_AGE old.
+        let stale = lmf_self()
+            .read()
+            .is_ok_and(|c| c.trp_information_stale(&node));
+        if known.iter().any(|(n, _)| *n == node) && !stale {
             continue;
         }
         if lmf_self()
