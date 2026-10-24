@@ -353,10 +353,8 @@ pub fn pfcp_open(ctx: &mut PfcpPathContext, local_addr: SocketAddr) -> Result<()
         SocketAddr::V4(addr) => NodeId::Ipv4(*addr.ip()),
         SocketAddr::V6(addr) => NodeId::Ipv6(*addr.ip()),
     };
-    ctx.recovery_time_stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as u32)
-        .unwrap_or(0);
+    // #995: NTP-era seconds (TS 29.244 §8.2.65).
+    ctx.recovery_time_stamp = nextgcore_pfcp::recovery_time::now();
 
     log::info!("PFCP path opened on {local_addr}");
     Ok(())
@@ -822,10 +820,8 @@ impl PfcpServer {
             SocketAddr::V6(addr) => NodeId::Ipv6(*addr.ip()),
         };
 
-        let recovery_time_stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as u32)
-            .unwrap_or(0);
+        // #995: NTP-era seconds (TS 29.244 §8.2.65), not Unix seconds.
+        let recovery_time_stamp = nextgcore_pfcp::recovery_time::now();
 
         Ok(Self {
             socket: Arc::new(socket),
@@ -5631,6 +5627,26 @@ mod tests {
         hb.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, 1);
         let resp = exchange(&smf, upf, &encode_pfcp(1, None, 4, &hb.build())).await;
         assert_eq!(resp[1], pfcp_type::HEARTBEAT_RESPONSE, "still serving");
+    }
+
+    /// #995: the UPF's own Recovery Time Stamp is NTP-era seconds (TS 29.244
+    /// §8.2.65), and a pre-#995 peer's Unix-seconds stamp is read in the NTP reading.
+    #[tokio::test]
+    async fn recovery_time_stamps_are_ntp_seconds() {
+        let (server, _smf, _addr, _rx) = spawn_test_server().await;
+        let now = nextgcore_pfcp::recovery_time::now();
+        assert!(now.wrapping_sub(server.recovery_time_stamp) < 60);
+        let unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 3600;
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, unix as u32);
+        assert_eq!(
+            crate::n4_build::parse_recovery_time_stamp(&b.build()),
+            Some(nextgcore_pfcp::recovery_time::from_unix_secs(unix))
+        );
     }
 
     /// The UPF's sessions as (UPF SEID, CP SEID, address it reports to).

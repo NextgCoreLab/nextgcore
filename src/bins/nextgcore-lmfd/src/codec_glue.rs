@@ -736,9 +736,10 @@ fn request_ies(method: LppMethod) -> lpp::RequestLocationInformation_r9_IEs {
                         lpp::NR_Multi_RTT_RequestLocationInformation_r16Nr_RequestedMeasurements_r16(
                             bits(&[true]),
                         ),
-                    // This LMF provides no PRS assistance data, so it must not claim
-                    // availability -- a UE told assistance is available and given
-                    // none reports nothing.
+                    // TS 37.355: "whether the target device may request additional
+                    // DL-PRS assistance data from the server". FALSE: the DL-PRS
+                    // assistance data this LMF has is sent before the request
+                    // (#911), and it answers no NR RequestAssistanceData.
                     nr_assistance_availability_r16:
                         lpp::NR_Multi_RTT_RequestLocationInformation_r16Nr_AssistanceAvailability_r16(
                             false,
@@ -771,6 +772,8 @@ fn request_ies(method: LppMethod) -> lpp::RequestLocationInformation_r9_IEs {
                         lpp::NR_DL_TDOA_RequestLocationInformation_r16Nr_RequestedMeasurements_r16(
                             bits(&[true]),
                         ),
+                    // As for Multi-RTT: no additional DL-PRS assistance data
+                    // can be requested (#911).
                     nr_assistance_availability_r16:
                         lpp::NR_DL_TDOA_RequestLocationInformation_r16Nr_AssistanceAvailability_r16(
                             false,

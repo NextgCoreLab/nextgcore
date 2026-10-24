@@ -578,10 +578,8 @@ impl SxaNode {
     ) -> std::io::Result<Arc<Self>> {
         let socket = UdpSocket::bind(bind).await?;
         let bound = socket.local_addr()?;
-        let recovery_time_stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as u32)
-            .unwrap_or(1);
+        // #995: NTP-era seconds (TS 29.244 §8.2.65), not Unix seconds.
+        let recovery_time_stamp = nextgcore_pfcp::recovery_time::now();
         let cache_ttl = timers.no_heartbeat.duration * (timers.no_heartbeat.max_count.max(2) + 2);
         let node = Arc::new(Self {
             socket: Arc::new(socket),
@@ -1203,9 +1201,11 @@ impl SxaNode {
                     fsm,
                 }
             });
-            let restarted = matches!(peer.recovery_time_stamp, Some(stored) if stored != req.recovery_time_stamp);
+            // #995: in the NTP reading (a pre-#995 SGW-C sends Unix seconds).
+            let rts = nextgcore_pfcp::recovery_time::normalize_received(req.recovery_time_stamp);
+            let restarted = matches!(peer.recovery_time_stamp, Some(stored) if stored != rts);
             peer.state = PfcpNodeState::Associated;
-            peer.recovery_time_stamp = Some(req.recovery_time_stamp);
+            peer.recovery_time_stamp = Some(rts);
             peer.missed_heartbeats = 0;
             // Drive the FSM the same way the association just went on the wire:
             // Initial -> WillAssociate -> Associated. Keeping it in step is what lets
@@ -1302,6 +1302,8 @@ impl SxaNode {
 
     /// Record a peer's Recovery Time Stamp, flushing its sessions if it changed.
     async fn note_peer_recovery_time_stamp(&self, from: SocketAddr, rts: u32) {
+        // #995: in the NTP reading, as stored at association.
+        let rts = nextgcore_pfcp::recovery_time::normalize_received(rts);
         let restarted = {
             let mut peers = self.peers.write().await;
             let Some(peer) = peers.get_mut(&from) else {
@@ -3303,6 +3305,45 @@ mod tests {
     }
 
     /// A bound node plus a socket standing in for the SGW-C.
+    /// #995: the SGW-U's own Recovery Time Stamp is NTP-era seconds (TS 29.244
+    /// §8.2.65), and a pre-#995 SGW-C's Unix-seconds stamp is stored in the NTP
+    /// reading, so the same SGW-C re-associating with it is not a restart.
+    #[tokio::test]
+    async fn recovery_time_stamps_are_ntp_seconds() {
+        let (_guard, node, peer) = node_and_peer().await;
+        let now = nextgcore_pfcp::recovery_time::now();
+        assert!(now.wrapping_sub(node.recovery_time_stamp) < 60);
+
+        let unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 3600;
+        let mut assoc = BytesMut::new();
+        PfcpLibMessage::AssociationSetupRequest(AssociationSetupRequest::new(
+            NodeId::new_ipv4([127, 0, 0, 9]),
+            unix as u32,
+        ))
+        .encode_body(&mut assoc);
+        deliver(
+            &node,
+            &peer,
+            &wire(pfcp_msg_type::ASSOCIATION_SETUP_REQUEST, None, 1, &assoc),
+        )
+        .await;
+        let _ = recv_decoded(&peer).await;
+        let stored = node
+            .peers()
+            .await
+            .into_iter()
+            .find(|p| p.addr == peer.local_addr().unwrap())
+            .and_then(|p| p.recovery_time_stamp);
+        assert_eq!(
+            stored,
+            Some(nextgcore_pfcp::recovery_time::from_unix_secs(unix))
+        );
+    }
+
     async fn node_and_peer() -> (SxaTestGuard, Arc<SxaNode>, UdpSocket) {
         let guard = sxa_test_guard().await;
         sgwu_context_init(1024);

@@ -280,6 +280,10 @@ pub struct PositioningSession {
     accumulated: Vec<CellMeasurement>,
     /// One-shot completion channel to the awaiting DetermineLocation handler.
     sender: Option<tokio::sync::oneshot::Sender<PositioningOutcome>>,
+    /// The DL-PRS IDs this session's assistance data assigned, with the registry
+    /// key of the TRP each names (#911). A measurement on one of them is keyed by
+    /// its TRP, whatever PCI it carries.
+    dl_prs_keys: HashMap<u8, String>,
 }
 
 /// One source of measurements for a positioning session (#715, #807).
@@ -299,6 +303,31 @@ pub enum MeasurementLeg {
     /// The gNB Rx–Tx halves of the NRPPa Measurement procedure, from every
     /// measured gNB, reported together by `multi_rtt` (TS 38.455 §8.5.1).
     NrppaTrp,
+}
+
+/// The registry key of TRP `trp_id` of `node` (#911): one per TRP, so a TRP
+/// that shares its PCI with another is still told apart.
+pub fn trp_key(node: &crate::site_config::NgRanNode, trp_id: u16) -> String {
+    format!("trp-{}{}-{:x}-{trp_id}", node.mcc, node.mnc, node.gnb_id)
+}
+
+/// `cell` keyed by the TRP its DL-PRS ID names, when that ID is one of `keys`
+/// (#911). The UE names a TRP of the assistance data by the DL-PRS ID it was
+/// given; the PCI it may also report can be another TRP's.
+fn keyed_by_dl_prs(mut cell: CellMeasurement, keys: &HashMap<u8, String>) -> CellMeasurement {
+    if let Some(key) = cell.dl_prs_id.and_then(|id| keys.get(&id)) {
+        cell.nr_cgi = key.clone();
+    }
+    cell
+}
+
+/// [`multi_rtt_observations`], for the #911 tests outside this module.
+#[cfg(test)]
+pub(crate) fn multi_rtt_observations_for_test(
+    measurements: &[CellMeasurement],
+    registry: &TrpRegistry,
+) -> Vec<RttObservation> {
+    multi_rtt_observations(measurements, registry)
 }
 
 /// An LPP Capability Transfer in flight (#906).
@@ -469,6 +498,9 @@ pub struct LmfContext {
     /// not asked again for [`TRP_INFORMATION_RETRY`], so a silent node does not
     /// cost every request a timeout.
     trp_info_failed: RwLock<HashMap<crate::site_config::NgRanNode, std::time::Instant>>,
+    /// The DL-PRS ID this LMF assigned each TRP (#911), for the life of the
+    /// process, so a TRP keeps its ID across sessions.
+    dl_prs_ids: RwLock<HashMap<(crate::site_config::NgRanNode, u16), u8>>,
 }
 
 /// How long a node that failed TRP Information Exchange is left alone.
@@ -511,6 +543,7 @@ impl LmfContext {
             ng_ran_nodes: RwLock::new(Vec::new()),
             trp_info: RwLock::new(Vec::new()),
             trp_info_failed: RwLock::new(HashMap::new()),
+            dl_prs_ids: RwLock::new(HashMap::new()),
         }
     }
 
@@ -959,6 +992,7 @@ impl LmfContext {
             reported_legs: Vec::new(),
             accumulated: Vec::new(),
             sender: Some(tx),
+            dl_prs_keys: HashMap::new(),
         };
         if let Ok(mut s) = self.positioning_sessions.write() {
             s.insert(corr.clone(), session);
@@ -1053,6 +1087,16 @@ impl LmfContext {
         if let Ok(mut sessions) = self.positioning_sessions.write() {
             if let Some(session) = sessions.get_mut(corr) {
                 session.nrppa_peer = Some(peer);
+            }
+        }
+    }
+
+    /// Record the DL-PRS IDs session `corr`'s assistance data assigned (#911).
+    /// Call it BEFORE the assistance data is sent.
+    pub fn positioning_session_set_dl_prs_keys(&self, corr: &str, keys: HashMap<u8, String>) {
+        if let Ok(mut sessions) = self.positioning_sessions.write() {
+            if let Some(session) = sessions.get_mut(corr) {
+                session.dl_prs_keys = keys;
             }
         }
     }
@@ -1158,7 +1202,13 @@ impl LmfContext {
                     cells.len() - room
                 );
             }
-            s.accumulated.extend(cells.into_iter().take(room));
+            let keys = &s.dl_prs_keys;
+            s.accumulated.extend(
+                cells
+                    .into_iter()
+                    .take(room)
+                    .map(|c| keyed_by_dl_prs(c, keys)),
+            );
             if !s.reported_legs.contains(&leg) {
                 s.reported_legs.push(leg);
             }
@@ -1422,6 +1472,33 @@ impl LmfContext {
             info.retain(|(n, _)| n != node);
             info.extend(trps.into_iter().map(|t| (node.clone(), t)));
         }
+    }
+
+    /// The DL-PRS ID of TRP `trp_id` of `node` (#911): the one it was given
+    /// before, else the lowest free one. `None` once all 256 are taken
+    /// (`dl-PRS-ID-r16 INTEGER (0..255)`).
+    pub fn dl_prs_id_assign(
+        &self,
+        node: &crate::site_config::NgRanNode,
+        trp_id: u16,
+    ) -> Option<u8> {
+        let mut ids = self.dl_prs_ids.write().ok()?;
+        if let Some(id) = ids.get(&(node.clone(), trp_id)) {
+            return Some(*id);
+        }
+        let taken: std::collections::HashSet<u8> = ids.values().copied().collect();
+        let free = (0..=255u8).find(|id| !taken.contains(id))?;
+        ids.insert((node.clone(), trp_id), free);
+        Some(free)
+    }
+
+    /// The DL-PRS ID TRP `trp_id` of `node` was given, if any (#911).
+    pub fn dl_prs_id_of(&self, node: &crate::site_config::NgRanNode, trp_id: u16) -> Option<u8> {
+        self.dl_prs_ids
+            .read()
+            .ok()?
+            .get(&(node.clone(), trp_id))
+            .copied()
     }
 
     /// Record that `node` did not answer TRP Information Exchange.
