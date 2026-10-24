@@ -469,6 +469,17 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// A flag the WORK sets as its first action, so a test can wait for a job to
+    /// have really started its exchange.
+    ///
+    /// `in_flight() == 1` is not that: the permit is taken a moment BEFORE the
+    /// job's WAITING->STARTED compare-exchange, so a test that waits on the
+    /// permit and then supersedes can still legitimately cancel the job. That
+    /// window made `settle_key_is_bounded` fail once in CI.
+    fn entered_flag() -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::new(std::sync::atomic::AtomicBool::new(false))
+    }
+
     async fn until(mut cond: impl FnMut() -> bool) {
         for _ in 0..400 {
             if cond() {
@@ -535,16 +546,18 @@ mod tests {
         let mut offload = SbiOffload::new(16);
         let seen: Arc<std::sync::Mutex<Vec<&'static str>>> = Arc::default();
         let gate = Arc::new(tokio::sync::Notify::new());
+        let entered = entered_flag();
         {
-            let (seen, gate) = (Arc::clone(&seen), Arc::clone(&gate));
+            let (seen, gate, flag) = (Arc::clone(&seen), Arc::clone(&gate), Arc::clone(&entered));
             offload.spawn_keyed((2, 1), move || async move {
+                flag.store(true, std::sync::atomic::Ordering::Release);
                 gate.notified().await;
                 seen.lock().expect("seen").push("running");
                 None
             });
         }
-        // Started: it holds its permit, so supersede leaves it to finish.
-        until(|| offload.in_flight() == 1).await;
+        // STARTED, so supersede leaves it to finish (see `entered_flag`).
+        until(|| entered.load(std::sync::atomic::Ordering::Acquire)).await;
         for name in ["queued 1", "queued 2"] {
             let seen = Arc::clone(&seen);
             offload.spawn_keyed((2, 1), move || async move {
@@ -568,15 +581,17 @@ mod tests {
     async fn settle_key_waits_for_the_running_exchange() {
         let mut offload = SbiOffload::new(16);
         let seen: Arc<std::sync::Mutex<Vec<&'static str>>> = Arc::default();
+        let entered = entered_flag();
         for (name, delay) in [("running", 50u64), ("queued", 0)] {
-            let seen = Arc::clone(&seen);
+            let (seen, flag) = (Arc::clone(&seen), Arc::clone(&entered));
             offload.spawn_keyed((3, 1), move || async move {
+                flag.store(true, std::sync::atomic::Ordering::Release);
                 tokio::time::sleep(Duration::from_millis(delay)).await;
                 seen.lock().expect("seen").push(name);
                 None
             });
         }
-        until(|| offload.in_flight() == 1).await;
+        until(|| entered.load(std::sync::atomic::Ordering::Acquire)).await;
         assert!(offload.settle_key((3, 1), Duration::from_secs(5)).await);
         assert_eq!(*seen.lock().expect("seen"), vec!["running"]);
         assert!(!offload.key_busy((3, 1)));
@@ -716,11 +731,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn settle_key_is_bounded() {
         let mut offload = SbiOffload::new(4);
-        offload.spawn_keyed((848, 7), || async {
+        let entered = entered_flag();
+        let flag = Arc::clone(&entered);
+        offload.spawn_keyed((848, 7), move || async move {
+            flag.store(true, std::sync::atomic::Ordering::Release);
             std::future::pending::<()>().await;
             None
         });
-        until(|| offload.in_flight() == 1).await;
+        // The exchange has STARTED, not merely taken its permit.
+        until(|| entered.load(std::sync::atomic::Ordering::Acquire)).await;
         let started = std::time::Instant::now();
         assert!(
             !offload
