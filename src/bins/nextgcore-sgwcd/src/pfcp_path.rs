@@ -24,7 +24,8 @@ use bytes::{Bytes, BytesMut};
 use nextgcore_pfcp::header::{PfcpHeader, PfcpMessageType};
 use nextgcore_pfcp::message::{
     AssociationSetupRequest, AssociationSetupResponse, HeartbeatRequest, HeartbeatResponse,
-    PfcpMessage as PfcpLibMessage, SessionReportRequest, SessionReportResponse,
+    NodeReportRequest, NodeReportResponse, PfcpMessage as PfcpLibMessage, SessionReportRequest,
+    SessionReportResponse,
 };
 use nextgcore_pfcp::types::{NodeId, PfcpCause};
 use tokio::net::UdpSocket;
@@ -66,6 +67,9 @@ pub mod pfcp_msg_type {
     pub const ASSOCIATION_SETUP_RESPONSE: u8 = 6;
     pub const ASSOCIATION_RELEASE_REQUEST: u8 = 9;
     pub const ASSOCIATION_RELEASE_RESPONSE: u8 = 10;
+    /// TS 29.244 §7.4.5: user plane path failure and recovery reports (#994).
+    pub const NODE_REPORT_REQUEST: u8 = 12;
+    pub const NODE_REPORT_RESPONSE: u8 = 13;
     /// TS 29.244 §7.2.2.1: answered when the version octet is not 1.
     pub const VERSION_NOT_SUPPORTED_RESPONSE: u8 = 11;
     pub const SESSION_ESTABLISHMENT_REQUEST: u8 = 50;
@@ -818,8 +822,111 @@ impl SxaNode {
                 self.handle_session_report_request(&header, &body, from)
                     .await;
             }
+            pfcp_msg_type::NODE_REPORT_REQUEST => {
+                self.handle_node_report_request(&header, &body, from).await;
+            }
             other => {
                 log::warn!("PFCP message type {other} from {from} is not handled on Sxa (CP side)");
+            }
+        }
+    }
+
+    /// An inbound Node Report Request (TS 29.244 §7.4.5.1, #994): the SGW-U reports a
+    /// GTP-U path toward a remote peer as failed or recovered (TS 23.007 §20.3.4).
+    ///
+    /// The Node Report Response carries our Node ID and a Cause, and is sent before
+    /// anything is acted on:
+    /// - 72 No established PFCP Association when the sender is not the SGW-U this
+    ///   SGW-C is associated with (§6.2.6.1);
+    /// - 66 Mandatory IE missing, with the Offending IE, when the Node ID, the Node
+    ///   Report Type, or the report the type announces is absent;
+    /// - 69 Mandatory IE incorrect when the message cannot be decoded;
+    /// - 1 Request accepted otherwise.
+    ///
+    /// [`crate::up_path`] then handles the reported peers.
+    async fn handle_node_report_request(&self, header: &PfcpHeader, body: &[u8], from: SocketAddr) {
+        use nextgcore_pfcp::ie::IeType;
+        let decoded = NodeReportRequest::decode(&mut Bytes::copy_from_slice(body));
+        let (cause, offending, request) = if !self.is_associated_with(from).await {
+            log::warn!("Node Report Request from {from}, which is not an associated SGW-U");
+            (PfcpCause::NoEstablishedPfcpAssociation, None, None)
+        } else {
+            match decoded {
+                Ok(req) => {
+                    let missing = if req.node_report_type.upfr
+                        && req.user_plane_path_failure_report.is_none()
+                    {
+                        Some(IeType::UserPlanePathFailureReport)
+                    } else if req.node_report_type.uprr
+                        && req.user_plane_path_recovery_report.is_none()
+                    {
+                        Some(IeType::UserPlanePathRecoveryReport)
+                    } else {
+                        None
+                    };
+                    match missing {
+                        Some(ie) => (PfcpCause::MandatoryIeMissing, Some(ie as u16), None),
+                        None => (PfcpCause::RequestAccepted, None, Some(req)),
+                    }
+                }
+                Err(nextgcore_pfcp::error::PfcpError::MissingMandatoryIe(name)) => {
+                    let ie = if name.contains("Report Type") {
+                        IeType::NodeReportType
+                    } else {
+                        IeType::NodeId
+                    };
+                    (PfcpCause::MandatoryIeMissing, Some(ie as u16), None)
+                }
+                Err(e) => {
+                    log::warn!("Node Report Request from {from} is malformed: {e}");
+                    (PfcpCause::MandatoryIeIncorrect, None, None)
+                }
+            }
+        };
+        let mut buf = BytesMut::new();
+        NodeReportResponse {
+            node_id: NodeId::new_ipv4(self.local_ip.octets()),
+            cause,
+            offending_ie: offending,
+        }
+        .encode(&mut buf);
+        let _ = self
+            .send(
+                pfcp_msg_type::NODE_REPORT_RESPONSE,
+                None,
+                header.sequence_number,
+                &buf,
+                from,
+            )
+            .await;
+        let Some(req) = request else {
+            return;
+        };
+
+        let peers_of = |report: &Option<nextgcore_pfcp::types::UserPlanePathFailureReport>| {
+            report
+                .iter()
+                .flat_map(|r| r.remote_gtpu_peers.iter())
+                .flat_map(|p| {
+                    p.ipv4
+                        .map(std::net::IpAddr::from)
+                        .into_iter()
+                        .chain(p.ipv6.map(std::net::IpAddr::from))
+                })
+                .collect::<Vec<_>>()
+        };
+        if req.node_report_type.uprr {
+            crate::up_path::on_recovery(&peers_of(&req.user_plane_path_recovery_report));
+        }
+        if req.node_report_type.upfr {
+            let hold = crate::up_path::hold();
+            for (peer, generation) in
+                crate::up_path::on_failure(&peers_of(&req.user_plane_path_failure_report))
+            {
+                tokio::spawn(async move {
+                    tokio::time::sleep(hold).await;
+                    crate::up_path::on_hold_expired(peer, generation);
+                });
             }
         }
     }
@@ -1397,6 +1504,10 @@ mod tests {
         setups: Arc<AtomicU32>,
         heartbeats: Arc<AtomicU32>,
         rts: Arc<AtomicU32>,
+        /// Node Report Responses received: (sequence number, body).
+        node_report_responses: Arc<std::sync::Mutex<Vec<(u32, Vec<u8>)>>>,
+        /// Session Modification Request bodies received (each answered accepted).
+        modifications: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
     }
 
     async fn assoc_sgwu(refusals: Vec<bool>) -> AssocSgwu {
@@ -1411,6 +1522,9 @@ mod tests {
             rts.clone(),
             sock.clone(),
         );
+        let node_report_responses = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let modifications = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (nrr, mods) = (node_report_responses.clone(), modifications.clone());
         tokio::spawn(async move {
             let mut refusals = std::collections::VecDeque::from(refusals);
             let mut buf = vec![0u8; 4096];
@@ -1423,6 +1537,33 @@ mod tests {
                     continue;
                 };
                 let mut body = BytesMut::new();
+                match header.message_type as u8 {
+                    pfcp_msg_type::NODE_REPORT_RESPONSE => {
+                        nrr.lock()
+                            .unwrap()
+                            .push((header.sequence_number, cursor.to_vec()));
+                        continue;
+                    }
+                    pfcp_msg_type::SESSION_MODIFICATION_REQUEST => {
+                        mods.lock().unwrap().push(cursor.to_vec());
+                        nextgcore_pfcp::message::SessionModificationResponse::new(
+                            PfcpCause::RequestAccepted,
+                        )
+                        .encode(&mut body);
+                        let mut out = BytesMut::new();
+                        let mut h = PfcpHeader::new_with_seid(
+                            PfcpMessageType::SessionModificationResponse,
+                            header.seid.unwrap_or(0),
+                            header.sequence_number,
+                        );
+                        h.length = (12 + body.len()) as u16;
+                        h.encode(&mut out);
+                        out.extend_from_slice(&body);
+                        let _ = up.send_to(&out, from).await;
+                        continue;
+                    }
+                    _ => {}
+                }
                 let resp_type = match header.message_type as u8 {
                     pfcp_msg_type::ASSOCIATION_SETUP_REQUEST => {
                         s.fetch_add(1, Ordering::SeqCst);
@@ -1460,6 +1601,8 @@ mod tests {
             setups,
             heartbeats,
             rts,
+            node_report_responses,
+            modifications,
         }
     }
 
@@ -1679,6 +1822,316 @@ mod tests {
             setups.load(Ordering::SeqCst) > before
         })
         .await;
+        let _ = stop.send(true);
+    }
+
+    /// A Node Report Request with a failure and/or recovery report for the peers.
+    fn node_report(seq: u32, failed: &[[u8; 4]], recovered: &[[u8; 4]]) -> Vec<u8> {
+        use nextgcore_pfcp::types::{NodeReportType, RemoteGtpUPeer, UserPlanePathFailureReport};
+        let report = |ips: &[[u8; 4]]| {
+            (!ips.is_empty()).then(|| UserPlanePathFailureReport {
+                remote_gtpu_peers: ips
+                    .iter()
+                    .map(|ip| RemoteGtpUPeer {
+                        ipv4: Some(*ip),
+                        ipv6: None,
+                    })
+                    .collect(),
+            })
+        };
+        node_report_pdu(
+            seq,
+            NodeReportRequest {
+                node_id: NodeId::new_ipv4([127, 0, 0, 9]),
+                node_report_type: NodeReportType {
+                    upfr: !failed.is_empty(),
+                    uprr: !recovered.is_empty(),
+                    ..Default::default()
+                },
+                user_plane_path_failure_report: report(failed),
+                user_plane_path_recovery_report: report(recovered),
+            },
+        )
+    }
+
+    fn node_report_pdu(seq: u32, req: NodeReportRequest) -> Vec<u8> {
+        let mut body = BytesMut::new();
+        req.encode(&mut body);
+        let mut out = BytesMut::new();
+        let mut h = PfcpHeader::new(PfcpMessageType::NodeReportRequest, seq);
+        h.length = (4 + body.len()) as u16;
+        h.encode(&mut out);
+        out.extend_from_slice(&body);
+        out.to_vec()
+    }
+
+    /// A UE with one bearer whose downlink S1-U endpoint is `enb`.
+    fn ue_toward(imsi: &[u8], enb: [u8; 4]) -> (u64, u64) {
+        let ctx = sgwc_self();
+        let ue = ctx.ue_add(imsi).expect("ue");
+        let sess = ctx.sess_add(ue.id, "internet").expect("sess");
+        let mut bearer = ctx.bearer_add(sess.id).expect("bearer");
+        bearer.ebi = 5;
+        ctx.bearer_update(&bearer);
+        let mut dl = ctx.dl_tunnel_in_bearer(bearer.id).expect("dl tunnel");
+        dl.far_id = Some(0x0994);
+        dl.remote_teid = 0x9940;
+        dl.remote_ip.ipv4 = Some(Ipv4Addr::from(enb));
+        ctx.tunnel_update(&dl);
+        (ue.id, bearer.id)
+    }
+
+    /// The SGW-C's node, running and associated with `sgwu` (no maintenance task).
+    async fn associated_node(
+        _ambient: &ProcessStateGuard,
+        sgwu: &AssocSgwu,
+    ) -> (Arc<SxaNode>, tokio::sync::watch::Sender<bool>) {
+        std::env::set_var("SGWC_SGWU_ADDR", sgwu.addr.to_string());
+        let node = SxaNode::open("127.0.0.1:0".parse().unwrap(), Ipv4Addr::LOCALHOST)
+            .await
+            .unwrap();
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(node.clone().run(rx));
+        node.associate(sgwu.addr).await.unwrap();
+        // `run` installs the outbound queue in its own body.
+        for _ in 0..200 {
+            if outbound().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        (node, stop)
+    }
+
+    fn response_cause(body: &[u8]) -> (PfcpCause, Option<u16>) {
+        let rsp = NodeReportResponse::decode(&mut Bytes::copy_from_slice(body)).unwrap();
+        (rsp.cause, rsp.offending_ie)
+    }
+
+    /// #994, TS 29.244 §7.4.5 / TS 23.007 §20.3.4: a User Plane Path Failure Report
+    /// from the associated SGW-U is answered Request accepted (its sequence number
+    /// echoed). The UE whose downlink S1-U endpoint is the failed eNodeB has its S1-U
+    /// bearers released with Release Access Bearers semantics: the endpoint is
+    /// forgotten, and its downlink FAR goes to BUFF + NOCP at the SGW-U, so downlink
+    /// data is buffered and notified (DDN, paging). A UE on another eNodeB is left
+    /// alone. A repeated report changes nothing, and the Recovery Report clears the
+    /// peer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_path_failure_report_releases_the_s1u_bearers_toward_that_enb() {
+        let guard = process_state_test_guard().await;
+        crate::up_path::clear_for_test();
+        let sgwu = assoc_sgwu(Vec::new()).await;
+        let (node, stop) = associated_node(&guard, &sgwu).await;
+        let (ue_a, bearer_a) = ue_toward(b"001010994000001", [10, 0, 0, 50]);
+        let (ue_b, bearer_b) = ue_toward(b"001010994000002", [10, 0, 0, 51]);
+        let ctx = sgwc_self();
+        let failures0 = crate::up_path::FAILURES_TOTAL.load(Ordering::Relaxed);
+        let to = node.local_addr();
+
+        sgwu.sock
+            .send_to(&node_report(0x99_0001, &[[10, 0, 0, 50]], &[]), to)
+            .await
+            .unwrap();
+        let responses = sgwu.node_report_responses.clone();
+        eventually("the Node Report Response", || {
+            !responses.lock().unwrap().is_empty()
+        })
+        .await;
+        let (seq, body) = responses.lock().unwrap()[0].clone();
+        assert_eq!(seq, 0x99_0001, "the sequence number is echoed");
+        assert_eq!(response_cause(&body).0, PfcpCause::RequestAccepted);
+
+        let mods = sgwu.modifications.clone();
+        eventually("the deactivation", || !mods.lock().unwrap().is_empty()).await;
+        let req = nextgcore_pfcp::message::SessionModificationRequest::decode(
+            &mut Bytes::copy_from_slice(&mods.lock().unwrap()[0]),
+        )
+        .unwrap();
+        let far = req
+            .update_fars
+            .iter()
+            .find(|f| f.far_id == 0x0994)
+            .expect("the downlink FAR is updated");
+        let aa = far.apply_action.expect("with an Apply Action");
+        assert!(aa.buff && aa.nocp && !aa.forw, "BUFF + NOCP: {aa:?}");
+        let dl_a = ctx.dl_tunnel_in_bearer(bearer_a).unwrap();
+        assert_eq!((dl_a.remote_teid, dl_a.remote_ip.ipv4), (0, None));
+        let dl_b = ctx.dl_tunnel_in_bearer(bearer_b).unwrap();
+        assert_eq!(
+            dl_b.remote_ip.ipv4,
+            Some(Ipv4Addr::new(10, 0, 0, 51)),
+            "the UE on another eNodeB is untouched"
+        );
+        assert_eq!(mods.lock().unwrap().len(), 1, "one session modified");
+        assert!(crate::up_path::is_failed("10.0.0.50".parse().unwrap()));
+        assert_eq!(
+            crate::up_path::FAILURES_TOTAL.load(Ordering::Relaxed),
+            failures0 + 1
+        );
+
+        // Repeated: answered, no second count.
+        sgwu.sock
+            .send_to(&node_report(0x99_0002, &[[10, 0, 0, 50]], &[]), to)
+            .await
+            .unwrap();
+        eventually("the second response", || {
+            responses.lock().unwrap().len() >= 2
+        })
+        .await;
+        assert_eq!(
+            crate::up_path::FAILURES_TOTAL.load(Ordering::Relaxed),
+            failures0 + 1
+        );
+
+        // Recovered.
+        sgwu.sock
+            .send_to(&node_report(0x99_0003, &[], &[[10, 0, 0, 50]]), to)
+            .await
+            .unwrap();
+        eventually("the third response", || {
+            responses.lock().unwrap().len() >= 3
+        })
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!crate::up_path::is_failed("10.0.0.50".parse().unwrap()));
+        assert!(crate::main_render_metrics_for_test().contains("sgwc_up_paths_failed 0"));
+        ctx.ue_remove(ue_a);
+        ctx.ue_remove(ue_b);
+        std::env::remove_var("SGWC_SGWU_ADDR");
+        let _ = stop.send(true);
+    }
+
+    /// #994: a Node Report from anyone but the associated SGW-U is refused with cause
+    /// 72 (TS 29.244 §6.2.6.1) and not acted on; one announcing a failure report it
+    /// does not carry is refused with 66 and the Offending IE.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_report_from_a_stranger_or_without_its_report_is_refused() {
+        let guard = process_state_test_guard().await;
+        crate::up_path::clear_for_test();
+        let sgwu = assoc_sgwu(Vec::new()).await;
+        let (node, stop) = associated_node(&guard, &sgwu).await;
+        let (ue, bearer) = ue_toward(b"001010994000003", [10, 0, 0, 52]);
+        let ctx = sgwc_self();
+
+        let stranger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        stranger
+            .send_to(&node_report(7, &[[10, 0, 0, 52]], &[]), node.local_addr())
+            .await
+            .unwrap();
+        let mut buf = [0u8; 512];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stranger.recv_from(&mut buf),
+        )
+        .await
+        .expect("answered")
+        .unwrap();
+        let mut cursor = Bytes::copy_from_slice(&buf[..len]);
+        let header = PfcpHeader::decode(&mut cursor).unwrap();
+        assert_eq!(
+            header.message_type as u8,
+            pfcp_msg_type::NODE_REPORT_RESPONSE
+        );
+        assert_eq!(header.sequence_number, 7);
+        assert_eq!(
+            response_cause(&cursor).0,
+            PfcpCause::NoEstablishedPfcpAssociation
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!crate::up_path::is_failed("10.0.0.52".parse().unwrap()));
+        assert_eq!(
+            ctx.dl_tunnel_in_bearer(bearer).unwrap().remote_teid,
+            0x9940,
+            "not released"
+        );
+
+        // UPFR set, report absent.
+        let pkt = node_report_pdu(
+            8,
+            NodeReportRequest {
+                node_id: NodeId::new_ipv4([127, 0, 0, 9]),
+                node_report_type: nextgcore_pfcp::types::NodeReportType {
+                    upfr: true,
+                    ..Default::default()
+                },
+                user_plane_path_failure_report: None,
+                user_plane_path_recovery_report: None,
+            },
+        );
+        sgwu.sock.send_to(&pkt, node.local_addr()).await.unwrap();
+        let responses = sgwu.node_report_responses.clone();
+        eventually("the response", || !responses.lock().unwrap().is_empty()).await;
+        let (seq, body) = responses.lock().unwrap()[0].clone();
+        assert_eq!(seq, 8);
+        assert_eq!(
+            response_cause(&body),
+            (
+                PfcpCause::MandatoryIeMissing,
+                Some(nextgcore_pfcp::ie::IeType::UserPlanePathFailureReport as u16)
+            )
+        );
+        assert!(!crate::up_path::is_failed("10.0.0.52".parse().unwrap()));
+        ctx.ue_remove(ue);
+        std::env::remove_var("SGWC_SGWU_ADDR");
+        let _ = stop.send(true);
+    }
+
+    /// #994, TS 23.007 §20.3.1: a path still down when the maximum path failure
+    /// duration expires has its record dropped, and a bearer a later Modify Bearer
+    /// pointed at it again is released then. A recovery inside the hold voids it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_hold_expires_only_for_a_path_still_down() {
+        let guard = process_state_test_guard().await;
+        crate::up_path::clear_for_test();
+        std::env::set_var("SGWC_UP_PATH_FAILURE_HOLD_SECS", "1");
+        let sgwu = assoc_sgwu(Vec::new()).await;
+        let (node, stop) = associated_node(&guard, &sgwu).await;
+        let (ue, bearer) = ue_toward(b"001010994000004", [10, 0, 0, 53]);
+        let ctx = sgwc_self();
+        let expired0 = crate::up_path::HOLDS_EXPIRED_TOTAL.load(Ordering::Relaxed);
+        let mods = sgwu.modifications.clone();
+        let to = node.local_addr();
+
+        sgwu.sock
+            .send_to(&node_report(1, &[[10, 0, 0, 53], [10, 0, 0, 54]], &[]), to)
+            .await
+            .unwrap();
+        eventually("the release", || mods.lock().unwrap().len() == 1).await;
+        // 10.0.0.54 recovers inside the hold.
+        sgwu.sock
+            .send_to(&node_report(2, &[], &[[10, 0, 0, 54]]), to)
+            .await
+            .unwrap();
+        // A Modify Bearer points the UE at the failed eNodeB again.
+        let mut dl = ctx.dl_tunnel_in_bearer(bearer).unwrap();
+        dl.remote_teid = 0x9941;
+        dl.remote_ip.ipv4 = Some(Ipv4Addr::new(10, 0, 0, 53));
+        ctx.tunnel_update(&dl);
+        assert!(crate::up_path::is_failed("10.0.0.53".parse().unwrap()));
+
+        let mut released_again = false;
+        for _ in 0..300 {
+            if mods.lock().unwrap().len() >= 2 {
+                released_again = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(released_again, "released again at the hold's expiry");
+        assert_eq!(ctx.dl_tunnel_in_bearer(bearer).unwrap().remote_teid, 0);
+        assert!(
+            !crate::up_path::is_failed("10.0.0.53".parse().unwrap()),
+            "dropped"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            crate::up_path::HOLDS_EXPIRED_TOTAL.load(Ordering::Relaxed),
+            expired0 + 1,
+            "only the path still down expired"
+        );
+        ctx.ue_remove(ue);
+        std::env::remove_var("SGWC_UP_PATH_FAILURE_HOLD_SECS");
+        std::env::remove_var("SGWC_SGWU_ADDR");
         let _ = stop.send(true);
     }
 }

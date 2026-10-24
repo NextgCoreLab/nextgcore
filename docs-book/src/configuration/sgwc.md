@@ -74,6 +74,29 @@ From the clap `Args` struct in `src/bins/nextgcore-sgwcd/src/main.rs`:
       Heartbeat Response and its own Heartbeat Request carry the stamp.
   - While there is no association, the SGW-C sends no PFCP session message (TS 29.244 §6.2.6.1):
     the S11 request that needs one is refused.
+- **User plane path failure** (TS 23.007 §20.3.4, TS 29.244 §7.4.5, #994):
+  - The SGW-U reports a GTP-U path toward a remote peer as failed or recovered in a PFCP Node
+    Report Request. The SGW-C answers it:
+    - Request accepted;
+    - 72 if the report is not from its associated SGW-U;
+    - 66 (with the Offending IE) if the Node ID, the Node Report Type, or the announced report
+      is missing;
+    - 69 if the request cannot be decoded.
+  - On a failure, every UE whose downlink S1-U endpoint is that eNodeB has its S1-U bearers
+    released with Release Access Bearers semantics. The FARs go to BUFF + NOCP and the EPS
+    bearers are kept, so downlink data is buffered, notified (DDN) and the UE paged.
+  - The peer stays marked failed for the maximum path failure duration,
+    `SGWC_UP_PATH_FAILURE_HOLD_SECS` (default 120, at most 3600). If the path is still down
+    when that expires, bearers pointed at the peer again are released too, and the record is
+    dropped.
+  - A recovery report clears the record.
+  - The optional S1-U path failure notification to the MME (cause "S1-U Path Failure",
+    §20.3.5) is not used, because it needs MME support (S1UN).
+- **Metrics:** `http://127.0.0.1:9090/metrics`. The port is set by `SGWC_METRICS_PORT`; the
+  bind is loopback unless `NEXTGCORE_METRICS_BIND` is set (#837). The metrics are:
+  - `sgwc_up`, `sgwc_pfcp_associations`, `sgwc_ues`;
+  - `sgwc_up_path_failures_total`, `sgwc_up_path_recoveries_total`, `sgwc_up_paths_failed`;
+  - `sgwc_up_path_ues_released_total`, `sgwc_up_path_holds_expired_total`.
 - **Environment variables** (read in `gtp_path.rs` / `pfcp_path.rs` / `main.rs`):
 
   | Variable | Default | Effect |

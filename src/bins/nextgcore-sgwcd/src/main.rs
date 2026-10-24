@@ -27,6 +27,7 @@ pub mod sxa_build;
 pub mod sxa_handler;
 pub mod sxa_response;
 pub mod timer;
+pub mod up_path;
 
 use context::sgwc_self;
 use event::{SgwcEvent, SgwcEventId};
@@ -292,6 +293,43 @@ impl Default for SgwcApp {
     }
 }
 
+/// Where the Prometheus endpoint listens (`SGWC_METRICS_PORT`, default 9090, the port
+/// every other daemon in this tree uses for it).
+fn metrics_addr() -> std::net::SocketAddr {
+    let port: u16 = std::env::var("SGWC_METRICS_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9090);
+    nextgcore_metrics::nes_energy::metrics_bind_addr(port)
+}
+
+/// The SGW-C's runtime state in Prometheus text format: liveness, the Sxa
+/// association, the UE census, and the user plane path reports (#994).
+fn render_metrics() -> String {
+    let associated = pfcp_path::sxa_node()
+        .map(|n| n.associated_peer_count())
+        .unwrap_or(0);
+    let mut out = format!(
+        "# HELP sgwc_up 1 while the SGW-C runtime is serving\n\
+         # TYPE sgwc_up gauge\n\
+         sgwc_up 1\n\
+         # HELP sgwc_pfcp_associations Sxa PFCP associations with an SGW-U\n\
+         # TYPE sgwc_pfcp_associations gauge\n\
+         sgwc_pfcp_associations {associated}\n\
+         # TYPE sgwc_ues gauge\n\
+         sgwc_ues {}\n",
+        sgwc_self().ue_count()
+    );
+    up_path::render_metrics(&mut out);
+    out
+}
+
+/// [`render_metrics`] for the tests of other modules.
+#[cfg(test)]
+pub(crate) fn main_render_metrics_for_test() -> String {
+    render_metrics()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Parse command line arguments
@@ -324,6 +362,19 @@ async fn main() -> Result<()> {
 
     // Initialize
     app.init(&args.config).await?;
+
+    // The Prometheus endpoint (#994). Loopback unless NEXTGCORE_METRICS_BIND says
+    // otherwise (#837). Non-fatal, as in sgwud: an SGW-C that cannot expose metrics
+    // still serves S11.
+    match nextgcore_metrics::nes_energy::serve_metrics(
+        metrics_addr(),
+        std::sync::Arc::new(render_metrics),
+    )
+    .await
+    {
+        Ok((bound, _handle)) => log::info!("SGWC metrics endpoint on http://{bound}/metrics"),
+        Err(e) => log::warn!("SGWC metrics endpoint not available: {e}"),
+    }
 
     // Run main loop
     app.run().await?;

@@ -1874,6 +1874,38 @@ fn dispatch_delete_session_request(server: &GtpcServer, msg: &Gtp2Message, peer:
     }
 }
 
+/// Release the UE's S1-U bearers at the user plane (TS 23.401 §5.3.5 step 3): the
+/// eNodeB endpoints are forgotten and the downlink FARs go to BUFF + NOCP, so the
+/// next downlink packet is buffered and reported, and a Downlink Data Notification
+/// pages the UE. The EPS bearer contexts are kept. Used by Release Access Bearers and
+/// by an S1-U path failure (#994). Returns the PFCP modifications sent.
+pub(crate) fn release_s1u_bearers(ue: &crate::context::SgwcUe, xact: u64) -> usize {
+    let ctx = sgwc_self();
+    let mut sent = 0;
+    for sess_id in &ue.sess_ids {
+        let Some(sess) = ctx.sess_find_by_id(*sess_id) else {
+            continue;
+        };
+        for bearer_id in &sess.bearer_ids {
+            if let Some(mut dl_tunnel) = ctx.dl_tunnel_in_bearer(*bearer_id) {
+                dl_tunnel.remote_teid = 0;
+                dl_tunnel.remote_ip = crate::context::IpAddr::default();
+                ctx.tunnel_update(&dl_tunnel);
+            }
+        }
+        match pfcp_path::send_session_modification_request(
+            &sess,
+            xact,
+            None,
+            sxa_handler::pfcp_modify::DL_ONLY | sxa_handler::pfcp_modify::DEACTIVATE,
+        ) {
+            Ok(()) => sent += 1,
+            Err(e) => log::error!("PFCP deactivation failed: {e}"),
+        }
+    }
+    sent
+}
+
 fn dispatch_release_access_bearers_request(
     server: &GtpcServer,
     msg: &Gtp2Message,
@@ -1894,30 +1926,9 @@ fn dispatch_release_access_bearers_request(
 
     let result = s11_handler::handle_release_access_bearers_request(Some(&ue), seq as u64, &[]);
 
-    let ctx = sgwc_self();
     match result {
         HandlerResult::SendPfcp => {
-            // Clear eNB endpoints (S1 release) and deactivate downlink
-            for sess_id in &ue.sess_ids {
-                let Some(sess) = ctx.sess_find_by_id(*sess_id) else {
-                    continue;
-                };
-                for bearer_id in &sess.bearer_ids {
-                    if let Some(mut dl_tunnel) = ctx.dl_tunnel_in_bearer(*bearer_id) {
-                        dl_tunnel.remote_teid = 0;
-                        dl_tunnel.remote_ip = crate::context::IpAddr::default();
-                        ctx.tunnel_update(&dl_tunnel);
-                    }
-                }
-                if let Err(e) = pfcp_path::send_session_modification_request(
-                    &sess,
-                    seq as u64,
-                    None,
-                    sxa_handler::pfcp_modify::DL_ONLY | sxa_handler::pfcp_modify::DEACTIVATE,
-                ) {
-                    log::error!("PFCP deactivation failed: {e}");
-                }
-            }
+            release_s1u_bearers(&ue, seq as u64);
             send_cause_response(
                 server,
                 peer,

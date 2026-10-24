@@ -808,6 +808,14 @@ impl SgwcContext {
     }
 
     /// Find UE by ID
+    /// Every UE context's id.
+    pub fn ue_ids(&self) -> Vec<u64> {
+        self.sgwc_ue_list
+            .read()
+            .map(|l| l.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
     pub fn ue_find_by_id(&self, id: u64) -> Option<SgwcUe> {
         self.sgwc_ue_list.read().ok()?.get(&id).cloned()
     }
