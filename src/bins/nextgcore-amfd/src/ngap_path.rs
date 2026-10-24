@@ -104,7 +104,9 @@ enum ModifyIndicationAnswer {
 }
 
 enum NgapTransport {
-    Userspace(SctpServer),
+    /// Boxed: the userspace server is several hundred bytes, the kernel one a few
+    /// handles (clippy `large_enum_variant` under `kernel-sctp`).
+    Userspace(Box<SctpServer>),
     #[cfg(feature = "kernel-sctp")]
     Kernel(nextgcore_sctp::KernelSctpServer),
 }
@@ -120,7 +122,7 @@ impl NgapTransport {
                 let server = SctpServer::bind(addr, config)
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to bind userspace SCTP server: {e}"))?;
-                Ok(Self::Userspace(server))
+                Ok(Self::Userspace(Box::new(server)))
             }
             SctpBackend::Kernel => {
                 #[cfg(feature = "kernel-sctp")]
@@ -752,8 +754,11 @@ impl UeNasContext {
             amf_ue.use_nextgcore_nas_security,
         );
         ctx.suci = amf_ue.suci.clone().unwrap_or_default();
-        // A record published without a RAN UE context has no N1 connection.
-        ctx.cm_idle = amf_ue.ran_ue_id == crate::context::NEXTGCORE_INVALID_POOL_ID;
+        // A record published without a RAN UE context has no N1 connection, and
+        // neither has one published with no association (#1089 review: a
+        // CreateUEContext target, which no gNB has signalled for yet).
+        ctx.cm_idle =
+            amf_ue.ran_ue_id == crate::context::NEXTGCORE_INVALID_POOL_ID || association_id == 0;
         ctx.amf_ue = amf_ue;
         ctx.registered = true;
         ctx
@@ -775,6 +780,18 @@ impl UeNasContext {
     /// Complete, cleared when the UE comes back with a Service Request).
     pub(crate) fn is_cm_idle(&self) -> bool {
         self.cm_idle
+    }
+
+    /// Whether the UE is registered: the record a CM-IDLE UE is paged by (#1087).
+    pub(crate) fn is_registered(&self) -> bool {
+        self.registered
+    }
+
+    /// Whether the record names an NG association at all (#1089 review). A context
+    /// created over Namf for a UE no gNB has signalled for yet has none: it is
+    /// neither connected nor pageable.
+    pub(crate) fn is_bound(&self) -> bool {
+        self.association_id != 0
     }
 
     /// Create a per-UE NAS context. `use_nextgcore_nas_security` is the Wave-6
@@ -1036,6 +1053,9 @@ pub struct NgapServer {
     /// PDU Session Establishment Requests waiting for them. See
     /// [`NgapServer::process_supersede_barriers`].
     supersede_barriers: HashMap<u64, SupersedeBarrier>,
+    /// #1087: positioning / UE-policy downlinks for a UE that is CM-IDLE and being
+    /// paged, held until its Service Request connects it.
+    held_positioning: Vec<crate::context::PendingPositioningDl>,
     /// How long a [`SupersedeBarrier`] holds establishments at most;
     /// [`SUPERSEDE_RELEASE_BARRIER`] outside tests.
     supersede_barrier_max: Duration,
@@ -1314,6 +1334,7 @@ impl NgapServer {
             pending_establishments: HashMap::new(),
             racs_assigns: HashMap::new(),
             supersede_barriers: HashMap::new(),
+            held_positioning: Vec::new(),
             supersede_barrier_max: SUPERSEDE_RELEASE_BARRIER,
             sbi_offload: crate::sbi_offload::SbiOffload::new(MAX_OFFLOADED_SBI),
             contextless_ue_ids: std::collections::VecDeque::new(),
@@ -6312,6 +6333,12 @@ impl NgapServer {
     /// arrives under a fresh id (#518, #609).
     fn rekey_ue_sessions(&mut self, old_id: u64, new_id: u64) {
         self.sbi_offload.rekey_ue(old_id, new_id);
+        // #1087: downlinks held for the paged UE follow it to its new connection.
+        for held in &mut self.held_positioning {
+            if held.amf_ue_ngap_id == old_id {
+                held.amf_ue_ngap_id = new_id;
+            }
+        }
         // #778 follow-up: the old ID's NG connection is gone, so what was active on it
         // is not active on the new one; each session the new connection sets up marks
         // itself again.
@@ -9322,6 +9349,22 @@ impl NgapServer {
     ) {
         use crate::context::ConnectedN2;
         use crate::namf_handler::PagedN2;
+        // #749: the UE is already being paged for another transfer. Its paging
+        // context holds that one, and this transfer was already answered 200, so
+        // it can neither overwrite it nor be refused. It waits in the queue: once
+        // the UE answers it is CM-CONNECTED and delivered as such, and if the page
+        // fails it pages for itself.
+        if crate::namf_handler::paging_ongoing(item.amf_ue_ngap_id) {
+            log::info!(
+                "UE {}: N1N2 transfer for PSI {} waits for the paging already ongoing",
+                item.amf_ue_ngap_id,
+                item.pdu_session_id
+            );
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.connected_downlink_add(item);
+            return;
+        }
         let (n2, paged) = match item.n2 {
             ConnectedN2::None => (None, PagedN2::Setup),
             ConnectedN2::Release => (None, PagedN2::Release),
@@ -10618,13 +10661,15 @@ impl NgapServer {
             };
             guard.positioning_dl_drain()
         };
-        for item in pending {
+        let mut pending_all = std::mem::take(&mut self.held_positioning);
+        pending_all.extend(pending);
+        for item in pending_all {
             // Resolve the serving association + RAN-UE-NGAP-ID (Copy values, so
             // the immutable borrow is released before the &mut send calls).
-            let Some((association_id, ran_ue_ngap_id)) = self
+            let Some((association_id, ran_ue_ngap_id, idle)) = self
                 .ue_auth_state
                 .get(item.amf_ue_ngap_id)
-                .map(|s| (s.association_id, s.ran_ue_ngap_id))
+                .map(|s| (s.association_id, s.ran_ue_ngap_id, s.is_cm_idle()))
             else {
                 log::warn!(
                     "LCS positioning DL for UE {} dropped: no live NGAP context",
@@ -10632,6 +10677,26 @@ impl NgapServer {
                 );
                 continue;
             };
+            // #1087: a CM-IDLE UE has no NG connection to send on; its stored
+            // association and RAN UE NGAP ID name the released one. While it is
+            // paged the downlink waits for its Service Request; otherwise it is
+            // dropped (the page ended unanswered).
+            if idle {
+                let paged = ctx
+                    .read()
+                    .ok()
+                    .is_some_and(|g| g.paging_find(item.amf_ue_ngap_id).is_some());
+                if paged {
+                    self.held_positioning.push(item);
+                } else {
+                    log::warn!(
+                        "LCS positioning DL for UE {} dropped: the UE is CM-IDLE and not \
+                         being paged",
+                        item.amf_ue_ngap_id
+                    );
+                }
+                continue;
+            }
             match item.kind {
                 crate::context::PositioningDlKind::NrppaToGnb {
                     routing_id,
@@ -19334,6 +19399,7 @@ mod tests {
     /// Handler-level tests asserting what amfd SENDS (#760, ...), in their own file.
     mod handler_tests;
     mod initial_registration_tests;
+    mod positioning_reach_tests;
     mod racs_handler_tests;
     mod racs_mapping_tests;
     mod reject_path_tests;
@@ -23750,6 +23816,22 @@ mod tests {
         (server, addr.port(), seen)
     }
 
+    /// Whether the offload's count of permit-holding exchanges satisfies `want` within
+    /// 10 s (#1056). A spawned exchange holds its permit only once the scheduler first
+    /// polls it, so a test that reads `in_flight()` right after spawning races that.
+    async fn offload_reaches(ngap: &NgapServer, want: impl Fn(usize) -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if want(ngap.sbi_offload.in_flight()) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// Run the offloaded SBI exchanges to completion and apply their outcomes on
     /// this task, as `poll` would (#922).
     async fn settle_offloaded_sbi(ngap: &mut NgapServer) {
@@ -23818,13 +23900,22 @@ mod tests {
         }
 
         // Bounded concurrency: 80 calls at 16 at a time is five waves of the SMF's delay.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // #1056: the first wave is waited for (bounded), not assumed after a fixed sleep:
+        // a loaded run can take longer than that to schedule the spawned calls.
+        assert!(
+            offload_reaches(&ngap, |n| n == MAX_OFFLOADED_SBI).await,
+            "every permit taken: {} in flight",
+            ngap.sbi_offload.in_flight()
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while seen.lock().expect("seen").is_empty() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let in_first_wave = seen.lock().expect("seen").len();
         assert!(
             (1..=MAX_OFFLOADED_SBI).contains(&in_first_wave),
             "{in_first_wave} calls in flight at once"
         );
-        assert_eq!(ngap.sbi_offload.in_flight(), MAX_OFFLOADED_SBI);
         ngap.sbi_offload.settle().await;
         assert_eq!(
             seen.lock().expect("seen").len(),
@@ -24185,10 +24276,12 @@ mod tests {
             "both Acknowledges"
         );
         assert!(ngap.ue_auth_state.get(b).expect("kept").is_cm_idle());
-        assert_eq!(
-            ngap.sbi_offload.in_flight(),
-            1,
-            "the SMF call is still hanging"
+        // #1056: a spawned call holds its permit only once the scheduler first polls
+        // it, so this is waited for (bounded) rather than read at once.
+        assert!(
+            offload_reaches(&ngap, |n| n == 1).await,
+            "the SMF call is hanging, holding its permit: {} in flight",
+            ngap.sbi_offload.in_flight()
         );
         holder.abort();
         for id in [a, b] {

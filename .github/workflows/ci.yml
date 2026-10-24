@@ -141,6 +141,25 @@ jobs:
         # explicit build+test here instead. Add a line per gated feature.
         run: cd src && cargo test -p nextgcore-easdfd --features dns-udp
 
+      - name: cargo test (kernel SCTP)
+        # Deployments that face an independent RAN run amfd with `kernel-sctp`
+        # (native Linux SCTP), which the default build never compiles. Built and
+        # linked against libsctp here. The tests that open a live kernel SCTP
+        # association need the `sctp` module: they run when it can be loaded, and
+        # otherwise the step still builds and links them (`--no-run`) and says why.
+        run: |
+          set -eu
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libsctp-dev
+          if sudo modprobe sctp 2>/dev/null || grep -qw '^sctp' /proc/modules; then
+            cd src && cargo test -p nextgcore-sctp --features kernel \
+              && cargo test -p nextgcore-amfd --features kernel-sctp
+          else
+            echo "::notice::kernel SCTP module unavailable on this runner; kernel-sctp tests built, not run"
+            cd src && cargo test -p nextgcore-sctp --features kernel --no-run \
+              && cargo test -p nextgcore-amfd --features kernel-sctp --no-run
+          fi
+
       - name: Peak memory
         if: always()
         run: |
@@ -170,6 +189,14 @@ jobs:
         # Same reasoning as the test job's non-default step: a gated module is
         # invisible to a default-feature lint. One line per gated feature.
         run: cd src && cargo clippy -p nextgcore-easdfd --features dns-udp --all-targets -- -D warnings
+
+      - name: cargo clippy (kernel SCTP)
+        # The kernel-sctp backend (see the test job): linted like the default one.
+        # Clippy does not link, so libsctp is not needed here.
+        run: >-
+          cd src && cargo clippy -p nextgcore-amfd -p nextgcore-sctp
+          --features nextgcore-amfd/kernel-sctp,nextgcore-sctp/kernel
+          --all-targets -- -D warnings
 
   fmt:
     name: Format

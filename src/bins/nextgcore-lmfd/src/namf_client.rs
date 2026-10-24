@@ -63,7 +63,10 @@ impl DiscoveredAmf {
 /// Outcome of the N1N2MessageTransfer POST toward the serving AMF.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransferOutcome {
-    /// 200 N1_N2_TRANSFER_INITIATED — the AMF accepted the downlink.
+    /// 200 N1_N2_TRANSFER_INITIATED — the AMF accepted the downlink — or 202
+    /// ATTEMPTING_TO_REACH_UE: the UE is CM-IDLE and being paged, and the AMF
+    /// delivers the downlink once it is connected (TS 29.518 §5.2.2.3.1, #1087).
+    /// Either way the answer is coming, so the session waits for it.
     Initiated,
     /// 504 UE_NOT_REACHABLE (TS 29.518 Table 6.1.7.3-1) — maps straight to
     /// DetermineLocation 504 UNREACHABLE_USER (A6 cause mapping).
@@ -438,7 +441,8 @@ pub async fn send_n2_nrppa_transfer(
         nrppa_pdu,
     );
     match client.send_request(request).await {
-        Ok(resp) if resp.status == 200 => TransferOutcome::Initiated,
+        // 202: the UE is being paged; the NRPPa follows once it is connected.
+        Ok(resp) if resp.status == 200 || resp.status == 202 => TransferOutcome::Initiated,
         Ok(resp) if resp.status == 504 => TransferOutcome::UeNotReachable,
         Ok(resp) => {
             log::warn!("NRPPa N2 transfer returned status {}", resp.status);
@@ -618,6 +622,15 @@ pub async fn send_n1n2_transfer(
                     if cause.as_deref() != Some("N1_N2_TRANSFER_INITIATED") {
                         log::warn!("A2: N1N2MessageTransfer 200 with cause {cause:?}");
                     }
+                    return TransferOutcome::Initiated;
+                }
+                // TS 29.518 §5.2.2.3.1: a CM-IDLE UE is paged and the LPP is
+                // delivered after its Service Request (#1087).
+                202 => {
+                    log::info!(
+                        "A2: N1N2MessageTransfer 202 ATTEMPTING_TO_REACH_UE: the UE is paged; \
+                         waiting for its answer"
+                    );
                     return TransferOutcome::Initiated;
                 }
                 504 => return TransferOutcome::UeNotReachable,
@@ -828,5 +841,60 @@ mod tests {
         });
         assert!(parse_amf_search_result(&search, None).is_none());
         assert!(parse_amf_search_result(&json!({}), None).is_none());
+    }
+
+    /// A stand-in AMF answering every request with `status`.
+    async fn amf_answering(status: u16) -> (nextgcore_sbi::server::SbiServer, DiscoveredAmf) {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        server
+            .start(move |_req: nextgcore_sbi::message::SbiRequest| async move {
+                let cause = match status {
+                    202 => "ATTEMPTING_TO_REACH_UE",
+                    504 => "UE_NOT_REACHABLE",
+                    _ => "N1_N2_TRANSFER_INITIATED",
+                };
+                nextgcore_sbi::message::SbiResponse::with_status(status)
+                    .with_json_body(&serde_json::json!({ "cause": cause }))
+                    .unwrap()
+            })
+            .await
+            .expect("stand-in AMF starts");
+        let amf = DiscoveredAmf {
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            scheme: "http".to_string(),
+            nf_instance_id: None,
+        };
+        (server, amf)
+    }
+
+    /// #1087, TS 29.518 §5.2.2.3.1: 202 ATTEMPTING_TO_REACH_UE (the UE is CM-IDLE
+    /// and paged) is an initiated transfer for both the LPP and the NRPPa leg, not a
+    /// failure: the AMF delivers once the UE is connected. 504 stays unreachable.
+    #[tokio::test]
+    async fn a_202_from_the_amf_is_an_initiated_transfer_and_504_is_unreachable() {
+        let (_amf, amf) = amf_answering(202).await;
+        assert!(matches!(
+            send_n1n2_transfer(&amf, "imsi-001010010870101", "c", "lmf", vec![0x90]).await,
+            TransferOutcome::Initiated
+        ));
+        assert!(matches!(
+            send_n2_nrppa_transfer(&amf, "imsi-001010010870101", "c", "lmf", vec![0x00]).await,
+            TransferOutcome::Initiated
+        ));
+        let (_amf, amf) = amf_answering(504).await;
+        assert!(matches!(
+            send_n1n2_transfer(&amf, "imsi-001010010870102", "c", "lmf", vec![0x90]).await,
+            TransferOutcome::UeNotReachable
+        ));
+        assert!(matches!(
+            send_n2_nrppa_transfer(&amf, "imsi-001010010870102", "c", "lmf", vec![0x00]).await,
+            TransferOutcome::UeNotReachable
+        ));
     }
 }
