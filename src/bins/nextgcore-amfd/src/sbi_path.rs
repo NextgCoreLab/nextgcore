@@ -963,6 +963,7 @@ pub fn amf_sess_have_session_release_pending(_sess: &AmfSess) -> bool {
 // ============================================================================
 
 /// SM Context Create response from SMF
+#[derive(Debug)]
 pub struct SmContextCreateResponse {
     /// N1 SM message (NAS PDU Session Establishment Accept)
     pub n1_sm_msg: Vec<u8>,

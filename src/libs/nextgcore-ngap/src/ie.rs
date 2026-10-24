@@ -1564,15 +1564,22 @@ pub fn encode_target_id(
         TargetId::TargetGlobalNgEnbId {
             plmn_identity,
             ng_enb_id,
-            selected_tai,
+            selected_eps_tai,
         } => {
             encoder.encode_choice_index(1, 2, true)?;
-            encoder.write_bit(false);
-            encoder.write_bit(false);
+            // TargeteNB-ID SEQUENCE { globalENB-ID, selected-EPS-TAI, iE-Extensions OPTIONAL, ... }
+            encoder.write_bit(false); // extension
+            encoder.write_bit(false); // no iE-Extensions
+                                      // GlobalNgENB-ID SEQUENCE { pLMNIdentity, ngENB-ID, iE-Extensions OPTIONAL, ... }
+            encoder.write_bit(false); // extension
+            encoder.write_bit(false); // no iE-Extensions
             encoder.encode_octet_string(plmn_identity, Some(3), Some(3))?;
-            // ng-eNB-ID is a BIT STRING (SIZE(20..32))
-            encoder.write_bits(*ng_enb_id as u64, 32);
-            encode_tai_inline(&mut encoder, selected_tai)?;
+            encode_ng_enb_id_into(&mut encoder, ng_enb_id)?;
+            // EPS-TAI SEQUENCE { pLMNIdentity, ePS-TAC OCTET STRING (SIZE(2)), iE-Extensions OPTIONAL, ... }
+            encoder.write_bit(false); // extension
+            encoder.write_bit(false); // no iE-Extensions
+            encoder.encode_octet_string(&selected_eps_tai.plmn_identity, Some(3), Some(3))?;
+            encoder.encode_octet_string(&selected_eps_tai.tac, Some(2), Some(2))?;
         }
     }
     encoder.align();
@@ -1582,6 +1589,51 @@ pub fn encode_target_id(
         value: encoder.into_bytes().to_vec(),
     });
     Ok(())
+}
+
+/// Encode an NgENB-ID CHOICE (TS 38.413 §9.3.1.8): four root alternatives
+/// (macro, short macro, long macro, choice-Extensions), NON-extensible, so a 2-bit
+/// index; each BIT STRING is fixed-size and longer than 16 bits, so it is
+/// octet-aligned (X.691 §16.10).
+fn encode_ng_enb_id_into(encoder: &mut AperEncoder, id: &crate::types::NgEnbId) -> NgapResult<()> {
+    if !id.fits() {
+        return Err(crate::error::NgapError::InvalidIeValue {
+            ie_name: "NgENB-ID",
+            reason: format!(
+                "value {:#x} does not fit the {}-bit alternative",
+                id.value(),
+                id.bit_len()
+            ),
+        });
+    }
+    encoder.encode_choice_index(id.choice_index(), 4, false)?;
+    encoder.align();
+    encoder.write_bits(u64::from(id.value()), id.bit_len());
+    Ok(())
+}
+
+/// Decode an NgENB-ID CHOICE (mirror of `encode_ng_enb_id_into`).
+fn decode_ng_enb_id_into(decoder: &mut AperDecoder) -> NgapResult<crate::types::NgEnbId> {
+    use crate::types::NgEnbId;
+    let choice = decoder.decode_choice_index(4, false)?;
+    let len = match choice {
+        0 => 20,
+        1 => 18,
+        2 => 21,
+        _ => {
+            return Err(crate::error::NgapError::InvalidIeValue {
+                ie_name: "NgENB-ID",
+                reason: "choice-Extensions is not supported".to_string(),
+            })
+        }
+    };
+    decoder.align();
+    let value = decoder.read_bits(len)? as u32;
+    Ok(match choice {
+        0 => NgEnbId::Macro(value),
+        1 => NgEnbId::ShortMacro(value),
+        _ => NgEnbId::LongMacro(value),
+    })
 }
 
 /// Encode TAI inline
@@ -2346,17 +2398,31 @@ pub fn decode_target_id(field: &ProtocolIeField) -> NgapResult<TargetId> {
             })
         }
         1 => {
+            // TargeteNB-ID (mirror of `encode_target_id`).
+            let _ext = decoder.read_bit()?;
+            let _ie_ext = decoder.read_bit()?;
+            // GlobalNgENB-ID
             let _ext = decoder.read_bit()?;
             let _ie_ext = decoder.read_bit()?;
             let plmn_bytes = decoder.decode_octet_string(Some(3), Some(3))?;
             let mut plmn_identity = [0u8; 3];
             plmn_identity.copy_from_slice(&plmn_bytes);
-            let ng_enb_id = decoder.read_bits(32)? as u32;
-            let selected_tai = decode_tai_inline(&mut decoder)?;
+            let ng_enb_id = decode_ng_enb_id_into(&mut decoder)?;
+            // EPS-TAI
+            let _ext = decoder.read_bit()?;
+            let _ie_ext = decoder.read_bit()?;
+            let plmn_bytes = decoder.decode_octet_string(Some(3), Some(3))?;
+            let tac_bytes = decoder.decode_octet_string(Some(2), Some(2))?;
+            let mut selected_eps_tai = crate::types::EpsTai {
+                plmn_identity: [0; 3],
+                tac: [0; 2],
+            };
+            selected_eps_tai.plmn_identity.copy_from_slice(&plmn_bytes);
+            selected_eps_tai.tac.copy_from_slice(&tac_bytes);
             Ok(TargetId::TargetGlobalNgEnbId {
                 plmn_identity,
                 ng_enb_id,
-                selected_tai,
+                selected_eps_tai,
             })
         }
         _ => Err(crate::error::NgapError::InvalidIeValue {

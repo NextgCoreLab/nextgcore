@@ -400,15 +400,18 @@ fn parse_diameter_tw(value: Option<&str>) -> u32 {
     }
 }
 
-/// The `/metrics` listen address: `MME_METRICS_ADDR` (`ip:port`), default
-/// `127.0.0.1:9090`. Private by default: nothing is published beyond the host
-/// unless an operator chooses an address.
+/// The `/metrics` listen address: `MME_METRICS_ADDR` (`ip:port`), else
+/// `NEXTGCORE_METRICS_BIND` (host) on port 9090, else `127.0.0.1:9090`.
+/// Private by default: nothing is published beyond the host unless an
+/// operator chooses an address.
 fn metrics_addr() -> std::net::SocketAddr {
     parse_metrics_addr(std::env::var("MME_METRICS_ADDR").ok().as_deref())
 }
 
 fn parse_metrics_addr(value: Option<&str>) -> std::net::SocketAddr {
-    let default = std::net::SocketAddr::from(([127, 0, 0, 1], 9090));
+    // Otherwise the shared default every NF uses (#837): 127.0.0.1 unless
+    // NEXTGCORE_METRICS_BIND names the host, port 9090.
+    let default = nextgcore_metrics::nes_energy::metrics_bind_addr(9090);
     match value.map(|v| v.trim().parse()) {
         None => default,
         Some(Ok(addr)) => addr,

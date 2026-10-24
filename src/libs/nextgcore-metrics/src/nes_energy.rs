@@ -195,6 +195,45 @@ impl EnergyGauges {
     }
 }
 
+/// Environment variable naming the host every NF's auxiliary listeners
+/// (`/metrics`) bind to (#837).
+pub const METRICS_BIND_ENV: &str = "NEXTGCORE_METRICS_BIND";
+
+/// The host an auxiliary listener binds to when [`METRICS_BIND_ENV`] is unset:
+/// loopback. The endpoint is unauthenticated and reveals per-session counters
+/// and topology, so on a bare-metal or host-network deployment it must not be
+/// reachable from other machines by default. Container and pod deployments set
+/// `NEXTGCORE_METRICS_BIND=0.0.0.0` inside their private network, with no
+/// published host port, so Prometheus can still scrape.
+pub const DEFAULT_METRICS_BIND: std::net::IpAddr =
+    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
+/// The address an NF's `/metrics` listener binds to: the host from
+/// [`METRICS_BIND_ENV`] (an IPv4 or IPv6 address) or [`DEFAULT_METRICS_BIND`],
+/// and `port`. A value that is not an IP address is ignored with a warning,
+/// falling back to loopback rather than to every interface.
+pub fn metrics_bind_addr(port: u16) -> SocketAddr {
+    metrics_bind_addr_from(std::env::var(METRICS_BIND_ENV).ok().as_deref(), port)
+}
+
+/// [`metrics_bind_addr`] with the environment value passed in.
+pub fn metrics_bind_addr_from(host: Option<&str>, port: u16) -> SocketAddr {
+    let ip = match host.map(str::trim).filter(|h| !h.is_empty()) {
+        None => DEFAULT_METRICS_BIND,
+        Some(h) => match h.trim_matches(|c| c == '[' || c == ']').parse() {
+            Ok(ip) => ip,
+            Err(_) => {
+                log::warn!(
+                    "{METRICS_BIND_ENV}={h:?} is not an IP address; the metrics endpoint \
+                     stays on {DEFAULT_METRICS_BIND}"
+                );
+                DEFAULT_METRICS_BIND
+            }
+        },
+    };
+    SocketAddr::new(ip, port)
+}
+
 /// Serve `render()` at `GET /metrics` over a minimal real HTTP/1.1 listener
 /// (`GET /` and `GET /healthz` answer `ok`; anything else is 404). Returns
 /// the bound address (useful with port 0) and the accept-loop task handle.
@@ -202,20 +241,53 @@ pub async fn serve_metrics(
     addr: SocketAddr,
     render: Arc<dyn Fn() -> String + Send + Sync>,
 ) -> std::io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+    serve_metrics_with(addr, render, METRICS_IO_TIMEOUT, MAX_METRICS_CONNECTIONS).await
+}
+
+/// How long a metrics client has to send its request (#837). Short, so an idle
+/// client gives its slot back quickly: a scraper sends the request at once.
+pub const METRICS_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long one metrics connection may take to receive the response (#837).
+pub const METRICS_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Connections served at once; further ones are closed immediately (#837), so
+/// a burst of idle clients cannot pile up tasks and sockets.
+pub const MAX_METRICS_CONNECTIONS: usize = 64;
+
+/// [`serve_metrics`] with the response timeout and the connection cap passed
+/// in. The request must still arrive within the smaller of `io_timeout` and
+/// [`METRICS_REQUEST_TIMEOUT`].
+pub async fn serve_metrics_with(
+    addr: SocketAddr,
+    render: Arc<dyn Fn() -> String + Send + Sync>,
+    io_timeout: std::time::Duration,
+    max_connections: usize,
+) -> std::io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let listener = TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
     log::info!("metrics endpoint listening on http://{bound}/metrics");
+    let slots = Arc::new(tokio::sync::Semaphore::new(max_connections));
+    let request_timeout = io_timeout.min(METRICS_REQUEST_TIMEOUT);
 
     let handle = tokio::spawn(async move {
         loop {
             let Ok((mut stream, _peer)) = listener.accept().await else {
                 break;
             };
+            let Ok(slot) = slots.clone().try_acquire_owned() else {
+                // At capacity: close at once rather than queue another task.
+                drop(stream);
+                continue;
+            };
             let render = render.clone();
             tokio::spawn(async move {
+                let _slot = slot;
                 let mut buf = vec![0u8; 4096];
-                let Ok(n) = stream.read(&mut buf).await else {
-                    return;
+                let n = match tokio::time::timeout(request_timeout, stream.read(&mut buf)).await {
+                    Ok(Ok(n)) => n,
+                    // Read error, or no request within the timeout: drop it.
+                    _ => return,
                 };
                 let head = String::from_utf8_lossy(&buf[..n]);
                 let target = head
@@ -237,8 +309,11 @@ pub async fn serve_metrics(
                     "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
+                let _ = tokio::time::timeout(io_timeout, async {
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                })
+                .await;
             });
         }
     });
@@ -249,6 +324,119 @@ pub async fn serve_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn connections_over_the_cap_are_closed_and_a_freed_slot_serves_again() {
+        // #837 review: the cap is the DoS guard against a burst of idle clients.
+        const CAP: usize = 4;
+        let (bound, handle) = serve_metrics_with(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(|| "x 1\n".to_string()),
+            std::time::Duration::from_secs(30),
+            CAP,
+        )
+        .await
+        .unwrap();
+        // CAP idle clients take every slot (their 1 s request timeout has not
+        // run out yet when the next one arrives).
+        let mut idle = Vec::new();
+        for _ in 0..CAP {
+            idle.push(tokio::net::TcpStream::connect(bound).await.unwrap());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut over = tokio::net::TcpStream::connect(bound).await.unwrap();
+        let _ = over.write_all(b"GET /metrics HTTP/1.0\r\n\r\n").await;
+        let mut sink = Vec::new();
+        let closed = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            over.read_to_end(&mut sink),
+        )
+        .await;
+        assert!(
+            closed.is_ok(),
+            "a connection over the cap is closed at once"
+        );
+        assert!(sink.is_empty(), "and is answered nothing: {sink:?}");
+
+        // Free one slot; a real request is answered again.
+        drop(idle.pop());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut client = tokio::net::TcpStream::connect(bound).await.unwrap();
+        client
+            .write_all(b"GET /metrics HTTP/1.0\r\n\r\n")
+            .await
+            .unwrap();
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.unwrap();
+        assert!(reply.starts_with("HTTP/1.1 200 OK"), "{reply}");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn an_idle_metrics_client_is_dropped_after_the_io_timeout() {
+        // #837: a client that connects and sends nothing used to hold its task
+        // forever. With the timeout the server closes it.
+        let (bound, handle) = serve_metrics_with(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(|| "x 1\n".to_string()),
+            std::time::Duration::from_millis(200),
+            MAX_METRICS_CONNECTIONS,
+        )
+        .await
+        .unwrap();
+        let mut idle = tokio::net::TcpStream::connect(bound).await.unwrap();
+        let mut sink = Vec::new();
+        let closed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            idle.read_to_end(&mut sink),
+        )
+        .await;
+        assert!(closed.is_ok(), "the server must close an idle connection");
+        assert!(
+            sink.is_empty(),
+            "nothing is sent to a client that asked nothing"
+        );
+
+        // A real request is still answered.
+        let mut client = tokio::net::TcpStream::connect(bound).await.unwrap();
+        client
+            .write_all(b"GET /metrics HTTP/1.0\r\n\r\n")
+            .await
+            .unwrap();
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.unwrap();
+        assert!(reply.starts_with("HTTP/1.1 200 OK"), "{reply}");
+        assert!(reply.ends_with("x 1\n"), "{reply}");
+        handle.abort();
+    }
+
+    #[test]
+    fn metrics_bind_defaults_to_loopback_and_honours_the_override() {
+        // #837: unset, blank or garbage never means every interface.
+        for host in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("not-an-ip"),
+            Some("0.0.0.0.0"),
+        ] {
+            let addr = metrics_bind_addr_from(host, 9090);
+            assert!(addr.ip().is_loopback(), "{host:?} -> {addr}");
+            assert_eq!(addr.port(), 9090);
+        }
+        assert_eq!(
+            metrics_bind_addr_from(Some("0.0.0.0"), 9091).to_string(),
+            "0.0.0.0:9091"
+        );
+        assert_eq!(
+            metrics_bind_addr_from(Some("[::]"), 9090).to_string(),
+            "[::]:9090"
+        );
+        assert_eq!(
+            metrics_bind_addr_from(Some("10.0.0.7"), 9090).to_string(),
+            "10.0.0.7:9090"
+        );
+    }
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
 
