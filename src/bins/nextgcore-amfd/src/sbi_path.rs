@@ -1749,12 +1749,8 @@ pub async fn call_ausf_authenticate_with_resync(
         .and_then(|loc| loc.rsplit('/').next().map(|s| s.to_string()))
         .unwrap_or_else(|| "1".to_string());
 
-    log::info!(
-        "AUSF auth response: ctx_id={}, RAND={}, AUTN={}",
-        auth_ctx_id,
-        hex::encode(&rand[..4]),
-        hex::encode(&autn[..4])
-    );
+    // Authentication vector material (RAND, AUTN) is never logged, not even a prefix.
+    log::info!("AUSF auth response: ctx_id={auth_ctx_id}");
 
     Ok(AusfAuthResponse {
         rand,
@@ -1781,11 +1777,8 @@ pub async fn call_ausf_5g_aka_confirm(
     auth_ctx_id: &str,
     res_star: &[u8; 16],
 ) -> SbiResult<AusfConfirmResponse> {
-    log::info!(
-        "Calling AUSF 5G-AKA confirmation: ctx_id={}, RES*={}",
-        auth_ctx_id,
-        hex::encode(&res_star[..4])
-    );
+    // RES* is authentication material: never logged, not even a prefix.
+    log::info!("Calling AUSF 5G-AKA confirmation: ctx_id={auth_ctx_id}");
 
     let client = crate::attach_oauth2(
         SbiClient::for_peer(ausf_host, ausf_port),
