@@ -345,9 +345,8 @@ pub fn handle_authentication_response(
     let xres = &mme_ue.xres[..res_len];
 
     if !constant_time_eq(res, xres) {
+        // Never log RES/XRES: they are authentication vector material.
         log::warn!("Authentication response mismatch");
-        log::debug!("  RES: {res:02x?}");
-        log::debug!("  XRES: {xres:02x?}");
         return Ok(false);
     }
 
