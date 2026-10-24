@@ -1053,43 +1053,10 @@ fn forward_pgw_bearer_procedure_to_mme(
     }
 }
 
-/// How a received restart counter relates to the one already stored for a peer
-/// (TS 23.007 Section 18).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RestartOrder {
-    /// Received value is ahead of the stored one: the peer restarted.
-    Restarted,
-    /// Received value equals the stored one: nothing happened.
-    Unchanged,
-    /// Received value is behind the stored one. TS 23.007 Section 18: "If the
-    /// value ... previously stored for a peer is larger than the Restart
-    /// counter value received ... this indicates a possible race condition ...
-    /// [the message] shall be discarded."
-    Stale,
-}
-
-/// Classify a received restart counter against the stored one.
-///
-/// The previous code used `previous != restart_counter`, which treats a value
-/// moving BACKWARDS as a restart. That is precisely the race TS 23.007 Section 18
-/// says to discard, and acting on it tears down live contexts on a reordered
-/// datagram.
-///
-/// Note on the counter's modulo-256 wrap: a genuine wrap (255 -> 0) is reported
-/// here as `Stale`, not `Restarted`, because Section 18 is written as a plain
-/// magnitude comparison on the stored-versus-received values and nextgcore #53's
-/// acceptance criteria require a rolled-over value to be discarded. The cost is
-/// that the 256th restart of a peer is not detected from its counter alone; it
-/// is still detected by N3 exhaustion on the path. Chosen deliberately: treating
-/// a backwards jump as a restart would delete live sessions on every reordered
-/// message, which is the far more damaging error.
-pub(crate) fn restart_counter_order(stored: u8, received: u8) -> RestartOrder {
-    match received.cmp(&stored) {
-        std::cmp::Ordering::Greater => RestartOrder::Restarted,
-        std::cmp::Ordering::Equal => RestartOrder::Unchanged,
-        std::cmp::Ordering::Less => RestartOrder::Stale,
-    }
-}
+/// TS 23.007 §18 ordering of Restart counters, with the 8-bit roll-over taken into
+/// account. Shared with mmed in `nextgcore-gtp` (#728); before that this node
+/// compared plain magnitudes, so a peer's 255 -> 0 restart read as a stale value.
+pub(crate) use nextgcore_gtp::v2::{restart_counter_order, RestartOrder};
 
 /// Whether restart-triggered context deletion is enabled.
 ///
@@ -1700,23 +1667,29 @@ fn dispatch_modify_bearer_request(server: &GtpcServer, msg: &Gtp2Message, peer: 
     // modified, so a dedicated bearer kept its downlink on the source eNB after
     // a handover while the MME believed it switched.
     let ctx = sgwc_self();
-    let mut modified: Vec<u64> = Vec::new();
+    let mut modified: Vec<(u64, u8)> = Vec::new();
     let mut marked_for_removal: Vec<(u8, u8)> = Vec::new();
     // Bearers to activate in the user plane, per session: one PFCP Session
     // Modification Request each.
-    let mut per_session: std::collections::BTreeMap<u64, Vec<u64>> = Default::default();
+    let mut per_session: std::collections::BTreeMap<u64, Vec<crate::sxa_response::SwitchedBearer>> =
+        Default::default();
     for (ebi, fteid) in &parsed.bearers {
         let Some(enb_fteid) = fteid else {
             // No S1-U eNodeB F-TEID: nothing to switch for this bearer. It is
             // reported as held (modified), and its downlink tunnel is left as
             // it is rather than pointed at TEID 0.
             match ctx.bearer_find_by_ue_ebi(ue.id, *ebi) {
-                Some(bearer) => modified.push(bearer.id),
+                Some(bearer) => modified.push((bearer.id, *ebi)),
                 None => marked_for_removal.push((*ebi, gtp_cause::CONTEXT_NOT_FOUND)),
             }
             continue;
         };
         let enb_teid = enb_fteid.teid;
+        // The endpoint before this request, restored if the SGW-U refuses.
+        let previous = ctx
+            .bearer_find_by_ue_ebi(ue.id, *ebi)
+            .and_then(|b| ctx.dl_tunnel_in_bearer(b.id))
+            .map(|t| (t.remote_teid, t.remote_ip.clone()));
         match s11_handler::handle_modify_bearer_request(Some(&ue), seq as u64, &[], *ebi, enb_teid)
         {
             HandlerResult::SendPfcp => {}
@@ -1740,7 +1713,11 @@ fn dispatch_modify_bearer_request(server: &GtpcServer, msg: &Gtp2Message, peer: 
         per_session
             .entry(bearer.sess_id)
             .or_default()
-            .push(bearer.id);
+            .push(crate::sxa_response::SwitchedBearer {
+                bearer_id: bearer.id,
+                ebi: *ebi,
+                previous,
+            });
         // Settled as modified only when the SGW-U confirms (#838).
     }
 
@@ -1762,7 +1739,9 @@ fn dispatch_modify_bearer_request(server: &GtpcServer, msg: &Gtp2Message, peer: 
         return;
     }
     let join = crate::sxa_response::park_modify_bearer(pending);
-    for (sess_id, bearer_ids) in &per_session {
+    for (sess_id, switched) in &per_session {
+        let bearer_ids: Vec<u64> = switched.iter().map(|b| b.bearer_id).collect();
+        let bearer_ids = &bearer_ids;
         let continuation = pfcp_path::S11Continuation::ModifyBearer {
             join,
             sess_id: *sess_id,
@@ -4082,6 +4061,9 @@ mod tests {
         let bearer = ctx.bearer_find_by_ue_ebi(ue_id, 5).unwrap();
         let mut dl = ctx.dl_tunnel_in_bearer(bearer.id).unwrap();
         dl.far_id = Some(0x0838);
+        // The source eNB's endpoint, which the refusal must leave in place.
+        dl.remote_teid = 0x1111;
+        dl.remote_ip.ipv4 = Some(Ipv4Addr::new(10, 0, 0, 1));
         ctx.tunnel_update(&dl);
 
         let mut mbr = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
@@ -4126,6 +4108,134 @@ mod tests {
                 .count(),
             1,
             "the retransmission did not reach the SGW-U a second time"
+        );
+        assert_eq!(crate::sxa_response::modify_bearer_pending_count(), 0);
+        // #839 review: the SGW-C's downlink endpoint is rolled back with the
+        // refusal, so it agrees with the SGW-U's FAR and the MME's view.
+        let dl = ctx.dl_tunnel_in_bearer(bearer.id).unwrap();
+        assert_eq!(dl.remote_teid, 0x1111, "the old eNB TEID is restored");
+        assert_eq!(dl.remote_ip.ipv4, Some(Ipv4Addr::new(10, 0, 0, 1)));
+        ctx.ue_remove(ue_id);
+        server.close();
+    }
+
+    /// #839 review: a Bearer Context with no S1-U eNodeB F-TEID is reported held
+    /// (modified) and its downlink tunnel is not touched; with nothing to switch,
+    /// no PFCP modification is sent and the answer goes out at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_bearer_context_without_an_enb_fteid_is_held_and_untouched() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let server = test_server(&ambient, 1000, 1);
+        set_s11_server(server.clone());
+        let mme = client();
+        let (ue_id, s11_teid, _) =
+            ue_with_pgw_session(mme.local_addr().unwrap(), b"001010839000001");
+        let ctx = sgwc_self();
+        let bearer = ctx.bearer_find_by_ue_ebi(ue_id, 5).unwrap();
+        let mut dl = ctx.dl_tunnel_in_bearer(bearer.id).unwrap();
+        dl.remote_teid = 0x2222;
+        dl.remote_ip.ipv4 = Some(Ipv4Addr::new(10, 0, 0, 2));
+        ctx.tunnel_update(&dl);
+
+        let mut mbr = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+            Gtp2MessageType::ModifyBearerRequest as u8,
+            s11_teid,
+            0x0839,
+        ));
+        let mut bc = Gtp2BearerContextIe::new();
+        bc.set_ebi(5);
+        mbr.add_bearer_context(0, &bc);
+        mme.send_to(&mbr.encode(), server.local_addr()).unwrap();
+        let rsp = recv_s11(&mme).await.expect("a Modify Bearer Response");
+        assert_eq!(
+            Gtp2CauseIe::decode(&rsp.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value)
+                .unwrap()
+                .cause,
+            gtp_cause::REQUEST_ACCEPTED
+        );
+        let modified: Vec<u8> = rsp
+            .get_ies(Gtp2IeType::BearerContext as u8)
+            .into_iter()
+            .filter(|ie| ie.instance == 0)
+            .filter_map(|ie| Gtp2BearerContextIe::decode(&ie.value).ok()?.ebi().ok())
+            .collect();
+        assert_eq!(modified, vec![5], "held, reported modified");
+        let dl = ctx.dl_tunnel_in_bearer(bearer.id).unwrap();
+        assert_eq!(
+            (dl.remote_teid, dl.remote_ip.ipv4),
+            (0x2222, Some(Ipv4Addr::new(10, 0, 0, 2))),
+            "the downlink tunnel is not pointed at TEID 0"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            sgwu.seen.lock().unwrap().iter().all(|(t, _, _)| *t != 52),
+            "no PFCP Session Modification"
+        );
+        ctx.ue_remove(ue_id);
+        server.close();
+    }
+
+    /// #839 review: an SGW-U that never answers the Session Modification (T1 x
+    /// (N1 + 1) runs out) gets the MME Remote peer not responding, the bearer
+    /// marked for removal, and the SGW-C's endpoint rolled back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_modify_bearer_the_sgwu_never_answers_is_remote_peer_not_responding() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let _sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::from_secs(60),
+        )
+        .await;
+        let server = test_server(&ambient, 1000, 1);
+        set_s11_server(server.clone());
+        let mme = client();
+        mme.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+        let (ue_id, s11_teid, _) =
+            ue_with_pgw_session(mme.local_addr().unwrap(), b"001010839000002");
+        let ctx = sgwc_self();
+        let bearer = ctx.bearer_find_by_ue_ebi(ue_id, 5).unwrap();
+        let mut dl = ctx.dl_tunnel_in_bearer(bearer.id).unwrap();
+        dl.far_id = Some(0x0839);
+        dl.remote_teid = 0x3333;
+        ctx.tunnel_update(&dl);
+
+        let mut mbr = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+            Gtp2MessageType::ModifyBearerRequest as u8,
+            s11_teid,
+            0x0840,
+        ));
+        let mut bc = Gtp2BearerContextIe::new();
+        bc.set_ebi(5);
+        bc.set_fteid(
+            0,
+            &nextgcore_gtp::v2::Gtp2FTeidIe::new_ipv4(0, 0x8805, [10, 0, 0, 8]),
+        );
+        mbr.add_bearer_context(0, &bc);
+        mme.send_to(&mbr.encode(), server.local_addr()).unwrap();
+        let rsp = recv_s11(&mme).await.expect("a Modify Bearer Response");
+        assert_eq!(
+            Gtp2CauseIe::decode(&rsp.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value)
+                .unwrap()
+                .cause,
+            gtp_cause::REMOTE_PEER_NOT_RESPONDING
+        );
+        let marked: Vec<u8> = rsp
+            .get_ies(Gtp2IeType::BearerContext as u8)
+            .into_iter()
+            .filter(|ie| ie.instance == 1)
+            .filter_map(|ie| Gtp2BearerContextIe::decode(&ie.value).ok()?.ebi().ok())
+            .collect();
+        assert_eq!(marked, vec![5]);
+        assert_eq!(
+            ctx.dl_tunnel_in_bearer(bearer.id).unwrap().remote_teid,
+            0x3333
         );
         assert_eq!(crate::sxa_response::modify_bearer_pending_count(), 0);
         ctx.ue_remove(ue_id);
@@ -4522,14 +4632,15 @@ mod tests {
     #[test]
     fn restart_counter_order_discards_a_backwards_jump() {
         assert_eq!(restart_counter_order(5, 6), RestartOrder::Restarted);
-        assert_eq!(restart_counter_order(5, 200), RestartOrder::Restarted);
+        assert_eq!(restart_counter_order(5, 132), RestartOrder::Restarted);
         assert_eq!(restart_counter_order(5, 5), RestartOrder::Unchanged);
         // The race: stored is larger than received.
         assert_eq!(restart_counter_order(5, 4), RestartOrder::Stale);
-        assert_eq!(restart_counter_order(200, 5), RestartOrder::Stale);
-        // A modulo-256 roll-over is reported Stale, per #53's criteria and the
-        // plain magnitude reading of Section 18. Documented on the function.
-        assert_eq!(restart_counter_order(255, 0), RestartOrder::Stale);
+        assert_eq!(restart_counter_order(5, 200), RestartOrder::Stale);
+        // Section 18 says "taking the integer roll-over into account" (#728):
+        // 255 -> 0 is the next incarnation, and 0 -> 255 the stale one.
+        assert_eq!(restart_counter_order(255, 0), RestartOrder::Restarted);
+        assert_eq!(restart_counter_order(0, 255), RestartOrder::Stale);
     }
 
     /// TS 29.274 Section 7.7.2: a datagram of a version higher than GTPv2 must

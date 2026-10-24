@@ -2,19 +2,27 @@
 //!
 //! Exact port of lib/core/nextgcore-conv.h and nextgcore-conv.c
 
-/// Convert hex string to bytes (identical to nextgcore_hex_from_string)
-pub fn nextgcore_hex_from_string(hex: &str) -> Option<Vec<u8>> {
-    let hex = hex.trim();
+/// Strict hex decode: `None` for an odd length or any octet that is not an
+/// ASCII hex digit (either case). No trimming and no sign or separator.
+///
+/// Works on octets, never on `str` slices, so hostile input cannot panic it:
+/// slicing `&hex[i..i + 2]` panics on an odd length or when the cut lands
+/// inside a multi-byte UTF-8 character (#765).
+pub fn hex_decode(hex: &str) -> Option<Vec<u8>> {
+    let hex = hex.as_bytes();
     if !hex.len().is_multiple_of(2) {
         return None;
     }
+    let nibble = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    hex.chunks_exact(2)
+        .map(|pair| Some((nibble(pair[0])? << 4) | nibble(pair[1])?))
+        .collect()
+}
 
-    let mut bytes = Vec::with_capacity(hex.len() / 2);
-    for i in (0..hex.len()).step_by(2) {
-        let byte = u8::from_str_radix(&hex[i..i + 2], 16).ok()?;
-        bytes.push(byte);
-    }
-    Some(bytes)
+/// Convert hex string to bytes (identical to nextgcore_hex_from_string):
+/// [`hex_decode`] after trimming surrounding whitespace.
+pub fn nextgcore_hex_from_string(hex: &str) -> Option<Vec<u8>> {
+    hex_decode(hex.trim())
 }
 
 /// Convert bytes to hex string (identical to nextgcore_hex_to_string)
@@ -105,5 +113,36 @@ impl From<u32> for NextgcoreUint24 {
 impl From<NextgcoreUint24> for u32 {
     fn from(v: NextgcoreUint24) -> Self {
         v.v
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_decode_accepts_both_cases() {
+        assert_eq!(hex_decode("00aBff"), Some(vec![0x00, 0xab, 0xff]));
+        assert_eq!(hex_decode(""), Some(vec![]));
+        assert_eq!(
+            nextgcore_hex_from_string(" 0a1B \n"),
+            Some(vec![0x0a, 0x1b])
+        );
+    }
+
+    #[test]
+    fn hex_decode_refuses_malformed_input_without_panicking() {
+        // Each of these panicked or was mis-parsed by the str-slicing decoders (#765).
+        for bad in [
+            "abc",          // odd length
+            "a\u{e9}b",     // even octet count, cut inside a multi-byte character
+            "\u{e9}\u{e9}", // non-ASCII
+            "+1",           // from_str_radix accepts a sign
+            "zz",
+            " 0a", // hex_decode does not trim
+        ] {
+            assert_eq!(hex_decode(bad), None, "{bad:?}");
+        }
+        assert_eq!(nextgcore_hex_from_string("a\u{e9}b"), None);
     }
 }
