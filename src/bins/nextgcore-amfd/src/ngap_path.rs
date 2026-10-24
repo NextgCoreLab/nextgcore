@@ -10996,7 +10996,9 @@ impl NgapServer {
 /// require both, so both are reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HandoverCompletion {
-    /// PDU sessions whose target DL tunnel the SMF accepted.
+    /// PDU sessions whose target DL tunnel the SMF accepted. For an EPS→5GS handover
+    /// (#945), the PDU sessions whose SMF was sent COMPLETED: that update runs off the
+    /// NGAP task after the Forward Relocation Complete Notification, and is not awaited.
     pub sessions_relayed: usize,
     /// `(association, source RAN-UE-NGAP-ID)` the release command was ADDRESSED to.
     ///
@@ -11731,24 +11733,12 @@ impl NgapServer {
         amf_ue_ngap_id: u64,
         in_flight: EpsHoInFlight,
     ) -> usize {
-        let mut completed = 0usize;
-        for sess in &in_flight.sessions {
-            match crate::sbi_path::call_smf_update_sm_context_ho_state(
-                &sess.smf.0,
-                sess.smf.1,
-                &sess.created.sm_context_ref,
-                "COMPLETED",
-                None,
-            )
-            .await
-            {
-                Ok(_) => completed += 1,
-                Err(e) => log::warn!(
-                    "EPS→5GS: SMF did not accept COMPLETED for PDU session {}: {e}",
-                    sess.created.pdu_session_id
-                ),
-            }
-        }
+        // #945: TS 23.502 §4.11.1.2.2.3 step 5, the Forward Relocation Complete
+        // Notification, comes BEFORE step 7, Nsmf_PDUSession_UpdateSMContext (Handover
+        // Complete). The MME needs it to release the source eNB and start its step-14
+        // indirect-forwarding timer, so it must not wait on any SMF: one slow or dead
+        // SMF+PGW-C used to delay it by up to the SBI timeout per PDN connection, while a
+        // failed COMPLETED still got an FRCN at the end.
         let seq = in_flight.server.alloc_sequence().await;
         let notification = crate::n26_eps_to_5gs::build_forward_relocation_complete_notification(
             seq,
@@ -11758,12 +11748,41 @@ impl NgapServer {
             .server
             .send_to_mme(in_flight.mme_peer, &notification)
             .await;
+        // Step 7, off the NGAP task and concurrently across sessions. Keyed per (UE, PSI),
+        // so a later exchange for the same session (a release, an activation) reaches the
+        // SMF after this one. Nothing waits on the answer: a refusal is logged.
+        for sess in &in_flight.sessions {
+            let (smf, sm_ref, psi) = (
+                sess.smf.clone(),
+                sess.created.sm_context_ref.clone(),
+                sess.created.pdu_session_id,
+            );
+            self.sbi_offload
+                .spawn_keyed((amf_ue_ngap_id, psi), move || async move {
+                    if let Err(e) = crate::sbi_path::call_smf_update_sm_context_ho_state(
+                        &smf.0,
+                        smf.1,
+                        &sm_ref,
+                        "COMPLETED",
+                        None,
+                    )
+                    .await
+                    {
+                        log::warn!(
+                            "EPS→5GS: SMF did not accept COMPLETED for PDU session {psi} of \
+                             UE {amf_ue_ngap_id}: {e}"
+                        );
+                    }
+                    None
+                });
+        }
+        let told = in_flight.sessions.len();
         log::info!(
             "EPS→5GS: UE {amf_ue_ngap_id} arrived on 5GS; Forward Relocation Complete \
-             Notification sent to MME {} (seq={seq}), {completed} SMF(s) completed",
+             Notification sent to MME {} (seq={seq}); COMPLETED sent to {told} SMF(s)",
             in_flight.mme_peer
         );
-        completed
+        told
     }
 
     /// End an EPS→5GS handover that will not complete: refuse to the MME, cancel at each
@@ -27764,6 +27783,123 @@ mod eps_to_5gs_tests {
     fn restore_guami(previous: Vec<crate::context::Guami>) {
         let ctx = crate::context::amf_self();
         ctx.write().unwrap_or_else(|e| e.into_inner()).served_guami = previous;
+    }
+
+    /// A stand-in SMF that answers every request only after `delay`, and reports
+    /// `(when it arrived, hoState)` for each.
+    async fn start_slow_smf(
+        delay: Duration,
+    ) -> (SbiServer, u16, mpsc::Receiver<(std::time::Instant, String)>) {
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = addr.port();
+        let (tx, rx) = mpsc::channel(16);
+        let server = SbiServer::on_listener(
+            SbiServerConfig::new(format!("127.0.0.1:{port}").parse().unwrap()),
+            listener,
+        );
+        server
+            .start(move |req: SbiRequest| {
+                let tx = tx.clone();
+                async move {
+                    let ho_state = req
+                        .http
+                        .content
+                        .as_deref()
+                        .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+                        .and_then(|v| v["hoState"].as_str().map(str::to_string))
+                        .unwrap_or_default();
+                    let _ = tx.send((std::time::Instant::now(), ho_state.clone())).await;
+                    tokio::time::sleep(delay).await;
+                    SbiResponse::with_status(200).with_body(
+                        serde_json::json!({ "hoState": ho_state }).to_string(),
+                        "application/json",
+                    )
+                }
+            })
+            .await
+            .expect("SMF stand-in");
+        (server, port, rx)
+    }
+
+    fn ho_session(smf: (&str, u16), psi: u8, sm_ref: &str) -> crate::n26_path::EpsHoSession {
+        crate::n26_path::EpsHoSession {
+            smf: (smf.0.to_string(), smf.1),
+            linked_ebi: psi,
+            apn_ambr_kbps: None,
+            created: crate::sbi_path::EpsHandoverCreated {
+                sm_context_ref: sm_ref.to_string(),
+                pdu_session_id: psi,
+                allocated_ebis: vec![psi],
+                ..Default::default()
+            },
+        }
+    }
+
+    /// #945, TS 23.502 §4.11.1.2.2.3: step 5, the Forward Relocation Complete
+    /// Notification, goes to the MME before step 7, and nothing waits on an SMF. One
+    /// session's SMF is blackholed (192.0.2.1, no answer at all), another's answers its
+    /// COMPLETED only after 2 s. Before #945 the FRCN went out only after both, at least
+    /// the 5 s connect timeout later, with the NGAP task held the whole time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_forward_relocation_complete_notification_does_not_wait_for_the_smfs() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (_smf, smf_port, mut smf_rx) = start_slow_smf(Duration::from_secs(2)).await;
+        let n26 = crate::n26_path::N26Server::open("127.0.0.1:0".parse().unwrap(), 1)
+            .await
+            .expect("N26 socket");
+        let mme = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut ngap = NgapServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            SctpBackend::Userspace,
+            mpsc::channel(64).0,
+        )
+        .await
+        .unwrap();
+        const UE: u64 = 945_001;
+        let in_flight = EpsHoInFlight {
+            server: n26,
+            seq: 945,
+            mme_peer: mme.local_addr().unwrap(),
+            mme_teid: MME_TEID,
+            sessions: vec![
+                ho_session(("192.0.2.1", 7777), 5, "945-dead"),
+                ho_session(("127.0.0.1", smf_port), 6, "945-slow"),
+            ],
+            answered: true,
+        };
+
+        let started = std::time::Instant::now();
+        let told = ngap.finish_eps_to_5gs_handover(UE, in_flight).await;
+        let returned = started.elapsed();
+        let complete = recv_gtp(&mme).await;
+        let frcn_at = std::time::Instant::now();
+        assert_eq!(
+            complete.header.message_type, 135,
+            "Forward Relocation Complete Notification"
+        );
+        assert_eq!(complete.header.teid, Some(MME_TEID));
+        assert!(
+            returned < Duration::from_millis(500),
+            "the NGAP task waited {returned:?} on the SMFs"
+        );
+        assert_eq!(told, 2, "both SMFs are told COMPLETED");
+
+        // Step 7 still happens, after step 5, and concurrently: the slow SMF is asked
+        // although the other SMF has not answered (and never will).
+        let (asked_at, ho_state) = tokio::time::timeout(Duration::from_secs(3), smf_rx.recv())
+            .await
+            .expect("the slow SMF must be told COMPLETED")
+            .unwrap();
+        assert_eq!(ho_state, "COMPLETED");
+        assert!(
+            frcn_at < asked_at + Duration::from_secs(2),
+            "the FRCN arrived only after the slow SMF answered"
+        );
+        assert!(
+            asked_at.duration_since(started) < Duration::from_secs(2),
+            "COMPLETED for one session waited on another session's SMF"
+        );
+        ngap.sbi_offload.cancel_ue(UE);
     }
 
     /// **#418 criterion 7**, and every other criterion on the way: a real type-133
