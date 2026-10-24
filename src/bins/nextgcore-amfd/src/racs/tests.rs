@@ -390,6 +390,192 @@ fn a_new_version_id_retires_the_old_ones_and_purges_the_cache() {
     assert!(!is_retired(&newer));
 }
 
+/// A distinct PLMN-assigned ID under Version ID `version` for each `n`.
+fn nth_id(version: u8, n: u32) -> Vec<u8> {
+    let mut id = vec![0x01, version, 0x00];
+    id.extend_from_slice(&n.to_be_bytes());
+    id
+}
+
+/// #747: the retired-ID set is bounded however many unknown IDs are presented,
+/// and evicts the oldest first.
+#[test]
+fn the_retired_set_is_bounded_and_evicts_the_oldest() {
+    let _g = guard();
+    let over = DELETED_CAPACITY_FOR_TESTS + 100;
+    for n in 0..over as u32 {
+        with_cache(|c| c.retire(&nth_id(0x05, n)));
+    }
+    assert_eq!(deleted_len(), DELETED_CAPACITY_FOR_TESTS);
+    assert!(!is_known_deleted(&nth_id(0x05, 0)), "the oldest is evicted");
+    assert!(!is_known_deleted(&nth_id(0x05, 99)));
+    assert!(is_known_deleted(&nth_id(0x05, 100)));
+    assert!(is_known_deleted(&nth_id(0x05, over as u32 - 1)));
+    // Retiring an ID already held moves nothing.
+    with_cache(|c| c.retire(&nth_id(0x05, over as u32 - 1)));
+    assert!(is_known_deleted(&nth_id(0x05, 100)));
+    // A notification's deletions go through the same bound.
+    let ids: Vec<String> = (0..10u32)
+        .map(|n| to_nucmf(&nth_id(0x07, n)).unwrap())
+        .collect();
+    apply_notification(&serde_json::json!({
+        "eventType": "DELETION_OF_PLMN_ASSIGNED_IDS",
+        "manAssOpRequestlist": { "plmnAssiUeRadioCapId": ids },
+    }));
+    assert_eq!(deleted_len(), DELETED_CAPACITY_FOR_TESTS);
+    assert!(is_known_deleted(&nth_id(0x07, 9)));
+}
+
+/// #747: a new Version ID drops the retired entries under older ones, which
+/// `is_retired` now covers by the Version ID alone.
+#[test]
+fn a_new_version_id_drops_the_retired_entries_it_covers() {
+    let _g = guard();
+    with_cache(|c| {
+        c.retire(&nth_id(0x05, 1));
+        c.retire(&nth_id(0x06, 2));
+        // Manufacturer-assigned: no Version ID, so kept.
+        c.retire(&[0x00, 0x00, 0x70, 0xDE, 0x09, 0x00, 0x00, 0x00, 0xA0, 0xCB]);
+    });
+    apply_notification(&serde_json::json!({
+        "eventType": "NEW_VERSION_ID_OF_PLMN_ASSIGNED_IDs",
+        "versionId": 6,
+    }));
+    assert_eq!(deleted_len(), 2);
+    assert!(!is_known_deleted(&nth_id(0x05, 1)));
+    assert!(
+        is_retired(&nth_id(0x05, 1)),
+        "still retired, by its Version ID"
+    );
+    assert!(is_known_deleted(&nth_id(0x06, 2)));
+    // The FIFO order follows the set, so a later eviction cannot resurrect a
+    // dropped entry or skip a live one.
+    assert_eq!(with_cache(|c| c.deleted_order.len()), 2);
+}
+
+/// #925 review MINOR 1: the two sources of a negative are bounded separately, so
+/// a flood of 404s on random IDs cannot evict the UCMF's genuine deletions — and
+/// those are what make a UE holding a deleted ID get the deletion indication.
+#[test]
+fn a_flood_of_404s_cannot_evict_a_notified_deletion() {
+    let _g = guard();
+    reset_for_tests();
+    let notified = nth_id(0x05, 1);
+    apply_notification(&serde_json::json!({
+        "eventType": "DELETION_OF_PLMN_ASSIGNED_IDS",
+        "manAssOpRequestlist": { "plmnAssiUeRadioCapId": [to_nucmf(&notified).unwrap()] },
+    }));
+    assert!(is_retired(&notified));
+
+    // Far more manufacturer-assigned 404s than either bound.
+    for n in 0..(UNRESOLVED_CAPACITY_FOR_TESTS + 500) as u32 {
+        let mut id = nth_id(0x05, n);
+        id[0] = 0x00; // Type Field 0: manufacturer-assigned (TS 23.003 §29.2)
+        note_unresolved_for_tests(&id);
+    }
+
+    assert_eq!(unresolved_len(), UNRESOLVED_CAPACITY_FOR_TESTS);
+    assert!(
+        is_retired(&notified),
+        "the notified deletion survives the flood"
+    );
+    assert_eq!(deleted_len(), 1, "and the retired set holds only it");
+}
+
+/// A manufacturer-assigned ID's 404 is a negative CACHE, not a retirement: the UE
+/// is not told to delete an ID the UCMF may yet be provisioned with
+/// (TS 29.675, TS 23.501 §5.4.4.1a NOTE 3).
+#[test]
+fn a_manufacturer_ids_404_retires_nothing() {
+    let _g = guard();
+    reset_for_tests();
+    let mut man = nth_id(0x05, 7);
+    man[0] = 0x00; // Type Field 0: manufacturer-assigned
+    note_unresolved_for_tests(&man);
+
+    assert!(
+        is_known_deleted(&man),
+        "it is not asked about again for now"
+    );
+    assert!(!is_retired(&man), "but nothing is told to delete it");
+    assert_eq!(deleted_len(), 0);
+
+    expire_unresolved_for_tests();
+    assert!(!is_known_deleted(&man), "and the negative expires");
+}
+
+/// A cached mapping clears a stale negative (a Resolve that later succeeds).
+#[test]
+fn caching_a_mapping_clears_its_negative() {
+    let _g = guard();
+    reset_for_tests();
+    let mut man = nth_id(0x05, 8);
+    man[0] = 0x00;
+    note_unresolved_for_tests(&man);
+    assert!(is_known_deleted(&man));
+
+    cache_put(&man, &[0x01, 0x02]);
+
+    assert!(!is_known_deleted(&man));
+    assert_eq!(unresolved_len(), 0);
+}
+
+/// #925 re-review MINOR B: a creation notice that names no ID says only that
+/// the dictionary changed, so every negative may now be wrong and all of them
+/// go. A mixed list takes the same cautious reading. Authoritative deletions
+/// are never cleared this way.
+#[test]
+fn a_creation_notice_that_names_no_id_clears_every_negative() {
+    let _g = guard();
+    reset_for_tests();
+    let mut man = nth_id(0x05, 11);
+    man[0] = 0x00;
+    let mut other = nth_id(0x05, 12);
+    other[0] = 0x00;
+    let deleted_by_the_ucmf = nth_id(0x05, 13);
+    note_unresolved_for_tests(&man);
+    note_unresolved_for_tests(&other);
+    apply_notification(&serde_json::json!({
+        "eventType": "DELETION_OF_PLMN_ASSIGNED_IDS",
+        "manAssOpRequestlist": {
+            "plmnAssiUeRadioCapId": [to_nucmf(&deleted_by_the_ucmf).unwrap()],
+        },
+    }));
+
+    // No `newDicEntries` at all.
+    apply_notification(&serde_json::json!({ "eventType": "CREATION_OF_DICTIONARY_ENTRY" }));
+
+    assert_eq!(unresolved_len(), 0, "every negative is cleared");
+    assert!(
+        is_retired(&deleted_by_the_ucmf),
+        "the UCMF's own deletion is NOT cleared by a creation notice"
+    );
+
+    // An entry that names only a typeAllocationCode has the same effect, even
+    // beside one that does name an ID.
+    note_unresolved_for_tests(&man);
+    note_unresolved_for_tests(&other);
+    apply_notification(&serde_json::json!({
+        "eventType": "CREATION_OF_DICTIONARY_ENTRY",
+        "newDicEntries": [
+            { "manAssiUeRadioCapId": to_nucmf(&man).unwrap() },
+            { "typeAllocationCode": "12345678" },
+        ],
+    }));
+    assert_eq!(unresolved_len(), 0, "a mixed list clears all");
+    assert!(is_retired(&deleted_by_the_ucmf));
+
+    // A list where EVERY entry names an ID clears only those.
+    note_unresolved_for_tests(&man);
+    note_unresolved_for_tests(&other);
+    apply_notification(&serde_json::json!({
+        "eventType": "CREATION_OF_DICTIONARY_ENTRY",
+        "newDicEntries": [{ "manAssiUeRadioCapId": to_nucmf(&man).unwrap() }],
+    }));
+    assert!(!is_known_deleted(&man), "the named ID is cleared");
+    assert!(is_known_deleted(&other), "and only it");
+}
+
 /// #748: a deletion keyed on TACs (TS 29.673 `ManAssOpRequestlist.typeAllocationCode`)
 /// retires every PLMN-assigned ID cached under them, and only those, and asks
 /// the NGAP task for a re-assignment naming the TACs.

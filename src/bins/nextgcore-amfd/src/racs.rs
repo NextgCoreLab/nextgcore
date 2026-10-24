@@ -61,6 +61,31 @@ const CONTENT_NGAP: &str = "application/vnd.3gpp.ngap";
 /// Bound of the AMF's ID → capability cache. The UCMF is the authority; the cache
 /// only saves a round trip per mapping request, so a modest bound is enough.
 const CACHE_CAPACITY: usize = 1024;
+/// Bound of the set of RETIRED IDs (#747): the UCMF's deletion notifications and
+/// the authoritative 404s (see [`retire`](Cache::retire)). A FIFO rather than
+/// unbounded. Four times the cache: a UE can still hold an ID the cache has long
+/// forgotten, and the entry is what tells it to delete it.
+const DELETED_CAPACITY: usize = 4 * CACHE_CAPACITY;
+
+/// Bound of the set of UNRESOLVED IDs: manufacturer-assigned IDs a Resolve
+/// answered 404 for (#925 review MINOR 1).
+///
+/// Its own FIFO, separate from the retired set, because its entries are driven
+/// by whatever IDs a gNB presents: sharing one FIFO let a flood of random IDs
+/// evict every genuine deletion, and those are what make a UE holding a deleted
+/// ID get the deletion indication.
+const UNRESOLVED_CAPACITY: usize = CACHE_CAPACITY;
+
+/// How long a manufacturer-assigned ID's 404 suppresses another Resolve (#925
+/// review MAJOR 1).
+///
+/// A manufacturer-assigned entry can be provisioned at the UCMF at any time
+/// (TS 29.675 Nucmf_Provisioning), and TS 23.501 §5.4.4.1a NOTE 3 has the AMF
+/// ask the UCMF again when a UE presents such an ID. So its 404 is a negative
+/// CACHE, not a retirement: it saves the round trips of a gNB retrying within
+/// the minute, and expires. A `CREATION_OF_DICTIONARY_ENTRY` notification
+/// clears it at once.
+const UNRESOLVED_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // ID forms
@@ -138,8 +163,20 @@ struct Cache {
     /// ID change: a UE still holding one gets the deletion indication, and the ID is
     /// no longer put in NGAP.
     deleted: HashSet<Vec<u8>>,
+    /// Insertion order of `deleted`, for its FIFO bound (#747).
+    deleted_order: VecDeque<Vec<u8>>,
+    /// Manufacturer-assigned IDs a Resolve answered 404 for, with when, so the
+    /// negative expires after [`UNRESOLVED_TTL`] (#925 review MAJOR 1).
+    unresolved: HashMap<Vec<u8>, std::time::Instant>,
+    /// Insertion order of `unresolved`, for its own FIFO bound.
+    unresolved_order: VecDeque<Vec<u8>>,
     /// The UCMF's current Version ID, when a NEW_VERSION_ID notification told us.
     current_version: Option<u8>,
+    /// Bumped by every `CREATION_OF_DICTIONARY_ENTRY` (#925 re-review MINOR C).
+    /// A Resolve reads it before it asks and passes it back when it records a
+    /// 404; a 404 whose epoch is stale is dropped, because a creation notice has
+    /// since said the dictionary changed.
+    creation_epoch: u64,
     /// #748: the Type Allocation Code each cached ID is assigned under (TS 29.673
     /// `DicEntryData.typeAllocationCode`), so a deletion keyed on TACs finds them.
     tacs: HashMap<Vec<u8>, String>,
@@ -174,7 +211,10 @@ pub fn cache_put(id: &[u8], capability: &[u8]) {
                 }
             }
         }
-        c.deleted.remove(id);
+        if c.deleted.remove(id) {
+            c.deleted_order.retain(|o| o != id);
+        }
+        c.clear_unresolved(id);
     });
 }
 
@@ -194,7 +234,7 @@ pub fn retire(id: &[u8]) {
         c.entries.remove(id);
         c.order.retain(|o| o != id);
         c.tacs.remove(id);
-        c.deleted.insert(id.to_vec());
+        c.retire(id);
     });
 }
 
@@ -204,6 +244,123 @@ pub fn retire(id: &[u8]) {
 pub fn take_reassignment() -> Option<Vec<String>> {
     with_cache(|c| c.reassignment.take())
 }
+
+/// #748: ask the NGAP task to look for UEs needing a new ID again (an Assign
+/// answered with an ID a later notification has already retired).
+pub fn request_reassignment() {
+    with_cache(|c| {
+        c.reassignment.get_or_insert_with(Vec::new);
+    });
+}
+
+impl Cache {
+    /// Record that the UCMF has no entry for the manufacturer-assigned `id`
+    /// right now (#925 review MAJOR 1): a bounded negative cache entry that
+    /// expires after [`UNRESOLVED_TTL`], NOT a retirement — nothing is told to
+    /// delete the ID, and the next Resolve past the TTL asks again.
+    fn note_unresolved(&mut self, id: &[u8]) {
+        if self
+            .unresolved
+            .insert(id.to_vec(), std::time::Instant::now())
+            .is_none()
+        {
+            self.unresolved_order.push_back(id.to_vec());
+            while self.unresolved_order.len() > UNRESOLVED_CAPACITY {
+                if let Some(old) = self.unresolved_order.pop_front() {
+                    self.unresolved.remove(&old);
+                }
+            }
+        }
+    }
+
+    /// Drop `id`'s negative-cache entry, if any.
+    fn clear_unresolved(&mut self, id: &[u8]) {
+        if self.unresolved.remove(id).is_some() {
+            self.unresolved_order.retain(|o| o != id);
+        }
+    }
+
+    /// Whether `id`'s 404 is still within [`UNRESOLVED_TTL`].
+    fn unresolved_recently(&self, id: &[u8]) -> bool {
+        self.unresolved
+            .get(id)
+            .is_some_and(|at| at.elapsed() < UNRESOLVED_TTL)
+    }
+
+    /// Retire `id`, evicting the oldest retired ID past [`DELETED_CAPACITY`] (#747).
+    fn retire(&mut self, id: &[u8]) {
+        if self.deleted.insert(id.to_vec()) {
+            self.deleted_order.push_back(id.to_vec());
+            while self.deleted_order.len() > DELETED_CAPACITY {
+                if let Some(old) = self.deleted_order.pop_front() {
+                    self.deleted.remove(&old);
+                }
+            }
+        }
+    }
+}
+
+/// Whether asking the UCMF about `id` again is pointless right now: it is
+/// recorded deleted (a UCMF notification, or an authoritative 404 for a
+/// PLMN-assigned ID), or a manufacturer-assigned ID whose 404 is still within
+/// [`UNRESOLVED_TTL`].
+///
+/// Unlike [`is_retired`], an ID under an old Version ID is not included: the UCMF
+/// may still map it until it purges.
+///
+/// #925 review MAJOR 1: the manufacturer-assigned half is deliberately a
+/// time-bounded negative cache. A permanent one meant an ID presented before the
+/// UCMF was provisioned was never looked up again, so RACS stayed dead for that
+/// model.
+pub fn is_known_deleted(id: &[u8]) -> bool {
+    with_cache(|c| c.deleted.contains(id) || c.unresolved_recently(id))
+}
+
+/// Test seam: age every negative-cache entry by [`UNRESOLVED_TTL`], so a test can
+/// show the expiry without sleeping.
+#[cfg(test)]
+pub(crate) fn expire_unresolved_for_tests() {
+    with_cache(|c| {
+        let then = std::time::Instant::now() - UNRESOLVED_TTL - std::time::Duration::from_secs(1);
+        for at in c.unresolved.values_mut() {
+            *at = then;
+        }
+    });
+}
+
+/// The dictionary generation: bumped by every `CREATION_OF_DICTIONARY_ENTRY`
+/// (#925 re-review MINOR C). Read it before asking the UCMF and pass it to
+/// [`ucmf_resolve_at`], so a 404 that crosses a creation notice is dropped
+/// instead of undoing it.
+pub fn creation_epoch() -> u64 {
+    with_cache(|c| c.creation_epoch)
+}
+
+/// Test seam: record a 404 negative for `id` without a UCMF.
+#[cfg(test)]
+pub(crate) fn note_unresolved_for_tests(id: &[u8]) {
+    with_cache(|c| c.note_unresolved(id));
+}
+
+/// How many 404 negatives are held, for tests.
+#[cfg(test)]
+pub(crate) fn unresolved_len() -> usize {
+    with_cache(|c| c.unresolved.len())
+}
+
+/// The bound of the negative cache, for tests.
+#[cfg(test)]
+pub(crate) const UNRESOLVED_CAPACITY_FOR_TESTS: usize = UNRESOLVED_CAPACITY;
+
+/// How many retired IDs are held (#747: bounded by [`DELETED_CAPACITY`]).
+#[cfg(test)]
+pub(crate) fn deleted_len() -> usize {
+    with_cache(|c| c.deleted.len())
+}
+
+/// The bound of the retired-ID set, for tests.
+#[cfg(test)]
+pub(crate) const DELETED_CAPACITY_FOR_TESTS: usize = DELETED_CAPACITY;
 
 /// Whether the AMF must no longer use `id` (deleted at the UCMF, or a PLMN-assigned
 /// ID under a Version ID other than the current one).
@@ -215,6 +372,21 @@ pub fn is_retired(id: &[u8]) -> bool {
                 (Some(current), Some(v)) if v != current
             )
     })
+}
+
+/// The UE radio capability ID a `newDicEntries` entry names, if it names one
+/// (TS 29.673 `DicEntryData`: `plmnAssiUeRadioCapId` or `manAssiUeRadioCapId`;
+/// an entry may instead carry only a `typeAllocationCode`).
+fn created_entry_id(entry: &serde_json::Value) -> Option<Vec<u8>> {
+    entry
+        .as_str()
+        .or_else(|| {
+            entry
+                .get("plmnAssiUeRadioCapId")
+                .or_else(|| entry.get("manAssiUeRadioCapId"))
+                .and_then(|x| x.as_str())
+        })
+        .and_then(from_nucmf)
 }
 
 /// Apply a UCMF notification (TS 29.673 §5.2.2.4, `UcmfNotification`).
@@ -254,7 +426,7 @@ pub fn apply_notification(body: &serde_json::Value) -> Vec<Vec<u8>> {
                     c.entries.remove(id);
                     c.order.retain(|o| o != id);
                     c.tacs.remove(id);
-                    c.deleted.insert(id.clone());
+                    c.retire(id);
                 }
                 c.reassignment.get_or_insert_with(Vec::new).extend(tacs);
             });
@@ -281,10 +453,54 @@ pub fn apply_notification(body: &serde_json::Value) -> Vec<Vec<u8>> {
                 }
                 // #748: every UE holding an ID of another Version ID needs a new one.
                 c.reassignment.get_or_insert_with(Vec::new);
+                // #747: a retired ID under an older Version ID needs no entry of its
+                // own any more: `is_retired` retires the whole Version ID.
+                c.deleted.retain(|id| version_id(id).is_none_or(|x| x == v));
+                let deleted = &c.deleted;
+                c.deleted_order.retain(|id| deleted.contains(id));
                 stale
             })
         }
-        // A new entry needs no action: the next Resolve finds it.
+        // #925 review MAJOR 1: a creation notice must undo the negatives it
+        // contradicts, or the Mapping path's short-circuit outlives the reason
+        // for it. The IDs it names are cleared; a notice that names none clears
+        // every 404 negative, since any of them may be what was provisioned.
+        "CREATION_OF_DICTIONARY_ENTRY" => {
+            let entries = body
+                .pointer("/newDicEntries")
+                .and_then(|l| l.as_array())
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let created: Vec<Vec<u8>> = entries.iter().filter_map(created_entry_id).collect();
+            // #925 re-review MINOR B: the rule, stated once. An entry that names
+            // an ID clears exactly that ID. An entry that names NONE — the
+            // `DicEntryData` shape that carries only a `typeAllocationCode`, and a
+            // notification with no `newDicEntries` at all — says only "something
+            // was created", so every negative may now be wrong and all of them
+            // go. Mixed lists take the cautious reading: one unnamed entry clears
+            // all. Only `unresolved` is cleared that way, so authoritative
+            // deletions are untouched, and the re-asks are gNB-driven and capped
+            // at 16 Resolves in flight.
+            let names_everything = !entries.is_empty() && created.len() == entries.len();
+            with_cache(|c| {
+                if !names_everything {
+                    c.unresolved.clear();
+                    c.unresolved_order.clear();
+                }
+                for id in &created {
+                    c.clear_unresolved(id);
+                    if c.deleted.remove(id) {
+                        c.deleted_order.retain(|o| o != id);
+                    }
+                }
+                // #925 re-review MINOR C: a Resolve that started before this
+                // notification and answers 404 after it must not re-add what the
+                // notification just cleared.
+                c.creation_epoch = c.creation_epoch.wrapping_add(1);
+            });
+            // Nothing was RETIRED by this notification.
+            Vec::new()
+        }
         _ => Vec::new(),
     }
 }
@@ -606,6 +822,15 @@ fn capability_5gs_part(response: &nextgcore_sbi::message::SbiResponse) -> Option
 /// `Ok(None)` when the UCMF has no entry (404 `NO_DICTIONARY_ENTRY_FOUND` or
 /// `OUT_DATED_VERSION_ID_IN_RAC_ID`), which retires the ID locally.
 pub async fn ucmf_resolve(id: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    ucmf_resolve_at(id, creation_epoch()).await
+}
+
+/// [`ucmf_resolve`] for a caller that read the dictionary generation earlier —
+/// the NGAP task reads it when it decides to ask, before the lookup is even
+/// spawned, so the "did a creation notice arrive while this ran?" test covers
+/// the whole life of the request rather than starting when the task happens to
+/// be polled.
+pub async fn ucmf_resolve_at(id: &[u8], asked_at: u64) -> Result<Option<Vec<u8>>, String> {
     let nucmf = to_nucmf(id).ok_or("an empty or over-long UE radio capability ID")?;
     let member = if is_plmn_assigned(id) {
         "plmnAssiUeRadioCapId"
@@ -641,8 +866,25 @@ pub async fn ucmf_resolve(id: &[u8]) -> Result<Option<Vec<u8>>, String> {
             Ok(Some(cap))
         }
         404 => {
+            // #925 review: a PLMN-assigned ID is assigned by THIS PLMN's UCMF, so
+            // "no entry" is authoritative and retires it — a UE still holding it
+            // gets the deletion indication. A manufacturer-assigned one may be
+            // provisioned later (TS 29.675), so its 404 is only a bounded,
+            // expiring negative: it suppresses re-asking, and retires nothing.
             with_cache(|c| {
-                c.deleted.insert(id.to_vec());
+                if c.creation_epoch != asked_at {
+                    log::info!(
+                        "Resolve of UE radio capability ID {id:02x?} answered 404, but a \
+                         dictionary-creation notification arrived while it ran; the ID is \
+                         left resolvable"
+                    );
+                    return;
+                }
+                if is_plmn_assigned(id) {
+                    c.retire(id);
+                } else {
+                    c.note_unresolved(id);
+                }
             });
             Ok(None)
         }

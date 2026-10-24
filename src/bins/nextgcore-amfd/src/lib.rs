@@ -64,7 +64,8 @@ pub mod test_support {
     pub static SMF_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Serialises tests that set the UCMF endpoint environment variables
-    /// (`UCMF_SBI_ADDR` / `UCMF_SBI_PORT`, #748), beside [`SMF_ENV_LOCK`].
+    /// (`UCMF_SBI_ADDR` / `UCMF_SBI_PORT`), for the same reason as
+    /// [`SMF_ENV_LOCK`].
     pub static UCMF_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Initialize the process-global AMF context for in-process strict-peer

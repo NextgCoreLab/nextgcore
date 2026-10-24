@@ -1017,3 +1017,289 @@ fn a_ue_ambr_change_during_a_service_request_setup_is_deferred() {
     ctx.enb_ue_remove(new_enb_ue);
     release(&ue);
 }
+
+/// A second PDN connection for `ue`, its default bearer `ebi` active at the
+/// Serving GW and (until an S1 release) at the eNB. Returns the session id.
+fn add_pdn(ue: &Ue, ebi: u8) -> u64 {
+    let ctx = mme_self();
+    let sess_id = ctx.sess_add(ue.mme_ue_id, 10);
+    let bearer_id = ctx.bearer_add(sess_id, ue.mme_ue_id);
+    {
+        let mut pool = ctx.bearer_pool.write().unwrap();
+        let b = pool.get_mut(&bearer_id).unwrap();
+        b.ebi = ebi;
+        b.qos.qci = 9;
+        b.sgw_s1u_teid = SGW_S1U_TEID + u32::from(ebi);
+        b.sgw_s1u_ip.ipv4 = Some([10, 0, 0, 2]);
+    }
+    ctx.sess_pool
+        .write()
+        .unwrap()
+        .get_mut(&sess_id)
+        .unwrap()
+        .bearer_list
+        .push(bearer_id);
+    ctx.mme_ue_pool
+        .write()
+        .unwrap()
+        .get_mut(&ue.mme_ue_id)
+        .unwrap()
+        .sess_list
+        .push(sess_id);
+    sess_id
+}
+
+/// A Delete Bearer Request for the PDN connection `lbi`, cause reactivation
+/// requested.
+fn dbr_reactivation(teid: u32, lbi: u8, seq: u32) -> Vec<u8> {
+    let mut m = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(99, teid, seq));
+    m.add_ie(nextgcore_gtp::v2::Gtp2Ie::from_slice(
+        Gtp2IeType::Ebi as u8,
+        0,
+        &[lbi],
+    ));
+    m.add_ie(nextgcore_gtp::v2::Gtp2Ie::from_slice(
+        Gtp2IeType::Cause as u8,
+        0,
+        &[crate::s11_handler::GTP_CAUSE_REACTIVATION_REQUESTED, 0],
+    ));
+    m.encode().to_vec()
+}
+
+fn is_erab_release_command(pdu: &g::S1AP_PDU) -> Option<()> {
+    matches!(
+        pdu,
+        g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+            value: g::InitiatingMessageValue::Id_E_RABRelease(_),
+            ..
+        })
+    )
+    .then_some(())
+}
+
+/// (cause, EBI of the Linked EBI) of a Delete Bearer Response.
+fn delete_bearer_response(sgw: &UdpSocket) -> (u8, u32) {
+    let (rsp, _) = recv(sgw, 100);
+    let cause = Gtp2CauseIe::decode(&rsp.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value)
+        .unwrap()
+        .cause;
+    (cause, rsp.header.sequence_number)
+}
+
+/// #862, TS 23.401 §5.4.4.1 step 4b: a PDN GW initiated deactivation with cause
+/// reactivation requested for an ECM-IDLE UE pages it; once the UE is
+/// ECM-CONNECTED (SERVICE REQUEST, Initial Context Setup), steps 4c-8 run: the
+/// E-RAB RELEASE COMMAND with the DEACTIVATE EPS BEARER CONTEXT REQUEST, and the
+/// Delete Bearer Response only after the UE accepts.
+#[test]
+fn a_reactivation_deactivation_for_an_idle_ue_pages_then_signals() {
+    let _guard = lock_s11();
+    crate::bearer_deactivation::clear_for_test();
+    let (sgw, _route) = sgw(Gtp2XactConfig::default());
+    let ue = seed(0x0862, &[5]);
+    let _sess6 = add_pdn(&ue, 6);
+    let ctx = mme_self();
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    let complete = release_to_command(&ue, &sgw);
+    crate::s1ap_handler::handle_ue_context_release_complete(ctx, ue.enb_id, &complete);
+    let _ = crate::s1ap_path::take_tapped_for_test(ue.enb_id);
+
+    let peer = sgw.local_addr().unwrap();
+    crate::s11_handler::dispatch_initial(
+        &dbr_reactivation(ue.local_teid, 6, 0x862),
+        99,
+        0x862,
+        peer,
+    );
+    wait_pdu(ue.enb_id, is_paging);
+    assert_eq!(crate::bearer_deactivation::pending_count(), 1, "parked");
+    sgw.set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    let mut buf = [0u8; 4096];
+    assert!(
+        sgw.recv_from(&mut buf).is_err(),
+        "the Delete Bearer Response waits for the UE"
+    );
+    sgw.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+
+    // The UE answers the paging.
+    let new_enb_ue = ctx.enb_ue_add(ue.enb_id, 8620);
+    ctx.enb_ue_associate_mme_ue(new_enb_ue, ue.mme_ue_id);
+    crate::nas_dispatch::nas_eps_handle_uplink(
+        ctx,
+        crate::nas_dispatch::UplinkNas {
+            enb_ue_id: new_enb_ue,
+            nas_pdu: &service_request(1, 1),
+            s_tmsi: None,
+        },
+    );
+    let (erabs, _, _) = wait_pdu(ue.enb_id, ics);
+    assert_eq!(erabs, vec![5, 6]);
+    let new = ctx.enb_ue_find_by_id(new_enb_ue).unwrap();
+    crate::s1ap_handler::handle_initial_context_setup_response(
+        ctx,
+        ue.enb_id,
+        &nextgcore_s1ap::InitialContextSetupResponse {
+            mme_ue_s1ap_id: new.mme_ue_s1ap_id,
+            enb_ue_s1ap_id: new.enb_ue_s1ap_id,
+            erab_setup_list: [5u8, 6]
+                .iter()
+                .map(|e| nextgcore_s1ap::ErabSetupItem {
+                    erab_id: *e,
+                    transport_layer_address: vec![10, 0, 0, 9],
+                    gtp_teid: 0x9900 + u32::from(*e),
+                })
+                .collect(),
+            erab_failed_list: vec![],
+        },
+    );
+    wait_pdu(ue.enb_id, is_erab_release_command);
+    let _ = recv(&sgw, 34);
+    assert!(crate::bearer_deactivation::on_accept(ctx, ue.mme_ue_id, 6));
+    assert_eq!(delete_bearer_response(&sgw), (16, 0x862));
+    assert!(ctx.bearer_find_by_ebi(ue.mme_ue_id, 6).is_none());
+    assert!(ctx.bearer_find_by_ebi(ue.mme_ue_id, 5).is_some());
+    ctx.enb_ue_remove(new_enb_ue);
+    release(&ue);
+}
+
+/// #984 review: a UE that answers the DeleteBearer paging with an
+/// integrity-protected TAU (TS 24.301 §5.6.2.2.1) gets its user plane with the
+/// TAU ACCEPT, and the parked deactivation runs on the ICS response.
+#[test]
+fn a_tau_answering_a_deactivation_paging_runs_the_deactivation() {
+    let _guard = lock_s11();
+    crate::bearer_deactivation::clear_for_test();
+    let (sgw, _route) = sgw(Gtp2XactConfig::default());
+    let ue = seed(0x0984, &[5]);
+    let _sess6 = add_pdn(&ue, 6);
+    let ctx = mme_self();
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    let complete = release_to_command(&ue, &sgw);
+    crate::s1ap_handler::handle_ue_context_release_complete(ctx, ue.enb_id, &complete);
+    let peer = sgw.local_addr().unwrap();
+    crate::s11_handler::dispatch_initial(
+        &dbr_reactivation(ue.local_teid, 6, 0x984),
+        99,
+        0x984,
+        peer,
+    );
+    wait_pdu(ue.enb_id, is_paging);
+
+    let new_enb_ue = ctx.enb_ue_add(ue.enb_id, 9840);
+    ctx.enb_ue_associate_mme_ue(new_enb_ue, ue.mme_ue_id);
+    if let Some(e) = ctx.enb_ue_pool.write().unwrap().get_mut(&new_enb_ue) {
+        e.saved.tai = ue.tai.clone();
+    }
+    crate::nas_dispatch::nas_eps_handle_uplink(
+        ctx,
+        crate::nas_dispatch::UplinkNas {
+            enb_ue_id: new_enb_ue,
+            nas_pdu: &tau_request(0, 0),
+            s_tmsi: None,
+        },
+    );
+    let (erabs, _, nas) = wait_pdu(ue.enb_id, ics);
+    assert!(nas, "the TAU ACCEPT in an Initial Context Setup");
+    assert_eq!(erabs, vec![5, 6]);
+    let new = ctx.enb_ue_find_by_id(new_enb_ue).unwrap();
+    crate::s1ap_handler::handle_initial_context_setup_response(
+        ctx,
+        ue.enb_id,
+        &nextgcore_s1ap::InitialContextSetupResponse {
+            mme_ue_s1ap_id: new.mme_ue_s1ap_id,
+            enb_ue_s1ap_id: new.enb_ue_s1ap_id,
+            erab_setup_list: [5u8, 6]
+                .iter()
+                .map(|e| nextgcore_s1ap::ErabSetupItem {
+                    erab_id: *e,
+                    transport_layer_address: vec![10, 0, 0, 9],
+                    gtp_teid: 0x9900 + u32::from(*e),
+                })
+                .collect(),
+            erab_failed_list: vec![],
+        },
+    );
+    wait_pdu(ue.enb_id, is_erab_release_command);
+    assert!(crate::bearer_deactivation::on_accept(ctx, ue.mme_ue_id, 6));
+    assert_eq!(delete_bearer_response(&sgw), (16, 0x984));
+    ctx.enb_ue_remove(new_enb_ue);
+    release(&ue);
+}
+
+/// #862: when the paging fails, the parked deactivation completes in the MME
+/// and the Serving GW is answered (the gateway asked for the deletion).
+#[test]
+fn a_reactivation_deactivation_whose_paging_fails_completes_locally() {
+    let _guard = lock_s11();
+    crate::bearer_deactivation::clear_for_test();
+    let (sgw, _route) = sgw(Gtp2XactConfig::default());
+    let ue = seed(0x0863, &[5]);
+    let _sess6 = add_pdn(&ue, 6);
+    let ctx = mme_self();
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    let complete = release_to_command(&ue, &sgw);
+    crate::s1ap_handler::handle_ue_context_release_complete(ctx, ue.enb_id, &complete);
+    let peer = sgw.local_addr().unwrap();
+    crate::s11_handler::dispatch_initial(
+        &dbr_reactivation(ue.local_teid, 6, 0x863),
+        99,
+        0x863,
+        peer,
+    );
+    wait_pdu(ue.enb_id, is_paging);
+    for _ in 0..=crate::nas_timer::MAX_RETRANSMISSIONS {
+        if let Some(u) = ctx.mme_ue_pool.write().unwrap().get_mut(&ue.mme_ue_id) {
+            u.t3413.expires_at = Instant::now().checked_sub(Duration::from_secs(1));
+        }
+        crate::nas_timer::expire_nas_timers(ctx, Instant::now());
+    }
+    assert_eq!(delete_bearer_response(&sgw), (16, 0x863));
+    assert!(
+        ctx.bearer_find_by_ebi(ue.mme_ue_id, 6).is_none(),
+        "deleted locally"
+    );
+    assert_eq!(crate::bearer_deactivation::pending_count(), 0);
+    release(&ue);
+}
+
+/// #862 (#863 review MINOR 3): a UE that goes ECM-IDLE before it accepts a
+/// reactivation-requested deactivation is paged again for it, not settled
+/// locally without being told.
+#[test]
+fn a_ue_going_idle_during_a_reactivation_deactivation_is_paged_again() {
+    let _guard = lock_s11();
+    crate::bearer_deactivation::clear_for_test();
+    let (sgw, _route) = sgw(Gtp2XactConfig::default());
+    let ue = seed(0x0864, &[5]);
+    let _sess6 = add_pdn(&ue, 6);
+    let ctx = mme_self();
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    let b6 = ctx.bearer_find_by_ebi(ue.mme_ue_id, 6).unwrap();
+    if let Some(b) = ctx.bearer_pool.write().unwrap().get_mut(&b6) {
+        b.enb_s1u_teid = 0x1006;
+        b.enb_s1u_ip.ipv4 = Some([10, 0, 0, 1]);
+    }
+    let peer = sgw.local_addr().unwrap();
+    crate::s11_handler::dispatch_initial(
+        &dbr_reactivation(ue.local_teid, 6, 0x864),
+        99,
+        0x864,
+        peer,
+    );
+    wait_pdu(ue.enb_id, is_erab_release_command);
+    assert_eq!(crate::bearer_deactivation::pending_count(), 1);
+    // The UE goes ECM-IDLE without accepting.
+    ctx.enb_ue_deassociate_mme_ue(ue.enb_ue_id, ue.mme_ue_id);
+    ctx.enb_ue_remove(ue.enb_ue_id);
+    crate::bearer_deactivation::sweep(ctx, Instant::now());
+    wait_pdu(ue.enb_id, is_paging);
+    assert_eq!(
+        crate::bearer_deactivation::pending_count(),
+        1,
+        "parked, not settled"
+    );
+    assert!(ctx.bearer_find_by_ebi(ue.mme_ue_id, 6).is_some());
+    crate::bearer_deactivation::clear_for_test();
+    release(&ue);
+}

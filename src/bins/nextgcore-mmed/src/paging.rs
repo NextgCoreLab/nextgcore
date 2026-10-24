@@ -108,6 +108,7 @@ pub fn answered(ctx: &MmeContext, mme_ue_id: u64) -> PagingType {
 /// "shall also be sent in the case that the UE responded to the page with a
 /// Service Request but that the MME has rejected the request").
 pub fn service_rejected(ctx: &MmeContext, mme_ue_id: u64) {
+    crate::bearer_deactivation::on_paging_failed(ctx, mme_ue_id);
     if answered(ctx, mme_ue_id) == PagingType::DownlinkDataNotification {
         if let Err(e) = crate::gtp_path::send_downlink_data_notification_failure_indication(
             ctx,

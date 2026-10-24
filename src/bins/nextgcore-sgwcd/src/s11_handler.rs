@@ -10,27 +10,10 @@ use std::net::Ipv4Addr;
 // GTP Cause Values (from NEXTGCORE_GTP2_CAUSE_*)
 // ============================================================================
 
-pub mod gtp_cause {
-    /// Request-initial cause: DDN triggered by Error Indication
-    /// (TS 29.274 Section 8.4, value 6)
-    pub const ERROR_INDICATION_FROM_RNC_ENODEB: u8 = 6;
-    pub const REQUEST_ACCEPTED: u8 = 16;
-    pub const REQUEST_ACCEPTED_PARTIALLY: u8 = 17;
-    pub const NEW_PDN_TYPE_DUE_TO_NETWORK_PREFERENCE: u8 = 18;
-    pub const NEW_PDN_TYPE_DUE_TO_SINGLE_ADDRESS_BEARER_ONLY: u8 = 19;
-    pub const CONTEXT_NOT_FOUND: u8 = 64;
-    pub const INVALID_MESSAGE_FORMAT: u8 = 65;
-    pub const MANDATORY_IE_MISSING: u8 = 70;
-    pub const CONDITIONAL_IE_MISSING: u8 = 71;
-    pub const INVALID_LENGTH: u8 = 72;
-    pub const MANDATORY_IE_INCORRECT: u8 = 73;
-    pub const SYSTEM_FAILURE: u8 = 75;
-    pub const NO_RESOURCES_AVAILABLE: u8 = 76;
-    pub const SERVICE_NOT_SUPPORTED: u8 = 68;
-    pub const REQUEST_REJECTED: u8 = 94;
-    pub const REMOTE_PEER_NOT_RESPONDING: u8 = 100;
-    pub const GRE_KEY_NOT_FOUND: u8 = 80;
-}
+/// GTPv2 cause octets (TS 29.274 Table 8.4-1): the shared table in
+/// `nextgcore-gtp`, which every GTPv2 node imports (#1024: this node's own copy
+/// had five values wrong, so "System failure" went out as 75, a TFT syntax error).
+pub use nextgcore_gtp::v2::cause as gtp_cause;
 
 // ============================================================================
 // GTP Message Types (from NEXTGCORE_GTP2_*_TYPE)

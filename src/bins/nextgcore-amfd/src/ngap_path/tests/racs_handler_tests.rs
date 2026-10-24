@@ -420,3 +420,48 @@ async fn an_idle_ue_gets_the_new_id_at_its_next_registration() {
     );
     server.forget_ue(ue);
 }
+
+/// #1046 review: UEs of one model (same TAC and capability) share one UCMF
+/// Assign, and a second notice while it is in flight adds none. Both UEs get
+/// the one answer, each in its own CONFIGURATION UPDATE COMMAND.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn ues_of_one_model_share_one_assign_and_a_second_notice_adds_none() {
+    let _racs = crate::racs::tests::guard();
+    let (_ucmf, port, assigns) = assigning_ucmf().await;
+    let _env = UcmfEnvGuard::set(port);
+    let mut server = capturing_ngap_server().await;
+    let (a, b) = (7_748_011u64, 7_748_012u64);
+    racs_ue_holding_id(&mut server, a, 61, false);
+    racs_ue_holding_id(&mut server, b, 62, false);
+    let new_version = serde_json::json!({
+        "eventType": "NEW_VERSION_ID_OF_PLMN_ASSIGNED_IDs",
+        "versionId": 6,
+    });
+
+    crate::racs::apply_notification(&new_version);
+    server.process_racs_reassignments();
+    // The UCMF says it again before the Assign has come back.
+    crate::racs::apply_notification(&new_version);
+    server.process_racs_reassignments();
+    server.sbi_offload.settle().await;
+    server.process_sbi_outcomes().await;
+
+    assert_eq!(
+        assigns.lock().expect("assigns").len(),
+        1,
+        "one Assign for the pair, whatever the number of UEs and notices"
+    );
+    let cucs = configuration_update_commands(take_sent_ngap(&mut server));
+    assert_eq!(cucs.len(), 2, "each UE gets the one answer");
+    assert!(cucs.iter().all(|c| carries_the_new_id(c)));
+    for ue in [a, b] {
+        let s = server.ue_auth_state.get(ue).expect("UE held");
+        assert_eq!(
+            s.amf_ue.ue_radio_capability_id.as_deref(),
+            Some(&NEW_ID[..])
+        );
+        server.forget_ue(ue);
+    }
+    assert!(server.racs_assigns.is_empty());
+}
