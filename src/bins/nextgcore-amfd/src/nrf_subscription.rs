@@ -533,7 +533,9 @@ mod tests {
                 "{t} is not cached"
             );
         }
-        for t in ["AMF", "UDR", "LMF", "NEF", "CHF", "BSF", "SCP", "NWDAF"] {
+        // The AMF itself is never a peer it discovers, and these are types
+        // `amf_nrf_discover` still drops. The LMF is NOT among them since #938.
+        for t in ["AMF", "UDR", "NEF", "CHF", "BSF", "SCP", "NWDAF"] {
             assert!(
                 crate::sbi_path::cached_peer_nf_type(t).is_none(),
                 "{t} is cached but not subscribed to"
