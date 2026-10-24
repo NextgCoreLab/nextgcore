@@ -909,6 +909,12 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
     }
     let dnn = sess.session_name.clone().unwrap_or_default();
     let sd_hex = sess.s_nssai.sd.map(|sd| format!("{sd:06x}"));
+    // #1072 review m4: the migrated PDN connection is now a 5G PDU session on its
+    // S-NSSAI. This SMF+PGW-C does no EPS counting at PDN connection establishment
+    // (TS 23.501 §5.15.11.5), so the session is counted in here, and its release
+    // counts it out.
+    let nsac_admitted =
+        crate::nsac_admit_migrated_session(supi, psi, sess.s_nssai.sst, sd_hex.as_deref()).await;
     {
         let handle = smf_self();
         if let Ok(ctx) = handle.read() {
@@ -949,7 +955,7 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
                         sst: sess.s_nssai.sst,
                         sd: sd_hex.clone(),
                         sdm_subscription_id: None,
-                        nsac_admitted: false,
+                        nsac_admitted,
                     },
                 );
             }

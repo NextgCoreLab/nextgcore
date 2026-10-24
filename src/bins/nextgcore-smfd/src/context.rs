@@ -1890,6 +1890,9 @@ pub struct UnrestorableSession {
     /// The UE's IPv4 address, if it could be salvaged from the raw record: the
     /// restored allocation that boot must free (#912 review M3).
     pub ue_ip: Option<[u8; 4]>,
+    /// The NSACF admission, if the raw record says it was admitted (#1072 review
+    /// m1): SUPI, PSI, SST and SD, so boot can count the session out.
+    pub nsac: Option<(String, u8, u8, Option<String>)>,
 }
 
 /// Why smfd durable state could not be loaded (issue #191).
@@ -2244,6 +2247,17 @@ impl SmfContext {
                         let salvaged_ip: Option<[u8; 4]> = field("ue_ip", "ueIp")
                             .and_then(|ip| serde_json::from_value::<[u8; 4]>(ip).ok())
                             .filter(|ip| *ip != [0; 4]);
+                        // #1072 review m1: an admitted session is counted out at boot.
+                        let salvaged_nsac = field("nsac_admitted", "nsacAdmitted")
+                            .and_then(|a| a.as_bool())
+                            .filter(|a| *a)
+                            .and_then(|_| {
+                                let supi = v.get("supi")?.as_str()?.to_string();
+                                let psi = u8::try_from(v.get("psi")?.as_u64()?).ok()?;
+                                let sst = u8::try_from(v.get("sst")?.as_u64()?).ok()?;
+                                let sd = v.get("sd").and_then(|d| d.as_str()).map(str::to_string);
+                                Some((supi, psi, sst, sd))
+                            });
                         match serde_json::from_value::<PolicyBinding>(v) {
                             Ok(b) => Some((k, b)),
                             Err(e) => {
@@ -2255,6 +2269,7 @@ impl SmfContext {
                                     sm_context_ref: k,
                                     status_uri: salvaged,
                                     ue_ip: salvaged_ip,
+                                    nsac: salvaged_nsac,
                                     reason: format!("policy binding could not be restored: {e}"),
                                 });
                                 None
