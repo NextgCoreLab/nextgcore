@@ -14025,6 +14025,15 @@ mod tests {
         }
     }
 
+    /// Poll `done`, at most 15 s: the release a hold starts runs in its own task, and
+    /// on a loaded machine its timing is not the test's to choose.
+    async fn wait_until(done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !done() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
     /// Deliver `pkt` to `upf`'s client as from `from`, and return the answer.
     async fn deliver(
         upf: &pfcp_path::stand_in::StandInUpf,
@@ -14188,7 +14197,11 @@ mod tests {
             &node_report_packet(0x996, 0x01, 102, [127, 0, 0, 9]),
         )
         .await;
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        wait_until(|| {
+            upf.seen()
+                .contains(&pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST)
+        })
+        .await;
         pfcp_path::drain_restart_fanouts(std::time::Duration::from_secs(5)).await;
         let seen = upf.seen();
         let posted = posts.lock().unwrap().clone();
@@ -14340,7 +14353,11 @@ mod tests {
             &node_report_packet(0x99b, 0x01, 102, [127, 0, 0, 9]),
         )
         .await;
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        wait_until(|| {
+            upf.seen()
+                .contains(&pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST)
+        })
+        .await;
         pfcp_path::drain_restart_fanouts(std::time::Duration::from_secs(5)).await;
         let seen = upf.seen();
         up_path::reset_for_test();
@@ -14387,7 +14404,11 @@ mod tests {
             );
 
         let armed = up_path::rearm_restored_holds();
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        wait_until(|| {
+            upf.seen()
+                .contains(&pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST)
+        })
+        .await;
         pfcp_path::drain_restart_fanouts(std::time::Duration::from_secs(5)).await;
         let seen = upf.seen();
         up_path::reset_for_test();
@@ -14401,6 +14422,65 @@ mod tests {
         );
     }
 
+    /// #1028 round 2, m3, m4: a restored hold waits for its UPF to be associated
+    /// again before it releases anything; an entry for a UPF that is no longer
+    /// configured is dropped.
+    #[tokio::test]
+    async fn a_restored_hold_waits_for_the_association_and_drops_unknown_upfs() {
+        let _state = up_path::UP_PATH_TEST_LOCK.lock().await;
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        up_path::reset_for_test();
+        up_path::set_hold_for_test(Some(std::time::Duration::from_millis(100)));
+        let (amf, amf_port, _posts) = recording_amf().await;
+        let reference = session_toward_gnb(&upf, "imsi-001010000009950", 12, amf_port).await;
+        upf.clear_seen();
+        upf.client.set_assoc_state_for_test(false, None, None).await;
+        {
+            let ctx = smf_self();
+            let ctx = ctx.read().unwrap();
+            let mut m = ctx.failed_up_paths.write().unwrap();
+            m.insert(
+                format!("{}|127.0.0.9", upf.client.recovery_time_stamp_key()),
+                0,
+            );
+            m.insert("renamed.example:8805|127.0.0.9".to_string(), 0);
+        }
+
+        let armed = up_path::rearm_restored_holds();
+        let unknown_left = smf_self()
+            .read()
+            .unwrap()
+            .failed_up_paths
+            .read()
+            .unwrap()
+            .contains_key("renamed.example:8805|127.0.0.9");
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let before_association = upf.seen();
+        upf.client.set_assoc_state_for_test(true, None, None).await;
+        wait_until(|| {
+            upf.seen()
+                .contains(&pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST)
+        })
+        .await;
+        pfcp_path::drain_restart_fanouts(std::time::Duration::from_secs(5)).await;
+        let after = upf.seen();
+        up_path::reset_for_test();
+        forget_seeded_session(&reference);
+        amf.stop().await.ok();
+
+        assert_eq!(armed, 1, "the unknown UPF's entry is not armed");
+        assert!(!unknown_left, "and is dropped");
+        assert!(
+            !before_association.contains(&pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST),
+            "nothing released before the association: {before_association:?}"
+        );
+        assert!(
+            after.contains(&pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST),
+            "released once associated: {after:?}"
+        );
+    }
+
     /// #1028 review m1: a graceful shutdown stops the pending holds before it
     /// deregisters, so a hold expiring during a slow deregistration releases
     /// nothing into the shutdown.
@@ -14410,7 +14490,10 @@ mod tests {
         let upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         up_path::reset_for_test();
-        up_path::set_hold_for_test(Some(std::time::Duration::from_millis(150)));
+        // #1028 round 2, M1: deterministic, not a race of timers against the setup.
+        // The hold is long; what is asserted is the order: by the time the
+        // deregistration runs, no hold is pending any more.
+        up_path::set_hold_for_test(Some(std::time::Duration::from_secs(600)));
         let (amf, amf_port, _posts) = recording_amf().await;
         let reference = session_toward_gnb(&upf, "imsi-001010000009948", 10, amf_port).await;
         let from = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -14421,26 +14504,30 @@ mod tests {
         )
         .await;
         pfcp_path::drain_restart_fanouts(std::time::Duration::from_secs(5)).await;
-        upf.clear_seen();
+        let pending_before = up_path::pending_hold_count();
 
+        let seen_by_deregister = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(99));
+        let probe = seen_by_deregister.clone();
         let listener = tokio::spawn(async {});
         graceful_shutdown(
-            tokio::time::sleep(std::time::Duration::from_millis(500)),
+            async move {
+                probe.store(up_path::pending_hold_count(), Ordering::SeqCst);
+            },
             &[],
             false,
             listener,
             tokio::time::Instant::now() + std::time::Duration::from_secs(60),
         )
         .await;
-        pfcp_path::drain_restart_fanouts(std::time::Duration::from_secs(5)).await;
-        let seen = upf.seen();
         up_path::reset_for_test();
         forget_seeded_session(&reference);
         amf.stop().await.ok();
 
-        assert!(
-            !seen.contains(&pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST),
-            "no release started during the shutdown: {seen:?}"
+        assert_eq!(pending_before, 1, "the failure armed one hold");
+        assert_eq!(
+            seen_by_deregister.load(Ordering::SeqCst),
+            0,
+            "the holds are stopped before the deregistration starts"
         );
     }
 
@@ -14462,6 +14549,14 @@ mod tests {
             &from,
             &node_report_packet(0x99d, 0x01, 102, [127, 0, 0, 9]),
         )
+        .await;
+        wait_until(|| {
+            posts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, j)| j.contains("n1MessageContainer"))
+        })
         .await;
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         pfcp_path::drain_restart_fanouts(std::time::Duration::from_secs(5)).await;
