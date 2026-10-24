@@ -4533,14 +4533,20 @@ fn erab_modification_abnormal(
             return Some(format!("duplicate E-RAB ID {}", item.erab_id));
         }
     }
-    let missing: Vec<u8> = ctx
-        .bearer_pool
-        .read()
-        .unwrap()
-        .values()
-        .filter(|b| b.mme_ue_id == mme_ue_id && b.enb_s1u_teid != 0 && !b.released_by_enb)
+    // The UE's own bearers, through its sessions rather than a scan of the
+    // whole pool (#949 review). A bearer being deactivated (#863) is on its way
+    // out: an eNB, e.g. an EN-DC one, may already omit it, and that is not the
+    // §8.2.4.4 case. The PENDING check is taken after the pool reads, per
+    // `bearer_deactivation`'s lock order.
+    let held: Vec<u8> = crate::gtp_path::bearers_of_ue(ctx, mme_ue_id)
+        .into_iter()
+        .filter(|b| b.enb_s1u_teid != 0 && !b.released_by_enb)
         .map(|b| b.ebi)
         .filter(|ebi| !listed.contains(ebi))
+        .collect();
+    let missing: Vec<u8> = held
+        .into_iter()
+        .filter(|ebi| !crate::bearer_deactivation::already_deactivating(ctx, mme_ue_id, *ebi))
         .collect();
     (!missing.is_empty()).then(|| format!("E-RABs {missing:?} of the UE context are not listed"))
 }
