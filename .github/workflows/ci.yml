@@ -270,6 +270,9 @@ jobs:
           repository: NextgCoreLab/nextgsim
           # Tracks main, as the nightly E2E jobs do: deploy-eks.sh renders
           # against the nextgsim checkout beside it, which is current main.
+          # Known coupling: a nextgsim change to k8s/ or config/ can turn this
+          # job red on a nextgcore PR that changed nothing. That is the point
+          # (the deploy breaks the same way), but the fix may be in nextgsim.
           ref: main
           path: nextgsim
       - uses: azure/setup-kubectl@v4
@@ -301,6 +304,18 @@ jobs:
             n=$((n + 1))
           done
           [ "$n" -gt 0 ] || { echo "no profile rendered"; exit 1; }
+      - name: EKS Service patches keep the base ports
+        # The 5g profile's Service patches replace whole port lists
+        # (`$patch: replace`), so a port added to a base Service later would
+        # be dropped silently on EKS (#1100 review). Every Service a patch
+        # names must keep the base ports, be ClusterIP, and set no nodePort.
+        working-directory: nextgcore
+        run: |
+          set -euo pipefail
+          { kubectl kustomize k8s; echo '---'; kubectl kustomize ../nextgsim/k8s; } > "$RUNNER_TEMP/base.yaml"
+          kubectl kustomize deploy/eks/profiles/5g > "$RUNNER_TEMP/eks-5g.yaml"
+          python3 deploy/eks/lib/check_service_ports.py \
+            "$RUNNER_TEMP/base.yaml" "$RUNNER_TEMP/eks-5g.yaml" deploy/eks/profiles/5g/patches/*.yaml
 
   fuzz-build:
     name: Fuzz targets build
