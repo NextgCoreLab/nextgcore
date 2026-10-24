@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-df495bb2.js";
+            window.path_to_searchindex_js = "searchindex-0f4a9f77.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-be5dca41.js"></script>
@@ -247,6 +247,7 @@ cargo test --workspace
 <tr><td>C/C++ compiler, cmake</td><td>any recent</td><td><code>aws-lc-sys</code>, the C crypto library under rustls</td></tr>
 <tr><td>libsctp-dev</td><td>any</td><td>only for <code>--features kernel-sctp</code> (amfd, mmed)</td></tr>
 <tr><td>Docker + Compose v2</td><td>Engine ≥ 24, Compose ≥ 2.20</td><td>E2E testing</td></tr>
+<tr><td>A set system clock</td><td>after 2020-01-01 (NTP-synchronised)</td><td>smfd, sgwcd, upfd, sgwud and mbsmfd refuse to start without it: see <a href="#a-set-clock-is-required-pfcp-nfs">A set clock is required</a></td></tr>
 </tbody>
 </table>
 </div>
@@ -375,7 +376,7 @@ kubectl port-forward -n nextg-system svc/jaeger 16686:16686   # traces
 <p><strong>1. Per-NF binary (clap).</strong> Each NF binary (e.g. <code>nextgcore-amfd</code>) parses CLI args and loads its YAML with <code>serde_yaml</code>. From <code>src/bins/nextgcore-amfd/src/lib.rs</code>:</p>
 <ul>
 <li><code>-c / --config &lt;path&gt;</code> — config file, default <code>/etc/nextgcore/amf.yaml</code></li>
-<li><code>--log-level &lt;level&gt;</code> — <code>trace|debug|info|warn|error</code>, default <code>info</code>. The short form is <code>-l</code> in amfd, mmed, sgwcd and sgwud; most other NFs follow Open5GS and use <code>-e</code> for the level and <code>-l</code> for <code>--log-file</code>. smfd has no log-level flag (it reads <code>RUST_LOG</code>, default <code>info</code>). Run <code>&lt;binary&gt; --help</code> for the rest of an NF’s flags</li>
+<li><code>--log-level &lt;level&gt;</code> — <code>trace|debug|info|warn|error</code>. Without it, the config file’s <code>logger.level</code>, else <code>info</code>. The short form is <code>-l</code> in amfd, mmed, sgwcd and sgwud; most other NFs, smfd included, follow Open5GS and use <code>-e</code> for the level and <code>-l</code> for <code>--log-file</code>. Run <code>&lt;binary&gt; --help</code> for the rest of an NF’s flags</li>
 <li><code>--ngap-addr</code> (AMF only) — NGAP bind address, default <code>0.0.0.0:38412</code></li>
 <li><code>--sctp-backend</code> (AMF only) — <code>userspace</code> (default, sctp-proto over UDP) or <code>kernel</code> (Linux kernel SCTP, needs the <code>kernel-sctp</code> build feature)</li>
 </ul>
@@ -388,7 +389,7 @@ kubectl port-forward -n nextg-system svc/jaeger 16686:16686   # traces
     path: /var/log/nextgcore/amf.log
   level: info
 </code></pre>
-<p><code>--log-level</code> works for every NF but smfd (which defaults to <code>info</code>). Every NF builds its logger with <code>nextgcore_core::log::nf_log_builder</code> (#691): <code>RUST_LOG</code>, when set, is the filter; otherwise the <code>--log-level</code> flag applies (an unknown value means <code>info</code>).</p>
+<p>Every NF picks its level the same way (#691): <code>RUST_LOG</code>, when set and not blank, is the filter; otherwise <code>--log-level</code> when given, else the config file’s <code>logger.level</code>, else <code>info</code> (<code>nextgcore_core::log::nf_log_level</code>). An unknown value means <code>info</code>; the C configs’ <code>fatal</code> and <code>none</code> mean <code>error</code> and <code>off</code>. The logger is built with <code>nextgcore_core::log::nf_log_builder</code>.</p>
 <h3 id="global"><a class="header" href="#global"><code>global</code></a></h3>
 <pre><code class="language-yaml">global:
   max:
@@ -414,7 +415,7 @@ kubectl port-forward -n nextg-system svc/jaeger 16686:16686   # traces
 <tr><th>Variable</th><th>Effect</th><th>Source</th></tr>
 </thead>
 <tbody>
-<tr><td><code>RUST_LOG</code></td><td>Overrides <code>--log-level</code> in every NF (env_logger filter syntax)</td><td><code>nextgcore_core::log::nf_log_builder</code></td></tr>
+<tr><td><code>RUST_LOG</code></td><td>Overrides <code>--log-level</code> and <code>logger.level</code> in every NF (env_logger filter syntax)</td><td><code>nextgcore_core::log::nf_log_builder</code></td></tr>
 <tr><td><code>DB_URI</code></td><td>Overrides the YAML <code>db_uri</code> (MongoDB)</td><td><code>init.rs</code> stage 4</td></tr>
 <tr><td><code>&lt;NF&gt;_SBI_ADDR</code> / <code>&lt;NF&gt;_SBI_PORT</code></td><td>SBI bind address/port (e.g. <code>AMF_SBI_ADDR</code>, <code>UDM_SBI_PORT</code>); defaults <code>127.0.0.1:7777</code></td><td>each NF <code>lib.rs</code></td></tr>
 <tr><td><code>NRF_URI</code>, <code>PCF_URI</code>, <code>NSACF_URI</code></td><td>Peer NF discovery URIs</td><td>NF binaries</td></tr>
@@ -570,6 +571,15 @@ this repo’s <code>udmd</code> serves from the UDR’s identity data (it answer
 </tbody>
 </table>
 </div>
+<h2 id="a-set-clock-is-required-pfcp-nfs"><a class="header" href="#a-set-clock-is-required-pfcp-nfs">A set clock is required (PFCP NFs)</a></h2>
+<p><code>nextgcore-smfd</code>, <code>nextgcore-sgwcd</code>, <code>nextgcore-upfd</code>, <code>nextgcore-sgwud</code> and <code>nextgcore-mbsmfd</code> <strong>refuse to start when the local clock reads before 2020-01-01</strong>. They exit with an error naming the clock.</p>
+<p>Each of these NFs puts its start time in every PFCP Association Setup and Heartbeat, as the Recovery Time Stamp (TS 29.244 §8.2.65, NTP-era seconds since 1900; #995). A host without a real-time clock that boots at 1970 would advertise a 1970 start time. Peers then misjudge restarts: one is missed, or a false one releases every session. So the NFs refuse to start rather than send a wrong stamp.</p>
+<p>On a host or node that may boot without a set clock (an RTC-less board, a VM restored from a snapshot), start these NFs only after the clock is synchronised:</p>
+<ul>
+<li><strong>systemd:</strong> order the unit <code>After=time-sync.target</code> and <code>Wants=time-sync.target</code>, and enable a time-sync waiter such as <code>systemd-time-wait-sync.service</code> (or chrony’s <code>chronyd-wait</code>).</li>
+<li><strong>Kubernetes:</strong> add an init container that waits for NTP sync, for example <code>chronyc waitsync</code> or polling <code>timedatectl show -p NTPSynchronized</code>. Alternatively, rely on the pod’s restart policy: the NF exits, and the kubelet restarts it with back-off until the node clock is set.</li>
+<li><strong>Docker / Compose:</strong> <code>restart: unless-stopped</code> (or <code>on-failure</code>) retries the same way. The containers use the host clock, so synchronise the host.</li>
+</ul>
 <h2 id="dynamic-reconfiguration"><a class="header" href="#dynamic-reconfiguration">Dynamic reconfiguration</a></h2>
 <p><code>nextgcore-app</code> includes a <code>ConfigReloadManager</code> that watches the config file and re-parses the <code>global</code> and NF-local sections on change, plus a versioned snapshot store with rollback and JSON export/import. These are library facilities (unit-tested); how much each NF wires them in varies — check the individual NF pages before relying on hot reload in a deployment.</p>
 <div style="break-before: page; page-break-before: always;"></div>
@@ -698,6 +708,9 @@ amf:
 <tr><td><code>AMF_OVERLOAD_REDUCE_PERCENT</code></td><td>Traffic reduction requested in NGAP Overload Start while congested, default <code>50</code>.</td></tr>
 <tr><td><code>AMF_SNPN_ALLOWED_NIDS</code> / <code>AMF_UAV_GEOFENCE</code></td><td>Rel-17/18 knobs: served SNPN NIDs, and the UAV geofence (see <code>docker/rust/README.md</code>).</td></tr>
 <tr><td><code>AMF_NTN_TIMING_ADVANCE_US</code></td><td>Default NTN timing advance; read only in an <code>ntn</code> feature build.</td></tr>
+<tr><td><code>AMF_HANDOVER_PREPARATION_SMF_WAIT_MS</code></td><td>N2 handover (TS 23.502 §4.9.1.3.2 step 8): the longest the AMF waits for the SMFs’ PREPARING answers before it sends the HANDOVER REQUEST with the sessions that answered; a session still waiting is not handed over and its SMF is told CANCELLED. Default <code>1000</code>; keep it well inside the source’s TNGRELOCprep.</td></tr>
+<tr><td><code>AMF_HANDOVER_COMMAND_SMF_WAIT_MS</code></td><td>The same wait for the PREPARED answers to the target’s Acknowledge before the HANDOVER COMMAND goes to the source; it counts against TNGRELOCoverall. Default <code>1000</code>.</td></tr>
+<tr><td><code>AMF_HANDOVER_SOURCE_HOLD_MS</code></td><td>N2 handover (TS 23.502 §4.9.1.3.3 steps 6a, 14a): how long after the target’s Handover Notify the source NG-RAN keeps its UE context, for in-flight forwarding, before the UE Context Release Command. Default <code>2000</code>; <code>0</code> releases at the Notify. A UE served on the old source connection again (ping-pong) is not released.</td></tr>
 </tbody>
 </table>
 </div>
@@ -845,28 +858,46 @@ smf:
 </thead>
 <tbody>
 <tr><td><code>SMF_CONFIG</code></td><td><code>/etc/nextgcore/smf.yaml</code></td><td>Config file path (overridden by <code>-c</code>/<code>--config</code>).</td></tr>
-<tr><td><code>SMF_PFCP_ADDR</code> / <code>SMF_PFCP_PORT</code></td><td><code>0.0.0.0</code> / <code>8805</code></td><td>N4 PFCP bind address (single socket; sequence-number matching per TS 29.244 §7.2.1, per code comment). <code>SMF_PFCP_ADDR</code> also supplies the PFCP Node ID (falls back to <code>127.0.0.1</code> if not a dotted IPv4).</td></tr>
+<tr><td><code>SMF_PFCP_ADDR</code> / <code>SMF_PFCP_PORT</code></td><td><code>0.0.0.0</code> / <code>8805</code></td><td>N4 PFCP bind address (single socket; sequence-number matching per TS 29.244 §7.2.1). An IPv4 address. When it is a specified address and nothing below overrides it, it is also the PFCP Node ID and the CP F-SEID address.</td></tr>
+<tr><td><code>SMF_PFCP_NODE_ID</code></td><td>the bind address when specified, else the F-SEID address</td><td>The PFCP Node ID (TS 29.244 §5.8.1, §8.2.38): an IPv4 address or an FQDN. It must stay the same across restarts, or the UPF sees a different CP function and does not keep its sessions; on k8s use the SMF’s Service FQDN. The SMF logs a warning when it has to derive the Node ID from a wildcard bind.</td></tr>
+<tr><td><code>SMF_PFCP_ADVERTISE_ADDR</code></td><td>the bind address when specified, else an IPv4 Node ID, else the local address routed toward the first UPF</td><td>The IPv4 address in every CP F-SEID (TS 29.244 §8.2.37), which the UPF sends Session Report Requests to. On k8s, the pod IP. The SMF refuses to start when it can find no routable address rather than signal <code>0.0.0.0</code>.</td></tr>
 <tr><td><code>UPF_PFCP_ADDR</code> / <code>UPF_PFCP_PORT</code></td><td><code>127.0.0.1</code> / <code>8805</code></td><td>UPF N4 peer(s), comma-separated. Each entry is an IP, <code>IP:port</code>, or a hostname (<code>host</code> or <code>host:port</code>); a hostname is re-resolved on every Association Setup attempt, so a UPF that moves to a new IP is re-associated.</td></tr>
-<tr><td><code>SMF_PFCP_RELEASE_ON_SHUTDOWN</code></td><td><code>false</code></td><td>Send PFCP Association Release on graceful shutdown. Off by default: the UPF deletes every session of a released association, so a restart would cut all UE traffic. Set <code>true</code> only when the SMF is being removed for good.</td></tr>
-<tr><td><code>SMF_SBI_ADVERTISE_URI</code></td><td>derived from SBI server address/port</td><td>Externally reachable base URI used in PCF callback (<code>notificationUri</code>) URIs.</td></tr>
-<tr><td><code>UDM_SBI_ADDR</code> / <code>UDM_SBI_PORT</code></td><td>unset / <code>7777</code></td><td>UDM address for <code>Nudm_SDM_Get(smf-select-data)</code>, used only to resolve the <strong>subscribed default DNN</strong> (#204). Tried <strong>after</strong> NRF discovery, so it is the fallback for a deployment with no NRF. With neither available, a <code>SmContextCreateData</code> carrying no <code>dnn</code> is refused with <code>SUBSCRIPTION_DATA_NOT_AVAILABLE</code>.</td></tr>
-<tr><td><code>NRF_URI</code></td><td>unset</td><td>NRF URI, used when the YAML names none.</td></tr>
-<tr><td><code>PCF_URI</code> / <code>NSACF_URI</code></td><td>unset</td><td>PCF / NSACF endpoint, tried before NRF discovery. With no NSACF configured or discoverable, slice admission control is skipped.</td></tr>
-<tr><td><code>SMF_METRICS_PORT</code></td><td><code>9090</code></td><td>Prometheus endpoint port (bound on <code>0.0.0.0</code>).</td></tr>
-<tr><td><code>SMF_UDM</code></td><td>off</td><td><code>1</code>/<code>true</code> turns on the UDM interaction of TS 23.502 §4.3.2.2.1 step 4 (UECM registration, SM-data subscription, #79). Off by default because the E2E harness has no conformant UDM.</td></tr>
-<tr><td><code>SMF_EPS_INTERWORKING</code></td><td>off</td><td><code>1</code>/<code>true</code> makes an establishing PDU session request an EPS Bearer Identity from the AMF and send Mapped EPS bearer contexts to the UE, so the session can later move to the EPC (#117).</td></tr>
-<tr><td><code>SMF_IWK_SNSSAI</code></td><td>SST <code>1</code></td><td>S-NSSAI (<code>sst</code> or <code>sst:sd</code>, SD six hex digits) the PGW-C+SMF assigns to a PDN connection that can move to 5GS (#475).</td></tr>
-<tr><td><code>SMF_PGW_FQDN</code></td><td>unset</td><td>PGW-C+SMF FQDN registered with the UDM; blank is treated as unset.</td></tr>
-<tr><td><code>SMF_INDIRECT_FORWARDING_TIMER_MS</code></td><td><code>3000</code></td><td>How long the UPF keeps EPS→5GS indirect data-forwarding tunnels after the handover executes.</td></tr>
-<tr><td><code>SMF_GN_ADDR</code></td><td><code>127.0.0.1</code></td><td>GGSN address this SMF puts in Gn Create/Update PDP Context Responses (GTPv1 interworking).</td></tr>
-<tr><td><code>SMF_EASDF</code> / <code>SMF_EASDF_EDGE_FQDN</code></td><td>off / unset</td><td><code>1</code>/<code>true</code> enables the EASDF DNS-context leg (TS 23.501 §5.6.7, #114); <code>SMF_EASDF_EDGE_FQDN</code> lists the FQDN patterns (e.g. <code>*.edge.example.com</code>) to steer. Enabled with no pattern logs a warning and steers nothing.</td></tr>
-<tr><td><code>REDCAP_SESS_AMBR_DL_BPS</code> / <code>_UL_BPS</code></td><td><code>150000000</code> / <code>50000000</code></td><td>Session-AMBR caps for RedCap UEs.</td></tr>
-<tr><td><code>NEXTGCORE_SBI_OAUTH2_REQUIRE</code></td><td>unset</td><td><code>1</code>/<code>true</code>/<code>yes</code> forces OAuth2 enforcement, taking precedence over the YAML knob.</td></tr>
-<tr><td><code>NEXTGCORE_SMF_STATE_FILE</code></td><td>unset</td><td>JSON snapshot file for PFCP sessions, policy bindings and IPv4-pool allocations (#191). Read only when <code>--state-file</code> is absent — the flag wins; an empty value is treated as unset. With neither set the SMF is memory-only, which is the shipped default.</td></tr>
-<tr><td><code>OTEL_EXPORTER_OTLP_ENDPOINT</code></td><td><code>http://jaeger:4317</code></td><td>OpenTelemetry OTLP trace exporter endpoint.</td></tr>
+<tr><td><code>SMF_PFCP_RELEASE_ON_SHUTDOWN</code></td><td>unset</td><td>Whether a graceful shutdown sends PFCP Association Release. Unset: released unless durable state (<code>--state-file</code> / <code>NEXTGCORE_SMF_STATE_FILE</code>) is armed. Without durable state the next SMF knows none of the sessions, so the UPF deletes them rather than keep them orphaned (#718). With durable state the association is kept, and the next SMF asks the UPF to retain the restored sessions (PFCP Session Retention Information, TS 29.244 §6.2.6.2); EPC PDN connections are not durable, so they are deleted at the PGW-U and toward the SGW first. <code>true</code> or <code>false</code> overrides either way. Without durable state an SMF that is killed (SIGKILL, OOM, node loss) cannot tell any UE: the next SMF knows none of the sessions, and the UPF deletes them when it associates. Only durable state, or TS 23.527 SMF restoration, avoids that. A graceful shutdown deregisters from the NRF and refuses new SM contexts (500 <code>NF_FAILOVER</code>) before it releases anything.</td></tr>
 </tbody>
 </table>
 </div>
+<p><strong>Who may talk to the SMF on N4 (#971).</strong> A datagram is handled as a UPF’s only when it comes from a configured or associated UPF: from its exact endpoint, or, for a request, from any port of its address or any of its other addresses (TS 29.244 §4.2.2, §5.8.1; the Node ID’s address, or what its FQDN or configured hostname resolves to, learnt at each Association Setup). A response is accepted only from the exact endpoint its request went to (§4.2.3). From any other host:</p>
+<ul>
+<li>a Heartbeat Request is answered with the SMF’s own Recovery Time Stamp, and nothing is taken from it (TS 23.007 §19A);</li>
+<li>an Association Setup Request is dropped, because UP-initiated setup (§6.2.6.3.2) is not implemented;</li>
+<li>any other request (Association Update or Release, Node Report, Session Set Deletion, Session Report) is refused with cause 72, “No established PFCP Association” (§8.2.1);</li>
+<li>a response is dropped.</li>
+</ul>
+<p>A UPF may report only on its own sessions. A Session Report for a SEID this SMF does not hold, or for a session served by another UPF, gets cause 65. A session restored from durable state belongs to the default UPF.</p>
+<p>Every refused datagram increments <code>smf_pfcp_unauthorized_messages_total</code>. This is one unlabelled counter, so it adds no series per sender. Each one is logged at DEBUG, with at most one WARN summary every 10 s, so a forged-sender flood does not fill the log. An on-path attacker that spoofs a UPF’s source address is that UPF as far as PFCP can tell: protect N4 at the transport (a private network, or IPsec, TS 33.501 §9.9).</p>
+<p><strong>One SMF instance at a time.</strong> Every SMF pod signals the same PFCP Node ID, and a UPF keeps one association per Node ID (TS 29.244 §6.2.6.2.2). A second instance replaces the first one’s association and deletes its sessions. The k8s and Helm Deployments therefore use <code>strategy: Recreate</code>, and the chart refuses <code>smf.replicas &gt; 1</code>. <code>Recreate</code> covers rollouts only. <code>kubectl delete pod</code> and a node drain create the replacement while the old pod is still terminating, so the two overlap for the termination grace period. Without durable state that is harmless: the old pod is releasing, and its UEs get #39. With durable state on a volume, both pods would open the same state file. Run a durable SMF as a StatefulSet, which never starts a replacement before the old pod has terminated.</p>
+<p><strong>Termination grace period.</strong> A graceful shutdown first tells every UE (#39) and every SGW (Delete Bearer, retransmitted for up to 12 s), then releases each UPF association (up to T1 x N1 when a UPF is gone). The shipped SMF and PGW-C manifests set <code>terminationGracePeriodSeconds: 45</code>. A shorter period cuts the retransmissions off.</p>
+<p><strong>Durable state is a one-way upgrade.</strong> The snapshot format is versioned. This release writes version 2 (5G CP SEIDs <code>1&lt;&lt;48 | ref</code>; a version-1 session keeps its legacy <code>ref | 0x1000</code> SEID). An older binary refuses a newer snapshot rather than misread it, so rolling smfd back across this change with a state file fails to start. Remove the file (the sessions are then released) or roll forward.
+| <code>SMF_SBI_ADVERTISE_URI</code> | derived from SBI server address/port | Externally reachable base URI used in PCF callback (<code>notificationUri</code>) URIs. |
+| <code>UDM_SBI_ADDR</code> / <code>UDM_SBI_PORT</code> | unset / <code>7777</code> | UDM address for <code>Nudm_SDM_Get(smf-select-data)</code>, used only to resolve the <strong>subscribed default DNN</strong> (#204). Tried <strong>after</strong> NRF discovery, so it is the fallback for a deployment with no NRF. With neither available, a <code>SmContextCreateData</code> carrying no <code>dnn</code> is refused with <code>SUBSCRIPTION_DATA_NOT_AVAILABLE</code>. |
+| <code>NRF_URI</code> | unset | NRF URI, used when the YAML names none. |
+| <code>PCF_URI</code> / <code>NSACF_URI</code> | unset | PCF / NSACF endpoint, tried before NRF discovery. With no NSACF configured or discoverable, slice admission control is skipped. |
+| <code>SMF_METRICS_PORT</code> | <code>9090</code> | Prometheus endpoint port. |
+| <code>NEXTGCORE_METRICS_BIND</code> | <code>127.0.0.1</code> | Host the unauthenticated <code>/metrics</code> listener binds to (#837). The compose files and manifests set <code>0.0.0.0</code> inside the private container/pod network. |
+| <code>SMF_UDM</code> | off | <code>1</code>/<code>true</code> turns on the UDM interaction of TS 23.502 §4.3.2.2.1 step 4 (UECM registration, SM-data subscription, #79). Off by default because the E2E harness has no conformant UDM. |
+| <code>SMF_EPS_INTERWORKING</code> | off | <code>1</code>/<code>true</code> makes an establishing PDU session request an EPS Bearer Identity from the AMF and send Mapped EPS bearer contexts to the UE, so the session can later move to the EPC (#117). |
+| <code>SMF_IWK_SNSSAI</code> | SST <code>1</code> | S-NSSAI (<code>sst</code> or <code>sst:sd</code>, SD six hex digits) the PGW-C+SMF assigns to a PDN connection that can move to 5GS (#475). |
+| <code>SMF_PGW_FQDN</code> | unset | PGW-C+SMF FQDN registered with the UDM; blank is treated as unset. |
+| <code>SMF_INDIRECT_FORWARDING_TIMER_MS</code> | <code>3000</code> | How long the UPF keeps EPS→5GS indirect data-forwarding tunnels after the handover executes. |
+| <code>SMF_GN_ADDR</code> | <code>127.0.0.1</code> | GGSN address this SMF puts in Gn Create/Update PDP Context Responses (GTPv1 interworking). |
+| <code>SMF_EASDF</code> / <code>SMF_EASDF_EDGE_FQDN</code> | off / unset | <code>1</code>/<code>true</code> enables the EASDF DNS-context leg (TS 23.501 §5.6.7, #114); <code>SMF_EASDF_EDGE_FQDN</code> lists the FQDN patterns (e.g. <code>*.edge.example.com</code>) to steer. Enabled with no pattern logs a warning and steers nothing. |
+| <code>REDCAP_SESS_AMBR_DL_BPS</code> / <code>_UL_BPS</code> | <code>150000000</code> / <code>50000000</code> | Session-AMBR caps for RedCap UEs. |
+| <code>NEXTGCORE_SBI_OAUTH2_REQUIRE</code> | unset | <code>1</code>/<code>true</code>/<code>yes</code> forces OAuth2 enforcement, taking precedence over the YAML knob. |
+| <code>NEXTGCORE_SMF_STATE_FILE</code> | unset | JSON snapshot file for PFCP sessions, policy bindings and IPv4-pool allocations (#191). Read only when <code>--state-file</code> is absent — the flag wins; an empty value is treated as unset. With neither set the SMF is memory-only, which is the shipped default. |
+| <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> | <code>http://jaeger:4317</code> | OpenTelemetry OTLP trace exporter endpoint. |</p>
+<blockquote>
+<p><strong>Clock:</strong> this NF refuses to start when the local clock reads before 2020-01-01, because its PFCP Recovery Time Stamp would be wrong. See <a href="#a-set-clock-is-required-pfcp-nfs">A set clock is required</a> for the remedy on RTC-less hosts.</p>
+</blockquote>
 <h2 id="command-line-flags-1"><a class="header" href="#command-line-flags-1">Command-line flags</a></h2>
 <p><code>smfd</code> has no <code>clap</code> argument parser; it scans <code>argv</code> for the two flags it
 understands and ignores everything else.</p>
@@ -906,7 +937,11 @@ back into each <code>PfcpClient</code> before the association loop starts, so th
 Association Setup after a reload compares the UPF’s reported stamp against it:
 a changed stamp means the UPF restarted while the SMF was down, and the restored
 sessions are flushed (TS 29.244 §5.22, TS 23.527 §4.2) instead of being believed
-in. An unchanged stamp means they are genuinely still valid.</p>
+in. An unchanged stamp means they are genuinely still valid. A UPF named by
+hostname has its stamp kept under the configured <code>host:port</code>, lower-cased and
+without a trailing dot, so it is found again after the UPF moves (#722). A stamp
+a pre-#722 snapshot kept under the UPF’s address is read once, moved to the name,
+and the address entry removed. A UPF hostname must name exactly one UPF.</p>
 <p><strong>Limits worth knowing:</strong></p>
 <ul>
 <li>The flush is process-wide, not per-peer — <code>clear_pfcp_sessions</code> empties the
@@ -1114,11 +1149,12 @@ upf:
 <tbody>
 <tr><td><code>-c, --config</code></td><td>string</td><td><code>/etc/nextgcore/upf.yaml</code></td><td>Configuration file path. Read if present, but contents are not applied (see note above).</td></tr>
 <tr><td><code>-l, --log-file</code></td><td>string</td><td><em>(none)</em></td><td>Log file path.</td></tr>
-<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level: <code>trace</code>, <code>debug</code>, <code>info</code>, <code>warn</code>, <code>error</code>.</td></tr>
+<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>logger.level</code>, else <code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else is <code>info</code>). Without the flag, the config’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code> overrides both (#691).</td></tr>
 <tr><td><code>-m, --no-color</code></td><td>bool</td><td><code>false</code></td><td>Disable colored log output.</td></tr>
 <tr><td><code>-k, --kill</code></td><td>bool</td><td><code>false</code></td><td>Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor.</td></tr>
 <tr><td><code>--pfcp-addr</code></td><td>string</td><td><code>127.0.0.4</code></td><td>N4 PFCP server bind address.</td></tr>
 <tr><td><code>--pfcp-port</code></td><td>u16</td><td><code>8805</code></td><td>N4 PFCP server port.</td></tr>
+<tr><td><code>--pfcp-allowed-peers</code></td><td>list</td><td>empty</td><td>SMF/PGW-C hosts allowed to set up the PFCP association: IPs, CIDR prefixes or host names (re-resolved every 10 s, and at once – at most once a second – when a Setup comes from an unresolved address; a failed lookup keeps the last good addresses), comma-separated; <code>UPF_PFCP_ALLOWED_PEERS</code> when the flag is not given. Only the source IP is compared. A listed host may move a live association only as the same CP function (one of its hosts, or the same Node ID); a different CP function is refused until the association is released or times out. The Node ID is sender-written, so a broad entry (a pod CIDR, <code>0.0.0.0/0</code>) lets any host in range that knows the SMF’s Node ID take the association over: prefer the SMF’s own address or headless Service name. <strong>Fail closed:</strong> empty refuses every Association Setup (logged as an error at startup); <code>0.0.0.0/0</code> / <code>::/0</code> admit any host (labs only). The shipped compose, Helm, k8s and EKS deployments set it. Every PFCP message other than Heartbeat and Association Setup is accepted only from the associated SMF’s hosts (its Setup source, its IPv4/IPv6 Node ID, or the addresses its FQDN Node ID resolves to); refusals count in <code>upf_pfcp_unauthorized_messages_total</code>.</td></tr>
 <tr><td><code>--gtpu-addr</code></td><td>string</td><td><code>127.0.0.4</code></td><td>N3 GTP-U bind address.</td></tr>
 <tr><td><code>--gtpu-port</code></td><td>u16</td><td><code>2152</code></td><td>N3 GTP-U port.</td></tr>
 <tr><td><code>--tun-ifname</code></td><td>string</td><td><code>ogstun</code></td><td>TUN interface name for the user-plane subnet.</td></tr>
@@ -1137,11 +1173,15 @@ upf:
 <tr><th>Variable</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>UPF_METRICS_PORT</code></td><td><code>9090</code></td><td>Prometheus <code>/metrics</code> port (bound on <code>0.0.0.0</code>), including the TUN-path data-plane counters (#581).</td></tr>
+<tr><td><code>UPF_METRICS_PORT</code></td><td><code>9090</code></td><td>Prometheus <code>/metrics</code> port, including the TUN-path data-plane counters (#581).</td></tr>
+<tr><td><code>NEXTGCORE_METRICS_BIND</code></td><td><code>127.0.0.1</code></td><td>Host the unauthenticated <code>/metrics</code> listener binds to (#837). The compose files and manifests set <code>0.0.0.0</code> inside the private container/pod network.</td></tr>
 <tr><td><code>OTEL_EXPORTER_OTLP_ENDPOINT</code></td><td><code>http://jaeger:4317</code></td><td>OTLP endpoint for OpenTelemetry tracing (initialization is best-effort; failure is ignored).</td></tr>
 </tbody>
 </table>
 </div>
+<blockquote>
+<p><strong>Clock:</strong> this NF refuses to start when the local clock reads before 2020-01-01, because its PFCP Recovery Time Stamp would be wrong. See <a href="#a-set-clock-is-required-pfcp-nfs">A set clock is required</a> for the remedy on RTC-less hosts.</p>
+</blockquote>
 <h2 id="behavior-notes"><a class="header" href="#behavior-notes">Behavior notes</a></h2>
 <ul>
 <li><strong>PFCP heartbeats:</strong> the UPF also initiates PFCP heartbeats toward the associated CP function every 10 seconds (code comment cites TS 29.244 §6.2.2: either node may initiate).</li>
@@ -1303,7 +1343,7 @@ nsacf:
 <h3 id="parsed-but-inert--decorative-yaml-fields"><a class="header" href="#parsed-but-inert--decorative-yaml-fields">Parsed-but-inert / decorative YAML fields</a></h3>
 <p>The daemon deserializes only the fields above; unknown YAML keys are silently ignored by serde. In particular, in the shipped example files:</p>
 <ul>
-<li><strong><code>logger.level</code> is inert.</strong> The log level comes from the CLI flag <code>-e/--log-level</code> (default <code>info</code>) or <code>RUST_LOG</code>, not the YAML.</li>
+<li><strong><code>logger.level</code> is read.</strong> The log level is <code>-e/--log-level</code> when given, else this file’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code>, when set, overrides all three (#691).</li>
 <li><strong><code>nsacf.sbi.server[]</code> (address/port) is inert.</strong> The SBI bind address and port come from the CLI flags <code>--sbi-addr</code>/<code>--sbi-port</code>; the YAML <code>server</code> list exists for visual consistency with other NF configs but is not read by <code>nextgcore-nsacfd</code>.</li>
 </ul>
 <h2 id="command-line-flags-2"><a class="header" href="#command-line-flags-2">Command-line flags</a></h2>
@@ -1315,7 +1355,7 @@ nsacf:
 </thead>
 <tbody>
 <tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/nsacf.yaml</code></td><td>Configuration file path.</td></tr>
-<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>).</td></tr>
+<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>logger.level</code>, else <code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else is <code>info</code>). Without the flag, the config’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code> overrides both (#691).</td></tr>
 <tr><td><code>-l, --log-file</code></td><td>path</td><td>unset</td><td>Log file path.</td></tr>
 <tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td>Disable color output.</td></tr>
 <tr><td><code>--sbi-addr</code></td><td>string</td><td><code>0.0.0.0</code></td><td>SBI server bind address.</td></tr>
@@ -1418,7 +1458,7 @@ ausf:
 <h3 id="parsed-but-inert--decorative-yaml-fields-1"><a class="header" href="#parsed-but-inert--decorative-yaml-fields-1">Parsed-but-inert / decorative YAML fields</a></h3>
 <p>Unknown YAML keys are silently ignored by serde. In the shipped <code>ausf.yaml</code>, the following blocks are decorative:</p>
 <ul>
-<li><strong><code>logger.file.path</code> and <code>logger.level</code> are inert.</strong> The log level comes from <code>RUST_LOG</code> when set, else the CLI flag <code>-e/--log-level</code>. Nothing writes to the YAML’s log-file path.</li>
+<li><strong><code>logger.level</code> is read; <code>logger.file.path</code> is inert.</strong> The log level is <code>-e/--log-level</code> when given, else this file’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code>, when set, overrides all three (#691). Nothing writes to the YAML’s log-file path.</li>
 <li><strong><code>global.max.ue</code> / <code>global.max.peer</code> are inert.</strong> The auth-context pool capacity comes from the CLI flag <code>--max-ue</code> (default <code>1024</code> — the example’s matching <code>1024</code> is coincidence, not causation). <code>max.peer</code> is read by nothing in this binary.</li>
 <li><strong><code>ausf.sbi.tls.*</code> (enabled/cert/key/ca/min_version) is inert.</strong> More honestly: even the CLI <code>--tls</code>/<code>--tls-cert</code>/<code>--tls-key</code> flags only populate the legacy <code>SbiServerConfig</code> consumed by the <code>ausf_sbi_open()</code> logging shim (<code>sbi_path.rs</code>, marked inert by the “ausfd-10” note). The live HTTP/2 server’s TLS is set only by the SBI security profile (<code>NEXTGCORE_SBI_PROFILE</code>, see <a href="#configuration-overview">Configuration Overview</a>).</li>
 <li><strong><code>ausf.security.pqc.*</code> is inert.</strong> No PQC code path exists in this binary.</li>
@@ -1433,7 +1473,7 @@ ausf:
 <tbody>
 <tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/ausf.yaml</code></td><td>Configuration file path (docker passes exactly <code>-c /etc/nextgcore/ausf.yaml</code>).</td></tr>
 <tr><td><code>-l, --log-file</code></td><td>path</td><td>unset</td><td>Accepted but <strong>not wired</strong> — <code>init_logging</code> never reads it; logs go to stdout/stderr.</td></tr>
-<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>); unrecognized values fall back to <code>info</code>.</td></tr>
+<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>logger.level</code>, else <code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else is <code>info</code>). Without the flag, the config’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code> overrides both (#691).</td></tr>
 <tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td>Disable color output.</td></tr>
 <tr><td><code>-k, --kill</code></td><td>flag</td><td>off</td><td>Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor.</td></tr>
 <tr><td><code>--sbi-addr</code></td><td>string</td><td><code>0.0.0.0</code></td><td>SBI bind address — <strong>overridden</strong> by <code>ausf.sbi.server[0].address</code> when the YAML sets it.</td></tr>
@@ -1526,7 +1566,7 @@ udm:
 <h3 id="parsed-but-inert--decorative-yaml-fields-2"><a class="header" href="#parsed-but-inert--decorative-yaml-fields-2">Parsed-but-inert / decorative YAML fields</a></h3>
 <p>Unknown YAML keys are silently ignored by serde. In the shipped <code>udm.yaml</code>:</p>
 <ul>
-<li><strong><code>logger.file.path</code> and <code>logger.level</code> are inert.</strong> The log level comes from the CLI flag <code>-e/--log-level</code> (default <code>info</code>); <code>init_logging()</code> never opens a log file (see the CLI table — even <code>-l/--log-file</code> is inert).</li>
+<li><strong><code>logger.level</code> is read; <code>logger.file.path</code> is inert.</strong> The log level is <code>-e/--log-level</code> when given, else this file’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code>, when set, overrides all three (#691). No log file is ever opened (see the CLI table: even <code>-l/--log-file</code> is inert).</li>
 <li><strong><code>global.max.ue</code> and <code>global.max.peer</code> are inert.</strong> Context capacities come from the CLI flags <code>--max-ue</code> (default <code>1024</code>) and <code>--max-sess</code> (default <code>4096</code>); the example’s <code>ue: 1024</code> merely coincides with the CLI default.</li>
 <li><strong><code>udm.sbi.tls.*</code> (<code>enabled</code>/<code>cert</code>/<code>key</code>/<code>ca</code>/<code>min_version</code>) is entirely inert.</strong> <code>SbiYaml</code> has no <code>tls</code> field, and even the CLI TLS flags only populate a legacy placeholder config (see behavior notes).</li>
 </ul>
@@ -1541,7 +1581,7 @@ udm:
 <tbody>
 <tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/udm.yaml</code></td><td>Configuration file path.</td></tr>
 <tr><td><code>-l, --log-file</code></td><td>path</td><td>unset</td><td><strong>Parsed but unused</strong> — <code>init_logging()</code> never references it; logging goes to stderr via <code>env_logger</code>.</td></tr>
-<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else falls back to <code>info</code>).</td></tr>
+<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>logger.level</code>, else <code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else is <code>info</code>). Without the flag, the config’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code> overrides both (#691).</td></tr>
 <tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td>Disable color output.</td></tr>
 <tr><td><code>-k, --kill</code></td><td>flag</td><td>off</td><td>Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor.</td></tr>
 <tr><td><code>--sbi-addr</code></td><td>string</td><td><code>0.0.0.0</code></td><td>SBI bind address — <strong>overridden</strong> by <code>udm.sbi.server[0].address</code> when present in the YAML.</td></tr>
@@ -1632,7 +1672,7 @@ udr:
 <h2 id="parsed-but-inert--decorative-yaml-fields-3"><a class="header" href="#parsed-but-inert--decorative-yaml-fields-3">Parsed-but-inert / decorative YAML fields</a></h2>
 <p>The daemon deserializes only the fields above; unknown YAML keys are silently ignored by serde. In the shipped example files:</p>
 <ul>
-<li><strong><code>logger.file.path</code> and <code>logger.level</code> are inert.</strong> The log level comes from <code>RUST_LOG</code> when set, else the CLI flag <code>-e/--log-level</code> (default <code>info</code>). Logs always go to stderr — see the <code>--log-file</code> caveat below.</li>
+<li><strong><code>logger.level</code> is read; <code>logger.file.path</code> is inert.</strong> The log level is <code>-e/--log-level</code> when given, else this file’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code>, when set, overrides all three (#691). Logs always go to stderr; see the <code>--log-file</code> caveat below.</li>
 <li><strong><code>global.max.ue</code> / <code>global.max.peer</code> are inert.</strong> No struct deserializes the <code>global</code> section.</li>
 <li><strong><code>udr.sbi.tls.*</code> (enabled/cert/key/ca/min_version) is inert.</strong> <code>SbiYaml</code> has only <code>server</code>, <code>client</code>, and <code>oauth2</code> members; TLS is controlled exclusively by the CLI flags <code>--tls</code>/<code>--tls-cert</code>/<code>--tls-key</code>.</li>
 </ul>
@@ -1646,7 +1686,7 @@ udr:
 <tbody>
 <tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/udr.yaml</code></td><td>Configuration file path.</td></tr>
 <tr><td><code>-l, --log-file</code></td><td>path</td><td>unset</td><td><strong>Accepted but currently unused</strong> — <code>init_logging</code> never opens it; logging always goes to stderr.</td></tr>
-<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>); unrecognized values fall back to <code>info</code>.</td></tr>
+<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>logger.level</code>, else <code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else is <code>info</code>). Without the flag, the config’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code> overrides both (#691).</td></tr>
 <tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td>Disable color output.</td></tr>
 <tr><td><code>-k, --kill</code></td><td>flag</td><td>off</td><td>Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor.</td></tr>
 <tr><td><code>--sbi-addr</code></td><td>string</td><td><code>0.0.0.0</code></td><td>SBI server bind address. Overridden by <code>udr.sbi.server[0].address</code> when present.</td></tr>
@@ -1755,7 +1795,7 @@ pcf:
 <p>The daemon deserializes only the fields above; unknown YAML keys are silently ignored by serde. In the shipped example file:</p>
 <ul>
 <li><strong><code>db_uri</code> is inert.</strong> <code>nextgcore-pcfd</code> never calls <code>nextgcore_dbi_init</code> — its subscription/session-data lookups through <code>nextgcore-dbi</code> therefore error out at runtime and fall back to built-in defaults (see Behavior notes). The key exists for visual consistency with NFs that do open MongoDB.</li>
-<li><strong><code>logger.file.path</code> and <code>logger.level</code> are inert.</strong> The log level comes from <code>RUST_LOG</code> when set, else the CLI flag <code>-e/--log-level</code> (default <code>info</code>); no file output is wired (the <code>-l/--log-file</code> flag is accepted but unused).</li>
+<li><strong><code>logger.level</code> is read; <code>logger.file.path</code> is inert.</strong> The log level is <code>-e/--log-level</code> when given, else this file’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code>, when set, overrides all three (#691). No file output is wired (the <code>-l/--log-file</code> flag is accepted but unused).</li>
 <li><strong><code>global.max.ue</code> / <code>global.max.peer</code> are inert.</strong> Context capacities come from the CLI flags <code>--max-ue</code> (1024) and <code>--max-sess</code> (4096).</li>
 <li><strong><code>pcf.metrics.server[]</code> is inert.</strong> The daemon starts no metrics HTTP server; its only telemetry export is OpenTelemetry OTLP via <code>OTEL_EXPORTER_OTLP_ENDPOINT</code>.</li>
 <li><strong><code>pcf.tls.*</code> is inert.</strong> No code reads this section. Even the CLI <code>--tls</code>/<code>--tls-cert</code>/<code>--tls-key</code> flags only flow into the legacy <code>SbiServerConfig</code> (<code>sbi_path.rs</code>), where they flip the <em>advertised</em> URI scheme to <code>https</code> in the legacy NF-instance builder; the live HTTP/2 listener is created from <code>NextgcoreSbiServerConfig::new(addr)</code> without any TLS wiring and serves cleartext h2c.</li>
@@ -1770,7 +1810,7 @@ pcf:
 <tbody>
 <tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/pcf.yaml</code></td><td>Configuration file path.</td></tr>
 <tr><td><code>-l, --log-file</code></td><td>path</td><td>unset</td><td>Log file path — parsed but currently <strong>not used</strong> by <code>init_logging</code> (no file logging).</td></tr>
-<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else falls back to <code>info</code>).</td></tr>
+<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>logger.level</code>, else <code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else is <code>info</code>). Without the flag, the config’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code> overrides both (#691).</td></tr>
 <tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td>Disable color output.</td></tr>
 <tr><td><code>-k, --kill</code></td><td>flag</td><td>off</td><td>Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor.</td></tr>
 <tr><td><code>--sbi-addr</code></td><td>string</td><td><code>0.0.0.0</code></td><td>SBI bind address; overridden by <code>pcf.sbi.server[0].address</code> when the YAML sets one.</td></tr>
@@ -1912,7 +1952,7 @@ nssf:
 <h3 id="parsed-but-inert--decorative-yaml-fields-5"><a class="header" href="#parsed-but-inert--decorative-yaml-fields-5">Parsed-but-inert / decorative YAML fields</a></h3>
 <p>Unknown YAML keys are silently ignored by serde. In the shipped example file:</p>
 <ul>
-<li><strong><code>logger.file.path</code> and <code>logger.level</code> are inert.</strong> The log level comes from <code>RUST_LOG</code> when set, else the CLI flag <code>-e/--log-level</code>; no file logging is wired (see <code>--log-file</code> below).</li>
+<li><strong><code>logger.level</code> is read; <code>logger.file.path</code> is inert.</strong> The log level is <code>-e/--log-level</code> when given, else this file’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code>, when set, overrides all three (#691). No file logging is wired (see <code>--log-file</code> below).</li>
 <li><strong><code>global.max.ue</code> / <code>global.max.peer</code> are inert</strong> — no <code>global</code> section exists in the deserialize structs; the only pool cap is CLI <code>--max-nf</code>.</li>
 <li><strong><code>nssf.sbi.client.nsi[]</code> (uri, s_nssai, optional nsi_id) is LOADED</strong> (#93). Each entry installs one Network Slice Instance into the context, which is what <code>slice-info-request-for-pdu-session</code> and <code>slice-info-request-for-other-purpose</code> resolve against. Until #93 <code>SbiClientYaml</code> declared only <code>nrf</code>, so this block — present in every shipped config — deserialised into nothing, <code>nsi_add</code> had no production caller, and <strong>every</strong> PDU-session selection was answered <code>403</code>. An entry with no <code>s_nssai</code> is skipped with a warning rather than installed under a guessed SST. With no entries at all the daemon logs an ERROR at startup naming the consequence (it still serves the registration and NSSAI-availability scenarios, which do not consult the NSI table, so it does not refuse to boot).</li>
 <li><strong><code>nssf.sbi.tls.*</code> (enabled/cert/key/ca/min_version) is inert.</strong> TLS is CLI-flag-only, and even those flags only populate a legacy config (next section).</li>
@@ -1928,7 +1968,7 @@ nssf:
 <tbody>
 <tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/nssf.yaml</code></td><td>Configuration file path.</td></tr>
 <tr><td><code>-l, --log-file</code></td><td>path</td><td>unset</td><td><strong>Parsed but never used</strong> — no file-logging sink is wired; logs go to the <code>env_logger</code> default (stderr).</td></tr>
-<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; unknown values fall back to <code>info</code>).</td></tr>
+<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>logger.level</code>, else <code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else is <code>info</code>). Without the flag, the config’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code> overrides both (#691).</td></tr>
 <tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td>Disable color output.</td></tr>
 <tr><td><code>-k, --kill</code></td><td>flag</td><td>off</td><td>Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor.</td></tr>
 <tr><td><code>--sbi-addr</code></td><td>string</td><td><code>0.0.0.0</code></td><td>SBI bind address — <strong>overridden</strong> by <code>nssf.sbi.server[0].address</code> when the YAML sets it.</td></tr>
@@ -2021,7 +2061,7 @@ bsf:
 <h3 id="parsed-but-inert--decorative-yaml-fields-6"><a class="header" href="#parsed-but-inert--decorative-yaml-fields-6">Parsed-but-inert / decorative YAML fields</a></h3>
 <p>The daemon deserializes only the fields above; unknown YAML keys are silently ignored by serde. In particular, in the shipped example files:</p>
 <ul>
-<li><strong><code>logger.file.path</code> and <code>logger.level</code> are inert.</strong> The log level comes from <code>RUST_LOG</code> when set, else the CLI flag <code>-e/--log-level</code> (default <code>info</code>). Logs go to stderr; no file sink is wired (see <code>--log-file</code> below).</li>
+<li><strong><code>logger.level</code> is read; <code>logger.file.path</code> is inert.</strong> The log level is <code>-e/--log-level</code> when given, else this file’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code>, when set, overrides all three (#691). Logs go to stderr; no file sink is wired (see <code>--log-file</code> below).</li>
 <li><strong><code>global.max.ue</code> / <code>global.max.peer</code> are inert.</strong> No <code>global</code> section exists in the deserialize structs; session capacity is the CLI flag <code>--max-sess</code>.</li>
 <li><strong><code>bsf.sbi.tls.*</code> (<code>enabled</code>/<code>cert</code>/<code>key</code>/<code>ca</code>/<code>min_version</code>) is inert.</strong> No <code>tls</code> field exists in <code>SbiYaml</code>. TLS-related knobs are the CLI flags <code>--tls</code>/<code>--tls-cert</code>/<code>--tls-key</code> — and even those only affect the advertised scheme (see Behavior notes). The <code>TLS_ENABLED</code>/<code>SBI_SCHEME</code> variables mentioned in the YAML comment, and the <code>TLS_CERT</code>/<code>TLS_KEY</code> environment variables set by <code>docker-compose.yml</code>, are not read by this binary.</li>
 </ul>
@@ -2035,7 +2075,7 @@ bsf:
 <tbody>
 <tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/bsf.yaml</code></td><td>Configuration file path. A missing file is tolerated (logged at debug); a malformed file is silently ignored.</td></tr>
 <tr><td><code>-l, --log-file</code></td><td>path</td><td>unset</td><td>Parsed but <strong>never used</strong> — <code>init_logging</code> wires no file sink; logging goes to stderr.</td></tr>
-<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>); unrecognized values fall back to <code>info</code>.</td></tr>
+<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>logger.level</code>, else <code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else is <code>info</code>). Without the flag, the config’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code> overrides both (#691).</td></tr>
 <tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td>Disable color output.</td></tr>
 <tr><td><code>-k, --kill</code></td><td>flag</td><td>off</td><td>Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor.</td></tr>
 <tr><td><code>--sbi-addr</code></td><td>string</td><td><code>0.0.0.0</code></td><td>SBI server bind address; <strong>overridden</strong> by <code>bsf.sbi.server[0].address</code> when the YAML provides one.</td></tr>
@@ -2149,7 +2189,7 @@ nwdaf:
 <h3 id="parsed-but-inert--decorative-yaml-fields-7"><a class="header" href="#parsed-but-inert--decorative-yaml-fields-7">Parsed-but-inert / decorative YAML fields</a></h3>
 <p>Everything in the shipped example except an (absent) <code>sbi.oauth2.require</code> key is decorative — the daemon never looks at it:</p>
 <ul>
-<li><strong><code>logger.level</code> is inert.</strong> The log filter comes from <code>RUST_LOG</code> (which wins, via <code>env_logger</code>’s default env) or else the CLI flag <code>-e/--log-level</code> (default <code>info</code>).</li>
+<li><strong><code>logger.level</code> is read.</strong> The log level is <code>-e/--log-level</code> when given, else this file’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code>, when set, overrides all three (#691).</li>
 <li><strong><code>nwdaf.sbi.server[]</code> (address/advertise/port) is inert.</strong> The SBI bind address and port come exclusively from <code>--sbi-addr</code>/<code>--sbi-port</code>; the docker deployment passes <code>--sbi-addr 172.23.0.30 --sbi-port 7777</code> on the command line.</li>
 <li><strong><code>nwdaf.nrf.uri</code> is inert.</strong> The NRF URI comes exclusively from the CLI flag <code>--nrf-uri</code>; docker passes <code>--nrf-uri http://172.23.0.10:7777</code> explicitly. The YAML value exists only for visual consistency with other NF configs.</li>
 <li><strong><code>nwdaf.analytics.ml_model_dir</code> is inert.</strong> No code in the binary reads a model directory (or any file other than the config itself); the ML model provision service is metadata/subscription-based, not filesystem-backed.</li>
@@ -2163,7 +2203,7 @@ nwdaf:
 </thead>
 <tbody>
 <tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/nwdaf.yaml</code></td><td>Configuration file path — consulted only for the OAuth2 knob above.</td></tr>
-<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>); <code>RUST_LOG</code> overrides it.</td></tr>
+<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>logger.level</code>, else <code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else is <code>info</code>). Without the flag, the config’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code> overrides both (#691).</td></tr>
 <tr><td><code>-l, --log-file</code></td><td>path</td><td>unset</td><td><strong>Accepted but currently unused</strong> — the parsed value is never referenced; logs go to stderr regardless.</td></tr>
 <tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td><strong>Accepted but currently unused</strong> — the parsed value is never referenced.</td></tr>
 <tr><td><code>--sbi-addr</code></td><td>string</td><td><code>0.0.0.0</code></td><td>SBI server bind address. Also used verbatim in the registered NFProfile <code>ipv4Addresses</code> and in the NFStatusNotify callback URI — see Behavior notes.</td></tr>
@@ -2234,7 +2274,7 @@ lmf:
 <h3 id="parsed-but-inert--decorative-yaml-fields-8"><a class="header" href="#parsed-but-inert--decorative-yaml-fields-8">Parsed-but-inert / decorative YAML fields</a></h3>
 <p>Everything else in the shipped example file is decorative — unknown keys are silently ignored:</p>
 <ul>
-<li><strong><code>logger.level</code> is inert.</strong> The log level comes from the CLI flag <code>-e/--log-level</code> (default <code>info</code>), overridable by <code>RUST_LOG</code>.</li>
+<li><strong><code>logger.level</code> is read.</strong> The log level is <code>-e/--log-level</code> when given, else this file’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code>, when set, overrides all three (#691).</li>
 <li><strong><code>lmf.sbi.server[]</code> (address/advertise/port) is inert.</strong> The SBI bind address and port come only from <code>--sbi-addr</code>/<code>--sbi-port</code>; the docker deployment passes them on the command line (<code>--sbi-addr 172.23.0.32 --sbi-port 7777</code>).</li>
 <li><strong><code>lmf.nrf.uri</code> is inert.</strong> The NRF URI comes only from the <code>--nrf-uri</code> flag (default <code>http://127.0.0.1:7777</code>). The docker deployment passes <code>--nrf-uri http://172.23.0.10:7777</code> explicitly — setting only the YAML field has no effect.</li>
 </ul>
@@ -2247,7 +2287,7 @@ lmf:
 </thead>
 <tbody>
 <tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/lmf.yaml</code></td><td>Configuration file path (probed only for <code>sbi.oauth2.require</code>).</td></tr>
-<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level (env_logger filter; <code>RUST_LOG</code> takes precedence when set).</td></tr>
+<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>logger.level</code>, else <code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else is <code>info</code>). Without the flag, the config’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code> overrides both (#691).</td></tr>
 <tr><td><code>-l, --log-file</code></td><td>path</td><td>unset</td><td>Accepted but currently <strong>unused</strong> — the daemon never reads this field.</td></tr>
 <tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td>Accepted but currently <strong>unused</strong>.</td></tr>
 <tr><td><code>--sbi-addr</code></td><td>string</td><td><code>0.0.0.0</code></td><td>SBI server bind address. Also used as the advertised host for N1N2 notify callback URIs — <code>0.0.0.0</code> falls back to <code>127.0.0.1</code> (see behavior notes).</td></tr>
@@ -2257,7 +2297,7 @@ lmf:
 <tr><td><code>--tls-key</code></td><td>path</td><td><code>/etc/nextgcore/tls/server.key</code> (when <code>--tls</code>)</td><td>TLS private key file.</td></tr>
 <tr><td><code>--max-measurements</code></td><td>usize</td><td><code>1024</code></td><td>Maximum concurrent measurement contexts in the LMF context store. When full, new positioning sessions fail with 500 <code>POSITIONING_FAILED</code> (“measurement store exhausted”).</td></tr>
 <tr><td><code>--nrf-uri</code></td><td>string</td><td><code>http://127.0.0.1:7777</code></td><td>NRF base URI for registration, heartbeat, AMF discovery, and (when OAuth2 is on) token issuance/JWKS.</td></tr>
-<tr><td><code>--debug-endpoints</code></td><td>bool</td><td><code>false</code></td><td>Enable the six bespoke/debug ingest routes (<code>measurements</code>, <code>nrppa-reports</code>, <code>nrppa-binary-reports</code>, <code>lpp-binary-reports</code>, <code>ue-locations</code>). Fail-closed by default: when disabled these paths 404 exactly like any unknown path (no route disclosure), and in particular <code>PUT ue-locations/{supi}</code> — which would inject an arbitrary client-supplied fix — is unreachable. Marked in source as “must not be enabled in production”. The <code>nrppa-reports</code> JSON takes <code>cellMeasurements[]</code> with <code>nrCgi</code>, <code>rsrp</code>, <code>rsrq</code>, <code>timingAdvance</code>, <code>aoa</code>, <code>rttNs</code> (a two-sided RTT), <code>rstdNs</code>, and, since #713, <code>ueRxTxNs</code> and <code>gnbRxTxNs</code> (the signed UE and gNB Rx-Tx halves, ns, ranged only as a pair).</td></tr>
+<tr><td><code>--debug-endpoints</code></td><td>bool</td><td><code>false</code></td><td>Enable the six bespoke/debug ingest routes (<code>measurements</code>, <code>nrppa-reports</code>, <code>nrppa-binary-reports</code>, <code>lpp-binary-reports</code>, <code>ue-locations</code>). Fail-closed by default: when disabled these paths 404 exactly like any unknown path (no route disclosure), and in particular <code>PUT ue-locations/{supi}</code> — which would inject an arbitrary client-supplied fix — is unreachable. Marked in source as “must not be enabled in production”. The <code>nrppa-reports</code> JSON takes <code>cellMeasurements[]</code> with <code>nrCgi</code>, <code>rsrp</code>, <code>rsrq</code>, <code>timingAdvance</code>, <code>aoa</code>, <code>rttNs</code> (a two-sided RTT), <code>rstdNs</code>, and, since #713, <code>ueRxTxNs</code> and <code>gnbRxTxNs</code> (the signed UE and gNB Rx-Tx halves, ns, ranged only as a pair), and since #832 <code>ecidRttNs</code> (the E-CID round trip, ns). <code>timingAdvance</code> on this route is an NR TA command (TS 38.213 §4.2).</td></tr>
 </tbody>
 </table>
 </div>
@@ -2286,10 +2326,21 @@ lmf:
 <p>A bad entry (latitude outside ±90, longitude outside ±180, missing <code>id</code>/<code>lat</code>/<code>lon</code>) is <strong>rejected individually and named at error level</strong>; the rest of the list still loads, because one typo should not cost every cell. With <strong>nothing</strong> configured, <code>DetermineLocation</code> is refused with 500 <code>POSITIONING_FAILED</code> whose detail names <code>lmf.positioning.cells</code> — it does not fabricate a coordinate. With <strong>fewer than three</strong>, only E-CID is selectable however high the requested accuracy; both cases are warned about once at startup.</p>
 </li>
 <li>
-<p><strong>The requested positioning method follows the LCS QoS (#103).</strong> Before #103 every network-initiated request was LPP E-CID with the Multi-RTT and DL-TDOA bodies hardcoded absent, so a request for ≤10 m accuracy was answered by a method whose output is a Timing-Advance ring. The rule, in order: fewer than three reference points ⇒ E-CID; the UE reported E-CID-only capability ⇒ E-CID; <code>hAccuracy ≤ 10</code> or <code>EMERGENCY_SERVICES</code> ⇒ <strong>NR DL-TDOA</strong> (#713: a Multi-RTT range is UE Rx-Tx plus gNB Rx-Tx, TS 38.305 §8.10, and this LMF does not yet run the NRPPa procedures that return the gNB half (#807), so it does not ask a UE for Multi-RTT; a UE-only Multi-RTT report is not ranged. This relies on the DL-TDOA reference keying fix #714, which lands with or before it); <code>LOW_DELAY</code> ⇒ E-CID (it is a statement about time, and PRS scheduling is not fast); otherwise E-CID. Every E-CID is the one of the UE’s access (#715): <strong>NR E-CID</strong> (<code>nr-ECID-RequestLocationInformation-r16</code>, SS-RSRP/RSRQ) when <code>InputData</code> names an <code>ncgi</code> or no serving cell, <strong>E-UTRA E-CID</strong> (RSRP, RSRQ and the UE Rx-Tx, <code>ueRxTxReq</code>) when it names only an <code>ecgi</code> (ng-eNB). NR E-CID over LPP carries no UE timing quantity, so an LPP-only NR E-CID report yields no fix (500 <code>POSITIONING_FAILED</code>). With <code>LMF_NRPPA_DOWNLINK=1</code> the session also waits for the gNB’s E-CID answer, and <strong>the legs are solved together</strong> once both are in, or with whatever arrived when the response-time budget runs out; whichever leg arrives first no longer decides the outcome alone (#715 review). The gNB’s answer to the on-demand request is read from the E-CID MEASUREMENT INITIATION RESPONSE (TS 38.455 §8.2.1.2), as well as from an E-CID MEASUREMENT REPORT. <strong>Limitation:</strong> only the E-UTRA TADV arms are decoded. A gNB on NR reports its timing term as <code>NR-TADV</code>, which is not decoded yet (#859), so an NR E-CID request against a real NR gNB still ends in 500 <code>POSITIONING_FAILED</code>. Fixes are reported as <code>NR_ECID</code> or <code>ECID</code> by the serving cell’s RAT.</p>
+<p><strong>The requested positioning method follows the LCS QoS (#103).</strong> Before #103 every network-initiated request was LPP E-CID with the Multi-RTT and DL-TDOA bodies hardcoded absent, so a request for ≤10 m accuracy was answered by a method whose output is a Timing-Advance ring. The rule, in order: fewer than three reference points ⇒ E-CID; the UE reported E-CID-only capability ⇒ E-CID; <code>hAccuracy ≤ 10</code> or <code>EMERGENCY_SERVICES</code> ⇒ <strong>NR Multi-RTT</strong> when the gNB half can be obtained (<code>LMF_NRPPA_DOWNLINK=1</code> and at least one <code>lmf.positioning.ngRanNodes</code> entry, #807), else <strong>NR DL-TDOA</strong> (#713: a Multi-RTT range is UE Rx-Tx plus gNB Rx-Tx, TS 38.305 §8.10, and a UE-only Multi-RTT report is not ranged; DL-TDOA relies on the reference keying fix #714); <code>LOW_DELAY</code> ⇒ E-CID (it is a statement about time, and PRS scheduling is not fast); otherwise E-CID. Every E-CID is the one of the UE’s access (#715): <strong>NR E-CID</strong> (<code>nr-ECID-RequestLocationInformation-r16</code>, SS-RSRP/RSRQ) when <code>InputData</code> names an <code>ncgi</code> or no serving cell, <strong>E-UTRA E-CID</strong> (RSRP, RSRQ and the UE Rx-Tx, <code>ueRxTxReq</code>) when it names only an <code>ecgi</code> (ng-eNB). NR E-CID over LPP carries no UE timing quantity, so an LPP-only NR E-CID report yields no fix (500 <code>POSITIONING_FAILED</code>). With <code>LMF_NRPPA_DOWNLINK=1</code> the session also waits for the gNB’s E-CID answer, and <strong>the legs are solved together</strong> once both are in, or with whatever arrived when the response-time budget runs out; whichever leg arrives first no longer decides the outcome alone (#715 review). An <strong>E-UTRA</strong> E-CID session is solved as soon as the UE’s LPP report alone gives a fix (its UE Rx-Tx is a timing term); the NRPPa leg would only refine it. Without that, a silent gNB holds an E-CID session for the whole budget: up to 20 s, or 5 s for <code>LOW_DELAY</code>. A session keeps at most 512 measurements. A session older than 40 s (twice the hard cap) is reaped with its measurement slot. An LPP report correlated only by its 8-bit transaction number is refused when two pending sessions share that number. A UE that reported exactly one E-CID flavour in an LPP <code>ProvideCapabilities</code> is asked for that flavour whatever its access; until #834’s follow-up, those capabilities were never recorded (#834 review). <strong>The UE’s capabilities are asked for (#906).</strong> Before the first positioning request to a UE whose capabilities it does not know, the LMF runs the LPP Capability Transfer (TS 37.355 §5.1.1): a <code>RequestCapabilities</code> for E-UTRA E-CID, NR E-CID, NR Multi-RTT and NR DL-TDOA, through the same N1N2MessageTransfer, and it waits for the <code>ProvideCapabilities</code> for a quarter of the response-time budget, at most 2 s. The wait counts against the budget. The answer is kept per SUPI and decides the method: a UE that reported DL-TDOA but not Multi-RTT is never asked for Multi-RTT; a UE that reported Multi-RTT but not DL-TDOA is asked for E-CID when the gNB half cannot be had, and its Multi-RTT request carries no DL-TDOA set; a UE that reported only E-CID is asked for E-CID. Concurrent requests for one UE share one exchange. A UE that does not answer is positioned as before (capability unknown) and is not asked again for 5 minutes. A late answer is still recorded, whether the AMF tags it with the request’s correlation or with the newest one (#998). An LPP <code>Abort</code> or <code>Error</code> on the request’s transaction ends the wait at once and starts the same back-off. A capability report is used for 24 hours, then asked for again; older reports are dropped from the store. With <code>NO_DELAY</code> (no budget) nothing is asked. The gNB’s answer to the on-demand request is read from the E-CID MEASUREMENT INITIATION RESPONSE (TS 38.455 §8.2.1.2), as well as from an E-CID MEASUREMENT REPORT. <strong>Limitation:</strong> only the E-UTRA TADV arms are decoded. A gNB on NR reports its timing term as <code>NR-TADV</code>, which is not decoded yet (#859), so an NR E-CID request against a real NR gNB still ends in 500 <code>POSITIONING_FAILED</code>. Fixes are reported as <code>NR_ECID</code> or <code>ECID</code> by the serving cell’s RAT. The E-CID timing term is decoded from its own report mapping into a round trip (#832): E-UTRA TADV Type 1/2 from NRPPa per TS 36.133 §10.3.1, and the E-UTRA UE Rx-Tx from LPP per TS 36.133 §9.1.9.3 (2 T_s steps up to 4096 T_s, then 8 T_s; the last, open-ended value is not used; on a TDD cell, identified by its EARFCN, the N_TA,offset of 624 T_s is removed). When a gNB reports both TADV Type 1 and Type 2, Type 1 is used (TS 36.305 §8.3, the more accurate). The NR TADV (<code>NR-TADV</code>, an NRPPa extension) is not decoded yet (#859).</p>
 </li>
 <li>
 <p><strong>TRP keys for the NR methods (#714).</strong> An LPP NR-DL-TDOA or Multi-RTT measurement is looked up as <code>pci-&lt;n&gt;</code> when the UE reported the NR PCI, else as <code>prs-&lt;id&gt;</code> (its DL-PRS ID), so either spelling works in <code>lmf.positioning.cells</code>/<code>.trps</code>. The DL-TDOA reference TRP never carries a PCI (<code>DL-PRS-ID-Info-r16</code> has none), so it is found only as <code>prs-&lt;id&gt;</code>. When the registry does not hold it, the RSTDs are rebased on a neighbour it does hold. The fix is unaffected, but the reported accuracy is doubled, because one TRP of redundancy is lost. When an MO-LR carries several LPP reports with different reference TRPs, each report stays relative to its own reference. The reports are joined through a TRP they share, matched by DL-PRS ID (unique to one TRP within a session) rather than by PCI, and a report that shares none is dropped (#824 review). A PCI does not identify a TRP: a <strong>multi-TRP cell</strong> puts one PCI on several TRPs, and PCIs are reused across sites. A <code>pci-&lt;n&gt;</code> key reached from two different DL-PRS IDs in one session is therefore treated as ambiguous and not used (logged at warn). Where measured TRPs share a PCI, key the registry by <code>prs-&lt;id&gt;</code>. Use <strong>one key scheme per registry</strong>, all <code>pci-&lt;n&gt;</code> or all <code>prs-&lt;id&gt;</code>: in a mixed registry, a neighbour whose PCI is missing can match another TRP’s <code>prs-&lt;id&gt;</code>. DL-TDOA fixes are reported as <code>DL_TDOA</code>. Open-ended NR-RSTD report values (the first and last bins, TS 38.133 §10.1.23.3) are not used.</p>
+</li>
+<li>
+<p><strong>Multi-RTT, the gNB half (#807).</strong> With the NRPPa downlink on and <code>lmf.positioning.ngRanNodes</code> set, a Multi-RTT request runs the NRPPa procedures of TS 38.305 §8.10.3.2 before the UE is asked: TRP Information Exchange with each configured node once (TS 38.455 §8.2.8; TRP-ID → NR PCI and position, a position not in the registry is added as <code>pci-&lt;n&gt;</code>, a configured one is kept), Positioning Information Exchange with the serving gNB (§8.2.6; semi-persistent SRS requested, the SRS configuration returned), Positioning Activation (§8.2.9; none for periodic SRS), and an on-demand MEASUREMENT REQUEST for the gNB Rx-Tx time difference of each node’s TRPs (§8.5.1, carrying the UE’s SRS configuration). The non-UE-associated messages go through the AMF’s <code>NonUeN2MessageTransfer</code> (TS 29.518 §5.2.2.4.1.2) and come back through a <code>NonUeN2InfoSubscribe</code> for the NRPPa class that the LMF creates. Answers are matched by NRPPa procedure code and transaction id. The gNB halves are keyed <code>pci-&lt;n&gt;</code> by the TRP information and paired with the UE halves of the same TRP whose time stamps (<code>nr-TimeStamp-r16</code> and the NRPPa <code>TimeStamp</code>) are within 200 ms, across the SFN wrap. The session waits for both legs, or for the response-time budget. Open-ended gNB Rx-Tx report values are not used, and the SRS is deactivated afterwards (§8.2.10). When any of this cannot be set up (no TRP with a PCI, no SRS configuration, the activation refused, no Measurement Request sent), the UE is asked for DL-TDOA instead. Once it is set up, the UE is asked for <strong>Multi-RTT and DL-TDOA in one request</strong>, and both result sets are kept, so a gNB that answers MEASUREMENT FAILURE or never answers leaves a DL-TDOA fix rather than a 500 (#903 review). A PCI that TRP Information reports on more than one TRP (a multi-TRP cell, or PCI reuse) names no single TRP: those TRPs are not measured, their position is not learned, and a UE-half key reached from two DL-PRS IDs is not ranged. A node that does not answer TRP Information is not asked again for 60 s. The setup counts against the response-time budget. The requested SRS bandwidth is <code>lmf.positioning.srsBandwidthMhz</code> (an FR1 value of TS 38.455 <code>BandwidthSRS</code>, default 20). <strong>DL-PRS assistance data (#911).</strong> For a Multi-RTT or DL-TDOA request (same conditions: NRPPa downlink on, <code>ngRanNodes</code> set), TRP Information Exchange also asks for each TRP’s NR CGI, ARFCN, PRS configuration and SFN initialisation time. The LMF gives every TRP that reported a PRS configuration a DL-PRS ID of its own (0..255, kept for the life of the process), and sends the UE an LPP <code>ProvideAssistanceData</code> with <code>NR-DL-PRS-AssistanceData-r16</code> before the <code>RequestLocationInformation</code> (TS 38.305 §8.10.3.2 step 7; TS 37.355 §5.2.2). It goes in the body of each method asked for. The assistance data is built as follows. The resource sets are grouped into positioning frequency layers by their common parameters: at most 4 layers, 64 TRPs per layer and 2 sets per TRP per layer. The reference TRP is the serving cell’s TRP when its CGI matches <code>InputData.ncgi</code>, else the first. The SFN0 offset comes from the SFN initialisation times; TRPs without them are taken as synchronised. The expected RSTD and its uncertainty come from the geometry around the serving TRP, or around the TRPs’ centroid. A resource set TS 37.355 cannot express (a periodicity it lacks for that subcarrier spacing, an RE offset not below the comb size, an extended symbol offset) is left out. Once the assistance data has been delivered, the session’s UE measurements on those DL-PRS IDs are keyed by their TRP (<code>trp-&lt;mcc&gt;&lt;mnc&gt;-&lt;gnbId hex&gt;-&lt;trpId&gt;</code>, whose position comes from TRP Information or the configured CGI/PCI entry), not by the PCI the UE reports. So TRPs sharing a PCI are measured (gNB half included) and ranged separately. <code>nr-AssistanceAvailability</code> stays FALSE: the UE may not request more DL-PRS assistance data. A node’s TRP Information is asked for again once it is an hour old, so a changed PRS configuration or a corrected TRP position is picked up; a TRP keeps its DL-PRS ID. <strong>posSIB IDs.</strong> A UE may also hold posSIB-broadcast DL-PRS assistance data with a different numbering, and could in principle report against those IDs. Such a measurement would be keyed by the TRP the LMF gave that ID. This is not expected, because the dedicated assistance data is the one sent for this request. With no TRP reporting a PRS configuration (nextgsim’s gNB reports none), no assistance data is sent, and a UE measures only the PRS its posSIBs describe. <strong>Not covered end to end:</strong> nextgsim’s gNB answers TRP and Positioning Information but not Positioning Activation or the Measurement procedure, so this path is tested in-process against amfd’s real Namf handlers and a scripted NG-RAN.</p>
+<pre><code class="language-yaml">lmf:
+  positioning:
+    ngRanNodes:
+      - mcc: "001"
+        mnc: "01"
+        gnbId: "000001"   # hex (TS 29.571 GNbId.gNBValue)
+        bitLength: 22     # 22..32
+</code></pre>
 </li>
 <li>
 <p><strong>NRPPa toward NG-RAN is gated (#103).</strong> <code>LMF_NRPPA_DOWNLINK=1</code> makes the LMF send an E-CID Measurement Initiation Request (TS 38.455 §8.2.1.2, procedure code 2) to the serving gNB before it asks the UE over LPP — the gNB half of the measurement. Off by default because it is new external N2 signalling. Best-effort: a gNB that declines must not fail a request the UE could still answer. The AMF relays it over NGAP procedure 8 and echoes the LMF id into the RoutingID, so the uplink reply routes back here.</p>
@@ -2351,10 +2402,13 @@ mbsmf:
 <h3 id="parsed-but-inert--decorative-yaml-fields-9"><a class="header" href="#parsed-but-inert--decorative-yaml-fields-9">Parsed-but-inert / decorative YAML fields</a></h3>
 <p>Everything else in the shipped example file is decorative for this binary — the daemon never deserializes it:</p>
 <ul>
-<li><strong><code>logger.level</code> is inert.</strong> The log level comes from the CLI flag <code>-e/--log-level</code> (default <code>info</code>), and <code>RUST_LOG</code> overrides that (the logger is built with <code>env_logger::Builder::from_env</code> using the flag only as the default filter).</li>
+<li><strong><code>logger.level</code> is read.</strong> The log level is <code>-e/--log-level</code> when given, else this file’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code>, when set, overrides all three (#691).</li>
 <li><strong><code>mbsmf.sbi.server[]</code> (address/advertise/port) is inert.</strong> The SBI bind address and port come exclusively from <code>--sbi-addr</code>/<code>--sbi-port</code>. No advertise address is read.</li>
 <li><strong><code>mbsmf.nrf.uri</code> is inert.</strong> Unlike some other NFs (e.g. NSACF, which falls back YAML→CLI), the MB-SMF takes its NRF URI only from the <code>--nrf-uri</code> flag; the docker deployment passes it on the command line and the YAML entry merely mirrors it.</li>
 </ul>
+<blockquote>
+<p><strong>Clock:</strong> this NF refuses to start when the local clock reads before 2020-01-01, because its PFCP Recovery Time Stamp would be wrong. See <a href="#a-set-clock-is-required-pfcp-nfs">A set clock is required</a> for the remedy on RTC-less hosts.</p>
+</blockquote>
 <h2 id="command-line-flags-11"><a class="header" href="#command-line-flags-11">Command-line flags</a></h2>
 <p>Runtime knobs with real defaults from the clap <code>Args</code> struct in <code>main.rs</code>:</p>
 <div class="table-wrapper">
@@ -2364,7 +2418,7 @@ mbsmf:
 </thead>
 <tbody>
 <tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/mbsmf.yaml</code></td><td>Configuration file path (read only for the OAuth2 knob above).</td></tr>
-<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>); acts as the <code>env_logger</code> default filter, so <code>RUST_LOG</code> wins when set.</td></tr>
+<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>logger.level</code>, else <code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else is <code>info</code>). Without the flag, the config’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code> overrides both (#691).</td></tr>
 <tr><td><code>-l, --log-file</code></td><td>path</td><td>unset</td><td>Accepted but currently <strong>unused</strong> — the parsed value is never referenced.</td></tr>
 <tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td>Accepted but currently <strong>unused</strong> — the parsed value is never referenced.</td></tr>
 <tr><td><code>--sbi-addr</code></td><td>string</td><td><code>0.0.0.0</code></td><td>SBI server bind address (also advertised to the NRF in the NF profile).</td></tr>
@@ -2426,7 +2480,7 @@ dccf:
 <h3 id="parsed-but-inert--decorative-yaml-fields-10"><a class="header" href="#parsed-but-inert--decorative-yaml-fields-10">Parsed-but-inert / decorative YAML fields</a></h3>
 <p>Every other field in the shipped example file is decorative; since the file is only probed for <code>sbi.oauth2.require</code>, all other keys are silently ignored:</p>
 <ul>
-<li><strong><code>logger.level</code> is inert.</strong> The log level comes from the CLI flag <code>-e/--log-level</code> (default <code>info</code>) or <code>RUST_LOG</code>, not the YAML.</li>
+<li><strong><code>logger.level</code> is read.</strong> The log level is <code>-e/--log-level</code> when given, else this file’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code>, when set, overrides all three (#691).</li>
 <li><strong><code>dccf.sbi.server[]</code> (address/advertise/port) is inert.</strong> The SBI bind address and port come from <code>--sbi-addr</code>/<code>--sbi-port</code>; the docker deployment passes them on the command line.</li>
 <li><strong><code>dccf.nrf.uri</code> is inert.</strong> The NRF URI comes exclusively from <code>--nrf-uri</code> (default <code>http://127.0.0.1:7777</code>); the docker deployment passes <code>--nrf-uri http://172.23.0.10:7777</code> explicitly.</li>
 <li><strong><code>dccf.max_subscriptions</code> is inert.</strong> The subscription cap comes from <code>--max-subscriptions</code>; the YAML value <code>4096</code> merely mirrors the CLI default.</li>
@@ -2441,7 +2495,7 @@ dccf:
 <tbody>
 <tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/dccf.yaml</code></td><td>Configuration file path (read only for the OAuth2 knob).</td></tr>
 <tr><td><code>-l, --log-file</code></td><td>path</td><td>unset</td><td><strong>Parsed but unused</strong> — declared in <code>Args</code> yet never referenced by the binary; logging goes to stderr via <code>env_logger</code>.</td></tr>
-<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>). Overridden by <code>RUST_LOG</code> when set.</td></tr>
+<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>logger.level</code>, else <code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else is <code>info</code>). Without the flag, the config’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code> overrides both (#691).</td></tr>
 <tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td><strong>Parsed but unused</strong> — declared in <code>Args</code> yet never referenced by the binary.</td></tr>
 <tr><td><code>--sbi-addr</code></td><td>string</td><td><code>0.0.0.0</code></td><td>SBI server bind address; also advertised as the NF’s <code>ipv4Addresses</code> in the NRF registration.</td></tr>
 <tr><td><code>--sbi-port</code></td><td>u16</td><td><code>7816</code></td><td>SBI server port (“TS 29.574 default: 7816” per code comment); docker deployments pass <code>7777</code>.</td></tr>
@@ -2490,7 +2544,7 @@ ees:
 <h3 id="parsed-but-inert--decorative-yaml-fields-11"><a class="header" href="#parsed-but-inert--decorative-yaml-fields-11">Parsed-but-inert / decorative YAML fields</a></h3>
 <p>Since the YAML file is never parsed, <strong>every</strong> field in the shipped example is decorative:</p>
 <ul>
-<li><strong><code>logger.level</code> is inert.</strong> The log level comes from the CLI flag <code>-e/--log-level</code> (default <code>info</code>) or <code>RUST_LOG</code>.</li>
+<li><strong><code>logger.level</code> is read.</strong> The log level is <code>-e/--log-level</code> when given, else this file’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code>, when set, overrides all three (#691).</li>
 <li><strong><code>ees.sbi.server[]</code> (address/advertise/port) is inert.</strong> The SBI bind address and port come from <code>--sbi-addr</code>/<code>--sbi-port</code>; the same values are what the EES advertises in its ECS-registration <code>EndPoint</code>.</li>
 <li><strong><code>ees.nrf.uri</code> is inert and doubly stale.</strong> The EES does not register with the NRF at all (eesd-01); the ECS apiRoot is <code>--ecs-uri</code>, a CLI flag only.</li>
 </ul>
@@ -2505,7 +2559,7 @@ ees:
 <tbody>
 <tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/ees.yaml</code></td><td>Configuration file path. <strong>Accepted but never read</strong> by the daemon.</td></tr>
 <tr><td><code>-l, --log-file</code></td><td>path</td><td>unset</td><td>Log file path. <strong>Parsed but never consumed</strong> — logging goes through <code>env_logger</code> regardless.</td></tr>
-<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>). <code>RUST_LOG</code> takes precedence when set.</td></tr>
+<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>logger.level</code>, else <code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else is <code>info</code>). Without the flag, the config’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code> overrides both (#691).</td></tr>
 <tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td>Disable color output. <strong>Parsed but never consumed.</strong></td></tr>
 <tr><td><code>--sbi-addr</code></td><td>string</td><td><code>0.0.0.0</code></td><td>SBI server bind address; also placed in the <code>EESRegistration</code> endpoint sent to the ECS.</td></tr>
 <tr><td><code>--sbi-port</code></td><td>u16</td><td><code>7814</code></td><td>SBI server port (docker deployments pass <code>7777</code>).</td></tr>
@@ -2782,7 +2836,7 @@ pin:
 <h3 id="parsed-but-inert--decorative-yaml-fields-12"><a class="header" href="#parsed-but-inert--decorative-yaml-fields-12">Parsed-but-inert / decorative YAML fields</a></h3>
 <p>Because the daemon never reads the file, <strong>every field in the shipped example YAML is decorative</strong>:</p>
 <ul>
-<li><strong><code>logger.level</code> is inert.</strong> The log level comes from the CLI flag <code>-e/--log-level</code> (default <code>info</code>) or the <code>RUST_LOG</code> environment variable.</li>
+<li><strong><code>logger.level</code> is read.</strong> The log level is <code>-e/--log-level</code> when given, else this file’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code>, when set, overrides all three (#691).</li>
 <li><strong><code>pin.sbi.server[]</code> (address/advertise/port) is inert.</strong> The SBI bind address and port come from <code>--sbi-addr</code>/<code>--sbi-port</code>. Note the example file says port <code>7777</code> while the docker deployment actually launches the daemon with <code>--sbi-port 7815</code> — the YAML value is not consulted.</li>
 <li><strong><code>pin.nrf.uri</code> is inert.</strong> The NRF location comes from <code>--nrf-uri</code>, and is used only to locate the NRF JWKS endpoint when OAuth2 enforcement is on (the daemon does not register with the NRF at all).</li>
 </ul>
@@ -2796,7 +2850,7 @@ pin:
 <tbody>
 <tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/pin.yaml</code></td><td>Configuration file path. <strong>Accepted but never read</strong> — the daemon performs no YAML parsing.</td></tr>
 <tr><td><code>-l, --log-file</code></td><td>path</td><td>unset</td><td>Declared but not applied — the field is never read after parsing; logging goes to env_logger’s default output.</td></tr>
-<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level, used as the env_logger default filter. <code>RUST_LOG</code>, when set, takes precedence.</td></tr>
+<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>logger.level</code>, else <code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else is <code>info</code>). Without the flag, the config’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code> overrides both (#691).</td></tr>
 <tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td>Declared but not applied — the field is never read after parsing.</td></tr>
 <tr><td><code>--sbi-addr</code></td><td>string</td><td><code>0.0.0.0</code></td><td>Server bind address (docker passes <code>172.23.0.35</code>).</td></tr>
 <tr><td><code>--sbi-port</code></td><td>u16</td><td><code>7815</code></td><td>Server port. The docker deployment also uses <code>7815</code> (not <code>7777</code> like most NFs).</td></tr>
@@ -3072,7 +3126,7 @@ read.</li>
 </thead>
 <tbody>
 <tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/nef.yaml</code></td><td>Configuration file path.</td></tr>
-<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level; <code>RUST_LOG</code> overrides it.</td></tr>
+<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>logger.level</code>, else <code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else is <code>info</code>). Without the flag, the config’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code> overrides both (#691).</td></tr>
 <tr><td><code>-l, --log-file</code></td><td>path</td><td>unset</td><td>Log file path.</td></tr>
 <tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td>Disable colored output.</td></tr>
 <tr><td><code>--sbi-addr</code> / <code>--sbi-port</code></td><td>string / u16</td><td><code>0.0.0.0</code> / <code>7817</code></td><td>SBI bind address and port.</td></tr>
@@ -3148,12 +3202,15 @@ ucmf:
 <tr><td><code>ucmf.version_id</code></td><td>string, two hex digits</td><td><code>"00"</code></td><td>TS 23.003 §29.2 Version ID of the PLMN-assigned IDs this UCMF assigns. Changing it makes every older PLMN-assigned ID resolve as <code>OUT_DATED_VERSION_ID_IN_RAC_ID</code>, notified to subscribers. <code>--version-id</code> overrides it.</td></tr>
 <tr><td><code>ucmf.mode</code></td><td><code>A</code> or <code>B</code></td><td><code>B</code></td><td>TS 23.501 §5.4.4.1a mode of operation. B (the RAN sends the TS 38.331 format only) is the only mode allowed when RACS is used in 5GS alone. <code>--mode</code> overrides it.</td></tr>
 <tr><td><code>ucmf.purge_outdated_ids</code></td><td>bool</td><td><code>false</code></td><td>Delete PLMN-assigned IDs under older Version IDs at startup.</td></tr>
-<tr><td><code>ucmf.state_file</code></td><td>path</td><td>unset</td><td>JSON snapshot of the dictionary, subscriptions and provisionings. Unset: memory only. <code>--state-file</code> overrides it.</td></tr>
+<tr><td><code>ucmf.state_file</code></td><td>path</td><td>unset</td><td>JSON snapshot of the dictionary, subscriptions and provisionings. Unset: memory only. <code>--state-file</code> overrides it. Written behind (#786): changes are flushed every 500 ms and at shutdown, not on every request, so a crash can lose up to the last 500 ms of changes. IDs are never reissued after such a crash: the snapshot reserves 1024 IDs of each kind ahead, written synchronously, so a restart continues above every ID handed out. When that reservation cannot be written (disk full, read-only, I/O error), no ID is handed out: Assign and Subscribe answer 500 <code>SYSTEM_FAILURE</code> and Provisioning reports <code>OTHER_REASON</code> until the file can be written (#843 review). The snapshot is copied under the state lock and serialised after it is released, and the final flush runs after the SBI server has stopped.</td></tr>
+<tr><td><code>ucmf.limits.max_dic_entries</code></td><td>integer</td><td><code>10000</code></td><td>Most dictionary entries, assigned plus provisioned (#786). Past it Assign answers <code>500 INSUFFICIENT_RESOURCES</code> and Provisioning reports the RACS ID <code>OTHER_REASON</code>. An ID counter (entry, subscription, provisioning) that reaches the top of its range refuses the same way rather than reissue an ID.</td></tr>
+<tr><td><code>ucmf.limits.max_subscriptions</code></td><td>integer</td><td><code>10000</code></td><td>Most Nucmf_UECapabilityManagement subscriptions; past it Subscribe answers <code>500 INSUFFICIENT_RESOURCES</code>.</td></tr>
+<tr><td><code>ucmf.limits.max_subscriptions_per_consumer</code></td><td>integer</td><td><code>16</code></td><td>Most subscriptions per consumer. A subscription counts against its <code>nfId</code> and against its notification URI’s <code>host:port</code>, and either reaching the limit refuses, so a consumer cannot sidestep it by varying the self-declared <code>nfId</code> (#843 review).</td></tr>
 <tr><td><code>ucmf.sbi.oauth2.require</code></td><td>bool</td><td><code>false</code></td><td>Require an OAuth2 token on the SBI. <code>--oauth2-require</code> overrides it.</td></tr>
 </tbody>
 </table>
 </div>
-<p><code>logger.level</code> is not read; use <code>-e/--log-level</code> or <code>RUST_LOG</code>.</p>
+<p>The log level is <code>-e/--log-level</code> when given, else this file’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code>, when set, overrides all three (#691).</p>
 <h2 id="command-line-flags-18"><a class="header" href="#command-line-flags-18">Command-line flags</a></h2>
 <div class="table-wrapper">
 <table>
@@ -3162,7 +3219,7 @@ ucmf:
 </thead>
 <tbody>
 <tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/ucmf.yaml</code></td><td>Configuration file path.</td></tr>
-<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level; <code>RUST_LOG</code> overrides it.</td></tr>
+<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>logger.level</code>, else <code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else is <code>info</code>). Without the flag, the config’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code> overrides both (#691).</td></tr>
 <tr><td><code>--sbi-addr</code> / <code>--sbi-port</code></td><td>string / u16</td><td><code>0.0.0.0</code> / <code>7777</code></td><td>SBI bind address and port.</td></tr>
 <tr><td><code>--tls</code>, <code>--tls-cert</code>, <code>--tls-key</code></td><td>flag, path, path</td><td>off</td><td>TLS on the SBI listener.</td></tr>
 <tr><td><code>--nrf-uri</code></td><td>string</td><td><code>http://127.0.0.1:7777</code></td><td>NRF base URI, used when the YAML names none.</td></tr>
@@ -3182,6 +3239,7 @@ ucmf:
 <tbody>
 <tr><td><code>OTEL_EXPORTER_OTLP_ENDPOINT</code></td><td><code>http://jaeger:4317</code></td><td>OpenTelemetry OTLP exporter.</td></tr>
 <tr><td><code>RUST_LOG</code></td><td>unset</td><td>Overrides the log level.</td></tr>
+<tr><td><code>UCMF_METRICS_ADDR</code></td><td><code>127.0.0.1:9096</code></td><td>Where <code>GET /metrics</code> (Prometheus text) listens (<code>ip:port</code>). Unset, the host is <code>NEXTGCORE_METRICS_BIND</code> if set, else <code>127.0.0.1</code>, as for every NF. It is unauthenticated, so it defaults to loopback; set a private address deliberately to scrape it from another host. Port 9096, not 9090, which mmed, sgwud and upfd default to. A value that does not parse is logged at warn and the default is used. Series: <code>ucmf_state_lock_poison_recoveries_total</code> (a request panicked while holding the state lock; a defect to report), <code>ucmf_dictionary_full_refusals_total</code> (Assign only), <code>ucmf_subscription_limit_refusals_total</code> (the two subscription limits only), <code>ucmf_dictionary_entries</code>, <code>ucmf_subscriptions</code>.</td></tr>
 </tbody>
 </table>
 </div>
@@ -3252,7 +3310,7 @@ scp:
 <p>All of the <code>scp</code>-level keys are shipped <strong>commented out</strong>, so the built-in defaults apply unless an operator uncomments them.</p>
 <p><strong>Inert</strong> — present in the shipped file and not read anywhere:</p>
 <ul>
-<li><strong><code>logger.file.path</code> and <code>logger.level</code>.</strong> The log level comes from <code>RUST_LOG</code> when set, else the CLI flag <code>-e/--log-level</code> (default <code>info</code>). There is no working log-file output (<code>-l/--log-file</code> is accepted but unused).</li>
+<li><strong><code>logger.level</code> is read; <code>logger.file.path</code> is not.</strong> The log level is <code>-e/--log-level</code> when given, else this file’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code>, when set, overrides all three (#691). There is no working log-file output (<code>-l/--log-file</code> is accepted but unused).</li>
 <li><strong><code>global.max.ue</code> / <code>global.max.peer</code>.</strong> Not read; <code>scp_context_init()</code> takes no size.</li>
 <li><strong><code>scp.sbi.tls.ca</code> and <code>scp.sbi.tls.min_version</code>.</strong> There is no CA-bundle or minimum-version knob in the code; the rest of the <code>tls</code> block <em>is</em> read.</li>
 </ul>
@@ -3266,7 +3324,7 @@ scp:
 <tbody>
 <tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/scp.yaml</code></td><td>Configuration file path. Parsed; see the live-fields table above.</td></tr>
 <tr><td><code>-l, --log-file</code></td><td>path</td><td>unset</td><td>Log file path — <strong>accepted but unused</strong> by <code>init_logging</code>.</td></tr>
-<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>); unrecognized values fall back to <code>info</code>.</td></tr>
+<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>logger.level</code>, else <code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else is <code>info</code>). Without the flag, the config’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code> overrides both (#691).</td></tr>
 <tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td>Disable color output.</td></tr>
 <tr><td><code>-k, --kill</code></td><td>flag</td><td>off</td><td>Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor.</td></tr>
 <tr><td><code>--sbi-addr</code></td><td>string</td><td><code>127.0.0.1</code></td><td>SBI server bind address (docker deployments pass the container IP). Precedence: flag &gt; <code>SCP_SBI_ADDR</code> &gt; <code>scp.sbi.server[0].address</code> &gt; default.</td></tr>
@@ -3414,7 +3472,7 @@ sepp:
 <h3 id="parsed-but-inert--decorative-yaml-fields-13"><a class="header" href="#parsed-but-inert--decorative-yaml-fields-13">Parsed-but-inert / decorative YAML fields</a></h3>
 <p>Everything in the shipped example YAML is inert. The functional equivalents, where they exist, are CLI flags:</p>
 <ul>
-<li><strong><code>logger.level</code> / <code>logger.file.path</code></strong> — inert. Log level comes only from <code>-e/--log-level</code> (default <code>info</code>); there is no working log-file output (<code>--log-file</code> is declared in the <code>Args</code> struct but never referenced again).</li>
+<li><strong><code>logger.level</code> is read; <code>logger.file.path</code> is inert.</strong> The log level is <code>-e/--log-level</code> when given, else this file’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code>, when set, overrides all three (#691). There is no working log-file output (<code>--log-file</code> is declared in the <code>Args</code> struct but never referenced again).</li>
 <li><strong><code>sepp.sbi.server[]</code> (address/port)</strong> — inert. The consumer SBI bind comes from <code>--sbi-addr</code>/<code>--sbi-port</code>.</li>
 <li><strong><code>sepp.n32.server[]</code> (sender/scheme/address/port/n32f)</strong> — inert. Use <code>--n32-addr</code>/<code>--n32-port</code> (single listener; the separate n32f port in the YAML has no equivalent — N32-c and N32-f share one listener) and <code>--sender</code> for the FQDN.</li>
 <li><strong><code>sepp.n32.client.sepp[]</code> (receiver/uri/resolve)</strong> — inert. Peers come from repeatable <code>--peer-sepp fqdn=apiroot</code> flags; there is no <code>resolve</code> (DNS-override) equivalent.</li>
@@ -3431,7 +3489,7 @@ sepp:
 </thead>
 <tbody>
 <tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/sepp.yaml</code></td><td>Configuration file path (read but not parsed — see above).</td></tr>
-<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>); unrecognized values fall back to <code>info</code>.</td></tr>
+<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>logger.level</code>, else <code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else is <code>info</code>). Without the flag, the config’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code> overrides both (#691).</td></tr>
 <tr><td><code>-l, --log-file</code></td><td>path</td><td>unset</td><td>Declared but <strong>never used</strong> — no file logging is wired up.</td></tr>
 <tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td>Disable color output.</td></tr>
 <tr><td><code>-k, --kill</code></td><td>flag</td><td>off</td><td>Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor.</td></tr>
@@ -3478,7 +3536,7 @@ sepp:
 </ul>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="mme-configuration"><a class="header" href="#mme-configuration">MME Configuration</a></h1>
-<p>The MME (Mobility Management Entity, <code>nextgcore-mmed</code>) is the 4G/EPS control-plane anchor of the dual 5G+4G core. It serves S1-MME toward eNBs (S1AP encoded and decoded by <code>nextgcore-s1ap-gen</code>, the codec generated from the TS 36.413 ASN.1; the hand-written S1AP codec was removed, #514), NAS EMM/ESM toward UEs (TS 24.301), S11 GTPv2-C toward the SGW-C, S6a Diameter toward the HSS, and optionally N26 GTPv2-C toward an AMF for EPS↔5GS interworking. The crate also carries SGsAP and SBc-AP message handling.</p>
+<p>The MME (Mobility Management Entity, <code>nextgcore-mmed</code>) is the 4G/EPS control-plane anchor of the dual 5G+4G core. It serves S1-MME toward eNBs (S1AP encoded and decoded by <code>nextgcore-s1ap-gen</code>, the codec generated from the TS 36.413 ASN.1; the hand-written S1AP codec was removed, #514), NAS EMM/ESM toward UEs (TS 24.301), S11 GTPv2-C toward the SGW-C, S6a Diameter toward the HSS, and optionally N26 GTPv2-C toward an AMF for EPS↔5GS interworking. The crate also carries SGsAP message handling and the SBc-AP warning data structures and handlers; it has no SBc-AP transport (see <a href="#not-supported">Not supported</a>).</p>
 <p>Configuration comes from a YAML file (default <code>/etc/nextgcore/mme.yaml</code>, <code>-c/--config</code>), the freeDiameter <code>.conf</code> that file names, a few environment variables, and four CLI flags. A missing or malformed file, or one with no <code>mme:</code> section, logs a warning and leaves the built-in defaults in place (<code>src/bins/nextgcore-mmed/src/config.rs</code>).</p>
 <blockquote>
 <p><strong>Honesty note:</strong> the nightly <code>Docker E2E (EPC)</code> job attaches a real LTE UE through nextgsim’s eNB to this MME and pings through the default bearer with 0% loss (<code>docker/rust/epc-attach-check.sh</code>). Dedicated bearers, handover, idle mode/paging and IPv6 PDN are not asserted there. This is the project’s own matched-simulator validation, not third-party certification.</p>
@@ -3568,7 +3626,7 @@ mme:
 </thead>
 <tbody>
 <tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/mme.yaml</code></td><td>Configuration file path.</td></tr>
-<tr><td><code>-l, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>); unrecognized values fall back to <code>info</code>.</td></tr>
+<tr><td><code>-l, --log-level</code></td><td>string</td><td><code>logger.level</code>, else <code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else is <code>info</code>). Without the flag, the config’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code> overrides both (#691).</td></tr>
 <tr><td><code>--no-color</code></td><td>flag</td><td>off</td><td>Disable colored output.</td></tr>
 <tr><td><code>-d, --daemon</code></td><td>flag</td><td>off</td><td>Daemon mode.</td></tr>
 </tbody>
@@ -3584,15 +3642,30 @@ mme:
 </thead>
 <tbody>
 <tr><td><code>MME_N26_INTERWORKING</code></td><td>off</td><td><code>1</code>/<code>true</code> binds the N26 socket and enables EPS↔5GS interworking (idle-mode context transfer, connected-mode handover). Off: a standalone EPC, and a UE arriving from 5GS is handled as TS 24.301 requires of an MME with no N26.</td></tr>
+<tr><td><code>MME_N26_PEER_T3_SECS</code></td><td><code>3</code></td><td>The AMF’s GTPv2-C T3-RESPONSE (TS 29.274 §7.6), floored at 1 and capped at 60 (a larger value is logged and capped). With <code>MME_N26_PEER_N3</code> it sizes how long a sent N26 response is kept to answer the AMF’s retransmission of the same request: (N3 + 1) x T3, 12 s by default. Set both to the AMF’s values when they are longer than the defaults, or a late retransmitted Forward Relocation Request is processed a second time.</td></tr>
+<tr><td><code>MME_N26_PEER_N3</code></td><td><code>3</code></td><td>The AMF’s GTPv2-C N3-REQUESTS (TS 29.274 §7.6), capped at 10; see <code>MME_N26_PEER_T3_SECS</code>.</td></tr>
 <tr><td><code>MME_ECHO_INTERVAL_SECS</code></td><td><code>60</code></td><td>GTPv2-C Echo (path management) interval; <code>0</code> disables it.</td></tr>
-<tr><td><code>MME_DIAMETER_TW_SECS</code></td><td><code>30</code></td><td>S6a Device-Watchdog interval Tw (RFC 6733 §5.5, RFC 3539 §3.4.1), floored at 6. After Tw with nothing received a DWR is sent; with no answer within another Tw the connection is closed and redialled (Tc, doubling to at most 8 x Tc). A redialled connection carries traffic once three watchdogs are answered. Keep Tw below 3 x the HSS’s Tc, where hssd drops an idle connection.</td></tr>
+<tr><td><code>MME_DIAMETER_TW_SECS</code></td><td><code>30</code></td><td>S6a Device-Watchdog interval Tw (RFC 6733 §5.5, RFC 3539 §3.4.1), floored at 6. After Tw with nothing received a DWR is sent; with no answer within another Tw the connection is closed and redialled (Tc, doubling to at most 8 x Tc). A redialled connection carries traffic once three watchdogs are answered. hssd drops no idle connection; against an HSS that does (one built on <code>DiameterServer</code> drops after 3 x its Tc), keep Tw below that. An unparsable value is logged and 30 is used.</td></tr>
 <tr><td><code>MME_RESTART_COUNTER_FILE</code></td><td><code>/var/lib/nextgcore/mme-restart-counter</code></td><td>Where the TS 23.007 restart counter is persisted; it is advanced on every start.</td></tr>
 <tr><td><code>MME_RESTART_COUNTER</code></td><td>unset</td><td>Fixed restart counter (u8), overriding the persisted one.</td></tr>
 <tr><td><code>OTEL_EXPORTER_OTLP_ENDPOINT</code></td><td><code>http://jaeger:4317</code></td><td>OpenTelemetry OTLP exporter.</td></tr>
+<tr><td><code>MME_METRICS_ADDR</code></td><td>unset</td><td>Full <code>ip:port</code> of the unauthenticated <code>/metrics</code> listener (handover failure counters). Wins over <code>NEXTGCORE_METRICS_BIND</code>.</td></tr>
+<tr><td><code>NEXTGCORE_METRICS_BIND</code></td><td><code>127.0.0.1</code></td><td>Host of the <code>/metrics</code> listener on port 9090 when <code>MME_METRICS_ADDR</code> is unset (#837). <code>docker-compose-epc.yml</code> and the EKS EPC overlay set <code>0.0.0.0</code> inside the private network; no metrics port is published on the host.</td></tr>
 </tbody>
 </table>
 </div>
 <p><code>RUST_LOG</code> overrides <code>-l/--log-level</code> when set (the <code>RUST_LOG: info</code> in <code>docker-compose-epc.yml</code> applies).</p>
+<h2 id="not-supported"><a class="header" href="#not-supported">Not supported</a></h2>
+<ul>
+<li><strong>SBc-AP: no CBC interface (#1071).</strong> mmed does not listen for, or connect to, a Cell Broadcast Centre. TS 29.168 SBc-AP runs over SCTP on port 29168 (PPID 24), and mmed has neither that transport nor an SBc-AP codec. As a result:
+<ul>
+<li>ETWS and CMAS warnings (TS 23.041) cannot be delivered. No Write-Replace Warning or Stop Warning arrives from a CBC, so no WRITE-REPLACE WARNING REQUEST or KILL REQUEST is sent to an eNB. The <code>sbc_handler</code> procedures exist, but nothing calls them in production.</li>
+<li>An eNB’s <strong>PWS RESTART INDICATION</strong> (TS 36.413 §8.12.3) is decoded and validated against the sender’s own Global eNB ID. It is counted in <code>mme_s1ap_pws_restart_indications_total</code> and logged, but not propagated to a CBC. TS 23.007 §15A.1.2 has the CBC reload the restarted cells’ warnings; mmed does not replay its own copy.</li>
+<li>An eNB’s <strong>PWS FAILURE INDICATION</strong> (TS 36.413 §8.12.4) is handled in the same way. It is decoded, validated against the sender, counted in <code>mme_s1ap_pws_failure_indications_total</code>, and its failed cells are logged. It is not propagated to a CBC.</li>
+<li>Toward a CBC, mmed sends no SBc-AP PWS Restart Indication, PWS Failure Indication, Write-Replace Warning Indication or Stop Warning Indication.</li>
+</ul>
+</li>
+</ul>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="hss-configuration"><a class="header" href="#hss-configuration">HSS Configuration</a></h1>
 <p>The HSS (Home Subscriber Server, <code>nextgcore-hssd</code>) is the central subscriber database of the 4G/EPS side of the dual 5G+4G core. Its one real wire interface is <strong>S6a</strong>: a Diameter server (application ID 16777251) that accepts MME connections and answers AIR (Authentication-Information), ULR (Update-Location) and PUR (Purge-UE) requests, and carries HSS-initiated CLR (Cancel-Location) and IDR (Insert-Subscriber-Data) on the same connections — per TS 29.272 and RFC 6733 as cited throughout <code>src/bins/nextgcore-hssd/src/s6a_path.rs</code>. Authentication vectors are generated with Milenage, including real AUTS re-synchronisation (TS 33.102 §6.3.5 per code comments) and per-vector random RAND (TS 33.401 per code comment). <strong>Cx</strong> (IMS, application ID 16777216) and <strong>SWx</strong> (non-3GPP AAA, TS 29.273 per the <code>swx_path.rs</code> header) exist as handler libraries (<code>handle_uar</code>/<code>handle_mar</code>/<code>handle_sar</code>/<code>handle_lir</code> in <code>cx_path.rs</code>, <code>handle_mar</code>/<code>handle_sar</code> in <code>swx_path.rs</code>), and both applications are advertised in the S6a server’s capabilities exchange, but no request dispatch reaches those handlers: only S6a requests are answered. The HSS speaks no SBI, S1AP or GTP.</p>
@@ -3645,7 +3718,7 @@ hss:
 <p>The <code>--diameter-id</code>/<code>--diameter-realm</code>/<code>--diameter-addr</code>/<code>--diameter-port</code> flags override the YAML values.</p>
 <h3 id="parsed-but-inert--decorative-yaml-fields-14"><a class="header" href="#parsed-but-inert--decorative-yaml-fields-14">Parsed-but-inert / decorative YAML fields</a></h3>
 <ul>
-<li><strong><code>logger.file.path</code> and <code>logger.level</code> are inert.</strong> Log level comes only from the CLI flag <code>-e/--log-level</code> (default <code>info</code>); <code>-l/--log-file</code> is accepted by clap but <code>init_logging()</code> never uses it, so logs always go to stderr.</li>
+<li><strong><code>logger.level</code> is read; <code>logger.file.path</code> is inert.</strong> The log level is <code>-e/--log-level</code> when given, else this file’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code>, when set, overrides all three (#691). <code>-l/--log-file</code> is accepted by clap but never used, so logs always go to stderr.</li>
 <li><strong><code>global.max.ue</code> and <code>global.max.peer</code> are inert.</strong> The identity-pool size comes from the CLI flag <code>--max-ue</code> (default <code>1024</code>); there is no peer cap in the code.</li>
 <li><strong><code>hss.freeDiameter</code> and the <code>--diameter-config</code> flag</strong> point at <code>docker/rust/configs/epc/freeDiameter/hss.conf</code>, which no code reads.</li>
 <li><strong><code>hss.metrics.server</code> is inert.</strong> The daemon starts no metrics HTTP server; its only telemetry export is OpenTelemetry OTLP tracing (<code>nextgcore_metrics::otel::init_otel</code> in <code>main.rs</code>).</li>
@@ -3660,7 +3733,7 @@ hss:
 <tbody>
 <tr><td><code>-c, --config</code></td><td>string</td><td><code>/etc/nextgcore/hss.yaml</code></td><td>Configuration file path. Unreadable or invalid YAML stops startup.</td></tr>
 <tr><td><code>-l, --log-file</code></td><td>string</td><td>unset</td><td><strong>Accepted but unused</strong> — <code>init_logging()</code> never opens it; logging always goes to stderr.</td></tr>
-<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>); any other value silently falls back to <code>info</code>.</td></tr>
+<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>logger.level</code>, else <code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else is <code>info</code>). Without the flag, the config’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code> overrides both (#691).</td></tr>
 <tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td>Disable color output.</td></tr>
 <tr><td><code>-k, --kill</code></td><td>flag</td><td>off</td><td>Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor.</td></tr>
 <tr><td><code>--diameter-config</code></td><td>string</td><td><code>/etc/nextgcore/freeDiameter/hss.conf</code></td><td><strong>Accepted but unused</strong> — no code reads freeDiameter config files.</td></tr>
@@ -3736,6 +3809,9 @@ sgwc:
 </table>
 </div>
 <p>Not read: <code>logger.*</code> (use <code>-l/--log-level</code>) and <code>global.max.*</code>.</p>
+<blockquote>
+<p><strong>Clock:</strong> this NF refuses to start when the local clock reads before 2020-01-01, because its PFCP Recovery Time Stamp would be wrong. See <a href="#a-set-clock-is-required-pfcp-nfs">A set clock is required</a> for the remedy on RTC-less hosts.</p>
+</blockquote>
 <h2 id="command-line-flags-23"><a class="header" href="#command-line-flags-23">Command-line flags</a></h2>
 <p>From the clap <code>Args</code> struct in <code>src/bins/nextgcore-sgwcd/src/main.rs</code>:</p>
 <div class="table-wrapper">
@@ -3745,7 +3821,7 @@ sgwc:
 </thead>
 <tbody>
 <tr><td><code>-c, --config</code></td><td>string</td><td><code>/etc/nextgcore/sgwc.yaml</code></td><td>Configuration file path.</td></tr>
-<tr><td><code>-l, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>); unrecognized values fall back to <code>info</code>.</td></tr>
+<tr><td><code>-l, --log-level</code></td><td>string</td><td><code>logger.level</code>, else <code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else is <code>info</code>). Without the flag, the config’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code> overrides both (#691).</td></tr>
 <tr><td><code>--no-color</code></td><td>flag</td><td>off</td><td>Parsed but never read — currently has no effect.</td></tr>
 <tr><td><code>-d, --daemon</code></td><td>flag</td><td>off</td><td>Parsed but never read — currently has no effect.</td></tr>
 </tbody>
@@ -3753,6 +3829,68 @@ sgwc:
 </div>
 <h2 id="behavior-notes-19"><a class="header" href="#behavior-notes-19">Behavior notes</a></h2>
 <ul>
+<li>
+<p><strong>Sxa association</strong> (TS 29.244 §6.2.6, #1001):</p>
+<ul>
+<li>The SGW-C sets up the association with its SGW-U at startup.</li>
+<li>While there is no association, it retries the Association Setup every 10 s (T1 3 s,
+N1 2 per attempt). This covers an SGW-U that comes up later, and one that refuses the
+first Setup because its allowlist has not yet resolved the SGW-C’s address.</li>
+<li>Once associated, it sends the SGW-U a Heartbeat Request every 10 s.</li>
+<li>No Heartbeat Response after T1 x (N1 + 1) is a PFCP path failure. The association and
+its sessions are kept, and heartbeating continues. Setting the association up again over
+a path that only blinked would make a conformant SGW-U drop every session (TS 29.244
+§6.2.6.2.2).</li>
+<li>A newer Recovery Time Stamp means the SGW-U restarted. The stamp is carried in its
+Heartbeat Response and in its own Heartbeat Request. It is normalised to NTP seconds
+(#995), so a pre-#995 SGW-U’s Unix seconds do not read as a restart, and an older stamp
+from a reordered message is ignored. After a restart:
+<ul>
+<li>the association is set up again;</li>
+<li>every established PFCP session is established again with the same CP F-SEID, F-TEIDs,
+PDRs and FARs. The SGW-C allocates them all, so the MME and the PGW keep their
+endpoints.</li>
+</ul>
+</li>
+<li>While there is no association, the SGW-C sends no PFCP session message (TS 29.244 §6.2.6.1).
+A Create Session Request is refused with No resources available before it is relayed to
+the PGW. Other S11 requests that need a PFCP session message are answered with a failure.</li>
+</ul>
+</li>
+<li>
+<p><strong>User plane path failure</strong> (TS 23.007 §20.3.4, TS 29.244 §7.4.5, #994):</p>
+<ul>
+<li>The SGW-U reports a GTP-U path toward a remote peer as failed or recovered in a PFCP Node
+Report Request. The SGW-C answers it:
+<ul>
+<li>Request accepted;</li>
+<li>72 if the report is not from its associated SGW-U;</li>
+<li>66 (with the Offending IE) if the Node ID or the Node Report Type is missing;</li>
+<li>67 (with the Offending IE) if the report the Node Report Type announces is missing;</li>
+<li>69 if the request cannot be decoded.</li>
+</ul>
+</li>
+<li>On a failure, every UE whose downlink S1-U endpoint is that eNodeB has its S1-U bearers
+released with Release Access Bearers semantics. The FARs go to BUFF + NOCP and the EPS
+bearers are kept, so downlink data is buffered, notified (DDN) and the UE paged.</li>
+<li>The peer stays marked failed for the maximum path failure duration,
+<code>SGWC_UP_PATH_FAILURE_HOLD_SECS</code> (default 120, at most 3600). If the path is still down
+when that expires, the record is dropped. A Modify Bearer that points a bearer at a failed
+peer inside the hold is answered, and the UE’s S1-U bearers are released at once.</li>
+<li>A recovery report clears the record.</li>
+<li>The optional S1-U path failure notification to the MME (cause “S1-U Path Failure”,
+§20.3.5) is not used, because it needs MME support (S1UN).</li>
+</ul>
+</li>
+<li>
+<p><strong>Metrics:</strong> <code>http://127.0.0.1:9090/metrics</code>. The port is set by <code>SGWC_METRICS_PORT</code>; the
+bind is loopback unless <code>NEXTGCORE_METRICS_BIND</code> is set (#837). The metrics are:</p>
+<ul>
+<li><code>sgwc_up</code>, <code>sgwc_pfcp_associations</code>, <code>sgwc_ues</code>;</li>
+<li><code>sgwc_up_path_failures_total</code>, <code>sgwc_up_path_recoveries_total</code>, <code>sgwc_up_paths_failed</code>;</li>
+<li><code>sgwc_up_path_ues_released_total</code>, <code>sgwc_up_path_holds_expired_total</code>.</li>
+</ul>
+</li>
 <li>
 <p><strong>Environment variables</strong> (read in <code>gtp_path.rs</code> / <code>pfcp_path.rs</code> / <code>main.rs</code>):</p>
 <div class="table-wrapper">
@@ -3832,6 +3970,8 @@ sgwu:
 <tr><th>Parameter</th><th>Type</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
+<tr><td><code>sgwu.pfcp.allowed_peers</code></td><td>list of IPs / CIDR prefixes / host names</td><td>empty</td><td>SGW-Cs allowed to set up an Sxa association (<code>SGWU_PFCP_ALLOWED_PEERS</code>, comma-separated, overrides it; host names re-resolved every 10 s, at once (at most once a second) when a Setup comes from an unresolved address, and kept at their last good addresses when a lookup fails). <strong>Fail closed:</strong> empty refuses every Association Setup (error at startup); <code>0.0.0.0/0</code> / <code>::/0</code> admit any host. A bad entry stops startup. Session requests are accepted only from an associated SGW-C’s host, and only for that SGW-C’s own sessions: a Modification/Deletion of another’s is answered as unknown (cause 65), an Establishment naming another’s CP F-SEID gets cause 69 and installs nothing. Refusals count in <code>sgwu_pfcp_unauthorized_messages_total</code>.</td></tr>
+<tr><td><code>sgwu.pfcp.max_sessions_per_peer</code></td><td>integer</td><td>see text</td><td>The most sessions one SGW-C may hold (<code>SGWU_PFCP_MAX_SESSIONS_PER_PEER</code> overrides). Default: none (only the global session capacity applies); enforced when set.</td></tr>
 <tr><td><code>sgwu.pfcp.server[0].address</code></td><td>IPv4</td><td>none</td><td>PFCP Node ID when <code>PFCP_NODE_IP</code> is unset (then loopback). Not the bind address: that is <code>PFCP_BIND_ADDR</code>.</td></tr>
 <tr><td><code>sgwu.gtpu.server[0].address</code></td><td>IPv4</td><td>none</td><td>GTP-U address advertised in UP-allocated F-TEIDs when the socket is bound to a wildcard and <code>SGWU_GTPU_ADVERTISE</code> is unset.</td></tr>
 <tr><td><code>logger.level</code></td><td>string</td><td><code>info</code></td><td>Log level when <code>-l/--log-level</code> is not given; <code>RUST_LOG</code> overrides both (#500).</td></tr>
@@ -3839,6 +3979,9 @@ sgwu:
 </table>
 </div>
 <p>A non-IPv4 address is logged and ignored. Not read: <code>logger.file</code>, <code>global.max.*</code>.</p>
+<blockquote>
+<p><strong>Clock:</strong> this NF refuses to start when the local clock reads before 2020-01-01, because its PFCP Recovery Time Stamp would be wrong. See <a href="#a-set-clock-is-required-pfcp-nfs">A set clock is required</a> for the remedy on RTC-less hosts.</p>
+</blockquote>
 <h2 id="command-line-flags-24"><a class="header" href="#command-line-flags-24">Command-line flags</a></h2>
 <div class="table-wrapper">
 <table>
@@ -3867,6 +4010,7 @@ sgwu:
 <tr><td><code>SGWU_MAX_BUFFERED_PACKETS</code></td><td><code>64</code></td><td>Per-FAR buffer depth for BUFF.</td></tr>
 <tr><td><code>SGWU_QER_ENFORCEMENT</code></td><td>off</td><td><code>1</code>/<code>true</code>/<code>yes</code> enables QER gate/MBR enforcement (#60). Off by default because a mis-provisioned QER would drop traffic.</td></tr>
 <tr><td><code>SGWU_METRICS_PORT</code></td><td><code>9090</code></td><td>Prometheus endpoint port.</td></tr>
+<tr><td><code>NEXTGCORE_METRICS_BIND</code></td><td><code>127.0.0.1</code></td><td>Host the unauthenticated <code>/metrics</code> listener binds to (#837). The compose files and manifests set <code>0.0.0.0</code> inside the private container/pod network.</td></tr>
 <tr><td><code>OTEL_EXPORTER_OTLP_ENDPOINT</code></td><td><code>http://jaeger:4317</code></td><td>OTLP endpoint for OpenTelemetry traces; init is best-effort.</td></tr>
 <tr><td><code>RUST_LOG</code></td><td>unset</td><td>Overrides the log level.</td></tr>
 </tbody>
@@ -3929,7 +4073,7 @@ pcrf:
 <p>Because parsing is a stub, <strong>every</strong> field in the shipped example file is inert:</p>
 <ul>
 <li><strong><code>db_uri</code> is inert.</strong> The binary has a <code>--db-uri</code> flag too, but neither is ever passed to <code>nextgcore_dbi_init</code>/<code>nextgcore_mongoc_init</code> — no MongoDB connection is made by this daemon.</li>
-<li><strong><code>logger.file.path</code> and <code>logger.level</code> are inert.</strong> Logging goes to stderr via <code>env_logger</code>; the level comes from <code>-e/--log-level</code> (default <code>info</code>). The <code>-l/--log-file</code> flag is also accepted but never used by <code>init_logging</code> in <code>main.rs</code>.</li>
+<li><strong><code>logger.level</code> is read; <code>logger.file.path</code> is inert.</strong> Logging goes to stderr via <code>env_logger</code>. The log level is <code>-e/--log-level</code> when given, else this file’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code>, when set, overrides all three (#691). The <code>-l/--log-file</code> flag is also accepted but never used.</li>
 <li><strong><code>global.max.ue</code> / <code>global.max.peer</code> are inert.</strong> The only session limit is the <code>--max-sess</code> flag (and even that is stored, not enforced — see Behavior notes).</li>
 <li><strong><code>pcrf.freeDiameter</code> is inert.</strong> Neither the YAML pointer (<code>/etc/freeDiameter/pcrf.conf</code>) nor the CLI default (<code>--diameter-config /etc/nextgcore/freeDiameter/pcrf.conf</code>) is ever opened. The shipped <code>docker/rust/configs/epc/freeDiameter/pcrf.conf</code> (Identity <code>pcrf.localdomain</code>, Realm <code>localdomain</code>, <code>ListenOn 172.24.0.9</code>, <code>ConnectPeer smf.localdomain</code>) is mounted into the container but ignored; the daemon’s actual identity/realm/listen address come from <code>--diameter-id</code>/<code>--diameter-realm</code>/<code>--diameter-addr</code>, whose defaults happen to match the conf’s Identity/Realm. The PCRF never dials out to peers (<code>ConnectPeer</code> has no equivalent): it only accepts inbound connections.</li>
 <li><strong><code>pcrf.metrics.server[]</code> (address/port) is inert.</strong> No Prometheus/metrics HTTP server is started by this binary; the only telemetry is the optional OTLP trace exporter (env var, see below).</li>
@@ -3944,7 +4088,7 @@ pcrf:
 <tbody>
 <tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/pcrf.yaml</code></td><td>Configuration file path. Only its existence is checked; contents are ignored (stub parser).</td></tr>
 <tr><td><code>-l, --log-file</code></td><td>path</td><td>unset</td><td>Accepted but <strong>never used</strong> — logs always go to stderr.</td></tr>
-<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>); unrecognized values fall back to <code>info</code>.</td></tr>
+<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>logger.level</code>, else <code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else is <code>info</code>). Without the flag, the config’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code> overrides both (#691).</td></tr>
 <tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td>Disable color output.</td></tr>
 <tr><td><code>-k, --kill</code></td><td>flag</td><td>off</td><td>Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor.</td></tr>
 <tr><td><code>--diameter-config</code></td><td>path</td><td><code>/etc/nextgcore/freeDiameter/pcrf.conf</code></td><td>FreeDiameter configuration file — accepted but <strong>never read</strong>.</td></tr>
@@ -4026,13 +4170,14 @@ diameter-layer issue; persistence needs nothing from it.</p>
 </thead>
 <tbody>
 <tr><td><code>nextgcore-smfd</code></td><td><code>smf_n4_associations</code>, <code>smf_n4_peers</code>, <code>smf_sessions</code>, <code>smf_up</code> (and the PGW-C S5/S8 binding)</td><td>9090, or <code>SMF_METRICS_PORT</code></td></tr>
-<tr><td><code>nextgcore-upfd</code></td><td><code>upf_pfcp_associations</code>, <code>upf_pfcp_sessions</code>, <code>upf_up</code>, <code>upf_dataplane_{ul,dl}_{packets,bytes}_total</code> and dropped/oversize/spoofed packet counters</td><td>9090, or <code>UPF_METRICS_PORT</code></td></tr>
-<tr><td><code>nextgcore-sgwud</code></td><td><code>sgwu_pfcp_sessions</code>, <code>sgwu_pfcp_associations</code>, <code>sgwu_up</code></td><td>9090, or <code>SGWU_METRICS_PORT</code></td></tr>
+<tr><td><code>nextgcore-upfd</code></td><td><code>upf_pfcp_associations</code>, <code>upf_pfcp_sessions</code>, <code>upf_pfcp_unauthorized_messages_total</code>, <code>upf_up</code>, <code>upf_dataplane_{ul,dl}_{packets,bytes}_total</code> and dropped/oversize/spoofed packet counters</td><td>9090, or <code>UPF_METRICS_PORT</code></td></tr>
+<tr><td><code>nextgcore-sgwud</code></td><td><code>sgwu_pfcp_sessions</code>, <code>sgwu_pfcp_associations</code>, <code>sgwu_pfcp_unauthorized_messages_total</code>, <code>sgwu_up</code></td><td>9090, or <code>SGWU_METRICS_PORT</code></td></tr>
 <tr><td><code>nextgcore-udmd</code></td><td>NES energy gauges, only with <code>--features nes</code></td><td>NES <code>metrics_port</code> (default 9090)</td></tr>
 <tr><td><code>nextgcore-nsacfd</code></td><td>slice-SLA observe gauges, only with <code>--features sla-observe</code></td><td>its <code>metrics_port</code> when &gt; 0</td></tr>
 </tbody>
 </table>
 </div>
+<p>Every one of these listeners is unauthenticated, so it binds <code>127.0.0.1</code> by default (#837): set <code>NEXTGCORE_METRICS_BIND</code> (an IP address, e.g. <code>0.0.0.0</code>) to widen it. The compose files, the Kind manifests, the Helm chart and the EKS overlays set it to <code>0.0.0.0</code> inside the private container or pod network, where Prometheus scrapes by container/pod address; none of them publishes a metrics port on the host. The <code>k8s/monitoring/*</code> and <code>k8s/manifests/nrf.yaml</code> NodePort Services are for kind only, where the node is the Docker bridge and <code>kind-config.yaml</code> maps the ports to 127.0.0.1; on a real cluster a NodePort is open on every node IP, so do not apply them there. The compose host-port publishes (MongoDB, NRF, PFCP, Prometheus, Grafana, Jaeger, OTLP) are bound to <code>127.0.0.1</code>; the RAN-facing NGAP/S1AP and GTP-U publishes use <code>${NEXTGCORE_RAN_PUBLISH_ADDR:-127.0.0.1}</code>, so an external gNB/eNB needs that set to the host address it reaches.</p>
 <p><code>docker-compose-epc.yml</code> uses these endpoints as healthchecks (<code>curl -fsS http://localhost:9090/metrics | grep -q '^smf_up 1$'</code>, likewise <code>upf_up</code>, <code>sgwu_up</code>).</p>
 <p>The other NF daemons serve <strong>no</strong> Prometheus metrics over HTTP:</p>
 <div class="table-wrapper">
@@ -4126,9 +4271,9 @@ diameter-layer issue; persistence needs nothing from it.</p>
 </tbody>
 </table>
 </div>
-<p><code>nextgcore-smfd</code> and <code>nextgcore-sgwud</code> have no clap parser. smfd — scans <code>std::env::args()</code> only for <code>-c &lt;config&gt;</code> (and <code>--state-file</code>) and takes its log level purely from <code>RUST_LOG</code> (default <code>info</code>); sgwud scans for <code>-c</code> and <code>-l/--log-level</code>.</p>
-<p><strong><code>RUST_LOG</code> precedence is the same in every NF.</strong> Every NF builds its logger with <code>nextgcore_core::log::nf_log_builder</code> (#691): <code>RUST_LOG</code>, when set, is the filter; otherwise the <code>--log-level</code> flag applies (an unknown value means <code>info</code>). <code>RUST_LOG_STYLE</code> sets the colour style; <code>--no-color</code> overrides it.</p>
-<p>Precedence, in full: a set, non-blank <code>RUST_LOG</code> <strong>replaces</strong> <code>--log-level</code>; the two are not merged. So <code>RUST_LOG=nextgcore_amfd=debug</code> alone logs only amfd’s own targets (at debug) and silences every other target. Include a default level, as the compose files do (<code>info,nextgcore_amfd=debug</code>), to keep the rest at <code>info</code>. A blank <code>RUST_LOG=</code> counts as unset. <code>src/libs/nextgcore-core/tests/nf_logging_init.rs</code> fails if a daemon builds its own logger.</p>
+<p><code>nextgcore-smfd</code> and <code>nextgcore-sgwud</code> have no clap parser. smfd scans <code>std::env::args()</code> for <code>-c/--config</code>, <code>-e/--log-level</code> (and <code>--state-file</code>); sgwud scans for <code>-c</code> and <code>-l/--log-level</code>.</p>
+<p><strong>The level is chosen the same way in every NF.</strong> Every NF builds its logger with <code>nextgcore_core::log::nf_log_builder</code> (#691): <code>RUST_LOG</code>, when set, is the filter; otherwise the level is <code>--log-level</code> when given, else the config file’s <code>logger.level</code>, else <code>info</code> (<code>nextgcore_core::log::nf_log_level</code>; an unknown value means <code>info</code>). <code>RUST_LOG_STYLE</code> sets the colour style; <code>--no-color</code> overrides it.</p>
+<p>Precedence, in full: a set, non-blank <code>RUST_LOG</code> <strong>replaces</strong> the resolved level (<code>--log-level</code> / <code>logger.level</code> / <code>info</code>); they are not merged. So <code>RUST_LOG=nextgcore_amfd=debug</code> alone logs only amfd’s own targets (at debug) and silences every other target. Include a default level, as the compose files do (<code>info,nextgcore_amfd=debug</code>), to keep the rest at <code>info</code>. A blank <code>RUST_LOG=</code> counts as unset. <code>src/libs/nextgcore-core/tests/nf_logging_init.rs</code> fails if a daemon builds its own logger, skips <code>nf_log_level</code>, or gives its <code>log_level</code> flag a clap default (which would hide <code>logger.level</code>).</p>
 <p><strong><code>--log-file</code> is accepted but not wired.</strong> 22 binary crates (ausfd, bsfd, dccfd, easdfd, eesd, hssd, lmfd, mbsmfd, nefd, nrfd, nsacfd, nssfd, nwdafd, pcfd, pcrfd, pind, scpd, seppd, tsctsf, udmd, udrd, upfd — <code>grep -rl log_file src/bins/*/src/*.rs</code>) declare a <code>log_file</code> CLI arg, but in none of them is the parsed value ever consumed by the logging setup — e.g. nrfd’s <code>init_logging()</code> never references <code>args.log_file</code>. Logs always go to stdout/stderr; rely on <code>docker logs</code> or shell redirection.</p>
 <h2 id="troubleshooting"><a class="header" href="#troubleshooting">Troubleshooting</a></h2>
 <p>Every row below is grounded in a specific file in this repo.</p>
@@ -5482,7 +5627,7 @@ test(upf): add SDF filter 5-tuple matching unit tests
 deregister on shutdown</li>
 <li>Expose <code>/metrics</code> (Prometheus, port 9090)</li>
 <li>Respond to SIGTERM with graceful shutdown</li>
-<li>Log at <code>info</code> level by default, configurable via <code>--log-level</code> and <code>RUST_LOG</code>
+<li>Log at <code>info</code> level by default, configurable via <code>--log-level</code>, the config’s <code>logger.level</code> and <code>RUST_LOG</code>, resolved by <code>nextgcore_core::log::nf_log_level</code> / <code>nf_log_builder</code>
 (build the logger with <code>nextgcore_core::log::nf_log_builder</code>; a test enforces it)</li>
 <li>Have ≥ 1 unit test per public function</li>
 </ul>

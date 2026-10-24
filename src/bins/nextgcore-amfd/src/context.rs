@@ -1983,6 +1983,28 @@ impl AmfContext {
     // Session Management
     // ========================================================================
 
+    /// This AMF's default S-NSSAI (#920 follow-up): the first configured S-NSSAI with a
+    /// slice, else SST 1 (eMBB, TS 23.501 §5.15.2.2). SST 0 is not a standardised value
+    /// -- it is what a record whose writer had no S-NSSAI holds -- so it is never the
+    /// default, and an AMF with no `plmn_support` still names a slice a gNB can admit.
+    pub fn default_s_nssai(&self) -> SNssai {
+        self.plmn_support
+            .iter()
+            .flat_map(|p| p.s_nssai.iter())
+            .find(|s| s.sst != 0)
+            .cloned()
+            .unwrap_or(SNssai { sst: 1, sd: None })
+    }
+
+    /// `candidate`, unless it is missing or names SST 0 (no slice), in which case the
+    /// [default](Self::default_s_nssai) (#920 follow-up). Every writer of a session's
+    /// S-NSSAI goes through this, so SST 0 never reaches NGAP or NAS from a record.
+    pub fn usable_s_nssai(&self, candidate: Option<SNssai>) -> SNssai {
+        candidate
+            .filter(|s| s.sst != 0)
+            .unwrap_or_else(|| self.default_s_nssai())
+    }
+
     /// Add a new session for an AMF UE
     pub fn sess_add(&self, amf_ue_id: u64, psi: u8) -> Option<AmfSess> {
         let mut sess_list = self.sess_list.write().ok()?;
@@ -5069,6 +5091,47 @@ pub fn amf_instance_get_load() -> i32 {
 mod tests {
     use super::*;
 
+    /// **#920 follow-up.** The default S-NSSAI is the first configured one that names a
+    /// slice, else SST 1; `usable_s_nssai` keeps a usable candidate and replaces a missing
+    /// one or SST 0 with the default.
+    #[test]
+    fn the_default_s_nssai_never_is_sst_0() {
+        let mut ctx = AmfContext::default();
+        assert_eq!(
+            (ctx.default_s_nssai().sst, ctx.default_s_nssai().sd),
+            (1, None),
+            "no plmn_support: SST 1"
+        );
+        ctx.plmn_support = vec![PlmnSupport {
+            plmn_id: PlmnId::new("001", "01"),
+            num_of_s_nssai: 2,
+            s_nssai: vec![
+                SNssai {
+                    sst: 0,
+                    sd: Some(1),
+                },
+                SNssai {
+                    sst: 3,
+                    sd: Some(0x0920),
+                },
+            ],
+        }];
+        let default = ctx.default_s_nssai();
+        assert_eq!((default.sst, default.sd), (3, Some(0x0920)));
+        let kept = ctx.usable_s_nssai(Some(SNssai { sst: 2, sd: None }));
+        assert_eq!((kept.sst, kept.sd), (2, None));
+        for candidate in [
+            None,
+            Some(SNssai {
+                sst: 0,
+                sd: Some(7),
+            }),
+        ] {
+            let used = ctx.usable_s_nssai(candidate);
+            assert_eq!((used.sst, used.sd), (3, Some(0x0920)));
+        }
+    }
+
     // ------------------------------------------------------------------
     // 5G-GUTI as a Namf `ueContextId` (#352, TS 29.518 §6.1.3.2.2)
     // ------------------------------------------------------------------
@@ -5501,11 +5564,15 @@ mod tests {
         // Setup, and (#512) the one answering a CM-IDLE Service Request, which
         // derives a fresh KgNB from that message's uplink NAS COUNT and so restarts
         // the {NH, NCC} chain at NCC 0 (TS 33.501 §6.9.2.1, Annex A.9/A.10).
+        // #759 adds the third: a mobility/periodic registration update from CM-IDLE
+        // that re-activates sessions sets up AS security in its own Initial Context
+        // Setup, from that REGISTRATION REQUEST's uplink NAS COUNT.
         assert_eq!(
             src.matches("init_next_hop_chain()").count(),
-            2,
+            3,
             "the forward-security chain must be seeded exactly at AS-security-context \
-             establishment: registration ICS and the CM-IDLE Service Request ICS"
+             establishment: registration ICS, the CM-IDLE Service Request ICS and the \
+             CM-IDLE registration-update ICS (#759)"
         );
         // Negative, and the reason the positives above are not enough on their
         // own: the defective form conveyed the stored pair unchanged.
