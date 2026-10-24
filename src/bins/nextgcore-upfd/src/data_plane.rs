@@ -2091,6 +2091,11 @@ impl DataPlaneUrr {
         self.measure_duration.store(duration, Ordering::Relaxed);
     }
 
+    /// Whether this URR measures time (DURAT) and so reports a Duration Measurement.
+    pub fn measures_duration(&self) -> bool {
+        self.measure_duration.load(Ordering::Relaxed)
+    }
+
     /// Put back the time measurement of a report that was not delivered (#818, with
     /// [`Self::restore_usage`]): the next report covers it -- its Start Time and Duration
     /// Measurement reach back over the undelivered one.
