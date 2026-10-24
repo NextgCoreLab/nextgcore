@@ -2263,12 +2263,19 @@ mod tests {
             "Forward Relocation Complete Notification"
         );
 
-        // Execution step 8 at the UPF: DL FAR 2 → the target gNB, PDR 1 removed. Read once:
-        // the AMF sends the FRCN only after the SMF answered COMPLETED, and the SMF answers
-        // after the switch reached the UPF. #791's `left: 0` was the SMF finding no N4
-        // session (an unlocked sibling had wiped `pfcp_sessions`, closed by #762), which no
-        // wait would recover; the diagnostics say which state it was in.
-        let mods = upf.modification_bodies();
+        // Execution step 8 at the UPF: DL FAR 2 → the target gNB, PDR 1 removed. #945: the
+        // AMF sends the FRCN first (TS 23.502 §4.11.1.2.2.3 step 5) and COMPLETED (step 7)
+        // off its NGAP task after it, so the switch is waited for here, up to 5 s. #791's
+        // `left: 0` was the SMF finding no N4 session (an unlocked sibling had wiped
+        // `pfcp_sessions`, closed by #762); the diagnostics say which state it was in.
+        let mut mods = upf.modification_bodies();
+        for _ in 0..100 {
+            if !mods.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            mods = upf.modification_bodies();
+        }
         assert_eq!(
             mods.len(),
             1,

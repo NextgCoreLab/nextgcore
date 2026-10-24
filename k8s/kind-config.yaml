@@ -10,20 +10,26 @@ nodes:
         nodeRegistration:
           kubeletExtraArgs:
             node-labels: "ingress-ready=true"
+    # Host-local only (#837): kind publishes on every interface unless
+    # listenAddress says otherwise, and none of these is authenticated.
     extraPortMappings:
       # NRF SBI (debug access)
       - containerPort: 30777
         hostPort: 7777
+        listenAddress: "127.0.0.1"
         protocol: TCP
       # Grafana dashboard
       - containerPort: 30300
         hostPort: 3000
+        listenAddress: "127.0.0.1"
         protocol: TCP
       # Prometheus
       - containerPort: 30909
         hostPort: 9090
+        listenAddress: "127.0.0.1"
         protocol: TCP
       # Jaeger UI
       - containerPort: 31686
         hostPort: 16686
+        listenAddress: "127.0.0.1"
         protocol: TCP

@@ -94,8 +94,8 @@ impl SlotTime {
     }
 }
 
-/// What the gNB said about one of its TRPs (TS 38.455 §9.2.x `TRPInformation`).
-#[derive(Debug, Clone, PartialEq)]
+/// What the gNB said about one of its TRPs (TS 38.455 §9.2.25 `TRP Information`).
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct TrpInfo {
     pub trp_id: u16,
     /// NR PCI of the TRP's cell (`pCI-NR`). The UE half of a Multi-RTT
@@ -105,6 +105,15 @@ pub struct TrpInfo {
     pub nr_cgi: Option<String>,
     /// The TRP's position (`geographicalCoordinates`, a direct position).
     pub coord: Option<TrpCoord>,
+    /// The NR CGI in the form LPP's `NCGI-r15` takes (#911).
+    pub ncgi: Option<crate::dl_prs_assistance::Ncgi>,
+    /// `aRFCN`, the NR-ARFCN (#911).
+    pub arfcn: Option<u32>,
+    /// `pRSConfiguration`, the TRP's DL-PRS (#911, TS 38.455 §9.2.44).
+    pub prs: Option<nrppa::PRSConfiguration>,
+    /// `sFNInitialisationTime` (TS 38.455 §9.2.36) as 32.32 fixed-point seconds
+    /// since 1900 (#911).
+    pub sfn_init: Option<u64>,
 }
 
 /// The PCIs that TRP Information reports on more than one TRP (#903 review). A
@@ -214,20 +223,29 @@ pub fn decode_trp_information_response(bytes: &[u8]) -> Result<Vec<TrpInfo>, Str
 fn trp_info(t: &nrppa::TRPInformation) -> TrpInfo {
     let mut info = TrpInfo {
         trp_id: t.trp_id.0,
-        pci: None,
-        nr_cgi: None,
-        coord: None,
+        ..TrpInfo::default()
     };
     for item in &t.trp_information_type_response_list.0 {
         use nrppa::TRPInformationTypeResponseItem as I;
         match item {
             I::PCI_NR(p) => info.pci = Some(p.0),
-            I::CGI_NR(c) => info.nr_cgi = Some(cgi_nr_to_string(c)),
+            I::CGI_NR(c) => {
+                info.nr_cgi = Some(cgi_nr_to_string(c));
+                info.ncgi = crate::dl_prs_assistance::Ncgi::from_nrppa(c);
+            }
+            I::ARFCN(a) => info.arfcn = Some(a.0),
+            I::PRSConfiguration(p) => info.prs = Some(p.clone()),
+            I::SFNInitialisationTime(t) => info.sfn_init = relative_time_1900(t),
             I::GeographicalCoordinates(g) => info.coord = geographical_coordinates(g),
             _ => {}
         }
     }
     info
+}
+
+/// A `RelativeTime1900` (BIT STRING (SIZE(64))) as 32.32 fixed-point seconds.
+fn relative_time_1900(t: &nrppa::RelativeTime1900) -> Option<u64> {
+    (t.0.len() == 64).then(|| t.0.iter().fold(0u64, |acc, b| (acc << 1) | u64::from(*b)))
 }
 
 /// `<plmn hex>-<9 hex digits>`, the spelling `nrppa_uplink` keys NR cells by.
@@ -559,36 +577,58 @@ pub mod test_support {
     /// raw values)`.
     pub fn trp_information_response(txn: u16, trps: &[(u16, u16, i32, i32, i32)]) -> Vec<u8> {
         use nrppa::TRPInformationTypeResponseItem as I;
-        let entries =
+        trp_information_response_items(
+            txn,
             trps.iter()
-                .map(
-                    |&(id, pci, lat, lon, alt)| nrppa::TRPInformationListTRPResp_Entry {
-                        trp_information: nrppa::TRPInformation {
-                            trp_id: nrppa::TRP_ID(id),
-                            trp_information_type_response_list:
-                                nrppa::TRPInformationTypeResponseList(vec![
+                .map(|&(id, pci, lat, lon, alt)| {
+                    (
+                        id,
+                        vec![
                             I::PCI_NR(nrppa::TRPInformationTypeResponseItem_pCI_NR(pci)),
-                            I::GeographicalCoordinates(nrppa::GeographicalCoordinates {
-                                trp_position_definition_type:
-                                    nrppa::TRPPositionDefinitionType::Direct(
-                                        nrppa::TRPPositionDirect {
-                                            accuracy:
-                                                nrppa::TRPPositionDirectAccuracy::TRPHAposition(
-                                                    ha_position(lat, lon, alt),
-                                                ),
-                                            ie_extensions: None,
-                                        },
-                                    ),
-                                dlprs_resource_coordinates: None,
-                                ie_extensions: None,
-                            }),
-                        ]),
-                            ie_extensions: None,
-                        },
+                            geographical(lat, lon, alt),
+                        ],
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// A high-accuracy direct TRP position.
+    pub fn geographical(lat: i32, lon: i32, alt: i32) -> nrppa::TRPInformationTypeResponseItem {
+        nrppa::TRPInformationTypeResponseItem::GeographicalCoordinates(
+            nrppa::GeographicalCoordinates {
+                trp_position_definition_type: nrppa::TRPPositionDefinitionType::Direct(
+                    nrppa::TRPPositionDirect {
+                        accuracy: nrppa::TRPPositionDirectAccuracy::TRPHAposition(ha_position(
+                            lat, lon, alt,
+                        )),
                         ie_extensions: None,
                     },
-                )
-                .collect();
+                ),
+                dlprs_resource_coordinates: None,
+                ie_extensions: None,
+            },
+        )
+    }
+
+    /// A TRP Information Response with the given items per TRP id (#911).
+    pub fn trp_information_response_items(
+        txn: u16,
+        trps: Vec<(u16, Vec<nrppa::TRPInformationTypeResponseItem>)>,
+    ) -> Vec<u8> {
+        let entries = trps
+            .into_iter()
+            .map(|(id, items)| nrppa::TRPInformationListTRPResp_Entry {
+                trp_information: nrppa::TRPInformation {
+                    trp_id: nrppa::TRP_ID(id),
+                    trp_information_type_response_list: nrppa::TRPInformationTypeResponseList(
+                        items,
+                    ),
+                    ie_extensions: None,
+                },
+                ie_extensions: None,
+            })
+            .collect();
         successful(
             nrppa::ID_T_RP_INFORMATION_EXCHANGE,
             txn,
