@@ -73,7 +73,7 @@ These are the fields actually read by the daemon. The serde structs are `UdrYaml
 
 The daemon deserializes only the fields above; unknown YAML keys are silently ignored by serde. In the shipped example files:
 
-- **`logger.file.path` and `logger.level` are inert.** The log level comes from `RUST_LOG` when set, else the CLI flag `-e/--log-level` (default `info`). Logs always go to stderr — see the `--log-file` caveat below.
+- **`logger.level` is read; `logger.file.path` is inert.** The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691). Logs always go to stderr; see the `--log-file` caveat below.
 - **`global.max.ue` / `global.max.peer` are inert.** No struct deserializes the `global` section.
 - **`udr.sbi.tls.*` (enabled/cert/key/ca/min_version) is inert.** `SbiYaml` has only `server`, `client`, and `oauth2` members; TLS is controlled exclusively by the CLI flags `--tls`/`--tls-cert`/`--tls-key`.
 
@@ -85,7 +85,7 @@ From the clap `Args` struct in `src/bins/nextgcore-udrd/src/main.rs`:
 |---|---|---|---|
 | `-c, --config` | path | `/etc/nextgcore/udr.yaml` | Configuration file path. |
 | `-l, --log-file` | path | unset | **Accepted but currently unused** — `init_logging` never opens it; logging always goes to stderr. |
-| `-e, --log-level` | string | `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`); unrecognized values fall back to `info`. |
+| `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-m, --no-color` | flag | off | Disable color output. |
 | `-k, --kill` | flag | off | Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor. |
 | `--sbi-addr` | string | `0.0.0.0` | SBI server bind address. Overridden by `udr.sbi.server[0].address` when present. |

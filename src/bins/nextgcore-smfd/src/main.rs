@@ -447,11 +447,33 @@ fn epco_config() -> (&'static [std::net::Ipv4Addr], Option<u16>) {
     }
 }
 
+/// The value after the first of `flags` in `args` (`-c x`, `--config x`), or
+/// `None`. smfd reads its few flags by hand rather than through clap.
+fn smf_flag_value(args: impl Iterator<Item = String>, flags: &[&str]) -> Option<String> {
+    let args: Vec<String> = args.collect();
+    args.windows(2)
+        .find_map(|w| flags.contains(&w[0].as_str()).then(|| w[1].clone()))
+}
+
+/// The configuration file: `-c/--config`, then `SMF_CONFIG`, then
+/// `/etc/nextgcore/smf.yaml`.
+fn smf_config_path(args: impl Iterator<Item = String>) -> String {
+    smf_flag_value(args, &["-c", "--config"])
+        .or_else(|| std::env::var("SMF_CONFIG").ok())
+        .unwrap_or_else(|| "/etc/nextgcore/smf.yaml".to_string())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
-    // RUST_LOG if set, else info (smfd has no --log-level): #691.
-    nextgcore_core::log::nf_log_builder("info").init();
+    // Configuration path: -c/--config first, then SMF_CONFIG. Resolved before
+    // the logger, whose level is `-e/--log-level`, then the file's
+    // `logger.level`, then info, as for every NF (#691); RUST_LOG overrides.
+    let config_path = smf_config_path(std::env::args());
+    nextgcore_core::log::nf_log_builder(&nextgcore_core::log::nf_log_level(
+        smf_flag_value(std::env::args(), &["-e", "--log-level"]).as_deref(),
+        Some(&config_path),
+    ))
+    .init();
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = nextgcore_metrics::otel::init_otel(
         nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
@@ -473,18 +495,7 @@ async fn main() -> Result<()> {
     })
     .expect("Failed to set Ctrl+C handler");
 
-    // Load configuration — respect -c/--config CLI arg first, then SMF_CONFIG env var
-    let config_path = std::env::args()
-        .zip(std::env::args().skip(1))
-        .find_map(|(a, b)| {
-            if a == "-c" || a == "--config" {
-                Some(b)
-            } else {
-                None
-            }
-        })
-        .or_else(|| std::env::var("SMF_CONFIG").ok())
-        .unwrap_or_else(|| "/etc/nextgcore/smf.yaml".to_string());
+    // Load configuration (the path was resolved before the logger, above).
     let config = load_config(&config_path);
     log::info!("Loading configuration from {config_path}");
     log::info!(
@@ -7435,6 +7446,36 @@ async fn handle_amf_status_change(sm_context_ref: &str) -> SbiResponse {
 
 #[cfg(test)]
 mod tests {
+    /// #691 follow-up: smfd's hand-read flags, used before its logger exists.
+    #[test]
+    fn smf_flags_are_read_before_the_logger() {
+        let args = |v: &[&str]| {
+            v.iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .into_iter()
+        };
+        assert_eq!(
+            smf_flag_value(
+                args(&["smfd", "-c", "/x.yaml", "--log-level", "debug"]),
+                &["-e", "--log-level"]
+            ),
+            Some("debug".to_string())
+        );
+        assert_eq!(
+            smf_flag_value(args(&["smfd", "-e", "warn"]), &["-e", "--log-level"]),
+            Some("warn".to_string())
+        );
+        assert_eq!(
+            smf_flag_value(args(&["smfd", "--log-level"]), &["-e", "--log-level"]),
+            None
+        );
+        assert_eq!(
+            smf_config_path(args(&["smfd", "--config", "/y.yaml"])),
+            "/y.yaml"
+        );
+    }
+
     use super::*;
 
     /// #718 (revising #677): a graceful shutdown keeps the PFCP association only
