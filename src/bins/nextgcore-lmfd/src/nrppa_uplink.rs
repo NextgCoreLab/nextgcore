@@ -252,6 +252,7 @@ fn to_cell(result: &nrppa::E_CID_MeasurementResult) -> CellMeasurement {
         ecid_rtt_ns: tadv.map(|(mid, _)| mid),
         ecid_rtt_width_ns: tadv.map(|(_, width)| width),
         gnb_rx_tx_ns: None,
+        meas_time: None,
         dl_prs_id: None,
         eutra: matches!(
             result.serving_cell_id.ng_ra_ncell,

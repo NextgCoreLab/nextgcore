@@ -70,7 +70,7 @@ All of the `scp`-level keys are shipped **commented out**, so the built-in defau
 
 **Inert** — present in the shipped file and not read anywhere:
 
-- **`logger.file.path` and `logger.level`.** The log level comes from the CLI flag `-e/--log-level` (default `info`); `init_logging` builds `env_logger` with an explicit filter level, so even `RUST_LOG` (set to `info` by the compose file's common environment) is not consulted. There is no working log-file output (`-l/--log-file` is accepted but unused).
+- **`logger.file.path` and `logger.level`.** The log level comes from `RUST_LOG` when set, else the CLI flag `-e/--log-level` (default `info`). There is no working log-file output (`-l/--log-file` is accepted but unused).
 - **`global.max.ue` / `global.max.peer`.** Not read; `scp_context_init()` takes no size.
 - **`scp.sbi.tls.ca` and `scp.sbi.tls.min_version`.** There is no CA-bundle or minimum-version knob in the code; the rest of the `tls` block *is* read.
 
