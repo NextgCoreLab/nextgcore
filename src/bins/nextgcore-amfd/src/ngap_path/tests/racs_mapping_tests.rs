@@ -169,7 +169,7 @@ async fn an_unknown_id_is_resolved_off_the_ngap_task() {
     })
     .await
     .expect("stand-in UCMF starts");
-    let _env = UcmfEnvGuard::set(addr.port());
+    let _env = UcmfEnvGuard::acquire(addr.port()).await;
     let mut server = capturing_ngap_server().await;
 
     tokio::time::timeout(
@@ -197,13 +197,14 @@ async fn an_unknown_id_is_resolved_off_the_ngap_task() {
 }
 
 /// Points the AMF's UCMF calls at `port` while held.
-struct UcmfEnvGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+struct UcmfEnvGuard(#[allow(dead_code)] tokio::sync::MutexGuard<'static, ()>);
 
 impl UcmfEnvGuard {
-    fn set(port: u16) -> Self {
-        let guard = crate::test_support::UCMF_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+    /// Async, because `UCMF_ENV_LOCK` is a tokio mutex (#643), held across the test's
+    /// awaits. Named `acquire` like `SmfEnvGuard::acquire`, so a sync `set` call
+    /// cannot bind the future unawaited.
+    async fn acquire(port: u16) -> Self {
+        let guard = crate::test_support::UCMF_ENV_LOCK.lock().await;
         std::env::set_var("UCMF_SBI_ADDR", "127.0.0.1");
         std::env::set_var("UCMF_SBI_PORT", port.to_string());
         Self(guard)
@@ -315,7 +316,7 @@ async fn one_resolve_answers_every_association_that_asked() {
     })
     .await
     .expect("stand-in UCMF starts");
-    let _env = UcmfEnvGuard::set(addr.port());
+    let _env = UcmfEnvGuard::acquire(addr.port()).await;
     let mut server = capturing_ngap_server().await;
 
     // Three gNBs ask for the same ID.
@@ -411,7 +412,7 @@ async fn a_manufacturer_ids_real_404_suppresses_without_retiring() {
     })
     .await
     .expect("stand-in UCMF starts");
-    let _env = UcmfEnvGuard::set(addr.port());
+    let _env = UcmfEnvGuard::acquire(addr.port()).await;
     let mut server = capturing_ngap_server().await;
 
     assert!(!crate::racs::is_plmn_assigned(&MAN_ID), "Type Field 0");
@@ -482,7 +483,7 @@ async fn a_404_in_flight_across_a_creation_notice_is_dropped() {
     })
     .await
     .expect("stand-in UCMF starts");
-    let _env = UcmfEnvGuard::set(addr.port());
+    let _env = UcmfEnvGuard::acquire(addr.port()).await;
     let mut server = capturing_ngap_server().await;
 
     // The Resolve is in flight...
