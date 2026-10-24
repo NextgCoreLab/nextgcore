@@ -199,6 +199,8 @@ pub enum SubscribeError {
     TooManySubscriptions,
     /// This consumer holds [`Limits::max_subscriptions_per_consumer`].
     TooManyForConsumer,
+    /// The subscription ID counter is at the top of its range.
+    IdSpaceExhausted,
     /// The ID reservation could not be written (#843 review).
     StateNotPersisted,
 }
@@ -625,10 +627,8 @@ impl Ucmf {
             );
             return Err(AssignError::DictionaryFull);
         }
+        let entry_id = self.allocate_entry_id()?;
         let id = self.allocate_plmn_id()?;
-        let entry_id = self
-            .allocate_entry_id()
-            .map_err(|_| AssignError::StateNotPersisted)?;
         let mut caps = caps;
         caps.complete();
         self.entries.insert(DicEntry {
@@ -655,10 +655,14 @@ impl Ucmf {
         Ok(id)
     }
 
-    fn allocate_entry_id(&mut self) -> Result<u32, String> {
-        self.reserve_ids()?;
+    /// The next Dictionary Entry ID. `StateNotPersisted` when the reservation could
+    /// not be written (#843 review), `IdSpaceExhausted` when the counter cannot
+    /// advance: handing out its last value again would give two entries one ID.
+    fn allocate_entry_id(&mut self) -> Result<u32, AssignError> {
+        self.reserve_ids()
+            .map_err(|_| AssignError::StateNotPersisted)?;
         let id = self.next_entry_id;
-        self.next_entry_id = self.next_entry_id.saturating_add(1);
+        self.next_entry_id = id.checked_add(1).ok_or(AssignError::IdSpaceExhausted)?;
         Ok(id)
     }
 
@@ -785,8 +789,9 @@ impl Ucmf {
             .map_err(|_| SubscribeError::StateNotPersisted)?;
         let seq = self.next_sub_seq;
         // The counter is restored from the state file, so it is not trusted not
-        // to be near the top of its range.
-        self.next_sub_seq = self.next_sub_seq.saturating_add(1);
+        // to be near the top of its range. At the top it refuses rather than
+        // hand out an ID again.
+        self.next_sub_seq = seq.checked_add(1).ok_or(SubscribeError::IdSpaceExhausted)?;
         // Deterministic per-subscription spread, so consecutive subscriptions
         // never share an expiry. `(seq mod m)·37 mod m` is `seq·37 mod m`
         // without the multiplication overflowing.
@@ -862,12 +867,21 @@ impl Ucmf {
                 .collect();
             return (None, failed, None);
         }
+        let Some(next_prov_seq) = self.next_prov_seq.checked_add(1) else {
+            // The counter cannot advance: refuse rather than reuse an ID.
+            log::error!("Provisioning refused: the provisioning ID space is used up");
+            let failed = racs_configs
+                .keys()
+                .map(|k| (k.clone(), RACS_OTHER_REASON))
+                .collect();
+            return (None, failed, None);
+        };
         let prov_id = self.next_prov_seq.to_string();
         let (ok, failed) = self.provision_entries(&prov_id, racs_configs, None);
         if ok.is_empty() {
             return (None, failed, None);
         }
-        self.next_prov_seq = self.next_prov_seq.saturating_add(1);
+        self.next_prov_seq = next_prov_seq;
         let prov = Provisioning {
             id: prov_id,
             configs: ok,
@@ -1054,11 +1068,11 @@ impl Ucmf {
                 failed.push((racs_key.clone(), RACS_OTHER_REASON));
                 continue;
             }
-            caps.complete();
             let Ok(entry_id) = self.allocate_entry_id() else {
                 failed.push((racs_key.clone(), RACS_OTHER_REASON));
                 continue;
             };
+            caps.complete();
             self.entries.insert(DicEntry {
                 id: entry_id,
                 tacs,
@@ -1226,7 +1240,7 @@ impl Ucmf {
             self.version_id = v as u8;
         }
         if let Some(v) = u64_of("nextEntryId") {
-            self.next_entry_id = v as u32;
+            self.next_entry_id = u32::try_from(v).unwrap_or(u32::MAX);
         }
         if let Some(v) = u64_of("nextRci") {
             self.next_rci = v;
@@ -1851,17 +1865,48 @@ mod tests {
     #[test]
     fn counters_at_the_top_of_their_range_do_not_overflow() {
         let mut u = Ucmf::new(1, ModeOfOperation::B);
-        u.restore(&json!({"nextSubSeq": u64::MAX, "nextProvSeq": u64::MAX}));
+        u.restore(&json!({"nextSubSeq": u64::MAX - 1, "nextProvSeq": u64::MAX - 1}));
         let a = u
             .subscribe(None, "http://amf/n".into(), None, now())
             .unwrap();
-        assert_eq!(a.id, u64::MAX.to_string());
+        assert_eq!(a.id, (u64::MAX - 1).to_string());
         let ceiling = now() + ChronoDuration::seconds(MAX_SUBSCRIPTION_LIFETIME_SECS);
         assert!(a.expires.unwrap() <= ceiling);
-        u.subscribe(None, "http://amf/m".into(), None, now())
-            .unwrap();
+        // At the top the counter refuses rather than hand out an ID again.
+        assert_eq!(
+            u.subscribe(None, "http://amf/m".into(), None, now()),
+            Err(SubscribeError::IdSpaceExhausted)
+        );
         let (prov, _, _) = u.create_provisioning(&racs(MAN, "0a"), None, now());
-        assert_eq!(prov.unwrap().id, u64::MAX.to_string());
+        assert_eq!(prov.unwrap().id, (u64::MAX - 1).to_string());
+        let other = "000007ed900000000abd";
+        let (prov, failed, _) = u.create_provisioning(&racs(other, "0b"), None, now());
+        assert!(prov.is_none());
+        assert_eq!(failed, [(other.to_string(), RACS_OTHER_REASON)]);
+    }
+
+    /// The Dictionary Entry ID counter refuses at u32::MAX instead of
+    /// saturating into a reused ID (#725 review).
+    #[test]
+    fn the_entry_id_counter_refuses_at_its_top() {
+        let mut u = Ucmf::new(1, ModeOfOperation::B);
+        u.restore(&json!({"nextEntryId": u64::from(u32::MAX) - 1}));
+        let (e, _, _) = u.assign("35123456", caps(&[1]), now()).unwrap();
+        assert_eq!(e, u32::MAX - 1);
+        assert_eq!(
+            u.assign("35123456", caps(&[2]), now()),
+            Err(AssignError::IdSpaceExhausted)
+        );
+        let (prov, failed, _) = u.create_provisioning(&racs(MAN, "0a"), None, now());
+        assert!(prov.is_none());
+        assert_eq!(failed, [(MAN.to_string(), RACS_OTHER_REASON)]);
+        // An out-of-range stored value is clamped, not truncated to a low ID.
+        let mut v = Ucmf::new(1, ModeOfOperation::B);
+        v.restore(&json!({"nextEntryId": u64::from(u32::MAX) + 5}));
+        assert_eq!(
+            v.assign("35123456", caps(&[1]), now()),
+            Err(AssignError::IdSpaceExhausted)
+        );
     }
 
     mod fuzz {

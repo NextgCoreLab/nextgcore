@@ -1847,10 +1847,22 @@ impl PcfContext {
             }
         }
         {
+            // A UE SM no restored session belongs to is dropped (#892): older
+            // snapshots kept one per SUPI ever served. Its id still lifts the
+            // allocator, so a removed id is never reused.
+            let owners: std::collections::HashSet<u64> =
+                sessions.iter().map(|s| s.pcf_ue_sm_id).collect();
             let mut list = write_through_poison(&self.ue_sm_list);
             let mut supi_hash = write_through_poison(&self.supi_sm_hash);
             for ue_sm in ue_sms {
                 max_ue_sm = max_ue_sm.max(ue_sm.id);
+                if !owners.contains(&ue_sm.id) {
+                    log::debug!(
+                        "[{}] dropping restored PCF UE SM with no session",
+                        ue_sm.supi
+                    );
+                    continue;
+                }
                 supi_hash.insert(ue_sm.supi.clone(), ue_sm.id);
                 list.insert(ue_sm.id, ue_sm);
             }
@@ -2160,11 +2172,93 @@ impl PcfContext {
 
     // Session management
 
+    /// Add the session `(pcf_ue_sm_id, psi)`, or return the existing one. `None`
+    /// when the UE SM is gone (it goes with its last session, #892) or the
+    /// session limit is reached. The SBI create uses [`Self::sess_add_for_supi`].
     pub fn sess_add(&self, pcf_ue_sm_id: u64, psi: u8) -> Option<PcfSess> {
         let mut sess_list = write_through_poison(&self.sess_list);
         let mut sm_policy_id_hash = write_through_poison(&self.sm_policy_id_hash);
         let mut ue_sm_list = write_through_poison(&self.ue_sm_list);
+        let (sess, added) = self.sess_insert_locked(
+            &mut sess_list,
+            &mut sm_policy_id_hash,
+            &mut ue_sm_list,
+            pcf_ue_sm_id,
+            psi,
+        )?;
+        drop((sess_list, sm_policy_id_hash, ue_sm_list));
+        if added {
+            self.persist();
+        }
+        Some(sess)
+    }
 
+    /// The session for `(supi, psi)`, resolving or adding the SUPI's UE SM and
+    /// adding the session under ONE set of guards (#892). The UE SM goes with its
+    /// last session, so a find-the-UE-then-add-the-session sequence could lose
+    /// its UE SM to a concurrent delete in between; here no delete can run
+    /// between the two steps. A UE SM added for a session that then cannot be
+    /// added (session limit) is taken out again, so a refusal leaves nothing.
+    pub fn sess_add_for_supi(&self, supi: &str, psi: u8) -> Option<PcfSess> {
+        // sess_list -> sm_policy_id_hash -> ue_sm_list -> supi_sm_hash: the order
+        // of `sess_remove_inner`, and ue_sm_list before supi_sm_hash as in
+        // `ue_sm_add` / `ue_sm_find_by_supi`.
+        let mut sess_list = write_through_poison(&self.sess_list);
+        let mut sm_policy_id_hash = write_through_poison(&self.sm_policy_id_hash);
+        let mut ue_sm_list = write_through_poison(&self.ue_sm_list);
+        let mut supi_sm_hash = write_through_poison(&self.supi_sm_hash);
+
+        let existing = supi_sm_hash
+            .get(supi)
+            .copied()
+            .filter(|id| ue_sm_list.contains_key(id));
+        let (ue_sm_id, ue_sm_added) = match existing {
+            Some(id) => (id, false),
+            None => {
+                if ue_sm_list.len() >= self.max_num_of_ue {
+                    log::error!("Maximum number of UE SMs [{}] reached", self.max_num_of_ue);
+                    return None;
+                }
+                let id = self.next_ue_sm_id.fetch_add(1, Ordering::SeqCst) as u64;
+                supi_sm_hash.insert(supi.to_string(), id);
+                ue_sm_list.insert(id, PcfUeSm::new(id, supi));
+                log::debug!("[{supi}] PCF UE SM added (id={id})");
+                (id, true)
+            }
+        };
+        let inserted = self.sess_insert_locked(
+            &mut sess_list,
+            &mut sm_policy_id_hash,
+            &mut ue_sm_list,
+            ue_sm_id,
+            psi,
+        );
+        if inserted.is_none() && ue_sm_added {
+            ue_sm_list.remove(&ue_sm_id);
+            supi_sm_hash.remove(supi);
+        }
+        drop((sess_list, sm_policy_id_hash, ue_sm_list, supi_sm_hash));
+        match inserted {
+            Some((sess, added)) => {
+                if added || ue_sm_added {
+                    self.persist();
+                }
+                Some(sess)
+            }
+            None => None,
+        }
+    }
+
+    /// The body of [`Self::sess_add`], under the caller's guards. Returns the
+    /// session and whether it was added (`false`: an existing one was reused).
+    fn sess_insert_locked(
+        &self,
+        sess_list: &mut HashMap<u64, PcfSess>,
+        sm_policy_id_hash: &mut HashMap<String, u64>,
+        ue_sm_list: &mut HashMap<u64, PcfUeSm>,
+        pcf_ue_sm_id: u64,
+        psi: u8,
+    ) -> Option<(PcfSess, bool)> {
         // A PDU session is identified by (UE SM, PSI): TS 29.512 §4.2.2.2 makes
         // the SM policy association one-per-PDU-session, so a repeat create for
         // the same pair is the SAME session, not a second one. Without this a
@@ -2190,7 +2284,18 @@ impl PcfContext {
                 existing.id
             );
             // Nothing mutated, so no persist: the snapshot is already correct.
-            return Some(existing);
+            return Some((existing, false));
+        }
+
+        // The UE SM must still exist (#892): it goes with its last session,
+        // so a caller that resolved it before a concurrent delete removed it
+        // would otherwise add a session with no parent. The SBI create uses
+        // `sess_add_for_supi`, which resolves it under these same guards.
+        if !ue_sm_list.contains_key(&pcf_ue_sm_id) {
+            log::debug!(
+                "[ue_sm_id={pcf_ue_sm_id}, psi={psi}] PCF UE SM is gone; not adding a session"
+            );
+            return None;
         }
 
         if sess_list.len() >= self.max_num_of_sess {
@@ -2207,15 +2312,13 @@ impl PcfContext {
         sm_policy_id_hash.insert(sess.sm_policy_id.clone(), id);
         sess_list.insert(id, sess.clone());
 
-        // Add session ID to UE SM
+        // Add session ID to UE SM (present: checked above, guards still held).
         if let Some(ue_sm) = ue_sm_list.get_mut(&pcf_ue_sm_id) {
             ue_sm.sess_ids.push(id);
         }
 
         log::debug!("[ue_sm_id={pcf_ue_sm_id}, psi={psi}] PCF session added (id={id})");
-        drop((sess_list, sm_policy_id_hash, ue_sm_list));
-        self.persist();
-        Some(sess)
+        Some((sess, true))
     }
 
     /// Remove a session, dropping its AF app sessions without telling their AFs.
@@ -2255,6 +2358,9 @@ impl PcfContext {
             let mut ipv4addr_hash = write_through_poison(&self.ipv4addr_hash);
             let mut ipv6prefix_hash = write_through_poison(&self.ipv6prefix_hash);
             let mut ue_sm_list = write_through_poison(&self.ue_sm_list);
+            // After ue_sm_list: the canonical primary-list-first order of
+            // `ue_sm_add` / `ue_sm_find_by_supi`.
+            let mut supi_sm_hash = write_through_poison(&self.supi_sm_hash);
 
             // The ONLY `None` this function may return: the session was not there.
             let sess = sess_list.remove(&id)?;
@@ -2265,9 +2371,28 @@ impl PcfContext {
             if let Some(ref prefix_str) = sess.ipv6prefix_string {
                 ipv6prefix_hash.remove(prefix_str);
             }
-            // Remove session ID from UE SM
+            // Remove session ID from UE SM, and the UE SM itself with its last
+            // session (#892): nothing else ever removed it, so the list grew by
+            // one per SUPI ever served and the state store kept them across
+            // restarts. Done under the same guards as the session removal, so a
+            // concurrent create either sees the session (and keeps the UE SM)
+            // or finds no UE SM and adds a fresh one; `sess_add` refuses a
+            // UE SM that is gone, so no session is left without its parent.
+            // A UE SM with no sessions has no AF app sessions either: those
+            // hang off sessions and go with them (the caller terminates them).
             if let Some(ue_sm) = ue_sm_list.get_mut(&sess.pcf_ue_sm_id) {
                 ue_sm.sess_ids.retain(|&sid| sid != id);
+                if ue_sm.sess_ids.is_empty() {
+                    let supi = ue_sm.supi.clone();
+                    ue_sm_list.remove(&sess.pcf_ue_sm_id);
+                    if supi_sm_hash.get(&supi) == Some(&sess.pcf_ue_sm_id) {
+                        supi_sm_hash.remove(&supi);
+                    }
+                    log::debug!(
+                        "[{supi}] PCF UE SM removed with its last session (id={})",
+                        sess.pcf_ue_sm_id
+                    );
+                }
             }
             sess
         };
@@ -3256,6 +3381,128 @@ mod tests {
             "sess_find_by_psi"
         );
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #892: a UE SM goes with its last session, and only then; its SUPI index
+    /// entry goes with it, and the SUPI gets a fresh UE SM on its next create.
+    ///
+    /// Revert-verified: without the removal in `sess_remove_inner` the count
+    /// stays 1.
+    #[test]
+    fn a_ue_sm_goes_with_its_last_session() {
+        let mut ctx = PcfContext::new();
+        ctx.init(64, 64);
+        let supi = "imsi-001010000000892";
+        let s1 = ctx.sess_add_for_supi(supi, 5).expect("sess 1");
+        let s2 = ctx.sess_add_for_supi(supi, 6).expect("sess 2");
+        assert_eq!(s1.pcf_ue_sm_id, s2.pcf_ue_sm_id, "one UE SM per SUPI");
+        let ue_id = s1.pcf_ue_sm_id;
+
+        let _ = ctx.sess_remove_with_apps(s1.id).expect("s1");
+        assert_eq!(ctx.ue_sm_count(), 1, "one session left: the UE SM stays");
+        assert_eq!(
+            ctx.ue_sm_find_by_supi(supi).map(|u| u.sess_ids),
+            Some(vec![s2.id])
+        );
+
+        let _ = ctx.sess_remove_with_apps(s2.id).expect("s2");
+        assert_eq!(ctx.ue_sm_count(), 0, "the last session took the UE SM");
+        assert!(ctx.ue_sm_find_by_supi(supi).is_none());
+        assert!(read_through_poison(&ctx.supi_sm_hash).is_empty());
+
+        let again = ctx.sess_add_for_supi(supi, 5).expect("fresh session");
+        assert_ne!(
+            again.pcf_ue_sm_id, ue_id,
+            "a removed UE SM id is not reused"
+        );
+        assert_eq!(ctx.ue_sm_count(), 1);
+    }
+
+    /// #892: a session is never added under a UE SM that is gone (a caller that
+    /// resolved it before a concurrent delete took it), and a create refused at
+    /// the session limit leaves no UE SM behind.
+    #[test]
+    fn sess_add_refuses_a_removed_ue_sm_and_a_refused_create_leaves_no_ue_sm() {
+        let mut ctx = PcfContext::new();
+        ctx.init(64, 1);
+        let supi = "imsi-001010000000893";
+        let s = ctx.sess_add_for_supi(supi, 5).expect("sess");
+        assert_eq!(
+            ctx.sess_add_for_supi(supi, 5).map(|r| r.id),
+            Some(s.id),
+            "a repeat create reuses the session"
+        );
+        let _ = ctx.sess_remove_with_apps(s.id).expect("removed");
+        assert!(
+            ctx.sess_add(s.pcf_ue_sm_id, 6).is_none(),
+            "the UE SM went with its last session; no orphan session"
+        );
+        assert_eq!(ctx.sess_count(), 0);
+
+        let _held = ctx
+            .sess_add_for_supi("imsi-001010000000898", 5)
+            .expect("fills the limit");
+        assert!(ctx.sess_add_for_supi(supi, 5).is_none(), "session limit");
+        assert!(
+            ctx.ue_sm_find_by_supi(supi).is_none(),
+            "the refused create took its new UE SM out again"
+        );
+        assert_eq!(ctx.ue_sm_count(), 1);
+    }
+
+    /// #892, race-safety: concurrent create/delete cycles for one SUPI never
+    /// leave a session whose UE SM is gone, a UE SM with no session, or a SUPI
+    /// index entry pointing at nothing, and no create is refused.
+    #[test]
+    fn concurrent_create_and_delete_for_one_supi_leave_a_consistent_context() {
+        let mut ctx = PcfContext::new();
+        ctx.init(64, 256);
+        let ctx = std::sync::Arc::new(ctx);
+        let supi = "imsi-001010000000894";
+        let threads: Vec<_> = (0..8u8)
+            .map(|t| {
+                let ctx = std::sync::Arc::clone(&ctx);
+                std::thread::spawn(move || {
+                    for _ in 0..300 {
+                        let sess = ctx
+                            .sess_add_for_supi(supi, t + 1)
+                            .expect("a create always lands, whatever deletes run beside it");
+                        let _ = ctx.sess_remove_with_apps(sess.id).expect("own session");
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("thread");
+        }
+        assert_eq!(ctx.sess_count(), 0);
+        assert_eq!(ctx.ue_sm_count(), 0, "no UE SM outlived its sessions");
+        assert!(read_through_poison(&ctx.supi_sm_hash).is_empty());
+    }
+
+    /// #892: a snapshot from before the fix kept a UE SM per SUPI ever served;
+    /// restore drops the ones no session belongs to, and keeps their ids out
+    /// of reuse.
+    #[test]
+    fn restore_drops_ue_sms_without_sessions() {
+        let path = temp_state_path("ue-sm-prune");
+        let (kept, dropped) = {
+            let ctx = ctx_with_state(&path);
+            let kept = ctx.ue_sm_add("imsi-001010000000895").expect("kept");
+            ctx.sess_add(kept.id, 5).expect("sess");
+            let dropped = ctx.ue_sm_add("imsi-001010000000896").expect("stale");
+            (kept, dropped)
+        };
+        let r = ctx_with_state(&path);
+        assert_eq!(r.ue_sm_count(), 1);
+        assert_eq!(
+            r.ue_sm_find_by_supi("imsi-001010000000895").map(|u| u.id),
+            Some(kept.id)
+        );
+        assert!(r.ue_sm_find_by_supi("imsi-001010000000896").is_none());
+        let fresh = r.ue_sm_add("imsi-001010000000897").expect("fresh");
+        assert!(fresh.id > dropped.id, "a dropped id is not reused");
         let _ = std::fs::remove_file(&path);
     }
 
