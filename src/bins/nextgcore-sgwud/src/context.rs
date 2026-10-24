@@ -293,7 +293,8 @@ pub struct SgwuFar {
 /// QoS Enforcement Rule (TS 29.244 §5.2.5.1, §8.2.7).
 ///
 /// `gate_status` packs both directions: bits 1-2 are the UL gate and bits 3-4
-/// the DL gate, each `0` = OPEN and `1` = CLOSED.
+/// the DL gate, each `0` = OPEN and `1` = CLOSED. An internal packing, the reverse of
+/// the §8.2.7 wire octet (DL bits 1-2, UL bits 3-4): see `gate_status_octet`.
 #[derive(Debug, Clone, Default)]
 pub struct SgwuQer {
     pub sess_id: u64,
@@ -1266,6 +1267,23 @@ impl SgwuContext {
         Some(BufferOutcome::Accepted {
             buffered: far.buffered.len(),
         })
+    }
+
+    /// DROBU (TS 29.244 §8.2.31, #1041): discard every packet buffered on any FAR of
+    /// the session, ending any flush. Returns how many were dropped.
+    pub fn sess_drop_buffered(&self, sess_id: u64) -> usize {
+        let Ok(mut fars) = self.far_list.write() else {
+            return 0;
+        };
+        let mut dropped = 0;
+        for ((sid, _), far) in fars.iter_mut() {
+            if *sid == sess_id {
+                far.flushing = false;
+                dropped += far.buffered.len();
+                far.buffered.clear();
+            }
+        }
+        dropped
     }
 
     /// Take all buffered packets from a FAR, discarding the queue (no GTP-U server to

@@ -1683,6 +1683,7 @@ pub fn parse_create_urr(data: &[u8]) -> Result<ParsedCreateUrr, &'static str> {
 
     // Measurement Method (IE type 62)
     if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::MEASUREMENT_METHOD) {
+        urr.measurement_method_present = true;
         if !ie.value.is_empty() {
             urr.measure_duration = (ie.value[0] & 0x01) != 0;
             urr.measure_volume = (ie.value[0] & 0x02) != 0;
@@ -1824,6 +1825,8 @@ fn parse_volume_ie(value: &[u8]) -> (Option<u64>, Option<u64>, Option<u64>) {
 pub struct ParsedCreateUrr {
     pub urr_id: u32,
     pub measure_duration: bool,
+    /// The Measurement Method IE was present (an Update URR changes it only then).
+    pub measurement_method_present: bool,
     pub measure_volume: bool,
     pub trigger_periodic: bool,
     pub trigger_volume_threshold: bool,
@@ -2966,6 +2969,24 @@ mod tests {
         // the bit to 0 to turn reflective QoS off for the flow).
         let explicit_off = parse_create_qer(&qer_ies(&[ie(123, &[0x00])])).expect("QER parses");
         assert!(!explicit_off.rqi);
+    }
+
+    /// #953 review: an Update URR changes DURAT only when it carries a Measurement
+    /// Method (an absent IE parses as `measure_duration == false`).
+    #[test]
+    fn an_update_urr_says_whether_it_carries_a_measurement_method() {
+        let mut b = PfcpMessageBuilder::new();
+        b.add_u32(pfcp_ie::URR_ID, 9);
+        assert!(
+            !parse_create_urr(&b.build())
+                .unwrap()
+                .measurement_method_present
+        );
+        let mut b = PfcpMessageBuilder::new();
+        b.add_u32(pfcp_ie::URR_ID, 9);
+        b.add_u8(pfcp_ie::MEASUREMENT_METHOD, 0x01);
+        let urr = parse_create_urr(&b.build()).unwrap();
+        assert!(urr.measurement_method_present && urr.measure_duration);
     }
 
     /// #820: the time-metering IEs of a Create/Update URR are parsed: Inactivity

@@ -2054,6 +2054,14 @@ impl AmfContext {
         moved
     }
 
+    /// Every session in the table (#756's orphan sweep).
+    pub fn sess_list_snapshot(&self) -> Vec<AmfSess> {
+        match self.sess_list.read() {
+            Ok(l) => l.values().cloned().collect(),
+            Err(e) => e.into_inner().values().cloned().collect(),
+        }
+    }
+
     /// Get sessions for an AMF UE
     pub fn sess_list_for_ue(&self, amf_ue_id: u64) -> Vec<AmfSess> {
         let sess_list = self.sess_list.read().unwrap();
@@ -4873,7 +4881,8 @@ static GLOBAL_AMF_CONTEXT: std::sync::OnceLock<Arc<RwLock<AmfContext>>> =
 /// and the sibling's UE was never deregistered. Declared beside the global it guards, so
 /// there is one lock for it rather than one per test module.
 #[cfg(test)]
-pub(crate) static REACHABILITY_SWEEP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static REACHABILITY_SWEEP_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
 
 /// Get the global AMF context
 pub fn amf_self() -> Arc<RwLock<AmfContext>> {
@@ -5732,9 +5741,7 @@ mod tests {
     /// bleeds.
     #[test]
     fn test_nas_security_canary_knob_seeds_new_ue() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.blocking_lock();
 
         // Default: OFF -> legacy UE.
         set_nas_security_canary(false);
