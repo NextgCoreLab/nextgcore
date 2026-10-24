@@ -861,6 +861,8 @@ async fn a_session_the_smf_does_not_switch_is_released_in_the_acknowledge() {
     server.ue_auth_state.insert(ue, state);
     hold_session(&mut server, ue, 5, "ps745-ok-5", port);
     hold_session(&mut server, ue, 6, "fail-ps745-6", port);
+    server.mark_up_active(ue, 5);
+    server.mark_up_active(ue, 6);
     server
         .handle_path_switch_request(target, &path_switch_request_pdu(ue, 68, &[5, 6]))
         .await
@@ -880,6 +882,10 @@ async fn a_session_the_smf_does_not_switch_is_released_in_the_acknowledge() {
             ("fail-ps745-6".to_string(), "PATH_SWITCH_REQ".to_string())
         ]
     );
+    // #778 follow-up: the session the Acknowledge releases has no user plane on the
+    // target; the switched one keeps its flag.
+    assert!(server.up_active.contains(&(ue, 5)));
+    assert!(!server.up_active.contains(&(ue, 6)), "the released session");
     let after = server.ue_auth_state.get(ue).expect("UE");
     assert_eq!(
         (after.association_id, after.ran_ue_ngap_id),
@@ -988,9 +994,12 @@ fn make_establishments_due(server: &mut NgapServer) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
 async fn an_establishment_while_the_smf_restarts_is_retried_and_succeeds() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    drop(listener); // the SMF is down: connection refused
+    // The SMF is down: its port is bound but not listening, so a connection is refused
+    // -- and, unlike a dropped listener's port, no other test's stand-in can be handed
+    // it meanwhile (#1050: that answered the "down" SMF's CreateSMContext).
+    let down = tokio::net::TcpSocket::new_v4().expect("socket");
+    down.bind("127.0.0.1:0".parse().unwrap()).expect("bind");
+    let port = down.local_addr().expect("addr").port();
     let _env = super::SmfEnvGuard::acquire(port).await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_796_001u64, 96);
@@ -1007,9 +1016,13 @@ async fn an_establishment_while_the_smf_restarts_is_retried_and_succeeds() {
     );
     assert!(server.pending_establishments.contains_key(&(ue, 5)));
 
-    // The SMF comes back on the same address.
-    let (_smf, seen) =
-        creating_smf_on(std::net::TcpListener::bind(("127.0.0.1", port)).expect("rebind")).await;
+    // The SMF comes back on the same address: the reserved socket starts listening.
+    let listener = down
+        .listen(64)
+        .expect("listen")
+        .into_std()
+        .expect("a std listener");
+    let (_smf, seen) = creating_smf_on(listener).await;
     make_establishments_due(&mut server);
     settle_establishments(&mut server).await;
 
@@ -1056,6 +1069,8 @@ async fn a_retried_establishment_carries_its_first_origination_timestamp() {
         .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &request))
         .await
         .expect("handled");
+    // #922: the first attempt runs off the NGAP task; let it fail.
+    settle_establishments(&mut server).await;
     let first = server
         .pending_establishments
         .get(&(ue, 5))
@@ -1177,17 +1192,6 @@ pub(super) fn hanging_smf() -> (std::net::TcpListener, u16) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
     (listener, port)
-}
-
-/// Wait until `n` off-task exchanges hold a permit.
-async fn until_in_flight(server: &NgapServer, n: usize) {
-    for _ in 0..200 {
-        if server.sbi_offload.in_flight() == n {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    panic!("in flight: {}, wanted {n}", server.sbi_offload.in_flight());
 }
 
 /// #796 review M1. With the SMF not answering, a due re-selection
@@ -1499,8 +1503,8 @@ async fn slow_to_fail_smf(hold: Duration) -> (u16, Arc<std::sync::atomic::Atomic
 /// #877 re-review m2: the re-selection window runs from the request's ARRIVAL,
 /// pinned through `handle_uplink_nas_transport` rather than at `defer_establishment`.
 ///
-/// The first attempt is made inline and takes `HOLD` to fail, so a window
-/// started at the deferral (`Instant::now()` there) would be `HOLD` shorter.
+/// The first attempt takes `HOLD` to fail (off the NGAP task since #922), so a
+/// window started at the failure would be `HOLD` shorter.
 /// The assertion is on the recorded start, which must be within a few ms of the
 /// instant before the handler was called.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1523,15 +1527,19 @@ async fn the_window_runs_from_arrival_through_the_uplink_nas_handler() {
         .expect("handled");
     let after = std::time::Instant::now();
     let inline = after.duration_since(before);
+    // #922: the first attempt runs off the NGAP task, so the handler does not
+    // wait out the slow SMF.
     assert!(
-        inline >= HOLD,
-        "the fixture must make the first attempt take time: {inline:?}"
+        inline < HOLD,
+        "the handler waited for the first attempt: {inline:?}"
     );
+    // Let the slow attempt fail, so the window's start is read after it.
+    settle_establishments(&mut server).await;
     let started = server.pending_establishments[&(ue, 5)].first_failure;
     assert!(
         started.duration_since(before) < Duration::from_millis(100),
         "the window must start at arrival ({:?} after it), not when the first \
-         attempt failed ({inline:?} after it)",
+         attempt failed (at least {HOLD:?} after it)",
         started.duration_since(before)
     );
 
@@ -2423,7 +2431,9 @@ async fn establish_psi_5(
         )
         .await
         .expect("handled");
-    // The unrecorded session's SMF release runs off the NGAP task.
+    // #922: the CreateSMContext runs off the NGAP task, and so does the
+    // unrecorded session's SMF release.
+    settle_establishments(&mut server).await;
     server.sbi_offload.settle().await;
     let sent = take_sent_ngap(&mut server)
         .into_iter()
@@ -3220,4 +3230,140 @@ async fn an_ics_response_relays_only_the_sessions_the_request_set_up() {
         "the Request is answered"
     );
     server.ue_auth_state.remove(ue);
+}
+
+// ---------------------------------------------------------------------------
+// #922: the first CreateSMContext runs off the NGAP task
+// ---------------------------------------------------------------------------
+
+/// #922: a PDU Session Establishment Request whose SMF never answers does not
+/// hold the NGAP task. The handler returns at once, with the attempt in flight
+/// off the task, and a second UE's establishment is handled meanwhile. Before
+/// #922 the first attempt was awaited inline, so N2 for every gNB stalled for
+/// the SBI client's timeout per establishment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_first_create_sm_context_to_an_unanswering_smf_does_not_hold_the_ngap_task() {
+    let (_hang, port) = hanging_smf();
+    let _env = super::SmfEnvGuard::acquire(port).await;
+    let mut server = capturing_ngap_server().await;
+    let (a, b) = (7_922_001u64, 7_922_002u64);
+    ue_ready_for_sessions(&mut server, a, 110);
+    ue_ready_for_sessions(&mut server, b, 111);
+    let request = [0x2E, 0x05, 0x01, 0xC1, 0xFF, 0xFF];
+
+    let started = std::time::Instant::now();
+    for (ue, ran) in [(a, 110), (b, 111)] {
+        server
+            .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &request))
+            .await
+            .expect("handled");
+    }
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "both establishments were handled at once: {:?}",
+        started.elapsed()
+    );
+    for ue in [a, b] {
+        assert!(
+            server.pending_establishments[&(ue, 5)].in_flight,
+            "UE {ue}: its CreateSMContext is in flight off the task"
+        );
+    }
+    until_in_flight(&server, 2).await;
+    assert!(
+        take_sent_ngap(&mut server).is_empty(),
+        "nothing answered yet"
+    );
+    server.forget_ue(a);
+    server.forget_ue(b);
+}
+
+/// #922: the off-task first attempt still sets the session up: the SMF's
+/// answer is applied on the NGAP task (the session recorded, the Accept relayed
+/// and the PDU SESSION RESOURCE SETUP REQUEST sent), exactly as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_first_create_sm_context_answered_off_the_task_sets_the_session_up() {
+    let (_smf, port, calls) = activating_smf().await;
+    let _env = super::SmfEnvGuard::acquire(port).await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_922_011u64, 112);
+    ue_ready_for_sessions(&mut server, ue, ran);
+    server
+        .handle_uplink_nas_transport(
+            ASSOC,
+            &uplink_nas_transport(ue, ran, &[0x2E, 0x05, 0x01, 0xC1, 0xFF, 0xFF]),
+        )
+        .await
+        .expect("handled");
+    settle_establishments(&mut server).await;
+
+    assert_eq!(
+        calls
+            .lock()
+            .expect("calls")
+            .iter()
+            .filter(|(u, _)| u.ends_with("/nsmf-pdusession/v1/sm-contexts"))
+            .count(),
+        1
+    );
+    assert!(server.sm_context_refs.contains_key(&(ue, 5)));
+    assert!(server.pending_establishments.is_empty());
+    let sent = sent_to(&mut server, ue);
+    assert!(
+        sent.iter().any(|s| matches!(s, Sent::SetupRequest { .. })),
+        "the session is set up at the gNB: {sent:?}"
+    );
+    server.forget_ue(ue);
+}
+
+/// #922: a UE-requested PDU Session Release does not wait for the SMF. The
+/// release command goes to the UE and the gNB at once, and the ReleaseSMContext
+/// reaches the SMF off the NGAP task. With an SMF that never answers, the
+/// handler still returns at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_ue_requested_release_does_not_wait_for_the_smf() {
+    let (_hang, hang_port) = hanging_smf();
+    let (_smf, port, calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_922_021u64, 113);
+    ue_ready_for_sessions(&mut server, ue, ran);
+    hold_session(&mut server, ue, 5, "rel-922-hang", hang_port);
+    hold_session(&mut server, ue, 6, "rel-922-ok", port);
+    let release_request = |psi: u8| vec![0x2E, psi, 0x01, 0xD1];
+
+    let started = std::time::Instant::now();
+    for psi in [5, 6] {
+        server
+            .handle_5gsm_message(ASSOC, ue, ran, &release_request(psi), None)
+            .await
+            .expect("handled");
+    }
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "the handler did not wait for the SMF: {:?}",
+        started.elapsed()
+    );
+    let releases = sent_to(&mut server, ue)
+        .into_iter()
+        .filter(|s| matches!(s, Sent::ReleaseCommand { .. }))
+        .count();
+    assert_eq!(releases, 2, "both sessions released at the gNB at once");
+    // The answering SMF gets its release off the task.
+    for _ in 0..200 {
+        if calls
+            .lock()
+            .expect("calls")
+            .iter()
+            .any(|(u, _)| u.ends_with("/sm-contexts/rel-922-ok/release"))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(calls
+        .lock()
+        .expect("calls")
+        .iter()
+        .any(|(u, _)| u.ends_with("/sm-contexts/rel-922-ok/release")));
+    server.forget_ue(ue);
 }
