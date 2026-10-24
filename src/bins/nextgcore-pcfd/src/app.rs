@@ -7294,6 +7294,31 @@ mod tests {
             .unwrap()
             .sess_find_by_sm_policy_id(&second)
             .is_some());
+
+        // #980 review: a retransmission (the same stamp, the same body) is the
+        // same request: 201 with the same association, which is not replaced.
+        let resp = pcf_sbi_request_handler(create("Fri, 23 Oct 2026 10:00:00.501 GMT")).await;
+        assert_eq!(resp.status, 201);
+        assert_eq!(
+            policy_id(&resp),
+            second,
+            "the retransmission reuses the association"
+        );
+
+        // And a create without the header is still accepted (as more recent).
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(full_create_body(supi, 5)),
+        ))
+        .await;
+        assert_eq!(resp.status, 201, "no header means accept");
+        assert_ne!(policy_id(&resp), second);
+        assert!(ctx
+            .read()
+            .unwrap()
+            .sess_find_by_sm_policy_id(&second)
+            .is_none());
     }
 
     /// #892: through the SBI handlers, SM policy create then delete leaves no

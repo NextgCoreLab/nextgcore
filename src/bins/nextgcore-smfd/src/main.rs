@@ -3813,7 +3813,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                 // create that omits it leaves the PCF with nothing to bound its
                 // authorisation by -- which is what this leg did before #310.
                 subs_sess_ambr: subscribed.as_ref(),
-                origination_timestamp: Some(&origination),
+                origination_timestamp: origination.as_deref(),
             };
             match policy::sm_policy_create(&pcf, &create_ctx).await {
                 Ok(decision) => {

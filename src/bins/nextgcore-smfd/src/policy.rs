@@ -677,40 +677,35 @@ pub struct SmPolicyCreateContext<'a> {
     /// the subscription at all.
     pub subs_sess_ambr: Option<&'a crate::udm::SubscribedSmData>,
     /// `3gpp-Sbi-Origination-Timestamp` for the create (TS 29.512 §4.2.2.2,
-    /// §4.2.7): see [`origination_timestamp_for_create`]. Fixed per PDU session
-    /// establishment, so a re-sent create carries the same value and the PCF
-    /// reuses the association instead of replacing it.
+    /// §4.2.7), forwarded from the CreateSMContext request; see
+    /// [`origination_timestamp_for_create`]. `None` sends no header.
     pub origination_timestamp: Option<&'a str>,
 }
 
 /// TS 29.502 §6.1.2.3.2 custom header.
 pub const ORIGINATION_TIMESTAMP_HEADER: &str = "3gpp-Sbi-Origination-Timestamp";
 
-/// The `3gpp-Sbi-Origination-Timestamp` the SMF sends on
-/// `Npcf_SMPolicyControl_Create` (#980 review).
+/// The `3gpp-Sbi-Origination-Timestamp` the SMF forwards on
+/// `Npcf_SMPolicyControl_Create` (#980 review): the CreateSMContext request's,
+/// when it carried a readable one, and nothing otherwise.
 ///
-/// TS 29.512 §4.2.2.2: when the CreateSMContext request carried the header, the
-/// SMF forwards it, so the PCF compares the AMF's origination times (§4.2.7).
-/// Otherwise the SMF stamps the time it handles the request, as the originating
-/// entity (TS 29.502 §6.1.2.3.2). The value is computed once per create and
-/// sent unchanged on any re-send. Without it, a create the PCF has already
-/// seen counts as more recent, which replaces the association and terminates
-/// its AF sessions. A present but unreadable value is not forwarded, because
-/// the PCF would refuse it with 400. The SMF stamps its own instead and logs
-/// the bad value.
-pub fn origination_timestamp_for_create(incoming: Option<&str>) -> String {
-    match incoming {
-        Some(v) if nextgcore_sbi::datetime::origination_timestamp_to_epoch_ms(v).is_some() => {
-            v.trim_matches([' ', '\t']).to_string()
-        }
-        Some(v) => {
-            log::warn!(
-                "CreateSMContext {ORIGINATION_TIMESTAMP_HEADER} {v:?} is not a TS 29.502 \
-                 timestamp; the SM policy create carries the SMF's own"
-            );
-            nextgcore_sbi::datetime::now_origination_timestamp()
-        }
-        None => nextgcore_sbi::datetime::now_origination_timestamp(),
+/// TS 29.512 §4.2.2.2: when the CreateSMContext request includes the header, the
+/// SMF shall forward it. The SMF is not the originating entity
+/// (TS 29.502 §6.1.2.3.2; the AMF is) and never stamps its own. Without the
+/// header, the PCF accepts a colliding create as more recent (§4.2.7). An AMF
+/// retransmission carries the AMF's unchanged stamp, so forwarding it lets the
+/// PCF reuse the association. An unreadable value is not forwarded, because the
+/// PCF would refuse it with 400; it is logged.
+pub fn origination_timestamp_for_create(incoming: Option<&str>) -> Option<String> {
+    let v = incoming?;
+    if nextgcore_sbi::datetime::origination_timestamp_to_epoch_ms(v).is_some() {
+        Some(v.trim_matches([' ', '\t']).to_string())
+    } else {
+        log::warn!(
+            "CreateSMContext {ORIGINATION_TIMESTAMP_HEADER} {v:?} is not a TS 29.502 \
+             timestamp; not forwarded to the PCF"
+        );
+        None
     }
 }
 
@@ -2142,11 +2137,10 @@ mod tests {
     /// so a subscription stating only one is reported as NOTHING rather than as a zero
     /// (a `subsSessAmbr` of "0 bps" would have the PCF bound the authorisation to
     /// nothing and police the subscriber to a standstill).
-    /// #980 review: the create carries `3gpp-Sbi-Origination-Timestamp`
-    /// verbatim. The value is fixed per establishment, so a re-sent create
-    /// compares equal at the PCF and reuses its association (TS 29.512 §4.2.7).
-    /// The value forwarded is the AMF's when it is readable, else the SMF's own
-    /// (§4.2.2.2).
+    /// #980 review: the create forwards `3gpp-Sbi-Origination-Timestamp`
+    /// verbatim when the AMF sent a readable one (TS 29.512 §4.2.2.2), so a
+    /// re-sent create compares equal at the PCF and reuses its association
+    /// (§4.2.7); otherwise no header is sent.
     #[tokio::test]
     async fn the_sm_policy_create_carries_the_origination_timestamp() {
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -2189,7 +2183,11 @@ mod tests {
         };
         let amf_stamp = "Fri, 23 Oct 2026 10:00:00.123 GMT";
         let origination = origination_timestamp_for_create(Some(amf_stamp));
-        assert_eq!(origination, amf_stamp, "the AMF's value is forwarded");
+        assert_eq!(
+            origination.as_deref(),
+            Some(amf_stamp),
+            "the AMF's value is forwarded"
+        );
         let ctx = SmPolicyCreateContext {
             supi: "imsi-001010000000980",
             psi: 5,
@@ -2200,7 +2198,7 @@ mod tests {
             ue_ipv4: [10, 45, 0, 98],
             notification_uri: "http://127.0.0.1:9/cb",
             subs_sess_ambr: None,
-            origination_timestamp: Some(&origination),
+            origination_timestamp: origination.as_deref(),
         };
         // The same create twice, as a re-send: the same value both times.
         for _ in 0..2 {
@@ -2214,14 +2212,24 @@ mod tests {
             vec![Some(amf_stamp.to_string()), Some(amf_stamp.to_string())]
         );
 
-        // No header, or an unreadable one: the SMF's own, which the PCF can read.
+        // No header, or an unreadable one: nothing is forwarded, and the SMF
+        // never stamps its own (it is not the originating entity).
         for incoming in [None, Some("yesterday")] {
-            let own = origination_timestamp_for_create(incoming);
-            assert!(
-                nextgcore_sbi::datetime::origination_timestamp_to_epoch_ms(&own).is_some(),
-                "{incoming:?} -> {own}"
+            assert_eq!(
+                origination_timestamp_for_create(incoming),
+                None,
+                "{incoming:?}"
             );
         }
+        let bare = SmPolicyCreateContext {
+            origination_timestamp: None,
+            ..ctx
+        };
+        tokio::time::timeout(Duration::from_secs(8), sm_policy_create(&pcf, &bare))
+            .await
+            .expect("in time")
+            .expect("created");
+        assert_eq!(stamps.lock().unwrap().last(), Some(&None), "no header sent");
     }
 
     #[tokio::test]
