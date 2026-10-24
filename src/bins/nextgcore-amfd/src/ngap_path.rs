@@ -2873,7 +2873,7 @@ impl NgapServer {
                 );
                 // TS 24.501 Section 5.4.2.5: abort the procedure; the network
                 // releases the N1 signalling connection.
-                self.release_ue(
+                self.abort_release_ue(
                     association_id,
                     ul_nas.amf_ue_ngap_id,
                     ul_nas.ran_ue_ngap_id,
@@ -10194,7 +10194,7 @@ impl NgapServer {
                     // funnel, or #356's emergency context leaks again the next time a path
                     // is added beside it.
                     self.ue_auth_state.insert(amf_ue_ngap_id, state);
-                    self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+                    self.abort_release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
                         .await?;
                 }
                 NasProcTimer::T3570 => {
@@ -10208,7 +10208,7 @@ impl NgapServer {
                         // SUCI identification aborted: release. `release_ue` -> `forget_ue`
                         // owns the removal; see the T3560 arm.
                         self.ue_auth_state.insert(amf_ue_ngap_id, state);
-                        self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+                        self.abort_release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
                             .await?;
                     }
                 }
@@ -10484,8 +10484,96 @@ impl NgapServer {
             "the NAS reject",
         )
         .await;
+        self.abort_release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, nas_cause)
+            .await
+    }
+
+    /// [`Self::release_ue`] for a procedure the AMF ABORTS (#845): a registration
+    /// reject, T3560 / T3570 exhaustion, a Security Mode Reject, an Initial
+    /// Context Setup Failure. Unlike a deregistration, nothing released the UE's
+    /// PDU sessions first, and `forget_ue` drops their refs (#756), after which
+    /// nothing in the AMF could ever release them: the SM contexts, PFCP sessions,
+    /// TEIDs and UE IP addresses would leak at the SMF and UPF. So every session
+    /// the UE still holds is released at its SMF first (TS 23.502 §4.2.2.3.2: a
+    /// UE context the AMF deletes has its PDU sessions released), off the NGAP
+    /// task ([`Self::offload_release_held_sessions`]).
+    async fn abort_release_ue(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        nas_cause: u8,
+    ) -> Result<()> {
+        self.offload_release_held_sessions(amf_ue_ngap_id);
         self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, nas_cause)
             .await
+    }
+
+    /// Nsmf_PDUSession_ReleaseSMContext for every PDU session `amf_ue_ngap_id`
+    /// still holds, through `sbi_offload` (#845). Durable and keyed on (UE, PSI):
+    /// the `forget_ue` that follows must not drop a release, and a release reaches
+    /// the SMF before any later exchange for the same session. Each goes to the
+    /// SMF that holds the context (#669). One whose SMF is not recorded is sent to
+    /// the SMF discovery selects, and skipped with a log when there is none rather
+    /// than sent to a guessed address.
+    fn offload_release_held_sessions(&mut self, amf_ue_ngap_id: u64) {
+        let mut held: std::collections::BTreeMap<u8, String> = self
+            .sm_context_refs
+            .iter()
+            .filter(|((ue, _), _)| *ue == amf_ue_ngap_id)
+            .map(|((_, psi), r)| (*psi, r.clone()))
+            .collect();
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            for sess in guard.sess_list_for_ue(amf_ue_ngap_id) {
+                if let Some(r) = sess.sm_context_ref {
+                    held.entry(sess.psi).or_insert(r);
+                }
+            }
+        }
+        if held.is_empty() {
+            return;
+        }
+        log::info!(
+            "UE {amf_ue_ngap_id}: the aborted procedure ends the UE context; releasing its {} \
+             PDU session(s) at the SMF first (TS 23.502 §4.2.2.3.2)",
+            held.len()
+        );
+        for (psi, sm_ref) in held {
+            let owner = self.sm_context_smfs.get(&(amf_ue_ngap_id, psi)).cloned();
+            self.sbi_offload
+                .spawn_keyed_durable((amf_ue_ngap_id, psi), move || async move {
+                    let (host, port) = match owner {
+                        Some(owner) => owner,
+                        None => match crate::sbi_path::resolve_nf_endpoint_async(
+                            crate::sbi_path::SbiServiceType::NsmfPdusession,
+                        )
+                        .await
+                        {
+                            Ok(ep) => ep,
+                            Err(e) => {
+                                log::warn!(
+                                    "UE {amf_ue_ngap_id}: no SMF to release SM context \
+                                     {sm_ref} (PSI={psi}) at: {e}"
+                                );
+                                return None;
+                            }
+                        },
+                    };
+                    match crate::sbi_path::call_smf_release_sm_context(&host, port, &sm_ref).await {
+                        Ok(()) => log::info!(
+                            "SMF SM Context Released: {sm_ref} (PSI={psi}) of UE \
+                             {amf_ue_ngap_id}, whose procedure was aborted"
+                        ),
+                        Err(e) => log::warn!(
+                            "UE {amf_ue_ngap_id}: SMF release of {sm_ref} (PSI={psi}) \
+                             failed: {e}"
+                        ),
+                    }
+                    None
+                });
+        }
     }
 
     /// Send a UEContextReleaseCommand with a NAS cause and drop the UE's
@@ -14291,7 +14379,7 @@ impl NgapServer {
         });
         // NAS cause #22 "congestion" is not appropriate; use #9 (UE identity
         // cannot be derived) so the UE re-registers (TS 24.501 Annex).
-        self.release_ue(
+        self.abort_release_ue(
             association_id,
             amf_ue_ngap_id,
             ran_ue_ngap_id,
