@@ -733,9 +733,12 @@ fn probe_stale_recovery(inner: &Arc<GtpcInner>, peer: SocketAddr, counter: u8) -
     let Ok(mut probes) = inner.stale_probe.lock() else {
         return false;
     };
+    // One probe per PEER per period (#955 review), whatever the value: a peer
+    // flapping between stale values must not turn each datagram into an Echo
+    // Request. The outstanding probe keeps the value it asked about.
     if probes
         .get(&peer.ip())
-        .is_some_and(|p| p.counter == counter && now.duration_since(p.sent) < STALE_PROBE_INTERVAL)
+        .is_some_and(|p| now.duration_since(p.sent) < STALE_PROBE_INTERVAL)
     {
         return false;
     }
@@ -2571,6 +2574,13 @@ mod tests {
         assert!(note_peer_recovery(&server.inner, peer_addr, 4));
         assert!(!note_peer_recovery(&server.inner, peer_addr, 3));
         let seq = recv_echo(&peer).expect("probed");
+        // Per peer, not per value (#955 review): another stale value within the
+        // period sends no second probe.
+        peer.set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        assert!(!note_peer_recovery(&server.inner, peer_addr, 2));
+        assert!(recv_echo(&peer).is_none(), "one probe per peer per period");
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         // Answered over the socket, so the receive path's routing of an Echo
         // Response to the probe is what is tested.
         let answer = Gtp2Message::echo_response(seq, 4);
@@ -2586,6 +2596,54 @@ mod tests {
             "the Echo Response closed the probe"
         );
         assert_eq!(stored(&server), Some(4), "kept");
+        server.close();
+    }
+
+    /// #955 review: the confirmed-restart path over the socket. A peer that lost
+    /// its counter answers the probe with the same lower value: the receive path
+    /// routes the Echo Response to the probe, re-bases the stored value, and the
+    /// peer's next increment is a restart again.
+    #[test]
+    fn a_lost_counter_confirmed_by_echo_over_the_socket_is_re_based() {
+        let _guard = lock_s11();
+        let (server, peer, peer_addr) = spawn_server_and_peer(Gtp2XactConfig::default());
+        assert!(!note_peer_recovery(&server.inner, peer_addr, 100));
+        assert!(!note_peer_recovery(&server.inner, peer_addr, 1), "stale");
+        let mut buf = [0u8; 4096];
+        let seq = loop {
+            let (len, _) = peer.recv_from(&mut buf).expect("an Echo Request");
+            let msg = Gtp2Message::decode(&mut Bytes::copy_from_slice(&buf[..len])).unwrap();
+            if msg.header.message_type == Gtp2MessageType::EchoRequest as u8 {
+                break msg.header.sequence_number;
+            }
+        };
+        let answer = Gtp2Message::echo_response(seq, 1);
+        peer.send_to(&answer.encode(), server.local_addr()).unwrap();
+        let stored = || {
+            server
+                .inner
+                .peer_restart
+                .lock()
+                .unwrap()
+                .get(&peer_addr.ip())
+                .copied()
+        };
+        for _ in 0..200 {
+            if stored() == Some(1) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            stored(),
+            Some(1),
+            "re-based by the confirming Echo Response"
+        );
+        assert!(server.inner.stale_probe.lock().unwrap().is_empty());
+        assert!(
+            note_peer_recovery(&server.inner, peer_addr, 4),
+            "the next restart is caught"
+        );
         server.close();
     }
 }
