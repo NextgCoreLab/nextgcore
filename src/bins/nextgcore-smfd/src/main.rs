@@ -18709,9 +18709,10 @@ mod tests {
                 .with_body(body.to_string(), "application/json");
             let resp = handle_sm_context_update(&reference, &req).await;
             assert_eq!(resp.status, 500, "{body}");
-            let problem: serde_json::Value =
+            // #1072 round 3 m11: an SmContextUpdateError (TS 29.502 §6.1.6.2.36).
+            let error: serde_json::Value =
                 serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("json");
-            assert_eq!(problem["cause"], "SYSTEM_FAILURE", "{body}");
+            assert_eq!(error["error"]["cause"], "SYSTEM_FAILURE", "{body}");
         }
     }
 

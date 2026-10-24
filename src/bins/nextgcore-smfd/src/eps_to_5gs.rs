@@ -675,6 +675,21 @@ impl Drop for HandoverLock {
     }
 }
 
+/// An SM context error answer (#1072 round 3 m11): SmContextCreateError (TS 29.502
+/// §6.1.6.2.35, Table 6.1.3.2.3.1-3) for the EPS→5GS create, and SmContextUpdateError
+/// (§6.1.6.2.36, Table 6.1.3.3.4.2.2-2) for PREPARED, COMPLETED and CANCELLED. Both
+/// carry the ProblemDetails, with its "cause", in "error", as application/json. A
+/// bare ProblemDetails is for errors an SCP originates.
+fn sm_context_error(status: u16, cause: &str, detail: &str) -> SbiResponse {
+    let body = serde_json::json!({
+        "error": { "status": status, "cause": cause, "detail": detail },
+    });
+    SbiResponse::with_status(status).with_body(
+        body.to_string(),
+        nextgcore_sbi::constants::content_type::APPLICATION_JSON,
+    )
+}
+
 /// TS 29.502 §5.2.2.2.3: the SMF's answer to an EPS→5GS handover preparation.
 pub(crate) async fn handle_create(body: &serde_json::Value) -> SbiResponse {
     let body = body.clone();
@@ -697,14 +712,15 @@ async fn detached(
         Ok(response) => response,
         Err(e) => {
             log::error!("EPS→5GS handover handler failed: {e}");
-            crate::problem_response(500, "SYSTEM_FAILURE", "the handover handler failed")
+            sm_context_error(500, "SYSTEM_FAILURE", "the handover handler failed")
         }
     }
 }
 
 async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
     let Some(supi) = body["supi"].as_str().filter(|s| !s.is_empty()) else {
-        return crate::problem_400(
+        return sm_context_error(
+            400,
             "MANDATORY_IE_MISSING",
             "supi is required to find the UE's EPS PDN connection (TS 29.502 6.1.6.2.2)",
         );
@@ -719,7 +735,8 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
         {
             Some(pdn) => pdn,
             None => {
-                return crate::problem_400(
+                return sm_context_error(
+                    400,
                     "MANDATORY_IE_INCORRECT",
                     "ueEpsPdnConnection is not a TS 29.274 PDN Connection this SMF can read",
                 )
@@ -735,7 +752,7 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
             pdn.pgw_c_control_fteid,
             pdn.linked_ebi
         );
-        return crate::problem_response(
+        return sm_context_error(
             404,
             "CONTEXT_NOT_FOUND",
             "no PDN connection on this SMF corresponds to the EPS bearer contexts",
@@ -750,7 +767,7 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
              sent none in its PCO), so it does not move to 5GS",
             sess.session_name
         );
-        return crate::problem_response(
+        return sm_context_error(
             403,
             "NO_EPS_5GS_CONTINUITY",
             "no PDU session ID was received for this PDN connection in EPS",
@@ -765,7 +782,7 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
         }
     }
     let Some(ue_ip) = sess.ipv4_addr.map(|a| a.octets()) else {
-        return crate::problem_response(
+        return sm_context_error(
             500,
             "SYSTEM_FAILURE",
             "the PDN connection holds no IPv4 address",
@@ -778,7 +795,7 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
         .or_else(|| bearers.first())
         .cloned()
     else {
-        return crate::problem_response(
+        return sm_context_error(
             500,
             "SYSTEM_FAILURE",
             "the PDN connection holds no EPS bearer",
@@ -821,7 +838,7 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
         match crate::nsac_admit_migrated_session(supi, psi, nsac_sst, nsac_sd.as_deref()).await {
             Some(admitted) => admitted,
             None => {
-                return crate::problem_response(
+                return sm_context_error(
                     500,
                     "INSUFFICIENT_RESOURCES_SLICE",
                     "the NSACF did not admit the PDU session on its S-NSSAI",
@@ -837,7 +854,7 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
             Err(e) => {
                 log::error!("[{supi}] EPS→5GS step 6: the UPF did not allocate the N3 tunnel: {e}");
                 crate::rollback_nsac(nsac_admitted, supi, psi, nsac_sst, nsac_sd.as_deref()).await;
-                return crate::problem_response(
+                return sm_context_error(
                     504,
                     "UPF_NOT_RESPONDING",
                     "the UPF did not allocate the N3 uplink tunnel",
@@ -870,7 +887,7 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
             let ebis: Vec<u8> = dedicated.iter().map(|b| b.ebi).collect();
             remove_dedicated_uplinks(smf_n4_seid, upf_seid, &ebis).await;
             crate::rollback_nsac(nsac_admitted, supi, psi, nsac_sst, nsac_sd.as_deref()).await;
-            return crate::problem_response(
+            return sm_context_error(
                 504,
                 "UPF_NOT_RESPONDING",
                 "the UPF did not install the dedicated bearers' QoS flows",
@@ -891,11 +908,7 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
                 }
                 crate::rollback_nsac(nsac_admitted, supi, psi, nsac_sst, nsac_sd.as_deref()).await;
             }
-            return crate::problem_response(
-                500,
-                "SYSTEM_FAILURE",
-                "N2 SM information encoding failed",
-            );
+            return sm_context_error(500, "SYSTEM_FAILURE", "N2 SM information encoding failed");
         }
     };
 
@@ -1054,14 +1067,16 @@ async fn handle_prepared_inner(sm_context_ref: &str, transfer: &[u8]) -> SbiResp
         Ok(ack) => ack,
         Err(e) => {
             log::warn!("SM Context Update (PREPARED) for ref={sm_context_ref}: undecodable HandoverRequestAcknowledgeTransfer: {e}");
-            return crate::problem_400(
+            return sm_context_error(
+                400,
                 "N2_SM_ERROR",
                 "n2SmInfo is not a HandoverRequestAcknowledgeTransfer",
             );
         }
     };
     let Some(gnb_addr) = ack.dl.ipv4() else {
-        return crate::problem_400(
+        return sm_context_error(
+            400,
             "N2_SM_ERROR",
             "the target's DL N3 endpoint is not an IPv4 address this SMF can forward to",
         );
@@ -1074,7 +1089,7 @@ async fn handle_prepared_inner(sm_context_ref: &str, transfer: &[u8]) -> SbiResp
         .ok()
         .and_then(|ctx| ctx.sess_find_by_sm_context_ref(sm_context_ref))
     else {
-        return crate::problem_response(
+        return sm_context_error(
             404,
             "CONTEXT_NOT_FOUND",
             "No SM context for this smContextRef",
@@ -1226,11 +1241,7 @@ async fn handle_prepared_inner(sm_context_ref: &str, transfer: &[u8]) -> SbiResp
                     "SM Context Update (PREPARED) for ref={sm_context_ref}: \
                      HandoverCommandTransfer encode failed: {e:?}"
                 );
-                return crate::problem_response(
-                    500,
-                    "SYSTEM_FAILURE",
-                    "N2 SM information encode failed",
-                );
+                return sm_context_error(500, "SYSTEM_FAILURE", "N2 SM information encode failed");
             }
         };
         log::info!(
@@ -1250,7 +1261,7 @@ async fn handle_prepared_inner(sm_context_ref: &str, transfer: &[u8]) -> SbiResp
                 "SM Context Update (PREPARED) for ref={sm_context_ref}: the SM context went \
                  away during the preparation; nothing kept"
             );
-            return crate::problem_response(
+            return sm_context_error(
                 404,
                 "CONTEXT_NOT_FOUND",
                 "the SM context was released during the handover preparation",
@@ -1285,7 +1296,7 @@ async fn handle_prepared_inner(sm_context_ref: &str, transfer: &[u8]) -> SbiResp
                 .await;
             }
         }
-        return crate::problem_response(
+        return sm_context_error(
             404,
             "CONTEXT_NOT_FOUND",
             "the SM context was released during the handover preparation",
@@ -1341,7 +1352,7 @@ async fn handle_completed_inner(
     // #894 review m2: the caller checked the context before the lock wait; a
     // CANCELLED that held the lock may have released it meanwhile.
     if !is_live_sm_context(sm_context_ref) {
-        return crate::problem_response(
+        return sm_context_error(
             404,
             "CONTEXT_NOT_FOUND",
             "the SM context was released before the handover completed",
@@ -1384,7 +1395,7 @@ async fn handle_completed_inner(
         );
         // #964 review: an error, not `200 COMPLETED`, so the AMF sees that the downlink was
         // not switched (it retries once and logs), rather than a success that did nothing.
-        return crate::problem_response(
+        return sm_context_error(
             500,
             "SYSTEM_FAILURE",
             "The handover cannot complete: no target DL endpoint or no N4 session",
@@ -3396,11 +3407,11 @@ mod tests {
             "ueEpsPdnConnection": base64::engine::general_purpose::STANDARD.encode(pdn_connection(pgw_c)),
         });
         let created = handle_create(&body).await;
-        let cause = serde_json::from_str::<serde_json::Value>(
+        let error = serde_json::from_str::<serde_json::Value>(
             created.http.content.as_deref().unwrap_or("{}"),
         )
-        .unwrap_or_default()
-        .to_string();
+        .unwrap_or_default();
+        let content_type = created.http.get_header("content-type").cloned();
         let mods = upf.modification_bodies();
         let ops = nsac_ops(&seen);
         let stays_on_eps = {
@@ -3414,7 +3425,12 @@ mod tests {
         s5.close();
 
         assert_eq!(created.status, 500);
-        assert!(cause.contains("INSUFFICIENT_RESOURCES_SLICE"), "{cause}");
+        // #1072 round 3 m11: an SmContextCreateError, the cause in "error".
+        assert_eq!(
+            error["error"]["cause"], "INSUFFICIENT_RESOURCES_SLICE",
+            "{error}"
+        );
+        assert_eq!(content_type.as_deref(), Some("application/json"));
         assert!(
             mods.is_empty(),
             "nothing installed: {} modification(s)",
