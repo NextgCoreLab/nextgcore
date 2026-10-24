@@ -1173,7 +1173,7 @@ async fn an_establishment_with_no_smf_back_in_the_window_gets_payload_not_forwar
 /// sits in the backlog and the request waits for the client's timeout. Locally
 /// deterministic stand-in for a blackholed address (a stale pod IP, a lost node).
 /// Keep the listener alive.
-fn hanging_smf() -> (std::net::TcpListener, u16) {
+pub(super) fn hanging_smf() -> (std::net::TcpListener, u16) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
     (listener, port)
@@ -2454,7 +2454,7 @@ async fn the_sweep_drops_orphaned_session_state_and_keeps_live_state() {
 
 /// A raw 5GSM PDU SESSION ESTABLISHMENT REQUEST for `psi` (the legacy 0x2E
 /// path): PTI 1, integrity protection maximum data rate full.
-fn establishment_request(psi: u8) -> Vec<u8> {
+pub(super) fn establishment_request(psi: u8) -> Vec<u8> {
     vec![0x2E, psi, 0x01, 0xC1, 0xFF, 0xFF]
 }
 
