@@ -29,6 +29,8 @@ pub mod error;
 pub mod header;
 pub mod ie;
 pub mod message;
+pub mod peer_policy;
+pub mod recovery_time;
 pub mod types;
 
 #[cfg(test)]

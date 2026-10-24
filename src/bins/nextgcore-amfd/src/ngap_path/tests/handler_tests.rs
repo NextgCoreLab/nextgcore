@@ -1017,6 +1017,91 @@ async fn an_establishment_while_the_smf_restarts_is_retried_and_succeeds() {
     server.forget_ue(ue);
 }
 
+/// #980 review: an establishment's `3gpp-Sbi-Origination-Timestamp` is taken
+/// once, when its first CreateSMContext goes out. It is kept with the waiting
+/// request (a UE retransmission does not change it) and sent unchanged on the
+/// retry, so the PCF sees the retried create as the same request
+/// (TS 29.512 §4.2.7) and does not replace the association.
+///
+/// Revert-verified: stamping each attempt afresh fails this test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn a_retried_establishment_carries_its_first_origination_timestamp() {
+    use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    drop(listener); // the SMF is down
+    let _env = super::SmfEnvGuard::acquire(port).await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_980_001u64, 98);
+    ue_ready_for_sessions(&mut server, ue, ran);
+
+    let request = [0x2E, 0x05, 0x01, 0xC1, 0xFF, 0xFF];
+    server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &request))
+        .await
+        .expect("handled");
+    let first = server
+        .pending_establishments
+        .get(&(ue, 5))
+        .expect("waiting")
+        .origination_timestamp
+        .clone();
+    assert!(
+        nextgcore_sbi::datetime::origination_timestamp_to_epoch_ms(&first).is_some(),
+        "{first}"
+    );
+    // The UE retransmits (T3580) a little later: the same establishment.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &request))
+        .await
+        .expect("handled");
+    assert_eq!(
+        server.pending_establishments[&(ue, 5)].origination_timestamp,
+        first
+    );
+
+    // The SMF comes back and records the header of what it receives.
+    let stamps: Arc<std::sync::Mutex<Vec<Option<String>>>> = Arc::default();
+    let sink = Arc::clone(&stamps);
+    let rebound = std::net::TcpListener::bind(("127.0.0.1", port)).expect("rebind");
+    let addr = rebound.local_addr().expect("addr");
+    let smf = nextgcore_sbi::server::SbiServer::on_listener(
+        nextgcore_sbi::server::SbiServerConfig::new(addr),
+        rebound,
+    );
+    smf.start(move |req: SReq| {
+        let sink = Arc::clone(&sink);
+        async move {
+            sink.lock().expect("sink").push(
+                req.http
+                    .get_header(crate::sbi_path::ORIGINATION_TIMESTAMP_HEADER)
+                    .cloned(),
+            );
+            let body = serde_json::json!({
+                "smContextRef": "est-980",
+                "n1SmMsg": base64::engine::general_purpose::STANDARD
+                    .encode([0x2E, 0x05, 0x01, 0xC2]),
+                "n2SmInfo": base64::engine::general_purpose::STANDARD
+                    .encode(transfer_for("est-980")),
+            });
+            SResp::with_status(201).with_body(body.to_string(), "application/json")
+        }
+    })
+    .await
+    .expect("stand-in SMF starts");
+    make_establishments_due(&mut server);
+    settle_establishments(&mut server).await;
+
+    assert_eq!(
+        *stamps.lock().expect("stamps"),
+        vec![Some(first)],
+        "the retry carries the establishment's first stamp"
+    );
+    server.forget_ue(ue);
+}
+
 /// When no SMF comes back within the window, the UE is answered as TS 24.501
 /// prescribes for a routing failure (§5.4.5.2.5 a) 1), §5.4.5.3.1 e)): a DL NAS
 /// TRANSPORT carrying its own 5GSM message back, with 5GMM #90. The AMF does
@@ -1113,6 +1198,7 @@ async fn an_unanswering_smf_does_not_hold_the_ngap_task() {
             &request,
             None,
             std::time::Instant::now(),
+            "Fri, 23 Oct 2026 10:00:00.000 GMT",
             &crate::sbi_path::SbiError::Timeout,
         )
         .await
@@ -1163,6 +1249,7 @@ async fn the_window_ends_on_time_while_an_attempt_hangs() {
             &request,
             None,
             std::time::Instant::now(),
+            "Fri, 23 Oct 2026 10:00:00.000 GMT",
             &crate::sbi_path::SbiError::Timeout,
         )
         .await
@@ -1219,6 +1306,7 @@ async fn a_ue_that_went_idle_is_dropped_from_the_window() {
             &request,
             None,
             std::time::Instant::now(),
+            "Fri, 23 Oct 2026 10:00:00.000 GMT",
             &crate::sbi_path::SbiError::Timeout,
         )
         .await
@@ -1250,6 +1338,7 @@ async fn the_window_runs_from_the_request_arrival() {
             &[0x2E, 0x05, 0x01, 0xC1, 0xFF, 0xFF],
             None,
             arrived,
+            "Fri, 23 Oct 2026 10:00:00.000 GMT",
             &crate::sbi_path::SbiError::Timeout,
         )
         .await
@@ -1334,6 +1423,7 @@ async fn forgetting_a_ue_frees_its_attempt_permit() {
             &[0x2E, 0x05, 0x01, 0xC1, 0xFF, 0xFF],
             None,
             std::time::Instant::now(),
+            "Fri, 23 Oct 2026 10:00:00.000 GMT",
             &crate::sbi_path::SbiError::Timeout,
         )
         .await
@@ -1357,6 +1447,7 @@ async fn defer_request(server: &mut NgapServer, ue: u64, ran: u32, request: &[u8
             request,
             None,
             std::time::Instant::now(),
+            "Fri, 23 Oct 2026 10:00:00.000 GMT",
             &crate::sbi_path::SbiError::Timeout,
         )
         .await

@@ -102,6 +102,71 @@ fn production(text: &str) -> &str {
     text
 }
 
+/// `text` with every `//` and `/* */` comment replaced by spaces, so byte
+/// offsets are kept and a brace, colon or `#[derive(Debug)]` in a comment is
+/// not parsed as code (#861 review: the token-based field parser would read
+/// `a, b: c` in a doc comment as a field). String literals are skipped, so
+/// `"http://x"` is not taken for a comment; `'"'` is a char, not a string.
+fn blank_comments(text: &str) -> String {
+    let b = text.as_bytes();
+    let mut out = b.to_vec();
+    let (mut i, mut in_str, mut block) = (0usize, false, 0usize);
+    while i < b.len() {
+        let c = b[i];
+        if block > 0 {
+            if c == b'*' && b.get(i + 1) == Some(&b'/') {
+                block -= 1;
+                out[i] = b' ';
+                out[i + 1] = b' ';
+                i += 2;
+                continue;
+            }
+            if c == b'/' && b.get(i + 1) == Some(&b'*') {
+                block += 1;
+            }
+            if c != b'\n' {
+                out[i] = b' ';
+            }
+            i += 1;
+            continue;
+        }
+        if in_str {
+            match c {
+                b'\\' => i += 2,
+                b'"' => {
+                    in_str = false;
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+            continue;
+        }
+        match c {
+            b'\'' if b.get(i + 1) == Some(&b'"') && b.get(i + 2) == Some(&b'\'') => i += 3,
+            b'"' => {
+                in_str = true;
+                i += 1;
+            }
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                while i < b.len() && b[i] != b'\n' {
+                    out[i] = b' ';
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                block = 1;
+                out[i] = b' ';
+                out[i + 1] = b' ';
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    // A multi-byte character inside a comment has every byte blanked, and one
+    // outside is untouched, so the result is still UTF-8.
+    String::from_utf8(out).unwrap_or_else(|_| text.to_string())
+}
+
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -277,39 +342,9 @@ const DEBUG_ALLOWED: &[&str] = &[
     "bins/nextgcore-lmfd/src/codec_glue.rs::TimeReport",
     // TUAK INSTANCE octet: `ck_256` / `ik_256` / `k_256` are key-LENGTH flags.
     "libs/nextgcore-crypt/src/tuak.rs::Instance",
+    // `KAnonymity { k }`: the k of k-anonymity, a group size.
+    "libs/nextgcore-dbi/src/federation.rs::AnonymizationMethod",
 ];
-
-/// `[pub[(...)]] (struct|enum) Name` after a derive and its trailing attributes.
-fn derived_item(rest: &str) -> Option<(&'static str, String, &str)> {
-    let mut item = rest.trim_start();
-    loop {
-        if item.starts_with("#[") {
-            item = item[item.find(']')? + 1..].trim_start();
-        } else if item.starts_with("///") || item.starts_with("//") {
-            item = item[item.find('\n')? + 1..].trim_start();
-        } else {
-            break;
-        }
-    }
-    if let Some(after) = item.strip_prefix("pub") {
-        item = after.trim_start();
-        if item.starts_with('(') {
-            item = item[item.find(')')? + 1..].trim_start();
-        }
-    }
-    let (kind, after) = if let Some(a) = item.strip_prefix("struct ") {
-        ("struct", a)
-    } else if let Some(a) = item.strip_prefix("enum ") {
-        ("enum", a)
-    } else {
-        return None;
-    };
-    let name: String = after
-        .chars()
-        .take_while(|c| c.is_alphanumeric() || *c == '_')
-        .collect();
-    Some((kind, name.clone(), &after[name.len()..]))
-}
 
 /// `CamelCase` -> `camel_case`, so a tuple type or variant named for the
 /// material (`Kasme(..)`, `PathSwitch { nh }` aside) is checked by its name.
@@ -348,138 +383,339 @@ fn balanced(text: &str, open: usize) -> &str {
     &text[open + 1..]
 }
 
-/// Named fields (`[pub[(..)]] name: Type`) in a struct or enum body.
-fn named_fields(body: &str) -> Vec<&str> {
-    body.lines()
-        .filter_map(|l| {
-            let mut l = l.trim_start();
-            if let Some(after) = l.strip_prefix("pub") {
-                l = after.trim_start();
-                if l.starts_with('(') {
-                    l = &l[l.find(')')? + 1..];
+/// Named fields (`[pub[(..)]] name: Type`) in a struct or enum body, with the
+/// text of each field's type. Token-based, not line-based (#861 review), so a
+/// one-line struct variant (`Key { kseaf: [u8; 32] },`) is read too: a field
+/// is an identifier followed by a single `:`, preceded by `{`, `,`, the start
+/// of the body or a visibility.
+fn named_fields_typed(body: &str) -> Vec<(&str, &str)> {
+    let b = body.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b':' || b.get(i + 1) == Some(&b':') || (i > 0 && b[i - 1] == b':') {
+            i += 1;
+            continue;
+        }
+        // The identifier right before the colon.
+        let mut end = i;
+        while end > 0 && b[end - 1] == b' ' {
+            end -= 1;
+        }
+        let mut start = end;
+        while start > 0 && (b[start - 1].is_ascii_alphanumeric() || b[start - 1] == b'_') {
+            start -= 1;
+        }
+        let name = &body[start..end];
+        // What precedes it, skipping whitespace and a visibility.
+        let mut before = body[..start].trim_end();
+        if let Some(v) = before.strip_suffix(')') {
+            if let Some(open) = v.rfind("pub(") {
+                before = v[..open].trim_end();
+            }
+        } else if let Some(v) = before.strip_suffix("pub") {
+            before = v.trim_end();
+        }
+        let field_position = before.is_empty() || before.ends_with(['{', ',']);
+        if !name.is_empty() && !name.as_bytes()[0].is_ascii_digit() && field_position {
+            // The type runs to the next top-level `,` or the end of the body.
+            let mut depth = 0i32;
+            let mut stop = b.len();
+            for (k, &c) in b.iter().enumerate().skip(i + 1) {
+                match c {
+                    b'<' | b'(' | b'[' | b'{' => depth += 1,
+                    b'>' | b')' | b']' | b'}' => {
+                        depth -= 1;
+                        if depth < 0 {
+                            stop = k;
+                            break;
+                        }
+                    }
+                    b',' if depth == 0 => {
+                        stop = k;
+                        break;
+                    }
+                    _ => {}
                 }
-                l = l.trim_start();
             }
-            let (field, rest) = l.split_once(':')?;
-            if rest.starts_with(':') {
-                return None; // a path, not a field
+            out.push((name, body[i + 1..stop].trim()));
+            i = stop;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// A `struct` or `enum` item of a production file.
+struct Item<'a> {
+    rel: String,
+    kind: &'static str,
+    name: String,
+    derives_debug: bool,
+    /// A tuple struct (`struct Kasme([u8; 32]);`).
+    tuple: bool,
+    /// Named fields with their type text (struct fields, or the fields of any
+    /// struct-like variant).
+    fields: Vec<(&'a str, &'a str)>,
+    /// Tuple-variant names of an enum.
+    tuple_variants: Vec<String>,
+}
+
+/// Whether the attributes in `region` derive `Debug`.
+fn region_derives_debug(region: &str) -> bool {
+    let mut from = 0;
+    while let Some(at) = region[from..].find("#[derive(") {
+        let open = from + at + 8;
+        let list = balanced(region, open);
+        if list.split(',').any(|d| d.trim() == "Debug") {
+            return true;
+        }
+        from = open + 1;
+    }
+    false
+}
+
+/// Every `struct` / `enum` item in `text` (comments already blanked), with
+/// any visibility.
+fn items<'a>(rel: &str, text: &'a str) -> Vec<Item<'a>> {
+    let mut out = Vec::new();
+    for (kw, kind) in [("struct ", "struct"), ("enum ", "enum")] {
+        let mut from = 0;
+        while let Some(at) = text[from..].find(kw) {
+            let p = from + at;
+            from = p + kw.len();
+            let line_start = text[..p].rfind('\n').map_or(0, |i| i + 1);
+            let prefix = text[line_start..p].trim();
+            let visibility = prefix.is_empty()
+                || prefix == "pub"
+                || (prefix.starts_with("pub(") && prefix.ends_with(')'));
+            if !visibility {
+                continue;
             }
-            let field = field.trim();
-            (!field.is_empty() && field.chars().all(|c| c.is_alphanumeric() || c == '_'))
-                .then_some(field)
-        })
+            let after = &text[from..];
+            let name: String = after
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if name.is_empty() {
+                continue;
+            }
+            // The attributes above: back to the previous item or block edge.
+            let region_start = text[..line_start]
+                .rfind(['}', ';', '{'])
+                .map_or(0, |i| i + 1);
+            let derives_debug = region_derives_debug(&text[region_start..line_start]);
+            let Some(open_rel) = after.find(['{', '(', ';']) else {
+                continue;
+            };
+            let open = from + open_rel;
+            let mut item = Item {
+                rel: rel.to_string(),
+                kind,
+                name,
+                derives_debug,
+                tuple: false,
+                fields: Vec::new(),
+                tuple_variants: Vec::new(),
+            };
+            match text.as_bytes()[open] {
+                b';' => {}
+                b'(' => item.tuple = true,
+                _ => {
+                    let body = balanced(text, open);
+                    item.fields = named_fields_typed(body);
+                    if kind == "enum" {
+                        // Variants start the body or follow a top-level `,`.
+                        let mut depth = 0i32;
+                        let mut starts = vec![0usize];
+                        for (k, c) in body.char_indices() {
+                            match c {
+                                '{' | '(' | '[' | '<' => depth += 1,
+                                '}' | ')' | ']' | '>' => depth -= 1,
+                                ',' if depth == 0 => starts.push(k + 1),
+                                _ => {}
+                            }
+                        }
+                        for st in starts {
+                            let v = body[st..].trim_start();
+                            let v = v
+                                .strip_prefix("#[")
+                                .map_or(v, |r| r[r.find(']').map_or(0, |i| i + 1)..].trim_start());
+                            let name: String = v
+                                .chars()
+                                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                                .collect();
+                            if !name.is_empty() && v[name.len()..].trim_start().starts_with('(') {
+                                item.tuple_variants.push(name);
+                            }
+                        }
+                    }
+                }
+            }
+            out.push(item);
+        }
+    }
+    out
+}
+
+/// The type names a field's type text mentions (`Option<KeyBytes>` ->
+/// `Option`, `KeyBytes`).
+fn type_names(ty: &str) -> Vec<&str> {
+    ty.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|w| w.chars().next().is_some_and(|c| c.is_ascii_uppercase()))
         .collect()
 }
 
 /// Production structs and enums that derive `Debug` and hold authentication
-/// material: a named field, or a tuple struct / tuple variant named for it.
-/// Each must use a redacting manual `Debug` instead (#861 review), so a future
-/// `{:?}` cannot print it. Any visibility (`pub(super)` included), tuple
-/// structs and enum variants are covered.
+/// material. Each must use a redacting manual `Debug` instead (#861 review),
+/// so a future `{:?}` cannot print it. Three shapes:
+///
+/// 1. a named field naming the material, in a struct or in any enum variant,
+///    one-line variants included (`Key { kseaf: [u8; 32] }`);
+/// 2. a tuple struct or tuple variant named for it (`Kasme([u8; 32])`);
+/// 3. a type whose own name says nothing (`struct KeyBytes([u8; 32])`) but
+///    that is the TYPE of a field naming the material anywhere
+///    (`kasme: KeyBytes`): its derived `Debug` prints the key wherever the
+///    value goes, whatever the variable is called.
+///
+/// Any visibility (`pub(super)` included) is covered.
 #[test]
 fn no_key_holding_type_derives_debug() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut files = Vec::new();
     rust_files(&src.join("bins"), &mut files);
     rust_files(&src.join("libs"), &mut files);
-    let mut problems = Vec::new();
-    let mut seen = 0usize;
-    for file in &files {
-        let full = fs::read_to_string(file).unwrap_or_default();
-        let text = production(&full);
-        let rel = file
-            .strip_prefix(&src)
-            .unwrap_or(file)
-            .display()
-            .to_string();
-        let mut from = 0;
-        while let Some(at) = text[from..].find("#[derive(") {
-            let start = from + at;
-            from = start + 9;
-            let Some(close) = text[from..].find(")]") else {
-                break;
-            };
-            if !text[from..from + close]
-                .split(',')
-                .any(|d| d.trim() == "Debug")
-            {
-                continue;
-            }
-            let rest = &text[from + close + 2..];
-            let Some((kind, name, after)) = derived_item(rest) else {
-                continue;
-            };
-            seen += 1;
-            if DEBUG_ALLOWED.contains(&format!("{rel}::{name}").as_str()) {
-                continue;
-            }
-            let after_off = text.len() - after.len();
-            let Some(open) = after.find(['{', '(', ';']) else {
-                continue;
-            };
-            let mut bad: Vec<String> = Vec::new();
-            match after.as_bytes()[open] {
-                b';' => {}
-                b'(' => {
-                    // Tuple struct: judged by its name.
-                    if is_sensitive(&snake(&name)) {
-                        bad.push(name.clone());
-                    }
-                }
-                _ => {
-                    let body = balanced(text, after_off + open);
-                    bad.extend(
-                        named_fields(body)
-                            .into_iter()
-                            .filter(|f| is_sensitive(f))
-                            .map(str::to_string),
-                    );
-                    if kind == "enum" {
-                        // Tuple variants: `Kasme([u8; 32]),` judged by name.
-                        for line in body.lines() {
-                            let l = line.trim_start();
-                            let v: String = l
-                                .chars()
-                                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                                .collect();
-                            if !v.is_empty()
-                                && l[v.len()..].trim_start().starts_with('(')
-                                && is_sensitive(&snake(&v))
-                            {
-                                bad.push(v);
-                            }
-                        }
-                    }
-                }
-            }
-            if !bad.is_empty() {
-                problems.push(format!(
-                    "{rel}::{name}: {kind} derives Debug but holds {bad:?}; give it a redacting Debug"
-                ));
-            }
-        }
-    }
+    let texts: Vec<(String, String)> = files
+        .iter()
+        .map(|file| {
+            let full = fs::read_to_string(file).unwrap_or_default();
+            let rel = file
+                .strip_prefix(&src)
+                .unwrap_or(file)
+                .display()
+                .to_string();
+            (rel, blank_comments(production(&full)))
+        })
+        .collect();
+    let all: Vec<Item> = texts
+        .iter()
+        .flat_map(|(rel, text)| items(rel, text))
+        .collect();
+    let problems = derive_problems(&all);
+    let derived = all.iter().filter(|i| i.derives_debug).count();
     assert!(
-        seen > 200,
-        "only {seen} derived types found: the parser is broken"
+        derived > 200,
+        "only {derived} derived types found: the parser is broken"
     );
     assert!(problems.is_empty(), "\n{}", problems.join("\n"));
 }
 
-/// The parser above, on the shapes the #861 review named.
+/// The findings of [`no_key_holding_type_derives_debug`] over `all`.
+fn derive_problems(all: &[Item]) -> Vec<String> {
+    let allowed = |i: &Item| DEBUG_ALLOWED.contains(&format!("{}::{}", i.rel, i.name).as_str());
+    let mut problems = Vec::new();
+    for item in all.iter().filter(|i| i.derives_debug && !allowed(i)) {
+        let mut bad: Vec<String> = item
+            .fields
+            .iter()
+            .filter(|(f, _)| is_sensitive(f))
+            .map(|(f, _)| f.to_string())
+            .collect();
+        if item.tuple && is_sensitive(&snake(&item.name)) {
+            bad.push(item.name.clone());
+        }
+        bad.extend(
+            item.tuple_variants
+                .iter()
+                .filter(|v| is_sensitive(&snake(v)))
+                .cloned(),
+        );
+        if !bad.is_empty() {
+            problems.push(format!(
+                "{}::{}: {} derives Debug but holds {bad:?}; give it a redacting Debug",
+                item.rel, item.name, item.kind
+            ));
+        }
+    }
+    // Shape 3: a Debug-deriving type used as the type of a key-named field.
+    for holder in all {
+        for (field, ty) in holder.fields.iter().filter(|(f, _)| is_sensitive(f)) {
+            for tn in type_names(ty) {
+                for inner in all
+                    .iter()
+                    .filter(|i| i.name == tn && i.derives_debug && !allowed(i))
+                {
+                    problems.push(format!(
+                        "{}::{}: derives Debug but is the type of {}::{}.{field}; give it a \
+                         redacting Debug",
+                        inner.rel, inner.name, holder.rel, holder.name
+                    ));
+                }
+            }
+        }
+    }
+    problems.sort();
+    problems.dedup();
+    problems
+}
+
+/// The parser above, on the shapes the #861 reviews named.
 #[test]
 fn derive_check_self_test() {
-    let (kind, name, _) =
-        derived_item("\n#[serde(x)]\n/// doc\npub(super) enum HandoverModifyKind {").unwrap();
-    assert_eq!((kind, name.as_str()), ("enum", "HandoverModifyKind"));
-    let (kind, name, _) = derived_item("pub struct Kasme(pub [u8; 32]);").unwrap();
-    assert_eq!((kind, name.as_str()), ("struct", "Kasme"));
-    assert!(is_sensitive(&snake("Kasme")));
-    assert!(!is_sensitive(&snake("PathSwitch")));
-    assert_eq!(
-        named_fields("PathSwitch {\n    enb_id: u64,\n    nh: [u8; 32],\n    pub(crate) kasme: X,\n    x: a::b,\n}"),
-        vec!["enb_id", "nh", "kasme", "x"]
+    let src = blank_comments(
+        r#"
+/// A doc comment with a, kasme: field-looking text and a { brace.
+#[derive(Clone)]
+#[derive(
+    Debug,
+)]
+pub(super) enum HandoverModifyKind {
+    PathSwitch { enb_id: u64, nh: [u8; 32] },
+    Key { kseaf: [u8; 32] },
+    #[allow(dead_code)]
+    Kasme([u8; 32]),
+    Other(u8),
+}
+
+#[derive(Debug, Clone)]
+pub struct KeyBytes(pub [u8; 32]);
+
+pub struct Holder {
+    pub(crate) kasme: Option<KeyBytes>,
+    note: &'static str,
+}
+
+#[derive(Debug)]
+struct Fine { imsi: String, url: &'static str }
+const URL: &str = "http://example/{x}";
+"#,
     );
+    let all = items("t.rs", &src);
+    let names: Vec<&str> = all.iter().map(|i| i.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["KeyBytes", "Holder", "Fine", "HandoverModifyKind"]
+    );
+    let kind = all.iter().find(|i| i.name == "HandoverModifyKind").unwrap();
+    assert!(kind.derives_debug, "multi-line derive");
+    assert_eq!(
+        kind.fields.iter().map(|(f, _)| *f).collect::<Vec<_>>(),
+        vec!["enb_id", "nh", "kseaf"],
+        "one-line variants are read; the doc comment is not"
+    );
+    assert_eq!(kind.tuple_variants, vec!["Kasme", "Other"]);
+    let holder = all.iter().find(|i| i.name == "Holder").unwrap();
+    assert!(!holder.derives_debug);
+    assert_eq!(
+        holder.fields,
+        vec![("kasme", "Option<KeyBytes>"), ("note", "&'static str")]
+    );
+    let problems = derive_problems(&all);
+    assert_eq!(problems.len(), 2, "{problems:#?}");
+    assert!(problems[0].starts_with("t.rs::HandoverModifyKind") && problems[0].contains("kseaf"));
+    assert!(problems[0].contains("\"Kasme\"") && problems[0].contains("\"nh\""));
+    assert!(problems[1].starts_with("t.rs::KeyBytes") && problems[1].contains("Holder.kasme"));
 }
 
 /// Whether `.field(label, value)` in a manual `Debug` prints authentication

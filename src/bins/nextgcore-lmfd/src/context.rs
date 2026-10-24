@@ -280,6 +280,10 @@ pub struct PositioningSession {
     accumulated: Vec<CellMeasurement>,
     /// One-shot completion channel to the awaiting DetermineLocation handler.
     sender: Option<tokio::sync::oneshot::Sender<PositioningOutcome>>,
+    /// The DL-PRS IDs this session's assistance data assigned, with the registry
+    /// key of the TRP each names (#911). A measurement on one of them is keyed by
+    /// its TRP, whatever PCI it carries.
+    dl_prs_keys: HashMap<u8, String>,
 }
 
 /// One source of measurements for a positioning session (#715, #807).
@@ -301,6 +305,31 @@ pub enum MeasurementLeg {
     NrppaTrp,
 }
 
+/// The registry key of TRP `trp_id` of `node` (#911): one per TRP, so a TRP
+/// that shares its PCI with another is still told apart.
+pub fn trp_key(node: &crate::site_config::NgRanNode, trp_id: u16) -> String {
+    format!("trp-{}{}-{:x}-{trp_id}", node.mcc, node.mnc, node.gnb_id)
+}
+
+/// `cell` keyed by the TRP its DL-PRS ID names, when that ID is one of `keys`
+/// (#911). The UE names a TRP of the assistance data by the DL-PRS ID it was
+/// given; the PCI it may also report can be another TRP's.
+fn keyed_by_dl_prs(mut cell: CellMeasurement, keys: &HashMap<u8, String>) -> CellMeasurement {
+    if let Some(key) = cell.dl_prs_id.and_then(|id| keys.get(&id)) {
+        cell.nr_cgi = key.clone();
+    }
+    cell
+}
+
+/// [`multi_rtt_observations`], for the #911 tests outside this module.
+#[cfg(test)]
+pub(crate) fn multi_rtt_observations_for_test(
+    measurements: &[CellMeasurement],
+    registry: &TrpRegistry,
+) -> Vec<RttObservation> {
+    multi_rtt_observations(measurements, registry)
+}
+
 /// An LPP Capability Transfer in flight (#906).
 struct CapabilityExchange {
     supi: String,
@@ -309,6 +338,28 @@ struct CapabilityExchange {
     /// any concurrent request for the same UE that joined it.
     waiters: Vec<tokio::sync::oneshot::Sender<()>>,
 }
+
+/// A UE's capability report, as kept (#998).
+#[derive(Debug, Clone, Copy)]
+struct UeCapabilities {
+    class: crate::codec_glue::UeLppCapability,
+    ecid: crate::codec_glue::EcidFlavours,
+    nr: crate::codec_glue::NrMethods,
+    at: std::time::Instant,
+}
+
+/// A Capability Transfer the UE did not answer (#998).
+struct UnansweredExchange {
+    supi: String,
+    lpp_transaction: u8,
+    at: std::time::Instant,
+}
+
+/// How long a capability report is used (#998): a day. After that it is asked
+/// for again, so a SIM moved to another device, or a UE whose capabilities
+/// changed, is not positioned on what the old one said, and the store does not
+/// grow without bound.
+pub const CAPABILITY_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
 /// How long a UE that left a `RequestCapabilities` unanswered is not asked again
 /// (#906). Five minutes: long enough that a UE without LPP capability support
@@ -385,20 +436,20 @@ pub struct LmfContext {
     /// Empty means unconfigured; real solvers fall back to the heuristic placeholder.
     cell_registry: RwLock<HashMap<String, TrpCoord>>,
 
-    /// Per-UE LPP positioning capability, as reported over LPP (#103). Absent means
-    /// no exchange happened, which `UeLppCapability::Unknown` is distinct from
-    /// `EcidOnly` precisely to express.
-    ue_capabilities: RwLock<HashMap<String, crate::codec_glue::UeLppCapability>>,
-    /// The E-CID flavours each UE reported (#834 review), keyed by SUPI.
-    ue_ecid_flavours: RwLock<HashMap<String, crate::codec_glue::EcidFlavours>>,
-    /// The NR multilateration methods each UE reported (#906), keyed by SUPI.
-    ue_nr_methods: RwLock<HashMap<String, crate::codec_glue::NrMethods>>,
+    /// What each UE reported in its last LPP `ProvideCapabilities` (#103, #834
+    /// review, #906), keyed by SUPI. Absent means no report, which
+    /// `UeLppCapability::Unknown` is distinct from `EcidOnly` precisely to
+    /// express. An entry older than [`CAPABILITY_MAX_AGE`] counts as absent
+    /// (#998).
+    ue_capabilities: RwLock<HashMap<String, UeCapabilities>>,
     /// LPP Capability Transfers in flight (#906, TS 37.355 §5.1.1), keyed by the
     /// lcsCorrelationId their `RequestCapabilities` was sent with.
     capability_exchanges: RwLock<HashMap<String, CapabilityExchange>>,
-    /// When each UE last left a `RequestCapabilities` unanswered (#906), so a UE
-    /// that does not answer is not asked again on every request.
-    capability_unanswered: RwLock<HashMap<String, std::time::Instant>>,
+    /// Capability Transfers a UE left unanswered, keyed by their
+    /// lcsCorrelationId, for [`CAPABILITY_RETRY`] (#906, #998). A UE in here is
+    /// not asked again, and a late answer is still found by the request's
+    /// correlation or transaction.
+    capability_unanswered: RwLock<HashMap<String, UnansweredExchange>>,
     /// Sidelink ranges reported by each UE (TS 23.586 §5.3.3, nextgsim #138), keyed
     /// by SUPI. The LATEST report per UE replaces the previous one: a range is a
     /// snapshot, and accumulating them would make an LMF answer with a distance the
@@ -469,10 +520,21 @@ pub struct LmfContext {
     /// not asked again for [`TRP_INFORMATION_RETRY`], so a silent node does not
     /// cost every request a timeout.
     trp_info_failed: RwLock<HashMap<crate::site_config::NgRanNode, std::time::Instant>>,
+    /// When each node's TRP Information was last recorded (#990 review).
+    trp_info_at: RwLock<HashMap<crate::site_config::NgRanNode, std::time::Instant>>,
+    /// The DL-PRS ID this LMF assigned each TRP (#911), for the life of the
+    /// process, so a TRP keeps its ID across sessions.
+    dl_prs_ids: RwLock<HashMap<(crate::site_config::NgRanNode, u16), u8>>,
 }
 
 /// How long a node that failed TRP Information Exchange is left alone.
 pub const TRP_INFORMATION_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long a node's TRP Information is used before it is asked for again
+/// (#990 review): an hour. A TRP's PRS configuration or surveyed position can
+/// change with the node's configuration, and the assistance data and the
+/// `trp-…` positions are built from it.
+pub const TRP_INFORMATION_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
 
 impl LmfContext {
     pub fn new() -> Self {
@@ -491,8 +553,6 @@ impl LmfContext {
             initialized: AtomicBool::new(false),
             cell_registry: RwLock::new(HashMap::new()),
             ue_capabilities: RwLock::new(HashMap::new()),
-            ue_ecid_flavours: RwLock::new(HashMap::new()),
-            ue_nr_methods: RwLock::new(HashMap::new()),
             capability_exchanges: RwLock::new(HashMap::new()),
             capability_unanswered: RwLock::new(HashMap::new()),
             sidelink_ranges: RwLock::new(HashMap::new()),
@@ -511,6 +571,8 @@ impl LmfContext {
             ng_ran_nodes: RwLock::new(Vec::new()),
             trp_info: RwLock::new(Vec::new()),
             trp_info_failed: RwLock::new(HashMap::new()),
+            trp_info_at: RwLock::new(HashMap::new()),
+            dl_prs_ids: RwLock::new(HashMap::new()),
         }
     }
 
@@ -959,6 +1021,7 @@ impl LmfContext {
             reported_legs: Vec::new(),
             accumulated: Vec::new(),
             sender: Some(tx),
+            dl_prs_keys: HashMap::new(),
         };
         if let Ok(mut s) = self.positioning_sessions.write() {
             s.insert(corr.clone(), session);
@@ -1053,6 +1116,18 @@ impl LmfContext {
         if let Ok(mut sessions) = self.positioning_sessions.write() {
             if let Some(session) = sessions.get_mut(corr) {
                 session.nrppa_peer = Some(peer);
+            }
+        }
+    }
+
+    /// Record the DL-PRS IDs session `corr`'s assistance data assigned (#911).
+    /// Call it once the assistance data has been delivered, and before the
+    /// location request is sent: a UE that never got the data names TRPs by its
+    /// posSIBs' IDs, and the report cannot arrive before the request.
+    pub fn positioning_session_set_dl_prs_keys(&self, corr: &str, keys: HashMap<u8, String>) {
+        if let Ok(mut sessions) = self.positioning_sessions.write() {
+            if let Some(session) = sessions.get_mut(corr) {
+                session.dl_prs_keys = keys;
             }
         }
     }
@@ -1158,7 +1233,13 @@ impl LmfContext {
                     cells.len() - room
                 );
             }
-            s.accumulated.extend(cells.into_iter().take(room));
+            let keys = &s.dl_prs_keys;
+            s.accumulated.extend(
+                cells
+                    .into_iter()
+                    .take(room)
+                    .map(|c| keyed_by_dl_prs(c, keys)),
+            );
             if !s.reported_legs.contains(&leg) {
                 s.reported_legs.push(leg);
             }
@@ -1422,6 +1503,57 @@ impl LmfContext {
             info.retain(|(n, _)| n != node);
             info.extend(trps.into_iter().map(|t| (node.clone(), t)));
         }
+        if let Ok(mut at) = self.trp_info_at.write() {
+            at.insert(node.clone(), std::time::Instant::now());
+        }
+    }
+
+    /// Whether `node`'s TRP Information is older than [`TRP_INFORMATION_MAX_AGE`]
+    /// (#990 review). A node never heard from is not stale: it is unknown.
+    pub fn trp_information_stale(&self, node: &crate::site_config::NgRanNode) -> bool {
+        self.trp_info_at
+            .read()
+            .ok()
+            .and_then(|a| a.get(node).copied())
+            .is_some_and(|t| t.elapsed() >= TRP_INFORMATION_MAX_AGE)
+    }
+
+    /// Test-only: age `node`'s TRP Information past [`TRP_INFORMATION_MAX_AGE`].
+    #[cfg(test)]
+    pub fn trp_information_age_for_test(&self, node: &crate::site_config::NgRanNode) {
+        if let Ok(mut at) = self.trp_info_at.write() {
+            at.insert(
+                node.clone(),
+                std::time::Instant::now() - TRP_INFORMATION_MAX_AGE,
+            );
+        }
+    }
+
+    /// The DL-PRS ID of TRP `trp_id` of `node` (#911): the one it was given
+    /// before, else the lowest free one. `None` once all 256 are taken
+    /// (`dl-PRS-ID-r16 INTEGER (0..255)`).
+    pub fn dl_prs_id_assign(
+        &self,
+        node: &crate::site_config::NgRanNode,
+        trp_id: u16,
+    ) -> Option<u8> {
+        let mut ids = self.dl_prs_ids.write().ok()?;
+        if let Some(id) = ids.get(&(node.clone(), trp_id)) {
+            return Some(*id);
+        }
+        let taken: std::collections::HashSet<u8> = ids.values().copied().collect();
+        let free = (0..=255u8).find(|id| !taken.contains(id))?;
+        ids.insert((node.clone(), trp_id), free);
+        Some(free)
+    }
+
+    /// The DL-PRS ID TRP `trp_id` of `node` was given, if any (#911).
+    pub fn dl_prs_id_of(&self, node: &crate::site_config::NgRanNode, trp_id: u16) -> Option<u8> {
+        self.dl_prs_ids
+            .read()
+            .ok()?
+            .get(&(node.clone(), trp_id))
+            .copied()
     }
 
     /// Record that `node` did not answer TRP Information Exchange.
@@ -1499,6 +1631,17 @@ impl LmfContext {
         }
     }
 
+    /// `supi`'s last capability report, unless it is older than
+    /// [`CAPABILITY_MAX_AGE`] (#998).
+    fn ue_capabilities_fresh(&self, supi: &str) -> Option<UeCapabilities> {
+        self.ue_capabilities
+            .read()
+            .ok()?
+            .get(supi)
+            .copied()
+            .filter(|c| c.at.elapsed() < CAPABILITY_MAX_AGE)
+    }
+
     /// What this LMF knows about `supi`'s LPP positioning capability (#103).
     ///
     /// `Unknown` unless a `ProvideCapabilities` has been decoded for that UE. Kept on
@@ -1506,56 +1649,44 @@ impl LmfContext {
     /// exchange and the positioning request are separate LPP transactions, possibly
     /// minutes apart.
     pub fn ue_lpp_capability(&self, supi: &str) -> crate::codec_glue::UeLppCapability {
-        self.ue_capabilities
-            .read()
-            .ok()
-            .and_then(|c| c.get(supi).copied())
+        self.ue_capabilities_fresh(supi)
+            .map(|c| c.class)
             .unwrap_or_default()
-    }
-
-    /// Record what a UE reported (#103). Called from the N1 uplink path when a
-    /// `ProvideCapabilities` arrives.
-    pub fn note_ue_lpp_capability(&self, supi: &str, cap: crate::codec_glue::UeLppCapability) {
-        if let Ok(mut c) = self.ue_capabilities.write() {
-            c.insert(supi.to_string(), cap);
-        }
     }
 
     /// The E-CID flavours `supi` reported, or none known.
     pub fn ue_ecid_flavours(&self, supi: &str) -> crate::codec_glue::EcidFlavours {
-        self.ue_ecid_flavours
-            .read()
-            .ok()
-            .and_then(|c| c.get(supi).copied())
+        self.ue_capabilities_fresh(supi)
+            .map(|c| c.ecid)
             .unwrap_or_default()
-    }
-
-    /// Record the E-CID flavours a UE reported.
-    pub fn note_ue_ecid_flavours(&self, supi: &str, flavours: crate::codec_glue::EcidFlavours) {
-        if let Ok(mut c) = self.ue_ecid_flavours.write() {
-            c.insert(supi.to_string(), flavours);
-        }
     }
 
     /// The NR multilateration methods `supi` reported (#906), or none known.
     pub fn ue_nr_methods(&self, supi: &str) -> crate::codec_glue::NrMethods {
-        self.ue_nr_methods
-            .read()
-            .ok()
-            .and_then(|c| c.get(supi).copied())
+        self.ue_capabilities_fresh(supi)
+            .map(|c| c.nr)
             .unwrap_or_default()
     }
 
     /// Record everything a UE's `ProvideCapabilities` said (#906), and release
-    /// whoever waits on a Capability Transfer for it.
+    /// whoever waits on a Capability Transfer for it. Reports older than
+    /// [`CAPABILITY_MAX_AGE`] are dropped here, so the store holds only UEs
+    /// that reported within it (#998).
     pub fn note_ue_capabilities(&self, supi: &str, caps: &crate::codec_glue::ReportedCapabilities) {
-        self.note_ue_lpp_capability(supi, caps.class);
-        self.note_ue_ecid_flavours(supi, caps.ecid);
-        if let Ok(mut c) = self.ue_nr_methods.write() {
-            c.insert(supi.to_string(), caps.nr);
+        if let Ok(mut c) = self.ue_capabilities.write() {
+            c.retain(|_, e| e.at.elapsed() < CAPABILITY_MAX_AGE);
+            c.insert(
+                supi.to_string(),
+                UeCapabilities {
+                    class: caps.class,
+                    ecid: caps.ecid,
+                    nr: caps.nr,
+                    at: std::time::Instant::now(),
+                },
+            );
         }
         if let Ok(mut u) = self.capability_unanswered.write() {
-            u.remove(supi);
+            u.retain(|_, e| e.supi != supi);
         }
         let done: Vec<CapabilityExchange> = match self.capability_exchanges.write() {
             Ok(mut x) => {
@@ -1575,12 +1706,11 @@ impl LmfContext {
         }
     }
 
-    /// Whether `supi` has reported its capabilities: then they are not asked for
-    /// again (#906). A report naming nothing this LMF can request still counts.
+    /// Whether `supi` has reported its capabilities within [`CAPABILITY_MAX_AGE`]:
+    /// then they are not asked for again (#906). A report naming nothing this LMF
+    /// can request still counts.
     pub fn ue_capabilities_reported(&self, supi: &str) -> bool {
-        self.ue_capabilities
-            .read()
-            .is_ok_and(|c| c.contains_key(supi))
+        self.ue_capabilities_fresh(supi).is_some()
     }
 
     /// Start, or join, the Capability Transfer for `supi` (#906). Returns the
@@ -1598,8 +1728,8 @@ impl LmfContext {
             return None;
         }
         if let Ok(mut u) = self.capability_unanswered.write() {
-            u.retain(|_, at| at.elapsed() < CAPABILITY_RETRY);
-            if u.contains_key(supi) {
+            u.retain(|_, e| e.at.elapsed() < CAPABILITY_RETRY);
+            if u.values().any(|e| e.supi == supi) {
                 return None;
             }
         }
@@ -1623,29 +1753,63 @@ impl LmfContext {
 
     /// The UE a `ProvideCapabilities` answers for (#906): the Capability Transfer
     /// named by `lcs_correlation_id`, else the one on `lpp_transaction` (TS 37.355
-    /// §5.1.1: the answer is on the request's transaction).
+    /// §5.1.1: the answer is on the request's transaction). An abandoned one
+    /// still counts while it is backed off (#998), so a late answer is found
+    /// whichever correlation the AMF tags it with.
     pub fn capability_exchange_supi(
         &self,
         lcs_correlation_id: Option<&str>,
         lpp_transaction: Option<u8>,
     ) -> Option<String> {
         let x = self.capability_exchanges.read().ok()?;
-        if let Some(e) = lcs_correlation_id.and_then(|c| x.get(c)) {
-            return Some(e.supi.clone());
+        let u = self.capability_unanswered.read().ok()?;
+        let live = x.iter().map(|(c, e)| (c, &e.supi, e.lpp_transaction));
+        let late = u
+            .iter()
+            .filter(|(_, e)| e.at.elapsed() < CAPABILITY_RETRY)
+            .map(|(c, e)| (c, &e.supi, e.lpp_transaction));
+        let all: Vec<(&String, &String, u8)> = live.chain(late).collect();
+        if let Some(corr) = lcs_correlation_id {
+            if let Some((_, supi, _)) = all.iter().find(|(c, ..)| c.as_str() == corr) {
+                return Some((*supi).clone());
+            }
         }
         let txn = lpp_transaction?;
-        let mut on_txn = x.values().filter(|e| e.lpp_transaction == txn);
+        let mut on_txn = all.iter().filter(|(.., t)| *t == txn);
         match (on_txn.next(), on_txn.next()) {
             // Two exchanges on one 8-bit number: the answer names neither.
-            (Some(e), None) => Some(e.supi.clone()),
+            (Some((_, supi, _)), None) => Some((*supi).clone()),
+            _ => None,
+        }
+    }
+
+    /// The live Capability Transfer an LPP `Abort` or `Error` on `lpp_transaction`
+    /// ends (#998): the one on that transaction, named by `lcs_correlation_id`
+    /// when the notification gives one. The transaction must match, so an
+    /// `Abort` of the location request is not taken for this one.
+    pub fn capability_exchange_on(
+        &self,
+        lcs_correlation_id: Option<&str>,
+        lpp_transaction: u8,
+    ) -> Option<String> {
+        let x = self.capability_exchanges.read().ok()?;
+        let mut on_txn = x
+            .iter()
+            .filter(|(c, e)| {
+                e.lpp_transaction == lpp_transaction
+                    && lcs_correlation_id.is_none_or(|l| l == c.as_str())
+            })
+            .map(|(c, _)| c.clone());
+        match (on_txn.next(), on_txn.next()) {
+            (Some(c), None) => Some(c),
             _ => None,
         }
     }
 
     /// Give up on the Capability Transfer `corr` (#906): the UE did not answer in
-    /// time, or the request was not delivered. The UE is not asked again for
-    /// [`CAPABILITY_RETRY`]; a late answer is still recorded, through the
-    /// positioning session the next request opens.
+    /// time, refused it (#998: LPP `Abort` or `Error`), or the request was not
+    /// delivered. Whoever waits on it is released. The UE is not asked again for
+    /// [`CAPABILITY_RETRY`], and a late answer is still recorded.
     pub fn capability_exchange_abandon(&self, corr: &str) {
         let gone = self
             .capability_exchanges
@@ -1653,7 +1817,15 @@ impl LmfContext {
             .ok()
             .and_then(|mut x| x.remove(corr));
         if let (Some(e), Ok(mut u)) = (gone, self.capability_unanswered.write()) {
-            u.insert(e.supi, std::time::Instant::now());
+            u.insert(
+                corr.to_string(),
+                UnansweredExchange {
+                    supi: e.supi,
+                    lpp_transaction: e.lpp_transaction,
+                    at: std::time::Instant::now(),
+                },
+            );
+            // The waiters' senders drop here: each wait ends at once.
         }
     }
 
@@ -2376,6 +2548,14 @@ pub fn lmf_context_init(max_measurements: usize) {
         // `site_config::load_into_context` fills the registry.
         #[cfg(test)]
         {
+            // It empties process state other tests read, so a test that calls it
+            // must hold PROCESS_STATE_TEST_LOCK. One that did not (the OAuth2
+            // tests' `start_server`) emptied the registry under a running test
+            // and made it flake in CI. `try_lock` succeeding means nobody holds it.
+            assert!(
+                PROCESS_STATE_TEST_LOCK.try_lock().is_err(),
+                "lmf_context_init in a test that does not hold PROCESS_STATE_TEST_LOCK"
+            );
             context.clear_cell_registry_for_test();
             // #807: the NG-RAN nodes and their TRPs are process state too.
             context.set_ng_ran_nodes(Vec::new());
@@ -4638,11 +4818,83 @@ mod tests_capability_exchange {
         assert!(c.capability_exchange_begin("imsi-3", 2).is_none());
         assert!(c.capability_exchange_begin("imsi-4", 3).is_some());
         // Once the back-off has run out, the UE is asked again.
-        c.capability_unanswered.write().unwrap().insert(
-            "imsi-3".into(),
-            std::time::Instant::now() - CAPABILITY_RETRY,
-        );
+        for e in c.capability_unanswered.write().unwrap().values_mut() {
+            e.at = std::time::Instant::now() - CAPABILITY_RETRY;
+        }
         assert!(c.capability_exchange_begin("imsi-3", 4).is_some());
+    }
+
+    /// #998: an abandoned exchange is still found, by its correlation or its
+    /// transaction, while it is backed off, so a late answer that the AMF tags
+    /// with the request's own correlation is filed.
+    #[test]
+    fn an_abandoned_exchange_still_files_a_late_answer() {
+        let c = LmfContext::new();
+        let (corr, _rx, _) = c.capability_exchange_begin("imsi-7", 21).unwrap();
+        c.capability_exchange_abandon(&corr);
+        assert_eq!(
+            c.capability_exchange_supi(Some(&corr), None).as_deref(),
+            Some("imsi-7")
+        );
+        assert_eq!(
+            c.capability_exchange_supi(None, Some(21)).as_deref(),
+            Some("imsi-7")
+        );
+        c.note_ue_capabilities("imsi-7", &report(UeLppCapability::EcidOnly));
+        assert_eq!(c.ue_lpp_capability("imsi-7"), UeLppCapability::EcidOnly);
+        assert!(
+            c.capability_exchange_supi(Some(&corr), None).is_none(),
+            "answered: no longer held"
+        );
+    }
+
+    /// #998: a report older than CAPABILITY_MAX_AGE is not used, the UE is asked
+    /// again, and the store drops stale reports.
+    #[test]
+    fn a_stale_capability_report_is_asked_for_again() {
+        let c = LmfContext::new();
+        c.note_ue_capabilities("imsi-8", &report(UeLppCapability::AdvancedMethods));
+        assert!(c.capability_exchange_begin("imsi-8", 1).is_none());
+        c.ue_capabilities
+            .write()
+            .unwrap()
+            .get_mut("imsi-8")
+            .unwrap()
+            .at = std::time::Instant::now() - CAPABILITY_MAX_AGE;
+        assert_eq!(c.ue_lpp_capability("imsi-8"), UeLppCapability::Unknown);
+        assert_eq!(c.ue_nr_methods("imsi-8"), NrMethods::default());
+        assert!(c.capability_exchange_begin("imsi-8", 2).is_some());
+        c.note_ue_capabilities("imsi-9", &report(UeLppCapability::Unknown));
+        assert!(
+            !c.ue_capabilities.read().unwrap().contains_key("imsi-8"),
+            "a stale report is dropped from the store"
+        );
+    }
+
+    /// #998: an Abort or Error ends the exchange on its own transaction only.
+    #[test]
+    fn an_abort_is_matched_to_its_exchange_by_transaction() {
+        let c = LmfContext::new();
+        let (corr, mut rx, _) = c.capability_exchange_begin("imsi-10", 30).unwrap();
+        assert!(c.capability_exchange_on(Some(&corr), 31).is_none());
+        assert!(c.capability_exchange_on(Some("other"), 30).is_none());
+        assert_eq!(c.capability_exchange_on(None, 30), Some(corr.clone()));
+        assert_eq!(
+            c.capability_exchange_on(Some(&corr), 30),
+            Some(corr.clone())
+        );
+        c.capability_exchange_abandon(&corr);
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ),
+            "the wait ends at once"
+        );
+        assert!(
+            c.capability_exchange_begin("imsi-10", 32).is_none(),
+            "backed off"
+        );
     }
 
     /// An answer without the correlation is found by its transaction, unless two

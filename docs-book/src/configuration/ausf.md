@@ -63,7 +63,7 @@ These are the fields actually deserialized by the daemon (`#[derive(Deserialize)
 
 Unknown YAML keys are silently ignored by serde. In the shipped `ausf.yaml`, the following blocks are decorative:
 
-- **`logger.file.path` and `logger.level` are inert.** The log level comes from `RUST_LOG` when set, else the CLI flag `-e/--log-level`. Nothing writes to the YAML's log-file path.
+- **`logger.level` is read; `logger.file.path` is inert.** The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691). Nothing writes to the YAML's log-file path.
 - **`global.max.ue` / `global.max.peer` are inert.** The auth-context pool capacity comes from the CLI flag `--max-ue` (default `1024` — the example's matching `1024` is coincidence, not causation). `max.peer` is read by nothing in this binary.
 - **`ausf.sbi.tls.*` (enabled/cert/key/ca/min_version) is inert.** More honestly: even the CLI `--tls`/`--tls-cert`/`--tls-key` flags only populate the legacy `SbiServerConfig` consumed by the `ausf_sbi_open()` logging shim (`sbi_path.rs`, marked inert by the "ausfd-10" note). The live HTTP/2 server's TLS is set only by the SBI security profile (`NEXTGCORE_SBI_PROFILE`, see [Configuration Overview](./overview.md)).
 - **`ausf.security.pqc.*` is inert.** No PQC code path exists in this binary.
@@ -76,7 +76,7 @@ From the clap `Args` struct in `src/bins/nextgcore-ausfd/src/app.rs`:
 |---|---|---|---|
 | `-c, --config` | path | `/etc/nextgcore/ausf.yaml` | Configuration file path (docker passes exactly `-c /etc/nextgcore/ausf.yaml`). |
 | `-l, --log-file` | path | unset | Accepted but **not wired** — `init_logging` never reads it; logs go to stdout/stderr. |
-| `-e, --log-level` | string | `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`); unrecognized values fall back to `info`. |
+| `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-m, --no-color` | flag | off | Disable color output. |
 | `-k, --kill` | flag | off | Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor. |
 | `--sbi-addr` | string | `0.0.0.0` | SBI bind address — **overridden** by `ausf.sbi.server[0].address` when the YAML sets it. |

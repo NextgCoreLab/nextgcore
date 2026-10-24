@@ -486,6 +486,18 @@ pub fn decode_lpp_provide_capabilities(bytes: &[u8]) -> Option<ReportedCapabilit
     }
 }
 
+/// The transaction number of an uplink LPP `Abort` or `Error` (TS 37.355 §5.4),
+/// with which it is, else `None` (#998). Both end the transaction they are on.
+pub fn decode_lpp_abort_or_error(bytes: &[u8]) -> Option<(u8, &'static str)> {
+    let msg = decode_lpp(bytes).ok()?;
+    let txn = msg.transaction_id.as_ref()?.transaction_number.0;
+    match c1(&msg)? {
+        lpp::LPP_MessageBody_c1::Abort(_) => Some((txn, "Abort")),
+        lpp::LPP_MessageBody_c1::Error(_) => Some((txn, "Error")),
+        _ => None,
+    }
+}
+
 /// Encode an LMF-initiated LPP `RequestCapabilities` (#906; TS 37.355 §5.1.1 step
 /// 1, §6.3) asking for the capability types method selection reads: E-UTRA E-CID
 /// (`ecid-RequestCapabilities`) and the Rel-16 NR E-CID, NR Multi-RTT and NR
@@ -736,9 +748,10 @@ fn request_ies(method: LppMethod) -> lpp::RequestLocationInformation_r9_IEs {
                         lpp::NR_Multi_RTT_RequestLocationInformation_r16Nr_RequestedMeasurements_r16(
                             bits(&[true]),
                         ),
-                    // This LMF provides no PRS assistance data, so it must not claim
-                    // availability -- a UE told assistance is available and given
-                    // none reports nothing.
+                    // TS 37.355: "whether the target device may request additional
+                    // DL-PRS assistance data from the server". FALSE: the DL-PRS
+                    // assistance data this LMF has is sent before the request
+                    // (#911), and it answers no NR RequestAssistanceData.
                     nr_assistance_availability_r16:
                         lpp::NR_Multi_RTT_RequestLocationInformation_r16Nr_AssistanceAvailability_r16(
                             false,
@@ -771,6 +784,8 @@ fn request_ies(method: LppMethod) -> lpp::RequestLocationInformation_r9_IEs {
                         lpp::NR_DL_TDOA_RequestLocationInformation_r16Nr_RequestedMeasurements_r16(
                             bits(&[true]),
                         ),
+                    // As for Multi-RTT: no additional DL-PRS assistance data
+                    // can be requested (#911).
                     nr_assistance_availability_r16:
                         lpp::NR_DL_TDOA_RequestLocationInformation_r16Nr_AssistanceAvailability_r16(
                             false,

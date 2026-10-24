@@ -66,7 +66,7 @@ These are the fields actually deserialized by the daemon (`#[derive(Deserialize)
 
 The daemon deserializes only the fields above; unknown YAML keys are silently ignored by serde. In particular, in the shipped example files:
 
-- **`logger.file.path` and `logger.level` are inert.** The log level comes from `RUST_LOG` when set, else the CLI flag `-e/--log-level` (default `info`). Logs go to stderr; no file sink is wired (see `--log-file` below).
+- **`logger.level` is read; `logger.file.path` is inert.** The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691). Logs go to stderr; no file sink is wired (see `--log-file` below).
 - **`global.max.ue` / `global.max.peer` are inert.** No `global` section exists in the deserialize structs; session capacity is the CLI flag `--max-sess`.
 - **`bsf.sbi.tls.*` (`enabled`/`cert`/`key`/`ca`/`min_version`) is inert.** No `tls` field exists in `SbiYaml`. TLS-related knobs are the CLI flags `--tls`/`--tls-cert`/`--tls-key` — and even those only affect the advertised scheme (see Behavior notes). The `TLS_ENABLED`/`SBI_SCHEME` variables mentioned in the YAML comment, and the `TLS_CERT`/`TLS_KEY` environment variables set by `docker-compose.yml`, are not read by this binary.
 
@@ -78,7 +78,7 @@ Runtime knobs with real defaults from the clap `Args` struct in `src/bins/nextgc
 |---|---|---|---|
 | `-c, --config` | path | `/etc/nextgcore/bsf.yaml` | Configuration file path. A missing file is tolerated (logged at debug); a malformed file is silently ignored. |
 | `-l, --log-file` | path | unset | Parsed but **never used** — `init_logging` wires no file sink; logging goes to stderr. |
-| `-e, --log-level` | string | `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`); unrecognized values fall back to `info`. |
+| `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-m, --no-color` | flag | off | Disable color output. |
 | `-k, --kill` | flag | off | Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor. |
 | `--sbi-addr` | string | `0.0.0.0` | SBI server bind address; **overridden** by `bsf.sbi.server[0].address` when the YAML provides one. |
