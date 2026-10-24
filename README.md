@@ -167,8 +167,8 @@ For the 4G EPC with nextgsim's LTE eNB and UE, use `docker-compose-epc.yml`
 
 ```bash
 RUST_BACKTRACE=1        # Enable backtraces for debugging
-RUST_LOG=info           # Log filter, honoured by 13 of the 28 NFs (#691);
-                        # every NF but smfd also takes --log-level
+RUST_LOG=info           # Log filter for every NF; overrides --log-level
+                        # (every NF but smfd takes --log-level)
 ```
 
 Per-NF environment variables are documented in the
