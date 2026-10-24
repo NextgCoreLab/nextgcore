@@ -435,6 +435,25 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
                             overload_reporter.as_ref(),
                         ));
                     }
+                    // #867: an incomplete request is answered 400 (TS 29.500 §5.2.7.2,
+                    // INVALID_MSG_FORMAT) and never reaches the handler. The peer has
+                    // usually reset the stream, so the answer may not arrive.
+                    Err(ConvertRequestError::BodyReadFailed) => {
+                        let body = serde_json::json!({
+                            "title": "Bad Request",
+                            "status": 400,
+                            "detail": "the request body could not be read",
+                            "cause": "INVALID_MSG_FORMAT",
+                        })
+                        .to_string();
+                        let resp = SbiResponse::with_status(400)
+                            .with_body(body, "application/problem+json");
+                        return Ok(convert_response_with_identity(
+                            resp,
+                            server_identity.as_ref(),
+                            overload_reporter.as_ref(),
+                        ));
+                    }
                 };
 
             // OAuth2 enforcement (opt-in). Verify the bearer token against the
@@ -559,6 +578,9 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
 enum ConvertRequestError {
     /// The request body exceeded the configured maximum size (T1.4).
     BodyTooLarge,
+    /// The body could not be read: the peer reset the stream or the connection
+    /// failed mid-body (#867). The request is incomplete and is never dispatched.
+    BodyReadFailed,
 }
 
 /// HTTP/2 server-side resource limits applied to every accepted connection
@@ -699,9 +721,26 @@ async fn convert_request(
     // containers, TS 29.500 §6.1.2.3) are decoded into the JSON root + binary
     // parts before any UTF-8 conversion so binary content survives byte-exact.
     let limited = Limited::new(req.into_body(), max_body_size);
+    let declared_length: Option<usize> = http
+        .get_header("content-length")
+        .and_then(|v| v.trim().parse().ok());
     match limited.collect().await {
+        // #867: hyper ends an HTTP/2 request body quietly when the peer resets the
+        // stream with CANCEL (or NO_ERROR), so a request cut off mid-body arrives as
+        // a complete one with what was sent so far, empty included. A body shorter
+        // (or longer) than the Content-Length the peer declared is that case: the
+        // request is incomplete and is not dispatched.
         Ok(body) => {
             let bytes = body.to_bytes();
+            if declared_length.is_some_and(|n| n != bytes.len()) {
+                log::warn!(
+                    "cid={correlation_id} method={method} path={uri} reason=BODY_READ_ERROR: \
+                     {} of the {} declared body bytes arrived; the request is not dispatched",
+                    bytes.len(),
+                    declared_length.unwrap_or_default()
+                );
+                return Err(ConvertRequestError::BodyReadFailed);
+            }
             if !bytes.is_empty() {
                 let multipart_content_type = http
                     .get_header(crate::constants::header::CONTENT_TYPE)
@@ -739,10 +778,14 @@ async fn convert_request(
                 );
                 return Err(ConvertRequestError::BodyTooLarge);
             }
+            // #867: this used to fall through and dispatch the request with an EMPTY
+            // body, so a handler saw a truncated request as a complete, bodiless one
+            // (a capture server in amfd's tests took it for a notification).
             log::warn!(
                 "cid={correlation_id} method={method} path={uri} \
-                 reason=BODY_READ_ERROR: {e}"
+                 reason=BODY_READ_ERROR: {e}; the request is not dispatched"
             );
+            return Err(ConvertRequestError::BodyReadFailed);
         }
     }
 
@@ -1472,6 +1515,81 @@ pub fn send_service_unavailable(detail: &str) -> SbiResponse {
 /// Send a 504 Gateway Timeout error response
 pub fn send_gateway_timeout(detail: &str) -> SbiResponse {
     send_error(504, "Gateway Timeout", detail, Some("GATEWAY_TIMEOUT"))
+}
+
+#[cfg(test)]
+mod body_read_failure_tests {
+    use crate::message::{SbiRequest, SbiResponse};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    async fn h2_client(addr: std::net::SocketAddr) -> h2::client::SendRequest<bytes::Bytes> {
+        let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let (client, conn) = h2::client::handshake(tcp).await.expect("h2 handshake");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        client.ready().await.expect("ready")
+    }
+
+    /// A POST declaring a `len`-byte body, as every nextgcore client sends one.
+    fn post(addr: std::net::SocketAddr, len: usize) -> hyper::Request<()> {
+        hyper::Request::post(format!("http://{addr}/notify/867"))
+            .header("content-type", "application/json")
+            .header("content-length", len.to_string())
+            .body(())
+            .expect("request")
+    }
+
+    /// #867: a request whose body the peer cuts off (RST_STREAM after a partial
+    /// DATA frame) is not handed to the handler as a complete request with an
+    /// empty body. A complete request on the same server still is.
+    #[tokio::test]
+    async fn a_request_whose_body_is_cut_off_never_reaches_the_handler() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let (_server, addr) =
+            crate::test_support::sbi_server_on_free_port(move |_req: SbiRequest| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    SbiResponse::no_content()
+                }
+            })
+            .await;
+
+        // Cut off after part of the body, and before any of it.
+        for sent in [&b"{\"reportList\":"[..], &b""[..]] {
+            let mut client = h2_client(addr).await;
+            let (answer, mut body) = client.send_request(post(addr, 40), false).expect("send");
+            if !sent.is_empty() {
+                body.send_data(bytes::Bytes::copy_from_slice(sent), false)
+                    .expect("data");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            body.send_reset(h2::Reason::CANCEL);
+            let _ = tokio::time::timeout(Duration::from_secs(2), answer).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a truncated request reached the handler"
+        );
+
+        // Control: the same server dispatches a complete one.
+        let mut client = h2_client(addr).await;
+        let (answer, mut body) = client.send_request(post(addr, 2), false).expect("send");
+        body.send_data(bytes::Bytes::from_static(b"{}"), true)
+            .expect("data");
+        let answer = tokio::time::timeout(Duration::from_secs(2), answer)
+            .await
+            .expect("answered")
+            .expect("response");
+        assert_eq!(answer.status(), 204);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 }
 
 #[cfg(test)]

@@ -11100,10 +11100,20 @@ mod tests {
         );
 
         fire_ues_in_area_report();
-        let (_, body) = tokio::time::timeout(Duration::from_secs(3), rx.recv())
-            .await
-            .expect("UES_IN_AREA_REPORT must produce a notification")
-            .expect("channel closed");
+        // #867: the capture server listens on a port other tests' subscriptions may
+        // have named before, and the store of subscriptions is process-wide; only
+        // this subscription's notification is this test's.
+        let body = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let (uri, body) = rx.recv().await.expect("channel closed");
+                if uri == "/notify/400-count" {
+                    return body;
+                }
+                eprintln!("#867: ignored a request for {uri} on this test's capture port");
+            }
+        })
+        .await
+        .expect("UES_IN_AREA_REPORT must produce a notification");
         let v: Value = serde_json::from_str(&body).expect("JSON");
         let report = &v["reportList"][0];
         assert_eq!(report["type"].as_str(), Some("UES_IN_AREA_REPORT"));
