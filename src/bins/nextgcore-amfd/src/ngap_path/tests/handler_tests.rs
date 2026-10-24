@@ -1186,19 +1186,6 @@ fn hanging_smf() -> (std::net::TcpListener, u16) {
     (listener, port)
 }
 
-/// Wait until `n` off-task exchanges hold a permit -- up to 10 s, not 1: under a loaded
-/// full-suite run a just-spawned attempt can take longer than a second to be scheduled
-/// and take its permit (seen as "in flight: 0, wanted 1" in a workspace run).
-async fn until_in_flight(server: &NgapServer, n: usize) {
-    for _ in 0..2000 {
-        if server.sbi_offload.in_flight() == n {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    panic!("in flight: {}, wanted {n}", server.sbi_offload.in_flight());
-}
-
 /// #796 review M1. With the SMF not answering, a due re-selection
 /// attempt does not hold the NGAP task: the supervision returns at once while the
 /// attempt waits for its connect timeout off the task, and NGAP keeps being
