@@ -867,8 +867,19 @@ fn note_peer_recovery(inner: &Arc<GtpcInner>, peer: SocketAddr, counter: u8) -> 
 /// TS 23.007 §15 (#689): a Serving GW restart lost every PDN connection the MME
 /// had through it. The UEs on it are detached, re-attach required.
 fn on_s11_peer_restart(peer: SocketAddr) {
+    #[cfg(test)]
+    S11_RESTARTS_SEEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(peer);
     on_s11_peer_restart_in(crate::context::mme_self(), peer);
 }
+
+/// The peers `on_s11_peer_restart` was called for. Test-only: lets a socket
+/// test assert the receive path acted, without inspecting the process-wide
+/// context's UEs.
+#[cfg(test)]
+static S11_RESTARTS_SEEN: Mutex<Vec<SocketAddr>> = Mutex::new(Vec::new());
 
 /// The effect of an S11 peer restart on `ctx`: the UEs with PDN connections
 /// through it are detached, re-attach required (TS 23.007 §15). Returns how
@@ -2843,6 +2854,10 @@ mod tests {
             stored(),
             Some(1),
             "re-based by the confirming Echo Response"
+        );
+        assert!(
+            S11_RESTARTS_SEEN.lock().unwrap().contains(&peer_addr),
+            "the receive path ran the restart handler (#991 review)"
         );
         assert!(server.inner.stale_probe.lock().unwrap().is_empty());
         assert!(

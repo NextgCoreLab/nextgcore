@@ -1708,6 +1708,10 @@ fn dispatch_modify_bearer_request(server: &GtpcServer, msg: &Gtp2Message, peer: 
         };
         if let Some(mut dl_tunnel) = ctx.dl_tunnel_in_bearer(bearer.id) {
             dl_tunnel.remote_ip.ipv4 = enb_fteid.ipv4_addr.map(Ipv4Addr::from);
+            // Every Modify Bearer write is a new generation, even one that
+            // writes the endpoint the tunnel already holds (#991 review): its
+            // refusal must not undo a later writer that wrote the same value.
+            dl_tunnel.generation = dl_tunnel.generation.wrapping_add(1);
             ctx.tunnel_update(&dl_tunnel);
         }
         // The generation this request's writes left (TEID by the handler, IP

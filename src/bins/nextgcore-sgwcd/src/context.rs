@@ -1194,7 +1194,10 @@ impl SgwcContext {
             if let Some(old) = list.get(&tunnel.id) {
                 let moved = old.remote_teid != tunnel.remote_teid
                     || old.remote_ip.ipv4 != tunnel.remote_ip.ipv4
-                    || old.remote_ip.ipv6 != tunnel.remote_ip.ipv6;
+                    || old.remote_ip.ipv6 != tunnel.remote_ip.ipv6
+                    // A writer that advanced the generation itself marks a
+                    // write even when the values are unchanged (#991 review).
+                    || tunnel.generation != old.generation;
                 tunnel.generation = if moved {
                     old.generation.wrapping_add(1)
                 } else {

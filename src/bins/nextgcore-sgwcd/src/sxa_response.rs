@@ -815,6 +815,33 @@ mod modify_bearer_tests {
     /// #937 review: a refusal rolls the DL endpoint back only while the tunnel
     /// still holds what this request wrote; an endpoint a later request set
     /// meanwhile stays.
+    /// #991 review: a writer that advances the generation marks a write even
+    /// when it writes the endpoint the tunnel already holds.
+    #[test]
+    fn a_same_value_write_that_advances_the_generation_is_a_new_generation() {
+        let _ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let ctx = sgwc_self();
+        let ue = ctx.ue_add(b"001010991000001").expect("ue");
+        let sess = ctx.sess_add(ue.id, "internet").expect("sess");
+        let bearer = ctx.bearer_add(sess.id).expect("bearer");
+        let mut dl = ctx.dl_tunnel_in_bearer(bearer.id).expect("a DL tunnel");
+        dl.remote_teid = 0x991;
+        ctx.tunnel_update(&dl);
+        let g0 = ctx.dl_tunnel_in_bearer(bearer.id).unwrap().generation;
+        // The same value, no advance: no new generation.
+        ctx.tunnel_update(&ctx.dl_tunnel_in_bearer(bearer.id).unwrap());
+        assert_eq!(ctx.dl_tunnel_in_bearer(bearer.id).unwrap().generation, g0);
+        // The same value, advanced (a Modify Bearer write): a new one.
+        let mut same = ctx.dl_tunnel_in_bearer(bearer.id).unwrap();
+        same.generation = same.generation.wrapping_add(1);
+        ctx.tunnel_update(&same);
+        assert_eq!(
+            ctx.dl_tunnel_in_bearer(bearer.id).unwrap().generation,
+            g0 + 1
+        );
+        ctx.ue_remove(ue.id);
+    }
+
     #[test]
     fn a_refusal_does_not_undo_a_newer_endpoint() {
         let _ambient = crate::pfcp_path::process_state_test_guard_blocking();
