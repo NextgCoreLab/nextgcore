@@ -364,6 +364,16 @@ const CAP_EPS_CATEGORY_0: [u8; 21] = [
 /// defers to bandEUTRA-v9e0 and is not a band (`00010011`, `00000010`).
 const PAGING_EPS_CATEGORY_0: [u8; 6] = [0x08, 0x0A, 0x04, 0x08, 0x98, 0x10];
 
+/// `transcode_eps_to_5gs(CAP_EPS_CATEGORY_0)` (#726 review): the TS 38.331
+/// wrapper `0 000 0` + length 14 (`00001110`), around count 1 (`0001`) and the
+/// E-UTRA container, `0 10` (eutra is index 2 in TS 38.331) + length 12 +
+/// `UE_EUTRA_CAPABILITY_20_64_3`. GERAN-PS has no TS 38.331 rat-Type and is
+/// dropped. The `ue-RadioPagingInfo-r12` is an EPS-only field with nowhere to go
+/// in the 5GS form.
+const FIVEGS_OF_CAP_EPS_CATEGORY_0: [u8; 16] = [
+    0x00, 0x70, 0xA0, 0xC1, 0xD8, 0x00, 0x02, 0x4D, 0xF8, 0x20, 0x40, 0xB8, 0x2E, 0x0B, 0x80, 0x00,
+];
+
 fn hex(b: &[u8]) -> String {
     b.iter()
         .map(|x| format!("{x:02X}"))
@@ -487,6 +497,23 @@ fn a_5gs_capability_transcodes_to_the_golden_eps_bytes() {
         "transcode_5gs_to_eps",
         &transcode_5gs_to_eps(&CAP_5GS).unwrap(),
         &EPS_OF_CAP_5GS,
+    );
+}
+
+#[test]
+fn the_category_0_eps_capability_transcodes_to_the_golden_5gs_bytes() {
+    golden(
+        "hand-derived",
+        &hand_nr_racap_info(&hand_nr_container_list(&[(
+            2,
+            &UE_EUTRA_CAPABILITY_20_64_3,
+        )])),
+        &FIVEGS_OF_CAP_EPS_CATEGORY_0,
+    );
+    golden(
+        "transcode_eps_to_5gs, category 0",
+        &transcode_eps_to_5gs(&CAP_EPS_CATEGORY_0).unwrap(),
+        &FIVEGS_OF_CAP_EPS_CATEGORY_0,
     );
 }
 
