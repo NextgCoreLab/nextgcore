@@ -301,25 +301,6 @@ fn handle_pws_restart_indication_with(
     resent
 }
 
-/// Handle PWS Failure Indication
-///
-/// Called when an eNB reports failure to broadcast a warning.
-pub fn handle_pws_failure_indication(
-    _mme_ctx: &Arc<MmeContext>,
-    enb_id: u32,
-    message_id: u16,
-    serial_number: u16,
-) {
-    warn!(
-        "[PWS-Failure] eNB {enb_id:08x} failed to broadcast message_id={message_id:#06x} serial_number={serial_number:#06x}"
-    );
-
-    // In a full implementation, would:
-    // 1. Track failure for this eNB
-    // 2. Potentially notify CBC
-    // 3. Consider retry logic
-}
-
 // ============================================================================
 // Helper Functions
 // ============================================================================
@@ -1061,7 +1042,7 @@ mod tests {
         };
 
         let pdu = pws_restart_pdu(TEST_PLMN, 0x10680, true);
-        // TS 36.413 §8.13.3 / ASN.1: initiating message, procedure code 49,
+        // TS 36.413 §8.12.3 / ASN.1: initiating message, procedure code 49,
         // criticality ignore.
         assert_eq!(&pdu[..3], &[0x00, 0x31, 0x40]);
         let counted = || {
@@ -1105,6 +1086,95 @@ mod tests {
         assert_eq!(written(pool_id), 0, "not run");
 
         ctx.pws_forget_active_warning(warning.message_id, warning.serial_number);
+        ctx.enb_remove(pool_id);
+    }
+
+    /// A PWS FAILURE INDICATION (TS 36.413 §9.1.13.6) from the eNB of Global eNB
+    /// ID (`plmn`, macro `enb_id`); `with_cells` false leaves out the mandatory
+    /// PWS failed E-CGI List.
+    fn pws_failure_pdu(plmn: [u8; 3], enb_id: u32, with_cells: bool) -> Vec<u8> {
+        use bitvec::prelude::*;
+        use g::PWSFailureIndicationProtocolIEs_EntryValue as V;
+        use nextgcore_s1ap_gen::generated as g;
+        let bits = |v: u32, w: usize| -> BitVec<u8, Msb0> {
+            (0..w).rev().map(|i| (v >> i) & 1 == 1).collect()
+        };
+        let mut ies = Vec::new();
+        if with_cells {
+            ies.push(g::PWSFailureIndicationProtocolIEs_Entry {
+                id: g::ProtocolIE_ID(222),
+                criticality: g::Criticality(g::Criticality::REJECT),
+                value: V::Id_PWSfailedECGIList(g::PWSfailedECGIList(vec![g::EUTRAN_CGI {
+                    plm_nidentity: g::TBCD_STRING(plmn.to_vec()),
+                    cell_id: g::CellIdentity(bits((enb_id << 8) | 2, 28)),
+                    ie_extensions: None,
+                }])),
+            });
+        }
+        ies.push(g::PWSFailureIndicationProtocolIEs_Entry {
+            id: g::ProtocolIE_ID(59),
+            criticality: g::Criticality(g::Criticality::REJECT),
+            value: V::Id_Global_ENB_ID(g::Global_ENB_ID {
+                plm_nidentity: g::TBCD_STRING(plmn.to_vec()),
+                enb_id: g::ENB_ID::MacroENB_ID(g::ENB_ID_macroENB_ID(bits(enb_id, 20))),
+                ie_extensions: None,
+            }),
+        });
+        nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+            procedure_code: g::ProcedureCode(51),
+            criticality: g::Criticality(g::Criticality::IGNORE),
+            value: g::InitiatingMessageValue::Id_PWSFailureIndication(g::PWSFailureIndication {
+                protocol_i_es: g::PWSFailureIndicationProtocolIEs(ies),
+            }),
+        }))
+        .unwrap()
+    }
+
+    /// TS 36.413 §8.12.4: a PWS FAILURE INDICATION reaching the S1AP dispatch is
+    /// accepted and counted, with no response (Class 2). One naming another
+    /// connected eNB's Global eNB ID is not counted, and one missing its
+    /// mandatory PWS failed E-CGI List (criticality reject) gets an ERROR
+    /// INDICATION and is not run.
+    #[test]
+    fn a_pws_failure_indication_through_the_s1ap_dispatch_is_accepted_and_counted() {
+        let _guard = crate::gtp_path::lock_s11();
+        let ctx = crate::context::mme_self();
+        let pool_id = add_setup_enb(ctx, "127.0.0.1:36470", 0x10720);
+        let other = add_setup_enb(ctx, "127.0.0.1:36471", 0x10721);
+        let counted = || {
+            crate::s1ap_handler::PWS_FAILURE_INDICATIONS.load(std::sync::atomic::Ordering::Relaxed)
+        };
+        let n0 = counted();
+
+        let pdu = pws_failure_pdu(TEST_PLMN, 0x10720, true);
+        // Initiating message, procedure code 51, criticality ignore.
+        assert_eq!(&pdu[..3], &[0x00, 0x33, 0x40]);
+        let out = crate::s1ap_handler::handle_s1ap_message(ctx, pool_id, &pdu);
+        assert!(out.is_empty(), "Class 2: no response");
+        assert_eq!(counted(), n0 + 1, "accepted and counted");
+        assert!(crate::s1ap_handler::render_metrics()
+            .contains("# TYPE mme_s1ap_pws_failure_indications_total counter"));
+
+        let out = crate::s1ap_handler::handle_s1ap_message(
+            ctx,
+            pool_id,
+            &pws_failure_pdu(TEST_PLMN, 0x10721, true),
+        );
+        assert!(out.is_empty());
+        assert_eq!(counted(), n0 + 1, "another eNB's identity is not counted");
+
+        let out = crate::s1ap_handler::handle_s1ap_message(
+            ctx,
+            pool_id,
+            &pws_failure_pdu(TEST_PLMN, 0x10720, false),
+        );
+        assert_eq!(out.len(), 1, "an ERROR INDICATION");
+        assert!(matches!(
+            crate::s1ap_gen::test_codec::decode_s1ap_pdu(&out[0].pdu),
+            Ok(nextgcore_s1ap::S1apMessage::ErrorIndication(_))
+        ));
+        assert_eq!(counted(), n0 + 1, "not run");
+        ctx.enb_remove(other);
         ctx.enb_remove(pool_id);
     }
 }

@@ -53,6 +53,11 @@ pub mod test_support {
     // std guard must not do (`clippy::await_holding_lock`). Sync tests take them
     // with `blocking_lock()`, async ones with `.lock().await`; a tokio mutex
     // does not poison, so no test inherits a sibling's panic.
+    //
+    // Await right at the call: `let _g = CONTEXT_GUARD.lock().await;`. A future
+    // bound to `_g` compiles but takes no lock. `tests/async_test_guards_awaited.rs`
+    // fails any lock or async guard helper that is not awaited at its call,
+    // in this crate and in every crate that uses this module.
     use tokio::sync::Mutex;
 
     /// Process-wide lock so strict-peer tests that touch the global AMF context
@@ -65,6 +70,13 @@ pub mod test_support {
     /// (`SMF_SBI_ADDR` / `SMF_SBI_PORT`). The process environment is global, so the
     /// lock lives here beside the other shared-state guards rather than in one
     /// module's `mod tests`.
+    ///
+    /// Holding this lock alone is enough only for a test that reads the environment
+    /// (`smf_sbi_target`). A test that RESOLVES an SMF must take the `ngap_path` tests'
+    /// `SmfEnvGuard` instead. Resolution consults the process-wide NF discovery cache
+    /// before the environment, and sibling tests seed SMFs there, so a call made while
+    /// they run would reach their SMF (#1034, #1064). `SmfEnvGuard` takes
+    /// `sbi_path::nf_cache_test_lock` first, then this lock.
     pub static SMF_ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
     /// Serialises tests that drain the process-global connected-UE downlink queue
@@ -73,6 +85,12 @@ pub mod test_support {
     /// so two such tests in parallel steal each other's transfers. A tokio mutex,
     /// because the guard is held across the drain's `.await`s.
     pub static CONNECTED_DOWNLINK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Serialises tests that drain the process-global positioning / UE-policy
+    /// downlink queue (`AmfContext::positioning_dl_queue`, drained by
+    /// `NgapServer::process_positioning_downlinks`), for the reason given for
+    /// [`CONNECTED_DOWNLINK_LOCK`].
+    pub static POSITIONING_DL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// Serialises tests that set the AUSF endpoint environment variables
     /// (`AUSF_SBI_ADDR` / `AUSF_SBI_PORT`), for the same reason as
@@ -234,6 +252,14 @@ struct AmfSection {
 #[derive(Debug, Default, Deserialize)]
 struct AmfYaml {
     amf: Option<AmfSection>,
+}
+
+/// The lists `AmfApp::resolve_lists` resolved from a configuration, ready to apply.
+/// `None` for a list the file leaves out.
+struct ResolvedLists {
+    guami: Option<Vec<context::Guami>>,
+    tai: Option<Vec<context::ServedTai>>,
+    plmn_support: Option<Vec<context::PlmnSupport>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -426,13 +452,20 @@ impl AmfApp {
             }
         };
 
-        let amf_section = match yaml.amf {
+        let mut amf_section = match yaml.amf {
             Some(s) => s,
             None => {
                 log::warn!("No 'amf' section in config file");
                 return Ok(());
             }
         };
+
+        // #1070 re-review m1: everything that can refuse the configuration is resolved
+        // and checked HERE, before the first write to any process-wide state (the NAS
+        // canary, the emergency policy, the NRF URI, the AMF context). A refused load
+        // leaves the AMF exactly as it was, rather than half-applied.
+        let lists = Self::resolve_lists(&mut amf_section)
+            .map_err(|why| anyhow::anyhow!("{config_path}: {why}"))?;
 
         // Wave-6 H9 NAS-security canary (nas-06 Phase-6): seed the process-wide
         // runtime knob from `AMF_NAS_SECURITY` env (override) or the yaml
@@ -510,76 +543,58 @@ impl AmfApp {
             }
         }
 
-        // GUAMI list
-        for entry in amf_section.guami.unwrap_or_default() {
-            if let Some(guami) = Self::resolve_guami(entry) {
+        // #1070 review: every list the configuration names REPLACES the context's, rather
+        // than being appended to it. Appending merged the file with whatever an earlier
+        // load (or a test) had left there, so a second load duplicated every GUAMI, TAI,
+        // PLMN and algorithm. A list the configuration leaves out keeps its current value.
+        if let Some(guamis) = lists.guami {
+            for guami in &guamis {
                 log::info!(
-                    "Configured GUAMI: PLMN {}{}{}-{}{}{}, AMF Region={}, Set={}",
-                    guami.plmn_id.mcc1,
-                    guami.plmn_id.mcc2,
-                    guami.plmn_id.mcc3,
-                    guami.plmn_id.mnc1,
-                    guami.plmn_id.mnc2,
-                    if guami.plmn_id.mnc3 == 0xf {
-                        String::new()
-                    } else {
-                        guami.plmn_id.mnc3.to_string()
-                    },
+                    "Configured GUAMI: PLMN {}/{}, AMF Region={}, Set={}",
+                    guami.plmn_id.mcc(),
+                    guami.plmn_id.mnc(),
                     guami.amf_id.region,
                     guami.amf_id.set
                 );
-                ctx.served_guami.push(guami);
-                ctx.num_of_served_guami += 1;
             }
+            ctx.num_of_served_guami = guamis.len();
+            ctx.served_guami = guamis;
         }
-
-        // TAI list
-        for entry in amf_section.tai.unwrap_or_default() {
-            if let Some(served_tai) = Self::resolve_tai(entry) {
-                let tac = served_tai.list0.tac.first().copied().unwrap_or(0);
+        if let Some(tais) = lists.tai {
+            for served_tai in &tais {
                 log::info!(
-                    "Configured TAI: PLMN {}{}{}-{}{}{}, TAC={}",
-                    served_tai.list0.plmn_id.mcc1,
-                    served_tai.list0.plmn_id.mcc2,
-                    served_tai.list0.plmn_id.mcc3,
-                    served_tai.list0.plmn_id.mnc1,
-                    served_tai.list0.plmn_id.mnc2,
-                    if served_tai.list0.plmn_id.mnc3 == 0xf {
-                        String::new()
-                    } else {
-                        served_tai.list0.plmn_id.mnc3.to_string()
-                    },
-                    tac
+                    "Configured TAI: PLMN {}/{}, TAC={}",
+                    served_tai.list0.plmn_id.mcc(),
+                    served_tai.list0.plmn_id.mnc(),
+                    served_tai.list0.tac.first().copied().unwrap_or(0)
                 );
-                ctx.served_tai.push(served_tai);
-                ctx.num_of_served_tai += 1;
             }
+            ctx.num_of_served_tai = tais.len();
+            ctx.served_tai = tais;
         }
-
-        // PLMN support
-        for entry in amf_section.plmn_support.unwrap_or_default() {
-            if let Some(plmn_support) = Self::resolve_plmn_support(entry) {
+        if let Some(plmns) = lists.plmn_support {
+            for plmn_support in &plmns {
                 log::info!(
-                    "Configured PLMN support: PLMN {}{}{}-{}{}{}, {} S-NSSAIs",
-                    plmn_support.plmn_id.mcc1,
-                    plmn_support.plmn_id.mcc2,
-                    plmn_support.plmn_id.mcc3,
-                    plmn_support.plmn_id.mnc1,
-                    plmn_support.plmn_id.mnc2,
-                    if plmn_support.plmn_id.mnc3 == 0xf {
-                        String::new()
-                    } else {
-                        plmn_support.plmn_id.mnc3.to_string()
-                    },
+                    "Configured PLMN support: PLMN {}/{}, {} S-NSSAIs",
+                    plmn_support.plmn_id.mcc(),
+                    plmn_support.plmn_id.mnc(),
                     plmn_support.num_of_s_nssai
                 );
-                ctx.plmn_support.push(plmn_support);
-                ctx.num_of_plmn_support += 1;
             }
+            ctx.num_of_plmn_support = plmns.len();
+            ctx.plmn_support = plmns;
         }
 
         // Security algorithms
         if let Some(security) = amf_section.security {
+            if security.integrity_order.is_some() {
+                ctx.integrity_order.clear();
+                ctx.num_of_integrity_order = 0;
+            }
+            if security.ciphering_order.is_some() {
+                ctx.ciphering_order.clear();
+                ctx.num_of_ciphering_order = 0;
+            }
             for algo_str in security.integrity_order.unwrap_or_default() {
                 let algo_id = Self::parse_integrity_algorithm(&algo_str);
                 ctx.integrity_order.push(algo_id);
@@ -678,9 +693,74 @@ impl AmfApp {
         })
     }
 
-    /// Build a runtime PlmnSupport from its typed YAML representation
-    fn resolve_plmn_support(entry: PlmnSupportYaml) -> Option<context::PlmnSupport> {
-        let plmn_id = Self::resolve_plmn_id(entry.plmn_id?)?;
+    /// Resolve the configuration's GUAMI, TAI and PLMN support lists, taking them out of
+    /// `section`, and refuse a configuration the AMF cannot serve with. `None` for a list
+    /// the file leaves out. Writes nothing: `load_config` applies the result only once
+    /// every check has passed (#1070 re-review m1).
+    ///
+    /// Refused (#1070 re-review m2):
+    /// - a `plmn_support` list that resolves to no PLMN (`[]`, or no entry with a usable
+    ///   PLMN ID). The NG Setup Response's PLMN Support List is SIZE(1..maxnoofPLMNs)
+    ///   (TS 38.413 §9.2.6.2), so every NG Setup would fail;
+    /// - a `guami` list that resolves to no GUAMI, for the same reason: the Served GUAMI
+    ///   List is SIZE(1..maxnoofServedGUAMIs);
+    /// - a PLMN with no usable S-NSSAI (see [`AmfApp::resolve_plmn_support`]).
+    fn resolve_lists(section: &mut AmfSection) -> Result<ResolvedLists, String> {
+        let guami = section.guami.take().map(|entries| {
+            entries
+                .into_iter()
+                .filter_map(Self::resolve_guami)
+                .collect::<Vec<_>>()
+        });
+        if guami.as_ref().is_some_and(Vec::is_empty) {
+            return Err(
+                "amf.guami resolves to no GUAMI (empty, or no entry with a usable \
+                 PLMN ID); the NG Setup Response's Served GUAMI List must hold at least one \
+                 (TS 38.413 §9.2.6.2)"
+                    .to_string(),
+            );
+        }
+        let tai = section.tai.take().map(|entries| {
+            entries
+                .into_iter()
+                .filter_map(Self::resolve_tai)
+                .collect::<Vec<_>>()
+        });
+        let plmn_support = match section.plmn_support.take() {
+            None => None,
+            Some(entries) => {
+                let mut resolved = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    if let Some(plmn_support) = Self::resolve_plmn_support(entry)? {
+                        resolved.push(plmn_support);
+                    }
+                }
+                if resolved.is_empty() {
+                    return Err("amf.plmn_support resolves to no PLMN (empty, or no entry \
+                         with a usable PLMN ID); the NG Setup Response's PLMN Support List \
+                         must hold at least one (TS 38.413 §9.2.6.2)"
+                        .to_string());
+                }
+                Some(resolved)
+            }
+        };
+        Ok(ResolvedLists {
+            guami,
+            tai,
+            plmn_support,
+        })
+    }
+
+    /// Build a runtime PlmnSupport from its typed YAML representation. `Ok(None)` for an
+    /// entry with no usable PLMN, as before; `Err` for a PLMN with no usable S-NSSAI
+    /// (#1060 review): TS 38.413 §9.3.1.17 makes the Slice Support List SIZE(1..), so an
+    /// NG Setup Response for it could not be built -- the AMF must not start on it.
+    fn resolve_plmn_support(
+        entry: PlmnSupportYaml,
+    ) -> Result<Option<context::PlmnSupport>, String> {
+        let Some(plmn_id) = entry.plmn_id.and_then(Self::resolve_plmn_id) else {
+            return Ok(None);
+        };
         // #920 follow-up: SST 0 is not a slice (TS 23.501 §5.15.2.2 standardises SST
         // values from 1). A configured SST 0 is refused -- logged and left out -- rather
         // than advertised in NG Setup and handed out as the default S-NSSAI.
@@ -701,12 +781,21 @@ impl AmfApp {
                 Some(context::SNssai { sst, sd: n.sd })
             })
             .collect();
+        if s_nssai_list.is_empty() {
+            return Err(format!(
+                "amf.plmn_support for PLMN {}/{} has no usable S-NSSAI (none \
+                 configured, or every one is SST 0); the NG Setup Response's Slice Support \
+                 List must hold at least one (TS 38.413 §9.3.1.17)",
+                plmn_id.mcc(),
+                plmn_id.mnc()
+            ));
+        }
         let num_of_s_nssai = s_nssai_list.len();
-        Some(context::PlmnSupport {
+        Ok(Some(context::PlmnSupport {
             plmn_id,
             num_of_s_nssai,
             s_nssai: s_nssai_list,
-        })
+        }))
     }
 
     /// Parse integrity algorithm name to ID
@@ -1177,7 +1266,9 @@ mod tests {
             "plmn_id: { mcc: 001, mnc: 01 }\ns_nssai:\n  - sst: 0\n    sd: 9\n  - sst: 2\n  - sd: 5\n",
         )
         .expect("yaml");
-        let resolved = AmfApp::resolve_plmn_support(entry).expect("the PLMN resolves");
+        let resolved = AmfApp::resolve_plmn_support(entry)
+            .expect("a usable S-NSSAI is left")
+            .expect("the PLMN resolves");
         assert_eq!(
             resolved
                 .s_nssai
@@ -1187,6 +1278,22 @@ mod tests {
             vec![(2, None), (1, Some(5))]
         );
         assert_eq!(resolved.num_of_s_nssai, 2);
+    }
+
+    /// **#1060 review.** An entry whose every S-NSSAI is SST 0 -- or that names none --
+    /// leaves the PLMN with no slice, and an NG Setup Response for it cannot be built (the
+    /// Slice Support List is SIZE(1..)): the configuration is refused at load, naming the
+    /// cause, instead of starting an AMF that fails every NG Setup.
+    #[test]
+    fn a_plmn_with_no_usable_s_nssai_fails_the_configuration() {
+        for yaml in [
+            "plmn_id: { mcc: 001, mnc: 01 }\ns_nssai:\n  - sst: 0\n  - sst: 0\n    sd: 1\n",
+            "plmn_id: { mcc: 001, mnc: 01 }\n",
+        ] {
+            let entry: PlmnSupportYaml = serde_yaml::from_str(yaml).expect("yaml");
+            let err = AmfApp::resolve_plmn_support(entry).expect_err(yaml);
+            assert!(err.contains("no usable S-NSSAI"), "{err}");
+        }
     }
 
     /// A fixture path inside a directory nothing else touches (#601).
@@ -1363,18 +1470,18 @@ amf:
         // once #341 gave `fini` more state to clear.
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
 
-        // The loader PUSHES onto these vectors, so the restore truncates to the saved
-        // lengths rather than cloning the elements.
+        // The loader REPLACES these lists (#1070 review), so the restore puts the saved
+        // contents back.
         context::amf_context_init(64, 1024, 4096);
         let ctx_arc = context::amf_self();
         let saved = {
             let c = ctx_arc.read().unwrap_or_else(|e| e.into_inner());
             (
-                c.integrity_order.len(),
-                c.ciphering_order.len(),
-                c.served_guami.len(),
-                c.served_tai.len(),
-                c.plmn_support.len(),
+                c.integrity_order.clone(),
+                c.ciphering_order.clone(),
+                c.served_guami.clone(),
+                c.served_tai.clone(),
+                c.plmn_support.clone(),
                 c.num_of_integrity_order,
                 c.num_of_ciphering_order,
                 c.num_of_served_guami,
@@ -1397,19 +1504,19 @@ amf:
             // The security-relevant pair, which #363 names as the one to worry about:
             // written to the injected instance only, so inert for a global reader.
             assert_eq!(
-                c.integrity_order[saved.0..],
+                c.integrity_order,
                 [3u8, 1u8],
                 "integrity_order must reach the global context IN ORDER"
             );
             assert_eq!(
-                c.ciphering_order[saved.1..],
+                c.ciphering_order,
                 [3u8, 1u8],
                 "ciphering_order must reach the global context IN ORDER"
             );
             // Asserted through the registration path's OWN reader rather than by
             // recomputing the mask here: NIA3|NIA1 is 0b1010 within the 0x0E window.
             assert_eq!(
-                ngap_path::algorithm_order_to_mask(&c.integrity_order[saved.0..], 0x0E),
+                ngap_path::algorithm_order_to_mask(&c.integrity_order, 0x0E),
                 (1 << 3) | (1 << 1),
                 "the NAS integrity mask the registration path computes must come from \
                  the configured order, not the default"
@@ -1448,11 +1555,11 @@ amf:
 
         {
             let mut c = ctx_arc.write().unwrap_or_else(|e| e.into_inner());
-            c.integrity_order.truncate(saved.0);
-            c.ciphering_order.truncate(saved.1);
-            c.served_guami.truncate(saved.2);
-            c.served_tai.truncate(saved.3);
-            c.plmn_support.truncate(saved.4);
+            c.integrity_order = saved.0;
+            c.ciphering_order = saved.1;
+            c.served_guami = saved.2;
+            c.served_tai = saved.3;
+            c.plmn_support = saved.4;
             c.num_of_integrity_order = saved.5;
             c.num_of_ciphering_order = saved.6;
             c.num_of_served_guami = saved.7;
@@ -1462,6 +1569,251 @@ amf:
             c.t3502_value = saved.11;
             c.amf_name = saved.12;
         }
+        remove_fixture(&path);
+    }
+
+    /// The lists `load_config` fills, saved and put back by the tests below.
+    type SavedLists = (
+        Vec<context::Guami>,
+        Vec<context::ServedTai>,
+        Vec<context::PlmnSupport>,
+        Vec<u8>,
+        Vec<u8>,
+    );
+
+    fn save_lists(c: &context::AmfContext) -> SavedLists {
+        (
+            c.served_guami.clone(),
+            c.served_tai.clone(),
+            c.plmn_support.clone(),
+            c.integrity_order.clone(),
+            c.ciphering_order.clone(),
+        )
+    }
+
+    fn restore_lists(c: &mut context::AmfContext, saved: SavedLists) {
+        c.num_of_served_guami = saved.0.len();
+        c.served_guami = saved.0;
+        c.num_of_served_tai = saved.1.len();
+        c.served_tai = saved.1;
+        c.num_of_plmn_support = saved.2.len();
+        c.plmn_support = saved.2;
+        c.num_of_integrity_order = saved.3.len();
+        c.integrity_order = saved.3;
+        c.num_of_ciphering_order = saved.4.len();
+        c.ciphering_order = saved.4;
+    }
+
+    /// What a test compares of [`SavedLists`]: each list's entries, by PLMN and id.
+    fn list_fingerprint(saved: &SavedLists) -> Vec<String> {
+        let mut out: Vec<String> = saved
+            .0
+            .iter()
+            .map(|g| {
+                format!(
+                    "guami {}/{} {}/{}/{}",
+                    g.plmn_id.mcc(),
+                    g.plmn_id.mnc(),
+                    g.amf_id.region,
+                    g.amf_id.set,
+                    g.amf_id.pointer
+                )
+            })
+            .collect();
+        out.extend(saved.1.iter().map(|t| {
+            format!(
+                "tai {}/{} {:?}",
+                t.list0.plmn_id.mcc(),
+                t.list0.plmn_id.mnc(),
+                t.list0.tac
+            )
+        }));
+        out.extend(
+            saved
+                .2
+                .iter()
+                .map(|p| format!("plmn {}/{}", p.plmn_id.mcc(), p.plmn_id.mnc())),
+        );
+        out
+    }
+
+    /// **#1070 re-review m2.** A `plmn_support` or `guami` list that resolves to nothing
+    /// -- empty, or no entry with a usable PLMN ID -- is refused at load: the NG Setup
+    /// Response's PLMN Support List and Served GUAMI List are both SIZE(1..)
+    /// (TS 38.413 §9.2.6.2), so the AMF would fail every NG Setup.
+    #[test]
+    fn a_list_that_resolves_to_nothing_fails_the_configuration() {
+        let ok_guami = "guami:\n  - plmn_id: { mcc: 001, mnc: 01 }\n";
+        let ok_plmn =
+            "plmn_support:\n  - plmn_id: { mcc: 001, mnc: 01 }\n    s_nssai: [ { sst: 1 } ]\n";
+        let unresolvable_plmns = "plmn_support:\n  - plmn_id: { mcc: 001 }\n    \
+             s_nssai: [ { sst: 1 } ]\n  - s_nssai: [ { sst: 1 } ]\n";
+        for (yaml, want) in [
+            (
+                format!("{ok_guami}plmn_support: []\n"),
+                "resolves to no PLMN",
+            ),
+            (
+                format!("{ok_guami}{unresolvable_plmns}"),
+                "resolves to no PLMN",
+            ),
+            (format!("guami: []\n{ok_plmn}"), "resolves to no GUAMI"),
+            (
+                format!("guami:\n  - amf_id: {{ region: 1 }}\n{ok_plmn}"),
+                "resolves to no GUAMI",
+            ),
+        ] {
+            let mut section: AmfSection = serde_yaml::from_str(&yaml).expect("yaml");
+            let err = AmfApp::resolve_lists(&mut section)
+                .err()
+                .unwrap_or_else(|| panic!("must be refused: {yaml}"));
+            assert!(err.contains(want), "{yaml}: {err}");
+        }
+        // Both present and resolvable: accepted. A list left out is `None`, not refused.
+        let mut section: AmfSection =
+            serde_yaml::from_str(&format!("{ok_guami}{ok_plmn}")).expect("yaml");
+        let lists = AmfApp::resolve_lists(&mut section).expect("accepted");
+        assert_eq!(lists.guami.map(|g| g.len()), Some(1));
+        assert_eq!(lists.plmn_support.map(|p| p.len()), Some(1));
+        assert!(lists.tai.is_none());
+    }
+
+    /// **#1070 review m3.** A list the configuration names replaces the context's list.
+    /// `load_config` used to append, so a second load of the same file doubled every
+    /// GUAMI, TAI, PLMN and algorithm, and a load after anything else had written them
+    /// merged the two.
+    #[tokio::test]
+    async fn loading_a_config_replaces_the_lists_it_names() {
+        use std::io::Write;
+
+        let yaml = r#"
+amf:
+  guami:
+    - plmn_id: { mcc: 999, mnc: 70 }
+      amf_id: { region: 2, set: 1, pointer: 0 }
+  tai:
+    - plmn_id: { mcc: 999, mnc: 70 }
+      tac: 1070
+  plmn_support:
+    - plmn_id: { mcc: 999, mnc: 70 }
+      s_nssai:
+        - sst: 1
+    - plmn_id: { mcc: 001, mnc: 01 }
+      s_nssai:
+        - sst: 2
+  security:
+    integrity_order: [ NIA2 ]
+    ciphering_order: [ NEA0 ]
+"#;
+        let path = unique_fixture_path("nextgcore-amfd-1070-replace.yaml");
+        std::fs::File::create(&path)
+            .and_then(|mut f| f.write_all(yaml.as_bytes()))
+            .expect("write the fixture config");
+        let path_str = path.to_str().expect("utf-8 temp path").to_owned();
+
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        context::amf_context_init(64, 1024, 4096);
+        let ctx_arc = context::amf_self();
+        let saved = save_lists(&ctx_arc.read().unwrap_or_else(|e| e.into_inner()));
+
+        let app = AmfApp::new();
+        for load in 1..=2 {
+            app.load_config(&path_str)
+                .await
+                .expect("the fixture config must load");
+            let c = ctx_arc.read().unwrap_or_else(|e| e.into_inner());
+            let plmns: Vec<(String, String)> = c
+                .plmn_support
+                .iter()
+                .map(|p| (p.plmn_id.mcc(), p.plmn_id.mnc()))
+                .collect();
+            assert_eq!(
+                plmns,
+                [("999".into(), "70".into()), ("001".into(), "01".into())],
+                "load {load}: plmn_support must be exactly the configured list"
+            );
+            assert_eq!(c.num_of_plmn_support, 2, "load {load}");
+            assert_eq!(c.served_guami.len(), 1, "load {load}: served_guami");
+            assert_eq!(c.num_of_served_guami, 1, "load {load}");
+            assert_eq!(c.served_tai.len(), 1, "load {load}: served_tai");
+            assert_eq!(c.num_of_served_tai, 1, "load {load}");
+            assert_eq!(c.integrity_order, [2u8], "load {load}: integrity_order");
+            assert_eq!(c.num_of_integrity_order, 1, "load {load}");
+            assert_eq!(c.ciphering_order, [0u8], "load {load}: ciphering_order");
+            assert_eq!(c.num_of_ciphering_order, 1, "load {load}");
+        }
+
+        restore_lists(
+            &mut ctx_arc.write().unwrap_or_else(|e| e.into_inner()),
+            saved,
+        );
+        remove_fixture(&path);
+    }
+
+    /// **#1070 review m2.** A PLMN with no usable S-NSSAI fails `load_config` itself, the
+    /// step `AmfApp::init` propagates to start-up. The error names the file and the PLMN
+    /// as MCC/MNC (m1). Nothing of the file is applied (#1070 re-review m1): its
+    /// `amf_name`, GUAMI and TAI, which come before `plmn_support`, are not written either.
+    #[tokio::test]
+    async fn a_plmn_with_no_usable_s_nssai_aborts_the_load() {
+        use std::io::Write;
+
+        let yaml = r#"
+amf:
+  amf_name: amf-1070-refused
+  guami:
+    - plmn_id: { mcc: 999, mnc: 70 }
+      amf_id: { region: 9, set: 9, pointer: 9 }
+  tai:
+    - plmn_id: { mcc: 999, mnc: 70 }
+      tac: 10700
+  plmn_support:
+    - plmn_id: { mcc: 001, mnc: 01 }
+      s_nssai:
+        - sst: 1
+    - plmn_id: { mcc: 999, mnc: 70 }
+      s_nssai:
+        - sst: 0
+"#;
+        let path = unique_fixture_path("nextgcore-amfd-1070-no-slice.yaml");
+        std::fs::File::create(&path)
+            .and_then(|mut f| f.write_all(yaml.as_bytes()))
+            .expect("write the fixture config");
+        let path_str = path.to_str().expect("utf-8 temp path").to_owned();
+
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        context::amf_context_init(64, 1024, 4096);
+        let ctx_arc = context::amf_self();
+        let (saved, name_before) = {
+            let c = ctx_arc.read().unwrap_or_else(|e| e.into_inner());
+            (save_lists(&c), c.amf_name.clone())
+        };
+        let before = list_fingerprint(&saved);
+
+        let err = AmfApp::new()
+            .load_config(&path_str)
+            .await
+            .expect_err("a PLMN with no usable S-NSSAI must fail the load")
+            .to_string();
+        assert!(err.contains(&path_str), "the error names the file: {err}");
+        assert!(
+            err.contains("PLMN 999/70 has no usable S-NSSAI"),
+            "the error names the PLMN as MCC/MNC: {err}"
+        );
+        {
+            let c = ctx_arc.read().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                list_fingerprint(&save_lists(&c)),
+                before,
+                "a refused load leaves every list as it was"
+            );
+            assert_eq!(c.amf_name, name_before, "and the AMF name");
+        }
+
+        restore_lists(
+            &mut ctx_arc.write().unwrap_or_else(|e| e.into_inner()),
+            saved,
+        );
         remove_fixture(&path);
     }
 

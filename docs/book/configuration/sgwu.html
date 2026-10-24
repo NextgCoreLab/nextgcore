@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-df495bb2.js";
+            window.path_to_searchindex_js = "../searchindex-3d04d415.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -214,6 +214,8 @@ sgwu:
 <tr><th>Parameter</th><th>Type</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
+<tr><td><code>sgwu.pfcp.allowed_peers</code></td><td>list of IPs / CIDR prefixes / host names</td><td>empty</td><td>SGW-Cs allowed to set up an Sxa association (<code>SGWU_PFCP_ALLOWED_PEERS</code>, comma-separated, overrides it; host names re-resolved every 10 s, at once (at most once a second) when a Setup comes from an unresolved address, and kept at their last good addresses when a lookup fails). <strong>Fail closed:</strong> empty refuses every Association Setup (error at startup); <code>0.0.0.0/0</code> / <code>::/0</code> admit any host. A bad entry stops startup. Session requests are accepted only from an associated SGW-C’s host, and only for that SGW-C’s own sessions: a Modification/Deletion of another’s is answered as unknown (cause 65), an Establishment naming another’s CP F-SEID gets cause 69 and installs nothing. Refusals count in <code>sgwu_pfcp_unauthorized_messages_total</code>.</td></tr>
+<tr><td><code>sgwu.pfcp.max_sessions_per_peer</code></td><td>integer</td><td>see text</td><td>The most sessions one SGW-C may hold (<code>SGWU_PFCP_MAX_SESSIONS_PER_PEER</code> overrides). Default: none (only the global session capacity applies); enforced when set.</td></tr>
 <tr><td><code>sgwu.pfcp.server[0].address</code></td><td>IPv4</td><td>none</td><td>PFCP Node ID when <code>PFCP_NODE_IP</code> is unset (then loopback). Not the bind address: that is <code>PFCP_BIND_ADDR</code>.</td></tr>
 <tr><td><code>sgwu.gtpu.server[0].address</code></td><td>IPv4</td><td>none</td><td>GTP-U address advertised in UP-allocated F-TEIDs when the socket is bound to a wildcard and <code>SGWU_GTPU_ADVERTISE</code> is unset.</td></tr>
 <tr><td><code>logger.level</code></td><td>string</td><td><code>info</code></td><td>Log level when <code>-l/--log-level</code> is not given; <code>RUST_LOG</code> overrides both (#500).</td></tr>
@@ -221,6 +223,9 @@ sgwu:
 </table>
 </div>
 <p>A non-IPv4 address is logged and ignored. Not read: <code>logger.file</code>, <code>global.max.*</code>.</p>
+<blockquote>
+<p><strong>Clock:</strong> this NF refuses to start when the local clock reads before 2020-01-01, because its PFCP Recovery Time Stamp would be wrong. See <a href="overview.html#a-set-clock-is-required-pfcp-nfs">A set clock is required</a> for the remedy on RTC-less hosts.</p>
+</blockquote>
 <h2 id="command-line-flags"><a class="header" href="#command-line-flags">Command-line flags</a></h2>
 <div class="table-wrapper">
 <table>
@@ -249,6 +254,7 @@ sgwu:
 <tr><td><code>SGWU_MAX_BUFFERED_PACKETS</code></td><td><code>64</code></td><td>Per-FAR buffer depth for BUFF.</td></tr>
 <tr><td><code>SGWU_QER_ENFORCEMENT</code></td><td>off</td><td><code>1</code>/<code>true</code>/<code>yes</code> enables QER gate/MBR enforcement (#60). Off by default because a mis-provisioned QER would drop traffic.</td></tr>
 <tr><td><code>SGWU_METRICS_PORT</code></td><td><code>9090</code></td><td>Prometheus endpoint port.</td></tr>
+<tr><td><code>NEXTGCORE_METRICS_BIND</code></td><td><code>127.0.0.1</code></td><td>Host the unauthenticated <code>/metrics</code> listener binds to (#837). The compose files and manifests set <code>0.0.0.0</code> inside the private container/pod network.</td></tr>
 <tr><td><code>OTEL_EXPORTER_OTLP_ENDPOINT</code></td><td><code>http://jaeger:4317</code></td><td>OTLP endpoint for OpenTelemetry traces; init is best-effort.</td></tr>
 <tr><td><code>RUST_LOG</code></td><td>unset</td><td>Overrides the log level.</td></tr>
 </tbody>

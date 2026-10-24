@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-df495bb2.js";
+            window.path_to_searchindex_js = "../searchindex-3d04d415.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -241,7 +241,7 @@ scp:
 <p>All of the <code>scp</code>-level keys are shipped <strong>commented out</strong>, so the built-in defaults apply unless an operator uncomments them.</p>
 <p><strong>Inert</strong> — present in the shipped file and not read anywhere:</p>
 <ul>
-<li><strong><code>logger.file.path</code> and <code>logger.level</code>.</strong> The log level comes from <code>RUST_LOG</code> when set, else the CLI flag <code>-e/--log-level</code> (default <code>info</code>). There is no working log-file output (<code>-l/--log-file</code> is accepted but unused).</li>
+<li><strong><code>logger.level</code> is read; <code>logger.file.path</code> is not.</strong> The log level is <code>-e/--log-level</code> when given, else this file’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code>, when set, overrides all three (#691). There is no working log-file output (<code>-l/--log-file</code> is accepted but unused).</li>
 <li><strong><code>global.max.ue</code> / <code>global.max.peer</code>.</strong> Not read; <code>scp_context_init()</code> takes no size.</li>
 <li><strong><code>scp.sbi.tls.ca</code> and <code>scp.sbi.tls.min_version</code>.</strong> There is no CA-bundle or minimum-version knob in the code; the rest of the <code>tls</code> block <em>is</em> read.</li>
 </ul>
@@ -255,7 +255,7 @@ scp:
 <tbody>
 <tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/scp.yaml</code></td><td>Configuration file path. Parsed; see the live-fields table above.</td></tr>
 <tr><td><code>-l, --log-file</code></td><td>path</td><td>unset</td><td>Log file path — <strong>accepted but unused</strong> by <code>init_logging</code>.</td></tr>
-<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>); unrecognized values fall back to <code>info</code>.</td></tr>
+<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>logger.level</code>, else <code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else is <code>info</code>). Without the flag, the config’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code> overrides both (#691).</td></tr>
 <tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td>Disable color output.</td></tr>
 <tr><td><code>-k, --kill</code></td><td>flag</td><td>off</td><td>Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor.</td></tr>
 <tr><td><code>--sbi-addr</code></td><td>string</td><td><code>127.0.0.1</code></td><td>SBI server bind address (docker deployments pass the container IP). Precedence: flag &gt; <code>SCP_SBI_ADDR</code> &gt; <code>scp.sbi.server[0].address</code> &gt; default.</td></tr>

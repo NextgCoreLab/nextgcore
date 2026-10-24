@@ -68,6 +68,28 @@ use smf_sm::SmfFsm;
 /// Global shutdown flag
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+/// Whether the shutdown signal has arrived.
+pub(crate) fn shutting_down() -> bool {
+    #[cfg(test)]
+    if SHUTDOWN_FOR_TEST.with(std::cell::Cell::get) {
+        return true;
+    }
+    SHUTDOWN.load(Ordering::SeqCst)
+}
+
+// A shutdown seen only by the calling test's thread. The process-wide flag would
+// also refuse the creates and the S5/S8 requests of tests running alongside.
+#[cfg(test)]
+thread_local! {
+    static SHUTDOWN_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Set the calling thread's [`shutting_down`] for a test.
+#[cfg(test)]
+pub(crate) fn set_shutting_down_for_test(on: bool) {
+    SHUTDOWN_FOR_TEST.with(|s| s.set(on));
+}
+
 /// When the shutdown signal arrived (#941 review M2): the start of the one deadline
 /// every shutdown phase is bounded by.
 static SHUTDOWN_STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -144,7 +166,10 @@ fn render_metrics() -> String {
          smf_up_path_sessions_released_total {}\n\
          # HELP smf_nsac_decrease_failures_total NSACF DECREASEs (Nnsacf_NSAC_NumOfPDUsUpdate) that failed or timed out; each leaves a PDU session counted at the NSACF\n\
          # TYPE smf_nsac_decrease_failures_total counter\n\
-         smf_nsac_decrease_failures_total {}\n",
+         smf_nsac_decrease_failures_total {}\n\
+         # HELP smf_ipv4_pool_stale_releases_total UE IPv4 addresses released while already free: each is a double free\n\
+         # TYPE smf_ipv4_pool_stale_releases_total counter\n\
+         smf_ipv4_pool_stale_releases_total {}\n",
         pool.len(),
         pfcp_path::PFCP_UNAUTHORIZED.load(Ordering::Relaxed),
         SM_POLICY_DELETE_FAILURES.load(Ordering::Relaxed),
@@ -154,6 +179,10 @@ fn render_metrics() -> String {
         up_path::UP_PATH_SESSIONS_DEACTIVATED.load(Ordering::Relaxed),
         up_path::UP_PATH_SESSIONS_RELEASED.load(Ordering::Relaxed),
         policy::NSAC_DECREASE_FAILURES.load(Ordering::Relaxed),
+        smf_self()
+            .read()
+            .map(|ctx| ctx.ipv4_pool.stale_releases())
+            .unwrap_or(0),
     )
 }
 
@@ -1022,6 +1051,8 @@ async fn main() -> Result<()> {
             client.seed_peer_recovery_time_stamp(rts).await;
         }
     }
+    // #930 review n1: after the seed, which migrated what it needed.
+    pfcp_path::prune_orphan_address_keys(&pfcp_clients);
     // #1031: restored sessions whose UPF is no longer configured.
     pfcp_path::unknown_session_upfs(&pfcp_clients);
     // #1028 review m2: paths still failed at the last shutdown are held again.
@@ -1134,6 +1165,9 @@ async fn main() -> Result<()> {
             .as_deref(),
         durable,
     );
+    let shutdown_deadline = tokio::time::Instant::from_std(
+        *SHUTDOWN_STARTED.get_or_init(std::time::Instant::now) + shutdown_budget(),
+    );
     graceful_shutdown(
         async {
             nextgcore_sbi::heartbeat::deregister_self().await;
@@ -1141,21 +1175,24 @@ async fn main() -> Result<()> {
         &pfcp_clients,
         release_on_shutdown,
         pfcp_listener_handle,
-        tokio::time::Instant::from_std(
-            *SHUTDOWN_STARTED.get_or_init(std::time::Instant::now) + shutdown_budget(),
-        ),
+        shutdown_deadline,
     )
     .await;
+    // #941 review MINOR 2: what follows is bounded by the same deadline, so the
+    // whole shutdown, and not only its N4 part, ends inside the budget.
+    let left = || shutdown_deadline.saturating_duration_since(tokio::time::Instant::now());
     // #912 review m5: the releases the UEs completed during the shutdown are still
     // telling the UDM, the AMF and the EASDF; the runtime would cut them.
-    drain_release_side_effects(std::time::Duration::from_secs(3)).await;
+    drain_release_side_effects(left().min(std::time::Duration::from_secs(3))).await;
 
-    // Stop SBI server
-    sbi_server
-        .stop()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {e}"))?;
-    log::info!("SBI HTTP/2 server stopped");
+    // Stop SBI server: its own drain is up to 5 s, bounded here by what is left.
+    match tokio::time::timeout(left(), sbi_server.stop()).await {
+        Ok(stopped) => {
+            stopped.map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {e}"))?;
+            log::info!("SBI HTTP/2 server stopped");
+        }
+        Err(_) => log::warn!("Shutdown: out of time while the SBI server drained its streams"),
+    }
 
     // Cleanup state machine
     smf_sm.fini();
@@ -1179,6 +1216,7 @@ async fn handle_pfcp_incoming(
     sock: &tokio::net::UdpSocket,
     pkt: &[u8],
     peer: std::net::SocketAddr,
+    admitted: Option<&pfcp_path::PfcpClient>,
 ) {
     if pkt.len() < 4 {
         log::warn!("PFCP packet from {peer} too short ({} bytes)", pkt.len());
@@ -1191,7 +1229,7 @@ async fn handle_pfcp_incoming(
     );
 
     match msg_type {
-        56 => handle_pfcp_session_report(sock, pkt, peer).await,
+        56 => handle_pfcp_session_report_from(sock, pkt, peer, admitted).await,
         _ => log::debug!("PFCP: unhandled message type={msg_type} from {peer}"),
     }
 }
@@ -1205,6 +1243,17 @@ async fn handle_pfcp_session_report(
     sock: &tokio::net::UdpSocket,
     pkt: &[u8],
     peer: std::net::SocketAddr,
+) {
+    handle_pfcp_session_report_from(sock, pkt, peer, None).await;
+}
+
+/// [`handle_pfcp_session_report`] for a datagram the listener admitted as
+/// `admitted`'s (#974 review n2).
+async fn handle_pfcp_session_report_from(
+    sock: &tokio::net::UdpSocket,
+    pkt: &[u8],
+    peer: std::net::SocketAddr,
+    admitted: Option<&pfcp_path::PfcpClient>,
 ) {
     // Minimum PFCP header with SEID: 16 bytes
     // flags[1] + msg_type[1] + length[2] + seid[8] + seq[3] + spare[1]
@@ -1230,7 +1279,7 @@ async fn handle_pfcp_session_report(
     // session exists on another one.
     // An unknown SEID is not counted: a report racing the session's deletion is one.
     let known = pfcp_path::holds_session_seid(seid);
-    if !known || !pfcp_path::report_sender_owns_session(seid, peer) {
+    if !known || !pfcp_path::report_sender_owns_session(seid, peer, admitted) {
         if known {
             pfcp_path::note_unauthorized(
                 format_args!("a Session Report for SEID 0x{seid:016x}, on another UPF (cause 65)"),
@@ -4084,6 +4133,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     log::error!("PCF rejected SM policy (status={status}): {detail}");
                     fsm_dispatch_policy_response(&mut fsm, status);
                     rollback();
+                    spawn_create_udm_rollback(&supi, pdu_session_id, sdm_subscription_id.clone());
                     rollback_nsac(
                         nsac_admitted,
                         &supi,
@@ -4106,6 +4156,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     log::error!("SM policy create failed: {e}");
                     fsm.transition_to(gsm_sm::GsmState::Exception);
                     rollback();
+                    spawn_create_udm_rollback(&supi, pdu_session_id, sdm_subscription_id.clone());
                     rollback_nsac(
                         nsac_admitted,
                         &supi,
@@ -4265,6 +4316,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     }
                 }
                 rollback();
+                spawn_create_udm_rollback(&supi, pdu_session_id, sdm_subscription_id.clone());
                 rollback_nsac(
                     nsac_admitted,
                     &supi,
@@ -4528,18 +4580,16 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
         decision.def_five_qi as u16,
         decision.arp_priority_level,
     ) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            log::error!("Failed to encode PDUSessionResourceSetupRequestTransfer: {e:?}");
-            rollback();
-            rollback_nsac(
-                nsac_admitted,
-                &supi,
-                pdu_session_id,
-                sst,
-                snssai_sd.as_deref(),
-            )
-            .await;
+        Ok(bytes) if !n2_setup_fails_for_test() => bytes,
+        result => {
+            log::error!(
+                "Failed to encode PDUSessionResourceSetupRequestTransfer: {:?}",
+                result.err()
+            );
+            // The binding records the NSAC admission, so this release counts the
+            // session out, once (#912 r1 meets #1072: a second DECREASE here was the
+            // duplicate).
+            rollback_established_create(&sm_context_ref).await;
             return sm_context_create_error(
                 500,
                 "SYSTEM_FAILURE",
@@ -6387,6 +6437,15 @@ fn udm_release_permits() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
 /// bound (#912 review N1): a create for the same PSI may be waiting on it, and it
 /// must not queue behind other releases' EASDF and AMF work.
 fn spawn_release_side_effects(sm_context_ref: &str, binding: context::PolicyBinding) {
+    spawn_release_side_effects_with(sm_context_ref, binding, true);
+}
+
+/// [`spawn_release_side_effects`], announcing PDU_SES_REL only when `announce`.
+fn spawn_release_side_effects_with(
+    sm_context_ref: &str,
+    binding: context::PolicyBinding,
+    announce: bool,
+) {
     let reference = sm_context_ref.to_string();
     let in_flight =
         ReleaseInFlight::begin_with(&binding.supi, binding.psi, nsac_release_of(&binding));
@@ -6401,7 +6460,7 @@ fn spawn_release_side_effects(sm_context_ref: &str, binding: context::PolicyBind
         );
         drop(in_flight);
         if let Ok(_permit) = release_side_effect_permits().clone().acquire_owned().await {
-            release_side_effects(&reference, &binding).await;
+            release_side_effects(&reference, &binding, announce).await;
         }
         RELEASE_SIDE_EFFECTS_RUNNING.fetch_sub(1, Ordering::SeqCst);
     });
@@ -6464,6 +6523,53 @@ async fn release_nsac_admission(binding: &context::PolicyBinding, entry: Option<
     }
 }
 
+/// A test's failing N2 SM information encode, the one step after the binding exists
+/// that a test cannot otherwise fail.
+#[cfg(test)]
+static N2_SETUP_FAILS_FOR_TEST: AtomicBool = AtomicBool::new(false);
+
+fn n2_setup_fails_for_test() -> bool {
+    #[cfg(test)]
+    {
+        N2_SETUP_FAILS_FOR_TEST.load(Ordering::SeqCst)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+/// A create that fails after its UDM step (#912 review r1): its Nudm_SDM
+/// subscription and its serving-SMF registration are removed, like a release's, and
+/// marked in flight so a retry for the PSI supersedes or waits for them. Before, a
+/// create that had superseded a pending release's UECM DELETE and then failed left
+/// that record, and its own, at the UDM.
+fn spawn_create_udm_rollback(supi: &str, psi: u8, sdm_subscription_id: Option<String>) {
+    let mut binding = context::PolicyBinding::snapshot_default();
+    binding.supi = supi.to_string();
+    binding.psi = psi;
+    binding.sdm_subscription_id = sdm_subscription_id;
+    let in_flight = ReleaseInFlight::begin(&binding.supi, binding.psi);
+    RELEASE_SIDE_EFFECTS_RUNNING.fetch_add(1, Ordering::SeqCst);
+    tokio::spawn(async move {
+        release_udm_cleanup(&binding, Some(&in_flight.entry)).await;
+        drop(in_flight);
+        RELEASE_SIDE_EFFECTS_RUNNING.fetch_sub(1, Ordering::SeqCst);
+    });
+}
+
+/// A create that fails after its N4 session and binding exist (#912 review r1, n4):
+/// released as a UE-requested release would be, without the PDU_SES_REL event. Its
+/// N4 session and SM policy go ([`release_user_plane`]), then the context, once
+/// ([`take_sm_context`]), and the UDM, EASDF and EBI effects. Before, this path
+/// removed only the binding, the session and the address.
+async fn rollback_established_create(sm_context_ref: &str) {
+    release_user_plane(sm_context_ref).await;
+    if let Some(Some(binding)) = take_sm_context(sm_context_ref) {
+        spawn_release_side_effects_with(sm_context_ref, binding, false);
+    }
+}
+
 /// TS 23.502 §4.3.4.2 steps 14-15 for a released session: Nudm_SDM_Unsubscribe, then
 /// Nudm_UECM_Deregistration, each bounded by [`UDM_RELEASE_TIMEOUT`]. A new session
 /// for the same (SUPI, PSI) supersedes only the deregistration (#912 review N1,
@@ -6521,7 +6627,11 @@ async fn release_udm_cleanup(binding: &context::PolicyBinding, entry: Option<&Re
 /// EASDF DNS context (#114), its EPS bearer identity at the AMF (#291), and the
 /// PDU_SES_REL event (#79). The UDM cleanup is [`release_udm_cleanup`]. Shared by
 /// every release path so none can skip one.
-async fn release_side_effects(sm_context_ref: &str, binding: &context::PolicyBinding) {
+async fn release_side_effects(
+    sm_context_ref: &str,
+    binding: &context::PolicyBinding,
+    announce: bool,
+) {
     // #114: a failure leaves an orphan the EASDF's own capacity cap bounds, whereas
     // failing the release would leave this SMF's session state inconsistent with
     // the AMF's.
@@ -6540,13 +6650,16 @@ async fn release_side_effects(sm_context_ref: &str, binding: &context::PolicyBin
         )
         .await;
     }
-    // #79: Nsmf_EventExposure_Notify for PDU_SES_REL (TS 29.508 §4.2.3.2).
-    event_exposure::notify(
-        event_exposure::event::PDU_SES_REL,
-        &binding.supi,
-        binding.psi,
-    )
-    .await;
+    // #79: Nsmf_EventExposure_Notify for PDU_SES_REL (TS 29.508 §4.2.3.2). Not for
+    // a create rolled back before it answered: that session was never established.
+    if announce {
+        event_exposure::notify(
+            event_exposure::event::PDU_SES_REL,
+            &binding.supi,
+            binding.psi,
+        )
+        .await;
+    }
     log::debug!("ref={sm_context_ref}: release side effects done");
 }
 
@@ -6825,6 +6938,7 @@ async fn run_gsm_timer_tick() {
                     &entry.supi,
                     entry.psi,
                     &entry.command,
+                    &sm_context_ref,
                 )
                 .await;
             }
@@ -6946,7 +7060,7 @@ async fn trigger_network_initiated_service_request(seid: u64, qfi: Option<u8>) {
         return;
     };
 
-    send_n1_n2_paging_request(&amf_uri, &supi, psi, qfi).await;
+    send_n1_n2_paging_request(&amf_uri, &supi, psi, qfi, &sm_context_ref).await;
 }
 
 /// Ask the AMF to page an idle UE for buffered downlink data (#78,
@@ -6956,7 +7070,16 @@ async fn trigger_network_initiated_service_request(seid: u64, qfi: Option<u8>) {
 /// point is to re-establish the user plane, not to deliver a NAS message. `skipInd`
 /// is deliberately absent: the AMF must NOT skip paging, which is the entire
 /// purpose of the request.
-async fn send_n1_n2_paging_request(amf_uri: &str, supi: &str, psi: u8, qfi: Option<u8>) {
+///
+/// `sm_context_ref` is the session the transfer is for: a retry after a 409 is
+/// sent only while that session still exists.
+async fn send_n1_n2_paging_request(
+    amf_uri: &str,
+    supi: &str,
+    psi: u8,
+    qfi: Option<u8>,
+    sm_context_ref: &str,
+) {
     use nextgcore_sbi::constants::content_type;
     use nextgcore_sbi::message::SbiRequest as SReq;
 
@@ -6988,7 +7111,7 @@ async fn send_n1_n2_paging_request(amf_uri: &str, supi: &str, psi: u8, qfi: Opti
     let config = nextgcore_sbi::security::sbi_peer_client_config(&host, port)
         .with_connect_timeout(std::time::Duration::from_secs(2))
         .with_request_timeout(std::time::Duration::from_secs(3));
-    match send_n1n2_honouring_paging_conflict(config, request).await {
+    match send_n1n2_honouring_paging_conflict(config, request, sm_context_ref.to_string()).await {
         Ok(resp) => log::info!(
             "N1N2MessageTransfer (paging, SUPI {supi}, PSI {psi}, QFI {qfi:?}) → \
              {host}:{port}: status={}",
@@ -7001,10 +7124,15 @@ async fn send_n1_n2_paging_request(amf_uri: &str, supi: &str, psi: u8, qfi: Opti
 /// How many times an N1N2MessageTransfer refused with 409
 /// `HIGHER_PRIORITY_REQUEST_ONGOING` is retried (#749).
 const N1N2_PAGING_CONFLICT_RETRIES: u32 = 5;
-/// The `retryAfter` assumed when the AMF's 409 names none, and the cap on one it
-/// names (seconds).
+/// The `retryAfter` assumed when the AMF's 409 names none (seconds).
 const N1N2_RETRY_AFTER_DEFAULT_S: u64 = 2;
-const N1N2_RETRY_AFTER_MAX_S: u64 = 10;
+/// The longest `retryAfter` the SMF waits out (seconds). TS 29.518 §5.2.2.3.1 has
+/// the consumer wait the full value ("shall not initiate the downlink messaging
+/// until the timer expires"), so a shorter wait is never substituted (#1079 review
+/// m2). It names no ceiling, though, and a transfer held longer than this is stale:
+/// the UE's paging (T3513) and the 5GSM procedure's own timers have run out. So a
+/// longer value is not waited out: the transfer is given up, and logged.
+const N1N2_RETRY_AFTER_MAX_S: u64 = 60;
 
 /// The `retryAfter` of an N1N2MessageTransfer 409 `HIGHER_PRIORITY_REQUEST_ONGOING`
 /// (TS 29.518 §5.2.2.3.1, `N1N2MessageTransferError.errInfo`), or `None` when the
@@ -7022,8 +7150,7 @@ fn n1n2_paging_conflict_retry_after(
         let secs = body
             .pointer("/errInfo/retryAfter")
             .and_then(|v| v.as_u64())
-            .unwrap_or(N1N2_RETRY_AFTER_DEFAULT_S)
-            .min(N1N2_RETRY_AFTER_MAX_S);
+            .unwrap_or(N1N2_RETRY_AFTER_DEFAULT_S);
         std::time::Duration::from_secs(secs)
     })
 }
@@ -7043,40 +7170,92 @@ fn n1n2_paging_conflict_retry_after(
 async fn send_n1n2_honouring_paging_conflict(
     config: nextgcore_sbi::client::SbiClientConfig,
     request: nextgcore_sbi::message::SbiRequest,
+    sm_context_ref: String,
 ) -> nextgcore_sbi::SbiResult<nextgcore_sbi::message::SbiResponse> {
     let resp = nextgcore_sbi::client::SbiClient::new(config.clone())
         .send_request(request.clone())
         .await?;
     if let Some(wait) = n1n2_paging_conflict_retry_after(&resp) {
-        tokio::spawn(async move {
-            let client = nextgcore_sbi::client::SbiClient::new(config);
-            let mut wait = wait;
-            for attempt in 1..=N1N2_PAGING_CONFLICT_RETRIES {
-                log::info!(
-                    "N1N2MessageTransfer refused, the AMF is paging the UE for another \
-                     transfer; retrying in {wait:?} ({attempt}/{N1N2_PAGING_CONFLICT_RETRIES})"
-                );
-                tokio::time::sleep(wait).await;
-                match client.send_request(request.clone()).await {
-                    Ok(resp) => match n1n2_paging_conflict_retry_after(&resp) {
-                        Some(next) => wait = next,
-                        None => {
-                            log::info!("N1N2MessageTransfer retried: status={}", resp.status);
-                            return;
-                        }
-                    },
-                    Err(e) => {
-                        log::warn!("N1N2MessageTransfer retry failed: {e}");
-                        return;
-                    }
-                }
-            }
-            log::warn!(
-                "N1N2MessageTransfer still refused after {N1N2_PAGING_CONFLICT_RETRIES} retries"
-            );
-        });
+        tokio::spawn(retry_n1n2_after_paging_conflict(
+            config,
+            request,
+            sm_context_ref,
+            wait,
+        ));
     }
     Ok(resp)
+}
+
+/// How a refused N1N2MessageTransfer's retries ended (#749), for the log and the
+/// tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum N1n2RetryEnd {
+    /// The AMF took it (any answer but the 409), with this status.
+    Sent(u16),
+    /// The session was released before the resend (#1079 review m1).
+    SessionGone,
+    /// The AMF asked for a longer wait than [`N1N2_RETRY_AFTER_MAX_S`] (m2).
+    WaitTooLong(std::time::Duration),
+    /// Still refused after [`N1N2_PAGING_CONFLICT_RETRIES`] retries.
+    Exhausted,
+    /// A resend failed in transport.
+    Failed,
+}
+
+/// Resend a transfer the AMF refused with 409 `HIGHER_PRIORITY_REQUEST_ONGOING`
+/// after each `retryAfter` it names, in full (TS 29.518 §5.2.2.3.1), a bounded
+/// number of times. Each resend first checks that the session `sm_context_ref`
+/// still exists: a released session's transfer is moot, and resending it would
+/// page the UE for nothing (#1079 review m1).
+async fn retry_n1n2_after_paging_conflict(
+    config: nextgcore_sbi::client::SbiClientConfig,
+    request: nextgcore_sbi::message::SbiRequest,
+    sm_context_ref: String,
+    first_wait: std::time::Duration,
+) -> N1n2RetryEnd {
+    let client = nextgcore_sbi::client::SbiClient::new(config);
+    let mut wait = first_wait;
+    for attempt in 1..=N1N2_PAGING_CONFLICT_RETRIES {
+        if wait > std::time::Duration::from_secs(N1N2_RETRY_AFTER_MAX_S) {
+            log::warn!(
+                "N1N2MessageTransfer for ref={sm_context_ref} refused with a retryAfter of \
+                 {wait:?}, past the {N1N2_RETRY_AFTER_MAX_S} s the SMF holds a transfer; \
+                 given up"
+            );
+            return N1n2RetryEnd::WaitTooLong(wait);
+        }
+        log::info!(
+            "N1N2MessageTransfer refused, the AMF is paging the UE for another transfer; \
+             retrying in {wait:?} ({attempt}/{N1N2_PAGING_CONFLICT_RETRIES})"
+        );
+        tokio::time::sleep(wait).await;
+        let held = smf_self()
+            .read()
+            .ok()
+            .is_some_and(|c| c.sess_find_by_sm_context_ref(&sm_context_ref).is_some());
+        if !held {
+            log::info!(
+                "N1N2MessageTransfer for ref={sm_context_ref} not resent: the session was \
+                 released meanwhile"
+            );
+            return N1n2RetryEnd::SessionGone;
+        }
+        match client.send_request(request.clone()).await {
+            Ok(resp) => match n1n2_paging_conflict_retry_after(&resp) {
+                Some(next) => wait = next,
+                None => {
+                    log::info!("N1N2MessageTransfer retried: status={}", resp.status);
+                    return N1n2RetryEnd::Sent(resp.status);
+                }
+            },
+            Err(e) => {
+                log::warn!("N1N2MessageTransfer retry failed: {e}");
+                return N1n2RetryEnd::Failed;
+            }
+        }
+    }
+    log::warn!("N1N2MessageTransfer still refused after {N1N2_PAGING_CONFLICT_RETRIES} retries");
+    N1n2RetryEnd::Exhausted
 }
 
 /// The N4 receive/dispatch loop over the one PFCP socket.
@@ -7112,7 +7291,8 @@ fn spawn_pfcp_listener(
                         pfcp_path::N4Admission::Peer(i) => {
                             let client = &clients[i];
                             if !client.on_datagram(&pkt, peer).await {
-                                handle_pfcp_incoming(&socket, &pkt, peer).await;
+                                handle_pfcp_incoming(&socket, &pkt, peer, Some(client.as_ref()))
+                                    .await;
                             }
                         }
                         pfcp_path::N4Admission::AnswerHeartbeat => {
@@ -7297,7 +7477,7 @@ fn refuse_create_while_shutting_down(shutting_down: bool) -> Option<SbiResponse>
 async fn shutdown_epc_pdn_connections(deadline: tokio::time::Instant) -> (usize, usize) {
     shutdown_epc_pdn_connections_via(
         gtp_path::s5s8_server().map(|s| s.as_ref()),
-        gtp_path::GTPC_PORT,
+        gtp_path::sgw_port(),
         deadline,
     )
     .await
@@ -7382,6 +7562,13 @@ async fn shutdown_epc_pdn_connections_via(
         }
     }
     if out_of_time {
+        // #941 review MINOR 1: count what finished, also when the deadline fired in
+        // the permit wait and the join loop never ran.
+        while let Some(done) = deletions.try_join_next() {
+            if matches!(done, Ok(true)) {
+                deleted += 1;
+            }
+        }
         deletions.abort_all();
         log::warn!(
             "Shutdown: out of time with {deleted}/{total} EPC PFCP session(s) deleted at the \
@@ -7392,7 +7579,8 @@ async fn shutdown_epc_pdn_connections_via(
 }
 
 /// The whole graceful shutdown's budget, from the signal (#941 review M2): inside the
-/// shipped 45 s termination grace period, with 2 s for the SBI stop and the exit.
+/// shipped 45 s termination grace period, leaving 2 s for the process exit. Every
+/// phase, the SBI server's stop included, is bounded by it (#941 review MINOR 2).
 /// `SMF_SHUTDOWN_BUDGET_SECS` overrides it for a deployment with another grace
 /// period; keep it a little under that.
 const SHUTDOWN_BUDGET_DEFAULT: std::time::Duration = std::time::Duration::from_secs(43);
@@ -7477,7 +7665,13 @@ async fn drain_s5s8_requests(server: Option<&gtp_path::S5S8Server>, budget: std:
 /// context create — the SMF has no other address for it, and an AMF that supplied
 /// no callback URI cannot be reached, so the transfer is skipped with a warning
 /// rather than guessed at.
-async fn send_n1_n2_message_transfer(amf_uri: Option<&str>, supi: &str, psi: u8, n1: &[u8]) {
+async fn send_n1_n2_message_transfer(
+    amf_uri: Option<&str>,
+    supi: &str,
+    psi: u8,
+    n1: &[u8],
+    sm_context_ref: &str,
+) {
     use nextgcore_sbi::constants::content_type;
     use nextgcore_sbi::message::{SbiPart, SbiRequest as SReq};
 
@@ -7511,7 +7705,7 @@ async fn send_n1_n2_message_transfer(amf_uri: Option<&str>, supi: &str, psi: u8,
     let config = nextgcore_sbi::security::sbi_peer_client_config(&host, port)
         .with_connect_timeout(std::time::Duration::from_secs(2))
         .with_request_timeout(std::time::Duration::from_secs(3));
-    match send_n1n2_honouring_paging_conflict(config, request).await {
+    match send_n1n2_honouring_paging_conflict(config, request, sm_context_ref.to_string()).await {
         Ok(resp) => log::info!(
             "N1N2MessageTransfer (SUPI {supi}, PSI {psi}, {} bytes) → {host}:{port}: status={}",
             n1.len(),
@@ -8072,7 +8266,7 @@ async fn handle_sm_context_release(
             release_nsac_admission(binding, entry),
             release_udm_cleanup(binding, entry),
         );
-        release_side_effects(sm_context_ref, binding).await;
+        release_side_effects(sm_context_ref, binding, true).await;
     }
 
     SbiResponse::with_status(204)
@@ -9392,6 +9586,276 @@ mod tests {
         );
     }
 
+    /// #1091 review A (#941 MINOR 6): the RELEASING shutdown deletes an EPC PDN
+    /// connection toward its SGW (Delete Bearer Request) before the bounded #39
+    /// fan-out, with a blackholed AMF holding 20 releases; the session goes, every 5G
+    /// session is flushed, and the Association Release still reaches the UPF.
+    #[tokio::test]
+    async fn a_releasing_shutdown_tells_the_sgw_with_a_blackholed_amf() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let blackhole = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let amf_port = blackhole.local_addr().unwrap().port();
+        let held = tokio::spawn(async move {
+            let mut conns = Vec::new();
+            while let Ok((c, _)) = blackhole.accept().await {
+                conns.push(c);
+            }
+        });
+        let (upf, seen, upf_task) = raw_upf(None).await;
+        let (client, listener) = client_behind_the_real_listener(upf).await;
+        // Process-wide, once; nothing else in the suite installs it (S5S8_SERVER).
+        gtp_path::s5s8_open(Some("127.0.0.1:0".parse().unwrap()), 1)
+            .await
+            .expect("S5/S8");
+        let sgw = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        gtp_path::set_sgw_port_for_test(Some(sgw.local_addr().unwrap().port()));
+        let refs: Vec<String> = (0..20).map(|i| format!("{}", 109_100 + i)).collect();
+        let mut epc = None;
+        if let Ok(ctx) = smf_self().read() {
+            for sess in ctx.sess_find_all_by(|s| s.epc) {
+                ctx.sess_remove(sess.id);
+            }
+            for (i, r) in refs.iter().enumerate() {
+                ctx.pfcp_sessions
+                    .write()
+                    .unwrap()
+                    .insert(r.clone(), 0x1091 + i as u64);
+                let mut b = context::PolicyBinding::snapshot_default();
+                b.supi = format!("imsi-0010100001091{i:02}");
+                b.psi = 5;
+                b.sm_context_status_uri = Some(format!("http://127.0.0.1:{amf_port}/sm-status"));
+                ctx.policy_bindings.write().unwrap().insert(r.clone(), b);
+                pfcp_path::record_session_peer(context::derive_cp_n4_seid(r), client.peer());
+            }
+            let ue = ctx.ue_add_by_imsi(b"001010000109199").expect("ue");
+            let sess = ctx.sess_add_by_apn(ue.id, "internet", 6).expect("sess");
+            ctx.bearer_add(sess.id).expect("default bearer");
+            let mut sess = ctx.sess_find_by_seid(sess.smf_n4_seid).expect("sess");
+            sess.upf_n4_seid = 0x0001_091a;
+            sess.sgw_s5c_teid = 0x1091_0000;
+            sess.sgw_s5c_ip.ipv4 = Some(std::net::Ipv4Addr::LOCALHOST);
+            ctx.sess_update(&sess);
+            pfcp_path::record_session_peer(sess.smf_n4_seid, client.peer());
+            epc = Some((ue.id, sess.id, sess.smf_n4_seid));
+        }
+        let (ue_id, epc_id, epc_seid) = epc.expect("EPC session");
+        let sgw_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            match tokio::time::timeout(std::time::Duration::from_secs(20), sgw.recv_from(&mut buf))
+                .await
+            {
+                Ok(Ok((len, _))) if len > 1 => Some(buf[1]),
+                _ => None,
+            }
+        });
+        let deadline = tokio::time::Instant::now()
+            + SHUTDOWN_ASSOCIATION_RELEASE
+            + SHUTDOWN_GTP_DRAIN
+            + std::time::Duration::from_millis(500);
+
+        graceful_shutdown(
+            async {},
+            std::slice::from_ref(&client),
+            true,
+            listener,
+            deadline,
+        )
+        .await;
+        let heard = sgw_task.await.unwrap();
+        let epc_removed = smf_self().read().unwrap().sess_find_by_id(epc_id).is_none();
+        let released = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(ty, _)| *ty == pfcp_path::pfcp_message_type::ASSOCIATION_RELEASE_REQUEST)
+            .count();
+        let flushed = refs.iter().all(|r| {
+            !smf_self()
+                .read()
+                .unwrap()
+                .pfcp_sessions
+                .read()
+                .unwrap()
+                .contains_key(r)
+        });
+        for r in &refs {
+            cancel_gsm_timer(r, timer::SmfTimerId::T3592);
+            pfcp_path::forget_session_peer(context::derive_cp_n4_seid(r));
+            if let Ok(ctx) = smf_self().read() {
+                ctx.policy_bindings.write().unwrap().remove(r);
+            }
+        }
+        gtp_path::set_sgw_port_for_test(None);
+        pfcp_path::forget_session_peer(epc_seid);
+        if let Ok(ctx) = smf_self().read() {
+            ctx.sess_remove(epc_id);
+            ctx.ue_remove(ue_id);
+        }
+        held.abort();
+        upf_task.abort();
+        pfcp_path::clear_global_upf_for_test();
+
+        assert_eq!(
+            heard,
+            Some(gtp_build::gtp2_message_type::DELETE_BEARER_REQUEST),
+            "the SGW is sent a Delete Bearer Request"
+        );
+        assert!(epc_removed, "the EPC PDN connection is removed");
+        assert_eq!(released, 1, "the Association Release still reached the UPF");
+        assert!(flushed, "every 5G session flushed");
+    }
+
+    /// #1091 review C (#941 MINOR 1, the #39 side): the release count is exact when
+    /// the deadline fires while the fan-out waits for a permit. Of 40 releases the
+    /// AMF answers the first 16 at once and holds the rest, so the next 16 hold every
+    /// permit when the deadline fires; the 16 that finished are counted.
+    #[tokio::test]
+    async fn the_unrecoverable_release_counts_what_was_sent_when_out_of_time() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let answered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n = answered.clone();
+        let (amf, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |_req: SbiRequest| {
+                let n = n.clone();
+                async move {
+                    if n.fetch_add(1, Ordering::SeqCst) >= 16 {
+                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    }
+                    SbiResponse::with_status(202)
+                }
+            })
+            .await;
+        let uri = format!("http://127.0.0.1:{}/sm-status", addr.port());
+        let refs: Vec<String> = (0..40).map(|i| format!("{}", 109_200 + i)).collect();
+        if let Ok(ctx) = smf_self().read() {
+            for (i, r) in refs.iter().enumerate() {
+                let mut b = context::PolicyBinding::snapshot_default();
+                b.supi = format!("imsi-0010100001092{i:02}");
+                b.psi = 5;
+                b.sm_context_status_uri = Some(uri.clone());
+                ctx.policy_bindings.write().unwrap().insert(r.clone(), b);
+            }
+        }
+        let notifiable = refs.iter().map(|r| (r.clone(), uri.clone())).collect();
+
+        let sent = restoration::unrecoverable_fan_out(
+            notifiable,
+            "test".to_string(),
+            Some(tokio::time::Instant::now() + std::time::Duration::from_millis(1500)),
+        )
+        .await;
+        for r in &refs {
+            cancel_gsm_timer(r, timer::SmfTimerId::T3592);
+            if let Ok(ctx) = smf_self().read() {
+                ctx.policy_bindings.write().unwrap().remove(r);
+            }
+        }
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), amf.stop()).await;
+
+        assert_eq!(sent, 16, "the finished releases are counted");
+    }
+
+    /// #1091 review D (#912 r1, n4): a create that fails after its N4 session and
+    /// binding exist (the N2 encode-failure path) is released like a UE-requested
+    /// release: N4 session deleted, SM policy deleted, the address freed once, and no
+    /// PDU_SES_REL announced for a session that never was.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_late_create_failure_releases_the_session_without_announcing_it() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _g = event_exposure::lock_store();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        event_exposure::clear_for_test();
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        smf_context_init(64, 256, 512);
+        let (pcf, pcf_seen) = spawn_recording_pcf(Err(204)).await;
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = events.clone();
+        let (consumer, consumer_addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock().unwrap().push(req.header.uri.clone());
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await;
+        let supi = "imsi-001010000010914";
+        let resp = smf_sbi_request_handler(events_request(
+            "POST",
+            "/nsmf-event-exposure/v1/subscriptions",
+            Some(subscription_body(
+                &format!("http://127.0.0.1:{}/nsmf-events", consumer_addr.port()),
+                Some(supi),
+            )),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+        let ip = std::net::Ipv4Addr::new(10, 45, 9, 31);
+        let reference = seed_established_session(supi, 14, ip);
+        if let Ok(ctx) = smf_self().read() {
+            ctx.policy_bindings
+                .write()
+                .unwrap()
+                .get_mut(&reference)
+                .unwrap()
+                .sm_policy_id = Some("pol-1091d".to_string());
+        }
+        let stale_before = smf_self().read().unwrap().ipv4_pool.stale_releases();
+
+        rollback_established_create(&reference).await;
+        side_effects_settled().await;
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !pcf_seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(u, _)| u.contains("pol-1091d/delete"))
+            && std::time::Instant::now() < until
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // Room for a PDU_SES_REL notification to arrive, if one were sent.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let policy_deleted = pcf_seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(u, _)| u.contains("pol-1091d/delete"));
+        let n4_deleted = upf
+            .seen()
+            .contains(&pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST);
+        let gone = lookup_policy_binding(&reference).is_none();
+        let (freed, stale_after) = {
+            let ctx = smf_self();
+            let ctx = ctx.read().unwrap();
+            let freed = ctx.ipv4_pool.reserve(ip);
+            ctx.ipv4_pool.release(ip);
+            (freed, ctx.ipv4_pool.stale_releases())
+        };
+        let announced = events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|u| u.contains("/nsmf-events"));
+        std::env::remove_var("PCF_URI");
+        pcf.stop().await.ok();
+        consumer.stop().await.ok();
+        event_exposure::clear_for_test();
+
+        assert!(n4_deleted, "the N4 session is deleted");
+        assert!(policy_deleted, "the SM policy is deleted");
+        assert!(gone, "the context is gone");
+        assert!(freed, "the address is freed");
+        assert_eq!(stale_after, stale_before, "once");
+        assert!(!announced, "no PDU_SES_REL for a session that never was");
+    }
+
     /// #941 review M2: an NRF that never answers holds NFDeregister only for its share
     /// of the deadline; the Association Release still goes out within it.
     #[tokio::test]
@@ -9402,14 +9866,19 @@ mod tests {
         let (client, listener) = client_behind_the_real_listener(upf).await;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1500);
         let started = std::time::Instant::now();
-        graceful_shutdown(
-            std::future::pending::<()>(),
-            std::slice::from_ref(&client),
-            true,
-            listener,
-            deadline,
+        // #941 review MINOR 3: a regression fails the test instead of hanging it.
+        let bounded = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            graceful_shutdown(
+                std::future::pending::<()>(),
+                std::slice::from_ref(&client),
+                true,
+                listener,
+                deadline,
+            ),
         )
         .await;
+        assert!(bounded.is_ok(), "the shutdown never returned");
         let took = started.elapsed();
         let released = seen
             .lock()
@@ -9754,6 +10223,9 @@ mod tests {
     /// most once per interval, not once per datagram.
     #[test]
     fn refused_datagrams_are_counted_each_and_logged_in_summary() {
+        // #974 review n3: the counter and the WARN interval are process-global, and
+        // a sibling asserts an exact counter delta under this lock.
+        let _n4 = pfcp_path::N4_TEST_LOCK.blocking_lock();
         let from: std::net::SocketAddr = "10.0.0.99:8805".parse().unwrap();
         let before = pfcp_path::PFCP_UNAUTHORIZED.load(Ordering::SeqCst);
         let warned = (0..1000)
@@ -9825,9 +10297,17 @@ mod tests {
             0x974,
             &[0, 96, 0, 4, 0, 0, 0x27, 0x0f],
         );
+        let before = pfcp_path::PFCP_UNAUTHORIZED.load(Ordering::SeqCst);
+        // #974 review n1: the gate itself, not only #928's second layer behind it.
+        let admitted = pfcp_path::admit_n4(
+            pfcp_path::pfcp_message_type::HEARTBEAT_REQUEST,
+            stranger.local_addr().unwrap(),
+            &[client.n4_peer()],
+        );
         stranger.send_to(&hb, smf).await.unwrap();
         let answer = recv_pfcp(&stranger).await;
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let counted = pfcp_path::PFCP_UNAUTHORIZED.load(Ordering::SeqCst) - before;
         let associated = client.is_associated().await;
         let stamp = client.peer_recovery_time_stamp_for_test().await;
         let kept = n4_gate_session_kept();
@@ -9846,6 +10326,68 @@ mod tests {
         assert!(associated, "UPF A is still associated");
         assert_eq!(stamp, Some(100), "A's stored stamp is untouched");
         assert!(kept, "A's session is kept");
+        assert_eq!(admitted, pfcp_path::N4Admission::AnswerHeartbeat);
+        assert_eq!(counted, 0, "a heartbeat is answered, not counted");
+    }
+
+    /// #974 review n2: two pool entries on one host are told apart by the client the
+    /// listener admitted the datagram as, not by IP: B, from its exact endpoint,
+    /// cannot report on A's session.
+    #[tokio::test]
+    async fn a_twin_on_the_same_host_cannot_report_on_its_siblings_session() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        smf_context_init(64, 256, 512);
+        let upf_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upf_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sock = std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let smf = sock.local_addr().unwrap();
+        let a = std::sync::Arc::new(pfcp_path::PfcpClient::new(
+            sock.clone(),
+            upf_a.local_addr().unwrap(),
+            [127, 0, 0, 1],
+        ));
+        let b = std::sync::Arc::new(pfcp_path::PfcpClient::new(
+            sock.clone(),
+            upf_b.local_addr().unwrap(),
+            [127, 0, 0, 1],
+        ));
+        pfcp_path::set_global_pool(vec![a.clone(), b.clone()]);
+        let listener = spawn_pfcp_listener(sock, vec![a.clone(), b.clone()]);
+        let reference = "9740104";
+        smf_self()
+            .read()
+            .unwrap()
+            .pfcp_sessions
+            .write()
+            .unwrap()
+            .insert(reference.to_string(), 0x0978);
+        let seid = crate::context::derive_cp_n4_seid(reference);
+        pfcp_path::record_session_peer(seid, a.peer());
+
+        upf_b
+            .send_to(&session_report(seid, 0x97a), smf)
+            .await
+            .unwrap();
+        let from_b = recv_pfcp(&upf_b).await;
+        upf_a
+            .send_to(&session_report(seid, 0x97b), smf)
+            .await
+            .unwrap();
+        let from_a = recv_pfcp(&upf_a).await;
+        pfcp_path::forget_session_peer(seid);
+        smf_self()
+            .read()
+            .unwrap()
+            .pfcp_sessions
+            .write()
+            .unwrap()
+            .remove(reference);
+        listener.abort();
+        pfcp_path::clear_global_upf_for_test();
+
+        assert_eq!(pfcp_cause_of(&from_b.expect("B answered")), Some(65));
+        assert_eq!(pfcp_cause_of(&from_a.expect("A answered")), Some(1));
     }
 
     /// #1031: a session restored from durable state onto UPF B, the non-default
@@ -9955,8 +10497,11 @@ mod tests {
             "127.0.0.5:8805".parse().unwrap(),
             [127, 0, 0, 1],
         ));
+        let installed = pfcp_path::global_pool();
         pfcp_path::set_global_pool(vec![other, upf.client.clone()]);
         let routed = pfcp_path::client_for_session(seid).map(|c| c.peer());
+        // #1059 review: the stand-in's pool goes back for the tests after this one.
+        pfcp_path::set_global_pool(installed);
         let _ = take_sm_context(&reference);
         let forgotten = !smf_self()
             .read()
@@ -10574,6 +11119,8 @@ mod tests {
     /// for them when there is time.
     #[tokio::test]
     async fn the_restart_fanout_drain_is_bounded() {
+        // #928 review m4: the tracked fan-outs are a process-global.
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
         let slow = tokio::spawn(async {
             tokio::time::sleep(Duration::from_millis(600)).await;
         });
@@ -10718,6 +11265,80 @@ mod tests {
         );
         assert_eq!(in_flight, 0, "A's release was still in flight then");
         assert_eq!(released, 1, "and A's session is released (#39) after all");
+    }
+
+    /// #941 review MINOR 1: the EPC deletion count is exact when the deadline fires
+    /// while the fan-out waits for a permit. Of 40 EPC sessions the PGW-U answers the
+    /// first 16 deletions and none after, so the next 16 hold every permit when the
+    /// deadline fires; the 16 that were answered are counted. Before, the join loop
+    /// that counted them never ran, and the count was 0.
+    #[tokio::test]
+    async fn the_epc_shutdown_counts_what_was_deleted_when_out_of_time() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        smf_context_init(64, 256, 512);
+        let upf = std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let upf_addr = upf.local_addr().unwrap();
+        let u = upf.clone();
+        let upf_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let mut answered = 0;
+            while let Ok((len, from)) = u.recv_from(&mut buf).await {
+                let Some(h) = pfcp_path::parse_wire_header(&buf[..len]) else {
+                    continue;
+                };
+                if h.msg_type == pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST
+                    && answered < 16
+                {
+                    answered += 1;
+                    let reply = pfcp_path::encode_wire_message(
+                        pfcp_path::pfcp_message_type::SESSION_DELETION_RESPONSE,
+                        Some(h.seid),
+                        h.sequence_number,
+                        &[0, 19, 0, 1, 1],
+                    );
+                    let _ = u.send_to(&reply, from).await;
+                }
+            }
+        });
+        let (client, listener) = client_behind_the_real_listener(upf_addr).await;
+        let mut ids = Vec::new();
+        if let Ok(ctx) = smf_self().read() {
+            for sess in ctx.sess_find_all_by(|s| s.epc) {
+                ctx.sess_remove(sess.id);
+            }
+            for i in 0..40u64 {
+                let imsi = format!("0010100000941{i:02}");
+                let ue = ctx.ue_add_by_imsi(imsi.as_bytes()).expect("ue");
+                let sess = ctx.sess_add_by_apn(ue.id, "internet", 6).expect("sess");
+                let mut sess = ctx.sess_find_by_seid(sess.smf_n4_seid).expect("sess");
+                sess.upf_n4_seid = 0x9410 + i;
+                ctx.sess_update(&sess);
+                pfcp_path::record_session_peer(sess.smf_n4_seid, client.peer());
+                ids.push(sess.id);
+            }
+        }
+
+        let (deleted, told) = shutdown_epc_pdn_connections_via(
+            None,
+            0,
+            tokio::time::Instant::now() + std::time::Duration::from_millis(1500),
+        )
+        .await;
+        listener.abort();
+        upf_task.abort();
+        if let Ok(ctx) = smf_self().read() {
+            for id in &ids {
+                if let Some(sess) = ctx.sess_find_by_id(*id) {
+                    pfcp_path::forget_session_peer(sess.smf_n4_seid);
+                    ctx.sess_remove(*id);
+                }
+            }
+        }
+        pfcp_path::clear_global_upf_for_test();
+
+        assert_eq!(told, 0);
+        assert_eq!(deleted, 16, "the answered deletions are counted");
     }
 
     /// #718 review M4: a shutdown that keeps the N4 association for durable state
@@ -12145,9 +12766,11 @@ mod tests {
             "error": { "cause": "HIGHER_PRIORITY_REQUEST_ONGOING" },
             "errInfo": { "retryAfter": 3600 },
         });
+        // #1079 review m2: the value is taken in full, never capped to a shorter
+        // wait; whether it is waited out is the retry loop's decision.
         assert_eq!(
             n1n2_paging_conflict_retry_after(&refusal(409, huge)),
-            Some(std::time::Duration::from_secs(N1N2_RETRY_AFTER_MAX_S))
+            Some(std::time::Duration::from_secs(3600))
         );
         let other = serde_json::json!({
             "error": { "cause": "TEMPORARY_REJECT_HANDOVER_ONGOING" },
@@ -12165,6 +12788,7 @@ mod tests {
     #[tokio::test]
     async fn a_paging_request_refused_while_the_amf_pages_is_retried() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let sm_ref = held_session_for_retry("imsi-001010007490031", 1);
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -12200,6 +12824,7 @@ mod tests {
             "imsi-001010007490031",
             1,
             None,
+            &sm_ref,
         )
         .await;
         // #1079 review: the caller (the N4 loop) is not held for the retry.
@@ -12216,6 +12841,148 @@ mod tests {
             2,
             "refused once, sent again off the caller's task"
         );
+        drop_session_for_retry(&sm_ref);
+    }
+
+    /// A session held at the SMF for the #749 retry tests; returns its SM context ref.
+    fn held_session_for_retry(supi: &str, psi: u8) -> String {
+        smf_context_init(64, 256, 512);
+        let ctx = smf_self();
+        let context = ctx.read().expect("context");
+        let ue = context.ue_add_by_supi(supi).expect("ue");
+        context
+            .sess_add_by_psi(ue.id, psi)
+            .and_then(|s| s.sm_context_ref)
+            .expect("session")
+    }
+
+    fn drop_session_for_retry(sm_ref: &str) {
+        let ctx = smf_self();
+        let context = ctx.read().expect("context");
+        if let Some(sess) = context.sess_find_by_sm_context_ref(sm_ref) {
+            context.sess_remove(sess.id);
+            // The UE goes too: the context holds a bounded number of UEs, which
+            // other tests share.
+            context.ue_remove(sess.smf_ue_id);
+        }
+    }
+
+    /// A stand-in AMF that refuses every N1N2MessageTransfer with 409
+    /// `HIGHER_PRIORITY_REQUEST_ONGOING` and `retryAfter` = `retry_after` s, counting
+    /// the requests.
+    async fn always_paging_amf(
+        retry_after: u64,
+    ) -> (
+        nextgcore_sbi::server::SbiServer,
+        u16,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&seen);
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        server
+            .start(move |_req: SbiRequest| {
+                let seen = Arc::clone(&counter);
+                async move {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    SbiResponse::with_status(409)
+                        .with_json_body(&serde_json::json!({
+                            "error": { "status": 409, "cause": "HIGHER_PRIORITY_REQUEST_ONGOING" },
+                            "errInfo": { "retryAfter": retry_after },
+                        }))
+                        .unwrap()
+                }
+            })
+            .await
+            .expect("stand-in AMF starts");
+        (server, addr.port(), seen)
+    }
+
+    fn n1n2_request_to(port: u16) -> (nextgcore_sbi::client::SbiClientConfig, SbiRequest) {
+        let config = nextgcore_sbi::security::sbi_peer_client_config("127.0.0.1", port)
+            .with_connect_timeout(std::time::Duration::from_secs(2))
+            .with_request_timeout(std::time::Duration::from_secs(3));
+        let request =
+            SbiRequest::post("/namf-comm/v1/ue-contexts/imsi-001010007490041/n1-n2-messages")
+                .with_body("{}".to_string(), "application/json");
+        (config, request)
+    }
+
+    /// #1079 review m1: a refused transfer is not resent once its session is
+    /// released. The retry re-checks the session before each resend.
+    #[tokio::test]
+    async fn a_refused_transfer_is_not_resent_after_its_session_is_released() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let sm_ref = held_session_for_retry("imsi-001010007490041", 1);
+        let (_amf, port, seen) = always_paging_amf(1).await;
+        let (config, request) = n1n2_request_to(port);
+        let retry = tokio::spawn(retry_n1n2_after_paging_conflict(
+            config,
+            request,
+            sm_ref.clone(),
+            std::time::Duration::from_secs(1),
+        ));
+        drop_session_for_retry(&sm_ref);
+        let end = tokio::time::timeout(std::time::Duration::from_secs(3), retry)
+            .await
+            .expect("the retry ends")
+            .expect("joined");
+        assert_eq!(end, N1n2RetryEnd::SessionGone);
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "nothing is resent for a released session"
+        );
+    }
+
+    /// #1079 review m2: a `retryAfter` past [`N1N2_RETRY_AFTER_MAX_S`] is not
+    /// shortened into an early resend (TS 29.518 §5.2.2.3.1): the transfer is given
+    /// up at once, and nothing is resent. One within it is waited out in full.
+    #[tokio::test]
+    async fn a_retry_after_past_the_maximum_is_given_up_not_shortened() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let sm_ref = held_session_for_retry("imsi-001010007490051", 1);
+        let (_amf, port, seen) = always_paging_amf(N1N2_RETRY_AFTER_MAX_S + 1).await;
+        let (config, request) = n1n2_request_to(port);
+        let end = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            retry_n1n2_after_paging_conflict(
+                config.clone(),
+                request.clone(),
+                sm_ref.clone(),
+                std::time::Duration::from_secs(N1N2_RETRY_AFTER_MAX_S + 1),
+            ),
+        )
+        .await
+        .expect("given up at once, not waited out or shortened");
+        assert_eq!(
+            end,
+            N1n2RetryEnd::WaitTooLong(std::time::Duration::from_secs(N1N2_RETRY_AFTER_MAX_S + 1))
+        );
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // Within the maximum: the resend comes only after the full retryAfter, and
+        // the AMF's next 409 (past the maximum) ends it.
+        let started = std::time::Instant::now();
+        let end = retry_n1n2_after_paging_conflict(
+            config,
+            request,
+            sm_ref.clone(),
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+        assert!(started.elapsed() >= std::time::Duration::from_secs(2));
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            end,
+            N1n2RetryEnd::WaitTooLong(std::time::Duration::from_secs(N1N2_RETRY_AFTER_MAX_S + 1))
+        );
+        drop_session_for_retry(&sm_ref);
     }
 
     #[tokio::test]
@@ -14475,8 +15242,12 @@ mod tests {
             .unwrap()
             .id;
         let before = smf_self().read().unwrap().ipv4_pool.allocated_addrs().len();
+        let stale = smf_self().read().unwrap().ipv4_pool.stale_releases();
 
         rollback_sm_context_create(&reference, Some(sess_id), held.octets());
+        // #912 review r2: a second free of the same address is counted, so the
+        // double free this test is named for is visible within one call.
+        let double_freed = smf_self().read().unwrap().ipv4_pool.stale_releases() - stale;
 
         let ctx = smf_self();
         let ctx = ctx.read().unwrap();
@@ -14491,6 +15262,7 @@ mod tests {
         assert!(!binding_left, "the inserted binding is removed");
         assert!(!sess_left, "the session is removed");
         assert_eq!(after + 1, before, "the address is freed once");
+        assert_eq!(double_freed, 0, "and not freed a second time");
         assert!(free_again);
     }
 
@@ -15026,6 +15798,41 @@ mod tests {
 
         assert_eq!(sent, vec!["DEC"], "sent");
         assert_eq!(accepted, 0, "but refused, so not counted out");
+    }
+
+    /// #912 r1 meets #1072: a create that fails at the N2 encode, after its binding
+    /// recorded the NSAC admission, is released by `rollback_established_create`,
+    /// which counts the session out; nothing else does. INC, then one DEC.
+    #[tokio::test]
+    async fn a_create_failing_at_the_n2_encode_counts_out_once() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let zero = std::time::Duration::ZERO;
+        let (nsacf, seen) = recording_nsacf(204, 204, zero, zero).await;
+        let supi = "imsi-001010000010727";
+        N2_SETUP_FAILS_FOR_TEST.store(true, Ordering::SeqCst);
+        let status = handle_sm_context_create(&create_request(
+            supi,
+            14,
+            &n1(
+                14,
+                1,
+                gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+                &[0x91, 0x00],
+            ),
+        ))
+        .await
+        .status;
+        N2_SETUP_FAILS_FOR_TEST.store(false, Ordering::SeqCst);
+        side_effects_settled().await;
+        let order = nsac_order(&seen, supi);
+        std::env::remove_var("NSACF_URI");
+        nsacf.stop().await.ok();
+
+        assert_eq!(status, 500);
+        assert_eq!(order, vec!["INC", "DEC"], "counted out once");
     }
 
     /// #1072 review M3: a DECREASE the NSACF refuses is logged and counted.
@@ -15827,6 +16634,101 @@ mod tests {
         assert!(
             n1n2[0].contains("n1MessageContainer"),
             "the #39 release only"
+        );
+    }
+
+    /// #912 review r1: a create that supersedes a pending release's UECM DELETE and
+    /// then fails (here its PCF is unreachable) removes the UDM records itself: the
+    /// serving-SMF registration for the PSI, and the SDM subscription it created.
+    /// Before, both stayed at the UDM.
+    #[tokio::test]
+    async fn a_create_that_fails_after_a_supersede_removes_its_udm_records() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        type Seen = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
+        let seen: Seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let (udm_srv, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let sink = sink.clone();
+                async move {
+                    if req.header.method == "DELETE" {
+                        // The old release's unsubscribe is still on the wire when the
+                        // create looks: its UECM DELETE is Pending, so superseded.
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    }
+                    sink.lock()
+                        .unwrap()
+                        .push((req.header.method.clone(), req.header.uri.clone()));
+                    if req.header.method == "DELETE" {
+                        return SbiResponse::with_status(204);
+                    }
+                    if req.header.uri.contains("/sdm-subscriptions") {
+                        return SbiResponse::with_status(201)
+                            .with_json_body(&serde_json::json!({ "subscriptionId": "sub-r1" }))
+                            .unwrap_or_else(|_| SbiResponse::with_status(201));
+                    }
+                    if req.header.uri.contains("/sm-data") {
+                        return SbiResponse::with_status(200)
+                            .with_json_body(&serde_json::json!([]))
+                            .unwrap_or_else(|_| SbiResponse::with_status(200));
+                    }
+                    SbiResponse::with_status(201)
+                }
+            })
+            .await;
+        std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("UDM_SBI_PORT", addr.port().to_string());
+        std::env::set_var("PCF_URI", "http://127.0.0.1:1");
+        udm::set_for_test(true);
+        let supi = "imsi-001010000009137";
+        let old = seed_established_session(supi, 9, std::net::Ipv4Addr::new(10, 45, 9, 38));
+        let _ = release_sm_context_locally(&old);
+
+        let resp = handle_sm_context_create(&create_request(
+            supi,
+            9,
+            &n1(
+                9,
+                1,
+                gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+                &[0x91, 0x00],
+            ),
+        ))
+        .await;
+        side_effects_settled().await;
+        let log = seen.lock().unwrap().clone();
+        std::env::remove_var("PCF_URI");
+        stop_udm_leg();
+        udm_srv.stop().await.ok();
+        smf_self()
+            .read()
+            .unwrap()
+            .ipv4_pool
+            .release(std::net::Ipv4Addr::new(10, 45, 9, 38));
+
+        assert_ne!(resp.status, 201, "the create failed");
+        let deletes = |suffix: &str| {
+            log.iter()
+                .filter(|(m, u)| m == "DELETE" && u.contains(supi) && u.ends_with(suffix))
+                .count()
+        };
+        assert_eq!(
+            deletes("/smf-registrations/9"),
+            1,
+            "the registration for PSI 9 is removed once: {log:?}"
+        );
+        assert_eq!(
+            deletes("/sdm-subscriptions/sub-9"),
+            1,
+            "the old subscription"
+        );
+        assert_eq!(
+            deletes("/sdm-subscriptions/sub-r1"),
+            1,
+            "and the create's own"
         );
     }
 

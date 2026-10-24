@@ -890,6 +890,76 @@ pub fn decode_pws_restart_indication(bytes: &[u8]) -> Class2Decode<PwsRestartInd
     }
 }
 
+/// PWS Failure Indication (TS 36.413 §8.12.4, §9.1.13.6), procedure code 51.
+pub const PROC_PWS_FAILURE_INDICATION: u8 = 51;
+const ID_PWS_FAILED_ECGI_LIST: u16 = 222;
+
+/// A decoded PWS FAILURE INDICATION.
+#[derive(Debug, Clone)]
+pub struct PwsFailureIndication {
+    /// The eNB whose PWS operation failed.
+    pub global_enb_id: GlobalEnbId,
+    /// The cells where it failed.
+    pub failed_ecgi_list: Vec<EutranCgi>,
+}
+
+/// Decode a PWS FAILURE INDICATION, a non-UE-associated Class 2 message
+/// (TS 36.413 §8.12.4). Both IEs are mandatory and `reject` (§9.1.13.6):
+/// missing or not understood, the procedure is not run (§10.3.4.2 / §10.3.5).
+pub fn decode_pws_failure_indication(bytes: &[u8]) -> Class2Decode<PwsFailureIndication> {
+    let Ok((pdu, unknown)) = nextgcore_s1ap_gen::decode_with_unknown_ies(bytes) else {
+        return Class2Decode::Undecodable;
+    };
+    let g::S1AP_PDU::InitiatingMessage(msg) = pdu else {
+        return Class2Decode::Undecodable;
+    };
+    let g::InitiatingMessageValue::Id_PWSFailureIndication(m) = msg.value else {
+        return Class2Decode::Undecodable;
+    };
+    let (mut reject, notify) = classify_unknown(&unknown);
+    let (mut global, mut failed) = (None, None);
+    use g::PWSFailureIndicationProtocolIEs_EntryValue as V;
+    for ie in m.protocol_i_es.0 {
+        match ie.value {
+            V::Id_Global_ENB_ID(v) => match plmn(&v.plm_nidentity.0) {
+                Some(plmn_identity) => {
+                    global = Some(GlobalEnbId {
+                        plmn_identity,
+                        enb_id: enb_id_from(&v.enb_id),
+                    })
+                }
+                None => reject.push(DiagnosedIe {
+                    criticality: REJECT,
+                    id: ID_GLOBAL_ENB_ID,
+                    type_of_error: g::TypeOfError::NOT_UNDERSTOOD,
+                }),
+            },
+            V::Id_PWSfailedECGIList(v) => {
+                failed = Some(v.0.iter().filter_map(cgi_from).collect::<Vec<_>>())
+            }
+        }
+    }
+    missing(&mut reject, failed.is_some(), ID_PWS_FAILED_ECGI_LIST);
+    missing(&mut reject, global.is_some(), ID_GLOBAL_ENB_ID);
+    if !reject.is_empty() {
+        return Class2Decode::Reject {
+            ies: reject,
+            enb_ue_s1ap_id: None,
+            mme_ue_s1ap_id: None,
+        };
+    }
+    let (Some(global_enb_id), Some(failed_ecgi_list)) = (global, failed) else {
+        return Class2Decode::Undecodable;
+    };
+    Class2Decode::Proceed {
+        msg: PwsFailureIndication {
+            global_enb_id,
+            failed_ecgi_list,
+        },
+        notify,
+    }
+}
+
 /// Whether `bytes` is an initiating message of `procedure_code`.
 pub fn is_initiating(bytes: &[u8], procedure_code: u8) -> bool {
     bytes.len() >= 2 && bytes[0] == 0x00 && bytes[1] == procedure_code

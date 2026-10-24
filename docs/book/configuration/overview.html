@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-df495bb2.js";
+            window.path_to_searchindex_js = "../searchindex-3d04d415.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -202,7 +202,7 @@
 <p><strong>1. Per-NF binary (clap).</strong> Each NF binary (e.g. <code>nextgcore-amfd</code>) parses CLI args and loads its YAML with <code>serde_yaml</code>. From <code>src/bins/nextgcore-amfd/src/lib.rs</code>:</p>
 <ul>
 <li><code>-c / --config &lt;path&gt;</code> — config file, default <code>/etc/nextgcore/amf.yaml</code></li>
-<li><code>--log-level &lt;level&gt;</code> — <code>trace|debug|info|warn|error</code>, default <code>info</code>. The short form is <code>-l</code> in amfd, mmed, sgwcd and sgwud; most other NFs follow Open5GS and use <code>-e</code> for the level and <code>-l</code> for <code>--log-file</code>. smfd has no log-level flag (it reads <code>RUST_LOG</code>, default <code>info</code>). Run <code>&lt;binary&gt; --help</code> for the rest of an NF’s flags</li>
+<li><code>--log-level &lt;level&gt;</code> — <code>trace|debug|info|warn|error</code>. Without it, the config file’s <code>logger.level</code>, else <code>info</code>. The short form is <code>-l</code> in amfd, mmed, sgwcd and sgwud; most other NFs, smfd included, follow Open5GS and use <code>-e</code> for the level and <code>-l</code> for <code>--log-file</code>. Run <code>&lt;binary&gt; --help</code> for the rest of an NF’s flags</li>
 <li><code>--ngap-addr</code> (AMF only) — NGAP bind address, default <code>0.0.0.0:38412</code></li>
 <li><code>--sctp-backend</code> (AMF only) — <code>userspace</code> (default, sctp-proto over UDP) or <code>kernel</code> (Linux kernel SCTP, needs the <code>kernel-sctp</code> build feature)</li>
 </ul>
@@ -215,7 +215,7 @@
     path: /var/log/nextgcore/amf.log
   level: info
 </code></pre>
-<p><code>--log-level</code> works for every NF but smfd (which defaults to <code>info</code>). Every NF builds its logger with <code>nextgcore_core::log::nf_log_builder</code> (#691): <code>RUST_LOG</code>, when set, is the filter; otherwise the <code>--log-level</code> flag applies (an unknown value means <code>info</code>).</p>
+<p>Every NF picks its level the same way (#691): <code>RUST_LOG</code>, when set and not blank, is the filter; otherwise <code>--log-level</code> when given, else the config file’s <code>logger.level</code>, else <code>info</code> (<code>nextgcore_core::log::nf_log_level</code>). An unknown value means <code>info</code>; the C configs’ <code>fatal</code> and <code>none</code> mean <code>error</code> and <code>off</code>. The logger is built with <code>nextgcore_core::log::nf_log_builder</code>.</p>
 <h3 id="global"><a class="header" href="#global"><code>global</code></a></h3>
 <pre><code class="language-yaml">global:
   max:
@@ -241,7 +241,7 @@
 <tr><th>Variable</th><th>Effect</th><th>Source</th></tr>
 </thead>
 <tbody>
-<tr><td><code>RUST_LOG</code></td><td>Overrides <code>--log-level</code> in every NF (env_logger filter syntax)</td><td><code>nextgcore_core::log::nf_log_builder</code></td></tr>
+<tr><td><code>RUST_LOG</code></td><td>Overrides <code>--log-level</code> and <code>logger.level</code> in every NF (env_logger filter syntax)</td><td><code>nextgcore_core::log::nf_log_builder</code></td></tr>
 <tr><td><code>DB_URI</code></td><td>Overrides the YAML <code>db_uri</code> (MongoDB)</td><td><code>init.rs</code> stage 4</td></tr>
 <tr><td><code>&lt;NF&gt;_SBI_ADDR</code> / <code>&lt;NF&gt;_SBI_PORT</code></td><td>SBI bind address/port (e.g. <code>AMF_SBI_ADDR</code>, <code>UDM_SBI_PORT</code>); defaults <code>127.0.0.1:7777</code></td><td>each NF <code>lib.rs</code></td></tr>
 <tr><td><code>NRF_URI</code>, <code>PCF_URI</code>, <code>NSACF_URI</code></td><td>Peer NF discovery URIs</td><td>NF binaries</td></tr>
@@ -397,6 +397,15 @@ this repo’s <code>udmd</code> serves from the UDR’s identity data (it answer
 </tbody>
 </table>
 </div>
+<h2 id="a-set-clock-is-required-pfcp-nfs"><a class="header" href="#a-set-clock-is-required-pfcp-nfs">A set clock is required (PFCP NFs)</a></h2>
+<p><code>nextgcore-smfd</code>, <code>nextgcore-sgwcd</code>, <code>nextgcore-upfd</code>, <code>nextgcore-sgwud</code> and <code>nextgcore-mbsmfd</code> <strong>refuse to start when the local clock reads before 2020-01-01</strong>. They exit with an error naming the clock.</p>
+<p>Each of these NFs puts its start time in every PFCP Association Setup and Heartbeat, as the Recovery Time Stamp (TS 29.244 §8.2.65, NTP-era seconds since 1900; #995). A host without a real-time clock that boots at 1970 would advertise a 1970 start time. Peers then misjudge restarts: one is missed, or a false one releases every session. So the NFs refuse to start rather than send a wrong stamp.</p>
+<p>On a host or node that may boot without a set clock (an RTC-less board, a VM restored from a snapshot), start these NFs only after the clock is synchronised:</p>
+<ul>
+<li><strong>systemd:</strong> order the unit <code>After=time-sync.target</code> and <code>Wants=time-sync.target</code>, and enable a time-sync waiter such as <code>systemd-time-wait-sync.service</code> (or chrony’s <code>chronyd-wait</code>).</li>
+<li><strong>Kubernetes:</strong> add an init container that waits for NTP sync, for example <code>chronyc waitsync</code> or polling <code>timedatectl show -p NTPSynchronized</code>. Alternatively, rely on the pod’s restart policy: the NF exits, and the kubelet restarts it with back-off until the node clock is set.</li>
+<li><strong>Docker / Compose:</strong> <code>restart: unless-stopped</code> (or <code>on-failure</code>) retries the same way. The containers use the host clock, so synchronise the host.</li>
+</ul>
 <h2 id="dynamic-reconfiguration"><a class="header" href="#dynamic-reconfiguration">Dynamic reconfiguration</a></h2>
 <p><code>nextgcore-app</code> includes a <code>ConfigReloadManager</code> that watches the config file and re-parses the <code>global</code> and NF-local sections on change, plus a versioned snapshot store with rollback and JSON export/import. These are library facilities (unit-tested); how much each NF wires them in varies — check the individual NF pages before relying on hot reload in a deployment.</p>
 

@@ -197,6 +197,22 @@ impl KernelSctpServer {
         }
     }
 
+    /// Close one association (graceful SCTP SHUTDOWN). Its read loop reports it
+    /// closed once the shutdown completes; an unknown id is a no-op.
+    pub fn close_association(&mut self, association_id: u64) -> Result<()> {
+        let sock = self
+            .associations
+            .lock()
+            .unwrap()
+            .get(&association_id)
+            .map(|a| Arc::clone(&a.sock));
+        if let Some(sock) = sock {
+            sock.shutdown().map_err(sctp_to_server_err)?;
+            log::info!("Kernel-SCTP: association {association_id} shut down");
+        }
+        Ok(())
+    }
+
     /// Stop accepting and drop all associations.
     pub fn stop(&mut self) {
         self.running = false;
@@ -448,6 +464,43 @@ fn sctp_to_server_err(e: SctpError) -> ServerError {
 
 #[cfg(test)]
 mod tests {
+
+    /// #1088 review: closing one association shuts it down at the SCTP level: the
+    /// SHUTDOWN completes, and the read loop reports the association closed and
+    /// forgets it.
+    #[tokio::test]
+    async fn closing_an_association_shuts_it_down() {
+        let mut server = KernelSctpServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            crate::server::SctpServerConfig::default(),
+        )
+        .await
+        .expect("bind");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        server.set_event_sender(tx);
+        let client = KernelSctpSocket::client(server.local_addr(), None).expect("client");
+        let id = match tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
+            Ok(Some(ServerEvent::NewAssociation { association_id, .. })) => association_id,
+            other => panic!("expected NewAssociation, got {other:?}"),
+        };
+        server.close_association(id).expect("close");
+        let closed = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match rx.recv().await {
+                    Some(ServerEvent::AssociationClosed { association_id, .. }) => {
+                        break association_id
+                    }
+                    Some(_) => continue,
+                    None => panic!("event channel closed"),
+                }
+            }
+        })
+        .await
+        .expect("the association is reported closed");
+        assert_eq!(closed, id);
+        assert_eq!(server.num_associations(), 0);
+        drop(client);
+    }
     use super::*;
 
     /// #870 follow-up: an `SCTP_RESTART` assoc change is a restart, not a close; the other

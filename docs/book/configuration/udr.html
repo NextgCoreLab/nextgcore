@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-df495bb2.js";
+            window.path_to_searchindex_js = "../searchindex-3d04d415.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -245,7 +245,7 @@ udr:
 <h2 id="parsed-but-inert--decorative-yaml-fields"><a class="header" href="#parsed-but-inert--decorative-yaml-fields">Parsed-but-inert / decorative YAML fields</a></h2>
 <p>The daemon deserializes only the fields above; unknown YAML keys are silently ignored by serde. In the shipped example files:</p>
 <ul>
-<li><strong><code>logger.file.path</code> and <code>logger.level</code> are inert.</strong> The log level comes from <code>RUST_LOG</code> when set, else the CLI flag <code>-e/--log-level</code> (default <code>info</code>). Logs always go to stderr — see the <code>--log-file</code> caveat below.</li>
+<li><strong><code>logger.level</code> is read; <code>logger.file.path</code> is inert.</strong> The log level is <code>-e/--log-level</code> when given, else this file’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code>, when set, overrides all three (#691). Logs always go to stderr; see the <code>--log-file</code> caveat below.</li>
 <li><strong><code>global.max.ue</code> / <code>global.max.peer</code> are inert.</strong> No struct deserializes the <code>global</code> section.</li>
 <li><strong><code>udr.sbi.tls.*</code> (enabled/cert/key/ca/min_version) is inert.</strong> <code>SbiYaml</code> has only <code>server</code>, <code>client</code>, and <code>oauth2</code> members; TLS is controlled exclusively by the CLI flags <code>--tls</code>/<code>--tls-cert</code>/<code>--tls-key</code>.</li>
 </ul>
@@ -259,7 +259,7 @@ udr:
 <tbody>
 <tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/udr.yaml</code></td><td>Configuration file path.</td></tr>
 <tr><td><code>-l, --log-file</code></td><td>path</td><td>unset</td><td><strong>Accepted but currently unused</strong> — <code>init_logging</code> never opens it; logging always goes to stderr.</td></tr>
-<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>); unrecognized values fall back to <code>info</code>.</td></tr>
+<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>logger.level</code>, else <code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else is <code>info</code>). Without the flag, the config’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code> overrides both (#691).</td></tr>
 <tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td>Disable color output.</td></tr>
 <tr><td><code>-k, --kill</code></td><td>flag</td><td>off</td><td>Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor.</td></tr>
 <tr><td><code>--sbi-addr</code></td><td>string</td><td><code>0.0.0.0</code></td><td>SBI server bind address. Overridden by <code>udr.sbi.server[0].address</code> when present.</td></tr>

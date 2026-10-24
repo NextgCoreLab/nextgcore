@@ -1,6 +1,6 @@
 # MME Configuration
 
-The MME (Mobility Management Entity, `nextgcore-mmed`) is the 4G/EPS control-plane anchor of the dual 5G+4G core. It serves S1-MME toward eNBs (S1AP encoded and decoded by `nextgcore-s1ap-gen`, the codec generated from the TS 36.413 ASN.1; the hand-written S1AP codec was removed, #514), NAS EMM/ESM toward UEs (TS 24.301), S11 GTPv2-C toward the SGW-C, S6a Diameter toward the HSS, and optionally N26 GTPv2-C toward an AMF for EPS↔5GS interworking. The crate also carries SGsAP and SBc-AP message handling.
+The MME (Mobility Management Entity, `nextgcore-mmed`) is the 4G/EPS control-plane anchor of the dual 5G+4G core. It serves S1-MME toward eNBs (S1AP encoded and decoded by `nextgcore-s1ap-gen`, the codec generated from the TS 36.413 ASN.1; the hand-written S1AP codec was removed, #514), NAS EMM/ESM toward UEs (TS 24.301), S11 GTPv2-C toward the SGW-C, S6a Diameter toward the HSS, and optionally N26 GTPv2-C toward an AMF for EPS↔5GS interworking. The crate also carries SGsAP message handling and the SBc-AP warning data structures and handlers; it has no SBc-AP transport (see [Not supported](#not-supported)).
 
 Configuration comes from a YAML file (default `/etc/nextgcore/mme.yaml`, `-c/--config`), the freeDiameter `.conf` that file names, a few environment variables, and four CLI flags. A missing or malformed file, or one with no `mme:` section, logs a warning and leaves the built-in defaults in place (`src/bins/nextgcore-mmed/src/config.rs`).
 
@@ -115,3 +115,11 @@ S1-MME runs **only** over native Linux kernel SCTP: mmed offers no userspace (sc
 | `NEXTGCORE_METRICS_BIND` | `127.0.0.1` | Host of the `/metrics` listener on port 9090 when `MME_METRICS_ADDR` is unset (#837). `docker-compose-epc.yml` and the EKS EPC overlay set `0.0.0.0` inside the private network; no metrics port is published on the host. |
 
 `RUST_LOG` overrides `-l/--log-level` when set (the `RUST_LOG: info` in `docker-compose-epc.yml` applies).
+
+## Not supported
+
+- **SBc-AP: no CBC interface (#1071).** mmed does not listen for, or connect to, a Cell Broadcast Centre. TS 29.168 SBc-AP runs over SCTP on port 29168 (PPID 24), and mmed has neither that transport nor an SBc-AP codec. As a result:
+  - ETWS and CMAS warnings (TS 23.041) cannot be delivered. No Write-Replace Warning or Stop Warning arrives from a CBC, so no WRITE-REPLACE WARNING REQUEST or KILL REQUEST is sent to an eNB. The `sbc_handler` procedures exist, but nothing calls them in production.
+  - An eNB's **PWS RESTART INDICATION** (TS 36.413 §8.12.3) is decoded and validated against the sender's own Global eNB ID. It is counted in `mme_s1ap_pws_restart_indications_total` and logged, but not propagated to a CBC. TS 23.007 §15A.1.2 has the CBC reload the restarted cells' warnings; mmed does not replay its own copy.
+  - An eNB's **PWS FAILURE INDICATION** (TS 36.413 §8.12.4) is handled in the same way. It is decoded, validated against the sender, counted in `mme_s1ap_pws_failure_indications_total`, and logged with its count of failed cells; the cell list itself is logged at debug level. TS 36.413 has the MME act on it as TS 23.041 defines, which means reporting it on to the CBC. mmed does not do that.
+  - Toward a CBC, mmed sends no SBc-AP PWS Restart Indication, PWS Failure Indication, Write-Replace Warning Indication or Stop Warning Indication.

@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-df495bb2.js";
+            window.path_to_searchindex_js = "searchindex-3d04d415.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-be5dca41.js"></script>
@@ -192,13 +192,14 @@
 </thead>
 <tbody>
 <tr><td><code>nextgcore-smfd</code></td><td><code>smf_n4_associations</code>, <code>smf_n4_peers</code>, <code>smf_sessions</code>, <code>smf_up</code> (and the PGW-C S5/S8 binding)</td><td>9090, or <code>SMF_METRICS_PORT</code></td></tr>
-<tr><td><code>nextgcore-upfd</code></td><td><code>upf_pfcp_associations</code>, <code>upf_pfcp_sessions</code>, <code>upf_up</code>, <code>upf_dataplane_{ul,dl}_{packets,bytes}_total</code> and dropped/oversize/spoofed packet counters</td><td>9090, or <code>UPF_METRICS_PORT</code></td></tr>
-<tr><td><code>nextgcore-sgwud</code></td><td><code>sgwu_pfcp_sessions</code>, <code>sgwu_pfcp_associations</code>, <code>sgwu_up</code></td><td>9090, or <code>SGWU_METRICS_PORT</code></td></tr>
+<tr><td><code>nextgcore-upfd</code></td><td><code>upf_pfcp_associations</code>, <code>upf_pfcp_sessions</code>, <code>upf_pfcp_unauthorized_messages_total</code>, <code>upf_up</code>, <code>upf_dataplane_{ul,dl}_{packets,bytes}_total</code> and dropped/oversize/spoofed packet counters</td><td>9090, or <code>UPF_METRICS_PORT</code></td></tr>
+<tr><td><code>nextgcore-sgwud</code></td><td><code>sgwu_pfcp_sessions</code>, <code>sgwu_pfcp_associations</code>, <code>sgwu_pfcp_unauthorized_messages_total</code>, <code>sgwu_up</code></td><td>9090, or <code>SGWU_METRICS_PORT</code></td></tr>
 <tr><td><code>nextgcore-udmd</code></td><td>NES energy gauges, only with <code>--features nes</code></td><td>NES <code>metrics_port</code> (default 9090)</td></tr>
 <tr><td><code>nextgcore-nsacfd</code></td><td>slice-SLA observe gauges, only with <code>--features sla-observe</code></td><td>its <code>metrics_port</code> when &gt; 0</td></tr>
 </tbody>
 </table>
 </div>
+<p>Every one of these listeners is unauthenticated, so it binds <code>127.0.0.1</code> by default (#837): set <code>NEXTGCORE_METRICS_BIND</code> (an IP address, e.g. <code>0.0.0.0</code>) to widen it. The compose files, the Kind manifests, the Helm chart and the EKS overlays set it to <code>0.0.0.0</code> inside the private container or pod network, where Prometheus scrapes by container/pod address; none of them publishes a metrics port on the host. The <code>k8s/monitoring/*</code> and <code>k8s/manifests/nrf.yaml</code> NodePort Services are for kind only, where the node is the Docker bridge and <code>kind-config.yaml</code> maps the ports to 127.0.0.1; on a real cluster a NodePort is open on every node IP, so do not apply them there. The compose host-port publishes (MongoDB, NRF, PFCP, Prometheus, Grafana, Jaeger, OTLP) are bound to <code>127.0.0.1</code>; the RAN-facing NGAP/S1AP and GTP-U publishes use <code>${NEXTGCORE_RAN_PUBLISH_ADDR:-127.0.0.1}</code>, so an external gNB/eNB needs that set to the host address it reaches.</p>
 <p><code>docker-compose-epc.yml</code> uses these endpoints as healthchecks (<code>curl -fsS http://localhost:9090/metrics | grep -q '^smf_up 1$'</code>, likewise <code>upf_up</code>, <code>sgwu_up</code>).</p>
 <p>The other NF daemons serve <strong>no</strong> Prometheus metrics over HTTP:</p>
 <div class="table-wrapper">
@@ -292,9 +293,9 @@
 </tbody>
 </table>
 </div>
-<p><code>nextgcore-smfd</code> and <code>nextgcore-sgwud</code> have no clap parser. smfd — scans <code>std::env::args()</code> only for <code>-c &lt;config&gt;</code> (and <code>--state-file</code>) and takes its log level purely from <code>RUST_LOG</code> (default <code>info</code>); sgwud scans for <code>-c</code> and <code>-l/--log-level</code>.</p>
-<p><strong><code>RUST_LOG</code> precedence is the same in every NF.</strong> Every NF builds its logger with <code>nextgcore_core::log::nf_log_builder</code> (#691): <code>RUST_LOG</code>, when set, is the filter; otherwise the <code>--log-level</code> flag applies (an unknown value means <code>info</code>). <code>RUST_LOG_STYLE</code> sets the colour style; <code>--no-color</code> overrides it.</p>
-<p>Precedence, in full: a set, non-blank <code>RUST_LOG</code> <strong>replaces</strong> <code>--log-level</code>; the two are not merged. So <code>RUST_LOG=nextgcore_amfd=debug</code> alone logs only amfd’s own targets (at debug) and silences every other target. Include a default level, as the compose files do (<code>info,nextgcore_amfd=debug</code>), to keep the rest at <code>info</code>. A blank <code>RUST_LOG=</code> counts as unset. <code>src/libs/nextgcore-core/tests/nf_logging_init.rs</code> fails if a daemon builds its own logger.</p>
+<p><code>nextgcore-smfd</code> and <code>nextgcore-sgwud</code> have no clap parser. smfd scans <code>std::env::args()</code> for <code>-c/--config</code>, <code>-e/--log-level</code> (and <code>--state-file</code>); sgwud scans for <code>-c</code> and <code>-l/--log-level</code>.</p>
+<p><strong>The level is chosen the same way in every NF.</strong> Every NF builds its logger with <code>nextgcore_core::log::nf_log_builder</code> (#691): <code>RUST_LOG</code>, when set, is the filter; otherwise the level is <code>--log-level</code> when given, else the config file’s <code>logger.level</code>, else <code>info</code> (<code>nextgcore_core::log::nf_log_level</code>; an unknown value means <code>info</code>). <code>RUST_LOG_STYLE</code> sets the colour style; <code>--no-color</code> overrides it.</p>
+<p>Precedence, in full: a set, non-blank <code>RUST_LOG</code> <strong>replaces</strong> the resolved level (<code>--log-level</code> / <code>logger.level</code> / <code>info</code>); they are not merged. So <code>RUST_LOG=nextgcore_amfd=debug</code> alone logs only amfd’s own targets (at debug) and silences every other target. Include a default level, as the compose files do (<code>info,nextgcore_amfd=debug</code>), to keep the rest at <code>info</code>. A blank <code>RUST_LOG=</code> counts as unset. <code>src/libs/nextgcore-core/tests/nf_logging_init.rs</code> fails if a daemon builds its own logger, skips <code>nf_log_level</code>, or gives its <code>log_level</code> flag a clap default (which would hide <code>logger.level</code>).</p>
 <p><strong><code>--log-file</code> is accepted but not wired.</strong> 22 binary crates (ausfd, bsfd, dccfd, easdfd, eesd, hssd, lmfd, mbsmfd, nefd, nrfd, nsacfd, nssfd, nwdafd, pcfd, pcrfd, pind, scpd, seppd, tsctsf, udmd, udrd, upfd — <code>grep -rl log_file src/bins/*/src/*.rs</code>) declare a <code>log_file</code> CLI arg, but in none of them is the parsed value ever consumed by the logging setup — e.g. nrfd’s <code>init_logging()</code> never references <code>args.log_file</code>. Logs always go to stdout/stderr; rely on <code>docker logs</code> or shell redirection.</p>
 <h2 id="troubleshooting"><a class="header" href="#troubleshooting">Troubleshooting</a></h2>
 <p>Every row below is grounded in a specific file in this repo.</p>

@@ -146,10 +146,15 @@ pub fn render_metrics() -> String {
          # HELP mme_s1ap_pws_restart_indications_total PWS RESTART INDICATIONs accepted from \
          an eNB (TS 36.413 8.12.3)\n\
          # TYPE mme_s1ap_pws_restart_indications_total counter\n\
-         mme_s1ap_pws_restart_indications_total {}\n",
+         mme_s1ap_pws_restart_indications_total {}\n\
+         # HELP mme_s1ap_pws_failure_indications_total PWS FAILURE INDICATIONs accepted from \
+         an eNB (TS 36.413 8.12.4)\n\
+         # TYPE mme_s1ap_pws_failure_indications_total counter\n\
+         mme_s1ap_pws_failure_indications_total {}\n",
         n(0),
         n(1),
-        PWS_RESTART_INDICATIONS.load(std::sync::atomic::Ordering::Relaxed)
+        PWS_RESTART_INDICATIONS.load(std::sync::atomic::Ordering::Relaxed),
+        PWS_FAILURE_INDICATIONS.load(std::sync::atomic::Ordering::Relaxed)
     )
 }
 
@@ -342,6 +347,34 @@ fn handle_s1ap_message_inner(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<
                 return class2_reject(
                     enb_id,
                     crate::s1ap_gen::PROC_PWS_RESTART_INDICATION,
+                    None,
+                    None,
+                    &ies,
+                );
+            }
+            Class2Decode::Undecodable => {}
+        }
+    }
+    // TS 36.413 §8.12.4: an eNB's PWS FAILURE INDICATION (Class 2, no
+    // response): validated, counted and logged, as the restart is.
+    if crate::s1ap_gen::is_initiating(data, crate::s1ap_gen::PROC_PWS_FAILURE_INDICATION) {
+        use crate::s1ap_gen::Class2Decode;
+        match crate::s1ap_gen::decode_pws_failure_indication(data) {
+            Class2Decode::Proceed { msg, notify } => {
+                let out = class2_notify(
+                    enb_id,
+                    crate::s1ap_gen::PROC_PWS_FAILURE_INDICATION,
+                    None,
+                    None,
+                    &notify,
+                );
+                handle_pws_failure(ctx, enb_id, &msg);
+                return out;
+            }
+            Class2Decode::Reject { ies, .. } => {
+                return class2_reject(
+                    enb_id,
+                    crate::s1ap_gen::PROC_PWS_FAILURE_INDICATION,
                     None,
                     None,
                     &ies,
@@ -1492,6 +1525,44 @@ pub fn handle_pws_restart(
         msg.ecgi_list.len(),
         msg.tai_list.len(),
         msg.emergency_area_ids.len()
+    );
+    true
+}
+
+/// PWS FAILURE INDICATIONs accepted from an eNB (TS 36.413 §8.12.4).
+pub static PWS_FAILURE_INDICATIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// A PWS FAILURE INDICATION from the eNB `enb_id` (TS 36.413 §8.12.4): ongoing
+/// PWS operation failed in the listed cells. The MME is to act as TS 23.041
+/// defines (the failure is reported on to the CBC over SBc-AP); with no SBc-AP
+/// transport (#1071) it is validated against the sender's own Global eNB ID,
+/// counted and logged, as [`handle_pws_restart`] does. Returns whether it was
+/// accepted.
+pub fn handle_pws_failure(
+    ctx: &MmeContext,
+    enb_id: u64,
+    msg: &crate::s1ap_gen::PwsFailureIndication,
+) -> bool {
+    let plmn = s1ap_build::decode_plmn_id(&msg.global_enb_id.plmn_identity);
+    if ctx.enb_find_by_global_enb_id(&plmn, msg.global_enb_id.enb_id) != Some(enb_id) {
+        log::warn!(
+            "PWS FAILURE INDICATION from eNB {enb_id} names Global eNB ID {:?}, which is not \
+             its own; not acted on",
+            msg.global_enb_id
+        );
+        return false;
+    }
+    PWS_FAILURE_INDICATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    log::warn!(
+        "PWS FAILURE INDICATION from eNB {enb_id} ({:?}): PWS operation failed in {} cell(s); \
+         this MME has no SBc-AP association to tell the CBC (#1071)",
+        msg.global_enb_id,
+        msg.failed_ecgi_list.len()
+    );
+    log::debug!(
+        "PWS FAILURE INDICATION from eNB {enb_id}: failed cells {:?}",
+        msg.failed_ecgi_list
     );
     true
 }

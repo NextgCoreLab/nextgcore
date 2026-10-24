@@ -184,6 +184,69 @@ pub fn bound_listener() -> BoundListener {
     BoundListener { listener, addr }
 }
 
+/// A loopback port held **bound but not listening**: a peer that is down now and
+/// can come back later on the same address.
+///
+/// A connection to it is refused (the kernel answers the SYN with a RST), and the
+/// port stays held for the whole test, so no other test's stand-in can be handed it
+/// in the meantime. That second point is why this exists. The older idiom bound
+/// `127.0.0.1:0`, dropped the listener and later rebound the port. In the window
+/// between, a sibling test's `bind(:0)` could be given that port, so the "down"
+/// peer answered, or the rebind failed (#1050). [`refused_port`] is simpler where
+/// the peer never comes back. Use this where it does.
+#[derive(Debug)]
+pub struct DownPort {
+    socket: tokio::net::TcpSocket,
+    addr: SocketAddr,
+}
+
+impl DownPort {
+    /// The address the socket holds. Never port 0.
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// The port the socket holds.
+    pub fn port(&self) -> u16 {
+        self.addr.port()
+    }
+
+    /// Bring the peer up: the held socket starts listening on the same address.
+    ///
+    /// # Panics
+    ///
+    /// If the socket cannot listen, or when called outside a Tokio runtime
+    /// (`listen` registers the socket with the runtime's reactor before it is
+    /// handed back as a `std` listener).
+    pub fn listen(self) -> TcpListener {
+        self.socket
+            .listen(64)
+            .expect("listen on the held port")
+            .into_std()
+            .expect("a std listener")
+    }
+}
+
+/// Hold a loopback port that refuses connections until [`DownPort::listen`].
+///
+/// The port is recorded in [`free_port`]'s issued set, like [`bound_listener`]'s.
+///
+/// # Panics
+///
+/// If a socket cannot be created or bound to `127.0.0.1:0`.
+pub fn down_port() -> DownPort {
+    let socket = tokio::net::TcpSocket::new_v4().expect("a TCP socket");
+    socket
+        .bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .expect("bind the held port");
+    let addr = socket.local_addr().expect("held port addr");
+    issued_ports()
+        .lock()
+        .expect("issued lock")
+        .insert(addr.port());
+    DownPort { socket, addr }
+}
+
 /// Build and start an [`SbiServer`] on a reserved loopback port, with no window
 /// in which the port is unbound (#313).
 ///
@@ -514,5 +577,28 @@ mod tests {
         let placeholder = SocketAddr::from(([127, 0, 0, 1], 0));
         let server = SbiServer::on_listener(SbiServerConfig::new(placeholder), listener);
         assert_eq!(server.config().addr, addr);
+    }
+
+    /// A [`DownPort`] refuses while held, then serves on the same address once it
+    /// listens.
+    #[tokio::test]
+    async fn a_down_port_refuses_until_it_listens() {
+        let down = down_port();
+        let addr = down.addr();
+        assert_ne!(addr.port(), 0);
+        let refused = tokio::net::TcpStream::connect(addr).await;
+        assert_eq!(
+            refused.map(|_| ()).map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::ConnectionRefused),
+            "a held, non-listening port must refuse"
+        );
+        let listener = down.listen();
+        assert_eq!(listener.local_addr().expect("addr"), addr);
+        listener.set_nonblocking(true).expect("nonblocking");
+        let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
+        let (accepted, connected) =
+            tokio::join!(listener.accept(), tokio::net::TcpStream::connect(addr));
+        accepted.expect("accepted");
+        connected.expect("connected once it listens");
     }
 }
