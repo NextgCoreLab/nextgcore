@@ -317,6 +317,34 @@ fn handle_s1ap_message_inner(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<
             }
         }
     }
+    // #1068, TS 36.413 §8.13.3: a restarted eNB's PWS RESTART INDICATION
+    // (Class 2, no response). Its active warnings are delivered again.
+    if crate::s1ap_gen::is_initiating(data, crate::s1ap_gen::PROC_PWS_RESTART_INDICATION) {
+        use crate::s1ap_gen::Class2Decode;
+        match crate::s1ap_gen::decode_pws_restart_indication(data) {
+            Class2Decode::Proceed { msg, notify } => {
+                let out = class2_notify(
+                    enb_id,
+                    crate::s1ap_gen::PROC_PWS_RESTART_INDICATION,
+                    None,
+                    None,
+                    &notify,
+                );
+                handle_pws_restart(ctx, enb_id, &msg);
+                return out;
+            }
+            Class2Decode::Reject { ies, .. } => {
+                return class2_reject(
+                    enb_id,
+                    crate::s1ap_gen::PROC_PWS_RESTART_INDICATION,
+                    None,
+                    None,
+                    &ies,
+                );
+            }
+            Class2Decode::Undecodable => {}
+        }
+    }
     if crate::s1ap_gen::is_initiating(data, crate::s1ap_gen::PROC_UPLINK_NAS_TRANSPORT) {
         use crate::s1ap_gen::Class2Decode;
         match crate::s1ap_gen::decode_uplink_nas_transport(data) {
@@ -1416,6 +1444,33 @@ fn class2_notify(
             notify,
         )),
     )
+}
+
+/// A PWS RESTART INDICATION from the eNB `enb_id` (TS 36.413 §8.13.3, #1068):
+/// the eNB may have lost its warnings, so each active one covering its area is
+/// written to it again (TS 23.041 §9.1.3.5). The Global eNB ID it names must be
+/// its own: a restart reported for another eNB's identity is not acted on.
+/// Returns how many warnings were re-sent.
+pub fn handle_pws_restart(
+    ctx: &MmeContext,
+    enb_id: u64,
+    msg: &crate::s1ap_gen::PwsRestartIndication,
+) -> usize {
+    let plmn = s1ap_build::decode_plmn_id(&msg.global_enb_id.plmn_identity);
+    if ctx.enb_find_by_global_enb_id(&plmn, msg.global_enb_id.enb_id) != Some(enb_id) {
+        log::warn!(
+            "PWS RESTART INDICATION from eNB {enb_id} names Global eNB ID {:?}, which is not \
+             its own; not acted on",
+            msg.global_enb_id
+        );
+        return 0;
+    }
+    log::info!(
+        "PWS RESTART INDICATION from eNB {enb_id}: {} cell(s), {} TAI(s) to restore",
+        msg.ecgi_list.len(),
+        msg.tai_list.len()
+    );
+    crate::sbc_handler::handle_pws_restart_indication(ctx, &plmn, msg.global_enb_id.enb_id)
 }
 
 /// TS 36.413 §10.3.4.2 / §10.3.5 for an initiating message of a Class 2
