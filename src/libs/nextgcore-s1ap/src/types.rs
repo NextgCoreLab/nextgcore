@@ -1031,13 +1031,37 @@ pub struct GlobalEnbId {
     pub enb_id: EnbId,
 }
 
-/// eNB ID - CHOICE between macro (20 bits) and home (28 bits)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// eNB ID (TS 36.413 §9.2.1.37): the ENB-ID CHOICE. Short and long macro ids are the
+/// Rel-15 extension alternatives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EnbId {
     /// Macro eNB ID (20 bits)
     Macro(u32),
     /// Home eNB ID (28 bits)
     Home(u32),
+    /// Short Macro eNB ID (18 bits)
+    ShortMacro(u32),
+    /// Long Macro eNB ID (21 bits)
+    LongMacro(u32),
+}
+
+impl EnbId {
+    /// The BIT STRING size of this alternative.
+    pub fn bit_len(&self) -> u8 {
+        match self {
+            EnbId::Macro(_) => 20,
+            EnbId::Home(_) => 28,
+            EnbId::ShortMacro(_) => 18,
+            EnbId::LongMacro(_) => 21,
+        }
+    }
+
+    /// The id value, right-aligned.
+    pub fn value(&self) -> u32 {
+        match *self {
+            EnbId::Macro(v) | EnbId::Home(v) | EnbId::ShortMacro(v) | EnbId::LongMacro(v) => v,
+        }
+    }
 }
 
 /// Supported TA Item
@@ -1118,12 +1142,24 @@ pub struct UeSecurityCapabilities {
 }
 
 /// Security Context (for handover)
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SecurityContext {
     /// Next Hop Chaining Count (0..7)
     pub next_hop_chaining_count: u8,
     /// Next Hop parameter (NH, 256 bits)
     pub next_hop_parameter: [u8; 32],
+}
+
+/// Manual `Debug` (no-auth-material-in-logs): the authentication material in
+/// this type (next_hop_parameter) prints as `<redacted>`, so a future
+/// `{:?}` in a log line cannot leak it.
+impl std::fmt::Debug for SecurityContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("SecurityContext");
+        d.field("next_hop_chaining_count", &self.next_hop_chaining_count);
+        d.field("next_hop_parameter", &"<redacted>");
+        d.finish()
+    }
 }
 
 /// Target ID for handover - CHOICE

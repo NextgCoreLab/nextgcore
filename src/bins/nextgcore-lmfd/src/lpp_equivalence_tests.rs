@@ -17,7 +17,7 @@ use crate::codec_glue::{self, LppMethod, UeLppCapability};
 
 const VECTORS: &str = include_str!("lpp_golden_vectors.txt");
 
-fn unhex(h: &str) -> Vec<u8> {
+pub(crate) fn unhex(h: &str) -> Vec<u8> {
     (0..h.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap())
@@ -106,11 +106,19 @@ fn without_new_fields(
     what: &str,
 ) -> Vec<std::collections::BTreeMap<String, String>> {
     for c in &mut new {
-        for k in ["ue_rx_tx_ns", "gnb_rx_tx_ns"] {
+        for k in ["ue_rx_tx_ns", "gnb_rx_tx_ns", "meas_time"] {
             assert_eq!(c.remove(k).as_deref(), Some("None"), "{what}: {k}");
         }
         check_dl_prs_id(c, what);
         check_eutra(c, what);
+        if what != "E-CID" {
+            assert_eq!(c.remove("ecid_rtt_ns").as_deref(), Some("None"), "{what}");
+            assert_eq!(
+                c.remove("ecid_rtt_width_ns").as_deref(),
+                Some("None"),
+                "{what}"
+            );
+        }
         check_rstd_reference(c, what);
     }
     new
@@ -173,12 +181,36 @@ fn every_report_adapts_as_the_old_adapters_did() {
             "{:?}",
             codec_glue::lpp_ecid_provide_to_measurements(&g)
         ));
-        assert_eq!(
-            without_new_fields(ecid, "E-CID"),
-            cells_of(f[1]),
-            "E-CID {}",
-            f[0]
-        );
+        // #832: the captured raw `timing_advance` (the UE Rx-Tx report value) is
+        // now decoded per TS 36.133 §9.1.9.3 into `ecid_rtt_ns`.
+        let mut captured = cells_of(f[1]);
+        let mut new = without_new_fields(ecid, "E-CID");
+        for (n_cell, c_cell) in new.iter_mut().zip(captured.iter_mut()) {
+            let raw = c_cell.remove("timing_advance").expect("timing_advance");
+            let want = match raw.as_str() {
+                "None" => None,
+                v => crate::positioning::eutra_time_report_to_ns(
+                    some_f64(v) as u32,
+                    crate::positioning::EUTRA_UE_RX_TX_MAX,
+                ),
+            };
+            assert_eq!(n_cell.remove("timing_advance").as_deref(), Some("None"));
+            assert_eq!(
+                n_cell.remove("ecid_rtt_ns").expect("ecid_rtt_ns"),
+                format!("{:?}", want.map(|(mid, _)| mid)),
+                "E-CID {} (the captured cells are FDD: no N_TA,offset)",
+                f[0]
+            );
+            assert_eq!(
+                n_cell
+                    .remove("ecid_rtt_width_ns")
+                    .expect("ecid_rtt_width_ns"),
+                format!("{:?}", want.map(|(_, width)| width)),
+                "E-CID {}",
+                f[0]
+            );
+        }
+        assert_eq!(new, captured, "E-CID {}", f[0]);
 
         let rtt = cells_of(&format!(
             "{:?}",
@@ -209,8 +241,14 @@ fn every_report_adapts_as_the_old_adapters_did() {
             }
             assert_eq!(new.remove("rtt_ns").as_deref(), Some("None"));
             assert_eq!(new.remove("gnb_rx_tx_ns").as_deref(), Some("None"));
+            // #807: the UE half carries its nr-TimeStamp-r16.
+            assert!(new
+                .remove("meas_time")
+                .is_some_and(|t| t.starts_with("Some(SlotTime")));
             check_dl_prs_id(&mut new, "Multi-RTT");
             check_eutra(&mut new, "Multi-RTT");
+            assert_eq!(new.remove("ecid_rtt_ns").as_deref(), Some("None"));
+            assert_eq!(new.remove("ecid_rtt_width_ns").as_deref(), Some("None"));
             check_rstd_reference(&mut new, "Multi-RTT");
             let mut old = old;
             old.remove("rtt_ns");
@@ -295,6 +333,40 @@ fn capability_classification_reads_the_generated_report() {
     );
 }
 
+/// `build_lpp_request_capabilities(0)` derived by hand from X.691 (UPER, TS 37.355
+/// §6.3 `RequestCapabilities`, #906):
+///
+/// | bits | field |
+/// |------|-------|
+/// | `1001` | LPP-Message optional bitmap: transactionID, ¬sequenceNumber, ¬acknowledgement, lpp-MessageBody |
+/// | `0 0 0` | LPP-TransactionID ext bit; Initiator ext bit, value locationServer (1 bit) |
+/// | `00000000` | transactionNumber 0 |
+/// | `0` | endTransaction FALSE: the target ends it (§5.1.1 step 2) |
+/// | `0 0000` | lpp-MessageBody c1; c1 index 0 = requestCapabilities (4 bits) |
+/// | `0 00` | criticalExtensions c1; requestCapabilities-r9 (2 bits) |
+/// | `1` | r9-IEs extension bit: extension additions present |
+/// | `00010` | root optional bitmap: only ecid-RequestCapabilities |
+/// | `0` | ECID-RequestCapabilities: ext bit (an empty extensible SEQUENCE) |
+/// | `0 000010` | X.691 §19.8: extension-addition bitmap length, normally small, `3 − 1` (three groups: r13, r16, r19) |
+/// | `010` | only the Rel-16 group is present |
+/// | `00000001` | X.691 §19.9: the group as an open type, length 1 octet |
+/// | `11010` | the group's presence bitmap: nr-ECID, nr-Multi-RTT present, nr-DL-AoD absent, nr-DL-TDOA present, nr-UL absent |
+/// | `0 0 0` | NR-ECID-, NR-Multi-RTT-, NR-DL-TDOA-RequestCapabilities-r16: one ext bit each |
+///
+/// 57 bits, padded: `90 00 00 88 09 00 E8 00`.
+#[test]
+fn request_capabilities_matches_x691() {
+    assert_eq!(
+        codec_glue::build_lpp_request_capabilities(0).unwrap(),
+        vec![0x90, 0x00, 0x00, 0x88, 0x09, 0x00, 0xE8, 0x00]
+    );
+    // The transaction number lands in bits 7..15: 0x5A = 0101 1010.
+    assert_eq!(
+        codec_glue::build_lpp_request_capabilities(0x5A).unwrap(),
+        vec![0x90, 0xB4, 0x00, 0x88, 0x09, 0x00, 0xE8, 0x00]
+    );
+}
+
 /// `build_lpp_ecid_request(0)` derived by hand from X.691 (UPER, TS 37.355):
 ///
 /// | bits | field |
@@ -343,5 +415,39 @@ fn nr_ecid_request_matches_x691() {
     assert_eq!(
         codec_glue::build_lpp_request(LppMethod::NrEcid, 0).unwrap(),
         vec![0x90, 0x00, 0x20, 0x80, 0x12, 0x02, 0x81, 0xC0]
+    );
+}
+
+/// #907 review: the uplink capability decode, on the captured vectors. #906:
+/// it also carries the NR methods and the transaction number the answer is on
+/// (`92 03`: transactionID present, initiator targetDevice, transactionNumber 1).
+#[test]
+fn an_uplink_provide_capabilities_decodes_to_its_class_and_flavours() {
+    use codec_glue::{EcidFlavours, NrMethods, ReportedCapabilities, UeLppCapability};
+    assert_eq!(
+        codec_glue::decode_lpp_provide_capabilities(&unhex("9203084858")),
+        Some(ReportedCapabilities {
+            class: UeLppCapability::EcidOnly,
+            ecid: EcidFlavours {
+                eutra: true,
+                nr: false
+            },
+            nr: NrMethods::default(),
+            transaction: Some(1),
+        })
+    );
+    assert_eq!(
+        codec_glue::decode_lpp_provide_capabilities(&unhex("92030840")),
+        Some(ReportedCapabilities {
+            class: UeLppCapability::Unknown,
+            ecid: EcidFlavours::default(),
+            nr: NrMethods::default(),
+            transaction: Some(1),
+        })
+    );
+    // A ProvideLocationInformation is not a capability report.
+    assert_eq!(
+        codec_glue::decode_lpp_provide_capabilities(&crate::lpp_fixtures::ecid_lpp(7, 60, 500, 1)),
+        None
     );
 }

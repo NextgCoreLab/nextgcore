@@ -41,7 +41,7 @@ logger:
   level: info
 ```
 
-`--log-level` works for every NF but smfd. `RUST_LOG` is honoured only by the NFs that build their logger with `env_logger::Env::default().default_filter_or(..)` (dccfd, easdfd, eesd, lmfd, mbsmfd, nefd, nsacfd, nwdafd, pind, sgwud, smfd, tsctsf, ucmfd). The other fifteen (amfd, ausfd, bsfd, hssd, mmed, nrfd, nssfd, pcfd, pcrfd, scpd, seppd, sgwcd, udmd, udrd, upfd) ignore it; tracked in [#691](https://github.com/NextgCoreLab/nextgcore/issues/691).
+`--log-level` works for every NF but smfd (which defaults to `info`). Every NF builds its logger with `nextgcore_core::log::nf_log_builder` (#691): `RUST_LOG`, when set, is the filter; otherwise the `--log-level` flag applies (an unknown value means `info`).
 
 ### `global`
 
@@ -70,7 +70,7 @@ Common sub-blocks seen in the Docker configs:
 
 | Variable | Effect | Source |
 |---|---|---|
-| `RUST_LOG` | Overrides the log level in the thirteen NFs listed under `logger` above | `init.rs`, NF `main.rs` |
+| `RUST_LOG` | Overrides `--log-level` in every NF (env_logger filter syntax) | `nextgcore_core::log::nf_log_builder` |
 | `DB_URI` | Overrides the YAML `db_uri` (MongoDB) | `init.rs` stage 4 |
 | `<NF>_SBI_ADDR` / `<NF>_SBI_PORT` | SBI bind address/port (e.g. `AMF_SBI_ADDR`, `UDM_SBI_PORT`); defaults `127.0.0.1:7777` | each NF `lib.rs` |
 | `NRF_URI`, `PCF_URI`, `NSACF_URI` | Peer NF discovery URIs | NF binaries |
