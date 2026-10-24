@@ -2431,7 +2431,13 @@ fn send_s11_create_session(
 
     // #1103: a request for this IMSI must not reach the Serving GW ahead of the
     // deletions of the context its re-attach replaced.
-    if gtp_path::defer_create_while_replaced(&mme_ue.imsi_bcd, enb_ue_id, sess_id, gtp_action) {
+    if gtp_path::defer_create_while_replaced(
+        &mme_ue.imsi_bcd,
+        mme_ue.id,
+        enb_ue_id,
+        sess_id,
+        gtp_action,
+    ) {
         log::info!(
             "[{}] S11 Create Session Request held until the replaced context's Delete Session \
              Requests are answered",

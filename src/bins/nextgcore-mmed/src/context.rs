@@ -2363,11 +2363,11 @@ impl MmeContext {
     /// Remove an MME UE
     pub fn mme_ue_remove(&self, id: u64) -> bool {
         if let Some(ue) = self.mme_ue_pool.write().unwrap().remove(&id) {
-            // #1103 review: nothing is left waiting to complete a detach of a
-            // context that is gone. The records are the process context's, so
+            // #1103 review: nothing is left waiting on behalf of a context that
+            // is gone (a detach to complete, a held Create Session Request). The records are the process context's, so
             // only its removals touch them (a test context's ids overlap).
             if std::ptr::eq(self, mme_self()) {
-                crate::gtp_path::drop_pending_detaches(id);
+                crate::gtp_path::forget_ue(id);
             }
             // Remove from hash tables
             if !ue.imsi_bcd.is_empty() {

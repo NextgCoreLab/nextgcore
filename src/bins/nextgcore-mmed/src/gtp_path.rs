@@ -1393,6 +1393,8 @@ pub enum PendingDelete {
 /// A Create Session Request held until a replaced context's deletions settle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DeferredCreate {
+    /// The new context whose Create Session Request this is.
+    mme_ue_id: u64,
     enb_ue_id: u64,
     sess_id: u64,
     action: GtpCreateAction,
@@ -1463,8 +1465,13 @@ pub fn on_delete_session_settled(ctx: &MmeContext, seq: u32) {
 /// of a context `imsi`'s re-attach replaced are unanswered; it is sent when
 /// they settle ([`on_delete_session_settled`]). `false`: nothing outstanding,
 /// send it now.
+///
+/// The hold is bounded by T3 × N3 (12 s by default) when the Serving GW does not
+/// answer, which is inside the UE's T3410 (15 s, TS 24.301 §5.5.1.2.6) for an
+/// attach.
 pub fn defer_create_while_replaced(
     imsi: &str,
+    mme_ue_id: u64,
     enb_ue_id: u64,
     sess_id: u64,
     action: GtpCreateAction,
@@ -1481,6 +1488,7 @@ pub fn defer_create_while_replaced(
             .entry(imsi.to_string())
             .or_default()
             .push(DeferredCreate {
+                mme_ue_id,
                 enb_ue_id,
                 sess_id,
                 action,
@@ -1501,12 +1509,28 @@ pub fn detach_deletes_outstanding(mme_ue_id: u64) -> bool {
         .unwrap_or(false)
 }
 
-/// Forget every Delete Session Request `mme_ue_id`'s detach waits on: the
-/// detach completed or the context is removed (`MmeContext::mme_ue_remove`).
-pub fn drop_pending_detaches(mme_ue_id: u64) {
+/// How many Create Session Requests are held for `imsi`. Test-only; callers
+/// hold [`S11_TEST_LOCK`].
+#[cfg(test)]
+pub(crate) fn creates_held_for_test(imsi: &str) -> usize {
+    delete_book()
+        .lock()
+        .map(|book| book.deferred.get(imsi).map_or(0, Vec::len))
+        .unwrap_or(0)
+}
+
+/// Forget what waits on behalf of `mme_ue_id`: its detach's Delete Session
+/// records, and any Create Session Request of it held behind a replaced
+/// context's deletions. Called when the context is removed
+/// (`MmeContext::mme_ue_remove`).
+pub fn forget_ue(mme_ue_id: u64) {
     if let Ok(mut book) = delete_book().lock() {
         book.pending
             .retain(|_, p| !matches!(p, PendingDelete::Detach(d) if d.mme_ue_id == mme_ue_id));
+        book.deferred.retain(|_, creates| {
+            creates.retain(|c| c.mme_ue_id != mme_ue_id);
+            !creates.is_empty()
+        });
     }
 }
 

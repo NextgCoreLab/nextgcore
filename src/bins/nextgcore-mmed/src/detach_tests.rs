@@ -328,18 +328,28 @@ fn a_re_attach_deletes_the_replaced_contexts_pdn_connections() {
     cleanup(&ue);
 }
 
-/// #1106 review MINOR 2: the new attach's Create Session Request is held until
-/// the Delete Session Requests of the context it replaced are answered. Sent
-/// ahead of them, a lost one retransmitted after it could delete the new
-/// session at a Serving GW that finds the UE by IMSI.
-#[test]
-fn a_re_attach_holds_its_create_session_until_the_old_deletions_settle() {
-    let _guard = lock_s11();
-    let (sgw, _route) = sgw(Gtp2XactConfig::default());
-    let stale = seed(0x1107, &[5]);
-    let fresh = seed(0x1108, &[5]);
+/// A PDN CONNECTIVITY REQUEST (PTI 7, IPv4, initial, APN "internet"),
+/// integrity protected and ciphered (EEA0) under EIA2 at uplink COUNT `count`.
+fn pdn_connectivity_request(count: u32) -> Vec<u8> {
+    let mut plain = vec![0x02u8, 7, 0xd0, 0x11, 0x28, 9, 8];
+    plain.extend_from_slice(b"internet");
+    let mut signed = vec![count as u8];
+    signed.extend_from_slice(&plain);
+    let mac = crate::nas_security::nas_mac_calculate(2, &KNAS_INT, count, 0, 0, &signed);
+    let mut pdu = vec![0x27u8];
+    pdu.extend_from_slice(&mac);
+    pdu.extend_from_slice(&signed);
+    pdu
+}
+
+/// Two seeded UEs under one IMSI: `stale`'s PDN connection deleted as a
+/// replaced context's (one Delete Session Request, unanswered), then `fresh`
+/// asking for a PDN connection, whose Create Session Request must be held.
+fn replaced_then_requested(sgw: &UdpSocket, tacs: (u16, u16)) -> (Ue, Ue, Gtp2Message, SocketAddr) {
+    let stale = seed(tacs.0, &[5]);
+    let fresh = seed(tacs.1, &[5]);
     let ctx = mme_self();
-    let imsi = format!("99970001107{:04}", stale.mme_ue_id % 10_000);
+    let imsi = format!("9997000{:04}{:04}", tacs.0, stale.mme_ue_id % 10_000);
     for id in [stale.mme_ue_id, fresh.mme_ue_id] {
         ctx.mme_ue_pool
             .write()
@@ -348,29 +358,45 @@ fn a_re_attach_holds_its_create_session_until_the_old_deletions_settle() {
             .unwrap()
             .imsi_bcd = imsi.clone();
     }
-
     let sent = crate::gtp_path::send_delete_all_sessions_for_replaced(ctx, stale.mme_ue_id, &imsi)
         .expect("sent");
     assert_eq!(sent.len(), 1);
-    let (req, from) = recv(&sgw, DELETE_SESSION_REQUEST);
+    let (req, from) = recv(sgw, DELETE_SESSION_REQUEST);
     assert_eq!(delete_session(&req), (Some(SGW_S11_TEID), 5, true));
+
+    crate::nas_dispatch::nas_eps_handle_uplink(
+        ctx,
+        crate::nas_dispatch::UplinkNas {
+            enb_ue_id: fresh.enb_ue_id,
+            nas_pdu: &pdn_connectivity_request(0),
+            s_tmsi: None,
+        },
+    );
     assert!(
-        crate::gtp_path::defer_create_while_replaced(
-            &imsi,
-            fresh.enb_ue_id,
-            fresh.sess_id,
-            crate::s11_build::GtpCreateAction::AttachRequest,
-        ),
-        "held"
+        ctx.sess_find_by_pti(fresh.mme_ue_id, 7).is_some(),
+        "precondition: the PDN CONNECTIVITY REQUEST was processed"
     );
     sgw.set_read_timeout(Some(Duration::from_millis(300)))
         .unwrap();
     let mut buf = [0u8; 4096];
     assert!(
         sgw.recv_from(&mut buf).is_err(),
-        "no Create Session Request yet"
+        "no Create Session Request while the old context's deletion is unanswered"
     );
     sgw.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    (stale, fresh, req, from)
+}
+
+/// #1106 review MINOR 2 (and round 2 MINOR 1, through the NAS call site): a
+/// Create Session Request for the IMSI is held until the Delete Session
+/// Requests of the context its re-attach replaced are answered. Sent ahead of
+/// them, a lost one retransmitted after it could delete the new session at a
+/// Serving GW that finds the UE by IMSI.
+#[test]
+fn a_create_session_waits_for_the_replaced_contexts_deletions() {
+    let _guard = lock_s11();
+    let (sgw, _route) = sgw(Gtp2XactConfig::default());
+    let (stale, fresh, req, from) = replaced_then_requested(&sgw, (0x1107, 0x1108));
 
     answer(&sgw, &stale, &req, from);
     let (csr, _) = recv(&sgw, CREATE_SESSION_REQUEST);
@@ -378,14 +404,36 @@ fn a_re_attach_holds_its_create_session_until_the_old_deletions_settle() {
         csr.header.message_type, CREATE_SESSION_REQUEST,
         "sent once settled"
     );
+    cleanup(&stale);
+    cleanup(&fresh);
+}
+
+/// #1106 review round 2 MINOR 2: a held Create Session Request goes with its
+/// context: removed before the deletions settle, it is never sent.
+#[test]
+fn a_held_create_session_goes_with_its_context() {
+    let _guard = lock_s11();
+    let (sgw, _route) = sgw(Gtp2XactConfig::default());
+    let (stale, fresh, req, from) = replaced_then_requested(&sgw, (0x1110, 0x1111));
+    let imsi = mme_self()
+        .mme_ue_find_by_id(fresh.mme_ue_id)
+        .unwrap()
+        .imsi_bcd;
+    assert_eq!(crate::gtp_path::creates_held_for_test(&imsi), 1, "held");
+    mme_self().mme_ue_remove(fresh.mme_ue_id);
+    assert_eq!(
+        crate::gtp_path::creates_held_for_test(&imsi),
+        0,
+        "dropped with the context, not left until the deletions settle"
+    );
+
+    answer(&sgw, &stale, &req, from);
+    sgw.set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    let mut buf = [0u8; 4096];
     assert!(
-        !crate::gtp_path::defer_create_while_replaced(
-            &imsi,
-            fresh.enb_ue_id,
-            fresh.sess_id,
-            crate::s11_build::GtpCreateAction::AttachRequest,
-        ),
-        "nothing outstanding any more"
+        sgw.recv_from(&mut buf).is_err(),
+        "nothing is sent for a removed context"
     );
     cleanup(&stale);
     cleanup(&fresh);
