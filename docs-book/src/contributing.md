@@ -175,7 +175,7 @@ Each NF binary must:
   deregister on shutdown
 - Expose `/metrics` (Prometheus, port 9090)
 - Respond to SIGTERM with graceful shutdown
-- Log at `info` level by default, configurable via `--log-level` and `RUST_LOG`
+- Log at `info` level by default, configurable via `--log-level`, the config's `logger.level` and `RUST_LOG`, resolved by `nextgcore_core::log::nf_log_level` / `nf_log_builder`
   (build the logger with `nextgcore_core::log::nf_log_builder`; a test enforces it)
 - Have ≥ 1 unit test per public function
 

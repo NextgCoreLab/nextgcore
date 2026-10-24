@@ -39,7 +39,7 @@ The LMF defines **no** `#[derive(Deserialize)]` configuration structs. The only 
 
 Everything else in the shipped example file is decorative — unknown keys are silently ignored:
 
-- **`logger.level` is inert.** The log level comes from the CLI flag `-e/--log-level` (default `info`), overridable by `RUST_LOG`.
+- **`logger.level` is read.** The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691).
 - **`lmf.sbi.server[]` (address/advertise/port) is inert.** The SBI bind address and port come only from `--sbi-addr`/`--sbi-port`; the docker deployment passes them on the command line (`--sbi-addr 172.23.0.32 --sbi-port 7777`).
 - **`lmf.nrf.uri` is inert.** The NRF URI comes only from the `--nrf-uri` flag (default `http://127.0.0.1:7777`). The docker deployment passes `--nrf-uri http://172.23.0.10:7777` explicitly — setting only the YAML field has no effect.
 
@@ -50,7 +50,7 @@ From the clap `Args` struct in `src/bins/nextgcore-lmfd/src/main.rs`:
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `-c, --config` | path | `/etc/nextgcore/lmf.yaml` | Configuration file path (probed only for `sbi.oauth2.require`). |
-| `-e, --log-level` | string | `info` | Log level (env_logger filter; `RUST_LOG` takes precedence when set). |
+| `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-l, --log-file` | path | unset | Accepted but currently **unused** — the daemon never reads this field. |
 | `-m, --no-color` | flag | off | Accepted but currently **unused**. |
 | `--sbi-addr` | string | `0.0.0.0` | SBI server bind address. Also used as the advertised host for N1N2 notify callback URIs — `0.0.0.0` falls back to `127.0.0.1` (see behavior notes). |

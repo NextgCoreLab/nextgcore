@@ -43,7 +43,7 @@ pcrf:
 Because parsing is a stub, **every** field in the shipped example file is inert:
 
 - **`db_uri` is inert.** The binary has a `--db-uri` flag too, but neither is ever passed to `nextgcore_dbi_init`/`nextgcore_mongoc_init` — no MongoDB connection is made by this daemon.
-- **`logger.file.path` and `logger.level` are inert.** Logging goes to stderr via `env_logger`; the level comes from `-e/--log-level` (default `info`). The `-l/--log-file` flag is also accepted but never used by `init_logging` in `main.rs`.
+- **`logger.level` is read; `logger.file.path` is inert.** Logging goes to stderr via `env_logger`. The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691). The `-l/--log-file` flag is also accepted but never used.
 - **`global.max.ue` / `global.max.peer` are inert.** The only session limit is the `--max-sess` flag (and even that is stored, not enforced — see Behavior notes).
 - **`pcrf.freeDiameter` is inert.** Neither the YAML pointer (`/etc/freeDiameter/pcrf.conf`) nor the CLI default (`--diameter-config /etc/nextgcore/freeDiameter/pcrf.conf`) is ever opened. The shipped `docker/rust/configs/epc/freeDiameter/pcrf.conf` (Identity `pcrf.localdomain`, Realm `localdomain`, `ListenOn 172.24.0.9`, `ConnectPeer smf.localdomain`) is mounted into the container but ignored; the daemon's actual identity/realm/listen address come from `--diameter-id`/`--diameter-realm`/`--diameter-addr`, whose defaults happen to match the conf's Identity/Realm. The PCRF never dials out to peers (`ConnectPeer` has no equivalent): it only accepts inbound connections.
 - **`pcrf.metrics.server[]` (address/port) is inert.** No Prometheus/metrics HTTP server is started by this binary; the only telemetry is the optional OTLP trace exporter (env var, see below).
@@ -56,7 +56,7 @@ From the clap `Args` struct in `src/bins/nextgcore-pcrfd/src/main.rs`:
 |---|---|---|---|
 | `-c, --config` | path | `/etc/nextgcore/pcrf.yaml` | Configuration file path. Only its existence is checked; contents are ignored (stub parser). |
 | `-l, --log-file` | path | unset | Accepted but **never used** — logs always go to stderr. |
-| `-e, --log-level` | string | `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`); unrecognized values fall back to `info`. |
+| `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-m, --no-color` | flag | off | Disable color output. |
 | `-k, --kill` | flag | off | Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor. |
 | `--diameter-config` | path | `/etc/nextgcore/freeDiameter/pcrf.conf` | FreeDiameter configuration file — accepted but **never read**. |
