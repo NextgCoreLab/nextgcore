@@ -322,18 +322,21 @@ fn paging_expiry(ctx: &MmeContext, mme_ue_id: u64) {
         Ok(pdu) => {
             crate::paging::repeat(ctx, mme_ue_id, pdu);
         }
-        Err(crate::context::PagingType::DownlinkDataNotification) => {
-            if let Err(e) = crate::gtp_path::send_downlink_data_notification_failure_indication(
-                ctx,
-                mme_ue_id,
-                crate::s11_build::GtpCause::UeNotResponding,
-            ) {
-                log::error!(
-                    "UE {mme_ue_id}: Downlink Data Notification Failure Indication not sent: {e}"
-                );
+        Err(paging_type) => {
+            if paging_type == crate::context::PagingType::DownlinkDataNotification {
+                if let Err(e) = crate::gtp_path::send_downlink_data_notification_failure_indication(
+                    ctx,
+                    mme_ue_id,
+                    crate::s11_build::GtpCause::UeNotResponding,
+                ) {
+                    log::error!(
+                        "UE {mme_ue_id}: Downlink Data Notification Failure Indication not sent: {e}"
+                    );
+                }
             }
+            // #862: deactivations waiting for this paging complete locally.
+            crate::bearer_deactivation::on_paging_failed(ctx, mme_ue_id);
         }
-        Err(_) => {}
     }
 }
 

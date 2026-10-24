@@ -21,6 +21,10 @@ rand.workspace = true
 uuid.workspace = true
 tokio = { workspace = true, features = ["time", "sync", "rt"] }
 
+[features]
+# A capturing logger for NF tests (#1026); enabled from [dev-dependencies] only.
+test-log = []
+
 [dev-dependencies]
 proptest.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
