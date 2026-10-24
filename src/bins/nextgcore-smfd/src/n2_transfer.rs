@@ -535,6 +535,76 @@ pub(crate) fn path_switch_request_acknowledge_transfer(
     )
 }
 
+/// `HandoverCommandTransfer` (TS 38.413 §9.3.4.10), the source NG-RAN's per-session
+/// content of a HANDOVER COMMAND (#964). `forwarding` is the target's DL Forwarding UP
+/// TNL Information and the QoS flows the source forwards into it, for direct data
+/// forwarding (TS 23.502 §4.9.1.3.2 step 11); with none, every member is absent and the
+/// source forwards nothing.
+pub(crate) fn handover_command_transfer(
+    forwarding: Option<((u32, [u8; 4]), &[u8])>,
+) -> Result<Vec<u8>, TransferError> {
+    const WHAT: &str = "HandoverCommandTransfer";
+    let (tunnel, flows) = match forwarding {
+        Some((tunnel, qfis)) if !qfis.is_empty() => {
+            let flows = qfis
+                .iter()
+                .map(|&q| {
+                    Ok(g::QosFlowToBeForwardedItem {
+                        qos_flow_identifier: qfi(WHAT, q)?,
+                        ie_extensions: None,
+                    })
+                })
+                .collect::<Result<Vec<_>, TransferError>>()?;
+            (
+                Some(gtp_tunnel(tunnel)),
+                Some(g::QosFlowToBeForwardedList(flows)),
+            )
+        }
+        _ => (None, None),
+    };
+    encode(
+        WHAT,
+        &g::HandoverCommandTransfer {
+            dl_forwarding_up_tnl_information: tunnel,
+            qos_flow_to_be_forwarded_list: flows,
+            data_forwarding_response_drb_list: None,
+            ie_extensions: None,
+        },
+    )
+}
+
+/// `HandoverPreparationUnsuccessfulTransfer` (TS 38.413 §9.3.4.18) for a session the
+/// target could not admit (#964), carrying the cause from the target's
+/// `HandoverResourceAllocationUnsuccessfulTransfer` (§9.3.4.13), or
+/// radioNetwork/ho-failure-in-target-5GC-ngran-node-or-target-system when that does not
+/// decode.
+pub(crate) fn handover_preparation_unsuccessful_transfer(
+    allocation_unsuccessful: &[u8],
+) -> Result<Vec<u8>, TransferError> {
+    let cause = decode::<g::HandoverResourceAllocationUnsuccessfulTransfer>(
+        "HandoverResourceAllocationUnsuccessfulTransfer",
+        allocation_unsuccessful,
+    )
+    .map(|t| t.cause)
+    .unwrap_or(g::Cause::RadioNetwork(g::CauseRadioNetwork(
+        g::CauseRadioNetwork::HO_FAILURE_IN_TARGET_5GC_NGRAN_NODE_OR_TARGET_SYSTEM,
+    )));
+    encode(
+        "HandoverPreparationUnsuccessfulTransfer",
+        &g::HandoverPreparationUnsuccessfulTransfer {
+            cause,
+            ie_extensions: None,
+        },
+    )
+}
+
+/// Whether a `HandoverRequiredTransfer` (TS 38.413 §9.3.4.14) reports a direct data
+/// forwarding path from the source NG-RAN to the target (#964).
+pub(crate) fn parse_handover_required_transfer(bytes: &[u8]) -> Result<bool, TransferError> {
+    let t = decode::<g::HandoverRequiredTransfer>("HandoverRequiredTransfer", bytes)?;
+    Ok(t.direct_forwarding_path_availability.is_some())
+}
+
 // ---------------------------------------------------------------------------
 // Parsers
 // ---------------------------------------------------------------------------
