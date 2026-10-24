@@ -1018,6 +1018,360 @@ fn a_ue_ambr_change_during_a_service_request_setup_is_deferred() {
     release(&ue);
 }
 
+/// A Downlink Data Notification for EBI `ebi` from the Serving GW at `sgw` to
+/// the MME at `mme`. Returns the Cause of its Acknowledge, and the requests
+/// the MME sent while acting on the notification (they precede the
+/// Acknowledge on the wire).
+fn notify(
+    sgw: &UdpSocket,
+    mme: std::net::SocketAddr,
+    ue: &Ue,
+    ebi: u8,
+    seq: u32,
+) -> (u8, Vec<Gtp2Message>) {
+    let mut ddn = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(176, ue.local_teid, seq));
+    ddn.add_ie(nextgcore_gtp::v2::Gtp2EbiIe::new(ebi).to_ie(0));
+    sgw.send_to(&ddn.encode(), mme).unwrap();
+    let mut before = Vec::new();
+    let mut buf = [0u8; 4096];
+    let ack = loop {
+        let (len, _) = sgw
+            .recv_from(&mut buf)
+            .expect("the SGW must receive the Downlink Data Notification Acknowledge");
+        let msg = Gtp2Message::decode(&mut bytes::Bytes::copy_from_slice(&buf[..len])).unwrap();
+        if msg.header.message_type == 177 {
+            break msg;
+        }
+        before.push(msg);
+    };
+    assert_eq!(ack.header.sequence_number, seq);
+    assert_eq!(ack.header.teid, Some(SGW_S11_TEID));
+    let cause = Gtp2CauseIe::decode(&ack.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value)
+        .unwrap()
+        .cause;
+    (cause, before)
+}
+
+/// The Release Access Bearers Request among `sent`, else the next one.
+fn release_access_bearers(sgw: &UdpSocket, sent: Vec<Gtp2Message>) -> Gtp2Message {
+    sent.into_iter()
+        .find(|m| m.header.message_type == 170)
+        .unwrap_or_else(|| recv(sgw, 170).0)
+}
+
+/// Answer the Modify Bearer Request `mbr` with message `cause` and, per
+/// bearer, its own cause, and wait until the MME has taken the response.
+fn answer_modify_bearer(
+    sgw: &UdpSocket,
+    mme: std::net::SocketAddr,
+    ue: &Ue,
+    mbr: &Gtp2Message,
+    cause: u8,
+    bearers: &[(u8, u8)],
+) {
+    let mut rsp = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+        35,
+        ue.local_teid,
+        mbr.header.sequence_number,
+    ));
+    rsp.add_ie(Gtp2CauseIe::new(cause).to_ie(0));
+    for (ebi, c) in bearers {
+        let mut bc = Gtp2BearerContextIe::new();
+        bc.set_ebi(*ebi);
+        bc.set_cause(&Gtp2CauseIe::new(*c));
+        rsp.add_bearer_context(0, &bc);
+    }
+    sgw.send_to(&rsp.encode(), mme).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while crate::gtp_path::modify_bearer_in_flight(ue.mme_ue_id) {
+        assert!(
+            Instant::now() < deadline,
+            "the MME must take the Modify Bearer Response"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The Cause of a UE CONTEXT RELEASE COMMAND.
+fn release_command_cause(pdu: &g::S1AP_PDU) -> Option<g::Cause> {
+    let g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+        value: g::InitiatingMessageValue::Id_UEContextRelease(cmd),
+        ..
+    }) = pdu
+    else {
+        return None;
+    };
+    cmd.protocol_i_es.0.iter().find_map(|ie| match &ie.value {
+        g::UEContextReleaseCommandProtocolIEs_EntryValue::Id_Cause(c) => Some(c.clone()),
+        _ => None,
+    })
+}
+
+/// Whether `ue` is still ECM-CONNECTED with nothing released: no UE context
+/// release recorded, no paging owed, and its eNB S1-U endpoints kept.
+fn untouched(ue: &Ue) -> bool {
+    let ctx = mme_self();
+    ctx.enb_ue_find_by_id(ue.enb_ue_id)
+        .is_some_and(|e| e.ue_ctx_rel_action == crate::context::UeCtxRelAction::Invalid)
+        && !ctx
+            .mme_ue_find_by_id(ue.mme_ue_id)
+            .unwrap()
+            .ddn_pending_after_release
+        && crate::gtp_path::bearers_of_ue(ctx, ue.mme_ue_id)
+            .iter()
+            .all(|b| b.enb_s1u_teid != 0)
+}
+
+/// #1015, TS 23.401 §5.3.5 / §5.3.4.3: once the Serving GW has accepted the
+/// eNB's S1-U F-TEIDs, a Downlink Data Notification for the ECM-CONNECTED UE
+/// means the Serving GW released its S1-U (an S1-U path failure with S1-MME
+/// up). The MME releases the S1 connection, Transport cause
+/// transport-resource-unavailable, the UE goes ECM-IDLE and is paged. Before
+/// the Serving GW held the F-TEIDs the same notification changes nothing.
+#[test]
+fn a_notification_for_a_connected_ue_whose_s1u_was_released_releases_and_pages() {
+    let _guard = lock_s11();
+    let (sgw, _route) = sgw(Gtp2XactConfig::default());
+    let ue = seed(0x1015, &[5, 6]);
+    let ctx = mme_self();
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    let _ = crate::s1ap_path::take_tapped_for_test(ue.enb_id);
+
+    // The Serving GW never held the eNB's F-TEIDs: S1-U is still being set up.
+    let (_, cause) =
+        crate::s11_handler::downlink_data_notification_for_bearer(ctx, ue.local_teid, Some(5));
+    assert_eq!(cause, crate::s11_build::GtpCause::RequestAccepted);
+    assert!(
+        untouched(&ue),
+        "S1-U not yet at the Serving GW: nothing released"
+    );
+
+    // Attach step 23: the Serving GW takes the eNB's F-TEIDs.
+    crate::gtp_path::send_modify_bearer_request(
+        ctx,
+        ue.enb_ue_id,
+        ue.mme_ue_id,
+        false,
+        crate::s11_build::GtpModifyAction::NoAction,
+    )
+    .unwrap();
+    let (mbr, mme) = recv(&sgw, 34);
+    answer_modify_bearer(&sgw, mme, &ue, &mbr, 16, &[(5, 16), (6, 16)]);
+
+    // The Serving GW released S1-U (BUFF + NOCP) and notifies downlink.
+    let (cause, sent) = notify(&sgw, mme, &ue, 5, 0x1015);
+    assert_eq!(cause, 16, "Request accepted");
+    let rab = release_access_bearers(&sgw, sent);
+    assert_eq!(rab.header.teid, Some(SGW_S11_TEID));
+    assert!(
+        crate::gtp_path::bearers_of_ue(ctx, ue.mme_ue_id)
+            .iter()
+            .all(|b| b.enb_s1u_teid == 0 && b.enb_s1u_at_sgw.is_none()),
+        "the S1-U bearers are released"
+    );
+    let mut rsp = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+        171,
+        ue.local_teid,
+        rab.header.sequence_number,
+    ));
+    rsp.add_ie(Gtp2CauseIe::new(16).to_ie(0));
+    sgw.send_to(&rsp.encode(), mme).unwrap();
+    assert_eq!(
+        wait_pdu(ue.enb_id, release_command_cause),
+        g::Cause::Transport(g::CauseTransport(0)),
+        "transport-resource-unavailable (TS 36.413 §9.2.1.3)"
+    );
+    assert!(!ctx
+        .mme_ue_find_by_id(ue.mme_ue_id)
+        .unwrap()
+        .t3413
+        .is_running());
+
+    let enb_ue = ctx.enb_ue_find_by_id(ue.enb_ue_id).unwrap();
+    crate::s1ap_handler::handle_ue_context_release_complete(
+        ctx,
+        ue.enb_id,
+        &nextgcore_s1ap::UeContextReleaseComplete {
+            mme_ue_s1ap_id: enb_ue.mme_ue_s1ap_id,
+            enb_ue_s1ap_id: enb_ue.enb_ue_s1ap_id,
+        },
+    );
+    wait_pdu(ue.enb_id, is_paging);
+    let mme_ue = ctx.mme_ue_find_by_id(ue.mme_ue_id).unwrap();
+    assert!(mme_ue.t3413.is_running(), "paged once ECM-IDLE");
+    assert!(ctx.enb_ue_find_by_id(ue.enb_ue_id).is_none(), "ECM-IDLE");
+    release(&ue);
+}
+
+/// #1015: the notification releases nothing while the Serving GW may lack the
+/// eNB's F-TEIDs for a reason that is not a failure: a Modify Bearer Request
+/// unanswered, an Initial Context Setup outstanding, or a bearer the Serving GW
+/// did not accept (Request accepted partially, TS 29.274 Table 7.2.8-1). A
+/// bearer it accepted still counts.
+#[test]
+fn a_notification_while_s1u_is_being_set_up_releases_nothing() {
+    let _guard = lock_s11();
+    let (sgw, _route) = sgw(Gtp2XactConfig::default());
+    let ue = seed(0x1016, &[5, 6]);
+    let ctx = mme_self();
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    let _ = crate::s1ap_path::take_tapped_for_test(ue.enb_id);
+
+    crate::gtp_path::send_modify_bearer_request(
+        ctx,
+        ue.enb_ue_id,
+        ue.mme_ue_id,
+        false,
+        crate::s11_build::GtpModifyAction::NoAction,
+    )
+    .unwrap();
+    let (mbr, mme) = recv(&sgw, 34);
+    let (cause, sent) = notify(&sgw, mme, &ue, 5, 0x1016);
+    assert_eq!(cause, 16);
+    assert!(sent.is_empty(), "nothing sent to the Serving GW");
+    assert!(untouched(&ue), "a Modify Bearer Request is in flight");
+
+    // EBI 6 is not accepted.
+    answer_modify_bearer(&sgw, mme, &ue, &mbr, 17, &[(5, 16), (6, 73)]);
+    let (cause, sent) = notify(&sgw, mme, &ue, 6, 0x1017);
+    assert_eq!(cause, 16);
+    assert!(sent.is_empty(), "nothing sent to the Serving GW");
+    assert!(untouched(&ue), "the Serving GW never held EBI 6's F-TEID");
+
+    // Another Modify Bearer Request (as for a handover) is in flight: the
+    // Serving GW may be switching EBI 5's F-TEID.
+    crate::gtp_path::send_modify_bearer_request(
+        ctx,
+        ue.enb_ue_id,
+        ue.mme_ue_id,
+        false,
+        crate::s11_build::GtpModifyAction::NoAction,
+    )
+    .unwrap();
+    let (mbr, _) = recv(&sgw, 34);
+    let (cause, sent) = notify(&sgw, mme, &ue, 5, 0x101a);
+    assert_eq!(cause, 16);
+    assert!(sent.is_empty(), "nothing sent to the Serving GW");
+    assert!(untouched(&ue), "a Modify Bearer Request is in flight again");
+    answer_modify_bearer(&sgw, mme, &ue, &mbr, 17, &[(5, 16), (6, 73)]);
+
+    ctx.mme_ue_pool
+        .write()
+        .unwrap()
+        .get_mut(&ue.mme_ue_id)
+        .unwrap()
+        .ics_pending_on = ue.enb_ue_id;
+    let (cause, sent) = notify(&sgw, mme, &ue, 5, 0x1018);
+    assert_eq!(cause, 16);
+    assert!(sent.is_empty(), "nothing sent to the Serving GW");
+    assert!(untouched(&ue), "an Initial Context Setup is outstanding");
+    ctx.mme_ue_pool
+        .write()
+        .unwrap()
+        .get_mut(&ue.mme_ue_id)
+        .unwrap()
+        .ics_pending_on = 0;
+
+    // EBI 5 was accepted: its notification is a released S1-U.
+    let (cause, sent) = notify(&sgw, mme, &ue, 5, 0x1019);
+    assert_eq!(cause, 16);
+    let rab = release_access_bearers(&sgw, sent);
+    let mut rsp = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+        171,
+        ue.local_teid,
+        rab.header.sequence_number,
+    ));
+    rsp.add_ie(Gtp2CauseIe::new(16).to_ie(0));
+    sgw.send_to(&rsp.encode(), mme).unwrap();
+    wait_pdu(ue.enb_id, release_command_cause);
+    let enb_ue = ctx.enb_ue_find_by_id(ue.enb_ue_id).unwrap();
+    crate::s1ap_handler::handle_ue_context_release_complete(
+        ctx,
+        ue.enb_id,
+        &nextgcore_s1ap::UeContextReleaseComplete {
+            mme_ue_s1ap_id: enb_ue.mme_ue_s1ap_id,
+            enb_ue_s1ap_id: enb_ue.enb_ue_s1ap_id,
+        },
+    );
+    wait_pdu(ue.enb_id, is_paging);
+    release(&ue);
+}
+
+/// #1023 review: under a user plane path that stays failed, each S1 release for
+/// a released S1-U pages the UE back onto the same dead path. At most two such
+/// releases per UE per minute: a third notification in the window releases
+/// nothing, and once the window has passed the next one releases again.
+#[test]
+fn released_s1u_releases_are_bounded_per_window() {
+    let _guard = lock_s11();
+    let (sgw, _route) = sgw(Gtp2XactConfig::default());
+    let ue = seed(0x1023, &[5]);
+    let ctx = mme_self();
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    let _ = crate::s1ap_path::take_tapped_for_test(ue.enb_id);
+    crate::gtp_path::send_modify_bearer_request(
+        ctx,
+        ue.enb_ue_id,
+        ue.mme_ue_id,
+        false,
+        crate::s11_build::GtpModifyAction::NoAction,
+    )
+    .unwrap();
+    let (mbr, mme) = recv(&sgw, 34);
+    answer_modify_bearer(&sgw, mme, &ue, &mbr, 16, &[(5, 16)]);
+
+    // Two releases in the last minute already.
+    let now = Instant::now();
+    ctx.mme_ue_pool
+        .write()
+        .unwrap()
+        .get_mut(&ue.mme_ue_id)
+        .unwrap()
+        .stale_s1u_releases = vec![now - Duration::from_secs(20), now - Duration::from_secs(5)];
+    let (cause, sent) = notify(&sgw, mme, &ue, 5, 0x1023);
+    assert_eq!(cause, 16);
+    assert!(sent.is_empty(), "no Release Access Bearers");
+    assert!(untouched(&ue), "bounded: no third release in the window");
+
+    // The window has passed: released again.
+    ctx.mme_ue_pool
+        .write()
+        .unwrap()
+        .get_mut(&ue.mme_ue_id)
+        .unwrap()
+        .stale_s1u_releases = vec![now - Duration::from_secs(70), now - Duration::from_secs(61)];
+    let (_, sent) = notify(&sgw, mme, &ue, 5, 0x1024);
+    let rab = release_access_bearers(&sgw, sent);
+    assert_eq!(rab.header.teid, Some(SGW_S11_TEID));
+    assert_eq!(
+        ctx.mme_ue_find_by_id(ue.mme_ue_id)
+            .unwrap()
+            .stale_s1u_releases
+            .len(),
+        1,
+        "the old entries pruned, this release recorded"
+    );
+    let mut rsp = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+        171,
+        ue.local_teid,
+        rab.header.sequence_number,
+    ));
+    rsp.add_ie(Gtp2CauseIe::new(16).to_ie(0));
+    sgw.send_to(&rsp.encode(), mme).unwrap();
+    wait_pdu(ue.enb_id, release_command_cause);
+    let enb_ue = ctx.enb_ue_find_by_id(ue.enb_ue_id).unwrap();
+    crate::s1ap_handler::handle_ue_context_release_complete(
+        ctx,
+        ue.enb_id,
+        &nextgcore_s1ap::UeContextReleaseComplete {
+            mme_ue_s1ap_id: enb_ue.mme_ue_s1ap_id,
+            enb_ue_s1ap_id: enb_ue.enb_ue_s1ap_id,
+        },
+    );
+    wait_pdu(ue.enb_id, is_paging);
+    release(&ue);
+}
+
 /// A second PDN connection for `ue`, its default bearer `ebi` active at the
 /// Serving GW and (until an S1 release) at the eNB. Returns the session id.
 fn add_pdn(ue: &Ue, ebi: u8) -> u64 {

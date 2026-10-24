@@ -412,6 +412,8 @@ impl GtpcServer {
                             // #730: a handover waits on this Modify Bearer Request.
                             // Without this the Path Switch Request is never answered.
                             if xact.message_type == s11_build::message_type::MODIFY_BEARER_REQUEST {
+                                // #1015: the Serving GW never took these endpoints.
+                                drop_mbr_endpoints(xact.sequence_number);
                                 if let Some(pending) =
                                     take_pending_handover_modification(xact.sequence_number)
                                 {
@@ -1167,7 +1169,11 @@ pub fn send_modify_bearer_request(
     let msg = s11_build::build_modify_bearer_request(&mme_ue, &sgw_ue, &bearer_refs, &[], seq)
         .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
     let xact_id = ctx.next_pool_id();
-    send_to_sgwc(ctx, &msg, xact_id)?;
+    record_mbr_endpoints(seq, mme_ue_id, &bearer_refs);
+    if let Err(e) = send_to_sgwc(ctx, &msg, xact_id) {
+        drop_mbr_endpoints(seq);
+        return Err(e);
+    }
 
     Ok(GtpXactData {
         xact_id,
@@ -1292,7 +1298,15 @@ pub fn send_create_bearer_response(
         sequence_number,
     )
     .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
-    send_response_to(peer, &msg)
+    send_response_to(peer, &msg)?;
+    // #1015: an accepted Create Bearer Response gives the Serving GW the new
+    // bearer's eNB S1-U F-TEID (TS 29.274 Table 7.2.4-2).
+    if matches!(cause_value, GtpCause::RequestAccepted) && bearer.enb_s1u_teid != 0 {
+        if let Some(b) = ctx.bearer_pool.write().unwrap().get_mut(&bearer_id) {
+            b.enb_s1u_at_sgw = Some((bearer.enb_s1u_teid, bearer.enb_s1u_ip.clone()));
+        }
+    }
+    Ok(())
 }
 
 pub fn send_update_bearer_response(
@@ -1393,6 +1407,101 @@ pub fn send_release_access_bearers_request(
     })
 }
 
+/// The eNB S1-U F-TEIDs one Modify Bearer Request carried, by EBI.
+type SentEnbEndpoints = Vec<(u8, u32, crate::context::IpAddr)>;
+
+/// Every Modify Bearer Request still waiting for its response, by sequence
+/// number: the UE and the eNB S1-U F-TEIDs it gave the Serving GW (#1015).
+/// The accepted response records them on the bearers
+/// ([`MmeBearer::enb_s1u_at_sgw`](crate::context::MmeBearer::enb_s1u_at_sgw)),
+/// and while a record is here the UE has a Modify Bearer Request in flight.
+static PENDING_MBR_ENDPOINTS: OnceLock<Mutex<HashMap<u32, (u64, SentEnbEndpoints)>>> =
+    OnceLock::new();
+
+fn pending_mbr_endpoints() -> &'static Mutex<HashMap<u32, (u64, SentEnbEndpoints)>> {
+    PENDING_MBR_ENDPOINTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record, before the send (the #359 lesson), the eNB S1-U F-TEIDs the Modify
+/// Bearer Request at `seq` carries for `mme_ue_id`.
+fn record_mbr_endpoints(seq: u32, mme_ue_id: u64, bearers: &[&crate::context::MmeBearer]) {
+    let sent = bearers
+        .iter()
+        .map(|b| (b.ebi, b.enb_s1u_teid, b.enb_s1u_ip.clone()))
+        .collect();
+    pending_mbr_endpoints()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(seq, (mme_ue_id, sent));
+}
+
+/// Forget the Modify Bearer Request at `seq` (unsent, or unanswered after N3).
+fn drop_mbr_endpoints(seq: u32) {
+    pending_mbr_endpoints()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&seq);
+}
+
+/// Whether `mme_ue_id` has a Modify Bearer Request the Serving GW has not
+/// answered yet (#1015): until it has, the Serving GW may lack the eNB's S1-U
+/// F-TEIDs for a reason that is not a failure.
+pub fn modify_bearer_in_flight(mme_ue_id: u64) -> bool {
+    pending_mbr_endpoints()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .any(|(ue, _)| *ue == mme_ue_id)
+}
+
+/// The Modify Bearer Response at `seq` (TS 29.274 §7.2.8): the eNB S1-U
+/// F-TEIDs its request carried are now the Serving GW's, for every bearer it
+/// accepted (#1015). Request accepted (16) covers each bearer that has no
+/// Cause of its own; Request accepted partially (17) only the bearers whose own
+/// Cause is 16 (Table 7.2.8-1). A bearer marked for removal is not held.
+pub fn confirm_mbr_endpoints(
+    ctx: &MmeContext,
+    seq: u32,
+    data: &crate::s11_handler::ModifyBearerResponseData,
+) {
+    use nextgcore_gtp::v2::cause::{REQUEST_ACCEPTED as ACCEPTED, REQUEST_ACCEPTED_PARTIALLY};
+    let Some((mme_ue_id, sent)) = pending_mbr_endpoints()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&seq)
+    else {
+        return;
+    };
+    if data.cause != ACCEPTED && data.cause != REQUEST_ACCEPTED_PARTIALLY {
+        return;
+    }
+    for (ebi, teid, ip) in sent {
+        if data.bearers_marked_for_removal.contains(&ebi) {
+            continue;
+        }
+        let own = data
+            .bearer_contexts
+            .iter()
+            .find(|b| b.ebi == ebi)
+            .and_then(|b| b.cause);
+        let held = match own {
+            Some(c) => c == ACCEPTED,
+            None => data.cause == ACCEPTED,
+        };
+        if !held {
+            continue;
+        }
+        // #1023 review: the bearer by its (UE, EBI) key, then the pool entry by
+        // id, rather than a scan of every bearer under the write lock.
+        let Some(id) = ctx.bearer_of_ue_by_ebi(mme_ue_id, ebi) else {
+            continue;
+        };
+        if let Some(b) = ctx.bearer_pool.write().unwrap().get_mut(&id) {
+            b.enb_s1u_at_sgw = Some((teid, ip));
+        }
+    }
+}
+
 /// The S1 releases (TS 23.401 §5.3.5) waiting for their Release Access Bearers
 /// Response before the UE CONTEXT RELEASE COMMAND goes (step 5), by sequence
 /// number: the eNB UE context to release (#956).
@@ -1450,6 +1559,8 @@ pub fn clear_enb_endpoints(ctx: &MmeContext, mme_ue_id: u64) {
     for b in pool.values_mut().filter(|b| b.mme_ue_id == mme_ue_id) {
         b.enb_s1u_teid = 0;
         b.enb_s1u_ip = Default::default();
+        // The Release Access Bearers Request releases them at the Serving GW.
+        b.enb_s1u_at_sgw = None;
     }
 }
 
@@ -1517,7 +1628,11 @@ pub fn send_modify_bearer_request_for_service_request(
     let seq = sequence()?;
     let msg = s11_build::build_modify_bearer_request(&mme_ue, &sgw_ue, &refs, &[], seq)
         .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
-    send_to_sgwc(ctx, &msg, mme_ue_id)?;
+    record_mbr_endpoints(seq, mme_ue_id, &refs);
+    if let Err(e) = send_to_sgwc(ctx, &msg, mme_ue_id) {
+        drop_mbr_endpoints(seq);
+        return Err(e);
+    }
     Ok(seq)
 }
 
@@ -1769,10 +1884,12 @@ pub fn send_modify_bearer_request_for_erab_modification(
         .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
     // Recorded before the send (the #359 lesson): a response can race the
     // return of `send_to`.
+    record_mbr_endpoints(seq, mme_ue_id, &bearer_refs);
     if let Ok(mut map) = pending_erab_modifications().lock() {
         map.insert(seq, pending);
     }
     if let Err(e) = send_to_sgwc(ctx, &msg, ctx.next_pool_id()) {
+        drop_mbr_endpoints(seq);
         take_pending_erab_modification(seq);
         return Err(e);
     }
@@ -1956,11 +2073,13 @@ pub fn send_modify_bearer_request_for_handover(
     .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
     // Recorded before the send (the #359 lesson): a response can race the
     // return of `send_to`.
+    record_mbr_endpoints(seq, pending.mme_ue_id, &bearer_refs);
     pending_handover_modifications()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(seq, pending);
     if let Err(e) = send_to_sgwc(ctx, &msg, ctx.next_pool_id()) {
+        drop_mbr_endpoints(seq);
         take_pending_handover_modification(seq);
         return Err(e);
     }
