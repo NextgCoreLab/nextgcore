@@ -13457,26 +13457,26 @@ mod tests {
         );
     }
 
-    /// A HANDOVER_COMPLETE with no decodable target endpoint still completes, and
-    /// says so. Asserted because the alternative — a bare 200 — would leave an
-    /// operator unable to tell a switched tunnel from an unswitched one.
+    /// A COMPLETED the SMF cannot carry out -- no target endpoint was learned at
+    /// PREPARED, and no N4 session -- is an error, not `200 COMPLETED` (#964 review): the
+    /// downlink was not switched, and a success would hide that from the AMF, which
+    /// retries once and logs.
     #[tokio::test]
-    async fn handover_complete_without_a_target_endpoint_still_completes() {
+    async fn a_handover_completed_without_a_target_endpoint_is_an_error() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let reference = seed_registered_session("imsi-001010000000082", 6, "internet");
-        let req = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts/x/modify").with_body(
-            serde_json::json!({
-                "n2SmInfoType": "HANDOVER_COMPLETE",
-                "hoState": "COMPLETED",
-            })
-            .to_string(),
-            "application/json",
-        );
-        let resp = handle_sm_context_update(&reference, &req).await;
-        assert_eq!(resp.status, 200);
-        let body: serde_json::Value =
-            serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("json");
-        assert_eq!(body["hoState"], serde_json::json!("COMPLETED"));
+        for body in [
+            serde_json::json!({ "n2SmInfoType": "HANDOVER_COMPLETE", "hoState": "COMPLETED" }),
+            serde_json::json!({ "hoState": "COMPLETED" }),
+        ] {
+            let req = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts/x/modify")
+                .with_body(body.to_string(), "application/json");
+            let resp = handle_sm_context_update(&reference, &req).await;
+            assert_eq!(resp.status, 500, "{body}");
+            let problem: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("json");
+            assert_eq!(problem["cause"], "SYSTEM_FAILURE", "{body}");
+        }
     }
 
     /// #78 criterion 7: create → retrieve → update → release, asserting each status

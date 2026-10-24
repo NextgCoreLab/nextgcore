@@ -1333,7 +1333,13 @@ async fn handle_completed_inner(
             target.is_some(),
             upf_seid.is_some()
         );
-        return completed();
+        // #964 review: an error, not `200 COMPLETED`, so the AMF sees that the downlink was
+        // not switched (it retries once and logs), rather than a success that did nothing.
+        return crate::problem_response(
+            500,
+            "SYSTEM_FAILURE",
+            "The handover cannot complete: no target DL endpoint or no N4 session",
+        );
     };
     let smf_n4_seid = crate::smf_n4_seid_for(sm_context_ref);
     let forwarding_ebis = sess

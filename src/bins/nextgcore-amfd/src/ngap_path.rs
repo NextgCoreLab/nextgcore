@@ -872,6 +872,21 @@ pub struct NgapServer {
     handover_dropped_psis: HashMap<u64, Vec<u8>>,
     /// Distinguishes one N2 handover step's SMF answers from a later one's (#964).
     ho_generation: u64,
+    /// The sessions the target admitted that are not handed over, per UE (#964 review):
+    /// released at the target, by PDU Session Resource Release Command, once the UE has
+    /// arrived there.
+    handover_target_release_psis: HashMap<u64, Vec<u8>>,
+    /// The sessions of the current preparation already told CANCELLED, per UE, so a
+    /// session is cancelled once whichever path gets there first (#964 review).
+    handover_cancelled_psis: HashMap<u64, HashSet<u8>>,
+    /// TS 23.502 §4.9.1.3.2 step 8: the longest the AMF waits for the SMFs' PREPARING
+    /// answers before it continues with the sessions that answered (#964 review).
+    /// `AMF_HANDOVER_PREPARATION_SMF_WAIT_MS`, default 1000.
+    ho_preparation_wait: Duration,
+    /// The same supervision for the PREPARED answers to a target's Acknowledge, which
+    /// count against the source's TNGRELOCoverall (#964 review).
+    /// `AMF_HANDOVER_COMMAND_SMF_WAIT_MS`, default 1000.
+    ho_command_wait: Duration,
     /// EPS→5GS handovers in flight, keyed by the AMF UE NGAP ID allocated for the
     /// arriving UE (#418).
     ///
@@ -1079,6 +1094,10 @@ impl NgapServer {
             handover_dropped_psis: HashMap::new(),
             handover_listed_psis: HashMap::new(),
             ho_generation: 0,
+            handover_target_release_psis: HashMap::new(),
+            handover_cancelled_psis: HashMap::new(),
+            ho_preparation_wait: handover_smf_wait_from_env("AMF_HANDOVER_PREPARATION_SMF_WAIT_MS"),
+            ho_command_wait: handover_smf_wait_from_env("AMF_HANDOVER_COMMAND_SMF_WAIT_MS"),
             eps_ho_in_flight: HashMap::new(),
             emergency: crate::emergency::EmergencyHandler::new(),
             ngap_overload_declared: false,
@@ -1150,6 +1169,7 @@ impl NgapServer {
         self.process_connected_downlinks().await;
 
         self.process_sbi_outcomes().await;
+        self.process_handover_deadlines().await;
         self.process_pending_establishments().await;
 
         // Relay any PWS warning containers the Namf non-UE N2 transfer handler
@@ -10056,6 +10076,8 @@ impl NgapServer {
         self.ho_commands.remove(&amf_ue_ngap_id);
         self.handover_dropped_psis.remove(&amf_ue_ngap_id);
         self.handover_listed_psis.remove(&amf_ue_ngap_id);
+        self.handover_target_release_psis.remove(&amf_ue_ngap_id);
+        self.handover_cancelled_psis.remove(&amf_ue_ngap_id);
         self.handover_target_assoc.remove(&amf_ue_ngap_id);
         self.handover_target_transfers
             .retain(|(ue, _psi), _| *ue != amf_ue_ngap_id);
@@ -10442,6 +10464,20 @@ impl NgapServer {
         required: nextgcore_ngap::types::HandoverRequired,
     ) -> Result<()> {
         let ue = required.amf_ue_ngap_id;
+        // #964 review: a preparation still in progress is superseded -- the source has
+        // abandoned it. Its target releases what it prepared and its SMFs are told
+        // CANCELLED, keyed ahead of this preparation's PREPARING.
+        if self.ho_preparations.contains_key(&ue)
+            || self.ho_commands.contains_key(&ue)
+            || self.handover_pending_target.contains_key(&ue)
+        {
+            log::info!(
+                "HandoverRequired for UE {ue} supersedes the preparation in progress; it is \
+                 cancelled"
+            );
+            self.release_cancelled_handover_target(ue, "HO_CANCEL")
+                .await;
+        }
         // #742: a new preparation starts from nothing. An earlier one that ended without
         // a Notify must not contribute a session transfer the new target never admitted.
         self.forget_handover_preparation(ue);
@@ -10506,6 +10542,7 @@ impl NgapServer {
             ue,
             HoPreparation {
                 generation,
+                deadline: Instant::now() + self.ho_preparation_wait,
                 source_assoc,
                 target_assoc,
                 required,
@@ -10556,12 +10593,21 @@ impl NgapServer {
                 }
                 match answer.result {
                     Ok(transfer) => prep.ready.push((answer.psi, transfer)),
-                    Err(e) => log::warn!(
-                        "HandoverRequired for UE {ue}: PSI {} not handed over: {e}",
-                        answer.psi
-                    ),
+                    Err(e) => {
+                        log::warn!(
+                            "HandoverRequired for UE {ue}: PSI {} not handed over: {e}",
+                            answer.psi
+                        );
+                        // #964 review: the SMF may have processed the PREPARING before
+                        // its answer was lost; CANCELLED leaves it no preparation.
+                        self.cancel_sessions_at_smfs(ue, &[answer.psi], "HO_FAILURE");
+                    }
                 }
-                if prep.awaiting.is_empty() {
+                if self
+                    .ho_preparations
+                    .get(&ue)
+                    .is_some_and(|p| p.awaiting.is_empty())
+                {
                     let prep = self.ho_preparations.remove(&ue).expect("present");
                     if prep.ready.is_empty() {
                         return self
@@ -10587,12 +10633,19 @@ impl NgapServer {
                         cmd.released.push((answer.psi, transfer))
                     }
                     (_, Ok(transfer)) => cmd.ready.push((answer.psi, transfer)),
-                    (step, Err(e)) => log::warn!(
-                        "HandoverRequestAcknowledge for UE {ue}: PSI {} ({step:?}): {e}",
-                        answer.psi
-                    ),
+                    (step, Err(e)) => {
+                        log::warn!(
+                            "HandoverRequestAcknowledge for UE {ue}: PSI {} ({step:?}): {e}",
+                            answer.psi
+                        );
+                        self.cancel_sessions_at_smfs(ue, &[answer.psi], "HO_FAILURE");
+                    }
                 }
-                if cmd.awaiting.is_empty() {
+                if self
+                    .ho_commands
+                    .get(&ue)
+                    .is_some_and(|c| c.awaiting.is_empty())
+                {
                     let cmd = self.ho_commands.remove(&ue).expect("present");
                     return self.send_handover_command(ue, cmd).await;
                 }
@@ -10696,6 +10749,7 @@ impl NgapServer {
         }
         let pending = HoCommandPending {
             generation,
+            deadline: Instant::now() + self.ho_command_wait,
             source_assoc,
             target_assoc,
             target_ran: ack.ran_ue_ngap_id,
@@ -10861,6 +10915,19 @@ impl NgapServer {
                 }
                 self.handover_dropped_psis
                     .insert(ue, dropped.iter().map(|(psi, _)| *psi).collect());
+                // #964 review: a session the target admitted but this handover does not
+                // carry (its PREPARED failed or was not answered in time) holds resources
+                // at the target; they are released once the UE is there.
+                let admitted_not_handed: Vec<u8> = cmd
+                    .admitted
+                    .iter()
+                    .map(|(psi, _)| *psi)
+                    .filter(|psi| !cmd.ready.iter().any(|(p, _)| p == psi))
+                    .collect();
+                if !admitted_not_handed.is_empty() {
+                    self.handover_target_release_psis
+                        .insert(ue, admitted_not_handed);
+                }
             }
             Err(()) => log::error!("Failed to build HandoverCommand"),
         }
@@ -10929,7 +10996,21 @@ impl NgapServer {
         }
         psis.sort_unstable();
         psis.dedup();
-        for psi in psis {
+        self.cancel_sessions_at_smfs(amf_ue_ngap_id, &psis, cause);
+    }
+
+    /// `hoState: CANCELLED` with `cause` to the SMF of each of `psis`, keyed per (UE, PSI)
+    /// so it runs after whatever step is still in flight for the session (#964).
+    fn cancel_sessions_at_smfs(&mut self, amf_ue_ngap_id: u64, psis: &[u8], cause: &'static str) {
+        for &psi in psis {
+            if !self
+                .handover_cancelled_psis
+                .entry(amf_ue_ngap_id)
+                .or_default()
+                .insert(psi)
+            {
+                continue;
+            }
             let Some(sm_ref) = self.sm_context_refs.get(&(amf_ue_ngap_id, psi)).cloned() else {
                 continue;
             };
@@ -10977,17 +11058,29 @@ impl NgapServer {
             };
             let (host, port) = self.smf_target_for(ue, psi);
             self.sbi_offload.spawn_keyed((ue, psi), move || async move {
-                match crate::sbi_path::call_smf_n2_handover(
-                    &host,
-                    port,
-                    &sm_ref,
-                    "COMPLETED",
-                    None,
-                    None,
-                    None,
-                )
-                .await
-                {
+                let complete = || {
+                    crate::sbi_path::call_smf_n2_handover(
+                        &host,
+                        port,
+                        &sm_ref,
+                        "COMPLETED",
+                        None,
+                        None,
+                        None,
+                    )
+                };
+                // #964 review: the source has been released, so a COMPLETED that does not
+                // land leaves the downlink pointed at nothing; it is tried once more.
+                let mut outcome = complete().await;
+                if let Err(e) = &outcome {
+                    log::warn!(
+                        "UE {ue}: PSI {psi} COMPLETED failed ({e}); retrying once in \
+                         {HANDOVER_COMPLETED_RETRY:?}"
+                    );
+                    tokio::time::sleep(HANDOVER_COMPLETED_RETRY).await;
+                    outcome = complete().await;
+                }
+                match outcome {
                     Ok(_) => log::info!(
                         "UE {ue}: PSI {psi} handover COMPLETED at the SMF; the downlink is on \
                          the target"
@@ -11020,6 +11113,68 @@ impl NgapServer {
             });
         }
         queued
+    }
+
+    /// TS 23.502 §4.9.1.3.2 step 8 (#964 review): "At expiry of the maximum wait time or
+    /// when all Nsmf_PDUSession_UpdateSMContext Response messages are received, AMF
+    /// continues with the N2 Handover procedure". A preparation or an Acknowledge whose
+    /// wait has expired goes on with the sessions that answered; each session still
+    /// waiting is not handed over and its SMF is told CANCELLED (HO_FAILURE), keyed after
+    /// the step it has not answered. Its late answer is ignored.
+    async fn process_handover_deadlines(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<u64> = self
+            .ho_preparations
+            .iter()
+            .filter(|(_, p)| p.deadline <= now)
+            .map(|(ue, _)| *ue)
+            .collect();
+        for ue in expired {
+            let Some(prep) = self.ho_preparations.remove(&ue) else {
+                continue;
+            };
+            let mut late: Vec<u8> = prep.awaiting.iter().copied().collect();
+            late.sort_unstable();
+            log::warn!(
+                "HandoverRequired for UE {ue}: no PREPARING answer within {:?} for PSIs \
+                 {late:?}; continuing with PSIs {:?}",
+                self.ho_preparation_wait,
+                prep.ready.iter().map(|(psi, _)| *psi).collect::<Vec<_>>()
+            );
+            self.cancel_sessions_at_smfs(ue, &late, "HO_FAILURE");
+            let result = if prep.ready.is_empty() {
+                self.fail_handover_preparation(prep.source_assoc, &prep.required)
+                    .await
+            } else {
+                self.send_handover_request(prep).await
+            };
+            if let Err(e) = result {
+                log::warn!("HandoverRequired for UE {ue}: continuing after the wait: {e}");
+            }
+        }
+        let expired: Vec<u64> = self
+            .ho_commands
+            .iter()
+            .filter(|(_, c)| c.deadline <= now)
+            .map(|(ue, _)| *ue)
+            .collect();
+        for ue in expired {
+            let Some(mut cmd) = self.ho_commands.remove(&ue) else {
+                continue;
+            };
+            let mut late: Vec<u8> = cmd.awaiting.drain().collect();
+            late.sort_unstable();
+            log::warn!(
+                "HandoverRequestAcknowledge for UE {ue}: no PREPARED answer within {:?} for \
+                 PSIs {late:?}; commanding the source with PSIs {:?}",
+                self.ho_command_wait,
+                cmd.ready.iter().map(|(psi, _)| *psi).collect::<Vec<_>>()
+            );
+            self.cancel_sessions_at_smfs(ue, &late, "HO_FAILURE");
+            if let Err(e) = self.send_handover_command(ue, cmd).await {
+                log::warn!("HandoverRequestAcknowledge for UE {ue}: after the wait: {e}");
+            }
+        }
     }
 
     /// The HANDOVER REQUEST to the target, carrying each session's Handover Request
@@ -11667,6 +11822,25 @@ impl NgapServer {
         }
         let sessions_relayed = self.complete_handover_at_smfs(ue, &handed_over);
         self.handover_target_transfers.retain(|(u, _), _| *u != ue);
+        if let Some(psis) = self.handover_target_release_psis.remove(&ue) {
+            match crate::ngap_asn1::build_pdu_session_resource_release_command_asn1(
+                ue,
+                notify.ran_ue_ngap_id,
+                &psis,
+            ) {
+                Some(cmd) => match self.send_to_association(association_id, &cmd).await {
+                    Ok(()) => log::info!(
+                        "HandoverNotify for UE {ue}: PDU Session Resource Release Command \
+                         to the target for PSIs {psis:?}, admitted there but not handed over"
+                    ),
+                    Err(e) => log::warn!(
+                        "HandoverNotify for UE {ue}: the target could not be told to \
+                         release PSIs {psis:?}: {e}"
+                    ),
+                },
+                None => log::error!("Failed to build the PDU Session Resource Release Command"),
+            }
+        }
 
         // #70: release the SOURCE NG-RAN UE context (TS 38.413 §8.4.3).
         //
@@ -16265,6 +16439,8 @@ pub(crate) struct N2HandoverAnswer {
 #[derive(Debug)]
 struct HoPreparation {
     generation: u64,
+    /// TS 23.502 §4.9.1.3.2 step 8: when the AMF stops waiting for PREPARING answers.
+    deadline: Instant,
     source_assoc: u64,
     target_assoc: u64,
     required: nextgcore_ngap::types::HandoverRequired,
@@ -16276,6 +16452,8 @@ struct HoPreparation {
 #[derive(Debug)]
 struct HoCommandPending {
     generation: u64,
+    /// When the AMF stops waiting for PREPARED answers (#964 review).
+    deadline: Instant,
     source_assoc: u64,
     target_assoc: u64,
     target_ran: u32,
@@ -16289,6 +16467,31 @@ struct HoCommandPending {
     offered: Vec<u8>,
     /// Each refused session's Handover Preparation Unsuccessful Transfer from its SMF.
     released: Vec<(u8, Vec<u8>)>,
+}
+
+/// How long a failed `hoState: COMPLETED` waits before its one retry (#964 review).
+const HANDOVER_COMPLETED_RETRY: Duration = Duration::from_millis(200);
+
+/// The default SMF wait of each N2 handover step (TS 23.502 §4.9.1.3.2 step 8, NOTE 2:
+/// locally configured): well inside the source's TNGRELOCprep.
+const DEFAULT_HANDOVER_SMF_WAIT: Duration = Duration::from_millis(1000);
+
+/// An N2 handover step's SMF wait from `var`, in milliseconds (#964 review). Unset or
+/// unparsable is the default; 0 means "do not wait at all", so only answers already in
+/// are used.
+fn handover_smf_wait_from_env(var: &str) -> Duration {
+    match std::env::var(var) {
+        Ok(v) => match v.trim().parse::<u64>() {
+            Ok(ms) => Duration::from_millis(ms),
+            Err(_) => {
+                log::warn!(
+                    "{var}={v:?} is not a number of milliseconds; using {DEFAULT_HANDOVER_SMF_WAIT:?}"
+                );
+                DEFAULT_HANDOVER_SMF_WAIT
+            }
+        },
+        Err(_) => DEFAULT_HANDOVER_SMF_WAIT,
+    }
 }
 
 /// The `NgRanTargetId` (TS 29.571) of an intra-5GS HandoverRequired's target, for the
@@ -21958,7 +22161,9 @@ mod tests {
     /// PREPARED (`HANDOVER_REQ_ACK`) with `HANDOVER_CMD` = [`ho_command_transfer_for`],
     /// except for a `nocmd-*` ref (500); `HANDOVER_RES_ALLOC_FAIL` with CANCELLED and
     /// `HANDOVER_PREP_FAIL` = [`ho_prep_fail_transfer_for`]. Everything else gets 204.
-    /// Every call is recorded. Keep the server alive.
+    /// A `hang-*` ref never answers PREPARING and a `hangcmd-*` ref never answers PREPARED
+    /// (a blackholed SMF); `hoState: PROBE` takes 300 ms. Every call is recorded when it
+    /// completes. Keep the server alive.
     #[allow(clippy::type_complexity)]
     async fn handover_smf() -> (
         nextgcore_sbi::server::SbiServer,
@@ -22007,6 +22212,16 @@ mod tests {
                     };
                     let info_type = body["n2SmInfoType"].as_str().unwrap_or("").to_string();
                     let cause = body["cause"].as_str().unwrap_or("").to_string();
+                    // A blackholed SMF: accepts the step and never answers.
+                    let hangs = (state == "PREPARING" && sm_ref.starts_with("hang-"))
+                        || (state == "PREPARED" && sm_ref.starts_with("hangcmd-"));
+                    if hangs {
+                        tokio::time::sleep(Duration::from_secs(3600)).await;
+                    }
+                    // A slow step, recorded only when it completes.
+                    if state == "PROBE" {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                    }
                     sink.lock().expect("sink").push((
                         sm_ref.clone(),
                         state.clone(),
@@ -22757,6 +22972,12 @@ mod tests {
         assert_eq!(sent[0].0, source);
         assert_eq!(failure_cause(&sent[0].1), Some(HO_FAILURE_IN_TARGET));
         assert!(!server.handover_pending_target.contains_key(&ue));
+        let steps: Vec<HoStep> = std::mem::take(&mut *seen.lock().expect("sink"));
+        assert_eq!(
+            ho_steps_in(&steps, "CANCELLED"),
+            vec![("noprep-1".to_string(), Vec::new(), "HO_FAILURE".to_string())],
+            "the failed PREPARING is cancelled (#964 review)"
+        );
 
         // The SMF prepares but gives no Command Transfer.
         let (ue, source_ran, target_ran) = (7_964_102u64, 66u32, 9_661u32);
@@ -23013,6 +23234,294 @@ mod tests {
             )]
         );
         assert!(no_state_left(&server, ue));
+    }
+
+    /// Process SBI outcomes until `done` holds (2 s at most), without waiting for every
+    /// in-flight exchange: a blackholed SMF's never finishes.
+    async fn pump_until(server: &mut NgapServer, done: impl Fn(&NgapServer) -> bool) {
+        for _ in 0..200 {
+            server.process_sbi_outcomes().await;
+            if done(server) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("condition not reached within 2 s");
+    }
+
+    /// **#964 review, MAJOR 1: TS 23.502 §4.9.1.3.2 step 8.** The AMF supervises the SMF
+    /// answers with a locally configured maximum wait and then continues with the
+    /// sessions that answered. One blackholed SMF used to hold the HANDOVER REQUEST for
+    /// the whole SBI timeout, past the source's TNGRELOCprep.
+    ///
+    /// - PREPARING: PSI 2's SMF never answers. When the wait expires the HANDOVER REQUEST
+    ///   goes out with PSI 1 only, and PSI 2's SMF has a CANCELLED (HO_FAILURE) queued
+    ///   behind the PREPARING it never answered.
+    /// - PREPARED: PSI 2's SMF never answers the target's Acknowledge, which admitted both.
+    ///   When the wait expires the HANDOVER COMMAND goes out with PSI 1 handed over and
+    ///   PSI 2 released. Once the UE arrives, the target is told to release PSI 2, the
+    ///   session it admitted but this handover does not carry (#964 review, MINOR 3).
+    ///
+    /// REVERT-VERIFIED: without `process_handover_deadlines`, no HANDOVER REQUEST is sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_blackholed_smf_does_not_hold_the_handover_past_the_wait() {
+        let (_smf, smf_port, seen) = handover_smf().await;
+        let mut server = capturing_ngap_server().await;
+        server.ho_preparation_wait = Duration::from_millis(150);
+        server.ho_command_wait = Duration::from_millis(150);
+        let (source, target) = (97_970u64, 97_971u64);
+        let gnb_t = 0x7_9701u32;
+        seed_gnb_session_with_id(&server, source, 0x7_9700).await;
+        seed_gnb_session_with_id(&server, target, gnb_t).await;
+        let ue_with = |server: &mut NgapServer, ue: u64, ran: u32, refs: [&str; 2]| {
+            let mut state = UeNasContext::new(ue, ran, source, false);
+            state.registered = true;
+            state.amf_ue.allowed_nssai = vec![SNssai { sst: 1, sd: None }];
+            server.ue_auth_state.insert(ue, state);
+            for (psi, r) in [(1u8, refs[0]), (2, refs[1])] {
+                server.sm_context_refs.insert((ue, psi), r.to_string());
+                server
+                    .sm_context_smfs
+                    .insert((ue, psi), ("127.0.0.1".to_string(), smf_port));
+            }
+        };
+
+        // PREPARING.
+        let (ue, ran) = (7_964_301u64, 70u32);
+        ue_with(&mut server, ue, ran, ["wait-1", "hang-2"]);
+        server
+            .handle_handover_required(source, &handover_required_pdu(ue, ran, gnb_t, &[1, 2]))
+            .await
+            .expect("handled");
+        pump_until(&mut server, |s| {
+            s.ho_preparations
+                .get(&ue)
+                .is_some_and(|p| !p.ready.is_empty())
+        })
+        .await;
+        server.process_handover_deadlines().await;
+        assert!(
+            take_sent_ngap(&mut server).is_empty(),
+            "nothing before the wait has expired"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        server.process_handover_deadlines().await;
+        let sent = take_sent_ngap(&mut server);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].0, target);
+        assert_eq!(
+            decoded_handover_request_transfers(&sent[0].1),
+            Some(vec![(1, ho_request_transfer_for("wait-1"))]),
+            "the HANDOVER REQUEST goes out with the session that answered"
+        );
+        assert!(
+            server.sbi_offload.key_busy((ue, 2)),
+            "PSI 2's CANCELLED waits behind its unanswered PREPARING"
+        );
+        assert_eq!(server.handover_listed_psis.get(&ue), Some(&vec![1, 2]));
+        server.forget_ue(ue);
+
+        // PREPARED.
+        let (ue, ran, target_ran) = (7_964_302u64, 71u32, 9_701u32);
+        ue_with(&mut server, ue, ran, ["wait-1", "hangcmd-2"]);
+        server
+            .handle_handover_required(source, &handover_required_pdu(ue, ran, gnb_t, &[1, 2]))
+            .await
+            .expect("handled");
+        pump_until(&mut server, |s| s.handover_pending_target.contains_key(&ue)).await;
+        take_sent_ngap(&mut server);
+        server
+            .handle_handover_request_acknowledge(
+                target,
+                &handover_ack_pdu(ue, target_ran, &[(1, vec![0xA1]), (2, vec![0xA2])]),
+            )
+            .await
+            .expect("handled");
+        pump_until(&mut server, |s| {
+            s.ho_commands.get(&ue).is_some_and(|c| !c.ready.is_empty())
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        server.process_handover_deadlines().await;
+        let sent = take_sent_ngap(&mut server);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].0, source);
+        let (handed, released) =
+            decoded_handover_command_lists(&sent[0].1).expect("a HANDOVER COMMAND");
+        assert_eq!(handed, vec![(1, ho_command_transfer_for("wait-1"))]);
+        assert_eq!(
+            released.iter().map(|(psi, _)| *psi).collect::<Vec<_>>(),
+            vec![2]
+        );
+        server
+            .handle_handover_notify(target, &handover_notify_pdu(ue, target_ran))
+            .await
+            .expect("handled");
+        let sent = take_sent_ngap(&mut server);
+        let release_to_target: Vec<&(u64, Vec<u8>)> = sent
+            .iter()
+            .filter(|(a, p)| {
+                *a == target
+                    && p[1] == nextgcore_ngap_gen::generated::ID_PDU_SESSION_RESOURCE_RELEASE
+            })
+            .collect();
+        assert_eq!(
+            release_to_target.len(),
+            1,
+            "the target releases PSI 2, which it admitted: {sent:?}"
+        );
+        pump_until(&mut server, |_| {
+            seen.lock()
+                .expect("sink")
+                .iter()
+                .any(|s| s.0 == "wait-1" && s.1 == "COMPLETED" && s.3.is_empty())
+        })
+        .await;
+        server.forget_ue(ue);
+    }
+
+    /// **#964 review, MINOR 1.** `hoState: COMPLETED` is keyed per (UE, PSI): it reaches
+    /// the SMF only after any earlier step still running for the session. Here a slow step
+    /// is in flight for PSI 1 when the Notify arrives, and the SMF must finish it before it
+    /// sees COMPLETED.
+    ///
+    /// REVERT-VERIFIED: with COMPLETED spawned unkeyed, the SMF records COMPLETED first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_reaches_the_smf_after_the_sessions_earlier_step() {
+        let (_smf, smf_port, seen) = handover_smf().await;
+        let mut server = capturing_ngap_server().await;
+        let (source, target) = (97_972u64, 97_973u64);
+        let gnb_t = 0x7_9721u32;
+        seed_gnb_session_with_id(&server, source, 0x7_9720).await;
+        seed_gnb_session_with_id(&server, target, gnb_t).await;
+        let (ue, ran, target_ran) = (7_964_401u64, 72u32, 9_721u32);
+        let mut state = UeNasContext::new(ue, ran, source, false);
+        state.registered = true;
+        state.amf_ue.allowed_nssai = vec![SNssai { sst: 1, sd: None }];
+        server.ue_auth_state.insert(ue, state);
+        server
+            .sm_context_refs
+            .insert((ue, 1), "order-1".to_string());
+        server
+            .sm_context_smfs
+            .insert((ue, 1), ("127.0.0.1".to_string(), smf_port));
+        server
+            .handle_handover_required(source, &handover_required_pdu(ue, ran, gnb_t, &[1]))
+            .await
+            .expect("handled");
+        drive_sbi(&mut server).await;
+        server
+            .handle_handover_request_acknowledge(
+                target,
+                &handover_ack_pdu(ue, target_ran, &[(1, vec![0xA1])]),
+            )
+            .await
+            .expect("handled");
+        drive_sbi(&mut server).await;
+        take_sent_ngap(&mut server);
+        seen.lock().expect("sink").clear();
+
+        // A slow step for the session, still running when the UE arrives.
+        server.sbi_offload.spawn_keyed((ue, 1), move || async move {
+            let _ = crate::sbi_path::call_smf_n2_handover(
+                "127.0.0.1",
+                smf_port,
+                "order-1",
+                "PROBE",
+                None,
+                None,
+                None,
+            )
+            .await;
+            None
+        });
+        server
+            .handle_handover_notify(target, &handover_notify_pdu(ue, target_ran))
+            .await
+            .expect("handled");
+        drive_sbi(&mut server).await;
+        let order: Vec<String> = seen
+            .lock()
+            .expect("sink")
+            .iter()
+            .filter(|s| s.0 == "order-1")
+            .map(|s| s.1.clone())
+            .collect();
+        assert_eq!(order, vec!["PROBE".to_string(), "COMPLETED".to_string()]);
+    }
+
+    /// **#964 review, MINOR 2.** A session whose PREPARING failed, and every session of a
+    /// preparation a new HandoverRequired superseded, is told CANCELLED, so no SMF is left
+    /// holding a preparation. The superseded preparation's target is released too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_or_superseded_preparing_is_cancelled_at_the_smf() {
+        let (_smf, smf_port, seen) = handover_smf().await;
+        let mut server = capturing_ngap_server().await;
+        let (source, target_a, target_b) = (97_974u64, 97_975u64, 97_976u64);
+        let (gnb_a, gnb_b) = (0x7_9751u32, 0x7_9761u32);
+        seed_gnb_session_with_id(&server, source, 0x7_9740).await;
+        seed_gnb_session_with_id(&server, target_a, gnb_a).await;
+        seed_gnb_session_with_id(&server, target_b, gnb_b).await;
+        let (ue, ran) = (7_964_501u64, 74u32);
+        let mut state = UeNasContext::new(ue, ran, source, false);
+        state.registered = true;
+        state.amf_ue.allowed_nssai = vec![SNssai { sst: 1, sd: None }];
+        server.ue_auth_state.insert(ue, state);
+        for (psi, r) in [(1u8, "sup-1"), (2, "noprep-2")] {
+            server.sm_context_refs.insert((ue, psi), r.to_string());
+            server
+                .sm_context_smfs
+                .insert((ue, psi), ("127.0.0.1".to_string(), smf_port));
+        }
+        server
+            .handle_handover_required(source, &handover_required_pdu(ue, ran, gnb_a, &[1, 2]))
+            .await
+            .expect("handled");
+        drive_sbi(&mut server).await;
+        let steps: Vec<HoStep> = std::mem::take(&mut *seen.lock().expect("sink"));
+        assert_eq!(
+            ho_steps_in(&steps, "CANCELLED"),
+            vec![("noprep-2".to_string(), Vec::new(), "HO_FAILURE".to_string())],
+            "the session whose PREPARING failed"
+        );
+        assert_eq!(
+            take_sent_ngap(&mut server).len(),
+            1,
+            "the HandoverRequest to A"
+        );
+
+        // The source asks again, toward B, before A answered.
+        server
+            .handle_handover_required(source, &handover_required_pdu(ue, ran, gnb_b, &[1]))
+            .await
+            .expect("handled");
+        drive_sbi(&mut server).await;
+        let sent = take_sent_ngap(&mut server);
+        assert_eq!(
+            sent.iter().map(|(a, _)| *a).collect::<Vec<_>>(),
+            vec![target_a, target_b],
+            "A is released, then B gets the HandoverRequest"
+        );
+        assert_eq!(
+            decoded_release_command(&sent[0].1),
+            Some((
+                ue,
+                None,
+                Some(nextgcore_ngap_gen::generated::CauseRadioNetwork::HANDOVER_CANCELLED)
+            ))
+        );
+        let steps: Vec<HoStep> = std::mem::take(&mut *seen.lock().expect("sink"));
+        let sup: Vec<&str> = steps
+            .iter()
+            .filter(|s| s.0 == "sup-1")
+            .map(|s| s.1.as_str())
+            .collect();
+        assert_eq!(
+            sup,
+            vec!["CANCELLED", "PREPARING"],
+            "A's preparation is cancelled before B's PREPARING"
+        );
+        server.forget_ue(ue);
     }
 
     /// **#742 review, MAJOR-2.** A UE ended mid-handover takes its preparation state with
