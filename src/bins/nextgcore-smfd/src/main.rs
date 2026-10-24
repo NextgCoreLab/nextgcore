@@ -447,11 +447,33 @@ fn epco_config() -> (&'static [std::net::Ipv4Addr], Option<u16>) {
     }
 }
 
+/// The value after the first of `flags` in `args` (`-c x`, `--config x`), or
+/// `None`. smfd reads its few flags by hand rather than through clap.
+fn smf_flag_value(args: impl Iterator<Item = String>, flags: &[&str]) -> Option<String> {
+    let args: Vec<String> = args.collect();
+    args.windows(2)
+        .find_map(|w| flags.contains(&w[0].as_str()).then(|| w[1].clone()))
+}
+
+/// The configuration file: `-c/--config`, then `SMF_CONFIG`, then
+/// `/etc/nextgcore/smf.yaml`.
+fn smf_config_path(args: impl Iterator<Item = String>) -> String {
+    smf_flag_value(args, &["-c", "--config"])
+        .or_else(|| std::env::var("SMF_CONFIG").ok())
+        .unwrap_or_else(|| "/etc/nextgcore/smf.yaml".to_string())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
-    // RUST_LOG if set, else info (smfd has no --log-level): #691.
-    nextgcore_core::log::nf_log_builder("info").init();
+    // Configuration path: -c/--config first, then SMF_CONFIG. Resolved before
+    // the logger, whose level is `-e/--log-level`, then the file's
+    // `logger.level`, then info, as for every NF (#691); RUST_LOG overrides.
+    let config_path = smf_config_path(std::env::args());
+    nextgcore_core::log::nf_log_builder(&nextgcore_core::log::nf_log_level(
+        smf_flag_value(std::env::args(), &["-e", "--log-level"]).as_deref(),
+        Some(&config_path),
+    ))
+    .init();
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = nextgcore_metrics::otel::init_otel(
         nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
@@ -473,18 +495,7 @@ async fn main() -> Result<()> {
     })
     .expect("Failed to set Ctrl+C handler");
 
-    // Load configuration — respect -c/--config CLI arg first, then SMF_CONFIG env var
-    let config_path = std::env::args()
-        .zip(std::env::args().skip(1))
-        .find_map(|(a, b)| {
-            if a == "-c" || a == "--config" {
-                Some(b)
-            } else {
-                None
-            }
-        })
-        .or_else(|| std::env::var("SMF_CONFIG").ok())
-        .unwrap_or_else(|| "/etc/nextgcore/smf.yaml".to_string());
+    // Load configuration (the path was resolved before the logger, above).
     let config = load_config(&config_path);
     log::info!("Loading configuration from {config_path}");
     log::info!(
@@ -3799,6 +3810,12 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
             decision
         }
         Some(pcf) => {
+            let origination = policy::origination_timestamp_for_create(
+                request
+                    .http
+                    .get_header(policy::ORIGINATION_TIMESTAMP_HEADER)
+                    .map(String::as_str),
+            );
             let create_ctx = policy::SmPolicyCreateContext {
                 supi: &supi,
                 psi: pdu_session_id,
@@ -3813,6 +3830,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                 // create that omits it leaves the PCF with nothing to bound its
                 // authorisation by -- which is what this leg did before #310.
                 subs_sess_ambr: subscribed.as_ref(),
+                origination_timestamp: origination.as_deref(),
             };
             match policy::sm_policy_create(&pcf, &create_ctx).await {
                 Ok(decision) => {
@@ -7961,6 +7979,36 @@ async fn handle_amf_status_change(sm_context_ref: &str) -> SbiResponse {
 
 #[cfg(test)]
 mod tests {
+    /// #691 follow-up: smfd's hand-read flags, used before its logger exists.
+    #[test]
+    fn smf_flags_are_read_before_the_logger() {
+        let args = |v: &[&str]| {
+            v.iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .into_iter()
+        };
+        assert_eq!(
+            smf_flag_value(
+                args(&["smfd", "-c", "/x.yaml", "--log-level", "debug"]),
+                &["-e", "--log-level"]
+            ),
+            Some("debug".to_string())
+        );
+        assert_eq!(
+            smf_flag_value(args(&["smfd", "-e", "warn"]), &["-e", "--log-level"]),
+            Some("warn".to_string())
+        );
+        assert_eq!(
+            smf_flag_value(args(&["smfd", "--log-level"]), &["-e", "--log-level"]),
+            None
+        );
+        assert_eq!(
+            smf_config_path(args(&["smfd", "--config", "/y.yaml"])),
+            "/y.yaml"
+        );
+    }
+
     use super::*;
 
     /// #718 (revising #677): a graceful shutdown keeps the PFCP association only
@@ -14004,6 +14052,77 @@ mod tests {
     /// association is deliberately down, not because no UPF exists. The
     /// REGISTRATION half its old comment asked for is
     /// `a_successful_create_registers_an_activated_session_and_its_binding` below.
+    /// #980 review, end to end: the CreateSMContext handler sends the AMF's
+    /// `3gpp-Sbi-Origination-Timestamp` on the SM policy create unchanged
+    /// (TS 29.512 §4.2.2.2). The PCF's collision rule (§4.2.7) then sees the
+    /// same value on a retried create, and reuses the association.
+    ///
+    /// Revert-verified: with the handler passing no timestamp, this test fails.
+    #[tokio::test]
+    async fn the_sm_policy_create_forwards_the_amfs_origination_timestamp() {
+        use nextgcore_sbi::message::SbiResponse;
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _upf = pfcp_path::stand_in::unassociated_upf().await;
+        smf_context_init(64, 256, 512);
+
+        let stamps: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>> = Default::default();
+        let sink = stamps.clone();
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
+        let pcf = SbiServer::on_listener(
+            SbiServerConfig::new(std::net::SocketAddr::from(([127, 0, 0, 1], port))),
+            port_listener,
+        );
+        pcf.start(move |req: SbiRequest| {
+            let sink = sink.clone();
+            async move {
+                if req.header.uri.ends_with("/sm-policies") {
+                    sink.lock().unwrap_or_else(|e| e.into_inner()).push(
+                        req.http
+                            .get_header(policy::ORIGINATION_TIMESTAMP_HEADER)
+                            .cloned(),
+                    );
+                    return SbiResponse::with_status(201)
+                        .with_header("Location", "/npcf-smpolicycontrol/v1/sm-policies/pol-980")
+                        .with_body(
+                            serde_json::json!({
+                                "sessRules": {}, "pccRules": {}, "qosDecs": {},
+                                "chgDecs": {}, "traffContDecs": {},
+                            })
+                            .to_string(),
+                            "application/json",
+                        );
+                }
+                SbiResponse::with_status(204)
+            }
+        })
+        .await
+        .expect("stub PCF starts");
+        std::env::set_var("PCF_URI", format!("http://127.0.0.1:{port}"));
+
+        let amf_stamp = "Fri, 23 Oct 2026 10:00:00.980 GMT";
+        let psi = 12u8;
+        let n1_msg = n1(
+            psi,
+            1,
+            gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+            &[0x91, 0x00],
+        );
+        let request = create_request("imsi-001010000000980", psi, &n1_msg)
+            .with_header(policy::ORIGINATION_TIMESTAMP_HEADER, amf_stamp);
+        let _ = handle_sm_context_create(&request).await;
+        std::env::remove_var("PCF_URI");
+        pcf.stop().await.ok();
+
+        assert_eq!(
+            *stamps.lock().unwrap(),
+            vec![Some(amf_stamp.to_string())],
+            "the SM policy create carries the AMF's origination timestamp"
+        );
+    }
+
     #[tokio::test]
     async fn a_failed_create_leaves_no_registered_sm_context() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
@@ -15033,6 +15152,77 @@ mod tests {
         // And the session survives every one of them: a handover that dropped the
         // context would be worse than one that was refused.
         assert!(sm_context_exists(&reference));
+    }
+
+    /// **#805, the #738 ordering at the SMF.** The source's AN release reaches the SMF
+    /// first (`upCnxState: DEACTIVATED`, the UPF's downlink FAR to BUFF), then the
+    /// target's HandoverNotify (`hoState: COMPLETED`). The handover completes onto the
+    /// recorded target endpoint: the downlink FAR forwards to the TARGET again and the
+    /// session's user plane is ACTIVATED -- left DEACTIVATED, a Downlink Data Report would
+    /// page a UE that is connected on the target.
+    ///
+    /// REVERT-VERIFIED: setting ACTIVATED only for an EPS->5GS handover leaves the
+    /// session DEACTIVATED.
+    #[tokio::test]
+    async fn a_handover_completed_after_a_deactivation_reactivates_onto_the_target() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = pfcp_path::stand_in::install_stand_in_upf().await;
+        upf.client.associate().await.expect("association");
+        let reference = seed_registered_session("imsi-001010000000805", 7, "internet");
+        seed_session(
+            &reference,
+            Some(upf.upf_seid),
+            Some((upf.upf_teid, upf.upf_ip)),
+        );
+        {
+            let ctx = smf_self();
+            let ctx = ctx.read().unwrap();
+            let mut sess = ctx
+                .sess_find_by_sm_context_ref(&reference)
+                .expect("session");
+            sess.handover.target_dl_known = true;
+            sess.handover.gnb_n3_teid = 0x0805_0001;
+            sess.handover.gnb_n3_ip.ipv4 = Some(std::net::Ipv4Addr::new(10, 8, 0, 5));
+            ctx.sess_update(&sess);
+        }
+        upf.clear_seen();
+        let update = |body: serde_json::Value| {
+            SbiRequest::post("/nsmf-pdusession/v1/sm-contexts/x/modify")
+                .with_body(body.to_string(), "application/json")
+        };
+
+        let resp = handle_sm_context_update(
+            &reference,
+            &update(serde_json::json!({ "upCnxState": "DEACTIVATED" })),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+        let resp = handle_sm_context_update(
+            &reference,
+            &update(serde_json::json!({ "hoState": "COMPLETED" })),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+
+        let bodies = upf.modification_bodies();
+        unseed_session(&reference);
+        assert_eq!(bodies.len(), 2, "BUFF, then the switch: {bodies:02x?}");
+        let has = |b: &[u8], needle: &[u8]| b.windows(needle.len()).any(|w| w == needle);
+        assert!(
+            has(&bodies[1], &[0x08, 0x05, 0x00, 0x01, 10, 8, 0, 5]),
+            "the switch's Outer Header Creation names the TARGET: {:02x?}",
+            bodies[1]
+        );
+        let ctx = smf_self();
+        let ctx = ctx.read().unwrap();
+        let sess = ctx
+            .sess_find_by_sm_context_ref(&reference)
+            .expect("session");
+        assert_eq!(
+            sess.up_cnx_state,
+            context::UpCnxState::Activated,
+            "the UE is connected on the target"
+        );
     }
 
     /// Record a UPF N3 uplink endpoint and a default policy binding for `reference`, as

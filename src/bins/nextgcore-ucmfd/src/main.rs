@@ -136,8 +136,8 @@ struct UcmfYaml {
 struct Args {
     #[arg(short = 'c', long, default_value = "/etc/nextgcore/ucmf.yaml")]
     config: String,
-    #[arg(short = 'e', long, default_value = "info")]
-    log_level: String,
+    #[arg(short = 'e', long)]
+    log_level: Option<String>,
     #[arg(long, default_value = "0.0.0.0")]
     sbi_addr: String,
     #[arg(long, default_value = "7777")]
@@ -333,7 +333,11 @@ fn api_root() -> &'static str {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    nextgcore_core::log::nf_log_builder(&args.log_level).init();
+    nextgcore_core::log::nf_log_builder(&nextgcore_core::log::nf_log_level(
+        args.log_level.as_deref(),
+        Some(&args.config),
+    ))
+    .init();
     let _otel = nextgcore_metrics::otel::init_otel(
         nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
             std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")

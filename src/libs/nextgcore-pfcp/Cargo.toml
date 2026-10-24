@@ -10,6 +10,7 @@ description = "NextGCore PFCP Protocol Library"
 nextgcore-core = { workspace = true }
 thiserror.workspace = true
 bytes.workspace = true
+log.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

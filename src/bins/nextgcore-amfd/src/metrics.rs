@@ -50,6 +50,8 @@ pub enum GlobalMetric {
     MmConfUpdate,
     /// Successful configuration updates
     MmConfUpdateSucc,
+    /// UEs an NG Reset moved to CM-IDLE (#754)
+    NgResetUeIdled,
 }
 
 impl GlobalMetric {
@@ -73,6 +75,7 @@ impl GlobalMetric {
             Self::AmfAuthReject => "fivegs_amffunction_amf_authreject",
             Self::MmConfUpdate => "fivegs_amffunction_mm_confupdate",
             Self::MmConfUpdateSucc => "fivegs_amffunction_mm_confupdatesucc",
+            Self::NgResetUeIdled => "amf_ng_reset_ue_idled",
         }
     }
 
@@ -105,6 +108,9 @@ impl GlobalMetric {
             Self::MmConfUpdate => "Number of UE Configuration Update commands requested by the AMF",
             Self::MmConfUpdateSucc => {
                 "Number of UE Configuration Update complete messages received by the AMF"
+            }
+            Self::NgResetUeIdled => {
+                "Number of registered UEs an NG Reset moved to CM-IDLE (TS 38.413 §8.7.4.2.2)"
             }
         }
     }
@@ -216,6 +222,13 @@ impl Default for AmfMetrics {
     }
 }
 
+/// The process's metrics registry: what the AMF counts, and what
+/// [`AmfMetrics::export_prometheus`] renders.
+pub fn global() -> &'static AmfMetrics {
+    static GLOBAL: std::sync::OnceLock<AmfMetrics> = std::sync::OnceLock::new();
+    GLOBAL.get_or_init(AmfMetrics::new)
+}
+
 impl AmfMetrics {
     /// Create a new metrics manager
     pub fn new() -> Self {
@@ -240,6 +253,7 @@ impl AmfMetrics {
             GlobalMetric::AmfAuthReject,
             GlobalMetric::MmConfUpdate,
             GlobalMetric::MmConfUpdateSucc,
+            GlobalMetric::NgResetUeIdled,
         ] {
             global_counters.insert(metric, AtomicU64::new(0));
         }

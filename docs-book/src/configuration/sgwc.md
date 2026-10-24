@@ -55,7 +55,7 @@ From the clap `Args` struct in `src/bins/nextgcore-sgwcd/src/main.rs`:
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `-c, --config` | string | `/etc/nextgcore/sgwc.yaml` | Configuration file path. |
-| `-l, --log-level` | string | `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`); unrecognized values fall back to `info`. |
+| `-l, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `--no-color` | flag | off | Parsed but never read — currently has no effect. |
 | `-d, --daemon` | flag | off | Parsed but never read — currently has no effect. |
 

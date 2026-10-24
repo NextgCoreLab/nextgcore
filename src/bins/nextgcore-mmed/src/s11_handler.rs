@@ -1474,7 +1474,10 @@ pub fn network_initiated_bearer_deletion(
                 detach_type,
             };
         }
-        if connected {
+        // #862: an ECM-IDLE UE with cause "reactivation requested" is paged
+        // first (TS 23.401 §5.4.4.1 step 4b): `bearer_deactivation::start`
+        // parks the deactivation until it answers.
+        if connected || reactivation {
             return DeleteBearerAction::Deactivate {
                 mme_ue_id,
                 sgw_teid,
@@ -1493,14 +1496,7 @@ pub fn network_initiated_bearer_deletion(
         if let Some(ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&mme_ue_id) {
             ue.sess_list.retain(|id| *id != sess_id);
         }
-        if reactivation {
-            log::warn!(
-                "[{}] PDN connection LBI {lbi} deleted with cause reactivation requested while \
-                 the UE is ECM-IDLE: deleted here, but the UE is not told to reactivate; step 4b \
-                 paging is #862",
-                mme_ue.imsi_bcd
-            );
-        } else {
+        {
             log::info!(
                 "[{}] PDN connection LBI {lbi} deleted by the gateway; the UE is ECM-IDLE, so it \
                  is deleted here and synchronised at the next ECM-CONNECTED transition (TS \
@@ -1511,7 +1507,7 @@ pub fn network_initiated_bearer_deletion(
         return DeleteBearerAction::PdnDeletedLocally { sgw_teid, lbi };
     }
 
-    if connected {
+    if connected || reactivation {
         let held: Vec<u8> = ebis
             .iter()
             .copied()
@@ -1551,13 +1547,7 @@ pub fn network_initiated_bearer_deletion(
             lbi: None,
         };
     }
-    if reactivation {
-        log::warn!(
-            "[{}] dedicated bearers {deleted:?} deleted with cause reactivation requested while \
-             the UE is ECM-IDLE: deleted here without paging (step 4b is #862)",
-            mme_ue.imsi_bcd
-        );
-    } else {
+    {
         log::info!(
             "[{}] dedicated bearers {deleted:?} deleted by the gateway; the UE is ECM-IDLE, so \
              they are deleted here and synchronised at the next ECM-CONNECTED transition (TS \
@@ -3688,13 +3678,14 @@ mod pgw_initiated_delete_bearer_tests {
     }
 
     /// TS 23.401 §5.4.4.1 condition (i): an ECM-IDLE UE's non-last PDN
-    /// connection is deleted locally at once.
+    /// connection is deleted locally at once, when the cause is not
+    /// "reactivation requested" (#862: that one pages first).
     #[test]
     fn a_pdn_that_is_not_the_last_is_deleted_without_a_detach() {
         let ctx = ctx();
         let (mme_ue_id, teid) = ue(&ctx, &[5, 6]);
         idle(&ctx, mme_ue_id);
-        let action = network_initiated_bearer_deletion(&ctx, teid, &dbr_lbi(teid, 6, Some(8)));
+        let action = network_initiated_bearer_deletion(&ctx, teid, &dbr_lbi(teid, 6, None));
         assert_eq!(
             action,
             DeleteBearerAction::PdnDeletedLocally {

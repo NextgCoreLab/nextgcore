@@ -36,6 +36,7 @@ fn render_metrics() -> String {
     let associated = pfcp_path::sxa_node()
         .map(|n| n.associated_peer_count())
         .unwrap_or(0);
+    let unauthorized = pfcp_path::PFCP_UNAUTHORIZED.load(std::sync::atomic::Ordering::Relaxed);
     format!(
         "# HELP sgwu_pfcp_sessions Number of PFCP sessions held on Sxa\n\
          # TYPE sgwu_pfcp_sessions gauge\n\
@@ -43,6 +44,9 @@ fn render_metrics() -> String {
          # HELP sgwu_pfcp_associations Number of associated SGW-C peers\n\
          # TYPE sgwu_pfcp_associations gauge\n\
          sgwu_pfcp_associations {associated}\n\
+         # HELP sgwu_pfcp_unauthorized_messages_total PFCP messages refused for not coming from an associated SGW-C\n\
+         # TYPE sgwu_pfcp_unauthorized_messages_total counter\n\
+         sgwu_pfcp_unauthorized_messages_total {unauthorized}\n\
          # HELP sgwu_up 1 when the SGW-U runtime is serving\n\
          # TYPE sgwu_up gauge\n\
          sgwu_up 1\n"

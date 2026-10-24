@@ -486,6 +486,18 @@ pub fn decode_lpp_provide_capabilities(bytes: &[u8]) -> Option<ReportedCapabilit
     }
 }
 
+/// The transaction number of an uplink LPP `Abort` or `Error` (TS 37.355 §5.4),
+/// with which it is, else `None` (#998). Both end the transaction they are on.
+pub fn decode_lpp_abort_or_error(bytes: &[u8]) -> Option<(u8, &'static str)> {
+    let msg = decode_lpp(bytes).ok()?;
+    let txn = msg.transaction_id.as_ref()?.transaction_number.0;
+    match c1(&msg)? {
+        lpp::LPP_MessageBody_c1::Abort(_) => Some((txn, "Abort")),
+        lpp::LPP_MessageBody_c1::Error(_) => Some((txn, "Error")),
+        _ => None,
+    }
+}
+
 /// Encode an LMF-initiated LPP `RequestCapabilities` (#906; TS 37.355 §5.1.1 step
 /// 1, §6.3) asking for the capability types method selection reads: E-UTRA E-CID
 /// (`ecid-RequestCapabilities`) and the Rel-16 NR E-CID, NR Multi-RTT and NR
