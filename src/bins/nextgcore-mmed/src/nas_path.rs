@@ -327,6 +327,7 @@ pub fn nas_eps_send_attach_accept(
         );
         NasError::BuildFailed
     })?;
+    mme_ue.ics_pending_on = enb_ue.id;
 
     // Store for retransmission and arm T3450 (issue #45) only now that the Initial
     // Context Setup carrying the accept exists (#495). Arming it first left a bare
@@ -708,6 +709,7 @@ pub fn nas_eps_send_tau_accept(
             ue_ambr,
         )
         .map_err(|_| NasError::BuildFailed)?;
+        mme_ue.ics_pending_on = enb_ue.id;
         nas_eps_send_to_enb(mme_ue, enb_ue, s1ap_message)
     } else {
         nas_eps_send_to_downlink_nas_transport(enb_ue, emm_message)

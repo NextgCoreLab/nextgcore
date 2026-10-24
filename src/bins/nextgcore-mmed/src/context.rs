@@ -1100,6 +1100,16 @@ pub struct MmeUe {
     /// running (the eNB UE context not yet released): the UE is paged once the
     /// release completes (#961 review).
     pub ddn_pending_after_release: bool,
+    /// The eNB UE context an INITIAL CONTEXT SETUP REQUEST was sent on and not
+    /// yet answered (0: none). Keyed by the S1 connection so a later connection
+    /// is not mistaken for one still being set up (#869 review).
+    pub ics_pending_on: u64,
+    /// A UE-AMBR change (TS 23.401 §5.4.2.2) waits for the Initial Context Setup
+    /// or S1 handover in progress, which carries a value computed earlier; it is
+    /// signalled when that procedure ends (#869 review).
+    pub ue_ambr_deferred: bool,
+    /// A UE CONTEXT MODIFICATION REQUEST carrying a UE-AMBR is outstanding.
+    pub ue_ambr_modification_pending: bool,
     /// The network-initiated detach in progress was started by an HSS Cancel Location
     /// (subscription withdrawal). Only then is a further CLR a retransmission of the one
     /// being served; a CLR during any other detach is the HSS's own instruction (#828).

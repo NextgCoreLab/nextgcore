@@ -797,14 +797,22 @@ fn an_unprotected_tau_does_not_answer_paging() {
             s_tmsi: None,
         },
     );
-    ctx.mme_ue_pool
-        .write()
-        .unwrap()
-        .get_mut(&ue.mme_ue_id)
-        .unwrap()
-        .selected_int_algorithm = 0;
-    let mut eia0 = vec![0x17u8, 0, 0, 0, 0, 1];
-    eia0.extend_from_slice(plain);
+    // EIA0 with EEA2: the message decodes (the ciphering is undone) but its
+    // integrity is "verified" by the null algorithm, which proves nothing; the
+    // decoder must report it unverified (TS 33.401 §5.1.4.2).
+    let knas_enc = [0x65u8; 16];
+    {
+        let mut pool = ctx.mme_ue_pool.write().unwrap();
+        let u = pool.get_mut(&ue.mme_ue_id).unwrap();
+        u.selected_int_algorithm = 0;
+        u.selected_enc_algorithm = 2;
+        u.knas_enc = knas_enc;
+        u.ul_count = 0;
+    }
+    let mut body = plain.to_vec();
+    crate::nas_security::nas_encrypt(2, &knas_enc, 1, 0, 0, &mut body);
+    let mut eia0 = vec![0x27u8, 0, 0, 0, 0, 1];
+    eia0.extend_from_slice(&body);
     crate::nas_dispatch::nas_eps_handle_uplink(
         ctx,
         crate::nas_dispatch::UplinkNas {
@@ -919,6 +927,94 @@ fn a_rejected_or_failed_service_request_leaves_the_serving_gw_informed() {
     for id in [new_enb_ue, enb_ue_2] {
         ctx.enb_ue_remove(id);
     }
+    release(&ue);
+}
+
+/// #961 review round 4 (with #916): the Initial Context Setup of a SERVICE
+/// REQUEST holds back a UE-AMBR change like any other (`ics_pending_on`): it
+/// carries the value computed before the change, and the change is signalled
+/// once its response arrives.
+#[test]
+fn a_ue_ambr_change_during_a_service_request_setup_is_deferred() {
+    let _guard = lock_s11();
+    let (sgw, _route) = sgw(Gtp2XactConfig::default());
+    let ue = seed(0x0966, &[5]);
+    let ctx = mme_self();
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    let complete = release_to_command(&ue, &sgw);
+    crate::s1ap_handler::handle_ue_context_release_complete(ctx, ue.enb_id, &complete);
+    if let Some(b) = ctx
+        .bearer_find_by_ebi(ue.mme_ue_id, 5)
+        .and_then(|id| ctx.sess_find_by_id(ctx.bearer_find_by_id(id)?.sess_id))
+    {
+        // One active APN of 40 Mbit/s, so a lower subscription changes the UE-AMBR.
+        let mut pool = ctx.sess_pool.write().unwrap();
+        let s = pool.get_mut(&b.id).unwrap();
+        s.ambr.downlink = 40_000_000;
+        s.ambr.uplink = 20_000_000;
+    }
+    let _ = crate::s1ap_path::take_tapped_for_test(ue.enb_id);
+    let new_enb_ue = ctx.enb_ue_add(ue.enb_id, 966);
+    ctx.enb_ue_associate_mme_ue(new_enb_ue, ue.mme_ue_id);
+    crate::nas_dispatch::nas_eps_handle_uplink(
+        ctx,
+        crate::nas_dispatch::UplinkNas {
+            enb_ue_id: new_enb_ue,
+            nas_pdu: &service_request(1, 1),
+            s_tmsi: None,
+        },
+    );
+    wait_pdu(ue.enb_id, ics);
+    assert_eq!(
+        ctx.mme_ue_find_by_id(ue.mme_ue_id).unwrap().ics_pending_on,
+        new_enb_ue
+    );
+
+    let imsi = ctx.mme_ue_find_by_id(ue.mme_ue_id).unwrap().imsi_bcd;
+    ctx.mme_ue_set_imsi(ue.mme_ue_id, &imsi);
+    crate::s6a_handler::mme_s6a_process_inbound(&crate::fd_path::InboundS6aRequest {
+        imsi_bcd: imsi,
+        message: crate::fd_path::S6aMessage::Idr(crate::fd_path::IdrMessage {
+            idr_flags: 0,
+            subscription_data: crate::fd_path::SubscriptionData {
+                ambr_downlink: 10_000_000,
+                ambr_uplink: 5_000_000,
+                ..Default::default()
+            },
+        }),
+    })
+    .unwrap();
+    assert!(
+        ctx.mme_ue_find_by_id(ue.mme_ue_id)
+            .unwrap()
+            .ue_ambr_deferred,
+        "deferred behind the SERVICE REQUEST's setup"
+    );
+    let new = ctx.enb_ue_find_by_id(new_enb_ue).unwrap();
+    crate::s1ap_handler::handle_initial_context_setup_response(
+        ctx,
+        ue.enb_id,
+        &nextgcore_s1ap::InitialContextSetupResponse {
+            mme_ue_s1ap_id: new.mme_ue_s1ap_id,
+            enb_ue_s1ap_id: new.enb_ue_s1ap_id,
+            erab_setup_list: vec![nextgcore_s1ap::ErabSetupItem {
+                erab_id: 5,
+                transport_layer_address: vec![10, 0, 0, 9],
+                gtp_teid: 0x9905,
+            }],
+            erab_failed_list: vec![],
+        },
+    );
+    assert_eq!(
+        ctx.mme_ue_find_by_id(ue.mme_ue_id).unwrap().ics_pending_on,
+        0
+    );
+    assert_eq!(
+        crate::s6a_handler::deferred_ue_ambr_sends(ctx).len(),
+        1,
+        "signalled once the setup is answered"
+    );
+    ctx.enb_ue_remove(new_enb_ue);
     release(&ue);
 }
 

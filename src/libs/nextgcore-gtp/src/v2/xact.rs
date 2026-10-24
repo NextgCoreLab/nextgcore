@@ -368,6 +368,17 @@ impl Gtp2XactMgr {
         );
     }
 
+    /// Drop the cached responses whose hold has expired, without touching the
+    /// locally originated requests [`Self::poll`] would also retransmit.
+    pub fn expire_responses(&mut self, now: Instant) {
+        self.responses.retain(|_, cached| cached.expires > now);
+    }
+
+    /// The number of cached responses, expired or not.
+    pub fn cached_response_count(&self) -> usize {
+        self.responses.len()
+    }
+
     /// Look up a previously sent response for a (possibly retransmitted)
     /// peer request.
     pub fn lookup_cached_response(&self, peer: SocketAddr, sequence_number: u32) -> Option<Bytes> {

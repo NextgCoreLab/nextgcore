@@ -121,9 +121,62 @@ pub const HANDOVER_PREPARATION_SUPERVISION: std::time::Duration =
 // Top-Level Dispatch
 // ============================================================================
 
+/// UE CONTEXT MODIFICATION FAILUREs received, for a UE-AMBR modification and for
+/// any other (#869 review).
+static UE_CONTEXT_MODIFICATION_FAILURES: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+fn count_ue_context_modification_failure(what: &'static str) {
+    let i = usize::from(what != "ue_ambr");
+    UE_CONTEXT_MODIFICATION_FAILURES[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The UE Context Modification failure counter in Prometheus text format.
+pub fn render_metrics() -> String {
+    let n =
+        |i: usize| UE_CONTEXT_MODIFICATION_FAILURES[i].load(std::sync::atomic::Ordering::Relaxed);
+    format!(
+        "# HELP mme_s1ap_ue_context_modification_failures_total UE CONTEXT MODIFICATION \
+         FAILUREs received, by what the request carried (TS 36.413 8.3.4.3)\n\
+         # TYPE mme_s1ap_ue_context_modification_failures_total counter\n\
+         mme_s1ap_ue_context_modification_failures_total{{carried=\"ue_ambr\"}} {}\n\
+         mme_s1ap_ue_context_modification_failures_total{{carried=\"other\"}} {}\n",
+        n(0),
+        n(1)
+    )
+}
+
+/// Whether the UE Context Modification answered on `enb_id` for
+/// `mme_ue_s1ap_id` carried a UE-AMBR; the outstanding mark is cleared.
+fn take_ue_ambr_modification(ctx: &MmeContext, enb_id: u64, mme_ue_s1ap_id: u32) -> bool {
+    let Some(mme_ue_id) = ctx
+        .enb_ue_find_by_mme_ue_s1ap_id(mme_ue_s1ap_id)
+        .and_then(|id| ctx.enb_ue_find_by_id(id))
+        .filter(|e| e.enb_id == enb_id)
+        .map(|e| e.mme_ue_id)
+    else {
+        return false;
+    };
+    ctx.mme_ue_pool
+        .write()
+        .unwrap()
+        .get_mut(&mme_ue_id)
+        .is_some_and(|ue| std::mem::take(&mut ue.ue_ambr_modification_pending))
+}
+
 /// Decode an incoming S1AP PDU from `enb_id` and dispatch it to the matching
 /// procedure handler. Returns the PDUs to transmit in response.
 pub fn handle_s1ap_message(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<S1apSend> {
+    let mut out = handle_s1ap_message_inner(ctx, enb_id, data);
+    // #869 review: a UE-AMBR change deferred behind an Initial Context Setup or
+    // S1 handover is signalled once the procedure has ended.
+    out.extend(crate::s6a_handler::deferred_ue_ambr_sends(ctx));
+    out
+}
+
+fn handle_s1ap_message_inner(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<S1apSend> {
     // S1 Setup is decoded with the generated codec, which applies TS 36.413
     // §10.3.4 / §10.3.5 to unknown and missing IEs (#514 stage 2).
     if crate::s1ap_gen::is_s1_setup_request(data) {
@@ -1190,6 +1243,7 @@ pub fn handle_s1ap_message(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<S1
                 "UE Context Modification accepted by eNB {enb_id} for mme_ue_s1ap_id={}",
                 msg.mme_ue_s1ap_id
             );
+            take_ue_ambr_modification(ctx, enb_id, msg.mme_ue_s1ap_id);
             Vec::new()
         }
         S1apMessage::UeContextModificationFailure(msg) => {
@@ -1204,6 +1258,20 @@ pub fn handle_s1ap_message(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<S1
                 msg.cause,
                 msg.criticality_diagnostics
             );
+            // #869 review: a rejected UE-AMBR leaves the eNB enforcing the old
+            // value while the MME holds the new one; counted, and named. The
+            // next Initial Context Setup or E-RAB Setup carries the current one.
+            let what = if take_ue_ambr_modification(ctx, enb_id, msg.mme_ue_s1ap_id) {
+                log::error!(
+                    "UE-AMBR NOT applied by eNB {enb_id} for mme_ue_s1ap_id={}: the eNB keeps the \
+                     previous value until the next Initial Context Setup or E-RAB Setup",
+                    msg.mme_ue_s1ap_id
+                );
+                "ue_ambr"
+            } else {
+                "other"
+            };
+            count_ue_context_modification_failure(what);
             Vec::new()
         }
         S1apMessage::WriteReplaceWarningResponse(msg) => {
@@ -1869,6 +1937,12 @@ pub fn handle_initial_context_setup_failure(
         Err(out) => return out,
     };
 
+    // #869/#961: the setup is over, whichever kind it was.
+    if let Some(mme_ue_id) = ctx.enb_ue_find_by_id(enb_ue_id).map(|e| e.mme_ue_id) {
+        if let Some(ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&mme_ue_id) {
+            ue.ics_pending_on = 0;
+        }
+    }
     // #956: a failed Initial Context Setup of a SERVICE REQUEST releases S1
     // only; the UE stays registered and ECM-IDLE (TS 23.401 §5.3.4.1).
     let service_request = ctx
@@ -2258,6 +2332,7 @@ fn release_s1_connection(ctx: &MmeContext, enb_ue_id: u64) {
         .get_mut(&mme_ue_id)
         .is_some_and(|ue| {
             ue.service_request_ics_pending = false;
+            ue.ics_pending_on = 0;
             std::mem::take(&mut ue.ddn_pending_after_release)
         });
     if page
@@ -4742,6 +4817,9 @@ pub fn handle_initial_context_setup_response(
     let Some(enb_ue) = ctx.enb_ue_find_by_id(enb_ue_id) else {
         return;
     };
+    if let Some(ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&enb_ue.mme_ue_id) {
+        ue.ics_pending_on = 0;
+    }
 
     for item in &msg.erab_setup_list {
         if let Some(bearer_id) = ctx.bearer_find_by_ebi(enb_ue.mme_ue_id, item.erab_id) {
@@ -7247,5 +7325,75 @@ mod tests {
             assert_eq!(ho_type_to_s1ap(ctx), wire, "{ctx:?} must be unchanged");
             assert_eq!(ho_type_from_s1ap(wire), ctx, "{wire:?} must be unchanged");
         }
+    }
+    /// #869 review: a UE CONTEXT MODIFICATION FAILURE for a UE-AMBR modification
+    /// is counted as such (the eNB keeps the old UE-AMBR) and rendered for
+    /// `/metrics`; one for anything else is counted apart.
+    #[test]
+    fn a_failed_ue_ambr_modification_is_counted() {
+        let ctx = MmeContext::new();
+        ctx.init();
+        let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+        let enb_ue_id = ctx.enb_ue_add(enb_id, 869);
+        let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
+        ctx.enb_ue_associate_mme_ue(enb_ue_id, mme_ue_id);
+        let mme_ue_s1ap_id = ctx.enb_ue_find_by_id(enb_ue_id).unwrap().mme_ue_s1ap_id;
+        ctx.mme_ue_pool
+            .write()
+            .unwrap()
+            .get_mut(&mme_ue_id)
+            .unwrap()
+            .ue_ambr_modification_pending = true;
+        let count = |carried: &str| -> u64 {
+            render_metrics()
+                .lines()
+                .find(|l| l.contains(&format!("carried=\"{carried}\"")))
+                .and_then(|l| l.rsplit(' ').next())
+                .and_then(|n| n.parse().ok())
+                .unwrap()
+        };
+        let (ambr0, other0) = (count("ue_ambr"), count("other"));
+        assert!(take_ue_ambr_modification(&ctx, enb_id, mme_ue_s1ap_id));
+        count_ue_context_modification_failure("ue_ambr");
+        assert!(
+            !take_ue_ambr_modification(&ctx, enb_id, mme_ue_s1ap_id),
+            "the mark is taken once"
+        );
+        count_ue_context_modification_failure("other");
+        assert!(count("ue_ambr") > ambr0);
+        assert!(count("other") > other0);
+        assert!(
+            !take_ue_ambr_modification(&ctx, enb_id + 1, mme_ue_s1ap_id),
+            "only from the eNB serving the UE"
+        );
+    }
+    /// #869 review: the Initial Context Setup Response ends the "setup in
+    /// progress" that defers a UE-AMBR change.
+    #[test]
+    fn the_initial_context_setup_response_ends_the_setup_in_progress() {
+        let ctx = MmeContext::new();
+        ctx.init();
+        let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+        let enb_ue_id = ctx.enb_ue_add(enb_id, 870);
+        let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
+        ctx.enb_ue_associate_mme_ue(enb_ue_id, mme_ue_id);
+        let mme_ue_s1ap_id = ctx.enb_ue_find_by_id(enb_ue_id).unwrap().mme_ue_s1ap_id;
+        ctx.mme_ue_pool
+            .write()
+            .unwrap()
+            .get_mut(&mme_ue_id)
+            .unwrap()
+            .ics_pending_on = enb_ue_id;
+        handle_initial_context_setup_response(
+            &ctx,
+            enb_id,
+            &InitialContextSetupResponse {
+                mme_ue_s1ap_id,
+                enb_ue_s1ap_id: 870,
+                erab_setup_list: vec![],
+                erab_failed_list: vec![],
+            },
+        );
+        assert_eq!(ctx.mme_ue_find_by_id(mme_ue_id).unwrap().ics_pending_on, 0);
     }
 }

@@ -435,6 +435,12 @@ async fn main() -> Result<()> {
                 // a backstop if this event is dropped (the URR's `threshold_exceeded` is
                 // also set), so the report cannot be lost, only duplicated -- and a
                 // duplicate carries its own UR-SEQN, which is what §8.2.60 exists for.
+                // #935: N3 path failure/recovery -> PFCP Node Report (§7.4.5.1).
+                data_plane::UpfReportEvent::PathReport { failure, peers } => {
+                    if let Err(e) = pfcp_for_reports.send_node_report(failure, &peers).await {
+                        log::warn!("User-plane path report for {peers:?} was NOT sent: {e}");
+                    }
+                }
                 data_plane::UpfReportEvent::QuotaExhausted {
                     upf_seid,
                     smf_seid,

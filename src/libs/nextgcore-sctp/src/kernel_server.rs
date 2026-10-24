@@ -182,6 +182,21 @@ impl KernelSctpServer {
         }
     }
 
+    /// The negotiated number of outbound streams of `association_id`; `None` for an
+    /// unknown association or when the kernel cannot report it (#813).
+    pub fn outbound_streams(&self, association_id: u64) -> Option<u16> {
+        let sock = Arc::clone(&self.associations.lock().unwrap().get(&association_id)?.sock);
+        match sock.negotiated_streams() {
+            Ok((_, outbound)) => Some(outbound),
+            Err(e) => {
+                log::warn!(
+                    "Kernel-SCTP: association {association_id}: SCTP_STATUS unavailable ({e})"
+                );
+                None
+            }
+        }
+    }
+
     /// Stop accepting and drop all associations.
     pub fn stop(&mut self) {
         self.running = false;
