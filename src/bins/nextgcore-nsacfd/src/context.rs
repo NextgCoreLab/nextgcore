@@ -577,10 +577,12 @@ impl SacSubscription {
         // Expiry and maxReports first: a spent subscription is spent whatever the
         // trigger says, and both mean "remove me" rather than "not now".
         if let Some(ref e) = self.expiry {
-            if let Some(deadline) = nextgcore_sbi::datetime::rfc3339_to_epoch(e) {
-                if now_secs >= deadline {
-                    return ReportDecision::Exhausted;
-                }
+            // Fail closed (#856 review): an expiry that cannot be read (stored
+            // before create validated it, or restored from older state) ends the
+            // subscription rather than making it immortal.
+            match nextgcore_sbi::datetime::rfc3339_to_epoch(e) {
+                Some(deadline) if now_secs < deadline => {}
+                _ => return ReportDecision::Exhausted,
             }
         }
         if let Some(max) = self.max_reports {
