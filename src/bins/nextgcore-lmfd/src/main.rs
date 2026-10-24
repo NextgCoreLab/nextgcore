@@ -3200,6 +3200,27 @@ async fn handle_n1_message_notify(request: &SbiRequest) -> SbiResponse {
         Err(e) => log::warn!("Sidelink ranging report present but undecodable: {e}"),
     }
 
+    // #998: an LPP Abort or Error on a RequestCapabilities transaction ends that
+    // Capability Transfer at once (TS 37.355 §5.4), rather than letting the
+    // positioning request wait out its capability wait. The UE is backed off as
+    // for no answer. On any other transaction it is the location request's.
+    if let Some((txn, what)) = codec_glue::decode_lpp_abort_or_error(&lpp_bytes) {
+        let exchange = lmf_self()
+            .read()
+            .ok()
+            .and_then(|c| c.capability_exchange_on(lcs_correlation_id, txn));
+        if let Some(corr) = exchange {
+            log::warn!(
+                "LPP {what} on the RequestCapabilities transaction {txn}: the Capability \
+                 Transfer ends; positioning on what is known"
+            );
+            if let Ok(c) = lmf_self().read() {
+                c.capability_exchange_abandon(&corr);
+            }
+            return SbiResponse::no_content();
+        }
+    }
+
     // #834 review: a ProvideCapabilities is what the method selection reads
     // (capability class, E-CID flavours and, since #906, the NR methods). It was
     // decoded nowhere on the uplink, so the stored capability was always Unknown.
@@ -7830,6 +7851,62 @@ mod positioning_chain_strict_peer {
             codec_glue::build_lpp_request(codec_glue::LppMethod::NrEcid, txn).unwrap()
         );
         det.abort();
+        let _ = amf_server.stop().await;
+        let _ = nrf_server.stop().await;
+    }
+
+    /// #998: a UE that answers the RequestCapabilities with an LPP Abort is
+    /// positioned at once, not after the capability wait, and is backed off.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_positioning_chain_an_aborted_capability_request_ends_the_wait() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _serial = chain_lock().lock().await;
+        let supi = "imsi-001010000000998".to_string();
+        lmf_context_init(1024);
+        prime_lmf_self();
+        seed_three_cells();
+        seed_amf_connected_ue(&supi);
+        let (amf_server, nrf_server, mut tap_rx) = start_positioning_harness(supi.clone()).await;
+
+        // 20 s budget: the capability wait would be 2 s.
+        let req = high_accuracy_request(&supi, 20);
+        let det = tokio::spawn(async move { handle_determine_location(&req).await });
+        let (cap_corr, dl, cap_txn) = next_downlink(&mut tap_rx).await;
+        assert_eq!(
+            dl,
+            codec_glue::build_lpp_request_capabilities(cap_txn).unwrap()
+        );
+        let aborted = std::time::Instant::now();
+        assert_eq!(
+            handle_n1_message_notify(&amfd_notify_request(
+                &cap_corr,
+                &supi,
+                &crate::lpp_fixtures::target_abort(cap_txn)
+            ))
+            .await
+            .status,
+            204
+        );
+        let (_corr, dl, txn) = next_downlink(&mut tap_rx).await;
+        assert!(
+            aborted.elapsed() < Duration::from_millis(1_000),
+            "the Abort ended the 2 s wait: {:?}",
+            aborted.elapsed()
+        );
+        assert_eq!(
+            dl,
+            codec_glue::build_lpp_request(codec_glue::LppMethod::DlTdoa, txn).unwrap()
+        );
+        det.abort();
+        assert!(
+            lmf_self()
+                .read()
+                .unwrap()
+                .capability_exchange_begin(&supi, 0)
+                .is_none(),
+            "backed off"
+        );
         let _ = amf_server.stop().await;
         let _ = nrf_server.stop().await;
     }

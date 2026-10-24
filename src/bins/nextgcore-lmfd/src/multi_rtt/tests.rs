@@ -851,3 +851,56 @@ async fn a_dl_tdoa_report_on_assigned_dl_prs_ids_is_solved() {
     let got = geodetic_to_enu(TrpCoord::new(fix.latitude, fix.longitude, 0.0), origin());
     assert!((got.e - UE.0).hypot(got.n - UE.1) < 1.0);
 }
+
+/// #990 review: a node's TRP Information is asked for again once it is old, and
+/// a TRP position NG-RAN has corrected replaces the one learned before; the TRP
+/// keeps its DL-PRS ID.
+#[tokio::test]
+async fn a_corrected_trp_position_replaces_the_old_one() {
+    let _g = PROCESS_STATE_TEST_LOCK.lock().await;
+    setup();
+    let before = FakeNgRan {
+        with_prs: true,
+        extra: Some((5, 205, 2000.0, 300.0)),
+        ..Default::default()
+    };
+    let a = prepare_assistance(&before, Duration::from_secs(1), None)
+        .await
+        .unwrap();
+    let key5 = crate::context::trp_key(&node(), 5);
+    let at = |k: &str| {
+        lmf_self()
+            .read()
+            .unwrap()
+            .build_trp_registry()
+            .lookup(k)
+            .unwrap()
+    };
+    let old = at(&key5);
+    // Fresh information is not asked for again.
+    let after = FakeNgRan {
+        with_prs: true,
+        extra: Some((5, 205, 2500.0, 300.0)),
+        ..Default::default()
+    };
+    prepare_assistance(&after, Duration::from_secs(1), None)
+        .await
+        .unwrap();
+    assert!(
+        after.seen.lock().unwrap().is_empty(),
+        "not asked again within the hour"
+    );
+    assert_eq!(at(&key5), old);
+    // An hour on, it is, and the new position replaces the old.
+    lmf_self()
+        .read()
+        .unwrap()
+        .trp_information_age_for_test(&node());
+    let b = prepare_assistance(&after, Duration::from_secs(1), None)
+        .await
+        .unwrap();
+    assert_eq!(after.seen.lock().unwrap().len(), 1);
+    let new = geodetic_to_enu(at(&key5), origin());
+    assert!((new.e - 2500.0).abs() < 0.5, "moved to {new:?}");
+    assert_eq!(b.trps, a.trps, "the TRPs keep their DL-PRS IDs");
+}
