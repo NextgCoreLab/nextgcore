@@ -3429,42 +3429,6 @@ async fn a_ue_requested_release_does_not_wait_for_the_smf() {
     server.forget_ue(ue);
 }
 
-/// #749 over the Namf surface: smfd's downlink-data N1N2 for PSI 2 pages the
-/// idle UE (202). The one for PSI 1, while that paging is ongoing, is answered
-/// 409 with `N1N2MessageTransferError` cause HIGHER_PRIORITY_REQUEST_ONGOING and
-/// `errInfo.retryAfter` (TS 29.518 §5.2.2.3.1), and leaves PSI 2's paging as it was.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_second_downlink_data_transfer_while_paging_gets_409_with_retry_after() {
-    let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
-    let (_smf, port, _calls) = activating_smf().await;
-    let mut server = capturing_ngap_server().await;
-    let (ue, ran, supi) = (7_749_021u64, 65, "imsi-001010007490021");
-    secured_registered_ue(&mut server, ue, ran);
-    with_supi(&mut server, ue, supi);
-    hold_session(&mut server, ue, 1, "n1n2-749-a", port);
-    hold_session(&mut server, ue, 2, "n1n2-749-b", port);
-    server.ue_auth_state.with_mut(ue, |s| s.cm_idle = true);
-
-    let first = n1n2_transfer(supi, 2, Some(("PDU_RES_SETUP_REQ", None)), None).await;
-    assert_eq!(first.status, 202, "the first one pages");
-    let second = n1n2_transfer(supi, 1, Some(("PDU_RES_SETUP_REQ", None)), None).await;
-    assert_eq!(second.status, 409);
-    let body: serde_json::Value =
-        serde_json::from_str(second.http.content.as_deref().unwrap_or("{}")).unwrap_or_default();
-    assert_eq!(body["error"]["cause"], "HIGHER_PRIORITY_REQUEST_ONGOING");
-    assert_eq!(
-        body["errInfo"]["retryAfter"].as_u64(),
-        Some(crate::namf_handler::PAGING_ONGOING_RETRY_AFTER_S)
-    );
-    let paged = crate::context::amf_self()
-        .read()
-        .unwrap()
-        .paging_remove(ue)
-        .expect("paging for PSI 2");
-    assert_eq!(paged.pdu_session_id, Some(2));
-    server.forget_ue(ue);
-}
-
 // ---------------------------------------------------------------------------
 // #759: mobility / periodic Registration with PDU session status and Uplink
 // data status (TS 24.501 §5.5.1.3.4)
@@ -4305,5 +4269,41 @@ async fn a_session_reactivated_by_a_registration_update_gets_no_second_setup() {
         calls.lock().expect("calls").is_empty(),
         "and no second ACTIVATING at the SMF"
     );
+    server.forget_ue(ue);
+}
+
+/// #749 over the Namf surface: smfd's downlink-data N1N2 for PSI 2 pages the
+/// idle UE (202). The one for PSI 1, while that paging is ongoing, is answered
+/// 409 with `N1N2MessageTransferError` cause HIGHER_PRIORITY_REQUEST_ONGOING and
+/// `errInfo.retryAfter` (TS 29.518 §5.2.2.3.1), and leaves PSI 2's paging as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_downlink_data_transfer_while_paging_gets_409_with_retry_after() {
+    let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
+    let (_smf, port, _calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran, supi) = (7_749_021u64, 65, "imsi-001010007490021");
+    secured_registered_ue(&mut server, ue, ran);
+    with_supi(&mut server, ue, supi);
+    hold_session(&mut server, ue, 1, "n1n2-749-a", port);
+    hold_session(&mut server, ue, 2, "n1n2-749-b", port);
+    server.ue_auth_state.with_mut(ue, |s| s.cm_idle = true);
+
+    let first = n1n2_transfer(supi, 2, Some(("PDU_RES_SETUP_REQ", None)), None).await;
+    assert_eq!(first.status, 202, "the first one pages");
+    let second = n1n2_transfer(supi, 1, Some(("PDU_RES_SETUP_REQ", None)), None).await;
+    assert_eq!(second.status, 409);
+    let body: serde_json::Value =
+        serde_json::from_str(second.http.content.as_deref().unwrap_or("{}")).unwrap_or_default();
+    assert_eq!(body["error"]["cause"], "HIGHER_PRIORITY_REQUEST_ONGOING");
+    assert_eq!(
+        body["errInfo"]["retryAfter"].as_u64(),
+        Some(crate::namf_handler::PAGING_ONGOING_RETRY_AFTER_S)
+    );
+    let paged = crate::context::amf_self()
+        .read()
+        .unwrap()
+        .paging_remove(ue)
+        .expect("paging for PSI 2");
+    assert_eq!(paged.pdu_session_id, Some(2));
     server.forget_ue(ue);
 }
