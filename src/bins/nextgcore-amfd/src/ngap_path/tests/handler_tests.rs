@@ -976,7 +976,7 @@ async fn an_establishment_while_the_smf_restarts_is_retried_and_succeeds() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
     drop(listener); // the SMF is down: connection refused
-    let _env = super::SmfEnvGuard::set(port);
+    let _env = super::SmfEnvGuard::acquire(port).await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_796_001u64, 96);
     ue_ready_for_sessions(&mut server, ue, ran);
@@ -1027,7 +1027,7 @@ async fn an_establishment_with_no_smf_back_in_the_window_gets_payload_not_forwar
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
     drop(listener);
-    let _env = super::SmfEnvGuard::set(port);
+    let _env = super::SmfEnvGuard::acquire(port).await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_796_002u64, 97);
     ue_ready_for_sessions(&mut server, ue, ran);
@@ -1099,7 +1099,7 @@ async fn until_in_flight(server: &NgapServer, n: usize) {
 #[allow(clippy::await_holding_lock)]
 async fn an_unanswering_smf_does_not_hold_the_ngap_task() {
     let (_hang, port) = hanging_smf();
-    let _env = super::SmfEnvGuard::set(port);
+    let _env = super::SmfEnvGuard::acquire(port).await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_796_011u64, 98);
     ue_ready_for_sessions(&mut server, ue, ran);
@@ -1150,7 +1150,7 @@ async fn an_unanswering_smf_does_not_hold_the_ngap_task() {
 #[allow(clippy::await_holding_lock)]
 async fn the_window_ends_on_time_while_an_attempt_hangs() {
     let (_hang, port) = hanging_smf();
-    let _env = super::SmfEnvGuard::set(port);
+    let _env = super::SmfEnvGuard::acquire(port).await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_796_012u64, 99);
     ue_ready_for_sessions(&mut server, ue, ran);
@@ -1322,7 +1322,7 @@ async fn a_late_success_for_an_earlier_request_is_released_not_applied() {
 #[allow(clippy::await_holding_lock)]
 async fn forgetting_a_ue_frees_its_attempt_permit() {
     let (_hang, port) = hanging_smf();
-    let _env = super::SmfEnvGuard::set(port);
+    let _env = super::SmfEnvGuard::acquire(port).await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_796_016u64, 103);
     ue_ready_for_sessions(&mut server, ue, ran);
@@ -1402,7 +1402,7 @@ async fn slow_to_fail_smf(hold: Duration) -> (u16, Arc<std::sync::atomic::Atomic
 async fn the_window_runs_from_arrival_through_the_uplink_nas_handler() {
     const HOLD: Duration = Duration::from_millis(400);
     let (port, stop) = slow_to_fail_smf(HOLD).await;
-    let _env = super::SmfEnvGuard::set(port);
+    let _env = super::SmfEnvGuard::acquire(port).await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_796_020u64, 105);
     ue_ready_for_sessions(&mut server, ue, ran);
@@ -1442,7 +1442,7 @@ async fn going_cm_idle_cancels_an_attempt_that_never_started() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
     drop(listener);
-    let _env = super::SmfEnvGuard::set(port);
+    let _env = super::SmfEnvGuard::acquire(port).await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_796_021u64, 106);
     ue_ready_for_sessions(&mut server, ue, ran);

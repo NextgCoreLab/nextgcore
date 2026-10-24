@@ -18392,7 +18392,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_service_request_releases_inactive_sessions_and_activates_its_uplink_ones() {
         let (_smf, port, seen) = fake_activating_smf().await;
-        let _env = SmfEnvGuard::set(port).await;
+        let _env = SmfEnvGuard::acquire(port).await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = test_ngap_server().await;
         let old_id = 5_180_101u64;
@@ -19793,7 +19793,7 @@ mod tests {
     async fn a_ue_initial_registration_dereg_notify_deregisters_the_ue_locally() {
         let _serial = crate::namf_server::dereg_queue_test_lock().lock().await;
         let (_nf, port, seen) = recording_nf().await;
-        let _env = SmfEnvGuard::set(port).await;
+        let _env = SmfEnvGuard::acquire(port).await;
         std::env::set_var("PCF_SBI_ADDR", "127.0.0.1");
         std::env::set_var("PCF_SBI_PORT", port.to_string());
         crate::context::amf_context_init(64, 1024, 4096);
@@ -19909,7 +19909,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_deregistration_terminates_the_am_policy_association() {
         let (_nf, port, seen) = recording_nf().await;
-        let _env = SmfEnvGuard::set(port).await;
+        let _env = SmfEnvGuard::acquire(port).await;
         set_pcf_env(port);
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = test_ngap_server().await;
@@ -19949,7 +19949,7 @@ mod tests {
     async fn an_implicit_deregistration_terminates_the_policy_associations() {
         let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK.lock().await;
         let (_nf, port, seen) = recording_nf().await;
-        let _env = SmfEnvGuard::set(port).await;
+        let _env = SmfEnvGuard::acquire(port).await;
         set_pcf_env(port);
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = test_ngap_server().await;
@@ -19998,7 +19998,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_t3522_exhaustion_terminates_the_policy_associations() {
         let (_nf, port, seen) = recording_nf().await;
-        let _env = SmfEnvGuard::set(port).await;
+        let _env = SmfEnvGuard::acquire(port).await;
         set_pcf_env(port);
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = test_ngap_server().await;
@@ -20044,7 +20044,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_ng_reset_releases_the_dropped_ues_sessions_at_the_smf() {
         let (_nf, port, seen) = recording_nf().await;
-        let _env = SmfEnvGuard::set(port).await;
+        let _env = SmfEnvGuard::acquire(port).await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = test_ngap_server().await;
         let assoc = 637_001u64;
@@ -20714,7 +20714,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn every_n2_sm_container_is_relayed_with_its_own_n2_sm_info_type() {
         let (_smf, port, seen) = fake_smf_typed().await;
-        let _env = SmfEnvGuard::set(port).await;
+        let _env = SmfEnvGuard::acquire(port).await;
 
         let mut server = test_ngap_server().await;
         let ue = 79_525u64;
@@ -20830,7 +20830,7 @@ mod tests {
         };
 
         let (_smf, port, seen) = fake_smf_typed().await;
-        let _env = SmfEnvGuard::set(port).await;
+        let _env = SmfEnvGuard::acquire(port).await;
         let mut server = test_ngap_server().await;
         let ue = 79_526u64;
         server
@@ -22167,7 +22167,13 @@ mod tests {
     struct SmfEnvGuard(tokio::sync::MutexGuard<'static, ()>);
 
     impl SmfEnvGuard {
-        async fn set(port: u16) -> Self {
+        /// Async because the lock is a tokio mutex (#643): it is held across
+        /// the test's awaits. Named `acquire`, not `set`: under the std mutex
+        /// this was a sync `set`, and a test written that way (`let _env =
+        /// SmfEnvGuard::set(port);`) still compiled against an async `set`,
+        /// binding the future unawaited, so the environment was never set.
+        /// With the old name gone, such a call fails to compile.
+        async fn acquire(port: u16) -> Self {
             let guard = smf_env_test_lock().lock().await;
             // The default SBI profile is production, i.e. TLS; the fake SMF below
             // speaks plain h2c. Same override the existing sbi_path tests use.
@@ -22190,7 +22196,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn setup_response_relays_every_pdu_session_not_just_the_last() {
         let (_smf, port, seen) = fake_smf().await;
-        let _env = SmfEnvGuard::set(port).await;
+        let _env = SmfEnvGuard::acquire(port).await;
 
         let mut server = test_ngap_server().await;
         let amf_ue_ngap_id = 79_001u64;
@@ -22254,7 +22260,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn modify_release_notify_and_modify_indication_all_relay_to_the_smf() {
         let (_smf, port, seen) = fake_smf().await;
-        let _env = SmfEnvGuard::set(port).await;
+        let _env = SmfEnvGuard::acquire(port).await;
 
         let mut server = test_ngap_server().await;
         let ue = 79_002u64;
@@ -22374,7 +22380,7 @@ mod tests {
     async fn release_responses_relay_per_the_criticality_rules() {
         use nextgcore_ngap_gen::generated::PDUSessionResourceReleaseResponseProtocolIEs_EntryValue as Ie;
         let (_smf, port, seen) = fake_smf().await;
-        let _env = SmfEnvGuard::set(port).await;
+        let _env = SmfEnvGuard::acquire(port).await;
 
         let mut server = test_ngap_server().await;
         let ue = 79_005u64;
@@ -22431,7 +22437,7 @@ mod tests {
     async fn setup_responses_relay_per_the_criticality_rules() {
         use nextgcore_ngap_gen::generated::PDUSessionResourceSetupResponseProtocolIEs_EntryValue as Ie;
         let (_smf, port, seen) = fake_smf().await;
-        let _env = SmfEnvGuard::set(port).await;
+        let _env = SmfEnvGuard::acquire(port).await;
 
         let mut server = test_ngap_server().await;
         let ue = 79_006u64;
@@ -22543,7 +22549,7 @@ mod tests {
         // Then: the handler must drive the SMF-facing relay for BOTH lists, each
         // against its own SM context ref.
         let (_smf, port, seen) = fake_smf().await;
-        let _env = SmfEnvGuard::set(port).await;
+        let _env = SmfEnvGuard::acquire(port).await;
 
         let mut server = test_ngap_server().await;
         let ue = 42u64;
@@ -22574,7 +22580,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_session_with_no_stored_sm_context_ref_is_not_relayed_under_a_guessed_one() {
         let (_smf, port, seen) = fake_smf().await;
-        let _env = SmfEnvGuard::set(port).await;
+        let _env = SmfEnvGuard::acquire(port).await;
 
         let mut server = test_ngap_server().await;
         let ue = 79_003u64;
@@ -25629,7 +25635,7 @@ mod tests {
     async fn an_established_pdu_session_is_recorded_by_the_handler() {
         crate::context::amf_context_init(64, 1024, 4096);
         let (_smf, port) = fake_smf_creating_sm_contexts("smf-ref-738-sess").await;
-        let _env = SmfEnvGuard::set(port).await;
+        let _env = SmfEnvGuard::acquire(port).await;
         let mut ngap = capturing_ngap_server().await;
         let ue = 7_738_010u64;
         let mut state = UeNasContext::new(ue, 72, 1, false);
@@ -25779,7 +25785,7 @@ mod tests {
     async fn an_emergency_pdu_session_is_recorded_only_when_it_is_the_emergency_session() {
         crate::context::amf_context_init(64, 1024, 4096);
         let (_smf, port) = fake_smf_creating_sm_contexts("smf-ref-emergency").await;
-        let _env = SmfEnvGuard::set(port).await;
+        let _env = SmfEnvGuard::acquire(port).await;
         let mut ngap = test_ngap_server().await;
 
         // 1. DNN omitted. TS 23.501 §5.16.4.2: the network uses the configured emergency
@@ -25890,7 +25896,7 @@ mod tests {
         crate::context::amf_context_init(64, 1024, 4096);
         let (_smf, port, smf_calls) =
             fake_smf_creating_sm_contexts_counted("smf-ref-361-dnn-fence").await;
-        let _env = SmfEnvGuard::set(port).await;
+        let _env = SmfEnvGuard::acquire(port).await;
         let mut ngap = test_ngap_server().await;
 
         // Distinct literal AMF UE NGAP IDs, and distinct from every other test's: the emergency
