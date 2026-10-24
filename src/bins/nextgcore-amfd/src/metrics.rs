@@ -52,6 +52,8 @@ pub enum GlobalMetric {
     MmConfUpdateSucc,
     /// UEs an NG Reset moved to CM-IDLE (#754)
     NgResetUeIdled,
+    /// UE-associated NGAP messages refused for a UE the sender does not serve (#739)
+    UeAssociatedRefused,
 }
 
 impl GlobalMetric {
@@ -76,6 +78,7 @@ impl GlobalMetric {
             Self::MmConfUpdate => "fivegs_amffunction_mm_confupdate",
             Self::MmConfUpdateSucc => "fivegs_amffunction_mm_confupdatesucc",
             Self::NgResetUeIdled => "amf_ng_reset_ue_idled",
+            Self::UeAssociatedRefused => "amf_ngap_ue_associated_refused",
         }
     }
 
@@ -111,6 +114,10 @@ impl GlobalMetric {
             }
             Self::NgResetUeIdled => {
                 "Number of registered UEs an NG Reset moved to CM-IDLE (TS 38.413 §8.7.4.2.2)"
+            }
+            Self::UeAssociatedRefused => {
+                "Number of UE-associated NGAP messages dropped with an Error Indication because \
+                 the sending association does not serve the UE they name (TS 38.413 §10.6)"
             }
         }
     }
@@ -254,6 +261,7 @@ impl AmfMetrics {
             GlobalMetric::MmConfUpdate,
             GlobalMetric::MmConfUpdateSucc,
             GlobalMetric::NgResetUeIdled,
+            GlobalMetric::UeAssociatedRefused,
         ] {
             global_counters.insert(metric, AtomicU64::new(0));
         }

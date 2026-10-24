@@ -322,6 +322,7 @@ fn render_metrics() -> String {
         sgwc_self().ue_count()
     );
     up_path::render_metrics(&mut out);
+    gtp_path::render_s5_delete_metrics(&mut out);
     out
 }
 

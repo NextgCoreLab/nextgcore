@@ -497,9 +497,12 @@ pub fn handle_session_modification_request(
     }
 
     // Send End Markers on the old path before re-pointing FARs
-    // (TS 23.214 Section 5.7 / PFCPSMReq-Flags SNDEM)
+    // (TS 23.214 Section 5.7 / PFCPSMReq-Flags SNDEM). #1042 review: only for an Update
+    // FAR that actually SWITCHES the tunnel -- TS 29.244 §8.2.31 sends End Markers
+    // "towards the old F-TEID of the downstream node when switching to the new F-TEID".
+    // An Update FAR that keeps the endpoint (or carries none) has no old path to close.
     for update_far in &req.update_fars {
-        if update_far.smreq_flags.send_end_marker_packets {
+        if end_marker_due(sess.id, update_far) {
             if let Some(server) = crate::gtp_path::gtpu_server() {
                 if let Err(e) = server.send_end_marker(sess.id, update_far.far_id) {
                     log::warn!("End Marker for FAR {} failed: {e}", update_far.far_id);
@@ -666,6 +669,35 @@ pub fn process_queried_urrs(
         req.query_all_urrs
     );
     reports
+}
+
+/// Whether `update_far` asks for End Markers (SNDEM) AND switches the FAR's tunnel, so
+/// there is an old path to end (#1042 review). Read before the update is applied.
+fn end_marker_due(sess_id: u64, update_far: &UpdateFarRequest) -> bool {
+    if !update_far.smreq_flags.send_end_marker_packets {
+        return false;
+    }
+    let current = sgwu_self()
+        .far_find(sess_id, update_far.far_id)
+        .and_then(|f| f.outer_header_creation);
+    let new = update_far
+        .update_forwarding_parameters
+        .as_ref()
+        .and_then(|fp| fp.outer_header_creation.as_ref());
+    switches_tunnel(current, new)
+}
+
+/// Whether an Update FAR moves the downlink tunnel: the FAR has an outer header now,
+/// and the update names a DIFFERENT one (TEID or peer address) -- the case End Markers
+/// on SNDEM are for (TS 29.244 §8.2.31).
+fn switches_tunnel(
+    current: Option<(u32, Option<std::net::Ipv4Addr>, Option<std::net::Ipv6Addr>)>,
+    new: Option<&OuterHeaderCreation>,
+) -> bool {
+    match (current, new) {
+        (Some(old), Some(new)) => old != (new.teid, new.ipv4, new.ipv6),
+        _ => false,
+    }
 }
 
 /// Handle Session Deletion Request from SGW-C
@@ -1261,6 +1293,64 @@ fn process_remove_bar(sess: &SgwuSess, bar_id: u8) -> Result<(), u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1042 review: SNDEM sends End Markers only when the Update FAR switches the
+    /// tunnel (TS 29.244 §8.2.31) -- not when it keeps the endpoint, carries none, or
+    /// the FAR had no outer header to end.
+    #[test]
+    fn end_markers_are_due_only_when_the_tunnel_switches() {
+        let a = std::net::Ipv4Addr::new(192, 0, 2, 1);
+        let b = std::net::Ipv4Addr::new(192, 0, 2, 2);
+        let ohc = |teid, ip| OuterHeaderCreation {
+            teid,
+            ipv4: Some(ip),
+            ipv6: None,
+        };
+        let cur = Some((0x10, Some(a), None));
+        assert!(switches_tunnel(cur, Some(&ohc(0x11, a))), "new TEID");
+        assert!(switches_tunnel(cur, Some(&ohc(0x10, b))), "new peer");
+        assert!(!switches_tunnel(cur, Some(&ohc(0x10, a))), "same endpoint");
+        assert!(!switches_tunnel(cur, None), "no new outer header");
+        assert!(
+            !switches_tunnel(None, Some(&ohc(0x11, a))),
+            "nothing to end"
+        );
+
+        // Through the installed FAR, as the handler decides it.
+        let ctx = sgwu_self();
+        let sess_id = 0x1042;
+        ctx.far_install(SgwuFar {
+            sess_id,
+            far_id: 1,
+            apply_action: crate::context::apply_action::FORW,
+            outer_header_creation: Some((0x10, Some(a), None)),
+            ..Default::default()
+        });
+        let update = |sndem: bool, teid: u32| UpdateFarRequest {
+            far_id: 1,
+            smreq_flags: SmreqFlags {
+                send_end_marker_packets: sndem,
+            },
+            update_forwarding_parameters: Some(ForwardingParameters {
+                destination_interface: 0,
+                outer_header_creation: Some(ohc(teid, a)),
+            }),
+            ..Default::default()
+        };
+        assert!(
+            end_marker_due(sess_id, &update(true, 0x11)),
+            "SNDEM + switch"
+        );
+        assert!(
+            !end_marker_due(sess_id, &update(true, 0x10)),
+            "SNDEM, same tunnel"
+        );
+        assert!(
+            !end_marker_due(sess_id, &update(false, 0x11)),
+            "switch, no SNDEM"
+        );
+        ctx.far_remove(sess_id, 1);
+    }
     use std::net::Ipv4Addr;
 
     fn create_test_sess() -> SgwuSess {

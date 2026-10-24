@@ -78,52 +78,8 @@ pub mod ie_type {
     pub const GGSN_BACK_OFF_TIME: u8 = 202;
 }
 
-/// GTPv1-C Cause Values
-pub mod cause {
-    pub const REQUEST_IMSI: u8 = 0;
-    pub const REQUEST_IMEI: u8 = 1;
-    pub const REQUEST_IMSI_AND_IMEI: u8 = 2;
-    pub const NO_IDENTITY_NEEDED: u8 = 3;
-    pub const MS_REFUSES: u8 = 4;
-    pub const REQUEST_ACCEPTED: u8 = 128;
-    pub const NEW_PDP_TYPE_DUE_TO_NETWORK_PREFERENCE: u8 = 129;
-    pub const NEW_PDP_TYPE_DUE_TO_SUBSCRIPTION: u8 = 130;
-    pub const NON_EXISTENT: u8 = 192;
-    pub const INVALID_MESSAGE_FORMAT: u8 = 193;
-    pub const IMSI_NOT_KNOWN: u8 = 194;
-    pub const MS_IS_GPRS_DETACHED: u8 = 195;
-    pub const MS_IS_NOT_GPRS_RESPONDING: u8 = 196;
-    pub const MS_REFUSES_2: u8 = 197;
-    pub const VERSION_NOT_SUPPORTED: u8 = 198;
-    pub const NO_RESOURCES_AVAILABLE: u8 = 199;
-    pub const SERVICE_NOT_SUPPORTED: u8 = 200;
-    pub const MANDATORY_IE_INCORRECT: u8 = 201;
-    pub const MANDATORY_IE_MISSING: u8 = 202;
-    pub const OPTIONAL_IE_INCORRECT: u8 = 203;
-    pub const SYSTEM_FAILURE: u8 = 204;
-    pub const ROAMING_RESTRICTION: u8 = 205;
-    pub const P_TMSI_SIGNATURE_MISMATCH: u8 = 206;
-    pub const GPRS_CONNECTION_SUSPENDED: u8 = 207;
-    pub const AUTHENTICATION_FAILURE: u8 = 208;
-    pub const USER_AUTHENTICATION_FAILED: u8 = 209;
-    pub const CONTEXT_NOT_FOUND: u8 = 210;
-    pub const ALL_DYNAMIC_PDP_ADDRESSES_OCCUPIED: u8 = 211;
-    pub const NO_MEMORY: u8 = 212;
-    pub const RELOCATION_FAILURE: u8 = 213;
-    pub const UNKNOWN_MANDATORY_EXTENSION_HEADER: u8 = 214;
-    pub const SEMANTIC_ERROR_TFT: u8 = 215;
-    pub const SYNTACTIC_ERROR_TFT: u8 = 216;
-    pub const SEMANTIC_ERROR_PACKET_FILTER: u8 = 217;
-    pub const SYNTACTIC_ERROR_PACKET_FILTER: u8 = 218;
-    pub const MISSING_OR_UNKNOWN_APN: u8 = 219;
-    pub const UNKNOWN_PDP_ADDRESS_OR_TYPE: u8 = 220;
-    pub const PDP_CONTEXT_WITHOUT_TFT_ACTIVATED: u8 = 221;
-    pub const APN_ACCESS_DENIED: u8 = 222;
-    pub const APN_INCOMPATIBLE_WITH_ACTIVE_PDP_CONTEXTS: u8 = 223;
-    pub const MS_MBMS_CAPABILITIES_INSUFFICIENT: u8 = 224;
-    pub const INVALID_CORRELATION_ID: u8 = 225;
-    pub const INVALID_BEARER_ID: u8 = 226;
-}
+/// GTPv1-C cause octets: the shared TS 29.060 §7.7.1 table (#1053), not a copy.
+pub use nextgcore_gtp::v1::cause;
 
 // ============================================================================
 // QoS Profile Mapping (3GPP TS 23.401 Annex E)
