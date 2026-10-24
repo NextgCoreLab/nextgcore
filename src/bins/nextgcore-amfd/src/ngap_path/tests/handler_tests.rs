@@ -3214,6 +3214,10 @@ async fn a_mobility_update_from_cm_idle_rides_an_initial_context_setup_with_its_
     assert_eq!(accept.pdu_session_status.map(|p| p.psi), Some(1 << 1));
     assert_eq!(accept.pdu_session_reactivation_result, Some(0));
 
+    // #826 review M2 (#778): PSI 1's user plane is recorded as set up on the
+    // new connection, so a downlink-data setup for it is not sent again.
+    assert!(server.up_active.contains(&(new_id, 1)));
+    assert!(!server.up_active.contains(&(new_id, 2)));
     let resumed = server.ue_auth_state.get(new_id).expect("the resumed UE");
     assert!(resumed.initial_context_setup_request_sent);
     assert!(
@@ -3546,4 +3550,55 @@ async fn a_later_update_without_session_ies_clears_earlier_ones() {
     if let Some(sess) = guard.sess_find_by_psi(ue, 1) {
         guard.sess_remove(sess.id);
     }
+}
+
+/// #826 review M2 (#778): a connected mobility update re-activates PSI 1 with
+/// its own PDU SESSION RESOURCE SETUP REQUEST. smfd's downlink-data N1N2
+/// (`PDU_RES_SETUP_REQ`) for the same PSI, queued meanwhile, must not produce
+/// a second one. The gNB would refuse it as a duplicate of an active session
+/// (TS 38.413 §8.2.1.4), and the relayed failure would have the SMF deactivate
+/// the working downlink.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_reactivated_by_a_registration_update_gets_no_second_setup() {
+    let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
+    let (_smf, port, calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran, supi) = (7_759_301u64, 63, "imsi-001010007590301");
+    registered_ue_with_guti(&mut server, ue, ran);
+    with_supi(&mut server, ue, supi);
+    hold_session(&mut server, ue, 1, "reg759-nodup-1", port);
+
+    let rr = ue_protect(
+        &update_registration_request(
+            crate::gmm_build::registration_type::MOBILITY_UPDATING,
+            Some(1 << 1),
+            Some(1 << 1),
+        ),
+        0,
+    );
+    let _ = server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &rr))
+        .await;
+    let first: Vec<Sent> = sent_to(&mut server, ue)
+        .into_iter()
+        .filter(|s| matches!(s, Sent::SetupRequest { .. }))
+        .collect();
+    assert_eq!(first.len(), 1, "the update's own setup: {first:?}");
+    calls.lock().expect("calls").clear();
+
+    let resp = n1n2_transfer(supi, 1, Some(("PDU_RES_SETUP_REQ", None)), None).await;
+    assert_eq!(resp.status, 200);
+    server.process_connected_downlinks().await;
+
+    assert!(
+        !sent_to(&mut server, ue)
+            .iter()
+            .any(|s| matches!(s, Sent::SetupRequest { .. })),
+        "no second PDU SESSION RESOURCE SETUP REQUEST for PSI 1"
+    );
+    assert!(
+        calls.lock().expect("calls").is_empty(),
+        "and no second ACTIVATING at the SMF"
+    );
+    server.forget_ue(ue);
 }

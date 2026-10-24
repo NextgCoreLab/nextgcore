@@ -5405,13 +5405,9 @@ impl NgapServer {
                     );
                 }
             }
-            self.sm_context_refs.remove(&(amf_ue_ngap_id, *psi));
-            self.sm_context_smfs.remove(&(amf_ue_ngap_id, *psi));
-            let ctx = crate::context::amf_self();
-            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
-            if let Some(sess) = guard.sess_find_by_psi(amf_ue_ngap_id, *psi) {
-                guard.sess_remove(sess.id);
-            }
+            // #826 review m3: #799's one funnel for a session that is over (its
+            // refs, its SMF, its handover transfer and its `sess_list` entry).
+            self.forget_session(amf_ue_ngap_id, *psi);
             log::info!(
                 "UE {amf_ue_ngap_id}: PSI {psi} released, the registration update reports it \
                  inactive (TS 24.501 §5.5.1.3.4)"
@@ -5522,6 +5518,12 @@ impl NgapServer {
         let (racs_id, racs_cap) = self.racs_ies_for(amf_ue_ngap_id);
         let ics = crate::racs::add_capability_ies(ics, racs_id.as_deref(), racs_cap.as_deref());
         self.send_to_association(association_id, &ics).await?;
+        // #826 review M2 (#778): these user planes are now set up on this
+        // connection, so a queued or retransmitted downlink-data setup for one of
+        // them is not sent as a duplicate (TS 38.413 §8.2.1.4).
+        for s in sessions {
+            self.mark_up_active(amf_ue_ngap_id, s.pdu_session_id);
+        }
         log::info!(
             "Registration Accept (update) sent in an Initial Context Setup to UE \
              {amf_ue_ngap_id} with {} re-activated PDU session(s)",
@@ -5559,7 +5561,11 @@ impl NgapServer {
                 continue;
             };
             match self.send_to_association(association_id, &req).await {
-                Ok(()) => carried = true,
+                Ok(()) => {
+                    carried = true;
+                    // #826 review M2 (#778): set up on this connection.
+                    self.mark_up_active(amf_ue_ngap_id, s.pdu_session_id);
+                }
                 Err(e) => log::warn!(
                     "UE {amf_ue_ngap_id}: PSI {} setup request not sent: {e}",
                     s.pdu_session_id
