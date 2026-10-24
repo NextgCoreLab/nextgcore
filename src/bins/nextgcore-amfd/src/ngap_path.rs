@@ -843,6 +843,10 @@ pub struct NgapServer {
     /// so a test can drive a handler's send-failure branch (#760).
     #[cfg(test)]
     fail_next_sends: usize,
+    /// Test seam (#986 review follow-up): the clock the step 6a hold reads, so a test
+    /// moves time instead of sleeping. `None` is the real clock.
+    #[cfg(test)]
+    clock_override: Option<Instant>,
     /// Test seam: the next PDU session record fails as a full session table
     /// would (#756 review m1), without filling the process-global table.
     #[cfg(test)]
@@ -958,8 +962,10 @@ pub struct NgapServer {
     /// answers before it continues with the sessions that answered (#964 review).
     /// `AMF_HANDOVER_PREPARATION_SMF_WAIT_MS`, default 1000.
     ho_preparation_wait: Duration,
-    /// The same supervision for the PREPARED answers to a target's Acknowledge, which
-    /// count against the source's TNGRELOCoverall (#964 review).
+    /// The same supervision for the PREPARED answers to a target's Acknowledge. Like the
+    /// PREPARING wait, it runs before the source has its HANDOVER COMMAND, so the two
+    /// together count against the source's TNGRELOCprep (TS 38.413 §8.4.1.2; #978 review
+    /// follow-up -- not TNGRELOCoverall, which starts at the Command).
     /// `AMF_HANDOVER_COMMAND_SMF_WAIT_MS`, default 1000.
     ho_command_wait: Duration,
     /// EPS→5GS handovers in flight, keyed by the AMF UE NGAP ID allocated for the
@@ -1169,6 +1175,8 @@ impl NgapServer {
             outbound_streams: std::collections::HashMap::new(),
             #[cfg(test)]
             fail_next_sends: 0,
+            #[cfg(test)]
+            clock_override: None,
             #[cfg(test)]
             fail_next_session_record: false,
             event_tx,
@@ -10700,12 +10708,22 @@ impl NgapServer {
             .retain(|(ue, _psi), _| *ue != amf_ue_ngap_id);
     }
 
+    /// The clock the step 6a hold is measured on: the real one, or a test's (#986 review
+    /// follow-up).
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(now) = self.clock_override {
+            return now;
+        }
+        Instant::now()
+    }
+
     /// Send the source NG-RAN Release Commands whose step 6a timer has expired (#806).
     async fn process_pending_source_releases(&mut self) {
         if self.pending_source_releases.is_empty() {
             return;
         }
-        let now = Instant::now();
+        let now = self.now();
         let (due, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending_source_releases)
             .into_iter()
             .partition(|p| p.deadline <= now);
@@ -10896,23 +10914,15 @@ impl NgapServer {
                  sessions; nothing is released.",
                 required.handover_type
             );
-            let failure = nextgcore_ngap::types::HandoverPreparationFailure {
-                amf_ue_ngap_id: required.amf_ue_ngap_id,
-                ran_ue_ngap_id: required.ran_ue_ngap_id,
-                cause: nextgcore_ngap::types::Cause::RadioNetwork(cause),
-                criticality_diagnostics: None,
-            };
-            // Local cleanup, the same state HandoverCancel drops: a relay target and
-            // any per-session transfers left from an earlier preparation for this UE.
-            // Dropped BEFORE the failure is sent, so a failed send cannot leave a
-            // stale relay target that a later Uplink RAN Status Transfer would follow
-            // to a gNB this UE is not moving to.
-            self.forget_handover_preparation(required.amf_ue_ngap_id);
-            if let Some(bytes) = crate::ngap_asn1::build_handover_preparation_failure_asn1(&failure)
-            {
-                self.send_to_association(association_id, &bytes).await?;
-            }
-            return Ok(());
+            // Local cleanup, the same state HandoverCancel drops, done BEFORE the failure
+            // is sent (`refuse_inter_system_preparation`): a relay target and any
+            // per-session transfers left from an earlier preparation for this UE, so a
+            // later Uplink RAN Status Transfer cannot follow them to a gNB this UE is not
+            // moving to; and a preparation still in progress is cancelled at its target and
+            // SMFs (#1043 review follow-up), as every other refusal does.
+            return self
+                .refuse_inter_system_preparation(association_id, &required, cause)
+                .await;
         }
 
         // #408: a `fivegs-to-eps` preparation that got past the refusal is one a Forward
@@ -12635,8 +12645,8 @@ impl NgapServer {
         // supervise when resources in S-RAN shall be release[d]" (step 6a), and step 14a
         // releases the source "after the timer in step 6a expires" -- so the source is
         // kept, for in-flight forwarding, for the hold after THIS Notify. 0 releases now.
-        let hold_until = (!self.handover_source_hold.is_zero())
-            .then(|| Instant::now() + self.handover_source_hold);
+        let hold_until =
+            (!self.handover_source_hold.is_zero()).then(|| self.now() + self.handover_source_hold);
         let mut source_release_deferred = false;
         if let (Some((source_assoc, source_ran_ue_id)), Some(deadline)) = (source, hold_until) {
             self.pending_source_releases.push(PendingSourceRelease {
@@ -23986,8 +23996,9 @@ mod tests {
     /// except for a `nocmd-*` ref (500); `HANDOVER_RES_ALLOC_FAIL` with CANCELLED and
     /// `HANDOVER_PREP_FAIL` = [`ho_prep_fail_transfer_for`]. Everything else gets 204.
     /// A `hang-*` ref never answers PREPARING and a `hangcmd-*` ref never answers PREPARED
-    /// (a blackholed SMF); `hoState: PROBE` takes 300 ms. Every call is recorded when it
-    /// completes. Keep the server alive.
+    /// (a blackholed SMF); a `late-*` PREPARING, a `latecmd-*` PREPARED and `hoState:
+    /// PROBE` take 300 ms; a `flaky-*` ref's first COMPLETED gets 500. Every call is
+    /// recorded when it completes. Keep the server alive.
     #[allow(clippy::type_complexity)]
     async fn handover_smf() -> (
         nextgcore_sbi::server::SbiServer,
@@ -23999,6 +24010,8 @@ mod tests {
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let seen: Arc<std::sync::Mutex<Vec<HoStep>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = Arc::clone(&seen);
+        // How many COMPLETEDs a `flaky-*` ref has been sent: the first one fails.
+        let completed_seen = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let server = nextgcore_sbi::server::SbiServer::on_listener(
             nextgcore_sbi::server::SbiServerConfig::new(addr),
@@ -24007,6 +24020,7 @@ mod tests {
         server
             .start(move |req: SReq| {
                 let sink = Arc::clone(&sink);
+                let completed_seen = Arc::clone(&completed_seen);
                 async move {
                     let sm_ref = req
                         .header
@@ -24042,10 +24056,16 @@ mod tests {
                     if hangs {
                         tokio::time::sleep(Duration::from_secs(3600)).await;
                     }
-                    // A slow step, recorded only when it completes.
-                    if state == "PROBE" {
+                    // A slow step, recorded only when it completes; and a SMF that answers a
+                    // `late-*` PREPARING or a `latecmd-*` PREPARED past the AMF's wait.
+                    let late = (state == "PREPARING" && sm_ref.starts_with("late-"))
+                        || (state == "PREPARED" && sm_ref.starts_with("latecmd-"));
+                    if state == "PROBE" || late {
                         tokio::time::sleep(Duration::from_millis(300)).await;
                     }
+                    let flaky_first = state == "COMPLETED"
+                        && sm_ref.starts_with("flaky-")
+                        && completed_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
                     sink.lock().expect("sink").push((
                         sm_ref.clone(),
                         state.clone(),
@@ -24064,6 +24084,9 @@ mod tests {
                             "application/json",
                         )
                     };
+                    if flaky_first {
+                        return SResp::with_status(500);
+                    }
                     match (state.as_str(), info_type.as_str()) {
                         ("PREPARING", "HANDOVER_REQUIRED") if sm_ref.starts_with("noprep-") => {
                             SResp::with_status(500)
@@ -25204,6 +25227,241 @@ mod tests {
         })
         .await;
         server.forget_ue(ue);
+    }
+
+    /// **#1043 review follow-up.** A HANDOVER REQUIRED this AMF refuses as inter-system
+    /// (fivegs-to-eps with no drivable N26) while an intra-5GS preparation is still in
+    /// progress for the UE ends that preparation as a superseding request does: its target
+    /// is released (the AMF UE NGAP ID alone, before an Acknowledge), its SMF is told
+    /// CANCELLED (HO_CANCEL), and no relay state is left -- then the source gets the
+    /// HANDOVER PREPARATION FAILURE, ho-target-not-allowed.
+    ///
+    /// REVERT-VERIFIED: with the old forget-only cleanup the target and the SMF hear
+    /// nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_inter_system_refusal_cancels_the_preparation_in_progress() {
+        assert!(
+            !crate::n26_path::forward_relocation_drivable(),
+            "precondition: no N26 in tests"
+        );
+        let (_smf, smf_port, seen) = handover_smf().await;
+        let mut server = capturing_ngap_server().await;
+        let (source, target) = (97_984u64, 97_985u64);
+        let gnb_t = 0x7_9851u32;
+        seed_gnb_session_with_id(&server, source, 0x7_9840).await;
+        seed_gnb_session_with_id(&server, target, gnb_t).await;
+        let (ue, ran) = (7_964_801u64, 84u32);
+        let mut state = UeNasContext::new(ue, ran, source, false);
+        state.registered = true;
+        state.amf_ue.allowed_nssai = vec![SNssai { sst: 1, sd: None }];
+        server.ue_auth_state.insert(ue, state);
+        server.sm_context_refs.insert((ue, 1), "isr-1".to_string());
+        server
+            .sm_context_smfs
+            .insert((ue, 1), ("127.0.0.1".to_string(), smf_port));
+        // An intra-5GS preparation, its HANDOVER REQUEST sent.
+        server
+            .handle_handover_required(source, &handover_required_pdu(ue, ran, gnb_t, &[1]))
+            .await
+            .expect("handled");
+        drive_sbi(&mut server).await;
+        assert_eq!(take_sent_ngap(&mut server).len(), 1, "the HandoverRequest");
+        seen.lock().expect("sink").clear();
+
+        let to_eps = {
+            let mut pdu = nextgcore_ngap_gen::decode(&handover_required_pdu(ue, ran, gnb_t, &[1]))
+                .expect("decodes");
+            let nextgcore_ngap_gen::generated::NGAP_PDU::InitiatingMessage(m) = &mut pdu else {
+                unreachable!()
+            };
+            let nextgcore_ngap_gen::generated::InitiatingMessageValue::Id_HandoverPreparation(r) =
+                &mut m.value
+            else {
+                unreachable!()
+            };
+            for ie in r.protocol_i_es.0.iter_mut() {
+                if let nextgcore_ngap_gen::generated::HandoverRequiredProtocolIEs_EntryValue::Id_HandoverType(t) = &mut ie.value {
+                    t.0 = nextgcore_ngap_gen::generated::HandoverType::FIVEGS_TO_EPS;
+                }
+            }
+            nextgcore_ngap_gen::encode(&pdu).expect("re-encodes")
+        };
+        server
+            .handle_handover_required(source, &to_eps)
+            .await
+            .expect("handled");
+        drive_sbi(&mut server).await;
+        let sent = take_sent_ngap(&mut server);
+        assert_eq!(
+            sent.iter().map(|(a, _)| *a).collect::<Vec<_>>(),
+            vec![target, source],
+            "the old target is released, then the source refused: {sent:?}"
+        );
+        assert_eq!(
+            decoded_release_command(&sent[0].1),
+            Some((
+                ue,
+                None,
+                Some(nextgcore_ngap_gen::generated::CauseRadioNetwork::HANDOVER_CANCELLED)
+            ))
+        );
+        assert_eq!(
+            (sent[1].1[0], sent[1].1[1]),
+            (0x40, nextgcore_ngap_gen::generated::ID_HANDOVER_PREPARATION)
+        );
+        let steps: Vec<HoStep> = std::mem::take(&mut *seen.lock().expect("sink"));
+        assert_eq!(
+            ho_steps_in(&steps, "CANCELLED"),
+            vec![("isr-1".to_string(), Vec::new(), "HO_CANCEL".to_string())]
+        );
+        assert!(!server.handover_pending_target.contains_key(&ue));
+        assert!(!server.handover_prepared_psis.contains_key(&ue));
+        server.forget_ue(ue);
+    }
+
+    /// **#978 review follow-up.** A COMPLETED the SMF does not accept is tried once more
+    /// after [`HANDOVER_COMPLETED_RETRY`]: the source is already released, so a lost
+    /// COMPLETED would leave the downlink pointed at nothing.
+    ///
+    /// REVERT-VERIFIED: without the retry the SMF sees one COMPLETED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_completed_is_retried_once() {
+        let (_smf, smf_port, seen) = handover_smf().await;
+        let mut server = capturing_ngap_server().await;
+        let (source, target) = (97_980u64, 97_981u64);
+        seed_gnb_session(&server, source).await;
+        seed_gnb_session(&server, target).await;
+        let ue = 7_964_601u64;
+        let mut state = UeNasContext::new(ue, 80, source, false);
+        state.registered = true;
+        server.ue_auth_state.insert(ue, state);
+        server
+            .sm_context_refs
+            .insert((ue, 1), "flaky-1".to_string());
+        server
+            .sm_context_smfs
+            .insert((ue, 1), ("127.0.0.1".to_string(), smf_port));
+        server.handover_target_assoc.insert(ue, (target, 81));
+        server.handover_target_transfers.insert((ue, 1), vec![0xA1]);
+        server
+            .handle_handover_notify(target, &handover_notify_pdu(ue, 81))
+            .await
+            .expect("handled");
+        drive_sbi(&mut server).await;
+        let completed: Vec<HoStep> = seen
+            .lock()
+            .expect("sink")
+            .iter()
+            .filter(|s| s.0 == "flaky-1" && s.1 == "COMPLETED")
+            .cloned()
+            .collect();
+        assert_eq!(
+            completed.len(),
+            2,
+            "the failed COMPLETED and its retry: {completed:?}"
+        );
+        server.forget_ue(ue);
+    }
+
+    /// **#978 review follow-up.** At either deadline a session whose SMF answers LATE is
+    /// left out of the handover and told CANCELLED (HO_FAILURE) once its late step is
+    /// done -- keyed, so the CANCELLED follows the late answer -- and the late answer is
+    /// ignored: it neither joins the HANDOVER REQUEST / COMMAND already sent nor restarts
+    /// anything.
+    ///
+    /// REVERT-VERIFIED: without the CANCELLED of the late sessions their SMFs hear
+    /// nothing after the late step.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_late_session_is_cancelled_at_either_deadline() {
+        let (_smf, smf_port, seen) = handover_smf().await;
+        let mut server = capturing_ngap_server().await;
+        server.ho_preparation_wait = Duration::from_millis(100);
+        server.ho_command_wait = Duration::from_millis(100);
+        let (source, target) = (97_982u64, 97_983u64);
+        let gnb_t = 0x7_9831u32;
+        seed_gnb_session_with_id(&server, source, 0x7_9820).await;
+        seed_gnb_session_with_id(&server, target, gnb_t).await;
+        for (n, refs) in [["on-1", "late-2"], ["on-1", "latecmd-2"]]
+            .into_iter()
+            .enumerate()
+        {
+            let (ue, ran, target_ran) = (7_964_701u64 + n as u64, 82u32 + n as u32, 9_831u32);
+            let mut state = UeNasContext::new(ue, ran, source, false);
+            state.registered = true;
+            state.amf_ue.allowed_nssai = vec![SNssai { sst: 1, sd: None }];
+            server.ue_auth_state.insert(ue, state);
+            let refs = [format!("{}-{n}", refs[0]), format!("{}-{n}", refs[1])];
+            for (psi, r) in [(1u8, &refs[0]), (2, &refs[1])] {
+                server.sm_context_refs.insert((ue, psi), r.clone());
+                server
+                    .sm_context_smfs
+                    .insert((ue, psi), ("127.0.0.1".to_string(), smf_port));
+            }
+            server
+                .handle_handover_required(source, &handover_required_pdu(ue, ran, gnb_t, &[1, 2]))
+                .await
+                .expect("handled");
+            if n == 1 {
+                drive_sbi(&mut server).await;
+                take_sent_ngap(&mut server);
+                server
+                    .handle_handover_request_acknowledge(
+                        target,
+                        &handover_ack_pdu(ue, target_ran, &[(1, vec![0xA1]), (2, vec![0xA2])]),
+                    )
+                    .await
+                    .expect("handled");
+            }
+            // PSI 1 answers at once; PSI 2's SMF only after the wait.
+            pump_until(&mut server, |s| {
+                s.ho_preparations
+                    .get(&ue)
+                    .is_some_and(|p| !p.ready.is_empty())
+                    || s.ho_commands.get(&ue).is_some_and(|c| !c.ready.is_empty())
+            })
+            .await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            server.process_handover_deadlines().await;
+            let sent = take_sent_ngap(&mut server);
+            assert_eq!(sent.len(), 1, "case {n}: {sent:?}");
+            if n == 0 {
+                assert_eq!(
+                    decoded_handover_request_transfers(&sent[0].1),
+                    Some(vec![(1, ho_request_transfer_for(&refs[0]))]),
+                    "case {n}: the late session is not offered"
+                );
+            } else {
+                let (handed, _) = decoded_handover_command_lists(&sent[0].1).expect("a Command");
+                assert_eq!(
+                    handed,
+                    vec![(1, ho_command_transfer_for(&refs[0]))],
+                    "case {n}"
+                );
+            }
+            drive_sbi(&mut server).await;
+            let late: Vec<(String, String)> = seen
+                .lock()
+                .expect("sink")
+                .iter()
+                .filter(|s| s.0 == refs[1])
+                .map(|s| (s.1.clone(), s.4.clone()))
+                .collect();
+            let step = if n == 0 { "PREPARING" } else { "PREPARED" };
+            assert_eq!(
+                late.last(),
+                Some(&("CANCELLED".to_string(), "HO_FAILURE".to_string())),
+                "case {n}: CANCELLED (HO_FAILURE) after the late {step}: {late:?}"
+            );
+            assert!(
+                late.iter().any(|(s, _)| s == step),
+                "case {n}: the late {step} itself was answered first: {late:?}"
+            );
+            assert!(
+                take_sent_ngap(&mut server).is_empty(),
+                "case {n}: the late answer adds nothing"
+            );
+            server.forget_ue(ue);
+        }
     }
 
     /// **#964 review, MINOR 1.** `hoState: COMPLETED` is keyed per (UE, PSI): it reaches
@@ -27550,7 +27808,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_source_is_released_when_the_step_6a_timer_expires() {
         let mut server = capturing_ngap_server().await;
-        server.handover_source_hold = Duration::from_millis(300);
+        // The hold is measured on the test's clock (#986 review): time is moved, not
+        // slept, and a slow machine cannot change the outcome.
+        let hold = Duration::from_secs(2);
+        let t0 = Instant::now();
+        server.clock_override = Some(t0);
+        server.handover_source_hold = hold;
         let (source, target) = (98_061u64, 98_062u64);
         seed_gnb_session(&server, source).await;
         seed_gnb_session(&server, target).await;
@@ -27560,7 +27823,6 @@ mod tests {
             .insert(ue, UeNasContext::new(ue, 61, source, false));
         server.handover_target_assoc.insert(ue, (target, 62));
 
-        let notified = Instant::now();
         let report = server
             .handle_handover_notify(target, &handover_notify_pdu(ue, 62))
             .await
@@ -27571,15 +27833,14 @@ mod tests {
         let state = server.ue_auth_state.get(ue).expect("UE");
         assert_eq!((state.association_id, state.ran_ue_ngap_id), (target, 62));
 
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        server.clock_override = Some(t0 + hold - Duration::from_millis(1));
         server.process_pending_source_releases().await;
         assert!(
             take_sent_ngap(&mut server).is_empty(),
-            "timer still running"
+            "timer still running a millisecond before it expires"
         );
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        server.clock_override = Some(t0 + hold);
         server.process_pending_source_releases().await;
-        assert!(notified.elapsed() >= Duration::from_millis(300));
         let sent = take_sent_ngap(&mut server);
         assert_eq!(sent.len(), 1, "{sent:?}");
         assert_eq!(sent[0].0, source);
@@ -27624,7 +27885,11 @@ mod tests {
     async fn a_ping_pong_within_the_hold_releases_only_the_stale_connection() {
         for (case, back_ran) in [(0u64, 33u32), (1, 31)] {
             let mut server = capturing_ngap_server().await;
-            server.handover_source_hold = Duration::from_millis(200);
+            // The test's clock (#986 review): t0 the first Notify, t0 + 50 ms the second.
+            let hold = Duration::from_secs(2);
+            let t0 = Instant::now();
+            server.clock_override = Some(t0);
+            server.handover_source_hold = hold;
             let (a, b) = (98_071u64 + 10 * case, 98_072u64 + 10 * case);
             seed_gnb_session(&server, a).await;
             seed_gnb_session(&server, b).await;
@@ -27641,7 +27906,7 @@ mod tests {
                 .expect("handled");
             assert!(report.source_release_deferred, "case {case}");
             // B -> A, within A's hold.
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            server.clock_override = Some(t0 + Duration::from_millis(50));
             server.handover_target_assoc.insert(ue, (a, back_ran));
             let report = server
                 .handle_handover_notify(a, &handover_notify_pdu(ue, back_ran))
@@ -27653,7 +27918,7 @@ mod tests {
             assert_eq!((state.association_id, state.ran_ue_ngap_id), (a, back_ran));
 
             // A's hold expires first.
-            tokio::time::sleep(Duration::from_millis(170)).await;
+            server.clock_override = Some(t0 + hold);
             server.process_pending_source_releases().await;
             let sent = take_sent_ngap(&mut server);
             if back_ran == 31 {
@@ -27671,7 +27936,7 @@ mod tests {
                 );
             }
             // Then B's.
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            server.clock_override = Some(t0 + hold + Duration::from_millis(50));
             server.process_pending_source_releases().await;
             let sent = take_sent_ngap(&mut server);
             assert_eq!(sent.len(), 1, "case {case}: {sent:?}");
