@@ -89,9 +89,7 @@ struct Args {
 }
 
 fn init_logging(level: &str) {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level))
-        .format_timestamp_millis()
-        .init();
+    nextgcore_core::log::nf_log_builder(level).init();
 }
 
 fn setup_signal_handlers(shutdown: Arc<AtomicBool>) {

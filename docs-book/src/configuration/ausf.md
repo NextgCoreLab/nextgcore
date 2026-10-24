@@ -63,7 +63,7 @@ These are the fields actually deserialized by the daemon (`#[derive(Deserialize)
 
 Unknown YAML keys are silently ignored by serde. In the shipped `ausf.yaml`, the following blocks are decorative:
 
-- **`logger.file.path` and `logger.level` are inert.** The log level comes solely from the CLI flag `-e/--log-level`; `init_logging` builds an `env_logger::Builder::new()` with `filter_level`, so even `RUST_LOG` (which the docker compose sets) is not consulted by this daemon. Nothing writes to the YAML's log-file path.
+- **`logger.file.path` and `logger.level` are inert.** The log level comes from `RUST_LOG` when set, else the CLI flag `-e/--log-level`. Nothing writes to the YAML's log-file path.
 - **`global.max.ue` / `global.max.peer` are inert.** The auth-context pool capacity comes from the CLI flag `--max-ue` (default `1024` — the example's matching `1024` is coincidence, not causation). `max.peer` is read by nothing in this binary.
 - **`ausf.sbi.tls.*` (enabled/cert/key/ca/min_version) is inert.** More honestly: even the CLI `--tls`/`--tls-cert`/`--tls-key` flags only populate the legacy `SbiServerConfig` consumed by the `ausf_sbi_open()` logging shim (`sbi_path.rs`, marked inert by the "ausfd-10" note). The live HTTP/2 server's TLS is set only by the SBI security profile (`NEXTGCORE_SBI_PROFILE`, see [Configuration Overview](./overview.md)).
 - **`ausf.security.pqc.*` is inert.** No PQC code path exists in this binary.

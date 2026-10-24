@@ -183,7 +183,7 @@ Common ones:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `RUST_LOG` | Log filter. Honoured by 13 of the 28 NFs; the others take `--log-level` only (#691) | `info` |
+| `RUST_LOG` | Log filter for every NF (env_logger syntax, e.g. `info,nextgcore_amfd=debug`). When set and not blank it replaces the NF's `--log-level` entirely; unset, `--log-level` applies to all targets (#691) | `info` |
 | `NEXTGCORE_SBI_PROFILE` | SBI security profile for amf/smf/ausf/udm; the compose files set `dev` (h2c, no mTLS) | `production` when unset |
 | `NEXTGCORE_SBI_OAUTH2_REQUIRE` | Force OAuth2 enforcement on an NF's SBI server (the `oauth2` overlay sets it) | unset |
 
