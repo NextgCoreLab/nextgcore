@@ -306,6 +306,18 @@ impl KernelSctpSocket {
         Ok((status.sstat_instrms, status.sstat_outstrms))
     }
 
+    /// Shut the association down gracefully (`shutdown(2)` with `SHUT_RDWR`: on a
+    /// one-to-one SCTP socket this starts the SHUTDOWN exchange, RFC 9260 §9.2,
+    /// RFC 6458 §4.1.7). The read loop then sees end-of-file and reports the
+    /// association closed.
+    pub fn shutdown(&self) -> Result<()> {
+        let result = unsafe { libc::shutdown(self.fd.as_raw_fd(), libc::SHUT_RDWR) };
+        if result < 0 {
+            return Err(SctpError::SendFailed(io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
     /// Receive a single SCTP message, returning the byte count, the decoded
     /// send/receive info (PPID restored to host order, stream number) and the
     /// raw `msg_flags`. `msg_flags & MSG_NOTIFICATION` marks an SCTP event

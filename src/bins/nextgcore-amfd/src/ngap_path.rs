@@ -180,6 +180,18 @@ impl NgapTransport {
         }
     }
 
+    /// Close `association_id` (SCTP SHUTDOWN); unknown ids are a no-op.
+    fn close_association(
+        &mut self,
+        association_id: u64,
+    ) -> std::result::Result<(), nextgcore_sctp::ServerError> {
+        match self {
+            Self::Userspace(s) => s.close_association(association_id),
+            #[cfg(feature = "kernel-sctp")]
+            Self::Kernel(s) => s.close_association(association_id),
+        }
+    }
+
     async fn send(
         &mut self,
         association_id: u64,
@@ -874,6 +886,9 @@ pub struct NgapServer {
     /// Each association's negotiated outbound stream count, asked of the transport once
     /// (#813); removed when the association closes.
     outbound_streams: std::collections::HashMap<u64, Option<u16>>,
+    /// Tests: the associations this AMF shut down itself (#1088 follow-up).
+    #[cfg(test)]
+    closed_associations: Vec<u64>,
     /// Test seam: the negotiated outbound stream count the capture reports for every
     /// association (a captured send has no SCTP association to ask). Default 2, amfd's
     /// configured count (#813).
@@ -1411,6 +1426,8 @@ impl NgapServer {
             #[cfg(test)]
             test_outbound_streams: 2,
             outbound_streams: std::collections::HashMap::new(),
+            #[cfg(test)]
+            closed_associations: Vec::new(),
             #[cfg(test)]
             fail_next_sends: 0,
             #[cfg(test)]
@@ -2452,9 +2469,9 @@ impl NgapServer {
                     "NG Setup on association {association_id} reuses the Global RAN Node \
                      ID (gNB {gnb_id:#x}/{gnb_id_len} bits) still held by association {old}; \
                      the new association replaces it and association {old} is dropped \
-                     (TS 38.413 §8.7.1.1)"
+                     and shut down (TS 38.413 §8.7.1.1)"
                 );
-                self.sessions.write().await.remove(&old);
+                self.drop_replaced_association(old).await;
             }
         }
 
@@ -2469,6 +2486,21 @@ impl NgapServer {
         }
 
         Ok(())
+    }
+
+    /// Forget an association a new NG Setup replaced (#1048 m1) and shut it down
+    /// (#1088 review). Its session, address and stream count go, and its SCTP
+    /// association is closed, so nothing it sends is processed again: no later NG
+    /// Setup on it can take the Global RAN Node ID back.
+    async fn drop_replaced_association(&mut self, old: u64) {
+        self.sessions.write().await.remove(&old);
+        self.assoc_to_addr.write().await.remove(&old);
+        self.outbound_streams.remove(&old);
+        #[cfg(test)]
+        self.closed_associations.push(old);
+        if let Err(e) = self.transport.close_association(old) {
+            log::warn!("Replaced association {old} could not be shut down: {e}");
+        }
     }
 
     /// Handle NG Reset from a gNB (TS 38.413 Section 8.7.4.2)
@@ -29634,6 +29666,13 @@ mod tests {
 
         // The same gNB on a new association: the old one's UE is released.
         connected_ue_on(&mut server, first, ue_b, 6, "setup1039-b", smf_port);
+        // As a live association has them (#1088 review).
+        server
+            .assoc_to_addr
+            .write()
+            .await
+            .insert(first, "10.9.8.7:38412".parse().unwrap());
+        server.outbound_streams.insert(first, Some(2));
         seed_gnb_session(&server, second).await;
         server
             .handle_ng_setup_request(second, &setup)
@@ -29664,6 +29703,25 @@ mod tests {
             1,
             "one association per Global RAN Node ID"
         );
+        drop(sessions);
+        // #1088 review: and the old association is gone at every layer, and shut
+        // down. An NG Setup it still sends is not processed, so the Global RAN Node
+        // ID stays with the new association.
+        assert!(!server.assoc_to_addr.read().await.contains_key(&first));
+        assert!(!server.outbound_streams.contains_key(&first));
+        assert_eq!(server.closed_associations, vec![first]);
+        take_sent_ngap(&mut server);
+        server
+            .handle_data_received(first, &setup)
+            .await
+            .expect("handled");
+        assert!(
+            take_sent_ngap(&mut server).is_empty(),
+            "nothing answers the replaced association"
+        );
+        let sessions = server.sessions.read().await;
+        assert!(!sessions.contains_key(&first));
+        assert!(sessions.contains_key(&second));
         drop(sessions);
         take_sent_ngap(&mut server);
         for id in [ue_a, ue_b] {
