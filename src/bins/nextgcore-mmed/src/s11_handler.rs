@@ -2740,6 +2740,47 @@ mod tests {
         ctx.mme_ue_remove(mme_ue_id);
     }
 
+    /// #852 review: a Change Notification nobody answers (N3 exhausted) does not
+    /// leave its parked record behind.
+    #[test]
+    fn an_unanswered_change_notification_is_pruned_at_n3() {
+        let _guard = crate::gtp_path::lock_s11();
+        let (mme_ue_id, _, sess_id, bearer_id, _) = seed_global_ue(5);
+        let ctx = crate::context::mme_self();
+        let sgw = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server = crate::gtp_path::GtpcServer::open(
+            "127.0.0.1:0",
+            nextgcore_gtp::v2::xact::Gtp2XactConfig {
+                t3_response: std::time::Duration::from_millis(100),
+                n3_requests: 1,
+                response_hold: std::time::Duration::from_secs(1),
+            },
+            7,
+        )
+        .unwrap();
+        let seq = crate::gtp_path::send_change_notification_on(
+            &server,
+            sgw.local_addr().unwrap(),
+            ctx,
+            mme_ue_id,
+            sess_id,
+        )
+        .expect("sent");
+        assert!(crate::gtp_path::change_notification_pending(seq));
+        for _ in 0..300 {
+            if !crate::gtp_path::change_notification_pending(seq) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !crate::gtp_path::change_notification_pending(seq),
+            "pruned when N3 runs out"
+        );
+        server.close();
+        release_global_ue(mme_ue_id, sess_id, bearer_id);
+    }
+
     /// #593: a Change Notification Request reaches the Serving GW on a real S11
     /// socket, and the Change Notification Response closes it, its Change
     /// Reporting Action replacing the PDN connection's.

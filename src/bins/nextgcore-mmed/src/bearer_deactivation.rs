@@ -300,23 +300,21 @@ fn park_and_page(
     true
 }
 
+/// Take the deactivations of `mme_ue_id` that wait for its paging.
+fn take_parked(mme_ue_id: u64) -> Vec<PendingDeactivation> {
+    let mut list = pending();
+    let (taken, kept): (Vec<_>, Vec<_>) = list
+        .drain(..)
+        .partition(|p| p.mme_ue_id == mme_ue_id && !p.parked.is_empty());
+    *list = kept;
+    taken
+}
+
 /// `mme_ue_id` is ECM-CONNECTED again (the user plane of its SERVICE REQUEST,
 /// or of a TAU answering paging, is up): the deactivations parked for it run
 /// steps 4c-8 now (#862).
 pub fn on_connected(ctx: &MmeContext, mme_ue_id: u64) {
-    let parked: Vec<PendingDeactivation> = {
-        let mut list = pending();
-        let mut taken = Vec::new();
-        let mut i = 0;
-        while i < list.len() {
-            if list[i].mme_ue_id == mme_ue_id && !list[i].parked.is_empty() {
-                taken.push(list.remove(i));
-            } else {
-                i += 1;
-            }
-        }
-        taken
-    };
+    let parked = take_parked(mme_ue_id);
     for p in parked {
         if !start(
             ctx,
@@ -339,19 +337,7 @@ pub fn on_connected(ctx: &MmeContext, mme_ue_id: u64) {
 /// deactivations are completed in the MME and answered (the gateway asked for
 /// the deletion; the UE's bearer state is synchronised when it next connects).
 pub fn on_paging_failed(ctx: &MmeContext, mme_ue_id: u64) {
-    let parked: Vec<PendingDeactivation> = {
-        let mut list = pending();
-        let mut taken = Vec::new();
-        let mut i = 0;
-        while i < list.len() {
-            if list[i].mme_ue_id == mme_ue_id && !list[i].parked.is_empty() {
-                taken.push(list.remove(i));
-            } else {
-                i += 1;
-            }
-        }
-        taken
-    };
+    let parked = take_parked(mme_ue_id);
     for p in parked {
         log::warn!(
             "UE {mme_ue_id}: not reached by paging; EBIs {:?} deactivated locally",

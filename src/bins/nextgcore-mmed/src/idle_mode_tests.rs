@@ -211,6 +211,26 @@ fn ics(pdu: &g::S1AP_PDU) -> Option<(Vec<u8>, Vec<u8>, bool)> {
     Some((erabs, key, nas))
 }
 
+/// The NAS-PDU of the first E-RAB of an INITIAL CONTEXT SETUP REQUEST.
+fn ics_nas_pdu(pdu: &g::S1AP_PDU) -> Option<Vec<u8>> {
+    let g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+        value: g::InitiatingMessageValue::Id_InitialContextSetup(req),
+        ..
+    }) = pdu
+    else {
+        return None;
+    };
+    use g::InitialContextSetupRequestProtocolIEs_EntryValue as V;
+    req.protocol_i_es.0.iter().find_map(|ie| match &ie.value {
+        V::Id_E_RABToBeSetupListCtxtSUReq(l) => l.0.iter().find_map(|e| {
+            let g::E_RABToBeSetupListCtxtSUReq_EntryValue::Id_E_RABToBeSetupItemCtxtSUReq(i) =
+                &e.value;
+            i.nas_pdu.as_ref().map(|n| n.0.clone())
+        }),
+        _ => None,
+    })
+}
+
 /// A SERVICE REQUEST (TS 24.301 §8.2.25) with `seq` and a valid short MAC under
 /// EIA2, for a UE whose uplink COUNT is `count` once `seq` is applied.
 fn service_request(seq: u8, count: u32) -> Vec<u8> {
@@ -644,6 +664,25 @@ fn a_tau_answering_a_data_paging_stops_it_and_restores_the_user_plane() {
     let (sgw, _route) = sgw(Gtp2XactConfig::default());
     let ue = seed(0x0962, &[5]);
     let ctx = mme_self();
+    // A second PDN connection the MME keeps but that was never connected (no
+    // S1-U SGW endpoint): reported in the EPS bearer context status, not set up.
+    let sess7 = ctx.sess_add(ue.mme_ue_id, 11);
+    let b7 = ctx.bearer_add(sess7, ue.mme_ue_id);
+    ctx.bearer_pool.write().unwrap().get_mut(&b7).unwrap().ebi = 7;
+    ctx.sess_pool
+        .write()
+        .unwrap()
+        .get_mut(&sess7)
+        .unwrap()
+        .bearer_list
+        .push(b7);
+    ctx.mme_ue_pool
+        .write()
+        .unwrap()
+        .get_mut(&ue.mme_ue_id)
+        .unwrap()
+        .sess_list
+        .push(sess7);
     crate::s1ap_path::tap_enb_for_test(ue.enb_id);
     let complete = release_to_command(&ue, &sgw);
     crate::s1ap_handler::handle_ue_context_release_complete(ctx, ue.enb_id, &complete);
@@ -665,9 +704,28 @@ fn a_tau_answering_a_data_paging_stops_it_and_restores_the_user_plane() {
             s_tmsi: None,
         },
     );
-    let (erabs, key, nas) = wait_pdu(ue.enb_id, ics);
-    assert_eq!(erabs, vec![5]);
+    let (erabs, key, nas, nas_pdu) = wait_pdu(ue.enb_id, |p| {
+        let (erabs, key, nas) = ics(p)?;
+        Some((erabs, key, nas, ics_nas_pdu(p)?))
+    });
+    assert_eq!(
+        erabs,
+        vec![5],
+        "only the bearer established at the Serving GW"
+    );
     assert!(nas, "the TAU ACCEPT rides in the Initial Context Setup");
+    // EPS bearer context status (IEI 0x57, TS 24.301 §9.9.2.1): every bearer
+    // the MME keeps, 5 and 7, not only the one set up (EEA0, so readable).
+    let at = nas_pdu
+        .windows(2)
+        .position(|w| w == [0x57, 0x02])
+        .expect("an EPS bearer context status");
+    let status = nas_pdu[at + 2];
+    assert_eq!(
+        status & (1 << 5 | 1 << 7),
+        1 << 5 | 1 << 7,
+        "EBIs 5 and 7: {status:#04x}"
+    );
     assert_eq!(
         key,
         nextgcore_crypt::kdf::nextgcore_kdf_kenb(&[0x11; 32], 0).to_vec()
@@ -707,6 +765,65 @@ fn a_tau_answering_a_data_paging_stops_it_and_restores_the_user_plane() {
     }
     assert!(seen.contains(&34), "Modify Bearer Request: {seen:?}");
     assert!(!seen.contains(&70), "no DDN Failure Indication: {seen:?}");
+    ctx.enb_ue_remove(new_enb_ue);
+    release(&ue);
+}
+
+/// #961 review round 3, TS 24.301 §5.6.2.2.1: only an INTEGRITY-PROTECTED,
+/// verified response stops the paging. A plain TAU REQUEST (anyone who heard
+/// the paged S-TMSI could send one) leaves T3413 running and sets up no user
+/// plane on a K_eNB from an unverified COUNT.
+#[test]
+fn an_unprotected_tau_does_not_answer_paging() {
+    let _guard = lock_s11();
+    let (sgw, _route) = sgw(Gtp2XactConfig::default());
+    let ue = seed(0x0965, &[5]);
+    let ctx = mme_self();
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    let complete = release_to_command(&ue, &sgw);
+    crate::s1ap_handler::handle_ue_context_release_complete(ctx, ue.enb_id, &complete);
+    let _ = crate::s11_handler::downlink_data_notification(ctx, ue.local_teid);
+    wait_pdu(ue.enb_id, is_paging);
+    let new_enb_ue = ctx.enb_ue_add(ue.enb_id, 965);
+    ctx.enb_ue_associate_mme_ue(new_enb_ue, ue.mme_ue_id);
+    // The TAU REQUEST in clear (no security header), and one "protected" under
+    // EIA0, which verifies nothing.
+    let plain = &tau_request(0, 0)[6..];
+    crate::nas_dispatch::nas_eps_handle_uplink(
+        ctx,
+        crate::nas_dispatch::UplinkNas {
+            enb_ue_id: new_enb_ue,
+            nas_pdu: plain,
+            s_tmsi: None,
+        },
+    );
+    ctx.mme_ue_pool
+        .write()
+        .unwrap()
+        .get_mut(&ue.mme_ue_id)
+        .unwrap()
+        .selected_int_algorithm = 0;
+    let mut eia0 = vec![0x17u8, 0, 0, 0, 0, 1];
+    eia0.extend_from_slice(plain);
+    crate::nas_dispatch::nas_eps_handle_uplink(
+        ctx,
+        crate::nas_dispatch::UplinkNas {
+            enb_ue_id: new_enb_ue,
+            nas_pdu: &eia0,
+            s_tmsi: None,
+        },
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        crate::s1ap_path::take_tapped_for_test(ue.enb_id)
+            .iter()
+            .filter_map(|p| nextgcore_s1ap_gen::decode(p).ok())
+            .all(|p| ics(&p).is_none()),
+        "no Initial Context Setup"
+    );
+    let u = ctx.mme_ue_find_by_id(ue.mme_ue_id).unwrap();
+    assert!(u.t3413.is_running(), "paging continues");
+    assert!(!u.service_request_ics_pending);
     ctx.enb_ue_remove(new_enb_ue);
     release(&ue);
 }
@@ -946,6 +1063,70 @@ fn a_reactivation_deactivation_for_an_idle_ue_pages_then_signals() {
     assert_eq!(delete_bearer_response(&sgw), (16, 0x862));
     assert!(ctx.bearer_find_by_ebi(ue.mme_ue_id, 6).is_none());
     assert!(ctx.bearer_find_by_ebi(ue.mme_ue_id, 5).is_some());
+    ctx.enb_ue_remove(new_enb_ue);
+    release(&ue);
+}
+
+/// #984 review: a UE that answers the DeleteBearer paging with an
+/// integrity-protected TAU (TS 24.301 §5.6.2.2.1) gets its user plane with the
+/// TAU ACCEPT, and the parked deactivation runs on the ICS response.
+#[test]
+fn a_tau_answering_a_deactivation_paging_runs_the_deactivation() {
+    let _guard = lock_s11();
+    crate::bearer_deactivation::clear_for_test();
+    let (sgw, _route) = sgw(Gtp2XactConfig::default());
+    let ue = seed(0x0984, &[5]);
+    let _sess6 = add_pdn(&ue, 6);
+    let ctx = mme_self();
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    let complete = release_to_command(&ue, &sgw);
+    crate::s1ap_handler::handle_ue_context_release_complete(ctx, ue.enb_id, &complete);
+    let peer = sgw.local_addr().unwrap();
+    crate::s11_handler::dispatch_initial(
+        &dbr_reactivation(ue.local_teid, 6, 0x984),
+        99,
+        0x984,
+        peer,
+    );
+    wait_pdu(ue.enb_id, is_paging);
+
+    let new_enb_ue = ctx.enb_ue_add(ue.enb_id, 9840);
+    ctx.enb_ue_associate_mme_ue(new_enb_ue, ue.mme_ue_id);
+    if let Some(e) = ctx.enb_ue_pool.write().unwrap().get_mut(&new_enb_ue) {
+        e.saved.tai = ue.tai.clone();
+    }
+    crate::nas_dispatch::nas_eps_handle_uplink(
+        ctx,
+        crate::nas_dispatch::UplinkNas {
+            enb_ue_id: new_enb_ue,
+            nas_pdu: &tau_request(0, 0),
+            s_tmsi: None,
+        },
+    );
+    let (erabs, _, nas) = wait_pdu(ue.enb_id, ics);
+    assert!(nas, "the TAU ACCEPT in an Initial Context Setup");
+    assert_eq!(erabs, vec![5, 6]);
+    let new = ctx.enb_ue_find_by_id(new_enb_ue).unwrap();
+    crate::s1ap_handler::handle_initial_context_setup_response(
+        ctx,
+        ue.enb_id,
+        &nextgcore_s1ap::InitialContextSetupResponse {
+            mme_ue_s1ap_id: new.mme_ue_s1ap_id,
+            enb_ue_s1ap_id: new.enb_ue_s1ap_id,
+            erab_setup_list: [5u8, 6]
+                .iter()
+                .map(|e| nextgcore_s1ap::ErabSetupItem {
+                    erab_id: *e,
+                    transport_layer_address: vec![10, 0, 0, 9],
+                    gtp_teid: 0x9900 + u32::from(*e),
+                })
+                .collect(),
+            erab_failed_list: vec![],
+        },
+    );
+    wait_pdu(ue.enb_id, is_erab_release_command);
+    assert!(crate::bearer_deactivation::on_accept(ctx, ue.mme_ue_id, 6));
+    assert_eq!(delete_bearer_response(&sgw), (16, 0x984));
     ctx.enb_ue_remove(new_enb_ue);
     release(&ue);
 }

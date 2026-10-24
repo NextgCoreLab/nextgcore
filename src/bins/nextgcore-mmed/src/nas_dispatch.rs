@@ -279,7 +279,7 @@ fn dispatch_emm(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, pdu: &[u8]) {
         return;
     }
 
-    let plain = if security_header_type == 0 {
+    let (plain, integrity_verified) = if security_header_type == 0 {
         // TS 24.301 §4.4.4.2: outside an enumerated allowlist, an EMM message
         // that is not integrity protected must not be processed, nor forwarded
         // to the ESM entity.
@@ -292,10 +292,10 @@ fn dispatch_emm(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, pdu: &[u8]) {
             );
             return;
         }
-        pdu.to_vec()
+        (pdu.to_vec(), false)
     } else {
         match decode_protected(ctx, mme_ue_id, security_header_type, pdu) {
-            Some(plain) => plain,
+            Some(decoded) => decoded,
             None => return,
         }
     };
@@ -374,7 +374,9 @@ fn dispatch_emm(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, pdu: &[u8]) {
         // because the AMF integrity-checks those exact octets (TS 29.274 Table 7.3.5-1,
         // `29274-j60.txt:19759`). Re-encoding the body from the parsed fields would fail
         // that check and the UE would be refused (#347).
-        emm_type::TAU_REQUEST => emm_tau_request(ctx, enb_ue, mme_ue_id, body, &plain),
+        emm_type::TAU_REQUEST => {
+            emm_tau_request(ctx, enb_ue, mme_ue_id, body, &plain, integrity_verified)
+        }
         emm_type::EXTENDED_SERVICE_REQUEST => {
             emm_extended_service_request(ctx, enb_ue, mme_ue_id, body);
         }
@@ -473,12 +475,15 @@ fn dispatch_emm(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, pdu: &[u8]) {
 /// Verify and decrypt a security-protected EMM message.
 ///
 /// Returns the plain NAS message, or `None` when the message must be discarded.
+/// The plain message of a security-protected PDU, and whether its integrity was
+/// verified against the UE's NAS security context (#961 review: the TS 24.301
+/// §4.4.4.3 messages processed without a verified MAC report `false`).
 fn decode_protected(
     ctx: &MmeContext,
     mme_ue_id: u64,
     security_header_type: u8,
     pdu: &[u8],
-) -> Option<Vec<u8>> {
+) -> Option<(Vec<u8>, bool)> {
     let flags = SecurityHeaderTypeFlags::from_header_type(security_header_type);
     let mut message = pdu.to_vec();
 
@@ -506,7 +511,7 @@ fn decode_protected(
                 mme_ue.imsi_bcd,
                 plain[1]
             );
-            return Some(plain);
+            return Some((plain, false));
         }
         if matches!(security_header_type, 2 | 4) {
             // TS 24.301 §4.4.5: a UE ciphers only once the secure exchange is
@@ -550,7 +555,7 @@ fn decode_protected(
                  subscriber will be re-authenticated (TS 24.301 4.4.4.3)",
                 mme_ue.imsi_bcd
             );
-            return Some(plain);
+            return Some((plain, false));
         }
     }
     if let Err(e) = decoded {
@@ -561,7 +566,9 @@ fn decode_protected(
         return None;
     }
 
-    Some(message)
+    // EIA0 "verifies" every message: it is no integrity protection.
+    let verified = !mac_failed && mme_ue.selected_int_algorithm != 0;
+    Some((message, verified))
 }
 
 // ============================================================================
@@ -1014,6 +1021,7 @@ fn emm_tau_request(
     mme_ue_id: u64,
     body: &[u8],
     whole_pdu: &[u8],
+    integrity_verified: bool,
 ) {
     let mut pool = ctx.mme_ue_pool.write().unwrap();
     let Some(mme_ue) = pool.get_mut(&mme_ue_id) else {
@@ -1166,14 +1174,24 @@ fn emm_tau_request(
     // downlink data, the user plane is brought up with the TAU ACCEPT as with
     // the active flag (TS 23.401 §5.3.3.1 step 20, §5.3.4.3), so the buffered
     // downlink reaches the UE instead of a DDN Failure Indication discarding it.
-    let verified = !mme_ue.mac_failed;
+    // The integrity result the dispatcher established for THIS message (#961
+    // review): a plain TAU REQUEST, or one processed without a verifiable MAC,
+    // answers nothing, so T3413 keeps running and no user plane is set up on a
+    // K_eNB from an unverified COUNT.
+    let verified = integrity_verified;
     let paged_for_data = if verified
         && (mme_ue.t3413.is_running() || mme_ue.paging.type_ != crate::context::PagingType::None)
     {
         let was = mme_ue.paging.type_;
         mme_ue.t3413.stop();
         mme_ue.paging.type_ = crate::context::PagingType::None;
-        was == crate::context::PagingType::DownlinkDataNotification
+        // #984 review: a paging for a deactivation parked behind it (#862)
+        // needs the user plane too: its steps 4c-8 run on the ICS response.
+        matches!(
+            was,
+            crate::context::PagingType::DownlinkDataNotification
+                | crate::context::PagingType::DeleteBearer
+        )
     } else {
         false
     };
@@ -1203,23 +1221,20 @@ fn emm_tau_request(
     // §7.2.6.2, A.3). The response then sends the Modify Bearer Request
     // (`service_request_ics_pending`), as for a SERVICE REQUEST.
     let restore = restore_user_plane && bearers.iter().any(|b| b.sgw_s1u_teid != 0);
-    let tau_bearers: Vec<crate::context::MmeBearer> = if restore {
+    if restore {
         mme_ue.kenb = nextgcore_crypt::kdf::nextgcore_kdf_kenb(&mme_ue.kasme, mme_ue.ul_count);
         mme_ue.nhcc = 0;
         mme_ue.nh = [0; 32];
-        bearers
-            .iter()
-            .filter(|b| b.sgw_s1u_teid != 0)
-            .cloned()
-            .collect()
-    } else {
-        bearers
-    };
+    }
+    // Every bearer the MME keeps goes in the EPS bearer context status, so the
+    // UE does not delete one the MME still holds (#961 review); the Initial
+    // Context Setup carries only those established at the Serving GW
+    // (`nas_eps_send_tau_accept`).
     match nas_path::nas_eps_send_tau_accept(
         mme_ue,
         enb_ue,
         restore,
-        &tau_bearers,
+        &bearers,
         s1ap_build::ue_ambr_of(ctx, mme_ue),
     ) {
         Ok(()) if restore => {
@@ -1440,8 +1455,9 @@ fn emm_service_request(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, pdu: &[
 /// REQUEST (TS 33.401 §7.2.8.1, Annex A.3), and the NH chain restarts from it.
 /// A paging the UE answered stops (TS 24.301 §5.6.2.2.1).
 fn service_request_initial_context_setup(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64) {
-    let was_paged = crate::paging::answered(ctx, mme_ue_id) != crate::context::PagingType::None; // The bearers established at the Serving GW (an S1-U SGW TEID): the ones a
-                                                                                                 // never-connected subscription session lacks.
+    let was_paged = crate::paging::answered(ctx, mme_ue_id) != crate::context::PagingType::None;
+    // The bearers established at the Serving GW (an S1-U SGW TEID): the ones a
+    // never-connected subscription session lacks.
     let bearers: Vec<crate::context::MmeBearer> = crate::gtp_path::bearers_of_ue(ctx, mme_ue_id)
         .into_iter()
         .filter(|b| b.sgw_s1u_teid != 0)

@@ -331,11 +331,7 @@ fn api_root() -> &'static str {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or(args.log_level.as_str()),
-    )
-    .format_timestamp_millis()
-    .init();
+    nextgcore_core::log::nf_log_builder(&args.log_level).init();
     let _otel = nextgcore_metrics::otel::init_otel(
         nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
             std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
