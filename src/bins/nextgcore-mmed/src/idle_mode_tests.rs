@@ -1666,3 +1666,58 @@ fn a_ue_going_idle_during_a_reactivation_deactivation_is_paged_again() {
     crate::bearer_deactivation::clear_for_test();
     release(&ue);
 }
+
+/// #984 review follow-up: an UNPROTECTED TAU does not answer a DeleteBearer
+/// paging either (TS 24.301 §5.6.2.2.1): the paging continues, nothing is set
+/// up, and the deactivation stays parked.
+#[test]
+fn an_unprotected_tau_does_not_answer_a_deactivation_paging() {
+    let _guard = lock_s11();
+    crate::bearer_deactivation::clear_for_test();
+    let (sgw, _route) = sgw(Gtp2XactConfig::default());
+    let ue = seed(0x0991, &[5]);
+    let _sess6 = add_pdn(&ue, 6);
+    let ctx = mme_self();
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    let complete = release_to_command(&ue, &sgw);
+    crate::s1ap_handler::handle_ue_context_release_complete(ctx, ue.enb_id, &complete);
+    let peer = sgw.local_addr().unwrap();
+    crate::s11_handler::dispatch_initial(
+        &dbr_reactivation(ue.local_teid, 6, 0x991),
+        99,
+        0x991,
+        peer,
+    );
+    wait_pdu(ue.enb_id, is_paging);
+    let new_enb_ue = ctx.enb_ue_add(ue.enb_id, 9910);
+    ctx.enb_ue_associate_mme_ue(new_enb_ue, ue.mme_ue_id);
+    crate::nas_dispatch::nas_eps_handle_uplink(
+        ctx,
+        crate::nas_dispatch::UplinkNas {
+            enb_ue_id: new_enb_ue,
+            nas_pdu: &tau_request(0, 0)[6..],
+            s_tmsi: None,
+        },
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        crate::s1ap_path::take_tapped_for_test(ue.enb_id)
+            .iter()
+            .filter_map(|p| nextgcore_s1ap_gen::decode(p).ok())
+            .all(|p| ics(&p).is_none()),
+        "no Initial Context Setup"
+    );
+    assert!(ctx
+        .mme_ue_find_by_id(ue.mme_ue_id)
+        .unwrap()
+        .t3413
+        .is_running());
+    assert_eq!(
+        crate::bearer_deactivation::pending_count(),
+        1,
+        "still parked"
+    );
+    crate::bearer_deactivation::clear_for_test();
+    ctx.enb_ue_remove(new_enb_ue);
+    release(&ue);
+}

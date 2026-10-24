@@ -1812,6 +1812,10 @@ fn dispatch_modify_bearer_request(server: &GtpcServer, msg: &Gtp2Message, peer: 
         };
         if let Some(mut dl_tunnel) = ctx.dl_tunnel_in_bearer(bearer.id) {
             dl_tunnel.remote_ip.ipv4 = enb_fteid.ipv4_addr.map(Ipv4Addr::from);
+            // Every Modify Bearer write is a new generation, even one that
+            // writes the endpoint the tunnel already holds (#991 review): its
+            // refusal must not undo a later writer that wrote the same value.
+            dl_tunnel.generation = dl_tunnel.generation.wrapping_add(1);
             ctx.tunnel_update(&dl_tunnel);
         }
         // The generation this request's writes left (TEID by the handler, IP
@@ -2999,9 +3003,22 @@ mod tests {
     }
 
     async fn stand_in_sgwu(
+        ambient: &crate::pfcp_path::ProcessStateGuard,
+        cause: u8,
+        delay: Duration,
+    ) -> StandInSgwu {
+        stand_in_sgwu_scripted(ambient, cause, delay, Vec::new()).await
+    }
+
+    /// [`stand_in_sgwu`] whose Session Modification Responses follow `script`
+    /// in order, one (cause, delay) each, then fall back to `cause` and `delay`.
+    /// The stand-in answers one request at a time, so a request arriving while
+    /// a delayed one is pending is answered after it.
+    async fn stand_in_sgwu_scripted(
         _ambient: &crate::pfcp_path::ProcessStateGuard,
         cause: u8,
         delay: Duration,
+        script: Vec<(u8, Duration)>,
     ) -> StandInSgwu {
         use nextgcore_pfcp::header::PfcpHeader as PHeader;
         use nextgcore_pfcp::message::{
@@ -3026,6 +3043,7 @@ mod tests {
         let up = up.clone();
         tokio::spawn(async move {
             let up = handle;
+            let mut script = std::collections::VecDeque::from(script);
             let mut buf = vec![0u8; 8192];
             loop {
                 let Ok((len, from)) = up.recv_from(&mut buf).await else {
@@ -3063,6 +3081,10 @@ mod tests {
                     let _ = up.send_to(&out, from).await;
                     continue;
                 }
+                let (cause, delay) = match msg_type {
+                    52 => script.pop_front().unwrap_or((cause, delay)),
+                    _ => (cause, delay),
+                };
                 let pfcp_cause = PfcpCause::from_wire(cause);
                 let mut body = bytes::BytesMut::new();
                 let resp_type = match msg_type {
@@ -5019,6 +5041,83 @@ mod tests {
         let dl = ctx.dl_tunnel_in_bearer(bearer.id).unwrap();
         assert_eq!(dl.remote_teid, 0x1111, "the old eNB TEID is restored");
         assert_eq!(dl.remote_ip.ipv4, Some(Ipv4Addr::new(10, 0, 0, 1)));
+        ctx.ue_remove(ue_id);
+        server.close();
+    }
+
+    /// #991/#1000 review: every Modify Bearer write is a new generation, even one
+    /// writing the endpoint the tunnel already holds. MBR1 points the bearer at
+    /// eNB F-TEID B and the SGW-U refuses it slowly; meanwhile MBR2 writes the
+    /// same B and is accepted. MBR1's refusal must not roll the tunnel back to
+    /// the source endpoint A under MBR2: with an unchanged generation it would.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_refusal_does_not_undo_a_later_write_of_the_same_endpoint() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let _sgwu = stand_in_sgwu_scripted(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+            vec![(
+                crate::sxa_handler::pfcp_cause::REQUEST_REJECTED,
+                Duration::from_millis(300),
+            )],
+        )
+        .await;
+        let server = test_server(&ambient, 1000, 1);
+        set_s11_server(server.clone());
+        let mme = client();
+        let (ue_id, s11_teid, _) =
+            ue_with_pgw_session(mme.local_addr().unwrap(), b"001010991000001");
+        let ctx = sgwc_self();
+        let bearer = ctx.bearer_find_by_ue_ebi(ue_id, 5).unwrap();
+        let mut dl = ctx.dl_tunnel_in_bearer(bearer.id).unwrap();
+        dl.far_id = Some(0x0991);
+        // A: the source eNB's endpoint.
+        dl.remote_teid = 0x1111;
+        dl.remote_ip.ipv4 = Some(Ipv4Addr::new(10, 0, 0, 1));
+        ctx.tunnel_update(&dl);
+
+        let mbr = |seq: u32| {
+            let mut m = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+                Gtp2MessageType::ModifyBearerRequest as u8,
+                s11_teid,
+                seq,
+            ));
+            let mut bc = Gtp2BearerContextIe::new();
+            bc.set_ebi(5);
+            // B: the target eNB's endpoint, in both requests.
+            bc.set_fteid(
+                0,
+                &nextgcore_gtp::v2::Gtp2FTeidIe::new_ipv4(0, 0x2222, [10, 0, 0, 2]),
+            );
+            m.add_bearer_context(0, &bc);
+            m.encode()
+        };
+        mme.send_to(&mbr(0x0991), server.local_addr()).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        mme.send_to(&mbr(0x0992), server.local_addr()).unwrap();
+
+        let cause_of = |rsp: &Gtp2Message| {
+            Gtp2CauseIe::decode(&rsp.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value)
+                .unwrap()
+                .cause
+        };
+        let first = recv_s11(&mme).await.expect("MBR1's response");
+        assert_eq!(first.header.sequence_number, 0x0991);
+        assert_eq!(cause_of(&first), gtp_cause::SYSTEM_FAILURE, "MBR1 refused");
+        let second = recv_s11(&mme).await.expect("MBR2's response");
+        assert_eq!(second.header.sequence_number, 0x0992);
+        assert_eq!(
+            cause_of(&second),
+            gtp_cause::REQUEST_ACCEPTED,
+            "MBR2 accepted"
+        );
+        let dl = ctx.dl_tunnel_in_bearer(bearer.id).unwrap();
+        assert_eq!(
+            (dl.remote_teid, dl.remote_ip.ipv4),
+            (0x2222, Some(Ipv4Addr::new(10, 0, 0, 2))),
+            "the tunnel holds B, which the SGW-U accepted"
+        );
         ctx.ue_remove(ue_id);
         server.close();
     }
