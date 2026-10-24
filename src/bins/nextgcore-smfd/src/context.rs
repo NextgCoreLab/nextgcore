@@ -1826,6 +1826,14 @@ pub struct SmfContext {
     /// released. Persisted; the boot re-arms each hold for what is left of it.
     pub failed_up_paths: RwLock<HashMap<String, u64>>,
 
+    /// The UPF each PFCP session was established on, by SMF-side N4 SEID: the pool
+    /// member's `recovery_time_stamp_key` (#1031). The in-memory endpoint binding
+    /// (`pfcp_path::SESSION_PEERS`) does not survive a restart; without this every
+    /// restored session routed to the default UPF, so in a pool the UPF actually
+    /// holding it got its modifications nowhere and its Session Reports refused.
+    /// Persisted per SM context with the session map.
+    pub session_upfs: RwLock<HashMap<u64, String>>,
+
     /// SM policy bindings: sm_context_ref -> PCF policy association + GSM FSM
     pub policy_bindings: RwLock<HashMap<String, PolicyBinding>>,
 
@@ -1956,6 +1964,7 @@ impl SmfContext {
             cp_n4_seids: RwLock::new(HashMap::new()),
             far_peers: RwLock::new(HashMap::new()),
             failed_up_paths: RwLock::new(HashMap::new()),
+            session_upfs: RwLock::new(HashMap::new()),
             unrestorable_sessions: RwLock::new(Vec::new()),
             policy_bindings: RwLock::new(HashMap::new()),
             upf_recovery_time_stamps: RwLock::new(HashMap::new()),
@@ -2136,6 +2145,30 @@ impl SmfContext {
                 })
                 .unwrap_or_default()
         };
+        // #1031: per SM context, keyed by the reference like `cpN4Seids`.
+        let session_upfs: std::collections::BTreeMap<String, String> = {
+            let seids: Vec<(String, u64)> = pfcp_sessions
+                .keys()
+                .map(|r| {
+                    (
+                        r.clone(),
+                        cp_n4_seids
+                            .get(r)
+                            .copied()
+                            .unwrap_or_else(|| derive_cp_n4_seid(r)),
+                    )
+                })
+                .collect();
+            self.session_upfs
+                .read()
+                .map(|m| {
+                    seids
+                        .into_iter()
+                        .filter_map(|(r, seid)| m.get(&seid).map(|k| (r, k.clone())))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
         // Ascending already (see `Ipv4Pool::allocated_addrs`), and as strings so
         // the file is readable by an operator diagnosing a double assignment.
         let ipv4_allocations: Vec<String> = self
@@ -2156,6 +2189,7 @@ impl SmfContext {
             "upfRecoveryTimeStamps": upf_rts,
             "cpN4Seids": cp_n4_seids,
             "farPeers": far_peers,
+            "sessionUpfs": session_upfs,
             "failedUpPaths": self
                 .failed_up_paths
                 .read()
@@ -2343,6 +2377,23 @@ impl SmfContext {
                 (seid, f)
             })
             .collect();
+        // #1031: absent before it existed; then every restored session routes to
+        // the default UPF, as before.
+        let session_upfs: HashMap<String, String> = doc
+            .get("sessionUpfs")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        let session_upfs: Vec<(u64, String)> = session_upfs
+            .into_iter()
+            .filter(|(r, _)| pfcp_sessions.contains_key(r))
+            .map(|(r, key)| {
+                let seid = cp_n4_seids
+                    .get(&r)
+                    .copied()
+                    .unwrap_or_else(|| derive_cp_n4_seid(&r));
+                (seid, key)
+            })
+            .collect();
         // One lock at a time, as in `snapshot`.
         if let Ok(mut map) = self.pfcp_sessions.write() {
             map.extend(pfcp_sessions);
@@ -2373,6 +2424,9 @@ impl SmfContext {
             .unwrap_or_default();
         if let Ok(mut map) = self.failed_up_paths.write() {
             map.extend(failed_up_paths);
+        }
+        if let Ok(mut map) = self.session_upfs.write() {
+            map.extend(session_upfs);
         }
         let mut n_addrs = 0usize;
         for addr in &ipv4_allocations {
@@ -3574,6 +3628,14 @@ pub fn smf_context_init(max_ue: usize, max_sess: usize, max_bearer: usize) {
         "PROCESS_STATE_TEST_LOCK",
         "smf_context_init (a test that then uses the process-wide SMF context)",
     );
+    // In a test binary the context is one per process and `init` takes the first
+    // caller's limits, while every test adds its own UEs and sessions to it. With
+    // 64 UEs, the tests of #928, #941 and #912 together ran out, and whichever test
+    // came late failed to register a UE. A test's limits say nothing about the
+    // process's, so a test binary gets room for all of them.
+    #[cfg(test)]
+    let (max_ue, max_sess, max_bearer) =
+        (max_ue.max(4096), max_sess.max(8192), max_bearer.max(16384));
     let ctx = smf_self();
     if let Ok(mut context) = ctx.write() {
         context.init(max_ue, max_sess, max_bearer);
@@ -4300,6 +4362,37 @@ mod tests {
                 .copied(),
             Some(1_700_000_000)
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #1031: the UPF each restored session was established on comes back with it,
+    /// under its SMF-side SEID; a session the snapshot does not restore leaves none.
+    #[test]
+    fn session_upfs_survive_a_restore() {
+        let path = temp_state_path("session-upfs");
+        let derived = {
+            let ctx = ctx_with_state(&path);
+            ctx.pfcp_sessions
+                .write()
+                .unwrap()
+                .insert("10311".to_string(), 0x1031);
+            let derived = derive_cp_n4_seid("10311");
+            {
+                let mut m = ctx.session_upfs.write().unwrap();
+                m.insert(derived, "upf-b.example:8805".to_string());
+                m.insert(0x0777, "upf-a.example:8805".to_string());
+            }
+            ctx.persist();
+            derived
+        };
+        let restored = ctx_with_state(&path);
+        let m = restored.session_upfs.read().unwrap();
+        assert_eq!(
+            m.get(&derived).map(String::as_str),
+            Some("upf-b.example:8805")
+        );
+        assert!(!m.contains_key(&0x0777));
+        drop(m);
         let _ = std::fs::remove_file(&path);
     }
 

@@ -98,7 +98,16 @@ fn bits_to_u32(bits: &BitVec<u8, Msb0>) -> u32 {
 }
 
 /// The low `width` bits of `value`, most significant first.
+/// `value` as a `width`-bit BIT STRING, most significant bit first. `value` must fit
+/// (#858 review, MINOR C): the bits above `width` are not encoded, so a wider value
+/// would name a different identity on the wire. Every caller builds the S1AP the MME
+/// sends from identities it already validated, so this is an invariant, checked in
+/// debug builds and tests.
 fn u32_to_bits(value: u32, width: usize) -> BitVec<u8, Msb0> {
+    debug_assert!(
+        width >= 32 || value >> width == 0,
+        "{value:#x} does not fit in {width} bits"
+    );
     (0..width).rev().map(|i| (value >> i) & 1 == 1).collect()
 }
 
