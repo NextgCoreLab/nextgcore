@@ -34,9 +34,9 @@ spec:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
     spec:
       # #718: a graceful SMF shutdown releases each UPF association (up to
-      # T1 x N1 = 9 s when a UPF is gone), sends every UE #39 and keeps
+      # T1 x (N1+1) = 12 s when a UPF is gone), sends every UE #39 and keeps
       # retransmitting its S5/S8 Delete Bearer Requests for up to 12 s.
-      terminationGracePeriodSeconds: 45
+      terminationGracePeriodSeconds: {{ .Values.smf.terminationGracePeriodSeconds }}
       initContainers:
         {{- include "nextgcore.advertiseInit" (dict "nf" "smf") | nindent 8 }}
         {{- include "nextgcore.waitForNrf" . | nindent 8 }}
@@ -72,6 +72,9 @@ spec:
               value: {{ .Values.global.logLevel }}
             - name: RUST_BACKTRACE
               value: "1"
+            # The shutdown's own deadline, derived from the grace period (#941).
+            - name: SMF_SHUTDOWN_BUDGET_SECS
+              value: "{{ sub (int .Values.smf.terminationGracePeriodSeconds) 2 }}"
             # /metrics defaults to 127.0.0.1 (#837); in the pod it must accept the
             # pod IP for Prometheus and the kubelet. Not exposed beyond the cluster.
             - name: NEXTGCORE_METRICS_BIND

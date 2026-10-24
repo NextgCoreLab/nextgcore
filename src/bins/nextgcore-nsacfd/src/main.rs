@@ -2165,7 +2165,10 @@ fn split_uri(uri: &str) -> Option<(String, u16, String)> {
 /// POST one notification body to a subscriber with bounded timeouts.
 async fn deliver_notification(notification_uri: String, body: serde_json::Value) {
     let Some((host, port, path)) = split_uri(&notification_uri) else {
-        log::warn!("Invalid notificationUri '{notification_uri}'");
+        log::warn!(
+            "Invalid notificationUri '{notification_uri}'",
+            notification_uri = nextgcore_sbi::log_redact::redact_last_segment(&notification_uri)
+        );
         return;
     };
     let client = SbiClient::new(
@@ -2178,16 +2181,26 @@ async fn deliver_notification(notification_uri: String, body: serde_json::Value)
     let client = attach_oauth2(client, NfType::Amf);
     match client.post_json(&path, &body).await {
         Ok(resp) if resp.status == 204 || resp.is_success() => {
-            log::debug!("Notification delivered to {notification_uri}");
+            log::debug!(
+                "Notification delivered to {notification_uri}",
+                notification_uri =
+                    nextgcore_sbi::log_redact::redact_last_segment(&notification_uri)
+            );
         }
         Ok(resp) => {
             log::warn!(
                 "Notification to {notification_uri} returned {}",
-                resp.status
+                resp.status,
+                notification_uri =
+                    nextgcore_sbi::log_redact::redact_last_segment(&notification_uri)
             );
         }
         Err(e) => {
-            log::warn!("Notification to {notification_uri} failed: {e}");
+            log::warn!(
+                "Notification to {notification_uri} failed: {e}",
+                notification_uri =
+                    nextgcore_sbi::log_redact::redact_last_segment(&notification_uri)
+            );
         }
     }
     client.close().await;

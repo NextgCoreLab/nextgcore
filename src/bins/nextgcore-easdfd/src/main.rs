@@ -739,16 +739,23 @@ async fn send_dns_message_report(
     });
 
     let Some((host, port, path)) = split_uri(notify_uri) else {
-        log::warn!("DNS context {ctx_id}: unparseable notification URI {notify_uri}");
+        log::warn!(
+            "DNS context {ctx_id}: unparseable notification URI {notify_uri}",
+            notify_uri = nextgcore_sbi::log_redact::redact_last_segment(notify_uri)
+        );
         return;
     };
     let client = SbiClient::with_host_port(&host, port);
     match client.post_json(&path, &body).await {
         Ok(resp) => log::info!(
             "DNS message report for {fqdn} (context {ctx_id}) -> {notify_uri} status={}",
-            resp.status
+            resp.status,
+            notify_uri = nextgcore_sbi::log_redact::redact_last_segment(notify_uri)
         ),
-        Err(e) => log::warn!("DNS message report to {notify_uri} failed: {e}"),
+        Err(e) => log::warn!(
+            "DNS message report to {notify_uri} failed: {e}",
+            notify_uri = nextgcore_sbi::log_redact::redact_last_segment(notify_uri)
+        ),
     }
 }
 
