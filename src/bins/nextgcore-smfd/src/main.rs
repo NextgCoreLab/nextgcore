@@ -449,7 +449,8 @@ fn epco_config() -> (&'static [std::net::Ipv4Addr], Option<u16>) {
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // RUST_LOG if set, else info (smfd has no --log-level): #691.
+    nextgcore_core::log::nf_log_builder("info").init();
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = nextgcore_metrics::otel::init_otel(
         nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
@@ -613,20 +614,24 @@ async fn main() -> Result<()> {
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty());
     if let Some(path) = state_file {
-        let ctx = smf_self();
-        let mut guard = ctx
-            .write()
-            .map_err(|_| anyhow::anyhow!("SMF context lock poisoned"))?;
         // Fail STARTUP on a snapshot that cannot be read or is from a newer build.
         // Coming up with an empty IPv4 pool is the one failure mode here that is
         // worse than not starting: it re-issues addresses live UEs still hold, and
         // nothing logs the collision. The store would then also refuse every later
         // write to protect the file, so the run would be silently non-durable too.
-        let restored = guard.set_state_file(std::path::PathBuf::from(&path))?;
+        //
+        // #884: the write guard lives in this block only. It must be gone before the
+        // notifier below is awaited: the notifier takes its own read guard, and
+        // `std::sync::RwLock` is not reentrant. A guard held across an `.await` also
+        // blocks the executor thread for whatever that await does.
+        let restored = {
+            let ctx = smf_self();
+            let mut guard = ctx
+                .write()
+                .map_err(|_| anyhow::anyhow!("SMF context lock poisoned"))?;
+            guard.set_state_file(std::path::PathBuf::from(&path))?
+        };
         log::info!("SMF durable state: {path} ({restored} record(s) restored)");
-        // The context lock must be released before the notifier runs: it takes its
-        // own read guard, and `std::sync::RwLock` is not reentrant.
-        drop(guard);
         // #193: a restored session whose policy binding did not survive is unusable
         // and its consumer still believes in it. This is the ONE restoration signal
         // that belongs at boot -- it needs no evidence from the UPF -- and it runs
@@ -13523,26 +13528,26 @@ mod tests {
         );
     }
 
-    /// A HANDOVER_COMPLETE with no decodable target endpoint still completes, and
-    /// says so. Asserted because the alternative — a bare 200 — would leave an
-    /// operator unable to tell a switched tunnel from an unswitched one.
+    /// A COMPLETED the SMF cannot carry out -- no target endpoint was learned at
+    /// PREPARED, and no N4 session -- is an error, not `200 COMPLETED` (#964 review): the
+    /// downlink was not switched, and a success would hide that from the AMF, which
+    /// retries once and logs.
     #[tokio::test]
-    async fn handover_complete_without_a_target_endpoint_still_completes() {
+    async fn a_handover_completed_without_a_target_endpoint_is_an_error() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let reference = seed_registered_session("imsi-001010000000082", 6, "internet");
-        let req = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts/x/modify").with_body(
-            serde_json::json!({
-                "n2SmInfoType": "HANDOVER_COMPLETE",
-                "hoState": "COMPLETED",
-            })
-            .to_string(),
-            "application/json",
-        );
-        let resp = handle_sm_context_update(&reference, &req).await;
-        assert_eq!(resp.status, 200);
-        let body: serde_json::Value =
-            serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("json");
-        assert_eq!(body["hoState"], serde_json::json!("COMPLETED"));
+        for body in [
+            serde_json::json!({ "n2SmInfoType": "HANDOVER_COMPLETE", "hoState": "COMPLETED" }),
+            serde_json::json!({ "hoState": "COMPLETED" }),
+        ] {
+            let req = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts/x/modify")
+                .with_body(body.to_string(), "application/json");
+            let resp = handle_sm_context_update(&reference, &req).await;
+            assert_eq!(resp.status, 500, "{body}");
+            let problem: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("json");
+            assert_eq!(problem["cause"], "SYSTEM_FAILURE", "{body}");
+        }
     }
 
     /// #78 criterion 7: create → retrieve → update → release, asserting each status

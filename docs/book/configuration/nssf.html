@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-c2411517.js";
+            window.path_to_searchindex_js = "../searchindex-df495bb2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -249,7 +249,7 @@ nssf:
 <h3 id="parsed-but-inert--decorative-yaml-fields"><a class="header" href="#parsed-but-inert--decorative-yaml-fields">Parsed-but-inert / decorative YAML fields</a></h3>
 <p>Unknown YAML keys are silently ignored by serde. In the shipped example file:</p>
 <ul>
-<li><strong><code>logger.file.path</code> and <code>logger.level</code> are inert.</strong> The log level comes solely from the CLI flag <code>-e/--log-level</code>; <code>init_logging</code> builds <code>env_logger::Builder::new()</code> with an explicit filter, so even <code>RUST_LOG</code> is not consulted, and no file logging is wired (see <code>--log-file</code> below).</li>
+<li><strong><code>logger.file.path</code> and <code>logger.level</code> are inert.</strong> The log level comes from <code>RUST_LOG</code> when set, else the CLI flag <code>-e/--log-level</code>; no file logging is wired (see <code>--log-file</code> below).</li>
 <li><strong><code>global.max.ue</code> / <code>global.max.peer</code> are inert</strong> — no <code>global</code> section exists in the deserialize structs; the only pool cap is CLI <code>--max-nf</code>.</li>
 <li><strong><code>nssf.sbi.client.nsi[]</code> (uri, s_nssai, optional nsi_id) is LOADED</strong> (#93). Each entry installs one Network Slice Instance into the context, which is what <code>slice-info-request-for-pdu-session</code> and <code>slice-info-request-for-other-purpose</code> resolve against. Until #93 <code>SbiClientYaml</code> declared only <code>nrf</code>, so this block — present in every shipped config — deserialised into nothing, <code>nsi_add</code> had no production caller, and <strong>every</strong> PDU-session selection was answered <code>403</code>. An entry with no <code>s_nssai</code> is skipped with a warning rather than installed under a guessed SST. With no entries at all the daemon logs an ERROR at startup naming the consequence (it still serves the registration and NSSAI-availability scenarios, which do not consult the NSI table, so it does not refuse to boot).</li>
 <li><strong><code>nssf.sbi.tls.*</code> (enabled/cert/key/ca/min_version) is inert.</strong> TLS is CLI-flag-only, and even those flags only populate a legacy config (next section).</li>
