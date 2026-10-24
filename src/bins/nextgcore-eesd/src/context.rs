@@ -1273,7 +1273,7 @@ impl EesContext {
         log::info!(
             "ACR management event subscription created: subscriptionId={id} easId={} notificationDestination={}",
             sub.eas_id,
-            sub.notification_destination
+            nextgcore_sbi::log_redact::redact_last_segment(&sub.notification_destination)
         );
         Some(sub)
     }

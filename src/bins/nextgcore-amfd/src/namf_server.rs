@@ -331,7 +331,11 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
         }
 
         _ => {
-            log::warn!("Unknown AMF SBI request: {method} {uri}");
+            // The path may be one of this AMF's token-bearing callbacks (#940).
+            log::warn!(
+                "Unknown AMF SBI request: {method} {}",
+                nextgcore_sbi::log_redact::redact_callback_tokens(&uri)
+            );
             send_not_found(
                 &format!("No resource for {method} {path}"),
                 Some("RESOURCE_URI_STRUCTURE_NOT_FOUND"),
@@ -5243,7 +5247,8 @@ fn handle_amf_status_subscription_create(request: &SbiRequest) -> SbiResponse {
     log::info!(
         "AMFStatusChange subscription created: id={subscription_id}, \
          amfStatusUri={amf_status_uri}, {} guami(s)",
-        sub.guami_list.len()
+        sub.guami_list.len(),
+        amf_status_uri = nextgcore_sbi::log_redact::redact_last_segment(&amf_status_uri)
     );
     let location = format!("/namf-comm/v1/subscriptions/{subscription_id}");
     match SbiResponse::with_status(201).with_json_body(&amf_status_subscription_json(&sub)) {
@@ -5312,7 +5317,8 @@ fn handle_amf_status_subscription_replace(
 
     log::info!(
         "AMFStatusChange subscription replaced: id={subscription_id}, \
-         amfStatusUri={amf_status_uri}"
+         amfStatusUri={amf_status_uri}",
+        amf_status_uri = nextgcore_sbi::log_redact::redact_last_segment(&amf_status_uri)
     );
     match SbiResponse::ok().with_json_body(&amf_status_subscription_json(&sub)) {
         Ok(resp) => resp,

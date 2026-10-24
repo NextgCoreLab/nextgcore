@@ -7039,19 +7039,22 @@ fn uri_path(uri: &str) -> String {
 /// failures are logged, not propagated — the local release proceeds regardless.
 /// smfd-07.
 async fn send_sm_context_status_notification(
-    uri: Option<&str>,
+    status_uri: Option<&str>,
     resource_status: &str,
     cause: Option<&str>,
 ) {
-    let Some(uri) = uri else {
+    let Some(status_uri) = status_uri else {
         log::debug!("No smContextStatusUri — skipping SmContextStatusNotification");
         return;
     };
-    let Some((host, port)) = policy::split_host_port(uri) else {
-        log::warn!("smContextStatusUri '{uri}' is not a valid URI — skipping notification");
+    let Some((host, port)) = policy::split_host_port(status_uri) else {
+        log::warn!(
+            "smContextStatusUri '{status_uri}' is not a valid URI — skipping notification",
+            status_uri = nextgcore_sbi::log_redact::redact_last_segment(status_uri)
+        );
         return;
     };
-    let path = uri_path(uri);
+    let path = uri_path(status_uri);
     let body = build_sm_context_status_notification(resource_status, cause);
     let client = nextgcore_sbi::client::SbiClient::new(
         nextgcore_sbi::security::sbi_peer_client_config(&host, port)
@@ -7060,10 +7063,14 @@ async fn send_sm_context_status_notification(
     );
     match client.post_json(&path, &body).await {
         Ok(resp) => log::info!(
-            "SmContextStatusNotification ({resource_status}) → {uri}: status={}",
-            resp.status
+            "SmContextStatusNotification ({resource_status}) → {status_uri}: status={}",
+            resp.status,
+            status_uri = nextgcore_sbi::log_redact::redact_last_segment(status_uri)
         ),
-        Err(e) => log::warn!("SmContextStatusNotification to {uri} failed: {e}"),
+        Err(e) => log::warn!(
+            "SmContextStatusNotification to {status_uri} failed: {e}",
+            status_uri = nextgcore_sbi::log_redact::redact_last_segment(status_uri)
+        ),
     }
 }
 
@@ -7601,7 +7608,7 @@ async fn handle_event_subscribe(request: &SbiRequest) -> SbiResponse {
     log::info!(
         "Event subscription {id} created: events={:?} notifUri={} ({} stored)",
         sub.events,
-        sub.notif_uri,
+        nextgcore_sbi::log_redact::redact_last_segment(&sub.notif_uri),
         event_exposure::count() + 1
     );
     let document = event_exposure::insert(sub);

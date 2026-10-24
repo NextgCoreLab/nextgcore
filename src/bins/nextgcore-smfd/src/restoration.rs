@@ -248,7 +248,7 @@ pub fn begin_unrecoverable_release(
 const RELEASE_FANOUT: usize = 16;
 
 /// Release one PDU session that can no longer be honoured.
-async fn release_one_unrecoverable(sm_context_ref: &str, uri: &str, reason: &str) {
+async fn release_one_unrecoverable(sm_context_ref: &str, status_uri: &str, reason: &str) {
     // #667: release the session through the UE, asking it to come back (#39),
     // so the user plane is rebuilt on the restarted UPF. A binding without the
     // UE's identity cannot be addressed that way, and gets the bare RELEASED
@@ -257,9 +257,10 @@ async fn release_one_unrecoverable(sm_context_ref: &str, uri: &str, reason: &str
         Some((supi, psi)) => {
             log::warn!(
                 "releasing sm_context_ref={sm_context_ref} after {reason}: PDU Session \
-                 Release Command #39 (reactivation requested) to {supi} PSI {psi} via {uri}"
+                 Release Command #39 (reactivation requested) to {supi} PSI {psi} via {status_uri}",
+                status_uri = nextgcore_sbi::log_redact::redact_last_segment(status_uri)
             );
-            crate::release_for_reactivation(sm_context_ref, uri, &supi, psi).await;
+            crate::release_for_reactivation(sm_context_ref, status_uri, &supi, psi).await;
         }
         None => {
             // #854: no UE identity to release through, so the release is finished here:
@@ -268,11 +269,12 @@ async fn release_one_unrecoverable(sm_context_ref: &str, uri: &str, reason: &str
             // notification went, and the binding and its SM policy stayed for good.
             log::warn!(
                 "releasing sm_context_ref={sm_context_ref} after {reason} locally (no SUPI/PSI \
-                 to release it through); notifying {uri}"
+                 to release it through); notifying {status_uri}",
+                status_uri = nextgcore_sbi::log_redact::redact_last_segment(status_uri)
             );
             crate::complete_sm_context_release(sm_context_ref);
             crate::send_sm_context_status_notification(
-                Some(uri),
+                Some(status_uri),
                 RESOURCE_STATUS_RELEASED,
                 Some(reason),
             )
@@ -507,15 +509,15 @@ pub async fn notify_unrestorable_at_boot() -> (usize, usize) {
             ctx.persist();
         }
         match entry.status_uri.as_deref() {
-            Some(uri) => {
+            Some(status_uri) => {
                 log::warn!(
-                    "boot restoration: sm_context_ref={} cannot be served ({}); telling {uri} it \
+                    "boot restoration: sm_context_ref={} cannot be served ({}); telling {status_uri} it \
                      is released",
                     entry.sm_context_ref,
-                    entry.reason
+                    entry.reason, status_uri = nextgcore_sbi::log_redact::redact_last_segment(status_uri)
                 );
                 crate::send_sm_context_status_notification(
-                    Some(uri),
+                    Some(status_uri),
                     RESOURCE_STATUS_RELEASED,
                     Some(&entry.reason),
                 )

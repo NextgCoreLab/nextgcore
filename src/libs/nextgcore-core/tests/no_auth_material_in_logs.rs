@@ -86,20 +86,56 @@ fn identifiers(code: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Production code only: everything from the first inline `#[cfg(test)]`
-/// module on is test code, where printing a published test vector is fine.
-fn production(text: &str) -> &str {
+/// Production code only: every inline `#[cfg(test)] mod name { .. }` block is
+/// blanked (offsets kept), since test code may print a published test vector.
+/// Only blocks are removed: a one-line `#[cfg(test)] mod name;` declaration used
+/// to end the scan of the whole file there, which hid most of smfd's, upfd's,
+/// mmed's and mbsmfd's `main.rs` from every check in this file (#1047 review).
+fn production(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = bytes.to_vec();
     let mut at = 0;
     for line in text.split_inclusive('\n') {
-        if line.trim() == "#[cfg(test)]" {
-            let rest = &text[at + line.len()..];
-            if rest.trim_start().starts_with("mod ") {
-                return &text[..at];
+        let line_start = at;
+        at += line.len();
+        if line.trim() != "#[cfg(test)]" {
+            continue;
+        }
+        let rest = &text[at..];
+        let item = rest.trim_start();
+        let is_mod = ["mod ", "pub mod ", "pub(crate) mod ", "pub(super) mod "]
+            .iter()
+            .any(|p| item.starts_with(p));
+        if !is_mod {
+            continue;
+        }
+        let item_at = at + (rest.len() - item.len());
+        let head_end = item.find(['{', ';']).map_or(text.len(), |i| item_at + i);
+        if bytes.get(head_end) != Some(&b'{') {
+            continue; // `mod name;`: its file is scanned (or skipped) on its own
+        }
+        let mut depth = 0usize;
+        let mut end = text.len();
+        for (i, b) in bytes[head_end..].iter().enumerate() {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = head_end + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
             }
         }
-        at += line.len();
+        for b in &mut out[line_start..end] {
+            if *b != b'\n' {
+                *b = b' ';
+            }
+        }
     }
-    text
+    String::from_utf8(out).unwrap_or_else(|_| text.to_string())
 }
 
 /// `text` with every `//` and `/* */` comment replaced by spaces, so byte
@@ -181,6 +217,12 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
             }
             rust_files(&path, out);
         } else if path.extension().is_some_and(|x| x == "rs") {
+            // A test module in its own file (`property_tests.rs`, `golden_tests.rs`,
+            // `strict_peer_test.rs`), declared by a `#[cfg(test)] mod name;`.
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            if stem.ends_with("tests") || stem.ends_with("_test") || stem == "tests" {
+                continue;
+            }
             out.push(path);
         }
     }
@@ -249,7 +291,8 @@ fn no_log_macro_prints_authentication_material() {
     let mut problems = Vec::new();
     for file in &files {
         let full = fs::read_to_string(file).unwrap_or_default();
-        let text = production(&full);
+        let prod = production(&full);
+        let text = prod.as_str();
         for mac in MACROS {
             let mut from = 0;
             while let Some(at) = text[from..].find(mac) {
@@ -595,7 +638,7 @@ fn no_key_holding_type_derives_debug() {
                 .unwrap_or(file)
                 .display()
                 .to_string();
-            (rel, blank_comments(production(&full)))
+            (rel, blank_comments(&production(&full)))
         })
         .collect();
     let all: Vec<Item> = texts
@@ -773,7 +816,8 @@ fn manual_debug_impls_redact_authentication_material() {
     let mut problems = Vec::new();
     for file in &files {
         let full = fs::read_to_string(file).unwrap_or_default();
-        let text = production(&full);
+        let prod = production(&full);
+        let text = prod.as_str();
         let mut from = 0;
         while let Some(at) = text[from..].find("Debug for ") {
             let start = from + at;
@@ -829,10 +873,13 @@ fn manual_debug_impls_redact_authentication_material() {
     assert!(problems.is_empty(), "\n{}", problems.join("\n"));
 }
 
-/// Whether an identifier chain names a callback URI (#1018): its last segment
-/// ends in `uri`/`url` and names a notification or callback target
-/// (`notification_uri`, `notif_uri`, `sub.notify_uri`, `dereg_callback_uri`,
-/// `event_notify_uri`), or is a bare `callback` / `callback_reference`.
+/// Whether an identifier chain names a callback URI (#1018, #1047 review): its
+/// last segment ends in `uri`/`url` and names a notification, callback or
+/// status target (`notification_uri`, `notif_uri`, `sub.notify_uri`,
+/// `dereg_callback_uri`, `amf_status_uri`, `nf_nssai_availability_uri`), ends in
+/// `destination` (`notification_destination`), or is a bare `callback` /
+/// `callback_reference`. A bare `uri` is not judged (it is mostly a request
+/// URI); a local that holds a callback is bound under a callback-style name.
 fn is_callback_uri(ident: &str) -> bool {
     let last = ident.rsplit('.').next().unwrap_or(ident);
     if !last.chars().any(|c| c.is_ascii_lowercase()) {
@@ -849,18 +896,215 @@ fn is_callback_uri(ident: &str) -> bool {
     {
         return true;
     }
+    if last.ends_with("destination") {
+        return true;
+    }
     let uri_like = last.ends_with("uri") || last.ends_with("url");
     uri_like
-        && ["notif", "notify", "callback", "dereg"]
+        && [
+            "notif",
+            "notify",
+            "callback",
+            "dereg",
+            "status",
+            "availability",
+        ]
+        .iter()
+        .any(|k| last.contains(k))
+}
+
+/// Byte spans of every `redact_*(..)` call in `code`.
+fn redact_spans(code: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut from = 0;
+    while let Some(at) = code[from..].find("redact_") {
+        let start = from + at;
+        from = start + 7;
+        let Some(open_rel) = code[start..].find('(') else {
+            break;
+        };
+        let open = start + open_rel;
+        if !code[start..open]
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_')
+        {
+            continue;
+        }
+        let mut depth = 0i32;
+        for (i, c) in code[open..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        spans.push((start, open + i + 1));
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    spans
+}
+
+/// The callback-URI identifiers a log macro body prints unredacted (#1047
+/// review: judged per identifier, not per macro). An occurrence is redacted
+/// when it sits inside a `redact_*(..)` call, or when it names a named
+/// argument whose value is one (`notify_uri = redact_last_segment(&notify_uri)`,
+/// which shadows the inline `{notify_uri}` capture).
+fn unredacted_callback_uris(body: &str) -> Vec<String> {
+    unredacted_callback_uris_with(body, &[])
+}
+
+/// [`unredacted_callback_uris`], also treating `tainted` locals (bound from a
+/// callback URI, see [`tainted_bindings`]) as callback URIs.
+fn unredacted_callback_uris_with(body: &str, tainted: &[&str]) -> Vec<String> {
+    let code = interpolated_and_args(body);
+    let spans = redact_spans(&code);
+    let shadowed = |name: &str| {
+        let mut from = 0;
+        while let Some(at) = code[from..].find(name) {
+            let start = from + at;
+            from = start + name.len();
+            let before_ok = code[..start]
+                .chars()
+                .last()
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '.'));
+            let after_ok = code[from..]
+                .chars()
+                .next()
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+            let rest = code[from..].trim_start();
+            if before_ok && after_ok && rest.starts_with('=') && !rest.starts_with("==") {
+                let value = rest[1..].split(',').next().unwrap_or("");
+                if value.contains("redact_") {
+                    return true;
+                }
+            }
+        }
+        false
+    };
+    let mut out = Vec::new();
+    let mut from = 0;
+    for ident in identifiers(&code) {
+        let Some(at) = code[from..].find(ident) else {
+            continue;
+        };
+        let start = from + at;
+        from = start + ident.len();
+        if !is_callback_uri(ident) && !tainted.contains(&ident) {
+            continue;
+        }
+        if spans.iter().any(|&(a, b)| a <= start && start < b) {
+            continue;
+        }
+        if !ident.contains('.') && shadowed(ident) {
+            continue;
+        }
+        out.push(ident.to_string());
+    }
+    out
+}
+
+/// Whether a string literal is a callback-URI JSON key (`"notifUri"`,
+/// `"ucmfNotificationUri"`, `"smContextStatusUri"`, `"amfStatusUri"`,
+/// `"nfNssaiAvailabilityUri"`, `"notificationDestination"`, ...).
+fn is_callback_key(literal: &str) -> bool {
+    let k = literal.to_ascii_lowercase();
+    let named = ["notif", "callback", "status", "availability", "destination"]
+        .iter()
+        .any(|w| k.contains(w));
+    named && (k.ends_with("uri") || k.ends_with("destination"))
+}
+
+/// Locals bound from a callback URI (#1047 review: a bare `uri` that holds one),
+/// as `(name, scope start, scope end)` byte offsets in `text`: the binding to the
+/// next `fn` item. A `let` whose value names a callback identifier
+/// ([`is_callback_uri`]) or a callback JSON key ([`is_callback_key`]) and is not
+/// itself redacted taints its name.
+fn tainted_bindings(text: &str) -> Vec<(String, usize, usize)> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(at) = text[from..].find("let ") {
+        let start = from + at;
+        from = start + 4;
+        if text[..start]
+            .chars()
+            .last()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        {
+            continue;
+        }
+        let rest = &text[from..];
+        let Some(eq) = rest.find('=') else { break };
+        let pattern = &rest[..eq];
+        if pattern.contains(['\n', ';']) && pattern.lines().count() > 2 {
+            continue;
+        }
+        let name: String = pattern
+            .trim_start_matches("mut ")
+            .trim_start_matches("Some(")
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if name.is_empty() || name.starts_with("logged") || is_callback_uri(&name) {
+            continue;
+        }
+        // The value ends at `;`, at the `{` of an `if let` / `while let` body,
+        // or at a `let ... else`.
+        let value_end = [";", "{", " else "]
             .iter()
-            .any(|k| last.contains(k))
+            .filter_map(|t| rest[eq..].find(t))
+            .min()
+            .map_or(rest.len(), |i| eq + i);
+        let value = &rest[eq + 1..value_end];
+        if value.contains("redact_") {
+            continue;
+        }
+        // A projection that is not the URI: a count, a presence test, or the
+        // authority (host:port), which carries no path or query.
+        let trimmed = value.trim_end().trim_end_matches('?');
+        let projection = [
+            ".len()",
+            ".count()",
+            ".is_some()",
+            ".is_none()",
+            ".is_empty()",
+        ]
+        .iter()
+        .any(|p| trimmed.ends_with(p))
+            || ["authority", "host"]
+                .iter()
+                .any(|f| value.contains(&format!("{f}(")))
+            // ucmfd: `nf:{id}` or `uri:{authority}`, never a path.
+            || value.contains("consumer_of(");
+        if projection {
+            continue;
+        }
+        // Any segment of a chain: `sub.notif_uri.clone()` reads one.
+        let from_ident = identifiers(value)
+            .into_iter()
+            .any(|chain| chain.split('.').any(is_callback_uri));
+        let from_key = value.split('"').skip(1).step_by(2).any(is_callback_key);
+        if from_ident || from_key {
+            let scope_end = text[from..]
+                .find("\nfn ")
+                .into_iter()
+                .chain(text[from..].find(" fn "))
+                .min()
+                .map_or(text.len(), |i| from + i);
+            out.push((name, start, scope_end));
+        }
+    }
+    out
 }
 
 /// #1018: a log macro never interpolates a consumer-supplied callback URI
 /// whole. A third party's callback URI may carry a secret anywhere in its path
 /// or query (the AMF's own carry a bearer token, #940/#1026), so an NF that
-/// calls or stores one logs it through `nextgcore_sbi::log_redact` (any
-/// `redact_` call in the macro counts).
+/// calls or stores one logs it through `nextgcore_sbi::log_redact`. Judged per
+/// identifier (#1047 review): one redacted argument does not excuse another.
 #[test]
 fn no_log_macro_prints_a_callback_uri_whole() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -870,7 +1114,9 @@ fn no_log_macro_prints_a_callback_uri_whole() {
     let mut problems = Vec::new();
     for file in &files {
         let full = fs::read_to_string(file).unwrap_or_default();
-        let text = production(&full);
+        let blanked = blank_comments(&production(&full));
+        let text = blanked.as_str();
+        let taint = tainted_bindings(text);
         for mac in MACROS {
             let mut from = 0;
             while let Some(at) = text[from..].find(mac) {
@@ -880,15 +1126,12 @@ fn no_log_macro_prints_a_callback_uri_whole() {
                 if before.is_alphanumeric() || before == '_' {
                     continue;
                 }
-                let body = macro_body(text, from);
-                if body.contains("redact_") {
-                    continue;
-                }
-                let code = interpolated_and_args(body);
-                let hits: Vec<&str> = identifiers(&code)
-                    .into_iter()
-                    .filter(|w| is_callback_uri(w))
+                let live: Vec<&str> = taint
+                    .iter()
+                    .filter(|(_, a, b)| *a < start && start < *b)
+                    .map(|(n, _, _)| n.as_str())
                     .collect();
+                let hits = unredacted_callback_uris_with(macro_body(text, from), &live);
                 if !hits.is_empty() {
                     let line = text[..start].matches('\n').count() + 1;
                     problems.push(format!(
@@ -918,6 +1161,12 @@ fn the_callback_uri_scan_sees_its_shapes() {
         "callback",
         "s.callback_reference",
         "notify_url",
+        // #1047 review: the shapes the first version missed.
+        "amf_status_uri",
+        "nf_nssai_availability_uri",
+        "ucmf_notification_uri",
+        "notification_destination",
+        "sm_context_status_uri",
     ] {
         assert!(is_callback_uri(flagged), "{flagged}");
     }
@@ -930,13 +1179,44 @@ fn the_callback_uri_scan_sees_its_shapes() {
         "api_root",
         "custom_header::CALLBACK",
         "CALLBACK",
+        "logged_uri",
     ] {
         assert!(!is_callback_uri(fine), "{fine}");
     }
-    let code =
-        interpolated_and_args("\"to {} for {supi}\", redact_last_segment(&sub.notification_uri)");
-    assert!(
-        identifiers(&code).iter().any(|w| is_callback_uri(w)),
-        "found, then skipped by redact_"
+    // Judged per identifier: one redacted argument does not excuse another.
+    assert_eq!(
+        unredacted_callback_uris(
+            "\"{} and {}\", redact_last_segment(&sub.notification_uri), sub.amf_status_uri"
+        ),
+        vec!["sub.amf_status_uri"]
     );
+    // A shadowing named argument counts; an unrelated one does not.
+    assert!(unredacted_callback_uris(
+        "\"to {notify_uri}\", notify_uri = redact_last_segment(&notify_uri)"
+    )
+    .is_empty());
+    assert_eq!(
+        unredacted_callback_uris("\"to {notify_uri} {x}\", x = redact_last_segment(&y)"),
+        vec!["notify_uri"]
+    );
+    // A bare local bound from a callback (#1047 review): field or JSON key.
+    let src = "fn a() {\n    let uri = sub.notif_uri.clone();\n    let Some(cb) = json.get(\"ucmfNotificationUri\").and_then(f) else { return };\n    let logged = redact_last_segment(&sub.notif_uri);\n    let uri2 = format!(\"{base}/x\");\n}\nfn b() {}\n";
+    let names: Vec<String> = tainted_bindings(src)
+        .into_iter()
+        .map(|(n, _, _)| n)
+        .collect();
+    assert_eq!(names, vec!["uri", "cb"]);
+    // Not taints: a count, an authority, and an `if let` whose body names one.
+    let src = "fn c() {\n    let n = subs.iter().filter_map(|s| s.notify_uri.as_deref()).count();\n    let a = uri_authority(&notification_uri);\n    if let Some(id) = &ctx_id {\n        let uri = c.dns_context_notify_uri(id);\n    }\n}\n";
+    let names: Vec<String> = tainted_bindings(src)
+        .into_iter()
+        .map(|(n, _, _)| n)
+        .collect();
+    assert_eq!(names, vec!["uri"]);
+    assert_eq!(
+        unredacted_callback_uris_with("\"unusable notifUri {uri}\"", &["uri"]),
+        vec!["uri"]
+    );
+    assert!(is_callback_key("smContextStatusUri") && is_callback_key("notificationDestination"));
+    assert!(!is_callback_key("nfInstanceId") && !is_callback_key("apiRoot"));
 }

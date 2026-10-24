@@ -239,10 +239,17 @@ pub fn install_sbi_notifier(config: SbiNotifierConfig) {
 /// (logged + counted). Never panics; never blocks a caller (runs on the
 /// background worker).
 async fn deliver(item: QueuedNotification, config: &SbiNotifierConfig, dropped: &AtomicU64) {
-    let QueuedNotification { uri, body, kind } = item;
+    let QueuedNotification {
+        uri: callback_uri,
+        body,
+        kind,
+    } = item;
 
-    let Some((scheme, host, port, path)) = parse_callback_uri(&uri) else {
-        log::error!("EES notifier: unparseable callback URI {uri:?} for {kind}; dropping");
+    let Some((scheme, host, port, path)) = parse_callback_uri(&callback_uri) else {
+        log::error!(
+            "EES notifier: unparseable callback URI {callback_uri:?} for {kind}; dropping",
+            callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
+        );
         dropped.fetch_add(1, Ordering::SeqCst);
         return;
     };
@@ -263,21 +270,24 @@ async fn deliver(item: QueuedNotification, config: &SbiNotifierConfig, dropped: 
             SbiRequest::post(path.clone()).with_body(body_str.clone(), "application/json");
         match client.send_request(request).await {
             Ok(resp) if resp.status == 204 => {
-                log::debug!("EES notifier delivered {kind} to {uri} (204, attempt {attempt})");
+                log::debug!(
+                    "EES notifier delivered {kind} to {callback_uri} (204, attempt {attempt})",
+                    callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
+                );
                 return;
             }
             Ok(resp) if resp.status == 200 => {
                 log::warn!(
-                    "EES notifier: {kind} to {uri} answered 200 (spec expects 204); accepting"
+                    "EES notifier: {kind} to {callback_uri} answered 200 (spec expects 204); accepting", callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
                 );
                 return;
             }
             Ok(resp) => {
                 if attempt >= max {
                     log::error!(
-                        "EES notifier: giving up on {kind} to {uri} after {attempt} attempt(s) \
+                        "EES notifier: giving up on {kind} to {callback_uri} after {attempt} attempt(s) \
                          (last status {})",
-                        resp.status
+                        resp.status, callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
                     );
                     dropped.fetch_add(1, Ordering::SeqCst);
                     return;
@@ -289,8 +299,8 @@ async fn deliver(item: QueuedNotification, config: &SbiNotifierConfig, dropped: 
             Err(e) => {
                 if attempt >= max {
                     log::error!(
-                        "EES notifier: giving up on {kind} to {uri} after {attempt} attempt(s) \
-                         (transport error: {e})"
+                        "EES notifier: giving up on {kind} to {callback_uri} after {attempt} attempt(s) \
+                         (transport error: {e})", callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
                     );
                     dropped.fetch_add(1, Ordering::SeqCst);
                     return;
