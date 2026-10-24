@@ -129,6 +129,11 @@ pub fn build_ecid_measurement_initiation(
 /// a measurement report names the TRP, and the coordinate is the reference point
 /// itself. Without both, a response cannot fill the registry: a coordinate with no
 /// id cannot be looked up, and an id with no coordinate cannot be solved against.
+///
+/// #911: also the NG-RAN CGI, the ARFCN, the PRS configuration and the SFN
+/// initialisation time, which the DL-PRS assistance data is built from. A node
+/// that cannot provide some of them leaves them out (TS 38.455 §8.2.8.3 fails the
+/// procedure only when it "cannot provide any of the requested information").
 pub fn build_trp_information(trp_ids: &[u16]) -> Result<(NrppaTransactionId, Vec<u8>), String> {
     let txn = next_transaction_id();
     let bytes = encode_trp_information_request(txn, trp_ids)?;
@@ -246,6 +251,10 @@ fn encode_trp_information_request(
         criticality: nrppa::Criticality(REJECT),
         value: V::Id_TRPInformationTypeListTRPReq(nrppa::TRPInformationTypeListTRPReq(vec![
             info_type(nrppa::TRPInformationTypeItem::NR_PCI),
+            info_type(nrppa::TRPInformationTypeItem::N_G_RAN_CGI),
+            info_type(nrppa::TRPInformationTypeItem::ARFCN),
+            info_type(nrppa::TRPInformationTypeItem::P_RS_CONFIG),
+            info_type(nrppa::TRPInformationTypeItem::S_FN_INIT_TIME),
             info_type(nrppa::TRPInformationTypeItem::GEO_COORD),
         ])),
     });
@@ -679,11 +688,26 @@ mod tests {
         0x0b, 0x00, 0x01, 0x08, 0x00, 0x0b, 0x00, 0x01, 0x10,
     ];
 
-    /// The production TRP request (every TRP; NR-PCI + geographical coordinate),
-    /// transaction 3 -- the same octets #515 stage 1 derived by hand.
-    const PRODUCTION_TRP_REQUEST: [u8; 24] = [
-        0x00, 0x10, 0x00, 0x00, 0x03, 0x12, 0x00, 0x00, 0x01, 0x00, 0x1d, 0x00, 0x0b, 0x04, 0x00,
-        0x39, 0x00, 0x01, 0x00, 0x00, 0x39, 0x00, 0x01, 0x70,
+    /// The production TRP request (every TRP), transaction 3, derived by hand from
+    /// X.691 (APER) and TS 38.455. #515 stage 1 derived the two-type version
+    /// (NR-PCI + geographical coordinate); #911 adds four types:
+    ///
+    /// ```text
+    /// 00 10 00 00 03 26  initiatingMessage, procedure 16, reject, transaction 3, length 38
+    ///  00 00 01          SEQUENCE ext 0 + pad; 1 IE (no id-TRPList: every TRP)
+    ///  00 1d 00 1f       TRPInformationTypeListTRPReq (29), reject; 31 octets:
+    ///   14               SIZE(1..64) count-1 = 5 in 6 bits, pad
+    ///   00 39 00 01 00   TRPInformationTypeItem (57), reject; ext 0, nrPCI (0) in 3 bits
+    ///   00 39 00 01 10   ... nG-RAN-CGI (1)
+    ///   00 39 00 01 20   ... arfcn (2)
+    ///   00 39 00 01 30   ... pRSConfig (3)
+    ///   00 39 00 01 50   ... sFNInitTime (5)
+    ///   00 39 00 01 70   ... geoCoord (7)
+    /// ```
+    const PRODUCTION_TRP_REQUEST: [u8; 44] = [
+        0x00, 0x10, 0x00, 0x00, 0x03, 0x26, 0x00, 0x00, 0x01, 0x00, 0x1d, 0x00, 0x1f, 0x14, 0x00,
+        0x39, 0x00, 0x01, 0x00, 0x00, 0x39, 0x00, 0x01, 0x10, 0x00, 0x39, 0x00, 0x01, 0x20, 0x00,
+        0x39, 0x00, 0x01, 0x30, 0x00, 0x39, 0x00, 0x01, 0x50, 0x00, 0x39, 0x00, 0x01, 0x70,
     ];
 
     #[test]
@@ -747,7 +771,7 @@ mod tests {
     #[test]
     fn a_trp_request_naming_one_trp_matches_x691() {
         let expected: Vec<u8> = [
-            &[0x00, 0x10, 0x00, 0x00, 0x03, 0x1b, 0x00, 0x00, 0x02][..],
+            &[0x00, 0x10, 0x00, 0x00, 0x03, 0x2f, 0x00, 0x00, 0x02][..],
             &[0x00, 0x2f, 0x40, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00],
             &PRODUCTION_TRP_REQUEST[9..],
         ]
