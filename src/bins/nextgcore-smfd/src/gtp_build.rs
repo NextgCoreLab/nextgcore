@@ -203,258 +203,10 @@ pub mod gtp2_ie_type {
 // GTPv2-C Cause Values
 // ============================================================================
 
-/// GTPv2-C Cause values (3GPP TS 29.274)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-#[derive(Default)]
-pub enum Gtp2Cause {
-    // Request / Initial message: TS 29.274 Table 8.4-1. #687: these were one off
-    // from 5 on (ReactivationRequested was 7, which is "IMSI Detach Only"); no
-    // caller used them until the PGW-U restart release did.
-    LocalDetach = 2,
-    CompleteDetach = 3,
-    RatChangedFrom3gppToNon3gpp = 4,
-    IsrDeactivation = 5,
-    ErrorIndicationReceived = 6,
-    ImsiDetachOnly = 7,
-    ReactivationRequested = 8,
-    PdnReconnectionToThisApnDisallowed = 9,
-    AccessChangedFromNon3gppTo3gpp = 10,
-    PdnConnectionInactivityTimerExpires = 11,
-    PgwNotResponding = 12,
-    NetworkFailure = 13,
-    QosParameterMismatch = 14,
-    EpsTo5gsMobility = 15,
-    #[default]
-    RequestAccepted = 16,
-    RequestAcceptedPartially = 17,
-    NewPdnTypeDueToNetworkPreference = 18,
-    NewPdnTypeDueToSingleAddressBearerOnly = 19,
-    UnableToPageUeDueToSuspension = 20,
-    // Acceptance in a Response / triggered message
-    ContextNotFound = 64,
-    InvalidMessageFormat = 65,
-    VersionNotSupportedByNextPeer = 66,
-    InvalidLength = 67,
-    ServiceNotSupported = 68,
-    MandatoryIeMissing = 69,
-    MandatoryIeIncorrect = 70,
-    OptionalIeIncorrect = 71,
-    SystemFailure = 72,
-    NoResourcesAvailable = 73,
-    SemanticErrorInTheTft = 74,
-    SyntacticErrorInTheTft = 75,
-    SemanticErrorsInPacketFilter = 76,
-    SyntacticErrorsInPacketFilter = 77,
-    MissingOrUnknownApn = 78,
-    GtpCEntityCongestion = 80,
-    BearerHandlingNotSupported = 81,
-    UeAlreadyReAttached = 82,
-    MultipleApnAccessNotAllowed = 83,
-    RequestRejectedReasonNotSpecified = 84,
-    UnableToProvideThePcoRequestedByTheUe = 85,
-    TftSemanticError = 86,
-    TftSyntacticError = 87,
-    CollisionWithNetworkInitiatedRequest = 88,
-    UnableToStartPagingProcedure = 89,
-    UnknownAccessType = 90,
-    PsToCSHandoverCancelled = 91,
-    TemporaryFailure = 92,
-    UnableToIdentifyTheTargetPlmn = 93,
-    DataForwardingNotSupported = 94,
-    SnriNotSupported = 95,
-    DeniedInRat = 96,
-    LackOfResources = 97,
-    NoMemoryAvailable = 98,
-    UserAuthenticationFailed = 99,
-    ApnAccessDeniedNoSubscription = 100,
-    RequestRejectedReasonNotSpecified2 = 101,
-    PtmsiSignatureMismatch = 102,
-    ImsiImeiNotKnown = 103,
-    SemanticErrorInTheTad = 104,
-    SyntacticErrorInTheTad = 105,
-    RemotePeerNotResponding = 106,
-    CollisionWithNetworkInitiatedRequest2 = 107,
-    UnableToPageUeDueToSuspension2 = 108,
-    ConditionalIeMissing = 109,
-    ApnRestrictionTypeIncompatible = 110,
-    InvalidOverallLengthOfTheTriggeredResponse = 111,
-    DataForwardingNotSupported2 = 112,
-    InvalidReplyFromRemotePeer = 113,
-    FallbackToGtpv1 = 114,
-    InvalidPeer = 115,
-    TemporarilyRejectedDueToHandoverTaiChange = 116,
-    ModificationsNotLimitedToS1UBearers = 117,
-    RequestRejectedForAPmipv6Reason = 118,
-    ApnCongestion = 119,
-    BearerHandlingNotSupportedDueToVplmnPolicy = 120,
-    UeContextWithoutTftAlreadyActivated = 121,
-    PgwNotResponding2 = 122,
-    CollisionWithNetworkInitiatedRequest3 = 123,
-    UnableToActivatePdnConnectivityDueToVplmnPolicy = 124,
-    ConditionalIeMissing2 = 125,
-    ApnNotSupportedInCurrentRatAndPlmnCombination = 126,
-    InvalidOverallLengthOfTheTriggeredResponse2 = 127,
-    AllDynamicAddressesAreOccupied = 128,
-    UeContextWithoutTftAlreadyActivated2 = 129,
-    ProtocolTypeNotSupported = 130,
-    UeNotResponding = 131,
-    UeRefuses = 132,
-    ServiceDenied = 133,
-    UnableToPageUe2 = 134,
-    NoMemoryAvailable2 = 135,
-    UserAuthenticationFailed2 = 136,
-    ApnAccessDeniedNoSubscription2 = 137,
-    RequestRejectedReasonNotSpecified3 = 138,
-    PtmsiSignatureMismatch2 = 139,
-    ImsiImeiNotKnown2 = 140,
-    SemanticErrorInTheTad2 = 141,
-    SyntacticErrorInTheTad2 = 142,
-    RemotePeerNotResponding2 = 143,
-    CollisionWithNetworkInitiatedRequest4 = 144,
-    UnableToPageUeDueToSuspension3 = 145,
-    ConditionalIeMissing3 = 146,
-    ApnRestrictionTypeIncompatible2 = 147,
-    InvalidOverallLengthOfTheTriggeredResponse3 = 148,
-    DataForwardingNotSupported3 = 149,
-    InvalidReplyFromRemotePeer2 = 150,
-    FallbackToGtpv1_2 = 151,
-    InvalidPeer2 = 152,
-    TemporarilyRejectedDueToHandoverTaiChange2 = 153,
-    ModificationsNotLimitedToS1UBearers2 = 154,
-    RequestRejectedForAPmipv6Reason2 = 155,
-    ApnCongestion2 = 156,
-    BearerHandlingNotSupportedDueToVplmnPolicy2 = 157,
-    UeContextWithoutTftAlreadyActivated3 = 158,
-    PgwNotResponding3 = 159,
-    CollisionWithNetworkInitiatedRequest5 = 160,
-    UnableToActivatePdnConnectivityDueToVplmnPolicy2 = 161,
-    ConditionalIeMissing4 = 162,
-    ApnNotSupportedInCurrentRatAndPlmnCombination2 = 163,
-    InvalidOverallLengthOfTheTriggeredResponse4 = 164,
-    AllDynamicAddressesAreOccupied2 = 165,
-    UeContextWithoutTftAlreadyActivated4 = 166,
-    ProtocolTypeNotSupported2 = 167,
-    UeNotResponding2 = 168,
-    UeRefuses2 = 169,
-    ServiceDenied2 = 170,
-    UnableToPageUe3 = 171,
-    NoMemoryAvailable3 = 172,
-    UserAuthenticationFailed3 = 173,
-    ApnAccessDeniedNoSubscription3 = 174,
-    RequestRejectedReasonNotSpecified4 = 175,
-    PtmsiSignatureMismatch3 = 176,
-    ImsiImeiNotKnown3 = 177,
-    SemanticErrorInTheTad3 = 178,
-    SyntacticErrorInTheTad3 = 179,
-    RemotePeerNotResponding3 = 180,
-    CollisionWithNetworkInitiatedRequest6 = 181,
-    UnableToPageUeDueToSuspension4 = 182,
-    ConditionalIeMissing5 = 183,
-    ApnRestrictionTypeIncompatible3 = 184,
-    InvalidOverallLengthOfTheTriggeredResponse5 = 185,
-    DataForwardingNotSupported4 = 186,
-    InvalidReplyFromRemotePeer3 = 187,
-    FallbackToGtpv1_3 = 188,
-    InvalidPeer3 = 189,
-    TemporarilyRejectedDueToHandoverTaiChange3 = 190,
-    ModificationsNotLimitedToS1UBearers3 = 191,
-    RequestRejectedForAPmipv6Reason3 = 192,
-    ApnCongestion3 = 193,
-    BearerHandlingNotSupportedDueToVplmnPolicy3 = 194,
-    UeContextWithoutTftAlreadyActivated5 = 195,
-    PgwNotResponding4 = 196,
-    CollisionWithNetworkInitiatedRequest7 = 197,
-    UnableToActivatePdnConnectivityDueToVplmnPolicy3 = 198,
-    ConditionalIeMissing6 = 199,
-    ApnNotSupportedInCurrentRatAndPlmnCombination3 = 200,
-    InvalidOverallLengthOfTheTriggeredResponse6 = 201,
-    AllDynamicAddressesAreOccupied3 = 202,
-    UeContextWithoutTftAlreadyActivated6 = 203,
-    ProtocolTypeNotSupported3 = 204,
-    UeNotResponding3 = 205,
-    UeRefuses3 = 206,
-    ServiceDenied3 = 207,
-    UnableToPageUe4 = 208,
-    NoMemoryAvailable4 = 209,
-    UserAuthenticationFailed4 = 210,
-    ApnAccessDeniedNoSubscription4 = 211,
-    RequestRejectedReasonNotSpecified5 = 212,
-    PtmsiSignatureMismatch4 = 213,
-    ImsiImeiNotKnown4 = 214,
-    SemanticErrorInTheTad4 = 215,
-    SyntacticErrorInTheTad4 = 216,
-    RemotePeerNotResponding4 = 217,
-    CollisionWithNetworkInitiatedRequest8 = 218,
-    UnableToPageUeDueToSuspension5 = 219,
-    ConditionalIeMissing7 = 220,
-    ApnRestrictionTypeIncompatible4 = 221,
-    InvalidOverallLengthOfTheTriggeredResponse7 = 222,
-    DataForwardingNotSupported5 = 223,
-    InvalidReplyFromRemotePeer4 = 224,
-    FallbackToGtpv1_4 = 225,
-    InvalidPeer4 = 226,
-    TemporarilyRejectedDueToHandoverTaiChange4 = 227,
-    ModificationsNotLimitedToS1UBearers4 = 228,
-    RequestRejectedForAPmipv6Reason4 = 229,
-    ApnCongestion4 = 230,
-    BearerHandlingNotSupportedDueToVplmnPolicy4 = 231,
-    UeContextWithoutTftAlreadyActivated7 = 232,
-    PgwNotResponding5 = 233,
-    CollisionWithNetworkInitiatedRequest9 = 234,
-    UnableToActivatePdnConnectivityDueToVplmnPolicy4 = 235,
-    ConditionalIeMissing8 = 236,
-    ApnNotSupportedInCurrentRatAndPlmnCombination4 = 237,
-    InvalidOverallLengthOfTheTriggeredResponse8 = 238,
-    AllDynamicAddressesAreOccupied4 = 239,
-    UeContextWithoutTftAlreadyActivated8 = 240,
-    ProtocolTypeNotSupported4 = 241,
-    UeNotResponding4 = 242,
-    UeRefuses4 = 243,
-    ServiceDenied4 = 244,
-    UnableToPageUe5 = 245,
-    NoMemoryAvailable5 = 246,
-    UserAuthenticationFailed5 = 247,
-    ApnAccessDeniedNoSubscription5 = 248,
-    RequestRejectedReasonNotSpecified6 = 249,
-    PtmsiSignatureMismatch5 = 250,
-    ImsiImeiNotKnown5 = 251,
-    SemanticErrorInTheTad5 = 252,
-    SyntacticErrorInTheTad5 = 253,
-    RemotePeerNotResponding5 = 254,
-    UndefinedValue = 0,
-}
-
-impl From<u8> for Gtp2Cause {
-    fn from(value: u8) -> Self {
-        match value {
-            16 => Gtp2Cause::RequestAccepted,
-            17 => Gtp2Cause::RequestAcceptedPartially,
-            18 => Gtp2Cause::NewPdnTypeDueToNetworkPreference,
-            19 => Gtp2Cause::NewPdnTypeDueToSingleAddressBearerOnly,
-            64 => Gtp2Cause::ContextNotFound,
-            65 => Gtp2Cause::InvalidMessageFormat,
-            66 => Gtp2Cause::VersionNotSupportedByNextPeer,
-            67 => Gtp2Cause::InvalidLength,
-            68 => Gtp2Cause::ServiceNotSupported,
-            69 => Gtp2Cause::MandatoryIeMissing,
-            70 => Gtp2Cause::MandatoryIeIncorrect,
-            71 => Gtp2Cause::OptionalIeIncorrect,
-            72 => Gtp2Cause::SystemFailure,
-            73 => Gtp2Cause::NoResourcesAvailable,
-            74 => Gtp2Cause::SemanticErrorInTheTft,
-            75 => Gtp2Cause::SyntacticErrorInTheTft,
-            76 => Gtp2Cause::SemanticErrorsInPacketFilter,
-            77 => Gtp2Cause::SyntacticErrorsInPacketFilter,
-            78 => Gtp2Cause::MissingOrUnknownApn,
-            80 => Gtp2Cause::GtpCEntityCongestion,
-            106 => Gtp2Cause::RemotePeerNotResponding,
-            109 => Gtp2Cause::ConditionalIeMissing,
-            128 => Gtp2Cause::AllDynamicAddressesAreOccupied,
-            _ => Gtp2Cause::UndefinedValue,
-        }
-    }
-}
+/// GTPv2-C Cause values: the shared TS 29.274 Table 8.4-1 enum (#1037). This
+/// node's own copy was wrong from 69 up (Mandatory IE missing was sent as 69,
+/// Request rejected as 84, Remote peer not responding as 106, ...).
+pub use nextgcore_gtp::v2::Gtp2Cause;
 
 // ============================================================================
 // GTPv2-C RAT Types
@@ -1681,12 +1433,42 @@ mod tests {
         assert_eq!(msg[1], gtp2_message_type::CREATE_SESSION_RESPONSE);
     }
 
+    /// #1037, TS 29.274 §5.5.1 / §8.4 / Table 8.4-1: the Cause IE a PGW-C
+    /// refusal carries, golden bytes. Before, "Mandatory IE missing" went out as
+    /// 69 (Mandatory IE incorrect) and "Remote peer not responding" as 106.
+    #[test]
+    fn refusal_causes_are_their_table_8_4_1_octets_on_the_wire() {
+        for (cause, octet) in [
+            (Gtp2Cause::MandatoryIeMissing, 0x46u8),
+            (Gtp2Cause::RemotePeerNotResponding, 0x64),
+            (Gtp2Cause::RequestRejectedReasonNotSpecified, 0x5e),
+            (Gtp2Cause::ConditionalIeMissing, 0x67),
+        ] {
+            let msg = build_error_message(
+                gtp2_message_type::CREATE_SESSION_RESPONSE,
+                0x0102_0304,
+                cause,
+            );
+            // Header with TEID (12 octets), then the Cause IE: type 2, length 2,
+            // instance 0, the cause, PCE/BCE/CS clear.
+            assert_eq!(msg[0], 0x48, "{cause:?}");
+            assert_eq!(&msg[4..8], &[0x01, 0x02, 0x03, 0x04]);
+            assert_eq!(
+                &msg[12..],
+                &[0x02, 0x00, 0x02, 0x00, octet, 0x00],
+                "{cause:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_gtp2_cause_from_u8() {
-        assert_eq!(Gtp2Cause::from(16), Gtp2Cause::RequestAccepted);
-        assert_eq!(Gtp2Cause::from(64), Gtp2Cause::ContextNotFound);
-        assert_eq!(Gtp2Cause::from(69), Gtp2Cause::MandatoryIeMissing);
-        assert_eq!(Gtp2Cause::from(255), Gtp2Cause::UndefinedValue);
+        assert_eq!(Gtp2Cause::from_wire(16), Gtp2Cause::RequestAccepted);
+        assert_eq!(Gtp2Cause::from_wire(64), Gtp2Cause::ContextNotFound);
+        // #1037, TS 29.274 Table 8.4-1: 69 is Mandatory IE incorrect, 70 missing.
+        assert_eq!(Gtp2Cause::from_wire(69), Gtp2Cause::MandatoryIeIncorrect);
+        assert_eq!(Gtp2Cause::from_wire(70), Gtp2Cause::MandatoryIeMissing);
+        assert_eq!(Gtp2Cause::from_wire(255), Gtp2Cause::UndefinedValue);
     }
 
     #[test]
