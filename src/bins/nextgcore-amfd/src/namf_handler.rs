@@ -319,6 +319,27 @@ pub enum NamfHandlerError {
     InvalidState,
     /// Internal error
     InternalError(String),
+    /// #749: the UE is CM-IDLE and already being paged for an earlier transfer.
+    /// TS 23.502 §4.2.3.3 step 3b: the AMF rejects a transfer of the same or a
+    /// lower priority while it waits for the paging response; TS 29.518
+    /// §5.2.2.3.1 maps that to 409 `HIGHER_PRIORITY_REQUEST_ONGOING`, with a
+    /// `retryAfter` the consumer waits out ([`PAGING_ONGOING_RETRY_AFTER_S`]).
+    PagingOngoing,
+}
+
+/// The `retryAfter` (seconds) of a 409 `HIGHER_PRIORITY_REQUEST_ONGOING` (#749):
+/// about one T3513 paging attempt, after which the UE has answered (and the
+/// retried transfer goes to a CM-CONNECTED UE) or is still being paged.
+pub const PAGING_ONGOING_RETRY_AFTER_S: u64 = 2;
+
+/// Whether a paging procedure is ongoing for `amf_ue_ngap_id` (#749). The AMF
+/// keeps no ARP priority per paging, so every transfer counts as the same
+/// priority as the one being paged for.
+pub(crate) fn paging_ongoing(amf_ue_ngap_id: u64) -> bool {
+    amf_self()
+        .read()
+        .ok()
+        .is_some_and(|c| c.paging_find(amf_ue_ngap_id).is_some())
 }
 
 /// Namf handler result
@@ -364,6 +385,9 @@ pub fn handle_n1_n2_message_transfer(
                 // (TS 23.501 §5.3.3.2.2), NOT the security flag, which a registered
                 // idle UE still has.
                 if cm_idle {
+                    if paging_ongoing(amf_ue.id) {
+                        return Err(NamfHandlerError::PagingOngoing);
+                    }
                     cause = N1N2MessageTransferCause::AttemptingToReachUe;
                     initiate_paging_for_idle_ue(
                         amf_ue,
@@ -390,6 +414,9 @@ pub fn handle_n1_n2_message_transfer(
                     ));
                 }
                 if cm_idle {
+                    if paging_ongoing(amf_ue.id) {
+                        return Err(NamfHandlerError::PagingOngoing);
+                    }
                     cause = N1N2MessageTransferCause::AttemptingToReachUe;
                     initiate_paging_for_idle_ue(
                         amf_ue,
@@ -408,6 +435,9 @@ pub fn handle_n1_n2_message_transfer(
                     if req_data.skip_ind {
                         cause = N1N2MessageTransferCause::N1MsgNotTransferred;
                     } else {
+                        if paging_ongoing(amf_ue.id) {
+                            return Err(NamfHandlerError::PagingOngoing);
+                        }
                         cause = N1N2MessageTransferCause::AttemptingToReachUe;
                         initiate_paging_for_idle_ue(
                             amf_ue,
@@ -444,6 +474,9 @@ pub fn handle_n1_n2_message_transfer(
         if req_data.skip_ind {
             cause = N1N2MessageTransferCause::N1MsgNotTransferred;
         } else {
+            if paging_ongoing(amf_ue.id) {
+                return Err(NamfHandlerError::PagingOngoing);
+            }
             cause = N1N2MessageTransferCause::AttemptingToReachUe;
             initiate_paging_for_idle_ue(
                 amf_ue,
@@ -664,7 +697,7 @@ pub fn handle_event_subscribe(
     log::info!(
         "Event subscription request: event={:?}, callback={}",
         subscription.event_type,
-        callback_uri
+        nextgcore_sbi::log_redact::redact_last_segment(callback_uri)
     );
 
     // Validate subscription
@@ -881,6 +914,26 @@ pub(crate) fn initiate_paging_for_idle_ue(
     );
 }
 
+/// Page a CM-IDLE UE for an LMF's positioning transfer (#1087, TS 23.273: LPP to
+/// the UE, UE-associated NRPPa to its gNB). The page carries no N1 and no SM N2:
+/// the NGAP task holds the positioning payloads and delivers them once the UE is
+/// connected. Returns the transfer's `Location`, as [`page_idle_ue_for_n1`] does.
+pub fn page_idle_ue_for_positioning(amf_ue: &AmfUe, failure_notify_uri: Option<&str>) -> String {
+    initiate_paging_for_idle_ue(
+        amf_ue,
+        None,
+        None,
+        None,
+        PagedN2::Setup,
+        None,
+        failure_notify_uri,
+    );
+    format!(
+        "/namf-comm/v1/ue-contexts/{}/n1-n2-messages",
+        amf_ue.supi.as_deref().unwrap_or("unknown")
+    )
+}
+
 /// Page a CM-IDLE UE for an N1 message that belongs to no PDU session -- a
 /// UE-policy (UPDP) delivery from the PCF (#540, TS 23.502 §4.2.3.3 step 3a) --
 /// and keep it for delivery, in `container_type`, once the Service Request
@@ -981,6 +1034,43 @@ mod tests {
             result.unwrap_err(),
             NamfHandlerError::MissingField(_)
         ));
+    }
+
+    /// #749, TS 23.502 §4.2.3.3 step 3b: an idle UE with two PDU sessions gets
+    /// downlink data on both. The first N1N2MessageTransfer pages it. The second
+    /// one, while that paging is ongoing, is refused (`PagingOngoing`, i.e. 409
+    /// HIGHER_PRIORITY_REQUEST_ONGOING) instead of overwriting the paging
+    /// context, so the first session's re-activation is not lost. Before #749 the
+    /// second silently replaced the first.
+    #[test]
+    fn a_second_transfer_while_paging_is_refused_and_keeps_the_first() {
+        let mut ue = create_test_ue();
+        ue.id = 7_749_001;
+        let setup = |psi: u8| N1N2MessageTransferReqData {
+            pdu_session_id: Some(psi),
+            n2_info: Some(N2InfoContainer {
+                ngap_ie_type: NgapIeType::PduResSetupReq,
+                ngap_data: Some(vec![0x00, psi]),
+            }),
+            ..Default::default()
+        };
+        let mut psi2 = create_test_sess();
+        psi2.psi = 2;
+        let first = handle_n1_n2_message_transfer(&ue, &mut psi2, None, true, &setup(2))
+            .expect("the first pages");
+        assert_eq!(first.cause, N1N2MessageTransferCause::AttemptingToReachUe);
+
+        let mut psi1 = create_test_sess();
+        let second = handle_n1_n2_message_transfer(&ue, &mut psi1, None, true, &setup(1));
+        assert_eq!(second.unwrap_err(), NamfHandlerError::PagingOngoing);
+
+        let paged = amf_self()
+            .read()
+            .unwrap()
+            .paging_remove(ue.id)
+            .expect("paging for the first");
+        assert_eq!(paged.pdu_session_id, Some(2), "the first transfer is kept");
+        assert_eq!(paged.pending_n2, Some(vec![0x00, 2]));
     }
 
     /// #518 / TS 23.502 §4.2.3.3 step 3a: an N1-only transfer to a CM-IDLE UE pages

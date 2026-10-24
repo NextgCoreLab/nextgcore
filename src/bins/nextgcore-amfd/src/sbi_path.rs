@@ -588,7 +588,8 @@ pub async fn amf_nrf_register(sbi_addr: &str, sbi_port: u16) -> Result<String, S
 /// discovery cache, which is exactly the set this AMF subscribes to at the NRF
 /// for NF status changes (#668, TS 29.510 §5.2.2.5). The NRF itself is cached
 /// too but is not a subscription target: it is not discovered through itself.
-pub const CACHED_PEER_NF_TYPES: [&str; 7] = ["AUSF", "UDM", "SMF", "PCF", "NSSF", "NSACF", "UCMF"];
+pub const CACHED_PEER_NF_TYPES: [&str; 8] =
+    ["AUSF", "UDM", "SMF", "PCF", "NSSF", "NSACF", "UCMF", "LMF"];
 
 /// The cache type of a discovered profile's `nfType`, or `None` for a type
 /// [`amf_nrf_discover`] drops.
@@ -607,6 +608,14 @@ pub(crate) fn cached_peer_nf_type(nf_type_str: &str) -> Option<nextgcore_sbi::ty
         // RACS (#570): the UCMF, so `racs::resolve_ucmf_endpoint` can use
         // what discovery found instead of every profile being dropped here.
         "UCMF" => nextgcore_sbi::types::NfType::Ucmf,
+        // LCS (#938): the LMF. `resolve_lmf_endpoint` asks discovery for
+        // `target-nf-type=LMF` and then reads the cache, so without this arm
+        // every discovered LMF profile was dropped here, the subsequent
+        // `replace_nf_instances(LMF, [])` emptied the type, and AMF→LMF
+        // positioning always fell through to the configured `LMF_SBI_ADDR` —
+        // or failed outright where that is unset, in a deployment whose NRF
+        // does list an LMF (TS 23.273 §5.1, TS 29.510 §6.1.6.2.2 `lmfInfo`).
+        "LMF" => nextgcore_sbi::types::NfType::Lmf,
         _ => return None,
     })
 }
@@ -2417,7 +2426,11 @@ fn namf_loc_lmf_enabled_value(value: Option<&str>) -> bool {
 /// `LMF_SBI_ADDR` is the addressless fallback a bring-up with no NRF needs. It is
 /// consulted AFTER discovery and logged when used, so it cannot silently stand in for
 /// discovery in a deployment that has an NRF.
-async fn resolve_lmf_endpoint() -> Option<(String, u16)> {
+///
+/// `pub` so `tests/lmf_discovery.rs` can drive the real resolution against a
+/// stand-in NRF (#938); nothing outside this crate calls it in production.
+#[doc(hidden)]
+pub async fn resolve_lmf_endpoint() -> Option<(String, u16)> {
     let sbi_ctx = global_context();
     let service = nextgcore_sbi::types::SbiServiceType::NlmfLoc;
     let endpoint_from_cache = |instances: Vec<NfInstance>| {
@@ -2672,7 +2685,7 @@ pub async fn notify_amf_status_change(status_change: &str) {
         let Some((host, port, path)) = split_absolute_uri(&sub.amf_status_uri) else {
             log::warn!(
                 "AMFStatusChangeNotify: cannot address amfStatusUri {}",
-                sub.amf_status_uri
+                nextgcore_sbi::log_redact::redact_last_segment(&sub.amf_status_uri)
             );
             continue;
         };
@@ -2688,20 +2701,20 @@ pub async fn notify_amf_status_change(status_change: &str) {
         {
             Ok(Ok(resp)) if resp.is_success() => log::info!(
                 "AMFStatusChangeNotify({status_change}) delivered to {}",
-                sub.amf_status_uri
+                nextgcore_sbi::log_redact::redact_last_segment(&sub.amf_status_uri)
             ),
             Ok(Ok(resp)) => log::warn!(
                 "AMFStatusChangeNotify to {} returned {}",
-                sub.amf_status_uri,
+                nextgcore_sbi::log_redact::redact_last_segment(&sub.amf_status_uri),
                 resp.status
             ),
             Ok(Err(e)) => log::warn!(
                 "AMFStatusChangeNotify to {} failed: {e}",
-                sub.amf_status_uri
+                nextgcore_sbi::log_redact::redact_last_segment(&sub.amf_status_uri)
             ),
             Err(_) => log::warn!(
                 "AMFStatusChangeNotify to {} timed out; the shutdown path will not wait longer",
-                sub.amf_status_uri
+                nextgcore_sbi::log_redact::redact_last_segment(&sub.amf_status_uri)
             ),
         }
     }

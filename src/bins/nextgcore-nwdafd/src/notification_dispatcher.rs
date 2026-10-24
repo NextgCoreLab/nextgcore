@@ -569,7 +569,7 @@ pub async fn dispatch_notifications(ctx: Arc<RwLock<NwdafContext>>) {
                 } else {
                     log::warn!(
                         "dispatch: invalid notificationUri '{}' for terminating sub={}",
-                        sub.notification_uri,
+                        nextgcore_sbi::log_redact::redact_last_segment(&sub.notification_uri),
                         sub.subscription_id
                     );
                 }
@@ -614,7 +614,7 @@ pub async fn dispatch_notifications(ctx: Arc<RwLock<NwdafContext>>) {
             None => {
                 log::warn!(
                     "dispatch: invalid notificationUri '{}' for sub={}",
-                    sub.notification_uri,
+                    nextgcore_sbi::log_redact::redact_last_segment(&sub.notification_uri),
                     sub.subscription_id
                 );
                 continue;
@@ -627,7 +627,7 @@ pub async fn dispatch_notifications(ctx: Arc<RwLock<NwdafContext>>) {
                 log::debug!(
                     "dispatch: notification delivered sub={} uri={} status={}",
                     sub.subscription_id,
-                    sub.notification_uri,
+                    nextgcore_sbi::log_redact::redact_last_segment(&sub.notification_uri),
                     resp.status
                 );
                 // Update last_notification_time so periodicity is enforced
@@ -646,7 +646,7 @@ pub async fn dispatch_notifications(ctx: Arc<RwLock<NwdafContext>>) {
                 log::warn!(
                     "dispatch: notify POST failed sub={} uri={}: {e}",
                     sub.subscription_id,
-                    sub.notification_uri
+                    nextgcore_sbi::log_redact::redact_last_segment(&sub.notification_uri)
                 );
             }
         }
@@ -699,7 +699,7 @@ async fn dispatch_ml_prov_notifications(ctx: Arc<RwLock<NwdafContext>>) {
             None => {
                 log::warn!(
                     "dispatch: invalid ML-prov notifUri '{}' for sub={}",
-                    sub.notif_uri,
+                    nextgcore_sbi::log_redact::redact_last_segment(&sub.notif_uri),
                     sub.subscription_id
                 );
                 continue;
@@ -721,7 +721,7 @@ async fn dispatch_ml_prov_notifications(ctx: Arc<RwLock<NwdafContext>>) {
             Err(e) => log::warn!(
                 "dispatch: ML-prov notify POST failed sub={} uri={}: {e}",
                 sub.subscription_id,
-                sub.notif_uri
+                nextgcore_sbi::log_redact::redact_last_segment(&sub.notif_uri)
             ),
         }
     }

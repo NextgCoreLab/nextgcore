@@ -2726,4 +2726,63 @@ mod tests {
         std::env::remove_var("SGWC_SGWU_ADDR");
         let _ = stop.send(true);
     }
+
+    /// #1065 review: the V6 case of Figure 8.2.70-1 in spec bytes. The flags
+    /// octet 0x01 (V6, bit 1) is followed by the 16 IPv6 octets. The SGW-C
+    /// records that IPv6 peer as failed and releases the S1-U of the UE whose
+    /// downlink goes to it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_report_in_spec_bytes_releases_the_s1u_toward_its_ipv6_peer() {
+        let guard = process_state_test_guard().await;
+        crate::up_path::clear_for_test();
+        let sgwu = assoc_sgwu(Vec::new()).await;
+        let (node, stop) = associated_node(&guard, &sgwu).await;
+        let enb6: [u8; 16] = [
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10, 0x65,
+        ];
+        let ctx = sgwc_self();
+        let (ue, bearer) = ue_toward(b"001010994000081", [10, 0, 0, 81]);
+        let mut dl = ctx.dl_tunnel_in_bearer(bearer).unwrap();
+        dl.remote_ip.ipv4 = None;
+        dl.remote_ip.ipv6 = Some(std::net::Ipv6Addr::from(enb6));
+        ctx.tunnel_update(&dl);
+        let mut peer = vec![0x00, 0x67, 0x00, 0x11, 0x01]; // Remote GTP-U Peer (103): V6
+        peer.extend_from_slice(&enb6);
+        let mut body: Vec<u8> = vec![
+            0x00, 0x3c, 0x00, 0x05, 0x00, 127, 0, 0, 9, // Node ID (60): IPv4 127.0.0.9
+            0x00, 0x65, 0x00, 0x01, 0x01, // Node Report Type (101): UPFR
+            0x00, 0x66, // User Plane Path Failure Report (102), grouped
+        ];
+        body.extend_from_slice(&(peer.len() as u16).to_be_bytes());
+        body.extend_from_slice(&peer);
+        let mut pdu = vec![0x20, 0x0c];
+        pdu.extend_from_slice(&((body.len() + 4) as u16).to_be_bytes());
+        pdu.extend_from_slice(&[0x00, 0x10, 0x65, 0x00]);
+        pdu.extend_from_slice(&body);
+        sgwu.sock.send_to(&pdu, node.local_addr()).await.unwrap();
+
+        let responses = sgwu.node_report_responses.clone();
+        eventually("the Node Report Response", || {
+            !responses.lock().unwrap().is_empty()
+        })
+        .await;
+        assert_eq!(
+            response_cause(&responses.lock().unwrap()[0].1).0,
+            PfcpCause::RequestAccepted
+        );
+        eventually("the IPv6 peer recorded failed", || {
+            crate::up_path::is_failed(std::net::IpAddr::from(enb6))
+        })
+        .await;
+        let mods = sgwu.modifications.clone();
+        eventually("the S1-U release", || !mods.lock().unwrap().is_empty()).await;
+        assert_eq!(ctx.dl_tunnel_in_bearer(bearer).unwrap().remote_teid, 0);
+        assert!(
+            !crate::up_path::is_failed("10.0.0.81".parse().unwrap()),
+            "not read as an IPv4 peer"
+        );
+        ctx.ue_remove(ue);
+        std::env::remove_var("SGWC_SGWU_ADDR");
+        let _ = stop.send(true);
+    }
 }

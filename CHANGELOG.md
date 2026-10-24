@@ -12,7 +12,14 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Changed
+- amfd refuses to start on a `plmn_support` entry with no usable S-NSSAI, meaning none
+  configured or every one `sst: 0`. It used to start an AMF that failed every NG Setup, because
+  the NG Setup Response's Slice Support List must hold at least one slice (TS 38.413 §9.3.1.17).
+  The error names the file and the PLMN as MCC/MNC. This is the one exception to lenient config
+  loading (#1060, #1070).
+- amfd: a `guami`, `tai`, `plmn_support`, `integrity_order` or `ciphering_order` list in the
+  config replaces the AMF's list instead of being appended to it (#1070).
 
 ## [0.2.0] — Unreleased (draft for operator review)
 
@@ -118,6 +125,8 @@ before the tag. The validation line is filled from the release run, not carried 
   event fire points (#398, #402, #407, #410), UDM dereg-notify handling (#605, #626), AM policy
   termination on every deregistration (#640), one UE id space (#644), several lock-order and
   deadlock fixes (#604, #638, #646, #647).
+- amfd **refuses to start** on a `plmn_support` entry with no usable S-NSSAI (none, or only
+  `sst: 0`; TS 38.413 §9.3.1.17). Check configs before upgrading (#1060, #1070).
 - smfd: UE-initiated 5GSM procedures (#224), SM context registration/404s/N2 handover/DDN paging
   (#283), UDM interaction and event exposure (#292, #298), durable PFCP/binding/IP-pool store
   (#279), URR quotas over N4 (#376), dual connectivity and Notify-released sessions (#633), UPF
@@ -145,6 +154,16 @@ before the tag. The validation line is filled from the release run, not carried 
   SQN stored as BSON Int64 (#137).
 
 ### Deployment
+- **Upgrade together (PFCP wire format):** two IE encodings are now spec-correct, and an
+  upgraded and a non-upgraded peer disagree on them until both sides are upgraded:
+  - Apply Action octets 5 and 6 (TS 29.244 §8.2.26): smfd and upfd (#1008, #1019);
+  - the Remote GTP-U Peer V4/V6 flags (§8.2.70, Figure 8.2.70-1: bit 1 V6, bit 2 V4) in
+    the shared `nextgcore-pfcp` codec: sgwud with sgwcd, and upfd with smfd, for the
+    PFCP Node Report (#994, #1028).
+  A rolling upgrade must move each CP/UP pair at the same time.
+- smfd answers PFCP Node Reports and acts on user plane path failure and recovery; a
+  path still down after `SMF_UP_PATH_FAILURE_HOLD_SECS` (default 120 s) releases its
+  sessions with #39 (#994, #1028).
 - **Operational change:** smfd, sgwcd, upfd, sgwud and mbsmfd refuse to start when the local
   clock reads before 2020-01-01, because their PFCP Recovery Time Stamp, now NTP-era seconds per
   TS 29.244 §8.2.65 (#995, #1004), would be wrong. On RTC-less hosts, start them after

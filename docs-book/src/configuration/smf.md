@@ -111,7 +111,7 @@ Every refused datagram increments `smf_pfcp_unauthorized_messages_total`. This i
 
 **One SMF instance at a time.** Every SMF pod signals the same PFCP Node ID, and a UPF keeps one association per Node ID (TS 29.244 §6.2.6.2.2). A second instance replaces the first one's association and deletes its sessions. The k8s and Helm Deployments therefore use `strategy: Recreate`, and the chart refuses `smf.replicas > 1`. `Recreate` covers rollouts only. `kubectl delete pod` and a node drain create the replacement while the old pod is still terminating, so the two overlap for the termination grace period. Without durable state that is harmless: the old pod is releasing, and its UEs get #39. With durable state on a volume, both pods would open the same state file. Run a durable SMF as a StatefulSet, which never starts a replacement before the old pod has terminated.
 
-**Termination grace period.** A graceful shutdown first tells every UE (#39) and every SGW (Delete Bearer, retransmitted for up to 12 s), then releases each UPF association (up to T1 x N1 when a UPF is gone). The shipped SMF and PGW-C manifests set `terminationGracePeriodSeconds: 45`. A shorter period cuts the retransmissions off.
+**Termination grace period.** A graceful shutdown runs against ONE deadline, taken when the signal arrives: 43 s by default. `SMF_SHUTDOWN_BUDGET_SECS` overrides it, clamped to 30-3600 s with a warning; the shipped manifests set it to the grace period less 2 s, and the Helm chart derives it from `smf.terminationGracePeriodSeconds`. NFDeregister gets at most 3 s. Every SGW is told first (Delete Bearer, which does not wait for an answer). Then each UPF association is released: the #39 releases to the UEs get whatever is left after reserving 12 s for the Association Release (T1 x (N1+1)) and 12 s for the S5/S8 retransmissions. The UEs not reached by then are counted in the log, and the UPF deletes their sessions on the release. On the durable path (association kept), the EPC PFCP deletions are bounded by the same deadline. The shipped SMF and PGW-C manifests set `terminationGracePeriodSeconds: 45`, and docker compose sets `stop_grace_period: 45s`.
 
 **Durable state is a one-way upgrade.** The snapshot format is versioned. This release writes version 2 (5G CP SEIDs `1<<48 | ref`; a version-1 session keeps its legacy `ref | 0x1000` SEID). An older binary refuses a newer snapshot rather than misread it, so rolling smfd back across this change with a state file fails to start. Remove the file (the sessions are then released) or roll forward.
 | `SMF_SBI_ADVERTISE_URI` | derived from SBI server address/port | Externally reachable base URI used in PCF callback (`notificationUri`) URIs. |
@@ -170,7 +170,7 @@ in. An unchanged stamp means they are genuinely still valid. A UPF named by
 hostname has its stamp kept under the configured `host:port`, lower-cased and
 without a trailing dot, so it is found again after the UPF moves (#722). A stamp
 a pre-#722 snapshot kept under the UPF's address is read once, moved to the name,
-and the address entry removed. A UPF hostname must name exactly one UPF.
+and the address entry removed. A UPF hostname must name exactly one UPF. The snapshot also records which UPF each session was established on, by the same key, so in a UPF pool a restored session keeps signalling the UPF that holds it, and that UPF can still report on it (#1031). A session whose UPF is no longer configured goes to the default UPF, and a warning at boot says how many.
 
 **Limits worth knowing:**
 
@@ -197,7 +197,9 @@ The SMF learns which sessions use which peer from its own accepted Session Estab
 - **Recovery:** the failed state is cleared, and the pending hold does nothing. Sessions stay deactivated until their next Service Request or paging.
 - **A peer GTP-U restart** (Peer UP Restart Report) and a session-level **Error Indication Report** deactivate the user plane in the same way, with no hold.
 
-A repeated failure report for a peer that is already failed starts no second hold. A graceful shutdown stops the pending holds; the next process learns the path state from the UPF again.
+A repeated failure report for a peer that is already failed starts no second hold. The failed paths are durable (`failedUpPaths` in the snapshot). A graceful shutdown stops the pending holds first, and the next process re-arms each one once its UPF is associated again, for what is left of it and at least 10 s. A path whose UPF is no longer configured is forgotten.
+
+A recovery the UPF reported while the SMF was down is lost, because the UPF stops retransmitting after N1. Such a path still counts as failed, so its sessions are released with #39 when the hold runs out, and the UEs re-establish them. That is the safe direction.
 
 Metrics:
 - `smf_up_path_failures_total` and `smf_up_path_recoveries_total`;

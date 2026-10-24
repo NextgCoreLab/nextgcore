@@ -573,11 +573,15 @@ async fn flush_state(ucmf: &Arc<RwLock<Ucmf>>) {
 
 /// Deliver a notification to every subscriber, without blocking the caller.
 fn dispatch(note: Notification) {
-    for uri in note.uris {
+    for notification_uri in note.uris {
         let body = note.body.clone();
         tokio::spawn(async move {
-            let Some((host, port, path)) = split_uri(&uri) else {
-                log::warn!("Invalid ucmfNotificationUri '{uri}'");
+            let Some((host, port, path)) = split_uri(&notification_uri) else {
+                log::warn!(
+                    "Invalid ucmfNotificationUri '{notification_uri}'",
+                    notification_uri =
+                        nextgcore_sbi::log_redact::redact_last_segment(&notification_uri)
+                );
                 return;
             };
             let mut client = SbiClient::new(
@@ -590,10 +594,23 @@ fn dispatch(note: Notification) {
             }
             match client.post_json(&path, &body).await {
                 Ok(r) if r.status == 204 || r.is_success() => {
-                    log::debug!("UCMF notification delivered to {uri}")
+                    log::debug!(
+                        "UCMF notification delivered to {notification_uri}",
+                        notification_uri =
+                            nextgcore_sbi::log_redact::redact_last_segment(&notification_uri)
+                    )
                 }
-                Ok(r) => log::warn!("UCMF notification to {uri} returned {}", r.status),
-                Err(e) => log::warn!("UCMF notification to {uri} failed: {e}"),
+                Ok(r) => log::warn!(
+                    "UCMF notification to {notification_uri} returned {}",
+                    r.status,
+                    notification_uri =
+                        nextgcore_sbi::log_redact::redact_last_segment(&notification_uri)
+                ),
+                Err(e) => log::warn!(
+                    "UCMF notification to {notification_uri} failed: {e}",
+                    notification_uri =
+                        nextgcore_sbi::log_redact::redact_last_segment(&notification_uri)
+                ),
             }
         });
     }

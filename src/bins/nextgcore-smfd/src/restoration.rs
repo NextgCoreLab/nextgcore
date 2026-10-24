@@ -179,7 +179,18 @@ pub struct SessionScope {
 
 /// [`notify_sessions_unrecoverable`] for the sessions in `scope` only (#720).
 pub async fn notify_sessions_unrecoverable_in(reason: &str, scope: Option<&SessionScope>) -> usize {
-    let (total, releases) = begin_unrecoverable_release(reason, scope);
+    notify_sessions_unrecoverable_until(reason, scope, None).await
+}
+
+/// [`notify_sessions_unrecoverable_in`], abandoning whatever has not been sent by
+/// `deadline` (#941 review M1): a shutdown must fit its grace period. The abandoned
+/// count is logged.
+pub async fn notify_sessions_unrecoverable_until(
+    reason: &str,
+    scope: Option<&SessionScope>,
+    deadline: Option<tokio::time::Instant>,
+) -> usize {
+    let (total, releases) = begin_unrecoverable_release(reason, scope, deadline);
     let _ = releases.await;
     total
 }
@@ -193,9 +204,13 @@ pub async fn notify_sessions_unrecoverable_in(reason: &str, scope: Option<&Sessi
 /// runs in the returned task. A caller on the N4 receive task drops the handle:
 /// awaiting it there stalled every PFCP message from every UPF, and the restarted
 /// UPF's own Heartbeat Response, for the length of the whole fan-out.
+///
+/// #941 review M1: with a `deadline`, the fan-out abandons, and logs, what it has
+/// not sent by then.
 pub fn begin_unrecoverable_release(
     reason: &str,
     scope: Option<&SessionScope>,
+    deadline: Option<tokio::time::Instant>,
 ) -> (usize, tokio::task::JoinHandle<()>) {
     let (notifiable, silent) = notifiable_sessions(scope);
     if notifiable.is_empty() && silent == 0 {
@@ -218,18 +233,43 @@ pub fn begin_unrecoverable_release(
     let fan_out = tokio::spawn(async move {
         let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(RELEASE_FANOUT));
         let mut releases = tokio::task::JoinSet::new();
+        let until = |d: Option<tokio::time::Instant>| {
+            d.unwrap_or_else(|| {
+                tokio::time::Instant::now() + std::time::Duration::from_secs(86_400)
+            })
+        };
+        let mut done = 0usize;
+        let mut out_of_time = false;
         for (sm_context_ref, uri) in notifiable {
-            let Ok(permit) = permits.clone().acquire_owned().await else {
-                break;
-            };
+            let permit =
+                match tokio::time::timeout_at(until(deadline), permits.clone().acquire_owned())
+                    .await
+                {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(_)) => break,
+                    Err(_) => {
+                        out_of_time = true;
+                        break;
+                    }
+                };
             let reason = reason.clone();
             releases.spawn(async move {
                 let _permit = permit;
                 release_one_unrecoverable(&sm_context_ref, &uri, &reason).await;
             });
         }
-        let mut done = 0usize;
-        while releases.join_next().await.is_some() {
+        loop {
+            if out_of_time {
+                break;
+            }
+            match tokio::time::timeout_at(until(deadline), releases.join_next()).await {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => {
+                    out_of_time = true;
+                    break;
+                }
+            }
             done += 1;
             if done.is_multiple_of(100) || done == total {
                 log::info!(
@@ -238,6 +278,14 @@ pub fn begin_unrecoverable_release(
                     total - done
                 );
             }
+        }
+        if out_of_time {
+            releases.abort_all();
+            log::warn!(
+                "PFCP restoration ({reason}): out of time with {done}/{total} PDU session \
+                 release(s) sent; {} UE(s) abandoned without #39",
+                total - done
+            );
         }
     });
     (total, fan_out)
@@ -248,7 +296,7 @@ pub fn begin_unrecoverable_release(
 const RELEASE_FANOUT: usize = 16;
 
 /// Release one PDU session that can no longer be honoured.
-async fn release_one_unrecoverable(sm_context_ref: &str, uri: &str, reason: &str) {
+async fn release_one_unrecoverable(sm_context_ref: &str, status_uri: &str, reason: &str) {
     // #667: release the session through the UE, asking it to come back (#39),
     // so the user plane is rebuilt on the restarted UPF. A binding without the
     // UE's identity cannot be addressed that way, and gets the bare RELEASED
@@ -257,9 +305,10 @@ async fn release_one_unrecoverable(sm_context_ref: &str, uri: &str, reason: &str
         Some((supi, psi)) => {
             log::warn!(
                 "releasing sm_context_ref={sm_context_ref} after {reason}: PDU Session \
-                 Release Command #39 (reactivation requested) to {supi} PSI {psi} via {uri}"
+                 Release Command #39 (reactivation requested) to {supi} PSI {psi} via {status_uri}",
+                status_uri = nextgcore_sbi::log_redact::redact_last_segment(status_uri)
             );
-            crate::release_for_reactivation(sm_context_ref, uri, &supi, psi).await;
+            crate::release_for_reactivation(sm_context_ref, status_uri, &supi, psi).await;
         }
         None => {
             // #854: no UE identity to release through, so the release is finished here:
@@ -268,11 +317,12 @@ async fn release_one_unrecoverable(sm_context_ref: &str, uri: &str, reason: &str
             // notification went, and the binding and its SM policy stayed for good.
             log::warn!(
                 "releasing sm_context_ref={sm_context_ref} after {reason} locally (no SUPI/PSI \
-                 to release it through); notifying {uri}"
+                 to release it through); notifying {status_uri}",
+                status_uri = nextgcore_sbi::log_redact::redact_last_segment(status_uri)
             );
             crate::complete_sm_context_release(sm_context_ref);
             crate::send_sm_context_status_notification(
-                Some(uri),
+                Some(status_uri),
                 RESOURCE_STATUS_RELEASED,
                 Some(reason),
             )
@@ -507,15 +557,15 @@ pub async fn notify_unrestorable_at_boot() -> (usize, usize) {
             ctx.persist();
         }
         match entry.status_uri.as_deref() {
-            Some(uri) => {
+            Some(status_uri) => {
                 log::warn!(
-                    "boot restoration: sm_context_ref={} cannot be served ({}); telling {uri} it \
+                    "boot restoration: sm_context_ref={} cannot be served ({}); telling {status_uri} it \
                      is released",
                     entry.sm_context_ref,
-                    entry.reason
+                    entry.reason, status_uri = nextgcore_sbi::log_redact::redact_last_segment(status_uri)
                 );
                 crate::send_sm_context_status_notification(
-                    Some(uri),
+                    Some(status_uri),
                     RESOURCE_STATUS_RELEASED,
                     Some(&entry.reason),
                 )

@@ -7391,18 +7391,21 @@ mod positioning_chain_strict_peer {
 
     /// Seed a CM-IDLE UE (SUPI known, no RAN association) so the relay
     /// fail-closes with 504 UE_NOT_REACHABLE.
-    fn seed_amf_idle_ue(supi: &str) {
+    fn seed_amf_idle_ue(supi: &str) -> u64 {
         nextgcore_amfd::test_support::init_context();
         let ctx = amf_self();
         let g = ctx.read().expect("amf ctx");
         let _ = g.positioning_dl_drain();
         let mut ue = g.amf_ue_add(NEXTGCORE_INVALID_POOL_ID).expect("amf_ue_add");
         // #341: see `seed_amf_connected_ue`. `ran_ue_id` stays invalid, which is
-        // what makes this UE CM-IDLE and the relay fail closed with 504.
+        // what makes this UE CM-IDLE. Published on the association its last NG
+        // connection was on, as a released UE's record is: that is what makes it
+        // pageable (#1087; a record with no association is not).
         ue.supi = Some(supi.to_string());
         ue.ran_ue_id = NEXTGCORE_INVALID_POOL_ID;
-        g.amf_ue_publish(&ue, 0, 0);
+        g.amf_ue_publish(&ue, 0, 1);
         g.amf_ue_update(&ue);
+        ue.id
     }
 
     /// Prime lmfd's own identity + notify-callback base so `initiate_positioning`
@@ -8748,21 +8751,26 @@ mod positioning_chain_strict_peer {
         assert_eq!(rec.lcs_correlation_id, corr);
     }
 
-    /// Negative (WS-H §H4): a CM-IDLE UE gets 504 UE_NOT_REACHABLE from amfd's
-    /// real handler (TS 29.518 Table 6.1.7.3-1) — not a fake 200.
+    /// WS-H §H4, #1087: a registered CM-IDLE UE is not "not reachable". amfd's real
+    /// handler pages it and answers 202 ATTEMPTING_TO_REACH_UE (TS 29.518
+    /// §5.2.2.3.1), which lmfd takes as an initiated transfer. It is not a fake 200,
+    /// and not the 504 a UE that cannot be paged gets.
     #[tokio::test]
-    async fn test_h4_lmfd_transfer_idle_ue_504_ue_not_reachable() {
+    async fn test_h4_lmfd_transfer_idle_ue_is_paged_202() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _serial = chain_lock().lock().await;
         let supi = "imsi-001010000000732";
-        seed_amf_idle_ue(supi);
+        let ue_id = seed_amf_idle_ue(supi);
 
         let lpp = codec_glue::build_lpp_ecid_request(42).expect("LPP encode");
         let req = namf_client::build_n1n2_transfer_request(supi, "corr-idle", "lmf-h4", lpp);
         let resp = nextgcore_amfd::handle_n1_n2_message_transfer_request(supi, &req);
-        assert_eq!(resp.status, 504);
-        // N1N2MessageTransferError envelope: {"error": {ProblemDetails}}.
-        assert_eq!(body_json(&resp)["error"]["cause"], "UE_NOT_REACHABLE");
+        assert_eq!(resp.status, 202);
+        assert_eq!(body_json(&resp)["cause"], "ATTEMPTING_TO_REACH_UE");
+        let g = amf_self();
+        let g = g.read().unwrap();
+        assert!(g.paging_remove(ue_id).is_some(), "the UE is paged");
+        let _ = g.positioning_dl_drain();
     }
 
     /// Negative (WS-H §H4): an unknown ueContextId → 404 CONTEXT_NOT_FOUND from

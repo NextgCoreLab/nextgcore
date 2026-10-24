@@ -419,3 +419,25 @@ fn an_ignore_ie_through_the_handler_sets_up_as_before() {
     assert_eq!(out_plain[0].pdu, out_ignore[0].pdu);
     assert!(ctx.enb_find_by_id(enb2).unwrap().state.s1_setup_success);
 }
+
+/// #858 review, MINOR C: `u32_to_bits` encodes a value that fits its width exactly, and
+/// a wider value -- whose high bits would silently vanish, naming another identity on
+/// the wire -- trips its debug assertion.
+#[test]
+fn u32_to_bits_encodes_a_fitting_value_and_refuses_a_wider_one() {
+    let bits = super::u32_to_bits(0x8_1234, 20);
+    assert_eq!(bits.len(), 20);
+    assert!(bits[0] && !bits[1], "most significant bit first");
+    // #1057 review m1: the refusal is a debug assertion, compiled out of a
+    // release build, so it is only checked where it exists.
+    #[cfg(debug_assertions)]
+    {
+        let wide = std::panic::catch_unwind(|| super::u32_to_bits(0x10_0000, 20));
+        assert!(wide.is_err(), "a 21-bit value is not a 20-bit eNB ID");
+    }
+    assert_eq!(
+        super::u32_to_bits(u32::MAX, 32).len(),
+        32,
+        "a full-width value fits"
+    );
+}

@@ -230,33 +230,44 @@ fn handle_stop_warning_request_with(
     })
 }
 
-/// Handle PWS Restart Indication (TS 36.413 §8.14, TS 23.041 §9.3.x).
+/// Re-send this MME's own copy of the active warnings to a restarted eNB.
 ///
-/// An eNB that restarted has lost its PWS state, so any warning the MME believes
-/// is broadcasting there is not. Every active warning whose area this eNB serves
-/// is re-sent. Returns how many were re-sent.
+/// NOT what TS 23.007 §15A.1.2 specifies, and not called on a PWS RESTART
+/// INDICATION (#1069 review): there the CBC reloads the warnings, for the
+/// restarted cells and with the broadcasts still owed, after the MME propagates
+/// the indication over SBc-AP (#1071). A replay from here would re-broadcast with
+/// the original area and repetition count. Kept for that SBc-AP work, which may
+/// want a local fallback. Returns how many were re-sent.
 ///
-/// `enb_id` is the Global eNB ID from the indication, not a pool id, because
-/// that is what the eNB identifies itself by.
-pub fn handle_pws_restart_indication(mme_ctx: &Arc<MmeContext>, enb_id: u32) -> usize {
-    handle_pws_restart_indication_with(mme_ctx, enb_id, &mut transport_sender)
+/// `(plmn, enb_id)` is the Global eNB ID from the indication (TS 36.413 §9.1.8.6), not
+/// a pool id, because that is what the eNB identifies itself by. The whole Global eNB ID
+/// names the eNB -- its PLMN and its ENB-ID alternative as well as the value (#858
+/// review, MINOR D): a Home eNB or another PLMN's eNB of equal value is a different eNB,
+/// and must not be sent this one's warnings.
+pub fn handle_pws_restart_indication(
+    mme_ctx: &MmeContext,
+    plmn: &crate::context::PlmnId,
+    enb_id: nextgcore_s1ap::EnbId,
+) -> usize {
+    handle_pws_restart_indication_with(mme_ctx, plmn, enb_id, &mut transport_sender)
 }
 
 fn handle_pws_restart_indication_with(
-    mme_ctx: &Arc<MmeContext>,
-    enb_id: u32,
+    mme_ctx: &MmeContext,
+    plmn: &crate::context::PlmnId,
+    enb_id: nextgcore_s1ap::EnbId,
     send: PduSender,
 ) -> usize {
     let active = mme_ctx.pws_active_warnings();
     if active.is_empty() {
-        debug!("[PWS-Restart] eNB {enb_id:08x} restarted; no active warnings to re-send");
+        debug!("[PWS-Restart] eNB {enb_id:?} restarted; no active warnings to re-send");
         return 0;
     }
 
-    let Some(pool_id) = mme_ctx.enb_find_by_enb_id(enb_id) else {
+    let Some(pool_id) = mme_ctx.enb_find_by_global_enb_id(plmn, enb_id) else {
         warn!(
-            "[PWS-Restart] eNB {enb_id:08x} is not registered; cannot re-send \
-             {} active warning(s)",
+            "[PWS-Restart] eNB {enb_id:?} of PLMN {plmn:?} is not S1-connected; cannot \
+             re-send {} active warning(s)",
             active.len()
         );
         return 0;
@@ -276,7 +287,7 @@ fn handle_pws_restart_indication_with(
         match send_write_replace_warning_to_enb(&enb, warning, send) {
             Ok(()) => resent += 1,
             Err(e) => warn!(
-                "[PWS-Restart] failed to re-send warning {:#06x}/{:#06x} to eNB {enb_id:08x}: \
+                "[PWS-Restart] failed to re-send warning {:#06x}/{:#06x} to eNB {enb_id:?}: \
                  {e:?}",
                 warning.message_id, warning.serial_number
             ),
@@ -284,7 +295,7 @@ fn handle_pws_restart_indication_with(
     }
 
     info!(
-        "[PWS-Restart] eNB {enb_id:08x} restarted; re-sent {resent} of {} active warning(s)",
+        "[PWS-Restart] eNB {enb_id:?} restarted; re-sent {resent} of {} active warning(s)",
         active.len()
     );
     resent
@@ -731,11 +742,17 @@ mod tests {
     }
 
     /// Register an eNB in `ctx` with S1 Setup complete, serving TAC 1.
+    /// The PLMN every test eNB here is in.
+    const TEST_PLMN: [u8; 3] = [0x00, 0xF1, 0x10];
+
     fn add_setup_enb(ctx: &MmeContext, addr: &str, enb_id: u32) -> u64 {
         let pool_id = ctx.enb_add(addr.parse().unwrap());
-        ctx.enb_set_enb_id(pool_id, enb_id);
+        ctx.enb_set_s1_connected_for_test(
+            pool_id,
+            &TEST_PLMN,
+            nextgcore_s1ap::EnbId::Macro(enb_id),
+        );
         if let Some(enb) = ctx.enb_pool.write().unwrap().get_mut(&pool_id) {
-            enb.state.s1_setup_success = true;
             enb.supported_ta_list = vec![test_tai(1)];
         }
         pool_id
@@ -818,10 +835,27 @@ mod tests {
         ctx.pws_record_active_warning(&elsewhere);
 
         let mut sent: Vec<(u64, Vec<u8>)> = Vec::new();
-        let resent = handle_pws_restart_indication_with(&ctx, 0x1234, &mut |enb_id, pdu| {
-            sent.push((enb_id, pdu));
-            true
-        });
+        let plmn = crate::s1ap_build::decode_plmn_id(&TEST_PLMN);
+        // #858 review, MINOR D: a Home eNB of the same value is a different eNB and
+        // gets nothing.
+        let home_twin = ctx.enb_add("127.0.0.2:36412".parse().unwrap());
+        ctx.enb_set_s1_connected_for_test(
+            home_twin,
+            &TEST_PLMN,
+            nextgcore_s1ap::EnbId::Home(0x1234),
+        );
+        if let Some(enb) = ctx.enb_pool.write().unwrap().get_mut(&home_twin) {
+            enb.supported_ta_list = vec![test_tai(1)];
+        }
+        let resent = handle_pws_restart_indication_with(
+            &ctx,
+            &plmn,
+            nextgcore_s1ap::EnbId::Macro(0x1234),
+            &mut |enb_id, pdu| {
+                sent.push((enb_id, pdu));
+                true
+            },
+        );
 
         assert_eq!(resent, 1, "only the warning covering this eNB's area");
         assert_eq!(sent.len(), 1);
@@ -850,10 +884,16 @@ mod tests {
         ctx.pws_record_active_warning(&pws);
 
         let mut sent = 0usize;
-        let resent = handle_pws_restart_indication_with(&ctx, 0xDEAD, &mut |_enb_id, _pdu| {
-            sent += 1;
-            true
-        });
+        let plmn = crate::s1ap_build::decode_plmn_id(&TEST_PLMN);
+        let resent = handle_pws_restart_indication_with(
+            &ctx,
+            &plmn,
+            nextgcore_s1ap::EnbId::Macro(0xDEAD),
+            &mut |_enb_id, _pdu| {
+                sent += 1;
+                true
+            },
+        );
 
         assert_eq!(resent, 0);
         assert_eq!(sent, 0);
@@ -939,5 +979,132 @@ mod tests {
         }
         assert_eq!(response.cause, None);
         assert!(ctx.pws_active_warnings().is_empty());
+    }
+
+    /// A PWS RESTART INDICATION (TS 36.413 §9.1.13.5) from the eNB of Global eNB
+    /// ID (`plmn`, macro `enb_id`), built with the generated codec; `with_tais`
+    /// false leaves out the mandatory TAI List for Restart.
+    fn pws_restart_pdu(plmn: [u8; 3], enb_id: u32, with_tais: bool) -> Vec<u8> {
+        use bitvec::prelude::*;
+        use g::PWSRestartIndicationProtocolIEs_EntryValue as V;
+        use nextgcore_s1ap_gen::generated as g;
+        let bits = |v: u32, w: usize| -> BitVec<u8, Msb0> {
+            (0..w).rev().map(|i| (v >> i) & 1 == 1).collect()
+        };
+        let mut ies = vec![
+            g::PWSRestartIndicationProtocolIEs_Entry {
+                id: g::ProtocolIE_ID(182),
+                criticality: g::Criticality(g::Criticality::REJECT),
+                value: V::Id_ECGIListForRestart(g::ECGIListForRestart(vec![g::EUTRAN_CGI {
+                    plm_nidentity: g::TBCD_STRING(plmn.to_vec()),
+                    cell_id: g::CellIdentity(bits((enb_id << 8) | 1, 28)),
+                    ie_extensions: None,
+                }])),
+            },
+            g::PWSRestartIndicationProtocolIEs_Entry {
+                id: g::ProtocolIE_ID(59),
+                criticality: g::Criticality(g::Criticality::REJECT),
+                value: V::Id_Global_ENB_ID(g::Global_ENB_ID {
+                    plm_nidentity: g::TBCD_STRING(plmn.to_vec()),
+                    enb_id: g::ENB_ID::MacroENB_ID(g::ENB_ID_macroENB_ID(bits(enb_id, 20))),
+                    ie_extensions: None,
+                }),
+            },
+        ];
+        if with_tais {
+            ies.push(g::PWSRestartIndicationProtocolIEs_Entry {
+                id: g::ProtocolIE_ID(188),
+                criticality: g::Criticality(g::Criticality::REJECT),
+                value: V::Id_TAIListForRestart(g::TAIListForRestart(vec![g::TAI {
+                    plm_nidentity: g::TBCD_STRING(plmn.to_vec()),
+                    tac: g::TAC(vec![0x00, 0x01]),
+                    ie_extensions: None,
+                }])),
+            });
+        }
+        nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+            procedure_code: g::ProcedureCode(49),
+            criticality: g::Criticality(g::Criticality::IGNORE),
+            value: g::InitiatingMessageValue::Id_PWSRestartIndication(g::PWSRestartIndication {
+                protocol_i_es: g::PWSRestartIndicationProtocolIEs(ies),
+            }),
+        }))
+        .unwrap()
+    }
+
+    /// #1068, TS 36.413 §8.12.3, #1069 review: a PWS RESTART INDICATION reaching
+    /// the S1AP dispatch is accepted and counted (no response: Class 2). The MME
+    /// does not replay its own copy of an active warning: the CBC reloads it
+    /// (TS 23.007 §15A.1.2). One naming another connected eNB's Global eNB ID is
+    /// not counted, and one missing its mandatory TAI List for Restart
+    /// (criticality reject) gets an ERROR INDICATION and is not run.
+    #[test]
+    fn a_pws_restart_indication_through_the_s1ap_dispatch_is_accepted_and_counted() {
+        let _guard = crate::gtp_path::lock_s11();
+        let ctx = crate::context::mme_self();
+        let pool_id = add_setup_enb(ctx, "127.0.0.1:36468", 0x10680);
+        let mut warning = etws_warning();
+        warning.add_tai(test_tai(1));
+        ctx.pws_record_active_warning(&warning);
+        crate::s1ap_path::tap_enb_for_test(pool_id);
+        let _ = crate::s1ap_path::take_tapped_for_test(pool_id);
+        let written = |pool_id: u64| {
+            crate::s1ap_path::take_tapped_for_test(pool_id)
+                .iter()
+                .filter(|p| {
+                    matches!(
+                        crate::s1ap_gen::test_codec::decode_s1ap_pdu(p),
+                        Ok(nextgcore_s1ap::S1apMessage::WriteReplaceWarningRequest(_))
+                    )
+                })
+                .count()
+        };
+
+        let pdu = pws_restart_pdu(TEST_PLMN, 0x10680, true);
+        // TS 36.413 §8.13.3 / ASN.1: initiating message, procedure code 49,
+        // criticality ignore.
+        assert_eq!(&pdu[..3], &[0x00, 0x31, 0x40]);
+        let counted = || {
+            crate::s1ap_handler::PWS_RESTART_INDICATIONS.load(std::sync::atomic::Ordering::Relaxed)
+        };
+        let n0 = counted();
+        let out = crate::s1ap_handler::handle_s1ap_message(ctx, pool_id, &pdu);
+        assert!(out.is_empty(), "Class 2: no response");
+        assert_eq!(counted(), n0 + 1, "accepted and counted");
+        assert_eq!(written(pool_id), 0, "no replay of the MME's own copy");
+        assert!(crate::s1ap_handler::render_metrics()
+            .contains("# TYPE mme_s1ap_pws_restart_indications_total counter"));
+
+        // Another connected eNB's Global eNB ID from this association: not acted
+        // on, so neither eNB is sent anything.
+        let other = add_setup_enb(ctx, "127.0.0.1:36469", 0x10681);
+        crate::s1ap_path::tap_enb_for_test(other);
+        let _ = crate::s1ap_path::take_tapped_for_test(other);
+        let out = crate::s1ap_handler::handle_s1ap_message(
+            ctx,
+            pool_id,
+            &pws_restart_pdu(TEST_PLMN, 0x10681, true),
+        );
+        assert!(out.is_empty());
+        assert_eq!(counted(), n0 + 1, "another eNB's identity is not counted");
+        assert_eq!(written(other), 0, "not the eNB the indication named either");
+        ctx.enb_remove(other);
+
+        // The mandatory TAI List for Restart missing: ERROR INDICATION.
+        let out = crate::s1ap_handler::handle_s1ap_message(
+            ctx,
+            pool_id,
+            &pws_restart_pdu(TEST_PLMN, 0x10680, false),
+        );
+        assert_eq!(out.len(), 1, "an ERROR INDICATION");
+        assert_eq!(counted(), n0 + 1, "not run");
+        assert!(matches!(
+            crate::s1ap_gen::test_codec::decode_s1ap_pdu(&out[0].pdu),
+            Ok(nextgcore_s1ap::S1apMessage::ErrorIndication(_))
+        ));
+        assert_eq!(written(pool_id), 0, "not run");
+
+        ctx.pws_forget_active_warning(warning.message_id, warning.serial_number);
+        ctx.enb_remove(pool_id);
     }
 }
