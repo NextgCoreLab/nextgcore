@@ -685,6 +685,11 @@ pub struct MmeEnb {
     pub enb_id_presence: bool,
     /// eNB ID (received from eNB)
     pub enb_id: u32,
+    /// The length of `enb_id` in bits, i.e. which S1AP ENB-ID alternative the eNB sent
+    /// (TS 36.413 §9.2.1.37): 20 for a macro eNB, 28 for a home eNB; 0 before S1 Setup.
+    /// Two eNBs of different kinds can have equal id values, so a lookup by id that
+    /// ignores this can pick the wrong one (#741).
+    pub enb_id_bits: u8,
     /// PLMN ID (received from eNB)
     pub plmn_id: PlmnId,
     /// State
@@ -2155,7 +2160,47 @@ impl MmeContext {
         self.enb_addr_hash.read().unwrap().get(&key).copied()
     }
 
-    /// Find eNB by eNB ID
+    /// The S1-connected eNB with this Global eNB ID (TS 36.413 §9.2.1.37): same PLMN,
+    /// same ENB-ID alternative (its length in bits) and same value, S1 Setup complete
+    /// (#741, #882). A macro eNB `0x12345` and a home eNB `0x0012345`, or two eNBs of
+    /// different PLMNs, are different eNBs; [`Self::enb_find_by_enb_id`] cannot tell them
+    /// apart.
+    pub fn enb_find_by_global_enb_id(
+        &self,
+        plmn_id: &PlmnId,
+        enb_id: nextgcore_s1ap::EnbId,
+    ) -> Option<u64> {
+        let pool = self.enb_pool.read().ok()?;
+        pool.iter()
+            .find(|(_, enb)| {
+                enb.state.s1_setup_success
+                    && enb.enb_id_presence
+                    && enb.enb_id_bits == enb_id.bit_len()
+                    && enb.enb_id == enb_id.value()
+                    && enb.plmn_id == *plmn_id
+            })
+            .map(|(id, _)| *id)
+    }
+
+    /// Test-only: an eNB as a completed S1 Setup leaves it, with Global eNB ID
+    /// `(plmn, enb_id)`, without driving the S1 Setup handler.
+    #[cfg(test)]
+    pub fn enb_set_s1_connected_for_test(
+        &self,
+        id: u64,
+        plmn_identity: &[u8; 3],
+        enb_id: nextgcore_s1ap::EnbId,
+    ) {
+        self.enb_set_enb_id(id, enb_id.value());
+        if let Some(enb) = self.enb_pool.write().unwrap().get_mut(&id) {
+            enb.enb_id_bits = enb_id.bit_len();
+            enb.plmn_id = crate::s1ap_build::decode_plmn_id(plmn_identity);
+            enb.state.s1_setup_success = true;
+        }
+    }
+
+    /// Find eNB by eNB ID value alone, whatever its ENB-ID alternative or PLMN. Prefer
+    /// [`Self::enb_find_by_global_enb_id`] wherever the full Global eNB ID is known.
     pub fn enb_find_by_enb_id(&self, enb_id: u32) -> Option<u64> {
         self.enb_id_hash.read().unwrap().get(&enb_id).copied()
     }

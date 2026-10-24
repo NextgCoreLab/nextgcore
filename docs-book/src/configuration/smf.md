@@ -107,7 +107,8 @@ The N4/PFCP endpoints are configured by environment variables, **not** by the `s
 | `UDM_SBI_ADDR` / `UDM_SBI_PORT` | unset / `7777` | UDM address for `Nudm_SDM_Get(smf-select-data)`, used only to resolve the **subscribed default DNN** (#204). Tried **after** NRF discovery, so it is the fallback for a deployment with no NRF. With neither available, a `SmContextCreateData` carrying no `dnn` is refused with `SUBSCRIPTION_DATA_NOT_AVAILABLE`. |
 | `NRF_URI` | unset | NRF URI, used when the YAML names none. |
 | `PCF_URI` / `NSACF_URI` | unset | PCF / NSACF endpoint, tried before NRF discovery. With no NSACF configured or discoverable, slice admission control is skipped. |
-| `SMF_METRICS_PORT` | `9090` | Prometheus endpoint port (bound on `0.0.0.0`). |
+| `SMF_METRICS_PORT` | `9090` | Prometheus endpoint port. |
+| `NEXTGCORE_METRICS_BIND` | `127.0.0.1` | Host the unauthenticated `/metrics` listener binds to (#837). The compose files and manifests set `0.0.0.0` inside the private container/pod network. |
 | `SMF_UDM` | off | `1`/`true` turns on the UDM interaction of TS 23.502 §4.3.2.2.1 step 4 (UECM registration, SM-data subscription, #79). Off by default because the E2E harness has no conformant UDM. |
 | `SMF_EPS_INTERWORKING` | off | `1`/`true` makes an establishing PDU session request an EPS Bearer Identity from the AMF and send Mapped EPS bearer contexts to the UE, so the session can later move to the EPC (#117). |
 | `SMF_IWK_SNSSAI` | SST `1` | S-NSSAI (`sst` or `sst:sd`, SD six hex digits) the PGW-C+SMF assigns to a PDN connection that can move to 5GS (#475). |
@@ -152,7 +153,11 @@ back into each `PfcpClient` before the association loop starts, so the first
 Association Setup after a reload compares the UPF's reported stamp against it:
 a changed stamp means the UPF restarted while the SMF was down, and the restored
 sessions are flushed (TS 29.244 §5.22, TS 23.527 §4.2) instead of being believed
-in. An unchanged stamp means they are genuinely still valid.
+in. An unchanged stamp means they are genuinely still valid. A UPF named by
+hostname has its stamp kept under the configured `host:port`, lower-cased and
+without a trailing dot, so it is found again after the UPF moves (#722). A stamp
+a pre-#722 snapshot kept under the UPF's address is read once, moved to the name,
+and the address entry removed. A UPF hostname must name exactly one UPF.
 
 **Limits worth knowing:**
 

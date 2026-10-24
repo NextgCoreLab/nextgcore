@@ -83,6 +83,16 @@ pub enum SetupRequestDecode {
     Undecodable,
 }
 
+/// A generated ENB-ID as the handler's, every alternative kept (#741).
+fn enb_id_from(id: &g::ENB_ID) -> EnbId {
+    match id {
+        g::ENB_ID::MacroENB_ID(b) => EnbId::Macro(bits_to_u32(&b.0)),
+        g::ENB_ID::HomeENB_ID(b) => EnbId::Home(bits_to_u32(&b.0)),
+        g::ENB_ID::Short_macroENB_ID(b) => EnbId::ShortMacro(bits_to_u32(&b.0)),
+        g::ENB_ID::Long_macroENB_ID(b) => EnbId::LongMacro(bits_to_u32(&b.0)),
+    }
+}
+
 fn bits_to_u32(bits: &BitVec<u8, Msb0>) -> u32 {
     bits.iter().fold(0u32, |acc, b| (acc << 1) | u32::from(*b))
 }
@@ -148,14 +158,10 @@ pub fn decode_s1_setup_request(bytes: &[u8]) -> SetupRequestDecode {
     for ie in req.protocol_i_es.0 {
         match ie.value {
             g::S1SetupRequestProtocolIEs_EntryValue::Id_Global_ENB_ID(v) => {
-                let enb_id = match v.enb_id {
-                    g::ENB_ID::MacroENB_ID(b) => Some(EnbId::Macro(bits_to_u32(&b.0))),
-                    g::ENB_ID::HomeENB_ID(b) => Some(EnbId::Home(bits_to_u32(&b.0))),
-                    // Short / long macro eNB IDs (extension alternatives) have no
-                    // representation in the handler's type; an eNB using one is
-                    // refused as not understood rather than mis-identified.
-                    _ => None,
-                };
+                // #741: the short and long macro eNB IDs are the Rel-15 extension
+                // alternatives of ENB-ID (TS 36.413 §9.2.1.37) and identify an eNB as
+                // validly as a macro one.
+                let enb_id = Some(enb_id_from(&v.enb_id));
                 match (plmn(&v.plm_nidentity.0), enb_id) {
                     (Some(plmn_identity), Some(enb_id)) => {
                         global_enb_id = Some(GlobalEnbId {
@@ -415,6 +421,12 @@ pub fn build_s1_setup_request(req: &S1SetupRequest) -> Result<Vec<u8>, asn1_code
     let enb_id = match req.global_enb_id.enb_id {
         EnbId::Macro(id) => g::ENB_ID::MacroENB_ID(g::ENB_ID_macroENB_ID(u32_to_bits(id, 20))),
         EnbId::Home(id) => g::ENB_ID::HomeENB_ID(g::ENB_ID_homeENB_ID(u32_to_bits(id, 28))),
+        EnbId::ShortMacro(id) => {
+            g::ENB_ID::Short_macroENB_ID(g::ENB_ID_short_macroENB_ID(u32_to_bits(id, 18)))
+        }
+        EnbId::LongMacro(id) => {
+            g::ENB_ID::Long_macroENB_ID(g::ENB_ID_long_macroENB_ID(u32_to_bits(id, 21)))
+        }
     };
     let mut ies = vec![g::S1SetupRequestProtocolIEs_Entry {
         id: g::ProtocolIE_ID(ID_GLOBAL_ENB_ID),
@@ -2327,11 +2339,7 @@ fn target_id_from(t: &g::TargetID) -> Result<Option<nextgcore_s1ap::TargetId>, (
     use nextgcore_s1ap::TargetId as T;
     Ok(match t {
         g::TargetID::TargeteNB_ID(v) => {
-            let enb_id = match &v.global_enb_id.enb_id {
-                g::ENB_ID::MacroENB_ID(b) => EnbId::Macro(bits_to_u32(&b.0)),
-                g::ENB_ID::HomeENB_ID(b) => EnbId::Home(bits_to_u32(&b.0)),
-                _ => return Err(()),
-            };
+            let enb_id = enb_id_from(&v.global_enb_id.enb_id);
             let (Some(plmn_identity), Some(selected_tai)) = (
                 plmn(&v.global_enb_id.plm_nidentity.0),
                 tai_from(&v.selected_tai),

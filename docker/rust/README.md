@@ -183,11 +183,12 @@ docker compose up -d amf smf upf gnb ue
 
 ### Environment Variables
 
-There is no `.env` file; the compose files set each NF's environment inline.
+The compose files set each NF's environment inline. `docker/rust/.env` (gitignored) holds the one secret compose needs, `GRAFANA_ADMIN_PASSWORD`.
 Common ones:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
+| `GRAFANA_ADMIN_PASSWORD` | Grafana `admin` password. **Required**: `docker compose` refuses to start without it (#837); put `GRAFANA_ADMIN_PASSWORD=...` in `docker/rust/.env` (gitignored) | none |
 | `RUST_LOG` | Log filter for every NF (env_logger syntax, e.g. `info,nextgcore_amfd=debug`). When set and not blank it replaces the NF's `--log-level` entirely; unset, `--log-level` applies to all targets (#691) | `info` |
 | `NEXTGCORE_SBI_PROFILE` | SBI security profile for amf/smf/ausf/udm; the compose files set `dev` (h2c, no mTLS) | `production` when unset |
 | `NEXTGCORE_SBI_OAUTH2_REQUIRE` | Force OAuth2 enforcement on an NF's SBI server (the `oauth2` overlay sets it) | unset |
@@ -390,7 +391,7 @@ services:
 | HSS | TCP | 3868 | Diameter (S6a) |
 | MongoDB | TCP | 27017 | Database |
 | Prometheus | TCP | 9090 | Metrics |
-| Grafana | TCP | 3000 | Dashboards (admin/nextgcore) |
+| Grafana | TCP | 3000 | Dashboards, on 127.0.0.1 only. Login `admin` with the password you set as `GRAFANA_ADMIN_PASSWORD` |
 | Jaeger | TCP | 16686 | Tracing UI |
 
 ## Validation
