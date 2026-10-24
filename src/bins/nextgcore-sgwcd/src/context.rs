@@ -379,6 +379,11 @@ pub struct SgwcTunnel {
     pub bearer_id: u64,
     /// GTP node ID
     pub gnode_id: Option<u64>,
+    /// Bumped by [`SgwcContext::tunnel_update`] whenever the remote endpoint
+    /// (TEID or IP) changes, whoever changes it (#987 review): a pending
+    /// Modify Bearer rolls back only the endpoint it wrote itself, even if a
+    /// later writer happens to put the same values back.
+    pub generation: u64,
 }
 
 impl SgwcTunnel {
@@ -395,6 +400,7 @@ impl SgwcTunnel {
             remote_ip: IpAddr::default(),
             bearer_id,
             gnode_id: None,
+            generation: 0,
         }
     }
 
@@ -1184,7 +1190,18 @@ impl SgwcContext {
     /// Update tunnel in context
     pub fn tunnel_update(&self, tunnel: &SgwcTunnel) -> bool {
         if let Ok(mut list) = self.tunnel_list.write() {
-            list.insert(tunnel.id, tunnel.clone());
+            let mut tunnel = tunnel.clone();
+            if let Some(old) = list.get(&tunnel.id) {
+                let moved = old.remote_teid != tunnel.remote_teid
+                    || old.remote_ip.ipv4 != tunnel.remote_ip.ipv4
+                    || old.remote_ip.ipv6 != tunnel.remote_ip.ipv6;
+                tunnel.generation = if moved {
+                    old.generation.wrapping_add(1)
+                } else {
+                    old.generation
+                };
+            }
+            list.insert(tunnel.id, tunnel);
             return true;
         }
         false
