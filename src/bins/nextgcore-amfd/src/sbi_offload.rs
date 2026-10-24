@@ -63,6 +63,9 @@ pub(crate) enum SbiOutcome {
         /// (404, or a failure). Reported either way, so the slot is released.
         capability: Option<Vec<u8>>,
     },
+    /// #964: the SMF's answer to an N2 handover step (PREPARING or PREPARED) for one
+    /// PDU session.
+    N2Handover(crate::ngap_path::N2HandoverAnswer),
 }
 
 /// What keyed work is serialised on: (AMF UE NGAP ID, PDU session ID).

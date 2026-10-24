@@ -5081,6 +5081,17 @@ pub fn path_switch_unsuccessful_transfer(cause: Cause) -> Option<Vec<u8>> {
     .ok()
 }
 
+/// A HandoverPreparationUnsuccessfulTransfer (TS 38.413 §9.3.4.18) carrying `cause`:
+/// the per-session content of a HANDOVER COMMAND's PDU Session Resource to Release List
+/// (§9.2.3.2), for a session the source offered that is not handed over (#964).
+pub fn handover_preparation_unsuccessful_transfer(cause: Cause) -> Option<Vec<u8>> {
+    nextgcore_ngap_gen::encode_contained(&ngap_gen::HandoverPreparationUnsuccessfulTransfer {
+        cause: generated_cause(cause),
+        ie_extensions: None,
+    })
+    .ok()
+}
+
 /// Build a PATH SWITCH REQUEST ACKNOWLEDGE (TS 38.413 §9.2.3.9) with the
 /// GENERATED codec (#417), in `PathSwitchRequestAcknowledgeIEs` object-set
 /// order, reporting `notify` -- the request's "ignore IE and notify sender"

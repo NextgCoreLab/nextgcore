@@ -744,8 +744,9 @@ impl PfcpMessageBuilder {
         if report_type.uplink_data_report {
             flags |= 0x08;
         }
+        // SESR is bit 6 (TS 29.244 §8.2.21); 0x10 is TMIR.
         if report_type.session_report {
-            flags |= 0x10;
+            flags |= 0x20;
         }
         self.add_u8(pfcp_ie::REPORT_TYPE, flags)
     }
@@ -1465,12 +1466,14 @@ pub fn parse_create_far(data: &[u8]) -> Result<ParsedCreateFar, &'static str> {
         return Err("FAR ID missing");
     }
 
-    // Apply Action (mandatory)
+    // Apply Action (mandatory; TS 29.244 §8.2.26). Octet 5 (DROP, FORW, BUFF, NOCP,
+    // DUPL, ...) comes first, octet 6 (EDRT, BDPN, DDPN, ...) second; the library's
+    // codec reads it into the FAR_ACTION_* numbering (octet 5 in the low byte).
+    // #1008: this read the two octets big-endian, which swapped them, the mirror of
+    // smfd's encoder; a conformant SMF's FORW (`02 00`) read as EDRT.
     if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::APPLY_ACTION) {
-        if ie.value.len() >= 2 {
-            far.apply_action = u16::from_be_bytes([ie.value[0], ie.value[1]]);
-        } else if !ie.value.is_empty() {
-            far.apply_action = ie.value[0] as u16;
+        if !ie.value.is_empty() {
+            far.apply_action = nextgcore_pfcp::types::ApplyAction::decode_ie(&ie.value).encode();
         }
     }
 
@@ -2052,12 +2055,11 @@ pub fn parse_recovery_time_stamp(payload: &[u8]) -> Option<u32> {
     let ies = ParsedIe::parse_all(payload);
     ParsedIe::find_ie(&ies, pfcp_ie::RECOVERY_TIME_STAMP).and_then(|ie| {
         if ie.value.len() >= 4 {
-            Some(u32::from_be_bytes([
-                ie.value[0],
-                ie.value[1],
-                ie.value[2],
-                ie.value[3],
-            ]))
+            // #995: in the NTP reading, so a pre-#995 peer's Unix-seconds stamp
+            // compares with an NTP one.
+            Some(nextgcore_pfcp::recovery_time::normalize_received(
+                u32::from_be_bytes([ie.value[0], ie.value[1], ie.value[2], ie.value[3]]),
+            ))
         } else {
             None
         }
@@ -2115,6 +2117,45 @@ pub fn parse_pfcpsmreq_flags(payload: &[u8]) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1008, TS 29.244 §8.2.26: octet 5 (DROP, FORW, BUFF, NOCP) first, octet 6
+    /// (EDRT, BDPN, DDPN) second. `02 00` is FORW; `00 02` is BDPN, not FORW; a
+    /// one-octet value is octet 5.
+    #[test]
+    fn a_create_fars_apply_action_is_read_octet_5_first() {
+        use crate::data_plane::{FAR_ACTION_BUFF, FAR_ACTION_FORW, FAR_ACTION_NOCP};
+        let far = |aa: &[u8]| {
+            let mut b = PfcpMessageBuilder::new();
+            b.add_u32(pfcp_ie::FAR_ID, 7);
+            b.add_tlv(pfcp_ie::APPLY_ACTION, aa);
+            parse_create_far(&b.build()).expect("FAR").apply_action
+        };
+        assert_eq!(far(&[0x02, 0x00]), FAR_ACTION_FORW);
+        assert_eq!(far(&[0x0c, 0x00]), FAR_ACTION_BUFF | FAR_ACTION_NOCP);
+        assert_eq!(far(&[0x02]), FAR_ACTION_FORW);
+        let bdpn = far(&[0x00, 0x02]);
+        assert_eq!(
+            bdpn & FAR_ACTION_FORW,
+            0,
+            "octet 6 bit 2 is BDPN: {bdpn:#x}"
+        );
+        assert_eq!(bdpn, 1 << 9);
+        // What the library writes, read back.
+        let mut lib = bytes::BytesMut::new();
+        nextgcore_pfcp::types::ApplyAction::forward().encode_ie(&mut lib);
+        assert_eq!(far(&lib[4..]), FAR_ACTION_FORW);
+    }
+
+    /// TS 29.244 §8.2.21: SESR is bit 6 (0x20); 0x10 is TMIR.
+    #[test]
+    fn a_session_report_type_is_sesr_not_tmir() {
+        let mut b = PfcpMessageBuilder::new();
+        b.add_report_type(&ReportType {
+            session_report: true,
+            ..Default::default()
+        });
+        assert_eq!(b.build(), vec![0x00, 39, 0x00, 0x01, 0x20]);
+    }
 
     /// #80 criterion 2: `parse_create_urr` decodes Volume Quota (IE 73), Time Quota
     /// (IE 74) and Measurement Period (IE 64).
