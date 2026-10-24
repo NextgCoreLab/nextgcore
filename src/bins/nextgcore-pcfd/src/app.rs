@@ -2410,23 +2410,13 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
 
     let ctx = pcf_self();
 
-    // Get or create UE SM
-    let ue_sm_id = if let Ok(context) = ctx.read() {
-        match context.ue_sm_find_by_supi(supi) {
-            Some(ue_sm) => Some(ue_sm.id),
-            None => context.ue_sm_add(supi).map(|ue| ue.id),
-        }
-    } else {
-        None
-    };
-
-    let sess = ue_sm_id.and_then(|ue_sm_id| {
-        if let Ok(context) = ctx.read() {
-            context.sess_add(ue_sm_id, pdu_session_id)
-        } else {
-            None
-        }
-    });
+    // Get or create the UE SM and the session in one step (#892): the UE SM goes
+    // with its last session, so resolving it first and adding the session after
+    // could lose it to a concurrent delete in between.
+    let sess = ctx
+        .read()
+        .ok()
+        .and_then(|context| context.sess_add_for_supi(supi, pdu_session_id));
 
     match sess {
         Some(mut sess) => {
@@ -2749,9 +2739,9 @@ fn terminate_af_app_sessions(apps: &[PcfApp]) -> usize {
 /// Remove a UE's SM-policy context with all its sessions, terminating every
 /// AF application session bound to them (TS 29.514 §4.2.5.3, #767 review).
 ///
-/// No live path removes a UE's SM-policy context today (the PCF keeps one per
-/// SUPI; see the issue on that growth). This is the API any future UE-level
-/// removal must use, so no AF is left believing in a context the PCF dropped.
+/// A UE SM normally goes with its last session (`sess_remove_inner`, #892).
+/// This is the API for removing one that still has sessions, so no AF is left
+/// believing in a context the PCF dropped.
 /// The termCause is PDU_SESSION_TERMINATION on purpose: every PDU session of
 /// the UE is gone, which is exactly that cause (§4.2.5.3 i).
 pub fn remove_ue_sm(pcf_ue_sm_id: u64) -> bool {
@@ -4081,21 +4071,8 @@ pub async fn handle_app_session_modify(app_session_id: &str, request: &SbiReques
 
 /// Initialize logging based on command line arguments
 fn init_logging(args: &Args) -> Result<()> {
-    let mut builder = env_logger::Builder::new();
-
-    // Set log level
-    let level = match args.log_level.to_lowercase().as_str() {
-        "trace" => log::LevelFilter::Trace,
-        "debug" => log::LevelFilter::Debug,
-        "info" => log::LevelFilter::Info,
-        "warn" => log::LevelFilter::Warn,
-        "error" => log::LevelFilter::Error,
-        _ => log::LevelFilter::Info,
-    };
-    builder.filter_level(level);
-
-    // Configure format
-    builder.format_timestamp_millis();
+    // RUST_LOG if set, else --log-level: the same for every NF (#691).
+    let mut builder = nextgcore_core::log::nf_log_builder(&args.log_level);
 
     if args.no_color {
         builder.write_style(env_logger::WriteStyle::Never);
@@ -7072,6 +7049,54 @@ mod tests {
     /// A `ueIpv6` binds the session whose PREFIX contains it — the AF sends a full
     /// address while the session holds a prefix, so an exact-string lookup would
     /// never match.
+    /// #892: through the SBI handlers, SM policy create then delete leaves no
+    /// UE SM behind, and the SUPI's next create works.
+    ///
+    /// Revert-verified: with main's context the count after the delete is 1.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn sm_policy_delete_of_the_last_session_removes_the_ue_sm() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        pcf_context_init(64, 64);
+        let supi = "imsi-001010000000892";
+        for round in 0..2 {
+            provision_session_with_ipv4(supi, 5, "10.45.0.192").await;
+            // Scoped to this SUPI, not `ue_sm_count()`: unguarded sibling tests
+            // add UE-SMs to the same process-global context (#338).
+            assert!(
+                pcf_self()
+                    .read()
+                    .unwrap()
+                    .ue_sm_find_by_supi(supi)
+                    .is_some(),
+                "round {round}"
+            );
+            let sm_policy_id = pcf_self()
+                .read()
+                .unwrap()
+                .sess_find_by_ipv4addr("10.45.0.192")
+                .expect("stored")
+                .sm_policy_id;
+            let resp = pcf_sbi_request_handler(make_request(
+                "POST",
+                &format!("/npcf-smpolicycontrol/v1/sm-policies/{sm_policy_id}/delete"),
+                None,
+            ))
+            .await;
+            assert_eq!(resp.status, 204, "round {round}");
+            let ctx = pcf_self();
+            let ctx = ctx.read().unwrap();
+            assert!(
+                ctx.ue_sm_find_by_supi(supi).is_none(),
+                "round {round}: the UE SM went with its last session"
+            );
+            assert!(ctx.sess_find_by_sm_policy_id(&sm_policy_id).is_none());
+        }
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
     async fn create_binds_by_ipv6_address_within_the_session_prefix() {
@@ -8371,29 +8396,19 @@ mod tests {
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
         assert_eq!(body["cause"], "UAV_FLIGHT_NOT_AUTHORIZED");
 
-        // #90 criterion 5: the refusal leaves NO session behind.
-        //
-        // The UE-SM lookup is `expect`, not `if let Some(..)`. That matters: the
-        // session assertion below is a NEGATIVE one, and a negative assertion is
-        // satisfied by every path that never arrived — including a create rejected
-        // before it ever resolved a UE-SM. Requiring the UE-SM to be there first is
-        // the positive half that proves the path DID arrive, and it is true by
-        // construction because the refusal removes the session, not the UE (the
-        // create resolves the UE-SM find-then-add, so a retry reuses it).
-        let ue_sm = ctx
-            .read()
-            .expect("ctx")
-            .ue_sm_find_by_supi("imsi-001010000000910")
-            .expect("the refused create must still have resolved a UE-SM");
+        // #90 criterion 5: the refusal leaves NO session behind, and since #892
+        // no UE-SM either: the refused session was the SUPI's only one, and a
+        // UE-SM goes with its last session. The positive half (the path DID
+        // arrive) is the UAV_FLIGHT_NOT_AUTHORIZED cause above, which is only
+        // answered after the session was created and is then removed.
+        let ctx = ctx.read().expect("ctx");
         assert!(
-            ctx.read()
-                .expect("ctx")
-                .sess_find_by_psi(ue_sm.id, 5)
-                .is_none(),
-            "a rejected UAV create must leave no PcfSess for its (SUPI, PSI) — it \
-             leaked one per attempt before #90, and again for every removal once any \
-             index lock was poisoned (#338)"
+            ctx.ue_sm_find_by_supi("imsi-001010000000910").is_none(),
+            "a rejected UAV create must leave neither a PcfSess (it leaked one per \
+             attempt before #90, and again once any index lock was poisoned, #338) nor \
+             its now-empty UE-SM (#892)"
         );
+        drop(ctx);
 
         std::env::remove_var("PCF_UAV_DNN");
     }
@@ -8460,27 +8475,13 @@ mod tests {
             let body: serde_json::Value =
                 serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
             assert_eq!(body["cause"], "UAV_FLIGHT_NOT_AUTHORIZED", "{label}");
-            // Scoped to THIS (SUPI, PSI), not a `sess_count()` delta. The delta was
-            // the flake #338 reported: 29 pcfd tests mutate the process-global PCF
-            // context without taking CONTEXT_GUARD, so a sibling creating or
-            // deleting a session between the two reads falsified it — and it read 0
-            // outright if any sibling had poisoned `sess_list`, since `sess_count`
-            // answers `unwrap_or(0)`. The UE-SM `expect` is the positive half: it
-            // proves the create reached the point of resolving a UE-SM, so the
-            // negative session assertion is not satisfied by a path that never ran.
-            let ue_sm = ctx
-                .read()
-                .expect("ctx")
-                .ue_sm_find_by_supi(&supi)
-                .unwrap_or_else(|| {
-                    panic!("{label}: the refused create must still have resolved a UE-SM")
-                });
+            // Scoped to THIS SUPI, not a `sess_count()` delta: 29 pcfd tests mutate
+            // the process-global context without CONTEXT_GUARD, so a delta flakes
+            // (#338). The refused session was the SUPI's only one, so its UE-SM
+            // goes with it (#892); the cause above proves the path ran.
             assert!(
-                ctx.read()
-                    .expect("ctx")
-                    .sess_find_by_psi(ue_sm.id, 9)
-                    .is_none(),
-                "{label}: the refusal must leave no session for this (SUPI, PSI)"
+                ctx.read().expect("ctx").ue_sm_find_by_supi(&supi).is_none(),
+                "{label}: the refusal must leave no session (and so no UE-SM) for this SUPI"
             );
         }
 

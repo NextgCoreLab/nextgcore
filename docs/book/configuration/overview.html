@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-c2411517.js";
+            window.path_to_searchindex_js = "../searchindex-df495bb2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -215,7 +215,7 @@
     path: /var/log/nextgcore/amf.log
   level: info
 </code></pre>
-<p><code>--log-level</code> works for every NF but smfd. <code>RUST_LOG</code> is honoured only by the NFs that build their logger with <code>env_logger::Env::default().default_filter_or(..)</code> (dccfd, easdfd, eesd, lmfd, mbsmfd, nefd, nsacfd, nwdafd, pind, sgwud, smfd, tsctsf, ucmfd). The other fifteen (amfd, ausfd, bsfd, hssd, mmed, nrfd, nssfd, pcfd, pcrfd, scpd, seppd, sgwcd, udmd, udrd, upfd) ignore it; tracked in <a href="https://github.com/NextgCoreLab/nextgcore/issues/691">#691</a>.</p>
+<p><code>--log-level</code> works for every NF but smfd (which defaults to <code>info</code>). Every NF builds its logger with <code>nextgcore_core::log::nf_log_builder</code> (#691): <code>RUST_LOG</code>, when set, is the filter; otherwise the <code>--log-level</code> flag applies (an unknown value means <code>info</code>).</p>
 <h3 id="global"><a class="header" href="#global"><code>global</code></a></h3>
 <pre><code class="language-yaml">global:
   max:
@@ -241,7 +241,7 @@
 <tr><th>Variable</th><th>Effect</th><th>Source</th></tr>
 </thead>
 <tbody>
-<tr><td><code>RUST_LOG</code></td><td>Overrides the log level in the thirteen NFs listed under <code>logger</code> above</td><td><code>init.rs</code>, NF <code>main.rs</code></td></tr>
+<tr><td><code>RUST_LOG</code></td><td>Overrides <code>--log-level</code> in every NF (env_logger filter syntax)</td><td><code>nextgcore_core::log::nf_log_builder</code></td></tr>
 <tr><td><code>DB_URI</code></td><td>Overrides the YAML <code>db_uri</code> (MongoDB)</td><td><code>init.rs</code> stage 4</td></tr>
 <tr><td><code>&lt;NF&gt;_SBI_ADDR</code> / <code>&lt;NF&gt;_SBI_PORT</code></td><td>SBI bind address/port (e.g. <code>AMF_SBI_ADDR</code>, <code>UDM_SBI_PORT</code>); defaults <code>127.0.0.1:7777</code></td><td>each NF <code>lib.rs</code></td></tr>
 <tr><td><code>NRF_URI</code>, <code>PCF_URI</code>, <code>NSACF_URI</code></td><td>Peer NF discovery URIs</td><td>NF binaries</td></tr>
