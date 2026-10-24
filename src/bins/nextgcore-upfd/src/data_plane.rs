@@ -1208,6 +1208,9 @@ pub struct TimeMeter {
     /// First / Last Packet).
     first_pkt_wall: Option<std::time::SystemTime>,
     last_pkt_wall: Option<std::time::SystemTime>,
+    /// Reports generated so far: lets a restore tell whether a NEWER report has gone
+    /// out since the undelivered one (#953 review).
+    report_gen: u64,
 }
 
 /// The time IEs of one usage report (#818, TS 29.244 Table 7.5.8.3-1).
@@ -1223,6 +1226,8 @@ pub struct ReportTimes {
     /// Time of First / Last Packet (§8.2.44/§8.2.45), when traffic was seen.
     pub first_pkt: Option<std::time::SystemTime>,
     pub last_pkt: Option<std::time::SystemTime>,
+    /// Which report this was (the URR's report count after it).
+    pub gen: u64,
 }
 
 impl Default for ReportTimes {
@@ -1234,12 +1239,14 @@ impl Default for ReportTimes {
             duration: None,
             first_pkt: None,
             last_pkt: None,
+            gen: 0,
         }
     }
 }
 
 /// A 3GPP NTP timestamp (§8.2.38: seconds since 1900-01-01, the first four octets
-/// of the RFC 5905 64-bit format).
+/// of the RFC 5905 64-bit format). The `as u32` truncation is the NTP era wrap: values
+/// are era 0 until 2036-02-07, then wrap to era 1 exactly as RFC 5905 §6 specifies.
 pub fn ntp_secs(t: std::time::SystemTime) -> u32 {
     const NTP_UNIX_OFFSET: u64 = 2_208_988_800;
     let unix = t
@@ -2031,7 +2038,9 @@ impl DataPlaneUrr {
                     .then(|| now.saturating_sub(m.report_anchor)),
                 first_pkt: m.first_pkt_wall.take(),
                 last_pkt: m.last_pkt_wall.take(),
+                gen: m.report_gen + 1,
             };
+            m.report_gen += 1;
             m.report_anchor = now;
             m.report_wall = Some(wall);
             if threshold_report {
@@ -2064,12 +2073,17 @@ impl DataPlaneUrr {
         if let Some(d) = times.duration {
             m.report_anchor = m.report_anchor.saturating_sub(d);
         }
-        m.report_wall = Some(m.report_wall.map_or(times.start, |w| w.min(times.start)));
-        if let Some(f) = times.first_pkt {
-            m.first_pkt_wall = Some(m.first_pkt_wall.map_or(f, |w| w.min(f)));
-        }
-        if m.last_pkt_wall.is_none() {
-            m.last_pkt_wall = times.last_pkt;
+        // #953 review: the window reaches back only if no NEWER report has gone out
+        // since -- otherwise the next report's Start Time would overlap a window already
+        // reported. The duration (and the volume) are still carried, so the totals sum.
+        if m.report_gen == times.gen {
+            m.report_wall = Some(m.report_wall.map_or(times.start, |w| w.min(times.start)));
+            if let Some(f) = times.first_pkt {
+                m.first_pkt_wall = Some(m.first_pkt_wall.map_or(f, |w| w.min(f)));
+            }
+            if m.last_pkt_wall.is_none() {
+                m.last_pkt_wall = times.last_pkt;
+            }
         }
     }
 
@@ -6777,6 +6791,50 @@ mod tests {
         let plain = DataPlaneUrr::new(2);
         let (_, t) = plain.take_report(false);
         assert_eq!(t.duration, None, "no Duration Measurement without DURAT");
+    }
+
+    /// #953 review: the restore wiring through `DataPlane::restore_urr_usage` (what a
+    /// failed send or an N1 give-up calls) puts the times back -- the next report's
+    /// Start Time reaches back over the undelivered one -- but NOT when a newer report
+    /// has gone out meanwhile, which would make two reported windows overlap.
+    #[test]
+    fn restored_times_reach_back_only_if_no_newer_report_went_out() {
+        let dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        dp.add_session_from_pfcp(
+            0x953,
+            0x1953,
+            Ipv4Addr::new(10, 45, 9, 53),
+            0x9531,
+            0x9532,
+            "127.0.0.1:2152".parse().unwrap(),
+            Some(5),
+            Some(9),
+        );
+        let session = dp.sessions.find_by_seid(0x953).unwrap();
+        let urr = Arc::new(DataPlaneUrr::new(1));
+        urr.set_reporting(Some(1), None, None, None, None);
+        session.urrs.write().unwrap().insert(1, Arc::clone(&urr));
+
+        urr.record(10, true);
+        let lost = dp.collect_urr_reports();
+        dp.restore_urr_usage(&lost);
+        urr.record(10, true);
+        let next = dp.collect_urr_reports();
+        assert_eq!(next[0].times.start, lost[0].times.start, "reaches back");
+
+        // Now: A is lost, B goes out, THEN A is restored.
+        urr.record(10, true);
+        let a = dp.collect_urr_reports();
+        urr.record(10, true);
+        let b = dp.collect_urr_reports();
+        dp.restore_urr_usage(&a);
+        urr.record(10, true);
+        let c = dp.collect_urr_reports();
+        assert_eq!(
+            c[0].times.start, b[0].times.end,
+            "no overlap with B's window"
+        );
+        assert_eq!(c[0].total_bytes, 20, "but A's volume is carried");
     }
 
     /// #818: a report that was not delivered gives its time back with its usage: the
