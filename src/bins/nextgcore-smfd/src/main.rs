@@ -3409,8 +3409,9 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     // #718 review M3: a shutting-down SMF takes no new SM context. Its N4
     // association is about to be released or handed to the next incarnation, so a
     // session created now would be torn down immediately or never reach the UPF.
-    // NF_FAILOVER (TS 29.500 Table 5.2.7.2-1) lets the AMF re-select an SMF at once.
-    if let Some(refusal) = refuse_create_while_shutting_down(SHUTDOWN.load(Ordering::SeqCst)) {
+    // NF_FAILOVER (TS 29.500 Table 5.2.7.2-1) lets the AMF re-select an SMF at once
+    // (amfd does since #1101). `shutting_down()`, so a test can pin this per thread.
+    if let Some(refusal) = refuse_create_while_shutting_down(shutting_down()) {
         return refusal;
     }
 
@@ -8712,6 +8713,30 @@ mod tests {
         assert_eq!(refusal.status, 500);
         let body: serde_json::Value =
             serde_json::from_str(refusal.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["cause"], "NF_FAILOVER");
+    }
+
+    /// #1101: the refusal at the handler, which is what amfd re-selects on. From the
+    /// shutdown signal on, SM Context Create answers 500 NF_FAILOVER as
+    /// `application/problem+json`, before the request is parsed or any state is
+    /// touched. Before the deregistration and the #39 releases (graceful_shutdown,
+    /// `the_shutdown_deregisters_before_it_releases`), so a UE's prompt
+    /// re-establishment is never created on this SMF.
+    ///
+    /// REVERT-VERIFIED: reading the process flag instead of `shutting_down()` lets the
+    /// create through to the body parse (400).
+    #[tokio::test]
+    async fn a_create_during_shutdown_is_answered_nf_failover_at_the_handler() {
+        set_shutting_down_for_test(true);
+        let resp = handle_sm_context_create(&create_request("imsi-001010000001101", 5, &[])).await;
+        set_shutting_down_for_test(false);
+        assert_eq!(resp.status, 500);
+        assert_eq!(
+            resp.http.get_header("content-type").map(String::as_str),
+            Some("application/problem+json")
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
         assert_eq!(body["cause"], "NF_FAILOVER");
     }
 

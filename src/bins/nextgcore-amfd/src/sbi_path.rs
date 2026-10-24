@@ -109,6 +109,11 @@ pub enum SbiError {
     NfInstanceNotFound,
     /// Request failed
     RequestFailed(String),
+    /// The SMF answered an SM Context Create with an error status (#1101), with
+    /// the ProblemDetails `cause` when its body carried one (TS 29.500 §5.2.7.2).
+    /// Kept apart from [`SbiError::RequestFailed`] so the AMF can tell an SMF
+    /// that asks to be re-selected (NF_FAILOVER, 503) from one that refused.
+    SmfRefused { status: u16, cause: Option<String> },
     /// Response parse error
     ResponseParseError(String),
     /// Timeout
@@ -125,6 +130,10 @@ impl std::fmt::Display for SbiError {
             SbiError::ServiceNotFound(s) => write!(f, "Service not found: {s}"),
             SbiError::NfInstanceNotFound => write!(f, "NF instance not found"),
             SbiError::RequestFailed(s) => write!(f, "Request failed: {s}"),
+            SbiError::SmfRefused { status, cause } => match cause {
+                Some(c) => write!(f, "Request failed: SMF returned status {status} ({c})"),
+                None => write!(f, "Request failed: SMF returned status {status}"),
+            },
             SbiError::ResponseParseError(s) => write!(f, "Response parse error: {s}"),
             SbiError::Timeout => write!(f, "Timeout"),
             SbiError::GatewayTimeout => write!(f, "Gateway timeout"),
@@ -1226,10 +1235,10 @@ pub async fn call_smf_create_sm_context(
         .map_err(|e| SbiError::RequestFailed(format!("SMF request failed: {e}")))?;
 
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "SMF returned status {}",
-            response.status
-        )));
+        return Err(SbiError::SmfRefused {
+            status: response.status,
+            cause: problem_cause(response.http.content.as_deref()),
+        });
     }
 
     let response_body: serde_json::Value = match &response.http.content {
@@ -1283,6 +1292,17 @@ pub async fn call_smf_create_sm_context(
         sm_context_ref,
         smf_authority,
     })
+}
+
+/// The `cause` of an error answer's ProblemDetails (TS 29.571 §5.2.4.1), at the top
+/// level of a `application/problem+json` body or under `error` in an
+/// SmContextCreateError (TS 29.502 §6.1.6.2.6). `None` when there is none (#1101).
+pub(crate) fn problem_cause(content: Option<&str>) -> Option<String> {
+    let body: serde_json::Value = serde_json::from_str(content?).ok()?;
+    body.get("cause")
+        .or_else(|| body.get("error").and_then(|e| e.get("cause")))
+        .and_then(|c| c.as_str())
+        .map(str::to_string)
 }
 
 /// Ask the SMF to deactivate a session's user plane on AN release (#540):

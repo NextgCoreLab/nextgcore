@@ -1178,6 +1178,283 @@ async fn an_establishment_with_no_smf_back_in_the_window_gets_payload_not_forwar
     server.forget_ue(ue);
 }
 
+// ---------------------------------------------------------------------------
+// #1101: an SMF that answers NF_FAILOVER or 503 is re-selected, and a refusal
+// carries a back-off timer
+// ---------------------------------------------------------------------------
+
+/// A stand-in SMF whose CreateSMContext answers follow `script`: the n-th create
+/// gets `script[n]` as `(status, ProblemDetails cause)`, and every create past the
+/// script is created (201, `smContextRef` "est-1101"). Returns the server, its port
+/// and the number of creates it saw. Keep the server alive.
+async fn scripted_create_smf(
+    script: Vec<(u16, Option<&'static str>)>,
+) -> (
+    nextgcore_sbi::server::SbiServer,
+    u16,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    let creates = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&creates);
+    let script = Arc::new(script);
+    let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+    let server = nextgcore_sbi::server::SbiServer::on_listener(
+        nextgcore_sbi::server::SbiServerConfig::new(addr),
+        listener,
+    );
+    server
+        .start(move |req: SReq| {
+            let counter = Arc::clone(&counter);
+            let script = Arc::clone(&script);
+            async move {
+                if !req.header.uri.ends_with("/nsmf-pdusession/v1/sm-contexts") {
+                    return SResp::no_content();
+                }
+                let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let Some((status, cause)) = script.get(n) {
+                    let problem = serde_json::json!({ "status": status, "cause": cause });
+                    return SResp::with_status(*status)
+                        .with_body(problem.to_string(), "application/problem+json");
+                }
+                let body = serde_json::json!({
+                    "smContextRef": "est-1101",
+                    "n1SmMsg": base64::engine::general_purpose::STANDARD
+                        .encode([0x2E, 0x05, 0x01, 0xC2]),
+                    "n2SmInfo": base64::engine::general_purpose::STANDARD
+                        .encode(transfer_for("est-1101")),
+                });
+                SResp::with_status(201).with_body(body.to_string(), "application/json")
+            }
+        })
+        .await
+        .expect("stand-in SMF starts");
+    for _ in 0..200 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    (server, addr.port(), creates)
+}
+
+/// Whether a PDU SESSION RESOURCE SETUP REQUEST for `psi` is among `sent`.
+fn sets_up(sent: &[(u64, Vec<u8>)], psi: u8) -> bool {
+    sent.iter().any(|(_, p)| {
+        matches!(decode_sent(p), Sent::SetupRequest { items, .. }
+            if items.first().map(|i| i.psi) == Some(psi))
+    })
+}
+
+/// Ask for PSI 5 and let the first CreateSMContext come back.
+async fn request_psi_5(server: &mut NgapServer, ue: u64, ran: u32) {
+    let request = [0x2E, 0x05, 0x01, 0xC1, 0xFF, 0xFF];
+    server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &request))
+        .await
+        .expect("handled");
+    settle_establishments(server).await;
+}
+
+/// **#1101** (TS 29.500 Table 5.2.7.2-1). The SMF answers the first CreateSMContext
+/// with 500 NF_FAILOVER, as a shutting-down smfd does (#718 review M3), and then, as
+/// the replacement behind the same Service does, creates. The AMF does not reject:
+/// the establishment waits, nothing goes to the UE, the retry is created and the
+/// session reaches the gNB.
+///
+/// REVERT-VERIFIED: without `smf_failing_over` the UE gets 5GSM #26 at once and no
+/// second CreateSMContext is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_nf_failover_answer_is_retried_not_rejected() {
+    let (_smf, port, creates) = scripted_create_smf(vec![(500, Some("NF_FAILOVER"))]).await;
+    let _env = super::SmfEnvGuard::acquire(port).await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_110_101u64, 101);
+    ue_ready_for_sessions(&mut server, ue, ran);
+
+    request_psi_5(&mut server, ue, ran).await;
+    assert_eq!(creates.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(
+        take_sent_ngap(&mut server).is_empty(),
+        "no 5GSM reject, no DL NAS Transport"
+    );
+    assert!(server.pending_establishments.contains_key(&(ue, 5)));
+
+    make_establishments_due(&mut server);
+    settle_establishments(&mut server).await;
+    assert_eq!(creates.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(server.pending_establishments.is_empty());
+    assert!(sets_up(&take_sent_ngap(&mut server), 5));
+    server.forget_ue(ue);
+}
+
+/// **#1101**, the 503 row (TS 29.500 §5.2.7.2: NF_SERVICE_FAILOVER, or the
+/// service unavailable for now): retried the same way.
+///
+/// REVERT-VERIFIED: without the 503 arm of `smf_failing_over` it is rejected #26.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_503_answer_is_retried_not_rejected() {
+    let (_smf, port, creates) =
+        scripted_create_smf(vec![(503, Some("NF_SERVICE_FAILOVER")), (503, None)]).await;
+    let _env = super::SmfEnvGuard::acquire(port).await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_110_102u64, 102);
+    ue_ready_for_sessions(&mut server, ue, ran);
+
+    request_psi_5(&mut server, ue, ran).await;
+    for _ in 0..2 {
+        make_establishments_due(&mut server);
+        settle_establishments(&mut server).await;
+    }
+    assert_eq!(creates.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert!(server.pending_establishments.is_empty());
+    assert!(sets_up(&take_sent_ngap(&mut server), 5));
+    server.forget_ue(ue);
+}
+
+/// **#1101**, re-selection. The discovery cache holds two SMF instances, one failing
+/// over. The establishment goes to it first, and its NF_FAILOVER evicts its profile
+/// and holds its endpoint down. So the retry goes to the other instance and is
+/// created there; the failing one sees no second create.
+///
+/// REVERT-VERIFIED: without the eviction and the hold-down, the failing instance is
+/// still cached and not held down, and the retry may go back to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_nf_failover_answer_re_selects_another_smf_instance() {
+    use nextgcore_sbi::context::{NfInstance, NfService};
+    use nextgcore_sbi::types::{NfType, SbiServiceType as S};
+    let (_failing, failing_port, failing_creates) =
+        scripted_create_smf(vec![(500, Some("NF_FAILOVER")); 4]).await;
+    let (_healthy, healthy_port, healthy_creates) = scripted_create_smf(Vec::new()).await;
+    let _env = super::SmfEnvGuard::acquire(failing_port).await;
+    let ctx = nextgcore_sbi::context::global_context();
+    let instance = |id: &str, port: u16| {
+        let mut i = NfInstance::new(id, NfType::Smf);
+        i.ipv4_addresses = vec!["127.0.0.1".to_string()];
+        let mut svc = NfService::new("nsmf-pdusession", S::NsmfPdusession);
+        svc.port = port;
+        i.add_service(svc);
+        i
+    };
+    ctx.add_nf_instance(instance("smf-1101-failing", failing_port))
+        .await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_110_103u64, 103);
+    ue_ready_for_sessions(&mut server, ue, ran);
+
+    request_psi_5(&mut server, ue, ran).await;
+    assert_eq!(failing_creates.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let cached: Vec<String> = ctx
+        .find_nf_instances_by_service(S::NsmfPdusession)
+        .await
+        .into_iter()
+        .map(|i| i.id)
+        .collect();
+    let held_down = ctx.endpoint_held_down("127.0.0.1", failing_port);
+    assert!(
+        !cached.iter().any(|id| id == "smf-1101-failing") && held_down,
+        "the failing SMF is evicted ({cached:?}) and held down ({held_down})"
+    );
+    // The replacement registers at the NRF meanwhile; the AMF's cache learns of it.
+    ctx.add_nf_instance(instance("smf-1101-healthy", healthy_port))
+        .await;
+    make_establishments_due(&mut server);
+    settle_establishments(&mut server).await;
+
+    let failing = failing_creates.load(std::sync::atomic::Ordering::SeqCst);
+    let healthy = healthy_creates.load(std::sync::atomic::Ordering::SeqCst);
+    ctx.remove_nf_instance("smf-1101-failing").await;
+    ctx.remove_nf_instance("smf-1101-healthy").await;
+    ctx.clear_endpoint_failure("127.0.0.1", failing_port);
+    assert_eq!(
+        (failing, healthy),
+        (1, 1),
+        "the retry went to the other SMF"
+    );
+    assert!(server.pending_establishments.is_empty());
+    assert!(sets_up(&take_sent_ngap(&mut server), 5));
+    server.forget_ue(ue);
+}
+
+/// The 5GSM message a DL NAS TRANSPORT in `sent` carries (NEA0: the plain message
+/// follows the 7-octet security header).
+fn delivered_n1(sent: &[(u64, Vec<u8>)]) -> Vec<u8> {
+    use nextgcore_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
+    let decoded: Vec<Sent> = sent.iter().map(|(_, p)| decode_sent(p)).collect();
+    let [Sent::DownlinkNas { nas_pdu, .. }] = decoded.as_slice() else {
+        panic!("one DL NAS Transport: {decoded:?}");
+    };
+    let Ok(FiveGmmMessage::DlNasTransport(dl)) =
+        parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&nas_pdu[7..]))
+    else {
+        panic!("a DL NAS TRANSPORT: {nas_pdu:02x?}");
+    };
+    dl.payload_container.data.to_vec()
+}
+
+/// **#1101**, a refusal (TS 24.501 §6.4.1.4.3). An SMF that answers 500
+/// SYSTEM_FAILURE refused; that is not a failover. The UE gets PDU SESSION
+/// ESTABLISHMENT REJECT #26 at once, now with a Back-off timer value of 10 s (GPRS
+/// timer 3: unit 2 s, value 5), so it asks again after T3396 rather than at T3512.
+///
+/// REVERT-VERIFIED: the reject without the back-off timer fails the byte compare.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_create_is_rejected_26_with_a_back_off_timer() {
+    let (_smf, port, creates) = scripted_create_smf(vec![(500, Some("SYSTEM_FAILURE"))]).await;
+    let _env = super::SmfEnvGuard::acquire(port).await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_110_104u64, 104);
+    ue_ready_for_sessions(&mut server, ue, ran);
+
+    request_psi_5(&mut server, ue, ran).await;
+    assert_eq!(creates.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(server.pending_establishments.is_empty());
+    assert_eq!(
+        delivered_n1(&take_sent_ngap(&mut server)),
+        vec![0x2E, 0x05, 0x01, 0xC3, 0x1A, 0x37, 0x01, 0x65]
+    );
+    server.forget_ue(ue);
+}
+
+/// **#1101.** The classification, row by row: which SMF answers are re-selected for,
+/// and the ProblemDetails `cause` read from either body shape.
+#[test]
+fn which_smf_answers_are_re_selected_for() {
+    use crate::sbi_path::SbiError::{RequestFailed, SmfRefused};
+    let refused = |status, cause: Option<&str>| SmfRefused {
+        status,
+        cause: cause.map(str::to_string),
+    };
+    assert!(smf_failing_over(&refused(500, Some("NF_FAILOVER"))));
+    assert!(smf_failing_over(&refused(503, Some("NF_SERVICE_FAILOVER"))));
+    assert!(smf_failing_over(&refused(503, None)));
+    assert!(!smf_failing_over(&refused(500, Some("SYSTEM_FAILURE"))));
+    assert!(!smf_failing_over(&refused(500, None)));
+    assert!(!smf_failing_over(&refused(403, Some("NF_FAILOVER"))));
+    assert!(!smf_failing_over(&RequestFailed(
+        "SMF request failed: refused".into()
+    )));
+    assert!(smf_unreachable(&RequestFailed(
+        "SMF request failed: refused".into()
+    )));
+    assert!(!smf_unreachable(&refused(500, Some("NF_FAILOVER"))));
+    assert_eq!(
+        refused(500, Some("NF_FAILOVER")).to_string(),
+        "Request failed: SMF returned status 500 (NF_FAILOVER)"
+    );
+    assert_eq!(
+        crate::sbi_path::problem_cause(Some(r#"{"status":500,"cause":"NF_FAILOVER"}"#)),
+        Some("NF_FAILOVER".to_string())
+    );
+    assert_eq!(
+        crate::sbi_path::problem_cause(Some(r#"{"error":{"status":503,"cause":"X"}}"#)),
+        Some("X".to_string())
+    );
+    assert_eq!(crate::sbi_path::problem_cause(Some("not json")), None);
+    assert_eq!(crate::sbi_path::problem_cause(None), None);
+}
+
 /// An SMF that never answers: a listener nobody accepts on, so the connection
 /// sits in the backlog and the request waits for the client's timeout. Locally
 /// deterministic stand-in for a blackholed address (a stale pod IP, a lost node).
