@@ -142,9 +142,14 @@ pub fn render_metrics() -> String {
          FAILUREs received, by what the request carried (TS 36.413 8.3.4.3)\n\
          # TYPE mme_s1ap_ue_context_modification_failures_total counter\n\
          mme_s1ap_ue_context_modification_failures_total{{carried=\"ue_ambr\"}} {}\n\
-         mme_s1ap_ue_context_modification_failures_total{{carried=\"other\"}} {}\n",
+         mme_s1ap_ue_context_modification_failures_total{{carried=\"other\"}} {}\n\
+         # HELP mme_s1ap_pws_restart_indications_total PWS RESTART INDICATIONs accepted from \
+         an eNB (TS 36.413 8.12.3)\n\
+         # TYPE mme_s1ap_pws_restart_indications_total counter\n\
+         mme_s1ap_pws_restart_indications_total {}\n",
         n(0),
-        n(1)
+        n(1),
+        PWS_RESTART_INDICATIONS.load(std::sync::atomic::Ordering::Relaxed)
     )
 }
 
@@ -317,8 +322,8 @@ fn handle_s1ap_message_inner(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<
             }
         }
     }
-    // #1068, TS 36.413 §8.13.3: a restarted eNB's PWS RESTART INDICATION
-    // (Class 2, no response). Its active warnings are delivered again.
+    // #1068, TS 36.413 §8.12.3: a restarted eNB's PWS RESTART INDICATION
+    // (Class 2, no response): validated, counted and logged (#1069 review).
     if crate::s1ap_gen::is_initiating(data, crate::s1ap_gen::PROC_PWS_RESTART_INDICATION) {
         use crate::s1ap_gen::Class2Decode;
         match crate::s1ap_gen::decode_pws_restart_indication(data) {
@@ -1446,16 +1451,29 @@ fn class2_notify(
     )
 }
 
-/// A PWS RESTART INDICATION from the eNB `enb_id` (TS 36.413 §8.13.3, #1068):
-/// the eNB may have lost its warnings, so each active one covering its area is
-/// written to it again (TS 23.041 §9.1.3.5). The Global eNB ID it names must be
-/// its own: a restart reported for another eNB's identity is not acted on.
-/// Returns how many warnings were re-sent.
+/// PWS RESTART INDICATIONs accepted from an eNB (TS 36.413 §8.12.3, #1068).
+pub static PWS_RESTART_INDICATIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// A PWS RESTART INDICATION from the eNB `enb_id` (TS 36.413 §8.12.3, #1068).
+///
+/// The indication tells the CBC that the restarted cells' warnings are lost and
+/// may be reloaded *from the CBC* (TS 23.007 §15A.1.2): the MME's job is to
+/// propagate it over SBc-AP (TS 29.168), and to forward the CBC's reload, which
+/// names the restarted cells and the broadcasts still owed. mmed has no SBc-AP
+/// transport yet (#1071), so the indication is validated, counted and logged; the
+/// MME does not replay its own copy of the warnings (that would re-broadcast with
+/// the original area and repetition count, #1069 review).
+///
+/// The Global eNB ID must be the sending association's own. mmed connects eNBs
+/// directly and does not serve a HeNB GW (TS 36.300 §4.6.2), behind which the
+/// association is the GW's and the HeNBs' identities are not checked this way.
+/// Returns whether the indication was accepted.
 pub fn handle_pws_restart(
     ctx: &MmeContext,
     enb_id: u64,
     msg: &crate::s1ap_gen::PwsRestartIndication,
-) -> usize {
+) -> bool {
     let plmn = s1ap_build::decode_plmn_id(&msg.global_enb_id.plmn_identity);
     if ctx.enb_find_by_global_enb_id(&plmn, msg.global_enb_id.enb_id) != Some(enb_id) {
         log::warn!(
@@ -1463,14 +1481,19 @@ pub fn handle_pws_restart(
              its own; not acted on",
             msg.global_enb_id
         );
-        return 0;
+        return false;
     }
-    log::info!(
-        "PWS RESTART INDICATION from eNB {enb_id}: {} cell(s), {} TAI(s) to restore",
+    PWS_RESTART_INDICATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    log::warn!(
+        "PWS RESTART INDICATION from eNB {enb_id} ({:?}): {} cell(s), {} TAI(s), {} \
+         emergency area(s) lost their warnings; the CBC reloads them (TS 23.007 §15A.1.2), \
+         and this MME has no SBc-AP association to tell it (#1071)",
+        msg.global_enb_id,
         msg.ecgi_list.len(),
-        msg.tai_list.len()
+        msg.tai_list.len(),
+        msg.emergency_area_ids.len()
     );
-    crate::sbc_handler::handle_pws_restart_indication(ctx, &plmn, msg.global_enb_id.enb_id)
+    true
 }
 
 /// TS 36.413 §10.3.4.2 / §10.3.5 for an initiating message of a Class 2

@@ -230,11 +230,14 @@ fn handle_stop_warning_request_with(
     })
 }
 
-/// Handle PWS Restart Indication (TS 36.413 §8.14, TS 23.041 §9.3.x).
+/// Re-send this MME's own copy of the active warnings to a restarted eNB.
 ///
-/// An eNB that restarted has lost its PWS state, so any warning the MME believes
-/// is broadcasting there is not. Every active warning whose area this eNB serves
-/// is re-sent. Returns how many were re-sent.
+/// NOT what TS 23.007 §15A.1.2 specifies, and not called on a PWS RESTART
+/// INDICATION (#1069 review): there the CBC reloads the warnings, for the
+/// restarted cells and with the broadcasts still owed, after the MME propagates
+/// the indication over SBc-AP (#1071). A replay from here would re-broadcast with
+/// the original area and repetition count. Kept for that SBc-AP work, which may
+/// want a local fallback. Returns how many were re-sent.
 ///
 /// `(plmn, enb_id)` is the Global eNB ID from the indication (TS 36.413 §9.1.8.6), not
 /// a pool id, because that is what the eNB identifies itself by. The whole Global eNB ID
@@ -1029,13 +1032,14 @@ mod tests {
         .unwrap()
     }
 
-    /// #1068, TS 36.413 §8.13.3: a PWS RESTART INDICATION reaching the S1AP
-    /// dispatch is handled. The active warnings covering the restarted eNB's
-    /// area are written to it again, a restart naming another eNB's Global eNB
-    /// ID is not acted on, and one missing its mandatory TAI List for Restart
-    /// (criticality reject) is answered with an ERROR INDICATION and not run.
+    /// #1068, TS 36.413 §8.12.3, #1069 review: a PWS RESTART INDICATION reaching
+    /// the S1AP dispatch is accepted and counted (no response: Class 2). The MME
+    /// does not replay its own copy of an active warning: the CBC reloads it
+    /// (TS 23.007 §15A.1.2). One naming another connected eNB's Global eNB ID is
+    /// not counted, and one missing its mandatory TAI List for Restart
+    /// (criticality reject) gets an ERROR INDICATION and is not run.
     #[test]
-    fn a_pws_restart_indication_through_the_s1ap_dispatch_re_sends_the_warnings() {
+    fn a_pws_restart_indication_through_the_s1ap_dispatch_is_accepted_and_counted() {
         let _guard = crate::gtp_path::lock_s11();
         let ctx = crate::context::mme_self();
         let pool_id = add_setup_enb(ctx, "127.0.0.1:36468", 0x10680);
@@ -1060,9 +1064,16 @@ mod tests {
         // TS 36.413 §8.13.3 / ASN.1: initiating message, procedure code 49,
         // criticality ignore.
         assert_eq!(&pdu[..3], &[0x00, 0x31, 0x40]);
+        let counted = || {
+            crate::s1ap_handler::PWS_RESTART_INDICATIONS.load(std::sync::atomic::Ordering::Relaxed)
+        };
+        let n0 = counted();
         let out = crate::s1ap_handler::handle_s1ap_message(ctx, pool_id, &pdu);
         assert!(out.is_empty(), "Class 2: no response");
-        assert_eq!(written(pool_id), 1, "the active warning is written again");
+        assert_eq!(counted(), n0 + 1, "accepted and counted");
+        assert_eq!(written(pool_id), 0, "no replay of the MME's own copy");
+        assert!(crate::s1ap_handler::render_metrics()
+            .contains("# TYPE mme_s1ap_pws_restart_indications_total counter"));
 
         // Another connected eNB's Global eNB ID from this association: not acted
         // on, so neither eNB is sent anything.
@@ -1075,7 +1086,7 @@ mod tests {
             &pws_restart_pdu(TEST_PLMN, 0x10681, true),
         );
         assert!(out.is_empty());
-        assert_eq!(written(pool_id), 0);
+        assert_eq!(counted(), n0 + 1, "another eNB's identity is not counted");
         assert_eq!(written(other), 0, "not the eNB the indication named either");
         ctx.enb_remove(other);
 
@@ -1086,6 +1097,7 @@ mod tests {
             &pws_restart_pdu(TEST_PLMN, 0x10680, false),
         );
         assert_eq!(out.len(), 1, "an ERROR INDICATION");
+        assert_eq!(counted(), n0 + 1, "not run");
         assert!(matches!(
             crate::s1ap_gen::test_codec::decode_s1ap_pdu(&out[0].pdu),
             Ok(nextgcore_s1ap::S1apMessage::ErrorIndication(_))

@@ -805,8 +805,7 @@ pub fn build_downlink_nas_transport(
     }))
 }
 
-/// Whether `bytes` is an initiating message of `procedure_code`.
-/// PWS Restart Indication (TS 36.413 §8.13.3, §9.1.13.5), procedure code 49.
+/// PWS Restart Indication (TS 36.413 §8.12.3, §9.1.13.5), procedure code 49.
 pub const PROC_PWS_RESTART_INDICATION: u8 = 49;
 const ID_ECGI_LIST_FOR_RESTART: u16 = 182;
 const ID_TAI_LIST_FOR_RESTART: u16 = 188;
@@ -825,7 +824,7 @@ pub struct PwsRestartIndication {
 }
 
 /// Decode a PWS RESTART INDICATION (#1068), a non-UE-associated Class 2
-/// message (TS 36.413 §8.13.3). Its three mandatory IEs are `reject`
+/// message (TS 36.413 §8.12.3). Its three mandatory IEs are `reject`
 /// (§9.1.13.5): missing or not understood, the procedure is not run
 /// (§10.3.4.2 / §10.3.5).
 pub fn decode_pws_restart_indication(bytes: &[u8]) -> Class2Decode<PwsRestartIndication> {
@@ -891,6 +890,7 @@ pub fn decode_pws_restart_indication(bytes: &[u8]) -> Class2Decode<PwsRestartInd
     }
 }
 
+/// Whether `bytes` is an initiating message of `procedure_code`.
 pub fn is_initiating(bytes: &[u8], procedure_code: u8) -> bool {
     bytes.len() >= 2 && bytes[0] == 0x00 && bytes[1] == procedure_code
 }
