@@ -157,7 +157,7 @@ in. An unchanged stamp means they are genuinely still valid. A UPF named by
 hostname has its stamp kept under the configured `host:port`, lower-cased and
 without a trailing dot, so it is found again after the UPF moves (#722). A stamp
 a pre-#722 snapshot kept under the UPF's address is read once, moved to the name,
-and the address entry removed. A UPF hostname must name exactly one UPF.
+and the address entry removed. A UPF hostname must name exactly one UPF. The snapshot also records which UPF each session was established on, by the same key, so in a UPF pool a restored session keeps signalling the UPF that holds it, and that UPF can still report on it (#1031). A session whose UPF is no longer configured goes to the default UPF, and a warning at boot says how many.
 
 **Limits worth knowing:**
 

@@ -367,6 +367,28 @@ pub(crate) fn clear_global_upf_for_test() {
 ///
 /// Returns an owned snapshot rather than a borrow: the pool is now behind a lock,
 /// and a guard must not be held across the `await`s every caller performs.
+/// Report, once at boot, the restored sessions whose UPF is no member of `pool`
+/// (#1031): they route to the default UPF, which may not hold them. Returns how
+/// many there are, per UPF identity.
+pub fn unknown_session_upfs(pool: &[Arc<PfcpClient>]) -> HashMap<String, usize> {
+    let keys: Vec<String> = pool.iter().map(|c| c.recovery_time_stamp_key()).collect();
+    let mut unknown: HashMap<String, usize> = HashMap::new();
+    if let Ok(ctx) = smf_self().read() {
+        if let Ok(m) = ctx.session_upfs.read() {
+            for key in m.values().filter(|k| !keys.contains(k)) {
+                *unknown.entry(key.clone()).or_default() += 1;
+            }
+        }
+    }
+    for (key, n) in &unknown {
+        log::warn!(
+            "{n} restored PFCP session(s) were established on UPF {key}, which is not \
+             configured now; they are routed to the default UPF (#1031)"
+        );
+    }
+    unknown
+}
+
 pub fn global_pool() -> Vec<Arc<PfcpClient>> {
     PFCP_POOL
         .read()
@@ -401,7 +423,49 @@ pub fn forget_session_peer(smf_n4_seid: u64) {
     if let Ok(mut map) = session_peers().write() {
         map.remove(&smf_n4_seid);
     }
+    // #1031: and its durable UPF identity.
+    if let Ok(ctx) = smf_self().read() {
+        if let Ok(mut map) = ctx.session_upfs.write() {
+            map.remove(&smf_n4_seid);
+        }
+    }
     forget_session_bridge_info(smf_n4_seid);
+}
+
+/// Record that the session with SMF-side SEID `smf_n4_seid` was established on
+/// `client`'s UPF: its endpoint, for this process, and its identity
+/// ([`PfcpClient::recovery_time_stamp_key`]), which the durable snapshot carries
+/// (#1031). After a restart only the identity is known, and it also survives a
+/// hostname UPF moving to a new address.
+pub fn record_session_upf(smf_n4_seid: u64, client: &PfcpClient) {
+    record_session_peer(smf_n4_seid, client.peer());
+    if let Ok(ctx) = smf_self().read() {
+        if let Ok(mut map) = ctx.session_upfs.write() {
+            map.insert(smf_n4_seid, client.recovery_time_stamp_key());
+        }
+    }
+}
+
+/// The pool member a session was recorded on (#1031): by its endpoint, else by its
+/// durable identity (a session restored from the snapshot, or a hostname UPF that
+/// moved). `None` when no record names a current member.
+fn recorded_client(smf_n4_seid: u64) -> Option<Arc<PfcpClient>> {
+    let pool = global_pool();
+    let peer = session_peers()
+        .read()
+        .ok()
+        .and_then(|map| map.get(&smf_n4_seid).copied());
+    if let Some(client) = peer.and_then(|peer| pool.iter().find(|c| c.peer() == peer)) {
+        return Some(client.clone());
+    }
+    let key = {
+        let ctx = smf_self();
+        let ctx = ctx.read().ok()?;
+        let key = ctx.session_upfs.read().ok()?.get(&smf_n4_seid).cloned();
+        key
+    }?;
+    pool.into_iter()
+        .find(|c| c.recovery_time_stamp_key() == key)
 }
 
 /// The 5GS bridge info a TSC-capable UPF reported per session (#321), keyed by the
@@ -507,16 +571,7 @@ pub fn clear_tsc_reports_for_test() {
 /// recorded; with a single configured UPF that is always the same client,
 /// so the legacy behavior is unchanged.
 pub fn client_for_session(smf_n4_seid: u64) -> Option<Arc<PfcpClient>> {
-    let peer = session_peers()
-        .read()
-        .ok()
-        .and_then(|map| map.get(&smf_n4_seid).copied());
-    if let Some(peer) = peer {
-        if let Some(client) = global_pool().into_iter().find(|c| c.peer() == peer) {
-            return Some(client);
-        }
-    }
-    global_client()
+    recorded_client(smf_n4_seid).or_else(global_client)
 }
 
 /// Pick the UPF for a NEW session (issue #20; UPF load is a TS 23.501
@@ -1585,6 +1640,7 @@ fn held_session_seids() -> Vec<u64> {
 /// state, where the binding is not persisted), or whose recorded peer no pool
 /// member has any more (a hostname UPF re-resolved), goes to the default client.
 fn session_served_by(seid: u64, client: &PfcpClient) -> bool {
+    // This client's own record: its endpoint, or (#1031) its identity.
     let recorded = session_peers()
         .read()
         .ok()
@@ -1592,9 +1648,17 @@ fn session_served_by(seid: u64, client: &PfcpClient) -> bool {
     if recorded == Some(client.peer()) {
         return true;
     }
-    let routed_elsewhere =
-        recorded.is_some_and(|peer| global_pool().iter().any(|c| c.peer() == peer));
-    !routed_elsewhere && global_client().is_some_and(|c| std::ptr::eq(Arc::as_ptr(&c), client))
+    let identity = smf_self()
+        .read()
+        .ok()
+        .and_then(|ctx| ctx.session_upfs.read().ok()?.get(&seid).cloned());
+    if identity.is_some_and(|k| k == client.recovery_time_stamp_key()) {
+        return true;
+    }
+    // A record naming another current member routes there; anything else goes to
+    // the default client.
+    recorded_client(seid).is_none()
+        && global_client().is_some_and(|c| std::ptr::eq(Arc::as_ptr(&c), client))
 }
 
 /// Whether this SMF holds a PFCP session on `client`'s UPF (#718 review M1).
@@ -2382,6 +2446,66 @@ pub(crate) mod stand_in {
 mod tests {
     use super::stand_in::{client_with_silent_peer as make_client_with_peer, unassociated_upf};
     use super::*;
+
+    /// #1031: a session whose only record is its durable UPF identity (restored from
+    /// the snapshot) is routed to that pool member, not to the default one; and so
+    /// is one whose recorded endpoint is stale because the hostname UPF moved.
+    #[tokio::test]
+    async fn a_restored_sessions_upf_identity_routes_it() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
+        let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let a = Arc::new(PfcpClient::new(
+            local.clone(),
+            "127.0.0.1:47931".parse().unwrap(),
+            [127, 0, 0, 1],
+        ));
+        let b = Arc::new(
+            PfcpClient::new(local, "127.0.0.1:47932".parse().unwrap(), [127, 0, 0, 1])
+                .with_peer_hostname("localhost", 47932),
+        );
+        let _pool = InstalledPool::new(vec![a.clone(), b.clone()]);
+        let restored = 0x1031_0001u64;
+        let moved = 0x1031_0002u64;
+        if let Ok(ctx) = smf_self().read() {
+            let mut m = ctx.session_upfs.write().unwrap();
+            m.insert(restored, b.recovery_time_stamp_key());
+            m.insert(moved, b.recovery_time_stamp_key());
+        }
+        // `moved` was recorded at an address b no longer has.
+        record_session_peer(moved, "127.0.0.1:40000".parse().unwrap());
+
+        let to = |seid| client_for_session(seid).map(|c| c.peer());
+        let routed = (to(restored), to(moved));
+        let served = (
+            session_served_by(restored, &b),
+            session_served_by(restored, &a),
+        );
+        forget_session_peer(restored);
+        forget_session_peer(moved);
+        let forgotten = smf_self()
+            .read()
+            .unwrap()
+            .session_upfs
+            .read()
+            .unwrap()
+            .contains_key(&restored);
+
+        if let Ok(ctx) = smf_self().read() {
+            ctx.session_upfs
+                .write()
+                .unwrap()
+                .insert(0x1031_0003, "gone.example:8805".to_string());
+        }
+        let unknown = unknown_session_upfs(&[a.clone(), b.clone()]);
+        forget_session_peer(0x1031_0003);
+        // Other tests' sessions may name other gone UPFs; this one is counted once.
+        assert_eq!(unknown.get("gone.example:8805"), Some(&1));
+        assert!(!unknown.contains_key(&b.recovery_time_stamp_key()));
+        assert_eq!(routed, (Some(b.peer()), Some(b.peer())));
+        assert_eq!(served, (true, false));
+        assert!(!forgotten, "forgetting the session forgets its UPF");
+    }
 
     fn body_with_cause(cause: u8) -> Vec<u8> {
         vec![0x00, 19, 0x00, 0x01, cause]

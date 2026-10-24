@@ -869,6 +869,8 @@ async fn main() -> Result<()> {
             client.seed_peer_recovery_time_stamp(rts).await;
         }
     }
+    // #1031: restored sessions whose UPF is no longer configured.
+    pfcp_path::unknown_session_upfs(&pfcp_clients);
 
     // PFCP receive/dispatch loop: responses complete pending transactions;
     // node-level requests (heartbeat, association release) are answered by
@@ -2489,7 +2491,7 @@ async fn pfcp_session_establish(
     // Issue #20: remember which UPF this session was established on so
     // modification/deletion keep signalling the same peer. Keyed by the
     // SMF-side SEID: UPF-chosen SEIDs collide across a multi-UPF pool.
-    pfcp_path::record_session_peer(smf_n4_seid, client.peer());
+    pfcp_path::record_session_upf(smf_n4_seid, &client);
 
     Ok(PfcpSessionResult {
         upf_seid,
@@ -5684,6 +5686,16 @@ pub(crate) fn take_sm_context(sm_context_ref: &str) -> Option<Option<context::Po
         .filter(|s| s.sm_context_ref.as_deref() == Some(sm_context_ref));
     if binding.is_none() && sess.is_none() {
         return None;
+    }
+    // #1031: its UPF binding, under the SEID the next line forgets.
+    let smf_seid = ctx
+        .cp_n4_seids
+        .read()
+        .ok()
+        .and_then(|m| m.get(sm_context_ref).copied())
+        .unwrap_or_else(|| context::derive_cp_n4_seid(sm_context_ref));
+    if let Ok(mut m) = ctx.session_upfs.write() {
+        m.remove(&smf_seid);
     }
     for map in [&ctx.pfcp_sessions, &ctx.cp_n4_seids] {
         if let Ok(mut m) = map.write() {
