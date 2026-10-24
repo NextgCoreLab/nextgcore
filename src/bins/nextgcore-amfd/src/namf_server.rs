@@ -4675,10 +4675,12 @@ fn record_transferred_sessions(ue_id: u64, ue_context: &Value, ue_context_id: &s
                  S-NSSAI"
             );
         }
+        // Read through a poisoned lock (#1060 review): falling back to `named` there would
+        // let SST 0 through after all.
         sess.s_nssai = ctx
             .read()
-            .map(|guard| guard.usable_s_nssai(named.clone()))
-            .unwrap_or_else(|_| named.unwrap_or_default());
+            .unwrap_or_else(|e| e.into_inner())
+            .usable_s_nssai(named.clone());
         if let Ok(guard) = ctx.read() {
             guard.sess_update(&sess);
         }

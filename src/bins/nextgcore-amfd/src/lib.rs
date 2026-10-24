@@ -553,7 +553,9 @@ impl AmfApp {
 
         // PLMN support
         for entry in amf_section.plmn_support.unwrap_or_default() {
-            if let Some(plmn_support) = Self::resolve_plmn_support(entry) {
+            if let Some(plmn_support) = Self::resolve_plmn_support(entry)
+                .map_err(|why| anyhow::anyhow!("{config_path}: {why}"))?
+            {
                 log::info!(
                     "Configured PLMN support: PLMN {}{}{}-{}{}{}, {} S-NSSAIs",
                     plmn_support.plmn_id.mcc1,
@@ -673,9 +675,16 @@ impl AmfApp {
         })
     }
 
-    /// Build a runtime PlmnSupport from its typed YAML representation
-    fn resolve_plmn_support(entry: PlmnSupportYaml) -> Option<context::PlmnSupport> {
-        let plmn_id = Self::resolve_plmn_id(entry.plmn_id?)?;
+    /// Build a runtime PlmnSupport from its typed YAML representation. `Ok(None)` for an
+    /// entry with no usable PLMN, as before; `Err` for a PLMN with no usable S-NSSAI
+    /// (#1060 review): TS 38.413 §9.3.1.17 makes the Slice Support List SIZE(1..), so an
+    /// NG Setup Response for it could not be built -- the AMF must not start on it.
+    fn resolve_plmn_support(
+        entry: PlmnSupportYaml,
+    ) -> Result<Option<context::PlmnSupport>, String> {
+        let Some(plmn_id) = entry.plmn_id.and_then(Self::resolve_plmn_id) else {
+            return Ok(None);
+        };
         // #920 follow-up: SST 0 is not a slice (TS 23.501 §5.15.2.2 standardises SST
         // values from 1). A configured SST 0 is refused -- logged and left out -- rather
         // than advertised in NG Setup and handed out as the default S-NSSAI.
@@ -696,12 +705,19 @@ impl AmfApp {
                 Some(context::SNssai { sst, sd: n.sd })
             })
             .collect();
+        if s_nssai_list.is_empty() {
+            return Err(format!(
+                "amf.plmn_support for PLMN {plmn_id:?} has no usable S-NSSAI (none \
+                 configured, or every one is SST 0); the NG Setup Response's Slice Support \
+                 List must hold at least one (TS 38.413 §9.3.1.17)"
+            ));
+        }
         let num_of_s_nssai = s_nssai_list.len();
-        Some(context::PlmnSupport {
+        Ok(Some(context::PlmnSupport {
             plmn_id,
             num_of_s_nssai,
             s_nssai: s_nssai_list,
-        })
+        }))
     }
 
     /// Parse integrity algorithm name to ID
@@ -1172,7 +1188,9 @@ mod tests {
             "plmn_id: { mcc: 001, mnc: 01 }\ns_nssai:\n  - sst: 0\n    sd: 9\n  - sst: 2\n  - sd: 5\n",
         )
         .expect("yaml");
-        let resolved = AmfApp::resolve_plmn_support(entry).expect("the PLMN resolves");
+        let resolved = AmfApp::resolve_plmn_support(entry)
+            .expect("a usable S-NSSAI is left")
+            .expect("the PLMN resolves");
         assert_eq!(
             resolved
                 .s_nssai
@@ -1182,6 +1200,22 @@ mod tests {
             vec![(2, None), (1, Some(5))]
         );
         assert_eq!(resolved.num_of_s_nssai, 2);
+    }
+
+    /// **#1060 review.** An entry whose every S-NSSAI is SST 0 -- or that names none --
+    /// leaves the PLMN with no slice, and an NG Setup Response for it cannot be built (the
+    /// Slice Support List is SIZE(1..)): the configuration is refused at load, naming the
+    /// cause, instead of starting an AMF that fails every NG Setup.
+    #[test]
+    fn a_plmn_with_no_usable_s_nssai_fails_the_configuration() {
+        for yaml in [
+            "plmn_id: { mcc: 001, mnc: 01 }\ns_nssai:\n  - sst: 0\n  - sst: 0\n    sd: 1\n",
+            "plmn_id: { mcc: 001, mnc: 01 }\n",
+        ] {
+            let entry: PlmnSupportYaml = serde_yaml::from_str(yaml).expect("yaml");
+            let err = AmfApp::resolve_plmn_support(entry).expect_err(yaml);
+            assert!(err.contains("no usable S-NSSAI"), "{err}");
+        }
     }
 
     /// A fixture path inside a directory nothing else touches (#601).
