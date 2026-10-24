@@ -40,6 +40,8 @@ pub mod sgsap_handler;
 pub mod sm;
 
 #[cfg(test)]
+mod detach_tests;
+#[cfg(test)]
 mod idle_mode_tests;
 #[cfg(test)]
 mod property_tests;

@@ -12,7 +12,7 @@ use nextgcore_gtp::v2::xact::{Gtp2XactConfig, Gtp2XactMgr};
 use nextgcore_gtp::v2::{Gtp2IeType, Gtp2Message, Gtp2MessageType, Gtp2RecoveryIe};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -446,6 +446,19 @@ impl GtpcServer {
                                 == s11_build::message_type::CHANGE_NOTIFICATION_REQUEST
                             {
                                 take_pending_change_notification(xact.sequence_number);
+                            }
+                            // #1103: a detach does not wait on a Serving GW that
+                            // does not answer: the PDN connection is already
+                            // released locally, and the detach completes.
+                            if xact.message_type == s11_build::message_type::DELETE_SESSION_REQUEST
+                            {
+                                DELETE_SESSION_TIMEOUTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                if let Some(pending) = take_pending_detach(xact.sequence_number) {
+                                    crate::nas_dispatch::on_detach_delete_answered(
+                                        crate::context::mme_self(),
+                                        pending,
+                                    );
+                                }
                             }
                             // #956: an S1 release still completes when the Serving
                             // GW does not answer its Release Access Bearers Request.
@@ -1191,6 +1204,20 @@ pub fn send_delete_session_request(
     sess_id: u64,
     action: GtpDeleteAction,
 ) -> GtpPathResult<GtpXactData> {
+    delete_session(ctx, enb_ue_id, sgw_ue_id, sess_id, action, None)
+}
+
+/// [`send_delete_session_request`], recording `pending` against the request's
+/// sequence number (before the send: the response can race it, #359) so its
+/// response or its N3 exhaustion continues the detach (#1103).
+fn delete_session(
+    ctx: &MmeContext,
+    enb_ue_id: Option<u64>,
+    sgw_ue_id: u64,
+    sess_id: u64,
+    action: GtpDeleteAction,
+    pending: Option<PendingDetach>,
+) -> GtpPathResult<GtpXactData> {
     log::debug!("Sending Delete Session Request");
 
     let sess = ctx
@@ -1202,6 +1229,13 @@ pub fn send_delete_session_request(
     let sgw_ue = ctx
         .sgw_ue_find_by_id(sgw_ue_id)
         .ok_or(GtpPathError::ContextNotFound)?;
+    // #1103: TEID 0 names no context at the Serving GW (its Create Session
+    // Response never came), so there is nothing there to delete.
+    if sgw_ue.sgw_s11_teid == 0 {
+        return Err(GtpPathError::InvalidState(
+            "no S11 session at the Serving GW".to_string(),
+        ));
+    }
 
     // The Linked EPS Bearer ID is the DEFAULT bearer of the PDN connection being
     // torn down (TS 29.274 Table 7.2.9.1-1). A literal 5 was passed before #51,
@@ -1218,7 +1252,16 @@ pub fn send_delete_session_request(
         s11_build::build_delete_session_request(&sess, &mme_ue, &sgw_ue, linked_ebi, action, seq)
             .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
     let xact_id = ctx.next_pool_id();
-    send_to_sgwc(ctx, &msg, xact_id)?;
+    if let Some(pending) = pending {
+        if let Ok(mut map) = pending_detaches().lock() {
+            map.insert(seq, pending);
+        }
+    }
+    if let Err(e) = send_to_sgwc(ctx, &msg, xact_id) {
+        take_pending_detach(seq);
+        return Err(e);
+    }
+    DELETE_SESSION_REQUESTS_TOTAL.fetch_add(1, Ordering::Relaxed);
 
     Ok(GtpXactData {
         xact_id,
@@ -1235,6 +1278,42 @@ pub fn send_delete_all_sessions(
     mme_ue_id: u64,
     action: GtpDeleteAction,
 ) -> GtpPathResult<Vec<GtpXactData>> {
+    delete_all_sessions(ctx, enb_ue_id, mme_ue_id, action, None)
+}
+
+/// A UE-initiated detach (#1103, TS 23.401 §5.3.8.2.1 step 2): a Delete Session
+/// Request, Operation Indication set, for every PDN connection of
+/// `pending.mme_ue_id`, each recorded so that its response or its N3
+/// exhaustion reaches [`crate::nas_dispatch::on_detach_delete_answered`].
+/// Returns how many went out: with none in flight the caller completes the
+/// detach itself.
+pub fn send_delete_all_sessions_for_detach(ctx: &MmeContext, pending: PendingDetach) -> usize {
+    match delete_all_sessions(
+        ctx,
+        Some(pending.enb_ue_id),
+        pending.mme_ue_id,
+        GtpDeleteAction::SendDetachAccept,
+        Some(pending),
+    ) {
+        Ok(xacts) => xacts.len(),
+        Err(GtpPathError::ContextNotFound) => 0,
+        Err(e) => {
+            log::warn!(
+                "UE {}: no Delete Session Request sent for the detach: {e}",
+                pending.mme_ue_id
+            );
+            0
+        }
+    }
+}
+
+fn delete_all_sessions(
+    ctx: &MmeContext,
+    enb_ue_id: Option<u64>,
+    mme_ue_id: u64,
+    action: GtpDeleteAction,
+    pending: Option<PendingDetach>,
+) -> GtpPathResult<Vec<GtpXactData>> {
     log::debug!("Sending Delete All Sessions");
 
     let mme_ue = ctx
@@ -1249,7 +1328,7 @@ pub fn send_delete_all_sessions(
     let mut first_error = None;
     for sess_id in &mme_ue.sess_list {
         if ctx.sess_find_by_id(*sess_id).is_some() {
-            match send_delete_session_request(ctx, enb_ue_id, sgw_ue_id, *sess_id, action) {
+            match delete_session(ctx, enb_ue_id, sgw_ue_id, *sess_id, action, pending) {
                 Ok(xact) => xacts.push(xact),
                 Err(e) => {
                     log::error!(
@@ -1266,6 +1345,81 @@ pub fn send_delete_all_sessions(
         Some(e) if xacts.is_empty() => Err(e),
         _ => Ok(xacts),
     }
+}
+
+/// A UE-initiated detach waiting for its Delete Session Responses before the
+/// DETACH ACCEPT (unless switching off) and the S1 release (#1103, TS 23.401
+/// §5.3.8.2.1 steps 2-8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingDetach {
+    /// The detaching UE.
+    pub mme_ue_id: u64,
+    /// The S1 connection the Detach Request came on.
+    pub enb_ue_id: u64,
+    /// TS 24.301 §5.5.2.2.2: a switch-off detach is not answered.
+    pub switch_off: bool,
+}
+
+/// The Delete Session Requests a [`PendingDetach`] waits on, by sequence
+/// number. TAKEN by the response, or by the request's N3 exhaustion, so a
+/// detach never waits on a Serving GW that does not answer.
+static PENDING_DETACHES: OnceLock<Mutex<HashMap<u32, PendingDetach>>> = OnceLock::new();
+
+fn pending_detaches() -> &'static Mutex<HashMap<u32, PendingDetach>> {
+    PENDING_DETACHES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Take the detach the Delete Session Request at `seq` was for, if any.
+pub fn take_pending_detach(seq: u32) -> Option<PendingDetach> {
+    pending_detaches().lock().ok()?.remove(&seq)
+}
+
+/// Whether a Delete Session Request of `mme_ue_id`'s detach is still unanswered.
+pub fn detach_deletes_outstanding(mme_ue_id: u64) -> bool {
+    pending_detaches()
+        .lock()
+        .map(|map| map.values().any(|p| p.mme_ue_id == mme_ue_id))
+        .unwrap_or(false)
+}
+
+/// Forget every Delete Session Request `mme_ue_id`'s detach waits on: the
+/// detach completed or the context went another way.
+pub fn drop_pending_detaches(mme_ue_id: u64) {
+    if let Ok(mut map) = pending_detaches().lock() {
+        map.retain(|_, p| p.mme_ue_id != mme_ue_id);
+    }
+}
+
+/// Delete Session Requests sent to the Serving GW (#1103).
+pub static DELETE_SESSION_REQUESTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Delete Session Responses received, Request accepted.
+pub static DELETE_SESSION_ACCEPTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Delete Session Responses received with any other cause.
+pub static DELETE_SESSION_REJECTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Delete Session Requests the Serving GW never answered (N3 exhausted).
+pub static DELETE_SESSION_TIMEOUTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Prometheus lines for the Delete Session counters (#1103).
+pub fn render_delete_session_metrics() -> String {
+    format!(
+        "# HELP mme_s11_delete_session_requests_total Delete Session Requests sent to the \
+         Serving GW\n\
+         # TYPE mme_s11_delete_session_requests_total counter\n\
+         mme_s11_delete_session_requests_total {}\n\
+         # HELP mme_s11_delete_session_responses_total Delete Session Responses received, by \
+         result\n\
+         # TYPE mme_s11_delete_session_responses_total counter\n\
+         mme_s11_delete_session_responses_total{{result=\"accepted\"}} {}\n\
+         mme_s11_delete_session_responses_total{{result=\"rejected\"}} {}\n\
+         # HELP mme_s11_delete_session_timeouts_total Delete Session Requests the Serving GW \
+         never answered (N3 exhausted); the PDN connections were released locally\n\
+         # TYPE mme_s11_delete_session_timeouts_total counter\n\
+         mme_s11_delete_session_timeouts_total {}\n",
+        DELETE_SESSION_REQUESTS_TOTAL.load(Ordering::Relaxed),
+        DELETE_SESSION_ACCEPTED_TOTAL.load(Ordering::Relaxed),
+        DELETE_SESSION_REJECTED_TOTAL.load(Ordering::Relaxed),
+        DELETE_SESSION_TIMEOUTS_TOTAL.load(Ordering::Relaxed),
+    )
 }
 
 pub fn send_create_bearer_response(

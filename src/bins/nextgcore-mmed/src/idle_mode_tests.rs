@@ -21,18 +21,18 @@ use nextgcore_s1ap_gen::generated as g;
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
-const SGW_S11_TEID: u32 = 0x0956_0001;
+pub(crate) const SGW_S11_TEID: u32 = 0x0956_0001;
 const SGW_S1U_TEID: u32 = 0x0956_5500;
-const KNAS_INT: [u8; 16] = [0x56; 16];
+pub(crate) const KNAS_INT: [u8; 16] = [0x56; 16];
 
-struct Ue {
-    mme_ue_id: u64,
-    enb_id: u64,
-    enb_ue_id: u64,
-    local_teid: u32,
-    sess_id: u64,
-    sgw_ue_id: u64,
-    tai: EpsTai,
+pub(crate) struct Ue {
+    pub(crate) mme_ue_id: u64,
+    pub(crate) enb_id: u64,
+    pub(crate) enb_ue_id: u64,
+    pub(crate) local_teid: u32,
+    pub(crate) sess_id: u64,
+    pub(crate) sgw_ue_id: u64,
+    pub(crate) tai: EpsTai,
 }
 
 fn enb_addr() -> std::net::SocketAddr {
@@ -44,7 +44,7 @@ fn enb_addr() -> std::net::SocketAddr {
 
 /// An attached ECM-CONNECTED UE with one PDN connection (EBIs `ebis`), on an
 /// eNB that completed S1 Setup advertising the UE's tracking area.
-fn seed(tac: u16, ebis: &[u8]) -> Ue {
+pub(crate) fn seed(tac: u16, ebis: &[u8]) -> Ue {
     let ctx = mme_self();
     let tai = EpsTai {
         plmn_id: PlmnId::new("999", "70"),
@@ -113,7 +113,7 @@ fn seed(tac: u16, ebis: &[u8]) -> Ue {
     }
 }
 
-fn release(ue: &Ue) {
+pub(crate) fn release(ue: &Ue) {
     let ctx = mme_self();
     ctx.bearer_pool
         .write()
@@ -124,7 +124,7 @@ fn release(ue: &Ue) {
     ctx.sgw_ue_pool.write().unwrap().remove(&ue.sgw_ue_id);
 }
 
-fn sgw(config: Gtp2XactConfig) -> (UdpSocket, crate::gtp_path::S11TestRoute) {
+pub(crate) fn sgw(config: Gtp2XactConfig) -> (UdpSocket, crate::gtp_path::S11TestRoute) {
     let sgw = UdpSocket::bind("127.0.0.1:0").unwrap();
     sgw.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
     let server = GtpcServer::open("127.0.0.1:0", config, 7).unwrap();
@@ -132,7 +132,7 @@ fn sgw(config: Gtp2XactConfig) -> (UdpSocket, crate::gtp_path::S11TestRoute) {
     (sgw, route)
 }
 
-fn recv(sgw: &UdpSocket, msg_type: u8) -> (Gtp2Message, std::net::SocketAddr) {
+pub(crate) fn recv(sgw: &UdpSocket, msg_type: u8) -> (Gtp2Message, std::net::SocketAddr) {
     let mut buf = [0u8; 4096];
     loop {
         let (len, from) = sgw
@@ -145,7 +145,7 @@ fn recv(sgw: &UdpSocket, msg_type: u8) -> (Gtp2Message, std::net::SocketAddr) {
     }
 }
 
-fn wait_pdu<T>(enb_id: u64, mut pick: impl FnMut(&g::S1AP_PDU) -> Option<T>) -> T {
+pub(crate) fn wait_pdu<T>(enb_id: u64, mut pick: impl FnMut(&g::S1AP_PDU) -> Option<T>) -> T {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         for pdu in crate::s1ap_path::take_tapped_for_test(enb_id) {
@@ -160,7 +160,7 @@ fn wait_pdu<T>(enb_id: u64, mut pick: impl FnMut(&g::S1AP_PDU) -> Option<T>) -> 
     panic!("no matching S1AP PDU reached eNB {enb_id}");
 }
 
-fn is_release_command(pdu: &g::S1AP_PDU) -> Option<()> {
+pub(crate) fn is_release_command(pdu: &g::S1AP_PDU) -> Option<()> {
     matches!(
         pdu,
         g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
@@ -1383,7 +1383,7 @@ fn released_s1u_releases_are_bounded_per_window() {
 
 /// A second PDN connection for `ue`, its default bearer `ebi` active at the
 /// Serving GW and (until an S1 release) at the eNB. Returns the session id.
-fn add_pdn(ue: &Ue, ebi: u8) -> u64 {
+pub(crate) fn add_pdn(ue: &Ue, ebi: u8) -> u64 {
     let ctx = mme_self();
     let sess_id = ctx.sess_add(ue.mme_ue_id, 10);
     let bearer_id = ctx.bearer_add(sess_id, ue.mme_ue_id);
