@@ -4354,6 +4354,154 @@ async fn an_aborted_procedure_releases_the_sessions_before_forgetting_the_ue() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// #653: an update from CM-IDLE with no follow-on request releases the connection
+// ---------------------------------------------------------------------------
+
+/// `inner` as the UE sends it under `ue`'s context: integrity protected and
+/// ciphered (security header type 2), uplink NAS COUNT `count`.
+fn ue_protect_ciphered(ue: &crate::context::AmfUe, inner: &[u8], count: u8) -> Vec<u8> {
+    let mut ciphered = inner.to_vec();
+    nas_security::nas_encrypt(
+        ue.selected_enc_algorithm,
+        &ue.knas_enc,
+        u32::from(count),
+        ue.access_type,
+        nas_security::direction::UPLINK,
+        &mut ciphered,
+    );
+    let mut mac_data = vec![count];
+    mac_data.extend_from_slice(&ciphered);
+    let mac = nas_security::nas_mac_calculate(
+        ue.selected_int_algorithm,
+        &ue.knas_int,
+        u32::from(count),
+        ue.access_type,
+        nas_security::direction::UPLINK,
+        &mac_data,
+    );
+    let mut out = vec![0x7E, security_header::INTEGRITY_PROTECTED_AND_CIPHERED];
+    out.extend_from_slice(&mac);
+    out.push(count);
+    out.extend_from_slice(&ciphered);
+    out
+}
+
+/// A periodic update from CM-IDLE (no session IEs), with the Follow-on request
+/// bit as given, answered and completed: ICS, ICS Response, Registration
+/// Complete. Returns the UE Context Release Commands sent after the Accept, as
+/// `(AMF UE NGAP ID, RAN UE NGAP ID, NAS cause)`, and whether the UE is still
+/// registered.
+async fn complete_idle_update(
+    follow_on: bool,
+    uplink_data_for_psi_1: bool,
+    ids: (u64, u64, u32),
+) -> (Vec<(u64, Option<u32>, Option<u8>)>, bool) {
+    let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    let _guami = ServeFixtureGuami::install();
+    let mut server = capturing_ngap_server().await;
+    let (old_id, new_id, tmsi) = ids;
+    let stored = idle_ue_for_update(old_id, tmsi);
+    let ue_keys = stored.amf_ue.clone();
+    server.ue_auth_state.insert(old_id, stored);
+    server.forced_amf_ue_ngap_id = Some(new_id);
+    let (_smf, port, _calls) = activating_smf().await;
+    hold_session(&mut server, old_id, 1, &format!("upd653-{old_id}"), port);
+
+    let mut rr = super::guti_registration_request(
+        crate::gmm_build::registration_type::PERIODIC_UPDATING,
+        tmsi,
+    );
+    if follow_on {
+        rr[3] |= 0x08; // Follow-on request pending (TS 24.501 §9.11.3.7)
+    }
+    let mut full = rr.clone();
+    if uplink_data_for_psi_1 {
+        full.extend_from_slice(&[0x40, 0x02, 1 << 1, 0x00]); // Uplink data status: PSI 1
+    }
+    let nas = super::protected_initial_registration(&ue_keys, &rr, &full, 5);
+    server
+        .handle_initial_ue_message(ASSOC, &super::service_request_initial_ue(nas))
+        .await
+        .expect("the update is handled");
+    let ran = server
+        .ue_auth_state
+        .get(new_id)
+        .expect("resumed")
+        .ran_ue_ngap_id;
+    take_sent_ngap(&mut server);
+    server
+        .handle_initial_context_setup_response(
+            ASSOC,
+            &crate::ngap_asn1::tests::ics_response_pdu(new_id, ran),
+        )
+        .await
+        .expect("ICS Response handled");
+    let complete = ue_protect_ciphered(
+        &ue_keys,
+        &[0x7E, 0x00, message_type::REGISTRATION_COMPLETE],
+        6,
+    );
+    server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(new_id, ran, &complete))
+        .await
+        .expect("Registration Complete handled");
+    let released: Vec<_> = take_sent_ngap(&mut server)
+        .iter()
+        .filter_map(|(_, pdu)| super::decoded_release_command(pdu))
+        .collect();
+    let registered = server
+        .ue_auth_state
+        .get(new_id)
+        .is_some_and(|s| s.registered);
+    server.forget_ue(new_id);
+    server.forget_ue(old_id);
+    (released, registered)
+}
+
+/// #653, TS 24.501 §5.3.1.3 b) / TS 23.502 §4.2.2.2.2 step 23: an update from
+/// 5GMM-IDLE with "No follow-on request pending", no Uplink data status and no
+/// user plane re-established has nothing left to use the connection for. Once
+/// the registration completes, the AMF releases it with a normal UE Context
+/// Release (CauseNas normal-release 0), and the UE stays registered. Its next
+/// uplink data then starts a Service Request, which restores the user plane.
+/// Before #653 the connection stayed up with no user plane, and the UE, which
+/// was CM-CONNECTED, never sent a Service Request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_update_without_follow_on_releases_the_connection_once_complete() {
+    let (released, registered) =
+        complete_idle_update(false, false, (7_653_001, 7_653_002, 0x0653_0001)).await;
+    // (`decoded_release_command` reads only a radioNetwork cause; the NAS
+    // normal-release is the builder's `cause_group::NAS`, 0.)
+    assert_eq!(
+        released,
+        vec![(7_653_002, Some(512), None)],
+        "one release of the update's connection, and not a radio-network one"
+    );
+    assert!(registered, "the UE stays registered");
+}
+
+/// The control: with "Follow-on request pending" the UE has more to do on the
+/// connection, so it is kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_update_with_follow_on_keeps_the_connection() {
+    let (released, registered) =
+        complete_idle_update(true, false, (7_653_011, 7_653_012, 0x0653_0011)).await;
+    assert_eq!(released, vec![], "no release");
+    assert!(registered);
+}
+
+/// Nor is a connection whose update re-established a user plane (Uplink data
+/// status {1}) released: the UE has data to send on it (TS 24.501 §5.3.1.3 b) 3)).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_update_that_reactivated_a_session_keeps_the_connection() {
+    let (released, registered) =
+        complete_idle_update(false, true, (7_653_021, 7_653_022, 0x0653_0021)).await;
+    assert_eq!(released, vec![], "no release");
+    assert!(registered);
+}
+
 /// #749 over the Namf surface: smfd's downlink-data N1N2 for PSI 2 pages the
 /// idle UE (202). The one for PSI 1, while that paging is ongoing, is answered
 /// 409 with `N1N2MessageTransferError` cause HIGHER_PRIORITY_REQUEST_ONGOING and
