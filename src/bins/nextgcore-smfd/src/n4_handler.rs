@@ -28,24 +28,10 @@ pub mod gtp1_cause {
     pub const ALL_DYNAMIC_PDP_ADDRS_OCCUPIED: u8 = 205;
 }
 
-/// GTPv2 Cause codes
-pub mod gtp2_cause {
-    pub const REQUEST_ACCEPTED: u8 = 16;
-    pub const REQUEST_REJECTED_REASON_NOT_SPECIFIED: u8 = 17;
-    pub const CONTEXT_NOT_FOUND: u8 = 64;
-    pub const MANDATORY_IE_MISSING: u8 = 70;
-    pub const CONDITIONAL_IE_MISSING: u8 = 71;
-    pub const INVALID_LENGTH: u8 = 72;
-    pub const MANDATORY_IE_INCORRECT: u8 = 73;
-    pub const INVALID_MESSAGE_FORMAT: u8 = 74;
-    pub const REMOTE_PEER_NOT_RESPONDING: u8 = 100;
-    pub const SEMANTIC_ERROR_IN_THE_TFT_OPERATION: u8 = 81;
-    pub const GTP_C_ENTITY_CONGESTION: u8 = 101;
-    pub const NO_RESOURCES_AVAILABLE: u8 = 73;
-    pub const SERVICE_NOT_SUPPORTED: u8 = 68;
-    pub const SYSTEM_FAILURE: u8 = 72;
-    pub const ALL_DYNAMIC_ADDRESSES_ARE_OCCUPIED: u8 = 84;
-}
+/// GTPv2 cause octets: the shared TS 29.274 Table 8.4-1 table (#1037). This
+/// node's own copy had seven wrong values, Request rejected among them as 17
+/// (Request accepted partially).
+pub use nextgcore_gtp::v2::cause as gtp2_cause;
 
 // ============================================================================
 // SBI HTTP Status Codes

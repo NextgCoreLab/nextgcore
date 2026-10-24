@@ -89,10 +89,16 @@ pub mod pfcp_interface {
     pub const CP_FUNCTION: u8 = 3;
 }
 
-/// PFCPSMReq-Flags (TS 29.244 §8.2.50).
+/// PFCPSMReq-Flags octet 5 (TS 29.244 §8.2.31 in Rel-20 numbering).
 pub mod smreq_flags {
-    /// DROBU: drop the packets buffered for this session.
-    pub const DROBU: u8 = 0x02;
+    /// Bit 1, DROBU: drop the packets buffered for this session before applying the
+    /// FARs. #1041: this was 0x02, which is SNDEM -- a conformant SGW-U read "discard
+    /// the buffered downlink" as "send End Marker packets" and kept the buffer.
+    pub const DROBU: u8 = 0x01;
+    /// Bit 2, SNDEM: send End Marker packets on the old path.
+    pub const SNDEM: u8 = 0x02;
+    /// Bit 3, QAURR: query all URRs.
+    pub const QAURR: u8 = 0x04;
 }
 
 // ============================================================================
@@ -322,7 +328,7 @@ pub fn build_bearer_to_modify_list(
 }
 
 /// Build a Session Modification Request that discards the session's buffered downlink
-/// packets (TS 29.244 §8.2.50 DROBU, TS 23.401 §5.3.4.2). Issue #54.
+/// packets (TS 29.244 §8.2.31 DROBU, TS 23.401 §5.3.4.2). Issue #54.
 pub fn build_drop_buffered_packets_request(sess: &SgwcSess) -> Option<PfcpMessage> {
     let mut msg = PfcpMessage::new(pfcp_type::SESSION_MODIFICATION_REQUEST, sess.sgwu_sxa_seid);
     let mut req = LibSessionModificationRequest::new();
@@ -542,10 +548,20 @@ mod tests {
         let msg = build_drop_buffered_packets_request(&sess).expect("built");
         let mut body = Bytes::copy_from_slice(&msg.data);
         let decoded = LibSessionModificationRequest::decode(&mut body).expect("decodable");
+        // #1041: the spec's bit, not the constant -- the constant itself was wrong
+        // (0x02 is SNDEM), and a test comparing against it could only agree with it.
         assert_eq!(
             decoded.pfcp_smreq_flags,
-            Some(smreq_flags::DROBU),
-            "without DROBU on the wire the SGW-U keeps the buffered packets forever"
+            Some(0x01),
+            "PFCPSMReq-Flags bit 1 (DROBU, TS 29.244 §8.2.31); without it the SGW-U \
+             keeps the buffered packets forever"
         );
+        // And the raw IE on the wire: type 49, length 1, octet 5 = 0x01.
+        let ie = msg
+            .data
+            .windows(5)
+            .find(|w| w[..4] == [0, 49, 0, 1])
+            .expect("a PFCPSMReq-Flags IE");
+        assert_eq!(ie[4], 0x01);
     }
 }

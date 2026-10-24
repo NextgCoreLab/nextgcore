@@ -147,6 +147,10 @@ pub mod pfcp_ie {
     /// no cadence and `DataPlaneUrr::measurement_period_secs`'s only reader could
     /// never fire.
     pub const MEASUREMENT_PERIOD: u16 = 64;
+    /// Inactivity Detection Time (§8.2.18), u32 seconds.
+    pub const INACTIVITY_DETECTION_TIME: u16 = 36;
+    /// Measurement Information (§8.2.68); bit 4 of octet 5 is ISTM.
+    pub const MEASUREMENT_INFORMATION: u16 = 100;
     pub const VOLUME_MEASUREMENT: u16 = 66;
     pub const DURATION_MEASUREMENT: u16 = 67;
     pub const TIME_OF_FIRST_PACKET: u16 = 69;
@@ -1679,6 +1683,7 @@ pub fn parse_create_urr(data: &[u8]) -> Result<ParsedCreateUrr, &'static str> {
 
     // Measurement Method (IE type 62)
     if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::MEASUREMENT_METHOD) {
+        urr.measurement_method_present = true;
         if !ie.value.is_empty() {
             urr.measure_duration = (ie.value[0] & 0x01) != 0;
             urr.measure_volume = (ie.value[0] & 0x02) != 0;
@@ -1703,6 +1708,22 @@ pub fn parse_create_urr(data: &[u8]) -> Result<ParsedCreateUrr, &'static str> {
             urr.trigger_volume_quota = (ie.value[1] & 0x01) != 0;
             urr.trigger_time_quota = (ie.value[1] & 0x02) != 0;
         }
+    }
+
+    // #820: Inactivity Detection Time (§8.2.18) and ISTM (Measurement Information
+    // §8.2.68 octet 5 bit 4), which define how TIME is measured (§5.2.2.2).
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::INACTIVITY_DETECTION_TIME) {
+        if ie.value.len() >= 4 {
+            urr.inactivity_detection_secs = Some(u32::from_be_bytes([
+                ie.value[0],
+                ie.value[1],
+                ie.value[2],
+                ie.value[3],
+            ]));
+        }
+    }
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::MEASUREMENT_INFORMATION) {
+        urr.immediate_start_time_metering = ie.value.first().is_some_and(|b| b & 0x08 != 0);
     }
 
     // Volume Threshold (IE type 31, TS 29.244 §8.2.13) - flags + values.
@@ -1804,6 +1825,8 @@ fn parse_volume_ie(value: &[u8]) -> (Option<u64>, Option<u64>, Option<u64>) {
 pub struct ParsedCreateUrr {
     pub urr_id: u32,
     pub measure_duration: bool,
+    /// The Measurement Method IE was present (an Update URR changes it only then).
+    pub measurement_method_present: bool,
     pub measure_volume: bool,
     pub trigger_periodic: bool,
     pub trigger_volume_threshold: bool,
@@ -1818,6 +1841,10 @@ pub struct ParsedCreateUrr {
     pub time_threshold_secs: Option<u32>,
     /// Measurement Period (IE type 64), the PERIO trigger's cadence.
     pub measurement_period_secs: Option<u32>,
+    /// Inactivity Detection Time (IE 36, §8.2.18), seconds (#820).
+    pub inactivity_detection_secs: Option<u32>,
+    /// ISTM, Immediate Start Time Metering (Measurement Information IE 100) (#820).
+    pub immediate_start_time_metering: bool,
     /// Volume Quota (IE type 73, TS 29.244 §8.2.40) — the volume at which the UP
     /// function STOPS FORWARDING the matching traffic, as distinct from the
     /// threshold at which it merely reports (#80, §5.2.2.2.2).
@@ -2055,11 +2082,14 @@ pub fn parse_recovery_time_stamp(payload: &[u8]) -> Option<u32> {
     let ies = ParsedIe::parse_all(payload);
     ParsedIe::find_ie(&ies, pfcp_ie::RECOVERY_TIME_STAMP).and_then(|ie| {
         if ie.value.len() >= 4 {
-            // #995: in the NTP reading, so a pre-#995 peer's Unix-seconds stamp
-            // compares with an NTP one.
-            Some(nextgcore_pfcp::recovery_time::normalize_received(
-                u32::from_be_bytes([ie.value[0], ie.value[1], ie.value[2], ie.value[3]]),
-            ))
+            // The wire value: the comparison sites normalize it (#995; a parser that
+            // depends on the clock was a #1004 review minor).
+            Some(u32::from_be_bytes([
+                ie.value[0],
+                ie.value[1],
+                ie.value[2],
+                ie.value[3],
+            ]))
         } else {
             None
         }
@@ -2942,5 +2972,44 @@ mod tests {
         // the bit to 0 to turn reflective QoS off for the flow).
         let explicit_off = parse_create_qer(&qer_ies(&[ie(123, &[0x00])])).expect("QER parses");
         assert!(!explicit_off.rqi);
+    }
+
+    /// #953 review: an Update URR changes DURAT only when it carries a Measurement
+    /// Method (an absent IE parses as `measure_duration == false`).
+    #[test]
+    fn an_update_urr_says_whether_it_carries_a_measurement_method() {
+        let mut b = PfcpMessageBuilder::new();
+        b.add_u32(pfcp_ie::URR_ID, 9);
+        assert!(
+            !parse_create_urr(&b.build())
+                .unwrap()
+                .measurement_method_present
+        );
+        let mut b = PfcpMessageBuilder::new();
+        b.add_u32(pfcp_ie::URR_ID, 9);
+        b.add_u8(pfcp_ie::MEASUREMENT_METHOD, 0x01);
+        let urr = parse_create_urr(&b.build()).unwrap();
+        assert!(urr.measurement_method_present && urr.measure_duration);
+    }
+
+    /// #820: the time-metering IEs of a Create/Update URR are parsed: Inactivity
+    /// Detection Time (IE 36, §8.2.18) and ISTM (Measurement Information IE 100,
+    /// octet 5 bit 4, §8.2.68).
+    #[test]
+    fn a_urr_carries_its_inactivity_detection_time_and_istm() {
+        let mut b = PfcpMessageBuilder::new();
+        b.add_u32(pfcp_ie::URR_ID, 9);
+        b.add_u32(pfcp_ie::INACTIVITY_DETECTION_TIME, 45);
+        b.add_u8(pfcp_ie::MEASUREMENT_INFORMATION, 0x08);
+        let urr = parse_create_urr(&b.build()).expect("parses");
+        assert_eq!(urr.inactivity_detection_secs, Some(45));
+        assert!(urr.immediate_start_time_metering);
+
+        let mut b = PfcpMessageBuilder::new();
+        b.add_u32(pfcp_ie::URR_ID, 9);
+        b.add_u8(pfcp_ie::MEASUREMENT_INFORMATION, 0x02); // INAM only
+        let urr = parse_create_urr(&b.build()).expect("parses");
+        assert_eq!(urr.inactivity_detection_secs, None);
+        assert!(!urr.immediate_start_time_metering);
     }
 }

@@ -27,6 +27,8 @@ pub mod sockopt; // Socket options (nextgcore-sockopt.h)
 pub mod state_store; // Durable JSON snapshot store for NF runtime state (issue #66)
 pub mod strings; // String utilities (nextgcore-strings.h)
 pub mod tcp; // TCP server/client (nextgcore-tcp.h)
+#[cfg(feature = "test-log")]
+pub mod test_log; // capturing logger for NF tests (#1026)
 pub mod thread; // Thread utilities (nextgcore-thread.h)
 pub mod time; // Time utilities (nextgcore-time.h)
 pub mod timer; // Timer wheel (nextgcore-timer.h)
