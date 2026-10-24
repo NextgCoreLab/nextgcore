@@ -92,14 +92,33 @@ The N4/PFCP endpoints are configured by environment variables, **not** by the `s
 | Variable | Default | Description |
 |---|---|---|
 | `SMF_CONFIG` | `/etc/nextgcore/smf.yaml` | Config file path (overridden by `-c`/`--config`). |
-| `SMF_PFCP_ADDR` / `SMF_PFCP_PORT` | `0.0.0.0` / `8805` | N4 PFCP bind address (single socket; sequence-number matching per TS 29.244 §7.2.1, per code comment). `SMF_PFCP_ADDR` also supplies the PFCP Node ID (falls back to `127.0.0.1` if not a dotted IPv4). |
+| `SMF_PFCP_ADDR` / `SMF_PFCP_PORT` | `0.0.0.0` / `8805` | N4 PFCP bind address (single socket; sequence-number matching per TS 29.244 §7.2.1). An IPv4 address. When it is a specified address and nothing below overrides it, it is also the PFCP Node ID and the CP F-SEID address. |
+| `SMF_PFCP_NODE_ID` | the bind address when specified, else the F-SEID address | The PFCP Node ID (TS 29.244 §5.8.1, §8.2.38): an IPv4 address or an FQDN. It must stay the same across restarts, or the UPF sees a different CP function and does not keep its sessions; on k8s use the SMF's Service FQDN. The SMF logs a warning when it has to derive the Node ID from a wildcard bind. |
+| `SMF_PFCP_ADVERTISE_ADDR` | the bind address when specified, else an IPv4 Node ID, else the local address routed toward the first UPF | The IPv4 address in every CP F-SEID (TS 29.244 §8.2.37), which the UPF sends Session Report Requests to. On k8s, the pod IP. The SMF refuses to start when it can find no routable address rather than signal `0.0.0.0`. |
 | `UPF_PFCP_ADDR` / `UPF_PFCP_PORT` | `127.0.0.1` / `8805` | UPF N4 peer(s), comma-separated. Each entry is an IP, `IP:port`, or a hostname (`host` or `host:port`); a hostname is re-resolved on every Association Setup attempt, so a UPF that moves to a new IP is re-associated. |
-| `SMF_PFCP_RELEASE_ON_SHUTDOWN` | `false` | Send PFCP Association Release on graceful shutdown. Off by default: the UPF deletes every session of a released association, so a restart would cut all UE traffic. Set `true` only when the SMF is being removed for good. |
+| `SMF_PFCP_RELEASE_ON_SHUTDOWN` | unset | Whether a graceful shutdown sends PFCP Association Release. Unset: released unless durable state (`--state-file` / `NEXTGCORE_SMF_STATE_FILE`) is armed. Without durable state the next SMF knows none of the sessions, so the UPF deletes them rather than keep them orphaned (#718). With durable state the association is kept, and the next SMF asks the UPF to retain the restored sessions (PFCP Session Retention Information, TS 29.244 §6.2.6.2); EPC PDN connections are not durable, so they are deleted at the PGW-U and toward the SGW first. `true` or `false` overrides either way. Without durable state an SMF that is killed (SIGKILL, OOM, node loss) cannot tell any UE: the next SMF knows none of the sessions, and the UPF deletes them when it associates. Only durable state, or TS 23.527 SMF restoration, avoids that. A graceful shutdown deregisters from the NRF and refuses new SM contexts (500 `NF_FAILOVER`) before it releases anything. |
+
+**Who may talk to the SMF on N4 (#971).** A datagram is handled as a UPF's only when it comes from a configured or associated UPF: from its exact endpoint, or, for a request, from any port of its address or any of its other addresses (TS 29.244 §4.2.2, §5.8.1; the Node ID's address, or what its FQDN or configured hostname resolves to, learnt at each Association Setup). A response is accepted only from the exact endpoint its request went to (§4.2.3). From any other host:
+- a Heartbeat Request is answered with the SMF's own Recovery Time Stamp, and nothing is taken from it (TS 23.007 §19A);
+- an Association Setup Request is dropped, because UP-initiated setup (§6.2.6.3.2) is not implemented;
+- any other request (Association Update or Release, Node Report, Session Set Deletion, Session Report) is refused with cause 72, "No established PFCP Association" (§8.2.1);
+- a response is dropped.
+
+A UPF may report only on its own sessions. A Session Report for a SEID this SMF does not hold, or for a session served by another UPF, gets cause 65. A session restored from durable state belongs to the default UPF.
+
+Every refused datagram increments `smf_pfcp_unauthorized_messages_total`. This is one unlabelled counter, so it adds no series per sender. Each one is logged at DEBUG, with at most one WARN summary every 10 s, so a forged-sender flood does not fill the log. An on-path attacker that spoofs a UPF's source address is that UPF as far as PFCP can tell: protect N4 at the transport (a private network, or IPsec, TS 33.501 §9.9).
+
+**One SMF instance at a time.** Every SMF pod signals the same PFCP Node ID, and a UPF keeps one association per Node ID (TS 29.244 §6.2.6.2.2). A second instance replaces the first one's association and deletes its sessions. The k8s and Helm Deployments therefore use `strategy: Recreate`, and the chart refuses `smf.replicas > 1`. `Recreate` covers rollouts only. `kubectl delete pod` and a node drain create the replacement while the old pod is still terminating, so the two overlap for the termination grace period. Without durable state that is harmless: the old pod is releasing, and its UEs get #39. With durable state on a volume, both pods would open the same state file. Run a durable SMF as a StatefulSet, which never starts a replacement before the old pod has terminated.
+
+**Termination grace period.** A graceful shutdown first tells every UE (#39) and every SGW (Delete Bearer, retransmitted for up to 12 s), then releases each UPF association (up to T1 x N1 when a UPF is gone). The shipped SMF and PGW-C manifests set `terminationGracePeriodSeconds: 45`. A shorter period cuts the retransmissions off.
+
+**Durable state is a one-way upgrade.** The snapshot format is versioned. This release writes version 2 (5G CP SEIDs `1<<48 | ref`; a version-1 session keeps its legacy `ref | 0x1000` SEID). An older binary refuses a newer snapshot rather than misread it, so rolling smfd back across this change with a state file fails to start. Remove the file (the sessions are then released) or roll forward.
 | `SMF_SBI_ADVERTISE_URI` | derived from SBI server address/port | Externally reachable base URI used in PCF callback (`notificationUri`) URIs. |
 | `UDM_SBI_ADDR` / `UDM_SBI_PORT` | unset / `7777` | UDM address for `Nudm_SDM_Get(smf-select-data)`, used only to resolve the **subscribed default DNN** (#204). Tried **after** NRF discovery, so it is the fallback for a deployment with no NRF. With neither available, a `SmContextCreateData` carrying no `dnn` is refused with `SUBSCRIPTION_DATA_NOT_AVAILABLE`. |
 | `NRF_URI` | unset | NRF URI, used when the YAML names none. |
 | `PCF_URI` / `NSACF_URI` | unset | PCF / NSACF endpoint, tried before NRF discovery. With no NSACF configured or discoverable, slice admission control is skipped. |
-| `SMF_METRICS_PORT` | `9090` | Prometheus endpoint port (bound on `0.0.0.0`). |
+| `SMF_METRICS_PORT` | `9090` | Prometheus endpoint port. |
+| `NEXTGCORE_METRICS_BIND` | `127.0.0.1` | Host the unauthenticated `/metrics` listener binds to (#837). The compose files and manifests set `0.0.0.0` inside the private container/pod network. |
 | `SMF_UDM` | off | `1`/`true` turns on the UDM interaction of TS 23.502 §4.3.2.2.1 step 4 (UECM registration, SM-data subscription, #79). Off by default because the E2E harness has no conformant UDM. |
 | `SMF_EPS_INTERWORKING` | off | `1`/`true` makes an establishing PDU session request an EPS Bearer Identity from the AMF and send Mapped EPS bearer contexts to the UE, so the session can later move to the EPC (#117). |
 | `SMF_IWK_SNSSAI` | SST `1` | S-NSSAI (`sst` or `sst:sd`, SD six hex digits) the PGW-C+SMF assigns to a PDN connection that can move to 5GS (#475). |
@@ -111,6 +130,8 @@ The N4/PFCP endpoints are configured by environment variables, **not** by the `s
 | `NEXTGCORE_SBI_OAUTH2_REQUIRE` | unset | `1`/`true`/`yes` forces OAuth2 enforcement, taking precedence over the YAML knob. |
 | `NEXTGCORE_SMF_STATE_FILE` | unset | JSON snapshot file for PFCP sessions, policy bindings and IPv4-pool allocations (#191). Read only when `--state-file` is absent — the flag wins; an empty value is treated as unset. With neither set the SMF is memory-only, which is the shipped default. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://jaeger:4317` | OpenTelemetry OTLP trace exporter endpoint. |
+
+> **Clock:** this NF refuses to start when the local clock reads before 2020-01-01, because its PFCP Recovery Time Stamp would be wrong. See [A set clock is required](overview.md#a-set-clock-is-required-pfcp-nfs) for the remedy on RTC-less hosts.
 
 ## Command-line flags
 
@@ -144,7 +165,11 @@ back into each `PfcpClient` before the association loop starts, so the first
 Association Setup after a reload compares the UPF's reported stamp against it:
 a changed stamp means the UPF restarted while the SMF was down, and the restored
 sessions are flushed (TS 29.244 §5.22, TS 23.527 §4.2) instead of being believed
-in. An unchanged stamp means they are genuinely still valid.
+in. An unchanged stamp means they are genuinely still valid. A UPF named by
+hostname has its stamp kept under the configured `host:port`, lower-cased and
+without a trailing dot, so it is found again after the UPF moves (#722). A stamp
+a pre-#722 snapshot kept under the UPF's address is read once, moved to the name,
+and the address entry removed. A UPF hostname must name exactly one UPF.
 
 **Limits worth knowing:**
 

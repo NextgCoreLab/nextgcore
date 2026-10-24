@@ -32,6 +32,8 @@ pub mod message_type {
     pub const RELEASE_ACCESS_BEARERS_RESPONSE: u8 = 171;
     pub const DOWNLINK_DATA_NOTIFICATION: u8 = 176;
     pub const DOWNLINK_DATA_NOTIFICATION_ACK: u8 = 177;
+    /// TS 29.274 §7.2.11.3 (#956).
+    pub const DOWNLINK_DATA_NOTIFICATION_FAILURE_INDICATION: u8 = 70;
     pub const DELETE_BEARER_COMMAND: u8 = 66;
     pub const BEARER_RESOURCE_COMMAND: u8 = 68;
     pub const BEARER_RESOURCE_FAILURE_INDICATION: u8 = 69;
@@ -84,71 +86,9 @@ pub mod ie_type {
 // GTP Cause Values
 // ============================================================================
 
-/// GTP-C Cause values
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[repr(u8)]
-pub enum GtpCause {
-    #[default]
-    Reserved = 0,
-    RequestAccepted = 16,
-    RequestAcceptedPartially = 17,
-    NewPdnTypeDueToNetworkPreference = 18,
-    NewPdnTypeDueToSingleAddressBearerOnly = 19,
-    ContextNotFound = 64,
-    InvalidMessageFormat = 65,
-    VersionNotSupported = 66,
-    InvalidLength = 67,
-    ServiceNotSupported = 68,
-    MandatoryIeIncorrect = 69,
-    MandatoryIeMissing = 70,
-    SystemFailure = 72,
-    NoResourcesAvailable = 73,
-    SemanticErrorInTftOperation = 74,
-    SyntacticErrorInTftOperation = 75,
-    SemanticErrorsInPacketFilter = 76,
-    SyntacticErrorsInPacketFilter = 77,
-    MissingOrUnknownApn = 78,
-    RequestRejected = 94,
-    ConditionalIeMissing = 103,
-}
-
-impl From<u8> for GtpCause {
-    /// TS 29.274 §8.4. Every variant this enum declares is now reachable (#51).
-    ///
-    /// The previous mapping listed nine values and collapsed the rest — including 66,
-    /// 68, 73, 74-78 and 94 — to `Reserved`. Cause 78 mattered most: an SGW rejecting
-    /// a session for "Missing or unknown APN" was indistinguishable from a reserved
-    /// value, so the UE was told `NETWORK_FAILURE` instead of the ESM cause that names
-    /// its own misconfiguration. A cause the receiver cannot distinguish is a cause
-    /// the operator cannot debug.
-    fn from(value: u8) -> Self {
-        match value {
-            16 => GtpCause::RequestAccepted,
-            17 => GtpCause::RequestAcceptedPartially,
-            18 => GtpCause::NewPdnTypeDueToNetworkPreference,
-            19 => GtpCause::NewPdnTypeDueToSingleAddressBearerOnly,
-            64 => GtpCause::ContextNotFound,
-            65 => GtpCause::InvalidMessageFormat,
-            66 => GtpCause::VersionNotSupported,
-            67 => GtpCause::InvalidLength,
-            68 => GtpCause::ServiceNotSupported,
-            69 => GtpCause::MandatoryIeIncorrect,
-            70 => GtpCause::MandatoryIeMissing,
-            72 => GtpCause::SystemFailure,
-            73 => GtpCause::NoResourcesAvailable,
-            74 => GtpCause::SemanticErrorInTftOperation,
-            75 => GtpCause::SyntacticErrorInTftOperation,
-            76 => GtpCause::SemanticErrorsInPacketFilter,
-            77 => GtpCause::SyntacticErrorsInPacketFilter,
-            78 => GtpCause::MissingOrUnknownApn,
-            94 => GtpCause::RequestRejected,
-            103 => GtpCause::ConditionalIeMissing,
-            // Anything else really is unmapped. `Reserved` is honest for a value
-            // TS 29.274 does not define; it was not honest for the twelve above.
-            _ => GtpCause::Reserved,
-        }
-    }
-}
+/// GTP-C Cause values: the shared TS 29.274 Table 8.4-1 enum (#1037), so this
+/// node and its peers name every cause from one table.
+pub use nextgcore_gtp::v2::Gtp2Cause as GtpCause;
 
 /// RAT Type values (TS 29.274 §8.17).
 pub mod rat_type {
@@ -558,12 +498,21 @@ fn create_session_paa(gtp_pdn_type: u8) -> Gtp2PaaIe {
     }
 }
 
-/// Build Modify Bearer Request (TS 29.274 §7.2.7)
+/// Build Modify Bearer Request (TS 29.274 §7.2.7).
+///
+/// `to_remove` are the EBIs sent as "Bearer Contexts to be removed" (instance 1,
+/// EBI only). Table 7.2.7-1 makes them mandatory "on the S4 and S11 interfaces for
+/// the TAU/RAU/Handover ... procedures where any of the bearers existing before
+/// the ... Handover procedure will be deactivated as consequence of the ...
+/// Handover procedure"; NOTE 3 says the MME then removes them by a separate
+/// procedure (#730 review M1).
+///
+/// The User Location Information IE is not encoded: a stated ceiling of #730.
 pub fn build_modify_bearer_request(
     mme_ue: &MmeUe,
     sgw_ue: &SgwUe,
     bearers: &[&MmeBearer],
-    _uli_presence: bool,
+    to_remove: &[u8],
     sequence_number: u32,
 ) -> S11BuildResult<Gtp2Message> {
     log::debug!("Build Modify Bearer Request with {} bearers", bearers.len());
@@ -601,6 +550,11 @@ pub fn build_modify_bearer_request(
             "Modify Bearer Request requires at least one bearer context with an eNB S1-U F-TEID"
                 .to_string(),
         ));
+    }
+    for ebi in to_remove {
+        let mut bc = Gtp2BearerContextIe::new();
+        bc.set_ebi(*ebi);
+        msg.add_bearer_context(1, &bc);
     }
 
     // RAT Type (C)
@@ -912,6 +866,26 @@ pub fn build_release_access_bearers_request(teid: u32, sequence_number: u32) -> 
     )
 }
 
+/// Build a Downlink Data Notification Failure Indication (TS 29.274 §7.2.11.3,
+/// #956): the UE did not answer the paging a Downlink Data Notification started.
+/// Cause (M); Originating Node and IMSI are conditional on ISR and restoration,
+/// neither of which this MME runs, so they are absent.
+pub fn build_downlink_data_notification_failure_indication(
+    sgw_s11_teid: u32,
+    sequence_number: u32,
+    cause: GtpCause,
+) -> S11BuildResult<Gtp2Message> {
+    let mut msg = new_message(
+        message_type::DOWNLINK_DATA_NOTIFICATION_FAILURE_INDICATION,
+        sgw_s11_teid,
+        sequence_number,
+    );
+    msg.add_ie(typed_ie(|buf| {
+        Gtp2CauseIe::new(cause as u8).encode(buf, 0)
+    })?);
+    Ok(msg)
+}
+
 /// Build Downlink Data Notification Acknowledge (TS 29.274 §7.2.11)
 pub fn build_downlink_data_notification_ack(
     teid: u32,
@@ -1077,9 +1051,9 @@ mod tests {
 
     #[test]
     fn test_gtp_cause_from_u8() {
-        assert_eq!(GtpCause::from(16), GtpCause::RequestAccepted);
-        assert_eq!(GtpCause::from(64), GtpCause::ContextNotFound);
-        assert_eq!(GtpCause::from(0), GtpCause::Reserved);
+        assert_eq!(GtpCause::from_wire(16), GtpCause::RequestAccepted);
+        assert_eq!(GtpCause::from_wire(64), GtpCause::ContextNotFound);
+        assert_eq!(GtpCause::from_wire(0), GtpCause::UndefinedValue);
     }
 
     /// #51 criterion 6: every value this enum declares must round-trip, because a
@@ -1092,10 +1066,10 @@ mod tests {
         for value in [
             16u8, 17, 18, 19, 64, 65, 66, 67, 68, 69, 70, 72, 73, 74, 75, 76, 77, 78, 94, 103,
         ] {
-            let mapped = GtpCause::from(value);
+            let mapped = GtpCause::from_wire(value);
             assert_ne!(
                 mapped,
-                GtpCause::Reserved,
+                GtpCause::UndefinedValue,
                 "GTP cause {value} collapses to Reserved, so a peer's rejection reason is lost"
             );
             assert_eq!(

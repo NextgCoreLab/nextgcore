@@ -27,6 +27,9 @@ pub mod pfcp_type {
     pub const SESSION_DELETION_RESPONSE: u8 = 55;
     pub const SESSION_REPORT_REQUEST: u8 = 56;
     pub const SESSION_REPORT_RESPONSE: u8 = 57;
+    /// Node Report Request / Response (Table 7.3-1), #935.
+    pub const NODE_REPORT_REQUEST: u8 = 12;
+    pub const NODE_REPORT_RESPONSE: u8 = 13;
 }
 
 // ============================================================================
@@ -129,6 +132,14 @@ pub mod pfcp_ie {
     pub const PDR_ID: u16 = 56;
     pub const F_SEID: u16 = 57;
     pub const NODE_ID: u16 = 60;
+    /// Node Report Type (§8.2.69): octet 5 bit 1 UPFR, bit 2 UPRR.
+    pub const NODE_REPORT_TYPE: u16 = 101;
+    /// User Plane Path Failure Report (Table 7.4.5.1.2-1).
+    pub const USER_PLANE_PATH_FAILURE_REPORT: u16 = 102;
+    /// Remote GTP-U Peer (§8.2.70).
+    pub const REMOTE_GTP_U_PEER: u16 = 103;
+    /// User Plane Path Recovery Report (Table 7.4.5.1.3-1).
+    pub const USER_PLANE_PATH_RECOVERY_REPORT: u16 = 187;
     pub const MEASUREMENT_METHOD: u16 = 62;
     pub const USAGE_REPORT_TRIGGER: u16 = 63;
     /// TS 29.244 §8.2.37. Parsed since #306: the PERIO reporting-trigger FLAG was
@@ -136,6 +147,10 @@ pub mod pfcp_ie {
     /// no cadence and `DataPlaneUrr::measurement_period_secs`'s only reader could
     /// never fire.
     pub const MEASUREMENT_PERIOD: u16 = 64;
+    /// Inactivity Detection Time (§8.2.18), u32 seconds.
+    pub const INACTIVITY_DETECTION_TIME: u16 = 36;
+    /// Measurement Information (§8.2.68); bit 4 of octet 5 is ISTM.
+    pub const MEASUREMENT_INFORMATION: u16 = 100;
     pub const VOLUME_MEASUREMENT: u16 = 66;
     pub const DURATION_MEASUREMENT: u16 = 67;
     pub const TIME_OF_FIRST_PACKET: u16 = 69;
@@ -167,6 +182,12 @@ pub mod pfcp_ie {
     pub const FRAMED_IPV6_ROUTE: u16 = 155;
     pub const APN_DNN: u16 = 159;
     pub const PFCPSEREQ_FLAGS: u16 = 186;
+    /// PFCP Session Retention Information (TS 29.244 Table 7.4.4.1-2), grouped (#718)
+    pub const PFCP_SESSION_RETENTION_INFORMATION: u16 = 183;
+    /// PFCPASRsp-Flags (TS 29.244 8.2.134): PSREI / UUPSI (#718)
+    pub const PFCPASRSP_FLAGS: u16 = 184;
+    /// CP PFCP Entity IP Address (TS 29.244 8.2.135), within the retention IE (#718)
+    pub const CP_PFCP_ENTITY_IP_ADDRESS: u16 = 185;
     /// PFCPSMReq-Flags (TS 29.244 8.2.50): DROBU / SNDEM / QAURR
     pub const PFCPSMREQ_FLAGS: u16 = 49;
     /// Downlink Data Notification Delay (TS 29.244 8.2.28)
@@ -727,8 +748,9 @@ impl PfcpMessageBuilder {
         if report_type.uplink_data_report {
             flags |= 0x08;
         }
+        // SESR is bit 6 (TS 29.244 §8.2.21); 0x10 is TMIR.
         if report_type.session_report {
-            flags |= 0x10;
+            flags |= 0x20;
         }
         self.add_u8(pfcp_ie::REPORT_TYPE, flags)
     }
@@ -1448,12 +1470,14 @@ pub fn parse_create_far(data: &[u8]) -> Result<ParsedCreateFar, &'static str> {
         return Err("FAR ID missing");
     }
 
-    // Apply Action (mandatory)
+    // Apply Action (mandatory; TS 29.244 §8.2.26). Octet 5 (DROP, FORW, BUFF, NOCP,
+    // DUPL, ...) comes first, octet 6 (EDRT, BDPN, DDPN, ...) second; the library's
+    // codec reads it into the FAR_ACTION_* numbering (octet 5 in the low byte).
+    // #1008: this read the two octets big-endian, which swapped them, the mirror of
+    // smfd's encoder; a conformant SMF's FORW (`02 00`) read as EDRT.
     if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::APPLY_ACTION) {
-        if ie.value.len() >= 2 {
-            far.apply_action = u16::from_be_bytes([ie.value[0], ie.value[1]]);
-        } else if !ie.value.is_empty() {
-            far.apply_action = ie.value[0] as u16;
+        if !ie.value.is_empty() {
+            far.apply_action = nextgcore_pfcp::types::ApplyAction::decode_ie(&ie.value).encode();
         }
     }
 
@@ -1659,6 +1683,7 @@ pub fn parse_create_urr(data: &[u8]) -> Result<ParsedCreateUrr, &'static str> {
 
     // Measurement Method (IE type 62)
     if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::MEASUREMENT_METHOD) {
+        urr.measurement_method_present = true;
         if !ie.value.is_empty() {
             urr.measure_duration = (ie.value[0] & 0x01) != 0;
             urr.measure_volume = (ie.value[0] & 0x02) != 0;
@@ -1683,6 +1708,22 @@ pub fn parse_create_urr(data: &[u8]) -> Result<ParsedCreateUrr, &'static str> {
             urr.trigger_volume_quota = (ie.value[1] & 0x01) != 0;
             urr.trigger_time_quota = (ie.value[1] & 0x02) != 0;
         }
+    }
+
+    // #820: Inactivity Detection Time (§8.2.18) and ISTM (Measurement Information
+    // §8.2.68 octet 5 bit 4), which define how TIME is measured (§5.2.2.2).
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::INACTIVITY_DETECTION_TIME) {
+        if ie.value.len() >= 4 {
+            urr.inactivity_detection_secs = Some(u32::from_be_bytes([
+                ie.value[0],
+                ie.value[1],
+                ie.value[2],
+                ie.value[3],
+            ]));
+        }
+    }
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::MEASUREMENT_INFORMATION) {
+        urr.immediate_start_time_metering = ie.value.first().is_some_and(|b| b & 0x08 != 0);
     }
 
     // Volume Threshold (IE type 31, TS 29.244 §8.2.13) - flags + values.
@@ -1784,6 +1825,8 @@ fn parse_volume_ie(value: &[u8]) -> (Option<u64>, Option<u64>, Option<u64>) {
 pub struct ParsedCreateUrr {
     pub urr_id: u32,
     pub measure_duration: bool,
+    /// The Measurement Method IE was present (an Update URR changes it only then).
+    pub measurement_method_present: bool,
     pub measure_volume: bool,
     pub trigger_periodic: bool,
     pub trigger_volume_threshold: bool,
@@ -1798,6 +1841,10 @@ pub struct ParsedCreateUrr {
     pub time_threshold_secs: Option<u32>,
     /// Measurement Period (IE type 64), the PERIO trigger's cadence.
     pub measurement_period_secs: Option<u32>,
+    /// Inactivity Detection Time (IE 36, §8.2.18), seconds (#820).
+    pub inactivity_detection_secs: Option<u32>,
+    /// ISTM, Immediate Start Time Metering (Measurement Information IE 100) (#820).
+    pub immediate_start_time_metering: bool,
     /// Volume Quota (IE type 73, TS 29.244 §8.2.40) — the volume at which the UP
     /// function STOPS FORWARDING the matching traffic, as distinct from the
     /// threshold at which it merely reports (#80, §5.2.2.2.2).
@@ -1916,11 +1963,55 @@ pub fn upf_function_features() -> Vec<u8> {
     buf.to_vec()
 }
 
+/// A PFCP Node Report Request reporting N3/N9 user-plane path FAILURE (`failure`)
+/// or RECOVERY for `peers` (#935, TS 29.244 §7.4.5.1): Node ID, the Node Report Type
+/// with UPFR or UPRR, and a User Plane Path Failure Report (IE 102) or a User Plane
+/// Path Recovery Report (IE 187) listing each peer as a Remote GTP-U Peer (§8.2.70:
+/// V4 = bit 2, V6 = bit 1 of the flags octet).
+pub fn build_node_report_request(
+    node_id: &NodeId,
+    failure: bool,
+    peers: &[std::net::IpAddr],
+) -> Vec<u8> {
+    let mut b = PfcpMessageBuilder::new();
+    b.add_node_id(node_id);
+    b.add_u8(pfcp_ie::NODE_REPORT_TYPE, if failure { 0x01 } else { 0x02 });
+    let mut report = PfcpMessageBuilder::new();
+    for peer in peers {
+        let value = match peer {
+            std::net::IpAddr::V4(v4) => {
+                let mut v = vec![0x02];
+                v.extend_from_slice(&v4.octets());
+                v
+            }
+            std::net::IpAddr::V6(v6) => {
+                let mut v = vec![0x01];
+                v.extend_from_slice(&v6.octets());
+                v
+            }
+        };
+        report.add_tlv(pfcp_ie::REMOTE_GTP_U_PEER, &value);
+    }
+    let ie = if failure {
+        pfcp_ie::USER_PLANE_PATH_FAILURE_REPORT
+    } else {
+        pfcp_ie::USER_PLANE_PATH_RECOVERY_REPORT
+    };
+    b.add_tlv(ie, &report.build());
+    b.build()
+}
+
 /// Build Association Setup Response
+///
+/// `sessions_retained` sets PSREI in a PFCPASRsp-Flags IE (TS 29.244 §6.2.6.2.2,
+/// §8.2.134): the request carried PFCP Session Retention Information for a Node ID
+/// that already had an association, and the requested sessions were kept. The IE is
+/// omitted otherwise, which a CP function reads as "nothing was retained".
 pub fn build_association_setup_response(
     node_id: &NodeId,
     recovery_time_stamp: u32,
     cause: PfcpCause,
+    sessions_retained: bool,
 ) -> Vec<u8> {
     let mut builder = PfcpMessageBuilder::new();
     builder.add_node_id(node_id);
@@ -1928,7 +2019,44 @@ pub fn build_association_setup_response(
     builder.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, recovery_time_stamp);
     // UP Function Features — only the bits this UPF really implements
     builder.add_tlv(pfcp_ie::UP_FUNCTION_FEATURES, &upf_function_features());
+    if sessions_retained {
+        builder.add_u8(pfcp_ie::PFCPASRSP_FLAGS, 0x01); // PSREI
+    }
     builder.build()
+}
+
+/// The PFCP Session Retention Information IE of an Association Setup Request
+/// (TS 29.244 Table 7.4.4.1-2), parsed (#718).
+///
+/// `None`: the IE is absent, so the existing association's sessions are deleted.
+/// `Some(vec![])`: present with no CP PFCP Entity IP Address, which means "keep all
+/// existing sessions". `Some(ips)`: keep the sessions of those CP PFCP entities only.
+pub fn parse_session_retention_information(payload: &[u8]) -> Option<Vec<std::net::IpAddr>> {
+    let ies = ParsedIe::parse_all(payload);
+    let retention = ParsedIe::find_ie(&ies, pfcp_ie::PFCP_SESSION_RETENTION_INFORMATION)?;
+    let inner = ParsedIe::parse_all(&retention.value);
+    let mut ips = Vec::new();
+    for entity in ParsedIe::find_all_ies(&inner, pfcp_ie::CP_PFCP_ENTITY_IP_ADDRESS) {
+        // Octet 5: bit 2 = V4, bit 1 = V6 (TS 29.244 §8.2.135); a field the flag
+        // announces but the IE is too short to carry is ignored, not read past.
+        let v = &entity.value;
+        let Some(&flags) = v.first() else { continue };
+        let mut off = 1;
+        if flags & 0x02 != 0 {
+            if let Some(b) = v.get(off..off + 4) {
+                ips.push(std::net::IpAddr::V4(Ipv4Addr::new(b[0], b[1], b[2], b[3])));
+            }
+            off += 4;
+        }
+        if flags & 0x01 != 0 {
+            if let Some(b) = v.get(off..off + 16) {
+                let mut o = [0u8; 16];
+                o.copy_from_slice(b);
+                ips.push(std::net::IpAddr::V6(Ipv6Addr::from(o)));
+            }
+        }
+    }
+    Some(ips)
 }
 
 /// Build Association Release Response (TS 29.244 7.4.4.2): Node ID + Cause
@@ -1954,6 +2082,8 @@ pub fn parse_recovery_time_stamp(payload: &[u8]) -> Option<u32> {
     let ies = ParsedIe::parse_all(payload);
     ParsedIe::find_ie(&ies, pfcp_ie::RECOVERY_TIME_STAMP).and_then(|ie| {
         if ie.value.len() >= 4 {
+            // The wire value: the comparison sites normalize it (#995; a parser that
+            // depends on the clock was a #1004 review minor).
             Some(u32::from_be_bytes([
                 ie.value[0],
                 ie.value[1],
@@ -2017,6 +2147,45 @@ pub fn parse_pfcpsmreq_flags(payload: &[u8]) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1008, TS 29.244 §8.2.26: octet 5 (DROP, FORW, BUFF, NOCP) first, octet 6
+    /// (EDRT, BDPN, DDPN) second. `02 00` is FORW; `00 02` is BDPN, not FORW; a
+    /// one-octet value is octet 5.
+    #[test]
+    fn a_create_fars_apply_action_is_read_octet_5_first() {
+        use crate::data_plane::{FAR_ACTION_BUFF, FAR_ACTION_FORW, FAR_ACTION_NOCP};
+        let far = |aa: &[u8]| {
+            let mut b = PfcpMessageBuilder::new();
+            b.add_u32(pfcp_ie::FAR_ID, 7);
+            b.add_tlv(pfcp_ie::APPLY_ACTION, aa);
+            parse_create_far(&b.build()).expect("FAR").apply_action
+        };
+        assert_eq!(far(&[0x02, 0x00]), FAR_ACTION_FORW);
+        assert_eq!(far(&[0x0c, 0x00]), FAR_ACTION_BUFF | FAR_ACTION_NOCP);
+        assert_eq!(far(&[0x02]), FAR_ACTION_FORW);
+        let bdpn = far(&[0x00, 0x02]);
+        assert_eq!(
+            bdpn & FAR_ACTION_FORW,
+            0,
+            "octet 6 bit 2 is BDPN: {bdpn:#x}"
+        );
+        assert_eq!(bdpn, 1 << 9);
+        // What the library writes, read back.
+        let mut lib = bytes::BytesMut::new();
+        nextgcore_pfcp::types::ApplyAction::forward().encode_ie(&mut lib);
+        assert_eq!(far(&lib[4..]), FAR_ACTION_FORW);
+    }
+
+    /// TS 29.244 §8.2.21: SESR is bit 6 (0x20); 0x10 is TMIR.
+    #[test]
+    fn a_session_report_type_is_sesr_not_tmir() {
+        let mut b = PfcpMessageBuilder::new();
+        b.add_report_type(&ReportType {
+            session_report: true,
+            ..Default::default()
+        });
+        assert_eq!(b.build(), vec![0x00, 39, 0x00, 0x01, 0x20]);
+    }
 
     /// #80 criterion 2: `parse_create_urr` decodes Volume Quota (IE 73), Time Quota
     /// (IE 74) and Measurement Period (IE 64).
@@ -2803,5 +2972,44 @@ mod tests {
         // the bit to 0 to turn reflective QoS off for the flow).
         let explicit_off = parse_create_qer(&qer_ies(&[ie(123, &[0x00])])).expect("QER parses");
         assert!(!explicit_off.rqi);
+    }
+
+    /// #953 review: an Update URR changes DURAT only when it carries a Measurement
+    /// Method (an absent IE parses as `measure_duration == false`).
+    #[test]
+    fn an_update_urr_says_whether_it_carries_a_measurement_method() {
+        let mut b = PfcpMessageBuilder::new();
+        b.add_u32(pfcp_ie::URR_ID, 9);
+        assert!(
+            !parse_create_urr(&b.build())
+                .unwrap()
+                .measurement_method_present
+        );
+        let mut b = PfcpMessageBuilder::new();
+        b.add_u32(pfcp_ie::URR_ID, 9);
+        b.add_u8(pfcp_ie::MEASUREMENT_METHOD, 0x01);
+        let urr = parse_create_urr(&b.build()).unwrap();
+        assert!(urr.measurement_method_present && urr.measure_duration);
+    }
+
+    /// #820: the time-metering IEs of a Create/Update URR are parsed: Inactivity
+    /// Detection Time (IE 36, §8.2.18) and ISTM (Measurement Information IE 100,
+    /// octet 5 bit 4, §8.2.68).
+    #[test]
+    fn a_urr_carries_its_inactivity_detection_time_and_istm() {
+        let mut b = PfcpMessageBuilder::new();
+        b.add_u32(pfcp_ie::URR_ID, 9);
+        b.add_u32(pfcp_ie::INACTIVITY_DETECTION_TIME, 45);
+        b.add_u8(pfcp_ie::MEASUREMENT_INFORMATION, 0x08);
+        let urr = parse_create_urr(&b.build()).expect("parses");
+        assert_eq!(urr.inactivity_detection_secs, Some(45));
+        assert!(urr.immediate_start_time_metering);
+
+        let mut b = PfcpMessageBuilder::new();
+        b.add_u32(pfcp_ie::URR_ID, 9);
+        b.add_u8(pfcp_ie::MEASUREMENT_INFORMATION, 0x02); // INAM only
+        let urr = parse_create_urr(&b.build()).expect("parses");
+        assert_eq!(urr.inactivity_detection_secs, None);
+        assert!(!urr.immediate_start_time_metering);
     }
 }

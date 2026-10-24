@@ -73,6 +73,11 @@ x-common: &common
   environment: &common-env
     RUST_LOG: info
     RUST_BACKTRACE: 1
+    # The /metrics listeners (smfd, upfd, sgwud, sgwcd; udmd/nsacfd when enabled)
+    # default to 127.0.0.1 (#837). Inside this private compose network they
+    # bind all container interfaces so Prometheus can scrape them; no service
+    # publishes its metrics port on the host.
+    NEXTGCORE_METRICS_BIND: "0.0.0.0"
 
 x-nf-healthcheck: &nf-healthcheck
   healthcheck:
@@ -277,6 +282,9 @@ services:
       # what makes `ip addr` on a host running both stacks legible.
       - "--tun-ifname"
       - "epctun"
+      # Only the PGW-C (172.24.0.4) may set up the Sxb association (#968).
+      - "--pfcp-allowed-peers"
+      - "172.24.0.4"
     volumes:
       - ./configs/epc/pgwu.yaml:/etc/nextgcore/pgwu.yaml:ro
     networks:
@@ -317,7 +325,9 @@ services:
       epc:
         ipv4_address: 172.24.0.5
     ports:
-      - "36412:36412/sctp"  # S1AP towards eNB
+      # S1AP towards eNB: host-local unless NEXTGCORE_RAN_PUBLISH_ADDR names the
+      # host address an external eNB reaches (#837).
+      - "${NEXTGCORE_RAN_PUBLISH_ADDR:-127.0.0.1}:36412:36412/sctp"
     depends_on:
       hss:
         condition: service_healthy

@@ -27,6 +27,7 @@
 
 use std::time::{Duration, Instant};
 
+use crate::context::MmeEpsType;
 use crate::context::{EnbUe, MmeContext, MmeUe, NEXTGCORE_INVALID_POOL_ID};
 use crate::nas_path;
 
@@ -113,6 +114,8 @@ const ALL_TIMERS: [NasTimer; 5] = [
 /// retransmission path can take the write lock and reach `nas_path` without the
 /// non-reentrant `RwLock` deadlocking against itself.
 pub fn expire_nas_timers(ctx: &MmeContext, now: Instant) {
+    // #734: T3495 of the PDN GW initiated bearer deactivations.
+    crate::bearer_deactivation::sweep(ctx, now);
     let expired: Vec<(u64, NasTimer)> = {
         let pool = ctx.mme_ue_pool.read().unwrap();
         pool.iter()
@@ -137,6 +140,14 @@ pub fn expire_nas_timers(ctx: &MmeContext, now: Instant) {
 }
 
 fn handle_expiry(ctx: &MmeContext, mme_ue_id: u64, timer: NasTimer) {
+    // #956: paging is for a UE with NO S1 connection, so T3413 cannot go
+    // through the S1-connection check below (which aborted it at its first
+    // expiry, so paging was never repeated): it repages on every eNB serving
+    // the UE's tracking area.
+    if timer == NasTimer::T3413 {
+        paging_expiry(ctx, mme_ue_id);
+        return;
+    }
     let enb_ue = ctx
         .mme_ue_find_by_id(mme_ue_id)
         .map(|mme_ue| mme_ue.enb_ue_id)
@@ -160,9 +171,10 @@ fn handle_expiry(ctx: &MmeContext, mme_ue_id: u64, timer: NasTimer) {
             timer.name()
         );
         // TS 24.301 §5.5.2.3.4 b: an aborted network detach still leaves the UE
-        // EMM-DEREGISTERED in the network.
+        // EMM-DEREGISTERED in the network, including one another procedure overtook
+        // (#828, as the with-S1 branch below).
         if timer == NasTimer::T3422 {
-            crate::network_detach::complete_mme_initiated_detach(ctx, mme_ue_id);
+            crate::network_detach::abandon_mme_initiated_detach(ctx, mme_ue_id);
         }
         return;
     };
@@ -172,6 +184,37 @@ fn handle_expiry(ctx: &MmeContext, mme_ue_id: u64, timer: NasTimer) {
         let Some(mme_ue) = pool.get_mut(&mme_ue_id) else {
             return;
         };
+
+        // #732: T3422 supervises the network-initiated detach only while that
+        // detach is the UE's procedure. An ATTACH that aborted it (TS 24.301
+        // §5.5.2.3.5 d) stops the timer; this catches any path that did not, so
+        // a stale DETACH REQUEST is never resent and a re-attaching UE is never
+        // released by the fifth expiry.
+        if timer == NasTimer::T3422 && mme_ue.nas_eps.type_ != MmeEpsType::DetachRequestToUe {
+            timer.on(mme_ue).stop();
+            if mme_ue.network_detach_type.is_none() {
+                // The detach was aborted (an ATTACH, §5.5.2.3.5 d): nothing to do.
+                log::info!(
+                    "[{}] T3422 expired, but no network-initiated detach is in progress; stopped",
+                    mme_ue.imsi_bcd
+                );
+                return;
+            }
+            // #828: the detach was never aborted, yet another procedure took the
+            // UE's EMM state. Its bearers are already gone, so leaving it would
+            // keep a registered UE with no PDN connection that is never told.
+            // The detach is completed: EMM-DEREGISTERED (§5.5.2.3.5 a).
+            log::warn!(
+                "[{}] T3422 expired with the network-initiated detach overtaken by {:?}; \
+                 completing the detach (TS 24.301 §5.5.2.3.5 a)",
+                mme_ue.imsi_bcd,
+                mme_ue.nas_eps.type_
+            );
+            drop(pool);
+            ctx.mme_ue_remove(mme_ue_id);
+            crate::nas_dispatch::release_ue_context(ctx, &enb_ue);
+            return;
+        }
 
         let state = timer.on(mme_ue);
         // Re-check under the write lock against a fresh instant: an uplink
@@ -213,22 +256,6 @@ fn handle_expiry(ctx: &MmeContext, mme_ue_id: u64, timer: NasTimer) {
         }
     };
 
-    if abort && timer == NasTimer::T3413 {
-        // A paging procedure has no NAS signalling connection to release -- that
-        // is the point of paging. TS 23.401 §5.3.4.3: the UE did not respond, so
-        // the procedure is marked failed and whatever triggered it decides
-        // (buffer, drop, or report).
-        if let Some(mme_ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&mme_ue_id) {
-            mme_ue.paging.failed = true;
-            mme_ue.paging.type_ = crate::context::PagingType::None;
-            log::warn!(
-                "[{}] paging gave up: the UE did not respond",
-                mme_ue.imsi_bcd
-            );
-        }
-        return;
-    }
-
     if abort && timer == NasTimer::T3422 {
         // TS 24.301 §5.5.2.3.4 b: "on the fifth expiry of timer T3422, the detach
         // procedure shall be aborted and the MME enters state EMM-DEREGISTERED".
@@ -236,8 +263,11 @@ fn handle_expiry(ctx: &MmeContext, mme_ue_id: u64, timer: NasTimer) {
             "T3422 exhausted its {MAX_RETRANSMISSIONS} retransmissions for UE {mme_ue_id}; \
              detaching it locally and releasing the S1 connection"
         );
-        crate::network_detach::complete_mme_initiated_detach(ctx, mme_ue_id);
-        crate::nas_dispatch::release_ue_context(ctx, &enb_ue);
+        // Only a detach that is still the procedure releases: the UE may have
+        // started another one in the meantime (#732).
+        if crate::network_detach::complete_mme_initiated_detach(ctx, mme_ue_id) {
+            crate::nas_dispatch::release_ue_context(ctx, &enb_ue);
+        }
         return;
     }
 
@@ -251,6 +281,62 @@ fn handle_expiry(ctx: &MmeContext, mme_ue_id: u64, timer: NasTimer) {
             timer.name()
         );
         crate::nas_dispatch::release_ue_context(ctx, &enb_ue);
+    }
+}
+
+/// T3413 expired (TS 24.301 §5.6.2.2.1, TS 23.401 §5.3.4.3): the PAGING is
+/// repeated up to [`MAX_RETRANSMISSIONS`] times on every eNB serving the UE,
+/// then the paging fails and whatever triggered it is told (#956: a Downlink
+/// Data Notification gets its Failure Indication, cause UE not responding).
+fn paging_expiry(ctx: &MmeContext, mme_ue_id: u64) {
+    let action = {
+        let mut pool = ctx.mme_ue_pool.write().unwrap();
+        let Some(mme_ue) = pool.get_mut(&mme_ue_id) else {
+            return;
+        };
+        if !mme_ue.t3413.is_expired(Instant::now()) {
+            return;
+        }
+        if mme_ue.t3413.retry_count >= MAX_RETRANSMISSIONS || mme_ue.t3413.pkbuf.is_none() {
+            mme_ue.t3413.stop();
+            let paging_type = mme_ue.paging.type_;
+            mme_ue.paging.failed = true;
+            mme_ue.paging.type_ = crate::context::PagingType::None;
+            log::warn!(
+                "[{}] paging gave up: the UE did not respond ({paging_type:?})",
+                mme_ue.imsi_bcd
+            );
+            Err(paging_type)
+        } else {
+            let pdu = mme_ue.t3413.pkbuf.clone().unwrap_or_default();
+            mme_ue.t3413.record_retransmission(T3413_DURATION);
+            log::info!(
+                "[{}] T3413 expired; paging repeated ({}/{MAX_RETRANSMISSIONS})",
+                mme_ue.imsi_bcd,
+                mme_ue.t3413.retry_count
+            );
+            Ok(pdu)
+        }
+    };
+    match action {
+        Ok(pdu) => {
+            crate::paging::repeat(ctx, mme_ue_id, pdu);
+        }
+        Err(paging_type) => {
+            if paging_type == crate::context::PagingType::DownlinkDataNotification {
+                if let Err(e) = crate::gtp_path::send_downlink_data_notification_failure_indication(
+                    ctx,
+                    mme_ue_id,
+                    crate::s11_build::GtpCause::UeNotResponding,
+                ) {
+                    log::error!(
+                        "UE {mme_ue_id}: Downlink Data Notification Failure Indication not sent: {e}"
+                    );
+                }
+            }
+            // #862: deactivations waiting for this paging complete locally.
+            crate::bearer_deactivation::on_paging_failed(ctx, mme_ue_id);
+        }
     }
 }
 
@@ -335,6 +421,126 @@ mod tests {
         force_expiry(&ctx, mme_ue_id, NasTimer::T3422);
         expire_nas_timers(&ctx, Instant::now());
         assert!(ctx.mme_ue_find_by_id(mme_ue_id).is_none());
+    }
+
+    /// #732: once the detach is no longer the UE's procedure, T3422 neither
+    /// resends the stale DETACH REQUEST nor, on its fifth expiry, releases the
+    /// UE. Before #732 the fifth expiry released a re-attaching UE.
+    #[test]
+    fn t3422_is_inert_once_the_detach_is_not_the_procedure() {
+        let ctx = test_ctx();
+        let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+        let enb_ue_id = ctx.enb_ue_add(enb_id, 100);
+        let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
+        ctx.enb_ue_associate_mme_ue(enb_ue_id, mme_ue_id);
+        crate::network_detach::mme_initiated_detach(
+            &ctx,
+            mme_ue_id,
+            crate::emm_build::DetachTypeToUe::ReAttachRequired,
+            "test",
+        );
+        // An ATTACH aborted the detach (§5.5.2.3.5 d) but, on some path, left
+        // the timer armed.
+        {
+            let mut pool = ctx.mme_ue_pool.write().unwrap();
+            let ue = pool.get_mut(&mme_ue_id).unwrap();
+            ue.nas_eps.type_ = MmeEpsType::AttachRequest;
+            ue.network_detach_type = None;
+        }
+        force_expiry(&ctx, mme_ue_id, NasTimer::T3422);
+        expire_nas_timers(&ctx, Instant::now());
+        let ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert_eq!(
+            ue.t3422.retry_count, 0,
+            "the stale DETACH REQUEST is not resent"
+        );
+        assert!(!ue.t3422.is_running(), "T3422 stopped at its first expiry");
+        for _ in 0..MAX_RETRANSMISSIONS {
+            force_expiry(&ctx, mme_ue_id, NasTimer::T3422);
+            expire_nas_timers(&ctx, Instant::now());
+        }
+        let ue = ctx
+            .mme_ue_find_by_id(mme_ue_id)
+            .expect("the UE is not released");
+        assert_eq!(ue.t3422.retry_count, 0, "nothing was retransmitted");
+        assert!(!ue.t3422.is_running());
+        assert!(
+            ctx.enb_ue_find_by_id(enb_ue_id).is_some(),
+            "S1 not released"
+        );
+    }
+
+    /// #828: a detach that was never aborted but whose EMM state another
+    /// procedure took (a CS fallback ESR before #828 routed it) is completed at
+    /// the next T3422 expiry: the bearer-less UE is deregistered and S1
+    /// released, not left registered and never told.
+    #[test]
+    fn t3422_completes_a_detach_another_procedure_overtook() {
+        let ctx = test_ctx();
+        let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+        let enb_ue_id = ctx.enb_ue_add(enb_id, 100);
+        let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
+        ctx.enb_ue_associate_mme_ue(enb_ue_id, mme_ue_id);
+        crate::network_detach::mme_initiated_detach(
+            &ctx,
+            mme_ue_id,
+            crate::emm_build::DetachTypeToUe::ReAttachRequired,
+            "test",
+        );
+        ctx.mme_ue_pool
+            .write()
+            .unwrap()
+            .get_mut(&mme_ue_id)
+            .unwrap()
+            .nas_eps
+            .type_ = MmeEpsType::ExtendedServiceRequest;
+        force_expiry(&ctx, mme_ue_id, NasTimer::T3422);
+        expire_nas_timers(&ctx, Instant::now());
+        assert!(
+            ctx.mme_ue_find_by_id(mme_ue_id).is_none(),
+            "the detach is completed: EMM-DEREGISTERED"
+        );
+    }
+
+    /// #828 follow-up: the overtaken-detach rule holds when T3422 expires with no S1
+    /// connection too. The detach is completed (the bearer-less UE deregistered), while a
+    /// detach an ATTACH aborted is left alone in the same branch.
+    #[test]
+    fn t3422_without_s1_completes_an_overtaken_detach_and_spares_an_aborted_one() {
+        for (aborted, expect_removed) in [(false, true), (true, false)] {
+            let ctx = test_ctx();
+            let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+            let enb_ue_id = ctx.enb_ue_add(enb_id, 100);
+            let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
+            ctx.enb_ue_associate_mme_ue(enb_ue_id, mme_ue_id);
+            crate::network_detach::mme_initiated_detach(
+                &ctx,
+                mme_ue_id,
+                crate::emm_build::DetachTypeToUe::ReAttachRequired,
+                "test",
+            );
+            {
+                let mut pool = ctx.mme_ue_pool.write().unwrap();
+                let ue = pool.get_mut(&mme_ue_id).unwrap();
+                ue.nas_eps.type_ = if aborted {
+                    MmeEpsType::AttachRequest
+                } else {
+                    MmeEpsType::ExtendedServiceRequest
+                };
+                if aborted {
+                    ue.network_detach_type = None;
+                }
+                // The S1 connection is gone.
+                ue.enb_ue_id = NEXTGCORE_INVALID_POOL_ID;
+            }
+            force_expiry(&ctx, mme_ue_id, NasTimer::T3422);
+            expire_nas_timers(&ctx, Instant::now());
+            assert_eq!(
+                ctx.mme_ue_find_by_id(mme_ue_id).is_none(),
+                expect_removed,
+                "aborted={aborted}"
+            );
+        }
     }
 
     #[test]

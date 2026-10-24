@@ -470,13 +470,16 @@ async fn notify_old_amf_if_changed(
         return;
     }
     let dereg = build_dereg_notification_body(access);
+    // The callback URI carries the old AMF's bearer token (#789, #753): logged
+    // with its last segment redacted, never whole.
+    let logged_uri = nextgcore_sbi::log_redact::redact_last_segment(old_uri);
     match client.send_dereg_notification(old_uri, &dereg).await {
         Ok(resp) => log::info!(
-            "[{supi}] Deregistration notification to old AMF {old_uri} -> {}",
+            "[{supi}] Deregistration notification to old AMF {logged_uri} -> {}",
             resp.status
         ),
         Err(e) => {
-            log::warn!("[{supi}] Deregistration notification to old AMF {old_uri} failed: {e}")
+            log::warn!("[{supi}] Deregistration notification to old AMF {logged_uri} failed: {e}")
         }
     }
 }
@@ -1308,6 +1311,54 @@ impl MockUdr {
 
 #[cfg(test)]
 mod tests {
+    /// #789 review: the old AMF's dereg-notify URI carries its bearer token, and
+    /// the notification to that AMF logs the URI with the token redacted. The
+    /// positive half (the line was logged at all) is checked first, so a logger
+    /// that never captured anything cannot pass.
+    ///
+    /// Revert-verified: logging `old_uri` whole fails this test.
+    #[tokio::test]
+    async fn the_old_amfs_dereg_callback_token_is_not_logged() {
+        nextgcore_core::test_log::init();
+        let supi = "imsi-001010000000789";
+        let token = "tok-789-do-not-log";
+        let prior = json!({
+            "amfInstanceId": "amf-old-789",
+            "deregCallbackUri":
+                format!("http://10.0.0.9:7777/namf-callback/v1/{supi}/dereg-notify/{token}"),
+        });
+        let new = json!({ "amfInstanceId": "amf-new-789" });
+        let mock = Arc::new(MockUdr::new());
+        let client = UdrClient::Mock(mock.clone());
+        notify_old_amf_if_changed(supi, &prior, &new, &client, UecmAccess::ThreeGpp).await;
+
+        let lines = nextgcore_core::test_log::captured(supi);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Deregistration notification to old AMF")
+                    && l.contains("/dereg-notify/<redacted>")),
+            "{lines:#?}"
+        );
+        assert!(lines.iter().all(|l| !l.contains(token)), "{lines:#?}");
+
+        // The shared sender's errors name the URI redacted too.
+        let err = crate::sbi_path::udm_sbi_send_callback_notification(
+            &format!("dereg-notify/{token}"),
+            &json!({}),
+        )
+        .await
+        .expect_err("not an absolute URI");
+        assert!(!err.contains(token), "{err}");
+
+        // And a UE context's Debug never prints either callback URI.
+        let mut ue = crate::context::UdmUe::new(1, supi);
+        ue.dereg_callback_uri = prior["deregCallbackUri"].as_str().map(str::to_string);
+        ue.non_3gpp_dereg_callback_uri = ue.dereg_callback_uri.clone();
+        let debug = format!("{ue:?}");
+        assert!(!debug.contains(token), "{debug}");
+    }
+
     use super::*;
     use std::sync::Arc;
 
@@ -1819,6 +1870,9 @@ mod tests {
         let ue = guard.amf_ue_add(ran.id).expect("amf_ue_add");
         let mut ue = ue;
         ue.supi = Some(supi.to_string());
+        // amfd #753: the token in this UE's UECM deregCallbackUri; a notification
+        // for any other registration is acknowledged without action.
+        ue.uecm_dereg_token = Some(format!("tok-{supi}"));
         // #341: publish into amfd's LIVE UE store, which is what its Namf handlers
         // resolve against now. `amf_ue_set_supi` wrote a SUPI index nothing in
         // production ever wrote -- the defect #341 removed.
@@ -1887,7 +1941,7 @@ mod tests {
 
         // Drive udmd's REAL body through amfd's REAL Namf SBI handler at the
         // path amfd itself registers as its absolute deregCallbackUri.
-        let path = format!("/namf-callback/v1/{supi}/dereg-notify");
+        let path = format!("/namf-callback/v1/{supi}/dereg-notify/tok-{supi}");
         let req = SbiRequest::post(path).with_json_body(&body).expect("json");
         let resp = nextgcore_amfd::namf_request_handler(req).await;
         assert_eq!(
@@ -1927,7 +1981,7 @@ mod tests {
         let ue_id = seed_amf_ue(supi, 60_101);
         let body =
             json!({ "deregReason": "UE_INITIAL_REGISTRATION", "accessType": "NON_3GPP_ACCESS" });
-        let path = format!("/namf-callback/v1/{supi}/dereg-notify");
+        let path = format!("/namf-callback/v1/{supi}/dereg-notify/tok-{supi}");
         let req = SbiRequest::post(path).with_json_body(&body).expect("json");
         let resp = nextgcore_amfd::namf_request_handler(req).await;
         assert_eq!(resp.status, 204, "non-3GPP dereg is accepted");
@@ -1952,7 +2006,7 @@ mod tests {
 
         // 400: mandatory accessType absent (WSB-4 fail-closed).
         let missing = json!({ "deregReason": "UE_INITIAL_REGISTRATION" });
-        let path = format!("/namf-callback/v1/{supi}/dereg-notify");
+        let path = format!("/namf-callback/v1/{supi}/dereg-notify/tok-{supi}");
         let resp = nextgcore_amfd::namf_request_handler(
             SbiRequest::post(path)
                 .with_json_body(&missing)
@@ -2060,7 +2114,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         nextgcore_amfd::test_support::init_context();
         let ue_id = seed_amf_ue(supi, 60_103);
-        let path = format!("/namf-callback/v1/{supi}/dereg-notify");
+        let path = format!("/namf-callback/v1/{supi}/dereg-notify/tok-{supi}");
         let req = SbiRequest::post(path)
             .with_json_body(&build_dereg_notification_body(UecmAccess::ThreeGpp))
             .expect("json");
@@ -2091,7 +2145,7 @@ mod tests {
         nextgcore_amfd::test_support::init_context();
         let ue_id = seed_amf_ue(supi, 60_104);
         let body = json!({ "deregReason": "SUBSCRIPTION_WITHDRAWN", "accessType": "3GPP_ACCESS" });
-        let path = format!("/namf-callback/v1/{supi}/dereg-notify");
+        let path = format!("/namf-callback/v1/{supi}/dereg-notify/tok-{supi}");
         let resp = nextgcore_amfd::namf_request_handler(
             SbiRequest::post(path).with_json_body(&body).expect("json"),
         )
@@ -2123,7 +2177,7 @@ mod tests {
         nextgcore_amfd::test_support::init_context();
         let ue_id = seed_amf_ue(supi, 60_105);
         let body = json!({ "deregReason": "NOT_A_REAL_REASON", "accessType": "3GPP_ACCESS" });
-        let path = format!("/namf-callback/v1/{supi}/dereg-notify");
+        let path = format!("/namf-callback/v1/{supi}/dereg-notify/tok-{supi}");
         let resp = nextgcore_amfd::namf_request_handler(
             SbiRequest::post(path).with_json_body(&body).expect("json"),
         )

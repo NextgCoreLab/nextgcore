@@ -1,4 +1,10 @@
 //! #514 stage 8b: HANDOVER REQUIRED / REQUEST / REQUEST ACKNOWLEDGE / COMMAND
+//!
+//! #737: since the hand-written encoder was deleted (#560), the
+//! `*_with_schema_criticalities` tests below compare the production encoder
+//! with itself and check it decodes back; what pins each IE criticality is
+//! `criticality_oracle`, which checks every PDU a production builder encodes
+//! against the TS 36.413 §9.3 object sets.
 //! on the generated codec.
 //!
 //! Oracle: the pre-change hand-written builders and parser
@@ -110,7 +116,7 @@ fn setup_items(n: usize) -> Vec<ErabToBeSetupItemHoReq> {
 }
 
 #[test]
-fn the_handover_request_matches_the_hand_written_encoder() {
+fn the_handover_request_round_trips_with_schema_criticalities() {
     let mut cases = 0;
     for ty in TYPES {
         for cause in causes() {
@@ -161,7 +167,7 @@ fn forwarding(n: usize) -> Vec<ErabDataForwardingItem> {
 }
 
 #[test]
-fn the_handover_command_matches_the_hand_written_encoder() {
+fn the_handover_command_round_trips_with_schema_criticalities() {
     let mut cases = 0;
     for ty in TYPES {
         for (mme, enb) in [(0, 0), (1, 1), (0xFFFF_FFFF, 0xFF_FFFF)] {
@@ -552,7 +558,7 @@ fn handover_ctx() -> (MmeContext, u64, u64, u32) {
         b.qos.arp.priority_level = 8;
     }
     let target = ctx.enb_add("127.0.0.8:36412".parse().unwrap());
-    ctx.enb_set_enb_id(target, 0x2222);
+    ctx.enb_set_s1_connected_for_test(target, &[0x13, 0x00, 0x14], EnbId::Macro(0x2222));
     (ctx, source, target, mme)
 }
 

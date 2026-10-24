@@ -39,11 +39,15 @@ A missing or malformed file logs a warning and leaves the defaults.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
+| `sgwu.pfcp.allowed_peers` | list of IPs / CIDR prefixes / host names | empty | SGW-Cs allowed to set up an Sxa association (`SGWU_PFCP_ALLOWED_PEERS`, comma-separated, overrides it; host names re-resolved every 10 s, at once (at most once a second) when a Setup comes from an unresolved address, and kept at their last good addresses when a lookup fails). **Fail closed:** empty refuses every Association Setup (error at startup); `0.0.0.0/0` / `::/0` admit any host. A bad entry stops startup. Session requests are accepted only from an associated SGW-C's host, and only for that SGW-C's own sessions: a Modification/Deletion of another's is answered as unknown (cause 65), an Establishment naming another's CP F-SEID gets cause 69 and installs nothing. Refusals count in `sgwu_pfcp_unauthorized_messages_total`. |
+| `sgwu.pfcp.max_sessions_per_peer` | integer | see text | The most sessions one SGW-C may hold (`SGWU_PFCP_MAX_SESSIONS_PER_PEER` overrides). Default: none (only the global session capacity applies); enforced when set. |
 | `sgwu.pfcp.server[0].address` | IPv4 | none | PFCP Node ID when `PFCP_NODE_IP` is unset (then loopback). Not the bind address: that is `PFCP_BIND_ADDR`. |
 | `sgwu.gtpu.server[0].address` | IPv4 | none | GTP-U address advertised in UP-allocated F-TEIDs when the socket is bound to a wildcard and `SGWU_GTPU_ADVERTISE` is unset. |
 | `logger.level` | string | `info` | Log level when `-l/--log-level` is not given; `RUST_LOG` overrides both (#500). |
 
 A non-IPv4 address is logged and ignored. Not read: `logger.file`, `global.max.*`.
+
+> **Clock:** this NF refuses to start when the local clock reads before 2020-01-01, because its PFCP Recovery Time Stamp would be wrong. See [A set clock is required](overview.md#a-set-clock-is-required-pfcp-nfs) for the remedy on RTC-less hosts.
 
 ## Command-line flags
 
@@ -65,6 +69,7 @@ A non-IPv4 address is logged and ignored. Not read: `logger.file`, `global.max.*
 | `SGWU_MAX_BUFFERED_PACKETS` | `64` | Per-FAR buffer depth for BUFF. |
 | `SGWU_QER_ENFORCEMENT` | off | `1`/`true`/`yes` enables QER gate/MBR enforcement (#60). Off by default because a mis-provisioned QER would drop traffic. |
 | `SGWU_METRICS_PORT` | `9090` | Prometheus endpoint port. |
+| `NEXTGCORE_METRICS_BIND` | `127.0.0.1` | Host the unauthenticated `/metrics` listener binds to (#837). The compose files and manifests set `0.0.0.0` inside the private container/pod network. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://jaeger:4317` | OTLP endpoint for OpenTelemetry traces; init is best-effort. |
 | `RUST_LOG` | unset | Overrides the log level. |
 

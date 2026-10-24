@@ -1,5 +1,11 @@
 //! #514 stage 2: the S1 Setup family on the generated codec.
 //!
+//! #737: since the hand-written encoder was deleted (#560), the
+//! `*_with_schema_criticalities` tests below compare the production encoder
+//! with itself and check it decodes back; what pins each IE criticality is
+//! `criticality_oracle`, which checks every PDU a production builder encodes
+//! against the TS 36.413 §9.3 object sets.
+//!
 //! The pre-change hand-written builders and parser are the oracle: the
 //! generated encoders must produce the same bytes and the generated decoder the
 //! same request. Golden octets come from nextgcore-s1ap's `golden_x691.rs`
@@ -83,7 +89,7 @@ fn the_setup_failure_is_the_x691_golden() {
 }
 
 #[test]
-fn the_setup_response_matches_the_hand_written_encoder() {
+fn the_setup_response_round_trips_with_schema_criticalities() {
     let mut cases = 0;
     for name in [None, Some(1usize), Some(3), Some(40), Some(150)] {
         for gummeis in 1..=8usize {
@@ -102,7 +108,7 @@ fn the_setup_response_matches_the_hand_written_encoder() {
 }
 
 #[test]
-fn the_setup_failure_matches_the_hand_written_encoder() {
+fn the_setup_failure_round_trips_with_schema_criticalities() {
     let groups = [
         S1apCauseGroup::Nothing,
         S1apCauseGroup::RadioNetwork,
@@ -144,6 +150,9 @@ fn requests() -> Vec<S1SetupRequest> {
         EnbId::Macro(0xF_FFFF),
         EnbId::Home(0),
         EnbId::Home(0xFFF_FFFF),
+        // #741: the Rel-15 extension alternatives (TS 36.413 §9.2.1.37).
+        EnbId::ShortMacro(0x3_FFFF),
+        EnbId::LongMacro(0x1F_FFFF),
     ] {
         for name in [None, Some("e".to_string()), Some("e".repeat(150))] {
             for tas in [1usize, 2, 256] {
@@ -181,7 +190,7 @@ fn same_request(a: &S1SetupRequest, b: &S1SetupRequest) -> bool {
 #[test]
 fn the_request_decodes_as_the_hand_written_parser_reads_it() {
     let reqs = requests();
-    assert_eq!(reqs.len(), 180);
+    assert_eq!(reqs.len(), 252);
     for req in &reqs {
         // Both encoders agree on the request, and both decoders read it back.
         let hand = builder::build_s1_setup_request(req).unwrap();

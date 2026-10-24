@@ -10,6 +10,7 @@ NextGCore is a 5G Core Network implemented in Rust, with a 3GPP Rel-15 baseline 
 | C/C++ compiler, cmake | any recent | `aws-lc-sys`, the C crypto library under rustls |
 | libsctp-dev | any | only for `--features kernel-sctp` (amfd, mmed) |
 | Docker + Compose v2 | Engine ≥ 24, Compose ≥ 2.20 | E2E testing |
+| A set system clock | after 2020-01-01 (NTP-synchronised) | smfd, sgwcd, upfd, sgwud and mbsmfd refuse to start without it: see [A set clock is required](configuration/overview.md#a-set-clock-is-required-pfcp-nfs) |
 
 ```bash
 # Ubuntu/Debian
@@ -138,7 +139,7 @@ docker/rust/configs/
 └── tls/            # SBI TLS material (see also docker/rust/certs/)
 ```
 
-Kubernetes configuration lives in `k8s/base/` and `k8s/manifests/`. NFs log at `info` by default, tunable via `--log-level` (and `RUST_LOG` in 13 of the 28 NFs; see the [configuration overview](configuration/overview.md)).
+Kubernetes configuration lives in `k8s/base/` and `k8s/manifests/`. NFs log at `info` by default, tunable via `--log-level` or `RUST_LOG`, which overrides it (see the [configuration overview](configuration/overview.md)).
 
 ## Next Steps
 

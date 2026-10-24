@@ -115,7 +115,7 @@ pub const NEXTGCORE_RAND_LEN: usize = 16;
 pub const NEXTGCORE_SQN_LEN: usize = 6;
 
 /// UDM UE context
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UdmUe {
     /// Unique pool ID
     pub id: u64,
@@ -201,6 +201,50 @@ pub struct UdmUe {
     /// Wave-6 F-06: recorded UPU acknowledgement state (TS 33.501 §6.15.2.1
     /// step 9) — the UPU mirror of `sor_ack`.
     pub upu_ack: Option<SorUpuAckState>,
+}
+
+/// Manual `Debug` (no-auth-material-in-logs): the authentication material in
+/// this type (k, opc, topc, rand, sqn) prints as `<redacted>`, so a future
+/// `{:?}` in a log line cannot leak it.
+impl std::fmt::Debug for UdmUe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("UdmUe");
+        d.field("id", &self.id);
+        d.field("ctx_id", &self.ctx_id);
+        d.field("suci", &self.suci);
+        d.field("supi", &self.supi);
+        d.field("serving_network_name", &self.serving_network_name);
+        d.field("ausf_instance_id", &self.ausf_instance_id);
+        d.field("amf_instance_id", &self.amf_instance_id);
+        // The AMF's dereg-notify URIs carry its bearer token (#789).
+        d.field("dereg_callback_uri", &"<redacted>");
+        d.field("non_3gpp_amf_instance_id", &self.non_3gpp_amf_instance_id);
+        d.field("non_3gpp_dereg_callback_uri", &"<redacted>");
+        d.field("auth_event_id", &self.auth_event_id);
+        d.field("k", &"<redacted>");
+        d.field("opc", &"<redacted>");
+        d.field("topc", &"<redacted>");
+        d.field("algorithm_id", &self.algorithm_id);
+        d.field("amf", &self.amf);
+        d.field("rand", &"<redacted>");
+        d.field("sqn", &"<redacted>");
+        d.field("guami", &self.guami);
+        d.field("auth_type", &self.auth_type);
+        d.field("rat_type", &self.rat_type);
+        d.field("auth_event", &self.auth_event);
+        d.field(
+            "amf_3gpp_access_registration",
+            &self.amf_3gpp_access_registration,
+        );
+        d.field("stream_id", &self.stream_id);
+        d.field("expected_sor_xmac_iue", &self.expected_sor_xmac_iue);
+        d.field("last_sor_counter", &self.last_sor_counter);
+        d.field("expected_upu_xmac_iue", &self.expected_upu_xmac_iue);
+        d.field("last_upu_counter", &self.last_upu_counter);
+        d.field("sor_ack", &self.sor_ack);
+        d.field("upu_ack", &self.upu_ack);
+        d.finish()
+    }
 }
 
 impl UdmUe {
@@ -494,13 +538,7 @@ pub fn parse_suci(suci: &str) -> Option<ParsedSuci> {
 
 /// Strict hex decode: rejects odd length and non-hex characters.
 fn hex_str_to_bytes(hex: &str) -> Option<Vec<u8>> {
-    if !hex.len().is_multiple_of(2) {
-        return None;
-    }
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
-        .collect()
+    nextgcore_core::conv::hex_decode(hex)
 }
 
 /// Decode an MSIN plaintext block (TBCD, swapped nibbles, 0xF filler) into digits.
@@ -1433,6 +1471,14 @@ pub fn get_ue_load() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hex_str_to_bytes_refuses_a_multi_byte_character_without_panicking() {
+        // The SUCI scheme output reaches this from the AMF (#765).
+        assert_eq!(hex_str_to_bytes("a\u{e9}b"), None);
+        assert_eq!(hex_str_to_bytes("abc"), None);
+        assert_eq!(hex_str_to_bytes("0aFF"), Some(vec![0x0a, 0xff]));
+    }
 
     #[test]
     fn test_udm_context_new() {

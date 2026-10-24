@@ -2076,9 +2076,7 @@ mod tests {
         // (0x00 instead of 0x40) under parallel load. Take the same guard and pin the
         // switch off -- the posture this test asserts -- rather than add a second lock
         // over the same global, which #276 showed hangs the suite.
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.blocking_lock();
         crate::n26_path::set_for_test(false);
         let mut ue = create_test_amf_ue();
         ue.access_type = 1;
@@ -2137,9 +2135,7 @@ mod tests {
     /// whichever value this test left behind.
     #[test]
     fn iwk_n26_posture_follows_the_runtime_switch() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.blocking_lock();
 
         // Leg UP => the AMF HAS N26 => "interworking without N26 NOT supported" => bit 0.
         crate::n26_path::set_for_test(true);

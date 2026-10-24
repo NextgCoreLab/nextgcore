@@ -489,7 +489,28 @@ pub fn amf_sbi_open() -> SbiResult<()> {
     Ok(())
 }
 
-/// Close AMF SBI
+/// Serialises the amfd unit tests that empty the process discovery cache
+/// ([`amf_sbi_close_async`]) against the ones that assert on entries in it
+/// (#668). Declared beside the code that clears the cache, not in a test module.
+#[doc(hidden)]
+pub fn nf_cache_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Close AMF SBI, and wait for the teardown: the client pool and the discovery
+/// cache are empty when this returns (#673).
+pub async fn amf_sbi_close_async() {
+    log::info!("AMF SBI closing...");
+    let sbi_ctx = global_context();
+    sbi_ctx.clear_clients().await;
+    sbi_ctx.clear_nf_instances().await;
+    log::info!("AMF SBI closed");
+}
+
+/// Close AMF SBI from a sync caller: the teardown runs on a spawned task and
+/// may still be running when this returns. Async callers use
+/// [`amf_sbi_close_async`].
 pub fn amf_sbi_close() {
     log::info!("AMF SBI closing...");
     let sbi_ctx = global_context();
@@ -563,6 +584,33 @@ pub async fn amf_nrf_register(sbi_addr: &str, sbi_port: u16) -> Result<String, S
     }
 }
 
+/// The NF types whose discovered profiles [`amf_nrf_discover`] keeps in the
+/// discovery cache, which is exactly the set this AMF subscribes to at the NRF
+/// for NF status changes (#668, TS 29.510 §5.2.2.5). The NRF itself is cached
+/// too but is not a subscription target: it is not discovered through itself.
+pub const CACHED_PEER_NF_TYPES: [&str; 7] = ["AUSF", "UDM", "SMF", "PCF", "NSSF", "NSACF", "UCMF"];
+
+/// The cache type of a discovered profile's `nfType`, or `None` for a type
+/// [`amf_nrf_discover`] drops.
+pub(crate) fn cached_peer_nf_type(nf_type_str: &str) -> Option<nextgcore_sbi::types::NfType> {
+    Some(match nf_type_str {
+        "AUSF" => nextgcore_sbi::types::NfType::Ausf,
+        "UDM" => nextgcore_sbi::types::NfType::Udm,
+        "SMF" => nextgcore_sbi::types::NfType::Smf,
+        "PCF" => nextgcore_sbi::types::NfType::Pcf,
+        "NSSF" => nextgcore_sbi::types::NfType::Nssf,
+        "NRF" => nextgcore_sbi::types::NfType::Nrf,
+        // NSAC (TS 23.501 §5.15.11): without this arm a discovered
+        // NSACF profile was silently DROPPED here, so UE admission
+        // always fell back to degrade-open.
+        "NSACF" => nextgcore_sbi::types::NfType::Nsacf,
+        // RACS (#570): the UCMF, so `racs::resolve_ucmf_endpoint` can use
+        // what discovery found instead of every profile being dropped here.
+        "UCMF" => nextgcore_sbi::types::NfType::Ucmf,
+        _ => return None,
+    })
+}
+
 /// Discover NF services from NRF
 ///
 /// Queries GET /nnrf-disc/v1/nf-instances?target-nf-type={type}&service-names={svc}
@@ -616,21 +664,8 @@ pub async fn amf_nrf_discover(target_nf_type: &str, service_name: &str) -> Resul
                 .unwrap_or("unknown");
             let nf_type_str = nf_json.get("nfType").and_then(|v| v.as_str()).unwrap_or("");
 
-            let nf_type = match nf_type_str {
-                "AUSF" => nextgcore_sbi::types::NfType::Ausf,
-                "UDM" => nextgcore_sbi::types::NfType::Udm,
-                "SMF" => nextgcore_sbi::types::NfType::Smf,
-                "PCF" => nextgcore_sbi::types::NfType::Pcf,
-                "NSSF" => nextgcore_sbi::types::NfType::Nssf,
-                "NRF" => nextgcore_sbi::types::NfType::Nrf,
-                // NSAC (TS 23.501 §5.15.11): without this arm a discovered
-                // NSACF profile was silently DROPPED here, so UE admission
-                // always fell back to degrade-open.
-                "NSACF" => nextgcore_sbi::types::NfType::Nsacf,
-                // RACS (#570): the UCMF, so `racs::resolve_ucmf_endpoint` can use
-                // what discovery found instead of every profile being dropped here.
-                "UCMF" => nextgcore_sbi::types::NfType::Ucmf,
-                _ => continue,
+            let Some(nf_type) = cached_peer_nf_type(nf_type_str) else {
+                continue;
             };
 
             let mut instance = NfInstance::new(nf_id, nf_type);
@@ -698,12 +733,6 @@ pub async fn amf_nrf_discover(target_nf_type: &str, service_name: &str) -> Resul
     Ok(())
 }
 
-/// Serialises amfd tests that point the process-wide SBI context at a stand-in
-/// NRF (#664). The NRF URI lives in `nextgcore_sbi`'s global context, which this
-/// crate cannot put a lock beside, so it sits beside the discovery that reads it.
-#[cfg(test)]
-pub(crate) static AMF_NRF_URI_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 /// Register [`amf_nrf_discover`] as the SBI client's re-discovery (#664), so a
 /// request that could not reach a cached peer is resent to whatever the NRF
 /// lists now instead of failing the procedure.
@@ -721,7 +750,7 @@ pub fn register_rediscovery_hook() {
 }
 
 /// Parse host and port from a URI string (e.g., "http://localhost:7777")
-fn parse_host_port(uri: &str) -> Option<(String, u16)> {
+pub(crate) fn parse_host_port(uri: &str) -> Option<(String, u16)> {
     let without_scheme = uri
         .strip_prefix("https://")
         .or_else(|| uri.strip_prefix("http://"))
@@ -957,6 +986,7 @@ pub fn amf_sess_have_session_release_pending(_sess: &AmfSess) -> bool {
 // ============================================================================
 
 /// SM Context Create response from SMF
+#[derive(Debug)]
 pub struct SmContextCreateResponse {
     /// N1 SM message (NAS PDU Session Establishment Accept)
     pub n1_sm_msg: Vec<u8>,
@@ -1037,7 +1067,18 @@ pub struct SmContextIdentity {
     /// the subscription carries none, in which case the member is omitted
     /// (issue #205).
     pub gpsi: Option<String>,
+    /// `3gpp-Sbi-Origination-Timestamp` (TS 29.502 §6.1.2.3.2): the AMF is the
+    /// originating entity of a PDU session establishment's CreateSMContext. It
+    /// is set ONCE per establishment attempt and sent unchanged on every
+    /// retransmission of that request, so the PCF's collision rule
+    /// (TS 29.512 §4.2.7, after the SMF forwards it per §4.2.2.2) sees a
+    /// retried create as the same request and reuses its association (#980
+    /// review). `None` omits the header.
+    pub origination_timestamp: Option<String>,
 }
+
+/// TS 29.502 §6.1.2.3.2 custom header.
+pub const ORIGINATION_TIMESTAMP_HEADER: &str = "3gpp-Sbi-Origination-Timestamp";
 
 fn build_create_sm_context_request(
     pdu_session_id: u8,
@@ -1117,13 +1158,17 @@ fn build_create_sm_context_request(
     if let Some(gpsi) = &identity.gpsi {
         obj.insert("gpsi".to_string(), serde_json::json!(gpsi));
     }
-    SbiRequest::post("/nsmf-pdusession/v1/sm-contexts")
+    let request = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts")
         .with_body(body.to_string(), content_type::APPLICATION_JSON)
         .with_part(SbiPart::with_content(
             "n1SmMsg",
             content_type::APPLICATION_5GNAS,
             bytes::Bytes::copy_from_slice(n1_sm_msg_from_ue),
-        ))
+        ));
+    match &identity.origination_timestamp {
+        Some(ts) => request.with_header(ORIGINATION_TIMESTAMP_HEADER, ts.as_str()),
+        None => request,
+    }
 }
 
 /// Call SMF to create SM context (POST /nsmf-pdusession/v1/sm-contexts)
@@ -1743,12 +1788,8 @@ pub async fn call_ausf_authenticate_with_resync(
         .and_then(|loc| loc.rsplit('/').next().map(|s| s.to_string()))
         .unwrap_or_else(|| "1".to_string());
 
-    log::info!(
-        "AUSF auth response: ctx_id={}, RAND={}, AUTN={}",
-        auth_ctx_id,
-        hex::encode(&rand[..4]),
-        hex::encode(&autn[..4])
-    );
+    // Authentication vector material (RAND, AUTN) is never logged, not even a prefix.
+    log::info!("AUSF auth response: ctx_id={auth_ctx_id}");
 
     Ok(AusfAuthResponse {
         rand,
@@ -1775,11 +1816,8 @@ pub async fn call_ausf_5g_aka_confirm(
     auth_ctx_id: &str,
     res_star: &[u8; 16],
 ) -> SbiResult<AusfConfirmResponse> {
-    log::info!(
-        "Calling AUSF 5G-AKA confirmation: ctx_id={}, RES*={}",
-        auth_ctx_id,
-        hex::encode(&res_star[..4])
-    );
+    // RES* is authentication material: never logged, not even a prefix.
+    log::info!("Calling AUSF 5G-AKA confirmation: ctx_id={auth_ctx_id}");
 
     let client = crate::attach_oauth2(
         SbiClient::for_peer(ausf_host, ausf_port),
@@ -2755,13 +2793,19 @@ pub fn sm_context_status_uri(supi: &str, psi: u8) -> String {
 }
 
 /// The absolute Nudm_UECM `deregCallbackUri` the AMF registers for `supi`
-/// (WSB-4, TS 29.503 §5.3.2.3.2). Routed by `namf_server` at
-/// `POST /namf-callback/v1/{supi}/dereg-notify`.
-pub fn dereg_callback_uri(supi: &str) -> String {
+/// (WSB-4, TS 29.503 §5.3.2.3.2), carrying the registration's `token` (#753).
+/// Routed by `namf_server` at `POST /namf-callback/v1/{supi}/dereg-notify/{token}`.
+/// The URI is opaque to the UDM, which POSTs to it verbatim.
+pub fn dereg_callback_uri(supi: &str, token: &str) -> String {
     format!(
-        "{}/namf-callback/v1/{supi}/dereg-notify",
+        "{}/namf-callback/v1/{supi}/dereg-notify/{token}",
         advertised_sbi_base()
     )
+}
+
+/// A fresh `deregCallbackUri` token for one Nudm_UECM registration (#753).
+pub fn new_dereg_callback_token() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 /// This AMF's configured GUAMIs as a TS 29.571 `Guami` JSON array, for the
@@ -2844,6 +2888,7 @@ pub async fn call_udm_uecm_registration(
     udm_port: u16,
     supi: &str,
     amf_instance_id: &str,
+    dereg_token: &str,
     guami_plmn_mcc: &str,
     guami_plmn_mnc: &str,
     amf_id_hex: &str,
@@ -2857,7 +2902,7 @@ pub async fn call_udm_uecm_registration(
         "amfInstanceId": amf_instance_id,
         // WSB-4: absolute URI (was relative) so udmd can POST the
         // DeregistrationNotification back (TS 29.503 §5.3.2.3.2).
-        "deregCallbackUri": dereg_callback_uri(supi),
+        "deregCallbackUri": dereg_callback_uri(supi, dereg_token),
         "guami": {
             "plmnId": { "mcc": guami_plmn_mcc, "mnc": guami_plmn_mnc },
             "amfId": amf_id_hex,
@@ -3886,6 +3931,79 @@ pub async fn call_smf_cancel_sm_context_handover(
     .await
 }
 
+/// One step of an intra-5GS N2 handover at the SMF (TS 29.502 §5.2.2.3.4,
+/// TS 23.502 §4.9.1.3), answered with the SMF's N2 SM information when it has any
+/// (#964):
+/// - `PREPARING` with the source's Handover Required Transfer (`HANDOVER_REQUIRED`) and
+///   the target's `targetId`: answered with `PDU_RES_SETUP_REQ`, the target's Handover
+///   Request Transfer (§5.2.2.3.4.2);
+/// - `PREPARED` with the target's Handover Request Acknowledge Transfer
+///   (`HANDOVER_REQ_ACK`): answered with `HANDOVER_CMD`, the source's Handover Command
+///   Transfer;
+/// - `PREPARED` with a Handover Resource Allocation Unsuccessful Transfer
+///   (`HANDOVER_RES_ALLOC_FAIL`) for a session the target refused;
+/// - `COMPLETED` (§5.2.2.3.4.3) and `CANCELLED` with a cause (§5.2.2.3.4.4), bare.
+///
+/// `Ok(None)` is a success with no N2 SM information in the answer.
+pub async fn call_smf_n2_handover(
+    smf_host: &str,
+    smf_port: u16,
+    sm_context_ref: &str,
+    ho_state: &str,
+    n2: Option<(&str, &[u8])>,
+    target_id: Option<&serde_json::Value>,
+    cause: Option<&str>,
+) -> Result<Option<(String, Vec<u8>)>, String> {
+    let client = crate::attach_oauth2(
+        SbiClient::for_peer(smf_host, smf_port),
+        nextgcore_sbi::types::NfType::Smf,
+    );
+    let mut body = serde_json::json!({ "hoState": ho_state });
+    if let Some(target_id) = target_id {
+        body["targetId"] = target_id.clone();
+    }
+    if let Some(cause) = cause {
+        body["cause"] = serde_json::json!(cause);
+    }
+    let path = format!("/nsmf-pdusession/v1/sm-contexts/{sm_context_ref}/modify");
+    let mut request = SbiRequest::post(&path);
+    if let Some((info_type, transfer)) = n2 {
+        body["n2SmInfo"] = serde_json::json!({ "contentId": "n2SmInfo" });
+        body["n2SmInfoType"] = serde_json::json!(info_type);
+        request = request
+            .with_body(body.to_string(), content_type::APPLICATION_JSON)
+            .with_part(SbiPart::with_content(
+                "n2SmInfo",
+                content_type::APPLICATION_NGAP,
+                bytes::Bytes::copy_from_slice(transfer),
+            ));
+    } else {
+        request = request.with_body(body.to_string(), content_type::APPLICATION_JSON);
+    }
+    let response = client
+        .send_request(request)
+        .await
+        .map_err(|e| format!("UpdateSMContext ({ho_state}) failed: {e}"))?;
+    if !response.is_success() {
+        return Err(format!(
+            "UpdateSMContext ({ho_state}) answered {}",
+            response.status
+        ));
+    }
+    let root: serde_json::Value = response
+        .http
+        .content
+        .as_deref()
+        .and_then(|c| serde_json::from_str(c).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let n2_type = root["n2SmInfoType"].as_str().map(str::to_owned);
+    let n2 = extract_binary_ref(&response, &root, "n2SmInfo").filter(|b| !b.is_empty());
+    Ok(match (n2_type, n2) {
+        (Some(t), Some(b)) => Some((t, b)),
+        _ => None,
+    })
+}
+
 async fn update_sm_context_ho_state(
     smf_host: &str,
     smf_port: u16,
@@ -4348,6 +4466,88 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // #753: the Nudm_UECM registration names this AMF by its pinnable
+    // nfInstanceId, and its deregCallbackUri carries the registration's token.
+    // ------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_uecm_registration_carries_the_nf_instance_id_and_the_dereg_token() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>> =
+            Default::default();
+        let sink = std::sync::Arc::clone(&seen);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        server
+            .start(move |req: nextgcore_sbi::message::SbiRequest| {
+                let sink = std::sync::Arc::clone(&sink);
+                async move {
+                    let body = req
+                        .http
+                        .content
+                        .as_deref()
+                        .and_then(|c| serde_json::from_str(c).ok())
+                        .unwrap_or_default();
+                    sink.lock()
+                        .expect("sink")
+                        .push((req.header.uri.clone(), body));
+                    nextgcore_sbi::message::SbiResponse::with_status(201)
+                }
+            })
+            .await
+            .expect("stand-in UDM starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let token = new_dereg_callback_token();
+        assert_ne!(
+            token,
+            new_dereg_callback_token(),
+            "one token per registration"
+        );
+        let nf_id =
+            nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf);
+        call_udm_uecm_registration(
+            "127.0.0.1",
+            addr.port(),
+            "imsi-001010000075302",
+            &crate::ngap_path::amf_instance_id_for_tests(),
+            &token,
+            "001",
+            "01",
+            "020040",
+        )
+        .await
+        .expect("registered");
+        let seen = seen.lock().expect("seen").clone();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0]
+            .0
+            .ends_with("/nudm-uecm/v1/imsi-001010000075302/registrations/amf-3gpp-access"));
+        assert_eq!(
+            seen[0].1["amfInstanceId"], nf_id,
+            "the pinnable nfInstanceId, the one the NRF knows"
+        );
+        let cb = seen[0].1["deregCallbackUri"]
+            .as_str()
+            .expect("deregCallbackUri");
+        assert!(
+            cb.ends_with(&format!(
+                "/namf-callback/v1/imsi-001010000075302/dereg-notify/{token}"
+            )),
+            "{cb}"
+        );
+        server.stop().await.expect("stop");
+    }
+
+    // ------------------------------------------------------------------
     // nsacf-01/02 pairing: call_nsacf_ue_admission sends a nested
     // UeACRequestData and maps 204 / 200-acuFailureList / 403, degrade-open.
     // ------------------------------------------------------------------
@@ -4541,12 +4741,17 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_amf_sbi_open_close() {
-        // `amf_sbi_close` clears the process-wide discovery cache and client pool,
-        // which `sm_context_create_reaches_an_smf_restarted_at_a_new_address`
-        // seeds and reads: serialise against it (#673).
-        let _guard = AMF_NRF_URI_TEST_LOCK.lock().await;
+        // #673: the teardown is awaited, so it is over when the test is. The
+        // fire-and-forget `amf_sbi_close` cleared the process-wide discovery cache
+        // and client pool from a spawned task, after any lock this test held was
+        // released.
+        let _cache = nf_cache_test_lock().lock().await;
         assert!(amf_sbi_open().is_ok());
-        amf_sbi_close();
+        amf_sbi_close_async().await;
+        assert!(global_context()
+            .find_nf_instances_by_service(nextgcore_sbi::types::SbiServiceType::NsmfPdusession)
+            .await
+            .is_empty());
     }
 
     // ------------------------------------------------------------------
@@ -4554,151 +4759,42 @@ mod tests {
     // amfd↔smfd Nsmf_PDUSession path (TS 29.502 §6.1.2.2.2 / §6.1.2.4)
     // ------------------------------------------------------------------
 
-    /// #664, end to end through the AMF's own code: the SMF restarted at a new
-    /// address. The AMF's cache holds the old profile; the NRF (a stand-in)
-    /// still lists it next to the new one, as it does until the old heartbeat
-    /// expires. `call_smf_create_sm_context` to the cached (dead) SMF must reach
-    /// the NEW SMF -- the same SM Context Create, not a rejected PDU session --
-    /// through `register_rediscovery_hook` -> `amf_nrf_discover` (replace) ->
-    /// the SBI client's one-shot resend.
-    #[tokio::test]
-    async fn sm_context_create_reaches_an_smf_restarted_at_a_new_address() {
-        use nextgcore_sbi::types::NfType;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
-        let _guard = AMF_NRF_URI_TEST_LOCK.lock().await;
-        let ctx = global_context();
-        // Plaintext loopback stand-ins: a dev-profile deployment, said explicitly.
-        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
-
-        let old_port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let hits = Arc::new(AtomicUsize::new(0));
-        let served = hits.clone();
-        let (smf, new_smf) =
-            nextgcore_sbi::test_support::sbi_server_on_free_port(move |_req: SbiRequest| {
-                let served = served.clone();
-                async move {
-                    served.fetch_add(1, Ordering::SeqCst);
-                    let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
-                    let mut resp = SbiResponse::with_status(201);
-                    resp.http.content = Some(
-                        serde_json::json!({
-                            "smContextRef": "664",
-                            "n1SmMsg": b64(&[0x2E, 0x05, 0x02, 0xC2]),
-                            "n2SmInfo": b64(&[0x00, 0x01]),
-                        })
-                        .to_string(),
-                    );
-                    resp
-                }
-            })
-            .await;
-
-        let profile = |id: &str, port: u16| {
-            serde_json::json!({
-                "nfInstanceId": id, "nfType": "SMF", "nfStatus": "REGISTERED",
-                "ipv4Addresses": ["127.0.0.1"],
-                "nfServices": [{
-                    "serviceInstanceId": "1", "serviceName": "nsmf-pdusession",
-                    "ipEndPoints": [{ "ipv4Address": "127.0.0.1", "port": port }]
-                }]
-            })
-        };
-        let answer = serde_json::json!({
-            "validityPeriod": 3600,
-            "nfInstances": [profile("smf-664-old", old_port), profile("smf-664-new", new_smf.port())],
-        })
-        .to_string();
-        let (nrf, nrf_addr) =
-            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
-                let answer = answer.clone();
-                async move {
-                    if req.header.uri.contains("target-nf-type=SMF")
-                        || req.http.params.get("target-nf-type").map(String::as_str) == Some("SMF")
-                    {
-                        let mut resp = SbiResponse::with_status(200);
-                        resp.http.content = Some(answer);
-                        resp
-                    } else {
-                        SbiResponse::with_status(404)
-                    }
-                }
-            })
-            .await;
-        ctx.set_nrf_uri(format!("http://{nrf_addr}")).await;
-        register_rediscovery_hook();
-
-        // The AMF discovered the SMF before it restarted: only the old profile.
-        let mut stale = NfInstance::new("smf-664-old", NfType::Smf);
-        let mut svc = NfService::new(
-            "nsmf-pdusession",
-            nextgcore_sbi::types::SbiServiceType::NsmfPdusession,
-        );
-        svc.ip_addresses = vec!["127.0.0.1".into()];
-        svc.port = old_port;
-        stale.add_service(svc);
-        ctx.replace_nf_instances(
-            NfType::Smf,
-            vec![stale],
-            std::time::Duration::from_secs(3600),
-        )
-        .await;
-        let (host, port) = resolve_nf_endpoint_async(SbiServiceType::NsmfPdusession)
-            .await
-            .unwrap();
-        assert_eq!(
-            (host.as_str(), port),
-            ("127.0.0.1", old_port),
-            "premise: cached old SMF"
-        );
-
-        let created = call_smf_create_sm_context(
-            &host,
-            port,
-            5,
-            1,
-            None,
-            Some("internet"),
-            &UE_N1_REQUEST,
-            false,
-            &test_identity(),
-        )
-        .await
-        .expect("SM Context Create must reach the restarted SMF");
-        assert_eq!(created.sm_context_ref, "664");
-        assert_eq!(
-            created.smf_authority,
-            Some(format!("127.0.0.1:{}", new_smf.port())),
-            "#669: the context lives in the SMF that answered, not the dead one asked"
-        );
-        assert_eq!(hits.load(Ordering::SeqCst), 1);
-        // And the next PDU session resolves straight to the new SMF.
-        assert_eq!(
-            resolve_nf_endpoint_async(SbiServiceType::NsmfPdusession)
-                .await
-                .unwrap(),
-            ("127.0.0.1".to_string(), new_smf.port())
-        );
-
-        ctx.replace_nf_instances(NfType::Smf, vec![], std::time::Duration::from_secs(1))
-            .await;
-        ctx.clear_endpoint_failure("127.0.0.1", old_port);
-        ctx.set_rediscovery_hook(Arc::new(|_, _| Box::pin(async {})));
-        ctx.clear_nrf_uri().await;
-        nrf.stop().await.ok();
-        smf.stop().await.ok();
-    }
-
     /// A UE PDU Session Establishment Request N1 container (PSI=5, PTI=2).
     const UE_N1_REQUEST: [u8; 14] = [
         0x2E, 0x05, 0x02, 0xC1, 0xFF, 0xFF, 0x93, 0xA2, 0x28, 0x01, 0x00, 0x55, 0x00, 0x10,
     ];
 
     /// A populated identity, as the AMF now builds it from the UE context.
+    /// #980 review: the CreateSMContext carries the identity's origination
+    /// timestamp verbatim, and no header without one.
+    #[test]
+    fn the_create_sm_context_request_carries_the_origination_timestamp() {
+        let with =
+            build_create_sm_context_request(5, 1, None, None, &[0x2E], false, &test_identity());
+        assert_eq!(
+            with.http
+                .get_header(ORIGINATION_TIMESTAMP_HEADER)
+                .map(String::as_str),
+            Some("Fri, 23 Oct 2026 10:00:00.980 GMT")
+        );
+        let without = build_create_sm_context_request(
+            5,
+            1,
+            None,
+            None,
+            &[0x2E],
+            false,
+            &SmContextIdentity {
+                origination_timestamp: None,
+                ..test_identity()
+            },
+        );
+        assert!(without
+            .http
+            .get_header(ORIGINATION_TIMESTAMP_HEADER)
+            .is_none());
+    }
+
     fn test_identity() -> SmContextIdentity {
         SmContextIdentity {
             supi: Some("imsi-262011234567890".to_string()),
@@ -4715,6 +4811,7 @@ mod tests {
                 }
             })),
             gpsi: Some("msisdn-491234567890".to_string()),
+            origination_timestamp: Some("Fri, 23 Oct 2026 10:00:00.980 GMT".to_string()),
         }
     }
 

@@ -38,9 +38,10 @@ struct Args {
     #[arg(short = 'l', long)]
     log_file: Option<String>,
 
-    /// Log level (trace, debug, info, warn, error)
-    #[arg(short = 'e', long, default_value = "info")]
-    log_level: String,
+    /// Log level (trace, debug, info, warn, error). Without it, the config
+    /// file's `logger.level`, else `info`; `RUST_LOG` overrides (#691).
+    #[arg(short = 'e', long)]
+    log_level: Option<String>,
 
     /// Disable color output
     #[arg(short = 'm', long)]
@@ -3147,7 +3148,8 @@ pub async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest)
         for (i, b) in ue.sqn.iter_mut().enumerate() {
             *b = ((new_sqn >> ((5 - i) * 8)) & 0xFF) as u8;
         }
-        log::info!("[{supi}] SQN resynchronized (new SQN=0x{new_sqn:012x})");
+        // The SQN value is authentication state: never logged.
+        log::info!("[{supi}] SQN resynchronized");
     }
 
     // Step 4: Generate RAND and compute the AV with Milenage
@@ -3209,7 +3211,7 @@ pub async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest)
     let new_sqn_hex: String = new_sqn_arr.iter().map(|b| format!("{b:02x}")).collect();
     match crate::udm_nudr_dr_send_auth_subscription_patch(&supi, &new_sqn_hex, 0, 0).await {
         Ok(r) if r.is_success() || r.status == 204 => {
-            log::debug!("[{supi}] SQN advanced to 0x{new_sqn_hex}");
+            log::debug!("[{supi}] SQN advanced");
         }
         Ok(r) => {
             // ANY failed advance withholds the AV, not only a 5xx (#84).
@@ -3501,21 +3503,11 @@ pub async fn handle_delete_auth(
 
 /// Initialize logging based on command line arguments
 fn init_logging(args: &Args) -> Result<()> {
-    let mut builder = env_logger::Builder::new();
-
-    // Set log level
-    let level = match args.log_level.to_lowercase().as_str() {
-        "trace" => log::LevelFilter::Trace,
-        "debug" => log::LevelFilter::Debug,
-        "info" => log::LevelFilter::Info,
-        "warn" => log::LevelFilter::Warn,
-        "error" => log::LevelFilter::Error,
-        _ => log::LevelFilter::Info,
-    };
-    builder.filter_level(level);
-
-    // Configure format
-    builder.format_timestamp_millis();
+    // RUST_LOG if set, else --log-level: the same for every NF (#691).
+    let mut builder = nextgcore_core::log::nf_log_builder(&nextgcore_core::log::nf_log_level(
+        args.log_level.as_deref(),
+        Some(&args.config),
+    ));
 
     if args.no_color {
         builder.write_style(env_logger::WriteStyle::Never);
@@ -3801,7 +3793,7 @@ mod tests {
     fn test_args_default() {
         let args = Args::parse_from(["nextgcore-udmd"]);
         assert_eq!(args.config, "/etc/nextgcore/udm.yaml");
-        assert_eq!(args.log_level, "info");
+        assert_eq!(args.log_level, None);
         assert_eq!(args.sbi_addr, "0.0.0.0");
         assert_eq!(args.sbi_port, 7777);
         assert!(!args.tls);
@@ -3827,7 +3819,7 @@ mod tests {
             "8192",
         ]);
         assert_eq!(args.config, "/custom/udm.yaml");
-        assert_eq!(args.log_level, "debug");
+        assert_eq!(args.log_level.as_deref(), Some("debug"));
         assert_eq!(args.sbi_addr, "0.0.0.0");
         assert_eq!(args.sbi_port, 8080);
         assert_eq!(args.max_ue, 2048);
@@ -3959,7 +3951,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let _ = env_logger::try_init();
+        nextgcore_core::test_log::init();
         tokio::time::timeout(Duration::from_secs(60), async {
             udm_context_init(64, 64);
 
@@ -4377,7 +4369,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let _ = env_logger::try_init();
+        nextgcore_core::test_log::init();
         use nextgcore_sbi::message::{SbiHeader, SbiHttpMessage, SbiRequest};
 
         udm_context_init(64, 64);
@@ -4478,7 +4470,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let _ = env_logger::try_init();
+        nextgcore_core::test_log::init();
         use nextgcore_sbi::message::{SbiHeader, SbiHttpMessage, SbiRequest};
 
         udm_context_init(64, 64);
@@ -4537,7 +4529,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let _ = env_logger::try_init();
+        nextgcore_core::test_log::init();
         use nextgcore_sbi::message::{SbiHeader, SbiHttpMessage, SbiRequest};
         udm_context_init(64, 64);
         let ue = "imsi-udmdee-0001";
@@ -5686,7 +5678,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let _ = env_logger::try_init();
+        nextgcore_core::test_log::init();
         udm_context_init(64, 64);
         std::env::remove_var("UDM_NOTIFY_DISABLE");
 
@@ -5955,7 +5947,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let _ = env_logger::try_init();
+        nextgcore_core::test_log::init();
         udm_context_init(64, 64);
 
         let state = Arc::new(UeauUdrState::default());
@@ -6170,7 +6162,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let _ = env_logger::try_init();
+        nextgcore_core::test_log::init();
         udm_context_init(64, 64);
         let (udm_server, client) = start_real_udm().await;
 
@@ -6394,7 +6386,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let _ = env_logger::try_init();
+        nextgcore_core::test_log::init();
         udm_context_init(64, 64);
         let (udr_server, store) = start_mock_udr_context_data().await;
         let (udm_server, client) = start_real_udm().await;
@@ -6473,7 +6465,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let _ = env_logger::try_init();
+        nextgcore_core::test_log::init();
         udm_context_init(64, 64);
         let (udr_server, store) = start_mock_udr_context_data().await;
         let (udm_server, client) = start_real_udm().await;

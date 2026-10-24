@@ -39,19 +39,19 @@ use nextgcore_gtp::v2::{
     Gtp2IndicationIe, Gtp2Message, Gtp2MessageType, Gtp2PdnConnectionIe,
 };
 
-/// GTPv2-C cause `Request accepted` (TS 29.274 Table 8.4-1).
-pub const CAUSE_REQUEST_ACCEPTED: u8 = 16;
+/// GTPv2-C cause `Conditional IE missing` (Table 8.4-1, value 103).
+pub use nextgcore_gtp::v2::cause::CONDITIONAL_IE_MISSING as CAUSE_CONDITIONAL_IE_MISSING;
 /// GTPv2-C cause `Mandatory IE incorrect` (Table 8.4-1, value 69).
-pub const CAUSE_MANDATORY_IE_INCORRECT: u8 = 69;
+pub use nextgcore_gtp::v2::cause::MANDATORY_IE_INCORRECT as CAUSE_MANDATORY_IE_INCORRECT;
 /// GTPv2-C cause `Mandatory IE missing` (Table 8.4-1, value 70).
-pub const CAUSE_MANDATORY_IE_MISSING: u8 = 70;
-/// GTPv2-C cause `System failure` (Table 8.4-1, value 72).
-pub const CAUSE_SYSTEM_FAILURE: u8 = 72;
+pub use nextgcore_gtp::v2::cause::MANDATORY_IE_MISSING as CAUSE_MANDATORY_IE_MISSING;
 /// GTPv2-C cause `Relocation failure` (Table 8.4-1, value 81) — §7.3.2's message-specific
 /// cause for a Forward Relocation Response that refuses.
-pub const CAUSE_RELOCATION_FAILURE: u8 = 81;
-/// GTPv2-C cause `Conditional IE missing` (Table 8.4-1, value 103).
-pub const CAUSE_CONDITIONAL_IE_MISSING: u8 = 103;
+pub use nextgcore_gtp::v2::cause::RELOCATION_FAILURE as CAUSE_RELOCATION_FAILURE;
+/// GTPv2-C cause `Request accepted` (TS 29.274 Table 8.4-1).
+pub use nextgcore_gtp::v2::cause::REQUEST_ACCEPTED as CAUSE_REQUEST_ACCEPTED;
+/// GTPv2-C cause `System failure` (Table 8.4-1, value 72).
+pub use nextgcore_gtp::v2::cause::SYSTEM_FAILURE as CAUSE_SYSTEM_FAILURE;
 
 /// F-TEID interface type `N26 AMF GTP-C` (TS 29.274 Table 8.22-1).
 pub const N26_AMF_GTP_C: u8 = 40;
@@ -118,7 +118,7 @@ pub const DEFAULT_5G_IA_OCTET: u8 = 0x60;
 /// (`SAMBRI`, `29274-j60.txt:27741-27746`) — and reading such a context with the AMF-shaped
 /// decoder would take the UE-AMBR octets as the UE Network Capability length. So the inbound
 /// direction reads Figure 8.38-5 in full, field by field.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct EpsSecurityContext {
     /// `KSI_ASME` (octet 5, bits 3..1): the eKSI of the EPS context, which becomes the value
     /// field of the mapped ngKSI (TS 33.501 §8.6.2).
@@ -151,6 +151,31 @@ pub struct EpsSecurityContext {
     pub ue_network_capability: Vec<u8>,
     /// `Mobile Equipment Identity` contents (TS 29.274 §8.10 TBCD).
     pub mei: Vec<u8>,
+}
+
+/// Manual `Debug` (no-auth-material-in-logs): the authentication material in
+/// this type (kasme, nh) prints as `<redacted>`, so a future
+/// `{:?}` in a log line cannot leak it.
+impl std::fmt::Debug for EpsSecurityContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("EpsSecurityContext");
+        d.field("ksi_asme", &self.ksi_asme);
+        d.field(
+            "used_nas_integrity_algorithm",
+            &self.used_nas_integrity_algorithm,
+        );
+        d.field("used_nas_cipher", &self.used_nas_cipher);
+        d.field("nas_downlink_count", &self.nas_downlink_count);
+        d.field("nas_uplink_count", &self.nas_uplink_count);
+        d.field("kasme", &"<redacted>");
+        d.field("nh", &"<redacted>");
+        d.field("ncc", &self.ncc);
+        d.field("subscribed_ue_ambr_kbps", &self.subscribed_ue_ambr_kbps);
+        d.field("used_ue_ambr_kbps", &self.used_ue_ambr_kbps);
+        d.field("ue_network_capability", &self.ue_network_capability);
+        d.field("mei", &self.mei);
+        d.finish()
+    }
 }
 
 /// Parse an MME's MM Context (type 107) contents per **Figure 8.38-5**.
@@ -686,7 +711,7 @@ pub fn ue_ambr_bps(
 ///
 /// Every field is a value the procedure fixes, and each is named for the clause that fixes
 /// it so a reviewer can check them one at a time.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct MappedSecurity {
     /// `K_AMF'` = KDF(K_ASME, FC 0x76, NH) (§8.6.2, Annex A.15.2).
     pub kamf: [u8; 32],
@@ -718,6 +743,28 @@ pub struct MappedSecurity {
     /// (§8.4.2 step 3, "increment the downlink NAS COUNT by one after creating a NAS
     /// Container").
     pub dl_count: u32,
+}
+
+/// Manual `Debug` (no-auth-material-in-logs): the authentication material in
+/// this type (kamf, knas_int, knas_enc, temporary_kgnb, stored_nh) prints as `<redacted>`, so a future
+/// `{:?}` in a log line cannot leak it.
+impl std::fmt::Debug for MappedSecurity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("MappedSecurity");
+        d.field("kamf", &"<redacted>");
+        d.field("knas_int", &"<redacted>");
+        d.field("knas_enc", &"<redacted>");
+        d.field("ngksi", &self.ngksi);
+        d.field("nia", &self.nia);
+        d.field("nea", &self.nea);
+        d.field("ue_5g_caps", &self.ue_5g_caps);
+        d.field("ue_eps_caps", &self.ue_eps_caps);
+        d.field("nas_container", &self.nas_container);
+        d.field("temporary_kgnb", &"<redacted>");
+        d.field("stored_nh", &"<redacted>");
+        d.field("dl_count", &self.dl_count);
+        d.finish()
+    }
 }
 
 /// The stored NCC after the HandoverRequest (TS 33.501 §8.4.2 step 4: *"The target AMF shall

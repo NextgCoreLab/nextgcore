@@ -12,6 +12,7 @@ thiserror.workspace = true
 # Issue #66: the shared NF state store persists full-store JSON snapshots, the
 # format the four NFs that already had one all used.
 serde_json.workspace = true
+serde_yaml.workspace = true
 bytes.workspace = true
 bitflags.workspace = true
 libc.workspace = true
@@ -19,6 +20,10 @@ env_logger.workspace = true
 rand.workspace = true
 uuid.workspace = true
 tokio = { workspace = true, features = ["time", "sync", "rt"] }
+
+[features]
+# A capturing logger for NF tests (#1026); enabled from [dev-dependencies] only.
+test-log = []
 
 [dev-dependencies]
 proptest.workspace = true

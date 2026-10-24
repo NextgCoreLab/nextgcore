@@ -791,6 +791,33 @@ pub fn build_pdu_session_resource_setup_request_asn1(
     nas_pdu: Option<&[u8]>,
     n2_sm_transfer: &[u8],
 ) -> Option<Vec<u8>> {
+    build_pdu_session_resource_setup_request_with_nas_asn1(
+        amf_ue_ngap_id,
+        ran_ue_ngap_id,
+        pdu_session_id,
+        s_nssai_sst,
+        s_nssai_sd,
+        nas_pdu,
+        None,
+        n2_sm_transfer,
+    )
+}
+
+/// [`build_pdu_session_resource_setup_request_asn1`] with the item's own
+/// PDU Session NAS-PDU (TS 38.413 §9.2.1.1): the place for a 5GSM message about
+/// that session (TS 23.502 §4.3.2.2.1 step 12), tied to the session's outcome at
+/// the gNB. `nas_pdu` is the message-level NAS-PDU, for a 5GMM message.
+#[allow(clippy::too_many_arguments)]
+pub fn build_pdu_session_resource_setup_request_with_nas_asn1(
+    amf_ue_ngap_id: u64,
+    ran_ue_ngap_id: u32,
+    pdu_session_id: u8,
+    s_nssai_sst: u8,
+    s_nssai_sd: Option<u32>,
+    nas_pdu: Option<&[u8]>,
+    pdu_session_nas_pdu: Option<&[u8]>,
+    n2_sm_transfer: &[u8],
+) -> Option<Vec<u8>> {
     use ngap_gen::{
         PDUSessionResourceSetupItemSUReq,
         PDUSessionResourceSetupItemSUReqPDUSessionResourceSetupRequestTransfer as Transfer,
@@ -801,7 +828,7 @@ pub fn build_pdu_session_resource_setup_request_asn1(
 
     let item = PDUSessionResourceSetupItemSUReq {
         pdu_session_id: ngap_gen::PDUSessionID(pdu_session_id),
-        pdu_session_nas_pdu: None,
+        pdu_session_nas_pdu: pdu_session_nas_pdu.map(|n| ngap_gen::NAS_PDU(n.to_vec())),
         s_nssai: generated_s_nssai(&crate::context::SNssai {
             sst: s_nssai_sst,
             sd: s_nssai_sd,
@@ -3000,6 +3027,42 @@ fn find_protocol_ie_value(data: &[u8], id: u16) -> Option<Vec<u8>> {
     None
 }
 
+/// Which UE id a UE-associated NGAP PDU names (#813): the AMF UE NGAP ID when it has
+/// one, else only the RAN UE NGAP ID, which is unique only within its association.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UeAssociation {
+    /// The PDU carries an AMF UE NGAP ID (IE 10, or inside UE-NGAP-IDs, IE 114).
+    Amf(u64),
+    /// The PDU carries only a RAN UE NGAP ID (IE 85).
+    Ran(u32),
+}
+
+/// The UE an NGAP PDU is UE-associated signalling for, as the key its SCTP stream is
+/// chosen by (TS 38.412 §7, #813); `None` for a non-UE-associated PDU.
+///
+/// A PDU is UE-associated exactly when it names a UE-associated logical NG-connection at
+/// the top level: an AMF-UE-NGAP-ID (IE 10), a RAN-UE-NGAP-ID (IE 85) or a UE-NGAP-IDs
+/// (IE 114, the UE Context Release Command's). Every non-UE-associated procedure of TS
+/// 38.413 §8 carries none of them at the top level; NG Reset names UEs only inside its
+/// ResetType.
+pub fn ue_association_key(data: &[u8]) -> Option<UeAssociation> {
+    if let Some(value) = find_protocol_ie_value(data, ngap_gen::ID_AMF_UE_NGAP_ID) {
+        if let Ok(id) = nextgcore_ngap_gen::decode_contained::<ngap_gen::AMF_UE_NGAP_ID>(&value) {
+            return Some(UeAssociation::Amf(id.0));
+        }
+    }
+    if let Some(value) = find_protocol_ie_value(data, ngap_gen::ID_UE_NGAP_I_DS) {
+        match nextgcore_ngap_gen::decode_contained::<ngap_gen::UE_NGAP_IDs>(&value) {
+            Ok(ngap_gen::UE_NGAP_IDs::UE_NGAP_ID_pair(pair)) => {
+                return Some(UeAssociation::Amf(pair.amf_ue_ngap_id.0))
+            }
+            Ok(ngap_gen::UE_NGAP_IDs::AMF_UE_NGAP_ID(id)) => return Some(UeAssociation::Amf(id.0)),
+            _ => {}
+        }
+    }
+    extract_ran_ue_ngap_id(data).map(UeAssociation::Ran)
+}
+
 /// Extract the AMF-UE-NGAP-ID (IE 10) from any UE-associated NGAP PDU,
 /// decoding the IE value with the GENERATED codec (#417).
 pub fn extract_amf_ue_ngap_id(data: &[u8]) -> Option<u64> {
@@ -3981,6 +4044,19 @@ fn ng_enb_id_value(id: &ngap_gen::NgENB_ID) -> Option<u32> {
     })
 }
 
+/// A generated NgENB-ID as the hand-written CHOICE, keeping which length the
+/// gNB named (TS 38.413 §9.3.1.8); `None` for a choice extension.
+fn ng_enb_id_variant(id: &ngap_gen::NgENB_ID) -> Option<nextgcore_ngap::types::NgEnbId> {
+    use nextgcore_ngap::types::NgEnbId;
+    Some(match id {
+        ngap_gen::NgENB_ID::MacroNgENB_ID(b) => NgEnbId::Macro(bits_value(&b.0)),
+        ngap_gen::NgENB_ID::ShortMacroNgENB_ID(b) => NgEnbId::ShortMacro(bits_value(&b.0)),
+        ngap_gen::NgENB_ID::LongMacroNgENB_ID(b) => NgEnbId::LongMacro(bits_value(&b.0)),
+        #[allow(unreachable_patterns)]
+        _ => return None,
+    })
+}
+
 /// The hand-written GlobalRanNodeId a generated GlobalRANNodeID maps to: a gNB or
 /// an ng-eNB; `None` for an N3IWF or a choice extension, which a handover target
 /// cannot be.
@@ -4015,7 +4091,9 @@ fn hand_written_global_ran_node_id(id: &ngap_gen::GlobalRANNodeID) -> Option<Glo
 /// EPS-TAI has a 2-octet one. So a 5GS-to-EPS HANDOVER REQUIRED naming its
 /// target as an eNB decoded to a garbage PLMN and eNB id, which the AMF then
 /// relayed to the MME in the Forward Relocation's Target Identification. The
-/// EPS TAC goes into the low two octets of `tai_tac`.
+/// ngENB-ID keeps which of the three lengths the gNB named (#741), because TS
+/// 29.274 §8.51 encodes a macro id under Target Type 1 and a short or long macro
+/// id under Target Type 4.
 fn hand_written_target_id(target: &ngap_gen::TargetID) -> Option<TargetId> {
     match target {
         ngap_gen::TargetID::TargetRANNodeID(t) => Some(TargetId::TargetRanNodeId {
@@ -4025,23 +4103,20 @@ fn hand_written_target_id(target: &ngap_gen::TargetID) -> Option<TargetId> {
                 tai_tac: t.selected_tai.tac.0.as_slice().try_into().ok()?,
             },
         }),
-        ngap_gen::TargetID::TargeteNB_ID(t) => {
-            let tac: [u8; 2] = t.selected_eps_tai.eps_tac.0.as_slice().try_into().ok()?;
-            Some(TargetId::TargetGlobalNgEnbId {
-                plmn_identity: t.global_enb_id.plmn_identity.0.as_slice().try_into().ok()?,
-                ng_enb_id: ng_enb_id_value(&t.global_enb_id.ng_enb_id)?,
-                selected_tai: TaiListItem {
-                    tai_plmn: t
-                        .selected_eps_tai
-                        .plmn_identity
-                        .0
-                        .as_slice()
-                        .try_into()
-                        .ok()?,
-                    tai_tac: [0, tac[0], tac[1]],
-                },
-            })
-        }
+        ngap_gen::TargetID::TargeteNB_ID(t) => Some(TargetId::TargetGlobalNgEnbId {
+            plmn_identity: t.global_enb_id.plmn_identity.0.as_slice().try_into().ok()?,
+            ng_enb_id: ng_enb_id_variant(&t.global_enb_id.ng_enb_id)?,
+            selected_eps_tai: nextgcore_ngap::types::EpsTai {
+                plmn_identity: t
+                    .selected_eps_tai
+                    .plmn_identity
+                    .0
+                    .as_slice()
+                    .try_into()
+                    .ok()?,
+                tac: t.selected_eps_tai.eps_tac.0.as_slice().try_into().ok()?,
+            },
+        }),
         #[allow(unreachable_patterns)]
         _ => None,
     }
@@ -4074,6 +4149,45 @@ pub fn hand_written_diagnostics(report: &CriticalityErrorIndication) -> Critical
     }
 }
 
+/// The UE ids of a HANDOVER REQUIRED that is well formed but asks for a handover this
+/// AMF cannot represent (#744): a HandoverType past the extension marker
+/// (fivegs-to-utran) or a TargetID it has no value for (the choice extensions
+/// targetRNC-ID / targetHomeENB-ID). `None` for anything else, including a PDU that
+/// does not decode or does not name both UE ids.
+///
+/// [`decode_handover_required_asn1`] answers such a PDU `Undecodable`, which used to
+/// produce an Error Indication with transfer-syntax-error: the wrong cause for a message
+/// that decoded, and no HANDOVER PREPARATION FAILURE, so the source waited for
+/// TNGRELOCprep (TS 38.413 §8.4.1.3). The handler uses this to answer the Failure.
+pub fn handover_required_unsupported_target(data: &[u8]) -> Option<(u64, u32)> {
+    use ngap_gen::HandoverRequiredProtocolIEs_EntryValue as Ie;
+    let (pdu, _unknown) = nextgcore_ngap_gen::decode_with_unknown_ies(data).ok()?;
+    let ngap_gen::NGAP_PDU::InitiatingMessage(m) = pdu else {
+        return None;
+    };
+    let ngap_gen::InitiatingMessageValue::Id_HandoverPreparation(required) = m.value else {
+        return None;
+    };
+    let (mut amf, mut ran, mut unsupported) = (None, None, false);
+    for entry in required.protocol_i_es.0 {
+        match entry.value {
+            Ie::Id_AMF_UE_NGAP_ID(v) => amf = Some(v.0),
+            Ie::Id_RAN_UE_NGAP_ID(v) => ran = Some(v.0),
+            Ie::Id_HandoverType(v) => {
+                unsupported |= !matches!(
+                    v.0,
+                    ngap_gen::HandoverType::INTRA5GS
+                        | ngap_gen::HandoverType::FIVEGS_TO_EPS
+                        | ngap_gen::HandoverType::EPS_TO_5GS
+                )
+            }
+            Ie::Id_TargetID(v) => unsupported |= hand_written_target_id(&v).is_none(),
+            _ => {}
+        }
+    }
+    unsupported.then_some((amf?, ran?))
+}
+
 /// Decode a HANDOVER REQUIRED (TS 38.413 §9.2.3.1) with the GENERATED codec
 /// (#417), applying §10.3.4.2 and §10.3.5. Handover Preparation is a Class 1
 /// procedure whose unsuccessful outcome is HANDOVER PREPARATION FAILURE, so a
@@ -4082,8 +4196,10 @@ pub fn hand_written_diagnostics(report: &CriticalityErrorIndication) -> Critical
 /// with that failure (or an Error Indication when the UE cannot be named); a
 /// "notify" IE comes back in `error_indication`. Cause and Direct Forwarding
 /// Path Availability are criticality ignore: a missing Cause is
-/// misc/unspecified. A TargetID this AMF cannot represent (an N3IWF, a
-/// choice extension) is `Undecodable`, as the hand-written parser had it.
+/// misc/unspecified. A HandoverType or TargetID this AMF cannot represent (an N3IWF, a
+/// choice extension) is `Undecodable` -- but only once the PDU has passed the
+/// §10.3.4.2 / §10.3.5 checks, so a missing mandatory IE or a not-comprehended reject
+/// IE is answered with abstract-syntax-error whatever the type or target (#844 review).
 pub fn decode_handover_required_asn1(data: &[u8]) -> NasTransportDecode<HandoverRequired> {
     use ngap_gen::HandoverRequiredProtocolIEs_EntryValue as Ie;
     let Some((criticality, ies, mut reject, notify)) =
@@ -4096,30 +4212,37 @@ pub fn decode_handover_required_asn1(data: &[u8]) -> NasTransportDecode<Handover
     };
     let (mut amf, mut ran, mut ho_type, mut cause, mut target) = (None, None, None, None, None);
     let (mut sessions, mut container, mut direct) = (None, None, None);
+    // Present but not representable here (#744): decided after the abstract-syntax checks.
+    let (mut ho_type_present, mut target_present, mut unsupported) = (false, false, false);
     for entry in ies {
         match entry.value {
             Ie::Id_AMF_UE_NGAP_ID(v) => amf = Some(v.0),
             Ie::Id_RAN_UE_NGAP_ID(v) => ran = Some(v.0),
             Ie::Id_HandoverType(v) => {
-                ho_type = Some(match v.0 {
-                    ngap_gen::HandoverType::INTRA5GS => HandoverType::Intra5gs,
-                    ngap_gen::HandoverType::FIVEGS_TO_EPS => HandoverType::FivegsToEps,
-                    ngap_gen::HandoverType::EPS_TO_5GS => HandoverType::EpsTo5gs,
+                ho_type_present = true;
+                ho_type = match v.0 {
+                    ngap_gen::HandoverType::INTRA5GS => Some(HandoverType::Intra5gs),
+                    ngap_gen::HandoverType::FIVEGS_TO_EPS => Some(HandoverType::FivegsToEps),
+                    ngap_gen::HandoverType::EPS_TO_5GS => Some(HandoverType::EpsTo5gs),
                     other => {
                         // 5GS-to-UTRAN and later: no hand-written value, as before.
                         log::warn!("Handover Required with an unsupported HandoverType {other}");
-                        return NasTransportDecode::Undecodable;
+                        unsupported = true;
+                        None
                     }
-                })
+                }
             }
             Ie::Id_Cause(v) => cause = Some(hand_written_cause(&v)),
-            Ie::Id_TargetID(v) => match hand_written_target_id(&v) {
-                Some(t) => target = Some(t),
-                None => {
-                    log::warn!("Handover Required names a target this AMF cannot represent");
-                    return NasTransportDecode::Undecodable;
+            Ie::Id_TargetID(v) => {
+                target_present = true;
+                match hand_written_target_id(&v) {
+                    Some(t) => target = Some(t),
+                    None => {
+                        log::warn!("Handover Required names a target this AMF cannot represent");
+                        unsupported = true;
+                    }
                 }
-            },
+            }
             Ie::Id_DirectForwardingPathAvailability(_) => {
                 direct = Some(
                     nextgcore_ngap::types::DirectForwardingPathAvailability::DirectPathAvailable,
@@ -4141,8 +4264,8 @@ pub fn decode_handover_required_asn1(data: &[u8]) -> NasTransportDecode<Handover
     for (present, id) in [
         (amf.is_some(), ngap_gen::ID_AMF_UE_NGAP_ID),
         (ran.is_some(), ngap_gen::ID_RAN_UE_NGAP_ID),
-        (ho_type.is_some(), ngap_gen::ID_HANDOVER_TYPE),
-        (target.is_some(), ngap_gen::ID_TARGET_ID),
+        (ho_type_present, ngap_gen::ID_HANDOVER_TYPE),
+        (target_present, ngap_gen::ID_TARGET_ID),
         (
             sessions.is_some(),
             ngap_gen::ID_PDU_SESSION_RESOURCE_LIST_HO_RQD,
@@ -4166,6 +4289,9 @@ pub fn decode_handover_required_asn1(data: &[u8]) -> NasTransportDecode<Handover
             diagnostics,
         )
     };
+    if unsupported && reject.is_empty() {
+        return NasTransportDecode::Undecodable;
+    }
     let (
         Some(amf_ue_ngap_id),
         Some(ran_ue_ngap_id),
@@ -4691,7 +4817,8 @@ pub fn build_handover_command_generated(msg: &HandoverCommand) -> Option<Vec<u8>
 pub struct RanStatusRelay {
     /// AMF UE NGAP ID.
     pub amf_ue_ngap_id: u64,
-    /// The source gNB's RAN UE NGAP ID (reused at the target).
+    /// The RAN UE NGAP ID of the gNB this message is for: the SOURCE's as decoded
+    /// from the uplink transfer, the TARGET's once the AMF relays it (#740).
     pub ran_ue_ngap_id: u32,
     /// The PDCP SN/HFN status container.
     pub container: ngap_gen::RANStatusTransfer_TransparentContainer,
@@ -4987,6 +5114,17 @@ pub fn decode_path_switch_request_asn1(data: &[u8]) -> PathSwitchRequestDecode {
 /// released lists.
 pub fn path_switch_unsuccessful_transfer(cause: Cause) -> Option<Vec<u8>> {
     nextgcore_ngap_gen::encode_contained(&ngap_gen::PathSwitchRequestUnsuccessfulTransfer {
+        cause: generated_cause(cause),
+        ie_extensions: None,
+    })
+    .ok()
+}
+
+/// A HandoverPreparationUnsuccessfulTransfer (TS 38.413 §9.3.4.18) carrying `cause`:
+/// the per-session content of a HANDOVER COMMAND's PDU Session Resource to Release List
+/// (§9.2.3.2), for a session the source offered that is not handed over (#964).
+pub fn handover_preparation_unsuccessful_transfer(cause: Cause) -> Option<Vec<u8>> {
+    nextgcore_ngap_gen::encode_contained(&ngap_gen::HandoverPreparationUnsuccessfulTransfer {
         cause: generated_cause(cause),
         ie_extensions: None,
     })
@@ -13950,31 +14088,90 @@ mod handover_required_tests {
         let TargetId::TargetGlobalNgEnbId {
             plmn_identity,
             ng_enb_id,
-            selected_tai,
+            selected_eps_tai,
         } = generated(&bytes).target_id
         else {
             panic!("an eNB target");
         };
         assert_eq!(plmn_identity, [0x99, 0xF9, 0x07]);
-        assert_eq!(ng_enb_id, 0x12345);
-        assert_eq!(selected_tai.tai_plmn, [0x99, 0xF9, 0x07]);
-        assert_eq!(selected_tai.tai_tac, [0x00, 0x00, 0x07]);
-        // The hand-written parser misreads this conformant encoding.
-        let misread = match parser::decode_ngap_pdu(&bytes) {
-            Ok(NgapMessage::HandoverRequired(old)) => match old.target_id {
-                TargetId::TargetGlobalNgEnbId {
-                    plmn_identity,
-                    ng_enb_id,
-                    ..
-                } => plmn_identity != [0x99, 0xF9, 0x07] || ng_enb_id != 0x12345,
-                _ => true,
-            },
-            _ => true,
-        };
-        assert!(
-            misread,
-            "the hand-written TargetID decoder was expected to misread"
+        assert_eq!(ng_enb_id, nextgcore_ngap::types::NgEnbId::Macro(0x12345));
+        assert_eq!(
+            selected_eps_tai,
+            nextgcore_ngap::types::EpsTai {
+                plmn_identity: [0x99, 0xF9, 0x07],
+                tac: [0x00, 0x07],
+            }
         );
+        // #741: the hand-written parser now reads the conformant encoding the same way.
+        let Ok(NgapMessage::HandoverRequired(old)) = parser::decode_ngap_pdu(&bytes) else {
+            panic!("the hand-written parser refused a conformant targeteNB-ID");
+        };
+        let TargetId::TargetGlobalNgEnbId {
+            plmn_identity,
+            ng_enb_id,
+            selected_eps_tai,
+        } = old.target_id
+        else {
+            panic!("an eNB target");
+        };
+        assert_eq!(plmn_identity, [0x99, 0xF9, 0x07]);
+        assert_eq!(ng_enb_id, nextgcore_ngap::types::NgEnbId::Macro(0x12345));
+        assert_eq!(selected_eps_tai.tac, [0x00, 0x07]);
+    }
+
+    /// #741: every ngENB-ID length survives the generated decode with its kind, and the
+    /// hand-written builder's targeteNB-ID is the octets the generated codec produces
+    /// (the GOLDEN above for the macro case), so the two codecs cannot drift.
+    #[test]
+    fn every_ng_enb_id_length_round_trips_through_both_codecs() {
+        use nextgcore_ngap::types::{EpsTai, NgEnbId};
+        let golden_target = |id: NgEnbId| TargetId::TargetGlobalNgEnbId {
+            plmn_identity: [0x99, 0xF9, 0x07],
+            ng_enb_id: id,
+            selected_eps_tai: EpsTai {
+                plmn_identity: [0x99, 0xF9, 0x07],
+                tac: [0x00, 0x07],
+            },
+        };
+        for id in [
+            NgEnbId::Macro(0x12345),
+            NgEnbId::Macro(0xF_FFFF),
+            NgEnbId::ShortMacro(0x2_ABCD),
+            NgEnbId::ShortMacro(0x3_FFFF),
+            NgEnbId::LongMacro(0x1A_BCDE),
+            NgEnbId::LongMacro(0x1F_FFFF),
+            NgEnbId::LongMacro(0),
+        ] {
+            let mut msg = required(golden_target(id), 1, false);
+            msg.handover_type = HandoverType::FivegsToEps;
+            let bytes = builder::build_handover_required(&msg).expect("build");
+            let TargetId::TargetGlobalNgEnbId { ng_enb_id, .. } = generated(&bytes).target_id
+            else {
+                panic!("an eNB target for {id:?}");
+            };
+            assert_eq!(ng_enb_id, id, "the generated decode keeps the kind");
+            if id == NgEnbId::Macro(0x12345) {
+                // The hand-derived octets of `an_enb_target_decodes_to_its_plmn_enb_id_and_eps_tac`.
+                const GOLDEN: [u8; 13] = [
+                    0x40, 0x99, 0xF9, 0x07, 0x00, 0x12, 0x34, 0x50, 0x99, 0xF9, 0x07, 0x00, 0x07,
+                ];
+                assert!(
+                    bytes.windows(GOLDEN.len()).any(|w| w == GOLDEN),
+                    "the hand-written builder writes the X.691 octets"
+                );
+            }
+            let Ok(NgapMessage::HandoverRequired(old)) = parser::decode_ngap_pdu(&bytes) else {
+                panic!("hand-written parse of {id:?}");
+            };
+            let TargetId::TargetGlobalNgEnbId { ng_enb_id, .. } = old.target_id else {
+                panic!("an eNB target for {id:?}");
+            };
+            assert_eq!(ng_enb_id, id, "the hand-written decode keeps the kind");
+        }
+        // A value too wide for its alternative is refused, not truncated.
+        let mut msg = required(golden_target(NgEnbId::ShortMacro(0x4_0000)), 1, false);
+        msg.handover_type = HandoverType::FivegsToEps;
+        assert!(builder::build_handover_required(&msg).is_err());
     }
 
     fn without(bytes: &[u8], id: u16) -> Vec<u8> {
@@ -14384,8 +14581,8 @@ mod handover_3b_ii_tests {
 
     /// The whole DOWNLINK RAN STATUS TRANSFER for AMF UE NGAP ID 1, RAN UE NGAP
     /// ID 2 and that container, derived by hand: CHOICE initiatingMessage `000`
-    /// + pad; procedure code 7; criticality ignore `01` + pad; open type length
-    /// 31; SEQUENCE ext bit + pad; IE count 3 (two-octet aligned); then each
+    /// plus pad; procedure code 7; criticality ignore `01` plus pad; open type
+    /// length 31; SEQUENCE ext bit plus pad; IE count 3 (two-octet aligned); then each
     /// ProtocolIE-Field: id (two octets), criticality reject `00` + pad, open
     /// type length, value -- AMF-UE-NGAP-ID 1 (3-bit octet count 0, pad, `01`),
     /// RAN-UE-NGAP-ID 2 (2-bit octet count 0, pad, `02`), the container.
@@ -15720,6 +15917,60 @@ pub(crate) mod generated_remnant_tests {
                 .map(|d| d.ie_id)
                 .collect::<Vec<_>>(),
             vec![ngap_gen::ID_PWS_FAILED_CELL_ID_LIST]
+        );
+    }
+}
+
+#[cfg(test)]
+mod ue_association_key_tests {
+    use super::*;
+
+    /// **#813.** UE-associated NGAP is told from non-UE-associated NGAP by the UE NGAP
+    /// ids at the top level (TS 38.412 §7): the key is the AMF UE NGAP ID, also out of a
+    /// UE-NGAP-IDs pair or AMF-only choice, else the RAN UE NGAP ID; NG Reset's
+    /// acknowledgement (UEs named only inside the list), Overload, Paging and an Error
+    /// Indication without ids have none.
+    #[test]
+    fn ue_associated_pdus_are_keyed_by_their_ue_and_the_rest_are_not() {
+        let nas = build_downlink_nas_transport_asn1(0x1_0000_0813, 81, &[0x7E, 0x00]).unwrap();
+        assert_eq!(
+            ue_association_key(&nas),
+            Some(UeAssociation::Amf(0x1_0000_0813))
+        );
+        let pair = build_ue_context_release_command_ids_asn1(813, Some(9), 0, 0).unwrap();
+        assert_eq!(ue_association_key(&pair), Some(UeAssociation::Amf(813)));
+        let amf_only = build_ue_context_release_command_ids_asn1(814, None, 0, 0).unwrap();
+        assert_eq!(ue_association_key(&amf_only), Some(UeAssociation::Amf(814)));
+        let ran_only = encode_error_indication(None, Some(815), None, None).unwrap();
+        assert_eq!(ue_association_key(&ran_only), Some(UeAssociation::Ran(815)));
+        let with_ids = encode_error_indication(Some(816), Some(1), None, None).unwrap();
+        assert_eq!(ue_association_key(&with_ids), Some(UeAssociation::Amf(816)));
+
+        let no_ids = encode_error_indication(None, None, None, None).unwrap();
+        assert_eq!(
+            ue_association_key(&no_ids),
+            None,
+            "Error Indication without ids"
+        );
+        let reset_ack = build_ng_reset_acknowledge_asn1(
+            Some(vec![UeAssociatedLogicalNgConnectionItem {
+                amf_ue_ngap_id: Some(817),
+                ran_ue_ngap_id: Some(2),
+            }]),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(ue_association_key(&reset_ack), None, "NG Reset Acknowledge");
+        assert_eq!(
+            ue_association_key(&build_overload_start_asn1(10).unwrap()),
+            None,
+            "Overload Start"
+        );
+        let plmn = crate::context::PlmnId::new("001", "01");
+        assert_eq!(
+            ue_association_key(&build_paging_asn1(1, 1, 0x0813, &plmn, 1).unwrap()),
+            None,
+            "Paging"
         );
     }
 }

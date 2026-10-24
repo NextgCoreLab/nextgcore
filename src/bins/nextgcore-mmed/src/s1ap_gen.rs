@@ -83,6 +83,16 @@ pub enum SetupRequestDecode {
     Undecodable,
 }
 
+/// A generated ENB-ID as the handler's, every alternative kept (#741).
+fn enb_id_from(id: &g::ENB_ID) -> EnbId {
+    match id {
+        g::ENB_ID::MacroENB_ID(b) => EnbId::Macro(bits_to_u32(&b.0)),
+        g::ENB_ID::HomeENB_ID(b) => EnbId::Home(bits_to_u32(&b.0)),
+        g::ENB_ID::Short_macroENB_ID(b) => EnbId::ShortMacro(bits_to_u32(&b.0)),
+        g::ENB_ID::Long_macroENB_ID(b) => EnbId::LongMacro(bits_to_u32(&b.0)),
+    }
+}
+
 fn bits_to_u32(bits: &BitVec<u8, Msb0>) -> u32 {
     bits.iter().fold(0u32, |acc, b| (acc << 1) | u32::from(*b))
 }
@@ -148,14 +158,10 @@ pub fn decode_s1_setup_request(bytes: &[u8]) -> SetupRequestDecode {
     for ie in req.protocol_i_es.0 {
         match ie.value {
             g::S1SetupRequestProtocolIEs_EntryValue::Id_Global_ENB_ID(v) => {
-                let enb_id = match v.enb_id {
-                    g::ENB_ID::MacroENB_ID(b) => Some(EnbId::Macro(bits_to_u32(&b.0))),
-                    g::ENB_ID::HomeENB_ID(b) => Some(EnbId::Home(bits_to_u32(&b.0))),
-                    // Short / long macro eNB IDs (extension alternatives) have no
-                    // representation in the handler's type; an eNB using one is
-                    // refused as not understood rather than mis-identified.
-                    _ => None,
-                };
+                // #741: the short and long macro eNB IDs are the Rel-15 extension
+                // alternatives of ENB-ID (TS 36.413 §9.2.1.37) and identify an eNB as
+                // validly as a macro one.
+                let enb_id = Some(enb_id_from(&v.enb_id));
                 match (plmn(&v.plm_nidentity.0), enb_id) {
                     (Some(plmn_identity), Some(enb_id)) => {
                         global_enb_id = Some(GlobalEnbId {
@@ -348,7 +354,7 @@ pub fn build_s1_setup_response(
             V::Id_CriticalityDiagnostics(diagnostics(notify)),
         );
     }
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
+    encode_pdu(&g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
         procedure_code: g::ProcedureCode(PROC_S1_SETUP),
         criticality: g::Criticality(REJECT),
         value: g::SuccessfulOutcomeValue::Id_S1Setup(g::S1SetupResponse {
@@ -398,7 +404,7 @@ pub fn build_s1_setup_failure(
             value: V::Id_CriticalityDiagnostics(diagnostics(reject)),
         });
     }
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::UnsuccessfulOutcome(g::UnsuccessfulOutcome {
+    encode_pdu(&g::S1AP_PDU::UnsuccessfulOutcome(g::UnsuccessfulOutcome {
         procedure_code: g::ProcedureCode(PROC_S1_SETUP),
         criticality: g::Criticality(REJECT),
         value: g::UnsuccessfulOutcomeValue::Id_S1Setup(g::S1SetupFailure {
@@ -415,6 +421,12 @@ pub fn build_s1_setup_request(req: &S1SetupRequest) -> Result<Vec<u8>, asn1_code
     let enb_id = match req.global_enb_id.enb_id {
         EnbId::Macro(id) => g::ENB_ID::MacroENB_ID(g::ENB_ID_macroENB_ID(u32_to_bits(id, 20))),
         EnbId::Home(id) => g::ENB_ID::HomeENB_ID(g::ENB_ID_homeENB_ID(u32_to_bits(id, 28))),
+        EnbId::ShortMacro(id) => {
+            g::ENB_ID::Short_macroENB_ID(g::ENB_ID_short_macroENB_ID(u32_to_bits(id, 18)))
+        }
+        EnbId::LongMacro(id) => {
+            g::ENB_ID::Long_macroENB_ID(g::ENB_ID_long_macroENB_ID(u32_to_bits(id, 21)))
+        }
     };
     let mut ies = vec![g::S1SetupRequestProtocolIEs_Entry {
         id: g::ProtocolIE_ID(ID_GLOBAL_ENB_ID),
@@ -456,7 +468,7 @@ pub fn build_s1_setup_request(req: &S1SetupRequest) -> Result<Vec<u8>, asn1_code
         criticality: g::Criticality(IGNORE),
         value: V::Id_DefaultPagingDRX(g::PagingDRX(req.default_paging_drx as u8)),
     });
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_S1_SETUP),
         criticality: g::Criticality(REJECT),
         value: g::InitiatingMessageValue::Id_S1Setup(g::S1SetupRequest {
@@ -766,7 +778,7 @@ pub fn build_downlink_nas_transport(
         criticality: g::Criticality(REJECT),
         value,
     };
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_DOWNLINK_NAS_TRANSPORT),
         criticality: g::Criticality(IGNORE),
         value: g::InitiatingMessageValue::Id_downlinkNASTransport(g::DownlinkNASTransport {
@@ -868,7 +880,7 @@ pub fn build_initial_context_setup_request(
             ),
         })
         .collect();
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_INITIAL_CONTEXT_SETUP),
         criticality: g::Criticality(REJECT),
         value: g::InitiatingMessageValue::Id_InitialContextSetup(g::InitialContextSetupRequest {
@@ -883,11 +895,7 @@ pub fn build_initial_context_setup_request(
                 ),
                 ie(
                     ID_UE_AMBR,
-                    V::Id_uEaggregateMaximumBitrate(g::UEAggregateMaximumBitrate {
-                        u_eaggregate_maximum_bit_rate_dl: g::BitRate(req.ue_ambr.dl),
-                        u_eaggregate_maximum_bit_rate_ul: g::BitRate(req.ue_ambr.ul),
-                        ie_extensions: None,
-                    }),
+                    V::Id_uEaggregateMaximumBitrate(ambr(&req.ue_ambr)),
                 ),
                 ie(
                     ID_ERAB_TO_BE_SETUP_LIST_CTXT_SU_REQ,
@@ -1259,7 +1267,7 @@ pub fn build_ue_context_release_command(
             g::UE_S1AP_IDs::MME_UE_S1AP_ID(g::MME_UE_S1AP_ID(mme_ue_s1ap_id))
         }
     };
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_UE_CONTEXT_RELEASE),
         criticality: g::Criticality(REJECT),
         value: g::InitiatingMessageValue::Id_UEContextRelease(g::UEContextReleaseCommand {
@@ -1399,11 +1407,37 @@ const ID_ERAB_TO_BE_MODIFIED_ITEM_BEARER_MOD_REQ: u16 = 36;
 const ID_ERAB_TO_BE_RELEASED_LIST: u16 = 33;
 const ID_ERAB_ITEM: u16 = 35;
 
+/// The largest legacy Bit Rate (TS 36.413 §9.2.1.20, BitRate ::= INTEGER
+/// (0..10000000000)).
+const MAX_BIT_RATE: u64 = 10_000_000_000;
+
+/// The UE Aggregate Maximum Bit Rate IE (TS 36.413 §9.2.1.20). A direction above
+/// 10 Gbit/s puts the legacy Bit Rate at its maximum and adds the Rel-15
+/// Extended UE Aggregate Maximum Bit Rate for that direction (criticality
+/// ignore, so a legacy eNB reads the maximum and an EN-DC one the real value).
 fn ambr(a: &nextgcore_s1ap::UeAmbr) -> g::UEAggregateMaximumBitrate {
+    use g::UEAggregateMaximumBitrateIE_Extensions_EntryExtensionValue as X;
+    let mut ext = Vec::new();
+    for (v, id, value) in [
+        (
+            a.dl,
+            259,
+            X::Id_extended_uEaggregateMaximumBitRateDL as fn(_) -> X,
+        ),
+        (a.ul, 260, X::Id_extended_uEaggregateMaximumBitRateUL),
+    ] {
+        if v > MAX_BIT_RATE {
+            ext.push(g::UEAggregateMaximumBitrateIE_Extensions_Entry {
+                id: g::ProtocolExtensionID(id),
+                criticality: g::Criticality(IGNORE),
+                extension_value: value(g::ExtendedBitRate(v)),
+            });
+        }
+    }
     g::UEAggregateMaximumBitrate {
-        u_eaggregate_maximum_bit_rate_dl: g::BitRate(a.dl),
-        u_eaggregate_maximum_bit_rate_ul: g::BitRate(a.ul),
-        ie_extensions: None,
+        u_eaggregate_maximum_bit_rate_dl: g::BitRate(a.dl.min(MAX_BIT_RATE)),
+        u_eaggregate_maximum_bit_rate_ul: g::BitRate(a.ul.min(MAX_BIT_RATE)),
+        ie_extensions: (!ext.is_empty()).then_some(g::UEAggregateMaximumBitrateIE_Extensions(ext)),
     }
 }
 
@@ -1473,7 +1507,7 @@ pub fn build_erab_setup_request(
         ID_ERAB_TO_BE_SETUP_LIST_BEARER_SU_REQ,
         V::Id_E_RABToBeSetupListBearerSUReq(g::E_RABToBeSetupListBearerSUReq(items)),
     ));
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_E_RAB_SETUP),
         criticality: g::Criticality(REJECT),
         value: g::InitiatingMessageValue::Id_E_RABSetup(g::E_RABSetupRequest {
@@ -1527,7 +1561,7 @@ pub fn build_erab_modify_request(
         ID_ERAB_TO_BE_MODIFIED_LIST_BEARER_MOD_REQ,
         V::Id_E_RABToBeModifiedListBearerModReq(g::E_RABToBeModifiedListBearerModReq(items)),
     ));
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_E_RAB_MODIFY),
         criticality: g::Criticality(REJECT),
         value: g::InitiatingMessageValue::Id_E_RABModify(g::E_RABModifyRequest {
@@ -1579,7 +1613,7 @@ pub fn build_erab_release_command(
             V::Id_NAS_PDU(g::NAS_PDU(nas.clone())),
         ));
     }
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_E_RAB_RELEASE),
         criticality: g::Criticality(REJECT),
         value: g::InitiatingMessageValue::Id_E_RABRelease(g::E_RABReleaseCommand {
@@ -1836,7 +1870,7 @@ pub fn build_paging(msg: &nextgcore_s1ap::Paging) -> Result<Vec<u8>, asn1_codecs
         V::Id_CNDomain(g::CNDomain(msg.cn_domain as u8)),
     ));
     ies.push(ie(ID_TAI_LIST, V::Id_TAIList(g::TAIList(tais))));
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_PAGING),
         criticality: g::Criticality(IGNORE),
         value: g::InitiatingMessageValue::Id_Paging(g::Paging {
@@ -1906,7 +1940,7 @@ pub fn build_handover_cancel_acknowledge(
             )),
         ));
     }
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
+    encode_pdu(&g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
         procedure_code: g::ProcedureCode(PROC_HANDOVER_CANCEL),
         criticality: g::Criticality(REJECT),
         value: g::SuccessfulOutcomeValue::Id_HandoverCancel(g::HandoverCancelAcknowledge {
@@ -1945,7 +1979,7 @@ pub fn build_mme_status_transfer(
         value,
     };
     let container = status_container_from(&msg.status_transfer_container)?;
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_MME_STATUS_TRANSFER),
         criticality: g::Criticality(IGNORE),
         value: g::InitiatingMessageValue::Id_MMEStatusTransfer(g::MMEStatusTransfer {
@@ -2305,11 +2339,7 @@ fn target_id_from(t: &g::TargetID) -> Result<Option<nextgcore_s1ap::TargetId>, (
     use nextgcore_s1ap::TargetId as T;
     Ok(match t {
         g::TargetID::TargeteNB_ID(v) => {
-            let enb_id = match &v.global_enb_id.enb_id {
-                g::ENB_ID::MacroENB_ID(b) => EnbId::Macro(bits_to_u32(&b.0)),
-                g::ENB_ID::HomeENB_ID(b) => EnbId::Home(bits_to_u32(&b.0)),
-                _ => return Err(()),
-            };
+            let enb_id = enb_id_from(&v.global_enb_id.enb_id);
             let (Some(plmn_identity), Some(selected_tai)) = (
                 plmn(&v.global_enb_id.plm_nidentity.0),
                 tai_from(&v.selected_tai),
@@ -2507,7 +2537,7 @@ pub fn build_handover_preparation_failure_with_diagnostics(
             )),
         ));
     }
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::UnsuccessfulOutcome(g::UnsuccessfulOutcome {
+    encode_pdu(&g::S1AP_PDU::UnsuccessfulOutcome(g::UnsuccessfulOutcome {
         procedure_code: g::ProcedureCode(PROC_HANDOVER_PREPARATION),
         criticality: g::Criticality(REJECT),
         value: g::UnsuccessfulOutcomeValue::Id_HandoverPreparation(g::HandoverPreparationFailure {
@@ -2558,7 +2588,7 @@ pub fn build_handover_request(
         })
         .collect();
     let sec = &msg.ue_security_capabilities;
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_HANDOVER_RESOURCE_ALLOCATION),
         criticality: g::Criticality(REJECT),
         value: g::InitiatingMessageValue::Id_HandoverResourceAllocation(g::HandoverRequest {
@@ -2805,7 +2835,7 @@ pub fn build_handover_command(
             )),
         ));
     }
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
+    encode_pdu(&g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
         procedure_code: g::ProcedureCode(PROC_HANDOVER_PREPARATION),
         criticality: g::Criticality(REJECT),
         value: g::SuccessfulOutcomeValue::Id_HandoverPreparation(g::HandoverCommand {
@@ -2893,7 +2923,7 @@ pub fn build_error_indication(
             V::Id_CriticalityDiagnostics(diagnostics_from(d)),
         ));
     }
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_ERROR_INDICATION),
         criticality: g::Criticality(IGNORE),
         value: g::InitiatingMessageValue::Id_ErrorIndication(g::ErrorIndication {
@@ -3077,7 +3107,7 @@ pub fn build_reset_acknowledge(
             )),
         ));
     }
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
+    encode_pdu(&g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
         procedure_code: g::ProcedureCode(PROC_RESET),
         criticality: g::Criticality(REJECT),
         value: g::SuccessfulOutcomeValue::Id_Reset(g::ResetAcknowledge {
@@ -3228,6 +3258,24 @@ pub fn build_path_switch_request_acknowledge(
     msg: &nextgcore_s1ap::PathSwitchRequestAcknowledge,
     notify: &[DiagnosedIe],
 ) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
+    build_path_switch_request_acknowledge_releasing(msg, None, &[], notify)
+}
+
+/// [`build_path_switch_request_acknowledge`] with an E-RAB To Be Released List
+/// (TS 36.413 §9.1.5.9, criticality ignore) naming `released`, when non-empty:
+/// E-RABs the core did not switch, which the eNB then considers released
+/// (§8.4.4.2, #730).
+///
+/// `ue_ambr`, when present, is the UE Aggregate Maximum Bit Rate (criticality
+/// ignore): TS 23.401 §5.5.1.1.2 step 6, "If the UE-AMBR has changed, e.g. all the
+/// bearers for an APN have been released, the MME shall provide the updated value
+/// of the UE-AMBR to the target eNodeB".
+pub fn build_path_switch_request_acknowledge_releasing(
+    msg: &nextgcore_s1ap::PathSwitchRequestAcknowledge,
+    ue_ambr: Option<&nextgcore_s1ap::UeAmbr>,
+    released: &[nextgcore_s1ap::ErabItem],
+    notify: &[DiagnosedIe],
+) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
     use g::PathSwitchRequestAcknowledgeProtocolIEs_EntryValue as V;
     let ie =
         |id: u16, criticality: u8, value: V| g::PathSwitchRequestAcknowledgeProtocolIEs_Entry {
@@ -3247,6 +3295,13 @@ pub fn build_path_switch_request_acknowledge(
             V::Id_eNB_UE_S1AP_ID(g::ENB_UE_S1AP_ID(msg.enb_ue_s1ap_id)),
         ),
     ];
+    if let Some(a) = ue_ambr {
+        ies.push(ie(
+            ID_UE_AMBR,
+            IGNORE,
+            V::Id_uEaggregateMaximumBitrate(ambr(a)),
+        ));
+    }
     if !msg.erab_switched_ul_list.is_empty() {
         ies.push(ie(
             ID_ERAB_TO_BE_SWITCHED_UL_LIST,
@@ -3270,6 +3325,13 @@ pub fn build_path_switch_request_acknowledge(
                     })
                     .collect(),
             )),
+        ));
+    }
+    if !released.is_empty() {
+        ies.push(ie(
+            ID_ERAB_TO_BE_RELEASED_LIST,
+            IGNORE,
+            V::Id_E_RABToBeReleasedList(erab_list(released)),
         ));
     }
     ies.push(ie(
@@ -3297,7 +3359,7 @@ pub fn build_path_switch_request_acknowledge(
             )),
         ));
     }
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
+    encode_pdu(&g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
         procedure_code: g::ProcedureCode(PROC_PATH_SWITCH_REQUEST),
         criticality: g::Criticality(REJECT),
         value: g::SuccessfulOutcomeValue::Id_PathSwitchRequest(g::PathSwitchRequestAcknowledge {
@@ -3341,7 +3403,7 @@ pub fn build_path_switch_request_failure(
             )),
         ));
     }
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::UnsuccessfulOutcome(g::UnsuccessfulOutcome {
+    encode_pdu(&g::S1AP_PDU::UnsuccessfulOutcome(g::UnsuccessfulOutcome {
         procedure_code: g::ProcedureCode(PROC_PATH_SWITCH_REQUEST),
         criticality: g::Criticality(REJECT),
         value: g::UnsuccessfulOutcomeValue::Id_PathSwitchRequest(g::PathSwitchRequestFailure {
@@ -3408,7 +3470,7 @@ pub fn build_enb_configuration_update_acknowledge(
             )),
         });
     }
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
+    encode_pdu(&g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
         procedure_code: g::ProcedureCode(PROC_ENB_CONFIGURATION_UPDATE),
         criticality: g::Criticality(REJECT),
         value: g::SuccessfulOutcomeValue::Id_ENBConfigurationUpdate(
@@ -3450,7 +3512,7 @@ pub fn build_enb_configuration_update_failure(
             )),
         ));
     }
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::UnsuccessfulOutcome(g::UnsuccessfulOutcome {
+    encode_pdu(&g::S1AP_PDU::UnsuccessfulOutcome(g::UnsuccessfulOutcome {
         procedure_code: g::ProcedureCode(PROC_ENB_CONFIGURATION_UPDATE),
         criticality: g::Criticality(REJECT),
         value: g::UnsuccessfulOutcomeValue::Id_ENBConfigurationUpdate(
@@ -3615,7 +3677,7 @@ pub fn build_ue_context_modification_request(
             }),
         ));
     }
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_UE_CONTEXT_MODIFICATION),
         criticality: g::Criticality(REJECT),
         value: g::InitiatingMessageValue::Id_UEContextModification(
@@ -3631,7 +3693,7 @@ pub fn build_ue_context_modification_request(
 pub fn build_overload_start(
     action: nextgcore_s1ap::OverloadAction,
 ) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_OVERLOAD_START),
         criticality: g::Criticality(IGNORE),
         value: g::InitiatingMessageValue::Id_OverloadStart(g::OverloadStart {
@@ -3649,7 +3711,7 @@ pub fn build_overload_start(
 /// Encode an OVERLOAD STOP (TS 36.413 §9.1.8.14): no IEs; procedure
 /// criticality reject.
 pub fn build_overload_stop() -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_OVERLOAD_STOP),
         criticality: g::Criticality(REJECT),
         value: g::InitiatingMessageValue::Id_OverloadStop(g::OverloadStop {
@@ -3773,7 +3835,7 @@ pub fn build_write_replace_warning_request(
             )),
         ));
     }
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_WRITE_REPLACE_WARNING),
         criticality: g::Criticality(REJECT),
         value: g::InitiatingMessageValue::Id_WriteReplaceWarning(g::WriteReplaceWarningRequest {
@@ -3821,7 +3883,7 @@ pub fn build_kill_request(
             )),
         ));
     }
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_KILL),
         criticality: g::Criticality(REJECT),
         value: g::InitiatingMessageValue::Id_Kill(g::KillRequest {
@@ -4592,7 +4654,7 @@ pub fn build_erab_modification_confirm(
             )),
         ));
     }
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
+    encode_pdu(&g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
         procedure_code: g::ProcedureCode(PROC_E_RAB_MODIFICATION_INDICATION),
         criticality: g::Criticality(REJECT),
         value: g::SuccessfulOutcomeValue::Id_E_RABModificationIndication(
@@ -4640,7 +4702,7 @@ pub fn build_location_reporting_control(
             }),
         ),
     ];
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+    encode_pdu(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         procedure_code: g::ProcedureCode(PROC_LOCATION_REPORTING_CONTROL),
         criticality: g::Criticality(IGNORE),
         value: g::InitiatingMessageValue::Id_LocationReportingControl(
@@ -4775,6 +4837,18 @@ pub fn decode_location_reporting_failure_indication(
 
 #[cfg(test)]
 pub(crate) mod test_codec;
+
+/// Encode a PDU a production builder made. Under `cfg(test)` every one is
+/// first checked against the TS 36.413 object sets (#737): the criticality of
+/// each IE must be the schema's.
+fn encode_pdu(pdu: &g::S1AP_PDU) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
+    #[cfg(test)]
+    criticality_oracle::assert_matches_ts_36_413(pdu);
+    nextgcore_s1ap_gen::encode(pdu)
+}
+
+#[cfg(test)]
+pub(crate) mod criticality_oracle;
 
 #[cfg(test)]
 mod golden_x691_tests;

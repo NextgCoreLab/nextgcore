@@ -685,6 +685,11 @@ pub struct MmeEnb {
     pub enb_id_presence: bool,
     /// eNB ID (received from eNB)
     pub enb_id: u32,
+    /// The length of `enb_id` in bits, i.e. which S1AP ENB-ID alternative the eNB sent
+    /// (TS 36.413 §9.2.1.37): 20 for a macro eNB, 28 for a home eNB; 0 before S1 Setup.
+    /// Two eNBs of different kinds can have equal id values, so a lookup by id that
+    /// ignores this can pick the wrong one (#741).
+    pub enb_id_bits: u8,
     /// PLMN ID (received from eNB)
     pub plmn_id: PlmnId,
     /// State
@@ -836,7 +841,7 @@ pub struct SgwUe {
 // ============================================================================
 
 /// MME UE memento for context backup/restore
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct MmeUeMemento {
     /// UE network capability
     pub ue_network_capability: UeNetworkCapability,
@@ -878,6 +883,42 @@ pub struct MmeUeMemento {
     pub selected_enc_algorithm: u8,
     /// Selected integrity algorithm
     pub selected_int_algorithm: u8,
+}
+
+/// Manual `Debug` (no-auth-material-in-logs): the authentication material in
+/// this type (xres, kasme, rand, autn, knas_int, knas_enc, kenb, nh) prints as `<redacted>`, so a future
+/// `{:?}` in a log line cannot leak it.
+impl std::fmt::Debug for MmeUeMemento {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("MmeUeMemento");
+        d.field("ue_network_capability", &self.ue_network_capability);
+        d.field("ms_network_capability", &self.ms_network_capability);
+        d.field(
+            "ue_additional_security_capability",
+            &self.ue_additional_security_capability,
+        );
+        d.field("xres", &"<redacted>");
+        d.field("xres_len", &self.xres_len);
+        d.field("kasme", &"<redacted>");
+        d.field("rand", &"<redacted>");
+        d.field("autn", &"<redacted>");
+        d.field("knas_int", &"<redacted>");
+        d.field("knas_enc", &"<redacted>");
+        d.field("dl_count", &self.dl_count);
+        d.field("ul_count", &self.ul_count);
+        d.field("kenb", &"<redacted>");
+        d.field("hash_mme", &self.hash_mme);
+        d.field("nonceue", &self.nonceue);
+        d.field("noncemme", &self.noncemme);
+        d.field(
+            "gprs_ciphering_key_sequence_number",
+            &self.gprs_ciphering_key_sequence_number,
+        );
+        d.field("nh", &"<redacted>");
+        d.field("selected_enc_algorithm", &self.selected_enc_algorithm);
+        d.field("selected_int_algorithm", &self.selected_int_algorithm);
+        d.finish()
+    }
 }
 
 // ============================================================================
@@ -1037,7 +1078,7 @@ pub const MAX_NUM_OF_GTP_COUNTER: usize = 16;
 // ============================================================================
 
 /// MME UE context
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct MmeUe {
     /// Pool ID
     pub id: u64,
@@ -1051,6 +1092,33 @@ pub struct MmeUe {
     pub tracking_area_update_accept_proc: i64,
     /// Detach type
     pub detach_type: DetachType,
+    /// The detach type of the network-initiated detach in progress (TS 24.301
+    /// §5.5.2.3), set with `nas_eps.type_ = DetachRequestToUe`. It decides how an
+    /// ATTACH, TAU or SERVICE REQUEST colliding with it is treated
+    /// (§5.5.2.3.5 d-f, #732).
+    pub network_detach_type: Option<crate::emm_build::DetachTypeToUe>,
+    /// An INITIAL CONTEXT SETUP REQUEST answering a SERVICE REQUEST is
+    /// outstanding: its response continues with the Modify Bearer Request of
+    /// TS 23.401 §5.3.4.1 step 8 (#956).
+    pub service_request_ics_pending: bool,
+    /// A Downlink Data Notification arrived while the S1 release was still
+    /// running (the eNB UE context not yet released): the UE is paged once the
+    /// release completes (#961 review).
+    pub ddn_pending_after_release: bool,
+    /// The eNB UE context an INITIAL CONTEXT SETUP REQUEST was sent on and not
+    /// yet answered (0: none). Keyed by the S1 connection so a later connection
+    /// is not mistaken for one still being set up (#869 review).
+    pub ics_pending_on: u64,
+    /// A UE-AMBR change (TS 23.401 §5.4.2.2) waits for the Initial Context Setup
+    /// or S1 handover in progress, which carries a value computed earlier; it is
+    /// signalled when that procedure ends (#869 review).
+    pub ue_ambr_deferred: bool,
+    /// A UE CONTEXT MODIFICATION REQUEST carrying a UE-AMBR is outstanding.
+    pub ue_ambr_modification_pending: bool,
+    /// The network-initiated detach in progress was started by an HSS Cancel Location
+    /// (subscription withdrawal). Only then is a further CLR a retransmission of the one
+    /// being served; a CLR during any other detach is the HSS's own instruction (#828).
+    pub network_detach_by_clr: bool,
 
     // UE Identity
     /// IMSI
@@ -1276,6 +1344,126 @@ pub struct MmeUe {
     /// The current attach's step-23 Modify Bearer Request has been sent, so a
     /// duplicate ATTACH COMPLETE or ICS response does not send a second (#495).
     pub attach_modify_bearer_sent: bool,
+}
+
+/// Manual `Debug` (no-auth-material-in-logs): the authentication material in
+/// this type (resync_auts, xres, xres_len, kasme, rand, autn, knas_int, knas_enc, kenb, nh) prints as `<redacted>`, so a future
+/// `{:?}` in a log line cannot leak it.
+impl std::fmt::Debug for MmeUe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("MmeUe");
+        d.field("id", &self.id);
+        d.field("nas_eps", &self.nas_eps);
+        d.field(
+            "tracking_area_update_request_presencemask",
+            &self.tracking_area_update_request_presencemask,
+        );
+        d.field(
+            "tracking_area_update_request_ebcs_value",
+            &self.tracking_area_update_request_ebcs_value,
+        );
+        d.field(
+            "tracking_area_update_accept_proc",
+            &self.tracking_area_update_accept_proc,
+        );
+        d.field("detach_type", &self.detach_type);
+        d.field("imsi", &self.imsi);
+        d.field("imsi_len", &self.imsi_len);
+        d.field("imsi_bcd", &self.imsi_bcd);
+        d.field("imeisv", &self.imeisv);
+        d.field("imeisv_len", &self.imeisv_len);
+        d.field("masked_imeisv", &self.masked_imeisv);
+        d.field("masked_imeisv_len", &self.masked_imeisv_len);
+        d.field("imeisv_bcd", &self.imeisv_bcd);
+        d.field("msisdn", &self.msisdn);
+        d.field("msisdn_len", &self.msisdn_len);
+        d.field("msisdn_bcd", &self.msisdn_bcd);
+        d.field("a_msisdn", &self.a_msisdn);
+        d.field("a_msisdn_len", &self.a_msisdn_len);
+        d.field("a_msisdn_bcd", &self.a_msisdn_bcd);
+        d.field("gn", &self.gn);
+        d.field("current", &self.current);
+        d.field("next", &self.next);
+        d.field("mme_s11_teid", &self.mme_s11_teid);
+        d.field("vlr_ostream_id", &self.vlr_ostream_id);
+        d.field("enb_ostream_id", &self.enb_ostream_id);
+        d.field("tai", &self.tai);
+        d.field("e_cgi", &self.e_cgi);
+        d.field("ue_location_timestamp", &self.ue_location_timestamp);
+        d.field("location_reporting_active", &self.location_reporting_active);
+        d.field("last_visited_plmn_id", &self.last_visited_plmn_id);
+        d.field(
+            "security_context_available",
+            &self.security_context_available,
+        );
+        d.field("mac_failed", &self.mac_failed);
+        d.field("resync_auts", &"<redacted>");
+        d.field("can_restore_context", &self.can_restore_context);
+        d.field("memento", &self.memento);
+        d.field("ue_network_capability", &self.ue_network_capability);
+        d.field("ms_network_capability", &self.ms_network_capability);
+        d.field(
+            "ue_additional_security_capability",
+            &self.ue_additional_security_capability,
+        );
+        d.field("xres", &"<redacted>");
+        d.field("xres_len", &self.xres_len);
+        d.field("kasme", &"<redacted>");
+        d.field("rand", &"<redacted>");
+        d.field("autn", &"<redacted>");
+        d.field("knas_int", &"<redacted>");
+        d.field("knas_enc", &"<redacted>");
+        d.field("dl_count", &self.dl_count);
+        d.field("ul_count", &self.ul_count);
+        d.field("kenb", &"<redacted>");
+        d.field("hash_mme", &self.hash_mme);
+        d.field("nonceue", &self.nonceue);
+        d.field("noncemme", &self.noncemme);
+        d.field(
+            "gprs_ciphering_key_sequence_number",
+            &self.gprs_ciphering_key_sequence_number,
+        );
+        d.field("nhcc", &self.nhcc);
+        d.field("nh", &"<redacted>");
+        d.field("selected_enc_algorithm", &self.selected_enc_algorithm);
+        d.field("selected_int_algorithm", &self.selected_int_algorithm);
+        d.field("ambr", &self.ambr);
+        d.field("network_access_mode", &self.network_access_mode);
+        d.field("charging_characteristics", &self.charging_characteristics);
+        d.field(
+            "charging_characteristics_presence",
+            &self.charging_characteristics_presence,
+        );
+        d.field("context_identifier", &self.context_identifier);
+        d.field("num_of_session", &self.num_of_session);
+        d.field("session", &self.session);
+        d.field("sess_list", &self.sess_list);
+        d.field("enb_ue_id", &self.enb_ue_id);
+        d.field("enb_ue_holding_id", &self.enb_ue_holding_id);
+        d.field("paging", &self.paging);
+        d.field("sgw_ue_id", &self.sgw_ue_id);
+        d.field("pdn_connectivity_request", &self.pdn_connectivity_request);
+        d.field("t3413", &self.t3413);
+        d.field("t3422", &self.t3422);
+        d.field("t3450", &self.t3450);
+        d.field("t3460", &self.t3460);
+        d.field("t3470", &self.t3470);
+        d.field("t_mobile_reachable", &self.t_mobile_reachable);
+        d.field("t_implicit_detach", &self.t_implicit_detach);
+        d.field("service_indicator", &self.service_indicator);
+        d.field("ue_radio_capability", &self.ue_radio_capability);
+        d.field("container", &self.container);
+        d.field("gtp_counter", &self.gtp_counter);
+        d.field("bearer_to_modify_list", &self.bearer_to_modify_list);
+        d.field("rat_type", &self.rat_type);
+        d.field("csmap_id", &self.csmap_id);
+        d.field("hssmap_id", &self.hssmap_id);
+        d.field("subscribed_rau_tau_timer", &self.subscribed_rau_tau_timer);
+        d.field("emergency_attach", &self.emergency_attach);
+        d.field("attach_completed", &self.attach_completed);
+        d.field("attach_modify_bearer_sent", &self.attach_modify_bearer_sent);
+        d.finish()
+    }
 }
 
 impl MmeUe {
@@ -1972,7 +2160,47 @@ impl MmeContext {
         self.enb_addr_hash.read().unwrap().get(&key).copied()
     }
 
-    /// Find eNB by eNB ID
+    /// The S1-connected eNB with this Global eNB ID (TS 36.413 §9.2.1.37): same PLMN,
+    /// same ENB-ID alternative (its length in bits) and same value, S1 Setup complete
+    /// (#741, #882). A macro eNB `0x12345` and a home eNB `0x0012345`, or two eNBs of
+    /// different PLMNs, are different eNBs; [`Self::enb_find_by_enb_id`] cannot tell them
+    /// apart.
+    pub fn enb_find_by_global_enb_id(
+        &self,
+        plmn_id: &PlmnId,
+        enb_id: nextgcore_s1ap::EnbId,
+    ) -> Option<u64> {
+        let pool = self.enb_pool.read().ok()?;
+        pool.iter()
+            .find(|(_, enb)| {
+                enb.state.s1_setup_success
+                    && enb.enb_id_presence
+                    && enb.enb_id_bits == enb_id.bit_len()
+                    && enb.enb_id == enb_id.value()
+                    && enb.plmn_id == *plmn_id
+            })
+            .map(|(id, _)| *id)
+    }
+
+    /// Test-only: an eNB as a completed S1 Setup leaves it, with Global eNB ID
+    /// `(plmn, enb_id)`, without driving the S1 Setup handler.
+    #[cfg(test)]
+    pub fn enb_set_s1_connected_for_test(
+        &self,
+        id: u64,
+        plmn_identity: &[u8; 3],
+        enb_id: nextgcore_s1ap::EnbId,
+    ) {
+        self.enb_set_enb_id(id, enb_id.value());
+        if let Some(enb) = self.enb_pool.write().unwrap().get_mut(&id) {
+            enb.enb_id_bits = enb_id.bit_len();
+            enb.plmn_id = crate::s1ap_build::decode_plmn_id(plmn_identity);
+            enb.state.s1_setup_success = true;
+        }
+    }
+
+    /// Find eNB by eNB ID value alone, whatever its ENB-ID alternative or PLMN. Prefer
+    /// [`Self::enb_find_by_global_enb_id`] wherever the full Global eNB ID is known.
     pub fn enb_find_by_enb_id(&self, enb_id: u32) -> Option<u64> {
         self.enb_id_hash.read().unwrap().get(&enb_id).copied()
     }
@@ -2477,14 +2705,17 @@ impl MmeContext {
         false
     }
 
-    /// Check if UE has active EPS bearers
+    /// Check if UE has active EPS bearers: established at the Serving GW (an
+    /// S1-U SGW TEID). An ECM-IDLE UE has no eNB endpoint, and its bearers are
+    /// still active (TS 24.301 §5.6.1.4; #956: keyed on the eNB TEID, every
+    /// SERVICE REQUEST of an idle UE was rejected with #40).
     pub fn mme_ue_have_active_eps_bearers(&self, mme_ue_id: u64) -> bool {
         if let Some(mme_ue) = self.mme_ue_find_by_id(mme_ue_id) {
             for sess_id in &mme_ue.sess_list {
                 if let Some(sess) = self.sess_find_by_id(*sess_id) {
                     for bearer_id in &sess.bearer_list {
                         if let Some(bearer) = self.bearer_find_by_id(*bearer_id) {
-                            if bearer.enb_s1u_teid != 0 {
+                            if bearer.sgw_s1u_teid != 0 {
                                 return true;
                             }
                         }

@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-c2411517.js";
+            window.path_to_searchindex_js = "../searchindex-df495bb2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -241,7 +241,7 @@ pcf:
 <p>The daemon deserializes only the fields above; unknown YAML keys are silently ignored by serde. In the shipped example file:</p>
 <ul>
 <li><strong><code>db_uri</code> is inert.</strong> <code>nextgcore-pcfd</code> never calls <code>nextgcore_dbi_init</code> — its subscription/session-data lookups through <code>nextgcore-dbi</code> therefore error out at runtime and fall back to built-in defaults (see Behavior notes). The key exists for visual consistency with NFs that do open MongoDB.</li>
-<li><strong><code>logger.file.path</code> and <code>logger.level</code> are inert.</strong> The log level comes only from the CLI flag <code>-e/--log-level</code> (default <code>info</code>); <code>init_logging</code> builds an <code>env_logger</code> with <code>filter_level</code> and does not wire file output (the <code>-l/--log-file</code> flag is accepted but unused).</li>
+<li><strong><code>logger.file.path</code> and <code>logger.level</code> are inert.</strong> The log level comes from <code>RUST_LOG</code> when set, else the CLI flag <code>-e/--log-level</code> (default <code>info</code>); no file output is wired (the <code>-l/--log-file</code> flag is accepted but unused).</li>
 <li><strong><code>global.max.ue</code> / <code>global.max.peer</code> are inert.</strong> Context capacities come from the CLI flags <code>--max-ue</code> (1024) and <code>--max-sess</code> (4096).</li>
 <li><strong><code>pcf.metrics.server[]</code> is inert.</strong> The daemon starts no metrics HTTP server; its only telemetry export is OpenTelemetry OTLP via <code>OTEL_EXPORTER_OTLP_ENDPOINT</code>.</li>
 <li><strong><code>pcf.tls.*</code> is inert.</strong> No code reads this section. Even the CLI <code>--tls</code>/<code>--tls-cert</code>/<code>--tls-key</code> flags only flow into the legacy <code>SbiServerConfig</code> (<code>sbi_path.rs</code>), where they flip the <em>advertised</em> URI scheme to <code>https</code> in the legacy NF-instance builder; the live HTTP/2 listener is created from <code>NextgcoreSbiServerConfig::new(addr)</code> without any TLS wiring and serves cleartext h2c.</li>

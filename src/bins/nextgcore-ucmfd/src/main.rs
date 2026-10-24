@@ -60,8 +60,8 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
 /// TS 29.673 V20.0.0 / TS 29.675 OpenAPI `info.version`.
@@ -75,6 +75,10 @@ const CONTENT_NGAP: &str = "application/vnd.3gpp.ngap";
 const CONTENT_S1AP: &str = "application/vnd.3gpp.s1ap";
 
 const NOTIFY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// How often write-behind state is flushed to the state file (#786). A crash
+/// loses at most this much of the most recent changes; IDs are never reissued
+/// (see `Ucmf::reserve_ids`).
+const STATE_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 const NOTIFY_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 
 // ---------------------------------------------------------------------------
@@ -107,6 +111,15 @@ struct UcmfSection {
     state_file: Option<String>,
     /// Delete PLMN-assigned IDs under older Version IDs at startup.
     purge_outdated_ids: Option<bool>,
+    /// Capacity limits (#786).
+    limits: Option<LimitsYaml>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct LimitsYaml {
+    max_dic_entries: Option<usize>,
+    max_subscriptions: Option<usize>,
+    max_subscriptions_per_consumer: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -123,8 +136,8 @@ struct UcmfYaml {
 struct Args {
     #[arg(short = 'c', long, default_value = "/etc/nextgcore/ucmf.yaml")]
     config: String,
-    #[arg(short = 'e', long, default_value = "info")]
-    log_level: String,
+    #[arg(short = 'e', long)]
+    log_level: Option<String>,
     #[arg(long, default_value = "0.0.0.0")]
     sbi_addr: String,
     #[arg(long, default_value = "7777")]
@@ -160,6 +173,7 @@ struct Settings {
     state_file: Option<String>,
     purge_outdated_ids: bool,
     require_oauth2: bool,
+    limits: context::Limits,
 }
 
 fn parse_version_id(s: &str) -> Result<u8> {
@@ -206,6 +220,17 @@ fn settle(args: &Args, yaml: Option<&str>) -> Result<Settings> {
         mode: parse_mode(mode)?,
         state_file: args.state_file.clone().or(section.state_file),
         purge_outdated_ids: section.purge_outdated_ids.unwrap_or(false),
+        limits: {
+            let d = context::Limits::default();
+            let l = section.limits.unwrap_or_default();
+            context::Limits {
+                max_dic_entries: l.max_dic_entries.unwrap_or(d.max_dic_entries),
+                max_subscriptions: l.max_subscriptions.unwrap_or(d.max_subscriptions),
+                max_subscriptions_per_consumer: l
+                    .max_subscriptions_per_consumer
+                    .unwrap_or(d.max_subscriptions_per_consumer),
+            }
+        },
         require_oauth2: args.oauth2_require.unwrap_or_else(|| {
             section
                 .sbi
@@ -225,6 +250,82 @@ static UCMF: OnceLock<Arc<RwLock<Ucmf>>> = OnceLock::new();
 static API_ROOT: OnceLock<String> = OnceLock::new();
 static OAUTH2_CLIENT: OnceLock<Arc<OAuth2Client>> = OnceLock::new();
 
+/// Poisoned state locks recovered (#725 review): each one is a request that
+/// panicked under the lock, a defect to report.
+static POISON_RECOVERIES: AtomicU64 = AtomicU64::new(0);
+/// Requests refused at a capacity limit (#786).
+static DICTIONARY_FULL_REFUSALS: AtomicU64 = AtomicU64::new(0);
+static SUBSCRIPTION_LIMIT_REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+/// The Prometheus text this UCMF serves at `GET /metrics`.
+fn render_metrics(ucmf: Option<&RwLock<Ucmf>>) -> String {
+    let mut out = String::new();
+    let mut metric = |name: &str, kind: &str, help: &str, value: u64| {
+        out.push_str(&format!(
+            "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}\n"
+        ));
+    };
+    metric(
+        "ucmf_state_lock_poison_recoveries_total",
+        "counter",
+        "State locks recovered after a request panicked while holding them",
+        POISON_RECOVERIES.load(Ordering::Relaxed),
+    );
+    metric(
+        "ucmf_dictionary_full_refusals_total",
+        "counter",
+        "Assign requests refused because the dictionary is at ucmf.limits.max_dic_entries (provisioning refusals are not counted)",
+        DICTIONARY_FULL_REFUSALS.load(Ordering::Relaxed),
+    );
+    metric(
+        "ucmf_subscription_limit_refusals_total",
+        "counter",
+        "Subscribe requests refused at ucmf.limits.max_subscriptions or max_subscriptions_per_consumer",
+        SUBSCRIPTION_LIMIT_REFUSALS.load(Ordering::Relaxed),
+    );
+    if let Some(ucmf) = ucmf {
+        let u = read_state(ucmf);
+        metric(
+            "ucmf_dictionary_entries",
+            "gauge",
+            "Dictionary entries held",
+            u.entry_count() as u64,
+        );
+        metric(
+            "ucmf_subscriptions",
+            "gauge",
+            "Subscriptions held",
+            u.subscription_count() as u64,
+        );
+    }
+    out
+}
+
+/// The default `/metrics` port: one of its own. 9090 is the default of mmed,
+/// sgwud and upfd, and on a shared host the second NF to bind it would lose its
+/// metrics (#857 review).
+const DEFAULT_METRICS_PORT: u16 = 9096;
+
+/// Where `/metrics` listens: `UCMF_METRICS_ADDR` (`ip:port`), else the shared
+/// default every NF uses (#837): `127.0.0.1` unless `NEXTGCORE_METRICS_BIND`
+/// names the host, on [`DEFAULT_METRICS_PORT`]. The endpoint is
+/// unauthenticated, so reaching it from another host is an operator's explicit
+/// choice of a private address (or a scraping sidecar). A value that does not
+/// parse falls back to the default and says so (#857 review), so an operator
+/// learns why a scrape from another host fails.
+fn metrics_addr(value: Option<&str>) -> SocketAddr {
+    let default = nextgcore_metrics::nes_energy::metrics_bind_addr(DEFAULT_METRICS_PORT);
+    match value {
+        None => default,
+        Some(v) => v.parse().unwrap_or_else(|_| {
+            log::warn!(
+                "UCMF_METRICS_ADDR '{v}' is not an ip:port; /metrics listens on {default} instead"
+            );
+            default
+        }),
+    }
+}
+
 fn api_root() -> &'static str {
     API_ROOT.get().map(String::as_str).unwrap_or("http://ucmf")
 }
@@ -232,10 +333,10 @@ fn api_root() -> &'static str {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or(args.log_level.as_str()),
-    )
-    .format_timestamp_millis()
+    nextgcore_core::log::nf_log_builder(&nextgcore_core::log::nf_log_level(
+        args.log_level.as_deref(),
+        Some(&args.config),
+    ))
     .init();
     let _otel = nextgcore_metrics::otel::init_otel(
         nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
@@ -257,6 +358,8 @@ async fn main() -> Result<()> {
     // Load the snapshot under the stored Version ID, then apply the configured
     // one so restored subscribers hear about a change.
     let mut ucmf = Ucmf::new(settings.version_id, settings.mode);
+    ucmf.set_limits(settings.limits);
+    log::info!("Capacity limits: {:?}", settings.limits);
     match ucmf.attach_store(settings.state_file.as_ref().map(PathBuf::from)) {
         Ok(true) => log::info!("Restored {} dictionary entries", ucmf.entry_count()),
         Ok(false) => {}
@@ -267,7 +370,22 @@ async fn main() -> Result<()> {
     if settings.purge_outdated_ids {
         startup_notes.extend(ucmf.purge_outdated_plmn_ids(Utc::now()));
     }
+    // #786: with a state file, changes are written behind, by the flusher below,
+    // instead of each one rewriting the whole snapshot under the state lock.
+    if settings.state_file.is_some() {
+        ucmf.set_write_behind(true);
+    }
     let _ = UCMF.set(Arc::new(RwLock::new(ucmf)));
+    if let Some(ucmf) = UCMF.get() {
+        let ucmf = ucmf.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(STATE_FLUSH_INTERVAL);
+            loop {
+                tick.tick().await;
+                flush_state(&ucmf).await;
+            }
+        });
+    }
 
     let nf_instance_id = nextgcore_sbi::nf_instance_id::nf_instance_id(NfType::Ucmf).to_string();
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -319,6 +437,15 @@ async fn main() -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
     log::info!("SBI server listening on {addr}");
+    match nextgcore_metrics::nes_energy::serve_metrics(
+        metrics_addr(std::env::var("UCMF_METRICS_ADDR").ok().as_deref()),
+        Arc::new(|| render_metrics(UCMF.get().map(|u| u.as_ref()))),
+    )
+    .await
+    {
+        Ok((bound, _handle)) => log::info!("UCMF metrics on http://{bound}/metrics"),
+        Err(e) => log::warn!("UCMF metrics endpoint not started: {e}"),
+    }
 
     global_context().set_nrf_uri(&settings.nrf_uri).await;
     match register_with_nrf(&args.sbi_addr, args.sbi_port, scheme, &nf_instance_id).await {
@@ -334,12 +461,18 @@ async fn main() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     log::info!("Shutting down...");
-    // Deregister before the listener goes away (TS 29.510 §5.2.2.4).
+    // Deregister before the listener goes away (TS 29.510 §5.2.2.4), stop
+    // serving, and only then write the final snapshot, so no request served
+    // after it is lost on a clean shutdown (#843 review).
     nextgcore_sbi::heartbeat::deregister_self().await;
-    sbi_server
+    let stopped = sbi_server
         .stop()
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {e}"));
+    if let Some(ucmf) = UCMF.get() {
+        flush_state(ucmf).await;
+    }
+    stopped?;
     log::info!("UCMF shutdown complete");
     Ok(())
 }
@@ -425,6 +558,19 @@ fn split_uri(uri: &str) -> Option<(String, u16, String)> {
     }
 }
 
+/// Write the pending snapshot, if any (#786). The snapshot is taken under the
+/// state lock; the file is written after the lock is released, on a blocking
+/// thread, so requests are not held up by the disk.
+async fn flush_state(ucmf: &Arc<RwLock<Ucmf>>) {
+    let pending = write_state(ucmf).take_pending_write();
+    if let Some((persister, generation, source)) = pending {
+        // Serialised and written off the state lock (#843 review). A failed write
+        // is logged by the persister; the next reservation retries it.
+        let _ = tokio::task::spawn_blocking(move || persister.write(generation, &source.to_json()))
+            .await;
+    }
+}
+
 /// Deliver a notification to every subscriber, without blocking the caller.
 fn dispatch(note: Notification) {
     for uri in note.uris {
@@ -479,71 +625,85 @@ fn handle(
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     log::debug!("UCMF SBI: {method} {path}");
 
-    let lock_poisoned = || (send_internal_error("UCMF state lock poisoned"), Vec::new());
     match parts.as_slice() {
         [UECM_API, "v1", "dic-entries"] => match method {
-            "GET" => match ucmf.read() {
-                Ok(u) => (resolve(&u, request), Vec::new()),
-                Err(_) => lock_poisoned(),
-            },
-            "POST" => match ucmf.write() {
-                Ok(mut u) => assign(&mut u, request, now),
-                Err(_) => lock_poisoned(),
-            },
+            "GET" => (resolve(&read_state(ucmf), request), Vec::new()),
+            "POST" => assign(&mut write_state(ucmf), request, now),
             _ => (send_method_not_allowed(method, "dic-entries"), Vec::new()),
         },
         [UECM_API, "v1", "dic-entries", id] => match method {
-            "GET" => match ucmf.read() {
-                Ok(u) => (get_dic_entry(&u, id, request), Vec::new()),
-                Err(_) => lock_poisoned(),
-            },
+            "GET" => (get_dic_entry(&read_state(ucmf), id, request), Vec::new()),
             _ => (
                 send_method_not_allowed(method, "dic-entries/{dicEntryId}"),
                 Vec::new(),
             ),
         },
         [UECM_API, "v1", "subscriptions"] => match method {
-            "POST" => match ucmf.write() {
-                Ok(mut u) => (subscribe(&mut u, request, now), Vec::new()),
-                Err(_) => lock_poisoned(),
-            },
+            "POST" => (subscribe(&mut write_state(ucmf), request, now), Vec::new()),
             _ => (send_method_not_allowed(method, "subscriptions"), Vec::new()),
         },
         [UECM_API, "v1", "subscriptions", id] => match method {
-            "DELETE" => match ucmf.write() {
-                Ok(mut u) => (unsubscribe(&mut u, id), Vec::new()),
-                Err(_) => lock_poisoned(),
-            },
+            "DELETE" => (unsubscribe(&mut write_state(ucmf), id), Vec::new()),
             _ => (
                 send_method_not_allowed(method, "subscriptions/{subscriptionId}"),
                 Vec::new(),
             ),
         },
         [PROVISIONING_API, "v1", "provisionings"] => match method {
-            "POST" => match ucmf.write() {
-                Ok(mut u) => create_provisioning(&mut u, request, now),
-                Err(_) => lock_poisoned(),
-            },
+            "POST" => create_provisioning(&mut write_state(ucmf), request, now),
             _ => (send_method_not_allowed(method, "provisionings"), Vec::new()),
         },
-        [PROVISIONING_API, "v1", "provisionings", id] => match ucmf.write() {
-            Ok(mut u) => match method {
-                "GET" => (get_provisioning(&u, id), Vec::new()),
-                "PUT" => replace_provisioning(&mut u, id, request, now),
-                "PATCH" => patch_provisioning(&mut u, id, request, now),
-                "DELETE" => delete_provisioning(&mut u, id, now),
-                _ => (
-                    send_method_not_allowed(method, "provisionings/{provisioningId}"),
-                    Vec::new(),
-                ),
-            },
-            Err(_) => lock_poisoned(),
+        [PROVISIONING_API, "v1", "provisionings", id] => match method {
+            "GET" => (get_provisioning(&read_state(ucmf), id), Vec::new()),
+            "PUT" => replace_provisioning(&mut write_state(ucmf), id, request, now),
+            "PATCH" => patch_provisioning(&mut write_state(ucmf), id, request, now),
+            "DELETE" => delete_provisioning(&mut write_state(ucmf), id, now),
+            _ => (
+                send_method_not_allowed(method, "provisionings/{provisioningId}"),
+                Vec::new(),
+            ),
         },
         _ => (
             send_not_found(&format!("Resource not found: {path}"), None),
             Vec::new(),
         ),
     }
+}
+
+/// The UCMF state for reading. See [`write_state`] for why a poisoned lock is
+/// taken rather than refused.
+fn read_state(ucmf: &RwLock<Ucmf>) -> RwLockReadGuard<'_, Ucmf> {
+    ucmf.read().unwrap_or_else(|poisoned| {
+        log_poison_recovery();
+        ucmf.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
+/// The UCMF state for writing, even when an earlier request panicked while
+/// holding it (#725).
+///
+/// Refusing a poisoned lock would make one panicking request answer `500` to
+/// every later request on both services until the process restarts. Taking it
+/// is sound because nothing that runs under the lock can leave the dictionary
+/// half-changed when it unwinds: the request decoders validate before they
+/// slice, the RRC codec calls are contained by `rac::guarded`, and the `Ucmf`
+/// operations do no indexing or arithmetic that request data can make fail. So a
+/// poisoned lock means a defect elsewhere, which is logged, not a torn state.
+fn write_state(ucmf: &RwLock<Ucmf>) -> RwLockWriteGuard<'_, Ucmf> {
+    ucmf.write().unwrap_or_else(|poisoned| {
+        log_poison_recovery();
+        ucmf.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
+fn log_poison_recovery() {
+    POISON_RECOVERIES.fetch_add(1, Ordering::Relaxed);
+    log::error!(
+        "UCMF state lock was poisoned by a request that panicked; recovering it so \
+         later requests are still served (#725). The panic above is a defect to report."
+    );
 }
 
 /// The request's JSON body (the JSON part of a multipart body).
@@ -806,12 +966,35 @@ fn assign(
             ),
             Vec::new(),
         ),
+        // TS 29.500 Table 5.2.7.2-1: INSUFFICIENT_RESOURCES is a 500 (#786).
+        Err(AssignError::DictionaryFull) => (
+            {
+                DICTIONARY_FULL_REFUSALS.fetch_add(1, Ordering::Relaxed);
+                send_error(
+                500,
+                "Internal Server Error",
+                "The UE radio capability dictionary is full",
+                Some("INSUFFICIENT_RESOURCES"),
+                )
+            },
+            Vec::new(),
+        ),
         Err(AssignError::IdSpaceExhausted) => (
             send_error(
                 500,
                 "Internal Server Error",
                 "No RCI left under the current Version ID",
                 Some("INSUFFICIENT_RESOURCES"),
+            ),
+            Vec::new(),
+        ),
+        // #843 review: no ID is handed out that the state file does not cover.
+        Err(AssignError::StateNotPersisted) => (
+            send_error(
+                500,
+                "Internal Server Error",
+                "The UCMF state could not be written, so no ID can be assigned safely",
+                Some("SYSTEM_FAILURE"),
             ),
             Vec::new(),
         ),
@@ -848,7 +1031,40 @@ fn subscribe(u: &mut Ucmf, request: &SbiRequest, now: DateTime<Utc>) -> SbiRespo
         },
     };
     let nf_id = json.get("nfId").and_then(Value::as_str).map(str::to_string);
-    let sub = u.subscribe(nf_id, uri.to_string(), suggested, now);
+    let sub = match u.subscribe(nf_id, uri.to_string(), suggested, now) {
+        Ok(sub) => sub,
+        // TS 29.500 Table 5.2.7.2-1: INSUFFICIENT_RESOURCES is a 500 (#786).
+        Err(e) => {
+            // MINOR 3 of the #857 review: the series counts the configured
+            // limits only, not an exhausted ID space or a failed write.
+            if matches!(
+                e,
+                context::SubscribeError::TooManySubscriptions
+                    | context::SubscribeError::TooManyForConsumer
+            ) {
+                SUBSCRIPTION_LIMIT_REFUSALS.fetch_add(1, Ordering::Relaxed);
+            }
+            let (detail, cause) = match e {
+                context::SubscribeError::TooManySubscriptions => (
+                    "The UCMF holds its maximum number of subscriptions",
+                    "INSUFFICIENT_RESOURCES",
+                ),
+                context::SubscribeError::TooManyForConsumer => (
+                    "This consumer holds its maximum number of subscriptions",
+                    "INSUFFICIENT_RESOURCES",
+                ),
+                context::SubscribeError::IdSpaceExhausted => {
+                    ("No subscription ID is left", "INSUFFICIENT_RESOURCES")
+                }
+                context::SubscribeError::StateNotPersisted => (
+                    "The UCMF state could not be written, so no subscription ID can be \
+                     assigned safely",
+                    "SYSTEM_FAILURE",
+                ),
+            };
+            return send_error(500, "Internal Server Error", detail, Some(cause));
+        }
+    };
     let mut body = json!({ "dicEntryId": u.highest_entry_id() });
     if let Some(e) = sub.expires {
         body["confirmedExpires"] = json!(e.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
@@ -1458,6 +1674,396 @@ mod tests {
         assert_eq!(r.status, 404);
         let (r, _) = handle(&u, &q, now());
         assert_eq!(r.status, 404);
+    }
+
+    // ----------------------------------------------------------------- #725
+
+    /// The issue's request: `"aéa"` is four bytes, passed the even-length check,
+    /// and panicked slicing across the `é` with the state write lock held.
+    const BAD_RACS_BODY: &str = r#"{"racsConfigs":{"000007ed900000000abc":{"imeiTacs":["12345678"],"racsParam5Gs":"aéa"}}}"#;
+
+    fn raw_body(mut r: SbiRequest, body: &str) -> SbiRequest {
+        r.http.content = Some(body.to_string());
+        r
+    }
+
+    /// Assign a capability and resolve it by entry ID: both locks, both services.
+    fn assert_still_serving(u: &RwLock<Ucmf>) {
+        let (r, _) = handle(u, &assign_request("35123456", &[0x5A]), now());
+        assert_eq!(
+            r.status,
+            201,
+            "Assign after the bad request: {:?}",
+            body(&r)
+        );
+        let entry = r
+            .http
+            .get_header("Location")
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_string();
+        let (r, _) = handle(
+            u,
+            &req("GET", &format!("/nucmf-uecm/v1/dic-entries/{entry}")),
+            now(),
+        );
+        assert_eq!(
+            r.status,
+            200,
+            "Resolve after the bad request: {:?}",
+            body(&r)
+        );
+        assert!(!u.is_poisoned());
+    }
+
+    #[test]
+    fn a_non_ascii_racs_param_is_other_reason_and_the_ucmf_keeps_serving() {
+        let u = ucmf();
+        let (r, _) = handle(
+            &u,
+            &raw_body(
+                req("POST", "/nucmf-provisioning/v1/provisionings"),
+                BAD_RACS_BODY,
+            ),
+            now(),
+        );
+        assert_eq!(r.status, 500);
+        assert_eq!(
+            body(&r),
+            json!([{"racsIds": [MAN], "failureCode": "OTHER_REASON"}])
+        );
+        assert!(
+            !u.is_poisoned(),
+            "the bad request must not poison the state lock"
+        );
+
+        // The same value through PUT and PATCH of an existing provisioning.
+        let create = with_json(
+            req("POST", "/nucmf-provisioning/v1/provisionings"),
+            provisioning_body("0a0b"),
+        );
+        assert_eq!(handle(&u, &create, now()).0.status, 201);
+        for method in ["PUT", "PATCH"] {
+            let (r, _) = handle(
+                &u,
+                &raw_body(
+                    req(method, "/nucmf-provisioning/v1/provisionings/1"),
+                    BAD_RACS_BODY,
+                ),
+                now(),
+            );
+            assert_eq!(r.status, 500, "{method}");
+            assert_eq!(body(&r)[0]["failureCode"], "OTHER_REASON", "{method}");
+        }
+        // A refused replace leaves the provisioning as it was.
+        let (r, _) = handle(
+            &u,
+            &req("GET", "/nucmf-provisioning/v1/provisionings/1"),
+            now(),
+        );
+        assert_eq!(body(&r)["racsConfigs"][MAN]["racsParam5Gs"], "0a0b");
+        assert_still_serving(&u);
+    }
+
+    /// Whatever panics under the lock, later requests are still served: the
+    /// lock is recovered, not refused with `500 "UCMF state lock poisoned"`.
+    #[test]
+    fn a_poisoned_state_lock_is_recovered_not_refused() {
+        let u = Arc::new(ucmf());
+        let held = u.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = held.write().unwrap();
+            panic!("a request handler panicking with the state write lock held");
+        })
+        .join();
+        assert!(u.is_poisoned(), "the test must start from a poisoned lock");
+        let (r, _) = handle(&u, &req("GET", "/nucmf-uecm/v1/dic-entries/1"), now());
+        assert_eq!(
+            (r.status, cause(&r)),
+            (404, json!("NO_DICTIONARY_ENTRY_FOUND"))
+        );
+        assert!(!u.is_poisoned());
+        assert_still_serving(&u);
+
+        // Poisoned again, and this time the first request after is a write.
+        let held = u.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = held.write().unwrap();
+            panic!("again");
+        })
+        .join();
+        assert!(u.is_poisoned());
+        assert_still_serving(&u);
+    }
+
+    /// The issue's scenario end to end over HTTP/2: the bad provisioning, then
+    /// good requests on both services, through the real SBI server (whose
+    /// `catch_handler_panic` is what used to hide the poisoning).
+    #[tokio::test]
+    async fn over_http_a_bad_racs_param_is_refused_and_the_next_requests_are_served() {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let state = Arc::new(ucmf());
+        let shared = state.clone();
+        let server = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+        server
+            .start(move |req: SbiRequest| {
+                let state = shared.clone();
+                async move { handle(&state, &req, Utc::now()).0 }
+            })
+            .await
+            .expect("UCMF test server starts");
+        let client = SbiClient::with_host_port("127.0.0.1", addr.port());
+        let send = |r: SbiRequest| {
+            let client = &client;
+            async move { client.send_request(r).await.expect("the UCMF answers") }
+        };
+        let json_of = |r: &SbiResponse| -> Value {
+            serde_json::from_str(r.http.content.as_deref().unwrap_or("null")).unwrap()
+        };
+        let bad: Value = serde_json::from_str(BAD_RACS_BODY).unwrap();
+
+        let r = send(
+            SbiRequest::post("/nucmf-provisioning/v1/provisionings")
+                .with_json_body(&bad)
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(r.status, 500);
+        assert_eq!(json_of(&r)[0]["failureCode"], "OTHER_REASON");
+
+        let r = send(
+            SbiRequest::post("/nucmf-provisioning/v1/provisionings")
+                .with_json_body(&provisioning_body("0a0b"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            r.status,
+            201,
+            "a good provisioning after the bad one: {:?}",
+            json_of(&r)
+        );
+        let r = send(
+            SbiRequest::patch("/nucmf-provisioning/v1/provisionings/1")
+                .with_json_body(&bad)
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(r.status, 500);
+        let r = send(SbiRequest::get("/nucmf-provisioning/v1/provisionings/1")).await;
+        assert_eq!(r.status, 200);
+        assert_eq!(json_of(&r)["racsConfigs"][MAN]["racsParam5Gs"], "0a0b");
+        // Nucmf_UECapabilityManagement too: the provisioned entry by its ID.
+        let r = send(SbiRequest::get("/nucmf-uecm/v1/dic-entries/1")).await;
+        assert_eq!(r.status, 200, "{:?}", json_of(&r));
+        assert_eq!(
+            json_of(&r)["manAssiUeRadioCapId"],
+            RacsId::from_digit_str(MAN).unwrap().to_nucmf()
+        );
+        assert!(!state.is_poisoned());
+        let _ = server.stop().await;
+    }
+
+    mod fuzz {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn method() -> impl Strategy<Value = &'static str> {
+            prop_oneof![
+                Just("GET"),
+                Just("POST"),
+                Just("PUT"),
+                Just("PATCH"),
+                Just("DELETE")
+            ]
+        }
+
+        fn path() -> impl Strategy<Value = String> {
+            prop_oneof![
+                Just("/nucmf-provisioning/v1/provisionings".to_string()),
+                Just("/nucmf-provisioning/v1/provisionings/1".to_string()),
+                Just("/nucmf-uecm/v1/dic-entries".to_string()),
+                Just("/nucmf-uecm/v1/subscriptions".to_string()),
+                "/nucmf-(uecm|provisioning)/v1/[a-z-]{0,12}/.{0,8}",
+            ]
+        }
+
+        /// JSON values shaped like the request bodies, with arbitrary leaves.
+        fn json_leaf() -> impl Strategy<Value = Value> {
+            prop_oneof![
+                Just(Value::Null),
+                any::<bool>().prop_map(Value::from),
+                any::<i64>().prop_map(Value::from),
+                any::<String>().prop_map(Value::from),
+                "[0-9a-f]{0,64}".prop_map(Value::from),
+                // Mostly hex, now and then a multi-byte character (#725).
+                "[0-9a-fA-Fé€]{0,16}".prop_map(Value::from),
+                "[0-9]{8}".prop_map(|t| json!([t])),
+            ]
+        }
+
+        fn body() -> impl Strategy<Value = String> {
+            let config = proptest::collection::btree_map(
+                prop_oneof![
+                    Just("imeiTacs".to_string()),
+                    Just("racsParam5Gs".to_string()),
+                    Just("racsParamEps".to_string()),
+                    ".{0,6}",
+                ],
+                json_leaf(),
+                0..4,
+            );
+            // A well-formed RacsConfiguration whose parameter alone is arbitrary,
+            // so the hex decoder is reached on most cases rather than few.
+            let well_formed = (
+                "0[0-9a-f]{19}",
+                "[0-9a-fA-Fé€ ]{0,16}|.{0,16}",
+                any::<bool>(),
+            )
+                .prop_map(|(key, param, eps)| {
+                    let member = if eps { "racsParamEps" } else { "racsParam5Gs" };
+                    json!({"racsConfigs": {key: {"imeiTacs": ["35123456"], member: param}}})
+                        .to_string()
+                });
+            prop_oneof![
+                2 => well_formed,
+                1 => proptest::collection::btree_map("0[0-9a-f]{19}|.{0,22}", config, 0..3)
+                    .prop_map(|m| json!({ "racsConfigs": m }).to_string()),
+                1 => proptest::collection::btree_map(".{0,24}", json_leaf(), 0..4)
+                    .prop_map(|m| json!(m).to_string()),
+                1 => any::<String>(),
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(512))]
+
+            /// Arbitrary requests at every route: each is answered, none panics,
+            /// and afterwards the UCMF still serves a good Assign and Resolve.
+            #[test]
+            fn arbitrary_requests_never_panic_or_wedge_the_ucmf(
+                reqs in proptest::collection::vec(
+                    (method(), path(), body(), proptest::collection::vec(any::<u8>(), 0..48)),
+                    1..6,
+                ),
+            ) {
+                let u = ucmf();
+                for (m, p, b, part) in reqs {
+                    let mut r = raw_body(req(m, &p), &b);
+                    r.http.parts.push(SbiPart::with_content("nr", CONTENT_NGAP, Bytes::from(part)));
+                    let (resp, _) = handle(&u, &r, now());
+                    prop_assert!((200..600).contains(&resp.status));
+                    prop_assert!(!u.is_poisoned());
+                }
+                assert_still_serving(&u);
+            }
+
+            /// Assign with arbitrary capability bytes in every format.
+            #[test]
+            fn an_assign_with_arbitrary_capability_bytes_is_answered(
+                parts in proptest::collection::vec(proptest::collection::vec(any::<u8>(), 0..64), 4),
+            ) {
+                let u = ucmf();
+                let names = ["ueRadioCapability5GS", "ueRadioCapabilityEPS", "ueRadioCap5GSForPaging", "ueRadioCapEPSForPaging"];
+                let mut j = json!({"typeAllocationCode": "35123456"});
+                let mut r = req("POST", "/nucmf-uecm/v1/dic-entries");
+                for (name, bytes) in names.iter().zip(parts) {
+                    j[*name] = json!({"contentId": name});
+                    r.http.parts.push(SbiPart::with_content(*name, CONTENT_NGAP, Bytes::from(bytes)));
+                }
+                let r = with_json(r, j);
+                let (resp, _) = handle(&u, &r, now());
+                prop_assert!(resp.status == 201 || resp.status == 400, "{}", resp.status);
+                prop_assert!(!u.is_poisoned());
+            }
+        }
+    }
+
+    /// #786: past the caps, Assign and Subscribe answer 500
+    /// INSUFFICIENT_RESOURCES (TS 29.500 Table 5.2.7.2-1).
+    #[test]
+    fn past_the_caps_assign_and_subscribe_are_insufficient_resources() {
+        let u = ucmf();
+        u.write().unwrap().set_limits(context::Limits {
+            max_dic_entries: 1,
+            max_subscriptions: 1,
+            max_subscriptions_per_consumer: 1,
+        });
+        assert_eq!(
+            handle(&u, &assign_request("35123456", &[1]), now())
+                .0
+                .status,
+            201
+        );
+        let (r, _) = handle(&u, &assign_request("35123456", &[2]), now());
+        assert_eq!(
+            (r.status, cause(&r)),
+            (500, json!("INSUFFICIENT_RESOURCES"))
+        );
+        let sub = || {
+            with_json(
+                req("POST", "/nucmf-uecm/v1/subscriptions"),
+                json!({"ucmfNotificationUri": "http://amf:7777/racs-notify"}),
+            )
+        };
+        assert_eq!(handle(&u, &sub(), now()).0.status, 201);
+        let (r, _) = handle(&u, &sub(), now());
+        assert_eq!(
+            (r.status, cause(&r)),
+            (500, json!("INSUFFICIENT_RESOURCES"))
+        );
+    }
+
+    #[test]
+    fn the_limits_are_configurable() {
+        let args = Args::parse_from(["nextgcore-ucmfd"]);
+        let s = settle(&args, None).unwrap();
+        assert_eq!(s.limits, context::Limits::default());
+        let yaml =
+            "ucmf:\n  limits:\n    max_dic_entries: 5\n    max_subscriptions_per_consumer: 2\n";
+        let s = settle(&args, Some(yaml)).unwrap();
+        assert_eq!(
+            s.limits,
+            context::Limits {
+                max_dic_entries: 5,
+                max_subscriptions: context::Limits::default().max_subscriptions,
+                max_subscriptions_per_consumer: 2,
+            }
+        );
+    }
+
+    /// The metrics text carries the poison-recovery counter and the gauges, and
+    /// the endpoint defaults to loopback.
+    #[test]
+    fn metrics_report_poison_recoveries_and_capacity() {
+        let u = Arc::new(ucmf());
+        handle(&u, &assign_request("35123456", &[1]), now());
+        let before = POISON_RECOVERIES.load(Ordering::Relaxed);
+        let held = u.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = held.write().unwrap();
+            panic!("poison");
+        })
+        .join();
+        handle(&u, &req("GET", "/nucmf-uecm/v1/dic-entries/1"), now());
+        assert!(POISON_RECOVERIES.load(Ordering::Relaxed) > before);
+        let text = render_metrics(Some(&u));
+        assert!(text.contains("# TYPE ucmf_state_lock_poison_recoveries_total counter\n"));
+        assert!(text.contains("\nucmf_dictionary_entries 1\n"), "{text}");
+        assert!(text.contains("\nucmf_subscriptions 0\n"));
+        assert_eq!(metrics_addr(None), SocketAddr::from(([127, 0, 0, 1], 9096)));
+        assert_eq!(
+            metrics_addr(Some("not-an-address")),
+            SocketAddr::from(([127, 0, 0, 1], 9096)),
+            "a bad value falls back to loopback"
+        );
+        assert_eq!(
+            metrics_addr(Some("10.0.0.5:9100")),
+            "10.0.0.5:9100".parse::<SocketAddr>().unwrap()
+        );
     }
 
     #[test]

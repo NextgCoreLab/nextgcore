@@ -6,6 +6,7 @@ pub mod builder;
 pub mod header;
 pub mod ie;
 pub mod message;
+pub mod recovery;
 pub mod teid_pool;
 pub mod types;
 pub mod xact;
@@ -37,6 +38,8 @@ pub use ie::{
 pub use ie::Gtp2CauseIe;
 
 // Re-export types
+/// TS 29.274 Table 8.4-1 cause octets, derived from [`Gtp2Cause`] (#1024, #1037).
+pub use types::cause;
 pub use types::{
     Gtp2Ambr, Gtp2ApnRestriction, Gtp2Arp, Gtp2Cause, Gtp2DaylightSavingTime,
     Gtp2ExtensionHeaderType, Gtp2FTeid, Gtp2FTeidInterfaceType, Gtp2NodeType, Gtp2PduType,
@@ -52,11 +55,15 @@ pub use builder::{
     Ambr as BuilderAmbr, FTeid as BuilderFTeid, Uli,
 };
 
+// Re-export the TS 23.007 §18 Restart counter comparison
+pub use recovery::{note_restart_counter, restart_counter_order, RestartOrder};
+
 // Re-export TEID pool
 pub use teid_pool::TeidPool;
 
 // Re-export transaction layer
 pub use xact::{
-    is_command, is_triggered_message, triggered_message_type, triggered_message_types,
-    Gtp2LocalXact, Gtp2XactConfig, Gtp2XactMgr, Gtp2XactPoll, GTP2_MAX_SEQUENCE,
+    is_command, is_command_sequence, is_triggered_message, triggered_message_type,
+    triggered_message_types, Gtp2LocalXact, Gtp2XactConfig, Gtp2XactMgr, Gtp2XactPoll,
+    GTP2_COMMAND_SEQUENCE_FLAG, GTP2_MAX_INITIAL_SEQUENCE, GTP2_MAX_SEQUENCE,
 };

@@ -27,7 +27,7 @@ Everything else is configured by flags.
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `-c, --config` | path | `/etc/nextgcore/nef.yaml` | Configuration file path. |
-| `-e, --log-level` | string | `info` | Log level; `RUST_LOG` overrides it. |
+| `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-l, --log-file` | path | unset | Log file path. |
 | `-m, --no-color` | flag | off | Disable colored output. |
 | `--sbi-addr` / `--sbi-port` | string / u16 | `0.0.0.0` / `7817` | SBI bind address and port. |

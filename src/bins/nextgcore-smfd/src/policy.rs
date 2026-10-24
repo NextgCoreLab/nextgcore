@@ -676,6 +676,37 @@ pub struct SmPolicyCreateContext<'a> {
     /// request did before #310, left the PCF unable to bound its authorisation by
     /// the subscription at all.
     pub subs_sess_ambr: Option<&'a crate::udm::SubscribedSmData>,
+    /// `3gpp-Sbi-Origination-Timestamp` for the create (TS 29.512 §4.2.2.2,
+    /// §4.2.7), forwarded from the CreateSMContext request; see
+    /// [`origination_timestamp_for_create`]. `None` sends no header.
+    pub origination_timestamp: Option<&'a str>,
+}
+
+/// TS 29.502 §6.1.2.3.2 custom header.
+pub const ORIGINATION_TIMESTAMP_HEADER: &str = "3gpp-Sbi-Origination-Timestamp";
+
+/// The `3gpp-Sbi-Origination-Timestamp` the SMF forwards on
+/// `Npcf_SMPolicyControl_Create` (#980 review): the CreateSMContext request's,
+/// when it carried a readable one, and nothing otherwise.
+///
+/// TS 29.512 §4.2.2.2: when the CreateSMContext request includes the header, the
+/// SMF shall forward it. The SMF is not the originating entity
+/// (TS 29.502 §6.1.2.3.2; the AMF is) and never stamps its own. Without the
+/// header, the PCF accepts a colliding create as more recent (§4.2.7). An AMF
+/// retransmission carries the AMF's unchanged stamp, so forwarding it lets the
+/// PCF reuse the association. An unreadable value is not forwarded, because the
+/// PCF would refuse it with 400; it is logged.
+pub fn origination_timestamp_for_create(incoming: Option<&str>) -> Option<String> {
+    let v = incoming?;
+    if nextgcore_sbi::datetime::origination_timestamp_to_epoch_ms(v).is_some() {
+        Some(v.trim_matches([' ', '\t']).to_string())
+    } else {
+        log::warn!(
+            "CreateSMContext {ORIGINATION_TIMESTAMP_HEADER} {v:?} is not a TS 29.502 \
+             timestamp; not forwarded to the PCF"
+        );
+        None
+    }
 }
 
 /// The TS 29.571 `Ambr` object for a subscribed session-AMBR, or `None` when the
@@ -751,9 +782,16 @@ pub async fn sm_policy_create(
         body["subsSessAmbr"] = ambr;
     }
 
+    let mut request =
+        nextgcore_sbi::message::SbiRequest::post("/npcf-smpolicycontrol/v1/sm-policies")
+            .with_json_body(&body)
+            .map_err(|e| PolicyError::Transport(e.to_string()))?;
+    if let Some(ts) = ctx.origination_timestamp {
+        request = request.with_header(ORIGINATION_TIMESTAMP_HEADER, ts);
+    }
     let resp = pcf
         .client()
-        .post_json("/npcf-smpolicycontrol/v1/sm-policies", &body)
+        .send_request(request)
         .await
         .map_err(|e| PolicyError::Transport(e.to_string()))?;
 
@@ -2054,6 +2092,7 @@ mod tests {
             ue_ipv4: [10, 45, 0, 2],
             notification_uri: "http://127.0.0.1:9/nsmf-callback/v1/sm-policy-notify/1",
             subs_sess_ambr: None,
+            origination_timestamp: None,
         };
 
         let run = async {
@@ -2098,6 +2137,101 @@ mod tests {
     /// so a subscription stating only one is reported as NOTHING rather than as a zero
     /// (a `subsSessAmbr` of "0 bps" would have the PCF bound the authorisation to
     /// nothing and police the subscriber to a standstill).
+    /// #980 review: the create forwards `3gpp-Sbi-Origination-Timestamp`
+    /// verbatim when the AMF sent a readable one (TS 29.512 §4.2.2.2), so a
+    /// re-sent create compares equal at the PCF and reuses its association
+    /// (§4.2.7); otherwise no header is sent.
+    #[tokio::test]
+    async fn the_sm_policy_create_carries_the_origination_timestamp() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let stamps: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = addr.port();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(
+                format!("127.0.0.1:{port}").parse().unwrap(),
+            ),
+            listener,
+        );
+        let recorded = stamps.clone();
+        server
+            .start(move |req: nextgcore_sbi::message::SbiRequest| {
+                let recorded = recorded.clone();
+                async move {
+                    recorded
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(req.http.get_header(ORIGINATION_TIMESTAMP_HEADER).cloned());
+                    nextgcore_sbi::message::SbiResponse::with_status(201)
+                        .with_header("Location", "/npcf-smpolicycontrol/v1/sm-policies/p-980")
+                        .with_body(
+                            serde_json::json!({
+                                "sessRules": {}, "pccRules": {}, "qosDecs": {},
+                                "chgDecs": {}, "traffContDecs": {},
+                            })
+                            .to_string(),
+                            "application/json",
+                        )
+                }
+            })
+            .await
+            .expect("start stub PCF");
+        let pcf = PcfEndpoint {
+            host: "127.0.0.1".into(),
+            port,
+        };
+        let amf_stamp = "Fri, 23 Oct 2026 10:00:00.123 GMT";
+        let origination = origination_timestamp_for_create(Some(amf_stamp));
+        assert_eq!(
+            origination.as_deref(),
+            Some(amf_stamp),
+            "the AMF's value is forwarded"
+        );
+        let ctx = SmPolicyCreateContext {
+            supi: "imsi-001010000000980",
+            psi: 5,
+            pdu_session_type: pdu_session_type::IPV4,
+            dnn: "internet",
+            sst: 1,
+            sd: None,
+            ue_ipv4: [10, 45, 0, 98],
+            notification_uri: "http://127.0.0.1:9/cb",
+            subs_sess_ambr: None,
+            origination_timestamp: origination.as_deref(),
+        };
+        // The same create twice, as a re-send: the same value both times.
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(8), sm_policy_create(&pcf, &ctx))
+                .await
+                .expect("in time")
+                .expect("created");
+        }
+        assert_eq!(
+            *stamps.lock().unwrap(),
+            vec![Some(amf_stamp.to_string()), Some(amf_stamp.to_string())]
+        );
+
+        // No header, or an unreadable one: nothing is forwarded, and the SMF
+        // never stamps its own (it is not the originating entity).
+        for incoming in [None, Some("yesterday")] {
+            assert_eq!(
+                origination_timestamp_for_create(incoming),
+                None,
+                "{incoming:?}"
+            );
+        }
+        let bare = SmPolicyCreateContext {
+            origination_timestamp: None,
+            ..ctx
+        };
+        tokio::time::timeout(Duration::from_secs(8), sm_policy_create(&pcf, &bare))
+            .await
+            .expect("in time")
+            .expect("created");
+        assert_eq!(stamps.lock().unwrap().last(), Some(&None), "no header sent");
+    }
+
     #[tokio::test]
     async fn the_sm_policy_create_body_carries_the_subscribed_session_ambr() {
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -2159,6 +2293,7 @@ mod tests {
             ue_ipv4: [10, 45, 0, 4],
             notification_uri: "http://127.0.0.1:9/cb",
             subs_sess_ambr: Some(&both),
+            origination_timestamp: None,
         };
         let run = async {
             sm_policy_create(&pcf, &base).await.expect("create");
@@ -2263,6 +2398,7 @@ mod tests {
             ue_ipv4: [10, 45, 0, 3],
             notification_uri: "http://127.0.0.1:9/cb",
             subs_sess_ambr: None,
+            origination_timestamp: None,
         };
         let res = tokio::time::timeout(Duration::from_secs(8), sm_policy_create(&pcf, &ctx))
             .await

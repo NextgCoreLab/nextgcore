@@ -45,7 +45,10 @@ const NOTIFY_REQUEST_TIMEOUT_SECS: u64 = 3;
 pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.clone();
     let uri = request.header.uri.clone();
-    log::debug!("AMF SBI request: {method} {uri}");
+    log::debug!(
+        "AMF SBI request: {method} {}",
+        nextgcore_sbi::log_redact::redact_callback_tokens(&uri)
+    );
 
     let path = uri.split('?').next().unwrap_or(&uri);
     let parts: Vec<&str> = path
@@ -251,8 +254,24 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
         "namf-callback" if parts.len() == 3 && parts[2] == "ucmf-notify" && method == "POST" => {
             handle_ucmf_notify_callback(&request)
         }
-        "namf-callback" if parts.len() == 4 && parts[3] == "dereg-notify" && method == "POST" => {
-            handle_dereg_notify_callback(parts[2], &request)
+        // Namf_Callback: Nnrf_NFManagement NFStatusNotify (#668, TS 29.510
+        // §5.2.2.6), POSTed to the nfStatusNotificationUri of the AMF's
+        // NF status subscriptions (`nrf_subscription`).
+        //   POST /namf-callback/v1/nf-status-notify/{token}
+        "namf-callback"
+            if parts.len() == 4 && parts[2] == "nf-status-notify" && method == "POST" =>
+        {
+            handle_nf_status_notify_callback(parts[3], &request).await
+        }
+        //   POST /namf-callback/v1/{supi}/dereg-notify/{token}   (#753)
+        //   POST /namf-callback/v1/{supi}/dereg-notify           (registrations
+        //                                                        made before #753)
+        "namf-callback"
+            if (parts.len() == 4 || parts.len() == 5)
+                && parts[3] == "dereg-notify"
+                && method == "POST" =>
+        {
+            handle_dereg_notify_callback(parts[2], parts.get(4).copied(), &request)
         }
 
         // Namf_Callback: Nsmf_PDUSession SmContextStatusNotification (#540,
@@ -469,6 +488,37 @@ fn handle_ucmf_notify_callback(request: &SbiRequest) -> SbiResponse {
     SbiResponse::no_content()
 }
 
+/// NFStatusNotify callback (#668, TS 29.510 §5.2.2.6).
+///
+/// `token` names the subscription the notification belongs to; one the AMF
+/// does not hold gets 404 and changes nothing (#940 review M2). Otherwise the
+/// named NF instance is dropped from the discovery cache, or re-discovered when
+/// it is the last of its type, when it deregistered or an attribute the cache
+/// uses changed, at most once per instance per `EVICT_HOLD`. The body's
+/// `nfProfile` is never read: the next request re-discovers (see
+/// `nrf_subscription`). 204 on success, 400 for a body without `event` or
+/// `nfInstanceUri`.
+async fn handle_nf_status_notify_callback(token: &str, request: &SbiRequest) -> SbiResponse {
+    use crate::nrf_subscription::{
+        apply_notification, classify_notification, token_nf_type, NotifyError,
+    };
+    let Some(nf_type) = token_nf_type(token) else {
+        log::warn!("NF status notification on a subscription this AMF does not hold; refused");
+        return SbiResponse::with_status(404);
+    };
+    let Some(body) = parse_json_body(request) else {
+        return malformed_body();
+    };
+    match classify_notification(&body) {
+        Ok(action) => {
+            apply_notification(&nf_type, &action).await;
+            SbiResponse::no_content()
+        }
+        Err(NotifyError::Missing(attr)) => mandatory_ie_missing(attr),
+        Err(NotifyError::Incorrect(attr, detail)) => mandatory_ie_incorrect(attr, &detail),
+    }
+}
+
 /// Nudm_UECM DeregistrationNotification callback (WSB-4, TS 29.503 §5.3.2.3.2).
 ///
 /// The UDM POSTs a `DeregistrationData` (deregReason + accessType) to the
@@ -482,7 +532,19 @@ fn handle_ucmf_notify_callback(request: &SbiRequest) -> SbiResponse {
 /// INVALID_MSG_FORMAT; a missing/unknown mandatory member is 400
 /// MANDATORY_IE_MISSING / MANDATORY_IE_INCORRECT; an unknown SUPI is 404
 /// CONTEXT_NOT_FOUND. On success the AMF answers 204 No Content.
-fn handle_dereg_notify_callback(supi: &str, request: &SbiRequest) -> SbiResponse {
+///
+/// #753: `token` is the `deregCallbackUri` token of the registration the UDM is
+/// notifying about. Only a notification for the UE's CURRENT registration acts.
+/// Any other token means a registration this AMF no longer holds, typically one it
+/// made before a restart: the restarted AMF registered the UE again, and the UDM
+/// is telling the "old AMF" about it. That notification is acknowledged (204) and
+/// changes nothing. Acting on it was a silent local deregistration of the UE's
+/// new registration.
+fn handle_dereg_notify_callback(
+    supi: &str,
+    token: Option<&str>,
+    request: &SbiRequest,
+) -> SbiResponse {
     let Some(body) = parse_json_body(request) else {
         return malformed_body();
     };
@@ -512,6 +574,17 @@ fn handle_dereg_notify_callback(supi: &str, request: &SbiRequest) -> SbiResponse
     let Some(ue) = find_ue_by_context_id(supi) else {
         return context_not_found(supi);
     };
+    if ue.uecm_dereg_token.as_deref().is_none() || ue.uecm_dereg_token.as_deref() != token {
+        // The UE's CURRENT token is never logged: with it, anyone who reads the
+        // log and reaches the SBI could forge a notification that acts.
+        log::info!(
+            "[{supi}] dereg-notify ({reason_str}) names UECM registration {} which is not \
+             the UE's current one: it concerns a registration this AMF no longer holds; \
+             acknowledged, nothing torn down",
+            token.unwrap_or("<untokened>")
+        );
+        return SbiResponse::no_content();
+    }
 
     let data = DeregistrationData {
         dereg_reason,
@@ -2918,6 +2991,90 @@ pub(crate) fn build_n2_info_notify_request(
         )))
 }
 
+/// Build the NonUeN2InfoNotify for an uplink non-UE-associated NRPPa PDU (#807,
+/// TS 29.518 §5.2.2.4.4.2): the `N2InformationNotification` of
+/// [`build_n2_info_notify_request`], without an `lcsCorrelationId` (the PDU belongs
+/// to no UE) and with `ranNodeId`, the node that answered. An LMF that measured
+/// several nodes needs it to tell their answers apart.
+pub fn build_non_ue_nrppa_info_notify_request(
+    path: &str,
+    n2_notify_subscription_id: &str,
+    nf_id: Option<&str>,
+    ran_node_id: Option<&Value>,
+    nrppa_pdu: &[u8],
+) -> Result<SbiRequest, serde_json::Error> {
+    let mut notification = json!({
+        "n2NotifySubscriptionId": n2_notify_subscription_id,
+        "n2InfoContainer": {
+            "n2InformationClass": "NRPPa",
+            "nrppaInfo": {
+                "nrppaPdu": {
+                    "ngapIeType": "NRPPA_PDU",
+                    "ngapData": { "contentId": N2_INFO_NOTIFY_NRPPA_CONTENT_ID },
+                },
+            },
+        },
+    });
+    if let Some(nf_id) = nf_id {
+        notification["n2InfoContainer"]["nrppaInfo"]["nfId"] = json!(nf_id);
+    }
+    if let Some(node) = ran_node_id {
+        notification["ranNodeId"] = node.clone();
+    }
+    Ok(SbiRequest::post(path)
+        .with_json_body(&notification)?
+        .with_part(SbiPart::with_content(
+            N2_INFO_NOTIFY_NRPPA_CONTENT_ID,
+            nextgcore_sbi::constants::content_type::APPLICATION_NGAP,
+            bytes::Bytes::copy_from_slice(nrppa_pdu),
+        )))
+}
+
+/// POST a non-UE NRPPa NonUeN2InfoNotify (#807). Fire-and-forget, like
+/// [`send_n2_info_notify`].
+pub fn send_non_ue_nrppa_info_notify(
+    callback_uri: String,
+    n2_notify_subscription_id: String,
+    nf_id: Option<String>,
+    ran_node_id: Option<Value>,
+    nrppa_pdu: Vec<u8>,
+) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        log::debug!("NonUeN2InfoNotify (NRPPa) skipped (no tokio runtime)");
+        return;
+    };
+    handle.spawn(async move {
+        let Some((host, port, path)) = parse_http_uri(&callback_uri) else {
+            log::warn!("Invalid n2NotifyCallbackUri: {callback_uri}");
+            return;
+        };
+        let request = match build_non_ue_nrppa_info_notify_request(
+            &path,
+            &n2_notify_subscription_id,
+            nf_id.as_deref(),
+            ran_node_id.as_ref(),
+            &nrppa_pdu,
+        ) {
+            Ok(req) => req,
+            Err(e) => {
+                log::warn!("NonUeN2InfoNotify (NRPPa) body build failed: {e}");
+                return;
+            }
+        };
+        match notify_client(&host, port).send_request(request).await {
+            Ok(resp) if resp.is_success() => log::info!(
+                "NonUeN2InfoNotify (NRPPa) delivered to {callback_uri} \
+                 (sub={n2_notify_subscription_id})"
+            ),
+            Ok(resp) => log::warn!(
+                "NonUeN2InfoNotify (NRPPa) to {callback_uri} returned {}",
+                resp.status
+            ),
+            Err(e) => log::warn!("NonUeN2InfoNotify (NRPPa) to {callback_uri} failed: {e}"),
+        }
+    });
+}
+
 /// POST an N2InfoNotify to the LMF's registered `n2NotifyCallbackUri`
 /// (TS 29.518 §5.2.2.3.3) relaying an uplink NRPPa PDU (TS 38.413 §8.15.3 /
 /// §8.15.5). Fire-and-forget on a background task with bounded timeouts,
@@ -4496,15 +4653,38 @@ fn record_transferred_sessions(ue_id: u64, ue_context: &Value, ue_context_id: &s
         if let Some(dnn) = session.get("dnn").and_then(Value::as_str) {
             sess.dnn = Some(dnn.to_string());
         }
-        if let Some(sst) = session.pointer("/sNssai/sst").and_then(Value::as_u64) {
-            sess.s_nssai.sst = sst as u8;
-        }
-        if let Some(sd) = session
-            .pointer("/sNssai/sd")
-            .and_then(Value::as_str)
-            .and_then(|s| u32::from_str_radix(s, 16).ok())
+        match session
+            .pointer("/sNssai/sst")
+            .and_then(Value::as_u64)
+            .and_then(|v| u8::try_from(v).ok())
         {
-            sess.s_nssai.sd = Some(sd);
+            Some(sst) => {
+                sess.s_nssai.sst = sst;
+                sess.s_nssai.sd = session
+                    .pointer("/sNssai/sd")
+                    .and_then(Value::as_str)
+                    .and_then(|s| u32::from_str_radix(s, 16).ok());
+            }
+            // TS 29.518 §6.1.6.2.19: PduSessionContext.sNssai is mandatory. A peer that
+            // omits it still names a session the UE holds, so it is recorded under this
+            // AMF's default S-NSSAI rather than as SST 0, which no target admits
+            // (#743 follow-up).
+            None => {
+                let default = ctx.read().ok().and_then(|guard| {
+                    guard
+                        .plmn_support
+                        .first()
+                        .and_then(|p| p.s_nssai.first().cloned())
+                });
+                log::warn!(
+                    "UE context {ue_context_id}: PDU session {psi} has no (valid) sNssai, \
+                     which TS 29.518 makes mandatory; recorded under the default S-NSSAI \
+                     {default:?}"
+                );
+                if let Some(default) = default {
+                    sess.s_nssai = default;
+                }
+            }
         }
         if let Ok(guard) = ctx.read() {
             guard.sess_update(&sess);
@@ -5660,18 +5840,22 @@ fn handle_non_ue_n2_info_subscribe(request: &SbiRequest) -> SbiResponse {
         return mandatory_ie_incorrect("n2NotifyCallbackUri", "not a valid HTTP URI");
     }
 
-    // Only the PWS classes are served. The other `N2InformationClass` values
-    // (`SM`, `NRPPa`, `RAN`, `V2X`, `PROSE`, `TSS`, `RSPP`, `A2X`) each need their
-    // own producer; `NRPPa` in particular is already served by the per-UE
-    // `n1-n2-messages/subscriptions` registry, so accepting it here would store a
-    // second subscription that nothing reads.
-    if !PWS_N2_INFORMATION_CLASSES.contains(&n2_information_class) {
+    // Only the PWS classes and NRPPa are served. The other `N2InformationClass`
+    // values (`SM`, `RAN`, `V2X`, `PROSE`, `TSS`, `RSPP`, `A2X`) each need their
+    // own producer. NRPPa (#807) is read by the UPLINK NON UE ASSOCIATED NRPPA
+    // TRANSPORT relay, which picks the LMF by the NGAP Routing ID (§5.2.2.4.4.2).
+    // #807: the NRPPa class is served too. TS 29.518 §5.2.2.4.4.2 has the AMF
+    // notify an LMF's non-UE-associated NRPPa answers through it.
+    if !PWS_N2_INFORMATION_CLASSES.contains(&n2_information_class)
+        && n2_information_class != "NRPPa"
+    {
         return send_error(
             403,
             "Forbidden",
             &format!(
                 "n2InformationClass '{n2_information_class}' is not served on this resource; \
-                 only the PWS classes {PWS_N2_INFORMATION_CLASSES:?} (TS 29.518 §5.2.2.4.2.2) are"
+                 only the PWS classes {PWS_N2_INFORMATION_CLASSES:?} (TS 29.518 §5.2.2.4.2.2) \
+                 and NRPPa (§5.2.2.4.4.2) are"
             ),
             Some("UNSPECIFIED"),
         );
@@ -5827,6 +6011,114 @@ fn handle_non_ue_n2_info_unsubscribe(subscription_id: &str) -> SbiResponse {
     }
 }
 
+/// The NRPPa class of `POST /namf-comm/v1/non-ue-n2-messages/transfer` (#807):
+/// TS 29.518 §5.2.2.4.1.2, Obtaining Non UE Associated Network Assistance Data.
+///
+/// §5.2.2.4.1.2 step 1: the body carries the N2 information "together with the NG
+/// RAN node identifier(s) to which the transfer needs to be initiated", and "the NF
+/// Instance Identifier of the NF Service Consumer (e.g. LMF) in "nfId"". So
+/// `globalRanNodeList` is required here, and `nrppaInfo.nfId` (mandatory in
+/// `NrppaInformation`) becomes the NGAP Routing ID of each DOWNLINK NON UE
+/// ASSOCIATED NRPPA TRANSPORT (TS 38.413 §8.15.4, §9.3.3.13), which is how the
+/// node's UPLINK answer finds the LMF again.
+///
+/// The PDU is relayed verbatim: TS 23.273 has the AMF transparent to NRPPa.
+///
+/// Step 2a: `N2_INFO_TRANSFER_INITIATED` once the transfer is initiated. Which
+/// named nodes are connected is known only to the NGAP task, after this response
+/// is written, so `PARTIAL_N2_INFO_TRANSFER` is not reported; a node the NGAP task
+/// cannot reach is logged there (the same reasoning as for PWS).
+fn handle_non_ue_nrppa_transfer(
+    request: &SbiRequest,
+    body: &Value,
+    n2_information: &Value,
+) -> SbiResponse {
+    let Some(nrppa_info) = n2_information.get("nrppaInfo") else {
+        return mandatory_ie_missing("n2Information.nrppaInfo");
+    };
+    // nfId and nrppaPdu are the required members of NrppaInformation.
+    let Some(nf_id) = nrppa_info
+        .get("nfId")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    else {
+        return mandatory_ie_missing("nrppaInfo.nfId");
+    };
+    let Some(content_id) = nrppa_info
+        .get("nrppaPdu")
+        .and_then(|p| p.get("ngapData"))
+        .and_then(|d| d.get("contentId"))
+        .and_then(Value::as_str)
+    else {
+        return mandatory_ie_missing("nrppaInfo.nrppaPdu.ngapData.contentId");
+    };
+    let Some(nrppa_pdu) = find_binary_part(request, content_id) else {
+        return mandatory_ie_incorrect(
+            "nrppaInfo.nrppaPdu.ngapData.contentId",
+            "no multipart part carries that contentId",
+        );
+    };
+    if nrppa_pdu.is_empty() {
+        return mandatory_ie_incorrect("nrppaInfo.nrppaPdu.ngapData", "empty NRPPa PDU");
+    }
+    let target_gnb_ids: Vec<u32> = body
+        .get("globalRanNodeList")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|node| {
+                    node.get("gNbId")
+                        .and_then(|g| g.get("gNBValue"))
+                        .and_then(Value::as_str)
+                        .and_then(|v| u32::from_str_radix(v, 16).ok())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if target_gnb_ids.is_empty() {
+        return mandatory_ie_missing("globalRanNodeList");
+    }
+    let ctx = crate::context::amf_self();
+    let Ok(guard) = ctx.read() else {
+        return send_error(
+            500,
+            "Internal Server Error",
+            "AMF context unavailable",
+            None,
+        );
+    };
+    let queued = guard.non_ue_nrppa_add(crate::context::PendingNonUeNrppa {
+        nrppa_pdu,
+        routing_id: nf_id.as_bytes().to_vec(),
+        target_gnb_ids: target_gnb_ids.clone(),
+    });
+    drop(guard);
+    if !queued {
+        // TS 29.500 Table 5.2.7.2-1: INSUFFICIENT_RESOURCES is a 500.
+        return send_error(
+            500,
+            "Internal Server Error",
+            "The non-UE NRPPa relay queue is full",
+            Some("INSUFFICIENT_RESOURCES"),
+        );
+    }
+    log::info!(
+        "Namf NonUeN2MessageTransfer (NRPPa): enqueued for {} NG-RAN node(s), Routing ID \
+         {nf_id}",
+        target_gnb_ids.len()
+    );
+    // The SCTP associations live in the NGAP task, so whether a named node is
+    // connected is only known when the pump runs, after this response. As for
+    // PWS, the 200 reports that the AMF initiated the transfer; a node the pump
+    // cannot reach is logged there.
+    match SbiResponse::with_status(200)
+        .with_json_body(&json!({ "result": "N2_INFO_TRANSFER_INITIATED" }))
+    {
+        Ok(resp) => resp,
+        Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
+    }
+}
+
 /// `POST /namf-comm/v1/non-ue-n2-messages/transfer` — Namf_Communication
 /// NonUeN2MessageTransfer (TS 29.518 §5.2.2.4.1,
 /// `TS29518_Namf_Communication.yaml:1718`), for the **PWS** N2 information class
@@ -5876,17 +6168,22 @@ fn handle_non_ue_n2_message_transfer(request: &SbiRequest) -> SbiResponse {
         return mandatory_ie_missing("n2Information.n2InformationClass");
     };
 
-    // Only PWS is served here. The other classes this service operation carries
-    // (NRPPa for §5.2.2.4.1.2, RAN for the Configuration Transfer and RIM
-    // procedures, TSS for §5.2.2.4.1.7) each need their own transport, and
-    // answering 200 for them would claim a transfer that never happened.
+    // #807: NRPPa (§5.2.2.4.1.2, Obtaining Non UE Associated Network
+    // Assistance Data) has its own transport.
+    if info_class == "NRPPa" {
+        return handle_non_ue_nrppa_transfer(request, &body, n2_information);
+    }
+    // Otherwise only PWS is served here. The other classes this service
+    // operation carries (RAN for the Configuration Transfer and RIM procedures,
+    // TSS for §5.2.2.4.1.7) each need their own transport, and answering 200 for
+    // them would claim a transfer that never happened.
     if info_class != "PWS" {
         return send_error(
             403,
             "Forbidden",
             &format!(
                 "n2InformationClass '{info_class}' is not served on this resource; \
-                 only 'PWS' (TS 29.518 §5.2.2.4.1.3) is"
+                 only 'PWS' (TS 29.518 §5.2.2.4.1.3) and 'NRPPa' (§5.2.2.4.1.2) are"
             ),
             Some("UNSPECIFIED"),
         );
@@ -6280,6 +6577,14 @@ pub(crate) fn dereg_queue_test_lock() -> &'static tokio::sync::Mutex<()> {
 /// modules serialize against ONE lock: a second lock declared inside a
 /// `mod tests` is what hung this suite once.
 #[cfg(test)]
+pub(crate) fn non_ue_nrppa_queue_test_lock() -> &'static tokio::sync::Mutex<()> {
+    // #807: the process-global `non_ue_nrppa_queue`, shared by the router test in
+    // this module and the NGAP pump test in `ngap_path`, like the PWS lock below.
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+#[cfg(test)]
 pub(crate) fn pws_queue_test_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
@@ -6316,6 +6621,8 @@ mod tests {
         ue.security_context_available = security;
         ue.nr_tai.tac = 100;
         ue.nr_cgi.cell_id = 0x12345;
+        // #753: the token of this UE's (stand-in) UECM registration.
+        ue.uecm_dereg_token = Some(format!("tok-{supi}"));
         if connected {
             guard.amf_ue_associate_ran_ue(ue.id, ran_ue.id);
             ue.ran_ue_id = ran_ue.id;
@@ -7979,9 +8286,7 @@ mod tests {
         // `LMF_SBI_ADDR`/`LMF_SBI_PORT` at a stand-in LMF while they run: unguarded, this
         // test's ProvidePositioningInfo reached THEIR stand-in, and the sibling's
         // "what the LMF received" assertion read this test's SUPI instead of its own.
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         let supi = "imsi-001010000060050";
         setup_ue(supi, true, true);
 
@@ -8117,7 +8422,7 @@ mod tests {
         let ue = setup_ue(supi, true, true);
 
         let body = json!({ "deregReason": "UE_INITIAL_REGISTRATION", "accessType": "3GPP_ACCESS" });
-        let req = SbiRequest::post(format!("/namf-callback/v1/{supi}/dereg-notify"))
+        let req = SbiRequest::post(format!("/namf-callback/v1/{supi}/dereg-notify/tok-{supi}"))
             .with_json_body(&body)
             .expect("json");
         let resp = namf_request_handler(req).await;
@@ -8134,6 +8439,44 @@ mod tests {
         assert_eq!(queued[0].gmm_cause, None);
     }
 
+    /// #753: after an AMF restart the UE registers again (new UECM registration,
+    /// new token), and the UDM sends a UE_INITIAL_REGISTRATION notification to
+    /// the callback of the registration made BEFORE the restart. It names the old
+    /// token, so it is acknowledged (204) and the UE's new registration survives:
+    /// nothing is enqueued, and the context is still resolvable. A notification
+    /// to a pre-#753 URI (no token) is the same case.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dereg_notify_for_a_registration_made_before_a_restart_leaves_the_ue_alone() {
+        let _serial = dereg_queue_test_lock().lock().await;
+        let supi = "imsi-001010000075301";
+        let ue = setup_ue(supi, true, true);
+        let body = json!({ "deregReason": "UE_INITIAL_REGISTRATION", "accessType": "3GPP_ACCESS" });
+        for uri in [
+            format!("/namf-callback/v1/{supi}/dereg-notify/tok-before-restart"),
+            format!("/namf-callback/v1/{supi}/dereg-notify"),
+        ] {
+            let req = SbiRequest::post(uri.clone())
+                .with_json_body(&body)
+                .expect("json");
+            assert_eq!(namf_request_handler(req).await.status, 204, "{uri}");
+        }
+        assert!(
+            drain_network_deregs_for(ue.id).is_empty(),
+            "the new registration is not torn down"
+        );
+        assert!(
+            find_ue_by_context_id(supi).is_some(),
+            "the context survives"
+        );
+
+        // The notification for the CURRENT registration still acts.
+        let req = SbiRequest::post(format!("/namf-callback/v1/{supi}/dereg-notify/tok-{supi}"))
+            .with_json_body(&body)
+            .expect("json");
+        assert_eq!(namf_request_handler(req).await.status, 204);
+        assert_eq!(drain_network_deregs_for(ue.id).len(), 1);
+    }
+
     /// SUBSCRIPTION_WITHDRAWN -> reregistration_required=false, and signalled.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_dereg_notify_callback_subscription_withdrawn_no_rereg() {
@@ -8142,7 +8485,7 @@ mod tests {
         let ue = setup_ue(supi, true, true);
 
         let body = json!({ "deregReason": "SUBSCRIPTION_WITHDRAWN", "accessType": "3GPP_ACCESS" });
-        let req = SbiRequest::post(format!("/namf-callback/v1/{supi}/dereg-notify"))
+        let req = SbiRequest::post(format!("/namf-callback/v1/{supi}/dereg-notify/tok-{supi}"))
             .with_json_body(&body)
             .expect("json");
         assert_eq!(namf_request_handler(req).await.status, 204);
@@ -8165,7 +8508,7 @@ mod tests {
         let ue = setup_ue(supi, true, true);
 
         let body = json!({ "deregReason": "REREGISTRATION_REQUIRED", "accessType": "3GPP_ACCESS" });
-        let req = SbiRequest::post(format!("/namf-callback/v1/{supi}/dereg-notify"))
+        let req = SbiRequest::post(format!("/namf-callback/v1/{supi}/dereg-notify/tok-{supi}"))
             .with_json_body(&body)
             .expect("json");
         assert_eq!(namf_request_handler(req).await.status, 204);
@@ -8323,9 +8666,7 @@ mod tests {
         // eight local runs and three earlier CI runs of the same commit passed -- a latent race,
         // not a defect in the code under test. Taking the EXISTING guard rather than declaring a
         // new lock: #276 showed a second lock over the same variables HANGS the suite.
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.blocking_lock();
         let supi = "imsi-001010000000117";
         setup_ue(supi, true, true);
 
@@ -8398,9 +8739,7 @@ mod tests {
     #[test]
     fn assign_ebi_releases_before_it_assigns_so_a_freed_ebi_is_reusable() {
         // #408: the process-global context guard; see the note on `assign_ebi_request`.
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.blocking_lock();
         let supi = "imsi-001010000000118";
         setup_ue(supi, true, true);
 
@@ -8441,9 +8780,7 @@ mod tests {
     #[test]
     fn assign_ebi_reports_exhaustion_rather_than_inventing_an_ebi() {
         // #408: the process-global context guard; see the note on `assign_ebi_request`.
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.blocking_lock();
         let supi = "imsi-001010000000119";
         setup_ue(supi, true, true);
 
@@ -8531,9 +8868,7 @@ mod tests {
     #[test]
     fn twelve_establish_release_cycles_keep_getting_an_ebi_and_twelve_without_release_do_not() {
         // #408: the process-global context guard; see the note on `assign_ebi_request`.
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.blocking_lock();
         let supi = "imsi-001010000000291";
         setup_ue(supi, true, true);
 
@@ -8606,9 +8941,7 @@ mod tests {
     #[test]
     fn deregistration_frees_the_ues_eps_bearer_identities() {
         // #408: the process-global context guard; see the note on `assign_ebi_request`.
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.blocking_lock();
         let supi = "imsi-001010000000293";
         setup_ue(supi, true, true);
 
@@ -8663,9 +8996,7 @@ mod tests {
     #[test]
     fn assign_ebi_rejects_a_malformed_request_and_an_unknown_ue() {
         // #408: the process-global context guard; see the note on `assign_ebi_request`.
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.blocking_lock();
         let supi = "imsi-001010000000120";
         setup_ue(supi, true, true);
 
@@ -8731,9 +9062,7 @@ mod tests {
     #[test]
     fn assign_ebi_modifies_a_held_ebi_and_409s_one_it_does_not_hold() {
         // #408: the process-global context guard; see the note on `assign_ebi_request`.
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.blocking_lock();
         let supi = "imsi-001010000000121";
         setup_ue(supi, true, true);
 
@@ -8997,9 +9326,7 @@ mod tests {
     /// store and would fail on that mistake.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_ue_context_creates_a_context_this_amf_can_resolve() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         amf_context_init(64, 1024, 4096);
 
         // A SUPI/PEI pair no sibling uses, so resolving them proves this handler ran.
@@ -9076,9 +9403,7 @@ mod tests {
     /// show the handler accepts the right bodies rather than accepting everything.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_ue_context_requires_every_mandatory_member() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         amf_context_init(64, 1024, 4096);
 
         // Distinct from `create_ue_context_creates_a_context_this_amf_can_resolve`,
@@ -9134,9 +9459,7 @@ mod tests {
     /// satisfied by a context that was never created.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn release_ue_context_releases_the_context() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         // Distinct SUPI per the process-global note at the top of this section.
         let supi = "imsi-001010000740020";
         let ue = setup_ue(supi, true, true);
@@ -9196,9 +9519,7 @@ mod tests {
     /// operation does.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn relocate_ue_context_creates_the_context_and_records_its_sessions() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         amf_context_init(64, 1024, 4096);
 
         // Distinct from every sibling in this section.
@@ -9215,6 +9536,12 @@ mod tests {
                     "pduSessionId": 7,
                     "smContextRef": sm_context_ref,
                     "sNssai": { "sst": 1, "sd": "0000AB" },
+                    "dnn": "internet",
+                    "accessType": "3GPP_ACCESS",
+                }, {
+                    // #743 follow-up: a peer that omits the mandatory sNssai.
+                    "pduSessionId": 8,
+                    "smContextRef": "smctx-relocate-740031",
                     "dnn": "internet",
                     "accessType": "3GPP_ACCESS",
                 }],
@@ -9236,7 +9563,24 @@ mod tests {
                 "application/vnd.3gpp.ngap",
                 bytes::Bytes::from_static(b"\x01\x02\x03"),
             ));
+        let default_slice = crate::context::SNssai {
+            sst: 2,
+            sd: Some(0x02_0202),
+        };
+        let saved_plmn_support = {
+            let ctx = amf_self();
+            let mut guard = ctx.write().expect("ctx lock");
+            std::mem::replace(
+                &mut guard.plmn_support,
+                vec![crate::context::PlmnSupport {
+                    plmn_id: PlmnId::new("001", "01"),
+                    num_of_s_nssai: 1,
+                    s_nssai: vec![default_slice.clone()],
+                }],
+            )
+        };
         let resp = namf_request_handler(req).await;
+        amf_self().write().expect("ctx lock").plmn_support = saved_plmn_support;
 
         assert_eq!(
             resp.status, 201,
@@ -9258,9 +9602,21 @@ mod tests {
         let sessions = ctx.read().expect("ctx lock").sess_list_for_ue(resolved.id);
         assert_eq!(
             sessions.len(),
-            1,
+            2,
             "the transferred sessionContextList must be RECORDED against the created \
              context -- the gap PR #390 named"
+        );
+        let mut sessions = sessions;
+        sessions.sort_by_key(|s| s.psi);
+        assert_eq!(
+            (
+                sessions[1].psi,
+                sessions[1].s_nssai.sst,
+                sessions[1].s_nssai.sd
+            ),
+            (8, default_slice.sst, default_slice.sd),
+            "#743 follow-up: a session without sNssai is recorded under the default S-NSSAI, \
+             not SST 0"
         );
         assert_eq!(sessions[0].psi, 7);
         assert_eq!(
@@ -9289,9 +9645,7 @@ mod tests {
     /// session lists that do not leak between the two.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_relocated_ue_never_takes_the_key_of_an_ngap_registered_ue() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         amf_context_init(64, 1024, 4096);
         let ngap_supi = "imsi-001010000600001";
         let relocated_supi = "imsi-001010000600002";
@@ -9434,9 +9788,7 @@ mod tests {
     /// accepted-and-ignored.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn relocate_ue_context_refuses_a_dangling_forward_relocation_reference() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         amf_context_init(64, 1024, 4096);
         // Distinct from the accepting sibling above.
         let supi = "imsi-001010000740031";
@@ -9481,9 +9833,7 @@ mod tests {
     /// same reason as the release test.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancel_relocate_ue_context_releases_the_relocated_context() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         // Distinct SUPI per the process-global note.
         let supi = "imsi-001010000740040";
         let _ue = setup_ue(supi, true, true);
@@ -9542,9 +9892,7 @@ mod tests {
     /// did nothing at all.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn amf_status_change_subscriptions_round_trip() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         amf_context_init(64, 1024, 4096);
 
         // URIs unique to this test: the subscription store is process-global, and the
@@ -9635,9 +9983,7 @@ mod tests {
     /// consumer-chosen ID.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn amf_status_change_subscription_validation() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         amf_context_init(64, 1024, 4096);
 
         let resp = namf_request_handler(
@@ -9691,9 +10037,7 @@ mod tests {
     /// conformant `amfStatusInfoList` carrying `AMF_UNAVAILABLE`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn planned_removal_notifies_every_amf_status_subscriber() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         amf_context_init(64, 1024, 4096);
 
         // A served GUAMI is a precondition: the notification body's `AmfStatusInfo`
@@ -9797,9 +10141,7 @@ mod tests {
     /// empty-target rejection below so the two discriminate.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_event_subscription_targeted_by_gpsi_pei_or_group_id_is_accepted() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         amf_context_init(64, 1024, 4096);
 
         // Identities unique to this test: the subscription store is process-global and
@@ -9860,9 +10202,7 @@ mod tests {
     /// lookup against real state — a SUPI cannot be converted into a GPSI.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_gpsi_subscription_resolves_to_the_known_ues_supi() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         // Distinct SUPI/GPSI pair: the resolution below is by value against the
         // process-global store.
         let supi = "imsi-001010000740510";
@@ -9952,9 +10292,7 @@ mod tests {
     /// which exists nowhere else in the fixture.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_gpsi_targeted_subscription_receives_a_notification_carrying_that_gpsi() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         // Distinct identities; the GPSI below is the assertion's subject.
         let supi = "imsi-001010000740520";
         let gpsi = "msisdn-001010000740520";
@@ -10029,9 +10367,7 @@ mod tests {
     /// `LossOfConnectivityReason` the spec defines for a timer expiry.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn loss_of_connectivity_delivers_a_notification() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         // Distinct SUPI: the delivered report is matched on it below.
         let supi = "imsi-001010000740600";
         let ue = setup_ue(supi, true, true);
@@ -10095,9 +10431,7 @@ mod tests {
     /// wrong body would fail.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn connectivity_state_and_access_type_reports_deliver_notifications() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         // Distinct SUPI from the LOSS_OF_CONNECTIVITY test.
         let supi = "imsi-001010000740610";
         let ue = setup_ue(supi, true, true);
@@ -10183,9 +10517,7 @@ mod tests {
     /// fail on the first assertion.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_tai_area_reports_in_area_for_a_ue_inside_it_and_out_for_one_outside() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         // This test's own SUPI and TAC. The TAC 0x0401 appears in no other test.
         let supi = "imsi-001010000400100";
         let mut ue = setup_ue(supi, true, true);
@@ -10312,9 +10644,7 @@ mod tests {
     /// `evaluate_presence` makes this fail.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_pra_id_without_enumerated_elements_reports_unknown() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         // Distinct SUPI and TAC from every sibling.
         let supi = "imsi-001010000400200";
         let mut ue = setup_ue(supi, true, true);
@@ -10391,9 +10721,7 @@ mod tests {
     /// turns the verdict into `OUT_OF_AREA` and this fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_ue_with_no_learned_location_reports_unknown() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         let supi = "imsi-001010000400300";
         let mut ue = setup_ue(supi, true, true);
         // Explicitly the DEFAULT TAI: `setup_ue` sets tac 100, so this reverts it to the
@@ -10480,9 +10808,7 @@ mod tests {
     /// check makes the first assertion read `OUT_OF_AREA`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_ncgi_area_reports_unknown_for_a_ue_whose_cell_was_never_learned() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         let supi = "imsi-001010000400400";
         let mut ue = setup_ue(supi, true, true);
         ue.nr_tai.plmn_id = PlmnId::new("001", "01");
@@ -10588,9 +10914,7 @@ mod tests {
     /// arrives.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unchanged_presence_state_is_not_notified_again() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         let supi = "imsi-001010000400500";
         let mut ue = setup_ue(supi, true, true);
         ue.nr_tai.plmn_id = PlmnId::new("001", "01");
@@ -10691,9 +11015,7 @@ mod tests {
     /// fail; routing through `fire_ue_event` makes the SUPI assertion fail.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ues_in_area_counts_only_the_ues_inside_the_area_and_names_none_of_them() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         // `setup_ue` calls `amf_context_init`, which CLEARS the store — so it must be
         // called for the first UE before the others are published, and the count below
         // is over exactly these three.
@@ -10763,10 +11085,20 @@ mod tests {
         );
 
         fire_ues_in_area_report();
-        let (_, body) = tokio::time::timeout(Duration::from_secs(3), rx.recv())
-            .await
-            .expect("UES_IN_AREA_REPORT must produce a notification")
-            .expect("channel closed");
+        // #867: the capture server listens on a port other tests' subscriptions may
+        // have named before, and the store of subscriptions is process-wide; only
+        // this subscription's notification is this test's.
+        let body = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let (uri, body) = rx.recv().await.expect("channel closed");
+                if uri == "/notify/400-count" {
+                    return body;
+                }
+                eprintln!("#867: ignored a request for {uri} on this test's capture port");
+            }
+        })
+        .await
+        .expect("UES_IN_AREA_REPORT must produce a notification");
         let v: Value = serde_json::from_str(&body).expect("JSON");
         let report = &v["reportList"][0];
         assert_eq!(report["type"].as_str(), Some("UES_IN_AREA_REPORT"));
@@ -10813,9 +11145,7 @@ mod tests {
     /// dropping its `anyUe`, makes this fail.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_empty_any_ue_area_reports_the_note_3_shape() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         // A fresh context with NO UE at all, which is the "no UE is IN the AOI" case in
         // its purest form.
         crate::context::amf_context_init(64, 1024, 4096);
@@ -10893,9 +11223,7 @@ mod tests {
     /// `areaList`, and the assertion fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unevaluable_area_alternative_is_accepted_and_reported_unknown() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         let supi = "imsi-001010000400800";
         let mut ue = setup_ue(supi, true, true);
         ue.nr_tai.plmn_id = PlmnId::new("001", "01");
@@ -10994,9 +11322,7 @@ mod tests {
     /// the test fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_malformed_tac_does_not_become_a_wildcard_area() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         let supi = "imsi-001010000400900";
         let mut ue = setup_ue(supi, true, true);
         // A REAL learned location, so `ue_tai_is_known` cannot shadow the guard under
@@ -11084,9 +11410,7 @@ mod tests {
     /// leaves `areas` empty, no notification is sent, and the recv times out.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_mpra_presence_info_list_map_form_is_parsed_and_keyed_by_its_pra_id() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         let supi = "imsi-001010000401000";
         let mut ue = setup_ue(supi, true, true);
         ue.nr_tai.plmn_id = PlmnId::new("001", "01");
@@ -11164,9 +11488,7 @@ mod tests {
     /// makes the second assertion fail.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_subscription_echoes_its_areas_without_a_presence_state() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         let supi = "imsi-001010000401100";
         setup_ue(supi, true, true);
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -11254,9 +11576,7 @@ mod tests {
     /// claimed `true`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn provide_location_info_is_routed_and_reports_the_last_known_location() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         // Distinct SUPI; the cell id below is this test's own.
         let supi = "imsi-001010000740700";
         let mut ue = setup_ue(supi, true, true);
@@ -11331,9 +11651,7 @@ mod tests {
     /// no LMF in this fixture, that path is the one that must still answer 204.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancel_location_is_routed_and_drops_the_lcs_correlation() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         // Distinct SUPI; the correlation below is keyed on it.
         let supi = "imsi-001010000740710";
         let _ue = setup_ue(supi, true, true);
@@ -11424,9 +11742,7 @@ mod tests {
     /// handler that skipped the round trip cannot produce it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn provide_positioning_info_drives_the_lmf_and_returns_its_position() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         // Distinct SUPI; the latitude below is this test's marker value.
         let supi = "imsi-001010000740720";
         let mut ue = setup_ue(supi, true, true);
@@ -11558,9 +11874,7 @@ mod tests {
     /// the same path.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn provide_positioning_info_falls_back_to_the_ngap_cell_without_an_lmf() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         // Distinct SUPI and cell from the LMF-driven sibling.
         let supi = "imsi-001010000740730";
         let mut ue = setup_ue(supi, true, true);
@@ -11662,9 +11976,7 @@ mod tests {
     /// RESOURCE_URI_STRUCTURE_NOT_FOUND.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_pws_warning_transfer_is_routed_enqueued_and_echoed() {
-        let _ctx = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         let _serial = super::pws_queue_test_lock().lock().await;
         amf_context_init(64, 1024, 4096);
 
@@ -11733,9 +12045,7 @@ mod tests {
     /// (§5.2.2.4.1.3, `29518-k00.txt:4176-4181`), not a stub.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn send_ran_response_without_a_subscription_reports_n2_pws_sub_miss_ind() {
-        let _ctx = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         let _serial = super::pws_queue_test_lock().lock().await;
         amf_context_init(64, 1024, 4096);
 
@@ -11765,9 +12075,7 @@ mod tests {
     /// Indication from the gNB that the CBCF never sees.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_non_amf_initiated_pws_container_is_refused_rather_than_relayed() {
-        let _ctx = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         let _serial = super::pws_queue_test_lock().lock().await;
         amf_context_init(64, 1024, 4096);
 
@@ -11812,9 +12120,7 @@ mod tests {
     /// AMF would forward arbitrary bytes to every served gNB.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_undecodable_pws_container_is_refused() {
-        let _ctx = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         let _serial = super::pws_queue_test_lock().lock().await;
         amf_context_init(64, 1024, 4096);
 
@@ -11838,9 +12144,7 @@ mod tests {
     /// make the AMF lie in both directions at once.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mismatched_identifiers_between_json_and_container_are_refused() {
-        let _ctx = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         let _serial = super::pws_queue_test_lock().lock().await;
         amf_context_init(64, 1024, 4096);
 
@@ -11860,24 +12164,21 @@ mod tests {
         assert!(pending.is_empty());
     }
 
-    /// A non-PWS `n2InformationClass` is refused rather than answered 200. The
-    /// other classes this operation carries (NRPPa, RAN, TSS) each need their own
-    /// transport; a 200 for them would claim a transfer that never happened.
+    /// A class with no transport here is refused rather than answered 200. RAN and
+    /// TSS each need their own transport (NRPPa has one since #807); a 200 for them
+    /// would claim a transfer that never happened.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_non_pws_information_class_is_not_served_here() {
-        let _ctx = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         let _serial = super::pws_queue_test_lock().lock().await;
         amf_context_init(64, 1024, 4096);
 
         let resp = namf_request_handler(pws_transfer_request(
             json!({
                 "n2Information": {
-                    "n2InformationClass": "NRPPa",
-                    "nrppaInfo": {
-                        "nfId": "6396",
-                        "nrppaPdu": { "ngapData": { "contentId": "pws-container" } }
+                    "n2InformationClass": "RAN",
+                    "ranInfo": {
+                        "n2InfoContent": { "ngapData": { "contentId": "pws-container" } }
                     }
                 }
             }),
@@ -11898,9 +12199,7 @@ mod tests {
     /// MANDATORY_IE_MISSING, not defaulted.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn missing_mandatory_pws_members_are_rejected() {
-        let _ctx = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         let _serial = super::pws_queue_test_lock().lock().await;
         amf_context_init(64, 1024, 4096);
 
@@ -11952,9 +12251,7 @@ mod tests {
     /// decimal parse here would silently target the wrong nodes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn targeting_selectors_survive_the_json_boundary() {
-        let _ctx = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         let _serial = super::pws_queue_test_lock().lock().await;
         amf_context_init(64, 1024, 4096);
 
@@ -11999,9 +12296,7 @@ mod tests {
     /// it as absent would broadcast to every RAT the consumer meant to exclude.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unknown_rat_selector_is_refused() {
-        let _ctx = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         let _serial = super::pws_queue_test_lock().lock().await;
         amf_context_init(64, 1024, 4096);
 
@@ -12025,9 +12320,7 @@ mod tests {
     /// `ngapMessageType` is 32 — not hardcoded 51.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_pws_cancel_container_relays_and_echoes_procedure_32() {
-        let _ctx = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         let _serial = super::pws_queue_test_lock().lock().await;
         amf_context_init(64, 1024, 4096);
 
@@ -12091,6 +12384,162 @@ mod tests {
         }
     }
 
+    fn non_ue_nrppa_transfer(body: Value) -> SbiRequest {
+        SbiRequest::post("/namf-comm/v1/non-ue-n2-messages/transfer")
+            .with_json_body(&body)
+            .expect("json")
+            .with_part(SbiPart::with_content(
+                "nrppa-non-ue",
+                "application/vnd.3gpp.ngap",
+                vec![0x00, 0x0b, 0x00, 0x00, 0x05, 0x00].into(),
+            ))
+    }
+
+    /// #807, TS 29.518 §5.2.2.4.1.2: an NRPPa NonUeN2MessageTransfer names its NG
+    /// RAN nodes and the LMF's nfId. It is queued for those nodes with the nfId
+    /// as the NGAP Routing ID, and answered N2_INFO_TRANSFER_INITIATED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_non_ue_nrppa_transfer_is_queued_for_the_named_nodes() {
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        let _serial = super::non_ue_nrppa_queue_test_lock().lock().await;
+        amf_context_init(64, 1024, 4096);
+        let ctx = crate::context::amf_self();
+        let _ = ctx.read().unwrap().non_ue_nrppa_drain();
+
+        let body = |nodes: Option<Value>, nf_id: Option<&str>| {
+            let mut nrppa = json!({
+                "nrppaPdu": { "ngapIeType": "NRPPA_PDU", "ngapData": { "contentId": "nrppa-non-ue" } }
+            });
+            if let Some(id) = nf_id {
+                nrppa["nfId"] = json!(id);
+            }
+            let mut b = json!({
+                "n2Information": { "n2InformationClass": "NRPPa", "nrppaInfo": nrppa }
+            });
+            if let Some(n) = nodes {
+                b["globalRanNodeList"] = n;
+            }
+            b
+        };
+        let nodes = json!([
+            { "plmnId": { "mcc": "001", "mnc": "01" }, "gNbId": { "bitLength": 22, "gNBValue": "000807" } }
+        ]);
+
+        let resp = namf_request_handler(non_ue_nrppa_transfer(body(
+            Some(nodes.clone()),
+            Some("lmf-807"),
+        )))
+        .await;
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        let v: Value = serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(v["result"], "N2_INFO_TRANSFER_INITIATED");
+        let queued = ctx.read().unwrap().non_ue_nrppa_drain();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].routing_id, b"lmf-807");
+        assert_eq!(queued[0].target_gnb_ids, vec![0x807]);
+        assert_eq!(
+            queued[0].nrppa_pdu,
+            vec![0x00, 0x0b, 0x00, 0x00, 0x05, 0x00]
+        );
+
+        // The node list and the nfId are both required by §5.2.2.4.1.2.
+        for b in [body(None, Some("lmf-807")), body(Some(nodes), None)] {
+            let resp = namf_request_handler(non_ue_nrppa_transfer(b)).await;
+            assert_eq!(resp.status, 400);
+        }
+        assert!(ctx.read().unwrap().non_ue_nrppa_drain().is_empty());
+    }
+
+    /// #807: an LMF can subscribe to the NRPPa class, and its subscription is found
+    /// by its nfId (the Routing ID its answers come back with), never by another
+    /// LMF's, and never through the PWS umbrella class.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_non_ue_nrppa_subscription_is_found_by_its_nf_id() {
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        amf_context_init(64, 1024, 4096);
+        let resp = namf_request_handler(non_ue_n2_subscribe_request(json!({
+            "n2InformationClass": "NRPPa",
+            "n2NotifyCallbackUri": "http://127.0.0.1:19807/nlmf-loc/v1/notify/n2",
+            "nfId": "lmf-sub-807",
+        })))
+        .await;
+        assert_eq!(resp.status, 201);
+        let v: Value = serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let id = v["n2NotifySubscriptionId"].as_str().unwrap().to_string();
+        let ctx = crate::context::amf_self();
+        {
+            let g = ctx.read().unwrap();
+            assert_eq!(
+                g.non_ue_nrppa_subscription_find(Some("lmf-sub-807"))
+                    .map(|s| s.subscription_id),
+                Some(id.clone())
+            );
+            assert!(
+                g.non_ue_nrppa_subscription_find(Some("another-lmf"))
+                    .is_none(),
+                "another LMF's answers never go to this subscription"
+            );
+            assert!(
+                g.non_ue_n2_subscription_find_by_class("PWS-BCAL", Some("lmf-sub-807"))
+                    .is_none(),
+                "an NRPPa subscription is not a PWS one"
+            );
+            g.non_ue_n2_subscription_remove(&id);
+        }
+        // #903 review: a subscription that named no nfId does not receive an
+        // answer that names its LMF; it may belong to another consumer.
+        let resp = namf_request_handler(non_ue_n2_subscribe_request(json!({
+            "n2InformationClass": "NRPPa",
+            "n2NotifyCallbackUri": "http://127.0.0.1:19808/nlmf-loc/v1/notify/n2",
+        })))
+        .await;
+        assert_eq!(resp.status, 201);
+        let v: Value = serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let anon = v["n2NotifySubscriptionId"].as_str().unwrap().to_string();
+        let g = ctx.read().unwrap();
+        assert!(g
+            .non_ue_nrppa_subscription_find(Some("lmf-sub-807"))
+            .is_none());
+        assert_eq!(
+            g.non_ue_nrppa_subscription_find(None)
+                .map(|s| s.subscription_id),
+            Some(anon.clone())
+        );
+        g.non_ue_n2_subscription_remove(&anon);
+    }
+
+    /// #903 review: the non-UE NRPPa queue is bounded; a transfer past it is
+    /// refused 500 INSUFFICIENT_RESOURCES, not queued.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_full_non_ue_nrppa_queue_refuses_the_transfer() {
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        let _serial = super::non_ue_nrppa_queue_test_lock().lock().await;
+        amf_context_init(64, 1024, 4096);
+        let ctx = crate::context::amf_self();
+        {
+            let g = ctx.read().unwrap();
+            let _ = g.non_ue_nrppa_drain();
+            for _ in 0..crate::context::MAX_PENDING_NON_UE_NRPPA {
+                assert!(g.non_ue_nrppa_add(crate::context::PendingNonUeNrppa {
+                    nrppa_pdu: vec![0],
+                    routing_id: b"x".to_vec(),
+                    target_gnb_ids: vec![1],
+                }));
+            }
+        }
+        let resp = namf_request_handler(non_ue_nrppa_transfer(json!({
+            "globalRanNodeList": [{ "plmnId": { "mcc": "001", "mnc": "01" },
+                "gNbId": { "bitLength": 22, "gNBValue": "000807" } }],
+            "n2Information": { "n2InformationClass": "NRPPa", "nrppaInfo": {
+                "nfId": "lmf-807",
+                "nrppaPdu": { "ngapIeType": "NRPPA_PDU", "ngapData": { "contentId": "nrppa-non-ue" } } } }
+        })))
+        .await;
+        assert_eq!(resp.status, 500);
+        let drained = ctx.read().unwrap().non_ue_nrppa_drain();
+        assert_eq!(drained.len(), crate::context::MAX_PENDING_NON_UE_NRPPA);
+    }
+
     fn non_ue_n2_subscribe_request(body: Value) -> SbiRequest {
         SbiRequest::post("/namf-comm/v1/non-ue-n2-messages/subscriptions")
             .with_json_body(&body)
@@ -12109,9 +12558,7 @@ mod tests {
     /// AMF serving an endpoint no conformant CBCF calls.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn non_ue_n2_info_subscribe_is_routed_at_the_spec_uri_and_returns_a_location() {
-        let _ctx = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         amf_context_init(64, 1024, 4096);
         clear_non_ue_n2_subscriptions();
 
@@ -12202,9 +12649,7 @@ mod tests {
     /// subscription that silently never fires.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn non_ue_n2_info_subscribe_rejects_half_pairs_and_unservable_classes() {
-        let _ctx = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         amf_context_init(64, 1024, 4096);
         clear_non_ue_n2_subscriptions();
 
@@ -12230,10 +12675,9 @@ mod tests {
         .await;
         assert_eq!(resp.status, 400);
 
-        // A class with no producer here. NRPPa in particular is already served by
-        // the per-UE `n1-n2-messages/subscriptions` registry, so accepting it would
-        // store a second subscription nothing reads.
-        for class in ["NRPPa", "SM", "TSS", "RAN"] {
+        // A class with no producer here. (NRPPa is served since #807: the uplink
+        // non-UE NRPPa relay reads it.)
+        for class in ["SM", "TSS", "RAN"] {
             let resp = namf_request_handler(non_ue_n2_subscribe_request(json!({
                 "n2InformationClass": class,
                 "n2NotifyCallbackUri": "http://127.0.0.1:19399/x",
@@ -12287,9 +12731,7 @@ mod tests {
     /// the `CONTEXT_NOT_FOUND` the per-UE unsubscribe uses.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn non_ue_n2_info_unsubscribe_removes_it_and_is_404_the_second_time() {
-        let _ctx = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         amf_context_init(64, 1024, 4096);
         clear_non_ue_n2_subscriptions();
 
@@ -12337,9 +12779,7 @@ mod tests {
     /// The umbrella `PWS` does answer for both.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_two_specific_pws_classes_do_not_answer_for_each_other() {
-        let _ctx = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         amf_context_init(64, 1024, 4096);
         clear_non_ue_n2_subscriptions();
 
@@ -12408,9 +12848,7 @@ mod tests {
     /// N2 information subscription" would needlessly tear down a live one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn n2_pws_sub_miss_ind_is_suppressed_once_a_pws_subscription_exists() {
-        let _ctx = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         let _serial = super::pws_queue_test_lock().lock().await;
         amf_context_init(64, 1024, 4096);
         clear_non_ue_n2_subscriptions();
@@ -12477,7 +12915,7 @@ mod tests {
         // anonymous subscriptions, and going through the router also proves the
         // subscription an `nfId` created is removable.
         assert_eq!(
-            namf_request_handler(SbiRequest::delete(&format!(
+            namf_request_handler(SbiRequest::delete(format!(
                 "/namf-comm/v1/non-ue-n2-messages/subscriptions/{sub_id}"
             )))
             .await
@@ -12493,9 +12931,7 @@ mod tests {
     /// gate §5.2.2.4.4.3 item 1 requires.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_transfer_without_send_ran_response_records_nothing_to_notify() {
-        let _ctx = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         let _serial = super::pws_queue_test_lock().lock().await;
         amf_context_init(64, 1024, 4096);
 
@@ -12531,9 +12967,7 @@ mod tests {
     /// `N2InformationNotification`, so it cannot ride the async notify either.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unknown_tai_list_reports_tais_this_amf_does_not_serve_on_the_cancel_branch() {
-        let _ctx = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         let _serial = super::pws_queue_test_lock().lock().await;
         amf_context_init(64, 1024, 4096);
 
@@ -12832,9 +13266,7 @@ mod tests {
     /// ... the `eventNotifyUri`"* — rather than merely that something was delivered.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_ue_context_takes_over_subscriptions_and_fires_subscription_id_change() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         amf_context_init(64, 1024, 4096);
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
 
@@ -12994,9 +13426,7 @@ mod tests {
     /// `notifyCorrelationId` instead — the exact inverse of the sibling.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_transferred_group_subscription_reports_subscription_id_addition() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         amf_context_init(64, 1024, 4096);
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
 
@@ -13070,9 +13500,7 @@ mod tests {
     /// to learn that.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_subscription_round_trips_its_subs_change_callback_and_refuses_a_bad_uri() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         amf_context_init(64, 1024, 4096);
         let supi = "imsi-001010000397800";
 

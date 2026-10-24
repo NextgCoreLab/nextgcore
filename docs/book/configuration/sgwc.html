@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-c2411517.js";
+            window.path_to_searchindex_js = "../searchindex-df495bb2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -279,7 +279,7 @@ sgwc:
 <p><strong>No NRF, no session store.</strong> As an EPC NF the SGW-C has no SBI server and performs no NRF registration or heartbeat; UE/session/bearer/tunnel state is in-memory and lost on restart. Only the restart counter is persisted (<code>SGWC_RESTART_COUNTER_FILE</code>).</p>
 </li>
 <li>
-<p><strong><code>RUST_LOG</code> is ignored.</strong> Logging is initialized via <code>env_logger::Builder::new().filter_level(...)</code> without env parsing, so the <code>RUST_LOG=info</code> set by the Docker compose files has no effect on this daemon; use <code>-l/--log-level</code>.</p>
+<p><strong><code>RUST_LOG</code> overrides <code>-l/--log-level</code></strong> when set, as in every NF.</p>
 </li>
 </ul>
 

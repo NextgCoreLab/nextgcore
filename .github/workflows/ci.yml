@@ -106,7 +106,11 @@ jobs:
         # being unbound is the point, plus one integration test that hands ports to
         # a child PROCESS and so cannot pass a socket at all.
         #
-        # So a red here is a real failure. Read it, do not re-run it.
+        # So a red here is a real failure. Read it, do not re-run it. One kind
+        # names its own cause: a test binary killed by SIGABRT with "TEST ISOLATION
+        # VIOLATION (#723)" on stderr is a test that reached guarded process-global
+        # state without its test lock (see smfd `context::require_test_lock`). Fix
+        # the named test's locks. The code under test is not what failed.
         #
         # A background sampler records peak used RAM and swap, which the "Peak
         # memory" step prints. A shrinking margin then shows up as a number
@@ -124,8 +128,10 @@ jobs:
         # timer map) can name a test that forgot PROCESS_STATE_TEST_LOCK /
         # N4_TEST_LOCK only when no sibling holds the lock, i.e. in a serial run.
         # The parallel run above cannot see such a test until it flakes a
-        # sibling. Reuses the build above; about 20 s.
-        run: cd src && cargo test -p nextgcore-smfd -- --test-threads=1
+        # sibling. `--workspace --bin` keeps the workspace's feature unification,
+        # so this reuses the build above instead of rebuilding smfd's dependency
+        # graph with `-p`'s features; about 20 s.
+        run: cd src && cargo test --workspace --bin nextgcore-smfd -- --test-threads=1
 
       - name: cargo test (non-default features)
         # Feature-gated paths are invisible to the default build, so a gated
@@ -155,15 +161,15 @@ jobs:
         with:
           workspaces: src
       - name: cargo clippy
-        # Pre-existing codebase has many style lints from Rust 1.95.
-        # Gate on errors only; warnings shown but don't fail CI until the
-        # tail is cleaned up incrementally. See Phase 8 follow-ups.
-        run: cd src && cargo clippy --workspace
+        # #643: the workspace is warning-clean across all targets (tests
+        # included), so any new warning fails the build. Test-serialisation
+        # locks that are held across `.await` are tokio mutexes, not std ones.
+        run: cd src && cargo clippy --workspace --all-targets -- -D warnings
 
       - name: cargo clippy (non-default features)
         # Same reasoning as the test job's non-default step: a gated module is
         # invisible to a default-feature lint. One line per gated feature.
-        run: cd src && cargo clippy -p nextgcore-easdfd --features dns-udp --all-targets
+        run: cd src && cargo clippy -p nextgcore-easdfd --features dns-udp --all-targets -- -D warnings
 
   fmt:
     name: Format
@@ -175,6 +181,36 @@ jobs:
           components: rustfmt
       - name: cargo fmt
         run: cd src && cargo fmt --all -- --check
+
+      - name: webui session key fails closed; bind defaults to loopback
+        # #913: the provisioning UI refuses to start without a real SECRET_KEY;
+        # #850: it listens on 127.0.0.1 unless WEBUI_BIND_ADDR says otherwise.
+        # These pin both checks without installing the UI's dependencies.
+        run: |
+          node webui/server/lib/session-key.check.js
+          node webui/server/lib/bind-address.check.js
+
+  helm:
+    # #753 review: `helm lint` reports a template `fail` only at [INFO] and exits
+    # 0, so it cannot catch the chart's refusal of amf.replicas > 1. The render
+    # is checked with `helm template`, both ways.
+    name: Helm chart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: helm lint
+        run: helm lint deploy/helm/nextgcore --set global.siteId=ci
+      - name: helm template renders
+        run: helm template t deploy/helm/nextgcore --set global.siteId=ci > /dev/null
+      - name: helm template refuses amf.replicas=2
+        run: |
+          if out=$(helm template t deploy/helm/nextgcore --set global.siteId=ci \
+              --set amf.replicas=2 2>&1); then
+            echo "amf.replicas=2 rendered; it must fail (#753)"; exit 1
+          fi
+          echo "$out" | grep -q 'amf.replicas > 1 is not supported' \
+            || { echo "failed for another reason: $out"; exit 1; }
 
   fuzz-build:
     name: Fuzz targets build
@@ -365,6 +401,10 @@ jobs:
     name: Docker E2E
     runs-on: ubuntu-latest
     needs: docker-build
+    env:
+      # docker-compose.yml fails fast without it (#837): no Grafana credential
+      # is committed. A per-run throwaway value; Grafana is not started here.
+      GRAFANA_ADMIN_PASSWORD: ci-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Checkout nextgcore
         uses: actions/checkout@v4

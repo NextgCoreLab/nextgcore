@@ -22,7 +22,7 @@ There are two cooperating layers.
 **1. Per-NF binary (clap).** Each NF binary (e.g. `nextgcore-amfd`) parses CLI args and loads its YAML with `serde_yaml`. From `src/bins/nextgcore-amfd/src/lib.rs`:
 
 - `-c / --config <path>` — config file, default `/etc/nextgcore/amf.yaml`
-- `--log-level <level>` — `trace|debug|info|warn|error`, default `info`. The short form is `-l` in amfd, mmed, sgwcd and sgwud; most other NFs follow Open5GS and use `-e` for the level and `-l` for `--log-file`. smfd has no log-level flag (it reads `RUST_LOG`, default `info`). Run `<binary> --help` for the rest of an NF's flags
+- `--log-level <level>` — `trace|debug|info|warn|error`. Without it, the config file's `logger.level`, else `info`. The short form is `-l` in amfd, mmed, sgwcd and sgwud; most other NFs, smfd included, follow Open5GS and use `-e` for the level and `-l` for `--log-file`. Run `<binary> --help` for the rest of an NF's flags
 - `--ngap-addr` (AMF only) — NGAP bind address, default `0.0.0.0:38412`
 - `--sctp-backend` (AMF only) — `userspace` (default, sctp-proto over UDP) or `kernel` (Linux kernel SCTP, needs the `kernel-sctp` build feature)
 
@@ -41,7 +41,7 @@ logger:
   level: info
 ```
 
-`--log-level` works for every NF but smfd. `RUST_LOG` is honoured only by the NFs that build their logger with `env_logger::Env::default().default_filter_or(..)` (dccfd, easdfd, eesd, lmfd, mbsmfd, nefd, nsacfd, nwdafd, pind, sgwud, smfd, tsctsf, ucmfd). The other fifteen (amfd, ausfd, bsfd, hssd, mmed, nrfd, nssfd, pcfd, pcrfd, scpd, seppd, sgwcd, udmd, udrd, upfd) ignore it; tracked in [#691](https://github.com/NextgCoreLab/nextgcore/issues/691).
+Every NF picks its level the same way (#691): `RUST_LOG`, when set and not blank, is the filter; otherwise `--log-level` when given, else the config file's `logger.level`, else `info` (`nextgcore_core::log::nf_log_level`). An unknown value means `info`; the C configs' `fatal` and `none` mean `error` and `off`. The logger is built with `nextgcore_core::log::nf_log_builder`.
 
 ### `global`
 
@@ -70,7 +70,7 @@ Common sub-blocks seen in the Docker configs:
 
 | Variable | Effect | Source |
 |---|---|---|
-| `RUST_LOG` | Overrides the log level in the thirteen NFs listed under `logger` above | `init.rs`, NF `main.rs` |
+| `RUST_LOG` | Overrides `--log-level` and `logger.level` in every NF (env_logger filter syntax) | `nextgcore_core::log::nf_log_builder` |
 | `DB_URI` | Overrides the YAML `db_uri` (MongoDB) | `init.rs` stage 4 |
 | `<NF>_SBI_ADDR` / `<NF>_SBI_PORT` | SBI bind address/port (e.g. `AMF_SBI_ADDR`, `UDM_SBI_PORT`); defaults `127.0.0.1:7777` | each NF `lib.rs` |
 | `NRF_URI`, `PCF_URI`, `NSACF_URI` | Peer NF discovery URIs | NF binaries |
@@ -223,6 +223,18 @@ this repo's `udmd` serves from the UDR's identity data (it answered `501` before
 | `tls.enabled` | `false` | Docker YAMLs |
 | `nas.use_nextgcore_security` (AMF) | `false` | amf.yaml / amfd |
 | Max PLMNs / slices / sessions / bearers | 6 / 8 / 4 / 4 | `config.rs` constants |
+
+## A set clock is required (PFCP NFs)
+
+`nextgcore-smfd`, `nextgcore-sgwcd`, `nextgcore-upfd`, `nextgcore-sgwud` and `nextgcore-mbsmfd` **refuse to start when the local clock reads before 2020-01-01**. They exit with an error naming the clock.
+
+Each of these NFs puts its start time in every PFCP Association Setup and Heartbeat, as the Recovery Time Stamp (TS 29.244 §8.2.65, NTP-era seconds since 1900; #995). A host without a real-time clock that boots at 1970 would advertise a 1970 start time. Peers then misjudge restarts: one is missed, or a false one releases every session. So the NFs refuse to start rather than send a wrong stamp.
+
+On a host or node that may boot without a set clock (an RTC-less board, a VM restored from a snapshot), start these NFs only after the clock is synchronised:
+
+- **systemd:** order the unit `After=time-sync.target` and `Wants=time-sync.target`, and enable a time-sync waiter such as `systemd-time-wait-sync.service` (or chrony's `chronyd-wait`).
+- **Kubernetes:** add an init container that waits for NTP sync, for example `chronyc waitsync` or polling `timedatectl show -p NTPSynchronized`. Alternatively, rely on the pod's restart policy: the NF exits, and the kubelet restarts it with back-off until the node clock is set.
+- **Docker / Compose:** `restart: unless-stopped` (or `on-failure`) retries the same way. The containers use the host clock, so synchronise the host.
 
 ## Dynamic reconfiguration
 

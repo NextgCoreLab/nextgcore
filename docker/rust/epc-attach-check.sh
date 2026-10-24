@@ -56,6 +56,12 @@ on_exit() {
 }
 trap on_exit EXIT
 
+# The idle stage (5-6) counts MME log lines; its first baseline is taken here,
+# before anything could have gone idle, so an S1 release that happens while the
+# attach steps run is still seen (#961 review).
+IDLE_RE='the UE goes ECM-IDLE'
+idle_baseline=$(docker logs "$MME" 2>&1 | grep -Ec "$IDLE_RE" || true)
+
 # 1. S1 Setup.
 wait_for "$MME" 'S1 Setup: eNB 0x[0-9a-fA-F]+ .*accepted' "S1 Setup accepted by the MME"
 
@@ -97,3 +103,107 @@ if [ -z "$ul" ] || [ -z "$dl" ] || [ "$ul" -lt "$COUNT" ] || [ "$dl" -lt "$COUNT
     exit 1
 fi
 echo "OK: PGW-U counted the ping on its TUN path (UL=${ul}, DL=${dl})"
+
+# 5-6. Idle mode (#956, TS 23.401 §5.3.5 / §5.3.4.1 / §5.3.4.3). Off until the
+#    simulator can idle an LTE UE and page it (nextgsim #350, #351): set
+#    EPC_IDLE_MODE=1 with an eNB configured for a user-inactivity release.
+#    Each step asserts a line only that step prints, never the absence of an
+#    error.
+if [ "${EPC_IDLE_MODE:-0}" = "1" ]; then
+    IDLE_TIMEOUT="${EPC_IDLE_TIMEOUT:-60}"
+    # mme_lines <regex>: how many lines of the MME log match, so a second
+    # occurrence can be told from the first.
+    mme_lines() { docker logs "$MME" 2>&1 | grep -Ec "$1" || true; }
+    wait_more() {
+        local re="$1" before="$2" what="$3" i
+        for i in $(seq 1 "$IDLE_TIMEOUT"); do
+            if [ "$(mme_lines "$re")" -gt "$before" ]; then
+                echo "OK: $what (after ${i}s)"
+                return 0
+            fi
+            sleep 1
+        done
+        echo "FAIL: $what -- no new /$re/ in $MME within ${IDLE_TIMEOUT}s"
+        return 1
+    }
+    SR_RE='SERVICE REQUEST accepted: Initial Context Setup Request'
+    UP_RE='SERVICE REQUEST user plane up; Modify Bearer Request'
+    PAGED_RE='paged on [0-9]+ eNB'
+
+    # 5. Mobile-originated: the eNB releases the idle UE (S1 release with
+    #    Release Access Bearers), then an uplink packet makes the UE send a
+    #    SERVICE REQUEST; the MME's Initial Context Setup and Modify Bearer
+    #    Request bring the user plane back, and the ping recovers.
+    # The eNB's inactivity timer runs from the attach, so the release may
+    # already have happened: count from the baseline taken before step 1. The
+    # timer must outlast steps 1-4 (EPC_IDLE_MODE needs an inactivity time
+    # longer than the attach checks take, e.g. 30 s), or step 3's first echo
+    # is the one that wakes the UE.
+    sr=$(mme_lines "$SR_RE"); up=$(mme_lines "$UP_RE")
+    wait_more "$IDLE_RE" "$idle_baseline" "S1 release: the MME took the UE to ECM-IDLE"
+    echo "Uplink from the idle UE..."
+    docker exec "$UE" lte-ue-ping-check "$TARGET" "$COUNT" || true
+    wait_more "$SR_RE" "$sr" "mobile-originated SERVICE REQUEST answered with Initial Context Setup"
+    wait_more "$UP_RE" "$up" "Serving GW given the new eNB S1-U endpoints"
+    docker exec "$UE" lte-ue-ping-check "$TARGET" "$COUNT"
+    echo "OK: ${COUNT}/${COUNT} echo replies after the mobile-originated SERVICE REQUEST"
+
+    # 6. Network-triggered: idle again, then downlink to the UE's PDN address
+    #    from the PGW-U side. The Serving GW buffers it and sends a Downlink Data
+    #    Notification, the MME pages, the UE answers with a SERVICE REQUEST, and
+    #    the user plane comes back: the buffered packets and then a fresh burst
+    #    reach the UE's TUN. Counted at the UE's TUN rather than as echo replies:
+    #    the UE container routes by default via eth0, so a reply to a
+    #    network-originated echo does not take the bearer.
+    ue_rx() { docker exec "$UE" cat /sys/class/net/lteuetun5/statistics/rx_packets; }
+    idle=$(mme_lines "$IDLE_RE"); sr=$(mme_lines "$SR_RE"); paged=$(mme_lines "$PAGED_RE")
+    wait_more "$IDLE_RE" "$idle" "S1 release again"
+    rx0=$(ue_rx)
+    echo "Downlink to the idle UE (${pdn}); UE TUN rx_packets=${rx0}..."
+    docker exec "$PGWU" ping -c 3 -W 1 "$pdn" >/dev/null 2>&1 || true
+    wait_more "$PAGED_RE" "$paged" "Downlink Data Notification paged the UE"
+    wait_more "$SR_RE" "$sr" "network-triggered SERVICE REQUEST answered with Initial Context Setup"
+    sleep 2
+    rx1=$(ue_rx)
+    if [ "$rx1" -le "$rx0" ]; then
+        echo "FAIL: no buffered downlink reached the UE after paging (rx ${rx0} -> ${rx1})"
+        exit 1
+    fi
+    echo "OK: $((rx1 - rx0)) buffered downlink packet(s) delivered after the paging"
+    docker exec "$PGWU" ping -c "$COUNT" -i 0.2 -W 1 "$pdn" >/dev/null 2>&1 || true
+    rx2=$(ue_rx)
+    if [ $((rx2 - rx1)) -lt "$COUNT" ]; then
+        echo "FAIL: ${COUNT} downlink packets sent, $((rx2 - rx1)) reached the UE"
+        exit 1
+    fi
+    echo "OK: ${COUNT}/${COUNT} downlink packets reach the UE after the network-triggered SERVICE REQUEST"
+fi
+
+# 7. Detach (#1032 review, TS 23.401 §5.3.8.2.1): the UE detaches; the MME's
+#    Delete Session Request (OI set) is relayed by the SGW-C to the PGW over
+#    S5/S8 (#1025), and the PGW's answer is what lets the SGW-U's session go.
+#    Off until the simulator can detach an LTE UE on command (nextgsim #365):
+#    set EPC_DETACH=1 once its image ships `lte-ue-detach`.
+if [ "${EPC_DETACH:-0}" = "1" ]; then
+    SGWC="${EPC_SGWC_CONTAINER:-nextgcore-sgwc}"
+    relayed_re='Delete Session Request for session [0-9]+ relayed to the PGW'
+    answered_re='S5/S8 Delete Session Response from .* cause=16'
+    relayed0=$(docker logs "$SGWC" 2>&1 | grep -Ec "$relayed_re" || true)
+    answered0=$(docker logs "$SGWC" 2>&1 | grep -Ec "$answered_re" || true)
+    echo "Detaching the UE..."
+    docker exec "$UE" lte-ue-detach
+    for i in $(seq 1 "$TIMEOUT"); do
+        relayed=$(docker logs "$SGWC" 2>&1 | grep -Ec "$relayed_re" || true)
+        answered=$(docker logs "$SGWC" 2>&1 | grep -Ec "$answered_re" || true)
+        if [ "$relayed" -gt "$relayed0" ] && [ "$answered" -gt "$answered0" ]; then
+            echo "OK: the detach's Delete Session crossed S5/S8 and the PGW accepted it (after ${i}s)"
+            break
+        fi
+        if [ "$i" -eq "$TIMEOUT" ]; then
+            echo "FAIL: no Delete Session relayed to and accepted by the PGW within ${TIMEOUT}s"
+            docker logs --tail 60 "$SGWC" 2>&1 || true
+            exit 1
+        fi
+        sleep 1
+    done
+fi

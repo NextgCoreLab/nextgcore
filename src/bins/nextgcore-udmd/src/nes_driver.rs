@@ -250,16 +250,15 @@ pub fn spawn_if_enabled(
 async fn run_nes_loop(settings: NesSettings, gauges: Arc<EnergyGauges>, actions: NrfNesActions) {
     // Live /metrics endpoint (real HTTP/1.1; acceptance criterion).
     let render_gauges = gauges.clone();
-    let metrics_addr = format!("0.0.0.0:{}", settings.metrics_port);
-    match metrics_addr.parse() {
-        Ok(addr) => {
-            if let Err(e) =
-                serve_metrics(addr, Arc::new(move || render_gauges.render_prometheus())).await
-            {
-                log::warn!("NES metrics endpoint failed to bind {metrics_addr}: {e}");
-            }
-        }
-        Err(e) => log::warn!("NES metrics address invalid ({metrics_addr}): {e}"),
+    // Loopback unless NEXTGCORE_METRICS_BIND says otherwise (#837).
+    let metrics_addr = nextgcore_metrics::nes_energy::metrics_bind_addr(settings.metrics_port);
+    if let Err(e) = serve_metrics(
+        metrics_addr,
+        Arc::new(move || render_gauges.render_prometheus()),
+    )
+    .await
+    {
+        log::warn!("NES metrics endpoint failed to bind {metrics_addr}: {e}");
     }
 
     let config = NesConfig {

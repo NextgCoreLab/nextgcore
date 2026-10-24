@@ -26,8 +26,10 @@ pub mod ngap_handler;
 pub mod ngap_mcast; // MBS: NGAP multicast session procedures (TS 38.413 / TS 23.247)
 pub mod ngap_path;
 pub mod ngap_sm;
+pub mod nrf_subscription; // #668: NF status subscriptions at the NRF (TS 29.510 §5.2.2.5)
 pub mod positioning; // LCS: LMF positioning relay (NRPPa N2 / LPP N1) — TS 23.273
 pub mod racs; // #570: RACS on the AMF (TS 23.501 §5.4.4.1a, TS 29.673)
+pub(crate) mod sbi_offload; // #796: SBI work off the NGAP task
 pub mod sbi_path;
 pub mod snpn; // Rel-16: SNPN authentication (TS 23.501 §5.30)
 pub mod timer;
@@ -47,19 +49,35 @@ pub use namf_server::{handle_n1_n2_message_transfer_request, namf_request_handle
 /// boundaries; a dev-dependency test in a peer crate must be able to seed the
 /// process-global AMF context.
 pub mod test_support {
-    use std::sync::Mutex;
+    // tokio mutexes (#643): the async tests hold these across `.await`, which a
+    // std guard must not do (`clippy::await_holding_lock`). Sync tests take them
+    // with `blocking_lock()`, async ones with `.lock().await`; a tokio mutex
+    // does not poison, so no test inherits a sibling's panic.
+    use tokio::sync::Mutex;
 
     /// Process-wide lock so strict-peer tests that touch the global AMF context
     /// run serially. The AMF context is process-global, so parallel tests would
     /// race (cf. the known-flaky `namf_server::tests::
     /// test_ue_context_transfer_error_paths`).
-    pub static CONTEXT_GUARD: Mutex<()> = Mutex::new(());
+    pub static CONTEXT_GUARD: Mutex<()> = Mutex::const_new(());
 
     /// Serialises tests that set the SMF endpoint environment variables
     /// (`SMF_SBI_ADDR` / `SMF_SBI_PORT`). The process environment is global, so the
     /// lock lives here beside the other shared-state guards rather than in one
     /// module's `mod tests`.
-    pub static SMF_ENV_LOCK: Mutex<()> = Mutex::new(());
+    pub static SMF_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    /// Serialises tests that drain the process-global connected-UE downlink queue
+    /// (`AmfContext::connected_downlink_queue`, drained by
+    /// `NgapServer::process_connected_downlinks`). A drain takes EVERY queued item,
+    /// so two such tests in parallel steal each other's transfers. A tokio mutex,
+    /// because the guard is held across the drain's `.await`s.
+    pub static CONNECTED_DOWNLINK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Serialises tests that set the UCMF endpoint environment variables
+    /// (`UCMF_SBI_ADDR` / `UCMF_SBI_PORT`), for the same reason as
+    /// [`SMF_ENV_LOCK`].
+    pub static UCMF_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Initialize the process-global AMF context for in-process strict-peer
     /// tests (wraps [`crate::context::amf_context_init`] with test capacities).
@@ -315,9 +333,10 @@ struct Args {
     #[arg(short, long, default_value = "/etc/nextgcore/amf.yaml")]
     config: String,
 
-    /// Log level (trace, debug, info, warn, error)
-    #[arg(short, long, default_value = "info")]
-    log_level: String,
+    /// Log level (trace, debug, info, warn, error). Without it, the config
+    /// file's `logger.level`, else `info`; `RUST_LOG` overrides (#691).
+    #[arg(short, long)]
+    log_level: Option<String>,
 
     /// Disable color output
     #[arg(long)]
@@ -853,13 +872,17 @@ impl AmfApp {
         // handing this profile to consumers instead of waiting out its
         // supervision timer. Only the async path can do it — the sync
         // `shutdown()` above cannot await, and has no caller.
+        // #668: NFStatusUnsubscribe before NFDeregister, bounded.
+        nrf_subscription::shutdown().await;
+
         nextgcore_sbi::heartbeat::deregister_self().await;
 
         // Close NGAP
         ngap_path::amf_ngap_close().await;
 
-        // Close SBI
-        sbi_path::amf_sbi_close();
+        // Close SBI, awaited (#673): the teardown is complete before the context
+        // is finalised.
+        sbi_path::amf_sbi_close_async().await;
 
         // Finalize AMF context
         context::amf_context_final();
@@ -900,19 +923,12 @@ pub async fn run() -> Result<()> {
     let args = Args::parse();
 
     // Initialize logging
-    let log_level = match args.log_level.to_lowercase().as_str() {
-        "trace" => log::LevelFilter::Trace,
-        "debug" => log::LevelFilter::Debug,
-        "info" => log::LevelFilter::Info,
-        "warn" => log::LevelFilter::Warn,
-        "error" => log::LevelFilter::Error,
-        _ => log::LevelFilter::Info,
-    };
-
-    env_logger::Builder::new()
-        .filter_level(log_level)
-        .format_timestamp_millis()
-        .init();
+    // RUST_LOG if set, else --log-level: the same for every NF (#691).
+    nextgcore_core::log::nf_log_builder(&nextgcore_core::log::nf_log_level(
+        args.log_level.as_deref(),
+        Some(&args.config),
+    ))
+    .init();
 
     log::info!("NextGCore AMF v{}", env!("CARGO_PKG_VERSION"));
     log::info!("Configuration: {}", args.config);
@@ -1072,6 +1088,13 @@ pub async fn run() -> Result<()> {
         }
     }
 
+    // #668: subscribe at the NRF to status changes of every NF type the
+    // discovery cache holds, and keep the subscriptions renewed, so a
+    // deregistered or moved peer is dropped from the cache when the NRF says
+    // so instead of on the first failed request. Its own task: a slow or
+    // blackholed NRF delays nothing else.
+    let _nrf_status_maintainer = nrf_subscription::spawn_maintainer(amf_nf_instance_id.clone());
+
     // #664: a request that cannot reach a cached peer re-discovers through this
     // and is resent once, instead of failing the UE's procedure.
     sbi_path::register_rediscovery_hook();
@@ -1184,11 +1207,9 @@ mod tests {
         // The posture is process-global; take the lock declared beside it in `emergency.rs`,
         // which also resets it to the shipped default so this test is not reading a
         // predecessor's value.
-        let _policy = crate::emergency::emergency_policy_test_guard();
+        let _policy = crate::emergency::emergency_policy_test_guard().await;
         // ...and the context guard, because `load_config` writes the global AmfContext too.
-        let _ctx = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         // The env override outranks the YAML, so it must be clear for the YAML to be what is
         // under test here. Its precedence is covered by `EmergencyPolicy::resolve`'s own test.
         std::env::remove_var("AMF_EMERGENCY_ALLOW_UNAUTHENTICATED");
@@ -1303,9 +1324,7 @@ amf:
         // dance cannot defend against that on its own, so hold the one lock that
         // serialises global-context tests. Observed as roughly 1 workspace run in 4
         // once #341 gave `fini` more state to clear.
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
 
         // The loader PUSHES onto these vectors, so the restore truncates to the saved
         // lengths rather than cloning the elements.

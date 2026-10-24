@@ -13,8 +13,11 @@ use crate::n4_build::{
     ParsedCreateFar, ParsedCreatePdr, ParsedCreateQer, ParsedCreateUrr, ParsedFSeid, ParsedIe,
     ParsedPfcpHeader, PfcpCause, ReportType, UserPlaneReport,
 };
+use nextgcore_pfcp::peer_policy::{
+    is_request_type, is_response_type, same_host, PeerAllowlist, RefusalLog,
+};
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -350,10 +353,8 @@ pub fn pfcp_open(ctx: &mut PfcpPathContext, local_addr: SocketAddr) -> Result<()
         SocketAddr::V4(addr) => NodeId::Ipv4(*addr.ip()),
         SocketAddr::V6(addr) => NodeId::Ipv6(*addr.ip()),
     };
-    ctx.recovery_time_stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as u32)
-        .unwrap_or(0);
+    // #995: NTP-era seconds (TS 29.244 §8.2.65).
+    ctx.recovery_time_stamp = nextgcore_pfcp::recovery_time::now();
 
     log::info!("PFCP path opened on {local_addr}");
     Ok(())
@@ -457,9 +458,101 @@ pub enum PfcpSessionEvent {
 #[derive(Debug, Clone)]
 pub struct PfcpAssociation {
     pub peer_addr: SocketAddr,
+    /// The CP function's Node ID IE value, the identifier of the association
+    /// (TS 29.244 §6.2.6.2.2), kept as the raw IE value so an FQDN Node ID compares
+    /// exactly as an IPv4 or IPv6 one does (#718).
+    ///
+    /// The source address does NOT identify the association: a restarted SMF pod
+    /// comes back with the same Node ID at a new IP.
+    pub node_id: Vec<u8>,
     /// The peer's Recovery Time Stamp from Association Setup / Heartbeat —
     /// a change means the peer restarted and all its sessions are stale
     pub recovery_time_stamp: u32,
+    /// The host addresses this association's CP function speaks from (security,
+    /// #968): the Association Setup source and, for an IPv4 or IPv6 Node ID, the
+    /// Node ID address. Compared by IP only: TS 29.244 §6.2.6 associates Node IDs,
+    /// not one UDP 4-tuple, so an SMF that sends requests from another port, or from
+    /// the address its Node ID names, is still this association.
+    pub addrs: Vec<IpAddr>,
+}
+
+impl PfcpAssociation {
+    /// Whether `ip` is one of this association's own host addresses.
+    pub fn owns(&self, ip: IpAddr) -> bool {
+        self.addrs.iter().any(|a| same_host(*a, ip))
+    }
+}
+
+/// The FQDN of a Node ID IE value of type 2 (§8.2.38), decoded from its DNS label
+/// encoding (TS 23.003 §19.4.2). `None` for any other type or a malformed value.
+fn node_id_fqdn(node_id: &[u8]) -> Option<String> {
+    if node_id.first().map(|b| b & 0x0f) != Some(2) {
+        return None;
+    }
+    let mut labels = Vec::new();
+    let mut rest = &node_id[1..];
+    while let Some((&len, tail)) = rest.split_first() {
+        let len = usize::from(len);
+        if len == 0 {
+            break;
+        }
+        let label = tail.get(..len)?;
+        if !label
+            .iter()
+            .all(|c| c.is_ascii_alphanumeric() || *c == b'-')
+        {
+            return None;
+        }
+        labels.push(std::str::from_utf8(label).ok()?);
+        rest = &tail[len..];
+    }
+    (!labels.is_empty()).then(|| labels.join("."))
+}
+
+/// How long an FQDN Node ID may take to resolve while its Association Setup is
+/// answered. Bounded so a slow resolver cannot stall the N4 receive loop.
+const NODE_ID_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The addresses an FQDN Node ID resolves to (empty on failure or timeout).
+async fn resolve_node_id_fqdn(fqdn: &str) -> Vec<IpAddr> {
+    match tokio::time::timeout(
+        NODE_ID_RESOLVE_TIMEOUT,
+        tokio::net::lookup_host((fqdn, nextgcore_pfcp::PFCP_UDP_PORT)),
+    )
+    .await
+    {
+        Ok(Ok(addrs)) => addrs.map(|a| a.ip().to_canonical()).collect(),
+        Ok(Err(e)) => {
+            log::warn!("PFCP Node ID FQDN '{fqdn}' does not resolve: {e}");
+            Vec::new()
+        }
+        Err(_) => {
+            log::warn!("PFCP Node ID FQDN '{fqdn}' did not resolve in time");
+            Vec::new()
+        }
+    }
+}
+
+/// The host addresses of an association set up from `src` with Node ID IE value
+/// `node_id` (§8.2.38: octet 0 bits 1-4 are the type, 0 = IPv4, 1 = IPv6, 2 = FQDN).
+/// An FQDN Node ID's addresses are added by the caller once resolved.
+fn association_addrs(src: SocketAddr, node_id: &[u8]) -> Vec<IpAddr> {
+    let mut addrs = vec![src.ip().to_canonical()];
+    let from_node_id = match (node_id.first().map(|b| b & 0x0f), node_id.len()) {
+        (Some(0), 5) => Some(IpAddr::from([
+            node_id[1], node_id[2], node_id[3], node_id[4],
+        ])),
+        (Some(1), 17) => <[u8; 16]>::try_from(&node_id[1..17])
+            .ok()
+            .map(|o| IpAddr::from(o).to_canonical()),
+        _ => None,
+    };
+    if let Some(ip) = from_node_id {
+        if !addrs.contains(&ip) {
+            addrs.push(ip);
+        }
+    }
+    addrs
 }
 
 /// PFCP request retransmission timer T1 (TS 29.244 / Open5GS default 3s).
@@ -486,6 +579,32 @@ pub struct PendingReport {
     pub attempts: u32,
     /// When the current (re)transmission was sent.
     pub last_sent: std::time::Instant,
+    /// The usage this request carries, TAKEN from its URRs by the harvest (#771).
+    /// Handed back to the data plane if the request is abandoned after N1, so a
+    /// report the CP function never acknowledged does not take its usage with it
+    /// (#780 review m2). Empty for requests that carry no harvested usage.
+    pub usage: Vec<crate::data_plane::UrrReportEntry>,
+}
+
+/// PFCP messages refused because they did not come from the associated CP function
+/// (rejected requests and dropped responses). Rendered as
+/// `upf_pfcp_unauthorized_messages_total`.
+pub static PFCP_UNAUTHORIZED: AtomicU64 = AtomicU64::new(0);
+
+/// Rate limit for the refusal log lines (#968 review): the counter above counts every
+/// refused datagram; the log speaks once per interval so a flood is not a log flood.
+static REFUSAL_LOG: RefusalLog = RefusalLog::new();
+
+/// Count one refused PFCP message and log it, rate-limited.
+fn note_refusal(what: std::fmt::Arguments<'_>) {
+    PFCP_UNAUTHORIZED.fetch_add(1, Ordering::Relaxed);
+    if let Some(suppressed) = REFUSAL_LOG.note() {
+        if suppressed > 0 {
+            log::warn!("{what} ({suppressed} earlier refusal(s) not logged)");
+        } else {
+            log::warn!("{what}");
+        }
+    }
 }
 
 /// Async PFCP server for handling SMF requests
@@ -537,6 +656,9 @@ pub struct PfcpServer {
     /// SMF/SGW-C was never detected: the association and every session stayed
     /// in place indefinitely while traffic blackholed.
     heartbeat: tokio::sync::Mutex<HeartbeatState>,
+    /// The CP-function hosts an Association Setup is accepted from (security, #968).
+    /// Fail closed: empty refuses every Setup.
+    allowed_peers: std::sync::RwLock<PeerAllowlist>,
 }
 
 /// Outstanding-heartbeat bookkeeping for peer-failure detection.
@@ -635,6 +757,10 @@ pub struct PfcpSessionInfo {
     pub upf_seid: u64,
     pub smf_seid: u64,
     pub smf_addr: SocketAddr,
+    /// The IPv4 and IPv6 addresses of the CP F-SEID. They name the CP PFCP entity
+    /// that a PFCP Session Retention Information IE lists (TS 29.244 §8.2.135, #718).
+    pub cp_f_seid_ipv4: Option<Ipv4Addr>,
+    pub cp_f_seid_ipv6: Option<std::net::Ipv6Addr>,
     pub ue_ipv4: Option<Ipv4Addr>,
     pub ul_teid: u32,
     pub dl_teid: u32,
@@ -679,6 +805,28 @@ pub struct SessionRuleIds {
     pub urr_ids: std::collections::HashSet<u32>,
 }
 
+/// The time IEs of a usage report, from the times taken with its usage (#818, TS
+/// 29.244 Table 7.5.8.3-1): Start Time and End Time always; Duration Measurement when
+/// the URR measures time; Time of First / Last Packet when traffic was seen.
+fn report_time_ies(
+    t: &crate::data_plane::ReportTimes,
+) -> (
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+) {
+    use crate::data_plane::ntp_secs;
+    (
+        Some(ntp_secs(t.start)),
+        Some(ntp_secs(t.end)),
+        t.duration.map(|d| d.as_secs().min(u32::MAX as u64) as u32),
+        t.first_pkt.map(ntp_secs),
+        t.last_pkt.map(ntp_secs),
+    )
+}
+
 impl PfcpServer {
     /// Create a new PFCP server
     pub async fn new(
@@ -694,10 +842,8 @@ impl PfcpServer {
             SocketAddr::V6(addr) => NodeId::Ipv6(*addr.ip()),
         };
 
-        let recovery_time_stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as u32)
-            .unwrap_or(0);
+        // #995: NTP-era seconds (TS 29.244 §8.2.65), not Unix seconds.
+        let recovery_time_stamp = nextgcore_pfcp::recovery_time::now();
 
         Ok(Self {
             socket: Arc::new(socket),
@@ -716,6 +862,7 @@ impl PfcpServer {
             data_plane: std::sync::RwLock::new(None),
             pending_reports: tokio::sync::Mutex::new(HashMap::new()),
             heartbeat: tokio::sync::Mutex::new(HeartbeatState::default()),
+            allowed_peers: std::sync::RwLock::new(PeerAllowlist::default()),
         })
     }
 
@@ -737,6 +884,21 @@ impl PfcpServer {
         } else {
             seq
         }
+    }
+
+    /// Set the CP-function addresses an Association Setup Request is accepted from
+    /// (`--pfcp-allowed-peers`, security #968).
+    pub fn set_allowed_peers(&self, allowlist: PeerAllowlist) {
+        if let Ok(mut a) = self.allowed_peers.write() {
+            *a = allowlist;
+        }
+    }
+
+    fn allowed_peers(&self) -> PeerAllowlist {
+        self.allowed_peers
+            .read()
+            .map(|a| a.clone())
+            .unwrap_or_default()
     }
 
     /// Whether a PFCP association with a CP function is currently up
@@ -777,7 +939,7 @@ impl PfcpServer {
     /// exactly what a rolling restart produces once two SMF pods overlap.
     async fn declare_peer_failure(&self, peer: SocketAddr, reason: &str) {
         match self.association.read().await.as_ref() {
-            Some(a) if a.peer_addr == peer => {}
+            Some(a) if a.owns(peer.ip()) => {}
             Some(a) => {
                 log::warn!(
                     "ignoring PFCP peer failure from {peer} ({reason}): the association \
@@ -799,6 +961,15 @@ impl PfcpServer {
             *association = None;
             self.publish_associated(&association);
         }
+        self.delete_association_sessions(peer, reason).await;
+    }
+
+    /// Delete every PFCP session of the association with `peer`, here and in the
+    /// data plane.
+    ///
+    /// This UPF holds one association at a time, so "the association's sessions" is
+    /// all of them.
+    async fn delete_association_sessions(&self, peer: SocketAddr, reason: &str) {
         let count = {
             let mut sessions = self.sessions.write().await;
             let n = sessions.len();
@@ -806,11 +977,69 @@ impl PfcpServer {
             self.publish_session_count(&sessions);
             n
         };
-        log::warn!("Cleared {count} PFCP sessions after peer failure");
+        log::warn!("Cleared {count} PFCP sessions of the association with {peer} ({reason})");
         let _ = self
             .session_tx
             .send(PfcpSessionEvent::PeerFailure { peer })
             .await;
+    }
+
+    /// Keep the sessions a PFCP Session Retention Information IE asks for, delete the
+    /// rest, and re-address the kept ones to the association's new peer (#718,
+    /// TS 29.244 §6.2.6.2.2).
+    ///
+    /// `entities` empty means keep every session (Table 7.4.4.1-2). Otherwise a
+    /// session is kept when its CP F-SEID address is one of the listed CP PFCP
+    /// entities (§8.2.135), or, as an extension the spec does not define, when the
+    /// address the session was established from is: a CP function that put an
+    /// unroutable address in its F-SEID (smfd before #797 sent 0.0.0.0) is still
+    /// matched by the address it actually used. Kept sessions now report to
+    /// `new_peer`: the association is the same CP function at a new address, and the
+    /// old address may be dead. Returns how many sessions were kept.
+    async fn retain_association_sessions(
+        &self,
+        entities: &[std::net::IpAddr],
+        new_peer: SocketAddr,
+    ) -> usize {
+        let wanted = |info: &PfcpSessionInfo| {
+            entities.is_empty()
+                || entities.iter().any(|ip| {
+                    *ip == info.smf_addr.ip()
+                        || info.cp_f_seid_ipv4.map(std::net::IpAddr::V4) == Some(*ip)
+                        || info.cp_f_seid_ipv6.map(std::net::IpAddr::V6) == Some(*ip)
+                })
+        };
+        let (kept, dropped) = {
+            let mut sessions = self.sessions.write().await;
+            let dropped: Vec<(u64, Option<Ipv4Addr>)> = sessions
+                .values()
+                .filter(|info| !wanted(info))
+                .map(|info| (info.upf_seid, info.ue_ipv4))
+                .collect();
+            for (seid, _) in &dropped {
+                sessions.remove(seid);
+            }
+            for info in sessions.values_mut() {
+                info.smf_addr = new_peer;
+            }
+            self.publish_session_count(&sessions);
+            (sessions.len(), dropped)
+        };
+        for (upf_seid, ue_ipv4) in &dropped {
+            let event = PfcpSessionEvent::SessionDeleted {
+                upf_seid: *upf_seid,
+                ue_ipv4: *ue_ipv4,
+            };
+            if let Err(e) = self.session_tx.send(event).await {
+                log::error!("Failed to send session event: {e}");
+            }
+        }
+        log::info!(
+            "PFCP Session Retention Information from {new_peer}: kept {kept} session(s), \
+             deleted {} not requested",
+            dropped.len()
+        );
+        kept
     }
 
     /// Run the PFCP server main loop
@@ -869,6 +1098,77 @@ impl PfcpServer {
             header.seid
         );
 
+        // SECURITY (#968): only the ASSOCIATED CP function may drive sessions, release
+        // the association or answer our requests. Only Heartbeat Request and Association
+        // Setup Request may come from anyone (TS 29.244 §8.2.1 cause 72), and the Setup
+        // handler applies the peer allowlist itself. Before, a Session Modification or
+        // Deletion from ANY source was executed on a guessed SEID -- redirecting or
+        // tearing down a UE's user plane -- and a stray response could acknowledge our
+        // reports or keep a dead peer looking alive.
+        //
+        // The source is matched by IP, never by port: the association is between Node
+        // IDs (§6.2.6), so any of the association's host addresses qualifies (its Setup
+        // source, its IPv4/IPv6 Node ID, or the addresses its FQDN Node ID resolves to).
+        let src_ip = src_addr.ip();
+        let from_peer = self
+            .association
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|a| a.owns(src_ip));
+        // A report response is accepted from the host its request went to.
+        let answers_our_report = header.msg_type == pfcp_type::SESSION_REPORT_RESPONSE
+            && self
+                .pending_reports
+                .lock()
+                .await
+                .get(&header.sequence_number)
+                .is_some_and(|p| same_host(p.dest.ip(), src_ip));
+        if !from_peer && !answers_our_report {
+            let t = header.msg_type;
+            match t {
+                pfcp_type::HEARTBEAT_REQUEST | pfcp_type::ASSOCIATION_SETUP_REQUEST => {}
+                t if is_response_type(t) => {
+                    // Not ours to accept: dropped and counted.
+                    note_refusal(format_args!(
+                        "PFCP response type={t} seq={} from {src_addr}, which is not the \
+                         associated CP function: dropped",
+                        header.sequence_number
+                    ));
+                    return Ok(());
+                }
+                t if is_request_type(t) => {
+                    // A request: rejected with "No established PFCP Association" (§5.8.3,
+                    // cause 72), never executed, and counted.
+                    note_refusal(format_args!(
+                        "PFCP request type={t} from {src_addr}, which is not the associated \
+                         CP function: rejected (cause 72), not executed"
+                    ));
+                    let resp_payload =
+                        build_failure_response(PfcpCause::NoEstablishedPfcpAssociation, None);
+                    let session_level = t >= pfcp_type::SESSION_ESTABLISHMENT_REQUEST;
+                    // `t` is a Table 7.3-1 request type, so `t + 1` is its response.
+                    let response = self.build_response(
+                        t + 1,
+                        0,
+                        header.sequence_number,
+                        &resp_payload,
+                        session_level,
+                    );
+                    let _ = self.socket.send_to(&response, src_addr).await;
+                    return Ok(());
+                }
+                t => {
+                    // An unknown message type is ignored (TS 29.244 §7.6), never answered:
+                    // there is no response type to answer it with (255 + 1 overflowed).
+                    note_refusal(format_args!(
+                        "PFCP message of unknown type {t} from {src_addr}: ignored"
+                    ));
+                    return Ok(());
+                }
+            }
+        }
+
         match header.msg_type {
             pfcp_type::HEARTBEAT_REQUEST => {
                 self.handle_heartbeat_request(&header, payload, src_addr)
@@ -902,6 +1202,20 @@ impl PfcpServer {
             pfcp_type::SESSION_DELETION_REQUEST => {
                 self.handle_session_deletion_request(&header, payload, src_addr)
                     .await?;
+            }
+            pfcp_type::NODE_REPORT_RESPONSE => {
+                // #935: the CP function acknowledged a path Node Report; stop T1/N1.
+                let removed = self
+                    .pending_reports
+                    .lock()
+                    .await
+                    .remove(&header.sequence_number)
+                    .is_some();
+                log::debug!(
+                    "Node Report Response (seq={}, tracked={removed})",
+                    header.sequence_number
+                );
+                return Ok(());
             }
             pfcp_type::SESSION_REPORT_RESPONSE => {
                 // Response to a UPF-initiated Session Report Request: clear the
@@ -943,10 +1257,12 @@ impl PfcpServer {
     /// from any other address says nothing about whether THIS association's
     /// peer restarted.
     async fn check_peer_recovery(&self, src_addr: SocketAddr, rts: u32) {
+        // #995: in the NTP reading, as stored at association.
+        let rts = nextgcore_pfcp::recovery_time::normalize_received(rts);
         let restarted = {
             let assoc = self.association.read().await;
             match assoc.as_ref() {
-                Some(a) => a.peer_addr == src_addr && a.recovery_time_stamp != rts,
+                Some(a) => a.owns(src_addr.ip()) && a.recovery_time_stamp != rts,
                 None => false,
             }
         };
@@ -999,6 +1315,23 @@ impl PfcpServer {
     ) -> Result<(), String> {
         log::info!("Handling Association Setup Request from {src_addr}");
 
+        // SECURITY (#968): an association is accepted only from a configured CP function.
+        // A refused Setup changes nothing: the live association and its sessions stay.
+        let allowed = self.allowed_peers();
+        if !allowed.permits(src_addr.ip()) {
+            // A restarted CP pod may be at an IP the last resolution predates: ask for
+            // an early re-resolution (rate-limited) so its NEXT attempt is judged
+            // against current DNS.
+            allowed.kick_refresh();
+            note_refusal(format_args!(
+                "PFCP Association Setup Request from {src_addr}, which is not an allowed CP \
+                 function ({allowed}): rejected (cause 64)"
+            ));
+            return self
+                .reject_association_setup(header.sequence_number, src_addr)
+                .await;
+        }
+
         // Node ID and Recovery Time Stamp are mandatory (TS 29.244 7.4.4.1)
         let ies = ParsedIe::parse_all(payload);
         let node_id_present = ParsedIe::find_ie(&ies, pfcp_ie::NODE_ID).is_some();
@@ -1028,16 +1361,94 @@ impl PfcpServer {
                 .map_err(|e| format!("Send error: {e}"))?;
             return Ok(());
         }
-        let rts = rts.unwrap();
+        // #995: kept in the NTP reading (a pre-#995 SMF sends Unix seconds).
+        let rts = nextgcore_pfcp::recovery_time::normalize_received(rts.unwrap());
+        let node_id = ParsedIe::find_ie(&ies, pfcp_ie::NODE_ID)
+            .map(|ie| ie.value.clone())
+            .unwrap_or_default();
+        let retention = crate::n4_build::parse_session_retention_information(payload);
 
-        // If we already had an association with a different recovery
-        // timestamp, the peer restarted — flush stale sessions first
-        self.check_peer_recovery(src_addr, rts).await;
+        // #718, TS 29.244 §6.2.6.2.2: a request from a Node ID that already has an
+        // association overwrites it "regardless of the Recovery Timestamp", and the
+        // existing association's sessions are deleted unless the request asks for them
+        // to be retained. Keyed by Node ID, not source address: a restarted SMF pod
+        // keeps its Node ID and comes back at a new IP, and keying by address left
+        // every session of the previous incarnation here with no CP function able to
+        // modify or release it, while the new incarnation reused its CP SEIDs.
+        //
+        // A request from a DIFFERENT Node ID also replaces the association, because
+        // this UPF holds one at a time. The replaced CP function can no longer
+        // control its sessions, so they are deleted too; retention is defined only
+        // for the same Node ID.
+        let previous = self.association.read().await.clone();
+        // SECURITY (#968): only an allowlisted CP function got this far (fail closed,
+        // above). It may replace or move a LIVE association only if it is one of that
+        // association's hosts, or presents the same Node ID (the same CP function at a
+        // new address, #718). A DIFFERENT CP function waits until the association is
+        // gone (Release or heartbeat timeout), so one listed host cannot evict
+        // another's sessions. Residual risk: the Node ID is written by the sender, so
+        // with a broad allowlist (a pod CIDR, 0.0.0.0/0) any host in range that knows
+        // the SMF's Node ID can still take the association over; list the CP's own
+        // address or headless Service name where possible.
+        if let Some(prev) = previous.as_ref() {
+            if !prev.owns(src_addr.ip()) && prev.node_id != node_id {
+                note_refusal(format_args!(
+                    "PFCP Association Setup Request from {src_addr} with another Node ID \
+                     would replace the live association with {}: rejected (cause 64), \
+                     association and sessions kept",
+                    prev.peer_addr
+                ));
+                return self
+                    .reject_association_setup(header.sequence_number, src_addr)
+                    .await;
+            }
+        }
+        let mut sessions_retained = false;
+        if let Some(prev) = previous {
+            let same_node = prev.node_id == node_id;
+            match (&retention, same_node) {
+                (Some(entities), true) => {
+                    self.retain_association_sessions(entities, src_addr).await;
+                    sessions_retained = true;
+                }
+                _ => {
+                    let reason = if same_node {
+                        "the same Node ID set up a new association without session retention"
+                    } else {
+                        "a different CP function replaced the association"
+                    };
+                    log::warn!(
+                        "Association Setup from {src_addr} replaces the association with {} \
+                         (peer RTS {} -> {rts}): {reason}",
+                        prev.peer_addr,
+                        prev.recovery_time_stamp
+                    );
+                    self.delete_association_sessions(prev.peer_addr, reason)
+                        .await;
+                }
+            }
+        }
 
+        // Resolved ONCE, here: a CP whose FQDN later resolves to new addresses must
+        // re-associate for them to count.
+        // A CP function identified by an FQDN may send from any address it resolves to
+        // (§6.2.6: the association is the Node ID's), and one with an IPv4/IPv6 Node ID
+        // from that address. Only addresses the allowlist permits are taken.
+        let mut addrs = association_addrs(src_addr, &node_id);
+        addrs.retain(|ip| same_host(*ip, src_addr.ip()) || allowed.permits(*ip));
+        if let Some(fqdn) = node_id_fqdn(&node_id) {
+            for ip in resolve_node_id_fqdn(&fqdn).await {
+                if allowed.permits(ip) && !addrs.contains(&ip) {
+                    addrs.push(ip);
+                }
+            }
+        }
         {
             let mut association = self.association.write().await;
             *association = Some(PfcpAssociation {
                 peer_addr: src_addr,
+                addrs,
+                node_id,
                 recovery_time_stamp: rts,
             });
             self.publish_associated(&association);
@@ -1047,6 +1458,7 @@ impl PfcpServer {
             &self.local_node_id,
             self.recovery_time_stamp,
             PfcpCause::RequestAccepted,
+            sessions_retained,
         );
 
         let response = self.build_response(
@@ -1063,6 +1475,29 @@ impl PfcpServer {
             .map_err(|e| format!("Send error: {e}"))?;
 
         log::info!("PFCP Association established with {src_addr} (peer RTS={rts})");
+        Ok(())
+    }
+
+    /// Answer a refused Association Setup Request with "Request rejected" (cause 64,
+    /// §8.2.1) and change nothing.
+    async fn reject_association_setup(&self, seq: u32, src_addr: SocketAddr) -> Result<(), String> {
+        let resp_payload = build_association_setup_response(
+            &self.local_node_id,
+            self.recovery_time_stamp,
+            PfcpCause::RequestRejected,
+            false,
+        );
+        let response = self.build_response(
+            pfcp_type::ASSOCIATION_SETUP_RESPONSE,
+            0,
+            seq,
+            &resp_payload,
+            false,
+        );
+        self.socket
+            .send_to(&response, src_addr)
+            .await
+            .map_err(|e| format!("Send error: {e}"))?;
         Ok(())
     }
 
@@ -1257,10 +1692,11 @@ impl PfcpServer {
 
         // Parse CP F-SEID (SMF's SEID) — presence checked above
         let f_seid_ie = ParsedIe::find_ie(&ies, pfcp_ie::F_SEID).unwrap();
-        let smf_seid = match ParsedFSeid::parse(&f_seid_ie.value) {
+        let (smf_seid, cp_f_seid_ipv4, cp_f_seid_ipv6) = match ParsedFSeid::parse(&f_seid_ie.value)
+        {
             Ok(f_seid) => {
                 log::debug!("SMF F-SEID: {:#x}", f_seid.seid);
-                f_seid.seid
+                (f_seid.seid, f_seid.ipv4, f_seid.ipv6)
             }
             Err(e) => {
                 log::warn!("Malformed CP F-SEID from {src_addr}: {e}");
@@ -1484,6 +1920,8 @@ impl PfcpServer {
             upf_seid,
             smf_seid,
             smf_addr: src_addr,
+            cp_f_seid_ipv4,
+            cp_f_seid_ipv6,
             ue_ipv4,
             ul_teid,
             dl_teid,
@@ -2235,15 +2673,18 @@ impl PfcpServer {
         self.collect_usage_reports(upf_seid, None, UsageReportReason::Termination)
     }
 
-    /// Read the current counters of a session's URRs and build Usage Reports.
+    /// TAKE the usage of a session's URRs and build Usage Reports (#821).
     ///
     /// `only` restricts the set to named URR ids — which is what a Remove URR needs,
     /// so a modification reports the residual volume of the rules it is detaching and
     /// nothing else (#306). `None` means every URR on the session, for a deletion's
     /// final reports or a QAURR query.
     ///
-    /// Read-only on the counters: the caller decides whether the URR survives, and
-    /// resetting here would zero a rule that is merely being queried.
+    /// Resetting, as TS 29.244 §5.2.2.3.1 requires of every usage report ("reset its
+    /// ongoing measurement counts"): a query reports the usage since the last report
+    /// and starts a new measurement. It used to READ the counters, so a racing or later
+    /// harvest re-reported the same bytes and a CP function summing reports billed
+    /// them twice.
     fn collect_usage_reports(
         &self,
         upf_seid: u64,
@@ -2254,14 +2695,9 @@ impl PfcpServer {
             Some(dp) => dp,
             None => return Vec::new(),
         };
-        let session = match dp.sessions.find_by_seid(upf_seid) {
-            Some(s) => s,
-            None => return Vec::new(),
-        };
-        let urrs = session.urrs.read().unwrap();
-        urrs.values()
-            .filter(|urr| only.is_none_or(|ids| ids.contains(&urr.urr_id)))
-            .map(|urr| {
+        dp.take_urr_reports(upf_seid, only)
+            .into_iter()
+            .map(|r| {
                 let mut trigger = crate::n4_build::UsageReportTrigger::default();
                 match reason {
                     // TS 29.244 §8.2.36: TERMR covers the removal of the URR as well
@@ -2269,33 +2705,24 @@ impl PfcpServer {
                     UsageReportReason::Termination => trigger.termination_report = true,
                     UsageReportReason::Immediate => trigger.immediate_report = true,
                 }
+                let times = report_time_ies(&r.times);
                 crate::n4_build::UsageReport {
-                    urr_id: urr.urr_id,
-                    ur_seqn: urr.next_ur_seqn(),
+                    urr_id: r.urr_id,
+                    ur_seqn: r.ur_seqn,
                     trigger,
                     volume_measurement: Some(crate::n4_build::VolumeMeasurement {
-                        total_volume: Some(
-                            urr.acc_total_bytes
-                                .load(std::sync::atomic::Ordering::Relaxed),
-                        ),
-                        uplink_volume: Some(
-                            urr.acc_ul_bytes.load(std::sync::atomic::Ordering::Relaxed),
-                        ),
-                        downlink_volume: Some(
-                            urr.acc_dl_bytes.load(std::sync::atomic::Ordering::Relaxed),
-                        ),
-                        total_packets: Some(
-                            urr.acc_total_pkts
-                                .load(std::sync::atomic::Ordering::Relaxed),
-                        ),
-                        uplink_packets: Some(
-                            urr.acc_ul_pkts.load(std::sync::atomic::Ordering::Relaxed),
-                        ),
-                        downlink_packets: Some(
-                            urr.acc_dl_pkts.load(std::sync::atomic::Ordering::Relaxed),
-                        ),
+                        total_volume: Some(r.total_bytes),
+                        uplink_volume: Some(r.ul_bytes),
+                        downlink_volume: Some(r.dl_bytes),
+                        total_packets: Some(r.total_pkts),
+                        uplink_packets: Some(r.ul_pkts),
+                        downlink_packets: Some(r.dl_pkts),
                     }),
-                    ..Default::default()
+                    start_time: times.0,
+                    end_time: times.1,
+                    duration_measurement: times.2,
+                    time_of_first_packet: times.3,
+                    time_of_last_packet: times.4,
                 }
             })
             .collect()
@@ -2303,6 +2730,47 @@ impl PfcpServer {
 
     /// Send a Session Report Request carrying a Downlink Data Report
     /// (TS 29.244 7.5.8.2) when the first DL packet is buffered under a
+    /// Report N3/N9 user-plane path FAILURE or RECOVERY for `peers` to the CP
+    /// function in a PFCP Node Report Request (#935, TS 29.244 §7.4.5.1), tracked for
+    /// T1/N1 retransmission like a Session Report Request until its Node Report
+    /// Response arrives. Without an association there is nobody to report to.
+    pub async fn send_node_report(
+        &self,
+        failure: bool,
+        peers: &[std::net::IpAddr],
+    ) -> Result<(), String> {
+        if peers.is_empty() {
+            return Err("no peers to report".to_string());
+        }
+        let Some(peer) = self.association.read().await.as_ref().map(|a| a.peer_addr) else {
+            return Err("no PFCP association: no CP function to report the path to".to_string());
+        };
+        let payload =
+            crate::n4_build::build_node_report_request(&self.local_node_id, failure, peers);
+        let seq = self.alloc_seq();
+        let message = self.build_response(pfcp_type::NODE_REPORT_REQUEST, 0, seq, &payload, false);
+        self.pending_reports.lock().await.insert(
+            seq,
+            PendingReport {
+                message: message.clone(),
+                dest: peer,
+                upf_seid: 0,
+                attempts: 0,
+                last_sent: std::time::Instant::now(),
+                usage: Vec::new(),
+            },
+        );
+        if let Err(e) = self.socket.send_to(&message, peer).await {
+            self.pending_reports.lock().await.remove(&seq);
+            return Err(format!("Failed to send Node Report Request: {e}"));
+        }
+        log::info!(
+            "Sent Node Report Request to {peer}: user-plane path {} for {peers:?}",
+            if failure { "FAILURE" } else { "RECOVERY" }
+        );
+        Ok(())
+    }
+
     /// BUFF+NOCP FAR.
     pub async fn send_downlink_data_report(
         &self,
@@ -2339,6 +2807,7 @@ impl PfcpServer {
             smf_addr,
             &payload,
             "Downlink Data Report",
+            Vec::new(),
         )
         .await?;
         log::info!(
@@ -2387,6 +2856,7 @@ impl PfcpServer {
             smf_addr,
             &payload,
             "Error Indication Report",
+            Vec::new(),
         )
         .await?;
         log::info!(
@@ -2395,8 +2865,63 @@ impl PfcpServer {
         Ok(())
     }
 
-    /// Send a PFCP Session Report Request for URR usage reports.
-    /// Called by the URR threshold check task when thresholds are exceeded.
+    /// Take the reports due on one session and send them, while the session is held
+    /// in the PFCP table (#821).
+    ///
+    /// The take happens UNDER `sessions.read()`, and the request is registered and on
+    /// the wire before that guard is released. A Session Deletion needs
+    /// `sessions.write()`, so it either ran first -- the session is gone, nothing is
+    /// taken here, and its TERMR carries every byte -- or waits until this report is
+    /// sent, and its TERMR carries only what came after. Before, the harvest took the
+    /// usage with no such ordering; a deletion in between made the send fail with
+    /// "session not found" and the taken usage was in no report.
+    ///
+    /// A report that cannot be sent hands its usage back (#780 m2).
+    pub async fn send_due_urr_reports(
+        &self,
+        upf_seid: u64,
+        smf_seid: u64,
+    ) -> Result<usize, String> {
+        let sessions = self.sessions.read().await;
+        self.send_due_urr_reports_held(&sessions, upf_seid, smf_seid)
+            .await
+    }
+
+    /// The body of [`Self::send_due_urr_reports`], run while the caller holds the
+    /// session table: the take, the send and -- on failure -- the restore all complete
+    /// before the guard can be released (#842 review). Restoring after the release let
+    /// a deletion waiting on the table build its TERMR in between and miss the bytes.
+    async fn send_due_urr_reports_held(
+        &self,
+        sessions: &HashMap<u64, PfcpSessionInfo>,
+        upf_seid: u64,
+        smf_seid: u64,
+    ) -> Result<usize, String> {
+        let Some(smf_addr) = sessions.get(&upf_seid).map(|s| s.smf_addr) else {
+            return Ok(0);
+        };
+        let dp = self.data_plane.read().unwrap().clone();
+        let Some(dp) = dp else {
+            return Ok(0);
+        };
+        let reports = dp.take_due_urr_reports(upf_seid);
+        if reports.is_empty() {
+            return Ok(0);
+        }
+        let n = reports.len();
+        match self
+            .send_urr_report_to(upf_seid, smf_seid, smf_addr, reports.clone())
+            .await
+        {
+            Ok(()) => Ok(n),
+            Err(e) => {
+                dp.restore_urr_usage(&reports);
+                Err(e)
+            }
+        }
+    }
+
+    /// Send a PFCP Session Report Request for URR usage reports already taken.
     pub async fn send_urr_report(
         &self,
         upf_seid: u64,
@@ -2415,7 +2940,17 @@ impl PfcpServer {
                 return Err(format!("Session {upf_seid:#x} not found for URR report"));
             }
         };
+        self.send_urr_report_to(upf_seid, smf_seid, smf_addr, reports)
+            .await
+    }
 
+    async fn send_urr_report_to(
+        &self,
+        upf_seid: u64,
+        smf_seid: u64,
+        smf_addr: SocketAddr,
+        reports: Vec<crate::data_plane::UrrReportEntry>,
+    ) -> Result<(), String> {
         // Build usage reports
         let usage_reports: Vec<crate::n4_build::UsageReport> = reports
             .iter()
@@ -2432,6 +2967,10 @@ impl PfcpServer {
                         volume_threshold: true,
                         ..Default::default()
                     },
+                    UrrReportReason::TimeThreshold => crate::n4_build::UsageReportTrigger {
+                        time_threshold: true,
+                        ..Default::default()
+                    },
                     UrrReportReason::Periodic => crate::n4_build::UsageReportTrigger {
                         periodic_reporting: true,
                         ..Default::default()
@@ -2446,6 +2985,7 @@ impl PfcpServer {
                     },
                 };
 
+                let times = report_time_ies(&r.times);
                 crate::n4_build::UsageReport {
                     urr_id: r.urr_id,
                     ur_seqn: r.ur_seqn,
@@ -2458,7 +2998,11 @@ impl PfcpServer {
                         uplink_packets: Some(r.ul_pkts),
                         downlink_packets: Some(r.dl_pkts),
                     }),
-                    ..Default::default()
+                    start_time: times.0,
+                    end_time: times.1,
+                    duration_measurement: times.2,
+                    time_of_first_packet: times.3,
+                    time_of_last_packet: times.4,
                 }
             })
             .collect();
@@ -2481,6 +3025,7 @@ impl PfcpServer {
             smf_addr,
             &payload,
             "Session Report Request (URR)",
+            reports.clone(),
         )
         .await?;
 
@@ -2495,11 +3040,14 @@ impl PfcpServer {
     /// (#80, TS 29.244 §5.2.2.2.2, §8.2.19).
     ///
     /// Distinct from [`Self::send_urr_report`] because it is driven by a data-plane
-    /// EVENT rather than by the harvest: it reads the URR's live counters and builds one
-    /// report for one rule, and it deliberately does **not** reset those counters. The
-    /// harvest owns the reset, and resetting here would make the volume this report
-    /// carries disappear from the next one — under-reporting the very usage the quota
-    /// was measuring.
+    /// EVENT rather than by the harvest. It TAKES the URR's usage, as every usage report
+    /// must (§5.2.2.3.1, #821), so the next report does not carry the same bytes again.
+    ///
+    /// The take and the send happen while the session is held in the PFCP table (#842
+    /// review), as in [`Self::send_due_urr_reports`]: a Session Deletion either ran
+    /// first -- nothing is taken and its TERMR carries everything -- or runs after this
+    /// report is on the wire. Releasing the table before the take let a deletion's TERMR
+    /// miss the bytes this report then sent for a session the SMF had already deleted.
     ///
     /// It also does not clear the exhaustion latch: a report is an announcement, not a
     /// grant. Only the CP function provisioning more quota (an Update URR) resumes
@@ -2510,13 +3058,11 @@ impl PfcpServer {
         smf_seid: u64,
         urr_id: u32,
     ) -> Result<(), String> {
-        let smf_addr = {
-            let sessions = self.sessions.read().await;
-            sessions
-                .get(&upf_seid)
-                .map(|s| s.smf_addr)
-                .ok_or_else(|| format!("Session {upf_seid:#x} not found for quota report"))?
-        };
+        let sessions = self.sessions.read().await;
+        let smf_addr = sessions
+            .get(&upf_seid)
+            .map(|s| s.smf_addr)
+            .ok_or_else(|| format!("Session {upf_seid:#x} not found for quota report"))?;
 
         // The live counters and the trigger, read off the URR that latched. Without the
         // data plane attached there is nothing to read, which is not an error: a UPF
@@ -2528,7 +3074,7 @@ impl PfcpServer {
         let Some(dp) = dp else {
             return Err("no data plane attached; cannot read URR counters".to_string());
         };
-        let Some(report) = dp.urr_report_snapshot(upf_seid, urr_id) else {
+        let Some(report) = dp.urr_report_take(upf_seid, urr_id) else {
             return Err(format!(
                 "URR {urr_id} not found on SEID {upf_seid:#x} for quota report"
             ));
@@ -2549,6 +3095,7 @@ impl PfcpServer {
             },
         };
 
+        let times = report_time_ies(&report.times);
         let user_plane_report = UserPlaneReport {
             report_type: crate::n4_build::ReportType {
                 usage_report: true,
@@ -2566,7 +3113,11 @@ impl PfcpServer {
                     uplink_packets: Some(report.ul_pkts),
                     downlink_packets: Some(report.dl_pkts),
                 }),
-                ..Default::default()
+                start_time: times.0,
+                end_time: times.1,
+                duration_measurement: times.2,
+                time_of_first_packet: times.3,
+                time_of_last_packet: times.4,
             }],
             ..Default::default()
         };
@@ -2579,13 +3130,28 @@ impl PfcpServer {
             smf_addr,
             &payload,
             "Session Report Request (quota exhausted)",
+            vec![report.clone()],
         )
-        .await?;
+        .await
+        .inspect_err(|_| {
+            // #821: the usage was TAKEN for this report; not sent, it goes back, and the
+            // report flag is re-raised so the harvest reports the exhaustion instead.
+            dp.restore_urr_usage(std::slice::from_ref(&report));
+            if let Some(urr) = dp
+                .sessions
+                .find_by_seid(upf_seid)
+                .and_then(|s| s.urrs.read().unwrap().get(&urr_id).cloned())
+            {
+                urr.threshold_exceeded
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        })?;
         log::info!(
             "Sent quota-exhausted Usage Report to {smf_addr} for SEID={upf_seid:#x} URR={urr_id} \
              ({}B total) — matching traffic is being dropped (TS 29.244 §5.2.2.2.2)",
             report.total_bytes
         );
+        drop(sessions);
         Ok(())
     }
 
@@ -2601,6 +3167,7 @@ impl PfcpServer {
         smf_addr: SocketAddr,
         payload: &[u8],
         what: &str,
+        usage: Vec<crate::data_plane::UrrReportEntry>,
     ) -> Result<(), String> {
         let seq = self.alloc_seq();
         let message = self.build_response(
@@ -2622,6 +3189,7 @@ impl PfcpServer {
                     upf_seid,
                     attempts: 0,
                     last_sent: std::time::Instant::now(),
+                    usage,
                 },
             );
         }
@@ -2641,7 +3209,7 @@ impl PfcpServer {
         // Collect work under the lock, then send without holding it.
         let now = std::time::Instant::now();
         let mut to_send: Vec<(u32, Vec<u8>, SocketAddr)> = Vec::new();
-        let mut gave_up: Vec<(u32, u64)> = Vec::new();
+        let mut gave_up: Vec<(u32, u64, Vec<crate::data_plane::UrrReportEntry>)> = Vec::new();
         {
             let mut pending = self.pending_reports.lock().await;
             pending.retain(|&seq, p| {
@@ -2650,7 +3218,7 @@ impl PfcpServer {
                 }
                 if p.attempts >= PFCP_N1_MAX_RETRANSMIT {
                     // N1 exhausted: give up on this request.
-                    gave_up.push((seq, p.upf_seid));
+                    gave_up.push((seq, p.upf_seid, std::mem::take(&mut p.usage)));
                     return false;
                 }
                 p.attempts += 1;
@@ -2667,11 +3235,23 @@ impl PfcpServer {
                 Err(e) => log::error!("Failed to retransmit Session Report (seq={seq}): {e}"),
             }
         }
-        for (seq, upf_seid) in gave_up {
+        for (seq, upf_seid, usage) in gave_up {
             log::error!(
                 "Session Report Request (seq={seq}, SEID=0x{upf_seid:x}) abandoned after {} retransmissions (N1) — peer unresponsive",
                 PFCP_N1_MAX_RETRANSMIT
             );
+            // #780 review m2: no response after N1+1 transmissions, so the CP function
+            // has not acknowledged this usage. It goes back to its URRs and rides on the
+            // next report rather than vanishing. (The opposite risk -- a request that
+            // arrived but whose every response was lost -- is the less likely of the
+            // two, and an over-report is visible to the CP function where a dropped one
+            // is not.)
+            if !usage.is_empty() {
+                let dp = self.data_plane.read().unwrap().clone();
+                if let Some(dp) = dp {
+                    dp.restore_urr_usage(&usage);
+                }
+            }
         }
     }
 
@@ -2778,6 +3358,8 @@ mod tests {
                 .await
                 .unwrap(),
         );
+        // The test SMF's host and its Node ID address (fail closed, #968).
+        server.set_allowed_peers(PeerAllowlist::parse("127.0.0.1, 127.0.0.9").unwrap());
         let server_addr = server.socket.local_addr().unwrap();
         let smf_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let srv = server.clone();
@@ -2863,6 +3445,81 @@ mod tests {
         // Recovery Time Stamp must be present and non-zero
         let rts = crate::n4_build::parse_recovery_time_stamp(body).unwrap();
         assert!(rts > 0, "recovery time stamp must be real, not hardcoded 0");
+    }
+
+    /// #935 (TS 29.244 §7.4.5.1, Tables 7.4.5.1.2-1/7.4.5.1.3-1) on the wire: a path
+    /// failure goes out as a Node Report Request with UPFR and a User Plane Path Failure
+    /// Report naming the peer; a recovery with UPRR and a User Plane Path Recovery
+    /// Report; the Node Report Response stops T1/N1; without an association nothing
+    /// is sent.
+    #[tokio::test]
+    async fn path_reports_go_out_as_node_reports() {
+        let (server, smf, addr, _rx) = spawn_test_server().await;
+        assert!(server
+            .send_node_report(true, &["10.0.0.1".parse().unwrap()])
+            .await
+            .is_err());
+
+        let payload = build_association_setup_request_payload(Some(0x5000_0000));
+        let resp = exchange(&smf, addr, &encode_pfcp(5, None, 1, &payload)).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+
+        for (failure, nrt, ie) in [
+            (
+                true,
+                0x01u8,
+                crate::n4_build::pfcp_ie::USER_PLANE_PATH_FAILURE_REPORT,
+            ),
+            (
+                false,
+                0x02u8,
+                crate::n4_build::pfcp_ie::USER_PLANE_PATH_RECOVERY_REPORT,
+            ),
+        ] {
+            server
+                .send_node_report(failure, &["10.0.0.1".parse().unwrap()])
+                .await
+                .expect("sent");
+            let mut buf = vec![0u8; 2048];
+            let (len, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), smf.recv_from(&mut buf))
+                    .await
+                    .expect("a Node Report arrives")
+                    .expect("recv");
+            let (hdr, body) = ParsedPfcpHeader::parse(&buf[..len]).unwrap();
+            assert_eq!(buf[1], pfcp_type::NODE_REPORT_REQUEST);
+            let ies = ParsedIe::parse_all(body);
+            let t = ParsedIe::find_ie(&ies, crate::n4_build::pfcp_ie::NODE_REPORT_TYPE).unwrap();
+            assert_eq!(t.value[0], nrt);
+            let report = ParsedIe::find_ie(&ies, ie).expect("the path report IE");
+            let inner = ParsedIe::parse_all(&report.value);
+            let peer =
+                ParsedIe::find_ie(&inner, crate::n4_build::pfcp_ie::REMOTE_GTP_U_PEER).unwrap();
+            assert_eq!(peer.value, vec![0x02, 10, 0, 0, 1], "V4 flag + 10.0.0.1");
+            assert_eq!(server.pending_report_count().await, 1, "tracked for T1/N1");
+
+            // The SMF answers; the request stops being tracked.
+            let mut ok = crate::n4_build::PfcpMessageBuilder::new();
+            ok.add_u8(pfcp_ie::CAUSE, PfcpCause::RequestAccepted as u8);
+            smf.send_to(
+                &encode_pfcp(
+                    pfcp_type::NODE_REPORT_RESPONSE,
+                    None,
+                    hdr.sequence_number,
+                    &ok.build(),
+                ),
+                addr,
+            )
+            .await
+            .unwrap();
+            for _ in 0..50 {
+                if server.pending_report_count().await == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(server.pending_report_count().await, 0, "acknowledged");
+        }
     }
 
     #[tokio::test]
@@ -2983,7 +3640,11 @@ mod tests {
     fn far_body(id: u32, apply_action: u16) -> Vec<u8> {
         let mut b = crate::n4_build::PfcpMessageBuilder::new();
         b.add_u32(pfcp_ie::FAR_ID, id);
-        b.add_u16(pfcp_ie::APPLY_ACTION, apply_action);
+        // #1008: octet 5 first, as a conformant SMF sends it.
+        b.add_tlv(
+            pfcp_ie::APPLY_ACTION,
+            &[apply_action as u8, (apply_action >> 8) as u8],
+        );
         b.build()
     }
 
@@ -3090,9 +3751,18 @@ mod tests {
     }
 
     fn usage_reports_in(resp: &[u8]) -> Vec<(u32, u64)> {
+        usage_reports_of(resp, pfcp_ie::USAGE_REPORT_SMR)
+    }
+
+    /// `(urr_id, total volume)` of the Usage Reports in a Session Report REQUEST.
+    fn usage_reports_in_report(req: &[u8]) -> Vec<(u32, u64)> {
+        usage_reports_of(req, pfcp_ie::USAGE_REPORT_SRR)
+    }
+
+    fn usage_reports_of(resp: &[u8], ie_type: u16) -> Vec<(u32, u64)> {
         let (_, body) = ParsedPfcpHeader::parse(resp).unwrap();
         let ies = ParsedIe::parse_all(body);
-        ParsedIe::find_all_ies(&ies, pfcp_ie::USAGE_REPORT_SMR)
+        ParsedIe::find_all_ies(&ies, ie_type)
             .iter()
             .filter_map(|ie| {
                 let inner = ParsedIe::parse_all(&ie.value);
@@ -3140,7 +3810,7 @@ mod tests {
         );
         let mut far = crate::n4_build::PfcpMessageBuilder::new();
         far.add_u32(pfcp_ie::FAR_ID, 0x50);
-        far.add_u16(pfcp_ie::APPLY_ACTION, 0x02);
+        far.add_tlv(pfcp_ie::APPLY_ACTION, &[0x02, 0x00]); // FORW, octet 5
         far.add_tlv(pfcp_ie::FORWARDING_PARAMETERS, &fp.build());
         let mut b = crate::n4_build::PfcpMessageBuilder::new();
         b.add_tlv(pfcp_ie::CREATE_PDR, &pdr.build());
@@ -3246,11 +3916,77 @@ mod tests {
             "an Update URR must NOT reset the volume measured so far"
         );
         assert_eq!(urr.acc_ul_bytes.load(Ordering::Relaxed), 4096);
+        // #842 review (TS 29.244 §7.5.4): an IE the Update URR does not carry is
+        // UNCHANGED. This used to assert the period was withdrawn -- which is how a
+        // quota top-up silently stopped periodic reporting.
         assert_eq!(
             urr.measurement_period_secs(),
-            None,
-            "a period the update omits is withdrawn, not silently retained"
+            Some(30),
+            "a period the update omits is kept"
         );
+    }
+
+    /// An Update URR body carrying ONLY a total Volume Quota (§8.2.50).
+    fn quota_only_update(id: u32, quota: u64) -> Vec<u8> {
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_u32(pfcp_ie::URR_ID, id);
+        let mut v = vec![0x01u8];
+        v.extend_from_slice(&quota.to_be_bytes());
+        b.add_tlv(crate::n4_build::pfcp_ie::VOLUME_QUOTA, &v);
+        b.build()
+    }
+
+    /// #842 review MAJOR 3 (TS 29.244 §7.5.4): a THRESHOLD-only Update URR leaves the
+    /// quota -- and an exhausted subscriber's latch -- alone; a QUOTA-only one leaves
+    /// the thresholds and the Measurement Period alone (and re-grants). Before, both
+    /// went through the Create setters, so each deleted what it did not carry.
+    #[tokio::test]
+    async fn an_update_urr_changes_only_the_ies_it_carries() {
+        let (_server, smf, addr, mut rx, dp, upf_seid) = established_session().await;
+        let urr = urr1(&dp, upf_seid);
+        urr.set_quotas(Some(1000), None, None, None);
+        assert_eq!(
+            urr.record(1500, true),
+            crate::data_plane::UrrOutcome::QuotaJustExhausted
+        );
+
+        // Threshold-only.
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(pfcp_ie::UPDATE_URR, &{
+            let mut u = crate::n4_build::PfcpMessageBuilder::new();
+            u.add_u32(pfcp_ie::URR_ID, 1);
+            let mut v = vec![0x01u8];
+            v.extend_from_slice(&5_000_000u64.to_be_bytes());
+            u.add_tlv(pfcp_ie::VOLUME_THRESHOLD, &v);
+            u.build()
+        });
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+        assert_eq!(urr.volume_threshold_total(), Some(5_000_000));
+        assert_eq!(
+            urr.volume_quota_total(),
+            Some(1000),
+            "the quota is unchanged"
+        );
+        assert!(urr.is_quota_exhausted(), "and the subscriber stays gated");
+        assert_eq!(urr.measurement_period_secs(), Some(30));
+
+        // Quota-only: a top-up.
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(pfcp_ie::UPDATE_URR, &quota_only_update(1, 1_000_000));
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 4, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+        assert_eq!(urr.volume_quota_total(), Some(1_000_000));
+        assert!(!urr.is_quota_exhausted(), "a quota top-up re-grants");
+        assert_eq!(
+            urr.volume_threshold_total(),
+            Some(5_000_000),
+            "thresholds kept"
+        );
+        assert_eq!(urr.time_threshold_secs(), Some(60));
+        assert_eq!(urr.measurement_period_secs(), Some(30), "period kept");
     }
 
     /// Criterion 3 plus the leak the issue names: a removed URR must report what it
@@ -3446,6 +4182,7 @@ mod tests {
                 ul_pkts: 2,
                 dl_pkts: 1,
                 trigger,
+                times: Default::default(),
             };
 
         // ---- PERIO ----
@@ -3515,6 +4252,144 @@ mod tests {
                 .expect("arrives")
                 .expect("recv");
         assert_eq!(report_triggers_in(&buf[..len])[0][1] & 0x02, 0x02, "TIMQU");
+
+        // ---- TIMTH (#842 review: it used to go out as VOLTH) ----
+        server
+            .send_urr_report(
+                upf_seid,
+                0x4242,
+                vec![entry(crate::data_plane::UrrReportReason::TimeThreshold)],
+            )
+            .await
+            .expect("sent");
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), smf.recv_from(&mut buf))
+                .await
+                .expect("arrives")
+                .expect("recv");
+        let t = &report_triggers_in(&buf[..len])[0];
+        assert_eq!(t[0] & 0x04, 0x04, "TIMTH");
+        assert_eq!(t[0] & 0x02, 0x00, "and not VOLTH");
+    }
+
+    /// The IE types inside the first Usage Report of a Session Report Request.
+    fn usage_report_ie_types(req: &[u8]) -> Vec<u16> {
+        usage_report_ie_types_in(req, pfcp_ie::USAGE_REPORT_SRR)
+    }
+
+    /// The IE types inside the first Usage Report (carrier `ie`) of a PFCP message.
+    fn usage_report_ie_types_in(msg: &[u8], ie: u16) -> Vec<u16> {
+        let (_, body) = ParsedPfcpHeader::parse(msg).unwrap();
+        let ies = ParsedIe::parse_all(body);
+        let ur = ParsedIe::find_ie(&ies, ie).expect("a Usage Report");
+        ParsedIe::parse_all(&ur.value)
+            .iter()
+            .map(|ie| ie.ie_type)
+            .collect()
+    }
+
+    fn assert_time_ies(types: &[u16], what: &str) {
+        for (ie, name) in [
+            (crate::n4_build::pfcp_ie::START_TIME, "Start Time"),
+            (crate::n4_build::pfcp_ie::END_TIME, "End Time"),
+            (
+                crate::n4_build::pfcp_ie::DURATION_MEASUREMENT,
+                "Duration Measurement",
+            ),
+            (
+                crate::n4_build::pfcp_ie::TIME_OF_FIRST_PACKET,
+                "Time of First Packet",
+            ),
+            (
+                crate::n4_build::pfcp_ie::TIME_OF_LAST_PACKET,
+                "Time of Last Packet",
+            ),
+        ] {
+            assert!(types.contains(&ie), "{what}: {name} missing: {types:?}");
+        }
+    }
+
+    /// #953 review: the time IEs reach the wire on EVERY send path -- the TERMR in a
+    /// Session Deletion Response (the final billing record), the IMMER in a QAURR
+    /// Modification Response, and the quota-exhausted Session Report Request.
+    #[tokio::test]
+    async fn every_report_path_carries_the_time_ies() {
+        // QAURR -> Modification Response (IMMER).
+        let (_server, smf, addr, _rx, dp, upf_seid) = established_session().await;
+        let urr = urr1(&dp, upf_seid);
+        urr.set_measure_duration(true);
+        urr.record(100, true);
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_u8(pfcp_ie::PFCPSMREQ_FLAGS, pfcpsmreq_flags::QAURR);
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 90, &b.build())).await;
+        assert_time_ies(
+            &usage_report_ie_types_in(&resp, pfcp_ie::USAGE_REPORT_SMR),
+            "IMMER",
+        );
+
+        // Deletion -> Deletion Response (TERMR).
+        urr.record(100, true);
+        let resp = exchange(&smf, addr, &encode_pfcp(54, Some(upf_seid), 91, &[])).await;
+        assert_time_ies(
+            &usage_report_ie_types_in(&resp, crate::n4_build::pfcp_ie::USAGE_REPORT_SDR),
+            "TERMR",
+        );
+
+        // Quota exhaustion -> Session Report Request (VOLQU).
+        let (server, smf, _addr, _rx, dp, upf_seid) = established_session().await;
+        let urr = urr1(&dp, upf_seid);
+        urr.set_measure_duration(true);
+        urr.set_quotas(Some(100), None, None, None);
+        urr.record(500, true);
+        server
+            .send_quota_exhausted_report(upf_seid, 0x4242, 1)
+            .await
+            .expect("sent");
+        let mut buf = vec![0u8; 4096];
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), smf.recv_from(&mut buf))
+                .await
+                .expect("arrives")
+                .expect("recv");
+        assert_time_ies(&usage_report_ie_types(&buf[..len]), "VOLQU");
+    }
+
+    /// #818 (Table 7.5.8.3-1) on the wire: a harvested report carries Start Time and End
+    /// Time, a Duration Measurement (the fixture's URR measures DURAT), and Time of
+    /// First / Last Packet.
+    #[tokio::test]
+    async fn a_usage_report_carries_its_time_ies_on_the_wire() {
+        let (server, smf, _addr, _rx, dp, upf_seid) = established_session().await;
+        let urr = urr1(&dp, upf_seid);
+        urr.set_measure_duration(true);
+        urr.set_reporting(Some(1), None, None, None, None);
+        urr.record(300, true);
+        assert_eq!(server.send_due_urr_reports(upf_seid, 0x4242).await, Ok(1));
+        let mut buf = vec![0u8; 4096];
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), smf.recv_from(&mut buf))
+                .await
+                .expect("the report reaches the SMF")
+                .expect("recv");
+        let types = usage_report_ie_types(&buf[..len]);
+        for (ie, name) in [
+            (crate::n4_build::pfcp_ie::START_TIME, "Start Time"),
+            (crate::n4_build::pfcp_ie::END_TIME, "End Time"),
+            (
+                crate::n4_build::pfcp_ie::DURATION_MEASUREMENT,
+                "Duration Measurement",
+            ),
+            (
+                crate::n4_build::pfcp_ie::TIME_OF_FIRST_PACKET,
+                "Time of First Packet",
+            ),
+            (
+                crate::n4_build::pfcp_ie::TIME_OF_LAST_PACKET,
+                "Time of Last Packet",
+            ),
+        ] {
+            assert!(types.contains(&ie), "{name} missing: {types:?}");
+        }
     }
 
     /// #80 criterion 5 (wire half): the event-driven quota report reaches the SMF with
@@ -3522,11 +4397,15 @@ mod tests {
     ///
     /// This is the path `UpfReportEvent::QuotaExhausted` drives, i.e. the one that
     /// reports the instant a subscriber is cut off rather than at the next 10-second
-    /// harvest (TS 29.244 §5.2.2.2.2). It reads the URR's counters WITHOUT resetting
-    /// them, which is asserted here: resetting would make the volume this report carries
-    /// vanish from the next one, under-reporting the usage the quota was measuring.
+    /// harvest (TS 29.244 §5.2.2.2.2).
+    ///
+    /// #821: it TAKES the URR's usage, as every usage report must (§5.2.2.3.1: "upon
+    /// generating a usage report ... reset its ongoing measurement counts"). It used to
+    /// read without resetting, so the next harvest re-sent the same 500 B -- asserted
+    /// here: the counters are zero after the report and the following harvest has
+    /// nothing to send, while the quota latch still gates traffic.
     #[tokio::test]
-    async fn the_event_driven_quota_report_carries_volqu_and_does_not_reset_counters() {
+    async fn the_event_driven_quota_report_carries_volqu_and_takes_the_usage() {
         let (server, smf, addr, _rx, dp, upf_seid) = established_session().await;
         let _ = addr;
 
@@ -3559,18 +4438,214 @@ mod tests {
             0x01,
             "the event-driven report must carry VOLQU"
         );
-        // The counters survive: the harvest owns the reset.
-        let session = dp.sessions.find_by_seid(upf_seid).unwrap();
-        let urrs = session.urrs.read().unwrap();
         assert_eq!(
-            urrs.get(&1)
-                .unwrap()
-                .acc_total_bytes
-                .load(Ordering::Relaxed),
-            500,
-            "an event-driven report must NOT reset the counters, or the volume it \
-             carries disappears from the next report"
+            usage_reports_in_report(&buf[..len]),
+            vec![(1, 500)],
+            "the quota report carries the measured 500 B"
         );
+        // The usage was taken: the next harvest has nothing to re-report.
+        let session = dp.sessions.find_by_seid(upf_seid).unwrap();
+        let urr = session.urrs.read().unwrap().get(&1).cloned().unwrap();
+        assert_eq!(urr.usage().total_bytes(), 0, "the report took the usage");
+        assert!(
+            dp.collect_urr_reports().is_empty(),
+            "the 500 B must not be reported a second time by the harvest"
+        );
+        assert!(
+            urr.is_quota_exhausted(),
+            "reporting does not lift the quota"
+        );
+    }
+
+    fn urr1(
+        dp: &crate::data_plane::DataPlane,
+        upf_seid: u64,
+    ) -> Arc<crate::data_plane::DataPlaneUrr> {
+        dp.sessions
+            .find_by_seid(upf_seid)
+            .unwrap()
+            .urrs
+            .read()
+            .unwrap()
+            .get(&1)
+            .cloned()
+            .unwrap()
+    }
+
+    /// #821: a harvest that finds the session already gone from the PFCP table (a
+    /// Session Deletion ran first) takes NOTHING, so the deletion's TERMR carries the
+    /// usage. Before, the harvest took the usage first and the send then failed with
+    /// "session not found", losing it.
+    #[tokio::test]
+    async fn a_harvest_after_deletion_leaves_the_usage_for_the_termr() {
+        let (server, _smf, _addr, _rx, dp, upf_seid) = established_session().await;
+        let urr = urr1(&dp, upf_seid);
+        urr.set_reporting(Some(1), None, None, None, None);
+        urr.record(700, true);
+        assert_eq!(dp.due_urr_sessions().len(), 1, "a report is due");
+
+        // The deletion removes the PFCP session before it builds its final reports.
+        server.sessions.write().await.remove(&upf_seid);
+        assert_eq!(
+            server.send_due_urr_reports(upf_seid, 0x4242).await,
+            Ok(0),
+            "no session, no take"
+        );
+        assert_eq!(urr.usage().ul_bytes, 700, "the usage is still there");
+        let termr = server.collect_final_usage_reports(upf_seid);
+        assert_eq!(
+            termr
+                .iter()
+                .map(|r| r.volume_measurement.as_ref().unwrap().total_volume)
+                .collect::<Vec<_>>(),
+            vec![Some(700)],
+            "the TERMR carries the usage the harvest did not take"
+        );
+        assert_eq!(urr.usage().total_bytes(), 0, "and a final report takes it");
+    }
+
+    /// #842 review MAJOR: the quota-exhausted report holds the session table from its
+    /// lookup through the take AND the send, so a Session Deletion cannot run between
+    /// the take and the send (its TERMR would miss the bytes, and the report would then
+    /// go out for a session the SMF had deleted). Deterministic: the send is parked on
+    /// the pending-report lock, and while it is parked the table must refuse a writer.
+    /// The harvest's send path is checked the same way.
+    #[tokio::test]
+    async fn reports_hold_the_session_table_from_take_to_send() {
+        let (server, smf, _addr, _rx, dp, upf_seid) = established_session().await;
+        let urr = urr1(&dp, upf_seid);
+        urr.set_quotas(Some(100), None, None, None);
+        assert_eq!(
+            urr.record(500, true),
+            crate::data_plane::UrrOutcome::QuotaJustExhausted
+        );
+
+        for path in ["quota", "harvest"] {
+            if path == "harvest" {
+                urr.set_quotas(None, None, None, None);
+                urr.set_reporting(Some(1), None, None, None, None);
+                urr.record(300, true);
+            }
+            let parked = server.pending_reports.lock().await;
+            let task = {
+                let server = Arc::clone(&server);
+                tokio::spawn(async move {
+                    if path == "quota" {
+                        server
+                            .send_quota_exhausted_report(upf_seid, 0x4242, 1)
+                            .await
+                            .map(|_| 1)
+                    } else {
+                        server.send_due_urr_reports(upf_seid, 0x4242).await
+                    }
+                })
+            };
+            // Let the task run up to the parked send.
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(urr.usage().total_bytes(), 0, "{path}: the usage was taken");
+            assert!(
+                server.sessions.try_write().is_err(),
+                "{path}: a deletion must not get the table between the take and the send"
+            );
+            drop(parked);
+            assert_eq!(task.await.unwrap(), Ok(1), "{path}: sent");
+            let mut buf = vec![0u8; 4096];
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(2), smf.recv_from(&mut buf))
+                    .await
+                    .expect("the report reaches the SMF");
+            assert!(
+                server.sessions.try_write().is_ok(),
+                "{path}: released after the send"
+            );
+        }
+    }
+
+    /// #842 review minor: a failed harvest send restores the usage while the session
+    /// table is STILL HELD, so a Session Deletion waiting on the table cannot build its
+    /// TERMR in between and miss the restored bytes. Deterministic: the test holds the
+    /// table itself and checks the usage is back before it lets go.
+    #[tokio::test]
+    async fn a_failed_harvest_send_restores_before_the_table_is_released() {
+        let (server, _smf, _addr, _rx, dp, upf_seid) = established_session().await;
+        let urr = urr1(&dp, upf_seid);
+        urr.set_reporting(Some(1), None, None, None, None);
+        server
+            .sessions
+            .write()
+            .await
+            .get_mut(&upf_seid)
+            .unwrap()
+            .smf_addr = "[::1]:8805".parse().unwrap();
+        urr.record(600, true);
+
+        let table = server.sessions.read().await;
+        assert!(server
+            .send_due_urr_reports_held(&table, upf_seid, 0x4242)
+            .await
+            .is_err());
+        assert_eq!(
+            urr.usage().ul_bytes,
+            600,
+            "restored while the table is held, so a waiting deletion's TERMR sees it"
+        );
+        drop(table);
+        let termr = server.collect_final_usage_reports(upf_seid);
+        assert_eq!(
+            termr
+                .iter()
+                .filter_map(|r| r.volume_measurement.as_ref()?.total_volume)
+                .sum::<u64>(),
+            600
+        );
+    }
+
+    /// #821 + #780 re-review: the harvest's send path end to end. A due report is
+    /// taken and sent to the SMF while the session is held; a report whose send FAILS
+    /// hands its usage back and is counted in `upf_dataplane_urr_reports_restored_total`.
+    #[tokio::test]
+    async fn the_harvest_send_path_sends_or_restores_and_counts_it() {
+        let (server, smf, _addr, _rx, dp, upf_seid) = established_session().await;
+        let urr = urr1(&dp, upf_seid);
+        urr.set_reporting(Some(1), None, None, None, None);
+
+        urr.record(300, true);
+        assert_eq!(server.send_due_urr_reports(upf_seid, 0x4242).await, Ok(1));
+        let mut buf = vec![0u8; 4096];
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), smf.recv_from(&mut buf))
+                .await
+                .expect("the report reaches the SMF")
+                .expect("recv");
+        assert_eq!(usage_reports_in_report(&buf[..len]), vec![(1, 300)]);
+        assert_eq!(urr.usage().total_bytes(), 0);
+
+        // Make the next send fail outright: an IPv6 destination on the IPv4 socket.
+        server
+            .sessions
+            .write()
+            .await
+            .get_mut(&upf_seid)
+            .unwrap()
+            .smf_addr = "[::1]:8805".parse().unwrap();
+        urr.record(400, false);
+        assert!(server.send_due_urr_reports(upf_seid, 0x4242).await.is_err());
+        assert_eq!(
+            urr.usage().dl_bytes,
+            400,
+            "a failed send restores the usage"
+        );
+        assert_eq!(
+            dp.stats.urr_reports_restored.load(Ordering::Relaxed),
+            1,
+            "and is counted"
+        );
+        assert!(dp
+            .stats
+            .render_prometheus()
+            .contains("upf_dataplane_urr_reports_restored_total 1"));
     }
 
     /// QAURR (§8.2.50) was a constant with no reader: an SMF asking for every URR to
@@ -3637,23 +4712,12 @@ mod tests {
              point of the per-URR form over QAURR"
         );
 
-        // THE COUNTERS SURVIVE, and that is upfd's model rather than an oversight.
-        //
-        // THIS DAEMON DIVERGES FROM sgwud DELIBERATELY, and the divergence is
-        // spec-visible, so it is recorded here rather than left for someone to
-        // "align". sgwud's `process_queried_urrs` TAKES the report -- it resets the
-        // measurement period, reading §5.2.2.3's "close the counts and start new
-        // counts" literally -- because sgwud has no harvest and a peek would let the
-        // same bytes be reported again and double-billed.
-        //
-        // upfd is the opposite, because it HAS a harvest: `collect_urr_reports` runs
-        // every 10s and calls `reset_counters` (data_plane.rs:3280), so the harvest
-        // owns the reset. #306 pinned that with its own test -- "an event-driven
-        // report must NOT reset the counters, or the volume it carries disappears
-        // from the next report". Resetting on a query here would destroy volume the
-        // harvest had not yet reported.
-        //
-        // So a second QAURR still carries BOTH URRs' full measurement.
+        // #821: the query TOOK URR 2's usage (TS 29.244 §5.2.2.3.1: every usage
+        // report resets the measurement), now as in sgwud. The old non-resetting read
+        // left the 222 B for the harvest to send again, double-billing it; with the
+        // take being atomic (#771) there is no volume the harvest "had not yet
+        // reported" left to protect. So a following QAURR carries URR 1's untouched
+        // 111 B and NOTHING more for URR 2.
         let mut b = crate::n4_build::PfcpMessageBuilder::new();
         b.add_u8(pfcp_ie::PFCPSMREQ_FLAGS, pfcpsmreq_flags::QAURR);
         let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &b.build())).await;
@@ -3661,9 +4725,9 @@ mod tests {
         reports.sort_unstable();
         assert_eq!(
             reports,
-            vec![(1, 111), (2, 222)],
-            "both URRs keep their volume: in THIS daemon the 10s harvest owns the \
-             reset (#306), unlike sgwud where a query takes it"
+            vec![(1, 111), (2, 0)],
+            "URR 2's 222 B were taken by the first query and must not be reported \
+             twice; URR 1 was not queried and keeps its 111 B"
         );
     }
 
@@ -4243,14 +5307,19 @@ mod tests {
         assert!(server.is_associated().await);
 
         // Peer B (a different source address) releases ITS association.
-        let smf_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let smf_b = UdpSocket::bind("127.0.0.2:0").await.unwrap();
         let mut rel = crate::n4_build::PfcpMessageBuilder::new();
         rel.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
         let resp = exchange(&smf_b, addr, &encode_pfcp(9, None, 2, &rel.build())).await;
 
-        // B is still answered per TS 29.244 7.4.4.2 ...
+        // B is answered with "No established PFCP Association" (TS 29.244 §8.2.1
+        // cause 72: any message but Association Setup / Heartbeat from a peer with no
+        // association) ...
         assert_eq!(resp[1], pfcp_type::ASSOCIATION_RELEASE_RESPONSE);
-        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::NoEstablishedPfcpAssociation as u8
+        );
         // ... but A's association and sessions survive.
         assert!(
             server.is_associated().await,
@@ -4275,7 +5344,7 @@ mod tests {
         assert!(server.is_associated().await);
 
         // Peer B heartbeats with a DIFFERENT RTS.
-        let smf_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let smf_b = UdpSocket::bind("127.0.0.2:0").await.unwrap();
         let mut hb = crate::n4_build::PfcpMessageBuilder::new();
         hb.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, 200);
         let resp = exchange(&smf_b, addr, &encode_pfcp(1, None, 2, &hb.build())).await;
@@ -4310,6 +5379,647 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(evt, PfcpSessionEvent::PeerFailure { .. }));
+    }
+
+    // ── #718: the association is identified by the CP function's Node ID ──
+
+    /// The Node ID every SMF incarnation in these tests advertises. On k8s smfd's
+    /// Node ID comes from `SMF_PFCP_ADDR`, so it is the same across pod restarts
+    /// while the pod IP is not.
+    const SMF_NODE: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 9);
+
+    /// The CP SEID every incarnation hands its first session: smfd without durable
+    /// state derives it from the SM context reference, which restarts at 1 in every
+    /// process (`1 | 0x1000` before the #718 review, `1 << 48 | 1` since). The value
+    /// is arbitrary here; what matters is that each incarnation reuses it.
+    const FIRST_CP_SEID: u64 = 0x1001;
+
+    /// An Association Setup Request body: Node ID, Recovery Time Stamp and, when
+    /// `retain` is `Some`, a PFCP Session Retention Information IE listing those
+    /// CP PFCP entities (empty = keep every session).
+    fn association_setup(node: Ipv4Addr, rts: u32, retain: Option<&[Ipv4Addr]>) -> Vec<u8> {
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_node_id(&NodeId::Ipv4(node));
+        b.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, rts);
+        if let Some(entities) = retain {
+            let mut inner = crate::n4_build::PfcpMessageBuilder::new();
+            for ip in entities {
+                let mut v = vec![0x02]; // V4
+                v.extend_from_slice(&ip.octets());
+                inner.add_tlv(pfcp_ie::CP_PFCP_ENTITY_IP_ADDRESS, &v);
+            }
+            b.add_tlv(pfcp_ie::PFCP_SESSION_RETENTION_INFORMATION, &inner.build());
+        }
+        b.build()
+    }
+
+    /// Associate `smf` and return the Association Setup Response.
+    async fn associate(
+        smf: &UdpSocket,
+        upf: SocketAddr,
+        node: Ipv4Addr,
+        rts: u32,
+        retain: Option<&[Ipv4Addr]>,
+    ) -> Vec<u8> {
+        let resp = exchange(
+            smf,
+            upf,
+            &encode_pfcp(5, None, rts, &association_setup(node, rts, retain)),
+        )
+        .await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        resp
+    }
+
+    /// Whether an Association Setup Response sets PSREI (TS 29.244 §8.2.134).
+    fn psrei(resp: &[u8]) -> bool {
+        let (_, body) = ParsedPfcpHeader::parse(resp).unwrap();
+        let ies = ParsedIe::parse_all(body);
+        ParsedIe::find_ie(&ies, pfcp_ie::PFCPASRSP_FLAGS)
+            .and_then(|ie| ie.value.first().copied())
+            .is_some_and(|f| f & 0x01 != 0)
+    }
+
+    /// Establish one session with CP F-SEID `cp_seid` from `smf`; returns its UPF SEID.
+    async fn establish(server: &PfcpServer, smf: &UdpSocket, upf: SocketAddr, cp_seid: u64) -> u64 {
+        let before: std::collections::HashSet<u64> =
+            server.sessions.read().await.keys().copied().collect();
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_node_id(&NodeId::Ipv4(SMF_NODE));
+        b.add_f_seid(&crate::n4_build::FSeid {
+            seid: cp_seid,
+            ipv4: Some(SMF_NODE),
+            ipv6: None,
+        });
+        b.add_tlv(pfcp_ie::CREATE_PDR, &pdr_body(1, 100, 1, 1, 1));
+        b.add_tlv(pfcp_ie::CREATE_FAR, &far_body(1, 0x02));
+        let resp = exchange(smf, upf, &encode_pfcp(50, Some(0), 50, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        let after = server.sessions.read().await;
+        *after
+            .keys()
+            .find(|k| !before.contains(k))
+            .expect("the accepted establishment must be held")
+    }
+
+    /// SECURITY: only the associated CP function may modify, delete or establish
+    /// sessions, or release the association. A host that is NOT the associated SMF --
+    /// here one that guesses a live SEID -- gets "No established PFCP Association"
+    /// (cause 72, §5.8.3) and NOTHING is executed; the attempt is counted. Before, a
+    /// Session Modification from any source re-pointed a UE's downlink tunnel and a
+    /// Deletion tore the session down.
+    #[tokio::test]
+    async fn session_messages_from_a_host_that_is_not_the_associated_smf_are_refused() {
+        let (server, smf, addr, _rx) = spawn_test_server().await;
+        let assoc = build_association_setup_request_payload(Some(100));
+        let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+        let upf_seid = establish(&server, &smf, addr, 0x5ec).await;
+        let dl_before = server.sessions.read().await[&upf_seid].dl_teid;
+        let before = PFCP_UNAUTHORIZED.load(Ordering::Relaxed);
+
+        let attacker = UdpSocket::bind("127.0.0.66:0").await.unwrap();
+        // Modification re-pointing the downlink tunnel.
+        let mut far = crate::n4_build::PfcpMessageBuilder::new();
+        far.add_u32(pfcp_ie::FAR_ID, 1);
+        far.add_u8(pfcp_ie::APPLY_ACTION, 0x02);
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(pfcp_ie::UPDATE_FAR, &far.build());
+        let resp = exchange(
+            &attacker,
+            addr,
+            &encode_pfcp(52, Some(upf_seid), 60, &b.build()),
+        )
+        .await;
+        assert_eq!(resp[1], pfcp_type::SESSION_MODIFICATION_RESPONSE);
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::NoEstablishedPfcpAssociation as u8
+        );
+        assert_eq!(server.sessions.read().await[&upf_seid].dl_teid, dl_before);
+
+        // Deletion: the session survives.
+        let resp = exchange(&attacker, addr, &encode_pfcp(54, Some(upf_seid), 61, &[])).await;
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::NoEstablishedPfcpAssociation as u8
+        );
+        assert!(
+            server.sessions.read().await.contains_key(&upf_seid),
+            "not deleted"
+        );
+
+        // Establishment: no session is created for it.
+        let n = server.sessions.read().await.len();
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_node_id(&NodeId::Ipv4(SMF_NODE));
+        b.add_f_seid(&crate::n4_build::FSeid {
+            seid: 0xbad,
+            ipv4: Some(SMF_NODE),
+            ipv6: None,
+        });
+        b.add_tlv(pfcp_ie::CREATE_PDR, &pdr_body(1, 100, 1, 1, 1));
+        b.add_tlv(pfcp_ie::CREATE_FAR, &far_body(1, 0x02));
+        let resp = exchange(&attacker, addr, &encode_pfcp(50, Some(0), 62, &b.build())).await;
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::NoEstablishedPfcpAssociation as u8
+        );
+        assert_eq!(server.sessions.read().await.len(), n, "no session created");
+
+        assert!(
+            server.is_associated().await,
+            "the real association is untouched"
+        );
+        assert!(
+            PFCP_UNAUTHORIZED.load(Ordering::Relaxed) >= before + 3,
+            "counted"
+        );
+
+        // The associated SMF itself is still served.
+        let resp = exchange(&smf, addr, &encode_pfcp(54, Some(upf_seid), 63, &[])).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+    }
+
+    /// SECURITY: a response from a host that is not where our request went is dropped:
+    /// it can neither acknowledge our Session Report (so it keeps retransmitting) nor
+    /// keep a dead peer looking alive with a Heartbeat Response.
+    #[tokio::test]
+    async fn responses_from_the_wrong_host_are_dropped() {
+        let (server, smf, upf_seid, smf_seid) = server_with_session().await;
+        server
+            .send_downlink_data_report(upf_seid, smf_seid, 2, Some(9))
+            .await
+            .unwrap();
+        let (hdr, _) = {
+            let mut buf = vec![0u8; 2048];
+            let (len, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), smf.recv_from(&mut buf))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let (h, _) = ParsedPfcpHeader::parse(&buf[..len]).unwrap();
+            (h.sequence_number, ())
+        };
+        let mut ok = crate::n4_build::PfcpMessageBuilder::new();
+        ok.add_u8(pfcp_ie::CAUSE, PfcpCause::RequestAccepted as u8);
+        let resp = encode_pfcp(
+            pfcp_type::SESSION_REPORT_RESPONSE,
+            Some(smf_seid),
+            hdr,
+            &ok.build(),
+        );
+        let attacker: SocketAddr = "127.0.0.66:8805".parse().unwrap();
+        server.handle_message(&resp, attacker).await.unwrap();
+        assert_eq!(
+            server.pending_report_count().await,
+            1,
+            "still waiting for the SMF"
+        );
+
+        // The real SMF's answer does clear it.
+        server
+            .handle_message(&resp, smf.local_addr().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(server.pending_report_count().await, 0);
+    }
+
+    /// Send an Association Setup Request from `sock` and return the response cause.
+    async fn setup_cause(sock: &UdpSocket, upf: SocketAddr, node: Ipv4Addr, rts: u32) -> u8 {
+        let resp = exchange(
+            sock,
+            upf,
+            &encode_pfcp(5, None, rts, &association_setup(node, rts, None)),
+        )
+        .await;
+        assert_eq!(resp[1], pfcp_type::ASSOCIATION_SETUP_RESPONSE);
+        response_cause(&resp)
+    }
+
+    /// SECURITY (#968 review, BLOCKER 1): with an allowlist configured, a host that is
+    /// not on it cannot associate -- with its own Node ID or with the real SMF's -- and
+    /// a refused Setup touches nothing: the association, its sessions and the real
+    /// SMF's control of them all survive. Before, one Setup from any host was accepted
+    /// (cause 1), replaced the association, deleted every session and left the real
+    /// SMF answered with cause 72.
+    #[tokio::test]
+    async fn with_an_allowlist_a_stranger_cannot_associate_or_take_anything() {
+        let (server, smf, upf, _rx) = spawn_test_server().await;
+        server.set_allowed_peers(PeerAllowlist::parse("127.0.0.1").unwrap());
+        let stranger = UdpSocket::bind("127.0.0.66:0").await.unwrap();
+        // With no association up, the stranger still cannot be the first to associate.
+        assert_eq!(
+            setup_cause(&stranger, upf, SMF_NODE, 6).await,
+            PfcpCause::RequestRejected as u8
+        );
+        assert!(!server.is_associated().await);
+
+        associate(&smf, upf, SMF_NODE, 100, None).await;
+        let x = establish(&server, &smf, upf, FIRST_CP_SEID).await;
+        let before = PFCP_UNAUTHORIZED.load(Ordering::Relaxed);
+
+        for node in [Ipv4Addr::new(127, 0, 0, 66), SMF_NODE] {
+            assert_eq!(
+                setup_cause(&stranger, upf, node, 7).await,
+                PfcpCause::RequestRejected as u8,
+                "Node ID {node}: refused with cause 64"
+            );
+        }
+        let smf_addr = smf.local_addr().unwrap();
+        assert_eq!(held(&server).await, vec![(x, FIRST_CP_SEID, smf_addr)]);
+        assert_eq!(
+            server.association.read().await.as_ref().unwrap().peer_addr,
+            smf_addr,
+            "the association is still the real SMF's"
+        );
+        assert!(PFCP_UNAUTHORIZED.load(Ordering::Relaxed) >= before + 2);
+
+        // The stranger is still refused session messages; the real SMF is served.
+        let resp = exchange(&stranger, upf, &encode_pfcp(54, Some(x), 9, &[])).await;
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::NoEstablishedPfcpAssociation as u8
+        );
+        let resp = exchange(&smf, upf, &encode_pfcp(54, Some(x), 10, &[])).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+    }
+
+    /// SECURITY (#968 re-review, fail closed): with NO allowlist configured, no host
+    /// can associate -- not the first one to ask, which used to win and then lock the
+    /// real SMF out -- and so nothing else is served either. `0.0.0.0/0` is the
+    /// explicit lab opt-out.
+    #[tokio::test]
+    async fn without_an_allowlist_no_host_can_associate() {
+        let (server, smf, upf, _rx) = spawn_test_server().await;
+        server.set_allowed_peers(PeerAllowlist::default());
+        let other = UdpSocket::bind("127.0.0.66:0").await.unwrap();
+        for sock in [&smf, &other] {
+            assert_eq!(
+                setup_cause(sock, upf, SMF_NODE, 7).await,
+                PfcpCause::RequestRejected as u8
+            );
+        }
+        assert!(!server.is_associated().await);
+
+        server.set_allowed_peers(PeerAllowlist::parse("0.0.0.0/0").unwrap());
+        assert_eq!(
+            setup_cause(&other, upf, Ipv4Addr::new(127, 0, 0, 66), 8).await,
+            PfcpCause::RequestAccepted as u8,
+            "the explicit any-host opt-out"
+        );
+    }
+
+    /// #968 round 3: a listed host may move a LIVE association only as the same CP
+    /// function -- same Node ID (the #718 new-pod-IP case) or one of its own hosts. A
+    /// DIFFERENT CP function from another listed host is refused (cause 64) and the
+    /// sessions stay; once the association is released, it may associate.
+    #[tokio::test]
+    async fn a_listed_host_moves_a_live_association_only_as_the_same_cp_function() {
+        let (server, smf_a, upf, _rx) = spawn_test_server().await;
+        server.set_allowed_peers(PeerAllowlist::parse("127.0.0.1, 127.0.0.2, 127.0.0.3").unwrap());
+        associate(&smf_a, upf, SMF_NODE, 100, None).await;
+        let x = establish(&server, &smf_a, upf, FIRST_CP_SEID).await;
+
+        let other_cp = UdpSocket::bind("127.0.0.2:0").await.unwrap();
+        assert_eq!(
+            setup_cause(&other_cp, upf, Ipv4Addr::new(127, 0, 0, 2), 5).await,
+            PfcpCause::RequestRejected as u8,
+            "another CP function cannot evict the live one"
+        );
+        assert_eq!(held(&server).await.len(), 1, "{x:#x} survives");
+        assert_eq!(
+            server.association.read().await.as_ref().unwrap().peer_addr,
+            smf_a.local_addr().unwrap()
+        );
+
+        // The same CP function (same Node ID) at a new listed address moves it.
+        let moved = UdpSocket::bind("127.0.0.3:0").await.unwrap();
+        assert_eq!(
+            setup_cause(&moved, upf, SMF_NODE, 6).await,
+            PfcpCause::RequestAccepted as u8
+        );
+        assert_eq!(
+            server.association.read().await.as_ref().unwrap().peer_addr,
+            moved.local_addr().unwrap()
+        );
+
+        // Released: now the other CP function may associate.
+        let mut rel = crate::n4_build::PfcpMessageBuilder::new();
+        rel.add_node_id(&NodeId::Ipv4(SMF_NODE));
+        let resp = exchange(&moved, upf, &encode_pfcp(9, None, 7, &rel.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(
+            setup_cause(&other_cp, upf, Ipv4Addr::new(127, 0, 0, 2), 8).await,
+            PfcpCause::RequestAccepted as u8
+        );
+    }
+
+    /// #968 review, MAJOR 3: the association is the CP function's, not one UDP
+    /// 4-tuple. Session messages from the SMF's host on ANOTHER source port, and from
+    /// the address its IPv4 Node ID names, are served.
+    #[tokio::test]
+    async fn the_associated_smf_is_served_from_another_port_and_its_node_id_address() {
+        let (server, smf, upf, _rx) = spawn_test_server().await;
+        associate(&smf, upf, SMF_NODE, 100, None).await;
+        let x = establish(&server, &smf, upf, FIRST_CP_SEID).await;
+        let y = establish(&server, &smf, upf, FIRST_CP_SEID + 1).await;
+
+        let other_port = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let resp = exchange(&other_port, upf, &encode_pfcp(54, Some(x), 20, &[])).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+
+        let node_id_addr = UdpSocket::bind(SocketAddr::from((SMF_NODE, 0)))
+            .await
+            .unwrap();
+        let resp = exchange(&node_id_addr, upf, &encode_pfcp(54, Some(y), 21, &[])).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+    }
+
+    /// An FQDN Node ID (§8.2.38 type 2) decodes from its label encoding, and its
+    /// resolved addresses join the association: an SMF named `localhost` that set up
+    /// from 127.0.0.2 is served from 127.0.0.1.
+    #[tokio::test]
+    async fn an_fqdn_node_id_adds_the_addresses_it_resolves_to() {
+        assert_eq!(
+            node_id_fqdn(b"\x02\x03smf\x04core\x03lab").as_deref(),
+            Some("smf.core.lab")
+        );
+        assert_eq!(node_id_fqdn(b"\x02\x05sm"), None, "truncated label");
+        assert_eq!(node_id_fqdn(&[0, 127, 0, 0, 1]), None, "not an FQDN");
+
+        let (server, _smf, upf, _rx) = spawn_test_server().await;
+        server.set_allowed_peers(PeerAllowlist::parse("127.0.0.1, 127.0.0.2").unwrap());
+        let smf = UdpSocket::bind("127.0.0.2:0").await.unwrap();
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(pfcp_ie::NODE_ID, b"\x02\x09localhost");
+        b.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, 1);
+        let resp = exchange(&smf, upf, &encode_pfcp(5, None, 1, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        let assoc = server.association.read().await.clone().unwrap();
+        assert!(
+            assoc.owns(IpAddr::from([127, 0, 0, 1])),
+            "{:?}",
+            assoc.addrs
+        );
+        assert!(assoc.owns(IpAddr::from([127, 0, 0, 2])));
+        assert!(!assoc.owns(IpAddr::from([127, 0, 0, 3])));
+    }
+
+    /// #968 review, MAJOR 2: a message of an unknown type is ignored (TS 29.244 §7.6),
+    /// not answered with type `t + 1` -- for type 255 that addition overflowed and
+    /// panicked the receive task in debug builds. The server keeps serving.
+    #[tokio::test]
+    async fn a_message_of_unknown_type_is_ignored_and_the_server_keeps_serving() {
+        let (_server, smf, upf, _rx) = spawn_test_server().await;
+        let stranger = UdpSocket::bind("127.0.0.66:0").await.unwrap();
+        for t in [255u8, 99, 18] {
+            stranger
+                .send_to(&encode_pfcp(t, None, 3, &[]), upf)
+                .await
+                .unwrap();
+            let mut buf = [0u8; 64];
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    stranger.recv_from(&mut buf)
+                )
+                .await
+                .is_err(),
+                "type {t} must not be answered"
+            );
+        }
+        let mut hb = crate::n4_build::PfcpMessageBuilder::new();
+        hb.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, 1);
+        let resp = exchange(&smf, upf, &encode_pfcp(1, None, 4, &hb.build())).await;
+        assert_eq!(resp[1], pfcp_type::HEARTBEAT_RESPONSE, "still serving");
+    }
+
+    /// #995: the UPF's own Recovery Time Stamp is NTP-era seconds (TS 29.244
+    /// §8.2.65), and a pre-#995 peer's Unix-seconds stamp is read in the NTP reading.
+    #[tokio::test]
+    async fn recovery_time_stamps_are_ntp_seconds() {
+        let (server, smf, addr, _rx) = spawn_test_server().await;
+        let now = nextgcore_pfcp::recovery_time::now();
+        assert!(now.wrapping_sub(server.recovery_time_stamp) < 60);
+        let unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 3600;
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, unix as u32);
+        assert_eq!(
+            crate::n4_build::parse_recovery_time_stamp(&b.build()),
+            Some(unix as u32),
+            "the parser returns the wire value"
+        );
+        // ... and the association stores it in the NTP reading.
+        let assoc = build_association_setup_request_payload(Some(unix as u32));
+        let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+        assert_eq!(
+            server
+                .association
+                .read()
+                .await
+                .as_ref()
+                .unwrap()
+                .recovery_time_stamp,
+            nextgcore_pfcp::recovery_time::from_unix_secs(unix)
+        );
+    }
+
+    /// The UPF's sessions as (UPF SEID, CP SEID, address it reports to).
+    async fn held(server: &PfcpServer) -> Vec<(u64, u64, SocketAddr)> {
+        let mut v: Vec<_> = server
+            .sessions
+            .read()
+            .await
+            .values()
+            .map(|s| (s.upf_seid, s.smf_seid, s.smf_addr))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// The first Session Report Request that reaches `smf`, as (CP SEID in the
+    /// header, PDR ID in its Downlink Data Report).
+    async fn first_report(smf: &UdpSocket) -> (u64, u16) {
+        let pkt = recv_report(smf).await;
+        let (header, body) = ParsedPfcpHeader::parse(&pkt).unwrap();
+        assert_eq!(header.msg_type, pfcp_type::SESSION_REPORT_REQUEST);
+        let ies = ParsedIe::parse_all(body);
+        let dldr = ParsedIe::find_ie(&ies, 83).expect("Downlink Data Report (IE 83)");
+        let inner = ParsedIe::parse_all(&dldr.value);
+        let pdr = ParsedIe::find_ie(&inner, pfcp_ie::PDR_ID).expect("PDR ID");
+        (
+            header.seid,
+            u16::from_be_bytes([pdr.value[0], pdr.value[1]]),
+        )
+    }
+
+    /// #718: the cross-UE Session Report. Three SMF incarnations with one Node ID:
+    /// the first at address A, the second at a new pod IP B, the third back at A
+    /// (pod IPs are recycled). Each one starts from an empty context, so each gives
+    /// its first UE the same CP SEID.
+    ///
+    /// On main, upfd keyed the association by source address, so neither
+    /// re-association deleted anything. Incarnation 1's session survived, still
+    /// reporting to A, and its Session Reports reached incarnation 3 carrying
+    /// incarnation 3's own UE's CP SEID. Incarnation 3 then pages, or charges, the
+    /// wrong subscriber. TS 29.244 §6.2.6.2.2: an Association Setup Request from a
+    /// Node ID that already has an association overwrites it "regardless of the
+    /// Recovery Timestamp" and deletes the existing association's sessions.
+    #[tokio::test]
+    async fn a_restarted_smf_at_a_new_address_does_not_inherit_its_predecessors_sessions() {
+        let (server, smf_a, upf, mut rx) = spawn_test_server().await;
+        let smf_b = UdpSocket::bind("127.0.0.2:0").await.unwrap();
+        // A new pod IP: accepted because the deployment allowlists its CP range (#968).
+        server.set_allowed_peers(PeerAllowlist::parse("127.0.0.0/8").unwrap());
+        let (a, b) = (smf_a.local_addr().unwrap(), smf_b.local_addr().unwrap());
+
+        // Incarnation 1 at A: UE X.
+        let resp = associate(&smf_a, upf, SMF_NODE, 100, None).await;
+        assert!(!psrei(&resp), "nothing to retain on a first association");
+        let x = establish(&server, &smf_a, upf, FIRST_CP_SEID).await;
+
+        // Incarnation 2 at B: the restarted pod, empty context, UE Y.
+        associate(&smf_b, upf, SMF_NODE, 200, None).await;
+        let y = establish(&server, &smf_b, upf, FIRST_CP_SEID).await;
+
+        // Incarnation 3, back at A: UE Z.
+        associate(&smf_a, upf, SMF_NODE, 300, None).await;
+        let z = establish(&server, &smf_a, upf, FIRST_CP_SEID).await;
+
+        // Every session the UPF still holds reports downlink data: Z's with PDR 7,
+        // any survivor with PDR 1. Survivors go first, so the first report A receives
+        // is a survivor's whenever one reports to A.
+        for (seid, cp_seid, _) in held(&server).await {
+            if seid != z {
+                server
+                    .send_downlink_data_report(seid, cp_seid, 1, None)
+                    .await
+                    .unwrap();
+            }
+        }
+        server
+            .send_downlink_data_report(z, FIRST_CP_SEID, 7, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            first_report(&smf_a).await,
+            (FIRST_CP_SEID, 7),
+            "incarnation 3 must receive only its own UE's report; a PDR 1 report under its UE's \
+             CP SEID is incarnation 1's session (UPF SEID {x:#x}) reaching the wrong subscriber"
+        );
+        // And the UPF holds exactly the sessions the live SMF knows about.
+        assert_eq!(
+            held(&server).await,
+            vec![(z, FIRST_CP_SEID, a)],
+            "the sessions of incarnations 1 ({x:#x}) and 2 ({y:#x}, at {b}) must be gone"
+        );
+        // The data plane was told about each deletion.
+        let mut failures = 0;
+        while let Ok(evt) = rx.try_recv() {
+            if matches!(evt, PfcpSessionEvent::PeerFailure { .. }) {
+                failures += 1;
+            }
+        }
+        assert_eq!(failures, 2, "one data-plane flush per replaced association");
+    }
+
+    /// #718: a CP function that restored its sessions (durable state) asks for them
+    /// to be kept with a PFCP Session Retention Information IE. With no CP PFCP
+    /// Entity IP Address in it, every session is kept (TS 29.244 Table 7.4.4.1-2) and
+    /// PSREI says so. The kept session now reports to the new address, because the
+    /// old pod IP is dead.
+    #[tokio::test]
+    async fn a_retention_request_from_the_same_node_keeps_the_sessions_and_says_so() {
+        let (server, smf_a, upf, _rx) = spawn_test_server().await;
+        let smf_b = UdpSocket::bind("127.0.0.2:0").await.unwrap();
+        // A new pod IP: accepted because the deployment allowlists its CP range (#968).
+        server.set_allowed_peers(PeerAllowlist::parse("127.0.0.0/8").unwrap());
+        associate(&smf_a, upf, SMF_NODE, 100, None).await;
+        let x = establish(&server, &smf_a, upf, FIRST_CP_SEID).await;
+
+        let resp = associate(&smf_b, upf, SMF_NODE, 200, Some(&[])).await;
+        assert!(psrei(&resp), "PSREI: the requested sessions were retained");
+        assert_eq!(
+            held(&server).await,
+            vec![(x, FIRST_CP_SEID, smf_b.local_addr().unwrap())]
+        );
+        server
+            .send_downlink_data_report(x, FIRST_CP_SEID, 1, None)
+            .await
+            .unwrap();
+        assert_eq!(first_report(&smf_b).await, (FIRST_CP_SEID, 1));
+    }
+
+    /// #718: a retention request naming CP PFCP entities keeps only those
+    /// entities' sessions. This session's CP F-SEID is 127.0.0.9, which the
+    /// request does not list.
+    #[tokio::test]
+    async fn a_retention_request_keeps_only_the_listed_cp_entities_sessions() {
+        let (server, smf_a, upf, _rx) = spawn_test_server().await;
+        associate(&smf_a, upf, SMF_NODE, 100, None).await;
+        let x = establish(&server, &smf_a, upf, FIRST_CP_SEID).await;
+
+        let resp = associate(
+            &smf_a,
+            upf,
+            SMF_NODE,
+            100,
+            Some(&[Ipv4Addr::new(10, 9, 9, 9)]),
+        )
+        .await;
+        assert!(
+            psrei(&resp),
+            "the request was honoured, for the entities it named"
+        );
+        assert!(held(&server).await.is_empty(), "{x:#x} was not requested");
+
+        let y = establish(&server, &smf_a, upf, FIRST_CP_SEID).await;
+        let resp = associate(&smf_a, upf, SMF_NODE, 100, Some(&[SMF_NODE])).await;
+        assert!(psrei(&resp));
+        assert_eq!(
+            held(&server).await,
+            vec![(y, FIRST_CP_SEID, smf_a.local_addr().unwrap())],
+            "the listed entity's session is kept"
+        );
+    }
+
+    /// #718 / #968 round 3: retention is defined for the SAME Node ID only, and a
+    /// DIFFERENT CP function cannot replace a live association at all: its Setup is
+    /// refused (cause 64), so it can neither adopt nor delete the previous one's
+    /// sessions.
+    #[tokio::test]
+    async fn a_different_cp_function_cannot_retain_the_previous_ones_sessions() {
+        let (server, smf_a, upf, _rx) = spawn_test_server().await;
+        let smf_b = UdpSocket::bind("127.0.0.2:0").await.unwrap();
+        server.set_allowed_peers(PeerAllowlist::parse("127.0.0.0/8").unwrap());
+        associate(&smf_a, upf, SMF_NODE, 100, None).await;
+        let x = establish(&server, &smf_a, upf, FIRST_CP_SEID).await;
+
+        let resp = exchange(
+            &smf_b,
+            upf,
+            &encode_pfcp(
+                5,
+                None,
+                100,
+                &association_setup(Ipv4Addr::new(127, 0, 0, 10), 100, Some(&[])),
+            ),
+        )
+        .await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestRejected as u8);
+        assert!(
+            !psrei(&resp),
+            "nothing was retained for a different Node ID"
+        );
+        assert_eq!(
+            held(&server).await,
+            vec![(x, FIRST_CP_SEID, smf_a.local_addr().unwrap())],
+            "and nothing was deleted"
+        );
     }
 
     #[test]
@@ -4591,6 +6301,8 @@ mod tests {
                 upf_seid,
                 smf_seid,
                 smf_addr,
+                cp_f_seid_ipv4: None,
+                cp_f_seid_ipv6: None,
                 ue_ipv4: Some(Ipv4Addr::new(10, 45, 0, 7)),
                 ul_teid: 0x100,
                 dl_teid: 0x200,
@@ -4662,6 +6374,56 @@ mod tests {
             .await
             .is_err(),
             "no retransmission after acknowledgement"
+        );
+    }
+
+    /// #780 review m2: a harvested URR report abandoned after N1 hands its usage back
+    /// to the URR, so the next report carries it instead of it vanishing.
+    #[tokio::test]
+    async fn an_abandoned_urr_report_returns_its_usage_to_the_urr() {
+        let (server, smf, upf_seid, smf_seid) = server_with_session().await;
+        let dp = Arc::new(crate::data_plane::DataPlane::new(Arc::new(
+            std::sync::atomic::AtomicBool::new(false),
+        )));
+        dp.add_session_from_pfcp(
+            upf_seid,
+            smf_seid,
+            std::net::Ipv4Addr::new(10, 45, 7, 80),
+            0x7801,
+            0x7802,
+            "127.0.0.1:2152".parse().unwrap(),
+            Some(5),
+            Some(9),
+        );
+        let urr = Arc::new(crate::data_plane::DataPlaneUrr::new(1));
+        urr.set_reporting(Some(1), None, None, None, None);
+        dp.sessions
+            .find_by_seid(upf_seid)
+            .unwrap()
+            .urrs
+            .write()
+            .unwrap()
+            .insert(1, Arc::clone(&urr));
+        server.set_data_plane(Arc::clone(&dp));
+
+        urr.record(1234, true);
+        let reports = dp.collect_urr_reports();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(urr.usage().total_bytes(), 0, "taken by the harvest");
+        server
+            .send_urr_report(upf_seid, smf_seid, reports)
+            .await
+            .unwrap();
+        let _ = recv_report(&smf).await;
+        for _ in 0..=PFCP_N1_MAX_RETRANSMIT {
+            server.test_expire_pending_t1().await;
+            server.retransmit_pending_reports().await;
+        }
+        assert_eq!(server.pending_report_count().await, 0, "abandoned after N1");
+        assert_eq!(
+            urr.usage().ul_bytes,
+            1234,
+            "the abandoned report's usage is back on the URR for the next report"
         );
     }
 

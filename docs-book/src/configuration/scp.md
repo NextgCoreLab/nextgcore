@@ -70,7 +70,7 @@ All of the `scp`-level keys are shipped **commented out**, so the built-in defau
 
 **Inert** — present in the shipped file and not read anywhere:
 
-- **`logger.file.path` and `logger.level`.** The log level comes from the CLI flag `-e/--log-level` (default `info`); `init_logging` builds `env_logger` with an explicit filter level, so even `RUST_LOG` (set to `info` by the compose file's common environment) is not consulted. There is no working log-file output (`-l/--log-file` is accepted but unused).
+- **`logger.level` is read; `logger.file.path` is not.** The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691). There is no working log-file output (`-l/--log-file` is accepted but unused).
 - **`global.max.ue` / `global.max.peer`.** Not read; `scp_context_init()` takes no size.
 - **`scp.sbi.tls.ca` and `scp.sbi.tls.min_version`.** There is no CA-bundle or minimum-version knob in the code; the rest of the `tls` block *is* read.
 
@@ -82,7 +82,7 @@ From the clap `Args` struct in `src/bins/nextgcore-scpd/src/main.rs`:
 |---|---|---|---|
 | `-c, --config` | path | `/etc/nextgcore/scp.yaml` | Configuration file path. Parsed; see the live-fields table above. |
 | `-l, --log-file` | path | unset | Log file path — **accepted but unused** by `init_logging`. |
-| `-e, --log-level` | string | `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`); unrecognized values fall back to `info`. |
+| `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-m, --no-color` | flag | off | Disable color output. |
 | `-k, --kill` | flag | off | Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor. |
 | `--sbi-addr` | string | `127.0.0.1` | SBI server bind address (docker deployments pass the container IP). Precedence: flag > `SCP_SBI_ADDR` > `scp.sbi.server[0].address` > default. |

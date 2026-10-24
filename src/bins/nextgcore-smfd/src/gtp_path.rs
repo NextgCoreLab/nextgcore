@@ -290,9 +290,32 @@ impl GtpPathManager {
         self.gtpu_addr6 = addr6;
     }
 
-    /// Generate next sequence number
+    /// Generate the next sequence number for an initial message that is not a
+    /// Command: 1..=0x7FFFFF, wrapping back to 1 (#792 review). GTPv2-C carries
+    /// 24 bits (TS 29.274 §5.5), and §7.6 reserves the MSB for Command
+    /// exchanges, so an unbounded counter would put a Command's bit, then
+    /// truncated garbage, on the wire.
     pub fn next_sequence(&self) -> u32 {
-        self.sequence_generator.fetch_add(1, Ordering::SeqCst)
+        let max = nextgcore_gtp::v2::GTP2_MAX_INITIAL_SEQUENCE;
+        let prev = self
+            .sequence_generator
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |s| {
+                Some(if s == 0 || s > max {
+                    // Out of range (never in normal running): hand out 1 now
+                    // and continue from 2, so 1 is not handed out twice.
+                    2
+                } else if s == max {
+                    1
+                } else {
+                    s + 1
+                })
+            })
+            .unwrap_or(1);
+        if prev == 0 || prev > max {
+            1
+        } else {
+            prev
+        }
     }
 
     /// Generate next transaction ID
@@ -744,261 +767,6 @@ pub mod gtp_modify_flags {
 }
 
 // ============================================================================
-// Unit Tests
-// ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_gtp_xact_new() {
-        let xact = GtpXact::new(1, 100, gtp2_message_type::CREATE_SESSION_REQUEST);
-
-        assert_eq!(xact.id, 1);
-        assert_eq!(xact.sequence, 100);
-        assert_eq!(xact.message_type, gtp2_message_type::CREATE_SESSION_REQUEST);
-        assert_eq!(xact.state, GtpXactState::Initial);
-        assert_eq!(xact.retry_count, 0);
-    }
-
-    #[test]
-    fn test_gtp_xact_timeout() {
-        let xact = GtpXact::new(1, 100, gtp2_message_type::CREATE_SESSION_REQUEST);
-
-        // Should not be timed out immediately
-        assert!(!xact.is_timed_out(Duration::from_secs(1)));
-    }
-
-    #[test]
-    fn test_gtp_xact_retry() {
-        let mut xact = GtpXact::new(1, 100, gtp2_message_type::CREATE_SESSION_REQUEST);
-
-        assert!(xact.can_retry());
-
-        for _ in 0..GTP_XACT_RETRY_COUNT {
-            xact.increment_retry();
-        }
-
-        assert!(!xact.can_retry());
-        assert_eq!(xact.retry_count, GTP_XACT_RETRY_COUNT);
-    }
-
-    #[test]
-    fn test_gtp_node_ipv4() {
-        let node = GtpNode::new_ipv4(1, Ipv4Addr::new(192, 168, 1, 1), GTPC_PORT);
-
-        assert_eq!(node.id, 1);
-        assert_eq!(node.addr, Some(Ipv4Addr::new(192, 168, 1, 1)));
-        assert_eq!(node.port, GTPC_PORT);
-        assert!(node.reachable);
-
-        let socket_addr = node.socket_addr().unwrap();
-        assert_eq!(socket_addr.port(), GTPC_PORT);
-    }
-
-    #[test]
-    fn test_gtp_node_ipv6() {
-        let node = GtpNode::new_ipv6(1, Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), GTPC_PORT);
-
-        assert_eq!(node.id, 1);
-        assert!(node.addr.is_none());
-        assert!(node.addr6.is_some());
-        assert_eq!(node.port, GTPC_PORT);
-    }
-
-    #[test]
-    fn test_gtp_node_echo() {
-        let mut node = GtpNode::new_ipv4(1, Ipv4Addr::new(192, 168, 1, 1), GTPC_PORT);
-
-        assert!(node.last_echo.is_none());
-
-        node.update_echo();
-
-        assert!(node.last_echo.is_some());
-        assert!(node.reachable);
-
-        node.mark_unreachable();
-        assert!(!node.reachable);
-    }
-
-    #[test]
-    fn test_gtp_path_manager_new() {
-        let manager = GtpPathManager::new();
-
-        assert!(manager.gtpc_addr.is_none());
-        assert!(manager.gtpc_addr6.is_none());
-        assert_eq!(manager.recovery, 0);
-    }
-
-    #[test]
-    fn test_gtp_path_manager_set_addr() {
-        let mut manager = GtpPathManager::new();
-
-        manager.set_gtpc_addr(Some(Ipv4Addr::new(192, 168, 1, 1)), None);
-
-        assert_eq!(manager.gtpc_addr, Some(Ipv4Addr::new(192, 168, 1, 1)));
-        assert!(manager.gtpc_addr6.is_none());
-    }
-
-    #[test]
-    fn test_gtp_path_manager_sequence() {
-        let manager = GtpPathManager::new();
-
-        let seq1 = manager.next_sequence();
-        let seq2 = manager.next_sequence();
-        let seq3 = manager.next_sequence();
-
-        assert_eq!(seq1, 1);
-        assert_eq!(seq2, 2);
-        assert_eq!(seq3, 3);
-    }
-
-    #[test]
-    fn test_gtp_path_manager_add_node() {
-        let manager = GtpPathManager::new();
-
-        let id = manager.add_node_ipv4(Ipv4Addr::new(192, 168, 1, 1), GTPC_PORT);
-
-        assert!(id > 0);
-
-        let node = manager.get_node(id);
-        assert!(node.is_some());
-
-        let node = node.unwrap();
-        assert_eq!(node.addr, Some(Ipv4Addr::new(192, 168, 1, 1)));
-    }
-
-    #[test]
-    fn test_gtp_path_manager_remove_node() {
-        let manager = GtpPathManager::new();
-
-        let id = manager.add_node_ipv4(Ipv4Addr::new(192, 168, 1, 1), GTPC_PORT);
-
-        let removed = manager.remove_node(id);
-        assert!(removed.is_some());
-
-        let node = manager.get_node(id);
-        assert!(node.is_none());
-    }
-
-    #[test]
-    fn test_gtp_path_manager_find_node() {
-        let manager = GtpPathManager::new();
-
-        let id = manager.add_node_ipv4(Ipv4Addr::new(192, 168, 1, 1), GTPC_PORT);
-
-        let found = manager.find_node_by_ipv4(Ipv4Addr::new(192, 168, 1, 1));
-        assert_eq!(found, Some(id));
-
-        let not_found = manager.find_node_by_ipv4(Ipv4Addr::new(192, 168, 1, 2));
-        assert!(not_found.is_none());
-    }
-
-    #[test]
-    fn test_gtp_path_manager_create_xact() {
-        let manager = GtpPathManager::new();
-
-        let xact_id = manager.create_local_xact(gtp2_message_type::CREATE_SESSION_REQUEST, Some(1));
-
-        assert!(xact_id > 0);
-
-        let xact = manager.get_xact(xact_id);
-        assert!(xact.is_some());
-
-        let xact = xact.unwrap();
-        assert_eq!(xact.message_type, gtp2_message_type::CREATE_SESSION_REQUEST);
-        assert_eq!(xact.sess_id, Some(1));
-    }
-
-    #[test]
-    fn test_gtp_path_manager_xact_lifecycle() {
-        let manager = GtpPathManager::new();
-
-        let xact_id = manager.create_local_xact(gtp2_message_type::CREATE_SESSION_REQUEST, Some(1));
-
-        // Set request
-        manager.set_xact_request(xact_id, vec![1, 2, 3]);
-
-        let xact = manager.get_xact(xact_id).unwrap();
-        assert_eq!(xact.state, GtpXactState::WaitingResponse);
-        assert!(xact.request_buf.is_some());
-
-        // Set response
-        manager.set_xact_response(xact_id, vec![4, 5, 6]);
-
-        let xact = manager.get_xact(xact_id).unwrap();
-        assert_eq!(xact.state, GtpXactState::ResponseReceived);
-        assert!(xact.response_buf.is_some());
-
-        // Commit
-        let committed = manager.commit_xact(xact_id);
-        assert!(committed.is_some());
-
-        let xact = committed.unwrap();
-        assert_eq!(xact.state, GtpXactState::Completed);
-
-        // Should be removed
-        let xact = manager.get_xact(xact_id);
-        assert!(xact.is_none());
-    }
-
-    #[test]
-    fn test_gtp_path_manager_find_xact_by_sequence() {
-        let manager = GtpPathManager::new();
-
-        let xact_id = manager.create_local_xact(gtp2_message_type::CREATE_SESSION_REQUEST, Some(1));
-
-        let xact = manager.get_xact(xact_id).unwrap();
-        let sequence = xact.sequence;
-
-        let found = manager.find_xact_by_sequence(sequence);
-        assert_eq!(found, Some(xact_id));
-
-        let not_found = manager.find_xact_by_sequence(99999);
-        assert!(not_found.is_none());
-    }
-
-    #[test]
-    fn test_gtp_path_manager_cleanup() {
-        let manager = GtpPathManager::new();
-
-        let xact_id = manager.create_local_xact(gtp2_message_type::CREATE_SESSION_REQUEST, Some(1));
-
-        // Complete the transaction
-        manager.update_xact_state(xact_id, GtpXactState::Completed);
-
-        // Cleanup
-        manager.cleanup_completed();
-
-        // Should be removed
-        let xact = manager.get_xact(xact_id);
-        assert!(xact.is_none());
-    }
-
-    #[test]
-    fn test_gtp_xact_state_default() {
-        let state = GtpXactState::default();
-        assert_eq!(state, GtpXactState::Initial);
-    }
-
-    #[test]
-    fn test_constants() {
-        assert_eq!(GTPC_PORT, 2123);
-        assert_eq!(GTPU_PORT, 2152);
-        assert_eq!(GTP_XACT_TIMEOUT, 3);
-        assert_eq!(GTP_XACT_RETRY_COUNT, 3);
-        assert_eq!(GTP2_VERSION, 2);
-    }
-
-    #[test]
-    fn test_gtp_modify_flags() {
-        assert_eq!(gtp_modify_flags::TFT_UPDATE, 0x01);
-        assert_eq!(gtp_modify_flags::QOS_UPDATE, 0x02);
-    }
-}
-
-// ============================================================================
 // S5/S8 GTP-C server: the PGW-C role on the wire (#52)
 // ============================================================================
 
@@ -1228,4 +996,276 @@ pub async fn s5s8_open(bind: Option<SocketAddr>, restart_counter: u8) -> Result<
         log::warn!("an S5/S8 server is already installed; this one is dropped");
     }
     Ok(())
+}
+
+// ============================================================================
+// Unit Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gtp_xact_new() {
+        let xact = GtpXact::new(1, 100, gtp2_message_type::CREATE_SESSION_REQUEST);
+
+        assert_eq!(xact.id, 1);
+        assert_eq!(xact.sequence, 100);
+        assert_eq!(xact.message_type, gtp2_message_type::CREATE_SESSION_REQUEST);
+        assert_eq!(xact.state, GtpXactState::Initial);
+        assert_eq!(xact.retry_count, 0);
+    }
+
+    #[test]
+    fn test_gtp_xact_timeout() {
+        let xact = GtpXact::new(1, 100, gtp2_message_type::CREATE_SESSION_REQUEST);
+
+        // Should not be timed out immediately
+        assert!(!xact.is_timed_out(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn test_gtp_xact_retry() {
+        let mut xact = GtpXact::new(1, 100, gtp2_message_type::CREATE_SESSION_REQUEST);
+
+        assert!(xact.can_retry());
+
+        for _ in 0..GTP_XACT_RETRY_COUNT {
+            xact.increment_retry();
+        }
+
+        assert!(!xact.can_retry());
+        assert_eq!(xact.retry_count, GTP_XACT_RETRY_COUNT);
+    }
+
+    #[test]
+    fn test_gtp_node_ipv4() {
+        let node = GtpNode::new_ipv4(1, Ipv4Addr::new(192, 168, 1, 1), GTPC_PORT);
+
+        assert_eq!(node.id, 1);
+        assert_eq!(node.addr, Some(Ipv4Addr::new(192, 168, 1, 1)));
+        assert_eq!(node.port, GTPC_PORT);
+        assert!(node.reachable);
+
+        let socket_addr = node.socket_addr().unwrap();
+        assert_eq!(socket_addr.port(), GTPC_PORT);
+    }
+
+    #[test]
+    fn test_gtp_node_ipv6() {
+        let node = GtpNode::new_ipv6(1, Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), GTPC_PORT);
+
+        assert_eq!(node.id, 1);
+        assert!(node.addr.is_none());
+        assert!(node.addr6.is_some());
+        assert_eq!(node.port, GTPC_PORT);
+    }
+
+    #[test]
+    fn test_gtp_node_echo() {
+        let mut node = GtpNode::new_ipv4(1, Ipv4Addr::new(192, 168, 1, 1), GTPC_PORT);
+
+        assert!(node.last_echo.is_none());
+
+        node.update_echo();
+
+        assert!(node.last_echo.is_some());
+        assert!(node.reachable);
+
+        node.mark_unreachable();
+        assert!(!node.reachable);
+    }
+
+    #[test]
+    fn test_gtp_path_manager_new() {
+        let manager = GtpPathManager::new();
+
+        assert!(manager.gtpc_addr.is_none());
+        assert!(manager.gtpc_addr6.is_none());
+        assert_eq!(manager.recovery, 0);
+    }
+
+    #[test]
+    fn test_gtp_path_manager_set_addr() {
+        let mut manager = GtpPathManager::new();
+
+        manager.set_gtpc_addr(Some(Ipv4Addr::new(192, 168, 1, 1)), None);
+
+        assert_eq!(manager.gtpc_addr, Some(Ipv4Addr::new(192, 168, 1, 1)));
+        assert!(manager.gtpc_addr6.is_none());
+    }
+
+    #[test]
+    fn test_gtp_path_manager_sequence() {
+        let manager = GtpPathManager::new();
+
+        let seq1 = manager.next_sequence();
+        let seq2 = manager.next_sequence();
+        let seq3 = manager.next_sequence();
+
+        assert_eq!(seq1, 1);
+        assert_eq!(seq2, 2);
+        assert_eq!(seq3, 3);
+    }
+
+    /// #792 review: the counter stays in the 23-bit initial space and wraps to 1,
+    /// never 0 and never with the Command MSB (TS 29.274 §7.6).
+    #[test]
+    fn the_sequence_wraps_inside_the_initial_space() {
+        let manager = GtpPathManager::new();
+        let max = nextgcore_gtp::v2::GTP2_MAX_INITIAL_SEQUENCE;
+        manager.sequence_generator.store(max - 1, Ordering::SeqCst);
+        assert_eq!(manager.next_sequence(), max - 1);
+        assert_eq!(manager.next_sequence(), max);
+        assert_eq!(manager.next_sequence(), 1, "wrapped, skipping 0");
+        assert_eq!(manager.next_sequence(), 2);
+        manager.sequence_generator.store(u32::MAX, Ordering::SeqCst);
+        let s = manager.next_sequence();
+        assert!((1..=max).contains(&s), "{s:#x}");
+        assert_ne!(manager.next_sequence(), s, "not handed out twice");
+    }
+
+    #[test]
+    fn test_gtp_path_manager_add_node() {
+        let manager = GtpPathManager::new();
+
+        let id = manager.add_node_ipv4(Ipv4Addr::new(192, 168, 1, 1), GTPC_PORT);
+
+        assert!(id > 0);
+
+        let node = manager.get_node(id);
+        assert!(node.is_some());
+
+        let node = node.unwrap();
+        assert_eq!(node.addr, Some(Ipv4Addr::new(192, 168, 1, 1)));
+    }
+
+    #[test]
+    fn test_gtp_path_manager_remove_node() {
+        let manager = GtpPathManager::new();
+
+        let id = manager.add_node_ipv4(Ipv4Addr::new(192, 168, 1, 1), GTPC_PORT);
+
+        let removed = manager.remove_node(id);
+        assert!(removed.is_some());
+
+        let node = manager.get_node(id);
+        assert!(node.is_none());
+    }
+
+    #[test]
+    fn test_gtp_path_manager_find_node() {
+        let manager = GtpPathManager::new();
+
+        let id = manager.add_node_ipv4(Ipv4Addr::new(192, 168, 1, 1), GTPC_PORT);
+
+        let found = manager.find_node_by_ipv4(Ipv4Addr::new(192, 168, 1, 1));
+        assert_eq!(found, Some(id));
+
+        let not_found = manager.find_node_by_ipv4(Ipv4Addr::new(192, 168, 1, 2));
+        assert!(not_found.is_none());
+    }
+
+    #[test]
+    fn test_gtp_path_manager_create_xact() {
+        let manager = GtpPathManager::new();
+
+        let xact_id = manager.create_local_xact(gtp2_message_type::CREATE_SESSION_REQUEST, Some(1));
+
+        assert!(xact_id > 0);
+
+        let xact = manager.get_xact(xact_id);
+        assert!(xact.is_some());
+
+        let xact = xact.unwrap();
+        assert_eq!(xact.message_type, gtp2_message_type::CREATE_SESSION_REQUEST);
+        assert_eq!(xact.sess_id, Some(1));
+    }
+
+    #[test]
+    fn test_gtp_path_manager_xact_lifecycle() {
+        let manager = GtpPathManager::new();
+
+        let xact_id = manager.create_local_xact(gtp2_message_type::CREATE_SESSION_REQUEST, Some(1));
+
+        // Set request
+        manager.set_xact_request(xact_id, vec![1, 2, 3]);
+
+        let xact = manager.get_xact(xact_id).unwrap();
+        assert_eq!(xact.state, GtpXactState::WaitingResponse);
+        assert!(xact.request_buf.is_some());
+
+        // Set response
+        manager.set_xact_response(xact_id, vec![4, 5, 6]);
+
+        let xact = manager.get_xact(xact_id).unwrap();
+        assert_eq!(xact.state, GtpXactState::ResponseReceived);
+        assert!(xact.response_buf.is_some());
+
+        // Commit
+        let committed = manager.commit_xact(xact_id);
+        assert!(committed.is_some());
+
+        let xact = committed.unwrap();
+        assert_eq!(xact.state, GtpXactState::Completed);
+
+        // Should be removed
+        let xact = manager.get_xact(xact_id);
+        assert!(xact.is_none());
+    }
+
+    #[test]
+    fn test_gtp_path_manager_find_xact_by_sequence() {
+        let manager = GtpPathManager::new();
+
+        let xact_id = manager.create_local_xact(gtp2_message_type::CREATE_SESSION_REQUEST, Some(1));
+
+        let xact = manager.get_xact(xact_id).unwrap();
+        let sequence = xact.sequence;
+
+        let found = manager.find_xact_by_sequence(sequence);
+        assert_eq!(found, Some(xact_id));
+
+        let not_found = manager.find_xact_by_sequence(99999);
+        assert!(not_found.is_none());
+    }
+
+    #[test]
+    fn test_gtp_path_manager_cleanup() {
+        let manager = GtpPathManager::new();
+
+        let xact_id = manager.create_local_xact(gtp2_message_type::CREATE_SESSION_REQUEST, Some(1));
+
+        // Complete the transaction
+        manager.update_xact_state(xact_id, GtpXactState::Completed);
+
+        // Cleanup
+        manager.cleanup_completed();
+
+        // Should be removed
+        let xact = manager.get_xact(xact_id);
+        assert!(xact.is_none());
+    }
+
+    #[test]
+    fn test_gtp_xact_state_default() {
+        let state = GtpXactState::default();
+        assert_eq!(state, GtpXactState::Initial);
+    }
+
+    #[test]
+    fn test_constants() {
+        assert_eq!(GTPC_PORT, 2123);
+        assert_eq!(GTPU_PORT, 2152);
+        assert_eq!(GTP_XACT_TIMEOUT, 3);
+        assert_eq!(GTP_XACT_RETRY_COUNT, 3);
+        assert_eq!(GTP2_VERSION, 2);
+    }
+
+    #[test]
+    fn test_gtp_modify_flags() {
+        assert_eq!(gtp_modify_flags::TFT_UPDATE, 0x01);
+        assert_eq!(gtp_modify_flags::QOS_UPDATE, 0x02);
+    }
 }

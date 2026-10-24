@@ -57,9 +57,10 @@ struct Args {
     #[arg(short = 'l', long)]
     log_file: Option<String>,
 
-    /// Log level (trace, debug, info, warn, error)
-    #[arg(short = 'e', long, default_value = "info")]
-    log_level: String,
+    /// Log level (trace, debug, info, warn, error). Without it, the config
+    /// file's `logger.level`, else `info`; `RUST_LOG` overrides (#691).
+    #[arg(short = 'e', long)]
+    log_level: Option<String>,
 
     /// Disable color output
     #[arg(short = 'm', long)]
@@ -1423,9 +1424,13 @@ fn pct_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(b);
+        // Octet-wise: slicing `&s[i + 1..i + 3]` panicked when the cut landed
+        // inside a multi-byte character, and from_str_radix took `%+1` as
+        // 0x01 (#765).
+        if bytes[i] == b'%' {
+            let digit = |j: usize| bytes.get(j).and_then(|b| (*b as char).to_digit(16));
+            if let (Some(h), Some(l)) = (digit(i + 1), digit(i + 2)) {
+                out.push((h * 16 + l) as u8);
                 i += 3;
                 continue;
             }
@@ -2515,21 +2520,11 @@ async fn handle_pcf_mbs_binding_update(binding_id: &str, request: &SbiRequest) -
 
 /// Initialize logging based on command line arguments
 fn init_logging(args: &Args) -> Result<()> {
-    let mut builder = env_logger::Builder::new();
-
-    // Set log level
-    let level = match args.log_level.to_lowercase().as_str() {
-        "trace" => log::LevelFilter::Trace,
-        "debug" => log::LevelFilter::Debug,
-        "info" => log::LevelFilter::Info,
-        "warn" => log::LevelFilter::Warn,
-        "error" => log::LevelFilter::Error,
-        _ => log::LevelFilter::Info,
-    };
-    builder.filter_level(level);
-
-    // Configure format
-    builder.format_timestamp_millis();
+    // RUST_LOG if set, else --log-level: the same for every NF (#691).
+    let mut builder = nextgcore_core::log::nf_log_builder(&nextgcore_core::log::nf_log_level(
+        args.log_level.as_deref(),
+        Some(&args.config),
+    ));
 
     if args.no_color {
         builder.write_style(env_logger::WriteStyle::Never);
@@ -2878,7 +2873,7 @@ mod tests {
     fn test_args_default() {
         let args = Args::parse_from(["nextgcore-bsfd"]);
         assert_eq!(args.config, "/etc/nextgcore/bsf.yaml");
-        assert_eq!(args.log_level, "info");
+        assert_eq!(args.log_level, None);
         assert_eq!(args.sbi_addr, "0.0.0.0");
         assert_eq!(args.sbi_port, 7777);
         assert!(!args.tls);
@@ -2901,7 +2896,7 @@ mod tests {
             "2048",
         ]);
         assert_eq!(args.config, "/custom/bsf.yaml");
-        assert_eq!(args.log_level, "debug");
+        assert_eq!(args.log_level.as_deref(), Some("debug"));
         assert_eq!(args.sbi_addr, "0.0.0.0");
         assert_eq!(args.sbi_port, 8080);
         assert_eq!(args.max_sess, 2048);
@@ -2931,6 +2926,12 @@ mod tests {
             "{\"sst\":1,\"sd\":\"010203\"}"
         );
         assert_eq!(pct_decode("2001%3Adb8%3A%3A1%2F128"), "2001:db8::1/128");
+        // #765: a cut inside a multi-byte character used to panic, and a sign
+        // was taken as a digit.
+        assert_eq!(pct_decode("%a\u{e9}"), "%a\u{e9}");
+        assert_eq!(pct_decode("%+1"), "%+1");
+        assert_eq!(pct_decode("x%41"), "xA");
+        assert_eq!(pct_decode("%4"), "%4");
     }
 
     #[test]

@@ -81,6 +81,10 @@ spec:
           value: info
         - name: RUST_BACKTRACE
           value: '1'
+        # /metrics defaults to 127.0.0.1 (#837); in the pod it must accept the
+        # pod IP for Prometheus and the kubelet. Not exposed beyond the cluster.
+        - name: NEXTGCORE_METRICS_BIND
+          value: "0.0.0.0"
         # The MME dials the HSS (S6a), and the HSS answers and sends CLR/IDR over
         # that connection, so the HSS has no use for the MME's address at start.
         # Tracking it made the HSS restart whenever the MME moved, which dropped
@@ -195,6 +199,10 @@ spec:
           value: info
         - name: RUST_BACKTRACE
           value: '1'
+        # /metrics defaults to 127.0.0.1 (#837); in the pod it must accept the
+        # pod IP for Prometheus and the kubelet. Not exposed beyond the cluster.
+        - name: NEXTGCORE_METRICS_BIND
+          value: "0.0.0.0"
         volumeMounts:
         - name: templates
           mountPath: /epc/templates
@@ -303,6 +311,10 @@ spec:
           value: info
         - name: RUST_BACKTRACE
           value: '1'
+        # /metrics defaults to 127.0.0.1 (#837); in the pod it must accept the
+        # pod IP for Prometheus and the kubelet. Not exposed beyond the cluster.
+        - name: NEXTGCORE_METRICS_BIND
+          value: "0.0.0.0"
         - name: EPC_EXPORT
           value: SGWC_PGW_S5C=pgwc SGWC_GTPU_ADVERTISE=sgwu
         # TS 23.007 §18: the GTP-C restart counter must survive the restart it
@@ -430,6 +442,10 @@ spec:
           value: info
         - name: RUST_BACKTRACE
           value: '1'
+        # /metrics defaults to 127.0.0.1 (#837); in the pod it must accept the
+        # pod IP for Prometheus and the kubelet. Not exposed beyond the cluster.
+        - name: NEXTGCORE_METRICS_BIND
+          value: "0.0.0.0"
         - name: UPF_PFCP_PORT
           value: '8805'
         - name: NEXTGCORE_SBI_PROFILE
@@ -437,9 +453,11 @@ spec:
         # smfd re-resolves a hostname UPF_PFCP_ADDR on every PFCP association
         # attempt (#658), so the PGW-U is named by its Service and is not a
         # liveness-tracked peer: a restarted PGW-U is found again without
-        # restarting the PGW-C.
+        # restarting the PGW-C. The PFCP Node ID is the PGW-C's Service FQDN
+        # (#797): the pod IP it binds changes on every restart, and a new Node ID
+        # looks like a different CP function to the PGW-U (TS 29.244 §5.8.1).
         - name: EPC_EXPORT
-          value: SMF_PFCP_ADDR=self UPF_PFCP_ADDR=dns:pgwu
+          value: SMF_PFCP_ADDR=self SMF_PFCP_NODE_ID=dns:pgwc UPF_PFCP_ADDR=dns:pgwu
         - name: EPC_UNTRACKED
           value: pgwu
         volumeMounts:
@@ -487,7 +505,10 @@ spec:
           defaultMode: 493
       - name: run
         emptyDir: {}
-      terminationGracePeriodSeconds: 5
+      # #718: a PGW-C shutdown tells the SGW (Delete Bearer, retransmitted for up to
+      # T3 x (N3+1) = 12 s) and the PGW-U (Association Release, up to T1 x N1 = 9 s
+      # when the PGW-U is gone) before it exits; 5 s cut that off.
+      terminationGracePeriodSeconds: 45
       nodeSelector:
         nextg.io/dataplane: 'true'
 ---
@@ -563,6 +584,11 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: status.podIP
+        # #968/#983: only the PGW-C may set up the Sxb association. The headless
+        # Service name resolves to the PGW-C pod's current IP (re-resolved every 10 s),
+        # so a PGW-C restart at a new IP is admitted.
+        - name: UPF_PFCP_ALLOWED_PEERS
+          value: pgwc.nextg-epc.svc.cluster.local
         - name: POD_NAMESPACE
           valueFrom:
             fieldRef:
@@ -571,6 +597,10 @@ spec:
           value: info
         - name: RUST_BACKTRACE
           value: '1'
+        # /metrics defaults to 127.0.0.1 (#837); in the pod it must accept the
+        # pod IP for Prometheus and the kubelet. Not exposed beyond the cluster.
+        - name: NEXTGCORE_METRICS_BIND
+          value: "0.0.0.0"
         volumeMounts:
         - name: templates
           mountPath: /epc/templates
@@ -706,6 +736,10 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: status.podIP
+        # #968/#983: only the SGW-C may set up the Sxa association (overrides the
+        # rendered sgwu.yaml's literal address with the headless Service name).
+        - name: SGWU_PFCP_ALLOWED_PEERS
+          value: sgwc.nextg-epc.svc.cluster.local
         - name: POD_NAMESPACE
           valueFrom:
             fieldRef:
@@ -714,6 +748,10 @@ spec:
           value: info
         - name: RUST_BACKTRACE
           value: '1'
+        # /metrics defaults to 127.0.0.1 (#837); in the pod it must accept the
+        # pod IP for Prometheus and the kubelet. Not exposed beyond the cluster.
+        - name: NEXTGCORE_METRICS_BIND
+          value: "0.0.0.0"
         volumeMounts:
         - name: templates
           mountPath: /epc/templates
@@ -861,6 +899,10 @@ spec:
           value: info
         - name: RUST_BACKTRACE
           value: '1'
+        # /metrics defaults to 127.0.0.1 (#837); in the pod it must accept the
+        # pod IP for Prometheus and the kubelet. Not exposed beyond the cluster.
+        - name: NEXTGCORE_METRICS_BIND
+          value: "0.0.0.0"
         # TS 23.007 §18: see sgwc; the counter outlives a container restart.
         - name: MME_RESTART_COUNTER_FILE
           value: /run/epc/mme-restart-counter
@@ -972,6 +1014,10 @@ spec:
           value: info
         - name: RUST_BACKTRACE
           value: '1'
+        # /metrics defaults to 127.0.0.1 (#837); in the pod it must accept the
+        # pod IP for Prometheus and the kubelet. Not exposed beyond the cluster.
+        - name: NEXTGCORE_METRICS_BIND
+          value: "0.0.0.0"
         volumeMounts:
         - name: templates
           mountPath: /epc/templates
@@ -1055,6 +1101,10 @@ spec:
           value: info
         - name: RUST_BACKTRACE
           value: '1'
+        # /metrics defaults to 127.0.0.1 (#837); in the pod it must accept the
+        # pod IP for Prometheus and the kubelet. Not exposed beyond the cluster.
+        - name: NEXTGCORE_METRICS_BIND
+          value: "0.0.0.0"
         volumeMounts:
         - name: templates
           mountPath: /epc/templates

@@ -7,6 +7,9 @@
 # Build artifacts — regenerate via docker/rust/build.sh
 docker/rust/binaries/
 
+# Local compose secrets (GRAFANA_ADMIN_PASSWORD, #837)
+docker/rust/.env
+
 # E2E failure artifacts — captured by docker/rust/e2e.sh on a failed run
 docker/rust/artifacts/
 
@@ -26,3 +29,7 @@ docker/rust/artifacts/
 # Python bytecode (deploy/eks/lib tests, #436)
 __pycache__/
 *.pyc
+
+# Proptest regression seeds from local runs. A seed worth keeping becomes a
+# named test; the few committed regression files elsewhere stay tracked.
+proptest-regressions/
