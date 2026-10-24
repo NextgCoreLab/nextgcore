@@ -578,7 +578,9 @@ pub(crate) fn clear_global_upf_for_test() {
     }
 }
 
-/// A test's extra delay before the address lookup of one name (#1091 review H).
+/// A test's extra delay before the address lookup of one name (#1091 review H). It
+/// applies to every client, so a test that sets it holds [`N4_TEST_LOCK`] and
+/// clears it before releasing the lock.
 #[cfg(test)]
 static NODE_LOOKUP_DELAY_FOR_TEST: std::sync::Mutex<Option<(String, Duration)>> =
     std::sync::Mutex::new(None);
@@ -2394,7 +2396,9 @@ pub fn clear_pfcp_sessions() -> usize {
 /// - the tracked restart/release fan-outs (`restart_fanouts`, #928 review m4):
 ///   `drain_restart_fanouts` takes every handle, including a sibling's;
 /// - [`PFCP_UNAUTHORIZED`] and its WARN interval (#974 review n3), which tests
-///   assert exact deltas of.
+///   assert exact deltas of;
+/// - [`NODE_LOOKUP_DELAY_FOR_TEST`] (#1091 review H), which delays every client's
+///   lookup of the name it holds.
 ///
 /// Any two tests that touch any of these will flush or contradict each other if
 /// they interleave — which is how the #191 pair first failed, one clearing the

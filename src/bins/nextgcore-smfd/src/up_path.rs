@@ -982,7 +982,6 @@ mod tests {
         b.build()
     }
 
-    /// #994: the FAR peers of a session follow its Create, Update and Remove FARs.
     /// #1091 review G: a Node Report that arrives once the SMF is shutting down
     /// records the failed path (in memory and in the snapshot, for the next start)
     /// but arms no hold.
@@ -1040,6 +1039,7 @@ mod tests {
         assert_eq!(after, before, "no hold timer pending");
     }
 
+    /// #994: the FAR peers of a session follow its Create, Update and Remove FARs.
     #[test]
     fn far_peers_follow_create_update_and_remove() {
         let mut fars = BTreeMap::new();
