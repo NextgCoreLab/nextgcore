@@ -1367,8 +1367,11 @@ impl NgapServer {
             ServerEvent::AssociationRestarted { association_id } => {
                 // RFC 9260 §5.2.2: the peer restarted and the streams were negotiated
                 // afresh, so the cached count is asked again. The gNB itself restarted:
-                // it re-runs NG Setup, and the UE contexts it served are gone with it.
+                // it re-runs NG Setup, and the UE contexts it served are gone with it
+                // (#1039).
                 self.outbound_streams.remove(&association_id);
+                self.reset_ue_associations_of(association_id, "SCTP association restart")
+                    .await;
                 log::warn!(
                     "NG association {association_id} restarted by the gNB; its outbound \
                      stream count is re-read"
@@ -1379,9 +1382,14 @@ impl NgapServer {
                 reason,
             } => {
                 self.outbound_streams.remove(&association_id);
-                // #758: the connections allocated there are gone with it.
-                self.contextless_ue_ids
-                    .retain(|c| c.association_id != association_id);
+                // #1039: the UE-associated connections the association carried are gone
+                // with it; its UEs are released as by an NG Reset rather than left
+                // CM-CONNECTED on a dead pair. (#758's contextless allocations go too.)
+                self.reset_ue_associations_of(
+                    association_id,
+                    &format!("SCTP association loss ({reason})"),
+                )
+                .await;
                 self.handle_association_closed(association_id, &reason)
                     .await?;
             }
@@ -2003,7 +2011,9 @@ impl NgapServer {
             }
         };
 
-        // Process request and build response with locks held, then release before sending
+        // Process request and build response with locks held, then release before sending.
+        // `accepted` names the Global RAN Node ID of an accepted setup (#1039).
+        let mut accepted: Option<(crate::context::PlmnId, u32)> = None;
         let response_data: Option<Vec<u8>> = {
             let mut sessions = self.sessions.write().await;
             if let Some(session) = sessions.get_mut(&association_id) {
@@ -2024,6 +2034,7 @@ impl NgapServer {
                             session.gnb.gnb_id,
                             association_id
                         );
+                        accepted = Some((session.gnb.plmn_id.clone(), session.gnb.gnb_id));
 
                         // Build NG Setup Response with proper ASN.1 APER encoding,
                         // reporting any "notify" IEs it ignored (§10.3.4.2).
@@ -2064,6 +2075,33 @@ impl NgapServer {
                 None
             }
         }; // All locks released here
+
+        // #1039, TS 38.413 §8.7.1.1: an accepted NG Setup erases the gNB's UE-related
+        // contexts like an NG Reset -- on this association (a repeated setup), and on any
+        // other association the same Global RAN Node ID still holds (the gNB restarted
+        // and came back on a new one). Done before the response, so nothing the gNB sends
+        // after it can name a connection of its previous incarnation.
+        if let Some((plmn, gnb_id)) = accepted {
+            let stale: Vec<u64> = self
+                .sessions
+                .read()
+                .await
+                .iter()
+                .filter(|(assoc, s)| {
+                    **assoc != association_id && s.gnb.gnb_id == gnb_id && s.gnb.plmn_id == plmn
+                })
+                .map(|(assoc, _)| *assoc)
+                .collect();
+            self.reset_ue_associations_of(association_id, "NG Setup (TS 38.413 §8.7.1.1)")
+                .await;
+            for old in stale {
+                self.reset_ue_associations_of(
+                    old,
+                    "NG Setup of the same gNB on another association",
+                )
+                .await;
+            }
+        }
 
         // Now send the response with &mut self available
         if let Some(response) = response_data {
@@ -2186,6 +2224,38 @@ impl NgapServer {
         // §8.7.4.2.2 gates on the NG resources alone. They are collected and run after the
         // Acknowledge, off this task, through the shared `sbi_offload` (its permits bound
         // every offloaded SBI exchange of this AMF, not just this reset's).
+        let (idled, smf_work) = self.release_ng_connections(affected).await;
+        crate::metrics::global().add(crate::metrics::GlobalMetric::NgResetUeIdled, idled as u64);
+
+        // Release the affected UE contexts and get the list to echo in the Ack
+        let ack_connections = ngap_handler::handle_ng_reset(gnb_pool_id, &reset);
+
+        if let Some(ack) = ngap_asn1::build_ng_reset_acknowledge_asn1(ack_connections, &notify) {
+            self.send_to_association(association_id, &ack).await?;
+            log::info!(
+                "NG Reset Acknowledge sent to association {association_id} ({idled} UE(s) \
+                 moved to CM-IDLE, {} SMF update(s) to follow)",
+                smf_work.len()
+            );
+        } else {
+            log::error!("Failed to build NG Reset Acknowledge");
+        }
+
+        for call in smf_work {
+            self.offload_ng_reset_smf_call(call);
+        }
+
+        Ok(())
+    }
+
+    /// Release the UE-associated logical NG-connections of `affected` as an NG Reset
+    /// does (#754, TS 38.413 §8.7.4.2.2): a registered UE goes CM-IDLE, keeping its
+    /// registration and PDU sessions, its procedures tied to the connection are aborted
+    /// (`abort_on_ng_release`) and its mobile reachable timer starts; a UE whose
+    /// registration had not completed is forgotten. Returns how many UEs went CM-IDLE and
+    /// the SMF calls owed, which the caller runs off the NGAP task
+    /// ([`Self::offload_ng_reset_smf_call`]) -- for an NG Reset, after its Acknowledge.
+    async fn release_ng_connections(&mut self, affected: Vec<u64>) -> (usize, Vec<NgResetSmfCall>) {
         let mut smf_work: Vec<NgResetSmfCall> = Vec::new();
         let mut idled = 0usize;
         for amf_ue_ngap_id in affected {
@@ -2241,26 +2311,43 @@ impl NgapServer {
             }
         }
         crate::metrics::global().add(crate::metrics::GlobalMetric::NgResetUeIdled, idled as u64);
+        (idled, smf_work)
+    }
 
-        // Release the affected UE contexts and get the list to echo in the Ack
-        let ack_connections = ngap_handler::handle_ng_reset(gnb_pool_id, &reset);
-
-        if let Some(ack) = ngap_asn1::build_ng_reset_acknowledge_asn1(ack_connections, &notify) {
-            self.send_to_association(association_id, &ack).await?;
-            log::info!(
-                "NG Reset Acknowledge sent to association {association_id} ({idled} UE(s) \
-                 moved to CM-IDLE, {} SMF update(s) to follow)",
-                smf_work.len()
-            );
-        } else {
-            log::error!("Failed to build NG Reset Acknowledge");
+    /// TS 38.413 §8.7.1.1 (#1039): an NG Setup "re-initialises the NGAP UE-related contexts
+    /// (if any) and erases all related signalling connections in the two nodes like an
+    /// NG Reset procedure would do" when the nodes do not agree on retaining them -- and
+    /// this AMF does not implement UE context retention. The same holds when the gNB's
+    /// association restarts (RFC 9260 §5.2.2: the peer lost its state) or closes: every
+    /// UE-associated connection it carried is gone. Each UE of `association_id` is
+    /// released as by a whole-interface NG Reset, and its SMF calls start at once.
+    async fn reset_ue_associations_of(&mut self, association_id: u64, why: &str) {
+        self.drop_contextless_ue_ids_for_reset(
+            association_id,
+            &nextgcore_ngap::types::ResetType::NgInterface,
+        );
+        // `snapshot`: the release re-enters the store (see `ue_store`).
+        let affected: Vec<u64> = self
+            .ue_auth_state
+            .snapshot()
+            .into_iter()
+            .filter(|(_, state)| state.association_id == association_id && !state.is_cm_idle())
+            .map(|(id, _)| id)
+            .collect();
+        if affected.is_empty() {
+            return;
         }
-
+        let count = affected.len();
+        let (idled, smf_work) = self.release_ng_connections(affected).await;
+        log::warn!(
+            "{why} on association {association_id}: its {count} UE-associated NG \
+             connection(s) are released as by an NG Reset ({idled} UE(s) moved to CM-IDLE, \
+             {} SMF update(s) to follow)",
+            smf_work.len()
+        );
         for call in smf_work {
             self.offload_ng_reset_smf_call(call);
         }
-
-        Ok(())
     }
 
     /// Parse NG Setup Request (fallback when ASN.1 parsing fails)
@@ -10508,7 +10595,9 @@ impl NgapServer {
                 port,
             } => {
                 let key = (amf_ue_ngap_id, psi);
-                // A second reset before the first one's call ran: one is enough.
+                // A second reset before the first one's call ran: one is enough. Only
+                // non-durable work is dropped: a queued handover CANCELLED or COMPLETED
+                // for the session is durable and still runs first (#978 review, m6).
                 self.sbi_offload.supersede_key(key);
                 self.sbi_offload.spawn_keyed(key, move || async move {
                     match crate::sbi_path::call_smf_deactivate_up_connection(&host, port, &sm_ref)
@@ -10555,7 +10644,8 @@ impl NgapServer {
         if self.sbi_offload.key_busy(key) {
             log::info!(
                 "UE {amf_ue_ngap_id}: PSI {psi} re-activated while an NG Reset deactivation \
-                 is pending; queued work is dropped and running work awaited first"
+                 is pending; queued work is dropped (durable work, such as a handover \
+                 CANCELLED or COMPLETED, still runs) and running work awaited first"
             );
             if !self
                 .sbi_offload
@@ -10998,6 +11088,7 @@ impl NgapServer {
         // #877 re-review M1: the UE's off-task SBI work is aborted, which frees
         // the permits it held for other UEs.
         self.sbi_offload.cancel_ue(amf_ue_ngap_id);
+
         // #796: nothing waits for an SMF on behalf of a UE that is gone.
         self.pending_establishments
             .retain(|(ue, _), _| *ue != amf_ue_ngap_id);
@@ -12400,7 +12491,7 @@ impl NgapServer {
             };
             let (host, port) = self.smf_target_for(amf_ue_ngap_id, psi);
             self.sbi_offload
-                .spawn_keyed((amf_ue_ngap_id, psi), move || async move {
+                .spawn_keyed_durable((amf_ue_ngap_id, psi), move || async move {
                     match crate::sbi_path::call_smf_n2_handover(
                         &host,
                         port,
@@ -12441,41 +12532,44 @@ impl NgapServer {
                 continue;
             };
             let (host, port) = self.smf_target_for(ue, psi);
-            self.sbi_offload.spawn_keyed((ue, psi), move || async move {
-                let complete = || {
-                    crate::sbi_path::call_smf_n2_handover(
-                        &host,
-                        port,
-                        &sm_ref,
-                        "COMPLETED",
-                        None,
-                        None,
-                        None,
-                    )
-                };
-                // #964 review: the source has been released, so a COMPLETED that does not
-                // land leaves the downlink pointed at nothing; it is tried once more.
-                let mut outcome = complete().await;
-                if let Err(e) = &outcome {
-                    log::warn!(
-                        "UE {ue}: PSI {psi} COMPLETED failed ({e}); retrying once in \
+            // Durable (#978 review, m6): an NG Reset or a re-activation that supersedes the
+            // session's queued work must not drop the handover's completion.
+            self.sbi_offload
+                .spawn_keyed_durable((ue, psi), move || async move {
+                    let complete = || {
+                        crate::sbi_path::call_smf_n2_handover(
+                            &host,
+                            port,
+                            &sm_ref,
+                            "COMPLETED",
+                            None,
+                            None,
+                            None,
+                        )
+                    };
+                    // #964 review: the source has been released, so a COMPLETED that does not
+                    // land leaves the downlink pointed at nothing; it is tried once more.
+                    let mut outcome = complete().await;
+                    if let Err(e) = &outcome {
+                        log::warn!(
+                            "UE {ue}: PSI {psi} COMPLETED failed ({e}); retrying once in \
                          {HANDOVER_COMPLETED_RETRY:?}"
-                    );
-                    tokio::time::sleep(HANDOVER_COMPLETED_RETRY).await;
-                    outcome = complete().await;
-                }
-                match outcome {
-                    Ok(_) => log::info!(
-                        "UE {ue}: PSI {psi} handover COMPLETED at the SMF; the downlink is on \
+                        );
+                        tokio::time::sleep(HANDOVER_COMPLETED_RETRY).await;
+                        outcome = complete().await;
+                    }
+                    match outcome {
+                        Ok(_) => log::info!(
+                            "UE {ue}: PSI {psi} handover COMPLETED at the SMF; the downlink is on \
                          the target"
-                    ),
-                    Err(e) => log::warn!(
-                        "UE {ue}: PSI {psi} COMPLETED not delivered ({e}); the SMF still \
+                        ),
+                        Err(e) => log::warn!(
+                            "UE {ue}: PSI {psi} COMPLETED not delivered ({e}); the SMF still \
                          points the downlink at the source"
-                    ),
-                }
-                None
-            });
+                        ),
+                    }
+                    None
+                });
             queued += 1;
         }
         for psi in dropped {
@@ -12483,18 +12577,22 @@ impl NgapServer {
                 continue;
             };
             let (host, port) = self.smf_target_for(ue, psi);
-            self.sbi_offload.spawn_keyed((ue, psi), move || async move {
-                match crate::sbi_path::call_smf_deactivate_up_connection(&host, port, &sm_ref).await
-                {
-                    Ok(_) => log::info!(
-                        "UE {ue}: PSI {psi}, not handed over, has its user plane deactivated"
-                    ),
-                    Err(e) => log::warn!(
-                        "UE {ue}: PSI {psi}, not handed over, could not be deactivated: {e}"
-                    ),
-                }
-                None
-            });
+            // Durable (#978 review, m6): an NG Reset or a re-activation that supersedes the
+            // session's queued work must not drop the handover's completion.
+            self.sbi_offload
+                .spawn_keyed_durable((ue, psi), move || async move {
+                    match crate::sbi_path::call_smf_deactivate_up_connection(&host, port, &sm_ref)
+                        .await
+                    {
+                        Ok(_) => log::info!(
+                            "UE {ue}: PSI {psi}, not handed over, has its user plane deactivated"
+                        ),
+                        Err(e) => log::warn!(
+                            "UE {ue}: PSI {psi}, not handed over, could not be deactivated: {e}"
+                        ),
+                    }
+                    None
+                });
         }
         queued
     }
@@ -23184,6 +23282,84 @@ mod tests {
         }
     }
 
+    /// **#848 review, MINOR 1: the connected-path settle.** A UE an NG Reset idled comes
+    /// back by Registration and, while CM-CONNECTED, sends a Service Request whose Uplink
+    /// data status names PSI 5. The connected path (`activate_up_for_connected_service_
+    /// request`) must, like the idle one, let the reset's DEACTIVATED for PSI 5 be
+    /// answered before its ACTIVATING goes out.
+    ///
+    /// REVERT-VERIFIED: without the settle in the connected path the ACTIVATING reaches
+    /// the SMF before the DEACTIVATED is answered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_connected_service_request_waits_for_the_resets_deactivation() {
+        let delay = Duration::from_millis(600);
+        let (_smf, port, seen) = slow_up_cnx_smf(delay).await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = capturing_ngap_server().await;
+        let assoc = 754_061u64;
+        seed_gnb_session(&ngap, assoc).await;
+        let ue = 7_754_611u64;
+        let mut state = idle_registered_ue(ue);
+        state.cm_idle = false;
+        state.reachability = None;
+        state.association_id = assoc;
+        ngap.ue_auth_state.insert(ue, state);
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap();
+            guard.sess_add(ue, 5).expect("session");
+        }
+        ngap.sm_context_refs
+            .insert((ue, 5), "ref-848-conn-5".to_string());
+        ngap.sm_context_smfs
+            .insert((ue, 5), ("127.0.0.1".to_string(), port));
+
+        ngap.handle_ng_reset(
+            assoc,
+            &ng_reset_pdu(nextgcore_ngap::types::ResetType::NgInterface),
+        )
+        .await
+        .expect("handled");
+        // The DEACTIVATED is on the wire; the UE is back, CM-CONNECTED (Registration).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        ngap.ue_auth_state.with_mut(ue, |s| {
+            s.cm_idle = false;
+            s.reachability = None;
+        });
+        // A plain Service Request, service type data: Uplink data status PSI 5.
+        let tmsi = ue as u32;
+        let mut nas = vec![0x7E, 0x00, 0x4C, 0x10, 0x00, 0x07, 0xF4, 0x55, 0x6A];
+        nas.extend_from_slice(&tmsi.to_be_bytes());
+        nas.extend_from_slice(&[0x40, 0x02, 0x20, 0x00, 0x50, 0x02, 0x20, 0x00]);
+        let _ = ngap
+            .activate_up_for_connected_service_request(assoc, ue, 51, &nas, &[])
+            .await;
+        ngap.sbi_offload.settle().await;
+
+        let seq: Vec<(String, Instant)> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(r, _, _)| r == "ref-848-conn-5")
+            .map(|(_, s, t)| (s.clone(), *t))
+            .collect();
+        assert_eq!(
+            seq.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>(),
+            vec!["DEACTIVATED", "ACTIVATING"],
+            "{seq:?}"
+        );
+        assert!(
+            seq[1].1.duration_since(seq[0].1) >= delay - Duration::from_millis(50),
+            "the ACTIVATING waited for the DEACTIVATED's answer"
+        );
+        ngap.ue_auth_state.remove(ue);
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap();
+        for sess in guard.sess_list_for_ue(ue) {
+            guard.sess_remove(sess.id);
+        }
+    }
+
     /// **#754, review of #848 (M1), blackholed SMF.** An SMF that accepts the connection
     /// and never answers does not stop the NGAP task. The reset is acknowledged, and while
     /// its SMF calls hang, the same task goes on to serve a second gNB's NG Reset and a
@@ -27255,6 +27431,247 @@ mod tests {
         let mut c = ctx_arc.write().unwrap_or_else(|e| e.into_inner());
         c.plmn_support.truncate(saved.0);
         c.num_of_plmn_support = saved.1;
+    }
+
+    /// A registered, CM-CONNECTED UE `ue` on `assoc` (RAN UE NGAP ID `ran`) holding PSI 1
+    /// as `sm_ref` at the SMF on `smf_port`.
+    fn connected_ue_on(
+        server: &mut NgapServer,
+        assoc: u64,
+        ue: u64,
+        ran: u32,
+        sm_ref: &str,
+        smf_port: u16,
+    ) {
+        let mut state = UeNasContext::new(ue, ran, assoc, false);
+        state.registered = true;
+        server.ue_auth_state.insert(ue, state);
+        server.sm_context_refs.insert((ue, 1), sm_ref.to_string());
+        server
+            .sm_context_smfs
+            .insert((ue, 1), ("127.0.0.1".to_string(), smf_port));
+    }
+
+    /// The UE `ue` was released as by an NG Reset: CM-IDLE, the mobile reachable timer
+    /// armed, and a `upCnxState: DEACTIVATED` for its session at the SMF.
+    fn assert_released_as_by_ng_reset(
+        server: &NgapServer,
+        steps: &[HoStep],
+        ue: u64,
+        sm_ref: &str,
+        what: &str,
+    ) {
+        let state = server
+            .ue_auth_state
+            .get(ue)
+            .expect("a registered UE is kept");
+        assert!(state.is_cm_idle(), "{what}: CM-IDLE");
+        assert_eq!(
+            state.reachability.map(|r| r.phase),
+            Some(ReachabilityPhase::MobileReachable),
+            "{what}: the mobile reachable timer runs"
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.0 == sm_ref && s.1 == "up:DEACTIVATED"),
+            "{what}: the SMF deactivated the user plane: {steps:?}"
+        );
+    }
+
+    /// **#1039, TS 38.413 §8.7.1.1 / RFC 9260 §5.2.2.** An SCTP association restart or
+    /// loss takes every UE-associated NG connection it carried with it: each of that
+    /// gNB's UEs is released as by a whole-interface NG Reset (#754) -- CM-IDLE, its user
+    /// plane DEACTIVATED at the SMF, the mobile reachable timer armed -- instead of being
+    /// left CM-CONNECTED on a dead pair. Another gNB's UE is untouched.
+    ///
+    /// REVERT-VERIFIED: without the reset at either event the UE stays CM-CONNECTED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_association_restart_or_loss_releases_the_gnbs_ues() {
+        let (_smf, smf_port, seen) = handover_smf().await;
+        let mut server = capturing_ngap_server().await;
+        let other = 91_039u64;
+        seed_gnb_session(&server, other).await;
+        for (n, restart) in [(0u64, true), (1, false)] {
+            let assoc = 91_040 + n;
+            seed_gnb_session(&server, assoc).await;
+            let (ue, bystander) = (7_103_901 + 10 * n, 7_103_902 + 10 * n);
+            let sm_ref = format!("rst1039-{n}");
+            connected_ue_on(&mut server, assoc, ue, 3, &sm_ref, smf_port);
+            connected_ue_on(&mut server, other, bystander, 3, "rst1039-other", smf_port);
+            let event = if restart {
+                ServerEvent::AssociationRestarted {
+                    association_id: assoc,
+                }
+            } else {
+                ServerEvent::AssociationClosed {
+                    association_id: assoc,
+                    reason: "test".to_string(),
+                }
+            };
+            server.handle_server_event(event).await.expect("handled");
+            drive_sbi(&mut server).await;
+            let steps: Vec<HoStep> = std::mem::take(&mut *seen.lock().expect("sink"));
+            let what = if restart { "restart" } else { "loss" };
+            assert_released_as_by_ng_reset(&server, &steps, ue, &sm_ref, what);
+            let b = server.ue_auth_state.get(bystander).expect("bystander");
+            assert!(!b.is_cm_idle(), "{what}: another gNB's UE stays connected");
+            assert!(
+                !steps.iter().any(|s| s.0 == "rst1039-other"),
+                "{what}: nothing for another gNB's UE"
+            );
+            for id in [ue, bystander] {
+                server.forget_ue(id);
+            }
+        }
+    }
+
+    /// **#1039, TS 38.413 §8.7.1.1.** An accepted NG Setup "re-initialises the NGAP
+    /// UE-related contexts ... like an NG Reset procedure would do" (this AMF retains no
+    /// UE contexts across a setup): a REPEATED setup on an association releases the UEs
+    /// it carries, and a setup of the same Global RAN Node ID on a NEW association (the
+    /// gNB came back on another one) releases the UEs the old association still holds.
+    /// The first setup on a fresh association finds nothing to release.
+    ///
+    /// REVERT-VERIFIED: without the NG Setup reset both UEs stay CM-CONNECTED.
+    // Holding CONTEXT_GUARD across the awaits serialises this test against every other
+    // global-context test (the NG Setup Response needs the PLMN support list).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ng_setup_releases_the_ue_contexts_of_the_gnbs_previous_incarnation() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        serve_tai_999_70_tac_1();
+        let saved = {
+            let ctx_arc = crate::context::amf_self();
+            let mut c = ctx_arc.write().unwrap_or_else(|e| e.into_inner());
+            let saved = (c.plmn_support.len(), c.num_of_plmn_support);
+            c.plmn_support.push(crate::context::PlmnSupport {
+                plmn_id: PlmnId::new("999", "70"),
+                num_of_s_nssai: 1,
+                s_nssai: vec![crate::context::SNssai { sst: 1, sd: None }],
+            });
+            c.num_of_plmn_support = c.plmn_support.len();
+            saved
+        };
+        let (_smf, smf_port, seen) = handover_smf().await;
+        let mut server = capturing_ngap_server().await;
+        let setup = ngap_asn1::tests::baseline_request();
+        let (first, second) = (91_050u64, 91_051u64);
+
+        // The first setup: nothing to release yet.
+        seed_gnb_session(&server, first).await;
+        server
+            .handle_ng_setup_request(first, &setup)
+            .await
+            .expect("handled");
+        assert!(
+            server.sessions.read().await[&first]
+                .gnb
+                .state
+                .ng_setup_success,
+            "precondition: the gNB is set up"
+        );
+        take_sent_ngap(&mut server);
+        let (ue_a, ue_b) = (7_103_951u64, 7_103_952u64);
+        connected_ue_on(&mut server, first, ue_a, 5, "setup1039-a", smf_port);
+
+        // A repeated setup on the same association.
+        server
+            .handle_ng_setup_request(first, &setup)
+            .await
+            .expect("handled");
+        drive_sbi(&mut server).await;
+        let steps: Vec<HoStep> = std::mem::take(&mut *seen.lock().expect("sink"));
+        assert_released_as_by_ng_reset(&server, &steps, ue_a, "setup1039-a", "repeated setup");
+
+        // The same gNB on a new association: the old one's UE is released.
+        connected_ue_on(&mut server, first, ue_b, 6, "setup1039-b", smf_port);
+        seed_gnb_session(&server, second).await;
+        server
+            .handle_ng_setup_request(second, &setup)
+            .await
+            .expect("handled");
+        drive_sbi(&mut server).await;
+        let steps: Vec<HoStep> = std::mem::take(&mut *seen.lock().expect("sink"));
+        assert_released_as_by_ng_reset(
+            &server,
+            &steps,
+            ue_b,
+            "setup1039-b",
+            "the same gNB on a new association",
+        );
+        take_sent_ngap(&mut server);
+        for id in [ue_a, ue_b] {
+            server.forget_ue(id);
+        }
+        let ctx_arc = crate::context::amf_self();
+        let mut c = ctx_arc.write().unwrap_or_else(|e| e.into_inner());
+        c.plmn_support.truncate(saved.0);
+        c.num_of_plmn_support = saved.1;
+    }
+
+    /// **#978 review, m6, with #848's NG Reset.** A reset's DEACTIVATED supersedes the
+    /// session's queued, non-durable work (a second reset's duplicate), but a queued
+    /// handover CANCELLED is durable: the SMF still receives it, before the DEACTIVATED.
+    ///
+    /// REVERT-VERIFIED: with CANCELLED spawned non-durable, the reset drops it and the
+    /// SMF sees only the DEACTIVATED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ng_reset_does_not_drop_a_queued_handover_cancelled() {
+        let (_smf, smf_port, seen) = handover_smf().await;
+        let mut server = capturing_ngap_server().await;
+        let assoc = 91_060u64;
+        seed_gnb_session(&server, assoc).await;
+        let ue = 7_103_961u64;
+        connected_ue_on(&mut server, assoc, ue, 9, "m6-1", smf_port);
+        // A slow step in flight for the session -- no SMF exchange of its own, so nothing
+        // about the stand-in's connection handling can shorten it -- and a handover
+        // CANCELLED queued behind it.
+        server.sbi_offload.spawn_keyed((ue, 1), move || async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            None
+        });
+        server.cancel_sessions_at_smfs(ue, &[1], "HO_CANCEL");
+        let reset = nextgcore_ngap::builder::build_ng_reset(&nextgcore_ngap::types::NgReset {
+            cause: nextgcore_ngap::types::Cause::Misc(
+                nextgcore_ngap::types::CauseMisc::Unspecified,
+            ),
+            reset_type: nextgcore_ngap::types::ResetType::NgInterface,
+        })
+        .expect("build NG Reset");
+        server
+            .handle_ng_reset(assoc, &reset)
+            .await
+            .expect("handled");
+        // And a second reset, whose duplicate DEACTIVATED supersedes the first's.
+        connected_again(&mut server, ue);
+        server
+            .handle_ng_reset(assoc, &reset)
+            .await
+            .expect("handled");
+        drive_sbi(&mut server).await;
+        let order: Vec<String> = seen
+            .lock()
+            .expect("sink")
+            .iter()
+            .filter(|s| s.0 == "m6-1")
+            .map(|s| s.1.clone())
+            .collect();
+        assert_eq!(
+            order,
+            vec!["CANCELLED".to_string(), "up:DEACTIVATED".to_string()],
+            "the CANCELLED survives both resets, and the second reset adds no duplicate"
+        );
+        server.forget_ue(ue);
+    }
+
+    /// Put an NG-Reset-idled UE back to CM-CONNECTED on its association, as a returning
+    /// UE would be, for a second reset to act on.
+    fn connected_again(server: &mut NgapServer, ue: u64) {
+        server.ue_auth_state.with_mut(ue, |s| {
+            s.cm_idle = false;
+            s.reachability = None;
+        });
     }
 
     // ---- criterion 8: the MBS builders name the right procedures ----
