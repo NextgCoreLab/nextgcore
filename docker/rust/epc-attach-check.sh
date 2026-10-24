@@ -178,3 +178,32 @@ if [ "${EPC_IDLE_MODE:-0}" = "1" ]; then
     fi
     echo "OK: ${COUNT}/${COUNT} downlink packets reach the UE after the network-triggered SERVICE REQUEST"
 fi
+
+# 7. Detach (#1032 review, TS 23.401 §5.3.8.2.1): the UE detaches; the MME's
+#    Delete Session Request (OI set) is relayed by the SGW-C to the PGW over
+#    S5/S8 (#1025), and the PGW's answer is what lets the SGW-U's session go.
+#    Off until the simulator can detach an LTE UE on command (nextgsim #365):
+#    set EPC_DETACH=1 once its image ships `lte-ue-detach`.
+if [ "${EPC_DETACH:-0}" = "1" ]; then
+    SGWC="${EPC_SGWC_CONTAINER:-nextgcore-sgwc}"
+    relayed_re='Delete Session Request for session [0-9]+ relayed to the PGW'
+    answered_re='S5/S8 Delete Session Response from .* cause=16'
+    relayed0=$(docker logs "$SGWC" 2>&1 | grep -Ec "$relayed_re" || true)
+    answered0=$(docker logs "$SGWC" 2>&1 | grep -Ec "$answered_re" || true)
+    echo "Detaching the UE..."
+    docker exec "$UE" lte-ue-detach
+    for i in $(seq 1 "$TIMEOUT"); do
+        relayed=$(docker logs "$SGWC" 2>&1 | grep -Ec "$relayed_re" || true)
+        answered=$(docker logs "$SGWC" 2>&1 | grep -Ec "$answered_re" || true)
+        if [ "$relayed" -gt "$relayed0" ] && [ "$answered" -gt "$answered0" ]; then
+            echo "OK: the detach's Delete Session crossed S5/S8 and the PGW accepted it (after ${i}s)"
+            break
+        fi
+        if [ "$i" -eq "$TIMEOUT" ]; then
+            echo "FAIL: no Delete Session relayed to and accepted by the PGW within ${TIMEOUT}s"
+            docker logs --tail 60 "$SGWC" 2>&1 || true
+            exit 1
+        fi
+        sleep 1
+    done
+fi
