@@ -27,6 +27,7 @@ pub mod sxa_build;
 pub mod sxa_handler;
 pub mod sxa_response;
 pub mod timer;
+pub mod up_path;
 
 use context::sgwc_self;
 use event::{SgwcEvent, SgwcEventId};
@@ -70,6 +71,8 @@ pub struct SgwcApp {
     pfcp_task: Option<tokio::task::JoinHandle<()>>,
     /// Asks that loop to stop.
     pfcp_shutdown: Option<tokio::sync::watch::Sender<bool>>,
+    /// Keeps the Sxa association up (#1001).
+    pfcp_assoc_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl SgwcApp {
@@ -81,6 +84,7 @@ impl SgwcApp {
             timer_mgr: timer::TimerManager::new(),
             pfcp_task: None,
             pfcp_shutdown: None,
+            pfcp_assoc_task: None,
         }
     }
 
@@ -146,20 +150,22 @@ impl SgwcApp {
         // procedure would time out.
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         self.pfcp_shutdown = Some(shutdown_tx);
+        let shutdown_rx_assoc = shutdown_rx.clone();
         self.pfcp_task = Some(tokio::spawn(pfcp.clone().run(shutdown_rx)));
 
-        // Associate with the SGW-U (TS 29.244 §6.2.6.2). NOT fatal: an SGW-U that comes up
-        // after the SGW-C is the normal bring-up order in the compose stack, and refusing
-        // to start would make the slower peer an outage. The association is retried by the
-        // first session request that needs it.
+        // Associate with the SGW-U (TS 29.244 §6.2.6.2) and keep the association up
+        // (#1001). NOT fatal: an SGW-U that comes up after the SGW-C is the normal
+        // bring-up order in the compose stack, and refusing to start would make the
+        // slower peer an outage. The task retries a refused or unanswered Setup every
+        // 10 s and heartbeats the association once it is up, re-associating when it is
+        // lost; session requests are refused while there is none.
         let sgwu = pfcp_path::configured_sgwu_addr();
-        match pfcp.associate(sgwu).await {
-            Ok(()) => log::info!("Associated with SGW-U {sgwu}"),
-            Err(e) => log::warn!(
-                "No PFCP association with SGW-U {sgwu} yet ({e}); session requests will \
-                 fail until it answers"
-            ),
-        }
+        self.pfcp_assoc_task = Some(tokio::spawn(pfcp.clone().maintain_association(
+            sgwu,
+            pfcp_path::ASSOCIATION_RETRY,
+            pfcp_path::HEARTBEAT_PERIOD,
+            shutdown_rx_assoc,
+        )));
 
         log::info!("SGWC initialized successfully");
         Ok(())
@@ -241,6 +247,10 @@ impl SgwcApp {
         if let Some(task) = self.pfcp_task.take() {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
         }
+        // An Association Setup or Heartbeat in flight is abandoned, not waited for.
+        if let Some(task) = self.pfcp_assoc_task.take() {
+            task.abort();
+        }
 
         // Send exit event to state machine
         let exit_event = SgwcEvent::exit();
@@ -284,6 +294,43 @@ impl Default for SgwcApp {
     }
 }
 
+/// Where the Prometheus endpoint listens (`SGWC_METRICS_PORT`, default 9090, the port
+/// every other daemon in this tree uses for it).
+fn metrics_addr() -> std::net::SocketAddr {
+    let port: u16 = std::env::var("SGWC_METRICS_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9090);
+    nextgcore_metrics::nes_energy::metrics_bind_addr(port)
+}
+
+/// The SGW-C's runtime state in Prometheus text format: liveness, the Sxa
+/// association, the UE census, and the user plane path reports (#994).
+fn render_metrics() -> String {
+    let associated = pfcp_path::sxa_node()
+        .map(|n| n.associated_peer_count())
+        .unwrap_or(0);
+    let mut out = format!(
+        "# HELP sgwc_up 1 while the SGW-C runtime is serving\n\
+         # TYPE sgwc_up gauge\n\
+         sgwc_up 1\n\
+         # HELP sgwc_pfcp_associations Sxa PFCP associations with an SGW-U\n\
+         # TYPE sgwc_pfcp_associations gauge\n\
+         sgwc_pfcp_associations {associated}\n\
+         # TYPE sgwc_ues gauge\n\
+         sgwc_ues {}\n",
+        sgwc_self().ue_count()
+    );
+    up_path::render_metrics(&mut out);
+    out
+}
+
+/// [`render_metrics`] for the tests of other modules.
+#[cfg(test)]
+pub(crate) fn main_render_metrics_for_test() -> String {
+    render_metrics()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Parse command line arguments
@@ -296,6 +343,8 @@ async fn main() -> Result<()> {
         Some(&args.config),
     ))
     .init();
+    // #1004 review: an unset clock makes a wrong PFCP Recovery Time Stamp.
+    nextgcore_pfcp::recovery_time::check_local_clock().map_err(|e| anyhow::anyhow!(e))?;
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = nextgcore_metrics::otel::init_otel(
         nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
@@ -320,6 +369,19 @@ async fn main() -> Result<()> {
 
     // Initialize
     app.init(&args.config).await?;
+
+    // The Prometheus endpoint (#994). Loopback unless NEXTGCORE_METRICS_BIND says
+    // otherwise (#837). Non-fatal, as in sgwud: an SGW-C that cannot expose metrics
+    // still serves S11.
+    match nextgcore_metrics::nes_energy::serve_metrics(
+        metrics_addr(),
+        std::sync::Arc::new(render_metrics),
+    )
+    .await
+    {
+        Ok((bound, _handle)) => log::info!("SGWC metrics endpoint on http://{bound}/metrics"),
+        Err(e) => log::warn!("SGWC metrics endpoint not available: {e}"),
+    }
 
     // Run main loop
     app.run().await?;
