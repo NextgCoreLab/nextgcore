@@ -73,8 +73,9 @@ pub struct GtpuPeerState {
 /// What an Echo Response meant to the [`GtpuPathTable`] (#887).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EchoResponse {
-    /// It answered our outstanding request: the path is alive.
-    Answered,
+    /// It answered our outstanding request: the path is alive. `recovered` when the
+    /// path had been declared FAILED, so the CP function is told it recovered (#935).
+    Answered { recovered: bool },
     /// Not an answer to anything we sent (unknown peer, no outstanding request, or a
     /// sequence number that does not match). Ignored.
     Unsolicited,
@@ -155,8 +156,8 @@ impl GtpuPathTable {
         state.pending_seq = None;
         state.miss_count = 0;
         state.last_success = Some(std::time::Instant::now());
-        state.path_failed = false;
-        EchoResponse::Answered
+        let recovered = std::mem::replace(&mut state.path_failed, false);
+        EchoResponse::Answered { recovered }
     }
 
     /// Advance the state machine by one echo interval tick.
@@ -768,7 +769,9 @@ pub struct DataPlaneFar {
     /// Outer header creation: DL TEID for GTP-U encap
     pub ohc_teid: Option<u32>,
     /// Outer header creation: peer address
-    pub ohc_addr: Option<Ipv4Addr>,
+    /// Outer Header Creation peer address, IPv4 or IPv6 (§8.2.56; #918: it was
+    /// IPv4-only, so a FAR could not point at an IPv6 gNB).
+    pub ohc_addr: Option<IpAddr>,
     /// Buffering Action Rule reference (TS 29.244 8.2.74)
     pub bar_id: Option<u8>,
 }
@@ -793,7 +796,7 @@ pub enum FarDecision {
     /// FORW — forward, optionally re-encapsulating via Outer Header Creation
     Forward {
         ohc_teid: Option<u32>,
-        ohc_addr: Option<Ipv4Addr>,
+        ohc_addr: Option<IpAddr>,
     },
     /// DROP — discard the packet
     Drop,
@@ -1200,6 +1203,91 @@ impl UrrOutcome {
     }
 }
 
+/// The time-based measurement of one URR (#820, TS 29.244 §5.2.2.2).
+///
+/// Measured time runs from the first packet -- or from provisioning, when the CP
+/// function set ISTM (Immediate Start Time Metering, §8.2.68) -- and, when an
+/// Inactivity Detection Time (§8.2.18) is provisioned, is suspended once no packet
+/// has been received for that long (the inactivity time itself counts), and resumes
+/// with the next packet. Without one (or with zero), it runs continuously.
+///
+/// The time threshold, time quota and usage reports each count from their own point
+/// on this ONE measured clock, so a report re-bases its anchor without disturbing the
+/// others (TS 29.244 §5.2.2.3.1).
+#[derive(Debug, Default)]
+pub struct TimeMeter {
+    /// Inactivity Detection Time; `None` (or zero) = measure continuously.
+    idt: Option<std::time::Duration>,
+    /// Start of the current metering segment, while metering.
+    running_since: Option<std::time::Instant>,
+    /// Last packet while metering.
+    last_pkt: Option<std::time::Instant>,
+    /// Measured time of the closed segments.
+    accumulated: std::time::Duration,
+    /// Measured time at which the time THRESHOLD count starts.
+    thr_anchor: std::time::Duration,
+    /// Measured time at which the time QUOTA count starts.
+    quota_anchor: std::time::Duration,
+    /// Measured time at the last usage report (the ongoing measurement's start).
+    report_anchor: std::time::Duration,
+}
+
+impl TimeMeter {
+    /// Measured time up to `now`.
+    fn measured(&self, now: std::time::Instant) -> std::time::Duration {
+        let running = self
+            .running_since
+            .map_or(std::time::Duration::ZERO, |start| {
+                let end = match (self.idt, self.last_pkt) {
+                    (Some(idt), Some(last)) if !idt.is_zero() => (last + idt).min(now),
+                    _ => now,
+                };
+                end.saturating_duration_since(start)
+            });
+        self.accumulated + running
+    }
+
+    /// A packet at `now`: start metering, or resume it after an inactivity gap.
+    fn on_packet(&mut self, now: std::time::Instant) {
+        match (self.running_since, self.idt, self.last_pkt) {
+            (None, _, _) => self.running_since = Some(now),
+            (Some(start), Some(idt), Some(last)) if !idt.is_zero() && now > last + idt => {
+                // The gap suspended metering at last + IDT; close that segment and open
+                // a new one at this packet.
+                self.accumulated += (last + idt).saturating_duration_since(start);
+                self.running_since = Some(now);
+            }
+            _ => {}
+        }
+        self.last_pkt = Some(now);
+    }
+
+    /// ISTM: start metering now, without waiting for a packet.
+    fn start_now(&mut self, now: std::time::Instant) {
+        if self.running_since.is_none() {
+            self.running_since = Some(now);
+            self.last_pkt = Some(now);
+        }
+    }
+
+    /// Re-provision the Inactivity Detection Time, closing the segment measured so
+    /// far under the old one first.
+    fn set_idt(&mut self, idt: Option<std::time::Duration>, now: std::time::Instant) {
+        if self.running_since.is_some() {
+            let suspended = matches!(
+                (self.idt, self.last_pkt),
+                (Some(i), Some(last)) if !i.is_zero() && now > last + i
+            );
+            self.accumulated = self.measured(now);
+            // A suspended meter stays suspended (the next packet resumes it); a running
+            // one continues from now under the new IDT.
+            self.running_since = (!suspended).then_some(now);
+            self.last_pkt = (!suspended).then_some(now);
+        }
+        self.idt = idt;
+    }
+}
+
 /// Lightweight URR for usage reporting in the data plane
 #[derive(Debug)]
 pub struct DataPlaneUrr {
@@ -1255,9 +1343,6 @@ pub struct DataPlaneUrr {
     quota_used_total: AtomicU64,
     quota_used_ul: AtomicU64,
     quota_used_dl: AtomicU64,
-    /// First packet since the quota was provisioned, for the Time Quota (§8.2.41) --
-    /// separate from `first_pkt_time`, which every report resets.
-    quota_first_pkt_time: RwLock<Option<std::time::Instant>>,
     /// Volume counted toward the volume THRESHOLDS: since the last threshold-triggered
     /// report or the last (re-)provisioning of a threshold. A non-threshold report
     /// (PERIO, query, quota) leaves it running -- §5.2.2.3.1's "adjust the thresholds
@@ -1266,12 +1351,12 @@ pub struct DataPlaneUrr {
     thr_used_total: AtomicU64,
     thr_used_ul: AtomicU64,
     thr_used_dl: AtomicU64,
-    /// Start of the TIME-threshold measurement (#842 review): re-based only by a
-    /// threshold-triggered report or a changed Time Threshold, NOT by every report.
-    /// Measuring it from `last_report_time` let each PERIO/query/quota report postpone
-    /// the time threshold, so with a Measurement Period shorter than it, TIMTH never
-    /// fired at all.
-    thr_time_start: std::sync::Mutex<std::time::Instant>,
+    /// The MEASURED time of this URR (#820, TS 29.244 §5.2.2.2) and the points on it
+    /// the time threshold, the time quota and the last report are counted from. Time
+    /// thresholds and quotas compare against measured time, not wall time since some
+    /// event: metering starts at the first packet (or at once, with ISTM), and is
+    /// suspended after an Inactivity Detection Time with no packets.
+    meter: std::sync::Mutex<TimeMeter>,
     /// Raised by `record()` when the TIME threshold is crossed, so the report says
     /// TIMTH (#842 review); cleared by every report.
     time_threshold_hit: AtomicBool,
@@ -1281,6 +1366,12 @@ pub struct DataPlaneUrr {
     /// Private (#724): read it through [`Self::last_report_time`], which copies the
     /// value out, so no guard on it can outlive a [`Self::reset_counters`] call.
     last_report_time: RwLock<Option<std::time::Instant>>,
+    /// Start of the CURRENT Measurement Period (#772). Periodic reports are due at
+    /// `period_start + k * period` -- a schedule anchored at the period boundaries,
+    /// not at whenever the last report of any kind happened -- and a PERIO report
+    /// advances it by whole periods. Private: read and advanced only through
+    /// [`Self::claim_period`] / [`Self::period_due`], under its own lock.
+    period_start: std::sync::Mutex<std::time::Instant>,
     /// Whether a threshold has been exceeded (needs reporting)
     pub threshold_exceeded: AtomicBool,
     /// Monotonic UR-SEQN per URR (TS 29.244 8.2.60) — incremented for every
@@ -1392,10 +1483,10 @@ impl DataPlaneUrr {
             return Some(UrrReportReason::VolumeQuota);
         }
         let time = self.time_quota_secs().is_some_and(|q| {
-            self.quota_first_pkt_time
-                .read()
-                .unwrap()
-                .is_some_and(|first| first.elapsed().as_secs() >= q as u64)
+            let m = self.meter.lock().unwrap();
+            m.measured(std::time::Instant::now())
+                .saturating_sub(m.quota_anchor)
+                >= std::time::Duration::from_secs(q as u64)
         });
         time.then_some(UrrReportReason::TimeQuota)
     }
@@ -1500,7 +1591,8 @@ impl DataPlaneUrr {
     }
 
     fn rebase_time_quota_to_ongoing(&self) {
-        *self.quota_first_pkt_time.write().unwrap() = *self.first_pkt_time.read().unwrap();
+        let mut m = self.meter.lock().unwrap();
+        m.quota_anchor = m.report_anchor;
     }
 
     /// The same for a newly received volume threshold.
@@ -1517,10 +1609,8 @@ impl DataPlaneUrr {
     /// The same for a newly received time threshold: measured from the start of the
     /// ongoing measurement (the last report).
     fn rebase_time_threshold_to_ongoing(&self) {
-        let start = self
-            .last_report_time()
-            .unwrap_or_else(std::time::Instant::now);
-        *self.thr_time_start.lock().unwrap() = start;
+        let mut m = self.meter.lock().unwrap();
+        m.thr_anchor = m.report_anchor;
     }
 
     fn volume(slot: &AtomicU64) -> Option<u64> {
@@ -1578,8 +1668,46 @@ impl DataPlaneUrr {
         {
             self.rebase_time_threshold_to_ongoing();
         }
-        self.measurement_period_secs_raw
-            .store(sec(measurement_period_secs), Ordering::Relaxed);
+        let previous = self
+            .measurement_period_secs_raw
+            .swap(sec(measurement_period_secs), Ordering::Relaxed);
+        // #772: a NEW Measurement Period starts its schedule now; re-provisioning the
+        // same period leaves the running schedule alone.
+        if previous != sec(measurement_period_secs) {
+            *self.period_start.lock().unwrap() = std::time::Instant::now();
+        }
+    }
+
+    /// Whether a Measurement Period has ended (#772) -- detection only.
+    pub fn period_due(&self) -> bool {
+        let Some(period) = self.measurement_period_secs() else {
+            return false;
+        };
+        let start = *self.period_start.lock().unwrap();
+        start.elapsed() >= std::time::Duration::from_secs(period as u64)
+    }
+
+    /// Claim the periodic report for the period(s) that have ended, if any (#772).
+    ///
+    /// Advances the schedule by WHOLE periods, so the next report is due at the next
+    /// period boundary however late this harvest ran: lateness never accumulates (the
+    /// old check compared against the reset instant, so every report slid a harvest
+    /// tick later than the last). If several periods passed unreported, one report
+    /// covers them and the schedule realigns to the boundary still ahead. Check and
+    /// advance happen under one lock, so two harvests cannot both claim one period.
+    pub fn claim_period(&self) -> bool {
+        let Some(period) = self.measurement_period_secs() else {
+            return false;
+        };
+        let period = std::time::Duration::from_secs(period as u64);
+        let mut start = self.period_start.lock().unwrap();
+        let elapsed = start.elapsed();
+        if elapsed < period {
+            return false;
+        }
+        let whole = (elapsed.as_nanos() / period.as_nanos()) as u32;
+        *start += period * whole;
+        true
     }
 
     /// Apply an Update URR's reporting IEs (#842 review, TS 29.244 §7.5.4): an ABSENT
@@ -1615,7 +1743,10 @@ impl DataPlaneUrr {
             }
         }
         if let Some(p) = measurement_period_secs {
-            self.measurement_period_secs_raw.store(p, Ordering::Relaxed);
+            // #772: a changed Measurement Period starts its schedule now.
+            if self.measurement_period_secs_raw.swap(p, Ordering::Relaxed) != p {
+                *self.period_start.lock().unwrap() = std::time::Instant::now();
+            }
         }
     }
 
@@ -1641,14 +1772,14 @@ impl DataPlaneUrr {
             quota_used_total: AtomicU64::new(0),
             quota_used_ul: AtomicU64::new(0),
             quota_used_dl: AtomicU64::new(0),
-            quota_first_pkt_time: RwLock::new(None),
             thr_used_total: AtomicU64::new(0),
             thr_used_ul: AtomicU64::new(0),
             thr_used_dl: AtomicU64::new(0),
-            thr_time_start: std::sync::Mutex::new(std::time::Instant::now()),
+            meter: std::sync::Mutex::new(TimeMeter::default()),
             time_threshold_hit: AtomicBool::new(false),
             first_pkt_time: RwLock::new(None),
             last_report_time: RwLock::new(Some(std::time::Instant::now())),
+            period_start: std::sync::Mutex::new(std::time::Instant::now()),
             threshold_exceeded: AtomicBool::new(false),
             ur_seqn: std::sync::atomic::AtomicU32::new(0),
         }
@@ -1742,23 +1873,22 @@ impl DataPlaneUrr {
         // first packet is recorded even for a session whose very first packet crosses
         // something -- a usage report with no Time of First Packet is a report the CP
         // function cannot place in a billing window.
-        for slot in [&self.first_pkt_time, &self.quota_first_pkt_time] {
-            let mut fpt = slot.write().unwrap();
+        {
+            let mut fpt = self.first_pkt_time.write().unwrap();
             if fpt.is_none() {
                 *fpt = Some(std::time::Instant::now());
             }
         }
+        self.meter
+            .lock()
+            .unwrap()
+            .on_packet(std::time::Instant::now());
 
         // ---- Volume quotas: per direction, then total (§8.2.40) ----
         let volume_quota_hit = dir_quota.is_some_and(|q| directional >= q)
             || self.volume_quota_total().is_some_and(|q| total >= q);
-        // ---- Time quota (§8.2.41): measured duration since the first packet ----
-        let time_quota_hit = self.time_quota_secs().is_some_and(|q| {
-            self.quota_first_pkt_time
-                .read()
-                .unwrap()
-                .is_some_and(|first| first.elapsed().as_secs() >= q as u64)
-        });
+        // ---- Time quota (§8.2.41): MEASURED time since the grant (#820) ----
+        let time_quota_hit = self.time_quota_used().is_some_and(|(used, q)| used >= q);
 
         if already_exhausted {
             // Latched by an earlier packet: dropped, not re-reported. Checked BEFORE
@@ -1793,13 +1923,10 @@ impl DataPlaneUrr {
         }
 
         // Check time threshold
-        if let Some(time_thresh) = self.time_threshold_secs() {
-            let start = *self.thr_time_start.lock().unwrap();
-            if start.elapsed() >= std::time::Duration::from_secs(time_thresh as u64) {
-                self.time_threshold_hit.store(true, Ordering::Relaxed);
-                self.threshold_exceeded.store(true, Ordering::Relaxed);
-                outcome = UrrOutcome::ThresholdExceeded;
-            }
+        if self.time_threshold_crossed() {
+            self.time_threshold_hit.store(true, Ordering::Relaxed);
+            self.threshold_exceeded.store(true, Ordering::Relaxed);
+            outcome = UrrOutcome::ThresholdExceeded;
         }
 
         outcome
@@ -1852,8 +1979,17 @@ impl DataPlaneUrr {
             .fetch_sub(usage.total_bytes(), Ordering::AcqRel);
         self.acc_total_pkts
             .fetch_sub(usage.total_pkts(), Ordering::AcqRel);
+        {
+            // #820: the next report's measurement starts here on the measured clock; a
+            // threshold report re-applies the time threshold from here too.
+            let mut m = self.meter.lock().unwrap();
+            let now = m.measured(std::time::Instant::now());
+            m.report_anchor = now;
+            if threshold_report {
+                m.thr_anchor = now;
+            }
+        }
         if threshold_report {
-            *self.thr_time_start.lock().unwrap() = std::time::Instant::now();
             // Read AFTER the swaps: a packet whose bytes this report took has already
             // added to these counters, so it is subtracted; one recorded after the read
             // stays, counting toward the re-applied threshold.
@@ -1868,20 +2004,124 @@ impl DataPlaneUrr {
     /// Why this URR must report now, or `None` (#821): a crossed threshold or quota
     /// (the flag `record()` raises), else an elapsed Measurement Period with usage
     /// counted (PERIO).
+    /// `(measured time since the time quota was granted, the quota)`, if one is
+    /// provisioned (#820).
+    fn time_quota_used(&self) -> Option<(std::time::Duration, std::time::Duration)> {
+        let q = std::time::Duration::from_secs(self.time_quota_secs()? as u64);
+        let m = self.meter.lock().unwrap();
+        Some((
+            m.measured(std::time::Instant::now())
+                .saturating_sub(m.quota_anchor),
+            q,
+        ))
+    }
+
+    /// Whether the measured time since the time threshold was (re-)applied has
+    /// reached it (#820).
+    fn time_threshold_crossed(&self) -> bool {
+        let Some(t) = self.time_threshold_secs() else {
+            return false;
+        };
+        let m = self.meter.lock().unwrap();
+        m.measured(std::time::Instant::now())
+            .saturating_sub(m.thr_anchor)
+            >= std::time::Duration::from_secs(t as u64)
+    }
+
+    /// Evaluate the TIME limits now, without waiting for a packet (#820): measured time
+    /// keeps running between packets (continuously, or until the Inactivity Detection
+    /// Time), so a time threshold or quota can be reached by a UE that sends nothing.
+    /// Before, both were checked only in `record()`, so an idle UE's TIMTH never fired
+    /// and its time quota was enforced only when its next packet arrived. Run on every
+    /// harvest tick (1 s).
+    fn evaluate_time_limits(&self) {
+        if !self.is_quota_exhausted() && self.time_quota_used().is_some_and(|(used, q)| used >= q) {
+            self.quota_exhausted.store(true, Ordering::Relaxed);
+            self.threshold_exceeded.store(true, Ordering::Relaxed);
+            log::info!(
+                "URR {} time quota exhausted on the measured clock: matching traffic stops \
+                 being forwarded (TS 29.244 §5.2.2.2)",
+                self.urr_id
+            );
+        }
+        if self.time_threshold_crossed() {
+            self.time_threshold_hit.store(true, Ordering::Relaxed);
+            self.threshold_exceeded.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Provision the time metering (#820): the Inactivity Detection Time (§8.2.18;
+    /// `None` or 0 = continuous) and ISTM (Immediate Start Time Metering, §8.2.68: start
+    /// metering now instead of at the first packet).
+    pub fn set_time_metering(&self, inactivity_detection_secs: Option<u32>, immediate_start: bool) {
+        let now = std::time::Instant::now();
+        let mut m = self.meter.lock().unwrap();
+        m.set_idt(
+            inactivity_detection_secs.map(|s| std::time::Duration::from_secs(s as u64)),
+            now,
+        );
+        if immediate_start {
+            m.start_now(now);
+        }
+    }
+
+    /// Apply an Update URR's time-metering IEs (#820, §7.5.4): an absent Inactivity
+    /// Detection Time is unchanged; ISTM starts metering now.
+    pub fn update_time_metering(
+        &self,
+        inactivity_detection_secs: Option<u32>,
+        immediate_start: bool,
+    ) {
+        let now = std::time::Instant::now();
+        let mut m = self.meter.lock().unwrap();
+        if let Some(s) = inactivity_detection_secs {
+            m.set_idt(Some(std::time::Duration::from_secs(s as u64)), now);
+        }
+        if immediate_start {
+            m.start_now(now);
+        }
+    }
+
+    /// Move measured time on by `by`, as if it had been metered (tests).
+    #[cfg(test)]
+    pub(crate) fn advance_measured(&self, by: std::time::Duration) {
+        let mut m = self.meter.lock().unwrap();
+        if m.running_since.is_none() {
+            m.running_since = Some(std::time::Instant::now());
+        }
+        m.accumulated += by;
+    }
+
     pub fn report_due(&self) -> Option<UrrReportReason> {
+        self.evaluate_time_limits();
         // #80: an exhausted quota is reported as a QUOTA report, not as a threshold
         // report -- that is what tells the CP function the subscriber is being DROPPED.
         if self.threshold_exceeded.load(Ordering::SeqCst) {
             return Some(self.report_reason());
         }
-        // #724: the instant is COPIED out (`last_report_time()` returns the value), so
-        // no guard on it is alive across `take_usage`, which writes it.
-        let period_elapsed = self.measurement_period_secs().is_some_and(|period| {
-            self.last_report_time()
-                .is_some_and(|last| last.elapsed().as_secs() >= period as u64)
-        });
-        (period_elapsed && self.acc_total_bytes.load(Ordering::Acquire) > 0)
-            .then_some(UrrReportReason::Periodic)
+        // #772: PERIO on the period schedule, and WITH ZERO USAGE too: TS 29.244
+        // §5.2.2.2.1 provisions the Measurement Period as "the period to generate
+        // periodic usage reports", and a period with no traffic is still a period.
+        // Skipping empty periods left the schedule unrestarted, so the first packet
+        // after an idle spell triggered an immediate report spanning several periods.
+        self.period_due().then_some(UrrReportReason::Periodic)
+    }
+
+    /// Like [`Self::report_due`], but CLAIMS a periodic report (advancing the period
+    /// schedule), for the path that is about to take the usage (#772).
+    pub fn claim_report(&self) -> Option<UrrReportReason> {
+        self.evaluate_time_limits();
+        if self.threshold_exceeded.load(Ordering::SeqCst) {
+            return Some(self.report_reason());
+        }
+        self.claim_period().then_some(UrrReportReason::Periodic)
+    }
+
+    /// Move the period schedule back by `by` (tests: reach a period boundary without
+    /// waiting for it).
+    #[cfg(test)]
+    pub(crate) fn backdate_period(&self, by: std::time::Duration) {
+        *self.period_start.lock().unwrap() -= by;
     }
 
     /// A non-resetting read of the usage counted since the last report.
@@ -2590,6 +2830,13 @@ pub enum UpfReportEvent {
         smf_seid: u64,
         urr_id: u32,
     },
+    /// N3 user-plane paths declared FAILED (`failure`) or RECOVERED, to be reported
+    /// to the CP function in a PFCP Node Report (#935, TS 29.244 §7.4.5.1). They used
+    /// to be only logged, so the SMF never learnt a gNB path was down or back.
+    PathReport {
+        failure: bool,
+        peers: Vec<std::net::IpAddr>,
+    },
 }
 
 /// Data plane runtime context
@@ -2598,6 +2845,9 @@ pub struct DataPlane {
     pub tun: Option<TunDevice>,
     /// GTP-U socket
     pub gtpu_socket: Option<Arc<TokioUdpSocket>>,
+    /// IPv6 GTP-U socket, when the UPF has an IPv6 N3 address (`--gtpu-addr6`, #918).
+    /// G-PDUs, Echo and End Markers to an IPv6 peer go out on it; it is also read.
+    pub gtpu_socket6: Option<Arc<TokioUdpSocket>>,
     /// Session manager
     pub sessions: SessionManager,
     /// Shutdown flag
@@ -2732,6 +2982,7 @@ impl DataPlane {
         Self {
             tun: None,
             gtpu_socket: None,
+            gtpu_socket6: None,
             sessions: SessionManager::new(),
             shutdown,
             stats: DataPlaneStats::default(),
@@ -2836,6 +3087,44 @@ impl DataPlane {
         Ok(())
     }
 
+    /// The GTP-U socket for a destination of `dst`'s address family (#918).
+    pub fn socket_for(&self, dst: &SocketAddr) -> Option<&Arc<TokioUdpSocket>> {
+        if dst.is_ipv6() {
+            self.gtpu_socket6.as_ref()
+        } else {
+            self.gtpu_socket.as_ref()
+        }
+    }
+
+    /// The N3 paths in use that this UPF can actually probe (#960 review).
+    ///
+    /// An IPv6 gNB with no IPv6 GTP-U socket (`--gtpu-addr6` unset) cannot be sent an
+    /// Echo Request. Tracking it anyway counted a miss every round, declared the path
+    /// failed and reported a User Plane Path Failure for a path never probed. It is
+    /// left out instead, and that is logged once.
+    pub fn probeable_paths(&self, mut in_use: HashSet<SocketAddr>) -> HashSet<SocketAddr> {
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if self.gtpu_socket6.is_none() {
+            let before = in_use.len();
+            in_use.retain(|p| p.is_ipv4());
+            if in_use.len() != before && !WARNED.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    "{} IPv6 N3 path(s) in use are not probed: no IPv6 GTP-U socket \
+                     (set --gtpu-addr6)",
+                    before - in_use.len()
+                );
+            }
+        }
+        in_use
+    }
+
+    /// Bind the IPv6 GTP-U socket (#918).
+    pub async fn bind_gtpu6(&mut self, addr: SocketAddr) -> io::Result<()> {
+        log::info!("Binding IPv6 GTP-U socket on {addr}");
+        self.gtpu_socket6 = Some(Arc::new(TokioUdpSocket::bind(addr).await?));
+        Ok(())
+    }
+
     /// Run the data plane forwarding loops
     pub async fn run(&self) -> io::Result<()> {
         let tun = self.tun.as_ref().ok_or_else(|| {
@@ -2882,6 +3171,29 @@ impl DataPlane {
                     }
                 }
             }
+        });
+
+        // #918: the IPv6 GTP-U socket feeds the same uplink queue.
+        let gtpu6_recv_task = self.gtpu_socket6.clone().map(|sock6| {
+            let ul_tx6 = ul_tx.clone();
+            let shutdown6 = shutdown.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; MAX_PACKET_SIZE];
+                log::info!("IPv6 GTP-U receive task started");
+                while !shutdown6.load(Ordering::Relaxed) {
+                    match sock6.recv_from(&mut buf).await {
+                        Ok((len, from)) if len > 0 => {
+                            let _ = ul_tx6.send((buf[..len].to_vec(), from)).await;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            if e.kind() != io::ErrorKind::WouldBlock {
+                                log::error!("IPv6 GTP-U recv error: {e}");
+                            }
+                        }
+                    }
+                }
+            })
         });
 
         // Spawn TUN read task (downlink: TUN -> UPF -> gNB)
@@ -2951,6 +3263,9 @@ impl DataPlane {
 
         // Cleanup
         gtpu_recv_task.abort();
+        if let Some(t) = gtpu6_recv_task {
+            t.abort();
+        }
         tun_read_task.abort();
 
         Ok(())
@@ -2972,7 +3287,7 @@ impl DataPlane {
             gtpu_msg_type::ECHO_REQUEST => {
                 log::debug!("GTP-U Echo Request from {from}");
                 let response = build_gtpu_echo_response(header.seq_num);
-                if let Some(sock) = &self.gtpu_socket {
+                if let Some(sock) = self.socket_for(&from) {
                     let _ = sock.send_to(&response, from).await;
                 }
                 return;
@@ -3026,8 +3341,18 @@ impl DataPlane {
                     .write()
                     .unwrap()
                     .on_echo_response(from, header.seq_num);
-                if outcome == EchoResponse::Unsolicited {
-                    log::debug!("GTP-U Echo Response from {from} answers nothing we sent: ignored");
+                match outcome {
+                    EchoResponse::Unsolicited => log::debug!(
+                        "GTP-U Echo Response from {from} answers nothing we sent: ignored"
+                    ),
+                    EchoResponse::Answered { recovered: true } => {
+                        log::warn!("GTP-U path to {from} RECOVERED");
+                        self.send_report_event(UpfReportEvent::PathReport {
+                            failure: false,
+                            peers: vec![from.ip()],
+                        });
+                    }
+                    EchoResponse::Answered { recovered: false } => {}
                 }
                 return;
             }
@@ -3087,7 +3412,7 @@ impl DataPlane {
                     );
                     let local = *self.local_gtpu_addr.read().unwrap();
                     let err_ind = build_gtpu_error_indication(header.teid, local);
-                    if let Some(sock) = &self.gtpu_socket {
+                    if let Some(sock) = self.socket_for(&from) {
                         let _ = sock.send_to(&err_ind, from).await;
                     }
                 } else {
@@ -3125,8 +3450,8 @@ impl DataPlane {
             if let Some((Some(teid), Some(addr))) = relay {
                 let qfi = qer_id.and_then(|q| session.qers.read().unwrap().get(&q)?.qfi);
                 let out = encapsulate_dl_gpdu(ip_payload, teid, qfi);
-                let to = SocketAddr::new(IpAddr::V4(addr), GTPU_PORT);
-                match &self.gtpu_socket {
+                let to = SocketAddr::new(addr, GTPU_PORT);
+                match self.socket_for(&to) {
                     Some(sock) => match sock.send_to(&out, to).await {
                         Ok(_) => {
                             self.stats.dl_packets.fetch_add(1, Ordering::Relaxed);
@@ -3406,7 +3731,7 @@ impl DataPlane {
                 FarDecision::Forward { ohc_teid, ohc_addr } => {
                     let teid = ohc_teid.unwrap_or(session.dl_teid());
                     let addr = ohc_addr
-                        .map(|ip| SocketAddr::new(IpAddr::V4(ip), GTPU_PORT))
+                        .map(|ip| SocketAddr::new(ip, GTPU_PORT))
                         .unwrap_or(session.gnb_addr());
                     (teid, addr)
                 }
@@ -3501,8 +3826,23 @@ impl DataPlane {
         let gtpu_pkt =
             encapsulate_dl_gpdu_marked(pkt, dl_teid, qfi_to_apply, rqi_to_apply, ppi_to_apply);
 
-        // Send to gNB
-        match gtpu.send_to(&gtpu_pkt, gnb_addr).await {
+        // Send to gNB -- on the IPv6 socket for an IPv6 gNB (#918).
+        let sock = if gnb_addr.is_ipv6() {
+            match self.gtpu_socket6.as_deref() {
+                Some(s) => s,
+                None => {
+                    log::warn!(
+                        "DL G-PDU to IPv6 gNB {gnb_addr} dropped: no IPv6 GTP-U socket \
+                         (start upfd with --gtpu-addr6)"
+                    );
+                    self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            }
+        } else {
+            gtpu
+        };
+        match sock.send_to(&gtpu_pkt, gnb_addr).await {
             Ok(_) => {
                 session.dl_packets.fetch_add(1, Ordering::Relaxed);
                 session.dl_bytes.fetch_add(payload_len, Ordering::Relaxed);
@@ -3556,7 +3896,7 @@ impl DataPlane {
         };
         let teid = ohc_teid.unwrap_or(session.dl_teid());
         let addr = ohc_addr
-            .map(|ip| SocketAddr::new(IpAddr::V4(ip), GTPU_PORT))
+            .map(|ip| SocketAddr::new(ip, GTPU_PORT))
             .unwrap_or(session.gnb_addr());
         let qfi = session.qfi;
         // Buffered packets are flushed against the SESSION's QFI rather than a
@@ -3582,7 +3922,15 @@ impl DataPlane {
         for pkt in pkts {
             let len = pkt.len() as u64;
             let gtpu_pkt = encapsulate_dl_gpdu_marked(&pkt, teid, qfi, rqi, ppi);
-            match gtpu.send_to(&gtpu_pkt, addr).await {
+            let Some(sock) = (if addr.is_ipv6() {
+                self.gtpu_socket6.as_ref()
+            } else {
+                Some(&gtpu)
+            }) else {
+                self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            match sock.send_to(&gtpu_pkt, addr).await {
                 Ok(_) => {
                     sent += 1;
                     session.dl_packets.fetch_add(1, Ordering::Relaxed);
@@ -3604,7 +3952,7 @@ impl DataPlane {
     /// change (TS 23.502 handover, TS 29.281 7.3.2). Triggered by the SNDEM
     /// flag in the PFCP Session Modification Request.
     pub async fn send_end_marker(&self, old_teid: u32, old_addr: SocketAddr) {
-        if let Some(gtpu) = &self.gtpu_socket {
+        if let Some(gtpu) = self.socket_for(&old_addr) {
             let pkt = build_gtpu_end_marker(old_teid);
             match gtpu.send_to(&pkt, old_addr).await {
                 Ok(_) => log::info!("Sent GTP-U End Marker TEID=0x{old_teid:x} to {old_addr}"),
@@ -3672,10 +4020,7 @@ impl DataPlane {
                 apply_action: FAR_ACTION_FORW,
                 destination_interface: SRC_INTF_ACCESS,
                 ohc_teid: Some(dl_teid),
-                ohc_addr: match gnb_addr.ip() {
-                    IpAddr::V4(ip) => Some(ip),
-                    _ => None,
-                },
+                ohc_addr: Some(gnb_addr.ip()),
                 bar_id: None,
             },
         );
@@ -3735,14 +4080,10 @@ impl DataPlane {
                         if let Some(teid) = dl_teid {
                             far.ohc_teid = Some(teid);
                         }
-                        match gnb_addr.map(|a| a.ip()) {
-                            Some(IpAddr::V4(ip)) => far.ohc_addr = Some(ip),
-                            // #883: the FAR endpoint is IPv4-only. Keeping the stale IPv4
-                            // address would forward to the gNB the session just LEFT;
-                            // cleared, the downlink falls back to the session tunnel,
-                            // which carries the IPv6 address.
-                            Some(IpAddr::V6(_)) => far.ohc_addr = None,
-                            None => {}
+                        // #918: IPv4 or IPv6 -- the FAR endpoint carries either now
+                        // (#883 had to clear it for an IPv6 gNB).
+                        if let Some(addr) = gnb_addr {
+                            far.ohc_addr = Some(addr.ip());
                         }
                     }
                 }
@@ -3887,7 +4228,7 @@ impl DataPlane {
             .collect();
         urrs.into_iter()
             .filter_map(|(urr_id, urr)| {
-                let trigger = urr.report_due()?;
+                let trigger = urr.claim_report()?;
                 // A report triggered by EITHER threshold re-applies the thresholds.
                 let usage = if matches!(
                     trigger,
@@ -3958,6 +4299,39 @@ impl DataPlane {
         }
     }
 
+    /// Newly FAILED N3 paths: log them with the sessions they carry, and report them
+    /// to the CP function in one Node Report (#935, TS 29.244 §7.4.5.1).
+    fn on_paths_failed(&self, failed: &[SocketAddr], miss_threshold: u32) {
+        for peer in failed {
+            log::warn!(
+                "GTP-U path to {peer} declared failed after {miss_threshold} missed responses"
+            );
+            let affected: Vec<u64> = {
+                let map = self.sessions.seid_map.read().unwrap();
+                map.values()
+                    .filter(|s| &s.gnb_addr() == peer)
+                    .map(|s| s.upf_seid)
+                    .collect()
+            };
+            if !affected.is_empty() {
+                log::warn!(
+                    "  {} session(s) affected (SEIDs: {:x?}); the SMF is told by a \
+                     Node Report (User Plane Path Failure Report)",
+                    affected.len(),
+                    affected
+                );
+            }
+        }
+        // #935 (TS 29.244 §7.4.5.1): tell the CP function, in ONE Node Report for
+        // every path that failed in this round.
+        if !failed.is_empty() {
+            self.send_report_event(UpfReportEvent::PathReport {
+                failure: true,
+                peers: failed.iter().map(|p| p.ip()).collect(),
+            });
+        }
+    }
+
     /// GTP-U N3 path management periodic task (upfd-04).
     ///
     /// Sends Echo Requests to all active gNB addresses at `echo_interval_secs`
@@ -3998,6 +4372,7 @@ impl DataPlane {
                 let map = self.sessions.seid_map.read().unwrap();
                 map.values().map(|s| s.gnb_addr()).collect()
             };
+            let active_peers = self.probeable_paths(active_peers);
 
             // #887 review: the table tracks exactly the paths in use; a peer whose last
             // session went is dropped, not probed forever.
@@ -4010,30 +4385,14 @@ impl DataPlane {
             let (to_send, failed) = self.path_table.write().unwrap().tick();
 
             // Handle newly-failed paths
-            for peer in &failed {
-                log::warn!(
-                    "GTP-U path to {peer} declared failed after {miss_threshold} missed responses"
-                );
-                let affected: Vec<u64> = {
-                    let map = self.sessions.seid_map.read().unwrap();
-                    map.values()
-                        .filter(|s| &s.gnb_addr() == peer)
-                        .map(|s| s.upf_seid)
-                        .collect()
-                };
-                if !affected.is_empty() {
-                    log::warn!(
-                        "  {} session(s) affected (SEIDs: {:x?}) — flagged; \
-                         SMF teardown deferred pending E2E validation",
-                        affected.len(),
-                        affected
-                    );
-                }
-            }
+            self.on_paths_failed(&failed, miss_threshold);
 
             // Send Echo Requests
-            if let Some(sock) = &self.gtpu_socket {
+            {
                 for (peer, seq) in to_send {
+                    let Some(sock) = self.socket_for(&peer) else {
+                        continue;
+                    };
                     let req = build_gtpu_echo_request(seq);
                     if let Err(e) = sock.send_to(&req, peer).await {
                         log::debug!("GTP-U Echo Request to {peer} failed: {e}");
@@ -4826,7 +5185,7 @@ mod tests {
                 apply_action: FAR_ACTION_FORW,
                 destination_interface: SRC_INTF_ACCESS,
                 ohc_teid: Some(0x1234),
-                ohc_addr: Some(Ipv4Addr::new(192, 168, 1, 1)),
+                ohc_addr: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))),
                 bar_id: None,
             },
         );
@@ -4835,7 +5194,7 @@ mod tests {
             session.apply_far(1),
             FarDecision::Forward {
                 ohc_teid: Some(0x1234),
-                ohc_addr: Some(Ipv4Addr::new(192, 168, 1, 1)),
+                ohc_addr: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))),
             }
         );
     }
@@ -4901,7 +5260,7 @@ mod tests {
                 apply_action: FAR_ACTION_FORW,
                 destination_interface: SRC_INTF_ACCESS,
                 ohc_teid: Some(dl_teid),
-                ohc_addr: Some(gnb),
+                ohc_addr: Some(IpAddr::V4(gnb)),
                 bar_id: None,
             },
         );
@@ -4921,7 +5280,7 @@ mod tests {
         let (teid, addr) = match session.apply_far(far_id.unwrap()) {
             FarDecision::Forward { ohc_teid, ohc_addr } => (
                 ohc_teid.unwrap_or(session.dl_teid()),
-                ohc_addr.unwrap_or(gnb),
+                ohc_addr.unwrap_or(IpAddr::V4(gnb)),
             ),
             other => panic!("expected Forward, got {other:?}"),
         };
@@ -5442,7 +5801,7 @@ mod tests {
                 apply_action: FAR_ACTION_FORW,
                 destination_interface: SRC_INTF_ACCESS,
                 ohc_teid: Some(0xF0D),
-                ohc_addr: Some(Ipv4Addr::new(127, 58, 3, 1)),
+                ohc_addr: Some(IpAddr::V4(Ipv4Addr::new(127, 58, 3, 1))),
                 bar_id: None,
             },
         );
@@ -5942,9 +6301,8 @@ mod tests {
         urr.set_quotas(None, None, None, Some(1));
         // Not yet: no time has passed.
         assert_eq!(urr.record(10, true), UrrOutcome::Continue);
-        // Backdate the first packet since the quota was granted past the quota.
-        *urr.quota_first_pkt_time.write().unwrap() =
-            Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
+        // 5 s of measured time pass (instead of sleeping through them).
+        urr.advance_measured(std::time::Duration::from_secs(5));
         assert_eq!(urr.record(10, true), UrrOutcome::QuotaJustExhausted);
         assert_eq!(
             urr.report_reason(),
@@ -6020,8 +6378,7 @@ mod tests {
                     // Read BEFORE the harvest so the final pass runs after the
                     // recorder finished and every pass is a real race until then.
                     let last = done.load(Ordering::SeqCst);
-                    *urr.last_report_time.write().unwrap() =
-                        Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
+                    urr.backdate_period(std::time::Duration::from_secs(5));
                     reports.extend(dp.collect_urr_reports());
                     if last {
                         break reports;
@@ -6139,8 +6496,7 @@ mod tests {
                 loop {
                     let last = done.load(Ordering::SeqCst);
                     if pass.is_multiple_of(2) {
-                        *urr.last_report_time.write().unwrap() =
-                            Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
+                        urr.backdate_period(std::time::Duration::from_secs(5));
                         reports.extend(dp.collect_urr_reports());
                     } else {
                         reports.extend(dp.take_urr_reports(0x821, None));
@@ -6198,14 +6554,14 @@ mod tests {
 
         assert_eq!(quota.record(900, true), UrrOutcome::Continue);
         assert_eq!(threshold.record(900, true), UrrOutcome::Continue);
-        let first_pkt = *quota.quota_first_pkt_time.read().unwrap();
+        let quota_anchor = quota.meter.lock().unwrap().quota_anchor;
         // The query: both URRs report and reset their measurement.
         let queried = dp.take_urr_reports(0x842, None);
         assert_eq!(queried.iter().map(|r| r.total_bytes).sum::<u64>(), 1800);
         assert_eq!(
-            *quota.quota_first_pkt_time.read().unwrap(),
-            first_pkt,
-            "the time quota keeps measuring from the first packet since the grant"
+            quota.meter.lock().unwrap().quota_anchor,
+            quota_anchor,
+            "the time quota keeps measuring from its grant, not from the query"
         );
 
         assert_eq!(
@@ -6254,11 +6610,11 @@ mod tests {
     fn a_query_does_not_postpone_the_time_threshold() {
         let urr = DataPlaneUrr::new(1);
         urr.set_reporting(None, None, None, Some(2), None);
-        // Move the time-threshold clock 1.5 s back instead of sleeping.
-        *urr.thr_time_start.lock().unwrap() -= std::time::Duration::from_millis(1500);
+        // 1.5 s of measured time instead of sleeping.
         assert_eq!(urr.record(10, true), UrrOutcome::Continue);
+        urr.advance_measured(std::time::Duration::from_millis(1500));
         let _ = urr.take_usage(); // the query (a non-threshold report)
-        *urr.thr_time_start.lock().unwrap() -= std::time::Duration::from_millis(800);
+        urr.advance_measured(std::time::Duration::from_millis(800));
         assert_eq!(
             urr.record(10, true),
             UrrOutcome::ThresholdExceeded,
@@ -6294,18 +6650,10 @@ mod tests {
         t.set_quotas(None, None, None, Some(2));
         assert_eq!(t.record(10, true), UrrOutcome::Continue);
         // 1 s of the 2 s used, then a report.
-        *t.quota_first_pkt_time.write().unwrap() =
-            Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        t.advance_measured(std::time::Duration::from_secs(1));
         let _ = t.take_usage();
         t.update_quotas(Some(1_000_000), None, None, None);
-        // Value first, in its own statement: a read guard alive across the write
-        // would self-deadlock (the #724 class).
-        let earlier = t
-            .quota_first_pkt_time
-            .read()
-            .unwrap()
-            .map(|f| f - std::time::Duration::from_millis(1100));
-        *t.quota_first_pkt_time.write().unwrap() = earlier;
+        t.advance_measured(std::time::Duration::from_millis(1100));
         assert_eq!(
             t.record(10, true),
             UrrOutcome::QuotaJustExhausted,
@@ -6320,7 +6668,7 @@ mod tests {
     fn a_crossed_time_threshold_reports_as_timth() {
         let urr = DataPlaneUrr::new(1);
         urr.set_reporting(Some(1_000_000), None, None, Some(2), None);
-        *urr.thr_time_start.lock().unwrap() -= std::time::Duration::from_secs(3);
+        urr.advance_measured(std::time::Duration::from_secs(3));
         assert_eq!(urr.record(10, true), UrrOutcome::ThresholdExceeded);
         assert_eq!(urr.report_due(), Some(UrrReportReason::TimeThreshold));
         let _ = urr.take_usage_for_threshold();
@@ -6344,6 +6692,110 @@ mod tests {
         assert_eq!(urr.volume_quota_ul(), None);
         assert_eq!(urr.time_threshold_secs(), Some(60), "absent IE unchanged");
         assert_eq!(urr.measurement_period_secs(), Some(30));
+    }
+
+    fn dp_with_urr(seid: u64, urr: &Arc<DataPlaneUrr>) -> DataPlane {
+        let dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        dp.add_session_from_pfcp(
+            seid,
+            seid + 0x1000,
+            Ipv4Addr::new(10, 45, 8, (seid & 0xff) as u8),
+            (seid as u32) << 4,
+            ((seid as u32) << 4) + 1,
+            "127.0.0.1:2152".parse().unwrap(),
+            Some(5),
+            Some(9),
+        );
+        dp.sessions
+            .find_by_seid(seid)
+            .unwrap()
+            .urrs
+            .write()
+            .unwrap()
+            .insert(urr.urr_id, Arc::clone(urr));
+        dp
+    }
+
+    /// #820: an IDLE UE's time threshold and time quota are evaluated on the harvest
+    /// tick. Measured time runs between packets (continuously, without an Inactivity
+    /// Detection Time), so a UE that sends nothing still reaches them; before, both were
+    /// checked only when a packet arrived, so TIMTH never fired for an idle UE and its
+    /// time quota was enforced only by its next packet.
+    #[test]
+    fn time_limits_are_reached_by_an_idle_ue_on_the_harvest_tick() {
+        let thr = Arc::new(DataPlaneUrr::new(1));
+        thr.set_reporting(None, None, None, Some(2), None);
+        let dp = dp_with_urr(0x820, &thr);
+        assert_eq!(thr.record(10, true), UrrOutcome::Continue);
+        thr.advance_measured(std::time::Duration::from_secs(3)); // no packet since
+        assert_eq!(dp.due_urr_sessions().len(), 1, "due without a packet");
+        let reports = dp.collect_urr_reports();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].trigger, UrrReportReason::TimeThreshold);
+
+        let quota = Arc::new(DataPlaneUrr::new(2));
+        quota.set_quotas(None, None, None, Some(2));
+        let dp = dp_with_urr(0x821, &quota);
+        assert_eq!(quota.record(10, true), UrrOutcome::Continue);
+        quota.advance_measured(std::time::Duration::from_secs(3));
+        let reports = dp.collect_urr_reports();
+        assert_eq!(reports.len(), 1, "the exhaustion is reported on the tick");
+        assert_eq!(reports[0].trigger, UrrReportReason::TimeQuota);
+        assert!(quota.is_quota_exhausted(), "and gates the next packet");
+        assert_eq!(quota.record(10, true), UrrOutcome::QuotaAlreadyExhausted);
+    }
+
+    /// #820 (TS 29.244 §5.2.2.2): with an Inactivity Detection Time, measured time stops
+    /// once no packet has arrived for that long (the IDT itself counts) and resumes with
+    /// the next packet. 10 s of silence under a 2 s IDT is 2 s of measured time.
+    #[test]
+    fn an_inactivity_detection_time_suspends_time_measurement() {
+        let urr = DataPlaneUrr::new(1);
+        urr.set_time_metering(Some(2), false);
+        urr.set_quotas(None, None, None, Some(5));
+        assert_eq!(urr.record(10, true), UrrOutcome::Continue);
+        {
+            let mut m = urr.meter.lock().unwrap();
+            let ten_ago = std::time::Instant::now() - std::time::Duration::from_secs(10);
+            m.running_since = Some(ten_ago);
+            m.last_pkt = Some(ten_ago);
+        }
+        let measured = urr
+            .meter
+            .lock()
+            .unwrap()
+            .measured(std::time::Instant::now());
+        assert!(
+            measured >= std::time::Duration::from_secs(2)
+                && measured < std::time::Duration::from_millis(2100),
+            "metering suspended after the IDT: {measured:?}"
+        );
+        assert_eq!(
+            urr.record(10, true),
+            UrrOutcome::Continue,
+            "2 s measured, under the 5 s time quota (10 s of wall time would have exhausted it)"
+        );
+    }
+
+    /// #820 (§5.2.2.2): time metering starts at the FIRST PACKET -- unless the CP
+    /// function set ISTM (Immediate Start Time Metering), which starts it at once.
+    #[test]
+    fn time_metering_starts_at_the_first_packet_or_immediately_with_istm() {
+        let lazy = DataPlaneUrr::new(1);
+        lazy.set_time_metering(None, false);
+        assert!(
+            lazy.meter.lock().unwrap().running_since.is_none(),
+            "not before a packet"
+        );
+        lazy.record(10, true);
+        assert!(lazy.meter.lock().unwrap().running_since.is_some());
+
+        let eager = DataPlaneUrr::new(2);
+        eager.set_time_metering(None, true);
+        assert!(
+            eager.meter.lock().unwrap().running_since.is_some(),
+            "ISTM starts metering without a packet"
+        );
     }
 
     /// #842 review (decision): a packet dropped because the quota is ALREADY exhausted
@@ -6435,9 +6887,96 @@ mod tests {
         assert!(next[0].ur_seqn > lost[0].ur_seqn);
     }
 
-    /// #883: a DL-tunnel modification to an IPv6 gNB clears the DL FAR's IPv4 endpoint,
-    /// so the downlink follows the session tunnel to the NEW gNB instead of forwarding
-    /// to the IPv4 gNB the session just left; an IPv4 move still updates the FAR.
+    /// #918: downlink to an IPv6 gNB goes out on the IPv6 GTP-U socket and reaches the
+    /// gNB; without one it is dropped and counted (it used to be sent nowhere: the FAR
+    /// could not hold the address and the only socket was IPv4).
+    /// A socket on `[::1]`. A host with no IPv6 loopback FAILS the calling test rather
+    /// than passing it vacuously (#960 review); `NEXTGCORE_NO_IPV6=1` opts out
+    /// explicitly, and then the test is skipped with a note.
+    async fn ipv6_loopback_socket() -> Option<TokioUdpSocket> {
+        match TokioUdpSocket::bind("[::1]:0").await {
+            Ok(s) => Some(s),
+            Err(e) if std::env::var_os("NEXTGCORE_NO_IPV6").is_some() => {
+                eprintln!("no IPv6 loopback ({e}); skipped because NEXTGCORE_NO_IPV6 is set");
+                None
+            }
+            Err(e) => panic!(
+                "cannot bind [::1]: {e}. This test needs IPv6 loopback; set NEXTGCORE_NO_IPV6=1 \
+                 to skip it explicitly"
+            ),
+        }
+    }
+
+    /// #960 review: with no IPv6 GTP-U socket an IPv6 gNB's path cannot be probed, so
+    /// it is not tracked -- it would otherwise collect a miss every round and be
+    /// reported failed without ever having been probed. IPv4 paths are untouched, and
+    /// with an IPv6 socket the IPv6 path is tracked.
+    #[tokio::test]
+    async fn an_ipv6_path_is_probed_only_when_there_is_an_ipv6_socket() {
+        let v4: SocketAddr = "192.0.2.1:2152".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::1]:2152".parse().unwrap();
+        let in_use: HashSet<SocketAddr> = [v4, v6].into_iter().collect();
+        let mut dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        assert_eq!(
+            dp.probeable_paths(in_use.clone()),
+            [v4].into_iter().collect::<HashSet<_>>()
+        );
+        let Some(sock6) = ipv6_loopback_socket().await else {
+            return;
+        };
+        dp.gtpu_socket6 = Some(Arc::new(sock6));
+        assert_eq!(dp.probeable_paths(in_use.clone()), in_use);
+    }
+
+    #[tokio::test]
+    async fn downlink_to_an_ipv6_gnb_is_sent_on_the_ipv6_socket() {
+        let Some(gnb) = ipv6_loopback_socket().await else {
+            return;
+        };
+        let gnb_addr = gnb.local_addr().unwrap();
+        let ue_ip = Ipv4Addr::new(10, 45, 9, 18);
+        let v4 = Arc::new(TokioUdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mut dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        dp.gtpu_socket = Some(Arc::clone(&v4));
+        dp.add_session_from_pfcp(
+            0x918,
+            0x1918,
+            ue_ip,
+            0x9181,
+            0x9182,
+            gnb_addr,
+            Some(5),
+            Some(9),
+        );
+        let session = dp.sessions.find_by_seid(0x918).unwrap();
+        for far in session.fars.write().unwrap().values_mut() {
+            // Use the session tunnel's exact (ephemeral) port.
+            far.ohc_addr = None;
+        }
+        let mut pkt = make_ipv4_udp_packet([8, 8, 8, 8], ue_ip.octets(), 53, 1234);
+        finalize_ipv4(&mut pkt);
+
+        // No IPv6 socket: dropped and counted.
+        dp.handle_downlink_packet(&pkt, &v4).await;
+        assert_eq!(dp.stats.dropped_packets.load(Ordering::Relaxed), 1);
+
+        dp.bind_gtpu6("[::1]:0".parse().unwrap()).await.unwrap();
+        dp.handle_downlink_packet(&pkt, &v4).await;
+        let mut buf = [0u8; 2048];
+        let (n, from) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), gnb.recv_from(&mut buf))
+                .await
+                .expect("the G-PDU reaches the IPv6 gNB")
+                .unwrap();
+        assert!(from.is_ipv6(), "sent from the IPv6 GTP-U socket");
+        let hdr = parse_gtpu_header(&buf[..n]).unwrap();
+        assert_eq!(hdr.teid, 0x9182, "on the session's DL tunnel");
+        assert_eq!(dp.stats.dl_packets.load(Ordering::Relaxed), 1);
+    }
+
+    /// #883/#918: a DL-tunnel modification to an IPv6 gNB moves the DL FAR's endpoint
+    /// to that IPv6 address (#918; #883 could only clear the IPv4-only endpoint), so the
+    /// downlink goes to the NEW gNB, never the IPv4 gNB the session just left.
     #[test]
     fn a_dl_tunnel_move_to_an_ipv6_gnb_does_not_leave_the_far_on_the_old_gnb() {
         let dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
@@ -6463,18 +7002,22 @@ mod tests {
         let far_addr = || session.fars.read().unwrap()[&dl_far_id].ohc_addr;
 
         dp.update_session_from_pfcp(0x883, Some(0x1), Some("127.0.0.9:2152".parse().unwrap()));
-        assert_eq!(far_addr(), Some(Ipv4Addr::new(127, 0, 0, 9)));
+        assert_eq!(far_addr(), Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 9))));
 
         let v6: SocketAddr = "[2001:db8::9]:2152".parse().unwrap();
         dp.update_session_from_pfcp(0x883, Some(0x2), Some(v6));
-        assert_eq!(far_addr(), None, "no stale IPv4 endpoint left on the FAR");
+        assert_eq!(
+            far_addr(),
+            Some(v6.ip()),
+            "the FAR now points at the IPv6 gNB"
+        );
         assert_eq!(session.dl_tunnel(), (0x2, v6));
         match session.apply_far(dl_far_id) {
             FarDecision::Forward { ohc_teid, ohc_addr } => {
                 assert_eq!(ohc_teid, Some(0x2));
                 assert_eq!(
                     ohc_addr
-                        .map(|ip| SocketAddr::new(IpAddr::V4(ip), GTPU_PORT))
+                        .map(|ip| SocketAddr::new(ip, GTPU_PORT))
                         .unwrap_or(session.gnb_addr()),
                     v6,
                     "the downlink resolves to the new IPv6 gNB"
@@ -6537,6 +7080,83 @@ mod tests {
         );
     }
 
+    /// #772: the periodic schedule is anchored at the period boundaries. A late claim
+    /// advances it by WHOLE periods -- to exactly `start + k * period` -- so lateness
+    /// never accumulates, a claim cannot fire twice for one period, and the next report
+    /// is due at the next boundary. The old check compared against the instant of the
+    /// last reset, so each report slid one 10 s harvest tick later than the previous.
+    #[test]
+    fn the_periodic_schedule_advances_by_whole_periods_without_drift() {
+        let urr = DataPlaneUrr::new(1);
+        urr.set_reporting(None, None, None, None, Some(10));
+        let period = std::time::Duration::from_secs(10);
+        // 2.5 periods ago: the harvest is late by half a period.
+        urr.backdate_period(period * 5 / 2);
+        let start = *urr.period_start.lock().unwrap();
+
+        assert!(urr.claim_period(), "two periods have ended");
+        assert_eq!(
+            *urr.period_start.lock().unwrap(),
+            start + period * 2,
+            "realigned to the boundary, not to the claim instant"
+        );
+        assert!(!urr.claim_period(), "one claim per period");
+        assert!(!urr.period_due(), "the next boundary is half a period away");
+        urr.backdate_period(period / 2);
+        assert!(
+            urr.period_due(),
+            "and is due exactly one period after the last boundary"
+        );
+    }
+
+    /// #772: a Measurement Period with NO traffic still produces its periodic report
+    /// (TS 29.244 §5.2.2.2.1: the Measurement Period is "the period to generate
+    /// periodic usage reports"), with zero volume, and restarts the period. Before, an
+    /// empty period was skipped and the schedule left unrestarted.
+    #[test]
+    fn an_empty_measurement_period_is_still_reported() {
+        let dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        dp.add_session_from_pfcp(
+            0x772,
+            0x1772,
+            Ipv4Addr::new(10, 45, 7, 72),
+            0x7721,
+            0x7722,
+            "127.0.0.1:2152".parse().unwrap(),
+            Some(5),
+            Some(9),
+        );
+        let session = dp.sessions.find_by_seid(0x772).expect("session");
+        let urr = Arc::new(DataPlaneUrr::new(1));
+        urr.set_reporting(None, None, None, None, Some(30));
+        session.urrs.write().unwrap().insert(1, Arc::clone(&urr));
+
+        assert!(
+            dp.collect_urr_reports().is_empty(),
+            "the period has not ended yet"
+        );
+        urr.backdate_period(std::time::Duration::from_secs(31));
+        assert_eq!(dp.due_urr_sessions(), vec![(0x772, 0x1772)]);
+        let reports = dp.collect_urr_reports();
+        assert_eq!(reports.len(), 1, "an idle period is still reported");
+        assert_eq!(reports[0].trigger, UrrReportReason::Periodic);
+        assert_eq!((reports[0].total_bytes, reports[0].total_pkts), (0, 0));
+        assert!(!urr.period_due(), "and the next period has started");
+    }
+
+    /// #772: an Update URR with a NEW Measurement Period starts the schedule afresh;
+    /// re-provisioning the SAME period leaves the running schedule alone.
+    #[test]
+    fn only_a_changed_measurement_period_restarts_the_schedule() {
+        let urr = DataPlaneUrr::new(1);
+        urr.set_reporting(None, None, None, None, Some(10));
+        urr.backdate_period(std::time::Duration::from_secs(11));
+        urr.set_reporting(None, None, None, None, Some(10));
+        assert!(urr.period_due(), "same period: the schedule kept running");
+        urr.set_reporting(None, None, None, None, Some(20));
+        assert!(!urr.period_due(), "new period: the schedule restarted");
+    }
+
     /// Run `f` on a thread of its own and hand back a receiver for its result, so a
     /// test can wait on it with `recv_timeout` -- the only way to observe a deadlock
     /// as a failure instead of a hung test binary. A thread that does hang is leaked,
@@ -6592,9 +7212,8 @@ mod tests {
         session.urrs.write().unwrap().insert(1, Arc::clone(&urr));
         assert_eq!(urr.record(600, true), UrrOutcome::Continue);
         assert_eq!(urr.record(400, false), UrrOutcome::Continue);
-        // Back-date the last report past the period instead of sleeping through it.
-        let backdated = std::time::Instant::now() - std::time::Duration::from_secs(5);
-        *urr.last_report_time.write().unwrap() = Some(backdated);
+        // Move the period schedule back past a boundary instead of sleeping to it.
+        urr.backdate_period(std::time::Duration::from_secs(5));
 
         let deadline = std::time::Duration::from_secs(5);
         let dp_h = Arc::clone(&dp);
@@ -6638,8 +7257,8 @@ mod tests {
         // The report restarted the measurement: counters zeroed, period re-armed.
         assert_eq!(urr.acc_total_bytes.load(Ordering::Relaxed), 0);
         assert!(
-            urr.last_report_time().expect("set by the reset") > backdated,
-            "the reset must restart the measurement period"
+            !urr.period_due(),
+            "the report must advance the period schedule to the next boundary"
         );
         // So the very next harvest has nothing to say -- and also returns.
         let dp_h = Arc::clone(&dp);
@@ -7149,7 +7768,10 @@ mod tests {
         assert!(failed.is_empty());
         let seq = to_send[0].1;
 
-        assert_eq!(pt.on_echo_response(peer, Some(seq)), EchoResponse::Answered);
+        assert_eq!(
+            pt.on_echo_response(peer, Some(seq)),
+            EchoResponse::Answered { recovered: false }
+        );
 
         // After response the peer must not be failed.
         let state = pt.peers.get(&peer).unwrap();
@@ -7194,9 +7816,15 @@ mod tests {
         // Answers carrying any Recovery value keep the path alive: the value is not
         // even read (#873, §8.2), only the sequence number matters (#887).
         let seq = pt.tick().0[0].1;
-        assert_eq!(pt.on_echo_response(peer, Some(seq)), EchoResponse::Answered);
+        assert_eq!(
+            pt.on_echo_response(peer, Some(seq)),
+            EchoResponse::Answered { recovered: false }
+        );
         let seq = pt.tick().0[0].1;
-        assert_eq!(pt.on_echo_response(peer, Some(seq)), EchoResponse::Answered);
+        assert_eq!(
+            pt.on_echo_response(peer, Some(seq)),
+            EchoResponse::Answered { recovered: false }
+        );
         let state = pt.peers.get(&peer).unwrap();
         assert_eq!(state.miss_count, 0);
         assert!(!state.path_failed);
@@ -7241,9 +7869,52 @@ mod tests {
         assert_eq!(pt.peers[&peer].miss_count, 1, "the miss stands");
         assert_eq!(
             pt.on_echo_response(peer, outstanding),
-            EchoResponse::Answered
+            EchoResponse::Answered { recovered: false }
         );
         assert_eq!(pt.peers[&peer].miss_count, 0);
+    }
+
+    /// #935 (TS 29.244 §7.4.5.1): a path FAILURE and a path RECOVERY each raise a
+    /// path report toward the PFCP layer (which sends the Node Report). Before, both
+    /// were only logged and the SMF never learnt that a gNB path was down or back.
+    #[tokio::test]
+    async fn path_failure_and_recovery_raise_node_reports() {
+        let dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        let (tx, mut rx) = mpsc::channel(8);
+        dp.set_report_channel(tx);
+        let gnb: SocketAddr = "127.0.0.1:2152".parse().unwrap();
+
+        dp.on_paths_failed(&[gnb], 3);
+        match rx.try_recv() {
+            Ok(UpfReportEvent::PathReport {
+                failure: true,
+                peers,
+            }) => {
+                assert_eq!(peers, vec![gnb.ip()])
+            }
+            other => panic!("expected a failure path report, got {other:?}"),
+        }
+
+        // The failed peer answers an outstanding probe: a recovery report.
+        let seq = {
+            let mut pt = dp.path_table.write().unwrap();
+            pt.sync_peers(&HashSet::from([gnb]));
+            pt.miss_threshold = 1;
+            pt.tick();
+            let _ = pt.tick(); // failed
+            pt.tick().0[0].1 // still probed
+        };
+        dp.handle_uplink_packet(&build_gtpu_echo_response(Some(seq)), gnb, -1)
+            .await;
+        match rx.try_recv() {
+            Ok(UpfReportEvent::PathReport {
+                failure: false,
+                peers,
+            }) => {
+                assert_eq!(peers, vec![gnb.ip()])
+            }
+            other => panic!("expected a recovery path report, got {other:?}"),
+        }
     }
 
     /// #887 review: only paths IN USE are tracked and probed (TS 29.281 §7.2.1). A
@@ -7288,7 +7959,8 @@ mod tests {
         assert!(refailed.is_empty(), "declared failed only once");
         assert_eq!(
             pt.on_echo_response(peer, Some(again[0].1)),
-            EchoResponse::Answered
+            EchoResponse::Answered { recovered: true },
+            "#935: the answer reports the recovery"
         );
         assert!(!pt.peers[&peer].path_failed, "the answer recovers the path");
     }

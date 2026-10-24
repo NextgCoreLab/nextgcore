@@ -635,8 +635,17 @@ impl PfcpMessageBuilder {
     }
 
     /// Add Apply Action IE
+    /// Add Apply Action IE (TS 29.244 §8.2.26). `action` is a set of [`apply_action`]
+    /// flags, octet 5 in the low byte and octet 6 in the high byte, the numbering of
+    /// the library's `ApplyAction`; its codec writes octet 5 first.
+    ///
+    /// #1008: this wrote the `u16` big-endian, so octet 5 went out second: FORW
+    /// arrived as BDPN and BUFF|NOCP as DDPN|FSSM, and a conformant UPF saw no
+    /// forwarding action at all. upfd decoded the same swapped way, so the pair
+    /// worked and nothing noticed.
     pub fn add_apply_action(&mut self, action: u16) -> &mut Self {
-        self.add_u16(pfcp_ie::APPLY_ACTION, action)
+        nextgcore_pfcp::types::ApplyAction::decode(action).encode_ie(&mut self.buffer);
+        self
     }
 
     /// Add PDN Type IE
@@ -2589,6 +2598,59 @@ mod tests {
         assert_eq!(apply_action::FORW, 2);
         assert_eq!(apply_action::BUFF, 4);
         assert_eq!(apply_action::NOCP, 8);
+    }
+
+    /// #1008, TS 29.244 §8.2.26 (Figure 8.2.26-1): octet 5 carries DROP (bit 1), FORW
+    /// (bit 2), BUFF (bit 3) and NOCP (bit 4); octet 6 carries EDRT (bit 1), BDPN
+    /// (bit 2) and DDPN (bit 3). Golden bytes, then the library's decoder over the
+    /// FARs this SMF actually builds.
+    #[test]
+    fn apply_action_goes_out_octet_5_first() {
+        let ie = |action: u16| {
+            let mut b = PfcpMessageBuilder::new();
+            b.add_apply_action(action);
+            b.build()
+        };
+        assert_eq!(
+            ie(apply_action::FORW),
+            vec![0x00, 0x2c, 0x00, 0x02, 0x02, 0x00]
+        );
+        assert_eq!(
+            ie(apply_action::BUFF | apply_action::NOCP),
+            vec![0x00, 0x2c, 0x00, 0x02, 0x0c, 0x00]
+        );
+        assert_eq!(
+            ie(apply_action::DROP),
+            vec![0x00, 0x2c, 0x00, 0x02, 0x01, 0x00]
+        );
+        assert_eq!(
+            ie(apply_action::DDPN),
+            vec![0x00, 0x2c, 0x00, 0x02, 0x00, 0x04],
+            "an octet-6 flag in octet 6"
+        );
+
+        let decoded = |far: &[u8]| {
+            let ie = crate::pfcp_path::find_ie(far, pfcp_ie::APPLY_ACTION).expect("Apply Action");
+            nextgcore_pfcp::types::ApplyAction::decode_ie(ie)
+        };
+        let forward = build_create_far(&FarParams {
+            far_id: 1,
+            apply_action: apply_action::FORW,
+            destination_interface: Some(0),
+            outer_header_creation: Some((0x0100, 0x1234, Some([10, 0, 0, 1]), None)),
+            network_instance: None,
+        });
+        let aa = decoded(&forward);
+        assert!(aa.forw && !aa.bdpn && !aa.edrt, "{aa:?}");
+        let buffer = build_create_far(&FarParams {
+            far_id: 2,
+            apply_action: apply_action::BUFF | apply_action::NOCP,
+            ..Default::default()
+        });
+        let aa = decoded(&buffer);
+        assert!(aa.buff && aa.nocp && !aa.ddpn && !aa.forw, "{aa:?}");
+        let aa = decoded(&build_update_far_deactivate(2));
+        assert!(aa.buff && aa.nocp && !aa.forw, "{aa:?}");
     }
 
     #[test]

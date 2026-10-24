@@ -45,7 +45,10 @@ const NOTIFY_REQUEST_TIMEOUT_SECS: u64 = 3;
 pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.clone();
     let uri = request.header.uri.clone();
-    log::debug!("AMF SBI request: {method} {uri}");
+    log::debug!(
+        "AMF SBI request: {method} {}",
+        nextgcore_sbi::log_redact::redact_callback_tokens(&uri)
+    );
 
     let path = uri.split('?').next().unwrap_or(&uri);
     let parts: Vec<&str> = path
@@ -250,6 +253,15 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
         //   POST /namf-callback/v1/ucmf-notify
         "namf-callback" if parts.len() == 3 && parts[2] == "ucmf-notify" && method == "POST" => {
             handle_ucmf_notify_callback(&request)
+        }
+        // Namf_Callback: Nnrf_NFManagement NFStatusNotify (#668, TS 29.510
+        // §5.2.2.6), POSTed to the nfStatusNotificationUri of the AMF's
+        // NF status subscriptions (`nrf_subscription`).
+        //   POST /namf-callback/v1/nf-status-notify/{token}
+        "namf-callback"
+            if parts.len() == 4 && parts[2] == "nf-status-notify" && method == "POST" =>
+        {
+            handle_nf_status_notify_callback(parts[3], &request).await
         }
         //   POST /namf-callback/v1/{supi}/dereg-notify/{token}   (#753)
         //   POST /namf-callback/v1/{supi}/dereg-notify           (registrations
@@ -474,6 +486,37 @@ fn handle_ucmf_notify_callback(request: &SbiRequest) -> SbiResponse {
         retired.len()
     );
     SbiResponse::no_content()
+}
+
+/// NFStatusNotify callback (#668, TS 29.510 §5.2.2.6).
+///
+/// `token` names the subscription the notification belongs to; one the AMF
+/// does not hold gets 404 and changes nothing (#940 review M2). Otherwise the
+/// named NF instance is dropped from the discovery cache, or re-discovered when
+/// it is the last of its type, when it deregistered or an attribute the cache
+/// uses changed, at most once per instance per `EVICT_HOLD`. The body's
+/// `nfProfile` is never read: the next request re-discovers (see
+/// `nrf_subscription`). 204 on success, 400 for a body without `event` or
+/// `nfInstanceUri`.
+async fn handle_nf_status_notify_callback(token: &str, request: &SbiRequest) -> SbiResponse {
+    use crate::nrf_subscription::{
+        apply_notification, classify_notification, token_nf_type, NotifyError,
+    };
+    let Some(nf_type) = token_nf_type(token) else {
+        log::warn!("NF status notification on a subscription this AMF does not hold; refused");
+        return SbiResponse::with_status(404);
+    };
+    let Some(body) = parse_json_body(request) else {
+        return malformed_body();
+    };
+    match classify_notification(&body) {
+        Ok(action) => {
+            apply_notification(&nf_type, &action).await;
+            SbiResponse::no_content()
+        }
+        Err(NotifyError::Missing(attr)) => mandatory_ie_missing(attr),
+        Err(NotifyError::Incorrect(attr, detail)) => mandatory_ie_incorrect(attr, &detail),
+    }
 }
 
 /// Nudm_UECM DeregistrationNotification callback (WSB-4, TS 29.503 §5.3.2.3.2).
@@ -4610,15 +4653,38 @@ fn record_transferred_sessions(ue_id: u64, ue_context: &Value, ue_context_id: &s
         if let Some(dnn) = session.get("dnn").and_then(Value::as_str) {
             sess.dnn = Some(dnn.to_string());
         }
-        if let Some(sst) = session.pointer("/sNssai/sst").and_then(Value::as_u64) {
-            sess.s_nssai.sst = sst as u8;
-        }
-        if let Some(sd) = session
-            .pointer("/sNssai/sd")
-            .and_then(Value::as_str)
-            .and_then(|s| u32::from_str_radix(s, 16).ok())
+        match session
+            .pointer("/sNssai/sst")
+            .and_then(Value::as_u64)
+            .and_then(|v| u8::try_from(v).ok())
         {
-            sess.s_nssai.sd = Some(sd);
+            Some(sst) => {
+                sess.s_nssai.sst = sst;
+                sess.s_nssai.sd = session
+                    .pointer("/sNssai/sd")
+                    .and_then(Value::as_str)
+                    .and_then(|s| u32::from_str_radix(s, 16).ok());
+            }
+            // TS 29.518 §6.1.6.2.19: PduSessionContext.sNssai is mandatory. A peer that
+            // omits it still names a session the UE holds, so it is recorded under this
+            // AMF's default S-NSSAI rather than as SST 0, which no target admits
+            // (#743 follow-up).
+            None => {
+                let default = ctx.read().ok().and_then(|guard| {
+                    guard
+                        .plmn_support
+                        .first()
+                        .and_then(|p| p.s_nssai.first().cloned())
+                });
+                log::warn!(
+                    "UE context {ue_context_id}: PDU session {psi} has no (valid) sNssai, \
+                     which TS 29.518 makes mandatory; recorded under the default S-NSSAI \
+                     {default:?}"
+                );
+                if let Some(default) = default {
+                    sess.s_nssai = default;
+                }
+            }
         }
         if let Ok(guard) = ctx.read() {
             guard.sess_update(&sess);
@@ -9496,6 +9562,12 @@ mod tests {
                     "sNssai": { "sst": 1, "sd": "0000AB" },
                     "dnn": "internet",
                     "accessType": "3GPP_ACCESS",
+                }, {
+                    // #743 follow-up: a peer that omits the mandatory sNssai.
+                    "pduSessionId": 8,
+                    "smContextRef": "smctx-relocate-740031",
+                    "dnn": "internet",
+                    "accessType": "3GPP_ACCESS",
                 }],
             },
             "targetId": {
@@ -9515,7 +9587,24 @@ mod tests {
                 "application/vnd.3gpp.ngap",
                 bytes::Bytes::from_static(b"\x01\x02\x03"),
             ));
+        let default_slice = crate::context::SNssai {
+            sst: 2,
+            sd: Some(0x02_0202),
+        };
+        let saved_plmn_support = {
+            let ctx = amf_self();
+            let mut guard = ctx.write().expect("ctx lock");
+            std::mem::replace(
+                &mut guard.plmn_support,
+                vec![crate::context::PlmnSupport {
+                    plmn_id: PlmnId::new("001", "01"),
+                    num_of_s_nssai: 1,
+                    s_nssai: vec![default_slice.clone()],
+                }],
+            )
+        };
         let resp = namf_request_handler(req).await;
+        amf_self().write().expect("ctx lock").plmn_support = saved_plmn_support;
 
         assert_eq!(
             resp.status, 201,
@@ -9537,9 +9626,21 @@ mod tests {
         let sessions = ctx.read().expect("ctx lock").sess_list_for_ue(resolved.id);
         assert_eq!(
             sessions.len(),
-            1,
+            2,
             "the transferred sessionContextList must be RECORDED against the created \
              context -- the gap PR #390 named"
+        );
+        let mut sessions = sessions;
+        sessions.sort_by_key(|s| s.psi);
+        assert_eq!(
+            (
+                sessions[1].psi,
+                sessions[1].s_nssai.sst,
+                sessions[1].s_nssai.sd
+            ),
+            (8, default_slice.sst, default_slice.sd),
+            "#743 follow-up: a session without sNssai is recorded under the default S-NSSAI, \
+             not SST 0"
         );
         assert_eq!(sessions[0].psi, 7);
         assert_eq!(

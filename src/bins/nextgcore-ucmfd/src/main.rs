@@ -136,8 +136,8 @@ struct UcmfYaml {
 struct Args {
     #[arg(short = 'c', long, default_value = "/etc/nextgcore/ucmf.yaml")]
     config: String,
-    #[arg(short = 'e', long, default_value = "info")]
-    log_level: String,
+    #[arg(short = 'e', long)]
+    log_level: Option<String>,
     #[arg(long, default_value = "0.0.0.0")]
     sbi_addr: String,
     #[arg(long, default_value = "7777")]
@@ -301,18 +301,20 @@ fn render_metrics(ucmf: Option<&RwLock<Ucmf>>) -> String {
     out
 }
 
-/// The default `/metrics` address: loopback, on a port of its own. 9090 is the
-/// default of mmed, sgwud and upfd, and on a shared host the second NF to bind it
-/// would lose its metrics (#857 review).
-const DEFAULT_METRICS_ADDR: ([u8; 4], u16) = ([127, 0, 0, 1], 9096);
+/// The default `/metrics` port: one of its own. 9090 is the default of mmed,
+/// sgwud and upfd, and on a shared host the second NF to bind it would lose its
+/// metrics (#857 review).
+const DEFAULT_METRICS_PORT: u16 = 9096;
 
-/// Where `/metrics` listens: `UCMF_METRICS_ADDR`, else loopback. The endpoint
-/// is unauthenticated, so reaching it from another host is an operator's
-/// explicit choice of a private address (or a scraping sidecar). A value that
-/// does not parse falls back to the default and says so (#857 review), so an
-/// operator learns why a scrape from another host fails.
+/// Where `/metrics` listens: `UCMF_METRICS_ADDR` (`ip:port`), else the shared
+/// default every NF uses (#837): `127.0.0.1` unless `NEXTGCORE_METRICS_BIND`
+/// names the host, on [`DEFAULT_METRICS_PORT`]. The endpoint is
+/// unauthenticated, so reaching it from another host is an operator's explicit
+/// choice of a private address (or a scraping sidecar). A value that does not
+/// parse falls back to the default and says so (#857 review), so an operator
+/// learns why a scrape from another host fails.
 fn metrics_addr(value: Option<&str>) -> SocketAddr {
-    let default = SocketAddr::from(DEFAULT_METRICS_ADDR);
+    let default = nextgcore_metrics::nes_energy::metrics_bind_addr(DEFAULT_METRICS_PORT);
     match value {
         None => default,
         Some(v) => v.parse().unwrap_or_else(|_| {
@@ -331,7 +333,11 @@ fn api_root() -> &'static str {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    nextgcore_core::log::nf_log_builder(&args.log_level).init();
+    nextgcore_core::log::nf_log_builder(&nextgcore_core::log::nf_log_level(
+        args.log_level.as_deref(),
+        Some(&args.config),
+    ))
+    .init();
     let _otel = nextgcore_metrics::otel::init_otel(
         nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
             std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")

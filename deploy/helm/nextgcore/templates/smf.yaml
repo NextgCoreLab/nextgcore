@@ -75,6 +75,10 @@ spec:
             # The shutdown's own deadline, derived from the grace period (#941).
             - name: SMF_SHUTDOWN_BUDGET_SECS
               value: "{{ sub (int .Values.smf.terminationGracePeriodSeconds) 2 }}"
+            # /metrics defaults to 127.0.0.1 (#837); in the pod it must accept the
+            # pod IP for Prometheus and the kubelet. Not exposed beyond the cluster.
+            - name: NEXTGCORE_METRICS_BIND
+              value: "0.0.0.0"
             - name: SMF_PFCP_ADDR
               value: "0.0.0.0"
             # #797: the PFCP Node ID identifies this CP function (TS 29.244
@@ -125,6 +129,28 @@ spec:
       protocol: TCP
       name: metrics
     {{- end }}
+  selector:
+    app.kubernetes.io/name: smf
+    app.kubernetes.io/instance: {{ .Release.Name }}-smf
+---
+# #968/#983: the name the UPF's PFCP peer allowlist resolves. Headless, so it
+# resolves to the SMF pod's own IP (the source address of its PFCP), not a
+# ClusterIP; publishNotReadyAddresses so the SMF can associate before it is Ready.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-smf-pfcp
+  labels:
+    app.kubernetes.io/name: smf
+    {{- include "nextgcore.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - port: {{ .Values.smf.service.pfcpPort }}
+      targetPort: pfcp
+      protocol: UDP
+      name: pfcp
   selector:
     app.kubernetes.io/name: smf
     app.kubernetes.io/instance: {{ .Release.Name }}-smf

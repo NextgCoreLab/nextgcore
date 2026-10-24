@@ -21,6 +21,28 @@ spec:
       port: 9090
       targetPort: 9090
 ---
+# #968/#983: the name the UPF's PFCP peer allowlist resolves. Headless, so it
+# resolves to the SMF pod's own IP (its PFCP source address), not a ClusterIP;
+# publishNotReadyAddresses so the SMF can associate before it is Ready.
+apiVersion: v1
+kind: Service
+metadata:
+  name: smf-pfcp
+  namespace: nextg-system
+  labels:
+    app.kubernetes.io/name: smf
+    app.kubernetes.io/part-of: nextgcore
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: smf
+  ports:
+    - name: pfcp
+      port: 8805
+      targetPort: 8805
+      protocol: UDP
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -122,6 +144,10 @@ spec:
             # for the exit (#941). Keep the two in step.
             - name: SMF_SHUTDOWN_BUDGET_SECS
               value: "43"
+            # /metrics defaults to 127.0.0.1 (#837); in the pod it must accept the
+            # pod IP for Prometheus and the kubelet. Not exposed beyond the cluster.
+            - name: NEXTGCORE_METRICS_BIND
+              value: "0.0.0.0"
             - name: SMF_PFCP_ADDR
               value: "0.0.0.0"
             # #797: the PFCP Node ID identifies this CP function (TS 29.244

@@ -346,3 +346,72 @@ pub(crate) fn nr_ecid_lpp(
         });
     provide_location_information(transaction_number, ies)
 }
+
+/// An uplink `ProvideCapabilities` answering transaction `transaction_number`
+/// (#906, TS 37.355 §5.1.1 step 2: endTransaction TRUE) that reports E-CID only:
+/// E-UTRA `ecid-ProvideCapabilities` and/or Rel-16 `nr-ECID-ProvideCapabilities-r16`.
+/// Built from the captured E-UTRA E-CID vector `9203084858` with its transaction
+/// number and flavours replaced.
+pub(crate) fn ecid_capabilities(transaction_number: u8, eutra: bool, nr: bool) -> Vec<u8> {
+    let bytes = crate::lpp_equivalence_tests::unhex("9203084858");
+    let mut msg = nextgcore_lpp_gen::decode(&bytes).expect("captured vector decodes");
+    if let Some(t) = msg.transaction_id.as_mut() {
+        t.transaction_number = lpp::TransactionNumber(transaction_number);
+    }
+    let Some(lpp::LPP_MessageBody::C1(lpp::LPP_MessageBody_c1::ProvideCapabilities(caps))) =
+        msg.lpp_message_body.as_mut()
+    else {
+        panic!("captured vector is a ProvideCapabilities");
+    };
+    let lpp::ProvideCapabilitiesCriticalExtensions::C1(
+        lpp::ProvideCapabilitiesCriticalExtensions_c1::ProvideCapabilities_r9(ies),
+    ) = &mut caps.critical_extensions
+    else {
+        panic!("r9 IEs");
+    };
+    if !eutra {
+        ies.ecid_provide_capabilities = None;
+    }
+    if nr {
+        ies.extensions.nr_ecid_provide_capabilities_r16 =
+            Some(lpp::NR_ECID_ProvideCapabilities_r16 {
+                nr_ecid_meas_supported_r16:
+                    lpp::NR_ECID_ProvideCapabilities_r16Nr_ECID_MeasSupported_r16(
+                        [true, true].into_iter().collect(),
+                    ),
+                periodical_reporting_r16: None,
+                triggered_reporting_r16: None,
+                extensions: Default::default(),
+            });
+    }
+    nextgcore_lpp_gen::encode(&msg).expect("encode LPP fixture")
+}
+
+/// An uplink LPP `Abort` (TS 37.355 §5.4) on transaction `transaction_number`,
+/// cause targetDeviceAbort (#998).
+pub(crate) fn target_abort(transaction_number: u8) -> Vec<u8> {
+    let msg = lpp::LPP_Message {
+        transaction_id: Some(lpp::LPP_TransactionID {
+            initiator: lpp::Initiator(lpp::Initiator::LOCATION_SERVER),
+            transaction_number: lpp::TransactionNumber(transaction_number),
+        }),
+        end_transaction: lpp::LPP_MessageEndTransaction(true),
+        sequence_number: None,
+        acknowledgement: None,
+        lpp_message_body: Some(lpp::LPP_MessageBody::C1(lpp::LPP_MessageBody_c1::Abort(
+            lpp::Abort {
+                critical_extensions: lpp::AbortCriticalExtensions::C1(
+                    lpp::AbortCriticalExtensions_c1::Abort_r9(lpp::Abort_r9_IEs {
+                        common_i_es_abort: Some(lpp::CommonIEsAbort {
+                            abort_cause: lpp::CommonIEsAbortAbortCause(
+                                lpp::CommonIEsAbortAbortCause::TARGET_DEVICE_ABORT,
+                            ),
+                        }),
+                        extensions: Default::default(),
+                    }),
+                ),
+            },
+        ))),
+    };
+    nextgcore_lpp_gen::encode(&msg).expect("encode LPP fixture")
+}

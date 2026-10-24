@@ -72,7 +72,7 @@ These are the fields actually deserialized by the daemon (`#[derive(Deserialize)
 
 Unknown YAML keys are silently ignored by serde. In the shipped `udm.yaml`:
 
-- **`logger.file.path` and `logger.level` are inert.** The log level comes from the CLI flag `-e/--log-level` (default `info`); `init_logging()` never opens a log file (see the CLI table — even `-l/--log-file` is inert).
+- **`logger.level` is read; `logger.file.path` is inert.** The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691). No log file is ever opened (see the CLI table: even `-l/--log-file` is inert).
 - **`global.max.ue` and `global.max.peer` are inert.** Context capacities come from the CLI flags `--max-ue` (default `1024`) and `--max-sess` (default `4096`); the example's `ue: 1024` merely coincides with the CLI default.
 - **`udm.sbi.tls.*` (`enabled`/`cert`/`key`/`ca`/`min_version`) is entirely inert.** `SbiYaml` has no `tls` field, and even the CLI TLS flags only populate a legacy placeholder config (see behavior notes).
 
@@ -86,7 +86,7 @@ From the clap `Args` struct in `src/bins/nextgcore-udmd/src/app.rs` (the binary'
 |---|---|---|---|
 | `-c, --config` | path | `/etc/nextgcore/udm.yaml` | Configuration file path. |
 | `-l, --log-file` | path | unset | **Parsed but unused** — `init_logging()` never references it; logging goes to stderr via `env_logger`. |
-| `-e, --log-level` | string | `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else falls back to `info`). |
+| `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-m, --no-color` | flag | off | Disable color output. |
 | `-k, --kill` | flag | off | Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor. |
 | `--sbi-addr` | string | `0.0.0.0` | SBI bind address — **overridden** by `udm.sbi.server[0].address` when present in the YAML. |

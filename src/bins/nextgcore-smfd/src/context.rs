@@ -1803,8 +1803,9 @@ pub struct SmfContext {
     /// tell an AMF about a context it released long ago.
     pub unrestorable_sessions: RwLock<Vec<UnrestorableSession>>,
 
-    /// Last Recovery Time Stamp each UPF peer reported, keyed by the peer's
-    /// socket address (issue #191).
+    /// Last Recovery Time Stamp each UPF peer reported (issue #191), keyed by
+    /// `PfcpClient::recovery_time_stamp_key`: the configured `host:port` for a UPF
+    /// named by hostname (#722), the socket address for a literal one.
     ///
     /// Persisted with the session map because it is what makes restoring that map
     /// safe: on the first Association Setup after a reload, `check_peer_restart`
@@ -1846,6 +1847,9 @@ pub struct UnrestorableSession {
     pub status_uri: Option<String>,
     /// What went wrong, for the operator-facing log and the notification cause.
     pub reason: String,
+    /// The UE's IPv4 address, if it could be salvaged from the raw record: the
+    /// restored allocation that boot must free (#912 review M3).
+    pub ue_ip: Option<[u8; 4]>,
 }
 
 /// Why smfd durable state could not be loaded (issue #191).
@@ -2152,10 +2156,18 @@ impl SmfContext {
             .map(|obj| {
                 obj.into_iter()
                     .filter_map(|(k, v)| {
-                        let salvaged = v
-                            .get("smContextStatusUri")
-                            .and_then(|u| u.as_str())
-                            .map(str::to_string);
+                        // #912 review N3: `PolicyBinding` serialises its field names
+                        // as they are (`sm_context_status_uri`, `ue_ip`); the camelCase
+                        // spellings are what the hand-written #193 fixtures used, and
+                        // are still accepted.
+                        let field = |snake: &str, camel: &str| {
+                            v.get(snake).or_else(|| v.get(camel)).cloned()
+                        };
+                        let salvaged = field("sm_context_status_uri", "smContextStatusUri")
+                            .and_then(|u| u.as_str().map(str::to_string));
+                        let salvaged_ip: Option<[u8; 4]> = field("ue_ip", "ueIp")
+                            .and_then(|ip| serde_json::from_value::<[u8; 4]>(ip).ok())
+                            .filter(|ip| *ip != [0; 4]);
                         match serde_json::from_value::<PolicyBinding>(v) {
                             Ok(b) => Some((k, b)),
                             Err(e) => {
@@ -2166,6 +2178,7 @@ impl SmfContext {
                                 unrestorable.push(UnrestorableSession {
                                     sm_context_ref: k,
                                     status_uri: salvaged,
+                                    ue_ip: salvaged_ip,
                                     reason: format!("policy binding could not be restored: {e}"),
                                 });
                                 None
@@ -2250,7 +2263,14 @@ impl SmfContext {
             map.extend(policy_bindings);
         }
         if let Ok(mut map) = self.upf_recovery_time_stamps.write() {
-            map.extend(upf_rts);
+            // #995, one-way migration: a pre-#995 snapshot holds Unix-seconds stamps.
+            // They are loaded in the NTP reading (and written back so on the next
+            // persist), so a UPF that did not restart is not taken for one that did.
+            map.extend(
+                upf_rts
+                    .into_iter()
+                    .map(|(k, v)| (k, nextgcore_pfcp::recovery_time::normalize_received(v))),
+            );
         }
         if let Ok(mut map) = self.cp_n4_seids.write() {
             map.extend(cp_n4_seids);
@@ -2317,10 +2337,8 @@ impl SmfContext {
         }
     }
 
-    /// Record the Recovery Time Stamp a UPF peer reported, and persist it.
-    ///
-    /// Keyed by the peer socket address as `PfcpClient::peer()` renders it, which
-    /// is what `main` uses to seed the value back after a restart.
+    /// Record the Recovery Time Stamp a UPF peer reported under `peer`, its key
+    /// (`PfcpClient::recovery_time_stamp_key`), and persist it.
     pub fn note_upf_recovery_time_stamp(&self, peer: &str, rts: u32) {
         let changed = {
             match self.upf_recovery_time_stamps.write() {
@@ -2332,6 +2350,17 @@ impl SmfContext {
         // every heartbeat, and rewriting the whole snapshot every 10s per peer
         // for an unchanged value is pure write amplification.
         if changed {
+            self.persist();
+        }
+    }
+
+    /// Forget the stamp recorded under `key`, persisting the change (#722 review M3).
+    pub fn forget_upf_recovery_time_stamp(&self, key: &str) {
+        let removed = match self.upf_recovery_time_stamps.write() {
+            Ok(mut map) => map.remove(key).is_some(),
+            Err(_) => false,
+        };
+        if removed {
             self.persist();
         }
     }
@@ -3376,6 +3405,14 @@ pub fn smf_context_init(max_ue: usize, max_sess: usize, max_bearer: usize) {
         "PROCESS_STATE_TEST_LOCK",
         "smf_context_init (a test that then uses the process-wide SMF context)",
     );
+    // In a test binary the context is one per process and `init` takes the first
+    // caller's limits, while every test adds its own UEs and sessions to it. With
+    // 64 UEs, the tests of #928, #941 and #912 together ran out, and whichever test
+    // came late failed to register a UE. A test's limits say nothing about the
+    // process's, so a test binary gets room for all of them.
+    #[cfg(test)]
+    let (max_ue, max_sess, max_bearer) =
+        (max_ue.max(4096), max_sess.max(8192), max_bearer.max(16384));
     let ctx = smf_self();
     if let Ok(mut context) = ctx.write() {
         context.init(max_ue, max_sess, max_bearer);
@@ -3759,6 +3796,35 @@ mod tests {
         assert!(b < FIVE_G_CP_SEID_BASE, "EPC SEIDs stay below the 5G range");
     }
 
+    /// #995, one-way migration: a pre-#995 snapshot holds UPF Recovery Time Stamps in
+    /// Unix seconds. They load in the NTP reading (TS 29.244 §8.2.65), and an NTP one
+    /// is left as it is.
+    #[test]
+    fn pre_995_unix_recovery_time_stamps_load_as_ntp() {
+        let started_unix = 1_767_225_600u64; // 2026-01-01, a UPF up since then
+        let ntp = nextgcore_pfcp::recovery_time::from_unix_secs(started_unix);
+        let path = temp_state_path("995-rts");
+        let doc = serde_json::json!({
+            "version": SmfContext::SNAPSHOT_VERSION,
+            "pfcpSessions": {},
+            "policyBindings": {},
+            "ipv4Allocations": [],
+            "upfRecoveryTimeStamps": { "upf-legacy:8805": started_unix, "upf-new:8805": ntp }
+        });
+        std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
+        let ctx = ctx_with_state(&path);
+        assert_eq!(
+            ctx.upf_recovery_time_stamp("upf-legacy:8805"),
+            Some(ntp),
+            "migrated"
+        );
+        assert_eq!(
+            ctx.upf_recovery_time_stamp("upf-new:8805"),
+            Some(ntp),
+            "unchanged"
+        );
+    }
+
     /// A version-1 snapshot's sessions keep the legacy CP SEID (`ref | 0x1000`): the
     /// UPF holds them under it. Only new sessions use the new derivation.
     #[test]
@@ -3806,6 +3872,49 @@ mod tests {
             .collect();
         assert_eq!(seids.len(), 10_000);
         assert!(seids.iter().all(|s| *s >= FIVE_G_CP_SEID_BASE));
+    }
+
+    /// #912 review N3: a REAL snapshot (written by `snapshot`, not hand-written)
+    /// whose binding record no longer types still yields its consumer callback and its
+    /// UE address, so boot can tell the AMF and free the restored allocation. The
+    /// salvage read camelCase keys a real snapshot never contains.
+    #[test]
+    fn a_real_snapshots_unreadable_binding_salvages_its_callback_and_address() {
+        let path = temp_state_path("n3-salvage");
+        {
+            let ctx = ctx_with_state(&path);
+            let mut b = PolicyBinding::snapshot_default();
+            b.supi = "imsi-001010000009130".to_string();
+            b.psi = 5;
+            b.ue_ip = [10, 45, 9, 30];
+            b.sm_context_status_uri = Some("http://amf.example/sm-status".to_string());
+            ctx.policy_bindings
+                .write()
+                .unwrap()
+                .insert("9130".to_string(), b);
+            ctx.pfcp_sessions
+                .write()
+                .unwrap()
+                .insert("9130".to_string(), 0x9130);
+            ctx.persist();
+        }
+        // Corrupt the binding the way a schema move would: one field of a wrong type.
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        doc["policyBindings"]["9130"]["psi"] = serde_json::json!("not-a-number");
+        std::fs::write(&path, doc.to_string()).unwrap();
+
+        let ctx = ctx_with_state(&path);
+        let pending = ctx.unrestorable_sessions.read().unwrap().clone();
+        let entry = pending
+            .iter()
+            .find(|u| u.sm_context_ref == "9130")
+            .expect("the unreadable binding is reported");
+        assert_eq!(
+            entry.status_uri.as_deref(),
+            Some("http://amf.example/sm-status")
+        );
+        assert_eq!(entry.ue_ip, Some([10, 45, 9, 30]));
     }
 
     // ── #193: a session whose binding record did not survive ──
