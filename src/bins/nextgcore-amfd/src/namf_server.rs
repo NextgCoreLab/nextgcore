@@ -4705,39 +4705,32 @@ fn record_transferred_sessions(ue_id: u64, ue_context: &Value, ue_context_id: &s
         if let Some(dnn) = session.get("dnn").and_then(Value::as_str) {
             sess.dnn = Some(dnn.to_string());
         }
-        match session
+        let named = session
             .pointer("/sNssai/sst")
             .and_then(Value::as_u64)
             .and_then(|v| u8::try_from(v).ok())
-        {
-            Some(sst) => {
-                sess.s_nssai.sst = sst;
-                sess.s_nssai.sd = session
+            .map(|sst| crate::context::SNssai {
+                sst,
+                sd: session
                     .pointer("/sNssai/sd")
                     .and_then(Value::as_str)
-                    .and_then(|s| u32::from_str_radix(s, 16).ok());
-            }
-            // TS 29.518 §6.1.6.2.19: PduSessionContext.sNssai is mandatory. A peer that
-            // omits it still names a session the UE holds, so it is recorded under this
-            // AMF's default S-NSSAI rather than as SST 0, which no target admits
-            // (#743 follow-up).
-            None => {
-                let default = ctx.read().ok().and_then(|guard| {
-                    guard
-                        .plmn_support
-                        .first()
-                        .and_then(|p| p.s_nssai.first().cloned())
-                });
-                log::warn!(
-                    "UE context {ue_context_id}: PDU session {psi} has no (valid) sNssai, \
-                     which TS 29.518 makes mandatory; recorded under the default S-NSSAI \
-                     {default:?}"
-                );
-                if let Some(default) = default {
-                    sess.s_nssai = default;
-                }
-            }
+                    .and_then(|s| u32::from_str_radix(s, 16).ok()),
+            });
+        // TS 29.518 §6.1.6.2.19: PduSessionContext.sNssai is mandatory. A peer that omits
+        // it, or names SST 0 (schema-valid, TS 29.571, but no slice), still names a session
+        // the UE holds, so it is recorded under this AMF's default S-NSSAI rather than as
+        // SST 0, which no target admits (#743 follow-up; #920 follow-up for SST 0).
+        if named.as_ref().is_none_or(|s| s.sst == 0) {
+            log::warn!(
+                "UE context {ue_context_id}: PDU session {psi} has no usable sNssai \
+                 ({named:?}), which TS 29.518 makes mandatory; recorded under the default \
+                 S-NSSAI"
+            );
         }
+        sess.s_nssai = ctx
+            .read()
+            .map(|guard| guard.usable_s_nssai(named.clone()))
+            .unwrap_or_else(|_| named.unwrap_or_default());
         if let Ok(guard) = ctx.read() {
             guard.sess_update(&sess);
         }
@@ -9600,6 +9593,14 @@ mod tests {
                     "smContextRef": "smctx-relocate-740031",
                     "dnn": "internet",
                     "accessType": "3GPP_ACCESS",
+                }, {
+                    // #920 follow-up: a peer that names SST 0 (schema-valid, TS 29.571,
+                    // but no slice).
+                    "pduSessionId": 9,
+                    "smContextRef": "smctx-relocate-740032",
+                    "sNssai": { "sst": 0, "sd": "000920" },
+                    "dnn": "internet",
+                    "accessType": "3GPP_ACCESS",
                 }],
             },
             "targetId": {
@@ -9623,20 +9624,36 @@ mod tests {
             sst: 2,
             sd: Some(0x02_0202),
         };
-        let saved_plmn_support = {
+        // #920 review, MINOR 3: the substitute PLMN support is put back by a drop guard,
+        // count included, even if the handler panics.
+        struct RestorePlmnSupport(Vec<crate::context::PlmnSupport>, usize);
+        impl Drop for RestorePlmnSupport {
+            fn drop(&mut self) {
+                let ctx = amf_self();
+                let mut guard = ctx.write().unwrap_or_else(|e| e.into_inner());
+                guard.plmn_support = std::mem::take(&mut self.0);
+                guard.num_of_plmn_support = self.1;
+            }
+        }
+        let restore = {
             let ctx = amf_self();
             let mut guard = ctx.write().expect("ctx lock");
-            std::mem::replace(
-                &mut guard.plmn_support,
-                vec![crate::context::PlmnSupport {
-                    plmn_id: PlmnId::new("001", "01"),
-                    num_of_s_nssai: 1,
-                    s_nssai: vec![default_slice.clone()],
-                }],
-            )
+            let saved = RestorePlmnSupport(
+                std::mem::replace(
+                    &mut guard.plmn_support,
+                    vec![crate::context::PlmnSupport {
+                        plmn_id: PlmnId::new("001", "01"),
+                        num_of_s_nssai: 1,
+                        s_nssai: vec![default_slice.clone()],
+                    }],
+                ),
+                guard.num_of_plmn_support,
+            );
+            guard.num_of_plmn_support = 1;
+            saved
         };
         let resp = namf_request_handler(req).await;
-        amf_self().write().expect("ctx lock").plmn_support = saved_plmn_support;
+        drop(restore);
 
         assert_eq!(
             resp.status, 201,
@@ -9658,7 +9675,7 @@ mod tests {
         let sessions = ctx.read().expect("ctx lock").sess_list_for_ue(resolved.id);
         assert_eq!(
             sessions.len(),
-            2,
+            3,
             "the transferred sessionContextList must be RECORDED against the created \
              context -- the gap PR #390 named"
         );
@@ -9673,6 +9690,15 @@ mod tests {
             (8, default_slice.sst, default_slice.sd),
             "#743 follow-up: a session without sNssai is recorded under the default S-NSSAI, \
              not SST 0"
+        );
+        assert_eq!(
+            (
+                sessions[2].psi,
+                sessions[2].s_nssai.sst,
+                sessions[2].s_nssai.sd
+            ),
+            (9, default_slice.sst, default_slice.sd),
+            "#920 follow-up: a peer's explicit SST 0 is recorded under the default S-NSSAI"
         );
         assert_eq!(sessions[0].psi, 7);
         assert_eq!(
