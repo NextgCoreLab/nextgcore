@@ -118,12 +118,13 @@ fn every_nf_metrics_listener_uses_the_loopback_default() {
             }
         }
     }
-    // The five that serve one today; a new one is fine as long as it passes.
+    // The seven that serve one today; a new one is fine as long as it passes.
     for nf in [
         "nextgcore-mmed",
         "nextgcore-nsacfd",
         "nextgcore-sgwud",
         "nextgcore-smfd",
+        "nextgcore-ucmfd",
         "nextgcore-udmd",
         "nextgcore-upfd",
     ] {
