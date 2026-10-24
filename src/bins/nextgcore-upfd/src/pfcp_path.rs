@@ -13,8 +13,11 @@ use crate::n4_build::{
     ParsedCreateFar, ParsedCreatePdr, ParsedCreateQer, ParsedCreateUrr, ParsedFSeid, ParsedIe,
     ParsedPfcpHeader, PfcpCause, ReportType, UserPlaneReport,
 };
+use nextgcore_pfcp::peer_policy::{
+    is_request_type, is_response_type, same_host, PeerAllowlist, RefusalLog,
+};
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -467,6 +470,91 @@ pub struct PfcpAssociation {
     /// The peer's Recovery Time Stamp from Association Setup / Heartbeat —
     /// a change means the peer restarted and all its sessions are stale
     pub recovery_time_stamp: u32,
+    /// The host addresses this association's CP function speaks from (security,
+    /// #968): the Association Setup source and, for an IPv4 or IPv6 Node ID, the
+    /// Node ID address. Compared by IP only: TS 29.244 §6.2.6 associates Node IDs,
+    /// not one UDP 4-tuple, so an SMF that sends requests from another port, or from
+    /// the address its Node ID names, is still this association.
+    pub addrs: Vec<IpAddr>,
+}
+
+impl PfcpAssociation {
+    /// Whether `ip` is one of this association's own host addresses.
+    pub fn owns(&self, ip: IpAddr) -> bool {
+        self.addrs.iter().any(|a| same_host(*a, ip))
+    }
+}
+
+/// The FQDN of a Node ID IE value of type 2 (§8.2.38), decoded from its DNS label
+/// encoding (TS 23.003 §19.4.2). `None` for any other type or a malformed value.
+fn node_id_fqdn(node_id: &[u8]) -> Option<String> {
+    if node_id.first().map(|b| b & 0x0f) != Some(2) {
+        return None;
+    }
+    let mut labels = Vec::new();
+    let mut rest = &node_id[1..];
+    while let Some((&len, tail)) = rest.split_first() {
+        let len = usize::from(len);
+        if len == 0 {
+            break;
+        }
+        let label = tail.get(..len)?;
+        if !label
+            .iter()
+            .all(|c| c.is_ascii_alphanumeric() || *c == b'-')
+        {
+            return None;
+        }
+        labels.push(std::str::from_utf8(label).ok()?);
+        rest = &tail[len..];
+    }
+    (!labels.is_empty()).then(|| labels.join("."))
+}
+
+/// How long an FQDN Node ID may take to resolve while its Association Setup is
+/// answered. Bounded so a slow resolver cannot stall the N4 receive loop.
+const NODE_ID_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The addresses an FQDN Node ID resolves to (empty on failure or timeout).
+async fn resolve_node_id_fqdn(fqdn: &str) -> Vec<IpAddr> {
+    match tokio::time::timeout(
+        NODE_ID_RESOLVE_TIMEOUT,
+        tokio::net::lookup_host((fqdn, nextgcore_pfcp::PFCP_UDP_PORT)),
+    )
+    .await
+    {
+        Ok(Ok(addrs)) => addrs.map(|a| a.ip().to_canonical()).collect(),
+        Ok(Err(e)) => {
+            log::warn!("PFCP Node ID FQDN '{fqdn}' does not resolve: {e}");
+            Vec::new()
+        }
+        Err(_) => {
+            log::warn!("PFCP Node ID FQDN '{fqdn}' did not resolve in time");
+            Vec::new()
+        }
+    }
+}
+
+/// The host addresses of an association set up from `src` with Node ID IE value
+/// `node_id` (§8.2.38: octet 0 bits 1-4 are the type, 0 = IPv4, 1 = IPv6, 2 = FQDN).
+/// An FQDN Node ID's addresses are added by the caller once resolved.
+fn association_addrs(src: SocketAddr, node_id: &[u8]) -> Vec<IpAddr> {
+    let mut addrs = vec![src.ip().to_canonical()];
+    let from_node_id = match (node_id.first().map(|b| b & 0x0f), node_id.len()) {
+        (Some(0), 5) => Some(IpAddr::from([
+            node_id[1], node_id[2], node_id[3], node_id[4],
+        ])),
+        (Some(1), 17) => <[u8; 16]>::try_from(&node_id[1..17])
+            .ok()
+            .map(|o| IpAddr::from(o).to_canonical()),
+        _ => None,
+    };
+    if let Some(ip) = from_node_id {
+        if !addrs.contains(&ip) {
+            addrs.push(ip);
+        }
+    }
+    addrs
 }
 
 /// PFCP request retransmission timer T1 (TS 29.244 / Open5GS default 3s).
@@ -504,6 +592,22 @@ pub struct PendingReport {
 /// (rejected requests and dropped responses). Rendered as
 /// `upf_pfcp_unauthorized_messages_total`.
 pub static PFCP_UNAUTHORIZED: AtomicU64 = AtomicU64::new(0);
+
+/// Rate limit for the refusal log lines (#968 review): the counter above counts every
+/// refused datagram; the log speaks once per interval so a flood is not a log flood.
+static REFUSAL_LOG: RefusalLog = RefusalLog::new();
+
+/// Count one refused PFCP message and log it, rate-limited.
+fn note_refusal(what: std::fmt::Arguments<'_>) {
+    PFCP_UNAUTHORIZED.fetch_add(1, Ordering::Relaxed);
+    if let Some(suppressed) = REFUSAL_LOG.note() {
+        if suppressed > 0 {
+            log::warn!("{what} ({suppressed} earlier refusal(s) not logged)");
+        } else {
+            log::warn!("{what}");
+        }
+    }
+}
 
 /// Async PFCP server for handling SMF requests
 pub struct PfcpServer {
@@ -554,6 +658,10 @@ pub struct PfcpServer {
     /// SMF/SGW-C was never detected: the association and every session stayed
     /// in place indefinitely while traffic blackholed.
     heartbeat: tokio::sync::Mutex<HeartbeatState>,
+    /// The CP-function addresses an Association Setup is accepted from (security,
+    /// #968). Unconfigured (empty) accepts any host, but a live association can then
+    /// be set up again only from one of its own addresses.
+    allowed_peers: std::sync::RwLock<PeerAllowlist>,
 }
 
 /// Outstanding-heartbeat bookkeeping for peer-failure detection.
@@ -737,6 +845,7 @@ impl PfcpServer {
             data_plane: std::sync::RwLock::new(None),
             pending_reports: tokio::sync::Mutex::new(HashMap::new()),
             heartbeat: tokio::sync::Mutex::new(HeartbeatState::default()),
+            allowed_peers: std::sync::RwLock::new(PeerAllowlist::default()),
         })
     }
 
@@ -758,6 +867,21 @@ impl PfcpServer {
         } else {
             seq
         }
+    }
+
+    /// Set the CP-function addresses an Association Setup Request is accepted from
+    /// (`--pfcp-allowed-peers`, security #968).
+    pub fn set_allowed_peers(&self, allowlist: PeerAllowlist) {
+        if let Ok(mut a) = self.allowed_peers.write() {
+            *a = allowlist;
+        }
+    }
+
+    fn allowed_peers(&self) -> PeerAllowlist {
+        self.allowed_peers
+            .read()
+            .map(|a| a.clone())
+            .unwrap_or_default()
     }
 
     /// Whether a PFCP association with a CP function is currently up
@@ -798,7 +922,7 @@ impl PfcpServer {
     /// exactly what a rolling restart produces once two SMF pods overlap.
     async fn declare_peer_failure(&self, peer: SocketAddr, reason: &str) {
         match self.association.read().await.as_ref() {
-            Some(a) if a.peer_addr == peer => {}
+            Some(a) if a.owns(peer.ip()) => {}
             Some(a) => {
                 log::warn!(
                     "ignoring PFCP peer failure from {peer} ({reason}): the association \
@@ -957,47 +1081,56 @@ impl PfcpServer {
             header.seid
         );
 
-        // SECURITY: only the ASSOCIATED CP function may drive sessions, release the
-        // association or answer our requests. Only Heartbeat Request and Association
-        // Setup Request may come from anyone (TS 29.244 §8.2.1 cause 72). Before, a
-        // Session Modification or Deletion from ANY source was executed on a guessed
-        // SEID -- redirecting or tearing down a UE's user plane -- and a stray response
-        // could acknowledge our reports or keep a dead peer looking alive.
-        let from_peer =
-            self.association.read().await.as_ref().map(|a| a.peer_addr) == Some(src_addr);
-        // A report response is accepted from exactly the address its request went to.
+        // SECURITY (#968): only the ASSOCIATED CP function may drive sessions, release
+        // the association or answer our requests. Only Heartbeat Request and Association
+        // Setup Request may come from anyone (TS 29.244 §8.2.1 cause 72), and the Setup
+        // handler applies the peer allowlist itself. Before, a Session Modification or
+        // Deletion from ANY source was executed on a guessed SEID -- redirecting or
+        // tearing down a UE's user plane -- and a stray response could acknowledge our
+        // reports or keep a dead peer looking alive.
+        //
+        // The source is matched by IP, never by port: the association is between Node
+        // IDs (§6.2.6), so any of the association's host addresses qualifies (its Setup
+        // source, its IPv4/IPv6 Node ID, or the addresses its FQDN Node ID resolves to).
+        let src_ip = src_addr.ip();
+        let from_peer = self
+            .association
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|a| a.owns(src_ip));
+        // A report response is accepted from the host its request went to.
         let answers_our_report = header.msg_type == pfcp_type::SESSION_REPORT_RESPONSE
             && self
                 .pending_reports
                 .lock()
                 .await
                 .get(&header.sequence_number)
-                .is_some_and(|p| p.dest == src_addr);
+                .is_some_and(|p| same_host(p.dest.ip(), src_ip));
         if !from_peer && !answers_our_report {
-            match header.msg_type {
+            let t = header.msg_type;
+            match t {
                 pfcp_type::HEARTBEAT_REQUEST | pfcp_type::ASSOCIATION_SETUP_REQUEST => {}
-                2 | 4 | 6 | 8 | 10 | 11 | 13 | 15 | 51 | 53 | 55 | 57 => {
-                    // A response (Table 7.3-1): not ours to accept. Dropped and counted.
-                    let t = header.msg_type;
-                    PFCP_UNAUTHORIZED.fetch_add(1, Ordering::Relaxed);
-                    log::warn!(
+                t if is_response_type(t) => {
+                    // Not ours to accept: dropped and counted.
+                    note_refusal(format_args!(
                         "PFCP response type={t} seq={} from {src_addr}, which is not the \
                          associated CP function: dropped",
                         header.sequence_number
-                    );
+                    ));
                     return Ok(());
                 }
-                t => {
+                t if is_request_type(t) => {
                     // A request: rejected with "No established PFCP Association" (§5.8.3,
                     // cause 72), never executed, and counted.
-                    PFCP_UNAUTHORIZED.fetch_add(1, Ordering::Relaxed);
-                    log::warn!(
+                    note_refusal(format_args!(
                         "PFCP request type={t} from {src_addr}, which is not the associated \
                          CP function: rejected (cause 72), not executed"
-                    );
+                    ));
                     let resp_payload =
                         build_failure_response(PfcpCause::NoEstablishedPfcpAssociation, None);
                     let session_level = t >= pfcp_type::SESSION_ESTABLISHMENT_REQUEST;
+                    // `t` is a Table 7.3-1 request type, so `t + 1` is its response.
                     let response = self.build_response(
                         t + 1,
                         0,
@@ -1006,6 +1139,14 @@ impl PfcpServer {
                         session_level,
                     );
                     let _ = self.socket.send_to(&response, src_addr).await;
+                    return Ok(());
+                }
+                t => {
+                    // An unknown message type is ignored (TS 29.244 §7.6), never answered:
+                    // there is no response type to answer it with (255 + 1 overflowed).
+                    note_refusal(format_args!(
+                        "PFCP message of unknown type {t} from {src_addr}: ignored"
+                    ));
                     return Ok(());
                 }
             }
@@ -1088,7 +1229,7 @@ impl PfcpServer {
         let restarted = {
             let assoc = self.association.read().await;
             match assoc.as_ref() {
-                Some(a) => a.peer_addr == src_addr && a.recovery_time_stamp != rts,
+                Some(a) => a.owns(src_addr.ip()) && a.recovery_time_stamp != rts,
                 None => false,
             }
         };
@@ -1141,6 +1282,19 @@ impl PfcpServer {
     ) -> Result<(), String> {
         log::info!("Handling Association Setup Request from {src_addr}");
 
+        // SECURITY (#968): an association is accepted only from a configured CP function.
+        // A refused Setup changes nothing: the live association and its sessions stay.
+        let allowed = self.allowed_peers();
+        if !allowed.permits(src_addr.ip()) {
+            note_refusal(format_args!(
+                "PFCP Association Setup Request from {src_addr}, which is not an allowed CP \
+                 function ({allowed}): rejected (cause 64)"
+            ));
+            return self
+                .reject_association_setup(header.sequence_number, src_addr)
+                .await;
+        }
+
         // Node ID and Recovery Time Stamp are mandatory (TS 29.244 7.4.4.1)
         let ies = ParsedIe::parse_all(payload);
         let node_id_present = ParsedIe::find_ie(&ies, pfcp_ie::NODE_ID).is_some();
@@ -1189,6 +1343,26 @@ impl PfcpServer {
         // control its sessions, so they are deleted too; retention is defined only
         // for the same Node ID.
         let previous = self.association.read().await.clone();
+        // SECURITY (#968): a Setup replaces or moves a LIVE association only when it comes
+        // from one of that association's own hosts, or from an explicitly allowlisted CP
+        // address. The Node ID cannot decide it: it is a value the sender writes. Without
+        // this, one datagram from any host replaced the association, deleted every
+        // session and locked the real SMF out with cause 72. With no allowlist
+        // configured, a CP function that moved to a new address is accepted once the
+        // old association has gone (heartbeat timeout or Association Release).
+        if let Some(prev) = previous.as_ref() {
+            if !prev.owns(src_addr.ip()) && !allowed.explicitly_permits(src_addr.ip()) {
+                note_refusal(format_args!(
+                    "PFCP Association Setup Request from {src_addr} would take over the live \
+                     association with {}, and {src_addr} is not an allowlisted CP function: \
+                     rejected (cause 64), association and sessions kept",
+                    prev.peer_addr
+                ));
+                return self
+                    .reject_association_setup(header.sequence_number, src_addr)
+                    .await;
+            }
+        }
         let mut sessions_retained = false;
         if let Some(prev) = previous {
             let same_node = prev.node_id == node_id;
@@ -1215,10 +1389,23 @@ impl PfcpServer {
             }
         }
 
+        // A CP function identified by an FQDN may send from any address it resolves to
+        // (§6.2.6: the association is the Node ID's), and one with an IPv4/IPv6 Node ID
+        // from that address. Only addresses the allowlist permits are taken.
+        let mut addrs = association_addrs(src_addr, &node_id);
+        addrs.retain(|ip| same_host(*ip, src_addr.ip()) || allowed.permits(*ip));
+        if let Some(fqdn) = node_id_fqdn(&node_id) {
+            for ip in resolve_node_id_fqdn(&fqdn).await {
+                if allowed.permits(ip) && !addrs.contains(&ip) {
+                    addrs.push(ip);
+                }
+            }
+        }
         {
             let mut association = self.association.write().await;
             *association = Some(PfcpAssociation {
                 peer_addr: src_addr,
+                addrs,
                 node_id,
                 recovery_time_stamp: rts,
             });
@@ -1246,6 +1433,29 @@ impl PfcpServer {
             .map_err(|e| format!("Send error: {e}"))?;
 
         log::info!("PFCP Association established with {src_addr} (peer RTS={rts})");
+        Ok(())
+    }
+
+    /// Answer a refused Association Setup Request with "Request rejected" (cause 64,
+    /// §8.2.1) and change nothing.
+    async fn reject_association_setup(&self, seq: u32, src_addr: SocketAddr) -> Result<(), String> {
+        let resp_payload = build_association_setup_response(
+            &self.local_node_id,
+            self.recovery_time_stamp,
+            PfcpCause::RequestRejected,
+            false,
+        );
+        let response = self.build_response(
+            pfcp_type::ASSOCIATION_SETUP_RESPONSE,
+            0,
+            seq,
+            &resp_payload,
+            false,
+        );
+        self.socket
+            .send_to(&response, src_addr)
+            .await
+            .map_err(|e| format!("Send error: {e}"))?;
         Ok(())
     }
 
@@ -4797,7 +5007,7 @@ mod tests {
         assert!(server.is_associated().await);
 
         // Peer B (a different source address) releases ITS association.
-        let smf_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let smf_b = UdpSocket::bind("127.0.0.2:0").await.unwrap();
         let mut rel = crate::n4_build::PfcpMessageBuilder::new();
         rel.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
         let resp = exchange(&smf_b, addr, &encode_pfcp(9, None, 2, &rel.build())).await;
@@ -4834,7 +5044,7 @@ mod tests {
         assert!(server.is_associated().await);
 
         // Peer B heartbeats with a DIFFERENT RTS.
-        let smf_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let smf_b = UdpSocket::bind("127.0.0.2:0").await.unwrap();
         let mut hb = crate::n4_build::PfcpMessageBuilder::new();
         hb.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, 200);
         let resp = exchange(&smf_b, addr, &encode_pfcp(1, None, 2, &hb.build())).await;
@@ -4967,7 +5177,7 @@ mod tests {
         let dl_before = server.sessions.read().await[&upf_seid].dl_teid;
         let before = PFCP_UNAUTHORIZED.load(Ordering::Relaxed);
 
-        let attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let attacker = UdpSocket::bind("127.0.0.66:0").await.unwrap();
         // Modification re-pointing the downlink tunnel.
         let mut far = crate::n4_build::PfcpMessageBuilder::new();
         far.add_u32(pfcp_ie::FAR_ID, 1);
@@ -5074,6 +5284,202 @@ mod tests {
         assert_eq!(server.pending_report_count().await, 0);
     }
 
+    /// Send an Association Setup Request from `sock` and return the response cause.
+    async fn setup_cause(sock: &UdpSocket, upf: SocketAddr, node: Ipv4Addr, rts: u32) -> u8 {
+        let resp = exchange(
+            sock,
+            upf,
+            &encode_pfcp(5, None, rts, &association_setup(node, rts, None)),
+        )
+        .await;
+        assert_eq!(resp[1], pfcp_type::ASSOCIATION_SETUP_RESPONSE);
+        response_cause(&resp)
+    }
+
+    /// SECURITY (#968 review, BLOCKER 1): with an allowlist configured, a host that is
+    /// not on it cannot associate -- with its own Node ID or with the real SMF's -- and
+    /// a refused Setup touches nothing: the association, its sessions and the real
+    /// SMF's control of them all survive. Before, one Setup from any host was accepted
+    /// (cause 1), replaced the association, deleted every session and left the real
+    /// SMF answered with cause 72.
+    #[tokio::test]
+    async fn with_an_allowlist_a_stranger_cannot_associate_or_take_anything() {
+        let (server, smf, upf, _rx) = spawn_test_server().await;
+        server.set_allowed_peers(PeerAllowlist::parse("127.0.0.1").unwrap());
+        let stranger = UdpSocket::bind("127.0.0.66:0").await.unwrap();
+        // With no association up, the stranger still cannot be the first to associate.
+        assert_eq!(
+            setup_cause(&stranger, upf, SMF_NODE, 6).await,
+            PfcpCause::RequestRejected as u8
+        );
+        assert!(!server.is_associated().await);
+
+        associate(&smf, upf, SMF_NODE, 100, None).await;
+        let x = establish(&server, &smf, upf, FIRST_CP_SEID).await;
+        let before = PFCP_UNAUTHORIZED.load(Ordering::Relaxed);
+
+        for node in [Ipv4Addr::new(127, 0, 0, 66), SMF_NODE] {
+            assert_eq!(
+                setup_cause(&stranger, upf, node, 7).await,
+                PfcpCause::RequestRejected as u8,
+                "Node ID {node}: refused with cause 64"
+            );
+        }
+        let smf_addr = smf.local_addr().unwrap();
+        assert_eq!(held(&server).await, vec![(x, FIRST_CP_SEID, smf_addr)]);
+        assert_eq!(
+            server.association.read().await.as_ref().unwrap().peer_addr,
+            smf_addr,
+            "the association is still the real SMF's"
+        );
+        assert!(PFCP_UNAUTHORIZED.load(Ordering::Relaxed) >= before + 2);
+
+        // The stranger is still refused session messages; the real SMF is served.
+        let resp = exchange(&stranger, upf, &encode_pfcp(54, Some(x), 9, &[])).await;
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::NoEstablishedPfcpAssociation as u8
+        );
+        let resp = exchange(&smf, upf, &encode_pfcp(54, Some(x), 10, &[])).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+    }
+
+    /// SECURITY (#968 review, BLOCKER 1 without configuration): with NO allowlist, a
+    /// live association still cannot be taken over from a host it does not use, with
+    /// either Node ID. Once the real SMF releases it, a CP function at a new address
+    /// may associate (the unconfigured failover path).
+    #[tokio::test]
+    async fn without_an_allowlist_a_live_association_cannot_be_taken_over() {
+        let (server, smf, upf, _rx) = spawn_test_server().await;
+        associate(&smf, upf, SMF_NODE, 100, None).await;
+        let x = establish(&server, &smf, upf, FIRST_CP_SEID).await;
+
+        let other = UdpSocket::bind("127.0.0.66:0").await.unwrap();
+        for node in [Ipv4Addr::new(127, 0, 0, 66), SMF_NODE] {
+            assert_eq!(
+                setup_cause(&other, upf, node, 7).await,
+                PfcpCause::RequestRejected as u8,
+                "Node ID {node}"
+            );
+        }
+        assert_eq!(held(&server).await.len(), 1, "{x:#x} survives");
+
+        // The SMF releases; now a CP function elsewhere may associate.
+        let mut rel = crate::n4_build::PfcpMessageBuilder::new();
+        rel.add_node_id(&NodeId::Ipv4(SMF_NODE));
+        let resp = exchange(&smf, upf, &encode_pfcp(9, None, 11, &rel.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(
+            setup_cause(&other, upf, Ipv4Addr::new(127, 0, 0, 66), 8).await,
+            PfcpCause::RequestAccepted as u8
+        );
+    }
+
+    /// #968 review (c): a Setup from a DIFFERENT CP function replaces the live
+    /// association when its address is allowlisted -- the configured failover.
+    #[tokio::test]
+    async fn an_allowlisted_cp_function_may_replace_the_association() {
+        let (server, smf_a, upf, _rx) = spawn_test_server().await;
+        server.set_allowed_peers(PeerAllowlist::parse("127.0.0.1, 127.0.0.2").unwrap());
+        associate(&smf_a, upf, SMF_NODE, 100, None).await;
+        establish(&server, &smf_a, upf, FIRST_CP_SEID).await;
+
+        let smf_b = UdpSocket::bind("127.0.0.2:0").await.unwrap();
+        assert_eq!(
+            setup_cause(&smf_b, upf, Ipv4Addr::new(127, 0, 0, 2), 5).await,
+            PfcpCause::RequestAccepted as u8
+        );
+        assert_eq!(
+            server.association.read().await.as_ref().unwrap().peer_addr,
+            smf_b.local_addr().unwrap()
+        );
+        // The replaced CP function no longer controls this UPF.
+        let resp = exchange(&smf_a, upf, &encode_pfcp(54, Some(1), 12, &[])).await;
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::NoEstablishedPfcpAssociation as u8
+        );
+    }
+
+    /// #968 review, MAJOR 3: the association is the CP function's, not one UDP
+    /// 4-tuple. Session messages from the SMF's host on ANOTHER source port, and from
+    /// the address its IPv4 Node ID names, are served.
+    #[tokio::test]
+    async fn the_associated_smf_is_served_from_another_port_and_its_node_id_address() {
+        let (server, smf, upf, _rx) = spawn_test_server().await;
+        associate(&smf, upf, SMF_NODE, 100, None).await;
+        let x = establish(&server, &smf, upf, FIRST_CP_SEID).await;
+        let y = establish(&server, &smf, upf, FIRST_CP_SEID + 1).await;
+
+        let other_port = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let resp = exchange(&other_port, upf, &encode_pfcp(54, Some(x), 20, &[])).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+
+        let node_id_addr = UdpSocket::bind(SocketAddr::from((SMF_NODE, 0)))
+            .await
+            .unwrap();
+        let resp = exchange(&node_id_addr, upf, &encode_pfcp(54, Some(y), 21, &[])).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+    }
+
+    /// An FQDN Node ID (§8.2.38 type 2) decodes from its label encoding, and its
+    /// resolved addresses join the association: an SMF named `localhost` that set up
+    /// from 127.0.0.2 is served from 127.0.0.1.
+    #[tokio::test]
+    async fn an_fqdn_node_id_adds_the_addresses_it_resolves_to() {
+        assert_eq!(
+            node_id_fqdn(b"\x02\x03smf\x04core\x03lab").as_deref(),
+            Some("smf.core.lab")
+        );
+        assert_eq!(node_id_fqdn(b"\x02\x05sm"), None, "truncated label");
+        assert_eq!(node_id_fqdn(&[0, 127, 0, 0, 1]), None, "not an FQDN");
+
+        let (server, _smf, upf, _rx) = spawn_test_server().await;
+        let smf = UdpSocket::bind("127.0.0.2:0").await.unwrap();
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(pfcp_ie::NODE_ID, b"\x02\x09localhost");
+        b.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, 1);
+        let resp = exchange(&smf, upf, &encode_pfcp(5, None, 1, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        let assoc = server.association.read().await.clone().unwrap();
+        assert!(
+            assoc.owns(IpAddr::from([127, 0, 0, 1])),
+            "{:?}",
+            assoc.addrs
+        );
+        assert!(assoc.owns(IpAddr::from([127, 0, 0, 2])));
+        assert!(!assoc.owns(IpAddr::from([127, 0, 0, 3])));
+    }
+
+    /// #968 review, MAJOR 2: a message of an unknown type is ignored (TS 29.244 §7.6),
+    /// not answered with type `t + 1` -- for type 255 that addition overflowed and
+    /// panicked the receive task in debug builds. The server keeps serving.
+    #[tokio::test]
+    async fn a_message_of_unknown_type_is_ignored_and_the_server_keeps_serving() {
+        let (_server, smf, upf, _rx) = spawn_test_server().await;
+        let stranger = UdpSocket::bind("127.0.0.66:0").await.unwrap();
+        for t in [255u8, 99, 18] {
+            stranger
+                .send_to(&encode_pfcp(t, None, 3, &[]), upf)
+                .await
+                .unwrap();
+            let mut buf = [0u8; 64];
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    stranger.recv_from(&mut buf)
+                )
+                .await
+                .is_err(),
+                "type {t} must not be answered"
+            );
+        }
+        let mut hb = crate::n4_build::PfcpMessageBuilder::new();
+        hb.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, 1);
+        let resp = exchange(&smf, upf, &encode_pfcp(1, None, 4, &hb.build())).await;
+        assert_eq!(resp[1], pfcp_type::HEARTBEAT_RESPONSE, "still serving");
+    }
+
     /// The UPF's sessions as (UPF SEID, CP SEID, address it reports to).
     async fn held(server: &PfcpServer) -> Vec<(u64, u64, SocketAddr)> {
         let mut v: Vec<_> = server
@@ -5118,7 +5524,9 @@ mod tests {
     #[tokio::test]
     async fn a_restarted_smf_at_a_new_address_does_not_inherit_its_predecessors_sessions() {
         let (server, smf_a, upf, mut rx) = spawn_test_server().await;
-        let smf_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let smf_b = UdpSocket::bind("127.0.0.2:0").await.unwrap();
+        // A new pod IP: accepted because the deployment allowlists its CP range (#968).
+        server.set_allowed_peers(PeerAllowlist::parse("127.0.0.0/8").unwrap());
         let (a, b) = (smf_a.local_addr().unwrap(), smf_b.local_addr().unwrap());
 
         // Incarnation 1 at A: UE X.
@@ -5179,7 +5587,9 @@ mod tests {
     #[tokio::test]
     async fn a_retention_request_from_the_same_node_keeps_the_sessions_and_says_so() {
         let (server, smf_a, upf, _rx) = spawn_test_server().await;
-        let smf_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let smf_b = UdpSocket::bind("127.0.0.2:0").await.unwrap();
+        // A new pod IP: accepted because the deployment allowlists its CP range (#968).
+        server.set_allowed_peers(PeerAllowlist::parse("127.0.0.0/8").unwrap());
         associate(&smf_a, upf, SMF_NODE, 100, None).await;
         let x = establish(&server, &smf_a, upf, FIRST_CP_SEID).await;
 
@@ -5235,7 +5645,9 @@ mod tests {
     #[tokio::test]
     async fn a_different_cp_function_cannot_retain_the_previous_ones_sessions() {
         let (server, smf_a, upf, _rx) = spawn_test_server().await;
-        let smf_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let smf_b = UdpSocket::bind("127.0.0.2:0").await.unwrap();
+        // A new pod IP: accepted because the deployment allowlists its CP range (#968).
+        server.set_allowed_peers(PeerAllowlist::parse("127.0.0.0/8").unwrap());
         associate(&smf_a, upf, SMF_NODE, 100, None).await;
         establish(&server, &smf_a, upf, FIRST_CP_SEID).await;
 

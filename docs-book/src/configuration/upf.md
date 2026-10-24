@@ -67,6 +67,7 @@ Defaults below are the real clap `default_value`s from the source.
 | `-k, --kill` | bool | `false` | Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor. |
 | `--pfcp-addr` | string | `127.0.0.4` | N4 PFCP server bind address. |
 | `--pfcp-port` | u16 | `8805` | N4 PFCP server port. |
+| `--pfcp-allowed-peers` | list | empty | SMF/PGW-C addresses (IPs or CIDR prefixes, comma-separated) allowed to set up the PFCP association; `UPF_PFCP_ALLOWED_PEERS` when the flag is not given. Only the source IP is compared. A listed host may also replace or move a live association. Empty: any host may associate while none is up (logged as a warning at startup) and a live association can be set up again only from its own addresses. Every PFCP message other than Heartbeat and Association Setup is accepted only from the associated SMF's hosts (its Setup source, its IPv4/IPv6 Node ID, or the addresses its FQDN Node ID resolves to); refusals count in `upf_pfcp_unauthorized_messages_total`. |
 | `--gtpu-addr` | string | `127.0.0.4` | N3 GTP-U bind address. |
 | `--gtpu-port` | u16 | `2152` | N3 GTP-U port. |
 | `--tun-ifname` | string | `ogstun` | TUN interface name for the user-plane subnet. |

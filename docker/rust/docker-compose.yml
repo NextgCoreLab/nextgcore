@@ -339,7 +339,8 @@ services:
       TLS_CERT: /etc/nextgcore/certs/upf.crt
       TLS_KEY: /etc/nextgcore/certs/upf.key
       TLS_CA: /etc/nextgcore/certs/ca.crt
-    command: ["-c", "/etc/nextgcore/upf.yaml", "--pfcp-addr", "172.23.0.7", "--gtpu-addr", "172.23.0.7", "--tun-ip", "10.45.0.1", "--tun-prefix", "16"]
+    # --pfcp-allowed-peers: only the SMF (172.23.0.4) may set up the N4 association (#968).
+    command: ["-c", "/etc/nextgcore/upf.yaml", "--pfcp-addr", "172.23.0.7", "--gtpu-addr", "172.23.0.7", "--tun-ip", "10.45.0.1", "--tun-prefix", "16", "--pfcp-allowed-peers", "172.23.0.4"]
     volumes:
       - ./configs/5gc/upf.yaml:/etc/nextgcore/upf.yaml:ro
       - ./certs:/etc/nextgcore/certs:ro

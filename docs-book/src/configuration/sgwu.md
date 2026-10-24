@@ -39,6 +39,7 @@ A missing or malformed file logs a warning and leaves the defaults.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
+| `sgwu.pfcp.allowed_peers` | list of IPs / CIDR prefixes | empty | SGW-Cs allowed to set up an Sxa association (`SGWU_PFCP_ALLOWED_PEERS`, comma-separated, overrides it). Empty: any host may associate (warned at startup). A bad entry stops startup. Session requests are accepted only from an associated SGW-C's host, and only for that SGW-C's own sessions (another's is answered as unknown, cause 65). Refusals count in `sgwu_pfcp_unauthorized_messages_total`. |
 | `sgwu.pfcp.server[0].address` | IPv4 | none | PFCP Node ID when `PFCP_NODE_IP` is unset (then loopback). Not the bind address: that is `PFCP_BIND_ADDR`. |
 | `sgwu.gtpu.server[0].address` | IPv4 | none | GTP-U address advertised in UP-allocated F-TEIDs when the socket is bound to a wildcard and `SGWU_GTPU_ADVERTISE` is unset. |
 | `logger.level` | string | `info` | Log level when `-l/--log-level` is not given; `RUST_LOG` overrides both (#500). |

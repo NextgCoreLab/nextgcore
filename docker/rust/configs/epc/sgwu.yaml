@@ -15,6 +15,11 @@ sgwu:
   pfcp:
     server:
       - address: 172.24.0.6
+    # The SGW-Cs allowed to set up an Sxa association: IPs or CIDR prefixes (#968).
+    # Unset means any host that reaches the PFCP port may associate.
+    # SGWU_PFCP_ALLOWED_PEERS (comma-separated) overrides this list.
+    allowed_peers:
+      - 172.24.0.3
   gtpu:
     server:
       - address: 172.24.0.6

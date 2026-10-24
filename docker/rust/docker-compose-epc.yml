@@ -277,6 +277,9 @@ services:
       # what makes `ip addr` on a host running both stacks legible.
       - "--tun-ifname"
       - "epctun"
+      # Only the PGW-C (172.24.0.4) may set up the Sxb association (#968).
+      - "--pfcp-allowed-peers"
+      - "172.24.0.4"
     volumes:
       - ./configs/epc/pgwu.yaml:/etc/nextgcore/pgwu.yaml:ro
     networks:
