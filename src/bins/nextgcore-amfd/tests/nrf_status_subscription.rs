@@ -154,6 +154,7 @@ async fn subscribes_per_type_renews_resubscribes_and_unsubscribes() {
     );
     let posts = nrf.take();
     assert_eq!(posts.len(), CACHED_PEER_NF_TYPES.len());
+    let mut tokens = std::collections::HashSet::new();
     let mut types: Vec<String> = posts
         .iter()
         .map(|p| {
@@ -162,7 +163,19 @@ async fn subscribes_per_type_renews_resubscribes_and_unsubscribes() {
                 ("POST", "/nnrf-nfm/v1/subscriptions")
             );
             let b = p.body.as_ref().unwrap();
-            assert_eq!(b["nfStatusNotificationUri"], NOTIFY_URI);
+            // #940 M2: each subscription is notified on its own token.
+            let uri = b["nfStatusNotificationUri"].as_str().unwrap();
+            let token = uri
+                .strip_prefix(&format!("{NOTIFY_URI}/"))
+                .unwrap_or_else(|| panic!("{uri} is not under {NOTIFY_URI}/"));
+            assert!(token.len() >= 32, "{token} is guessable");
+            let nf_type = b["subscrCond"]["nfType"].as_str().unwrap();
+            assert_eq!(
+                nrf_subscription::token_nf_type(token).as_deref(),
+                Some(nf_type)
+            );
+            assert_eq!(subs.by_nf_type[nf_type].token, token);
+            assert!(tokens.insert(token.to_string()), "a token was reused");
             assert_eq!(b["reqNfInstanceId"], "amf-668");
             assert_eq!(
                 b["reqNotifEvents"],
@@ -243,11 +256,22 @@ async fn subscribes_per_type_renews_resubscribes_and_unsubscribes() {
         "SMF"
     );
     assert_ne!(subs.by_nf_type["SMF"].id, smf.id);
+    // The replaced subscription's token no longer evicts anything.
+    assert_ne!(subs.by_nf_type["SMF"].token, smf.token);
+    assert_eq!(nrf_subscription::token_nf_type(&smf.token), None);
+    assert_eq!(
+        nrf_subscription::token_nf_type(&subs.by_nf_type["SMF"].token).as_deref(),
+        Some("SMF")
+    );
 
     // Shutdown: one DELETE per held subscription.
     let held: Vec<String> = subs.by_nf_type.values().map(|s| s.id.clone()).collect();
+    let held_tokens: Vec<String> = subs.by_nf_type.values().map(|s| s.token.clone()).collect();
     let removed = nrf_subscription::unsubscribe_all(&mut subs, &nrf.uri()).await;
     assert_eq!(removed, held.len());
+    assert!(held_tokens
+        .iter()
+        .all(|t| nrf_subscription::token_nf_type(t).is_none()));
     assert!(subs.by_nf_type.is_empty());
     let mut deleted: Vec<String> = nrf
         .take()
@@ -288,52 +312,136 @@ async fn a_blackholed_nrf_bounds_the_pass() {
     assert!(subs.by_nf_type.is_empty());
 }
 
+fn cached_smf(id: &str, port: u16) -> NfInstance {
+    use nextgcore_sbi::types::{NfType, SbiServiceType};
+    let mut i = NfInstance::new(id, NfType::Smf);
+    let mut svc = NfService::new("nsmf-pdusession", SbiServiceType::NsmfPdusession);
+    svc.ip_addresses = vec!["127.0.0.1".into()];
+    svc.port = port;
+    i.add_service(svc);
+    i
+}
+
+/// Subscribe at `nrf` and return the SMF subscription's notification token.
+async fn smf_token(nrf: &StandInNrf) -> String {
+    let mut subs = NrfSubscriptions::default();
+    nrf_subscription::maintain_all(&mut subs, &nrf.uri(), "amf-668", NOTIFY_URI).await;
+    nrf.take();
+    subs.by_nf_type["SMF"].token.clone()
+}
+
+async fn notify_dereg(token: &str, nrf_uri: &str, id: &str) -> u16 {
+    nextgcore_amfd::namf_server::namf_request_handler(
+        SbiRequest::post(format!("{NOTIFY_PATH}/{token}")).with_body(
+            json!({
+                "event": "NF_DEREGISTERED",
+                "nfInstanceUri": format!("{nrf_uri}/nnrf-nfm/v1/nf-instances/{id}"),
+            })
+            .to_string(),
+            "application/json",
+        ),
+    )
+    .await
+    .status
+}
+
 /// The point of #668: a deregistered SMF leaves the cache when the NRF says
-/// so, and the next resolution re-discovers the replacement, with no
-/// request to the old SMF having failed first.
+/// so, and the next resolution reaches the replacement, with no request to the
+/// old SMF having failed first.
+///
+/// #940 M2: the old SMF is the last one cached, so the notification does not
+/// drop it outright. It re-discovers SMF, and the NRF's answer decides: here
+/// the NRF lists only the replacement, so the old one goes. Then the two ways
+/// the last instance must survive: an NRF that still lists it (a forged or
+/// stale notification), and an NRF that does not answer (192.0.2.1). One test,
+/// because every step points the process's one NRF URI somewhere.
 #[tokio::test]
 async fn a_deregistration_notification_makes_the_next_resolution_rediscover() {
-    use nextgcore_sbi::types::{NfType, SbiServiceType};
+    use nextgcore_sbi::types::NfType;
     dev_profile();
     let nrf = stand_in_nrf(json!({
         "validityPeriod": 3600,
         "nfInstances": [smf_profile("smf-668-new", 46682)],
     }))
     .await;
+    let token = smf_token(&nrf).await;
     let ctx = global_context();
     ctx.set_nrf_uri(nrf.uri()).await;
 
-    let mut old = NfInstance::new("smf-668-old", NfType::Smf);
-    let mut svc = NfService::new("nsmf-pdusession", SbiServiceType::NsmfPdusession);
-    svc.ip_addresses = vec!["127.0.0.1".into()];
-    svc.port = 46681;
-    old.add_service(svc);
-    ctx.replace_nf_instances(NfType::Smf, vec![old], Duration::from_secs(3600))
-        .await;
+    ctx.replace_nf_instances(
+        NfType::Smf,
+        vec![cached_smf("smf-668-old", 46681)],
+        Duration::from_secs(3600),
+    )
+    .await;
     let ep = sbi_path::resolve_nf_endpoint_async(sbi_path::SbiServiceType::NsmfPdusession)
         .await
         .unwrap();
     assert_eq!(ep, ("127.0.0.1".to_string(), 46681));
     assert_eq!(nrf.discoveries.load(Ordering::SeqCst), 0);
 
-    let resp = nextgcore_amfd::namf_server::namf_request_handler(
-        SbiRequest::post(NOTIFY_PATH).with_body(
-            json!({
-                "event": "NF_DEREGISTERED",
-                "nfInstanceUri": format!("{}/nnrf-nfm/v1/nf-instances/smf-668-old", nrf.uri()),
-            })
-            .to_string(),
-            "application/json",
-        ),
+    assert_eq!(notify_dereg(&token, &nrf.uri(), "smf-668-old").await, 204);
+    let replaced = nextgcore_sbi::test_support::poll_until(
+        Duration::from_secs(5),
+        Duration::from_millis(20),
+        || async {
+            (ctx.get_nf_instance("smf-668-old").await.is_none()
+                && ctx.get_nf_instance("smf-668-new").await.is_some())
+            .then_some(())
+        },
     )
     .await;
-    assert_eq!(resp.status, 204);
-
+    assert!(
+        replaced.is_some(),
+        "the NRF's answer did not replace the old SMF"
+    );
     let ep = sbi_path::resolve_nf_endpoint_async(sbi_path::SbiServiceType::NsmfPdusession)
         .await
         .unwrap();
     assert_eq!(ep, ("127.0.0.1".to_string(), 46682));
     assert_eq!(nrf.discoveries.load(Ordering::SeqCst), 1);
+
+    // A notification for an SMF the NRF still lists: re-discovered, and kept.
+    // `smf-668-new` was never acted on, so the hold does not apply.
+    assert_eq!(notify_dereg(&token, &nrf.uri(), "smf-668-new").await, 204);
+    let asked = nextgcore_sbi::test_support::poll_until(
+        Duration::from_secs(5),
+        Duration::from_millis(20),
+        || async { (nrf.discoveries.load(Ordering::SeqCst) == 2).then_some(()) },
+    )
+    .await;
+    assert!(asked.is_some(), "no re-discovery for the last SMF");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        ctx.get_nf_instance("smf-668-new").await.is_some(),
+        "the last SMF was dropped although the NRF still lists it"
+    );
+
+    // The NRF stops answering: the last SMF stays, and the callback itself
+    // does not wait for the NRF.
+    ctx.replace_nf_instances(
+        NfType::Smf,
+        vec![cached_smf("smf-940-blackholed", 46684)],
+        Duration::from_secs(3600),
+    )
+    .await;
+    ctx.set_nrf_uri("http://192.0.2.1:7777").await;
+    let started = Instant::now();
+    assert_eq!(
+        notify_dereg(&token, "http://192.0.2.1:7777", "smf-940-blackholed").await,
+        204
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "the callback waited {:?} on the NRF",
+        started.elapsed()
+    );
+    tokio::time::sleep(nrf_subscription::NRF_REQUEST_TIMEOUT + Duration::from_secs(1)).await;
+    assert!(
+        ctx.get_nf_instance("smf-940-blackholed").await.is_some(),
+        "the last SMF was dropped while the NRF could not be asked"
+    );
+    ctx.clear_nrf_uri().await;
 }
 
 /// Against the real `nextgcore-nrfd` binary (manual: `NEXTGCORE_LIVE_NRF_URI=http://127.0.0.1:<port>

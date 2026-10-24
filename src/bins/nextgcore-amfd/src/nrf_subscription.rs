@@ -15,8 +15,30 @@
 //! endpoint, a status or a whole profile from the notification body: the next
 //! request for that NF type misses the cache and re-discovers through the NRF
 //! (`resolve_nf_endpoint_async`), so every endpoint the AMF dials still comes
-//! from a discovery answer. A forged or stale notification can therefore cost
-//! one extra discovery and cannot redirect traffic.
+//! from a discovery answer. A notification cannot redirect traffic.
+//!
+//! # Who may evict, and how often (#940 review M2)
+//!
+//! - Each subscription has its own `nfStatusNotificationUri`,
+//!   `{NOTIFY_PATH}/{token}`, with an unguessable token (as #753 did for the
+//!   UECM `deregCallbackUri`). A notification on a token the AMF does not
+//!   currently hold gets 404 and changes nothing, and one naming an instance
+//!   that is not of its subscription's NF type is ignored.
+//! - An instance is acted on at most once per [`EVICT_HOLD`], so a burst of
+//!   notifications costs one eviction, and one re-discovery, per instance.
+//! - The last cached instance of a type is never simply dropped. The AMF
+//!   re-discovers that type instead, and the NRF's answer replaces the cache
+//!   (#664): an instance the NRF no longer lists goes, one it still lists
+//!   stays. A notification that lands during an NRF outage therefore leaves the
+//!   AMF with the peer it had rather than with nothing (and the `*_SBI_ADDR`
+//!   fallback).
+//!
+//! # An NRF that lost its state
+//!
+//! When the heartbeat finds the NRF no longer holds this AMF and re-registers
+//! it (#434, `heartbeat::reregistration_count`), the NRF has lost the
+//! subscriptions too. The maintainer then re-creates every one at its next pass
+//! instead of waiting for a renewal to get a 404.
 //!
 //! # Off every procedure task
 //!
@@ -46,17 +68,25 @@ pub const REQ_NOTIF_EVENTS: [&str; 2] = ["NF_DEREGISTERED", "NF_PROFILE_CHANGED"
 /// cached profile correct and is not worth a notification. Sent as
 /// `notifCondition.monitoredAttributes`, and applied again by the callback
 /// to an NRF that ignores the condition.
+///
+/// TS 29.510 §6.1.6.2.43 makes `monitoredAttributes` a list of JSON Pointers
+/// (RFC 6901), so each entry is the pointer to a top-level attribute.
 pub const MONITORED_ATTRIBUTES: [&str; 6] = [
-    "nfStatus",
-    "fqdn",
-    "ipv4Addresses",
-    "ipv6Addresses",
-    "nfServices",
-    "nfServiceList",
+    "/nfStatus",
+    "/fqdn",
+    "/ipv4Addresses",
+    "/ipv6Addresses",
+    "/nfServices",
+    "/nfServiceList",
 ];
 
-/// The resource the NRF POSTs `NotificationData` to (routed by `namf_server`).
+/// The resource the NRF POSTs `NotificationData` to (routed by `namf_server`),
+/// followed by `/{token}` for the subscription it belongs to.
 pub const NOTIFY_PATH: &str = "/namf-callback/v1/nf-status-notify";
+
+/// An NF instance is acted on (evicted, or re-discovered) at most once in this
+/// long, however many notifications name it.
+pub const EVICT_HOLD: Duration = Duration::from_secs(10);
 
 /// Upper bound on one subscribe, renew or unsubscribe exchange with the NRF.
 pub const NRF_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -80,6 +110,8 @@ pub struct NrfSubscription {
     /// The NRF's `validityTime` (epoch seconds), or `None` when the NRF gave
     /// none and the subscription does not expire.
     pub expires_at: Option<u64>,
+    /// The token in this subscription's `nfStatusNotificationUri`.
+    pub token: String,
 }
 
 impl NrfSubscription {
@@ -122,9 +154,45 @@ pub fn subscription_body(amf_instance_id: &str, nf_type: &str, notify_uri: &str)
     })
 }
 
-/// The absolute notification URI this AMF subscribes with.
+/// The absolute notification URI this AMF subscribes with, without the
+/// per-subscription token [`subscribe`] appends.
 pub fn notification_uri() -> String {
     format!("{}{NOTIFY_PATH}", advertised_sbi_base())
+}
+
+/// The notification tokens this AMF currently holds, each with the NF type of
+/// its subscription. Written by [`subscribe`] and by whoever drops a
+/// subscription; read by the callback. Tests use their own fresh tokens, so
+/// they never collide here.
+fn notify_tokens() -> &'static std::sync::Mutex<HashMap<String, String>> {
+    static TOKENS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    TOKENS.get_or_init(Default::default)
+}
+
+fn register_token(nf_type: &str) -> String {
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    notify_tokens()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(token.clone(), nf_type.to_string());
+    token
+}
+
+fn unregister_token(token: &str) {
+    notify_tokens()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(token);
+}
+
+/// The NF type of the subscription `token` belongs to, if the AMF holds it.
+pub fn token_nf_type(token: &str) -> Option<String> {
+    notify_tokens()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(token)
+        .cloned()
 }
 
 /// Read the 201 answer: `subscriptionId` from the body, else from the
@@ -146,6 +214,7 @@ fn parse_created(body: Option<&str>, location: Option<&str>, now: u64) -> Option
         id,
         granted_at: now,
         expires_at: validity_of(doc.as_ref()),
+        token: String::new(),
     })
 }
 
@@ -187,14 +256,34 @@ async fn send(
     }
 }
 
-/// NFStatusSubscribe (TS 29.510 §5.2.2.5.2) for `nf_type`.
+/// NFStatusSubscribe (TS 29.510 §5.2.2.5.2) for `nf_type`, notified at
+/// `{notify_base}/{token}` under a fresh token.
+///
+/// The token is held before the POST goes out, because the NRF may notify
+/// before its 201 arrives, and released again when the subscribe fails.
 pub async fn subscribe(
     nrf_uri: &str,
     amf_instance_id: &str,
     nf_type: &str,
-    notify_uri: &str,
+    notify_base: &str,
 ) -> Result<NrfSubscription, String> {
-    let body = subscription_body(amf_instance_id, nf_type, notify_uri);
+    let token = register_token(nf_type);
+    let result = subscribe_with(nrf_uri, amf_instance_id, nf_type, notify_base, &token).await;
+    if result.is_err() {
+        unregister_token(&token);
+    }
+    result.map(|sub| NrfSubscription { token, ..sub })
+}
+
+async fn subscribe_with(
+    nrf_uri: &str,
+    amf_instance_id: &str,
+    nf_type: &str,
+    notify_base: &str,
+    token: &str,
+) -> Result<NrfSubscription, String> {
+    let notify_uri = format!("{}/{token}", notify_base.trim_end_matches('/'));
+    let body = subscription_body(amf_instance_id, nf_type, &notify_uri);
     let request = SbiRequest::post(SUBSCRIPTIONS_PATH)
         .with_json_body(&body)
         .map_err(|e| e.to_string())?;
@@ -245,6 +334,7 @@ async fn renew(nrf_uri: &str, sub: &NrfSubscription) -> Result<NrfSubscription, 
                 // The NRF answers with the validity it will enforce; one that
                 // echoes nothing has accepted what was asked for.
                 expires_at: validity_of(doc.as_ref()).or(Some(now + lifetime)),
+                token: sub.token.clone(),
             })
         }
         // 204: accepted, nothing echoed (TS 29.510 permits it).
@@ -252,6 +342,7 @@ async fn renew(nrf_uri: &str, sub: &NrfSubscription) -> Result<NrfSubscription, 
             id: sub.id.clone(),
             granted_at: now,
             expires_at: Some(now + lifetime),
+            token: sub.token.clone(),
         }),
         404 => Err(RenewError::Gone),
         s => Err(RenewError::Other(format!("answered {s}"))),
@@ -265,11 +356,11 @@ pub async fn maintain_one(
     nrf_uri: &str,
     amf_instance_id: &str,
     nf_type: &str,
-    notify_uri: &str,
+    notify_base: &str,
     current: Option<NrfSubscription>,
 ) -> (Option<NrfSubscription>, MaintainOutcome) {
     let Some(sub) = current else {
-        return match subscribe(nrf_uri, amf_instance_id, nf_type, notify_uri).await {
+        return match subscribe(nrf_uri, amf_instance_id, nf_type, notify_base).await {
             Ok(s) => (Some(s), MaintainOutcome::Subscribed),
             Err(e) => (None, MaintainOutcome::Failed(e)),
         };
@@ -280,7 +371,7 @@ pub async fn maintain_one(
     match renew(nrf_uri, &sub).await {
         Ok(s) => (Some(s), MaintainOutcome::Renewed),
         Err(RenewError::Gone) => {
-            match subscribe(nrf_uri, amf_instance_id, nf_type, notify_uri).await {
+            match subscribe(nrf_uri, amf_instance_id, nf_type, notify_base).await {
                 Ok(s) => (Some(s), MaintainOutcome::Resubscribed),
                 Err(e) => (None, MaintainOutcome::Failed(e)),
             }
@@ -298,12 +389,13 @@ pub async fn maintain_one(
     }
 }
 
-/// One maintenance pass over every cached NF type, concurrently.
+/// One maintenance pass over every cached NF type, concurrently. Each
+/// subscription is notified at `{notify_base}/{token}`.
 pub async fn maintain_all(
     subs: &mut NrfSubscriptions,
     nrf_uri: &str,
     amf_instance_id: &str,
-    notify_uri: &str,
+    notify_base: &str,
 ) -> HashMap<String, MaintainOutcome> {
     let mut set = tokio::task::JoinSet::new();
     for nf_type in CACHED_PEER_NF_TYPES {
@@ -311,10 +403,17 @@ pub async fn maintain_all(
         let (nrf, amf, uri) = (
             nrf_uri.to_string(),
             amf_instance_id.to_string(),
-            notify_uri.to_string(),
+            notify_base.to_string(),
         );
         set.spawn(async move {
+            let previous = current.as_ref().map(|s| s.token.clone());
             let (next, outcome) = maintain_one(&nrf, &amf, nf_type, &uri, current).await;
+            // A subscription that was replaced or dropped takes its token with it.
+            if let Some(previous) = previous {
+                if next.as_ref().is_none_or(|n| n.token != previous) {
+                    unregister_token(&previous);
+                }
+            }
             (nf_type, next, outcome)
         });
     }
@@ -353,6 +452,7 @@ pub async fn maintain_all(
 pub async fn unsubscribe_all(subs: &mut NrfSubscriptions, nrf_uri: &str) -> usize {
     let mut set = tokio::task::JoinSet::new();
     for (_, sub) in subs.by_nf_type.drain() {
+        unregister_token(&sub.token);
         let nrf = nrf_uri.to_string();
         set.spawn(async move {
             let request = SbiRequest::delete(format!("{SUBSCRIPTIONS_PATH}/{}", sub.id));
@@ -366,6 +466,21 @@ pub async fn unsubscribe_all(subs: &mut NrfSubscriptions, nrf_uri: &str) -> usiz
         }
     }
     removed
+}
+
+/// Drop every held subscription when the NRF has re-registered this AMF since
+/// `seen` (it lost its state, and the subscriptions with it), so the next
+/// [`maintain_all`] creates them afresh. Returns whether it dropped them.
+pub fn forget_if_nrf_lost_us(subs: &mut NrfSubscriptions, seen: &mut u64) -> bool {
+    let now = nextgcore_sbi::heartbeat::reregistration_count();
+    if now == *seen {
+        return false;
+    }
+    *seen = now;
+    for (_, sub) in subs.by_nf_type.drain() {
+        unregister_token(&sub.token);
+    }
+    true
 }
 
 /// The process's subscriptions. Written only by the maintainer task and by
@@ -383,7 +498,8 @@ pub fn spawn_maintainer(amf_instance_id: String) -> Option<tokio::task::JoinHand
         return None;
     }
     Some(tokio::spawn(async move {
-        let notify_uri = notification_uri();
+        let notify_base = notification_uri();
+        let mut seen = nextgcore_sbi::heartbeat::reregistration_count();
         let mut tick = tokio::time::interval(MAINTAIN_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -392,7 +508,12 @@ pub fn spawn_maintainer(amf_instance_id: String) -> Option<tokio::task::JoinHand
                 continue;
             };
             let mut subs = held().lock().await;
-            maintain_all(&mut subs, &nrf_uri, &amf_instance_id, &notify_uri).await;
+            if forget_if_nrf_lost_us(&mut subs, &mut seen) {
+                log::info!(
+                    "The NRF lost this AMF's registration; re-creating its NF status subscriptions"
+                );
+            }
+            maintain_all(&mut subs, &nrf_uri, &amf_instance_id, &notify_base).await;
         }
     }))
 }
@@ -464,8 +585,7 @@ pub fn classify_notification(body: &Value) -> Result<NotifyAction, NotifyError> 
                 Some(list) if !list.is_empty() => list.iter().any(|c| {
                     c.get("path")
                         .and_then(Value::as_str)
-                        .and_then(|p| p.trim_start_matches('/').split('/').next())
-                        .is_none_or(|attr| MONITORED_ATTRIBUTES.contains(&attr))
+                        .is_none_or(|p| MONITORED_ATTRIBUTES.iter().any(|m| pointer_overlaps(m, p)))
                 }),
                 _ => true,
             };
@@ -479,18 +599,147 @@ pub fn classify_notification(body: &Value) -> Result<NotifyAction, NotifyError> 
     }
 }
 
-/// Apply a notification to the process discovery cache. Returns whether an
-/// instance was removed.
-pub async fn apply_notification(action: &NotifyAction) -> bool {
-    match action {
-        NotifyAction::Evict(id) => {
-            let removed = global_context().remove_nf_instance(id).await.is_some();
-            if removed {
-                log::info!("NRF notified a change of NF instance {id}; dropped it from the discovery cache");
-            }
-            removed
+/// Whether a change at `path` touches the location `monitored` points to:
+/// the same location, one below it, or one of its ancestors (a replaced
+/// document or `/nfServices` changes `/nfServices/0/...`). Whole reference
+/// tokens only. A path without its leading `/` is read as a pointer.
+fn pointer_overlaps(monitored: &str, path: &str) -> bool {
+    let path = path.trim_end_matches('/');
+    let path = if path.is_empty() || path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    let covers = |outer: &str, inner: &str| {
+        inner == outer
+            || outer.is_empty()
+            || inner
+                .strip_prefix(outer)
+                .is_some_and(|rest| rest.starts_with('/'))
+    };
+    covers(monitored, &path) || covers(&path, monitored)
+}
+
+/// What [`apply_notification`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotifyOutcome {
+    /// The instance was dropped from the discovery cache.
+    Evicted,
+    /// It was the last cached instance of its type: a re-discovery of that
+    /// type was started, and its answer decides whether the instance stays.
+    Rediscovering,
+    /// The instance was acted on less than [`EVICT_HOLD`] ago.
+    Throttled,
+    /// Not cached (or already expired): nothing to do.
+    NotCached,
+    /// Cached, but not of the NF type the notification's subscription is for.
+    WrongType,
+    /// The notification asked for nothing.
+    Ignored,
+}
+
+/// When each instance was last acted on. Entries older than [`EVICT_HOLD`]
+/// are pruned on every insert, and only cached instances are ever entered, so
+/// it is bounded by the discovery cache.
+fn last_acted() -> &'static std::sync::Mutex<HashMap<String, std::time::Instant>> {
+    static LAST: std::sync::OnceLock<std::sync::Mutex<HashMap<String, std::time::Instant>>> =
+        std::sync::OnceLock::new();
+    LAST.get_or_init(Default::default)
+}
+
+/// The NF types with a notification-driven re-discovery in flight.
+fn rediscovering() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static SET: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(Default::default)
+}
+
+/// Whether `id` may be acted on now; if so, records that it was.
+fn take_slot(id: &str) -> bool {
+    let mut last = last_acted().lock().unwrap_or_else(|p| p.into_inner());
+    let now = std::time::Instant::now();
+    last.retain(|_, at| now.duration_since(*at) < EVICT_HOLD);
+    if last.contains_key(id) {
+        return false;
+    }
+    last.insert(id.to_string(), now);
+    true
+}
+
+/// Apply a notification that arrived for a subscription to `nf_type` to the
+/// process discovery cache. Does no network I/O itself: a re-discovery of the
+/// last instance runs on its own task, bounded by [`NRF_REQUEST_TIMEOUT`], one
+/// per NF type at a time.
+pub async fn apply_notification(nf_type: &str, action: &NotifyAction) -> NotifyOutcome {
+    let NotifyAction::Evict(id) = action else {
+        return NotifyOutcome::Ignored;
+    };
+    let ctx = global_context();
+    let Some(instance) = ctx.get_nf_instance(id).await else {
+        return NotifyOutcome::NotCached;
+    };
+    if instance.nf_type.to_str() != nf_type {
+        log::warn!(
+            "NRF notification for a {nf_type} subscription names {id}, a {} instance; ignored",
+            instance.nf_type.to_str()
+        );
+        return NotifyOutcome::WrongType;
+    }
+    if !take_slot(id) {
+        log::debug!("NRF notification for {id} within {EVICT_HOLD:?} of the last; ignored");
+        return NotifyOutcome::Throttled;
+    }
+    let others = ctx
+        .find_nf_instances_by_type(instance.nf_type)
+        .await
+        .into_iter()
+        .any(|i| i.id != *id);
+    let service = instance.services.first().map(|s| s.name.clone());
+    match (others, service) {
+        // Another instance of the type remains, or this one names no service
+        // to re-discover by (and so could not be selected anyway).
+        (true, _) | (false, None) => {
+            ctx.remove_nf_instance(id).await;
+            log::info!(
+                "NRF notified a change of NF instance {id}; dropped it from the discovery cache"
+            );
+            NotifyOutcome::Evicted
         }
-        NotifyAction::Ignore => false,
+        (false, Some(service)) => {
+            let first = rediscovering()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(nf_type.to_string());
+            if first {
+                let (nf_type, id) = (nf_type.to_string(), id.clone());
+                tokio::spawn(async move {
+                    let found = tokio::time::timeout(
+                        NRF_REQUEST_TIMEOUT,
+                        crate::sbi_path::amf_nrf_discover(&nf_type, &service),
+                    )
+                    .await;
+                    match found {
+                        Ok(Ok(())) => log::info!(
+                            "NRF notified a change of {id}, the last cached {nf_type}; \
+                             re-discovered {nf_type}"
+                        ),
+                        Ok(Err(e)) => log::warn!(
+                            "NRF notified a change of {id}, the last cached {nf_type}; \
+                             re-discovery failed ({e}), so it is kept"
+                        ),
+                        Err(_) => log::warn!(
+                            "NRF notified a change of {id}, the last cached {nf_type}; \
+                             re-discovery timed out, so it is kept"
+                        ),
+                    }
+                    rediscovering()
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(&nf_type);
+                });
+            }
+            NotifyOutcome::Rediscovering
+        }
     }
 }
 
@@ -519,8 +768,15 @@ mod tests {
         let monitored = b["notifCondition"]["monitoredAttributes"]
             .as_array()
             .unwrap();
-        assert!(monitored.contains(&json!("nfServices")));
-        assert!(!monitored.contains(&json!("load")));
+        assert!(monitored.contains(&json!("/nfServices")));
+        assert!(!monitored.contains(&json!("/load")));
+        // TS 29.510 §6.1.6.2.43: RFC 6901 JSON Pointers, not bare names.
+        assert!(
+            monitored
+                .iter()
+                .all(|m| m.as_str().is_some_and(|m| m.starts_with('/'))),
+            "{monitored:?}"
+        );
         // The NRF chooses the validity; the AMF proposes none.
         assert!(b.get("validityTime").is_none());
     }
@@ -547,6 +803,7 @@ mod tests {
             id: "s".into(),
             granted_at: 1_000,
             expires_at: Some(1_000 + 86_400),
+            token: String::new(),
         };
         assert!(!sub.renew_due(1_000));
         assert!(!sub.renew_due(1_000 + 64_799));
@@ -557,6 +814,7 @@ mod tests {
             id: "s".into(),
             granted_at: 0,
             expires_at: Some(100),
+            token: String::new(),
         };
         assert!(!short.renew_due(39));
         assert!(short.renew_due(40));
@@ -564,6 +822,7 @@ mod tests {
             id: "s".into(),
             granted_at: 0,
             expires_at: None,
+            token: String::new(),
         };
         assert!(!forever.renew_due(u64::MAX / 2));
     }
@@ -635,6 +894,26 @@ mod tests {
         );
     }
 
+    /// Change paths are matched against the monitored pointers on whole
+    /// reference tokens, below and above.
+    #[test]
+    fn change_paths_match_the_monitored_pointers() {
+        assert!(pointer_overlaps("/nfStatus", "/nfStatus"));
+        assert!(pointer_overlaps(
+            "/nfServices",
+            "/nfServices/0/ipEndPoints/0/port"
+        ));
+        assert!(pointer_overlaps("/nfServices", "/"));
+        assert!(pointer_overlaps("/nfServices", "nfServices/0"));
+        assert!(!pointer_overlaps("/nfStatus", "/nfStatusX"));
+        assert!(!pointer_overlaps("/fqdn", "/load"));
+        let b = json!({
+            "event": "NF_PROFILE_CHANGED", "nfInstanceUri": uri("smf-1"),
+            "profileChanges": [{ "op": "replace", "path": "/nfStatusExtra" }]
+        });
+        assert_eq!(classify_notification(&b), Ok(NotifyAction::Ignore));
+    }
+
     #[test]
     fn a_registration_is_ignored() {
         let b = json!({ "event": "NF_REGISTERED", "nfInstanceUri": uri("smf-2") });
@@ -679,8 +958,9 @@ mod tests {
         i
     }
 
-    fn notify(body: Value) -> SbiRequest {
-        SbiRequest::post(NOTIFY_PATH).with_body(body.to_string(), "application/json")
+    fn notify_on(token: &str, body: Value) -> SbiRequest {
+        SbiRequest::post(format!("{NOTIFY_PATH}/{token}"))
+            .with_body(body.to_string(), "application/json")
     }
 
     /// Through the router: a deregistration drops exactly the named
@@ -688,9 +968,13 @@ mod tests {
     #[tokio::test]
     async fn the_callback_evicts_the_named_instance_and_takes_nothing_from_the_body() {
         let _cache = crate::sbi_path::nf_cache_test_lock().lock().await;
+        let token = register_token("SMF");
+        let notify = |body| notify_on(&token, body);
         let ctx = global_context();
         ctx.add_nf_instance(cached("smf-668-gone", 40001)).await;
         ctx.add_nf_instance(cached("smf-668-kept", 40002)).await;
+        // A third, so the last eviction below is never of the last SMF.
+        ctx.add_nf_instance(cached("smf-668-third", 40003)).await;
 
         let resp = crate::namf_server::namf_request_handler(notify(json!({
             "event": "NF_DEREGISTERED",
@@ -733,22 +1017,129 @@ mod tests {
         .await;
         assert_eq!(resp.status, 204);
         assert!(ctx.get_nf_instance("smf-668-kept").await.is_none());
+        ctx.remove_nf_instance("smf-668-third").await;
+        unregister_token(&token);
+    }
+
+    /// #940 M2: only a token the AMF holds can evict, and only an instance of
+    /// that subscription's type. The pre-#940 tokenless route is gone.
+    #[tokio::test]
+    async fn an_unknown_token_or_another_types_instance_evicts_nothing() {
+        let _cache = crate::sbi_path::nf_cache_test_lock().lock().await;
+        let ctx = global_context();
+        ctx.add_nf_instance(cached("smf-940-a", 40011)).await;
+        ctx.add_nf_instance(cached("smf-940-b", 40012)).await;
+        let dereg = json!({ "event": "NF_DEREGISTERED", "nfInstanceUri": uri("smf-940-a") });
+
+        let forged = uuid::Uuid::new_v4().simple().to_string();
+        let resp =
+            crate::namf_server::namf_request_handler(notify_on(&forged, dereg.clone())).await;
+        assert_eq!(resp.status, 404);
+        let resp = crate::namf_server::namf_request_handler(
+            SbiRequest::post(NOTIFY_PATH).with_body(dereg.to_string(), "application/json"),
+        )
+        .await;
+        assert_eq!(resp.status, 404);
+        assert!(ctx.get_nf_instance("smf-940-a").await.is_some());
+
+        // A real token, but for the AUSF subscription: an SMF is not its to evict.
+        let ausf = register_token("AUSF");
+        let resp = crate::namf_server::namf_request_handler(notify_on(&ausf, dereg.clone())).await;
+        assert_eq!(resp.status, 204);
+        assert!(ctx.get_nf_instance("smf-940-a").await.is_some());
+        assert_eq!(
+            apply_notification("AUSF", &NotifyAction::Evict("smf-940-a".into())).await,
+            NotifyOutcome::WrongType
+        );
+
+        // A dropped subscription's token stops working.
+        let smf = register_token("SMF");
+        unregister_token(&smf);
+        let resp = crate::namf_server::namf_request_handler(notify_on(&smf, dereg)).await;
+        assert_eq!(resp.status, 404);
+        assert!(ctx.get_nf_instance("smf-940-a").await.is_some());
+
+        unregister_token(&ausf);
+        ctx.remove_nf_instance("smf-940-a").await;
+        ctx.remove_nf_instance("smf-940-b").await;
+    }
+
+    /// #940 M2: a burst of notifications for one instance acts once. An
+    /// instance re-cached by a discovery right after is not evicted again
+    /// within the hold.
+    #[tokio::test]
+    async fn a_burst_of_notifications_evicts_once() {
+        let _cache = crate::sbi_path::nf_cache_test_lock().lock().await;
+        let ctx = global_context();
+        ctx.add_nf_instance(cached("smf-940-burst", 40021)).await;
+        ctx.add_nf_instance(cached("smf-940-other", 40022)).await;
+        let evict = NotifyAction::Evict("smf-940-burst".into());
+
+        assert_eq!(
+            apply_notification("SMF", &evict).await,
+            NotifyOutcome::Evicted
+        );
+        // Re-discovered straight away (the next request did a discovery).
+        ctx.add_nf_instance(cached("smf-940-burst", 40021)).await;
+        for _ in 0..50 {
+            assert_eq!(
+                apply_notification("SMF", &evict).await,
+                NotifyOutcome::Throttled
+            );
+        }
+        assert!(ctx.get_nf_instance("smf-940-burst").await.is_some());
+
+        ctx.remove_nf_instance("smf-940-burst").await;
+        ctx.remove_nf_instance("smf-940-other").await;
+    }
+
+    /// The re-registration count moving drops every held subscription and
+    /// its token, so the next pass subscribes afresh.
+    #[test]
+    fn a_reregistration_drops_the_held_subscriptions() {
+        let token = register_token("SMF");
+        let mut subs = NrfSubscriptions::default();
+        subs.by_nf_type.insert(
+            "SMF".into(),
+            NrfSubscription {
+                id: "s".into(),
+                granted_at: 0,
+                expires_at: None,
+                token: token.clone(),
+            },
+        );
+        let now = nextgcore_sbi::heartbeat::reregistration_count();
+        let mut seen = now;
+        assert!(!forget_if_nrf_lost_us(&mut subs, &mut seen));
+        assert_eq!(subs.by_nf_type.len(), 1);
+        let mut seen = now.wrapping_sub(1);
+        assert!(forget_if_nrf_lost_us(&mut subs, &mut seen));
+        assert!(subs.by_nf_type.is_empty());
+        assert_eq!(seen, now);
+        assert_eq!(token_nf_type(&token), None);
     }
 
     #[tokio::test]
     async fn the_callback_refuses_a_body_without_its_mandatory_members() {
-        let resp =
-            crate::namf_server::namf_request_handler(notify(json!({ "nfInstanceUri": uri("x") })))
-                .await;
+        let token = register_token("SMF");
+        let resp = crate::namf_server::namf_request_handler(notify_on(
+            &token,
+            json!({ "nfInstanceUri": uri("x") }),
+        ))
+        .await;
         assert_eq!(resp.status, 400);
-        let resp =
-            crate::namf_server::namf_request_handler(notify(json!({ "event": "NF_DEREGISTERED" })))
-                .await;
+        let resp = crate::namf_server::namf_request_handler(notify_on(
+            &token,
+            json!({ "event": "NF_DEREGISTERED" }),
+        ))
+        .await;
         assert_eq!(resp.status, 400);
         let resp = crate::namf_server::namf_request_handler(
-            SbiRequest::post(NOTIFY_PATH).with_body("not json", "application/json"),
+            SbiRequest::post(format!("{NOTIFY_PATH}/{token}"))
+                .with_body("not json", "application/json"),
         )
         .await;
         assert_eq!(resp.status, 400);
+        unregister_token(&token);
     }
 }
