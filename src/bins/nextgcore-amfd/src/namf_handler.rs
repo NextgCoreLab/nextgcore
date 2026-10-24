@@ -881,6 +881,26 @@ pub(crate) fn initiate_paging_for_idle_ue(
     );
 }
 
+/// Page a CM-IDLE UE for an LMF's positioning transfer (#1087, TS 23.273: LPP to
+/// the UE, UE-associated NRPPa to its gNB). The page carries no N1 and no SM N2:
+/// the NGAP task holds the positioning payloads and delivers them once the UE is
+/// connected. Returns the transfer's `Location`, as [`page_idle_ue_for_n1`] does.
+pub fn page_idle_ue_for_positioning(amf_ue: &AmfUe, failure_notify_uri: Option<&str>) -> String {
+    initiate_paging_for_idle_ue(
+        amf_ue,
+        None,
+        None,
+        None,
+        PagedN2::Setup,
+        None,
+        failure_notify_uri,
+    );
+    format!(
+        "/namf-comm/v1/ue-contexts/{}/n1-n2-messages",
+        amf_ue.supi.as_deref().unwrap_or("unknown")
+    )
+}
+
 /// Page a CM-IDLE UE for an N1 message that belongs to no PDU session -- a
 /// UE-policy (UPDP) delivery from the PCF (#540, TS 23.502 §4.2.3.3 step 3a) --
 /// and keep it for delivery, in `container_type`, once the Service Request

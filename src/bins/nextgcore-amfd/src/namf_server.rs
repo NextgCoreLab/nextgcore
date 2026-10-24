@@ -441,7 +441,46 @@ fn ue_cm_idle(ue: &AmfUe) -> bool {
     }
 }
 
-/// CM state check: the UE is CM-CONNECTED when it has a live RAN UE context
+/// Whether the UE has an NG connection now, i.e. is CM-CONNECTED (#1087).
+///
+/// Answered from the live NGAP record (#341), which the NGAP task binds and
+/// unbinds on every path that changes the UE's NG connection: an Initial UE
+/// Message, a Service Request or registration from CM-IDLE, a handover or path
+/// switch, an AN release, an NG Reset, an association loss. Each one sets the
+/// record's `cm_idle`, association and RAN UE NGAP ID.
+///
+/// The pool's `RanUe` is consulted only for a UE with no NGAP record (a context
+/// created over Namf, e.g. by RelocateUEContext). The live path never creates one,
+/// and `AmfUe.ran_ue_id` on a live record is always unset. Before #1087 every
+/// reader below gated on that, so a CM-CONNECTED UE looked unreachable: LPP,
+/// UE-associated NRPPa and UPDP transfers were refused 504 UE_NOT_REACHABLE, and
+/// the reachability, connectivity and location answers said IDLE.
+fn ue_ng_connected(ue: &AmfUe) -> bool {
+    let ctx = amf_self();
+    let Ok(guard) = ctx.read() else {
+        return false;
+    };
+    match guard.ue_store().get(ue.id) {
+        Some(state) => !state.is_cm_idle(),
+        None => {
+            drop(guard);
+            ue_ran_context(ue).is_some()
+        }
+    }
+}
+
+/// Whether the UE can be paged: its live NGAP record says registered and CM-IDLE,
+/// so it holds the 5G-S-TMSI and the registration area paging needs.
+fn ue_pageable(ue: &AmfUe) -> bool {
+    amf_self()
+        .read()
+        .ok()
+        .and_then(|g| g.ue_store().get(ue.id))
+        .is_some_and(|state| state.is_registered() && state.is_cm_idle())
+}
+
+/// The pool's RAN UE context of a UE with no live NGAP record (see
+/// [`ue_ng_connected`]). Not a CM state check for a live UE.
 fn ue_ran_context(ue: &AmfUe) -> Option<RanUe> {
     if ue.ran_ue_id == NEXTGCORE_INVALID_POOL_ID {
         return None;
@@ -1618,11 +1657,11 @@ fn build_immediate_reports(
                 "rmInfoList": [{ "rmState": "REGISTERED", "accessType": "3GPP_ACCESS" }]
             }),
             "REACHABILITY_REPORT" => {
-                let reachable = ue_ran_context(&ue).is_some();
+                let reachable = ue_ng_connected(&ue);
                 json!({ "reachability": if reachable { "REACHABLE" } else { "UNREACHABLE" } })
             }
             "CONNECTIVITY_STATE_REPORT" => {
-                let connected = ue_ran_context(&ue).is_some();
+                let connected = ue_ng_connected(&ue);
                 json!({
                     "cmInfoList": [{
                         "cmState": if connected { "CONNECTED" } else { "IDLE" },
@@ -3443,9 +3482,16 @@ fn try_positioning_relay(
         return None; // not a positioning transfer — fall through to SM handling
     }
 
-    // Both LPP→UE and UE-associated NRPPa→gNB require the UE to be CM-CONNECTED.
-    if ue_ran_context(ue).is_none() {
-        return Some(ue_not_reachable_error(ue_context_id, None));
+    // Both LPP→UE and UE-associated NRPPa→gNB need an NG connection. TS 29.518
+    // §5.2.2.3.1: 504 UE_NOT_REACHABLE is for a UE that is not reachable, not for
+    // one that is merely CM-IDLE. A CM-IDLE UE is paged (202
+    // ATTEMPTING_TO_REACH_UE, TS 23.502 §4.2.3.3). Its LPP is delivered after
+    // the Service Request, as the UPDP is, and its NRPPa is held by the NGAP task
+    // until the UE is connected (#1087).
+    let failure_uri = body.get("n1n2FailureTxfNotifURI").and_then(Value::as_str);
+    let connected = ue_ng_connected(ue);
+    if !connected && !ue_pageable(ue) {
+        return Some(ue_not_reachable_error(ue_context_id, failure_uri));
     }
 
     // Fallback correlation record (TS 29.518 N1N2MessageTransferReqData
@@ -3525,6 +3571,33 @@ fn try_positioning_relay(
         });
     }
 
+    if !connected {
+        // Paged. The downlinks are enqueued as usual, and the NGAP task holds them
+        // while the UE is being paged, then delivers them once its Service Request
+        // has connected it. A page already running (for another transfer) is not
+        // replaced: it brings the UE back just the same.
+        let paging = amf_self()
+            .read()
+            .ok()
+            .is_some_and(|g| g.paging_find(ue.id).is_some());
+        let location = if paging {
+            format!("/namf-comm/v1/ue-contexts/{ue_context_id}/n1-n2-messages")
+        } else {
+            crate::namf_handler::page_idle_ue_for_positioning(ue, failure_uri)
+        };
+        if let Ok(context) = amf_self().read() {
+            for dl in downlinks {
+                context.positioning_dl_add(dl);
+            }
+        }
+        log::info!("[{ue_context_id}] LCS: UE is CM-IDLE, paging it for the positioning transfer");
+        let body = json!({ "cause": "ATTEMPTING_TO_REACH_UE" });
+        return Some(match SbiResponse::with_status(202).with_json_body(&body) {
+            Ok(resp) => resp.with_header("location", location),
+            Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
+        });
+    }
+
     // Enqueue for NGAP-task egress (TS 23.273). The pump resolves the serving
     // SCTP association from its per-UE state and delivers over N2/N1.
     if let Ok(context) = amf_self().read() {
@@ -3590,16 +3663,11 @@ fn try_ue_policy_relay(
     // and the UPDP is delivered after its Service Request (#540, TS 23.502
     // §4.2.3.3 step 3a, TS 29.518 §5.2.2.3.1: 202 ATTEMPTING_TO_REACH_UE);
     // before this the PCF got 504 and the policy never reached the UE.
-    if ue_ran_context(ue).is_none() {
+    if !ue_ng_connected(ue) {
         // Paging needs a registered UE whose NGAP record says CM-IDLE (it holds
         // the 5G-S-TMSI and registration area); a UE with no such record cannot
         // be paged and stays UE_NOT_REACHABLE.
-        let registered_idle = amf_self()
-            .read()
-            .ok()
-            .and_then(|g| g.ue_store().get(ue.id))
-            .is_some_and(|state| state.is_cm_idle());
-        if !registered_idle {
+        if !ue_pageable(ue) {
             return Some(ue_not_reachable_error(ue_context_id, failure_uri));
         }
         let location = crate::namf_handler::page_idle_ue_for_n1(
@@ -3749,7 +3817,7 @@ pub fn handle_n1_n2_message_transfer_request(
     // instead of silently faking success (the 200 is kept this wave for
     // backward compatibility — the full fail-closed fix is WS-A scope).
     let Some(psi) = pdu_session_id else {
-        return if ran_ue.is_some() {
+        return if ue_ng_connected(&ue) {
             let class = body
                 .pointer("/n1MessageContainer/n1MessageClass")
                 .and_then(Value::as_str)
@@ -5327,7 +5395,7 @@ fn handle_enable_ue_reachability(ue_context_id: &str, request: &SbiRequest) -> S
         }
     }
 
-    if ue_ran_context(&ue).is_some() {
+    if ue_ng_connected(&ue) {
         let response_body = json!({ "reachability": "REACHABLE" });
         match SbiResponse::ok().with_json_body(&response_body) {
             Ok(resp) => resp,
@@ -5356,7 +5424,7 @@ fn handle_mt_ue_context_info(ue_context_id: &str, request: &SbiRequest) -> SbiRe
         return mandatory_ie_missing("info-class");
     }
 
-    let connected = ue_ran_context(&ue).is_some();
+    let connected = ue_ng_connected(&ue);
     let mut response_body = json!({
         "accessType": "3GPP_ACCESS",
         "ratType": "NR",
@@ -5540,7 +5608,7 @@ fn handle_provide_location_info(ue_context_id: &str, request: &SbiRequest) -> Sb
     }
     // `ratType` only when the UE is genuinely attached over NR. `reqRatType` is a
     // request for it, not a licence to assert one for a UE with no live connection.
-    if ue_ran_context(&ue).is_some() {
+    if ue_ng_connected(&ue) {
         response_body["ratType"] = json!("NR");
     }
     // `timezone` is deliberately OMITTED. The AMF never learns a UE time zone —
@@ -7141,14 +7209,10 @@ mod tests {
         );
     }
 
-    /// Serializes the two UPDP tests that DRAIN the shared global
-    /// positioning_dl_queue (drains are destructive; other relay tests only
-    /// enqueue and never read the queue, so they are unaffected).
-    static UPDP_QUEUE_TEST_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
-        std::sync::OnceLock::new();
-
+    /// The tests here that DRAIN the shared positioning downlink queue hold the
+    /// crate-wide lock beside it (#1087: the NGAP pump tests drain it too).
     fn updp_queue_test_lock() -> &'static tokio::sync::Mutex<()> {
-        UPDP_QUEUE_TEST_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+        &crate::test_support::POSITIONING_DL_LOCK
     }
 
     /// Drain the global downlink queue, keep the items for `ue_id`, re-add
