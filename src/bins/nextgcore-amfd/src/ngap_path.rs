@@ -747,8 +747,11 @@ impl UeNasContext {
             amf_ue.use_nextgcore_nas_security,
         );
         ctx.suci = amf_ue.suci.clone().unwrap_or_default();
-        // A record published without a RAN UE context has no N1 connection.
-        ctx.cm_idle = amf_ue.ran_ue_id == crate::context::NEXTGCORE_INVALID_POOL_ID;
+        // A record published without a RAN UE context has no N1 connection, and
+        // neither has one published with no association (#1089 review: a
+        // CreateUEContext target, which no gNB has signalled for yet).
+        ctx.cm_idle =
+            amf_ue.ran_ue_id == crate::context::NEXTGCORE_INVALID_POOL_ID || association_id == 0;
         ctx.amf_ue = amf_ue;
         ctx.registered = true;
         ctx
@@ -770,6 +773,18 @@ impl UeNasContext {
     /// Complete, cleared when the UE comes back with a Service Request).
     pub(crate) fn is_cm_idle(&self) -> bool {
         self.cm_idle
+    }
+
+    /// Whether the UE is registered: the record a CM-IDLE UE is paged by (#1087).
+    pub(crate) fn is_registered(&self) -> bool {
+        self.registered
+    }
+
+    /// Whether the record names an NG association at all (#1089 review). A context
+    /// created over Namf for a UE no gNB has signalled for yet has none: it is
+    /// neither connected nor pageable.
+    pub(crate) fn is_bound(&self) -> bool {
+        self.association_id != 0
     }
 
     /// Create a per-UE NAS context. `use_nextgcore_nas_security` is the Wave-6
@@ -1029,6 +1044,9 @@ pub struct NgapServer {
     /// PDU Session Establishment Requests waiting for them. See
     /// [`NgapServer::process_supersede_barriers`].
     supersede_barriers: HashMap<u64, SupersedeBarrier>,
+    /// #1087: positioning / UE-policy downlinks for a UE that is CM-IDLE and being
+    /// paged, held until its Service Request connects it.
+    held_positioning: Vec<crate::context::PendingPositioningDl>,
     /// How long a [`SupersedeBarrier`] holds establishments at most;
     /// [`SUPERSEDE_RELEASE_BARRIER`] outside tests.
     supersede_barrier_max: Duration,
@@ -1307,6 +1325,7 @@ impl NgapServer {
             pending_establishments: HashMap::new(),
             racs_assigns: HashMap::new(),
             supersede_barriers: HashMap::new(),
+            held_positioning: Vec::new(),
             supersede_barrier_max: SUPERSEDE_RELEASE_BARRIER,
             sbi_offload: crate::sbi_offload::SbiOffload::new(MAX_OFFLOADED_SBI),
             contextless_ue_ids: std::collections::VecDeque::new(),
@@ -6283,6 +6302,12 @@ impl NgapServer {
     /// arrives under a fresh id (#518, #609).
     fn rekey_ue_sessions(&mut self, old_id: u64, new_id: u64) {
         self.sbi_offload.rekey_ue(old_id, new_id);
+        // #1087: downlinks held for the paged UE follow it to its new connection.
+        for held in &mut self.held_positioning {
+            if held.amf_ue_ngap_id == old_id {
+                held.amf_ue_ngap_id = new_id;
+            }
+        }
         // #778 follow-up: the old ID's NG connection is gone, so what was active on it
         // is not active on the new one; each session the new connection sets up marks
         // itself again.
@@ -10605,13 +10630,15 @@ impl NgapServer {
             };
             guard.positioning_dl_drain()
         };
-        for item in pending {
+        let mut pending_all = std::mem::take(&mut self.held_positioning);
+        pending_all.extend(pending);
+        for item in pending_all {
             // Resolve the serving association + RAN-UE-NGAP-ID (Copy values, so
             // the immutable borrow is released before the &mut send calls).
-            let Some((association_id, ran_ue_ngap_id)) = self
+            let Some((association_id, ran_ue_ngap_id, idle)) = self
                 .ue_auth_state
                 .get(item.amf_ue_ngap_id)
-                .map(|s| (s.association_id, s.ran_ue_ngap_id))
+                .map(|s| (s.association_id, s.ran_ue_ngap_id, s.is_cm_idle()))
             else {
                 log::warn!(
                     "LCS positioning DL for UE {} dropped: no live NGAP context",
@@ -10619,6 +10646,26 @@ impl NgapServer {
                 );
                 continue;
             };
+            // #1087: a CM-IDLE UE has no NG connection to send on; its stored
+            // association and RAN UE NGAP ID name the released one. While it is
+            // paged the downlink waits for its Service Request; otherwise it is
+            // dropped (the page ended unanswered).
+            if idle {
+                let paged = ctx
+                    .read()
+                    .ok()
+                    .is_some_and(|g| g.paging_find(item.amf_ue_ngap_id).is_some());
+                if paged {
+                    self.held_positioning.push(item);
+                } else {
+                    log::warn!(
+                        "LCS positioning DL for UE {} dropped: the UE is CM-IDLE and not \
+                         being paged",
+                        item.amf_ue_ngap_id
+                    );
+                }
+                continue;
+            }
             match item.kind {
                 crate::context::PositioningDlKind::NrppaToGnb {
                     routing_id,
@@ -19258,6 +19305,7 @@ mod tests {
     /// Handler-level tests asserting what amfd SENDS (#760, ...), in their own file.
     mod handler_tests;
     mod initial_registration_tests;
+    mod positioning_reach_tests;
     mod racs_handler_tests;
     mod racs_mapping_tests;
     mod reject_path_tests;
