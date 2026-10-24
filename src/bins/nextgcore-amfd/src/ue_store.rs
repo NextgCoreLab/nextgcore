@@ -231,6 +231,22 @@ impl<T: Clone + UeIdentity> UeStore<T> {
             .map(|(id, ue)| (*id, ue.clone()))
     }
 
+    /// Every record with this SUPI, sorted by id.
+    ///
+    /// For the one place that has to find the ties [`UeStore::find_by_supi`] cannot
+    /// see (#774): while an initial registration is being authenticated, the
+    /// subscriber's earlier context can still be held under another id.
+    pub fn find_all_by_supi(&self, supi: &str) -> Vec<(u64, T)> {
+        let mut all: Vec<(u64, T)> = self
+            .read()
+            .iter()
+            .filter(|(_, ue)| ue.amf_ue().supi.as_deref() == Some(supi))
+            .map(|(id, ue)| (*id, ue.clone()))
+            .collect();
+        all.sort_unstable_by_key(|(id, _)| *id);
+        all
+    }
+
     /// The AMF-UE-NGAP-ID and record of the UE holding this 5G-GUTI.
     pub fn find_by_guti(&self, guti: &Guti5gs) -> Option<(u64, T)> {
         self.read()
