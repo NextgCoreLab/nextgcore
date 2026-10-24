@@ -119,6 +119,16 @@ impl DiameterSession {
         client: DiameterClient,
         options: SessionOptions,
     ) -> DiameterResult<(Self, tokio::task::JoinHandle<()>)> {
+        Self::start_session(client, options, true)
+    }
+
+    /// [`Self::start_with`]; `user_timeout` false leaves the socket's
+    /// TCP_USER_TIMEOUT unset, so a test can prove the Tw write bound on its own.
+    fn start_session(
+        client: DiameterClient,
+        options: SessionOptions,
+        user_timeout: bool,
+    ) -> DiameterResult<(Self, tokio::task::JoinHandle<()>)> {
         let tw = options.tw;
         let request_timeout = Duration::from_secs(client.config().request_timeout as u64);
         let (hop_seed, end_seed) = client.identifier_seeds();
@@ -135,8 +145,12 @@ impl DiameterSession {
         // #729 review B1: unacknowledged data may not hold the socket longer than
         // 2 x Tw (TCP_USER_TIMEOUT), so a vanished peer fails the connection at
         // the kernel too, whatever is queued.
-        if let Err(e) = peer.set_user_timeout(tw * 2) {
-            log::warn!("Diameter: TCP_USER_TIMEOUT not set ({e}); writes are bounded by Tw only");
+        if user_timeout {
+            if let Err(e) = peer.set_user_timeout(tw * 2) {
+                log::warn!(
+                    "Diameter: TCP_USER_TIMEOUT not set ({e}); writes are bounded by Tw only"
+                );
+            }
         }
         let handle = tokio::spawn(run_session(
             peer,
@@ -354,6 +368,54 @@ async fn run_session(
                     continue;
                 }
 
+                // RFC 3539 §3.4.1 REOPEN, "Receive non-DWA: Throwaway()": an
+                // application message on a connection that has not yet proved
+                // itself is not delivered (#816 review m-f). Delivered, its
+                // answer would be held behind the REOPEN gate on `outbound`.
+                // A REQUEST is not dropped silently, though (#899 review): it is
+                // answered DIAMETER_TOO_BUSY (3004, RFC 6733 §7.1.3: a specific
+                // server was requested and cannot provide the service now), so
+                // the sender keeps it and retries; a silent drop leaves the
+                // sender to its own retransmission timer, and hssd's runs out
+                // after three attempts 30 s apart. REOPEN here normally lasts
+                // three watchdog round trips (each DWA asks for the next proof
+                // at once), but can last a Tw or more against a slow peer.
+                // Base-protocol messages (DWR, DPR) still reach the state
+                // machine, which must answer them.
+                if !watchdog.carries_traffic()
+                    && msg.header.application_id != crate::message::BASE_APPLICATION_ID
+                {
+                    REOPEN_DISCARDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if !msg.header.is_request() {
+                        log::info!(
+                            "Diameter answer (command {}) from {:?} discarded: the connection is \
+                             in REOPEN (RFC 3539 §3.4.1)",
+                            msg.header.command_code,
+                            peer.remote_host()
+                        );
+                        continue;
+                    }
+                    log::warn!(
+                        "Diameter request (command {}) from {:?} received in REOPEN (RFC 3539 \
+                         §3.4.1): answered DIAMETER_TOO_BUSY so it is retried",
+                        msg.header.command_code,
+                        peer.remote_host()
+                    );
+                    let busy = peer.protocol_error_answer(&msg, DIAMETER_TOO_BUSY);
+                    match tokio::time::timeout(write_bound, peer.send_message(&busy)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            log::warn!("Diameter TOO_BUSY answer not sent: {e}");
+                            break;
+                        }
+                        Err(_) => {
+                            log::warn!("Diameter TOO_BUSY answer stalled for Tw; closing");
+                            break;
+                        }
+                    }
+                    continue;
+                }
+
                 // Answers are routed here rather than through the state machine:
                 // an application answer carries no base-protocol meaning, and
                 // matching it now keeps the hot path short.
@@ -429,6 +491,19 @@ async fn run_session(
     // Without this, a connection loss would stall every in-flight request for
     // the full request_timeout.
     pending.lock().await.clear();
+}
+
+/// RFC 6733 §7.1.3 DIAMETER_TOO_BUSY.
+const DIAMETER_TOO_BUSY: u32 = 3004;
+
+/// Application messages received in REOPEN and not delivered (#899 review).
+static REOPEN_DISCARDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many application messages sessions of this process have not delivered
+/// because they arrived in REOPEN (each request among them was answered
+/// DIAMETER_TOO_BUSY). For an operator's metrics.
+pub fn reopen_discards() -> u64 {
+    REOPEN_DISCARDS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// RFC 3539 §3.4.1: "Tw MUST NOT be set lower than 6 seconds".
@@ -535,7 +610,9 @@ impl Watchdog {
             WatchdogState::Reopen => {
                 if dwa {
                     self.dwr_outstanding = false;
-                    self.num_dwa = self.num_dwa.max(0) + 1;
+                    // RFC 3539 §3.4.1: NumDWA++, so a DWA after the grace
+                    // expiry (NumDWA = -1) brings it to 0: three more are needed.
+                    self.num_dwa += 1;
                     if self.num_dwa >= REOPEN_DWA {
                         log::info!(
                             "Diameter connection answered {REOPEN_DWA} watchdogs: back in \
@@ -1139,6 +1216,46 @@ mod tests {
         );
     }
 
+    /// #816 review m-c: the Tw write bound alone ends the session. The socket's
+    /// TCP_USER_TIMEOUT is left unset, so nothing else can: on loopback the peer's
+    /// stack keeps acknowledging zero-window probes and an unbounded write would
+    /// wait forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_tw_write_bound_alone_ends_a_session_whose_peer_stops_reading() {
+        let listener = DiameterListener::bind(([127, 0, 0, 1], 0).into())
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _hss = spawn_never_reading_hss(listener).await;
+        let mut client = DiameterClient::new(config("mme.example.com", 30), addr);
+        client.connect().await.unwrap();
+        let tw = Duration::from_millis(200);
+        let (session, reader) = DiameterSession::start_session(
+            client,
+            SessionOptions {
+                tw,
+                start: WatchdogStart::Okay,
+            },
+            false,
+        )
+        .unwrap();
+        // Enough to fill the loopback socket buffers (a few MiB) and no more.
+        let big = bytes::Bytes::from(vec![0x5a; 512 * 1024]);
+        for _ in 0..16 {
+            let session = session.clone();
+            let big = big.clone();
+            tokio::spawn(async move {
+                let mut air = DiameterMessage::new_request(AIR, S6A_APP);
+                air.add_avp(Avp::mandatory(1, AvpData::OctetString(big)));
+                let _ = session.send_request(&air).await;
+            });
+        }
+        tokio::time::timeout(Duration::from_secs(3), reader)
+            .await
+            .expect("the write bound ends the session with no TCP_USER_TIMEOUT")
+            .unwrap();
+    }
+
     /// #729 review m4: a DWA whose hop-by-hop id equals an application
     /// request's never reaches that request's waiter, which gets its own answer.
     #[tokio::test]
@@ -1235,6 +1352,112 @@ mod tests {
                 >= 3,
             "three watchdogs before any application traffic: {order:?}"
         );
+    }
+
+    /// #816 review m-d, RFC 3539 §3.4.1 REOPEN: NumDWA++. A DWA after the grace
+    /// expiry set NumDWA to -1 brings it to 0, so three MORE answers are needed;
+    /// before the fix the first one counted as 1 and the connection returned to
+    /// service on two.
+    #[tokio::test]
+    async fn a_reopen_dwa_after_the_grace_expiry_counts_from_minus_one() {
+        let mut w = Watchdog::new(Duration::from_millis(100), WatchdogStart::Reopen);
+        w.sent();
+        assert_eq!(w.expired(), TimerAction::Wait, "the grace expiry");
+        assert_eq!(w.num_dwa, -1);
+        w.received(true);
+        assert_eq!(w.num_dwa, 0);
+        for _ in 0..2 {
+            w.sent();
+            w.received(true);
+        }
+        assert!(
+            !w.carries_traffic(),
+            "two answers since the grace are not three"
+        );
+        w.sent();
+        w.received(true);
+        assert!(w.carries_traffic(), "the third returns it to service");
+    }
+
+    /// #816 review m-f / #899 review, RFC 3539 §3.4.1 REOPEN: an application
+    /// request arriving before the connection has proved itself is not handed to
+    /// the application. It is answered DIAMETER_TOO_BUSY (3004, E bit, its
+    /// Session-Id echoed, RFC 6733 §7.1.3), so the sender keeps it, and its retry
+    /// once the connection is in service is delivered.
+    #[tokio::test]
+    async fn an_application_request_during_reopen_is_answered_too_busy_and_its_retry_delivered() {
+        const IDR: u32 = 319;
+        let listener = DiameterListener::bind(([127, 0, 0, 1], 0).into())
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cfg = config("hss.example.com", 30);
+        let (go_tx, mut go_rx) = mpsc::unbounded_channel::<()>();
+        let (ans_tx, mut ans_rx) = mpsc::unbounded_channel::<DiameterMessage>();
+        let idr = || {
+            let mut idr = DiameterMessage::new_request(IDR, S6A_APP);
+            idr.header.hop_by_hop_id = 0x816_0001;
+            idr.add_avp(Avp::mandatory(263, AvpData::Utf8String("hss;899;1".into())));
+            idr
+        };
+        let _hss = tokio::spawn(async move {
+            let transport = listener.accept().await.unwrap();
+            let mut peer = DiameterPeer::new_responder(transport, &cfg);
+            peer.start().await.unwrap();
+            let _cer = peer.next_event().await.unwrap();
+            peer.send_message(&idr()).await.unwrap();
+            loop {
+                tokio::select! {
+                    msg = peer.recv_raw() => {
+                        let Ok(msg) = msg else { break };
+                        if msg.header.command_code == AIR {
+                            let mut answer = DiameterMessage::new_answer(&msg);
+                            answer.add_avp(Avp::mandatory(268, AvpData::Unsigned32(2001)));
+                            peer.send_message(&answer).await.unwrap();
+                        } else if msg.header.command_code == IDR && msg.header.is_answer() {
+                            let _ = ans_tx.send(msg);
+                        } else if peer.handle_message(msg).await.is_err() {
+                            break;
+                        }
+                    }
+                    // The HSS retries the request it was told to retry.
+                    Some(()) = go_rx.recv() => {
+                        peer.send_message(&idr()).await.unwrap();
+                    }
+                }
+            }
+        });
+        let discards = reopen_discards();
+        let mut client = DiameterClient::new(config("mme.example.com", 5), addr);
+        client.connect().await.unwrap();
+        let (session, _reader) = DiameterSession::start_with(
+            client,
+            SessionOptions {
+                tw: Duration::from_millis(200),
+                start: WatchdogStart::Reopen,
+            },
+        )
+        .unwrap();
+        let busy = tokio::time::timeout(Duration::from_secs(2), ans_rx.recv())
+            .await
+            .expect("the request in REOPEN is answered")
+            .unwrap();
+        assert_eq!(busy.result_code(), Some(DIAMETER_TOO_BUSY));
+        assert!(busy.header.is_error(), "a protocol error: the E bit");
+        assert_eq!(busy.session_id(), Some("hss;899;1"));
+        assert_eq!(busy.header.hop_by_hop_id, 0x816_0001);
+        assert!(reopen_discards() > discards, "counted");
+        session
+            .send_request(&DiameterMessage::new_request(AIR, S6A_APP))
+            .await
+            .expect("in service after three watchdogs");
+        go_tx.send(()).unwrap();
+        let delivered = session
+            .recv_inbound_request(Duration::from_secs(2))
+            .await
+            .unwrap()
+            .expect("the retry, in service, is delivered");
+        assert_eq!(delivered.session_id(), Some("hss;899;1"));
     }
 
     /// RFC 3539 §3.4.1 REOPEN: a re-established connection whose peer does not
