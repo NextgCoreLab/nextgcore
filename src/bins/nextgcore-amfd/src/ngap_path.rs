@@ -22968,10 +22968,11 @@ mod tests {
             "both Acknowledges"
         );
         assert!(ngap.ue_auth_state.get(b).expect("kept").is_cm_idle());
-        // The SMF call is still hanging: it holds its permit. Waited for rather than read
-        // once, because the spawned job takes the permit only when it is first polled,
-        // which under load can be after the resets above return.
-        until_in_flight(&ngap, 1).await;
+        assert_eq!(
+            ngap.sbi_offload.in_flight(),
+            1,
+            "the SMF call is still hanging"
+        );
         holder.abort();
         for id in [a, b] {
             ngap.ue_auth_state.remove(id);
