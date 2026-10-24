@@ -192,7 +192,7 @@ pub struct EpsGuti {
 }
 
 /// IP address
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IpAddr {
     /// IPv4 address
     pub ipv4: Option<[u8; 4]>,
@@ -1105,6 +1105,10 @@ pub struct MmeUe {
     /// running (the eNB UE context not yet released): the UE is paged once the
     /// release completes (#961 review).
     pub ddn_pending_after_release: bool,
+    /// When this UE's recent S1 releases for a Serving-GW-released S1-U started
+    /// (#1023 review): bounded per window, so a path that stays failed does not
+    /// cycle the UE through release and paging.
+    pub stale_s1u_releases: Vec<std::time::Instant>,
     /// The eNB UE context an INITIAL CONTEXT SETUP REQUEST was sent on and not
     /// yet answered (0: none). Keyed by the S1 connection so a later connection
     /// is not mistaken for one still being set up (#869 review).
@@ -1570,6 +1574,13 @@ pub struct MmeBearer {
     pub enb_s1u_teid: u32,
     /// eNB S1-U IP
     pub enb_s1u_ip: IpAddr,
+    /// The eNB S1-U F-TEID the Serving GW holds for this bearer: the one an
+    /// accepted Modify Bearer Response or an accepted Create Bearer Response
+    /// carried (#1015). `None` once a Release Access Bearers Request released
+    /// the S1-U bearers. When it equals (`enb_s1u_teid`, `enb_s1u_ip`) the
+    /// Serving GW can tunnel downlink to the eNB, so a Downlink Data
+    /// Notification for the bearer means the Serving GW released its S1-U.
+    pub enb_s1u_at_sgw: Option<(u32, IpAddr)>,
     /// SGW S1-U TEID
     pub sgw_s1u_teid: u32,
     /// SGW S1-U IP
@@ -2490,6 +2501,34 @@ impl MmeContext {
     /// Find bearer by pool ID
     pub fn bearer_find_by_id(&self, id: u64) -> Option<MmeBearer> {
         self.bearer_pool.read().unwrap().get(&id).cloned()
+    }
+
+    /// The bearer `ebi` of `mme_ue_id`, found through the UE's sessions and their
+    /// bearer lists (O(the UE's bearers)) rather than a scan of every bearer of
+    /// every UE (#1023 review).
+    pub fn bearer_of_ue_by_ebi(&self, mme_ue_id: u64, ebi: u8) -> Option<u64> {
+        // One pool lock at a time: no nested acquisition to order against writers.
+        let sess_list = self
+            .mme_ue_pool
+            .read()
+            .unwrap()
+            .get(&mme_ue_id)?
+            .sess_list
+            .clone();
+        let bearer_ids: Vec<u64> = {
+            let sess_pool = self.sess_pool.read().unwrap();
+            sess_list
+                .iter()
+                .filter_map(|s| sess_pool.get(s))
+                .flat_map(|s| s.bearer_list.iter().copied())
+                .collect()
+        };
+        let bearer_pool = self.bearer_pool.read().unwrap();
+        bearer_ids.into_iter().find(|b| {
+            bearer_pool
+                .get(b)
+                .is_some_and(|b| b.ebi == ebi && b.mme_ue_id == mme_ue_id)
+        })
     }
 
     /// Find bearer by EBI
