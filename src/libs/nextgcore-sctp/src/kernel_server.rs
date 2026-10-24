@@ -43,8 +43,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::kernel::{
-    KernelSctpSocket, SCTP_ASSOC_CHANGE, SCTP_CANT_STR_ASSOC, SCTP_COMM_LOST, SCTP_SHUTDOWN_COMP,
-    SCTP_SHUTDOWN_EVENT,
+    KernelSctpSocket, SCTP_ASSOC_CHANGE, SCTP_CANT_STR_ASSOC, SCTP_COMM_LOST, SCTP_RESTART,
+    SCTP_SHUTDOWN_COMP, SCTP_SHUTDOWN_EVENT,
 };
 use crate::server::{SctpServerConfig, ServerError, ServerEvent};
 use crate::{ReceivedMessage, SctpError, MSG_EOR, MSG_NOTIFICATION, NEXTGCORE_MAX_SDU_LEN};
@@ -338,7 +338,11 @@ async fn read_loop(
                         emit_closed(&tx, &associations, id, "SCTP association down");
                         return;
                     }
-                    // Non-terminal notification (e.g. COMM_UP): nothing to deliver.
+                    if is_restart_notification(&buf[..n]) {
+                        log::warn!("Kernel-SCTP: association {id} restarted by its peer");
+                        let _ = tx.send(ServerEvent::AssociationRestarted { association_id: id });
+                    }
+                    // Other non-terminal notifications (e.g. COMM_UP): nothing to deliver.
                     continue;
                 }
                 buf.truncate(n);
@@ -428,6 +432,15 @@ fn is_close_notification(buf: &[u8]) -> bool {
     }
 }
 
+/// Whether a notification is `SCTP_ASSOC_CHANGE` / `SCTP_RESTART` (RFC 6458 §6.1.1): the
+/// peer restarted the association, which stays up under the same id with streams
+/// negotiated afresh (RFC 9260 §5.2.2).
+fn is_restart_notification(buf: &[u8]) -> bool {
+    buf.len() >= 10
+        && u16::from_ne_bytes([buf[0], buf[1]]) == SCTP_ASSOC_CHANGE
+        && u16::from_ne_bytes([buf[8], buf[9]]) == SCTP_RESTART
+}
+
 /// Map a primitive [`SctpError`] to a server-layer error for setup paths.
 fn sctp_to_server_err(e: SctpError) -> ServerError {
     ServerError::Io(io::Error::other(e.to_string()))
@@ -436,6 +449,33 @@ fn sctp_to_server_err(e: SctpError) -> ServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #870 follow-up: an `SCTP_RESTART` assoc change is a restart, not a close; the other
+    /// states are not restarts.
+    #[test]
+    fn assoc_change_restart_is_a_restart_not_a_close() {
+        let change = |state: u16| {
+            let mut buf = vec![0u8; 20];
+            buf[0..2].copy_from_slice(&SCTP_ASSOC_CHANGE.to_ne_bytes());
+            buf[8..10].copy_from_slice(&state.to_ne_bytes());
+            buf
+        };
+        assert!(is_restart_notification(&change(SCTP_RESTART)));
+        assert!(!is_close_notification(&change(SCTP_RESTART)));
+        for state in [
+            0u16,
+            SCTP_COMM_LOST,
+            SCTP_SHUTDOWN_COMP,
+            SCTP_CANT_STR_ASSOC,
+        ] {
+            assert!(!is_restart_notification(&change(state)), "state {state}");
+        }
+        let mut shutdown = vec![0u8; 20];
+        shutdown[0..2].copy_from_slice(&SCTP_SHUTDOWN_EVENT.to_ne_bytes());
+        shutdown[8..10].copy_from_slice(&SCTP_RESTART.to_ne_bytes());
+        assert!(!is_restart_notification(&shutdown), "only an assoc change");
+        assert!(!is_restart_notification(&change(SCTP_RESTART)[..9]));
+    }
 
     #[test]
     fn shutdown_event_is_close() {

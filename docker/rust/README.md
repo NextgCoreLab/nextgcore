@@ -374,6 +374,14 @@ services:
 
 ### Port Mappings
 
+Host publishes are bound to `127.0.0.1` in both compose files; the NFs, the
+simulated RAN and the UEs talk over the compose networks and need none of them.
+The TCP tools (mongosh, the NRF SBI, Prometheus, Grafana, Jaeger) can be reached
+from another machine through an SSH tunnel. An SSH tunnel does not carry SCTP or
+GTP-U, so a real external eNB/gNB uses the opt-in `NEXTGCORE_RAN_PUBLISH_ADDR`
+instead (#837): set it to the host's address on the private RAN-facing interface
+(not `0.0.0.0`), and only the S1AP/NGAP and GTP-U publishes follow it.
+
 | Service | Protocol | Port | Description |
 |---------|----------|------|-------------|
 | NRF | HTTP/2 | 7777 | SBI interface |

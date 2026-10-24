@@ -607,6 +607,17 @@ pub fn clear_registered_profile() {
     }
 }
 
+/// How many times [`reregister_self`] has succeeded in this process.
+static REREGISTRATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many times this process has re-registered after the NRF lost its
+/// profile (#434). A change means the NRF lost its state, so whatever else this
+/// NF holds at that NRF, its NF status subscriptions included, is gone too
+/// (#940: the AMF re-subscribes when it sees this move).
+pub fn reregistration_count() -> u64 {
+    REREGISTRATIONS.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Re-register this process's recorded profile under `nf_instance_id`
 /// (`PUT /nnrf-nfm/v1/nf-instances/{id}`, NFRegister, TS 29.510 §5.2.2.2.1).
 ///
@@ -634,7 +645,10 @@ pub async fn reregister_self(nf_instance_id: &str) -> Result<u16, String> {
     let client = SbiClient::with_host_port(&nrf_host, nrf_port);
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     match client.put_json(&path, &profile).await {
-        Ok(resp) if resp.status == 200 || resp.status == 201 => Ok(resp.status),
+        Ok(resp) if resp.status == 200 || resp.status == 201 => {
+            REREGISTRATIONS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Ok(resp.status)
+        }
         Ok(resp) => Err(format!("NRF returned status {}", resp.status)),
         Err(e) => Err(format!("NFRegister failed: {e}")),
     }
