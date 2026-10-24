@@ -2744,7 +2744,7 @@ mod tests {
             on_s11_peer_restart_in(&ctx, "127.0.0.1:2123".parse().unwrap()),
             1
         );
-        let detached = ctx.mme_ue_find_by_id(mme_ue_id).map_or(true, |ue| {
+        let detached = ctx.mme_ue_find_by_id(mme_ue_id).is_none_or(|ue| {
             ue.nas_eps.type_ == crate::context::MmeEpsType::DetachRequestToUe
                 && ue.network_detach_type
                     == Some(crate::emm_build::DetachTypeToUe::ReAttachRequired)
