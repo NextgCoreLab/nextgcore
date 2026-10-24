@@ -791,6 +791,33 @@ pub fn build_pdu_session_resource_setup_request_asn1(
     nas_pdu: Option<&[u8]>,
     n2_sm_transfer: &[u8],
 ) -> Option<Vec<u8>> {
+    build_pdu_session_resource_setup_request_with_nas_asn1(
+        amf_ue_ngap_id,
+        ran_ue_ngap_id,
+        pdu_session_id,
+        s_nssai_sst,
+        s_nssai_sd,
+        nas_pdu,
+        None,
+        n2_sm_transfer,
+    )
+}
+
+/// [`build_pdu_session_resource_setup_request_asn1`] with the item's own
+/// PDU Session NAS-PDU (TS 38.413 §9.2.1.1): the place for a 5GSM message about
+/// that session (TS 23.502 §4.3.2.2.1 step 12), tied to the session's outcome at
+/// the gNB. `nas_pdu` is the message-level NAS-PDU, for a 5GMM message.
+#[allow(clippy::too_many_arguments)]
+pub fn build_pdu_session_resource_setup_request_with_nas_asn1(
+    amf_ue_ngap_id: u64,
+    ran_ue_ngap_id: u32,
+    pdu_session_id: u8,
+    s_nssai_sst: u8,
+    s_nssai_sd: Option<u32>,
+    nas_pdu: Option<&[u8]>,
+    pdu_session_nas_pdu: Option<&[u8]>,
+    n2_sm_transfer: &[u8],
+) -> Option<Vec<u8>> {
     use ngap_gen::{
         PDUSessionResourceSetupItemSUReq,
         PDUSessionResourceSetupItemSUReqPDUSessionResourceSetupRequestTransfer as Transfer,
@@ -801,7 +828,7 @@ pub fn build_pdu_session_resource_setup_request_asn1(
 
     let item = PDUSessionResourceSetupItemSUReq {
         pdu_session_id: ngap_gen::PDUSessionID(pdu_session_id),
-        pdu_session_nas_pdu: None,
+        pdu_session_nas_pdu: pdu_session_nas_pdu.map(|n| ngap_gen::NAS_PDU(n.to_vec())),
         s_nssai: generated_s_nssai(&crate::context::SNssai {
             sst: s_nssai_sst,
             sd: s_nssai_sd,
@@ -14554,8 +14581,8 @@ mod handover_3b_ii_tests {
 
     /// The whole DOWNLINK RAN STATUS TRANSFER for AMF UE NGAP ID 1, RAN UE NGAP
     /// ID 2 and that container, derived by hand: CHOICE initiatingMessage `000`
-    /// + pad; procedure code 7; criticality ignore `01` + pad; open type length
-    /// 31; SEQUENCE ext bit + pad; IE count 3 (two-octet aligned); then each
+    /// plus pad; procedure code 7; criticality ignore `01` plus pad; open type
+    /// length 31; SEQUENCE ext bit plus pad; IE count 3 (two-octet aligned); then each
     /// ProtocolIE-Field: id (two octets), criticality reject `00` + pad, open
     /// type length, value -- AMF-UE-NGAP-ID 1 (3-bit octet count 0, pad, `01`),
     /// RAN-UE-NGAP-ID 2 (2-bit octet count 0, pad, `02`), the container.

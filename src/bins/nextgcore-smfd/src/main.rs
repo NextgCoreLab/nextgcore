@@ -116,10 +116,14 @@ fn render_metrics() -> String {
          # HELP smf_up 1 when the SMF runtime is serving\n\
          # TYPE smf_up gauge\n\
          smf_up 1\n\
+         # HELP smf_pfcp_unauthorized_messages_total PFCP messages refused or dropped because their sender is no UPF of this SMF, or reported on another UPF's session\n\
+         # TYPE smf_pfcp_unauthorized_messages_total counter\n\
+         smf_pfcp_unauthorized_messages_total {}\n\
          # HELP smf_sm_policy_delete_failures_total SM Policy Association terminations (Npcf_SMPolicyControl_Delete) that failed after every attempt; each leaves an association at the PCF\n\
          # TYPE smf_sm_policy_delete_failures_total counter\n\
          smf_sm_policy_delete_failures_total {}\n",
         pool.len(),
+        pfcp_path::PFCP_UNAUTHORIZED.load(Ordering::Relaxed),
         SM_POLICY_DELETE_FAILURES.load(Ordering::Relaxed)
     )
 }
@@ -474,6 +478,8 @@ async fn main() -> Result<()> {
         Some(&config_path),
     ))
     .init();
+    // #1004 review: an unset clock makes a wrong PFCP Recovery Time Stamp.
+    nextgcore_pfcp::recovery_time::check_local_clock().map_err(|e| anyhow::anyhow!(e))?;
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = nextgcore_metrics::otel::init_otel(
         nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
@@ -1063,6 +1069,36 @@ async fn handle_pfcp_session_report(
     let seq = u32::from_be_bytes([0, pkt[12], pkt[13], pkt[14]]);
 
     log::info!("PFCP Session Report Request: SEID=0x{seid:016x}, seq={seq}, peer={peer}");
+
+    // #971: a UPF reports only on its own sessions. A report naming a session that
+    // lives on another UPF is refused as "Session context not found" (cause 65,
+    // TS 29.244 §8.2.1), not executed, and counted.
+    // #974 review m2: a SEID this SMF does not hold is cause 65 as well (TS 29.244
+    // §6.3.5.3: an unknown F-SEID), so the answer does not tell a UPF whether the
+    // session exists on another one.
+    // An unknown SEID is not counted: a report racing the session's deletion is one.
+    let known = pfcp_path::holds_session_seid(seid);
+    if !known || !pfcp_path::report_sender_owns_session(seid, peer) {
+        if known {
+            pfcp_path::note_unauthorized(
+                format_args!("a Session Report for SEID 0x{seid:016x}, on another UPF (cause 65)"),
+                peer,
+            );
+        } else {
+            log::info!(
+                "PFCP Session Report Request from {peer} for SEID 0x{seid:016x}, which this \
+                 SMF does not hold: cause 65"
+            );
+        }
+        let resp = pfcp_path::encode_wire_message(
+            pfcp_path::pfcp_message_type::SESSION_REPORT_RESPONSE,
+            Some(0),
+            seq,
+            &[0, 19, 0, 1, 65],
+        );
+        let _ = sock.send_to(&resp, peer).await;
+        return;
+    }
 
     // Parse IEs from the payload (offset 16 onward).
     let payload = &pkt[16..];
@@ -6402,19 +6438,53 @@ fn spawn_pfcp_listener(
             match socket.recv_from(&mut buf).await {
                 Ok((len, peer)) => {
                     let pkt = buf[..len].to_vec();
-                    // Route the datagram to the client owning this peer so
-                    // transaction matching and association state stay
-                    // per-UPF. Unknown sources fall back to pool slot 0,
-                    // preserving the single-UPF behavior.
-                    let Some(client) = clients
-                        .iter()
-                        .find(|c| c.peer() == peer)
-                        .or_else(|| clients.first())
-                    else {
+                    let Some(header) = pfcp_path::parse_wire_header(&pkt) else {
+                        pfcp_path::note_unauthorized(
+                            format_args!("an undecodable datagram ({len} bytes)"),
+                            peer,
+                        );
                         continue;
                     };
-                    if !client.on_datagram(&pkt, peer).await {
-                        handle_pfcp_incoming(&socket, &pkt, peer).await;
+                    // #971: route by the sender to the client owning it, so
+                    // transaction matching and association state stay per UPF, and
+                    // admit from anyone else only what TS 29.244 / TS 23.007 allow.
+                    let peers: Vec<pfcp_path::N4Peer> =
+                        clients.iter().map(|c| c.n4_peer()).collect();
+                    match pfcp_path::admit_n4(header.msg_type, peer, &peers) {
+                        pfcp_path::N4Admission::Peer(i) => {
+                            let client = &clients[i];
+                            if !client.on_datagram(&pkt, peer).await {
+                                handle_pfcp_incoming(&socket, &pkt, peer).await;
+                            }
+                        }
+                        pfcp_path::N4Admission::AnswerHeartbeat => {
+                            let resp = pfcp_path::heartbeat_response(
+                                header.sequence_number,
+                                pfcp_path::smf_recovery_time_stamp(),
+                            );
+                            let _ = socket.send_to(&resp, peer).await;
+                        }
+                        pfcp_path::N4Admission::RefuseRequest => {
+                            pfcp_path::note_unauthorized(
+                                format_args!("PFCP request type {} (cause 72)", header.msg_type),
+                                peer,
+                            );
+                            if let Some(resp) = clients.first().and_then(|c| {
+                                pfcp_path::refusal_response(
+                                    header.msg_type,
+                                    header.sequence_number,
+                                    c.node_id(),
+                                )
+                            }) {
+                                let _ = socket.send_to(&resp, peer).await;
+                            }
+                        }
+                        pfcp_path::N4Admission::Drop => {
+                            pfcp_path::note_unauthorized(
+                                format_args!("PFCP message type {} (dropped)", header.msg_type),
+                                peer,
+                            );
+                        }
                     }
                 }
                 Err(e) => log::warn!("PFCP listener recv error: {e}"),
@@ -8422,6 +8492,614 @@ mod tests {
         );
     }
 
+    // ---- #971: N4 admits PFCP only from this SMF's UPFs ----
+
+    /// The cause IE of a PFCP message body.
+    fn pfcp_cause_of(pkt: &[u8]) -> Option<u8> {
+        let h = pfcp_path::parse_wire_header(pkt)?;
+        pfcp_path::find_ie(&pkt[h.body_offset..], 19).and_then(|v| v.first().copied())
+    }
+
+    /// A minimal Session Report Request (Report Type DLDR) for CP SEID `seid`.
+    fn session_report(seid: u64, seq: u32) -> Vec<u8> {
+        pfcp_path::encode_wire_message(
+            pfcp_path::pfcp_message_type::SESSION_REPORT_REQUEST,
+            Some(seid),
+            seq,
+            &[0, 39, 0, 1, 0x01],
+        )
+    }
+
+    async fn recv_pfcp(sock: &tokio::net::UdpSocket) -> Option<Vec<u8>> {
+        let mut buf = vec![0u8; 2048];
+        tokio::time::timeout(std::time::Duration::from_secs(2), sock.recv_from(&mut buf))
+            .await
+            .ok()?
+            .ok()
+            .map(|(n, _)| buf[..n].to_vec())
+    }
+
+    /// #971: a Session Report Request from a host that is no UPF of this SMF is
+    /// refused with cause 72 and counted; the same report from the UPF is accepted. A
+    /// Heartbeat Request from the stranger is still answered (TS 23.007 §19A).
+    #[tokio::test]
+    async fn pfcp_requests_from_a_host_that_is_no_upf_are_refused_and_counted() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let (upf, _seen, upf_task) = raw_upf(None).await;
+        let sock = std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let smf = sock.local_addr().unwrap();
+        let client = std::sync::Arc::new(pfcp_path::PfcpClient::new(
+            sock.clone(),
+            upf,
+            [127, 0, 0, 1],
+        ));
+        client.set_assoc_state_for_test(true, None, None).await;
+        pfcp_path::set_global_pool(vec![client.clone()]);
+        let listener = spawn_pfcp_listener(sock, vec![client.clone()]);
+        // Another IP: another port of the same host is the same PFCP node.
+        let stranger = tokio::net::UdpSocket::bind("127.0.0.2:0").await.unwrap();
+        let before = pfcp_path::PFCP_UNAUTHORIZED.load(Ordering::SeqCst);
+
+        stranger
+            .send_to(&session_report(0x0971, 0x971), smf)
+            .await
+            .unwrap();
+        let refused = recv_pfcp(&stranger).await;
+        let hb = pfcp_path::encode_wire_message(
+            pfcp_path::pfcp_message_type::HEARTBEAT_REQUEST,
+            None,
+            0x972,
+            &[0, 96, 0, 4, 0, 0, 0, 9],
+        );
+        stranger.send_to(&hb, smf).await.unwrap();
+        let hb_answer = recv_pfcp(&stranger).await;
+        let counted = pfcp_path::PFCP_UNAUTHORIZED.load(Ordering::SeqCst) - before;
+        listener.abort();
+        upf_task.abort();
+        pfcp_path::clear_global_upf_for_test();
+
+        let refused = refused.expect("a Session Report Response");
+        assert_eq!(
+            pfcp_cause_of(&refused),
+            Some(72),
+            "No established PFCP Association"
+        );
+        let hb_answer = hb_answer.expect("a Heartbeat Response");
+        assert_eq!(
+            pfcp_path::parse_wire_header(&hb_answer).unwrap().msg_type,
+            pfcp_path::pfcp_message_type::HEARTBEAT_RESPONSE
+        );
+        assert_eq!(counted, 1, "the report is counted, the heartbeat is not");
+    }
+
+    /// #971: a response from a host other than the UPF the request went to does not
+    /// complete the request; the UPF's own response does.
+    #[tokio::test]
+    async fn a_response_from_the_wrong_host_does_not_complete_a_pfcp_request() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let upf = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sock = std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let smf = sock.local_addr().unwrap();
+        let client = std::sync::Arc::new(pfcp_path::PfcpClient::new(
+            sock.clone(),
+            upf.local_addr().unwrap(),
+            [127, 0, 0, 1],
+        ));
+        client.set_assoc_state_for_test(true, None, None).await;
+        pfcp_path::set_global_pool(vec![client.clone()]);
+        let listener = spawn_pfcp_listener(sock, vec![client.clone()]);
+        let stranger = tokio::net::UdpSocket::bind("127.0.0.2:0").await.unwrap();
+
+        let c = client.clone();
+        let request = tokio::spawn(async move {
+            c.request(
+                pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST,
+                Some(0x971),
+                &[],
+            )
+            .await
+        });
+        let mut buf = vec![0u8; 2048];
+        let (n, _) = upf.recv_from(&mut buf).await.unwrap();
+        let seq = pfcp_path::parse_wire_header(&buf[..n])
+            .unwrap()
+            .sequence_number;
+        let answer = |cause: u8| {
+            pfcp_path::encode_wire_message(
+                pfcp_path::pfcp_message_type::SESSION_DELETION_RESPONSE,
+                Some(0x971),
+                seq,
+                &[0, 19, 0, 1, cause],
+            )
+        };
+        // The stranger answers first, "accepted".
+        stranger.send_to(&answer(1), smf).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let completed_by_stranger = request.is_finished();
+        // The UPF answers with its own cause.
+        upf.send_to(&answer(64), smf).await.unwrap();
+        let result = request.await.unwrap();
+        listener.abort();
+        pfcp_path::clear_global_upf_for_test();
+
+        assert!(
+            !completed_by_stranger,
+            "the stranger's response completed nothing"
+        );
+        let (_, body) = result.expect("the UPF's response completes the request");
+        assert_eq!(
+            pfcp_path::parse_cause(&body),
+            Some(64),
+            "and it is the UPF's answer"
+        );
+    }
+
+    /// #974 review: a UPF's Heartbeat Request from another source port of its own
+    /// address is the same PFCP node (TS 29.244 §4.2.2: any source port).
+    #[test]
+    fn a_upf_is_its_ip_address_not_its_port() {
+        let upf: std::net::SocketAddr = "10.0.0.7:8805".parse().unwrap();
+        let other: std::net::SocketAddr = "10.0.0.8:8805".parse().unwrap();
+        let ephemeral: std::net::SocketAddr = "10.0.0.7:40001".parse().unwrap();
+        assert_eq!(
+            pfcp_path::admit_n4(
+                pfcp_path::pfcp_message_type::SESSION_REPORT_REQUEST,
+                ephemeral,
+                &[pfcp_path::N4Peer::at(upf), pfcp_path::N4Peer::at(other)]
+            ),
+            pfcp_path::N4Admission::Peer(0)
+        );
+        let mapped: std::net::SocketAddr = "[::ffff:10.0.0.8]:8805".parse().unwrap();
+        assert_eq!(
+            pfcp_path::admit_n4(
+                pfcp_path::pfcp_message_type::SESSION_REPORT_REQUEST,
+                mapped,
+                &[pfcp_path::N4Peer::at(upf), pfcp_path::N4Peer::at(other)]
+            ),
+            pfcp_path::N4Admission::Peer(1)
+        );
+        // Two pool entries on one host: only the exact endpoint routes.
+        let twin: std::net::SocketAddr = "10.0.0.7:8806".parse().unwrap();
+        assert_eq!(
+            pfcp_path::admit_n4(
+                pfcp_path::pfcp_message_type::SESSION_REPORT_REQUEST,
+                ephemeral,
+                &[pfcp_path::N4Peer::at(upf), pfcp_path::N4Peer::at(twin)]
+            ),
+            pfcp_path::N4Admission::RefuseRequest
+        );
+    }
+
+    /// #974 review m4, m5: a UPF's other addresses (TS 29.244 §5.8.1) route its
+    /// requests to it; a response is admitted only from the exact endpoint its
+    /// request went to (§4.2.3).
+    #[test]
+    fn a_upfs_other_addresses_are_the_upf_and_responses_need_the_endpoint() {
+        let upf: std::net::SocketAddr = "10.0.0.7:8805".parse().unwrap();
+        let other: std::net::SocketAddr = "10.0.0.8:8805".parse().unwrap();
+        let multi = pfcp_path::N4Peer {
+            endpoint: upf,
+            addrs: vec!["10.9.9.9".parse().unwrap()],
+        };
+        let peers = [multi, pfcp_path::N4Peer::at(other)];
+        let second_address: std::net::SocketAddr = "10.9.9.9:8805".parse().unwrap();
+        let ephemeral: std::net::SocketAddr = "10.0.0.7:40001".parse().unwrap();
+        let t = pfcp_path::pfcp_message_type::SESSION_REPORT_REQUEST;
+        assert_eq!(
+            pfcp_path::admit_n4(t, second_address, &peers),
+            pfcp_path::N4Admission::Peer(0)
+        );
+        let resp = pfcp_path::pfcp_message_type::SESSION_MODIFICATION_RESPONSE;
+        assert_eq!(
+            pfcp_path::admit_n4(resp, upf, &peers),
+            pfcp_path::N4Admission::Peer(0)
+        );
+        assert_eq!(
+            pfcp_path::admit_n4(resp, ephemeral, &peers),
+            pfcp_path::N4Admission::Drop,
+            "a response from another port of the UPF's address"
+        );
+        assert_eq!(
+            pfcp_path::admit_n4(resp, second_address, &peers),
+            pfcp_path::N4Admission::Drop
+        );
+        // A stranger: a heartbeat is answered, a setup dropped, other requests
+        // refused with cause 72.
+        let stranger: std::net::SocketAddr = "10.0.0.99:8805".parse().unwrap();
+        use pfcp_path::pfcp_message_type as mt;
+        for (msg, want) in [
+            (
+                mt::HEARTBEAT_REQUEST,
+                pfcp_path::N4Admission::AnswerHeartbeat,
+            ),
+            (mt::ASSOCIATION_SETUP_REQUEST, pfcp_path::N4Admission::Drop),
+            (
+                mt::ASSOCIATION_RELEASE_REQUEST,
+                pfcp_path::N4Admission::RefuseRequest,
+            ),
+            (
+                mt::ASSOCIATION_UPDATE_REQUEST,
+                pfcp_path::N4Admission::RefuseRequest,
+            ),
+            (
+                mt::NODE_REPORT_REQUEST,
+                pfcp_path::N4Admission::RefuseRequest,
+            ),
+            (
+                mt::SESSION_REPORT_REQUEST,
+                pfcp_path::N4Admission::RefuseRequest,
+            ),
+            (mt::HEARTBEAT_RESPONSE, pfcp_path::N4Admission::Drop),
+        ] {
+            assert_eq!(
+                pfcp_path::admit_n4(msg, stranger, &peers),
+                want,
+                "type {msg}"
+            );
+        }
+    }
+
+    /// #974 review M1: a refused datagram is counted every time and logged at WARN at
+    /// most once per interval, not once per datagram.
+    #[test]
+    fn refused_datagrams_are_counted_each_and_logged_in_summary() {
+        let from: std::net::SocketAddr = "10.0.0.99:8805".parse().unwrap();
+        let before = pfcp_path::PFCP_UNAUTHORIZED.load(Ordering::SeqCst);
+        let warned = (0..1000)
+            .filter(|_| pfcp_path::note_unauthorized(format_args!("a test datagram"), from))
+            .count();
+        let counted = pfcp_path::PFCP_UNAUTHORIZED.load(Ordering::SeqCst) - before;
+        assert!(counted >= 1000, "{counted}");
+        assert!(warned <= 1, "{warned} WARN lines for 1000 datagrams");
+    }
+
+    /// One associated UPF A (127.0.0.1) with stored Recovery Time Stamp 100 and one
+    /// session, behind the real listener; and a stranger on 127.0.0.2.
+    async fn upf_a_and_a_stranger() -> (
+        std::sync::Arc<pfcp_path::PfcpClient>,
+        std::net::SocketAddr,
+        tokio::net::UdpSocket,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (upf, _seen, upf_task) = raw_upf(None).await;
+        let sock = std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let smf = sock.local_addr().unwrap();
+        let client = std::sync::Arc::new(pfcp_path::PfcpClient::new(
+            sock.clone(),
+            upf,
+            [127, 0, 0, 1],
+        ));
+        client.set_assoc_state_for_test(true, None, None).await;
+        client.seed_peer_recovery_time_stamp(100).await;
+        pfcp_path::set_global_pool(vec![client.clone()]);
+        let listener = spawn_pfcp_listener(sock, vec![client.clone()]);
+        smf_self()
+            .read()
+            .unwrap()
+            .pfcp_sessions
+            .write()
+            .unwrap()
+            .insert("9740101".to_string(), 0x0974);
+        let stranger = tokio::net::UdpSocket::bind("127.0.0.2:0").await.unwrap();
+        (client, smf, stranger, listener, upf_task)
+    }
+
+    fn n4_gate_session_kept() -> bool {
+        let kept = smf_self()
+            .read()
+            .unwrap()
+            .pfcp_sessions
+            .write()
+            .unwrap()
+            .remove("9740101")
+            .is_some();
+        kept
+    }
+
+    /// #974 review M2, #971: a stranger's Heartbeat Request carrying a new Recovery
+    /// Time Stamp is answered, with this SMF's own stamp (m7), and tears nothing
+    /// down: UPF A stays associated with its stamp and its session. Before the gate,
+    /// it went to pool slot 0, which read the new stamp as A's restart.
+    #[tokio::test]
+    async fn a_strangers_heartbeat_with_a_new_stamp_tears_nothing_down() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        smf_context_init(64, 256, 512);
+        let (client, smf, stranger, listener, upf_task) = upf_a_and_a_stranger().await;
+
+        let hb = pfcp_path::encode_wire_message(
+            pfcp_path::pfcp_message_type::HEARTBEAT_REQUEST,
+            None,
+            0x974,
+            &[0, 96, 0, 4, 0, 0, 0x27, 0x0f],
+        );
+        stranger.send_to(&hb, smf).await.unwrap();
+        let answer = recv_pfcp(&stranger).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let associated = client.is_associated().await;
+        let stamp = client.peer_recovery_time_stamp_for_test().await;
+        let kept = n4_gate_session_kept();
+        listener.abort();
+        upf_task.abort();
+        pfcp_path::clear_global_upf_for_test();
+
+        let answer = answer.expect("a Heartbeat Response");
+        let h = pfcp_path::parse_wire_header(&answer).unwrap();
+        assert_eq!(h.msg_type, pfcp_path::pfcp_message_type::HEARTBEAT_RESPONSE);
+        let rts = pfcp_path::find_ie(&answer[h.body_offset..], 96).expect("Recovery Time Stamp");
+        assert_eq!(
+            u32::from_be_bytes([rts[0], rts[1], rts[2], rts[3]]),
+            pfcp_path::smf_recovery_time_stamp()
+        );
+        assert!(associated, "UPF A is still associated");
+        assert_eq!(stamp, Some(100), "A's stored stamp is untouched");
+        assert!(kept, "A's session is kept");
+    }
+
+    /// #1031: a session restored from durable state onto UPF B, the non-default
+    /// pool member, is B's: B's Session Report on it is accepted, A's is refused.
+    #[tokio::test]
+    async fn a_restored_session_on_a_non_default_upf_takes_its_reports() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        smf_context_init(64, 256, 512);
+        let upf_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upf_b = tokio::net::UdpSocket::bind("127.0.0.3:0").await.unwrap();
+        let sock = std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let smf = sock.local_addr().unwrap();
+        let a = std::sync::Arc::new(pfcp_path::PfcpClient::new(
+            sock.clone(),
+            upf_a.local_addr().unwrap(),
+            [127, 0, 0, 1],
+        ));
+        let b = std::sync::Arc::new(pfcp_path::PfcpClient::new(
+            sock.clone(),
+            upf_b.local_addr().unwrap(),
+            [127, 0, 0, 1],
+        ));
+        pfcp_path::set_global_pool(vec![a.clone(), b.clone()]);
+        let listener = spawn_pfcp_listener(sock, vec![a.clone(), b.clone()]);
+        // Restored: in the session table, its UPF known only by identity.
+        let reference = "10312";
+        let seid = crate::context::derive_cp_n4_seid(reference);
+        {
+            let ctx = smf_self();
+            let ctx = ctx.read().unwrap();
+            ctx.pfcp_sessions
+                .write()
+                .unwrap()
+                .insert(reference.to_string(), 0x1031);
+            ctx.session_upfs
+                .write()
+                .unwrap()
+                .insert(seid, b.recovery_time_stamp_key());
+        }
+
+        upf_b
+            .send_to(&session_report(seid, 0x1031), smf)
+            .await
+            .unwrap();
+        let from_b = recv_pfcp(&upf_b).await;
+        upf_a
+            .send_to(&session_report(seid, 0x1032), smf)
+            .await
+            .unwrap();
+        let from_a = recv_pfcp(&upf_a).await;
+        pfcp_path::forget_session_peer(seid);
+        smf_self()
+            .read()
+            .unwrap()
+            .pfcp_sessions
+            .write()
+            .unwrap()
+            .remove(reference);
+        listener.abort();
+        pfcp_path::clear_global_upf_for_test();
+
+        assert_eq!(pfcp_cause_of(&from_b.expect("B answered")), Some(1));
+        assert_eq!(pfcp_cause_of(&from_a.expect("A answered")), Some(65));
+    }
+
+    /// #974 review M2, m6, #971: a stranger's Association Release Request is refused
+    /// with cause 72 (TS 29.244 §8.2.1) and counted; UPF A stays associated with its
+    /// session. Before the gate, it released A's association.
+    #[tokio::test]
+    async fn a_strangers_association_release_is_refused_and_releases_nothing() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        smf_context_init(64, 256, 512);
+        let (client, smf, stranger, listener, upf_task) = upf_a_and_a_stranger().await;
+        let before = pfcp_path::PFCP_UNAUTHORIZED.load(Ordering::SeqCst);
+
+        let mut nid = bytes::BytesMut::new();
+        nextgcore_pfcp::types::NodeId::new_ipv4([127, 0, 0, 2]).encode(&mut nid);
+        let mut body = vec![0, 60];
+        body.extend_from_slice(&(nid.len() as u16).to_be_bytes());
+        body.extend_from_slice(&nid);
+        let release = pfcp_path::encode_wire_message(
+            pfcp_path::pfcp_message_type::ASSOCIATION_RELEASE_REQUEST,
+            None,
+            0x975,
+            &body,
+        );
+        stranger.send_to(&release, smf).await.unwrap();
+        let answer = recv_pfcp(&stranger).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let counted = pfcp_path::PFCP_UNAUTHORIZED.load(Ordering::SeqCst) - before;
+        let associated = client.is_associated().await;
+        let kept = n4_gate_session_kept();
+        listener.abort();
+        upf_task.abort();
+        pfcp_path::clear_global_upf_for_test();
+
+        let answer = answer.expect("an Association Release Response");
+        assert_eq!(
+            pfcp_path::parse_wire_header(&answer).unwrap().msg_type,
+            pfcp_path::pfcp_message_type::ASSOCIATION_RELEASE_RESPONSE
+        );
+        assert_eq!(pfcp_cause_of(&answer), Some(72));
+        assert!(counted >= 1, "counted");
+        assert!(associated, "UPF A is still associated");
+        assert!(kept, "A's session is kept");
+    }
+
+    /// #974 review m2, m3: a report for a SEID nobody holds is cause 65, like one for
+    /// another UPF's session; and a session restored from durable state (no recorded
+    /// UPF) is the default UPF's, so another UPF cannot report on it.
+    #[tokio::test]
+    async fn reports_on_unknown_and_restored_sessions_are_checked() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        smf_context_init(64, 256, 512);
+        let upf_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upf_b = tokio::net::UdpSocket::bind("127.0.0.3:0").await.unwrap();
+        let sock = std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let smf = sock.local_addr().unwrap();
+        let a = std::sync::Arc::new(pfcp_path::PfcpClient::new(
+            sock.clone(),
+            upf_a.local_addr().unwrap(),
+            [127, 0, 0, 1],
+        ));
+        let b = std::sync::Arc::new(pfcp_path::PfcpClient::new(
+            sock.clone(),
+            upf_b.local_addr().unwrap(),
+            [127, 0, 0, 1],
+        ));
+        pfcp_path::set_global_pool(vec![a.clone(), b.clone()]);
+        let listener = spawn_pfcp_listener(sock, vec![a.clone(), b.clone()]);
+        // Restored: in the session table, with no recorded UPF.
+        let reference = "9740102";
+        smf_self()
+            .read()
+            .unwrap()
+            .pfcp_sessions
+            .write()
+            .unwrap()
+            .insert(reference.to_string(), 0x0976);
+        let seid = crate::context::derive_cp_n4_seid(reference);
+
+        upf_b
+            .send_to(&session_report(seid, 0x976), smf)
+            .await
+            .unwrap();
+        let from_b = recv_pfcp(&upf_b).await;
+        // From A, the default UPF, which would own it if it existed.
+        upf_a
+            .send_to(&session_report(0x0bad_0974, 0x977), smf)
+            .await
+            .unwrap();
+        let unknown = recv_pfcp(&upf_a).await;
+        upf_a
+            .send_to(&session_report(seid, 0x978), smf)
+            .await
+            .unwrap();
+        let from_a = recv_pfcp(&upf_a).await;
+        smf_self()
+            .read()
+            .unwrap()
+            .pfcp_sessions
+            .write()
+            .unwrap()
+            .remove(reference);
+        listener.abort();
+        pfcp_path::clear_global_upf_for_test();
+
+        assert_eq!(pfcp_cause_of(&from_b.expect("B answered")), Some(65));
+        assert_eq!(pfcp_cause_of(&unknown.expect("answered")), Some(65));
+        assert_eq!(
+            pfcp_cause_of(&from_a.expect("A answered")),
+            Some(1),
+            "the default UPF owns a restored session"
+        );
+    }
+
+    /// #974 review m4: a report from another address of the UPF (TS 29.244 §5.8.1,
+    /// learnt at Association Setup) is accepted for its own session.
+    #[tokio::test]
+    async fn a_upf_reports_from_its_other_address() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        smf_context_init(64, 256, 512);
+        let upf_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let a_elsewhere = tokio::net::UdpSocket::bind("127.0.0.4:0").await.unwrap();
+        let sock = std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let smf = sock.local_addr().unwrap();
+        let a = std::sync::Arc::new(pfcp_path::PfcpClient::new(
+            sock.clone(),
+            upf_a.local_addr().unwrap(),
+            [127, 0, 0, 1],
+        ));
+        a.set_node_addresses_for_test(vec!["127.0.0.4".parse().unwrap()]);
+        pfcp_path::set_global_pool(vec![a.clone()]);
+        let listener = spawn_pfcp_listener(sock, vec![a.clone()]);
+        let reference = "9740103";
+        smf_self()
+            .read()
+            .unwrap()
+            .pfcp_sessions
+            .write()
+            .unwrap()
+            .insert(reference.to_string(), 0x0977);
+        let seid = crate::context::derive_cp_n4_seid(reference);
+
+        a_elsewhere
+            .send_to(&session_report(seid, 0x979), smf)
+            .await
+            .unwrap();
+        let answer = recv_pfcp(&a_elsewhere).await;
+        smf_self()
+            .read()
+            .unwrap()
+            .pfcp_sessions
+            .write()
+            .unwrap()
+            .remove(reference);
+        listener.abort();
+        pfcp_path::clear_global_upf_for_test();
+
+        assert_eq!(pfcp_cause_of(&answer.expect("answered")), Some(1));
+    }
+
+    /// #971: a UPF reports only on its own sessions. A report for a session recorded
+    /// on another UPF is refused with cause 65.
+    #[tokio::test]
+    async fn a_upf_cannot_report_on_another_upfs_session() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let upf_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // Another node: UPFs are told apart by IP address.
+        let upf_b = tokio::net::UdpSocket::bind("127.0.0.3:0").await.unwrap();
+        let sock = std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let smf = sock.local_addr().unwrap();
+        let a = std::sync::Arc::new(pfcp_path::PfcpClient::new(
+            sock.clone(),
+            upf_a.local_addr().unwrap(),
+            [127, 0, 0, 1],
+        ));
+        let b = std::sync::Arc::new(pfcp_path::PfcpClient::new(
+            sock.clone(),
+            upf_b.local_addr().unwrap(),
+            [127, 0, 0, 1],
+        ));
+        pfcp_path::set_global_pool(vec![a.clone(), b.clone()]);
+        let listener = spawn_pfcp_listener(sock, vec![a.clone(), b.clone()]);
+        pfcp_path::record_session_peer(0x0973, a.peer());
+
+        upf_b
+            .send_to(&session_report(0x0973, 0x973), smf)
+            .await
+            .unwrap();
+        let refused = recv_pfcp(&upf_b).await;
+        pfcp_path::forget_session_peer(0x0973);
+        listener.abort();
+        pfcp_path::clear_global_upf_for_test();
+
+        assert_eq!(pfcp_cause_of(&refused.expect("a response")), Some(65));
+    }
+
     use std::time::Duration;
 
     /// The fixture of the #721/#928 receive-task tests: an AMF taking `amf_delay` per
@@ -8638,7 +9316,8 @@ mod tests {
 
     /// #928 review M3 (TS 23.007 §19A): a Heartbeat Request from an address that is
     /// not the UPF, carrying a different stamp, is answered and tears nothing down.
-    /// The listener routes an unknown source to pool slot 0.
+    /// Since #971 the listener's gate answers it; the client's own check is the
+    /// second layer behind that.
     #[tokio::test]
     async fn a_heartbeat_from_a_stranger_cannot_release_a_upfs_sessions() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
@@ -8689,7 +9368,19 @@ mod tests {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
         let fx = restart_fixture("92804", Duration::ZERO).await;
-        heartbeat_request_from_a(&fx, 50, 0x9284).await;
+        // Real start times (#1004 follow-up): a stored stamp in the future is not a
+        // reference for ordering, so the fixture's synthetic 100 (an era-1, 2036
+        // value) cannot stand in for "the current incarnation" here.
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        fx.a.seed_peer_recovery_time_stamp(nextgcore_pfcp::recovery_time::from_unix_secs(
+            now_unix - 60,
+        ))
+        .await;
+        let older = nextgcore_pfcp::recovery_time::from_unix_secs(now_unix - 86_400);
+        heartbeat_request_from_a(&fx, older, 0x9284).await;
         let kept = fx.session_kept();
         fx.teardown().await;
         assert!(
@@ -9450,13 +10141,29 @@ mod tests {
     /// and is observable from the SMF's own state rather than from a log line.
     #[tokio::test]
     async fn test_session_report_tsc_management_information_is_decoded() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _guard = pfcp_path::N4_TEST_LOCK.lock().await;
         pfcp_path::clear_tsc_reports_for_test();
+        smf_context_init(64, 256, 512);
 
-        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sock = std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let peer_addr = peer.local_addr().unwrap();
-        let seid = 0x0000_0000_0BAD_F00Du64;
+        // #974: a session this SMF holds, reported on by the UPF serving it.
+        let reference = "9740201";
+        smf_self()
+            .read()
+            .unwrap()
+            .pfcp_sessions
+            .write()
+            .unwrap()
+            .insert(reference.to_string(), 0x0BAD_F00D);
+        let seid = crate::context::derive_cp_n4_seid(reference);
+        pfcp_path::set_global_pool(vec![std::sync::Arc::new(pfcp_path::PfcpClient::new(
+            sock.clone(),
+            peer_addr,
+            [127, 0, 0, 1],
+        ))]);
 
         // Body: Report Type with TMIR (bit 5 => 0x10) plus one IE 201 carrying a
         // PMIC and its NW-TT port. Hand-built, so the test does not depend on the
@@ -9478,6 +10185,14 @@ mod tests {
         );
 
         handle_pfcp_session_report(&sock, &pkt, peer_addr).await;
+        pfcp_path::clear_global_upf_for_test();
+        smf_self()
+            .read()
+            .unwrap()
+            .pfcp_sessions
+            .write()
+            .unwrap()
+            .remove(reference);
 
         let reports = pfcp_path::tsc_reports_for(seid)
             .expect("the decoded TSC report must be recorded against the SEID");
@@ -14175,21 +14890,21 @@ mod tests {
         );
     }
 
-    /// #289 acceptance: the whole tail after the PFCP block, which no test could
-    /// reach before the stand-in UPF existed.
-    ///
-    /// Four claims, each of which was "verified by inspection" until now:
-    /// 1. the create answers `201` with a resolvable `smContextRef`;
-    /// 2. the session fill-in ran — `upCnxState` is ACTIVATED and the authorised
-    ///    session AMBR is stored on the session (#78, #191);
-    /// 3. the `PolicyBinding` was inserted — the release, update and notify paths
-    ///    all key off it, so a create that skipped it produces a session none of
-    ///    them can act on;
-    /// 4. the N4 exchange really happened, asserted from the stand-in's own
-    ///    record rather than from the SMF's report of it.
-    ///
-    /// Positive assertions throughout: each reads a value only reachable by
-    /// executing the step it names, so no early return can satisfy them.
+    // #289 acceptance: the whole tail after the PFCP block, which no test could
+    // reach before the stand-in UPF existed.
+    //
+    // Four claims, each of which was "verified by inspection" until now:
+    // 1. the create answers `201` with a resolvable `smContextRef`;
+    // 2. the session fill-in ran — `upCnxState` is ACTIVATED and the authorised
+    //    session AMBR is stored on the session (#78, #191);
+    // 3. the `PolicyBinding` was inserted — the release, update and notify paths
+    //    all key off it, so a create that skipped it produces a session none of
+    //    them can act on;
+    // 4. the N4 exchange really happened, asserted from the stand-in's own
+    //    record rather than from the SMF's report of it.
+    //
+    // Positive assertions throughout: each reads a value only reachable by
+    // executing the step it names, so no early return can satisfy them.
     // ── #193: the SMF stops believing a session the UPF says it does not have ──
 
     /// Criterion 3 driven over a REAL N4 round trip, from the production entry
@@ -14268,8 +14983,7 @@ mod tests {
             let global = smf_self();
             let ctx = global.read().expect("context");
             let sessions = ctx.pfcp_sessions.read().expect("sessions");
-            let present = sessions.contains_key(sm_context_ref);
-            present
+            sessions.contains_key(sm_context_ref)
         };
         {
             let global = smf_self();
@@ -15648,7 +16362,16 @@ mod tests {
             .await
             .expect("smf socket");
         let upf_addr = upf.local_addr().expect("upf addr");
+        // #974: a report is accepted only from the UPF serving the session.
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let smf_sock = std::sync::Arc::new(smf_sock);
+        pfcp_path::set_global_pool(vec![std::sync::Arc::new(pfcp_path::PfcpClient::new(
+            smf_sock.clone(),
+            upf_addr,
+            [127, 0, 0, 1],
+        ))]);
         handle_pfcp_session_report(&smf_sock, &dldr_report_packet(seid, 5), upf_addr).await;
+        pfcp_path::clear_global_upf_for_test();
 
         let requests = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let paging = requests
