@@ -73,6 +73,11 @@ docker compose -f docker-compose-epc.yml up -d
 docker compose -f docker-compose-epc.yml ps
 ./epc-attach-check.sh 10.45.0.1 20
 
+# Idle mode as well (#956): S1 release, mobile-originated and network-triggered
+# SERVICE REQUEST. Needs an eNB with a user-inactivity release and LTE paging
+# (nextgsim #350, #351); off by default until then.
+EPC_IDLE_MODE=1 ./epc-attach-check.sh 10.45.0.1 20
+
 # View logs
 docker compose -f docker-compose-epc.yml logs -f
 ```
