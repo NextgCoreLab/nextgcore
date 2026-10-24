@@ -1066,6 +1066,10 @@ pub struct MmeUe {
     pub ue_ambr_deferred: bool,
     /// A UE CONTEXT MODIFICATION REQUEST carrying a UE-AMBR is outstanding.
     pub ue_ambr_modification_pending: bool,
+    /// The network-initiated detach in progress was started by an HSS Cancel Location
+    /// (subscription withdrawal). Only then is a further CLR a retransmission of the one
+    /// being served; a CLR during any other detach is the HSS's own instruction (#828).
+    pub network_detach_by_clr: bool,
 
     // UE Identity
     /// IMSI

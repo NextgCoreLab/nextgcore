@@ -2410,23 +2410,13 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
 
     let ctx = pcf_self();
 
-    // Get or create UE SM
-    let ue_sm_id = if let Ok(context) = ctx.read() {
-        match context.ue_sm_find_by_supi(supi) {
-            Some(ue_sm) => Some(ue_sm.id),
-            None => context.ue_sm_add(supi).map(|ue| ue.id),
-        }
-    } else {
-        None
-    };
-
-    let sess = ue_sm_id.and_then(|ue_sm_id| {
-        if let Ok(context) = ctx.read() {
-            context.sess_add(ue_sm_id, pdu_session_id)
-        } else {
-            None
-        }
-    });
+    // Get or create the UE SM and the session in one step (#892): the UE SM goes
+    // with its last session, so resolving it first and adding the session after
+    // could lose it to a concurrent delete in between.
+    let sess = ctx
+        .read()
+        .ok()
+        .and_then(|context| context.sess_add_for_supi(supi, pdu_session_id));
 
     match sess {
         Some(mut sess) => {
@@ -2697,34 +2687,27 @@ pub async fn handle_sm_policy_delete(sm_policy_id: &str) -> SbiResponse {
 
     match sess {
         Some(sess) => {
-            // Deregister the BSF binding (best-effort) before dropping the session.
-            let binding_id = sess.binding.id.clone().unwrap_or_default();
-            sbi_path::pcf_sess_deregister_bsf_binding(binding_id);
-            // TS 29.514 §4.2.5.3: the AF application session contexts bound to
-            // this PDU session are no longer valid. Tell each AF (TerminationInfo,
-            // termCause PDU_SESSION_TERMINATION) before the contexts go with the
-            // session (#767). The sender reads the app under its own lock; no
-            // guard is held here. The AF then deletes the context (§4.2.4.2),
-            // which is answered from the tombstone below.
-            let app_session_ids: Vec<String> = match ctx.read() {
-                Ok(context) => sess
-                    .app_ids
-                    .iter()
-                    .filter_map(|id| context.app_find_by_id(*id))
-                    .map(|app| app.app_session_id)
-                    .collect(),
-                Err(_) => Vec::new(),
+            // Remove first, then act on what THIS call removed (#767 review):
+            // a concurrent delete of the same policy gets None here and sends
+            // nothing, and an AF whose Delete races the notification finds no
+            // app session (only its tombstone), so it never triggers an SM
+            // policy update toward an SMF that is deleting the policy.
+            let removed = ctx
+                .read()
+                .ok()
+                .and_then(|c| c.sess_remove_with_apps(sess.id));
+            let Some((removed_sess, apps)) = removed else {
+                return send_not_found(
+                    &format!("SM Policy {sm_policy_id} not found"),
+                    Some("POLICY_NOT_FOUND"),
+                );
             };
-            for app_id in &sess.app_ids {
-                pcf_sbi_send_policyauthorization_terminate_notify(*app_id);
-            }
-            remember_terminated_app_sessions(&app_session_ids);
-            if let Ok(context) = ctx.read() {
-                context.sess_remove(sess.id);
-            }
+            // Deregister the BSF binding (best-effort), once.
+            let binding_id = removed_sess.binding.id.clone().unwrap_or_default();
+            sbi_path::pcf_sess_deregister_bsf_binding(binding_id);
+            let terminated = terminate_af_app_sessions(&apps);
             log::info!(
-                "SM Policy {sm_policy_id} deleted ({} AF app session(s) terminated)",
-                app_session_ids.len()
+                "SM Policy {sm_policy_id} deleted ({terminated} AF app session(s) terminated)"
             );
             SbiResponse::with_status(204)
         }
@@ -2732,6 +2715,50 @@ pub async fn handle_sm_policy_delete(sm_policy_id: &str) -> SbiResponse {
             &format!("SM Policy {sm_policy_id} not found"),
             Some("POLICY_NOT_FOUND"),
         ),
+    }
+}
+
+/// Tell each AF that its application session context is no longer valid
+/// (TS 29.514 §4.2.5.3: `POST {notifUri}/terminate`, TerminationInfo with
+/// termCause PDU_SESSION_TERMINATION) and remember the ids so the AF's
+/// follow-up Delete (§4.2.4.2) is answered 204. `apps` must already be removed
+/// from the context. The tombstones go in BEFORE the notifications, so an AF
+/// that deletes at once still finds one. Returns how many were terminated.
+///
+/// PS_TO_CS_HO (§4.2.5.3 iii) is not derived: it applies only with the
+/// IMS_SBI feature, which this PCF does not advertise.
+fn terminate_af_app_sessions(apps: &[PcfApp]) -> usize {
+    let ids: Vec<String> = apps.iter().map(|a| a.app_session_id.clone()).collect();
+    remember_terminated_app_sessions(&ids);
+    for app in apps {
+        pcf_sbi_send_policyauthorization_terminate_notify_for(app);
+    }
+    apps.len()
+}
+
+/// Remove a UE's SM-policy context with all its sessions, terminating every
+/// AF application session bound to them (TS 29.514 §4.2.5.3, #767 review).
+///
+/// A UE SM normally goes with its last session (`sess_remove_inner`, #892).
+/// This is the API for removing one that still has sessions, so no AF is left
+/// believing in a context the PCF dropped.
+/// The termCause is PDU_SESSION_TERMINATION on purpose: every PDU session of
+/// the UE is gone, which is exactly that cause (§4.2.5.3 i).
+pub fn remove_ue_sm(pcf_ue_sm_id: u64) -> bool {
+    let removed = pcf_self()
+        .read()
+        .ok()
+        .and_then(|c| c.ue_sm_remove_with_apps(pcf_ue_sm_id));
+    match removed {
+        Some((ue_sm, apps)) => {
+            let n = terminate_af_app_sessions(&apps);
+            log::info!(
+                "[{}] PCF UE SM removed ({n} AF app session(s) terminated)",
+                ue_sm.supi
+            );
+            true
+        }
+        None => false,
     }
 }
 
@@ -7035,6 +7062,54 @@ mod tests {
     /// A `ueIpv6` binds the session whose PREFIX contains it — the AF sends a full
     /// address while the session holds a prefix, so an exact-string lookup would
     /// never match.
+    /// #892: through the SBI handlers, SM policy create then delete leaves no
+    /// UE SM behind, and the SUPI's next create works.
+    ///
+    /// Revert-verified: with main's context the count after the delete is 1.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn sm_policy_delete_of_the_last_session_removes_the_ue_sm() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        pcf_context_init(64, 64);
+        let supi = "imsi-001010000000892";
+        for round in 0..2 {
+            provision_session_with_ipv4(supi, 5, "10.45.0.192").await;
+            // Scoped to this SUPI, not `ue_sm_count()`: unguarded sibling tests
+            // add UE-SMs to the same process-global context (#338).
+            assert!(
+                pcf_self()
+                    .read()
+                    .unwrap()
+                    .ue_sm_find_by_supi(supi)
+                    .is_some(),
+                "round {round}"
+            );
+            let sm_policy_id = pcf_self()
+                .read()
+                .unwrap()
+                .sess_find_by_ipv4addr("10.45.0.192")
+                .expect("stored")
+                .sm_policy_id;
+            let resp = pcf_sbi_request_handler(make_request(
+                "POST",
+                &format!("/npcf-smpolicycontrol/v1/sm-policies/{sm_policy_id}/delete"),
+                None,
+            ))
+            .await;
+            assert_eq!(resp.status, 204, "round {round}");
+            let ctx = pcf_self();
+            let ctx = ctx.read().unwrap();
+            assert!(
+                ctx.ue_sm_find_by_supi(supi).is_none(),
+                "round {round}: the UE SM went with its last session"
+            );
+            assert!(ctx.sess_find_by_sm_policy_id(&sm_policy_id).is_none());
+        }
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
     async fn create_binds_by_ipv6_address_within_the_session_prefix() {
@@ -7086,6 +7161,206 @@ mod tests {
             resp.status, 403,
             "an address outside the prefix must not bind"
         );
+    }
+
+    /// A local AF that records every request (URI, JSON body) and answers 204.
+    async fn recording_af() -> (
+        Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+        u16,
+        nextgcore_sbi::server::SbiServer,
+    ) {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        let seen: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>> = Arc::default();
+        let sink = Arc::clone(&seen);
+        let (listener, local) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = local.port();
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let af = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+        af.start(move |req: SbiRequest| {
+            let sink = Arc::clone(&sink);
+            async move {
+                let body = req
+                    .http
+                    .content
+                    .as_deref()
+                    .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+                    .unwrap_or(serde_json::Value::Null);
+                sink.lock()
+                    .expect("sink")
+                    .push((req.header.uri.clone(), body));
+                SbiResponse::with_status(204)
+            }
+        })
+        .await
+        .expect("AF listener starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (seen, port, af)
+    }
+
+    async fn create_app_session(notif_uri: &str, ipv4: &str) -> String {
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions",
+            Some(af_create_body(notif_uri, ("ueIpv4", ipv4))),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        body["appSessionId"].as_str().unwrap().to_string()
+    }
+
+    fn sm_policy_id_of(ipv4: &str) -> String {
+        pcf_self()
+            .read()
+            .unwrap()
+            .sess_find_by_ipv4addr(ipv4)
+            .expect("the SM policy is stored")
+            .sm_policy_id
+    }
+
+    async fn terminates_seen(
+        seen: &std::sync::Mutex<Vec<(String, serde_json::Value)>>,
+        settle: Duration,
+    ) -> usize {
+        tokio::time::sleep(settle).await;
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|(uri, _)| uri.ends_with("/terminate"))
+            .count()
+    }
+
+    /// #767 review: two concurrent deletes of one SM policy terminate its AF
+    /// app session exactly once; the loser gets 404.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn concurrent_sm_policy_deletes_terminate_the_af_once() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        pcf_context_init(64, 64);
+        provision_session_with_ipv4("imsi-001010000000768", 8, "10.45.0.168").await;
+        let (seen, port, af) = recording_af().await;
+        create_app_session(&format!("http://127.0.0.1:{port}/af-768"), "10.45.0.168").await;
+        let path = format!(
+            "/npcf-smpolicycontrol/v1/sm-policies/{}/delete",
+            sm_policy_id_of("10.45.0.168")
+        );
+
+        // Two tasks on the multi-thread runtime, released together. The race
+        // window is too narrow to force from a test, so this pins the contract
+        // under real concurrency; the mechanism (only the caller whose removal
+        // succeeded gets the apps) is pinned deterministically by
+        // `context::tests::session_and_ue_removal_hand_back_their_apps_and_leave_no_index`.
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let spawn_delete = |path: String, barrier: Arc<tokio::sync::Barrier>| {
+            tokio::spawn(async move {
+                barrier.wait().await;
+                pcf_sbi_request_handler(make_request("POST", &path, Some(serde_json::json!({}))))
+                    .await
+                    .status
+            })
+        };
+        let a = spawn_delete(path.clone(), barrier.clone());
+        let b = spawn_delete(path.clone(), barrier);
+        let mut statuses = [a.await.unwrap(), b.await.unwrap()];
+        statuses.sort();
+        assert_eq!(
+            statuses,
+            [204, 404],
+            "one delete wins, the other finds nothing"
+        );
+        assert_eq!(
+            terminates_seen(&seen, Duration::from_millis(500)).await,
+            1,
+            "the AF is told exactly once"
+        );
+        af.stop().await.expect("stop AF");
+    }
+
+    /// #767 review: an unreachable AF does not hold up or fail the SM policy
+    /// delete, and the AF's later Delete is still answered 204.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn sm_policy_delete_with_an_unreachable_af_still_succeeds() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        pcf_context_init(64, 64);
+        provision_session_with_ipv4("imsi-001010000000769", 9, "10.45.0.169").await;
+        // A port with nothing listening: bind, read the port, close.
+        let dead_port = {
+            let (_listener, local) = nextgcore_sbi::test_support::bound_listener().into_parts();
+            local.port()
+        };
+        let app_session_id = create_app_session(
+            &format!("http://127.0.0.1:{dead_port}/af-769"),
+            "10.45.0.169",
+        )
+        .await;
+        let path = format!(
+            "/npcf-smpolicycontrol/v1/sm-policies/{}/delete",
+            sm_policy_id_of("10.45.0.169")
+        );
+        let started = std::time::Instant::now();
+        let resp =
+            pcf_sbi_request_handler(make_request("POST", &path, Some(serde_json::json!({})))).await;
+        assert_eq!(resp.status, 204);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the notification is spawned, never awaited by the delete"
+        );
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            &format!("/npcf-policyauthorization/v1/app-sessions/{app_session_id}/delete"),
+            None,
+        ))
+        .await;
+        assert_eq!(
+            resp.status, 204,
+            "the AF's Delete after termination is a 204"
+        );
+    }
+
+    /// #767 review: removing a UE's SM-policy context terminates the AF app
+    /// sessions of all its sessions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn ue_removal_terminates_the_af_app_sessions() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        pcf_context_init(64, 64);
+        provision_session_with_ipv4("imsi-001010000000770", 10, "10.45.0.170").await;
+        let (seen, port, af) = recording_af().await;
+        create_app_session(&format!("http://127.0.0.1:{port}/af-770"), "10.45.0.170").await;
+        let ue_id = pcf_self()
+            .read()
+            .unwrap()
+            .ue_sm_find_by_supi("imsi-001010000000770")
+            .expect("ue sm")
+            .id;
+
+        assert!(remove_ue_sm(ue_id));
+        let mut n = 0;
+        for _ in 0..100 {
+            n = terminates_seen(&seen, Duration::from_millis(20)).await;
+            if n > 0 {
+                break;
+            }
+        }
+        assert_eq!(n, 1, "the AF of the UE's session is told");
+        assert!(!remove_ue_sm(ue_id), "a second removal finds nothing");
+        af.stop().await.expect("stop AF");
     }
 
     /// #767, TS 29.514 §4.2.5.3: deleting the SM policy terminates the AF
@@ -7183,6 +7458,20 @@ mod tests {
         assert!(
             uri.ends_with("/af-notif-767/terminate"),
             "delivered to {uri}"
+        );
+        // #878 review: the app session was already gone from the context when
+        // its terminate notification was sent (remove first, notify after).
+        let sent: Vec<bool> = crate::sbi_path::TERMINATES_SENT_FOR_TEST
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| *id == app_session_id)
+            .map(|(_, present)| *present)
+            .collect();
+        assert_eq!(
+            sent,
+            vec![false],
+            "notified exactly once, after the removal"
         );
         assert_eq!(body["termCause"], "PDU_SESSION_TERMINATION", "{body}");
         assert_eq!(
@@ -8120,29 +8409,19 @@ mod tests {
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
         assert_eq!(body["cause"], "UAV_FLIGHT_NOT_AUTHORIZED");
 
-        // #90 criterion 5: the refusal leaves NO session behind.
-        //
-        // The UE-SM lookup is `expect`, not `if let Some(..)`. That matters: the
-        // session assertion below is a NEGATIVE one, and a negative assertion is
-        // satisfied by every path that never arrived — including a create rejected
-        // before it ever resolved a UE-SM. Requiring the UE-SM to be there first is
-        // the positive half that proves the path DID arrive, and it is true by
-        // construction because the refusal removes the session, not the UE (the
-        // create resolves the UE-SM find-then-add, so a retry reuses it).
-        let ue_sm = ctx
-            .read()
-            .expect("ctx")
-            .ue_sm_find_by_supi("imsi-001010000000910")
-            .expect("the refused create must still have resolved a UE-SM");
+        // #90 criterion 5: the refusal leaves NO session behind, and since #892
+        // no UE-SM either: the refused session was the SUPI's only one, and a
+        // UE-SM goes with its last session. The positive half (the path DID
+        // arrive) is the UAV_FLIGHT_NOT_AUTHORIZED cause above, which is only
+        // answered after the session was created and is then removed.
+        let ctx = ctx.read().expect("ctx");
         assert!(
-            ctx.read()
-                .expect("ctx")
-                .sess_find_by_psi(ue_sm.id, 5)
-                .is_none(),
-            "a rejected UAV create must leave no PcfSess for its (SUPI, PSI) — it \
-             leaked one per attempt before #90, and again for every removal once any \
-             index lock was poisoned (#338)"
+            ctx.ue_sm_find_by_supi("imsi-001010000000910").is_none(),
+            "a rejected UAV create must leave neither a PcfSess (it leaked one per \
+             attempt before #90, and again once any index lock was poisoned, #338) nor \
+             its now-empty UE-SM (#892)"
         );
+        drop(ctx);
 
         std::env::remove_var("PCF_UAV_DNN");
     }
@@ -8209,27 +8488,13 @@ mod tests {
             let body: serde_json::Value =
                 serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
             assert_eq!(body["cause"], "UAV_FLIGHT_NOT_AUTHORIZED", "{label}");
-            // Scoped to THIS (SUPI, PSI), not a `sess_count()` delta. The delta was
-            // the flake #338 reported: 29 pcfd tests mutate the process-global PCF
-            // context without taking CONTEXT_GUARD, so a sibling creating or
-            // deleting a session between the two reads falsified it — and it read 0
-            // outright if any sibling had poisoned `sess_list`, since `sess_count`
-            // answers `unwrap_or(0)`. The UE-SM `expect` is the positive half: it
-            // proves the create reached the point of resolving a UE-SM, so the
-            // negative session assertion is not satisfied by a path that never ran.
-            let ue_sm = ctx
-                .read()
-                .expect("ctx")
-                .ue_sm_find_by_supi(&supi)
-                .unwrap_or_else(|| {
-                    panic!("{label}: the refused create must still have resolved a UE-SM")
-                });
+            // Scoped to THIS SUPI, not a `sess_count()` delta: 29 pcfd tests mutate
+            // the process-global context without CONTEXT_GUARD, so a delta flakes
+            // (#338). The refused session was the SUPI's only one, so its UE-SM
+            // goes with it (#892); the cause above proves the path ran.
             assert!(
-                ctx.read()
-                    .expect("ctx")
-                    .sess_find_by_psi(ue_sm.id, 9)
-                    .is_none(),
-                "{label}: the refusal must leave no session for this (SUPI, PSI)"
+                ctx.read().expect("ctx").ue_sm_find_by_supi(&supi).is_none(),
+                "{label}: the refusal must leave no session (and so no UE-SM) for this SUPI"
             );
         }
 
