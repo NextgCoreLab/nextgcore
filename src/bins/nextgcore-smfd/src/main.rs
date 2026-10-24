@@ -6394,12 +6394,10 @@ async fn send_n1_n2_paging_request(amf_uri: &str, supi: &str, psi: u8, qfi: Opti
             serde_json::json!({ "qfi": qfi });
     }
     let request = SReq::post(&path).with_body(body.to_string(), content_type::APPLICATION_JSON);
-    let client = nextgcore_sbi::client::SbiClient::new(
-        nextgcore_sbi::security::sbi_peer_client_config(&host, port)
-            .with_connect_timeout(std::time::Duration::from_secs(2))
-            .with_request_timeout(std::time::Duration::from_secs(3)),
-    );
-    match send_n1n2_honouring_paging_conflict(&client, request).await {
+    let config = nextgcore_sbi::security::sbi_peer_client_config(&host, port)
+        .with_connect_timeout(std::time::Duration::from_secs(2))
+        .with_request_timeout(std::time::Duration::from_secs(3));
+    match send_n1n2_honouring_paging_conflict(config, request).await {
         Ok(resp) => log::info!(
             "N1N2MessageTransfer (paging, SUPI {supi}, PSI {psi}, QFI {qfi:?}) → \
              {host}:{port}: status={}",
@@ -6439,32 +6437,55 @@ fn n1n2_paging_conflict_retry_after(
     })
 }
 
-/// Send an N1N2MessageTransfer, and when the AMF refuses it because it is already
+/// Send an N1N2MessageTransfer. When the AMF refuses it because it is already
 /// paging the UE for another transfer (#749: 409 `HIGHER_PRIORITY_REQUEST_ONGOING`,
-/// TS 23.502 §4.2.3.3 step 3b), wait the `retryAfter` it names (the consumer "shall
-/// not initiate the downlink messaging until the timer expires", TS 29.518
-/// §5.2.2.3.1) and send it again, a bounded number of times. By then the UE has
-/// answered the paging and the transfer reaches it CM-CONNECTED, or it is still
-/// being paged.
+/// TS 23.502 §4.2.3.3 step 3b), send it again after the `retryAfter` the AMF
+/// names, a bounded number of times. The consumer "shall not initiate the
+/// downlink messaging until the timer expires" (TS 29.518 §5.2.2.3.1). By then
+/// the UE has answered the paging and the transfer reaches it CM-CONNECTED, or it
+/// is still being paged.
+///
+/// The retries run on their own task (#1079 review): the callers sit on the N4
+/// receive loop (a DLDR's Session Report) and the 5GSM timer tick, which serve
+/// every UE, so waiting there would stall N4, heartbeat answers included. The
+/// first answer is returned as is.
 async fn send_n1n2_honouring_paging_conflict(
-    client: &nextgcore_sbi::client::SbiClient,
+    config: nextgcore_sbi::client::SbiClientConfig,
     request: nextgcore_sbi::message::SbiRequest,
 ) -> nextgcore_sbi::SbiResult<nextgcore_sbi::message::SbiResponse> {
-    let mut attempt = 0;
-    loop {
-        let resp = client.send_request(request.clone()).await?;
-        match n1n2_paging_conflict_retry_after(&resp) {
-            Some(wait) if attempt < N1N2_PAGING_CONFLICT_RETRIES => {
-                attempt += 1;
+    let resp = nextgcore_sbi::client::SbiClient::new(config.clone())
+        .send_request(request.clone())
+        .await?;
+    if let Some(wait) = n1n2_paging_conflict_retry_after(&resp) {
+        tokio::spawn(async move {
+            let client = nextgcore_sbi::client::SbiClient::new(config);
+            let mut wait = wait;
+            for attempt in 1..=N1N2_PAGING_CONFLICT_RETRIES {
                 log::info!(
                     "N1N2MessageTransfer refused, the AMF is paging the UE for another \
                      transfer; retrying in {wait:?} ({attempt}/{N1N2_PAGING_CONFLICT_RETRIES})"
                 );
                 tokio::time::sleep(wait).await;
+                match client.send_request(request.clone()).await {
+                    Ok(resp) => match n1n2_paging_conflict_retry_after(&resp) {
+                        Some(next) => wait = next,
+                        None => {
+                            log::info!("N1N2MessageTransfer retried: status={}", resp.status);
+                            return;
+                        }
+                    },
+                    Err(e) => {
+                        log::warn!("N1N2MessageTransfer retry failed: {e}");
+                        return;
+                    }
+                }
             }
-            _ => return Ok(resp),
-        }
+            log::warn!(
+                "N1N2MessageTransfer still refused after {N1N2_PAGING_CONFLICT_RETRIES} retries"
+            );
+        });
     }
+    Ok(resp)
 }
 
 /// The N4 receive/dispatch loop over the one PFCP socket.
@@ -6776,12 +6797,10 @@ async fn send_n1_n2_message_transfer(amf_uri: Option<&str>, supi: &str, psi: u8,
             content_type::APPLICATION_5GNAS,
             bytes::Bytes::copy_from_slice(n1),
         ));
-    let client = nextgcore_sbi::client::SbiClient::new(
-        nextgcore_sbi::security::sbi_peer_client_config(&host, port)
-            .with_connect_timeout(std::time::Duration::from_secs(2))
-            .with_request_timeout(std::time::Duration::from_secs(3)),
-    );
-    match send_n1n2_honouring_paging_conflict(&client, request).await {
+    let config = nextgcore_sbi::security::sbi_peer_client_config(&host, port)
+        .with_connect_timeout(std::time::Duration::from_secs(2))
+        .with_request_timeout(std::time::Duration::from_secs(3));
+    match send_n1n2_honouring_paging_conflict(config, request).await {
         Ok(resp) => log::info!(
             "N1N2MessageTransfer (SUPI {supi}, PSI {psi}, {} bytes) → {host}:{port}: status={}",
             n1.len(),
@@ -11093,7 +11112,7 @@ mod tests {
                         SbiResponse::with_status(409)
                             .with_json_body(&serde_json::json!({
                                 "error": { "status": 409, "cause": "HIGHER_PRIORITY_REQUEST_ONGOING" },
-                                "errInfo": { "retryAfter": 0 },
+                                "errInfo": { "retryAfter": 1 },
                             }))
                             .unwrap()
                     } else {
@@ -11105,6 +11124,7 @@ mod tests {
             })
             .await
             .expect("stand-in AMF starts");
+        let started = std::time::Instant::now();
         send_n1_n2_paging_request(
             &format!("http://127.0.0.1:{}", port_addr.port()),
             "imsi-001010007490031",
@@ -11112,10 +11132,19 @@ mod tests {
             None,
         )
         .await;
+        // #1079 review: the caller (the N4 loop) is not held for the retry.
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        for _ in 0..200 {
+            if seen.load(std::sync::atomic::Ordering::SeqCst) == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         assert_eq!(
             seen.load(std::sync::atomic::Ordering::SeqCst),
             2,
-            "refused once, sent again"
+            "refused once, sent again off the caller's task"
         );
     }
 
