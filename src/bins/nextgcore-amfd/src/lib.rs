@@ -67,6 +67,13 @@ pub mod test_support {
     /// module's `mod tests`.
     pub static SMF_ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
+    /// Serialises tests that drain the process-global connected-UE downlink queue
+    /// (`AmfContext::connected_downlink_queue`, drained by
+    /// `NgapServer::process_connected_downlinks`). A drain takes EVERY queued item,
+    /// so two such tests in parallel steal each other's transfers. A tokio mutex,
+    /// because the guard is held across the drain's `.await`s.
+    pub static CONNECTED_DOWNLINK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// Serialises tests that set the UCMF endpoint environment variables
     /// (`UCMF_SBI_ADDR` / `UCMF_SBI_PORT`), for the same reason as
     /// [`SMF_ENV_LOCK`].
