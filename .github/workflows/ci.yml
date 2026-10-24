@@ -208,17 +208,23 @@ jobs:
 
   research-features:
     name: 6G / research features
-    # The 6G and research code is behind cargo features that no other job
-    # enables, so the default test and clippy runs never see it. The Check job's
-    # `--all-features` build only compiles it, and does not deny warnings. That
-    # is how the http3 test module carried an unused import nobody saw. This job
+    # No other job enables the cargo features that gate the 6G and research
+    # code, so the default test and clippy runs never see it. The Check job's
+    # `--all-features` build only compiles it and does not deny warnings. That
+    # is how an unused import in the http3 test module went unnoticed. This job
     # tests and lints each feature on its own crate, the way an operator would
     # build it. It mirrors nextgsim's "6G crates (feature-gated)" job.
     #
     # One list drives both loops, so the tested set and the linted set cannot
-    # drift apart. Each entry is `crate:feature`, built with `-p`, so one
-    # crate's feature cannot pull in another crate's. Add a line per new gated
-    # research feature.
+    # drift apart. Each entry is `crate:feature` and is built with `-p`, so one
+    # crate's feature cannot leak into another crate's build. Add a line per
+    # new gated research feature.
+    #
+    # Trigger: the lint steps run on every push and PR. The test loop runs
+    # NIGHTLY and on dispatch. Measured on the PR that added the job (#1108),
+    # the whole job took 12m49s: about 9 min of tests and 3 min of clippy. That
+    # is over the ~10 min a per-push job may add. The lint is the cheap half,
+    # and it is the half that caught the http3 import.
     runs-on: ubuntu-latest
     needs: check
     timeout-minutes: 60
@@ -245,15 +251,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src
-      - name: cargo test (per crate and feature)
-        run: |
-          set -eu
-          cd src
-          for entry in $RESEARCH_FEATURES; do
-            echo "::group::cargo test -p ${entry%%:*} --features ${entry#*:}"
-            cargo test -p "${entry%%:*}" --features "${entry#*:}"
-            echo "::endgroup::"
-          done
       - name: cargo clippy (per crate and feature)
         run: |
           set -eu
@@ -261,6 +258,22 @@ jobs:
           for entry in $RESEARCH_FEATURES; do
             echo "::group::cargo clippy -p ${entry%%:*} --features ${entry#*:}"
             cargo clippy -p "${entry%%:*}" --features "${entry#*:}" --all-targets -- -D warnings
+            echo "::endgroup::"
+          done
+      - name: cargo clippy (all features together)
+        # The loop above lints each feature on its own. This step lints them
+        # combined, so it catches a lint that appears only when two features
+        # meet (for example sbi's `6g-extensions` with `http3`). Clippy does not
+        # link, so the kernel-sctp features need no libsctp here.
+        run: cd src && cargo clippy --workspace --all-features --all-targets -- -D warnings
+      - name: cargo test (per crate and feature)
+        if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+        run: |
+          set -eu
+          cd src
+          for entry in $RESEARCH_FEATURES; do
+            echo "::group::cargo test -p ${entry%%:*} --features ${entry#*:}"
+            cargo test -p "${entry%%:*}" --features "${entry#*:}"
             echo "::endgroup::"
           done
 
