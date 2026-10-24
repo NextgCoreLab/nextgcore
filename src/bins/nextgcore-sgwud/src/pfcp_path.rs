@@ -1299,7 +1299,7 @@ impl SxaNode {
         }
     }
 
-    /// TS 29.244 §6.2.9: acknowledge, then drop the peer and its sessions.
+    /// TS 29.244 §6.2.8.3 (UP function behaviour): acknowledge, then drop the peer and its sessions.
     async fn handle_association_release_request(
         &self,
         header: &PfcpHeader,
