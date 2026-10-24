@@ -452,11 +452,16 @@ pub mod interface {
 
 /// PFCP apply action flags
 /// The [`apply_action`] flags of an Apply Action IE value as
-/// [`PfcpMessageBuilder::add_apply_action`] writes it: the inverse of that encoder,
-/// so a reader of this SMF's own requests (#994) agrees with it whatever its octet
-/// order (#1008). A one-octet value is the first octet.
+/// [`PfcpMessageBuilder::add_apply_action`] writes it (#994): its inverse, whatever
+/// octet order that encoder uses (#1008 moves it to octet 5 first), found by probing
+/// it, so a reader of this SMF's own requests always agrees with them. A one-octet
+/// value is octet 5.
 pub fn decode_apply_action(value: &[u8]) -> u16 {
+    let mut probe = PfcpMessageBuilder::new();
+    probe.add_apply_action(apply_action::DROP);
+    let octet5_first = probe.build().get(4) == Some(&0x01);
     match value {
+        [a, b, ..] if octet5_first => u16::from_le_bytes([*a, *b]),
         [a, b, ..] => u16::from_be_bytes([*a, *b]),
         [a] => u16::from(*a),
         [] => 0,
