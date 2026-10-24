@@ -693,10 +693,17 @@ pub fn nas_eps_send_tau_accept(
     if use_initial_context_setup {
         // The TAU Accept travels inside the Initial Context Setup Request, so
         // transmit that PDU rather than the bare NAS message (issue #42).
+        // E-RABs only for the bearers established at the Serving GW: a session
+        // that never connected has no S1-U SGW endpoint to set up.
+        let active: Vec<MmeBearer> = bearers
+            .iter()
+            .filter(|b| b.sgw_s1u_teid != 0)
+            .cloned()
+            .collect();
         let s1ap_message = s1ap_build::build_initial_context_setup_request(
             mme_ue,
             enb_ue,
-            bearers,
+            &active,
             Some(&emm_message),
             ue_ambr,
         )
