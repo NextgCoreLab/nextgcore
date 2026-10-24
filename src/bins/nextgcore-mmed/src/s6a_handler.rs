@@ -303,13 +303,22 @@ pub fn mme_s6a_process_inbound(inbound: &crate::fd_path::InboundS6aRequest) -> S
                     };
                     // A retransmitted CLR while the detach it started is
                     // running changes nothing: it would resend DETACH
-                    // REQUEST and reset T3422's count (#828).
-                    let detaching = ctx.mme_ue_find_by_id(ue_id).is_some_and(|ue| {
+                    // REQUEST and reset T3422's count (#828). Only a detach a
+                    // CLR started: one begun for another reason (an SGW
+                    // restart, a PGW-initiated last-bearer release) has not
+                    // carried the HSS's detach type, so the CLR is served: the
+                    // DETACH REQUEST is resent with the CLR's type and T3422
+                    // restarted (§5.5.2.3.5). That other detach has normally
+                    // already deleted the PDN connections locally, so there is
+                    // usually no Delete Session Request left to send.
+                    let detaching_by_clr = ctx.mme_ue_find_by_id(ue_id).is_some_and(|ue| {
                         ue.nas_eps.type_ == crate::context::MmeEpsType::DetachRequestToUe
+                            && ue.network_detach_by_clr
                     });
-                    if detaching {
+                    if detaching_by_clr {
                         log::info!(
-                            "[{}] Cancel Location while its detach is already running; ignored",
+                            "[{}] Cancel Location while the detach it started is running; \
+                             ignored",
                             inbound.imsi_bcd
                         );
                         return Ok(());
@@ -334,6 +343,11 @@ pub fn mme_s6a_process_inbound(inbound: &crate::fd_path::InboundS6aRequest) -> S
                         detach_type,
                         "a Cancel Location (subscription withdrawal) from the HSS",
                     );
+                    if outcome == crate::network_detach::DetachOutcome::DetachRequestSent {
+                        if let Some(ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&ue_id) {
+                            ue.network_detach_by_clr = true;
+                        }
+                    }
                     log::info!(
                         "[{}] HSS-initiated detach ({detach_type:?}, Reattach-Required={}): \
                          {outcome:?}",
@@ -349,12 +363,148 @@ pub fn mme_s6a_process_inbound(inbound: &crate::fd_path::InboundS6aRequest) -> S
             Ok(())
         }
         S6aMessage::Idr(idr) => {
-            let mut pool = ctx.mme_ue_pool.write().unwrap();
-            let mme_ue = pool.get_mut(&ue_id).ok_or(S6aError::UeNotFound)?;
-            mme_s6a_handle_idr(mme_ue, idr)
+            let (before, after) = {
+                let mut pool = ctx.mme_ue_pool.write().unwrap();
+                let mme_ue = pool.get_mut(&ue_id).ok_or(S6aError::UeNotFound)?;
+                let before = crate::s1ap_build::ue_ambr_of(ctx, mme_ue);
+                mme_s6a_handle_idr(mme_ue, idr)?;
+                (before, crate::s1ap_build::ue_ambr_of(ctx, mme_ue))
+            };
+            // #811, TS 23.401 §5.4.2.2: when the subscribed UE-AMBR changes for
+            // an ECM-CONNECTED UE, the eNB is told the new UE-AMBR with UE
+            // CONTEXT MODIFICATION (TS 36.413 §8.3.4). An ECM-IDLE UE gets it
+            // in its next Initial Context Setup.
+            if after != before {
+                for send in signal_ue_ambr(ctx, ue_id, &inbound.imsi_bcd) {
+                    crate::s1ap_path::s1ap_send(send);
+                }
+            }
+            Ok(())
         }
         _ => Err(S6aError::InvalidMessage),
     }
+}
+
+/// UEs whose UE-AMBR change waits for a procedure in progress (an index over
+/// `MmeUe::ue_ambr_deferred`, so the S1AP dispatch does not walk every UE).
+static UE_AMBR_DEFERRED: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+/// Why a UE CONTEXT MODIFICATION REQUEST for the UE-AMBR must wait, if it must:
+/// an INITIAL CONTEXT SETUP or an S1 handover is in progress on `enb_ue`, and the
+/// in-flight procedure carries a UE-AMBR computed before the change (#869
+/// review). The eNB could fail the modification (TS 36.413 §8.3.4.3) or the
+/// handover would install the old value at the target.
+fn ue_ambr_blocked(
+    ctx: &crate::context::MmeContext,
+    mme_ue: &MmeUe,
+    enb_ue: &crate::context::EnbUe,
+) -> Option<&'static str> {
+    if mme_ue.ics_pending_on == enb_ue.id {
+        return Some("an Initial Context Setup is in progress");
+    }
+    let handover = enb_ue.target_ue_id != crate::context::NEXTGCORE_INVALID_POOL_ID
+        || ctx
+            .enb_ue_pool
+            .read()
+            .unwrap()
+            .values()
+            .any(|t| t.mme_ue_id == mme_ue.id && t.handover_prep_deadline.is_some());
+    handover.then_some("an S1 handover is in progress")
+}
+
+/// Tell the eNB serving `ue_id` its current UE-AMBR (TS 23.401 §5.4.2.2, UE
+/// CONTEXT MODIFICATION, TS 36.413 §8.3.4). Nothing for an ECM-IDLE UE: its next
+/// Initial Context Setup carries the value. Deferred while an Initial Context
+/// Setup or S1 handover is in progress; [`deferred_ue_ambr_sends`] sends it when
+/// that ends.
+pub fn signal_ue_ambr(
+    ctx: &crate::context::MmeContext,
+    ue_id: u64,
+    imsi: &str,
+) -> Vec<crate::s1ap_handler::S1apSend> {
+    let Some(mme_ue) = ctx.mme_ue_find_by_id(ue_id) else {
+        return Vec::new();
+    };
+    let Some(enb_ue) = ctx
+        .enb_ue_find_by_id(mme_ue.enb_ue_id)
+        .filter(|e| e.mme_ue_id == ue_id)
+    else {
+        log::info!(
+            "[{imsi}] UE-AMBR changed while ECM-IDLE: the next Initial Context Setup carries it"
+        );
+        return Vec::new();
+    };
+    if let Some(why) = ue_ambr_blocked(ctx, &mme_ue, &enb_ue) {
+        log::info!("[{imsi}] UE-AMBR change deferred: {why}");
+        if let Some(ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&ue_id) {
+            ue.ue_ambr_deferred = true;
+        }
+        let mut index = UE_AMBR_DEFERRED.lock().unwrap_or_else(|e| e.into_inner());
+        if !index.contains(&ue_id) {
+            index.push(ue_id);
+        }
+        return Vec::new();
+    }
+    let ambr = crate::s1ap_build::ue_ambr_of(ctx, &mme_ue);
+    match crate::s1ap_build::build_ue_context_modification_for_ue_ambr(&enb_ue, ambr) {
+        Ok(pdu) => {
+            log::info!(
+                "[{imsi}] UE-AMBR changed: UE CONTEXT MODIFICATION REQUEST with UE-AMBR {}/{} \
+                 bit/s (TS 23.401 §5.4.2.2)",
+                ambr.dl,
+                ambr.ul
+            );
+            if let Some(ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&ue_id) {
+                ue.ue_ambr_deferred = false;
+                ue.ue_ambr_modification_pending = true;
+            }
+            vec![crate::s1ap_handler::S1apSend {
+                enb_id: enb_ue.enb_id,
+                pdu,
+            }]
+        }
+        Err(e) => {
+            log::error!("[{imsi}] UE Context Modification Request not built: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// The UE-AMBR changes deferred by [`signal_ue_ambr`] whose blocking procedure
+/// has ended, as UE CONTEXT MODIFICATION REQUESTs. Called after each S1AP
+/// message and handover-preparation sweep; free when nothing is deferred.
+pub fn deferred_ue_ambr_sends(
+    ctx: &crate::context::MmeContext,
+) -> Vec<crate::s1ap_handler::S1apSend> {
+    let ids: Vec<u64> = {
+        let index = UE_AMBR_DEFERRED.lock().unwrap_or_else(|e| e.into_inner());
+        if index.is_empty() {
+            return Vec::new();
+        }
+        index.clone()
+    };
+    let mut out = Vec::new();
+    for id in ids {
+        let Some(ue) = ctx.mme_ue_find_by_id(id).filter(|ue| ue.ue_ambr_deferred) else {
+            UE_AMBR_DEFERRED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|x| *x != id);
+            continue;
+        };
+        let sends = signal_ue_ambr(ctx, id, &ue.imsi_bcd);
+        let still = ctx
+            .mme_ue_find_by_id(id)
+            .is_some_and(|ue| ue.ue_ambr_deferred);
+        if !still {
+            UE_AMBR_DEFERRED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|x| *x != id);
+        }
+        out.extend(sends);
+    }
+    out
 }
 
 /// Handle Insert Subscriber Data Request
@@ -825,6 +975,194 @@ mod tests {
         mme_ue_id
     }
 
+    /// A connected UE with one active 1 Gbit/s APN and a 1 Gbit/s subscribed
+    /// UE-AMBR, its eNB tapped. Returns (MME UE id, eNB UE id, an ISD builder, a
+    /// reader of the UE-AMBRs in UE CONTEXT MODIFICATION REQUESTs sent).
+    #[allow(clippy::type_complexity)]
+    fn ue_ambr_fixture(
+        imsi: &'static str,
+        s1ap_id: u32,
+    ) -> (
+        u64,
+        u64,
+        impl Fn(u64, u64) -> crate::fd_path::InboundS6aRequest,
+        impl Fn() -> Vec<(u64, u64)>,
+    ) {
+        use nextgcore_s1ap_gen::generated as g;
+        let mme_ue_id = seed_connected_ue(imsi, s1ap_id);
+        let ctx = crate::context::mme_self();
+        let enb_ue_id = ctx.mme_ue_find_by_id(mme_ue_id).unwrap().enb_ue_id;
+        let enb_id = ctx.enb_ue_find_by_id(enb_ue_id).unwrap().enb_id;
+        // One active APN of 1 Gbit/s; subscribed UE-AMBR 1 Gbit/s.
+        let sess_id = ctx.sess_add(mme_ue_id, 1);
+        let bearer_id = ctx.bearer_add(sess_id, mme_ue_id);
+        {
+            let mut pool = ctx.bearer_pool.write().unwrap();
+            let b = pool.get_mut(&bearer_id).unwrap();
+            b.ebi = 5;
+            b.sgw_s1u_teid = 0x811;
+        }
+        {
+            let mut pool = ctx.sess_pool.write().unwrap();
+            let s = pool.get_mut(&sess_id).unwrap();
+            s.bearer_list.push(bearer_id);
+            s.ambr.downlink = 1_000_000_000;
+            s.ambr.uplink = 1_000_000_000;
+        }
+        {
+            let mut pool = ctx.mme_ue_pool.write().unwrap();
+            let ue = pool.get_mut(&mme_ue_id).unwrap();
+            ue.sess_list.push(sess_id);
+            ue.ambr.downlink = 1_000_000_000;
+            ue.ambr.uplink = 1_000_000_000;
+        }
+        crate::s1ap_path::tap_enb_for_test(enb_id);
+        let _ = crate::s1ap_path::take_tapped_for_test(enb_id);
+        let isd = move |dl: u64, ul: u64| crate::fd_path::InboundS6aRequest {
+            imsi_bcd: imsi.to_string(),
+            message: crate::fd_path::S6aMessage::Idr(crate::fd_path::IdrMessage {
+                idr_flags: 0,
+                subscription_data: crate::fd_path::SubscriptionData {
+                    ambr_downlink: dl,
+                    ambr_uplink: ul,
+                    ..Default::default()
+                },
+            }),
+        };
+        let ue_ctx_mods = move || -> Vec<(u64, u64)> {
+            crate::s1ap_path::take_tapped_for_test(enb_id)
+                .into_iter()
+                .filter_map(|pdu| match nextgcore_s1ap_gen::decode(&pdu) {
+                    Ok(g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+                        value: g::InitiatingMessageValue::Id_UEContextModification(req),
+                        ..
+                    })) => req.protocol_i_es.0.into_iter().find_map(|ie| match ie.value {
+                        g::UEContextModificationRequestProtocolIEs_EntryValue::Id_uEaggregateMaximumBitrate(a) => {
+                            Some((a.u_eaggregate_maximum_bit_rate_dl.0, a.u_eaggregate_maximum_bit_rate_ul.0))
+                        }
+                        _ => None,
+                    }),
+                    _ => None,
+                })
+                .collect()
+        };
+        (mme_ue_id, enb_ue_id, isd, ue_ctx_mods)
+    }
+
+    /// #869 review MAJOR, TS 23.401 §5.4.2.2: an Insert Subscriber Data that
+    /// changes the subscribed UE-AMBR of an ECM-CONNECTED UE reaches the eNB in
+    /// a UE CONTEXT MODIFICATION REQUEST carrying the recomputed UE-AMBR; one
+    /// that leaves it unchanged sends nothing.
+    #[test]
+    fn a_subscribed_ue_ambr_change_is_signalled_to_the_enb() {
+        let _guard = crate::gtp_path::lock_s11();
+        const IMSI: &str = "999990000000811";
+        let (mme_ue_id, _, isd, ue_ctx_mods) = ue_ambr_fixture(IMSI, 811);
+        let ctx = crate::context::mme_self();
+        // Lowered to 10 / 5 Mbit/s: the eNB is told.
+        mme_s6a_process_inbound(&isd(10_000_000, 5_000_000)).unwrap();
+        assert_eq!(ue_ctx_mods(), vec![(10_000_000, 5_000_000)]);
+        // The same value again: nothing to tell.
+        mme_s6a_process_inbound(&isd(10_000_000, 5_000_000)).unwrap();
+        assert!(ue_ctx_mods().is_empty());
+        ctx.mme_ue_remove(mme_ue_id);
+    }
+
+    /// #869 review: an ECM-IDLE UE is sent nothing; its next Initial Context
+    /// Setup carries the recomputed UE-AMBR (`ue_ambr_of` reads the new value).
+    #[test]
+    fn an_idle_ue_gets_its_ue_ambr_change_at_the_next_connection() {
+        let _guard = crate::gtp_path::lock_s11();
+        let (mme_ue_id, _, isd, ue_ctx_mods) = ue_ambr_fixture("999990000008691", 8691);
+        let ctx = crate::context::mme_self();
+        ctx.mme_ue_pool
+            .write()
+            .unwrap()
+            .get_mut(&mme_ue_id)
+            .unwrap()
+            .enb_ue_id = crate::context::NEXTGCORE_INVALID_POOL_ID;
+        mme_s6a_process_inbound(&isd(10_000_000, 5_000_000)).unwrap();
+        assert!(ue_ctx_mods().is_empty(), "nothing to an idle UE");
+        let ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert!(!ue.ue_ambr_deferred, "not deferred either: there is no S1");
+        assert_eq!(
+            crate::s1ap_build::ue_ambr_of(ctx, &ue),
+            nextgcore_s1ap::UeAmbr {
+                dl: 10_000_000,
+                ul: 5_000_000
+            },
+            "what the next Initial Context Setup carries"
+        );
+        ctx.mme_ue_remove(mme_ue_id);
+    }
+
+    /// #869 review: while an Initial Context Setup is outstanding the change is
+    /// deferred (the request in flight carries the earlier value, and the eNB
+    /// could fail a modification racing it), then signalled once it is answered.
+    #[test]
+    fn a_ue_ambr_change_waits_for_the_initial_context_setup() {
+        let _guard = crate::gtp_path::lock_s11();
+        let (mme_ue_id, enb_ue_id, isd, ue_ctx_mods) = ue_ambr_fixture("999990000008692", 8692);
+        let ctx = crate::context::mme_self();
+        ctx.mme_ue_pool
+            .write()
+            .unwrap()
+            .get_mut(&mme_ue_id)
+            .unwrap()
+            .ics_pending_on = enb_ue_id;
+        mme_s6a_process_inbound(&isd(10_000_000, 5_000_000)).unwrap();
+        assert!(ue_ctx_mods().is_empty(), "deferred");
+        assert!(deferred_ue_ambr_sends(ctx).is_empty(), "still in progress");
+        ctx.mme_ue_pool
+            .write()
+            .unwrap()
+            .get_mut(&mme_ue_id)
+            .unwrap()
+            .ics_pending_on = 0;
+        let sends = deferred_ue_ambr_sends(ctx);
+        assert_eq!(sends.len(), 1, "signalled once the setup is answered");
+        for send in sends {
+            crate::s1ap_path::s1ap_send(send);
+        }
+        assert_eq!(ue_ctx_mods(), vec![(10_000_000, 5_000_000)]);
+        let ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert!(!ue.ue_ambr_deferred);
+        assert!(ue.ue_ambr_modification_pending);
+        assert!(deferred_ue_ambr_sends(ctx).is_empty(), "once");
+        ctx.mme_ue_remove(mme_ue_id);
+    }
+
+    /// #869 review: during an S1 handover (a target context in preparation) the
+    /// change is deferred too; the Handover Request already sent holds the old
+    /// value.
+    #[test]
+    fn a_ue_ambr_change_waits_for_an_s1_handover() {
+        let _guard = crate::gtp_path::lock_s11();
+        let (mme_ue_id, enb_ue_id, isd, ue_ctx_mods) = ue_ambr_fixture("999990000008693", 8693);
+        let ctx = crate::context::mme_self();
+        let enb_id = ctx.enb_ue_find_by_id(enb_ue_id).unwrap().enb_id;
+        let target = ctx.enb_ue_add(enb_id, crate::context::INVALID_UE_S1AP_ID);
+        {
+            let mut pool = ctx.enb_ue_pool.write().unwrap();
+            let t = pool.get_mut(&target).unwrap();
+            t.mme_ue_id = mme_ue_id;
+            t.handover_prep_deadline =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
+            pool.get_mut(&enb_ue_id).unwrap().target_ue_id = target;
+        }
+        mme_s6a_process_inbound(&isd(10_000_000, 5_000_000)).unwrap();
+        assert!(ue_ctx_mods().is_empty(), "deferred during the handover");
+        assert!(ctx.mme_ue_find_by_id(mme_ue_id).unwrap().ue_ambr_deferred);
+        {
+            let mut pool = ctx.enb_ue_pool.write().unwrap();
+            pool.get_mut(&enb_ue_id).unwrap().target_ue_id = 0;
+            pool.get_mut(&target).unwrap().handover_prep_deadline = None;
+        }
+        assert_eq!(deferred_ue_ambr_sends(ctx).len(), 1, "signalled after it");
+        ctx.enb_ue_remove(target);
+        ctx.mme_ue_remove(mme_ue_id);
+    }
+
     fn clr(imsi: &str, cancellation_type: u32) -> crate::fd_path::InboundS6aRequest {
         crate::fd_path::InboundS6aRequest {
             imsi_bcd: imsi.to_string(),
@@ -1027,6 +1365,73 @@ mod tests {
         assert_eq!(ue.t3422.retry_count, retries);
         assert_eq!(ue.t3422.pkbuf, stored);
         crate::network_detach::complete_mme_initiated_detach(ctx, mme_ue_id);
+    }
+
+    /// #828 follow-up: the duplicate-CLR guard covers only a detach a CLR started. A first
+    /// CLR during a detach begun for another reason (here a re-attach-required detach, as an
+    /// SGW restart sends) is the HSS's instruction and is served: the DETACH REQUEST is resent
+    /// with the CLR's type (Reattach-Required clear: "re-attach not required"). Its
+    /// retransmission is then ignored.
+    #[test]
+    fn a_first_cancel_location_during_another_detach_is_served() {
+        use crate::emm_build::DetachTypeToUe as T;
+        // The detach path can reach gtp_path (Delete Session Requests): serialised
+        // with the S11 tests (#897 review).
+        let _guard = crate::gtp_path::lock_s11();
+        const IMSI: &str = "999990000008281";
+        let mme_ue_id = seed_connected_ue(IMSI, 8281);
+        let ctx = crate::context::mme_self();
+        assert_eq!(
+            crate::network_detach::mme_initiated_detach(
+                ctx,
+                mme_ue_id,
+                T::ReAttachRequired,
+                "a Serving GW restart"
+            ),
+            crate::network_detach::DetachOutcome::DetachRequestSent
+        );
+        assert!(
+            !ctx.mme_ue_find_by_id(mme_ue_id)
+                .unwrap()
+                .network_detach_by_clr
+        );
+
+        mme_s6a_process_inbound(&clr(IMSI, cancellation_type::SUBSCRIPTION_WITHDRAWAL))
+            .expect("applied");
+        let ue = ctx
+            .mme_ue_find_by_id(mme_ue_id)
+            .expect("waits for DETACH ACCEPT");
+        assert_eq!(ue.network_detach_type, Some(T::ReAttachNotRequired));
+        assert!(ue.network_detach_by_clr);
+        assert_eq!(
+            ue.t3422
+                .pkbuf
+                .as_ref()
+                .and_then(|d| d.get(8))
+                .map(|o| o & 0x07),
+            Some(T::ReAttachNotRequired as u8),
+            "the CLR's detach type is on the wire"
+        );
+        let retries = ue.t3422.retry_count;
+        let stored = ue.t3422.pkbuf.clone();
+
+        // Its retransmission changes nothing: no DETACH REQUEST resent, T3422 not reset.
+        ctx.mme_ue_pool
+            .write()
+            .unwrap()
+            .get_mut(&mme_ue_id)
+            .unwrap()
+            .t3422
+            .record_retransmission(crate::nas_timer::T3422_DURATION);
+        let retries = retries + 1;
+        mme_s6a_process_inbound(&clr(IMSI, cancellation_type::SUBSCRIPTION_WITHDRAWAL))
+            .expect("applied");
+        let ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert_eq!(ue.t3422.retry_count, retries);
+        assert_eq!(ue.t3422.pkbuf, stored);
+        assert!(crate::network_detach::complete_mme_initiated_detach(
+            ctx, mme_ue_id
+        ));
     }
 
     #[test]

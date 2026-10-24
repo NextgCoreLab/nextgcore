@@ -39,6 +39,9 @@ struct GtpcInner {
     xact: Mutex<Gtp2XactMgr>,
     /// Last Recovery (restart counter) seen per peer IP (TS 23.007 §18).
     peer_restart: Mutex<HashMap<IpAddr, u8>>,
+    /// A Recovery value behind the stored one, being verified by an Echo Request
+    /// (#798 review), per peer IP.
+    stale_probe: Mutex<HashMap<IpAddr, StaleProbe>>,
     peer_state: Mutex<HashMap<SocketAddr, GtpPeerState>>,
     running: AtomicBool,
 }
@@ -262,6 +265,12 @@ pub fn send_response_to_sgwc(peer: SocketAddr, msg: &Gtp2Message) -> GtpPathResu
 
 /// Send `msg` as a triggered message, echoing the request's sequence number.
 fn send_response_to(peer: SocketAddr, msg: &Gtp2Message) -> GtpPathResult<()> {
+    #[cfg(test)]
+    if let Some((server, _)) = test_route(None) {
+        return server
+            .send_response(peer, msg)
+            .map_err(GtpPathError::SocketError);
+    }
     let server = server().ok_or_else(|| {
         GtpPathError::SocketError("no S11 socket bound: cannot answer".to_string())
     })?;
@@ -337,6 +346,7 @@ impl GtpcServer {
             restart_counter,
             xact: Mutex::new(Gtp2XactMgr::new(config)),
             peer_restart: Mutex::new(HashMap::new()),
+            stale_probe: Mutex::new(HashMap::new()),
             peer_state: Mutex::new(HashMap::new()),
             running: AtomicBool::new(true),
         });
@@ -409,6 +419,46 @@ impl GtpcServer {
                                         crate::context::mme_self(),
                                         pending,
                                     );
+                                }
+                                // #736: an E-UTRAN initiated E-RAB modification
+                                // waits on it too. Its confirm says every E-RAB
+                                // failed, rather than never coming (TS 36.413
+                                // §8.2.4), and the record does not leak.
+                                if let Some(pending) =
+                                    take_pending_erab_modification(xact.sequence_number)
+                                {
+                                    if let Some(send) =
+                                        crate::s1ap_handler::erab_modification_unanswered(
+                                            crate::context::mme_self(),
+                                            pending,
+                                        )
+                                    {
+                                        crate::s1ap_path::s1ap_send(send);
+                                    }
+                                }
+                            }
+                            // #736 (and #616's record): nobody waits on an
+                            // unanswered Change Notification, but its record
+                            // must not stay forever.
+                            if xact.message_type
+                                == s11_build::message_type::CHANGE_NOTIFICATION_REQUEST
+                            {
+                                take_pending_change_notification(xact.sequence_number);
+                            }
+                            // #956: an S1 release still completes when the Serving
+                            // GW does not answer its Release Access Bearers Request.
+                            if xact.message_type
+                                == s11_build::message_type::RELEASE_ACCESS_BEARERS_REQUEST
+                            {
+                                if let Some(enb_ue_id) =
+                                    take_pending_s1_release(xact.sequence_number)
+                                {
+                                    for send in crate::s1ap_handler::s1_release_command(
+                                        crate::context::mme_self(),
+                                        enb_ue_id,
+                                    ) {
+                                        crate::s1ap_path::s1ap_send(send);
+                                    }
                                 }
                             }
                         }
@@ -668,25 +718,141 @@ fn echo_interval() -> Option<Duration> {
     }
 }
 
-/// Note a peer's Recovery counter (TS 23.007 §18). Returns `true` when it
-/// differs from the one last seen from that peer: the peer restarted.
+/// Note a peer's Recovery counter (TS 23.007 §18). Returns `true` only when the
+/// peer restarted: the received counter is AHEAD of the stored one, taking the
+/// 8-bit roll-over into account (#728).
 ///
-/// The first counter seen from a peer is only recorded. TS 23.007 §18 makes "a
-/// value different from the one stored" the restart signal, so this is a
-/// comparison with the stored value and not an ordering. A reordered datagram
-/// from one incarnation carries that incarnation's counter, so it cannot fake a
-/// change.
-fn note_peer_recovery(inner: &Arc<GtpcInner>, peer: SocketAddr, counter: u8) -> bool {
+/// The first counter seen from a peer is only recorded. A counter BEHIND the
+/// stored one is, per §18, "a possible race condition (newer message arriving
+/// before the older one)": a reordered datagram from the old incarnation, or an
+/// old SGW-C still answering from the same address during a pod replacement. It
+/// is discarded, and the stored value is kept, so the next message of the
+/// current incarnation is not read as another restart. Before #728 any change was
+/// a restart and the stored value was overwritten, so 3 -> 4 -> 3 -> 4 detached
+/// every UE on the SGW three times.
+/// A Recovery value behind the stored one under verification (#798 review).
+#[derive(Debug, Clone, Copy)]
+struct StaleProbe {
+    /// The lower value seen.
+    counter: u8,
+    /// The Echo Request asking the peer for its current value.
+    seq: u32,
+    sent: Instant,
+}
+
+/// How long one verification stands before a further stale value probes again.
+const STALE_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// TS 23.007 §18 discards a lower Recovery value as a reordered message from an
+/// older incarnation. That reading is wrong when the peer LOST its persisted
+/// counter and came back lower (a recreated volume, or a malformed file reset to
+/// 1): every later message would read stale and its restarts would be missed. So
+/// a stale value is verified (#798 review): an Echo Request is sent, and a fresh
+/// Echo Response is the current incarnation speaking. One period of warning per
+/// peer and value; the stale datagrams in between log at debug.
+fn probe_stale_recovery(inner: &Arc<GtpcInner>, peer: SocketAddr, counter: u8) -> bool {
+    let now = Instant::now();
+    let Ok(mut probes) = inner.stale_probe.lock() else {
+        return false;
+    };
+    if probes
+        .get(&peer.ip())
+        .is_some_and(|p| p.counter == counter && now.duration_since(p.sent) < STALE_PROBE_INTERVAL)
+    {
+        return false;
+    }
+    let server = GtpcServer {
+        inner: Arc::clone(inner),
+    };
+    match server.send_echo_request(peer) {
+        Ok(seq) => {
+            probes.insert(
+                peer.ip(),
+                StaleProbe {
+                    counter,
+                    seq,
+                    sent: now,
+                },
+            );
+            true
+        }
+        Err(e) => {
+            log::warn!("S11 Echo Request to verify {peer}'s Recovery {counter} not sent: {e}");
+            false
+        }
+    }
+}
+
+/// An Echo Response answering a stale-Recovery probe (#798 review). When it
+/// carries the same lower value, the current incarnation of the peer uses it:
+/// the peer restarted and lost its counter. The stored value is re-based and
+/// `true` returned, a restart. Any other answer only closes the probe.
+fn confirm_stale_recovery(inner: &Arc<GtpcInner>, peer: SocketAddr, seq: u32, counter: u8) -> bool {
+    let probe = {
+        let Ok(mut probes) = inner.stale_probe.lock() else {
+            return false;
+        };
+        match probes.get(&peer.ip()) {
+            Some(p) if p.seq == seq => probes.remove(&peer.ip()),
+            _ => None,
+        }
+    };
+    let Some(probe) = probe else {
+        return false;
+    };
     let Ok(mut seen) = inner.peer_restart.lock() else {
         return false;
     };
-    match seen.insert(peer.ip(), counter) {
-        Some(previous) if previous != counter => {
+    let stored = seen.get(&peer.ip()).copied();
+    // Only the probed value proves anything: a different one is an ordinary
+    // Recovery, judged by `note_peer_recovery` as any other.
+    if probe.counter == counter && stored != Some(counter) {
+        seen.insert(peer.ip(), counter);
+        drop(seen);
+        log::warn!(
+            "S11 peer {peer} answered an Echo Request with Recovery {counter}, behind the stored \
+             {}: its current incarnation uses the lower value, so it restarted and lost its \
+             persisted counter. Treated as a restart and re-based (TS 23.007 §18)",
+            stored.unwrap_or_default()
+        );
+        return true;
+    }
+    false
+}
+
+fn note_peer_recovery(inner: &Arc<GtpcInner>, peer: SocketAddr, counter: u8) -> bool {
+    use nextgcore_gtp::v2::RestartOrder;
+    let Ok(mut seen) = inner.peer_restart.lock() else {
+        return false;
+    };
+    let mut stored = seen.get(&peer.ip()).copied();
+    let previous = stored;
+    let order = nextgcore_gtp::v2::note_restart_counter(&mut stored, counter);
+    if let Some(value) = stored {
+        seen.insert(peer.ip(), value);
+    }
+    drop(seen);
+    match (order, previous) {
+        (RestartOrder::Restarted, Some(previous)) => {
             log::warn!(
                 "S11 peer {peer} restarted: Recovery {previous} -> {counter}; the PDN \
                  connections this MME held with it are gone (TS 23.007 §18)"
             );
             true
+        }
+        (RestartOrder::Stale, Some(previous)) => {
+            if probe_stale_recovery(inner, peer, counter) {
+                log::warn!(
+                    "S11 peer {peer} sent Recovery {counter}, behind the stored {previous}: \
+                     discarded as a message from an older incarnation (TS 23.007 §18), and an \
+                     Echo Request asks the peer for its current value"
+                );
+            } else {
+                log::debug!(
+                    "S11 peer {peer} Recovery {counter} behind the stored {previous}: discarded"
+                );
+            }
+            false
         }
         _ => {
             log::debug!("S11 peer {peer} Recovery counter {counter}");
@@ -719,7 +885,17 @@ fn handle_datagram(inner: &Arc<GtpcInner>, data: &[u8], peer: SocketAddr) {
             // Acted on BEFORE the message is dispatched: a Create Session Response
             // from the new incarnation then lands on a UE whose S11 session is not
             // yet recorded, so its fresh PDN connection is not mistaken for a lost one.
-            if note_peer_recovery(inner, peer, rec.restart_counter) {
+            let echo_response = msg.header.message_type == Gtp2MessageType::EchoResponse as u8;
+            if echo_response
+                && confirm_stale_recovery(
+                    inner,
+                    peer,
+                    msg.header.sequence_number,
+                    rec.restart_counter,
+                )
+            {
+                on_s11_peer_restart(peer);
+            } else if note_peer_recovery(inner, peer, rec.restart_counter) {
                 on_s11_peer_restart(peer);
             }
         }
@@ -1196,6 +1372,134 @@ pub fn send_release_access_bearers_request(
     })
 }
 
+/// The S1 releases (TS 23.401 §5.3.5) waiting for their Release Access Bearers
+/// Response before the UE CONTEXT RELEASE COMMAND goes (step 5), by sequence
+/// number: the eNB UE context to release (#956).
+static PENDING_S1_RELEASES: OnceLock<Mutex<HashMap<u32, u64>>> = OnceLock::new();
+
+fn pending_s1_releases() -> &'static Mutex<HashMap<u32, u64>> {
+    PENDING_S1_RELEASES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Take the eNB UE context the Release Access Bearers Request at `seq` was for.
+pub fn take_pending_s1_release(seq: u32) -> Option<u64> {
+    pending_s1_releases().lock().ok()?.remove(&seq)
+}
+
+/// S1 release, TS 23.401 §5.3.5 step 2 (#956): the MME tells the Serving GW to
+/// release the UE's S1-U bearers (it then buffers downlink and sends a Downlink
+/// Data Notification), and forgets the eNB's S1-U endpoints itself, the UE going
+/// ECM-IDLE. The UE CONTEXT RELEASE COMMAND for `enb_ue_id` waits for the
+/// response (step 5, `take_pending_s1_release`). Returns the sequence number.
+pub fn release_access_bearers_for_s1_release(
+    ctx: &MmeContext,
+    enb_ue_id: u64,
+    mme_ue_id: u64,
+) -> GtpPathResult<u32> {
+    let mme_ue = ctx
+        .mme_ue_find_by_id(mme_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let sgw_ue = ctx
+        .sgw_ue_find_by_id(mme_ue.sgw_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    if sgw_ue.sgw_s11_teid == 0 {
+        return Err(GtpPathError::InvalidState(
+            "no S11 session at the Serving GW".to_string(),
+        ));
+    }
+    let seq = sequence()?;
+    let msg = s11_build::build_release_access_bearers_request(sgw_ue.sgw_s11_teid, seq);
+    // Recorded before the send (#359): the response can race `send_to`.
+    if let Ok(mut map) = pending_s1_releases().lock() {
+        map.insert(seq, enb_ue_id);
+    }
+    if let Err(e) = send_to_sgwc(ctx, &msg, enb_ue_id) {
+        take_pending_s1_release(seq);
+        return Err(e);
+    }
+    clear_enb_endpoints(ctx, mme_ue_id);
+    Ok(seq)
+}
+
+/// Forget the eNB S1-U endpoints of every bearer of `mme_ue_id`: the S1-U
+/// bearers are released (TS 23.401 §5.3.5) and the next Initial Context Setup
+/// brings new ones.
+pub fn clear_enb_endpoints(ctx: &MmeContext, mme_ue_id: u64) {
+    let mut pool = ctx.bearer_pool.write().unwrap();
+    for b in pool.values_mut().filter(|b| b.mme_ue_id == mme_ue_id) {
+        b.enb_s1u_teid = 0;
+        b.enb_s1u_ip = Default::default();
+    }
+}
+
+/// Downlink Data Notification Failure Indication to the Serving GW of
+/// `mme_ue_id` (TS 29.274 §7.2.11.3, TS 23.401 §5.3.4.3 step 3a, #956). An
+/// initial message with no response, so it is sent once and not retransmitted.
+pub fn send_downlink_data_notification_failure_indication(
+    ctx: &MmeContext,
+    mme_ue_id: u64,
+    cause: GtpCause,
+) -> GtpPathResult<()> {
+    let mme_ue = ctx
+        .mme_ue_find_by_id(mme_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let sgw_ue = ctx
+        .sgw_ue_find_by_id(mme_ue.sgw_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let seq = sequence()?;
+    let msg = s11_build::build_downlink_data_notification_failure_indication(
+        sgw_ue.sgw_s11_teid,
+        seq,
+        cause,
+    )
+    .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
+    #[cfg(test)]
+    if let Some((server, peer)) = test_route(Some(ctx)) {
+        return server
+            .send_response(peer, &msg)
+            .map_err(GtpPathError::SocketError);
+    }
+    let server =
+        server().ok_or_else(|| GtpPathError::SocketError("no S11 socket bound".to_string()))?;
+    let peer = *ctx
+        .sgwc_list
+        .first()
+        .ok_or_else(|| GtpPathError::InvalidState("no Serving GW configured".to_string()))?;
+    server
+        .send_response(peer, &msg)
+        .map_err(GtpPathError::SocketError)
+}
+
+/// Modify Bearer Request for the bearers of `mme_ue_id` the eNB set up (a
+/// non-zero eNB S1-U TEID), after the Initial Context Setup of a SERVICE
+/// REQUEST (TS 23.401 §5.3.4.1 step 8, #956). Returns the sequence number.
+pub fn send_modify_bearer_request_for_service_request(
+    ctx: &MmeContext,
+    mme_ue_id: u64,
+) -> GtpPathResult<u32> {
+    let mme_ue = ctx
+        .mme_ue_find_by_id(mme_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let sgw_ue = ctx
+        .sgw_ue_find_by_id(mme_ue.sgw_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let bearers: Vec<crate::context::MmeBearer> = bearers_of_ue(ctx, mme_ue_id)
+        .into_iter()
+        .filter(|b| b.enb_s1u_teid != 0)
+        .collect();
+    if bearers.is_empty() {
+        return Err(GtpPathError::InvalidState(
+            "no bearer was set up by the eNB".to_string(),
+        ));
+    }
+    let refs: Vec<&crate::context::MmeBearer> = bearers.iter().collect();
+    let seq = sequence()?;
+    let msg = s11_build::build_modify_bearer_request(&mme_ue, &sgw_ue, &refs, &[], seq)
+        .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
+    send_to_sgwc(ctx, &msg, mme_ue_id)?;
+    Ok(seq)
+}
+
 pub fn send_release_all_ue_in_enb(
     ctx: &MmeContext,
     enb_id: u64,
@@ -1379,6 +1683,11 @@ pub struct PendingErabModification {
     pub confirm: crate::s1ap_gen::ErabModificationConfirm,
     /// `notify` IEs of the indication, for the confirm's diagnostics.
     pub notify: Vec<crate::s1ap_gen::DiagnosedIe>,
+    /// The UE, and the new eNB endpoint of each E-RAB to modify: written to
+    /// the bearer contexts only for the bearers the Serving GW accepts (#736),
+    /// so the MME never names an endpoint the SGW does not use.
+    pub mme_ue_id: u64,
+    pub switched: Vec<SwitchedBearer>,
 }
 
 static PENDING_ERAB_MODIFICATIONS: OnceLock<Mutex<HashMap<u32, PendingErabModification>>> =
@@ -1407,24 +1716,31 @@ pub(crate) fn record_pending_erab_modification_for_test(
 }
 
 /// Send the Modify Bearer Request of an E-UTRAN initiated E-RAB modification
-/// (TS 23.401 §5.4.7 step 2) for the bearers `ebis` of `mme_ue_id`, whose eNB
-/// endpoints the caller has already stored, and park `pending` until the
+/// (TS 23.401 §5.4.7 step 2) for the bearers of `pending.switched`, carrying
+/// their NEW eNB endpoints from that list (the bearer contexts are written only
+/// when the Serving GW accepts them, #736), and park `pending` until the
 /// response arrives. Returns the request's sequence number.
 pub fn send_modify_bearer_request_for_erab_modification(
     ctx: &MmeContext,
-    mme_ue_id: u64,
-    ebis: &[u8],
     pending: PendingErabModification,
 ) -> GtpPathResult<u32> {
+    let mme_ue_id = pending.mme_ue_id;
     let mme_ue = ctx
         .mme_ue_find_by_id(mme_ue_id)
         .ok_or(GtpPathError::ContextNotFound)?;
     let sgw_ue = ctx
         .sgw_ue_find_by_id(mme_ue.sgw_ue_id)
         .ok_or(GtpPathError::ContextNotFound)?;
+    // Copies carrying the new endpoints: the bearer contexts keep the old ones
+    // until the Serving GW accepts (#736).
     let bearers: Vec<crate::context::MmeBearer> = bearers_of_ue(ctx, mme_ue_id)
         .into_iter()
-        .filter(|b| ebis.contains(&b.ebi))
+        .filter_map(|mut b| {
+            let new = pending.switched.iter().find(|s| s.ebi == b.ebi)?;
+            b.enb_s1u_teid = new.teid;
+            b.enb_s1u_ip = new.ip.clone();
+            Some(b)
+        })
         .collect();
     let bearer_refs: Vec<&crate::context::MmeBearer> = bearers.iter().collect();
     let seq = sequence()?;
@@ -1458,8 +1774,9 @@ pub struct SwitchedBearer {
     pub ip: crate::context::IpAddr,
 }
 
-/// What a handover's Modify Bearer Request was for.
-#[derive(Debug, Clone)]
+/// What a handover's Modify Bearer Request was for. `Debug` is manual: the
+/// X2 variant carries the derived NH key, which must never reach a log (#861).
+#[derive(Clone)]
 pub enum HandoverModifyKind {
     /// X2 handover: the PATH SWITCH REQUEST ACKNOWLEDGE (or FAILURE) waits on
     /// the response (TS 23.401 §5.5.1.1.2 step 5).
@@ -1491,6 +1808,43 @@ pub enum HandoverModifyKind {
         /// COMMAND (#730 review N1).
         admitted: Vec<u8>,
     },
+}
+
+impl std::fmt::Debug for HandoverModifyKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PathSwitch {
+                enb_id,
+                mme_ue_s1ap_id,
+                enb_ue_s1ap_id,
+                ncc,
+                nh: _,
+                released,
+                notify,
+            } => f
+                .debug_struct("PathSwitch")
+                .field("enb_id", enb_id)
+                .field("mme_ue_s1ap_id", mme_ue_s1ap_id)
+                .field("enb_ue_s1ap_id", enb_ue_s1ap_id)
+                .field("ncc", ncc)
+                .field("nh", &"<redacted>")
+                .field("released", released)
+                .field("notify", notify)
+                .finish(),
+            Self::HandoverNotify {
+                enb_id,
+                mme_ue_s1ap_id,
+                enb_ue_s1ap_id,
+                admitted,
+            } => f
+                .debug_struct("HandoverNotify")
+                .field("enb_id", enb_id)
+                .field("mme_ue_s1ap_id", mme_ue_s1ap_id)
+                .field("enb_ue_s1ap_id", enb_ue_s1ap_id)
+                .field("admitted", admitted)
+                .finish(),
+        }
+    }
 }
 
 /// A handover's Modify Bearer Request waiting for its response, keyed by the
@@ -1607,6 +1961,15 @@ fn pending_change_notifications() -> &'static Mutex<HashMap<u32, u64>> {
 }
 
 /// Take the session the Change Notification Request at `seq` reported.
+/// Whether a Change Notification at `seq` is still parked. Test/diagnostic.
+#[cfg(test)]
+pub fn change_notification_pending(seq: u32) -> bool {
+    pending_change_notifications()
+        .lock()
+        .map(|m| m.contains_key(&seq))
+        .unwrap_or(false)
+}
+
 pub fn take_pending_change_notification(seq: u32) -> Option<u64> {
     pending_change_notifications().lock().ok()?.remove(&seq)
 }
@@ -2300,7 +2663,7 @@ mod tests {
         server.close();
     }
 
-    /// #689: only a CHANGED counter from a known peer is a restart.
+    /// #689: a counter AHEAD of the stored one from a known peer is a restart.
     #[test]
     fn a_changed_recovery_counter_is_a_restart() {
         let _guard = lock_s11();
@@ -2315,6 +2678,112 @@ mod tests {
         );
         assert!(note_peer_recovery(&server.inner, peer_addr, 4), "restarted");
         assert!(!note_peer_recovery(&server.inner, peer_addr, 4));
+        server.close();
+    }
+
+    /// #728, TS 23.007 §18: 3 -> 4 -> 3 -> 4 is ONE restart. The stale 3 (a
+    /// reordered old-incarnation datagram) is discarded and does not overwrite the
+    /// stored 4, so the following 4 is not a second restart. 255 -> 0 is a restart
+    /// (the roll-over).
+    #[test]
+    fn a_reordered_old_incarnation_counter_is_not_a_restart() {
+        let _guard = lock_s11();
+        let (server, _peer, peer_addr) = spawn_server_and_peer(Gtp2XactConfig::default());
+        let restarts: Vec<bool> = [3u8, 4, 3, 4, 3, 4]
+            .into_iter()
+            .map(|c| note_peer_recovery(&server.inner, peer_addr, c))
+            .collect();
+        assert_eq!(restarts, [false, true, false, false, false, false]);
+        assert_eq!(
+            server
+                .inner
+                .peer_restart
+                .lock()
+                .unwrap()
+                .get(&peer_addr.ip()),
+            Some(&4),
+            "the stale value must not replace the stored one"
+        );
+        // Roll-over: the incarnation after 255 is 0.
+        let mut roll = Vec::new();
+        for c in [100u8, 200, 255, 0, 255] {
+            roll.push(note_peer_recovery(&server.inner, peer_addr, c));
+        }
+        assert_eq!(roll, [true, true, true, true, false]);
+        server.close();
+    }
+
+    /// #798 review: a stale Recovery is verified with an Echo Request. A peer that
+    /// lost its persisted counter answers with the same lower value: a restart,
+    /// re-based, so its later restarts are caught again. A reordered old message is
+    /// answered with the current (higher) value: still discarded. Repeated stale
+    /// datagrams send one probe per period, not one per datagram.
+    #[test]
+    fn a_stale_recovery_is_verified_by_an_echo_request() {
+        let _guard = lock_s11();
+        let (server, peer, peer_addr) = spawn_server_and_peer(Gtp2XactConfig::default());
+        let recv_echo = |peer: &UdpSocket| -> Option<u32> {
+            let mut buf = [0u8; 4096];
+            let (len, _) = peer.recv_from(&mut buf).ok()?;
+            let msg = Gtp2Message::decode(&mut Bytes::copy_from_slice(&buf[..len])).ok()?;
+            (msg.header.message_type == Gtp2MessageType::EchoRequest as u8)
+                .then_some(msg.header.sequence_number)
+        };
+        let stored = |server: &GtpcServer| {
+            server
+                .inner
+                .peer_restart
+                .lock()
+                .unwrap()
+                .get(&peer_addr.ip())
+                .copied()
+        };
+
+        // The peer lost its counter: stored 100, it now says 1.
+        assert!(!note_peer_recovery(&server.inner, peer_addr, 100));
+        assert!(
+            !note_peer_recovery(&server.inner, peer_addr, 1),
+            "stale, discarded"
+        );
+        let seq = recv_echo(&peer).expect("an Echo Request verifies it");
+        peer.set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        assert!(!note_peer_recovery(&server.inner, peer_addr, 1));
+        assert!(recv_echo(&peer).is_none(), "one probe per period");
+        assert!(
+            !confirm_stale_recovery(&server.inner, peer_addr, seq.wrapping_add(1), 1),
+            "only the probe's own answer counts"
+        );
+        assert!(
+            confirm_stale_recovery(&server.inner, peer_addr, seq, 1),
+            "the fresh answer carries the lower value: a restart"
+        );
+        assert_eq!(stored(&server), Some(1), "re-based");
+        assert!(
+            note_peer_recovery(&server.inner, peer_addr, 2),
+            "the next restart is seen"
+        );
+
+        // A reordered old message: stored 4, a stray 3; the peer answers 4.
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        assert!(note_peer_recovery(&server.inner, peer_addr, 4));
+        assert!(!note_peer_recovery(&server.inner, peer_addr, 3));
+        let seq = recv_echo(&peer).expect("probed");
+        // Answered over the socket, so the receive path's routing of an Echo
+        // Response to the probe is what is tested.
+        let answer = Gtp2Message::echo_response(seq, 4);
+        peer.send_to(&answer.encode(), server.local_addr()).unwrap();
+        for _ in 0..200 {
+            if server.inner.stale_probe.lock().unwrap().is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            server.inner.stale_probe.lock().unwrap().is_empty(),
+            "the Echo Response closed the probe"
+        );
+        assert_eq!(stored(&server), Some(4), "kept");
         server.close();
     }
 }

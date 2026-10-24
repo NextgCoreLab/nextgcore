@@ -61,7 +61,7 @@ fn the_report_encodes_to_the_hand_derived_octets_and_decodes() {
     assert_eq!(cells[0].nr_cgi, "02f839-000000001");
     assert_eq!(cells[0].rsrp, Some(-80), "value 60 -> 60 - 140 dBm");
     assert_eq!(
-        (cells[0].rsrq, cells[0].timing_advance, cells[0].aoa),
+        (cells[0].rsrq, cells[0].ecid_rtt_ns, cells[0].aoa),
         (None, None, None)
     );
 }
@@ -85,10 +85,19 @@ fn measured_results_map_to_cell_measurements() {
         "02f839-efffffff"
     );
 
+    // #832: TADV is decoded per TS 36.133 §10.3.1 into a round trip (bin
+    // midpoint): 2 T_s bins up to 4096 T_s, 8 T_s above, and the last value open.
+    let ts = crate::positioning::TS_NS;
     let c = cell(nr_cgi(PLMN, 1), Some(vec![ta1(0)]));
-    assert_eq!(c.timing_advance, Some(0));
+    assert_eq!((c.timing_advance, c.ecid_rtt_ns), (None, Some(ts)));
+    let c = cell(nr_cgi(PLMN, 1), Some(vec![ta2(2047)]));
+    assert_eq!(c.ecid_rtt_ns, Some(4095.0 * ts));
+    let c = cell(nr_cgi(PLMN, 1), Some(vec![ta2(2048)]));
+    assert_eq!(c.ecid_rtt_ns, Some(4100.0 * ts));
+    let c = cell(nr_cgi(PLMN, 1), Some(vec![ta1(7689)]));
+    assert_eq!(c.ecid_rtt_ns, Some((4096.0 + 8.0 * 5641.0 + 4.0) * ts));
     let c = cell(nr_cgi(PLMN, 1), Some(vec![ta2(7690)]));
-    assert_eq!(c.timing_advance, Some(7690));
+    assert_eq!(c.ecid_rtt_ns, None, "TADV_7690 is open-ended");
     let c = cell(nr_cgi(PLMN, 1), Some(vec![aoa(719)]));
     assert_eq!(c.aoa, Some(719.0));
     // RSRP: strongest item of each list, strongest list wins; 0..97 -> -140..-43.
@@ -109,8 +118,13 @@ fn measured_results_map_to_cell_measurements() {
         ]),
     );
     assert_eq!(
-        (c.timing_advance, c.aoa, c.rsrp, c.rsrq),
-        (Some(500), Some(90.0), Some(-80), Some(10))
+        (c.ecid_rtt_ns, c.aoa, c.rsrp, c.rsrq),
+        (
+            Some(1001.0 * crate::positioning::TS_NS),
+            Some(90.0),
+            Some(-80),
+            Some(10)
+        )
     );
 }
 
@@ -238,4 +252,72 @@ fn a_pdu_that_is_not_an_ecid_report_is_an_error() {
     let (_, request) = crate::nrppa_downlink::build_ecid_measurement_initiation(1).unwrap();
     assert!(decode_ecid_report(&request).is_err());
     assert!(decode_ecid_report(&[0xff, 0x00]).is_err());
+}
+
+/// #834 review: an on-demand E-CID request is answered in the E-CID MEASUREMENT
+/// INITIATION RESPONSE (TS 38.455 §8.2.1.2), which a real gNB (and nextgsim) sends.
+/// It is read exactly like the report it replaces.
+#[test]
+fn the_initiation_response_carries_the_results_of_an_on_demand_request() {
+    let measured = Some(vec![rsrp(&[60]), ta1(500)]);
+    let from_response = accepted(&ecid_initiation_response(
+        9,
+        3,
+        5,
+        nr_cgi(PLMN, 1),
+        TAC,
+        measured.clone(),
+    ));
+    let from_report = accepted(&ecid_report(9, 3, 5, nr_cgi(PLMN, 1), TAC, measured));
+    assert_eq!(from_response.0, 3, "LMF-UE-Measurement-ID");
+    assert_eq!(from_response.1.len(), 1);
+    assert_eq!(from_response.1[0].nr_cgi, from_report.1[0].nr_cgi);
+    assert_eq!(from_response.1[0].rsrp, from_report.1[0].rsrp);
+    assert_eq!(from_response.1[0].ecid_rtt_ns, from_report.1[0].ecid_rtt_ns);
+    assert!(from_response.1[0].ecid_rtt_ns.is_some());
+}
+
+/// The response's error handling names the procedure it belongs to: an unknown
+/// reject IE in an E-CID Measurement Initiation Response is reported against
+/// procedure 2, successful outcome.
+#[test]
+fn a_rejected_initiation_response_is_diagnosed_against_procedure_2() {
+    let bytes = splice_ie(
+        &ecid_initiation_response(9, 3, 5, nr_cgi(PLMN, 1), TAC, None),
+        9999,
+        0,
+    );
+    let EcidReportOutcome::Rejected {
+        error_indication, ..
+    } = decode_ecid_report(&bytes).expect("decodes")
+    else {
+        panic!("an unknown reject IE rejects the response");
+    };
+    let nrppa::NRPPA_PDU::InitiatingMessage(m) =
+        nextgcore_nrppa_gen::decode(&error_indication).unwrap()
+    else {
+        panic!("an ERROR INDICATION is an initiating message");
+    };
+    let nrppa::InitiatingMessageValue::Id_errorIndication(ei) = m.value else {
+        panic!("not an ERROR INDICATION");
+    };
+    let diag = ei
+        .protocol_i_es
+        .0
+        .iter()
+        .find_map(|ie| match &ie.value {
+            nrppa::ErrorIndicationProtocolIEs_EntryValue::Id_CriticalityDiagnostics(d) => {
+                Some(d.clone())
+            }
+            _ => None,
+        })
+        .expect("criticality diagnostics");
+    assert_eq!(
+        diag.procedure_code.map(|p| p.0),
+        Some(nrppa::ID_E_CID_MEASUREMENT_INITIATION)
+    );
+    assert_eq!(
+        diag.triggering_message.map(|t| t.0),
+        Some(nrppa::TriggeringMessage::SUCCESSFUL_OUTCOME)
+    );
 }

@@ -651,6 +651,247 @@ async fn a_setup_whose_send_fails_hands_the_accept_to_the_next_setup() {
     assert_protected_service_accept(nas_pdu.as_deref().expect("PSI 2's setup carries it"));
 }
 
+// ---- #745 follow-ups (review of #830): Path Switch with SM contexts held at an SMF ----
+
+/// A stand-in SMF for Path Switch: records `(ref, n2SmInfoType)` of every update and
+/// answers `PATH_SWITCH_REQ` with 200 and `n2SmInfo` = `transfer_for(ref)` (the
+/// acknowledge transfer the AMF relays), except a `fail-*` ref, which gets 500.
+async fn path_switch_smf() -> (
+    nextgcore_sbi::server::SbiServer,
+    u16,
+    Arc<std::sync::Mutex<Vec<(String, String)>>>,
+) {
+    use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    let seen: Arc<std::sync::Mutex<Vec<(String, String)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+    let server = nextgcore_sbi::server::SbiServer::on_listener(
+        nextgcore_sbi::server::SbiServerConfig::new(addr),
+        listener,
+    );
+    server
+        .start(move |req: SReq| {
+            let sink = Arc::clone(&sink);
+            async move {
+                let sm_ref = req
+                    .header
+                    .uri
+                    .split("/sm-contexts/")
+                    .nth(1)
+                    .and_then(|rest| rest.split('/').next())
+                    .unwrap_or_default()
+                    .to_string();
+                let body: serde_json::Value = req
+                    .http
+                    .content
+                    .as_deref()
+                    .and_then(|c| serde_json::from_str(c).ok())
+                    .unwrap_or_default();
+                let n2_type = body["n2SmInfoType"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                sink.lock()
+                    .expect("sink")
+                    .push((sm_ref.clone(), n2_type.clone()));
+                if n2_type != "PATH_SWITCH_REQ" {
+                    return SResp::no_content();
+                }
+                if sm_ref.starts_with("fail-") {
+                    return SResp::with_status(500);
+                }
+                let answer = serde_json::json!({
+                    "n2SmInfoType": "PATH_SWITCH_REQ_ACK",
+                    "n2SmInfo": base64::engine::general_purpose::STANDARD
+                        .encode(transfer_for(&sm_ref)),
+                });
+                SResp::with_status(200).with_body(answer.to_string(), "application/json")
+            }
+        })
+        .await
+        .expect("stand-in SMF starts");
+    for _ in 0..200 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    (server, addr.port(), seen)
+}
+
+/// A PATH SWITCH REQUEST ACKNOWLEDGE's switched `[(psi, transfer)]` and released
+/// `[(psi, unsuccessful transfer)]` lists, decoded with the generated codec.
+#[allow(clippy::type_complexity)]
+fn decoded_path_switch_ack(pdu: &[u8]) -> Option<(Vec<(u8, Vec<u8>)>, Vec<(u8, Vec<u8>)>)> {
+    let g::NGAP_PDU::SuccessfulOutcome(m) = nextgcore_ngap_gen::decode(pdu).ok()? else {
+        return None;
+    };
+    let g::SuccessfulOutcomeValue::Id_PathSwitchRequest(ack) = m.value else {
+        return None;
+    };
+    let (mut switched, mut released) = (Vec::new(), Vec::new());
+    for ie in ack.protocol_i_es.0 {
+        use g::PathSwitchRequestAcknowledgeProtocolIEs_EntryValue as Ie;
+        match ie.value {
+            Ie::Id_PDUSessionResourceSwitchedList(list) => {
+                switched = list
+                    .0
+                    .into_iter()
+                    .map(|i| {
+                        (
+                            i.pdu_session_id.0,
+                            i.path_switch_request_acknowledge_transfer.0,
+                        )
+                    })
+                    .collect()
+            }
+            Ie::Id_PDUSessionResourceReleasedListPSAck(list) => {
+                released = list
+                    .0
+                    .into_iter()
+                    .map(|i| {
+                        (
+                            i.pdu_session_id.0,
+                            i.path_switch_request_unsuccessful_transfer.0,
+                        )
+                    })
+                    .collect()
+            }
+            _ => {}
+        }
+    }
+    Some((switched, released))
+}
+
+fn forget_amf_sessions(ue: u64) {
+    let ctx = crate::context::amf_self();
+    let guard = ctx.read().unwrap();
+    for sess in guard.sess_list_for_ue(ue) {
+        guard.sess_remove(sess.id);
+    }
+}
+
+/// #745 follow-up (review of #830, MINOR 2): the duplicate check runs before ANY SMF
+/// call. The UE's sessions 5 and 6 are held at a recording SMF that would switch them;
+/// a request naming PSI 5 twice is failed, the SMF sees no request at all, and the UE
+/// stays on the source.
+///
+/// REVERT-VERIFIED: without the duplicate check the SMF receives three
+/// PATH_SWITCH_REQ updates (PSIs 5, 6, 5) and the gNB gets an Acknowledge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_duplicated_psi_reaches_no_smf() {
+    crate::context::amf_context_init(64, 1024, 4096);
+    let (_smf, port, calls) = path_switch_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (source, target) = (97_461u64, 97_462u64);
+    seed_gnb_session(&server, source).await;
+    seed_gnb_session(&server, target).await;
+    let ue = 7_745_011u64;
+    let mut state = UeNasContext::new(ue, 11, source, false);
+    state.registered = true;
+    server.ue_auth_state.insert(ue, state);
+    hold_session(&mut server, ue, 5, "ps745-dup-5", port);
+    hold_session(&mut server, ue, 6, "ps745-dup-6", port);
+
+    server
+        .handle_path_switch_request(target, &path_switch_request_pdu(ue, 67, &[5, 6, 5]))
+        .await
+        .expect("handled");
+
+    let sent = take_sent_ngap(&mut server);
+    forget_amf_sessions(ue);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    let (_, _, released) =
+        decoded_path_switch_failure(&sent[0].1).expect("a PATH SWITCH REQUEST FAILURE");
+    assert_eq!(
+        released.iter().map(|(psi, _)| *psi).collect::<Vec<_>>(),
+        vec![5, 6]
+    );
+    assert!(
+        calls.lock().expect("calls").is_empty(),
+        "no SMF is called for a failed request: {:?}",
+        calls.lock().expect("calls")
+    );
+    let after = server.ue_auth_state.get(ue).expect("UE");
+    assert_eq!((after.association_id, after.ran_ue_ngap_id), (source, 11));
+}
+
+/// #745 follow-up (review of #830, MINOR 3), TS 38.413 §8.4.4.2: a session the SMF does
+/// not switch is listed in the Acknowledge's PDU Session Resource Released List, with an
+/// AMF-generated Path Switch Request Unsuccessful Transfer, while the switched one
+/// carries the SMF's own acknowledge transfer. When no session switches, §8.4.4.3: a
+/// PATH SWITCH REQUEST FAILURE releasing every requested session.
+///
+/// REVERT-VERIFIED: with `released_list: Vec::new()` in the Acknowledge, PSI 6 is
+/// missing from the Released List.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_the_smf_does_not_switch_is_released_in_the_acknowledge() {
+    crate::context::amf_context_init(64, 1024, 4096);
+    let (_smf, port, calls) = path_switch_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (source, target) = (97_463u64, 97_464u64);
+    seed_gnb_session(&server, source).await;
+    seed_gnb_session(&server, target).await;
+    let unswitched = crate::ngap_asn1::path_switch_unsuccessful_transfer(
+        nextgcore_ngap::types::Cause::Misc(nextgcore_ngap::types::CauseMisc::Unspecified),
+    )
+    .expect("encode");
+
+    // One switched, one not.
+    let ue = 7_745_012u64;
+    let mut state = UeNasContext::new(ue, 12, source, false);
+    state.registered = true;
+    server.ue_auth_state.insert(ue, state);
+    hold_session(&mut server, ue, 5, "ps745-ok-5", port);
+    hold_session(&mut server, ue, 6, "fail-ps745-6", port);
+    server
+        .handle_path_switch_request(target, &path_switch_request_pdu(ue, 68, &[5, 6]))
+        .await
+        .expect("handled");
+    let sent = take_sent_ngap(&mut server);
+    forget_amf_sessions(ue);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].0, target);
+    let (switched, released) =
+        decoded_path_switch_ack(&sent[0].1).expect("a PATH SWITCH REQUEST ACKNOWLEDGE");
+    assert_eq!(switched, vec![(5, transfer_for("ps745-ok-5"))]);
+    assert_eq!(released, vec![(6, unswitched.clone())]);
+    assert_eq!(
+        calls.lock().expect("calls").clone(),
+        vec![
+            ("ps745-ok-5".to_string(), "PATH_SWITCH_REQ".to_string()),
+            ("fail-ps745-6".to_string(), "PATH_SWITCH_REQ".to_string())
+        ]
+    );
+    let after = server.ue_auth_state.get(ue).expect("UE");
+    assert_eq!(
+        (after.association_id, after.ran_ue_ngap_id),
+        (target, 68),
+        "an acknowledged switch relocates the UE"
+    );
+
+    // Nothing switched: the Failure releases both.
+    let ue = 7_745_013u64;
+    let mut state = UeNasContext::new(ue, 13, source, false);
+    state.registered = true;
+    server.ue_auth_state.insert(ue, state);
+    hold_session(&mut server, ue, 5, "fail-ps745-n5", port);
+    hold_session(&mut server, ue, 6, "fail-ps745-n6", port);
+    server
+        .handle_path_switch_request(target, &path_switch_request_pdu(ue, 69, &[5, 6]))
+        .await
+        .expect("handled");
+    let sent = take_sent_ngap(&mut server);
+    forget_amf_sessions(ue);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    let (amf, ran, released) =
+        decoded_path_switch_failure(&sent[0].1).expect("a PATH SWITCH REQUEST FAILURE");
+    assert_eq!((amf, ran), (ue, 69));
+    assert_eq!(released, vec![(5, unswitched.clone()), (6, unswitched)]);
+}
+
 // ---------------------------------------------------------------------------
 // #796: a PDU session establishment while no SMF is reachable (SMF restart)
 // ---------------------------------------------------------------------------
@@ -1056,10 +1297,14 @@ async fn a_late_success_for_an_earlier_request_is_released_not_applied() {
         })
         .await
         .expect("applied");
+    // #877 re-review m1/M1: the release is DURABLE keyed work. The window
+    // ending for this PSI supersedes its attempts, and the UE then leaves;
+    // neither may drop the release, or the context leaks at the SMF.
+    server.sbi_offload.supersede_key((ue, 5));
+    server.sbi_offload.cancel_ue(ue);
     server.sbi_offload.settle().await;
 
     assert!(take_sent_ngap(&mut server).is_empty(), "nothing set up");
-    assert!(server.pending_establishments.contains_key(&(ue, 5)));
     assert!(!server.sm_context_refs.contains_key(&(ue, 5)));
     assert!(
         seen.lock()
@@ -1116,4 +1361,397 @@ async fn defer_request(server: &mut NgapServer, ue: u64, ran: u32, request: &[u8
         )
         .await
         .expect("deferred");
+}
+
+/// A stand-in that accepts the TCP connection, holds it for `hold`, then drops
+/// it: a transport failure the AMF classifies as "no SMF reachable", but one
+/// that takes measurable time, so a test can tell the request's arrival from
+/// the moment its first attempt failed. Returns its port and a stop flag.
+async fn slow_to_fail_smf(hold: Duration) -> (u16, Arc<std::sync::atomic::AtomicBool>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    tokio::spawn(async move {
+        while !flag.load(std::sync::atomic::Ordering::Acquire) {
+            let Ok(Ok((sock, _))) =
+                tokio::time::timeout(Duration::from_secs(5), listener.accept()).await
+            else {
+                continue;
+            };
+            tokio::spawn(async move {
+                tokio::time::sleep(hold).await;
+                drop(sock);
+            });
+        }
+    });
+    (port, stop)
+}
+
+/// #877 re-review m2: the re-selection window runs from the request's ARRIVAL,
+/// pinned through `handle_uplink_nas_transport` rather than at `defer_establishment`.
+///
+/// The first attempt is made inline and takes `HOLD` to fail, so a window
+/// started at the deferral (`Instant::now()` there) would be `HOLD` shorter.
+/// The assertion is on the recorded start, which must be within a few ms of the
+/// instant before the handler was called.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn the_window_runs_from_arrival_through_the_uplink_nas_handler() {
+    const HOLD: Duration = Duration::from_millis(400);
+    let (port, stop) = slow_to_fail_smf(HOLD).await;
+    let _env = super::SmfEnvGuard::set(port);
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_796_020u64, 105);
+    ue_ready_for_sessions(&mut server, ue, ran);
+
+    let before = std::time::Instant::now();
+    server
+        .handle_uplink_nas_transport(
+            ASSOC,
+            &uplink_nas_transport(ue, ran, &[0x2E, 0x05, 0x01, 0xC1, 0xFF, 0xFF]),
+        )
+        .await
+        .expect("handled");
+    let after = std::time::Instant::now();
+    let inline = after.duration_since(before);
+    assert!(
+        inline >= HOLD,
+        "the fixture must make the first attempt take time: {inline:?}"
+    );
+    let started = server.pending_establishments[&(ue, 5)].first_failure;
+    assert!(
+        started.duration_since(before) < Duration::from_millis(100),
+        "the window must start at arrival ({:?} after it), not when the first \
+         attempt failed ({inline:?} after it)",
+        started.duration_since(before)
+    );
+
+    server.forget_ue(ue);
+    stop.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// #877 re-review m1: a UE that goes CM-IDLE while an attempt is still waiting
+/// for a concurrency permit frees the PSI's key at once, so a later request for
+/// that session is not queued behind an attempt nobody waits for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn going_cm_idle_cancels_an_attempt_that_never_started() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    drop(listener);
+    let _env = super::SmfEnvGuard::set(port);
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_796_021u64, 106);
+    ue_ready_for_sessions(&mut server, ue, ran);
+    defer_request(&mut server, ue, ran, &[0x2E, 0x05, 0x01, 0xC1, 0xFF, 0xFF]).await;
+
+    // Every permit is taken by other UEs' hanging exchanges, so this UE's next
+    // attempt is spawned and waits.
+    for other in 0..MAX_OFFLOADED_SBI as u64 {
+        server
+            .sbi_offload
+            .spawn_keyed((7_796_900 + other, 1), || async {
+                std::future::pending::<()>().await;
+                None
+            });
+    }
+    until_in_flight(&server, MAX_OFFLOADED_SBI).await;
+    make_establishments_due(&mut server);
+    server.process_pending_establishments().await;
+    assert!(
+        server.sbi_offload.key_busy((ue, 5)),
+        "the attempt is waiting"
+    );
+
+    server.ue_auth_state.with_mut(ue, |s| s.cm_idle = true);
+    server.process_pending_establishments().await;
+
+    assert!(!server.pending_establishments.contains_key(&(ue, 5)));
+    assert!(
+        !server.sbi_offload.key_busy((ue, 5)),
+        "an attempt that never started must not keep the session's key"
+    );
+    for other in 0..MAX_OFFLOADED_SBI as u64 {
+        server.forget_ue(7_796_900 + other);
+    }
+    server.forget_ue(ue);
+}
+
+// ---------------------------------------------------------------------------
+// #758: an Uplink NAS Transport for an AMF UE NGAP ID never allocated here
+// ---------------------------------------------------------------------------
+
+/// The radio-network causes of the Error Indications in `sent`.
+fn error_indication_causes(sent: Vec<(u64, Vec<u8>)>) -> Vec<Option<u8>> {
+    sent.into_iter()
+        .filter_map(|(_, p)| match decode_sent(&p) {
+            Sent::ErrorIndication {
+                radio_network_cause,
+            } => Some(radio_network_cause),
+            _ => None,
+        })
+        .collect()
+}
+
+fn plain_initial_registration(amf_ue_ngap_id: u64, ran: u32) -> Vec<u8> {
+    uplink_nas_transport(amf_ue_ngap_id, ran, &super::sample_registration_request())
+}
+
+/// #758: a gNB names an AMF UE NGAP ID this AMF never allocated, with a plain
+/// initial Registration Request. No NAS context is created (the ID could later be
+/// allocated to another UE). The AMF answers an Error Indication "Unknown local UE
+/// NGAP ID" (TS 38.413 §10.6), and nothing else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_initial_registration_under_an_unallocated_id_gets_an_error_indication() {
+    let mut server = capturing_ngap_server().await;
+    let invented = 7_758_001u64;
+    server
+        .handle_uplink_nas_transport(ASSOC, &plain_initial_registration(invented, 58))
+        .await
+        .expect("handled");
+    assert!(
+        !server.ue_auth_state.contains(invented),
+        "no context for an invented ID"
+    );
+    let sent = take_sent_ngap(&mut server);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].0, ASSOC);
+    assert_eq!(
+        error_indication_causes(sent),
+        vec![Some(g::CauseRadioNetwork::UNKNOWN_LOCAL_UE_NGAP_ID)]
+    );
+}
+
+/// The ID IS allocated with no context (a Service Request rejected #9), but the
+/// Uplink NAS Transport names another RAN UE NGAP ID on the same association. That
+/// is "Inconsistent remote UE NGAP ID"; on another association it is "Unknown
+/// local UE NGAP ID". No context is created either way. The genuine connection keeps its
+/// allocation and is taken up afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_initial_registration_on_another_connection_than_the_allocation_is_refused() {
+    let mut server = capturing_ngap_server().await;
+    let id = 7_758_002u64;
+    server.forced_amf_ue_ngap_id = Some(id);
+    server
+        .handle_initial_ue_message(
+            ASSOC,
+            &super::service_request_initial_ue(service_request(None)),
+        )
+        .await
+        .expect("rejected #9");
+    take_sent_ngap(&mut server);
+    assert!(!server.ue_auth_state.contains(id));
+
+    // Wrong RAN UE NGAP ID (the allocation is for 512).
+    server
+        .handle_uplink_nas_transport(ASSOC, &plain_initial_registration(id, 513))
+        .await
+        .expect("handled");
+    assert!(!server.ue_auth_state.contains(id));
+    assert_eq!(
+        error_indication_causes(take_sent_ngap(&mut server)),
+        vec![Some(g::CauseRadioNetwork::INCONSISTENT_REMOTE_UE_NGAP_ID)]
+    );
+    // Wrong association: there the ID names no logical connection at all, so it
+    // is an unknown LOCAL ID (TS 38.413 §10.6), and the answer does not tell that
+    // gNB the ID is live elsewhere.
+    server
+        .handle_uplink_nas_transport(ASSOC + 1, &plain_initial_registration(id, 512))
+        .await
+        .expect("handled");
+    assert!(!server.ue_auth_state.contains(id));
+    assert_eq!(
+        error_indication_causes(take_sent_ngap(&mut server)),
+        vec![Some(g::CauseRadioNetwork::UNKNOWN_LOCAL_UE_NGAP_ID)]
+    );
+
+    // The genuine connection's registration is taken up, once.
+    let _ = server
+        .handle_uplink_nas_transport(ASSOC, &plain_initial_registration(id, 512))
+        .await;
+    assert!(
+        server.ue_auth_state.contains(id),
+        "the allocated connection registers"
+    );
+    server.ue_auth_state.remove(id);
+    take_sent_ngap(&mut server);
+    let _ = server
+        .handle_uplink_nas_transport(ASSOC, &plain_initial_registration(id, 512))
+        .await;
+    assert!(
+        !server.ue_auth_state.contains(id),
+        "the allocation is consumed: a second context is not minted under it"
+    );
+}
+
+/// A gNB inventing IDs cannot grow the allocation record without bound: it is
+/// capped, oldest first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_contextless_allocation_record_is_bounded() {
+    let mut server = capturing_ngap_server().await;
+    for i in 0..(MAX_CONTEXTLESS_UE_IDS as u64 + 10) {
+        server.remember_contextless_ue_id(ASSOC, 9_000_000 + i, 1);
+    }
+    assert_eq!(server.contextless_ue_ids.len(), MAX_CONTEXTLESS_UE_IDS);
+    assert_eq!(
+        server.take_contextless_ue_id(ASSOC, 9_000_000, 1),
+        ContextlessLookup::Unknown,
+        "the oldest went first"
+    );
+}
+
+/// The plain-dispatch SERVICE REQUEST arm of the Initial UE Message: a message
+/// whose third octet is 0x4C but which is neither a plain nor a type-1 Service
+/// Request (here security header type 3, so octet 3 is a MAC octet). It is
+/// answered SERVICE REJECT #9 like the others, and the ID it allocated is
+/// recorded, so the UE's re-registration on that connection is taken up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_plain_dispatch_service_request_arm_records_its_allocation() {
+    let mut server = capturing_ngap_server().await;
+    let id = 7_758_011u64;
+    server.forced_amf_ue_ngap_id = Some(id);
+    let odd = vec![
+        0x7E,
+        0x03,
+        message_type::SERVICE_REQUEST,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ];
+    server
+        .handle_initial_ue_message(ASSOC, &super::service_request_initial_ue(odd))
+        .await
+        .expect("rejected #9");
+    let sent: Vec<Sent> = take_sent_ngap(&mut server)
+        .into_iter()
+        .map(|(_, p)| decode_sent(&p))
+        .collect();
+    let [Sent::DownlinkNas { nas_pdu, .. }] = sent.as_slice() else {
+        panic!("one DL NAS Transport, the Service Reject: {sent:?}");
+    };
+    assert_eq!(nas_pdu.get(2), Some(&message_type::SERVICE_REJECT));
+    assert!(!server.ue_auth_state.contains(id));
+
+    let _ = server
+        .handle_uplink_nas_transport(ASSOC, &plain_initial_registration(id, 512))
+        .await;
+    assert!(
+        server.ue_auth_state.contains(id),
+        "the re-registration on the allocated connection is taken up"
+    );
+    server.ue_auth_state.remove(id);
+}
+
+/// A released NG connection loses its contextless allocation: after the UE
+/// Context Release Complete for the ID, the same gNB cannot mint a context under
+/// it. It gets an Error Indication "Unknown local UE NGAP ID".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_released_connection_loses_its_contextless_allocation() {
+    let mut server = capturing_ngap_server().await;
+    let id = 7_758_021u64;
+    server.forced_amf_ue_ngap_id = Some(id);
+    server
+        .handle_initial_ue_message(
+            ASSOC,
+            &super::service_request_initial_ue(service_request(None)),
+        )
+        .await
+        .expect("rejected #9");
+    take_sent_ngap(&mut server);
+
+    let complete = nextgcore_ngap::builder::build_ue_context_release_complete(
+        &nextgcore_ngap::types::UeContextReleaseComplete {
+            amf_ue_ngap_id: id,
+            ran_ue_ngap_id: 512,
+        },
+    )
+    .expect("encode a UE Context Release Complete");
+    server
+        .handle_ue_context_release_complete(ASSOC, &complete)
+        .await
+        .expect("handled");
+    take_sent_ngap(&mut server);
+
+    server
+        .handle_uplink_nas_transport(ASSOC, &plain_initial_registration(id, 512))
+        .await
+        .expect("handled");
+    assert!(!server.ue_auth_state.contains(id));
+    assert_eq!(
+        error_indication_causes(take_sent_ngap(&mut server)),
+        vec![Some(g::CauseRadioNetwork::UNKNOWN_LOCAL_UE_NGAP_ID)]
+    );
+}
+
+/// An NG Reset drops the contextless allocations of the connections it resets:
+/// a partial reset only those its items name (by either ID) on the resetting
+/// association, a whole reset every one on that association. Another
+/// association's allocation is untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ng_reset_drops_the_contextless_allocations_it_resets() {
+    use nextgcore_ngap::types::{
+        Cause, CauseTransport, NgReset, ResetType, UeAssociatedLogicalNgConnectionItem,
+    };
+    let mut server = capturing_ngap_server().await;
+    // Its own association (and so gNB pool id): an NG Reset also resets the
+    // process-global RAN UE bookkeeping of that gNB, which the other tests here
+    // share on [`ASSOC`].
+    let assoc = 758_041u64;
+    super::seed_gnb_session(&server, assoc).await;
+    let other = assoc + 7;
+    server.remember_contextless_ue_id(assoc, 7_758_031, 31);
+    server.remember_contextless_ue_id(assoc, 7_758_032, 32);
+    server.remember_contextless_ue_id(assoc, 7_758_033, 33);
+    server.remember_contextless_ue_id(other, 7_758_034, 31);
+    let reset = |reset_type| {
+        nextgcore_ngap::builder::build_ng_reset(&NgReset {
+            cause: Cause::Transport(CauseTransport::TransportResourceUnavailable),
+            reset_type,
+        })
+        .expect("encode an NG Reset")
+    };
+
+    let partial = reset(ResetType::PartOfNgInterface(vec![
+        UeAssociatedLogicalNgConnectionItem {
+            amf_ue_ngap_id: Some(7_758_031),
+            ran_ue_ngap_id: None,
+        },
+        UeAssociatedLogicalNgConnectionItem {
+            amf_ue_ngap_id: None,
+            ran_ue_ngap_id: Some(32),
+        },
+    ]));
+    let _ = server.handle_ng_reset(assoc, &partial).await;
+    let held: Vec<u64> = server
+        .contextless_ue_ids
+        .iter()
+        .map(|c| c.amf_ue_ngap_id)
+        .collect();
+    assert_eq!(
+        held,
+        vec![7_758_033, 7_758_034],
+        "the two named connections are dropped, by AMF and by RAN UE NGAP ID"
+    );
+
+    let _ = server
+        .handle_ng_reset(assoc, &reset(ResetType::NgInterface))
+        .await;
+    let held: Vec<u64> = server
+        .contextless_ue_ids
+        .iter()
+        .map(|c| c.amf_ue_ngap_id)
+        .collect();
+    assert_eq!(
+        held,
+        vec![7_758_034],
+        "only the other association's is left"
+    );
+    take_sent_ngap(&mut server);
 }

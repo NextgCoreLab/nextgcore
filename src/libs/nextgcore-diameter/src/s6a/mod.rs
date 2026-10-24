@@ -458,7 +458,7 @@ pub mod exp_result {
 }
 
 /// E-UTRAN authentication vector
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct EUtranVector {
     /// RAND (16 bytes)
     pub rand: [u8; 16],
@@ -468,6 +468,20 @@ pub struct EUtranVector {
     pub autn: [u8; 16],
     /// KASME (32 bytes)
     pub kasme: [u8; 32],
+}
+
+/// Manual `Debug` (no-auth-material-in-logs): the authentication material in
+/// this type (rand, xres, autn, kasme) prints as `<redacted>`, so a future
+/// `{:?}` in a log line cannot leak it.
+impl std::fmt::Debug for EUtranVector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("EUtranVector");
+        d.field("rand", &"<redacted>");
+        d.field("xres", &"<redacted>");
+        d.field("autn", &"<redacted>");
+        d.field("kasme", &"<redacted>");
+        d.finish()
+    }
 }
 
 /// AIA (Authentication-Information-Answer) message data
@@ -1662,5 +1676,25 @@ mod tests {
         // Nothing reported.
         assert!(PdnGwIdentity::default().to_stored_string().is_none());
         assert!(PdnGwIdentity::default().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod debug_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn eutran_vector_debug_prints_no_key_material() {
+        let v = EUtranVector {
+            rand: [0xa1; 16],
+            xres: vec![0xb2; 8],
+            autn: [0xc3; 16],
+            kasme: [0xd4; 32],
+        };
+        let shown = format!("{v:?}");
+        for byte in ["161", "178", "195", "212", "a1", "b2", "c3", "d4"] {
+            assert!(!shown.contains(byte), "{shown}");
+        }
+        assert!(shown.contains("<redacted>"));
     }
 }

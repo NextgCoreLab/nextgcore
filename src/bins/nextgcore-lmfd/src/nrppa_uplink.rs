@@ -57,26 +57,60 @@ struct Diag {
 pub fn decode_ecid_report(bytes: &[u8]) -> Result<EcidReportOutcome, String> {
     let (pdu, unknown) = nextgcore_nrppa_gen::decode_with_unknown_ies(bytes)
         .map_err(|e| format!("NRPPa APER decode: {e:?}"))?;
-    let nrppa::NRPPA_PDU::InitiatingMessage(msg) = pdu else {
-        return Err("PDU is not an E-CID measurement report".to_string());
-    };
-    let nrppa::InitiatingMessageValue::Id_e_CIDMeasurementReport(report) = msg.value else {
-        return Err("PDU is not an E-CID measurement report".to_string());
-    };
-    let txn = msg.nrppatransaction_id.0;
-
     let mut lmf_id = None;
     let mut ran_id = None;
     let mut result = None;
-    for ie in report.protocol_i_es.0 {
-        use nrppa::E_CIDMeasurementReportProtocolIEs_EntryValue as V;
-        match ie.value {
-            V::Id_LMF_UE_Measurement_ID(id) => lmf_id = Some(id.0),
-            V::Id_RAN_UE_Measurement_ID(id) => ran_id = Some(id.0),
-            V::Id_E_CID_MeasurementResult(r) => result = Some(r),
-            V::Id_Cell_Portion_ID(_) => {}
+    // The two PDUs that carry E-CID results (#834 review). TS 38.455 §8.2.1.2: an
+    // ON DEMAND request -- the only kind this LMF sends -- is answered in the
+    // E-CID MEASUREMENT INITIATION RESPONSE, so that is where a gNB puts the
+    // results. Only a PERIODIC one is followed by E-CID MEASUREMENT REPORTs
+    // (§8.2.3). Decoding the report alone meant a real gNB's answer was never
+    // read.
+    let (txn, procedure, triggering) = match pdu {
+        nrppa::NRPPA_PDU::InitiatingMessage(nrppa::InitiatingMessage {
+            nrppatransaction_id,
+            value: nrppa::InitiatingMessageValue::Id_e_CIDMeasurementReport(report),
+            ..
+        }) => {
+            for ie in report.protocol_i_es.0 {
+                use nrppa::E_CIDMeasurementReportProtocolIEs_EntryValue as V;
+                match ie.value {
+                    V::Id_LMF_UE_Measurement_ID(id) => lmf_id = Some(id.0),
+                    V::Id_RAN_UE_Measurement_ID(id) => ran_id = Some(id.0),
+                    V::Id_E_CID_MeasurementResult(r) => result = Some(r),
+                    V::Id_Cell_Portion_ID(_) => {}
+                }
+            }
+            (
+                nrppatransaction_id.0,
+                nrppa::ID_E_CID_MEASUREMENT_REPORT,
+                nrppa::TriggeringMessage::INITIATING_MESSAGE,
+            )
         }
-    }
+        nrppa::NRPPA_PDU::SuccessfulOutcome(nrppa::SuccessfulOutcome {
+            nrppatransaction_id,
+            value: nrppa::SuccessfulOutcomeValue::Id_e_CIDMeasurementInitiation(response),
+            ..
+        }) => {
+            for ie in response.protocol_i_es.0 {
+                use nrppa::E_CIDMeasurementInitiationResponseProtocolIEs_EntryValue as V;
+                match ie.value {
+                    V::Id_LMF_UE_Measurement_ID(id) => lmf_id = Some(id.0),
+                    V::Id_RAN_UE_Measurement_ID(id) => ran_id = Some(id.0),
+                    V::Id_E_CID_MeasurementResult(r) => result = Some(r),
+                    _ => {}
+                }
+            }
+            (
+                nrppatransaction_id.0,
+                nrppa::ID_E_CID_MEASUREMENT_INITIATION,
+                nrppa::TriggeringMessage::SUCCESSFUL_OUTCOME,
+            )
+        }
+        _ => {
+            return Err("PDU is not an E-CID measurement report or initiation response".to_string())
+        }
+    };
 
     let mut rejected: Vec<Diag> = Vec::new();
     let mut notified: Vec<Diag> = Vec::new();
@@ -121,6 +155,8 @@ pub fn decode_ecid_report(bytes: &[u8]) -> Result<EcidReportOutcome, String> {
         return Ok(EcidReportOutcome::Rejected {
             error_indication: build_error_indication(
                 txn,
+                procedure,
+                triggering,
                 nrppa::CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT,
                 &rejected,
             )?,
@@ -137,6 +173,8 @@ pub fn decode_ecid_report(bytes: &[u8]) -> Result<EcidReportOutcome, String> {
     } else {
         Some(build_error_indication(
             txn,
+            procedure,
+            triggering,
             nrppa::CauseProtocol::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY,
             &notified,
         )?)
@@ -149,10 +187,17 @@ pub fn decode_ecid_report(bytes: &[u8]) -> Result<EcidReportOutcome, String> {
 }
 
 /// The same `CellMeasurement` the pre-#515 adapter produced from a decoded result.
+/// An E-UTRA TADV report value as a round trip in ns (bin midpoint), or `None`
+/// for the open-ended last value (TS 36.133 §10.3.1, #832).
+fn tadv_ns(v: u16) -> Option<(f64, f64)> {
+    crate::positioning::eutra_time_report_to_ns(u32::from(v), crate::positioning::EUTRA_TADV_MAX)
+}
+
 fn to_cell(result: &nrppa::E_CID_MeasurementResult) -> CellMeasurement {
     let mut rsrp: Option<i16> = None;
     let mut rsrq: Option<i16> = None;
-    let mut timing_advance: Option<u32> = None;
+    let mut tadv1: Option<(f64, f64)> = None;
+    let mut tadv2: Option<(f64, f64)> = None;
     let mut aoa: Option<f64> = None;
     if let Some(measured) = &result.measured_results {
         for value in &measured.0 {
@@ -161,11 +206,14 @@ fn to_cell(result: &nrppa::E_CID_MeasurementResult) -> CellMeasurement {
                 M::ValueAngleOfArrival_EUTRA(deg) => {
                     aoa.get_or_insert(f64::from(deg.0));
                 }
+                // TS 36.133 §10.3.1: TADV Type 1 (eNB Rx–Tx + UE Rx–Tx) and
+                // Type 2 (eNB Rx–Tx with the UE's TA applied) are both the round
+                // trip, in T_s bins (#832). The open-ended last value is dropped.
                 M::ValueTimingAdvanceType1_EUTRA(ta) => {
-                    timing_advance.get_or_insert(u32::from(ta.0));
+                    tadv1 = tadv1.or_else(|| tadv_ns(ta.0));
                 }
                 M::ValueTimingAdvanceType2_EUTRA(ta) => {
-                    timing_advance.get_or_insert(u32::from(ta.0));
+                    tadv2 = tadv2.or_else(|| tadv_ns(ta.0));
                 }
                 M::ResultRSRP_EUTRA(items) => {
                     // value_rsrp_eutra 0..97 -> -140..-43 dBm; the strongest item wins.
@@ -187,14 +235,29 @@ fn to_cell(result: &nrppa::E_CID_MeasurementResult) -> CellMeasurement {
             }
         }
     }
+    // #865 review: Type 1 (eNB Rx–Tx + UE Rx–Tx, both measured) is the more
+    // accurate (TS 36.305 §8.3), so it is used whenever it is present, whatever
+    // the order of the IEs.
+    let tadv = tadv1.or(tadv2);
     CellMeasurement {
         nr_cgi: cgi_to_string(&result.serving_cell_id),
         rsrp,
         rsrq,
-        timing_advance,
+        timing_advance: None,
         aoa,
         rtt_ns: None,
         rstd_ns: None,
+        ue_rx_tx_ns: None,
+        rstd_reference: None,
+        ecid_rtt_ns: tadv.map(|(mid, _)| mid),
+        ecid_rtt_width_ns: tadv.map(|(_, width)| width),
+        gnb_rx_tx_ns: None,
+        meas_time: None,
+        dl_prs_id: None,
+        eutra: matches!(
+            result.serving_cell_id.ng_ra_ncell,
+            nrppa::NG_RANCell::EUTRA_CellID(_)
+        ),
     }
 }
 
@@ -219,7 +282,13 @@ fn cgi_to_string(cgi: &nrppa::NG_RAN_CGI) -> String {
 
 /// An NRPPa ERROR INDICATION (TS 38.455 §8.3.1, procedure 0, criticality ignore)
 /// reporting `diags` for the E-CID Measurement Report with transaction `txn`.
-fn build_error_indication(txn: u16, cause: u8, diags: &[Diag]) -> Result<Vec<u8>, String> {
+fn build_error_indication(
+    txn: u16,
+    procedure: u8,
+    triggering: u8,
+    cause: u8,
+    diags: &[Diag],
+) -> Result<Vec<u8>, String> {
     use nrppa::ErrorIndicationProtocolIEs_EntryValue as V;
     let list = diags
         .iter()
@@ -236,11 +305,17 @@ fn build_error_indication(txn: u16, cause: u8, diags: &[Diag]) -> Result<Vec<u8>
         })
         .collect();
     let diagnostics = nrppa::CriticalityDiagnostics {
-        procedure_code: Some(nrppa::ProcedureCode(nrppa::ID_E_CID_MEASUREMENT_REPORT)),
-        triggering_message: Some(nrppa::TriggeringMessage(
-            nrppa::TriggeringMessage::INITIATING_MESSAGE,
+        procedure_code: Some(nrppa::ProcedureCode(procedure)),
+        triggering_message: Some(nrppa::TriggeringMessage(triggering)),
+        // E-CID Measurement Report is class 2 (ignore), E-CID Measurement
+        // Initiation class 1 (reject).
+        procedure_criticality: Some(nrppa::Criticality(
+            if procedure == nrppa::ID_E_CID_MEASUREMENT_INITIATION {
+                REJECT
+            } else {
+                IGNORE
+            },
         )),
-        procedure_criticality: Some(nrppa::Criticality(IGNORE)),
         // TS 38.455 §10: an NRPPa Criticality Diagnostics also names the transaction.
         nrppatransaction_id: Some(nrppa::NRPPATransactionID(txn)),
         i_es_criticality_diagnostics: Some(nrppa::CriticalityDiagnostics_IE_List(list)),
@@ -395,6 +470,60 @@ pub mod test_support {
             value: nrppa::InitiatingMessageValue::Id_e_CIDMeasurementReport(
                 nrppa::E_CIDMeasurementReport {
                     protocol_i_es: nrppa::E_CIDMeasurementReportProtocolIEs(ies),
+                },
+            ),
+        });
+        nextgcore_nrppa_gen::encode(&pdu).expect("generated encode")
+    }
+
+    /// An E-CID Measurement Initiation Response (TS 38.455 §9.1.2.2), the answer
+    /// to an on-demand request, IEs in object-set order.
+    pub fn ecid_initiation_response(
+        txn: u16,
+        lmf: u16,
+        ran: u16,
+        cgi: nrppa::NG_RAN_CGI,
+        tac: [u8; 3],
+        measured: Option<Vec<nrppa::MeasuredResultsValue>>,
+    ) -> Vec<u8> {
+        use nrppa::E_CIDMeasurementInitiationResponseProtocolIEs_EntryValue as V;
+        let entry = |id: u16, criticality: u8, value: V| {
+            nrppa::E_CIDMeasurementInitiationResponseProtocolIEs_Entry {
+                id: nrppa::ProtocolIE_ID(id),
+                criticality: nrppa::Criticality(criticality),
+                value,
+            }
+        };
+        let ies = vec![
+            entry(
+                nrppa::ID_LMF_UE_MEASUREMENT_ID,
+                super::REJECT,
+                V::Id_LMF_UE_Measurement_ID(nrppa::UE_Measurement_ID(lmf)),
+            ),
+            entry(
+                nrppa::ID_RAN_UE_MEASUREMENT_ID,
+                super::REJECT,
+                V::Id_RAN_UE_Measurement_ID(nrppa::UE_Measurement_ID(ran)),
+            ),
+            entry(
+                nrppa::ID_E_CID_MEASUREMENT_RESULT,
+                super::IGNORE,
+                V::Id_E_CID_MeasurementResult(nrppa::E_CID_MeasurementResult {
+                    serving_cell_id: cgi,
+                    serving_cell_tac: nrppa::TAC(tac.to_vec()),
+                    ng_ran_access_point_position: None,
+                    measured_results: measured.map(nrppa::MeasuredResults),
+                    ie_extensions: None,
+                }),
+            ),
+        ];
+        let pdu = nrppa::NRPPA_PDU::SuccessfulOutcome(nrppa::SuccessfulOutcome {
+            procedure_code: nrppa::ProcedureCode(nrppa::ID_E_CID_MEASUREMENT_INITIATION),
+            criticality: nrppa::Criticality(super::REJECT),
+            nrppatransaction_id: nrppa::NRPPATransactionID(txn),
+            value: nrppa::SuccessfulOutcomeValue::Id_e_CIDMeasurementInitiation(
+                nrppa::E_CIDMeasurementInitiationResponse {
+                    protocol_i_es: nrppa::E_CIDMeasurementInitiationResponseProtocolIEs(ies),
                 },
             ),
         });
