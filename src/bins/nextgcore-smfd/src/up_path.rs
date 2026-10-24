@@ -983,6 +983,50 @@ mod tests {
     }
 
     /// #994: the FAR peers of a session follow its Create, Update and Remove FARs.
+    /// #1091 review G: a Node Report that arrives once the SMF is shutting down
+    /// records the failed path (in memory and in the snapshot, for the next start)
+    /// but arms no hold.
+    #[tokio::test]
+    async fn a_node_report_during_the_shutdown_records_the_path_but_arms_no_hold() {
+        let _state = UP_PATH_TEST_LOCK.lock().await;
+        let upf_key = "upf-1091g:8805";
+        let ip: IpAddr = "10.10.91.7".parse().unwrap();
+        let before = pending_hold_count();
+        crate::set_shutting_down_for_test(true);
+        on_node_report(
+            upf_key,
+            SessionScope::default(),
+            NodeReport {
+                failed: vec![ip],
+                recovered: Vec::new(),
+                restarted: Vec::new(),
+            },
+        );
+        crate::set_shutting_down_for_test(false);
+        let after = pending_hold_count();
+        let failed = is_failed(upf_key, ip);
+        let durable = smf_self()
+            .read()
+            .unwrap()
+            .failed_up_paths
+            .read()
+            .unwrap()
+            .contains_key(&durable_key(upf_key, ip));
+        on_node_report(
+            upf_key,
+            SessionScope::default(),
+            NodeReport {
+                failed: Vec::new(),
+                recovered: vec![ip],
+                restarted: Vec::new(),
+            },
+        );
+
+        assert_eq!(after, before, "no hold armed");
+        assert!(failed, "the path is recorded failed");
+        assert!(durable, "and in the snapshot, for the next start to re-arm");
+    }
+
     /// #1028 review: a path that fails during the shutdown arms no hold (its #39s
     /// would meet NF_FAILOVER); the next start re-arms it from the snapshot.
     #[tokio::test]

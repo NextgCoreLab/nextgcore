@@ -578,6 +578,21 @@ pub(crate) fn clear_global_upf_for_test() {
     }
 }
 
+/// A test's extra delay before the address lookup of one name (#1091 review H).
+#[cfg(test)]
+static NODE_LOOKUP_DELAY_FOR_TEST: std::sync::Mutex<Option<(String, Duration)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn node_lookup_delay_for_test(name: &str) -> Option<Duration> {
+    NODE_LOOKUP_DELAY_FOR_TEST
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|(n, _)| n == name)
+        .map(|(_, d)| *d)
+}
+
 /// Install `addrs` as a UPF's other addresses, learnt by lookup `generation`, unless a
 /// later Association Setup started a newer lookup meanwhile (#1091 review E). The
 /// lookups run detached, so after a re-association they can finish in either order;
@@ -1203,6 +1218,10 @@ impl PfcpClient {
         let own = self.peer();
         tokio::spawn(async move {
             for name in names {
+                #[cfg(test)]
+                if let Some(delay) = node_lookup_delay_for_test(&name) {
+                    tokio::time::sleep(delay).await;
+                }
                 let lookup = tokio::net::lookup_host((name.as_str(), PFCP_PORT));
                 if let Ok(Ok(found)) = tokio::time::timeout(Duration::from_secs(2), lookup).await {
                     addrs.extend(found.map(|a| a.ip()));
@@ -3142,6 +3161,37 @@ mod tests {
         assert!(commit_node_addresses(&known, &latest, newer, vec![moved]));
         assert!(!commit_node_addresses(&known, &latest, older, vec![before]));
         assert_eq!(*known.read().unwrap(), vec![moved]);
+    }
+
+    /// #1091 review H: two Association Setups on one client, the first one's lookup
+    /// slow: the second's addresses stay, though the first finishes last.
+    #[tokio::test]
+    async fn the_older_of_two_address_lookups_is_dropped_when_it_finishes_last() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client = Arc::new(PfcpClient::new(
+            sock,
+            "10.0.0.7:8805".parse().unwrap(),
+            [127, 0, 0, 1],
+        ));
+        let _pool = InstalledPool::new(vec![client.clone()]);
+        *NODE_LOOKUP_DELAY_FOR_TEST.lock().unwrap() =
+            Some(("localhost".to_string(), Duration::from_millis(300)));
+        let older = client.learn_node_addresses(&NodeId::new_fqdn("localhost".to_string()));
+        let newer = client.learn_node_addresses(&NodeId::new_ipv4([10, 9, 9, 9]));
+        newer.await.unwrap();
+        older.await.unwrap();
+        *NODE_LOOKUP_DELAY_FOR_TEST.lock().unwrap() = None;
+
+        assert!(
+            client.is_node_address("10.9.9.9:8805".parse().unwrap()),
+            "the newer set stays"
+        );
+        assert!(
+            !client.is_node_address("127.0.0.1:8805".parse().unwrap()),
+            "the older one, finished last, is dropped"
+        );
     }
 
     /// #974 review n2: a learnt address that another pool member is dialled at is

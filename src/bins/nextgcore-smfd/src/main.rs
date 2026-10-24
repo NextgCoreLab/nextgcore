@@ -70,7 +70,24 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 /// Whether the shutdown signal has arrived.
 pub(crate) fn shutting_down() -> bool {
+    #[cfg(test)]
+    if SHUTDOWN_FOR_TEST.with(std::cell::Cell::get) {
+        return true;
+    }
     SHUTDOWN.load(Ordering::SeqCst)
+}
+
+// A shutdown seen only by the calling test's thread. The process-wide flag would
+// also refuse the creates and the S5/S8 requests of tests running alongside.
+#[cfg(test)]
+thread_local! {
+    static SHUTDOWN_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Set the calling thread's [`shutting_down`] for a test.
+#[cfg(test)]
+pub(crate) fn set_shutting_down_for_test(on: bool) {
+    SHUTDOWN_FOR_TEST.with(|s| s.set(on));
 }
 
 /// When the shutdown signal arrived (#941 review M2): the start of the one deadline
