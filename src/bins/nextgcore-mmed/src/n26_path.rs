@@ -793,6 +793,13 @@ fn handle_datagram(inner: &Arc<N26Inner>, data: &[u8], peer: SocketAddr) {
     }
 
     // Only a request sent to `peer` can be closed by what `peer` sends (#735).
+    //
+    // Close first, dispatch second, deliberately (#942 review): once the
+    // transaction is closed no retransmission timer can resend the request
+    // while its procedure runs, and a duplicate of this response is matched to
+    // nothing rather than dispatched twice. The cost is that `outstanding() ==
+    // 0` does not mean the procedure has run yet; a test waits for the
+    // procedure's own effect (#934).
     let matched = match inner.xact.lock() {
         Ok(mut xact) => xact.match_response_from(peer, seq, msg_type),
         Err(_) => None,

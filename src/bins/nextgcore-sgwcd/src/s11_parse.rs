@@ -231,6 +231,9 @@ pub struct ParsedDeleteSessionRequest {
     pub linked_ebi: u8,
     /// Scope Indication flag (SI) from the Indication IE
     pub scope_indication: bool,
+    /// Operation Indication flag (OI): the SGW forwards the request to the PGW
+    /// (TS 29.274 Table 7.2.9.1-1, #1025).
+    pub operation_indication: bool,
 }
 
 pub fn parse_delete_session_request(
@@ -245,15 +248,16 @@ pub fn parse_delete_session_request(
         .map_err(|_| IeError::incorrect_mandatory(Gtp2IeType::Ebi))?
         .ebi;
 
-    let scope_indication = msg
+    let indication = msg
         .get_ie(Gtp2IeType::Indication as u8, 0)
-        .and_then(|ie| Gtp2IndicationIe::decode(&ie.value).ok())
-        .map(|ind| ind.si)
-        .unwrap_or(false);
+        .and_then(|ie| Gtp2IndicationIe::decode(&ie.value).ok());
+    let scope_indication = indication.as_ref().is_some_and(|ind| ind.si);
+    let operation_indication = indication.as_ref().is_some_and(|ind| ind.oi);
 
     Ok(ParsedDeleteSessionRequest {
         linked_ebi,
         scope_indication,
+        operation_indication,
     })
 }
 

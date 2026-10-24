@@ -119,6 +119,7 @@ Cargo features: `kernel-sctp` (enables `--sctp-backend kernel`; the Docker build
 | `AMF_NTN_TIMING_ADVANCE_US` | Default NTN timing advance; read only in an `ntn` feature build. |
 | `AMF_HANDOVER_PREPARATION_SMF_WAIT_MS` | N2 handover (TS 23.502 §4.9.1.3.2 step 8): the longest the AMF waits for the SMFs' PREPARING answers before it sends the HANDOVER REQUEST with the sessions that answered; a session still waiting is not handed over and its SMF is told CANCELLED. Default `1000`; keep it well inside the source's TNGRELOCprep. |
 | `AMF_HANDOVER_COMMAND_SMF_WAIT_MS` | The same wait for the PREPARED answers to the target's Acknowledge before the HANDOVER COMMAND goes to the source; it counts against TNGRELOCoverall. Default `1000`. |
+| `AMF_HANDOVER_SOURCE_HOLD_MS` | N2 handover (TS 23.502 §4.9.1.3.3 steps 6a, 14a): how long after the target's Handover Notify the source NG-RAN keeps its UE context, for in-flight forwarding, before the UE Context Release Command. Default `2000`; `0` releases at the Notify. A UE served on the old source connection again (ping-pong) is not released. |
 
 ## Behavior notes and caveats
 

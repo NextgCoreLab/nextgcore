@@ -757,9 +757,12 @@ fn probe_stale_recovery(inner: &Arc<GtpcInner>, peer: SocketAddr, counter: u8) -
     let Ok(mut probes) = inner.stale_probe.lock() else {
         return false;
     };
+    // One probe per PEER per period (#955 review), whatever the value: a peer
+    // flapping between stale values must not turn each datagram into an Echo
+    // Request. The outstanding probe keeps the value it asked about.
     if probes
         .get(&peer.ip())
-        .is_some_and(|p| p.counter == counter && now.duration_since(p.sent) < STALE_PROBE_INTERVAL)
+        .is_some_and(|p| now.duration_since(p.sent) < STALE_PROBE_INTERVAL)
     {
         return false;
     }
@@ -866,9 +869,16 @@ fn note_peer_recovery(inner: &Arc<GtpcInner>, peer: SocketAddr, counter: u8) -> 
 /// TS 23.007 §15 (#689): a Serving GW restart lost every PDN connection the MME
 /// had through it. The UEs on it are detached, re-attach required.
 fn on_s11_peer_restart(peer: SocketAddr) {
-    let ctx = crate::context::mme_self();
+    on_s11_peer_restart_in(crate::context::mme_self(), peer);
+}
+
+/// The effect of an S11 peer restart on `ctx`: the UEs with PDN connections
+/// through it are detached, re-attach required (TS 23.007 §15). Returns how
+/// many.
+fn on_s11_peer_restart_in(ctx: &MmeContext, peer: SocketAddr) -> usize {
     let n = crate::network_detach::sgw_restarted(ctx, ctx.sgwc_list.first().copied(), peer.ip());
     log::warn!("S11 peer {peer} restart: {n} UE(s) detached, re-attach required");
+    n
 }
 
 /// Dispatch one received datagram.
@@ -2888,6 +2898,13 @@ mod tests {
         assert!(note_peer_recovery(&server.inner, peer_addr, 4));
         assert!(!note_peer_recovery(&server.inner, peer_addr, 3));
         let seq = recv_echo(&peer).expect("probed");
+        // Per peer, not per value (#955 review): another stale value within the
+        // period sends no second probe.
+        peer.set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        assert!(!note_peer_recovery(&server.inner, peer_addr, 2));
+        assert!(recv_echo(&peer).is_none(), "one probe per peer per period");
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         // Answered over the socket, so the receive path's routing of an Echo
         // Response to the probe is what is tested.
         let answer = Gtp2Message::echo_response(seq, 4);
@@ -2904,5 +2921,97 @@ mod tests {
         );
         assert_eq!(stored(&server), Some(4), "kept");
         server.close();
+    }
+
+    /// #955 review: the confirmed-restart path over the socket. A peer that lost
+    /// its counter answers the probe with the same lower value: the receive path
+    /// routes the Echo Response to the probe, re-bases the stored value, and the
+    /// peer's next increment is a restart again.
+    #[test]
+    fn a_lost_counter_confirmed_by_echo_over_the_socket_is_re_based() {
+        let _guard = lock_s11();
+        let (server, peer, peer_addr) = spawn_server_and_peer(Gtp2XactConfig::default());
+        assert!(!note_peer_recovery(&server.inner, peer_addr, 100));
+        assert!(!note_peer_recovery(&server.inner, peer_addr, 1), "stale");
+        let mut buf = [0u8; 4096];
+        let seq = loop {
+            let (len, _) = peer.recv_from(&mut buf).expect("an Echo Request");
+            let msg = Gtp2Message::decode(&mut Bytes::copy_from_slice(&buf[..len])).unwrap();
+            if msg.header.message_type == Gtp2MessageType::EchoRequest as u8 {
+                break msg.header.sequence_number;
+            }
+        };
+        let answer = Gtp2Message::echo_response(seq, 1);
+        peer.send_to(&answer.encode(), server.local_addr()).unwrap();
+        let stored = || {
+            server
+                .inner
+                .peer_restart
+                .lock()
+                .unwrap()
+                .get(&peer_addr.ip())
+                .copied()
+        };
+        for _ in 0..200 {
+            if stored() == Some(1) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            stored(),
+            Some(1),
+            "re-based by the confirming Echo Response"
+        );
+        assert!(server.inner.stale_probe.lock().unwrap().is_empty());
+        assert!(
+            note_peer_recovery(&server.inner, peer_addr, 4),
+            "the next restart is caught"
+        );
+        server.close();
+    }
+
+    /// #987 review: what a confirmed restart (`confirm_stale_recovery`, a lost
+    /// counter) does: the UEs whose PDN connections go through that Serving GW
+    /// are detached, re-attach required, and a UE of another gateway is not. On
+    /// its own context, so the process-wide one's UEs are untouched.
+    #[test]
+    fn a_confirmed_restart_detaches_the_ues_of_that_serving_gw() {
+        let mut ctx = MmeContext::new();
+        ctx.sgwc_list = vec!["127.0.0.1:2123".parse().unwrap()];
+        let ctx = ctx;
+        ctx.init();
+        let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+        let enb_ue_id = ctx.enb_ue_add(enb_id, 987);
+        let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
+        ctx.enb_ue_associate_mme_ue(enb_ue_id, mme_ue_id);
+        let sgw_ue_id = ctx.sgw_ue_add(mme_ue_id);
+        ctx.sgw_ue_pool
+            .write()
+            .unwrap()
+            .get_mut(&sgw_ue_id)
+            .unwrap()
+            .sgw_s11_teid = 0x987;
+        ctx.mme_ue_pool
+            .write()
+            .unwrap()
+            .get_mut(&mme_ue_id)
+            .unwrap()
+            .sgw_ue_id = sgw_ue_id;
+        assert_eq!(
+            on_s11_peer_restart_in(&ctx, "10.9.8.7:2123".parse().unwrap()),
+            0,
+            "another gateway's restart"
+        );
+        assert_eq!(
+            on_s11_peer_restart_in(&ctx, "127.0.0.1:2123".parse().unwrap()),
+            1
+        );
+        let detached = ctx.mme_ue_find_by_id(mme_ue_id).is_none_or(|ue| {
+            ue.nas_eps.type_ == crate::context::MmeEpsType::DetachRequestToUe
+                && ue.network_detach_type
+                    == Some(crate::emm_build::DetachTypeToUe::ReAttachRequired)
+        });
+        assert!(detached, "detached, re-attach required (or implicitly)");
     }
 }
