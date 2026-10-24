@@ -182,6 +182,14 @@ jobs:
       - name: cargo fmt
         run: cd src && cargo fmt --all -- --check
 
+      - name: webui session key fails closed; bind defaults to loopback
+        # #913: the provisioning UI refuses to start without a real SECRET_KEY;
+        # #850: it listens on 127.0.0.1 unless WEBUI_BIND_ADDR says otherwise.
+        # These pin both checks without installing the UI's dependencies.
+        run: |
+          node webui/server/lib/session-key.check.js
+          node webui/server/lib/bind-address.check.js
+
   helm:
     # #753 review: `helm lint` reports a template `fail` only at [INFO] and exits
     # 0, so it cannot catch the chart's refusal of amf.replicas > 1. The render
@@ -393,6 +401,10 @@ jobs:
     name: Docker E2E
     runs-on: ubuntu-latest
     needs: docker-build
+    env:
+      # docker-compose.yml fails fast without it (#837): no Grafana credential
+      # is committed. A per-run throwaway value; Grafana is not started here.
+      GRAFANA_ADMIN_PASSWORD: ci-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Checkout nextgcore
         uses: actions/checkout@v4
