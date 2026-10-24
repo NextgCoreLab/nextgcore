@@ -720,6 +720,8 @@ async fn convert_request(
     // Read body under a size cap. multipart/related bodies (N1/N2 binary
     // containers, TS 29.500 §6.1.2.3) are decoded into the JSON root + binary
     // parts before any UTF-8 conversion so binary content survives byte-exact.
+    // #940: the path may carry a callback token; the log lines below show it redacted.
+    let logged_uri = crate::log_redact::redact_callback_tokens(&uri);
     let limited = Limited::new(req.into_body(), max_body_size);
     let declared_length: Option<usize> = http
         .get_header("content-length")
@@ -734,8 +736,9 @@ async fn convert_request(
             let bytes = body.to_bytes();
             if declared_length.is_some_and(|n| n != bytes.len()) {
                 log::warn!(
-                    "cid={correlation_id} method={method} path={uri} reason=BODY_READ_ERROR: \
-                     {} of the {} declared body bytes arrived; the request is not dispatched",
+                    "cid={correlation_id} method={method} path={logged_uri} \
+                     reason=BODY_READ_ERROR: {} of the {} declared body bytes arrived; the \
+                     request is not dispatched",
                     bytes.len(),
                     declared_length.unwrap_or_default()
                 );
@@ -757,7 +760,7 @@ async fn convert_request(
                         Err(e) => {
                             log::warn!(
                                 "cid={correlation_id} Failed to decode multipart request body \
-                                 on {uri}: {e}"
+                                 on {logged_uri}: {e}"
                             );
                             http.set_content(String::from_utf8_lossy(&bytes).to_string());
                         }
@@ -773,7 +776,7 @@ async fn convert_request(
                 .is_some()
             {
                 log::warn!(
-                    "cid={correlation_id} method={method} path={uri} \
+                    "cid={correlation_id} method={method} path={logged_uri} \
                      reason=PAYLOAD_TOO_LARGE: body exceeds {max_body_size}-byte limit"
                 );
                 return Err(ConvertRequestError::BodyTooLarge);
@@ -782,7 +785,7 @@ async fn convert_request(
             // body, so a handler saw a truncated request as a complete, bodiless one
             // (a capture server in amfd's tests took it for a notification).
             log::warn!(
-                "cid={correlation_id} method={method} path={uri} \
+                "cid={correlation_id} method={method} path={logged_uri} \
                  reason=BODY_READ_ERROR: {e}; the request is not dispatched"
             );
             return Err(ConvertRequestError::BodyReadFailed);

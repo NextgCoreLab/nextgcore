@@ -62,7 +62,7 @@ Defaults below are the real clap `default_value`s from the source.
 |-----------|------|---------|-------------|
 | `-c, --config` | string | `/etc/nextgcore/upf.yaml` | Configuration file path. Read if present, but contents are not applied (see note above). |
 | `-l, --log-file` | string | *(none)* | Log file path. |
-| `-e, --log-level` | string | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error`. |
+| `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-m, --no-color` | bool | `false` | Disable colored log output. |
 | `-k, --kill` | bool | `false` | Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor. |
 | `--pfcp-addr` | string | `127.0.0.4` | N4 PFCP server bind address. |

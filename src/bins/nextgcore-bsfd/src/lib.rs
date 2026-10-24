@@ -57,9 +57,10 @@ struct Args {
     #[arg(short = 'l', long)]
     log_file: Option<String>,
 
-    /// Log level (trace, debug, info, warn, error)
-    #[arg(short = 'e', long, default_value = "info")]
-    log_level: String,
+    /// Log level (trace, debug, info, warn, error). Without it, the config
+    /// file's `logger.level`, else `info`; `RUST_LOG` overrides (#691).
+    #[arg(short = 'e', long)]
+    log_level: Option<String>,
 
     /// Disable color output
     #[arg(short = 'm', long)]
@@ -2520,7 +2521,10 @@ async fn handle_pcf_mbs_binding_update(binding_id: &str, request: &SbiRequest) -
 /// Initialize logging based on command line arguments
 fn init_logging(args: &Args) -> Result<()> {
     // RUST_LOG if set, else --log-level: the same for every NF (#691).
-    let mut builder = nextgcore_core::log::nf_log_builder(&args.log_level);
+    let mut builder = nextgcore_core::log::nf_log_builder(&nextgcore_core::log::nf_log_level(
+        args.log_level.as_deref(),
+        Some(&args.config),
+    ));
 
     if args.no_color {
         builder.write_style(env_logger::WriteStyle::Never);
@@ -2869,7 +2873,7 @@ mod tests {
     fn test_args_default() {
         let args = Args::parse_from(["nextgcore-bsfd"]);
         assert_eq!(args.config, "/etc/nextgcore/bsf.yaml");
-        assert_eq!(args.log_level, "info");
+        assert_eq!(args.log_level, None);
         assert_eq!(args.sbi_addr, "0.0.0.0");
         assert_eq!(args.sbi_port, 7777);
         assert!(!args.tls);
@@ -2892,7 +2896,7 @@ mod tests {
             "2048",
         ]);
         assert_eq!(args.config, "/custom/bsf.yaml");
-        assert_eq!(args.log_level, "debug");
+        assert_eq!(args.log_level.as_deref(), Some("debug"));
         assert_eq!(args.sbi_addr, "0.0.0.0");
         assert_eq!(args.sbi_port, 8080);
         assert_eq!(args.max_sess, 2048);

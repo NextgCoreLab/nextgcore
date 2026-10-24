@@ -29,6 +29,8 @@ const UE: (f64, f64) = (350.0, 600.0);
 const UE_CLOCK_OFFSET_NS: f64 = 3_000.0;
 const SRS_AFTER_PRS_NS: f64 = 1_000.0;
 const SRS_SET: u8 = 5;
+/// The TRPs' SFN initialisation time, 32.32 seconds since 1900 (#911).
+const SFN_INIT: u64 = 3_900_000_000u64 << 32;
 
 fn node() -> NgRanNode {
     NgRanNode {
@@ -65,6 +67,9 @@ struct FakeNgRan {
     measurement_fails: bool,
     /// Never answer TRP Information Exchange.
     silent_trp_information: bool,
+    /// Report each TRP's CGI, ARFCN, PRS configuration and SFN initialisation
+    /// time too (#911).
+    with_prs: bool,
 }
 
 impl FakeNgRan {
@@ -103,7 +108,44 @@ impl FakeNgRan {
                         )
                     })
                     .collect();
-                gnb::trp_information_response(txn, &trps)
+                if self.with_prs {
+                    use nrppa::TRPInformationTypeResponseItem as I;
+                    let items = trps
+                        .iter()
+                        .map(|&(id, pci, lat, lon, alt)| {
+                            (
+                                id,
+                                vec![
+                                    I::PCI_NR(nrppa::TRPInformationTypeResponseItem_pCI_NR(pci)),
+                                    I::CGI_NR(gnb::cgi_nr(
+                                        [0x00, 0xf1, 0x10],
+                                        0x807_000 + u64::from(id),
+                                    )),
+                                    I::ARFCN(nrppa::TRPInformationTypeResponseItem_aRFCN(620_000)),
+                                    I::PRSConfiguration(crate::dl_prs_assistance::tests::config(
+                                        vec![crate::dl_prs_assistance::tests::set(
+                                            0,
+                                            1,
+                                            5,
+                                            0,
+                                            0,
+                                            620_000,
+                                            &[(100 + id, 0)],
+                                        )],
+                                    )),
+                                    // Synchronised: one SFN initialisation time for all.
+                                    I::SFNInitialisationTime(nrppa::RelativeTime1900(
+                                        (0..64).map(|i| (SFN_INIT >> (63 - i)) & 1 == 1).collect(),
+                                    )),
+                                    gnb::geographical(lat, lon, alt),
+                                ],
+                            )
+                        })
+                        .collect();
+                    gnb::trp_information_response_items(txn, items)
+                } else {
+                    gnb::trp_information_response(txn, &trps)
+                }
             }
             nrppa::InitiatingMessageValue::Id_positioningInformationExchange(_) => {
                 gnb::positioning_information_response(txn, gnb::srs_configuration(SRS_SET))
@@ -245,7 +287,7 @@ async fn the_gnb_half_is_measured_and_paired_into_a_multi_rtt_fix() {
         gnb_slot: 12,
         ..Default::default()
     };
-    let prepared = prepare(&ran, Duration::from_secs(1), 1_000)
+    let prepared = prepare(&ran, Duration::from_secs(1), 1_000, &[])
         .await
         .expect("the gNB half is set up");
     let (request_id, _corr, mut rx) = register();
@@ -346,7 +388,9 @@ async fn halves_measured_seconds_apart_are_not_paired() {
         gnb_slot: 11,
         ..Default::default()
     };
-    let prepared = prepare(&ran, Duration::from_secs(1), 1_000).await.unwrap();
+    let prepared = prepare(&ran, Duration::from_secs(1), 1_000, &[])
+        .await
+        .unwrap();
     let (request_id, _corr, _rx) = register();
     let ctx = lmf_self();
     ctx.read()
@@ -404,7 +448,7 @@ async fn no_srs_configuration_means_no_gnb_half() {
     let _g = PROCESS_STATE_TEST_LOCK.lock().await;
     setup();
     let ran = NoSrs(FakeNgRan::default());
-    let err = prepare(&ran, Duration::from_secs(1), 1_000)
+    let err = prepare(&ran, Duration::from_secs(1), 1_000, &[])
         .await
         .err()
         .expect("no SRS, no gNB half");
@@ -460,7 +504,9 @@ async fn a_measurement_failure_falls_back_to_the_dl_tdoa_fix() {
         measurement_fails: true,
         ..Default::default()
     };
-    let prepared = prepare(&ran, Duration::from_secs(1), 1_000).await.unwrap();
+    let prepared = prepare(&ran, Duration::from_secs(1), 1_000, &[])
+        .await
+        .unwrap();
     let (request_id, _corr, mut rx) = register();
     let ctx = lmf_self();
     // DL-TDOA needs the reference TRP, which reports no PCI: key it by DL-PRS ID.
@@ -500,7 +546,9 @@ async fn a_pci_on_two_trps_is_not_ranged() {
         extra: Some((5, 201, 2000.0, 300.0)),
         ..Default::default()
     };
-    let prepared = prepare(&ran, Duration::from_secs(1), 1_000).await.unwrap();
+    let prepared = prepare(&ran, Duration::from_secs(1), 1_000, &[])
+        .await
+        .unwrap();
     // The Measurement Request names neither TRP of PCI 201.
     let seen = ran.seen.lock().unwrap().clone();
     let (_, _, req) = seen
@@ -561,10 +609,10 @@ async fn a_silent_node_is_backed_off() {
         silent_trp_information: true,
         ..Default::default()
     };
-    assert!(prepare(&ran, Duration::from_millis(50), 1_000)
+    assert!(prepare(&ran, Duration::from_millis(50), 1_000, &[])
         .await
         .is_err());
-    assert!(prepare(&ran, Duration::from_millis(50), 1_000)
+    assert!(prepare(&ran, Duration::from_millis(50), 1_000, &[])
         .await
         .is_err());
     let asked = ran
@@ -578,4 +626,228 @@ async fn a_silent_node_is_backed_off() {
         asked, 1,
         "the second request does not ask the silent node again"
     );
+}
+
+/// The UE's Multi-RTT halves for `trps` named by the DL-PRS IDs the assistance
+/// data gave them (#911), with the PCI each TRP has.
+fn ue_halves_by_assigned_id(
+    trps: &[(u16, u16, f64, f64)],
+    assistance: &Assistance,
+) -> Vec<CellMeasurement> {
+    let cells: Vec<(u8, u16, u32)> = trps
+        .iter()
+        .map(|(id, pci, e, n)| {
+            let prs = assistance
+                .trps
+                .iter()
+                .find(|(_, t, _)| t == id)
+                .map(|(_, _, p)| *p)
+                .expect("the TRP was described");
+            let t = propagation_ns(*e, *n) + UE_CLOCK_OFFSET_NS - SRS_AFTER_PRS_NS;
+            (prs, *pci, (t / TC_NS + 985_024.0).round() as u32)
+        })
+        .collect();
+    crate::codec_glue::decode_lpp_provide_report(&crate::lpp_fixtures::multi_rtt_lpp_with_prs(
+        &cells, 7,
+    ))
+    .expect("decodes")
+    .1
+}
+
+/// #911: the assistance data describes every TRP that reported a PRS
+/// configuration, each under its own DL-PRS ID, and keys its position by the TRP.
+#[tokio::test]
+async fn the_assistance_data_names_each_trp_by_its_own_dl_prs_id() {
+    let _g = PROCESS_STATE_TEST_LOCK.lock().await;
+    setup();
+    let ran = FakeNgRan {
+        with_prs: true,
+        extra: Some((5, 201, 2000.0, 300.0)),
+        ..Default::default()
+    };
+    let a = prepare_assistance(&ran, Duration::from_secs(1), None)
+        .await
+        .expect("assistance data");
+    let ids: Vec<u8> = a.trps.iter().map(|(_, _, id)| *id).collect();
+    assert_eq!(
+        ids,
+        vec![0, 1, 2, 3, 4],
+        "one DL-PRS ID per TRP, PCI 201 twice included"
+    );
+    assert_eq!(a.built.dl_prs_ids, ids);
+    for (node, trp, id) in &a.trps {
+        let key = crate::context::trp_key(node, *trp);
+        assert_eq!(a.keys.get(id), Some(&key));
+        assert!(
+            lmf_self()
+                .read()
+                .unwrap()
+                .build_trp_registry()
+                .lookup(&key)
+                .is_some(),
+            "{key} has the position NG-RAN reported"
+        );
+    }
+    assert_eq!(crate::context::trp_key(&node(), 5), "trp-00101-807-5");
+    // The PRS of TRP 5 is the one TRP 5 reported, with its CGI and ARFCN.
+    let per = &a.built.data.nr_dl_prs_assistance_data_list_r16.0[0]
+        .nr_dl_prs_assistance_data_per_freq_r16
+        .0;
+    let t5 = per.iter().find(|t| t.dl_prs_id_r16.0 == 4).unwrap();
+    assert_eq!(t5.nr_phys_cell_id_r16.as_ref().map(|p| p.0), Some(201));
+    assert_eq!(t5.nr_arfcn_r16.as_ref().map(|a| a.0), Some(620_000));
+    assert!(t5.nr_cell_global_id_r16.is_some());
+    assert_eq!(
+        t5.nr_dl_prs_info_r16.nr_dl_prs_resource_set_list_r16.0[0]
+            .dl_prs_resource_list_r16
+            .0[0]
+            .dl_prs_sequence_id_r16
+            .0,
+        105
+    );
+    // The same TRPs keep their IDs on the next session.
+    let again = prepare_assistance(&ran, Duration::from_secs(1), None)
+        .await
+        .unwrap();
+    assert_eq!(again.trps, a.trps);
+}
+
+/// #911, the payoff: two TRPs that share PCI 201 cannot be told apart by PCI
+/// (#903 left both out). Named by the DL-PRS IDs of the assistance data, both
+/// are measured, paired and ranged, and the fix uses all five TRPs.
+#[tokio::test]
+async fn a_shared_pci_is_ranged_once_the_assistance_data_names_its_trps() {
+    let _g = PROCESS_STATE_TEST_LOCK.lock().await;
+    setup();
+    let extra = (5, 201, 2000.0, 300.0);
+    let ran = FakeNgRan {
+        gnb_slot: 12,
+        with_prs: true,
+        extra: Some(extra),
+        ..Default::default()
+    };
+    let a = prepare_assistance(&ran, Duration::from_secs(1), None)
+        .await
+        .unwrap();
+    let prepared = prepare(&ran, Duration::from_secs(1), 1_000, &a.trps)
+        .await
+        .unwrap();
+    // Both TRPs of PCI 201 are measured now.
+    let seen = ran.seen.lock().unwrap().clone();
+    let (_, _, req) = seen
+        .iter()
+        .find(|(p, ..)| *p == nrppa::ID_MEASUREMENT)
+        .unwrap();
+    let nrppa::NRPPA_PDU::InitiatingMessage(m) = nextgcore_nrppa_gen::decode(req).unwrap() else {
+        unreachable!()
+    };
+    let nrppa::InitiatingMessageValue::Id_Measurement(r) = m.value else {
+        unreachable!()
+    };
+    assert!(r.protocol_i_es.0.iter().any(|ie| matches!(&ie.value,
+        nrppa::MeasurementRequestProtocolIEs_EntryValue::Id_TRP_MeasurementRequestList(l)
+            if l.0.iter().map(|t| t.trp_id.0).collect::<Vec<_>>() == [1, 2, 3, 4, 5])));
+
+    let (request_id, corr, _rx) = register();
+    let ctx = lmf_self();
+    ctx.read()
+        .unwrap()
+        .positioning_session_set_dl_prs_keys(&corr, a.keys.clone());
+    let all = [TRPS[0], TRPS[1], TRPS[2], TRPS[3], extra];
+    ctx.read().unwrap().measurement_leg_report(
+        request_id,
+        MeasurementLeg::Lpp,
+        ue_halves_by_assigned_id(&all, &a),
+    );
+    let cells = collect(&ran, prepared, Duration::from_secs(1)).await;
+    assert_eq!(cells.len(), 5, "a gNB half for every TRP");
+    assert!(cells.iter().all(|c| c.nr_cgi.starts_with("trp-")));
+    let gnb_cells = cells.clone();
+    let LegProgress::Completed(Some(fix)) =
+        ctx.read()
+            .unwrap()
+            .measurement_leg_report(request_id, MeasurementLeg::NrppaTrp, cells)
+    else {
+        panic!("five TRPs solve");
+    };
+    assert_eq!(fix.method_used.as_deref(), Some("MULTI-RTT"));
+    let got = geodetic_to_enu(TrpCoord::new(fix.latitude, fix.longitude, 0.0), origin());
+    let err = (got.e - UE.0).hypot(got.n - UE.1);
+    assert!(err < 1.0, "{err:.2} m off");
+    // The ranges: all five, TRP 5 at its own distance. The UE halves keyed as the
+    // session keys them, by the TRP their DL-PRS ID names.
+    let registry = ctx.read().unwrap().build_trp_registry();
+    let mut both: Vec<CellMeasurement> = ue_halves_by_assigned_id(&all, &a)
+        .into_iter()
+        .map(|mut c| {
+            c.nr_cgi = a.keys[&c.dl_prs_id.unwrap()].clone();
+            c
+        })
+        .collect();
+    both.extend(gnb_cells);
+    let obs = crate::context::multi_rtt_observations_for_test(&both, &registry);
+    assert_eq!(obs.len(), 5);
+    let key5 = crate::context::trp_key(&node(), 5);
+    let r5 = obs.iter().find(|o| o.trp_id == key5).unwrap().range_m;
+    let want = (UE.0 - extra.2).hypot(UE.1 - extra.3);
+    assert!(
+        (r5 - want).abs() < 1.0,
+        "TRP 5 ranged {r5:.1} m, truly {want:.1} m"
+    );
+}
+
+/// #911: a DL-TDOA report on the assistance data's DL-PRS IDs solves against the
+/// TRPs those IDs name. The reference TRP carries no PCI at all.
+#[tokio::test]
+async fn a_dl_tdoa_report_on_assigned_dl_prs_ids_is_solved() {
+    let _g = PROCESS_STATE_TEST_LOCK.lock().await;
+    setup();
+    let ran = FakeNgRan {
+        with_prs: true,
+        ..Default::default()
+    };
+    let a = prepare_assistance(&ran, Duration::from_secs(1), None)
+        .await
+        .unwrap();
+    let id_of = |trp: u16| a.trps.iter().find(|(_, t, _)| *t == trp).unwrap().2;
+    let d_ref = propagation_ns(TRPS[0].2, TRPS[0].3);
+    let neighbours: Vec<(u8, Option<u16>, u32)> = TRPS[1..]
+        .iter()
+        .map(|(id, pci, e, n)| {
+            let rstd = propagation_ns(*e, *n) - d_ref;
+            (
+                id_of(*id),
+                Some(*pci),
+                (rstd / TC_NS + 985_024.0).round() as u32,
+            )
+        })
+        .collect();
+    let cells = crate::codec_glue::decode_lpp_provide_report(&crate::lpp_fixtures::dl_tdoa_lpp(
+        id_of(1),
+        &neighbours,
+        7,
+    ))
+    .unwrap()
+    .1;
+    let ctx = lmf_self();
+    let c = ctx.read().unwrap();
+    let req = c
+        .measurement_request(
+            0,
+            PositioningMethod::NrBased,
+            None,
+            None,
+            PositioningQos::HighAccuracy,
+        )
+        .unwrap();
+    let (corr, _rx) = c.positioning_session_register(Some("imsi-911".into()), 8, req.request_id);
+    c.positioning_session_set_dl_prs_keys(&corr, a.keys.clone());
+    let LegProgress::Completed(Some(fix)) =
+        c.measurement_leg_report(req.request_id, MeasurementLeg::Lpp, cells)
+    else {
+        panic!("a DL-TDOA fix");
+    };
+    assert_eq!(fix.method_used.as_deref(), Some("DL_TDOA"));
+    let got = geodetic_to_enu(TrpCoord::new(fix.latitude, fix.longitude, 0.0), origin());
+    assert!((got.e - UE.0).hypot(got.n - UE.1) < 1.0);
 }

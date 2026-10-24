@@ -96,15 +96,10 @@ pub fn log_level_from_args<I: IntoIterator<Item = String>>(args: I) -> Option<St
 /// then `info` -- the level every other NF starts at. `RUST_LOG`, when set, still
 /// overrides it (`env_logger`'s `default_filter_or`). Read silently, because it
 /// runs before the logger exists; [`load`] reports any problem with the file.
+///
+/// The shared resolution every NF uses (#691 follow-up).
 pub fn default_log_level(cli: Option<String>, path: Option<&str>) -> String {
-    cli.or_else(|| {
-        let content = std::fs::read_to_string(path?).ok()?;
-        serde_yaml::from_str::<SgwuYaml>(&content)
-            .ok()?
-            .logger?
-            .level
-    })
-    .unwrap_or_else(|| "info".to_string())
+    nextgcore_core::log::nf_log_level(cli.as_deref(), path)
 }
 
 /// Parse `path`. A missing or unparsable file yields the default and a warning
