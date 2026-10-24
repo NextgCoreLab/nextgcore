@@ -5564,11 +5564,15 @@ mod tests {
         // Setup, and (#512) the one answering a CM-IDLE Service Request, which
         // derives a fresh KgNB from that message's uplink NAS COUNT and so restarts
         // the {NH, NCC} chain at NCC 0 (TS 33.501 §6.9.2.1, Annex A.9/A.10).
+        // #759 adds the third: a mobility/periodic registration update from CM-IDLE
+        // that re-activates sessions sets up AS security in its own Initial Context
+        // Setup, from that REGISTRATION REQUEST's uplink NAS COUNT.
         assert_eq!(
             src.matches("init_next_hop_chain()").count(),
-            2,
+            3,
             "the forward-security chain must be seeded exactly at AS-security-context \
-             establishment: registration ICS and the CM-IDLE Service Request ICS"
+             establishment: registration ICS, the CM-IDLE Service Request ICS and the \
+             CM-IDLE registration-update ICS (#759)"
         );
         // Negative, and the reason the positives above are not enough on their
         // own: the defective form conveyed the stored pair unchanged.

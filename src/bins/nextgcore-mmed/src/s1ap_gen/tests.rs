@@ -428,8 +428,13 @@ fn u32_to_bits_encodes_a_fitting_value_and_refuses_a_wider_one() {
     let bits = super::u32_to_bits(0x8_1234, 20);
     assert_eq!(bits.len(), 20);
     assert!(bits[0] && !bits[1], "most significant bit first");
-    let wide = std::panic::catch_unwind(|| super::u32_to_bits(0x10_0000, 20));
-    assert!(wide.is_err(), "a 21-bit value is not a 20-bit eNB ID");
+    // #1057 review m1: the refusal is a debug assertion, compiled out of a
+    // release build, so it is only checked where it exists.
+    #[cfg(debug_assertions)]
+    {
+        let wide = std::panic::catch_unwind(|| super::u32_to_bits(0x10_0000, 20));
+        assert!(wide.is_err(), "a 21-bit value is not a 20-bit eNB ID");
+    }
     assert_eq!(
         super::u32_to_bits(u32::MAX, 32).len(),
         32,
