@@ -671,7 +671,7 @@ async fn a_setup_whose_send_fails_hands_the_accept_to_the_next_setup() {
 /// A stand-in SMF for Path Switch: records `(ref, n2SmInfoType)` of every update and
 /// answers `PATH_SWITCH_REQ` with 200 and `n2SmInfo` = `transfer_for(ref)` (the
 /// acknowledge transfer the AMF relays), except a `fail-*` ref, which gets 500.
-async fn path_switch_smf() -> (
+pub(super) async fn path_switch_smf() -> (
     nextgcore_sbi::server::SbiServer,
     u16,
     Arc<std::sync::Mutex<Vec<(String, String)>>>,
@@ -2812,6 +2812,414 @@ async fn an_ng_reset_drops_the_contextless_allocations_it_resets() {
         "only the other association's is left"
     );
     take_sent_ngap(&mut server);
+}
+
+// ---- #739: the UE-association gate (TS 38.413 §10.6) ----
+
+/// An ERROR INDICATION's `(amf id, ran id, radio-network cause)`, decoded with the
+/// generated codec; `None` for any other PDU.
+fn decoded_error_indication(pdu: &[u8]) -> Option<(Option<u64>, Option<u32>, Option<u8>)> {
+    let g::NGAP_PDU::InitiatingMessage(m) = nextgcore_ngap_gen::decode(pdu).ok()? else {
+        return None;
+    };
+    let g::InitiatingMessageValue::Id_ErrorIndication(e) = m.value else {
+        return None;
+    };
+    let (mut amf, mut ran, mut cause) = (None, None, None);
+    for ie in e.protocol_i_es.0 {
+        use g::ErrorIndicationProtocolIEs_EntryValue as Ie;
+        match ie.value {
+            Ie::Id_AMF_UE_NGAP_ID(id) => amf = Some(id.0),
+            Ie::Id_RAN_UE_NGAP_ID(id) => ran = Some(id.0),
+            Ie::Id_Cause(g::Cause::RadioNetwork(c)) => cause = Some(c.0),
+            _ => {}
+        }
+    }
+    Some((amf, ran, cause))
+}
+
+/// Every gNB->AMF UE-associated message of the #739 table and of the #787 / #805
+/// follow-ups, naming `(amf, ran)`.
+fn ue_associated_uplinks(amf: u64, ran: u32) -> Vec<(&'static str, Vec<u8>)> {
+    use nextgcore_ngap::builder as b;
+    use nextgcore_ngap::types as t;
+    let uli = super::test_user_location(1, 0x10);
+    let radio_cap = nextgcore_ngap_gen::encode(&g::NGAP_PDU::InitiatingMessage(
+        g::InitiatingMessage {
+            procedure_code: g::ProcedureCode(g::ID_UE_RADIO_CAPABILITY_INFO_INDICATION),
+            criticality: g::Criticality(g::Criticality::IGNORE),
+            value: g::InitiatingMessageValue::Id_UERadioCapabilityInfoIndication(
+                g::UERadioCapabilityInfoIndication {
+                    protocol_i_es: g::UERadioCapabilityInfoIndicationProtocolIEs(vec![
+                        g::UERadioCapabilityInfoIndicationProtocolIEs_Entry {
+                            id: g::ProtocolIE_ID(g::ID_AMF_UE_NGAP_ID),
+                            criticality: g::Criticality(g::Criticality::REJECT),
+                            value: g::UERadioCapabilityInfoIndicationProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(
+                                g::AMF_UE_NGAP_ID(amf),
+                            ),
+                        },
+                        g::UERadioCapabilityInfoIndicationProtocolIEs_Entry {
+                            id: g::ProtocolIE_ID(g::ID_RAN_UE_NGAP_ID),
+                            criticality: g::Criticality(g::Criticality::REJECT),
+                            value: g::UERadioCapabilityInfoIndicationProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(
+                                g::RAN_UE_NGAP_ID(ran),
+                            ),
+                        },
+                        g::UERadioCapabilityInfoIndicationProtocolIEs_Entry {
+                            id: g::ProtocolIE_ID(g::ID_UE_RADIO_CAPABILITY),
+                            criticality: g::Criticality(g::Criticality::IGNORE),
+                            value: g::UERadioCapabilityInfoIndicationProtocolIEs_EntryValue::Id_UERadioCapability(
+                                g::UERadioCapability(vec![0x07, 0x39]),
+                            ),
+                        },
+                    ]),
+                },
+            ),
+        },
+    ))
+    .expect("encode UERadioCapabilityInfoIndication");
+    let nrppa = {
+        use nextgcore_asn1c::ngap::ies::{AmfUeNgapId, NrppaPdu, RanUeNgapId, RoutingId};
+        use nextgcore_asn1c::ngap::pdu::build_uplink_ue_associated_nrppa_transport;
+        super::encode_ngap_pdu(
+            &build_uplink_ue_associated_nrppa_transport(
+                AmfUeNgapId(amf),
+                RanUeNgapId(ran),
+                RoutingId::new(b"lmf-739".to_vec()),
+                NrppaPdu::new(vec![0x20, 0x0B, 0x00]),
+            )
+            .expect("build NRPPa"),
+        )
+    };
+    vec![
+        (
+            "InitialContextSetupResponse",
+            b::build_initial_context_setup_response(&t::InitialContextSetupResponse {
+                amf_ue_ngap_id: amf,
+                ran_ue_ngap_id: ran,
+            })
+            .unwrap(),
+        ),
+        ("UplinkUEAssociatedNRPPaTransport", nrppa),
+        (
+            "PDUSessionResourceNotify",
+            b::build_pdu_session_resource_notify(&t::PduSessionResourceNotify {
+                amf_ue_ngap_id: amf,
+                ran_ue_ngap_id: ran,
+                notify_list: vec![t::PduSessionResourceNotifyItem {
+                    pdu_session_id: 5,
+                    transfer: vec![0x00],
+                }],
+                released_list: Vec::new(),
+            })
+            .unwrap(),
+        ),
+        ("UERadioCapabilityInfoIndication", radio_cap),
+        (
+            "UplinkNASTransport",
+            b::build_uplink_nas_transport(&t::UplinkNasTransport {
+                amf_ue_ngap_id: amf,
+                ran_ue_ngap_id: ran,
+                nas_pdu: vec![0x7E, 0x00, 0x67],
+                user_location_info: uli,
+            })
+            .unwrap(),
+        ),
+        (
+            "UplinkRANStatusTransfer",
+            super::uplink_status_pdu(amf, ran),
+        ),
+        (
+            "UEContextReleaseRequest",
+            b::build_ue_context_release_request(&t::UeContextReleaseRequest {
+                amf_ue_ngap_id: amf,
+                ran_ue_ngap_id: ran,
+                cause: t::Cause::RadioNetwork(t::CauseRadioNetwork::RadioConnectionWithUeLost),
+            })
+            .unwrap(),
+        ),
+        (
+            "HandoverCancel",
+            b::build_handover_cancel(&t::HandoverCancel {
+                amf_ue_ngap_id: amf,
+                ran_ue_ngap_id: ran,
+                cause: t::Cause::RadioNetwork(t::CauseRadioNetwork::HandoverCancelled),
+            })
+            .unwrap(),
+        ),
+    ]
+}
+
+/// **#739.** A UE-associated message that names a UE the sending association does not
+/// serve is dropped and answered with an Error Indication (TS 38.413 §10.6), before any
+/// handler acts on it:
+/// - from ANOTHER gNB: unknown-local-UE-NGAP-ID (AP IDs are local to their interface);
+/// - from the serving gNB with another RAN UE NGAP ID: inconsistent-remote-UE-NGAP-ID;
+/// - for a CM-IDLE UE (no logical connection): unknown-local-UE-NGAP-ID.
+///
+/// For every message of the issue's table (ICS Response, UL UE-associated NRPPa, PDU
+/// Session Resource Notify, UE Radio Capability Info Indication) and of the #787
+/// (UL RAN Status Transfer) and #805 (UE Context Release Request) follow-ups, plus
+/// Uplink NAS Transport and Handover Cancel. The UE is left exactly as it was.
+///
+/// REVERT-VERIFIED: with the gate disabled the handlers run, and the intruder's messages
+/// get no Error Indication (or a different answer).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ue_associated_messages_for_a_ue_the_sender_does_not_serve_are_refused() {
+    crate::context::amf_context_init(64, 1024, 4096);
+    let mut server = capturing_ngap_server().await;
+    let (serving, intruder) = (97_391u64, 97_392u64);
+    seed_gnb_session(&server, serving).await;
+    seed_gnb_session(&server, intruder).await;
+    let (ue, ran) = (7_739_001u64, 7u32);
+    let mut state = UeNasContext::new(ue, ran, serving, false);
+    state.registered = true;
+    server.ue_auth_state.insert(ue, state);
+    let (idle, idle_ran) = (7_739_002u64, 8u32);
+    let mut state = UeNasContext::new(idle, idle_ran, serving, false);
+    state.registered = true;
+    state.cm_idle = true;
+    server.ue_auth_state.insert(idle, state);
+    let unknown = ngap_gen::CauseRadioNetwork::UNKNOWN_LOCAL_UE_NGAP_ID;
+    let inconsistent = ngap_gen::CauseRadioNetwork::INCONSISTENT_REMOTE_UE_NGAP_ID;
+    let refused_before =
+        crate::metrics::global().get(crate::metrics::GlobalMetric::UeAssociatedRefused);
+    let mut refused = 0u64;
+
+    let cases = [
+        (intruder, ue, ran, unknown, "another gNB"),
+        (
+            serving,
+            ue,
+            ran + 100,
+            inconsistent,
+            "another RAN UE NGAP ID",
+        ),
+        (serving, idle, idle_ran, unknown, "a CM-IDLE UE"),
+    ];
+    for (from, amf, r, cause, what) in cases {
+        for (name, pdu) in ue_associated_uplinks(amf, r) {
+            server
+                .process_ngap_message(from, &pdu)
+                .await
+                .expect("handled");
+            let sent = take_sent_ngap(&mut server);
+            assert_eq!(sent.len(), 1, "{name} from {what}: {sent:?}");
+            assert_eq!(sent[0].0, from, "{name}: answered to the sender");
+            assert_eq!(
+                decoded_error_indication(&sent[0].1),
+                Some((Some(amf), Some(r), Some(cause))),
+                "{name} from {what}: Error Indication naming the received ids"
+            );
+            refused += 1;
+        }
+    }
+    // #1009 review: each refusal is counted in the exported metric (process-wide, so at
+    // least this test's own).
+    assert!(
+        crate::metrics::global().get(crate::metrics::GlobalMetric::UeAssociatedRefused)
+            >= refused_before + refused,
+        "amf_ngap_ue_associated_refused counts the {refused} refusals"
+    );
+    // #1009 review, M1: a HANDOVER NOTIFY is exempt from the gate (the target allocates
+    // its own RAN UE NGAP ID) and its handler checks it against the recorded target
+    // (#803): with no handover in progress, a gNB naming a connected UE is refused with
+    // an Error Indication and takes nothing over -- no relocation, no release of the
+    // serving gNB.
+    for (from, r) in [(intruder, 99u32), (intruder, ran), (serving, ran + 1)] {
+        server
+            .process_ngap_message(from, &super::handover_notify_pdu(ue, r))
+            .await
+            .expect("handled");
+        let sent = take_sent_ngap(&mut server);
+        assert_eq!(sent.len(), 1, "stray Notify from {from}: {sent:?}");
+        assert_eq!(sent[0].0, from, "only the sender hears of it");
+        assert_eq!(
+            decoded_error_indication(&sent[0].1),
+            Some((Some(ue), Some(r), Some(unknown))),
+            "stray Notify from {from}"
+        );
+    }
+    for (id, ran, idle_now) in [(ue, ran, false), (idle, idle_ran, true)] {
+        let state = server.ue_auth_state.get(id).expect("untouched");
+        assert_eq!(
+            (
+                state.association_id,
+                state.ran_ue_ngap_id,
+                state.is_cm_idle()
+            ),
+            (serving, ran, idle_now),
+            "UE {id} left as it was"
+        );
+        assert!(state.reachability.is_none());
+    }
+    assert_eq!(
+        server.check_ue_association(
+            serving,
+            Some(42),
+            &ue_associated_uplinks(ue, ran)
+                .into_iter()
+                .find(|(n, _)| *n == "UEContextReleaseRequest")
+                .unwrap()
+                .1
+        ),
+        UeAssociation::Serving,
+        "positive control: the serving pair passes"
+    );
+    server.ue_auth_state.remove(ue);
+    server.ue_auth_state.remove(idle);
+}
+
+/// **#1009 review, M2.** A PATH SWITCH REQUEST is exempt from the gate (it comes from the
+/// new gNB), so its handler refuses a UE that is not CM-CONNECTED -- an Xn handover
+/// presupposes one -- with PATH SWITCH REQUEST FAILURE, unknown-local-UE-NGAP-ID, before
+/// any SMF call; and only an Acknowledge moves the UE and advances its NH chain. Here a
+/// CM-IDLE UE is named by a stray gNB; it used to have its serving pair moved to that gNB
+/// and its NH advanced even though the request failed.
+///
+/// REVERT-VERIFIED: without the CM-CONNECTED check the SMF is asked to switch the
+/// session; without commit-on-Acknowledge the failed request still moves the UE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_path_switch_for_a_ue_that_is_not_connected_changes_nothing() {
+    crate::context::amf_context_init(64, 1024, 4096);
+    let (_smf, port, calls) = path_switch_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (serving, stray) = (97_393u64, 97_394u64);
+    seed_gnb_session(&server, serving).await;
+    seed_gnb_session(&server, stray).await;
+    let ue = 7_739_201u64;
+    let mut state = UeNasContext::new(ue, 21, serving, false);
+    state.registered = true;
+    state.cm_idle = true;
+    server.ue_auth_state.insert(ue, state);
+    hold_session(&mut server, ue, 5, "ps1009-idle-5", port);
+    let before = server.ue_auth_state.get(ue).expect("UE").amf_ue.clone();
+
+    server
+        .process_ngap_message(stray, &super::path_switch_request_pdu(ue, 77, &[5]))
+        .await
+        .expect("handled");
+
+    let sent = take_sent_ngap(&mut server);
+    forget_amf_sessions(ue);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].0, stray);
+    let (amf, ran, released) =
+        super::decoded_path_switch_failure(&sent[0].1).expect("a PATH SWITCH REQUEST FAILURE");
+    assert_eq!((amf, ran), (ue, 77));
+    assert_eq!(
+        released.iter().map(|(psi, _)| *psi).collect::<Vec<_>>(),
+        vec![5]
+    );
+    assert!(
+        calls.lock().expect("calls").is_empty(),
+        "no SMF is asked to switch a CM-IDLE UE's session"
+    );
+    let after = server.ue_auth_state.get(ue).expect("UE");
+    assert_eq!(
+        (
+            after.association_id,
+            after.ran_ue_ngap_id,
+            after.is_cm_idle()
+        ),
+        (serving, 21, true),
+        "the UE keeps its stored pair"
+    );
+    assert_eq!(
+        (after.amf_ue.nhcc, after.amf_ue.nh),
+        (before.nhcc, before.nh),
+        "and its NH chain"
+    );
+    server.ue_auth_state.remove(ue);
+}
+
+/// An INITIAL CONTEXT SETUP RESPONSE for `(amf, ran)` reporting `sessions` as set up,
+/// each with the one-octet transfer `[psi]`.
+fn ics_response_with_sessions(amf: u64, ran: u32, sessions: &[u8]) -> Vec<u8> {
+    use g::InitialContextSetupResponseProtocolIEs_EntryValue as Ie;
+    let entry = |id: u16, value| g::InitialContextSetupResponseProtocolIEs_Entry {
+        id: g::ProtocolIE_ID(id),
+        criticality: g::Criticality(g::Criticality::IGNORE),
+        value,
+    };
+    let list = g::PDUSessionResourceSetupListCxtRes(
+        sessions
+            .iter()
+            .map(|&psi| g::PDUSessionResourceSetupItemCxtRes {
+                pdu_session_id: g::PDUSessionID(psi),
+                pdu_session_resource_setup_response_transfer:
+                    g::PDUSessionResourceSetupItemCxtResPDUSessionResourceSetupResponseTransfer(
+                        vec![psi],
+                    ),
+                ie_extensions: None,
+            })
+            .collect(),
+    );
+    nextgcore_ngap_gen::encode(&g::NGAP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
+        procedure_code: g::ProcedureCode(g::ID_INITIAL_CONTEXT_SETUP),
+        criticality: g::Criticality(g::Criticality::REJECT),
+        value: g::SuccessfulOutcomeValue::Id_InitialContextSetup(g::InitialContextSetupResponse {
+            protocol_i_es: g::InitialContextSetupResponseProtocolIEs(vec![
+                entry(
+                    g::ID_AMF_UE_NGAP_ID,
+                    Ie::Id_AMF_UE_NGAP_ID(g::AMF_UE_NGAP_ID(amf)),
+                ),
+                entry(
+                    g::ID_RAN_UE_NGAP_ID,
+                    Ie::Id_RAN_UE_NGAP_ID(g::RAN_UE_NGAP_ID(ran)),
+                ),
+                entry(
+                    g::ID_PDU_SESSION_RESOURCE_SETUP_LIST_CXT_RES,
+                    Ie::Id_PDUSessionResourceSetupListCxtRes(list),
+                ),
+            ]),
+        }),
+    }))
+    .expect("encode InitialContextSetupResponse")
+}
+
+/// **#739 (the #550 row).** An INITIAL CONTEXT SETUP RESPONSE relays to the SMF only the
+/// sessions its Request asked the gNB to set up. The serving gNB reports PSI 1, which
+/// the Service Request's ICS carried, and PSI 2, which it did not: only PSI 1's Setup
+/// Response Transfer reaches the SMF, so a gNB cannot re-point another session's
+/// downlink at itself.
+///
+/// REVERT-VERIFIED: relaying every reported session sends PSI 2's transfer too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ics_response_relays_only_the_sessions_the_request_set_up() {
+    let (_smf, port, calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_739_101u64, 91);
+    secured_registered_ue(&mut server, ue, ran);
+    hold_session(&mut server, ue, 1, "ics739-asked-1", port);
+    hold_session(&mut server, ue, 2, "ics739-not-asked-2", port);
+    server
+        .ue_auth_state
+        .with_mut(ue, |s| s.ics_requested_psis = vec![1]);
+
+    server
+        .process_ngap_message(ASSOC, &ics_response_with_sessions(ue, ran, &[1, 2]))
+        .await
+        .expect("handled");
+
+    let calls = calls.lock().expect("calls").clone();
+    let refs: Vec<&str> = calls
+        .iter()
+        .filter(|(_, body)| body["n2SmInfoType"] == "PDU_RES_SETUP_RSP")
+        .map(|(uri, _)| uri.as_str())
+        .collect();
+    assert_eq!(refs.len(), 1, "{calls:?}");
+    assert!(refs[0].contains("/sm-contexts/ics739-asked-1/"), "{refs:?}");
+    assert!(
+        server
+            .ue_auth_state
+            .get(ue)
+            .expect("UE")
+            .ics_requested_psis
+            .is_empty(),
+        "the Request is answered"
+    );
+    server.ue_auth_state.remove(ue);
 }
 
 // ---------------------------------------------------------------------------
