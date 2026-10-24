@@ -231,64 +231,77 @@ pub fn begin_unrecoverable_release(
     // the UEs after the SIGKILL heard nothing. Progress is logged, so an operator
     // can see how many were left if it is cut short anyway.
     let fan_out = tokio::spawn(async move {
-        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(RELEASE_FANOUT));
-        let mut releases = tokio::task::JoinSet::new();
-        let until = |d: Option<tokio::time::Instant>| {
-            d.unwrap_or_else(|| {
-                tokio::time::Instant::now() + std::time::Duration::from_secs(86_400)
-            })
-        };
-        let mut done = 0usize;
-        let mut out_of_time = false;
-        for (sm_context_ref, uri) in notifiable {
-            let permit =
-                match tokio::time::timeout_at(until(deadline), permits.clone().acquire_owned())
-                    .await
-                {
-                    Ok(Ok(permit)) => permit,
-                    Ok(Err(_)) => break,
-                    Err(_) => {
-                        out_of_time = true;
-                        break;
-                    }
-                };
-            let reason = reason.clone();
-            releases.spawn(async move {
-                let _permit = permit;
-                release_one_unrecoverable(&sm_context_ref, &uri, &reason).await;
-            });
-        }
-        loop {
-            if out_of_time {
-                break;
-            }
-            match tokio::time::timeout_at(until(deadline), releases.join_next()).await {
-                Ok(Some(_)) => {}
-                Ok(None) => break,
+        unrecoverable_fan_out(notifiable, reason, deadline).await;
+    });
+    (total, fan_out)
+}
+
+/// The fan-out of [`begin_unrecoverable_release`]: returns how many releases
+/// finished, those the deadline left behind not counted (#941 review MINOR 1).
+pub(crate) async fn unrecoverable_fan_out(
+    notifiable: Vec<(String, String)>,
+    reason: String,
+    deadline: Option<tokio::time::Instant>,
+) -> usize {
+    let total = notifiable.len();
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(RELEASE_FANOUT));
+    let mut releases = tokio::task::JoinSet::new();
+    let until = |d: Option<tokio::time::Instant>| {
+        d.unwrap_or_else(|| tokio::time::Instant::now() + std::time::Duration::from_secs(86_400))
+    };
+    let mut done = 0usize;
+    let mut out_of_time = false;
+    for (sm_context_ref, uri) in notifiable {
+        let permit =
+            match tokio::time::timeout_at(until(deadline), permits.clone().acquire_owned()).await {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_)) => break,
                 Err(_) => {
                     out_of_time = true;
                     break;
                 }
-            }
-            done += 1;
-            if done.is_multiple_of(100) || done == total {
-                log::info!(
-                    "PFCP restoration ({reason}): {done}/{total} PDU session release(s) sent, \
-                     {} remaining",
-                    total - done
-                );
+            };
+        let reason = reason.clone();
+        releases.spawn(async move {
+            let _permit = permit;
+            release_one_unrecoverable(&sm_context_ref, &uri, &reason).await;
+        });
+    }
+    loop {
+        if out_of_time {
+            break;
+        }
+        match tokio::time::timeout_at(until(deadline), releases.join_next()).await {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => {
+                out_of_time = true;
+                break;
             }
         }
-        if out_of_time {
-            releases.abort_all();
-            log::warn!(
-                "PFCP restoration ({reason}): out of time with {done}/{total} PDU session \
-                 release(s) sent; {} UE(s) abandoned without #39",
+        done += 1;
+        if done.is_multiple_of(100) || done == total {
+            log::info!(
+                "PFCP restoration ({reason}): {done}/{total} PDU session release(s) sent, \
+                 {} remaining",
                 total - done
             );
         }
-    });
-    (total, fan_out)
+    }
+    if out_of_time {
+        // #941 review MINOR 1: count what finished, also when the deadline fired
+        // in the permit wait and the join loop never ran.
+        while releases.try_join_next().is_some() {
+            done += 1;
+        }
+        releases.abort_all();
+        log::warn!(
+            "PFCP restoration ({reason}): out of time with {done}/{total} PDU session \
+             release(s) sent; {} UE(s) abandoned without #39",
+            total - done
+        );
+    }
+    done
 }
 
 /// How many PDU session releases [`notify_sessions_unrecoverable`] has in flight at
@@ -359,7 +372,7 @@ pub async fn release_epc_pdn_connections_in(reason: &str, scope: Option<&Session
     let Some(server) = crate::gtp_path::s5s8_server() else {
         return 0;
     };
-    release_epc_pdn_connections_scoped(server, crate::gtp_path::GTPC_PORT, reason, scope).await
+    release_epc_pdn_connections_scoped(server, crate::gtp_path::sgw_port(), reason, scope).await
 }
 
 /// [`release_epc_pdn_connections`] through `server`, addressing each SGW-C at

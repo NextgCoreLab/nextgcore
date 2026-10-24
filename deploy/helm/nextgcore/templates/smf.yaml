@@ -36,6 +36,12 @@ spec:
       # #718: a graceful SMF shutdown releases each UPF association (up to
       # T1 x (N1+1) = 12 s when a UPF is gone), sends every UE #39 and keeps
       # retransmitting its S5/S8 Delete Bearer Requests for up to 12 s.
+      {{- /* #941 review MINOR 5: the budget is the grace period less 2 s, and the
+             binary clamps a budget under 30 s up to 30 s, past a shorter grace
+             period: the SIGKILL would land before the Association Release. */}}
+      {{- if lt (int .Values.smf.terminationGracePeriodSeconds) 32 }}
+      {{- fail (printf "smf.terminationGracePeriodSeconds must be at least 32 (the shutdown budget is it less 2 s, and at least 30 s); got %v" .Values.smf.terminationGracePeriodSeconds) }}
+      {{- end }}
       terminationGracePeriodSeconds: {{ .Values.smf.terminationGracePeriodSeconds }}
       initContainers:
         {{- include "nextgcore.advertiseInit" (dict "nf" "smf") | nindent 8 }}
