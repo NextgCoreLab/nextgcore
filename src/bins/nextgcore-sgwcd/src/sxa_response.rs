@@ -118,6 +118,9 @@ fn indirect_forwarding_response(continuation: S11Continuation, pfcp_cause: Optio
 pub fn fail_with_cause(continuation: S11Continuation, cause: u8) {
     match continuation {
         S11Continuation::None => {}
+        S11Continuation::Restoration { sess_id } => {
+            crate::pfcp_path::restoration_failed(sess_id, &format!("cause {cause}"))
+        }
         S11Continuation::CreateSession { peer, seq, teid } => {
             answer(
                 peer,
@@ -163,6 +166,9 @@ pub fn fail_with_cause(continuation: S11Continuation, cause: u8) {
 pub fn fail(continuation: S11Continuation, reason: &str) {
     match continuation {
         S11Continuation::None => {}
+        S11Continuation::Restoration { sess_id } => {
+            crate::pfcp_path::restoration_failed(sess_id, &format!("no answer ({reason})"))
+        }
         S11Continuation::CreateSession { peer, seq, teid } => {
             log::error!(
                 "Create Session Response to {peer} carries a failure: the SGW-U never answered \
@@ -255,10 +261,11 @@ pub struct SwitchedBearer {
     pub ebi: u8,
     /// The DL tunnel's (remote TEID, remote IP) before the request.
     pub previous: Option<(u32, crate::context::IpAddr)>,
-    /// What this request wrote into the DL tunnel: the rollback restores
-    /// `previous` only while the tunnel still holds this (#937 review), so a
-    /// later request that changed the endpoint meanwhile is not undone.
-    pub written: (u32, crate::context::IpAddr),
+    /// The DL tunnel's generation after this request wrote it: the rollback
+    /// restores `previous` only while the tunnel is still at it (#937, #987
+    /// review), so a later writer is never undone, even one that wrote the
+    /// same values.
+    pub written: u64,
 }
 
 static PENDING_MODIFY_BEARER: std::sync::Mutex<
@@ -334,9 +341,7 @@ pub fn modify_bearer_session_done(join: u64, sess_id: u64, failure: Option<u8>) 
                     if let (Some((teid, ip)), Some(mut dl)) =
                         (b.previous, ctx.dl_tunnel_in_bearer(b.bearer_id))
                     {
-                        let still_ours = dl.remote_teid == b.written.0
-                            && dl.remote_ip.ipv4 == b.written.1.ipv4
-                            && dl.remote_ip.ipv6 == b.written.1.ipv6;
+                        let still_ours = dl.generation == b.written;
                         if still_ours {
                             dl.remote_teid = teid;
                             dl.remote_ip = ip;
@@ -398,19 +403,28 @@ pub fn answer_modify_bearer(pending: &PendingModifyBearer, last_failure: Option<
         pending.modified.len(),
         pending.marked_for_removal
     );
-    let Some(server) = gtp_path::s11_server() else {
-        log::error!("S11 server not open: cannot answer {}", pending.peer);
-        return;
-    };
-    let response = s11_build::build_modify_bearer_response_per_bearer(
-        pending.mme_teid,
-        pending.seq,
-        cause,
-        &pending.modified,
-        &pending.marked_for_removal,
-    );
-    if let Err(e) = server.send_response(pending.peer, &response) {
-        log::error!("Modify Bearer Response to {} failed: {e}", pending.peer);
+    // #1014 review: whether an endpoint is on a failed path is decided before the
+    // response goes; the release follows it.
+    let modified: Vec<u64> = pending.modified.iter().map(|(b, _)| *b).collect();
+    let release = crate::up_path::toward_failed(&modified);
+    match gtp_path::s11_server() {
+        Some(server) => {
+            let response = s11_build::build_modify_bearer_response_per_bearer(
+                pending.mme_teid,
+                pending.seq,
+                cause,
+                &pending.modified,
+                &pending.marked_for_removal,
+            );
+            if let Err(e) = server.send_response(pending.peer, &response) {
+                log::error!("Modify Bearer Response to {} failed: {e}", pending.peer);
+            }
+        }
+        None => log::error!("S11 server not open: cannot answer {}", pending.peer),
+    }
+    // An endpoint on a failed path is released now, not at the hold's expiry.
+    if let Some((ue_id, peer)) = release {
+        crate::up_path::release_toward_failed(ue_id, peer);
     }
 }
 
@@ -434,6 +448,19 @@ fn establishment_response(sess_id: u64, continuation: S11Continuation, body: &[u
 
     let result =
         sxa_handler::handle_session_establishment_response(sess.as_ref(), 0, pfcp_cause, up_f_seid);
+
+    // #1010 review: a restoration on a restarted SGW-U that it refused.
+    if let S11Continuation::Restoration { sess_id } = continuation {
+        if matches!(result, HandlerResult::Error(_))
+            || pfcp_cause != sxa_handler::pfcp_cause::REQUEST_ACCEPTED
+        {
+            crate::pfcp_path::restoration_failed(
+                sess_id,
+                &format!("the SGW-U refused it (PFCP cause {pfcp_cause})"),
+            );
+        }
+        return;
+    }
 
     let S11Continuation::CreateSession { peer, seq, teid } = continuation else {
         return;
@@ -788,7 +815,7 @@ mod modify_bearer_tests {
             bearer_id: bearer.id,
             ebi: 7,
             previous: None,
-            written: (0, Default::default()),
+            written: 0,
         };
         let join = park_modify_bearer(PendingModifyBearer {
             peer: "127.0.0.1:2123".parse().unwrap(),
@@ -825,8 +852,13 @@ mod modify_bearer_tests {
         let mut bearer = ctx.bearer_add(sess.id).expect("bearer");
         bearer.ebi = 5;
         ctx.bearer_update(&bearer);
-        let mut dl = ctx.dl_tunnel_in_bearer(bearer.id).expect("a DL tunnel");
-        let park = |written_teid: u32| {
+        let write = |teid: u32| {
+            let mut dl = ctx.dl_tunnel_in_bearer(bearer.id).expect("a DL tunnel");
+            dl.remote_teid = teid;
+            ctx.tunnel_update(&dl);
+            ctx.dl_tunnel_in_bearer(bearer.id).unwrap().generation
+        };
+        let park = |written: u64| {
             park_modify_bearer(PendingModifyBearer {
                 peer: "127.0.0.1:2123".parse().unwrap(),
                 seq: 0x937,
@@ -837,7 +869,7 @@ mod modify_bearer_tests {
                         bearer_id: bearer.id,
                         ebi: 5,
                         previous: Some((0x1111, Default::default())),
-                        written: (written_teid, Default::default()),
+                        written,
                     }],
                 )]
                 .into_iter()
@@ -847,23 +879,24 @@ mod modify_bearer_tests {
             })
         };
         // Still ours: rolled back.
-        dl.remote_teid = 0x2222;
-        ctx.tunnel_update(&dl);
-        let join = park(0x2222);
+        let g = write(0x2222);
+        let join = park(g);
         modify_bearer_session_done(join, sess.id, Some(gtp_cause::SYSTEM_FAILURE));
         assert_eq!(
             ctx.dl_tunnel_in_bearer(bearer.id).unwrap().remote_teid,
             0x1111
         );
-        // Changed since: left alone.
-        dl.remote_teid = 0x3333;
-        ctx.tunnel_update(&dl);
-        let join = park(0x2222);
+        // A later writer, even one that puts the same TEID back (A-B-A): left
+        // alone, because the generation moved (#987 review).
+        let g = write(0x2222);
+        let _ = write(0x3333);
+        let _ = write(0x2222);
+        let join = park(g);
         modify_bearer_session_done(join, sess.id, Some(gtp_cause::SYSTEM_FAILURE));
         assert_eq!(
             ctx.dl_tunnel_in_bearer(bearer.id).unwrap().remote_teid,
-            0x3333,
-            "the newer endpoint stays"
+            0x2222,
+            "the newer writer's endpoint stays"
         );
         ctx.ue_remove(ue.id);
     }

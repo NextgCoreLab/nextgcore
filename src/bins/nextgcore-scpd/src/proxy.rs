@@ -2109,10 +2109,12 @@ impl ScpProxy {
                 if let Some(uri) = forward_uri {
                     request.header.uri = uri;
                 }
+                // The request URI of a relayed callback can carry the notified
+                // NF's bearer token (#940, #789): logged redacted.
                 log::debug!(
                     "SCP callback: {} {} -> {} (no discovery, no token)",
                     request.header.method,
-                    request.header.uri,
+                    nextgcore_sbi::log_redact::redact_callback_tokens(&request.header.uri),
                     target.to_uri()
                 );
                 self.forward(&request, &target, RelayContext::default(), None)
@@ -2122,7 +2124,7 @@ impl ScpProxy {
                 log::debug!(
                     "SCP Model C: {} {} -> {}",
                     request.header.method,
-                    request.header.uri,
+                    nextgcore_sbi::log_redact::redact_callback_tokens(&request.header.uri),
                     target.to_uri()
                 );
                 // Model C: the consumer named the target, so nothing is
@@ -2142,7 +2144,7 @@ impl ScpProxy {
                 log::debug!(
                     "SCP binding stickiness: {} {} -> {}",
                     request.header.method,
-                    request.header.uri,
+                    nextgcore_sbi::log_redact::redact_callback_tokens(&request.header.uri),
                     target.to_uri()
                 );
                 self.forward(
@@ -2173,7 +2175,7 @@ impl ScpProxy {
                     log::debug!(
                         "SCP Model D: {} {} -> {} (producer {}, {} alternate(s))",
                         request.header.method,
-                        request.header.uri,
+                        nextgcore_sbi::log_redact::redact_callback_tokens(&request.header.uri),
                         outcome.primary.target.to_uri(),
                         outcome.primary.nf_instance_id,
                         outcome.alternates.len()

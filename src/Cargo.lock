@@ -3094,6 +3094,7 @@ name = "nextgcore-pfcp"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "log",
  "nextgcore-core",
  "proptest",
  "thiserror 1.0.69",

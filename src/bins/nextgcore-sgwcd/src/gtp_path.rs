@@ -198,6 +198,11 @@ impl GtpcServer {
                             if let Ok(mut relays) = inner.command_relays.lock() {
                                 relays.remove(&(xact.peer, xact.sequence_number));
                             }
+                            // #1025: a PGW that never answers a relayed Delete
+                            // Session does not keep the session alive here.
+                            if xact.message_type == Gtp2MessageType::DeleteSessionRequest as u8 {
+                                continue_delete_session_after_pgw(xact.sequence_number, None);
+                            }
                             // A failed path leaves the same stale contexts a
                             // restart does, so run the same cleanup rather than
                             // only recording the state (TS 23.007 Section 20).
@@ -918,6 +923,24 @@ fn handle_datagram(inner: &Arc<GtpcInner>, data: &[u8], peer: SocketAddr) {
         // The PGW's answer to our Create Session Request. This arm is what wires
         // `s5c_handler` into the receive path at last: it had no production caller, so
         // no PGW response could ever be acted on.
+        // #1025: the PGW's answer to a relayed Delete Session Request.
+        t if t == T::DeleteSessionResponse as u8 => {
+            // Only the answer that completes the transaction continues the
+            // deletion: a late duplicate must not answer the MME twice.
+            let completes = inner
+                .xact
+                .lock()
+                .map(|mut xact| xact.match_response(seq, msg_type).is_some())
+                .unwrap_or(false);
+            if completes {
+                dispatch_s5c_delete_session_response(&msg, peer);
+            } else {
+                log::debug!(
+                    "S5/S8 Delete Session Response seq={seq} from {peer} completes no \
+                     outstanding transaction (late duplicate?)"
+                );
+            }
+        }
         t if t == T::CreateSessionResponse as u8 => {
             // TS 29.274 §7.6: the response completes the request, so its T3/N3
             // retransmission stops. This arm never completed the transaction, so
@@ -1249,6 +1272,26 @@ fn dispatch_create_session_request(server: &GtpcServer, msg: &Gtp2Message, peer:
         }
     };
 
+    // #1010 review: with no Sxa association the user plane cannot be provisioned
+    // (TS 29.244 §6.2.6.1), so the request is refused here, before anything is
+    // created and before the PGW is asked to anchor a session nobody would delete.
+    if !pfcp_path::sgwu_associated() {
+        log::warn!(
+            "Create Session Request from {peer} refused: no PFCP association with the \
+             SGW-U {} (No resources available)",
+            pfcp_path::configured_sgwu_addr()
+        );
+        send_cause_response(
+            server,
+            peer,
+            Gtp2MessageType::CreateSessionResponse,
+            parsed.sender_fteid.teid,
+            seq,
+            gtp_cause::NO_RESOURCES_AVAILABLE,
+        );
+        return;
+    }
+
     let ctx = sgwc_self();
     let existing_ue = ctx.ue_find_by_imsi(&parsed.imsi);
     let result = s11_handler::handle_create_session_request(
@@ -1491,6 +1534,15 @@ fn take_pending_s5c(seq: u32) -> Option<(u64, pfcp_path::S11Continuation)> {
         .and_then(|mut map| map.as_mut().and_then(|m| m.remove(&seq)))
 }
 
+/// The EBI of the default bearer a Create Session Response's Bearer Context names
+/// (5 when it names none: the first EBI an MME assigns).
+fn created_lbi(msg: &Gtp2Message) -> u8 {
+    msg.get_ie(Gtp2IeType::BearerContext as u8, 0)
+        .and_then(|ie| Gtp2BearerContextIe::decode(&ie.value).ok())
+        .and_then(|bc| bc.ebi().ok())
+        .unwrap_or(5)
+}
+
 /// The PGW answered our S5/S8 Create Session Request (#52 criteria 5 and 7).
 ///
 /// This is where the SGW-C stops inventing an answer. The PAA, the PGW's control and
@@ -1562,12 +1614,30 @@ fn dispatch_s5c_create_session_response(msg: &Gtp2Message, peer: SocketAddr) {
     }
 
     let existing = ctx.sess_find_by_id(sess_id);
+    if existing.is_none() {
+        log::error!("S5/S8 Create Session Response for session {sess_id}, which is gone");
+        crate::sxa_response::fail(
+            continuation,
+            "the session was removed while the PGW answered",
+        );
+        // #1032 review: a Delete Session that raced this Create removed the local
+        // session before the PGW had a TEID to be told; if the PGW anchored it, it
+        // is deleted there now.
+        if cause == gtp_cause::REQUEST_ACCEPTED {
+            abandon_pgw_session(
+                pgw_c.as_ref().map(|ft| ft.teid).unwrap_or(0),
+                created_lbi(msg),
+                "its local session was deleted while the PGW answered the Create",
+            );
+        }
+        return;
+    }
     match crate::s5c_handler::handle_create_session_response(
         existing.as_ref(),
         0,
         &[],
         cause,
-        pgw_c.map(|ft| ft.teid).unwrap_or(0),
+        pgw_c.as_ref().map(|ft| ft.teid).unwrap_or(0),
         pgw_u.as_ref().map(|ft| ft.teid).unwrap_or(0),
         pgw_u
             .as_ref()
@@ -1592,6 +1662,12 @@ fn dispatch_s5c_create_session_response(msg: &Gtp2Message, peer: SocketAddr) {
             continuation,
             "the session was removed while the PGW answered",
         );
+        // Removed between the check above and here: the PGW anchored it.
+        abandon_pgw_session(
+            pgw_c.as_ref().map(|ft| ft.teid).unwrap_or(0),
+            created_lbi(msg),
+            "its local session was deleted while the PGW answered the Create",
+        );
         return;
     };
 
@@ -1599,7 +1675,26 @@ fn dispatch_s5c_create_session_response(msg: &Gtp2Message, peer: SocketAddr) {
     if let Err(e) =
         pfcp_path::send_session_establishment_request(&sess, seq as u64, None, 0, continuation)
     {
-        log::error!("PFCP Session Establishment failed after the PGW answered: {e}");
+        // #1010 review: the refusal hands the procedure back, so the MME is answered
+        // rather than left to its own timer. The association went down while the PGW
+        // answered: the cause is the one an up-front refusal gives.
+        log::error!(
+            "PFCP Session Establishment not sent after the PGW answered ({e}); the Create \
+             Session Request is refused"
+        );
+        crate::sxa_response::fail_with_cause(continuation, gtp_cause::NO_RESOURCES_AVAILABLE);
+        // #1010 review: the PGW anchored a session the MME was just refused, and the
+        // local one is abandoned with it.
+        let lbi = ctx
+            .default_bearer_in_sess(sess.id)
+            .map(|b| b.ebi)
+            .unwrap_or_else(|| created_lbi(msg));
+        abandon_pgw_session(
+            sess.pgw_s5c_teid,
+            lbi,
+            "no Sxa association to provision it when the PGW answered",
+        );
+        ctx.sess_remove(sess.id);
     }
 }
 
@@ -1706,12 +1801,16 @@ fn dispatch_modify_bearer_request(server: &GtpcServer, msg: &Gtp2Message, peer: 
             marked_for_removal.push((*ebi, gtp_cause::CONTEXT_NOT_FOUND));
             continue;
         };
-        let mut written = (enb_teid, crate::context::IpAddr::default());
         if let Some(mut dl_tunnel) = ctx.dl_tunnel_in_bearer(bearer.id) {
             dl_tunnel.remote_ip.ipv4 = enb_fteid.ipv4_addr.map(Ipv4Addr::from);
             ctx.tunnel_update(&dl_tunnel);
-            written = (dl_tunnel.remote_teid, dl_tunnel.remote_ip.clone());
         }
+        // The generation this request's writes left (TEID by the handler, IP
+        // above).
+        let written = ctx
+            .dl_tunnel_in_bearer(bearer.id)
+            .map(|t| t.generation)
+            .unwrap_or(0);
         per_session
             .entry(bearer.sess_id)
             .or_default()
@@ -1826,29 +1925,28 @@ fn dispatch_delete_session_request(server: &GtpcServer, msg: &Gtp2Message, peer:
             // user plane, with the SGW-C no longer holding anything to address it by.
             match sess {
                 Some(sess) => {
-                    if let Err(e) = pfcp_path::send_session_deletion_request(
-                        &sess,
-                        seq as u64,
-                        None,
-                        pfcp_path::S11Continuation::DeleteSession {
-                            peer,
-                            seq,
-                            teid: ue.mme_s11_teid,
-                            sess_id: sess.id,
-                        },
-                    ) {
-                        log::error!("PFCP session deletion failed: {e}");
-                        send_cause_response(
-                            server,
-                            peer,
-                            Gtp2MessageType::DeleteSessionResponse,
-                            ue.mme_s11_teid,
-                            seq,
-                            sxa_handler::gtp_cause_from_pfcp(
-                                sxa_handler::pfcp_cause::SYSTEM_FAILURE,
-                            ),
+                    // #1025, TS 23.401 §5.3.8.2.1 steps 4-7 / §5.10.3: a detach or
+                    // PDN disconnection (OI set, SI clear, TS 29.274 Table 7.2.9.1-1)
+                    // is relayed to the PGW first; the SGW-U's session goes when the
+                    // PGW has answered. A Serving GW relocation (SI) or a request
+                    // without OI deletes the local resources only.
+                    // The MME's retransmission while its request waits for the
+                    // PGW is answered by that request, not relayed again.
+                    if delete_relay_in_flight(peer, seq) {
+                        log::debug!(
+                            "Delete Session Request seq={seq} from {peer} is waiting for the \
+                             PGW; retransmission absorbed"
                         );
+                        return;
                     }
+                    let forward = matches!(result, HandlerResult::ForwardToPgw)
+                        && parsed.operation_indication;
+                    if forward
+                        && relay_delete_session_to_pgw(server, &sess, peer, seq, ue.mme_s11_teid)
+                    {
+                        return;
+                    }
+                    delete_session_user_plane(&sess, peer, seq, ue.mme_s11_teid);
                 }
                 None => {
                     // Nothing to tear down on the SGW-U: answer now, as before.
@@ -1877,6 +1975,289 @@ fn dispatch_delete_session_request(server: &GtpcServer, msg: &Gtp2Message, peer:
     }
 }
 
+/// Release the UE's S1-U bearers at the user plane (TS 23.401 §5.3.5 step 3): the
+/// eNodeB endpoints are forgotten and the downlink FARs go to BUFF + NOCP, so the
+/// next downlink packet is buffered and reported, and a Downlink Data Notification
+/// pages the UE. The EPS bearer contexts are kept. Used by Release Access Bearers and
+/// by an S1-U path failure (#994). Returns the PFCP modifications sent.
+pub(crate) fn release_s1u_bearers(ue: &crate::context::SgwcUe, xact: u64) -> usize {
+    let ctx = sgwc_self();
+    let mut sent = 0;
+    for sess_id in &ue.sess_ids {
+        let Some(sess) = ctx.sess_find_by_id(*sess_id) else {
+            continue;
+        };
+        for bearer_id in &sess.bearer_ids {
+            if let Some(mut dl_tunnel) = ctx.dl_tunnel_in_bearer(*bearer_id) {
+                dl_tunnel.remote_teid = 0;
+                dl_tunnel.remote_ip = crate::context::IpAddr::default();
+                ctx.tunnel_update(&dl_tunnel);
+            }
+        }
+        match pfcp_path::send_session_modification_request(
+            &sess,
+            xact,
+            None,
+            sxa_handler::pfcp_modify::DL_ONLY | sxa_handler::pfcp_modify::DEACTIVATE,
+        ) {
+            Ok(()) => sent += 1,
+            Err(e) => log::error!("PFCP deactivation failed: {e}"),
+        }
+    }
+    sent
+}
+
+/// A Delete Session Request sent to the PGW, waiting for its answer (#1025), by the
+/// S5/S8 sequence number: the session, and the MME request to answer when it is a
+/// relay. `mme` is `None` for a session the SGW-C abandons itself after the PGW
+/// anchored it (#1032 / #1010 review): nobody waits, the PGW's session just goes.
+#[derive(Debug, Clone, Copy)]
+struct PendingS5cDelete {
+    sess_id: u64,
+    mme: Option<MmeDeleteRequest>,
+}
+
+/// The MME's Delete Session Request a relay answers.
+#[derive(Debug, Clone, Copy)]
+struct MmeDeleteRequest {
+    peer: SocketAddr,
+    seq: u32,
+    teid: u32,
+}
+
+static PENDING_S5C_DELETE: Mutex<Option<HashMap<u32, PendingS5cDelete>>> = Mutex::new(None);
+
+/// Whether the MME's Delete Session Request `mme_seq` from `mme` is relayed and
+/// waiting for the PGW.
+fn delete_relay_in_flight(mme: SocketAddr, mme_seq: u32) -> bool {
+    PENDING_S5C_DELETE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|m| {
+            m.values()
+                .any(|p| p.mme.is_some_and(|r| r.peer == mme && r.seq == mme_seq))
+        })
+}
+
+fn take_pending_s5c_delete(seq: u32) -> Option<PendingS5cDelete> {
+    PENDING_S5C_DELETE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+        .and_then(|m| m.remove(&seq))
+}
+
+/// Relay the MME's Delete Session Request for `sess` to its PGW over S5/S8 (TS
+/// 29.274 §7.2.9.1: "sent on the S11 interface by the MME to the SGW and on the
+/// S5/S8 interface by the SGW to the PGW"), addressed to the PGW's S5/S8-C TEID
+/// with the Linked EBI and the Operation Indication. The MME is answered when the
+/// PGW has answered and the SGW-U has deleted the session
+/// ([`dispatch_s5c_delete_session_response`]). Returns false when nothing could be
+/// relayed (no PGW session or peer, a build or send failure): the caller then
+/// deletes the local resources at once.
+fn relay_delete_session_to_pgw(
+    server: &GtpcServer,
+    sess: &crate::context::SgwcSess,
+    mme: SocketAddr,
+    mme_seq: u32,
+    mme_teid: u32,
+) -> bool {
+    if sess.pgw_s5c_teid == 0 {
+        log::warn!(
+            "Delete Session for session {}: no PGW S5/S8 session to relay to; deleting \
+             locally",
+            sess.id
+        );
+        return false;
+    }
+    let Some(pgw) = sgwc_self().pgw_s5c_peer() else {
+        log::warn!(
+            "Delete Session for session {}: no PGW S5/S8 peer configured; deleting locally",
+            sess.id
+        );
+        return false;
+    };
+    let s5c_seq = server.alloc_sequence();
+    let msg = match s11_build::build_s5c_delete_session_request(sess, s5c_seq) {
+        Ok(m) => m,
+        Err(e) => {
+            log::error!(
+                "S5/S8 Delete Session Request for session {} not built: {e}",
+                sess.id
+            );
+            return false;
+        }
+    };
+    // Recorded before the send: the answer can race it.
+    PENDING_S5C_DELETE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(
+            s5c_seq,
+            PendingS5cDelete {
+                sess_id: sess.id,
+                mme: Some(MmeDeleteRequest {
+                    peer: mme,
+                    seq: mme_seq,
+                    teid: mme_teid,
+                }),
+            },
+        );
+    if let Err(e) = server.send_request(pgw, &msg, sess.id) {
+        log::error!("S5/S8 Delete Session Request to {pgw} failed: {e}; deleting locally");
+        take_pending_s5c_delete(s5c_seq);
+        return false;
+    }
+    log::info!(
+        "Delete Session Request for session {} relayed to the PGW {pgw} (seq={s5c_seq})",
+        sess.id
+    );
+    true
+}
+
+/// The PGW answered (or never answered) the relayed Delete Session Request at
+/// `s5c_seq` (#1025): the SGW-U's session is deleted and the MME answered, as for a
+/// local deletion. A PGW refusal does not keep the session: the UE is detached or
+/// the PDN connection released either way, and keeping it would only leak the
+/// SGW-U's.
+fn continue_delete_session_after_pgw(s5c_seq: u32, pgw_cause: Option<u8>) {
+    let Some(pending) = take_pending_s5c_delete(s5c_seq) else {
+        log::warn!(
+            "S5/S8 Delete Session Response (seq={s5c_seq}) matches no relayed request; dropped"
+        );
+        return;
+    };
+    let Some(mme) = pending.mme else {
+        // An abandoned session: nothing waits for the PGW's answer.
+        match pgw_cause {
+            Some(gtp_cause::REQUEST_ACCEPTED) => {
+                log::info!("The PGW deleted the abandoned session (S5/S8 seq={s5c_seq})")
+            }
+            Some(c) => {
+                log::warn!("The PGW answered the abandoned session's Delete Session with cause {c}")
+            }
+            None => log::error!(
+                "The PGW never answered the abandoned session's Delete Session (N3): its \
+                 session may remain"
+            ),
+        }
+        return;
+    };
+    match pgw_cause {
+        Some(gtp_cause::REQUEST_ACCEPTED) => {}
+        Some(c) => log::warn!(
+            "The PGW answered the Delete Session for session {} with cause {c}; deleting it \
+             locally all the same",
+            pending.sess_id
+        ),
+        None => log::warn!(
+            "The PGW never answered the Delete Session for session {} (N3); deleting it \
+             locally",
+            pending.sess_id
+        ),
+    }
+    let Some(sess) = sgwc_self().sess_find_by_id(pending.sess_id) else {
+        // Already gone (a restart cleanup, say): what the MME asked for is done.
+        crate::sxa_response::fail_with_cause(
+            pfcp_path::S11Continuation::DeleteSession {
+                peer: mme.peer,
+                seq: mme.seq,
+                teid: mme.teid,
+                sess_id: pending.sess_id,
+            },
+            gtp_cause::REQUEST_ACCEPTED,
+        );
+        return;
+    };
+    delete_session_user_plane(&sess, mme.peer, mme.seq, mme.teid);
+}
+
+/// Delete at the PGW a session this SGW-C abandons after the PGW anchored it
+/// (#1032 / #1010 review): a Create Session that could not be completed (no Sxa
+/// association when the PGW answered), or one whose local session was deleted
+/// while the PGW's answer was in flight. Without this the PGW keeps the session
+/// and the UE's address. Nobody waits for the answer.
+fn abandon_pgw_session(pgw_s5c_teid: u32, lbi: u8, why: &str) {
+    let (Some(server), Some(pgw)) = (s11_server(), sgwc_self().pgw_s5c_peer()) else {
+        log::error!("Cannot delete the abandoned PGW session ({why}): no S5/S8 path");
+        return;
+    };
+    if pgw_s5c_teid == 0 {
+        return;
+    }
+    let seq = server.alloc_sequence();
+    let msg = s11_build::build_s5c_delete_session_request_to(pgw_s5c_teid, lbi, seq);
+    PENDING_S5C_DELETE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(
+            seq,
+            PendingS5cDelete {
+                sess_id: 0,
+                mme: None,
+            },
+        );
+    match server.send_request(pgw, &msg, 0) {
+        Ok(_) => log::warn!(
+            "Delete Session Request to the PGW {pgw} for an abandoned session \
+             (TEID {pgw_s5c_teid:#x}, LBI {lbi}): {why}"
+        ),
+        Err(e) => {
+            take_pending_s5c_delete(seq);
+            log::error!("Delete Session Request to {pgw} for an abandoned session failed: {e}");
+        }
+    }
+}
+
+/// The PGW's answer to a relayed Delete Session Request (#1025).
+fn dispatch_s5c_delete_session_response(msg: &Gtp2Message, peer: SocketAddr) {
+    let cause = msg
+        .get_ie(Gtp2IeType::Cause as u8, 0)
+        .and_then(|ie| ie.value.first().copied())
+        .unwrap_or(gtp_cause::SYSTEM_FAILURE);
+    log::info!(
+        "S5/S8 Delete Session Response from {peer} (seq={}) cause={cause}",
+        msg.header.sequence_number
+    );
+    continue_delete_session_after_pgw(msg.header.sequence_number, Some(cause));
+}
+
+/// Delete `sess` on the SGW-U and answer the MME's Delete Session Request when it
+/// confirms (#54): the local context is removed only then.
+fn delete_session_user_plane(
+    sess: &crate::context::SgwcSess,
+    mme: SocketAddr,
+    mme_seq: u32,
+    mme_teid: u32,
+) {
+    if let Err(e) = pfcp_path::send_session_deletion_request(
+        sess,
+        mme_seq as u64,
+        None,
+        pfcp_path::S11Continuation::DeleteSession {
+            peer: mme,
+            seq: mme_seq,
+            teid: mme_teid,
+            sess_id: sess.id,
+        },
+    ) {
+        log::error!("PFCP session deletion failed: {e}");
+        if let Some(server) = s11_server() {
+            send_cause_response(
+                &server,
+                mme,
+                Gtp2MessageType::DeleteSessionResponse,
+                mme_teid,
+                mme_seq,
+                sxa_handler::gtp_cause_from_pfcp(sxa_handler::pfcp_cause::SYSTEM_FAILURE),
+            );
+        }
+    }
+}
+
 fn dispatch_release_access_bearers_request(
     server: &GtpcServer,
     msg: &Gtp2Message,
@@ -1897,30 +2278,9 @@ fn dispatch_release_access_bearers_request(
 
     let result = s11_handler::handle_release_access_bearers_request(Some(&ue), seq as u64, &[]);
 
-    let ctx = sgwc_self();
     match result {
         HandlerResult::SendPfcp => {
-            // Clear eNB endpoints (S1 release) and deactivate downlink
-            for sess_id in &ue.sess_ids {
-                let Some(sess) = ctx.sess_find_by_id(*sess_id) else {
-                    continue;
-                };
-                for bearer_id in &sess.bearer_ids {
-                    if let Some(mut dl_tunnel) = ctx.dl_tunnel_in_bearer(*bearer_id) {
-                        dl_tunnel.remote_teid = 0;
-                        dl_tunnel.remote_ip = crate::context::IpAddr::default();
-                        ctx.tunnel_update(&dl_tunnel);
-                    }
-                }
-                if let Err(e) = pfcp_path::send_session_modification_request(
-                    &sess,
-                    seq as u64,
-                    None,
-                    sxa_handler::pfcp_modify::DL_ONLY | sxa_handler::pfcp_modify::DEACTIVATE,
-                ) {
-                    log::error!("PFCP deactivation failed: {e}");
-                }
-            }
+            release_s1u_bearers(&ue, seq as u64);
             send_cause_response(
                 server,
                 peer,
@@ -2558,6 +2918,11 @@ mod tests {
     }
 
     impl StandInSgwu {
+        /// The stand-in's Sxa address (the SGW-C's association peer).
+        fn addr(&self) -> SocketAddr {
+            self.sock.local_addr().unwrap()
+        }
+
         /// Bodies the stand-in received for a message type, in order.
         fn received(&self, msg_type: u8) -> usize {
             self.seen
@@ -2637,6 +3002,27 @@ mod tests {
                     cursor.to_vec(),
                 ));
 
+                // #1001: the SGW-C sends no session message before the association
+                // (TS 29.244 §6.2.6.1), so the stand-in accepts the Association Setup.
+                if msg_type == 5 {
+                    let mut body = bytes::BytesMut::new();
+                    nextgcore_pfcp::message::AssociationSetupResponse::new(
+                        NodeId::new_ipv4([127, 0, 0, 9]),
+                        PfcpCause::RequestAccepted,
+                        1,
+                    )
+                    .encode(&mut body);
+                    let mut out = bytes::BytesMut::new();
+                    let mut h = PHeader::new(
+                        nextgcore_pfcp::header::PfcpMessageType::AssociationSetupResponse,
+                        header.sequence_number,
+                    );
+                    h.length = (4 + body.len()) as u16;
+                    h.encode(&mut out);
+                    out.extend_from_slice(&body);
+                    let _ = up.send_to(&out, from).await;
+                    continue;
+                }
                 let pfcp_cause = PfcpCause::from_wire(cause);
                 let mut body = bytes::BytesMut::new();
                 let resp_type = match msg_type {
@@ -2660,7 +3046,7 @@ mod tests {
                         SessionDeletionResponse::new(pfcp_cause).encode(&mut body);
                         55u8
                     }
-                    // Association Setup, Heartbeat: not needed by these tests.
+                    // Heartbeat: not needed by these tests.
                     _ => continue,
                 };
                 if !delay.is_zero() {
@@ -2685,6 +3071,9 @@ mod tests {
                 .expect("bind the SGW-C's Sxa socket");
         let (_tx, rx) = tokio::sync::watch::channel(false);
         tokio::spawn(node.clone().run(rx));
+        node.associate(up_addr)
+            .await
+            .expect("the stand-in accepts the association");
         // `run` installs the outbound queue in its own body; a request enqueued before it
         // is polled would be refused with "no Sxa transport".
         for _ in 0..200 {
@@ -2733,6 +3122,14 @@ mod tests {
         addr: SocketAddr,
         /// Message types received, in order.
         seen: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        /// Delete Session Requests received (#1025): (header TEID, Linked EBI, OI).
+        deletes: std::sync::Arc<std::sync::Mutex<Vec<(Option<u32>, Option<u8>, bool)>>>,
+        /// Whether a Delete Session Request is answered.
+        answer_deletes: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        /// The cause a Delete Session Request is answered with.
+        delete_cause: std::sync::Arc<std::sync::atomic::AtomicU8>,
+        /// How long a Create Session Request waits for its answer, in ms.
+        create_delay_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
     }
 
     /// The address this stand-in allocates. Not in 10.45.0.0/16 and not anything a test
@@ -2748,6 +3145,14 @@ mod tests {
         let addr = sock.local_addr().unwrap();
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = seen.clone();
+        let deletes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let answer_deletes = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let delete_cause = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            gtp_cause::REQUEST_ACCEPTED,
+        ));
+        let create_delay_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (dels, answer_dels) = (deletes.clone(), answer_deletes.clone());
+        let (del_cause, create_delay) = (delete_cause.clone(), create_delay_ms.clone());
         let handle = sock.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 8192];
@@ -2763,8 +3168,42 @@ mod tests {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .push(msg.header.message_type);
+                if msg.header.message_type == Gtp2MessageType::DeleteSessionRequest as u8 {
+                    let lbi = msg
+                        .get_ie(Gtp2IeType::Ebi as u8, 0)
+                        .and_then(|ie| nextgcore_gtp::v2::ie::Gtp2EbiIe::decode(&ie.value).ok())
+                        .map(|e| e.ebi);
+                    let oi = msg
+                        .get_ie(Gtp2IeType::Indication as u8, 0)
+                        .and_then(|ie| {
+                            nextgcore_gtp::v2::ie::Gtp2IndicationIe::decode(&ie.value).ok()
+                        })
+                        .is_some_and(|i| i.oi);
+                    dels.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push((msg.header.teid, lbi, oi));
+                    if answer_dels.load(std::sync::atomic::Ordering::SeqCst) {
+                        let mut resp = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+                            Gtp2MessageType::DeleteSessionResponse as u8,
+                            0,
+                            msg.header.sequence_number,
+                        ));
+                        resp.add_ie(
+                            nextgcore_gtp::v2::Gtp2CauseIe::new(
+                                del_cause.load(std::sync::atomic::Ordering::SeqCst),
+                            )
+                            .to_ie(0),
+                        );
+                        let _ = handle.send_to(&resp.encode(), from).await;
+                    }
+                    continue;
+                }
                 if msg.header.message_type != Gtp2MessageType::CreateSessionRequest as u8 {
                     continue;
+                }
+                let delay = create_delay.load(std::sync::atomic::Ordering::SeqCst);
+                if delay > 0 {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
                 }
 
                 // Answer as a PGW does: Cause, its own control F-TEID at instance 1, the
@@ -2797,7 +3236,14 @@ mod tests {
             }
         });
         let _ = sock;
-        StandInPgw { addr, seen }
+        StandInPgw {
+            addr,
+            seen,
+            deletes,
+            answer_deletes,
+            delete_cause,
+            create_delay_ms,
+        }
     }
 
     /// Point the SGW-C at a stand-in PGW. Returns it so the test can assert what it saw.
@@ -2990,6 +3436,55 @@ mod tests {
             response.get_ie(Gtp2IeType::Paa as u8, 0).is_none(),
             "a refused session must carry no PDN address"
         );
+    }
+
+    /// #1010 review MAJOR 1, TS 29.244 §6.2.6.1: with no Sxa association a Create
+    /// Session Request is answered at once with No resources available. Nothing is
+    /// relayed to the PGW (no anchored session is left behind) and no UE context is
+    /// created. Before, the PGW anchored the session, the PFCP establishment was
+    /// refused locally, and the MME got no answer at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_create_session_request_with_no_sxa_association_is_refused_before_the_pgw() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        // The Sxa path runs, but nothing ever answers the Association Setup.
+        let node =
+            crate::pfcp_path::SxaNode::open("127.0.0.1:0".parse().unwrap(), Ipv4Addr::LOCALHOST)
+                .await
+                .expect("bind the SGW-C's Sxa socket");
+        let (_stop, rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(node.clone().run(rx));
+        assert!(!crate::pfcp_path::sgwu_associated());
+        let pgw = with_stand_in_pgw().await;
+        let server = test_server(&ambient, 1000, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x01, 0xf0];
+
+        sock.send_to(&csr(0x1010, &imsi).encode(), server.local_addr())
+            .unwrap();
+        let response = recv_s11(&sock).await.expect("the MME must be answered");
+        assert_eq!(
+            response.header.message_type,
+            Gtp2MessageType::CreateSessionResponse as u8
+        );
+        assert_eq!(response.header.sequence_number, 0x1010);
+        assert_eq!(
+            response
+                .get_ie(Gtp2IeType::Cause as u8, 0)
+                .and_then(|ie| ie.value.first().copied()),
+            Some(gtp_cause::NO_RESOURCES_AVAILABLE)
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            pgw.seen.lock().unwrap().is_empty(),
+            "nothing relayed to the PGW"
+        );
+        assert!(
+            sgwc_self().ue_find_by_imsi(&imsi).is_none(),
+            "no UE context created"
+        );
+        sgwc_self().set_pgw_s5c_peer(None);
     }
 
     /// #54 criterion 6, first half: NO Create Session Response is sent until the PFCP
@@ -3751,6 +4246,371 @@ mod tests {
         let ue = ctx.ue_find_by_imsi(&imsi).unwrap();
         assert!(ue.sess_ids.is_empty());
 
+        server.close();
+    }
+
+    /// Create a session over S11 through the stand-ins; returns the SGW's S11 TEID.
+    async fn created_session(server: &GtpcServer, sock: &UdpSocket, imsi: &[u8], seq: u32) -> u32 {
+        sock.send_to(&csr(seq, imsi).encode(), server.local_addr())
+            .unwrap();
+        let csrsp = recv_s11(sock).await.expect("create session response");
+        Gtp2FTeidIe::decode(&csrsp.get_ie(Gtp2IeType::FTeid as u8, 0).unwrap().value)
+            .unwrap()
+            .teid
+    }
+
+    /// A Delete Session Request for EBI 5 with Indication flags `oi` / `si`.
+    fn delete_session(sgw_teid: u32, seq: u32, oi: bool, si: bool) -> Gtp2Message {
+        let mut dsr = Gtp2Message::new(nextgcore_gtp::v2::header::Gtp2Header::new(
+            Gtp2MessageType::DeleteSessionRequest as u8,
+            sgw_teid,
+            seq,
+        ));
+        dsr.add_ie(nextgcore_gtp::v2::ie::Gtp2EbiIe::new(5).to_ie(0));
+        dsr.add_ie(
+            nextgcore_gtp::v2::ie::Gtp2IndicationIe {
+                oi,
+                si,
+                ..Default::default()
+            }
+            .to_ie(0),
+        );
+        dsr
+    }
+
+    fn cause_of(msg: &Gtp2Message) -> u8 {
+        Gtp2CauseIe::decode(&msg.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value)
+            .unwrap()
+            .cause
+    }
+
+    /// Wait until the stand-in PGW has seen `n` Delete Session Requests.
+    async fn pgw_deletes(pgw: &StandInPgw, n: usize) -> Vec<(Option<u32>, Option<u8>, bool)> {
+        for _ in 0..300 {
+            let d = pgw.deletes.lock().unwrap().clone();
+            if d.len() >= n {
+                return d;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the PGW did not see {n} Delete Session Request(s)");
+    }
+
+    /// #1032 review, TS 29.274 Table 7.2.9.1-1: a Delete Session Request with
+    /// neither OI nor SI deletes the local resources only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_delete_session_without_oi_or_si_stays_local() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let pgw = with_stand_in_pgw().await;
+        let server = test_server(&ambient, 1000, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x32, 0xf1];
+        let sgw_teid = created_session(&server, &sock, &imsi, 0x3201).await;
+        sock.send_to(
+            &delete_session(sgw_teid, 0x3202, false, false).encode(),
+            server.local_addr(),
+        )
+        .unwrap();
+        let dsrsp = recv_s11(&sock).await.expect("delete session response");
+        assert_eq!(cause_of(&dsrsp), gtp_cause::REQUEST_ACCEPTED);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            pgw.deletes.lock().unwrap().is_empty(),
+            "not relayed without OI"
+        );
+        assert_eq!(sgwu.received(54), 1, "deleted locally");
+        sgwc_self().set_pgw_s5c_peer(None);
+        server.close();
+    }
+
+    /// #1032 review: a PGW that refuses the relayed Delete Session (here Context
+    /// not found) does not keep the session: the SGW-U's goes and the MME is
+    /// answered Request accepted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_pgw_refusing_the_delete_session_does_not_keep_it() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let pgw = with_stand_in_pgw().await;
+        pgw.delete_cause.store(
+            gtp_cause::CONTEXT_NOT_FOUND,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        let server = test_server(&ambient, 1000, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x32, 0xf2];
+        let sgw_teid = created_session(&server, &sock, &imsi, 0x3211).await;
+        sock.send_to(
+            &delete_session(sgw_teid, 0x3212, true, false).encode(),
+            server.local_addr(),
+        )
+        .unwrap();
+        let dsrsp = recv_s11(&sock).await.expect("delete session response");
+        assert_eq!(dsrsp.header.sequence_number, 0x3212);
+        assert_eq!(cause_of(&dsrsp), gtp_cause::REQUEST_ACCEPTED);
+        assert_eq!(pgw.deletes.lock().unwrap().len(), 1);
+        assert_eq!(
+            sgwu.received(54),
+            1,
+            "the SGW-U's session is deleted all the same"
+        );
+        assert!(sgwc_self()
+            .ue_find_by_imsi(&imsi)
+            .unwrap()
+            .sess_ids
+            .is_empty());
+        sgwc_self().set_pgw_s5c_peer(None);
+        server.close();
+    }
+
+    /// #1032 review: a Delete Session that removes the session while its Create
+    /// is still at the PGW (no PGW TEID to relay to yet) no longer orphans the
+    /// PGW's session: when the PGW's Create answer arrives for the vanished
+    /// session, the SGW-C deletes it at the PGW (its S5/S8-C TEID, the LBI).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_delete_racing_a_pending_create_deletes_the_pgw_session() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let _sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let pgw = with_stand_in_pgw().await;
+        pgw.create_delay_ms
+            .store(400, std::sync::atomic::Ordering::SeqCst);
+        let server = test_server(&ambient, 2000, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x32, 0xf3];
+        sock.send_to(&csr(0x3221, &imsi).encode(), server.local_addr())
+            .unwrap();
+        // The Create is at the PGW; the session exists locally with no PGW TEID.
+        let mut sgw_teid = 0;
+        for _ in 0..100 {
+            if let Some(ue) = sgwc_self().ue_find_by_imsi(&imsi) {
+                if !ue.sess_ids.is_empty() && ue.sgw_s11_teid != 0 {
+                    sgw_teid = ue.sgw_s11_teid;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_ne!(sgw_teid, 0);
+        sock.send_to(
+            &delete_session(sgw_teid, 0x3222, true, false).encode(),
+            server.local_addr(),
+        )
+        .unwrap();
+        let first = recv_s11(&sock).await.expect("an answer");
+        assert_eq!(
+            first.header.message_type,
+            Gtp2MessageType::DeleteSessionResponse as u8
+        );
+        let deletes = pgw_deletes(&pgw, 1).await;
+        assert_eq!(
+            deletes,
+            vec![(Some(0x0BEE_F001), Some(5), true)],
+            "the PGW's session is deleted at its S5/S8-C TEID"
+        );
+        sgwc_self().set_pgw_s5c_peer(None);
+        server.close();
+    }
+
+    /// #1010 review MAJOR 1, second half: the Sxa association goes down while the
+    /// PGW is answering the Create. The MME is refused (No resources available),
+    /// the PGW's session is deleted, and the local session removed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_association_lost_while_the_pgw_answers_deletes_the_pgw_session() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let pgw = with_stand_in_pgw().await;
+        pgw.create_delay_ms
+            .store(300, std::sync::atomic::Ordering::SeqCst);
+        let server = test_server(&ambient, 2000, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x10, 0xf4];
+        sock.send_to(&csr(0x1011, &imsi).encode(), server.local_addr())
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The Create is at the PGW: the association goes.
+        crate::pfcp_path::sxa_node()
+            .unwrap()
+            .drop_association_for_test(sgwu.addr())
+            .await;
+        assert!(!crate::pfcp_path::sgwu_associated());
+        let rsp = recv_s11(&sock).await.expect("the MME is answered");
+        assert_eq!(
+            rsp.header.message_type,
+            Gtp2MessageType::CreateSessionResponse as u8
+        );
+        assert_eq!(cause_of(&rsp), gtp_cause::NO_RESOURCES_AVAILABLE);
+        let deletes = pgw_deletes(&pgw, 1).await;
+        assert_eq!(deletes, vec![(Some(0x0BEE_F001), Some(5), true)]);
+        assert!(
+            sgwc_self()
+                .ue_find_by_imsi(&imsi)
+                .unwrap()
+                .sess_ids
+                .is_empty(),
+            "the local session is removed"
+        );
+        sgwc_self().set_pgw_s5c_peer(None);
+        server.close();
+    }
+
+    /// #1025, TS 29.274 §7.2.9.1, TS 23.401 §5.3.8.2.1 steps 3-7: a detach's Delete
+    /// Session Request (OI set) is relayed to the PGW, at its S5/S8-C TEID with the
+    /// Linked EBI and OI; the SGW-U's session is deleted after the PGW's answer, and
+    /// then the MME is answered. Before, the PGW never heard of it and kept the
+    /// session and its UE IP address.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_detach_delete_session_is_relayed_to_the_pgw() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let pgw = with_stand_in_pgw().await;
+        let server = test_server(&ambient, 1000, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x25, 0xf1];
+        let sgw_teid = created_session(&server, &sock, &imsi, 0x2501).await;
+
+        sock.send_to(
+            &delete_session(sgw_teid, 0x2502, true, false).encode(),
+            server.local_addr(),
+        )
+        .unwrap();
+        let dsrsp = recv_s11(&sock).await.expect("delete session response");
+        assert_eq!(
+            dsrsp.header.message_type,
+            Gtp2MessageType::DeleteSessionResponse as u8
+        );
+        assert_eq!(dsrsp.header.sequence_number, 0x2502);
+        assert_eq!(cause_of(&dsrsp), gtp_cause::REQUEST_ACCEPTED);
+        assert_eq!(
+            *pgw.deletes.lock().unwrap(),
+            vec![(Some(0x0BEE_F001), Some(5), true)],
+            "relayed once, to the PGW's S5/S8-C TEID, with the LBI and OI"
+        );
+        assert_eq!(sgwu.received(54), 1, "the SGW-U's session is deleted");
+        let ue = sgwc_self().ue_find_by_imsi(&imsi).unwrap();
+        assert!(ue.sess_ids.is_empty(), "the session is gone");
+        sgwc_self().set_pgw_s5c_peer(None);
+        server.close();
+    }
+
+    /// #1025, TS 29.274 Table 7.2.9.1-1: a Delete Session Request for a Serving GW
+    /// relocation (SI set, OI clear) deletes the local resources only: the PGW keeps
+    /// the session the new SGW now serves.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_relocation_delete_session_is_not_relayed_to_the_pgw() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let pgw = with_stand_in_pgw().await;
+        let server = test_server(&ambient, 1000, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x25, 0xf2];
+        let sgw_teid = created_session(&server, &sock, &imsi, 0x2511).await;
+
+        sock.send_to(
+            &delete_session(sgw_teid, 0x2512, false, true).encode(),
+            server.local_addr(),
+        )
+        .unwrap();
+        let dsrsp = recv_s11(&sock).await.expect("delete session response");
+        assert_eq!(cause_of(&dsrsp), gtp_cause::REQUEST_ACCEPTED);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(pgw.deletes.lock().unwrap().is_empty(), "not relayed");
+        assert_eq!(sgwu.received(54), 1, "deleted locally");
+        sgwc_self().set_pgw_s5c_peer(None);
+        server.close();
+    }
+
+    /// #1025: the MME's answer waits for the PGW; a PGW that never answers (N3
+    /// exhausted) does not keep the session: it is deleted on the SGW-U and the MME
+    /// answered then.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_pgw_that_never_answers_the_delete_session_does_not_keep_it() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let pgw = with_stand_in_pgw().await;
+        let server = test_server(&ambient, 300, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x25, 0xf3];
+        let sgw_teid = created_session(&server, &sock, &imsi, 0x2521).await;
+        pgw.answer_deletes
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+
+        sock.set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        sock.send_to(
+            &delete_session(sgw_teid, 0x2522, true, false).encode(),
+            server.local_addr(),
+        )
+        .unwrap();
+        assert!(
+            recv_s11(&sock).await.is_none(),
+            "no answer while the PGW may still answer"
+        );
+        // The MME retransmits: absorbed, not relayed a second time.
+        sock.send_to(
+            &delete_session(sgw_teid, 0x2522, true, false).encode(),
+            server.local_addr(),
+        )
+        .unwrap();
+        assert_eq!(
+            sgwu.received(54),
+            0,
+            "the SGW-U's session waits for the PGW"
+        );
+        sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let dsrsp = recv_s11(&sock).await.expect("answered after N3");
+        assert_eq!(dsrsp.header.sequence_number, 0x2522);
+        assert_eq!(cause_of(&dsrsp), gtp_cause::REQUEST_ACCEPTED);
+        assert_eq!(
+            pgw.deletes.lock().unwrap().len(),
+            2,
+            "sent, then retransmitted once on T3; the MME's retransmission is not relayed"
+        );
+        assert_eq!(sgwu.received(54), 1);
+        sgwc_self().set_pgw_s5c_peer(None);
         server.close();
     }
 
