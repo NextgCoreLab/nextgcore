@@ -7,6 +7,7 @@ use clap::Parser;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+pub mod bearer_deactivation;
 pub mod config;
 pub mod context;
 pub mod emm_build;
