@@ -14163,21 +14163,21 @@ mod tests {
         );
     }
 
-    /// #289 acceptance: the whole tail after the PFCP block, which no test could
-    /// reach before the stand-in UPF existed.
-    ///
-    /// Four claims, each of which was "verified by inspection" until now:
-    /// 1. the create answers `201` with a resolvable `smContextRef`;
-    /// 2. the session fill-in ran — `upCnxState` is ACTIVATED and the authorised
-    ///    session AMBR is stored on the session (#78, #191);
-    /// 3. the `PolicyBinding` was inserted — the release, update and notify paths
-    ///    all key off it, so a create that skipped it produces a session none of
-    ///    them can act on;
-    /// 4. the N4 exchange really happened, asserted from the stand-in's own
-    ///    record rather than from the SMF's report of it.
-    ///
-    /// Positive assertions throughout: each reads a value only reachable by
-    /// executing the step it names, so no early return can satisfy them.
+    // #289 acceptance: the whole tail after the PFCP block, which no test could
+    // reach before the stand-in UPF existed.
+    //
+    // Four claims, each of which was "verified by inspection" until now:
+    // 1. the create answers `201` with a resolvable `smContextRef`;
+    // 2. the session fill-in ran — `upCnxState` is ACTIVATED and the authorised
+    //    session AMBR is stored on the session (#78, #191);
+    // 3. the `PolicyBinding` was inserted — the release, update and notify paths
+    //    all key off it, so a create that skipped it produces a session none of
+    //    them can act on;
+    // 4. the N4 exchange really happened, asserted from the stand-in's own
+    //    record rather than from the SMF's report of it.
+    //
+    // Positive assertions throughout: each reads a value only reachable by
+    // executing the step it names, so no early return can satisfy them.
     // ── #193: the SMF stops believing a session the UPF says it does not have ──
 
     /// Criterion 3 driven over a REAL N4 round trip, from the production entry
@@ -14256,8 +14256,7 @@ mod tests {
             let global = smf_self();
             let ctx = global.read().expect("context");
             let sessions = ctx.pfcp_sessions.read().expect("sessions");
-            let present = sessions.contains_key(sm_context_ref);
-            present
+            sessions.contains_key(sm_context_ref)
         };
         {
             let global = smf_self();
