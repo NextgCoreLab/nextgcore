@@ -217,6 +217,17 @@ Metrics:
 - `smf_up_paths_failed` (gauge);
 - `smf_up_path_sessions_deactivated_total` and `smf_up_path_sessions_released_total`.
 
+## Network slice admission control (#959, #1072)
+
+With an NSACF configured (`NSACF_URI`) or discoverable, every PDU session is counted in and out of its S-NSSAI's PDU-session quota with Nnsacf_NSAC_NumOfPDUsUpdate (TS 23.502 §4.2.11.4, TS 29.536). The NSACF keeps one entry per UE ID and PDU session ID on each S-NSSAI.
+
+- **Count-in.** SM Context Create sends an INCREASE before it commits PCF and PFCP resources. A rejection fails the create with 5GSM cause #67. An NSACF that is absent or refuses with another status fails open: the session is not counted. If an INCREASE gets no answer at all (a timeout, a broken stream), the NSACF may have applied it, so the session fails open and a precautionary DECREASE follows. That DECREASE is a no-op at the NSACF when the INCREASE was never applied.
+- **EPC to 5GC.** This SMF+PGW-C does no EPS counting, so a PDN connection is counted in when it moves to 5GS (TS 23.501 §5.15.11.5). One the NSACF does not admit is not transferred: the EPS→5GS SM Context Create fails with `INSUFFICIENT_RESOURCES_SLICE`, and the PDN connection stays on EPS. A cancelled move counts the session out again.
+- **Count-out.** Every release sends the DECREASE, alongside the UDM cleanup. A same-PSI re-establishment on the same S-NSSAI waits for the old session's DECREASE if it is already sent, and takes the admission over if it is not (then neither a DECREASE nor a new INCREASE is sent). A re-establishment on another S-NSSAI waits for neither.
+- **Shutdown and boot.** A shutdown that releases the association counts out every session still admitted, alongside the #39 fan-out and the Association Release, within the shutdown deadline. A durable shutdown counts nothing out: the sessions continue. At boot, a snapshot session that cannot be restored is counted out.
+
+`smf_nsac_decrease_failures_total` counts the DECREASEs the NSACF refused or did not answer. Each such session stays counted at the NSACF. Precautionary DECREASEs are not counted.
+
 ## Restoration signalling (#193)
 
 The interlock above decides what the SMF *believes*. This decides what it

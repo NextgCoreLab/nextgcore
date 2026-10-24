@@ -675,6 +675,21 @@ impl Drop for HandoverLock {
     }
 }
 
+/// An SM context error answer (#1072 round 3 m11): SmContextCreateError (TS 29.502
+/// §6.1.6.2.35, Table 6.1.3.2.3.1-3) for the EPS→5GS create, and SmContextUpdateError
+/// (§6.1.6.2.36, Table 6.1.3.3.4.2.2-2) for PREPARED, COMPLETED and CANCELLED. Both
+/// carry the ProblemDetails, with its "cause", in "error", as application/json. A
+/// bare ProblemDetails is for errors an SCP originates.
+fn sm_context_error(status: u16, cause: &str, detail: &str) -> SbiResponse {
+    let body = serde_json::json!({
+        "error": { "status": status, "cause": cause, "detail": detail },
+    });
+    SbiResponse::with_status(status).with_body(
+        body.to_string(),
+        nextgcore_sbi::constants::content_type::APPLICATION_JSON,
+    )
+}
+
 /// TS 29.502 §5.2.2.2.3: the SMF's answer to an EPS→5GS handover preparation.
 pub(crate) async fn handle_create(body: &serde_json::Value) -> SbiResponse {
     let body = body.clone();
@@ -697,14 +712,15 @@ async fn detached(
         Ok(response) => response,
         Err(e) => {
             log::error!("EPS→5GS handover handler failed: {e}");
-            crate::problem_response(500, "SYSTEM_FAILURE", "the handover handler failed")
+            sm_context_error(500, "SYSTEM_FAILURE", "the handover handler failed")
         }
     }
 }
 
 async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
     let Some(supi) = body["supi"].as_str().filter(|s| !s.is_empty()) else {
-        return crate::problem_400(
+        return sm_context_error(
+            400,
             "MANDATORY_IE_MISSING",
             "supi is required to find the UE's EPS PDN connection (TS 29.502 6.1.6.2.2)",
         );
@@ -719,7 +735,8 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
         {
             Some(pdn) => pdn,
             None => {
-                return crate::problem_400(
+                return sm_context_error(
+                    400,
                     "MANDATORY_IE_INCORRECT",
                     "ueEpsPdnConnection is not a TS 29.274 PDN Connection this SMF can read",
                 )
@@ -735,7 +752,7 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
             pdn.pgw_c_control_fteid,
             pdn.linked_ebi
         );
-        return crate::problem_response(
+        return sm_context_error(
             404,
             "CONTEXT_NOT_FOUND",
             "no PDN connection on this SMF corresponds to the EPS bearer contexts",
@@ -750,7 +767,7 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
              sent none in its PCO), so it does not move to 5GS",
             sess.session_name
         );
-        return crate::problem_response(
+        return sm_context_error(
             403,
             "NO_EPS_5GS_CONTINUITY",
             "no PDU session ID was received for this PDN connection in EPS",
@@ -765,7 +782,7 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
         }
     }
     let Some(ue_ip) = sess.ipv4_addr.map(|a| a.octets()) else {
-        return crate::problem_response(
+        return sm_context_error(
             500,
             "SYSTEM_FAILURE",
             "the PDN connection holds no IPv4 address",
@@ -778,7 +795,7 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
         .or_else(|| bearers.first())
         .cloned()
     else {
-        return crate::problem_response(
+        return sm_context_error(
             500,
             "SYSTEM_FAILURE",
             "the PDN connection holds no EPS bearer",
@@ -806,6 +823,29 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
         .eps_to_5gs
         .then(|| crate::lookup_upf_ul_endpoint(&sm_context_ref))
         .flatten();
+
+    // #1072 review m4, m9: NSAC for the PDU session this PDN connection becomes, before
+    // anything is installed for it. This SMF+PGW-C does no EPS counting, so the count
+    // happens at the move (TS 23.501 §5.15.11.5), and a session the NSACF does not
+    // admit is not transferred: TS 29.502 Table 6.1.3.2.3.1-3,
+    // INSUFFICIENT_RESOURCES_SLICE. A repeated preparation (NOTE 2) keeps the first
+    // one's admission.
+    let nsac_sst = sess.s_nssai.sst;
+    let nsac_sd = sess.s_nssai.sd.map(|sd| format!("{sd:06x}"));
+    let nsac_admitted = if existing.is_some() {
+        crate::lookup_policy_binding(&sm_context_ref).is_some_and(|b| b.nsac_admitted)
+    } else {
+        match crate::nsac_admit_migrated_session(supi, psi, nsac_sst, nsac_sd.as_deref()).await {
+            Some(admitted) => admitted,
+            None => {
+                return sm_context_error(
+                    500,
+                    "INSUFFICIENT_RESOURCES_SLICE",
+                    "the NSACF did not admit the PDU session on its S-NSSAI",
+                )
+            }
+        }
+    };
     let n3_ul = match existing {
         Some(endpoint) => endpoint,
         None => match pfcp_create_n3_uplink(smf_n4_seid, upf_seid, ue_ip, default_bearer.ebi).await
@@ -813,7 +853,8 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
             Ok(endpoint) => endpoint,
             Err(e) => {
                 log::error!("[{supi}] EPS→5GS step 6: the UPF did not allocate the N3 tunnel: {e}");
-                return crate::problem_response(
+                crate::rollback_nsac(nsac_admitted, supi, psi, nsac_sst, nsac_sd.as_deref()).await;
+                return sm_context_error(
                     504,
                     "UPF_NOT_RESPONDING",
                     "the UPF did not allocate the N3 uplink tunnel",
@@ -845,7 +886,8 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
             // keep the N3 uplink PDR in place too.
             let ebis: Vec<u8> = dedicated.iter().map(|b| b.ebi).collect();
             remove_dedicated_uplinks(smf_n4_seid, upf_seid, &ebis).await;
-            return crate::problem_response(
+            crate::rollback_nsac(nsac_admitted, supi, psi, nsac_sst, nsac_sd.as_deref()).await;
+            return sm_context_error(
                 504,
                 "UPF_NOT_RESPONDING",
                 "the UPF did not install the dedicated bearers' QoS flows",
@@ -864,12 +906,9 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
                 if let Err(e) = pfcp_remove_n3_uplink(smf_n4_seid, upf_seid, &ebis, &[]).await {
                     log::warn!("[{supi}] and the step-6 rules were not removed: {e}");
                 }
+                crate::rollback_nsac(nsac_admitted, supi, psi, nsac_sst, nsac_sd.as_deref()).await;
             }
-            return crate::problem_response(
-                500,
-                "SYSTEM_FAILURE",
-                "N2 SM information encoding failed",
-            );
+            return sm_context_error(500, "SYSTEM_FAILURE", "N2 SM information encoding failed");
         }
     };
 
@@ -949,6 +988,7 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
                         sst: sess.s_nssai.sst,
                         sd: sd_hex.clone(),
                         sdm_subscription_id: None,
+                        nsac_admitted,
                     },
                 );
             }
@@ -1027,14 +1067,16 @@ async fn handle_prepared_inner(sm_context_ref: &str, transfer: &[u8]) -> SbiResp
         Ok(ack) => ack,
         Err(e) => {
             log::warn!("SM Context Update (PREPARED) for ref={sm_context_ref}: undecodable HandoverRequestAcknowledgeTransfer: {e}");
-            return crate::problem_400(
+            return sm_context_error(
+                400,
                 "N2_SM_ERROR",
                 "n2SmInfo is not a HandoverRequestAcknowledgeTransfer",
             );
         }
     };
     let Some(gnb_addr) = ack.dl.ipv4() else {
-        return crate::problem_400(
+        return sm_context_error(
+            400,
             "N2_SM_ERROR",
             "the target's DL N3 endpoint is not an IPv4 address this SMF can forward to",
         );
@@ -1047,7 +1089,7 @@ async fn handle_prepared_inner(sm_context_ref: &str, transfer: &[u8]) -> SbiResp
         .ok()
         .and_then(|ctx| ctx.sess_find_by_sm_context_ref(sm_context_ref))
     else {
-        return crate::problem_response(
+        return sm_context_error(
             404,
             "CONTEXT_NOT_FOUND",
             "No SM context for this smContextRef",
@@ -1199,11 +1241,7 @@ async fn handle_prepared_inner(sm_context_ref: &str, transfer: &[u8]) -> SbiResp
                     "SM Context Update (PREPARED) for ref={sm_context_ref}: \
                      HandoverCommandTransfer encode failed: {e:?}"
                 );
-                return crate::problem_response(
-                    500,
-                    "SYSTEM_FAILURE",
-                    "N2 SM information encode failed",
-                );
+                return sm_context_error(500, "SYSTEM_FAILURE", "N2 SM information encode failed");
             }
         };
         log::info!(
@@ -1223,7 +1261,7 @@ async fn handle_prepared_inner(sm_context_ref: &str, transfer: &[u8]) -> SbiResp
                 "SM Context Update (PREPARED) for ref={sm_context_ref}: the SM context went \
                  away during the preparation; nothing kept"
             );
-            return crate::problem_response(
+            return sm_context_error(
                 404,
                 "CONTEXT_NOT_FOUND",
                 "the SM context was released during the handover preparation",
@@ -1258,7 +1296,7 @@ async fn handle_prepared_inner(sm_context_ref: &str, transfer: &[u8]) -> SbiResp
                 .await;
             }
         }
-        return crate::problem_response(
+        return sm_context_error(
             404,
             "CONTEXT_NOT_FOUND",
             "the SM context was released during the handover preparation",
@@ -1314,7 +1352,7 @@ async fn handle_completed_inner(
     // #894 review m2: the caller checked the context before the lock wait; a
     // CANCELLED that held the lock may have released it meanwhile.
     if !is_live_sm_context(sm_context_ref) {
-        return crate::problem_response(
+        return sm_context_error(
             404,
             "CONTEXT_NOT_FOUND",
             "the SM context was released before the handover completed",
@@ -1357,7 +1395,7 @@ async fn handle_completed_inner(
         );
         // #964 review: an error, not `200 COMPLETED`, so the AMF sees that the downlink was
         // not switched (it retries once and logs), rather than a success that did nothing.
-        return crate::problem_response(
+        return sm_context_error(
             500,
             "SYSTEM_FAILURE",
             "The handover cannot complete: no target DL endpoint or no N4 session",
@@ -1516,6 +1554,7 @@ async fn handle_cancelled_inner(sm_context_ref: &str) -> SbiResponse {
             }
             // The PDN connection is left exactly as EPS was using it: it never became a PDU
             // session, so the SM context the preparation created goes away.
+            let mut counted = None;
             if let Ok(ctx) = smf_self().read() {
                 for map in [&ctx.pfcp_sessions, &ctx.cp_n4_seids] {
                     if let Ok(mut m) = map.write() {
@@ -1526,12 +1565,20 @@ async fn handle_cancelled_inner(sm_context_ref: &str) -> SbiResponse {
                     m.remove(sm_context_ref);
                 }
                 if let Ok(mut m) = ctx.policy_bindings.write() {
-                    m.remove(sm_context_ref);
+                    counted = m
+                        .remove(sm_context_ref)
+                        .filter(|b| b.nsac_admitted)
+                        .map(|b| (b.supi, b.psi, b.sst, b.sd));
                 }
                 sess.psi = 0;
                 sess.sm_context_ref = None;
                 sess.pdu_session_ref = None;
                 ctx.persist();
+            }
+            // #1072 round 2 m8: and the 5G count the preparation took is given back,
+            // under the handover lock, so a retried preparation counts in after it.
+            if let Some((supi, psi, sst, sd)) = counted {
+                crate::rollback_nsac(true, &supi, psi, sst, sd.as_deref()).await;
             }
             log::info!(
                 "SM Context Update (CANCELLED) for ref={sm_context_ref}: EPS→5GS handover \
@@ -3294,6 +3341,110 @@ mod tests {
                 && n4_has(&mods[3], 18, &[0x00, 0x6D, 0x00, 0x04, 0, 0, 0, 0x16]),
             "Remove the dedicated UL PDR 0x16 and QER 0x16"
         );
+    }
+
+    /// The INC/DEC order the recording NSACF saw for the test UE.
+    fn nsac_ops(seen: &std::sync::Mutex<Vec<(String, String)>>) -> Vec<String> {
+        let supi = format!("imsi-{IMSI}");
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, s)| *s == supi)
+            .map(|(op, _)| op.clone())
+            .collect()
+    }
+
+    /// #1072 round 2 m8: an EPS→5GS move counts the PDU session in at the NSACF
+    /// (TS 23.501 §5.15.11.5, no EPS counting here), and CANCELLED, which leaves the
+    /// PDN connection on EPS, counts it out again.
+    #[tokio::test]
+    async fn an_eps_to_5gs_move_is_counted_in_and_a_cancel_counts_it_out() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _upf = crate::pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        crate::context::smf_context_init(64, 256, 512);
+        let zero = std::time::Duration::ZERO;
+        let (nsacf, seen) = crate::tests::recording_nsacf(204, 204, zero, zero).await;
+        let (s5, pgw_c, _) = establish_pdn(Some(&pco_with_psi(5))).await;
+        use base64::Engine as _;
+        let body = serde_json::json!({
+            "supi": format!("imsi-{IMSI}"),
+            "hoState": "PREPARING",
+            "ueEpsPdnConnection": base64::engine::general_purpose::STANDARD.encode(pdn_connection(pgw_c)),
+        });
+        let created = handle_create(&body).await;
+        let after_create = nsac_ops(&seen);
+        let reference = serde_json::from_str::<serde_json::Value>(
+            created.http.content.as_deref().unwrap_or("{}"),
+        )
+        .unwrap_or_default()["smContextRef"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let cancelled = handle_cancelled(&reference).await.status;
+        let after_cancel = nsac_ops(&seen);
+        std::env::remove_var("NSACF_URI");
+        nsacf.stop().await.ok();
+        s5.close();
+
+        assert_eq!(created.status, 201);
+        assert_eq!(after_create, vec!["INC"], "counted in at the move");
+        assert_eq!(cancelled, 200);
+        assert_eq!(after_cancel, vec!["INC", "DEC"], "and out at the cancel");
+    }
+
+    /// #1072 round 2 m9: a PDU session the NSACF does not admit is not transferred
+    /// (TS 23.501 §5.15.11.5): INSUFFICIENT_RESOURCES_SLICE (TS 29.502 Table
+    /// 6.1.3.2.3.1-3), nothing installed at the UPF, and the PDN connection stays on
+    /// EPS.
+    #[tokio::test]
+    async fn an_eps_to_5gs_move_the_nsacf_rejects_is_not_transferred() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        crate::context::smf_context_init(64, 256, 512);
+        let zero = std::time::Duration::ZERO;
+        let (nsacf, seen) = crate::tests::recording_nsacf(403, 204, zero, zero).await;
+        let (s5, pgw_c, _) = establish_pdn(Some(&pco_with_psi(5))).await;
+        upf.clear_seen();
+        use base64::Engine as _;
+        let body = serde_json::json!({
+            "supi": format!("imsi-{IMSI}"),
+            "hoState": "PREPARING",
+            "ueEpsPdnConnection": base64::engine::general_purpose::STANDARD.encode(pdn_connection(pgw_c)),
+        });
+        let created = handle_create(&body).await;
+        let error = serde_json::from_str::<serde_json::Value>(
+            created.http.content.as_deref().unwrap_or("{}"),
+        )
+        .unwrap_or_default();
+        let content_type = created.http.get_header("content-type").cloned();
+        let mods = upf.modification_bodies();
+        let ops = nsac_ops(&seen);
+        let stays_on_eps = {
+            let ctx = smf_self();
+            let ctx = ctx.read().unwrap();
+            ctx.sess_find_by_teid(pgw_c.0)
+                .is_some_and(|s| s.epc && s.sm_context_ref.is_none())
+        };
+        std::env::remove_var("NSACF_URI");
+        nsacf.stop().await.ok();
+        s5.close();
+
+        assert_eq!(created.status, 500);
+        // #1072 round 3 m11: an SmContextCreateError, the cause in "error".
+        assert_eq!(
+            error["error"]["cause"], "INSUFFICIENT_RESOURCES_SLICE",
+            "{error}"
+        );
+        assert_eq!(content_type.as_deref(), Some("application/json"));
+        assert!(
+            mods.is_empty(),
+            "nothing installed: {} modification(s)",
+            mods.len()
+        );
+        assert_eq!(ops, vec!["INC"], "asked once, nothing to count out");
+        assert!(stays_on_eps, "the PDN connection stays on EPS");
     }
 
     /// TS 29.502 §5.2.2.3.4.4: CANCELLED releases the N3 uplink step 6 created and forgets
