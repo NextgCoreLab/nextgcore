@@ -601,7 +601,10 @@ mod tests {
         // The eNB is now registered and S1 Setup succeeded, so the S1 interface
         // is operational per TS 36.413 §8.7.3.2.
         let enb_id = ctx
-            .enb_find_by_enb_id(0x1234)
+            .enb_find_by_global_enb_id(
+                &PlmnId::new("310", "410"),
+                nextgcore_s1ap::EnbId::Macro(0x1234),
+            )
             .expect("eNB registered by Global-eNB-ID");
         let enb = ctx.enb_find_by_id(enb_id).expect("eNB in pool");
         assert!(

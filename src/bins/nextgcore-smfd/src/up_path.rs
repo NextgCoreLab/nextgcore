@@ -273,6 +273,15 @@ pub fn is_failed(upf_key: &str, ip: IpAddr) -> bool {
         .is_ok_and(|m| m.contains_key(&(upf_key.to_string(), ip)))
 }
 
+/// How many hold timers are pending (tests).
+#[cfg(test)]
+pub(crate) fn pending_hold_count() -> usize {
+    hold_timers()
+        .lock()
+        .map(|h| h.iter().filter(|h| !h.is_finished()).count())
+        .unwrap_or(0)
+}
+
 /// Stop the pending hold timers (a graceful shutdown): their releases would outlive
 /// the deadline, and the next incarnation learns the path state again from the UPF.
 pub fn abort_hold_timers() {
@@ -642,8 +651,22 @@ fn durable_key(upf_key: &str, ip: IpAddr) -> String {
     format!("{upf_key}|{ip}")
 }
 
+/// After a restart, a re-armed hold waits for its UPF to be associated again, then
+/// at least this long (#1028 round 2, m3): a hold that ran out while the SMF was
+/// down would otherwise release at boot, before the association, and its PFCP
+/// Deletions would wait out T1 x N1 each.
+pub const REARM_GRACE: Duration = Duration::from_secs(10);
+
 /// Re-arm the holds of the failed paths the snapshot restored (#1028 review m2), for
-/// what is left of each. Run at boot, once the pool is installed. Returns how many.
+/// what is left of each, once their UPF is associated again (and at least
+/// [`REARM_GRACE`] after that). Run at boot, once the pool is installed. An entry
+/// whose UPF is no longer configured (a renamed hostname UPF, #1028 round 2 m4) is
+/// dropped. Returns how many were armed.
+///
+/// A recovery the UPF reported while this SMF was down is lost (the UPF gives up
+/// after N1 retransmissions), so such a path still counts as failed: its sessions are
+/// released with #39 after the hold, and the UEs re-establish them. That is the
+/// safe direction.
 pub fn rearm_restored_holds() -> usize {
     let entries: Vec<(String, u64)> = {
         let handle = smf_self();
@@ -655,16 +678,27 @@ pub fn rearm_restored_holds() -> usize {
             .unwrap_or_default();
         entries
     };
+    let pool_keys: Vec<String> = crate::pfcp_path::global_pool()
+        .iter()
+        .map(|c| c.recovery_time_stamp_key())
+        .collect();
     let hold = hold_duration();
     let now = unix_now();
     let mut armed = 0;
+    let mut stale = Vec::new();
     for (key, since) in entries {
         let Some((upf_key, ip)) = key
             .rsplit_once('|')
             .and_then(|(k, ip)| Some((k.to_string(), ip.parse::<IpAddr>().ok()?)))
         else {
+            stale.push(key);
             continue;
         };
+        if !pool_keys.contains(&upf_key) {
+            log::info!("UPF {upf_key} is not configured now; its failed path to {ip} is forgotten");
+            stale.push(key);
+            continue;
+        }
         let generation = GENERATION.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut failed) = failed_paths().lock() {
             failed.insert((upf_key.clone(), ip), generation);
@@ -672,13 +706,63 @@ pub fn rearm_restored_holds() -> usize {
         let left = hold.saturating_sub(Duration::from_secs(now.saturating_sub(since)));
         log::warn!(
             "UPF {upf_key}: GTP-U path to {ip} was down at the last shutdown; its sessions \
-             are released in {} s unless it recovers",
-            left.as_secs()
+             are released {} s after the UPF is associated again, unless it recovers",
+            left.max(rearm_grace()).as_secs()
         );
-        arm_hold(&upf_key, ip, generation, left);
+        arm_rearmed_hold(upf_key, ip, generation, left.max(rearm_grace()));
         armed += 1;
     }
+    if !stale.is_empty() {
+        let handle = smf_self();
+        if let Ok(ctx) = handle.read() {
+            if let Ok(mut m) = ctx.failed_up_paths.write() {
+                for k in &stale {
+                    m.remove(k);
+                }
+            }
+            ctx.persist();
+        };
+    }
     armed
+}
+
+/// [`REARM_GRACE`], or a test's hold.
+fn rearm_grace() -> Duration {
+    #[cfg(test)]
+    if let Some(hold) = *HOLD_FOR_TEST.lock().unwrap_or_else(|e| e.into_inner()) {
+        return hold;
+    }
+    REARM_GRACE
+}
+
+/// A restored hold: first wait for the UPF's association (at most [`MAX_HOLD`]),
+/// then `left`.
+fn arm_rearmed_hold(upf_key: String, ip: IpAddr, generation: u64, left: Duration) {
+    let timer = tokio::spawn(async move {
+        let give_up = tokio::time::Instant::now() + MAX_HOLD;
+        loop {
+            let associated = match crate::pfcp_path::global_pool()
+                .into_iter()
+                .find(|c| c.recovery_time_stamp_key() == upf_key)
+            {
+                Some(c) => c.is_associated().await,
+                None => return,
+            };
+            if associated {
+                break;
+            }
+            if tokio::time::Instant::now() >= give_up {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        tokio::time::sleep(left).await;
+        hold_expired(&upf_key, ip, generation);
+    });
+    if let Ok(mut holds) = hold_timers().lock() {
+        holds.retain(|h| !h.is_finished());
+        holds.push(timer.abort_handle());
+    }
 }
 
 /// The hold for `ip` at `upf_key` expired: release what still points there, if the
@@ -1033,6 +1117,30 @@ mod tests {
             )),
             "no peer"
         );
+    }
+
+    /// #1028 round 2, m1: a dual-stack N3 FAR records both addresses, and a failure
+    /// naming either one matches it.
+    #[test]
+    fn a_dual_stack_far_matches_either_address() {
+        let v6: std::net::Ipv6Addr = "2001:db8::5".parse().unwrap();
+        let mut ohc = vec![0x03, 0x00, 0, 0, 0, 1, 10, 0, 0, 5];
+        ohc.extend_from_slice(&v6.octets());
+        let mut fp = PfcpMessageBuilder::new();
+        fp.add_u8(pfcp_ie::DESTINATION_INTERFACE, 0);
+        fp.add_tlv(pfcp_ie::OUTER_HEADER_CREATION, &ohc);
+        let mut far = PfcpMessageBuilder::new();
+        far.add_tlv(pfcp_ie::FAR_ID, &2u32.to_be_bytes());
+        far.add_apply_action(apply_action::FORW);
+        far.add_tlv(pfcp_ie::FORWARDING_PARAMETERS, &fp.build());
+        let mut body = PfcpMessageBuilder::new();
+        body.add_tlv(pfcp_ie::CREATE_FAR, &far.build());
+        let mut fars = BTreeMap::new();
+        apply_far_edits(&mut fars, &body.build());
+        let peer = fars[&2];
+        assert!(peer.matches("10.0.0.5".parse().unwrap()));
+        assert!(peer.matches(IpAddr::V6(v6)), "the IPv6 address too");
+        assert!(!peer.matches("10.0.0.6".parse().unwrap()));
     }
 
     #[test]

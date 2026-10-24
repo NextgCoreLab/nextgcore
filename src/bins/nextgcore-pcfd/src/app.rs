@@ -1984,7 +1984,10 @@ pub async fn handle_ue_policy_update(pol_asso_id: &str, request: &SbiRequest) ->
     if let Some(uri) = data.get("notificationUri").and_then(|v| v.as_str()) {
         if uri != existing.notification_uri {
             ue_policy::ue_policy_set_notification_uri(pol_asso_id, uri);
-            log::info!("[{pol_asso_id}] UE policy update: notificationUri -> {uri}");
+            log::info!(
+                "[{pol_asso_id}] UE policy update: notificationUri -> {uri}",
+                uri = nextgcore_sbi::log_redact::redact_last_segment(uri)
+            );
         }
     }
 

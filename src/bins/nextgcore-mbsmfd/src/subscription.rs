@@ -355,7 +355,10 @@ pub async fn send_notify_post(notify_uri: &str, body: &impl Serialize) {
     let (host, port) = match crate::parse_host_port(notify_uri) {
         Some(hp) => hp,
         None => {
-            log::warn!("[sub] invalid notifyUri (cannot parse host:port): {notify_uri}");
+            log::warn!(
+                "[sub] invalid notifyUri (cannot parse host:port): {notify_uri}",
+                notify_uri = nextgcore_sbi::log_redact::redact_last_segment(notify_uri)
+            );
             return;
         }
     };
@@ -368,14 +371,22 @@ pub async fn send_notify_post(notify_uri: &str, body: &impl Serialize) {
         Ok(rsp) if rsp.status / 100 == 2 => {
             log::debug!(
                 "[sub] notification delivered to {notify_uri} ({})",
-                rsp.status
+                rsp.status,
+                notify_uri = nextgcore_sbi::log_redact::redact_last_segment(notify_uri)
             );
         }
         Ok(rsp) => {
-            log::warn!("[sub] notification to {notify_uri} returned {}", rsp.status);
+            log::warn!(
+                "[sub] notification to {notify_uri} returned {}",
+                rsp.status,
+                notify_uri = nextgcore_sbi::log_redact::redact_last_segment(notify_uri)
+            );
         }
         Err(e) => {
-            log::warn!("[sub] notification to {notify_uri} failed: {e}");
+            log::warn!(
+                "[sub] notification to {notify_uri} failed: {e}",
+                notify_uri = nextgcore_sbi::log_redact::redact_last_segment(notify_uri)
+            );
         }
     }
 }

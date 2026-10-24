@@ -1168,17 +1168,30 @@ fn handle_forward_relocation_request(
     record_forward_relocation_source(mme_ue_id, ForwardRelocationSource { peer, amf_teid });
 }
 
-/// The S1-connected eNB a Target Identification names: same eNB id KIND (its length in bits),
-/// value and PLMN, S1 Setup complete (#741). The kind matters: a macro eNB `0x12345` and a
-/// home eNB `0x0012345` are different eNBs, and a home eNB is never a Type 1 or Type 4 target
-/// (§8.51.4 is Type 3). A selected TAI the eNB did not announce in its S1 Setup is logged and
-/// counted, not refused: the TAI does not address the eNB, and the eNB id and PLMN already do.
+/// [`FORWARD_RELOCATION_TAC_NOT_ANNOUNCED`] in the Prometheus text format, for the
+/// MME's `/metrics` (#858 review, MINOR A).
+pub fn render_metrics() -> String {
+    format!(
+        "# HELP mme_n26_forward_relocation_tac_not_announced_total Forward Relocations \
+         admitted onto an eNB that did not announce the selected EPS TAC in its S1 Setup \
+         (a misconfigured neighbour table, or a stale S1 Setup)\n\
+         # TYPE mme_n26_forward_relocation_tac_not_announced_total counter\n\
+         mme_n26_forward_relocation_tac_not_announced_total {}\n",
+        FORWARD_RELOCATION_TAC_NOT_ANNOUNCED.load(std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
 /// Forward Relocations admitted onto an eNB that did not announce the selected EPS TAC in
 /// its S1 Setup (#741): a non-zero count points an operator at a misconfigured neighbour
 /// table on the source side or a stale S1 Setup on the target.
 pub static FORWARD_RELOCATION_TAC_NOT_ANNOUNCED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// The S1-connected eNB a Target Identification names: same eNB id KIND (its length in bits),
+/// value and PLMN, S1 Setup complete (#741). The kind matters: a macro eNB `0x12345` and a
+/// home eNB `0x0012345` are different eNBs, and a home eNB is never a Type 1 or Type 4 target
+/// (§8.51.4 is Type 3). A selected TAI the eNB did not announce in its S1 Setup is logged and
+/// counted, not refused: the TAI does not address the eNB, and the eNB id and PLMN already do.
 fn select_target_enb(
     ctx: &crate::context::MmeContext,
     target: &n26_build::EnbTarget,
@@ -1725,6 +1738,22 @@ pub fn n26_open() -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::gtp_path::lock_s11;
+
+    /// #858 review, MINOR A: the not-announced-TAC count is on the MME's `/metrics`.
+    #[test]
+    fn the_tac_not_announced_count_is_exported() {
+        let before =
+            FORWARD_RELOCATION_TAC_NOT_ANNOUNCED.load(std::sync::atomic::Ordering::Relaxed);
+        FORWARD_RELOCATION_TAC_NOT_ANNOUNCED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let text = render_metrics();
+        assert!(text.contains("# TYPE mme_n26_forward_relocation_tac_not_announced_total counter"));
+        let value: u64 = text
+            .lines()
+            .find_map(|l| l.strip_prefix("mme_n26_forward_relocation_tac_not_announced_total "))
+            .and_then(|v| v.trim().parse().ok())
+            .expect("a sample line");
+        assert!(value > before, "the sample carries the count");
+    }
 
     /// #618: each N26 response arriving on the REAL socket closes its request and
     /// reaches the procedure. Before #618 the transaction layer had no N26 pair, so
