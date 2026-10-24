@@ -76,7 +76,7 @@ These are the fields actually deserialized by the daemon (`#[derive(Deserialize)
 
 Unknown YAML keys are silently ignored by serde. In the shipped example file:
 
-- **`logger.file.path` and `logger.level` are inert.** The log level comes solely from the CLI flag `-e/--log-level`; `init_logging` builds `env_logger::Builder::new()` with an explicit filter, so even `RUST_LOG` is not consulted, and no file logging is wired (see `--log-file` below).
+- **`logger.file.path` and `logger.level` are inert.** The log level comes from `RUST_LOG` when set, else the CLI flag `-e/--log-level`; no file logging is wired (see `--log-file` below).
 - **`global.max.ue` / `global.max.peer` are inert** — no `global` section exists in the deserialize structs; the only pool cap is CLI `--max-nf`.
 - **`nssf.sbi.client.nsi[]` (uri, s_nssai, optional nsi_id) is LOADED** (#93). Each entry installs one Network Slice Instance into the context, which is what `slice-info-request-for-pdu-session` and `slice-info-request-for-other-purpose` resolve against. Until #93 `SbiClientYaml` declared only `nrf`, so this block — present in every shipped config — deserialised into nothing, `nsi_add` had no production caller, and **every** PDU-session selection was answered `403`. An entry with no `s_nssai` is skipped with a warning rather than installed under a guessed SST. With no entries at all the daemon logs an ERROR at startup naming the consequence (it still serves the registration and NSSAI-availability scenarios, which do not consult the NSI table, so it does not refuse to boot).
 - **`nssf.sbi.tls.*` (enabled/cert/key/ca/min_version) is inert.** TLS is CLI-flag-only, and even those flags only populate a legacy config (next section).

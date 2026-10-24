@@ -179,9 +179,27 @@ pub struct SessionScope {
 
 /// [`notify_sessions_unrecoverable`] for the sessions in `scope` only (#720).
 pub async fn notify_sessions_unrecoverable_in(reason: &str, scope: Option<&SessionScope>) -> usize {
+    let (total, releases) = begin_unrecoverable_release(reason, scope);
+    let _ = releases.await;
+    total
+}
+
+/// Start releasing the sessions in `scope` (all, for `None`) that can no longer be
+/// honoured, and return at once: `(how many are being released, the fan-out)`.
+///
+/// #721: which sessions, and their callbacks, are decided here, synchronously, so
+/// the caller may flush the session map as soon as this returns. The per-session
+/// work (an N1N2MessageTransfer per UE, up to its connect and request timeouts)
+/// runs in the returned task. A caller on the N4 receive task drops the handle:
+/// awaiting it there stalled every PFCP message from every UPF, and the restarted
+/// UPF's own Heartbeat Response, for the length of the whole fan-out.
+pub fn begin_unrecoverable_release(
+    reason: &str,
+    scope: Option<&SessionScope>,
+) -> (usize, tokio::task::JoinHandle<()>) {
     let (notifiable, silent) = notifiable_sessions(scope);
     if notifiable.is_empty() && silent == 0 {
-        return 0;
+        return (0, tokio::spawn(async {}));
     }
     log::warn!(
         "PFCP restoration ({reason}): {} PDU session(s) can no longer be honoured; notifying \
@@ -191,35 +209,38 @@ pub async fn notify_sessions_unrecoverable_in(reason: &str, scope: Option<&Sessi
         notifiable.len(),
         silent
     );
+    let total = notifiable.len();
+    let reason = reason.to_string();
     // #718 review m2: a bounded parallel fan-out. One sequential POST per session
     // could not finish inside a pod's termination grace period with many UEs, and
     // the UEs after the SIGKILL heard nothing. Progress is logged, so an operator
     // can see how many were left if it is cut short anyway.
-    let total = notifiable.len();
-    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(RELEASE_FANOUT));
-    let mut releases = tokio::task::JoinSet::new();
-    for (sm_context_ref, uri) in notifiable {
-        let Ok(permit) = permits.clone().acquire_owned().await else {
-            break;
-        };
-        let reason = reason.to_string();
-        releases.spawn(async move {
-            let _permit = permit;
-            release_one_unrecoverable(&sm_context_ref, &uri, &reason).await;
-        });
-    }
-    let mut done = 0usize;
-    while releases.join_next().await.is_some() {
-        done += 1;
-        if done.is_multiple_of(100) || done == total {
-            log::info!(
-                "PFCP restoration ({reason}): {done}/{total} PDU session release(s) sent, \
-                 {} remaining",
-                total - done
-            );
+    let fan_out = tokio::spawn(async move {
+        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(RELEASE_FANOUT));
+        let mut releases = tokio::task::JoinSet::new();
+        for (sm_context_ref, uri) in notifiable {
+            let Ok(permit) = permits.clone().acquire_owned().await else {
+                break;
+            };
+            let reason = reason.clone();
+            releases.spawn(async move {
+                let _permit = permit;
+                release_one_unrecoverable(&sm_context_ref, &uri, &reason).await;
+            });
         }
-    }
-    total
+        let mut done = 0usize;
+        while releases.join_next().await.is_some() {
+            done += 1;
+            if done.is_multiple_of(100) || done == total {
+                log::info!(
+                    "PFCP restoration ({reason}): {done}/{total} PDU session release(s) sent, \
+                     {} remaining",
+                    total - done
+                );
+            }
+        }
+    });
+    (total, fan_out)
 }
 
 /// How many PDU session releases [`notify_sessions_unrecoverable`] has in flight at
@@ -241,7 +262,15 @@ async fn release_one_unrecoverable(sm_context_ref: &str, uri: &str, reason: &str
             crate::release_for_reactivation(sm_context_ref, uri, &supi, psi).await;
         }
         None => {
-            log::warn!("releasing sm_context_ref={sm_context_ref} after {reason}; notifying {uri}");
+            // #854: no UE identity to release through, so the release is finished here:
+            // the binding, session and address, the SM policy and the effects at the
+            // other NFs go now, and the AMF is told RELEASED. Before, only the
+            // notification went, and the binding and its SM policy stayed for good.
+            log::warn!(
+                "releasing sm_context_ref={sm_context_ref} after {reason} locally (no SUPI/PSI \
+                 to release it through); notifying {uri}"
+            );
+            crate::complete_sm_context_release(sm_context_ref);
             crate::send_sm_context_status_notification(
                 Some(uri),
                 RESOURCE_STATUS_RELEASED,
@@ -398,29 +427,15 @@ pub async fn reconcile_session_not_found(upf_seid: u64) -> bool {
 /// [`reconcile_session_not_found`] so the multi-match case is a loop rather than a
 /// duplicated body.
 async fn reconcile_one(upf_seid: u64, sm_context_ref: String) {
-    let global = smf_self();
-    let uri = {
-        let removed = global.read().ok().and_then(|ctx| {
-            let removed = match ctx.pfcp_sessions.write() {
-                Ok(mut sessions) => sessions.remove(&sm_context_ref).is_some(),
-                Err(_) => false,
-            };
-            // After the write guard drops: `persist` takes a read lock on this
-            // same map and `RwLock` is not reentrant.
-            if removed {
-                ctx.persist();
-            }
-            ctx.policy_bindings.read().ok().and_then(|b| {
-                b.get(&sm_context_ref)
-                    .and_then(|b| b.sm_context_status_uri.clone())
-            })
-        });
-        removed
-    };
+    // #912 review M3: the whole release, not only the PFCP map entry: the binding,
+    // session and address (`take_sm_context`), the SM policy and the effects at the
+    // UDM, the EASDF and the AMF (`complete_sm_context_release`). Before, the context
+    // stayed half-live and every later request for it found it.
+    let uri = crate::complete_sm_context_release(&sm_context_ref);
     log::warn!(
         "UPF has no context for SEID {upf_seid:#x} (sm_context_ref={sm_context_ref}): the SMF \
-         and the UPF disagreed about a session. Dropped locally so it is no longer treated as \
-         live; the UE must re-establish."
+         and the UPF disagreed about a session. Released locally so it is no longer treated \
+         as live; the UE must re-establish."
     );
     crate::send_sm_context_status_notification(
         uri.as_deref(),
@@ -482,6 +497,11 @@ pub async fn notify_unrestorable_at_boot() -> (usize, usize) {
                     "unrestorable session {} was already gone",
                     entry.sm_context_ref
                 );
+            }
+            // #912 review M3: the restored allocation goes back too; nothing else
+            // holds it, since the binding that named it could not be read.
+            if let Some(ip) = entry.ue_ip {
+                ctx.ipv4_pool.release(std::net::Ipv4Addr::from(ip));
             }
             // After the write guard drops: `persist` re-reads the same map.
             ctx.persist();
@@ -943,6 +963,7 @@ mod tests {
             }
             let mut pending = ctx.unrestorable_sessions.write().expect("pending");
             pending.push(crate::context::UnrestorableSession {
+                ue_ip: None,
                 sm_context_ref: "boot-orphan-ref".to_string(),
                 status_uri: Some(sink.uri.clone()),
                 reason: "policy binding could not be restored: test".to_string(),
@@ -994,6 +1015,7 @@ mod tests {
             }
             let mut pending = ctx.unrestorable_sessions.write().expect("pending");
             pending.push(crate::context::UnrestorableSession {
+                ue_ip: None,
                 sm_context_ref: "boot-mute-ref".to_string(),
                 status_uri: None,
                 reason: "policy binding could not be restored: test".to_string(),
@@ -1034,6 +1056,7 @@ mod tests {
             }
             let mut pending = ctx.unrestorable_sessions.write().expect("pending");
             pending.push(crate::context::UnrestorableSession {
+                ue_ip: None,
                 sm_context_ref: "boot-once-ref".to_string(),
                 status_uri: Some(sink.uri.clone()),
                 reason: "policy binding could not be restored: test".to_string(),
@@ -1050,6 +1073,37 @@ mod tests {
         assert_eq!(first, (1, 0));
         assert_eq!(second, (0, 0), "the list must be drained, not re-read");
         assert_eq!(posts, 1);
+    }
+
+    /// #912 review N3: boot frees the restored address of a session whose binding could
+    /// not be read (salvaged as `ue_ip`); nothing else holds it.
+    #[tokio::test]
+    async fn boot_frees_the_address_of_an_unrestorable_session() {
+        let _state = PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = N4_TEST_LOCK.lock().await;
+        let ip = std::net::Ipv4Addr::new(10, 45, 9, 31);
+        {
+            let global = crate::context::smf_self();
+            let ctx = global.read().expect("smf context");
+            assert!(
+                ctx.ipv4_pool.reserve(ip),
+                "precondition: the restored allocation"
+            );
+            ctx.unrestorable_sessions.write().expect("pending").push(
+                crate::context::UnrestorableSession {
+                    ue_ip: Some(ip.octets()),
+                    sm_context_ref: "boot-free-ref".to_string(),
+                    status_uri: None,
+                    reason: "policy binding could not be restored: test".to_string(),
+                },
+            );
+        }
+        let _ = notify_unrestorable_at_boot().await;
+        let global = crate::context::smf_self();
+        let ctx = global.read().expect("smf context");
+        let freed = ctx.ipv4_pool.reserve(ip);
+        ctx.ipv4_pool.release(ip);
+        assert!(freed, "the address is back in the pool");
     }
 
     /// #193 criterion 4: with nothing restored there is nothing to signal.

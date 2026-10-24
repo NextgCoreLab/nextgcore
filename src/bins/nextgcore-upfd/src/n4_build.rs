@@ -27,6 +27,9 @@ pub mod pfcp_type {
     pub const SESSION_DELETION_RESPONSE: u8 = 55;
     pub const SESSION_REPORT_REQUEST: u8 = 56;
     pub const SESSION_REPORT_RESPONSE: u8 = 57;
+    /// Node Report Request / Response (Table 7.3-1), #935.
+    pub const NODE_REPORT_REQUEST: u8 = 12;
+    pub const NODE_REPORT_RESPONSE: u8 = 13;
 }
 
 // ============================================================================
@@ -129,6 +132,14 @@ pub mod pfcp_ie {
     pub const PDR_ID: u16 = 56;
     pub const F_SEID: u16 = 57;
     pub const NODE_ID: u16 = 60;
+    /// Node Report Type (§8.2.69): octet 5 bit 1 UPFR, bit 2 UPRR.
+    pub const NODE_REPORT_TYPE: u16 = 101;
+    /// User Plane Path Failure Report (Table 7.4.5.1.2-1).
+    pub const USER_PLANE_PATH_FAILURE_REPORT: u16 = 102;
+    /// Remote GTP-U Peer (§8.2.70).
+    pub const REMOTE_GTP_U_PEER: u16 = 103;
+    /// User Plane Path Recovery Report (Table 7.4.5.1.3-1).
+    pub const USER_PLANE_PATH_RECOVERY_REPORT: u16 = 187;
     pub const MEASUREMENT_METHOD: u16 = 62;
     pub const USAGE_REPORT_TRIGGER: u16 = 63;
     /// TS 29.244 §8.2.37. Parsed since #306: the PERIO reporting-trigger FLAG was
@@ -1946,6 +1957,44 @@ pub fn upf_function_features() -> Vec<u8> {
     buf.to_vec()
 }
 
+/// A PFCP Node Report Request reporting N3/N9 user-plane path FAILURE (`failure`)
+/// or RECOVERY for `peers` (#935, TS 29.244 §7.4.5.1): Node ID, the Node Report Type
+/// with UPFR or UPRR, and a User Plane Path Failure Report (IE 102) or a User Plane
+/// Path Recovery Report (IE 187) listing each peer as a Remote GTP-U Peer (§8.2.70:
+/// V4 = bit 2, V6 = bit 1 of the flags octet).
+pub fn build_node_report_request(
+    node_id: &NodeId,
+    failure: bool,
+    peers: &[std::net::IpAddr],
+) -> Vec<u8> {
+    let mut b = PfcpMessageBuilder::new();
+    b.add_node_id(node_id);
+    b.add_u8(pfcp_ie::NODE_REPORT_TYPE, if failure { 0x01 } else { 0x02 });
+    let mut report = PfcpMessageBuilder::new();
+    for peer in peers {
+        let value = match peer {
+            std::net::IpAddr::V4(v4) => {
+                let mut v = vec![0x02];
+                v.extend_from_slice(&v4.octets());
+                v
+            }
+            std::net::IpAddr::V6(v6) => {
+                let mut v = vec![0x01];
+                v.extend_from_slice(&v6.octets());
+                v
+            }
+        };
+        report.add_tlv(pfcp_ie::REMOTE_GTP_U_PEER, &value);
+    }
+    let ie = if failure {
+        pfcp_ie::USER_PLANE_PATH_FAILURE_REPORT
+    } else {
+        pfcp_ie::USER_PLANE_PATH_RECOVERY_REPORT
+    };
+    b.add_tlv(ie, &report.build());
+    b.build()
+}
+
 /// Build Association Setup Response
 ///
 /// `sessions_retained` sets PSREI in a PFCPASRsp-Flags IE (TS 29.244 §6.2.6.2.2,
@@ -2027,12 +2076,11 @@ pub fn parse_recovery_time_stamp(payload: &[u8]) -> Option<u32> {
     let ies = ParsedIe::parse_all(payload);
     ParsedIe::find_ie(&ies, pfcp_ie::RECOVERY_TIME_STAMP).and_then(|ie| {
         if ie.value.len() >= 4 {
-            Some(u32::from_be_bytes([
-                ie.value[0],
-                ie.value[1],
-                ie.value[2],
-                ie.value[3],
-            ]))
+            // #995: in the NTP reading, so a pre-#995 peer's Unix-seconds stamp
+            // compares with an NTP one.
+            Some(nextgcore_pfcp::recovery_time::normalize_received(
+                u32::from_be_bytes([ie.value[0], ie.value[1], ie.value[2], ie.value[3]]),
+            ))
         } else {
             None
         }
