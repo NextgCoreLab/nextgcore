@@ -1650,10 +1650,21 @@ impl PolicyBinding {
 pub struct FarPeer {
     /// The remote GTP-U peer (gNB/eNB, SGW-U, or another UPF).
     pub ip: std::net::IpAddr,
+    /// Its IPv6 address too, for a dual-stack Outer Header Creation (#1028 review m4).
+    #[serde(default)]
+    pub ip6: Option<std::net::IpAddr>,
     /// Destination Interface Access (TS 29.244 §8.2.24): the AN side, N3 or S1-U/S5-U.
     pub access: bool,
     /// Whether the FAR forwards (Apply Action FORW); a buffering FAR sends nothing.
     pub forwarding: bool,
+}
+
+impl FarPeer {
+    /// Whether `peer` is this FAR's GTP-U peer, by either of its addresses.
+    pub fn matches(&self, peer: std::net::IpAddr) -> bool {
+        let peer = peer.to_canonical();
+        self.ip.to_canonical() == peer || self.ip6.is_some_and(|a| a.to_canonical() == peer)
+    }
 }
 
 pub const FIVE_G_CP_SEID_BASE: u64 = 1 << 48;
@@ -1809,6 +1820,12 @@ pub struct SmfContext {
     /// context with the session map, so a restored session is still found.
     pub far_peers: RwLock<HashMap<u64, std::collections::BTreeMap<u32, FarPeer>>>,
 
+    /// The GTP-U paths a UPF reported failed and not recovered, as "UPF key|peer IP"
+    /// → when, in Unix seconds (#1028 review m2). A UP function reports a transition
+    /// once, so without this a path still down across a restart was never held or
+    /// released. Persisted; the boot re-arms each hold for what is left of it.
+    pub failed_up_paths: RwLock<HashMap<String, u64>>,
+
     /// SM policy bindings: sm_context_ref -> PCF policy association + GSM FSM
     pub policy_bindings: RwLock<HashMap<String, PolicyBinding>>,
 
@@ -1938,6 +1955,7 @@ impl SmfContext {
             upf_ul_endpoints: RwLock::new(HashMap::new()),
             cp_n4_seids: RwLock::new(HashMap::new()),
             far_peers: RwLock::new(HashMap::new()),
+            failed_up_paths: RwLock::new(HashMap::new()),
             unrestorable_sessions: RwLock::new(Vec::new()),
             policy_bindings: RwLock::new(HashMap::new()),
             upf_recovery_time_stamps: RwLock::new(HashMap::new()),
@@ -2138,6 +2156,11 @@ impl SmfContext {
             "upfRecoveryTimeStamps": upf_rts,
             "cpN4Seids": cp_n4_seids,
             "farPeers": far_peers,
+            "failedUpPaths": self
+                .failed_up_paths
+                .read()
+                .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect::<std::collections::BTreeMap<_, _>>())
+                .unwrap_or_default(),
             "bootEpoch": self.boot_epoch.load(Ordering::SeqCst),
         })
     }
@@ -2343,6 +2366,14 @@ impl SmfContext {
         if let Ok(mut map) = self.far_peers.write() {
             map.extend(far_peers);
         }
+        // #1028 review m2: absent before it existed, which means none.
+        let failed_up_paths: HashMap<String, u64> = doc
+            .get("failedUpPaths")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        if let Ok(mut map) = self.failed_up_paths.write() {
+            map.extend(failed_up_paths);
+        }
         let mut n_addrs = 0usize;
         for addr in &ipv4_allocations {
             if self.ipv4_pool.reserve(*addr) {
@@ -2383,6 +2414,76 @@ impl SmfContext {
              Association Setup if the UPF reports a changed Recovery Time Stamp."
         );
         Ok(restored)
+    }
+
+    /// Learn the GTP-U peers of the session with SMF-side SEID `smf_seid` from one of
+    /// this SMF's own session requests and the UPF's answer (#994).
+    ///
+    /// An accepted Establishment or Modification applies its Create, Update and
+    /// Remove FAR IEs; an accepted Deletion, or any answer that the session does not
+    /// exist (cause 65), forgets the session. A change to a durable (5G) session's
+    /// peers is persisted at once (#1028 review M1): an N3 peer installed or moved by
+    /// a modification (the N2 setup response, a Service Request, a handover) must
+    /// survive a restart, or a later path failure misses the session, or releases
+    /// one that moved. Returns whether anything changed.
+    pub fn note_far_edits(
+        &self,
+        smf_seid: u64,
+        msg_type: u8,
+        request: &[u8],
+        response: &[u8],
+    ) -> bool {
+        use crate::pfcp_path::pfcp_message_type as mt;
+        let cause = crate::pfcp_path::parse_cause(response);
+        let changed = {
+            let Ok(mut map) = self.far_peers.write() else {
+                return false;
+            };
+            let before = map.get(&smf_seid).cloned();
+            match (msg_type, cause) {
+                (mt::SESSION_ESTABLISHMENT_REQUEST | mt::SESSION_MODIFICATION_REQUEST, Some(1)) => {
+                    let fars = map.entry(smf_seid).or_default();
+                    if msg_type == mt::SESSION_ESTABLISHMENT_REQUEST {
+                        fars.clear();
+                    }
+                    crate::up_path::apply_far_edits(fars, request);
+                    if fars.is_empty() {
+                        map.remove(&smf_seid);
+                    }
+                }
+                (mt::SESSION_DELETION_REQUEST, Some(1))
+                | (mt::SESSION_MODIFICATION_REQUEST | mt::SESSION_DELETION_REQUEST, Some(65)) => {
+                    map.remove(&smf_seid);
+                }
+                _ => {}
+            }
+            map.get(&smf_seid) != before.as_ref()
+        };
+        if changed && self.is_durable_session_seid(smf_seid) {
+            self.persist();
+        }
+        changed
+    }
+
+    /// Whether `smf_seid` is a 5G session's, the kind the snapshot carries.
+    fn is_durable_session_seid(&self, smf_seid: u64) -> bool {
+        let refs: Vec<String> = self
+            .pfcp_sessions
+            .read()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+        let inherited = self
+            .cp_n4_seids
+            .read()
+            .map(|m| m.clone())
+            .unwrap_or_default();
+        refs.iter().any(|r| {
+            inherited
+                .get(r)
+                .copied()
+                .unwrap_or_else(|| derive_cp_n4_seid(r))
+                == smf_seid
+        })
     }
 
     /// Write the snapshot after a mutation. A no-op with no state file, and
@@ -4079,6 +4180,7 @@ mod tests {
         let path = temp_state_path("far-peers");
         let peer = FarPeer {
             ip: "10.0.0.5".parse().unwrap(),
+            ip6: None,
             access: true,
             forwarding: true,
         };
@@ -4118,6 +4220,86 @@ mod tests {
         );
         assert!(!m.contains_key(&0x0777), "only restored sessions' peers");
         drop(m);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #1028 review M1: the N3 peer a modification installs or moves is persisted
+    /// by the edit itself, with no other write to carry it, so a restart restores
+    /// the session's current gNB. #1028 review m2: so are the failed paths.
+    #[test]
+    fn far_peer_edits_and_failed_paths_are_persisted_as_they_happen() {
+        use crate::n4_build::{
+            build_create_far, build_session_modification_request, FarParams, PfcpMessageBuilder,
+            SessionModificationParams,
+        };
+        let path = temp_state_path("far-edits");
+        let accepted = [0u8, 19, 0, 1, 1];
+        let seid = derive_cp_n4_seid("10281");
+        {
+            let ctx = ctx_with_state(&path);
+            ctx.pfcp_sessions
+                .write()
+                .unwrap()
+                .insert("10281".to_string(), 0x1028);
+            let far = build_create_far(&FarParams {
+                far_id: 2,
+                apply_action: crate::n4_build::apply_action::FORW,
+                destination_interface: Some(0),
+                outer_header_creation: Some((0x0100, 0x77, Some([10, 0, 0, 5]), None)),
+                network_instance: None,
+            });
+            let mut est = PfcpMessageBuilder::new();
+            est.add_tlv(crate::n4_build::pfcp_ie::CREATE_FAR, &far);
+            assert!(ctx.note_far_edits(seid, 50, &est.build(), &accepted));
+            // A handover to the gNB at 10.0.0.6.
+            let moved = build_session_modification_request(&SessionModificationParams {
+                update_fars_activate: vec![(
+                    2,
+                    0,
+                    Some((0x0100, 0x78, Some([10, 0, 0, 6]), None)),
+                    false,
+                )],
+                ..Default::default()
+            });
+            assert!(ctx.note_far_edits(seid, 52, &moved, &accepted));
+            assert!(
+                !ctx.note_far_edits(seid, 52, &moved, &accepted),
+                "no change"
+            );
+            // No explicit persist: the edits wrote the snapshot themselves.
+        }
+        let restored = ctx_with_state(&path);
+        let peer = restored
+            .far_peers
+            .read()
+            .unwrap()
+            .get(&seid)
+            .and_then(|f| f.get(&2))
+            .copied();
+        assert_eq!(peer.map(|p| p.ip), Some("10.0.0.6".parse().unwrap()));
+        drop(restored);
+        let _ = std::fs::remove_file(&path);
+
+        // The failed paths go into the snapshot and come back.
+        let path = temp_state_path("failed-paths");
+        {
+            let ctx = ctx_with_state(&path);
+            ctx.failed_up_paths
+                .write()
+                .unwrap()
+                .insert("upf-a.example:8805|10.0.0.9".to_string(), 1_700_000_000);
+            ctx.persist();
+        }
+        let restored = ctx_with_state(&path);
+        assert_eq!(
+            restored
+                .failed_up_paths
+                .read()
+                .unwrap()
+                .get("upf-a.example:8805|10.0.0.9")
+                .copied(),
+            Some(1_700_000_000)
+        );
         let _ = std::fs::remove_file(&path);
     }
 

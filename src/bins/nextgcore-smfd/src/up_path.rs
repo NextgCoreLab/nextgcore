@@ -20,7 +20,10 @@
 //!   toward the peer go to BUFF|NOCP, so downlink data is buffered and reported, and
 //!   the UE is paged instead of the data being sent into the failed path. For an N3
 //!   FAR, the NG-RAN is told to release the session's resources through the AMF, whose
-//!   path is not the failed one.
+//!   path is not the failed one. Step 4 also removes the AN Tunnel Info; this SMF
+//!   keeps the Outer Header Creation on the buffering FAR instead (#1028 review m6).
+//!   It sends nothing while BUFF is set, the next activation replaces it, and it is
+//!   how the hold below tells "still points at the failed peer" from "moved".
 //! - **After the hold**, a session whose tunnel still points at the peer, i.e. no
 //!   Service Request has moved it, is released: PFCP deletion, then a PDU Session
 //!   Release with #39 so the UE re-establishes it; an EPC PDN connection is deleted at
@@ -77,6 +80,7 @@ pub mod cause {
     pub const REQUEST_ACCEPTED: u8 = 1;
     pub const MANDATORY_IE_MISSING: u8 = 66;
     pub const CONDITIONAL_IE_MISSING: u8 = 67;
+    pub const MANDATORY_IE_INCORRECT: u8 = 69;
     pub const NO_ESTABLISHED_PFCP_ASSOCIATION: u8 = 72;
 }
 
@@ -91,39 +95,11 @@ pub mod cause {
 /// FAR IEs; an accepted Deletion, or any answer that the session does not exist
 /// (cause 65), forgets the session.
 pub fn note_session_request(smf_seid: u64, msg_type: u8, request: &[u8], response: &[u8]) {
-    let cause = crate::pfcp_path::parse_cause(response);
     let handle = smf_self();
     let Ok(ctx) = handle.read() else {
         return;
     };
-    let Ok(mut map) = ctx.far_peers.write() else {
-        return;
-    };
-    match (msg_type, cause) {
-        (
-            pfcp_message_type::SESSION_ESTABLISHMENT_REQUEST
-            | pfcp_message_type::SESSION_MODIFICATION_REQUEST,
-            Some(cause::REQUEST_ACCEPTED),
-        ) => {
-            let fars = map.entry(smf_seid).or_default();
-            if msg_type == pfcp_message_type::SESSION_ESTABLISHMENT_REQUEST {
-                fars.clear();
-            }
-            apply_far_edits(fars, request);
-            if fars.is_empty() {
-                map.remove(&smf_seid);
-            }
-        }
-        (pfcp_message_type::SESSION_DELETION_REQUEST, Some(cause::REQUEST_ACCEPTED))
-        | (
-            pfcp_message_type::SESSION_MODIFICATION_REQUEST
-            | pfcp_message_type::SESSION_DELETION_REQUEST,
-            Some(65),
-        ) => {
-            map.remove(&smf_seid);
-        }
-        _ => {}
-    }
+    ctx.note_far_edits(smf_seid, msg_type, request, response);
 }
 
 /// Forget the GTP-U peers of these sessions (a teardown that flushed them).
@@ -148,11 +124,12 @@ pub fn apply_far_edits(fars: &mut BTreeMap<u32, FarPeer>, body: &[u8]) {
                     .unwrap_or(0);
                 let fp = find_ie(v, pfcp_ie::FORWARDING_PARAMETERS);
                 match fp.and_then(|fp| peer_of(fp, None)) {
-                    Some((ip, access)) => {
+                    Some(((ip, ip6), access)) => {
                         fars.insert(
                             id,
                             FarPeer {
                                 ip,
+                                ip6,
                                 access,
                                 forwarding: action & apply_action::FORW != 0,
                             },
@@ -168,8 +145,10 @@ pub fn apply_far_edits(fars: &mut BTreeMap<u32, FarPeer>, body: &[u8]) {
                 let known = fars.get(&id).copied();
                 let peer = find_ie(v, pfcp_ie::UPDATE_FORWARDING_PARAMETERS)
                     .and_then(|ufp| peer_of(ufp, known.map(|k| k.access)))
-                    .or(known.map(|k| (k.ip, k.access)));
-                let Some((ip, access)) = peer else { continue };
+                    .or(known.map(|k| ((k.ip, k.ip6), k.access)));
+                let Some(((ip, ip6), access)) = peer else {
+                    continue;
+                };
                 let forwarding = find_ie(v, pfcp_ie::APPLY_ACTION)
                     .map(|a| crate::n4_build::decode_apply_action(a) & apply_action::FORW != 0)
                     .or(known.map(|k| k.forwarding))
@@ -178,6 +157,7 @@ pub fn apply_far_edits(fars: &mut BTreeMap<u32, FarPeer>, body: &[u8]) {
                     id,
                     FarPeer {
                         ip,
+                        ip6,
                         access,
                         forwarding,
                     },
@@ -216,37 +196,48 @@ fn far_id(far: &[u8]) -> Option<u32> {
         .map(|v| u32::from_be_bytes([v[0], v[1], v[2], v[3]]))
 }
 
-/// The GTP-U peer of a (Update) Forwarding Parameters IE, and whether its Destination
-/// Interface is Access (§8.2.24, value 0); `access_default` when the IE has none.
-fn peer_of(fp: &[u8], access_default: Option<bool>) -> Option<(IpAddr, bool)> {
-    let ip = find_ie(fp, pfcp_ie::OUTER_HEADER_CREATION).and_then(outer_header_ip)?;
+/// The GTP-U peer of a (Update) Forwarding Parameters IE (its address, and a second
+/// IPv6 one for a dual-stack header), and whether its Destination Interface is
+/// Access (§8.2.24, value 0); `access_default` when the IE has none.
+fn peer_of(fp: &[u8], access_default: Option<bool>) -> Option<((IpAddr, Option<IpAddr>), bool)> {
+    let addrs = find_ie(fp, pfcp_ie::OUTER_HEADER_CREATION).and_then(outer_header_ips)?;
     let access = find_ie(fp, pfcp_ie::DESTINATION_INTERFACE)
         .and_then(|v| v.first())
         .map(|di| di & 0x0f == 0)
         .or(access_default)
         .unwrap_or(false);
-    Some((ip, access))
+    Some((addrs, access))
 }
 
-/// The address of an Outer Header Creation IE (TS 29.244 §8.2.56): octets 5-6 are
+/// The addresses of an Outer Header Creation IE (TS 29.244 §8.2.56): octets 5-6 are
 /// the description, then a TEID when it is GTP-U (octet 5 bit 1 or 2), then IPv4
-/// (bit 1 or 3) and/or IPv6 (bit 2 or 4).
-pub fn outer_header_ip(v: &[u8]) -> Option<IpAddr> {
+/// (bit 1, 3 or 5) and IPv6 (bit 2, 4 or 6), in that order. The first is returned,
+/// and the IPv6 one second when both are present (#1028 review m4: a dual-stack
+/// gNB's failure may name either).
+pub fn outer_header_ips(v: &[u8]) -> Option<(IpAddr, Option<IpAddr>)> {
     let desc = *v.first()?;
-    // Bit 1 GTP-U/UDP/IPv4, 2 GTP-U/UDP/IPv6, 3 UDP/IPv4, 4 UDP/IPv6, 5 IPv4, 6 IPv6.
     let gtpu = desc & 0x03 != 0;
     let has_v4 = desc & 0x15 != 0;
     let has_v6 = desc & 0x2a != 0;
-    let off = 2 + if gtpu { 4 } else { 0 };
-    if has_v4 {
+    let mut off = 2 + if gtpu { 4 } else { 0 };
+    let v4 = if has_v4 {
         let a: [u8; 4] = v.get(off..off + 4)?.try_into().ok()?;
-        return Some(IpAddr::from(a));
-    }
-    if has_v6 {
+        off += 4;
+        Some(IpAddr::from(a))
+    } else {
+        None
+    };
+    let v6 = if has_v6 {
         let a: [u8; 16] = v.get(off..off + 16)?.try_into().ok()?;
-        return Some(IpAddr::from(a));
+        Some(IpAddr::from(a))
+    } else {
+        None
+    };
+    match (v4, v6) {
+        (Some(a), b) => Some((a, b)),
+        (None, Some(b)) => Some((b, None)),
+        (None, None) => None,
     }
-    None
 }
 
 // ============================================================================
@@ -368,7 +359,8 @@ pub struct NodeReport {
 }
 
 /// Decode a Node Report Request body (TS 29.244 §7.4.5.1). `Err((cause, offending
-/// IE))` for one that is missing a mandatory or conditional IE.
+/// IE))` for one that is missing a mandatory or conditional IE, or whose report names
+/// no decodable Remote GTP-U Peer (#1028 review m5).
 pub fn parse_node_report(body: &[u8]) -> Result<NodeReport, (u8, u16)> {
     if find_ie(body, ie::NODE_ID).is_none() {
         return Err((cause::MANDATORY_IE_MISSING, ie::NODE_ID));
@@ -381,7 +373,11 @@ pub fn parse_node_report(body: &[u8]) -> Result<NodeReport, (u8, u16)> {
             return Ok(Vec::new());
         }
         let v = find_ie(body, grouped).ok_or((cause::CONDITIONAL_IE_MISSING, grouped))?;
-        Ok(remote_peers(v))
+        let peers = remote_peers(v).map_err(|_| (cause::MANDATORY_IE_INCORRECT, grouped))?;
+        if peers.is_empty() {
+            return Err((cause::MANDATORY_IE_INCORRECT, grouped));
+        }
+        Ok(peers)
     };
     Ok(NodeReport {
         failed: peers(ie::USER_PLANE_PATH_FAILURE_REPORT, node_report_type::UPFR)?,
@@ -390,37 +386,21 @@ pub fn parse_node_report(body: &[u8]) -> Result<NodeReport, (u8, u16)> {
     })
 }
 
-/// The Remote GTP-U Peer IEs (§8.2.70) of a grouped report: flags octet (V4 bit 1,
-/// V6 bit 2), then the addresses; the optional Destination Interface and Network
-/// Instance after them are not needed here.
-fn remote_peers(grouped: &[u8]) -> Vec<IpAddr> {
+/// The Remote GTP-U Peer IEs (§8.2.70) of a grouped report, decoded by the shared
+/// library codec (#1028 review B1: octet 5 bit 1 is V6, bit 2 is V4). Each peer's
+/// IPv4 and IPv6 address both count.
+fn remote_peers(grouped: &[u8]) -> Result<Vec<IpAddr>, nextgcore_pfcp::PfcpError> {
+    let report = nextgcore_pfcp::types::UserPlanePathFailureReport::decode(grouped)?;
     let mut out = Vec::new();
-    for (t, v) in ies(grouped) {
-        if t != ie::REMOTE_GTP_U_PEER {
-            continue;
+    for peer in report.remote_gtpu_peers {
+        if let Some(v4) = peer.ipv4 {
+            out.push(IpAddr::from(v4));
         }
-        let Some(flags) = v.first() else { continue };
-        let mut off = 1;
-        if flags & 0x01 != 0 {
-            if let Some(a) = v
-                .get(off..off + 4)
-                .and_then(|a| <[u8; 4]>::try_from(a).ok())
-            {
-                out.push(IpAddr::from(a));
-            }
-            off += 4;
-        }
-        if flags & 0x02 != 0 {
-            if let Some(a) = v
-                .get(off..off + 16)
-                .and_then(|a| <[u8; 16]>::try_from(a).ok())
-            {
-                out.push(IpAddr::from(a));
-            }
+        if let Some(v6) = peer.ipv6 {
+            out.push(IpAddr::from(v6).to_canonical());
         }
     }
-    out.iter_mut().for_each(|a| *a = a.to_canonical());
-    out
+    Ok(out)
 }
 
 /// The Node Report Response (TS 29.244 §7.4.5.2): this SMF's Node ID and the Cause,
@@ -518,7 +498,7 @@ pub fn affected_sessions(
         let hits: Vec<(u32, bool)> = fars
             .iter()
             .filter(|(_, p)| {
-                peers.contains(&p.ip.to_canonical()) && (p.forwarding || !forwarding_only)
+                peers.iter().any(|ip| p.matches(*ip)) && (p.forwarding || !forwarding_only)
             })
             .map(|(id, p)| (*id, p.access))
             .collect();
@@ -562,7 +542,9 @@ const PATH_FANOUT: usize = 16;
 /// Called on the N4 receive task after the response went out: the state changes
 /// here are synchronous, the per-session work runs in tracked tasks.
 pub fn on_node_report(upf_key: &str, scope: SessionScope, report: NodeReport) {
+    let hold = hold_duration();
     let mut newly_failed = Vec::new();
+    let mut durable_changed = false;
     if let Ok(mut failed) = failed_paths().lock() {
         for ip in &report.failed {
             let key = (upf_key.to_string(), *ip);
@@ -585,8 +567,32 @@ pub fn on_node_report(upf_key: &str, scope: SessionScope, report: NodeReport) {
             }
         }
     }
+    // #1028 review m2: a UP function reports a transition once, so the failed paths
+    // and when they failed are durable: a path still down across a restart is held
+    // and released as TS 23.007 §20.3.1 requires.
+    {
+        let handle = smf_self();
+        if let Ok(ctx) = handle.read() {
+            if let Ok(mut durable) = ctx.failed_up_paths.write() {
+                let now = unix_now();
+                for (ip, _) in &newly_failed {
+                    durable.insert(durable_key(upf_key, *ip), now);
+                    durable_changed = true;
+                }
+                for ip in &report.recovered {
+                    durable_changed |= durable.remove(&durable_key(upf_key, *ip)).is_some();
+                }
+            }
+            if durable_changed {
+                ctx.persist();
+            }
+        };
+    }
+    // #1028 review m3: with no hold the release follows at once, so the separate
+    // N2-only deactivation would race its #39 for the same session.
     let deactivate: HashSet<IpAddr> = newly_failed
         .iter()
+        .filter(|_| !hold.is_zero())
         .map(|(ip, _)| *ip)
         .chain(report.restarted.iter().copied())
         .collect();
@@ -602,22 +608,77 @@ pub fn on_node_report(upf_key: &str, scope: SessionScope, report: NodeReport) {
                 format!(", peer GTP-U restart of {:?}", report.restarted)
             },
             affected.len(),
-            hold_duration().as_secs()
+            hold.as_secs()
         );
         spawn_fanout(affected, "user plane path failure", Action::Deactivate);
     }
-    let hold = hold_duration();
     for (ip, generation) in newly_failed {
-        let upf_key = upf_key.to_string();
-        let timer = tokio::spawn(async move {
-            tokio::time::sleep(hold).await;
-            hold_expired(&upf_key, ip, generation);
-        });
-        if let Ok(mut holds) = hold_timers().lock() {
-            holds.retain(|h| !h.is_finished());
-            holds.push(timer.abort_handle());
-        }
+        arm_hold(upf_key, ip, generation, hold);
     }
+}
+
+/// Start the hold timer for a failed path.
+fn arm_hold(upf_key: &str, ip: IpAddr, generation: u64, hold: Duration) {
+    let upf_key = upf_key.to_string();
+    let timer = tokio::spawn(async move {
+        tokio::time::sleep(hold).await;
+        hold_expired(&upf_key, ip, generation);
+    });
+    if let Ok(mut holds) = hold_timers().lock() {
+        holds.retain(|h| !h.is_finished());
+        holds.push(timer.abort_handle());
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The snapshot key of a failed path: the UPF's identity and the peer.
+fn durable_key(upf_key: &str, ip: IpAddr) -> String {
+    format!("{upf_key}|{ip}")
+}
+
+/// Re-arm the holds of the failed paths the snapshot restored (#1028 review m2), for
+/// what is left of each. Run at boot, once the pool is installed. Returns how many.
+pub fn rearm_restored_holds() -> usize {
+    let entries: Vec<(String, u64)> = {
+        let handle = smf_self();
+        let Ok(ctx) = handle.read() else { return 0 };
+        let entries = ctx
+            .failed_up_paths
+            .read()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())
+            .unwrap_or_default();
+        entries
+    };
+    let hold = hold_duration();
+    let now = unix_now();
+    let mut armed = 0;
+    for (key, since) in entries {
+        let Some((upf_key, ip)) = key
+            .rsplit_once('|')
+            .and_then(|(k, ip)| Some((k.to_string(), ip.parse::<IpAddr>().ok()?)))
+        else {
+            continue;
+        };
+        let generation = GENERATION.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut failed) = failed_paths().lock() {
+            failed.insert((upf_key.clone(), ip), generation);
+        }
+        let left = hold.saturating_sub(Duration::from_secs(now.saturating_sub(since)));
+        log::warn!(
+            "UPF {upf_key}: GTP-U path to {ip} was down at the last shutdown; its sessions \
+             are released in {} s unless it recovers",
+            left.as_secs()
+        );
+        arm_hold(&upf_key, ip, generation, left);
+        armed += 1;
+    }
+    armed
 }
 
 /// The hold for `ip` at `upf_key` expired: release what still points there, if the
@@ -628,6 +689,20 @@ fn hold_expired(upf_key: &str, ip: IpAddr, generation: u64) {
         .is_ok_and(|m| m.get(&(upf_key.to_string(), ip)) == Some(&generation));
     if !still_down {
         return;
+    }
+    // Its hold is spent; a restart need not re-arm it (and a peer that never
+    // recovers does not stay in the snapshot for good).
+    {
+        let handle = smf_self();
+        if let Ok(ctx) = handle.read() {
+            let removed = ctx
+                .failed_up_paths
+                .write()
+                .is_ok_and(|mut m| m.remove(&durable_key(upf_key, ip)).is_some());
+            if removed {
+                ctx.persist();
+            }
+        };
     }
     let Some(client) = crate::pfcp_path::global_pool()
         .into_iter()
@@ -722,7 +797,7 @@ pub fn deactivate_after_error_indication(smf_seid: u64, peer: Option<IpAddr>) {
             .filter(|(_, p)| {
                 p.forwarding
                     && match peer {
-                        Some(ip) => p.ip.to_canonical() == ip.to_canonical(),
+                        Some(ip) => p.matches(ip),
                         None => p.access,
                     }
             })
@@ -759,6 +834,12 @@ pub(crate) fn reset_for_test() {
     if let Ok(mut m) = failed_paths().lock() {
         m.clear();
     }
+    let handle = smf_self();
+    if let Ok(ctx) = handle.read() {
+        if let Ok(mut m) = ctx.failed_up_paths.write() {
+            m.clear();
+        }
+    };
 }
 
 #[cfg(test)]
@@ -798,6 +879,7 @@ mod tests {
             fars.get(&2),
             Some(&FarPeer {
                 ip: "10.0.0.5".parse().unwrap(),
+                ip6: None,
                 access: true,
                 forwarding: true
             })
@@ -835,20 +917,23 @@ mod tests {
     }
 
     #[test]
-    fn an_outer_header_creation_names_its_address() {
+    fn an_outer_header_creation_names_its_addresses() {
         assert_eq!(
-            outer_header_ip(&[0x01, 0x00, 0, 0, 0, 1, 10, 0, 0, 7]),
-            Some("10.0.0.7".parse().unwrap())
+            outer_header_ips(&[0x01, 0x00, 0, 0, 0, 1, 10, 0, 0, 7]),
+            Some(("10.0.0.7".parse().unwrap(), None))
         );
-        let mut v6 = vec![0x02, 0x00, 0, 0, 0, 1];
-        v6.extend_from_slice(
-            &"2001:db8::7"
-                .parse::<std::net::Ipv6Addr>()
-                .unwrap()
-                .octets(),
+        let v6: std::net::Ipv6Addr = "2001:db8::7".parse().unwrap();
+        let mut only6 = vec![0x02, 0x00, 0, 0, 0, 1];
+        only6.extend_from_slice(&v6.octets());
+        assert_eq!(outer_header_ips(&only6), Some((IpAddr::V6(v6), None)));
+        // #1028 review m4: dual stack, both addresses.
+        let mut dual = vec![0x03, 0x00, 0, 0, 0, 1, 10, 0, 0, 7];
+        dual.extend_from_slice(&v6.octets());
+        assert_eq!(
+            outer_header_ips(&dual),
+            Some(("10.0.0.7".parse().unwrap(), Some(IpAddr::V6(v6))))
         );
-        assert_eq!(outer_header_ip(&v6), Some("2001:db8::7".parse().unwrap()));
-        assert_eq!(outer_header_ip(&[0x01, 0x00, 0, 0]), None, "truncated");
+        assert_eq!(outer_header_ips(&[0x01, 0x00, 0, 0]), None, "truncated");
     }
 
     fn report(report_type: u8, grouped: &[(u16, [u8; 4])]) -> Vec<u8> {
@@ -857,7 +942,8 @@ mod tests {
         b.add_tlv(ie::NODE_REPORT_TYPE, &[report_type]);
         for (t, ip) in grouped {
             let mut peer = PfcpMessageBuilder::new();
-            let mut v = vec![0x01];
+            // TS 29.244 §8.2.70: octet 5 bit 2 is V4.
+            let mut v = vec![0x02];
             v.extend_from_slice(ip);
             peer.add_tlv(ie::REMOTE_GTP_U_PEER, &v);
             b.add_tlv(*t, &peer.build());
@@ -904,6 +990,48 @@ mod tests {
         assert_eq!(
             parse_node_report(&[0, 60, 0, 5, 0, 10, 0, 0, 7]),
             Err((cause::MANDATORY_IE_MISSING, ie::NODE_REPORT_TYPE))
+        );
+    }
+
+    /// #1028 review B1: the bytes a conformant UP function sends (TS 29.244
+    /// §8.2.70, and nextgcore's upfd `build_node_report`): an IPv4 peer is
+    /// `[0x02, a, b, c, d]`, an IPv6 one `[0x01, 16 octets]`. A report naming none
+    /// that decodes is cause 69.
+    #[test]
+    fn remote_gtpu_peers_decode_as_the_spec_encodes_them() {
+        let body = |grouped: &[u8]| {
+            let mut b = vec![0, 60, 0, 5, 0, 10, 0, 0, 1, 0, 101, 0, 1, 0x01, 0, 102];
+            b.extend_from_slice(&(grouped.len() as u16).to_be_bytes());
+            b.extend_from_slice(grouped);
+            b
+        };
+        let v4 = body(&[0, 103, 0, 5, 0x02, 10, 0, 0, 5]);
+        assert_eq!(
+            parse_node_report(&v4).unwrap().failed,
+            vec!["10.0.0.5".parse::<IpAddr>().unwrap()]
+        );
+        let v6addr: std::net::Ipv6Addr = "2001:db8::5".parse().unwrap();
+        let mut g = vec![0, 103, 0, 17, 0x01];
+        g.extend_from_slice(&v6addr.octets());
+        assert_eq!(
+            parse_node_report(&body(&g)).unwrap().failed,
+            vec![IpAddr::V6(v6addr)]
+        );
+        assert_eq!(
+            parse_node_report(&body(&[0, 103, 0, 3, 0x02, 10, 0])),
+            Err((
+                cause::MANDATORY_IE_INCORRECT,
+                ie::USER_PLANE_PATH_FAILURE_REPORT
+            )),
+            "a truncated address"
+        );
+        assert_eq!(
+            parse_node_report(&body(&[])),
+            Err((
+                cause::MANDATORY_IE_INCORRECT,
+                ie::USER_PLANE_PATH_FAILURE_REPORT
+            )),
+            "no peer"
         );
     }
 

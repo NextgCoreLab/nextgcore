@@ -890,6 +890,8 @@ async fn main() -> Result<()> {
             client.seed_peer_recovery_time_stamp(rts).await;
         }
     }
+    // #1028 review m2: paths still failed at the last shutdown are held again.
+    up_path::rearm_restored_holds();
 
     // PFCP receive/dispatch loop: responses complete pending transactions;
     // node-level requests (heartbeat, association release) are answered by
@@ -6643,10 +6645,12 @@ async fn graceful_shutdown(
     release: bool,
     pfcp_listener: tokio::task::JoinHandle<()>,
 ) {
-    deregister.await;
-    // #994: a pending path-failure hold would release sessions after the deadline;
-    // the next incarnation hears the path state from the UPF again.
+    // #994, #1028 review m1: first, before the deregistration (up to its request
+    // timeout against a stalled NRF), so no hold expires into the shutdown and starts
+    // a #39 fan-out whose UEs would re-establish into NF_FAILOVER. The failed paths
+    // are durable, and the next incarnation re-arms what is left of each hold.
     up_path::abort_hold_timers();
+    deregister.await;
     // #928 round 2, M1: the #39 fan-outs a UPF restart or release started earlier
     // drain ALONGSIDE this shutdown's own releases, inside the same budget, not after.
     let fanouts = pfcp_path::drain_restart_fanouts(std::time::Duration::from_secs(5));
@@ -12815,7 +12819,8 @@ mod tests {
     /// A Node Report Request packet of `report_type` with one grouped report naming
     /// `peer`.
     fn node_report_packet(seq: u32, report_type: u8, grouped: u16, peer: [u8; 4]) -> Vec<u8> {
-        let mut remote = vec![0x01];
+        // TS 29.244 §8.2.70: octet 5 bit 2 is V4 (#1028 review B1).
+        let mut remote = vec![0x02];
         remote.extend_from_slice(&peer);
         let mut inner = vec![0, 103];
         inner.extend_from_slice(&(remote.len() as u16).to_be_bytes());
@@ -13234,6 +13239,128 @@ mod tests {
         assert!(
             seen.contains(&pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST),
             "{seen:?}"
+        );
+    }
+
+    /// #1028 review m2: a path the snapshot says was still failed is held again at
+    /// boot, for what is left of its hold, and its sessions are then released.
+    #[tokio::test]
+    async fn a_restored_failed_path_is_held_again_and_released() {
+        let _state = up_path::UP_PATH_TEST_LOCK.lock().await;
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        up_path::reset_for_test();
+        up_path::set_hold_for_test(Some(std::time::Duration::from_millis(200)));
+        let (amf, amf_port, _posts) = recording_amf().await;
+        let reference = session_toward_gnb(&upf, "imsi-001010000009947", 9, amf_port).await;
+        upf.clear_seen();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        smf_self()
+            .read()
+            .unwrap()
+            .failed_up_paths
+            .write()
+            .unwrap()
+            .insert(
+                format!("{}|127.0.0.9", upf.client.recovery_time_stamp_key()),
+                now,
+            );
+
+        let armed = up_path::rearm_restored_holds();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        pfcp_path::drain_restart_fanouts(std::time::Duration::from_secs(5)).await;
+        let seen = upf.seen();
+        up_path::reset_for_test();
+        forget_seeded_session(&reference);
+        amf.stop().await.ok();
+
+        assert_eq!(armed, 1);
+        assert!(
+            seen.contains(&pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST),
+            "{seen:?}"
+        );
+    }
+
+    /// #1028 review m1: a graceful shutdown stops the pending holds before it
+    /// deregisters, so a hold expiring during a slow deregistration releases
+    /// nothing into the shutdown.
+    #[tokio::test]
+    async fn a_shutdown_stops_the_holds_before_deregistering() {
+        let _state = up_path::UP_PATH_TEST_LOCK.lock().await;
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        up_path::reset_for_test();
+        up_path::set_hold_for_test(Some(std::time::Duration::from_millis(150)));
+        let (amf, amf_port, _posts) = recording_amf().await;
+        let reference = session_toward_gnb(&upf, "imsi-001010000009948", 10, amf_port).await;
+        let from = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let _ = deliver(
+            &upf,
+            &from,
+            &node_report_packet(0x99c, 0x01, 102, [127, 0, 0, 9]),
+        )
+        .await;
+        pfcp_path::drain_restart_fanouts(std::time::Duration::from_secs(5)).await;
+        upf.clear_seen();
+
+        let listener = tokio::spawn(async {});
+        graceful_shutdown(
+            tokio::time::sleep(std::time::Duration::from_millis(500)),
+            &[],
+            false,
+            listener,
+        )
+        .await;
+        pfcp_path::drain_restart_fanouts(std::time::Duration::from_secs(5)).await;
+        let seen = upf.seen();
+        up_path::reset_for_test();
+        forget_seeded_session(&reference);
+        amf.stop().await.ok();
+
+        assert!(
+            !seen.contains(&pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST),
+            "no release started during the shutdown: {seen:?}"
+        );
+    }
+
+    /// #1028 review m3: with no hold, a failure releases at once, and sends no
+    /// separate N2-only deactivation to race the #39.
+    #[tokio::test]
+    async fn with_no_hold_a_failure_releases_without_a_separate_deactivation() {
+        let _state = up_path::UP_PATH_TEST_LOCK.lock().await;
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        up_path::reset_for_test();
+        up_path::set_hold_for_test(Some(std::time::Duration::ZERO));
+        let (amf, amf_port, posts) = recording_amf().await;
+        let reference = session_toward_gnb(&upf, "imsi-001010000009949", 11, amf_port).await;
+        let from = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let _ = deliver(
+            &upf,
+            &from,
+            &node_report_packet(0x99d, 0x01, 102, [127, 0, 0, 9]),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        pfcp_path::drain_restart_fanouts(std::time::Duration::from_secs(5)).await;
+        let posted = posts.lock().unwrap().clone();
+        up_path::reset_for_test();
+        forget_seeded_session(&reference);
+        amf.stop().await.ok();
+
+        let n1n2: Vec<&String> = posted
+            .iter()
+            .filter(|(p, _)| p.ends_with("/n1-n2-messages"))
+            .map(|(_, j)| j)
+            .collect();
+        assert_eq!(n1n2.len(), 1, "{posted:?}");
+        assert!(
+            n1n2[0].contains("n1MessageContainer"),
+            "the #39 release only"
         );
     }
 
