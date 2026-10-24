@@ -216,14 +216,14 @@ pub async fn notify_ue_context_change(supi: &str, event: UeContextEvent) -> (usi
                 log::info!(
                     "EE MonitoringReport ({}) for {supi} -> {}: status={}",
                     event.ee_event_type(),
-                    sub.callback_reference,
+                    nextgcore_sbi::log_redact::redact_last_segment(&sub.callback_reference),
                     resp.status
                 );
                 ee_delivered += 1;
             }
             Err(e) => log::warn!(
                 "EE MonitoringReport to {} failed: {e}",
-                sub.callback_reference
+                nextgcore_sbi::log_redact::redact_last_segment(&sub.callback_reference)
             ),
         }
     }

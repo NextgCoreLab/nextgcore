@@ -437,6 +437,10 @@ pub struct SgwcContext {
     bearer_list: RwLock<HashMap<u64, SgwcBearer>>,
     /// Tunnel list (by pool ID)
     tunnel_list: RwLock<HashMap<u64, SgwcTunnel>>,
+    /// Downlink tunnels by the remote peer (eNodeB) they forward to, kept with
+    /// `tunnel_list` (#1014 review): a user plane path failure releases the UEs
+    /// toward one eNodeB without a scan of every UE.
+    dl_peer_index: RwLock<HashMap<std::net::IpAddr, std::collections::HashSet<u64>>>,
 
     // Hash tables
     /// IMSI -> UE ID hash
@@ -503,6 +507,7 @@ impl SgwcContext {
             sess_list: RwLock::new(HashMap::new()),
             bearer_list: RwLock::new(HashMap::new()),
             tunnel_list: RwLock::new(HashMap::new()),
+            dl_peer_index: RwLock::new(HashMap::new()),
             imsi_hash: RwLock::new(HashMap::new()),
             sgw_s11_teid_hash: RwLock::new(HashMap::new()),
             sgwc_sxa_seid_hash: RwLock::new(HashMap::new()),
@@ -799,6 +804,14 @@ impl SgwcContext {
         }
     }
 
+    /// Every session, cloned (#1010 review: restored on a restarted SGW-U).
+    pub fn sess_list_all(&self) -> Vec<SgwcSess> {
+        match self.sess_list.read() {
+            Ok(list) => list.values().cloned().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Remove all UEs
     pub fn ue_remove_all(&self) {
         let ids: Vec<u64> = {
@@ -814,6 +827,14 @@ impl SgwcContext {
     }
 
     /// Find UE by ID
+    /// Every UE context's id.
+    pub fn ue_ids(&self) -> Vec<u64> {
+        self.sgwc_ue_list
+            .read()
+            .map(|l| l.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
     pub fn ue_find_by_id(&self, id: u64) -> Option<SgwcUe> {
         self.sgwc_ue_list.read().ok()?.get(&id).cloned()
     }
@@ -1129,6 +1150,7 @@ impl SgwcContext {
         let mut tunnel_list = self.tunnel_list.write().ok()?;
 
         if let Some(tunnel) = tunnel_list.remove(&id) {
+            self.index_dl_peer(Some(&tunnel), None);
             // Remove tunnel from bearer's tunnel list
             if let Ok(mut bearer_list) = self.bearer_list.write() {
                 if let Some(bearer) = bearer_list.get_mut(&tunnel.bearer_id) {
@@ -1187,24 +1209,94 @@ impl SgwcContext {
         self.tunnel_find_by_interface_type(bearer_id, gtp_interface::S1_U_SGW_GTP_U)
     }
 
-    /// Update tunnel in context
+    /// Update tunnel in context.
+    ///
+    /// A changed remote endpoint, or a generation the writer advanced, is a new
+    /// generation (the Modify Bearer rollback compares it, #987/#991). Writers
+    /// must therefore re-read the tunnel just before updating it: writing back
+    /// an older clone counts as a write and blocks a legitimate rollback (and
+    /// would clobber the endpoint anyway).
     pub fn tunnel_update(&self, tunnel: &SgwcTunnel) -> bool {
         if let Ok(mut list) = self.tunnel_list.write() {
             let mut tunnel = tunnel.clone();
             if let Some(old) = list.get(&tunnel.id) {
                 let moved = old.remote_teid != tunnel.remote_teid
                     || old.remote_ip.ipv4 != tunnel.remote_ip.ipv4
-                    || old.remote_ip.ipv6 != tunnel.remote_ip.ipv6;
+                    || old.remote_ip.ipv6 != tunnel.remote_ip.ipv6
+                    // A writer that advanced the generation itself marks a
+                    // write even when the values are unchanged (#991 review).
+                    || tunnel.generation != old.generation;
                 tunnel.generation = if moved {
                     old.generation.wrapping_add(1)
                 } else {
                     old.generation
                 };
             }
-            list.insert(tunnel.id, tunnel);
+            let old = list.insert(tunnel.id, tunnel.clone());
+            // Under the tunnel list's lock, so the index never disagrees with it.
+            self.index_dl_peer(old.as_ref(), Some(&tunnel));
             return true;
         }
         false
+    }
+
+    /// The remote peers a downlink tunnel forwards to: none until it has a remote
+    /// TEID (an S1-U released, or not yet set up, forwards nowhere).
+    fn dl_peers_of(tunnel: &SgwcTunnel) -> Vec<std::net::IpAddr> {
+        if tunnel.interface_type != gtp_interface::S5_S8_SGW_GTP_U || tunnel.remote_teid == 0 {
+            return Vec::new();
+        }
+        tunnel
+            .remote_ip
+            .ipv4
+            .map(std::net::IpAddr::from)
+            .into_iter()
+            .chain(tunnel.remote_ip.ipv6.map(std::net::IpAddr::from))
+            .collect()
+    }
+
+    /// Move a tunnel's entry in `dl_peer_index` from `old` to `new`. Called with
+    /// the tunnel list's write lock held; the index lock is always taken second.
+    fn index_dl_peer(&self, old: Option<&SgwcTunnel>, new: Option<&SgwcTunnel>) {
+        let Ok(mut index) = self.dl_peer_index.write() else {
+            return;
+        };
+        if let Some(old) = old {
+            for peer in Self::dl_peers_of(old) {
+                if let Some(set) = index.get_mut(&peer) {
+                    set.remove(&old.id);
+                    if set.is_empty() {
+                        index.remove(&peer);
+                    }
+                }
+            }
+        }
+        if let Some(new) = new {
+            for peer in Self::dl_peers_of(new) {
+                index.entry(peer).or_default().insert(new.id);
+            }
+        }
+    }
+
+    /// The UEs with a downlink tunnel forwarding to `peer` (#1014 review), from the
+    /// index rather than a scan of every UE.
+    pub fn ue_ids_with_downlink_toward(&self, peer: std::net::IpAddr) -> Vec<u64> {
+        let tunnel_ids: Vec<u64> = match self.dl_peer_index.read() {
+            Ok(index) => index
+                .get(&peer)
+                .map(|s| s.iter().copied().collect())
+                .unwrap_or_default(),
+            Err(_) => return Vec::new(),
+        };
+        let mut ues: Vec<u64> = tunnel_ids
+            .into_iter()
+            .filter_map(|t| self.tunnel_find_by_id(t))
+            .filter_map(|t| self.bearer_find_by_id(t.bearer_id))
+            .map(|b| b.sgwc_ue_id)
+            .collect();
+        ues.sort_unstable();
+        ues.dedup();
+        ues
     }
 }
 

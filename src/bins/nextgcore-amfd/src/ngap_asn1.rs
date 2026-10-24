@@ -791,6 +791,33 @@ pub fn build_pdu_session_resource_setup_request_asn1(
     nas_pdu: Option<&[u8]>,
     n2_sm_transfer: &[u8],
 ) -> Option<Vec<u8>> {
+    build_pdu_session_resource_setup_request_with_nas_asn1(
+        amf_ue_ngap_id,
+        ran_ue_ngap_id,
+        pdu_session_id,
+        s_nssai_sst,
+        s_nssai_sd,
+        nas_pdu,
+        None,
+        n2_sm_transfer,
+    )
+}
+
+/// [`build_pdu_session_resource_setup_request_asn1`] with the item's own
+/// PDU Session NAS-PDU (TS 38.413 §9.2.1.1): the place for a 5GSM message about
+/// that session (TS 23.502 §4.3.2.2.1 step 12), tied to the session's outcome at
+/// the gNB. `nas_pdu` is the message-level NAS-PDU, for a 5GMM message.
+#[allow(clippy::too_many_arguments)]
+pub fn build_pdu_session_resource_setup_request_with_nas_asn1(
+    amf_ue_ngap_id: u64,
+    ran_ue_ngap_id: u32,
+    pdu_session_id: u8,
+    s_nssai_sst: u8,
+    s_nssai_sd: Option<u32>,
+    nas_pdu: Option<&[u8]>,
+    pdu_session_nas_pdu: Option<&[u8]>,
+    n2_sm_transfer: &[u8],
+) -> Option<Vec<u8>> {
     use ngap_gen::{
         PDUSessionResourceSetupItemSUReq,
         PDUSessionResourceSetupItemSUReqPDUSessionResourceSetupRequestTransfer as Transfer,
@@ -801,7 +828,7 @@ pub fn build_pdu_session_resource_setup_request_asn1(
 
     let item = PDUSessionResourceSetupItemSUReq {
         pdu_session_id: ngap_gen::PDUSessionID(pdu_session_id),
-        pdu_session_nas_pdu: None,
+        pdu_session_nas_pdu: pdu_session_nas_pdu.map(|n| ngap_gen::NAS_PDU(n.to_vec())),
         s_nssai: generated_s_nssai(&crate::context::SNssai {
             sst: s_nssai_sst,
             sd: s_nssai_sd,
@@ -1435,6 +1462,10 @@ pub enum InitialContextSetupOutcomeDecode {
         /// its PDUSessionResourceSetupResponseTransfer, which the SMF needs to
         /// point the downlink at the gNB (#540). Empty for a Failure.
         setup_sessions: Vec<(u8, Vec<u8>)>,
+        /// The Response's PDU Session Resource Failed to Setup List: each session's ID
+        /// and its PDUSessionResourceSetupUnsuccessfulTransfer (#778 follow-up). Empty for
+        /// a Failure.
+        failed_sessions: Vec<(u8, Vec<u8>)>,
     },
     /// A not-comprehended IE was marked "reject": the procedure is
     /// "unsuccessfully terminated" and handled locally (§10.3.4.2), with no
@@ -1485,6 +1516,7 @@ pub fn decode_initial_context_setup_response_asn1(data: &[u8]) -> InitialContext
     let mut amf_ue_ngap_id = None;
     let mut ran_ue_ngap_id = None;
     let mut setup_sessions = Vec::new();
+    let mut failed_sessions = Vec::new();
     for entry in response.protocol_i_es.0 {
         match entry.value {
             Ie::Id_AMF_UE_NGAP_ID(v) => amf_ue_ngap_id = Some(v.0),
@@ -1503,8 +1535,19 @@ pub fn decode_initial_context_setup_response_asn1(data: &[u8]) -> InitialContext
                     })
                     .collect();
             }
-            Ie::Id_PDUSessionResourceFailedToSetupListCxtRes(_)
-            | Ie::Id_CriticalityDiagnostics(_) => {}
+            Ie::Id_PDUSessionResourceFailedToSetupListCxtRes(list) => {
+                failed_sessions = list
+                    .0
+                    .into_iter()
+                    .map(|item| {
+                        (
+                            item.pdu_session_id.0,
+                            item.pdu_session_resource_setup_unsuccessful_transfer.0,
+                        )
+                    })
+                    .collect();
+            }
+            Ie::Id_CriticalityDiagnostics(_) => {}
         }
     }
     Decoded {
@@ -1512,6 +1555,7 @@ pub fn decode_initial_context_setup_response_asn1(data: &[u8]) -> InitialContext
         ran_ue_ngap_id,
         cause: None,
         setup_sessions,
+        failed_sessions,
         error_indication: ics_error_indication(
             amf_ue_ngap_id,
             ran_ue_ngap_id,
@@ -1579,6 +1623,7 @@ pub fn decode_initial_context_setup_failure_asn1(data: &[u8]) -> InitialContextS
         ran_ue_ngap_id,
         cause,
         setup_sessions: Vec::new(),
+        failed_sessions: Vec::new(),
         error_indication: ics_error_indication(
             amf_ue_ngap_id,
             ran_ue_ngap_id,
@@ -12507,6 +12552,7 @@ pub(crate) mod tests {
                         cause: None,
                         error_indication: None,
                         setup_sessions: Vec::new(),
+                        failed_sessions: Vec::new(),
                     }
                 );
                 compared += 1;
@@ -12559,6 +12605,7 @@ pub(crate) mod tests {
                             cause: Some(expected_cause),
                             error_indication: None,
                             setup_sessions: Vec::new(),
+                            failed_sessions: Vec::new(),
                         },
                         "group {group} value {value}"
                     );
@@ -12620,6 +12667,7 @@ pub(crate) mod tests {
                     cause,
                     error_indication: None,
                     setup_sessions: Vec::new(),
+                    failed_sessions: Vec::new(),
                 }
             );
             assert_eq!(
@@ -12641,6 +12689,7 @@ pub(crate) mod tests {
                         diagnostics: vec![diag(ngap_gen::Criticality::NOTIFY)],
                     }),
                     setup_sessions: Vec::new(),
+                    failed_sessions: Vec::new(),
                 }
             );
             assert_eq!(

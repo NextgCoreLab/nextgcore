@@ -3,11 +3,23 @@
 
 use super::*;
 
-/// The RACS cache is process-global: tests that touch it hold its lock.
-pub(crate) fn guard() -> std::sync::MutexGuard<'static, ()> {
+/// The RACS cache is process-global: tests that touch it hold its lock. The
+/// cache is reset when it is taken and again when it is let go (#748), so a
+/// test that retires IDs (a Version ID change) leaves nothing for a test that
+/// does not take the lock.
+pub(crate) fn guard() -> RacsGuard {
     let g = RACS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     reset_for_tests();
-    g
+    RacsGuard(g)
+}
+
+/// See [`guard`].
+pub(crate) struct RacsGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+impl Drop for RacsGuard {
+    fn drop(&mut self) {
+        reset_for_tests();
+    }
 }
 
 /// PLMN-assigned, Version ID 05, RCI 1: digits `1 05 00000000001` (14), packed low
@@ -562,4 +574,51 @@ fn a_creation_notice_that_names_no_id_clears_every_negative() {
     }));
     assert!(!is_known_deleted(&man), "the named ID is cleared");
     assert!(is_known_deleted(&other), "and only it");
+}
+
+/// #748: a deletion keyed on TACs (TS 29.673 `ManAssOpRequestlist.typeAllocationCode`)
+/// retires every PLMN-assigned ID cached under them, and only those, and asks
+/// the NGAP task for a re-assignment naming the TACs.
+#[test]
+fn a_deletion_by_tac_retires_the_ids_under_it() {
+    let _g = guard();
+    let other = [0x01, 0x05, 0x00, 0x00, 0x00, 0x00, 0x20];
+    // Manufacturer-assigned (Type Field digit 0) under the deleted TAC: a
+    // PLMN-assigned-ID deletion does not touch it (#1046 review m4).
+    let manufacturer = [0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x40];
+    cache_put_with_tac(&ID, &[0xAA], "35693803");
+    cache_put_with_tac(&other, &[0xBB], "86000000");
+    cache_put_with_tac(&manufacturer, &[0xCC], "35693803");
+    assert_eq!(take_reassignment(), None, "nothing retired yet");
+    let retired = apply_notification(&serde_json::json!({
+        "eventType": "DELETION_OF_PLMN_ASSIGNED_IDS",
+        "dicEntryId": 1,
+        "manAssOpRequestlist": { "typeAllocationCode": ["35693803"] },
+    }));
+    assert_eq!(retired, vec![ID.to_vec()]);
+    assert!(is_retired(&ID));
+    assert_eq!(cache_get(&ID), None);
+    assert!(!is_retired(&other));
+    assert_eq!(cache_get(&other), Some(vec![0xBB]));
+    assert!(!is_retired(&manufacturer));
+    assert_eq!(cache_get(&manufacturer), Some(vec![0xCC]));
+    assert_eq!(take_reassignment(), Some(vec!["35693803".to_string()]));
+    assert_eq!(take_reassignment(), None, "taken once");
+}
+
+/// #748: an ID deletion and a Version ID change both ask for a re-assignment.
+#[test]
+fn a_retiring_notification_asks_for_a_reassignment() {
+    let _g = guard();
+    apply_notification(&serde_json::json!({
+        "eventType": "DELETION_OF_PLMN_ASSIGNED_IDS",
+        "dicEntryId": 1,
+        "manAssOpRequestlist": { "plmnAssiUeRadioCapId": [to_nucmf(&ID).unwrap()] },
+    }));
+    assert_eq!(take_reassignment(), Some(vec![]));
+    apply_notification(&serde_json::json!({
+        "eventType": "NEW_VERSION_ID_OF_PLMN_ASSIGNED_IDs",
+        "versionId": 6,
+    }));
+    assert_eq!(take_reassignment(), Some(vec![]));
 }
