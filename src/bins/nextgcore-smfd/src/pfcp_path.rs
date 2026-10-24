@@ -62,6 +62,61 @@ pub mod pfcp_message_type {
     pub const SESSION_REPORT_RESPONSE: u8 = 57;
 }
 
+/// PFCP messages refused because their sender is not a UPF this SMF is configured
+/// with or associated to (#971). Exported as `smf_pfcp_unauthorized_messages_total`.
+pub static PFCP_UNAUTHORIZED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What the N4 listener does with a datagram (#971).
+#[derive(Debug, PartialEq, Eq)]
+pub enum N4Admission {
+    /// From a configured or associated UPF: handle it as that UPF's.
+    Peer(usize),
+    /// A Heartbeat Request from an unknown host: answer it (TS 23.007 §19A, "even
+    /// from unknown peers"), take nothing from it.
+    AnswerHeartbeat,
+    /// An Association Setup Request from an unknown host: the one request a new UPF
+    /// may send before it is anyone's peer (TS 29.244 §6.2.6.3).
+    AssociationSetup,
+    /// A Session Report Request from an unknown host: refused with cause 72 (No
+    /// established PFCP Association), not executed, counted.
+    RefuseReport,
+    /// Anything else from an unknown host, including every response: dropped and
+    /// counted. A response is accepted only from the UPF its request went to.
+    Drop,
+}
+
+/// Decide what to do with a datagram of type `msg_type` from `from` (#971). Before,
+/// a datagram from an unknown source went to pool slot 0, and nothing checked the
+/// sender: anyone reaching UDP 8805 could answer our requests, forge a Session
+/// Report for any SEID, or tear UPF 0's association down.
+pub fn admit_n4(msg_type: u8, from: SocketAddr, peers: &[SocketAddr]) -> N4Admission {
+    if let Some(i) = peers.iter().position(|p| *p == from) {
+        return N4Admission::Peer(i);
+    }
+    match msg_type {
+        pfcp_message_type::HEARTBEAT_REQUEST => N4Admission::AnswerHeartbeat,
+        pfcp_message_type::ASSOCIATION_SETUP_REQUEST => N4Admission::AssociationSetup,
+        pfcp_message_type::SESSION_REPORT_REQUEST => N4Admission::RefuseReport,
+        _ => N4Admission::Drop,
+    }
+}
+
+/// A Heartbeat Response carrying our Recovery Time Stamp (TS 29.244 §7.4.2.2).
+pub fn heartbeat_response(sequence_number: u32, recovery_time_stamp: u32) -> Vec<u8> {
+    let msg = PfcpMessage::HeartbeatResponse(HeartbeatResponse::new(recovery_time_stamp));
+    build_message(&msg, sequence_number, None).to_vec()
+}
+
+/// Whether a Session Report for the session with SMF-side SEID `seid` may come from
+/// `from` (#971): the UPF the session was established on, when one is recorded.
+pub fn report_sender_owns_session(seid: u64, from: SocketAddr) -> bool {
+    session_peers()
+        .read()
+        .ok()
+        .and_then(|map| map.get(&seid).copied())
+        .is_none_or(|peer| peer == from)
+}
+
 /// Is this message type a response (solicited by one of our requests)?
 fn is_response_type(msg_type: u8) -> bool {
     matches!(
