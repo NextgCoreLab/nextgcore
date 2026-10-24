@@ -8,7 +8,7 @@ Configuration comes from a YAML file (default `/etc/nextgcore/mme.yaml`, `-c/--c
 
 ## Example configuration
 
-From `nextgcore/docker/rust/configs/epc/mme.yaml` (mounted by `docker-compose-epc.yml`, which runs the daemon as `-c /etc/nextgcore/mme.yaml` at `172.24.0.5` and publishes `36412/sctp`; abridged, the shipped file also carries a commented-out `overload:` block):
+From `nextgcore/docker/rust/configs/epc/mme.yaml` (mounted by `docker-compose-epc.yml`, which runs the daemon as `-c /etc/nextgcore/mme.yaml` at `172.24.0.5` and publishes `36412/sctp` on `127.0.0.1`, or on `NEXTGCORE_RAN_PUBLISH_ADDR` for an external eNB; abridged, the shipped file also carries a commented-out `overload:` block):
 
 ```yaml
 # NextGCore MME Configuration for Docker EPC Deployment
@@ -91,7 +91,7 @@ From the clap `Args` struct in `src/bins/nextgcore-mmed/src/main.rs`:
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `-c, --config` | path | `/etc/nextgcore/mme.yaml` | Configuration file path. |
-| `-l, --log-level` | string | `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`); unrecognized values fall back to `info`. |
+| `-l, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `--no-color` | flag | off | Disable colored output. |
 | `-d, --daemon` | flag | off | Daemon mode. |
 

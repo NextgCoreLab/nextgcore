@@ -44,9 +44,10 @@ struct Args {
     #[arg(short, long, default_value = "/etc/nextgcore/sgwc.yaml")]
     config: String,
 
-    /// Log level (trace, debug, info, warn, error)
-    #[arg(short, long, default_value = "info")]
-    log_level: String,
+    /// Log level (trace, debug, info, warn, error). Without it, the config
+    /// file's `logger.level`, else `info`; `RUST_LOG` overrides (#691).
+    #[arg(short, long)]
+    log_level: Option<String>,
 
     /// Disable color output
     #[arg(long)]
@@ -290,7 +291,11 @@ async fn main() -> Result<()> {
 
     // Initialize logging
     // RUST_LOG if set, else --log-level: the same for every NF (#691).
-    nextgcore_core::log::nf_log_builder(&args.log_level).init();
+    nextgcore_core::log::nf_log_builder(&nextgcore_core::log::nf_log_level(
+        args.log_level.as_deref(),
+        Some(&args.config),
+    ))
+    .init();
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = nextgcore_metrics::otel::init_otel(
         nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
