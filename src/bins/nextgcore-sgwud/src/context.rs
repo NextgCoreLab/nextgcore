@@ -757,6 +757,13 @@ impl SgwuContext {
         }
     }
 
+    /// A context whose session capacity is `max_sess` (0 = unlimited).
+    pub fn with_capacity(max_sess: usize) -> Self {
+        let mut ctx = Self::new();
+        ctx.init(max_sess);
+        ctx
+    }
+
     /// Initialize the SGWU context
     pub fn init(&mut self, max_sess: usize) {
         if self.initialized.load(Ordering::SeqCst) {
@@ -1674,8 +1681,17 @@ pub fn sgwu_self() -> &'static SgwuContext {
 
 /// Initialize the global SGWU context
 pub fn sgwu_context_init(max_sess: usize) {
-    let _ctx = SGWU_CONTEXT.get_or_init(SgwuContext::new);
-    log::info!("SGWU context initialized with max {max_sess} sessions");
+    // #968 round 3: the capacity is APPLIED. This used to build the context with
+    // `SgwuContext::new` and only log `max_sess`, so the session capacity was 0
+    // (unlimited) and nothing derived from it held.
+    let ctx = SGWU_CONTEXT.get_or_init(|| SgwuContext::with_capacity(max_sess));
+    if ctx.sess_capacity() != max_sess {
+        log::warn!(
+            "SGWU context was created before sgwu_context_init({max_sess}); its session \
+             capacity stays {}",
+            ctx.sess_capacity()
+        );
+    }
 }
 
 /// Finalize the global SGWU context

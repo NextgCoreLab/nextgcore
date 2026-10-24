@@ -16,8 +16,10 @@
 //! * [`RefusalLog`]: a rate limit for the refusal log line, so a spoofed flood does not
 //!   become a log flood (the refusal counter still counts every datagram).
 
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// One allowlist entry: an address prefix. A bare address is a full-length prefix.
@@ -88,12 +90,28 @@ impl std::fmt::Display for Prefix {
 /// is resolved off the receive path by [`Self::resolve_hosts`], which the NF calls
 /// periodically; [`Self::permits`] only reads the last resolution, so a flood of
 /// Setups never turns into a flood of DNS queries. Clones share that resolution.
+///
+/// A Setup from an address not (yet) resolved can [`Self::kick_refresh`] the
+/// resolver, at most once per [`KICK_INTERVAL`], so a CP pod that just restarted at
+/// a new IP is admitted on its next attempt instead of after a full interval.
+///
+/// A name whose lookup FAILS keeps its last good addresses (a DNS blip does not
+/// empty the allowlist); one that resolves to nothing is taken at its word.
 #[derive(Debug, Clone, Default)]
 pub struct PeerAllowlist {
     entries: Vec<Prefix>,
     hosts: Vec<String>,
-    resolved: std::sync::Arc<std::sync::RwLock<Vec<IpAddr>>>,
+    resolved: Arc<RwLock<Vec<IpAddr>>>,
+    /// Last good addresses per name.
+    per_host: Arc<Mutex<HashMap<String, Vec<IpAddr>>>>,
+    /// Set by [`Self::kick_refresh`], cleared by the refresh thread.
+    wake: Arc<(Mutex<bool>, Condvar)>,
+    /// Milliseconds since the Unix epoch of the last accepted kick.
+    last_kick_ms: Arc<AtomicU64>,
 }
+
+/// The minimum interval between two early re-resolutions.
+pub const KICK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Whether `s` is a syntactically valid DNS host name (RFC 1123 labels).
 fn is_host_name(s: &str) -> bool {
@@ -163,38 +181,49 @@ impl PeerAllowlist {
         &self.hosts
     }
 
-    /// Whether this allowlist can admit at most ONE host: a single full-length
-    /// address. A prefix, several entries or a host name may admit several CP
-    /// functions, which then compete for the UP function's session capacity.
-    pub fn admits_a_single_host(&self) -> bool {
-        self.hosts.is_empty()
-            && self.entries.len() == 1
-            && self.entries[0].len
-                == if self.entries[0].addr.is_ipv4() {
-                    32
-                } else {
-                    128
-                }
+    /// Resolve the configured host names now (blocking: call it off the PFCP receive
+    /// path, e.g. from the refresh thread) and publish the result to every clone.
+    /// Returns the published addresses.
+    pub fn resolve_hosts(&self) -> Vec<IpAddr> {
+        self.resolve_hosts_with(|h| {
+            use std::net::ToSocketAddrs;
+            (h, 0u16)
+                .to_socket_addrs()
+                .map(|it| it.map(|a| a.ip()).collect())
+        })
     }
 
-    /// Resolve the configured host names now (blocking: call it off the PFCP receive
-    /// path, e.g. from a refresh thread) and publish the result to every clone. A
-    /// name that does not resolve contributes nothing; a lookup failure keeps the
-    /// previous addresses of that run's other names only. Returns the addresses.
-    pub fn resolve_hosts(&self) -> Vec<IpAddr> {
-        use std::net::ToSocketAddrs;
-        let mut ips: Vec<IpAddr> = Vec::new();
+    fn resolve_hosts_with(
+        &self,
+        lookup: impl Fn(&str) -> std::io::Result<Vec<IpAddr>>,
+    ) -> Vec<IpAddr> {
+        let mut per_host = self.per_host.lock().unwrap_or_else(|e| e.into_inner());
         for h in &self.hosts {
-            match (h.as_str(), 0u16).to_socket_addrs() {
+            match lookup(h) {
                 Ok(addrs) => {
-                    for a in addrs {
-                        let ip = a.ip().to_canonical();
-                        if !ips.contains(&ip) {
-                            ips.push(ip);
+                    let mut v: Vec<IpAddr> = Vec::new();
+                    for ip in addrs.into_iter().map(|ip| ip.to_canonical()) {
+                        if !v.contains(&ip) {
+                            v.push(ip);
                         }
                     }
+                    per_host.insert(h.clone(), v);
                 }
-                Err(e) => log::warn!("PFCP allowed peer '{h}' does not resolve: {e}"),
+                // Keep the last good addresses: a DNS blip must not refuse a CP
+                // function that is still where it was.
+                Err(e) => log::warn!(
+                    "PFCP allowed peer '{h}' does not resolve ({e}); keeping its last \
+                     addresses {:?}",
+                    per_host.get(h).cloned().unwrap_or_default()
+                ),
+            }
+        }
+        let mut ips: Vec<IpAddr> = Vec::new();
+        for v in per_host.values() {
+            for ip in v {
+                if !ips.contains(ip) {
+                    ips.push(*ip);
+                }
             }
         }
         if let Ok(mut r) = self.resolved.write() {
@@ -203,10 +232,41 @@ impl PeerAllowlist {
         ips
     }
 
-    /// Spawn a thread that re-resolves the host names every `interval` (#968): a CP
-    /// pod that restarts at a new IP is admitted within one interval. Resolves once
-    /// before returning, so the first Setup after startup is already judged against
-    /// real addresses. Does nothing when no host name is configured.
+    /// Ask the refresh thread to re-resolve now, because a Setup came from an address
+    /// the last resolution does not contain. Rate-limited to one kick per
+    /// [`KICK_INTERVAL`] and non-blocking, so a flood of strangers costs at most one
+    /// lookup a second. Returns whether this call kicked.
+    pub fn kick_refresh(&self) -> bool {
+        if self.hosts.is_empty() {
+            return false;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(1)
+            .max(1);
+        let last = self.last_kick_ms.load(Ordering::Relaxed);
+        if last != 0 && now.saturating_sub(last) < KICK_INTERVAL.as_millis() as u64 {
+            return false;
+        }
+        if self
+            .last_kick_ms
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return false;
+        }
+        let (flag, cv) = &*self.wake;
+        *flag.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        cv.notify_one();
+        true
+    }
+
+    /// Spawn a thread that re-resolves the host names every `interval`, or at once
+    /// when kicked (#968): a CP pod that restarts at a new IP is admitted within one
+    /// interval, or on its next Setup after a kick. Resolves once before returning,
+    /// so the first Setup after startup is judged against real addresses. Does
+    /// nothing when no host name is configured.
     pub fn spawn_host_refresh(&self, interval: Duration) {
         if self.hosts.is_empty() {
             return;
@@ -220,7 +280,14 @@ impl PeerAllowlist {
         let _ = std::thread::Builder::new()
             .name("pfcp-peer-dns".into())
             .spawn(move || loop {
-                std::thread::sleep(interval);
+                {
+                    let (flag, cv) = &*me.wake;
+                    let guard = flag.lock().unwrap_or_else(|e| e.into_inner());
+                    let (mut guard, _) = cv
+                        .wait_timeout_while(guard, interval, |kicked| !*kicked)
+                        .unwrap_or_else(|e| e.into_inner());
+                    *guard = false;
+                }
                 me.resolve_hosts();
             });
     }
@@ -360,13 +427,6 @@ mod tests {
         let any = PeerAllowlist::parse("0.0.0.0/0, ::/0").unwrap();
         assert!(any.permits(ip("192.0.2.1")));
         assert!(any.permits(ip("2001:db8::1")));
-        assert!(!any.admits_a_single_host());
-        assert!(PeerAllowlist::parse("172.23.0.4")
-            .unwrap()
-            .admits_a_single_host());
-        assert!(!PeerAllowlist::parse("172.23.0.0/24")
-            .unwrap()
-            .admits_a_single_host());
     }
 
     #[test]
@@ -374,7 +434,6 @@ mod tests {
         let a = PeerAllowlist::parse("smf-pfcp.nextg-system.svc.cluster.local").unwrap();
         assert!(a.is_configured());
         assert_eq!(a.hosts(), ["smf-pfcp.nextg-system.svc.cluster.local"]);
-        assert!(!a.admits_a_single_host());
         assert!(!a.permits(ip("10.1.2.3")), "nothing resolved yet");
         let clone = a.clone();
         a.set_resolved(vec![ip("10.1.2.3")]);
@@ -384,6 +443,50 @@ mod tests {
         let local = PeerAllowlist::parse("localhost").unwrap();
         local.resolve_hosts();
         assert!(local.permits(ip("127.0.0.1")), "localhost resolves");
+    }
+
+    #[test]
+    fn a_failed_lookup_keeps_the_last_good_addresses() {
+        let a = PeerAllowlist::parse("smf-pfcp").unwrap();
+        a.resolve_hosts_with(|_| Ok(vec![ip("10.1.2.3")]));
+        assert!(a.permits(ip("10.1.2.3")));
+        a.resolve_hosts_with(|_| Err(std::io::Error::other("SERVFAIL")));
+        assert!(
+            a.permits(ip("10.1.2.3")),
+            "a DNS blip keeps the last addresses"
+        );
+        a.resolve_hosts_with(|_| Ok(vec![ip("10.1.2.4")]));
+        assert!(!a.permits(ip("10.1.2.3")), "a real answer replaces them");
+        assert!(a.permits(ip("10.1.2.4")));
+    }
+
+    #[test]
+    fn a_kick_is_rate_limited_and_needs_a_host_name() {
+        assert!(!PeerAllowlist::parse("10.0.0.1").unwrap().kick_refresh());
+        let a = PeerAllowlist::parse("smf-pfcp").unwrap();
+        assert!(a.kick_refresh(), "the first kick");
+        assert!(
+            !a.clone().kick_refresh(),
+            "a second within the interval is dropped"
+        );
+    }
+
+    /// A kick wakes the refresh thread before its interval: a name that resolves to
+    /// a new address is admitted within the kick, not a full interval later.
+    #[test]
+    fn a_kick_re_resolves_before_the_interval() {
+        let a = PeerAllowlist::parse("localhost").unwrap();
+        a.spawn_host_refresh(Duration::from_secs(3600));
+        // Simulate a stale resolution, then kick.
+        a.per_host.lock().unwrap().clear();
+        a.set_resolved(Vec::new());
+        assert!(!a.permits(ip("127.0.0.1")));
+        assert!(a.kick_refresh());
+        let t0 = std::time::Instant::now();
+        while !a.permits(ip("127.0.0.1")) {
+            assert!(t0.elapsed() < Duration::from_secs(5), "not re-resolved");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]

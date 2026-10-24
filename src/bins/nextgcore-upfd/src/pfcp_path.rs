@@ -1299,6 +1299,10 @@ impl PfcpServer {
         // A refused Setup changes nothing: the live association and its sessions stay.
         let allowed = self.allowed_peers();
         if !allowed.permits(src_addr.ip()) {
+            // A restarted CP pod may be at an IP the last resolution predates: ask for
+            // an early re-resolution (rate-limited) so its NEXT attempt is judged
+            // against current DNS.
+            allowed.kick_refresh();
             note_refusal(format_args!(
                 "PFCP Association Setup Request from {src_addr}, which is not an allowed CP \
                  function ({allowed}): rejected (cause 64)"
@@ -1357,8 +1361,27 @@ impl PfcpServer {
         // for the same Node ID.
         let previous = self.association.read().await.clone();
         // SECURITY (#968): only an allowlisted CP function got this far (fail closed,
-        // above), so it may replace or move the live association -- the configured
-        // failover. The Node ID never authorises anything: the sender writes it.
+        // above). It may replace or move a LIVE association only if it is one of that
+        // association's hosts, or presents the same Node ID (the same CP function at a
+        // new address, #718). A DIFFERENT CP function waits until the association is
+        // gone (Release or heartbeat timeout), so one listed host cannot evict
+        // another's sessions. Residual risk: the Node ID is written by the sender, so
+        // with a broad allowlist (a pod CIDR, 0.0.0.0/0) any host in range that knows
+        // the SMF's Node ID can still take the association over; list the CP's own
+        // address or headless Service name where possible.
+        if let Some(prev) = previous.as_ref() {
+            if !prev.owns(src_addr.ip()) && prev.node_id != node_id {
+                note_refusal(format_args!(
+                    "PFCP Association Setup Request from {src_addr} with another Node ID \
+                     would replace the live association with {}: rejected (cause 64), \
+                     association and sessions kept",
+                    prev.peer_addr
+                ));
+                return self
+                    .reject_association_setup(header.sequence_number, src_addr)
+                    .await;
+            }
+        }
         let mut sessions_retained = false;
         if let Some(prev) = previous {
             let same_node = prev.node_id == node_id;
@@ -5485,29 +5508,48 @@ mod tests {
         );
     }
 
-    /// #968 review (c): a Setup from a DIFFERENT CP function replaces the live
-    /// association when its address is allowlisted -- the configured failover.
+    /// #968 round 3: a listed host may move a LIVE association only as the same CP
+    /// function -- same Node ID (the #718 new-pod-IP case) or one of its own hosts. A
+    /// DIFFERENT CP function from another listed host is refused (cause 64) and the
+    /// sessions stay; once the association is released, it may associate.
     #[tokio::test]
-    async fn an_allowlisted_cp_function_may_replace_the_association() {
+    async fn a_listed_host_moves_a_live_association_only_as_the_same_cp_function() {
         let (server, smf_a, upf, _rx) = spawn_test_server().await;
-        server.set_allowed_peers(PeerAllowlist::parse("127.0.0.1, 127.0.0.2").unwrap());
+        server.set_allowed_peers(PeerAllowlist::parse("127.0.0.1, 127.0.0.2, 127.0.0.3").unwrap());
         associate(&smf_a, upf, SMF_NODE, 100, None).await;
-        establish(&server, &smf_a, upf, FIRST_CP_SEID).await;
+        let x = establish(&server, &smf_a, upf, FIRST_CP_SEID).await;
 
-        let smf_b = UdpSocket::bind("127.0.0.2:0").await.unwrap();
+        let other_cp = UdpSocket::bind("127.0.0.2:0").await.unwrap();
         assert_eq!(
-            setup_cause(&smf_b, upf, Ipv4Addr::new(127, 0, 0, 2), 5).await,
+            setup_cause(&other_cp, upf, Ipv4Addr::new(127, 0, 0, 2), 5).await,
+            PfcpCause::RequestRejected as u8,
+            "another CP function cannot evict the live one"
+        );
+        assert_eq!(held(&server).await.len(), 1, "{x:#x} survives");
+        assert_eq!(
+            server.association.read().await.as_ref().unwrap().peer_addr,
+            smf_a.local_addr().unwrap()
+        );
+
+        // The same CP function (same Node ID) at a new listed address moves it.
+        let moved = UdpSocket::bind("127.0.0.3:0").await.unwrap();
+        assert_eq!(
+            setup_cause(&moved, upf, SMF_NODE, 6).await,
             PfcpCause::RequestAccepted as u8
         );
         assert_eq!(
             server.association.read().await.as_ref().unwrap().peer_addr,
-            smf_b.local_addr().unwrap()
+            moved.local_addr().unwrap()
         );
-        // The replaced CP function no longer controls this UPF.
-        let resp = exchange(&smf_a, upf, &encode_pfcp(54, Some(1), 12, &[])).await;
+
+        // Released: now the other CP function may associate.
+        let mut rel = crate::n4_build::PfcpMessageBuilder::new();
+        rel.add_node_id(&NodeId::Ipv4(SMF_NODE));
+        let resp = exchange(&moved, upf, &encode_pfcp(9, None, 7, &rel.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
         assert_eq!(
-            response_cause(&resp),
-            PfcpCause::NoEstablishedPfcpAssociation as u8
+            setup_cause(&other_cp, upf, Ipv4Addr::new(127, 0, 0, 2), 8).await,
+            PfcpCause::RequestAccepted as u8
         );
     }
 
@@ -5750,24 +5792,39 @@ mod tests {
         );
     }
 
-    /// #718: retention is defined for the SAME Node ID only. A different CP function
-    /// replacing this UPF's one association cannot adopt the previous one's sessions,
-    /// and the replaced CP function can no longer control them, so they go.
+    /// #718 / #968 round 3: retention is defined for the SAME Node ID only, and a
+    /// DIFFERENT CP function cannot replace a live association at all: its Setup is
+    /// refused (cause 64), so it can neither adopt nor delete the previous one's
+    /// sessions.
     #[tokio::test]
     async fn a_different_cp_function_cannot_retain_the_previous_ones_sessions() {
         let (server, smf_a, upf, _rx) = spawn_test_server().await;
         let smf_b = UdpSocket::bind("127.0.0.2:0").await.unwrap();
-        // A new pod IP: accepted because the deployment allowlists its CP range (#968).
         server.set_allowed_peers(PeerAllowlist::parse("127.0.0.0/8").unwrap());
         associate(&smf_a, upf, SMF_NODE, 100, None).await;
-        establish(&server, &smf_a, upf, FIRST_CP_SEID).await;
+        let x = establish(&server, &smf_a, upf, FIRST_CP_SEID).await;
 
-        let resp = associate(&smf_b, upf, Ipv4Addr::new(127, 0, 0, 10), 100, Some(&[])).await;
+        let resp = exchange(
+            &smf_b,
+            upf,
+            &encode_pfcp(
+                5,
+                None,
+                100,
+                &association_setup(Ipv4Addr::new(127, 0, 0, 10), 100, Some(&[])),
+            ),
+        )
+        .await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestRejected as u8);
         assert!(
             !psrei(&resp),
             "nothing was retained for a different Node ID"
         );
-        assert!(held(&server).await.is_empty());
+        assert_eq!(
+            held(&server).await,
+            vec![(x, FIRST_CP_SEID, smf_a.local_addr().unwrap())],
+            "and nothing was deleted"
+        );
     }
 
     #[test]

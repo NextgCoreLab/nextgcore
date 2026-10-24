@@ -1120,6 +1120,9 @@ impl SxaNode {
         // refused Setup changes nothing.
         let allowed = self.allowed_peers();
         if !allowed.permits(from.ip()) {
+            // A restarted SGW-C may be at an IP the last resolution predates: ask for
+            // an early re-resolution (rate-limited) for its next attempt.
+            allowed.kick_refresh();
             note_refusal(format_args!(
                 "PFCP Association Setup Request from {from}, which is not an allowed SGW-C \
                  ({allowed}): rejected (cause 64)"
@@ -2263,17 +2266,16 @@ pub async fn pfcp_open() -> Result<Arc<SxaNode>, String> {
     let cap = per_peer_session_cap(
         std::env::var("SGWU_PFCP_MAX_SESSIONS_PER_PEER").ok(),
         crate::config::config().pfcp_max_sessions_per_peer,
-        &allowed,
-        sgwu_self().sess_capacity(),
     )?;
-    log::info!(
-        "PFCP sessions per SGW-C: at most {}",
-        if cap == 0 {
-            "the global capacity".to_string()
-        } else {
-            cap.to_string()
-        }
-    );
+    if cap == 0 {
+        log::info!(
+            "No per-SGW-C session cap (global capacity {}); set \
+             sgwu.pfcp.max_sessions_per_peer to add one",
+            sgwu_self().sess_capacity()
+        );
+    } else {
+        log::info!("PFCP sessions per SGW-C: at most {cap}");
+    }
     let node = SxaNode::open(bind, local_ip)
         .await
         .map_err(|e| format!("failed to bind PFCP socket on {bind}: {e}"))?;
@@ -2283,27 +2285,17 @@ pub async fn pfcp_open() -> Result<Arc<SxaNode>, String> {
 }
 
 /// The per-SGW-C session cap (#968): `SGWU_PFCP_MAX_SESSIONS_PER_PEER`, then
-/// `sgwu.pfcp.max_sessions_per_peer`, then a default. The default is no cap of its
-/// own (0) when the allowlist admits exactly one host -- that SGW-C may use the
-/// whole capacity -- and HALF the capacity otherwise, so no one peer can take every
-/// slot from the others.
-fn per_peer_session_cap(
-    env: Option<String>,
-    file: Option<usize>,
-    allowed: &PeerAllowlist,
-    capacity: usize,
-) -> Result<usize, String> {
+/// `sgwu.pfcp.max_sessions_per_peer`, else NONE (0): an operator setting, enforced
+/// when set. With fail-closed allowlists only listed SGW-Cs hold sessions, so a
+/// default that reserves capacity would cost more than it protects.
+fn per_peer_session_cap(env: Option<String>, file: Option<usize>) -> Result<usize, String> {
     if let Some(v) = env {
         return v
             .trim()
             .parse()
             .map_err(|e| format!("SGWU_PFCP_MAX_SESSIONS_PER_PEER '{v}': {e}"));
     }
-    Ok(file.unwrap_or(if allowed.admits_a_single_host() {
-        0
-    } else {
-        capacity / 2
-    }))
+    Ok(file.unwrap_or(0))
 }
 
 /// Close the Sxa PFCP path. The socket closes with the node; this drops the
@@ -2979,20 +2971,39 @@ mod tests {
         }
     }
 
-    /// The per-peer cap: env, then file, then no own cap for a single-host
-    /// allowlist and half the capacity otherwise.
+    /// The per-peer cap is an operator setting: env, then file, else none.
     #[test]
-    fn the_per_peer_session_cap_defaults_by_allowlist_shape() {
-        let one = PeerAllowlist::parse("172.24.0.3").unwrap();
-        let many = PeerAllowlist::parse("172.24.0.0/24").unwrap();
-        assert_eq!(per_peer_session_cap(None, None, &one, 1024), Ok(0));
-        assert_eq!(per_peer_session_cap(None, None, &many, 1024), Ok(512));
-        assert_eq!(per_peer_session_cap(None, Some(100), &many, 1024), Ok(100));
-        assert_eq!(
-            per_peer_session_cap(Some("7".into()), Some(100), &many, 1024),
-            Ok(7)
+    fn the_per_peer_session_cap_is_off_unless_configured() {
+        assert_eq!(per_peer_session_cap(None, None), Ok(0));
+        assert_eq!(per_peer_session_cap(None, Some(100)), Ok(100));
+        assert_eq!(per_peer_session_cap(Some("7".into()), Some(100)), Ok(7));
+        assert!(per_peer_session_cap(Some("x".into()), None).is_err());
+    }
+
+    /// #968 round 3: `sgwu_context_init`'s capacity is applied -- before, it was only
+    /// logged, so the context was unlimited. A context of capacity 2 refuses a third
+    /// session, and the per-node cap refuses within it.
+    #[test]
+    fn a_context_with_a_capacity_refuses_beyond_it() {
+        let ctx = crate::context::SgwuContext::with_capacity(2);
+        assert_eq!(ctx.sess_capacity(), 2);
+        let ip = Ipv4Addr::new(127, 0, 0, 9);
+        assert!(ctx
+            .sess_add_for_node_capped(&FSeid::with_ipv4(1, ip), Some(1), 1)
+            .is_some());
+        assert!(
+            ctx.sess_add_for_node_capped(&FSeid::with_ipv4(2, ip), Some(1), 1)
+                .is_none(),
+            "node 1 is at its cap of 1"
         );
-        assert!(per_peer_session_cap(Some("x".into()), None, &one, 1024).is_err());
+        assert!(ctx
+            .sess_add_for_node_capped(&FSeid::with_ipv4(3, ip), Some(2), 1)
+            .is_some());
+        assert!(
+            ctx.sess_add_for_node(&FSeid::with_ipv4(4, ip), Some(3))
+                .is_none(),
+            "the context is at its capacity of 2"
+        );
     }
 
     /// SECURITY (#968 re-review, fail closed): with no allowlist, no SGW-C can
@@ -3130,10 +3141,16 @@ mod tests {
         .await;
         let _ = recv_decoded(&peer).await;
         // Owned by the peer (#968: a session request is served only for its own sessions).
-        let owner = node.peer_on_host(peer.local_addr().unwrap().ip()).await.map(|p| p.1);
+        let owner = node
+            .peer_on_host(peer.local_addr().unwrap().ip())
+            .await
+            .map(|p| p.1);
         let ctx = sgwu_self();
         let sess = ctx
-            .sess_add_for_node(&FSeid::with_ipv4(0x9081, Ipv4Addr::new(127, 0, 0, 9)), owner)
+            .sess_add_for_node(
+                &FSeid::with_ipv4(0x9081, Ipv4Addr::new(127, 0, 0, 9)),
+                owner,
+            )
             .unwrap();
 
         let unknown = wire(
