@@ -178,3 +178,97 @@ fn every_nf_builds_its_logger_with_the_shared_builder() {
     }
     assert!(problems.is_empty(), "\n{}", problems.join("\n"));
 }
+
+/// #691 follow-up: every NF resolves its level the same way, `--log-level`,
+/// then the config's `logger.level`, then `info`
+/// (`nextgcore_core::log::nf_log_level`). A crate that builds its logger must
+/// call `nf_log_level(`, and no `log_level` flag may carry a clap default: with
+/// a default, the flag always looks explicit and the file never speaks. That
+/// is how 26 NFs ignored `logger.level` before this check.
+#[test]
+fn every_nf_resolves_its_level_flag_then_file_then_info() {
+    let bins = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bins");
+    let mut crates: Vec<PathBuf> = fs::read_dir(&bins)
+        .expect("src/bins")
+        .map(|e| e.expect("dir entry").path())
+        .filter(|p| p.join("Cargo.toml").is_file())
+        .collect();
+    crates.sort();
+    let mut problems = Vec::new();
+    let mut resolving = 0;
+    for krate in &crates {
+        let name = krate.file_name().unwrap().to_string_lossy().to_string();
+        if NOT_AN_NF.contains(&name.as_str()) {
+            continue;
+        }
+        let mut files = Vec::new();
+        rust_files(&krate.join("src"), &mut files);
+        let (mut builds, mut resolves) = (false, false);
+        for file in &files {
+            let code = code(file);
+            builds |= code.contains("nf_log_builder(");
+            resolves |= code.contains("nf_log_level(");
+            problems.extend(defaulted_level_flags(&code).into_iter().map(|at| {
+                format!(
+                    "{}: the `log_level` flag has a clap default ({at}); make it \
+                     Option<String> and resolve it with nf_log_level",
+                    file.strip_prefix(&bins).unwrap_or(file).display()
+                )
+            }));
+        }
+        if builds && !resolves {
+            problems.push(format!(
+                "{name}: builds its logger without nextgcore_core::log::nf_log_level, so \
+                 its config's logger.level is ignored"
+            ));
+        }
+        resolving += usize::from(resolves);
+    }
+    assert!(resolving >= 28, "only {resolving} NFs resolve their level");
+    assert!(problems.is_empty(), "\n{}", problems.join("\n"));
+}
+
+/// Where a `log_level` field is a `String` or follows an `#[arg(..)]` with a
+/// `default_value` (in comment- and literal-stripped code).
+fn defaulted_level_flags(code: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(at) = code[from..].find("log_level:") {
+        let p = from + at;
+        from = p + 10;
+        let ty = code[from..].trim_start();
+        if ty.starts_with("String") {
+            out.push("a String field".to_string());
+            continue;
+        }
+        // The `#[arg(..)]` directly on this field: nothing but attributes and
+        // a visibility between its `)]` and the field.
+        let Some(a) = code[..p].rfind("#[arg(") else {
+            continue;
+        };
+        let Some(close) = code[a..p].find(")]") else {
+            continue;
+        };
+        let between = &code[a + close + 2..p];
+        let own = !between.contains([',', '{', ';', '}']);
+        if own && code[a..a + close].contains("default_value") {
+            out.push("default_value".to_string());
+        }
+    }
+    out
+}
+
+#[test]
+fn the_level_flag_scan_sees_both_shapes() {
+    let flagged = |src: &str| defaulted_level_flags(&strip_comments_and_literals(src));
+    assert_eq!(
+        flagged("struct A {\n    #[arg(short = 'e', long, default_value = \"info\")]\n    log_level: Option<String>,\n}"),
+        vec!["default_value"]
+    );
+    assert_eq!(
+        flagged("struct A {\n    #[arg(long)]\n    log_level: String,\n}"),
+        vec!["a String field"]
+    );
+    assert!(flagged("struct A {\n    #[arg(long, default_value = \"x\")]\n    config: String,\n    #[arg(long)]\n    log_level: Option<String>,\n}").is_empty());
+    assert!(flagged("fn f(log_level: &str) {}").is_empty());
+}

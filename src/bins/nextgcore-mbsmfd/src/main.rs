@@ -51,9 +51,10 @@ struct Args {
     #[arg(short = 'l', long)]
     log_file: Option<String>,
 
-    /// Log level (trace, debug, info, warn, error)
-    #[arg(short = 'e', long, default_value = "info")]
-    log_level: String,
+    /// Log level (trace, debug, info, warn, error). Without it, the config
+    /// file's `logger.level`, else `info`; `RUST_LOG` overrides (#691).
+    #[arg(short = 'e', long)]
+    log_level: Option<String>,
 
     /// Disable color output
     #[arg(short = 'm', long)]
@@ -182,7 +183,10 @@ fn apply_oauth2_enforcement(
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    init_logging(&args.log_level);
+    init_logging(&nextgcore_core::log::nf_log_level(
+        args.log_level.as_deref(),
+        Some(&args.config),
+    ));
     // #1004 review: an unset clock makes a wrong PFCP Recovery Time Stamp.
     nextgcore_pfcp::recovery_time::check_local_clock().map_err(|e| anyhow::anyhow!(e))?;
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
@@ -2367,7 +2371,7 @@ mod tests {
     fn test_args_default() {
         let args = Args::parse_from(["nextgcore-mbsmfd"]);
         assert_eq!(args.config, "/etc/nextgcore/mbsmf.yaml");
-        assert_eq!(args.log_level, "info");
+        assert_eq!(args.log_level, None);
         assert_eq!(args.sbi_port, 7812);
         assert_eq!(args.max_sessions, 256);
     }

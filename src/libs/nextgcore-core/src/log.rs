@@ -23,14 +23,54 @@ pub fn nextgcore_log_init() {
     env_logger::init();
 }
 
-/// The level an NF logs at when `RUST_LOG` is not set: its `--log-level`
-/// value, case-insensitive (`trace`, `debug`, `info`, `warn`, `error`, `off`).
-/// Anything else is `info`, never a module filter that silences everything.
+/// The level an NF logs at when `RUST_LOG` is not set: its resolved level
+/// ([`nf_log_level`]), case-insensitive (`trace`, `debug`, `info`, `warn`,
+/// `error`, `off`). The C configs' `fatal` and `none` (`logger.level`) are
+/// `error` and `off`. Anything else is `info`, never a module filter that
+/// silences everything.
 pub fn nf_default_level(log_level: &str) -> log::LevelFilter {
-    log_level
-        .trim()
+    let level = log_level.trim();
+    if level.eq_ignore_ascii_case("fatal") {
+        return log::LevelFilter::Error;
+    }
+    if level.eq_ignore_ascii_case("none") {
+        return log::LevelFilter::Off;
+    }
+    level
         .parse::<log::LevelFilter>()
         .unwrap_or(log::LevelFilter::Info)
+}
+
+/// The level an NF's logger starts at when `RUST_LOG` is unset (#691), the same
+/// order for every NF:
+///
+/// 1. an explicit `--log-level` (`cli`; the flag has no clap default, so an
+///    absent flag is `None` and the file can speak);
+/// 2. the NF's YAML `logger.level` ([`yaml_logger_level`]);
+/// 3. `info`.
+///
+/// `RUST_LOG`, when set, still replaces the result ([`nf_log_builder`]).
+pub fn nf_log_level(cli: Option<&str>, config_path: Option<&str>) -> String {
+    cli.map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .or_else(|| config_path.and_then(yaml_logger_level))
+        .unwrap_or_else(|| "info".to_string())
+}
+
+/// `logger.level` from an NF's YAML config, or `None` when the file is missing
+/// or unreadable, is not YAML, or has no non-blank `logger.level` string.
+/// Silent, because it runs before the logger exists. The NF's own config load
+/// reports any problem with the file.
+pub fn yaml_logger_level(config_path: &str) -> Option<String> {
+    let content = std::fs::read_to_string(config_path).ok()?;
+    let doc: serde_yaml::Value = serde_yaml::from_str(&content).ok()?;
+    doc.get("logger")?
+        .get("level")?
+        .as_str()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
 }
 
 /// The logger builder every NF daemon starts from (#691), so they all behave
@@ -539,5 +579,57 @@ mod nf_log_builder_tests {
         let logger = nf_log_builder_from("verbose", None, None).build();
         assert!(enabled(&logger, "nextgcore_upfd", Level::Info));
         assert!(!enabled(&logger, "nextgcore_upfd", Level::Debug));
+    }
+
+    /// The C configs' level names (`logger.level`) map onto the nearest filter.
+    #[test]
+    fn c_config_level_names_map_to_filters() {
+        assert_eq!(nf_default_level("fatal"), log::LevelFilter::Error);
+        assert_eq!(nf_default_level("NONE"), log::LevelFilter::Off);
+    }
+
+    /// #691 follow-up: `--log-level`, then the file's `logger.level`, then
+    /// `info`, for every NF.
+    #[test]
+    fn the_level_is_the_flag_then_the_file_then_info() {
+        let dir = std::env::temp_dir().join(format!("nextgcore-loglevel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            p.to_string_lossy().into_owned()
+        };
+        let debug = file(
+            "debug.yaml",
+            "logger:\n  file:\n    path: /x.log\n  level: debug\nnf: {}\n",
+        );
+        let flow = file("flow.yaml", "logger: { level: trace }\n");
+        let blank = file("blank.yaml", "logger:\n  level: \"  \"\n");
+        let none = file("none.yaml", "amf:\n  sbi: {}\n");
+        let broken = file("broken.yaml", "logger: [unclosed\n");
+        let missing = dir.join("missing.yaml").to_string_lossy().into_owned();
+
+        assert_eq!(
+            nf_log_level(Some("warn"), Some(&debug)),
+            "warn",
+            "the flag wins"
+        );
+        assert_eq!(nf_log_level(None, Some(&debug)), "debug", "then the file");
+        assert_eq!(
+            nf_log_level(Some("  "), Some(&debug)),
+            "debug",
+            "a blank flag is no flag"
+        );
+        assert_eq!(nf_log_level(None, Some(&flow)), "trace");
+        for path in [&blank, &none, &broken, &missing] {
+            assert_eq!(nf_log_level(None, Some(path)), "info", "{path}");
+        }
+        assert_eq!(nf_log_level(None, None), "info");
+
+        // RUST_LOG still replaces whatever this resolved to.
+        let logger =
+            nf_log_builder_from(&nf_log_level(None, Some(&debug)), Some("error"), None).build();
+        assert!(!enabled(&logger, "nextgcore_amfd", Level::Warn));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

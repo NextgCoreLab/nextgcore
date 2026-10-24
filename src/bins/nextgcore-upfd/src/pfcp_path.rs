@@ -3325,7 +3325,11 @@ mod tests {
     fn far_body(id: u32, apply_action: u16) -> Vec<u8> {
         let mut b = crate::n4_build::PfcpMessageBuilder::new();
         b.add_u32(pfcp_ie::FAR_ID, id);
-        b.add_u16(pfcp_ie::APPLY_ACTION, apply_action);
+        // #1008: octet 5 first, as a conformant SMF sends it.
+        b.add_tlv(
+            pfcp_ie::APPLY_ACTION,
+            &[apply_action as u8, (apply_action >> 8) as u8],
+        );
         b.build()
     }
 
@@ -3491,7 +3495,7 @@ mod tests {
         );
         let mut far = crate::n4_build::PfcpMessageBuilder::new();
         far.add_u32(pfcp_ie::FAR_ID, 0x50);
-        far.add_u16(pfcp_ie::APPLY_ACTION, 0x02);
+        far.add_tlv(pfcp_ie::APPLY_ACTION, &[0x02, 0x00]); // FORW, octet 5
         far.add_tlv(pfcp_ie::FORWARDING_PARAMETERS, &fp.build());
         let mut b = crate::n4_build::PfcpMessageBuilder::new();
         b.add_tlv(pfcp_ie::CREATE_PDR, &pdr.build());
