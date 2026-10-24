@@ -1506,9 +1506,32 @@ impl PfcpClient {
         let _ = releases.await;
     }
 
+    /// [`Self::teardown_association`] whose #39 fan-out stops at `deadline` (#941
+    /// review M1). Only the fan-out is bounded: the EPC PDN connections are told
+    /// first (their Delete Bearer Requests do not wait for answers), and the
+    /// association-down step and the flush always run.
+    async fn teardown_association_until(
+        &self,
+        reason: &str,
+        deadline: Option<tokio::time::Instant>,
+    ) {
+        let releases = self.begin_teardown_until(reason, deadline).await;
+        let _ = releases.await;
+    }
+
     /// [`Self::teardown_association`] up to the per-session releases, which are
     /// returned still running (#721).
     async fn begin_teardown(&self, reason: &str) -> tokio::task::JoinHandle<()> {
+        self.begin_teardown_until(reason, None).await
+    }
+
+    /// [`Self::begin_teardown`] whose fan-out abandons what it has not sent by
+    /// `deadline` (#941 review M1).
+    async fn begin_teardown_until(
+        &self,
+        reason: &str,
+        deadline: Option<tokio::time::Instant>,
+    ) -> tokio::task::JoinHandle<()> {
         #[cfg(test)]
         assert_teardown_is_serialised();
         #[cfg(test)]
@@ -1518,11 +1541,12 @@ impl PfcpClient {
         // are alive; releasing them sent every UE in the pool a #39 and orphaned
         // their sessions on the healthy UPFs.
         let scope = self.session_scope();
-        let (notified, releases) =
-            crate::restoration::begin_unrecoverable_release(reason, Some(&scope));
-        // #687: the EPC PDN connections on this PGW-U, which have no SM context.
+        // #687: the EPC PDN connections on this PGW-U, which have no SM context. First,
+        // so no fan-out deadline can cut them (#941 review M1).
         let epc_released =
             crate::restoration::release_epc_pdn_connections_in(reason, Some(&scope)).await;
+        let (notified, releases) =
+            crate::restoration::begin_unrecoverable_release(reason, Some(&scope), deadline);
         {
             let mut assoc = self.assoc.write().await;
             assoc.associated = false;
@@ -1734,18 +1758,39 @@ impl PfcpClient {
         }
     }
 
-    /// Run the PFCP Association Release procedure (TS 29.244 6.2.9).
+    /// Run the PFCP Association Release procedure (TS 29.244 §6.2.8).
     pub async fn release_association(&self) -> Result<(), PfcpRequestError> {
+        self.release_association_within(None).await
+    }
+
+    /// [`Self::release_association`] with the local teardown's #39 fan-out bounded by
+    /// `teardown_budget` (#809 follow-up, #941 review M1).
+    ///
+    /// At shutdown the whole sequence must fit the termination grace period. With a
+    /// blackholed AMF each release waits out its connect and request timeouts, and
+    /// thousands of them at 16 in flight would run for minutes, past the SIGKILL, and
+    /// the Association Release would never be sent. When the budget runs out the
+    /// remaining #39s are abandoned (counted in the log); the EPC Delete Bearers, the
+    /// association-down step and the flush run regardless, and the Association
+    /// Release still goes to the UPF, which deletes the sessions.
+    pub async fn release_association_within(
+        &self,
+        teardown_budget: Option<Duration>,
+    ) -> Result<(), PfcpRequestError> {
         if !self.is_associated().await {
             return Ok(());
         }
-        // The association's sessions are deleted locally FIRST (TS 29.244 §6.2.9):
-        // the UEs (#39) and the SGWs (Delete Bearer) are told before the request
-        // waits on the UPF, which can take T1 x N1 when the UPF is gone (#718 review
-        // m5). Before, they were told only after that wait, and a short termination
-        // grace period cut them off.
-        self.teardown_association("association release requested locally")
-            .await;
+        // TS 29.244 §6.2.8.2 has the CP function delete the association's sessions on
+        // a successful Association Release Response. This SMF deletes them locally
+        // FIRST, before the request, deliberately (#718 review m5): the UEs (#39) and
+        // the SGWs (Delete Bearer) are then told before the request waits on the UPF,
+        // up to T1 x (N1+1) = 12 s when the UPF is gone, which a short termination
+        // grace period cut off. The UPF's own deletion is unchanged.
+        self.teardown_association_until(
+            "association release requested locally",
+            teardown_budget.map(|budget| tokio::time::Instant::now() + budget),
+        )
+        .await;
         let msg = PfcpMessage::AssociationReleaseRequest(AssociationReleaseRequest::new(
             self.node_id.clone(),
         ));
@@ -3626,6 +3671,83 @@ mod tests {
         fn drop(&mut self) {
             clear_global_upf_for_test();
         }
+    }
+
+    /// #809 follow-up: at shutdown the #39 releases are bounded. The AMF accepts the
+    /// connection and never answers, so each release would wait out its timeouts.
+    /// With a 300 ms budget the release returns at once, and the Association Release
+    /// still reaches the UPF.
+    #[tokio::test]
+    async fn a_blackholed_amf_cannot_hold_the_association_release_past_its_budget() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let blackhole = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let amf_port = blackhole.local_addr().unwrap().port();
+        let held = tokio::spawn(async move {
+            let mut conns = Vec::new();
+            while let Ok((c, _)) = blackhole.accept().await {
+                conns.push(c);
+            }
+        });
+        let upf = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client = pumped_client(PfcpClient::new(
+            local,
+            upf.local_addr().unwrap(),
+            [127, 0, 0, 1],
+        ))
+        .await;
+        client.set_assoc_state_for_test(true, None, None).await;
+        let _pool = InstalledPool::new(vec![client.clone()]);
+        seed_pfcp_session("80901", 0x809);
+        let mut b = crate::context::PolicyBinding::snapshot_default();
+        b.supi = "imsi-001010000000809".to_string();
+        b.psi = 5;
+        b.sm_context_status_uri = Some(format!("http://127.0.0.1:{amf_port}/sm-status"));
+        smf_self()
+            .read()
+            .unwrap()
+            .policy_bindings
+            .write()
+            .unwrap()
+            .insert("80901".to_string(), b);
+        let released = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let (len, from) = upf.recv_from(&mut buf).await.unwrap();
+            let h = parse_wire_header(&buf[..len]).unwrap();
+            let resp = PfcpMessage::AssociationReleaseResponse(
+                nextgcore_pfcp::message::AssociationReleaseResponse::new(
+                    NodeId::new_ipv4([127, 0, 0, 4]),
+                    nextgcore_pfcp::types::PfcpCause::RequestAccepted,
+                ),
+            );
+            upf.send_to(&build_message(&resp, h.sequence_number, None), from)
+                .await
+                .unwrap();
+            h.msg_type
+        });
+
+        let started = std::time::Instant::now();
+        let result = client
+            .release_association_within(Some(Duration::from_millis(300)))
+            .await;
+        let took = started.elapsed();
+        let request = released.await.unwrap();
+        crate::cancel_gsm_timer_for_test("80901");
+        forget_pfcp_session("80901");
+        if let Ok(ctx) = smf_self().read() {
+            ctx.policy_bindings.write().unwrap().remove("80901");
+        }
+        held.abort();
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(request, pfcp_message_type::ASSOCIATION_RELEASE_REQUEST);
+        assert!(
+            took < Duration::from_secs(1),
+            "bounded by the budget: {took:?}"
+        );
+        assert!(!client.is_associated().await);
     }
 
     fn forget_pfcp_session(sm_context_ref: &str) {

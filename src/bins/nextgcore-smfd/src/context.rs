@@ -3574,6 +3574,14 @@ pub fn smf_context_init(max_ue: usize, max_sess: usize, max_bearer: usize) {
         "PROCESS_STATE_TEST_LOCK",
         "smf_context_init (a test that then uses the process-wide SMF context)",
     );
+    // In a test binary the context is one per process and `init` takes the first
+    // caller's limits, while every test adds its own UEs and sessions to it. With
+    // 64 UEs, the tests of #928, #941 and #912 together ran out, and whichever test
+    // came late failed to register a UE. A test's limits say nothing about the
+    // process's, so a test binary gets room for all of them.
+    #[cfg(test)]
+    let (max_ue, max_sess, max_bearer) =
+        (max_ue.max(4096), max_sess.max(8192), max_bearer.max(16384));
     let ctx = smf_self();
     if let Ok(mut context) = ctx.write() {
         context.init(max_ue, max_sess, max_bearer);
