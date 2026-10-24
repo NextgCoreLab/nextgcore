@@ -161,15 +161,15 @@ jobs:
         with:
           workspaces: src
       - name: cargo clippy
-        # Pre-existing codebase has many style lints from Rust 1.95.
-        # Gate on errors only; warnings shown but don't fail CI until the
-        # tail is cleaned up incrementally. See Phase 8 follow-ups.
-        run: cd src && cargo clippy --workspace
+        # #643: the workspace is warning-clean across all targets (tests
+        # included), so any new warning fails the build. Test-serialisation
+        # locks that are held across `.await` are tokio mutexes, not std ones.
+        run: cd src && cargo clippy --workspace --all-targets -- -D warnings
 
       - name: cargo clippy (non-default features)
         # Same reasoning as the test job's non-default step: a gated module is
         # invisible to a default-feature lint. One line per gated feature.
-        run: cd src && cargo clippy -p nextgcore-easdfd --features dns-udp --all-targets
+        run: cd src && cargo clippy -p nextgcore-easdfd --features dns-udp --all-targets -- -D warnings
 
   fmt:
     name: Format

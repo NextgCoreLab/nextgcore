@@ -2082,11 +2082,14 @@ pub fn parse_recovery_time_stamp(payload: &[u8]) -> Option<u32> {
     let ies = ParsedIe::parse_all(payload);
     ParsedIe::find_ie(&ies, pfcp_ie::RECOVERY_TIME_STAMP).and_then(|ie| {
         if ie.value.len() >= 4 {
-            // #995: in the NTP reading, so a pre-#995 peer's Unix-seconds stamp
-            // compares with an NTP one.
-            Some(nextgcore_pfcp::recovery_time::normalize_received(
-                u32::from_be_bytes([ie.value[0], ie.value[1], ie.value[2], ie.value[3]]),
-            ))
+            // The wire value: the comparison sites normalize it (#995; a parser that
+            // depends on the clock was a #1004 review minor).
+            Some(u32::from_be_bytes([
+                ie.value[0],
+                ie.value[1],
+                ie.value[2],
+                ie.value[3],
+            ]))
         } else {
             None
         }
