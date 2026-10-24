@@ -560,8 +560,11 @@ mod tests {
     /// config drift breaks this test instead of going unnoticed.
     const SHIPPED_CONFIG: &str = "../../../docker/rust/configs/epc/mme.yaml";
 
+    /// Under the process id (#934): `temp_dir()` is shared by every test process
+    /// on the host, and two concurrent runs of this suite (parallel worktrees, a
+    /// workspace run beside a crate run) otherwise overwrite each other's files.
     fn write_temp(name: &str, content: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(name);
+        let path = std::env::temp_dir().join(format!("{}-{name}", std::process::id()));
         std::fs::write(&path, content).unwrap();
         path
     }
