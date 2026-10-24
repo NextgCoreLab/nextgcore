@@ -28628,6 +28628,10 @@ mod tests {
     /// `SMF_SBI_ADDR`; a context with no recorded owner keeps the old fallback.
     #[tokio::test]
     async fn sm_context_updates_go_to_the_smf_that_holds_the_context() {
+        // #1034: the environment fallback is read twice below; a test that sets
+        // SMF_SBI_* under `SmfEnvGuard` in between made the two disagree. Holding the same
+        // lock for the whole test reads one stable environment.
+        let _env = smf_env_test_lock().lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = test_ngap_server().await;
         ngap.sm_context_refs.insert((7_669_001, 1), "1".to_string());
