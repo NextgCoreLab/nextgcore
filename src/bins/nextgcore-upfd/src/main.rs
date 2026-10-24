@@ -535,7 +535,11 @@ async fn main() -> Result<()> {
     let pfcp_for_urr = pfcp_server.clone();
     let shutdown_urr = shutdown.clone();
     let urr_check_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+        // #772: every second, so a periodic report goes out within 1 s of its period
+        // boundary (it was up to 10 s, and the old reset-anchored check added that
+        // lateness to every following period). Detection is a read of atomics and one
+        // instant per URR; nothing is taken unless a report is due.
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
         loop {
             interval.tick().await;
             if shutdown_urr.load(Ordering::SeqCst) {
