@@ -10171,6 +10171,12 @@ impl NgapServer {
                          {amf_ue_ngap_id} asks for a handover type or target this AMF \
                          cannot represent; HandoverPreparationFailure ho-target-not-allowed"
                     );
+                    // #844 review: as the other refusals do, no relay target or session
+                    // transfer of an earlier preparation outlives this one, so a later
+                    // Uplink RAN Status Transfer cannot follow it to a gNB the UE is not
+                    // moving to; a preparation still in progress is cancelled.
+                    self.supersede_handover_in_progress(amf_ue_ngap_id).await;
+                    self.forget_handover_preparation(amf_ue_ngap_id);
                     let failure = nextgcore_ngap::types::HandoverPreparationFailure {
                         amf_ue_ngap_id,
                         ran_ue_ngap_id,
@@ -10509,6 +10515,8 @@ impl NgapServer {
             cause: nextgcore_ngap::types::Cause::RadioNetwork(cause),
             criticality_diagnostics: None,
         };
+        self.supersede_handover_in_progress(required.amf_ue_ngap_id)
+            .await;
         self.forget_handover_preparation(required.amf_ue_ngap_id);
         if let Some(bytes) = crate::ngap_asn1::build_handover_preparation_failure_asn1(&failure) {
             self.send_to_association(association_id, &bytes).await?;
@@ -10528,20 +10536,7 @@ impl NgapServer {
         required: nextgcore_ngap::types::HandoverRequired,
     ) -> Result<()> {
         let ue = required.amf_ue_ngap_id;
-        // #964 review: a preparation still in progress is superseded -- the source has
-        // abandoned it. Its target releases what it prepared and its SMFs are told
-        // CANCELLED, keyed ahead of this preparation's PREPARING.
-        if self.ho_preparations.contains_key(&ue)
-            || self.ho_commands.contains_key(&ue)
-            || self.handover_pending_target.contains_key(&ue)
-        {
-            log::info!(
-                "HandoverRequired for UE {ue} supersedes the preparation in progress; it is \
-                 cancelled"
-            );
-            self.release_cancelled_handover_target(ue, "HO_CANCEL")
-                .await;
-        }
+        self.supersede_handover_in_progress(ue).await;
         // #742: a new preparation starts from nothing. An earlier one that ended without
         // a Notify must not contribute a session transfer the new target never admitted.
         self.forget_handover_preparation(ue);
@@ -10615,6 +10610,24 @@ impl NgapServer {
             },
         );
         Ok(())
+    }
+
+    /// A new HandoverRequired from the source supersedes a preparation still in progress
+    /// for the UE (#964 review; #844 review for the refusals): the source has abandoned it,
+    /// so its target releases what it prepared and its SMFs are told CANCELLED, keyed
+    /// ahead of anything the new request starts.
+    async fn supersede_handover_in_progress(&mut self, ue: u64) {
+        if self.ho_preparations.contains_key(&ue)
+            || self.ho_commands.contains_key(&ue)
+            || self.handover_pending_target.contains_key(&ue)
+        {
+            log::info!(
+                "HandoverRequired for UE {ue} supersedes the preparation in progress; it is \
+                 cancelled"
+            );
+            self.release_cancelled_handover_target(ue, "HO_CANCEL")
+                .await;
+        }
     }
 
     /// HANDOVER PREPARATION FAILURE for an intra-5GS preparation this AMF could not carry
@@ -23946,11 +23959,31 @@ mod tests {
             }
         });
 
-        for (name, pdu) in [("fivegs-to-utran", to_utran), ("targetRNC-ID", to_rnc)] {
+        for (name, pdu) in [
+            ("fivegs-to-utran", to_utran.clone()),
+            ("targetRNC-ID", to_rnc),
+        ] {
+            // #844 review, MINOR 2: a relay target and a session transfer left over from an
+            // earlier preparation do not survive the refusal.
+            server.handover_target_assoc.insert(7_744_001, (97_442, 7));
+            server
+                .handover_target_transfers
+                .insert((7_744_001, 1), vec![0xEE]);
             server
                 .handle_handover_required(source, &pdu)
                 .await
                 .expect("handled");
+            assert!(
+                !server.handover_target_assoc.contains_key(&7_744_001),
+                "{name}: no stale relay target"
+            );
+            assert!(
+                !server
+                    .handover_target_transfers
+                    .keys()
+                    .any(|(u, _)| *u == 7_744_001),
+                "{name}: no stale session transfer"
+            );
             let sent = take_sent_ngap(&mut server);
             assert_eq!(sent.len(), 1, "{name}: {sent:?}");
             assert_eq!(sent[0].0, source);
@@ -23980,16 +24013,93 @@ mod tests {
             );
         }
 
-        // Negative control: bytes that do not decode still get the Error Indication.
+        // #844 review, MINOR 3: an unsupported type with a mandatory IE missing (the
+        // Source to Target Transparent Container) fails the §10.3.4.2 check first: a
+        // HANDOVER PREPARATION FAILURE with abstract-syntax-error-reject and diagnostics
+        // naming the missing IE, not ho-target-not-allowed.
+        let missing_container = {
+            let mut pdu = nextgcore_ngap_gen::decode(&to_utran).expect("decodes");
+            let g::NGAP_PDU::InitiatingMessage(m) = &mut pdu else {
+                unreachable!()
+            };
+            let g::InitiatingMessageValue::Id_HandoverPreparation(r) = &mut m.value else {
+                unreachable!()
+            };
+            r.protocol_i_es
+                .0
+                .retain(|ie| !matches!(ie.value, Ie::Id_SourceToTarget_TransparentContainer(_)));
+            nextgcore_ngap_gen::encode(&pdu).expect("re-encodes")
+        };
+        server
+            .handle_handover_required(source, &missing_container)
+            .await
+            .expect("handled");
+        let sent = take_sent_ngap(&mut server);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let g::NGAP_PDU::UnsuccessfulOutcome(m) =
+            nextgcore_ngap_gen::decode(&sent[0].1).expect("decodes")
+        else {
+            panic!("not a HANDOVER PREPARATION FAILURE");
+        };
+        let g::UnsuccessfulOutcomeValue::Id_HandoverPreparation(failure) = m.value else {
+            panic!("not a HANDOVER PREPARATION FAILURE");
+        };
+        let (mut cause, mut missing) = (None, Vec::new());
+        for ie in failure.protocol_i_es.0 {
+            use g::HandoverPreparationFailureProtocolIEs_EntryValue as F;
+            match ie.value {
+                F::Id_Cause(c) => cause = Some(c),
+                F::Id_CriticalityDiagnostics(d) => {
+                    for item in d
+                        .i_es_criticality_diagnostics
+                        .map(|l| l.0)
+                        .unwrap_or_default()
+                    {
+                        if item.type_of_error.0 == g::TypeOfError::MISSING {
+                            missing.push(item.ie_id.0);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            cause,
+            Some(g::Cause::Protocol(g::CauseProtocol(
+                g::CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT
+            )))
+        );
+        assert_eq!(missing, vec![g::ID_SOURCE_TO_TARGET_TRANSPARENT_CONTAINER]);
+
+        // Negative control: bytes that do not decode still get the Error Indication, with
+        // transfer-syntax-error (#844 review, MINOR 4: decoded, not just its first octets).
         server
             .handle_handover_required(source, &[0x00, 0x0C, 0x00])
             .await
             .expect("handled");
         let sent = take_sent_ngap(&mut server);
         assert_eq!(sent.len(), 1);
+        let g::NGAP_PDU::InitiatingMessage(m) =
+            nextgcore_ngap_gen::decode(&sent[0].1).expect("decodes")
+        else {
+            panic!("not an initiating message");
+        };
+        let g::InitiatingMessageValue::Id_ErrorIndication(ei) = m.value else {
+            panic!("not an Error Indication");
+        };
+        let cause = ei
+            .protocol_i_es
+            .0
+            .into_iter()
+            .find_map(|ie| match ie.value {
+                g::ErrorIndicationProtocolIEs_EntryValue::Id_Cause(c) => Some(c),
+                _ => None,
+            });
         assert_eq!(
-            sent[0].1[1],
-            nextgcore_ngap_gen::generated::ID_ERROR_INDICATION,
+            cause,
+            Some(g::Cause::Protocol(g::CauseProtocol(
+                g::CauseProtocol::TRANSFER_SYNTAX_ERROR
+            ))),
             "an undecodable PDU is still a transfer-syntax error"
         );
     }
