@@ -18,13 +18,15 @@ use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+const CREATE_SESSION_REQUEST: u8 = 32;
 const DELETE_SESSION_REQUEST: u8 = 36;
 const DELETE_SESSION_RESPONSE: u8 = 37;
 const DETACH_ACCEPT: u8 = 0x46;
 
 /// A DETACH REQUEST (TS 24.301 §8.2.11.1, EPS detach) with the UE's GUTI,
-/// integrity protected under EIA2 at uplink COUNT 0.
-fn detach_request(switch_off: bool) -> Vec<u8> {
+/// integrity protected under EIA2 at uplink COUNT `count` (sequence number
+/// its low octet).
+fn detach_request(switch_off: bool, count: u32) -> Vec<u8> {
     let detach_type = 0x01 | if switch_off { 0x08 } else { 0 };
     let plain = [
         0x07u8,
@@ -43,21 +45,21 @@ fn detach_request(switch_off: bool) -> Vec<u8> {
         0x09,
         0x61,
     ];
-    let mut signed = vec![0u8];
+    let mut signed = vec![count as u8];
     signed.extend_from_slice(&plain);
-    let mac = crate::nas_security::nas_mac_calculate(2, &KNAS_INT, 0, 0, 0, &signed);
+    let mac = crate::nas_security::nas_mac_calculate(2, &KNAS_INT, count, 0, 0, &signed);
     let mut pdu = vec![0x17u8];
     pdu.extend_from_slice(&mac);
     pdu.extend_from_slice(&signed);
     pdu
 }
 
-fn send_detach(ue: &Ue, switch_off: bool) {
+fn send_detach(ue: &Ue, switch_off: bool, count: u32) {
     crate::nas_dispatch::nas_eps_handle_uplink(
         mme_self(),
         crate::nas_dispatch::UplinkNas {
             enb_ue_id: ue.enb_ue_id,
-            nas_pdu: &detach_request(switch_off),
+            nas_pdu: &detach_request(switch_off, count),
             s_tmsi: None,
         },
     );
@@ -147,7 +149,7 @@ fn a_ue_initiated_detach_deletes_every_pdn_connection_then_accepts() {
     let sent0 = crate::gtp_path::DELETE_SESSION_REQUESTS_TOTAL.load(Ordering::Relaxed);
     let accepted0 = crate::gtp_path::DELETE_SESSION_ACCEPTED_TOTAL.load(Ordering::Relaxed);
 
-    send_detach(&ue, false);
+    send_detach(&ue, false, 0);
 
     let reqs = delete_sessions(&sgw, 2);
     let mut seen: Vec<_> = reqs.iter().map(|(m, _)| delete_session(m)).collect();
@@ -164,6 +166,16 @@ fn a_ue_initiated_detach_deletes_every_pdn_connection_then_accepts() {
     let mme_ue = ctx.mme_ue_find_by_id(ue.mme_ue_id).expect("waits");
     assert!(mme_ue.sess_list.is_empty(), "released locally at once");
     assert_eq!(tapped(ue.enb_id), (0, 0), "nothing to the UE yet");
+
+    // #1106 review MINOR 1: the UE's T3421 retransmission is the same detach,
+    // and keeps waiting rather than completing ahead of the Serving GW.
+    send_detach(&ue, false, 1);
+    assert!(ctx.mme_ue_find_by_id(ue.mme_ue_id).is_some(), "still waits");
+    assert_eq!(
+        tapped(ue.enb_id),
+        (0, 0),
+        "nothing to the UE on the retransmission"
+    );
 
     // The first answer: one still outstanding.
     answer(&sgw, &ue, &reqs[0].0, reqs[0].1);
@@ -203,7 +215,7 @@ fn a_switch_off_detach_deletes_the_pdn_connection_without_a_detach_accept() {
     crate::s1ap_path::tap_enb_for_test(ue.enb_id);
     let _ = crate::s1ap_path::take_tapped_for_test(ue.enb_id);
 
-    send_detach(&ue, true);
+    send_detach(&ue, true, 0);
 
     let (req, from) = recv(&sgw, DELETE_SESSION_REQUEST);
     assert_eq!(delete_session(&req), (Some(SGW_S11_TEID), 5, true));
@@ -244,7 +256,7 @@ fn an_unanswered_delete_session_request_does_not_block_the_detach() {
     let _ = crate::s1ap_path::take_tapped_for_test(ue.enb_id);
     let timeouts0 = crate::gtp_path::DELETE_SESSION_TIMEOUTS_TOTAL.load(Ordering::Relaxed);
 
-    send_detach(&ue, false);
+    send_detach(&ue, false, 0);
 
     let (req, _) = recv(&sgw, DELETE_SESSION_REQUEST);
     assert_eq!(delete_session(&req), (Some(SGW_S11_TEID), 5, true));
@@ -313,5 +325,84 @@ fn a_re_attach_deletes_the_replaced_contexts_pdn_connections() {
     assert_ne!(fresh, ue.mme_ue_id);
     ctx.mme_ue_remove(fresh);
     ctx.enb_ue_remove(new_conn);
+    cleanup(&ue);
+}
+
+/// #1106 review MINOR 2: the new attach's Create Session Request is held until
+/// the Delete Session Requests of the context it replaced are answered. Sent
+/// ahead of them, a lost one retransmitted after it could delete the new
+/// session at a Serving GW that finds the UE by IMSI.
+#[test]
+fn a_re_attach_holds_its_create_session_until_the_old_deletions_settle() {
+    let _guard = lock_s11();
+    let (sgw, _route) = sgw(Gtp2XactConfig::default());
+    let stale = seed(0x1107, &[5]);
+    let fresh = seed(0x1108, &[5]);
+    let ctx = mme_self();
+    let imsi = format!("99970001107{:04}", stale.mme_ue_id % 10_000);
+    for id in [stale.mme_ue_id, fresh.mme_ue_id] {
+        ctx.mme_ue_pool
+            .write()
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .imsi_bcd = imsi.clone();
+    }
+
+    let sent = crate::gtp_path::send_delete_all_sessions_for_replaced(ctx, stale.mme_ue_id, &imsi)
+        .expect("sent");
+    assert_eq!(sent.len(), 1);
+    let (req, from) = recv(&sgw, DELETE_SESSION_REQUEST);
+    assert_eq!(delete_session(&req), (Some(SGW_S11_TEID), 5, true));
+    assert!(
+        crate::gtp_path::defer_create_while_replaced(
+            &imsi,
+            fresh.enb_ue_id,
+            fresh.sess_id,
+            crate::s11_build::GtpCreateAction::AttachRequest,
+        ),
+        "held"
+    );
+    sgw.set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    let mut buf = [0u8; 4096];
+    assert!(
+        sgw.recv_from(&mut buf).is_err(),
+        "no Create Session Request yet"
+    );
+    sgw.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+
+    answer(&sgw, &stale, &req, from);
+    let (csr, _) = recv(&sgw, CREATE_SESSION_REQUEST);
+    assert_eq!(
+        csr.header.message_type, CREATE_SESSION_REQUEST,
+        "sent once settled"
+    );
+    assert!(
+        !crate::gtp_path::defer_create_while_replaced(
+            &imsi,
+            fresh.enb_ue_id,
+            fresh.sess_id,
+            crate::s11_build::GtpCreateAction::AttachRequest,
+        ),
+        "nothing outstanding any more"
+    );
+    cleanup(&stale);
+    cleanup(&fresh);
+}
+
+/// #1106 review MINOR 3: removing a detaching context, by whatever path, drops
+/// the Delete Session records its detach waited on.
+#[test]
+fn removing_a_detaching_context_drops_its_pending_deletes() {
+    let _guard = lock_s11();
+    let (sgw, _route) = sgw(Gtp2XactConfig::default());
+    let ue = seed(0x1109, &[5]);
+    let ctx = mme_self();
+    send_detach(&ue, false, 0);
+    let _ = recv(&sgw, DELETE_SESSION_REQUEST);
+    assert!(crate::gtp_path::detach_deletes_outstanding(ue.mme_ue_id));
+    ctx.mme_ue_remove(ue.mme_ue_id);
+    assert!(!crate::gtp_path::detach_deletes_outstanding(ue.mme_ue_id));
     cleanup(&ue);
 }

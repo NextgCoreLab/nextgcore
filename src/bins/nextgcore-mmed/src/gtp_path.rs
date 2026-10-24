@@ -447,18 +447,16 @@ impl GtpcServer {
                             {
                                 take_pending_change_notification(xact.sequence_number);
                             }
-                            // #1103: a detach does not wait on a Serving GW that
-                            // does not answer: the PDN connection is already
-                            // released locally, and the detach completes.
+                            // #1103: a detach (or a re-attach's Create Session)
+                            // does not wait on a Serving GW that does not answer:
+                            // the PDN connection is already released locally.
                             if xact.message_type == s11_build::message_type::DELETE_SESSION_REQUEST
                             {
                                 DELETE_SESSION_TIMEOUTS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                if let Some(pending) = take_pending_detach(xact.sequence_number) {
-                                    crate::nas_dispatch::on_detach_delete_answered(
-                                        crate::context::mme_self(),
-                                        pending,
-                                    );
-                                }
+                                on_delete_session_settled(
+                                    crate::context::mme_self(),
+                                    xact.sequence_number,
+                                );
                             }
                             // #956: an S1 release still completes when the Serving
                             // GW does not answer its Release Access Bearers Request.
@@ -1109,8 +1107,7 @@ pub fn send_create_session_request(
     // The Sender F-TEID's address is this MME's bound S11 address, so it is the
     // socket's own rather than whatever configuration says — a mismatch would send
     // the SGW's response to an address nothing is listening on.
-    let local_s11 = server()
-        .map(|s| s.local_addr())
+    let local_s11 = bound_s11_addr()
         .or_else(|| ctx.gtpc_list.first().copied())
         .ok_or_else(|| {
             GtpPathError::InvalidState("no S11 local address to put in the Sender F-TEID".into())
@@ -1209,14 +1206,14 @@ pub fn send_delete_session_request(
 
 /// [`send_delete_session_request`], recording `pending` against the request's
 /// sequence number (before the send: the response can race it, #359) so its
-/// response or its N3 exhaustion continues the detach (#1103).
+/// response or its N3 exhaustion continues what waits on it (#1103).
 fn delete_session(
     ctx: &MmeContext,
     enb_ue_id: Option<u64>,
     sgw_ue_id: u64,
     sess_id: u64,
     action: GtpDeleteAction,
-    pending: Option<PendingDetach>,
+    pending: Option<&PendingDelete>,
 ) -> GtpPathResult<GtpXactData> {
     log::debug!("Sending Delete Session Request");
 
@@ -1253,12 +1250,14 @@ fn delete_session(
             .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
     let xact_id = ctx.next_pool_id();
     if let Some(pending) = pending {
-        if let Ok(mut map) = pending_detaches().lock() {
-            map.insert(seq, pending);
+        if let Ok(mut book) = delete_book().lock() {
+            book.pending.insert(seq, pending.clone());
         }
     }
     if let Err(e) = send_to_sgwc(ctx, &msg, xact_id) {
-        take_pending_detach(seq);
+        if let Ok(mut book) = delete_book().lock() {
+            book.pending.remove(&seq);
+        }
         return Err(e);
     }
     DELETE_SESSION_REQUESTS_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -1293,7 +1292,7 @@ pub fn send_delete_all_sessions_for_detach(ctx: &MmeContext, pending: PendingDet
         Some(pending.enb_ue_id),
         pending.mme_ue_id,
         GtpDeleteAction::SendDetachAccept,
-        Some(pending),
+        Some(&PendingDelete::Detach(pending)),
     ) {
         Ok(xacts) => xacts.len(),
         Err(GtpPathError::ContextNotFound) => 0,
@@ -1312,7 +1311,7 @@ fn delete_all_sessions(
     enb_ue_id: Option<u64>,
     mme_ue_id: u64,
     action: GtpDeleteAction,
-    pending: Option<PendingDetach>,
+    pending: Option<&PendingDelete>,
 ) -> GtpPathResult<Vec<GtpXactData>> {
     log::debug!("Sending Delete All Sessions");
 
@@ -1347,6 +1346,28 @@ fn delete_all_sessions(
     }
 }
 
+/// A context replaced by a re-attach (#1103, TS 23.401 §5.3.2.1 step 4): a
+/// Delete Session Request, Operation Indication set, for each of its PDN
+/// connections, recorded under `imsi` so the new attach's Create Session
+/// Request waits for them ([`defer_create_while_replaced`]). Sent ahead of the
+/// new session, a lost request retransmitted after it could otherwise delete
+/// the new session at a Serving GW that finds the UE by IMSI.
+pub fn send_delete_all_sessions_for_replaced(
+    ctx: &MmeContext,
+    stale_id: u64,
+    imsi: &str,
+) -> GtpPathResult<Vec<GtpXactData>> {
+    delete_all_sessions(
+        ctx,
+        None,
+        stale_id,
+        GtpDeleteAction::NoAction,
+        Some(&PendingDelete::Replaced {
+            imsi: imsi.to_string(),
+        }),
+    )
+}
+
 /// A UE-initiated detach waiting for its Delete Session Responses before the
 /// DETACH ACCEPT (unless switching off) and the S1 release (#1103, TS 23.401
 /// §5.3.8.2.1 steps 2-8).
@@ -1360,33 +1381,132 @@ pub struct PendingDetach {
     pub switch_off: bool,
 }
 
-/// The Delete Session Requests a [`PendingDetach`] waits on, by sequence
-/// number. TAKEN by the response, or by the request's N3 exhaustion, so a
-/// detach never waits on a Serving GW that does not answer.
-static PENDING_DETACHES: OnceLock<Mutex<HashMap<u32, PendingDetach>>> = OnceLock::new();
-
-fn pending_detaches() -> &'static Mutex<HashMap<u32, PendingDetach>> {
-    PENDING_DETACHES.get_or_init(|| Mutex::new(HashMap::new()))
+/// What waits on a Delete Session Request (#1103).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingDelete {
+    /// A UE-initiated detach.
+    Detach(PendingDetach),
+    /// The new attach of the UE `imsi`, whose old context these delete.
+    Replaced { imsi: String },
 }
 
-/// Take the detach the Delete Session Request at `seq` was for, if any.
-pub fn take_pending_detach(seq: u32) -> Option<PendingDetach> {
-    pending_detaches().lock().ok()?.remove(&seq)
+/// A Create Session Request held until a replaced context's deletions settle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeferredCreate {
+    enb_ue_id: u64,
+    sess_id: u64,
+    action: GtpCreateAction,
+}
+
+/// The Delete Session Requests something waits on, by sequence number, and the
+/// Create Session Requests held behind a replaced context's. One lock, so a
+/// create cannot be deferred behind deletions that settle meanwhile.
+/// Entries are TAKEN by the response, or by the request's N3 exhaustion, so
+/// nothing waits on a Serving GW that does not answer.
+#[derive(Default)]
+struct DeleteBook {
+    pending: HashMap<u32, PendingDelete>,
+    deferred: HashMap<String, Vec<DeferredCreate>>,
+}
+
+static DELETE_BOOK: OnceLock<Mutex<DeleteBook>> = OnceLock::new();
+
+fn delete_book() -> &'static Mutex<DeleteBook> {
+    DELETE_BOOK.get_or_init(|| Mutex::new(DeleteBook::default()))
+}
+
+/// The Delete Session Request at `seq` was answered or exhausted its
+/// retransmissions: continue whatever waited on it.
+pub fn on_delete_session_settled(ctx: &MmeContext, seq: u32) {
+    let (settled, creates) = {
+        let Ok(mut book) = delete_book().lock() else {
+            return;
+        };
+        let Some(settled) = book.pending.remove(&seq) else {
+            return;
+        };
+        let creates = match &settled {
+            PendingDelete::Replaced { imsi } => {
+                let outstanding = book
+                    .pending
+                    .values()
+                    .any(|p| matches!(p, PendingDelete::Replaced { imsi: i } if i == imsi));
+                if outstanding {
+                    Vec::new()
+                } else {
+                    book.deferred.remove(imsi).unwrap_or_default()
+                }
+            }
+            PendingDelete::Detach(_) => Vec::new(),
+        };
+        (settled, creates)
+    };
+    if let PendingDelete::Detach(pending) = settled {
+        crate::nas_dispatch::on_detach_delete_answered(ctx, pending);
+    }
+    for create in creates {
+        match send_create_session_request(ctx, create.enb_ue_id, create.sess_id, create.action) {
+            Ok(_) => log::info!(
+                "session {}: the replaced context's Delete Session Requests settled; Create \
+                 Session Request sent",
+                create.sess_id
+            ),
+            Err(e) => log::error!(
+                "session {}: deferred Create Session Request not sent: {e}",
+                create.sess_id
+            ),
+        }
+    }
+}
+
+/// Hold the Create Session Request for `sess_id` while Delete Session Requests
+/// of a context `imsi`'s re-attach replaced are unanswered; it is sent when
+/// they settle ([`on_delete_session_settled`]). `false`: nothing outstanding,
+/// send it now.
+pub fn defer_create_while_replaced(
+    imsi: &str,
+    enb_ue_id: u64,
+    sess_id: u64,
+    action: GtpCreateAction,
+) -> bool {
+    let Ok(mut book) = delete_book().lock() else {
+        return false;
+    };
+    let outstanding = book
+        .pending
+        .values()
+        .any(|p| matches!(p, PendingDelete::Replaced { imsi: i } if i == imsi));
+    if outstanding {
+        book.deferred
+            .entry(imsi.to_string())
+            .or_default()
+            .push(DeferredCreate {
+                enb_ue_id,
+                sess_id,
+                action,
+            });
+    }
+    outstanding
 }
 
 /// Whether a Delete Session Request of `mme_ue_id`'s detach is still unanswered.
 pub fn detach_deletes_outstanding(mme_ue_id: u64) -> bool {
-    pending_detaches()
+    delete_book()
         .lock()
-        .map(|map| map.values().any(|p| p.mme_ue_id == mme_ue_id))
+        .map(|book| {
+            book.pending
+                .values()
+                .any(|p| matches!(p, PendingDelete::Detach(d) if d.mme_ue_id == mme_ue_id))
+        })
         .unwrap_or(false)
 }
 
 /// Forget every Delete Session Request `mme_ue_id`'s detach waits on: the
-/// detach completed or the context went another way.
+/// detach completed or the context is removed (`MmeContext::mme_ue_remove`).
 pub fn drop_pending_detaches(mme_ue_id: u64) {
-    if let Ok(mut map) = pending_detaches().lock() {
-        map.retain(|_, p| p.mme_ue_id != mme_ue_id);
+    if let Ok(mut book) = delete_book().lock() {
+        book.pending
+            .retain(|_, p| !matches!(p, PendingDelete::Detach(d) if d.mme_ue_id == mme_ue_id));
     }
 }
 
@@ -2382,6 +2502,15 @@ pub fn send_delete_bearer_command(
 /// `ctx.next_pool_id()` — a pool index. TS 29.274 §7.6 requires one sequence number
 /// per outstanding initial message, echoed in the response, so both spellings made
 /// correlation impossible.
+/// The bound S11 socket's address (in a test, the routed server's).
+fn bound_s11_addr() -> Option<SocketAddr> {
+    #[cfg(test)]
+    if let Some((server, _)) = test_route(None) {
+        return Some(server.local_addr());
+    }
+    server().map(|s| s.local_addr())
+}
+
 fn sequence() -> GtpPathResult<u32> {
     #[cfg(test)]
     if let Some((server, _)) = test_route(None) {

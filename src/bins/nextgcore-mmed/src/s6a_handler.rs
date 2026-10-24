@@ -386,7 +386,6 @@ pub fn mme_s6a_process_inbound(inbound: &crate::fd_path::InboundS6aRequest) -> S
                         .and_then(|id| ctx.enb_ue_find_by_id(id))
                         .filter(|e| e.mme_ue_id == ue_id);
                     crate::network_detach::delete_pdn_connections_locally(ctx, ue_id);
-                    crate::gtp_path::drop_pending_detaches(ue_id);
                     ctx.mme_ue_remove(ue_id);
                     // The UE is at the other MME: an S1 connection left here is
                     // stale.

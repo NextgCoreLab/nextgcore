@@ -402,12 +402,10 @@ pub fn dispatch_triggered(raw: &[u8], msg_type: u8, sequence_number: u32, peer: 
                     log::error!("S11 Delete Session Response from {peer} unparsable: {e:?}")
                 }
             }
-            // #1103, TS 23.401 §5.3.8.2.1 steps 2-8: a UE-initiated detach
-            // waits on this response, whatever it says: the PDN connection is
-            // already released locally (TS 29.274 §7.2.10.1).
-            if let Some(pending) = crate::gtp_path::take_pending_detach(sequence_number) {
-                crate::nas_dispatch::on_detach_delete_answered(crate::context::mme_self(), pending);
-            }
+            // #1103, TS 23.401 §5.3.8.2.1 steps 2-8: a UE-initiated detach (or a
+            // re-attach's Create Session) waits on this response, whatever it
+            // says: the PDN connection is already released locally.
+            crate::gtp_path::on_delete_session_settled(crate::context::mme_self(), sequence_number);
         }
         mt::RELEASE_ACCESS_BEARERS_RESPONSE => match handle_release_access_bearers_response(raw) {
             Ok(data) => {
