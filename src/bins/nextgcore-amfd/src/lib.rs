@@ -81,6 +81,11 @@ pub mod test_support {
     /// because the guard is held across the drain's `.await`s.
     pub static CONNECTED_DOWNLINK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    /// Serialises tests that set the AUSF endpoint environment variables
+    /// (`AUSF_SBI_ADDR` / `AUSF_SBI_PORT`), for the same reason as
+    /// [`SMF_ENV_LOCK`].
+    pub static AUSF_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
     /// Serialises tests that set the UCMF endpoint environment variables
     /// (`UCMF_SBI_ADDR` / `UCMF_SBI_PORT`), for the same reason as
     /// [`SMF_ENV_LOCK`].
