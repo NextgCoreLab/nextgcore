@@ -56,6 +56,11 @@ pub(crate) enum SbiOutcome {
     /// #964: the SMF's answer to an N2 handover step (PREPARING or PREPARED) for one
     /// PDU session.
     N2Handover(crate::ngap_path::N2HandoverAnswer),
+    /// #748: the UCMF's Assign for a UE whose UE radio capability ID it retired.
+    RacsAssigned {
+        amf_ue_ngap_id: u64,
+        result: Result<Vec<u8>, String>,
+    },
 }
 
 /// What keyed work is serialised on: (AMF UE NGAP ID, PDU session ID).

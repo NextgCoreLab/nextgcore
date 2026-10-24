@@ -988,6 +988,10 @@ pub(crate) struct EstablishmentAttempt {
     result: Result<crate::sbi_path::SmContextCreateResponse, crate::sbi_path::SbiError>,
 }
 
+/// The `sbi_offload` key PSI of a UE's UCMF exchanges (#748): 0 is no PDU
+/// session (TS 24.007 §11.2.3.1b), so they never queue behind a session's N11.
+const RACS_SBI_KEY_PSI: u8 = 0;
+
 /// How many SBI exchanges run off the NGAP task at once (#796 review M1).
 const MAX_OFFLOADED_SBI: usize = 16;
 
@@ -1203,6 +1207,7 @@ impl NgapServer {
         // N1 in a DOWNLINK NAS TRANSPORT. Dormant when none pending.
         self.process_connected_downlinks().await;
 
+        self.process_racs_reassignments();
         self.process_sbi_outcomes().await;
         self.process_handover_deadlines().await;
         self.process_pending_establishments().await;
@@ -6590,6 +6595,102 @@ impl NgapServer {
         Ok(())
     }
 
+    /// #748: after a UCMF notification retired UE radio capability IDs, give every
+    /// UE that held one a new ID (TS 23.501 §5.4.4.1a: the AMF "shall proceed to
+    /// assign a new PLMN assigned UE Radio Capability ID to all the UEs ... using a
+    /// UE Configuration Update procedure, or when these UEs perform a
+    /// Registration").
+    ///
+    /// A deletion keyed on TACs first retires the IDs the UEs of those TACs hold,
+    /// which the cache may not know. Then each RACS UE with a retired (or already
+    /// withdrawn) ID, a stored capability and a PEI gets a UCMF Assign, off this
+    /// task and keyed on the UE, applied in [`Self::apply_racs_reassignment`].
+    fn process_racs_reassignments(&mut self) {
+        let Some(deleted_tacs) = crate::racs::take_reassignment() else {
+            return;
+        };
+        for (ue, state) in self.ue_auth_state.snapshot() {
+            let amf_ue = &state.amf_ue;
+            if !amf_ue.racs_supported {
+                continue;
+            }
+            let tac = amf_ue.pei.as_deref().and_then(crate::racs::tac_from_pei);
+            if let (Some(id), Some(tac)) = (amf_ue.ue_radio_capability_id.as_deref(), &tac) {
+                if crate::racs::is_plmn_assigned(id) && deleted_tacs.contains(tac) {
+                    crate::racs::retire(id);
+                }
+            }
+            let needs_new = amf_ue
+                .ue_radio_capability_id
+                .as_deref()
+                .is_none_or(crate::racs::is_retired);
+            let (Some(tac), false, true) = (tac, amf_ue.ue_radio_capability.is_empty(), needs_new)
+            else {
+                continue;
+            };
+            let capability = amf_ue.ue_radio_capability.clone();
+            log::info!(
+                "UE {ue}: UE radio capability ID retired by the UCMF; assigning a new one \
+                 (TAC {tac}, TS 23.501 §5.4.4.1a)"
+            );
+            self.sbi_offload
+                .spawn_keyed((ue, RACS_SBI_KEY_PSI), move || async move {
+                    let result = crate::racs::ucmf_assign(&tac, &capability).await;
+                    Some(crate::sbi_offload::SbiOutcome::RacsAssigned {
+                        amf_ue_ngap_id: ue,
+                        result,
+                    })
+                });
+        }
+    }
+
+    /// #748: a UCMF Assign for a UE whose ID was retired came back. The UE keeps the
+    /// new ID; a registered, CM-CONNECTED UE gets it in a CONFIGURATION UPDATE
+    /// COMMAND now (deferred by [`Self::send_racs_configuration_update`] while
+    /// another NAS procedure runs), any other at its next Registration Accept.
+    async fn apply_racs_reassignment(
+        &mut self,
+        amf_ue_ngap_id: u64,
+        result: Result<Vec<u8>, String>,
+    ) -> Result<()> {
+        let id = match result {
+            Ok(id) => id,
+            Err(e) => {
+                log::warn!("UE {amf_ue_ngap_id}: no new UE radio capability ID: {e}");
+                return Ok(());
+            }
+        };
+        let connection = self
+            .ue_auth_state
+            .with_mut(amf_ue_ngap_id, |s| {
+                // Something newer may have given the UE a usable ID meanwhile.
+                let stale = s
+                    .amf_ue
+                    .ue_radio_capability_id
+                    .as_deref()
+                    .is_none_or(crate::racs::is_retired);
+                if stale {
+                    s.amf_ue.ue_radio_capability_id = Some(id.clone());
+                    s.amf_ue.ue_radio_capability_id_known_to_ue = false;
+                }
+                (stale && !s.is_cm_idle()).then_some((s.association_id, s.ran_ue_ngap_id))
+            })
+            .flatten();
+        log::info!(
+            "UCMF re-assigned UE radio capability ID {id:02x?} to UE {amf_ue_ngap_id}{}",
+            if connection.is_some() {
+                ""
+            } else {
+                " (delivered at its next registration)"
+            }
+        );
+        if let Some((association_id, ran_ue_ngap_id)) = connection {
+            self.send_racs_configuration_update(association_id, amf_ue_ngap_id, ran_ue_ngap_id)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// #570: UE RADIO CAPABILITY ID MAPPING (TS 38.413 §8.14.3): answer with the UE
     /// radio capability mapped to the ID, from the AMF's cache or a UCMF Resolve.
     ///
@@ -8276,6 +8377,16 @@ impl NgapServer {
                 crate::sbi_offload::SbiOutcome::Establishment(attempt) => {
                     if let Err(e) = self.apply_establishment_attempt(attempt).await {
                         log::warn!("Establishment retry outcome not applied: {e}");
+                    }
+                }
+                crate::sbi_offload::SbiOutcome::RacsAssigned {
+                    amf_ue_ngap_id,
+                    result,
+                } => {
+                    if let Err(e) = self.apply_racs_reassignment(amf_ue_ngap_id, result).await {
+                        log::warn!(
+                            "UE {amf_ue_ngap_id}: re-assigned UE radio capability ID not sent: {e}"
+                        );
                     }
                 }
             }

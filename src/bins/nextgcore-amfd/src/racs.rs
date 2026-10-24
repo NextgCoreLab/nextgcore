@@ -140,6 +140,13 @@ struct Cache {
     deleted: HashSet<Vec<u8>>,
     /// The UCMF's current Version ID, when a NEW_VERSION_ID notification told us.
     current_version: Option<u8>,
+    /// #748: the Type Allocation Code each cached ID is assigned under (TS 29.673
+    /// `DicEntryData.typeAllocationCode`), so a deletion keyed on TACs finds them.
+    tacs: HashMap<Vec<u8>, String>,
+    /// #748: a notification retired IDs since the NGAP task last looked, so UEs may
+    /// need a new one (TS 23.501 §5.4.4.1a). With the TACs a deletion named, whose
+    /// UE-held IDs the cache may not know.
+    reassignment: Option<Vec<String>>,
 }
 
 /// The AMF's RACS state. Process-global, with its lock declared beside it.
@@ -163,11 +170,39 @@ pub fn cache_put(id: &[u8], capability: &[u8]) {
             while c.order.len() > CACHE_CAPACITY {
                 if let Some(old) = c.order.pop_front() {
                     c.entries.remove(&old);
+                    c.tacs.remove(&old);
                 }
             }
         }
         c.deleted.remove(id);
     });
+}
+
+/// [`cache_put`], recording the TAC the ID is assigned under (#748).
+pub fn cache_put_with_tac(id: &[u8], capability: &[u8], tac: &str) {
+    cache_put(id, capability);
+    with_cache(|c| {
+        if c.entries.contains_key(id) {
+            c.tacs.insert(id.to_vec(), tac.to_string());
+        }
+    });
+}
+
+/// Retire `id`: a UE-held ID under a TAC a deletion named (#748).
+pub fn retire(id: &[u8]) {
+    with_cache(|c| {
+        c.entries.remove(id);
+        c.order.retain(|o| o != id);
+        c.tacs.remove(id);
+        c.deleted.insert(id.to_vec());
+    });
+}
+
+/// #748: whether a notification retired IDs since the last call, and if so the
+/// TACs a deletion named (possibly none). Taken once: the NGAP task then retires
+/// the UE-held IDs under those TACs and re-assigns (TS 23.501 §5.4.4.1a).
+pub fn take_reassignment() -> Option<Vec<String>> {
+    with_cache(|c| c.reassignment.take())
 }
 
 /// Whether the AMF must no longer use `id` (deleted at the UCMF, or a PLMN-assigned
@@ -188,7 +223,7 @@ pub fn apply_notification(body: &serde_json::Value) -> Vec<Vec<u8>> {
     let event = body.get("eventType").and_then(|e| e.as_str()).unwrap_or("");
     match event {
         "DELETION_OF_PLMN_ASSIGNED_IDS" => {
-            let ids: Vec<Vec<u8>> = body
+            let mut ids: Vec<Vec<u8>> = body
                 .pointer("/manAssOpRequestlist/plmnAssiUeRadioCapId")
                 .and_then(|l| l.as_array())
                 .map(|l| {
@@ -197,12 +232,31 @@ pub fn apply_notification(body: &serde_json::Value) -> Vec<Vec<u8>> {
                         .collect()
                 })
                 .unwrap_or_default();
+            // #748: TS 29.673 `ManAssOpRequestlist` is oneOf the IDs or a
+            // `typeAllocationCode` list: every PLMN-assigned ID under those TACs.
+            let tacs: Vec<String> = body
+                .pointer("/manAssOpRequestlist/typeAllocationCode")
+                .and_then(|l| l.as_array())
+                .map(|l| {
+                    l.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
             with_cache(|c| {
+                ids.extend(
+                    c.tacs
+                        .iter()
+                        .filter(|(id, tac)| is_plmn_assigned(id) && tacs.contains(tac))
+                        .map(|(id, _)| id.clone()),
+                );
                 for id in &ids {
                     c.entries.remove(id);
                     c.order.retain(|o| o != id);
+                    c.tacs.remove(id);
                     c.deleted.insert(id.clone());
                 }
+                c.reassignment.get_or_insert_with(Vec::new).extend(tacs);
             });
             ids
         }
@@ -223,7 +277,10 @@ pub fn apply_notification(body: &serde_json::Value) -> Vec<Vec<u8>> {
                 for id in &stale {
                     c.entries.remove(id);
                     c.order.retain(|o| o != id);
+                    c.tacs.remove(id);
                 }
+                // #748: every UE holding an ID of another Version ID needs a new one.
+                c.reassignment.get_or_insert_with(Vec::new);
                 stale
             })
         }
@@ -570,7 +627,17 @@ pub async fn ucmf_resolve(id: &[u8]) -> Result<Option<Vec<u8>>, String> {
         200 => {
             let cap = capability_5gs_part(&response)
                 .ok_or("Resolve answer carries no ueRadioCapability5GS part")?;
-            cache_put(id, &cap);
+            // #748: `DicEntryData.typeAllocationCode` is mandatory; kept so a deletion
+            // by TAC finds this ID.
+            let tac = serde_json::from_str::<serde_json::Value>(
+                response.http.content.as_deref().unwrap_or_default(),
+            )
+            .ok()
+            .and_then(|j| j.get("typeAllocationCode")?.as_str().map(str::to_string));
+            match tac {
+                Some(tac) => cache_put_with_tac(id, &cap, &tac),
+                None => cache_put(id, &cap),
+            }
             Ok(Some(cap))
         }
         404 => {
@@ -617,7 +684,7 @@ pub async fn ucmf_assign(tac: &str, capability: &[u8]) -> Result<Vec<u8>, String
         .and_then(|v| v.as_str())
         .and_then(from_nucmf)
         .ok_or("Assign answer carries no valid plmnAssiUeRadioCapId")?;
-    cache_put(&id, capability);
+    cache_put_with_tac(&id, capability, tac);
     Ok(id)
 }
 
