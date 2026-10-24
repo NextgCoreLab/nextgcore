@@ -70,6 +70,17 @@ pub struct GtpuPeerState {
     pub path_failed: bool,
 }
 
+/// What an Echo Response meant to the [`GtpuPathTable`] (#887).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EchoResponse {
+    /// It answered our outstanding request: the path is alive. `recovered` when the
+    /// path had been declared FAILED, so the CP function is told it recovered (#935).
+    Answered { recovered: bool },
+    /// Not an answer to anything we sent (unknown peer, no outstanding request, or a
+    /// sequence number that does not match). Ignored.
+    Unsolicited,
+}
+
 /// Per-N3-peer path management table.
 ///
 /// Tracks Echo Request/Response exchanges for each gNB address derived from
@@ -79,9 +90,6 @@ pub struct GtpuPathTable {
     peers: HashMap<SocketAddr, GtpuPeerState>,
     /// Rolling sequence counter for outbound Echo Requests (never zero).
     next_seq: u16,
-    /// Our own restart counter included in outbound Echo Requests. Fixed at 0
-    /// for a fresh UPF process (incremented on restart by an operator).
-    pub restart_counter: u8,
     /// Consecutive missed responses before declaring path failure (default 3).
     pub miss_threshold: u32,
     /// Echo interval in seconds (default 60, per TS 23.007).
@@ -95,7 +103,6 @@ impl Default for GtpuPathTable {
         Self {
             peers: HashMap::new(),
             next_seq: 1,
-            restart_counter: 0,
             miss_threshold: 3,
             echo_interval_secs: 60,
             enabled: true,
@@ -114,20 +121,43 @@ impl GtpuPathTable {
         self.peers.remove(peer);
     }
 
-    /// Called on receiving an Echo Response from `peer`: the path is alive.
+    /// Track exactly the paths IN USE (#887 review, TS 29.281 §7.2.1: "Echo Request
+    /// messages may be sent for each path in use ... if at least one ... PDU Session
+    /// ... uses the path"): add the peers of `in_use` and DROP every other one. Before,
+    /// a peer was only ever added, so the table kept every gNB address ever used --
+    /// and now that a failed path keeps being probed (to see it recover), a gNB that
+    /// left would otherwise be probed for the life of the process.
+    pub fn sync_peers(&mut self, in_use: &HashSet<SocketAddr>) {
+        self.peers.retain(|peer, _| in_use.contains(peer));
+        for &peer in in_use {
+            self.add_peer(peer);
+        }
+    }
+
+    /// Called on receiving an Echo Response from `peer` carrying sequence number `seq`.
     ///
-    /// The Recovery IE it carries says nothing about a restart. TS 29.281 §8.2:
-    /// "The value of the restart counter shall be set to 0 by the sending entity
-    /// and ignored by the receiving entity" (#798 review). GTP-U restarts are
-    /// learnt through the control plane (TS 23.007), not from this counter, so
-    /// before #798's follow-up a peer sending a non-zero value was misread as
-    /// restarting on every change.
-    pub fn on_echo_response(&mut self, peer: SocketAddr) {
-        let state = self.peers.entry(peer).or_default();
+    /// #887: only an ANSWER is accepted -- a response from a peer this table probes,
+    /// whose sequence number matches the Echo Request outstanding to it (TS 29.281
+    /// §7.2.2: the response copies the request's sequence number). Anything else is
+    /// unsolicited and changes nothing. This used to create an entry for any source
+    /// address, so a spoofed response grew the table without bound -- and every entry
+    /// it created was then PROBED, making the UPF send Echo Requests to addresses of
+    /// the sender's choosing.
+    ///
+    /// The Recovery IE an answer carries says nothing about a restart (#873, TS 29.281
+    /// §8.2: "set to 0 by the sending entity and ignored by the receiving entity").
+    pub fn on_echo_response(&mut self, peer: SocketAddr, seq: Option<u16>) -> EchoResponse {
+        let Some(state) = self.peers.get_mut(&peer) else {
+            return EchoResponse::Unsolicited;
+        };
+        if seq.is_none() || state.pending_seq != seq {
+            return EchoResponse::Unsolicited;
+        }
         state.pending_seq = None;
         state.miss_count = 0;
         state.last_success = Some(std::time::Instant::now());
-        state.path_failed = false;
+        let recovered = std::mem::replace(&mut state.path_failed, false);
+        EchoResponse::Answered { recovered }
     }
 
     /// Advance the state machine by one echo interval tick.
@@ -142,18 +172,17 @@ impl GtpuPathTable {
         let mut failed = Vec::new();
 
         for (peer, state) in self.peers.iter_mut() {
-            if state.path_failed {
-                continue;
-            }
             // An outstanding request that wasn't answered counts as a miss.
             if state.pending_seq.is_some() {
-                state.miss_count += 1;
-                if state.miss_count >= self.miss_threshold {
+                state.miss_count = state.miss_count.saturating_add(1);
+                if !state.path_failed && state.miss_count >= self.miss_threshold {
                     state.path_failed = true;
                     failed.push(*peer);
-                    continue;
                 }
             }
+            // #887: a FAILED path keeps being probed. Recovery is now learned only
+            // from an answer that matches an outstanding request, so a peer that is no
+            // longer probed could never be seen to recover.
             // Issue the next Echo Request.
             let seq = self.next_seq;
             self.next_seq = self.next_seq.wrapping_add(1);
@@ -655,21 +684,19 @@ pub fn build_gtpu_echo_response(seq: Option<u16>) -> Vec<u8> {
     pkt
 }
 
-/// Build GTP-U Echo Request with Recovery IE (TS 29.281 §7.2.1).
-///
-/// Structure mirrors Echo Response: S=1, TEID=0, Recovery IE appended.
-pub fn build_gtpu_echo_request(seq: u16, restart_counter: u8) -> Vec<u8> {
-    let mut pkt = vec![0u8; 14];
+/// Build a GTP-U Echo Request (TS 29.281 §7.2.1): S=1, TEID=0, and NO information
+/// element -- §7.2.1 lists only the Private Extension (#887; the Recovery IE belongs
+/// to the Echo Response, §7.2.2).
+pub fn build_gtpu_echo_request(seq: u16) -> Vec<u8> {
+    let mut pkt = vec![0u8; 12];
     pkt[0] = 0x32; // Version=1, PT=1, S=1
     pkt[1] = gtpu_msg_type::ECHO_REQUEST;
-    // length = 4 (seq/npdu/next-ext) + 2 (Recovery IE) = 6
-    pkt[2..4].copy_from_slice(&6u16.to_be_bytes());
+    // length = 4: the sequence number, N-PDU number and next-extension octets.
+    pkt[2..4].copy_from_slice(&4u16.to_be_bytes());
     pkt[4..8].copy_from_slice(&0u32.to_be_bytes()); // TEID=0
     pkt[8..10].copy_from_slice(&seq.to_be_bytes());
     pkt[10] = 0; // N-PDU number
     pkt[11] = 0; // next extension header type = None
-    pkt[12] = GTPU_IE_RECOVERY;
-    pkt[13] = restart_counter;
     pkt
 }
 
@@ -1220,6 +1247,35 @@ pub struct DataPlaneUrr {
     pub acc_total_pkts: AtomicU64,
     pub acc_ul_pkts: AtomicU64,
     pub acc_dl_pkts: AtomicU64,
+    /// Volume consumed since the QUOTA was provisioned (#842 review, #819). Never reset
+    /// by a usage report: TS 29.244 §5.2.2.3.1 has every report "adjust the quota ...
+    /// by subtracting the reported usage", which is the same as comparing the quota
+    /// against everything consumed since it was granted. Checking the quota against
+    /// the per-report counters instead re-granted the full quota on every report.
+    /// Re-based only by [`Self::set_quotas`].
+    quota_used_total: AtomicU64,
+    quota_used_ul: AtomicU64,
+    quota_used_dl: AtomicU64,
+    /// First packet since the quota was provisioned, for the Time Quota (§8.2.41) --
+    /// separate from `first_pkt_time`, which every report resets.
+    quota_first_pkt_time: RwLock<Option<std::time::Instant>>,
+    /// Volume counted toward the volume THRESHOLDS: since the last threshold-triggered
+    /// report or the last (re-)provisioning of a threshold. A non-threshold report
+    /// (PERIO, query, quota) leaves it running -- §5.2.2.3.1's "adjust the thresholds
+    /// ... by subtracting the reported usage" -- so such a report no longer postpones
+    /// the threshold; a VOLTH report "re-applies" it by restarting the count.
+    thr_used_total: AtomicU64,
+    thr_used_ul: AtomicU64,
+    thr_used_dl: AtomicU64,
+    /// Start of the TIME-threshold measurement (#842 review): re-based only by a
+    /// threshold-triggered report or a changed Time Threshold, NOT by every report.
+    /// Measuring it from `last_report_time` let each PERIO/query/quota report postpone
+    /// the time threshold, so with a Measurement Period shorter than it, TIMTH never
+    /// fired at all.
+    thr_time_start: std::sync::Mutex<std::time::Instant>,
+    /// Raised by `record()` when the TIME threshold is crossed, so the report says
+    /// TIMTH (#842 review); cleared by every report.
+    time_threshold_hit: AtomicBool,
     /// Timestamp of first packet in this measurement period
     pub first_pkt_time: RwLock<Option<std::time::Instant>>,
     /// Timestamp of last report.
@@ -1294,9 +1350,12 @@ impl DataPlaneUrr {
     /// report's `VolumeMeasurement` and so the one the trigger should explain.
     pub fn report_reason(&self) -> UrrReportReason {
         if self.is_quota_exhausted() {
-            // Which KIND of quota: re-derived from the provisioned values rather than
-            // stored alongside the latch, so there is one source of truth for "which
-            // limit is in force" and it cannot disagree with itself.
+            // Which KIND of quota: the limit that is actually reached, re-derived from
+            // the consumption counters (one source of truth). Falls back to the
+            // provisioned kind for a latch whose limit was re-provisioned away.
+            if let Some(reason) = self.quota_reached() {
+                return reason;
+            }
             let volume_provisioned = self.volume_quota_total().is_some()
                 || self.volume_quota_ul().is_some()
                 || self.volume_quota_dl().is_some();
@@ -1306,7 +1365,40 @@ impl DataPlaneUrr {
                 UrrReportReason::TimeQuota
             };
         }
+        let volume_reached = self
+            .volume_threshold_total()
+            .is_some_and(|t| self.thr_used_total.load(Ordering::Relaxed) >= t)
+            || self
+                .volume_threshold_ul()
+                .is_some_and(|t| self.thr_used_ul.load(Ordering::Relaxed) >= t)
+            || self
+                .volume_threshold_dl()
+                .is_some_and(|t| self.thr_used_dl.load(Ordering::Relaxed) >= t);
+        if !volume_reached && self.time_threshold_hit.load(Ordering::Relaxed) {
+            return UrrReportReason::TimeThreshold;
+        }
         UrrReportReason::VolumeThreshold
+    }
+
+    /// The quota currently REACHED, if any: a provisioned volume quota consumed in
+    /// full (total, UL or DL), else a provisioned time quota elapsed since the first
+    /// packet after its grant.
+    fn quota_reached(&self) -> Option<UrrReportReason> {
+        let vol =
+            |q: Option<u64>, used: &AtomicU64| q.is_some_and(|q| used.load(Ordering::Relaxed) >= q);
+        if vol(self.volume_quota_total(), &self.quota_used_total)
+            || vol(self.volume_quota_ul(), &self.quota_used_ul)
+            || vol(self.volume_quota_dl(), &self.quota_used_dl)
+        {
+            return Some(UrrReportReason::VolumeQuota);
+        }
+        let time = self.time_quota_secs().is_some_and(|q| {
+            self.quota_first_pkt_time
+                .read()
+                .unwrap()
+                .is_some_and(|first| first.elapsed().as_secs() >= q as u64)
+        });
+        time.then_some(UrrReportReason::TimeQuota)
     }
 
     /// Install this URR's quota limits (TS 29.244 §8.2.40, §8.2.41), replacing
@@ -1340,7 +1432,96 @@ impl DataPlaneUrr {
             time_quota_secs.unwrap_or(NO_TIME_THRESHOLD),
             Ordering::Relaxed,
         );
+        self.rebase_quota_to_ongoing();
         self.quota_exhausted.store(false, Ordering::Relaxed);
+    }
+
+    /// Apply an Update URR's quota IEs (#842 review, TS 29.244 §7.5.4): an IE that is
+    /// ABSENT (`None`) leaves its value unchanged. Before, an Update URR was applied
+    /// through [`Self::set_quotas`] with the absent IEs as `None`, so a threshold-only
+    /// modification deleted the quota and lifted an exhausted subscriber's latch.
+    /// Only a modification that actually carries a quota re-grants (clears the latch).
+    pub fn update_quotas(
+        &self,
+        volume_total: Option<u64>,
+        volume_ul: Option<u64>,
+        volume_dl: Option<u64>,
+        time_quota_secs: Option<u32>,
+    ) {
+        let volume_ie = volume_total.is_some() || volume_ul.is_some() || volume_dl.is_some();
+        if volume_ie {
+            // A present Volume Quota IE replaces the IE AS A WHOLE (§8.2.50): its
+            // flags say which of total/UL/DL it carries, and an unflagged one is no
+            // longer provisioned.
+            let vol = |v: Option<u64>| v.unwrap_or(NO_VOLUME_THRESHOLD);
+            self.volume_quota_total_raw
+                .store(vol(volume_total), Ordering::Relaxed);
+            self.volume_quota_ul_raw
+                .store(vol(volume_ul), Ordering::Relaxed);
+            self.volume_quota_dl_raw
+                .store(vol(volume_dl), Ordering::Relaxed);
+            self.rebase_volume_quota_to_ongoing();
+        }
+        if let Some(t) = time_quota_secs {
+            self.time_quota_secs_raw.store(t, Ordering::Relaxed);
+            self.rebase_time_quota_to_ongoing();
+        }
+        if !volume_ie && time_quota_secs.is_none() {
+            return;
+        }
+        // #842 review: an ABSENT quota is unchanged -- including what it has consumed --
+        // so only the re-provisioned kind was re-based above, and the latch is lifted
+        // only if no provisioned quota is still reached. A time top-up no longer
+        // re-grants an exhausted volume quota (or the reverse). A quota the re-base
+        // itself leaves reached is not latched here: the next packet finds it and
+        // reports the exhaustion.
+        if self.quota_reached().is_none() {
+            self.quota_exhausted.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// A newly received quota is measured against the ONGOING (not yet reported) usage
+    /// (#842 review, TS 29.244 §5.2.2.3.1: "consider its ongoing measurements counts
+    /// ... against the new ... quota ... i.e. ... discard any remaining quota"): the old
+    /// remaining allowance is dropped, but what was measured since the last report
+    /// still counts. Re-basing to zero let that usage pass free.
+    fn rebase_quota_to_ongoing(&self) {
+        self.rebase_volume_quota_to_ongoing();
+        self.rebase_time_quota_to_ongoing();
+    }
+
+    fn rebase_volume_quota_to_ongoing(&self) {
+        for (dst, src) in [
+            (&self.quota_used_total, &self.acc_total_bytes),
+            (&self.quota_used_ul, &self.acc_ul_bytes),
+            (&self.quota_used_dl, &self.acc_dl_bytes),
+        ] {
+            dst.store(src.load(Ordering::Acquire), Ordering::Relaxed);
+        }
+    }
+
+    fn rebase_time_quota_to_ongoing(&self) {
+        *self.quota_first_pkt_time.write().unwrap() = *self.first_pkt_time.read().unwrap();
+    }
+
+    /// The same for a newly received volume threshold.
+    fn rebase_volume_threshold_to_ongoing(&self) {
+        for (dst, src) in [
+            (&self.thr_used_total, &self.acc_total_bytes),
+            (&self.thr_used_ul, &self.acc_ul_bytes),
+            (&self.thr_used_dl, &self.acc_dl_bytes),
+        ] {
+            dst.store(src.load(Ordering::Acquire), Ordering::Relaxed);
+        }
+    }
+
+    /// The same for a newly received time threshold: measured from the start of the
+    /// ongoing measurement (the last report).
+    fn rebase_time_threshold_to_ongoing(&self) {
+        let start = self
+            .last_report_time()
+            .unwrap_or_else(std::time::Instant::now);
+        *self.thr_time_start.lock().unwrap() = start;
     }
 
     fn volume(slot: &AtomicU64) -> Option<u64> {
@@ -1374,16 +1555,69 @@ impl DataPlaneUrr {
     ) {
         let vol = |v: Option<u64>| v.unwrap_or(NO_VOLUME_THRESHOLD);
         let sec = |v: Option<u32>| v.unwrap_or(NO_TIME_THRESHOLD);
-        self.volume_threshold_total_raw
-            .store(vol(volume_total), Ordering::Relaxed);
-        self.volume_threshold_ul_raw
-            .store(vol(volume_ul), Ordering::Relaxed);
-        self.volume_threshold_dl_raw
-            .store(vol(volume_dl), Ordering::Relaxed);
-        self.time_threshold_secs_raw
-            .store(sec(time_threshold_secs), Ordering::Relaxed);
+        let changed = [
+            self.volume_threshold_total_raw
+                .swap(vol(volume_total), Ordering::Relaxed)
+                != vol(volume_total),
+            self.volume_threshold_ul_raw
+                .swap(vol(volume_ul), Ordering::Relaxed)
+                != vol(volume_ul),
+            self.volume_threshold_dl_raw
+                .swap(vol(volume_dl), Ordering::Relaxed)
+                != vol(volume_dl),
+        ]
+        .contains(&true);
+        // #842 review: a NEW volume threshold counts the ongoing measurement
+        // (§5.2.2.3.1); an unchanged one keeps counting where it was.
+        if changed {
+            self.rebase_volume_threshold_to_ongoing();
+        }
+        if self
+            .time_threshold_secs_raw
+            .swap(sec(time_threshold_secs), Ordering::Relaxed)
+            != sec(time_threshold_secs)
+        {
+            self.rebase_time_threshold_to_ongoing();
+        }
         self.measurement_period_secs_raw
             .store(sec(measurement_period_secs), Ordering::Relaxed);
+    }
+
+    /// Apply an Update URR's reporting IEs (#842 review, TS 29.244 §7.5.4): an ABSENT
+    /// IE (`None`) leaves its value unchanged, so a quota-only modification no longer
+    /// deletes the thresholds and the Measurement Period. A present one replaces the
+    /// value and, when it changed, is measured against the ongoing counts.
+    pub fn update_reporting(
+        &self,
+        volume_total: Option<u64>,
+        volume_ul: Option<u64>,
+        volume_dl: Option<u64>,
+        time_threshold_secs: Option<u32>,
+        measurement_period_secs: Option<u32>,
+    ) {
+        let mut volume_changed = false;
+        if volume_total.is_some() || volume_ul.is_some() || volume_dl.is_some() {
+            // A present Volume Threshold IE replaces the IE as a whole (§8.2.13).
+            for (slot, v) in [
+                (&self.volume_threshold_total_raw, volume_total),
+                (&self.volume_threshold_ul_raw, volume_ul),
+                (&self.volume_threshold_dl_raw, volume_dl),
+            ] {
+                let v = v.unwrap_or(NO_VOLUME_THRESHOLD);
+                volume_changed |= slot.swap(v, Ordering::Relaxed) != v;
+            }
+        }
+        if volume_changed {
+            self.rebase_volume_threshold_to_ongoing();
+        }
+        if let Some(t) = time_threshold_secs {
+            if self.time_threshold_secs_raw.swap(t, Ordering::Relaxed) != t {
+                self.rebase_time_threshold_to_ongoing();
+            }
+        }
+        if let Some(p) = measurement_period_secs {
+            self.measurement_period_secs_raw.store(p, Ordering::Relaxed);
+        }
     }
 
     pub fn new(urr_id: u32) -> Self {
@@ -1405,6 +1639,15 @@ impl DataPlaneUrr {
             acc_total_pkts: AtomicU64::new(0),
             acc_ul_pkts: AtomicU64::new(0),
             acc_dl_pkts: AtomicU64::new(0),
+            quota_used_total: AtomicU64::new(0),
+            quota_used_ul: AtomicU64::new(0),
+            quota_used_dl: AtomicU64::new(0),
+            quota_first_pkt_time: RwLock::new(None),
+            thr_used_total: AtomicU64::new(0),
+            thr_used_ul: AtomicU64::new(0),
+            thr_used_dl: AtomicU64::new(0),
+            thr_time_start: std::sync::Mutex::new(std::time::Instant::now()),
+            time_threshold_hit: AtomicBool::new(false),
             first_pkt_time: RwLock::new(None),
             last_report_time: RwLock::new(Some(std::time::Instant::now())),
             threshold_exceeded: AtomicBool::new(false),
@@ -1443,8 +1686,31 @@ impl DataPlaneUrr {
     /// to be dropped: §5.2.2 has the UP function measure the traffic matching the PDR,
     /// and the volume that exhausted the quota is part of the usage being reported.
     pub fn record(&self, bytes: u64, is_uplink: bool) -> UrrOutcome {
-        let total = self.acc_total_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        // #842 review (decision): a packet dropped because the quota is ALREADY
+        // exhausted is not usage -- it is never forwarded, so it is neither measured
+        // nor billed. The packet that exhausts the quota is measured (below): it is
+        // the usage that crossed the limit.
+        if self.quota_exhausted.load(Ordering::Relaxed) {
+            return UrrOutcome::QuotaAlreadyExhausted;
+        }
+        self.acc_total_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.acc_total_pkts.fetch_add(1, Ordering::Relaxed);
+        // #842 review: the quota and the thresholds are measured on their OWN counters,
+        // which a usage report does not zero (see the fields). Added BEFORE the AcqRel
+        // directional add below, so `take_usage`'s Acquire swap sees them too.
+        let total = self.quota_used_total.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        let thr_total = self.thr_used_total.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        let (quota_dir, thr_dir) = if is_uplink {
+            (
+                self.quota_used_ul.fetch_add(bytes, Ordering::Relaxed) + bytes,
+                self.thr_used_ul.fetch_add(bytes, Ordering::Relaxed) + bytes,
+            )
+        } else {
+            (
+                self.quota_used_dl.fetch_add(bytes, Ordering::Relaxed) + bytes,
+                self.thr_used_dl.fetch_add(bytes, Ordering::Relaxed) + bytes,
+            )
+        };
 
         let mut outcome = UrrOutcome::Continue;
         // A quota already found exhausted stays exhausted until it is re-provisioned,
@@ -1456,21 +1722,29 @@ impl DataPlaneUrr {
             // AcqRel (#771): pairs with `take_usage`'s Acquire swap, so a harvest that
             // takes this packet also sees the total-counter add sequenced before it,
             // and its `fetch_sub` on the total can never run ahead of that add.
-            let ul = self.acc_ul_bytes.fetch_add(bytes, Ordering::AcqRel) + bytes;
+            self.acc_ul_bytes.fetch_add(bytes, Ordering::AcqRel);
             self.acc_ul_pkts.fetch_add(1, Ordering::AcqRel);
-            (ul, self.volume_threshold_ul(), self.volume_quota_ul())
+            (
+                quota_dir,
+                self.volume_threshold_ul(),
+                self.volume_quota_ul(),
+            )
         } else {
-            let dl = self.acc_dl_bytes.fetch_add(bytes, Ordering::AcqRel) + bytes;
+            self.acc_dl_bytes.fetch_add(bytes, Ordering::AcqRel);
             self.acc_dl_pkts.fetch_add(1, Ordering::AcqRel);
-            (dl, self.volume_threshold_dl(), self.volume_quota_dl())
+            (
+                quota_dir,
+                self.volume_threshold_dl(),
+                self.volume_quota_dl(),
+            )
         };
 
         // Track first packet time. Before the early returns below, so the time of the
         // first packet is recorded even for a session whose very first packet crosses
         // something -- a usage report with no Time of First Packet is a report the CP
         // function cannot place in a billing window.
-        {
-            let mut fpt = self.first_pkt_time.write().unwrap();
+        for slot in [&self.first_pkt_time, &self.quota_first_pkt_time] {
+            let mut fpt = slot.write().unwrap();
             if fpt.is_none() {
                 *fpt = Some(std::time::Instant::now());
             }
@@ -1481,7 +1755,7 @@ impl DataPlaneUrr {
             || self.volume_quota_total().is_some_and(|q| total >= q);
         // ---- Time quota (§8.2.41): measured duration since the first packet ----
         let time_quota_hit = self.time_quota_secs().is_some_and(|q| {
-            self.first_pkt_time
+            self.quota_first_pkt_time
                 .read()
                 .unwrap()
                 .is_some_and(|first| first.elapsed().as_secs() >= q as u64)
@@ -1510,8 +1784,10 @@ impl DataPlaneUrr {
         }
 
         // ---- Thresholds: report, keep forwarding ----
-        if dir_threshold.is_some_and(|t| directional >= t)
-            || self.volume_threshold_total().is_some_and(|t| total >= t)
+        if dir_threshold.is_some_and(|t| thr_dir >= t)
+            || self
+                .volume_threshold_total()
+                .is_some_and(|t| thr_total >= t)
         {
             self.threshold_exceeded.store(true, Ordering::Relaxed);
             outcome = UrrOutcome::ThresholdExceeded;
@@ -1519,11 +1795,11 @@ impl DataPlaneUrr {
 
         // Check time threshold
         if let Some(time_thresh) = self.time_threshold_secs() {
-            if let Some(last) = self.last_report_time() {
-                if last.elapsed().as_secs() >= time_thresh as u64 {
-                    self.threshold_exceeded.store(true, Ordering::Relaxed);
-                    outcome = UrrOutcome::ThresholdExceeded;
-                }
+            let start = *self.thr_time_start.lock().unwrap();
+            if start.elapsed() >= std::time::Duration::from_secs(time_thresh as u64) {
+                self.time_threshold_hit.store(true, Ordering::Relaxed);
+                self.threshold_exceeded.store(true, Ordering::Relaxed);
+                outcome = UrrOutcome::ThresholdExceeded;
             }
         }
 
@@ -1551,7 +1827,20 @@ impl DataPlaneUrr {
     /// crossed by a packet recorded after the swap re-sets `threshold_exceeded` and
     /// is reported next time, instead of being cleared by this reset.
     pub fn take_usage(&self) -> UrrUsage {
+        self.take_usage_for(false)
+    }
+
+    /// [`Self::take_usage`] for a report triggered by a volume THRESHOLD (#842 review):
+    /// the thresholds are then "re-applied" (§5.2.2.3.1), i.e. their count restarts
+    /// from what arrived after this take. Any other report leaves the threshold count
+    /// running, which is the spec's "subtract the reported usage" from the threshold.
+    pub fn take_usage_for_threshold(&self) -> UrrUsage {
+        self.take_usage_for(true)
+    }
+
+    fn take_usage_for(&self, threshold_report: bool) -> UrrUsage {
         self.threshold_exceeded.store(false, Ordering::SeqCst);
+        self.time_threshold_hit.store(false, Ordering::SeqCst);
         *self.first_pkt_time.write().unwrap() = None;
         *self.last_report_time.write().unwrap() = Some(std::time::Instant::now());
         let usage = UrrUsage {
@@ -1564,7 +1853,36 @@ impl DataPlaneUrr {
             .fetch_sub(usage.total_bytes(), Ordering::AcqRel);
         self.acc_total_pkts
             .fetch_sub(usage.total_pkts(), Ordering::AcqRel);
+        if threshold_report {
+            *self.thr_time_start.lock().unwrap() = std::time::Instant::now();
+            // Read AFTER the swaps: a packet whose bytes this report took has already
+            // added to these counters, so it is subtracted; one recorded after the read
+            // stays, counting toward the re-applied threshold.
+            for c in [&self.thr_used_total, &self.thr_used_ul, &self.thr_used_dl] {
+                let v = c.load(Ordering::Acquire);
+                c.fetch_sub(v, Ordering::AcqRel);
+            }
+        }
         usage
+    }
+
+    /// Why this URR must report now, or `None` (#821): a crossed threshold or quota
+    /// (the flag `record()` raises), else an elapsed Measurement Period with usage
+    /// counted (PERIO).
+    pub fn report_due(&self) -> Option<UrrReportReason> {
+        // #80: an exhausted quota is reported as a QUOTA report, not as a threshold
+        // report -- that is what tells the CP function the subscriber is being DROPPED.
+        if self.threshold_exceeded.load(Ordering::SeqCst) {
+            return Some(self.report_reason());
+        }
+        // #724: the instant is COPIED out (`last_report_time()` returns the value), so
+        // no guard on it is alive across `take_usage`, which writes it.
+        let period_elapsed = self.measurement_period_secs().is_some_and(|period| {
+            self.last_report_time()
+                .is_some_and(|last| last.elapsed().as_secs() >= period as u64)
+        });
+        (period_elapsed && self.acc_total_bytes.load(Ordering::Acquire) > 0)
+            .then_some(UrrReportReason::Periodic)
     }
 
     /// A non-resetting read of the usage counted since the last report.
@@ -2273,6 +2591,13 @@ pub enum UpfReportEvent {
         smf_seid: u64,
         urr_id: u32,
     },
+    /// N3 user-plane paths declared FAILED (`failure`) or RECOVERED, to be reported
+    /// to the CP function in a PFCP Node Report (#935, TS 29.244 §7.4.5.1). They used
+    /// to be only logged, so the SMF never learnt a gNB path was down or back.
+    PathReport {
+        failure: bool,
+        peers: Vec<std::net::IpAddr>,
+    },
 }
 
 /// Data plane runtime context
@@ -2313,6 +2638,10 @@ pub struct DataPlaneStats {
     /// Packets dropped because the inner IP packet exceeded the TUN MTU and
     /// could not be safely forwarded (no fragmentation here).
     pub oversize_packets: AtomicU64,
+    /// Usage reports whose taken usage was handed back to the URR because the report
+    /// was not delivered (send failure, or abandoned after N1). See
+    /// [`DataPlane::restore_urr_usage`].
+    pub urr_reports_restored: AtomicU64,
 }
 
 /// How often the forwarding loop logs [`DataPlaneStats::summary`] (#581).
@@ -2337,7 +2666,7 @@ impl DataPlaneStats {
     /// UPF's `/metrics` body. Counters, not gauges: they only ever grow for the life
     /// of the process. Read on every scrape, so they are as live as the atomics.
     pub fn render_prometheus(&self) -> String {
-        let families: [(&str, &str, &AtomicU64); 7] = [
+        let families: [(&str, &str, &AtomicU64); 8] = [
             (
                 "upf_dataplane_ul_packets_total",
                 "Uplink G-PDUs decapsulated and written to the TUN (N3/S5-U to N6/SGi)",
@@ -2373,6 +2702,11 @@ impl DataPlaneStats {
                 "Packets dropped for exceeding the TUN MTU",
                 &self.oversize_packets,
             ),
+            (
+                "upf_dataplane_urr_reports_restored_total",
+                "Usage reports not delivered (send failure or N1 abandon) whose usage was restored to the URR for the next report; one abandoned after N1 may have been received, so it is then reported twice",
+                &self.urr_reports_restored,
+            ),
         ];
         let mut out = String::new();
         for (name, help, v) in families {
@@ -2395,6 +2729,7 @@ impl Default for DataPlaneStats {
             dropped_packets: AtomicU64::new(0),
             spoofed_packets: AtomicU64::new(0),
             oversize_packets: AtomicU64::new(0),
+            urr_reports_restored: AtomicU64::new(0),
         }
     }
 }
@@ -2690,10 +3025,28 @@ impl DataPlane {
                     None
                 };
                 log::debug!(
-                    "GTP-U Echo Response from {from}, Recovery={recovery:?} (ignored, TS 29.281 \
-                     §8.2)"
+                    "GTP-U Echo Response from {from}, seq={:?}, Recovery={recovery:?} \
+                     (ignored, TS 29.281 §8.2)",
+                    header.seq_num
                 );
-                self.path_table.write().unwrap().on_echo_response(from);
+                let outcome = self
+                    .path_table
+                    .write()
+                    .unwrap()
+                    .on_echo_response(from, header.seq_num);
+                match outcome {
+                    EchoResponse::Unsolicited => log::debug!(
+                        "GTP-U Echo Response from {from} answers nothing we sent: ignored"
+                    ),
+                    EchoResponse::Answered { recovered: true } => {
+                        log::warn!("GTP-U path to {from} RECOVERED");
+                        self.send_report_event(UpfReportEvent::PathReport {
+                            failure: false,
+                            peers: vec![from.ip()],
+                        });
+                    }
+                    EchoResponse::Answered { recovered: false } => {}
+                }
                 return;
             }
             gtpu_msg_type::END_MARKER => {
@@ -3376,42 +3729,49 @@ impl DataPlane {
             let new_dl_teid = dl_teid.unwrap_or(old_teid);
             let new_gnb_addr = gnb_addr.unwrap_or(old_addr);
 
-            // Update the downlink FAR's outer header creation if present
+            // #583: only the FARs the session's DOWNLINK (Core-source) PDRs use. A FAR
+            // toward the access side that an uplink-side PDR uses -- an indirect
+            // forwarding tunnel to the target NG-RAN -- has its own endpoint, which the
+            // session's DL tunnel moving must not overwrite.
+            let dl_fars: std::collections::HashSet<u32> = session
+                .pdrs
+                .read()
+                .unwrap()
+                .iter()
+                .filter(|p| p.source_interface == SRC_INTF_CORE)
+                .filter_map(|p| p.far_id)
+                .collect();
+            // #883: the FARs' endpoint and the session's tunnel move in ONE critical
+            // section (lock order `fars` -> `dl_tunnel`; nothing takes them the other
+            // way), so a downlink packet never pairs the new FAR endpoint with the old
+            // tunnel or the reverse.
+            let mut fars = session.fars.write().unwrap();
             if dl_teid.is_some() || gnb_addr.is_some() {
-                // #583: only the FARs the session's DOWNLINK (Core-source) PDRs use. A FAR
-                // toward the access side that an uplink-side PDR uses -- an indirect
-                // forwarding tunnel to the target NG-RAN -- has its own endpoint, which the
-                // session's DL tunnel moving must not overwrite.
-                let dl_fars: std::collections::HashSet<u32> = session
-                    .pdrs
-                    .read()
-                    .unwrap()
-                    .iter()
-                    .filter(|p| p.source_interface == SRC_INTF_CORE)
-                    .filter_map(|p| p.far_id)
-                    .collect();
-                let mut fars = session.fars.write().unwrap();
                 for far in fars.values_mut() {
                     if far.destination_interface == SRC_INTF_ACCESS && dl_fars.contains(&far.far_id)
                     {
                         if let Some(teid) = dl_teid {
                             far.ohc_teid = Some(teid);
                         }
-                        if let Some(addr) = gnb_addr {
-                            if let IpAddr::V4(ip) = addr.ip() {
-                                far.ohc_addr = Some(ip);
-                            }
+                        match gnb_addr.map(|a| a.ip()) {
+                            Some(IpAddr::V4(ip)) => far.ohc_addr = Some(ip),
+                            // #883: the FAR endpoint is IPv4-only. Keeping the stale IPv4
+                            // address would forward to the gNB the session just LEFT;
+                            // cleared, the downlink falls back to the session tunnel,
+                            // which carries the IPv6 address.
+                            Some(IpAddr::V6(_)) => far.ohc_addr = None,
+                            None => {}
                         }
                     }
                 }
             }
-
             // #822: moved IN PLACE. This used to `mem::take` the PDRs, FARs, QERs, URRs,
             // BARs and DL buffer out of the live session and re-add a rebuilt one, so a
             // packet already holding the old `Arc` found no rules (dropped, or forwarded
             // unmeasured) and a concurrent TERMR/QAURR found no session -- on every
             // DL-tunnel modification (handover, Service Request) under traffic.
             session.set_dl_tunnel(new_dl_teid, new_gnb_addr);
+            drop(fars);
             log::info!(
                 "Updated data plane session: SEID={upf_seid:#x}, DL_TEID=0x{new_dl_teid:x}, gNB={new_gnb_addr}"
             );
@@ -3447,95 +3807,152 @@ impl DataPlane {
         self.sessions.get_all_session_stats()
     }
 
-    /// Snapshot one URR's live counters for an event-driven report (#80).
+    /// Take one URR's usage for an event-driven quota report (#80, #821).
     ///
-    /// Read-only and **non-resetting**, unlike [`Self::collect_urr_reports`]: the harvest
-    /// owns the reset, and resetting here would make the volume this report carries
-    /// vanish from the next one, under-reporting the usage the quota was measuring.
-    ///
-    /// A UR-SEQN is still allocated, because it is per REPORT rather than per reset
-    /// (TS 29.244 §8.2.60) — two reports carrying overlapping volume are exactly what a
-    /// sequence number lets the CP function reconcile.
-    pub fn urr_report_snapshot(&self, upf_seid: u64, urr_id: u32) -> Option<UrrReportEntry> {
-        let seid_map = self.sessions.seid_map.read().unwrap();
-        let session = seid_map.get(&upf_seid)?;
-        let urrs = session.urrs.read().unwrap();
-        let urr = urrs.get(&urr_id)?;
+    /// Resetting, like every usage report (TS 29.244 §5.2.2.3.1: "upon generating a
+    /// usage report ... reset its ongoing measurement counts"). This used to be a
+    /// non-resetting snapshot, so the next PERIO or threshold report re-sent the same
+    /// bytes and a CP function summing reports billed them twice. Taking also clears
+    /// the URR's report flag, so the harvest does not re-report an exhaustion this
+    /// report already announced; the quota LATCH is untouched (only `set_quotas`
+    /// clears it).
+    pub fn urr_report_take(&self, upf_seid: u64, urr_id: u32) -> Option<UrrReportEntry> {
+        let session = self.sessions.find_by_seid(upf_seid)?;
+        let urr = session.urrs.read().unwrap().get(&urr_id).cloned()?;
+        let reason = urr.report_reason();
+        let usage = urr.take_usage();
         Some(UrrReportEntry::new(
-            session,
+            &session,
             urr_id,
             urr.next_ur_seqn(),
-            urr.usage(),
-            urr.report_reason(),
+            usage,
+            reason,
         ))
     }
 
-    /// Harvest the usage reports that are due: every URR whose threshold/quota was
-    /// crossed, and every URR whose Measurement Period has elapsed with usage counted.
-    /// Each report's usage is TAKEN from its URR atomically ([`DataPlaneUrr::take_usage`],
-    /// #771), so traffic racing the harvest is neither lost nor counted twice.
+    /// Take the usage of a session's URRs unconditionally -- every URR, or the ones in
+    /// `only` -- for a final (TERMR) or queried (IMMER) report (#821).
     ///
-    /// No lock is held while the URRs are examined (#780 review m1): the session and
-    /// URR `Arc`s are snapshotted and every map guard is released first, so a slow
-    /// harvest can never stall Session Establishment, the forwarding path or
-    /// `/metrics` behind `seid_map` again -- which is how #724's hang spread.
-    pub fn collect_urr_reports(&self) -> Vec<UrrReportEntry> {
-        let sessions: Vec<Arc<DataPlaneSession>> = self
-            .sessions
+    /// Taking rather than reading is what stops these reports and a racing harvest
+    /// from both carrying the same bytes. The returned reports are labelled
+    /// `trigger` here only as a placeholder: the caller encodes the TERMR/IMMER
+    /// trigger it is building.
+    pub fn take_urr_reports(&self, upf_seid: u64, only: Option<&[u32]>) -> Vec<UrrReportEntry> {
+        let Some(session) = self.sessions.find_by_seid(upf_seid) else {
+            return Vec::new();
+        };
+        let urrs: Vec<(u32, Arc<DataPlaneUrr>)> = session
+            .urrs
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| only.is_none_or(|ids| ids.contains(id)))
+            .map(|(id, urr)| (*id, Arc::clone(urr)))
+            .collect();
+        urrs.into_iter()
+            .map(|(urr_id, urr)| {
+                let reason = urr.report_reason();
+                let usage = urr.take_usage();
+                UrrReportEntry::new(&session, urr_id, urr.next_ur_seqn(), usage, reason)
+            })
+            .collect()
+    }
+
+    /// The sessions with at least one URR report due now, as `(upf_seid, smf_seid)`
+    /// -- detection only, nothing is taken (#821).
+    ///
+    /// The harvest is split in two so that the TAKE can happen inside the PFCP server
+    /// while it holds the session in its table ([`crate::pfcp_path::PfcpServer::send_due_urr_reports`]):
+    /// a Session Deletion then either runs first and its TERMR carries all the usage,
+    /// or runs after the harvest's report is on the wire. Taking here, as the harvest
+    /// used to, let a deletion slip between the take and the send; the send then
+    /// failed ("session not found") and the taken bytes were in no report at all.
+    pub fn due_urr_sessions(&self) -> Vec<(u64, u64)> {
+        self.session_snapshot()
+            .into_iter()
+            .filter(|s| {
+                s.urrs
+                    .read()
+                    .unwrap()
+                    .values()
+                    .any(|urr| urr.report_due().is_some())
+            })
+            .map(|s| (s.upf_seid, s.smf_seid))
+            .collect()
+    }
+
+    /// Take every report due on one session (#821): the URRs whose threshold/quota was
+    /// crossed and those whose Measurement Period elapsed with usage counted. Each
+    /// URR's usage is TAKEN atomically ([`DataPlaneUrr::take_usage`], #771), and the
+    /// due condition is re-evaluated at the take, so a URR another report just took
+    /// is not re-reported.
+    ///
+    /// No map lock is held while URRs are examined (#780 review m1).
+    pub fn take_due_urr_reports(&self, upf_seid: u64) -> Vec<UrrReportEntry> {
+        let Some(session) = self.sessions.find_by_seid(upf_seid) else {
+            return Vec::new();
+        };
+        Self::take_due_on(&session)
+    }
+
+    fn take_due_on(session: &DataPlaneSession) -> Vec<UrrReportEntry> {
+        let urrs: Vec<(u32, Arc<DataPlaneUrr>)> = session
+            .urrs
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(id, urr)| (*id, Arc::clone(urr)))
+            .collect();
+        urrs.into_iter()
+            .filter_map(|(urr_id, urr)| {
+                let trigger = urr.report_due()?;
+                // A report triggered by EITHER threshold re-applies the thresholds.
+                let usage = if matches!(
+                    trigger,
+                    UrrReportReason::VolumeThreshold | UrrReportReason::TimeThreshold
+                ) {
+                    urr.take_usage_for_threshold()
+                } else {
+                    urr.take_usage()
+                };
+                Some(UrrReportEntry::new(
+                    session,
+                    urr_id,
+                    urr.next_ur_seqn(),
+                    usage,
+                    trigger,
+                ))
+            })
+            .collect()
+    }
+
+    fn session_snapshot(&self) -> Vec<Arc<DataPlaneSession>> {
+        self.sessions
             .seid_map
             .read()
             .unwrap()
             .values()
             .cloned()
-            .collect();
+            .collect()
+    }
 
-        let mut reports = Vec::new();
-        for session in sessions {
-            let urrs: Vec<(u32, Arc<DataPlaneUrr>)> = session
-                .urrs
-                .read()
-                .unwrap()
-                .iter()
-                .map(|(id, urr)| (*id, Arc::clone(urr)))
-                .collect();
-            for (urr_id, urr) in urrs {
-                // #80: the report says why it exists. An exhausted quota is reported as
-                // a QUOTA report, not as a threshold report -- that distinction is what
-                // tells the CP function the subscriber is currently being DROPPED
-                // rather than merely approaching a limit.
-                let trigger = if urr.threshold_exceeded.load(Ordering::SeqCst) {
-                    urr.report_reason()
-                } else if urr.measurement_period_secs().is_some_and(|period| {
-                    // #724: the instant is COPIED out (`last_report_time()` returns the
-                    // value), so no guard on it is alive across `take_usage`, which
-                    // writes it -- std's RwLock is not re-entrant, and holding it here
-                    // parked the harvest forever.
-                    urr.last_report_time()
-                        .is_some_and(|last| last.elapsed().as_secs() >= period as u64)
-                }) && urr.acc_total_bytes.load(Ordering::Acquire) > 0
-                {
-                    // #80: PERIO, because that is what this arm is.
-                    UrrReportReason::Periodic
-                } else {
-                    continue;
-                };
-                let usage = urr.take_usage();
-                reports.push(UrrReportEntry::new(
-                    &session,
-                    urr_id,
-                    urr.next_ur_seqn(),
-                    usage,
-                    trigger,
-                ));
-            }
-        }
-
-        reports
+    /// Take every due report on every session at once. The production harvest goes
+    /// through [`Self::due_urr_sessions`] + the PFCP server instead (#821); this is the
+    /// same take for callers that have no PFCP table to coordinate with.
+    pub fn collect_urr_reports(&self) -> Vec<UrrReportEntry> {
+        self.session_snapshot()
+            .iter()
+            .flat_map(|s| Self::take_due_on(s))
+            .collect()
     }
 
     /// Return the usage of reports that could not be delivered to their URRs, so
     /// the next report carries it (#780 review m2). A URR that has since been
     /// removed is skipped: its usage left with the rule's own final report.
+    ///
+    /// Counted in `upf_dataplane_urr_reports_restored_total` (#780 re-review): a report
+    /// restored after N1 may in fact have been received, and is then reported twice,
+    /// so an operator needs to see how often it happens.
     pub fn restore_urr_usage(&self, reports: &[UrrReportEntry]) {
         for r in reports {
             let Some(session) = self.sessions.find_by_seid(r.upf_seid) else {
@@ -3544,6 +3961,9 @@ impl DataPlane {
             let urr = session.urrs.read().unwrap().get(&r.urr_id).cloned();
             if let Some(urr) = urr {
                 urr.restore_usage(&r.usage());
+                self.stats
+                    .urr_reports_restored
+                    .fetch_add(1, Ordering::Relaxed);
                 log::warn!(
                     "URR {} on SEID {:#x}: report UR-SEQN {} was not delivered; its {}B \
                      will be carried by the next report",
@@ -3553,6 +3973,39 @@ impl DataPlane {
                     r.total_bytes
                 );
             }
+        }
+    }
+
+    /// Newly FAILED N3 paths: log them with the sessions they carry, and report them
+    /// to the CP function in one Node Report (#935, TS 29.244 §7.4.5.1).
+    fn on_paths_failed(&self, failed: &[SocketAddr], miss_threshold: u32) {
+        for peer in failed {
+            log::warn!(
+                "GTP-U path to {peer} declared failed after {miss_threshold} missed responses"
+            );
+            let affected: Vec<u64> = {
+                let map = self.sessions.seid_map.read().unwrap();
+                map.values()
+                    .filter(|s| &s.gnb_addr() == peer)
+                    .map(|s| s.upf_seid)
+                    .collect()
+            };
+            if !affected.is_empty() {
+                log::warn!(
+                    "  {} session(s) affected (SEIDs: {:x?}); the SMF is told by a \
+                     Node Report (User Plane Path Failure Report)",
+                    affected.len(),
+                    affected
+                );
+            }
+        }
+        // #935 (TS 29.244 §7.4.5.1): tell the CP function, in ONE Node Report for
+        // every path that failed in this round.
+        if !failed.is_empty() {
+            self.send_report_event(UpfReportEvent::PathReport {
+                failure: true,
+                peers: failed.iter().map(|p| p.ip()).collect(),
+            });
         }
     }
 
@@ -3591,54 +4044,29 @@ impl DataPlane {
                 break;
             }
 
-            // Derive current N3 peer set from active sessions (additive only:
-            // stale peers with miss_count > 0 age out naturally via tick()).
+            // The N3 peer set in use, derived from the live sessions.
             let active_peers: HashSet<SocketAddr> = {
                 let map = self.sessions.seid_map.read().unwrap();
                 map.values().map(|s| s.gnb_addr()).collect()
             };
 
+            // #887 review: the table tracks exactly the paths in use; a peer whose last
+            // session went is dropped, not probed forever.
+            self.path_table.write().unwrap().sync_peers(&active_peers);
             if active_peers.is_empty() {
                 continue;
             }
 
-            {
-                let mut pt = self.path_table.write().unwrap();
-                for &peer in &active_peers {
-                    pt.add_peer(peer);
-                }
-            }
-
-            let restart_counter = self.path_table.read().unwrap().restart_counter;
             let miss_threshold = self.path_table.read().unwrap().miss_threshold;
             let (to_send, failed) = self.path_table.write().unwrap().tick();
 
             // Handle newly-failed paths
-            for peer in &failed {
-                log::warn!(
-                    "GTP-U path to {peer} declared failed after {miss_threshold} missed responses"
-                );
-                let affected: Vec<u64> = {
-                    let map = self.sessions.seid_map.read().unwrap();
-                    map.values()
-                        .filter(|s| &s.gnb_addr() == peer)
-                        .map(|s| s.upf_seid)
-                        .collect()
-                };
-                if !affected.is_empty() {
-                    log::warn!(
-                        "  {} session(s) affected (SEIDs: {:x?}) — flagged; \
-                         SMF teardown deferred pending E2E validation",
-                        affected.len(),
-                        affected
-                    );
-                }
-            }
+            self.on_paths_failed(&failed, miss_threshold);
 
             // Send Echo Requests
             if let Some(sock) = &self.gtpu_socket {
                 for (peer, seq) in to_send {
-                    let req = build_gtpu_echo_request(seq, restart_counter);
+                    let req = build_gtpu_echo_request(seq);
                     if let Err(e) = sock.send_to(&req, peer).await {
                         log::debug!("GTP-U Echo Request to {peer} failed: {e}");
                     } else {
@@ -3735,9 +4163,12 @@ impl UrrReportEntry {
 /// Why a usage report was generated (TS 29.244 §8.2.19) — #80.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UrrReportReason {
-    /// VOLTH / TIMTH — a threshold was crossed; traffic keeps flowing.
+    /// VOLTH — a volume threshold was crossed; traffic keeps flowing.
     #[default]
     VolumeThreshold,
+    /// TIMTH — the time threshold was crossed (#842 review: it used to go out as
+    /// VOLTH, so a CP function treating the two differently was told the wrong thing).
+    TimeThreshold,
     /// PERIO — the Measurement Period elapsed.
     Periodic,
     /// VOLQU — a volume quota was exhausted; matching traffic is being dropped.
@@ -5543,8 +5974,8 @@ mod tests {
         urr.set_quotas(None, None, None, Some(1));
         // Not yet: no time has passed.
         assert_eq!(urr.record(10, true), UrrOutcome::Continue);
-        // Backdate the first-packet time past the quota.
-        *urr.first_pkt_time.write().unwrap() =
+        // Backdate the first packet since the quota was granted past the quota.
+        *urr.quota_first_pkt_time.write().unwrap() =
             Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
         assert_eq!(urr.record(10, true), UrrOutcome::QuotaJustExhausted);
         assert_eq!(
@@ -5695,6 +6126,305 @@ mod tests {
         }
     }
 
+    /// #821: final (TERMR) and queried (IMMER) reports TAKE the usage too, so they
+    /// and a racing harvest never carry the same bytes. A recorder races a harvester
+    /// that alternates the PERIO harvest with `take_urr_reports` (what a query or a
+    /// Remove URR does); every byte recorded is in exactly one report or still on the
+    /// URR. With the old non-resetting read for TERMR/IMMER this double-counted.
+    #[test]
+    fn query_and_final_reports_racing_the_harvest_count_every_byte_once() {
+        let dp = Arc::new(DataPlane::new(Arc::new(AtomicBool::new(false))));
+        dp.add_session_from_pfcp(
+            0x821,
+            0x1821,
+            Ipv4Addr::new(10, 45, 8, 21),
+            0x8211,
+            0x8212,
+            "127.0.0.1:2152".parse().unwrap(),
+            Some(5),
+            Some(9),
+        );
+        let session = dp.sessions.find_by_seid(0x821).expect("session");
+        let urr = Arc::new(DataPlaneUrr::new(1));
+        urr.set_reporting(None, None, None, None, Some(1));
+        session.urrs.write().unwrap().insert(1, Arc::clone(&urr));
+
+        const PACKETS: u64 = 100_000;
+        let recorder = {
+            let urr = Arc::clone(&urr);
+            on_thread("recorder-821", move || {
+                (0..PACKETS)
+                    .map(|i| {
+                        let b = 40 + (i % 1400);
+                        urr.record(b, i % 2 == 0);
+                        b
+                    })
+                    .sum::<u64>()
+            })
+        };
+        let done = Arc::new(AtomicBool::new(false));
+        let harvester = {
+            let (dp, urr, done) = (Arc::clone(&dp), Arc::clone(&urr), Arc::clone(&done));
+            on_thread("harvester-821", move || {
+                let mut reports = Vec::new();
+                let mut pass = 0u64;
+                loop {
+                    let last = done.load(Ordering::SeqCst);
+                    if pass.is_multiple_of(2) {
+                        *urr.last_report_time.write().unwrap() =
+                            Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
+                        reports.extend(dp.collect_urr_reports());
+                    } else {
+                        reports.extend(dp.take_urr_reports(0x821, None));
+                    }
+                    pass += 1;
+                    if last {
+                        break reports;
+                    }
+                }
+            })
+        };
+        let deadline = std::time::Duration::from_secs(30);
+        let sent = recorder.recv_timeout(deadline).expect("recorder finishes");
+        done.store(true, Ordering::SeqCst);
+        let reports = harvester
+            .recv_timeout(deadline)
+            .expect("harvester finishes");
+        assert!(reports.len() > 10, "raced: {}", reports.len());
+        let reported: u64 = reports.iter().map(|r| r.total_bytes).sum();
+        assert_eq!(
+            reported + urr.usage().total_bytes(),
+            sent,
+            "every byte exactly once"
+        );
+    }
+
+    /// #842 review BLOCKER (TS 29.244 §5.2.2.3.1): a usage report that is NOT
+    /// threshold-triggered -- here a query, the PERIO harvest behaves the same --
+    /// neither re-grants a quota nor postpones a volume threshold. Before, both were
+    /// checked against the per-report counters a report zeroes, so 900 B + query +
+    /// 900 B left a 1000 B quota unexhausted and a 1000 B threshold unreached.
+    #[test]
+    fn a_report_neither_regrants_the_quota_nor_postpones_the_threshold() {
+        let dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        dp.add_session_from_pfcp(
+            0x842,
+            0x1842,
+            Ipv4Addr::new(10, 45, 8, 42),
+            0x8421,
+            0x8422,
+            "127.0.0.1:2152".parse().unwrap(),
+            Some(5),
+            Some(9),
+        );
+        let session = dp.sessions.find_by_seid(0x842).expect("session");
+        let quota = Arc::new(DataPlaneUrr::new(1));
+        quota.set_quotas(Some(1000), None, None, Some(3600));
+        let threshold = Arc::new(DataPlaneUrr::new(2));
+        threshold.set_reporting(Some(1000), None, None, None, None);
+        {
+            let mut urrs = session.urrs.write().unwrap();
+            urrs.insert(1, Arc::clone(&quota));
+            urrs.insert(2, Arc::clone(&threshold));
+        }
+
+        assert_eq!(quota.record(900, true), UrrOutcome::Continue);
+        assert_eq!(threshold.record(900, true), UrrOutcome::Continue);
+        let first_pkt = *quota.quota_first_pkt_time.read().unwrap();
+        // The query: both URRs report and reset their measurement.
+        let queried = dp.take_urr_reports(0x842, None);
+        assert_eq!(queried.iter().map(|r| r.total_bytes).sum::<u64>(), 1800);
+        assert_eq!(
+            *quota.quota_first_pkt_time.read().unwrap(),
+            first_pkt,
+            "the time quota keeps measuring from the first packet since the grant"
+        );
+
+        assert_eq!(
+            quota.record(900, true),
+            UrrOutcome::QuotaJustExhausted,
+            "1800 B against a 1000 B quota: the query did not re-grant it"
+        );
+        assert_eq!(threshold.record(900, true), UrrOutcome::ThresholdExceeded);
+        assert_eq!(
+            threshold.report_due(),
+            Some(UrrReportReason::VolumeThreshold),
+            "the threshold was not postponed by the query"
+        );
+        // A re-grant drops the old remaining quota but COUNTS THE ONGOING usage
+        // (§5.2.2.3.1): 900 B unreported since the query, so 100 B more exhausts it.
+        quota.set_quotas(Some(1000), None, None, None);
+        assert_eq!(quota.record(50, true), UrrOutcome::Continue);
+        assert_eq!(quota.record(100, true), UrrOutcome::QuotaJustExhausted);
+    }
+
+    /// #842 review MAJOR 2 (TS 29.244 §5.2.2.3.1): a quota or threshold received for a
+    /// measurement already under way is measured against the ONGOING counts -- "the UP
+    /// function shall discard any remaining quota" but not the unreported usage.
+    /// 600 B unreported, a new 1000 B quota, then 500 B: exhausted. The same for a new
+    /// volume threshold.
+    #[test]
+    fn a_new_quota_or_threshold_counts_the_ongoing_measurement() {
+        let urr = DataPlaneUrr::new(1);
+        urr.set_quotas(Some(1000), None, None, None);
+        assert_eq!(urr.record(600, true), UrrOutcome::Continue);
+        urr.update_quotas(Some(1000), None, None, None);
+        assert_eq!(urr.record(500, true), UrrOutcome::QuotaJustExhausted);
+
+        let thr = DataPlaneUrr::new(2);
+        thr.set_reporting(Some(5000), None, None, None, None);
+        assert_eq!(thr.record(600, true), UrrOutcome::Continue);
+        thr.update_reporting(Some(1000), None, None, None, None);
+        assert_eq!(thr.record(500, true), UrrOutcome::ThresholdExceeded);
+    }
+
+    /// #842 review MAJOR 1: the TIME threshold is not postponed by a non-threshold
+    /// report. 2 s TIMTH; a query at 1.5 s; at 2.3 s the threshold is crossed. Before,
+    /// it was measured from the last report of any kind, so it fired only at 3.5 s --
+    /// and never, with a Measurement Period shorter than the time threshold.
+    #[test]
+    fn a_query_does_not_postpone_the_time_threshold() {
+        let urr = DataPlaneUrr::new(1);
+        urr.set_reporting(None, None, None, Some(2), None);
+        // Move the time-threshold clock 1.5 s back instead of sleeping.
+        *urr.thr_time_start.lock().unwrap() -= std::time::Duration::from_millis(1500);
+        assert_eq!(urr.record(10, true), UrrOutcome::Continue);
+        let _ = urr.take_usage(); // the query (a non-threshold report)
+        *urr.thr_time_start.lock().unwrap() -= std::time::Duration::from_millis(800);
+        assert_eq!(
+            urr.record(10, true),
+            UrrOutcome::ThresholdExceeded,
+            "2.3 s since the threshold was applied: TIMTH is crossed"
+        );
+        // A threshold report re-applies it.
+        let _ = urr.take_usage_for_threshold();
+        assert_eq!(urr.record(10, true), UrrOutcome::Continue);
+    }
+
+    /// #842 review round 3: an Update URR re-grants only the KIND of quota it carries.
+    /// A time-only update leaves an exhausted VOLUME quota exhausted (it used to clear
+    /// the latch and re-base every counter -- a time top-up was a volume bypass), and a
+    /// volume-only top-up does not restart the TIME quota.
+    #[test]
+    fn an_update_urr_re_grants_only_the_quota_kind_it_carries() {
+        let v = DataPlaneUrr::new(1);
+        v.set_quotas(Some(1000), None, None, None);
+        assert_eq!(v.record(1200, true), UrrOutcome::QuotaJustExhausted);
+        assert_eq!(v.report_reason(), UrrReportReason::VolumeQuota);
+        let _ = v.take_usage(); // the VOLQU report
+        v.update_quotas(None, None, None, Some(3600));
+        assert!(
+            v.is_quota_exhausted(),
+            "a time top-up does not lift a volume exhaustion"
+        );
+        assert_eq!(v.record(10, true), UrrOutcome::QuotaAlreadyExhausted);
+        v.update_quotas(Some(5000), None, None, None);
+        assert!(!v.is_quota_exhausted(), "a volume top-up does");
+        assert_eq!(v.record(10, true), UrrOutcome::Continue);
+
+        let t = DataPlaneUrr::new(2);
+        t.set_quotas(None, None, None, Some(2));
+        assert_eq!(t.record(10, true), UrrOutcome::Continue);
+        // 1 s of the 2 s used, then a report.
+        *t.quota_first_pkt_time.write().unwrap() =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        let _ = t.take_usage();
+        t.update_quotas(Some(1_000_000), None, None, None);
+        // Value first, in its own statement: a read guard alive across the write
+        // would self-deadlock (the #724 class).
+        let earlier = t
+            .quota_first_pkt_time
+            .read()
+            .unwrap()
+            .map(|f| f - std::time::Duration::from_millis(1100));
+        *t.quota_first_pkt_time.write().unwrap() = earlier;
+        assert_eq!(
+            t.record(10, true),
+            UrrOutcome::QuotaJustExhausted,
+            "2.1 s used: the volume top-up did not restart the time quota"
+        );
+        assert_eq!(t.report_reason(), UrrReportReason::TimeQuota);
+    }
+
+    /// #842 review round 3: a crossed TIME threshold is reported as TIMTH, not VOLTH,
+    /// and its report re-applies the thresholds.
+    #[test]
+    fn a_crossed_time_threshold_reports_as_timth() {
+        let urr = DataPlaneUrr::new(1);
+        urr.set_reporting(Some(1_000_000), None, None, Some(2), None);
+        *urr.thr_time_start.lock().unwrap() -= std::time::Duration::from_secs(3);
+        assert_eq!(urr.record(10, true), UrrOutcome::ThresholdExceeded);
+        assert_eq!(urr.report_due(), Some(UrrReportReason::TimeThreshold));
+        let _ = urr.take_usage_for_threshold();
+        assert_eq!(urr.report_due(), None);
+        assert_eq!(urr.record(10, true), UrrOutcome::Continue, "re-applied");
+    }
+
+    /// #842 review round 3 (TS 29.244 §8.2.13/§8.2.50): a present Volume Threshold or
+    /// Volume Quota IE replaces the IE as a whole -- a direction it no longer flags is
+    /// no longer provisioned -- while an ABSENT IE leaves everything unchanged.
+    #[test]
+    fn a_volume_ie_in_an_update_urr_replaces_all_three_fields() {
+        let urr = DataPlaneUrr::new(1);
+        urr.set_reporting(Some(1000), Some(500), None, Some(60), Some(30));
+        urr.set_quotas(Some(9000), Some(4000), None, None);
+        urr.update_reporting(Some(2000), None, None, None, None);
+        urr.update_quotas(Some(8000), None, None, None);
+        assert_eq!(urr.volume_threshold_total(), Some(2000));
+        assert_eq!(urr.volume_threshold_ul(), None, "UL no longer flagged");
+        assert_eq!(urr.volume_quota_total(), Some(8000));
+        assert_eq!(urr.volume_quota_ul(), None);
+        assert_eq!(urr.time_threshold_secs(), Some(60), "absent IE unchanged");
+        assert_eq!(urr.measurement_period_secs(), Some(30));
+    }
+
+    /// #842 review (decision): a packet dropped because the quota is ALREADY exhausted
+    /// is not measured -- it was never forwarded, so it is not usage to bill.
+    #[test]
+    fn packets_dropped_after_the_quota_latch_are_not_usage() {
+        let urr = DataPlaneUrr::new(1);
+        urr.set_quotas(Some(100), None, None, None);
+        assert_eq!(urr.record(150, true), UrrOutcome::QuotaJustExhausted);
+        assert_eq!(urr.record(1000, true), UrrOutcome::QuotaAlreadyExhausted);
+        assert_eq!(
+            urr.usage().ul_bytes,
+            150,
+            "the exhausting packet is usage; the dropped one is not"
+        );
+    }
+
+    /// #842 review: a THRESHOLD-triggered report re-applies the threshold (§5.2.2.3.1):
+    /// its count restarts, so the next VOLTH needs another full threshold of traffic.
+    #[test]
+    fn a_threshold_report_re_applies_the_threshold() {
+        let dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        dp.add_session_from_pfcp(
+            0x843,
+            0x1843,
+            Ipv4Addr::new(10, 45, 8, 43),
+            0x8431,
+            0x8432,
+            "127.0.0.1:2152".parse().unwrap(),
+            Some(5),
+            Some(9),
+        );
+        let session = dp.sessions.find_by_seid(0x843).expect("session");
+        let urr = Arc::new(DataPlaneUrr::new(1));
+        urr.set_reporting(Some(1000), None, None, None, None);
+        session.urrs.write().unwrap().insert(1, Arc::clone(&urr));
+
+        assert_eq!(urr.record(1000, true), UrrOutcome::ThresholdExceeded);
+        let reports = dp.collect_urr_reports();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].trigger, UrrReportReason::VolumeThreshold);
+        assert_eq!(
+            urr.record(500, true),
+            UrrOutcome::Continue,
+            "threshold re-applied"
+        );
+        assert_eq!(urr.record(500, true), UrrOutcome::ThresholdExceeded);
+    }
+
     /// #780 review m2: usage taken for a report that was never delivered is handed
     /// back, and the NEXT report carries it, together with what arrived since.
     #[test]
@@ -5735,6 +6465,55 @@ mod tests {
             "the next report carries the undelivered usage plus the new"
         );
         assert!(next[0].ur_seqn > lost[0].ur_seqn);
+    }
+
+    /// #883: a DL-tunnel modification to an IPv6 gNB clears the DL FAR's IPv4 endpoint,
+    /// so the downlink follows the session tunnel to the NEW gNB instead of forwarding
+    /// to the IPv4 gNB the session just left; an IPv4 move still updates the FAR.
+    #[test]
+    fn a_dl_tunnel_move_to_an_ipv6_gnb_does_not_leave_the_far_on_the_old_gnb() {
+        let dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        dp.add_session_from_pfcp(
+            0x883,
+            0x1883,
+            Ipv4Addr::new(10, 45, 8, 83),
+            0x8831,
+            0x8832,
+            "127.0.0.1:2152".parse().unwrap(),
+            Some(5),
+            Some(9),
+        );
+        let session = dp.sessions.find_by_seid(0x883).expect("session");
+        let dl_far_id = session
+            .pdrs
+            .read()
+            .unwrap()
+            .iter()
+            .find(|p| p.source_interface == SRC_INTF_CORE)
+            .and_then(|p| p.far_id)
+            .expect("a downlink PDR with a FAR");
+        let far_addr = || session.fars.read().unwrap()[&dl_far_id].ohc_addr;
+
+        dp.update_session_from_pfcp(0x883, Some(0x1), Some("127.0.0.9:2152".parse().unwrap()));
+        assert_eq!(far_addr(), Some(Ipv4Addr::new(127, 0, 0, 9)));
+
+        let v6: SocketAddr = "[2001:db8::9]:2152".parse().unwrap();
+        dp.update_session_from_pfcp(0x883, Some(0x2), Some(v6));
+        assert_eq!(far_addr(), None, "no stale IPv4 endpoint left on the FAR");
+        assert_eq!(session.dl_tunnel(), (0x2, v6));
+        match session.apply_far(dl_far_id) {
+            FarDecision::Forward { ohc_teid, ohc_addr } => {
+                assert_eq!(ohc_teid, Some(0x2));
+                assert_eq!(
+                    ohc_addr
+                        .map(|ip| SocketAddr::new(IpAddr::V4(ip), GTPU_PORT))
+                        .unwrap_or(session.gnb_addr()),
+                    v6,
+                    "the downlink resolves to the new IPv6 gNB"
+                );
+            }
+            other => panic!("expected Forward, got {other:?}"),
+        }
     }
 
     /// #822: a DL-tunnel modification moves the tunnel IN PLACE. A packet that already
@@ -6366,25 +7145,27 @@ mod tests {
     // upfd-04: Echo Request builder and GtpuPathTable state machine
     // =========================================================================
 
-    /// TS 29.281 §7.2.1: Echo Request layout mirrors Echo Response.
+    /// TS 29.281 §7.2.1: an Echo Request is the 12-byte header with S=1 and no IE
+    /// (#887: the Recovery IE it used to carry belongs to the Echo Response).
     #[test]
     fn test_gtpu_echo_request_layout() {
-        let req = build_gtpu_echo_request(0xABCD, 42);
-        assert_eq!(req.len(), 14, "Echo Request must be 14 bytes");
+        let req = build_gtpu_echo_request(0xABCD);
+        assert_eq!(req.len(), 12, "Echo Request must be 12 bytes: header only");
         assert_eq!(
             req[1],
             gtpu_msg_type::ECHO_REQUEST,
             "msg type must be ECHO_REQUEST (1)"
         );
         let length = u16::from_be_bytes([req[2], req[3]]);
-        assert_eq!(length, 6, "length must be 6");
+        assert_eq!(
+            length, 4,
+            "length covers only the seq/N-PDU/next-ext octets"
+        );
         assert_eq!(req[0] & 0x02, 0x02, "S flag must be set");
         let teid = u32::from_be_bytes([req[4], req[5], req[6], req[7]]);
         assert_eq!(teid, 0, "TEID must be 0");
         let seq = u16::from_be_bytes([req[8], req[9]]);
         assert_eq!(seq, 0xABCD, "sequence number must be as passed");
-        assert_eq!(req[12], GTPU_IE_RECOVERY, "Recovery IE type must be 14");
-        assert_eq!(req[13], 42, "restart counter must be as passed");
     }
 
     /// Successful response resets miss_count and returns false (no restart).
@@ -6398,8 +7179,12 @@ mod tests {
         let (to_send, failed) = pt.tick();
         assert_eq!(to_send.len(), 1);
         assert!(failed.is_empty());
+        let seq = to_send[0].1;
 
-        pt.on_echo_response(peer);
+        assert_eq!(
+            pt.on_echo_response(peer, Some(seq)),
+            EchoResponse::Answered { recovered: false }
+        );
 
         // After response the peer must not be failed.
         let state = pt.peers.get(&peer).unwrap();
@@ -6441,13 +7226,156 @@ mod tests {
         let peer: SocketAddr = "10.0.0.2:2152".parse().unwrap();
         let mut pt = GtpuPathTable::default();
         pt.add_peer(peer);
-        let _ = pt.tick();
-        pt.on_echo_response(peer);
-        let _ = pt.tick();
-        pt.on_echo_response(peer);
+        // Answers carrying any Recovery value keep the path alive: the value is not
+        // even read (#873, §8.2), only the sequence number matters (#887).
+        let seq = pt.tick().0[0].1;
+        assert_eq!(
+            pt.on_echo_response(peer, Some(seq)),
+            EchoResponse::Answered { recovered: false }
+        );
+        let seq = pt.tick().0[0].1;
+        assert_eq!(
+            pt.on_echo_response(peer, Some(seq)),
+            EchoResponse::Answered { recovered: false }
+        );
         let state = pt.peers.get(&peer).unwrap();
         assert_eq!(state.miss_count, 0);
         assert!(!state.path_failed);
+    }
+
+    /// #887: an Echo Response that answers nothing we sent changes nothing. 1000
+    /// spoofed responses from unknown addresses add no peer (so none is probed), and
+    /// from a known peer a missing or wrong sequence number neither clears its miss
+    /// count nor recovers it.
+    #[test]
+    fn unsolicited_echo_responses_change_nothing() {
+        let mut pt = GtpuPathTable::default();
+        for i in 0..1000u32 {
+            let spoofed = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(0x0A_88_00_00 | i)), 2152);
+            assert_eq!(
+                pt.on_echo_response(spoofed, Some(1)),
+                EchoResponse::Unsolicited
+            );
+        }
+        assert_eq!(
+            pt.peer_count(),
+            0,
+            "no peer is learned from an unsolicited response"
+        );
+        assert!(pt.tick().0.is_empty(), "so nothing is probed");
+
+        let peer: SocketAddr = "10.88.1.1:2152".parse().unwrap();
+        pt.add_peer(peer);
+        let seq = pt.tick().0[0].1;
+        pt.tick(); // that request missed; a new one is outstanding
+        let outstanding = pt.peers[&peer].pending_seq;
+        assert_eq!(
+            pt.on_echo_response(peer, Some(seq)),
+            EchoResponse::Unsolicited,
+            "a stale seq"
+        );
+        assert_eq!(
+            pt.on_echo_response(peer, None),
+            EchoResponse::Unsolicited,
+            "no seq"
+        );
+        assert_eq!(pt.peers[&peer].miss_count, 1, "the miss stands");
+        assert_eq!(
+            pt.on_echo_response(peer, outstanding),
+            EchoResponse::Answered { recovered: false }
+        );
+        assert_eq!(pt.peers[&peer].miss_count, 0);
+    }
+
+    /// #935 (TS 29.244 §7.4.5.1): a path FAILURE and a path RECOVERY each raise a
+    /// path report toward the PFCP layer (which sends the Node Report). Before, both
+    /// were only logged and the SMF never learnt that a gNB path was down or back.
+    #[tokio::test]
+    async fn path_failure_and_recovery_raise_node_reports() {
+        let dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        let (tx, mut rx) = mpsc::channel(8);
+        dp.set_report_channel(tx);
+        let gnb: SocketAddr = "127.0.0.1:2152".parse().unwrap();
+
+        dp.on_paths_failed(&[gnb], 3);
+        match rx.try_recv() {
+            Ok(UpfReportEvent::PathReport {
+                failure: true,
+                peers,
+            }) => {
+                assert_eq!(peers, vec![gnb.ip()])
+            }
+            other => panic!("expected a failure path report, got {other:?}"),
+        }
+
+        // The failed peer answers an outstanding probe: a recovery report.
+        let seq = {
+            let mut pt = dp.path_table.write().unwrap();
+            pt.sync_peers(&HashSet::from([gnb]));
+            pt.miss_threshold = 1;
+            pt.tick();
+            let _ = pt.tick(); // failed
+            pt.tick().0[0].1 // still probed
+        };
+        dp.handle_uplink_packet(&build_gtpu_echo_response(Some(seq)), gnb, -1)
+            .await;
+        match rx.try_recv() {
+            Ok(UpfReportEvent::PathReport {
+                failure: false,
+                peers,
+            }) => {
+                assert_eq!(peers, vec![gnb.ip()])
+            }
+            other => panic!("expected a recovery path report, got {other:?}"),
+        }
+    }
+
+    /// #887 review: only paths IN USE are tracked and probed (TS 29.281 §7.2.1). A
+    /// peer whose last session went -- failed or not -- is dropped from the table and
+    /// no longer probed; a failed peer still in use keeps being probed.
+    #[test]
+    fn a_peer_that_loses_its_last_session_is_no_longer_probed() {
+        let a: SocketAddr = "10.88.3.1:2152".parse().unwrap();
+        let b: SocketAddr = "10.88.3.2:2152".parse().unwrap();
+        let mut pt = GtpuPathTable::default();
+        pt.miss_threshold = 1;
+        pt.sync_peers(&HashSet::from([a, b]));
+        pt.tick();
+        let (_, failed) = pt.tick();
+        assert_eq!(failed.len(), 2, "both paths failed");
+
+        // b's sessions are gone.
+        pt.sync_peers(&HashSet::from([a]));
+        assert_eq!(pt.peer_count(), 1, "b is dropped from the table");
+        let (probed, _) = pt.tick();
+        assert_eq!(
+            probed.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+            vec![a],
+            "only the failed path still in use is probed"
+        );
+    }
+
+    /// #887: a failed path is still probed, so a matching answer can recover it.
+    #[test]
+    fn a_failed_path_keeps_being_probed_and_recovers_on_an_answer() {
+        let peer: SocketAddr = "10.88.2.1:2152".parse().unwrap();
+        let mut pt = GtpuPathTable::default();
+        pt.miss_threshold = 2;
+        pt.add_peer(peer);
+        pt.tick();
+        pt.tick();
+        let (_, failed) = pt.tick();
+        assert_eq!(failed, vec![peer]);
+        // AFTER the failure, rounds keep probing it (and do not re-declare it).
+        let (again, refailed) = pt.tick();
+        assert_eq!(again.len(), 1, "the failed peer is probed again");
+        assert!(refailed.is_empty(), "declared failed only once");
+        assert_eq!(
+            pt.on_echo_response(peer, Some(again[0].1)),
+            EchoResponse::Answered { recovered: true },
+            "#935: the answer reports the recovery"
+        );
+        assert!(!pt.peers[&peer].path_failed, "the answer recovers the path");
     }
 
     /// Recovery IE parser: finds IE type 14 in a 2-byte TV payload.

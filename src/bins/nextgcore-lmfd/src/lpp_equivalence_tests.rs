@@ -17,7 +17,7 @@ use crate::codec_glue::{self, LppMethod, UeLppCapability};
 
 const VECTORS: &str = include_str!("lpp_golden_vectors.txt");
 
-fn unhex(h: &str) -> Vec<u8> {
+pub(crate) fn unhex(h: &str) -> Vec<u8> {
     (0..h.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap())
@@ -106,11 +106,19 @@ fn without_new_fields(
     what: &str,
 ) -> Vec<std::collections::BTreeMap<String, String>> {
     for c in &mut new {
-        for k in ["ue_rx_tx_ns", "gnb_rx_tx_ns"] {
+        for k in ["ue_rx_tx_ns", "gnb_rx_tx_ns", "meas_time"] {
             assert_eq!(c.remove(k).as_deref(), Some("None"), "{what}: {k}");
         }
         check_dl_prs_id(c, what);
         check_eutra(c, what);
+        if what != "E-CID" {
+            assert_eq!(c.remove("ecid_rtt_ns").as_deref(), Some("None"), "{what}");
+            assert_eq!(
+                c.remove("ecid_rtt_width_ns").as_deref(),
+                Some("None"),
+                "{what}"
+            );
+        }
         check_rstd_reference(c, what);
     }
     new
@@ -173,12 +181,36 @@ fn every_report_adapts_as_the_old_adapters_did() {
             "{:?}",
             codec_glue::lpp_ecid_provide_to_measurements(&g)
         ));
-        assert_eq!(
-            without_new_fields(ecid, "E-CID"),
-            cells_of(f[1]),
-            "E-CID {}",
-            f[0]
-        );
+        // #832: the captured raw `timing_advance` (the UE Rx-Tx report value) is
+        // now decoded per TS 36.133 §9.1.9.3 into `ecid_rtt_ns`.
+        let mut captured = cells_of(f[1]);
+        let mut new = without_new_fields(ecid, "E-CID");
+        for (n_cell, c_cell) in new.iter_mut().zip(captured.iter_mut()) {
+            let raw = c_cell.remove("timing_advance").expect("timing_advance");
+            let want = match raw.as_str() {
+                "None" => None,
+                v => crate::positioning::eutra_time_report_to_ns(
+                    some_f64(v) as u32,
+                    crate::positioning::EUTRA_UE_RX_TX_MAX,
+                ),
+            };
+            assert_eq!(n_cell.remove("timing_advance").as_deref(), Some("None"));
+            assert_eq!(
+                n_cell.remove("ecid_rtt_ns").expect("ecid_rtt_ns"),
+                format!("{:?}", want.map(|(mid, _)| mid)),
+                "E-CID {} (the captured cells are FDD: no N_TA,offset)",
+                f[0]
+            );
+            assert_eq!(
+                n_cell
+                    .remove("ecid_rtt_width_ns")
+                    .expect("ecid_rtt_width_ns"),
+                format!("{:?}", want.map(|(_, width)| width)),
+                "E-CID {}",
+                f[0]
+            );
+        }
+        assert_eq!(new, captured, "E-CID {}", f[0]);
 
         let rtt = cells_of(&format!(
             "{:?}",
@@ -209,8 +241,14 @@ fn every_report_adapts_as_the_old_adapters_did() {
             }
             assert_eq!(new.remove("rtt_ns").as_deref(), Some("None"));
             assert_eq!(new.remove("gnb_rx_tx_ns").as_deref(), Some("None"));
+            // #807: the UE half carries its nr-TimeStamp-r16.
+            assert!(new
+                .remove("meas_time")
+                .is_some_and(|t| t.starts_with("Some(SlotTime")));
             check_dl_prs_id(&mut new, "Multi-RTT");
             check_eutra(&mut new, "Multi-RTT");
+            assert_eq!(new.remove("ecid_rtt_ns").as_deref(), Some("None"));
+            assert_eq!(new.remove("ecid_rtt_width_ns").as_deref(), Some("None"));
             check_rstd_reference(&mut new, "Multi-RTT");
             let mut old = old;
             old.remove("rtt_ns");
@@ -343,5 +381,30 @@ fn nr_ecid_request_matches_x691() {
     assert_eq!(
         codec_glue::build_lpp_request(LppMethod::NrEcid, 0).unwrap(),
         vec![0x90, 0x00, 0x20, 0x80, 0x12, 0x02, 0x81, 0xC0]
+    );
+}
+
+/// #907 review: the uplink capability decode, on the captured vectors.
+#[test]
+fn an_uplink_provide_capabilities_decodes_to_its_class_and_flavours() {
+    use codec_glue::{EcidFlavours, UeLppCapability};
+    assert_eq!(
+        codec_glue::decode_lpp_provide_capabilities(&unhex("9203084858")),
+        Some((
+            UeLppCapability::EcidOnly,
+            EcidFlavours {
+                eutra: true,
+                nr: false
+            }
+        ))
+    );
+    assert_eq!(
+        codec_glue::decode_lpp_provide_capabilities(&unhex("92030840")),
+        Some((UeLppCapability::Unknown, EcidFlavours::default()))
+    );
+    // A ProvideLocationInformation is not a capability report.
+    assert_eq!(
+        codec_glue::decode_lpp_provide_capabilities(&crate::lpp_fixtures::ecid_lpp(7, 60, 500, 1)),
+        None
     );
 }

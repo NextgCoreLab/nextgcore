@@ -7,6 +7,7 @@ use clap::Parser;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+pub mod bearer_deactivation;
 pub mod config;
 pub mod context;
 pub mod emm_build;
@@ -228,12 +229,10 @@ impl MmeApp {
                 .filter(|addr| addr != "0.0.0.0" && addr != "::"),
             applications,
             // Watchdog interval Tw (RFC 3539 §3.4.1, #729): MME_DIAMETER_TW_SECS,
-            // default 30, floored at 6. Keep it below 3 x the HSS's Tc, which
-            // is where hssd drops a connection it has heard nothing on.
-            timer_tw: std::env::var("MME_DIAMETER_TW_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(30),
+            // default 30, floored at 6. hssd drops no idle connection; against a
+            // server peer that does (one built on `DiameterServer` drops after
+            // 3 x its Tc), keep Tw below that.
+            timer_tw: parse_diameter_tw(std::env::var("MME_DIAMETER_TW_SECS").ok().as_deref()),
             ..Default::default()
         };
 
@@ -310,6 +309,10 @@ impl MmeApp {
             for send in s1ap_handler::expire_handover_preparations(ctx, std::time::Instant::now()) {
                 s1ap_path::s1ap_send(send);
             }
+            // A UE-AMBR change deferred behind a handover that just expired (#869).
+            for send in s6a_handler::deferred_ue_ambr_sends(ctx) {
+                s1ap_path::s1ap_send(send);
+            }
 
             // Signal or lift S1AP overload if the attached-UE count crossed the
             // configured threshold (TS 36.413 §8.7.6). A no-op unless
@@ -376,6 +379,25 @@ impl Default for MmeApp {
     }
 }
 
+/// `MME_DIAMETER_TW_SECS`: whole seconds, default 30. An unparsable value is
+/// logged rather than silently replaced, so a mistyped override is noticed
+/// (#816 review m-e).
+fn parse_diameter_tw(value: Option<&str>) -> u32 {
+    const DEFAULT_TW_SECS: u32 = 30;
+    match value.map(|v| v.trim().parse::<u32>()) {
+        None => DEFAULT_TW_SECS,
+        Some(Ok(secs)) => secs,
+        Some(Err(_)) => {
+            log::warn!(
+                "MME_DIAMETER_TW_SECS={:?} is not a whole number of seconds; using \
+                 {DEFAULT_TW_SECS}",
+                value.unwrap_or_default()
+            );
+            DEFAULT_TW_SECS
+        }
+    }
+}
+
 /// The `/metrics` listen address: `MME_METRICS_ADDR` (`ip:port`), default
 /// `127.0.0.1:9090`. Private by default: nothing is published beyond the host
 /// unless an operator chooses an address.
@@ -384,9 +406,18 @@ fn metrics_addr() -> std::net::SocketAddr {
 }
 
 fn parse_metrics_addr(value: Option<&str>) -> std::net::SocketAddr {
-    value
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| std::net::SocketAddr::from(([127, 0, 0, 1], 9090)))
+    let default = std::net::SocketAddr::from(([127, 0, 0, 1], 9090));
+    match value.map(|v| v.trim().parse()) {
+        None => default,
+        Some(Ok(addr)) => addr,
+        Some(Err(_)) => {
+            log::warn!(
+                "MME_METRICS_ADDR={:?} is not an ip:port; using {default}",
+                value.unwrap_or_default()
+            );
+            default
+        }
+    }
 }
 
 /// The MME runs on a tokio runtime.
@@ -402,19 +433,8 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     // Initialize logging
-    let log_level = match args.log_level.to_lowercase().as_str() {
-        "trace" => log::LevelFilter::Trace,
-        "debug" => log::LevelFilter::Debug,
-        "info" => log::LevelFilter::Info,
-        "warn" => log::LevelFilter::Warn,
-        "error" => log::LevelFilter::Error,
-        _ => log::LevelFilter::Info,
-    };
-
-    env_logger::Builder::new()
-        .filter_level(log_level)
-        .format_timestamp_millis()
-        .init();
+    // RUST_LOG if set, else --log-level: the same for every NF (#691).
+    nextgcore_core::log::nf_log_builder(&args.log_level).init();
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = nextgcore_metrics::otel::init_otel(
         nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
@@ -443,7 +463,18 @@ async fn main() -> Result<()> {
     // address on purpose (or scrapes through a sidecar).
     match nextgcore_metrics::nes_energy::serve_metrics(
         metrics_addr(),
-        Arc::new(handover_switch::render_metrics),
+        Arc::new(|| {
+            // #899 review: S6a messages not delivered because they arrived while a
+            // re-established connection was in RFC 3539 REOPEN.
+            format!(
+                "{}# HELP mme_diameter_reopen_discards_total Diameter application messages \
+                 received in RFC 3539 REOPEN and not delivered (requests answered 3004)\n\
+                 # TYPE mme_diameter_reopen_discards_total counter\n\
+                 mme_diameter_reopen_discards_total {}\n",
+                handover_switch::render_metrics() + &s1ap_handler::render_metrics(),
+                nextgcore_diameter::session::reopen_discards()
+            )
+        }),
     )
     .await
     {
@@ -484,6 +515,15 @@ mod tests {
             parse_metrics_addr(Some("10.0.0.5:9191")),
             "10.0.0.5:9191".parse().unwrap()
         );
+    }
+
+    /// #816 review m-e: `MME_DIAMETER_TW_SECS` falls back to 30 when unset or
+    /// unparsable (the latter logged).
+    #[test]
+    fn the_diameter_tw_override_is_parsed() {
+        assert_eq!(parse_diameter_tw(None), 30);
+        assert_eq!(parse_diameter_tw(Some(" 12 ")), 12);
+        assert_eq!(parse_diameter_tw(Some("12s")), 30);
     }
 
     #[test]

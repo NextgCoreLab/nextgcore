@@ -505,27 +505,64 @@ pub fn build_forward_relocation_complete_acknowledge(
 // 136 above. The AMF is the target in EPS to 5GS (#418), and that builder lives with the rest
 // of that direction in `crate::n26_eps_to_5gs`.
 
-/// Encode a `Target Identification` IE body for a target eNB (TS 29.274 §8.51).
+/// Encode the `Target Identification` IE body (TS 29.274 §8.51, from octet 5) for the
+/// target eNB of a 5GS to EPS handover (#741).
 ///
-/// | octet | field | line |
-/// |---|---|---|
-/// | 5 | Target Type | `29274-j60.txt:29283` |
-/// | 6.. | Target ID, per the type | same |
+/// The target is what the source gNB named in its NGAP `targeteNB-ID` (TS 38.413
+/// §9.3.1.25): a Global ng-eNB ID and the selected EPS TAI. It is relayed rather than
+/// invented, because a Target Identification the AMF made up would route the preparation
+/// to an eNB the gNB did not choose. The ngENB-ID length picks the Target Type:
 ///
-/// Target Type **1** is `eNodeB ID` (Table 8.51-1). The body is the MCC/MNC in TBCD followed
-/// by the eNB's own identity, which for an inter-system handover is what the source gNB named
-/// in its NGAP `TargetID` — relayed rather than invented, because a Target Identification the
-/// AMF made up would route the preparation to an eNB the gNB did not choose.
-pub fn encode_target_identification(target_type: u8, plmn_bcd: &[u8], enb_id: &[u8]) -> Bytes {
-    let mut value = BytesMut::with_capacity(1 + plmn_bcd.len() + enb_id.len());
+/// | ngENB-ID | Target Type | octet 9 | figure |
+/// |---|---|---|---|
+/// | macro (20 bits) | 1 Macro eNodeB ID | `spare(4) \| id bits 20..17` | 8.51-2 |
+/// | long macro (21 bits) | 4 Extended Macro eNodeB ID | `SMeNB=0 \| spare(2) \| id bits 21..17` | 8.51-4 |
+/// | short macro (18 bits) | 4 Extended Macro eNodeB ID | `SMeNB=1 \| spare(2) \| 000 \| id bits 18..17` | 8.51-4 |
+///
+/// Octets 6-8 are the GlobalNgENB-ID's PLMN (NGAP's PLMNIdentity is already the TS
+/// 24.008 TBCD layout §8.51 uses), octets 10-11 the low 16 id bits, and octets 12-13 the
+/// 2-octet EPS TAC. An id wider than its alternative is refused, not truncated: a
+/// truncated id names a different eNB.
+pub fn encode_enb_target_identification(
+    plmn_identity: &[u8; 3],
+    ng_enb_id: nextgcore_ngap::types::NgEnbId,
+    eps_tac: [u8; 2],
+) -> Result<Bytes, String> {
+    use nextgcore_ngap::types::NgEnbId;
+    if !ng_enb_id.fits() {
+        return Err(format!(
+            "ng-eNB id {:#x} does not fit its {}-bit alternative",
+            ng_enb_id.value(),
+            ng_enb_id.bit_len()
+        ));
+    }
+    let v = ng_enb_id.value();
+    let (target_type, octet9) = match ng_enb_id {
+        NgEnbId::Macro(_) => (TARGET_TYPE_MACRO_ENODEB, ((v >> 16) & 0x0F) as u8),
+        NgEnbId::LongMacro(_) => (TARGET_TYPE_EXTENDED_MACRO_ENODEB, ((v >> 16) & 0x1F) as u8),
+        NgEnbId::ShortMacro(_) => (
+            TARGET_TYPE_EXTENDED_MACRO_ENODEB,
+            SMENB_FLAG | ((v >> 16) & 0x03) as u8,
+        ),
+    };
+    let mut value = BytesMut::with_capacity(9);
     value.put_u8(target_type);
-    value.put_slice(plmn_bcd);
-    value.put_slice(enb_id);
-    value.freeze()
+    value.put_slice(plmn_identity);
+    value.put_u8(octet9);
+    value.put_u16(v as u16);
+    value.put_slice(&eps_tac);
+    Ok(value.freeze())
 }
 
-/// `Target Type` = `eNodeB ID` (TS 29.274 Table 8.51-1).
-pub const TARGET_TYPE_ENODEB: u8 = 1;
+/// `Target Type` = `Macro eNodeB ID` (TS 29.274 Table 8.51-1).
+pub const TARGET_TYPE_MACRO_ENODEB: u8 = 1;
+
+/// `Target Type` = `Extended Macro eNodeB ID` (TS 29.274 Table 8.51-1).
+pub const TARGET_TYPE_EXTENDED_MACRO_ENODEB: u8 = 4;
+
+/// Octet 9 bit 8 of Figure 8.51-4: set for a Short Macro eNodeB ID (18 bits), clear for
+/// a Long Macro eNodeB ID (21 bits).
+pub const SMENB_FLAG: u8 = 0x80;
 
 /// Encode amfd's nibble-packed PLMN as the three TBCD octets every GTPv2-C PLMN field uses.
 ///
@@ -576,8 +613,12 @@ mod tests {
              counting rows rather than reading them (#401's lesson)"
         );
         assert_eq!(
-            TARGET_TYPE_ENODEB, 1,
-            "Target Type 1 is eNodeB ID (Table 8.51-1)"
+            TARGET_TYPE_MACRO_ENODEB, 1,
+            "Target Type 1 is Macro eNodeB ID (Table 8.51-1)"
+        );
+        assert_eq!(
+            TARGET_TYPE_EXTENDED_MACRO_ENODEB, 4,
+            "Target Type 4 is Extended Macro eNodeB ID (Table 8.51-1)"
         );
     }
 
@@ -614,7 +655,12 @@ mod tests {
             &mm,
             std::slice::from_ref(&pdn),
             &[0xAA, 0xBB],
-            &encode_target_identification(TARGET_TYPE_ENODEB, &[0x00, 0xF1, 0x10], &[0, 0, 0, 1]),
+            &encode_enb_target_identification(
+                &[0x00, 0xF1, 0x10],
+                nextgcore_ngap::types::NgEnbId::Macro(1),
+                [0x00, 0x01],
+            )
+            .expect("fits"),
             &[0x00, 0xF1, 0x10],
         );
 
@@ -707,8 +753,8 @@ mod tests {
             .get_ie(Gtp2IeType::TargetIdentification as u8, 0)
             .expect("Target Identification IE");
         assert_eq!(
-            target.value[0], TARGET_TYPE_ENODEB,
-            "Target Type must be 1 (eNodeB ID): the target of a 5GS-to-EPS handover is an eNB"
+            target.value[0], TARGET_TYPE_MACRO_ENODEB,
+            "Target Type must be 1 (Macro eNodeB ID): the target of a 5GS-to-EPS handover is an eNB"
         );
         assert_eq!(
             msg.get_ie(Gtp2IeType::PlmnId as u8, 0)
@@ -949,7 +995,7 @@ mod tests {
 
         // No Complete NOTIFICATION builder is asserted here, because this module has none: this
         // AMF is the SOURCE in the direction #408 implements, so it receives 135 and answers
-        // 136. The note above `encode_target_identification` records why a builder here would
+        // 136. The note above `encode_enb_target_identification` records why a builder here would
         // have no production caller; mmed's
         // `forward_relocation_response_carries_its_table_7_3_2_1_ies` covers the one that IS
         // driven.
@@ -1088,11 +1134,68 @@ mod tests {
             "a three-digit MNC puts its third digit in the high nibble of octet 2 rather than \
              the 0xF filler"
         );
+    }
 
-        // And the Target Identification body starts with the type, then the PLMN.
-        let target = encode_target_identification(TARGET_TYPE_ENODEB, &[0x00, 0xF1, 0x10], &[1, 2]);
-        assert_eq!(target[0], TARGET_TYPE_ENODEB, "octet 5 is the Target Type");
-        assert_eq!(&target[1..4], &[0x00, 0xF1, 0x10], "then the PLMN in TBCD");
-        assert_eq!(&target[4..], &[1, 2], "then the eNB identity the gNB named");
+    /// #741: the Target Identification body for each ngENB-ID length, as golden octets
+    /// written from TS 29.274 Figures 8.51-2 and 8.51-4 (octet 5 onward), not from the
+    /// encoder. PLMN 001/01 is `00 F1 10`; the EPS TAC is `12 34`.
+    #[test]
+    fn target_identification_follows_figures_8_51_2_and_8_51_4() {
+        use nextgcore_ngap::types::NgEnbId;
+        let plmn = [0x00, 0xF1, 0x10];
+        let cases: [(NgEnbId, [u8; 9], &str); 6] = [
+            // Fig 8.51-2: type 1; octet 9 = spare 0000 | id bits 20-17 (0x1); then 0x2345.
+            (
+                NgEnbId::Macro(0x1_2345),
+                [0x01, 0x00, 0xF1, 0x10, 0x01, 0x23, 0x45, 0x12, 0x34],
+                "macro",
+            ),
+            (
+                NgEnbId::Macro(0xF_FFFF),
+                [0x01, 0x00, 0xF1, 0x10, 0x0F, 0xFF, 0xFF, 0x12, 0x34],
+                "macro, all ones: the spare nibble stays 0",
+            ),
+            // Fig 8.51-4: type 4; SMeNB 0, spare 00, id bits 21-17 (0x1A); then 0xBCDE.
+            (
+                NgEnbId::LongMacro(0x1A_BCDE),
+                [0x04, 0x00, 0xF1, 0x10, 0x1A, 0xBC, 0xDE, 0x12, 0x34],
+                "long macro",
+            ),
+            (
+                NgEnbId::LongMacro(0x1F_FFFF),
+                [0x04, 0x00, 0xF1, 0x10, 0x1F, 0xFF, 0xFF, 0x12, 0x34],
+                "long macro, all ones: SMeNB stays clear",
+            ),
+            // Fig 8.51-4: SMeNB 1, spare 00, bits 5-3 = 000, id bits 18-17 (0x2); then 0xABCD.
+            (
+                NgEnbId::ShortMacro(0x2_ABCD),
+                [0x04, 0x00, 0xF1, 0x10, 0x82, 0xAB, 0xCD, 0x12, 0x34],
+                "short macro",
+            ),
+            (
+                NgEnbId::ShortMacro(0x3_FFFF),
+                [0x04, 0x00, 0xF1, 0x10, 0x83, 0xFF, 0xFF, 0x12, 0x34],
+                "short macro, all ones: bits 5-3 of octet 9 stay 0",
+            ),
+        ];
+        for (id, golden, what) in cases {
+            assert_eq!(
+                encode_enb_target_identification(&plmn, id, [0x12, 0x34])
+                    .expect("fits")
+                    .as_ref(),
+                &golden,
+                "{what}"
+            );
+        }
+        for too_wide in [
+            NgEnbId::Macro(0x10_0000),
+            NgEnbId::ShortMacro(0x4_0000),
+            NgEnbId::LongMacro(0x20_0000),
+        ] {
+            assert!(
+                encode_enb_target_identification(&plmn, too_wide, [0, 1]).is_err(),
+                "{too_wide:?} is refused, not truncated"
+            );
+        }
     }
 }

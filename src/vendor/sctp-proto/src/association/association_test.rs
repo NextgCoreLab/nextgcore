@@ -346,8 +346,10 @@ fn handle_init_test(name: &str, initial_state: AssociationState, expect_err: boo
         "{} should match",
         name
     );
-    assert_eq!(1001, a.my_max_num_outbound_streams, "{} should match", name);
-    assert_eq!(1002, a.my_max_num_inbound_streams, "{} should match", name);
+    // nextgcore patch (#813), RFC 9260 §5.1.1: the outbound count is bounded by the
+    // peer's MIS (1002), the inbound count by the peer's OS (1001).
+    assert_eq!(1002, a.my_max_num_outbound_streams, "{} should match", name);
+    assert_eq!(1001, a.my_max_num_inbound_streams, "{} should match", name);
     assert_eq!(5678, a.peer_verification_tag, "{} should match", name);
     assert_eq!(
         pkt.common_header.source_port, a.destination_port,

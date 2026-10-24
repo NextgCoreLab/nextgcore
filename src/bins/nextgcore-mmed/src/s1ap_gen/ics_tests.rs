@@ -301,3 +301,119 @@ fn through_the_handler_a_failure_for_an_unknown_ue_still_gets_an_error_indicatio
         S1apMessage::ErrorIndication(_)
     ));
 }
+
+/// #869 review: a UE-AMBR above 10 Gbit/s is not lost. The legacy Bit Rate is
+/// at its maximum and the Rel-15 Extended UE-AMBR (id 259 DL / 260 UL,
+/// criticality ignore, TS 36.413 §9.2.1.20) carries the value, for that
+/// direction only. The encode runs the criticality oracle under test, so a wrong
+/// criticality on the extension fails here too.
+#[test]
+fn a_ue_ambr_above_10_gbits_travels_in_the_extended_ie() {
+    use nextgcore_s1ap_gen::generated as g;
+    let mut req = golden_request();
+    req.ue_ambr = UeAmbr {
+        dl: 15_000_000_000,
+        ul: 2_000,
+    };
+    let bytes = build_initial_context_setup_request(&req).unwrap();
+    let pdu = nextgcore_s1ap_gen::decode(&bytes).unwrap();
+    let g::S1AP_PDU::InitiatingMessage(m) = pdu else {
+        panic!("an initiating message")
+    };
+    let g::InitiatingMessageValue::Id_InitialContextSetup(r) = m.value else {
+        panic!("an Initial Context Setup Request")
+    };
+    let a = r
+        .protocol_i_es
+        .0
+        .iter()
+        .find_map(|ie| match &ie.value {
+            g::InitialContextSetupRequestProtocolIEs_EntryValue::Id_uEaggregateMaximumBitrate(
+                a,
+            ) => Some(a.clone()),
+            _ => None,
+        })
+        .expect("the UE-AMBR IE");
+    assert_eq!(a.u_eaggregate_maximum_bit_rate_dl.0, 10_000_000_000);
+    assert_eq!(a.u_eaggregate_maximum_bit_rate_ul.0, 2_000);
+    let ext = a.ie_extensions.expect("the extension container").0;
+    assert_eq!(ext.len(), 1, "DL only");
+    assert_eq!(ext[0].id.0, 259);
+    assert_eq!(ext[0].criticality.0, g::Criticality::IGNORE);
+    assert!(matches!(
+        ext[0].extension_value,
+        g::UEAggregateMaximumBitrateIE_Extensions_EntryExtensionValue::Id_extended_uEaggregateMaximumBitRateDL(
+            g::ExtendedBitRate(15_000_000_000)
+        )
+    ));
+}
+
+/// #880 review: the oracle's EXTENSION comparison, through a real builder. No
+/// production builder writes `ie_extensions`, so the suite compared none; here
+/// the production INITIAL CONTEXT SETUP REQUEST gains a Correlation-ID (id
+/// 156, `CRITICALITY ignore` in E-RABToBeSetupItemCtxtSUReqExtIEs). With
+/// ignore the oracle reads the extension entry and passes; with reject it fails.
+#[test]
+fn the_oracle_compares_a_real_extension_entry() {
+    use crate::s1ap_gen::criticality_oracle::{assert_matches_ts_36_413, entries};
+    use nextgcore_s1ap_gen::generated as g;
+    let bytes = build_initial_context_setup_request(&golden_request()).unwrap();
+    let pdu = nextgcore_s1ap_gen::decode(&bytes).unwrap();
+    let with_extension = |crit: u8| {
+        let mut pdu = pdu.clone();
+        let g::S1AP_PDU::InitiatingMessage(ref mut m) = pdu else {
+            panic!("an initiating message")
+        };
+        let g::InitiatingMessageValue::Id_InitialContextSetup(ref mut req) = m.value else {
+            panic!("an Initial Context Setup Request")
+        };
+        let mut added = 0;
+        for ie in req.protocol_i_es.0.iter_mut() {
+            if let g::InitialContextSetupRequestProtocolIEs_EntryValue::Id_E_RABToBeSetupListCtxtSUReq(
+                ref mut list,
+            ) = ie.value
+            {
+                for item in list.0.iter_mut() {
+                    let g::E_RABToBeSetupListCtxtSUReq_EntryValue::Id_E_RABToBeSetupItemCtxtSUReq(
+                        ref mut erab,
+                    ) = item.value;
+                    erab.ie_extensions = Some(g::E_RABToBeSetupItemCtxtSUReqIE_Extensions(vec![
+                        g::E_RABToBeSetupItemCtxtSUReqIE_Extensions_Entry {
+                            id: g::ProtocolExtensionID(156),
+                            criticality: g::Criticality(crit),
+                            extension_value:
+                                g::E_RABToBeSetupItemCtxtSUReqIE_Extensions_EntryExtensionValue::Id_Correlation_ID(
+                                    g::Correlation_ID(vec![0, 0, 0, 1]),
+                                ),
+                        },
+                    ]));
+                    added += 1;
+                }
+            }
+        }
+        assert_eq!(added, 1, "the golden request has one E-RAB");
+        pdu
+    };
+
+    let ok = with_extension(g::Criticality::IGNORE);
+    let read: Vec<_> = entries(&format!("{ok:?}"))
+        .into_iter()
+        .filter(|(container, ..)| container == "E_RABToBeSetupItemCtxtSUReqIE_Extensions")
+        .collect();
+    assert_eq!(
+        read,
+        vec![(
+            "E_RABToBeSetupItemCtxtSUReqIE_Extensions".to_string(),
+            156,
+            g::Criticality::IGNORE
+        )],
+        "the extension entry is read"
+    );
+    assert_matches_ts_36_413(&ok);
+
+    let wrong = with_extension(g::Criticality::REJECT);
+    assert!(
+        std::panic::catch_unwind(|| assert_matches_ts_36_413(&wrong)).is_err(),
+        "a reject Correlation-ID is caught"
+    );
+}

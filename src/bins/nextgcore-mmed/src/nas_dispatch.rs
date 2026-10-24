@@ -1175,7 +1175,13 @@ fn emm_tau_request(
                 .collect::<Vec<_>>()
         })
         .collect();
-    if let Err(e) = nas_path::nas_eps_send_tau_accept(mme_ue, enb_ue, false, &bearers) {
+    if let Err(e) = nas_path::nas_eps_send_tau_accept(
+        mme_ue,
+        enb_ue,
+        false,
+        &bearers,
+        s1ap_build::ue_ambr_of(ctx, mme_ue),
+    ) {
         log::error!("[{}] TAU Accept send failed: {e}", mme_ue.imsi_bcd);
     }
 }
@@ -1259,7 +1265,13 @@ pub fn continue_inter_system_tau(ctx: &MmeContext, mme_ue_id: u64, enb_ue_id: u6
     let Some(mme_ue) = pool.get_mut(&mme_ue_id) else {
         return;
     };
-    if let Err(e) = nas_path::nas_eps_send_tau_accept(mme_ue, &enb_ue, false, &bearers) {
+    if let Err(e) = nas_path::nas_eps_send_tau_accept(
+        mme_ue,
+        &enb_ue,
+        false,
+        &bearers,
+        s1ap_build::ue_ambr_of(ctx, mme_ue),
+    ) {
         log::error!("[{}] TAU Accept send failed: {e}", mme_ue.imsi_bcd);
     } else {
         log::info!(
@@ -1916,11 +1928,17 @@ pub fn handle_esm_message(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue: &MmeUe, esm:
             match esm_handler::handle_deactivate_bearer_context_accept(
                 enb_ue, mme_ue, &sess, &bearer, body,
             ) {
-                Ok(()) => log::info!(
-                    "[{}] EPS bearer (ebi={}) deactivated by the UE",
-                    mme_ue.imsi_bcd,
-                    bearer.ebi
-                ),
+                Ok(()) => {
+                    log::info!(
+                        "[{}] EPS bearer (ebi={}) deactivated by the UE",
+                        mme_ue.imsi_bcd,
+                        bearer.ebi
+                    );
+                    // #734, TS 23.401 §5.4.4.1 step 7: a PDN GW initiated
+                    // deactivation completes; the Serving GW is answered when
+                    // its last bearer is done.
+                    crate::bearer_deactivation::on_accept(ctx, mme_ue.id, bearer.ebi);
+                }
                 Err(e) => log::warn!("[{}] Deactivate accept rejected: {e}", mme_ue.imsi_bcd),
             }
         }
@@ -2609,6 +2627,55 @@ mod tests {
         ];
         pdu.extend_from_slice(&[0xaa; 8]);
         pdu
+    }
+
+    /// #734: the ESM DEACTIVATE EPS BEARER CONTEXT ACCEPT reaches the PDN GW
+    /// initiated deactivation, which deletes the bearer and settles the request.
+    #[test]
+    fn a_deactivate_accept_settles_the_bearer_deactivation() {
+        let _guard = crate::gtp_path::lock_s11();
+        crate::bearer_deactivation::clear_for_test();
+        let ctx = test_ctx();
+        let enb_ue_id = enb_with_connection(&ctx);
+        let mme_ue_id = ue_with_vector(&ctx, enb_ue_id);
+        let sess_id = ctx.sess_add(mme_ue_id, 1);
+        for ebi in [5u8, 6] {
+            let id = ctx.bearer_add(sess_id, mme_ue_id);
+            ctx.bearer_pool.write().unwrap().get_mut(&id).unwrap().ebi = ebi;
+            ctx.sess_pool
+                .write()
+                .unwrap()
+                .get_mut(&sess_id)
+                .unwrap()
+                .bearer_list
+                .push(id);
+        }
+        ctx.mme_ue_pool
+            .write()
+            .unwrap()
+            .get_mut(&mme_ue_id)
+            .unwrap()
+            .sess_list
+            .push(sess_id);
+        assert!(crate::bearer_deactivation::start(
+            &ctx,
+            mme_ue_id,
+            "127.0.0.1:2123".parse().unwrap(),
+            0x734,
+            0x5ca1,
+            crate::bearer_deactivation::DeleteBearerAnswer::Ebis(vec![6]),
+            None,
+            &[6],
+            false,
+        ));
+        assert_eq!(crate::bearer_deactivation::pending_count(), 1);
+        let enb_ue = ctx.enb_ue_find_by_id(enb_ue_id).unwrap();
+        let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        // DEACTIVATE EPS BEARER CONTEXT ACCEPT, EBI 6.
+        handle_esm_message(&ctx, &enb_ue, &mme_ue, &[0x62, 0x00, 0xce]);
+        assert_eq!(crate::bearer_deactivation::pending_count(), 0);
+        assert!(ctx.bearer_find_by_ebi(mme_ue_id, 6).is_none());
+        assert!(ctx.bearer_find_by_ebi(mme_ue_id, 5).is_some());
     }
 
     /// A UE in a network-initiated detach of `detach_type`, DETACH REQUEST sent

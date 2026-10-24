@@ -27,6 +27,9 @@ pub mod pfcp_type {
     pub const SESSION_DELETION_RESPONSE: u8 = 55;
     pub const SESSION_REPORT_REQUEST: u8 = 56;
     pub const SESSION_REPORT_RESPONSE: u8 = 57;
+    /// Node Report Request / Response (Table 7.3-1), #935.
+    pub const NODE_REPORT_REQUEST: u8 = 12;
+    pub const NODE_REPORT_RESPONSE: u8 = 13;
 }
 
 // ============================================================================
@@ -129,6 +132,14 @@ pub mod pfcp_ie {
     pub const PDR_ID: u16 = 56;
     pub const F_SEID: u16 = 57;
     pub const NODE_ID: u16 = 60;
+    /// Node Report Type (§8.2.69): octet 5 bit 1 UPFR, bit 2 UPRR.
+    pub const NODE_REPORT_TYPE: u16 = 101;
+    /// User Plane Path Failure Report (Table 7.4.5.1.2-1).
+    pub const USER_PLANE_PATH_FAILURE_REPORT: u16 = 102;
+    /// Remote GTP-U Peer (§8.2.70).
+    pub const REMOTE_GTP_U_PEER: u16 = 103;
+    /// User Plane Path Recovery Report (Table 7.4.5.1.3-1).
+    pub const USER_PLANE_PATH_RECOVERY_REPORT: u16 = 187;
     pub const MEASUREMENT_METHOD: u16 = 62;
     pub const USAGE_REPORT_TRIGGER: u16 = 63;
     /// TS 29.244 §8.2.37. Parsed since #306: the PERIO reporting-trigger FLAG was
@@ -167,6 +178,12 @@ pub mod pfcp_ie {
     pub const FRAMED_IPV6_ROUTE: u16 = 155;
     pub const APN_DNN: u16 = 159;
     pub const PFCPSEREQ_FLAGS: u16 = 186;
+    /// PFCP Session Retention Information (TS 29.244 Table 7.4.4.1-2), grouped (#718)
+    pub const PFCP_SESSION_RETENTION_INFORMATION: u16 = 183;
+    /// PFCPASRsp-Flags (TS 29.244 8.2.134): PSREI / UUPSI (#718)
+    pub const PFCPASRSP_FLAGS: u16 = 184;
+    /// CP PFCP Entity IP Address (TS 29.244 8.2.135), within the retention IE (#718)
+    pub const CP_PFCP_ENTITY_IP_ADDRESS: u16 = 185;
     /// PFCPSMReq-Flags (TS 29.244 8.2.50): DROBU / SNDEM / QAURR
     pub const PFCPSMREQ_FLAGS: u16 = 49;
     /// Downlink Data Notification Delay (TS 29.244 8.2.28)
@@ -1916,11 +1933,55 @@ pub fn upf_function_features() -> Vec<u8> {
     buf.to_vec()
 }
 
+/// A PFCP Node Report Request reporting N3/N9 user-plane path FAILURE (`failure`)
+/// or RECOVERY for `peers` (#935, TS 29.244 §7.4.5.1): Node ID, the Node Report Type
+/// with UPFR or UPRR, and a User Plane Path Failure Report (IE 102) or a User Plane
+/// Path Recovery Report (IE 187) listing each peer as a Remote GTP-U Peer (§8.2.70:
+/// V4 = bit 2, V6 = bit 1 of the flags octet).
+pub fn build_node_report_request(
+    node_id: &NodeId,
+    failure: bool,
+    peers: &[std::net::IpAddr],
+) -> Vec<u8> {
+    let mut b = PfcpMessageBuilder::new();
+    b.add_node_id(node_id);
+    b.add_u8(pfcp_ie::NODE_REPORT_TYPE, if failure { 0x01 } else { 0x02 });
+    let mut report = PfcpMessageBuilder::new();
+    for peer in peers {
+        let value = match peer {
+            std::net::IpAddr::V4(v4) => {
+                let mut v = vec![0x02];
+                v.extend_from_slice(&v4.octets());
+                v
+            }
+            std::net::IpAddr::V6(v6) => {
+                let mut v = vec![0x01];
+                v.extend_from_slice(&v6.octets());
+                v
+            }
+        };
+        report.add_tlv(pfcp_ie::REMOTE_GTP_U_PEER, &value);
+    }
+    let ie = if failure {
+        pfcp_ie::USER_PLANE_PATH_FAILURE_REPORT
+    } else {
+        pfcp_ie::USER_PLANE_PATH_RECOVERY_REPORT
+    };
+    b.add_tlv(ie, &report.build());
+    b.build()
+}
+
 /// Build Association Setup Response
+///
+/// `sessions_retained` sets PSREI in a PFCPASRsp-Flags IE (TS 29.244 §6.2.6.2.2,
+/// §8.2.134): the request carried PFCP Session Retention Information for a Node ID
+/// that already had an association, and the requested sessions were kept. The IE is
+/// omitted otherwise, which a CP function reads as "nothing was retained".
 pub fn build_association_setup_response(
     node_id: &NodeId,
     recovery_time_stamp: u32,
     cause: PfcpCause,
+    sessions_retained: bool,
 ) -> Vec<u8> {
     let mut builder = PfcpMessageBuilder::new();
     builder.add_node_id(node_id);
@@ -1928,7 +1989,44 @@ pub fn build_association_setup_response(
     builder.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, recovery_time_stamp);
     // UP Function Features — only the bits this UPF really implements
     builder.add_tlv(pfcp_ie::UP_FUNCTION_FEATURES, &upf_function_features());
+    if sessions_retained {
+        builder.add_u8(pfcp_ie::PFCPASRSP_FLAGS, 0x01); // PSREI
+    }
     builder.build()
+}
+
+/// The PFCP Session Retention Information IE of an Association Setup Request
+/// (TS 29.244 Table 7.4.4.1-2), parsed (#718).
+///
+/// `None`: the IE is absent, so the existing association's sessions are deleted.
+/// `Some(vec![])`: present with no CP PFCP Entity IP Address, which means "keep all
+/// existing sessions". `Some(ips)`: keep the sessions of those CP PFCP entities only.
+pub fn parse_session_retention_information(payload: &[u8]) -> Option<Vec<std::net::IpAddr>> {
+    let ies = ParsedIe::parse_all(payload);
+    let retention = ParsedIe::find_ie(&ies, pfcp_ie::PFCP_SESSION_RETENTION_INFORMATION)?;
+    let inner = ParsedIe::parse_all(&retention.value);
+    let mut ips = Vec::new();
+    for entity in ParsedIe::find_all_ies(&inner, pfcp_ie::CP_PFCP_ENTITY_IP_ADDRESS) {
+        // Octet 5: bit 2 = V4, bit 1 = V6 (TS 29.244 §8.2.135); a field the flag
+        // announces but the IE is too short to carry is ignored, not read past.
+        let v = &entity.value;
+        let Some(&flags) = v.first() else { continue };
+        let mut off = 1;
+        if flags & 0x02 != 0 {
+            if let Some(b) = v.get(off..off + 4) {
+                ips.push(std::net::IpAddr::V4(Ipv4Addr::new(b[0], b[1], b[2], b[3])));
+            }
+            off += 4;
+        }
+        if flags & 0x01 != 0 {
+            if let Some(b) = v.get(off..off + 16) {
+                let mut o = [0u8; 16];
+                o.copy_from_slice(b);
+                ips.push(std::net::IpAddr::V6(Ipv6Addr::from(o)));
+            }
+        }
+    }
+    Some(ips)
 }
 
 /// Build Association Release Response (TS 29.244 7.4.4.2): Node ID + Cause

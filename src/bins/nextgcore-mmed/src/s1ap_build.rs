@@ -447,6 +447,86 @@ pub(crate) fn hand_written_build_downlink_nas_transport(
 // Initial Context Setup (§8.3.1)
 // ============================================================================
 
+/// The UE-AMBR the MME signals (TS 23.401 §4.7.3, #811): "the sum of the
+/// APN-AMBR of all active APNs up to the value of the subscribed UE-AMBR", per
+/// direction. An APN-AMBR sum of zero (none known) falls back to the subscribed
+/// value, and a zero subscribed value (none received) to the sum.
+pub fn ue_ambr(
+    subscribed: &crate::context::Bitrate,
+    active_apn_ambrs: impl IntoIterator<Item = crate::context::Bitrate>,
+) -> UeAmbr {
+    let (mut dl, mut ul) = (0u64, 0u64);
+    for a in active_apn_ambrs {
+        dl = dl.saturating_add(a.downlink);
+        ul = ul.saturating_add(a.uplink);
+    }
+    let cap = |sum: u64, sub: u64| match (sum, sub) {
+        // Neither known: 0 would tell the eNB to allow nothing (the IE is
+        // mandatory in Initial Context Setup and Handover Request), so the
+        // maximum the IE can carry (TS 36.413 §9.2.1.20, 10 Gbit/s) is sent and
+        // enforcement is left to the gateways' APN-AMBR (#869 review).
+        (0, 0) => UE_AMBR_UNKNOWN,
+        (0, s) | (s, 0) => s,
+        (s, sub) => s.min(sub),
+    };
+    // Above BitRate's 10 Gbit/s (TS 36.413 §9.2.1.20) the value travels in the
+    // Extended UE-AMBR IEs (Rel-15, ExtendedBitRate up to 4 Tbit/s; the encoder
+    // writes them, with the legacy IE at its maximum). Only a value beyond
+    // ExtendedBitRate is clamped, and said so.
+    let clamp = |v: u64, dir: &str| {
+        if v > UE_AMBR_MAX {
+            log::warn!(
+                "UE-AMBR {dir} of {v} bit/s exceeds the largest Extended Bit Rate (TS 36.413 \
+                 §9.2.1.20); signalling {UE_AMBR_MAX} bit/s"
+            );
+        }
+        v.min(UE_AMBR_MAX)
+    };
+    let unknown = (dl == 0 && subscribed.downlink == 0) || (ul == 0 && subscribed.uplink == 0);
+    let ambr = UeAmbr {
+        dl: clamp(cap(dl, subscribed.downlink), "downlink"),
+        ul: clamp(cap(ul, subscribed.uplink), "uplink"),
+    };
+    if unknown {
+        log::warn!(
+            "UE-AMBR unknown in a direction (no subscribed UE-AMBR and no APN-AMBR): signalling \
+             {UE_AMBR_UNKNOWN} bit/s, the largest legacy Bit Rate"
+        );
+    }
+    ambr
+}
+
+/// The UE-AMBR signalled when neither the subscription nor any APN-AMBR gives
+/// one: the largest Bit Rate (TS 36.413 §9.2.1.20, BitRate ::= INTEGER
+/// (0..10000000000)), so a legacy eNB reads it without the extension.
+pub const UE_AMBR_UNKNOWN: u64 = 10_000_000_000;
+
+/// The ceiling of any UE-AMBR this MME signals: the largest Extended Bit Rate
+/// (TS 36.413 §9.2.1.20, ExtendedBitRate ::= INTEGER (10000000001..4000000000000)).
+pub const UE_AMBR_MAX: u64 = 4_000_000_000_000;
+
+/// [`ue_ambr`] for `mme_ue`'s ACTIVE PDN connections: those whose bearers have a
+/// Serving GW S1-U endpoint (a Create Session completed). `sess_list` also holds
+/// the not yet connected sessions materialised from the subscription, whose
+/// APN-AMBR does not count. Reads only the session and bearer pools, so it is
+/// safe under an `mme_ue_pool` guard.
+pub fn ue_ambr_of(ctx: &crate::context::MmeContext, mme_ue: &MmeUe) -> UeAmbr {
+    ue_ambr(
+        &mme_ue.ambr,
+        mme_ue
+            .sess_list
+            .iter()
+            .filter_map(|id| ctx.sess_find_by_id(*id))
+            .filter(|s| {
+                s.bearer_list
+                    .iter()
+                    .filter_map(|b| ctx.bearer_find_by_id(*b))
+                    .any(|b| b.sgw_s1u_teid != 0)
+            })
+            .map(|s| s.ambr),
+    )
+}
+
 /// Build Initial Context Setup Request.
 ///
 /// The E-RAB To Be Setup list is populated from the UE's bearer contexts
@@ -456,6 +536,7 @@ pub fn build_initial_context_setup_request(
     enb_ue: &EnbUe,
     bearers: &[MmeBearer],
     nas_pdu: Option<&[u8]>,
+    ue_ambr: UeAmbr,
 ) -> S1apResult<Vec<u8>> {
     let erab_list = bearers
         .iter()
@@ -476,10 +557,9 @@ pub fn build_initial_context_setup_request(
     let req = InitialContextSetupRequest {
         mme_ue_s1ap_id: enb_ue.mme_ue_s1ap_id,
         enb_ue_s1ap_id: enb_ue.enb_ue_s1ap_id,
-        ue_ambr: UeAmbr {
-            dl: mme_ue.ambr.downlink,
-            ul: mme_ue.ambr.uplink,
-        },
+        // #811: the UE-AMBR of the active APNs (§4.7.3), not the subscribed
+        // value as such.
+        ue_ambr,
         erab_list,
         ue_security_capabilities: ue_security_capabilities_from(mme_ue),
         security_key: mme_ue.kenb,
@@ -519,15 +599,19 @@ pub fn build_ue_context_release_command(
 // ============================================================================
 
 /// Build E-RAB Setup Request for a bearer (NAS PDU is mandatory per item)
+/// `ue_ambr` is the UE-AMBR to signal when it changes, i.e. when the bearer is
+/// the default bearer of a new PDN connection (TS 23.401 §5.10.2 step 9,
+/// §4.7.3; #811); `None` for a dedicated bearer.
 pub fn build_e_rab_setup_request(
     enb_ue: &EnbUe,
     bearer: &MmeBearer,
     nas_pdu: &[u8],
+    ue_ambr: Option<UeAmbr>,
 ) -> S1apResult<Vec<u8>> {
     crate::s1ap_gen::build_erab_setup_request(&ErabSetupRequest {
         mme_ue_s1ap_id: enb_ue.mme_ue_s1ap_id,
         enb_ue_s1ap_id: enb_ue.enb_ue_s1ap_id,
-        ue_ambr: None,
+        ue_ambr,
         erab_list: vec![ErabToBeSetupItem {
             erab_id: bearer.ebi,
             erab_qos: erab_qos_from_bearer(bearer),
@@ -559,17 +643,20 @@ pub fn build_e_rab_modify_request(
 }
 
 /// Build E-RAB Release Command for a bearer
+/// `ue_ambr`: the UE-AMBR after the release, when a PDN connection goes (its
+/// default bearer, TS 23.401 §4.7.3; #811); `None` for a dedicated bearer.
 pub fn build_e_rab_release_command(
     enb_ue: &EnbUe,
     ebi: u8,
     cause_group: S1apCauseGroup,
     cause_value: i64,
     nas_pdu: Option<&[u8]>,
+    ue_ambr: Option<UeAmbr>,
 ) -> S1apResult<Vec<u8>> {
     crate::s1ap_gen::build_erab_release_command(&ErabReleaseCommand {
         mme_ue_s1ap_id: enb_ue.mme_ue_s1ap_id,
         enb_ue_s1ap_id: enb_ue.enb_ue_s1ap_id,
-        ue_ambr: None,
+        ue_ambr,
         erab_list: vec![ErabItem {
             erab_id: ebi,
             cause: cause_to_s1ap(cause_group, cause_value),
@@ -662,6 +749,25 @@ pub fn build_ue_context_modification_for_csfb(
         } else {
             CsFallbackIndicator::CsFallbackRequired
         }),
+        ue_security_capabilities: None,
+    })
+    .map_err(gen_err)
+}
+
+/// Build a UE CONTEXT MODIFICATION REQUEST carrying only a new UE-AMBR
+/// (TS 36.413 §8.3.4, #811): the HSS-initiated subscribed QoS modification of
+/// TS 23.401 §5.4.2.2, when only the UE-AMBR changes.
+pub fn build_ue_context_modification_for_ue_ambr(
+    enb_ue: &EnbUe,
+    ue_ambr: UeAmbr,
+) -> S1apResult<Vec<u8>> {
+    crate::s1ap_gen::build_ue_context_modification_request(&UeContextModificationRequest {
+        mme_ue_s1ap_id: enb_ue.mme_ue_s1ap_id,
+        enb_ue_s1ap_id: enb_ue.enb_ue_s1ap_id,
+        security_key: None,
+        subscriber_profile_id_for_rfp: None,
+        ue_ambr: Some(ue_ambr),
+        cs_fallback_indicator: None,
         ue_security_capabilities: None,
     })
     .map_err(gen_err)
@@ -948,6 +1054,59 @@ mod tests {
         }
     }
 
+    /// #811, TS 23.401 §4.7.3: min(subscribed, sum of APN-AMBRs), per
+    /// direction, with the zero (unknown) fallbacks.
+    #[test]
+    fn the_ue_ambr_is_the_sum_of_apn_ambrs_up_to_the_subscribed_value() {
+        let b = |downlink, uplink| crate::context::Bitrate { downlink, uplink };
+        let sub = b(100, 60);
+        assert_eq!(
+            ue_ambr(&sub, [b(10, 5), b(20, 5)]),
+            UeAmbr { dl: 30, ul: 10 }
+        );
+        assert_eq!(
+            ue_ambr(&sub, [b(80, 50), b(40, 40)]),
+            UeAmbr { dl: 100, ul: 60 }
+        );
+        assert_eq!(
+            ue_ambr(&sub, []),
+            UeAmbr { dl: 100, ul: 60 },
+            "no APN-AMBR known"
+        );
+        assert_eq!(
+            ue_ambr(&b(0, 0), [b(7, 3)]),
+            UeAmbr { dl: 7, ul: 3 },
+            "none subscribed"
+        );
+        assert_eq!(
+            ue_ambr(&b(0, 0), []),
+            UeAmbr {
+                dl: UE_AMBR_UNKNOWN,
+                ul: UE_AMBR_UNKNOWN
+            },
+            "nothing known: the maximum, never 0 bit/s"
+        );
+        assert_eq!(
+            ue_ambr(&b(u64::MAX, u64::MAX), [b(u64::MAX, 1), b(1, 1)]),
+            UeAmbr {
+                dl: UE_AMBR_MAX,
+                ul: 2
+            },
+            "no overflow, and clamped to the Extended Bit Rate range"
+        );
+        assert_eq!(
+            ue_ambr(
+                &b(20_000_000_000, 20_000_000_000),
+                [b(15_000_000_000, 1_000)]
+            ),
+            UeAmbr {
+                dl: 15_000_000_000,
+                ul: 1_000
+            },
+            "above 10 Gbit/s is kept: it travels in the Extended UE-AMBR IEs"
+        );
+    }
+
     #[test]
     fn test_build_initial_context_setup_request_roundtrip() {
         let mme_ue = test_mme_ue();
@@ -955,8 +1114,9 @@ mod tests {
         let bearer = test_bearer();
         let nas_pdu = vec![0x27, 0x01, 0x02];
 
+        let ambr = ue_ambr(&mme_ue.ambr, []);
         let bytes =
-            build_initial_context_setup_request(&mme_ue, &enb_ue, &[bearer], Some(&nas_pdu))
+            build_initial_context_setup_request(&mme_ue, &enb_ue, &[bearer], Some(&nas_pdu), ambr)
                 .unwrap();
         match decode_s1ap_pdu(&bytes).unwrap() {
             S1apMessage::InitialContextSetupRequest(req) => {
@@ -1020,7 +1180,7 @@ mod tests {
         let enb_ue = test_enb_ue();
         let bearer = test_bearer();
         let nas_pdu = vec![0x27, 0xAA];
-        let bytes = build_e_rab_setup_request(&enb_ue, &bearer, &nas_pdu).unwrap();
+        let bytes = build_e_rab_setup_request(&enb_ue, &bearer, &nas_pdu, None).unwrap();
         match decode_s1ap_pdu(&bytes).unwrap() {
             S1apMessage::ErabSetupRequest(req) => {
                 assert_eq!(req.mme_ue_s1ap_id, 42);
@@ -1061,6 +1221,7 @@ mod tests {
             S1apCauseGroup::Nas,
             nas_cause::NORMAL_RELEASE,
             Some(&nas_pdu),
+            None,
         )
         .unwrap();
         match decode_s1ap_pdu(&bytes).unwrap() {

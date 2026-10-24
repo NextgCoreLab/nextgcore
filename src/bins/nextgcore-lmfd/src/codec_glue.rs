@@ -9,7 +9,7 @@
 //! - [`decode_nrppa_ecid_report`] — E-CID Measurement Report (procedure code 4),
 //!   decoded and adapted by [`crate::nrppa_uplink`] on the generated NRPPa codec:
 //!   serving-cell NG-RAN-CGI → `nr_cgi`; measuredResults CHOICE →
-//!   `timing_advance`, `aoa`, `rsrp`, `rsrq`.
+//!   `ecid_rtt_ns` (TADV, TS 36.133 §10.3.1), `aoa`, `rsrp`, `rsrq`.
 //!
 //! - [`lpp_multi_rtt_provide_to_measurements`] — ProvideLocationInformation →
 //!   nr-Multi-RTT list: `nr-UE-RxTxTimeDiff` k-arm → `ue_rx_tx_ns` (signed
@@ -130,7 +130,7 @@ fn empty_request_ies() -> lpp::RequestLocationInformation_r9_IEs {
 /// `ECID-RequestLocationInformation`): bit0 rsrpReq, bit1 rsrqReq, bit2 ueRxTxReq.
 ///
 /// ueRxTxReq is set (#715): the UE Rx–Tx time difference is the E-CID timing
-/// term (`timing_advance`), and a conformant UE does not report what it was not
+/// term (`ecid_rtt_ns`), and a conformant UE does not report what it was not
 /// asked for. Without it an LPP-only E-CID session had no timing term to solve.
 fn ecid_request_ies() -> lpp::RequestLocationInformation_r9_IEs {
     lpp::RequestLocationInformation_r9_IEs {
@@ -411,6 +411,39 @@ pub fn classify_ue_capability(caps: &lpp::ProvideCapabilities) -> UeLppCapabilit
     }
 }
 
+/// Which E-CID flavours a UE reported (#834 review): E-UTRA
+/// `ecid-ProvideCapabilities` and/or Rel-16 `nr-ECID-ProvideCapabilities-r16`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EcidFlavours {
+    pub eutra: bool,
+    pub nr: bool,
+}
+
+/// The E-CID flavours of a decoded `ProvideCapabilities`.
+pub fn ecid_flavours(caps: &lpp::ProvideCapabilities) -> EcidFlavours {
+    match &caps.critical_extensions {
+        lpp::ProvideCapabilitiesCriticalExtensions::C1(
+            lpp::ProvideCapabilitiesCriticalExtensions_c1::ProvideCapabilities_r9(ies),
+        ) => EcidFlavours {
+            eutra: ies.ecid_provide_capabilities.is_some(),
+            nr: ies.extensions.nr_ecid_provide_capabilities_r16.is_some(),
+        },
+        _ => EcidFlavours::default(),
+    }
+}
+
+/// The capability class and E-CID flavours of an uplink LPP PDU that is a
+/// `ProvideCapabilities`, else `None` (#834 review).
+pub fn decode_lpp_provide_capabilities(bytes: &[u8]) -> Option<(UeLppCapability, EcidFlavours)> {
+    let msg = decode_lpp(bytes).ok()?;
+    match c1(&msg) {
+        Some(lpp::LPP_MessageBody_c1::ProvideCapabilities(caps)) => {
+            Some((classify_ue_capability(caps), ecid_flavours(caps)))
+        }
+        _ => None,
+    }
+}
+
 /// Minimum reference points a multilateration method needs.
 ///
 /// Three: both Multi-RTT trilateration and DL-TDOA hyperbolic multilateration need
@@ -419,15 +452,24 @@ pub fn classify_ue_capability(caps: &lpp::ProvideCapabilities) -> UeLppCapabilit
 /// solve for would spend a UE measurement campaign to arrive at no fix.
 pub const MIN_POINTS_FOR_MULTILATERATION: usize = 3;
 
-/// Whether this LMF can obtain the gNB half of a Multi-RTT measurement (#713).
+/// Whether this build can obtain the gNB half of a Multi-RTT measurement (#713,
+/// #807).
 ///
 /// TS 38.305 §8.10: a Multi-RTT range is UE Rx–Tx plus gNB Rx–Tx for the same TRP.
-/// The gNB half comes from the NRPPa Measurement procedure (TS 38.455), after the
-/// serving gNB has configured the UE's SRS through Positioning Information
-/// Exchange and Positioning Activation. This LMF implements none of those, so a
-/// Multi-RTT request would collect UE halves that can never be ranged. Until it
-/// does (#807), Multi-RTT is not requested.
-pub const MULTI_RTT_GNB_HALF_AVAILABLE: bool = false;
+/// The gNB half comes from the NRPPa Measurement procedure (TS 38.455 §8.5.1),
+/// after the serving gNB has configured the UE's SRS through Positioning
+/// Information Exchange and Positioning Activation. Since #807 `multi_rtt` runs
+/// all of them. Whether a given request can use them is the runtime half of the
+/// decision, [`multi_rtt_gnb_half_ready`].
+pub const MULTI_RTT_GNB_HALF_AVAILABLE: bool = true;
+
+/// Whether the gNB half can be obtained in this deployment: the NRPPa downlink is
+/// enabled (`LMF_NRPPA_DOWNLINK=1`) and `lmf.positioning.ngRanNodes` names the
+/// gNBs whose TRPs are measured. Without both, a Multi-RTT request would collect UE
+/// halves that can never be ranged, so DL-TDOA is asked for instead.
+pub fn multi_rtt_gnb_half_ready(nrppa_downlink: bool, ng_ran_nodes: usize) -> bool {
+    MULTI_RTT_GNB_HALF_AVAILABLE && nrppa_downlink && ng_ran_nodes > 0
+}
 
 /// The radio access the target UE is served on, which decides the E-CID flavour
 /// (#715).
@@ -459,6 +501,18 @@ impl AccessRat {
             AccessRat::Eutra => LppMethod::Ecid,
         }
     }
+
+    /// The E-CID method for this access and what the UE reported it supports
+    /// (#834 review): a UE that reported exactly one flavour is asked for that
+    /// one, since asking for the other gets an error or an empty report. With
+    /// both or neither reported, the access decides.
+    pub fn ecid_for(self, flavours: EcidFlavours) -> LppMethod {
+        match (flavours.eutra, flavours.nr) {
+            (true, false) => LppMethod::Ecid,
+            (false, true) => LppMethod::NrEcid,
+            _ => self.ecid(),
+        }
+    }
 }
 
 /// Choose the LPP method for a positioning request (#103 criterion 4).
@@ -480,7 +534,8 @@ impl AccessRat {
 /// 2. **The UE reported E-CID only ⇒ E-CID.** Asking a UE for a method it has said
 ///    it cannot perform gets an error or an empty report.
 /// 3. **High-accuracy or emergency QoS ⇒ a multilateration method.** Multi-RTT
-///    when the gNB Rx–Tx half can be obtained ([`MULTI_RTT_GNB_HALF_AVAILABLE`]),
+///    when the gNB Rx–Tx half can be obtained (`gnb_half_ready`, from
+///    [`multi_rtt_gnb_half_ready`]),
 ///    because its two-sided measurement cancels the clock offset. Otherwise
 ///    NR DL-TDOA (TS 38.305 §8.12), whose RSTDs the UE measures alone and which
 ///    needs no gNB measurement (#713). This depends on #714, the DL-TDOA
@@ -501,24 +556,26 @@ pub fn select_lpp_method(
     reference_points: usize,
     capability: UeLppCapability,
     access: AccessRat,
+    flavours: EcidFlavours,
+    gnb_half_ready: bool,
 ) -> LppMethod {
     use crate::context::PositioningQos;
 
     if reference_points < MIN_POINTS_FOR_MULTILATERATION {
-        return access.ecid();
+        return access.ecid_for(flavours);
     }
     if capability == UeLppCapability::EcidOnly {
-        return access.ecid();
+        return access.ecid_for(flavours);
     }
     match qos {
         PositioningQos::HighAccuracy | PositioningQos::Emergency => {
-            if MULTI_RTT_GNB_HALF_AVAILABLE {
+            if gnb_half_ready {
                 LppMethod::MultiRtt
             } else {
                 LppMethod::DlTdoa
             }
         }
-        PositioningQos::LowLatency | PositioningQos::BestEffort => access.ecid(),
+        PositioningQos::LowLatency | PositioningQos::BestEffort => access.ecid_for(flavours),
     }
 }
 
@@ -532,7 +589,31 @@ pub fn select_lpp_method(
 /// The NR bodies are Rel-16 extension additions of `RequestLocationInformation-r9-IEs`
 /// (TS 37.355 §6.2), which the generated codec carries since nextgsim #253.
 pub fn build_lpp_request(method: LppMethod, transaction_number: u8) -> Result<Vec<u8>, String> {
-    let ies = match method {
+    encode(
+        &request_location(transaction_number, request_ies(method)),
+        &format!("RequestLocationInformation ({method:?})"),
+    )
+}
+
+/// A Multi-RTT request that also asks for NR DL-TDOA (#903 review): both are
+/// members of the same Rel-16 extension group of `RequestLocationInformation-r9-IEs`
+/// (TS 37.355 §6.2), and a UE measures both on the same DL-PRS. The DL-TDOA RSTDs
+/// let the solver fall back when no Multi-RTT pair forms: the gNB answered
+/// MEASUREMENT FAILURE, never answered, or its halves did not pair. The fix states
+/// which method produced it.
+pub fn build_lpp_multi_rtt_with_dl_tdoa_request(transaction_number: u8) -> Result<Vec<u8>, String> {
+    let mut ies = request_ies(LppMethod::MultiRtt);
+    ies.extensions.nr_dl_tdoa_request_location_information_r16 = request_ies(LppMethod::DlTdoa)
+        .extensions
+        .nr_dl_tdoa_request_location_information_r16;
+    encode(
+        &request_location(transaction_number, ies),
+        "RequestLocationInformation (Multi-RTT + DL-TDOA)",
+    )
+}
+
+fn request_ies(method: LppMethod) -> lpp::RequestLocationInformation_r9_IEs {
+    match method {
         LppMethod::Ecid => ecid_request_ies(),
         LppMethod::NrEcid => nr_ecid_request_ies(),
         LppMethod::MultiRtt => {
@@ -598,11 +679,7 @@ pub fn build_lpp_request(method: LppMethod, transaction_number: u8) -> Result<Ve
                 });
             ies
         }
-    };
-    encode(
-        &request_location(transaction_number, ies),
-        &format!("RequestLocationInformation ({method:?})"),
-    )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -757,6 +834,17 @@ pub fn decode_nrppa_ecid_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasuremen
 // LPP E-CID adapter (A4)
 // ---------------------------------------------------------------------------
 
+/// N_TA,offset of an E-UTRA TDD cell, in T_s (TS 36.211 §8.1: 624 for frame
+/// structure type 2, 0 for type 1).
+const N_TA_OFFSET_TDD_TS: f64 = 624.0;
+
+/// Whether `earfcn` is a downlink EARFCN of an E-UTRA TDD band: bands 33..54,
+/// N_DL 36000..60304 (TS 36.101 Table 5.7.3-1; band 54 is 60255..60304). Every
+/// FDD band is below 36000 or, for bands 65 and up, at 65536 and above.
+fn is_eutra_tdd_earfcn(earfcn: u32) -> bool {
+    (36_000..=60_304).contains(&earfcn)
+}
+
 /// Map one LPP `MeasuredResultsElement` (TS 37.355 §6.5.3
 /// `ECID-SignalMeasurementInformation`) to a [`CellMeasurement`].
 ///
@@ -765,19 +853,51 @@ pub fn decode_nrppa_ecid_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasuremen
 /// | `phys_cell_id` (0..503)      | `nr_cgi`          | `"pci-<n>"` (matches the Multi-RTT / DL-TDOA adapters, so one seeded registry serves all methods) |
 /// | `rsrp_result` (0..97)        | `rsrp`            | `v − 140` → −140..−43 dBm (E-UTRA RSRP-Range, TS 36.133 §9.1.4; same convention as the NRPPa E-CID adapter in [`crate::nrppa_uplink`]) |
 /// | `rsrq_result` (0..34)        | `rsrq`            | raw 0..34 index (E-UTRA RSRQ-Range, TS 36.133 §9.1.7; same as the NRPPa adapter) |
-/// | `ue_rx_tx_time_diff` (0..4095) | `timing_advance` | raw UE Rx−Tx time-difference units — the E-CID ranging term `solve_ecid`'s TA ring consumes |
+/// | `ue_rx_tx_time_diff` (0..4095) | `ecid_rtt_ns` | TS 36.133 §9.1.9.3 bins (2 T_s to 4096 T_s, then 8 T_s), midpoint in ns, less N_TA,offset on a TDD cell; the last value is open-ended and dropped (#832) |
 fn measured_results_element_to_cell(elem: &lpp::MeasuredResultsElement) -> CellMeasurement {
+    // ARFCN-ValueEUTRA-v9a0 carries an EARFCN above 65535 when the root field
+    // holds maxEARFCN (TS 37.355).
+    let earfcn = elem
+        .extensions
+        .arfcn_eutra_v9a0
+        .as_ref()
+        .map(|v| v.0)
+        .unwrap_or(u32::from(elem.arfcn_eutra.0));
+    let rtt = elem.ue_rx_tx_time_diff.as_ref().and_then(|v| {
+        crate::positioning::eutra_time_report_to_ns(
+            u32::from(v.0),
+            crate::positioning::EUTRA_UE_RX_TX_MAX,
+        )
+        .map(|(mid, width)| {
+            // #865 review: on a TDD cell the UE Rx–Tx includes the uplink timing
+            // offset N_TA,offset = 624 T_s (TS 36.211 §8.1, frame structure type 2),
+            // which is not propagation. Removed, so the ring is not ~3 km too large.
+            if is_eutra_tdd_earfcn(earfcn) {
+                (
+                    (mid - N_TA_OFFSET_TDD_TS * crate::positioning::TS_NS).max(0.0),
+                    width,
+                )
+            } else {
+                (mid, width)
+            }
+        })
+    });
     CellMeasurement {
         nr_cgi: format!("pci-{}", elem.phys_cell_id.0),
         rsrp: elem.rsrp_result.as_ref().map(|v| i16::from(v.0) - 140),
         rsrq: elem.rsrq_result.as_ref().map(|v| i16::from(v.0)),
-        timing_advance: elem.ue_rx_tx_time_diff.as_ref().map(|v| u32::from(v.0)),
+        timing_advance: None,
         aoa: None,
         rtt_ns: None,
         rstd_ns: None,
         ue_rx_tx_ns: None,
         rstd_reference: None,
+        // TS 36.133 §9.1.9.3: the UE Rx–Tx time difference, in T_s bins. With the
+        // TA loop converged it is the UE's N_TA, the round trip (#832).
+        ecid_rtt_ns: rtt.map(|(mid, _)| mid),
+        ecid_rtt_width_ns: rtt.map(|(_, width)| width),
         gnb_rx_tx_ns: None,
+        meas_time: None,
         dl_prs_id: None,
         eutra: true,
     }
@@ -826,9 +946,12 @@ pub fn decode_lpp_ecid_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasurement>
 // LPP NR E-CID adapter (#715)
 // ---------------------------------------------------------------------------
 
-/// TS 38.133 §10.1.6.1 SS-RSRP report mapping: `SS-RSRP_v` covers
-/// `−157 + v ≤ RSRP < −156 + v` dBm (0 is below −156, 127 is −31 and above).
-/// The upper bound is used, the same convention as the E-UTRA `v − 140`.
+/// TS 38.133 §10.1.6.1 SS-RSRP report mapping, read as `v − 156` dBm: the upper
+/// edge of the bin, the same convention as the E-UTRA `v − 140`. The lowest and
+/// highest report values are open-ended bins, so they are reported at their
+/// inner edge. RSRP only ranks cells here (the serving-cell choice) and never
+/// enters a range, so an open-ended value is kept rather than dropped (#834
+/// review: the old comment's "127 is −31 and above" disagreed with this formula).
 fn nr_rsrp_dbm(v: u8) -> i16 {
     i16::from(v) - 156
 }
@@ -842,7 +965,7 @@ fn nr_rsrp_dbm(v: u8) -> i16 {
 /// | `resultsSSB-Cell-r16.nr-RSRP-r16` (0..127), else the CSI-RS cell result | `rsrp` | `v − 156` dBm ([`nr_rsrp_dbm`]) |
 /// | `…nr-RSRQ-r16` (0..127) | `rsrq` | raw index (TS 38.133 §10.1.11.1), like the E-UTRA adapter's raw index |
 ///
-/// NR E-CID carries no UE timing quantity, so `timing_advance` stays empty. The
+/// NR E-CID carries no UE timing quantity, so `ecid_rtt_ns` stays empty. The
 /// timing term of an NR E-CID fix is the gNB's, from the NRPPa E-CID leg.
 fn nr_measured_results_element_to_cell(
     elem: &lpp::NR_MeasuredResultsElement_r16,
@@ -864,7 +987,10 @@ fn nr_measured_results_element_to_cell(
         rtt_ns: None,
         rstd_ns: None,
         ue_rx_tx_ns: None,
+        ecid_rtt_ns: None,
+        ecid_rtt_width_ns: None,
         gnb_rx_tx_ns: None,
+        meas_time: None,
         rstd_reference: None,
         dl_prs_id: None,
         eutra: false,
@@ -947,12 +1073,32 @@ pub fn lpp_multi_rtt_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<Cell
                 // None for a saturated (open-ended) report value.
                 ue_rx_tx_ns: ue_rx_tx_to_signed_ns(rx_tx_report(&elem.nr_ue_rx_tx_time_diff_r16)),
                 rstd_reference: None,
+                ecid_rtt_ns: None,
+                ecid_rtt_width_ns: None,
                 gnb_rx_tx_ns: None,
+                meas_time: Some(lpp_time_stamp(&elem.nr_time_stamp_r16)),
                 dl_prs_id: Some(elem.dl_prs_id_r16.0),
                 eutra: false,
             }
         })
         .collect()
+}
+
+/// A TS 37.355 `NR-TimeStamp-r16` as a [`SlotTime`](crate::nrppa_positioning::SlotTime):
+/// the SFN and slot of the TRP the measurement was made on (#807).
+fn lpp_time_stamp(t: &lpp::NR_TimeStamp_r16) -> crate::nrppa_positioning::SlotTime {
+    use lpp::NR_TimeStamp_r16Nr_Slot_r16 as S;
+    let (slot, slots_per_frame) = match &t.nr_slot_r16 {
+        S::Scs15_r16(s) => (s.0, 10),
+        S::Scs30_r16(s) => (s.0, 20),
+        S::Scs60_r16(s) => (s.0, 40),
+        S::Scs120_r16(s) => (s.0, 80),
+    };
+    crate::nrppa_positioning::SlotTime {
+        sfn: t.nr_sfn_r16.0,
+        slot,
+        slots_per_frame,
+    }
 }
 
 /// Extract the LPP transaction number as a correlation request-id.
@@ -1018,7 +1164,10 @@ pub fn lpp_dl_tdoa_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<CellMe
         rstd_ns: Some(0.0),
         ue_rx_tx_ns: None,
         rstd_reference: Some(reference),
+        ecid_rtt_ns: None,
+        ecid_rtt_width_ns: None,
         gnb_rx_tx_ns: None,
+        meas_time: None,
         dl_prs_id: Some(sig.dl_prs_reference_info_r16.dl_prs_id_r16.0),
         eutra: false,
     });
@@ -1045,7 +1194,10 @@ pub fn lpp_dl_tdoa_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<CellMe
                 .map(nrrstd_to_signed_ns),
             ue_rx_tx_ns: None,
             rstd_reference: Some(reference),
+            ecid_rtt_ns: None,
+            ecid_rtt_width_ns: None,
             gnb_rx_tx_ns: None,
+            meas_time: None,
             dl_prs_id: Some(elem.dl_prs_id_r16.0),
             eutra: false,
         });
@@ -1082,12 +1234,12 @@ pub fn decode_lpp_provide_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasureme
     let cells = if !ecid.is_empty() {
         ecid
     } else {
-        let multi_rtt = lpp_multi_rtt_provide_to_measurements(&msg);
-        if multi_rtt.is_empty() {
-            lpp_dl_tdoa_provide_to_measurements(&msg)
-        } else {
-            multi_rtt
-        }
+        // #903 review: a report answering a Multi-RTT + DL-TDOA request carries both
+        // sets. Both are kept, so the solver falls back to DL-TDOA when the
+        // Multi-RTT halves do not pair.
+        let mut cells = lpp_multi_rtt_provide_to_measurements(&msg);
+        cells.extend(lpp_dl_tdoa_provide_to_measurements(&msg));
+        cells
     };
     Ok((request_id, cells))
 }
@@ -1212,7 +1364,7 @@ mod tests {
     ///   physCellId 42        -> `"pci-42"`
     ///   rsrp-Result 60       -> 60 − 140 = −80 dBm (E-UTRA RSRP-Range §9.1.4)
     ///   rsrq-Result 20       -> raw index 20 (E-UTRA RSRQ-Range §9.1.7)
-    ///   ue-RxTxTimeDiff 700  -> timing_advance 700 (the ranging term)
+    ///   ue-RxTxTimeDiff 700  -> ecid_rtt_ns 1401·T_s (TS 36.133 §9.1.9.3, #832)
     /// The exact UPER bytes are pinned so an encoder regression is caught, then
     /// decoded through the adapter and the adapted values are asserted.
     #[test]
@@ -1243,10 +1395,12 @@ mod tests {
         assert_eq!(cells[0].nr_cgi, "pci-42");
         assert_eq!(cells[0].rsrp, Some(-80), "rsrp-Result 60 -> 60-140 dBm");
         assert_eq!(cells[0].rsrq, Some(20), "rsrq-Result raw index");
+        // #832: TS 36.133 §9.1.9.3, value 700 is [1400, 1402) T_s: midpoint 1401 T_s.
+        assert_eq!(cells[0].timing_advance, None);
         assert_eq!(
-            cells[0].timing_advance,
-            Some(700),
-            "ue-RxTxTimeDiff -> TA term"
+            cells[0].ecid_rtt_ns,
+            Some(1401.0 * crate::positioning::TS_NS),
+            "ue-RxTxTimeDiff -> the E-CID round trip"
         );
         assert_eq!(cells[0].rtt_ns, None);
         assert_eq!(cells[0].rstd_ns, None);
@@ -1261,7 +1415,10 @@ mod tests {
             decode_lpp_provide_report(bytes).expect("decode via the provide entry point");
         assert_eq!(cells2.len(), 2);
         assert_eq!(cells2[0].nr_cgi, "pci-42");
-        assert_eq!(cells2[0].timing_advance, Some(700));
+        assert_eq!(
+            cells2[0].ecid_rtt_ns,
+            Some(1401.0 * crate::positioning::TS_NS)
+        );
     }
 
     /// An `ECID-Error`-only provide body (no signal measurements) adapts to an
@@ -1337,7 +1494,7 @@ mod tests {
         assert_eq!(cells.len(), 1, "one serving-cell entry");
         let c = &cells[0];
         assert_eq!(c.nr_cgi, "02f839-000000001");
-        assert_eq!(c.timing_advance, Some(500));
+        assert_eq!(c.ecid_rtt_ns, Some(1001.0 * crate::positioning::TS_NS));
         assert_eq!(c.aoa, Some(90.0));
         // Best RSRP item = 60 → 60 − 140 = −80 dBm.
         assert_eq!(c.rsrp, Some(-80));

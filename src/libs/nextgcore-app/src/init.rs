@@ -405,10 +405,9 @@ pub fn nf_common_init(
     log_level: &str,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), InitError> {
-    // 1. Logging — honour RUST_LOG env var; fall back to the supplied level.
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level))
-        .format_timestamp_millis()
-        .init();
+    // 1. Logging — honour RUST_LOG env var; fall back to the supplied level
+    //    (the shared NF behaviour, #691).
+    nextgcore_core::log::nf_log_builder(log_level).init();
 
     // 2. OpenTelemetry — best-effort; failures are logged but not fatal.
     let otel_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
