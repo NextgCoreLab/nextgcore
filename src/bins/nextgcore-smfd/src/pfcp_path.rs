@@ -90,7 +90,20 @@ pub enum N4Admission {
 /// sender: anyone reaching UDP 8805 could answer our requests, forge a Session
 /// Report for any SEID, or tear UPF 0's association down.
 pub fn admit_n4(msg_type: u8, from: SocketAddr, peers: &[SocketAddr]) -> N4Admission {
+    // The exact endpoint first; else the PFCP node, i.e. the canonical IP address:
+    // TS 29.244 §4.2.2 lets a request come from any source port, and TS 23.007 §19A
+    // identifies the peer by its source IP address. A node shared by two pool
+    // entries (two UPFs on one host) is matched only by the exact endpoint.
     if let Some(i) = peers.iter().position(|p| *p == from) {
+        return N4Admission::Peer(i);
+    }
+    let same_node: Vec<usize> = peers
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| same_pfcp_node(**p, from))
+        .map(|(i, _)| i)
+        .collect();
+    if let [i] = same_node[..] {
         return N4Admission::Peer(i);
     }
     match msg_type {
@@ -99,6 +112,12 @@ pub fn admit_n4(msg_type: u8, from: SocketAddr, peers: &[SocketAddr]) -> N4Admis
         pfcp_message_type::SESSION_REPORT_REQUEST => N4Admission::RefuseReport,
         _ => N4Admission::Drop,
     }
+}
+
+/// Whether two PFCP endpoints are the same PFCP node: the canonical IP address (an
+/// IPv4-mapped IPv6 address is the IPv4 one), not the port.
+pub fn same_pfcp_node(a: SocketAddr, b: SocketAddr) -> bool {
+    a.ip().to_canonical() == b.ip().to_canonical()
 }
 
 /// A Heartbeat Response carrying our Recovery Time Stamp (TS 29.244 §7.4.2.2).
@@ -114,7 +133,7 @@ pub fn report_sender_owns_session(seid: u64, from: SocketAddr) -> bool {
         .read()
         .ok()
         .and_then(|map| map.get(&seid).copied())
-        .is_none_or(|peer| peer == from)
+        .is_none_or(|peer| same_pfcp_node(peer, from))
 }
 
 /// Is this message type a response (solicited by one of our requests)?

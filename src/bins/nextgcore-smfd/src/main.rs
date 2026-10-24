@@ -7941,7 +7941,8 @@ mod tests {
         client.set_assoc_state_for_test(true, None, None).await;
         pfcp_path::set_global_pool(vec![client.clone()]);
         let listener = spawn_pfcp_listener(sock, vec![client.clone()]);
-        let stranger = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // Another IP: another port of the same host is the same PFCP node.
+        let stranger = tokio::net::UdpSocket::bind("127.0.0.2:0").await.unwrap();
         let before = pfcp_path::PFCP_UNAUTHORIZED.load(Ordering::SeqCst);
 
         stranger
@@ -7993,7 +7994,7 @@ mod tests {
         client.set_assoc_state_for_test(true, None, None).await;
         pfcp_path::set_global_pool(vec![client.clone()]);
         let listener = spawn_pfcp_listener(sock, vec![client.clone()]);
-        let stranger = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stranger = tokio::net::UdpSocket::bind("127.0.0.2:0").await.unwrap();
 
         let c = client.clone();
         let request = tokio::spawn(async move {
@@ -8039,6 +8040,42 @@ mod tests {
         );
     }
 
+    /// #974 review: a UPF's Heartbeat Request from another source port of its own
+    /// address is the same PFCP node (TS 29.244 §4.2.2: any source port).
+    #[test]
+    fn a_upf_is_its_ip_address_not_its_port() {
+        let upf: std::net::SocketAddr = "10.0.0.7:8805".parse().unwrap();
+        let other: std::net::SocketAddr = "10.0.0.8:8805".parse().unwrap();
+        let ephemeral: std::net::SocketAddr = "10.0.0.7:40001".parse().unwrap();
+        assert_eq!(
+            pfcp_path::admit_n4(
+                pfcp_path::pfcp_message_type::SESSION_REPORT_REQUEST,
+                ephemeral,
+                &[upf, other]
+            ),
+            pfcp_path::N4Admission::Peer(0)
+        );
+        let mapped: std::net::SocketAddr = "[::ffff:10.0.0.8]:8805".parse().unwrap();
+        assert_eq!(
+            pfcp_path::admit_n4(
+                pfcp_path::pfcp_message_type::SESSION_REPORT_REQUEST,
+                mapped,
+                &[upf, other]
+            ),
+            pfcp_path::N4Admission::Peer(1)
+        );
+        // Two pool entries on one host: only the exact endpoint routes.
+        let twin: std::net::SocketAddr = "10.0.0.7:8806".parse().unwrap();
+        assert_eq!(
+            pfcp_path::admit_n4(
+                pfcp_path::pfcp_message_type::SESSION_REPORT_REQUEST,
+                ephemeral,
+                &[upf, twin]
+            ),
+            pfcp_path::N4Admission::RefuseReport
+        );
+    }
+
     /// #971: a UPF reports only on its own sessions. A report for a session recorded
     /// on another UPF is refused with cause 65.
     #[tokio::test]
@@ -8046,7 +8083,8 @@ mod tests {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
         let upf_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let upf_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // Another node: UPFs are told apart by IP address.
+        let upf_b = tokio::net::UdpSocket::bind("127.0.0.3:0").await.unwrap();
         let sock = std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let smf = sock.local_addr().unwrap();
         let a = std::sync::Arc::new(pfcp_path::PfcpClient::new(
