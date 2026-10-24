@@ -59,9 +59,10 @@ struct Args {
     #[arg(short = 'l', long)]
     log_file: Option<String>,
 
-    /// Log level (trace, debug, info, warn, error)
-    #[arg(short = 'e', long, default_value = "info")]
-    log_level: String,
+    /// Log level (trace, debug, info, warn, error). Without it, the config
+    /// file's `logger.level`, else `info`; `RUST_LOG` overrides (#691).
+    #[arg(short = 'e', long)]
+    log_level: Option<String>,
 
     /// Disable color output
     #[arg(short = 'm', long)]
@@ -2331,6 +2332,26 @@ fn parse_subs_sess_ambr(v: Option<&serde_json::Value>) -> Option<crate::context:
     })
 }
 
+/// TS 29.502 §6.1.2.3.2 custom header, forwarded by the SMF (TS 29.512 §5.2.3.2).
+const ORIGINATION_TIMESTAMP_HEADER: &str = "3gpp-Sbi-Origination-Timestamp";
+
+/// `403 LATE_OVERLAPPING_REQUEST` (TS 29.512 §4.2.7, Table 5.7.3-1): the create
+/// collides with an existing SM Policy Association whose origination timestamp
+/// is more recent.
+fn late_overlapping_request(supi: &str, pdu_session_id: u8) -> SbiResponse {
+    SbiResponse::with_status(403)
+        .with_json_body(&serde_json::json!({
+            "title": "Forbidden",
+            "status": 403,
+            "cause": "LATE_OVERLAPPING_REQUEST",
+            "detail": format!(
+                "an SM policy association for {supi} PDU session {pdu_session_id} with a more \
+                 recent origination timestamp exists"
+            ),
+        }))
+        .unwrap_or_else(|_| SbiResponse::with_status(403))
+}
+
 pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
     log::info!("SM Policy Create");
 
@@ -2408,25 +2429,59 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
     // subscribed bound to authorise against.
     let subs_sess_ambr = parse_subs_sess_ambr(policy_data.get("subsSessAmbr"));
 
-    let ctx = pcf_self();
-
-    // Get or create UE SM
-    let ue_sm_id = if let Ok(context) = ctx.read() {
-        match context.ue_sm_find_by_supi(supi) {
-            Some(ue_sm) => Some(ue_sm.id),
-            None => context.ue_sm_add(supi).map(|ue| ue.id),
-        }
-    } else {
-        None
+    // TS 29.512 §4.2.7 / §5.2.3.2: the SMF forwards the AMF's origination
+    // timestamp. A value that is present but unreadable is refused rather than
+    // treated as absent: absent means "accept as more recent", so a garbled
+    // late request would otherwise replace a newer association.
+    let origination_ms = match request.http.get_header(ORIGINATION_TIMESTAMP_HEADER) {
+        None => None,
+        Some(v) => match nextgcore_sbi::datetime::origination_timestamp_to_epoch_ms(v) {
+            Some(ms) => Some(ms),
+            None => {
+                return send_bad_request(
+                    &format!("{ORIGINATION_TIMESTAMP_HEADER} is not a TS 29.502 timestamp"),
+                    Some("INVALID_MSG_FORMAT"),
+                )
+            }
+        },
     };
 
-    let sess = ue_sm_id.and_then(|ue_sm_id| {
-        if let Ok(context) = ctx.read() {
-            context.sess_add(ue_sm_id, pdu_session_id)
-        } else {
-            None
+    let ctx = pcf_self();
+
+    // Resolve the UE SM, apply the collision rule and add the session in one
+    // step (#892, TS 29.512 §4.2.7).
+    let created = match ctx.read() {
+        Ok(context) => context.sess_create_for_supi(&crate::context::SessCreateRequest {
+            supi,
+            psi: pdu_session_id,
+            dnn,
+            s_nssai: SNssai { sst, sd },
+            origination_ms,
+        }),
+        Err(_) => Err(crate::context::SessCreateError::Limit),
+    };
+    let sess = match created {
+        Ok(created) => {
+            if let Some((old, apps)) = created.replaced {
+                // The existing association was deleted locally (§4.2.7 NOTE 2):
+                // the same follow-ups as an SM policy delete.
+                sbi_path::pcf_sess_deregister_bsf_binding(
+                    old.binding.id.clone().unwrap_or_default(),
+                );
+                let terminated = terminate_af_app_sessions(&apps);
+                log::info!(
+                    "SM Policy {} replaced by a more recent create ({terminated} AF app \
+                     session(s) terminated)",
+                    old.sm_policy_id
+                );
+            }
+            Some(created.sess)
         }
-    });
+        Err(crate::context::SessCreateError::LateOverlapping) => {
+            return late_overlapping_request(supi, pdu_session_id)
+        }
+        Err(crate::context::SessCreateError::Limit) => None,
+    };
 
     match sess {
         Some(mut sess) => {
@@ -2749,9 +2804,9 @@ fn terminate_af_app_sessions(apps: &[PcfApp]) -> usize {
 /// Remove a UE's SM-policy context with all its sessions, terminating every
 /// AF application session bound to them (TS 29.514 §4.2.5.3, #767 review).
 ///
-/// No live path removes a UE's SM-policy context today (the PCF keeps one per
-/// SUPI; see the issue on that growth). This is the API any future UE-level
-/// removal must use, so no AF is left believing in a context the PCF dropped.
+/// A UE SM normally goes with its last session (`sess_remove_inner`, #892).
+/// This is the API for removing one that still has sessions, so no AF is left
+/// believing in a context the PCF dropped.
 /// The termCause is PDU_SESSION_TERMINATION on purpose: every PDU session of
 /// the UE is gone, which is exactly that cause (§4.2.5.3 i).
 pub fn remove_ue_sm(pcf_ue_sm_id: u64) -> bool {
@@ -4081,21 +4136,11 @@ pub async fn handle_app_session_modify(app_session_id: &str, request: &SbiReques
 
 /// Initialize logging based on command line arguments
 fn init_logging(args: &Args) -> Result<()> {
-    let mut builder = env_logger::Builder::new();
-
-    // Set log level
-    let level = match args.log_level.to_lowercase().as_str() {
-        "trace" => log::LevelFilter::Trace,
-        "debug" => log::LevelFilter::Debug,
-        "info" => log::LevelFilter::Info,
-        "warn" => log::LevelFilter::Warn,
-        "error" => log::LevelFilter::Error,
-        _ => log::LevelFilter::Info,
-    };
-    builder.filter_level(level);
-
-    // Configure format
-    builder.format_timestamp_millis();
+    // RUST_LOG if set, else --log-level: the same for every NF (#691).
+    let mut builder = nextgcore_core::log::nf_log_builder(&nextgcore_core::log::nf_log_level(
+        args.log_level.as_deref(),
+        Some(&args.config),
+    ));
 
     if args.no_color {
         builder.write_style(env_logger::WriteStyle::Never);
@@ -4190,7 +4235,7 @@ mod tests {
     fn test_args_default() {
         let args = Args::parse_from(["nextgcore-pcfd"]);
         assert_eq!(args.config, "/etc/nextgcore/pcf.yaml");
-        assert_eq!(args.log_level, "info");
+        assert_eq!(args.log_level, None);
         assert_eq!(args.sbi_addr, "0.0.0.0");
         assert_eq!(args.sbi_port, 7777);
         assert!(!args.tls);
@@ -4216,7 +4261,7 @@ mod tests {
             "8192",
         ]);
         assert_eq!(args.config, "/custom/pcf.yaml");
-        assert_eq!(args.log_level, "debug");
+        assert_eq!(args.log_level.as_deref(), Some("debug"));
         assert_eq!(args.sbi_addr, "0.0.0.0");
         assert_eq!(args.sbi_port, 8080);
         assert_eq!(args.max_ue, 2048);
@@ -7072,6 +7117,262 @@ mod tests {
     /// A `ueIpv6` binds the session whose PREFIX contains it — the AF sends a full
     /// address while the session holds a prefix, so an exact-string lookup would
     /// never match.
+    /// #980 review: replacing an association does what deleting it does. The
+    /// old association's AF app session gets `POST {notifUri}/terminate`
+    /// (TS 29.514 §4.2.5.3), and its BSF binding is deregistered.
+    ///
+    /// Revert-verified: without either follow-up in the create handler's replace
+    /// branch, this test fails.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn a_replaced_association_terminates_its_af_sessions_and_deregisters_its_binding() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        use std::sync::Mutex as StdMutex;
+
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        pcf_context_init(64, 64);
+        let supi = "imsi-001010000000980";
+        let create = |ts: &str| {
+            let mut body = full_create_body(supi, 5);
+            body["ipv4Address"] = serde_json::json!("10.45.0.198");
+            make_request("POST", "/npcf-smpolicycontrol/v1/sm-policies", Some(body))
+                .with_header(ORIGINATION_TIMESTAMP_HEADER, ts)
+        };
+        let resp = pcf_sbi_request_handler(create("Fri, 23 Oct 2026 10:00:00.100 GMT")).await;
+        assert_eq!(resp.status, 201);
+        let first = pcf_self()
+            .read()
+            .unwrap()
+            .sess_find_by_ipv4addr("10.45.0.198")
+            .expect("stored");
+        // As a BSF that answered the registration would have left it.
+        let mut bound = first.clone();
+        bound.binding.id = Some("bind-980".to_string());
+        pcf_self().read().unwrap().sess_update(&bound);
+
+        let seen: Arc<StdMutex<Vec<(String, serde_json::Value)>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let af = SbiServer::on_listener(SbiServerConfig::new(addr), port_listener);
+        af.start(move |req: SbiRequest| {
+            let sink = Arc::clone(&sink);
+            async move {
+                let body = req
+                    .http
+                    .content
+                    .as_deref()
+                    .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+                    .unwrap_or(serde_json::Value::Null);
+                sink.lock()
+                    .expect("sink")
+                    .push((req.header.uri.clone(), body));
+                SbiResponse::with_status(204)
+            }
+        })
+        .await
+        .expect("AF listener starts");
+        let notif_uri = format!("http://127.0.0.1:{port}/af-notif-980");
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions",
+            Some(af_create_body(&notif_uri, ("ueIpv4", "10.45.0.198"))),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let app_session_id = body["appSessionId"].as_str().unwrap().to_string();
+
+        let resp = pcf_sbi_request_handler(create("Fri, 23 Oct 2026 10:00:00.200 GMT")).await;
+        assert_eq!(resp.status, 201, "the more recent create replaces");
+        assert!(pcf_self()
+            .read()
+            .unwrap()
+            .sess_find_by_sm_policy_id(&first.sm_policy_id)
+            .is_none());
+
+        let mut terminate = None;
+        for _ in 0..200 {
+            terminate = seen
+                .lock()
+                .expect("sink")
+                .iter()
+                .find(|(uri, _)| uri.ends_with("/af-notif-980/terminate"))
+                .cloned();
+            if terminate.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let (_, body) = terminate.unwrap_or_else(|| {
+            panic!(
+                "the replaced association's AF got no terminate: {:?}",
+                seen.lock().unwrap()
+            )
+        });
+        assert_eq!(body["termCause"], "PDU_SESSION_TERMINATION");
+        assert_eq!(
+            body["resUri"],
+            format!("/npcf-policyauthorization/v1/app-sessions/{app_session_id}")
+        );
+        assert!(
+            crate::sbi_path::BSF_DEREGISTRATIONS_FOR_TEST
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|b| b == "bind-980"),
+            "the replaced association's BSF binding was not deregistered"
+        );
+    }
+
+    /// TS 29.512 §4.2.7 through the SBI handler: a create carrying an older
+    /// `3gpp-Sbi-Origination-Timestamp` than the existing association gets 403
+    /// LATE_OVERLAPPING_REQUEST, a newer one replaces it (201, new id, the old
+    /// id gone), and an unreadable header is a 400.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn sm_policy_create_applies_the_origination_timestamp_rule() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        pcf_context_init(64, 64);
+        let supi = "imsi-001010000000744";
+        let create = |ts: &str| {
+            make_request(
+                "POST",
+                "/npcf-smpolicycontrol/v1/sm-policies",
+                Some(full_create_body(supi, 5)),
+            )
+            .with_header(ORIGINATION_TIMESTAMP_HEADER, ts)
+        };
+        let policy_id = |resp: &SbiResponse| {
+            resp.http
+                .get_header("Location")
+                .and_then(|l| l.rsplit('/').next().map(str::to_string))
+                .expect("Location")
+        };
+
+        let resp = pcf_sbi_request_handler(create("Fri, 23 Oct 2026 10:00:00.500 GMT")).await;
+        assert_eq!(resp.status, 201);
+        let first = policy_id(&resp);
+
+        let resp = pcf_sbi_request_handler(create("Fri, 23 Oct 2026 10:00:00.499 GMT")).await;
+        assert_eq!(resp.status, 403);
+        assert_eq!(
+            problem_cause_of(&resp).as_deref(),
+            Some("LATE_OVERLAPPING_REQUEST")
+        );
+        assert!(pcf_self()
+            .read()
+            .unwrap()
+            .sess_find_by_sm_policy_id(&first)
+            .is_some());
+
+        let resp = pcf_sbi_request_handler(create("Fri, 23 Oct 2026 10:00:00.501 GMT")).await;
+        assert_eq!(resp.status, 201);
+        let second = policy_id(&resp);
+        assert_ne!(second, first);
+        let ctx = pcf_self();
+        assert!(ctx
+            .read()
+            .unwrap()
+            .sess_find_by_sm_policy_id(&first)
+            .is_none());
+        assert!(ctx
+            .read()
+            .unwrap()
+            .sess_find_by_sm_policy_id(&second)
+            .is_some());
+
+        let resp = pcf_sbi_request_handler(create("yesterday")).await;
+        assert_eq!(resp.status, 400);
+        assert!(ctx
+            .read()
+            .unwrap()
+            .sess_find_by_sm_policy_id(&second)
+            .is_some());
+
+        // #980 review: a retransmission (the same stamp, the same body) is the
+        // same request: 201 with the same association, which is not replaced.
+        let resp = pcf_sbi_request_handler(create("Fri, 23 Oct 2026 10:00:00.501 GMT")).await;
+        assert_eq!(resp.status, 201);
+        assert_eq!(
+            policy_id(&resp),
+            second,
+            "the retransmission reuses the association"
+        );
+
+        // And a create without the header is still accepted (as more recent).
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(full_create_body(supi, 5)),
+        ))
+        .await;
+        assert_eq!(resp.status, 201, "no header means accept");
+        assert_ne!(policy_id(&resp), second);
+        assert!(ctx
+            .read()
+            .unwrap()
+            .sess_find_by_sm_policy_id(&second)
+            .is_none());
+    }
+
+    /// #892: through the SBI handlers, SM policy create then delete leaves no
+    /// UE SM behind, and the SUPI's next create works.
+    ///
+    /// Revert-verified: with main's context the count after the delete is 1.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn sm_policy_delete_of_the_last_session_removes_the_ue_sm() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        pcf_context_init(64, 64);
+        let supi = "imsi-001010000000892";
+        for round in 0..2 {
+            provision_session_with_ipv4(supi, 5, "10.45.0.192").await;
+            // Scoped to this SUPI, not `ue_sm_count()`: unguarded sibling tests
+            // add UE-SMs to the same process-global context (#338).
+            assert!(
+                pcf_self()
+                    .read()
+                    .unwrap()
+                    .ue_sm_find_by_supi(supi)
+                    .is_some(),
+                "round {round}"
+            );
+            let sm_policy_id = pcf_self()
+                .read()
+                .unwrap()
+                .sess_find_by_ipv4addr("10.45.0.192")
+                .expect("stored")
+                .sm_policy_id;
+            let resp = pcf_sbi_request_handler(make_request(
+                "POST",
+                &format!("/npcf-smpolicycontrol/v1/sm-policies/{sm_policy_id}/delete"),
+                None,
+            ))
+            .await;
+            assert_eq!(resp.status, 204, "round {round}");
+            let ctx = pcf_self();
+            let ctx = ctx.read().unwrap();
+            assert!(
+                ctx.ue_sm_find_by_supi(supi).is_none(),
+                "round {round}: the UE SM went with its last session"
+            );
+            assert!(ctx.sess_find_by_sm_policy_id(&sm_policy_id).is_none());
+        }
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
     async fn create_binds_by_ipv6_address_within_the_session_prefix() {
@@ -8371,29 +8672,19 @@ mod tests {
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
         assert_eq!(body["cause"], "UAV_FLIGHT_NOT_AUTHORIZED");
 
-        // #90 criterion 5: the refusal leaves NO session behind.
-        //
-        // The UE-SM lookup is `expect`, not `if let Some(..)`. That matters: the
-        // session assertion below is a NEGATIVE one, and a negative assertion is
-        // satisfied by every path that never arrived — including a create rejected
-        // before it ever resolved a UE-SM. Requiring the UE-SM to be there first is
-        // the positive half that proves the path DID arrive, and it is true by
-        // construction because the refusal removes the session, not the UE (the
-        // create resolves the UE-SM find-then-add, so a retry reuses it).
-        let ue_sm = ctx
-            .read()
-            .expect("ctx")
-            .ue_sm_find_by_supi("imsi-001010000000910")
-            .expect("the refused create must still have resolved a UE-SM");
+        // #90 criterion 5: the refusal leaves NO session behind, and since #892
+        // no UE-SM either: the refused session was the SUPI's only one, and a
+        // UE-SM goes with its last session. The positive half (the path DID
+        // arrive) is the UAV_FLIGHT_NOT_AUTHORIZED cause above, which is only
+        // answered after the session was created and is then removed.
+        let ctx = ctx.read().expect("ctx");
         assert!(
-            ctx.read()
-                .expect("ctx")
-                .sess_find_by_psi(ue_sm.id, 5)
-                .is_none(),
-            "a rejected UAV create must leave no PcfSess for its (SUPI, PSI) — it \
-             leaked one per attempt before #90, and again for every removal once any \
-             index lock was poisoned (#338)"
+            ctx.ue_sm_find_by_supi("imsi-001010000000910").is_none(),
+            "a rejected UAV create must leave neither a PcfSess (it leaked one per \
+             attempt before #90, and again once any index lock was poisoned, #338) nor \
+             its now-empty UE-SM (#892)"
         );
+        drop(ctx);
 
         std::env::remove_var("PCF_UAV_DNN");
     }
@@ -8460,27 +8751,13 @@ mod tests {
             let body: serde_json::Value =
                 serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
             assert_eq!(body["cause"], "UAV_FLIGHT_NOT_AUTHORIZED", "{label}");
-            // Scoped to THIS (SUPI, PSI), not a `sess_count()` delta. The delta was
-            // the flake #338 reported: 29 pcfd tests mutate the process-global PCF
-            // context without taking CONTEXT_GUARD, so a sibling creating or
-            // deleting a session between the two reads falsified it — and it read 0
-            // outright if any sibling had poisoned `sess_list`, since `sess_count`
-            // answers `unwrap_or(0)`. The UE-SM `expect` is the positive half: it
-            // proves the create reached the point of resolving a UE-SM, so the
-            // negative session assertion is not satisfied by a path that never ran.
-            let ue_sm = ctx
-                .read()
-                .expect("ctx")
-                .ue_sm_find_by_supi(&supi)
-                .unwrap_or_else(|| {
-                    panic!("{label}: the refused create must still have resolved a UE-SM")
-                });
+            // Scoped to THIS SUPI, not a `sess_count()` delta: 29 pcfd tests mutate
+            // the process-global context without CONTEXT_GUARD, so a delta flakes
+            // (#338). The refused session was the SUPI's only one, so its UE-SM
+            // goes with it (#892); the cause above proves the path ran.
             assert!(
-                ctx.read()
-                    .expect("ctx")
-                    .sess_find_by_psi(ue_sm.id, 9)
-                    .is_none(),
-                "{label}: the refusal must leave no session for this (SUPI, PSI)"
+                ctx.read().expect("ctx").ue_sm_find_by_supi(&supi).is_none(),
+                "{label}: the refusal must leave no session (and so no UE-SM) for this SUPI"
             );
         }
 

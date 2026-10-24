@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-c2411517.js";
+            window.path_to_searchindex_js = "searchindex-df495bb2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-be5dca41.js"></script>
@@ -322,7 +322,7 @@ deregister on shutdown</li>
 <li>Expose <code>/metrics</code> (Prometheus, port 9090)</li>
 <li>Respond to SIGTERM with graceful shutdown</li>
 <li>Log at <code>info</code> level by default, configurable via <code>--log-level</code> and <code>RUST_LOG</code>
-(13 NFs honour <code>RUST_LOG</code> today; #691 tracks the rest)</li>
+(build the logger with <code>nextgcore_core::log::nf_log_builder</code>; a test enforces it)</li>
 <li>Have ≥ 1 unit test per public function</li>
 </ul>
 <h2 id="license"><a class="header" href="#license">License</a></h2>

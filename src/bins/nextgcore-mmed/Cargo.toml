@@ -53,6 +53,8 @@ nextgcore-asn1c = { workspace = true }
 # catch the two drifting — the same reason lmfd, pcfd and udmd already dev-depend on amfd for
 # their strict-peer tests.
 nextgcore-amfd = { path = "../nextgcore-amfd" }
+# #741: the NGAP ngENB-ID variants amfd encodes a Target Identification from.
+nextgcore-ngap = { workspace = true }
 
 [lints]
 workspace = true

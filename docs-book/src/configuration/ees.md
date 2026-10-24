@@ -35,7 +35,7 @@ The docker deployment does its real configuration on the command line: `command:
 
 Since the YAML file is never parsed, **every** field in the shipped example is decorative:
 
-- **`logger.level` is inert.** The log level comes from the CLI flag `-e/--log-level` (default `info`) or `RUST_LOG`.
+- **`logger.level` is read.** The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691).
 - **`ees.sbi.server[]` (address/advertise/port) is inert.** The SBI bind address and port come from `--sbi-addr`/`--sbi-port`; the same values are what the EES advertises in its ECS-registration `EndPoint`.
 - **`ees.nrf.uri` is inert and doubly stale.** The EES does not register with the NRF at all (eesd-01); the ECS apiRoot is `--ecs-uri`, a CLI flag only.
 
@@ -49,7 +49,7 @@ From the clap `Args` struct in `src/bins/nextgcore-eesd/src/main.rs`:
 |---|---|---|---|
 | `-c, --config` | path | `/etc/nextgcore/ees.yaml` | Configuration file path. **Accepted but never read** by the daemon. |
 | `-l, --log-file` | path | unset | Log file path. **Parsed but never consumed** — logging goes through `env_logger` regardless. |
-| `-e, --log-level` | string | `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`). `RUST_LOG` takes precedence when set. |
+| `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-m, --no-color` | flag | off | Disable color output. **Parsed but never consumed.** |
 | `--sbi-addr` | string | `0.0.0.0` | SBI server bind address; also placed in the `EESRegistration` endpoint sent to the ECS. |
 | `--sbi-port` | u16 | `7814` | SBI server port (docker deployments pass `7777`). |

@@ -23,6 +23,94 @@ pub fn nextgcore_log_init() {
     env_logger::init();
 }
 
+/// The level an NF logs at when `RUST_LOG` is not set: its resolved level
+/// ([`nf_log_level`]), case-insensitive (`trace`, `debug`, `info`, `warn`,
+/// `error`, `off`). The C configs' `fatal` and `none` (`logger.level`) are
+/// `error` and `off`. Anything else is `info`, never a module filter that
+/// silences everything.
+pub fn nf_default_level(log_level: &str) -> log::LevelFilter {
+    let level = log_level.trim();
+    if level.eq_ignore_ascii_case("fatal") {
+        return log::LevelFilter::Error;
+    }
+    if level.eq_ignore_ascii_case("none") {
+        return log::LevelFilter::Off;
+    }
+    level
+        .parse::<log::LevelFilter>()
+        .unwrap_or(log::LevelFilter::Info)
+}
+
+/// The level an NF's logger starts at when `RUST_LOG` is unset (#691), the same
+/// order for every NF:
+///
+/// 1. an explicit `--log-level` (`cli`; the flag has no clap default, so an
+///    absent flag is `None` and the file can speak);
+/// 2. the NF's YAML `logger.level` ([`yaml_logger_level`]);
+/// 3. `info`.
+///
+/// `RUST_LOG`, when set, still replaces the result ([`nf_log_builder`]).
+pub fn nf_log_level(cli: Option<&str>, config_path: Option<&str>) -> String {
+    cli.map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .or_else(|| config_path.and_then(yaml_logger_level))
+        .unwrap_or_else(|| "info".to_string())
+}
+
+/// `logger.level` from an NF's YAML config, or `None` when the file is missing
+/// or unreadable, is not YAML, or has no non-blank `logger.level` string.
+/// Silent, because it runs before the logger exists. The NF's own config load
+/// reports any problem with the file.
+pub fn yaml_logger_level(config_path: &str) -> Option<String> {
+    let content = std::fs::read_to_string(config_path).ok()?;
+    let doc: serde_yaml::Value = serde_yaml::from_str(&content).ok()?;
+    doc.get("logger")?
+        .get("level")?
+        .as_str()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+/// The logger builder every NF daemon starts from (#691), so they all behave
+/// the same:
+///
+/// - `RUST_LOG`, when set and not blank, is the filter (env_logger syntax,
+///   e.g. `info,nextgcore_amfd=debug`), as in `docker/rust/docker-compose.yml`;
+/// - otherwise the NF's `--log-level` ([`nf_default_level`]) applies to all
+///   targets;
+/// - `RUST_LOG_STYLE` sets the colour style; timestamps are in milliseconds.
+///
+/// The caller may adjust the builder (e.g. `write_style` for `--no-color`)
+/// and then calls `.init()`.
+pub fn nf_log_builder(log_level: &str) -> env_logger::Builder {
+    nf_log_builder_from(
+        log_level,
+        std::env::var("RUST_LOG").ok().as_deref(),
+        std::env::var("RUST_LOG_STYLE").ok().as_deref(),
+    )
+}
+
+/// [`nf_log_builder`] with the environment passed in, so the precedence is
+/// testable without touching the process environment.
+pub fn nf_log_builder_from(
+    log_level: &str,
+    rust_log: Option<&str>,
+    rust_log_style: Option<&str>,
+) -> env_logger::Builder {
+    let mut builder = env_logger::Builder::new();
+    match rust_log.map(str::trim).filter(|spec| !spec.is_empty()) {
+        Some(spec) => builder.parse_filters(spec),
+        None => builder.filter_level(nf_default_level(log_level)),
+    };
+    if let Some(style) = rust_log_style {
+        builder.parse_write_style(style);
+    }
+    builder.format_timestamp_millis();
+    builder
+}
+
 /// Logging macros matching C implementation
 #[macro_export]
 macro_rules! nextgcore_fatal {
@@ -440,5 +528,108 @@ mod otel_tests {
         assert!(json.contains("\"body\":\"Test JSON\""));
         assert!(json.contains("\"severityText\":\"INFO\""));
         assert!(json.contains("\"key\":\"value\""));
+    }
+}
+
+#[cfg(test)]
+mod nf_log_builder_tests {
+    use super::*;
+    use log::{Level, Log, Metadata};
+
+    fn enabled(logger: &env_logger::Logger, target: &str, level: Level) -> bool {
+        logger.enabled(&Metadata::builder().target(target).level(level).build())
+    }
+
+    #[test]
+    fn log_level_applies_when_rust_log_is_unset_or_blank() {
+        for rust_log in [None, Some(""), Some("  ")] {
+            let logger = nf_log_builder_from("debug", rust_log, None).build();
+            assert!(
+                enabled(&logger, "nextgcore_amfd", Level::Debug),
+                "{rust_log:?}"
+            );
+            assert!(
+                !enabled(&logger, "nextgcore_amfd", Level::Trace),
+                "{rust_log:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_log_overrides_log_level_per_target() {
+        // docker/rust/docker-compose.yml's amf filter (#691).
+        let logger = nf_log_builder_from("warn", Some("info,nextgcore_amfd=debug"), None).build();
+        assert!(enabled(&logger, "nextgcore_amfd::ngap", Level::Debug));
+        assert!(!enabled(&logger, "nextgcore_amfd", Level::Trace));
+        assert!(enabled(&logger, "nextgcore_sbi", Level::Info));
+        assert!(!enabled(&logger, "nextgcore_sbi", Level::Debug));
+
+        let logger = nf_log_builder_from("trace", Some("error"), None).build();
+        assert!(!enabled(&logger, "nextgcore_amfd", Level::Warn));
+    }
+
+    #[test]
+    fn log_level_is_case_insensitive_and_unknown_is_info() {
+        assert_eq!(nf_default_level("DEBUG"), log::LevelFilter::Debug);
+        assert_eq!(nf_default_level(" Warn "), log::LevelFilter::Warn);
+        assert_eq!(nf_default_level("off"), log::LevelFilter::Off);
+        assert_eq!(nf_default_level("verbose"), log::LevelFilter::Info);
+        assert_eq!(nf_default_level(""), log::LevelFilter::Info);
+
+        let logger = nf_log_builder_from("verbose", None, None).build();
+        assert!(enabled(&logger, "nextgcore_upfd", Level::Info));
+        assert!(!enabled(&logger, "nextgcore_upfd", Level::Debug));
+    }
+
+    /// The C configs' level names (`logger.level`) map onto the nearest filter.
+    #[test]
+    fn c_config_level_names_map_to_filters() {
+        assert_eq!(nf_default_level("fatal"), log::LevelFilter::Error);
+        assert_eq!(nf_default_level("NONE"), log::LevelFilter::Off);
+    }
+
+    /// #691 follow-up: `--log-level`, then the file's `logger.level`, then
+    /// `info`, for every NF.
+    #[test]
+    fn the_level_is_the_flag_then_the_file_then_info() {
+        let dir = std::env::temp_dir().join(format!("nextgcore-loglevel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            p.to_string_lossy().into_owned()
+        };
+        let debug = file(
+            "debug.yaml",
+            "logger:\n  file:\n    path: /x.log\n  level: debug\nnf: {}\n",
+        );
+        let flow = file("flow.yaml", "logger: { level: trace }\n");
+        let blank = file("blank.yaml", "logger:\n  level: \"  \"\n");
+        let none = file("none.yaml", "amf:\n  sbi: {}\n");
+        let broken = file("broken.yaml", "logger: [unclosed\n");
+        let missing = dir.join("missing.yaml").to_string_lossy().into_owned();
+
+        assert_eq!(
+            nf_log_level(Some("warn"), Some(&debug)),
+            "warn",
+            "the flag wins"
+        );
+        assert_eq!(nf_log_level(None, Some(&debug)), "debug", "then the file");
+        assert_eq!(
+            nf_log_level(Some("  "), Some(&debug)),
+            "debug",
+            "a blank flag is no flag"
+        );
+        assert_eq!(nf_log_level(None, Some(&flow)), "trace");
+        for path in [&blank, &none, &broken, &missing] {
+            assert_eq!(nf_log_level(None, Some(path)), "info", "{path}");
+        }
+        assert_eq!(nf_log_level(None, None), "info");
+
+        // RUST_LOG still replaces whatever this resolved to.
+        let logger =
+            nf_log_builder_from(&nf_log_level(None, Some(&debug)), Some("error"), None).build();
+        assert!(!enabled(&logger, "nextgcore_amfd", Level::Warn));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

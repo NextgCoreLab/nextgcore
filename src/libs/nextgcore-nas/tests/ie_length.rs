@@ -392,7 +392,12 @@ fn eps_bearer_context_status_holds_two_octets() {
     let mut ok = body.clone();
     ok.extend_from_slice(&[0x57, 0x02, 0x20, 0x00]);
     let msg = eps::ExtendedServiceRequest::decode(&mut b(&ok)).unwrap();
-    assert_eq!(msg.eps_bearer_context_status, Some(0x2000));
+    // Octet 3 bit 6 is EBI(5) (§9.9.2.1): bit n of the value is EBI n.
+    assert_eq!(msg.eps_bearer_context_status, Some(1 << 5));
+    // And it encodes back to the same octets.
+    let mut out = bytes::BytesMut::new();
+    msg.encode(&mut out);
+    assert_eq!(&out[out.len() - 4..], &[0x57, 0x02, 0x20, 0x00]);
 
     // Length 1 is syntactically incorrect. The IE is optional, so it is
     // absent (TS 24.301 §7.7.1, #630), and the CSFB response after it still

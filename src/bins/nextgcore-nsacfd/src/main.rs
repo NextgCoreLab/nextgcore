@@ -150,9 +150,10 @@ struct Args {
     #[arg(short = 'l', long)]
     log_file: Option<String>,
 
-    /// Log level (trace, debug, info, warn, error)
-    #[arg(short = 'e', long, default_value = "info")]
-    log_level: String,
+    /// Log level (trace, debug, info, warn, error). Without it, the config
+    /// file's `logger.level`, else `info`; `RUST_LOG` overrides (#691).
+    #[arg(short = 'e', long)]
+    log_level: Option<String>,
 
     /// Disable color output
     #[arg(short = 'm', long)]
@@ -202,9 +203,7 @@ struct Args {
 }
 
 fn init_logging(level: &str) {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level))
-        .format_timestamp_millis()
-        .init();
+    nextgcore_core::log::nf_log_builder(level).init();
 }
 
 fn setup_signal_handlers(shutdown: Arc<AtomicBool>) {
@@ -226,7 +225,10 @@ fn with_nsacf_context<T>(f: impl FnOnce(&NsacfContext) -> T) -> Option<T> {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    init_logging(&args.log_level);
+    init_logging(&nextgcore_core::log::nf_log_level(
+        args.log_level.as_deref(),
+        Some(&args.config),
+    ));
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = nextgcore_metrics::otel::init_otel(
         nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
@@ -2527,7 +2529,7 @@ nsacf:
     fn test_args_default() {
         let args = Args::parse_from(["nextgcore-nsacfd"]);
         assert_eq!(args.config, "/etc/nextgcore/nsacf.yaml");
-        assert_eq!(args.log_level, "info");
+        assert_eq!(args.log_level, None);
         assert_eq!(args.sbi_port, 7813);
         assert_eq!(args.max_quotas, 64);
         assert_eq!(args.eac_threshold, 80);
@@ -4700,6 +4702,58 @@ nsacf:
             json!({ "expiry": "2030-01-01T00:00:00+02:00" }),
         );
         assert!(invalid_expiry(&ok).is_none());
+    }
+
+    /// #856 follow-up: the CREATE handler itself refuses an unreadable `expiry`.
+    /// `an_unreadable_expiry_is_refused` pins the helper and the modify
+    /// validator, but not that `handle_slice_ee_subscribe` calls it, so dropping
+    /// that call (and storing a subscription that would then never expire) went
+    /// unnoticed.
+    ///
+    /// Revert-verified: without the `invalid_expiry` call in the create handler,
+    /// a bad expiry gets 201.
+    #[tokio::test]
+    async fn subscribe_refuses_an_unreadable_expiry() {
+        let _ctx_guard = GLOBAL_CTX_TEST_LOCK.lock().await;
+        nsacf_context_init(64);
+        let post = |doc: &serde_json::Value| {
+            SbiRequest::post("/nnsacf-slice-ee/v1/subscriptions")
+                .with_body(doc.to_string(), "application/json")
+        };
+        for bad in [
+            json!("2026-6-1T00:00:00Z"),
+            json!("+2026-01-01T00:00:00Z"),
+            json!("2026-01-01T00:00Z"),
+            json!(1),
+        ] {
+            let doc =
+                subscription_doc("http://127.0.0.1:9/cb", json!({}), json!({ "expiry": bad }));
+            let resp = handle_slice_ee_subscribe(&post(&doc)).await;
+            assert_eq!(
+                resp.status, 400,
+                "{bad}: a create with this expiry was accepted"
+            );
+            assert!(
+                resp.http
+                    .content
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("MANDATORY_IE_INCORRECT"),
+                "{bad}"
+            );
+            assert!(
+                !resp.http.headers.contains_key("Location"),
+                "{bad}: no subscription resource for a refused create"
+            );
+        }
+        // The positive control: the same document with a valid expiry is created,
+        // so the 400s above are the expiry check and not some other refusal.
+        let ok = subscription_doc(
+            "http://127.0.0.1:9/cb",
+            json!({}),
+            json!({ "expiry": "2030-01-01T00:00:00+02:00" }),
+        );
+        assert_eq!(handle_slice_ee_subscribe(&post(&ok)).await.status, 201);
     }
 
     /// Every trigger field is parsed, and from the RIGHT object: `eventTrigger`,

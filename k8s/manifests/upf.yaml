@@ -194,6 +194,18 @@ spec:
               value: info
             - name: RUST_BACKTRACE
               value: "1"
+<<<<<<< HEAD
+            # #968/#983: only the SMF may set up the N4 association (the UPF fails
+            # closed without this). The headless smf-pfcp Service resolves to the
+            # SMF pod's current IP, re-resolved every 10 s.
+            - name: UPF_PFCP_ALLOWED_PEERS
+              value: smf-pfcp.nextg-system.svc.cluster.local
+=======
+            # /metrics defaults to 127.0.0.1 (#837); in the pod it must accept the
+            # pod IP for Prometheus and the kubelet. Not exposed beyond the cluster.
+            - name: NEXTGCORE_METRICS_BIND
+              value: "0.0.0.0"
+>>>>>>> origin/main
             # Consumed by wrapper.sh as --gtpu-addr: the N3 endpoint the UPF
             # advertises to the SMF, and thence to the gNB. Must be a routable
             # address, not 0.0.0.0.
