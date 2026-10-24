@@ -1493,10 +1493,10 @@ pub fn handle_s1_setup_request_reporting(
     msg: &S1SetupRequest,
     notify: &[crate::s1ap_gen::DiagnosedIe],
 ) -> Vec<S1apSend> {
-    let enb_id_value = match msg.global_enb_id.enb_id {
-        EnbId::Macro(id) => id,
-        EnbId::Home(id) => id,
-    };
+    let (enb_id_value, enb_id_bits) = (
+        msg.global_enb_id.enb_id.value(),
+        msg.global_enb_id.enb_id.bit_len(),
+    );
 
     // Convert the supported TA list into context TAIs
     let mut supported_tais = Vec::new();
@@ -1563,6 +1563,7 @@ pub fn handle_s1_setup_request_reporting(
     ctx.enb_set_enb_id(enb_id, enb_id_value);
     if let Some(enb) = ctx.enb_pool.write().unwrap().get_mut(&enb_id) {
         enb.plmn_id = decode_plmn_id(&msg.global_enb_id.plmn_identity);
+        enb.enb_id_bits = enb_id_bits;
         enb.supported_ta_list = supported_tais;
         enb.state.s1_setup_success = true;
     }
@@ -1937,16 +1938,50 @@ pub fn handle_initial_context_setup_failure(
         Err(out) => return out,
     };
 
+    // #869/#961: the setup is over, whichever kind it was.
     if let Some(mme_ue_id) = ctx.enb_ue_find_by_id(enb_ue_id).map(|e| e.mme_ue_id) {
         if let Some(ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&mme_ue_id) {
             ue.ics_pending_on = 0;
+        }
+    }
+    // #956: a failed Initial Context Setup of a SERVICE REQUEST releases S1
+    // only; the UE stays registered and ECM-IDLE (TS 23.401 §5.3.4.1).
+    let service_request = ctx
+        .enb_ue_find_by_id(enb_ue_id)
+        .map(|e| e.mme_ue_id)
+        .and_then(|id| {
+            ctx.mme_ue_pool
+                .write()
+                .unwrap()
+                .get_mut(&id)
+                .map(|ue| std::mem::take(&mut ue.service_request_ics_pending))
+        })
+        .unwrap_or(false);
+    // #961 review: the Serving GW still buffers for a SERVICE REQUEST whose user
+    // plane did not come up. Release Access Bearers returns it to the idle
+    // state, so the next downlink packet is notified afresh.
+    if service_request {
+        if let Some(mme_ue_id) = ctx.enb_ue_find_by_id(enb_ue_id).map(|e| e.mme_ue_id) {
+            if let Err(e) = crate::gtp_path::send_release_access_bearers_request(
+                ctx,
+                enb_ue_id,
+                mme_ue_id,
+                crate::s11_build::GtpReleaseAction::S1ContextRemove,
+            ) {
+                log::error!("UE {mme_ue_id}: Release Access Bearers Request not sent: {e}");
+            }
+            crate::gtp_path::clear_enb_endpoints(ctx, mme_ue_id);
         }
     }
     let cause = cause_from_s1ap(&msg.cause);
     if let Some(enb_ue) = ctx.enb_ue_pool.write().unwrap().get_mut(&enb_ue_id) {
         enb_ue.relcause.group = cause.group;
         enb_ue.relcause.cause = cause.cause;
-        enb_ue.ue_ctx_rel_action = UeCtxRelAction::UeContextRemove;
+        enb_ue.ue_ctx_rel_action = if service_request {
+            UeCtxRelAction::S1ContextRemove
+        } else {
+            UeCtxRelAction::UeContextRemove
+        };
     }
 
     match s1ap_build::build_ue_context_release_command(
@@ -2067,19 +2102,60 @@ pub fn handle_ue_context_release_request(
     };
 
     let cause = cause_from_s1ap(&msg.cause);
-    if let Some(enb_ue) = ctx.enb_ue_pool.write().unwrap().get_mut(&enb_ue_id) {
+    let mme_ue_id = {
+        let mut pool = ctx.enb_ue_pool.write().unwrap();
+        let Some(enb_ue) = pool.get_mut(&enb_ue_id) else {
+            return Vec::new();
+        };
         enb_ue.relcause.group = cause.group;
         enb_ue.relcause.cause = cause.cause;
         enb_ue.ue_ctx_rel_action = UeCtxRelAction::S1ContextRemove;
-    }
+        enb_ue.mme_ue_id
+    };
 
+    // #956, TS 23.401 §5.3.5 step 2: a UE with PDN connections at a Serving GW
+    // goes ECM-IDLE. Its S1-U bearers are released at the Serving GW first, so
+    // downlink is buffered and notified (§5.3.4.3) rather than tunnelled to an
+    // eNB that has dropped the UE. The UE CONTEXT RELEASE COMMAND (step 5)
+    // follows the Release Access Bearers Response.
+    let has_session = ctx
+        .mme_ue_find_by_id(mme_ue_id)
+        .filter(|ue| ue.enb_ue_id == enb_ue_id)
+        .and_then(|ue| ctx.sgw_ue_find_by_id(ue.sgw_ue_id))
+        .is_some_and(|sgw| sgw.sgw_s11_teid != 0);
+    if has_session {
+        match crate::gtp_path::release_access_bearers_for_s1_release(ctx, enb_ue_id, mme_ue_id) {
+            Ok(seq) => {
+                log::info!(
+                    "UE Context Release Request (cause {:?}): Release Access Bearers Request \
+                     (seq={seq}) to the Serving GW; the UE goes ECM-IDLE (TS 23.401 §5.3.5)",
+                    msg.cause
+                );
+                return Vec::new();
+            }
+            Err(e) => log::error!(
+                "UE Context Release Request: Release Access Bearers Request not sent ({e}); \
+                 releasing S1 now"
+            ),
+        }
+    }
+    s1_release_command(ctx, enb_ue_id)
+}
+
+/// The UE CONTEXT RELEASE COMMAND of an S1 release for `enb_ue_id`, with the
+/// cause recorded from the request (TS 23.401 §5.3.5 step 5, TS 36.413 §8.3.3).
+/// Empty when the context is gone.
+pub fn s1_release_command(ctx: &MmeContext, enb_ue_id: u64) -> Vec<S1apSend> {
+    let Some(enb_ue) = ctx.enb_ue_find_by_id(enb_ue_id) else {
+        return Vec::new();
+    };
     match s1ap_build::build_ue_context_release_command(
-        Some(msg.enb_ue_s1ap_id),
-        msg.mme_ue_s1ap_id,
-        cause.group,
-        cause.cause,
+        Some(enb_ue.enb_ue_s1ap_id),
+        enb_ue.mme_ue_s1ap_id,
+        enb_ue.relcause.group,
+        enb_ue.relcause.cause,
     ) {
-        Ok(pdu) => S1apSend::to_origin(enb_id, pdu),
+        Ok(pdu) => S1apSend::to_origin(enb_ue.enb_id, pdu),
         Err(e) => {
             log::error!("Failed to build UE Context Release Command: {e}");
             Vec::new()
@@ -2231,6 +2307,7 @@ fn release_all_s1_connections(ctx: &MmeContext, enb_id: u64) -> usize {
 }
 
 fn release_s1_connection(ctx: &MmeContext, enb_ue_id: u64) {
+    let mut idle_ue = None;
     if let Some(enb_ue) = ctx.enb_ue_find_by_id(enb_ue_id) {
         if enb_ue.mme_ue_id != NEXTGCORE_INVALID_POOL_ID {
             let still_attached = ctx
@@ -2238,10 +2315,42 @@ fn release_s1_connection(ctx: &MmeContext, enb_ue_id: u64) {
                 .is_some_and(|mme_ue| mme_ue.enb_ue_id == enb_ue_id);
             if still_attached {
                 ctx.enb_ue_deassociate_mme_ue(enb_ue_id, enb_ue.mme_ue_id);
+                idle_ue = Some(enb_ue.mme_ue_id);
             }
         }
     }
     ctx.enb_ue_remove(enb_ue_id);
+    let Some(mme_ue_id) = idle_ue else {
+        return;
+    };
+    // #961 review: the UE is ECM-IDLE now. An Initial Context Setup of a
+    // SERVICE REQUEST that was still outstanding is void, and a Downlink Data
+    // Notification that arrived during the release pages the UE now.
+    let page = ctx
+        .mme_ue_pool
+        .write()
+        .unwrap()
+        .get_mut(&mme_ue_id)
+        .is_some_and(|ue| {
+            ue.service_request_ics_pending = false;
+            ue.ics_pending_on = 0;
+            std::mem::take(&mut ue.ddn_pending_after_release)
+        });
+    if page
+        && crate::paging::page_ue(
+            ctx,
+            mme_ue_id,
+            crate::context::PagingType::DownlinkDataNotification,
+        ) == 0
+    {
+        if let Err(e) = crate::gtp_path::send_downlink_data_notification_failure_indication(
+            ctx,
+            mme_ue_id,
+            crate::s11_build::GtpCause::UeNotResponding,
+        ) {
+            log::error!("UE {mme_ue_id}: DDN Failure Indication not sent: {e}");
+        }
+    }
 }
 
 // ============================================================================
@@ -2326,13 +2435,12 @@ pub fn handle_handover_required_reporting(
 
     // Resolve the target eNB (only intra-LTE targets are supported)
     let target_enb_pool_id = match &msg.target_id {
-        TargetId::TargetEnbId { global_enb_id, .. } => {
-            let id = match global_enb_id.enb_id {
-                EnbId::Macro(id) => id,
-                EnbId::Home(id) => id,
-            };
-            ctx.enb_find_by_enb_id(id)
-        }
+        // #741/#882: by the whole Global eNB ID -- PLMN, ENB-ID alternative and value --
+        // because a macro and a home eNB, or eNBs of two PLMNs, can share an id value.
+        TargetId::TargetEnbId { global_enb_id, .. } => ctx.enb_find_by_global_enb_id(
+            &decode_plmn_id(&global_enb_id.plmn_identity),
+            global_enb_id.enb_id,
+        ),
         TargetId::TargetRncId { .. } | TargetId::Cgi { .. } => None,
     };
     let Some(target_enb_pool_id) = target_enb_pool_id else {
@@ -4723,8 +4831,64 @@ pub fn handle_initial_context_setup_response(
     }
     log_erab_failures(enb_id, &msg.erab_failed_list);
 
+    // #956, TS 23.401 §5.3.4.1 steps 7-8: the Initial Context Setup of a SERVICE
+    // REQUEST. The Serving GW gets the eNB S1-U endpoints of the E-RABs set up;
+    // the ones the eNB failed are deactivated at the core (Delete Bearer
+    // Command, the E-RAB release path of §5.4.4.2).
+    let service_request = ctx
+        .mme_ue_pool
+        .write()
+        .unwrap()
+        .get_mut(&enb_ue.mme_ue_id)
+        .is_some_and(|ue| std::mem::take(&mut ue.service_request_ics_pending));
+    if service_request {
+        service_request_context_set_up(ctx, enb_ue.mme_ue_id, &msg.erab_failed_list);
+        return;
+    }
+
     // TS 23.401 §5.3.2.1 step 23 needs this response AND the ATTACH COMPLETE (#495).
     crate::nas_dispatch::modify_bearer_after_attach(ctx, enb_ue_id, enb_ue.mme_ue_id);
+}
+
+/// The Initial Context Setup of a SERVICE REQUEST succeeded (TS 23.401
+/// §5.3.4.1 steps 7-8, #956): Modify Bearer Request for the E-RABs set up, and a
+/// Delete Bearer Command for those the eNB failed.
+fn service_request_context_set_up(
+    ctx: &MmeContext,
+    mme_ue_id: u64,
+    failed: &[nextgcore_s1ap::ErabFailedItem],
+) {
+    let failed_ebis: Vec<u8> = failed.iter().map(|f| f.erab_id).collect();
+    if !failed_ebis.is_empty() {
+        for ebi in &failed_ebis {
+            if let Some(id) = ctx.bearer_find_by_ebi(mme_ue_id, *ebi) {
+                if let Some(b) = ctx.bearer_pool.write().unwrap().get_mut(&id) {
+                    b.enb_s1u_teid = 0;
+                    b.released_by_enb = true;
+                }
+            }
+        }
+        match crate::gtp_path::send_delete_bearer_command(ctx, mme_ue_id, &failed_ebis) {
+            Ok(seq) => log::warn!(
+                "UE {mme_ue_id}: the eNB did not set up E-RABs {failed_ebis:?} of the SERVICE \
+                 REQUEST; Delete Bearer Command (seq={seq}) for them (TS 23.401 §5.3.4.1)"
+            ),
+            Err(e) => log::error!(
+                "UE {mme_ue_id}: Delete Bearer Command for the failed E-RABs {failed_ebis:?} not \
+                 sent: {e}"
+            ),
+        }
+    }
+    match crate::gtp_path::send_modify_bearer_request_for_service_request(ctx, mme_ue_id) {
+        Ok(seq) => log::info!(
+            "UE {mme_ue_id}: SERVICE REQUEST user plane up; Modify Bearer Request (seq={seq}) \
+             with the eNB S1-U F-TEIDs (TS 23.401 §5.3.4.1 step 8)"
+        ),
+        Err(e) => log::error!(
+            "UE {mme_ue_id}: SERVICE REQUEST Modify Bearer Request not sent ({e}); the Serving \
+             GW keeps buffering downlink"
+        ),
+    }
 }
 
 fn handle_erab_setup_response(
@@ -4911,7 +5075,8 @@ mod tests {
             .sess_list
             .push(sess_id);
         let target = ctx.enb_add("127.0.0.1:36481".parse().unwrap());
-        ctx.enb_set_enb_id(target, 0x811);
+        // #858: the target is found by its full Global eNB ID, S1 Setup complete.
+        ctx.enb_set_s1_connected_for_test(target, &[0x13, 0x00, 0x14], EnbId::Macro(0x811));
         let required = HandoverRequired {
             mme_ue_s1ap_id,
             enb_ue_s1ap_id: 100,
@@ -5195,7 +5360,7 @@ mod tests {
                 target_id: TargetId::TargetEnbId {
                     global_enb_id: GlobalEnbId {
                         plmn_identity: [0x13, 0x00, 0x14],
-                        enb_id: EnbId::Macro(0x731),
+                        enb_id: nextgcore_s1ap::EnbId::Macro(0x731),
                     },
                     selected_tai: nextgcore_s1ap::Tai {
                         plmn_identity: [0x13, 0x00, 0x14],
@@ -5721,6 +5886,28 @@ mod tests {
             other => panic!("expected S1SetupResponse, got {other:?}"),
         }
         assert!(ctx.enb_find_by_id(enb_id).unwrap().state.s1_setup_success);
+        assert_eq!(
+            ctx.enb_find_by_id(enb_id).unwrap().enb_id_bits,
+            20,
+            "#741: a macro eNB's id is recorded as 20 bits"
+        );
+
+        // #741: a home eNB's id is recorded as 28 bits, so an N26 target lookup by a
+        // macro id of equal value cannot land on it.
+        let home_enb = ctx.enb_add("127.0.0.3:36412".parse().unwrap());
+        let home = S1SetupRequest {
+            global_enb_id: GlobalEnbId {
+                plmn_identity: s1ap_build::encode_plmn_id(&plmn),
+                enb_id: nextgcore_s1ap::EnbId::Home(0x1234),
+            },
+            ..request.clone()
+        };
+        handle_s1ap_message(
+            &ctx,
+            home_enb,
+            &builder::build_s1_setup_request(&home).unwrap(),
+        );
+        assert_eq!(ctx.enb_find_by_id(home_enb).unwrap().enb_id_bits, 28);
 
         // An eNB in a tracking area the file does not declare is still rejected.
         let other_enb = ctx.enb_add("127.0.0.2:36412".parse().unwrap());
@@ -5952,7 +6139,26 @@ mod tests {
 
         // Target eNB registered with eNB ID 0x2222
         let target_enb_id = ctx.enb_add("127.0.0.8:36412".parse().unwrap());
-        ctx.enb_set_enb_id(target_enb_id, 0x2222);
+        ctx.enb_set_s1_connected_for_test(
+            target_enb_id,
+            &s1ap_build::encode_plmn_id(&PlmnId::new("310", "410")),
+            nextgcore_s1ap::EnbId::Macro(0x2222),
+        );
+        // #882: a home eNB and an eNB of another PLMN with the same id value, set up
+        // AFTER the target, so a lookup by value alone (the old `enb_id_hash`) finds one
+        // of them instead.
+        let home_twin = ctx.enb_add("127.0.0.9:36412".parse().unwrap());
+        ctx.enb_set_s1_connected_for_test(
+            home_twin,
+            &s1ap_build::encode_plmn_id(&PlmnId::new("310", "410")),
+            nextgcore_s1ap::EnbId::Home(0x2222),
+        );
+        let plmn_twin = ctx.enb_add("127.0.0.10:36412".parse().unwrap());
+        ctx.enb_set_s1_connected_for_test(
+            plmn_twin,
+            &s1ap_build::encode_plmn_id(&PlmnId::new("001", "01")),
+            nextgcore_s1ap::EnbId::Macro(0x2222),
+        );
 
         let ho = HandoverRequired {
             mme_ue_s1ap_id,
@@ -6048,7 +6254,11 @@ mod tests {
             bearer.qos.arp.priority_level = 8;
         }
         let target_enb_id = ctx.enb_add("127.0.0.8:36412".parse().unwrap());
-        ctx.enb_set_enb_id(target_enb_id, 0x2222);
+        ctx.enb_set_s1_connected_for_test(
+            target_enb_id,
+            &s1ap_build::encode_plmn_id(&PlmnId::new("310", "410")),
+            nextgcore_s1ap::EnbId::Macro(0x2222),
+        );
 
         // Run the preparation phase to create the target context
         let ho = HandoverRequired {
@@ -6182,7 +6392,11 @@ mod tests {
             bearer.qos.arp.priority_level = 8;
         }
         let target_enb_id = ctx.enb_add("127.0.0.8:36412".parse().unwrap());
-        ctx.enb_set_enb_id(target_enb_id, 0x2222);
+        ctx.enb_set_s1_connected_for_test(
+            target_enb_id,
+            &s1ap_build::encode_plmn_id(&PlmnId::new("310", "410")),
+            nextgcore_s1ap::EnbId::Macro(0x2222),
+        );
 
         let ho = HandoverRequired {
             mme_ue_s1ap_id,

@@ -3000,6 +3000,42 @@ fn find_protocol_ie_value(data: &[u8], id: u16) -> Option<Vec<u8>> {
     None
 }
 
+/// Which UE id a UE-associated NGAP PDU names (#813): the AMF UE NGAP ID when it has
+/// one, else only the RAN UE NGAP ID, which is unique only within its association.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UeAssociation {
+    /// The PDU carries an AMF UE NGAP ID (IE 10, or inside UE-NGAP-IDs, IE 114).
+    Amf(u64),
+    /// The PDU carries only a RAN UE NGAP ID (IE 85).
+    Ran(u32),
+}
+
+/// The UE an NGAP PDU is UE-associated signalling for, as the key its SCTP stream is
+/// chosen by (TS 38.412 §7, #813); `None` for a non-UE-associated PDU.
+///
+/// A PDU is UE-associated exactly when it names a UE-associated logical NG-connection at
+/// the top level: an AMF-UE-NGAP-ID (IE 10), a RAN-UE-NGAP-ID (IE 85) or a UE-NGAP-IDs
+/// (IE 114, the UE Context Release Command's). Every non-UE-associated procedure of TS
+/// 38.413 §8 carries none of them at the top level; NG Reset names UEs only inside its
+/// ResetType.
+pub fn ue_association_key(data: &[u8]) -> Option<UeAssociation> {
+    if let Some(value) = find_protocol_ie_value(data, ngap_gen::ID_AMF_UE_NGAP_ID) {
+        if let Ok(id) = nextgcore_ngap_gen::decode_contained::<ngap_gen::AMF_UE_NGAP_ID>(&value) {
+            return Some(UeAssociation::Amf(id.0));
+        }
+    }
+    if let Some(value) = find_protocol_ie_value(data, ngap_gen::ID_UE_NGAP_I_DS) {
+        match nextgcore_ngap_gen::decode_contained::<ngap_gen::UE_NGAP_IDs>(&value) {
+            Ok(ngap_gen::UE_NGAP_IDs::UE_NGAP_ID_pair(pair)) => {
+                return Some(UeAssociation::Amf(pair.amf_ue_ngap_id.0))
+            }
+            Ok(ngap_gen::UE_NGAP_IDs::AMF_UE_NGAP_ID(id)) => return Some(UeAssociation::Amf(id.0)),
+            _ => {}
+        }
+    }
+    extract_ran_ue_ngap_id(data).map(UeAssociation::Ran)
+}
+
 /// Extract the AMF-UE-NGAP-ID (IE 10) from any UE-associated NGAP PDU,
 /// decoding the IE value with the GENERATED codec (#417).
 pub fn extract_amf_ue_ngap_id(data: &[u8]) -> Option<u64> {
@@ -3981,6 +4017,19 @@ fn ng_enb_id_value(id: &ngap_gen::NgENB_ID) -> Option<u32> {
     })
 }
 
+/// A generated NgENB-ID as the hand-written CHOICE, keeping which length the
+/// gNB named (TS 38.413 §9.3.1.8); `None` for a choice extension.
+fn ng_enb_id_variant(id: &ngap_gen::NgENB_ID) -> Option<nextgcore_ngap::types::NgEnbId> {
+    use nextgcore_ngap::types::NgEnbId;
+    Some(match id {
+        ngap_gen::NgENB_ID::MacroNgENB_ID(b) => NgEnbId::Macro(bits_value(&b.0)),
+        ngap_gen::NgENB_ID::ShortMacroNgENB_ID(b) => NgEnbId::ShortMacro(bits_value(&b.0)),
+        ngap_gen::NgENB_ID::LongMacroNgENB_ID(b) => NgEnbId::LongMacro(bits_value(&b.0)),
+        #[allow(unreachable_patterns)]
+        _ => return None,
+    })
+}
+
 /// The hand-written GlobalRanNodeId a generated GlobalRANNodeID maps to: a gNB or
 /// an ng-eNB; `None` for an N3IWF or a choice extension, which a handover target
 /// cannot be.
@@ -4015,7 +4064,9 @@ fn hand_written_global_ran_node_id(id: &ngap_gen::GlobalRANNodeID) -> Option<Glo
 /// EPS-TAI has a 2-octet one. So a 5GS-to-EPS HANDOVER REQUIRED naming its
 /// target as an eNB decoded to a garbage PLMN and eNB id, which the AMF then
 /// relayed to the MME in the Forward Relocation's Target Identification. The
-/// EPS TAC goes into the low two octets of `tai_tac`.
+/// ngENB-ID keeps which of the three lengths the gNB named (#741), because TS
+/// 29.274 §8.51 encodes a macro id under Target Type 1 and a short or long macro
+/// id under Target Type 4.
 fn hand_written_target_id(target: &ngap_gen::TargetID) -> Option<TargetId> {
     match target {
         ngap_gen::TargetID::TargetRANNodeID(t) => Some(TargetId::TargetRanNodeId {
@@ -4025,23 +4076,20 @@ fn hand_written_target_id(target: &ngap_gen::TargetID) -> Option<TargetId> {
                 tai_tac: t.selected_tai.tac.0.as_slice().try_into().ok()?,
             },
         }),
-        ngap_gen::TargetID::TargeteNB_ID(t) => {
-            let tac: [u8; 2] = t.selected_eps_tai.eps_tac.0.as_slice().try_into().ok()?;
-            Some(TargetId::TargetGlobalNgEnbId {
-                plmn_identity: t.global_enb_id.plmn_identity.0.as_slice().try_into().ok()?,
-                ng_enb_id: ng_enb_id_value(&t.global_enb_id.ng_enb_id)?,
-                selected_tai: TaiListItem {
-                    tai_plmn: t
-                        .selected_eps_tai
-                        .plmn_identity
-                        .0
-                        .as_slice()
-                        .try_into()
-                        .ok()?,
-                    tai_tac: [0, tac[0], tac[1]],
-                },
-            })
-        }
+        ngap_gen::TargetID::TargeteNB_ID(t) => Some(TargetId::TargetGlobalNgEnbId {
+            plmn_identity: t.global_enb_id.plmn_identity.0.as_slice().try_into().ok()?,
+            ng_enb_id: ng_enb_id_variant(&t.global_enb_id.ng_enb_id)?,
+            selected_eps_tai: nextgcore_ngap::types::EpsTai {
+                plmn_identity: t
+                    .selected_eps_tai
+                    .plmn_identity
+                    .0
+                    .as_slice()
+                    .try_into()
+                    .ok()?,
+                tac: t.selected_eps_tai.eps_tac.0.as_slice().try_into().ok()?,
+            },
+        }),
         #[allow(unreachable_patterns)]
         _ => None,
     }
@@ -13990,31 +14038,90 @@ mod handover_required_tests {
         let TargetId::TargetGlobalNgEnbId {
             plmn_identity,
             ng_enb_id,
-            selected_tai,
+            selected_eps_tai,
         } = generated(&bytes).target_id
         else {
             panic!("an eNB target");
         };
         assert_eq!(plmn_identity, [0x99, 0xF9, 0x07]);
-        assert_eq!(ng_enb_id, 0x12345);
-        assert_eq!(selected_tai.tai_plmn, [0x99, 0xF9, 0x07]);
-        assert_eq!(selected_tai.tai_tac, [0x00, 0x00, 0x07]);
-        // The hand-written parser misreads this conformant encoding.
-        let misread = match parser::decode_ngap_pdu(&bytes) {
-            Ok(NgapMessage::HandoverRequired(old)) => match old.target_id {
-                TargetId::TargetGlobalNgEnbId {
-                    plmn_identity,
-                    ng_enb_id,
-                    ..
-                } => plmn_identity != [0x99, 0xF9, 0x07] || ng_enb_id != 0x12345,
-                _ => true,
-            },
-            _ => true,
-        };
-        assert!(
-            misread,
-            "the hand-written TargetID decoder was expected to misread"
+        assert_eq!(ng_enb_id, nextgcore_ngap::types::NgEnbId::Macro(0x12345));
+        assert_eq!(
+            selected_eps_tai,
+            nextgcore_ngap::types::EpsTai {
+                plmn_identity: [0x99, 0xF9, 0x07],
+                tac: [0x00, 0x07],
+            }
         );
+        // #741: the hand-written parser now reads the conformant encoding the same way.
+        let Ok(NgapMessage::HandoverRequired(old)) = parser::decode_ngap_pdu(&bytes) else {
+            panic!("the hand-written parser refused a conformant targeteNB-ID");
+        };
+        let TargetId::TargetGlobalNgEnbId {
+            plmn_identity,
+            ng_enb_id,
+            selected_eps_tai,
+        } = old.target_id
+        else {
+            panic!("an eNB target");
+        };
+        assert_eq!(plmn_identity, [0x99, 0xF9, 0x07]);
+        assert_eq!(ng_enb_id, nextgcore_ngap::types::NgEnbId::Macro(0x12345));
+        assert_eq!(selected_eps_tai.tac, [0x00, 0x07]);
+    }
+
+    /// #741: every ngENB-ID length survives the generated decode with its kind, and the
+    /// hand-written builder's targeteNB-ID is the octets the generated codec produces
+    /// (the GOLDEN above for the macro case), so the two codecs cannot drift.
+    #[test]
+    fn every_ng_enb_id_length_round_trips_through_both_codecs() {
+        use nextgcore_ngap::types::{EpsTai, NgEnbId};
+        let golden_target = |id: NgEnbId| TargetId::TargetGlobalNgEnbId {
+            plmn_identity: [0x99, 0xF9, 0x07],
+            ng_enb_id: id,
+            selected_eps_tai: EpsTai {
+                plmn_identity: [0x99, 0xF9, 0x07],
+                tac: [0x00, 0x07],
+            },
+        };
+        for id in [
+            NgEnbId::Macro(0x12345),
+            NgEnbId::Macro(0xF_FFFF),
+            NgEnbId::ShortMacro(0x2_ABCD),
+            NgEnbId::ShortMacro(0x3_FFFF),
+            NgEnbId::LongMacro(0x1A_BCDE),
+            NgEnbId::LongMacro(0x1F_FFFF),
+            NgEnbId::LongMacro(0),
+        ] {
+            let mut msg = required(golden_target(id), 1, false);
+            msg.handover_type = HandoverType::FivegsToEps;
+            let bytes = builder::build_handover_required(&msg).expect("build");
+            let TargetId::TargetGlobalNgEnbId { ng_enb_id, .. } = generated(&bytes).target_id
+            else {
+                panic!("an eNB target for {id:?}");
+            };
+            assert_eq!(ng_enb_id, id, "the generated decode keeps the kind");
+            if id == NgEnbId::Macro(0x12345) {
+                // The hand-derived octets of `an_enb_target_decodes_to_its_plmn_enb_id_and_eps_tac`.
+                const GOLDEN: [u8; 13] = [
+                    0x40, 0x99, 0xF9, 0x07, 0x00, 0x12, 0x34, 0x50, 0x99, 0xF9, 0x07, 0x00, 0x07,
+                ];
+                assert!(
+                    bytes.windows(GOLDEN.len()).any(|w| w == GOLDEN),
+                    "the hand-written builder writes the X.691 octets"
+                );
+            }
+            let Ok(NgapMessage::HandoverRequired(old)) = parser::decode_ngap_pdu(&bytes) else {
+                panic!("hand-written parse of {id:?}");
+            };
+            let TargetId::TargetGlobalNgEnbId { ng_enb_id, .. } = old.target_id else {
+                panic!("an eNB target for {id:?}");
+            };
+            assert_eq!(ng_enb_id, id, "the hand-written decode keeps the kind");
+        }
+        // A value too wide for its alternative is refused, not truncated.
+        let mut msg = required(golden_target(NgEnbId::ShortMacro(0x4_0000)), 1, false);
+        msg.handover_type = HandoverType::FivegsToEps;
+        assert!(builder::build_handover_required(&msg).is_err());
     }
 
     fn without(bytes: &[u8], id: u16) -> Vec<u8> {
@@ -15760,6 +15867,60 @@ pub(crate) mod generated_remnant_tests {
                 .map(|d| d.ie_id)
                 .collect::<Vec<_>>(),
             vec![ngap_gen::ID_PWS_FAILED_CELL_ID_LIST]
+        );
+    }
+}
+
+#[cfg(test)]
+mod ue_association_key_tests {
+    use super::*;
+
+    /// **#813.** UE-associated NGAP is told from non-UE-associated NGAP by the UE NGAP
+    /// ids at the top level (TS 38.412 §7): the key is the AMF UE NGAP ID, also out of a
+    /// UE-NGAP-IDs pair or AMF-only choice, else the RAN UE NGAP ID; NG Reset's
+    /// acknowledgement (UEs named only inside the list), Overload, Paging and an Error
+    /// Indication without ids have none.
+    #[test]
+    fn ue_associated_pdus_are_keyed_by_their_ue_and_the_rest_are_not() {
+        let nas = build_downlink_nas_transport_asn1(0x1_0000_0813, 81, &[0x7E, 0x00]).unwrap();
+        assert_eq!(
+            ue_association_key(&nas),
+            Some(UeAssociation::Amf(0x1_0000_0813))
+        );
+        let pair = build_ue_context_release_command_ids_asn1(813, Some(9), 0, 0).unwrap();
+        assert_eq!(ue_association_key(&pair), Some(UeAssociation::Amf(813)));
+        let amf_only = build_ue_context_release_command_ids_asn1(814, None, 0, 0).unwrap();
+        assert_eq!(ue_association_key(&amf_only), Some(UeAssociation::Amf(814)));
+        let ran_only = encode_error_indication(None, Some(815), None, None).unwrap();
+        assert_eq!(ue_association_key(&ran_only), Some(UeAssociation::Ran(815)));
+        let with_ids = encode_error_indication(Some(816), Some(1), None, None).unwrap();
+        assert_eq!(ue_association_key(&with_ids), Some(UeAssociation::Amf(816)));
+
+        let no_ids = encode_error_indication(None, None, None, None).unwrap();
+        assert_eq!(
+            ue_association_key(&no_ids),
+            None,
+            "Error Indication without ids"
+        );
+        let reset_ack = build_ng_reset_acknowledge_asn1(
+            Some(vec![UeAssociatedLogicalNgConnectionItem {
+                amf_ue_ngap_id: Some(817),
+                ran_ue_ngap_id: Some(2),
+            }]),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(ue_association_key(&reset_ack), None, "NG Reset Acknowledge");
+        assert_eq!(
+            ue_association_key(&build_overload_start_asn1(10).unwrap()),
+            None,
+            "Overload Start"
+        );
+        let plmn = crate::context::PlmnId::new("001", "01");
+        assert_eq!(
+            ue_association_key(&build_paging_asn1(1, 1, 0x0813, &plmn, 1).unwrap()),
+            None,
+            "Paging"
         );
     }
 }

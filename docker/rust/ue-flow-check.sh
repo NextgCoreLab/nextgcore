@@ -37,7 +37,8 @@
 # Containers are addressed by docker-compose.yml's fixed `container_name`s, so this
 # runs the same under `docker compose` (CI) and under a plain `docker run` harness.
 # Overrides: UE_CONTAINER GNB_CONTAINER AMF_CONTAINER SMF_CONTAINER UPF_CONTAINER,
-# AMF_SBI (host:port), UE_SUPI, PING_TARGET, PING_COUNT, NR_CLI (host path to nr-cli).
+# AMF_SBI / UDM_SBI (host:port), UE_SUPI, PING_TARGET, PING_COUNT, NR_CLI (host path to
+# nr-cli).
 #
 # Usage: ue-flow-check.sh <paging|idle-uplink|deregister|network-rereg|all>
 set -euo pipefail
@@ -49,6 +50,7 @@ AMF="${AMF_CONTAINER:-nextgcore-amf}"
 SMF="${SMF_CONTAINER:-nextgcore-smf}"
 UPF="${UPF_CONTAINER:-nextgcore-upf}"
 AMF_SBI="${AMF_SBI:-172.23.0.5:7777}"
+UDM_SBI="${UDM_SBI:-172.23.0.12:7777}"
 SUPI="${UE_SUPI:-imsi-999700000000001}"
 TARGET="${PING_TARGET:-10.45.0.1}"
 COUNT="${PING_COUNT:-20}"
@@ -262,10 +264,23 @@ scenario_network_rereg() {
     # registered in its Nudm_UECM Registration. udmd never emits this reason
     # itself (no UDR purge path), so it is sent from the SMF container, which is on
     # the core network and ships curl.
+    #
+    # #947: to the URI the AMF REGISTERED, read back from the UDM with Nudm_UECM_Get
+    # (TS 29.503 §5.3.2.5, GET .../registrations/amf-3gpp-access). The callback URI is
+    # the consumer's (§5.3.2.2.2) and, since #753, ends in a per-registration token;
+    # a notification to any other URI concerns a registration the AMF no longer holds
+    # and is acknowledged without effect, as it must be.
+    local reg uri
+    reg=$(docker exec "$SMF" curl -s --http2-prior-knowledge \
+        "http://${UDM_SBI}/nudm-uecm/v1/${SUPI}/registrations/amf-3gpp-access" || true)
+    uri=$(printf '%s' "$reg" | tr -d '\n' \
+        | sed -n 's/.*"deregCallbackUri"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    [ -n "$uri" ] || fail "the UDM holds no AMF 3GPP-access registration with a deregCallbackUri for ${SUPI}: ${reg}"
+    echo "  registered deregCallbackUri: ${uri}"
     code=$(docker exec "$SMF" curl -s -o /dev/null -w '%{http_code}' --http2-prior-knowledge \
         -X POST -H 'Content-Type: application/json' \
         -d '{"deregReason":"REREGISTRATION_REQUIRED","accessType":"3GPP_ACCESS"}' \
-        "http://${AMF_SBI}/namf-callback/v1/${SUPI}/dereg-notify" || true)
+        "${uri}" || true)
     echo "  dereg-notify -> HTTP ${code}"
     [ "$code" = "204" ] || fail "the AMF answered the DeregistrationNotification with HTTP ${code}, not 204"
     wait_for "$UE" 'Network-initiated de-registration' 10 \

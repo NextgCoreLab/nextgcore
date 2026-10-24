@@ -28,6 +28,7 @@ pub mod ngap_path;
 pub mod ngap_sm;
 pub mod positioning; // LCS: LMF positioning relay (NRPPa N2 / LPP N1) — TS 23.273
 pub mod racs; // #570: RACS on the AMF (TS 23.501 §5.4.4.1a, TS 29.673)
+pub(crate) mod sbi_offload; // #796: SBI work off the NGAP task
 pub mod sbi_path;
 pub mod snpn; // Rel-16: SNPN authentication (TS 23.501 §5.30)
 pub mod timer;

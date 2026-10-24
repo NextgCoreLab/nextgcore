@@ -333,6 +333,40 @@ fn capability_classification_reads_the_generated_report() {
     );
 }
 
+/// `build_lpp_request_capabilities(0)` derived by hand from X.691 (UPER, TS 37.355
+/// §6.3 `RequestCapabilities`, #906):
+///
+/// | bits | field |
+/// |------|-------|
+/// | `1001` | LPP-Message optional bitmap: transactionID, ¬sequenceNumber, ¬acknowledgement, lpp-MessageBody |
+/// | `0 0 0` | LPP-TransactionID ext bit; Initiator ext bit, value locationServer (1 bit) |
+/// | `00000000` | transactionNumber 0 |
+/// | `0` | endTransaction FALSE: the target ends it (§5.1.1 step 2) |
+/// | `0 0000` | lpp-MessageBody c1; c1 index 0 = requestCapabilities (4 bits) |
+/// | `0 00` | criticalExtensions c1; requestCapabilities-r9 (2 bits) |
+/// | `1` | r9-IEs extension bit: extension additions present |
+/// | `00010` | root optional bitmap: only ecid-RequestCapabilities |
+/// | `0` | ECID-RequestCapabilities: ext bit (an empty extensible SEQUENCE) |
+/// | `0 000010` | X.691 §19.8: extension-addition bitmap length, normally small, `3 − 1` (three groups: r13, r16, r19) |
+/// | `010` | only the Rel-16 group is present |
+/// | `00000001` | X.691 §19.9: the group as an open type, length 1 octet |
+/// | `11010` | the group's presence bitmap: nr-ECID, nr-Multi-RTT present, nr-DL-AoD absent, nr-DL-TDOA present, nr-UL absent |
+/// | `0 0 0` | NR-ECID-, NR-Multi-RTT-, NR-DL-TDOA-RequestCapabilities-r16: one ext bit each |
+///
+/// 57 bits, padded: `90 00 00 88 09 00 E8 00`.
+#[test]
+fn request_capabilities_matches_x691() {
+    assert_eq!(
+        codec_glue::build_lpp_request_capabilities(0).unwrap(),
+        vec![0x90, 0x00, 0x00, 0x88, 0x09, 0x00, 0xE8, 0x00]
+    );
+    // The transaction number lands in bits 7..15: 0x5A = 0101 1010.
+    assert_eq!(
+        codec_glue::build_lpp_request_capabilities(0x5A).unwrap(),
+        vec![0x90, 0xB4, 0x00, 0x88, 0x09, 0x00, 0xE8, 0x00]
+    );
+}
+
 /// `build_lpp_ecid_request(0)` derived by hand from X.691 (UPER, TS 37.355):
 ///
 /// | bits | field |
@@ -384,23 +418,32 @@ fn nr_ecid_request_matches_x691() {
     );
 }
 
-/// #907 review: the uplink capability decode, on the captured vectors.
+/// #907 review: the uplink capability decode, on the captured vectors. #906:
+/// it also carries the NR methods and the transaction number the answer is on
+/// (`92 03`: transactionID present, initiator targetDevice, transactionNumber 1).
 #[test]
 fn an_uplink_provide_capabilities_decodes_to_its_class_and_flavours() {
-    use codec_glue::{EcidFlavours, UeLppCapability};
+    use codec_glue::{EcidFlavours, NrMethods, ReportedCapabilities, UeLppCapability};
     assert_eq!(
         codec_glue::decode_lpp_provide_capabilities(&unhex("9203084858")),
-        Some((
-            UeLppCapability::EcidOnly,
-            EcidFlavours {
+        Some(ReportedCapabilities {
+            class: UeLppCapability::EcidOnly,
+            ecid: EcidFlavours {
                 eutra: true,
                 nr: false
-            }
-        ))
+            },
+            nr: NrMethods::default(),
+            transaction: Some(1),
+        })
     );
     assert_eq!(
         codec_glue::decode_lpp_provide_capabilities(&unhex("92030840")),
-        Some((UeLppCapability::Unknown, EcidFlavours::default()))
+        Some(ReportedCapabilities {
+            class: UeLppCapability::Unknown,
+            ecid: EcidFlavours::default(),
+            nr: NrMethods::default(),
+            transaction: Some(1),
+        })
     );
     // A ProvideLocationInformation is not a capability report.
     assert_eq!(
