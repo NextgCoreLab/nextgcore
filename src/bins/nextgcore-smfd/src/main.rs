@@ -3549,12 +3549,27 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     // registered SM context behind for a create that answered an error -- a context
     // the AMF never learned about and will never release. Named `rollback` rather
     // than `release_ip` so a later reader adding a failure path sees what it undoes.
+    //
+    // #912 review n4: the address once. Once the session holds it (`ipv4_addr`, set
+    // further down), `sess_remove` frees it, and freeing it here as well was the
+    // double free that hands one address to two UEs. A binding inserted before the
+    // failure goes too.
+    let rollback_ref = sm_context_ref.clone();
     let rollback = || {
         if let Ok(ctx) = smf_self().read() {
-            ctx.ipv4_pool
-                .release(std::net::Ipv4Addr::from(ue_ip_octets));
+            if let Ok(mut b) = ctx.policy_bindings.write() {
+                b.remove(&rollback_ref);
+            }
+            let sess_held_ip = registered_sess_id
+                .and_then(|id| ctx.sess_find_by_id(id))
+                .is_some_and(|s| s.ipv4_addr.is_some());
             if let Some(sess_id) = registered_sess_id {
                 ctx.sess_remove(sess_id);
+            }
+            if !sess_held_ip {
+                ctx.ipv4_pool
+                    .release(std::net::Ipv4Addr::from(ue_ip_octets));
+                ctx.persist();
             }
         }
     };
@@ -5555,85 +5570,170 @@ fn release_side_effect_permits() -> &'static std::sync::Arc<tokio::sync::Semapho
     })
 }
 
-/// The releases whose effects at other NFs are still running, per (SUPI, PSI)
-/// (#912 review M2). Each entry's semaphore is closed, waking every waiter, when the
-/// release finishes.
-fn releases_in_flight() -> &'static std::sync::Mutex<
-    std::collections::HashMap<(String, u8), std::sync::Arc<tokio::sync::Semaphore>>,
-> {
+/// The releases whose UDM cleanup is still to come or under way, per (SUPI, PSI)
+/// (#912 review M2, N1).
+fn releases_in_flight(
+) -> &'static std::sync::Mutex<std::collections::HashMap<(String, u8), ReleaseEntry>> {
     static IN_FLIGHT: std::sync::OnceLock<
-        std::sync::Mutex<
-            std::collections::HashMap<(String, u8), std::sync::Arc<tokio::sync::Semaphore>>,
-        >,
+        std::sync::Mutex<std::collections::HashMap<(String, u8), ReleaseEntry>>,
     > = std::sync::OnceLock::new();
     IN_FLIGHT.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Where a release's UDM cleanup is (#912 review N1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UdmReleaseStage {
+    /// Not started. A new session for the same (SUPI, PSI) may supersede it.
+    Pending,
+    /// The SDM unsubscribe and UECM deregistration are on the wire, each bounded by
+    /// [`UDM_RELEASE_TIMEOUT`].
+    Deleting,
+    /// Finished, skipped, or abandoned.
+    Done,
+}
+
+#[derive(Debug)]
+struct ReleaseState {
+    stage: UdmReleaseStage,
+    superseded: bool,
+}
+
+/// One release's UDM cleanup, shared by the release task and any SM Context Create
+/// for the same (SUPI, PSI) that has to wait for it.
+#[derive(Clone)]
+struct ReleaseEntry {
+    state: std::sync::Arc<std::sync::Mutex<ReleaseState>>,
+    changed: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl ReleaseEntry {
+    fn new() -> Self {
+        Self {
+            state: std::sync::Arc::new(std::sync::Mutex::new(ReleaseState {
+                stage: UdmReleaseStage::Pending,
+                superseded: false,
+            })),
+            changed: std::sync::Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ReleaseState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Start the UDM cleanup unless a new session superseded it: `false` means skip
+    /// it, because the new session's UECM registration replaces the record anyway.
+    fn begin_udm(&self) -> bool {
+        let mut st = self.lock();
+        if st.superseded {
+            st.stage = UdmReleaseStage::Done;
+            drop(st);
+            self.changed.notify_waiters();
+            return false;
+        }
+        st.stage = UdmReleaseStage::Deleting;
+        true
+    }
+
+    fn finish_udm(&self) {
+        self.lock().stage = UdmReleaseStage::Done;
+        self.changed.notify_waiters();
+    }
 }
 
 /// Marks one release of (SUPI, PSI) in flight until dropped.
 struct ReleaseInFlight {
     key: (String, u8),
-    done: std::sync::Arc<tokio::sync::Semaphore>,
+    entry: ReleaseEntry,
 }
 
 impl ReleaseInFlight {
     fn begin(supi: &str, psi: u8) -> Self {
         let key = (supi.to_string(), psi);
-        let done = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let entry = ReleaseEntry::new();
         releases_in_flight()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(key.clone(), done.clone());
-        Self { key, done }
+            .insert(key.clone(), entry.clone());
+        Self { key, entry }
     }
 }
 
 impl Drop for ReleaseInFlight {
     fn drop(&mut self) {
+        self.entry.finish_udm();
         let mut map = releases_in_flight()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if map
             .get(&self.key)
-            .is_some_and(|d| std::sync::Arc::ptr_eq(d, &self.done))
+            .is_some_and(|e| std::sync::Arc::ptr_eq(&e.state, &self.entry.state))
         {
             map.remove(&self.key);
         }
-        self.done.close();
     }
 }
 
-/// How long a new session for a (SUPI, PSI) waits for that pair's release to finish.
-const RELEASE_IN_FLIGHT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Each of a release's UDM requests is bounded by this (#912 review N1), so a create
+/// waiting on one waits a known, short time instead of the SBI client's 30 s.
+const UDM_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Wait, at most [`RELEASE_IN_FLIGHT_WAIT`], for a release of (SUPI, PSI) to finish
-/// (#912 review M2).
+/// Before SM Context Create registers (SUPI, PSI) at the UDM (#912 review M2, N1): a
+/// release of the same pair whose UDM cleanup has not started is SUPERSEDED (it
+/// skips its UECM deregistration, which would delete the new registration), and one
+/// whose cleanup is on the wire is waited for, at most its two bounded requests. A
+/// finished one costs nothing. So no old DELETE can land after the new PUT, and a
+/// create waits only when one is actually outstanding.
 async fn await_release_in_flight(supi: &str, psi: u8) {
-    let pending = releases_in_flight()
+    let Some(entry) = releases_in_flight()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&(supi.to_string(), psi))
-        .cloned();
-    if let Some(done) = pending {
-        log::info!("[{supi}] PSI {psi}: waiting for the previous release of this PSI to finish");
-        if tokio::time::timeout(RELEASE_IN_FLIGHT_WAIT, done.acquire())
-            .await
-            .is_err()
+        .cloned()
+    else {
+        return;
+    };
+    let deadline = tokio::time::Instant::now()
+        + UDM_RELEASE_TIMEOUT * 2
+        + std::time::Duration::from_millis(500);
+    loop {
+        let notified = entry.changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         {
+            let mut st = entry.lock();
+            match st.stage {
+                UdmReleaseStage::Pending => {
+                    st.superseded = true;
+                    log::info!(
+                        "[{supi}] PSI {psi}: the previous release's UDM cleanup had not \
+                         started; superseded by this session"
+                    );
+                    return;
+                }
+                UdmReleaseStage::Done => return,
+                UdmReleaseStage::Deleting => {}
+            }
+        }
+        if tokio::time::timeout_at(deadline, notified).await.is_err() {
             log::warn!(
-                "[{supi}] PSI {psi}: the previous release is still running after {:?}; \
-                 registering anyway",
-                RELEASE_IN_FLIGHT_WAIT
+                "[{supi}] PSI {psi}: the previous release's UDM cleanup is still running; \
+                 registering anyway"
             );
+            return;
         }
     }
 }
 
 /// Wait, at most `budget`, until no release side effects are running (#912 review
 /// m5): a graceful shutdown would otherwise cut them when the runtime goes.
+/// Release side-effect tasks still running (#912 review m5).
+static RELEASE_SIDE_EFFECTS_RUNNING: AtomicU64 = AtomicU64::new(0);
+
 async fn drain_release_side_effects(budget: std::time::Duration) {
     let deadline = tokio::time::Instant::now() + budget;
     loop {
-        let left = releases_in_flight().lock().map(|m| m.len()).unwrap_or(0);
+        let left = RELEASE_SIDE_EFFECTS_RUNNING.load(Ordering::SeqCst);
         if left == 0 {
             return;
         }
@@ -5648,28 +5748,77 @@ async fn drain_release_side_effects(budget: std::time::Duration) {
     }
 }
 
-/// Run [`release_side_effects`] in its own task, bounded and marked in flight.
+/// Run [`release_side_effects`] in its own task, marked in flight. The UDM cleanup
+/// runs first and outside the fan-out bound (#912 review N1): a create for the same
+/// PSI may be waiting on it, and it must not queue behind other releases' EASDF and
+/// AMF work.
 fn spawn_release_side_effects(sm_context_ref: &str, binding: context::PolicyBinding) {
     let reference = sm_context_ref.to_string();
     let in_flight = ReleaseInFlight::begin(&binding.supi, binding.psi);
+    RELEASE_SIDE_EFFECTS_RUNNING.fetch_add(1, Ordering::SeqCst);
     tokio::spawn(async move {
-        let _in_flight = in_flight;
-        let Ok(_permit) = release_side_effect_permits().clone().acquire_owned().await else {
-            return;
-        };
-        release_side_effects(&reference, &binding).await;
+        release_udm_cleanup(&binding, Some(&in_flight.entry)).await;
+        drop(in_flight);
+        if let Ok(_permit) = release_side_effect_permits().clone().acquire_owned().await {
+            release_side_effects(&reference, &binding).await;
+        }
+        RELEASE_SIDE_EFFECTS_RUNNING.fetch_sub(1, Ordering::SeqCst);
     });
 }
 
-/// A released SM context's effects at other NFs, each best-effort (#853): its EASDF
-/// DNS context (#114), its SDM subscription and UDM serving-SMF registration (#293),
-/// its EPS bearer identity at the AMF (#291), and the PDU_SES_REL event (#79). Shared
-/// by every release path so none can skip one.
+/// TS 23.502 §4.3.4.2 steps 14-15 for a released session: Nudm_SDM_Unsubscribe, then
+/// Nudm_UECM_Deregistration, each bounded by [`UDM_RELEASE_TIMEOUT`], skipped when a
+/// new session for the same (SUPI, PSI) superseded them (#912 review N1).
 ///
-/// TS 23.502 §4.3.4.2 order: step 14 (Nudm_SDM_Unsubscribe) before step 15
-/// (Nudm_UECM_Deregistration). Step 14 is conditioned on the last PDU session for the
-/// (DNN, S-NSSAI); this SMF subscribes per PDU session (the subscription id is on the
-/// binding), so each session's own subscription is the one to remove.
+/// Step 14 is conditioned on the last PDU session for the (DNN, S-NSSAI); this SMF
+/// subscribes per PDU session (the subscription id is on the binding), so each
+/// session's own subscription is the one to remove.
+async fn release_udm_cleanup(binding: &context::PolicyBinding, entry: Option<&ReleaseEntry>) {
+    if !entry.is_none_or(ReleaseEntry::begin_udm) {
+        log::info!(
+            "[{}] PSI {}: UDM cleanup skipped; a new session for this PSI registered meanwhile",
+            binding.supi,
+            binding.psi
+        );
+        return;
+    }
+    // #293: without the unsubscribe the UDM keeps notifying a callback URI whose
+    // smContextRef no longer resolves; without the deregistration it accumulates
+    // serving-SMF records for released sessions, so a procedure resolving the serving
+    // SMF through the UDM resolves a released session to this SMF.
+    if let Some(sub_id) = &binding.sdm_subscription_id {
+        if tokio::time::timeout(
+            UDM_RELEASE_TIMEOUT,
+            udm::unsubscribe_sm_data(&binding.supi, sub_id),
+        )
+        .await
+        .is_err()
+        {
+            log::warn!("[{}] Nudm_SDM_Unsubscribe timed out", binding.supi);
+        }
+    }
+    if tokio::time::timeout(
+        UDM_RELEASE_TIMEOUT,
+        udm::deregister_serving_smf(&binding.supi, binding.psi),
+    )
+    .await
+    .is_err()
+    {
+        log::warn!(
+            "[{}] Nudm_UECM_Deregistration (PSI {}) timed out",
+            binding.supi,
+            binding.psi
+        );
+    }
+    if let Some(e) = entry {
+        e.finish_udm();
+    }
+}
+
+/// A released SM context's other effects at other NFs, each best-effort (#853): its
+/// EASDF DNS context (#114), its EPS bearer identity at the AMF (#291), and the
+/// PDU_SES_REL event (#79). The UDM cleanup is [`release_udm_cleanup`]. Shared by
+/// every release path so none can skip one.
 async fn release_side_effects(sm_context_ref: &str, binding: &context::PolicyBinding) {
     // #114: a failure leaves an orphan the EASDF's own capacity cap bounds, whereas
     // failing the release would leave this SMF's session state inconsistent with
@@ -5677,14 +5826,6 @@ async fn release_side_effects(sm_context_ref: &str, binding: &context::PolicyBin
     if let Some(ctx_id) = &binding.easdf_dns_context_id {
         easdf::delete_dns_context(&binding.supi, ctx_id).await;
     }
-    // #293: without the unsubscribe the UDM keeps notifying a callback URI whose
-    // smContextRef no longer resolves; without the deregistration it accumulates
-    // serving-SMF records for released sessions, so a procedure resolving the serving
-    // SMF through the UDM resolves a released session to this SMF.
-    if let Some(sub_id) = &binding.sdm_subscription_id {
-        udm::unsubscribe_sm_data(&binding.supi, sub_id).await;
-    }
-    udm::deregister_serving_smf(&binding.supi, binding.psi).await;
     // #291: the eleven-wide per-UE EBI space (TS 24.301 §9.3.2) otherwise leaks one
     // identity per session lifetime. The AMF's authority is the same
     // `smContextStatusUri` callback root the assignment used.
@@ -6373,14 +6514,20 @@ async fn handle_n1_sm_message(sm_context_ref: &str, n1: &[u8]) -> SbiResponse {
                 cause.unwrap_or(policy::gsm_cause::REQUEST_REJECTED_UNSPECIFIED),
             );
             let n2_cmd = build_release_command_transfer();
-            arm_gsm_timer(
-                sm_context_ref,
-                timer::SmfTimerId::T3592,
-                &n1_cmd,
-                &binding.supi,
-                psi,
-                amf_uri.as_deref(),
-            );
+            // #912 review n3: the user-plane release can find the UPF holds no such
+            // session (cause 65), and that reconciliation completes the whole release;
+            // a T3592 for a context that is gone would only retransmit and abandon
+            // nothing.
+            if lookup_policy_binding(sm_context_ref).is_some() {
+                arm_gsm_timer(
+                    sm_context_ref,
+                    timer::SmfTimerId::T3592,
+                    &n1_cmd,
+                    &binding.supi,
+                    psi,
+                    amf_uri.as_deref(),
+                );
+            }
             sbi_response_with_n1_n2(
                 200,
                 serde_json::json!({ "n2SmInfoType": "PDU_RES_REL_CMD" }),
@@ -6484,14 +6631,17 @@ async fn ran_released_session(sm_context_ref: &str, n2: Option<&[u8]>) -> SbiRes
         0, // network-initiated: no procedure transaction (TS 24.501 §6.3.3.2)
         policy::gsm_cause::REGULAR_DEACTIVATION,
     );
-    arm_gsm_timer(
-        sm_context_ref,
-        timer::SmfTimerId::T3592,
-        &n1_cmd,
-        &binding.supi,
-        binding.psi,
-        binding.sm_context_status_uri.as_deref(),
-    );
+    // #912 review n3: not for a context the user-plane release already completed.
+    if lookup_policy_binding(sm_context_ref).is_some() {
+        arm_gsm_timer(
+            sm_context_ref,
+            timer::SmfTimerId::T3592,
+            &n1_cmd,
+            &binding.supi,
+            binding.psi,
+            binding.sm_context_status_uri.as_deref(),
+        );
+    }
     sbi_response_with_n1(
         200,
         serde_json::json!({ "upCnxState": "DEACTIVATED" }),
@@ -6804,8 +6954,9 @@ async fn handle_sm_context_release(
     // Steps 14-15 and the rest at other NFs (EASDF, UDM, the EBI at the AMF, the
     // PDU_SES_REL event), shared with every other release path (#853), awaited here as
     // before #853 so the AMF's 204 still follows them.
+    // Not gated by the fan-out bound: the AMF is waiting for this 204 (#912 review n1).
     if let Some(binding) = &binding {
-        let _permit = release_side_effect_permits().clone().acquire_owned().await;
+        release_udm_cleanup(binding, _in_flight.as_ref().map(|f| &f.entry)).await;
         release_side_effects(sm_context_ref, binding).await;
     }
 
@@ -11042,33 +11193,183 @@ mod tests {
         smf_context_init(64, 256, 512);
         let (udm_srv, seen) = spawn_slow_udm(std::time::Duration::from_millis(400)).await;
         let supi = "imsi-001010000009123";
-        let reference = seed_established_session(supi, 7, std::net::Ipv4Addr::new(10, 45, 9, 14));
+        let deletes = |psi: u8| {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|(m, u)| m == "DELETE" && u.ends_with(&format!("/smf-registrations/{psi}")))
+                .count()
+        };
 
-        let _ = release_sm_context_locally(&reference);
+        // (a) The old deregistration is already on the wire: the create waits for it.
+        let on_wire = seed_established_session(supi, 7, std::net::Ipv4Addr::new(10, 45, 9, 14));
+        let _ = release_sm_context_locally(&on_wire);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let started = std::time::Instant::now();
         await_release_in_flight(supi, 7).await;
         let waited = started.elapsed();
-        let deregistered_before = seen
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|(m, u)| m == "DELETE" && u.contains("/smf-registrations/7"));
-        // A different PSI does not wait.
-        let other = std::time::Instant::now();
+        let landed_before = deletes(7);
+
+        // (b) The old cleanup has not started: the create supersedes it, and the old
+        // deregistration is never sent (it would delete the new registration).
+        let pending = seed_established_session(supi, 8, std::net::Ipv4Addr::new(10, 45, 9, 21));
+        let _ = release_sm_context_locally(&pending);
+        let started = std::time::Instant::now();
         await_release_in_flight(supi, 8).await;
+        let superseded_in = started.elapsed();
+        side_effects_settled().await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let late_deletes = deletes(8);
+
+        // (c) Another PSI does not wait.
+        let other = std::time::Instant::now();
+        await_release_in_flight(supi, 9).await;
         let other_waited = other.elapsed();
         stop_udm_leg();
         udm_srv.stop().await.ok();
 
-        assert!(
-            deregistered_before,
-            "the old deregistration landed before the new session may register"
+        assert_eq!(
+            landed_before, 1,
+            "the old deregistration landed before the create returns"
         );
         assert!(
-            waited >= std::time::Duration::from_millis(400),
+            waited >= std::time::Duration::from_millis(300),
             "{waited:?}"
         );
+        assert!(
+            superseded_in < std::time::Duration::from_millis(50),
+            "{superseded_in:?}"
+        );
+        assert_eq!(
+            late_deletes, 0,
+            "a superseded release sends no deregistration"
+        );
         assert!(other_waited < std::time::Duration::from_millis(50));
+    }
+
+    /// #912 review N2: SM Context Create itself waits for the previous release of its
+    /// (SUPI, PSI). The old Nudm_UECM_Deregistration is on the wire (the UDM answers
+    /// DELETEs after 500 ms); a create for the same PSI registers only after it has
+    /// been answered, so the old DELETE cannot remove the new registration.
+    #[tokio::test]
+    async fn a_create_registers_only_after_the_old_deregistration_is_answered() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        type Seen = std::sync::Arc<
+            std::sync::Mutex<Vec<(String, String, std::time::Instant, std::time::Instant)>>,
+        >;
+        let seen: Seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let (udm_srv, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let sink = sink.clone();
+                async move {
+                    let arrived = std::time::Instant::now();
+                    if req.header.method == "DELETE" {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                    sink.lock().unwrap().push((
+                        req.header.method.clone(),
+                        req.header.uri.clone(),
+                        arrived,
+                        std::time::Instant::now(),
+                    ));
+                    if req.header.method == "DELETE" {
+                        return SbiResponse::with_status(204);
+                    }
+                    if req.header.uri.contains("/sdm-subscriptions") {
+                        return SbiResponse::with_status(201)
+                            .with_json_body(&serde_json::json!({ "subscriptionId": "sub-n2" }))
+                            .unwrap_or_else(|_| SbiResponse::with_status(201));
+                    }
+                    if req.header.uri.contains("/sm-data") {
+                        return SbiResponse::with_status(200)
+                            .with_json_body(&serde_json::json!([]))
+                            .unwrap_or_else(|_| SbiResponse::with_status(200));
+                    }
+                    SbiResponse::with_status(201)
+                }
+            })
+            .await;
+        std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("UDM_SBI_PORT", addr.port().to_string());
+        udm::set_for_test(true);
+        let supi = "imsi-001010000009129";
+        let old = seed_established_session(supi, 6, std::net::Ipv4Addr::new(10, 45, 9, 22));
+        let _ = release_sm_context_locally(&old);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let resp = handle_sm_context_create(&create_request(
+            supi,
+            6,
+            &n1(
+                6,
+                1,
+                gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+                &[0x91, 0x00],
+            ),
+        ))
+        .await;
+        side_effects_settled().await;
+        let log = seen.lock().unwrap().clone();
+        stop_udm_leg();
+        udm_srv.stop().await.ok();
+
+        assert_eq!(resp.status, 201);
+        let old_delete_done = log
+            .iter()
+            .find(|(m, u, _, _)| m == "DELETE" && u.ends_with("/smf-registrations/6"))
+            .map(|(_, _, _, done)| *done)
+            .expect("the old deregistration was sent");
+        let new_put = log
+            .iter()
+            .find(|(m, u, _, _)| m == "PUT" && u.ends_with("/smf-registrations/6"))
+            .map(|(_, _, arrived, _)| *arrived)
+            .expect("the new session registered");
+        assert!(
+            new_put >= old_delete_done,
+            "the new registration arrived only after the old deregistration was answered"
+        );
+    }
+
+    /// #912 review m5/n6: the shutdown drain of release side effects is bounded, and
+    /// waits for them when there is time.
+    #[tokio::test]
+    async fn the_release_side_effect_drain_is_bounded() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let (udm_srv, seen) = spawn_slow_udm(std::time::Duration::from_millis(800)).await;
+        let reference = seed_established_session(
+            "imsi-001010000009131",
+            14,
+            std::net::Ipv4Addr::new(10, 45, 9, 32),
+        );
+        let _ = release_sm_context_locally(&reference);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let started = std::time::Instant::now();
+        drain_release_side_effects(std::time::Duration::from_millis(200)).await;
+        let short = started.elapsed();
+        let unfinished = seen.lock().unwrap().is_empty();
+        drain_release_side_effects(std::time::Duration::from_secs(5)).await;
+        let finished = !seen.lock().unwrap().is_empty();
+        smf_self()
+            .read()
+            .unwrap()
+            .ipv4_pool
+            .release(std::net::Ipv4Addr::new(10, 45, 9, 32));
+        stop_udm_leg();
+        udm_srv.stop().await.ok();
+
+        assert!(short < std::time::Duration::from_millis(500), "{short:?}");
+        assert!(
+            unfinished,
+            "the short drain gave up while the UDM was still answering"
+        );
+        assert!(finished, "the long drain waited for it");
     }
 
     /// #912 review M4: the UE-requested release (PDU SESSION RELEASE REQUEST, then

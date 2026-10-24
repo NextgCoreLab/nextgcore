@@ -1054,6 +1054,37 @@ mod tests {
         assert_eq!(posts, 1);
     }
 
+    /// #912 review N3: boot frees the restored address of a session whose binding could
+    /// not be read (salvaged as `ue_ip`); nothing else holds it.
+    #[tokio::test]
+    async fn boot_frees_the_address_of_an_unrestorable_session() {
+        let _state = PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = N4_TEST_LOCK.lock().await;
+        let ip = std::net::Ipv4Addr::new(10, 45, 9, 31);
+        {
+            let global = crate::context::smf_self();
+            let ctx = global.read().expect("smf context");
+            assert!(
+                ctx.ipv4_pool.reserve(ip),
+                "precondition: the restored allocation"
+            );
+            ctx.unrestorable_sessions.write().expect("pending").push(
+                crate::context::UnrestorableSession {
+                    ue_ip: Some(ip.octets()),
+                    sm_context_ref: "boot-free-ref".to_string(),
+                    status_uri: None,
+                    reason: "policy binding could not be restored: test".to_string(),
+                },
+            );
+        }
+        let _ = notify_unrestorable_at_boot().await;
+        let global = crate::context::smf_self();
+        let ctx = global.read().expect("smf context");
+        let freed = ctx.ipv4_pool.reserve(ip);
+        ctx.ipv4_pool.release(ip);
+        assert!(freed, "the address is back in the pool");
+    }
+
     /// #193 criterion 4: with nothing restored there is nothing to signal.
     ///
     /// The shipped default configures no state file, so a fresh SMF has an empty
