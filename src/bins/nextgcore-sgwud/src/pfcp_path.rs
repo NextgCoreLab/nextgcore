@@ -411,9 +411,12 @@ pub struct SxaNode {
     /// every mutation of `peers`, which is the only way the two can disagree.
     associated_peers: std::sync::atomic::AtomicUsize,
     timers: SgwuTimerConfigs,
-    /// The SGW-C addresses an Association Setup is accepted from (security, #968).
-    /// Unconfigured (empty) accepts any host.
+    /// The SGW-C hosts an Association Setup is accepted from (security, #968).
+    /// Fail closed: empty refuses every Setup.
     allowed_peers: std::sync::RwLock<PeerAllowlist>,
+    /// The most sessions one SGW-C may hold (0 = only the global capacity), so one
+    /// peer cannot take every session slot from the others (#968).
+    max_sessions_per_peer: std::sync::atomic::AtomicUsize,
 }
 
 impl SxaNode {
@@ -451,6 +454,7 @@ impl SxaNode {
             associated_peers: std::sync::atomic::AtomicUsize::new(0),
             timers,
             allowed_peers: std::sync::RwLock::new(PeerAllowlist::default()),
+            max_sessions_per_peer: std::sync::atomic::AtomicUsize::new(0),
         });
         log::info!(
             "PFCP/Sxa listening on {bound} (Node ID {local_ip}, Recovery Time Stamp \
@@ -470,6 +474,11 @@ impl SxaNode {
         }
     }
 
+    /// Set the per-SGW-C session cap (0 = only the global capacity).
+    pub fn set_max_sessions_per_peer(&self, cap: usize) {
+        self.max_sessions_per_peer.store(cap, Ordering::Relaxed);
+    }
+
     fn allowed_peers(&self) -> PeerAllowlist {
         self.allowed_peers
             .read()
@@ -482,7 +491,9 @@ impl SxaNode {
     /// By IP, never by port (#968 review, MAJOR 3): the association is the CP
     /// function's (TS 29.244 §6.2.6), so an SGW-C that sends a request from another
     /// source port, or whose NAT binding moved, is still that peer. Association Setup
-    /// keeps at most one peer per host (see `handle_association_setup_request`).
+    /// keeps at most one peer per host (see `handle_association_setup_request`), so
+    /// two SGW-Cs behind ONE IP address are one peer here: they must use distinct
+    /// addresses (a known limitation; keying on (IP, Node ID) would lift it).
     async fn peer_on_host(&self, ip: IpAddr) -> Option<(SocketAddr, u64)> {
         self.peers
             .read()
@@ -1351,10 +1362,31 @@ impl SxaNode {
         // answered from the OLD SGW-C's session, still tagged with the old node, and
         // that node's restoration then deleted the new UE's rules.
         let parsed = establishment_from_lib(&req, &cp_f_seid);
-        let outcome = establish_session(ctx, &cp_f_seid, node_id, |sess| {
+        let cap = self.max_sessions_per_peer.load(Ordering::Relaxed);
+        let outcome = establish_session(ctx, &cp_f_seid, node_id, cap, |sess| {
             crate::sxa_handler::handle_session_establishment_request(Some(sess), 0, &parsed)
         });
         match outcome {
+            Establishment::Conflict => {
+                // Mandatory IE incorrect, Offending IE = the CP F-SEID (TS 29.244
+                // §7.5.3.1, §8.2.1): it identifies a session this sender does not own.
+                let mut body = Vec::new();
+                body.extend_from_slice(&19u16.to_be_bytes());
+                body.extend_from_slice(&1u16.to_be_bytes());
+                body.push(sxa_build::pfcp_cause::MANDATORY_IE_INCORRECT);
+                body.extend_from_slice(&40u16.to_be_bytes());
+                body.extend_from_slice(&2u16.to_be_bytes());
+                body.extend_from_slice(&57u16.to_be_bytes());
+                let _ = self
+                    .send(
+                        pfcp_msg_type::SESSION_ESTABLISHMENT_RESPONSE,
+                        Some(cp_f_seid.seid),
+                        header.sequence_number,
+                        &body,
+                        from,
+                    )
+                    .await;
+            }
             Establishment::NoResources => {
                 log::error!(
                     "Cannot add SGW-U session for CP F-SEID 0x{:x}",
@@ -1645,6 +1677,8 @@ fn gate_status_octet(gate: &LibGateStatus) -> u8 {
 enum Establishment {
     /// The session could not be created at all.
     NoResources,
+    /// The CP F-SEID names a session another SGW-C owns (#968): nothing installed.
+    Conflict,
     /// The request was rejected with this cause. A session this request CREATED has
     /// been removed again, with every rule and TEID it had installed (#836).
     Rejected(u8),
@@ -1665,6 +1699,7 @@ fn establish_session(
     ctx: &crate::context::SgwuContext,
     cp_f_seid: &crate::context::FSeid,
     node_id: Option<u64>,
+    per_peer_cap: usize,
     install: impl FnOnce(
         &SgwuSess,
     ) -> (
@@ -1673,8 +1708,21 @@ fn establish_session(
     ),
 ) -> Establishment {
     let (sess, created_here) = match ctx.sess_find_by_sgwc_sxa_f_seid(cp_f_seid) {
+        // SECURITY (#968 re-review, BLOCKER A): the CP F-SEID is data in the message,
+        // and CP SEIDs are sequential at a known SGW-C address, so an Establishment
+        // naming ANOTHER peer's F-SEID used to run `install` on that peer's session --
+        // its rules rewritten, its user plane re-pointed. A session owned by another
+        // node is a conflict: nothing is installed.
+        Some(existing) if existing.pfcp_node_id != node_id => {
+            note_refusal(format_args!(
+                "Session Establishment for CP F-SEID 0x{:x}, a session of another SGW-C: \
+                 rejected (cause 69), nothing installed",
+                cp_f_seid.seid
+            ));
+            return Establishment::Conflict;
+        }
         Some(existing) => (existing, false),
-        None => match ctx.sess_add_for_node(cp_f_seid, node_id) {
+        None => match ctx.sess_add_for_node_capped(cp_f_seid, node_id, per_peer_cap) {
             Some(sess) => (sess, true),
             None => return Establishment::NoResources,
         },
@@ -1996,16 +2044,58 @@ pub async fn pfcp_open() -> Result<Arc<SxaNode>, String> {
     if allowed.is_configured() {
         log::info!("PFCP associations accepted only from: {allowed}");
     } else {
-        log::warn!(
-            "sgwu.pfcp.allowed_peers is not set: ANY host that reaches {bind} may set up a \
-             PFCP association. Set it to the SGW-C address(es)."
+        log::error!(
+            "sgwu.pfcp.allowed_peers / SGWU_PFCP_ALLOWED_PEERS is not set: EVERY PFCP \
+             Association Setup will be refused, so no SGW-C can use this SGW-U. Set it to \
+             the SGW-C address(es), CIDR or host name (0.0.0.0/0 admits any host)."
         );
     }
+    // Host-name entries are re-resolved off the receive path.
+    allowed.spawn_host_refresh(std::time::Duration::from_secs(10));
+    let cap = per_peer_session_cap(
+        std::env::var("SGWU_PFCP_MAX_SESSIONS_PER_PEER").ok(),
+        crate::config::config().pfcp_max_sessions_per_peer,
+        &allowed,
+        sgwu_self().sess_capacity(),
+    )?;
+    log::info!(
+        "PFCP sessions per SGW-C: at most {}",
+        if cap == 0 {
+            "the global capacity".to_string()
+        } else {
+            cap.to_string()
+        }
+    );
     let node = SxaNode::open(bind, local_ip)
         .await
         .map_err(|e| format!("failed to bind PFCP socket on {bind}: {e}"))?;
     node.set_allowed_peers(allowed);
+    node.set_max_sessions_per_peer(cap);
     Ok(node)
+}
+
+/// The per-SGW-C session cap (#968): `SGWU_PFCP_MAX_SESSIONS_PER_PEER`, then
+/// `sgwu.pfcp.max_sessions_per_peer`, then a default. The default is no cap of its
+/// own (0) when the allowlist admits exactly one host -- that SGW-C may use the
+/// whole capacity -- and HALF the capacity otherwise, so no one peer can take every
+/// slot from the others.
+fn per_peer_session_cap(
+    env: Option<String>,
+    file: Option<usize>,
+    allowed: &PeerAllowlist,
+    capacity: usize,
+) -> Result<usize, String> {
+    if let Some(v) = env {
+        return v
+            .trim()
+            .parse()
+            .map_err(|e| format!("SGWU_PFCP_MAX_SESSIONS_PER_PEER '{v}': {e}"));
+    }
+    Ok(file.unwrap_or(if allowed.admits_a_single_host() {
+        0
+    } else {
+        capacity / 2
+    }))
 }
 
 /// Close the Sxa PFCP path. The socket closes with the node; this drops the
@@ -2277,7 +2367,7 @@ mod tests {
             )
         };
 
-        let out = establish_session(&ctx, &f_seid, Some(7), install_then_fail);
+        let out = establish_session(&ctx, &f_seid, Some(7), 0, install_then_fail);
         assert!(
             matches!(out, Establishment::Rejected(c) if c == sxa_build::pfcp_cause::SYSTEM_FAILURE)
         );
@@ -2285,14 +2375,14 @@ mod tests {
         assert!(ctx.pdr_find_by_teid(0x8361).is_none(), "and so is its TEID");
 
         // Established for real, then a retransmission of it is rejected.
-        let ok = establish_session(&ctx, &f_seid, Some(7), |_| {
+        let ok = establish_session(&ctx, &f_seid, Some(7), 0, |_| {
             (crate::sxa_handler::HandlerResult::Ok, Vec::new())
         });
         let Establishment::Accepted(sess, _) = ok else {
             panic!("accepted");
         };
         assert_eq!(sess.pfcp_node_id, Some(7));
-        let again = establish_session(&ctx, &f_seid, Some(7), install_then_fail);
+        let again = establish_session(&ctx, &f_seid, Some(7), 0, install_then_fail);
         assert!(matches!(again, Establishment::Rejected(_)));
         assert!(
             ctx.sess_find_by_id(sess.id).is_some(),
@@ -2553,6 +2643,167 @@ mod tests {
         assert_eq!(node.peers().await.len(), 1, "one peer per host");
     }
 
+    /// A Session Establishment for CP F-SEID `seid`@`cp_ip` with one Create PDR
+    /// `pdr_id` (CH F-TEID) and FAR 1.
+    fn establishment_wire(seq: u32, seid: u64, cp_ip: [u8; 4], pdr_id: u16) -> Vec<u8> {
+        let mut req = LibSessionEstablishmentRequest::new(
+            NodeId::new_ipv4(cp_ip),
+            LibFSeid::new_ipv4(seid, cp_ip),
+        );
+        let mut pdi = Pdi::new(SourceInterface::Access);
+        let mut f_teid = FTeid::new_ipv4(0, [127, 0, 0, 1]);
+        f_teid.ch = true;
+        pdi.local_f_teid = Some(f_teid);
+        let mut pdr = CreatePdr::new(pdr_id, 100, pdi);
+        pdr.far_id = Some(1);
+        req.create_pdrs.push(pdr);
+        let mut far = CreateFar::new(1, ApplyAction::forward());
+        far.forwarding_parameters = Some(ForwardingParameters::new(DestinationInterface::Core));
+        req.create_fars.push(far);
+        let mut body = BytesMut::new();
+        req.encode(&mut body);
+        wire(
+            pfcp_msg_type::SESSION_ESTABLISHMENT_REQUEST,
+            Some(0),
+            seq,
+            &body,
+        )
+    }
+
+    /// SECURITY (#968 re-review, BLOCKER A): an associated SGW-C that sends a Session
+    /// Establishment naming ANOTHER SGW-C's CP F-SEID gets cause 69 (Mandatory IE
+    /// incorrect, Offending IE = F-SEID) and installs NOTHING on that session. Before,
+    /// it was accepted (cause 1) and the victim's session gained the attacker's PDR 9
+    /// while still owned by the victim's node.
+    #[tokio::test]
+    async fn an_establishment_naming_another_peers_f_seid_installs_nothing() {
+        let (_guard, node, owner) = node_and_peer().await;
+        let owner_node = associate_from(&node, &owner).await;
+        const CP: [u8; 4] = [127, 0, 0, 9];
+        deliver(&node, &owner, &establishment_wire(5, 0x9681, CP, 1)).await;
+        let (_, resp) = recv_decoded(&owner).await;
+        assert_eq!(
+            find_cause(&resp),
+            Some(sxa_build::pfcp_cause::REQUEST_ACCEPTED)
+        );
+        let ctx = sgwu_self();
+        let sess = ctx
+            .sess_find_by_sgwc_sxa_f_seid(&FSeid::with_ipv4(0x9681, Ipv4Addr::from(CP)))
+            .expect("the owner's session");
+        assert_eq!(sess.pfcp_node_id, Some(owner_node));
+
+        let attacker = UdpSocket::bind("127.0.0.66:0").await.unwrap();
+        associate_from(&node, &attacker).await;
+        let before = PFCP_UNAUTHORIZED.load(Ordering::Relaxed);
+        deliver(&node, &attacker, &establishment_wire(6, 0x9681, CP, 9)).await;
+        let (_, resp) = recv_decoded(&attacker).await;
+        assert_eq!(
+            find_cause(&resp),
+            Some(sxa_build::pfcp_cause::MANDATORY_IE_INCORRECT)
+        );
+        assert!(
+            ctx.pdr_find(sess.id, 9).is_none(),
+            "PDR 9 was not installed"
+        );
+        assert!(
+            ctx.pdr_find(sess.id, 1).is_some(),
+            "the owner's PDR is intact"
+        );
+        assert_eq!(
+            ctx.sess_find_by_id(sess.id).unwrap().pfcp_node_id,
+            Some(owner_node)
+        );
+        assert!(
+            PFCP_UNAUTHORIZED.load(Ordering::Relaxed) > before,
+            "counted"
+        );
+
+        // The owner re-establishing its own F-SEID is still served.
+        deliver(&node, &owner, &establishment_wire(7, 0x9681, CP, 2)).await;
+        let (_, resp) = recv_decoded(&owner).await;
+        assert_eq!(
+            find_cause(&resp),
+            Some(sxa_build::pfcp_cause::REQUEST_ACCEPTED)
+        );
+        ctx.sess_remove(sess.id);
+    }
+
+    /// #968 re-review: one SGW-C cannot take every session slot. At its per-peer cap
+    /// a further Establishment is NO_RESOURCES, while another SGW-C is still served.
+    #[tokio::test]
+    async fn one_sgwc_cannot_take_every_session_slot() {
+        let (_guard, node, a) = node_and_peer().await;
+        node.set_max_sessions_per_peer(1);
+        associate_from(&node, &a).await;
+        let b = UdpSocket::bind("127.0.0.67:0").await.unwrap();
+        associate_from(&node, &b).await;
+
+        deliver(&node, &a, &establishment_wire(10, 0xC1, [127, 0, 0, 1], 1)).await;
+        assert_eq!(
+            find_cause(&recv_decoded(&a).await.1),
+            Some(sxa_build::pfcp_cause::REQUEST_ACCEPTED)
+        );
+        deliver(&node, &a, &establishment_wire(11, 0xC2, [127, 0, 0, 1], 1)).await;
+        assert_eq!(
+            find_cause(&recv_decoded(&a).await.1),
+            Some(sxa_build::pfcp_cause::NO_RESOURCES_AVAILABLE),
+            "A is at its cap"
+        );
+        deliver(&node, &b, &establishment_wire(12, 0xC1, [127, 0, 0, 67], 1)).await;
+        assert_eq!(
+            find_cause(&recv_decoded(&b).await.1),
+            Some(sxa_build::pfcp_cause::REQUEST_ACCEPTED),
+            "B still has room"
+        );
+        let ctx = sgwu_self();
+        for (seid, ip) in [(0xC1, [127, 0, 0, 1]), (0xC1, [127, 0, 0, 67])] {
+            if let Some(s) =
+                ctx.sess_find_by_sgwc_sxa_f_seid(&FSeid::with_ipv4(seid, Ipv4Addr::from(ip)))
+            {
+                ctx.sess_remove(s.id);
+            }
+        }
+    }
+
+    /// The per-peer cap: env, then file, then no own cap for a single-host
+    /// allowlist and half the capacity otherwise.
+    #[test]
+    fn the_per_peer_session_cap_defaults_by_allowlist_shape() {
+        let one = PeerAllowlist::parse("172.24.0.3").unwrap();
+        let many = PeerAllowlist::parse("172.24.0.0/24").unwrap();
+        assert_eq!(per_peer_session_cap(None, None, &one, 1024), Ok(0));
+        assert_eq!(per_peer_session_cap(None, None, &many, 1024), Ok(512));
+        assert_eq!(per_peer_session_cap(None, Some(100), &many, 1024), Ok(100));
+        assert_eq!(
+            per_peer_session_cap(Some("7".into()), Some(100), &many, 1024),
+            Ok(7)
+        );
+        assert!(per_peer_session_cap(Some("x".into()), None, &one, 1024).is_err());
+    }
+
+    /// SECURITY (#968 re-review, fail closed): with no allowlist, no SGW-C can
+    /// associate.
+    #[tokio::test]
+    async fn without_an_allowlist_no_sgwc_can_associate() {
+        let (_guard, node, peer) = node_and_peer().await;
+        node.set_allowed_peers(PeerAllowlist::default());
+        let mut assoc = BytesMut::new();
+        PfcpLibMessage::AssociationSetupRequest(AssociationSetupRequest::new(
+            NodeId::new_ipv4([127, 0, 0, 1]),
+            1000,
+        ))
+        .encode_body(&mut assoc);
+        deliver(
+            &node,
+            &peer,
+            &wire(pfcp_msg_type::ASSOCIATION_SETUP_REQUEST, None, 1, &assoc),
+        )
+        .await;
+        let (_, resp) = recv_decoded(&peer).await;
+        assert_eq!(find_cause(&resp), Some(PfcpCause::RequestRejected as u8));
+        assert!(node.peers().await.is_empty());
+    }
+
     async fn node_and_peer() -> (SxaTestGuard, Arc<SxaNode>, UdpSocket) {
         let guard = sxa_test_guard().await;
         sgwu_context_init(1024);
@@ -2564,6 +2815,8 @@ mod tests {
         let node = SxaNode::open("127.0.0.1:0".parse().unwrap(), Ipv4Addr::new(127, 0, 0, 1))
             .await
             .expect("bind Sxa socket");
+        // Fail closed (#968): the tests' SGW-Cs live on 127/8.
+        node.set_allowed_peers(PeerAllowlist::parse("127.0.0.0/8").unwrap());
         let peer = UdpSocket::bind("127.0.0.1:0").await.expect("bind peer");
         (guard, node, peer)
     }

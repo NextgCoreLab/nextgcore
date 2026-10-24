@@ -658,9 +658,8 @@ pub struct PfcpServer {
     /// SMF/SGW-C was never detected: the association and every session stayed
     /// in place indefinitely while traffic blackholed.
     heartbeat: tokio::sync::Mutex<HeartbeatState>,
-    /// The CP-function addresses an Association Setup is accepted from (security,
-    /// #968). Unconfigured (empty) accepts any host, but a live association can then
-    /// be set up again only from one of its own addresses.
+    /// The CP-function hosts an Association Setup is accepted from (security, #968).
+    /// Fail closed: empty refuses every Setup.
     allowed_peers: std::sync::RwLock<PeerAllowlist>,
 }
 
@@ -1343,26 +1342,9 @@ impl PfcpServer {
         // control its sessions, so they are deleted too; retention is defined only
         // for the same Node ID.
         let previous = self.association.read().await.clone();
-        // SECURITY (#968): a Setup replaces or moves a LIVE association only when it comes
-        // from one of that association's own hosts, or from an explicitly allowlisted CP
-        // address. The Node ID cannot decide it: it is a value the sender writes. Without
-        // this, one datagram from any host replaced the association, deleted every
-        // session and locked the real SMF out with cause 72. With no allowlist
-        // configured, a CP function that moved to a new address is accepted once the
-        // old association has gone (heartbeat timeout or Association Release).
-        if let Some(prev) = previous.as_ref() {
-            if !prev.owns(src_addr.ip()) && !allowed.explicitly_permits(src_addr.ip()) {
-                note_refusal(format_args!(
-                    "PFCP Association Setup Request from {src_addr} would take over the live \
-                     association with {}, and {src_addr} is not an allowlisted CP function: \
-                     rejected (cause 64), association and sessions kept",
-                    prev.peer_addr
-                ));
-                return self
-                    .reject_association_setup(header.sequence_number, src_addr)
-                    .await;
-            }
-        }
+        // SECURITY (#968): only an allowlisted CP function got this far (fail closed,
+        // above), so it may replace or move the live association -- the configured
+        // failover. The Node ID never authorises anything: the sender writes it.
         let mut sessions_retained = false;
         if let Some(prev) = previous {
             let same_node = prev.node_id == node_id;
@@ -1389,6 +1371,8 @@ impl PfcpServer {
             }
         }
 
+        // Resolved ONCE, here: a CP whose FQDN later resolves to new addresses must
+        // re-associate for them to count.
         // A CP function identified by an FQDN may send from any address it resolves to
         // (§6.2.6: the association is the Node ID's), and one with an IPv4/IPv6 Node ID
         // from that address. Only addresses the allowlist permits are taken.
@@ -3260,6 +3244,8 @@ mod tests {
                 .await
                 .unwrap(),
         );
+        // The test SMF's host and its Node ID address (fail closed, #968).
+        server.set_allowed_peers(PeerAllowlist::parse("127.0.0.1, 127.0.0.9").unwrap());
         let server_addr = server.socket.local_addr().unwrap();
         let smf_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let srv = server.clone();
@@ -5344,34 +5330,28 @@ mod tests {
         assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
     }
 
-    /// SECURITY (#968 review, BLOCKER 1 without configuration): with NO allowlist, a
-    /// live association still cannot be taken over from a host it does not use, with
-    /// either Node ID. Once the real SMF releases it, a CP function at a new address
-    /// may associate (the unconfigured failover path).
+    /// SECURITY (#968 re-review, fail closed): with NO allowlist configured, no host
+    /// can associate -- not the first one to ask, which used to win and then lock the
+    /// real SMF out -- and so nothing else is served either. `0.0.0.0/0` is the
+    /// explicit lab opt-out.
     #[tokio::test]
-    async fn without_an_allowlist_a_live_association_cannot_be_taken_over() {
+    async fn without_an_allowlist_no_host_can_associate() {
         let (server, smf, upf, _rx) = spawn_test_server().await;
-        associate(&smf, upf, SMF_NODE, 100, None).await;
-        let x = establish(&server, &smf, upf, FIRST_CP_SEID).await;
-
+        server.set_allowed_peers(PeerAllowlist::default());
         let other = UdpSocket::bind("127.0.0.66:0").await.unwrap();
-        for node in [Ipv4Addr::new(127, 0, 0, 66), SMF_NODE] {
+        for sock in [&smf, &other] {
             assert_eq!(
-                setup_cause(&other, upf, node, 7).await,
-                PfcpCause::RequestRejected as u8,
-                "Node ID {node}"
+                setup_cause(sock, upf, SMF_NODE, 7).await,
+                PfcpCause::RequestRejected as u8
             );
         }
-        assert_eq!(held(&server).await.len(), 1, "{x:#x} survives");
+        assert!(!server.is_associated().await);
 
-        // The SMF releases; now a CP function elsewhere may associate.
-        let mut rel = crate::n4_build::PfcpMessageBuilder::new();
-        rel.add_node_id(&NodeId::Ipv4(SMF_NODE));
-        let resp = exchange(&smf, upf, &encode_pfcp(9, None, 11, &rel.build())).await;
-        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        server.set_allowed_peers(PeerAllowlist::parse("0.0.0.0/0").unwrap());
         assert_eq!(
             setup_cause(&other, upf, Ipv4Addr::new(127, 0, 0, 66), 8).await,
-            PfcpCause::RequestAccepted as u8
+            PfcpCause::RequestAccepted as u8,
+            "the explicit any-host opt-out"
         );
     }
 
@@ -5435,6 +5415,7 @@ mod tests {
         assert_eq!(node_id_fqdn(&[0, 127, 0, 0, 1]), None, "not an FQDN");
 
         let (server, _smf, upf, _rx) = spawn_test_server().await;
+        server.set_allowed_peers(PeerAllowlist::parse("127.0.0.1, 127.0.0.2").unwrap());
         let smf = UdpSocket::bind("127.0.0.2:0").await.unwrap();
         let mut b = crate::n4_build::PfcpMessageBuilder::new();
         b.add_tlv(pfcp_ie::NODE_ID, b"\x02\x09localhost");

@@ -76,21 +76,43 @@ impl std::fmt::Display for Prefix {
     }
 }
 
-/// The CP-function source addresses a UP function accepts an Association Setup
-/// Request from.
+/// The CP-function hosts a UP function accepts an Association Setup Request from.
 ///
-/// An EMPTY allowlist is "not configured": [`Self::permits`] then accepts every host,
-/// which is the pre-#968 behaviour kept so an unconfigured lab deployment still comes
-/// up. The NFs log a startup warning for it and add their own restriction on top (a
-/// live association cannot be taken over from an address it does not already use).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// FAIL CLOSED (#968 re-review, operator decision): an EMPTY allowlist permits no
+/// host, so a UP function nobody configured refuses every association rather than
+/// handing its sessions to the first host that asks. A lab opts out explicitly with
+/// `0.0.0.0/0` and/or `::/0`.
+///
+/// Entries are IP addresses, CIDR prefixes, or host names. A host name (a Kubernetes
+/// headless Service, for instance, whose name resolves to the CP pods' current IPs)
+/// is resolved off the receive path by [`Self::resolve_hosts`], which the NF calls
+/// periodically; [`Self::permits`] only reads the last resolution, so a flood of
+/// Setups never turns into a flood of DNS queries. Clones share that resolution.
+#[derive(Debug, Clone, Default)]
 pub struct PeerAllowlist {
     entries: Vec<Prefix>,
+    hosts: Vec<String>,
+    resolved: std::sync::Arc<std::sync::RwLock<Vec<IpAddr>>>,
+}
+
+/// Whether `s` is a syntactically valid DNS host name (RFC 1123 labels).
+fn is_host_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 253
+        && s.trim_end_matches('.').split('.').all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+        // An all-numeric dotted name is a mistyped address, not a host.
+        && !s.split('.').all(|l| l.chars().all(|c| c.is_ascii_digit()))
 }
 
 impl PeerAllowlist {
-    /// Parse a list of `IP` / `IP/len` entries separated by commas and/or whitespace.
-    /// Empty input yields the unconfigured (open) allowlist.
+    /// Parse a list of `IP` / `IP/len` / host-name entries separated by commas and/or
+    /// whitespace. Empty input yields the empty allowlist, which permits no host.
     pub fn parse(list: &str) -> Result<Self, String> {
         Self::from_entries(
             list.split(|c: char| c == ',' || c.is_whitespace())
@@ -98,48 +120,136 @@ impl PeerAllowlist {
         )
     }
 
-    /// Build from individual `IP` / `IP/len` entries.
+    /// Build from individual `IP` / `IP/len` / host-name entries.
     pub fn from_entries<I, S>(entries: I) -> Result<Self, String>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let entries = entries
-            .into_iter()
-            .map(|s| Prefix::parse(s.as_ref().trim()))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { entries })
+        let mut out = Self::default();
+        for e in entries {
+            let e = e.as_ref().trim();
+            if e.is_empty() {
+                continue;
+            }
+            match Prefix::parse(e) {
+                Ok(p) => out.entries.push(p),
+                Err(_) if !e.contains('/') && is_host_name(e) => out.hosts.push(e.to_string()),
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(out)
     }
 
-    /// Whether any entry is configured. `false` means every host is permitted.
+    /// Whether any entry is configured. `false` means NO host is permitted.
     pub fn is_configured(&self) -> bool {
-        !self.entries.is_empty()
+        !self.entries.is_empty() || !self.hosts.is_empty()
     }
 
-    /// Whether `ip` may associate: it is inside a configured entry, or nothing is
-    /// configured.
+    /// Whether `ip` may associate: it is inside a configured prefix, or is a current
+    /// address of a configured host name. Never true for an empty allowlist.
     pub fn permits(&self, ip: IpAddr) -> bool {
-        !self.is_configured() || self.entries.iter().any(|p| p.contains(ip))
+        let ip = ip.to_canonical();
+        self.entries.iter().any(|p| p.contains(ip))
+            || self
+                .resolved
+                .read()
+                .map(|r| r.contains(&ip))
+                .unwrap_or(false)
     }
 
-    /// Whether `ip` is inside a configured entry. Unlike [`Self::permits`], `false`
-    /// when nothing is configured: used where an explicit authorisation is required
-    /// (moving a live association to a new address).
-    pub fn explicitly_permits(&self, ip: IpAddr) -> bool {
-        self.entries.iter().any(|p| p.contains(ip))
+    /// The configured host names (resolved by [`Self::resolve_hosts`]).
+    pub fn hosts(&self) -> &[String] {
+        &self.hosts
+    }
+
+    /// Whether this allowlist can admit at most ONE host: a single full-length
+    /// address. A prefix, several entries or a host name may admit several CP
+    /// functions, which then compete for the UP function's session capacity.
+    pub fn admits_a_single_host(&self) -> bool {
+        self.hosts.is_empty()
+            && self.entries.len() == 1
+            && self.entries[0].len
+                == if self.entries[0].addr.is_ipv4() {
+                    32
+                } else {
+                    128
+                }
+    }
+
+    /// Resolve the configured host names now (blocking: call it off the PFCP receive
+    /// path, e.g. from a refresh thread) and publish the result to every clone. A
+    /// name that does not resolve contributes nothing; a lookup failure keeps the
+    /// previous addresses of that run's other names only. Returns the addresses.
+    pub fn resolve_hosts(&self) -> Vec<IpAddr> {
+        use std::net::ToSocketAddrs;
+        let mut ips: Vec<IpAddr> = Vec::new();
+        for h in &self.hosts {
+            match (h.as_str(), 0u16).to_socket_addrs() {
+                Ok(addrs) => {
+                    for a in addrs {
+                        let ip = a.ip().to_canonical();
+                        if !ips.contains(&ip) {
+                            ips.push(ip);
+                        }
+                    }
+                }
+                Err(e) => log::warn!("PFCP allowed peer '{h}' does not resolve: {e}"),
+            }
+        }
+        if let Ok(mut r) = self.resolved.write() {
+            *r = ips.clone();
+        }
+        ips
+    }
+
+    /// Spawn a thread that re-resolves the host names every `interval` (#968): a CP
+    /// pod that restarts at a new IP is admitted within one interval. Resolves once
+    /// before returning, so the first Setup after startup is already judged against
+    /// real addresses. Does nothing when no host name is configured.
+    pub fn spawn_host_refresh(&self, interval: Duration) {
+        if self.hosts.is_empty() {
+            return;
+        }
+        let first = self.resolve_hosts();
+        log::info!(
+            "PFCP allowed peer names {:?} resolve to {first:?}",
+            self.hosts
+        );
+        let me = self.clone();
+        let _ = std::thread::Builder::new()
+            .name("pfcp-peer-dns".into())
+            .spawn(move || loop {
+                std::thread::sleep(interval);
+                me.resolve_hosts();
+            });
+    }
+
+    #[cfg(test)]
+    fn set_resolved(&self, ips: Vec<IpAddr>) {
+        *self.resolved.write().unwrap() = ips;
     }
 }
 
 impl std::fmt::Display for PeerAllowlist {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.entries.is_empty() {
-            return f.write_str("<any host>");
+        if !self.is_configured() {
+            return f.write_str("<none: every Association Setup is refused>");
         }
-        for (i, p) in self.entries.iter().enumerate() {
-            if i > 0 {
+        let mut first = true;
+        for p in &self.entries {
+            if !first {
                 f.write_str(", ")?;
             }
+            first = false;
             write!(f, "{p}")?;
+        }
+        for h in &self.hosts {
+            if !first {
+                f.write_str(", ")?;
+            }
+            first = false;
+            f.write_str(h)?;
         }
         Ok(())
     }
@@ -242,19 +352,48 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_allowlist_permits_everyone_but_explicitly_no_one() {
+    fn an_empty_allowlist_permits_no_one_and_any_is_explicit() {
         let a = PeerAllowlist::parse(" ").unwrap();
         assert!(!a.is_configured());
-        assert!(a.permits(ip("192.0.2.1")));
-        assert!(!a.explicitly_permits(ip("192.0.2.1")));
-        let b = PeerAllowlist::parse("0.0.0.0/0").unwrap();
-        assert!(b.explicitly_permits(ip("192.0.2.1")));
-        assert!(!b.explicitly_permits(ip("2001:db8::1")));
+        assert!(!a.permits(ip("192.0.2.1")), "fail closed");
+        assert!(!a.permits(ip("::1")));
+        let any = PeerAllowlist::parse("0.0.0.0/0, ::/0").unwrap();
+        assert!(any.permits(ip("192.0.2.1")));
+        assert!(any.permits(ip("2001:db8::1")));
+        assert!(!any.admits_a_single_host());
+        assert!(PeerAllowlist::parse("172.23.0.4")
+            .unwrap()
+            .admits_a_single_host());
+        assert!(!PeerAllowlist::parse("172.23.0.0/24")
+            .unwrap()
+            .admits_a_single_host());
+    }
+
+    #[test]
+    fn host_names_are_matched_on_their_last_resolution() {
+        let a = PeerAllowlist::parse("smf-pfcp.nextg-system.svc.cluster.local").unwrap();
+        assert!(a.is_configured());
+        assert_eq!(a.hosts(), ["smf-pfcp.nextg-system.svc.cluster.local"]);
+        assert!(!a.admits_a_single_host());
+        assert!(!a.permits(ip("10.1.2.3")), "nothing resolved yet");
+        let clone = a.clone();
+        a.set_resolved(vec![ip("10.1.2.3")]);
+        assert!(clone.permits(ip("10.1.2.3")), "clones share the resolution");
+        assert!(!clone.permits(ip("10.1.2.4")));
+
+        let local = PeerAllowlist::parse("localhost").unwrap();
+        local.resolve_hosts();
+        assert!(local.permits(ip("127.0.0.1")), "localhost resolves");
     }
 
     #[test]
     fn bad_entries_are_refused() {
-        assert!(PeerAllowlist::parse("smf.local").is_err());
+        assert!(
+            PeerAllowlist::parse("10.0.0.300").is_err(),
+            "not an address, not a name"
+        );
+        assert!(PeerAllowlist::parse("smf/24").is_err());
+        assert!(PeerAllowlist::parse("bad_name").is_err());
         assert!(PeerAllowlist::parse("10.0.0.0/33").is_err());
         assert!(PeerAllowlist::parse("::/129").is_err());
         assert!(PeerAllowlist::parse("10.0.0.0/x").is_err());

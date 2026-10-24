@@ -21,6 +21,28 @@ spec:
       port: 9090
       targetPort: 9090
 ---
+# #968/#983: the name the UPF's PFCP peer allowlist resolves. Headless, so it
+# resolves to the SMF pod's own IP (its PFCP source address), not a ClusterIP;
+# publishNotReadyAddresses so the SMF can associate before it is Ready.
+apiVersion: v1
+kind: Service
+metadata:
+  name: smf-pfcp
+  namespace: nextg-system
+  labels:
+    app.kubernetes.io/name: smf
+    app.kubernetes.io/part-of: nextgcore
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: smf
+  ports:
+    - name: pfcp
+      port: 8805
+      targetPort: 8805
+      protocol: UDP
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:

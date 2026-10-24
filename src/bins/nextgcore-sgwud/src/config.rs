@@ -27,8 +27,10 @@ struct ServerList {
 #[derive(Debug, Default, Deserialize)]
 struct PfcpSection {
     server: Option<Vec<AddrEntry>>,
-    /// The SGW-C addresses (IPs or CIDR prefixes) allowed to associate (#968).
+    /// The SGW-C addresses (IPs, CIDR prefixes or host names) allowed to associate.
     allowed_peers: Option<Vec<String>>,
+    /// The most sessions one SGW-C may hold (#968).
+    max_sessions_per_peer: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -57,10 +59,12 @@ pub struct SgwuConfig {
     pub gtpu_ip: Option<Ipv4Addr>,
     /// `logger.level`: the default log filter when `RUST_LOG` is unset (#500).
     pub log_level: Option<String>,
-    /// `sgwu.pfcp.allowed_peers`: the SGW-C addresses (IPs or CIDR prefixes) an
-    /// Association Setup is accepted from (security, #968), as written. Parsed by
+    /// `sgwu.pfcp.allowed_peers`: the SGW-C addresses (IPs, CIDR prefixes or host
+    /// names) an Association Setup is accepted from (security, #968), as written. Parsed by
     /// `pfcp_open`, which refuses to start on a bad entry.
     pub pfcp_allowed_peers: Vec<String>,
+    /// `sgwu.pfcp.max_sessions_per_peer`: the per-SGW-C session cap (#968).
+    pub pfcp_max_sessions_per_peer: Option<usize>,
 }
 
 static CONFIG: OnceLock<SgwuConfig> = OnceLock::new();
@@ -164,6 +168,7 @@ fn parse(content: &str) -> Result<SgwuConfig, serde_yaml::Error> {
         gtpu_ip: first_ipv4(section.gtpu, "gtpu"),
         log_level: yaml.logger.and_then(|l| l.level),
         pfcp_allowed_peers: pfcp.allowed_peers.unwrap_or_default(),
+        pfcp_max_sessions_per_peer: pfcp.max_sessions_per_peer,
     })
 }
 
@@ -204,11 +209,12 @@ mod tests {
     fn the_pfcp_allowed_peers_are_read() {
         let config = parse(
             "sgwu:\n  pfcp:\n    server:\n      - address: 172.24.0.6\n    allowed_peers:\n      \
-             - 172.24.0.5\n      - 10.0.0.0/8\n",
+             - 172.24.0.5\n      - 10.0.0.0/8\n    max_sessions_per_peer: 300\n",
         )
         .unwrap();
         assert_eq!(config.pfcp_ip, Some(Ipv4Addr::new(172, 24, 0, 6)));
         assert_eq!(config.pfcp_allowed_peers, vec!["172.24.0.5", "10.0.0.0/8"]);
+        assert_eq!(config.pfcp_max_sessions_per_peer, Some(300));
     }
 
     /// #500: with no RUST_LOG, sgwud starts at `--log-level`, else the file's

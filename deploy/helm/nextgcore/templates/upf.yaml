@@ -162,6 +162,10 @@ spec:
                   fieldPath: status.podIP
             - name: UPF_ALLOW_NO_DATAPLANE
               value: "{{ not .Values.upf.dataPlane.enabled }}"
+            # #968/#983: the CP functions allowed to set up the N4 association. The
+            # UPF fails closed without it. Default: the SMF's headless PFCP Service.
+            - name: UPF_PFCP_ALLOWED_PEERS
+              value: {{ .Values.upf.pfcpAllowedPeers | default (printf "%s-smf-pfcp.%s.svc.cluster.local" .Release.Name .Release.Namespace) | quote }}
           {{- if .Values.upf.dataPlane.enabled }}
           securityContext:
             privileged: true

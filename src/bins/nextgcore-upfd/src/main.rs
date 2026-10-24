@@ -103,12 +103,12 @@ struct Args {
     #[arg(long, default_value = "8805")]
     pfcp_port: u16,
 
-    /// CP functions (SMF / PGW-C) allowed to set up a PFCP association: IP addresses
-    /// and CIDR prefixes, comma-separated (e.g. `172.23.0.4` or `10.0.0.0/8`). Only
-    /// the source IP is compared, never the port. A listed host may also replace or
-    /// move a live association (CP failover to a new address). Unset: any host may
-    /// associate while no association is up (insecure; logged at startup), and a
-    /// live association can be set up again only from its own addresses. Security,
+    /// CP functions (SMF / PGW-C) allowed to set up a PFCP association: IP addresses,
+    /// CIDR prefixes or host names, comma-separated (e.g. `172.23.0.4`, `10.0.0.0/8`,
+    /// `smf-pfcp.nextg-system.svc.cluster.local`; names are re-resolved every 10 s).
+    /// Only the source IP is compared, never the port. A listed host may also replace
+    /// or move a live association (CP failover). FAIL CLOSED: unset refuses every
+    /// Association Setup; `0.0.0.0/0` / `::/0` admit any host (labs only). Security,
     /// TS 29.244 §6.2.6 / TS 33.501 §9.9. `UPF_PFCP_ALLOWED_PEERS` is read when this
     /// flag is not given.
     #[arg(long, default_value = "")]
@@ -388,11 +388,14 @@ async fn main() -> Result<()> {
     if allowed_peers.is_configured() {
         log::info!("PFCP associations accepted only from: {allowed_peers}");
     } else {
-        log::warn!(
-            "--pfcp-allowed-peers is not set: ANY host that reaches {pfcp_addr} may set up \
-             the PFCP association while none is up. Set it to the SMF/PGW-C address(es)."
+        log::error!(
+            "--pfcp-allowed-peers / UPF_PFCP_ALLOWED_PEERS is not set: EVERY PFCP \
+             Association Setup will be refused, so no SMF can use this UPF. Set it to the \
+             SMF/PGW-C address(es), CIDR or host name (0.0.0.0/0 admits any host)."
         );
     }
+    // Host-name entries are re-resolved off the receive path (#968).
+    allowed_peers.spawn_host_refresh(std::time::Duration::from_secs(10));
     pfcp_server.set_allowed_peers(allowed_peers);
     let pfcp_server = Arc::new(pfcp_server);
 
@@ -1463,7 +1466,12 @@ mod tests {
         assert!(a.permits("192.0.2.1".parse().unwrap()));
         assert!(!a.permits("192.0.2.2".parse().unwrap()));
         assert!(!allowed_peers_setting("", None).unwrap().is_configured());
-        assert!(allowed_peers_setting("smf.example", None).is_err());
+        assert!(allowed_peers_setting("10.0.0.0/33", None).is_err());
+        assert_eq!(
+            allowed_peers_setting("smf.example", None).unwrap().hosts(),
+            ["smf.example"],
+            "a host name is an entry"
+        );
     }
 
     #[test]

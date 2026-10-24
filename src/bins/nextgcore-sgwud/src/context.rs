@@ -821,7 +821,33 @@ impl SgwuContext {
         cp_f_seid: &FSeid,
         pfcp_node_id: Option<u64>,
     ) -> Option<SgwuSess> {
+        self.sess_add_for_node_capped(cp_f_seid, pfcp_node_id, 0)
+    }
+
+    /// [`Self::sess_add_for_node`], refusing (`None`) when the node already holds
+    /// `per_node_cap` sessions (#968 re-review: one CP peer cannot take every session
+    /// slot from the others). `0` means no per-node cap. Checked under the same write
+    /// lock that adds the session, so concurrent adds cannot overshoot it.
+    pub fn sess_add_for_node_capped(
+        &self,
+        cp_f_seid: &FSeid,
+        pfcp_node_id: Option<u64>,
+        per_node_cap: usize,
+    ) -> Option<SgwuSess> {
         let mut sess_list = self.sess_list.write().ok()?;
+        if let (Some(node), true) = (pfcp_node_id, per_node_cap > 0) {
+            let held = sess_list
+                .values()
+                .filter(|s| s.pfcp_node_id == Some(node))
+                .count();
+            if held >= per_node_cap {
+                log::warn!(
+                    "PFCP node {node} already holds {held} session(s), its cap: no session \
+                     added"
+                );
+                return None;
+            }
+        }
         let mut sgwu_sxa_seid_hash = self.sgwu_sxa_seid_hash.write().ok()?;
         let mut sgwc_sxa_seid_hash = self.sgwc_sxa_seid_hash.write().ok()?;
         let mut sgwc_sxa_f_seid_hash = self.sgwc_sxa_f_seid_hash.write().ok()?;
@@ -970,6 +996,11 @@ impl SgwuContext {
     pub fn sess_find_by_id(&self, id: u64) -> Option<SgwuSess> {
         let sess_list = self.sess_list.read().ok()?;
         sess_list.get(&id).cloned()
+    }
+
+    /// The configured session capacity (0 = unlimited).
+    pub fn sess_capacity(&self) -> usize {
+        self.max_num_of_sess
     }
 
     /// Get session count
