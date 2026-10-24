@@ -1639,6 +1639,8 @@ impl DataPlaneUrr {
     }
 
     fn rebase_volume_quota_to_ongoing(&self) {
+        // #902: under the meter lock, which `record` holds for its counter updates.
+        let _meter = self.meter.lock().unwrap();
         for (dst, src) in [
             (&self.quota_used_total, &self.acc_total_bytes),
             (&self.quota_used_ul, &self.acc_ul_bytes),
@@ -1655,6 +1657,8 @@ impl DataPlaneUrr {
 
     /// The same for a newly received volume threshold.
     fn rebase_volume_threshold_to_ongoing(&self) {
+        // #902: under the meter lock, which `record` holds for its counter updates.
+        let _meter = self.meter.lock().unwrap();
         for (dst, src) in [
             (&self.thr_used_total, &self.acc_total_bytes),
             (&self.thr_used_ul, &self.acc_ul_bytes),
@@ -1885,6 +1889,12 @@ impl DataPlaneUrr {
         if self.quota_exhausted.load(Ordering::Relaxed) {
             return UrrOutcome::QuotaAlreadyExhausted;
         }
+        // #902: every counter of this packet is updated under the meter lock (already
+        // taken per packet for the time measurement), so a quota/threshold re-base --
+        // which copies the ongoing counts under the same lock -- can never overwrite a
+        // concurrent packet's add. Released before any limit is evaluated: those
+        // evaluations take the lock themselves.
+        let mut meter = self.meter.lock().unwrap();
         self.acc_total_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.acc_total_pkts.fetch_add(1, Ordering::Relaxed);
         // #842 review: the quota and the thresholds are measured on their OWN counters,
@@ -1931,6 +1941,9 @@ impl DataPlaneUrr {
             )
         };
 
+        meter.on_packet(std::time::Instant::now());
+        drop(meter);
+
         // Track first packet time. Before the early returns below, so the time of the
         // first packet is recorded even for a session whose very first packet crosses
         // something -- a usage report with no Time of First Packet is a report the CP
@@ -1941,10 +1954,6 @@ impl DataPlaneUrr {
                 *fpt = Some(std::time::Instant::now());
             }
         }
-        self.meter
-            .lock()
-            .unwrap()
-            .on_packet(std::time::Instant::now());
 
         // ---- Volume quotas: per direction, then total (§8.2.40) ----
         let volume_quota_hit = dir_quota.is_some_and(|q| directional >= q)
@@ -7015,6 +7024,81 @@ mod tests {
         assert_eq!(next.start, lost.start);
         assert_eq!(next.duration.map(|d| d.as_secs()), Some(7));
         assert_eq!(next.first_pkt, lost.first_pkt);
+    }
+
+    /// #902, deterministically: a re-base waits for a packet that is mid-record. The
+    /// test plays the recorder -- holding the meter lock between the quota add and the
+    /// ongoing add, exactly where `record` holds it -- while a re-grant runs on another
+    /// thread. The re-grant must wait for the lock and then copy the COMPLETE ongoing
+    /// count; without the lock it copied the count from between the two adds and the
+    /// packet was lost from the quota for good.
+    #[test]
+    fn a_re_base_waits_for_a_packet_that_is_being_recorded() {
+        let urr = Arc::new(DataPlaneUrr::new(1));
+        urr.set_quotas(Some(1_000_000), None, None, None);
+        let meter = urr.meter.lock().unwrap();
+        urr.quota_used_total.fetch_add(500, Ordering::SeqCst);
+        let regrant = {
+            let urr = Arc::clone(&urr);
+            on_thread("regrant", move || {
+                urr.update_quotas(Some(2_000_000), None, None, None)
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        urr.acc_total_bytes.fetch_add(500, Ordering::SeqCst);
+        drop(meter);
+        regrant
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the re-grant completes once the packet is recorded");
+        assert_eq!(
+            urr.quota_used_total.load(Ordering::SeqCst),
+            500,
+            "the packet in flight counts against the new quota"
+        );
+    }
+
+    /// #902: re-basing a quota/threshold to the ongoing counts while packets are being
+    /// recorded loses none of them. A recorder records 200 000 packets while another
+    /// thread re-grants the quota and re-sets the threshold over and over; with no
+    /// report in between, the quota and threshold counts must end EXACTLY equal to the
+    /// ongoing count. Before, `store(acc.load())` overwrote concurrent adds.
+    #[test]
+    fn re_basing_while_packets_are_recorded_loses_no_bytes() {
+        let urr = Arc::new(DataPlaneUrr::new(1));
+        urr.set_quotas(Some(u64::MAX / 2), None, None, None);
+        urr.set_reporting(Some(u64::MAX / 2), None, None, None, None);
+        let done = Arc::new(AtomicBool::new(false));
+        let rebaser = {
+            let (urr, done) = (Arc::clone(&urr), Arc::clone(&done));
+            on_thread("rebaser", move || {
+                let mut n = 0u64;
+                while !done.load(Ordering::SeqCst) {
+                    urr.update_quotas(Some(u64::MAX / 2 - (n % 2)), None, None, None);
+                    urr.update_reporting(Some(u64::MAX / 2 - (n % 2)), None, None, None, None);
+                    n += 1;
+                }
+                n
+            })
+        };
+        for i in 0..200_000u64 {
+            urr.record(1 + (i % 7), i % 2 == 0);
+        }
+        done.store(true, Ordering::SeqCst);
+        let rounds = rebaser
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("rebaser stops");
+        assert!(rounds > 10, "the race was exercised: {rounds}");
+        let ongoing = urr.acc_total_bytes.load(Ordering::SeqCst);
+        assert_eq!(
+            urr.quota_used_total.load(Ordering::SeqCst),
+            ongoing,
+            "quota count"
+        );
+        assert_eq!(
+            urr.thr_used_total.load(Ordering::SeqCst),
+            ongoing,
+            "threshold count"
+        );
     }
 
     /// #842 review (decision): a packet dropped because the quota is ALREADY exhausted

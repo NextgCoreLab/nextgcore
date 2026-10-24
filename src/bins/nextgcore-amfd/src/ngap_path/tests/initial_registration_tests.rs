@@ -54,13 +54,12 @@ async fn confirming_ausf(auth_result: &str, supi: &str) -> (nextgcore_sbi::serve
 }
 
 /// Points the AMF's AUSF calls at `port` while held.
-struct AusfEnvGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+struct AusfEnvGuard(#[allow(dead_code)] tokio::sync::MutexGuard<'static, ()>);
 
 impl AusfEnvGuard {
-    fn set(port: u16) -> Self {
-        let guard = crate::test_support::AUSF_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+    /// Async: the lock is a tokio mutex (#643), held across the test's awaits.
+    async fn acquire(port: u16) -> Self {
+        let guard = crate::test_support::AUSF_ENV_LOCK.lock().await;
         std::env::set_var("AUSF_SBI_ADDR", "127.0.0.1");
         std::env::set_var("AUSF_SBI_PORT", port.to_string());
         Self(guard)
@@ -180,7 +179,7 @@ async fn an_initial_registration_releases_the_sessions_of_the_earlier_registrati
     let (_smf, smf_port, seen) = activating_smf().await;
     let supi = "imsi-001010000774001";
     let (_ausf, ausf_port) = confirming_ausf("AUTHENTICATION_SUCCESS", supi).await;
-    let _env = AusfEnvGuard::set(ausf_port);
+    let _env = AusfEnvGuard::acquire(ausf_port).await;
     let mut server = capturing_ngap_server().await;
     let (old, new) = (7_774_001u64, 7_774_002u64);
     earlier_registration(
@@ -240,7 +239,7 @@ async fn a_connected_earlier_registration_also_gets_its_n2_connection_released()
     let (_smf, smf_port, seen) = activating_smf().await;
     let supi = "imsi-001010000774002";
     let (_ausf, ausf_port) = confirming_ausf("AUTHENTICATION_SUCCESS", supi).await;
-    let _env = AusfEnvGuard::set(ausf_port);
+    let _env = AusfEnvGuard::acquire(ausf_port).await;
     let mut server = capturing_ngap_server().await;
     let (old, new) = (7_774_011u64, 7_774_012u64);
     earlier_registration(
@@ -285,7 +284,7 @@ async fn a_reused_ran_ue_ngap_id_is_not_released() {
     let (_smf, smf_port, seen) = activating_smf().await;
     let supi = "imsi-001010000774003";
     let (_ausf, ausf_port) = confirming_ausf("AUTHENTICATION_SUCCESS", supi).await;
-    let _env = AusfEnvGuard::set(ausf_port);
+    let _env = AusfEnvGuard::acquire(ausf_port).await;
     let mut server = capturing_ngap_server().await;
     let (old, new) = (7_774_021u64, 7_774_022u64);
     earlier_registration(
@@ -324,7 +323,7 @@ async fn a_failed_authentication_keeps_the_earlier_registration() {
     let (_smf, smf_port, seen) = activating_smf().await;
     let supi = "imsi-001010000774004";
     let (_ausf, ausf_port) = confirming_ausf("AUTHENTICATION_FAILURE", supi).await;
-    let _env = AusfEnvGuard::set(ausf_port);
+    let _env = AusfEnvGuard::acquire(ausf_port).await;
     let mut server = capturing_ngap_server().await;
     let (old, new) = (7_774_031u64, 7_774_032u64);
     earlier_registration(&mut server, old, 71, supi, true, &[(1, "774-f1")], smf_port);
@@ -353,7 +352,7 @@ async fn a_mobility_registration_does_not_release_the_earlier_sessions() {
     let (_smf, smf_port, seen) = activating_smf().await;
     let supi = "imsi-001010000774005";
     let (_ausf, ausf_port) = confirming_ausf("AUTHENTICATION_SUCCESS", supi).await;
-    let _env = AusfEnvGuard::set(ausf_port);
+    let _env = AusfEnvGuard::acquire(ausf_port).await;
     let mut server = capturing_ngap_server().await;
     let (old, new) = (7_774_041u64, 7_774_042u64);
     earlier_registration(&mut server, old, 81, supi, true, &[(1, "774-m1")], smf_port);
@@ -384,7 +383,7 @@ async fn sessions_carried_into_the_initial_registration_are_released() {
     let (_smf, smf_port, seen) = activating_smf().await;
     let supi = "imsi-001010000774006";
     let (_ausf, ausf_port) = confirming_ausf("AUTHENTICATION_SUCCESS", supi).await;
-    let _env = AusfEnvGuard::set(ausf_port);
+    let _env = AusfEnvGuard::acquire(ausf_port).await;
     let mut server = capturing_ngap_server().await;
     let ue = 7_774_051u64;
     authenticating_ue(
@@ -443,11 +442,11 @@ fn sent_downlink_nas(server: &mut NgapServer) -> bool {
 #[allow(clippy::await_holding_lock)]
 async fn a_blackholed_smf_holds_neither_the_registration_nor_the_new_sessions_for_long() {
     let (_smf, smf_port, seen) = activating_smf().await;
-    let _smf_env = super::SmfEnvGuard::set(smf_port);
+    let _smf_env = super::SmfEnvGuard::acquire(smf_port).await;
     let (_blackhole, blackhole_port) = hanging_smf();
     let supi = "imsi-001010000774007";
     let (_ausf, ausf_port) = confirming_ausf("AUTHENTICATION_SUCCESS", supi).await;
-    let _env = AusfEnvGuard::set(ausf_port);
+    let _env = AusfEnvGuard::acquire(ausf_port).await;
     let mut server = capturing_ngap_server().await;
     server.supersede_barrier_max = Duration::from_millis(400);
     let (old, new) = (7_774_061u64, 7_774_062u64);
@@ -522,10 +521,10 @@ async fn a_blackholed_smf_holds_neither_the_registration_nor_the_new_sessions_fo
 #[allow(clippy::await_holding_lock)]
 async fn the_new_establishments_reach_the_smf_after_the_earlier_releases() {
     let (_smf, smf_port, seen) = activating_smf().await;
-    let _smf_env = super::SmfEnvGuard::set(smf_port);
+    let _smf_env = super::SmfEnvGuard::acquire(smf_port).await;
     let supi = "imsi-001010000774008";
     let (_ausf, ausf_port) = confirming_ausf("AUTHENTICATION_SUCCESS", supi).await;
-    let _env = AusfEnvGuard::set(ausf_port);
+    let _env = AusfEnvGuard::acquire(ausf_port).await;
     let mut server = capturing_ngap_server().await;
     let (old, new) = (7_774_071u64, 7_774_072u64);
     earlier_registration(

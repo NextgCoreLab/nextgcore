@@ -49,29 +49,40 @@ pub use namf_server::{handle_n1_n2_message_transfer_request, namf_request_handle
 /// boundaries; a dev-dependency test in a peer crate must be able to seed the
 /// process-global AMF context.
 pub mod test_support {
-    use std::sync::Mutex;
+    // tokio mutexes (#643): the async tests hold these across `.await`, which a
+    // std guard must not do (`clippy::await_holding_lock`). Sync tests take them
+    // with `blocking_lock()`, async ones with `.lock().await`; a tokio mutex
+    // does not poison, so no test inherits a sibling's panic.
+    use tokio::sync::Mutex;
 
     /// Process-wide lock so strict-peer tests that touch the global AMF context
     /// run serially. The AMF context is process-global, so parallel tests would
     /// race (cf. the known-flaky `namf_server::tests::
     /// test_ue_context_transfer_error_paths`).
-    pub static CONTEXT_GUARD: Mutex<()> = Mutex::new(());
+    pub static CONTEXT_GUARD: Mutex<()> = Mutex::const_new(());
 
     /// Serialises tests that set the SMF endpoint environment variables
     /// (`SMF_SBI_ADDR` / `SMF_SBI_PORT`). The process environment is global, so the
     /// lock lives here beside the other shared-state guards rather than in one
     /// module's `mod tests`.
-    pub static SMF_ENV_LOCK: Mutex<()> = Mutex::new(());
+    pub static SMF_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    /// Serialises tests that drain the process-global connected-UE downlink queue
+    /// (`AmfContext::connected_downlink_queue`, drained by
+    /// `NgapServer::process_connected_downlinks`). A drain takes EVERY queued item,
+    /// so two such tests in parallel steal each other's transfers. A tokio mutex,
+    /// because the guard is held across the drain's `.await`s.
+    pub static CONNECTED_DOWNLINK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// Serialises tests that set the AUSF endpoint environment variables
     /// (`AUSF_SBI_ADDR` / `AUSF_SBI_PORT`), for the same reason as
     /// [`SMF_ENV_LOCK`].
-    pub static AUSF_ENV_LOCK: Mutex<()> = Mutex::new(());
+    pub static AUSF_ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
     /// Serialises tests that set the UCMF endpoint environment variables
     /// (`UCMF_SBI_ADDR` / `UCMF_SBI_PORT`), for the same reason as
     /// [`SMF_ENV_LOCK`].
-    pub static UCMF_ENV_LOCK: Mutex<()> = Mutex::new(());
+    pub static UCMF_ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
     /// Initialize the process-global AMF context for in-process strict-peer
     /// tests (wraps [`crate::context::amf_context_init`] with test capacities).
@@ -1201,11 +1212,9 @@ mod tests {
         // The posture is process-global; take the lock declared beside it in `emergency.rs`,
         // which also resets it to the shipped default so this test is not reading a
         // predecessor's value.
-        let _policy = crate::emergency::emergency_policy_test_guard();
+        let _policy = crate::emergency::emergency_policy_test_guard().await;
         // ...and the context guard, because `load_config` writes the global AmfContext too.
-        let _ctx = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         // The env override outranks the YAML, so it must be clear for the YAML to be what is
         // under test here. Its precedence is covered by `EmergencyPolicy::resolve`'s own test.
         std::env::remove_var("AMF_EMERGENCY_ALLOW_UNAUTHENTICATED");
@@ -1320,9 +1329,7 @@ amf:
         // dance cannot defend against that on its own, so hold the one lock that
         // serialises global-context tests. Observed as roughly 1 workspace run in 4
         // once #341 gave `fini` more state to clear.
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
 
         // The loader PUSHES onto these vectors, so the restore truncates to the saved
         // lengths rather than cloning the elements.

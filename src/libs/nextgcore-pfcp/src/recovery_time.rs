@@ -65,8 +65,49 @@ pub fn normalize(stamp: u32, now_ntp: u32) -> u32 {
 }
 
 /// [`normalize`] against the local clock.
+///
+/// Transitional (#995): the Unix reading exists only for pre-#995 nextgcore peers and
+/// durable state. Tracked for removal in #1033 once mixed-version deployments are gone,
+/// because it also re-reads a third-party NTP stamp when a clock is ~34 years off.
 pub fn normalize_received(stamp: u32) -> u32 {
     normalize(stamp, now())
+}
+
+/// How far ahead of our clock a peer's start time may plausibly be (clock skew).
+pub const FUTURE_SKEW_SECS: u32 = 86_400;
+
+/// Whether `stamp`, a start time, lies more than [`FUTURE_SKEW_SECS`] in the future
+/// of `now_ntp` (#1004 review). A start time cannot be in the future: such a stamp
+/// came from a clock that was wrong (an RTC-less peer that booted at 1970, its stamp
+/// then read in the Unix branch, ~2040), and an ordering judged against it is
+/// meaningless.
+pub fn is_in_the_future(stamp: u32, now_ntp: u32) -> bool {
+    is_newer(stamp, now_ntp.wrapping_add(FUTURE_SKEW_SECS))
+}
+
+/// 2020-01-01T00:00:00Z: a local clock before this has not been set.
+pub const PLAUSIBLE_CLOCK_UNIX: u64 = 1_577_836_800;
+
+/// Refuse to run PFCP with an unset local clock (#1004 review): its Recovery Time
+/// Stamp would read as ~1970, which peers misjudge (and [`normalize`] reads the other
+/// way). The classic RTC-unset check.
+pub fn check_local_clock() -> Result<(), String> {
+    let unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    check_clock(unix)
+}
+
+fn check_clock(unix: u64) -> Result<(), String> {
+    if unix < PLAUSIBLE_CLOCK_UNIX {
+        return Err(format!(
+            "the local clock reads {unix} s after 1970, before 2020-01-01: it is not set. \
+             A PFCP Recovery Time Stamp taken from it (TS 29.244 §8.2.65) would be wrong; \
+             set the clock (NTP) before starting this NF"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -124,6 +165,26 @@ mod tests {
             assert_eq!(normalize(ntp, now), ntp);
             assert_eq!(normalize(started as u32, now), ntp);
         }
+    }
+
+    #[test]
+    fn a_start_time_in_the_future_is_flagged() {
+        let now = from_unix_secs(1_767_225_600);
+        assert!(!is_in_the_future(now, now));
+        assert!(!is_in_the_future(now.wrapping_add(3600), now), "skew");
+        assert!(
+            is_in_the_future(now.wrapping_add(86_400 * 365 * 14), now),
+            "~2040"
+        );
+        assert!(!is_in_the_future(now.wrapping_sub(86_400 * 365), now));
+    }
+
+    #[test]
+    fn an_unset_clock_is_refused() {
+        assert!(check_clock(0).is_err(), "1970");
+        assert!(check_clock(PLAUSIBLE_CLOCK_UNIX - 1).is_err());
+        assert!(check_clock(PLAUSIBLE_CLOCK_UNIX).is_ok());
+        assert!(check_local_clock().is_ok(), "this host's clock is set");
     }
 
     /// Why normalization is needed: across the change the two readings are more than
