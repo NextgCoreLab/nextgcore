@@ -34,6 +34,8 @@ p256 = { workspace = true, features = ["ecdsa"] }
 
 [dev-dependencies]
 proptest.workspace = true
+# The capturing logger for log-content tests (#1026).
+nextgcore-core = { workspace = true, features = ["test-log"] }
 # Issue #393: build a real CA and a real leaf over a CCA signing key, so the x5c
 # binding tests exercise interoperable X.509 rather than a byte fixture of my own
 # making. Test-only: no production path in nrfd generates a certificate.

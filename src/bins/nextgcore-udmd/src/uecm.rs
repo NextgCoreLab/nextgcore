@@ -1319,7 +1319,7 @@ mod tests {
     /// Revert-verified: logging `old_uri` whole fails this test.
     #[tokio::test]
     async fn the_old_amfs_dereg_callback_token_is_not_logged() {
-        crate::test_log::init();
+        nextgcore_core::test_log::init();
         let supi = "imsi-001010000000789";
         let token = "tok-789-do-not-log";
         let prior = json!({
@@ -1332,7 +1332,7 @@ mod tests {
         let client = UdrClient::Mock(mock.clone());
         notify_old_amf_if_changed(supi, &prior, &new, &client, UecmAccess::ThreeGpp).await;
 
-        let lines = crate::test_log::captured(supi);
+        let lines = nextgcore_core::test_log::captured(supi);
         assert!(
             lines
                 .iter()

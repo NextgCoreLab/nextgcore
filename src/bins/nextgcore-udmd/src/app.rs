@@ -3951,7 +3951,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        crate::test_log::init();
+        nextgcore_core::test_log::init();
         tokio::time::timeout(Duration::from_secs(60), async {
             udm_context_init(64, 64);
 
@@ -4369,7 +4369,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        crate::test_log::init();
+        nextgcore_core::test_log::init();
         use nextgcore_sbi::message::{SbiHeader, SbiHttpMessage, SbiRequest};
 
         udm_context_init(64, 64);
@@ -4470,7 +4470,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        crate::test_log::init();
+        nextgcore_core::test_log::init();
         use nextgcore_sbi::message::{SbiHeader, SbiHttpMessage, SbiRequest};
 
         udm_context_init(64, 64);
@@ -4529,7 +4529,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        crate::test_log::init();
+        nextgcore_core::test_log::init();
         use nextgcore_sbi::message::{SbiHeader, SbiHttpMessage, SbiRequest};
         udm_context_init(64, 64);
         let ue = "imsi-udmdee-0001";
@@ -5678,7 +5678,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        crate::test_log::init();
+        nextgcore_core::test_log::init();
         udm_context_init(64, 64);
         std::env::remove_var("UDM_NOTIFY_DISABLE");
 
@@ -5947,7 +5947,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        crate::test_log::init();
+        nextgcore_core::test_log::init();
         udm_context_init(64, 64);
 
         let state = Arc::new(UeauUdrState::default());
@@ -6162,7 +6162,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        crate::test_log::init();
+        nextgcore_core::test_log::init();
         udm_context_init(64, 64);
         let (udm_server, client) = start_real_udm().await;
 
@@ -6386,7 +6386,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        crate::test_log::init();
+        nextgcore_core::test_log::init();
         udm_context_init(64, 64);
         let (udr_server, store) = start_mock_udr_context_data().await;
         let (udm_server, client) = start_real_udm().await;
@@ -6465,7 +6465,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        crate::test_log::init();
+        nextgcore_core::test_log::init();
         udm_context_init(64, 64);
         let (udr_server, store) = start_mock_udr_context_data().await;
         let (udm_server, client) = start_real_udm().await;
