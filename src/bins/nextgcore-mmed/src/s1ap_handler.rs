@@ -1882,6 +1882,22 @@ pub fn handle_initial_context_setup_failure(
                 .map(|ue| std::mem::take(&mut ue.service_request_ics_pending))
         })
         .unwrap_or(false);
+    // #961 review: the Serving GW still buffers for a SERVICE REQUEST whose user
+    // plane did not come up. Release Access Bearers returns it to the idle
+    // state, so the next downlink packet is notified afresh.
+    if service_request {
+        if let Some(mme_ue_id) = ctx.enb_ue_find_by_id(enb_ue_id).map(|e| e.mme_ue_id) {
+            if let Err(e) = crate::gtp_path::send_release_access_bearers_request(
+                ctx,
+                enb_ue_id,
+                mme_ue_id,
+                crate::s11_build::GtpReleaseAction::S1ContextRemove,
+            ) {
+                log::error!("UE {mme_ue_id}: Release Access Bearers Request not sent: {e}");
+            }
+            crate::gtp_path::clear_enb_endpoints(ctx, mme_ue_id);
+        }
+    }
     let cause = cause_from_s1ap(&msg.cause);
     if let Some(enb_ue) = ctx.enb_ue_pool.write().unwrap().get_mut(&enb_ue_id) {
         enb_ue.relcause.group = cause.group;
@@ -2216,6 +2232,7 @@ fn release_all_s1_connections(ctx: &MmeContext, enb_id: u64) -> usize {
 }
 
 fn release_s1_connection(ctx: &MmeContext, enb_ue_id: u64) {
+    let mut idle_ue = None;
     if let Some(enb_ue) = ctx.enb_ue_find_by_id(enb_ue_id) {
         if enb_ue.mme_ue_id != NEXTGCORE_INVALID_POOL_ID {
             let still_attached = ctx
@@ -2223,10 +2240,41 @@ fn release_s1_connection(ctx: &MmeContext, enb_ue_id: u64) {
                 .is_some_and(|mme_ue| mme_ue.enb_ue_id == enb_ue_id);
             if still_attached {
                 ctx.enb_ue_deassociate_mme_ue(enb_ue_id, enb_ue.mme_ue_id);
+                idle_ue = Some(enb_ue.mme_ue_id);
             }
         }
     }
     ctx.enb_ue_remove(enb_ue_id);
+    let Some(mme_ue_id) = idle_ue else {
+        return;
+    };
+    // #961 review: the UE is ECM-IDLE now. An Initial Context Setup of a
+    // SERVICE REQUEST that was still outstanding is void, and a Downlink Data
+    // Notification that arrived during the release pages the UE now.
+    let page = ctx
+        .mme_ue_pool
+        .write()
+        .unwrap()
+        .get_mut(&mme_ue_id)
+        .is_some_and(|ue| {
+            ue.service_request_ics_pending = false;
+            std::mem::take(&mut ue.ddn_pending_after_release)
+        });
+    if page
+        && crate::paging::page_ue(
+            ctx,
+            mme_ue_id,
+            crate::context::PagingType::DownlinkDataNotification,
+        ) == 0
+    {
+        if let Err(e) = crate::gtp_path::send_downlink_data_notification_failure_indication(
+            ctx,
+            mme_ue_id,
+            crate::s11_build::GtpCause::UeNotResponding,
+        ) {
+            log::error!("UE {mme_ue_id}: DDN Failure Indication not sent: {e}");
+        }
+    }
 }
 
 // ============================================================================

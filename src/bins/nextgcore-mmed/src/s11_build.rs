@@ -113,6 +113,9 @@ pub enum GtpCause {
     /// TS 29.274 Table 8.4-1: the UE did not answer paging (DDN Failure
     /// Indication, #956).
     UeNotResponding = 87,
+    /// TS 29.274 Table 8.4-1: a paged UE's SERVICE REQUEST was rejected (DDN
+    /// Failure Indication, §7.2.11.3).
+    ServiceDenied = 89,
     /// TS 29.274 Table 8.4-1: the MME cannot page the UE (DDN Acknowledge).
     UnableToPageUe = 90,
     RequestRejected = 94,
@@ -149,6 +152,7 @@ impl From<u8> for GtpCause {
             77 => GtpCause::SyntacticErrorsInPacketFilter,
             78 => GtpCause::MissingOrUnknownApn,
             87 => GtpCause::UeNotResponding,
+            89 => GtpCause::ServiceDenied,
             90 => GtpCause::UnableToPageUe,
             94 => GtpCause::RequestRejected,
             103 => GtpCause::ConditionalIeMissing,

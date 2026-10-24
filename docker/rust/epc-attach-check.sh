@@ -56,6 +56,12 @@ on_exit() {
 }
 trap on_exit EXIT
 
+# The idle stage (5-6) counts MME log lines; its first baseline is taken here,
+# before anything could have gone idle, so an S1 release that happens while the
+# attach steps run is still seen (#961 review).
+IDLE_RE='the UE goes ECM-IDLE'
+idle_baseline=$(docker logs "$MME" 2>&1 | grep -Ec "$IDLE_RE" || true)
+
 # 1. S1 Setup.
 wait_for "$MME" 'S1 Setup: eNB 0x[0-9a-fA-F]+ .*accepted' "S1 Setup accepted by the MME"
 
@@ -120,7 +126,6 @@ if [ "${EPC_IDLE_MODE:-0}" = "1" ]; then
         echo "FAIL: $what -- no new /$re/ in $MME within ${IDLE_TIMEOUT}s"
         return 1
     }
-    IDLE_RE='the UE goes ECM-IDLE'
     SR_RE='SERVICE REQUEST accepted: Initial Context Setup Request'
     UP_RE='SERVICE REQUEST user plane up; Modify Bearer Request'
     PAGED_RE='paged on [0-9]+ eNB'
@@ -129,8 +134,13 @@ if [ "${EPC_IDLE_MODE:-0}" = "1" ]; then
     #    Release Access Bearers), then an uplink packet makes the UE send a
     #    SERVICE REQUEST; the MME's Initial Context Setup and Modify Bearer
     #    Request bring the user plane back, and the ping recovers.
-    idle=$(mme_lines "$IDLE_RE"); sr=$(mme_lines "$SR_RE"); up=$(mme_lines "$UP_RE")
-    wait_more "$IDLE_RE" "$idle" "S1 release: the MME took the UE to ECM-IDLE"
+    # The eNB's inactivity timer runs from the attach, so the release may
+    # already have happened: count from the baseline taken before step 1. The
+    # timer must outlast steps 1-4 (EPC_IDLE_MODE needs an inactivity time
+    # longer than the attach checks take, e.g. 30 s), or step 3's first echo
+    # is the one that wakes the UE.
+    sr=$(mme_lines "$SR_RE"); up=$(mme_lines "$UP_RE")
+    wait_more "$IDLE_RE" "$idle_baseline" "S1 release: the MME took the UE to ECM-IDLE"
     echo "Uplink from the idle UE..."
     docker exec "$UE" lte-ue-ping-check "$TARGET" "$COUNT" || true
     wait_more "$SR_RE" "$sr" "mobile-originated SERVICE REQUEST answered with Initial Context Setup"
@@ -141,13 +151,30 @@ if [ "${EPC_IDLE_MODE:-0}" = "1" ]; then
     # 6. Network-triggered: idle again, then downlink to the UE's PDN address
     #    from the PGW-U side. The Serving GW buffers it and sends a Downlink Data
     #    Notification, the MME pages, the UE answers with a SERVICE REQUEST, and
-    #    the user plane comes back.
+    #    the user plane comes back: the buffered packets and then a fresh burst
+    #    reach the UE's TUN. Counted at the UE's TUN rather than as echo replies:
+    #    the UE container routes by default via eth0, so a reply to a
+    #    network-originated echo does not take the bearer.
+    ue_rx() { docker exec "$UE" cat /sys/class/net/lteuetun5/statistics/rx_packets; }
     idle=$(mme_lines "$IDLE_RE"); sr=$(mme_lines "$SR_RE"); paged=$(mme_lines "$PAGED_RE")
     wait_more "$IDLE_RE" "$idle" "S1 release again"
-    echo "Downlink to the idle UE (${pdn})..."
-    docker exec "$PGWU" ping -c 5 -W 2 "$pdn" || true
+    rx0=$(ue_rx)
+    echo "Downlink to the idle UE (${pdn}); UE TUN rx_packets=${rx0}..."
+    docker exec "$PGWU" ping -c 3 -W 1 "$pdn" >/dev/null 2>&1 || true
     wait_more "$PAGED_RE" "$paged" "Downlink Data Notification paged the UE"
     wait_more "$SR_RE" "$sr" "network-triggered SERVICE REQUEST answered with Initial Context Setup"
-    docker exec "$PGWU" ping -c "$COUNT" -W 2 "$pdn"
-    echo "OK: downlink reaches the UE after paging (network-triggered SERVICE REQUEST)"
+    sleep 2
+    rx1=$(ue_rx)
+    if [ "$rx1" -le "$rx0" ]; then
+        echo "FAIL: no buffered downlink reached the UE after paging (rx ${rx0} -> ${rx1})"
+        exit 1
+    fi
+    echo "OK: $((rx1 - rx0)) buffered downlink packet(s) delivered after the paging"
+    docker exec "$PGWU" ping -c "$COUNT" -i 0.2 -W 1 "$pdn" >/dev/null 2>&1 || true
+    rx2=$(ue_rx)
+    if [ $((rx2 - rx1)) -lt "$COUNT" ]; then
+        echo "FAIL: ${COUNT} downlink packets sent, $((rx2 - rx1)) reached the UE"
+        exit 1
+    fi
+    echo "OK: ${COUNT}/${COUNT} downlink packets reach the UE after the network-triggered SERVICE REQUEST"
 fi

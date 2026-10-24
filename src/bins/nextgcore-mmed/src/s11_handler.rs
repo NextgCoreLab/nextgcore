@@ -1062,10 +1062,23 @@ pub fn downlink_data_notification(
         .sgw_ue_find_by_id(mme_ue.sgw_ue_id)
         .map(|s| s.sgw_s11_teid)
         .unwrap_or(0);
-    let connected = ctx
+    let enb_ue = ctx
         .enb_ue_find_by_id(mme_ue.enb_ue_id)
-        .is_some_and(|e| e.mme_ue_id == mme_ue.id);
-    if connected {
+        .filter(|e| e.mme_ue_id == mme_ue.id);
+    if let Some(enb_ue) = enb_ue {
+        // #961 review: between the Release Access Bearers Response and the UE
+        // CONTEXT RELEASE COMPLETE the UE still has an eNB UE context, but the
+        // Serving GW already buffers. It sends one DDN for that data, so the UE
+        // is paged as soon as the release completes.
+        if enb_ue.ue_ctx_rel_action == crate::context::UeCtxRelAction::S1ContextRemove {
+            if let Some(ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&mme_ue.id) {
+                ue.ddn_pending_after_release = true;
+            }
+            log::info!(
+                "[{}] Downlink Data Notification during the S1 release: paging when it completes",
+                mme_ue.imsi_bcd
+            );
+        }
         return (sgw_teid, GtpCause::RequestAccepted);
     }
     if mme_ue.t3413.is_running() {

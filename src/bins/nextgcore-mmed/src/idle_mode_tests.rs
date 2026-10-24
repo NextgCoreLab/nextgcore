@@ -553,3 +553,254 @@ fn a_packet_services_extended_service_request_restores_what_the_enb_sets_up() {
     ctx.enb_ue_remove(new_enb_ue);
     release(&ue);
 }
+
+/// Take `ue` to ECM-IDLE the way the eNB and the Serving GW do: UE CONTEXT
+/// RELEASE REQUEST, Release Access Bearers, its Response and the release
+/// command. Returns before the UE CONTEXT RELEASE COMPLETE.
+fn release_to_command(ue: &Ue, sgw: &UdpSocket) -> nextgcore_s1ap::UeContextReleaseComplete {
+    let ctx = mme_self();
+    let enb_ue = ctx.enb_ue_find_by_id(ue.enb_ue_id).unwrap();
+    let _ = crate::s1ap_handler::handle_ue_context_release_request(
+        ctx,
+        ue.enb_id,
+        &nextgcore_s1ap::UeContextReleaseRequest {
+            mme_ue_s1ap_id: enb_ue.mme_ue_s1ap_id,
+            enb_ue_s1ap_id: enb_ue.enb_ue_s1ap_id,
+            cause: nextgcore_s1ap::Cause::RadioNetwork(
+                nextgcore_s1ap::CauseRadioNetwork::UserInactivity,
+            ),
+        },
+    );
+    let (rab, from) = recv(sgw, 170);
+    let mut rsp = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+        171,
+        ue.local_teid,
+        rab.header.sequence_number,
+    ));
+    rsp.add_ie(Gtp2CauseIe::new(16).to_ie(0));
+    sgw.send_to(&rsp.encode(), from).unwrap();
+    wait_pdu(ue.enb_id, is_release_command);
+    nextgcore_s1ap::UeContextReleaseComplete {
+        mme_ue_s1ap_id: enb_ue.mme_ue_s1ap_id,
+        enb_ue_s1ap_id: enb_ue.enb_ue_s1ap_id,
+    }
+}
+
+/// #961 review MAJOR 1: a Downlink Data Notification that lands between the
+/// Release Access Bearers Response and the UE CONTEXT RELEASE COMPLETE (the
+/// Serving GW already buffers, the eNB UE context is not yet gone) pages the UE
+/// as soon as the release completes. The SGW sends one DDN for that data.
+#[test]
+fn a_notification_during_the_s1_release_pages_when_it_completes() {
+    let _guard = lock_s11();
+    let (sgw, _route) = sgw(Gtp2XactConfig::default());
+    let ue = seed(0x0961, &[5]);
+    let ctx = mme_self();
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    let _ = crate::s1ap_path::take_tapped_for_test(ue.enb_id);
+    let complete = release_to_command(&ue, &sgw);
+
+    let (_, cause) = crate::s11_handler::downlink_data_notification(ctx, ue.local_teid);
+    assert_eq!(cause, crate::s11_build::GtpCause::RequestAccepted);
+    assert!(!ctx
+        .mme_ue_find_by_id(ue.mme_ue_id)
+        .unwrap()
+        .t3413
+        .is_running());
+    crate::s1ap_handler::handle_ue_context_release_complete(ctx, ue.enb_id, &complete);
+    wait_pdu(ue.enb_id, is_paging);
+    assert!(
+        ctx.mme_ue_find_by_id(ue.mme_ue_id)
+            .unwrap()
+            .t3413
+            .is_running(),
+        "paged once the release completed"
+    );
+    release(&ue);
+}
+
+/// A TRACKING AREA UPDATE REQUEST (TA updating, no active flag) with the UE's
+/// GUTI, integrity protected under EIA2 at uplink COUNT `count`.
+fn tau_request(sqn: u8, count: u32) -> Vec<u8> {
+    let plain = [
+        0x07u8, 0x48, 0x00, 0x0b, 0xf6, 0x99, 0xf9, 0x07, 0x00, 0x02, 0x01, 0x00, 0x00, 0x09, 0x61,
+    ];
+    let mut signed = vec![sqn];
+    signed.extend_from_slice(&plain);
+    let mac = crate::nas_security::nas_mac_calculate(2, &KNAS_INT, count, 0, 0, &signed);
+    let mut pdu = vec![0x17u8];
+    pdu.extend_from_slice(&mac);
+    pdu.extend_from_slice(&signed);
+    pdu
+}
+
+/// #961 review MAJOR 2, TS 24.301 §5.6.2.2.1: a paged UE that answers with a
+/// TAU stops the paging (no DDN Failure Indication follows), and because the
+/// paging was for downlink data the TAU ACCEPT goes in an Initial Context Setup
+/// whose response sends the Modify Bearer Request.
+#[test]
+fn a_tau_answering_a_data_paging_stops_it_and_restores_the_user_plane() {
+    let _guard = lock_s11();
+    let (sgw, _route) = sgw(Gtp2XactConfig::default());
+    let ue = seed(0x0962, &[5]);
+    let ctx = mme_self();
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    let complete = release_to_command(&ue, &sgw);
+    crate::s1ap_handler::handle_ue_context_release_complete(ctx, ue.enb_id, &complete);
+    let _ = crate::s1ap_path::take_tapped_for_test(ue.enb_id);
+    let (_, cause) = crate::s11_handler::downlink_data_notification(ctx, ue.local_teid);
+    assert_eq!(cause, crate::s11_build::GtpCause::RequestAccepted);
+    wait_pdu(ue.enb_id, is_paging);
+
+    let new_enb_ue = ctx.enb_ue_add(ue.enb_id, 962);
+    ctx.enb_ue_associate_mme_ue(new_enb_ue, ue.mme_ue_id);
+    if let Some(e) = ctx.enb_ue_pool.write().unwrap().get_mut(&new_enb_ue) {
+        e.saved.tai = ue.tai.clone();
+    }
+    crate::nas_dispatch::nas_eps_handle_uplink(
+        ctx,
+        crate::nas_dispatch::UplinkNas {
+            enb_ue_id: new_enb_ue,
+            nas_pdu: &tau_request(0, 0),
+            s_tmsi: None,
+        },
+    );
+    let (erabs, key, nas) = wait_pdu(ue.enb_id, ics);
+    assert_eq!(erabs, vec![5]);
+    assert!(nas, "the TAU ACCEPT rides in the Initial Context Setup");
+    assert_eq!(
+        key,
+        nextgcore_crypt::kdf::nextgcore_kdf_kenb(&[0x11; 32], 0).to_vec()
+    );
+    assert!(
+        !ctx.mme_ue_find_by_id(ue.mme_ue_id)
+            .unwrap()
+            .t3413
+            .is_running(),
+        "paging stopped"
+    );
+    // No Failure Indication, however long T3413 would have run.
+    crate::nas_timer::expire_nas_timers(ctx, Instant::now() + Duration::from_secs(60));
+    let new = ctx.enb_ue_find_by_id(new_enb_ue).unwrap();
+    crate::s1ap_handler::handle_initial_context_setup_response(
+        ctx,
+        ue.enb_id,
+        &nextgcore_s1ap::InitialContextSetupResponse {
+            mme_ue_s1ap_id: new.mme_ue_s1ap_id,
+            enb_ue_s1ap_id: new.enb_ue_s1ap_id,
+            erab_setup_list: vec![nextgcore_s1ap::ErabSetupItem {
+                erab_id: 5,
+                transport_layer_address: vec![10, 0, 0, 9],
+                gtp_teid: 0x9905,
+            }],
+            erab_failed_list: vec![],
+        },
+    );
+    let mut seen = Vec::new();
+    let mut buf = [0u8; 4096];
+    while let Ok((len, _)) = sgw.recv_from(&mut buf) {
+        let msg = Gtp2Message::decode(&mut bytes::Bytes::copy_from_slice(&buf[..len])).unwrap();
+        seen.push(msg.header.message_type);
+        if msg.header.message_type == 34 {
+            break;
+        }
+    }
+    assert!(seen.contains(&34), "Modify Bearer Request: {seen:?}");
+    assert!(!seen.contains(&70), "no DDN Failure Indication: {seen:?}");
+    ctx.enb_ue_remove(new_enb_ue);
+    release(&ue);
+}
+
+/// #961 review MINORs: a paged UE whose SERVICE REQUEST is rejected stops being
+/// paged and the Serving GW is told, cause Service denied (TS 29.274
+/// §7.2.11.3); the S1 release clears an outstanding SERVICE REQUEST's Initial
+/// Context Setup; and a failed one sends Release Access Bearers so the Serving
+/// GW goes back to idle-mode buffering.
+#[test]
+fn a_rejected_or_failed_service_request_leaves_the_serving_gw_informed() {
+    let _guard = lock_s11();
+    let (sgw, _route) = sgw(Gtp2XactConfig::default());
+    let ue = seed(0x0963, &[5]);
+    let ctx = mme_self();
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    let complete = release_to_command(&ue, &sgw);
+    crate::s1ap_handler::handle_ue_context_release_complete(ctx, ue.enb_id, &complete);
+    let _ = crate::s11_handler::downlink_data_notification(ctx, ue.local_teid);
+    wait_pdu(ue.enb_id, is_paging);
+    // No active bearer any more: the SERVICE REQUEST is rejected with #40.
+    let b5 = ctx.bearer_find_by_ebi(ue.mme_ue_id, 5).unwrap();
+    ctx.bearer_pool
+        .write()
+        .unwrap()
+        .get_mut(&b5)
+        .unwrap()
+        .sgw_s1u_teid = 0;
+    let new_enb_ue = ctx.enb_ue_add(ue.enb_id, 963);
+    ctx.enb_ue_associate_mme_ue(new_enb_ue, ue.mme_ue_id);
+    crate::nas_dispatch::nas_eps_handle_uplink(
+        ctx,
+        crate::nas_dispatch::UplinkNas {
+            enb_ue_id: new_enb_ue,
+            nas_pdu: &service_request(1, 1),
+            s_tmsi: None,
+        },
+    );
+    let (fi, _) = recv(&sgw, 70);
+    assert_eq!(
+        Gtp2CauseIe::decode(&fi.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value)
+            .unwrap()
+            .cause,
+        89,
+        "Service denied"
+    );
+    assert!(!ctx
+        .mme_ue_find_by_id(ue.mme_ue_id)
+        .unwrap()
+        .t3413
+        .is_running());
+
+    // An outstanding SERVICE REQUEST Initial Context Setup does not survive an
+    // S1 release, and one that fails sends Release Access Bearers.
+    let enb_ue_2 = ctx.enb_ue_add(ue.enb_id, 964);
+    ctx.enb_ue_associate_mme_ue(enb_ue_2, ue.mme_ue_id);
+    if let Some(u) = ctx.mme_ue_pool.write().unwrap().get_mut(&ue.mme_ue_id) {
+        u.service_request_ics_pending = true;
+    }
+    let e2 = ctx.enb_ue_find_by_id(enb_ue_2).unwrap();
+    let _ = crate::s1ap_handler::handle_initial_context_setup_failure(
+        ctx,
+        ue.enb_id,
+        &nextgcore_s1ap::InitialContextSetupFailure {
+            mme_ue_s1ap_id: e2.mme_ue_s1ap_id,
+            enb_ue_s1ap_id: e2.enb_ue_s1ap_id,
+            cause: nextgcore_s1ap::Cause::RadioNetwork(
+                nextgcore_s1ap::CauseRadioNetwork::Unspecified,
+            ),
+        },
+    );
+    let _ = recv(&sgw, 170);
+    let enb_ue_3 = ctx.enb_ue_add(ue.enb_id, 965);
+    ctx.enb_ue_associate_mme_ue(enb_ue_3, ue.mme_ue_id);
+    if let Some(u) = ctx.mme_ue_pool.write().unwrap().get_mut(&ue.mme_ue_id) {
+        u.service_request_ics_pending = true;
+    }
+    let e3 = ctx.enb_ue_find_by_id(enb_ue_3).unwrap();
+    crate::s1ap_handler::handle_ue_context_release_complete(
+        ctx,
+        ue.enb_id,
+        &nextgcore_s1ap::UeContextReleaseComplete {
+            mme_ue_s1ap_id: e3.mme_ue_s1ap_id,
+            enb_ue_s1ap_id: e3.enb_ue_s1ap_id,
+        },
+    );
+    assert!(
+        !ctx.mme_ue_find_by_id(ue.mme_ue_id)
+            .unwrap()
+            .service_request_ics_pending,
+        "cleared by the S1 release"
+    );
+    for id in [new_enb_ue, enb_ue_2] {
+        ctx.enb_ue_remove(id);
+    }
+    release(&ue);
+}

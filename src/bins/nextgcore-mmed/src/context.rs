@@ -1060,6 +1060,10 @@ pub struct MmeUe {
     /// outstanding: its response continues with the Modify Bearer Request of
     /// TS 23.401 §5.3.4.1 step 8 (#956).
     pub service_request_ics_pending: bool,
+    /// A Downlink Data Notification arrived while the S1 release was still
+    /// running (the eNB UE context not yet released): the UE is paged once the
+    /// release completes (#961 review).
+    pub ddn_pending_after_release: bool,
     /// The network-initiated detach in progress was started by an HSS Cancel Location
     /// (subscription withdrawal). Only then is a further CLR a retransmission of the one
     /// being served; a CLR during any other detach is the HSS's own instruction (#828).
