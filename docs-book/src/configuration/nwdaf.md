@@ -41,7 +41,7 @@ Unlike most NextGCore NFs, `nextgcore-nwdafd` defines **no** `#[derive(Deseriali
 
 Everything in the shipped example except an (absent) `sbi.oauth2.require` key is decorative — the daemon never looks at it:
 
-- **`logger.level` is inert.** The log filter comes from `RUST_LOG` (which wins, via `env_logger`'s default env) or else the CLI flag `-e/--log-level` (default `info`).
+- **`logger.level` is read.** The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691).
 - **`nwdaf.sbi.server[]` (address/advertise/port) is inert.** The SBI bind address and port come exclusively from `--sbi-addr`/`--sbi-port`; the docker deployment passes `--sbi-addr 172.23.0.30 --sbi-port 7777` on the command line.
 - **`nwdaf.nrf.uri` is inert.** The NRF URI comes exclusively from the CLI flag `--nrf-uri`; docker passes `--nrf-uri http://172.23.0.10:7777` explicitly. The YAML value exists only for visual consistency with other NF configs.
 - **`nwdaf.analytics.ml_model_dir` is inert.** No code in the binary reads a model directory (or any file other than the config itself); the ML model provision service is metadata/subscription-based, not filesystem-backed.
@@ -53,7 +53,7 @@ Runtime knobs with real defaults from the clap `Args` struct in `src/bins/nextgc
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `-c, --config` | path | `/etc/nextgcore/nwdaf.yaml` | Configuration file path — consulted only for the OAuth2 knob above. |
-| `-e, --log-level` | string | `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`); `RUST_LOG` overrides it. |
+| `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-l, --log-file` | path | unset | **Accepted but currently unused** — the parsed value is never referenced; logs go to stderr regardless. |
 | `-m, --no-color` | flag | off | **Accepted but currently unused** — the parsed value is never referenced. |
 | `--sbi-addr` | string | `0.0.0.0` | SBI server bind address. Also used verbatim in the registered NFProfile `ipv4Addresses` and in the NFStatusNotify callback URI — see Behavior notes. |
