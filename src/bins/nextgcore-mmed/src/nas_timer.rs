@@ -114,6 +114,8 @@ const ALL_TIMERS: [NasTimer; 5] = [
 /// retransmission path can take the write lock and reach `nas_path` without the
 /// non-reentrant `RwLock` deadlocking against itself.
 pub fn expire_nas_timers(ctx: &MmeContext, now: Instant) {
+    // #734: T3495 of the PDN GW initiated bearer deactivations.
+    crate::bearer_deactivation::sweep(ctx, now);
     let expired: Vec<(u64, NasTimer)> = {
         let pool = ctx.mme_ue_pool.read().unwrap();
         pool.iter()
@@ -161,9 +163,10 @@ fn handle_expiry(ctx: &MmeContext, mme_ue_id: u64, timer: NasTimer) {
             timer.name()
         );
         // TS 24.301 §5.5.2.3.4 b: an aborted network detach still leaves the UE
-        // EMM-DEREGISTERED in the network.
+        // EMM-DEREGISTERED in the network, including one another procedure overtook
+        // (#828, as the with-S1 branch below).
         if timer == NasTimer::T3422 {
-            crate::network_detach::complete_mme_initiated_detach(ctx, mme_ue_id);
+            crate::network_detach::abandon_mme_initiated_detach(ctx, mme_ue_id);
         }
         return;
     };
@@ -449,6 +452,47 @@ mod tests {
             ctx.mme_ue_find_by_id(mme_ue_id).is_none(),
             "the detach is completed: EMM-DEREGISTERED"
         );
+    }
+
+    /// #828 follow-up: the overtaken-detach rule holds when T3422 expires with no S1
+    /// connection too. The detach is completed (the bearer-less UE deregistered), while a
+    /// detach an ATTACH aborted is left alone in the same branch.
+    #[test]
+    fn t3422_without_s1_completes_an_overtaken_detach_and_spares_an_aborted_one() {
+        for (aborted, expect_removed) in [(false, true), (true, false)] {
+            let ctx = test_ctx();
+            let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+            let enb_ue_id = ctx.enb_ue_add(enb_id, 100);
+            let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
+            ctx.enb_ue_associate_mme_ue(enb_ue_id, mme_ue_id);
+            crate::network_detach::mme_initiated_detach(
+                &ctx,
+                mme_ue_id,
+                crate::emm_build::DetachTypeToUe::ReAttachRequired,
+                "test",
+            );
+            {
+                let mut pool = ctx.mme_ue_pool.write().unwrap();
+                let ue = pool.get_mut(&mme_ue_id).unwrap();
+                ue.nas_eps.type_ = if aborted {
+                    MmeEpsType::AttachRequest
+                } else {
+                    MmeEpsType::ExtendedServiceRequest
+                };
+                if aborted {
+                    ue.network_detach_type = None;
+                }
+                // The S1 connection is gone.
+                ue.enb_ue_id = NEXTGCORE_INVALID_POOL_ID;
+            }
+            force_expiry(&ctx, mme_ue_id, NasTimer::T3422);
+            expire_nas_timers(&ctx, Instant::now());
+            assert_eq!(
+                ctx.mme_ue_find_by_id(mme_ue_id).is_none(),
+                expect_removed,
+                "aborted={aborted}"
+            );
+        }
     }
 
     #[test]

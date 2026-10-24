@@ -66,7 +66,7 @@ These are the fields actually deserialized by the daemon (`#[derive(Deserialize)
 
 The daemon deserializes only the fields above; unknown YAML keys are silently ignored by serde. In particular, in the shipped example files:
 
-- **`logger.file.path` and `logger.level` are inert.** The log level comes solely from the CLI flag `-e/--log-level` (default `info`). Note that `RUST_LOG` has *no* effect either — `init_logging` builds a fresh `env_logger::Builder::new()` without reading the environment. Logs go to stderr; no file sink is wired (see `--log-file` below).
+- **`logger.file.path` and `logger.level` are inert.** The log level comes from `RUST_LOG` when set, else the CLI flag `-e/--log-level` (default `info`). Logs go to stderr; no file sink is wired (see `--log-file` below).
 - **`global.max.ue` / `global.max.peer` are inert.** No `global` section exists in the deserialize structs; session capacity is the CLI flag `--max-sess`.
 - **`bsf.sbi.tls.*` (`enabled`/`cert`/`key`/`ca`/`min_version`) is inert.** No `tls` field exists in `SbiYaml`. TLS-related knobs are the CLI flags `--tls`/`--tls-cert`/`--tls-key` — and even those only affect the advertised scheme (see Behavior notes). The `TLS_ENABLED`/`SBI_SCHEME` variables mentioned in the YAML comment, and the `TLS_CERT`/`TLS_KEY` environment variables set by `docker-compose.yml`, are not read by this binary.
 
