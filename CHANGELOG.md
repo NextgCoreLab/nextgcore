@@ -154,6 +154,16 @@ before the tag. The validation line is filled from the release run, not carried 
   SQN stored as BSON Int64 (#137).
 
 ### Deployment
+- **Upgrade together (PFCP wire format):** two IE encodings are now spec-correct, and an
+  upgraded and a non-upgraded peer disagree on them until both sides are upgraded:
+  - Apply Action octets 5 and 6 (TS 29.244 §8.2.26): smfd and upfd (#1008, #1019);
+  - the Remote GTP-U Peer V4/V6 flags (§8.2.70, Figure 8.2.70-1: bit 1 V6, bit 2 V4) in
+    the shared `nextgcore-pfcp` codec: sgwud with sgwcd, and upfd with smfd, for the
+    PFCP Node Report (#994, #1028).
+  A rolling upgrade must move each CP/UP pair at the same time.
+- smfd answers PFCP Node Reports and acts on user plane path failure and recovery; a
+  path still down after `SMF_UP_PATH_FAILURE_HOLD_SECS` (default 120 s) releases its
+  sessions with #39 (#994, #1028).
 - **Operational change:** smfd, sgwcd, upfd, sgwud and mbsmfd refuse to start when the local
   clock reads before 2020-01-01, because their PFCP Recovery Time Stamp, now NTP-era seconds per
   TS 29.244 §8.2.65 (#995, #1004), would be wrong. On RTC-less hosts, start them after

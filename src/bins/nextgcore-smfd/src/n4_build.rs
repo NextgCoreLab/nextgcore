@@ -451,6 +451,13 @@ pub mod interface {
 // ============================================================================
 
 /// PFCP apply action flags
+/// The [`apply_action`] flags of an Apply Action IE value (TS 29.244 §8.2.26),
+/// read by the same library codec [`PfcpMessageBuilder::add_apply_action`] writes
+/// with (#1008): octet 5 first. A one-octet value is octet 5.
+pub fn decode_apply_action(value: &[u8]) -> u16 {
+    nextgcore_pfcp::types::ApplyAction::decode_ie(value).encode()
+}
+
 pub mod apply_action {
     pub const DROP: u16 = 1 << 0;
     pub const FORW: u16 = 1 << 1;

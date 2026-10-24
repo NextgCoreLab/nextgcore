@@ -192,7 +192,7 @@ pub struct EpsGuti {
 }
 
 /// IP address
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IpAddr {
     /// IPv4 address
     pub ipv4: Option<[u8; 4]>,
@@ -1105,6 +1105,10 @@ pub struct MmeUe {
     /// running (the eNB UE context not yet released): the UE is paged once the
     /// release completes (#961 review).
     pub ddn_pending_after_release: bool,
+    /// When this UE's recent S1 releases for a Serving-GW-released S1-U started
+    /// (#1023 review): bounded per window, so a path that stays failed does not
+    /// cycle the UE through release and paging.
+    pub stale_s1u_releases: Vec<std::time::Instant>,
     /// The eNB UE context an INITIAL CONTEXT SETUP REQUEST was sent on and not
     /// yet answered (0: none). Keyed by the S1 connection so a later connection
     /// is not mistaken for one still being set up (#869 review).
@@ -1570,6 +1574,13 @@ pub struct MmeBearer {
     pub enb_s1u_teid: u32,
     /// eNB S1-U IP
     pub enb_s1u_ip: IpAddr,
+    /// The eNB S1-U F-TEID the Serving GW holds for this bearer: the one an
+    /// accepted Modify Bearer Response or an accepted Create Bearer Response
+    /// carried (#1015). `None` once a Release Access Bearers Request released
+    /// the S1-U bearers. When it equals (`enb_s1u_teid`, `enb_s1u_ip`) the
+    /// Serving GW can tunnel downlink to the eNB, so a Downlink Data
+    /// Notification for the bearer means the Serving GW released its S1-U.
+    pub enb_s1u_at_sgw: Option<(u32, IpAddr)>,
     /// SGW S1-U TEID
     pub sgw_s1u_teid: u32,
     /// SGW S1-U IP
@@ -1780,7 +1791,6 @@ pub struct MmeContext {
 
     /// Hash tables
     pub enb_addr_hash: RwLock<HashMap<String, u64>>,
-    pub enb_id_hash: RwLock<HashMap<u32, u64>>,
     pub imsi_ue_hash: RwLock<HashMap<String, u64>>,
     pub guti_ue_hash: RwLock<HashMap<EpsGuti, u64>>,
     pub mme_s11_teid_hash: RwLock<HashMap<u32, u64>>,
@@ -2163,8 +2173,9 @@ impl MmeContext {
     /// The S1-connected eNB with this Global eNB ID (TS 36.413 §9.2.1.37): same PLMN,
     /// same ENB-ID alternative (its length in bits) and same value, S1 Setup complete
     /// (#741, #882). A macro eNB `0x12345` and a home eNB `0x0012345`, or two eNBs of
-    /// different PLMNs, are different eNBs; [`Self::enb_find_by_enb_id`] cannot tell them
-    /// apart.
+    /// different PLMNs, are different eNBs. It is the only eNB lookup by identity: the
+    /// value-only `enb_find_by_enb_id` could not tell them apart and is gone (#858 review,
+    /// MINOR D).
     pub fn enb_find_by_global_enb_id(
         &self,
         plmn_id: &PlmnId,
@@ -2199,18 +2210,11 @@ impl MmeContext {
         }
     }
 
-    /// Find eNB by eNB ID value alone, whatever its ENB-ID alternative or PLMN. Prefer
-    /// [`Self::enb_find_by_global_enb_id`] wherever the full Global eNB ID is known.
-    pub fn enb_find_by_enb_id(&self, enb_id: u32) -> Option<u64> {
-        self.enb_id_hash.read().unwrap().get(&enb_id).copied()
-    }
-
     /// Set eNB ID
     pub fn enb_set_enb_id(&self, id: u64, enb_id: u32) -> bool {
         if let Some(enb) = self.enb_pool.write().unwrap().get_mut(&id) {
             enb.enb_id = enb_id;
             enb.enb_id_presence = true;
-            self.enb_id_hash.write().unwrap().insert(enb_id, id);
             true
         } else {
             false
@@ -2497,6 +2501,34 @@ impl MmeContext {
     /// Find bearer by pool ID
     pub fn bearer_find_by_id(&self, id: u64) -> Option<MmeBearer> {
         self.bearer_pool.read().unwrap().get(&id).cloned()
+    }
+
+    /// The bearer `ebi` of `mme_ue_id`, found through the UE's sessions and their
+    /// bearer lists (O(the UE's bearers)) rather than a scan of every bearer of
+    /// every UE (#1023 review).
+    pub fn bearer_of_ue_by_ebi(&self, mme_ue_id: u64, ebi: u8) -> Option<u64> {
+        // One pool lock at a time: no nested acquisition to order against writers.
+        let sess_list = self
+            .mme_ue_pool
+            .read()
+            .unwrap()
+            .get(&mme_ue_id)?
+            .sess_list
+            .clone();
+        let bearer_ids: Vec<u64> = {
+            let sess_pool = self.sess_pool.read().unwrap();
+            sess_list
+                .iter()
+                .filter_map(|s| sess_pool.get(s))
+                .flat_map(|s| s.bearer_list.iter().copied())
+                .collect()
+        };
+        let bearer_pool = self.bearer_pool.read().unwrap();
+        bearer_ids.into_iter().find(|b| {
+            bearer_pool
+                .get(b)
+                .is_some_and(|b| b.ebi == ebi && b.mme_ue_id == mme_ue_id)
+        })
     }
 
     /// Find bearer by EBI
@@ -2787,6 +2819,35 @@ pub fn mme_context_final() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **#858 review, MINOR B.** `enb_find_by_global_enb_id` matches the PLMN: with only
+    /// another PLMN's eNB of the same kind and value S1-connected, nothing is found, and
+    /// the right PLMN finds it. (The S1 HO test's twins cannot pin this: the pool is a
+    /// HashMap, so which twin `find` meets first is arbitrary.)
+    ///
+    /// REVERT-VERIFIED: without the PLMN comparison the other PLMN's eNB is returned.
+    #[test]
+    fn the_global_enb_lookup_matches_the_plmn() {
+        let ctx = MmeContext::new();
+        ctx.init();
+        let twin = ctx.enb_add("127.0.0.1:36413".parse().unwrap());
+        ctx.enb_set_s1_connected_for_test(
+            twin,
+            &[0x13, 0x00, 0x14],
+            nextgcore_s1ap::EnbId::Macro(0x858),
+        );
+        let wanted = crate::s1ap_build::decode_plmn_id(&[0x00, 0xF1, 0x10]);
+        assert_eq!(
+            ctx.enb_find_by_global_enb_id(&wanted, nextgcore_s1ap::EnbId::Macro(0x858)),
+            None,
+            "another PLMN's eNB of the same id is not it"
+        );
+        let twins_plmn = crate::s1ap_build::decode_plmn_id(&[0x13, 0x00, 0x14]);
+        assert_eq!(
+            ctx.enb_find_by_global_enb_id(&twins_plmn, nextgcore_s1ap::EnbId::Macro(0x858)),
+            Some(twin)
+        );
+    }
 
     /// #479: the IMSI is stored as TBCD octets (TS 29.274 §8.3) with `imsi_len`
     /// the octet count, so S11 carries the subscriber rather than zeros.
