@@ -988,9 +988,12 @@ fn make_establishments_due(server: &mut NgapServer) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
 async fn an_establishment_while_the_smf_restarts_is_retried_and_succeeds() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    drop(listener); // the SMF is down: connection refused
+    // The SMF is down: its port is bound but not listening, so a connection is refused
+    // -- and, unlike a dropped listener's port, no other test's stand-in can be handed
+    // it meanwhile (#1050: that answered the "down" SMF's CreateSMContext).
+    let down = tokio::net::TcpSocket::new_v4().expect("socket");
+    down.bind("127.0.0.1:0".parse().unwrap()).expect("bind");
+    let port = down.local_addr().expect("addr").port();
     let _env = super::SmfEnvGuard::acquire(port).await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_796_001u64, 96);
@@ -1007,9 +1010,13 @@ async fn an_establishment_while_the_smf_restarts_is_retried_and_succeeds() {
     );
     assert!(server.pending_establishments.contains_key(&(ue, 5)));
 
-    // The SMF comes back on the same address.
-    let (_smf, seen) =
-        creating_smf_on(std::net::TcpListener::bind(("127.0.0.1", port)).expect("rebind")).await;
+    // The SMF comes back on the same address: the reserved socket starts listening.
+    let listener = down
+        .listen(64)
+        .expect("listen")
+        .into_std()
+        .expect("a std listener");
+    let (_smf, seen) = creating_smf_on(listener).await;
     make_establishments_due(&mut server);
     settle_establishments(&mut server).await;
 
@@ -1177,17 +1184,6 @@ fn hanging_smf() -> (std::net::TcpListener, u16) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
     (listener, port)
-}
-
-/// Wait until `n` off-task exchanges hold a permit.
-async fn until_in_flight(server: &NgapServer, n: usize) {
-    for _ in 0..200 {
-        if server.sbi_offload.in_flight() == n {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    panic!("in flight: {}, wanted {n}", server.sbi_offload.in_flight());
 }
 
 /// #796 review M1. With the SMF not answering, a due re-selection

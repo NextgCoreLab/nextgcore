@@ -26354,8 +26354,32 @@ mod tests {
 
     // ---- criteria 4 + 5: every N2 SM container reaches the SMF ----
 
+    /// Wait until `n` off-task exchanges hold a permit -- up to 10 s, not 1: under a loaded
+    /// full-suite run a just-spawned attempt can take longer than a second to be scheduled
+    /// and take its permit (seen as "in flight: 0, wanted 1" in a workspace run).
+    pub(super) async fn until_in_flight(server: &NgapServer, n: usize) {
+        for _ in 0..2000 {
+            if server.sbi_offload.in_flight() == n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("in flight: {}, wanted {n}", server.sbi_offload.in_flight());
+    }
+
     /// Point the AMF's N11 calls at `port` for the duration of the guard.
-    struct SmfEnvGuard(tokio::sync::MutexGuard<'static, ()>);
+    ///
+    /// The SMF is resolved from the process-wide NF discovery cache BEFORE the
+    /// `SMF_SBI_*` fallback (`sbi_path::resolve_nf_endpoint`), and the tests that seed
+    /// SMF instances there do so under `sbi_path::nf_cache_test_lock` (#1064 review): an
+    /// N11 call made while one ran went to its cached SMF, not to `port`. So the guard
+    /// holds that lock too -- ALWAYS the cache lock first, then the env lock, the one
+    /// order every site uses, so two guards cannot deadlock. Fields drop in declaration
+    /// order: the env lock is released first.
+    struct SmfEnvGuard {
+        _env: tokio::sync::MutexGuard<'static, ()>,
+        _cache: tokio::sync::MutexGuard<'static, ()>,
+    }
 
     impl SmfEnvGuard {
         /// Async because the lock is a tokio mutex (#643): it is held across
@@ -26365,6 +26389,7 @@ mod tests {
         /// binding the future unawaited, so the environment was never set.
         /// With the old name gone, such a call fails to compile.
         async fn acquire(port: u16) -> Self {
+            let cache = crate::sbi_path::nf_cache_test_lock().lock().await;
             let guard = smf_env_test_lock().lock().await;
             // The default SBI profile is production, i.e. TLS; the fake SMF below
             // speaks plain h2c. Same override the existing sbi_path tests use.
@@ -26373,7 +26398,10 @@ mod tests {
             );
             std::env::set_var("SMF_SBI_ADDR", "127.0.0.1");
             std::env::set_var("SMF_SBI_PORT", port.to_string());
-            Self(guard)
+            Self {
+                _env: guard,
+                _cache: cache,
+            }
         }
     }
 
@@ -29045,6 +29073,10 @@ mod tests {
     /// `SMF_SBI_ADDR`; a context with no recorded owner keeps the old fallback.
     #[tokio::test]
     async fn sm_context_updates_go_to_the_smf_that_holds_the_context() {
+        // #1034: the environment fallback is read twice below; a test that sets
+        // SMF_SBI_* under `SmfEnvGuard` in between made the two disagree. Holding the same
+        // lock for the whole test reads one stable environment.
+        let _env = smf_env_test_lock().lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = test_ngap_server().await;
         ngap.sm_context_refs.insert((7_669_001, 1), "1".to_string());
