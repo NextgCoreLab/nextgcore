@@ -53,6 +53,11 @@ pub mod test_support {
     // std guard must not do (`clippy::await_holding_lock`). Sync tests take them
     // with `blocking_lock()`, async ones with `.lock().await`; a tokio mutex
     // does not poison, so no test inherits a sibling's panic.
+    //
+    // Await right at the call: `let _g = CONTEXT_GUARD.lock().await;`. A future
+    // bound to `_g` compiles but takes no lock. `tests/async_test_guards_awaited.rs`
+    // fails any lock or async guard helper that is not awaited at its call,
+    // in this crate and in every crate that uses this module.
     use tokio::sync::Mutex;
 
     /// Process-wide lock so strict-peer tests that touch the global AMF context
