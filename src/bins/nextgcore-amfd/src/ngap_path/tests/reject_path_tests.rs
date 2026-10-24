@@ -115,6 +115,28 @@ async fn gnb(server: &mut NgapServer) {
     server.sessions.write().await.insert(GNB_ASSOC, session);
 }
 
+/// `pdu`, one of the UE-associated fixtures here (AMF UE NGAP ID 42), naming AMF UE NGAP
+/// ID `id` instead. The UE store is process-wide, so each test names its own UE.
+fn for_ue(pdu: &[u8], id: u8) -> Vec<u8> {
+    const AMF_ID_42: [u8; 6] = [0x00, 0x0A, 0x00, 0x02, 0x00, 0x2A];
+    let at = pdu
+        .windows(AMF_ID_42.len())
+        .position(|w| w == AMF_ID_42)
+        .expect("the fixture names AMF UE NGAP ID 42");
+    let mut out = pdu.to_vec();
+    out[at + 5] = id;
+    out
+}
+
+/// A UE with AMF UE NGAP ID `id` and RAN UE NGAP ID 7 (the fixtures'), served on
+/// [`GNB_ASSOC`] and CM-CONNECTED, so the #739 UE-association gate (TS 38.413 §10.6)
+/// passes its messages to the handler whose reject paths these tests drive.
+fn served_ue(server: &mut NgapServer, id: u8) {
+    let mut state = UeNasContext::new(u64::from(id), 7, GNB_ASSOC, false);
+    state.registered = true;
+    server.ue_auth_state.insert(u64::from(id), state);
+}
+
 async fn stored_tacs(server: &NgapServer) -> Vec<u32> {
     server.sessions.read().await[&GNB_ASSOC]
         .gnb
@@ -244,7 +266,13 @@ async fn a_notify_missing_its_amf_ue_ngap_id_gets_an_error_indication() {
 async fn a_notify_with_a_reject_ie_gets_an_error_indication() {
     let mut server = capturing_ngap_server().await;
     gnb(&mut server).await;
-    let sent = answers_to(&mut server, &with_unknown_ie(&NOTIFY, 9_998, 0x00)).await;
+    served_ue(&mut server, 143);
+    let sent = answers_to(
+        &mut server,
+        &with_unknown_ie(&for_ue(&NOTIFY, 143), 9_998, 0x00),
+    )
+    .await;
+    server.ue_auth_state.remove(143);
     let [(
         _,
         Answer::ErrorIndication {
@@ -264,13 +292,19 @@ async fn a_notify_with_a_reject_ie_gets_an_error_indication() {
 }
 
 /// §10.3.4.2: an IE marked "ignore and notify" is reported in an Error
-/// Indication and the Notify is processed (here: its UE is unknown, so nothing
-/// else is sent).
+/// Indication and the Notify is processed (here: its UE holds no SM context, so
+/// nothing else is sent).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_notify_with_a_notify_ie_is_processed_and_reported() {
     let mut server = capturing_ngap_server().await;
     gnb(&mut server).await;
-    let sent = answers_to(&mut server, &with_unknown_ie(&NOTIFY, 9_997, 0x80)).await;
+    served_ue(&mut server, 144);
+    let sent = answers_to(
+        &mut server,
+        &with_unknown_ie(&for_ue(&NOTIFY, 144), 9_997, 0x80),
+    )
+    .await;
+    server.ue_auth_state.remove(144);
     let [(
         _,
         Answer::ErrorIndication {
@@ -289,13 +323,30 @@ async fn a_notify_with_a_notify_ie_is_processed_and_reported() {
     );
 }
 
-/// #71: a well-formed Notify is accepted and answered with nothing (class 2;
-/// its UE is unknown here, so nothing is relayed either).
+/// #71: a well-formed Notify for a UE the gNB serves is accepted and answered with
+/// nothing (class 2; the UE holds no SM context, so nothing is relayed either). For a
+/// UE this association does not serve, the #739 gate answers an Error Indication
+/// naming the received ids (TS 38.413 §10.6, unknown-local-UE-NGAP-ID).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_well_formed_notify_gets_no_answer() {
     let mut server = capturing_ngap_server().await;
     gnb(&mut server).await;
-    assert_eq!(answers_to(&mut server, &NOTIFY).await, vec![]);
+    let sent = answers_to(&mut server, &for_ue(&NOTIFY, 147)).await;
+    assert_eq!(
+        sent,
+        vec![(
+            GNB_ASSOC,
+            Answer::ErrorIndication {
+                protocol_cause: None,
+                ie_ids: vec![],
+                amf_ue_ngap_id: Some(147),
+            }
+        )],
+        "a UE this association does not serve"
+    );
+    served_ue(&mut server, 146);
+    assert_eq!(answers_to(&mut server, &for_ue(&NOTIFY, 146)).await, vec![]);
+    server.ue_auth_state.remove(146);
 }
 
 /// §10.2 for the Notify too.
@@ -330,7 +381,9 @@ const UL_UE_NRPPA_NO_ROUTING: [u8; 28] = [
 async fn an_uplink_nrppa_transport_without_its_routing_id_gets_an_error_indication() {
     let mut server = capturing_ngap_server().await;
     gnb(&mut server).await;
-    let sent = answers_to(&mut server, &UL_UE_NRPPA_NO_ROUTING).await;
+    served_ue(&mut server, 145);
+    let sent = answers_to(&mut server, &for_ue(&UL_UE_NRPPA_NO_ROUTING, 145)).await;
+    server.ue_auth_state.remove(145);
     let [(
         assoc,
         Answer::ErrorIndication {
@@ -344,7 +397,7 @@ async fn an_uplink_nrppa_transport_without_its_routing_id_gets_an_error_indicati
     };
     assert_eq!(*assoc, GNB_ASSOC);
     assert_eq!(ie_ids, &vec![g::ID_ROUTING_ID]);
-    assert_eq!(*amf_ue_ngap_id, Some(42));
+    assert_eq!(*amf_ue_ngap_id, Some(145));
 }
 
 /// PWS FAILURE INDICATION (procedure 48... per the generated constant), with or
