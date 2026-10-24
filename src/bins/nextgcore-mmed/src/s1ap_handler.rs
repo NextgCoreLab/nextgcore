@@ -1534,10 +1534,11 @@ pub static PWS_FAILURE_INDICATIONS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// A PWS FAILURE INDICATION from the eNB `enb_id` (TS 36.413 §8.12.4): ongoing
-/// PWS operation failed in the listed cells. The MME is to act per TS 23.007
-/// (§15A.1.2: the indication goes on to the CBC); with no SBc-AP transport (#1071)
-/// it is validated against the sender's own Global eNB ID, counted and logged,
-/// as [`handle_pws_restart`] does. Returns whether it was accepted.
+/// PWS operation failed in the listed cells. The MME is to act as TS 23.041
+/// defines (the failure is reported on to the CBC over SBc-AP); with no SBc-AP
+/// transport (#1071) it is validated against the sender's own Global eNB ID,
+/// counted and logged, as [`handle_pws_restart`] does. Returns whether it was
+/// accepted.
 pub fn handle_pws_failure(
     ctx: &MmeContext,
     enb_id: u64,
@@ -1554,10 +1555,13 @@ pub fn handle_pws_failure(
     }
     PWS_FAILURE_INDICATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     log::warn!(
-        "PWS FAILURE INDICATION from eNB {enb_id} ({:?}): PWS operation failed in {} cell(s) \
-         {:?}; this MME has no SBc-AP association to tell the CBC (#1071)",
+        "PWS FAILURE INDICATION from eNB {enb_id} ({:?}): PWS operation failed in {} cell(s); \
+         this MME has no SBc-AP association to tell the CBC (#1071)",
         msg.global_enb_id,
-        msg.failed_ecgi_list.len(),
+        msg.failed_ecgi_list.len()
+    );
+    log::debug!(
+        "PWS FAILURE INDICATION from eNB {enb_id}: failed cells {:?}",
         msg.failed_ecgi_list
     );
     true

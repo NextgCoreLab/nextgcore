@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-0f4a9f77.js";
+            window.path_to_searchindex_js = "../searchindex-3d04d415.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -303,7 +303,7 @@ mme:
 <ul>
 <li>ETWS and CMAS warnings (TS 23.041) cannot be delivered. No Write-Replace Warning or Stop Warning arrives from a CBC, so no WRITE-REPLACE WARNING REQUEST or KILL REQUEST is sent to an eNB. The <code>sbc_handler</code> procedures exist, but nothing calls them in production.</li>
 <li>An eNB’s <strong>PWS RESTART INDICATION</strong> (TS 36.413 §8.12.3) is decoded and validated against the sender’s own Global eNB ID. It is counted in <code>mme_s1ap_pws_restart_indications_total</code> and logged, but not propagated to a CBC. TS 23.007 §15A.1.2 has the CBC reload the restarted cells’ warnings; mmed does not replay its own copy.</li>
-<li>An eNB’s <strong>PWS FAILURE INDICATION</strong> (TS 36.413 §8.12.4) is handled in the same way. It is decoded, validated against the sender, counted in <code>mme_s1ap_pws_failure_indications_total</code>, and its failed cells are logged. It is not propagated to a CBC.</li>
+<li>An eNB’s <strong>PWS FAILURE INDICATION</strong> (TS 36.413 §8.12.4) is handled in the same way. It is decoded, validated against the sender, counted in <code>mme_s1ap_pws_failure_indications_total</code>, and logged with its count of failed cells; the cell list itself is logged at debug level. TS 36.413 has the MME act on it as TS 23.041 defines, which means reporting it on to the CBC. mmed does not do that.</li>
 <li>Toward a CBC, mmed sends no SBc-AP PWS Restart Indication, PWS Failure Indication, Write-Replace Warning Indication or Stop Warning Indication.</li>
 </ul>
 </li>
