@@ -22407,6 +22407,22 @@ mod tests {
         (server, addr.port(), seen)
     }
 
+    /// Whether the offload's count of permit-holding exchanges satisfies `want` within
+    /// 10 s (#1056). A spawned exchange holds its permit only once the scheduler first
+    /// polls it, so a test that reads `in_flight()` right after spawning races that.
+    async fn offload_reaches(ngap: &NgapServer, want: impl Fn(usize) -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if want(ngap.sbi_offload.in_flight()) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     fn ng_reset_pdu(reset_type: nextgcore_ngap::types::ResetType) -> Vec<u8> {
         nextgcore_ngap::builder::build_ng_reset(&nextgcore_ngap::types::NgReset {
             cause: nextgcore_ngap::types::Cause::Transport(
@@ -22466,13 +22482,22 @@ mod tests {
         }
 
         // Bounded concurrency: 80 calls at 16 at a time is five waves of the SMF's delay.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // #1056: the first wave is waited for (bounded), not assumed after a fixed sleep:
+        // a loaded run can take longer than that to schedule the spawned calls.
+        assert!(
+            offload_reaches(&ngap, |n| n == MAX_OFFLOADED_SBI).await,
+            "every permit taken: {} in flight",
+            ngap.sbi_offload.in_flight()
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while seen.lock().expect("seen").is_empty() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let in_first_wave = seen.lock().expect("seen").len();
         assert!(
             (1..=MAX_OFFLOADED_SBI).contains(&in_first_wave),
             "{in_first_wave} calls in flight at once"
         );
-        assert_eq!(ngap.sbi_offload.in_flight(), MAX_OFFLOADED_SBI);
         ngap.sbi_offload.settle().await;
         assert_eq!(
             seen.lock().expect("seen").len(),
@@ -22755,10 +22780,12 @@ mod tests {
             "both Acknowledges"
         );
         assert!(ngap.ue_auth_state.get(b).expect("kept").is_cm_idle());
-        assert_eq!(
-            ngap.sbi_offload.in_flight(),
-            1,
-            "the SMF call is still hanging"
+        // #1056: a spawned call holds its permit only once the scheduler first polls
+        // it, so this is waited for (bounded) rather than read at once.
+        assert!(
+            offload_reaches(&ngap, |n| n == 1).await,
+            "the SMF call is hanging, holding its permit: {} in flight",
+            ngap.sbi_offload.in_flight()
         );
         holder.abort();
         for id in [a, b] {
