@@ -469,27 +469,41 @@ pub fn ue_ambr(
         (0, s) | (s, 0) => s,
         (s, sub) => s.min(sub),
     };
-    // BitRate is INTEGER (0..10000000000) (TS 36.413 §9.2.1.20); a higher value
-    // needs the Extended UE-AMBR IEs, which are not sent, so it is clamped
-    // rather than failing the whole message's encode.
-    let clamp = |v: u64| v.min(UE_AMBR_UNKNOWN);
-    let ambr = UeAmbr {
-        dl: clamp(cap(dl, subscribed.downlink)),
-        ul: clamp(cap(ul, subscribed.uplink)),
+    // Above BitRate's 10 Gbit/s (TS 36.413 §9.2.1.20) the value travels in the
+    // Extended UE-AMBR IEs (Rel-15, ExtendedBitRate up to 4 Tbit/s; the encoder
+    // writes them, with the legacy IE at its maximum). Only a value beyond
+    // ExtendedBitRate is clamped, and said so.
+    let clamp = |v: u64, dir: &str| {
+        if v > UE_AMBR_MAX {
+            log::warn!(
+                "UE-AMBR {dir} of {v} bit/s exceeds the largest Extended Bit Rate (TS 36.413 \
+                 §9.2.1.20); signalling {UE_AMBR_MAX} bit/s"
+            );
+        }
+        v.min(UE_AMBR_MAX)
     };
-    if ambr.dl == UE_AMBR_UNKNOWN || ambr.ul == UE_AMBR_UNKNOWN {
+    let unknown = (dl == 0 && subscribed.downlink == 0) || (ul == 0 && subscribed.uplink == 0);
+    let ambr = UeAmbr {
+        dl: clamp(cap(dl, subscribed.downlink), "downlink"),
+        ul: clamp(cap(ul, subscribed.uplink), "uplink"),
+    };
+    if unknown {
         log::warn!(
             "UE-AMBR unknown in a direction (no subscribed UE-AMBR and no APN-AMBR): signalling \
-             the maximum, {UE_AMBR_UNKNOWN} bit/s"
+             {UE_AMBR_UNKNOWN} bit/s, the largest legacy Bit Rate"
         );
     }
     ambr
 }
 
 /// The UE-AMBR signalled when neither the subscription nor any APN-AMBR gives
-/// one, and the ceiling of any UE-AMBR this MME signals: the largest Bit Rate
-/// (TS 36.413 §9.2.1.20, BitRate ::= INTEGER (0..10000000000)).
+/// one: the largest Bit Rate (TS 36.413 §9.2.1.20, BitRate ::= INTEGER
+/// (0..10000000000)), so a legacy eNB reads it without the extension.
 pub const UE_AMBR_UNKNOWN: u64 = 10_000_000_000;
+
+/// The ceiling of any UE-AMBR this MME signals: the largest Extended Bit Rate
+/// (TS 36.413 §9.2.1.20, ExtendedBitRate ::= INTEGER (10000000001..4000000000000)).
+pub const UE_AMBR_MAX: u64 = 4_000_000_000_000;
 
 /// [`ue_ambr`] for `mme_ue`'s ACTIVE PDN connections: those whose bearers have a
 /// Serving GW S1-U endpoint (a Create Session completed). `sess_list` also holds
@@ -1075,10 +1089,21 @@ mod tests {
         assert_eq!(
             ue_ambr(&b(u64::MAX, u64::MAX), [b(u64::MAX, 1), b(1, 1)]),
             UeAmbr {
-                dl: UE_AMBR_UNKNOWN,
+                dl: UE_AMBR_MAX,
                 ul: 2
             },
-            "no overflow, and clamped to the BitRate range"
+            "no overflow, and clamped to the Extended Bit Rate range"
+        );
+        assert_eq!(
+            ue_ambr(
+                &b(20_000_000_000, 20_000_000_000),
+                [b(15_000_000_000, 1_000)]
+            ),
+            UeAmbr {
+                dl: 15_000_000_000,
+                ul: 1_000
+            },
+            "above 10 Gbit/s is kept: it travels in the Extended UE-AMBR IEs"
         );
     }
 

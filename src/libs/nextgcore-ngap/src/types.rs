@@ -821,15 +821,70 @@ pub enum TargetId {
         /// Selected TAI
         selected_tai: TaiListItem,
     },
-    /// Target Global NG-eNB ID (for handover to EPS)
+    /// `targeteNB-ID` (TS 38.413 §9.3.1.25, for a 5GS to EPS handover): the target
+    /// eNB's GlobalNgENB-ID and the selected EPS TAI.
     TargetGlobalNgEnbId {
-        /// PLMN Identity
+        /// PLMN Identity of the GlobalNgENB-ID
         plmn_identity: [u8; 3],
-        /// ng-eNB ID
-        ng_enb_id: u32,
-        /// Selected TAI
-        selected_tai: TaiListItem,
+        /// The ngENB-ID CHOICE, with its length kept: a macro, short macro and long
+        /// macro id are different identities even when their values are equal, and
+        /// TS 29.274 §8.51 encodes each under its own Target Type.
+        ng_enb_id: NgEnbId,
+        /// selected-EPS-TAI (TS 38.413 §9.3.3.11): an EPS TAI, with a 2-octet TAC.
+        selected_eps_tai: EpsTai,
     },
+}
+
+/// NgENB-ID (TS 38.413 §9.3.1.8): the CHOICE of the three eNB id lengths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NgEnbId {
+    /// `macroNgENB-ID`, BIT STRING (SIZE(20))
+    Macro(u32),
+    /// `shortMacroNgENB-ID`, BIT STRING (SIZE(18))
+    ShortMacro(u32),
+    /// `longMacroNgENB-ID`, BIT STRING (SIZE(21))
+    LongMacro(u32),
+}
+
+impl NgEnbId {
+    /// The BIT STRING size of this alternative.
+    pub fn bit_len(&self) -> usize {
+        match self {
+            NgEnbId::Macro(_) => 20,
+            NgEnbId::ShortMacro(_) => 18,
+            NgEnbId::LongMacro(_) => 21,
+        }
+    }
+
+    /// The id value, right-aligned.
+    pub fn value(&self) -> u32 {
+        match *self {
+            NgEnbId::Macro(v) | NgEnbId::ShortMacro(v) | NgEnbId::LongMacro(v) => v,
+        }
+    }
+
+    /// The CHOICE index (TS 38.413 ASN.1 order).
+    pub fn choice_index(&self) -> usize {
+        match self {
+            NgEnbId::Macro(_) => 0,
+            NgEnbId::ShortMacro(_) => 1,
+            NgEnbId::LongMacro(_) => 2,
+        }
+    }
+
+    /// Whether the value fits in its BIT STRING size.
+    pub fn fits(&self) -> bool {
+        u64::from(self.value()) < (1u64 << self.bit_len())
+    }
+}
+
+/// EPS-TAI (TS 38.413 §9.3.3.11): a PLMN and a 2-octet EPS TAC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpsTai {
+    /// PLMN Identity
+    pub plmn_identity: [u8; 3],
+    /// EPS TAC (TS 38.413 §9.3.3.12), OCTET STRING (SIZE(2))
+    pub tac: [u8; 2],
 }
 
 /// Security Context

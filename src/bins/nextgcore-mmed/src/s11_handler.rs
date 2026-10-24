@@ -373,11 +373,24 @@ pub fn dispatch_triggered(raw: &[u8], msg_type: u8, sequence_number: u32, peer: 
             Err(e) => log::error!("S11 Delete Session Response from {peer} unparsable: {e:?}"),
         },
         mt::RELEASE_ACCESS_BEARERS_RESPONSE => match handle_release_access_bearers_response(raw) {
-            Ok(data) => log::info!(
-                "S11 Release Access Bearers Response from {peer} (seq={sequence_number}) \
+            Ok(data) => {
+                log::info!(
+                    "S11 Release Access Bearers Response from {peer} (seq={sequence_number}) \
                      cause={}",
-                data.cause
-            ),
+                    data.cause
+                );
+                // #956, TS 23.401 §5.3.5 step 5: the S1 release continues with
+                // the UE CONTEXT RELEASE COMMAND, whatever the cause: the eNB
+                // asked for the release.
+                if let Some(enb_ue_id) = crate::gtp_path::take_pending_s1_release(sequence_number) {
+                    for send in crate::s1ap_handler::s1_release_command(
+                        crate::context::mme_self(),
+                        enb_ue_id,
+                    ) {
+                        crate::s1ap_path::s1ap_send(send);
+                    }
+                }
+            }
             Err(e) => {
                 log::error!("S11 Release Access Bearers Response from {peer} unparsable: {e:?}")
             }
@@ -1004,11 +1017,15 @@ pub fn dispatch_initial(raw: &[u8], msg_type: u8, sequence_number: u32, peer: So
                 let local_teid = parse_gtp_header(raw)
                     .map(|(_, teid, _, _)| teid)
                     .unwrap_or(0);
+                // #956, TS 23.401 §5.3.4.3: an ECM-IDLE UE is paged. The Ack is
+                // addressed to the Serving GW's TEID, not echoed back with ours.
+                let (sgw_teid, cause) =
+                    downlink_data_notification(crate::context::mme_self(), local_teid);
                 if let Err(e) = crate::gtp_path::send_downlink_data_notification_ack_to(
                     peer,
-                    local_teid,
+                    sgw_teid,
                     sequence_number,
-                    crate::s11_build::GtpCause::RequestAccepted,
+                    cause,
                 ) {
                     log::error!("S11 Downlink Data Notification Ack to {peer} failed: {e}");
                 }
@@ -1020,6 +1037,66 @@ pub fn dispatch_initial(raw: &[u8], msg_type: u8, sequence_number: u32, peer: So
             "S11 initial message type={other} seq={sequence_number} from {peer} not handled: this \
              MME originates no procedure for it"
         ),
+    }
+}
+
+/// Act on a Downlink Data Notification for the UE whose S11 TEID is
+/// `mme_s11_teid` (TS 23.401 §5.3.4.3 steps 2-3, #956). Returns the Serving GW
+/// TEID and the cause of the Acknowledge:
+/// - no such UE: Context not found, TEID 0 (TS 29.274 §5.5.2);
+/// - ECM-CONNECTED, or already being paged: Request accepted, nothing more;
+/// - ECM-IDLE: paged on every eNB serving its tracking area (TS 36.413 §8.5),
+///   Request accepted, or Unable to page UE when no eNB serves it.
+pub fn downlink_data_notification(
+    ctx: &crate::context::MmeContext,
+    mme_s11_teid: u32,
+) -> (u32, crate::s11_build::GtpCause) {
+    use crate::s11_build::GtpCause;
+    let Some(mme_ue) = ctx
+        .mme_ue_find_by_s11_local_teid(mme_s11_teid)
+        .and_then(|id| ctx.mme_ue_find_by_id(id))
+    else {
+        return (0, GtpCause::ContextNotFound);
+    };
+    let sgw_teid = ctx
+        .sgw_ue_find_by_id(mme_ue.sgw_ue_id)
+        .map(|s| s.sgw_s11_teid)
+        .unwrap_or(0);
+    let enb_ue = ctx
+        .enb_ue_find_by_id(mme_ue.enb_ue_id)
+        .filter(|e| e.mme_ue_id == mme_ue.id);
+    if let Some(enb_ue) = enb_ue {
+        // #961 review: between the Release Access Bearers Response and the UE
+        // CONTEXT RELEASE COMPLETE the UE still has an eNB UE context, but the
+        // Serving GW already buffers. It sends one DDN for that data, so the UE
+        // is paged as soon as the release completes.
+        if enb_ue.ue_ctx_rel_action == crate::context::UeCtxRelAction::S1ContextRemove {
+            if let Some(ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&mme_ue.id) {
+                ue.ddn_pending_after_release = true;
+            }
+            log::info!(
+                "[{}] Downlink Data Notification during the S1 release: paging when it completes",
+                mme_ue.imsi_bcd
+            );
+        }
+        return (sgw_teid, GtpCause::RequestAccepted);
+    }
+    if mme_ue.t3413.is_running() {
+        log::debug!(
+            "[{}] Downlink Data Notification while paging",
+            mme_ue.imsi_bcd
+        );
+        return (sgw_teid, GtpCause::RequestAccepted);
+    }
+    let enbs = crate::paging::page_ue(
+        ctx,
+        mme_ue.id,
+        crate::context::PagingType::DownlinkDataNotification,
+    );
+    if enbs == 0 {
+        (sgw_teid, GtpCause::UnableToPageUe)
+    } else {
+        (sgw_teid, GtpCause::RequestAccepted)
     }
 }
 

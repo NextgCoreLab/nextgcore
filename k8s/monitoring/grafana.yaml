@@ -65,8 +65,15 @@ spec:
           env:
             - name: GF_SECURITY_ADMIN_USER
               value: admin
+            # No credential in the manifest (#837 review). The Secret is
+            # required: without it the pod does not start (fail closed), rather
+            # than come up with Grafana's built-in admin/admin. k8s/deploy.sh
+            # creates it with a generated password when it is absent.
             - name: GF_SECURITY_ADMIN_PASSWORD
-              value: nextgcore
+              valueFrom:
+                secretKeyRef:
+                  name: grafana-admin
+                  key: password
           resources:
             requests:
               cpu: 50m

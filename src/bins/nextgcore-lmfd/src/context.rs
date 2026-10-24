@@ -330,6 +330,21 @@ pub(crate) fn multi_rtt_observations_for_test(
     multi_rtt_observations(measurements, registry)
 }
 
+/// An LPP Capability Transfer in flight (#906).
+struct CapabilityExchange {
+    supi: String,
+    lpp_transaction: u8,
+    /// Everyone waiting on the answer: the request that started the exchange and
+    /// any concurrent request for the same UE that joined it.
+    waiters: Vec<tokio::sync::oneshot::Sender<()>>,
+}
+
+/// How long a UE that left a `RequestCapabilities` unanswered is not asked again
+/// (#906). Five minutes: long enough that a UE without LPP capability support
+/// does not cost every request a capability wait, short enough that a UE that
+/// was briefly unreachable is asked again soon.
+pub const CAPABILITY_RETRY: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// An NRPPa exchange waiting for its answer (#807).
 struct NrppaWaiter {
     sender: tokio::sync::oneshot::Sender<Vec<u8>>,
@@ -405,6 +420,14 @@ pub struct LmfContext {
     ue_capabilities: RwLock<HashMap<String, crate::codec_glue::UeLppCapability>>,
     /// The E-CID flavours each UE reported (#834 review), keyed by SUPI.
     ue_ecid_flavours: RwLock<HashMap<String, crate::codec_glue::EcidFlavours>>,
+    /// The NR multilateration methods each UE reported (#906), keyed by SUPI.
+    ue_nr_methods: RwLock<HashMap<String, crate::codec_glue::NrMethods>>,
+    /// LPP Capability Transfers in flight (#906, TS 37.355 §5.1.1), keyed by the
+    /// lcsCorrelationId their `RequestCapabilities` was sent with.
+    capability_exchanges: RwLock<HashMap<String, CapabilityExchange>>,
+    /// When each UE last left a `RequestCapabilities` unanswered (#906), so a UE
+    /// that does not answer is not asked again on every request.
+    capability_unanswered: RwLock<HashMap<String, std::time::Instant>>,
     /// Sidelink ranges reported by each UE (TS 23.586 §5.3.3, nextgsim #138), keyed
     /// by SUPI. The LATEST report per UE replaces the previous one: a range is a
     /// snapshot, and accumulating them would make an LMF answer with a distance the
@@ -501,6 +524,9 @@ impl LmfContext {
             cell_registry: RwLock::new(HashMap::new()),
             ue_capabilities: RwLock::new(HashMap::new()),
             ue_ecid_flavours: RwLock::new(HashMap::new()),
+            ue_nr_methods: RwLock::new(HashMap::new()),
+            capability_exchanges: RwLock::new(HashMap::new()),
+            capability_unanswered: RwLock::new(HashMap::new()),
             sidelink_ranges: RwLock::new(HashMap::new()),
             up_subscriptions: RwLock::new(HashMap::new()),
             up_configs: RwLock::new(HashMap::new()),
@@ -1585,6 +1611,126 @@ impl LmfContext {
     pub fn note_ue_ecid_flavours(&self, supi: &str, flavours: crate::codec_glue::EcidFlavours) {
         if let Ok(mut c) = self.ue_ecid_flavours.write() {
             c.insert(supi.to_string(), flavours);
+        }
+    }
+
+    /// The NR multilateration methods `supi` reported (#906), or none known.
+    pub fn ue_nr_methods(&self, supi: &str) -> crate::codec_glue::NrMethods {
+        self.ue_nr_methods
+            .read()
+            .ok()
+            .and_then(|c| c.get(supi).copied())
+            .unwrap_or_default()
+    }
+
+    /// Record everything a UE's `ProvideCapabilities` said (#906), and release
+    /// whoever waits on a Capability Transfer for it.
+    pub fn note_ue_capabilities(&self, supi: &str, caps: &crate::codec_glue::ReportedCapabilities) {
+        self.note_ue_lpp_capability(supi, caps.class);
+        self.note_ue_ecid_flavours(supi, caps.ecid);
+        if let Ok(mut c) = self.ue_nr_methods.write() {
+            c.insert(supi.to_string(), caps.nr);
+        }
+        if let Ok(mut u) = self.capability_unanswered.write() {
+            u.remove(supi);
+        }
+        let done: Vec<CapabilityExchange> = match self.capability_exchanges.write() {
+            Ok(mut x) => {
+                let keys: Vec<String> = x
+                    .iter()
+                    .filter(|(_, e)| e.supi == supi)
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                keys.iter().filter_map(|k| x.remove(k)).collect()
+            }
+            Err(_) => Vec::new(),
+        };
+        for e in done {
+            for w in e.waiters {
+                let _ = w.send(());
+            }
+        }
+    }
+
+    /// Whether `supi` has reported its capabilities: then they are not asked for
+    /// again (#906). A report naming nothing this LMF can request still counts.
+    pub fn ue_capabilities_reported(&self, supi: &str) -> bool {
+        self.ue_capabilities
+            .read()
+            .is_ok_and(|c| c.contains_key(supi))
+    }
+
+    /// Start, or join, the Capability Transfer for `supi` (#906). Returns the
+    /// lcsCorrelationId, a receiver that fires when the UE's `ProvideCapabilities`
+    /// is recorded, and whether this call started the exchange (and so must send
+    /// the `RequestCapabilities`). `None` when the UE need not be asked: it has
+    /// reported, or it left a request unanswered less than
+    /// [`CAPABILITY_RETRY`] ago.
+    pub fn capability_exchange_begin(
+        &self,
+        supi: &str,
+        lpp_transaction: u8,
+    ) -> Option<(String, tokio::sync::oneshot::Receiver<()>, bool)> {
+        if self.ue_capabilities_reported(supi) {
+            return None;
+        }
+        if let Ok(mut u) = self.capability_unanswered.write() {
+            u.retain(|_, at| at.elapsed() < CAPABILITY_RETRY);
+            if u.contains_key(supi) {
+                return None;
+            }
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut x = self.capability_exchanges.write().ok()?;
+        if let Some((corr, e)) = x.iter_mut().find(|(_, e)| e.supi == supi) {
+            e.waiters.push(tx);
+            return Some((corr.clone(), rx, false));
+        }
+        let corr = uuid::Uuid::new_v4().to_string();
+        x.insert(
+            corr.clone(),
+            CapabilityExchange {
+                supi: supi.to_string(),
+                lpp_transaction,
+                waiters: vec![tx],
+            },
+        );
+        Some((corr, rx, true))
+    }
+
+    /// The UE a `ProvideCapabilities` answers for (#906): the Capability Transfer
+    /// named by `lcs_correlation_id`, else the one on `lpp_transaction` (TS 37.355
+    /// §5.1.1: the answer is on the request's transaction).
+    pub fn capability_exchange_supi(
+        &self,
+        lcs_correlation_id: Option<&str>,
+        lpp_transaction: Option<u8>,
+    ) -> Option<String> {
+        let x = self.capability_exchanges.read().ok()?;
+        if let Some(e) = lcs_correlation_id.and_then(|c| x.get(c)) {
+            return Some(e.supi.clone());
+        }
+        let txn = lpp_transaction?;
+        let mut on_txn = x.values().filter(|e| e.lpp_transaction == txn);
+        match (on_txn.next(), on_txn.next()) {
+            // Two exchanges on one 8-bit number: the answer names neither.
+            (Some(e), None) => Some(e.supi.clone()),
+            _ => None,
+        }
+    }
+
+    /// Give up on the Capability Transfer `corr` (#906): the UE did not answer in
+    /// time, or the request was not delivered. The UE is not asked again for
+    /// [`CAPABILITY_RETRY`]; a late answer is still recorded, through the
+    /// positioning session the next request opens.
+    pub fn capability_exchange_abandon(&self, corr: &str) {
+        let gone = self
+            .capability_exchanges
+            .write()
+            .ok()
+            .and_then(|mut x| x.remove(corr));
+        if let (Some(e), Ok(mut u)) = (gone, self.capability_unanswered.write()) {
+            u.insert(e.supi, std::time::Instant::now());
         }
     }
 
@@ -4500,5 +4646,94 @@ mod tests_session_bounds {
             "its measurement slot is freed"
         );
         assert!(c.measurement_find(young_id).is_some());
+    }
+}
+
+/// #906: the LPP Capability Transfer registry.
+#[cfg(test)]
+mod tests_capability_exchange {
+    use super::*;
+    use crate::codec_glue::{EcidFlavours, NrMethods, ReportedCapabilities, UeLppCapability};
+
+    fn report(class: UeLppCapability) -> ReportedCapabilities {
+        ReportedCapabilities {
+            class,
+            ecid: EcidFlavours::default(),
+            nr: NrMethods {
+                multi_rtt: false,
+                dl_tdoa: true,
+            },
+            transaction: None,
+        }
+    }
+
+    /// The first request for a UE starts the exchange; a concurrent one joins it
+    /// (no second RequestCapabilities); the answer releases both.
+    #[test]
+    fn a_concurrent_request_joins_the_exchange_and_both_are_released() {
+        let c = LmfContext::new();
+        let (corr, mut rx1, started) = c.capability_exchange_begin("imsi-1", 10).unwrap();
+        assert!(started);
+        let (corr2, mut rx2, started2) = c.capability_exchange_begin("imsi-1", 11).unwrap();
+        assert!(!started2, "joined, not a second RequestCapabilities");
+        assert_eq!(corr, corr2);
+        assert_eq!(
+            c.capability_exchange_supi(Some(&corr), None).as_deref(),
+            Some("imsi-1")
+        );
+        c.note_ue_capabilities("imsi-1", &report(UeLppCapability::AdvancedMethods));
+        assert!(rx1.try_recv().is_ok());
+        assert!(rx2.try_recv().is_ok());
+        assert_eq!(
+            c.ue_nr_methods("imsi-1"),
+            NrMethods {
+                multi_rtt: false,
+                dl_tdoa: true
+            }
+        );
+        assert!(c.capability_exchange_supi(Some(&corr), None).is_none());
+        assert!(
+            c.capability_exchange_begin("imsi-1", 12).is_none(),
+            "reported: not asked again"
+        );
+    }
+
+    /// A report naming nothing this LMF can request still counts as reported.
+    #[test]
+    fn an_unknown_class_report_is_not_asked_for_again() {
+        let c = LmfContext::new();
+        c.note_ue_capabilities("imsi-2", &report(UeLppCapability::Unknown));
+        assert!(c.capability_exchange_begin("imsi-2", 1).is_none());
+    }
+
+    /// An unanswered exchange backs off for CAPABILITY_RETRY, per UE.
+    #[test]
+    fn an_unanswered_exchange_backs_off() {
+        let c = LmfContext::new();
+        let (corr, _rx, _) = c.capability_exchange_begin("imsi-3", 1).unwrap();
+        c.capability_exchange_abandon(&corr);
+        assert!(c.capability_exchange_begin("imsi-3", 2).is_none());
+        assert!(c.capability_exchange_begin("imsi-4", 3).is_some());
+        // Once the back-off has run out, the UE is asked again.
+        c.capability_unanswered.write().unwrap().insert(
+            "imsi-3".into(),
+            std::time::Instant::now() - CAPABILITY_RETRY,
+        );
+        assert!(c.capability_exchange_begin("imsi-3", 4).is_some());
+    }
+
+    /// An answer without the correlation is found by its transaction, unless two
+    /// exchanges share the 8-bit number.
+    #[test]
+    fn an_answer_is_found_by_transaction_only_when_unambiguous() {
+        let c = LmfContext::new();
+        c.capability_exchange_begin("imsi-5", 7).unwrap();
+        assert_eq!(
+            c.capability_exchange_supi(None, Some(7)).as_deref(),
+            Some("imsi-5")
+        );
+        assert!(c.capability_exchange_supi(None, Some(8)).is_none());
+        c.capability_exchange_begin("imsi-6", 7).unwrap();
+        assert!(c.capability_exchange_supi(None, Some(7)).is_none());
     }
 }
