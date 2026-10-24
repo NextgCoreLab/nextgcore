@@ -284,6 +284,28 @@ impl KernelSctpSocket {
         Ok(sent as usize)
     }
 
+    /// The association's negotiated `(inbound, outbound)` stream counts, read with
+    /// `getsockopt(SCTP_STATUS)` (RFC 6458 §8.2.1): `sstat_instrms` / `sstat_outstrms`,
+    /// i.e. the configured counts lowered to what the peer offered in its INIT / INIT ACK.
+    /// An outbound stream identifier must be below the outbound count (#813).
+    pub fn negotiated_streams(&self) -> Result<(u16, u16)> {
+        let mut status: SctpStatus = unsafe { mem::zeroed() };
+        let mut len = mem::size_of::<SctpStatus>() as socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                self.fd.as_raw_fd(),
+                SOL_SCTP,
+                libc::SCTP_STATUS,
+                &mut status as *mut SctpStatus as *mut c_void,
+                &mut len,
+            )
+        };
+        if result < 0 {
+            return Err(SctpError::SockoptFailed(io::Error::last_os_error()));
+        }
+        Ok((status.sstat_instrms, status.sstat_outstrms))
+    }
+
     /// Receive a single SCTP message, returning the byte count, the decoded
     /// send/receive info (PPID restored to host order, stream number) and the
     /// raw `msg_flags`. `msg_flags & MSG_NOTIFICATION` marks an SCTP event
@@ -511,6 +533,25 @@ impl KernelSctpSocket {
     }
 }
 
+/// `struct sctp_status` (`<linux/sctp.h>`, RFC 6458 §8.2.1). libc does not define it.
+/// The trailing `struct sctp_paddrinfo` (packed, aligned 4: an `sctp_assoc_t`, a
+/// 128-octet `sockaddr_storage` and five 32-bit fields) is kept as opaque octets.
+#[repr(C)]
+struct SctpStatus {
+    sstat_assoc_id: i32,
+    sstat_state: i32,
+    sstat_rwnd: u32,
+    sstat_unackdata: u16,
+    sstat_penddata: u16,
+    sstat_instrms: u16,
+    sstat_outstrms: u16,
+    sstat_fragmentation_point: u32,
+    sstat_primary: [u8; 152],
+}
+
+// The kernel rejects a shorter option buffer with EINVAL, so the layout is pinned.
+const _: () = assert!(mem::size_of::<SctpStatus>() == 176);
+
 impl AsRawFd for KernelSctpSocket {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
@@ -579,6 +620,22 @@ fn sockaddr_to_socketaddr(storage: &libc::sockaddr_storage, len: socklen_t) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #813 (review of #870, MINOR 5): `negotiated_streams` reads the kernel's
+    /// `SCTP_STATUS` on a real loopback association. Both ends offer 10 / 10, so the
+    /// accepted socket reports 10 outbound streams. Ignored by default: it needs the SCTP
+    /// kernel module and libsctp; run with `--features kernel -- --ignored`.
+    #[test]
+    #[ignore = "needs the SCTP kernel module and libsctp"]
+    fn negotiated_streams_reads_sctp_status_on_a_live_association() {
+        let server = KernelSctpSocket::server("127.0.0.1:0".parse().unwrap()).expect("server");
+        let _client = KernelSctpSocket::client(server.local_addr(), None).expect("client");
+        let (accepted, _) = server.accept().expect("accept");
+        assert_eq!(
+            accepted.negotiated_streams().expect("SCTP_STATUS"),
+            (10, 10)
+        );
+    }
 
     /// `SctpEventSubscribe` is the one SCTP struct `libc` lacks, so it is still
     /// transcribed and handed to `setsockopt` by size: a dropped, reordered or
