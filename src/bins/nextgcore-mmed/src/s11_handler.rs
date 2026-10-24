@@ -943,7 +943,9 @@ fn continue_attach(
         return;
     }
 
-    match crate::nas_path::nas_eps_send_attach_accept(mme_ue, &enb_ue, &sess, &bearer) {
+    // #811: the UE-AMBR of the active APNs (TS 23.401 §4.7.3).
+    let ue_ambr = crate::s1ap_build::ue_ambr_of(ctx, mme_ue);
+    match crate::nas_path::nas_eps_send_attach_accept(mme_ue, &enb_ue, &sess, &bearer, ue_ambr) {
         Ok(()) => log::info!(
             "[{}] Attach Accept sent in an Initial Context Setup Request (EBI {})",
             mme_ue.imsi_bcd,
@@ -2464,6 +2466,47 @@ mod tests {
         ctx.mme_ue_remove(mme_ue_id);
     }
 
+    /// #852 review: a Change Notification nobody answers (N3 exhausted) does not
+    /// leave its parked record behind.
+    #[test]
+    fn an_unanswered_change_notification_is_pruned_at_n3() {
+        let _guard = crate::gtp_path::lock_s11();
+        let (mme_ue_id, _, sess_id, bearer_id, _) = seed_global_ue(5);
+        let ctx = crate::context::mme_self();
+        let sgw = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server = crate::gtp_path::GtpcServer::open(
+            "127.0.0.1:0",
+            nextgcore_gtp::v2::xact::Gtp2XactConfig {
+                t3_response: std::time::Duration::from_millis(100),
+                n3_requests: 1,
+                response_hold: std::time::Duration::from_secs(1),
+            },
+            7,
+        )
+        .unwrap();
+        let seq = crate::gtp_path::send_change_notification_on(
+            &server,
+            sgw.local_addr().unwrap(),
+            ctx,
+            mme_ue_id,
+            sess_id,
+        )
+        .expect("sent");
+        assert!(crate::gtp_path::change_notification_pending(seq));
+        for _ in 0..300 {
+            if !crate::gtp_path::change_notification_pending(seq) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !crate::gtp_path::change_notification_pending(seq),
+            "pruned when N3 runs out"
+        );
+        server.close();
+        release_global_ue(mme_ue_id, sess_id, bearer_id);
+    }
+
     /// #593: a Change Notification Request reaches the Serving GW on a real S11
     /// socket, and the Change Notification Response closes it, its Change
     /// Reporting Action replacing the PDN connection's.
@@ -2973,6 +3016,77 @@ mod tests {
             bearer.ebi
         );
 
+        release_global_ue(mme_ue_id, sess_id, bearer_id);
+        crate::gtp_path::clear_pending_creates_for_test();
+    }
+
+    /// #811, TS 23.401 §4.7.3: the Initial Context Setup Request that carries
+    /// the Attach Accept signals the UE-AMBR as the sum of the ACTIVE APNs'
+    /// APN-AMBRs up to the subscribed UE-AMBR, not the subscribed value as such.
+    /// A subscribed APN that is not connected (no S1-U endpoint) does not count.
+    #[test]
+    fn the_attach_initial_context_setup_carries_the_ue_ambr_of_the_active_apns() {
+        use nextgcore_s1ap_gen::generated as g;
+        let _guard = crate::gtp_path::lock_s11();
+        crate::gtp_path::clear_pending_creates_for_test();
+        let (mme_ue_id, enb_ue_id, sess_id, bearer_id, local_teid) = seed_global_ue(5);
+        let ctx = crate::context::mme_self();
+        let enb_id = ctx.enb_ue_find_by_id(enb_ue_id).unwrap().enb_id;
+        // Subscribed UE-AMBR 1 Gbit/s; the APN 10 / 5 Mbit/s; a second,
+        // not connected subscribed APN of 50 Mbit/s.
+        let idle_sess = ctx.sess_add(mme_ue_id, 0);
+        {
+            let mut pool = ctx.mme_ue_pool.write().unwrap();
+            let ue = pool.get_mut(&mme_ue_id).unwrap();
+            ue.ambr.downlink = 1_000_000_000;
+            ue.ambr.uplink = 1_000_000_000;
+            ue.sess_list.push(idle_sess);
+        }
+        {
+            let mut pool = ctx.sess_pool.write().unwrap();
+            let s = pool.get_mut(&sess_id).unwrap();
+            s.ambr.downlink = 10_000_000;
+            s.ambr.uplink = 5_000_000;
+            let i = pool.get_mut(&idle_sess).unwrap();
+            i.ambr.downlink = 50_000_000;
+            i.ambr.uplink = 50_000_000;
+        }
+        crate::s1ap_path::tap_enb_for_test(enb_id);
+        crate::gtp_path::record_pending_create_for_test(
+            4811,
+            crate::gtp_path::PendingCreate {
+                create_action: GtpCreateAction::AttachRequest,
+                enb_ue_id,
+                sess_id,
+            },
+        );
+        apply_create_session_response(
+            &accepted_response(5, [10, 45, 0, 11]),
+            local_teid,
+            4811,
+            "127.0.0.1:2123".parse().unwrap(),
+        );
+        let ambr = crate::s1ap_path::take_tapped_for_test(enb_id)
+            .into_iter()
+            .find_map(|pdu| match nextgcore_s1ap_gen::decode(&pdu) {
+                Ok(g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+                    value: g::InitiatingMessageValue::Id_InitialContextSetup(req),
+                    ..
+                })) => req.protocol_i_es.0.into_iter().find_map(|ie| match ie.value {
+                    g::InitialContextSetupRequestProtocolIEs_EntryValue::Id_uEaggregateMaximumBitrate(a) => {
+                        Some((a.u_eaggregate_maximum_bit_rate_dl.0, a.u_eaggregate_maximum_bit_rate_ul.0))
+                    }
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("an Initial Context Setup Request with a UE-AMBR");
+        assert_eq!(
+            ambr,
+            (10_000_000, 5_000_000),
+            "min(subscribed, sum of active APN-AMBRs)"
+        );
+        ctx.sess_remove(idle_sess);
         release_global_ue(mme_ue_id, sess_id, bearer_id);
         crate::gtp_path::clear_pending_creates_for_test();
     }

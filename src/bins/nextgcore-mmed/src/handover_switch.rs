@@ -95,24 +95,7 @@ pub fn only_pdns_with_a_switched_default(
 /// zero APN-AMBR sum (not known) falls back to the subscribed value.
 pub fn ue_ambr(ctx: &MmeContext, mme_ue_id: u64) -> Option<nextgcore_s1ap::UeAmbr> {
     let ue = ctx.mme_ue_find_by_id(mme_ue_id)?;
-    let (mut dl, mut ul) = (0u64, 0u64);
-    for sess in ue
-        .sess_list
-        .iter()
-        .filter_map(|id| ctx.sess_find_by_id(*id))
-    {
-        dl = dl.saturating_add(sess.ambr.downlink);
-        ul = ul.saturating_add(sess.ambr.uplink);
-    }
-    let cap = |sum: u64, subscribed: u64| match (sum, subscribed) {
-        (0, s) => s,
-        (s, 0) => s,
-        (s, sub) => s.min(sub),
-    };
-    Some(nextgcore_s1ap::UeAmbr {
-        dl: cap(dl, ue.ambr.downlink),
-        ul: cap(ul, ue.ambr.uplink),
-    })
+    Some(crate::s1ap_build::ue_ambr_of(ctx, &ue))
 }
 
 /// Handover failures in the core, by reason, for operators (#730 review m7).

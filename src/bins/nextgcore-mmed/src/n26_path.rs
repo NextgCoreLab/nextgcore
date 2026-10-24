@@ -875,11 +875,24 @@ fn handle_datagram(inner: &Arc<N26Inner>, data: &[u8], peer: SocketAddr) {
                     crate::s1ap_path::s1ap_send(send);
                 }
             }
-            None => log::info!(
-                "N26 Forward Relocation Complete Notification (TEID {:#x}, seq={seq}) from \
-                 {peer} matches no EPS to 5GS relocation in flight",
-                msg.header.teid.unwrap_or(0)
-            ),
+            None => {
+                // TS 29.274 §5.5.2: an unknown TEID-C is answered "Context not found" with
+                // header TEID 0, so the AMF stops retransmitting now rather than after N3 x T3
+                // and knows this MME holds no such relocation. Cached like any response, so a
+                // retransmission gets the same answer.
+                log::info!(
+                    "N26 Forward Relocation Complete Notification (TEID {:#x}, seq={seq}) from \
+                     {peer} matches no EPS to 5GS relocation in flight: answered 'Context not \
+                     found'",
+                    msg.header.teid.unwrap_or(0)
+                );
+                let ack = n26_build::build_forward_relocation_complete_acknowledge(
+                    seq,
+                    0,
+                    n26_build::CAUSE_CONTEXT_NOT_FOUND,
+                );
+                send_response_from(inner, peer, &ack);
+            }
         }
         return;
     }
@@ -1189,12 +1202,6 @@ fn select_target_enb(
     Some(id)
 }
 
-/// Send a triggered message from the receive thread, caching it for retransmission.
-///
-/// The receive thread holds `&Arc<N26Inner>` rather than an `N26Server`, so this is the same
-/// send [`N26Server::send_response`] performs, reached from where the datagram was decoded. One
-/// function rather than two spellings of "cache then send", because a cached response that
-/// differs from the sent one is how a retransmitted request gets a different answer.
 /// The response this MME already sent for initial message `msg_type` at
 /// (`peer`, `seq`), if one is cached and it answers that message type: a
 /// sequence number alone does not name one transaction (the S11 rule,
@@ -1210,6 +1217,12 @@ fn cached_response_for(
     (cached.get(1) == Some(&expected)).then_some(cached)
 }
 
+/// Send a triggered message from the receive thread, caching it for retransmission.
+///
+/// The receive thread holds `&Arc<N26Inner>` rather than an `N26Server`, so this is the same
+/// send [`N26Server::send_response`] performs, reached from where the datagram was decoded. One
+/// function rather than two spellings of "cache then send", because a cached response that
+/// differs from the sent one is how a retransmitted request gets a different answer.
 fn send_response_from(inner: &Arc<N26Inner>, peer: SocketAddr, msg: &Gtp2Message) {
     let encoded = Bytes::from(msg.encode().to_vec());
     if let Ok(mut xact) = inner.xact.lock() {
@@ -1586,6 +1599,54 @@ pub fn reject_inter_system_tau(ctx: &MmeContext, pending: PendingContextRequest,
     }
 }
 
+/// The AMF's T3-RESPONSE in seconds (TS 29.274 §7.6), used to size how long a sent N26
+/// response is kept for its retransmitted request.
+pub const N26_PEER_T3_ENV: &str = "MME_N26_PEER_T3_SECS";
+/// The AMF's N3-REQUESTS (TS 29.274 §7.6), with [`N26_PEER_T3_ENV`].
+pub const N26_PEER_N3_ENV: &str = "MME_N26_PEER_N3";
+
+/// The N26 transaction config, its response hold derived from the AMF's timers.
+///
+/// TS 29.274 §7.6: a retransmitted initial message is answered with the response already
+/// sent. The AMF retransmits up to N3 times, T3 apart, so a cached response must outlive
+/// (N3 + 1) x T3 of the **peer's** timers, not this MME's: an AMF configured with a longer
+/// schedule than ours would otherwise retransmit after the entry had gone and have its
+/// Forward Relocation Request processed a second time. Unset or unparsable values fall back to
+/// the TS 29.274 defaults this tree uses everywhere (T3 = 3 s, N3 = 3, a 12 s hold); an
+/// unparsable one is logged, since silently using the default is how a mistyped override goes
+/// unnoticed. T3 is floored at 1 s: a zero T3 would make the hold zero and the cache useless.
+pub fn n26_xact_config(peer_t3: Option<&str>, peer_n3: Option<&str>) -> Gtp2XactConfig {
+    let base = Gtp2XactConfig::default();
+    let t3 = match peer_t3.map(|v| v.trim().parse::<u64>()) {
+        None => base.t3_response,
+        Some(Ok(secs)) => std::time::Duration::from_secs(secs.max(1)),
+        Some(Err(_)) => {
+            log::warn!(
+                "{N26_PEER_T3_ENV}={:?} is not a whole number of seconds; using {}s",
+                peer_t3.unwrap_or_default(),
+                base.t3_response.as_secs()
+            );
+            base.t3_response
+        }
+    };
+    let n3 = match peer_n3.map(|v| v.trim().parse::<u32>()) {
+        None => base.n3_requests,
+        Some(Ok(n)) => n,
+        Some(Err(_)) => {
+            log::warn!(
+                "{N26_PEER_N3_ENV}={:?} is not a whole number; using {}",
+                peer_n3.unwrap_or_default(),
+                base.n3_requests
+            );
+            base.n3_requests
+        }
+    };
+    Gtp2XactConfig {
+        response_hold: t3.saturating_mul(n3.saturating_add(1)),
+        ..base
+    }
+}
+
 /// Bind the N26 socket from configuration and install it process-wide.
 ///
 /// Returns `Ok(())` and logs why when the leg is off or no address is configured: an MME
@@ -1623,7 +1684,11 @@ pub fn n26_open() -> Result<(), String> {
     let restart_counter = crate::gtp_path::server()
         .map(|s| s.restart_counter())
         .unwrap_or(0);
-    let server = N26Server::open(bind, Gtp2XactConfig::default(), restart_counter)?;
+    let config = n26_xact_config(
+        std::env::var(N26_PEER_T3_ENV).ok().as_deref(),
+        std::env::var(N26_PEER_N3_ENV).ok().as_deref(),
+    );
+    let server = N26Server::open(bind, config, restart_counter)?;
     if !install_server(server) {
         log::warn!("an N26 server is already installed; this one is dropped");
     }
@@ -1669,6 +1734,26 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         };
+        // #934: the receive thread closes the transaction BEFORE it dispatches
+        // the response to the procedure (`handle_datagram`), so `outstanding()`
+        // reaching 0 does not mean the procedure has run. Under a loaded full
+        // suite the thread can be descheduled between the two, and asserting the
+        // procedure's effect right after `wait_idle` then fails. The effect is
+        // waited for instead (bounded), and asserted after.
+        let wait_for = |done: &dyn Fn() -> bool| {
+            for _ in 0..500 {
+                if done() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        let pending_context_request = |seq: u32| {
+            pending_context_requests()
+                .lock()
+                .map(|m| m.contains_key(&seq))
+                .unwrap_or(false)
+        };
         let request = |t: Gtp2MessageType, teid: u32| {
             let seq = server.alloc_sequence();
             let msg = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(t as u8, teid, seq));
@@ -1701,6 +1786,7 @@ mod tests {
             0,
             "the Context Response closes the request"
         );
+        wait_for(&|| !pending_context_request(seq));
         assert!(
             take_pending_context_request(seq).is_none(),
             "the Context Response reached the TAU continuation"
@@ -1729,6 +1815,7 @@ mod tests {
             0,
             "the Forward Relocation Response closes the request"
         );
+        wait_for(&|| eps_to_5gs_relocation(mme_ue_id).is_none());
         assert!(
             eps_to_5gs_relocation(mme_ue_id).is_none(),
             "the refusal reached the handover, which abandoned it"
@@ -1755,6 +1842,207 @@ mod tests {
         let mut buf = [0u8; 2048];
         assert!(amf.recv_from(&mut buf).is_err(), "no retransmission");
         server.close();
+    }
+
+    /// A Forward Relocation Request from amfd's real builder, for the cache tests below.
+    fn forward_relocation_request_840(imsi: &str, seq: u32, ebi: u8) -> Gtp2Message {
+        use nextgcore_gtp::v2::{Gtp2AmbrIe, Gtp2ApnIe, Gtp2FTeidIe, Gtp2PdnConnectionIe};
+        let mut amf_ue = nextgcore_amfd::context::AmfUe::new(0x840_0200, 840);
+        amf_ue.supi = Some(format!("imsi-{imsi}"));
+        amf_ue.kamf = [0x84; 32];
+        amf_ue.dl_count = 0x840;
+        amf_ue.nas.amf_ksi = 3;
+        amf_ue.selected_enc_algorithm = 2;
+        amf_ue.selected_int_algorithm = 1;
+        let mm_context = nextgcore_amfd::n26_build::build_handover_mm_context(&amf_ue, 0x840);
+        let mut pdn = Gtp2PdnConnectionIe::new();
+        pdn.add_ie(Gtp2ApnIe::from_string("n26cache").to_ie(0));
+        pdn.add_ie(nextgcore_gtp::v2::Gtp2EbiIe::new(ebi).to_ie(0));
+        pdn.add_ie(Gtp2FTeidIe::new_ipv4(7, 0x0840_0BC1, [10, 8, 4, 47]).to_ie(0));
+        let mut bearer = nextgcore_gtp::v2::Gtp2BearerContextIe::new();
+        bearer.set_ebi(ebi);
+        bearer.set_bearer_qos(&nextgcore_gtp::v2::Gtp2BearerQosIe::new(9, 0, 0, 0, 0));
+        pdn.add_ie(bearer.to_ie(0));
+        pdn.add_ie(Gtp2AmbrIe::new(1_000, 2_000).to_ie(0));
+        nextgcore_amfd::n26_build::build_forward_relocation_request(
+            seq,
+            Some(imsi),
+            &Gtp2FTeidIe::new_ipv4(
+                nextgcore_amfd::n26_path::N26_AMF_GTP_C,
+                0x0840_0200,
+                [10, 8, 4, 1],
+            ),
+            &mm_context,
+            std::slice::from_ref(&pdn),
+            &[0xA8, 0x40],
+            &nextgcore_amfd::n26_build::encode_enb_target_identification(
+                &[0x00, 0xF1, 0x10],
+                nextgcore_ngap::types::NgEnbId::Macro(0x804),
+                [0x00, 0x01],
+            )
+            .expect("a macro eNB id encodes"),
+            &[0x00, 0xF1, 0x10],
+        )
+    }
+
+    /// Send `msg` to `server` and return the next datagram of `answer_type` it sends back.
+    fn exchange(
+        amf: &std::net::UdpSocket,
+        server: &N26Server,
+        msg: &Gtp2Message,
+        answer_type: u8,
+    ) -> Vec<u8> {
+        amf.send_to(&msg.encode(), server.local_addr()).unwrap();
+        let mut buf = [0u8; 4096];
+        loop {
+            let (len, _) = amf.recv_from(&mut buf).expect("an answer");
+            if buf.get(1) == Some(&answer_type) {
+                return buf[..len].to_vec();
+            }
+        }
+    }
+
+    /// #840 follow-up, TS 29.274 §7.6: a retransmitted Forward Relocation Request (the AMF
+    /// lost the response) is answered from the cache with the SAME response and installs no
+    /// second context. Processed again it would allocate a second UE, whose TEID would head a
+    /// different Sender's F-TEID, so the two answers would differ and the IMSI would be held
+    /// twice.
+    #[test]
+    fn a_retransmitted_forward_relocation_request_installs_once_and_is_answered_alike() {
+        let _guard = lock_s11();
+        const IMSI: &str = "001010000000840";
+        let ctx = mme_self();
+        ctx.init();
+        let target = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+        // #858: the Target Identification names this eNB by its Global eNB ID.
+        ctx.enb_set_s1_connected_for_test(
+            target,
+            &[0x00, 0xF1, 0x10],
+            nextgcore_s1ap::EnbId::Macro(0x804),
+        );
+        let amf = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        amf.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let server =
+            N26Server::open("127.0.0.1:0".parse().unwrap(), Gtp2XactConfig::default(), 3).unwrap();
+        let request = forward_relocation_request_840(IMSI, 0x0840, 9);
+        let first = exchange(&amf, &server, &request, 134);
+        let second = exchange(&amf, &server, &request, 134);
+        let held = |imsi: &str| {
+            ctx.mme_ue_pool
+                .read()
+                .unwrap()
+                .iter()
+                .filter(|(_, ue)| ue.imsi_bcd == imsi)
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>()
+        };
+        let installed = held(IMSI);
+        assert_eq!(installed.len(), 1, "one context installed, not two");
+        let response =
+            Gtp2Message::decode(&mut bytes::Bytes::from(first.clone())).expect("decodes");
+        assert_eq!(
+            response
+                .get_ie(nextgcore_gtp::v2::Gtp2IeType::Cause as u8, 0)
+                .map(|ie| ie.value[0]),
+            Some(crate::n26_build::CAUSE_REQUEST_ACCEPTED),
+            "the first request was accepted"
+        );
+        assert_eq!(first, second, "the retransmission gets the same response");
+        server.close();
+        for id in installed {
+            take_forward_relocation_source(id);
+            ctx.mme_ue_remove(id);
+        }
+    }
+
+    /// #840 follow-up: the cache answers a retransmission of the SAME initial message only. A
+    /// different initial message reusing a cached sequence number (the AMF's counter wrapped,
+    /// or a second procedure) is processed: a Forward Relocation Complete Notification on the
+    /// Forward Relocation Request's number is not answered with the Forward Relocation
+    /// Response. And a Notification matching no relocation is answered 'Context not found'
+    /// with header TEID 0 (TS 29.274 §5.5.2), not left to run out the AMF's N3.
+    #[test]
+    fn the_cache_answers_only_its_own_message_type_and_an_unknown_notification_is_refused() {
+        let _guard = lock_s11();
+        const IMSI: &str = "001010000000841";
+        let ctx = mme_self();
+        ctx.init();
+        let target = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+        // #858: the Target Identification names this eNB by its Global eNB ID.
+        ctx.enb_set_s1_connected_for_test(
+            target,
+            &[0x00, 0xF1, 0x10],
+            nextgcore_s1ap::EnbId::Macro(0x804),
+        );
+        let amf = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        amf.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let server =
+            N26Server::open("127.0.0.1:0".parse().unwrap(), Gtp2XactConfig::default(), 3).unwrap();
+        exchange(
+            &amf,
+            &server,
+            &forward_relocation_request_840(IMSI, 0x0841, 10),
+            134,
+        );
+        // Same peer, same sequence number, a TEID no relocation holds.
+        let notification =
+            nextgcore_amfd::n26_eps_to_5gs::build_forward_relocation_complete_notification(
+                0x0841,
+                0x0841_DEAD,
+            );
+        amf.send_to(&notification.encode(), server.local_addr())
+            .unwrap();
+        let mut buf = [0u8; 4096];
+        let (len, _) = amf.recv_from(&mut buf).expect("an answer");
+        let answer = Gtp2Message::decode(&mut bytes::Bytes::copy_from_slice(&buf[..len])).unwrap();
+        assert_eq!(
+            answer.header.message_type,
+            Gtp2MessageType::ForwardRelocationCompleteAcknowledge as u8,
+            "processed as a Notification, not answered with the cached Forward Relocation \
+             Response"
+        );
+        assert_eq!(answer.header.sequence_number, 0x0841);
+        assert_eq!(answer.header.teid, Some(0), "TEID 0 (TS 29.274 §5.5.2)");
+        let cause = answer
+            .get_ie(nextgcore_gtp::v2::Gtp2IeType::Cause as u8, 0)
+            .map(|ie| ie.value[0]);
+        assert_eq!(cause, Some(crate::n26_build::CAUSE_CONTEXT_NOT_FOUND));
+        server.close();
+        let ids: Vec<u64> = ctx
+            .mme_ue_pool
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(_, ue)| ue.imsi_bcd == IMSI)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            take_forward_relocation_source(id);
+            ctx.mme_ue_remove(id);
+        }
+    }
+
+    /// #840 follow-up: the response hold covers the AMF's whole retransmission schedule,
+    /// (N3 + 1) x T3 of the peer's timers; unset or unparsable values keep the defaults.
+    #[test]
+    fn the_n26_response_hold_follows_the_peers_timers() {
+        let secs = |t3, n3| n26_xact_config(t3, n3).response_hold.as_secs();
+        assert_eq!(secs(None, None), 12);
+        assert_eq!(secs(Some("5"), Some("4")), 25);
+        assert_eq!(secs(Some(" 10 "), None), 40);
+        assert_eq!(secs(Some("x"), Some("-1")), 12, "unparsable: defaults");
+        assert_eq!(secs(Some("0"), Some("0")), 1, "T3 floored at 1 s");
+        let config = n26_xact_config(Some("5"), Some("4"));
+        assert_eq!(
+            (config.t3_response, config.n3_requests),
+            (
+                Gtp2XactConfig::default().t3_response,
+                Gtp2XactConfig::default().n3_requests
+            ),
+            "this MME's own retransmission timers are unchanged"
+        );
     }
 
     /// With the switch off nothing is sent, and the reason names the switch.

@@ -100,6 +100,8 @@ pub fn mme_initiated_detach(
         if let Some(ue) = pool.get_mut(&mme_ue_id) {
             ue.nas_eps.type_ = MmeEpsType::DetachRequestToUe;
             ue.network_detach_type = Some(detach_type);
+            // Whoever started this detach marks it; a CLR does so after this returns.
+            ue.network_detach_by_clr = false;
             // A fresh procedure: a stale buffer would be resent instead.
             ue.t3422.stop();
             match crate::nas_path::nas_eps_send_detach_request(ue, &enb_ue, detach_type) {
@@ -204,6 +206,7 @@ pub fn on_colliding_procedure(
         ue.t3422.stop();
         ue.nas_eps.type_ = MmeEpsType::None;
         ue.network_detach_type = None;
+        ue.network_detach_by_clr = false;
         log::info!(
             "[{}] {procedure:?} during a network-initiated detach ({detach_type:?}): the detach \
              is aborted, T3422 stopped, and the {procedure:?} progressed (TS 24.301 \
@@ -232,6 +235,26 @@ pub fn complete_mme_initiated_detach(ctx: &MmeContext, mme_ue_id: u64) -> bool {
         ctx.mme_ue_remove(mme_ue_id);
     }
     in_detach
+}
+
+/// T3422 ran out with no S1 connection to resend over (TS 24.301 §5.5.2.3.4 b): the detach
+/// is abandoned and the UE is EMM-DEREGISTERED in the network. Returns whether the context was
+/// removed.
+///
+/// Unlike [`complete_mme_initiated_detach`] this also covers a detach another procedure
+/// overtook without aborting (the `nas_eps.type_` moved on, `network_detach_type` did not
+/// clear): the UE's PDN connections were already deleted by [`mme_initiated_detach`], so
+/// keeping the context would leave a registered UE with no bearers that is never told (#828,
+/// the rule the with-S1 branch of `nas_timer` applies). A detach that was aborted
+/// (§5.5.2.3.5 d) cleared `network_detach_type` and is left alone.
+pub fn abandon_mme_initiated_detach(ctx: &MmeContext, mme_ue_id: u64) -> bool {
+    let detaching = ctx.mme_ue_find_by_id(mme_ue_id).is_some_and(|ue| {
+        ue.nas_eps.type_ == MmeEpsType::DetachRequestToUe || ue.network_detach_type.is_some()
+    });
+    if detaching {
+        ctx.mme_ue_remove(mme_ue_id);
+    }
+    detaching
 }
 
 /// TS 23.007 §15 (#689): the Serving GW at `restarted` lost its contexts.
