@@ -15076,6 +15076,77 @@ mod tests {
         assert!(sm_context_exists(&reference));
     }
 
+    /// **#805, the #738 ordering at the SMF.** The source's AN release reaches the SMF
+    /// first (`upCnxState: DEACTIVATED`, the UPF's downlink FAR to BUFF), then the
+    /// target's HandoverNotify (`hoState: COMPLETED`). The handover completes onto the
+    /// recorded target endpoint: the downlink FAR forwards to the TARGET again and the
+    /// session's user plane is ACTIVATED -- left DEACTIVATED, a Downlink Data Report would
+    /// page a UE that is connected on the target.
+    ///
+    /// REVERT-VERIFIED: setting ACTIVATED only for an EPS->5GS handover leaves the
+    /// session DEACTIVATED.
+    #[tokio::test]
+    async fn a_handover_completed_after_a_deactivation_reactivates_onto_the_target() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = pfcp_path::stand_in::install_stand_in_upf().await;
+        upf.client.associate().await.expect("association");
+        let reference = seed_registered_session("imsi-001010000000805", 7, "internet");
+        seed_session(
+            &reference,
+            Some(upf.upf_seid),
+            Some((upf.upf_teid, upf.upf_ip)),
+        );
+        {
+            let ctx = smf_self();
+            let ctx = ctx.read().unwrap();
+            let mut sess = ctx
+                .sess_find_by_sm_context_ref(&reference)
+                .expect("session");
+            sess.handover.target_dl_known = true;
+            sess.handover.gnb_n3_teid = 0x0805_0001;
+            sess.handover.gnb_n3_ip.ipv4 = Some(std::net::Ipv4Addr::new(10, 8, 0, 5));
+            ctx.sess_update(&sess);
+        }
+        upf.clear_seen();
+        let update = |body: serde_json::Value| {
+            SbiRequest::post("/nsmf-pdusession/v1/sm-contexts/x/modify")
+                .with_body(body.to_string(), "application/json")
+        };
+
+        let resp = handle_sm_context_update(
+            &reference,
+            &update(serde_json::json!({ "upCnxState": "DEACTIVATED" })),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+        let resp = handle_sm_context_update(
+            &reference,
+            &update(serde_json::json!({ "hoState": "COMPLETED" })),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+
+        let bodies = upf.modification_bodies();
+        unseed_session(&reference);
+        assert_eq!(bodies.len(), 2, "BUFF, then the switch: {bodies:02x?}");
+        let has = |b: &[u8], needle: &[u8]| b.windows(needle.len()).any(|w| w == needle);
+        assert!(
+            has(&bodies[1], &[0x08, 0x05, 0x00, 0x01, 10, 8, 0, 5]),
+            "the switch's Outer Header Creation names the TARGET: {:02x?}",
+            bodies[1]
+        );
+        let ctx = smf_self();
+        let ctx = ctx.read().unwrap();
+        let sess = ctx
+            .sess_find_by_sm_context_ref(&reference)
+            .expect("session");
+        assert_eq!(
+            sess.up_cnx_state,
+            context::UpCnxState::Activated,
+            "the UE is connected on the target"
+        );
+    }
+
     /// Record a UPF N3 uplink endpoint and a default policy binding for `reference`, as
     /// establishment does.
     fn seed_user_plane(reference: &str, ul: (u32, [u8; 4])) {
