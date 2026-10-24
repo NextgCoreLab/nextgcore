@@ -11,25 +11,84 @@ use std::net::Ipv4Addr;
 // ============================================================================
 
 pub mod gtp_cause {
-    /// Request-initial cause: DDN triggered by Error Indication
-    /// (TS 29.274 Section 8.4, value 6)
-    pub const ERROR_INDICATION_FROM_RNC_ENODEB: u8 = 6;
-    pub const REQUEST_ACCEPTED: u8 = 16;
-    pub const REQUEST_ACCEPTED_PARTIALLY: u8 = 17;
-    pub const NEW_PDN_TYPE_DUE_TO_NETWORK_PREFERENCE: u8 = 18;
-    pub const NEW_PDN_TYPE_DUE_TO_SINGLE_ADDRESS_BEARER_ONLY: u8 = 19;
-    pub const CONTEXT_NOT_FOUND: u8 = 64;
-    pub const INVALID_MESSAGE_FORMAT: u8 = 65;
-    pub const MANDATORY_IE_MISSING: u8 = 70;
-    pub const CONDITIONAL_IE_MISSING: u8 = 71;
-    pub const INVALID_LENGTH: u8 = 72;
-    pub const MANDATORY_IE_INCORRECT: u8 = 73;
-    pub const SYSTEM_FAILURE: u8 = 75;
-    pub const NO_RESOURCES_AVAILABLE: u8 = 76;
-    pub const SERVICE_NOT_SUPPORTED: u8 = 68;
-    pub const REQUEST_REJECTED: u8 = 94;
-    pub const REMOTE_PEER_NOT_RESPONDING: u8 = 100;
-    pub const GRE_KEY_NOT_FOUND: u8 = 80;
+    //! GTPv2 Cause values (TS 29.274 Table 8.4-1), taken from the shared
+    //! [`Gtp2Cause`] so this node cannot drift from the table again (#1024: five
+    //! of these were wrong, so "System failure" went out as 75, a TFT syntax
+    //! error). Pinned value by value in `gtp_cause_tests`.
+    use nextgcore_gtp::v2::Gtp2Cause as C;
+
+    /// Request-initial cause: DDN triggered by Error Indication.
+    pub const ERROR_INDICATION_FROM_RNC_ENODEB: u8 = C::ErrorIndicationReceived as u8;
+    pub const REQUEST_ACCEPTED: u8 = C::RequestAccepted as u8;
+    pub const REQUEST_ACCEPTED_PARTIALLY: u8 = C::RequestAcceptedPartially as u8;
+    pub const NEW_PDN_TYPE_DUE_TO_NETWORK_PREFERENCE: u8 =
+        C::NewPdnTypeDueToNetworkPreference as u8;
+    pub const NEW_PDN_TYPE_DUE_TO_SINGLE_ADDRESS_BEARER_ONLY: u8 =
+        C::NewPdnTypeDueToSingleAddressBearerOnly as u8;
+    pub const CONTEXT_NOT_FOUND: u8 = C::ContextNotFound as u8;
+    pub const INVALID_MESSAGE_FORMAT: u8 = C::InvalidMessageFormat as u8;
+    pub const MANDATORY_IE_MISSING: u8 = C::MandatoryIeMissing as u8;
+    pub const CONDITIONAL_IE_MISSING: u8 = C::ConditionalIeMissing as u8;
+    pub const INVALID_LENGTH: u8 = C::InvalidLength as u8;
+    pub const MANDATORY_IE_INCORRECT: u8 = C::MandatoryIeIncorrect as u8;
+    pub const SYSTEM_FAILURE: u8 = C::SystemFailure as u8;
+    pub const NO_RESOURCES_AVAILABLE: u8 = C::NoResourcesAvailable as u8;
+    pub const SERVICE_NOT_SUPPORTED: u8 = C::ServiceNotSupported as u8;
+    pub const REQUEST_REJECTED: u8 = C::RequestRejectedReasonNotSpecified as u8;
+    pub const REMOTE_PEER_NOT_RESPONDING: u8 = C::RemotePeerNotResponding as u8;
+    pub const GRE_KEY_NOT_FOUND: u8 = C::GreKeyNotFound as u8;
+}
+
+/// #1024: every constant against TS 29.274 Table 8.4-1, as literal octets.
+#[cfg(test)]
+mod gtp_cause_tests {
+    use super::gtp_cause::*;
+
+    #[test]
+    fn every_cause_constant_is_its_table_8_4_1_value() {
+        let table: &[(&str, u8, u8)] = &[
+            (
+                "Error Indication received from RNC/eNodeB",
+                ERROR_INDICATION_FROM_RNC_ENODEB,
+                6,
+            ),
+            ("Request accepted", REQUEST_ACCEPTED, 16),
+            ("Request accepted partially", REQUEST_ACCEPTED_PARTIALLY, 17),
+            (
+                "New PDN type due to network preference",
+                NEW_PDN_TYPE_DUE_TO_NETWORK_PREFERENCE,
+                18,
+            ),
+            (
+                "New PDN type due to single address bearer only",
+                NEW_PDN_TYPE_DUE_TO_SINGLE_ADDRESS_BEARER_ONLY,
+                19,
+            ),
+            ("Context Not Found", CONTEXT_NOT_FOUND, 64),
+            ("Invalid Message Format", INVALID_MESSAGE_FORMAT, 65),
+            ("Invalid length", INVALID_LENGTH, 67),
+            ("Service not supported", SERVICE_NOT_SUPPORTED, 68),
+            ("Mandatory IE incorrect", MANDATORY_IE_INCORRECT, 69),
+            ("Mandatory IE missing", MANDATORY_IE_MISSING, 70),
+            ("System failure", SYSTEM_FAILURE, 72),
+            ("No resources available", NO_RESOURCES_AVAILABLE, 73),
+            ("GRE key not found", GRE_KEY_NOT_FOUND, 80),
+            (
+                "Request rejected (reason not specified)",
+                REQUEST_REJECTED,
+                94,
+            ),
+            (
+                "Remote peer not responding",
+                REMOTE_PEER_NOT_RESPONDING,
+                100,
+            ),
+            ("Conditional IE missing", CONDITIONAL_IE_MISSING, 103),
+        ];
+        for (name, constant, octet) in table {
+            assert_eq!(constant, octet, "{name}");
+        }
+    }
 }
 
 // ============================================================================
