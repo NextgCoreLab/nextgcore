@@ -12890,7 +12890,8 @@ mod tests {
         reference
     }
 
-    /// Drop a session [`session_toward_gnb`] seeded.
+    /// Drop a session [`session_toward_gnb`] seeded, and its UE: the context holds at
+    /// most 64 UEs process-wide, so a test that leaves one behind starves a sibling.
     fn forget_seeded_session(reference: &str) {
         let ctx = smf_self();
         let ctx = ctx.read().unwrap();
@@ -12898,6 +12899,7 @@ mod tests {
         ctx.pfcp_sessions.write().unwrap().remove(reference);
         if let Some(sess) = ctx.sess_find_by_sm_context_ref(reference) {
             ctx.sess_remove(sess.id);
+            ctx.ue_remove(sess.smf_ue_id);
         }
     }
 
@@ -13221,7 +13223,12 @@ mod tests {
         let seen = upf.seen();
         up_path::reset_for_test();
         if let Ok(ctx) = smf_self().read() {
-            ctx.sess_remove(sess_id);
+            if let Some(sess) = ctx.sess_find_by_id(sess_id) {
+                ctx.sess_remove(sess.id);
+            }
+            if let Some(ue) = ctx.ue_find_by_imsi(b"001010000099946") {
+                ctx.ue_remove(ue.id);
+            }
         }
 
         assert!(
