@@ -1,0 +1,59 @@
+# Grafana, Prometheus and Jaeger are NodePort 30300/30909/31686 in the Kind
+# manifests, which exists only so kind-config.yaml can map them to 127.0.0.1 on
+# the host. On EKS a NodePort opens the port on every node, to anything the node
+# security group admits, and nothing on Prometheus or Jaeger authenticates.
+# ClusterIP, as for the NRF (headless-services.yaml): reach them with
+# `kubectl port-forward` (README, deploy-eks.sh summary). #1100: grafana could
+# not start before deploy-eks.sh created its admin Secret, so this closes a port
+# that the fix would otherwise have opened.
+#
+# $patch: replace on ports for the reason given in headless-services.yaml: a
+# merged list keeps the base's nodePort, which the API server rejects with
+# `type: ClusterIP`.
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: nextg-system
+spec:
+  type: ClusterIP
+  ports:
+    - $patch: replace
+    - name: http
+      port: 3000
+      targetPort: 3000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: nextg-system
+spec:
+  type: ClusterIP
+  ports:
+    - $patch: replace
+    - name: http
+      port: 9090
+      targetPort: 9090
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger
+  namespace: nextg-system
+spec:
+  type: ClusterIP
+  ports:
+    - $patch: replace
+    - name: ui
+      port: 16686
+      targetPort: 16686
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+    - name: otlp-http
+      port: 4318
+      targetPort: 4318
+    - name: collector
+      port: 14268
+      targetPort: 14268
