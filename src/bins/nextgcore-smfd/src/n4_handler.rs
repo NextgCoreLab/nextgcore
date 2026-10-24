@@ -13,20 +13,10 @@ use crate::n4_build::PfcpCause;
 // GTP Cause Codes (for conversion)
 // ============================================================================
 
-/// GTPv1 Cause codes
-pub mod gtp1_cause {
-    pub const REQUEST_ACCEPTED: u8 = 128;
-    pub const REJ_MS_NOT_GPRS_RESPONDING: u8 = 202;
-    pub const CONTEXT_NOT_FOUND: u8 = 201;
-    pub const MANDATORY_IE_MISSING: u8 = 193;
-    pub const INVALID_MESSAGE_FORMAT: u8 = 194;
-    pub const NO_RESOURCES_AVAILABLE: u8 = 199;
-    pub const SEMANTIC_ERR_TFT_OPERATION: u8 = 177;
-    pub const APN_CONGESTION: u8 = 174;
-    pub const SERVICE_NOT_SUPPORTED: u8 = 200;
-    pub const SYSTEM_FAILURE: u8 = 204;
-    pub const ALL_DYNAMIC_PDP_ADDRS_OCCUPIED: u8 = 205;
-}
+/// GTPv1 cause octets: the shared TS 29.060 §7.7.1 table (#1053). This node's
+/// own copy had seven wrong values (Context not found sent as 201, Mandatory IE
+/// incorrect; Mandatory IE missing as 193, Invalid message format; ...).
+pub use nextgcore_gtp::v1::cause as gtp1_cause;
 
 /// GTPv2 cause octets: the shared TS 29.274 Table 8.4-1 table (#1037). This
 /// node's own copy had seven wrong values, Request rejected among them as 17
@@ -63,7 +53,8 @@ pub fn gtp_cause_from_pfcp(pfcp_cause: u8, gtp_version: u8) -> u8 {
             c if c == PfcpCause::MandatoryIeMissing as u8 => gtp1_cause::MANDATORY_IE_MISSING,
             c if c == PfcpCause::ConditionalIeMissing as u8 => gtp1_cause::MANDATORY_IE_MISSING,
             c if c == PfcpCause::InvalidLength as u8 => gtp1_cause::INVALID_MESSAGE_FORMAT,
-            c if c == PfcpCause::MandatoryIeIncorrect as u8 => gtp1_cause::MANDATORY_IE_MISSING,
+            // GTPv1 has the cause itself (TS 29.060 §7.7.1, 201).
+            c if c == PfcpCause::MandatoryIeIncorrect as u8 => gtp1_cause::MANDATORY_IE_INCORRECT,
             c if c == PfcpCause::InvalidForwardingPolicy as u8 => {
                 gtp1_cause::INVALID_MESSAGE_FORMAT
             }
@@ -766,6 +757,39 @@ pub fn usage_report_trigger_to_gy_reporting_reason(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1053, TS 29.060 §7.7.1: the GTPv1 cause octets a PFCP outcome maps to,
+    /// as literals. Before, Context not found went out as 201 (Mandatory IE
+    /// incorrect), Mandatory IE missing as 193 (Invalid message format), the TFT
+    /// error as 177 and APN congestion as 174 (both undefined).
+    #[test]
+    fn pfcp_causes_map_to_their_ts_29_060_octets() {
+        for (pfcp, octet) in [
+            (PfcpCause::RequestAccepted, 128u8),
+            (PfcpCause::RequestRejected, 196),
+            (PfcpCause::SessionContextNotFound, 210),
+            (PfcpCause::MandatoryIeMissing, 202),
+            (PfcpCause::MandatoryIeIncorrect, 201),
+            (PfcpCause::InvalidLength, 193),
+            (PfcpCause::NoResourcesAvailable, 199),
+            (PfcpCause::RuleCreationModificationFailure, 215),
+            (PfcpCause::PfcpEntityInCongestion, 229),
+            (PfcpCause::ServiceNotSupported, 200),
+            (PfcpCause::SystemFailure, 204),
+            (PfcpCause::AllDynamicAddressAreOccupied, 211),
+        ] {
+            assert_eq!(gtp_cause_from_pfcp(pfcp as u8, 1), octet, "{pfcp:?}");
+        }
+        // On the wire: a Delete PDP Context Response refusing for a missing
+        // context carries the Cause IE (TV, type 1) with 210.
+        assert_eq!(
+            crate::gn_build::build_delete_pdp_context_response(gtp_cause_from_pfcp(
+                PfcpCause::SessionContextNotFound as u8,
+                1
+            )),
+            vec![0x01, 0xd2]
+        );
+    }
 
     #[test]
     fn test_gtp_cause_from_pfcp_v1() {

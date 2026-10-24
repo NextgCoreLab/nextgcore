@@ -3492,8 +3492,11 @@ pub struct RemoteGtpUPeer {
 }
 
 impl RemoteGtpUPeer {
+    /// TS 29.244 §8.2.70 (Figure 8.2.70-1), octet 5: bit 1 is V6, bit 2 is V4; the
+    /// IPv4 address field comes first when both are present (#1028 review B1: the
+    /// two bits were swapped, so a conformant peer's IPv4 report decoded as none).
     pub fn encode(&self, buf: &mut BytesMut) {
-        let flags = (self.ipv4.is_some() as u8) | ((self.ipv6.is_some() as u8) << 1);
+        let flags = (self.ipv6.is_some() as u8) | ((self.ipv4.is_some() as u8) << 1);
         buf.put_u8(flags);
         if let Some(v4) = self.ipv4 {
             buf.put_slice(&v4);
@@ -3512,8 +3515,8 @@ impl RemoteGtpUPeer {
             });
         }
         let flags = buf.get_u8();
-        let v4 = flags & 0x01 != 0;
-        let v6 = flags & 0x02 != 0;
+        let v6 = flags & 0x01 != 0;
+        let v4 = flags & 0x02 != 0;
         let mut peer = RemoteGtpUPeer::default();
         if v4 {
             if buf.remaining() < 4 {
@@ -5067,6 +5070,34 @@ mod tests {
         let payload = &buf[buf.len() - 2..];
         assert!(ApplyAction::decode_ie(payload).ddpn);
         assert!(ApplyAction::decode_ie(&[0x02, 0x00]).forw);
+    }
+
+    /// TS 29.244 §8.2.70, Figure 8.2.70-1: octet 5 bit 1 is V6, bit 2 is V4, and the
+    /// IPv4 field precedes the IPv6 one (#1028 review B1).
+    #[test]
+    fn remote_gtpu_peer_flags_follow_figure_8_2_70_1() {
+        let v4 = RemoteGtpUPeer {
+            ipv4: Some([10, 0, 0, 5]),
+            ipv6: None,
+        };
+        let mut buf = BytesMut::new();
+        v4.encode(&mut buf);
+        assert_eq!(&buf[..], &[0x02, 10, 0, 0, 5]);
+        assert_eq!(RemoteGtpUPeer::decode(&[0x02, 10, 0, 0, 5]).unwrap(), v4);
+
+        let addr6 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5];
+        let mut wire = vec![0x01];
+        wire.extend_from_slice(&addr6);
+        let v6 = RemoteGtpUPeer::decode(&wire).unwrap();
+        assert_eq!((v6.ipv4, v6.ipv6), (None, Some(addr6)));
+
+        let mut both = vec![0x03, 10, 0, 0, 5];
+        both.extend_from_slice(&addr6);
+        let dual = RemoteGtpUPeer::decode(&both).unwrap();
+        assert_eq!((dual.ipv4, dual.ipv6), (Some([10, 0, 0, 5]), Some(addr6)));
+        let mut buf = BytesMut::new();
+        dual.encode(&mut buf);
+        assert_eq!(&buf[..], &both[..]);
     }
 
     #[test]

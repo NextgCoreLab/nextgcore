@@ -97,6 +97,7 @@ The N4/PFCP endpoints are configured by environment variables, **not** by the `s
 | `SMF_PFCP_ADVERTISE_ADDR` | the bind address when specified, else an IPv4 Node ID, else the local address routed toward the first UPF | The IPv4 address in every CP F-SEID (TS 29.244 §8.2.37), which the UPF sends Session Report Requests to. On k8s, the pod IP. The SMF refuses to start when it can find no routable address rather than signal `0.0.0.0`. |
 | `UPF_PFCP_ADDR` / `UPF_PFCP_PORT` | `127.0.0.1` / `8805` | UPF N4 peer(s), comma-separated. Each entry is an IP, `IP:port`, or a hostname (`host` or `host:port`); a hostname is re-resolved on every Association Setup attempt, so a UPF that moves to a new IP is re-associated. |
 | `SMF_PFCP_RELEASE_ON_SHUTDOWN` | unset | Whether a graceful shutdown sends PFCP Association Release. Unset: released unless durable state (`--state-file` / `NEXTGCORE_SMF_STATE_FILE`) is armed. Without durable state the next SMF knows none of the sessions, so the UPF deletes them rather than keep them orphaned (#718). With durable state the association is kept, and the next SMF asks the UPF to retain the restored sessions (PFCP Session Retention Information, TS 29.244 §6.2.6.2); EPC PDN connections are not durable, so they are deleted at the PGW-U and toward the SGW first. `true` or `false` overrides either way. Without durable state an SMF that is killed (SIGKILL, OOM, node loss) cannot tell any UE: the next SMF knows none of the sessions, and the UPF deletes them when it associates. Only durable state, or TS 23.527 SMF restoration, avoids that. A graceful shutdown deregisters from the NRF and refuses new SM contexts (500 `NF_FAILOVER`) before it releases anything. |
+| `SMF_UP_PATH_FAILURE_HOLD_SECS` | `120` | How long sessions toward a GTP-U peer that a UPF reported failed are kept (deactivated, downlink buffered) before they are released: the operator maximum path failure duration of TS 23.007 §20.3.1. `0` releases them at once; at most 3600. See [User plane path failure](#user-plane-path-failure-994). |
 
 **Who may talk to the SMF on N4 (#971).** A datagram is handled as a UPF's only when it comes from a configured or associated UPF: from its exact endpoint, or, for a request, from any port of its address or any of its other addresses (TS 29.244 §4.2.2, §5.8.1; the Node ID's address, or what its FQDN or configured hostname resolves to, learnt at each Association Setup). A response is accepted only from the exact endpoint its request went to (§4.2.3). From any other host:
 - a Heartbeat Request is answered with the SMF's own Recovery Time Stamp, and nothing is taken from it (TS 23.007 §19A);
@@ -178,6 +179,30 @@ and the address entry removed. A UPF hostname must name exactly one UPF. The sna
   session bookkeeping for all of them. The map has no peer column to do better.
 - Not enabled in the shipped Docker compose (unlike `udrd`), so the default E2E
   path is unchanged.
+
+## User plane path failure (#994)
+
+A UPF reports a GTP-U path to a gNB, eNB, SGW-U or another UPF failing or recovering in a PFCP Node Report Request (TS 29.244 §5.10A, §7.4.5.1). The SMF answers each one with a Node Report Response:
+
+- cause 1 when it is from the association's own UPF;
+- cause 72 from any other host;
+- cause 66 or 67, with the Offending IE, when the Node ID, the Node Report Type or a report the type announces is missing.
+
+The SMF learns which sessions use which peer from its own accepted Session Establishment and Modification Requests: the Outer Header Creation address of each FAR. The durable snapshot carries this (`farPeers`), so a restored session is still found.
+
+- **Path failure:** the UP connection of every session with a forwarding FAR toward the peer is deactivated (TS 23.502 §4.3.7, steps 4 and 5). Those FARs are set to BUFF|NOCP, so downlink data is buffered and reported and the UE is paged. For an N3 FAR, the NG-RAN gets an N2-only PDU Session Resource Release Command (cause transport-resource-unavailable) through the AMF.
+- **Still down after `SMF_UP_PATH_FAILURE_HOLD_SECS`** (TS 23.007 §20.3.1):
+  - a session whose tunnel still points at the peer (no Service Request moved it) is released: its N4 session is deleted, and the UE gets a PDU Session Release Command #39 so it re-establishes the session;
+  - an EPC PDN connection is deleted at the PGW-U and toward the SGW.
+- **Recovery:** the failed state is cleared, and the pending hold does nothing. Sessions stay deactivated until their next Service Request or paging.
+- **A peer GTP-U restart** (Peer UP Restart Report) and a session-level **Error Indication Report** deactivate the user plane in the same way, with no hold.
+
+A repeated failure report for a peer that is already failed starts no second hold. A graceful shutdown stops the pending holds; the next process learns the path state from the UPF again.
+
+Metrics:
+- `smf_up_path_failures_total` and `smf_up_path_recoveries_total`;
+- `smf_up_paths_failed` (gauge);
+- `smf_up_path_sessions_deactivated_total` and `smf_up_path_sessions_released_total`.
 
 ## Restoration signalling (#193)
 
