@@ -61,6 +61,19 @@ From the clap `Args` struct in `src/bins/nextgcore-sgwcd/src/main.rs`:
 
 ## Behavior notes
 
+- **Sxa association** (TS 29.244 §6.2.6, #1001):
+  - The SGW-C sets up the association with its SGW-U at startup.
+  - While there is no association, it retries the Association Setup every 10 s (T1 3 s,
+    N1 2 per attempt). This covers an SGW-U that comes up later, and one that refuses the
+    first Setup because its allowlist has not yet resolved the SGW-C's address.
+  - Once associated, it sends the SGW-U a Heartbeat Request every 10 s.
+  - The association is marked lost, and set up again on the next turn, in either of these
+    cases:
+    - no Heartbeat Response arrives after T1 x (N1 + 1);
+    - the SGW-U reports a new Recovery Time Stamp, which means it restarted. Both the SGW-U's
+      Heartbeat Response and its own Heartbeat Request carry the stamp.
+  - While there is no association, the SGW-C sends no PFCP session message (TS 29.244 §6.2.6.1):
+    the S11 request that needs one is refused.
 - **Environment variables** (read in `gtp_path.rs` / `pfcp_path.rs` / `main.rs`):
 
   | Variable | Default | Effect |

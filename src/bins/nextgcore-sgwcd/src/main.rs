@@ -69,6 +69,8 @@ pub struct SgwcApp {
     pfcp_task: Option<tokio::task::JoinHandle<()>>,
     /// Asks that loop to stop.
     pfcp_shutdown: Option<tokio::sync::watch::Sender<bool>>,
+    /// Keeps the Sxa association up (#1001).
+    pfcp_assoc_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl SgwcApp {
@@ -80,6 +82,7 @@ impl SgwcApp {
             timer_mgr: timer::TimerManager::new(),
             pfcp_task: None,
             pfcp_shutdown: None,
+            pfcp_assoc_task: None,
         }
     }
 
@@ -145,20 +148,22 @@ impl SgwcApp {
         // procedure would time out.
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         self.pfcp_shutdown = Some(shutdown_tx);
+        let shutdown_rx_assoc = shutdown_rx.clone();
         self.pfcp_task = Some(tokio::spawn(pfcp.clone().run(shutdown_rx)));
 
-        // Associate with the SGW-U (TS 29.244 §6.2.6.2). NOT fatal: an SGW-U that comes up
-        // after the SGW-C is the normal bring-up order in the compose stack, and refusing
-        // to start would make the slower peer an outage. The association is retried by the
-        // first session request that needs it.
+        // Associate with the SGW-U (TS 29.244 §6.2.6.2) and keep the association up
+        // (#1001). NOT fatal: an SGW-U that comes up after the SGW-C is the normal
+        // bring-up order in the compose stack, and refusing to start would make the
+        // slower peer an outage. The task retries a refused or unanswered Setup every
+        // 10 s and heartbeats the association once it is up, re-associating when it is
+        // lost; session requests are refused while there is none.
         let sgwu = pfcp_path::configured_sgwu_addr();
-        match pfcp.associate(sgwu).await {
-            Ok(()) => log::info!("Associated with SGW-U {sgwu}"),
-            Err(e) => log::warn!(
-                "No PFCP association with SGW-U {sgwu} yet ({e}); session requests will \
-                 fail until it answers"
-            ),
-        }
+        self.pfcp_assoc_task = Some(tokio::spawn(pfcp.clone().maintain_association(
+            sgwu,
+            pfcp_path::ASSOCIATION_RETRY,
+            pfcp_path::HEARTBEAT_PERIOD,
+            shutdown_rx_assoc,
+        )));
 
         log::info!("SGWC initialized successfully");
         Ok(())
@@ -239,6 +244,10 @@ impl SgwcApp {
         }
         if let Some(task) = self.pfcp_task.take() {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+        }
+        // An Association Setup or Heartbeat in flight is abandoned, not waited for.
+        if let Some(task) = self.pfcp_assoc_task.take() {
+            task.abort();
         }
 
         // Send exit event to state machine

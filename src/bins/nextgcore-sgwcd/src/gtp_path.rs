@@ -2634,6 +2634,27 @@ mod tests {
                     cursor.to_vec(),
                 ));
 
+                // #1001: the SGW-C sends no session message before the association
+                // (TS 29.244 §6.2.6.1), so the stand-in accepts the Association Setup.
+                if msg_type == 5 {
+                    let mut body = bytes::BytesMut::new();
+                    nextgcore_pfcp::message::AssociationSetupResponse::new(
+                        NodeId::new_ipv4([127, 0, 0, 9]),
+                        PfcpCause::RequestAccepted,
+                        1,
+                    )
+                    .encode(&mut body);
+                    let mut out = bytes::BytesMut::new();
+                    let mut h = PHeader::new(
+                        nextgcore_pfcp::header::PfcpMessageType::AssociationSetupResponse,
+                        header.sequence_number,
+                    );
+                    h.length = (4 + body.len()) as u16;
+                    h.encode(&mut out);
+                    out.extend_from_slice(&body);
+                    let _ = up.send_to(&out, from).await;
+                    continue;
+                }
                 let pfcp_cause = PfcpCause::from_wire(cause);
                 let mut body = bytes::BytesMut::new();
                 let resp_type = match msg_type {
@@ -2657,7 +2678,7 @@ mod tests {
                         SessionDeletionResponse::new(pfcp_cause).encode(&mut body);
                         55u8
                     }
-                    // Association Setup, Heartbeat: not needed by these tests.
+                    // Heartbeat: not needed by these tests.
                     _ => continue,
                 };
                 if !delay.is_zero() {
@@ -2682,6 +2703,9 @@ mod tests {
                 .expect("bind the SGW-C's Sxa socket");
         let (_tx, rx) = tokio::sync::watch::channel(false);
         tokio::spawn(node.clone().run(rx));
+        node.associate(up_addr)
+            .await
+            .expect("the stand-in accepts the association");
         // `run` installs the outbound queue in its own body; a request enqueued before it
         // is polled would be refused with "no Sxa transport".
         for _ in 0..200 {

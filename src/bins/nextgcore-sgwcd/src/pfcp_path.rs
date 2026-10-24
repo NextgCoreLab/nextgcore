@@ -23,7 +23,7 @@ use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 use nextgcore_pfcp::header::{PfcpHeader, PfcpMessageType};
 use nextgcore_pfcp::message::{
-    AssociationSetupRequest, AssociationSetupResponse, HeartbeatResponse,
+    AssociationSetupRequest, AssociationSetupResponse, HeartbeatRequest, HeartbeatResponse,
     PfcpMessage as PfcpLibMessage, SessionReportRequest, SessionReportResponse,
 };
 use nextgcore_pfcp::types::{NodeId, PfcpCause};
@@ -44,6 +44,16 @@ const SEQ_MASK: u32 = 0x00FF_FFFF;
 /// do not disagree about how long a message may take.
 const T1: std::time::Duration = std::time::Duration::from_secs(3);
 const N1: u32 = 2;
+
+/// How often an SGW-C with no association to its SGW-U tries the Association Setup
+/// again (#1001), each attempt with T1/N1 (TS 29.244 §6.2.6.1). The same 10 s smfd
+/// uses (`reassociate_holdoff`).
+pub const ASSOCIATION_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How often the SGW-C sends an associated SGW-U a Heartbeat Request (TS 29.244
+/// §6.2.2, §7.4.2), so a peer that went away or restarted is noticed without a
+/// session request failing first. The same 10 s smfd uses.
+pub const HEARTBEAT_PERIOD: std::time::Duration = std::time::Duration::from_secs(10);
 
 // ============================================================================
 // PFCP Message Types
@@ -542,6 +552,128 @@ impl SxaNode {
         Ok(())
     }
 
+    /// Whether the association with `peer` is up.
+    pub async fn is_associated_with(&self, peer: SocketAddr) -> bool {
+        self.peers
+            .read()
+            .await
+            .get(&peer)
+            .is_some_and(|p| p.state == PfcpNodeState::Associated)
+    }
+
+    /// The association with `peer` is gone (#1001): its record is dropped, so session
+    /// requests are refused until [`Self::maintain_association`] sets it up again.
+    async fn mark_association_lost(&self, peer: SocketAddr, why: &str) {
+        let was = self.peers.write().await.remove(&peer).is_some();
+        self.refresh_peer_gauge().await;
+        if was {
+            log::warn!(
+                "PFCP association with SGW-U {peer} lost: {why}; setting it up again \
+                 (TS 29.244 §6.2.6)"
+            );
+        }
+    }
+
+    /// One Heartbeat Request to `peer` (TS 29.244 §7.4.2), with T1/N1. Returns the
+    /// peer's Recovery Time Stamp.
+    pub async fn heartbeat(&self, peer: SocketAddr) -> Result<u32, String> {
+        let mut body = BytesMut::new();
+        PfcpLibMessage::HeartbeatRequest(HeartbeatRequest::new(self.recovery_time_stamp))
+            .encode_body(&mut body);
+        let (resp_type, resp_body) = self
+            .request(pfcp_msg_type::HEARTBEAT_REQUEST, None, &body, peer)
+            .await
+            .map_err(|e| e.to_string())?;
+        if resp_type != pfcp_msg_type::HEARTBEAT_RESPONSE {
+            return Err(format!(
+                "unexpected response type {resp_type} to a Heartbeat Request"
+            ));
+        }
+        let mut cursor = Bytes::copy_from_slice(&resp_body);
+        HeartbeatResponse::decode(&mut cursor)
+            .map(|r| r.recovery_time_stamp)
+            .map_err(|e| format!("malformed Heartbeat Response from {peer}: {e}"))
+    }
+
+    /// A Recovery Time Stamp `peer` reported: when it differs from the one its
+    /// association recorded, the peer restarted and lost the association with all its
+    /// sessions (TS 29.244 §6.2.2, TS 23.007 §19A), so it is set up again.
+    async fn check_peer_recovery(&self, peer: SocketAddr, reported: u32) {
+        let stored = self
+            .peers
+            .read()
+            .await
+            .get(&peer)
+            .filter(|p| p.state == PfcpNodeState::Associated)
+            .and_then(|p| p.recovery_time_stamp);
+        if let Some(stored) = stored {
+            if reported != 0 && reported != stored {
+                self.mark_association_lost(
+                    peer,
+                    &format!("the SGW-U restarted (Recovery Time Stamp {stored} -> {reported})"),
+                )
+                .await;
+            }
+        }
+    }
+
+    /// Keep the association with `peer` up for the life of the node (#1001).
+    ///
+    /// While unassociated the Association Setup is tried every `retry`: a refused or
+    /// unanswered first Setup (an SGW-U that comes up later, or one whose allowlist has
+    /// not yet resolved a restarted SGW-C's new address) no longer leaves the SGW-C
+    /// unassociated until a session request happens to need it. While associated a
+    /// Heartbeat Request goes every `heartbeat`. No answer after T1/N1, or a changed
+    /// Recovery Time Stamp, marks the association lost, and the next turn sets it up
+    /// again. smfd keeps its N4 associations the same way.
+    pub async fn maintain_association(
+        self: Arc<Self>,
+        peer: SocketAddr,
+        retry: std::time::Duration,
+        heartbeat: std::time::Duration,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        let mut failing = false;
+        loop {
+            if *shutdown.borrow() {
+                return;
+            }
+            if !self.is_associated_with(peer).await {
+                match self.associate(peer).await {
+                    Ok(()) => failing = false,
+                    Err(e) if !failing => {
+                        failing = true;
+                        log::warn!(
+                            "No PFCP association with SGW-U {peer} ({e}); session requests \
+                             are refused until it is set up; retrying every {}s",
+                            retry.as_secs_f32()
+                        );
+                    }
+                    Err(e) => log::debug!("PFCP Association Setup with {peer} still failing: {e}"),
+                }
+            }
+            let associated = self.is_associated_with(peer).await;
+            let wait = if associated { heartbeat } else { retry };
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                }
+            }
+            if associated && self.is_associated_with(peer).await {
+                match self.heartbeat(peer).await {
+                    Ok(reported) => self.check_peer_recovery(peer, reported).await,
+                    Err(e) => {
+                        self.mark_association_lost(peer, &format!("no Heartbeat Response ({e})"))
+                            .await
+                    }
+                }
+            }
+        }
+    }
+
     /// The receive loop, plus the drain of the synchronous senders' queue.
     pub async fn run(self: Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
         let (tx, mut queued) = mpsc::unbounded_channel();
@@ -661,6 +793,12 @@ impl SxaNode {
 
         match msg_type {
             pfcp_msg_type::HEARTBEAT_REQUEST => {
+                // #1001: the peer's own heartbeat reports its Recovery Time Stamp too; a
+                // changed one is a restart, noticed here before our next heartbeat.
+                if let Ok(req) = HeartbeatRequest::decode(&mut Bytes::copy_from_slice(&body)) {
+                    self.check_peer_recovery(from, req.recovery_time_stamp)
+                        .await;
+                }
                 // TS 29.244 §6.2.2.2: answer at any time. A CP function that does not is
                 // declared down by the UP function's own heartbeat monitor.
                 let mut buf = BytesMut::new();
@@ -861,6 +999,15 @@ pub async fn pfcp_close() {
 fn enqueue(msg: &PfcpMessage, sess_id: u64, continuation: S11Continuation) -> Result<(), String> {
     let tx = outbound()
         .ok_or_else(|| "PFCP path is not running: no Sxa transport to send on".to_string())?;
+    // TS 29.244 §6.2.6.1: no PFCP session message before the association is set up
+    // (#1001). `maintain_association` sets it up, and sets it up again when it is lost.
+    if sxa_node().is_none_or(|n| n.associated_peer_count() == 0) {
+        return Err(format!(
+            "no PFCP association with the SGW-U {}: session messages wait for it \
+             (TS 29.244 §6.2.6.1)",
+            configured_sgwu_addr()
+        ));
+    }
     tx.send(QueuedRequest {
         msg_type: msg.msg_type,
         seid: msg.seid,
@@ -1239,5 +1386,299 @@ mod tests {
             err.contains("not running"),
             "the error must name why nothing was sent, got {err}"
         );
+    }
+
+    /// A stand-in SGW-U for the association tests: Association Setup Requests are
+    /// answered in turn from `refusals` (true = refused) and then accepted, each with
+    /// the current `rts`; Heartbeat Requests are answered with `rts` too.
+    struct AssocSgwu {
+        addr: SocketAddr,
+        sock: Arc<UdpSocket>,
+        setups: Arc<AtomicU32>,
+        heartbeats: Arc<AtomicU32>,
+        rts: Arc<AtomicU32>,
+    }
+
+    async fn assoc_sgwu(refusals: Vec<bool>) -> AssocSgwu {
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = sock.local_addr().unwrap();
+        let setups = Arc::new(AtomicU32::new(0));
+        let heartbeats = Arc::new(AtomicU32::new(0));
+        let rts = Arc::new(AtomicU32::new(100));
+        let (s, h, r, up) = (
+            setups.clone(),
+            heartbeats.clone(),
+            rts.clone(),
+            sock.clone(),
+        );
+        tokio::spawn(async move {
+            let mut refusals = std::collections::VecDeque::from(refusals);
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let Ok((len, from)) = up.recv_from(&mut buf).await else {
+                    return;
+                };
+                let mut cursor = Bytes::copy_from_slice(&buf[..len]);
+                let Ok(header) = PfcpHeader::decode(&mut cursor) else {
+                    continue;
+                };
+                let mut body = BytesMut::new();
+                let resp_type = match header.message_type as u8 {
+                    pfcp_msg_type::ASSOCIATION_SETUP_REQUEST => {
+                        s.fetch_add(1, Ordering::SeqCst);
+                        let cause = if refusals.pop_front().unwrap_or(false) {
+                            PfcpCause::RequestRejected
+                        } else {
+                            PfcpCause::RequestAccepted
+                        };
+                        AssociationSetupResponse::new(
+                            NodeId::new_ipv4([127, 0, 0, 9]),
+                            cause,
+                            r.load(Ordering::SeqCst),
+                        )
+                        .encode(&mut body);
+                        PfcpMessageType::AssociationSetupResponse
+                    }
+                    pfcp_msg_type::HEARTBEAT_REQUEST => {
+                        h.fetch_add(1, Ordering::SeqCst);
+                        HeartbeatResponse::new(r.load(Ordering::SeqCst)).encode(&mut body);
+                        PfcpMessageType::HeartbeatResponse
+                    }
+                    _ => continue,
+                };
+                let mut out = BytesMut::new();
+                let mut h = PfcpHeader::new(resp_type, header.sequence_number);
+                h.length = (4 + body.len()) as u16;
+                h.encode(&mut out);
+                out.extend_from_slice(&body);
+                let _ = up.send_to(&out, from).await;
+            }
+        });
+        AssocSgwu {
+            addr,
+            sock,
+            setups,
+            heartbeats,
+            rts,
+        }
+    }
+
+    /// #1001: an associated SGW-U that stops answering heartbeats (T1 x (N1 + 1), 9 s)
+    /// has lost the association: session requests are refused, and once it answers
+    /// again the association is set up anew.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unanswered_heartbeat_loses_the_association_until_the_sgwu_returns() {
+        let guard = process_state_test_guard().await;
+        // A peer that answers the Setup, then nothing: a relay that stops forwarding
+        // once the first Setup is through.
+        let real = assoc_sgwu(Vec::new()).await;
+        let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let relay_addr = relay.local_addr().unwrap();
+        let silent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (r, s, real_addr) = (relay.clone(), silent.clone(), real.addr);
+        tokio::spawn(async move {
+            let mut client = None;
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let Ok((len, from)) = r.recv_from(&mut buf).await else {
+                    return;
+                };
+                if from == real_addr {
+                    if let Some(c) = client {
+                        let _ = r.send_to(&buf[..len], c).await;
+                    }
+                } else if !s.load(Ordering::SeqCst) {
+                    client = Some(from);
+                    let _ = r.send_to(&buf[..len], real_addr).await;
+                }
+            }
+        });
+        let (node, stop) = maintained_node(
+            &guard,
+            relay_addr,
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        let setups = real.setups.clone();
+        eventually("the association", || setups.load(Ordering::SeqCst) >= 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(node.associated_peer_count(), 1);
+        silent.store(true, Ordering::SeqCst);
+        let mut lost = false;
+        for _ in 0..150 {
+            if node.associated_peer_count() == 0 {
+                lost = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            lost,
+            "lost after T1 x (N1 + 1) without a Heartbeat Response"
+        );
+        silent.store(false, Ordering::SeqCst);
+        let mut back = false;
+        for _ in 0..150 {
+            if node.associated_peer_count() == 1 {
+                back = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(back, "set up again once the SGW-U answers");
+        assert!(setups.load(Ordering::SeqCst) >= 2);
+        let _ = stop.send(true);
+    }
+
+    /// #1001, TS 29.244 §6.2.6.1: no PFCP session message goes before the association
+    /// is set up; with the transport running but unassociated the send is an error that
+    /// says so, and once associated it goes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_session_message_before_the_association() {
+        let _guard = process_state_test_guard().await;
+        let sgwu = assoc_sgwu(Vec::new()).await;
+        std::env::set_var("SGWC_SGWU_ADDR", sgwu.addr.to_string());
+        let node = SxaNode::open("127.0.0.1:0".parse().unwrap(), Ipv4Addr::LOCALHOST)
+            .await
+            .unwrap();
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(node.clone().run(rx));
+        let sess = SgwcSess {
+            id: 1,
+            sgwc_sxa_seid: 0x1000,
+            sgwu_sxa_seid: 0x2000,
+            ..Default::default()
+        };
+        let mut err = String::new();
+        for _ in 0..200 {
+            match send_session_deletion_request(&sess, 0, None, S11Continuation::None) {
+                Err(e) if e.contains("not running") => {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await
+                }
+                Err(e) => {
+                    err = e;
+                    break;
+                }
+                Ok(()) => panic!("sent with no association"),
+            }
+        }
+        assert!(err.contains("no PFCP association"), "got {err:?}");
+        node.associate(sgwu.addr).await.unwrap();
+        assert!(send_session_deletion_request(&sess, 0, None, S11Continuation::None).is_ok());
+        std::env::remove_var("SGWC_SGWU_ADDR");
+        let _ = stop.send(true);
+    }
+
+    /// The SGW-C's node, running, with the association kept by `maintain_association`.
+    async fn maintained_node(
+        _ambient: &ProcessStateGuard,
+        peer: SocketAddr,
+        retry: std::time::Duration,
+        heartbeat: std::time::Duration,
+    ) -> (Arc<SxaNode>, tokio::sync::watch::Sender<bool>) {
+        let node = SxaNode::open("127.0.0.1:0".parse().unwrap(), Ipv4Addr::LOCALHOST)
+            .await
+            .unwrap();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(node.clone().run(rx.clone()));
+        tokio::spawn(
+            node.clone()
+                .maintain_association(peer, retry, heartbeat, rx),
+        );
+        (node, tx)
+    }
+
+    async fn eventually(what: &str, mut cond: impl FnMut() -> bool) {
+        for _ in 0..300 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// #1001 acceptance: an SGW-C whose first Association Setup is refused (an SGW-U
+    /// whose allowlist has not resolved it yet) associates on the next retry, with no
+    /// session request to prompt it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_association_setup_is_retried_on_the_timer() {
+        let guard = process_state_test_guard().await;
+        let sgwu = assoc_sgwu(vec![true]).await;
+        let (node, stop) = maintained_node(
+            &guard,
+            sgwu.addr,
+            std::time::Duration::from_millis(200),
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+        let setups = sgwu.setups.clone();
+        eventually("the first Setup", || setups.load(Ordering::SeqCst) >= 1).await;
+        assert!(!node.is_associated_with(sgwu.addr).await, "refused");
+        assert_eq!(node.associated_peer_count(), 0);
+        let mut associated = false;
+        for _ in 0..300 {
+            if node.is_associated_with(sgwu.addr).await {
+                associated = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(associated, "associated on the retry");
+        assert_eq!(sgwu.setups.load(Ordering::SeqCst), 2);
+        assert_eq!(node.associated_peer_count(), 1);
+        let _ = stop.send(true);
+    }
+
+    /// #1001: an associated SGW-U is heartbeated, and one that restarted (a new
+    /// Recovery Time Stamp, TS 23.007 §19A) has lost the association: it is set up
+    /// again. A restart its own Heartbeat Request reports is noticed the same way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restarted_sgwu_is_associated_again() {
+        let guard = process_state_test_guard().await;
+        let sgwu = assoc_sgwu(Vec::new()).await;
+        let (node, stop) = maintained_node(
+            &guard,
+            sgwu.addr,
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        let (setups, heartbeats) = (sgwu.setups.clone(), sgwu.heartbeats.clone());
+        eventually("a heartbeat on the association", || {
+            heartbeats.load(Ordering::SeqCst) >= 1
+        })
+        .await;
+        assert_eq!(setups.load(Ordering::SeqCst), 1, "same peer: no new Setup");
+
+        // Restart seen by our heartbeat.
+        sgwu.rts.store(200, Ordering::SeqCst);
+        eventually("the Setup after the restart", || {
+            setups.load(Ordering::SeqCst) >= 2
+        })
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let peer = node.peers().await;
+        assert_eq!(peer.len(), 1);
+        assert_eq!(peer[0].state, PfcpNodeState::Associated);
+        assert_eq!(peer[0].recovery_time_stamp, Some(200));
+
+        // Restart reported by the SGW-U's own Heartbeat Request (our heartbeats
+        // still see 200, so only the inbound report can trigger this Setup).
+        let mut body = BytesMut::new();
+        HeartbeatRequest::new(300).encode(&mut body);
+        let mut out = BytesMut::new();
+        let mut h = PfcpHeader::new(PfcpMessageType::HeartbeatRequest, 0x77);
+        h.length = (4 + body.len()) as u16;
+        h.encode(&mut out);
+        out.extend_from_slice(&body);
+        let before = setups.load(Ordering::SeqCst);
+        sgwu.sock.send_to(&out, node.local_addr()).await.unwrap();
+        eventually("the Setup after the reported restart", || {
+            setups.load(Ordering::SeqCst) > before
+        })
+        .await;
+        let _ = stop.send(true);
     }
 }
