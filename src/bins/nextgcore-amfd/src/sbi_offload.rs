@@ -69,6 +69,9 @@ pub(crate) enum SbiOutcome {
     /// #774: one ReleaseSMContext of a superseded registration has reported back
     /// (whatever its result), for the barrier with this id.
     SupersedeReleased { barrier: u64 },
+    /// #922 part 2: an SMF answer an NGAP step waits for (a modification, a
+    /// re-activation, an EPS→5GS PREPARED).
+    Smf(crate::ngap_path::SmfAnswer),
 }
 
 /// What keyed work is serialised on: (AMF UE NGAP ID, PDU session ID).
