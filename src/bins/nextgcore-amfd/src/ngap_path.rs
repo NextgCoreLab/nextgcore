@@ -27277,6 +27277,12 @@ mod eps_to_5gs_tests {
     /// A stand-in SMF+PGW-C: answers the EPS→5GS create with step 7's members and every
     /// modify with its `hoState`, and records each request.
     async fn start_smf() -> (SbiServer, u16, mpsc::Receiver<Captured>) {
+        start_smf_with_delay(Duration::ZERO).await
+    }
+
+    /// [`start_smf`], answering every request only after `delay` -- an SMF slower than
+    /// the MME's T3-RESPONSE, so the MME retransmits while the AMF still waits (#755).
+    async fn start_smf_with_delay(delay: Duration) -> (SbiServer, u16, mpsc::Receiver<Captured>) {
         let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let port = addr.port();
         let (tx, rx) = mpsc::channel(16);
@@ -27288,6 +27294,7 @@ mod eps_to_5gs_tests {
             .start(move |req: SbiRequest| {
                 let tx = tx.clone();
                 async move {
+                    tokio::time::sleep(delay).await;
                     let uri = req.header.uri.clone();
                     let body = req.http.content.clone().unwrap_or_default();
                     let _ = tx
@@ -28183,6 +28190,195 @@ mod eps_to_5gs_tests {
         restore_guami(previous_guami);
     }
 
+    /// **#755, TS 29.274 §7.6.** A Forward Relocation Request retransmitted while the
+    /// first copy still waits on a slow SMF is not processed again: ONE CreateSMContext,
+    /// and nothing reaches the NGAP layer twice. A Relocation Cancel retransmitted after
+    /// its first copy was answered "accepted" -- the preparation since abandoned -- is
+    /// answered from the response cache with the SAME octets instead of being handled
+    /// afresh (which queued a second cancel for the NGAP layer, answered there "IMSI/IMEI
+    /// not known").
+    ///
+    /// REVERT-VERIFIED: without the cache lookup and the in-flight drop in
+    /// `handle_datagram` the SMF sees a second CreateSMContext and the retransmitted cancel
+    /// is queued for the NGAP layer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_retransmitted_request_is_answered_from_the_cache_and_never_processed_twice() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::test_support::init_context();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _ = crate::n26_path::drain_eps_to_5gs_preparations();
+        let _ = crate::n26_path::drain_eps_to_5gs_cancels();
+        let previous_guami = serve_guami_999_70();
+        let (_smf, smf_port, mut smf_rx) = start_smf_with_delay(Duration::from_millis(1500)).await;
+        let (_nrf, nrf_port, _nrf_rx) = start_nrf(smf_port, PGW_FQDN).await;
+        crate::sbi_path::set_pgw_discovery_nrf_for_test(Some(format!(
+            "http://127.0.0.1:{nrf_port}"
+        )));
+        let n26 = crate::n26_path::N26Server::open("127.0.0.1:0".parse().unwrap(), 1)
+            .await
+            .expect("N26 socket");
+        let mme = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let frr = forward_relocation_request([127, 0, 0, 1]);
+
+        // The FRR, its retransmission while the SMF is still answering, then a cancel.
+        mme.send_to(&frr, n26.local_addr()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        mme.send_to(&frr, n26.local_addr()).await.unwrap();
+        let cancel = relocation_cancel_request(0x7551, 0, "001010000004180");
+        mme.send_to(&cancel, n26.local_addr()).await.unwrap();
+        let accepted = recv_gtp(&mme).await;
+        assert_eq!(
+            (
+                accepted.header.message_type,
+                accepted.header.sequence_number
+            ),
+            (140, 0x7551),
+            "the cancel is answered while the preparation is at its SMF"
+        );
+        assert_eq!(
+            Gtp2CauseIe::decode(&accepted.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value)
+                .unwrap()
+                .cause,
+            crate::n26_eps_to_5gs::CAUSE_REQUEST_ACCEPTED
+        );
+
+        // The first FRR's task finishes at the SMF and is abandoned (it was cancelled).
+        let _create = recv_smf(&mut smf_rx).await;
+        let refusal = recv_gtp(&mme).await;
+        assert_eq!(
+            (refusal.header.message_type, refusal.header.sequence_number),
+            (134, SEQ),
+            "the cancelled preparation's FRR is answered once"
+        );
+        // The retransmitted FRR started nothing: no second CreateSMContext. (The abandoned
+        // preparation's own clean-up of its SM context may still reach the SMF.)
+        let mut later = Vec::new();
+        while let Ok(Some((uri, _, _))) =
+            tokio::time::timeout(Duration::from_millis(2500), smf_rx.recv()).await
+        {
+            later.push(uri);
+        }
+        assert!(
+            !later.iter().any(|uri| uri.ends_with("/sm-contexts")),
+            "one CreateSMContext only; later SMF requests: {later:?}"
+        );
+        assert!(
+            crate::n26_path::drain_eps_to_5gs_preparations().is_empty(),
+            "no preparation reached the NGAP layer"
+        );
+
+        // The cancel's retransmission: the cached answer, octet for octet, and nothing
+        // queued for the NGAP layer.
+        mme.send_to(&cancel, n26.local_addr()).await.unwrap();
+        let again = recv_gtp(&mme).await;
+        assert_eq!(again.encode(), accepted.encode(), "the cached response");
+        assert!(crate::n26_path::drain_eps_to_5gs_cancels().is_empty());
+
+        crate::sbi_path::set_pgw_discovery_nrf_for_test(None);
+        restore_guami(previous_guami);
+    }
+
+    /// **#755 (review of #851, MAJOR 1).** A second Forward Relocation Request for the same
+    /// UE under a NEW sequence number -- not a retransmission -- while the first still waits
+    /// on a slow SMF is refused at once with "Relocation failure" (TS 29.274 §7.3.2), starts
+    /// no second CreateSMContext, and leaves the first preparation's record intact: a
+    /// Relocation Cancel still reaches it.
+    ///
+    /// REVERT-VERIFIED: with `PreparationGuard::start` never returning `None` (the old
+    /// overwrite) the second request is not refused and a second CreateSMContext is sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_second_forward_relocation_for_a_ue_in_preparation_is_refused() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::test_support::init_context();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _ = crate::n26_path::drain_eps_to_5gs_preparations();
+        let _ = crate::n26_path::drain_eps_to_5gs_cancels();
+        let previous_guami = serve_guami_999_70();
+        let (_smf, smf_port, mut smf_rx) = start_smf_with_delay(Duration::from_millis(1500)).await;
+        let (_nrf, nrf_port, _nrf_rx) = start_nrf(smf_port, PGW_FQDN).await;
+        crate::sbi_path::set_pgw_discovery_nrf_for_test(Some(format!(
+            "http://127.0.0.1:{nrf_port}"
+        )));
+        let n26 = crate::n26_path::N26Server::open("127.0.0.1:0".parse().unwrap(), 1)
+            .await
+            .expect("N26 socket");
+        let mme = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let frr = forward_relocation_request([127, 0, 0, 1]);
+        let second = {
+            let mut bytes = bytes::Bytes::from(frr.clone());
+            let mut msg = Gtp2Message::decode(&mut bytes).expect("decodes");
+            msg.header.sequence_number = SEQ + 1;
+            msg.encode().to_vec()
+        };
+
+        mme.send_to(&frr, n26.local_addr()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        mme.send_to(&second, n26.local_addr()).await.unwrap();
+        let refusal = recv_gtp(&mme).await;
+        assert_eq!(
+            (refusal.header.message_type, refusal.header.sequence_number),
+            (134, SEQ + 1),
+            "the second request is answered at once, under its own sequence number"
+        );
+        assert_eq!(
+            Gtp2CauseIe::decode(&refusal.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value)
+                .unwrap()
+                .cause,
+            crate::n26_eps_to_5gs::CAUSE_RELOCATION_FAILURE
+        );
+
+        // The first preparation's record is intact: a cancel still finds it.
+        let cancel = relocation_cancel_request(0x7552, 0, "001010000004180");
+        mme.send_to(&cancel, n26.local_addr()).await.unwrap();
+        let accepted = recv_gtp(&mme).await;
+        assert_eq!(
+            (
+                accepted.header.message_type,
+                accepted.header.sequence_number
+            ),
+            (140, 0x7552)
+        );
+        assert_eq!(
+            Gtp2CauseIe::decode(&accepted.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value)
+                .unwrap()
+                .cause,
+            crate::n26_eps_to_5gs::CAUSE_REQUEST_ACCEPTED,
+            "the cancel reaches the first preparation"
+        );
+
+        // The first request finishes at the SMF and, cancelled, is refused once.
+        let first = recv_smf(&mut smf_rx).await;
+        assert!(first.0.ends_with("/sm-contexts"), "the one CreateSMContext");
+        let first_answer = recv_gtp(&mme).await;
+        assert_eq!(
+            (
+                first_answer.header.message_type,
+                first_answer.header.sequence_number
+            ),
+            (134, SEQ)
+        );
+        let mut later = Vec::new();
+        while let Ok(Some((uri, _, _))) =
+            tokio::time::timeout(Duration::from_millis(2500), smf_rx.recv()).await
+        {
+            later.push(uri);
+        }
+        assert!(
+            !later.iter().any(|uri| uri.ends_with("/sm-contexts")),
+            "one CreateSMContext only; later SMF requests: {later:?}"
+        );
+        assert!(crate::n26_path::drain_eps_to_5gs_preparations().is_empty());
+
+        crate::sbi_path::set_pgw_discovery_nrf_for_test(None);
+        restore_guami(previous_guami);
+    }
+
     /// A cancel naming nothing this AMF prepares is answered "IMSI/IMEI not known" (§7.3.17),
     /// at TEID 0 since this AMF has no MME TEID for it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -28262,7 +28458,8 @@ mod eps_to_5gs_tests {
         let supi = prep.supi.clone().expect("supi");
 
         // The N26 leg's state while the SMF round trips run.
-        let in_progress = crate::n26_path::PreparationGuard::start(Some(&supi), MME_TEID);
+        let in_progress = crate::n26_path::PreparationGuard::start(Some(&supi), MME_TEID)
+            .expect("no preparation in progress for this SUPI");
         let routed = crate::n26_path::route_relocation_cancel(crate::n26_path::EpsToFivegsCancel {
             server: Arc::clone(&prep.server),
             seq: 0x5923,
