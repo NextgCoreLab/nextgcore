@@ -10630,7 +10630,8 @@ impl NgapServer {
             // The target admitted the UE under this pair, so it is released under it.
             self.handover_target_assoc
                 .insert(ue, (cmd.target_assoc, cmd.target_ran));
-            self.release_cancelled_handover_target(ue).await;
+            self.release_cancelled_handover_target(ue, "HO_FAILURE")
+                .await;
             self.forget_handover_preparation(ue);
             let failure = nextgcore_ngap::types::HandoverPreparationFailure {
                 amf_ue_ngap_id: ue,
@@ -10703,7 +10704,25 @@ impl NgapServer {
         let source_assoc = cmd.source_assoc;
         match crate::ngap_asn1::build_handover_command_generated(&command).ok_or(()) {
             Ok(bytes) => {
-                self.send_to_association(source_assoc, &bytes).await?;
+                if let Err(e) = self.send_to_association(source_assoc, &bytes).await {
+                    // The source never learns the handover was prepared, so it will not
+                    // execute it: the target releases what it admitted and the SMFs are
+                    // told the handover failed, rather than both holding a preparation
+                    // until their own timers.
+                    log::warn!(
+                        "HandoverCommand for UE {ue} could not be sent to the source \
+                         association {source_assoc} ({e}); the handover is abandoned: the \
+                         target association {} releases its prepared context and the SMFs \
+                         are told CANCELLED (HO_FAILURE)",
+                        cmd.target_assoc
+                    );
+                    self.handover_target_assoc
+                        .insert(ue, (cmd.target_assoc, cmd.target_ran));
+                    self.release_cancelled_handover_target(ue, "HO_FAILURE")
+                        .await;
+                    self.forget_handover_preparation(ue);
+                    return Ok(());
+                }
                 log::info!(
                     "HandoverCommand sent to source association {source_assoc} for UE {ue} \
                      ({} session(s))",
@@ -10741,8 +10760,14 @@ impl NgapServer {
     /// Release what a cancelled intra-5GS handover prepared (#804): a UE Context Release
     /// Command to the target, cause handover-cancelled -- under the id pair its
     /// Acknowledge established, or the AMF UE NGAP ID alone before one (UE-NGAP-IDs) --
-    /// and `hoState: CANCELLED`, cause `HO_CANCEL`, to each session's SMF.
-    async fn release_cancelled_handover_target(&mut self, amf_ue_ngap_id: u64) {
+    /// and `hoState: CANCELLED` with `smf_cause` to each session's SMF: `HO_CANCEL` for
+    /// the source's Handover Cancel, `HO_FAILURE` for a handover this AMF could not carry
+    /// out (TS 29.502 §5.2.2.3.4.4).
+    async fn release_cancelled_handover_target(
+        &mut self,
+        amf_ue_ngap_id: u64,
+        smf_cause: &'static str,
+    ) {
         let target = match (
             self.handover_target_assoc.get(&amf_ue_ngap_id).copied(),
             self.handover_pending_target.get(&amf_ue_ngap_id).copied(),
@@ -10775,7 +10800,7 @@ impl NgapServer {
                 None => log::error!("Failed to build the target's UE Context Release Command"),
             }
         }
-        self.cancel_handover_at_smfs(amf_ue_ngap_id, "HO_CANCEL");
+        self.cancel_handover_at_smfs(amf_ue_ngap_id, smf_cause);
     }
 
     /// `hoState: CANCELLED` with `cause` (TS 29.502 §5.2.2.3.4.4) to the SMF of every
@@ -11020,13 +11045,28 @@ impl NgapServer {
             Ok(bytes) => {
                 // #570: the UE Radio Capability ID, when the UE has one (TS 38.413 §9.2.3.4).
                 let bytes = crate::racs::add_capability_ies(bytes, racs_id.as_deref(), None);
-                self.send_to_association(target_assoc, &bytes).await?;
-                self.handover_pending_target
-                    .insert(required.amf_ue_ngap_id, target_assoc);
                 self.handover_prepared_psis.insert(
                     required.amf_ue_ngap_id,
                     ready.iter().map(|(psi, _)| *psi).collect(),
                 );
+                if let Err(e) = self.send_to_association(target_assoc, &bytes).await {
+                    // The target never saw the request: the SMFs that prepared are told
+                    // the handover failed, and the source gets its answer now rather than
+                    // waiting out TNGRELOCprep.
+                    log::warn!(
+                        "HandoverRequest for UE {} could not be sent to the target \
+                         association {target_assoc} ({e}); the preparation fails: the SMFs \
+                         are told CANCELLED (HO_FAILURE) and the source association \
+                         {association_id} gets a HANDOVER PREPARATION FAILURE",
+                        required.amf_ue_ngap_id
+                    );
+                    self.cancel_handover_at_smfs(required.amf_ue_ngap_id, "HO_FAILURE");
+                    return self
+                        .fail_handover_preparation(association_id, &required)
+                        .await;
+                }
+                self.handover_pending_target
+                    .insert(required.amf_ue_ngap_id, target_assoc);
                 self.handover_listed_psis.insert(
                     required.amf_ue_ngap_id,
                     required
@@ -12525,7 +12565,7 @@ impl NgapServer {
         // The source abandoned the handover; nothing further will be relayed.
         // #804, TS 23.502 §4.9.1.4 steps 2-3: the target releases what it reserved for
         // the handover, and the SMFs are told the handover is CANCELLED.
-        self.release_cancelled_handover_target(cancel.amf_ue_ngap_id)
+        self.release_cancelled_handover_target(cancel.amf_ue_ngap_id, "HO_CANCEL")
             .await;
         // Dropped BEFORE the acknowledgement is sent, so a failed ack cannot leave
         // a stale relay target behind. The per-session transfers go with it (#742).
@@ -22522,7 +22562,7 @@ mod tests {
         let steps: Vec<HoStep> = std::mem::take(&mut *seen.lock().expect("sink"));
         assert_eq!(
             ho_steps_in(&steps, "CANCELLED"),
-            vec![("nocmd-1".to_string(), Vec::new(), "HO_CANCEL".to_string())]
+            vec![("nocmd-1".to_string(), Vec::new(), "HO_FAILURE".to_string())]
         );
         assert!(!server.handover_pending_target.contains_key(&ue));
         assert!(!server.handover_target_assoc.contains_key(&ue));
@@ -22624,6 +22664,117 @@ mod tests {
         for id in [ue, ue2, ue3] {
             server.ue_auth_state.remove(id);
         }
+    }
+
+    /// **#964.** A HANDOVER REQUEST that cannot be sent to the target, or a HANDOVER
+    /// COMMAND that cannot be sent to the source, ends the handover cleanly instead of
+    /// leaving it to the peers' timers: the SMFs are told CANCELLED (HO_FAILURE); a lost
+    /// Request gets the source a HANDOVER PREPARATION FAILURE, and a lost Command gets
+    /// the target a Release Command under its Acknowledge's pair. No preparation state is
+    /// left.
+    ///
+    /// REVERT-VERIFIED: with the send failures propagated (`?`) as before, the source
+    /// gets nothing, the SMFs hear nothing and the pending target stays.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_handover_message_that_cannot_be_sent_ends_the_handover() {
+        let (_smf, smf_port, seen) = handover_smf().await;
+        let mut server = capturing_ngap_server().await;
+        let (source, target) = (97_968u64, 97_969u64);
+        let gnb_t = 0x7_9681u32;
+        seed_gnb_session_with_id(&server, source, 0x7_9680).await;
+        seed_gnb_session_with_id(&server, target, gnb_t).await;
+        let ue_on = |server: &mut NgapServer, ue: u64, ran: u32, sm_ref: &str| {
+            let mut state = UeNasContext::new(ue, ran, source, false);
+            state.registered = true;
+            state.amf_ue.allowed_nssai = vec![SNssai { sst: 1, sd: None }];
+            server.ue_auth_state.insert(ue, state);
+            server.sm_context_refs.insert((ue, 1), sm_ref.to_string());
+            server
+                .sm_context_smfs
+                .insert((ue, 1), ("127.0.0.1".to_string(), smf_port));
+        };
+        let no_state_left = |server: &NgapServer, ue: u64| {
+            !server.handover_pending_target.contains_key(&ue)
+                && !server.handover_target_assoc.contains_key(&ue)
+                && !server.handover_prepared_psis.contains_key(&ue)
+                && !server.ho_preparations.contains_key(&ue)
+                && !server.ho_commands.contains_key(&ue)
+                && !server
+                    .handover_target_transfers
+                    .keys()
+                    .any(|(u, _)| *u == ue)
+        };
+
+        // The HandoverRequest is lost.
+        let (ue, ran) = (7_964_201u64, 68u32);
+        ue_on(&mut server, ue, ran, "lostreq-1");
+        server
+            .handle_handover_required(source, &handover_required_pdu(ue, ran, gnb_t, &[1]))
+            .await
+            .expect("handled");
+        server.fail_next_sends = 1;
+        drive_sbi(&mut server).await;
+        let sent = take_sent_ngap(&mut server);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(
+            (sent[0].0, sent[0].1[0], sent[0].1[1]),
+            (
+                source,
+                0x40,
+                nextgcore_ngap_gen::generated::ID_HANDOVER_PREPARATION
+            ),
+            "a HANDOVER PREPARATION FAILURE to the source"
+        );
+        let steps: Vec<HoStep> = std::mem::take(&mut *seen.lock().expect("sink"));
+        assert_eq!(
+            ho_steps_in(&steps, "CANCELLED"),
+            vec![(
+                "lostreq-1".to_string(),
+                Vec::new(),
+                "HO_FAILURE".to_string()
+            )]
+        );
+        assert!(no_state_left(&server, ue));
+
+        // The HandoverCommand is lost.
+        let (ue, ran, target_ran) = (7_964_202u64, 69u32, 9_681u32);
+        ue_on(&mut server, ue, ran, "lostcmd-1");
+        server
+            .handle_handover_required(source, &handover_required_pdu(ue, ran, gnb_t, &[1]))
+            .await
+            .expect("handled");
+        drive_sbi(&mut server).await;
+        assert_eq!(take_sent_ngap(&mut server).len(), 1, "the HandoverRequest");
+        server
+            .handle_handover_request_acknowledge(
+                target,
+                &handover_ack_pdu(ue, target_ran, &[(1, vec![0xA1])]),
+            )
+            .await
+            .expect("handled");
+        server.fail_next_sends = 1;
+        drive_sbi(&mut server).await;
+        let sent = take_sent_ngap(&mut server);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].0, target);
+        assert_eq!(
+            decoded_release_command(&sent[0].1),
+            Some((
+                ue,
+                Some(target_ran),
+                Some(nextgcore_ngap_gen::generated::CauseRadioNetwork::HANDOVER_CANCELLED)
+            ))
+        );
+        let steps: Vec<HoStep> = std::mem::take(&mut *seen.lock().expect("sink"));
+        assert_eq!(
+            ho_steps_in(&steps, "CANCELLED"),
+            vec![(
+                "lostcmd-1".to_string(),
+                Vec::new(),
+                "HO_FAILURE".to_string()
+            )]
+        );
+        assert!(no_state_left(&server, ue));
     }
 
     /// **#742 review, MAJOR-2.** A UE ended mid-handover takes its preparation state with
