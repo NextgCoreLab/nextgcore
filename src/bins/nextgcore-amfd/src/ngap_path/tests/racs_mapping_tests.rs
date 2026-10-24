@@ -197,11 +197,11 @@ async fn an_unknown_id_is_resolved_off_the_ngap_task() {
 }
 
 /// Points the AMF's UCMF calls at `port` while held.
-struct UcmfEnvGuard(#[allow(dead_code)] tokio::sync::MutexGuard<'static, ()>);
+pub(super) struct UcmfEnvGuard(#[allow(dead_code)] tokio::sync::MutexGuard<'static, ()>);
 
 impl UcmfEnvGuard {
     /// Async: the lock is a tokio mutex (#643), held across the test's awaits.
-    async fn acquire(port: u16) -> Self {
+    pub(super) async fn acquire(port: u16) -> Self {
         let guard = crate::test_support::UCMF_ENV_LOCK.lock().await;
         std::env::set_var("UCMF_SBI_ADDR", "127.0.0.1");
         std::env::set_var("UCMF_SBI_PORT", port.to_string());
