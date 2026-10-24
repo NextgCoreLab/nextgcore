@@ -4899,6 +4899,8 @@ fn service_request_context_set_up(
              GW keeps buffering downlink"
         ),
     }
+    // #862: deactivations parked while the UE was ECM-IDLE run now.
+    crate::bearer_deactivation::on_connected(ctx, mme_ue_id);
 }
 
 fn handle_erab_setup_response(
