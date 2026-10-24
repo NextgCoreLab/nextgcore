@@ -1015,19 +1015,20 @@ impl PfcpClient {
                 // §19A requires even for unknown peers) but tears nothing down. The
                 // listener routes an unknown source to pool slot 0, so before this any
                 // host reaching N4 could release every UE on that UPF.
-                if from == self.peer() {
+                if same_pfcp_node(from, self.peer()) {
                     if let Some(rts) = find_ie(body, 96)
                         .filter(|v| v.len() >= 4)
                         .map(|v| u32::from_be_bytes([v[0], v[1], v[2], v[3]]))
                     {
-                        self.check_peer_restart_detached(rts).await;
+                        self.check_peer_restart_detached(rts, StampSource::Request)
+                            .await;
                     }
                 }
                 true
             }
             pfcp_message_type::ASSOCIATION_RELEASE_REQUEST => {
                 // #928 review M3: only the associated UPF can release its association.
-                let ours = from == self.peer();
+                let ours = same_pfcp_node(from, self.peer());
                 log::warn!(
                     "PFCP Association Release Request from {from}{}",
                     if ours {
@@ -1062,7 +1063,7 @@ impl PfcpClient {
     /// Compare a peer Recovery Time Stamp with the stored value; a change
     /// means the UPF restarted: all sessions on it are gone (TS 23.527 4.2).
     pub async fn check_peer_restart(&self, rts: u32) {
-        if let Some(releases) = self.detect_peer_restart(rts).await {
+        if let Some(releases) = self.detect_peer_restart(rts, StampSource::Response).await {
             let _ = releases.await;
         }
     }
@@ -1071,38 +1072,57 @@ impl PfcpClient {
     /// itself (association down, this UPF's sessions flushed) is done when this
     /// returns, but the per-session releases run on in their own task. Awaiting them
     /// here stalled every PFCP message from every UPF for the whole fan-out.
-    async fn check_peer_restart_detached(&self, rts: u32) {
-        if let Some(releases) = self.detect_peer_restart(rts).await {
+    async fn check_peer_restart_detached(&self, rts: u32, source: StampSource) {
+        if let Some(releases) = self.detect_peer_restart(rts, source).await {
             track_restart_fanout(releases);
         }
     }
 
     /// Detect a peer restart and tear the association down. `Some(fan-out)` when a
     /// restart was detected, the per-session releases still running in it.
-    async fn detect_peer_restart(&self, rts: u32) -> Option<tokio::task::JoinHandle<()>> {
-        // TS 23.007 §19A, under one write guard (#928 review m2, m3): a LARGER stamp
-        // than the stored one is a restart, and the new stamp is stored at once, so a
-        // second path seeing the same stamp (the receive task's Heartbeat Request and
-        // the maintenance task's Heartbeat Response) finds it stored and tears nothing
-        // down twice. A SMALLER one is "a possible race condition (newer message
-        // arriving before the older one)": discarded and logged, not a restart. With
-        // none stored, the received one is stored.
+    async fn detect_peer_restart(
+        &self,
+        rts: u32,
+        source: StampSource,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        // TS 23.007 §19A, under one write guard (#928 review m2): the new stamp is
+        // stored at once, so a second path seeing the same stamp (the receive task's
+        // Heartbeat Request and the maintenance task's Heartbeat Response) finds it
+        // stored and tears nothing down twice. With none stored, the received one is
+        // stored.
+        //
+        // Which change is a restart (#928 round 2, B1):
+        // - in the RESPONSE to our own request, any change: the UPF answering now is a
+        //   different incarnation, whatever its clock says. Discarding a smaller stamp
+        //   there kept a UPF that came back with its clock behind, or past the 2036
+        //   wrap, "associated" for good, with every new session refused;
+        // - in an unsolicited Heartbeat REQUEST, a stamp NEWER than the stored one in
+        //   serial arithmetic (RFC 1982, so the 2036 wrap counts as newer). An older
+        //   one is "a possible race condition (newer message arriving before the older
+        //   one)": discarded and logged.
         let restarted = {
             let mut assoc = self.assoc.write().await;
             match assoc.peer_recovery_time_stamp {
-                Some(stored) if rts > stored => {
-                    assoc.peer_recovery_time_stamp = Some(rts);
-                    true
-                }
-                Some(stored) if rts < stored => {
-                    log::error!(
-                        "UPF {}: Recovery Time Stamp {rts} older than the stored {stored}; \
-                         discarded as a reordered message (TS 23.007 §19A)",
-                        self.peer()
-                    );
-                    false
-                }
-                Some(_) => false,
+                Some(stored) if rts == stored => false,
+                Some(stored) => match source {
+                    StampSource::Response => {
+                        assoc.peer_recovery_time_stamp = Some(rts);
+                        true
+                    }
+                    StampSource::Request if stamp_is_newer(rts, stored) => {
+                        assoc.peer_recovery_time_stamp = Some(rts);
+                        true
+                    }
+                    StampSource::Request => {
+                        log::error!(
+                            "UPF {}: Recovery Time Stamp {rts} in a Heartbeat Request is older \
+                             than the stored {stored}; discarded as a reordered message \
+                             (TS 23.007 §19A)",
+                            self.peer()
+                        );
+                        false
+                    }
+                },
                 None => {
                     assoc.peer_recovery_time_stamp = Some(rts);
                     false
@@ -1144,6 +1164,8 @@ impl PfcpClient {
     async fn begin_teardown(&self, reason: &str) -> tokio::task::JoinHandle<()> {
         #[cfg(test)]
         assert_teardown_is_serialised();
+        #[cfg(test)]
+        TEARDOWNS_FOR_TEST.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // #720: only the sessions on THIS UPF. A pool member's restart, release or
         // heartbeat loss says nothing about the sessions on the other members, which
         // are alive; releasing them sent every UE in the pool a #39 and orphaned
@@ -1224,7 +1246,10 @@ impl PfcpClient {
         // here held the one association/heartbeat task, which serves every pool
         // member, for the whole fan-out, and kept this UPF unassociated while the UEs
         // that got #39 came back to re-establish.
-        let restarted = match self.detect_peer_restart(resp.recovery_time_stamp).await {
+        let restarted = match self
+            .detect_peer_restart(resp.recovery_time_stamp, StampSource::Response)
+            .await
+        {
             Some(releases) => {
                 track_restart_fanout(releases);
                 true
@@ -1324,7 +1349,8 @@ impl PfcpClient {
             .map(|v| u32::from_be_bytes([v[0], v[1], v[2], v[3]]))
         {
             // #928 review M1: off the association/heartbeat task, like the rest.
-            self.check_peer_restart_detached(rts).await;
+            self.check_peer_restart_detached(rts, StampSource::Response)
+                .await;
         } else {
             log::warn!("Heartbeat Response missing Recovery Time Stamp (mandatory IE)");
         }
@@ -1348,6 +1374,12 @@ fn track_restart_fanout(releases: tokio::task::JoinHandle<()>) {
     fanouts.push(releases);
 }
 
+/// [`track_restart_fanout`] for tests.
+#[cfg(test)]
+pub(crate) fn track_restart_fanout_for_test(releases: tokio::task::JoinHandle<()>) {
+    track_restart_fanout(releases);
+}
+
 /// Wait, at most `budget`, for every tracked fan-out (#928 review m1).
 pub async fn drain_restart_fanouts(budget: Duration) {
     let pending: Vec<_> =
@@ -1367,6 +1399,35 @@ pub async fn drain_restart_fanouts(budget: Duration) {
              of their UEs are not told"
         );
     }
+}
+
+/// How many teardowns ran, for the #928 compare-and-set test.
+#[cfg(test)]
+pub(crate) static TEARDOWNS_FOR_TEST: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Where a peer Recovery Time Stamp came from (#928 round 2, B1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StampSource {
+    /// The response to a request of ours: any change is a restart.
+    Response,
+    /// An unsolicited Heartbeat Request: an older stamp may be a reordered message.
+    Request,
+}
+
+/// Whether Recovery Time Stamp `a` is newer than `b` in serial-number arithmetic
+/// (RFC 1982): the 32-bit NTP seconds field wraps in February 2036, and a stamp just
+/// past the wrap is newer than one just before it.
+fn stamp_is_newer(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) > 0
+}
+
+/// Whether two PFCP endpoints are the same PFCP node (#928 round 2, m1): the IP
+/// address, canonical (an IPv4-mapped IPv6 address is the IPv4 one), not the port.
+/// TS 29.244 §4.2.2: a request may come from any source port; TS 23.007 §19A ties
+/// the Recovery Time Stamp to the source IP address.
+pub fn same_pfcp_node(a: SocketAddr, b: SocketAddr) -> bool {
+    a.ip().to_canonical() == b.ip().to_canonical()
 }
 
 /// PFCP Session Retention Information (TS 29.244 Table 7.4.4.1-2), grouped (#718).

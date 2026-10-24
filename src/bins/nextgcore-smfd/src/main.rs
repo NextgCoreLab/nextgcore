@@ -5808,44 +5808,48 @@ async fn graceful_shutdown(
     pfcp_listener: tokio::task::JoinHandle<()>,
 ) {
     deregister.await;
-    if release {
-        let mut releases = tokio::task::JoinSet::new();
-        for client in pfcp_clients.iter().map(Arc::clone) {
-            releases.spawn(async move {
-                if !client.is_associated().await {
-                    return;
-                }
-                match client.release_association().await {
-                    Ok(()) => log::info!("PFCP association with {} released", client.peer()),
-                    Err(e) => {
-                        log::warn!("PFCP Association Release to {} failed: {e}", client.peer())
+    // #928 round 2, M1: the #39 fan-outs a UPF restart or release started earlier
+    // drain ALONGSIDE this shutdown's own releases, inside the same budget, not after.
+    let fanouts = pfcp_path::drain_restart_fanouts(std::time::Duration::from_secs(5));
+    let n4 = async {
+        if release {
+            let mut releases = tokio::task::JoinSet::new();
+            for client in pfcp_clients.iter().map(Arc::clone) {
+                releases.spawn(async move {
+                    if !client.is_associated().await {
+                        return;
                     }
-                }
-            });
-        }
-        while releases.join_next().await.is_some() {}
-    } else {
-        log::info!(
-            "PFCP association kept on shutdown: durable state hands its 5G sessions to the \
-             next SMF incarnation, which asks the UPF to retain them \
-             (SMF_PFCP_RELEASE_ON_SHUTDOWN=true releases it)"
-        );
-        // #718 review M4: the EPC PDN connections are NOT durable (the snapshot has
-        // no session list, #687). The next incarnation cannot ask for them, and its
-        // retention request keeps every session of the association, so left alone
-        // they would be orphaned in the PGW-U while the SGW, MME and UE kept
-        // believing in them.
-        let (deleted, told) = shutdown_epc_pdn_connections().await;
-        if deleted + told > 0 {
-            log::warn!(
-                "Shutdown: {told} EPC PDN connection(s) deleted toward the SGW, {deleted} \
-                 EPC PFCP session(s) deleted at the PGW-U; EPC sessions do not survive a \
-                 PGW-C restart"
+                    match client.release_association().await {
+                        Ok(()) => log::info!("PFCP association with {} released", client.peer()),
+                        Err(e) => {
+                            log::warn!("PFCP Association Release to {} failed: {e}", client.peer())
+                        }
+                    }
+                });
+            }
+            while releases.join_next().await.is_some() {}
+        } else {
+            log::info!(
+                "PFCP association kept on shutdown: durable state hands its 5G sessions to the \
+                 next SMF incarnation, which asks the UPF to retain them \
+                 (SMF_PFCP_RELEASE_ON_SHUTDOWN=true releases it)"
             );
+            // #718 review M4: the EPC PDN connections are NOT durable (the snapshot has
+            // no session list, #687). The next incarnation cannot ask for them, and its
+            // retention request keeps every session of the association, so left alone
+            // they would be orphaned in the PGW-U while the SGW, MME and UE kept
+            // believing in them.
+            let (deleted, told) = shutdown_epc_pdn_connections().await;
+            if deleted + told > 0 {
+                log::warn!(
+                    "Shutdown: {told} EPC PDN connection(s) deleted toward the SGW, {deleted} \
+                     EPC PFCP session(s) deleted at the PGW-U; EPC sessions do not survive a \
+                     PGW-C restart"
+                );
+            }
         }
-    }
-    // #928 review m1: the #39 fan-outs a UPF restart or release started earlier.
-    pfcp_path::drain_restart_fanouts(std::time::Duration::from_secs(5)).await;
+    };
+    tokio::join!(fanouts, n4);
     pfcp_listener.abort();
     log::info!("SMF N4 PFCP listener stopped");
     // #718 review m2: the Delete Bearer Requests sent above, on either path, are
@@ -8055,7 +8059,7 @@ mod tests {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
         let fx = restart_fixture("92803", Duration::ZERO).await;
-        let stranger = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stranger = tokio::net::UdpSocket::bind("127.0.0.2:0").await.unwrap();
         let hb = pfcp_path::encode_wire_message(
             pfcp_path::pfcp_message_type::HEARTBEAT_REQUEST,
             None,
@@ -8079,26 +8083,169 @@ mod tests {
         assert!(kept && associated, "and tears nothing down");
     }
 
-    /// #928 review m3 (TS 23.007 §19A): a SMALLER stamp than the stored one is a
-    /// reordered message, discarded, not a restart. m2: the same larger stamp seen
-    /// twice (receive task and heartbeat task) tears down once.
+    /// A Heartbeat Request from UPF A's own address carrying `rts`.
+    async fn heartbeat_request_from_a(fx: &RestartFixture, rts: u32, seq: u32) {
+        let hb = pfcp_path::encode_wire_message(
+            pfcp_path::pfcp_message_type::HEARTBEAT_REQUEST,
+            None,
+            seq,
+            &pfcp_body_rts(rts),
+        );
+        fx.upf_a.send_to(&hb, fx.smf_addr).await.unwrap();
+        let mut buf = vec![0u8; 512];
+        let _ = tokio::time::timeout(Duration::from_secs(2), fx.upf_a.recv_from(&mut buf)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    /// #928 m3 / round 2 B1 (TS 23.007 §19A): an OLDER stamp in an unsolicited
+    /// Heartbeat Request is a reordered message, discarded.
     #[tokio::test]
-    async fn an_older_stamp_is_discarded_and_a_new_one_tears_down_once() {
+    async fn an_older_stamp_in_a_heartbeat_request_is_discarded() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
         let fx = restart_fixture("92804", Duration::ZERO).await;
-        fx.a.check_peer_restart(50).await;
-        let kept_after_older = fx.session_kept();
-        let a1 = fx.a.clone();
-        let a2 = fx.a.clone();
-        let (_, _) = tokio::join!(a1.check_peer_restart(300), a2.check_peer_restart(300));
-        fx.wait_released(1).await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let released = fx.released();
+        heartbeat_request_from_a(&fx, 50, 0x9284).await;
+        let kept = fx.session_kept();
         fx.teardown().await;
+        assert!(
+            kept,
+            "an older stamp in a Heartbeat Request is not a restart"
+        );
+    }
 
-        assert!(kept_after_older, "an older stamp is not a restart");
-        assert_eq!(released, 1, "one restart, one release");
+    /// #928 round 2 B1: in the RESPONSE to our own heartbeat any changed stamp is a
+    /// restart, even a smaller one (a UPF back with its clock behind): the UPF
+    /// answering is a different incarnation. Before, it stayed "associated" for good.
+    #[tokio::test]
+    async fn a_smaller_stamp_in_the_answer_to_our_heartbeat_is_a_restart() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let fx = restart_fixture("92805", Duration::ZERO).await;
+        let a = fx.a.clone();
+        let hb = tokio::spawn(async move { a.heartbeat_once().await });
+        let mut buf = vec![0u8; 512];
+        let (len, from) = fx.upf_a.recv_from(&mut buf).await.unwrap();
+        let h = pfcp_path::parse_wire_header(&buf[..len]).unwrap();
+        let resp = pfcp_path::encode_wire_message(
+            pfcp_path::pfcp_message_type::HEARTBEAT_RESPONSE,
+            None,
+            h.sequence_number,
+            &pfcp_body_rts(50),
+        );
+        fx.upf_a.send_to(&resp, from).await.unwrap();
+        let _ = hb.await.unwrap();
+        let kept = fx.session_kept();
+        fx.teardown().await;
+        assert!(
+            !kept,
+            "the smaller stamp in our own heartbeat's answer is a restart"
+        );
+    }
+
+    /// #928 round 2 B1: past the 2036 wrap of the 32-bit NTP seconds, a stamp just
+    /// after the wrap is NEWER than one just before it (RFC 1982 serial arithmetic).
+    #[tokio::test]
+    async fn a_stamp_past_the_2036_wrap_is_a_restart() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let fx = restart_fixture("92806", Duration::ZERO).await;
+        fx.a.seed_peer_recovery_time_stamp(0xFFFF_FF00).await;
+        heartbeat_request_from_a(&fx, 0x10, 0x9286).await;
+        let kept = fx.session_kept();
+        fx.teardown().await;
+        assert!(!kept, "0x10 after 0xFFFFFF00 is a newer incarnation");
+    }
+
+    /// #928 round 2 B2: the stamp's compare-and-set under one write guard. On a
+    /// multi-thread runtime, two detectors released together by a barrier see each
+    /// new stamp; exactly one tears down per stamp.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_detectors_of_one_new_stamp_tear_down_once() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let fx = restart_fixture("92807", Duration::ZERO).await;
+        let before = pfcp_path::TEARDOWNS_FOR_TEST.load(Ordering::SeqCst);
+        let rounds = 20u32;
+        for i in 0..rounds {
+            let stamp = 1000 + i;
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let mut tasks = Vec::new();
+            for _ in 0..2 {
+                let a = fx.a.clone();
+                let b = barrier.clone();
+                tasks.push(tokio::spawn(async move {
+                    b.wait().await;
+                    a.check_peer_restart(stamp).await;
+                }));
+            }
+            for t in tasks {
+                t.await.unwrap();
+            }
+        }
+        let teardowns = pfcp_path::TEARDOWNS_FOR_TEST.load(Ordering::SeqCst) - before;
+        fx.teardown().await;
+        assert_eq!(teardowns, rounds as usize, "one teardown per new stamp");
+    }
+
+    /// #928 round 2 M2: an Association Release Request from a host that is not the
+    /// association's UPF is refused with cause 72 and tears nothing down.
+    #[tokio::test]
+    async fn a_strangers_association_release_is_refused() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let fx = restart_fixture("92808", Duration::ZERO).await;
+        // Another IP: the same host on another port is the same PFCP node.
+        let stranger = tokio::net::UdpSocket::bind("127.0.0.2:0").await.unwrap();
+        let mut body = 60u16.to_be_bytes().to_vec();
+        body.extend_from_slice(&5u16.to_be_bytes());
+        body.extend_from_slice(&[0, 127, 0, 0, 2]);
+        let rel = pfcp_path::encode_wire_message(
+            pfcp_path::pfcp_message_type::ASSOCIATION_RELEASE_REQUEST,
+            None,
+            0x9288,
+            &body,
+        );
+        stranger.send_to(&rel, fx.smf_addr).await.unwrap();
+        let mut buf = vec![0u8; 512];
+        let answer = tokio::time::timeout(Duration::from_secs(2), stranger.recv_from(&mut buf))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .map(|(n, _)| buf[..n].to_vec());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let kept = fx.session_kept();
+        let associated = fx.a.is_associated().await;
+        fx.teardown().await;
+        let answer = answer.expect("an Association Release Response");
+        let h = pfcp_path::parse_wire_header(&answer).unwrap();
+        assert_eq!(
+            pfcp_path::find_ie(&answer[h.body_offset..], 19).and_then(|v| v.first().copied()),
+            Some(72),
+            "No established PFCP Association"
+        );
+        assert!(kept && associated, "nothing torn down");
+    }
+
+    /// #928 round 2 M3: the shutdown drain of tracked fan-outs is bounded, and waits
+    /// for them when there is time.
+    #[tokio::test]
+    async fn the_restart_fanout_drain_is_bounded() {
+        let slow = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+        });
+        pfcp_path::track_restart_fanout_for_test(slow);
+        let started = std::time::Instant::now();
+        pfcp_path::drain_restart_fanouts(Duration::from_millis(100)).await;
+        let short = started.elapsed();
+        let slow = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        });
+        pfcp_path::track_restart_fanout_for_test(slow);
+        let started = std::time::Instant::now();
+        pfcp_path::drain_restart_fanouts(Duration::from_secs(5)).await;
+        let long = started.elapsed();
+        assert!(short < Duration::from_millis(400), "{short:?}");
+        assert!(long >= Duration::from_millis(250), "it waited: {long:?}");
     }
 
     /// #721: a UPF restart seen on a Heartbeat Request is answered at once, and the
