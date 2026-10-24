@@ -276,6 +276,13 @@ jobs:
           ref: main
           path: nextgsim
       - uses: azure/setup-kubectl@v4
+      # deploy-eks.sh and check_service_ports.py import PyYAML. Installed
+      # explicitly rather than relying on what the runner image ships.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PyYAML
+        run: python3 -m pip install pyyaml
       - name: Render every kustomization
         working-directory: nextgcore
         run: |
