@@ -74,6 +74,9 @@ pub(crate) enum SbiOutcome {
         capability: Vec<u8>,
         result: Result<Vec<u8>, String>,
     },
+    /// #774: one ReleaseSMContext of a superseded registration has reported back
+    /// (whatever its result), for the barrier with this id.
+    SupersedeReleased { barrier: u64 },
 }
 
 /// What keyed work is serialised on: (AMF UE NGAP ID, PDU session ID).
