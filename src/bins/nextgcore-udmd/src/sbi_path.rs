@@ -787,13 +787,20 @@ pub async fn udm_sbi_send_callback_notification(
     callback_uri: &str,
     body: &serde_json::Value,
 ) -> Result<SbiResponse, String> {
-    let (host, port, path) = parse_callback_uri(callback_uri)
-        .ok_or_else(|| format!("callback reference is not an absolute URI: {callback_uri}"))?;
+    // A consumer's callback URI may carry its bearer token (the AMF's
+    // dereg-notify, #789): errors, which are logged, name it redacted.
+    let logged_uri = || nextgcore_sbi::log_redact::redact_last_segment(callback_uri);
+    let (host, port, path) = parse_callback_uri(callback_uri).ok_or_else(|| {
+        format!(
+            "callback reference is not an absolute URI: {}",
+            logged_uri()
+        )
+    })?;
     let client = global_context().get_client(&host, port).await;
     client
         .post_json(&path, body)
         .await
-        .map_err(|e| format!("Notification POST to {callback_uri} failed: {e}"))
+        .map_err(|e| format!("Notification POST to {} failed: {e}", logged_uri()))
 }
 
 // ---------------------------------------------------------------------------

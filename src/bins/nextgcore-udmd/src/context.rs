@@ -216,12 +216,10 @@ impl std::fmt::Debug for UdmUe {
         d.field("serving_network_name", &self.serving_network_name);
         d.field("ausf_instance_id", &self.ausf_instance_id);
         d.field("amf_instance_id", &self.amf_instance_id);
-        d.field("dereg_callback_uri", &self.dereg_callback_uri);
+        // The AMF's dereg-notify URIs carry its bearer token (#789).
+        d.field("dereg_callback_uri", &"<redacted>");
         d.field("non_3gpp_amf_instance_id", &self.non_3gpp_amf_instance_id);
-        d.field(
-            "non_3gpp_dereg_callback_uri",
-            &self.non_3gpp_dereg_callback_uri,
-        );
+        d.field("non_3gpp_dereg_callback_uri", &"<redacted>");
         d.field("auth_event_id", &self.auth_event_id);
         d.field("k", &"<redacted>");
         d.field("opc", &"<redacted>");
