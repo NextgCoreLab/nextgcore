@@ -172,6 +172,11 @@ struct Cache {
     unresolved_order: VecDeque<Vec<u8>>,
     /// The UCMF's current Version ID, when a NEW_VERSION_ID notification told us.
     current_version: Option<u8>,
+    /// Bumped by every `CREATION_OF_DICTIONARY_ENTRY` (#925 re-review MINOR C).
+    /// A Resolve reads it before it asks and passes it back when it records a
+    /// 404; a 404 whose epoch is stale is dropped, because a creation notice has
+    /// since said the dictionary changed.
+    creation_epoch: u64,
 }
 
 /// The AMF's RACS state. Process-global, with its lock declared beside it.
@@ -280,6 +285,14 @@ pub(crate) fn expire_unresolved_for_tests() {
     });
 }
 
+/// The dictionary generation: bumped by every `CREATION_OF_DICTIONARY_ENTRY`
+/// (#925 re-review MINOR C). Read it before asking the UCMF and pass it to
+/// [`ucmf_resolve_at`], so a 404 that crosses a creation notice is dropped
+/// instead of undoing it.
+pub fn creation_epoch() -> u64 {
+    with_cache(|c| c.creation_epoch)
+}
+
 /// Test seam: record a 404 negative for `id` without a UCMF.
 #[cfg(test)]
 pub(crate) fn note_unresolved_for_tests(id: &[u8]) {
@@ -316,6 +329,21 @@ pub fn is_retired(id: &[u8]) -> bool {
                 (Some(current), Some(v)) if v != current
             )
     })
+}
+
+/// The UE radio capability ID a `newDicEntries` entry names, if it names one
+/// (TS 29.673 `DicEntryData`: `plmnAssiUeRadioCapId` or `manAssiUeRadioCapId`;
+/// an entry may instead carry only a `typeAllocationCode`).
+fn created_entry_id(entry: &serde_json::Value) -> Option<Vec<u8>> {
+    entry
+        .as_str()
+        .or_else(|| {
+            entry
+                .get("plmnAssiUeRadioCapId")
+                .or_else(|| entry.get("manAssiUeRadioCapId"))
+                .and_then(|x| x.as_str())
+        })
+        .and_then(from_nucmf)
 }
 
 /// Apply a UCMF notification (TS 29.673 §5.2.2.4, `UcmfNotification`).
@@ -373,28 +401,26 @@ pub fn apply_notification(body: &serde_json::Value) -> Vec<Vec<u8>> {
         // for it. The IDs it names are cleared; a notice that names none clears
         // every 404 negative, since any of them may be what was provisioned.
         "CREATION_OF_DICTIONARY_ENTRY" => {
-            let created: Vec<Vec<u8>> = body
+            let entries = body
                 .pointer("/newDicEntries")
                 .and_then(|l| l.as_array())
-                .map(|l| {
-                    l.iter()
-                        .filter_map(|v| {
-                            v.as_str()
-                                .or_else(|| {
-                                    v.get("plmnAssiUeRadioCapId")
-                                        .or_else(|| v.get("manAssiUeRadioCapId"))
-                                        .and_then(|x| x.as_str())
-                                })
-                                .and_then(from_nucmf)
-                        })
-                        .collect()
-                })
+                .map(Vec::as_slice)
                 .unwrap_or_default();
+            let created: Vec<Vec<u8>> = entries.iter().filter_map(created_entry_id).collect();
+            // #925 re-review MINOR B: the rule, stated once. An entry that names
+            // an ID clears exactly that ID. An entry that names NONE — the
+            // `DicEntryData` shape that carries only a `typeAllocationCode`, and a
+            // notification with no `newDicEntries` at all — says only "something
+            // was created", so every negative may now be wrong and all of them
+            // go. Mixed lists take the cautious reading: one unnamed entry clears
+            // all. Only `unresolved` is cleared that way, so authoritative
+            // deletions are untouched, and the re-asks are gNB-driven and capped
+            // at 16 Resolves in flight.
+            let names_everything = !entries.is_empty() && created.len() == entries.len();
             with_cache(|c| {
-                if created.is_empty() {
+                if !names_everything {
                     c.unresolved.clear();
                     c.unresolved_order.clear();
-                    return;
                 }
                 for id in &created {
                     c.clear_unresolved(id);
@@ -402,6 +428,10 @@ pub fn apply_notification(body: &serde_json::Value) -> Vec<Vec<u8>> {
                         c.deleted_order.retain(|o| o != id);
                     }
                 }
+                // #925 re-review MINOR C: a Resolve that started before this
+                // notification and answers 404 after it must not re-add what the
+                // notification just cleared.
+                c.creation_epoch = c.creation_epoch.wrapping_add(1);
             });
             // Nothing was RETIRED by this notification.
             Vec::new()
@@ -727,6 +757,15 @@ fn capability_5gs_part(response: &nextgcore_sbi::message::SbiResponse) -> Option
 /// `Ok(None)` when the UCMF has no entry (404 `NO_DICTIONARY_ENTRY_FOUND` or
 /// `OUT_DATED_VERSION_ID_IN_RAC_ID`), which retires the ID locally.
 pub async fn ucmf_resolve(id: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    ucmf_resolve_at(id, creation_epoch()).await
+}
+
+/// [`ucmf_resolve`] for a caller that read the dictionary generation earlier —
+/// the NGAP task reads it when it decides to ask, before the lookup is even
+/// spawned, so the "did a creation notice arrive while this ran?" test covers
+/// the whole life of the request rather than starting when the task happens to
+/// be polled.
+pub async fn ucmf_resolve_at(id: &[u8], asked_at: u64) -> Result<Option<Vec<u8>>, String> {
     let nucmf = to_nucmf(id).ok_or("an empty or over-long UE radio capability ID")?;
     let member = if is_plmn_assigned(id) {
         "plmnAssiUeRadioCapId"
@@ -758,6 +797,14 @@ pub async fn ucmf_resolve(id: &[u8]) -> Result<Option<Vec<u8>>, String> {
             // provisioned later (TS 29.675), so its 404 is only a bounded,
             // expiring negative: it suppresses re-asking, and retires nothing.
             with_cache(|c| {
+                if c.creation_epoch != asked_at {
+                    log::info!(
+                        "Resolve of UE radio capability ID {id:02x?} answered 404, but a \
+                         dictionary-creation notification arrived while it ran; the ID is \
+                         left resolvable"
+                    );
+                    return;
+                }
                 if is_plmn_assigned(id) {
                     c.retire(id);
                 } else {

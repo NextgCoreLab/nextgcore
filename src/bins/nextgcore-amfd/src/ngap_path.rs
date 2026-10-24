@@ -6364,10 +6364,13 @@ impl NgapServer {
             },
         );
         let lookup_id = id.clone();
+        // #925 re-review MINOR C: the dictionary generation as of the decision to
+        // ask, read here on the NGAP task rather than inside the job.
+        let asked_at = crate::racs::creation_epoch();
         // The job ALWAYS reports, so the slot is released whether the UCMF
         // answered, refused or could not be reached.
         self.sbi_offload.spawn(async move {
-            let capability = match crate::racs::ucmf_resolve(&lookup_id).await {
+            let capability = match crate::racs::ucmf_resolve_at(&lookup_id, asked_at).await {
                 Ok(cap) => cap,
                 Err(e) => {
                     log::warn!("UE radio capability ID {lookup_id:02x?} not resolved: {e}");

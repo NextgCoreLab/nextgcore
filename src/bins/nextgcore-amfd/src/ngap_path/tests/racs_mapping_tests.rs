@@ -35,8 +35,10 @@ fn in_flight(server: &NgapServer) -> usize {
     server.mapping_resolves.len()
 }
 
-/// A manufacturer-assigned ID (Type Field digit != 1, TS 23.003 §29.2).
-const MAN_ID: [u8; 7] = [0x02, 0x05, 0x00, 0x00, 0x00, 0x07, 0x48];
+/// A manufacturer-assigned ID: Type Field digit **0** (TS 23.003 §29.2 — 0 is
+/// manufacturer-assigned, 1 network-assigned, 2..F spare), so the low nibble of
+/// octet 0 is 0, followed by an 8-digit Vendor ID (#925 re-review MINOR A).
+const MAN_ID: [u8; 7] = [0x00, 0x12, 0x34, 0x56, 0x78, 0x07, 0x48];
 
 /// A UE RADIO CAPABILITY ID MAPPING REQUEST for `id`.
 fn mapping_request_for(id: &[u8]) -> Vec<u8> {
@@ -378,6 +380,143 @@ async fn a_lookup_that_never_reports_does_not_hold_its_slot() {
 
     assert_eq!(in_flight(&server), 1, "the stale slots were released");
     assert!(server.mapping_resolves.contains_key(ID.as_slice()));
+    server.sbi_offload.settle().await;
+    server.process_sbi_outcomes().await;
+}
+
+/// #925 re-review MAJOR: the manufacturer-ID behaviour pinned through the REAL
+/// `ucmf_resolve` 404 branch, not a seeded negative. A Type-Field-0 ID that the
+/// UCMF has no entry for is NOT retired — nothing tells a UE to delete an ID
+/// Nucmf_Provisioning may yet add (TS 29.675, TS 23.501 §5.4.4.1a NOTE 3) — it
+/// is suppressed for the TTL only, and the lookup restarts once that expires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_manufacturer_ids_real_404_suppresses_without_retiring() {
+    use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
+    let _g = racs_guard();
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&asked);
+    let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+    let ucmf = nextgcore_sbi::server::SbiServer::on_listener(
+        nextgcore_sbi::server::SbiServerConfig::new(addr),
+        listener,
+    );
+    ucmf.start(move |_req: SReq| {
+        let counted = Arc::clone(&counted);
+        async move {
+            counted.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            // TS 29.673 §5.2.2.2.1: NO_DICTIONARY_ENTRY_FOUND.
+            SResp::with_status(404)
+        }
+    })
+    .await
+    .expect("stand-in UCMF starts");
+    let _env = UcmfEnvGuard::set(addr.port());
+    let mut server = capturing_ngap_server().await;
+
+    assert!(!crate::racs::is_plmn_assigned(&MAN_ID), "Type Field 0");
+    server
+        .handle_ue_radio_capability_id_mapping(ASSOC, &mapping_request_for(&MAN_ID))
+        .await
+        .expect("handled");
+    server.sbi_offload.settle().await;
+    server.process_sbi_outcomes().await;
+
+    assert_eq!(asked.load(std::sync::atomic::Ordering::Acquire), 1);
+    assert!(
+        !crate::racs::is_retired(&MAN_ID),
+        "a manufacturer-assigned ID's 404 must retire nothing: no UE is told to \
+         delete an ID the UCMF may yet be provisioned with"
+    );
+    assert!(
+        crate::racs::is_known_deleted(&MAN_ID),
+        "but it is suppressed within the TTL"
+    );
+    assert!(
+        take_sent_ngap(&mut server).is_empty(),
+        "and nothing is answered"
+    );
+
+    // Within the TTL, no second Resolve.
+    server
+        .handle_ue_radio_capability_id_mapping(ASSOC, &mapping_request_for(&MAN_ID))
+        .await
+        .expect("handled");
+    assert_eq!(asked.load(std::sync::atomic::Ordering::Acquire), 1);
+
+    // Past the TTL, the UCMF is asked again.
+    crate::racs::expire_unresolved_for_tests();
+    server
+        .handle_ue_radio_capability_id_mapping(ASSOC, &mapping_request_for(&MAN_ID))
+        .await
+        .expect("handled");
+    server.sbi_offload.settle().await;
+    server.process_sbi_outcomes().await;
+    assert_eq!(
+        asked.load(std::sync::atomic::Ordering::Acquire),
+        2,
+        "the expired negative lets the ID be looked up again"
+    );
+}
+
+/// #925 re-review MINOR C: a Resolve that started BEFORE a creation notice and
+/// answers 404 after it must not re-add the negative the notice cleared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_404_in_flight_across_a_creation_notice_is_dropped() {
+    use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
+    let _g = racs_guard();
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    let release = Arc::new(tokio::sync::Notify::new());
+    let gate = Arc::clone(&release);
+    let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+    let ucmf = nextgcore_sbi::server::SbiServer::on_listener(
+        nextgcore_sbi::server::SbiServerConfig::new(addr),
+        listener,
+    );
+    ucmf.start(move |_req: SReq| {
+        let gate = Arc::clone(&gate);
+        async move {
+            gate.notified().await;
+            SResp::with_status(404)
+        }
+    })
+    .await
+    .expect("stand-in UCMF starts");
+    let _env = UcmfEnvGuard::set(addr.port());
+    let mut server = capturing_ngap_server().await;
+
+    // The Resolve is in flight...
+    server
+        .handle_ue_radio_capability_id_mapping(ASSOC, &mapping_request_for(&MAN_ID))
+        .await
+        .expect("handled");
+    assert_eq!(in_flight(&server), 1);
+
+    // ...when the UCMF says the entry now exists.
+    let before = crate::racs::creation_epoch();
+    crate::racs::apply_notification(&serde_json::json!({
+        "eventType": "CREATION_OF_DICTIONARY_ENTRY",
+        "newDicEntries": [{ "manAssiUeRadioCapId": crate::racs::to_nucmf(&MAN_ID).unwrap() }],
+    }));
+    assert_ne!(crate::racs::creation_epoch(), before);
+
+    // Only then does the old Resolve answer 404.
+    release.notify_one();
+    server.sbi_offload.settle().await;
+    server.process_sbi_outcomes().await;
+
+    assert!(
+        !crate::racs::is_known_deleted(&MAN_ID),
+        "the stale 404 must not undo the creation notice"
+    );
+    assert!(!crate::racs::is_retired(&MAN_ID));
+    // So the next request looks it up again.
+    server
+        .handle_ue_radio_capability_id_mapping(ASSOC, &mapping_request_for(&MAN_ID))
+        .await
+        .expect("handled");
+    assert_eq!(in_flight(&server), 1);
+    release.notify_one();
     server.sbi_offload.settle().await;
     server.process_sbi_outcomes().await;
 }

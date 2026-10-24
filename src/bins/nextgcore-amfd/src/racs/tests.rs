@@ -458,7 +458,7 @@ fn a_flood_of_404s_cannot_evict_a_notified_deletion() {
     // Far more manufacturer-assigned 404s than either bound.
     for n in 0..(UNRESOLVED_CAPACITY_FOR_TESTS + 500) as u32 {
         let mut id = nth_id(0x05, n);
-        id[0] = 0x02; // manufacturer-assigned
+        id[0] = 0x00; // Type Field 0: manufacturer-assigned (TS 23.003 §29.2)
         note_unresolved_for_tests(&id);
     }
 
@@ -478,7 +478,7 @@ fn a_manufacturer_ids_404_retires_nothing() {
     let _g = guard();
     reset_for_tests();
     let mut man = nth_id(0x05, 7);
-    man[0] = 0x02;
+    man[0] = 0x00; // Type Field 0: manufacturer-assigned
     note_unresolved_for_tests(&man);
 
     assert!(
@@ -498,7 +498,7 @@ fn caching_a_mapping_clears_its_negative() {
     let _g = guard();
     reset_for_tests();
     let mut man = nth_id(0x05, 8);
-    man[0] = 0x02;
+    man[0] = 0x00;
     note_unresolved_for_tests(&man);
     assert!(is_known_deleted(&man));
 
@@ -506,4 +506,60 @@ fn caching_a_mapping_clears_its_negative() {
 
     assert!(!is_known_deleted(&man));
     assert_eq!(unresolved_len(), 0);
+}
+
+/// #925 re-review MINOR B: a creation notice that names no ID says only that
+/// the dictionary changed, so every negative may now be wrong and all of them
+/// go. A mixed list takes the same cautious reading. Authoritative deletions
+/// are never cleared this way.
+#[test]
+fn a_creation_notice_that_names_no_id_clears_every_negative() {
+    let _g = guard();
+    reset_for_tests();
+    let mut man = nth_id(0x05, 11);
+    man[0] = 0x00;
+    let mut other = nth_id(0x05, 12);
+    other[0] = 0x00;
+    let deleted_by_the_ucmf = nth_id(0x05, 13);
+    note_unresolved_for_tests(&man);
+    note_unresolved_for_tests(&other);
+    apply_notification(&serde_json::json!({
+        "eventType": "DELETION_OF_PLMN_ASSIGNED_IDS",
+        "manAssOpRequestlist": {
+            "plmnAssiUeRadioCapId": [to_nucmf(&deleted_by_the_ucmf).unwrap()],
+        },
+    }));
+
+    // No `newDicEntries` at all.
+    apply_notification(&serde_json::json!({ "eventType": "CREATION_OF_DICTIONARY_ENTRY" }));
+
+    assert_eq!(unresolved_len(), 0, "every negative is cleared");
+    assert!(
+        is_retired(&deleted_by_the_ucmf),
+        "the UCMF's own deletion is NOT cleared by a creation notice"
+    );
+
+    // An entry that names only a typeAllocationCode has the same effect, even
+    // beside one that does name an ID.
+    note_unresolved_for_tests(&man);
+    note_unresolved_for_tests(&other);
+    apply_notification(&serde_json::json!({
+        "eventType": "CREATION_OF_DICTIONARY_ENTRY",
+        "newDicEntries": [
+            { "manAssiUeRadioCapId": to_nucmf(&man).unwrap() },
+            { "typeAllocationCode": "12345678" },
+        ],
+    }));
+    assert_eq!(unresolved_len(), 0, "a mixed list clears all");
+    assert!(is_retired(&deleted_by_the_ucmf));
+
+    // A list where EVERY entry names an ID clears only those.
+    note_unresolved_for_tests(&man);
+    note_unresolved_for_tests(&other);
+    apply_notification(&serde_json::json!({
+        "eventType": "CREATION_OF_DICTIONARY_ENTRY",
+        "newDicEntries": [{ "manAssiUeRadioCapId": to_nucmf(&man).unwrap() }],
+    }));
+    assert!(!is_known_deleted(&man), "the named ID is cleared");
+    assert!(is_known_deleted(&other), "and only it");
 }
