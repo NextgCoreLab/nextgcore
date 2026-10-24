@@ -553,6 +553,12 @@ pub async fn notify_unrestorable_at_boot() -> (usize, usize) {
             if let Some(ip) = entry.ue_ip {
                 ctx.ipv4_pool.release(std::net::Ipv4Addr::from(ip));
             }
+            // #1072 review m1: and its NSACF admission is counted out.
+            if let Some((supi, psi, sst, sd)) = entry.nsac.clone() {
+                tokio::spawn(async move {
+                    crate::rollback_nsac(true, &supi, psi, sst, sd.as_deref()).await;
+                });
+            }
             // After the write guard drops: `persist` re-reads the same map.
             ctx.persist();
         }
@@ -1017,6 +1023,7 @@ mod tests {
                 sm_context_ref: "boot-orphan-ref".to_string(),
                 status_uri: Some(sink.uri.clone()),
                 reason: "policy binding could not be restored: test".to_string(),
+                nsac: None,
             });
         }
 
@@ -1069,6 +1076,7 @@ mod tests {
                 sm_context_ref: "boot-mute-ref".to_string(),
                 status_uri: None,
                 reason: "policy binding could not be restored: test".to_string(),
+                nsac: None,
             });
         }
 
@@ -1110,6 +1118,7 @@ mod tests {
                 sm_context_ref: "boot-once-ref".to_string(),
                 status_uri: Some(sink.uri.clone()),
                 reason: "policy binding could not be restored: test".to_string(),
+                nsac: None,
             });
         }
 
@@ -1145,6 +1154,7 @@ mod tests {
                     sm_context_ref: "boot-free-ref".to_string(),
                     status_uri: None,
                     reason: "policy binding could not be restored: test".to_string(),
+                    nsac: None,
                 },
             );
         }
@@ -1154,6 +1164,58 @@ mod tests {
         let freed = ctx.ipv4_pool.reserve(ip);
         ctx.ipv4_pool.release(ip);
         assert!(freed, "the address is back in the pool");
+    }
+
+    /// #1072 review m1: a boot-unrestorable session the snapshot says the NSACF
+    /// admitted is counted out there.
+    #[tokio::test]
+    async fn boot_counts_out_an_unrestorable_admitted_session() {
+        let _state = PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = N4_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = seen.clone();
+        let (nsacf, addr) = nextgcore_sbi::test_support::sbi_server_on_free_port(
+            move |req: nextgcore_sbi::message::SbiRequest| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock()
+                        .unwrap()
+                        .push(req.http.content.clone().unwrap_or_default());
+                    nextgcore_sbi::message::SbiResponse::with_status(200)
+                }
+            },
+        )
+        .await;
+        std::env::set_var("NSACF_URI", format!("http://127.0.0.1:{}", addr.port()));
+        {
+            let global = crate::context::smf_self();
+            let ctx = global.read().expect("smf context");
+            ctx.unrestorable_sessions.write().expect("pending").push(
+                crate::context::UnrestorableSession {
+                    ue_ip: None,
+                    sm_context_ref: "boot-nsac-ref".to_string(),
+                    status_uri: None,
+                    reason: "policy binding could not be restored: test".to_string(),
+                    nsac: Some(("imsi-001010000010724".to_string(), 5, 1, None)),
+                },
+            );
+        }
+        let _ = notify_unrestorable_at_boot().await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while seen.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let bodies = seen.lock().unwrap().clone();
+        std::env::remove_var("NSACF_URI");
+        nsacf.stop().await.ok();
+
+        assert!(
+            bodies
+                .iter()
+                .any(|b| b.contains("DECREASE") && b.contains("imsi-001010000010724")),
+            "{bodies:?}"
+        );
     }
 
     /// #193 criterion 4: with nothing restored there is nothing to signal.
