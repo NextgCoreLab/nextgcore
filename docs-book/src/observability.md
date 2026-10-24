@@ -13,8 +13,8 @@ NextGCore ships a Docker-based observability stack (Prometheus, Grafana, Jaeger)
 | NF daemon | Metrics served on `/metrics` | Port |
 |---|---|---|
 | `nextgcore-smfd` | `smf_n4_associations`, `smf_n4_peers`, `smf_sessions`, `smf_up` (and the PGW-C S5/S8 binding) | 9090, or `SMF_METRICS_PORT` |
-| `nextgcore-upfd` | `upf_pfcp_associations`, `upf_pfcp_sessions`, `upf_up`, `upf_dataplane_{ul,dl}_{packets,bytes}_total` and dropped/oversize/spoofed packet counters | 9090, or `UPF_METRICS_PORT` |
-| `nextgcore-sgwud` | `sgwu_pfcp_sessions`, `sgwu_pfcp_associations`, `sgwu_up` | 9090, or `SGWU_METRICS_PORT` |
+| `nextgcore-upfd` | `upf_pfcp_associations`, `upf_pfcp_sessions`, `upf_pfcp_unauthorized_messages_total`, `upf_up`, `upf_dataplane_{ul,dl}_{packets,bytes}_total` and dropped/oversize/spoofed packet counters | 9090, or `UPF_METRICS_PORT` |
+| `nextgcore-sgwud` | `sgwu_pfcp_sessions`, `sgwu_pfcp_associations`, `sgwu_pfcp_unauthorized_messages_total`, `sgwu_up` | 9090, or `SGWU_METRICS_PORT` |
 | `nextgcore-udmd` | NES energy gauges, only with `--features nes` | NES `metrics_port` (default 9090) |
 | `nextgcore-nsacfd` | slice-SLA observe gauges, only with `--features sla-observe` | its `metrics_port` when > 0 |
 

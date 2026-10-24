@@ -489,6 +489,15 @@ pub fn amf_sbi_open() -> SbiResult<()> {
     Ok(())
 }
 
+/// Serialises the amfd unit tests that empty the process discovery cache
+/// ([`amf_sbi_close_async`]) against the ones that assert on entries in it
+/// (#668). Declared beside the code that clears the cache, not in a test module.
+#[doc(hidden)]
+pub fn nf_cache_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// Close AMF SBI, and wait for the teardown: the client pool and the discovery
 /// cache are empty when this returns (#673).
 pub async fn amf_sbi_close_async() {
@@ -575,6 +584,33 @@ pub async fn amf_nrf_register(sbi_addr: &str, sbi_port: u16) -> Result<String, S
     }
 }
 
+/// The NF types whose discovered profiles [`amf_nrf_discover`] keeps in the
+/// discovery cache, which is exactly the set this AMF subscribes to at the NRF
+/// for NF status changes (#668, TS 29.510 §5.2.2.5). The NRF itself is cached
+/// too but is not a subscription target: it is not discovered through itself.
+pub const CACHED_PEER_NF_TYPES: [&str; 7] = ["AUSF", "UDM", "SMF", "PCF", "NSSF", "NSACF", "UCMF"];
+
+/// The cache type of a discovered profile's `nfType`, or `None` for a type
+/// [`amf_nrf_discover`] drops.
+pub(crate) fn cached_peer_nf_type(nf_type_str: &str) -> Option<nextgcore_sbi::types::NfType> {
+    Some(match nf_type_str {
+        "AUSF" => nextgcore_sbi::types::NfType::Ausf,
+        "UDM" => nextgcore_sbi::types::NfType::Udm,
+        "SMF" => nextgcore_sbi::types::NfType::Smf,
+        "PCF" => nextgcore_sbi::types::NfType::Pcf,
+        "NSSF" => nextgcore_sbi::types::NfType::Nssf,
+        "NRF" => nextgcore_sbi::types::NfType::Nrf,
+        // NSAC (TS 23.501 §5.15.11): without this arm a discovered
+        // NSACF profile was silently DROPPED here, so UE admission
+        // always fell back to degrade-open.
+        "NSACF" => nextgcore_sbi::types::NfType::Nsacf,
+        // RACS (#570): the UCMF, so `racs::resolve_ucmf_endpoint` can use
+        // what discovery found instead of every profile being dropped here.
+        "UCMF" => nextgcore_sbi::types::NfType::Ucmf,
+        _ => return None,
+    })
+}
+
 /// Discover NF services from NRF
 ///
 /// Queries GET /nnrf-disc/v1/nf-instances?target-nf-type={type}&service-names={svc}
@@ -628,21 +664,8 @@ pub async fn amf_nrf_discover(target_nf_type: &str, service_name: &str) -> Resul
                 .unwrap_or("unknown");
             let nf_type_str = nf_json.get("nfType").and_then(|v| v.as_str()).unwrap_or("");
 
-            let nf_type = match nf_type_str {
-                "AUSF" => nextgcore_sbi::types::NfType::Ausf,
-                "UDM" => nextgcore_sbi::types::NfType::Udm,
-                "SMF" => nextgcore_sbi::types::NfType::Smf,
-                "PCF" => nextgcore_sbi::types::NfType::Pcf,
-                "NSSF" => nextgcore_sbi::types::NfType::Nssf,
-                "NRF" => nextgcore_sbi::types::NfType::Nrf,
-                // NSAC (TS 23.501 §5.15.11): without this arm a discovered
-                // NSACF profile was silently DROPPED here, so UE admission
-                // always fell back to degrade-open.
-                "NSACF" => nextgcore_sbi::types::NfType::Nsacf,
-                // RACS (#570): the UCMF, so `racs::resolve_ucmf_endpoint` can use
-                // what discovery found instead of every profile being dropped here.
-                "UCMF" => nextgcore_sbi::types::NfType::Ucmf,
-                _ => continue,
+            let Some(nf_type) = cached_peer_nf_type(nf_type_str) else {
+                continue;
             };
 
             let mut instance = NfInstance::new(nf_id, nf_type);
@@ -727,7 +750,7 @@ pub fn register_rediscovery_hook() {
 }
 
 /// Parse host and port from a URI string (e.g., "http://localhost:7777")
-fn parse_host_port(uri: &str) -> Option<(String, u16)> {
+pub(crate) fn parse_host_port(uri: &str) -> Option<(String, u16)> {
     let without_scheme = uri
         .strip_prefix("https://")
         .or_else(|| uri.strip_prefix("http://"))
@@ -1044,7 +1067,18 @@ pub struct SmContextIdentity {
     /// the subscription carries none, in which case the member is omitted
     /// (issue #205).
     pub gpsi: Option<String>,
+    /// `3gpp-Sbi-Origination-Timestamp` (TS 29.502 §6.1.2.3.2): the AMF is the
+    /// originating entity of a PDU session establishment's CreateSMContext. It
+    /// is set ONCE per establishment attempt and sent unchanged on every
+    /// retransmission of that request, so the PCF's collision rule
+    /// (TS 29.512 §4.2.7, after the SMF forwards it per §4.2.2.2) sees a
+    /// retried create as the same request and reuses its association (#980
+    /// review). `None` omits the header.
+    pub origination_timestamp: Option<String>,
 }
+
+/// TS 29.502 §6.1.2.3.2 custom header.
+pub const ORIGINATION_TIMESTAMP_HEADER: &str = "3gpp-Sbi-Origination-Timestamp";
 
 fn build_create_sm_context_request(
     pdu_session_id: u8,
@@ -1124,13 +1158,17 @@ fn build_create_sm_context_request(
     if let Some(gpsi) = &identity.gpsi {
         obj.insert("gpsi".to_string(), serde_json::json!(gpsi));
     }
-    SbiRequest::post("/nsmf-pdusession/v1/sm-contexts")
+    let request = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts")
         .with_body(body.to_string(), content_type::APPLICATION_JSON)
         .with_part(SbiPart::with_content(
             "n1SmMsg",
             content_type::APPLICATION_5GNAS,
             bytes::Bytes::copy_from_slice(n1_sm_msg_from_ue),
-        ))
+        ));
+    match &identity.origination_timestamp {
+        Some(ts) => request.with_header(ORIGINATION_TIMESTAMP_HEADER, ts.as_str()),
+        None => request,
+    }
 }
 
 /// Call SMF to create SM context (POST /nsmf-pdusession/v1/sm-contexts)
@@ -4707,6 +4745,7 @@ mod tests {
         // fire-and-forget `amf_sbi_close` cleared the process-wide discovery cache
         // and client pool from a spawned task, after any lock this test held was
         // released.
+        let _cache = nf_cache_test_lock().lock().await;
         assert!(amf_sbi_open().is_ok());
         amf_sbi_close_async().await;
         assert!(global_context()
@@ -4726,6 +4765,36 @@ mod tests {
     ];
 
     /// A populated identity, as the AMF now builds it from the UE context.
+    /// #980 review: the CreateSMContext carries the identity's origination
+    /// timestamp verbatim, and no header without one.
+    #[test]
+    fn the_create_sm_context_request_carries_the_origination_timestamp() {
+        let with =
+            build_create_sm_context_request(5, 1, None, None, &[0x2E], false, &test_identity());
+        assert_eq!(
+            with.http
+                .get_header(ORIGINATION_TIMESTAMP_HEADER)
+                .map(String::as_str),
+            Some("Fri, 23 Oct 2026 10:00:00.980 GMT")
+        );
+        let without = build_create_sm_context_request(
+            5,
+            1,
+            None,
+            None,
+            &[0x2E],
+            false,
+            &SmContextIdentity {
+                origination_timestamp: None,
+                ..test_identity()
+            },
+        );
+        assert!(without
+            .http
+            .get_header(ORIGINATION_TIMESTAMP_HEADER)
+            .is_none());
+    }
+
     fn test_identity() -> SmContextIdentity {
         SmContextIdentity {
             supi: Some("imsi-262011234567890".to_string()),
@@ -4742,6 +4811,7 @@ mod tests {
                 }
             })),
             gpsi: Some("msisdn-491234567890".to_string()),
+            origination_timestamp: Some("Fri, 23 Oct 2026 10:00:00.980 GMT".to_string()),
         }
     }
 
