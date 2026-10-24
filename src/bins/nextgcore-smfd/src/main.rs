@@ -4272,6 +4272,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     sst,
                     sd: snssai_sd.clone(),
                     sdm_subscription_id: sdm_subscription_id.clone(),
+                    nsac_admitted,
                 },
             );
         }
@@ -6114,6 +6115,16 @@ async fn release_side_effects(sm_context_ref: &str, binding: &context::PolicyBin
         )
         .await;
     }
+    // #959: Nnsacf_NSAC_NumOfPDUsUpdate DECREASE (TS 23.502 §4.3.4.2, TS 29.536
+    // §5.2.2.2), for a session the NSACF admitted at create.
+    rollback_nsac(
+        binding.nsac_admitted,
+        &binding.supi,
+        binding.psi,
+        binding.sst,
+        binding.sd.as_deref(),
+    )
+    .await;
     // #79: Nsmf_EventExposure_Notify for PDU_SES_REL (TS 29.508 §4.2.3.2).
     event_exposure::notify(
         event_exposure::event::PDU_SES_REL,
@@ -11174,6 +11185,7 @@ mod tests {
                         // #293: no SDM subscription by default, so the release path
                         // has nothing to unsubscribe.
                         sdm_subscription_id: None,
+                        nsac_admitted: false,
                     },
                 );
             }
@@ -13242,6 +13254,139 @@ mod tests {
         assert!(!sess_left, "the session is removed");
         assert_eq!(after + 1, before, "the address is freed once");
         assert!(free_again);
+    }
+
+    /// #959, TS 23.502 §4.3.4.2: a released session the NSACF admitted at create is
+    /// counted out with a DECREASE, once, on the AMF-driven and on a UE-completed
+    /// release; a session it never admitted sends none.
+    #[tokio::test]
+    async fn a_release_sends_the_nsacf_decrease_for_an_admitted_session() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = seen.clone();
+        let (nsacf, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock()
+                        .unwrap()
+                        .push(req.http.content.clone().unwrap_or_default());
+                    SbiResponse::with_status(200)
+                }
+            })
+            .await;
+        std::env::set_var("NSACF_URI", format!("http://127.0.0.1:{}", addr.port()));
+        let admitted = |supi: &str, psi: u8, ip: [u8; 4], nsac: bool| {
+            let reference = seed_established_session(supi, psi, std::net::Ipv4Addr::from(ip));
+            if let Some(b) = smf_self()
+                .read()
+                .unwrap()
+                .policy_bindings
+                .write()
+                .unwrap()
+                .get_mut(&reference)
+            {
+                b.nsac_admitted = nsac;
+                b.sst = 1;
+            }
+            reference
+        };
+        let amf_side = admitted("imsi-001010000009591", 5, [10, 45, 9, 91], true);
+        let ue_side = admitted("imsi-001010000009592", 6, [10, 45, 9, 92], true);
+        let never = admitted("imsi-001010000009593", 7, [10, 45, 9, 93], false);
+
+        let status = handle_sm_context_release(&amf_side, None).await.status;
+        let _ = release_sm_context_locally(&ue_side);
+        let _ = release_sm_context_locally(&never);
+        side_effects_settled().await;
+        let bodies = seen.lock().unwrap().clone();
+        std::env::remove_var("NSACF_URI");
+        nsacf.stop().await.ok();
+        for ip in [91u8, 92, 93] {
+            smf_self()
+                .read()
+                .unwrap()
+                .ipv4_pool
+                .release(std::net::Ipv4Addr::new(10, 45, 9, ip));
+        }
+
+        assert_eq!(status, 204);
+        let decreases = |supi: &str| {
+            bodies
+                .iter()
+                .filter(|b| b.contains("DECREASE") && b.contains(supi))
+                .count()
+        };
+        assert_eq!(
+            decreases("imsi-001010000009591"),
+            1,
+            "AMF-driven: {bodies:?}"
+        );
+        assert_eq!(decreases("imsi-001010000009592"), 1, "UE-completed");
+        assert_eq!(decreases("imsi-001010000009593"), 0, "never admitted");
+    }
+
+    /// #959 end to end: SM Context Create counts the session in at the NSACF
+    /// (INCREASE, 204), and the AMF-driven release counts it out (DECREASE).
+    #[tokio::test]
+    async fn a_created_and_released_session_is_counted_in_and_out_at_the_nsacf() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = seen.clone();
+        let (nsacf, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock()
+                        .unwrap()
+                        .push(req.http.content.clone().unwrap_or_default());
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await;
+        std::env::set_var("NSACF_URI", format!("http://127.0.0.1:{}", addr.port()));
+        let supi = "imsi-001010000009594";
+        let resp = handle_sm_context_create(&create_request(
+            supi,
+            8,
+            &n1(
+                8,
+                1,
+                gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+                &[0x91, 0x00],
+            ),
+        ))
+        .await;
+        let reference = smf_self()
+            .read()
+            .unwrap()
+            .policy_bindings
+            .read()
+            .unwrap()
+            .iter()
+            .find(|(_, b)| b.supi == supi && b.psi == 8)
+            .map(|(r, b)| (r.clone(), b.nsac_admitted));
+        if let Some((r, _)) = &reference {
+            let _ = handle_sm_context_release(r, None).await;
+        }
+        side_effects_settled().await;
+        let bodies = seen.lock().unwrap().clone();
+        std::env::remove_var("NSACF_URI");
+        nsacf.stop().await.ok();
+
+        assert_eq!(resp.status, 201);
+        assert_eq!(
+            reference.map(|(_, a)| a),
+            Some(true),
+            "admitted is recorded"
+        );
+        let count = |flag: &str| bodies.iter().filter(|b| b.contains(flag)).count();
+        assert_eq!((count("INCREASE"), count("DECREASE")), (1, 1), "{bodies:?}");
     }
 
     // ---- #719: a reactivation release terminates the SM Policy Association ----

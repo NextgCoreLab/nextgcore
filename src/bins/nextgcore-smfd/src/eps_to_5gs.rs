@@ -949,6 +949,7 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
                         sst: sess.s_nssai.sst,
                         sd: sd_hex.clone(),
                         sdm_subscription_id: None,
+                        nsac_admitted: false,
                     },
                 );
             }
