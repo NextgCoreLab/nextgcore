@@ -6,6 +6,7 @@ pub mod builder;
 pub mod header;
 pub mod ie;
 pub mod message;
+pub mod recovery;
 pub mod teid_pool;
 pub mod types;
 pub mod xact;
@@ -51,6 +52,9 @@ pub use builder::{
     build_create_session_request, build_delete_session_request, build_modify_bearer_request,
     Ambr as BuilderAmbr, FTeid as BuilderFTeid, Uli,
 };
+
+// Re-export the TS 23.007 §18 Restart counter comparison
+pub use recovery::{note_restart_counter, restart_counter_order, RestartOrder};
 
 // Re-export TEID pool
 pub use teid_pool::TeidPool;
