@@ -502,10 +502,16 @@ pub(crate) fn modify_indication_unsuccessful_transfer(
 /// `PDUSessionResourceReleaseCommandTransfer` (TS 38.413 §9.3.4.12) with
 /// Cause nas / normal-release.
 pub(crate) fn release_command_transfer() -> Result<Vec<u8>, TransferError> {
+    release_command_transfer_with(SmfCause::NasNormalRelease)
+}
+
+/// `PDUSessionResourceReleaseCommandTransfer` with `cause` (#994: transport /
+/// transport-resource-unavailable when the N3 path failed).
+pub(crate) fn release_command_transfer_with(cause: SmfCause) -> Result<Vec<u8>, TransferError> {
     encode(
         "PDUSessionResourceReleaseCommandTransfer",
         &g::PDUSessionResourceReleaseCommandTransfer {
-            cause: SmfCause::NasNormalRelease.generated(),
+            cause: cause.generated(),
             ie_extensions: None,
         },
     )

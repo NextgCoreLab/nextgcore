@@ -660,6 +660,13 @@ pub struct UeNasContext {
     initial_context_setup_request_sent: bool,
     /// Initial Context Setup Response received from the gNB.
     initial_context_setup_response_received: bool,
+    /// The PDU sessions the last INITIAL CONTEXT SETUP REQUEST asked the gNB to set up
+    /// (#739). Its Response may only report these: a Setup Response Transfer for any
+    /// other PSI would re-point that session's downlink at the gNB without the AMF
+    /// having asked. Replaced by each new Request and cleared when its Response is
+    /// handled, so a late Response to an earlier Request is checked against the latest
+    /// one's sessions (#1009 review).
+    ics_requested_psis: Vec<u8>,
     /// Whether the Registration Accept has left the AMF for this UE (#91).
     ///
     /// Gates the UE-policy association create, because creating it is what makes the
@@ -788,6 +795,7 @@ impl UeNasContext {
             gmm_fsm: GmmFsm::new(amf_ue_ngap_id),
             initial_context_setup_request_sent: false,
             initial_context_setup_response_received: false,
+            ics_requested_psis: Vec::new(),
             registration_accept_sent: false,
             ue_policy_container: None,
             cm_idle: false,
@@ -900,7 +908,7 @@ pub struct NgapServer {
     ///
     /// Recorded when the target admits the UE (HandoverRequestAcknowledge) and
     /// dropped when the handover completes, is cancelled, or fails. It exists for
-    /// UPLINK RAN STATUS TRANSFER (TS 38.413 §8.4.7): the source gNB sends the
+    /// UPLINK RAN STATUS TRANSFER (TS 38.413 §8.4.6): the source gNB sends the
     /// PDCP SN/HFN status *after* the HandoverCommand, and the AMF has to know
     /// where to forward it. `ue_auth_state` cannot answer that — it still names
     /// the SOURCE association until the UE arrives.
@@ -1012,6 +1020,21 @@ pub struct NgapServer {
     /// Uplink NAS Transport create a context under the ID. Bounded by
     /// [`MAX_CONTEXTLESS_UE_IDS`], oldest first.
     contextless_ue_ids: std::collections::VecDeque<ContextlessUeId>,
+}
+
+/// What the #739 UE-association gate decided for one received NGAP PDU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UeAssociation {
+    /// Not a gated message (not UE-associated, or its procedure checks itself).
+    NotGated,
+    /// A UE-associated logical NG-connection of the sending association.
+    Serving,
+    /// Not one: dropped, answered with an Error Indication with this cause.
+    Refused {
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: Option<u32>,
+        cause: u8,
+    },
 }
 
 /// A PDU Session Establishment Request waiting for a reachable SMF (#796).
@@ -1516,6 +1539,32 @@ impl NgapServer {
             "NGAP message from association {association_id}: procedure_code={procedure_code:?}"
         );
 
+        // #739: one gate for every UE-associated message (TS 38.413 §10.6).
+        if let UeAssociation::Refused {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            cause,
+        } = self.check_ue_association(association_id, procedure_code, data)
+        {
+            // Exported as `amf_ngap_ue_associated_refused` (#1009 review): a rise is a gNB
+            // out of step with this AMF, or one naming other gNBs' UEs.
+            crate::metrics::global().inc(crate::metrics::GlobalMetric::UeAssociatedRefused);
+            log::warn!(
+                "NGAP procedure {procedure_code:?} from association {association_id} names \
+                 AMF UE NGAP ID {amf_ue_ngap_id} / RAN UE NGAP ID {ran_ue_ngap_id:?}, which is \
+                 not a UE-associated logical connection of this association: dropped, Error \
+                 Indication ({cause:?}, TS 38.413 §10.6)"
+            );
+            self.send_error_indication(
+                association_id,
+                Some(amf_ue_ngap_id),
+                ran_ue_ngap_id,
+                ngap_gen::Cause::RadioNetwork(ngap_gen::CauseRadioNetwork(cause)),
+            )
+            .await?;
+            return Ok(());
+        }
+
         match procedure_code {
             Some(21) => {
                 // NGSetupRequest (procedure code 21)
@@ -1737,7 +1786,7 @@ impl NgapServer {
                 }
             }
             Some(49) => {
-                // UPLINK RAN STATUS TRANSFER (TS 38.413 §8.4.7): relay the PDCP
+                // UPLINK RAN STATUS TRANSFER (TS 38.413 §8.4.6): relay the PDCP
                 // status to the handover target as DOWNLINK RAN STATUS TRANSFER.
                 // Accepting and dropping it made handover lossy.
                 if data[0] == 0x00 {
@@ -1905,6 +1954,78 @@ impl NgapServer {
             crate::ngap_asn1::extract_ran_ue_ngap_id(data),
             cause,
         )
+    }
+
+    /// The #739 gate: is `data`, a UE-associated message from `association_id`, about a
+    /// UE-associated logical NG-connection of THAT association (TS 38.413 §10.6)?
+    ///
+    /// AP IDs are local to their NG interface, so an AMF UE NGAP ID that no CM-CONNECTED
+    /// UE holds on this association is an UNKNOWN local AP ID here, whatever another
+    /// association holds under it; a RAN UE NGAP ID other than the one stored for the UE
+    /// is an INCONSISTENT remote AP ID. Either way the message is dropped and an Error
+    /// Indication names the received IDs. A CM-IDLE UE has no logical connection, so a
+    /// RAN UE NGAP ID it kept from a released one never resolves to it (#848 review).
+    ///
+    /// Known deviation, as on the #758 path: §10.6 also has both nodes locally release
+    /// the connection with the erroneous AP ID. That is not done: a peer naming a wrong
+    /// pair must not be able to release another UE's connection.
+    ///
+    /// Not gated here, because the procedure defines who may send it:
+    /// - the messages that open a connection (Initial UE Message, Path Switch Request,
+    ///   which names the SOURCE AMF UE NGAP ID from a new association);
+    /// - the handover target's Acknowledge, Failure and Notify, checked against the
+    ///   recorded target in their handlers;
+    /// - a UE Context Release Complete, the "last message" (§10.6: local release only),
+    ///   checked in its handler;
+    /// - an Error Indication, which is never answered with one.
+    fn check_ue_association(
+        &self,
+        association_id: u64,
+        procedure_code: Option<u16>,
+        data: &[u8],
+    ) -> UeAssociation {
+        use nextgcore_ngap_gen::generated as g;
+        let Some(code) = procedure_code else {
+            return UeAssociation::NotGated;
+        };
+        let exempt = [
+            g::ID_INITIAL_UE_MESSAGE as u16,
+            proc_code::PATH_SWITCH_REQUEST,
+            proc_code::HANDOVER_RESOURCE_ALLOCATION,
+            proc_code::HANDOVER_NOTIFICATION,
+            g::ID_UE_CONTEXT_RELEASE as u16,
+            proc_code::ERROR_INDICATION,
+        ];
+        if exempt.contains(&code) {
+            return UeAssociation::NotGated;
+        }
+        let Some(amf_ue_ngap_id) = crate::ngap_asn1::extract_amf_ue_ngap_id(data) else {
+            return UeAssociation::NotGated;
+        };
+        let ran_ue_ngap_id = crate::ngap_asn1::extract_ran_ue_ngap_id(data);
+        let refused = |cause| UeAssociation::Refused {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            cause,
+        };
+        match self.ue_auth_state.get(amf_ue_ngap_id) {
+            Some(state) if state.association_id == association_id && !state.is_cm_idle() => {
+                match ran_ue_ngap_id {
+                    Some(ran) if ran != state.ran_ue_ngap_id => {
+                        refused(ngap_gen::CauseRadioNetwork::INCONSISTENT_REMOTE_UE_NGAP_ID)
+                    }
+                    _ => UeAssociation::Serving,
+                }
+            }
+            // An allocation without a NAS context (#758) is the handler's to judge.
+            _ if self.contextless_ue_ids.iter().any(|c| {
+                c.amf_ue_ngap_id == amf_ue_ngap_id && c.association_id == association_id
+            }) =>
+            {
+                UeAssociation::Serving
+            }
+            _ => refused(ngap_gen::CauseRadioNetwork::UNKNOWN_LOCAL_UE_NGAP_ID),
+        }
     }
 
     /// Extract procedure code from NGAP message
@@ -5627,6 +5748,9 @@ impl NgapServer {
         state.gmm_fsm.transition_to_initial_context_setup();
         self.ue_auth_state.insert(amf_ue_ngap_id, state);
 
+        // #739: this Request sets up no PDU session, so its Response may report none.
+        self.ue_auth_state
+            .with_mut(amf_ue_ngap_id, |s| s.ics_requested_psis.clear());
         self.send_to_association(association_id, &ics).await?;
         // Arm T3550 against the ICS PDU: until the gNB confirms with an ICS
         // Response, the retransmission carries the whole request (Registration
@@ -6273,6 +6397,10 @@ impl NgapServer {
         };
         let (racs_id, racs_cap) = self.racs_ies_for(amf_ue_ngap_id);
         let ics = crate::racs::add_capability_ies(ics, racs_id.as_deref(), racs_cap.as_deref());
+        let requested: Vec<u8> = sessions.iter().map(|s| s.pdu_session_id).collect();
+        self.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
+            s.ics_requested_psis = requested;
+        });
         self.send_to_association(association_id, &ics).await?;
         for s in &sessions {
             self.mark_up_active(amf_ue_ngap_id, s.pdu_session_id);
@@ -12903,8 +13031,8 @@ impl NgapServer {
     }
 
     /// Handle an UPLINK RAN STATUS TRANSFER from the source gNB (TS 38.413
-    /// §8.4.7) by relaying it to the target as a DOWNLINK RAN STATUS TRANSFER
-    /// (§8.4.8).
+    /// §8.4.6) by relaying it to the target as a DOWNLINK RAN STATUS TRANSFER
+    /// (§8.4.7).
     ///
     /// This is the PDCP SN/HFN status the target needs to resume the DRBs without
     /// losing or duplicating packets. It used to be accepted and dropped (and
@@ -14620,9 +14748,18 @@ impl NgapServer {
         }
 
         // Unknown UE → PathSwitchRequestFailure releasing every session it named,
-        // cause unknown-local-UE-NGAP-ID (the list is mandatory, §9.2.3.10).
-        if !self.ue_auth_state.contains(amf_ue_ngap_id) {
-            log::warn!("PathSwitchRequest for unknown UE {amf_ue_ngap_id}; failing");
+        // cause unknown-local-UE-NGAP-ID (the list is mandatory, §9.2.3.10). So is a UE
+        // that is not CM-CONNECTED (#1009 review): an Xn handover presupposes a connected
+        // UE, and a request naming an idle one comes from a gNB that does not serve it.
+        let connected = self
+            .ue_auth_state
+            .get(amf_ue_ngap_id)
+            .is_some_and(|s| !s.is_cm_idle());
+        if !connected {
+            log::warn!(
+                "PathSwitchRequest from association {association_id} for UE {amf_ue_ngap_id}, \
+                 which is unknown or not CM-CONNECTED; failing"
+            );
             if let Some(bytes) = path_switch_failure(
                 amf_ue_ngap_id,
                 req.ran_ue_ngap_id,
@@ -14637,80 +14774,43 @@ impl NgapServer {
             return Ok(());
         }
 
-        // Derive a fresh NH from KAMF (vertical key derivation) and increment
-        // the NHCC (TS 33.501 Section 6.9.2.3.3 / 6.9.4.1).
-        // `with_mut`, because everything this block does to `state` must PERSIST:
-        // it advances the NH key chain and it moves the UE's serving association
-        // to the target gNB. A dropped clone would leave the AMF believing the UE
-        // is still on the source association -- so every later downlink NAS would
-        // be sent to the gNB the UE just left -- and would reuse the NCC on the
-        // next switch. Await-free; the relays below happen after it returns.
-        let (ncc, inbound, allowed_nssai, ue_caps) = self
-            .ue_auth_state
-            .with_mut(amf_ue_ngap_id, |state| {
-                // Shared with the N2 path (see AmfUe::advance_next_hop) so the two
-                // cannot derive keys differently. The chain is seeded from KgNB at
-                // AS-context establishment, so this no longer chains from zeros.
-                let (_ncc, _nh) = state.amf_ue.advance_next_hop();
-                // Move the UE's serving RAN association and RAN-UE-NGAP-ID to the
-                // target gNB; this is the N3 tunnel/RAN identity update.
-                state.ran_ue_ngap_id = req.ran_ue_ngap_id;
-                state.association_id = association_id;
-
-                // #406, the SECOND instance of the discarded-location class: move the
-                // stored location to the TARGET cell as well as the target association.
-                //
-                // `UserLocationInformation` is MANDATORY on PATH SWITCH REQUEST
-                // (TS 38.413 §9.2.3.8, `38413-j30.txt:13741-13742`), and TS 23.502
-                // §4.9.1.2.2 step 1b says what it is for: the target NG-RAN *"sends an N2
-                // Path Switch Request message to an AMF to inform that the UE has moved to
-                // a new Target cell"* (`23502-k20.txt:17848-17858`). Before this the
-                // handler bound `req` and never read `req.user_location_info` at all.
-                //
-                // This is the arm that matters most after the filed one: an Xn handover
-                // produces NO `HandoverNotify`, so this message is the AMF's ONLY
-                // notification that the UE relocated. Without it a UE that moved by Xn —
-                // the common case, since Xn is preferred wherever the interface exists —
-                // left the stored location untouched, and `nr_cgi`'s single writer was
-                // reachable only via the LESS common handover type.
-                //
-                // Inside the same `with_mut` as the association move, deliberately: the two
-                // describe one event, and a reader must not have to wonder whether the
-                // location and the serving gNB can disagree.
-                // Criticality ignore: a request without it keeps the stored location.
-                if let Some(uli) = &req.user_location_info {
-                    apply_user_location(&mut state.amf_ue, uli);
-                }
-
-                // #70: the inbound request transfers, kept so each can be relayed to the SMF
-                // AFTER this borrow ends. The switched list is built from the SMF's ANSWERS
-                // below, not from these — echoing the gNB's own PathSwitchRequestTransfer back
-                // as the acknowledge is the defect #70 names, and it tells the target gNB to
-                // send uplink traffic to itself (TS 38.413 §9.3.4.8 vs §9.3.4.9).
-                let inbound: Vec<(u8, Vec<u8>)> = req
-                    .pdu_session_list
-                    .iter()
-                    .map(|p| (p.pdu_session_id, p.transfer.clone()))
-                    .collect();
-
-                let allowed_nssai = state
-                    .amf_ue
-                    .allowed_nssai
-                    .iter()
-                    .map(|s| nextgcore_ngap::types::SNssai {
-                        sst: s.sst,
-                        sd: s.sd.map(|sd| sd.to_be_bytes()[1..4].try_into().unwrap()),
-                    })
-                    .collect::<Vec<_>>();
-
-                (
-                    state.amf_ue.nhcc,
-                    inbound,
-                    allowed_nssai,
-                    ue_caps_to_ngap_for_ue(&state.amf_ue),
-                )
-            })
-            .expect("the UE was resolved above");
+        // What the Acknowledge needs, READ only: nothing about the UE changes until the
+        // outcome is decided (#1009 review). The fresh {NCC, NH} (TS 33.501 §6.9.2.3.3 /
+        // §6.9.4.1) is previewed here and committed with the association move below, only
+        // for an Acknowledge -- a request that ends in a PATH SWITCH REQUEST FAILURE leaves
+        // the UE on its source with its key chain where it was.
+        let (inbound, allowed_nssai, ue_caps, (ncc, nh)) = {
+            let state = self
+                .ue_auth_state
+                .get(amf_ue_ngap_id)
+                .expect("the UE was resolved above");
+            // #70: the inbound request transfers, relayed to the SMF below. The switched
+            // list is built from the SMF's ANSWERS, not from these -- echoing the gNB's own
+            // PathSwitchRequestTransfer back as the acknowledge is the defect #70 names
+            // (TS 38.413 §9.3.4.8 vs §9.3.4.9).
+            let inbound: Vec<(u8, Vec<u8>)> = req
+                .pdu_session_list
+                .iter()
+                .map(|p| (p.pdu_session_id, p.transfer.clone()))
+                .collect();
+            let allowed_nssai = state
+                .amf_ue
+                .allowed_nssai
+                .iter()
+                .map(|s| nextgcore_ngap::types::SNssai {
+                    sst: s.sst,
+                    sd: s.sd.map(|sd| sd.to_be_bytes()[1..4].try_into().unwrap()),
+                })
+                .collect::<Vec<_>>();
+            (
+                inbound,
+                allowed_nssai,
+                ue_caps_to_ngap_for_ue(&state.amf_ue),
+                // Shared with the N2 path (AmfUe::advance_next_hop) so the two cannot
+                // derive keys differently.
+                state.amf_ue.next_hop_preview(),
+            )
+        };
 
         // #70: Nsmf_PDUSession_UpdateSMContext per switched PDU session
         // (TS 29.502 §5.2.2.3.3). The SMF switches the UPF's DL path to the target and
@@ -14723,13 +14823,6 @@ impl NgapServer {
         // point the target gNB at a tunnel no UPF serves. A gNB that finds a session
         // missing from the switched list releases it, which is the honest outcome.
         let switched_list = self.switched_list_from_smf(amf_ue_ngap_id, &inbound).await;
-
-        let nh = self
-            .ue_auth_state
-            .get(amf_ue_ngap_id)
-            .expect("checked")
-            .amf_ue
-            .nh;
 
         let allowed_for_ack = if allowed_nssai.is_empty() {
             vec![nextgcore_ngap::types::SNssai { sst: 1, sd: None }]
@@ -14766,6 +14859,21 @@ impl NgapServer {
         let (racs_id, _) = self.racs_ies_for(amf_ue_ngap_id);
         match ack_bytes {
             Some(bytes) => {
+                // The outcome is an Acknowledge: commit what it tells the target. The NH
+                // chain advances to exactly the {NCC, NH} the Acknowledge carries, and the
+                // UE's serving RAN association, RAN-UE-NGAP-ID and location move to the
+                // target (#406: `UserLocationInformation` is mandatory here, TS 38.413
+                // §9.2.3.8, and an Xn handover produces no HandoverNotify, so this is the
+                // AMF's only notice that the UE relocated). `with_mut`, so it persists.
+                self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
+                    let committed = state.amf_ue.advance_next_hop();
+                    debug_assert_eq!(committed, (ncc, nh), "the previewed NH is the one sent");
+                    state.ran_ue_ngap_id = req.ran_ue_ngap_id;
+                    state.association_id = association_id;
+                    if let Some(uli) = &req.user_location_info {
+                        apply_user_location(&mut state.amf_ue, uli);
+                    }
+                });
                 // #570: the UE Radio Capability ID, when the UE has one (TS 38.413 §9.2.3.9).
                 let bytes = crate::racs::add_capability_ies(bytes, racs_id.as_deref(), None);
                 self.send_to_association(association_id, &bytes).await?;
@@ -14895,7 +15003,22 @@ impl NgapServer {
         // downlink tunnel; the SMF must have it to move the UPF's downlink FAR off
         // BUFF (TS 23.502 §4.2.3.2 steps 12-14). Before this an ICS that carried
         // sessions -- a Service Request's re-activation -- left the UPF buffering.
+        //
+        // #739: only the sessions the Request asked for. Any other PSI would have the
+        // SMF re-point a session's downlink at this gNB on the gNB's say-so alone.
+        let requested = self
+            .ue_auth_state
+            .get(amf_ue_ngap_id)
+            .map(|s| s.ics_requested_psis.clone())
+            .unwrap_or_default();
         for (psi, transfer) in &ics_setup_sessions {
+            if !requested.contains(psi) {
+                log::warn!(
+                    "Initial Context Setup Response for UE {amf_ue_ngap_id} reports PSI {psi}, \
+                     which its Request did not set up ({requested:?}); not relayed to the SMF"
+                );
+                continue;
+            }
             self.relay_n2_sm_to_smf(
                 amf_ue_ngap_id,
                 *psi,
@@ -14908,6 +15031,7 @@ impl NgapServer {
 
         let updated = self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
             state.initial_context_setup_response_received = true;
+            state.ics_requested_psis.clear();
             // The gNB has the Registration Accept; stop retransmitting the ICS
             // request. T3550 logic that waits for Registration Complete is reset
             // here — Registration Complete arrives on the uplink NAS path.
@@ -26482,7 +26606,7 @@ mod tests {
 
     /// **#740.** The DOWNLINK RAN STATUS TRANSFER relayed to the handover target names
     /// the UE by the RAN UE NGAP ID the TARGET allocated in its HandoverRequestAcknowledge
-    /// (TS 38.413 §8.4.2.2, §8.4.8, §9.2.3.5), not by the source's: each gNB allocates
+    /// (TS 38.413 §8.4.2.2, §8.4.7, §9.2.3.5), not by the source's: each gNB allocates
     /// its own, and the source's id at the target is an inconsistent pair (§10.6) or
     /// another UE.
     ///
@@ -28996,16 +29120,19 @@ mod tests {
         // send, which is where the defect was.
         let _ = server.handle_path_switch_request(assoc, &pdu).await;
 
-        // The UE's NCC advanced (the pre-existing forward-security behaviour) and the
-        // relocation happened, so the handler ran to completion rather than bailing early.
+        // #1009 review: with nothing switched the outcome is a PATH SWITCH REQUEST
+        // FAILURE, and a failed Path Switch changes nothing -- the UE stays on its source
+        // pair and its NH chain where it was (it used to move and advance regardless).
         let state = server.ue_auth_state.get(amf_ue_ngap_id).expect("UE");
         assert_eq!(
-            state.ran_ue_ngap_id, 67,
-            "the handler completed the relocation"
+            (state.association_id, state.ran_ue_ngap_id),
+            (assoc, 66),
+            "a failed Path Switch does not relocate the UE"
         );
-        assert!(
-            state.amf_ue.nh.iter().any(|b| *b != 0) || state.amf_ue.nhcc != 0,
-            "and advanced the NH chain"
+        assert_eq!(
+            (state.amf_ue.nhcc, state.amf_ue.nh),
+            (0, [0u8; 32]),
+            "nor advance its NH chain"
         );
     }
     // ------------------------------------------------------------------
@@ -29624,9 +29751,9 @@ mod tests {
     /// at all, so this message is the AMF's only notification that the UE relocated.
     ///
     /// Contrast pair again: the UE is seeded at the SOURCE cell and the request comes
-    /// from the TARGET. The acknowledge cannot egress (no association) and the SMF cannot
-    /// be reached, which is fine — the location write is inside the `with_mut` that also
-    /// moves the serving association, both of which happen before any of that.
+    /// from the TARGET. A stand-in SMF switches the session, so the outcome is an
+    /// Acknowledge (#1009 review: only then do the location, the serving association and
+    /// the NH chain move).
     ///
     /// REVERT-VERIFIED: deleting the `apply_user_location` call from the handler's
     /// `with_mut` makes this FAIL, reading back the source TAC 0x000403.
@@ -29669,9 +29796,21 @@ mod tests {
             },
         )
         .expect("encode a PathSwitchRequest");
-        // Association 2 is the target's. The acknowledge send fails (no live
-        // association), which the handler logs rather than propagating.
+        // Association 2 is the target's; the session is held at a stand-in SMF that
+        // switches it, so the Acknowledge goes out and the relocation is committed.
+        let (_smf, smf_port, _calls) = handler_tests::path_switch_smf().await;
+        ngap.sm_context_refs
+            .insert((amf_ue_ngap_id, 1), "ps406-1".to_string());
+        ngap.sm_context_smfs
+            .insert((amf_ue_ngap_id, 1), ("127.0.0.1".to_string(), smf_port));
+        ngap.sent_ngap = Some(Vec::new());
         let _ = ngap.handle_path_switch_request(2, &pdu).await;
+        let sent = take_sent_ngap(&mut ngap);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(
+            sent[0].1[0], 0x20,
+            "a PATH SWITCH REQUEST ACKNOWLEDGE (successful outcome)"
+        );
 
         let state = ngap
             .ue_auth_state

@@ -2679,4 +2679,51 @@ mod tests {
         std::env::remove_var("SGWC_SGWU_ADDR");
         let _ = stop.send(true);
     }
+
+    /// #1014 / #1028 review, TS 29.244 §7.4.5.1 and §8.2.70 (Figure 8.2.70-1):
+    /// a Node Report Request built byte by byte as an SGW-U sends it, not
+    /// through the library's encoder. The Remote GTP-U Peer flags octet carries
+    /// V4 as bit 2 (0x02), then the IPv4 address. The SGW-C reads 10.0.0.80 as
+    /// the failed peer and releases the S1-U bearers toward it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_report_in_spec_bytes_releases_the_s1u_toward_its_ipv4_peer() {
+        let guard = process_state_test_guard().await;
+        crate::up_path::clear_for_test();
+        let sgwu = assoc_sgwu(Vec::new()).await;
+        let (node, stop) = associated_node(&guard, &sgwu).await;
+        let (ue, bearer) = ue_toward(b"001010994000080", [10, 0, 0, 80]);
+        let body: Vec<u8> = vec![
+            0x00, 0x3c, 0x00, 0x05, 0x00, 127, 0, 0, 9, // Node ID (60): IPv4 127.0.0.9
+            0x00, 0x65, 0x00, 0x01, 0x01, // Node Report Type (101): UPFR
+            0x00, 0x66, 0x00, 0x09, // User Plane Path Failure Report (102), grouped:
+            0x00, 0x67, 0x00, 0x05, 0x02, 10, 0, 0, 80, // Remote GTP-U Peer (103): V4
+        ];
+        let mut pdu = vec![0x20, 0x0c]; // version 1, no SEID; Node Report Request (12)
+        pdu.extend_from_slice(&((body.len() + 4) as u16).to_be_bytes());
+        pdu.extend_from_slice(&[0x00, 0x10, 0x14, 0x00]); // sequence 0x001014, spare
+        pdu.extend_from_slice(&body);
+        sgwu.sock.send_to(&pdu, node.local_addr()).await.unwrap();
+
+        let responses = sgwu.node_report_responses.clone();
+        eventually("the Node Report Response", || {
+            !responses.lock().unwrap().is_empty()
+        })
+        .await;
+        let (seq, rsp) = responses.lock().unwrap()[0].clone();
+        assert_eq!(seq, 0x00_1014);
+        assert_eq!(response_cause(&rsp).0, PfcpCause::RequestAccepted);
+        eventually("the IPv4 peer recorded failed", || {
+            crate::up_path::is_failed("10.0.0.80".parse().unwrap())
+        })
+        .await;
+        let mods = sgwu.modifications.clone();
+        eventually("the S1-U release", || !mods.lock().unwrap().is_empty()).await;
+        assert_eq!(
+            sgwc_self().dl_tunnel_in_bearer(bearer).unwrap().remote_teid,
+            0
+        );
+        sgwc_self().ue_remove(ue);
+        std::env::remove_var("SGWC_SGWU_ADDR");
+        let _ = stop.send(true);
+    }
 }
