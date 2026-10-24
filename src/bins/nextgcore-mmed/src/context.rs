@@ -836,7 +836,7 @@ pub struct SgwUe {
 // ============================================================================
 
 /// MME UE memento for context backup/restore
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct MmeUeMemento {
     /// UE network capability
     pub ue_network_capability: UeNetworkCapability,
@@ -878,6 +878,42 @@ pub struct MmeUeMemento {
     pub selected_enc_algorithm: u8,
     /// Selected integrity algorithm
     pub selected_int_algorithm: u8,
+}
+
+/// Manual `Debug` (no-auth-material-in-logs): the authentication material in
+/// this type (xres, kasme, rand, autn, knas_int, knas_enc, kenb, nh) prints as `<redacted>`, so a future
+/// `{:?}` in a log line cannot leak it.
+impl std::fmt::Debug for MmeUeMemento {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("MmeUeMemento");
+        d.field("ue_network_capability", &self.ue_network_capability);
+        d.field("ms_network_capability", &self.ms_network_capability);
+        d.field(
+            "ue_additional_security_capability",
+            &self.ue_additional_security_capability,
+        );
+        d.field("xres", &"<redacted>");
+        d.field("xres_len", &self.xres_len);
+        d.field("kasme", &"<redacted>");
+        d.field("rand", &"<redacted>");
+        d.field("autn", &"<redacted>");
+        d.field("knas_int", &"<redacted>");
+        d.field("knas_enc", &"<redacted>");
+        d.field("dl_count", &self.dl_count);
+        d.field("ul_count", &self.ul_count);
+        d.field("kenb", &"<redacted>");
+        d.field("hash_mme", &self.hash_mme);
+        d.field("nonceue", &self.nonceue);
+        d.field("noncemme", &self.noncemme);
+        d.field(
+            "gprs_ciphering_key_sequence_number",
+            &self.gprs_ciphering_key_sequence_number,
+        );
+        d.field("nh", &"<redacted>");
+        d.field("selected_enc_algorithm", &self.selected_enc_algorithm);
+        d.field("selected_int_algorithm", &self.selected_int_algorithm);
+        d.finish()
+    }
 }
 
 // ============================================================================
@@ -1037,7 +1073,7 @@ pub const MAX_NUM_OF_GTP_COUNTER: usize = 16;
 // ============================================================================
 
 /// MME UE context
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct MmeUe {
     /// Pool ID
     pub id: u64,
@@ -1285,6 +1321,126 @@ pub struct MmeUe {
     /// The current attach's step-23 Modify Bearer Request has been sent, so a
     /// duplicate ATTACH COMPLETE or ICS response does not send a second (#495).
     pub attach_modify_bearer_sent: bool,
+}
+
+/// Manual `Debug` (no-auth-material-in-logs): the authentication material in
+/// this type (resync_auts, xres, xres_len, kasme, rand, autn, knas_int, knas_enc, kenb, nh) prints as `<redacted>`, so a future
+/// `{:?}` in a log line cannot leak it.
+impl std::fmt::Debug for MmeUe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("MmeUe");
+        d.field("id", &self.id);
+        d.field("nas_eps", &self.nas_eps);
+        d.field(
+            "tracking_area_update_request_presencemask",
+            &self.tracking_area_update_request_presencemask,
+        );
+        d.field(
+            "tracking_area_update_request_ebcs_value",
+            &self.tracking_area_update_request_ebcs_value,
+        );
+        d.field(
+            "tracking_area_update_accept_proc",
+            &self.tracking_area_update_accept_proc,
+        );
+        d.field("detach_type", &self.detach_type);
+        d.field("imsi", &self.imsi);
+        d.field("imsi_len", &self.imsi_len);
+        d.field("imsi_bcd", &self.imsi_bcd);
+        d.field("imeisv", &self.imeisv);
+        d.field("imeisv_len", &self.imeisv_len);
+        d.field("masked_imeisv", &self.masked_imeisv);
+        d.field("masked_imeisv_len", &self.masked_imeisv_len);
+        d.field("imeisv_bcd", &self.imeisv_bcd);
+        d.field("msisdn", &self.msisdn);
+        d.field("msisdn_len", &self.msisdn_len);
+        d.field("msisdn_bcd", &self.msisdn_bcd);
+        d.field("a_msisdn", &self.a_msisdn);
+        d.field("a_msisdn_len", &self.a_msisdn_len);
+        d.field("a_msisdn_bcd", &self.a_msisdn_bcd);
+        d.field("gn", &self.gn);
+        d.field("current", &self.current);
+        d.field("next", &self.next);
+        d.field("mme_s11_teid", &self.mme_s11_teid);
+        d.field("vlr_ostream_id", &self.vlr_ostream_id);
+        d.field("enb_ostream_id", &self.enb_ostream_id);
+        d.field("tai", &self.tai);
+        d.field("e_cgi", &self.e_cgi);
+        d.field("ue_location_timestamp", &self.ue_location_timestamp);
+        d.field("location_reporting_active", &self.location_reporting_active);
+        d.field("last_visited_plmn_id", &self.last_visited_plmn_id);
+        d.field(
+            "security_context_available",
+            &self.security_context_available,
+        );
+        d.field("mac_failed", &self.mac_failed);
+        d.field("resync_auts", &"<redacted>");
+        d.field("can_restore_context", &self.can_restore_context);
+        d.field("memento", &self.memento);
+        d.field("ue_network_capability", &self.ue_network_capability);
+        d.field("ms_network_capability", &self.ms_network_capability);
+        d.field(
+            "ue_additional_security_capability",
+            &self.ue_additional_security_capability,
+        );
+        d.field("xres", &"<redacted>");
+        d.field("xres_len", &self.xres_len);
+        d.field("kasme", &"<redacted>");
+        d.field("rand", &"<redacted>");
+        d.field("autn", &"<redacted>");
+        d.field("knas_int", &"<redacted>");
+        d.field("knas_enc", &"<redacted>");
+        d.field("dl_count", &self.dl_count);
+        d.field("ul_count", &self.ul_count);
+        d.field("kenb", &"<redacted>");
+        d.field("hash_mme", &self.hash_mme);
+        d.field("nonceue", &self.nonceue);
+        d.field("noncemme", &self.noncemme);
+        d.field(
+            "gprs_ciphering_key_sequence_number",
+            &self.gprs_ciphering_key_sequence_number,
+        );
+        d.field("nhcc", &self.nhcc);
+        d.field("nh", &"<redacted>");
+        d.field("selected_enc_algorithm", &self.selected_enc_algorithm);
+        d.field("selected_int_algorithm", &self.selected_int_algorithm);
+        d.field("ambr", &self.ambr);
+        d.field("network_access_mode", &self.network_access_mode);
+        d.field("charging_characteristics", &self.charging_characteristics);
+        d.field(
+            "charging_characteristics_presence",
+            &self.charging_characteristics_presence,
+        );
+        d.field("context_identifier", &self.context_identifier);
+        d.field("num_of_session", &self.num_of_session);
+        d.field("session", &self.session);
+        d.field("sess_list", &self.sess_list);
+        d.field("enb_ue_id", &self.enb_ue_id);
+        d.field("enb_ue_holding_id", &self.enb_ue_holding_id);
+        d.field("paging", &self.paging);
+        d.field("sgw_ue_id", &self.sgw_ue_id);
+        d.field("pdn_connectivity_request", &self.pdn_connectivity_request);
+        d.field("t3413", &self.t3413);
+        d.field("t3422", &self.t3422);
+        d.field("t3450", &self.t3450);
+        d.field("t3460", &self.t3460);
+        d.field("t3470", &self.t3470);
+        d.field("t_mobile_reachable", &self.t_mobile_reachable);
+        d.field("t_implicit_detach", &self.t_implicit_detach);
+        d.field("service_indicator", &self.service_indicator);
+        d.field("ue_radio_capability", &self.ue_radio_capability);
+        d.field("container", &self.container);
+        d.field("gtp_counter", &self.gtp_counter);
+        d.field("bearer_to_modify_list", &self.bearer_to_modify_list);
+        d.field("rat_type", &self.rat_type);
+        d.field("csmap_id", &self.csmap_id);
+        d.field("hssmap_id", &self.hssmap_id);
+        d.field("subscribed_rau_tau_timer", &self.subscribed_rau_tau_timer);
+        d.field("emergency_attach", &self.emergency_attach);
+        d.field("attach_completed", &self.attach_completed);
+        d.field("attach_modify_bearer_sent", &self.attach_modify_bearer_sent);
+        d.finish()
+    }
 }
 
 impl MmeUe {

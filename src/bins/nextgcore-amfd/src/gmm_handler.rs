@@ -387,10 +387,21 @@ pub fn handle_deregistration_request(
 // ============================================================================
 
 /// Parsed authentication response
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct AuthenticationResponse {
     /// Authentication response parameter (RES*)
     pub res_star: Vec<u8>,
+}
+
+/// Manual `Debug` (no-auth-material-in-logs): the authentication material in
+/// this type (res_star) prints as `<redacted>`, so a future
+/// `{:?}` in a log line cannot leak it.
+impl std::fmt::Debug for AuthenticationResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("AuthenticationResponse");
+        d.field("res_star", &"<redacted>");
+        d.finish()
+    }
 }
 
 /// Handle authentication response

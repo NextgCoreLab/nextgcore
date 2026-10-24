@@ -73,7 +73,7 @@ These are the fields actually read by the daemon. The serde structs are `UdrYaml
 
 The daemon deserializes only the fields above; unknown YAML keys are silently ignored by serde. In the shipped example files:
 
-- **`logger.file.path` and `logger.level` are inert.** The log level comes only from the CLI flag `-e/--log-level` (default `info`); `init_logging` builds an `env_logger` filter directly from the flag and does not consult `RUST_LOG`. Logs always go to stderr — see the `--log-file` caveat below.
+- **`logger.file.path` and `logger.level` are inert.** The log level comes from `RUST_LOG` when set, else the CLI flag `-e/--log-level` (default `info`). Logs always go to stderr — see the `--log-file` caveat below.
 - **`global.max.ue` / `global.max.peer` are inert.** No struct deserializes the `global` section.
 - **`udr.sbi.tls.*` (enabled/cert/key/ca/min_version) is inert.** `SbiYaml` has only `server`, `client`, and `oauth2` members; TLS is controlled exclusively by the CLI flags `--tls`/`--tls-cert`/`--tls-key`.
 

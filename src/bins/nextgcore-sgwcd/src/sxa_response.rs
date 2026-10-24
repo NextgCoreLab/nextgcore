@@ -238,11 +238,23 @@ pub struct PendingModifyBearer {
     pub seq: u32,
     pub mme_teid: u32,
     /// Sessions still waiting for the SGW-U, with the bearers each switches.
-    pub waiting: std::collections::BTreeMap<u64, Vec<u64>>,
-    /// Bearers already settled as modified.
-    pub modified: Vec<u64>,
+    pub waiting: std::collections::BTreeMap<u64, Vec<SwitchedBearer>>,
+    /// (bearer id, EBI) of the bearers already settled as modified. The EBI is
+    /// kept from when the request was parked, so a bearer deleted meanwhile is
+    /// still named in the answer (#839 review).
+    pub modified: Vec<(u64, u8)>,
     /// (EBI, cause) of the bearers not modified.
     pub marked_for_removal: Vec<(u8, u8)>,
+}
+
+/// A bearer a parked Modify Bearer Request switches, with the downlink endpoint
+/// it had before, restored if the SGW-U does not switch it (#839 review).
+#[derive(Debug, Clone)]
+pub struct SwitchedBearer {
+    pub bearer_id: u64,
+    pub ebi: u8,
+    /// The DL tunnel's (remote TEID, remote IP) before the request.
+    pub previous: Option<(u32, crate::context::IpAddr)>,
 }
 
 static PENDING_MODIFY_BEARER: std::sync::Mutex<
@@ -295,14 +307,34 @@ pub fn modify_bearer_session_done(join: u64, sess_id: u64, failure: Option<u8>) 
         let Some(bearers) = pending.waiting.remove(&sess_id) else {
             return;
         };
+        let ctx = sgwc_self();
         match failure {
-            None => pending.modified.extend(bearers),
-            Some(cause) => {
-                let ctx = sgwc_self();
-                for bearer_id in bearers {
-                    if let Some(b) = ctx.bearer_find_by_id(bearer_id) {
-                        pending.marked_for_removal.push((b.ebi, cause));
+            None => {
+                for b in bearers {
+                    if ctx.bearer_find_by_id(b.bearer_id).is_some() {
+                        pending.modified.push((b.bearer_id, b.ebi));
+                    } else {
+                        // Deleted while the modification was pending.
+                        pending
+                            .marked_for_removal
+                            .push((b.ebi, gtp_cause::CONTEXT_NOT_FOUND));
                     }
+                }
+            }
+            Some(cause) => {
+                for b in bearers {
+                    // #839 review: the SGW-U kept its FAR and the MME keeps the
+                    // old eNB endpoint, so the SGW-C does too. Otherwise a later
+                    // PFCP modification built from this tunnel would push an
+                    // endpoint the MME never confirmed.
+                    if let (Some((teid, ip)), Some(mut dl)) =
+                        (b.previous, ctx.dl_tunnel_in_bearer(b.bearer_id))
+                    {
+                        dl.remote_teid = teid;
+                        dl.remote_ip = ip;
+                        ctx.tunnel_update(&dl);
+                    }
+                    pending.marked_for_removal.push((b.ebi, cause));
                 }
             }
         }
@@ -315,6 +347,16 @@ pub fn modify_bearer_session_done(join: u64, sess_id: u64, failure: Option<u8>) 
     if let Some(pending) = done {
         answer_modify_bearer(&pending, failure);
     }
+}
+
+/// The parked Modify Bearer answer `join`, if still waiting. Test/diagnostic.
+#[cfg(test)]
+pub fn modify_bearer_pending(join: u64) -> Option<PendingModifyBearer> {
+    PENDING_MODIFY_BEARER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&join)
+        .cloned()
 }
 
 /// Send the Modify Bearer Response for a settled request.
@@ -704,5 +746,41 @@ fn answer(
     let msg = s11_build::build_error_response(response_type as u8, teid, seq, cause, None);
     if let Err(e) = server.send_response(peer, &msg) {
         log::error!("Failed to answer {peer}: {e}");
+    }
+}
+
+#[cfg(test)]
+mod modify_bearer_tests {
+    use super::*;
+
+    /// #839 review: a bearer deleted while its PFCP modification was pending is
+    /// still named in the answer, by the EBI kept when the request was parked,
+    /// and as not found rather than modified.
+    #[test]
+    fn a_bearer_deleted_while_pending_is_named_by_its_parked_ebi() {
+        let gone = SwitchedBearer {
+            bearer_id: u64::MAX - 839,
+            ebi: 7,
+            previous: None,
+        };
+        let join = park_modify_bearer(PendingModifyBearer {
+            peer: "127.0.0.1:2123".parse().unwrap(),
+            seq: 0x839,
+            mme_teid: 1,
+            waiting: [(u64::MAX - 1, vec![gone]), (u64::MAX - 2, vec![])]
+                .into_iter()
+                .collect(),
+            modified: Vec::new(),
+            marked_for_removal: Vec::new(),
+        });
+        modify_bearer_session_done(join, u64::MAX - 1, None);
+        let pending = modify_bearer_pending(join).expect("one session still waiting");
+        assert!(pending.modified.is_empty(), "not reported modified");
+        assert_eq!(
+            pending.marked_for_removal,
+            vec![(7, gtp_cause::CONTEXT_NOT_FOUND)]
+        );
+        modify_bearer_session_done(join, u64::MAX - 2, None);
+        assert!(modify_bearer_pending(join).is_none());
     }
 }

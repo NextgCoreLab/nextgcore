@@ -1602,6 +1602,15 @@ pub(crate) mod stand_in {
         /// lets one drive the SMF's cause-65 reconciliation over a real round trip
         /// rather than by calling the reconciler directly.
         session_cause: Arc<std::sync::atomic::AtomicU8>,
+        /// How long the stand-in waits before answering a Session Modification
+        /// (#750): a slow UPF, so a test can interleave another request.
+        modification_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+        /// Answer Session Modifications with no Created PDR (#751): an incomplete
+        /// answer to a request that created PDRs with CHOOSE.
+        omit_created_pdrs: Arc<std::sync::atomic::AtomicBool>,
+        /// Reject the Nth Session Modification from now (1-based; 0 = none) with
+        /// cause 64, accepting the others (#751).
+        reject_modification: Arc<std::sync::atomic::AtomicU64>,
         /// Bodies of the Session Modification Requests this stand-in received, in
         /// order (#321).
         ///
@@ -1665,6 +1674,24 @@ pub(crate) mod stand_in {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone()
+        }
+
+        /// Answer every Session Modification after `ms` milliseconds (#750).
+        pub(crate) fn delay_modifications(&self, ms: u64) {
+            self.modification_delay_ms
+                .store(ms, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// Answer Session Modifications with no Created PDR (#751).
+        pub(crate) fn omit_created_pdrs(&self, omit: bool) {
+            self.omit_created_pdrs
+                .store(omit, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// Reject the `n`th Session Modification from now with cause 64 (#751).
+        pub(crate) fn reject_modification(&self, n: u64) {
+            self.reject_modification
+                .store(n, std::sync::atomic::Ordering::SeqCst);
         }
 
         /// Answer the next Session Modification / Deletion with `cause` (#193).
@@ -1826,6 +1853,12 @@ pub(crate) mod stand_in {
             pfcp_cause::REQUEST_ACCEPTED,
         ));
         let answered_cause = session_cause.clone();
+        let modification_delay_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let omit_created_pdrs = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let delay_ms = modification_delay_ms.clone();
+        let omit = omit_created_pdrs.clone();
+        let reject_modification = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let reject_nth = reject_modification.clone();
         tokio::spawn(async move {
             let rts = 0x5EED_0289_u32;
             let mut buf = vec![0u8; 8192];
@@ -1903,13 +1936,26 @@ pub(crate) mod stand_in {
                         &establishment_response_body(upf_seid, upf_teid, upf_ip),
                     )),
                     pfcp_message_type::SESSION_MODIFICATION_REQUEST => {
-                        let cause = answered_cause.load(std::sync::atomic::Ordering::SeqCst);
+                        let mut cause = answered_cause.load(std::sync::atomic::Ordering::SeqCst);
+                        let nth = reject_nth.load(std::sync::atomic::Ordering::SeqCst);
+                        if nth > 0 {
+                            if nth == 1 {
+                                cause = 64; // PFCP: Request rejected (reason not specified)
+                            }
+                            reject_nth.store(nth - 1, std::sync::atomic::Ordering::SeqCst);
+                        }
                         let mut body = tlv(19, &[cause]);
                         // #475: a modification that CREATES a PDR whose F-TEID the UP
                         // function chooses is answered with a Created PDR carrying the
                         // allocated F-TEID (TS 29.244 §7.5.5.2), as the establishment is.
                         let req_body = &buf[h.body_offset..len];
-                        if cause == pfcp_cause::REQUEST_ACCEPTED {
+                        let delay = delay_ms.load(std::sync::atomic::Ordering::SeqCst);
+                        if delay > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                        }
+                        if cause == pfcp_cause::REQUEST_ACCEPTED
+                            && !omit.load(std::sync::atomic::Ordering::SeqCst)
+                        {
                             // #583: EVERY Create PDR whose F-TEID is to be chosen (TEID 0)
                             // gets its own, N3_STAND_IN_TEID first; a message naming none
                             // that way keeps the #475 answer for its first Create PDR.
@@ -1977,6 +2023,9 @@ pub(crate) mod stand_in {
             upf_teid,
             upf_ip,
             session_cause,
+            modification_delay_ms,
+            omit_created_pdrs,
+            reject_modification,
             modification_bodies,
             establishment_bodies,
             _n4_guard: n4_guard,
