@@ -1223,8 +1223,18 @@ async fn handle_prepared_inner(sm_context_ref: &str, transfer: &[u8]) -> SbiResp
             gnb_addr[3],
             ack.forwarding_accepted_qfis,
         );
-        if let Ok(ctx) = smf_self().read() {
-            ctx.sess_update(&sess);
+        // #964 follow-up: #894's write-back, as for EPS→5GS below -- only what PREPARED
+        // decided, onto the session as it is now, and only if it is still this context.
+        if !apply_prepared(sm_context_ref, &sess) {
+            log::warn!(
+                "SM Context Update (PREPARED) for ref={sm_context_ref}: the SM context went \
+                 away during the preparation; nothing kept"
+            );
+            return crate::problem_response(
+                404,
+                "CONTEXT_NOT_FOUND",
+                "the SM context was released during the handover preparation",
+            );
         }
         root["n2SmInfoType"] = serde_json::json!("HANDOVER_CMD");
         root["n2SmInfo"] = serde_json::json!({ "contentId": "n2SmInfo" });
@@ -1239,20 +1249,7 @@ async fn handle_prepared_inner(sm_context_ref: &str, transfer: &[u8]) -> SbiResp
     // #750: write back only what PREPARED decided, onto the session as it is NOW,
     // and only if it is still this SM context. The copy read above predates the UPF
     // round trip; writing it whole replaced whatever happened meanwhile.
-    let applied = smf_self().read().ok().and_then(|ctx| {
-        let mut fresh = ctx
-            .sess_find_by_sm_context_ref(sm_context_ref)
-            .filter(|f| f.sm_context_ref.as_deref() == Some(sm_context_ref))
-            .filter(|f| f.id == sess.id)?;
-        fresh.handover.gnb_n3_teid = sess.handover.gnb_n3_teid;
-        fresh.handover.gnb_n3_ip = sess.handover.gnb_n3_ip.clone();
-        fresh.handover.target_dl_known = true;
-        fresh.handover.prepared = true;
-        fresh.handover.forwarding_ebis = sess.handover.forwarding_ebis.clone();
-        ctx.sess_update(&fresh);
-        Some(())
-    });
-    if applied.is_none() {
+    if !apply_prepared(sm_context_ref, &sess) {
         log::warn!(
             "SM Context Update (PREPARED) for ref={sm_context_ref}: the SM context went away \
              during the UPF round trip; nothing kept"
@@ -1275,6 +1272,31 @@ async fn handle_prepared_inner(sm_context_ref: &str, transfer: &[u8]) -> SbiResp
         );
     }
     SbiResponse::with_status(200).with_body(root.to_string(), "application/json")
+}
+
+/// Write back what PREPARED decided -- the target's DL N3 endpoint, `prepared`, and the
+/// forwarding EBIs -- onto the session as it is NOW, and only if it is still this SM
+/// context (#750, #894; #964 follow-up for the intra-5GS answer). The copy `decided` was
+/// read from may predate a UPF round trip; writing it whole would replace whatever
+/// happened meanwhile. `false` when the context went away.
+fn apply_prepared(sm_context_ref: &str, decided: &SmfSess) -> bool {
+    smf_self()
+        .read()
+        .ok()
+        .and_then(|ctx| {
+            let mut fresh = ctx
+                .sess_find_by_sm_context_ref(sm_context_ref)
+                .filter(|f| f.sm_context_ref.as_deref() == Some(sm_context_ref))
+                .filter(|f| f.id == decided.id)?;
+            fresh.handover.gnb_n3_teid = decided.handover.gnb_n3_teid;
+            fresh.handover.gnb_n3_ip = decided.handover.gnb_n3_ip.clone();
+            fresh.handover.target_dl_known = true;
+            fresh.handover.prepared = true;
+            fresh.handover.forwarding_ebis = decided.handover.forwarding_ebis.clone();
+            ctx.sess_update(&fresh);
+            Some(())
+        })
+        .is_some()
 }
 
 /// TS 29.502 §5.2.2.3.4.3: COMPLETED — switch the downlink to the target NG-RAN.
