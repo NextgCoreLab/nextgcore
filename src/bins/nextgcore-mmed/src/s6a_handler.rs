@@ -306,9 +306,11 @@ pub fn mme_s6a_process_inbound(inbound: &crate::fd_path::InboundS6aRequest) -> S
                     // REQUEST and reset T3422's count (#828). Only a detach a
                     // CLR started: one begun for another reason (an SGW
                     // restart, a PGW-initiated last-bearer release) has not
-                    // carried the HSS's detach type, and its PDN connections
-                    // may still hold sessions at gateways the CLR's Delete
-                    // Session Requests reach, so the CLR is served.
+                    // carried the HSS's detach type, so the CLR is served: the
+                    // DETACH REQUEST is resent with the CLR's type and T3422
+                    // restarted (§5.5.2.3.5). That other detach has normally
+                    // already deleted the PDN connections locally, so there is
+                    // usually no Delete Session Request left to send.
                     let detaching_by_clr = ctx.mme_ue_find_by_id(ue_id).is_some_and(|ue| {
                         ue.nas_eps.type_ == crate::context::MmeEpsType::DetachRequestToUe
                             && ue.network_detach_by_clr
@@ -1373,6 +1375,9 @@ mod tests {
     #[test]
     fn a_first_cancel_location_during_another_detach_is_served() {
         use crate::emm_build::DetachTypeToUe as T;
+        // The detach path can reach gtp_path (Delete Session Requests): serialised
+        // with the S11 tests (#897 review).
+        let _guard = crate::gtp_path::lock_s11();
         const IMSI: &str = "999990000008281";
         let mme_ue_id = seed_connected_ue(IMSI, 8281);
         let ctx = crate::context::mme_self();

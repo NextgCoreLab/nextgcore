@@ -1529,6 +1529,13 @@ pub const N26_PEER_T3_ENV: &str = "MME_N26_PEER_T3_SECS";
 /// The AMF's N3-REQUESTS (TS 29.274 §7.6), with [`N26_PEER_T3_ENV`].
 pub const N26_PEER_N3_ENV: &str = "MME_N26_PEER_N3";
 
+/// Ceilings on the AMF timers [`n26_xact_config`] accepts (#897 review): a mistyped
+/// value would otherwise keep every cached response for hours. 60 s x (10 + 1) is
+/// over ten minutes, beyond any GTP-C retransmission schedule in use.
+pub const N26_PEER_T3_MAX_SECS: u64 = 60;
+/// See [`N26_PEER_T3_MAX_SECS`].
+pub const N26_PEER_N3_MAX: u32 = 10;
+
 /// The N26 transaction config, its response hold derived from the AMF's timers.
 ///
 /// TS 29.274 §7.6: a retransmitted initial message is answered with the response already
@@ -1543,6 +1550,14 @@ pub fn n26_xact_config(peer_t3: Option<&str>, peer_n3: Option<&str>) -> Gtp2Xact
     let base = Gtp2XactConfig::default();
     let t3 = match peer_t3.map(|v| v.trim().parse::<u64>()) {
         None => base.t3_response,
+        Some(Ok(secs)) if secs > N26_PEER_T3_MAX_SECS => {
+            log::warn!(
+                "{N26_PEER_T3_ENV}={secs} is above {N26_PEER_T3_MAX_SECS}; using \
+                 {N26_PEER_T3_MAX_SECS} so a mistyped value cannot keep every cached N26 \
+                 response for hours"
+            );
+            std::time::Duration::from_secs(N26_PEER_T3_MAX_SECS)
+        }
         Some(Ok(secs)) => std::time::Duration::from_secs(secs.max(1)),
         Some(Err(_)) => {
             log::warn!(
@@ -1555,6 +1570,10 @@ pub fn n26_xact_config(peer_t3: Option<&str>, peer_n3: Option<&str>) -> Gtp2Xact
     };
     let n3 = match peer_n3.map(|v| v.trim().parse::<u32>()) {
         None => base.n3_requests,
+        Some(Ok(n)) if n > N26_PEER_N3_MAX => {
+            log::warn!("{N26_PEER_N3_ENV}={n} is above {N26_PEER_N3_MAX}; using {N26_PEER_N3_MAX}");
+            N26_PEER_N3_MAX
+        }
         Some(Ok(n)) => n,
         Some(Err(_)) => {
             log::warn!(
@@ -1945,6 +1964,16 @@ mod tests {
         assert_eq!(secs(Some(" 10 "), None), 40);
         assert_eq!(secs(Some("x"), Some("-1")), 12, "unparsable: defaults");
         assert_eq!(secs(Some("0"), Some("0")), 1, "T3 floored at 1 s");
+        assert_eq!(
+            secs(Some("3"), Some("3000")),
+            3 * (u64::from(N26_PEER_N3_MAX) + 1),
+            "N3 clamped (#897 review)"
+        );
+        assert_eq!(
+            secs(Some("86400"), Some("3")),
+            N26_PEER_T3_MAX_SECS * 4,
+            "T3 clamped"
+        );
         let config = n26_xact_config(Some("5"), Some("4"));
         assert_eq!(
             (config.t3_response, config.n3_requests),
