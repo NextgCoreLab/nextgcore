@@ -18,15 +18,15 @@ use crate::s1ap_build::{
 };
 use nextgcore_s1ap::{
     BroadcastCancelledAreaList, BroadcastCompletedAreaList, Cause, CauseRadioNetwork,
-    CriticalityDiagnostics, EnbConfigurationUpdate, EnbId, EnbStatusTransfer,
-    ErabDataForwardingItem, ErabToBeSetupItemHoReq, ErrorIndication, HandoverCancel,
-    HandoverCancelAcknowledge, HandoverCommand, HandoverFailure, HandoverNotify,
-    HandoverPreparationFailure, HandoverRequest, HandoverRequestAcknowledge, HandoverRequired,
-    HandoverType as S1apHandoverType, InitialContextSetupFailure, InitialContextSetupResponse,
-    InitialUeMessage, KillResponse, MmeStatusTransfer, NasNonDeliveryIndication, PathSwitchRequest,
-    PathSwitchRequestFailure, Reset, ResetAcknowledge, ResetType, S1SetupRequest, S1apMessage,
-    SecurityContext, TargetId, TimeToWait, UeCapabilityInfoIndication, UeContextReleaseComplete,
-    UeContextReleaseRequest, UlNasTransport, WriteReplaceWarningResponse,
+    CriticalityDiagnostics, EnbConfigurationUpdate, EnbStatusTransfer, ErabDataForwardingItem,
+    ErabToBeSetupItemHoReq, ErrorIndication, HandoverCancel, HandoverCancelAcknowledge,
+    HandoverCommand, HandoverFailure, HandoverNotify, HandoverPreparationFailure, HandoverRequest,
+    HandoverRequestAcknowledge, HandoverRequired, HandoverType as S1apHandoverType,
+    InitialContextSetupFailure, InitialContextSetupResponse, InitialUeMessage, KillResponse,
+    MmeStatusTransfer, NasNonDeliveryIndication, PathSwitchRequest, PathSwitchRequestFailure,
+    Reset, ResetAcknowledge, ResetType, S1SetupRequest, S1apMessage, SecurityContext, TargetId,
+    TimeToWait, UeCapabilityInfoIndication, UeContextReleaseComplete, UeContextReleaseRequest,
+    UlNasTransport, WriteReplaceWarningResponse,
 };
 
 // ============================================================================
@@ -1942,6 +1942,10 @@ pub fn handle_initial_context_setup_failure(
     if let Some(mme_ue_id) = ctx.enb_ue_find_by_id(enb_ue_id).map(|e| e.mme_ue_id) {
         if let Some(ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&mme_ue_id) {
             ue.ics_pending_on = 0;
+            // #916 review: the S1 connection is being released; a UE-AMBR
+            // change deferred behind this setup is carried by the next one,
+            // not sent to a context on its way out.
+            ue.ue_ambr_deferred = false;
         }
     }
     // #956: a failed Initial Context Setup of a SERVICE REQUEST releases S1
@@ -5030,6 +5034,7 @@ mod tests {
     use super::*;
     use crate::context::{Bitrate, MmeUe, PlmnId, ServedGummei};
     use crate::s1ap_gen::test_codec::{builder, decode_s1ap_pdu};
+    use nextgcore_s1ap::EnbId;
     use nextgcore_s1ap::{
         CauseRadioNetwork, ErabSwitchedItem, GlobalEnbId, STmsi, SupportedTaItem,
         UeAssociatedLogicalS1Connection, UeSecurityCapabilities,
