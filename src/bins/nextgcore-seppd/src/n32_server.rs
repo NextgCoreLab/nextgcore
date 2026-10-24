@@ -1396,7 +1396,10 @@ async fn sbi_consumer_handler(request: HttpRequest) -> HttpResponse {
         .map(|(_, v): (&String, &String)| v.clone());
 
     let Some(target_apiroot) = target_apiroot else {
-        log::debug!("SBI request without target-apiRoot handled locally: {method} {uri}");
+        log::debug!(
+            "SBI request without target-apiRoot handled locally: {method} {}",
+            nextgcore_sbi::log_redact::redact_callback_tokens(&uri)
+        );
         return send_error(
             400,
             "Bad Request",
@@ -1434,7 +1437,8 @@ async fn sbi_consumer_handler(request: HttpRequest) -> HttpResponse {
     match forward_via_n32f(node.id, &method, &uri, &headers, body.as_deref(), None).await {
         Ok((status, rsp_body)) => {
             log::info!(
-                "SBI forward {method} {uri} -> peer [{}] status={status}",
+                "SBI forward {method} {} -> peer [{}] status={status}",
+                nextgcore_sbi::log_redact::redact_callback_tokens(&uri),
                 node.receiver
             );
             let mut resp = HttpResponse::with_status(status);
