@@ -145,6 +145,11 @@ before the tag. The validation line is filled from the release run, not carried 
   SQN stored as BSON Int64 (#137).
 
 ### Deployment
+- **Operational change:** smfd, sgwcd, upfd, sgwud and mbsmfd refuse to start when the local
+  clock reads before 2020-01-01, because their PFCP Recovery Time Stamp, now NTP-era seconds per
+  TS 29.244 §8.2.65 (#995, #1004), would be wrong. On RTC-less hosts, start them after
+  `time-sync.target`, give the pod an NTP-wait init container, or rely on the restart policy
+  (#1040). See the configuration overview, "A set clock is required".
 - EKS overlay for the matched-pair E2E on a shared cluster (#127), image tags by git SHA (#146,
   #431), rollout reporting (#439).
 - `deploy/eks` script interface `PROFILE=5g|epc|6g` (#656), `e2e-internet.sh` UE-to-internet
