@@ -680,6 +680,13 @@ pub struct UeNasContext {
     /// `send_registration_accept`, which releases and re-activates the sessions
     /// and reports both in the Accept.
     registration_session_ies: Option<ServiceRequestSessionIes>,
+    /// Whether the REGISTRATION REQUEST being answered set "Follow-on request
+    /// pending" (#653).
+    registration_follow_on: bool,
+    /// #653: release the NAS signalling connection once this registration update
+    /// completes, because the UE set no follow-on request and no user plane was
+    /// re-established (TS 24.501 §5.3.1.3 b), the conditions of the UE's T3540).
+    release_after_registration: bool,
 }
 
 /// Manual `Debug` (no-auth-material-in-logs): the authentication material in
@@ -796,6 +803,8 @@ impl UeNasContext {
             registration_accept_sent: false,
             ue_policy_container: None,
             registration_session_ies: None,
+            registration_follow_on: false,
+            release_after_registration: false,
             cm_idle: false,
         }
     }
@@ -2926,6 +2935,13 @@ impl NgapServer {
                     ul_nas.ran_ue_ngap_id,
                 )
                 .await?;
+                // #653: the update is complete; release if nothing needs the connection.
+                self.release_after_registration_update(
+                    association_id,
+                    ul_nas.amf_ue_ngap_id,
+                    ul_nas.ran_ue_ngap_id,
+                )
+                .await?;
             }
             message_type::CONFIGURATION_UPDATE_COMPLETE => {
                 // TS 24.501 §5.4.4.3: the COMPLETE stops T3555 and the procedure is
@@ -3217,6 +3233,7 @@ impl NgapServer {
             .flatten();
         self.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
             s.registration_session_ies = session_ies;
+            s.registration_follow_on = req.follow_on_request;
         });
 
         log::info!(
@@ -5613,10 +5630,14 @@ impl NgapServer {
         };
         // #570: the UE radio capability ID, or its deletion indication, for a UE that
         // set the RACS bit (TS 24.501 §5.5.1.2.4). T3550 is armed below in every case.
-        plain.extend(crate::racs::nas_ies_for(
+        let racs_ies = crate::racs::nas_ies_for(
             &mut state.amf_ue,
             crate::racs::NasMessage::RegistrationAccept,
-        ));
+        );
+        // The UE radio capability ID deletion indication (half-octet IEI E) keeps the
+        // UE from releasing on T3540 (TS 24.501 §5.3.1.3 b) 1)), and so the network.
+        let racs_deletion = racs_ies.first().is_some_and(|o| o & 0xF0 == 0xE0);
+        plain.extend(racs_ies);
         let Some(protected) = nas_security::nas_5gs_security_encode(
             &mut state.amf_ue,
             &plain,
@@ -5648,6 +5669,16 @@ impl NgapServer {
                 // establishes next on this connection needs the gNB's UE context,
                 // and the AMF only sends that session's setup once an Initial
                 // Context Setup Response has arrived.
+                //
+                // #653, TS 24.501 §5.3.1.3 b) (the UE's T3540 conditions) and TS
+                // 23.502 §4.2.2.2.2 step 23: an update from 5GMM-IDLE with no
+                // follow-on request and no user plane re-established leaves the UE
+                // nothing to use the connection for. It is released once the
+                // registration completes, so the UE's next uplink data starts a
+                // Service Request instead of finding a connection with no user
+                // plane.
+                state.release_after_registration =
+                    !state.registration_follow_on && sessions.is_empty() && !racs_deletion;
                 self.send_update_accept_in_initial_context_setup(
                     association_id,
                     amf_ue_ngap_id,
@@ -14844,6 +14875,65 @@ impl NgapServer {
         if updated.is_none() {
             log::warn!("Initial Context Setup Response for unknown UE {amf_ue_ngap_id}; ignoring");
         }
+        // #653: an update Accept with no new 5G-GUTI asks for no Registration
+        // Complete, so the registration is complete with the UE context set up.
+        let no_complete_expected = self
+            .ue_auth_state
+            .get(amf_ue_ngap_id)
+            .is_some_and(|s| s.amf_ue.next_guti.tmsi == 0);
+        if no_complete_expected {
+            let ran_ue_ngap_id = self
+                .ue_auth_state
+                .get(amf_ue_ngap_id)
+                .map(|s| s.ran_ue_ngap_id)
+                .unwrap_or_default();
+            self.release_after_registration_update(association_id, amf_ue_ngap_id, ran_ue_ngap_id)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// #653: release the N1 NAS signalling connection of a UE whose registration
+    /// update from 5GMM-IDLE asked for nothing more (`release_after_registration`).
+    /// A normal UE Context Release (TS 38.413 §8.3.3, CauseNas normal-release): the
+    /// UE stays registered, and the Release Complete moves it to CM-IDLE and starts
+    /// its supervision. Not while another NAS procedure is running or a transfer is
+    /// waiting to page it.
+    async fn release_after_registration_update(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+    ) -> Result<()> {
+        let release = self
+            .ue_auth_state
+            .with_mut(amf_ue_ngap_id, |s| {
+                std::mem::take(&mut s.release_after_registration)
+                    && s.registered
+                    && s.retx.is_none()
+                    && !s.is_cm_idle()
+            })
+            .unwrap_or(false);
+        let paged = crate::context::amf_self()
+            .read()
+            .ok()
+            .is_some_and(|c| c.paging_find(amf_ue_ngap_id).is_some());
+        if !release || paged {
+            return Ok(());
+        }
+        let Some(cmd) = crate::ngap_asn1::build_ue_context_release_command_asn1(
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            ngap_handler::cause_group::NAS,
+            0, // CauseNas normal-release
+        ) else {
+            return Ok(());
+        };
+        self.send_to_association(association_id, &cmd).await?;
+        log::info!(
+            "UE {amf_ue_ngap_id}: registration update complete with no follow-on request and \
+             no user plane; NAS signalling connection released (TS 24.501 §5.3.1.3)"
+        );
         Ok(())
     }
 
@@ -16435,6 +16525,9 @@ pub(crate) fn amf_instance_id_for_tests() -> String {
 #[derive(Debug, Clone, Default)]
 struct ParsedRegistrationRequest {
     registration_type: u8,
+    /// Follow-on request pending (5GS registration type octet, bit 4; TS 24.501
+    /// §9.11.3.7), #653.
+    follow_on_request: bool,
     tsc: u8,
     ksi: u8,
     identity_type: u8,
@@ -17296,6 +17389,7 @@ fn parse_registration_request_pdu(nas: &[u8]) -> Option<ParsedRegistrationReques
     }
     let mut req = ParsedRegistrationRequest {
         registration_type: nas[3] & 0x07,
+        follow_on_request: nas[3] & 0x08 != 0,
         tsc: (nas[3] >> 7) & 0x01,
         ksi: (nas[3] >> 4) & 0x07,
         ..Default::default()
