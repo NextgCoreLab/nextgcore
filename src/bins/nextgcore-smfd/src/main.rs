@@ -67,6 +67,10 @@ use smf_sm::SmfFsm;
 /// Global shutdown flag
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+/// When the shutdown signal arrived (#941 review M2): the start of the one deadline
+/// every shutdown phase is bounded by.
+static SHUTDOWN_STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
 /// Where the Prometheus endpoint listens (`SMF_METRICS_PORT`, default 9090 — the port
 /// `sgwud` uses and the port `configs/observability/prometheus.yml` already scrapes
 /// `172.23.0.4` on).
@@ -466,6 +470,7 @@ async fn main() -> Result<()> {
     let shutdown_clone = shutdown.clone();
     ctrlc::set_handler(move || {
         log::info!("Received shutdown signal");
+        let _ = SHUTDOWN_STARTED.set(std::time::Instant::now());
         shutdown_clone.store(true, Ordering::SeqCst);
         SHUTDOWN.store(true, Ordering::SeqCst);
     })
@@ -970,6 +975,9 @@ async fn main() -> Result<()> {
         &pfcp_clients,
         release_on_shutdown,
         pfcp_listener_handle,
+        tokio::time::Instant::from_std(
+            *SHUTDOWN_STARTED.get_or_init(std::time::Instant::now) + shutdown_budget(),
+        ),
     )
     .await;
 
@@ -5802,8 +5810,24 @@ async fn graceful_shutdown(
     pfcp_clients: &[Arc<pfcp_path::PfcpClient>],
     release: bool,
     pfcp_listener: tokio::task::JoinHandle<()>,
+    deadline: tokio::time::Instant,
 ) {
-    deregister.await;
+    // #941 review M2: every phase is bounded by what is left of ONE deadline, taken
+    // when the shutdown started. A blackholed NRF held the deregistration for its
+    // 30 s request timeout and pushed the rest past the SIGKILL.
+    let left = || deadline.saturating_duration_since(tokio::time::Instant::now());
+    if tokio::time::timeout(left().min(SHUTDOWN_DEREGISTER_BUDGET), deregister)
+        .await
+        .is_err()
+    {
+        log::warn!(
+            "Shutdown: NFDeregister did not finish within {SHUTDOWN_DEREGISTER_BUDGET:?}; \
+             the NRF learns of this SMF's absence from its heartbeat supervision instead"
+        );
+    }
+    // What the #39 fan-out may use: everything but the Association Release's own
+    // T1 x (N1+1) and the S5/S8 drain after it.
+    let release_budget = left().saturating_sub(SHUTDOWN_ASSOCIATION_RELEASE + SHUTDOWN_GTP_DRAIN);
     if release {
         let mut releases = tokio::task::JoinSet::new();
         for client in pfcp_clients.iter().map(Arc::clone) {
@@ -5812,7 +5836,7 @@ async fn graceful_shutdown(
                     return;
                 }
                 match client
-                    .release_association_within(Some(SHUTDOWN_RELEASE_BUDGET))
+                    .release_association_within(Some(release_budget))
                     .await
                 {
                     Ok(()) => log::info!("PFCP association with {} released", client.peer()),
@@ -5847,7 +5871,11 @@ async fn graceful_shutdown(
     log::info!("SMF N4 PFCP listener stopped");
     // #718 review m2: the Delete Bearer Requests sent above, on either path, are
     // retransmitted until answered or N3 is exhausted.
-    drain_s5s8_requests(gtp_path::s5s8_server().map(|s| s.as_ref())).await;
+    drain_s5s8_requests(
+        gtp_path::s5s8_server().map(|s| s.as_ref()),
+        left().min(SHUTDOWN_GTP_DRAIN),
+    )
+    .await;
 }
 
 /// Whether a graceful shutdown releases the PFCP association (#677, #718).
@@ -5952,11 +5980,27 @@ async fn shutdown_epc_pdn_connections_via(
     (deleted, told)
 }
 
-/// How long a shutdown spends releasing sessions through their UEs (#39) before it
-/// sends each Association Release regardless (#809 follow-up). With the Association
-/// Release (up to T1 x (N1+1) = 12 s) and the S5/S8 drain (12 s) this keeps the
-/// sequence inside the shipped 45 s grace period.
-const SHUTDOWN_RELEASE_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+/// The whole graceful shutdown's budget, from the signal (#941 review M2): inside the
+/// shipped 45 s termination grace period, with 2 s for the SBI stop and the exit.
+/// `SMF_SHUTDOWN_BUDGET_SECS` overrides it for a deployment with another grace
+/// period; keep it a little under that.
+const SHUTDOWN_BUDGET_DEFAULT: std::time::Duration = std::time::Duration::from_secs(43);
+
+/// The shutdown budget in force: `SMF_SHUTDOWN_BUDGET_SECS`, else the default.
+fn shutdown_budget() -> std::time::Duration {
+    std::env::var("SMF_SHUTDOWN_BUDGET_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(SHUTDOWN_BUDGET_DEFAULT)
+}
+
+/// At most this long for NFDeregister (#941 review M2).
+const SHUTDOWN_DEREGISTER_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// What an Association Release can take with the defaults: T1 x (N1+1) = 3 s x 4.
+/// The #39 fan-out gets the shutdown budget less this and the S5/S8 drain.
+const SHUTDOWN_ASSOCIATION_RELEASE: std::time::Duration = std::time::Duration::from_secs(12);
 
 /// How long a shutdown keeps retransmitting its own S5/S8 requests (#718 review
 /// m2): T3-RESPONSE x (N3-REQUESTS + 1) with the defaults, 3 s x 4. The SGW gets
@@ -5966,11 +6010,11 @@ const SHUTDOWN_GTP_DRAIN: std::time::Duration = std::time::Duration::from_secs(1
 
 /// Wait, at most [`SHUTDOWN_GTP_DRAIN`], until no S5/S8 request this node sent is
 /// still awaiting its answer: the T3/N3 task retransmits them meanwhile.
-async fn drain_s5s8_requests(server: Option<&gtp_path::S5S8Server>) {
+async fn drain_s5s8_requests(server: Option<&gtp_path::S5S8Server>, budget: std::time::Duration) {
     let Some(server) = server else {
         return;
     };
-    let deadline = tokio::time::Instant::now() + SHUTDOWN_GTP_DRAIN;
+    let deadline = tokio::time::Instant::now() + budget;
     loop {
         let outstanding = server.outstanding().await;
         if outstanding == 0 {
@@ -5978,8 +6022,7 @@ async fn drain_s5s8_requests(server: Option<&gtp_path::S5S8Server>) {
         }
         if tokio::time::Instant::now() >= deadline {
             log::warn!(
-                "Shutdown: {outstanding} S5/S8 request(s) still unanswered after {:?}",
-                SHUTDOWN_GTP_DRAIN
+                "Shutdown: {outstanding} S5/S8 request(s) still unanswered after {budget:?}"
             );
             return;
         }
@@ -7468,6 +7511,11 @@ mod tests {
         assert_eq!(body["cause"], "NF_FAILOVER");
     }
 
+    /// The shipped shutdown deadline, from now (#941).
+    fn test_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + SHUTDOWN_BUDGET_DEFAULT
+    }
+
     /// A raw UPF on loopback for the shutdown tests (#718 review N1): answers
     /// Session Deletion and Association Release with Request Accepted, and records
     /// every request as `(message type, sequence number)`, retransmissions included.
@@ -7596,7 +7644,14 @@ mod tests {
         }
 
         let started = std::time::Instant::now();
-        graceful_shutdown(async {}, std::slice::from_ref(&client), false, listener).await;
+        graceful_shutdown(
+            async {},
+            std::slice::from_ref(&client),
+            false,
+            listener,
+            test_deadline(),
+        )
+        .await;
         let took = started.elapsed();
         let requests = seen.lock().unwrap().clone();
         upf_task.abort();
@@ -7645,6 +7700,7 @@ mod tests {
             std::slice::from_ref(&client),
             true,
             listener,
+            test_deadline(),
         )
         .await;
         let took = started.elapsed();
@@ -7714,7 +7770,14 @@ mod tests {
         }
         pfcp_path::record_session_peer(seid, a.peer());
 
-        graceful_shutdown(async {}, &[a.clone(), b.clone()], true, listener).await;
+        graceful_shutdown(
+            async {},
+            &[a.clone(), b.clone()],
+            true,
+            listener,
+            test_deadline(),
+        )
+        .await;
         let release_commands = amf_seen
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -7834,6 +7897,126 @@ mod tests {
             took < std::time::Duration::from_millis(750),
             "the deletions overlapped: {took:?}"
         );
+    }
+
+    /// #941 review M3: the shutdown WIRING keeps the deadline. A blackholed AMF and 20
+    /// sessions on the UPF (more than the 16 releases in flight, so the fan-out
+    /// queues). With 0.5 s of the deadline left for the #39s, the shutdown returns
+    /// promptly, every session is flushed, and the Association Release still reaches
+    /// the UPF.
+    #[tokio::test]
+    async fn the_shutdown_keeps_its_deadline_with_a_blackholed_amf() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let blackhole = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let amf_port = blackhole.local_addr().unwrap().port();
+        let held = tokio::spawn(async move {
+            let mut conns = Vec::new();
+            while let Ok((c, _)) = blackhole.accept().await {
+                conns.push(c);
+            }
+        });
+        let (upf, seen, upf_task) = raw_upf(None).await;
+        let (client, listener) = client_behind_the_real_listener(upf).await;
+        let refs: Vec<String> = (0..20).map(|i| format!("{}", 94_100 + i)).collect();
+        if let Ok(ctx) = smf_self().read() {
+            for (i, r) in refs.iter().enumerate() {
+                ctx.pfcp_sessions
+                    .write()
+                    .unwrap()
+                    .insert(r.clone(), 0x941 + i as u64);
+                let mut b = context::PolicyBinding::snapshot_default();
+                b.supi = format!("imsi-0010100000941{i:02}");
+                b.psi = 5;
+                b.sm_context_status_uri = Some(format!("http://127.0.0.1:{amf_port}/sm-status"));
+                ctx.policy_bindings.write().unwrap().insert(r.clone(), b);
+                pfcp_path::record_session_peer(context::derive_cp_n4_seid(r), client.peer());
+            }
+        }
+        let deadline = tokio::time::Instant::now()
+            + SHUTDOWN_ASSOCIATION_RELEASE
+            + SHUTDOWN_GTP_DRAIN
+            + std::time::Duration::from_millis(500);
+
+        let started = std::time::Instant::now();
+        graceful_shutdown(
+            async {},
+            std::slice::from_ref(&client),
+            true,
+            listener,
+            deadline,
+        )
+        .await;
+        let took = started.elapsed();
+        let released = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(ty, _)| *ty == pfcp_path::pfcp_message_type::ASSOCIATION_RELEASE_REQUEST)
+            .count();
+        let flushed = refs.iter().all(|r| {
+            !smf_self()
+                .read()
+                .unwrap()
+                .pfcp_sessions
+                .read()
+                .unwrap()
+                .contains_key(r)
+        });
+        for r in &refs {
+            cancel_gsm_timer(r, timer::SmfTimerId::T3592);
+            pfcp_path::forget_session_peer(context::derive_cp_n4_seid(r));
+            if let Ok(ctx) = smf_self().read() {
+                ctx.policy_bindings.write().unwrap().remove(r);
+            }
+        }
+        held.abort();
+        upf_task.abort();
+        pfcp_path::clear_global_upf_for_test();
+
+        assert!(
+            took < std::time::Duration::from_secs(3),
+            "bounded: {took:?}"
+        );
+        assert_eq!(released, 1, "the Association Release still reached the UPF");
+        assert!(
+            flushed,
+            "every session flushed although most #39s were abandoned"
+        );
+    }
+
+    /// #941 review M2: an NRF that never answers holds NFDeregister only for its share
+    /// of the deadline; the Association Release still goes out within it.
+    #[tokio::test]
+    async fn a_blackholed_nrf_cannot_hold_the_shutdown_past_its_deadline() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let (upf, seen, upf_task) = raw_upf(None).await;
+        let (client, listener) = client_behind_the_real_listener(upf).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1500);
+        let started = std::time::Instant::now();
+        graceful_shutdown(
+            std::future::pending::<()>(),
+            std::slice::from_ref(&client),
+            true,
+            listener,
+            deadline,
+        )
+        .await;
+        let took = started.elapsed();
+        let released = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(ty, _)| *ty == pfcp_path::pfcp_message_type::ASSOCIATION_RELEASE_REQUEST)
+            .count();
+        upf_task.abort();
+        pfcp_path::clear_global_upf_for_test();
+
+        assert!(took < std::time::Duration::from_secs(3), "{took:?}");
+        assert_eq!(released, 1);
     }
 
     /// #718 review M4: a shutdown that keeps the N4 association for durable state

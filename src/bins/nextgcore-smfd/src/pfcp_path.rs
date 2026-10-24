@@ -1069,6 +1069,18 @@ impl PfcpClient {
     /// Previously this cleared the map, logged a count, and left every AMF
     /// believing in contexts that could not carry a packet.
     async fn teardown_association(&self, reason: &str) {
+        self.teardown_association_until(reason, None).await;
+    }
+
+    /// [`Self::teardown_association`] whose #39 fan-out stops at `deadline` (#941
+    /// review M1). Only the fan-out is bounded: the EPC PDN connections are told
+    /// first (their Delete Bearer Requests do not wait for answers), and the
+    /// association-down step and the flush always run.
+    async fn teardown_association_until(
+        &self,
+        reason: &str,
+        deadline: Option<tokio::time::Instant>,
+    ) {
         #[cfg(test)]
         assert_teardown_is_serialised();
         // #720: only the sessions on THIS UPF. A pool member's restart, release or
@@ -1076,11 +1088,13 @@ impl PfcpClient {
         // are alive; releasing them sent every UE in the pool a #39 and orphaned
         // their sessions on the healthy UPFs.
         let scope = self.session_scope();
-        let notified =
-            crate::restoration::notify_sessions_unrecoverable_in(reason, Some(&scope)).await;
-        // #687: the EPC PDN connections on this PGW-U, which have no SM context.
+        // #687: the EPC PDN connections on this PGW-U, which have no SM context. First,
+        // so no fan-out deadline can cut them (#941 review M1).
         let epc_released =
             crate::restoration::release_epc_pdn_connections_in(reason, Some(&scope)).await;
+        let notified =
+            crate::restoration::notify_sessions_unrecoverable_until(reason, Some(&scope), deadline)
+                .await;
         {
             let mut assoc = self.assoc.write().await;
             assoc.associated = false;
@@ -1197,15 +1211,16 @@ impl PfcpClient {
         self.release_association_within(None).await
     }
 
-    /// [`Self::release_association`] with the local teardown, which releases every
-    /// session through its UE (#39), bounded by `teardown_budget` (#809 follow-up).
+    /// [`Self::release_association`] with the local teardown's #39 fan-out bounded by
+    /// `teardown_budget` (#809 follow-up, #941 review M1).
     ///
     /// At shutdown the whole sequence must fit the termination grace period. With a
     /// blackholed AMF each release waits out its connect and request timeouts, and
     /// thousands of them at 16 in flight would run for minutes, past the SIGKILL, and
     /// the Association Release would never be sent. When the budget runs out the
-    /// remaining releases are abandoned (logged), the association is marked down, and
-    /// the Association Release still goes to the UPF, which deletes the sessions.
+    /// remaining #39s are abandoned (counted in the log); the EPC Delete Bearers, the
+    /// association-down step and the flush run regardless, and the Association
+    /// Release still goes to the UPF, which deletes the sessions.
     pub async fn release_association_within(
         &self,
         teardown_budget: Option<Duration>,
@@ -1213,28 +1228,17 @@ impl PfcpClient {
         if !self.is_associated().await {
             return Ok(());
         }
-        // The association's sessions are deleted locally FIRST (TS 29.244 §6.2.8.2):
-        // the UEs (#39) and the SGWs (Delete Bearer) are told before the request
-        // waits on the UPF, which can take T1 x (N1+1) = 12 s when the UPF is gone (#718 review
-        // m5). Before, they were told only after that wait, and a short termination
-        // grace period cut them off.
-        let teardown = self.teardown_association("association release requested locally");
-        match teardown_budget {
-            None => teardown.await,
-            Some(budget) => {
-                if tokio::time::timeout(budget, teardown).await.is_err() {
-                    log::warn!(
-                        "PFCP association with {}: the per-session releases did not finish \
-                         within {budget:?}; the rest are abandoned, and the UPF deletes their \
-                         sessions on the Association Release",
-                        self.peer()
-                    );
-                    let mut assoc = self.assoc.write().await;
-                    assoc.associated = false;
-                    self.publish_associated(&assoc);
-                }
-            }
-        }
+        // TS 29.244 §6.2.8.2 has the CP function delete the association's sessions on
+        // a successful Association Release Response. This SMF deletes them locally
+        // FIRST, before the request, deliberately (#718 review m5): the UEs (#39) and
+        // the SGWs (Delete Bearer) are then told before the request waits on the UPF,
+        // up to T1 x (N1+1) = 12 s when the UPF is gone, which a short termination
+        // grace period cut off. The UPF's own deletion is unchanged.
+        self.teardown_association_until(
+            "association release requested locally",
+            teardown_budget.map(|budget| tokio::time::Instant::now() + budget),
+        )
+        .await;
         let msg = PfcpMessage::AssociationReleaseRequest(AssociationReleaseRequest::new(
             self.node_id.clone(),
         ));

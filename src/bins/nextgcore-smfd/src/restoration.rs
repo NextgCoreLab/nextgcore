@@ -179,6 +179,17 @@ pub struct SessionScope {
 
 /// [`notify_sessions_unrecoverable`] for the sessions in `scope` only (#720).
 pub async fn notify_sessions_unrecoverable_in(reason: &str, scope: Option<&SessionScope>) -> usize {
+    notify_sessions_unrecoverable_until(reason, scope, None).await
+}
+
+/// [`notify_sessions_unrecoverable_in`], abandoning whatever has not been sent by
+/// `deadline` (#941 review M1): a shutdown must fit its grace period. The abandoned
+/// count is logged.
+pub async fn notify_sessions_unrecoverable_until(
+    reason: &str,
+    scope: Option<&SessionScope>,
+    deadline: Option<tokio::time::Instant>,
+) -> usize {
     let (notifiable, silent) = notifiable_sessions(scope);
     if notifiable.is_empty() && silent == 0 {
         return 0;
@@ -198,18 +209,39 @@ pub async fn notify_sessions_unrecoverable_in(reason: &str, scope: Option<&Sessi
     let total = notifiable.len();
     let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(RELEASE_FANOUT));
     let mut releases = tokio::task::JoinSet::new();
+    let until = |d: Option<tokio::time::Instant>| {
+        d.unwrap_or_else(|| tokio::time::Instant::now() + std::time::Duration::from_secs(86_400))
+    };
+    let mut done = 0usize;
+    let mut out_of_time = false;
     for (sm_context_ref, uri) in notifiable {
-        let Ok(permit) = permits.clone().acquire_owned().await else {
-            break;
-        };
+        let permit =
+            match tokio::time::timeout_at(until(deadline), permits.clone().acquire_owned()).await {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    out_of_time = true;
+                    break;
+                }
+            };
         let reason = reason.to_string();
         releases.spawn(async move {
             let _permit = permit;
             release_one_unrecoverable(&sm_context_ref, &uri, &reason).await;
         });
     }
-    let mut done = 0usize;
-    while releases.join_next().await.is_some() {
+    loop {
+        if out_of_time {
+            break;
+        }
+        match tokio::time::timeout_at(until(deadline), releases.join_next()).await {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => {
+                out_of_time = true;
+                break;
+            }
+        }
         done += 1;
         if done.is_multiple_of(100) || done == total {
             log::info!(
@@ -218,6 +250,14 @@ pub async fn notify_sessions_unrecoverable_in(reason: &str, scope: Option<&Sessi
                 total - done
             );
         }
+    }
+    if out_of_time {
+        releases.abort_all();
+        log::warn!(
+            "PFCP restoration ({reason}): out of time with {done}/{total} PDU session \
+             release(s) sent; {} UE(s) abandoned without #39",
+            total - done
+        );
     }
     total
 }
