@@ -10,7 +10,8 @@
 // already corrected for exactly this reason; this was the last holdout.
 process.env.DB_URI = process.env.DB_URI || 'mongodb://127.0.0.1/nextgcore';
 
-const _hostname = process.env.HOSTNAME || 'localhost';
+// Loopback unless WEBUI_BIND_ADDR is set; never the container's HOSTNAME (#850).
+const _hostname = require('./lib/bind-address').bindAddress(process.env);
 const port = process.env.PORT || 9999;
 
 const co = require('co');
@@ -33,7 +34,8 @@ const passport = require('passport');
 const LocalStrategy = require('passport-local').Strategy;
 
 const csrf = require('lusca').csrf();
-const secret = process.env.SECRET_KEY || 'change-me';
+// No fallback key (#913): refuse to start without a real SECRET_KEY.
+const secret = require('./lib/session-key').sessionKey(process.env);
 
 const api = require('./routes');
 

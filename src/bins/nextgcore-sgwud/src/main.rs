@@ -22,7 +22,8 @@ fn metrics_addr() -> std::net::SocketAddr {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(9090);
-    std::net::SocketAddr::from(([0, 0, 0, 0], port))
+    // Loopback unless NEXTGCORE_METRICS_BIND says otherwise (#837).
+    nextgcore_metrics::nes_energy::metrics_bind_addr(port)
 }
 
 /// Render the SGW-U's runtime state in Prometheus text format (issue #59).
@@ -86,9 +87,7 @@ async fn main() -> Result<()> {
         config::log_level_from_args(std::env::args()),
         config_path.as_deref(),
     );
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level))
-        .format_timestamp_millis()
-        .init();
+    nextgcore_core::log::nf_log_builder(&level).init();
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = nextgcore_metrics::otel::init_otel(
         nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(

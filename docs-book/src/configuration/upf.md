@@ -81,7 +81,8 @@ Defaults below are the real clap `default_value`s from the source.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `UPF_METRICS_PORT` | `9090` | Prometheus `/metrics` port (bound on `0.0.0.0`), including the TUN-path data-plane counters (#581). |
+| `UPF_METRICS_PORT` | `9090` | Prometheus `/metrics` port, including the TUN-path data-plane counters (#581). |
+| `NEXTGCORE_METRICS_BIND` | `127.0.0.1` | Host the unauthenticated `/metrics` listener binds to (#837). The compose files and manifests set `0.0.0.0` inside the private container/pod network. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://jaeger:4317` | OTLP endpoint for OpenTelemetry tracing (initialization is best-effort; failure is ignored). |
 
 ## Behavior notes

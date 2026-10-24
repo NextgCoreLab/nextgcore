@@ -67,6 +67,7 @@ A non-IPv4 address is logged and ignored. Not read: `logger.file`, `global.max.*
 | `SGWU_MAX_BUFFERED_PACKETS` | `64` | Per-FAR buffer depth for BUFF. |
 | `SGWU_QER_ENFORCEMENT` | off | `1`/`true`/`yes` enables QER gate/MBR enforcement (#60). Off by default because a mis-provisioned QER would drop traffic. |
 | `SGWU_METRICS_PORT` | `9090` | Prometheus endpoint port. |
+| `NEXTGCORE_METRICS_BIND` | `127.0.0.1` | Host the unauthenticated `/metrics` listener binds to (#837). The compose files and manifests set `0.0.0.0` inside the private container/pod network. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://jaeger:4317` | OTLP endpoint for OpenTelemetry traces; init is best-effort. |
 | `RUST_LOG` | unset | Overrides the log level. |
 

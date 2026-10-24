@@ -2842,6 +2842,7 @@ dependencies = [
  "nextgcore-gtp",
  "nextgcore-metrics",
  "nextgcore-nas",
+ "nextgcore-ngap",
  "nextgcore-s1ap",
  "nextgcore-s1ap-gen",
  "nextgcore-sctp",
