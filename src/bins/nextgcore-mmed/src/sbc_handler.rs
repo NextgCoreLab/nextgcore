@@ -1061,7 +1061,7 @@ mod tests {
         };
 
         let pdu = pws_restart_pdu(TEST_PLMN, 0x10680, true);
-        // TS 36.413 §8.13.3 / ASN.1: initiating message, procedure code 49,
+        // TS 36.413 §8.12.3 / ASN.1: initiating message, procedure code 49,
         // criticality ignore.
         assert_eq!(&pdu[..3], &[0x00, 0x31, 0x40]);
         let counted = || {
