@@ -8704,9 +8704,19 @@ impl NgapServer {
             }
         }
         // TS 24.501 §5.3.7: for a UE that is still REGISTERED this is the moment the
-        // mobile reachable timer starts.
-        self.start_reachability_supervision(association_id, amf_ue_ngap_id)
-            .await;
+        // mobile reachable timer starts. A Complete that names no UE (undecodable, or
+        // a not-comprehended reject IE handled locally, TS 38.413 §10.3.4.2) ended no
+        // N1 connection this AMF can identify, so it arms nobody (#802 follow-up):
+        // the association's other UEs are either CONNECTED, or idle since an earlier
+        // release that already armed them, and re-arming those would extend their
+        // supervision and send a false CM-CONNECTED -> CM-IDLE report each time.
+        match amf_ue_ngap_id {
+            Some(id) => self.start_reachability_supervision(id).await,
+            None => log::warn!(
+                "UE Context Release Complete on association {association_id} names no \
+                 usable UE; no mobile reachable timer is started"
+            ),
+        }
         Ok(())
     }
 
@@ -8739,20 +8749,9 @@ impl NgapServer {
         }
     }
 
-    /// Start mobile-reachable supervision for every registered UE whose N1 connection
-    /// this release complete ended (TS 24.501 §5.3.7).
-    ///
-    /// `amf_ue_ngap_id` is the UE the Release Complete names, when it could be used. A
-    /// Release Complete that cannot (undecodable, or a not-comprehended reject IE, which
-    /// TS 38.413 §10.3.4.2 has handled locally) names nobody, so it falls back to the
-    /// association's UEs that are ALREADY CM-IDLE and unsupervised -- never a CONNECTED
-    /// one (#802). Arming every registered UE of the association put the connected UEs
-    /// on the gNB on the path to implicit deregistration on one malformed PDU.
-    async fn start_reachability_supervision(
-        &mut self,
-        association_id: u64,
-        amf_ue_ngap_id: Option<u64>,
-    ) {
+    /// Start mobile-reachable supervision for a registered UE whose N1 connection was
+    /// just released (TS 24.501 §5.3.7).
+    async fn start_reachability_supervision(&mut self, amf_ue_ngap_id: u64) {
         let Some(config) = self.timer_configs.get(AmfTimerId::MobileReachable).cloned() else {
             return;
         };
@@ -8760,21 +8759,7 @@ impl NgapServer {
             log::debug!("Mobile reachable timer disabled by configuration; not supervising");
             return;
         }
-        let targets: Vec<u64> = match amf_ue_ngap_id {
-            Some(amf_ue_ngap_id) => vec![amf_ue_ngap_id],
-            None => self
-                .ue_auth_state
-                .snapshot()
-                .into_iter()
-                .filter(|(_, s)| {
-                    s.association_id == association_id
-                        && s.registered
-                        && s.cm_idle
-                        && s.reachability.is_none()
-                })
-                .map(|(id, _)| id)
-                .collect(),
-        };
+        let targets = [amf_ue_ngap_id];
         let deadline = Instant::now() + config.duration;
         for amf_ue_ngap_id in targets {
             // Await-free, so the arming happens under one lock acquisition: a
@@ -21256,7 +21241,8 @@ mod tests {
     // ---- outbound capture: what amfd SENDS, not just what it stores ----
 
     /// A test server whose `send_to_association` records each NGAP PDU as
-    /// `(association_id, pdu)` instead of writing it to SCTP (see `sent_ngap`).
+    /// `(association_id, sctp_stream_id, pdu)` instead of writing it to SCTP (see
+    /// `sent_ngap`).
     async fn capturing_ngap_server() -> NgapServer {
         let mut server = test_ngap_server().await;
         server.sent_ngap = Some(Vec::new());
@@ -25563,13 +25549,17 @@ mod tests {
 
     /// **#802.** A UE Context Release Complete that names no usable UE -- undecodable,
     /// or carrying a not-comprehended IE marked reject (TS 38.413 §10.3.4.2) -- must not
-    /// arm the mobile reachable timer for a CONNECTED UE of the sending gNB. Before, the
+    /// arm the mobile reachable timer for any UE of the sending gNB. Before #802 the
     /// fallback armed every registered UE of the association, so one malformed PDU put
-    /// every connected UE on the gNB on the path to implicit deregistration. An idle,
-    /// unsupervised UE there is still supervised (the reason the fallback exists).
+    /// every connected UE on the gNB on the path to implicit deregistration. #802 narrowed
+    /// it to idle, unsupervised UEs; the follow-up arms nobody, because those UEs' N1
+    /// connections ended at an EARLIER release (TS 24.501 §5.3.7 starts the timer then),
+    /// and re-arming them extended their supervision and sent a false CM-CONNECTED ->
+    /// CM-IDLE report each time. A UE already in implicit-deregistration supervision keeps
+    /// its phase and deadline.
     ///
-    /// REVERT-VERIFIED: with the fallback's old association-only filter the connected
-    /// UE is armed and this fails.
+    /// REVERT-VERIFIED: with #802's fallback the idle unsupervised UE is armed; with the
+    /// original one the connected UE is too.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unusable_release_complete_never_supervises_a_connected_ue() {
         crate::context::amf_context_init(64, 1024, 4096);
@@ -25592,6 +25582,16 @@ mod tests {
             i.registered = true;
             i.cm_idle = true;
             ngap.ue_auth_state.insert(idle, i);
+            let dereg = 7_802_003u64 + 10 * n as u64;
+            let dereg_deadline = Instant::now() + Duration::from_secs(600);
+            let mut d = UeNasContext::new(dereg, 3, assoc, false);
+            d.registered = true;
+            d.cm_idle = true;
+            d.reachability = Some(Reachability {
+                phase: ReachabilityPhase::ImplicitDeregistration,
+                deadline: dereg_deadline,
+            });
+            ngap.ue_auth_state.insert(dereg, d);
 
             ngap.handle_ue_context_release_complete(assoc, &pdu)
                 .await
@@ -25611,11 +25611,20 @@ mod tests {
             assert!(!ngap.ue_auth_state.get(connected).unwrap().is_cm_idle());
             assert_eq!(
                 phase(idle),
-                Some(ReachabilityPhase::MobileReachable),
-                "case {n}: the idle, unsupervised UE of the association is"
+                None,
+                "case {n}: an idle UE whose N1 connection this Complete did not end is not"
             );
-            ngap.ue_auth_state.remove(connected);
-            ngap.ue_auth_state.remove(idle);
+            assert_eq!(
+                ngap.ue_auth_state
+                    .get(dereg)
+                    .and_then(|s| s.reachability)
+                    .map(|r| (r.phase, r.deadline)),
+                Some((ReachabilityPhase::ImplicitDeregistration, dereg_deadline)),
+                "case {n}: an implicit-deregistration supervision is left as it was"
+            );
+            for id in [connected, idle, dereg] {
+                ngap.ue_auth_state.remove(id);
+            }
         }
     }
 
