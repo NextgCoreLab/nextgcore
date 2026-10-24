@@ -104,7 +104,9 @@ enum ModifyIndicationAnswer {
 }
 
 enum NgapTransport {
-    Userspace(SctpServer),
+    /// Boxed: the userspace server is several hundred bytes, the kernel one a few
+    /// handles (clippy `large_enum_variant` under `kernel-sctp`).
+    Userspace(Box<SctpServer>),
     #[cfg(feature = "kernel-sctp")]
     Kernel(nextgcore_sctp::KernelSctpServer),
 }
@@ -120,7 +122,7 @@ impl NgapTransport {
                 let server = SctpServer::bind(addr, config)
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to bind userspace SCTP server: {e}"))?;
-                Ok(Self::Userspace(server))
+                Ok(Self::Userspace(Box::new(server)))
             }
             SctpBackend::Kernel => {
                 #[cfg(feature = "kernel-sctp")]
