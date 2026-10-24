@@ -665,10 +665,8 @@ pub async fn try_associate(client: &PfcpClient) -> Result<(), PfcpRequestError> 
 impl PfcpClient {
     /// Create a client bound to an existing N4 socket.
     pub fn new(socket: Arc<UdpSocket>, peer: SocketAddr, node_ip: [u8; 4]) -> Self {
-        let recovery_time_stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as u32)
-            .unwrap_or(1);
+        // #995: NTP-era seconds (TS 29.244 §8.2.65), not Unix seconds.
+        let recovery_time_stamp = nextgcore_pfcp::recovery_time::now();
         Self {
             socket,
             peer: std::sync::RwLock::new(peer),
@@ -817,6 +815,10 @@ impl PfcpClient {
     /// Deliberately does **not** set `associated`: the association still has to be
     /// established on the wire. Only the restart-detection input is restored.
     pub async fn seed_peer_recovery_time_stamp(&self, rts: u32) {
+        // #995: a pre-#995 snapshot holds the stamp a pre-#995 UPF sent, in Unix
+        // seconds; compared raw with an NTP one it would read as a restart (or, on a
+        // Heartbeat Request, as 70 years older and be discarded).
+        let rts = nextgcore_pfcp::recovery_time::normalize_received(rts);
         let mut assoc = self.assoc.write().await;
         assoc.peer_recovery_time_stamp = Some(rts);
         log::info!(
@@ -1085,6 +1087,8 @@ impl PfcpClient {
         rts: u32,
         source: StampSource,
     ) -> Option<tokio::task::JoinHandle<()>> {
+        // #995: compared in the NTP reading, whatever the UPF's nextgcore version.
+        let rts = nextgcore_pfcp::recovery_time::normalize_received(rts);
         // TS 23.007 §19A, under one write guard (#928 review m2): the new stamp is
         // stored at once, so a second path seeing the same stamp (the receive task's
         // Heartbeat Request and the maintenance task's Heartbeat Response) finds it
@@ -1246,8 +1250,10 @@ impl PfcpClient {
         // here held the one association/heartbeat task, which serves every pool
         // member, for the whole fan-out, and kept this UPF unassociated while the UEs
         // that got #39 came back to re-establish.
+        // #995: the stamp in the NTP reading (a pre-#995 UPF sends Unix seconds).
+        let peer_rts = nextgcore_pfcp::recovery_time::normalize_received(resp.recovery_time_stamp);
         let restarted = match self
-            .detect_peer_restart(resp.recovery_time_stamp, StampSource::Response)
+            .detect_peer_restart(peer_rts, StampSource::Response)
             .await
         {
             Some(releases) => {
@@ -1272,7 +1278,7 @@ impl PfcpClient {
         {
             let mut assoc = self.assoc.write().await;
             assoc.associated = true;
-            assoc.peer_recovery_time_stamp = Some(resp.recovery_time_stamp);
+            assoc.peer_recovery_time_stamp = Some(peer_rts);
             assoc.up_function_features = resp.up_function_features;
             self.publish_associated(&assoc);
             log::info!(
@@ -1288,7 +1294,7 @@ impl PfcpClient {
         // Issue #191: record the stamp durably so the NEXT process can compare
         // against it. Scoped after the async guard drops, and the std lock is not
         // held across an await.
-        self.record_peer_recovery_time_stamp(resp.recovery_time_stamp);
+        self.record_peer_recovery_time_stamp(peer_rts);
         Ok(())
     }
 
@@ -1502,7 +1508,7 @@ enum StampSource {
 /// (RFC 1982): the 32-bit NTP seconds field wraps in February 2036, and a stamp just
 /// past the wrap is newer than one just before it.
 fn stamp_is_newer(a: u32, b: u32) -> bool {
-    (a.wrapping_sub(b) as i32) > 0
+    nextgcore_pfcp::recovery_time::is_newer(a, b)
 }
 
 /// Whether two PFCP endpoints are the same PFCP node (#928 round 2, m1): the IP
@@ -2883,6 +2889,8 @@ mod tests {
         let answered = tokio::spawn(answer_association_setup(upf_b, 200, false));
         try_associate(&client).await.expect("association with B");
         let _ = answered.await;
+        // #928: the restart's #39 fan-out runs off the association task; wait for it.
+        drain_restart_fanouts(Duration::from_secs(5)).await;
         let kept = pfcp_session_present("72201");
         let released = crate::cancel_gsm_timer_for_test("72201");
         forget_pfcp_session("72201");
@@ -3704,6 +3712,63 @@ mod tests {
     // smfd test asserts on the *contents* of the global `pfcp_sessions` map, and
     // each of these asserts only about its own uniquely-named key rather than
     // about the map being empty.
+
+    /// #995: across the upgrade, stamps compare in the NTP reading. A UPF still on a
+    /// pre-#995 binary keeps sending the Unix-seconds stamp the (migrated) seed was
+    /// taken from: no restart, on either path. An UPGRADED UPF -- a real restart --
+    /// sends an NTP stamp; unnormalized, that is 70 years "older" than the Unix seed in
+    /// serial arithmetic, so a Heartbeat Request carrying it was discarded as reordered
+    /// and the restart went unseen.
+    #[tokio::test]
+    async fn stamps_compare_across_the_995_upgrade() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
+        let (client, _upf) = make_client_with_peer().await;
+        let _pool = InstalledPool::new(vec![client.clone()]);
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let legacy = (now_unix - 86_400) as u32; // a pre-#995 UPF up for a day
+        client.seed_peer_recovery_time_stamp(legacy).await;
+        client.set_assoc_state_for_test(true, None, None).await;
+
+        for source in [StampSource::Request, StampSource::Response] {
+            assert!(
+                client.detect_peer_restart(legacy, source).await.is_none(),
+                "the same pre-#995 UPF is not a restart ({source:?})"
+            );
+        }
+        assert!(client.is_associated().await);
+
+        let upgraded = nextgcore_pfcp::recovery_time::from_unix_secs(now_unix - 60);
+        let fanout = client
+            .detect_peer_restart(upgraded, StampSource::Request)
+            .await;
+        assert!(
+            fanout.is_some(),
+            "an upgraded UPF's newer NTP stamp in a Heartbeat Request is a restart"
+        );
+        if let Some(f) = fanout {
+            let _ = f.await;
+        }
+        assert_eq!(
+            client.association().await.peer_recovery_time_stamp,
+            Some(upgraded)
+        );
+    }
+
+    /// #995: this SMF's own stamp is NTP-era seconds (TS 29.244 §8.2.65).
+    #[tokio::test]
+    async fn the_smf_recovery_time_stamp_is_ntp_seconds() {
+        let (client, _upf) = make_client_with_peer().await;
+        let now = nextgcore_pfcp::recovery_time::now();
+        assert!(
+            now.wrapping_sub(client.recovery_time_stamp) < 60,
+            "{}",
+            client.recovery_time_stamp
+        );
+    }
 
     /// A stamp restored from a snapshot must participate in restart detection.
     /// Without the seed a fresh process holds `None`, no restart is detectable,
