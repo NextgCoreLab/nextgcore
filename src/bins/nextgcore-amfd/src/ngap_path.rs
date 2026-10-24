@@ -623,6 +623,11 @@ pub struct UeNasContext {
     initial_context_setup_request_sent: bool,
     /// Initial Context Setup Response received from the gNB.
     initial_context_setup_response_received: bool,
+    /// The PDU sessions the last INITIAL CONTEXT SETUP REQUEST asked the gNB to set up
+    /// (#739). Its Response may only report these: a Setup Response Transfer for any
+    /// other PSI would re-point that session's downlink at the gNB without the AMF
+    /// having asked.
+    ics_requested_psis: Vec<u8>,
     /// Whether the Registration Accept has left the AMF for this UE (#91).
     ///
     /// Gates the UE-policy association create, because creating it is what makes the
@@ -751,6 +756,7 @@ impl UeNasContext {
             gmm_fsm: GmmFsm::new(amf_ue_ngap_id),
             initial_context_setup_request_sent: false,
             initial_context_setup_response_received: false,
+            ics_requested_psis: Vec::new(),
             registration_accept_sent: false,
             ue_policy_container: None,
             cm_idle: false,
@@ -848,7 +854,7 @@ pub struct NgapServer {
     ///
     /// Recorded when the target admits the UE (HandoverRequestAcknowledge) and
     /// dropped when the handover completes, is cancelled, or fails. It exists for
-    /// UPLINK RAN STATUS TRANSFER (TS 38.413 §8.4.7): the source gNB sends the
+    /// UPLINK RAN STATUS TRANSFER (TS 38.413 §8.4.6): the source gNB sends the
     /// PDCP SN/HFN status *after* the HandoverCommand, and the AMF has to know
     /// where to forward it. `ue_auth_state` cannot answer that — it still names
     /// the SOURCE association until the UE arrives.
@@ -907,6 +913,26 @@ pub struct NgapServer {
     /// [`MAX_CONTEXTLESS_UE_IDS`], oldest first.
     contextless_ue_ids: std::collections::VecDeque<ContextlessUeId>,
 }
+
+/// What the #739 UE-association gate decided for one received NGAP PDU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UeAssociation {
+    /// Not a gated message (not UE-associated, or its procedure checks itself).
+    NotGated,
+    /// A UE-associated logical NG-connection of the sending association.
+    Serving,
+    /// Not one: dropped, answered with an Error Indication with this cause.
+    Refused {
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: Option<u32>,
+        cause: u8,
+    },
+}
+
+/// UE-associated NGAP messages the #739 gate dropped (TS 38.413 §10.6): a rise is a gNB
+/// out of step with this AMF, or one naming other gNBs' UEs.
+pub(crate) static UE_ASSOCIATED_REFUSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// A PDU Session Establishment Request waiting for a reachable SMF (#796).
 #[derive(Debug, Clone)]
@@ -1318,6 +1344,30 @@ impl NgapServer {
             "NGAP message from association {association_id}: procedure_code={procedure_code:?}"
         );
 
+        // #739: one gate for every UE-associated message (TS 38.413 §10.6).
+        if let UeAssociation::Refused {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            cause,
+        } = self.check_ue_association(association_id, procedure_code, data)
+        {
+            UE_ASSOCIATED_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            log::warn!(
+                "NGAP procedure {procedure_code:?} from association {association_id} names \
+                 AMF UE NGAP ID {amf_ue_ngap_id} / RAN UE NGAP ID {ran_ue_ngap_id:?}, which is \
+                 not a UE-associated logical connection of this association: dropped, Error \
+                 Indication ({cause:?}, TS 38.413 §10.6)"
+            );
+            self.send_error_indication(
+                association_id,
+                Some(amf_ue_ngap_id),
+                ran_ue_ngap_id,
+                ngap_gen::Cause::RadioNetwork(ngap_gen::CauseRadioNetwork(cause)),
+            )
+            .await?;
+            return Ok(());
+        }
+
         match procedure_code {
             Some(21) => {
                 // NGSetupRequest (procedure code 21)
@@ -1539,7 +1589,7 @@ impl NgapServer {
                 }
             }
             Some(49) => {
-                // UPLINK RAN STATUS TRANSFER (TS 38.413 §8.4.7): relay the PDCP
+                // UPLINK RAN STATUS TRANSFER (TS 38.413 §8.4.6): relay the PDCP
                 // status to the handover target as DOWNLINK RAN STATUS TRANSFER.
                 // Accepting and dropping it made handover lossy.
                 if data[0] == 0x00 {
@@ -1719,6 +1769,78 @@ impl NgapServer {
     /// In APER encoding:
     /// - Byte 0: CHOICE index (0x00, 0x20, or 0x40 with extension bit)
     /// - Byte 1: Procedure code (0-255)
+    /// The #739 gate: is `data`, a UE-associated message from `association_id`, about a
+    /// UE-associated logical NG-connection of THAT association (TS 38.413 §10.6)?
+    ///
+    /// AP IDs are local to their NG interface, so an AMF UE NGAP ID that no CM-CONNECTED
+    /// UE holds on this association is an UNKNOWN local AP ID here, whatever another
+    /// association holds under it; a RAN UE NGAP ID other than the one stored for the UE
+    /// is an INCONSISTENT remote AP ID. Either way the message is dropped and an Error
+    /// Indication names the received IDs. A CM-IDLE UE has no logical connection, so a
+    /// RAN UE NGAP ID it kept from a released one never resolves to it (#848 review).
+    ///
+    /// Known deviation, as on the #758 path: §10.6 also has both nodes locally release
+    /// the connection with the erroneous AP ID. That is not done: a peer naming a wrong
+    /// pair must not be able to release another UE's connection.
+    ///
+    /// Not gated here, because the procedure defines who may send it:
+    /// - the messages that open a connection (Initial UE Message, Path Switch Request,
+    ///   which names the SOURCE AMF UE NGAP ID from a new association);
+    /// - the handover target's Acknowledge, Failure and Notify, checked against the
+    ///   recorded target in their handlers;
+    /// - a UE Context Release Complete, the "last message" (§10.6: local release only),
+    ///   checked in its handler;
+    /// - an Error Indication, which is never answered with one.
+    fn check_ue_association(
+        &self,
+        association_id: u64,
+        procedure_code: Option<u16>,
+        data: &[u8],
+    ) -> UeAssociation {
+        use nextgcore_ngap_gen::generated as g;
+        let Some(code) = procedure_code else {
+            return UeAssociation::NotGated;
+        };
+        let exempt = [
+            g::ID_INITIAL_UE_MESSAGE as u16,
+            proc_code::PATH_SWITCH_REQUEST,
+            proc_code::HANDOVER_RESOURCE_ALLOCATION,
+            proc_code::HANDOVER_NOTIFICATION,
+            g::ID_UE_CONTEXT_RELEASE as u16,
+            proc_code::ERROR_INDICATION,
+        ];
+        if exempt.contains(&code) {
+            return UeAssociation::NotGated;
+        }
+        let Some(amf_ue_ngap_id) = crate::ngap_asn1::extract_amf_ue_ngap_id(data) else {
+            return UeAssociation::NotGated;
+        };
+        let ran_ue_ngap_id = crate::ngap_asn1::extract_ran_ue_ngap_id(data);
+        let refused = |cause| UeAssociation::Refused {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            cause,
+        };
+        match self.ue_auth_state.get(amf_ue_ngap_id) {
+            Some(state) if state.association_id == association_id && !state.is_cm_idle() => {
+                match ran_ue_ngap_id {
+                    Some(ran) if ran != state.ran_ue_ngap_id => {
+                        refused(ngap_gen::CauseRadioNetwork::INCONSISTENT_REMOTE_UE_NGAP_ID)
+                    }
+                    _ => UeAssociation::Serving,
+                }
+            }
+            // An allocation without a NAS context (#758) is the handler's to judge.
+            _ if self.contextless_ue_ids.iter().any(|c| {
+                c.amf_ue_ngap_id == amf_ue_ngap_id && c.association_id == association_id
+            }) =>
+            {
+                UeAssociation::Serving
+            }
+            _ => refused(ngap_gen::CauseRadioNetwork::UNKNOWN_LOCAL_UE_NGAP_ID),
+        }
+    }
+
     fn extract_procedure_code(&self, data: &[u8]) -> Option<u16> {
         if data.len() < 3 {
             log::warn!(
@@ -5227,6 +5349,9 @@ impl NgapServer {
         state.gmm_fsm.transition_to_initial_context_setup();
         self.ue_auth_state.insert(amf_ue_ngap_id, state);
 
+        // #739: this Request sets up no PDU session, so its Response may report none.
+        self.ue_auth_state
+            .with_mut(amf_ue_ngap_id, |s| s.ics_requested_psis.clear());
         self.send_to_association(association_id, &ics).await?;
         // Arm T3550 against the ICS PDU: until the gNB confirms with an ICS
         // Response, the retransmission carries the whole request (Registration
@@ -5865,6 +5990,10 @@ impl NgapServer {
         };
         let (racs_id, racs_cap) = self.racs_ies_for(amf_ue_ngap_id);
         let ics = crate::racs::add_capability_ies(ics, racs_id.as_deref(), racs_cap.as_deref());
+        let requested: Vec<u8> = sessions.iter().map(|s| s.pdu_session_id).collect();
+        self.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
+            s.ics_requested_psis = requested;
+        });
         self.send_to_association(association_id, &ics).await?;
         if let Some(p) = &paging {
             self.deliver_paged_after_service_request(
@@ -10716,7 +10845,7 @@ impl NgapServer {
                     ack.amf_ue_ngap_id
                 );
                 // Remember where the UE is going. The source gNB may now send an
-                // UPLINK RAN STATUS TRANSFER (TS 38.413 §8.4.7) that has to reach
+                // UPLINK RAN STATUS TRANSFER (TS 38.413 §8.4.6) that has to reach
                 // this target, and only this point in the procedure knows which
                 // association admitted the UE.
                 //
@@ -10743,8 +10872,8 @@ impl NgapServer {
     }
 
     /// Handle an UPLINK RAN STATUS TRANSFER from the source gNB (TS 38.413
-    /// §8.4.7) by relaying it to the target as a DOWNLINK RAN STATUS TRANSFER
-    /// (§8.4.8).
+    /// §8.4.6) by relaying it to the target as a DOWNLINK RAN STATUS TRANSFER
+    /// (§8.4.7).
     ///
     /// This is the PDCP SN/HFN status the target needs to resume the DRBs without
     /// losing or duplicating packets. It used to be accepted and dropped (and
@@ -12519,7 +12648,22 @@ impl NgapServer {
         // downlink tunnel; the SMF must have it to move the UPF's downlink FAR off
         // BUFF (TS 23.502 §4.2.3.2 steps 12-14). Before this an ICS that carried
         // sessions -- a Service Request's re-activation -- left the UPF buffering.
+        //
+        // #739: only the sessions the Request asked for. Any other PSI would have the
+        // SMF re-point a session's downlink at this gNB on the gNB's say-so alone.
+        let requested = self
+            .ue_auth_state
+            .get(amf_ue_ngap_id)
+            .map(|s| s.ics_requested_psis.clone())
+            .unwrap_or_default();
         for (psi, transfer) in &ics_setup_sessions {
+            if !requested.contains(psi) {
+                log::warn!(
+                    "Initial Context Setup Response for UE {amf_ue_ngap_id} reports PSI {psi}, \
+                     which its Request did not set up ({requested:?}); not relayed to the SMF"
+                );
+                continue;
+            }
             self.relay_n2_sm_to_smf(
                 amf_ue_ngap_id,
                 *psi,
@@ -12532,6 +12676,7 @@ impl NgapServer {
 
         let updated = self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
             state.initial_context_setup_response_received = true;
+            state.ics_requested_psis.clear();
             // The gNB has the Registration Accept; stop retransmitting the ICS
             // request. T3550 logic that waits for Registration Complete is reset
             // here — Registration Complete arrives on the uplink NAS path.
@@ -22024,7 +22169,7 @@ mod tests {
 
     /// **#740.** The DOWNLINK RAN STATUS TRANSFER relayed to the handover target names
     /// the UE by the RAN UE NGAP ID the TARGET allocated in its HandoverRequestAcknowledge
-    /// (TS 38.413 §8.4.2.2, §8.4.8, §9.2.3.5), not by the source's: each gNB allocates
+    /// (TS 38.413 §8.4.2.2, §8.4.7, §9.2.3.5), not by the source's: each gNB allocates
     /// its own, and the source's id at the target is an inconsistent pair (§10.6) or
     /// another UE.
     ///
