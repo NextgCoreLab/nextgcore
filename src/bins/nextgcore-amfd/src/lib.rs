@@ -70,7 +70,7 @@ pub mod test_support {
     /// Serialises tests that set the UCMF endpoint environment variables
     /// (`UCMF_SBI_ADDR` / `UCMF_SBI_PORT`), for the same reason as
     /// [`SMF_ENV_LOCK`].
-    pub static UCMF_ENV_LOCK: Mutex<()> = Mutex::new(());
+    pub static UCMF_ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
     /// Initialize the process-global AMF context for in-process strict-peer
     /// tests (wraps [`crate::context::amf_context_init`] with test capacities).

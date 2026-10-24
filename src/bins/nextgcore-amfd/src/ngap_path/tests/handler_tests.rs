@@ -1746,7 +1746,7 @@ async fn establish_psi_5(
     ran: u32,
 ) -> (Vec<SmfCall>, Vec<Sent>, (usize, usize, usize)) {
     let (_smf, port, calls) = activating_smf().await;
-    let _env = super::SmfEnvGuard::set(port);
+    let _env = super::SmfEnvGuard::acquire(port).await;
     let mut server = capturing_ngap_server().await;
     secured_registered_ue(&mut server, ue, ran);
     server.ue_auth_state.with_mut(ue, |s| {
@@ -1835,9 +1835,7 @@ async fn a_recorded_session_is_established() {
 // walks the shared store, and no sibling sweep may run in between.
 #[allow(clippy::await_holding_lock)]
 async fn an_implicit_deregistration_releases_at_the_smf_then_prunes() {
-    let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK.lock().await;
     let (_smf, port, calls) = activating_smf().await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_756_021u64, 63);
