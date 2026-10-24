@@ -7,10 +7,22 @@
 //! shared with the live path.
 
 /// Resynchronization info for authentication (TS 29.503 ResynchronizationInfo)
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ResynchronizationInfo {
     pub rand: String,
     pub auts: String,
+}
+
+/// Manual `Debug` (no-auth-material-in-logs): the authentication material in
+/// this type (rand, auts) prints as `<redacted>`, so a future
+/// `{:?}` in a log line cannot leak it.
+impl std::fmt::Debug for ResynchronizationInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("ResynchronizationInfo");
+        d.field("rand", &"<redacted>");
+        d.field("auts", &"<redacted>");
+        d.finish()
+    }
 }
 
 /// Get current timestamp in ISO 8601 format
