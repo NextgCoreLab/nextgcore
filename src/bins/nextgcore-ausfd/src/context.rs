@@ -58,7 +58,7 @@ impl AuthEvent {
 }
 
 /// AUSF UE context
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AusfUe {
     /// Unique pool ID
     pub id: u64,
@@ -96,6 +96,34 @@ pub struct AusfUe {
     pub stream_id: Option<u64>,
     /// SNPN NID (Network Identifier) - Rel-17
     pub snpn_nid: Option<String>,
+}
+
+/// Manual `Debug` (no-auth-material-in-logs): the authentication material in
+/// this type (rand, xres_star, hxres_star, kausf, kseaf, autn, res_star_hex) prints as `<redacted>`, so a future
+/// `{:?}` in a log line cannot leak it.
+impl std::fmt::Debug for AusfUe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("AusfUe");
+        d.field("id", &self.id);
+        d.field("ctx_id", &self.ctx_id);
+        d.field("suci", &self.suci);
+        d.field("supi", &self.supi);
+        d.field("serving_network_name", &self.serving_network_name);
+        d.field("auth_type", &self.auth_type);
+        d.field("auth_event", &self.auth_event);
+        d.field("auth_result", &self.auth_result);
+        d.field("rand", &"<redacted>");
+        d.field("xres_star", &"<redacted>");
+        d.field("hxres_star", &"<redacted>");
+        d.field("kausf", &"<redacted>");
+        d.field("kseaf", &"<redacted>");
+        d.field("autn", &"<redacted>");
+        d.field("res_star_hex", &"<redacted>");
+        d.field("eap_session", &self.eap_session);
+        d.field("stream_id", &self.stream_id);
+        d.field("snpn_nid", &self.snpn_nid);
+        d.finish()
+    }
 }
 
 impl AusfUe {

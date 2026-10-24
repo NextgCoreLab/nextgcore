@@ -194,20 +194,20 @@ async fn dispatch_notify_request_async(
     req_nf_type: Option<&str>,
     event_str: &str,
 ) -> NotifySendResult {
+    // #940: the subscriber's callback URI may carry a bearer token (the AMF's does),
+    // so it is logged with its last segment redacted, never whole.
+    let notification_uri = &nextgcore_sbi::log_redact::redact_last_segment(notification_uri);
     log::debug!(
-        "Sending NF status notify to {} (event={}, nf_instance={})",
-        notify_request.uri,
-        event_str,
-        nf_instance_id
+        "Sending NF status notify to {notification_uri} (event={event_str}, \
+         nf_instance={nf_instance_id})"
     );
 
     let (host, port, path, scheme) = match parse_notification_uri(&notify_request.uri) {
         Some(parts) => parts,
         None => {
-            log::error!("Failed to parse notification URI: {}", notify_request.uri);
+            log::error!("Failed to parse notification URI: {notification_uri}");
             return NotifySendResult::Failed(format!(
-                "Invalid notification URI: {}",
-                notify_request.uri
+                "Invalid notification URI: {notification_uri}"
             ));
         }
     };
@@ -283,12 +283,9 @@ async fn dispatch_notify_request_async(
             }
         }
         Err(e) => {
-            log::error!(
-                "Failed to deliver NF status notify to {}: {}",
-                notification_uri,
-                e
-            );
-            NotifySendResult::Failed(e.to_string())
+            let e = nextgcore_sbi::log_redact::redact_callback_tokens(&e.to_string());
+            log::error!("Failed to deliver NF status notify to {notification_uri}: {e}");
+            NotifySendResult::Failed(e)
         }
     }
 }
@@ -392,7 +389,7 @@ pub fn nrf_nnrf_nfm_send_nf_status_notify(
     log::info!(
         "NF status notify queued: {} -> {} ({})",
         nf_instance.nf_instance_id,
-        subscription_data.notification_uri,
+        nextgcore_sbi::log_redact::redact_last_segment(&subscription_data.notification_uri),
         event.as_str()
     );
 
@@ -462,7 +459,7 @@ pub async fn nrf_nnrf_nfm_send_nf_status_notify_all_async(
             NotifySendResult::Failed(err) => {
                 log::error!(
                     "Failed to send NF status notify to {}: {}",
-                    subscription.notification_uri,
+                    nextgcore_sbi::log_redact::redact_last_segment(&subscription.notification_uri),
                     err
                 );
                 // Continue sending to other subscribers rather than aborting
@@ -523,7 +520,7 @@ pub async fn nrf_nnrf_nfm_send_nf_profile_changed_notify_all_async(
             NotifySendResult::Failed(err) => {
                 log::error!(
                     "Failed to send NF_PROFILE_CHANGED notify to {}: {}",
-                    subscription.notification_uri,
+                    nextgcore_sbi::log_redact::redact_last_segment(&subscription.notification_uri),
                     err
                 );
                 // Continue to remaining subscribers.
@@ -576,7 +573,7 @@ pub fn nrf_nnrf_nfm_send_nf_profile_changed_notify_all(
                 log::info!(
                     "NF_PROFILE_CHANGED notify queued: {} -> {}",
                     nf_instance.nf_instance_id,
-                    subscription.notification_uri
+                    nextgcore_sbi::log_redact::redact_last_segment(&subscription.notification_uri)
                 );
                 sent_count += 1;
             }
@@ -623,7 +620,7 @@ pub fn nrf_nnrf_nfm_send_nf_status_notify_all(
             NotifySendResult::Failed(err) => {
                 log::error!(
                     "Failed to send NF status notify to {}: {}",
-                    subscription.notification_uri,
+                    nextgcore_sbi::log_redact::redact_last_segment(&subscription.notification_uri),
                     err
                 );
                 return Err(err);

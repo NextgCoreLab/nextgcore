@@ -104,12 +104,14 @@ S1-MME runs **only** over native Linux kernel SCTP: mmed offers no userspace (sc
 | Variable | Default | Description |
 |---|---|---|
 | `MME_N26_INTERWORKING` | off | `1`/`true` binds the N26 socket and enables EPS↔5GS interworking (idle-mode context transfer, connected-mode handover). Off: a standalone EPC, and a UE arriving from 5GS is handled as TS 24.301 requires of an MME with no N26. |
-| `MME_N26_PEER_T3_SECS` | `3` | The AMF's GTPv2-C T3-RESPONSE (TS 29.274 §7.6), floored at 1. With `MME_N26_PEER_N3` it sizes how long a sent N26 response is kept to answer the AMF's retransmission of the same request: (N3 + 1) x T3, 12 s by default. Set both to the AMF's values when they are longer than the defaults, or a late retransmitted Forward Relocation Request is processed a second time. |
-| `MME_N26_PEER_N3` | `3` | The AMF's GTPv2-C N3-REQUESTS (TS 29.274 §7.6); see `MME_N26_PEER_T3_SECS`. |
+| `MME_N26_PEER_T3_SECS` | `3` | The AMF's GTPv2-C T3-RESPONSE (TS 29.274 §7.6), floored at 1 and capped at 60 (a larger value is logged and capped). With `MME_N26_PEER_N3` it sizes how long a sent N26 response is kept to answer the AMF's retransmission of the same request: (N3 + 1) x T3, 12 s by default. Set both to the AMF's values when they are longer than the defaults, or a late retransmitted Forward Relocation Request is processed a second time. |
+| `MME_N26_PEER_N3` | `3` | The AMF's GTPv2-C N3-REQUESTS (TS 29.274 §7.6), capped at 10; see `MME_N26_PEER_T3_SECS`. |
 | `MME_ECHO_INTERVAL_SECS` | `60` | GTPv2-C Echo (path management) interval; `0` disables it. |
 | `MME_DIAMETER_TW_SECS` | `30` | S6a Device-Watchdog interval Tw (RFC 6733 §5.5, RFC 3539 §3.4.1), floored at 6. After Tw with nothing received a DWR is sent; with no answer within another Tw the connection is closed and redialled (Tc, doubling to at most 8 x Tc). A redialled connection carries traffic once three watchdogs are answered. hssd drops no idle connection; against an HSS that does (one built on `DiameterServer` drops after 3 x its Tc), keep Tw below that. An unparsable value is logged and 30 is used. |
 | `MME_RESTART_COUNTER_FILE` | `/var/lib/nextgcore/mme-restart-counter` | Where the TS 23.007 restart counter is persisted; it is advanced on every start. |
 | `MME_RESTART_COUNTER` | unset | Fixed restart counter (u8), overriding the persisted one. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://jaeger:4317` | OpenTelemetry OTLP exporter. |
+| `MME_METRICS_ADDR` | unset | Full `ip:port` of the unauthenticated `/metrics` listener (handover failure counters). Wins over `NEXTGCORE_METRICS_BIND`. |
+| `NEXTGCORE_METRICS_BIND` | `127.0.0.1` | Host of the `/metrics` listener on port 9090 when `MME_METRICS_ADDR` is unset (#837). `docker-compose-epc.yml` and the EKS EPC overlay set `0.0.0.0` inside the private network; no metrics port is published on the host. |
 
 `RUST_LOG` overrides `-l/--log-level` when set (the `RUST_LOG: info` in `docker-compose-epc.yml` applies).

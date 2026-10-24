@@ -140,6 +140,14 @@ pub fn expire_nas_timers(ctx: &MmeContext, now: Instant) {
 }
 
 fn handle_expiry(ctx: &MmeContext, mme_ue_id: u64, timer: NasTimer) {
+    // #956: paging is for a UE with NO S1 connection, so T3413 cannot go
+    // through the S1-connection check below (which aborted it at its first
+    // expiry, so paging was never repeated): it repages on every eNB serving
+    // the UE's tracking area.
+    if timer == NasTimer::T3413 {
+        paging_expiry(ctx, mme_ue_id);
+        return;
+    }
     let enb_ue = ctx
         .mme_ue_find_by_id(mme_ue_id)
         .map(|mme_ue| mme_ue.enb_ue_id)
@@ -248,22 +256,6 @@ fn handle_expiry(ctx: &MmeContext, mme_ue_id: u64, timer: NasTimer) {
         }
     };
 
-    if abort && timer == NasTimer::T3413 {
-        // A paging procedure has no NAS signalling connection to release -- that
-        // is the point of paging. TS 23.401 §5.3.4.3: the UE did not respond, so
-        // the procedure is marked failed and whatever triggered it decides
-        // (buffer, drop, or report).
-        if let Some(mme_ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&mme_ue_id) {
-            mme_ue.paging.failed = true;
-            mme_ue.paging.type_ = crate::context::PagingType::None;
-            log::warn!(
-                "[{}] paging gave up: the UE did not respond",
-                mme_ue.imsi_bcd
-            );
-        }
-        return;
-    }
-
     if abort && timer == NasTimer::T3422 {
         // TS 24.301 §5.5.2.3.4 b: "on the fifth expiry of timer T3422, the detach
         // procedure shall be aborted and the MME enters state EMM-DEREGISTERED".
@@ -289,6 +281,59 @@ fn handle_expiry(ctx: &MmeContext, mme_ue_id: u64, timer: NasTimer) {
             timer.name()
         );
         crate::nas_dispatch::release_ue_context(ctx, &enb_ue);
+    }
+}
+
+/// T3413 expired (TS 24.301 §5.6.2.2.1, TS 23.401 §5.3.4.3): the PAGING is
+/// repeated up to [`MAX_RETRANSMISSIONS`] times on every eNB serving the UE,
+/// then the paging fails and whatever triggered it is told (#956: a Downlink
+/// Data Notification gets its Failure Indication, cause UE not responding).
+fn paging_expiry(ctx: &MmeContext, mme_ue_id: u64) {
+    let action = {
+        let mut pool = ctx.mme_ue_pool.write().unwrap();
+        let Some(mme_ue) = pool.get_mut(&mme_ue_id) else {
+            return;
+        };
+        if !mme_ue.t3413.is_expired(Instant::now()) {
+            return;
+        }
+        if mme_ue.t3413.retry_count >= MAX_RETRANSMISSIONS || mme_ue.t3413.pkbuf.is_none() {
+            mme_ue.t3413.stop();
+            let paging_type = mme_ue.paging.type_;
+            mme_ue.paging.failed = true;
+            mme_ue.paging.type_ = crate::context::PagingType::None;
+            log::warn!(
+                "[{}] paging gave up: the UE did not respond ({paging_type:?})",
+                mme_ue.imsi_bcd
+            );
+            Err(paging_type)
+        } else {
+            let pdu = mme_ue.t3413.pkbuf.clone().unwrap_or_default();
+            mme_ue.t3413.record_retransmission(T3413_DURATION);
+            log::info!(
+                "[{}] T3413 expired; paging repeated ({}/{MAX_RETRANSMISSIONS})",
+                mme_ue.imsi_bcd,
+                mme_ue.t3413.retry_count
+            );
+            Ok(pdu)
+        }
+    };
+    match action {
+        Ok(pdu) => {
+            crate::paging::repeat(ctx, mme_ue_id, pdu);
+        }
+        Err(crate::context::PagingType::DownlinkDataNotification) => {
+            if let Err(e) = crate::gtp_path::send_downlink_data_notification_failure_indication(
+                ctx,
+                mme_ue_id,
+                crate::s11_build::GtpCause::UeNotResponding,
+            ) {
+                log::error!(
+                    "UE {mme_ue_id}: Downlink Data Notification Failure Indication not sent: {e}"
+                );
+            }
+        }
+        Err(_) => {}
     }
 }
 
