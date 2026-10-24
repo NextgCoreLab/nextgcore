@@ -1202,6 +1202,23 @@ impl PfcpClient {
         result
     }
 
+    /// A session-level request (Establishment, Modification, Deletion) for the
+    /// session with SMF-side SEID `smf_seid`: [`Self::request`], and then the GTP-U
+    /// peers of its FARs are learnt from the request the UPF accepted (#994).
+    pub async fn session_request(
+        &self,
+        msg_type: u8,
+        smf_seid: u64,
+        upf_seid: Option<u64>,
+        body: &[u8],
+    ) -> Result<(u8, Vec<u8>), PfcpRequestError> {
+        let result = self.request(msg_type, upf_seid, body).await;
+        if let Ok((_, response)) = &result {
+            crate::up_path::note_session_request(smf_seid, msg_type, body, response);
+        }
+        result
+    }
+
     /// Feed an incoming datagram into the engine. Returns true when the
     /// datagram was consumed (response to a pending request, or a node-level
     /// request that was handled here).
@@ -1322,6 +1339,46 @@ impl PfcpClient {
                 if ours {
                     // #721: the per-session releases run off the receive task.
                     track_restart_fanout(self.begin_teardown("association released by peer").await);
+                }
+                true
+            }
+            pfcp_message_type::NODE_REPORT_REQUEST => {
+                // #994, TS 29.244 §6.2.9.3: answer, then "process the information being
+                // reported as appropriate". Only from this association's UPF, like the
+                // Release above; anyone else has no association here (§8.2.1).
+                // Behind the #971 gate, which refuses a stranger's Node Report with
+                // the same cause 72; any address of this UPF (§5.8.1) is its own.
+                let ours = self.is_node_address(from);
+                let decoded = if ours {
+                    crate::up_path::parse_node_report(body)
+                } else {
+                    Err((crate::up_path::cause::NO_ESTABLISHED_PFCP_ASSOCIATION, 0))
+                };
+                let (cause, offending) = match &decoded {
+                    Ok(_) => (crate::up_path::cause::REQUEST_ACCEPTED, None),
+                    Err((cause, 0)) => (*cause, None),
+                    Err((cause, ie)) => (*cause, Some(*ie)),
+                };
+                if cause != crate::up_path::cause::REQUEST_ACCEPTED {
+                    log::warn!(
+                        "PFCP Node Report Request from {from} refused: cause {cause} ({}){}",
+                        cause_name(cause),
+                        offending.map(|ie| format!(", IE {ie}")).unwrap_or_default()
+                    );
+                }
+                let resp = crate::up_path::node_report_response(
+                    header.sequence_number,
+                    &self.node_id,
+                    cause,
+                    offending,
+                );
+                let _ = self.socket.send_to(&resp, from).await;
+                if let Ok(report) = decoded {
+                    crate::up_path::on_node_report(
+                        &self.recovery_time_stamp_key(),
+                        self.session_scope(),
+                        report,
+                    );
                 }
                 true
             }
@@ -1744,7 +1801,7 @@ fn restart_fanouts() -> &'static std::sync::Mutex<Vec<tokio::task::JoinHandle<()
 }
 
 /// Keep `releases` for [`drain_restart_fanouts`], forgetting finished ones.
-fn track_restart_fanout(releases: tokio::task::JoinHandle<()>) {
+pub(crate) fn track_restart_fanout(releases: tokio::task::JoinHandle<()>) {
     let mut fanouts = restart_fanouts().lock().unwrap_or_else(|e| e.into_inner());
     fanouts.retain(|h| !h.is_finished());
     fanouts.push(releases);
@@ -2017,6 +2074,8 @@ pub fn clear_pfcp_sessions_in(scope: &crate::restoration::SessionScope) -> usize
     for seid in &scope.seids {
         forget_session_peer(*seid);
     }
+    // #994: and the GTP-U peers of their FARs.
+    crate::up_path::forget_sessions(scope.seids.iter().copied());
     n
 }
 
