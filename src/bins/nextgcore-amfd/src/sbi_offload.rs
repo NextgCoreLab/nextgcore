@@ -102,7 +102,20 @@ struct Running {
     id: u64,
     handle: JoinHandle<()>,
     state: Arc<std::sync::atomic::AtomicU8>,
-    durable: bool,
+    kind: Kind,
+}
+
+/// How droppable a keyed job is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// Dropped by `supersede_key`, `settle_key` and `cancel_ue`.
+    Normal,
+    /// [`Kind::Normal`], and also dropped by [`SbiOffload::supersede_moot`]: work a
+    /// later exchange for the key makes moot (a DEACTIVATED that a re-activation
+    /// overtakes, #922).
+    Moot,
+    /// Dropped by nothing.
+    Durable,
 }
 
 impl Running {
@@ -129,8 +142,8 @@ impl Running {
 #[derive(Default)]
 struct KeyQueue {
     running: Option<Running>,
-    /// Not yet spawned, in submission order; `true` marks durable work.
-    queued: VecDeque<(Job, bool)>,
+    /// Not yet spawned, in submission order, with how droppable each is.
+    queued: VecDeque<(Job, Kind)>,
 }
 
 /// Spawner of off-task SBI work, owned by the NGAP server.
@@ -202,7 +215,26 @@ impl SbiOffload {
         M: FnOnce() -> F + Send + 'static,
         F: Future<Output = Option<SbiOutcome>> + Send + 'static,
     {
-        self.enqueue(key, Box::new(move || Box::pin(make()) as BoxedWork), false);
+        self.enqueue(
+            key,
+            Box::new(move || Box::pin(make()) as BoxedWork),
+            Kind::Normal,
+        );
+    }
+
+    /// [`SbiOffload::spawn_keyed`] for work a later exchange for the key can make
+    /// moot, so [`SbiOffload::supersede_moot`] drops it while it has not started:
+    /// a user-plane DEACTIVATED, which a re-activation of the session overtakes.
+    pub(crate) fn spawn_keyed_moot<M, F>(&mut self, key: SbiKey, make: M)
+    where
+        M: FnOnce() -> F + Send + 'static,
+        F: Future<Output = Option<SbiOutcome>> + Send + 'static,
+    {
+        self.enqueue(
+            key,
+            Box::new(move || Box::pin(make()) as BoxedWork),
+            Kind::Moot,
+        );
     }
 
     /// [`SbiOffload::spawn_keyed`] for work that must reach the peer whatever
@@ -213,12 +245,16 @@ impl SbiOffload {
         M: FnOnce() -> F + Send + 'static,
         F: Future<Output = Option<SbiOutcome>> + Send + 'static,
     {
-        self.enqueue(key, Box::new(move || Box::pin(make()) as BoxedWork), true);
+        self.enqueue(
+            key,
+            Box::new(move || Box::pin(make()) as BoxedWork),
+            Kind::Durable,
+        );
     }
 
-    fn enqueue(&mut self, key: SbiKey, job: Job, durable: bool) {
+    fn enqueue(&mut self, key: SbiKey, job: Job, kind: Kind) {
         let queue = self.keys.entry(key).or_default();
-        queue.queued.push_back((job, durable));
+        queue.queued.push_back((job, kind));
         if queue.running.is_none() {
             self.start_next(key);
         }
@@ -231,14 +267,34 @@ impl SbiOffload {
         let Some(queue) = self.keys.get_mut(&key) else {
             return;
         };
-        queue.queued.retain(|(_, durable)| *durable);
+        queue.queued.retain(|(_, kind)| *kind == Kind::Durable);
         let cancelled = queue
             .running
             .as_ref()
-            .is_some_and(|r| !r.durable && r.cancel_if_waiting());
+            .is_some_and(|r| r.kind != Kind::Durable && r.cancel_if_waiting());
         if cancelled {
             queue.running = None;
             // Durable work queued behind it goes next.
+            self.start_next(key);
+        } else if queue.running.is_none() && queue.queued.is_empty() {
+            self.keys.remove(&key);
+        }
+    }
+
+    /// Drop only the moot work for `key` ([`SbiOffload::spawn_keyed_moot`]) that has
+    /// not started. Everything else queued for the key (a modification, an N1 relay,
+    /// durable work) stays, in order. A started exchange is left to finish.
+    pub(crate) fn supersede_moot(&mut self, key: SbiKey) {
+        let Some(queue) = self.keys.get_mut(&key) else {
+            return;
+        };
+        queue.queued.retain(|(_, kind)| *kind != Kind::Moot);
+        let cancelled = queue
+            .running
+            .as_ref()
+            .is_some_and(|r| r.kind == Kind::Moot && r.cancel_if_waiting());
+        if cancelled {
+            queue.running = None;
             self.start_next(key);
         } else if queue.running.is_none() && queue.queued.is_empty() {
             self.keys.remove(&key);
@@ -296,9 +352,9 @@ impl SbiOffload {
             let Some(queue) = self.keys.get_mut(&key) else {
                 continue;
             };
-            queue.queued.retain(|(_, durable)| *durable);
+            queue.queued.retain(|(_, kind)| *kind == Kind::Durable);
             let aborted = match queue.running.as_ref() {
-                Some(r) if !r.durable => {
+                Some(r) if r.kind != Kind::Durable => {
                     // Mark it so a task between its permit and its build stops.
                     r.state
                         .store(CANCELLED, std::sync::atomic::Ordering::Release);
@@ -403,7 +459,7 @@ impl SbiOffload {
         let Some(queue) = self.keys.get_mut(&key) else {
             return;
         };
-        let Some((job, durable)) = queue.queued.pop_front() else {
+        let Some((job, kind)) = queue.queued.pop_front() else {
             if queue.running.is_none() {
                 self.keys.remove(&key);
             }
@@ -418,7 +474,7 @@ impl SbiOffload {
                 id,
                 handle,
                 state,
-                durable,
+                kind,
             });
         }
     }
@@ -780,6 +836,31 @@ mod tests {
 
     /// Durable work survives `supersede_key` and `cancel_ue`, and runs in its
     /// place in the key's order.
+    /// #1086 review: a re-activation drops only the moot work queued for the
+    /// session (a DEACTIVATED). A modification or an N1 relay queued for it stays and
+    /// runs, in order.
+    #[tokio::test]
+    async fn superseding_moot_work_keeps_the_rest() {
+        let mut offload = SbiOffload::new(1);
+        let gate = Arc::new(Semaphore::new(0));
+        hold_the_permit(&mut offload, &gate).await;
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        offload.spawn_keyed_moot((1086, 5), recording(&seen, "waiting deactivation"));
+        until(|| offload.waiting_for_a_permit() == 1).await;
+        offload.spawn_keyed((1086, 5), recording(&seen, "modification"));
+        offload.spawn_keyed_moot((1086, 5), recording(&seen, "queued deactivation"));
+        offload.spawn_keyed((1086, 5), recording(&seen, "n1 relay"));
+        offload.supersede_moot((1086, 5));
+        offload.spawn_keyed((1086, 5), recording(&seen, "activation"));
+
+        gate.add_permits(1);
+        offload.settle().await;
+        assert_eq!(
+            seen.lock().expect("seen").clone(),
+            vec!["built modification", "built n1 relay", "built activation"]
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn durable_work_is_never_dropped() {
         let mut offload = SbiOffload::new(1);

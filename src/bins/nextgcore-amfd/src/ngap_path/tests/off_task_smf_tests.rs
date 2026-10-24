@@ -408,3 +408,227 @@ async fn a_deregistration_does_not_wait_for_a_blackholed_smf() {
         "the blackholed release still runs: it is durable"
     );
 }
+
+// ---- #1086 review: the join deadline and the connection-ended guard ----
+
+/// The upCnxStates the slow stand-in SMF saw for `sm_ref`, waiting (up to 5 s)
+/// until there are `n` of them. Off-task outcomes are applied meanwhile, as `poll`
+/// does: that is what starts the next job queued for a key.
+async fn up_cnx_states_of(
+    server: &mut NgapServer,
+    seen: &Arc<std::sync::Mutex<Vec<(String, String, Instant)>>>,
+    sm_ref: &str,
+    n: usize,
+) -> Vec<String> {
+    let states = || -> Vec<String> {
+        seen.lock()
+            .expect("seen")
+            .iter()
+            .filter(|(r, _, _)| r == sm_ref)
+            .map(|(_, s, _)| s.clone())
+            .collect()
+    };
+    for _ in 0..500 {
+        if states().len() >= n {
+            break;
+        }
+        server.process_sbi_outcomes().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    states()
+}
+
+/// Apply outcomes until the only join left waits for just `psi` (up to 3 s).
+async fn until_join_waits_only_for(server: &mut NgapServer, psi: u8) {
+    for _ in 0..300 {
+        server.process_sbi_outcomes().await;
+        if server
+            .smf_joins
+            .values()
+            .all(|j| j.waiting.len() == 1 && j.waiting.contains(&psi))
+            && !server.smf_joins.is_empty()
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the join never narrowed to PSI {psi}");
+}
+
+/// A CM-IDLE UE holding PSI 5 at `fast` and PSI 6 at `slow`, and the protected
+/// Service Request (Initial UE Message) that re-activates both.
+fn idle_ue_with_two_sessions(
+    server: &mut NgapServer,
+    old: u64,
+    new: u64,
+    fast: u16,
+    slow: u16,
+    refs: (&str, &str),
+) -> Vec<u8> {
+    let mut ue = idle_registered_ue(old);
+    ue.amf_ue.allowed_nssai = vec![crate::context::SNssai {
+        sst: SLICE.0,
+        sd: SLICE.1,
+    }];
+    server.ue_auth_state.insert(old, ue);
+    hold_session(server, old, 5, refs.0, fast);
+    hold_session(server, old, 6, refs.1, slow);
+    server.forced_amf_ue_ngap_id = Some(new);
+    let tmsi = old as u32;
+    // Data (1); uplink data status and PDU session status: PSI 5 and 6.
+    let mut inner = vec![0x7E, 0x00, 0x4C, 0x10, 0x00, 0x07, 0xF4, 0x55, 0x6A];
+    inner.extend_from_slice(&tmsi.to_be_bytes());
+    inner.extend_from_slice(&[0x40, 0x02, 0x60, 0x00, 0x50, 0x02, 0x60, 0x00]);
+    let mut nas = protected_service_request([0; 4], tmsi);
+    nas.extend_from_slice(&[0x71, 0x00, inner.len() as u8]);
+    nas.extend_from_slice(&inner);
+    service_request_initial_ue(nas)
+}
+
+/// TS 23.502 §4.2.3.2, CM-IDLE, at the join deadline: PSI 5's SMF answered and
+/// PSI 6's had not. The ICS carries PSI 5 only, and PSI 6's ACTIVATING, which then
+/// succeeds late, is rolled back (DEACTIVATED, after it on its key). Otherwise the
+/// SMF would wait in ACTIVATING for a setup that never comes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_idle_service_requests_unanswered_activation_is_rolled_back_at_the_deadline() {
+    crate::context::amf_context_init(64, 1024, 4096);
+    let _guami = ServeOneGuami::install();
+    let (_fast, fast_port, _calls) = activating_smf().await;
+    let (_slow, slow_port, seen) = slow_up_cnx_smf(Duration::from_millis(800)).await;
+    let mut server = capturing_ngap_server().await;
+    seed_gnb_session(&server, 1).await;
+    let (old, new) = (7_922_311u64, 7_922_312u64);
+    let pdu = idle_ue_with_two_sessions(
+        &mut server,
+        old,
+        new,
+        fast_port,
+        slow_port,
+        ("isr-dl-fast", "isr-dl-slow"),
+    );
+    server
+        .handle_initial_ue_message(1, &pdu)
+        .await
+        .expect("handled");
+    until_join_waits_only_for(&mut server, 6).await;
+
+    joins_due(&mut server);
+    server.process_smf_join_deadlines().await;
+    let ics: Vec<_> = take_sent_ngap(&mut server)
+        .into_iter()
+        .filter(|(_, p)| decode_sent(p) == Sent::Other(Some(14)))
+        .collect();
+    assert_eq!(ics.len(), 1, "the ICS goes at the deadline");
+    assert!(server.up_active.contains(&(new, 5)), "with PSI 5");
+    assert!(!server.up_active.contains(&(new, 6)), "without PSI 6");
+    assert_eq!(
+        up_cnx_states_of(&mut server, &seen, "isr-dl-slow", 2).await,
+        vec!["ACTIVATING", "DEACTIVATED"],
+        "the late ACTIVATING is rolled back"
+    );
+    server.forced_amf_ue_ngap_id = None;
+    server.forget_ue(new);
+}
+
+/// TS 23.502 §4.2.3.2, CM-CONNECTED, at the join deadline: the setup with the
+/// Service Accept carries the answered PSI 5, and PSI 6's late ACTIVATING is
+/// rolled back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connected_service_requests_unanswered_activation_is_rolled_back_at_the_deadline() {
+    let (_fast, fast_port, _calls) = activating_smf().await;
+    let (_slow, slow_port, seen) = slow_up_cnx_smf(Duration::from_millis(800)).await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_922_211u64, 131u32);
+    secured_registered_ue(&mut server, ue, ran);
+    hold_session(&mut server, ue, 5, "csr-dl-fast", fast_port);
+    hold_session(&mut server, ue, 6, "csr-dl-slow", slow_port);
+    let sr = ue_protect(&service_request(Some((1 << 5) | (1 << 6))), 0);
+    server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &sr))
+        .await
+        .expect("handled");
+    until_join_waits_only_for(&mut server, 6).await;
+
+    joins_due(&mut server);
+    server.process_smf_join_deadlines().await;
+    let sent: Vec<(u64, Sent)> = take_sent_ngap(&mut server)
+        .into_iter()
+        .map(|(a, p)| (a, decode_sent(&p)))
+        .collect();
+    let setups: Vec<&Sent> = concerns(&sent, ue)
+        .into_iter()
+        .filter(|s| matches!(s, Sent::SetupRequest { .. }))
+        .collect();
+    let [Sent::SetupRequest { items, nas_pdu, .. }] = setups[..] else {
+        panic!("one setup request at the deadline: {sent:?}");
+    };
+    assert_eq!(items, &vec![setup_item(5, transfer_for("csr-dl-fast"))]);
+    assert_protected_service_accept(nas_pdu.as_deref().expect("the Accept rides it"));
+    assert_eq!(
+        up_cnx_states_of(&mut server, &seen, "csr-dl-slow", 2).await,
+        vec!["ACTIVATING", "DEACTIVATED"],
+        "the late ACTIVATING is rolled back"
+    );
+    server.forget_ue(ue);
+}
+
+/// TS 23.502 §4.2.6 during a CM-IDLE Service Request's join: the gNB releases the
+/// UE's new connection before the SMF answers. When the ACTIVATING's answer
+/// arrives, no Initial Context Setup goes to the released connection, and the
+/// activation is rolled back. The SMF ends DEACTIVATED.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_an_release_during_the_join_sends_no_initial_context_setup() {
+    crate::context::amf_context_init(64, 1024, 4096);
+    let _guami = ServeOneGuami::install();
+    let (_fast, fast_port, _calls) = activating_smf().await;
+    let (_slow, slow_port, seen) = slow_up_cnx_smf(Duration::from_millis(400)).await;
+    let mut server = capturing_ngap_server().await;
+    seed_gnb_session(&server, 1).await;
+    let (old, new) = (7_922_321u64, 7_922_322u64);
+    let pdu = idle_ue_with_two_sessions(
+        &mut server,
+        old,
+        new,
+        fast_port,
+        slow_port,
+        ("isr-an-fast", "isr-an-slow"),
+    );
+    server
+        .handle_initial_ue_message(1, &pdu)
+        .await
+        .expect("handled");
+    // The AN release lands while the join waits.
+    server
+        .handle_ue_context_release_complete(1, &release_complete_pdu(new, Some(512)))
+        .await
+        .expect("handled");
+    assert!(server.ue_auth_state.get(new).expect("ue").is_cm_idle());
+    for _ in 0..300 {
+        server.process_sbi_outcomes().await;
+        if server.smf_joins.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(server.smf_joins.is_empty(), "both answers came in");
+    assert!(
+        !take_sent_ngap(&mut server)
+            .iter()
+            .any(|(_, p)| decode_sent(p) == Sent::Other(Some(14))),
+        "no ICS to the released connection"
+    );
+    assert!(server.up_active.is_empty() || !server.up_active.contains(&(new, 5)));
+    let states = up_cnx_states_of(&mut server, &seen, "isr-an-slow", 3).await;
+    assert_eq!(
+        states.last().map(String::as_str),
+        Some("DEACTIVATED"),
+        "the SMF ends DEACTIVATED: {states:?}"
+    );
+    assert!(
+        states.len() >= 3,
+        "the AN release's DEACTIVATED and the roll-back both follow the ACTIVATING: \
+         {states:?}"
+    );
+    server.forced_amf_ue_ngap_id = None;
+    server.forget_ue(new);
+}

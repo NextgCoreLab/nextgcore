@@ -9967,7 +9967,7 @@ impl NgapServer {
     ) {
         let (host, port) = self.smf_target_for(amf_ue_ngap_id, psi);
         self.sbi_offload
-            .spawn_keyed((amf_ue_ngap_id, psi), move || async move {
+            .spawn_keyed_moot((amf_ue_ngap_id, psi), move || async move {
                 match crate::sbi_path::call_smf_deactivate_up_connection(&host, port, &sm_ref).await
                 {
                     Ok(()) => log::info!(
@@ -9992,10 +9992,10 @@ impl NgapServer {
         if self.sbi_offload.key_busy(key) {
             log::info!(
                 "UE {amf_ue_ngap_id}: PSI {psi} re-activated with SMF work pending for it; \
-                 queued work is dropped (durable work still runs) and running work is \
-                 answered before the ACTIVATING goes out"
+                 a queued DEACTIVATED is dropped as moot, other queued work stays, and \
+                 running work is answered before the ACTIVATING goes out"
             );
-            self.sbi_offload.supersede_key(key);
+            self.sbi_offload.supersede_moot(key);
         }
         let (host, port) = self.smf_target_for(amf_ue_ngap_id, psi);
         self.sbi_offload.spawn_keyed(key, move || async move {
@@ -11262,7 +11262,7 @@ impl NgapServer {
                 // non-durable work is dropped: a queued handover CANCELLED or COMPLETED
                 // for the session is durable and still runs first (#978 review, m6).
                 self.sbi_offload.supersede_key(key);
-                self.sbi_offload.spawn_keyed(key, move || async move {
+                self.sbi_offload.spawn_keyed_moot(key, move || async move {
                     match crate::sbi_path::call_smf_deactivate_up_connection(&host, port, &sm_ref)
                         .await
                     {
@@ -11330,7 +11330,7 @@ impl NgapServer {
         for (psi, sm_ref) in refs {
             let (smf_host, smf_port) = self.smf_target_for(amf_ue_ngap_id, psi);
             self.sbi_offload
-                .spawn_keyed((amf_ue_ngap_id, psi), move || async move {
+                .spawn_keyed_moot((amf_ue_ngap_id, psi), move || async move {
                     match crate::sbi_path::call_smf_deactivate_up_connection(
                         &smf_host, smf_port, &sm_ref,
                     )
