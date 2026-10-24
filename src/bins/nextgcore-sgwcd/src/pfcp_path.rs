@@ -350,10 +350,8 @@ impl SxaNode {
     pub async fn open(bind: SocketAddr, local_ip: Ipv4Addr) -> std::io::Result<Arc<Self>> {
         let socket = UdpSocket::bind(bind).await?;
         let bound = socket.local_addr()?;
-        let recovery_time_stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as u32)
-            .unwrap_or(1);
+        // #995: NTP-era seconds (TS 29.244 §8.2.65), not Unix seconds.
+        let recovery_time_stamp = nextgcore_pfcp::recovery_time::now();
         let node = Arc::new(Self {
             socket: Arc::new(socket),
             local_ip,
@@ -532,7 +530,10 @@ impl SxaNode {
         let peer_record = SxaPeer {
             addr: peer,
             state: PfcpNodeState::Associated,
-            recovery_time_stamp: Some(rsp.recovery_time_stamp),
+            // #995: kept in the NTP reading (a pre-#995 SGW-U sends Unix seconds).
+            recovery_time_stamp: Some(nextgcore_pfcp::recovery_time::normalize_received(
+                rsp.recovery_time_stamp,
+            )),
             up_function_features: UpFunctionFeatures {
                 ftup: features.map(|f| f.ftup).unwrap_or(false),
                 empu: features.map(|f| f.empu).unwrap_or(false),
@@ -1245,6 +1246,17 @@ mod tests {
         let mut node = PfcpNode::new(1, "127.0.0.1", 8805);
         node.state = PfcpNodeState::Associated;
         assert!(node.is_associated());
+    }
+
+    /// #995: the SGW-C's Recovery Time Stamp is NTP-era seconds (TS 29.244 §8.2.65).
+    #[tokio::test]
+    async fn the_sgwc_recovery_time_stamp_is_ntp_seconds() {
+        let _guard = process_state_test_guard().await;
+        let node = SxaNode::open("127.0.0.1:0".parse().unwrap(), Ipv4Addr::LOCALHOST)
+            .await
+            .unwrap();
+        let now = nextgcore_pfcp::recovery_time::now();
+        assert!(now.wrapping_sub(node.recovery_time_stamp) < 60);
     }
 
     /// #54: `pfcp_open` binds a real socket. It used to log "In actual implementation:
