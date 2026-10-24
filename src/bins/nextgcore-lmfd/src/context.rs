@@ -2453,6 +2453,14 @@ pub fn lmf_context_init(max_measurements: usize) {
         // `site_config::load_into_context` fills the registry.
         #[cfg(test)]
         {
+            // It empties process state other tests read, so a test that calls it
+            // must hold PROCESS_STATE_TEST_LOCK. One that did not (the OAuth2
+            // tests' `start_server`) emptied the registry under a running test
+            // and made it flake in CI. `try_lock` succeeding means nobody holds it.
+            assert!(
+                PROCESS_STATE_TEST_LOCK.try_lock().is_err(),
+                "lmf_context_init in a test that does not hold PROCESS_STATE_TEST_LOCK"
+            );
             context.clear_cell_registry_for_test();
             // #807: the NG-RAN nodes and their TRPs are process state too.
             context.set_ng_ran_nodes(Vec::new());
