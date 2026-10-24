@@ -386,21 +386,31 @@ impl Drop for S6aTestTw {
     }
 }
 
-/// Whether an S6a session to the HSS has been up before in this process: a
-/// later one is a re-established connection, whose watchdog starts in RFC 3539
-/// §3.4.1 REOPEN (#729 review M1).
+/// Whether an S6a session to the HSS has been up since the last orderly start:
+/// a later one is a connection re-established after a failure, whose watchdog
+/// starts in RFC 3539 §3.4.1 REOPEN (#729 review M1). Process-global because the
+/// supervisor redials through the same path as the first connect; cleared by
+/// [`mme_fd_final_async`], since a connection after an orderly close follows no
+/// failure. Tests that start sessions hold [`S6A_TEST_LOCK`], and every session
+/// after the first in the process starts in REOPEN (#816 review m-g).
 static S6A_WAS_CONNECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The watchdog start for the next S6a session, recording that one is up.
+fn next_watchdog_start() -> nextgcore_diameter::session::WatchdogStart {
+    use nextgcore_diameter::session::WatchdogStart;
+    if S6A_WAS_CONNECTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        WatchdogStart::Reopen
+    } else {
+        WatchdogStart::Okay
+    }
+}
 
 /// Start the S6a session on a connected client, with the watchdog (#729).
 fn start_s6a_session(
     client: DiameterClient,
 ) -> nextgcore_diameter::error::DiameterResult<(DiameterSession, tokio::task::JoinHandle<()>)> {
-    use nextgcore_diameter::session::{SessionOptions, WatchdogStart};
-    let start = if S6A_WAS_CONNECTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        WatchdogStart::Reopen
-    } else {
-        WatchdogStart::Okay
-    };
+    use nextgcore_diameter::session::SessionOptions;
+    let start = next_watchdog_start();
     #[cfg_attr(not(test), allow(unused_mut))]
     let mut options = SessionOptions::from_config(client.config(), start);
     #[cfg(test)]
@@ -620,6 +630,8 @@ pub async fn mme_fd_final_async() {
             handle.abort();
         }
     }
+    // An orderly close: the next connection starts in OKAY, not REOPEN.
+    S6A_WAS_CONNECTED.store(false, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// True when the ULR did not set Skip-Subscriber-Data, i.e. the ULA is
@@ -1636,6 +1648,20 @@ mod tests {
         // Sync init should succeed (deferred connect)
         let result = mme_fd_init();
         assert!(result.is_ok());
+    }
+
+    /// #816 review m-g: every S6a session after the first starts in REOPEN, until an
+    /// orderly close (`mme_fd_final_async`) clears the record; the next one is a fresh
+    /// start in OKAY.
+    #[tokio::test]
+    async fn an_orderly_close_clears_the_reopen_record() {
+        use nextgcore_diameter::session::WatchdogStart;
+        let _s6a = S6A_TEST_LOCK.lock().await;
+        let _ = next_watchdog_start();
+        assert_eq!(next_watchdog_start(), WatchdogStart::Reopen);
+        mme_fd_final_async().await;
+        assert_eq!(next_watchdog_start(), WatchdogStart::Okay);
+        assert_eq!(next_watchdog_start(), WatchdogStart::Reopen);
     }
 
     #[tokio::test]

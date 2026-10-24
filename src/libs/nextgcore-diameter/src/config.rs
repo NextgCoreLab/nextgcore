@@ -44,9 +44,9 @@ pub struct DiameterConfig {
     /// A connection re-established after a failure starts in REOPEN and
     /// carries application traffic only after three watchdog answers. Every
     /// write is bounded by Tw and the socket's TCP_USER_TIMEOUT is 2 x Tw, so a
-    /// peer that stops reading cannot hold a write either. Keep Tw below three
-    /// times a server peer's Tc if that peer drops idle connections after 3 x Tc
-    /// (hssd does).
+    /// peer that stops reading cannot hold a write either. Against a server
+    /// peer that drops idle connections after 3 x Tc (e.g. one built on
+    /// `DiameterServer`), keep Tw below that; hssd drops none.
     pub timer_tw: u32,
 
     /// Applications this node advertises in CER/CEA, and the vendors whose AVPs
