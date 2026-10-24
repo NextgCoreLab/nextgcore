@@ -808,9 +808,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
-        let _env = crate::test_support::SMF_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _env = crate::test_support::SMF_ENV_LOCK.blocking_lock();
         // The release helper only reaches the context when an SMF resolves.
         std::env::set_var("SMF_SBI_ADDR", "127.0.0.1");
         std::env::set_var("SMF_SBI_PORT", "9");
