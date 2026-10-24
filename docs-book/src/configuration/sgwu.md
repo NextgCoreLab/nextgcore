@@ -47,6 +47,8 @@ A missing or malformed file logs a warning and leaves the defaults.
 
 A non-IPv4 address is logged and ignored. Not read: `logger.file`, `global.max.*`.
 
+> **Clock:** this NF refuses to start when the local clock reads before 2020-01-01, because its PFCP Recovery Time Stamp would be wrong. See [A set clock is required](overview.md#a-set-clock-is-required-pfcp-nfs) for the remedy on RTC-less hosts.
+
 ## Command-line flags
 
 | Flag | Default | Description |
