@@ -6450,6 +6450,7 @@ async fn run_gsm_timer_tick() {
                     &entry.supi,
                     entry.psi,
                     &entry.command,
+                    &sm_context_ref,
                 )
                 .await;
             }
@@ -6571,7 +6572,7 @@ async fn trigger_network_initiated_service_request(seid: u64, qfi: Option<u8>) {
         return;
     };
 
-    send_n1_n2_paging_request(&amf_uri, &supi, psi, qfi).await;
+    send_n1_n2_paging_request(&amf_uri, &supi, psi, qfi, &sm_context_ref).await;
 }
 
 /// Ask the AMF to page an idle UE for buffered downlink data (#78,
@@ -6581,7 +6582,16 @@ async fn trigger_network_initiated_service_request(seid: u64, qfi: Option<u8>) {
 /// point is to re-establish the user plane, not to deliver a NAS message. `skipInd`
 /// is deliberately absent: the AMF must NOT skip paging, which is the entire
 /// purpose of the request.
-async fn send_n1_n2_paging_request(amf_uri: &str, supi: &str, psi: u8, qfi: Option<u8>) {
+///
+/// `sm_context_ref` is the session the transfer is for: a retry after a 409 is
+/// sent only while that session still exists.
+async fn send_n1_n2_paging_request(
+    amf_uri: &str,
+    supi: &str,
+    psi: u8,
+    qfi: Option<u8>,
+    sm_context_ref: &str,
+) {
     use nextgcore_sbi::constants::content_type;
     use nextgcore_sbi::message::SbiRequest as SReq;
 
@@ -6613,7 +6623,7 @@ async fn send_n1_n2_paging_request(amf_uri: &str, supi: &str, psi: u8, qfi: Opti
     let config = nextgcore_sbi::security::sbi_peer_client_config(&host, port)
         .with_connect_timeout(std::time::Duration::from_secs(2))
         .with_request_timeout(std::time::Duration::from_secs(3));
-    match send_n1n2_honouring_paging_conflict(config, request).await {
+    match send_n1n2_honouring_paging_conflict(config, request, sm_context_ref.to_string()).await {
         Ok(resp) => log::info!(
             "N1N2MessageTransfer (paging, SUPI {supi}, PSI {psi}, QFI {qfi:?}) → \
              {host}:{port}: status={}",
@@ -6626,10 +6636,15 @@ async fn send_n1_n2_paging_request(amf_uri: &str, supi: &str, psi: u8, qfi: Opti
 /// How many times an N1N2MessageTransfer refused with 409
 /// `HIGHER_PRIORITY_REQUEST_ONGOING` is retried (#749).
 const N1N2_PAGING_CONFLICT_RETRIES: u32 = 5;
-/// The `retryAfter` assumed when the AMF's 409 names none, and the cap on one it
-/// names (seconds).
+/// The `retryAfter` assumed when the AMF's 409 names none (seconds).
 const N1N2_RETRY_AFTER_DEFAULT_S: u64 = 2;
-const N1N2_RETRY_AFTER_MAX_S: u64 = 10;
+/// The longest `retryAfter` the SMF waits out (seconds). TS 29.518 §5.2.2.3.1 has
+/// the consumer wait the full value ("shall not initiate the downlink messaging
+/// until the timer expires"), so a shorter wait is never substituted (#1079 review
+/// m2). It names no ceiling, though, and a transfer held longer than this is stale:
+/// the UE's paging (T3513) and the 5GSM procedure's own timers have run out. So a
+/// longer value is not waited out: the transfer is given up, and logged.
+const N1N2_RETRY_AFTER_MAX_S: u64 = 60;
 
 /// The `retryAfter` of an N1N2MessageTransfer 409 `HIGHER_PRIORITY_REQUEST_ONGOING`
 /// (TS 29.518 §5.2.2.3.1, `N1N2MessageTransferError.errInfo`), or `None` when the
@@ -6647,8 +6662,7 @@ fn n1n2_paging_conflict_retry_after(
         let secs = body
             .pointer("/errInfo/retryAfter")
             .and_then(|v| v.as_u64())
-            .unwrap_or(N1N2_RETRY_AFTER_DEFAULT_S)
-            .min(N1N2_RETRY_AFTER_MAX_S);
+            .unwrap_or(N1N2_RETRY_AFTER_DEFAULT_S);
         std::time::Duration::from_secs(secs)
     })
 }
@@ -6668,40 +6682,92 @@ fn n1n2_paging_conflict_retry_after(
 async fn send_n1n2_honouring_paging_conflict(
     config: nextgcore_sbi::client::SbiClientConfig,
     request: nextgcore_sbi::message::SbiRequest,
+    sm_context_ref: String,
 ) -> nextgcore_sbi::SbiResult<nextgcore_sbi::message::SbiResponse> {
     let resp = nextgcore_sbi::client::SbiClient::new(config.clone())
         .send_request(request.clone())
         .await?;
     if let Some(wait) = n1n2_paging_conflict_retry_after(&resp) {
-        tokio::spawn(async move {
-            let client = nextgcore_sbi::client::SbiClient::new(config);
-            let mut wait = wait;
-            for attempt in 1..=N1N2_PAGING_CONFLICT_RETRIES {
-                log::info!(
-                    "N1N2MessageTransfer refused, the AMF is paging the UE for another \
-                     transfer; retrying in {wait:?} ({attempt}/{N1N2_PAGING_CONFLICT_RETRIES})"
-                );
-                tokio::time::sleep(wait).await;
-                match client.send_request(request.clone()).await {
-                    Ok(resp) => match n1n2_paging_conflict_retry_after(&resp) {
-                        Some(next) => wait = next,
-                        None => {
-                            log::info!("N1N2MessageTransfer retried: status={}", resp.status);
-                            return;
-                        }
-                    },
-                    Err(e) => {
-                        log::warn!("N1N2MessageTransfer retry failed: {e}");
-                        return;
-                    }
-                }
-            }
-            log::warn!(
-                "N1N2MessageTransfer still refused after {N1N2_PAGING_CONFLICT_RETRIES} retries"
-            );
-        });
+        tokio::spawn(retry_n1n2_after_paging_conflict(
+            config,
+            request,
+            sm_context_ref,
+            wait,
+        ));
     }
     Ok(resp)
+}
+
+/// How a refused N1N2MessageTransfer's retries ended (#749), for the log and the
+/// tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum N1n2RetryEnd {
+    /// The AMF took it (any answer but the 409), with this status.
+    Sent(u16),
+    /// The session was released before the resend (#1079 review m1).
+    SessionGone,
+    /// The AMF asked for a longer wait than [`N1N2_RETRY_AFTER_MAX_S`] (m2).
+    WaitTooLong(std::time::Duration),
+    /// Still refused after [`N1N2_PAGING_CONFLICT_RETRIES`] retries.
+    Exhausted,
+    /// A resend failed in transport.
+    Failed,
+}
+
+/// Resend a transfer the AMF refused with 409 `HIGHER_PRIORITY_REQUEST_ONGOING`
+/// after each `retryAfter` it names, in full (TS 29.518 §5.2.2.3.1), a bounded
+/// number of times. Each resend first checks that the session `sm_context_ref`
+/// still exists: a released session's transfer is moot, and resending it would
+/// page the UE for nothing (#1079 review m1).
+async fn retry_n1n2_after_paging_conflict(
+    config: nextgcore_sbi::client::SbiClientConfig,
+    request: nextgcore_sbi::message::SbiRequest,
+    sm_context_ref: String,
+    first_wait: std::time::Duration,
+) -> N1n2RetryEnd {
+    let client = nextgcore_sbi::client::SbiClient::new(config);
+    let mut wait = first_wait;
+    for attempt in 1..=N1N2_PAGING_CONFLICT_RETRIES {
+        if wait > std::time::Duration::from_secs(N1N2_RETRY_AFTER_MAX_S) {
+            log::warn!(
+                "N1N2MessageTransfer for ref={sm_context_ref} refused with a retryAfter of \
+                 {wait:?}, past the {N1N2_RETRY_AFTER_MAX_S} s the SMF holds a transfer; \
+                 given up"
+            );
+            return N1n2RetryEnd::WaitTooLong(wait);
+        }
+        log::info!(
+            "N1N2MessageTransfer refused, the AMF is paging the UE for another transfer; \
+             retrying in {wait:?} ({attempt}/{N1N2_PAGING_CONFLICT_RETRIES})"
+        );
+        tokio::time::sleep(wait).await;
+        let held = smf_self()
+            .read()
+            .ok()
+            .is_some_and(|c| c.sess_find_by_sm_context_ref(&sm_context_ref).is_some());
+        if !held {
+            log::info!(
+                "N1N2MessageTransfer for ref={sm_context_ref} not resent: the session was \
+                 released meanwhile"
+            );
+            return N1n2RetryEnd::SessionGone;
+        }
+        match client.send_request(request.clone()).await {
+            Ok(resp) => match n1n2_paging_conflict_retry_after(&resp) {
+                Some(next) => wait = next,
+                None => {
+                    log::info!("N1N2MessageTransfer retried: status={}", resp.status);
+                    return N1n2RetryEnd::Sent(resp.status);
+                }
+            },
+            Err(e) => {
+                log::warn!("N1N2MessageTransfer retry failed: {e}");
+                return N1n2RetryEnd::Failed;
+            }
+        }
+    }
+    log::warn!("N1N2MessageTransfer still refused after {N1N2_PAGING_CONFLICT_RETRIES} retries");
+    N1n2RetryEnd::Exhausted
 }
 
 /// The N4 receive/dispatch loop over the one PFCP socket.
@@ -6987,7 +7053,13 @@ async fn drain_s5s8_requests(server: Option<&gtp_path::S5S8Server>) {
 /// context create — the SMF has no other address for it, and an AMF that supplied
 /// no callback URI cannot be reached, so the transfer is skipped with a warning
 /// rather than guessed at.
-async fn send_n1_n2_message_transfer(amf_uri: Option<&str>, supi: &str, psi: u8, n1: &[u8]) {
+async fn send_n1_n2_message_transfer(
+    amf_uri: Option<&str>,
+    supi: &str,
+    psi: u8,
+    n1: &[u8],
+    sm_context_ref: &str,
+) {
     use nextgcore_sbi::constants::content_type;
     use nextgcore_sbi::message::{SbiPart, SbiRequest as SReq};
 
@@ -7021,7 +7093,7 @@ async fn send_n1_n2_message_transfer(amf_uri: Option<&str>, supi: &str, psi: u8,
     let config = nextgcore_sbi::security::sbi_peer_client_config(&host, port)
         .with_connect_timeout(std::time::Duration::from_secs(2))
         .with_request_timeout(std::time::Duration::from_secs(3));
-    match send_n1n2_honouring_paging_conflict(config, request).await {
+    match send_n1n2_honouring_paging_conflict(config, request, sm_context_ref.to_string()).await {
         Ok(resp) => log::info!(
             "N1N2MessageTransfer (SUPI {supi}, PSI {psi}, {} bytes) → {host}:{port}: status={}",
             n1.len(),
@@ -11296,9 +11368,11 @@ mod tests {
             "error": { "cause": "HIGHER_PRIORITY_REQUEST_ONGOING" },
             "errInfo": { "retryAfter": 3600 },
         });
+        // #1079 review m2: the value is taken in full, never capped to a shorter
+        // wait; whether it is waited out is the retry loop's decision.
         assert_eq!(
             n1n2_paging_conflict_retry_after(&refusal(409, huge)),
-            Some(std::time::Duration::from_secs(N1N2_RETRY_AFTER_MAX_S))
+            Some(std::time::Duration::from_secs(3600))
         );
         let other = serde_json::json!({
             "error": { "cause": "TEMPORARY_REJECT_HANDOVER_ONGOING" },
@@ -11316,6 +11390,7 @@ mod tests {
     #[tokio::test]
     async fn a_paging_request_refused_while_the_amf_pages_is_retried() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let sm_ref = held_session_for_retry("imsi-001010007490031", 1);
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -11351,6 +11426,7 @@ mod tests {
             "imsi-001010007490031",
             1,
             None,
+            &sm_ref,
         )
         .await;
         // #1079 review: the caller (the N4 loop) is not held for the retry.
@@ -11367,6 +11443,148 @@ mod tests {
             2,
             "refused once, sent again off the caller's task"
         );
+        drop_session_for_retry(&sm_ref);
+    }
+
+    /// A session held at the SMF for the #749 retry tests; returns its SM context ref.
+    fn held_session_for_retry(supi: &str, psi: u8) -> String {
+        smf_context_init(64, 256, 512);
+        let ctx = smf_self();
+        let context = ctx.read().expect("context");
+        let ue = context.ue_add_by_supi(supi).expect("ue");
+        context
+            .sess_add_by_psi(ue.id, psi)
+            .and_then(|s| s.sm_context_ref)
+            .expect("session")
+    }
+
+    fn drop_session_for_retry(sm_ref: &str) {
+        let ctx = smf_self();
+        let context = ctx.read().expect("context");
+        if let Some(sess) = context.sess_find_by_sm_context_ref(sm_ref) {
+            context.sess_remove(sess.id);
+            // The UE goes too: the context holds a bounded number of UEs, which
+            // other tests share.
+            context.ue_remove(sess.smf_ue_id);
+        }
+    }
+
+    /// A stand-in AMF that refuses every N1N2MessageTransfer with 409
+    /// `HIGHER_PRIORITY_REQUEST_ONGOING` and `retryAfter` = `retry_after` s, counting
+    /// the requests.
+    async fn always_paging_amf(
+        retry_after: u64,
+    ) -> (
+        nextgcore_sbi::server::SbiServer,
+        u16,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&seen);
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        server
+            .start(move |_req: SbiRequest| {
+                let seen = Arc::clone(&counter);
+                async move {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    SbiResponse::with_status(409)
+                        .with_json_body(&serde_json::json!({
+                            "error": { "status": 409, "cause": "HIGHER_PRIORITY_REQUEST_ONGOING" },
+                            "errInfo": { "retryAfter": retry_after },
+                        }))
+                        .unwrap()
+                }
+            })
+            .await
+            .expect("stand-in AMF starts");
+        (server, addr.port(), seen)
+    }
+
+    fn n1n2_request_to(port: u16) -> (nextgcore_sbi::client::SbiClientConfig, SbiRequest) {
+        let config = nextgcore_sbi::security::sbi_peer_client_config("127.0.0.1", port)
+            .with_connect_timeout(std::time::Duration::from_secs(2))
+            .with_request_timeout(std::time::Duration::from_secs(3));
+        let request =
+            SbiRequest::post("/namf-comm/v1/ue-contexts/imsi-001010007490041/n1-n2-messages")
+                .with_body("{}".to_string(), "application/json");
+        (config, request)
+    }
+
+    /// #1079 review m1: a refused transfer is not resent once its session is
+    /// released. The retry re-checks the session before each resend.
+    #[tokio::test]
+    async fn a_refused_transfer_is_not_resent_after_its_session_is_released() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let sm_ref = held_session_for_retry("imsi-001010007490041", 1);
+        let (_amf, port, seen) = always_paging_amf(1).await;
+        let (config, request) = n1n2_request_to(port);
+        let retry = tokio::spawn(retry_n1n2_after_paging_conflict(
+            config,
+            request,
+            sm_ref.clone(),
+            std::time::Duration::from_secs(1),
+        ));
+        drop_session_for_retry(&sm_ref);
+        let end = tokio::time::timeout(std::time::Duration::from_secs(3), retry)
+            .await
+            .expect("the retry ends")
+            .expect("joined");
+        assert_eq!(end, N1n2RetryEnd::SessionGone);
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "nothing is resent for a released session"
+        );
+    }
+
+    /// #1079 review m2: a `retryAfter` past [`N1N2_RETRY_AFTER_MAX_S`] is not
+    /// shortened into an early resend (TS 29.518 §5.2.2.3.1): the transfer is given
+    /// up at once, and nothing is resent. One within it is waited out in full.
+    #[tokio::test]
+    async fn a_retry_after_past_the_maximum_is_given_up_not_shortened() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let sm_ref = held_session_for_retry("imsi-001010007490051", 1);
+        let (_amf, port, seen) = always_paging_amf(N1N2_RETRY_AFTER_MAX_S + 1).await;
+        let (config, request) = n1n2_request_to(port);
+        let end = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            retry_n1n2_after_paging_conflict(
+                config.clone(),
+                request.clone(),
+                sm_ref.clone(),
+                std::time::Duration::from_secs(N1N2_RETRY_AFTER_MAX_S + 1),
+            ),
+        )
+        .await
+        .expect("given up at once, not waited out or shortened");
+        assert_eq!(
+            end,
+            N1n2RetryEnd::WaitTooLong(std::time::Duration::from_secs(N1N2_RETRY_AFTER_MAX_S + 1))
+        );
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // Within the maximum: the resend comes only after the full retryAfter, and
+        // the AMF's next 409 (past the maximum) ends it.
+        let started = std::time::Instant::now();
+        let end = retry_n1n2_after_paging_conflict(
+            config,
+            request,
+            sm_ref.clone(),
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+        assert!(started.elapsed() >= std::time::Duration::from_secs(2));
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            end,
+            N1n2RetryEnd::WaitTooLong(std::time::Duration::from_secs(N1N2_RETRY_AFTER_MAX_S + 1))
+        );
+        drop_session_for_retry(&sm_ref);
     }
 
     #[tokio::test]

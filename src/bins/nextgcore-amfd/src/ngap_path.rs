@@ -2162,7 +2162,7 @@ impl NgapServer {
 
         // Process request and build response with locks held, then release before sending.
         // `accepted` names the Global RAN Node ID of an accepted setup (#1039).
-        let mut accepted: Option<(crate::context::PlmnId, u32)> = None;
+        let mut accepted: Option<(crate::context::PlmnId, u32, u8)> = None;
         let response_data: Option<Vec<u8>> = {
             let mut sessions = self.sessions.write().await;
             if let Some(session) = sessions.get_mut(&association_id) {
@@ -2183,7 +2183,11 @@ impl NgapServer {
                             session.gnb.gnb_id,
                             association_id
                         );
-                        accepted = Some((session.gnb.plmn_id.clone(), session.gnb.gnb_id));
+                        accepted = Some((
+                            session.gnb.plmn_id.clone(),
+                            session.gnb.gnb_id,
+                            session.gnb.gnb_id_len,
+                        ));
 
                         // Build NG Setup Response with proper ASN.1 APER encoding,
                         // reporting any "notify" IEs it ignored (§10.3.4.2).
@@ -2230,14 +2234,18 @@ impl NgapServer {
         // other association the same Global RAN Node ID still holds (the gNB restarted
         // and came back on a new one). Done before the response, so nothing the gNB sends
         // after it can name a connection of its previous incarnation.
-        if let Some((plmn, gnb_id)) = accepted {
+        if let Some((plmn, gnb_id, gnb_id_len)) = accepted {
+            // The whole Global RAN Node ID: PLMN, gNB ID and its length (§9.3.1.6).
             let stale: Vec<u64> = self
                 .sessions
                 .read()
                 .await
                 .iter()
                 .filter(|(assoc, s)| {
-                    **assoc != association_id && s.gnb.gnb_id == gnb_id && s.gnb.plmn_id == plmn
+                    **assoc != association_id
+                        && s.gnb.gnb_id == gnb_id
+                        && s.gnb.gnb_id_len == gnb_id_len
+                        && s.gnb.plmn_id == plmn
                 })
                 .map(|(assoc, _)| *assoc)
                 .collect();
@@ -2249,6 +2257,21 @@ impl NgapServer {
                     "NG Setup of the same gNB on another association",
                 )
                 .await;
+                // #1048 review m1: the new setup REPLACES the old association's
+                // application-level configuration (§8.7.1.1: the procedure "erases any
+                // existing application level configuration data ... replaces it by the
+                // one received"). Two live associations under one Global RAN Node ID
+                // would leave every lookup by it (paging, handover target, RAN
+                // configuration) picking either one. So the old one stops being a
+                // set-up NG-RAN node here: its UEs are released above, and it is
+                // forgotten. Anything it still sends finds no NG Setup.
+                log::error!(
+                    "NG Setup on association {association_id} reuses the Global RAN Node \
+                     ID (gNB {gnb_id:#x}/{gnb_id_len} bits) still held by association {old}; \
+                     the new association replaces it and association {old} is dropped \
+                     (TS 38.413 §8.7.1.1)"
+                );
+                self.sessions.write().await.remove(&old);
             }
         }
 
@@ -27897,9 +27920,11 @@ mod tests {
     /// UE contexts across a setup): a REPEATED setup on an association releases the UEs
     /// it carries, and a setup of the same Global RAN Node ID on a NEW association (the
     /// gNB came back on another one) releases the UEs the old association still holds.
-    /// The first setup on a fresh association finds nothing to release.
+    /// The first setup on a fresh association finds nothing to release. The new
+    /// association then replaces the old one (#1048 review m1).
     ///
-    /// REVERT-VERIFIED: without the NG Setup reset both UEs stay CM-CONNECTED.
+    /// REVERT-VERIFIED: without the NG Setup reset both UEs stay CM-CONNECTED; without
+    /// the replacement both associations stay set up under one Global RAN Node ID.
     // Holding CONTEXT_GUARD across the awaits serialises this test against every other
     // global-context test (the NG Setup Response needs the PLMN support list).
     #[allow(clippy::await_holding_lock)]
@@ -27966,6 +27991,23 @@ mod tests {
             "setup1039-b",
             "the same gNB on a new association",
         );
+        // #1048 review m1: the new association replaces the old one, so the Global RAN
+        // Node ID names one association only.
+        let sessions = server.sessions.read().await;
+        assert!(
+            !sessions.contains_key(&first),
+            "the old association is dropped"
+        );
+        assert_eq!(
+            sessions
+                .values()
+                .filter(|s| s.gnb.gnb_id == sessions[&second].gnb.gnb_id
+                    && s.gnb.plmn_id == sessions[&second].gnb.plmn_id)
+                .count(),
+            1,
+            "one association per Global RAN Node ID"
+        );
+        drop(sessions);
         take_sent_ngap(&mut server);
         for id in [ue_a, ue_b] {
             server.forget_ue(id);
