@@ -2948,6 +2948,90 @@ pub(crate) fn build_n2_info_notify_request(
         )))
 }
 
+/// Build the NonUeN2InfoNotify for an uplink non-UE-associated NRPPa PDU (#807,
+/// TS 29.518 §5.2.2.4.4.2): the `N2InformationNotification` of
+/// [`build_n2_info_notify_request`], without an `lcsCorrelationId` (the PDU belongs
+/// to no UE) and with `ranNodeId`, the node that answered. An LMF that measured
+/// several nodes needs it to tell their answers apart.
+pub fn build_non_ue_nrppa_info_notify_request(
+    path: &str,
+    n2_notify_subscription_id: &str,
+    nf_id: Option<&str>,
+    ran_node_id: Option<&Value>,
+    nrppa_pdu: &[u8],
+) -> Result<SbiRequest, serde_json::Error> {
+    let mut notification = json!({
+        "n2NotifySubscriptionId": n2_notify_subscription_id,
+        "n2InfoContainer": {
+            "n2InformationClass": "NRPPa",
+            "nrppaInfo": {
+                "nrppaPdu": {
+                    "ngapIeType": "NRPPA_PDU",
+                    "ngapData": { "contentId": N2_INFO_NOTIFY_NRPPA_CONTENT_ID },
+                },
+            },
+        },
+    });
+    if let Some(nf_id) = nf_id {
+        notification["n2InfoContainer"]["nrppaInfo"]["nfId"] = json!(nf_id);
+    }
+    if let Some(node) = ran_node_id {
+        notification["ranNodeId"] = node.clone();
+    }
+    Ok(SbiRequest::post(path)
+        .with_json_body(&notification)?
+        .with_part(SbiPart::with_content(
+            N2_INFO_NOTIFY_NRPPA_CONTENT_ID,
+            nextgcore_sbi::constants::content_type::APPLICATION_NGAP,
+            bytes::Bytes::copy_from_slice(nrppa_pdu),
+        )))
+}
+
+/// POST a non-UE NRPPa NonUeN2InfoNotify (#807). Fire-and-forget, like
+/// [`send_n2_info_notify`].
+pub fn send_non_ue_nrppa_info_notify(
+    callback_uri: String,
+    n2_notify_subscription_id: String,
+    nf_id: Option<String>,
+    ran_node_id: Option<Value>,
+    nrppa_pdu: Vec<u8>,
+) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        log::debug!("NonUeN2InfoNotify (NRPPa) skipped (no tokio runtime)");
+        return;
+    };
+    handle.spawn(async move {
+        let Some((host, port, path)) = parse_http_uri(&callback_uri) else {
+            log::warn!("Invalid n2NotifyCallbackUri: {callback_uri}");
+            return;
+        };
+        let request = match build_non_ue_nrppa_info_notify_request(
+            &path,
+            &n2_notify_subscription_id,
+            nf_id.as_deref(),
+            ran_node_id.as_ref(),
+            &nrppa_pdu,
+        ) {
+            Ok(req) => req,
+            Err(e) => {
+                log::warn!("NonUeN2InfoNotify (NRPPa) body build failed: {e}");
+                return;
+            }
+        };
+        match notify_client(&host, port).send_request(request).await {
+            Ok(resp) if resp.is_success() => log::info!(
+                "NonUeN2InfoNotify (NRPPa) delivered to {callback_uri} \
+                 (sub={n2_notify_subscription_id})"
+            ),
+            Ok(resp) => log::warn!(
+                "NonUeN2InfoNotify (NRPPa) to {callback_uri} returned {}",
+                resp.status
+            ),
+            Err(e) => log::warn!("NonUeN2InfoNotify (NRPPa) to {callback_uri} failed: {e}"),
+        }
+    });
+}
+
 /// POST an N2InfoNotify to the LMF's registered `n2NotifyCallbackUri`
 /// (TS 29.518 §5.2.2.3.3) relaying an uplink NRPPa PDU (TS 38.413 §8.15.3 /
 /// §8.15.5). Fire-and-forget on a background task with bounded timeouts,
@@ -5690,18 +5774,22 @@ fn handle_non_ue_n2_info_subscribe(request: &SbiRequest) -> SbiResponse {
         return mandatory_ie_incorrect("n2NotifyCallbackUri", "not a valid HTTP URI");
     }
 
-    // Only the PWS classes are served. The other `N2InformationClass` values
-    // (`SM`, `NRPPa`, `RAN`, `V2X`, `PROSE`, `TSS`, `RSPP`, `A2X`) each need their
-    // own producer; `NRPPa` in particular is already served by the per-UE
-    // `n1-n2-messages/subscriptions` registry, so accepting it here would store a
-    // second subscription that nothing reads.
-    if !PWS_N2_INFORMATION_CLASSES.contains(&n2_information_class) {
+    // Only the PWS classes and NRPPa are served. The other `N2InformationClass`
+    // values (`SM`, `RAN`, `V2X`, `PROSE`, `TSS`, `RSPP`, `A2X`) each need their
+    // own producer. NRPPa (#807) is read by the UPLINK NON UE ASSOCIATED NRPPA
+    // TRANSPORT relay, which picks the LMF by the NGAP Routing ID (§5.2.2.4.4.2).
+    // #807: the NRPPa class is served too. TS 29.518 §5.2.2.4.4.2 has the AMF
+    // notify an LMF's non-UE-associated NRPPa answers through it.
+    if !PWS_N2_INFORMATION_CLASSES.contains(&n2_information_class)
+        && n2_information_class != "NRPPa"
+    {
         return send_error(
             403,
             "Forbidden",
             &format!(
                 "n2InformationClass '{n2_information_class}' is not served on this resource; \
-                 only the PWS classes {PWS_N2_INFORMATION_CLASSES:?} (TS 29.518 §5.2.2.4.2.2) are"
+                 only the PWS classes {PWS_N2_INFORMATION_CLASSES:?} (TS 29.518 §5.2.2.4.2.2) \
+                 and NRPPa (§5.2.2.4.4.2) are"
             ),
             Some("UNSPECIFIED"),
         );
@@ -5857,6 +5945,114 @@ fn handle_non_ue_n2_info_unsubscribe(subscription_id: &str) -> SbiResponse {
     }
 }
 
+/// The NRPPa class of `POST /namf-comm/v1/non-ue-n2-messages/transfer` (#807):
+/// TS 29.518 §5.2.2.4.1.2, Obtaining Non UE Associated Network Assistance Data.
+///
+/// §5.2.2.4.1.2 step 1: the body carries the N2 information "together with the NG
+/// RAN node identifier(s) to which the transfer needs to be initiated", and "the NF
+/// Instance Identifier of the NF Service Consumer (e.g. LMF) in "nfId"". So
+/// `globalRanNodeList` is required here, and `nrppaInfo.nfId` (mandatory in
+/// `NrppaInformation`) becomes the NGAP Routing ID of each DOWNLINK NON UE
+/// ASSOCIATED NRPPA TRANSPORT (TS 38.413 §8.15.4, §9.3.3.13), which is how the
+/// node's UPLINK answer finds the LMF again.
+///
+/// The PDU is relayed verbatim: TS 23.273 has the AMF transparent to NRPPa.
+///
+/// Step 2a: `N2_INFO_TRANSFER_INITIATED` once the transfer is initiated. Which
+/// named nodes are connected is known only to the NGAP task, after this response
+/// is written, so `PARTIAL_N2_INFO_TRANSFER` is not reported; a node the NGAP task
+/// cannot reach is logged there (the same reasoning as for PWS).
+fn handle_non_ue_nrppa_transfer(
+    request: &SbiRequest,
+    body: &Value,
+    n2_information: &Value,
+) -> SbiResponse {
+    let Some(nrppa_info) = n2_information.get("nrppaInfo") else {
+        return mandatory_ie_missing("n2Information.nrppaInfo");
+    };
+    // nfId and nrppaPdu are the required members of NrppaInformation.
+    let Some(nf_id) = nrppa_info
+        .get("nfId")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    else {
+        return mandatory_ie_missing("nrppaInfo.nfId");
+    };
+    let Some(content_id) = nrppa_info
+        .get("nrppaPdu")
+        .and_then(|p| p.get("ngapData"))
+        .and_then(|d| d.get("contentId"))
+        .and_then(Value::as_str)
+    else {
+        return mandatory_ie_missing("nrppaInfo.nrppaPdu.ngapData.contentId");
+    };
+    let Some(nrppa_pdu) = find_binary_part(request, content_id) else {
+        return mandatory_ie_incorrect(
+            "nrppaInfo.nrppaPdu.ngapData.contentId",
+            "no multipart part carries that contentId",
+        );
+    };
+    if nrppa_pdu.is_empty() {
+        return mandatory_ie_incorrect("nrppaInfo.nrppaPdu.ngapData", "empty NRPPa PDU");
+    }
+    let target_gnb_ids: Vec<u32> = body
+        .get("globalRanNodeList")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|node| {
+                    node.get("gNbId")
+                        .and_then(|g| g.get("gNBValue"))
+                        .and_then(Value::as_str)
+                        .and_then(|v| u32::from_str_radix(v, 16).ok())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if target_gnb_ids.is_empty() {
+        return mandatory_ie_missing("globalRanNodeList");
+    }
+    let ctx = crate::context::amf_self();
+    let Ok(guard) = ctx.read() else {
+        return send_error(
+            500,
+            "Internal Server Error",
+            "AMF context unavailable",
+            None,
+        );
+    };
+    let queued = guard.non_ue_nrppa_add(crate::context::PendingNonUeNrppa {
+        nrppa_pdu,
+        routing_id: nf_id.as_bytes().to_vec(),
+        target_gnb_ids: target_gnb_ids.clone(),
+    });
+    drop(guard);
+    if !queued {
+        // TS 29.500 Table 5.2.7.2-1: INSUFFICIENT_RESOURCES is a 500.
+        return send_error(
+            500,
+            "Internal Server Error",
+            "The non-UE NRPPa relay queue is full",
+            Some("INSUFFICIENT_RESOURCES"),
+        );
+    }
+    log::info!(
+        "Namf NonUeN2MessageTransfer (NRPPa): enqueued for {} NG-RAN node(s), Routing ID \
+         {nf_id}",
+        target_gnb_ids.len()
+    );
+    // The SCTP associations live in the NGAP task, so whether a named node is
+    // connected is only known when the pump runs, after this response. As for
+    // PWS, the 200 reports that the AMF initiated the transfer; a node the pump
+    // cannot reach is logged there.
+    match SbiResponse::with_status(200)
+        .with_json_body(&json!({ "result": "N2_INFO_TRANSFER_INITIATED" }))
+    {
+        Ok(resp) => resp,
+        Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
+    }
+}
+
 /// `POST /namf-comm/v1/non-ue-n2-messages/transfer` — Namf_Communication
 /// NonUeN2MessageTransfer (TS 29.518 §5.2.2.4.1,
 /// `TS29518_Namf_Communication.yaml:1718`), for the **PWS** N2 information class
@@ -5906,17 +6102,22 @@ fn handle_non_ue_n2_message_transfer(request: &SbiRequest) -> SbiResponse {
         return mandatory_ie_missing("n2Information.n2InformationClass");
     };
 
-    // Only PWS is served here. The other classes this service operation carries
-    // (NRPPa for §5.2.2.4.1.2, RAN for the Configuration Transfer and RIM
-    // procedures, TSS for §5.2.2.4.1.7) each need their own transport, and
-    // answering 200 for them would claim a transfer that never happened.
+    // #807: NRPPa (§5.2.2.4.1.2, Obtaining Non UE Associated Network
+    // Assistance Data) has its own transport.
+    if info_class == "NRPPa" {
+        return handle_non_ue_nrppa_transfer(request, &body, n2_information);
+    }
+    // Otherwise only PWS is served here. The other classes this service
+    // operation carries (RAN for the Configuration Transfer and RIM procedures,
+    // TSS for §5.2.2.4.1.7) each need their own transport, and answering 200 for
+    // them would claim a transfer that never happened.
     if info_class != "PWS" {
         return send_error(
             403,
             "Forbidden",
             &format!(
                 "n2InformationClass '{info_class}' is not served on this resource; \
-                 only 'PWS' (TS 29.518 §5.2.2.4.1.3) is"
+                 only 'PWS' (TS 29.518 §5.2.2.4.1.3) and 'NRPPa' (§5.2.2.4.1.2) are"
             ),
             Some("UNSPECIFIED"),
         );
@@ -6309,6 +6510,14 @@ pub(crate) fn dereg_queue_test_lock() -> &'static tokio::sync::Mutex<()> {
 /// the queue's other test lock, module-level and `pub(crate)`, so both test
 /// modules serialize against ONE lock: a second lock declared inside a
 /// `mod tests` is what hung this suite once.
+#[cfg(test)]
+pub(crate) fn non_ue_nrppa_queue_test_lock() -> &'static tokio::sync::Mutex<()> {
+    // #807: the process-global `non_ue_nrppa_queue`, shared by the router test in
+    // this module and the NGAP pump test in `ngap_path`, like the PWS lock below.
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 #[cfg(test)]
 pub(crate) fn pws_queue_test_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
@@ -11930,9 +12139,9 @@ mod tests {
         assert!(pending.is_empty());
     }
 
-    /// A non-PWS `n2InformationClass` is refused rather than answered 200. The
-    /// other classes this operation carries (NRPPa, RAN, TSS) each need their own
-    /// transport; a 200 for them would claim a transfer that never happened.
+    /// A class with no transport here is refused rather than answered 200. RAN and
+    /// TSS each need their own transport (NRPPa has one since #807); a 200 for them
+    /// would claim a transfer that never happened.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_non_pws_information_class_is_not_served_here() {
         let _ctx = crate::test_support::CONTEXT_GUARD
@@ -11944,10 +12153,9 @@ mod tests {
         let resp = namf_request_handler(pws_transfer_request(
             json!({
                 "n2Information": {
-                    "n2InformationClass": "NRPPa",
-                    "nrppaInfo": {
-                        "nfId": "6396",
-                        "nrppaPdu": { "ngapData": { "contentId": "pws-container" } }
+                    "n2InformationClass": "RAN",
+                    "ranInfo": {
+                        "n2InfoContent": { "ngapData": { "contentId": "pws-container" } }
                     }
                 }
             }),
@@ -12161,6 +12369,168 @@ mod tests {
         }
     }
 
+    fn non_ue_nrppa_transfer(body: Value) -> SbiRequest {
+        SbiRequest::post("/namf-comm/v1/non-ue-n2-messages/transfer")
+            .with_json_body(&body)
+            .expect("json")
+            .with_part(SbiPart::with_content(
+                "nrppa-non-ue",
+                "application/vnd.3gpp.ngap",
+                vec![0x00, 0x0b, 0x00, 0x00, 0x05, 0x00].into(),
+            ))
+    }
+
+    /// #807, TS 29.518 §5.2.2.4.1.2: an NRPPa NonUeN2MessageTransfer names its NG
+    /// RAN nodes and the LMF's nfId. It is queued for those nodes with the nfId
+    /// as the NGAP Routing ID, and answered N2_INFO_TRANSFER_INITIATED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_non_ue_nrppa_transfer_is_queued_for_the_named_nodes() {
+        let _ctx = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _serial = super::non_ue_nrppa_queue_test_lock().lock().await;
+        amf_context_init(64, 1024, 4096);
+        let ctx = crate::context::amf_self();
+        let _ = ctx.read().unwrap().non_ue_nrppa_drain();
+
+        let body = |nodes: Option<Value>, nf_id: Option<&str>| {
+            let mut nrppa = json!({
+                "nrppaPdu": { "ngapIeType": "NRPPA_PDU", "ngapData": { "contentId": "nrppa-non-ue" } }
+            });
+            if let Some(id) = nf_id {
+                nrppa["nfId"] = json!(id);
+            }
+            let mut b = json!({
+                "n2Information": { "n2InformationClass": "NRPPa", "nrppaInfo": nrppa }
+            });
+            if let Some(n) = nodes {
+                b["globalRanNodeList"] = n;
+            }
+            b
+        };
+        let nodes = json!([
+            { "plmnId": { "mcc": "001", "mnc": "01" }, "gNbId": { "bitLength": 22, "gNBValue": "000807" } }
+        ]);
+
+        let resp = namf_request_handler(non_ue_nrppa_transfer(body(
+            Some(nodes.clone()),
+            Some("lmf-807"),
+        )))
+        .await;
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        let v: Value = serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(v["result"], "N2_INFO_TRANSFER_INITIATED");
+        let queued = ctx.read().unwrap().non_ue_nrppa_drain();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].routing_id, b"lmf-807");
+        assert_eq!(queued[0].target_gnb_ids, vec![0x807]);
+        assert_eq!(
+            queued[0].nrppa_pdu,
+            vec![0x00, 0x0b, 0x00, 0x00, 0x05, 0x00]
+        );
+
+        // The node list and the nfId are both required by §5.2.2.4.1.2.
+        for b in [body(None, Some("lmf-807")), body(Some(nodes), None)] {
+            let resp = namf_request_handler(non_ue_nrppa_transfer(b)).await;
+            assert_eq!(resp.status, 400);
+        }
+        assert!(ctx.read().unwrap().non_ue_nrppa_drain().is_empty());
+    }
+
+    /// #807: an LMF can subscribe to the NRPPa class, and its subscription is found
+    /// by its nfId (the Routing ID its answers come back with), never by another
+    /// LMF's, and never through the PWS umbrella class.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_non_ue_nrppa_subscription_is_found_by_its_nf_id() {
+        let _ctx = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        amf_context_init(64, 1024, 4096);
+        let resp = namf_request_handler(non_ue_n2_subscribe_request(json!({
+            "n2InformationClass": "NRPPa",
+            "n2NotifyCallbackUri": "http://127.0.0.1:19807/nlmf-loc/v1/notify/n2",
+            "nfId": "lmf-sub-807",
+        })))
+        .await;
+        assert_eq!(resp.status, 201);
+        let v: Value = serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let id = v["n2NotifySubscriptionId"].as_str().unwrap().to_string();
+        let ctx = crate::context::amf_self();
+        {
+            let g = ctx.read().unwrap();
+            assert_eq!(
+                g.non_ue_nrppa_subscription_find(Some("lmf-sub-807"))
+                    .map(|s| s.subscription_id),
+                Some(id.clone())
+            );
+            assert!(
+                g.non_ue_nrppa_subscription_find(Some("another-lmf"))
+                    .is_none(),
+                "another LMF's answers never go to this subscription"
+            );
+            assert!(
+                g.non_ue_n2_subscription_find_by_class("PWS-BCAL", Some("lmf-sub-807"))
+                    .is_none(),
+                "an NRPPa subscription is not a PWS one"
+            );
+            g.non_ue_n2_subscription_remove(&id);
+        }
+        // #903 review: a subscription that named no nfId does not receive an
+        // answer that names its LMF; it may belong to another consumer.
+        let resp = namf_request_handler(non_ue_n2_subscribe_request(json!({
+            "n2InformationClass": "NRPPa",
+            "n2NotifyCallbackUri": "http://127.0.0.1:19808/nlmf-loc/v1/notify/n2",
+        })))
+        .await;
+        assert_eq!(resp.status, 201);
+        let v: Value = serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let anon = v["n2NotifySubscriptionId"].as_str().unwrap().to_string();
+        let g = ctx.read().unwrap();
+        assert!(g
+            .non_ue_nrppa_subscription_find(Some("lmf-sub-807"))
+            .is_none());
+        assert_eq!(
+            g.non_ue_nrppa_subscription_find(None)
+                .map(|s| s.subscription_id),
+            Some(anon.clone())
+        );
+        g.non_ue_n2_subscription_remove(&anon);
+    }
+
+    /// #903 review: the non-UE NRPPa queue is bounded; a transfer past it is
+    /// refused 500 INSUFFICIENT_RESOURCES, not queued.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_full_non_ue_nrppa_queue_refuses_the_transfer() {
+        let _ctx = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _serial = super::non_ue_nrppa_queue_test_lock().lock().await;
+        amf_context_init(64, 1024, 4096);
+        let ctx = crate::context::amf_self();
+        {
+            let g = ctx.read().unwrap();
+            let _ = g.non_ue_nrppa_drain();
+            for _ in 0..crate::context::MAX_PENDING_NON_UE_NRPPA {
+                assert!(g.non_ue_nrppa_add(crate::context::PendingNonUeNrppa {
+                    nrppa_pdu: vec![0],
+                    routing_id: b"x".to_vec(),
+                    target_gnb_ids: vec![1],
+                }));
+            }
+        }
+        let resp = namf_request_handler(non_ue_nrppa_transfer(json!({
+            "globalRanNodeList": [{ "plmnId": { "mcc": "001", "mnc": "01" },
+                "gNbId": { "bitLength": 22, "gNBValue": "000807" } }],
+            "n2Information": { "n2InformationClass": "NRPPa", "nrppaInfo": {
+                "nfId": "lmf-807",
+                "nrppaPdu": { "ngapIeType": "NRPPA_PDU", "ngapData": { "contentId": "nrppa-non-ue" } } } }
+        })))
+        .await;
+        assert_eq!(resp.status, 500);
+        let drained = ctx.read().unwrap().non_ue_nrppa_drain();
+        assert_eq!(drained.len(), crate::context::MAX_PENDING_NON_UE_NRPPA);
+    }
+
     fn non_ue_n2_subscribe_request(body: Value) -> SbiRequest {
         SbiRequest::post("/namf-comm/v1/non-ue-n2-messages/subscriptions")
             .with_json_body(&body)
@@ -12300,10 +12670,9 @@ mod tests {
         .await;
         assert_eq!(resp.status, 400);
 
-        // A class with no producer here. NRPPa in particular is already served by
-        // the per-UE `n1-n2-messages/subscriptions` registry, so accepting it would
-        // store a second subscription nothing reads.
-        for class in ["NRPPa", "SM", "TSS", "RAN"] {
+        // A class with no producer here. (NRPPa is served since #807: the uplink
+        // non-UE NRPPa relay reads it.)
+        for class in ["SM", "TSS", "RAN"] {
             let resp = namf_request_handler(non_ue_n2_subscribe_request(json!({
                 "n2InformationClass": class,
                 "n2NotifyCallbackUri": "http://127.0.0.1:19399/x",

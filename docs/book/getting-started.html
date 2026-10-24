@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-c2411517.js";
+            window.path_to_searchindex_js = "searchindex-df495bb2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-be5dca41.js"></script>
@@ -285,7 +285,7 @@ kubectl port-forward -n nextg-system svc/jaeger 16686:16686   # traces
 ├── scp.yaml, sepp1.yaml, sepp2.yaml
 └── tls/            # SBI TLS material (see also docker/rust/certs/)
 </code></pre>
-<p>Kubernetes configuration lives in <code>k8s/base/</code> and <code>k8s/manifests/</code>. NFs log at <code>info</code> by default, tunable via <code>--log-level</code> (and <code>RUST_LOG</code> in 13 of the 28 NFs; see the <a href="configuration/overview.html">configuration overview</a>).</p>
+<p>Kubernetes configuration lives in <code>k8s/base/</code> and <code>k8s/manifests/</code>. NFs log at <code>info</code> by default, tunable via <code>--log-level</code> or <code>RUST_LOG</code>, which overrides it (see the <a href="configuration/overview.html">configuration overview</a>).</p>
 <h2 id="next-steps"><a class="header" href="#next-steps">Next Steps</a></h2>
 <ul>
 <li>Read the <a href="contributing.html">Contributing guide</a> for the style gate (<code>cargo fmt --all</code>, <code>cargo clippy --workspace --all-targets</code>, <code>cargo check --all-features</code>, <code>cargo audit</code>) and the PR process.</li>

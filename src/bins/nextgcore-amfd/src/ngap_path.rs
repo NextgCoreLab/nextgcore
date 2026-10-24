@@ -564,7 +564,7 @@ struct Reachability {
 /// replayed UE security capabilities, GUTI) so that all downlink NAS is
 /// built by gmm_build and protected by nas_security — there is no inline
 /// plain-NAS path.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UeNasContext {
     /// Full AMF UE context (security keys, capabilities, GUTI, NSSAI).
     ///
@@ -629,6 +629,42 @@ pub struct UeNasContext {
     /// belongs to is created later in the procedure, and because it must survive the
     /// authentication round trips in between.
     ue_policy_container: Option<Vec<u8>>,
+}
+
+/// Manual `Debug` (no-auth-material-in-logs): the authentication material in
+/// this type (autn) prints as `<redacted>`, so a future
+/// `{:?}` in a log line cannot leak it.
+impl std::fmt::Debug for UeNasContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("UeNasContext");
+        d.field("amf_ue", &self.amf_ue);
+        d.field("auth_ctx_id", &self.auth_ctx_id);
+        d.field("ran_ue_ngap_id", &self.ran_ue_ngap_id);
+        d.field("association_id", &self.association_id);
+        d.field("suci", &self.suci);
+        d.field("autn", &"<redacted>");
+        d.field("registered", &self.registered);
+        d.field("pei_requested", &self.pei_requested);
+        d.field("auth_failure_count", &self.auth_failure_count);
+        d.field("retx", &self.retx);
+        d.field("reachability", &self.reachability);
+        d.field("cm_idle", &self.cm_idle);
+        d.field("sdm_subscription_id", &self.sdm_subscription_id);
+        d.field("policy_association_id", &self.policy_association_id);
+        d.field("ue_policy_association_id", &self.ue_policy_association_id);
+        d.field("gmm_fsm", &self.gmm_fsm);
+        d.field(
+            "initial_context_setup_request_sent",
+            &self.initial_context_setup_request_sent,
+        );
+        d.field(
+            "initial_context_setup_response_received",
+            &self.initial_context_setup_response_received,
+        );
+        d.field("registration_accept_sent", &self.registration_accept_sent);
+        d.field("ue_policy_container", &self.ue_policy_container);
+        d.finish()
+    }
 }
 
 impl UeNasContext {
@@ -1120,6 +1156,10 @@ impl NgapServer {
         // enqueued (#396, TS 29.518 §5.2.2.4.1.3 / TS 38.413 §8.12) to the
         // NG-RAN nodes the consumer targeted. Dormant when none pending.
         self.process_pws_n2_transfers().await;
+
+        // Relay non-UE-associated NRPPa an LMF handed the Namf transfer handler
+        // (#807, TS 29.518 §5.2.2.4.1.2 / TS 38.413 §8.15.4). Dormant when none.
+        self.process_non_ue_nrppa_transfers().await;
 
         // Page every CM-IDLE UE a Namf N1N2MessageTransfer queued (#512, TS 23.502
         // §4.2.3.3): PAGING to the gNBs serving its registration area, T3513
@@ -8343,6 +8383,57 @@ impl NgapServer {
         }
     }
 
+    /// Drain the non-UE-associated NRPPa relays (#807) and send each as a
+    /// DOWNLINK NON UE ASSOCIATED NRPPA TRANSPORT (TS 38.413 §8.15.4) to the
+    /// connected gNBs named in `globalRanNodeList`, with the LMF's nfId as the
+    /// Routing ID. Resolved against the live sessions, like the PWS relay.
+    pub(crate) async fn process_non_ue_nrppa_transfers(&mut self) {
+        let pending = {
+            let ctx = crate::context::amf_self();
+            let Ok(guard) = ctx.read() else {
+                return;
+            };
+            guard.non_ue_nrppa_drain()
+        };
+        for item in pending {
+            let Some(pdu) = crate::positioning::build_nrppa_dl_non_ue_associated(
+                &item.routing_id,
+                &item.nrppa_pdu,
+            ) else {
+                log::warn!(
+                    "Non-UE NRPPa relay: DOWNLINK NON UE ASSOCIATED NRPPA TRANSPORT encode failed"
+                );
+                continue;
+            };
+            let targets: Vec<(u32, u64)> = {
+                let sessions = self.sessions.read().await;
+                sessions
+                    .values()
+                    .filter(|s| item.target_gnb_ids.contains(&s.gnb.gnb_id))
+                    .map(|s| (s.gnb.gnb_id, s.association_id))
+                    .collect()
+            };
+            for gnb in &item.target_gnb_ids {
+                if !targets.iter().any(|(g, _)| g == gnb) {
+                    log::warn!(
+                        "Non-UE NRPPa relay: gNB {gnb:#x} is not connected; the NRPPa PDU \
+                         ({} B) was not delivered to it",
+                        item.nrppa_pdu.len()
+                    );
+                }
+            }
+            for (gnb, association_id) in targets {
+                match self.send_to_association(association_id, &pdu).await {
+                    Ok(()) => log::info!(
+                        "Non-UE NRPPa relay: {} B to gNB {gnb:#x} (association {association_id})",
+                        item.nrppa_pdu.len()
+                    ),
+                    Err(e) => log::warn!("Non-UE NRPPa relay to gNB {gnb:#x} failed: {e}"),
+                }
+            }
+        }
+    }
+
     /// Resolve the SCTP associations a PWS transfer targets, applying the IE
     /// precedence of TS 29.518 §5.2.2.4.1.3 (`29518-k00.txt:4152-4159`):
     ///
@@ -8988,6 +9079,44 @@ impl NgapServer {
             }
         };
 
+        let nf_id = String::from_utf8(ul.routing_id.clone())
+            .ok()
+            .filter(|s| !s.is_empty());
+
+        // #807, TS 29.518 §5.2.2.4.4.2: the answer goes to the LMF the Routing ID
+        // names, through its non-UE NRPPa subscription, with the responding node's
+        // identity. Only without one does the any-UE N1N2 fallback below apply.
+        let non_ue = {
+            let ctx = crate::context::amf_self();
+            let Ok(guard) = ctx.read() else {
+                return Ok(());
+            };
+            guard.non_ue_nrppa_subscription_find(nf_id.as_deref())
+        };
+        if let Some(sub) = non_ue {
+            let ran_node_id = self.sessions.read().await.get(&association_id).map(|s| {
+                crate::namf_server::global_ran_node_id_json(
+                    &s.gnb.plmn_id,
+                    s.gnb.gnb_id,
+                    s.gnb.gnb_id_len,
+                )
+            });
+            log::info!(
+                "LCS: relaying uplink non-UE-associated NRPPa ({} B) to LMF {nf_id:?} via \
+                 non-UE subscription {}",
+                ul.nrppa_pdu.len(),
+                sub.subscription_id
+            );
+            crate::namf_server::send_non_ue_nrppa_info_notify(
+                sub.n2_notify_callback_uri,
+                sub.subscription_id,
+                nf_id,
+                ran_node_id,
+                ul.nrppa_pdu,
+            );
+            return Ok(());
+        }
+
         let sub = {
             let ctx = crate::context::amf_self();
             let Ok(guard) = ctx.read() else {
@@ -9005,10 +9134,6 @@ impl NgapServer {
             return Ok(());
         };
         let sub = sub.expect("callback_uri implies subscription");
-
-        let nf_id = String::from_utf8(ul.routing_id.clone())
-            .ok()
-            .filter(|s| !s.is_empty());
 
         log::info!(
             "LCS: relaying uplink non-UE-associated NRPPa ({} B) to LMF \
@@ -9243,9 +9368,19 @@ impl NgapServer {
             }
         }
         // TS 24.501 §5.3.7: for a UE that is still REGISTERED this is the moment the
-        // mobile reachable timer starts.
-        self.start_reachability_supervision(association_id, amf_ue_ngap_id)
-            .await;
+        // mobile reachable timer starts. A Complete that names no UE (undecodable, or
+        // a not-comprehended reject IE handled locally, TS 38.413 §10.3.4.2) ended no
+        // N1 connection this AMF can identify, so it arms nobody (#802 follow-up):
+        // the association's other UEs are either CONNECTED, or idle since an earlier
+        // release that already armed them, and re-arming those would extend their
+        // supervision and send a false CM-CONNECTED -> CM-IDLE report each time.
+        match amf_ue_ngap_id {
+            Some(id) => self.start_reachability_supervision(id).await,
+            None => log::warn!(
+                "UE Context Release Complete on association {association_id} names no \
+                 usable UE; no mobile reachable timer is started"
+            ),
+        }
         Ok(())
     }
 
@@ -9278,20 +9413,9 @@ impl NgapServer {
         }
     }
 
-    /// Start mobile-reachable supervision for every registered UE whose N1 connection
-    /// this release complete ended (TS 24.501 §5.3.7).
-    ///
-    /// `amf_ue_ngap_id` is the UE the Release Complete names, when it could be used. A
-    /// Release Complete that cannot (undecodable, or a not-comprehended reject IE, which
-    /// TS 38.413 §10.3.4.2 has handled locally) names nobody, so it falls back to the
-    /// association's UEs that are ALREADY CM-IDLE and unsupervised -- never a CONNECTED
-    /// one (#802). Arming every registered UE of the association put the connected UEs
-    /// on the gNB on the path to implicit deregistration on one malformed PDU.
-    async fn start_reachability_supervision(
-        &mut self,
-        association_id: u64,
-        amf_ue_ngap_id: Option<u64>,
-    ) {
+    /// Start mobile-reachable supervision for a registered UE whose N1 connection was
+    /// just released (TS 24.501 §5.3.7).
+    async fn start_reachability_supervision(&mut self, amf_ue_ngap_id: u64) {
         let Some(config) = self.timer_configs.get(AmfTimerId::MobileReachable).cloned() else {
             return;
         };
@@ -9299,21 +9423,7 @@ impl NgapServer {
             log::debug!("Mobile reachable timer disabled by configuration; not supervising");
             return;
         }
-        let targets: Vec<u64> = match amf_ue_ngap_id {
-            Some(amf_ue_ngap_id) => vec![amf_ue_ngap_id],
-            None => self
-                .ue_auth_state
-                .snapshot()
-                .into_iter()
-                .filter(|(_, s)| {
-                    s.association_id == association_id
-                        && s.registered
-                        && s.cm_idle
-                        && s.reachability.is_none()
-                })
-                .map(|(id, _)| id)
-                .collect(),
-        };
+        let targets = [amf_ue_ngap_id];
         let deadline = Instant::now() + config.duration;
         for amf_ue_ngap_id in targets {
             // Await-free, so the arming happens under one lock acquisition: a
@@ -20663,6 +20773,134 @@ mod tests {
         );
     }
 
+    /// #807: the pump sends each queued non-UE NRPPa PDU as a DOWNLINK NON UE
+    /// ASSOCIATED NRPPA TRANSPORT (TS 38.413 §8.15.4) with the LMF's Routing ID,
+    /// to the named connected gNB only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_non_ue_nrppa_pump_sends_to_the_named_gnb_only() {
+        let _serial = crate::namf_server::non_ue_nrppa_queue_test_lock()
+            .lock()
+            .await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        ngap.sent_ngap = Some(Vec::new());
+        insert_pws_test_gnb(
+            &ngap,
+            8071,
+            0x807,
+            crate::context::RatType::Nr,
+            &[("001", "01", 1)],
+        )
+        .await;
+        insert_pws_test_gnb(
+            &ngap,
+            8072,
+            0x808,
+            crate::context::RatType::Nr,
+            &[("001", "01", 1)],
+        )
+        .await;
+        let nrppa = vec![0x00u8, 0x0b, 0x00, 0x00, 0x05, 0x00];
+        {
+            let ctx = crate::context::amf_self();
+            let g = ctx.read().unwrap();
+            let _ = g.non_ue_nrppa_drain();
+            assert!(g.non_ue_nrppa_add(crate::context::PendingNonUeNrppa {
+                nrppa_pdu: nrppa.clone(),
+                routing_id: b"lmf-807".to_vec(),
+                target_gnb_ids: vec![0x807, 0x999],
+            }));
+        }
+        ngap.process_non_ue_nrppa_transfers().await;
+        let sent: Vec<(u64, Vec<u8>)> = ngap
+            .sent_ngap
+            .take()
+            .unwrap()
+            .into_iter()
+            .map(|(association, _stream, pdu)| (association, pdu))
+            .collect();
+        assert_eq!(
+            sent,
+            vec![(
+                8071,
+                crate::positioning::build_nrppa_dl_non_ue_associated(b"lmf-807", &nrppa).unwrap()
+            )],
+            "only the named, connected gNB 0x807; 0x808 was not named, 0x999 is not connected"
+        );
+        assert_eq!(sent[0].1[1], 5, "NGAP procedure 5");
+    }
+
+    /// #807, TS 29.518 §5.2.2.4.4.2: an uplink non-UE NRPPa answer goes to the LMF
+    /// its Routing ID names, through that LMF's non-UE NRPPa subscription, with
+    /// the answering node as `ranNodeId` and no `lcsCorrelationId` (it belongs to
+    /// no UE).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_uplink_non_ue_nrppa_answer_goes_to_the_lmf_its_routing_id_names() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        use nextgcore_asn1c::ngap::ies::{NrppaPdu, RoutingId};
+        use nextgcore_asn1c::ngap::pdu::build_uplink_non_ue_associated_nrppa_transport;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (_sink, port, mut rx) = start_lmf_callback_sink().await;
+        let sub_id = "nonuen2sub-807-routing";
+        {
+            let ctx = crate::context::amf_self();
+            let g = ctx.read().unwrap();
+            assert!(
+                g.non_ue_n2_subscription_add(crate::context::NonUeN2InfoSubscription {
+                    subscription_id: sub_id.to_string(),
+                    n2_information_class: "NRPPa".to_string(),
+                    n2_notify_callback_uri: format!(
+                        "http://127.0.0.1:{port}/nlmf-loc/v1/notify/n2"
+                    ),
+                    nf_id: Some("lmf-routing-807".to_string()),
+                    notif_correlation_id: None,
+                    global_ran_node_gnb_ids: Vec::new(),
+                    an_type_list: Vec::new(),
+                    supported_features: None,
+                })
+            );
+        }
+        let mut ngap = test_ngap_server().await;
+        insert_pws_test_gnb(
+            &ngap,
+            1,
+            0x807,
+            crate::context::RatType::Nr,
+            &[("001", "01", 1)],
+        )
+        .await;
+        let nrppa = vec![0x20u8, 0x0b, 0x00, 0x00, 0x05, 0x00];
+        let bytes = encode_ngap_pdu(
+            &build_uplink_non_ue_associated_nrppa_transport(
+                RoutingId::new(b"lmf-routing-807".to_vec()),
+                NrppaPdu::new(nrppa.clone()),
+            )
+            .unwrap(),
+        );
+        ngap.process_ngap_message(1, &bytes).await.unwrap();
+        let (_, json_root, parts) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("NonUeN2InfoNotify within 5s")
+            .unwrap();
+        crate::context::amf_self()
+            .read()
+            .unwrap()
+            .non_ue_n2_subscription_remove(sub_id);
+        let body: serde_json::Value = serde_json::from_str(&json_root).unwrap();
+        assert_eq!(body["n2NotifySubscriptionId"], sub_id);
+        assert!(body.get("lcsCorrelationId").is_none());
+        assert_eq!(
+            u32::from_str_radix(body["ranNodeId"]["gNbId"]["gNBValue"].as_str().unwrap(), 16),
+            Ok(0x807),
+            "the answering node"
+        );
+        assert_eq!(
+            body["n2InfoContainer"]["nrppaInfo"]["nfId"],
+            "lmf-routing-807"
+        );
+        assert_eq!(parts[0].data.as_ref(), nrppa.as_slice());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_uplink_non_ue_associated_nrppa_relays_to_registered_lmf() {
         // This test drives production code against a loopback PLAINTEXT peer, i.e.
@@ -23746,7 +23984,8 @@ mod tests {
     // ---- outbound capture: what amfd SENDS, not just what it stores ----
 
     /// A test server whose `send_to_association` records each NGAP PDU as
-    /// `(association_id, pdu)` instead of writing it to SCTP (see `sent_ngap`).
+    /// `(association_id, sctp_stream_id, pdu)` instead of writing it to SCTP (see
+    /// `sent_ngap`).
     async fn capturing_ngap_server() -> NgapServer {
         let mut server = test_ngap_server().await;
         server.sent_ngap = Some(Vec::new());
@@ -28051,13 +28290,17 @@ mod tests {
 
     /// **#802.** A UE Context Release Complete that names no usable UE -- undecodable,
     /// or carrying a not-comprehended IE marked reject (TS 38.413 §10.3.4.2) -- must not
-    /// arm the mobile reachable timer for a CONNECTED UE of the sending gNB. Before, the
+    /// arm the mobile reachable timer for any UE of the sending gNB. Before #802 the
     /// fallback armed every registered UE of the association, so one malformed PDU put
-    /// every connected UE on the gNB on the path to implicit deregistration. An idle,
-    /// unsupervised UE there is still supervised (the reason the fallback exists).
+    /// every connected UE on the gNB on the path to implicit deregistration. #802 narrowed
+    /// it to idle, unsupervised UEs; the follow-up arms nobody, because those UEs' N1
+    /// connections ended at an EARLIER release (TS 24.501 §5.3.7 starts the timer then),
+    /// and re-arming them extended their supervision and sent a false CM-CONNECTED ->
+    /// CM-IDLE report each time. A UE already in implicit-deregistration supervision keeps
+    /// its phase and deadline.
     ///
-    /// REVERT-VERIFIED: with the fallback's old association-only filter the connected
-    /// UE is armed and this fails.
+    /// REVERT-VERIFIED: with #802's fallback the idle unsupervised UE is armed; with the
+    /// original one the connected UE is too.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unusable_release_complete_never_supervises_a_connected_ue() {
         crate::context::amf_context_init(64, 1024, 4096);
@@ -28080,6 +28323,16 @@ mod tests {
             i.registered = true;
             i.cm_idle = true;
             ngap.ue_auth_state.insert(idle, i);
+            let dereg = 7_802_003u64 + 10 * n as u64;
+            let dereg_deadline = Instant::now() + Duration::from_secs(600);
+            let mut d = UeNasContext::new(dereg, 3, assoc, false);
+            d.registered = true;
+            d.cm_idle = true;
+            d.reachability = Some(Reachability {
+                phase: ReachabilityPhase::ImplicitDeregistration,
+                deadline: dereg_deadline,
+            });
+            ngap.ue_auth_state.insert(dereg, d);
 
             ngap.handle_ue_context_release_complete(assoc, &pdu)
                 .await
@@ -28099,11 +28352,20 @@ mod tests {
             assert!(!ngap.ue_auth_state.get(connected).unwrap().is_cm_idle());
             assert_eq!(
                 phase(idle),
-                Some(ReachabilityPhase::MobileReachable),
-                "case {n}: the idle, unsupervised UE of the association is"
+                None,
+                "case {n}: an idle UE whose N1 connection this Complete did not end is not"
             );
-            ngap.ue_auth_state.remove(connected);
-            ngap.ue_auth_state.remove(idle);
+            assert_eq!(
+                ngap.ue_auth_state
+                    .get(dereg)
+                    .and_then(|s| s.reachability)
+                    .map(|r| (r.phase, r.deadline)),
+                Some((ReachabilityPhase::ImplicitDeregistration, dereg_deadline)),
+                "case {n}: an implicit-deregistration supervision is left as it was"
+            );
+            for id in [connected, idle, dereg] {
+                ngap.ue_auth_state.remove(id);
+            }
         }
     }
 
