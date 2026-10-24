@@ -901,6 +901,8 @@ async fn main() -> Result<()> {
             client.seed_peer_recovery_time_stamp(rts).await;
         }
     }
+    // #1031: restored sessions whose UPF is no longer configured.
+    pfcp_path::unknown_session_upfs(&pfcp_clients);
     // #1028 review m2: paths still failed at the last shutdown are held again.
     up_path::rearm_restored_holds();
 
@@ -2568,7 +2570,7 @@ async fn pfcp_session_establish(
     // Issue #20: remember which UPF this session was established on so
     // modification/deletion keep signalling the same peer. Keyed by the
     // SMF-side SEID: UPF-chosen SEIDs collide across a multi-UPF pool.
-    pfcp_path::record_session_peer(smf_n4_seid, client.peer());
+    pfcp_path::record_session_upf(smf_n4_seid, &client);
 
     Ok(PfcpSessionResult {
         upf_seid,
@@ -5770,7 +5772,8 @@ pub(crate) fn take_sm_context(sm_context_ref: &str) -> Option<Option<context::Po
     if binding.is_none() && sess.is_none() {
         return None;
     }
-    // #994: the GTP-U peers of its FARs, under the SEID the next line forgets.
+    // #994, #1031: the GTP-U peers of its FARs and its UPF binding, under the SEID
+    // the next line forgets.
     let smf_seid = ctx
         .cp_n4_seids
         .read()
@@ -5778,6 +5781,9 @@ pub(crate) fn take_sm_context(sm_context_ref: &str) -> Option<Option<context::Po
         .and_then(|m| m.get(sm_context_ref).copied())
         .unwrap_or_else(|| context::derive_cp_n4_seid(sm_context_ref));
     if let Ok(mut m) = ctx.far_peers.write() {
+        m.remove(&smf_seid);
+    }
+    if let Ok(mut m) = ctx.session_upfs.write() {
         m.remove(&smf_seid);
     }
     for map in [&ctx.pfcp_sessions, &ctx.cp_n4_seids] {
@@ -9380,6 +9386,129 @@ mod tests {
         assert!(associated, "UPF A is still associated");
         assert_eq!(stamp, Some(100), "A's stored stamp is untouched");
         assert!(kept, "A's session is kept");
+    }
+
+    /// #1031: a session restored from durable state onto UPF B, the non-default
+    /// pool member, is B's: B's Session Report on it is accepted, A's is refused.
+    #[tokio::test]
+    async fn a_restored_session_on_a_non_default_upf_takes_its_reports() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        smf_context_init(64, 256, 512);
+        let upf_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upf_b = tokio::net::UdpSocket::bind("127.0.0.3:0").await.unwrap();
+        let sock = std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let smf = sock.local_addr().unwrap();
+        let a = std::sync::Arc::new(pfcp_path::PfcpClient::new(
+            sock.clone(),
+            upf_a.local_addr().unwrap(),
+            [127, 0, 0, 1],
+        ));
+        let b = std::sync::Arc::new(pfcp_path::PfcpClient::new(
+            sock.clone(),
+            upf_b.local_addr().unwrap(),
+            [127, 0, 0, 1],
+        ));
+        pfcp_path::set_global_pool(vec![a.clone(), b.clone()]);
+        let listener = spawn_pfcp_listener(sock, vec![a.clone(), b.clone()]);
+        // Restored: in the session table, its UPF known only by identity.
+        let reference = "10312";
+        let seid = crate::context::derive_cp_n4_seid(reference);
+        {
+            let ctx = smf_self();
+            let ctx = ctx.read().unwrap();
+            ctx.pfcp_sessions
+                .write()
+                .unwrap()
+                .insert(reference.to_string(), 0x1031);
+            ctx.session_upfs
+                .write()
+                .unwrap()
+                .insert(seid, b.recovery_time_stamp_key());
+        }
+
+        upf_b
+            .send_to(&session_report(seid, 0x1031), smf)
+            .await
+            .unwrap();
+        let from_b = recv_pfcp(&upf_b).await;
+        upf_a
+            .send_to(&session_report(seid, 0x1032), smf)
+            .await
+            .unwrap();
+        let from_a = recv_pfcp(&upf_a).await;
+        pfcp_path::forget_session_peer(seid);
+        smf_self()
+            .read()
+            .unwrap()
+            .pfcp_sessions
+            .write()
+            .unwrap()
+            .remove(reference);
+        listener.abort();
+        pfcp_path::clear_global_upf_for_test();
+
+        assert_eq!(pfcp_cause_of(&from_b.expect("B answered")), Some(1));
+        assert_eq!(pfcp_cause_of(&from_a.expect("A answered")), Some(65));
+    }
+
+    /// #1059 round 2, M1, m1: the write side. A real establishment records the UPF's
+    /// identity; once the in-memory endpoint record is gone (a restart) and the UPF
+    /// is no longer the default member, the session still routes to it; and taking
+    /// the SM context forgets the identity.
+    #[tokio::test]
+    async fn an_established_sessions_upf_identity_survives_the_endpoint_record() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        smf_context_init(64, 256, 512);
+        let reference = seed_registered_session("imsi-001010000010311", 5, "internet");
+        let seid = smf_n4_seid_for(&reference);
+        let qos = SessionQos {
+            qfi: 9,
+            ambr_ul_bps: 100_000_000,
+            ambr_dl_bps: 100_000_000,
+            xr_flow: None,
+        };
+        let result = pfcp_session_establish(seid, [10, 45, 3, 11], "internet", 1, &qos)
+            .await
+            .expect("established");
+        smf_self()
+            .read()
+            .unwrap()
+            .pfcp_sessions
+            .write()
+            .unwrap()
+            .insert(reference.clone(), result.upf_seid);
+        let recorded = smf_self()
+            .read()
+            .unwrap()
+            .session_upfs
+            .read()
+            .unwrap()
+            .get(&seid)
+            .cloned();
+
+        // A restart: the endpoint record is gone; and B is no longer the default.
+        pfcp_path::forget_session_endpoint_for_test(seid);
+        let other = std::sync::Arc::new(pfcp_path::PfcpClient::new(
+            std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            "127.0.0.5:8805".parse().unwrap(),
+            [127, 0, 0, 1],
+        ));
+        pfcp_path::set_global_pool(vec![other, upf.client.clone()]);
+        let routed = pfcp_path::client_for_session(seid).map(|c| c.peer());
+        let _ = take_sm_context(&reference);
+        let forgotten = !smf_self()
+            .read()
+            .unwrap()
+            .session_upfs
+            .read()
+            .unwrap()
+            .contains_key(&seid);
+
+        assert_eq!(recorded, Some(upf.client.recovery_time_stamp_key()));
+        assert_eq!(routed, Some(upf.client.peer()), "by its identity");
+        assert!(forgotten, "take_sm_context forgets the identity");
     }
 
     /// #974 review M2, m6, #971: a stranger's Association Release Request is refused
