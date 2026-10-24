@@ -322,7 +322,7 @@ pub async fn notify(event: &str, supi: &str, psi: u8) {
                 "subscription {} has an unusable notifUri '{}': the {event} \
                  notification for {supi} cannot be delivered",
                 sub.id,
-                sub.notif_uri
+                nextgcore_sbi::log_redact::redact_last_segment(&sub.notif_uri)
             );
             continue;
         };
