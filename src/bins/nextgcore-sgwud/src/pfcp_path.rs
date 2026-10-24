@@ -449,9 +449,17 @@ impl ResponseCache {
 
     /// Pop the expired front of the queue; a queue item whose key was re-filed later
     /// (a newer instant) is skipped. Amortized O(1) per insertion.
+    ///
+    /// The cap counts in-flight entries too (#908 review follow-up): a request that is
+    /// never answered (no response built) stayed in `in_flight` until its TTL, so an
+    /// associated source could hold any number of them. The live in-flight entry is
+    /// the newest (requests are handled inline, one at a time), at the BACK of the
+    /// queue, so eviction from the front reaches it only when the cap is below 2.
     fn expire(&mut self, now: std::time::Instant) {
         while let Some(&(at, key)) = self.order.front() {
-            if now.duration_since(at) < self.ttl && self.answered.len() <= self.cap {
+            if now.duration_since(at) < self.ttl
+                && self.answered.len() + self.in_flight.len() <= self.cap
+            {
                 break;
             }
             self.order.pop_front();
@@ -515,6 +523,11 @@ impl ResponseCache {
     pub(crate) fn len(&self) -> usize {
         self.answered.len()
     }
+
+    #[cfg(test)]
+    pub(crate) fn in_flight_len(&self) -> usize {
+        self.in_flight.len()
+    }
 }
 
 fn digest(bytes: &[u8]) -> u64 {
@@ -524,7 +537,8 @@ fn digest(bytes: &[u8]) -> u64 {
     h.finish()
 }
 
-/// At most this many cached answers (#908 review): the oldest go first beyond it.
+/// At most this many cached answers and in-flight requests together (#908 review):
+/// the oldest go first beyond it. At least 2, so the live in-flight entry survives.
 const RESPONSE_CACHE_CAP: usize = 65_536;
 
 impl SxaNode {
@@ -874,8 +888,18 @@ impl SxaNode {
         // Only an ASSOCIATED peer's session/association requests are cached (#908
         // review): Heartbeats are idempotent, and an unassociated sender must not be
         // able to fill the cache.
-        let cacheable = msg_type != pfcp_msg_type::HEARTBEAT_REQUEST
-            && self.peers.read().await.contains_key(&from);
+        //
+        // Only the request types this node answers (#908 review follow-up): an
+        // unhandled type never gets a response filed, so registering it only filled
+        // `in_flight` until the TTL.
+        let cacheable = matches!(
+            msg_type,
+            pfcp_msg_type::ASSOCIATION_SETUP_REQUEST
+                | pfcp_msg_type::ASSOCIATION_RELEASE_REQUEST
+                | pfcp_msg_type::SESSION_ESTABLISHMENT_REQUEST
+                | pfcp_msg_type::SESSION_MODIFICATION_REQUEST
+                | pfcp_msg_type::SESSION_DELETION_REQUEST
+        ) && self.peers.read().await.contains_key(&from);
         if cacheable {
             let key = (from, header.sequence_number, msg_type);
             let lookup = self
@@ -2573,6 +2597,145 @@ mod tests {
             CacheLookup::New,
             "oldest dropped"
         );
+    }
+
+    /// #908 review follow-up: requests that are never answered count against the cap,
+    /// so an associated source cannot grow `in_flight` without bound.
+    #[test]
+    fn unanswered_requests_count_against_the_cap() {
+        let t0 = std::time::Instant::now();
+        let mut c = ResponseCache::new(std::time::Duration::from_secs(30), 16);
+        for seq in 0..10_000u32 {
+            c.on_request(ck(seq), b"never answered", t0);
+        }
+        assert!(c.in_flight_len() + c.len() <= 17, "{}", c.in_flight_len());
+        // The newest request is still in flight and gets its answer filed.
+        c.on_response(ck(9_999), b"a", t0);
+        assert_eq!(
+            c.on_request(ck(9_999), b"never answered", t0),
+            CacheLookup::Replay(b"a".to_vec())
+        );
+    }
+
+    /// Deliver `msg` from `peer` and return the response cause.
+    async fn cause_of(node: &SxaNode, peer: &UdpSocket, msg: &[u8]) -> Option<u8> {
+        deliver(node, peer, msg).await;
+        find_cause(&recv_decoded(peer).await.1)
+    }
+
+    /// An Association Setup Request body with Recovery Time Stamp `rts`.
+    fn setup_with_rts(rts: u32) -> Vec<u8> {
+        let mut assoc = BytesMut::new();
+        PfcpLibMessage::AssociationSetupRequest(AssociationSetupRequest::new(
+            NodeId::new_ipv4([127, 0, 0, 9]),
+            rts,
+        ))
+        .encode_body(&mut assoc);
+        assoc.to_vec()
+    }
+
+    /// #908 review follow-up: the response cache is flushed when the peer restarts, on
+    /// BOTH paths -- a new Association Setup (same Recovery Time Stamp: only the
+    /// Setup's own flush runs) and a Heartbeat Request with a changed stamp (the
+    /// restoration's flush). After either, the old instance's request bytes are
+    /// EXECUTED again (a deleted session: cause 65), not replayed (cause 1).
+    #[tokio::test]
+    async fn a_peer_restart_flushes_its_cached_answers() {
+        for via_heartbeat in [false, true] {
+            let (_guard, node, peer) = node_and_peer().await;
+            let rts = 5000u32;
+            deliver(
+                &node,
+                &peer,
+                &wire(
+                    pfcp_msg_type::ASSOCIATION_SETUP_REQUEST,
+                    None,
+                    1,
+                    &setup_with_rts(rts),
+                ),
+            )
+            .await;
+            let _ = recv_decoded(&peer).await;
+            let ctx = sgwu_self();
+            let sess = ctx
+                .sess_add(&FSeid::with_ipv4(
+                    0x908 + via_heartbeat as u64,
+                    Ipv4Addr::new(127, 0, 0, 9),
+                ))
+                .expect("add");
+            let deletion = wire(
+                pfcp_msg_type::SESSION_DELETION_REQUEST,
+                Some(sess.sgwu_sxa_seid),
+                7,
+                &[],
+            );
+            assert_eq!(
+                cause_of(&node, &peer, &deletion).await,
+                Some(sxa_build::pfcp_cause::REQUEST_ACCEPTED)
+            );
+            assert_eq!(
+                cause_of(&node, &peer, &deletion).await,
+                Some(sxa_build::pfcp_cause::REQUEST_ACCEPTED),
+                "a retransmission is replayed"
+            );
+
+            if via_heartbeat {
+                let mut hb = BytesMut::new();
+                PfcpLibMessage::HeartbeatRequest(HeartbeatRequest::new(rts + 1))
+                    .encode_body(&mut hb);
+                deliver(
+                    &node,
+                    &peer,
+                    &wire(pfcp_msg_type::HEARTBEAT_REQUEST, None, 8, &hb),
+                )
+                .await;
+                let _ = recv_decoded(&peer).await;
+            } else {
+                deliver(
+                    &node,
+                    &peer,
+                    &wire(
+                        pfcp_msg_type::ASSOCIATION_SETUP_REQUEST,
+                        None,
+                        9,
+                        &setup_with_rts(rts),
+                    ),
+                )
+                .await;
+                let _ = recv_decoded(&peer).await;
+            }
+            assert_eq!(
+                cause_of(&node, &peer, &deletion).await,
+                Some(sxa_build::pfcp_cause::SESSION_CONTEXT_NOT_FOUND),
+                "after the restart (heartbeat: {via_heartbeat}) the old bytes are executed, \
+                 not replayed"
+            );
+        }
+    }
+
+    /// An unhandled request type from an associated peer is not registered in the
+    /// cache (#908 review follow-up).
+    #[tokio::test]
+    async fn an_unhandled_request_type_is_not_cached() {
+        let (_guard, node, peer) = node_and_peer().await;
+        deliver(
+            &node,
+            &peer,
+            &wire(
+                pfcp_msg_type::ASSOCIATION_SETUP_REQUEST,
+                None,
+                1,
+                &setup_with_rts(1),
+            ),
+        )
+        .await;
+        let _ = recv_decoded(&peer).await;
+        let before = node.response_cache.lock().unwrap().in_flight_len();
+        for seq in 10..20u32 {
+            // Node Report Request (12): not handled on the SGW-U's Sxa.
+            deliver(&node, &peer, &wire(12, None, seq, &[])).await;
+        }
+        assert_eq!(node.response_cache.lock().unwrap().in_flight_len(), before);
     }
 
     /// A bound node plus a socket standing in for the SGW-C.
