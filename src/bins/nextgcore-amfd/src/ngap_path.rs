@@ -682,6 +682,11 @@ pub struct UeNasContext {
     /// belongs to is created later in the procedure, and because it must survive the
     /// authentication round trips in between.
     ue_policy_container: Option<Vec<u8>>,
+    /// The PDU session status / Uplink data status of the mobility or periodic
+    /// REGISTRATION REQUEST being answered (#759, TS 24.501 §5.5.1.3.4). Taken by
+    /// `send_registration_accept`, which releases and re-activates the sessions
+    /// and reports both in the Accept.
+    registration_session_ies: Option<ServiceRequestSessionIes>,
 }
 
 /// Manual `Debug` (no-auth-material-in-logs): the authentication material in
@@ -798,6 +803,7 @@ impl UeNasContext {
             ics_requested_psis: Vec::new(),
             registration_accept_sent: false,
             ue_policy_container: None,
+            registration_session_ies: None,
             cm_idle: false,
         }
     }
@@ -3443,6 +3449,21 @@ impl NgapServer {
             }
         }
 
+        // #759: the session IEs of a mobility or periodic update, recorded on the
+        // UE's context so whichever path sends the Accept finds them. Recorded only
+        // once the request has passed the §4.4.6 and congestion gates, and always
+        // overwritten, so a rejected or earlier request never leaves IEs behind for
+        // a later Accept.
+        // Only from an integrity-verified request: an unprotected one, including a
+        // request whose MAC failed (re-authenticated afterwards, with no replay of
+        // the full request), must not release or re-activate anyone's sessions.
+        let session_ies = integrity_protected
+            .then(|| registration_update_session_ies(nas))
+            .flatten();
+        self.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
+            s.registration_session_ies = session_ies;
+        });
+
         log::info!(
             "Registration Request: type={}, ngKSI={}/{}, identity_type={}, suci={:?}",
             req.registration_type,
@@ -5596,6 +5617,225 @@ impl NgapServer {
             .await
     }
 
+    /// Release and re-activate a registration update's sessions (#759, TS 24.501
+    /// §5.5.1.3.4, TS 23.502 §4.2.2.2.2 steps 17-21). This is the Service Request's
+    /// plan applied to the REGISTRATION REQUEST's IEs:
+    /// - each held PSI the PDU session status reports inactive is released at its
+    ///   SMF and forgotten;
+    /// - each PSI in the Uplink data status is activated at its SMF
+    ///   (upCnxState ACTIVATING), and its transfer is returned for the gNB.
+    async fn reconcile_update_sessions(
+        &mut self,
+        amf_ue_ngap_id: u64,
+        ies: ServiceRequestSessionIes,
+    ) -> UpdateSessionOutcome {
+        let held: Vec<(u8, Option<String>, crate::context::SNssai)> = {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard
+                .sess_list_for_ue(amf_ue_ngap_id)
+                .into_iter()
+                .map(|s| {
+                    let r = self
+                        .sm_context_refs
+                        .get(&(amf_ue_ngap_id, s.psi))
+                        .cloned()
+                        .or(s.sm_context_ref.clone());
+                    (s.psi, r, s.s_nssai)
+                })
+                .collect()
+        };
+        let plan = plan_service_request_sessions(
+            &held.iter().map(|(psi, _, _)| *psi).collect::<Vec<_>>(),
+            ies,
+            &[],
+        );
+        for psi in &plan.release {
+            let (smf_host, smf_port) = self.smf_target_for(amf_ue_ngap_id, *psi);
+            if let Some(r) = held
+                .iter()
+                .find(|(p, _, _)| p == psi)
+                .and_then(|(_, r, _)| r.clone())
+            {
+                if let Err(e) =
+                    crate::sbi_path::call_smf_release_sm_context(&smf_host, smf_port, &r).await
+                {
+                    log::warn!(
+                        "UE {amf_ue_ngap_id}: SMF release of PSI {psi} (inactive at the UE, \
+                         registration update) failed: {e}"
+                    );
+                }
+            }
+            // #826 review m3: #799's one funnel for a session that is over (its
+            // refs, its SMF, its handover transfer and its `sess_list` entry).
+            self.forget_session(amf_ue_ngap_id, *psi);
+            log::info!(
+                "UE {amf_ue_ngap_id}: PSI {psi} released, the registration update reports it \
+                 inactive (TS 24.501 §5.5.1.3.4)"
+            );
+        }
+        let mut activated = Vec::new();
+        let mut failed: u16 = 0;
+        for psi in &plan.activate {
+            let found = held.iter().find(|(p, _, _)| p == psi).cloned();
+            let transfer = match &found {
+                Some((_, Some(r), _)) => {
+                    let (smf_host, smf_port) = self.smf_target_for(amf_ue_ngap_id, *psi);
+                    match crate::sbi_path::call_smf_activate_up_connection(&smf_host, smf_port, r)
+                        .await
+                    {
+                        Ok(t) => Some(t),
+                        Err(e) => {
+                            log::warn!("UE {amf_ue_ngap_id}: PSI {psi} UP activation failed: {e}");
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+            match (transfer, found) {
+                (Some(transfer), Some((_, _, s_nssai))) => {
+                    activated.push(crate::ngap_asn1::CxtReqSession {
+                        pdu_session_id: *psi,
+                        s_nssai,
+                        transfer,
+                    })
+                }
+                _ => failed |= 1 << psi,
+            }
+        }
+        let remaining: u16 = held
+            .iter()
+            .map(|(p, _, _)| *p)
+            .filter(|p| !plan.release.contains(p))
+            .fold(0, |m, p| m | (1 << p));
+        UpdateSessionOutcome {
+            pdu_session_status: ies.pdu_session_status.map(|_| remaining),
+            reactivation_result: ies.uplink_data_status.map(|_| failed),
+            activated,
+        }
+    }
+
+    /// The Accept of a registration update on a new NG connection (from CM-IDLE),
+    /// sent in an Initial Context Setup together with the sessions it re-activated
+    /// (#759). If the Initial Context Setup cannot be encoded, the Accept still
+    /// goes, on its own in a Downlink NAS Transport, and the UE stays without AS
+    /// security on this connection, as it was before.
+    async fn send_update_accept_in_initial_context_setup(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        mut state: UeNasContext,
+        protected: &[u8],
+        sessions: &[crate::ngap_asn1::CxtReqSession],
+    ) -> Result<()> {
+        // KgNB from the uplink NAS COUNT of the REGISTRATION REQUEST, as the
+        // initial registration and the idle Service Request derive it (TS 33.501
+        // Annex A.9), and the {NH, NCC} chain restarted from it (Annex A.10).
+        let kgnb = nextgcore_crypt::kdf::nextgcore_kdf_kgnb_and_kn3iwf(
+            &state.amf_ue.kamf,
+            state.amf_ue.ul_count,
+            if state.amf_ue.access_type == 0 {
+                ACCESS_TYPE_3GPP
+            } else {
+                state.amf_ue.access_type
+            },
+        );
+        let ue_ambr = (state.amf_ue.ue_ambr.downlink > 0 || state.amf_ue.ue_ambr.uplink > 0)
+            .then_some((state.amf_ue.ue_ambr.downlink, state.amf_ue.ue_ambr.uplink));
+        let ics = {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            crate::ngap_asn1::build_initial_context_setup_request_with_sessions_asn1(
+                &guard,
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                &state.amf_ue.allowed_nssai,
+                &state.amf_ue.ue_security_capability,
+                &kgnb,
+                Some(protected),
+                ue_ambr,
+                sessions,
+            )
+        };
+        let Some(ics) = ics else {
+            log::error!(
+                "UE {amf_ue_ngap_id}: the Initial Context Setup for the registration update \
+                 did not encode; the Accept goes in a Downlink NAS Transport, and {} \
+                 re-activated session(s) get no user plane on this connection",
+                sessions.len()
+            );
+            self.ue_auth_state.insert(amf_ue_ngap_id, state);
+            self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, protected)
+                .await?;
+            return Ok(());
+        };
+        state.amf_ue.kgnb = kgnb;
+        state.amf_ue.init_next_hop_chain();
+        state.initial_context_setup_request_sent = true;
+        state.initial_context_setup_response_received = false;
+        self.ue_auth_state.insert(amf_ue_ngap_id, state);
+        let (racs_id, racs_cap) = self.racs_ies_for(amf_ue_ngap_id);
+        let ics = crate::racs::add_capability_ies(ics, racs_id.as_deref(), racs_cap.as_deref());
+        self.send_to_association(association_id, &ics).await?;
+        // #826 review M2 (#778): these user planes are now set up on this
+        // connection, so a queued or retransmitted downlink-data setup for one of
+        // them is not sent as a duplicate (TS 38.413 §8.2.1.4).
+        for s in sessions {
+            self.mark_up_active(amf_ue_ngap_id, s.pdu_session_id);
+        }
+        log::info!(
+            "Registration Accept (update) sent in an Initial Context Setup to UE \
+             {amf_ue_ngap_id} with {} re-activated PDU session(s)",
+            sessions.len()
+        );
+        Ok(())
+    }
+
+    /// One PDU SESSION RESOURCE SETUP REQUEST per session for a connected UE, the
+    /// NAS PDU `nas` in the first that is actually sent. Returns whether it was
+    /// carried (#759; the Service Request's #685 rule).
+    async fn send_setup_requests_carrying(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        sessions: &[crate::ngap_asn1::CxtReqSession],
+        nas: &[u8],
+    ) -> bool {
+        let mut carried = false;
+        for s in sessions {
+            let Some(req) = crate::ngap_asn1::build_pdu_session_resource_setup_request_asn1(
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                s.pdu_session_id,
+                s.s_nssai.sst,
+                s.s_nssai.sd,
+                (!carried).then_some(nas),
+                &s.transfer,
+            ) else {
+                log::error!(
+                    "UE {amf_ue_ngap_id}: PSI {} PDU Session Resource Setup did not encode",
+                    s.pdu_session_id
+                );
+                continue;
+            };
+            match self.send_to_association(association_id, &req).await {
+                Ok(()) => {
+                    carried = true;
+                    // #826 review M2 (#778): set up on this connection.
+                    self.mark_up_active(amf_ue_ngap_id, s.pdu_session_id);
+                }
+                Err(e) => log::warn!(
+                    "UE {amf_ue_ngap_id}: PSI {} setup request not sent: {e}",
+                    s.pdu_session_id
+                ),
+            }
+        }
+        carried
+    }
+
     /// Establish AS-layer security and deliver the initial Registration Accept.
     ///
     /// Per TS 23.502 §4.2.2.2.2 step 16 / TS 38.413 §8.3.1, the AMF derives
@@ -5616,7 +5856,19 @@ impl NgapServer {
             return Ok(());
         };
 
-        let Some(mut plain) = gmm_build::build_registration_accept(&state.amf_ue) else {
+        // #759, TS 24.501 §5.5.1.3.4: a mobility or periodic update's PDU session
+        // status releases what the UE no longer has, and its Uplink data status
+        // re-activates user planes. Both outcomes are reported in the Accept.
+        let update = state.registered && state.amf_ue.security_context_available;
+        let reconciled = match state.registration_session_ies.take() {
+            Some(ies) if update => Some(self.reconcile_update_sessions(amf_ue_ngap_id, ies).await),
+            _ => None,
+        };
+        let Some(mut plain) = gmm_build::build_registration_accept_for_sessions(
+            &state.amf_ue,
+            reconciled.as_ref().and_then(|r| r.pdu_session_status),
+            reconciled.as_ref().and_then(|r| r.reactivation_result),
+        ) else {
             self.ue_auth_state.insert(amf_ue_ngap_id, state);
             return Ok(());
         };
@@ -5643,14 +5895,54 @@ impl NgapServer {
         // re-issuing it on a periodic update would needlessly re-establish AS
         // security. `registered` is false during initial registration (set only
         // after Registration Complete), so this branch is taken solely on update.
-        if state.registered && state.amf_ue.security_context_available {
+        if update {
             let tmsi = state.amf_ue.next_guti.tmsi;
-            self.ue_auth_state.insert(amf_ue_ngap_id, state);
-            self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &protected)
+            let sessions = reconciled.map(|r| r.activated).unwrap_or_default();
+            let reactivated = sessions.len();
+            if !state.initial_context_setup_request_sent {
+                // A new NG connection: the UE came back from CM-IDLE (#609 resume),
+                // so the gNB holds no UE context and no AS security for it. The
+                // Accept rides an Initial Context Setup together with any session
+                // this request re-activated, as a Service Request's does (TS 23.502
+                // §4.2.2.2.2 step 21, §4.2.3.2 step 12; TS 38.413 §8.3.1). It does
+                // so even with no session to re-activate: a PDU session the UE
+                // establishes next on this connection needs the gNB's UE context,
+                // and the AMF only sends that session's setup once an Initial
+                // Context Setup Response has arrived.
+                self.send_update_accept_in_initial_context_setup(
+                    association_id,
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    state,
+                    &protected,
+                    &sessions,
+                )
                 .await?;
+            } else if !sessions.is_empty() {
+                // A connected UE: one PDU SESSION RESOURCE SETUP REQUEST per
+                // session, the Accept in the first one that goes out.
+                self.ue_auth_state.insert(amf_ue_ngap_id, state);
+                let carried = self
+                    .send_setup_requests_carrying(
+                        association_id,
+                        amf_ue_ngap_id,
+                        ran_ue_ngap_id,
+                        &sessions,
+                        &protected,
+                    )
+                    .await;
+                if !carried {
+                    self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &protected)
+                        .await?;
+                }
+            } else {
+                self.ue_auth_state.insert(amf_ue_ngap_id, state);
+                self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &protected)
+                    .await?;
+            }
             log::info!(
-                "Registration Accept (update) sent via DownlinkNASTransport to UE \
-                 {amf_ue_ngap_id} (5G-TMSI=0x{tmsi:08x})"
+                "Registration Accept (update) sent to UE {amf_ue_ngap_id} \
+                 (5G-TMSI=0x{tmsi:08x}, {reactivated} re-activated PDU session(s))"
             );
             // #91: AFTER the Accept is on the wire, never before.
             self.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
@@ -6082,6 +6374,10 @@ impl NgapServer {
         state.association_id = association_id;
         state.reachability = None;
         state.cm_idle = false;
+        // #759: a new NG connection, with no UE context at the gNB yet. A session
+        // re-activated by this registration has to ride an Initial Context Setup.
+        state.initial_context_setup_request_sent = false;
+        state.initial_context_setup_response_received = false;
         state.amf_ue.nr_tai = crate::context::Tai5gs {
             plmn_id: initial_ue.plmn_id.clone(),
             tac: initial_ue.tac,
@@ -14456,6 +14752,17 @@ impl NgapServer {
         amf_ue_ngap_id: u64,
         in_flight: EpsHoInFlight,
     ) -> usize {
+        // The Handover Request set up the UE's context and AS security at the
+        // target gNB (TS 38.413 §8.4.2.2), and its Handover Notify says the UE is
+        // there. Record that as an established UE context, as an Initial Context
+        // Setup Response would: the registration update that follows (TS 23.502
+        // §4.11.1.2.2 step 14) must not be answered with an Initial Context Setup
+        // to a gNB that already holds one (#759), and a new PDU session's setup is
+        // only sent once this is true.
+        self.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
+            s.initial_context_setup_request_sent = true;
+            s.initial_context_setup_response_received = true;
+        });
         // #945: TS 23.502 §4.11.1.2.2.3 step 5, the Forward Relocation Complete
         // Notification, comes BEFORE step 7, Nsmf_PDUSession_UpdateSMContext (Handover
         // Complete). The MME needs it to release the source eNB and start its step-14
@@ -15171,6 +15478,44 @@ impl NgapServer {
              ran_ue_ngap_id={ran_ue_ngap_id}, cause={cause:?} (association {association_id}); \
              releasing UE"
         );
+
+        // #826 review M1, TS 38.413 §8.3.1.3: the gNB could not set up THIS UE
+        // context. For a UE that was already registered (the ICS answered a
+        // registration update or a Service Request from CM-IDLE), that ends only
+        // the NG connection. The UE stays registered and goes CM-IDLE:
+        // - the Accept the ICS carried is not counted as delivered;
+        // - the user planes this ICS re-activated are deactivated at their SMFs,
+        //   so none is left in ACTIVATING;
+        // - the NG connection is released with a normal release.
+        // Deleting the NAS context instead would deregister the UE locally on
+        // every periodic update a gNB refuses.
+        let registered = self
+            .ue_auth_state
+            .with_mut(amf_ue_ngap_id, |s| s.registered)
+            .unwrap_or(false);
+        if registered {
+            self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
+                state.retx = None;
+                state.registration_accept_sent = false;
+                state.initial_context_setup_request_sent = false;
+                state.initial_context_setup_response_received = false;
+                state.cm_idle = true;
+            });
+            self.deactivate_up_connections(amf_ue_ngap_id).await;
+            if let Some(cmd) = crate::ngap_asn1::build_ue_context_release_command_asn1(
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                ngap_handler::cause_group::NAS,
+                0, // CauseNas normal-release
+            ) {
+                self.send_to_association(association_id, &cmd).await?;
+            }
+            log::warn!(
+                "UE {amf_ue_ngap_id}: Initial Context Setup failed; the UE stays registered, \
+                 CM-IDLE, its re-activated user planes deactivated (TS 38.413 §8.3.1.3)"
+            );
+            return Ok(());
+        }
 
         // Drop any pending ICS retransmission, then release the NG context.
         self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
@@ -16770,6 +17115,10 @@ mod reg_present {
     pub const REQUESTED_NSSAI: u64 = 1 << 2;
     /// Last visited registered TAI (IEI 0x52) — NOT cleartext.
     pub const LAST_VISITED_TAI: u64 = 1 << 3;
+    /// Uplink data status (IEI 0x40) — NOT cleartext (#759).
+    pub const UPLINK_DATA_STATUS: u64 = 1 << 4;
+    /// PDU session status (IEI 0x50) — NOT cleartext (#759).
+    pub const PDU_SESSION_STATUS: u64 = 1 << 5;
 }
 
 /// IEs permitted in an unprotected initial NAS message per TS 24.501 §4.4.6.
@@ -17149,7 +17498,40 @@ fn is_snpn_onboarding_suci(suci: &str) -> bool {
     suci.contains("onboarding")
 }
 
-/// Parse a plain Registration Request NAS PDU
+/// What `reconcile_update_sessions` did (#759).
+struct UpdateSessionOutcome {
+    /// The PDU session status for the Accept: `Some` when the UE sent one.
+    pdu_session_status: Option<u16>,
+    /// The PDU session reactivation result: `Some` when the UE sent an Uplink
+    /// data status. Bit n set = PSI n failed.
+    reactivation_result: Option<u16>,
+    /// The sessions activated at their SMFs, with the transfers for the gNB.
+    activated: Vec<crate::ngap_asn1::CxtReqSession>,
+}
+
+/// The PDU session status (0x50) and Uplink data status (0x40) of a mobility or
+/// periodic REGISTRATION REQUEST (#759, TS 24.501 §8.2.6). `None` for any other
+/// registration type, or when the request carries neither IE.
+pub(crate) fn registration_update_session_ies(plain: &[u8]) -> Option<ServiceRequestSessionIes> {
+    use nextgcore_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
+    let Ok(FiveGmmMessage::RegistrationRequest(rr)) =
+        parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(plain))
+    else {
+        return None;
+    };
+    let reg_type = plain.get(3).copied()? & 0x07;
+    if reg_type != crate::gmm_build::registration_type::MOBILITY_UPDATING
+        && reg_type != crate::gmm_build::registration_type::PERIODIC_UPDATING
+    {
+        return None;
+    }
+    let ies = ServiceRequestSessionIes {
+        uplink_data_status: rr.uplink_data_status.map(|u| u.psi),
+        pdu_session_status: rr.pdu_session_status.map(|p| p.psi),
+    };
+    (ies != ServiceRequestSessionIes::default()).then_some(ies)
+}
+
 /// The session IEs of a SERVICE REQUEST (#518): Uplink data status (TS 24.501
 /// §9.11.3.57) and PDU session status (§9.11.3.44), as PSI bitmaps (bit n = PSI n).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -17673,9 +18055,17 @@ fn parse_registration_request_pdu(nas: &[u8]) -> Option<ParsedRegistrationReques
                 pos += 1;
             }
             // Default: assume TLV
-            _ => {
+            iei => {
                 if pos + 1 >= nas.len() {
                     break;
+                }
+                // #759: the session IEs are non-cleartext (TS 24.501 §4.4.6), so
+                // their presence feeds the cleartext gate. Read elsewhere, by
+                // `registration_update_session_ies`.
+                match iei {
+                    0x40 => req.presencemask |= reg_present::UPLINK_DATA_STATUS,
+                    0x50 => req.presencemask |= reg_present::PDU_SESSION_STATUS,
+                    _ => {}
                 }
                 let len = nas[pos + 1] as usize;
                 pos += 2 + len;
@@ -34477,6 +34867,15 @@ mod eps_to_5gs_tests {
         );
         assert_eq!(complete.header.teid, Some(MME_TEID));
         assert!(!ngap.eps_ho_in_flight.contains_key(&amf_ue_ngap_id));
+        // #759: the target gNB holds the UE's context and AS security now, so the
+        // registration update that follows is not answered with an Initial
+        // Context Setup, and a new PDU session's setup is not deferred.
+        let arrived = ngap.ue_auth_state.get(amf_ue_ngap_id).unwrap();
+        assert!(
+            arrived.initial_context_setup_request_sent
+                && arrived.initial_context_setup_response_received,
+            "the handed-over UE has an established UE context at the target"
+        );
 
         crate::sbi_path::set_pgw_discovery_nrf_for_test(None);
         ngap.ue_auth_state.remove(amf_ue_ngap_id);
