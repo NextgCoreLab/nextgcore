@@ -17,7 +17,7 @@ use crate::codec_glue::{self, LppMethod, UeLppCapability};
 
 const VECTORS: &str = include_str!("lpp_golden_vectors.txt");
 
-fn unhex(h: &str) -> Vec<u8> {
+pub(crate) fn unhex(h: &str) -> Vec<u8> {
     (0..h.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap())
@@ -381,5 +381,30 @@ fn nr_ecid_request_matches_x691() {
     assert_eq!(
         codec_glue::build_lpp_request(LppMethod::NrEcid, 0).unwrap(),
         vec![0x90, 0x00, 0x20, 0x80, 0x12, 0x02, 0x81, 0xC0]
+    );
+}
+
+/// #907 review: the uplink capability decode, on the captured vectors.
+#[test]
+fn an_uplink_provide_capabilities_decodes_to_its_class_and_flavours() {
+    use codec_glue::{EcidFlavours, UeLppCapability};
+    assert_eq!(
+        codec_glue::decode_lpp_provide_capabilities(&unhex("9203084858")),
+        Some((
+            UeLppCapability::EcidOnly,
+            EcidFlavours {
+                eutra: true,
+                nr: false
+            }
+        ))
+    );
+    assert_eq!(
+        codec_glue::decode_lpp_provide_capabilities(&unhex("92030840")),
+        Some((UeLppCapability::Unknown, EcidFlavours::default()))
+    );
+    // A ProvideLocationInformation is not a capability report.
+    assert_eq!(
+        codec_glue::decode_lpp_provide_capabilities(&crate::lpp_fixtures::ecid_lpp(7, 60, 500, 1)),
+        None
     );
 }

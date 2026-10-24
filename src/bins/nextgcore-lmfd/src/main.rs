@@ -235,6 +235,19 @@ async fn main() -> Result<()> {
 
     lmf_context_init(args.max_measurements);
 
+    // #834 review: reap positioning sessions whose DetermineLocation went away
+    // without expiring them. Twice the hard response-time cap, so no live
+    // session is ever reaped.
+    tokio::spawn(async {
+        let mut tick = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            tick.tick().await;
+            if let Ok(context) = lmf_self().read() {
+                context.positioning_session_reap(SESSION_REAP_AGE);
+            }
+        }
+    });
+
     // #103: load the cell/TRP reference points BEFORE the SBI server accepts a
     // DetermineLocation, so no request is answered against a half-filled registry.
     // Every geometric solver reads this; before #103 the only writer was test code,
@@ -862,6 +875,10 @@ async fn initiate_positioning(
     };
     let access =
         crate::codec_glue::AccessRat::from_serving_cell(input.ncgi.is_some(), input.ecgi.is_some());
+    let flavours = match (input.supi.as_deref(), lmf_self().read()) {
+        (Some(supi), Ok(context)) => context.ue_ecid_flavours(supi),
+        _ => crate::codec_glue::EcidFlavours::default(),
+    };
     let budget = wait_budget(input);
     let gnb_half_ready = crate::codec_glue::multi_rtt_gnb_half_ready(
         nrppa_downlink::enabled(),
@@ -875,6 +892,7 @@ async fn initiate_positioning(
         reference_points,
         capability,
         access,
+        flavours,
         gnb_half_ready,
     );
     log::info!(
@@ -1155,6 +1173,10 @@ fn positioning_qos_from_input(input: &nlmf::InputData) -> PositioningQos {
         _ => PositioningQos::BestEffort,
     }
 }
+
+/// A positioning session older than this is reaped (#834 review): twice the
+/// hard cap of [`wait_budget`].
+const SESSION_REAP_AGE: Duration = Duration::from_secs(40);
 
 /// A2: bounded wait budget for the positioning procedure —
 /// `min(maxRespTime, locationQoS-derived bound, hard cap 20 s)`.
@@ -3024,6 +3046,31 @@ async fn handle_n1_message_notify(request: &SbiRequest) -> SbiResponse {
         // is worth a line: the E-CID half of the same message may still be fine, so
         // this does not fail the notification.
         Err(e) => log::warn!("Sidelink ranging report present but undecodable: {e}"),
+    }
+
+    // #834 review: a ProvideCapabilities is what the method selection reads
+    // (capability class and E-CID flavours). It was decoded nowhere on the uplink,
+    // so the stored capability was always Unknown.
+    if let Some((capability, flavours)) = codec_glue::decode_lpp_provide_capabilities(&lpp_bytes) {
+        match resolve_notify_supi(lcs_correlation_id, lpp_txn) {
+            Some(supi) => {
+                if let Ok(context) = lmf_self().read() {
+                    log::info!(
+                        "LPP ProvideCapabilities from {supi}: {capability:?}, E-CID {flavours:?}"
+                    );
+                    context.note_ue_lpp_capability(&supi, capability);
+                    context.note_ue_ecid_flavours(&supi, flavours);
+                }
+            }
+            None => log::warn!(
+                "LPP ProvideCapabilities with no SUPI to file it against \
+                 (lcsCorrelationId={lcs_correlation_id:?})"
+            ),
+        }
+        // #907 review: a capability report is not a measurement report. Counted
+        // as the session's LPP leg, an unsolicited one completed the session as a
+        // 500 and the real report then found no session (404).
+        return SbiResponse::no_content();
     }
 
     let Some(request_id) = resolve_notify_session(lcs_correlation_id, lpp_txn) else {
@@ -5199,6 +5246,7 @@ lmf:
     fn the_positioning_method_follows_qos_capability_and_the_registry() {
         use crate::codec_glue::{select_lpp_method, AccessRat, LppMethod, UeLppCapability};
         let nr = AccessRat::Nr;
+        let none = crate::codec_glue::EcidFlavours::default();
 
         // High accuracy, enough reference points, capability unknown, and no gNB
         // half to be had (NRPPa downlink off or no NG-RAN node configured) -> a
@@ -5211,6 +5259,7 @@ lmf:
                     3,
                     UeLppCapability::Unknown,
                     access,
+                    none,
                     false
                 ),
                 LppMethod::DlTdoa,
@@ -5224,6 +5273,7 @@ lmf:
                 5,
                 UeLppCapability::Unknown,
                 nr,
+                none,
                 false
             ),
             LppMethod::DlTdoa,
@@ -5235,6 +5285,7 @@ lmf:
                 3,
                 UeLppCapability::AdvancedMethods,
                 nr,
+                none,
                 false
             ),
             LppMethod::DlTdoa
@@ -5245,7 +5296,7 @@ lmf:
         const { assert!(crate::codec_glue::MULTI_RTT_GNB_HALF_AVAILABLE) };
         for qos in [PositioningQos::HighAccuracy, PositioningQos::Emergency] {
             assert_eq!(
-                select_lpp_method(qos, 3, UeLppCapability::Unknown, nr, true),
+                select_lpp_method(qos, 3, UeLppCapability::Unknown, nr, none, true),
                 LppMethod::MultiRtt,
                 "its two-sided measurement cancels the UE-gNB clock offset"
             );
@@ -5257,6 +5308,7 @@ lmf:
                 2,
                 UeLppCapability::Unknown,
                 nr,
+                none,
                 true
             ),
             LppMethod::NrEcid
@@ -5267,6 +5319,7 @@ lmf:
                 3,
                 UeLppCapability::EcidOnly,
                 nr,
+                none,
                 true
             ),
             LppMethod::NrEcid
@@ -5277,6 +5330,7 @@ lmf:
                 9,
                 UeLppCapability::Unknown,
                 nr,
+                none,
                 true
             ),
             LppMethod::NrEcid
@@ -5298,6 +5352,7 @@ lmf:
                 2,
                 UeLppCapability::Unknown,
                 nr,
+                none,
                 false
             ),
             LppMethod::NrEcid,
@@ -5309,6 +5364,7 @@ lmf:
                 2,
                 UeLppCapability::Unknown,
                 AccessRat::Eutra,
+                none,
                 false
             ),
             LppMethod::Ecid
@@ -5322,10 +5378,61 @@ lmf:
                 3,
                 UeLppCapability::EcidOnly,
                 nr,
+                none,
                 false
             ),
             LppMethod::NrEcid,
             "asking a UE for a method it has said it cannot perform gets an empty report"
+        );
+
+        // #834 review: a UE that reported only one E-CID flavour is asked for that
+        // one whatever the access; with both or neither, the access decides.
+        use crate::codec_glue::EcidFlavours;
+        let eutra_only = EcidFlavours {
+            eutra: true,
+            nr: false,
+        };
+        let nr_only = EcidFlavours {
+            eutra: false,
+            nr: true,
+        };
+        let both = EcidFlavours {
+            eutra: true,
+            nr: true,
+        };
+        assert_eq!(
+            select_lpp_method(
+                PositioningQos::BestEffort,
+                9,
+                UeLppCapability::EcidOnly,
+                nr,
+                eutra_only,
+                false
+            ),
+            LppMethod::Ecid,
+            "nextgsim #330: a UE with only E-UTRA E-CID on NR access"
+        );
+        assert_eq!(
+            select_lpp_method(
+                PositioningQos::BestEffort,
+                9,
+                UeLppCapability::EcidOnly,
+                AccessRat::Eutra,
+                nr_only,
+                false
+            ),
+            LppMethod::NrEcid
+        );
+        assert_eq!(
+            select_lpp_method(
+                PositioningQos::BestEffort,
+                9,
+                UeLppCapability::EcidOnly,
+                nr,
+                both,
+                false
+            ),
+            LppMethod::NrEcid
         );
 
         // Low latency prefers the cheapest measurement, not the most accurate.
@@ -5335,6 +5442,7 @@ lmf:
                 9,
                 UeLppCapability::Unknown,
                 nr,
+                none,
                 false
             ),
             LppMethod::NrEcid,
@@ -5346,6 +5454,7 @@ lmf:
                 9,
                 UeLppCapability::Unknown,
                 nr,
+                none,
                 false
             ),
             LppMethod::NrEcid
@@ -5356,6 +5465,7 @@ lmf:
                 9,
                 UeLppCapability::Unknown,
                 AccessRat::Eutra,
+                none,
                 false
             ),
             LppMethod::Ecid
@@ -7568,6 +7678,62 @@ mod positioning_chain_strict_peer {
 
         // An answer nobody waits for, with no session, is still unknown: 404.
         assert_eq!(handle_n2_info_notify(&notify).await.status, 404);
+    }
+
+    /// #907 review MAJOR: an unsolicited ProvideCapabilities during a session is
+    /// recorded and answered 204, and it is not the session's LPP leg: the session
+    /// stays pending, and the real report still completes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_capability_report_is_recorded_and_is_not_the_lpp_leg() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _serial = chain_lock().lock().await;
+        lmf_context_init(1024);
+        let supi = "imsi-001010000000907";
+        let (corr, mut rx, request_id) = {
+            let g = lmf_self();
+            let g = g.read().unwrap();
+            g.set_cell_coord("pci-7", crate::positioning::TrpCoord::new(40.0, -74.0, 0.0));
+            let req = g
+                .measurement_request(
+                    0,
+                    PositioningMethod::Ecid,
+                    None,
+                    None,
+                    PositioningQos::BestEffort,
+                )
+                .unwrap();
+            let (corr, rx) = g.positioning_session_register(Some(supi.into()), 3, req.request_id);
+            (corr, rx, req.request_id)
+        };
+        let caps = crate::lpp_equivalence_tests::unhex("9203084858");
+        assert_eq!(
+            handle_n1_message_notify(&amfd_notify_request(&corr, supi, &caps))
+                .await
+                .status,
+            204
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the capability report did not complete the session"
+        );
+        assert!(lmf_self()
+            .read()
+            .unwrap()
+            .positioning_session_find(&corr)
+            .is_some());
+        assert_eq!(
+            lmf_self().read().unwrap().ue_lpp_capability(supi),
+            crate::codec_glue::UeLppCapability::EcidOnly
+        );
+        let report = crate::lpp_fixtures::ecid_lpp(7, 60, 500, 3);
+        assert_eq!(
+            handle_n1_message_notify(&amfd_notify_request(&corr, supi, &report))
+                .await
+                .status,
+            204
+        );
+        assert!(matches!(rx.try_recv(), Ok(PositioningOutcome::Fix(_))));
+        let _ = request_id;
     }
 
     /// Negative leg (WS-A §A9 step 3): amfd accepts the transfer but the UE stays
