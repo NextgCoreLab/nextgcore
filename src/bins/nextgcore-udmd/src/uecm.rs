@@ -470,13 +470,16 @@ async fn notify_old_amf_if_changed(
         return;
     }
     let dereg = build_dereg_notification_body(access);
+    // The callback URI carries the old AMF's bearer token (#789, #753): logged
+    // with its last segment redacted, never whole.
+    let logged_uri = nextgcore_sbi::log_redact::redact_last_segment(old_uri);
     match client.send_dereg_notification(old_uri, &dereg).await {
         Ok(resp) => log::info!(
-            "[{supi}] Deregistration notification to old AMF {old_uri} -> {}",
+            "[{supi}] Deregistration notification to old AMF {logged_uri} -> {}",
             resp.status
         ),
         Err(e) => {
-            log::warn!("[{supi}] Deregistration notification to old AMF {old_uri} failed: {e}")
+            log::warn!("[{supi}] Deregistration notification to old AMF {logged_uri} failed: {e}")
         }
     }
 }
@@ -1308,6 +1311,54 @@ impl MockUdr {
 
 #[cfg(test)]
 mod tests {
+    /// #789 review: the old AMF's dereg-notify URI carries its bearer token, and
+    /// the notification to that AMF logs the URI with the token redacted. The
+    /// positive half (the line was logged at all) is checked first, so a logger
+    /// that never captured anything cannot pass.
+    ///
+    /// Revert-verified: logging `old_uri` whole fails this test.
+    #[tokio::test]
+    async fn the_old_amfs_dereg_callback_token_is_not_logged() {
+        crate::test_log::init();
+        let supi = "imsi-001010000000789";
+        let token = "tok-789-do-not-log";
+        let prior = json!({
+            "amfInstanceId": "amf-old-789",
+            "deregCallbackUri":
+                format!("http://10.0.0.9:7777/namf-callback/v1/{supi}/dereg-notify/{token}"),
+        });
+        let new = json!({ "amfInstanceId": "amf-new-789" });
+        let mock = Arc::new(MockUdr::new());
+        let client = UdrClient::Mock(mock.clone());
+        notify_old_amf_if_changed(supi, &prior, &new, &client, UecmAccess::ThreeGpp).await;
+
+        let lines = crate::test_log::captured(supi);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Deregistration notification to old AMF")
+                    && l.contains("/dereg-notify/<redacted>")),
+            "{lines:#?}"
+        );
+        assert!(lines.iter().all(|l| !l.contains(token)), "{lines:#?}");
+
+        // The shared sender's errors name the URI redacted too.
+        let err = crate::sbi_path::udm_sbi_send_callback_notification(
+            &format!("dereg-notify/{token}"),
+            &json!({}),
+        )
+        .await
+        .expect_err("not an absolute URI");
+        assert!(!err.contains(token), "{err}");
+
+        // And a UE context's Debug never prints either callback URI.
+        let mut ue = crate::context::UdmUe::new(1, supi);
+        ue.dereg_callback_uri = prior["deregCallbackUri"].as_str().map(str::to_string);
+        ue.non_3gpp_dereg_callback_uri = ue.dereg_callback_uri.clone();
+        let debug = format!("{ue:?}");
+        assert!(!debug.contains(token), "{debug}");
+    }
+
     use super::*;
     use std::sync::Arc;
 
