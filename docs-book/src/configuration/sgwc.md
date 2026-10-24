@@ -48,6 +48,8 @@ Parsed by `src/bins/nextgcore-sgwcd/src/config.rs`. Every field is optional; a m
 
 Not read: `logger.*` (use `-l/--log-level`) and `global.max.*`.
 
+> **Clock:** this NF refuses to start when the local clock reads before 2020-01-01, because its PFCP Recovery Time Stamp would be wrong. See [A set clock is required](overview.md#a-set-clock-is-required-pfcp-nfs) for the remedy on RTC-less hosts.
+
 ## Command-line flags
 
 From the clap `Args` struct in `src/bins/nextgcore-sgwcd/src/main.rs`:
