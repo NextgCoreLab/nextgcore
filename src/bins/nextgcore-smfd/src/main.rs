@@ -273,13 +273,10 @@ async fn self_nf_id() -> String {
         .unwrap_or_else(|| "nextgcore-smf".to_string())
 }
 
-/// Roll back a previously-admitted NSACF PDU-session count (DECREASE) when a
-/// later establishment step fails after admission. No-op when `admitted` is
-/// false (no count was taken). Resolves the NSACF endpoint afresh; best-effort.
 /// Count out at the NSACF every session still admitted there (#959), at most
 /// `budget`, 16 at once. Each admission is taken first (its binding's
 /// `nsac_admitted` cleared), so a release that completes later sends no second
-/// DECREASE. Returns how many DECREASEs were sent.
+/// DECREASE. Returns how many DECREASEs the NSACF accepted (#1072 round 2 m10).
 async fn nsac_count_out_unreleased(budget: std::time::Duration) -> usize {
     let deadline = tokio::time::Instant::now() + budget;
     let admitted: Vec<(String, u8, u8, Option<String>)> = {
@@ -317,65 +314,92 @@ async fn nsac_count_out_unreleased(budget: std::time::Duration) -> usize {
         };
         sends.spawn(async move {
             let _permit = permit;
-            rollback_nsac(true, &supi, psi, sst, sd.as_deref()).await;
+            rollback_nsac(true, &supi, psi, sst, sd.as_deref()).await
         });
     }
-    let mut sent = 0;
-    while let Ok(Some(_)) = tokio::time::timeout_at(deadline, sends.join_next()).await {
-        sent += 1;
+    let mut accepted = 0;
+    while let Ok(Some(done)) = tokio::time::timeout_at(deadline, sends.join_next()).await {
+        accepted += usize::from(done.unwrap_or(false));
     }
-    while sends.try_join_next().is_some() {
-        sent += 1;
+    while let Some(done) = sends.try_join_next() {
+        accepted += usize::from(done.unwrap_or(false));
     }
     sends.abort_all();
-    if sent < total {
+    if accepted < total {
         log::warn!(
-            "Shutdown: {sent}/{total} NSACF admission(s) counted out; the rest stay counted \
-             at the NSACF"
+            "Shutdown: {accepted}/{total} NSACF admission(s) counted out; the rest stay \
+             counted at the NSACF"
         );
+    } else {
+        log::info!("Shutdown: {total} NSACF admission(s) counted out");
     }
-    sent
+    accepted
 }
 
-/// NSAC for an EPS→5GS migrated session (#1072 review m4): an INCREASE, whose
-/// answer decides `nsac_admitted`. A rejection does not fail the mobility (the PDN
-/// connection exists and is in use); it is logged, and the session is not counted.
+/// NSAC for a PDN connection moving from EPC to 5GC (#1072 review m4, m9): an
+/// INCREASE. `Some(admitted)` decides `nsac_admitted`; `None` is a rejection. This
+/// SMF+PGW-C does no EPS counting, so per TS 23.501 §5.15.11.5 the NSAC "is performed
+/// when the UE moves from EPC to 5GC", and "Mobility from EPC to 5GC does not
+/// guarantee all active PDU Session(s) can be transferred to the 5GC": a rejected
+/// one is not transferred. An NSACF that is absent or does not answer fails open,
+/// as at establishment.
 pub(crate) async fn nsac_admit_migrated_session(
     supi: &str,
     psi: u8,
     sst: u8,
     sd: Option<&str>,
-) -> bool {
+) -> Option<bool> {
     let Some(nsacf) = policy::resolve_nsacf_endpoint().await else {
-        return false;
+        return Some(false);
     };
     let nf_id = self_nf_id().await;
     match policy::nsac_pdu_session_admit(&nsacf, &nf_id, supi, psi, sst, sd).await {
-        policy::NsacAdmission::Admitted => true,
+        policy::NsacAdmission::Admitted => Some(true),
         policy::NsacAdmission::Rejected => {
             log::warn!(
                 "[{supi}] NSACF rejected the EPS→5GS PDU session {psi} on S-NSSAI[SST:{sst} \
-                 SD:{sd:?}]; it is kept (the PDN connection is in use) and not counted"
+                 SD:{sd:?}]; it is not transferred to 5GS"
             );
-            false
+            None
         }
-        policy::NsacAdmission::Unavailable => false,
+        policy::NsacAdmission::Unavailable => Some(false),
         policy::NsacAdmission::NoAnswer => {
             let _ =
                 policy::nsac_pdu_session_release_precautionary(&nsacf, &nf_id, supi, psi, sst, sd)
                     .await;
-            false
+            Some(false)
         }
     }
 }
 
-pub(crate) async fn rollback_nsac(admitted: bool, supi: &str, psi: u8, sst: u8, sd: Option<&str>) {
+/// Roll back a previously-admitted NSACF PDU-session count (DECREASE) when a
+/// later establishment step fails after admission, or count a released session out.
+/// No-op when `admitted` is false (no count was taken). Resolves the NSACF endpoint
+/// afresh; best-effort. Returns whether the NSACF accepted the DECREASE (`true` for
+/// the no-op).
+pub(crate) async fn rollback_nsac(
+    admitted: bool,
+    supi: &str,
+    psi: u8,
+    sst: u8,
+    sd: Option<&str>,
+) -> bool {
     if !admitted {
-        return;
+        return true;
     }
-    if let Some(nsacf) = policy::resolve_nsacf_endpoint().await {
-        let nf_id = self_nf_id().await;
-        let _ = policy::nsac_pdu_session_release(&nsacf, &nf_id, supi, psi, sst, sd).await;
+    match policy::resolve_nsacf_endpoint().await {
+        Some(nsacf) => {
+            let nf_id = self_nf_id().await;
+            policy::nsac_pdu_session_release(&nsacf, &nf_id, supi, psi, sst, sd).await
+        }
+        None => {
+            policy::NSAC_DECREASE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            log::warn!(
+                "[{supi}] no NSACF resolved for the DECREASE of PSI {psi}; the session stays \
+                 counted at the NSACF"
+            );
+            false
+        }
     }
 }
 
@@ -3758,7 +3782,8 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     // land after this session's UECM registration and EBI assignment, and delete the
     // live session's serving-SMF record and free its EBI. A #39 reactivation is
     // re-established at once with the same PSI, so this is the common case.
-    await_release_in_flight(&supi, pdu_session_id).await;
+    let nsac_carried =
+        await_release_in_flight_on(&supi, pdu_session_id, Some((sst, snssai_sd.as_deref()))).await;
 
     // ---- Nnsacf_NSAC: per-S-NSSAI PDU-session admission (TS 29.536 §5.3) ----
     // Before committing PCF/PFCP resources, ask the NSACF (if deployed) whether
@@ -3769,6 +3794,8 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     // (fail-open), and a transport/HTTP failure also fails open so a missing
     // NSACF never blocks the basic data path.
     let nsac_admitted = match policy::resolve_nsacf_endpoint().await {
+        // #1072 review m6: counted in already, by the released session it replaces.
+        _ if nsac_carried => true,
         None => {
             log::debug!("No NSACF configured/discoverable — skipping slice admission control");
             false
@@ -6016,9 +6043,34 @@ enum UdmReleaseStage {
 struct ReleaseState {
     stage: UdmReleaseStage,
     superseded: bool,
-    /// The released session's NSACF DECREASE is still to come (#1072 review M1): a
-    /// create for the same (SUPI, PSI) counts in only after it.
-    nsac_pending: bool,
+    /// The released session's NSACF DECREASE (#1072 review M1, m6).
+    nsac: NsacRelease,
+}
+
+/// Where a release's NSACF DECREASE is (#1072 review m6). The NSACF keys an entry by
+/// UE ID and PDU session ID per S-NSSAI (TS 29.536 §5.2.2.3.2, TS 23.502 §4.2.11.4
+/// step 3), so only a DECREASE for the S-NSSAI a re-establishment counts in on can
+/// remove the new session's entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum NsacRelease {
+    /// Nothing to send, or sent and answered.
+    Done,
+    /// Not sent yet (waiting for a permit): for this S-NSSAI (SST, SD).
+    Queued(u8, Option<String>),
+    /// Sent, not answered yet: for this S-NSSAI.
+    OnWire(u8, Option<String>),
+    /// A same-S-NSSAI re-establishment took the admission over; never sent.
+    Superseded,
+}
+
+/// The same S-NSSAI, the SD compared without regard to case.
+fn same_snssai(a: (u8, Option<&str>), b: (u8, Option<&str>)) -> bool {
+    a.0 == b.0
+        && match (a.1, b.1) {
+            (None, None) => true,
+            (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
+            _ => false,
+        }
 }
 
 /// One release's UECM deregistration, shared by the release task and any SM Context
@@ -6030,12 +6082,15 @@ struct ReleaseEntry {
 }
 
 impl ReleaseEntry {
-    fn new(nsac_pending: bool) -> Self {
+    fn new(nsac: Option<(u8, Option<String>)>) -> Self {
         Self {
             state: std::sync::Arc::new(std::sync::Mutex::new(ReleaseState {
                 stage: UdmReleaseStage::Pending,
                 superseded: false,
-                nsac_pending,
+                nsac: match nsac {
+                    Some((sst, sd)) => NsacRelease::Queued(sst, sd),
+                    None => NsacRelease::Done,
+                },
             })),
             changed: std::sync::Arc::new(tokio::sync::Notify::new()),
         }
@@ -6080,13 +6135,65 @@ impl ReleaseEntry {
         self.changed.notify_waiters();
     }
 
-    fn nsac_pending(&self) -> bool {
-        self.lock().nsac_pending
+    /// Whether this release's DECREASE for `snssai` is still to be answered: queued or
+    /// on the wire. A DECREASE for another S-NSSAI cannot touch the new session's
+    /// entry, so it is never waited for.
+    fn nsac_pending_for(&self, snssai: (u8, Option<&str>)) -> bool {
+        match &self.lock().nsac {
+            NsacRelease::Queued(sst, sd) | NsacRelease::OnWire(sst, sd) => {
+                same_snssai((*sst, sd.as_deref()), snssai)
+            }
+            NsacRelease::Done | NsacRelease::Superseded => false,
+        }
+    }
+
+    /// A same-S-NSSAI re-establishment takes over a DECREASE that has not been sent
+    /// (#1072 review m6): the NSACF entry the old session was counted in under is the
+    /// new session's (same UE, PSI and S-NSSAI), so neither the DECREASE nor a new
+    /// INCREASE goes out. Returns whether the admission was taken over. A compare-and-
+    /// set under the entry's mutex, the one [`ReleaseEntry::begin_nsac_decrease`]
+    /// takes.
+    fn supersede_nsac(&self, snssai: (u8, Option<&str>)) -> bool {
+        let mut st = self.lock();
+        match &st.nsac {
+            NsacRelease::Queued(sst, sd) if same_snssai((*sst, sd.as_deref()), snssai) => {
+                st.nsac = NsacRelease::Superseded;
+                drop(st);
+                self.changed.notify_waiters();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Queued to OnWire, unless a re-establishment superseded it: `false` means do
+    /// not send the DECREASE.
+    fn begin_nsac_decrease(&self) -> bool {
+        let mut st = self.lock();
+        match std::mem::replace(&mut st.nsac, NsacRelease::Done) {
+            NsacRelease::Queued(sst, sd) => {
+                st.nsac = NsacRelease::OnWire(sst, sd);
+                true
+            }
+            other => {
+                st.nsac = other;
+                false
+            }
+        }
     }
 
     fn finish_nsac(&self) {
-        self.lock().nsac_pending = false;
+        let mut st = self.lock();
+        if st.nsac != NsacRelease::Superseded {
+            st.nsac = NsacRelease::Done;
+        }
+        drop(st);
         self.changed.notify_waiters();
+    }
+
+    #[cfg(test)]
+    fn nsac_stage(&self) -> NsacRelease {
+        self.lock().nsac.clone()
     }
 }
 
@@ -6098,14 +6205,14 @@ struct ReleaseInFlight {
 
 impl ReleaseInFlight {
     fn begin(supi: &str, psi: u8) -> Self {
-        Self::begin_with(supi, psi, false)
+        Self::begin_with(supi, psi, None)
     }
 
-    /// [`Self::begin`], with the session's NSACF DECREASE still to come when
-    /// `nsac_pending` (#1072 review M1).
-    fn begin_with(supi: &str, psi: u8, nsac_pending: bool) -> Self {
+    /// [`Self::begin`], with the session's NSACF DECREASE on `nsac`, the S-NSSAI it
+    /// was counted in on, still to come (#1072 review M1, m6).
+    fn begin_with(supi: &str, psi: u8, nsac: Option<(u8, Option<String>)>) -> Self {
         let key = (supi.to_string(), psi);
-        let entry = ReleaseEntry::new(nsac_pending);
+        let entry = ReleaseEntry::new(nsac);
         releases_in_flight()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -6150,6 +6257,19 @@ const UDM_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// no old DELETE can land after the new PUT, and a create waits only when one is
 /// actually outstanding.
 async fn await_release_in_flight(supi: &str, psi: u8) {
+    await_release_in_flight_on(supi, psi, None).await;
+}
+
+/// [`await_release_in_flight`] for a create that counts in on `snssai` at the NSACF
+/// (#1072 review M1, m6): a previous release's DECREASE for that S-NSSAI that has not
+/// been sent is superseded, and one on the wire is waited for. Returns whether an
+/// admission was taken over, i.e. the session is counted already and must send no
+/// INCREASE.
+async fn await_release_in_flight_on(
+    supi: &str,
+    psi: u8,
+    snssai: Option<(u8, Option<&str>)>,
+) -> bool {
     let entries = releases_in_flight()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -6157,7 +6277,19 @@ async fn await_release_in_flight(supi: &str, psi: u8) {
         .cloned()
         .unwrap_or_default();
     if entries.is_empty() {
-        return;
+        return false;
+    }
+    let mut carried = false;
+    if let Some(snssai) = snssai {
+        for entry in &entries {
+            if entry.supersede_nsac(snssai) {
+                log::info!(
+                    "[{supi}] PSI {psi}: a previous release's NSACF DECREASE had not been \
+                     sent; this session takes its admission over"
+                );
+                carried = true;
+            }
+        }
     }
     // Supersede every pending one first, so none of them starts its DELETE while
     // this create waits on another.
@@ -6175,7 +6307,8 @@ async fn await_release_in_flight(supi: &str, psi: u8) {
     }
     let deadline =
         tokio::time::Instant::now() + UDM_RELEASE_TIMEOUT + std::time::Duration::from_millis(500);
-    // #1072 review M1: and the old session's NSACF DECREASE, superseded or not.
+    // #1072 review M1: and the old session's NSACF DECREASE on the wire, for the
+    // S-NSSAI this create counts in on.
     let waiting: Vec<(ReleaseEntry, bool)> = all
         .into_iter()
         .map(|e| {
@@ -6190,7 +6323,8 @@ async fn await_release_in_flight(supi: &str, psi: u8) {
             let notified = entry.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if (!uecm || entry.stage() == UdmReleaseStage::Done) && !entry.nsac_pending() {
+            let nsac = snssai.is_some_and(|sn| entry.nsac_pending_for(sn));
+            if (!uecm || entry.stage() == UdmReleaseStage::Done) && !nsac {
                 break;
             }
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
@@ -6198,10 +6332,19 @@ async fn await_release_in_flight(supi: &str, psi: u8) {
                     "[{supi}] PSI {psi}: a previous release's UECM deregistration or NSACF \
                      DECREASE is still running; proceeding anyway"
                 );
-                return;
+                return carried;
             }
         }
     }
+    carried
+}
+
+/// The S-NSSAI a released session's DECREASE is for; `None` when it was not counted
+/// in.
+fn nsac_release_of(binding: &context::PolicyBinding) -> Option<(u8, Option<String>)> {
+    binding
+        .nsac_admitted
+        .then(|| (binding.sst, binding.sd.clone()))
 }
 
 /// Release side-effect tasks still running (#912 review m5).
@@ -6245,7 +6388,8 @@ fn udm_release_permits() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
 /// must not queue behind other releases' EASDF and AMF work.
 fn spawn_release_side_effects(sm_context_ref: &str, binding: context::PolicyBinding) {
     let reference = sm_context_ref.to_string();
-    let in_flight = ReleaseInFlight::begin_with(&binding.supi, binding.psi, binding.nsac_admitted);
+    let in_flight =
+        ReleaseInFlight::begin_with(&binding.supi, binding.psi, nsac_release_of(&binding));
     RELEASE_SIDE_EFFECTS_RUNNING.fetch_add(1, Ordering::SeqCst);
     tokio::spawn(async move {
         // #1072 review M1: the NSACF DECREASE in the early, ungated stage, beside
@@ -6279,6 +6423,20 @@ fn nsac_release_permits() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
 async fn release_nsac_admission(binding: &context::PolicyBinding, entry: Option<&ReleaseEntry>) {
     if binding.nsac_admitted {
         let _permit = nsac_release_permits().clone().acquire_owned().await;
+        // #1072 review m6: a re-establishment may have taken the admission over while
+        // this waited for its permit.
+        if entry.is_some_and(|e| !e.begin_nsac_decrease()) {
+            log::info!(
+                "[{}] PSI {}: NSACF DECREASE not sent; a re-establishment took the \
+                 admission over",
+                binding.supi,
+                binding.psi
+            );
+            if let Some(e) = entry {
+                e.finish_nsac();
+            }
+            return;
+        }
         if tokio::time::timeout(
             UDM_RELEASE_TIMEOUT,
             rollback_nsac(
@@ -7002,13 +7160,18 @@ async fn graceful_shutdown(
             }
         }
     };
-    tokio::join!(fanouts, n4);
-    // #959, #941 review: the sessions released with the association that never
-    // reached `release_side_effects` (the #39s the deadline abandoned, and the UEs
-    // that have not completed yet) are counted out at the NSACF here.
-    if release {
-        nsac_count_out_unreleased(left().saturating_sub(SHUTDOWN_GTP_DRAIN)).await;
-    }
+    // #959, #941 review, #1072 round 2 N1: the sessions released with the
+    // association are counted out at the NSACF ALONGSIDE the fan-out and the
+    // Association Release, not after them: those can use the whole window, and
+    // the sessions the deadline then abandons are the ones that most need it. Every
+    // admission is taken at the first poll, so a UE that completes its release
+    // meanwhile sends no second DECREASE.
+    let nsac = async {
+        if release {
+            nsac_count_out_unreleased(left().saturating_sub(SHUTDOWN_GTP_DRAIN)).await;
+        }
+    };
+    tokio::join!(fanouts, n4, nsac);
     pfcp_listener.abort();
     log::info!("SMF N4 PFCP listener stopped");
     // #718 review m2: the Delete Bearer Requests sent above, on either path, are
@@ -7762,7 +7925,7 @@ async fn handle_sm_context_release(
     };
     let _in_flight = binding
         .as_ref()
-        .map(|b| ReleaseInFlight::begin_with(&b.supi, b.psi, b.nsac_admitted));
+        .map(|b| ReleaseInFlight::begin_with(&b.supi, b.psi, nsac_release_of(b)));
 
     // Drive the GSM FSM: Operational → WaitPfcpDeletion
     let mut fsm = binding.as_ref().map(|b| b.fsm.clone());
@@ -14298,7 +14461,7 @@ mod tests {
     /// A recording NSACF: answers INCREASE with `increase` and DECREASE with
     /// `decrease`, each after its delay; records "INC"/"DEC" per SUPI when it
     /// answers, i.e. when the count changes.
-    async fn recording_nsacf(
+    pub(crate) async fn recording_nsacf(
         increase: u16,
         decrease: u16,
         increase_delay: std::time::Duration,
@@ -14387,6 +14550,13 @@ mod tests {
             .await
             .unwrap();
         let _ = release_sm_context_locally(&reference);
+        // #1072 round 2 m6: on the wire (a queued one is superseded instead, below).
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !matches!(nsac_release_stage(supi, 8), Some(NsacRelease::OnWire(..)))
+            && std::time::Instant::now() < until
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
         let second = create().await.status;
         let order: Vec<String> = seen
             .lock()
@@ -14419,6 +14589,264 @@ mod tests {
             vec!["INC", "DEC", "INC"],
             "the old session counts out first"
         );
+    }
+
+    /// The NSAC stage of the first release of (SUPI, PSI) in flight.
+    fn nsac_release_stage(supi: &str, psi: u8) -> Option<NsacRelease> {
+        releases_in_flight()
+            .lock()
+            .unwrap()
+            .get(&(supi.to_string(), psi))
+            .and_then(|l| l.first().map(ReleaseEntry::nsac_stage))
+    }
+
+    /// The INC/DEC order the recording NSACF saw for `supi`.
+    fn nsac_order(seen: &std::sync::Mutex<Vec<(String, String)>>, supi: &str) -> Vec<String> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, s)| s == supi)
+            .map(|(op, _)| op.clone())
+            .collect()
+    }
+
+    /// The live binding of (SUPI, PSI), if any.
+    fn binding_of(supi: &str, psi: u8) -> Option<(String, context::PolicyBinding)> {
+        smf_self()
+            .read()
+            .unwrap()
+            .policy_bindings
+            .read()
+            .unwrap()
+            .iter()
+            .find(|(_, b)| b.supi == supi && b.psi == psi)
+            .map(|(r, b)| (r.clone(), b.clone()))
+    }
+
+    /// #1072 round 2 m6: with every NSAC release permit held (a UPF-restart storm
+    /// against a slow NSACF), the old session's DECREASE waits unsent. A same-S-NSSAI
+    /// re-establishment takes the admission over: no INCREASE, and that DECREASE is
+    /// never sent, so it cannot remove the live entry after the INCREASE. The next
+    /// release counts the session out once.
+    #[tokio::test]
+    async fn a_reestablishment_takes_over_a_decrease_not_yet_sent() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let zero = std::time::Duration::ZERO;
+        let (nsacf, seen) = recording_nsacf(204, 204, zero, zero).await;
+        let supi = "imsi-001010000010724";
+        let request = create_request(
+            supi,
+            10,
+            &n1(
+                10,
+                1,
+                gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+                &[0x91, 0x00],
+            ),
+        );
+        let first = handle_sm_context_create(&request).await.status;
+        let (reference, _) = binding_of(supi, 10).expect("first session");
+        let held = nsac_release_permits()
+            .clone()
+            .acquire_many_owned(NSAC_RELEASE_FANOUT as u32)
+            .await
+            .unwrap();
+        let _ = release_sm_context_locally(&reference);
+        let queued = matches!(nsac_release_stage(supi, 10), Some(NsacRelease::Queued(..)));
+        let started = std::time::Instant::now();
+        let second = handle_sm_context_create(&request).await.status;
+        let took = started.elapsed();
+        let carried = binding_of(supi, 10).is_some_and(|(_, b)| b.nsac_admitted);
+        drop(held);
+        side_effects_settled().await;
+        let before_cleanup = nsac_order(&seen, supi);
+        let leftover = binding_of(supi, 10).map(|(r, _)| r);
+        if let Some(r) = leftover {
+            let _ = release_sm_context_locally(&r);
+        }
+        side_effects_settled().await;
+        let after_cleanup = nsac_order(&seen, supi);
+        std::env::remove_var("NSACF_URI");
+        nsacf.stop().await.ok();
+
+        assert!(queued, "the old DECREASE was waiting for a permit");
+        assert_eq!((first, second), (201, 201));
+        assert!(
+            took < std::time::Duration::from_secs(2),
+            "no wait: {took:?}"
+        );
+        assert!(carried, "the new session holds the admission");
+        assert_eq!(before_cleanup, vec!["INC"], "no second INC, no old DEC");
+        assert_eq!(after_cleanup, vec!["INC", "DEC"], "counted out once");
+    }
+
+    /// #1072 round 2 m6: a DECREASE for another S-NSSAI cannot touch the new
+    /// session's NSACF entry, so a re-establishment on another slice neither waits
+    /// for it nor takes it over: INC, INC, then the old slice's DEC.
+    #[tokio::test]
+    async fn a_reestablishment_on_another_slice_neither_waits_nor_takes_over() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let zero = std::time::Duration::ZERO;
+        let (nsacf, seen) = recording_nsacf(204, 204, zero, zero).await;
+        let supi = "imsi-001010000010725";
+        let request = create_request(
+            supi,
+            11,
+            &n1(
+                11,
+                1,
+                gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+                &[0x91, 0x00],
+            ),
+        );
+        let first = handle_sm_context_create(&request).await.status;
+        let (reference, _) = binding_of(supi, 11).expect("first session");
+        // The old session was on SST 2.
+        if let Ok(ctx) = smf_self().read() {
+            if let Some(b) = ctx.policy_bindings.write().unwrap().get_mut(&reference) {
+                b.sst = 2;
+            }
+        }
+        let held = nsac_release_permits()
+            .clone()
+            .acquire_many_owned(NSAC_RELEASE_FANOUT as u32)
+            .await
+            .unwrap();
+        let _ = release_sm_context_locally(&reference);
+        let started = std::time::Instant::now();
+        let second = handle_sm_context_create(&request).await.status;
+        let took = started.elapsed();
+        let at_second = nsac_order(&seen, supi);
+        drop(held);
+        side_effects_settled().await;
+        let after = nsac_order(&seen, supi);
+        let leftover = binding_of(supi, 11).map(|(r, _)| r);
+        if let Some(r) = leftover {
+            let _ = release_sm_context_locally(&r);
+        }
+        side_effects_settled().await;
+        std::env::remove_var("NSACF_URI");
+        nsacf.stop().await.ok();
+
+        assert_eq!((first, second), (201, 201));
+        assert!(
+            took < std::time::Duration::from_secs(2),
+            "no wait: {took:?}"
+        );
+        assert_eq!(at_second, vec!["INC", "INC"]);
+        assert_eq!(
+            after,
+            vec!["INC", "INC", "DEC"],
+            "the old slice counted out"
+        );
+    }
+
+    /// #1072 round 2 N1: a releasing shutdown whose #39 fan-out never finishes and
+    /// whose Association Release is never answered (both run out their whole time)
+    /// still counts out every admitted session before it returns. Before, the count-out ran after the release, with
+    /// nothing left of the deadline.
+    #[tokio::test]
+    async fn a_releasing_shutdown_counts_out_while_the_release_runs_out_its_time() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let zero = std::time::Duration::ZERO;
+        let (nsacf, seen) = recording_nsacf(204, 204, zero, zero).await;
+        let supis: Vec<String> = (0..3).map(|i| format!("imsi-00101000001072{i}")).collect();
+        let refs: Vec<String> = supis
+            .iter()
+            .enumerate()
+            .map(|(i, supi)| {
+                let r = seed_established_session(
+                    supi,
+                    12,
+                    std::net::Ipv4Addr::new(10, 45, 10, 72 + i as u8),
+                );
+                if let Ok(ctx) = smf_self().read() {
+                    if let Some(b) = ctx.policy_bindings.write().unwrap().get_mut(&r) {
+                        b.nsac_admitted = true;
+                        b.sst = 1;
+                    }
+                }
+                r
+            })
+            .collect();
+        // A UPF that never answers: the Association Release takes all its time.
+        let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = std::sync::Arc::new(pfcp_path::PfcpClient::new(
+            std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            silent.local_addr().unwrap(),
+            [127, 0, 0, 1],
+        ));
+        client.set_assoc_state_for_test(true, None, None).await;
+        // And a #39 fan-out an earlier UPF restart started, that never finishes.
+        pfcp_path::track_restart_fanout_for_test(tokio::spawn(std::future::pending::<()>()));
+        let deadline = tokio::time::Instant::now()
+            + SHUTDOWN_ASSOCIATION_RELEASE
+            + SHUTDOWN_GTP_DRAIN
+            + std::time::Duration::from_secs(1);
+
+        graceful_shutdown(
+            async {},
+            std::slice::from_ref(&client),
+            true,
+            tokio::spawn(async {}),
+            deadline,
+        )
+        .await;
+        let counted_out: usize = supis
+            .iter()
+            .map(|s| {
+                nsac_order(&seen, s)
+                    .iter()
+                    .filter(|op| *op == "DEC")
+                    .count()
+            })
+            .sum();
+        for r in &refs {
+            let _ = release_sm_context_locally(r);
+        }
+        side_effects_settled().await;
+        std::env::remove_var("NSACF_URI");
+        nsacf.stop().await.ok();
+        drop(silent);
+
+        assert_eq!(counted_out, 3, "every admitted session counted out");
+    }
+
+    /// #1072 round 2 m10: the shutdown count-out reports the DECREASEs the NSACF
+    /// accepted, not the ones it merely finished.
+    #[tokio::test]
+    async fn the_shutdown_count_out_reports_only_accepted_decreases() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let zero = std::time::Duration::ZERO;
+        let (nsacf, seen) = recording_nsacf(204, 500, zero, zero).await;
+        let supi = "imsi-001010000010726";
+        let reference = seed_established_session(supi, 13, std::net::Ipv4Addr::new(10, 45, 10, 76));
+        if let Ok(ctx) = smf_self().read() {
+            if let Some(b) = ctx.policy_bindings.write().unwrap().get_mut(&reference) {
+                b.nsac_admitted = true;
+                b.sst = 1;
+            }
+        }
+        let accepted = nsac_count_out_unreleased(std::time::Duration::from_secs(5)).await;
+        let sent = nsac_order(&seen, supi);
+        let _ = release_sm_context_locally(&reference);
+        side_effects_settled().await;
+        std::env::remove_var("NSACF_URI");
+        nsacf.stop().await.ok();
+
+        assert_eq!(sent, vec!["DEC"], "sent");
+        assert_eq!(accepted, 0, "but refused, so not counted out");
     }
 
     /// #1072 review M3: a DECREASE the NSACF refuses is logged and counted.
