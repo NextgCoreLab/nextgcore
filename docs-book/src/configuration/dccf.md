@@ -42,7 +42,7 @@ That is the complete list — no other YAML field influences the daemon.
 
 Every other field in the shipped example file is decorative; since the file is only probed for `sbi.oauth2.require`, all other keys are silently ignored:
 
-- **`logger.level` is inert.** The log level comes from the CLI flag `-e/--log-level` (default `info`) or `RUST_LOG`, not the YAML.
+- **`logger.level` is read.** The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691).
 - **`dccf.sbi.server[]` (address/advertise/port) is inert.** The SBI bind address and port come from `--sbi-addr`/`--sbi-port`; the docker deployment passes them on the command line.
 - **`dccf.nrf.uri` is inert.** The NRF URI comes exclusively from `--nrf-uri` (default `http://127.0.0.1:7777`); the docker deployment passes `--nrf-uri http://172.23.0.10:7777` explicitly.
 - **`dccf.max_subscriptions` is inert.** The subscription cap comes from `--max-subscriptions`; the YAML value `4096` merely mirrors the CLI default.
@@ -55,7 +55,7 @@ From the clap `Args` struct in `src/bins/nextgcore-dccfd/src/main.rs`:
 |---|---|---|---|
 | `-c, --config` | path | `/etc/nextgcore/dccf.yaml` | Configuration file path (read only for the OAuth2 knob). |
 | `-l, --log-file` | path | unset | **Parsed but unused** — declared in `Args` yet never referenced by the binary; logging goes to stderr via `env_logger`. |
-| `-e, --log-level` | string | `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`). Overridden by `RUST_LOG` when set. |
+| `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-m, --no-color` | flag | off | **Parsed but unused** — declared in `Args` yet never referenced by the binary. |
 | `--sbi-addr` | string | `0.0.0.0` | SBI server bind address; also advertised as the NF's `ipv4Addresses` in the NRF registration. |
 | `--sbi-port` | u16 | `7816` | SBI server port ("TS 29.574 default: 7816" per code comment); docker deployments pass `7777`. |

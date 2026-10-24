@@ -150,9 +150,10 @@ struct Args {
     #[arg(short = 'l', long)]
     log_file: Option<String>,
 
-    /// Log level (trace, debug, info, warn, error)
-    #[arg(short = 'e', long, default_value = "info")]
-    log_level: String,
+    /// Log level (trace, debug, info, warn, error). Without it, the config
+    /// file's `logger.level`, else `info`; `RUST_LOG` overrides (#691).
+    #[arg(short = 'e', long)]
+    log_level: Option<String>,
 
     /// Disable color output
     #[arg(short = 'm', long)]
@@ -224,7 +225,10 @@ fn with_nsacf_context<T>(f: impl FnOnce(&NsacfContext) -> T) -> Option<T> {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    init_logging(&args.log_level);
+    init_logging(&nextgcore_core::log::nf_log_level(
+        args.log_level.as_deref(),
+        Some(&args.config),
+    ));
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = nextgcore_metrics::otel::init_otel(
         nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
@@ -2525,7 +2529,7 @@ nsacf:
     fn test_args_default() {
         let args = Args::parse_from(["nextgcore-nsacfd"]);
         assert_eq!(args.config, "/etc/nextgcore/nsacf.yaml");
-        assert_eq!(args.log_level, "info");
+        assert_eq!(args.log_level, None);
         assert_eq!(args.sbi_port, 7813);
         assert_eq!(args.max_quotas, 64);
         assert_eq!(args.eac_threshold, 80);
