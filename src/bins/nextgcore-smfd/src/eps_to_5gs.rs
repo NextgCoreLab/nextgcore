@@ -1097,10 +1097,14 @@ pub(crate) async fn handle_completed(
         sess.handover.eps_to_5gs = false;
         sess.handover.n3_ul_pdr_id = None;
         sess.handover.forwarding_ebis.clear();
+        // The UE is CONNECTED on the target and the downlink FAR forwards to it, so the
+        // user plane is ACTIVATED whatever it was before -- including after the source's
+        // AN release DEACTIVATED it mid-handover (#805, the #738 ordering). Left
+        // DEACTIVATED, a Downlink Data Report would page a connected UE.
+        sess.up_cnx_state = context::UpCnxState::Activated;
         if was_eps {
             // The PDN connection is a PDU session now; its S5/S8 leg was released above.
             sess.epc = false;
-            sess.up_cnx_state = context::UpCnxState::Activated;
             sess.establishment_accept_sent = true;
         }
         if let Ok(ctx) = smf_self().read() {

@@ -836,6 +836,15 @@ pub struct NgapServer {
     handover_dropped_psis: HashMap<u64, Vec<u8>>,
     /// Distinguishes one N2 handover step's SMF answers from a later one's (#964).
     ho_generation: u64,
+    /// When each UE's HandoverCommand went to the source (#806): TS 23.502 §4.9.1.3.3
+    /// step 6a starts the AMF's supervision timer then, and step 14a releases the source
+    /// NG-RAN only once it expires, so indirect data forwarding is not cut short.
+    handover_command_sent: HashMap<u64, Instant>,
+    /// Source NG-RAN releases a HandoverNotify deferred to that timer's expiry (#806).
+    pending_source_releases: Vec<PendingSourceRelease>,
+    /// The step 6a timer: how long after the HandoverCommand the source is kept (#806).
+    /// `AMF_HANDOVER_SOURCE_HOLD_MS`; 0 releases at the Notify.
+    handover_source_hold: Duration,
     /// EPS→5GS handovers in flight, keyed by the AMF UE NGAP ID allocated for the
     /// arriving UE (#418).
     ///
@@ -1038,6 +1047,9 @@ impl NgapServer {
             handover_target_transfers: HashMap::new(),
             handover_pending_target: HashMap::new(),
             handover_prepared_psis: HashMap::new(),
+            handover_command_sent: HashMap::new(),
+            pending_source_releases: Vec::new(),
+            handover_source_hold: handover_source_hold_from_env(),
             ho_preparations: HashMap::new(),
             ho_commands: HashMap::new(),
             handover_dropped_psis: HashMap::new(),
@@ -1093,6 +1105,9 @@ impl NgapServer {
         // Reachability supervision for idle registered UEs (TS 24.501 §5.3.7):
         // mobile reachable -> implicit deregistration. Dormant when no UE is idle.
         self.process_reachability_timers().await?;
+
+        // #806: source NG-RAN releases waiting for the step 6a timer.
+        self.process_pending_source_releases().await;
 
         // Keep the RAN's view of overload in step with the NAS congestion posture.
         // A no-op unless the posture just changed, and the posture is off by default.
@@ -9941,6 +9956,7 @@ impl NgapServer {
     /// DL tunnel of a target the UE never reached.
     fn forget_handover_preparation(&mut self, amf_ue_ngap_id: u64) {
         self.handover_pending_target.remove(&amf_ue_ngap_id);
+        self.handover_command_sent.remove(&amf_ue_ngap_id);
         self.handover_prepared_psis.remove(&amf_ue_ngap_id);
         self.ho_preparations.remove(&amf_ue_ngap_id);
         self.ho_commands.remove(&amf_ue_ngap_id);
@@ -9949,6 +9965,42 @@ impl NgapServer {
         self.handover_target_assoc.remove(&amf_ue_ngap_id);
         self.handover_target_transfers
             .retain(|(ue, _psi), _| *ue != amf_ue_ngap_id);
+    }
+
+    /// Send the source NG-RAN Release Commands whose step 6a timer has expired (#806).
+    async fn process_pending_source_releases(&mut self) {
+        if self.pending_source_releases.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let (due, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending_source_releases)
+            .into_iter()
+            .partition(|p| p.deadline <= now);
+        self.pending_source_releases = waiting;
+        for p in due {
+            let Some(cmd) = crate::ngap_asn1::build_ue_context_release_command_asn1(
+                p.amf_ue_ngap_id,
+                p.ran_ue_ngap_id,
+                ngap_handler::cause_group::RADIO_NETWORK,
+                nextgcore_ngap::types::CauseRadioNetwork::SuccessfulHandover as i64,
+            ) else {
+                continue;
+            };
+            match self.send_to_association(p.association_id, &cmd).await {
+                Ok(()) => log::info!(
+                    "UE Context Release Command sent to SOURCE association {} for UE {} \
+                     (source ran_ue_ngap_id={}, successful-handover) after the step 6a timer",
+                    p.association_id,
+                    p.amf_ue_ngap_id,
+                    p.ran_ue_ngap_id
+                ),
+                Err(e) => log::warn!(
+                    "Could not release the SOURCE context for UE {} on association {}: {e}",
+                    p.amf_ue_ngap_id,
+                    p.association_id
+                ),
+            }
+        }
     }
 
     /// Handle a HandoverRequired from the source gNB (TS 38.413 Section 8.4.1).
@@ -10722,6 +10774,8 @@ impl NgapServer {
                 // status must name the UE as the target knows it.
                 self.handover_target_assoc
                     .insert(ue, (cmd.target_assoc, cmd.target_ran));
+                // #806: TS 23.502 §4.9.1.3.3 step 6a, the supervision timer starts here.
+                self.handover_command_sent.insert(ue, Instant::now());
                 // #70 / #964: the sessions the HandoverCommand hands over, completed at
                 // the SMF once the UE has actually arrived (Notify).
                 for (psi, transfer) in &cmd.admitted {
@@ -11388,16 +11442,58 @@ impl NgapServer {
             notify.amf_ue_ngap_id,
             notify.ran_ue_ngap_id
         );
+        // #803 / #739: a Notify is accepted only from the target this AMF prepared, under
+        // the RAN UE NGAP ID that target allocated in its Acknowledge (TS 38.413 §8.4.3,
+        // §10.6). For an EPS->5GS handover that is the UE's recorded target; otherwise the
+        // Acknowledge's (association, RAN UE NGAP ID). Anything else -- no handover in
+        // flight, a stale or duplicate Notify, another gNB -- would move the UE's serving
+        // connection to the sender and release the real one, so it is dropped with an
+        // Error Indication and changes nothing.
+        let expected = if self.eps_ho_in_flight.contains_key(&notify.amf_ue_ngap_id) {
+            self.ue_auth_state
+                .get(notify.amf_ue_ngap_id)
+                .map(|s| (s.association_id, s.ran_ue_ngap_id))
+        } else {
+            self.handover_target_assoc
+                .get(&notify.amf_ue_ngap_id)
+                .copied()
+        };
+        if expected != Some((association_id, notify.ran_ue_ngap_id)) {
+            let cause = if expected.is_some_and(|(assoc, _)| assoc == association_id) {
+                ngap_gen::CauseRadioNetwork::INCONSISTENT_REMOTE_UE_NGAP_ID
+            } else {
+                ngap_gen::CauseRadioNetwork::UNKNOWN_LOCAL_UE_NGAP_ID
+            };
+            log::warn!(
+                "HandoverNotify for UE {} from association {association_id} (RAN UE NGAP ID \
+                 {}) is not from the prepared target ({expected:?}); dropped, Error Indication",
+                notify.amf_ue_ngap_id,
+                notify.ran_ue_ngap_id
+            );
+            self.send_error_indication(
+                association_id,
+                Some(notify.amf_ue_ngap_id),
+                Some(notify.ran_ue_ngap_id),
+                ngap_gen::Cause::RadioNetwork(ngap_gen::CauseRadioNetwork(cause)),
+            )
+            .await?;
+            return Ok(HandoverCompletion::default());
+        }
         // #70: the SOURCE identity, captured BEFORE the serving association is moved to
         // the target below. After that move it is unrecoverable, and it is exactly what the
         // UEContextReleaseCommand has to be addressed to — TS 38.413 §8.4.3 has the AMF
         // release the source NG-RAN UE context once the UE has arrived, and before #70
         // nothing did, so every N2 handover leaked a source RAN context.
+        //
+        // #803: compared as the (association, RAN UE NGAP ID) PAIR. An intra-gNB N2
+        // handover keeps the association and changes the RAN UE NGAP ID, and its source
+        // context needs releasing just the same; comparing associations alone left it to
+        // the gNB's own TNGRELOCoverall.
         let source = self
             .ue_auth_state
             .get(notify.amf_ue_ngap_id)
             .map(|s| (s.association_id, s.ran_ue_ngap_id))
-            .filter(|(assoc, _)| *assoc != association_id);
+            .filter(|pair| *pair != (association_id, notify.ran_ue_ngap_id));
 
         let updated = self.ue_auth_state.with_mut(notify.amf_ue_ngap_id, |state| {
             // Move the serving association/RAN-UE-NGAP-ID and location to the
@@ -11492,6 +11588,7 @@ impl NgapServer {
                 sessions_relayed,
                 source_context: None,
                 source_release_sent: false,
+                source_release_deferred: false,
             });
         }
 
@@ -11524,7 +11621,30 @@ impl NgapServer {
         // it has MOVED, and dropping its context here would deregister a UE that is
         // registered and served by the target. Only the source gNB's copy is released.
         let mut source_release_sent = false;
-        if let Some((source_assoc, source_ran_ue_id)) = source {
+        // #806, TS 23.502 §4.9.1.3.3 step 14a: the source is released "after the timer in
+        // step 6a expires" -- the one started with the HandoverCommand -- so a Notify that
+        // arrives first leaves the source in place until then, for indirect forwarding.
+        let hold_until = self
+            .handover_command_sent
+            .remove(&notify.amf_ue_ngap_id)
+            .map(|sent| sent + self.handover_source_hold)
+            .filter(|until| *until > Instant::now());
+        let mut source_release_deferred = false;
+        if let (Some((source_assoc, source_ran_ue_id)), Some(deadline)) = (source, hold_until) {
+            self.pending_source_releases.push(PendingSourceRelease {
+                deadline,
+                amf_ue_ngap_id: notify.amf_ue_ngap_id,
+                association_id: source_assoc,
+                ran_ue_ngap_id: source_ran_ue_id,
+            });
+            source_release_deferred = true;
+            log::info!(
+                "UE {}: source release on association {source_assoc} deferred {:?} to the \
+                 step 6a timer (TS 23.502 §4.9.1.3.3 step 14a)",
+                notify.amf_ue_ngap_id,
+                deadline.saturating_duration_since(Instant::now())
+            );
+        } else if let Some((source_assoc, source_ran_ue_id)) = source {
             if let Some(cmd) = crate::ngap_asn1::build_ue_context_release_command_asn1(
                 notify.amf_ue_ngap_id,
                 source_ran_ue_id,
@@ -11568,6 +11688,7 @@ impl NgapServer {
             sessions_relayed,
             source_context: source,
             source_release_sent,
+            source_release_deferred,
         })
     }
 }
@@ -11597,6 +11718,39 @@ pub struct HandoverCompletion {
     pub source_context: Option<(u64, u32)>,
     /// Whether the release command actually reached the source association.
     pub source_release_sent: bool,
+    /// Whether the release was deferred to the step 6a timer (#806); it is then sent by
+    /// the poll loop when that timer expires.
+    pub source_release_deferred: bool,
+}
+
+/// A source NG-RAN UE context waiting for the step 6a timer before its Release Command
+/// (#806, TS 23.502 §4.9.1.3.3 step 14a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingSourceRelease {
+    deadline: Instant,
+    amf_ue_ngap_id: u64,
+    association_id: u64,
+    ran_ue_ngap_id: u32,
+}
+
+/// Default of the step 6a timer (#806): long enough for in-flight downlink to drain over
+/// the forwarding path, short against the gNB's own TNGRELOCoverall.
+const DEFAULT_HANDOVER_SOURCE_HOLD: Duration = Duration::from_secs(2);
+
+/// `AMF_HANDOVER_SOURCE_HOLD_MS`, else [`DEFAULT_HANDOVER_SOURCE_HOLD`]. Test builds
+/// default to 0 so handover tests see the release at the Notify unless they ask.
+fn handover_source_hold_from_env() -> Duration {
+    if let Some(ms) = std::env::var("AMF_HANDOVER_SOURCE_HOLD_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        return Duration::from_millis(ms);
+    }
+    if cfg!(test) {
+        Duration::ZERO
+    } else {
+        DEFAULT_HANDOVER_SOURCE_HOLD
+    }
 }
 
 /// An EPS→5GS handover between the HandoverRequest and its completion (#418).
@@ -12522,11 +12676,13 @@ impl NgapServer {
             cancel.amf_ue_ngap_id,
             cancel.cause
         );
-        // The source abandoned the handover; nothing further will be relayed.
-        // #804, TS 23.502 §4.9.1.4 steps 2-3: the target releases what it reserved for
-        // the handover, and the SMFs are told the handover is CANCELLED.
+        // #804, TS 23.502 §4.9.1.4 steps 2-3 (and §4.11.1.2.3 steps 3, 4b): the target
+        // releases what it reserved for the handover, and the SMF is told the handover is
+        // cancelled. Before, the target kept its prepared UE context until its own timer
+        // and the SMF never heard.
         self.release_cancelled_handover_target(cancel.amf_ue_ngap_id)
             .await;
+        // The source abandoned the handover; nothing further will be relayed.
         // Dropped BEFORE the acknowledgement is sent, so a failed ack cannot leave
         // a stale relay target behind. The per-session transfers go with it (#742).
         self.forget_handover_preparation(cancel.amf_ue_ngap_id);
@@ -21955,6 +22111,8 @@ mod tests {
             let sent = take_sent_ngap(&mut server);
             let outcome: Vec<(u64, u8, u8)> = sent.iter().map(|(a, p)| (*a, p[0], p[1])).collect();
             match abandon {
+                // #804: the cancelled target A is released first (a UE Context Release
+                // Command, initiating), then the source gets its Acknowledge.
                 Abandon::Cancel => assert_eq!(
                     outcome,
                     vec![
@@ -21966,10 +22124,10 @@ mod tests {
                         (
                             source,
                             0x20,
-                            nextgcore_ngap_gen::generated::ID_HANDOVER_CANCEL as u8
+                            nextgcore_ngap_gen::generated::ID_HANDOVER_CANCEL
                         )
                     ],
-                    "a Release Command to the target, then the Acknowledge to the source"
+                    "Release Command to target A, then HandoverCancelAcknowledge to the source"
                 ),
                 Abandon::Failure => assert_eq!(
                     outcome,
@@ -22822,7 +22980,9 @@ mod tests {
         // That surfaced as that test reading THIS test's association (9212) instead
         // of its own (9301), about 1 run in 3.
         let ue_notify = 78_101u64;
-        server.handover_target_assoc.insert(ue_notify, (target, 1));
+        // #803: the target the Acknowledge recorded, with the RAN UE NGAP ID the Notify
+        // carries.
+        server.handover_target_assoc.insert(ue_notify, (target, 9));
         let notify = nextgcore_ngap::builder::build_handover_notify(
             &nextgcore_ngap::types::HandoverNotify {
                 amf_ue_ngap_id: ue_notify,
@@ -23566,6 +23726,10 @@ mod tests {
         state.amf_ue.supi = Some("imsi-001010000000001".to_string());
         server.ue_auth_state.insert(amf_ue_ngap_id, state);
 
+        // #803: the Notify comes from the target the Acknowledge recorded.
+        server
+            .handover_target_assoc
+            .insert(amf_ue_ngap_id, (target, 22));
         let report = server
             .handle_handover_notify(target, &handover_notify_pdu(amf_ue_ngap_id, 22))
             .await
@@ -23658,6 +23822,10 @@ mod tests {
         let state = UeNasContext::new(amf_ue_ngap_id, 13, source, false);
         server.ue_auth_state.insert(amf_ue_ngap_id, state);
 
+        // #803: the Notify comes from the target the Acknowledge recorded.
+        server
+            .handover_target_assoc
+            .insert(amf_ue_ngap_id, (target, 23));
         let report = server
             .handle_handover_notify(target, &handover_notify_pdu(amf_ue_ngap_id, 23))
             .await
@@ -23978,6 +24146,10 @@ mod tests {
             "precondition: the timer is armed"
         );
 
+        // #803: the Notify comes from the target the Acknowledge recorded.
+        server
+            .handover_target_assoc
+            .insert(amf_ue_ngap_id, (target, 8));
         server
             .handle_handover_notify(target, &handover_notify_pdu(amf_ue_ngap_id, 8))
             .await
@@ -24308,6 +24480,10 @@ mod tests {
 
         // THE PRODUCTION PATH: a real HandoverNotify PDU through the real handler.
         // `handover_notify_pdu` carries TAI 001-01 TAC 0x000001, outside the area.
+        // #803: the Notify comes from the target the Acknowledge recorded.
+        server
+            .handover_target_assoc
+            .insert(amf_ue_ngap_id, (target, 42));
         server
             .handle_handover_notify(target, &handover_notify_pdu(amf_ue_ngap_id, 42))
             .await
@@ -24353,11 +24529,186 @@ mod tests {
         sink.stop().await.expect("sink stop");
     }
 
-    /// An intra-gNB notify — arriving on the association already serving the UE — has no
-    /// separate source context, so nothing is released.
+    /// An ERROR INDICATION's `(amf id, ran id, radio-network cause)`; `None` otherwise.
+    fn decoded_error_indication_ids(pdu: &[u8]) -> Option<(Option<u64>, Option<u32>, Option<u8>)> {
+        use nextgcore_ngap_gen::generated as g;
+        let g::NGAP_PDU::InitiatingMessage(m) = nextgcore_ngap_gen::decode(pdu).ok()? else {
+            return None;
+        };
+        let g::InitiatingMessageValue::Id_ErrorIndication(e) = m.value else {
+            return None;
+        };
+        let (mut amf, mut ran, mut cause) = (None, None, None);
+        for ie in e.protocol_i_es.0 {
+            use g::ErrorIndicationProtocolIEs_EntryValue as Ie;
+            match ie.value {
+                Ie::Id_AMF_UE_NGAP_ID(id) => amf = Some(id.0),
+                Ie::Id_RAN_UE_NGAP_ID(id) => ran = Some(id.0),
+                Ie::Id_Cause(g::Cause::RadioNetwork(c)) => cause = Some(c.0),
+                _ => {}
+            }
+        }
+        Some((amf, ran, cause))
+    }
+
+    /// **#806, TS 23.502 §4.9.1.3.3 step 14a.** The source NG-RAN is released "after the
+    /// timer in step 6a expires", the timer the HandoverCommand started: a Notify that
+    /// arrives before it leaves the source in place (indirect data forwarding still runs
+    /// through it) and the poll loop sends the source's Release Command once it expires.
+    /// With the hold at 0, or a timer already expired, the Notify releases at once.
+    ///
+    /// REVERT-VERIFIED: releasing at the Notify sends the Release Command before the timer.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_intra_gnb_handover_notify_releases_nothing() {
-        let mut server = test_ngap_server().await;
+    async fn the_source_is_released_when_the_step_6a_timer_expires() {
+        let mut server = capturing_ngap_server().await;
+        server.handover_source_hold = Duration::from_millis(300);
+        let (source, target) = (98_061u64, 98_062u64);
+        seed_gnb_session(&server, source).await;
+        seed_gnb_session(&server, target).await;
+        let ue = 7_806_001u64;
+        server
+            .ue_auth_state
+            .insert(ue, UeNasContext::new(ue, 61, source, false));
+        server.handover_target_assoc.insert(ue, (target, 62));
+        server.handover_command_sent.insert(ue, Instant::now());
+
+        let report = server
+            .handle_handover_notify(target, &handover_notify_pdu(ue, 62))
+            .await
+            .expect("handled");
+        assert_eq!(report.source_context, Some((source, 61)));
+        assert!(report.source_release_deferred && !report.source_release_sent);
+        assert!(take_sent_ngap(&mut server).is_empty(), "nothing yet");
+        let state = server.ue_auth_state.get(ue).expect("UE");
+        assert_eq!((state.association_id, state.ran_ue_ngap_id), (target, 62));
+
+        server.process_pending_source_releases().await;
+        assert!(
+            take_sent_ngap(&mut server).is_empty(),
+            "timer still running"
+        );
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        server.process_pending_source_releases().await;
+        let sent = take_sent_ngap(&mut server);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].0, source);
+        assert_eq!(
+            decoded_release_command(&sent[0].1),
+            Some((
+                ue,
+                Some(61),
+                Some(nextgcore_ngap_gen::generated::CauseRadioNetwork::SUCCESSFUL_HANDOVER)
+            ))
+        );
+        server.process_pending_source_releases().await;
+        assert!(take_sent_ngap(&mut server).is_empty(), "released once");
+
+        // A timer already expired at the Notify: released at once.
+        let ue2 = 7_806_002u64;
+        server
+            .ue_auth_state
+            .insert(ue2, UeNasContext::new(ue2, 63, source, false));
+        server.handover_target_assoc.insert(ue2, (target, 64));
+        server
+            .handover_command_sent
+            .insert(ue2, Instant::now() - Duration::from_secs(1));
+        let report = server
+            .handle_handover_notify(target, &handover_notify_pdu(ue2, 64))
+            .await
+            .expect("handled");
+        assert!(report.source_release_sent && !report.source_release_deferred);
+        assert_eq!(take_sent_ngap(&mut server).len(), 1);
+        for id in [ue, ue2] {
+            server.ue_auth_state.remove(id);
+        }
+    }
+
+    /// **#803 / #739.** A HANDOVER NOTIFY is accepted only from the target the
+    /// Acknowledge recorded, under the RAN UE NGAP ID that target allocated. From another
+    /// gNB, with another RAN UE NGAP ID, with no handover in flight, or a second time after
+    /// the handover completed, it is dropped with an Error Indication (TS 38.413 §10.6),
+    /// and the UE keeps its serving connection: no relocation, no release of the real
+    /// serving gNB.
+    ///
+    /// REVERT-VERIFIED: without the check the intruder's Notify moves the UE to the
+    /// intruder and releases the source.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_handover_notify_is_accepted_only_from_the_recorded_target() {
+        let mut server = capturing_ngap_server().await;
+        let (source, target, intruder) = (98_031u64, 98_032u64, 98_033u64);
+        for a in [source, target, intruder] {
+            seed_gnb_session(&server, a).await;
+        }
+        let ue = 7_803_001u64;
+        server
+            .ue_auth_state
+            .insert(ue, UeNasContext::new(ue, 11, source, false));
+        server.handover_target_assoc.insert(ue, (target, 22));
+        let unknown = nextgcore_ngap_gen::generated::CauseRadioNetwork::UNKNOWN_LOCAL_UE_NGAP_ID;
+        let inconsistent =
+            nextgcore_ngap_gen::generated::CauseRadioNetwork::INCONSISTENT_REMOTE_UE_NGAP_ID;
+
+        for (from, ran, cause, what) in [
+            (intruder, 22u32, unknown, "another gNB"),
+            (target, 23, inconsistent, "another RAN UE NGAP ID"),
+            (source, 11, unknown, "the source itself"),
+        ] {
+            let report = server
+                .handle_handover_notify(from, &handover_notify_pdu(ue, ran))
+                .await
+                .expect("handled");
+            assert_eq!(report, HandoverCompletion::default(), "{what}");
+            let sent = take_sent_ngap(&mut server);
+            assert_eq!(sent.len(), 1, "{what}: {sent:?}");
+            assert_eq!(sent[0].0, from);
+            assert_eq!(
+                decoded_error_indication_ids(&sent[0].1),
+                Some((Some(ue), Some(ran), Some(cause))),
+                "{what}"
+            );
+            let state = server.ue_auth_state.get(ue).expect("UE");
+            assert_eq!(
+                (state.association_id, state.ran_ue_ngap_id),
+                (source, 11),
+                "{what}: still on the source"
+            );
+        }
+
+        // The real one completes; a second (stale) Notify is then refused too.
+        let report = server
+            .handle_handover_notify(target, &handover_notify_pdu(ue, 22))
+            .await
+            .expect("handled");
+        assert!(report.source_release_sent);
+        take_sent_ngap(&mut server);
+        let report = server
+            .handle_handover_notify(target, &handover_notify_pdu(ue, 22))
+            .await
+            .expect("handled");
+        assert_eq!(
+            report,
+            HandoverCompletion::default(),
+            "no handover in flight"
+        );
+        let sent = take_sent_ngap(&mut server);
+        assert_eq!(
+            decoded_error_indication_ids(&sent[0].1).map(|(_, _, c)| c),
+            Some(Some(unknown))
+        );
+        server.ue_auth_state.remove(ue);
+    }
+
+    /// **#803.** An intra-gNB N2 handover keeps the association and changes the RAN UE
+    /// NGAP ID, and its source NG-RAN context is released all the same (TS 38.413
+    /// §8.4.3): the Release Command goes to the SAME association under the OLD RAN UE
+    /// NGAP ID, cause successful-handover. Before #803 the source was found by comparing
+    /// associations only, so it was never released and leaked until the gNB's
+    /// TNGRELOCoverall. A Notify naming the serving pair itself has no source to release.
+    ///
+    /// REVERT-VERIFIED: with the association-only comparison no Release Command is sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_intra_gnb_handover_notify_releases_the_old_ran_ue_context() {
+        let mut server = capturing_ngap_server().await;
         let assoc = 9303u64;
         let amf_ue_ngap_id = 78_002u64;
         seed_gnb_session(&server, assoc).await;
@@ -24365,16 +24716,46 @@ mod tests {
             amf_ue_ngap_id,
             UeNasContext::new(amf_ue_ngap_id, 33, assoc, false),
         );
+        server
+            .handover_target_assoc
+            .insert(amf_ue_ngap_id, (assoc, 34));
 
         let report = server
-            .handle_handover_notify(assoc, &handover_notify_pdu(amf_ue_ngap_id, 33))
+            .handle_handover_notify(assoc, &handover_notify_pdu(amf_ue_ngap_id, 34))
             .await
             .expect("handled");
+        assert_eq!(report.source_context, Some((assoc, 33)));
+        assert!(report.source_release_sent);
+        let sent = take_sent_ngap(&mut server);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].0, assoc, "to the same gNB");
         assert_eq!(
-            report.source_context, None,
-            "there is no source context distinct from the serving one"
+            decoded_release_command(&sent[0].1),
+            Some((
+                amf_ue_ngap_id,
+                Some(33),
+                Some(nextgcore_ngap_gen::generated::CauseRadioNetwork::SUCCESSFUL_HANDOVER)
+            )),
+            "under the OLD RAN UE NGAP ID"
         );
-        assert!(!report.source_release_sent);
+        let state = server.ue_auth_state.get(amf_ue_ngap_id).expect("UE");
+        assert_eq!((state.association_id, state.ran_ue_ngap_id), (assoc, 34));
+
+        // The degenerate case: the target re-used the serving id pair.
+        let ue2 = 78_003u64;
+        server
+            .ue_auth_state
+            .insert(ue2, UeNasContext::new(ue2, 35, assoc, false));
+        server.handover_target_assoc.insert(ue2, (assoc, 35));
+        let report = server
+            .handle_handover_notify(assoc, &handover_notify_pdu(ue2, 35))
+            .await
+            .expect("handled");
+        assert_eq!(report.source_context, None);
+        assert!(take_sent_ngap(&mut server).is_empty());
+        for id in [amf_ue_ngap_id, ue2] {
+            server.ue_auth_state.remove(id);
+        }
     }
 
     /// The target's handover transfer is kept between HandoverRequestAcknowledge and
@@ -24403,6 +24784,10 @@ mod tests {
             .handover_target_transfers
             .insert((amf_ue_ngap_id + 1, 1), vec![0xDD]);
 
+        // #803: the Notify comes from the target the Acknowledge recorded.
+        server
+            .handover_target_assoc
+            .insert(amf_ue_ngap_id, (target, 55));
         server
             .handle_handover_notify(target, &handover_notify_pdu(amf_ue_ngap_id, 55))
             .await
