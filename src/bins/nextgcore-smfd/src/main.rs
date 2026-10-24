@@ -60,12 +60,17 @@ pub mod slicing; // Rel-17: per-slice QoS profiles
 mod smf_sm;
 mod timer;
 mod udm; // #79: Nudm_UECM_Registration + Nudm_SDM_Get sm-data
+mod up_path; // #994: PFCP Node Report, user plane path failure and recovery
 
 use context::{smf_context_final, smf_context_init, smf_self};
 use smf_sm::SmfFsm;
 
 /// Global shutdown flag
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// When the shutdown signal arrived (#941 review M2): the start of the one deadline
+/// every shutdown phase is bounded by.
+static SHUTDOWN_STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 /// Where the Prometheus endpoint listens (`SMF_METRICS_PORT`, default 9090 — the port
 /// `sgwud` uses and the port `configs/observability/prometheus.yml` already scrapes
@@ -121,10 +126,30 @@ fn render_metrics() -> String {
          smf_pfcp_unauthorized_messages_total {}\n\
          # HELP smf_sm_policy_delete_failures_total SM Policy Association terminations (Npcf_SMPolicyControl_Delete) that failed after every attempt; each leaves an association at the PCF\n\
          # TYPE smf_sm_policy_delete_failures_total counter\n\
-         smf_sm_policy_delete_failures_total {}\n",
+         smf_sm_policy_delete_failures_total {}\n\
+         # HELP smf_up_path_failures_total Remote GTP-U peers a UPF reported a user plane path failure toward (PFCP Node Report, TS 29.244 §5.10A)\n\
+         # TYPE smf_up_path_failures_total counter\n\
+         smf_up_path_failures_total {}\n\
+         # HELP smf_up_path_recoveries_total Remote GTP-U peers a UPF reported recovered\n\
+         # TYPE smf_up_path_recoveries_total counter\n\
+         smf_up_path_recoveries_total {}\n\
+         # HELP smf_up_paths_failed Remote GTP-U peers failed now, over all UPFs\n\
+         # TYPE smf_up_paths_failed gauge\n\
+         smf_up_paths_failed {}\n\
+         # HELP smf_up_path_sessions_deactivated_total Sessions whose user plane was deactivated toward a failed or restarted GTP-U peer, or after an Error Indication\n\
+         # TYPE smf_up_path_sessions_deactivated_total counter\n\
+         smf_up_path_sessions_deactivated_total {}\n\
+         # HELP smf_up_path_sessions_released_total Sessions released because their path was still down after SMF_UP_PATH_FAILURE_HOLD_SECS\n\
+         # TYPE smf_up_path_sessions_released_total counter\n\
+         smf_up_path_sessions_released_total {}\n",
         pool.len(),
         pfcp_path::PFCP_UNAUTHORIZED.load(Ordering::Relaxed),
-        SM_POLICY_DELETE_FAILURES.load(Ordering::Relaxed)
+        SM_POLICY_DELETE_FAILURES.load(Ordering::Relaxed),
+        up_path::UP_PATH_FAILURES.load(Ordering::Relaxed),
+        up_path::UP_PATH_RECOVERIES.load(Ordering::Relaxed),
+        up_path::failed_path_count(),
+        up_path::UP_PATH_SESSIONS_DEACTIVATED.load(Ordering::Relaxed),
+        up_path::UP_PATH_SESSIONS_RELEASED.load(Ordering::Relaxed),
     )
 }
 
@@ -496,6 +521,7 @@ async fn main() -> Result<()> {
     let shutdown_clone = shutdown.clone();
     ctrlc::set_handler(move || {
         log::info!("Received shutdown signal");
+        let _ = SHUTDOWN_STARTED.set(std::time::Instant::now());
         shutdown_clone.store(true, Ordering::SeqCst);
         SHUTDOWN.store(true, Ordering::SeqCst);
     })
@@ -875,6 +901,10 @@ async fn main() -> Result<()> {
             client.seed_peer_recovery_time_stamp(rts).await;
         }
     }
+    // #1031: restored sessions whose UPF is no longer configured.
+    pfcp_path::unknown_session_upfs(&pfcp_clients);
+    // #1028 review m2: paths still failed at the last shutdown are held again.
+    up_path::rearm_restored_holds();
 
     // PFCP receive/dispatch loop: responses complete pending transactions;
     // node-level requests (heartbeat, association release) are answered by
@@ -990,6 +1020,9 @@ async fn main() -> Result<()> {
         &pfcp_clients,
         release_on_shutdown,
         pfcp_listener_handle,
+        tokio::time::Instant::from_std(
+            *SHUTDOWN_STARTED.get_or_init(std::time::Instant::now) + shutdown_budget(),
+        ),
     )
     .await;
     // #912 review m5: the releases the UEs completed during the shutdown are still
@@ -1162,11 +1195,22 @@ async fn handle_pfcp_session_report(
 
     // Error Indication Report (bit 0x04): a peer GTP-U node rejected one of
     // the session's tunnels — the DL tunnel toward the gNB is stale.
+    //
+    // #994: the tunnel toward that peer is unusable, so the session's user plane is
+    // deactivated as for a path failure (TS 23.502 §4.3.7 steps 4-5): its FARs toward
+    // the peer buffer, and the NG-RAN is told through the AMF. The Error Indication
+    // Report IE (§7.5.8.4) names the peer in its Remote F-TEID.
     if report_type & 0x04 != 0 {
+        let peer = pfcp_path::find_ie(payload, 99)
+            .and_then(|eir| pfcp_path::find_ie(eir, 21))
+            .and_then(fteid_ip);
         log::warn!(
-            "Error Indication Report for SEID=0x{seid:016x}: remote GTP-U endpoint rejected \
-             the DL tunnel (stale gNB F-TEID)"
+            "Error Indication Report for SEID=0x{seid:016x}: remote GTP-U endpoint {} \
+             rejected the DL tunnel; deactivating the session's user plane toward it",
+            peer.map(|p| p.to_string())
+                .unwrap_or_else(|| "(unnamed)".into())
         );
+        up_path::deactivate_after_error_indication(seid, peer);
     }
 
     // TSC Management Information Report (TMIR, bit 0x10 — §8.2.21 bit 5), #321.
@@ -2363,8 +2407,9 @@ async fn pfcp_session_establish(
     // attempts, exhaustion = error (TS 29.244 7.2.1). SEID=0 for a new
     // session (TS 29.244 7.2.2.4.2).
     let (resp_type, resp_body) = client
-        .request(
+        .session_request(
             pfcp_path::pfcp_message_type::SESSION_ESTABLISHMENT_REQUEST,
+            smf_n4_seid,
             Some(0),
             &payload,
         )
@@ -2525,7 +2570,7 @@ async fn pfcp_session_establish(
     // Issue #20: remember which UPF this session was established on so
     // modification/deletion keep signalling the same peer. Keyed by the
     // SMF-side SEID: UPF-chosen SEIDs collide across a multi-UPF pool.
-    pfcp_path::record_session_peer(smf_n4_seid, client.peer());
+    pfcp_path::record_session_upf(smf_n4_seid, &client);
 
     Ok(PfcpSessionResult {
         upf_seid,
@@ -2575,8 +2620,9 @@ async fn pfcp_session_modify(
     let payload = build_session_modification_request(&params);
 
     let (resp_type, resp_body) = client
-        .request(
+        .session_request(
             pfcp_path::pfcp_message_type::SESSION_MODIFICATION_REQUEST,
+            smf_n4_seid,
             Some(upf_seid),
             &payload,
         )
@@ -2625,8 +2671,9 @@ async fn pfcp_modify_with(
     }
     let payload = n4_build::build_session_modification_request(params);
     let (resp_type, resp_body) = client
-        .request(
+        .session_request(
             pfcp_path::pfcp_message_type::SESSION_MODIFICATION_REQUEST,
+            smf_n4_seid,
             Some(upf_seid),
             &payload,
         )
@@ -2678,8 +2725,9 @@ async fn pfcp_session_delete(smf_n4_seid: u64, upf_seid: u64) -> Result<()> {
     let payload = n4_build::build_session_deletion_request();
 
     let (resp_type, resp_body) = client
-        .request(
+        .session_request(
             pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST,
+            smf_n4_seid,
             Some(upf_seid),
             &payload,
         )
@@ -4660,8 +4708,9 @@ async fn pfcp_update_session_qer(
     };
     let payload = n4_build::build_session_modification_request(&params);
     let (_, resp_body) = client
-        .request(
+        .session_request(
             pfcp_path::pfcp_message_type::SESSION_MODIFICATION_REQUEST,
+            smf_n4_seid,
             Some(upf_seid),
             &payload,
         )
@@ -4738,8 +4787,9 @@ async fn pfcp_send_tsc_containers(
     };
     let payload = n4_build::build_session_modification_request(&params);
     let (_, resp_body) = client
-        .request(
+        .session_request(
             pfcp_path::pfcp_message_type::SESSION_MODIFICATION_REQUEST,
+            smf_n4_seid,
             Some(upf_seid),
             &payload,
         )
@@ -4824,8 +4874,9 @@ async fn pfcp_deactivate_dl_far(smf_n4_seid: u64, upf_seid: u64) -> Result<()> {
     };
     let payload = n4_build::build_session_modification_request(&params);
     let (_, resp_body) = client
-        .request(
+        .session_request(
             pfcp_path::pfcp_message_type::SESSION_MODIFICATION_REQUEST,
+            smf_n4_seid,
             Some(upf_seid),
             &payload,
         )
@@ -5721,6 +5772,20 @@ pub(crate) fn take_sm_context(sm_context_ref: &str) -> Option<Option<context::Po
     if binding.is_none() && sess.is_none() {
         return None;
     }
+    // #994, #1031: the GTP-U peers of its FARs and its UPF binding, under the SEID
+    // the next line forgets.
+    let smf_seid = ctx
+        .cp_n4_seids
+        .read()
+        .ok()
+        .and_then(|m| m.get(sm_context_ref).copied())
+        .unwrap_or_else(|| context::derive_cp_n4_seid(sm_context_ref));
+    if let Ok(mut m) = ctx.far_peers.write() {
+        m.remove(&smf_seid);
+    }
+    if let Ok(mut m) = ctx.session_upfs.write() {
+        m.remove(&smf_seid);
+    }
     for map in [&ctx.pfcp_sessions, &ctx.cp_n4_seids] {
         if let Ok(mut m) = map.write() {
             m.remove(sm_context_ref);
@@ -6124,6 +6189,171 @@ async fn release_side_effects(sm_context_ref: &str, binding: &context::PolicyBin
     log::debug!("ref={sm_context_ref}: release side effects done");
 }
 
+/// The IP address of an F-TEID IE value (TS 29.244 §8.2.3): flags (V4 bit 1, V6
+/// bit 2, CH bit 3), TEID, then IPv4 and/or IPv6.
+fn fteid_ip(v: &[u8]) -> Option<std::net::IpAddr> {
+    let flags = *v.first()?;
+    if flags & 0x04 != 0 {
+        return None; // CHOOSE: no address
+    }
+    if flags & 0x01 != 0 {
+        let a: [u8; 4] = v.get(5..9)?.try_into().ok()?;
+        return Some(std::net::IpAddr::from(a));
+    }
+    if flags & 0x02 != 0 {
+        let a: [u8; 16] = v.get(5..21)?.try_into().ok()?;
+        return Some(std::net::IpAddr::from(a));
+    }
+    None
+}
+
+/// CN-initiated deactivation of the UP connection of a session whose GTP-U peer
+/// failed or restarted (#994; TS 23.502 §4.3.7). Step 4: an N4 Session Modification
+/// sets its FARs toward the peer to BUFF|NOCP, so downlink data is buffered and
+/// reported (and the UE paged) rather than sent into the failed path. Step 5: for an
+/// N3 FAR, Namf_Communication_N1N2MessageTransfer with the N2 Resource Release
+/// Request, through the AMF, whose path to the NG-RAN is not the one that failed.
+/// An EPC PDN connection (a PGW-U FAR toward an SGW-U) is only buffered. Returns
+/// whether the UPF accepted the modification.
+pub(crate) async fn deactivate_up_toward_failed_path(a: &up_path::Affected, reason: &str) -> bool {
+    let params = n4_build::SessionModificationParams {
+        update_fars_deactivate: a.fars.clone(),
+        ..Default::default()
+    };
+    if let Err(e) = pfcp_modify_with(a.smf_seid, a.upf_seid, &params).await {
+        log::warn!(
+            "{reason}: deactivating FARs {:?} of SEID 0x{:016x} failed: {e}",
+            a.fars,
+            a.smf_seid
+        );
+        return false;
+    }
+    let Some(reference) = a.reference.as_deref().filter(|_| a.access) else {
+        return true;
+    };
+    let was_active = smf_self()
+        .read()
+        .ok()
+        .and_then(|ctx| {
+            let mut sess = ctx.sess_find_by_sm_context_ref(reference)?;
+            let was = sess.up_cnx_state != context::UpCnxState::Deactivated;
+            sess.up_cnx_state = context::UpCnxState::Deactivated;
+            ctx.sess_update(&sess);
+            Some(was)
+        })
+        .unwrap_or(false);
+    let Some(binding) = lookup_policy_binding(reference) else {
+        return true;
+    };
+    match (was_active, binding.sm_context_status_uri.as_deref()) {
+        (true, Some(amf_uri)) => {
+            let n2 = n2_transfer::release_command_transfer_with(
+                n2_transfer::SmfCause::TransportResourceUnavailable,
+            )
+            .unwrap_or_default();
+            log::warn!(
+                "{reason}: ref={reference} (SUPI {}, PSI {}): user plane deactivated; N2 \
+                 PDU Session Resource Release Command via the AMF",
+                binding.supi,
+                binding.psi
+            );
+            send_n2_release_transfer(amf_uri, &binding.supi, binding.psi, &n2).await;
+        }
+        _ => log::info!("{reason}: ref={reference}: downlink now buffered"),
+    }
+    true
+}
+
+/// Release a session whose GTP-U path was still down after the hold (#994; TS 23.007
+/// §20.3.1). 5G: the N4 session and the PCF association go (as for a UE-requested
+/// release), then a PDU Session Release Command #39 (reactivation requested), so the
+/// UE re-establishes the session over a working path. EPC: the PFCP session at the
+/// PGW-U, then a Delete Bearer Request toward the SGW. Returns whether one was
+/// released.
+pub(crate) async fn release_after_path_failure(a: &up_path::Affected, reason: &str) -> bool {
+    if let Some(reference) = a.reference.as_deref() {
+        let Some(binding) = lookup_policy_binding(reference) else {
+            return false;
+        };
+        release_user_plane(reference).await;
+        match binding.sm_context_status_uri.as_deref() {
+            Some(amf_uri) => {
+                log::warn!(
+                    "{reason}: releasing ref={reference} (SUPI {}, PSI {}) with #39",
+                    binding.supi,
+                    binding.psi
+                );
+                release_for_reactivation(reference, amf_uri, &binding.supi, binding.psi).await;
+            }
+            None => {
+                log::warn!("{reason}: releasing ref={reference}; no AMF callback to tell");
+                complete_sm_context_release(reference);
+            }
+        }
+        return true;
+    }
+    let Some(id) = a.epc_sess_id else {
+        return false;
+    };
+    if let Err(e) = pfcp_session_delete(a.smf_seid, a.upf_seid).await {
+        log::warn!(
+            "{reason}: EPC PFCP Session Deletion (SEID 0x{:016x}) failed: {e}",
+            a.smf_seid
+        );
+    }
+    let scope = restoration::SessionScope {
+        epc_sess_ids: std::collections::HashSet::from([id]),
+        ..Default::default()
+    };
+    restoration::release_epc_pdn_connections_in(reason, Some(&scope)).await > 0
+}
+
+/// N1N2MessageTransfer carrying only an N2 PDU Session Resource Release Command
+/// transfer: the CN-initiated UP deactivation (TS 23.502 §4.3.7 step 5), no N1.
+async fn send_n2_release_transfer(amf_uri: &str, supi: &str, psi: u8, n2: &[u8]) {
+    use nextgcore_sbi::constants::content_type;
+    use nextgcore_sbi::message::{SbiPart, SbiRequest as SReq};
+
+    let Some((host, port)) = policy::split_host_port(amf_uri) else {
+        log::warn!("AMF URI '{amf_uri}' is not a valid URI — skipping N1N2MessageTransfer");
+        return;
+    };
+    let path = format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages");
+    let body = serde_json::json!({
+        "n2InfoContainer": {
+            "n2InformationClass": "SM",
+            "smInfo": {
+                "pduSessionId": psi,
+                "n2InfoContent": {
+                    "ngapIeType": "PDU_RES_REL_CMD",
+                    "ngapData": { "contentId": "n2SmInfo" }
+                }
+            }
+        },
+        "pduSessionId": psi,
+    });
+    let request = SReq::post(&path)
+        .with_body(body.to_string(), content_type::APPLICATION_JSON)
+        .with_part(SbiPart::with_content(
+            "n2SmInfo",
+            content_type::APPLICATION_NGAP,
+            bytes::Bytes::copy_from_slice(n2),
+        ));
+    let client = nextgcore_sbi::client::SbiClient::new(
+        nextgcore_sbi::security::sbi_peer_client_config(&host, port)
+            .with_connect_timeout(std::time::Duration::from_secs(2))
+            .with_request_timeout(std::time::Duration::from_secs(3)),
+    );
+    match client.send_request(request).await {
+        Ok(resp) => log::info!(
+            "N1N2MessageTransfer (UP deactivation, SUPI {supi}, PSI {psi}) → {host}:{port}: \
+             status={}",
+            resp.status
+        ),
+        Err(e) => log::warn!("N1N2MessageTransfer (UP deactivation) to {host}:{port} failed: {e}"),
+    }
+}
+
 /// Release a PDU session whose UPF restarted, asking the UE to establish it again
 /// (#667, TS 23.527 §4.2, TS 23.502 §4.3.4.2): N1 PDU SESSION RELEASE COMMAND with
 /// 5GSM cause #39 "reactivation requested" plus the N2 PDU Session Resource Release
@@ -6414,7 +6644,7 @@ async fn send_n1_n2_paging_request(amf_uri: &str, supi: &str, psi: u8, qfi: Opti
 /// Stopped only by aborting the handle. #718 review N1: it used to break as soon
 /// as SHUTDOWN was set, which the signal handler does first, so the shutdown's own
 /// PFCP requests (each pool member's Association Release, every EPC Session
-/// Deletion) got no responses and waited out T1 x N1 each, serially, until the
+/// Deletion) got no responses and waited out T1 x (N1+1) = 12 s each, serially, until the
 /// orchestrator's SIGKILL. [`graceful_shutdown`] aborts it after its last request.
 fn spawn_pfcp_listener(
     socket: Arc<tokio::net::UdpSocket>,
@@ -6498,11 +6728,33 @@ async fn graceful_shutdown(
     pfcp_clients: &[Arc<pfcp_path::PfcpClient>],
     release: bool,
     pfcp_listener: tokio::task::JoinHandle<()>,
+    deadline: tokio::time::Instant,
 ) {
-    deregister.await;
+    // #994, #1028 review m1: first, before the deregistration, so no hold expires
+    // into the shutdown and starts a #39 fan-out whose UEs would re-establish into
+    // NF_FAILOVER. The failed paths are durable, and the next incarnation re-arms
+    // what is left of each hold.
+    up_path::abort_hold_timers();
+    // #941 review M2: every phase is bounded by what is left of ONE deadline, taken
+    // when the shutdown started. A blackholed NRF held the deregistration for its
+    // 30 s request timeout and pushed the rest past the SIGKILL.
+    let left = || deadline.saturating_duration_since(tokio::time::Instant::now());
+    if tokio::time::timeout(left().min(SHUTDOWN_DEREGISTER_BUDGET), deregister)
+        .await
+        .is_err()
+    {
+        log::warn!(
+            "Shutdown: NFDeregister did not finish within {SHUTDOWN_DEREGISTER_BUDGET:?}; \
+             the NRF learns of this SMF's absence from its heartbeat supervision instead"
+        );
+    }
+    // What the #39 fan-out may use: everything but the Association Release's own
+    // T1 x (N1+1) and the S5/S8 drain after it.
+    let release_budget = left().saturating_sub(SHUTDOWN_ASSOCIATION_RELEASE + SHUTDOWN_GTP_DRAIN);
     // #928 round 2, M1: the #39 fan-outs a UPF restart or release started earlier
-    // drain ALONGSIDE this shutdown's own releases, inside the same budget, not after.
-    let fanouts = pfcp_path::drain_restart_fanouts(std::time::Duration::from_secs(5));
+    // drain ALONGSIDE this shutdown's own releases, not after; and, since #941, inside
+    // the same deadline: until the S5/S8 drain, at most.
+    let fanouts = pfcp_path::drain_restart_fanouts(left().saturating_sub(SHUTDOWN_GTP_DRAIN));
     let n4 = async {
         if release {
             let mut releases = tokio::task::JoinSet::new();
@@ -6511,7 +6763,10 @@ async fn graceful_shutdown(
                     if !client.is_associated().await {
                         return;
                     }
-                    match client.release_association().await {
+                    match client
+                        .release_association_within(Some(release_budget))
+                        .await
+                    {
                         Ok(()) => log::info!("PFCP association with {} released", client.peer()),
                         Err(e) => {
                             log::warn!("PFCP Association Release to {} failed: {e}", client.peer())
@@ -6531,7 +6786,10 @@ async fn graceful_shutdown(
             // retention request keeps every session of the association, so left alone
             // they would be orphaned in the PGW-U while the SGW, MME and UE kept
             // believing in them.
-            let (deleted, told) = shutdown_epc_pdn_connections().await;
+            let (deleted, told) = shutdown_epc_pdn_connections(
+                tokio::time::Instant::now() + left().saturating_sub(SHUTDOWN_GTP_DRAIN),
+            )
+            .await;
             if deleted + told > 0 {
                 log::warn!(
                     "Shutdown: {told} EPC PDN connection(s) deleted toward the SGW, {deleted} \
@@ -6546,7 +6804,11 @@ async fn graceful_shutdown(
     log::info!("SMF N4 PFCP listener stopped");
     // #718 review m2: the Delete Bearer Requests sent above, on either path, are
     // retransmitted until answered or N3 is exhausted.
-    drain_s5s8_requests(gtp_path::s5s8_server().map(|s| s.as_ref())).await;
+    drain_s5s8_requests(
+        gtp_path::s5s8_server().map(|s| s.as_ref()),
+        left().min(SHUTDOWN_GTP_DRAIN),
+    )
+    .await;
 }
 
 /// Whether a graceful shutdown releases the PFCP association (#677, #718).
@@ -6581,10 +6843,11 @@ fn refuse_create_while_shutting_down(shutting_down: bool) -> Option<SbiResponse>
 /// Delete every EPC PDN connection on a shutdown that keeps the N4 association
 /// (#718 review M4). Returns `(PFCP sessions deleted at the PGW-U, PDN connections
 /// deleted toward the SGW)`.
-async fn shutdown_epc_pdn_connections() -> (usize, usize) {
+async fn shutdown_epc_pdn_connections(deadline: tokio::time::Instant) -> (usize, usize) {
     shutdown_epc_pdn_connections_via(
         gtp_path::s5s8_server().map(|s| s.as_ref()),
         gtp_path::GTPC_PORT,
+        deadline,
     )
     .await
 }
@@ -6605,6 +6868,7 @@ const SHUTDOWN_EPC_FANOUT: usize = 16;
 async fn shutdown_epc_pdn_connections_via(
     server: Option<&gtp_path::S5S8Server>,
     sgw_port: u16,
+    deadline: tokio::time::Instant,
 ) -> (usize, usize) {
     let epc: Vec<(u64, u64)> = smf_self()
         .read()
@@ -6622,11 +6886,23 @@ async fn shutdown_epc_pdn_connections_via(
         }
         None => 0,
     };
+    // #941 round 2, M1: the PGW-U deletions are bounded by `deadline` too. With a dead
+    // PGW-U each one waits out T1 x (N1+1) = 12 s, so 64 sessions at 16 in flight took
+    // about 51 s, past the SIGKILL. What is not deleted by then the next incarnation's
+    // association handles.
+    let total = epc.len();
     let permits = Arc::new(tokio::sync::Semaphore::new(SHUTDOWN_EPC_FANOUT));
     let mut deletions = tokio::task::JoinSet::new();
+    let mut out_of_time = false;
     for (smf_n4_seid, upf_seid) in epc {
-        let Ok(permit) = permits.clone().acquire_owned().await else {
-            break;
+        let permit = match tokio::time::timeout_at(deadline, permits.clone().acquire_owned()).await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => break,
+            Err(_) => {
+                out_of_time = true;
+                break;
+            }
         };
         deletions.spawn(async move {
             let _permit = permit;
@@ -6643,13 +6919,77 @@ async fn shutdown_epc_pdn_connections_via(
         });
     }
     let mut deleted = 0;
-    while let Some(done) = deletions.join_next().await {
-        if matches!(done, Ok(true)) {
-            deleted += 1;
+    while !out_of_time {
+        match tokio::time::timeout_at(deadline, deletions.join_next()).await {
+            Ok(Some(done)) => {
+                if matches!(done, Ok(true)) {
+                    deleted += 1;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => out_of_time = true,
         }
+    }
+    if out_of_time {
+        deletions.abort_all();
+        log::warn!(
+            "Shutdown: out of time with {deleted}/{total} EPC PFCP session(s) deleted at the \
+             PGW-U"
+        );
     }
     (deleted, told)
 }
+
+/// The whole graceful shutdown's budget, from the signal (#941 review M2): inside the
+/// shipped 45 s termination grace period, with 2 s for the SBI stop and the exit.
+/// `SMF_SHUTDOWN_BUDGET_SECS` overrides it for a deployment with another grace
+/// period; keep it a little under that.
+const SHUTDOWN_BUDGET_DEFAULT: std::time::Duration = std::time::Duration::from_secs(43);
+
+/// The shutdown budget in force: `SMF_SHUTDOWN_BUDGET_SECS`, else the default.
+fn shutdown_budget() -> std::time::Duration {
+    parse_shutdown_budget(std::env::var("SMF_SHUTDOWN_BUDGET_SECS").ok().as_deref())
+}
+
+/// The bounds of `SMF_SHUTDOWN_BUDGET_SECS` (#941 round 2, M2). Below the minimum no
+/// UE would be told anything (the Association Release and the S5/S8 drain reserve
+/// 24 s, and NFDeregister 3 s); above the maximum the deadline arithmetic is not
+/// meaningful for any grace period a pod gets.
+const SHUTDOWN_BUDGET_MIN: std::time::Duration = std::time::Duration::from_secs(30);
+const SHUTDOWN_BUDGET_MAX: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Parse and clamp `SMF_SHUTDOWN_BUDGET_SECS`, warning on a value it does not take as
+/// given. Unset or empty: the default.
+fn parse_shutdown_budget(value: Option<&str>) -> std::time::Duration {
+    let Some(raw) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return SHUTDOWN_BUDGET_DEFAULT;
+    };
+    let Ok(secs) = raw.parse::<u64>() else {
+        log::warn!(
+            "SMF_SHUTDOWN_BUDGET_SECS={raw:?} is not a number of seconds; using {:?}",
+            SHUTDOWN_BUDGET_DEFAULT
+        );
+        return SHUTDOWN_BUDGET_DEFAULT;
+    };
+    let asked = std::time::Duration::from_secs(secs.min(SHUTDOWN_BUDGET_MAX.as_secs() + 1));
+    let budget = asked.clamp(SHUTDOWN_BUDGET_MIN, SHUTDOWN_BUDGET_MAX);
+    if budget != asked {
+        log::warn!(
+            "SMF_SHUTDOWN_BUDGET_SECS={secs} is outside {:?}..={:?}; using {budget:?}. Set it \
+             a little under the pod's termination grace period",
+            SHUTDOWN_BUDGET_MIN,
+            SHUTDOWN_BUDGET_MAX
+        );
+    }
+    budget
+}
+
+/// At most this long for NFDeregister (#941 review M2).
+const SHUTDOWN_DEREGISTER_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// What an Association Release can take with the defaults: T1 x (N1+1) = 3 s x 4.
+/// The #39 fan-out gets the shutdown budget less this and the S5/S8 drain.
+const SHUTDOWN_ASSOCIATION_RELEASE: std::time::Duration = std::time::Duration::from_secs(12);
 
 /// How long a shutdown keeps retransmitting its own S5/S8 requests (#718 review
 /// m2): T3-RESPONSE x (N3-REQUESTS + 1) with the defaults, 3 s x 4. The SGW gets
@@ -6659,11 +6999,11 @@ const SHUTDOWN_GTP_DRAIN: std::time::Duration = std::time::Duration::from_secs(1
 
 /// Wait, at most [`SHUTDOWN_GTP_DRAIN`], until no S5/S8 request this node sent is
 /// still awaiting its answer: the T3/N3 task retransmits them meanwhile.
-async fn drain_s5s8_requests(server: Option<&gtp_path::S5S8Server>) {
+async fn drain_s5s8_requests(server: Option<&gtp_path::S5S8Server>, budget: std::time::Duration) {
     let Some(server) = server else {
         return;
     };
-    let deadline = tokio::time::Instant::now() + SHUTDOWN_GTP_DRAIN;
+    let deadline = tokio::time::Instant::now() + budget;
     loop {
         let outstanding = server.outstanding().await;
         if outstanding == 0 {
@@ -6671,8 +7011,7 @@ async fn drain_s5s8_requests(server: Option<&gtp_path::S5S8Server>) {
         }
         if tokio::time::Instant::now() >= deadline {
             log::warn!(
-                "Shutdown: {outstanding} S5/S8 request(s) still unanswered after {:?}",
-                SHUTDOWN_GTP_DRAIN
+                "Shutdown: {outstanding} S5/S8 request(s) still unanswered after {budget:?}"
             );
             return;
         }
@@ -7041,19 +7380,22 @@ fn uri_path(uri: &str) -> String {
 /// failures are logged, not propagated — the local release proceeds regardless.
 /// smfd-07.
 async fn send_sm_context_status_notification(
-    uri: Option<&str>,
+    status_uri: Option<&str>,
     resource_status: &str,
     cause: Option<&str>,
 ) {
-    let Some(uri) = uri else {
+    let Some(status_uri) = status_uri else {
         log::debug!("No smContextStatusUri — skipping SmContextStatusNotification");
         return;
     };
-    let Some((host, port)) = policy::split_host_port(uri) else {
-        log::warn!("smContextStatusUri '{uri}' is not a valid URI — skipping notification");
+    let Some((host, port)) = policy::split_host_port(status_uri) else {
+        log::warn!(
+            "smContextStatusUri '{status_uri}' is not a valid URI — skipping notification",
+            status_uri = nextgcore_sbi::log_redact::redact_last_segment(status_uri)
+        );
         return;
     };
-    let path = uri_path(uri);
+    let path = uri_path(status_uri);
     let body = build_sm_context_status_notification(resource_status, cause);
     let client = nextgcore_sbi::client::SbiClient::new(
         nextgcore_sbi::security::sbi_peer_client_config(&host, port)
@@ -7062,10 +7404,14 @@ async fn send_sm_context_status_notification(
     );
     match client.post_json(&path, &body).await {
         Ok(resp) => log::info!(
-            "SmContextStatusNotification ({resource_status}) → {uri}: status={}",
-            resp.status
+            "SmContextStatusNotification ({resource_status}) → {status_uri}: status={}",
+            resp.status,
+            status_uri = nextgcore_sbi::log_redact::redact_last_segment(status_uri)
         ),
-        Err(e) => log::warn!("SmContextStatusNotification to {uri} failed: {e}"),
+        Err(e) => log::warn!(
+            "SmContextStatusNotification to {status_uri} failed: {e}",
+            status_uri = nextgcore_sbi::log_redact::redact_last_segment(status_uri)
+        ),
     }
 }
 
@@ -7603,7 +7949,7 @@ async fn handle_event_subscribe(request: &SbiRequest) -> SbiResponse {
     log::info!(
         "Event subscription {id} created: events={:?} notifUri={} ({} stored)",
         sub.events,
-        sub.notif_uri,
+        nextgcore_sbi::log_redact::redact_last_segment(&sub.notif_uri),
         event_exposure::count() + 1
     );
     let document = event_exposure::insert(sub);
@@ -8112,6 +8458,11 @@ mod tests {
         assert_eq!(body["cause"], "NF_FAILOVER");
     }
 
+    /// The shipped shutdown deadline, from now (#941).
+    fn test_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + SHUTDOWN_BUDGET_DEFAULT
+    }
+
     /// A raw UPF on loopback for the shutdown tests (#718 review N1): answers
     /// Session Deletion and Association Release with Request Accepted, and records
     /// every request as `(message type, sequence number)`, retransmissions included.
@@ -8216,7 +8567,7 @@ mod tests {
     /// sessions through the REAL N4 listener, which is still running: both Session
     /// Deletions are answered on the first transmission, concurrently, well inside
     /// one T1. Before, the listener stopped at SIGTERM, so each deletion waited out
-    /// T1 x N1 (about 9 s), serially, and the SGW was told only after all of them.
+    /// T1 x (N1+1) (12 s), serially, and the SGW was told only after all of them.
     #[tokio::test]
     async fn the_shutdown_deletes_epc_sessions_through_the_live_listener_without_retransmitting() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
@@ -8240,7 +8591,14 @@ mod tests {
         }
 
         let started = std::time::Instant::now();
-        graceful_shutdown(async {}, std::slice::from_ref(&client), false, listener).await;
+        graceful_shutdown(
+            async {},
+            std::slice::from_ref(&client),
+            false,
+            listener,
+            test_deadline(),
+        )
+        .await;
         let took = started.elapsed();
         let requests = seen.lock().unwrap().clone();
         upf_task.abort();
@@ -8289,6 +8647,7 @@ mod tests {
             std::slice::from_ref(&client),
             true,
             listener,
+            test_deadline(),
         )
         .await;
         let took = started.elapsed();
@@ -8358,7 +8717,14 @@ mod tests {
         }
         pfcp_path::record_session_peer(seid, a.peer());
 
-        graceful_shutdown(async {}, &[a.clone(), b.clone()], true, listener).await;
+        graceful_shutdown(
+            async {},
+            &[a.clone(), b.clone()],
+            true,
+            listener,
+            test_deadline(),
+        )
+        .await;
         let release_commands = amf_seen
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -8453,7 +8819,12 @@ mod tests {
             }
             (first, n)
         });
-        let (deleted, told) = shutdown_epc_pdn_connections_via(Some(&server), sgw_port).await;
+        let (deleted, told) = shutdown_epc_pdn_connections_via(
+            Some(&server),
+            sgw_port,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .await;
         let took = started.elapsed();
         let (sgw_first, dbrs) = sgw_task.await.unwrap();
         let pfcp_first = arrivals.lock().unwrap().first().copied();
@@ -8477,6 +8848,203 @@ mod tests {
         assert!(
             took < std::time::Duration::from_millis(750),
             "the deletions overlapped: {took:?}"
+        );
+    }
+
+    /// #941 review M3: the shutdown WIRING keeps the deadline. A blackholed AMF and 20
+    /// sessions on the UPF (more than the 16 releases in flight, so the fan-out
+    /// queues). With 0.5 s of the deadline left for the #39s, the shutdown returns
+    /// promptly, every session is flushed, and the Association Release still reaches
+    /// the UPF.
+    #[tokio::test]
+    async fn the_shutdown_keeps_its_deadline_with_a_blackholed_amf() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let blackhole = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let amf_port = blackhole.local_addr().unwrap().port();
+        let held = tokio::spawn(async move {
+            let mut conns = Vec::new();
+            while let Ok((c, _)) = blackhole.accept().await {
+                conns.push(c);
+            }
+        });
+        let (upf, seen, upf_task) = raw_upf(None).await;
+        let (client, listener) = client_behind_the_real_listener(upf).await;
+        let refs: Vec<String> = (0..20).map(|i| format!("{}", 94_100 + i)).collect();
+        if let Ok(ctx) = smf_self().read() {
+            for (i, r) in refs.iter().enumerate() {
+                ctx.pfcp_sessions
+                    .write()
+                    .unwrap()
+                    .insert(r.clone(), 0x941 + i as u64);
+                let mut b = context::PolicyBinding::snapshot_default();
+                b.supi = format!("imsi-0010100000941{i:02}");
+                b.psi = 5;
+                b.sm_context_status_uri = Some(format!("http://127.0.0.1:{amf_port}/sm-status"));
+                ctx.policy_bindings.write().unwrap().insert(r.clone(), b);
+                pfcp_path::record_session_peer(context::derive_cp_n4_seid(r), client.peer());
+            }
+        }
+        let deadline = tokio::time::Instant::now()
+            + SHUTDOWN_ASSOCIATION_RELEASE
+            + SHUTDOWN_GTP_DRAIN
+            + std::time::Duration::from_millis(500);
+
+        let started = std::time::Instant::now();
+        graceful_shutdown(
+            async {},
+            std::slice::from_ref(&client),
+            true,
+            listener,
+            deadline,
+        )
+        .await;
+        let took = started.elapsed();
+        let released = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(ty, _)| *ty == pfcp_path::pfcp_message_type::ASSOCIATION_RELEASE_REQUEST)
+            .count();
+        let flushed = refs.iter().all(|r| {
+            !smf_self()
+                .read()
+                .unwrap()
+                .pfcp_sessions
+                .read()
+                .unwrap()
+                .contains_key(r)
+        });
+        for r in &refs {
+            cancel_gsm_timer(r, timer::SmfTimerId::T3592);
+            pfcp_path::forget_session_peer(context::derive_cp_n4_seid(r));
+            if let Ok(ctx) = smf_self().read() {
+                ctx.policy_bindings.write().unwrap().remove(r);
+            }
+        }
+        held.abort();
+        upf_task.abort();
+        pfcp_path::clear_global_upf_for_test();
+
+        assert!(
+            took < std::time::Duration::from_secs(3),
+            "bounded: {took:?}"
+        );
+        assert_eq!(released, 1, "the Association Release still reached the UPF");
+        assert!(
+            flushed,
+            "every session flushed although most #39s were abandoned"
+        );
+    }
+
+    /// #941 review M2: an NRF that never answers holds NFDeregister only for its share
+    /// of the deadline; the Association Release still goes out within it.
+    #[tokio::test]
+    async fn a_blackholed_nrf_cannot_hold_the_shutdown_past_its_deadline() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let (upf, seen, upf_task) = raw_upf(None).await;
+        let (client, listener) = client_behind_the_real_listener(upf).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1500);
+        let started = std::time::Instant::now();
+        graceful_shutdown(
+            std::future::pending::<()>(),
+            std::slice::from_ref(&client),
+            true,
+            listener,
+            deadline,
+        )
+        .await;
+        let took = started.elapsed();
+        let released = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(ty, _)| *ty == pfcp_path::pfcp_message_type::ASSOCIATION_RELEASE_REQUEST)
+            .count();
+        upf_task.abort();
+        pfcp_path::clear_global_upf_for_test();
+
+        assert!(took < std::time::Duration::from_secs(3), "{took:?}");
+        assert_eq!(released, 1);
+    }
+
+    /// #941 round 2, M2: `SMF_SHUTDOWN_BUDGET_SECS` is clamped, never trusted as is: 0
+    /// would tell no UE anything, and u64::MAX overflowed the deadline arithmetic.
+    #[test]
+    fn the_shutdown_budget_is_validated() {
+        let s = std::time::Duration::from_secs;
+        assert_eq!(parse_shutdown_budget(None), SHUTDOWN_BUDGET_DEFAULT);
+        assert_eq!(parse_shutdown_budget(Some("  ")), SHUTDOWN_BUDGET_DEFAULT);
+        assert_eq!(parse_shutdown_budget(Some("abc")), SHUTDOWN_BUDGET_DEFAULT);
+        assert_eq!(parse_shutdown_budget(Some("88")), s(88));
+        assert_eq!(parse_shutdown_budget(Some("0")), SHUTDOWN_BUDGET_MIN);
+        assert_eq!(
+            parse_shutdown_budget(Some("18446744073709551615")),
+            SHUTDOWN_BUDGET_MAX
+        );
+        // And the deadline built from the maximum does not overflow.
+        let _ = tokio::time::Instant::now() + parse_shutdown_budget(Some("18446744073709551615"));
+    }
+
+    /// #941 round 2, M3: on the durable path the EPC PFCP deletions are bounded by the
+    /// deadline. A PGW-U that never answers holds each deletion for T1 x (N1+1); with
+    /// 20 EPC sessions (more than the 16 in flight) and 0.5 s left, the shutdown
+    /// still returns at once.
+    #[tokio::test]
+    async fn the_epc_shutdown_keeps_its_deadline_with_a_dead_pgw_u() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        smf_context_init(64, 256, 512);
+        // A PGW-U that reads and never answers.
+        let dead = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        let sink = tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            while dead.recv_from(&mut buf).await.is_ok() {}
+        });
+        let (client, listener) = client_behind_the_real_listener(dead_addr).await;
+        let mut ids = Vec::new();
+        if let Ok(ctx) = smf_self().read() {
+            for sess in ctx.sess_find_all_by(|s| s.epc) {
+                ctx.sess_remove(sess.id);
+            }
+            for i in 0..20u64 {
+                let imsi = format!("0010100000941{i:02}");
+                let ue = ctx.ue_add_by_imsi(imsi.as_bytes()).expect("ue");
+                let mut sess = ctx.sess_add_by_apn(ue.id, "internet", 6).expect("sess");
+                sess.upf_n4_seid = 0x9410 + i;
+                ctx.sess_update(&sess);
+                pfcp_path::record_session_peer(sess.smf_n4_seid, client.peer());
+                ids.push((sess.id, sess.smf_n4_seid));
+            }
+        }
+        let deadline = tokio::time::Instant::now()
+            + SHUTDOWN_GTP_DRAIN
+            + std::time::Duration::from_millis(500);
+        let started = std::time::Instant::now();
+        graceful_shutdown(
+            async {},
+            std::slice::from_ref(&client),
+            false,
+            listener,
+            deadline,
+        )
+        .await;
+        let took = started.elapsed();
+        sink.abort();
+        if let Ok(ctx) = smf_self().read() {
+            for (id, seid) in &ids {
+                ctx.sess_remove(*id);
+                pfcp_path::forget_session_peer(*seid);
+            }
+        }
+        pfcp_path::clear_global_upf_for_test();
+        assert!(
+            took < std::time::Duration::from_secs(3),
+            "bounded: {took:?}"
         );
     }
 
@@ -8825,6 +9393,129 @@ mod tests {
         assert!(associated, "UPF A is still associated");
         assert_eq!(stamp, Some(100), "A's stored stamp is untouched");
         assert!(kept, "A's session is kept");
+    }
+
+    /// #1031: a session restored from durable state onto UPF B, the non-default
+    /// pool member, is B's: B's Session Report on it is accepted, A's is refused.
+    #[tokio::test]
+    async fn a_restored_session_on_a_non_default_upf_takes_its_reports() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        smf_context_init(64, 256, 512);
+        let upf_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upf_b = tokio::net::UdpSocket::bind("127.0.0.3:0").await.unwrap();
+        let sock = std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let smf = sock.local_addr().unwrap();
+        let a = std::sync::Arc::new(pfcp_path::PfcpClient::new(
+            sock.clone(),
+            upf_a.local_addr().unwrap(),
+            [127, 0, 0, 1],
+        ));
+        let b = std::sync::Arc::new(pfcp_path::PfcpClient::new(
+            sock.clone(),
+            upf_b.local_addr().unwrap(),
+            [127, 0, 0, 1],
+        ));
+        pfcp_path::set_global_pool(vec![a.clone(), b.clone()]);
+        let listener = spawn_pfcp_listener(sock, vec![a.clone(), b.clone()]);
+        // Restored: in the session table, its UPF known only by identity.
+        let reference = "10312";
+        let seid = crate::context::derive_cp_n4_seid(reference);
+        {
+            let ctx = smf_self();
+            let ctx = ctx.read().unwrap();
+            ctx.pfcp_sessions
+                .write()
+                .unwrap()
+                .insert(reference.to_string(), 0x1031);
+            ctx.session_upfs
+                .write()
+                .unwrap()
+                .insert(seid, b.recovery_time_stamp_key());
+        }
+
+        upf_b
+            .send_to(&session_report(seid, 0x1031), smf)
+            .await
+            .unwrap();
+        let from_b = recv_pfcp(&upf_b).await;
+        upf_a
+            .send_to(&session_report(seid, 0x1032), smf)
+            .await
+            .unwrap();
+        let from_a = recv_pfcp(&upf_a).await;
+        pfcp_path::forget_session_peer(seid);
+        smf_self()
+            .read()
+            .unwrap()
+            .pfcp_sessions
+            .write()
+            .unwrap()
+            .remove(reference);
+        listener.abort();
+        pfcp_path::clear_global_upf_for_test();
+
+        assert_eq!(pfcp_cause_of(&from_b.expect("B answered")), Some(1));
+        assert_eq!(pfcp_cause_of(&from_a.expect("A answered")), Some(65));
+    }
+
+    /// #1059 round 2, M1, m1: the write side. A real establishment records the UPF's
+    /// identity; once the in-memory endpoint record is gone (a restart) and the UPF
+    /// is no longer the default member, the session still routes to it; and taking
+    /// the SM context forgets the identity.
+    #[tokio::test]
+    async fn an_established_sessions_upf_identity_survives_the_endpoint_record() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        smf_context_init(64, 256, 512);
+        let reference = seed_registered_session("imsi-001010000010311", 5, "internet");
+        let seid = smf_n4_seid_for(&reference);
+        let qos = SessionQos {
+            qfi: 9,
+            ambr_ul_bps: 100_000_000,
+            ambr_dl_bps: 100_000_000,
+            xr_flow: None,
+        };
+        let result = pfcp_session_establish(seid, [10, 45, 3, 11], "internet", 1, &qos)
+            .await
+            .expect("established");
+        smf_self()
+            .read()
+            .unwrap()
+            .pfcp_sessions
+            .write()
+            .unwrap()
+            .insert(reference.clone(), result.upf_seid);
+        let recorded = smf_self()
+            .read()
+            .unwrap()
+            .session_upfs
+            .read()
+            .unwrap()
+            .get(&seid)
+            .cloned();
+
+        // A restart: the endpoint record is gone; and B is no longer the default.
+        pfcp_path::forget_session_endpoint_for_test(seid);
+        let other = std::sync::Arc::new(pfcp_path::PfcpClient::new(
+            std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            "127.0.0.5:8805".parse().unwrap(),
+            [127, 0, 0, 1],
+        ));
+        pfcp_path::set_global_pool(vec![other, upf.client.clone()]);
+        let routed = pfcp_path::client_for_session(seid).map(|c| c.peer());
+        let _ = take_sm_context(&reference);
+        let forgotten = !smf_self()
+            .read()
+            .unwrap()
+            .session_upfs
+            .read()
+            .unwrap()
+            .contains_key(&seid);
+
+        assert_eq!(recorded, Some(upf.client.recovery_time_stamp_key()));
+        assert_eq!(routed, Some(upf.client.peer()), "by its identity");
+        assert!(forgotten, "take_sm_context forgets the identity");
     }
 
     /// #974 review M2, m6, #971: a stranger's Association Release Request is refused
@@ -9599,7 +10290,10 @@ mod tests {
             ctx.sess_update(&sess);
             sess.id
         };
-        let (deleted, _told) = shutdown_epc_pdn_connections().await;
+        let (deleted, _told) = shutdown_epc_pdn_connections(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .await;
         let seen = upf.seen();
         if let Ok(ctx) = smf_self().read() {
             ctx.sess_remove(sess_id);
@@ -13242,6 +13936,652 @@ mod tests {
         assert!(!sess_left, "the session is removed");
         assert_eq!(after + 1, before, "the address is freed once");
         assert!(free_again);
+    }
+
+    // ---- #994: PFCP Node Report: user plane path failure and recovery ----
+
+    /// A Node Report Request packet of `report_type` with one grouped report naming
+    /// `peer`.
+    fn node_report_packet(seq: u32, report_type: u8, grouped: u16, peer: [u8; 4]) -> Vec<u8> {
+        // TS 29.244 §8.2.70: octet 5 bit 2 is V4 (#1028 review B1).
+        let mut remote = vec![0x02];
+        remote.extend_from_slice(&peer);
+        let mut inner = vec![0, 103];
+        inner.extend_from_slice(&(remote.len() as u16).to_be_bytes());
+        inner.extend_from_slice(&remote);
+        let mut body = vec![0, 60, 0, 5, 0, 127, 0, 0, 1, 0, 101, 0, 1, report_type];
+        body.extend_from_slice(&grouped.to_be_bytes());
+        body.extend_from_slice(&(inner.len() as u16).to_be_bytes());
+        body.extend_from_slice(&inner);
+        pfcp_path::encode_wire_message(
+            pfcp_path::pfcp_message_type::NODE_REPORT_REQUEST,
+            None,
+            seq,
+            &body,
+        )
+    }
+
+    /// The posts an AMF stand-in received: (path, JSON part).
+    type AmfPosts = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+    async fn recording_amf() -> (nextgcore_sbi::server::SbiServer, u16, AmfPosts) {
+        let posts: AmfPosts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = posts.clone();
+        let (srv, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock().unwrap().push((
+                        req.header.uri.clone(),
+                        req.http.content.clone().unwrap_or_default(),
+                    ));
+                    SbiResponse::with_status(200)
+                }
+            })
+            .await;
+        (srv, addr.port(), posts)
+    }
+
+    /// An established session on the stand-in UPF whose DL FAR 2 forwards to the
+    /// gNB at 127.0.0.9, installed through the real `pfcp_session_modify`, so the SMF
+    /// learnt the peer from its own request; and a binding naming the AMF.
+    async fn session_toward_gnb(
+        upf: &pfcp_path::stand_in::StandInUpf,
+        supi: &str,
+        psi: u8,
+        amf_port: u16,
+    ) -> String {
+        let reference = seed_registered_session(supi, psi, "internet");
+        {
+            let ctx = smf_self();
+            let ctx = ctx.read().unwrap();
+            ctx.pfcp_sessions
+                .write()
+                .unwrap()
+                .insert(reference.clone(), upf.upf_seid);
+            let mut b = context::PolicyBinding::snapshot_default();
+            b.supi = supi.to_string();
+            b.psi = psi;
+            b.sm_context_status_uri = Some(format!("http://127.0.0.1:{amf_port}/sm-status"));
+            ctx.policy_bindings
+                .write()
+                .unwrap()
+                .insert(reference.clone(), b);
+        }
+        pfcp_session_modify(
+            smf_n4_seid_for(&reference),
+            upf.upf_seid,
+            0x99,
+            [127, 0, 0, 9],
+        )
+        .await
+        .expect("DL tunnel installed");
+        reference
+    }
+
+    /// Drop a session [`session_toward_gnb`] seeded, and its UE: the context holds at
+    /// most 64 UEs process-wide, so a test that leaves one behind starves a sibling.
+    fn forget_seeded_session(reference: &str) {
+        let ctx = smf_self();
+        let ctx = ctx.read().unwrap();
+        ctx.policy_bindings.write().unwrap().remove(reference);
+        ctx.pfcp_sessions.write().unwrap().remove(reference);
+        if let Some(sess) = ctx.sess_find_by_sm_context_ref(reference) {
+            ctx.sess_remove(sess.id);
+            ctx.ue_remove(sess.smf_ue_id);
+        }
+    }
+
+    /// Poll `done`, at most 15 s: the release a hold starts runs in its own task, and
+    /// on a loaded machine its timing is not the test's to choose.
+    async fn wait_until(done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !done() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Deliver `pkt` to `upf`'s client as from `from`, and return the answer.
+    async fn deliver(
+        upf: &pfcp_path::stand_in::StandInUpf,
+        from: &tokio::net::UdpSocket,
+        pkt: &[u8],
+    ) -> Vec<u8> {
+        assert!(
+            upf.client
+                .on_datagram(pkt, from.local_addr().unwrap())
+                .await
+        );
+        let mut buf = vec![0u8; 2048];
+        let (n, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), from.recv_from(&mut buf))
+                .await
+                .expect("an answer")
+                .unwrap();
+        buf.truncate(n);
+        buf
+    }
+
+    fn cause_of(pkt: &[u8]) -> Option<u8> {
+        let h = pfcp_path::parse_wire_header(pkt)?;
+        pfcp_path::find_ie(&pkt[h.body_offset..], 19).and_then(|v| v.first().copied())
+    }
+
+    /// The Apply Action the last modification set on FAR `far_id`, if it updated it.
+    fn last_update_far_action(upf: &pfcp_path::stand_in::StandInUpf, far_id: u32) -> Option<u16> {
+        let bodies = upf.modification_bodies();
+        let body = bodies.last()?;
+        let mut off = 0;
+        while off + 4 <= body.len() {
+            let t = u16::from_be_bytes([body[off], body[off + 1]]);
+            let l = u16::from_be_bytes([body[off + 2], body[off + 3]]) as usize;
+            let v = &body[off + 4..off + 4 + l];
+            if t == n4_build::pfcp_ie::UPDATE_FAR
+                && pfcp_path::find_ie(v, n4_build::pfcp_ie::FAR_ID)
+                    == Some(&far_id.to_be_bytes()[..])
+            {
+                return pfcp_path::find_ie(v, n4_build::pfcp_ie::APPLY_ACTION)
+                    .map(n4_build::decode_apply_action);
+            }
+            off += 4 + l;
+        }
+        None
+    }
+
+    /// #994, TS 29.244 §6.2.9.3 and §5.10A, TS 23.502 §4.3.7 steps 4-5: a UPF's Node
+    /// Report naming a failed GTP-U peer is answered "Request accepted"; the session
+    /// whose DL FAR forwards to that peer gets that FAR set to BUFF|NOCP, its UP
+    /// connection becomes DEACTIVATED, and the AMF gets an N2-only PDU Session
+    /// Resource Release Command for it.
+    #[tokio::test]
+    async fn a_node_report_deactivates_the_sessions_toward_the_failed_peer() {
+        let _state = up_path::UP_PATH_TEST_LOCK.lock().await;
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        up_path::reset_for_test();
+        up_path::set_hold_for_test(Some(std::time::Duration::from_secs(600)));
+        let (amf, amf_port, posts) = recording_amf().await;
+        let supi = "imsi-001010000009941";
+        let reference = session_toward_gnb(&upf, supi, 5, amf_port).await;
+        let from = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let before = up_path::UP_PATH_SESSIONS_DEACTIVATED.load(Ordering::SeqCst);
+
+        let answer = deliver(
+            &upf,
+            &from,
+            &node_report_packet(0x994, 0x01, 102, [127, 0, 0, 9]),
+        )
+        .await;
+        pfcp_path::drain_restart_fanouts(std::time::Duration::from_secs(5)).await;
+        let far2 = last_update_far_action(&upf, 2);
+        let state = smf_self()
+            .read()
+            .unwrap()
+            .sess_find_by_sm_context_ref(&reference)
+            .map(|s| s.up_cnx_state);
+        let posted = posts.lock().unwrap().clone();
+        let deactivated = up_path::UP_PATH_SESSIONS_DEACTIVATED.load(Ordering::SeqCst) - before;
+        up_path::reset_for_test();
+        forget_seeded_session(&reference);
+        amf.stop().await.ok();
+
+        assert_eq!(
+            pfcp_path::parse_wire_header(&answer).unwrap().msg_type,
+            pfcp_path::pfcp_message_type::NODE_REPORT_RESPONSE
+        );
+        assert_eq!(cause_of(&answer), Some(1));
+        assert_eq!(
+            far2,
+            Some(n4_build::apply_action::BUFF | n4_build::apply_action::NOCP),
+            "the DL FAR toward the failed gNB buffers"
+        );
+        assert_eq!(state, Some(context::UpCnxState::Deactivated));
+        let (path, json) = posted
+            .iter()
+            .find(|(p, _)| p.ends_with(&format!("/ue-contexts/{supi}/n1-n2-messages")))
+            .expect("an N1N2MessageTransfer");
+        assert!(path.contains(supi));
+        assert!(json.contains("PDU_RES_REL_CMD"), "{json}");
+        assert!(!json.contains("n1MessageContainer"), "N2 only: {json}");
+        assert_eq!(deactivated, 1);
+    }
+
+    /// #994, TS 29.244 §8.2.1: a Node Report from a host that is not this
+    /// association's UPF is refused with cause 72 and changes nothing.
+    #[tokio::test]
+    async fn a_node_report_from_another_host_is_refused() {
+        let _state = up_path::UP_PATH_TEST_LOCK.lock().await;
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        up_path::reset_for_test();
+        let (amf, amf_port, posts) = recording_amf().await;
+        let reference = session_toward_gnb(&upf, "imsi-001010000009942", 5, amf_port).await;
+        let mods = upf.modification_bodies().len();
+        let stranger = tokio::net::UdpSocket::bind("127.0.0.2:0").await.unwrap();
+
+        let answer = deliver(
+            &upf,
+            &stranger,
+            &node_report_packet(0x995, 0x01, 102, [127, 0, 0, 9]),
+        )
+        .await;
+        pfcp_path::drain_restart_fanouts(std::time::Duration::from_secs(5)).await;
+        let mods_after = upf.modification_bodies().len();
+        let failed = up_path::is_failed(
+            &upf.client.recovery_time_stamp_key(),
+            "127.0.0.9".parse().unwrap(),
+        );
+        let posted = posts.lock().unwrap().len();
+        up_path::reset_for_test();
+        forget_seeded_session(&reference);
+        amf.stop().await.ok();
+
+        assert_eq!(cause_of(&answer), Some(72));
+        assert_eq!(mods_after, mods, "no modification");
+        assert!(!failed);
+        assert_eq!(posted, 0);
+    }
+
+    /// #994, TS 23.007 §20.3.1: a path still down when the hold expires releases the
+    /// session that still uses it: the N4 session is deleted, and the UE is sent a
+    /// PDU Session Release Command #39 through the AMF (T3592 armed).
+    #[tokio::test]
+    async fn a_path_still_down_after_the_hold_releases_the_session() {
+        let _state = up_path::UP_PATH_TEST_LOCK.lock().await;
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        up_path::reset_for_test();
+        up_path::set_hold_for_test(Some(std::time::Duration::from_millis(200)));
+        let (amf, amf_port, posts) = recording_amf().await;
+        let supi = "imsi-001010000009943";
+        let reference = session_toward_gnb(&upf, supi, 6, amf_port).await;
+        upf.clear_seen();
+        let from = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let _ = deliver(
+            &upf,
+            &from,
+            &node_report_packet(0x996, 0x01, 102, [127, 0, 0, 9]),
+        )
+        .await;
+        wait_until(|| {
+            upf.seen()
+                .contains(&pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST)
+        })
+        .await;
+        pfcp_path::drain_restart_fanouts(std::time::Duration::from_secs(5)).await;
+        let seen = upf.seen();
+        let posted = posts.lock().unwrap().clone();
+        let t3592 = cancel_gsm_timer_for_test(&reference);
+        up_path::reset_for_test();
+        forget_seeded_session(&reference);
+        amf.stop().await.ok();
+
+        assert!(
+            seen.contains(&pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST),
+            "{seen:?}"
+        );
+        assert!(
+            posted.iter().any(|(_, j)| j.contains("n1MessageContainer")),
+            "a release command through the UE: {posted:?}"
+        );
+        assert!(t3592, "T3592 guards the release command");
+    }
+
+    /// #994: a recovery before the hold expires voids it: nothing is released. A
+    /// repeated failure report starts no second hold.
+    #[tokio::test]
+    async fn a_recovery_report_cancels_the_hold() {
+        let _state = up_path::UP_PATH_TEST_LOCK.lock().await;
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        up_path::reset_for_test();
+        up_path::set_hold_for_test(Some(std::time::Duration::from_millis(300)));
+        let (amf, amf_port, _posts) = recording_amf().await;
+        let reference = session_toward_gnb(&upf, "imsi-001010000009944", 7, amf_port).await;
+        upf.clear_seen();
+        let from = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let key = upf.client.recovery_time_stamp_key();
+        let gnb: std::net::IpAddr = "127.0.0.9".parse().unwrap();
+        let failures = up_path::UP_PATH_FAILURES.load(Ordering::SeqCst);
+
+        let _ = deliver(
+            &upf,
+            &from,
+            &node_report_packet(0x997, 0x01, 102, [127, 0, 0, 9]),
+        )
+        .await;
+        let _ = deliver(
+            &upf,
+            &from,
+            &node_report_packet(0x998, 0x01, 102, [127, 0, 0, 9]),
+        )
+        .await;
+        let failed = up_path::is_failed(&key, gnb);
+        let counted = up_path::UP_PATH_FAILURES.load(Ordering::SeqCst) - failures;
+        let recovered = deliver(
+            &upf,
+            &from,
+            &node_report_packet(0x999, 0x02, 187, [127, 0, 0, 9]),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        pfcp_path::drain_restart_fanouts(std::time::Duration::from_secs(5)).await;
+        let still_failed = up_path::is_failed(&key, gnb);
+        let seen = upf.seen();
+        up_path::reset_for_test();
+        forget_seeded_session(&reference);
+        amf.stop().await.ok();
+
+        assert!(failed);
+        assert_eq!(counted, 1, "one failure, one hold");
+        assert_eq!(cause_of(&recovered), Some(1));
+        assert!(!still_failed);
+        assert!(
+            !seen.contains(&pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST),
+            "nothing released after the recovery: {seen:?}"
+        );
+    }
+
+    /// #994: an Error Indication Report (TS 29.244 §8.2.21 ERIR) naming the gNB in
+    /// its Remote F-TEID deactivates that session's user plane toward it.
+    #[tokio::test]
+    async fn an_error_indication_report_deactivates_the_sessions_user_plane() {
+        let _state = up_path::UP_PATH_TEST_LOCK.lock().await;
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        up_path::reset_for_test();
+        let (amf, amf_port, posts) = recording_amf().await;
+        let reference = session_toward_gnb(&upf, "imsi-001010000009945", 8, amf_port).await;
+        let seid = smf_n4_seid_for(&reference);
+        // Report Type ERIR; Error Indication Report { Remote F-TEID 127.0.0.9 }.
+        let mut fteid = vec![0x01, 0, 0, 0, 0x99];
+        fteid.extend_from_slice(&[127, 0, 0, 9]);
+        let mut eir = vec![0, 21];
+        eir.extend_from_slice(&(fteid.len() as u16).to_be_bytes());
+        eir.extend_from_slice(&fteid);
+        let mut body = vec![0, 39, 0, 1, 0x04, 0, 99];
+        body.extend_from_slice(&(eir.len() as u16).to_be_bytes());
+        body.extend_from_slice(&eir);
+        let pkt = pfcp_path::encode_wire_message(
+            pfcp_path::pfcp_message_type::SESSION_REPORT_REQUEST,
+            Some(seid),
+            0x99a,
+            &body,
+        );
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        handle_pfcp_session_report(&sock, &pkt, upf.client.peer()).await;
+        pfcp_path::drain_restart_fanouts(std::time::Duration::from_secs(5)).await;
+        let far2 = last_update_far_action(&upf, 2);
+        let posted = posts.lock().unwrap().len();
+        up_path::reset_for_test();
+        forget_seeded_session(&reference);
+        amf.stop().await.ok();
+
+        assert_eq!(
+            far2,
+            Some(n4_build::apply_action::BUFF | n4_build::apply_action::NOCP)
+        );
+        assert_eq!(posted, 1, "the NG-RAN is told through the AMF");
+    }
+
+    /// #994, TS 23.007 §20.3.1 and §20.3.4: an EPC PDN connection whose PGW-U FAR
+    /// forwards to an SGW-U that stays failed for the hold is deleted at the PGW-U.
+    #[tokio::test]
+    async fn an_epc_pdn_connection_toward_a_failed_sgw_u_is_deleted_after_the_hold() {
+        let _state = up_path::UP_PATH_TEST_LOCK.lock().await;
+        smf_context_init(64, 256, 512);
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        up_path::reset_for_test();
+        up_path::set_hold_for_test(Some(std::time::Duration::from_millis(200)));
+        let (sess_id, smf_seid) = {
+            let ctx = smf_self();
+            let ctx = ctx.read().unwrap();
+            for sess in ctx.sess_find_all_by(|s| s.epc && s.upf_n4_seid != 0) {
+                ctx.sess_remove(sess.id);
+            }
+            let ue = ctx.ue_add_by_imsi(b"001010000099946").expect("ue");
+            let mut sess = ctx.sess_add_by_apn(ue.id, "internet", 6).expect("sess");
+            sess.upf_n4_seid = upf.upf_seid;
+            ctx.sess_update(&sess);
+            (sess.id, sess.smf_n4_seid)
+        };
+        // The S5-U FAR toward the SGW-U at 127.0.0.9, learnt from the SMF's request.
+        pfcp_session_modify(smf_seid, upf.upf_seid, 0x5u32, [127, 0, 0, 9])
+            .await
+            .expect("S5-U downlink installed");
+        upf.clear_seen();
+        let from = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let _ = deliver(
+            &upf,
+            &from,
+            &node_report_packet(0x99b, 0x01, 102, [127, 0, 0, 9]),
+        )
+        .await;
+        wait_until(|| {
+            upf.seen()
+                .contains(&pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST)
+        })
+        .await;
+        pfcp_path::drain_restart_fanouts(std::time::Duration::from_secs(5)).await;
+        let seen = upf.seen();
+        up_path::reset_for_test();
+        if let Ok(ctx) = smf_self().read() {
+            if let Some(sess) = ctx.sess_find_by_id(sess_id) {
+                ctx.sess_remove(sess.id);
+            }
+            if let Some(ue) = ctx.ue_find_by_imsi(b"001010000099946") {
+                ctx.ue_remove(ue.id);
+            }
+        }
+
+        assert!(
+            seen.contains(&pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST),
+            "{seen:?}"
+        );
+    }
+
+    /// #1028 review m2: a path the snapshot says was still failed is held again at
+    /// boot, for what is left of its hold, and its sessions are then released.
+    #[tokio::test]
+    async fn a_restored_failed_path_is_held_again_and_released() {
+        let _state = up_path::UP_PATH_TEST_LOCK.lock().await;
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        up_path::reset_for_test();
+        up_path::set_hold_for_test(Some(std::time::Duration::from_millis(200)));
+        let (amf, amf_port, _posts) = recording_amf().await;
+        let reference = session_toward_gnb(&upf, "imsi-001010000009947", 9, amf_port).await;
+        upf.clear_seen();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        smf_self()
+            .read()
+            .unwrap()
+            .failed_up_paths
+            .write()
+            .unwrap()
+            .insert(
+                format!("{}|127.0.0.9", upf.client.recovery_time_stamp_key()),
+                now,
+            );
+
+        let armed = up_path::rearm_restored_holds();
+        wait_until(|| {
+            upf.seen()
+                .contains(&pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST)
+        })
+        .await;
+        pfcp_path::drain_restart_fanouts(std::time::Duration::from_secs(5)).await;
+        let seen = upf.seen();
+        up_path::reset_for_test();
+        forget_seeded_session(&reference);
+        amf.stop().await.ok();
+
+        assert_eq!(armed, 1);
+        assert!(
+            seen.contains(&pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST),
+            "{seen:?}"
+        );
+    }
+
+    /// #1028 round 2, m3, m4: a restored hold waits for its UPF to be associated
+    /// again before it releases anything; an entry for a UPF that is no longer
+    /// configured is dropped.
+    #[tokio::test]
+    async fn a_restored_hold_waits_for_the_association_and_drops_unknown_upfs() {
+        let _state = up_path::UP_PATH_TEST_LOCK.lock().await;
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        up_path::reset_for_test();
+        up_path::set_hold_for_test(Some(std::time::Duration::from_millis(100)));
+        let (amf, amf_port, _posts) = recording_amf().await;
+        let reference = session_toward_gnb(&upf, "imsi-001010000009950", 12, amf_port).await;
+        upf.clear_seen();
+        upf.client.set_assoc_state_for_test(false, None, None).await;
+        {
+            let ctx = smf_self();
+            let ctx = ctx.read().unwrap();
+            let mut m = ctx.failed_up_paths.write().unwrap();
+            m.insert(
+                format!("{}|127.0.0.9", upf.client.recovery_time_stamp_key()),
+                0,
+            );
+            m.insert("renamed.example:8805|127.0.0.9".to_string(), 0);
+        }
+
+        let armed = up_path::rearm_restored_holds();
+        let unknown_left = smf_self()
+            .read()
+            .unwrap()
+            .failed_up_paths
+            .read()
+            .unwrap()
+            .contains_key("renamed.example:8805|127.0.0.9");
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let before_association = upf.seen();
+        upf.client.set_assoc_state_for_test(true, None, None).await;
+        wait_until(|| {
+            upf.seen()
+                .contains(&pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST)
+        })
+        .await;
+        pfcp_path::drain_restart_fanouts(std::time::Duration::from_secs(5)).await;
+        let after = upf.seen();
+        up_path::reset_for_test();
+        forget_seeded_session(&reference);
+        amf.stop().await.ok();
+
+        assert_eq!(armed, 1, "the unknown UPF's entry is not armed");
+        assert!(!unknown_left, "and is dropped");
+        assert!(
+            !before_association.contains(&pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST),
+            "nothing released before the association: {before_association:?}"
+        );
+        assert!(
+            after.contains(&pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST),
+            "released once associated: {after:?}"
+        );
+    }
+
+    /// #1028 review m1: a graceful shutdown stops the pending holds before it
+    /// deregisters, so a hold expiring during a slow deregistration releases
+    /// nothing into the shutdown.
+    #[tokio::test]
+    async fn a_shutdown_stops_the_holds_before_deregistering() {
+        let _state = up_path::UP_PATH_TEST_LOCK.lock().await;
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        up_path::reset_for_test();
+        // #1028 round 2, M1: deterministic, not a race of timers against the setup.
+        // The hold is long; what is asserted is the order: by the time the
+        // deregistration runs, no hold is pending any more.
+        up_path::set_hold_for_test(Some(std::time::Duration::from_secs(600)));
+        let (amf, amf_port, _posts) = recording_amf().await;
+        let reference = session_toward_gnb(&upf, "imsi-001010000009948", 10, amf_port).await;
+        let from = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let _ = deliver(
+            &upf,
+            &from,
+            &node_report_packet(0x99c, 0x01, 102, [127, 0, 0, 9]),
+        )
+        .await;
+        pfcp_path::drain_restart_fanouts(std::time::Duration::from_secs(5)).await;
+        let pending_before = up_path::pending_hold_count();
+
+        let seen_by_deregister = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(99));
+        let probe = seen_by_deregister.clone();
+        let listener = tokio::spawn(async {});
+        graceful_shutdown(
+            async move {
+                probe.store(up_path::pending_hold_count(), Ordering::SeqCst);
+            },
+            &[],
+            false,
+            listener,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+        )
+        .await;
+        up_path::reset_for_test();
+        forget_seeded_session(&reference);
+        amf.stop().await.ok();
+
+        assert_eq!(pending_before, 1, "the failure armed one hold");
+        assert_eq!(
+            seen_by_deregister.load(Ordering::SeqCst),
+            0,
+            "the holds are stopped before the deregistration starts"
+        );
+    }
+
+    /// #1028 review m3: with no hold, a failure releases at once, and sends no
+    /// separate N2-only deactivation to race the #39.
+    #[tokio::test]
+    async fn with_no_hold_a_failure_releases_without_a_separate_deactivation() {
+        let _state = up_path::UP_PATH_TEST_LOCK.lock().await;
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        up_path::reset_for_test();
+        up_path::set_hold_for_test(Some(std::time::Duration::ZERO));
+        let (amf, amf_port, posts) = recording_amf().await;
+        let reference = session_toward_gnb(&upf, "imsi-001010000009949", 11, amf_port).await;
+        let from = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let _ = deliver(
+            &upf,
+            &from,
+            &node_report_packet(0x99d, 0x01, 102, [127, 0, 0, 9]),
+        )
+        .await;
+        wait_until(|| {
+            posts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, j)| j.contains("n1MessageContainer"))
+        })
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        pfcp_path::drain_restart_fanouts(std::time::Duration::from_secs(5)).await;
+        let posted = posts.lock().unwrap().clone();
+        up_path::reset_for_test();
+        forget_seeded_session(&reference);
+        amf.stop().await.ok();
+
+        let n1n2: Vec<&String> = posted
+            .iter()
+            .filter(|(p, _)| p.ends_with("/n1-n2-messages"))
+            .map(|(_, j)| j)
+            .collect();
+        assert_eq!(n1n2.len(), 1, "{posted:?}");
+        assert!(
+            n1n2[0].contains("n1MessageContainer"),
+            "the #39 release only"
+        );
     }
 
     // ---- #719: a reactivation release terminates the SM Policy Association ----
