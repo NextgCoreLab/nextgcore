@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-df495bb2.js";
+            window.path_to_searchindex_js = "searchindex-0f4a9f77.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-be5dca41.js"></script>
@@ -190,6 +190,7 @@
 <tr><td>C/C++ compiler, cmake</td><td>any recent</td><td><code>aws-lc-sys</code>, the C crypto library under rustls</td></tr>
 <tr><td>libsctp-dev</td><td>any</td><td>only for <code>--features kernel-sctp</code> (amfd, mmed)</td></tr>
 <tr><td>Docker + Compose v2</td><td>Engine ≥ 24, Compose ≥ 2.20</td><td>E2E testing</td></tr>
+<tr><td>A set system clock</td><td>after 2020-01-01 (NTP-synchronised)</td><td>smfd, sgwcd, upfd, sgwud and mbsmfd refuse to start without it: see <a href="configuration/overview.html#a-set-clock-is-required-pfcp-nfs">A set clock is required</a></td></tr>
 </tbody>
 </table>
 </div>

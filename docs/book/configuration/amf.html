@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-df495bb2.js";
+            window.path_to_searchindex_js = "../searchindex-0f4a9f77.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -302,6 +302,9 @@ amf:
 <tr><td><code>AMF_OVERLOAD_REDUCE_PERCENT</code></td><td>Traffic reduction requested in NGAP Overload Start while congested, default <code>50</code>.</td></tr>
 <tr><td><code>AMF_SNPN_ALLOWED_NIDS</code> / <code>AMF_UAV_GEOFENCE</code></td><td>Rel-17/18 knobs: served SNPN NIDs, and the UAV geofence (see <code>docker/rust/README.md</code>).</td></tr>
 <tr><td><code>AMF_NTN_TIMING_ADVANCE_US</code></td><td>Default NTN timing advance; read only in an <code>ntn</code> feature build.</td></tr>
+<tr><td><code>AMF_HANDOVER_PREPARATION_SMF_WAIT_MS</code></td><td>N2 handover (TS 23.502 §4.9.1.3.2 step 8): the longest the AMF waits for the SMFs’ PREPARING answers before it sends the HANDOVER REQUEST with the sessions that answered; a session still waiting is not handed over and its SMF is told CANCELLED. Default <code>1000</code>; keep it well inside the source’s TNGRELOCprep.</td></tr>
+<tr><td><code>AMF_HANDOVER_COMMAND_SMF_WAIT_MS</code></td><td>The same wait for the PREPARED answers to the target’s Acknowledge before the HANDOVER COMMAND goes to the source; it counts against TNGRELOCoverall. Default <code>1000</code>.</td></tr>
+<tr><td><code>AMF_HANDOVER_SOURCE_HOLD_MS</code></td><td>N2 handover (TS 23.502 §4.9.1.3.3 steps 6a, 14a): how long after the target’s Handover Notify the source NG-RAN keeps its UE context, for in-flight forwarding, before the UE Context Release Command. Default <code>2000</code>; <code>0</code> releases at the Notify. A UE served on the old source connection again (ping-pong) is not released.</td></tr>
 </tbody>
 </table>
 </div>
