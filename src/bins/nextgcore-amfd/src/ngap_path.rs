@@ -97,7 +97,9 @@ enum ModifyIndicationAnswer {
     Confirm(Vec<u8>),
     /// The procedure was rejected: report it in an Error Indication.
     ErrorIndication(crate::ngap_asn1::CriticalityErrorIndication),
-    /// Undecodable, or the Confirm could not be built: nothing to send.
+    /// Undecodable: an Error Indication with transfer-syntax-error (TS 38.413 §10.2).
+    TransferSyntaxError,
+    /// The Confirm could not be built: nothing to send.
     Nothing,
 }
 
@@ -1930,7 +1932,11 @@ impl NgapServer {
                 }
                 return Ok(());
             }
-            NgResetDecode::Undecodable => return Ok(()),
+            NgResetDecode::Undecodable => {
+                return self
+                    .report_transfer_syntax_error(association_id, "NG Reset")
+                    .await
+            }
         };
 
         let gnb_pool_id = self
@@ -2165,8 +2171,9 @@ impl NgapServer {
                     .await;
             }
             crate::ngap_asn1::NasTransportDecode::Undecodable => {
-                log::error!("Failed to parse Initial UE Message");
-                return Ok(());
+                return self
+                    .report_transfer_syntax_error(association_id, "Initial UE Message")
+                    .await;
             }
         };
 
@@ -2359,8 +2366,9 @@ impl NgapServer {
                     .await;
             }
             crate::ngap_asn1::NasTransportDecode::Undecodable => {
-                log::error!("Failed to parse Uplink NAS Transport");
-                return Ok(());
+                return self
+                    .report_transfer_syntax_error(association_id, "Uplink NAS Transport")
+                    .await;
             }
         };
 
@@ -6381,9 +6389,17 @@ impl NgapServer {
         data: &[u8],
     ) -> Result<()> {
         let Some(ind) = crate::racs::decode_info_indication(data) else {
+            if nextgcore_ngap_gen::decode(data).is_err() {
+                return self
+                    .report_transfer_syntax_error(
+                        association_id,
+                        "UE Radio Capability Info Indication",
+                    )
+                    .await;
+            }
             log::warn!(
-                "UE Radio Capability Info Indication from association {association_id} is \
-                 undecodable or lacks a mandatory IE; ignored"
+                "UE Radio Capability Info Indication from association {association_id} lacks a \
+                 mandatory IE; ignored"
             );
             return Ok(());
         };
@@ -6532,9 +6548,17 @@ impl NgapServer {
         data: &[u8],
     ) -> Result<()> {
         let Some(id) = crate::racs::decode_mapping_request(data) else {
+            if nextgcore_ngap_gen::decode(data).is_err() {
+                return self
+                    .report_transfer_syntax_error(
+                        association_id,
+                        "UE Radio Capability ID Mapping Request",
+                    )
+                    .await;
+            }
             log::warn!(
                 "UE Radio Capability ID Mapping Request from association {association_id} \
-                 is undecodable or carries no ID; ignored"
+                 carries no ID; ignored"
             );
             return Ok(());
         };
@@ -8552,11 +8576,12 @@ impl NgapServer {
                 return Ok(());
             }
             crate::ngap_asn1::NasTransportDecode::Undecodable => {
-                log::warn!(
-                    "PWS response (procedure {procedure_code:?}) from association \
-                     {association_id} undecodable, dropped"
-                );
-                return Ok(());
+                return self
+                    .report_transfer_syntax_error(
+                        association_id,
+                        &format!("PWS response (procedure {procedure_code:?})"),
+                    )
+                    .await;
             }
         };
         let (message_identifier, serial_number, has_area_list) = (
@@ -8703,11 +8728,12 @@ impl NgapServer {
                 return Ok(());
             }
             crate::ngap_asn1::NasTransportDecode::Undecodable => {
-                log::warn!(
-                    "PWS indication (procedure {procedure_code:?}) from association \
-                     {association_id} undecodable, dropped"
-                );
-                return Ok(());
+                return self
+                    .report_transfer_syntax_error(
+                        association_id,
+                        &format!("PWS indication (procedure {procedure_code:?})"),
+                    )
+                    .await;
             }
         };
         if ind.restart {
@@ -8949,11 +8975,12 @@ impl NgapServer {
                 return Ok(());
             }
             crate::ngap_asn1::NasTransportDecode::Undecodable => {
-                log::warn!(
-                    "Uplink UE-associated NRPPa transport from association \
-                     {association_id} undecodable, dropped"
-                );
-                return Ok(());
+                return self
+                    .report_transfer_syntax_error(
+                        association_id,
+                        "Uplink UE-associated NRPPa Transport",
+                    )
+                    .await;
             }
         };
         let Some(amf_ue_ngap_id) = ul.amf_ue_ngap_id else {
@@ -9068,11 +9095,12 @@ impl NgapServer {
                 return Ok(());
             }
             crate::ngap_asn1::NasTransportDecode::Undecodable => {
-                log::warn!(
-                    "Uplink non-UE-associated NRPPa transport from association \
-                     {association_id} undecodable, dropped"
-                );
-                return Ok(());
+                return self
+                    .report_transfer_syntax_error(
+                        association_id,
+                        "Uplink non-UE-associated NRPPa Transport",
+                    )
+                    .await;
             }
         };
 
@@ -9296,7 +9324,16 @@ impl NgapServer {
                     );
                     (None, None)
                 }
-                Undecodable => (None, None),
+                // #999, TS 38.413 §10.2; then the same local handling as any
+                // Release Complete that names no usable UE (#802).
+                Undecodable => {
+                    self.report_transfer_syntax_error(
+                        association_id,
+                        "UE Context Release Complete",
+                    )
+                    .await?;
+                    (None, None)
+                }
             };
         // #758: the released NG connection's contextless allocation goes with it, so
         // the gNB cannot later mint a context under the released ID.
@@ -9934,6 +9971,37 @@ impl NgapServer {
                 );
             }
             None => log::error!("Failed to build ErrorIndication"),
+        }
+        Ok(())
+    }
+
+    /// TS 38.413 §10.2: *"If a Transfer Syntax Error occurs, the receiver should initiate
+    /// Error Indication procedure with appropriate cause value for the Transfer Syntax
+    /// protocol error."* The message could not be decoded, so the Error Indication names
+    /// no UE (#999). Never used for an Error Indication itself, which is not answered.
+    async fn report_transfer_syntax_error(
+        &mut self,
+        association_id: u64,
+        what: &str,
+    ) -> Result<()> {
+        log::warn!(
+            "{what} from association {association_id} could not be decoded; sending Error \
+             Indication (transfer-syntax-error, TS 38.413 §10.2)"
+        );
+        // Best effort: a report that cannot be sent is logged, and the handler goes on
+        // with whatever local handling it does for an unusable message.
+        if let Err(e) = self
+            .send_error_indication(
+                association_id,
+                None,
+                None,
+                ngap_gen::Cause::Protocol(ngap_gen::CauseProtocol(
+                    ngap_gen::CauseProtocol::TRANSFER_SYNTAX_ERROR,
+                )),
+            )
+            .await
+        {
+            log::warn!("Failed to send ErrorIndication to association {association_id}: {e}");
         }
         Ok(())
     }
@@ -10640,7 +10708,11 @@ impl NgapServer {
                 );
                 return Ok(());
             }
-            crate::ngap_asn1::NasTransportDecode::Undecodable => return Ok(()),
+            crate::ngap_asn1::NasTransportDecode::Undecodable => {
+                return self
+                    .report_transfer_syntax_error(association_id, "Handover Request Acknowledge")
+                    .await
+            }
         };
         log::info!(
             "HandoverRequestAcknowledge from association {association_id} \
@@ -10784,9 +10856,8 @@ impl NgapServer {
                 return Ok(None);
             }
             crate::ngap_asn1::NasTransportDecode::Undecodable => {
-                log::warn!(
-                    "Failed to decode UplinkRANStatusTransfer from association {association_id}"
-                );
+                self.report_transfer_syntax_error(association_id, "Uplink RAN Status Transfer")
+                    .await?;
                 return Ok(None);
             }
         };
@@ -10879,7 +10950,11 @@ impl NgapServer {
                 log::warn!("HandoverFailure from association {association_id} not comprehended: {report:?}");
                 return Ok(());
             }
-            crate::ngap_asn1::NasTransportDecode::Undecodable => return Ok(()),
+            crate::ngap_asn1::NasTransportDecode::Undecodable => {
+                return self
+                    .report_transfer_syntax_error(association_id, "Handover Failure")
+                    .await
+            }
         };
         log::warn!(
             "HandoverFailure from association {association_id} (amf_ue_ngap_id={}, cause={:?})",
@@ -10973,7 +11048,9 @@ impl NgapServer {
                 return Ok(HandoverCompletion::default());
             }
             crate::ngap_asn1::NasTransportDecode::Undecodable => {
-                return Ok(HandoverCompletion::default())
+                self.report_transfer_syntax_error(association_id, "Handover Notify")
+                    .await?;
+                return Ok(HandoverCompletion::default());
             }
         };
         log::info!(
@@ -12511,7 +12588,14 @@ impl NgapServer {
                     );
                     return Ok(());
                 }
-                Undecodable => return Ok(()),
+                Undecodable => {
+                    return self
+                        .report_transfer_syntax_error(
+                            association_id,
+                            "Initial Context Setup Response",
+                        )
+                        .await
+                }
             };
         log::info!(
             "Initial Context Setup Response: amf_ue_ngap_id={amf_ue_ngap_id}, \
@@ -12609,7 +12693,14 @@ impl NgapServer {
                     );
                     return Ok(());
                 }
-                Undecodable => return Ok(()),
+                Undecodable => {
+                    return self
+                        .report_transfer_syntax_error(
+                            association_id,
+                            "Initial Context Setup Failure",
+                        )
+                        .await
+                }
             };
         log::warn!(
             "Initial Context Setup Failure: amf_ue_ngap_id={amf_ue_ngap_id}, \
@@ -12926,11 +13017,12 @@ impl NgapServer {
                     return Ok(());
                 }
                 Undecodable => {
-                    log::warn!(
-                        "Failed to decode PDU Session Resource Setup Response from \
-                         association {association_id}"
-                    );
-                    return Ok(());
+                    return self
+                        .report_transfer_syntax_error(
+                            association_id,
+                            "PDU Session Resource Setup Response",
+                        )
+                        .await;
                 }
             };
         // The AMF UE NGAP ID has criticality ignore, so its absence is ignored
@@ -13088,11 +13180,12 @@ impl NgapServer {
                     return Ok(());
                 }
                 Undecodable => {
-                    log::warn!(
-                        "Failed to decode PDU Session Resource Modify Response from \
-                         association {association_id}"
-                    );
-                    return Ok(());
+                    return self
+                        .report_transfer_syntax_error(
+                            association_id,
+                            "PDU Session Resource Modify Response",
+                        )
+                        .await;
                 }
             };
         // Criticality ignore, so its absence is ignored (§10.3.5) -- but it names
@@ -13189,11 +13282,12 @@ impl NgapServer {
                     return Ok(());
                 }
                 Undecodable => {
-                    log::warn!(
-                        "Failed to decode PDU Session Resource Release Response from \
-                         association {association_id}"
-                    );
-                    return Ok(());
+                    return self
+                        .report_transfer_syntax_error(
+                            association_id,
+                            "PDU Session Resource Release Response",
+                        )
+                        .await;
                 }
             };
         // The AMF UE NGAP ID has criticality ignore, so its absence is ignored
@@ -13268,6 +13362,13 @@ impl NgapServer {
                 self.send_criticality_error_indication(association_id, &report)
                     .await
             }
+            ModifyIndicationAnswer::TransferSyntaxError => {
+                self.report_transfer_syntax_error(
+                    association_id,
+                    "PDU Session Resource Modify Indication",
+                )
+                .await
+            }
             ModifyIndicationAnswer::Nothing => Ok(()),
         }
     }
@@ -13289,10 +13390,7 @@ impl NgapServer {
                     notify,
                 } => (amf_ue_ngap_id, ran_ue_ngap_id, sessions, notify),
                 Reject(report) => return ModifyIndicationAnswer::ErrorIndication(report),
-                Undecodable => {
-                    log::warn!("Failed to decode PDU Session Resource Modify Indication");
-                    return ModifyIndicationAnswer::Nothing;
-                }
+                Undecodable => return ModifyIndicationAnswer::TransferSyntaxError,
             };
 
         log::info!(
@@ -13664,7 +13762,12 @@ impl NgapServer {
                         .send_criticality_error_indication(association_id, &report)
                         .await;
                 }
-                Undecodable => (None, None, None),
+                // Nothing identifies a UE to release (#999, TS 38.413 §10.2).
+                Undecodable => {
+                    return self
+                        .report_transfer_syntax_error(association_id, "UE Context Release Request")
+                        .await
+                }
             };
 
         log::info!(
@@ -15794,6 +15897,8 @@ mod tests {
     mod handler_tests;
     mod racs_handler_tests;
     mod reject_path_tests;
+    /// #999: every handler's undecodable arm answers TS 38.413 §10.2.
+    mod undecodable_tests;
 
     use super::*;
     use crate::context::AmfContext;
@@ -20547,8 +20652,9 @@ mod tests {
         // Not 30 (PDU Session Resource Notify) any more: these three octets do not
         // decode, and since #752 an undecodable Notify gets the TS 38.413 §10.2
         // Error Indication. `reject_path_tests::a_well_formed_notify_gets_no_answer`
-        // keeps #71's point for it.
-        for pc in [19u8, 27, 44, 48, 49, 52] {
+        // keeps #71's point for it. Nor 27, 44 or 49 since #999, for the same reason:
+        // `undecodable_tests` pins their §10.2 Error Indication.
+        for pc in [19u8, 48, 52] {
             ngap.process_ngap_message(1, &[0x00u8, pc, 0x00])
                 .await
                 .unwrap_or_else(|e| {
@@ -21296,7 +21402,8 @@ mod tests {
             "a status transfer must not be echoed to the association that sent it"
         );
 
-        // An undecodable PDU is dropped, not relayed with a defaulted UE id.
+        // An undecodable PDU is not relayed with a defaulted UE id (it gets the §10.2
+        // Error Indication instead, #999).
         assert_eq!(
             server
                 .handle_uplink_ran_status_transfer(source, &[0x00, 0x31, 0x00])
