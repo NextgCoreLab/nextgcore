@@ -60,7 +60,7 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
@@ -250,6 +250,80 @@ static UCMF: OnceLock<Arc<RwLock<Ucmf>>> = OnceLock::new();
 static API_ROOT: OnceLock<String> = OnceLock::new();
 static OAUTH2_CLIENT: OnceLock<Arc<OAuth2Client>> = OnceLock::new();
 
+/// Poisoned state locks recovered (#725 review): each one is a request that
+/// panicked under the lock, a defect to report.
+static POISON_RECOVERIES: AtomicU64 = AtomicU64::new(0);
+/// Requests refused at a capacity limit (#786).
+static DICTIONARY_FULL_REFUSALS: AtomicU64 = AtomicU64::new(0);
+static SUBSCRIPTION_LIMIT_REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+/// The Prometheus text this UCMF serves at `GET /metrics`.
+fn render_metrics(ucmf: Option<&RwLock<Ucmf>>) -> String {
+    let mut out = String::new();
+    let mut metric = |name: &str, kind: &str, help: &str, value: u64| {
+        out.push_str(&format!(
+            "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}\n"
+        ));
+    };
+    metric(
+        "ucmf_state_lock_poison_recoveries_total",
+        "counter",
+        "State locks recovered after a request panicked while holding them",
+        POISON_RECOVERIES.load(Ordering::Relaxed),
+    );
+    metric(
+        "ucmf_dictionary_full_refusals_total",
+        "counter",
+        "Assign requests refused because the dictionary is at ucmf.limits.max_dic_entries (provisioning refusals are not counted)",
+        DICTIONARY_FULL_REFUSALS.load(Ordering::Relaxed),
+    );
+    metric(
+        "ucmf_subscription_limit_refusals_total",
+        "counter",
+        "Subscribe requests refused at ucmf.limits.max_subscriptions or max_subscriptions_per_consumer",
+        SUBSCRIPTION_LIMIT_REFUSALS.load(Ordering::Relaxed),
+    );
+    if let Some(ucmf) = ucmf {
+        let u = read_state(ucmf);
+        metric(
+            "ucmf_dictionary_entries",
+            "gauge",
+            "Dictionary entries held",
+            u.entry_count() as u64,
+        );
+        metric(
+            "ucmf_subscriptions",
+            "gauge",
+            "Subscriptions held",
+            u.subscription_count() as u64,
+        );
+    }
+    out
+}
+
+/// The default `/metrics` address: loopback, on a port of its own. 9090 is the
+/// default of mmed, sgwud and upfd, and on a shared host the second NF to bind it
+/// would lose its metrics (#857 review).
+const DEFAULT_METRICS_ADDR: ([u8; 4], u16) = ([127, 0, 0, 1], 9096);
+
+/// Where `/metrics` listens: `UCMF_METRICS_ADDR`, else loopback. The endpoint
+/// is unauthenticated, so reaching it from another host is an operator's
+/// explicit choice of a private address (or a scraping sidecar). A value that
+/// does not parse falls back to the default and says so (#857 review), so an
+/// operator learns why a scrape from another host fails.
+fn metrics_addr(value: Option<&str>) -> SocketAddr {
+    let default = SocketAddr::from(DEFAULT_METRICS_ADDR);
+    match value {
+        None => default,
+        Some(v) => v.parse().unwrap_or_else(|_| {
+            log::warn!(
+                "UCMF_METRICS_ADDR '{v}' is not an ip:port; /metrics listens on {default} instead"
+            );
+            default
+        }),
+    }
+}
+
 fn api_root() -> &'static str {
     API_ROOT.get().map(String::as_str).unwrap_or("http://ucmf")
 }
@@ -357,6 +431,15 @@ async fn main() -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
     log::info!("SBI server listening on {addr}");
+    match nextgcore_metrics::nes_energy::serve_metrics(
+        metrics_addr(std::env::var("UCMF_METRICS_ADDR").ok().as_deref()),
+        Arc::new(|| render_metrics(UCMF.get().map(|u| u.as_ref()))),
+    )
+    .await
+    {
+        Ok((bound, _handle)) => log::info!("UCMF metrics on http://{bound}/metrics"),
+        Err(e) => log::warn!("UCMF metrics endpoint not started: {e}"),
+    }
 
     global_context().set_nrf_uri(&settings.nrf_uri).await;
     match register_with_nrf(&args.sbi_addr, args.sbi_port, scheme, &nf_instance_id).await {
@@ -610,6 +693,7 @@ fn write_state(ucmf: &RwLock<Ucmf>) -> RwLockWriteGuard<'_, Ucmf> {
 }
 
 fn log_poison_recovery() {
+    POISON_RECOVERIES.fetch_add(1, Ordering::Relaxed);
     log::error!(
         "UCMF state lock was poisoned by a request that panicked; recovering it so \
          later requests are still served (#725). The panic above is a defect to report."
@@ -878,12 +962,15 @@ fn assign(
         ),
         // TS 29.500 Table 5.2.7.2-1: INSUFFICIENT_RESOURCES is a 500 (#786).
         Err(AssignError::DictionaryFull) => (
-            send_error(
+            {
+                DICTIONARY_FULL_REFUSALS.fetch_add(1, Ordering::Relaxed);
+                send_error(
                 500,
                 "Internal Server Error",
                 "The UE radio capability dictionary is full",
                 Some("INSUFFICIENT_RESOURCES"),
-            ),
+                )
+            },
             Vec::new(),
         ),
         Err(AssignError::IdSpaceExhausted) => (
@@ -942,6 +1029,15 @@ fn subscribe(u: &mut Ucmf, request: &SbiRequest, now: DateTime<Utc>) -> SbiRespo
         Ok(sub) => sub,
         // TS 29.500 Table 5.2.7.2-1: INSUFFICIENT_RESOURCES is a 500 (#786).
         Err(e) => {
+            // MINOR 3 of the #857 review: the series counts the configured
+            // limits only, not an exhausted ID space or a failed write.
+            if matches!(
+                e,
+                context::SubscribeError::TooManySubscriptions
+                    | context::SubscribeError::TooManyForConsumer
+            ) {
+                SUBSCRIPTION_LIMIT_REFUSALS.fetch_add(1, Ordering::Relaxed);
+            }
             let (detail, cause) = match e {
                 context::SubscribeError::TooManySubscriptions => (
                     "The UCMF holds its maximum number of subscriptions",
@@ -951,6 +1047,9 @@ fn subscribe(u: &mut Ucmf, request: &SbiRequest, now: DateTime<Utc>) -> SbiRespo
                     "This consumer holds its maximum number of subscriptions",
                     "INSUFFICIENT_RESOURCES",
                 ),
+                context::SubscribeError::IdSpaceExhausted => {
+                    ("No subscription ID is left", "INSUFFICIENT_RESOURCES")
+                }
                 context::SubscribeError::StateNotPersisted => (
                     "The UCMF state could not be written, so no subscription ID can be \
                      assigned safely",
@@ -1927,6 +2026,37 @@ mod tests {
                 max_subscriptions: context::Limits::default().max_subscriptions,
                 max_subscriptions_per_consumer: 2,
             }
+        );
+    }
+
+    /// The metrics text carries the poison-recovery counter and the gauges, and
+    /// the endpoint defaults to loopback.
+    #[test]
+    fn metrics_report_poison_recoveries_and_capacity() {
+        let u = Arc::new(ucmf());
+        handle(&u, &assign_request("35123456", &[1]), now());
+        let before = POISON_RECOVERIES.load(Ordering::Relaxed);
+        let held = u.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = held.write().unwrap();
+            panic!("poison");
+        })
+        .join();
+        handle(&u, &req("GET", "/nucmf-uecm/v1/dic-entries/1"), now());
+        assert!(POISON_RECOVERIES.load(Ordering::Relaxed) > before);
+        let text = render_metrics(Some(&u));
+        assert!(text.contains("# TYPE ucmf_state_lock_poison_recoveries_total counter\n"));
+        assert!(text.contains("\nucmf_dictionary_entries 1\n"), "{text}");
+        assert!(text.contains("\nucmf_subscriptions 0\n"));
+        assert_eq!(metrics_addr(None), SocketAddr::from(([127, 0, 0, 1], 9096)));
+        assert_eq!(
+            metrics_addr(Some("not-an-address")),
+            SocketAddr::from(([127, 0, 0, 1], 9096)),
+            "a bad value falls back to loopback"
+        );
+        assert_eq!(
+            metrics_addr(Some("10.0.0.5:9100")),
+            "10.0.0.5:9100".parse::<SocketAddr>().unwrap()
         );
     }
 

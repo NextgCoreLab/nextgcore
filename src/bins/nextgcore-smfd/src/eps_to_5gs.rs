@@ -1252,6 +1252,24 @@ mod tests {
         msg.encode()
     }
 
+    /// The stand-in's Session Modification bodies once `done` holds for them, waiting at
+    /// most 10 s (#791): an asynchronous effect is asserted when it has happened, not
+    /// when the test happens to look. Returns what was seen either way, so the caller's
+    /// assertion reports it.
+    async fn poll_modifications(
+        upf: &crate::pfcp_path::stand_in::StandInUpf,
+        done: impl Fn(&[Vec<u8>]) -> bool,
+    ) -> Vec<Vec<u8>> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let mods = upf.modification_bodies();
+            if done(&mods) || std::time::Instant::now() >= deadline {
+                return mods;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     async fn recv_gtp(sock: &tokio::net::UdpSocket) -> Gtp2Message {
         let mut buf = vec![0u8; 8192];
         let (len, _) = tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
@@ -1571,7 +1589,9 @@ mod tests {
         // EPS: the PDN connection, with PSI 5 in the PCO.
         let (s5, pgw_c, answered_pco) = establish_pdn(Some(&pco_with_psi(5))).await;
         seed_dedicated_gbr_bearer(pgw_c.0);
-        std::env::set_var("SMF_INDIRECT_FORWARDING_TIMER_MS", "200");
+        // Long enough that the step-14 release cannot land before the execution check
+        // reads the UPF's modifications, which asserts exactly one (#900 review m1).
+        std::env::set_var("SMF_INDIRECT_FORWARDING_TIMER_MS", "1500");
         let answered_pco = answered_pco.expect("the PGW-C answers the PCO");
         assert_eq!(
             eps_iwk::pco_container(&answered_pco, false, eps_iwk::pco_container::NW_S_NSSAI),
@@ -1815,7 +1835,15 @@ mod tests {
                 (5, Some((23, teid, upf.upf_ip))),
                 (6, Some((23, teid + 1, upf.upf_ip)))
             ],
-            "the EPS Bearer Setup List carries a forwarding tunnel per bearer"
+            "the EPS Bearer Setup List carries a forwarding tunnel per bearer (#791 \
+             diagnostics: N4 messages {:?}, {} modification(s), handover {:?})",
+            upf.seen(),
+            upf.modification_bodies().len(),
+            smf_self()
+                .read()
+                .ok()
+                .and_then(|c| c.sess_find_by_sm_context_ref(&ref_))
+                .map(|s| s.handover)
         );
         // Step 12 at the UPF: one FAR to the target's forwarding tunnel, one PDR per bearer
         // on a UPF-chosen F-TEID, each with a QER adding the bearer's QFI. The DL path is
@@ -1867,9 +1895,24 @@ mod tests {
             "Forward Relocation Complete Notification"
         );
 
-        // Execution step 8 at the UPF: DL FAR 2 → the target gNB, PDR 1 removed.
+        // Execution step 8 at the UPF: DL FAR 2 → the target gNB, PDR 1 removed. Read once:
+        // the AMF sends the FRCN only after the SMF answered COMPLETED, and the SMF answers
+        // after the switch reached the UPF. #791's `left: 0` was the SMF finding no N4
+        // session (an unlocked sibling had wiped `pfcp_sessions`, closed by #762), which no
+        // wait would recover; the diagnostics say which state it was in.
         let mods = upf.modification_bodies();
-        assert_eq!(mods.len(), 1, "execution is one N4 Session Modification");
+        assert_eq!(
+            mods.len(),
+            1,
+            "execution is one N4 Session Modification (#791 diagnostics: N4 messages {:?}, \
+             handover {:?})",
+            upf.seen(),
+            smf_self()
+                .read()
+                .ok()
+                .and_then(|c| c.sess_find_by_sm_context_ref(&ref_))
+                .map(|s| s.handover)
+        );
         let mut ohc = vec![0x01, 0x00]; // GTP-U/UDP/IPv4
         ohc.extend_from_slice(&GNB_DL.1.to_be_bytes());
         ohc.extend_from_slice(&GNB_DL.0);
@@ -1892,19 +1935,14 @@ mod tests {
             !n4_has(&mods[0], 15, &[0x00, 0x38, 0x00, 0x02, 0x00, 0x55]),
             "the forwarding tunnels outlive execution"
         );
-        // Step 14: the forwarding timer expires and the tunnels go.
-        let released = {
-            let mut found = None;
-            for _ in 0..100 {
-                let mods = upf.modification_bodies();
-                if mods.len() >= 2 {
-                    found = Some(mods[1].clone());
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            found.expect("the indirect forwarding resources are released on the timer")
-        };
+        // Step 14: the forwarding timer expires and the tunnels go. Found by content,
+        // with a bounded wait (#791), not by position.
+        let far_0x50: &[u8] = &[0x00, 0x6C, 0x00, 0x04, 0, 0, 0, 0x50];
+        let released = poll_modifications(&upf, |m| m.iter().any(|b| n4_has(b, 16, far_0x50)))
+            .await
+            .into_iter()
+            .find(|b| n4_has(b, 16, far_0x50))
+            .expect("the indirect forwarding resources are released on the timer");
         for pdr in [0x55u8, 0x56] {
             assert!(
                 n4_has(&released, 15, &[0x00, 0x38, 0x00, 0x02, 0x00, pdr]),
