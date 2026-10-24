@@ -224,6 +224,18 @@ this repo's `udmd` serves from the UDR's identity data (it answered `501` before
 | `nas.use_nextgcore_security` (AMF) | `false` | amf.yaml / amfd |
 | Max PLMNs / slices / sessions / bearers | 6 / 8 / 4 / 4 | `config.rs` constants |
 
+## A set clock is required (PFCP NFs)
+
+`nextgcore-smfd`, `nextgcore-sgwcd`, `nextgcore-upfd`, `nextgcore-sgwud` and `nextgcore-mbsmfd` **refuse to start when the local clock reads before 2020-01-01**. They exit with an error naming the clock.
+
+Each of these NFs puts its start time in every PFCP Association Setup and Heartbeat, as the Recovery Time Stamp (TS 29.244 §8.2.65, NTP-era seconds since 1900; #995). A host without a real-time clock that boots at 1970 would advertise a 1970 start time. Peers then misjudge restarts: one is missed, or a false one releases every session. So the NFs refuse to start rather than send a wrong stamp.
+
+On a host or node that may boot without a set clock (an RTC-less board, a VM restored from a snapshot), start these NFs only after the clock is synchronised:
+
+- **systemd:** order the unit `After=time-sync.target` and `Wants=time-sync.target`, and enable a time-sync waiter such as `systemd-time-wait-sync.service` (or chrony's `chronyd-wait`).
+- **Kubernetes:** add an init container that waits for NTP sync, for example `chronyc waitsync` or polling `timedatectl show -p NTPSynchronized`. Alternatively, rely on the pod's restart policy: the NF exits, and the kubelet restarts it with back-off until the node clock is set.
+- **Docker / Compose:** `restart: unless-stopped` (or `on-failure`) retries the same way. The containers use the host clock, so synchronise the host.
+
 ## Dynamic reconfiguration
 
 `nextgcore-app` includes a `ConfigReloadManager` that watches the config file and re-parses the `global` and NF-local sections on change, plus a versioned snapshot store with rollback and JSON export/import. These are library facilities (unit-tested); how much each NF wires them in varies — check the individual NF pages before relying on hot reload in a deployment.
