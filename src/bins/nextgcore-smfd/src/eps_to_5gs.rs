@@ -2412,6 +2412,13 @@ mod tests {
             "a PDN connection is never handed over to a SUPI that does not own it"
         );
         s5.close();
+        // #941 review: the PDN connection this test established is removed, or a later
+        // test's EPC sweep (the shutdown's PGW-U deletions) sees it as its own.
+        if let Ok(ctx) = crate::context::smf_self().read() {
+            for sess in ctx.sess_find_all_by(|s| s.epc) {
+                ctx.sess_remove(sess.id);
+            }
+        }
     }
 
     /// #583, direct forwarding: the AMF's `directForwardingFlag` becomes Direct Forwarding

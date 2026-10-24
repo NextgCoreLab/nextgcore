@@ -253,8 +253,20 @@ pub fn heartbeat_response(sequence_number: u32, recovery_time_stamp: u32) -> Vec
 /// UPF, or, for a session with no record (one restored from durable state), the
 /// default client. Never open: with no UPF to own it, it is refused. Whether the
 /// session exists at all is [`holds_session_seid`].
-pub fn report_sender_owns_session(seid: u64, from: SocketAddr) -> bool {
-    client_for_session(seid).is_some_and(|c| c.is_node_address(from))
+///
+/// #974 review n2: when the listener admitted the datagram as one client's
+/// (`admitted`), ownership is that client's identity, not the sender's IP: two pool
+/// entries on one host, or a learnt address set that reaches a sibling, cannot
+/// report on each other's sessions.
+pub fn report_sender_owns_session(
+    seid: u64,
+    from: SocketAddr,
+    admitted: Option<&PfcpClient>,
+) -> bool {
+    client_for_session(seid).is_some_and(|owner| match admitted {
+        Some(a) => std::ptr::eq(Arc::as_ptr(&owner), a),
+        None => owner.is_node_address(from),
+    })
 }
 
 /// Is this message type a response (solicited by one of our requests)?
@@ -474,7 +486,7 @@ pub struct PfcpClient {
     /// The UPF's other addresses (TS 29.244 §5.8.1, #974 review m4): its Node ID's
     /// address, or every address its Node ID FQDN, or the hostname it was configured
     /// by, resolves to. Learnt at each Association Setup.
-    node_addrs: std::sync::RwLock<Vec<std::net::IpAddr>>,
+    node_addrs: Arc<std::sync::RwLock<Vec<std::net::IpAddr>>>,
     pending: Mutex<HashMap<u32, oneshot::Sender<(u8, Vec<u8>)>>>,
     assoc: RwLock<AssociationState>,
     /// Synchronously-readable projection of `assoc.associated` (#380).
@@ -567,6 +579,45 @@ pub(crate) fn clear_global_upf_for_test() {
 ///
 /// Returns an owned snapshot rather than a borrow: the pool is now behind a lock,
 /// and a guard must not be held across the `await`s every caller performs.
+/// Drop the durable Recovery Time Stamps keyed by an address that no literal pool
+/// member owns (#930 review n1). Run after the boot seed, so a hostname member's
+/// legacy address key has already been read and migrated. Left in place, such an
+/// orphan (an address a hostname UPF left earlier, or a decommissioned literal UPF)
+/// would win over a correct name key the next time the name resolves to that
+/// address, and declare a false restart. A later rollback then misses the seed,
+/// which is the safe direction. Returns how many were dropped.
+pub fn prune_orphan_address_keys(pool: &[Arc<PfcpClient>]) -> usize {
+    let orphans: Vec<String> = match smf_self().read() {
+        Ok(ctx) => ctx
+            .upf_recovery_time_stamps
+            .read()
+            .map(|m| {
+                m.keys()
+                    .filter(|k| {
+                        k.parse::<SocketAddr>().is_ok_and(|addr| {
+                            !pool
+                                .iter()
+                                .any(|c| c.peer_host.is_none() && c.peer() == addr)
+                        })
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Err(_) => return 0,
+    };
+    if let Ok(ctx) = smf_self().read() {
+        for key in &orphans {
+            log::info!(
+                "Durable Recovery Time Stamp under {key} belongs to no literal UPF of this \
+                 SMF; dropped (#930)"
+            );
+            ctx.forget_upf_recovery_time_stamp(key);
+        }
+    }
+    orphans.len()
+}
+
 pub fn global_pool() -> Vec<Arc<PfcpClient>> {
     PFCP_POOL
         .read()
@@ -873,7 +924,7 @@ impl PfcpClient {
             node_ip,
             node_id: NodeId::new_ipv4(node_ip),
             recovery_time_stamp,
-            node_addrs: std::sync::RwLock::new(Vec::new()),
+            node_addrs: Arc::new(std::sync::RwLock::new(Vec::new())),
             pending: Mutex::new(HashMap::new()),
             assoc: RwLock::new(AssociationState::default()),
             associated_gauge: std::sync::atomic::AtomicBool::new(false),
@@ -1013,7 +1064,9 @@ impl PfcpClient {
     /// Learn the UPF's addresses (TS 29.244 §5.8.1): the Node ID's own address, or
     /// what its FQDN resolves to, and what the configured hostname resolves to. Each
     /// lookup is bounded, and one that fails leaves the endpoint's address alone.
-    async fn learn_node_addresses(&self, node_id: &NodeId) {
+    fn learn_node_addresses(&self, node_id: &NodeId) -> tokio::task::JoinHandle<()> {
+        // #974 review n4: in its own task, so the association task, which serves
+        // every UPF, never waits on a DNS lookup.
         let mut addrs: Vec<std::net::IpAddr> = Vec::new();
         if let Some(v4) = node_id.ipv4_addr {
             addrs.push(std::net::IpAddr::from(v4));
@@ -1028,19 +1081,35 @@ impl PfcpClient {
         if let Some((host, _)) = &self.peer_host {
             names.push(host.clone());
         }
-        for name in names {
-            let lookup = tokio::net::lookup_host((name.as_str(), PFCP_PORT));
-            if let Ok(Ok(found)) = tokio::time::timeout(Duration::from_secs(2), lookup).await {
-                addrs.extend(found.map(|a| a.ip()));
+        let known = self.node_addrs.clone();
+        let own = self.peer();
+        tokio::spawn(async move {
+            for name in names {
+                let lookup = tokio::net::lookup_host((name.as_str(), PFCP_PORT));
+                if let Ok(Ok(found)) = tokio::time::timeout(Duration::from_secs(2), lookup).await {
+                    addrs.extend(found.map(|a| a.ip()));
+                }
             }
-        }
-        let mut addrs: Vec<std::net::IpAddr> =
-            addrs.into_iter().map(|a| a.to_canonical()).collect();
-        addrs.sort();
-        addrs.dedup();
-        if let Ok(mut known) = self.node_addrs.write() {
-            *known = addrs;
-        }
+            // #974 review n2: an address another pool member is dialled at is that
+            // member's, never this one's: a shared Service name, or a Node ID naming
+            // a sibling, must not let this UPF vouch for it.
+            let others: Vec<std::net::IpAddr> = global_pool()
+                .iter()
+                .map(|c| c.peer())
+                .filter(|p| *p != own)
+                .map(|p| p.ip().to_canonical())
+                .collect();
+            let mut addrs: Vec<std::net::IpAddr> = addrs
+                .into_iter()
+                .map(|a| a.to_canonical())
+                .filter(|a| !others.contains(a))
+                .collect();
+            addrs.sort();
+            addrs.dedup();
+            if let Ok(mut known) = known.write() {
+                *known = addrs;
+            }
+        })
     }
 
     /// Whether the N4 association is currently established.
@@ -1611,7 +1680,7 @@ impl PfcpClient {
             });
         }
 
-        self.learn_node_addresses(&resp.node_id).await;
+        drop(self.learn_node_addresses(&resp.node_id));
         // Restart detection against any previously stored timestamp
         // #928 review M1: the teardown (association down, this UPF's sessions flushed)
         // is done when this returns, but its #39 fan-out runs on, tracked. Awaiting it
@@ -1839,7 +1908,8 @@ impl PfcpClient {
 /// The restart/release fan-outs still running (#928 review m1): the #39 releases a
 /// teardown started off the receive or the association task. A graceful shutdown
 /// drains them, bounded, before the runtime goes; their sessions are already flushed,
-/// so nothing else would tell those UEs.
+/// so nothing else would tell those UEs. Tests that track or drain them hold
+/// [`N4_TEST_LOCK`].
 fn restart_fanouts() -> &'static std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>> {
     static FANOUTS: OnceLock<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> = OnceLock::new();
     FANOUTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
@@ -2169,7 +2239,11 @@ pub fn clear_pfcp_sessions() -> usize {
 ///   `clear_pfcp_sessions`, which clears the map for the WHOLE process rather
 ///   than for the client that tore down;
 /// - the `AssociationState` of the one installed client, which decides whether
-///   `pfcp_session_establish` proceeds or bails.
+///   `pfcp_session_establish` proceeds or bails;
+/// - the tracked restart/release fan-outs (`restart_fanouts`, #928 review m4):
+///   `drain_restart_fanouts` takes every handle, including a sibling's;
+/// - [`PFCP_UNAUTHORIZED`] and its WARN interval (#974 review n3), which tests
+///   assert exact deltas of.
 ///
 /// Any two tests that touch any of these will flush or contradict each other if
 /// they interleave — which is how the #191 pair first failed, one clearing the
@@ -2814,23 +2888,58 @@ mod tests {
     /// UPF's other address (TS 29.244 §5.8.1), and an FQDN Node ID what it resolves to.
     #[tokio::test]
     async fn the_node_id_teaches_the_upfs_other_addresses() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
         let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let client = PfcpClient::new(sock, "10.0.0.7:8805".parse().unwrap(), [127, 0, 0, 1]);
+        let client = Arc::new(PfcpClient::new(
+            sock,
+            "10.0.0.7:8805".parse().unwrap(),
+            [127, 0, 0, 1],
+        ));
+        let _pool = InstalledPool::new(vec![client.clone()]);
         let other: SocketAddr = "10.9.9.9:8805".parse().unwrap();
         assert!(!client.is_node_address(other));
         client
             .learn_node_addresses(&NodeId::new_ipv4([10, 9, 9, 9]))
-            .await;
+            .await
+            .unwrap();
         assert!(client.is_node_address(other));
         assert!(client.is_node_address("10.0.0.7:40001".parse().unwrap()));
         client
             .learn_node_addresses(&NodeId::new_fqdn("localhost".to_string()))
-            .await;
+            .await
+            .unwrap();
         assert!(client.is_node_address("127.0.0.1:8805".parse().unwrap()));
         assert!(
             !client.is_node_address(other),
             "relearnt at each association"
         );
+    }
+
+    /// #974 review n2: a learnt address that another pool member is dialled at is
+    /// dropped: this UPF cannot vouch for its sibling's address.
+    #[tokio::test]
+    async fn a_learnt_address_of_another_pool_member_is_dropped() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let a = Arc::new(PfcpClient::new(
+            sock.clone(),
+            "10.0.0.7:8805".parse().unwrap(),
+            [127, 0, 0, 1],
+        ));
+        let b = Arc::new(PfcpClient::new(
+            sock,
+            "10.0.0.8:8805".parse().unwrap(),
+            [127, 0, 0, 1],
+        ));
+        let _pool = InstalledPool::new(vec![a.clone(), b.clone()]);
+        // A's Node ID names B's address.
+        a.learn_node_addresses(&NodeId::new_ipv4([10, 0, 0, 8]))
+            .await
+            .unwrap();
+        assert!(!a.is_node_address("10.0.0.8:40001".parse().unwrap()));
+        assert!(b.is_node_address("10.0.0.8:40001".parse().unwrap()));
     }
 
     fn body_with_cause(cause: u8) -> Vec<u8> {
@@ -3240,6 +3349,61 @@ mod tests {
         }
         assert_eq!(seeded, Some(300), "the newer address-key record seeds");
         assert_eq!((by_name, by_address), (Some(300), None), "and is migrated");
+    }
+
+    /// #930 review n1: after the seed, an address-keyed stamp no literal member owns
+    /// is dropped; a literal member's own key and a hostname member's name key stay.
+    #[tokio::test]
+    async fn orphan_address_keys_are_pruned_after_the_seed() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
+        let literal = "127.0.0.1:47926";
+        let name = "localhost:47927";
+        let orphan = "127.0.0.1:47928";
+        let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let pool = vec![
+            Arc::new(PfcpClient::new(
+                local.clone(),
+                literal.parse().unwrap(),
+                [127, 0, 0, 1],
+            )),
+            Arc::new(
+                PfcpClient::new(local, "127.0.0.1:47927".parse().unwrap(), [127, 0, 0, 1])
+                    .with_peer_hostname("localhost", 47927),
+            ),
+        ];
+        if let Ok(ctx) = smf_self().read() {
+            for (k, v) in [(literal, 1), (name, 2), (orphan, 3)] {
+                ctx.note_upf_recovery_time_stamp(k, v);
+            }
+        }
+        let pruned = prune_orphan_address_keys(&pool);
+        let left: Vec<Option<u32>> = {
+            let ctx = smf_self();
+            let ctx = ctx.read().unwrap();
+            [literal, name, orphan]
+                .iter()
+                .map(|k| ctx.upf_recovery_time_stamp(k))
+                .collect()
+        };
+        if let Ok(ctx) = smf_self().read() {
+            for k in [literal, name, orphan] {
+                ctx.forget_upf_recovery_time_stamp(k);
+            }
+        }
+        assert!(pruned >= 1);
+        assert_eq!(left, vec![Some(1), Some(2), None]);
+    }
+
+    /// #928 review: two endpoints are one PFCP node when their canonical IP is the
+    /// same, whatever the port (TS 29.244 §4.2.2, TS 23.007 §19A).
+    #[test]
+    fn same_pfcp_node_compares_the_canonical_ip_not_the_port() {
+        let a: SocketAddr = "10.0.0.7:8805".parse().unwrap();
+        assert!(same_pfcp_node(a, "10.0.0.7:40001".parse().unwrap()));
+        assert!(same_pfcp_node(a, "[::ffff:10.0.0.7]:8805".parse().unwrap()));
+        assert!(!same_pfcp_node(a, "10.0.0.8:8805".parse().unwrap()));
+        assert!(!same_pfcp_node(a, "[2001:db8::7]:8805".parse().unwrap()));
     }
 
     /// #930 round 2 N2: recording a hostname UPF's stamp retires the legacy address

@@ -280,6 +280,11 @@ pub fn begin_unrecoverable_release(
             }
         }
         if out_of_time {
+            // #941 review MINOR 1: count what finished, also when the deadline fired
+            // in the permit wait and the join loop never ran.
+            while releases.try_join_next().is_some() {
+                done += 1;
+            }
             releases.abort_all();
             log::warn!(
                 "PFCP restoration ({reason}): out of time with {done}/{total} PDU session \

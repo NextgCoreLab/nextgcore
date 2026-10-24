@@ -140,6 +140,10 @@ pub struct Ipv4Pool {
     bitmap: Mutex<Vec<u64>>,
     /// Number of currently allocated addresses (excludes reserved)
     allocated_count: AtomicU32,
+    /// Releases of an address that was already free (#912 review r2): each one is a
+    /// double free, which hands one address to two UEs if another allocation lands
+    /// between the two frees. Exported as `smf_ipv4_pool_stale_releases_total`.
+    stale_releases: std::sync::atomic::AtomicU64,
 }
 
 impl Ipv4Pool {
@@ -153,6 +157,7 @@ impl Ipv4Pool {
             pool_size,
             bitmap: Mutex::new(vec![0u64; bitmap_words]),
             allocated_count: AtomicU32::new(0),
+            stale_releases: std::sync::atomic::AtomicU64::new(0),
         };
         // Reserve network address (.0.0) and gateway (.0.1)
         pool.mark_allocated(0);
@@ -217,8 +222,15 @@ impl Ipv4Pool {
                 log::debug!("IPv4 pool: released {addr}");
                 return true;
             }
+            self.stale_releases.fetch_add(1, Ordering::Relaxed);
+            log::warn!("IPv4 pool: {addr} released while already free (a double free)");
         }
         false
+    }
+
+    /// How many releases found their address already free (#912 review r2).
+    pub fn stale_releases(&self) -> u64 {
+        self.stale_releases.load(Ordering::Relaxed)
     }
 
     /// Every host address currently marked allocated, including the reserved

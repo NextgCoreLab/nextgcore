@@ -1149,7 +1149,7 @@ pub struct SessionModificationParams {
 pub fn build_session_modification_request(params: &SessionModificationParams) -> Vec<u8> {
     let mut builder = PfcpMessageBuilder::new();
 
-    // PFCPSMReq-Flags (TS 29.244 8.2.50): SNDEM (0x02) when any updated FAR
+    // PFCPSMReq-Flags (TS 29.244 §8.2.31): SNDEM (0x02) when any updated FAR
     // requires End Marker packets on the old tunnel. Message-level IE.
     if params
         .update_fars_activate
