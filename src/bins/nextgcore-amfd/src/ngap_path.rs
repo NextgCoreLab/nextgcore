@@ -27341,18 +27341,41 @@ mod tests {
     /// own counter, which starts at 1 as the context allocator does: a fresh server's
     /// first UE took key 1 whatever the context had already issued, and overwrote a
     /// Namf-created UE holding it.
+    ///
+    /// # Isolation (#927)
+    ///
+    /// Both UEs live in the PROCESS-GLOBAL live store (`NgapServer::ue_auth_state`
+    /// IS `AmfContext::ue_store`), which this test shared with ~880 others, and it
+    /// was flaky once in four full runs. Two changes, so it reads only its own
+    /// records:
+    ///
+    /// - It holds `CONTEXT_GUARD` for its whole duration, as every other
+    ///   global-context test here does, so a sibling cannot finalize the context
+    ///   (`amf_context_final` clears the live store) between the publish and the
+    ///   assertions.
+    /// - It identifies both UEs by their own keys instead of scanning the store.
+    ///   The old form searched every record for one matching
+    ///   `(ran_ue_ngap_id, association_id)` and resolved the Namf UE by a
+    ///   store-wide SUPI scan, so any sibling record could satisfy or shadow
+    ///   either filter. The association id and the RAN UE NGAP IDs are this
+    ///   issue's own literals for the same reason.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_n2_registered_ue_never_takes_the_key_of_a_namf_created_ue() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         crate::context::amf_context_init(64, 1024, 4096);
         let ctx = crate::context::amf_self();
         let supi = "imsi-001010000600900";
+        const ASSOC: u64 = 927_001;
         let namf_ue = {
             let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
             let ran_ue = guard.ran_ue_add(900_600, 600_900).expect("ran_ue_add");
             let mut ue = guard.amf_ue_add(ran_ue.id).expect("amf_ue_add");
             ue.supi = Some(supi.to_string());
             guard.amf_ue_update(&ue);
-            guard.amf_ue_publish(&ue, 600_900, 1);
+            guard.amf_ue_publish(&ue, 600_900, ASSOC);
             ue
         };
         let mut ngap = test_ngap_server().await;
@@ -27375,13 +27398,15 @@ mod tests {
             },
         )
         .expect("encode an InitialUEMessage");
-        let _ = ngap.handle_initial_ue_message(1, &pdu).await;
+        let _ = ngap.handle_initial_ue_message(ASSOC, &pdu).await;
 
+        // This test's own connection, so the record found can only be the one the
+        // Initial UE Message just created (#927).
         let n2_key = ngap
             .ue_auth_state
             .snapshot()
             .into_iter()
-            .find(|(_, s)| s.ran_ue_ngap_id == ran_ue_ngap_id && s.association_id == 1)
+            .find(|(_, s)| s.ran_ue_ngap_id == ran_ue_ngap_id && s.association_id == ASSOC)
             .map(|(key, _)| key)
             .expect("the Initial UE Message creates a UE context");
         assert!(
@@ -27390,14 +27415,17 @@ mod tests {
              issued {} to the Namf-created UE",
             namf_ue.id
         );
+        // By key, not by a store-wide SUPI scan (#927): the point is that THIS
+        // record still holds THIS UE, which is what an overwrite would break.
         let still = ctx
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .amf_ue_find_by_supi(supi)
-            .map(|ue| ue.id);
+            .ue_store()
+            .get(namf_ue.id)
+            .map(|held| held.amf_ue.supi.clone());
         assert_eq!(
             still,
-            Some(namf_ue.id),
+            Some(Some(supi.to_string())),
             "the Namf-created UE is still in the live store under its own key"
         );
 

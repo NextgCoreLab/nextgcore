@@ -194,20 +194,20 @@ async fn dispatch_notify_request_async(
     req_nf_type: Option<&str>,
     event_str: &str,
 ) -> NotifySendResult {
+    // #940: the subscriber's callback URI may carry a bearer token (the AMF's does),
+    // so it is logged with its last segment redacted, never whole.
+    let notification_uri = &nextgcore_sbi::log_redact::redact_last_segment(notification_uri);
     log::debug!(
-        "Sending NF status notify to {} (event={}, nf_instance={})",
-        notify_request.uri,
-        event_str,
-        nf_instance_id
+        "Sending NF status notify to {notification_uri} (event={event_str}, \
+         nf_instance={nf_instance_id})"
     );
 
     let (host, port, path, scheme) = match parse_notification_uri(&notify_request.uri) {
         Some(parts) => parts,
         None => {
-            log::error!("Failed to parse notification URI: {}", notify_request.uri);
+            log::error!("Failed to parse notification URI: {notification_uri}");
             return NotifySendResult::Failed(format!(
-                "Invalid notification URI: {}",
-                notify_request.uri
+                "Invalid notification URI: {notification_uri}"
             ));
         }
     };
@@ -283,12 +283,9 @@ async fn dispatch_notify_request_async(
             }
         }
         Err(e) => {
-            log::error!(
-                "Failed to deliver NF status notify to {}: {}",
-                notification_uri,
-                e
-            );
-            NotifySendResult::Failed(e.to_string())
+            let e = nextgcore_sbi::log_redact::redact_callback_tokens(&e.to_string());
+            log::error!("Failed to deliver NF status notify to {notification_uri}: {e}");
+            NotifySendResult::Failed(e)
         }
     }
 }
@@ -392,7 +389,7 @@ pub fn nrf_nnrf_nfm_send_nf_status_notify(
     log::info!(
         "NF status notify queued: {} -> {} ({})",
         nf_instance.nf_instance_id,
-        subscription_data.notification_uri,
+        nextgcore_sbi::log_redact::redact_last_segment(&subscription_data.notification_uri),
         event.as_str()
     );
 
@@ -462,7 +459,7 @@ pub async fn nrf_nnrf_nfm_send_nf_status_notify_all_async(
             NotifySendResult::Failed(err) => {
                 log::error!(
                     "Failed to send NF status notify to {}: {}",
-                    subscription.notification_uri,
+                    nextgcore_sbi::log_redact::redact_last_segment(&subscription.notification_uri),
                     err
                 );
                 // Continue sending to other subscribers rather than aborting
@@ -523,7 +520,7 @@ pub async fn nrf_nnrf_nfm_send_nf_profile_changed_notify_all_async(
             NotifySendResult::Failed(err) => {
                 log::error!(
                     "Failed to send NF_PROFILE_CHANGED notify to {}: {}",
-                    subscription.notification_uri,
+                    nextgcore_sbi::log_redact::redact_last_segment(&subscription.notification_uri),
                     err
                 );
                 // Continue to remaining subscribers.
@@ -576,7 +573,7 @@ pub fn nrf_nnrf_nfm_send_nf_profile_changed_notify_all(
                 log::info!(
                     "NF_PROFILE_CHANGED notify queued: {} -> {}",
                     nf_instance.nf_instance_id,
-                    subscription.notification_uri
+                    nextgcore_sbi::log_redact::redact_last_segment(&subscription.notification_uri)
                 );
                 sent_count += 1;
             }
@@ -623,7 +620,7 @@ pub fn nrf_nnrf_nfm_send_nf_status_notify_all(
             NotifySendResult::Failed(err) => {
                 log::error!(
                     "Failed to send NF status notify to {}: {}",
-                    subscription.notification_uri,
+                    nextgcore_sbi::log_redact::redact_last_segment(&subscription.notification_uri),
                     err
                 );
                 return Err(err);
@@ -698,19 +695,19 @@ pub fn subscription_accepts_profile_changes(
         .any(|attr| cond.notifies_attribute(attr))
 }
 
-/// The top-level NFProfile attribute each `ChangeItem` touches, e.g. `/load` and
-/// `/nfServices/0/priority` both reduce to the first path segment (`load`,
-/// `nfServices`), which is the granularity `notifCondition` is expressed at.
+/// The location each `ChangeItem` touches, as an RFC 6901 pointer (`/load`,
+/// `/nfServices/0/priority`). `notifCondition` lists pointers too (TS 29.510
+/// §6.1.6.2.43), and [`NotifCondition::notifies_attribute`] matches them on
+/// whole reference tokens. The whole-document path (`""` or `"/"`) is dropped:
+/// it names no attribute, and an empty list is "no restriction".
+///
+/// [`NotifCondition::notifies_attribute`]: crate::nnrf_handler::NotifCondition::notifies_attribute
 fn changed_attribute_names(changes: &[ChangeItem]) -> Vec<String> {
     changes
         .iter()
         .filter_map(|c| {
-            c.path
-                .trim_start_matches('/')
-                .split('/')
-                .next()
-                .filter(|s| !s.is_empty())
-                .map(String::from)
+            let p = c.path.trim_start_matches('/').trim_end_matches('/');
+            (!p.is_empty()).then(|| format!("/{p}"))
         })
         .collect()
 }
@@ -1965,10 +1962,9 @@ mod tests {
         assert!(subscription_accepts_profile_changes(&sub, &[]));
     }
 
-    /// `notifCondition` is expressed over top-level NFProfile attributes, so a
-    /// nested RFC 6902 path must reduce to its first segment.
+    /// Every change path becomes a pointer; the whole-document path is dropped.
     #[test]
-    fn changed_attribute_names_reduce_a_json_pointer_to_its_first_segment() {
+    fn changed_attribute_names_are_pointers() {
         let changes = vec![
             ChangeItem {
                 op: "replace".to_string(),
@@ -2000,10 +1996,83 @@ mod tests {
         assert_eq!(
             changed_attribute_names(&changes),
             vec![
-                "load".to_string(),
-                "nfServices".to_string(),
-                "capacity".to_string()
+                "/load".to_string(),
+                "/nfServices/0/priority".to_string(),
+                "/capacity".to_string()
             ]
         );
+    }
+
+    /// #940: `monitoredAttributes` / `unmonitoredAttributes` are JSON Pointers
+    /// (TS 29.510 §6.1.6.2.43, RFC 6901). A pointer covers its own location and
+    /// everything below it, on whole reference tokens; a bare name still works.
+    #[test]
+    fn notif_condition_attributes_are_json_pointers() {
+        use crate::nnrf_handler::NotifCondition;
+
+        let mut sub = create_test_subscription(None);
+        let paths = |ps: &[&str]| ps.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        sub.notif_condition = Some(NotifCondition {
+            monitored_attributes: Some(vec!["/nfStatus".into(), "/nfServices".into()]),
+            unmonitored_attributes: None,
+        });
+        assert!(subscription_accepts_profile_changes(
+            &sub,
+            &paths(&["/nfStatus"])
+        ));
+        assert!(subscription_accepts_profile_changes(
+            &sub,
+            &paths(&["/nfServices/0/ipEndPoints/0/port"])
+        ));
+        assert!(!subscription_accepts_profile_changes(
+            &sub,
+            &paths(&["/load"])
+        ));
+        assert!(
+            !subscription_accepts_profile_changes(&sub, &paths(&["/nfStatusX"])),
+            "a pointer matches whole reference tokens only"
+        );
+
+        // A deeper monitored pointer matches a change to its ancestor.
+        sub.notif_condition = Some(NotifCondition {
+            monitored_attributes: Some(vec!["/nfServices/0/ipEndPoints".into()]),
+            unmonitored_attributes: None,
+        });
+        assert!(subscription_accepts_profile_changes(
+            &sub,
+            &paths(&["/nfServices"])
+        ));
+        assert!(!subscription_accepts_profile_changes(
+            &sub,
+            &paths(&["/nfServices/0/priority"])
+        ));
+
+        // The denylist form: a change under an unmonitored pointer is dropped.
+        sub.notif_condition = Some(NotifCondition {
+            monitored_attributes: None,
+            unmonitored_attributes: Some(vec!["/load".into()]),
+        });
+        assert!(!subscription_accepts_profile_changes(
+            &sub,
+            &paths(&["/load"])
+        ));
+        assert!(subscription_accepts_profile_changes(
+            &sub,
+            &paths(&["/nfStatus"])
+        ));
+
+        // A bare name (pre-#940 AMFs) is the pointer to that attribute.
+        sub.notif_condition = Some(NotifCondition {
+            monitored_attributes: Some(vec!["nfStatus".into()]),
+            unmonitored_attributes: None,
+        });
+        assert!(subscription_accepts_profile_changes(
+            &sub,
+            &paths(&["/nfStatus"])
+        ));
+        assert!(!subscription_accepts_profile_changes(
+            &sub,
+            &paths(&["/load"])
+        ));
     }
 }
