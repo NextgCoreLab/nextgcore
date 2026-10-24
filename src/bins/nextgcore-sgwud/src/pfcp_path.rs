@@ -2068,6 +2068,25 @@ pub enum PathReport {
     Recovery,
 }
 
+/// The Remote GTP-U Peers of a path report (#957).
+fn peer_list(peers: &[IpAddr]) -> LibUserPlanePathFailureReport {
+    LibUserPlanePathFailureReport {
+        remote_gtpu_peers: peers
+            .iter()
+            .map(|ip| match ip {
+                IpAddr::V4(v4) => LibRemoteGtpUPeer {
+                    ipv4: Some(v4.octets()),
+                    ipv6: None,
+                },
+                IpAddr::V6(v6) => LibRemoteGtpUPeer {
+                    ipv4: None,
+                    ipv6: Some(v6.octets()),
+                },
+            })
+            .collect(),
+    }
+}
+
 /// Report a GTP-U user-plane path failure (or recovery) to the SGW-C with a PFCP
 /// Node Report Request (TS 23.007 §20.3.4, TS 29.244 §7.4.5). Issue #217.
 ///
@@ -2105,24 +2124,12 @@ pub fn send_node_report_request(peers: &[IpAddr], report: PathReport) -> Result<
     let request = NodeReportRequest {
         node_id: NodeId::new_ipv4(node.local_ip.octets()),
         node_report_type,
-        // TS 29.244 Table 7.4.5.1-1 carries the peer list in a User Plane Path
-        // Failure Report for both directions; §8.2.83's Remote GTP-U Peer is the
-        // member that names which path.
-        user_plane_path_failure_report: Some(LibUserPlanePathFailureReport {
-            remote_gtpu_peers: peers
-                .iter()
-                .map(|ip| match ip {
-                    IpAddr::V4(v4) => LibRemoteGtpUPeer {
-                        ipv4: Some(v4.octets()),
-                        ipv6: None,
-                    },
-                    IpAddr::V6(v6) => LibRemoteGtpUPeer {
-                        ipv4: None,
-                        ipv6: Some(v6.octets()),
-                    },
-                })
-                .collect(),
-        }),
+        // #957 (TS 29.244 Table 7.4.5.1-1): a FAILURE lists the peers in a User Plane
+        // Path Failure Report (IE 102), a RECOVERY in a User Plane Path Recovery Report
+        // (IE 187). Recovery used to ride in a Failure Report too, so a conformant
+        // SGW-C read recovered paths as failed. §8.2.70's Remote GTP-U Peer names each.
+        user_plane_path_failure_report: (report == PathReport::Failure).then(|| peer_list(peers)),
+        user_plane_path_recovery_report: (report == PathReport::Recovery).then(|| peer_list(peers)),
     };
     let mut body = BytesMut::new();
     request.encode(&mut body);
@@ -3541,15 +3548,24 @@ mod tests {
             );
             peer.send_to(&pkt, from).await.expect("answer the report");
 
-            let names_it = report
-                .user_plane_path_failure_report
-                .as_ref()
-                .is_some_and(|r| {
-                    r.remote_gtpu_peers.iter().any(|p| match about {
-                        IpAddr::V4(v4) => p.ipv4 == Some(v4.octets()),
-                        IpAddr::V6(v6) => p.ipv6 == Some(v6.octets()),
-                    })
-                });
+            // #957: the peer list lives in the Failure Report (UPFR) or in the Recovery
+            // Report (UPRR, IE 187) -- each in its own IE, never the other's.
+            let list = if report.node_report_type.uprr {
+                assert!(
+                    report.user_plane_path_failure_report.is_none(),
+                    "a recovery must not carry a Path FAILURE Report"
+                );
+                report.user_plane_path_recovery_report.as_ref()
+            } else {
+                assert!(report.user_plane_path_recovery_report.is_none());
+                report.user_plane_path_failure_report.as_ref()
+            };
+            let names_it = list.is_some_and(|r| {
+                r.remote_gtpu_peers.iter().any(|p| match about {
+                    IpAddr::V4(v4) => p.ipv4 == Some(v4.octets()),
+                    IpAddr::V6(v6) => p.ipv6 == Some(v6.octets()),
+                })
+            });
             if names_it {
                 matched += 1;
                 kind = Some(report.node_report_type);

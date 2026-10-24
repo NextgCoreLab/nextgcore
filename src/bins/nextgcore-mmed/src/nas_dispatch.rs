@@ -1469,8 +1469,12 @@ fn service_request_initial_context_setup(ctx: &MmeContext, enb_ue: &EnbUe, mme_u
     ) {
         Ok(pdu) => {
             mme_ue.service_request_ics_pending = true;
+            // #869: a UE-AMBR change waits behind this setup, which carries the
+            // value computed here.
+            mme_ue.ics_pending_on = enb_ue.id;
             if let Err(e) = nas_path::nas_eps_send_to_enb(mme_ue, enb_ue, pdu) {
                 mme_ue.service_request_ics_pending = false;
+                mme_ue.ics_pending_on = 0;
                 log::error!(
                     "[{}] SERVICE REQUEST: Initial Context Setup not sent: {e}",
                     mme_ue.imsi_bcd
