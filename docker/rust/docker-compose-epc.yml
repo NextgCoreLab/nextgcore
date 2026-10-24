@@ -73,6 +73,11 @@ x-common: &common
   environment: &common-env
     RUST_LOG: info
     RUST_BACKTRACE: 1
+    # The /metrics listeners (smfd, upfd, sgwud; udmd/nsacfd when enabled)
+    # default to 127.0.0.1 (#837). Inside this private compose network they
+    # bind all container interfaces so Prometheus can scrape them; no service
+    # publishes its metrics port on the host.
+    NEXTGCORE_METRICS_BIND: "0.0.0.0"
 
 x-nf-healthcheck: &nf-healthcheck
   healthcheck:
@@ -316,11 +321,10 @@ services:
     networks:
       epc:
         ipv4_address: 172.24.0.5
-    # S1AP towards an eNB. The compose eNB reaches 172.24.0.5 over the epc
-    # network and needs no publish; this one is for an eNB run on the host, and
-    # is loopback-bound so S1-MME is not offered to every host interface.
     ports:
-      - "127.0.0.1:36412:36412/sctp"
+      # S1AP towards eNB: host-local unless NEXTGCORE_RAN_PUBLISH_ADDR names the
+      # host address an external eNB reaches (#837).
+      - "${NEXTGCORE_RAN_PUBLISH_ADDR:-127.0.0.1}:36412:36412/sctp"
     depends_on:
       hss:
         condition: service_healthy

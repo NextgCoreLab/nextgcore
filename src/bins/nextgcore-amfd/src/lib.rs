@@ -28,6 +28,7 @@ pub mod ngap_path;
 pub mod ngap_sm;
 pub mod positioning; // LCS: LMF positioning relay (NRPPa N2 / LPP N1) — TS 23.273
 pub mod racs; // #570: RACS on the AMF (TS 23.501 §5.4.4.1a, TS 29.673)
+pub(crate) mod sbi_offload; // #796: SBI work off the NGAP task
 pub mod sbi_path;
 pub mod snpn; // Rel-16: SNPN authentication (TS 23.501 §5.30)
 pub mod timer;
@@ -901,19 +902,8 @@ pub async fn run() -> Result<()> {
     let args = Args::parse();
 
     // Initialize logging
-    let log_level = match args.log_level.to_lowercase().as_str() {
-        "trace" => log::LevelFilter::Trace,
-        "debug" => log::LevelFilter::Debug,
-        "info" => log::LevelFilter::Info,
-        "warn" => log::LevelFilter::Warn,
-        "error" => log::LevelFilter::Error,
-        _ => log::LevelFilter::Info,
-    };
-
-    env_logger::Builder::new()
-        .filter_level(log_level)
-        .format_timestamp_millis()
-        .init();
+    // RUST_LOG if set, else --log-level: the same for every NF (#691).
+    nextgcore_core::log::nf_log_builder(&args.log_level).init();
 
     log::info!("NextGCore AMF v{}", env!("CARGO_PKG_VERSION"));
     log::info!("Configuration: {}", args.config);

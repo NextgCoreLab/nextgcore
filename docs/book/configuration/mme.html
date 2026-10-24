@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-c2411517.js";
+            window.path_to_searchindex_js = "../searchindex-df495bb2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -184,7 +184,7 @@
 <p><strong>Honesty note:</strong> the nightly <code>Docker E2E (EPC)</code> job attaches a real LTE UE through nextgsim’s eNB to this MME and pings through the default bearer with 0% loss (<code>docker/rust/epc-attach-check.sh</code>). Dedicated bearers, handover, idle mode/paging and IPv6 PDN are not asserted there. This is the project’s own matched-simulator validation, not third-party certification.</p>
 </blockquote>
 <h2 id="example-configuration"><a class="header" href="#example-configuration">Example configuration</a></h2>
-<p>From <code>nextgcore/docker/rust/configs/epc/mme.yaml</code> (mounted by <code>docker-compose-epc.yml</code>, which runs the daemon as <code>-c /etc/nextgcore/mme.yaml</code> at <code>172.24.0.5</code> and publishes <code>36412/sctp</code> on <code>127.0.0.1</code> only; abridged, the shipped file also carries a commented-out <code>overload:</code> block):</p>
+<p>From <code>nextgcore/docker/rust/configs/epc/mme.yaml</code> (mounted by <code>docker-compose-epc.yml</code>, which runs the daemon as <code>-c /etc/nextgcore/mme.yaml</code> at <code>172.24.0.5</code> and publishes <code>36412/sctp</code> on <code>127.0.0.1</code>, or on <code>NEXTGCORE_RAN_PUBLISH_ADDR</code> for an external eNB; abridged, the shipped file also carries a commented-out <code>overload:</code> block):</p>
 <pre><code class="language-yaml"># NextGCore MME Configuration for Docker EPC Deployment
 # Rust implementation
 
@@ -285,13 +285,14 @@ mme:
 <tbody>
 <tr><td><code>MME_N26_INTERWORKING</code></td><td>off</td><td><code>1</code>/<code>true</code> binds the N26 socket and enables EPS↔5GS interworking (idle-mode context transfer, connected-mode handover). Off: a standalone EPC, and a UE arriving from 5GS is handled as TS 24.301 requires of an MME with no N26.</td></tr>
 <tr><td><code>MME_ECHO_INTERVAL_SECS</code></td><td><code>60</code></td><td>GTPv2-C Echo (path management) interval; <code>0</code> disables it.</td></tr>
+<tr><td><code>MME_DIAMETER_TW_SECS</code></td><td><code>30</code></td><td>S6a Device-Watchdog interval Tw (RFC 6733 §5.5, RFC 3539 §3.4.1), floored at 6. After Tw with nothing received a DWR is sent; with no answer within another Tw the connection is closed and redialled (Tc, doubling to at most 8 x Tc). A redialled connection carries traffic once three watchdogs are answered. Keep Tw below 3 x the HSS’s Tc, where hssd drops an idle connection.</td></tr>
 <tr><td><code>MME_RESTART_COUNTER_FILE</code></td><td><code>/var/lib/nextgcore/mme-restart-counter</code></td><td>Where the TS 23.007 restart counter is persisted; it is advanced on every start.</td></tr>
 <tr><td><code>MME_RESTART_COUNTER</code></td><td>unset</td><td>Fixed restart counter (u8), overriding the persisted one.</td></tr>
 <tr><td><code>OTEL_EXPORTER_OTLP_ENDPOINT</code></td><td><code>http://jaeger:4317</code></td><td>OpenTelemetry OTLP exporter.</td></tr>
 </tbody>
 </table>
 </div>
-<p><code>RUST_LOG</code> is <strong>not</strong> honoured: the logger is built with <code>env_logger::Builder::new().filter_level(...)</code>, so the level comes only from <code>-l/--log-level</code>, and the <code>RUST_LOG: info</code> in <code>docker-compose-epc.yml</code> has no effect on the MME.</p>
+<p><code>RUST_LOG</code> overrides <code>-l/--log-level</code> when set (the <code>RUST_LOG: info</code> in <code>docker-compose-epc.yml</code> applies).</p>
 
                     </main>
 
