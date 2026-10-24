@@ -3,6 +3,7 @@
 //! Port of src/mme/mme-s11-handler.c - GTP-C message handling for S11 interface
 
 use crate::s11_build::{ie_type, message_type};
+use nextgcore_gtp::v2::cause as gtp2_cause;
 use std::net::SocketAddr;
 
 // ============================================================================
@@ -68,20 +69,30 @@ pub mod esm_cause {
 /// UE can do something different for knowing it.
 pub fn esm_cause_from_gtp(gtp_cause: u8) -> u8 {
     match gtp_cause {
-        64 => esm_cause::INVALID_EPS_BEARER_IDENTITY,
-        68 => esm_cause::SERVICE_OPTION_NOT_SUPPORTED,
+        gtp2_cause::CONTEXT_NOT_FOUND => esm_cause::INVALID_EPS_BEARER_IDENTITY,
+        gtp2_cause::SERVICE_NOT_SUPPORTED => esm_cause::SERVICE_OPTION_NOT_SUPPORTED,
         // TS 29.274 §8.4 cause 73 "No resources available" is a capacity refusal, and
         // §9.9.4.4 cause 26 says exactly that to the UE.
-        73 => esm_cause::INSUFFICIENT_RESOURCES,
-        74 => esm_cause::SEMANTIC_ERROR_IN_THE_TFT_OPERATION,
-        75 => esm_cause::SYNTACTICAL_ERROR_IN_THE_TFT_OPERATION,
-        76 => esm_cause::SEMANTIC_ERRORS_IN_PACKET_FILTERS,
-        77 => esm_cause::SYNTACTICAL_ERROR_IN_PACKET_FILTERS,
+        gtp2_cause::NO_RESOURCES_AVAILABLE => esm_cause::INSUFFICIENT_RESOURCES,
+        gtp2_cause::SEMANTIC_ERROR_IN_THE_TFT_OPERATION => {
+            esm_cause::SEMANTIC_ERROR_IN_THE_TFT_OPERATION
+        }
+        gtp2_cause::SYNTACTIC_ERROR_IN_THE_TFT_OPERATION => {
+            esm_cause::SYNTACTICAL_ERROR_IN_THE_TFT_OPERATION
+        }
+        gtp2_cause::SEMANTIC_ERRORS_IN_PACKET_FILTER => {
+            esm_cause::SEMANTIC_ERRORS_IN_PACKET_FILTERS
+        }
+        gtp2_cause::SYNTACTIC_ERRORS_IN_PACKET_FILTER => {
+            esm_cause::SYNTACTICAL_ERROR_IN_PACKET_FILTERS
+        }
         // The one the issue names.
-        78 => esm_cause::MISSING_OR_UNKNOWN_APN,
+        gtp2_cause::MISSING_OR_UNKNOWN_APN => esm_cause::MISSING_OR_UNKNOWN_APN,
         // A refusal by the SGW/PGW that names no more specific reason. Distinct from
         // NETWORK_FAILURE, which claims the network broke rather than declined.
-        94 => esm_cause::REQUEST_REJECTED_BY_SERVING_GW_OR_PDN_GW,
+        gtp2_cause::REQUEST_REJECTED_REASON_NOT_SPECIFIED => {
+            esm_cause::REQUEST_REJECTED_BY_SERVING_GW_OR_PDN_GW
+        }
         _ => esm_cause::NETWORK_FAILURE,
     }
 }
@@ -466,7 +477,7 @@ fn apply_create_session_response(
 ) {
     let ctx = crate::context::mme_self();
 
-    if data.cause != 16 {
+    if data.cause != gtp2_cause::REQUEST_ACCEPTED {
         // TS 29.274 §8.4: 16 is "Request accepted". Anything else means no bearer
         // was created, and the UE is owed the mapped ESM cause rather than a wait.
         log::warn!(
@@ -500,7 +511,7 @@ fn apply_create_session_response(
     for bearer in &data.bearer_contexts {
         // TS 29.274 §8.4 / Table 7.2.2-2: a bearer context's own Cause says whether
         // THAT bearer was created. One that was not has no usable S1-U endpoint.
-        if bearer.cause != 16 {
+        if bearer.cause != gtp2_cause::REQUEST_ACCEPTED {
             log::warn!(
                 "S11 Create Session Response: EBI {} not created (bearer cause {})",
                 bearer.ebi,
@@ -721,7 +732,7 @@ fn apply_change_notification_response(
         );
         return;
     };
-    if data.cause != 16 {
+    if data.cause != gtp2_cause::REQUEST_ACCEPTED {
         log::warn!(
             "S11 Change Notification Response from {peer} (seq={sequence_number}) refused the \
              location change for session {sess_id}: cause {}",
@@ -1107,14 +1118,26 @@ pub fn downlink_data_notification_for_bearer(
                 mme_ue.imsi_bcd
             );
         } else if s1u_released_at_sgw(ctx, &mme_ue, &enb_ue, ebi) {
-            log::warn!(
-                "[{}] Downlink Data Notification (EBI {ebi:?}) for an ECM-CONNECTED UE whose \
-                 S1-U the Serving GW held: its S1-U is released; releasing the S1 connection \
-                 and paging (TS 23.401 §5.3.5, §5.3.4.3)",
-                mme_ue.imsi_bcd
-            );
-            for send in crate::s1ap_handler::release_for_released_s1u(ctx, enb_ue.id, mme_ue.id) {
-                crate::s1ap_path::s1ap_send(send);
+            if stale_s1u_release_allowed(ctx, mme_ue.id) {
+                log::warn!(
+                    "[{}] Downlink Data Notification (EBI {ebi:?}) for an ECM-CONNECTED UE \
+                     whose S1-U the Serving GW held: its S1-U is released; releasing the S1 \
+                     connection and paging (TS 23.401 §5.3.5, §5.3.4.3)",
+                    mme_ue.imsi_bcd
+                );
+                for send in crate::s1ap_handler::release_for_released_s1u(ctx, enb_ue.id, mme_ue.id)
+                {
+                    crate::s1ap_path::s1ap_send(send);
+                }
+            } else {
+                log::error!(
+                    "[{}] Downlink Data Notification for an ECM-CONNECTED UE whose S1-U was \
+                     released again: {STALE_S1U_RELEASES_PER_WINDOW} S1 releases in {}s did \
+                     not restore it (a user plane path that stays failed); not releasing again \
+                     until the window passes",
+                    mme_ue.imsi_bcd,
+                    STALE_S1U_WINDOW.as_secs()
+                );
             }
         }
         return (sgw_teid, GtpCause::RequestAccepted);
@@ -1136,6 +1159,32 @@ pub fn downlink_data_notification_for_bearer(
     } else {
         (sgw_teid, GtpCause::RequestAccepted)
     }
+}
+
+/// At most this many S1 releases for a released S1-U per UE in
+/// [`STALE_S1U_WINDOW`] (#1023 review). Each release pages the UE, whose
+/// SERVICE REQUEST sets up S1-U toward the same eNB; while the path to it stays
+/// failed the Serving GW releases that S1-U again (sgwcd #1014), and without a
+/// bound the UE would cycle release, paging, SERVICE REQUEST for as long as the
+/// failure lasts.
+const STALE_S1U_RELEASES_PER_WINDOW: usize = 2;
+const STALE_S1U_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether another S1 release for a released S1-U is allowed for `mme_ue_id`
+/// now, recording it when it is.
+fn stale_s1u_release_allowed(ctx: &crate::context::MmeContext, mme_ue_id: u64) -> bool {
+    let now = std::time::Instant::now();
+    let mut pool = ctx.mme_ue_pool.write().unwrap();
+    let Some(ue) = pool.get_mut(&mme_ue_id) else {
+        return false;
+    };
+    ue.stale_s1u_releases
+        .retain(|t| now.saturating_duration_since(*t) < STALE_S1U_WINDOW);
+    if ue.stale_s1u_releases.len() >= STALE_S1U_RELEASES_PER_WINDOW {
+        return false;
+    }
+    ue.stale_s1u_releases.push(now);
+    true
 }
 
 /// Whether a Downlink Data Notification for the ECM-CONNECTED `mme_ue` on
@@ -2311,7 +2360,7 @@ fn apply_indirect_forwarding_response(
     // buffered downlink data forwarded is better off attached to the target than stuck
     // between cells. So the command goes out with an EMPTY forwarding list, and the
     // loss is logged rather than hidden.
-    if data.cause != 16 {
+    if data.cause != gtp2_cause::REQUEST_ACCEPTED {
         log::error!(
             "SGW refused indirect forwarding tunnels (cause={}); completing the handover WITHOUT \
              data forwarding, so buffered downlink data is lost",
@@ -2362,7 +2411,7 @@ fn apply_indirect_forwarding_response(
         return;
     }
 
-    let forwarding_list = if data.cause == 16 {
+    let forwarding_list = if data.cause == gtp2_cause::REQUEST_ACCEPTED {
         crate::s1ap_handler::sgw_forwarding_list(ctx, mme_ue_id)
     } else {
         Vec::new()

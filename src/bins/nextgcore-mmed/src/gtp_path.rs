@@ -1453,8 +1453,7 @@ pub fn confirm_mbr_endpoints(
     seq: u32,
     data: &crate::s11_handler::ModifyBearerResponseData,
 ) {
-    const ACCEPTED: u8 = 16;
-    const ACCEPTED_PARTIALLY: u8 = 17;
+    use nextgcore_gtp::v2::cause::{REQUEST_ACCEPTED as ACCEPTED, REQUEST_ACCEPTED_PARTIALLY};
     let Some((mme_ue_id, sent)) = pending_mbr_endpoints()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1462,10 +1461,9 @@ pub fn confirm_mbr_endpoints(
     else {
         return;
     };
-    if data.cause != ACCEPTED && data.cause != ACCEPTED_PARTIALLY {
+    if data.cause != ACCEPTED && data.cause != REQUEST_ACCEPTED_PARTIALLY {
         return;
     }
-    let mut pool = ctx.bearer_pool.write().unwrap();
     for (ebi, teid, ip) in sent {
         if data.bearers_marked_for_removal.contains(&ebi) {
             continue;
@@ -1482,10 +1480,12 @@ pub fn confirm_mbr_endpoints(
         if !held {
             continue;
         }
-        if let Some(b) = pool
-            .values_mut()
-            .find(|b| b.mme_ue_id == mme_ue_id && b.ebi == ebi)
-        {
+        // #1023 review: the bearer by its (UE, EBI) key, then the pool entry by
+        // id, rather than a scan of every bearer under the write lock.
+        let Some(id) = ctx.bearer_of_ue_by_ebi(mme_ue_id, ebi) else {
+            continue;
+        };
+        if let Some(b) = ctx.bearer_pool.write().unwrap().get_mut(&id) {
             b.enb_s1u_at_sgw = Some((teid, ip));
         }
     }

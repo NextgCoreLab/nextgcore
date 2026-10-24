@@ -1296,3 +1296,78 @@ fn a_notification_while_s1u_is_being_set_up_releases_nothing() {
     wait_pdu(ue.enb_id, is_paging);
     release(&ue);
 }
+
+/// #1023 review: under a user plane path that stays failed, each S1 release for
+/// a released S1-U pages the UE back onto the same dead path. At most two such
+/// releases per UE per minute: a third notification in the window releases
+/// nothing, and once the window has passed the next one releases again.
+#[test]
+fn released_s1u_releases_are_bounded_per_window() {
+    let _guard = lock_s11();
+    let (sgw, _route) = sgw(Gtp2XactConfig::default());
+    let ue = seed(0x1023, &[5]);
+    let ctx = mme_self();
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    let _ = crate::s1ap_path::take_tapped_for_test(ue.enb_id);
+    crate::gtp_path::send_modify_bearer_request(
+        ctx,
+        ue.enb_ue_id,
+        ue.mme_ue_id,
+        false,
+        crate::s11_build::GtpModifyAction::NoAction,
+    )
+    .unwrap();
+    let (mbr, mme) = recv(&sgw, 34);
+    answer_modify_bearer(&sgw, mme, &ue, &mbr, 16, &[(5, 16)]);
+
+    // Two releases in the last minute already.
+    let now = Instant::now();
+    ctx.mme_ue_pool
+        .write()
+        .unwrap()
+        .get_mut(&ue.mme_ue_id)
+        .unwrap()
+        .stale_s1u_releases = vec![now - Duration::from_secs(20), now - Duration::from_secs(5)];
+    let (cause, sent) = notify(&sgw, mme, &ue, 5, 0x1023);
+    assert_eq!(cause, 16);
+    assert!(sent.is_empty(), "no Release Access Bearers");
+    assert!(untouched(&ue), "bounded: no third release in the window");
+
+    // The window has passed: released again.
+    ctx.mme_ue_pool
+        .write()
+        .unwrap()
+        .get_mut(&ue.mme_ue_id)
+        .unwrap()
+        .stale_s1u_releases = vec![now - Duration::from_secs(70), now - Duration::from_secs(61)];
+    let (_, sent) = notify(&sgw, mme, &ue, 5, 0x1024);
+    let rab = release_access_bearers(&sgw, sent);
+    assert_eq!(rab.header.teid, Some(SGW_S11_TEID));
+    assert_eq!(
+        ctx.mme_ue_find_by_id(ue.mme_ue_id)
+            .unwrap()
+            .stale_s1u_releases
+            .len(),
+        1,
+        "the old entries pruned, this release recorded"
+    );
+    let mut rsp = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+        171,
+        ue.local_teid,
+        rab.header.sequence_number,
+    ));
+    rsp.add_ie(Gtp2CauseIe::new(16).to_ie(0));
+    sgw.send_to(&rsp.encode(), mme).unwrap();
+    wait_pdu(ue.enb_id, release_command_cause);
+    let enb_ue = ctx.enb_ue_find_by_id(ue.enb_ue_id).unwrap();
+    crate::s1ap_handler::handle_ue_context_release_complete(
+        ctx,
+        ue.enb_id,
+        &nextgcore_s1ap::UeContextReleaseComplete {
+            mme_ue_s1ap_id: enb_ue.mme_ue_s1ap_id,
+            enb_ue_s1ap_id: enb_ue.enb_ue_s1ap_id,
+        },
+    );
+    wait_pdu(ue.enb_id, is_paging);
+    release(&ue);
+}
