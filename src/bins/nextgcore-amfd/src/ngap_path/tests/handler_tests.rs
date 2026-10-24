@@ -1185,7 +1185,8 @@ async fn an_establishment_with_no_smf_back_in_the_window_gets_payload_not_forwar
 
 /// A stand-in SMF whose CreateSMContext answers follow `script`: the n-th create
 /// gets `script[n]` as `(status, ProblemDetails cause)`, and every create past the
-/// script is created (201, `smContextRef` "est-1101"). Returns the server, its port
+/// script is created (201, `smContextRef` "est-1101"). The error bodies are
+/// SmContextCreateErrors. Returns the server, its port
 /// and the number of creates it saw. Keep the server alive.
 async fn scripted_create_smf(
     script: Vec<(u16, Option<&'static str>)>,
@@ -1214,9 +1215,13 @@ async fn scripted_create_smf(
                 }
                 let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if let Some((status, cause)) = script.get(n) {
-                    let problem = serde_json::json!({ "status": status, "cause": cause });
+                    // An SmContextCreateError, as smfd sends (TS 29.502 Table
+                    // 6.1.3.2.3.1-3); `problem_cause` also reads the flat form.
+                    let error = serde_json::json!({
+                        "error": { "status": status, "cause": cause },
+                    });
                     return SResp::with_status(*status)
-                        .with_body(problem.to_string(), "application/problem+json");
+                        .with_body(error.to_string(), "application/json");
                 }
                 let body = serde_json::json!({
                     "smContextRef": "est-1101",
@@ -1269,6 +1274,10 @@ async fn request_psi_5(server: &mut NgapServer, ue: u64, ran: u32) {
 async fn an_nf_failover_answer_is_retried_not_rejected() {
     let (_smf, port, creates) = scripted_create_smf(vec![(500, Some("NF_FAILOVER"))]).await;
     let _env = super::SmfEnvGuard::acquire(port).await;
+    let _seeded = SeededSmfs {
+        ids: &[],
+        held_down: ("127.0.0.1", port),
+    };
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_110_101u64, 101);
     ue_ready_for_sessions(&mut server, ue, ran);
@@ -1298,6 +1307,10 @@ async fn a_503_answer_is_retried_not_rejected() {
     let (_smf, port, creates) =
         scripted_create_smf(vec![(503, Some("NF_SERVICE_FAILOVER")), (503, None)]).await;
     let _env = super::SmfEnvGuard::acquire(port).await;
+    let _seeded = SeededSmfs {
+        ids: &[],
+        held_down: ("127.0.0.1", port),
+    };
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_110_102u64, 102);
     ue_ready_for_sessions(&mut server, ue, ran);
@@ -1311,6 +1324,37 @@ async fn a_503_answer_is_retried_not_rejected() {
     assert!(server.pending_establishments.is_empty());
     assert!(sets_up(&take_sent_ngap(&mut server), 5));
     server.forget_ue(ue);
+}
+
+/// SMF instances a test put in the process-global discovery cache, and the endpoint
+/// its NF_FAILOVER held down. Drop removes both (#1107 review m1), so neither a
+/// cached profile nor a hold-down outlives the test: the port is freed and may be
+/// another test's SMF next. The cache removal is async, so
+/// it runs on a fresh runtime of its own on a scoped thread: a panicking test drops
+/// this while its own runtime is unwinding.
+struct SeededSmfs {
+    ids: &'static [&'static str],
+    held_down: (&'static str, u16),
+}
+
+impl Drop for SeededSmfs {
+    fn drop(&mut self) {
+        let ctx = nextgcore_sbi::context::global_context();
+        ctx.clear_endpoint_failure(self.held_down.0, self.held_down.1);
+        let ids = self.ids;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("cleanup runtime");
+                rt.block_on(async {
+                    for id in ids {
+                        ctx.remove_nf_instance(id).await;
+                    }
+                });
+            });
+        });
+    }
 }
 
 /// **#1101**, re-selection. The discovery cache holds two SMF instances, one failing
@@ -1336,6 +1380,12 @@ async fn an_nf_failover_answer_re_selects_another_smf_instance() {
         svc.port = port;
         i.add_service(svc);
         i
+    };
+    // #1107 review m1: dropped whether the test passes or panics, so a failure here
+    // leaves no cached SMF or hold-down behind for the next SmfEnvGuard test.
+    let _seeded = SeededSmfs {
+        ids: &["smf-1101-failing", "smf-1101-healthy"],
+        held_down: ("127.0.0.1", failing_port),
     };
     ctx.add_nf_instance(instance("smf-1101-failing", failing_port))
         .await;
@@ -1364,9 +1414,6 @@ async fn an_nf_failover_answer_re_selects_another_smf_instance() {
 
     let failing = failing_creates.load(std::sync::atomic::Ordering::SeqCst);
     let healthy = healthy_creates.load(std::sync::atomic::Ordering::SeqCst);
-    ctx.remove_nf_instance("smf-1101-failing").await;
-    ctx.remove_nf_instance("smf-1101-healthy").await;
-    ctx.clear_endpoint_failure("127.0.0.1", failing_port);
     assert_eq!(
         (failing, healthy),
         (1, 1),

@@ -10776,7 +10776,8 @@ impl NgapServer {
                     ctx.note_endpoint_failure(host, *port, true);
                     let evicted = ctx.evict_nf_instances_at_endpoint(host, *port).await;
                     log::info!(
-                        "UE {}: SMF {host}:{port} answered PSI={} with {e}; re-selecting                          (evicted {evicted:?})",
+                        "UE {}: SMF {host}:{port} answered PSI={} with {e}; re-selecting \
+                         (evicted {evicted:?})",
                         a.amf_ue_ngap_id,
                         a.psi
                     );

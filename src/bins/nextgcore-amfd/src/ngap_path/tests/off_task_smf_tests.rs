@@ -197,6 +197,10 @@ async fn a_connected_service_request_to_a_blackholed_smf_does_not_hold_the_ngap_
 /// that session, and the Service Accept reports the re-activation failed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_idle_service_request_to_a_blackholed_smf_does_not_hold_the_ngap_task() {
+    // #1107: `served_guami` is process-global. Unguarded, this fixture's restore put
+    // back the list it saw at install, under a test (the EPS→5GS ones) that had set its
+    // own meanwhile, and that test's HandoverRequest then had no GUAMI to encode.
+    let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
     let _guami = ServeOneGuami::install();
     let mut server = capturing_ngap_server().await;
@@ -491,6 +495,10 @@ fn idle_ue_with_two_sessions(
 /// SMF would wait in ACTIVATING for a setup that never comes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_idle_service_requests_unanswered_activation_is_rolled_back_at_the_deadline() {
+    // #1107: `served_guami` is process-global. Unguarded, this fixture's restore put
+    // back the list it saw at install, under a test (the EPS→5GS ones) that had set its
+    // own meanwhile, and that test's HandoverRequest then had no GUAMI to encode.
+    let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
     let _guami = ServeOneGuami::install();
     let (_fast, fast_port, _calls) = activating_smf().await;
@@ -578,6 +586,10 @@ async fn a_connected_service_requests_unanswered_activation_is_rolled_back_at_th
 /// activation is rolled back. The SMF ends DEACTIVATED.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_an_release_during_the_join_sends_no_initial_context_setup() {
+    // #1107: `served_guami` is process-global. Unguarded, this fixture's restore put
+    // back the list it saw at install, under a test (the EPS→5GS ones) that had set its
+    // own meanwhile, and that test's HandoverRequest then had no GUAMI to encode.
+    let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
     let _guami = ServeOneGuami::install();
     let (_fast, fast_port, _calls) = activating_smf().await;

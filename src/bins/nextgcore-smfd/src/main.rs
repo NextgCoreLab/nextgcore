@@ -7459,13 +7459,15 @@ fn release_association_on_shutdown(value: Option<&str>, durable: bool) -> bool {
 
 /// The answer to an SM Context Create while the SMF shuts down (#718 review M3):
 /// 500 NF_FAILOVER, "the requester may trigger an immediate re-selection of an
-/// alternative NF" (TS 29.500 Table 5.2.7.2-1). `None` while running.
+/// alternative NF" (TS 29.500 Table 5.2.7.2-1). `None` while running. The body is an
+/// SmContextCreateError, as TS 29.502 Table 6.1.3.2.3.1-3 requires of an SMF's 500
+/// (#1107 review; a bare ProblemDetails on 500 is an SCP's).
 fn refuse_create_while_shutting_down(shutting_down: bool) -> Option<SbiResponse> {
     if !shutting_down {
         return None;
     }
     log::warn!("SM Context Create refused: the SMF is shutting down");
-    Some(problem_response(
+    Some(eps_to_5gs::sm_context_error(
         500,
         "NF_FAILOVER",
         "the SMF is shutting down",
@@ -9103,12 +9105,14 @@ mod tests {
         assert_eq!(refusal.status, 500);
         let body: serde_json::Value =
             serde_json::from_str(refusal.http.content.as_deref().unwrap()).unwrap();
-        assert_eq!(body["cause"], "NF_FAILOVER");
+        assert_eq!(body["error"]["cause"], "NF_FAILOVER");
+        assert_eq!(body["error"]["status"], 500);
     }
 
     /// #1101: the refusal at the handler, which is what amfd re-selects on. From the
-    /// shutdown signal on, SM Context Create answers 500 NF_FAILOVER as
-    /// `application/problem+json`, before the request is parsed or any state is
+    /// shutdown signal on, SM Context Create answers 500 with an SmContextCreateError
+    /// whose cause is NF_FAILOVER (TS 29.502 Table 6.1.3.2.3.1-3, `application/json`),
+    /// before the request is parsed or any state is
     /// touched. Before the deregistration and the #39 releases (graceful_shutdown,
     /// `the_shutdown_deregisters_before_it_releases`), so a UE's prompt
     /// re-establishment is never created on this SMF.
@@ -9123,11 +9127,11 @@ mod tests {
         assert_eq!(resp.status, 500);
         assert_eq!(
             resp.http.get_header("content-type").map(String::as_str),
-            Some("application/problem+json")
+            Some("application/json")
         );
         let body: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
-        assert_eq!(body["cause"], "NF_FAILOVER");
+        assert_eq!(body["error"]["cause"], "NF_FAILOVER");
     }
 
     /// The shipped shutdown deadline, from now (#941).
