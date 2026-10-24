@@ -82,9 +82,10 @@ struct Args {
     #[arg(short = 'l', long)]
     log_file: Option<String>,
 
-    /// Log level (trace, debug, info, warn, error)
-    #[arg(short = 'e', long, default_value = "info")]
-    log_level: String,
+    /// Log level (trace, debug, info, warn, error). Without it, the config
+    /// file's `logger.level`, else `info`; `RUST_LOG` overrides (#691).
+    #[arg(short = 'e', long)]
+    log_level: Option<String>,
 
     /// Disable color output
     #[arg(short = 'm', long)]
@@ -535,7 +536,11 @@ async fn main() -> Result<()> {
     let pfcp_for_urr = pfcp_server.clone();
     let shutdown_urr = shutdown.clone();
     let urr_check_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+        // #772: every second, so a periodic report goes out within 1 s of its period
+        // boundary (it was up to 10 s, and the old reset-anchored check added that
+        // lateness to every following period). Detection is a read of atomics and one
+        // instant per URR; nothing is taken unless a report is due.
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
         loop {
             interval.tick().await;
             if shutdown_urr.load(Ordering::SeqCst) {
@@ -705,7 +710,10 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
 /// Initialize logging based on command line arguments
 fn init_logging(args: &Args) -> Result<()> {
     // RUST_LOG if set, else --log-level: the same for every NF (#691).
-    let mut builder = nextgcore_core::log::nf_log_builder(&args.log_level);
+    let mut builder = nextgcore_core::log::nf_log_builder(&nextgcore_core::log::nf_log_level(
+        args.log_level.as_deref(),
+        Some(&args.config),
+    ));
 
     if args.no_color {
         builder.write_style(env_logger::WriteStyle::Never);
@@ -1356,7 +1364,7 @@ mod tests {
     fn test_args_default() {
         let args = Args::parse_from(["nextgcore-upfd"]);
         assert_eq!(args.config, "/etc/nextgcore/upf.yaml");
-        assert_eq!(args.log_level, "info");
+        assert_eq!(args.log_level, None);
         assert_eq!(args.pfcp_addr, "127.0.0.4");
         assert_eq!(args.pfcp_port, 8805);
         assert_eq!(args.gtpu_addr, "127.0.0.4");
@@ -1389,7 +1397,7 @@ mod tests {
             "2048",
         ]);
         assert_eq!(args.config, "/custom/upf.yaml");
-        assert_eq!(args.log_level, "debug");
+        assert_eq!(args.log_level.as_deref(), Some("debug"));
         assert_eq!(args.pfcp_addr, "10.0.0.1");
         assert_eq!(args.pfcp_port, 8806);
         assert_eq!(args.gtpu_addr, "10.0.0.2");

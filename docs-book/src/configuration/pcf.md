@@ -65,7 +65,7 @@ These are the fields actually deserialized by the daemon (`#[derive(Deserialize)
 The daemon deserializes only the fields above; unknown YAML keys are silently ignored by serde. In the shipped example file:
 
 - **`db_uri` is inert.** `nextgcore-pcfd` never calls `nextgcore_dbi_init` — its subscription/session-data lookups through `nextgcore-dbi` therefore error out at runtime and fall back to built-in defaults (see Behavior notes). The key exists for visual consistency with NFs that do open MongoDB.
-- **`logger.file.path` and `logger.level` are inert.** The log level comes from `RUST_LOG` when set, else the CLI flag `-e/--log-level` (default `info`); no file output is wired (the `-l/--log-file` flag is accepted but unused).
+- **`logger.level` is read; `logger.file.path` is inert.** The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691). No file output is wired (the `-l/--log-file` flag is accepted but unused).
 - **`global.max.ue` / `global.max.peer` are inert.** Context capacities come from the CLI flags `--max-ue` (1024) and `--max-sess` (4096).
 - **`pcf.metrics.server[]` is inert.** The daemon starts no metrics HTTP server; its only telemetry export is OpenTelemetry OTLP via `OTEL_EXPORTER_OTLP_ENDPOINT`.
 - **`pcf.tls.*` is inert.** No code reads this section. Even the CLI `--tls`/`--tls-cert`/`--tls-key` flags only flow into the legacy `SbiServerConfig` (`sbi_path.rs`), where they flip the *advertised* URI scheme to `https` in the legacy NF-instance builder; the live HTTP/2 listener is created from `NextgcoreSbiServerConfig::new(addr)` without any TLS wiring and serves cleartext h2c.
@@ -78,7 +78,7 @@ Runtime knobs with real defaults from the clap `Args` struct in `src/bins/nextgc
 |---|---|---|---|
 | `-c, --config` | path | `/etc/nextgcore/pcf.yaml` | Configuration file path. |
 | `-l, --log-file` | path | unset | Log file path — parsed but currently **not used** by `init_logging` (no file logging). |
-| `-e, --log-level` | string | `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else falls back to `info`). |
+| `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-m, --no-color` | flag | off | Disable color output. |
 | `-k, --kill` | flag | off | Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor. |
 | `--sbi-addr` | string | `0.0.0.0` | SBI bind address; overridden by `pcf.sbi.server[0].address` when the YAML sets one. |

@@ -2328,7 +2328,14 @@ impl SmfContext {
             map.extend(policy_bindings);
         }
         if let Ok(mut map) = self.upf_recovery_time_stamps.write() {
-            map.extend(upf_rts);
+            // #995, one-way migration: a pre-#995 snapshot holds Unix-seconds stamps.
+            // They are loaded in the NTP reading (and written back so on the next
+            // persist), so a UPF that did not restart is not taken for one that did.
+            map.extend(
+                upf_rts
+                    .into_iter()
+                    .map(|(k, v)| (k, nextgcore_pfcp::recovery_time::normalize_received(v))),
+            );
         }
         if let Ok(mut map) = self.cp_n4_seids.write() {
             map.extend(cp_n4_seids);
@@ -3847,6 +3854,35 @@ mod tests {
         assert_eq!(a >> 32, 1, "first boot, epoch 1: {a:#x}");
         assert_eq!(b >> 32, 2, "second boot, epoch 2: {b:#x}");
         assert!(b < FIVE_G_CP_SEID_BASE, "EPC SEIDs stay below the 5G range");
+    }
+
+    /// #995, one-way migration: a pre-#995 snapshot holds UPF Recovery Time Stamps in
+    /// Unix seconds. They load in the NTP reading (TS 29.244 §8.2.65), and an NTP one
+    /// is left as it is.
+    #[test]
+    fn pre_995_unix_recovery_time_stamps_load_as_ntp() {
+        let started_unix = 1_767_225_600u64; // 2026-01-01, a UPF up since then
+        let ntp = nextgcore_pfcp::recovery_time::from_unix_secs(started_unix);
+        let path = temp_state_path("995-rts");
+        let doc = serde_json::json!({
+            "version": SmfContext::SNAPSHOT_VERSION,
+            "pfcpSessions": {},
+            "policyBindings": {},
+            "ipv4Allocations": [],
+            "upfRecoveryTimeStamps": { "upf-legacy:8805": started_unix, "upf-new:8805": ntp }
+        });
+        std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
+        let ctx = ctx_with_state(&path);
+        assert_eq!(
+            ctx.upf_recovery_time_stamp("upf-legacy:8805"),
+            Some(ntp),
+            "migrated"
+        );
+        assert_eq!(
+            ctx.upf_recovery_time_stamp("upf-new:8805"),
+            Some(ntp),
+            "unchanged"
+        );
     }
 
     /// A version-1 snapshot's sessions keep the legacy CP SEID (`ref | 0x1000`): the
