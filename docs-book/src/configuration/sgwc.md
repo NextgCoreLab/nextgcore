@@ -67,13 +67,21 @@ From the clap `Args` struct in `src/bins/nextgcore-sgwcd/src/main.rs`:
     N1 2 per attempt). This covers an SGW-U that comes up later, and one that refuses the
     first Setup because its allowlist has not yet resolved the SGW-C's address.
   - Once associated, it sends the SGW-U a Heartbeat Request every 10 s.
-  - The association is marked lost, and set up again on the next turn, in either of these
-    cases:
-    - no Heartbeat Response arrives after T1 x (N1 + 1);
-    - the SGW-U reports a new Recovery Time Stamp, which means it restarted. Both the SGW-U's
-      Heartbeat Response and its own Heartbeat Request carry the stamp.
-  - While there is no association, the SGW-C sends no PFCP session message (TS 29.244 §6.2.6.1):
-    the S11 request that needs one is refused.
+  - No Heartbeat Response after T1 x (N1 + 1) is a PFCP path failure. The association and
+    its sessions are kept, and heartbeating continues. Setting the association up again over
+    a path that only blinked would make a conformant SGW-U drop every session (TS 29.244
+    §6.2.6.2.2).
+  - A newer Recovery Time Stamp means the SGW-U restarted. The stamp is carried in its
+    Heartbeat Response and in its own Heartbeat Request. It is normalised to NTP seconds
+    (#995), so a pre-#995 SGW-U's Unix seconds do not read as a restart, and an older stamp
+    from a reordered message is ignored. After a restart:
+    - the association is set up again;
+    - every established PFCP session is established again with the same CP F-SEID, F-TEIDs,
+      PDRs and FARs. The SGW-C allocates them all, so the MME and the PGW keep their
+      endpoints.
+  - While there is no association, the SGW-C sends no PFCP session message (TS 29.244 §6.2.6.1).
+    A Create Session Request is refused with No resources available before it is relayed to
+    the PGW. Other S11 requests that need a PFCP session message are answered with a failure.
 - **Environment variables** (read in `gtp_path.rs` / `pfcp_path.rs` / `main.rs`):
 
   | Variable | Default | Effect |

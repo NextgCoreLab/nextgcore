@@ -1249,6 +1249,26 @@ fn dispatch_create_session_request(server: &GtpcServer, msg: &Gtp2Message, peer:
         }
     };
 
+    // #1010 review: with no Sxa association the user plane cannot be provisioned
+    // (TS 29.244 §6.2.6.1), so the request is refused here, before anything is
+    // created and before the PGW is asked to anchor a session nobody would delete.
+    if !pfcp_path::sgwu_associated() {
+        log::warn!(
+            "Create Session Request from {peer} refused: no PFCP association with the \
+             SGW-U {} (No resources available)",
+            pfcp_path::configured_sgwu_addr()
+        );
+        send_cause_response(
+            server,
+            peer,
+            Gtp2MessageType::CreateSessionResponse,
+            parsed.sender_fteid.teid,
+            seq,
+            gtp_cause::NO_RESOURCES_AVAILABLE,
+        );
+        return;
+    }
+
     let ctx = sgwc_self();
     let existing_ue = ctx.ue_find_by_imsi(&parsed.imsi);
     let result = s11_handler::handle_create_session_request(
@@ -1599,7 +1619,14 @@ fn dispatch_s5c_create_session_response(msg: &Gtp2Message, peer: SocketAddr) {
     if let Err(e) =
         pfcp_path::send_session_establishment_request(&sess, seq as u64, None, 0, continuation)
     {
-        log::error!("PFCP Session Establishment failed after the PGW answered: {e}");
+        // #1010 review: the refusal hands the procedure back, so the MME is answered
+        // rather than left to its own timer. The association went down while the PGW
+        // answered: the cause is the one an up-front refusal gives.
+        log::error!(
+            "PFCP Session Establishment not sent after the PGW answered ({e}); the Create \
+             Session Request is refused"
+        );
+        crate::sxa_response::fail_with_cause(continuation, gtp_cause::NO_RESOURCES_AVAILABLE);
     }
 }
 
@@ -3011,6 +3038,55 @@ mod tests {
             response.get_ie(Gtp2IeType::Paa as u8, 0).is_none(),
             "a refused session must carry no PDN address"
         );
+    }
+
+    /// #1010 review MAJOR 1, TS 29.244 §6.2.6.1: with no Sxa association a Create
+    /// Session Request is answered at once with No resources available. Nothing is
+    /// relayed to the PGW (no anchored session is left behind) and no UE context is
+    /// created. Before, the PGW anchored the session, the PFCP establishment was
+    /// refused locally, and the MME got no answer at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_create_session_request_with_no_sxa_association_is_refused_before_the_pgw() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        // The Sxa path runs, but nothing ever answers the Association Setup.
+        let node =
+            crate::pfcp_path::SxaNode::open("127.0.0.1:0".parse().unwrap(), Ipv4Addr::LOCALHOST)
+                .await
+                .expect("bind the SGW-C's Sxa socket");
+        let (_stop, rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(node.clone().run(rx));
+        assert!(!crate::pfcp_path::sgwu_associated());
+        let pgw = with_stand_in_pgw().await;
+        let server = test_server(&ambient, 1000, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x01, 0xf0];
+
+        sock.send_to(&csr(0x1010, &imsi).encode(), server.local_addr())
+            .unwrap();
+        let response = recv_s11(&sock).await.expect("the MME must be answered");
+        assert_eq!(
+            response.header.message_type,
+            Gtp2MessageType::CreateSessionResponse as u8
+        );
+        assert_eq!(response.header.sequence_number, 0x1010);
+        assert_eq!(
+            response
+                .get_ie(Gtp2IeType::Cause as u8, 0)
+                .and_then(|ie| ie.value.first().copied()),
+            Some(gtp_cause::NO_RESOURCES_AVAILABLE)
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            pgw.seen.lock().unwrap().is_empty(),
+            "nothing relayed to the PGW"
+        );
+        assert!(
+            sgwc_self().ue_find_by_imsi(&imsi).is_none(),
+            "no UE context created"
+        );
+        sgwc_self().set_pgw_s5c_peer(None);
     }
 
     /// #54 criterion 6, first half: NO Create Session Response is sent until the PFCP

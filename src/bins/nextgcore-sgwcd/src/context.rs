@@ -793,6 +793,14 @@ impl SgwcContext {
         }
     }
 
+    /// Every session, cloned (#1010 review: restored on a restarted SGW-U).
+    pub fn sess_list_all(&self) -> Vec<SgwcSess> {
+        match self.sess_list.read() {
+            Ok(list) => list.values().cloned().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Remove all UEs
     pub fn ue_remove_all(&self) {
         let ids: Vec<u64> = {
