@@ -1204,8 +1204,21 @@ impl NgapServer {
                 association_id,
                 remote_addr,
             } => {
+                // #870 follow-up: a new association has its own negotiated streams; a
+                // count cached under a reused id is not its count.
+                self.outbound_streams.remove(&association_id);
                 self.handle_new_association(association_id, remote_addr)
                     .await?;
+            }
+            ServerEvent::AssociationRestarted { association_id } => {
+                // RFC 9260 §5.2.2: the peer restarted and the streams were negotiated
+                // afresh, so the cached count is asked again. The gNB itself restarted:
+                // it re-runs NG Setup, and the UE contexts it served are gone with it.
+                self.outbound_streams.remove(&association_id);
+                log::warn!(
+                    "NG association {association_id} restarted by the gNB; its outbound \
+                     stream count is re-read"
+                );
             }
             ServerEvent::AssociationClosed {
                 association_id,
@@ -23126,6 +23139,41 @@ mod tests {
             !server.outbound_streams.contains_key(&assoc),
             "a closed association's count is forgotten"
         );
+    }
+
+    /// #870 follow-up: a cached stream count is also forgotten when an association id
+    /// arrives as a NEW association (the id reused) and when the peer RESTARTS the
+    /// association (RFC 9260 §5.2.2: streams negotiated afresh).
+    ///
+    /// REVERT-VERIFIED: without either removal its assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_new_or_restarted_association_rereads_its_stream_count() {
+        let mut server = test_ngap_server().await;
+        let assoc = 98_142u64;
+        server.outbound_streams.insert(assoc, Some(9));
+        server
+            .handle_server_event(ServerEvent::AssociationRestarted {
+                association_id: assoc,
+            })
+            .await
+            .expect("handled");
+        assert!(
+            !server.outbound_streams.contains_key(&assoc),
+            "a restarted association's count is re-read"
+        );
+        server.outbound_streams.insert(assoc, Some(9));
+        server
+            .handle_server_event(ServerEvent::NewAssociation {
+                association_id: assoc,
+                remote_addr: "127.0.0.1:38412".parse().unwrap(),
+            })
+            .await
+            .expect("handled");
+        assert!(
+            !server.outbound_streams.contains_key(&assoc),
+            "a new association under a reused id starts with no count"
+        );
+        server.sessions.write().await.remove(&assoc);
     }
 
     #[test]
