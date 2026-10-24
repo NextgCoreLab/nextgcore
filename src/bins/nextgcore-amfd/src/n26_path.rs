@@ -2256,7 +2256,9 @@ mod tests {
     /// **#755 (review of #851, MINOR A).** The response cache is purged where in-flight
     /// entries expire, on every initial request: a response held past its hold is gone
     /// once the next request from any peer is handled, so the cache does not keep every
-    /// response ever sent. A 1 ms hold stands in for the 30 s one.
+    /// response ever sent. A 200 ms hold stands in for the 30 s one: long enough that the
+    /// precondition (still cached right after the send) holds on a loaded machine (#1051
+    /// review), short enough to wait out.
     ///
     /// REVERT-VERIFIED: without `expire_responses` in `handle_datagram` the expired
     /// response is still cached.
@@ -2266,7 +2268,7 @@ mod tests {
             .await
             .expect("N26 socket");
         server.xact.lock().await.mgr = Gtp2XactMgr::new(Gtp2XactConfig {
-            response_hold: std::time::Duration::from_millis(1),
+            response_hold: std::time::Duration::from_millis(200),
             ..Gtp2XactConfig::default()
         });
         let sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -2287,7 +2289,7 @@ mod tests {
                 .is_some(),
             "precondition: the response is cached"
         );
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         // The next initial request -- an Echo Request, from another peer.
         let other = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();

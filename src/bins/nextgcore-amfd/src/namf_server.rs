@@ -3654,6 +3654,12 @@ fn try_ue_policy_relay(
         if !registered_idle {
             return Some(ue_not_reachable_error(ue_context_id, failure_uri));
         }
+        // #749: paging is ongoing for another transfer; overwriting its context
+        // would lose that one, so this one is refused for the PCF to retry.
+        if crate::namf_handler::paging_ongoing(ue.id) {
+            log::info!("[{ue_context_id}] UE policy: the UE is already being paged; 409");
+            return Some(paging_ongoing_error());
+        }
         let location = crate::namf_handler::page_idle_ue_for_n1(
             ue,
             updp_pdu,
@@ -3910,12 +3916,39 @@ pub fn handle_n1_n2_message_transfer_request(
             }
         },
         Err(namf_handler::NamfHandlerError::MissingField(f)) => mandatory_ie_missing(&f),
+        Err(namf_handler::NamfHandlerError::PagingOngoing) => {
+            log::info!(
+                "[{ue_context_id}] N1N2 transfer for PSI {psi} refused: the UE is already being \
+                 paged (409 HIGHER_PRIORITY_REQUEST_ONGOING, retry after {}s)",
+                namf_handler::PAGING_ONGOING_RETRY_AFTER_S
+            );
+            paging_ongoing_error()
+        }
         Err(e) => send_error(
             500,
             "Internal Server Error",
             &format!("N1N2 transfer failed: {e:?}"),
             None,
         ),
+    }
+}
+
+/// #749: 409 `HIGHER_PRIORITY_REQUEST_ONGOING` for an N1N2MessageTransfer to a UE
+/// already being paged (TS 29.518 §5.2.2.3.1, TS 23.502 §4.2.3.3 step 3b). The
+/// body is the `N1N2MessageTransferError`: the ProblemDetails, and in `errInfo`
+/// the `retryAfter` before which the consumer must not try again.
+fn paging_ongoing_error() -> SbiResponse {
+    let problem = ProblemDetails::with_status(409)
+        .with_title("Conflict")
+        .with_detail("A paging procedure is ongoing for the UE")
+        .with_cause("HIGHER_PRIORITY_REQUEST_ONGOING");
+    let body = json!({
+        "error": problem,
+        "errInfo": { "retryAfter": namf_handler::PAGING_ONGOING_RETRY_AFTER_S },
+    });
+    match SbiResponse::with_status(409).with_json_body(&body) {
+        Ok(resp) => resp.with_header("content-type", "application/problem+json"),
+        Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
     }
 }
 
@@ -4705,39 +4738,34 @@ fn record_transferred_sessions(ue_id: u64, ue_context: &Value, ue_context_id: &s
         if let Some(dnn) = session.get("dnn").and_then(Value::as_str) {
             sess.dnn = Some(dnn.to_string());
         }
-        match session
+        let named = session
             .pointer("/sNssai/sst")
             .and_then(Value::as_u64)
             .and_then(|v| u8::try_from(v).ok())
-        {
-            Some(sst) => {
-                sess.s_nssai.sst = sst;
-                sess.s_nssai.sd = session
+            .map(|sst| crate::context::SNssai {
+                sst,
+                sd: session
                     .pointer("/sNssai/sd")
                     .and_then(Value::as_str)
-                    .and_then(|s| u32::from_str_radix(s, 16).ok());
-            }
-            // TS 29.518 §6.1.6.2.19: PduSessionContext.sNssai is mandatory. A peer that
-            // omits it still names a session the UE holds, so it is recorded under this
-            // AMF's default S-NSSAI rather than as SST 0, which no target admits
-            // (#743 follow-up).
-            None => {
-                let default = ctx.read().ok().and_then(|guard| {
-                    guard
-                        .plmn_support
-                        .first()
-                        .and_then(|p| p.s_nssai.first().cloned())
-                });
-                log::warn!(
-                    "UE context {ue_context_id}: PDU session {psi} has no (valid) sNssai, \
-                     which TS 29.518 makes mandatory; recorded under the default S-NSSAI \
-                     {default:?}"
-                );
-                if let Some(default) = default {
-                    sess.s_nssai = default;
-                }
-            }
+                    .and_then(|s| u32::from_str_radix(s, 16).ok()),
+            });
+        // TS 29.518 §6.1.6.2.19: PduSessionContext.sNssai is mandatory. A peer that omits
+        // it, or names SST 0 (schema-valid, TS 29.571, but no slice), still names a session
+        // the UE holds, so it is recorded under this AMF's default S-NSSAI rather than as
+        // SST 0, which no target admits (#743 follow-up; #920 follow-up for SST 0).
+        if named.as_ref().is_none_or(|s| s.sst == 0) {
+            log::warn!(
+                "UE context {ue_context_id}: PDU session {psi} has no usable sNssai \
+                 ({named:?}), which TS 29.518 makes mandatory; recorded under the default \
+                 S-NSSAI"
+            );
         }
+        // Read through a poisoned lock (#1060 review): falling back to `named` there would
+        // let SST 0 through after all.
+        sess.s_nssai = ctx
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .usable_s_nssai(named.clone());
         if let Ok(guard) = ctx.read() {
             guard.sess_update(&sess);
         }
@@ -7331,6 +7359,39 @@ mod tests {
             paged.pending_n1_container_type,
             crate::gmm_handler::payload_container_type::UE_POLICY_CONTAINER
         );
+
+        // #749: a second UPDP while that paging is ongoing is refused, 409
+        // HIGHER_PRIORITY_REQUEST_ONGOING with a retryAfter (TS 29.518
+        // §5.2.2.3.1), and the first one's paging context is untouched.
+        let second = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"))
+            .with_json_body(&body)
+            .expect("json")
+            .with_part(SbiPart::with_content(
+                "updp-pdu",
+                "application/vnd.3gpp.5gnas",
+                bytes::Bytes::from_static(&[0x80, 0x02, 0x00]),
+            ));
+        let resp = try_ue_policy_relay(supi, &ue, &second, &body).expect("a UE-policy relay");
+        assert_eq!(resp.status, 409);
+        let refusal = body_json(&resp);
+        assert_eq!(
+            refusal["error"]["cause"].as_str(),
+            Some("HIGHER_PRIORITY_REQUEST_ONGOING")
+        );
+        assert_eq!(
+            refusal["errInfo"]["retryAfter"].as_u64(),
+            Some(crate::namf_handler::PAGING_ONGOING_RETRY_AFTER_S)
+        );
+        let still = amf_self()
+            .read()
+            .unwrap()
+            .paging_find(ue.id)
+            .expect("still paging");
+        assert_eq!(
+            still.pending_n1.as_deref(),
+            Some(&[0x80, 0x01, 0x00][..]),
+            "the first UPDP is not overwritten"
+        );
         amf_self().read().unwrap().paging_remove(ue.id);
         amf_self().read().unwrap().amf_ue_unpublish(ue.id);
     }
@@ -9600,6 +9661,14 @@ mod tests {
                     "smContextRef": "smctx-relocate-740031",
                     "dnn": "internet",
                     "accessType": "3GPP_ACCESS",
+                }, {
+                    // #920 follow-up: a peer that names SST 0 (schema-valid, TS 29.571,
+                    // but no slice).
+                    "pduSessionId": 9,
+                    "smContextRef": "smctx-relocate-740032",
+                    "sNssai": { "sst": 0, "sd": "000920" },
+                    "dnn": "internet",
+                    "accessType": "3GPP_ACCESS",
                 }],
             },
             "targetId": {
@@ -9623,20 +9692,36 @@ mod tests {
             sst: 2,
             sd: Some(0x02_0202),
         };
-        let saved_plmn_support = {
+        // #920 review, MINOR 3: the substitute PLMN support is put back by a drop guard,
+        // count included, even if the handler panics.
+        struct RestorePlmnSupport(Vec<crate::context::PlmnSupport>, usize);
+        impl Drop for RestorePlmnSupport {
+            fn drop(&mut self) {
+                let ctx = amf_self();
+                let mut guard = ctx.write().unwrap_or_else(|e| e.into_inner());
+                guard.plmn_support = std::mem::take(&mut self.0);
+                guard.num_of_plmn_support = self.1;
+            }
+        }
+        let restore = {
             let ctx = amf_self();
             let mut guard = ctx.write().expect("ctx lock");
-            std::mem::replace(
-                &mut guard.plmn_support,
-                vec![crate::context::PlmnSupport {
-                    plmn_id: PlmnId::new("001", "01"),
-                    num_of_s_nssai: 1,
-                    s_nssai: vec![default_slice.clone()],
-                }],
-            )
+            let saved = RestorePlmnSupport(
+                std::mem::replace(
+                    &mut guard.plmn_support,
+                    vec![crate::context::PlmnSupport {
+                        plmn_id: PlmnId::new("001", "01"),
+                        num_of_s_nssai: 1,
+                        s_nssai: vec![default_slice.clone()],
+                    }],
+                ),
+                guard.num_of_plmn_support,
+            );
+            guard.num_of_plmn_support = 1;
+            saved
         };
         let resp = namf_request_handler(req).await;
-        amf_self().write().expect("ctx lock").plmn_support = saved_plmn_support;
+        drop(restore);
 
         assert_eq!(
             resp.status, 201,
@@ -9658,7 +9743,7 @@ mod tests {
         let sessions = ctx.read().expect("ctx lock").sess_list_for_ue(resolved.id);
         assert_eq!(
             sessions.len(),
-            2,
+            3,
             "the transferred sessionContextList must be RECORDED against the created \
              context -- the gap PR #390 named"
         );
@@ -9673,6 +9758,15 @@ mod tests {
             (8, default_slice.sst, default_slice.sd),
             "#743 follow-up: a session without sNssai is recorded under the default S-NSSAI, \
              not SST 0"
+        );
+        assert_eq!(
+            (
+                sessions[2].psi,
+                sessions[2].s_nssai.sst,
+                sessions[2].s_nssai.sd
+            ),
+            (9, default_slice.sst, default_slice.sd),
+            "#920 follow-up: a peer's explicit SST 0 is recorded under the default S-NSSAI"
         );
         assert_eq!(sessions[0].psi, 7);
         assert_eq!(

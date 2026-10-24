@@ -429,6 +429,20 @@ fn encode_gprs_timer2_seconds(seconds: u64) -> Option<nextgcore_types::GprsTimer
 }
 
 pub fn build_registration_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
+    build_registration_accept_for_sessions(amf_ue, None, None)
+}
+
+/// [`build_registration_accept`] with the session IEs of a mobility or periodic
+/// registration update (TS 24.501 §5.5.1.3.4, #759):
+/// - `pdu_session_status`: the AMF's view after the request's releases, included
+///   when the UE sent its own PDU session status;
+/// - `reactivation_result`: bit n set when re-establishing PSI n's user plane
+///   failed, included when the UE sent an Uplink data status.
+pub fn build_registration_accept_for_sessions(
+    amf_ue: &AmfUe,
+    pdu_session_status: Option<u16>,
+    reactivation_result: Option<u16>,
+) -> Option<Vec<u8>> {
     // nas-06 Phase 2 (Tier C, REGISTRATION-CRITICAL): encoded via nextgcore-nas. Byte-
     // identical to the prior hand-rolled output — 5GS registration result LV
     // [01, access&7]; 5G-GUTI (0x77 TLV-E) when a next-GUTI is assigned; single-TAI
@@ -577,7 +591,8 @@ pub fn build_registration_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
             allowed_nssai,
             rejected_nssai: None,
             network_feature_support,
-            pdu_session_status: None,
+            pdu_session_status: pdu_session_status.map(|psi| PduSessionStatus { length: 2, psi }),
+            pdu_session_reactivation_result: reactivation_result,
             t3512_value,
             t3502_value: None,
         });
