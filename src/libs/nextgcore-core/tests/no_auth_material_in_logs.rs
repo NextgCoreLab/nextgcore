@@ -1150,6 +1150,53 @@ fn no_log_macro_prints_a_callback_uri_whole() {
     );
 }
 
+/// #1047 review: a notification or callback struct names its URI field for
+/// what it is (`callback_uri`, `notification_uri`), never plain `uri`. A plain
+/// name hides every `item.uri` access, and every local copied from it, from
+/// the scan above. That is how eesd's `QueuedNotification.uri` and nrfd's
+/// `SbiNotifyRequest.uri` were logged whole.
+#[test]
+fn notification_structs_name_their_callback_uri() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut files = Vec::new();
+    rust_files(&src.join("bins"), &mut files);
+    rust_files(&src.join("libs"), &mut files);
+    let mut problems = Vec::new();
+    for file in &files {
+        let full = fs::read_to_string(file).unwrap_or_default();
+        let rel = file
+            .strip_prefix(&src)
+            .unwrap_or(file)
+            .display()
+            .to_string();
+        let text = blank_comments(&production(&full));
+        problems.extend(plain_uri_in_notification_structs(&rel, &text));
+    }
+    assert!(problems.is_empty(), "\n{}", problems.join("\n"));
+}
+
+/// Structs whose name says notification/callback and that have a plain `uri`
+/// (or `url`) field.
+fn plain_uri_in_notification_structs(rel: &str, text: &str) -> Vec<String> {
+    items(rel, text)
+        .into_iter()
+        .filter(|i| i.kind == "struct")
+        .filter(|i| {
+            let n = i.name.to_ascii_lowercase();
+            ["notif", "notify", "callback"]
+                .iter()
+                .any(|k| n.contains(k))
+        })
+        .filter(|i| i.fields.iter().any(|(f, _)| *f == "uri" || *f == "url"))
+        .map(|i| {
+            format!(
+                "{}::{}: a plain `uri` field holds a callback URI; name it callback_uri",
+                i.rel, i.name
+            )
+        })
+        .collect()
+}
+
 #[test]
 fn the_callback_uri_scan_sees_its_shapes() {
     for flagged in [
@@ -1218,5 +1265,19 @@ fn the_callback_uri_scan_sees_its_shapes() {
         vec!["uri"]
     );
     assert!(is_callback_key("smContextStatusUri") && is_callback_key("notificationDestination"));
+    // #1047 review, eesd: a plain `uri` field in a notification struct is refused,
+    // and a local copied from the renamed field is tracked.
+    let src = "pub struct QueuedNotification {\n    pub uri: String,\n    pub kind: &'static str,\n}\npub struct QueuedOk {\n    pub callback_uri: String,\n}\n";
+    assert_eq!(plain_uri_in_notification_structs("t.rs", src).len(), 1);
+    let src = "fn d() {\n    let target = dropped.callback_uri.clone();\n}\n";
+    let names: Vec<String> = tainted_bindings(src)
+        .into_iter()
+        .map(|(n, _, _)| n)
+        .collect();
+    assert_eq!(names, vec!["target"]);
+    assert_eq!(
+        unredacted_callback_uris("\"dropping {} to {}\", dropped.kind, dropped.callback_uri"),
+        vec!["dropped.callback_uri"]
+    );
     assert!(!is_callback_key("nfInstanceId") && !is_callback_key("apiRoot"));
 }

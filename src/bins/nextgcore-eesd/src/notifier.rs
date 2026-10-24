@@ -46,7 +46,8 @@ use tokio::sync::mpsc;
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueuedNotification {
     /// Absolute callback URI (`notificationDestination`) to POST to.
-    pub uri: String,
+    /// The consumer's callback URI; logged only redacted (#1047 review).
+    pub callback_uri: String,
     /// The serialized spec notification body (`application/json`).
     pub body: serde_json::Value,
     /// Schema name of `body` (e.g. `"ACRInfoNotification"`), for logs/metrics.
@@ -79,7 +80,7 @@ impl Notifier for QueueNotifier {
         log::info!(
             "notification queued (D5 stub — delivery lands in D6): kind={} uri={}",
             item.kind,
-            item.uri
+            nextgcore_sbi::log_redact::redact_last_segment(&item.callback_uri)
         );
         if let Ok(mut q) = self.queue.write() {
             q.push(item);
@@ -120,7 +121,11 @@ pub fn set_notifier(n: Arc<dyn Notifier>) {
 
 /// Build a [`QueuedNotification`] and hand it to the current notifier.
 pub fn enqueue(uri: String, body: serde_json::Value, kind: &'static str) {
-    notifier().enqueue(QueuedNotification { uri, body, kind });
+    notifier().enqueue(QueuedNotification {
+        callback_uri: uri,
+        body,
+        kind,
+    });
 }
 
 // ===========================================================================
@@ -212,7 +217,7 @@ impl Notifier for SbiNotifier {
             log::warn!(
                 "EES notifier dropping {} to {} ({reason})",
                 dropped.kind,
-                dropped.uri
+                nextgcore_sbi::log_redact::redact_last_segment(&dropped.callback_uri)
             );
             self.dropped.fetch_add(1, Ordering::SeqCst);
         }
@@ -240,7 +245,7 @@ pub fn install_sbi_notifier(config: SbiNotifierConfig) {
 /// background worker).
 async fn deliver(item: QueuedNotification, config: &SbiNotifierConfig, dropped: &AtomicU64) {
     let QueuedNotification {
-        uri: callback_uri,
+        callback_uri,
         body,
         kind,
     } = item;
@@ -385,18 +390,18 @@ mod tests {
         let n = QueueNotifier::default();
         assert!(n.drain().is_empty());
         n.enqueue(QueuedNotification {
-            uri: "http://cb/1".into(),
+            callback_uri: "http://cb/1".into(),
             body: serde_json::json!({"subId":"s1"}),
             kind: "ACRInfoNotification",
         });
         n.enqueue(QueuedNotification {
-            uri: "http://cb/2".into(),
+            callback_uri: "http://cb/2".into(),
             body: serde_json::json!({"subId":"s2"}),
             kind: "ACRInfoNotification",
         });
         let drained = n.drain();
         assert_eq!(drained.len(), 2);
-        assert_eq!(drained[0].uri, "http://cb/1");
+        assert_eq!(drained[0].callback_uri, "http://cb/1");
         // drain clears the queue.
         assert!(n.drain().is_empty());
     }
@@ -566,7 +571,7 @@ mod tests {
             ..Default::default()
         });
         n.enqueue(QueuedNotification {
-            uri: format!("http://127.0.0.1:{port}/acr-cb"),
+            callback_uri: format!("http://127.0.0.1:{port}/acr-cb"),
             body: notif_body(),
             kind: "ACRInfoNotification",
         });
@@ -609,7 +614,7 @@ mod tests {
             ..Default::default()
         });
         n.enqueue(QueuedNotification {
-            uri: format!("http://127.0.0.1:{port}/acr-cb"),
+            callback_uri: format!("http://127.0.0.1:{port}/acr-cb"),
             body: notif_body(),
             kind: "ACRInfoNotification",
         });
@@ -645,7 +650,7 @@ mod tests {
             ..Default::default()
         });
         n.enqueue(QueuedNotification {
-            uri: format!("http://127.0.0.1:{port}/acr-cb"),
+            callback_uri: format!("http://127.0.0.1:{port}/acr-cb"),
             body: notif_body(),
             kind: "ACRInfoNotification",
         });
@@ -689,7 +694,7 @@ mod tests {
         });
         let start = std::time::Instant::now();
         n.enqueue(QueuedNotification {
-            uri: format!("http://127.0.0.1:{port}/acr-cb"),
+            callback_uri: format!("http://127.0.0.1:{port}/acr-cb"),
             body: notif_body(),
             kind: "ACRInfoNotification",
         });

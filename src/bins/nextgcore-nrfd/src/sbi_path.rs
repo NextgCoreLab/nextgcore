@@ -204,7 +204,7 @@ async fn dispatch_notify_request_async(
          nf_instance={nf_instance_id})"
     );
 
-    let (host, port, path, scheme) = match parse_notification_uri(&notify_request.uri) {
+    let (host, port, path, scheme) = match parse_notification_uri(&notify_request.callback_uri) {
         Some(parts) => parts,
         None => {
             log::error!("Failed to parse notification URI: {logged_uri}");
@@ -383,7 +383,7 @@ pub fn nrf_nnrf_nfm_send_nf_status_notify(
     // with the last segment redacted, as the queued line below (#1026 review).
     log::debug!(
         "Sending NF status notify to {} (event={:?}, nf_instance={})",
-        nextgcore_sbi::log_redact::redact_last_segment(&request.uri),
+        nextgcore_sbi::log_redact::redact_last_segment(&request.callback_uri),
         event,
         nf_instance.nf_instance_id
     );
