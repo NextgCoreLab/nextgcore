@@ -6811,6 +6811,11 @@ mod oauth2_h8_tests {
 
     #[tokio::test]
     async fn test_oauth2_missing_token_rejected_401() {
+        // `start_server` re-initialises the process-global LMF context, which
+        // empties the cell registry: without the lock that raced every test
+        // that seeds coordinates (the a_capability_report_is_recorded_and_is_not_
+        // the_lpp_leg CI flake).
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let sk = p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
         let (server, port) = start_server(jwks_for(&sk, "nrf-es256")).await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
@@ -6827,6 +6832,11 @@ mod oauth2_h8_tests {
 
     #[tokio::test]
     async fn test_oauth2_wrong_audience_rejected_401() {
+        // `start_server` re-initialises the process-global LMF context, which
+        // empties the cell registry: without the lock that raced every test
+        // that seeds coordinates (the a_capability_report_is_recorded_and_is_not_
+        // the_lpp_leg CI flake).
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let sk = p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
         let (server, port) = start_server(jwks_for(&sk, "nrf-es256")).await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
@@ -6843,6 +6853,11 @@ mod oauth2_h8_tests {
 
     #[tokio::test]
     async fn test_oauth2_valid_token_reaches_handler() {
+        // `start_server` re-initialises the process-global LMF context, which
+        // empties the cell registry: without the lock that raced every test
+        // that seeds coordinates (the a_capability_report_is_recorded_and_is_not_
+        // the_lpp_leg CI flake).
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let sk = p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
         let (server, port) = start_server(jwks_for(&sk, "nrf-es256")).await;
         let client = SbiClient::with_host_port("127.0.0.1", port);

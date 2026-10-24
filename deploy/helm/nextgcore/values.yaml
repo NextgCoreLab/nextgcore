@@ -176,6 +176,10 @@ smf:
 upf:
   enabled: true
   replicas: 1
+  # CP functions allowed to set up the N4 association (#968): IPs, CIDRs or host
+  # names, comma-separated. Empty uses the SMF's headless PFCP Service. The UPF
+  # refuses every association when this resolves to nothing.
+  pfcpAllowedPeers: ""
   image:
     repository: nextgcore-rust/upf
     tag: latest
