@@ -1566,8 +1566,9 @@ pub(crate) fn record_pending_erab_modification_for_test(
 }
 
 /// Send the Modify Bearer Request of an E-UTRAN initiated E-RAB modification
-/// (TS 23.401 §5.4.7 step 2) for the bearers `ebis` of `mme_ue_id`, whose eNB
-/// endpoints the caller has already stored, and park `pending` until the
+/// (TS 23.401 §5.4.7 step 2) for the bearers of `pending.switched`, carrying
+/// their NEW eNB endpoints from that list (the bearer contexts are written only
+/// when the Serving GW accepts them, #736), and park `pending` until the
 /// response arrives. Returns the request's sequence number.
 pub fn send_modify_bearer_request_for_erab_modification(
     ctx: &MmeContext,
@@ -1772,6 +1773,15 @@ fn pending_change_notifications() -> &'static Mutex<HashMap<u32, u64>> {
 }
 
 /// Take the session the Change Notification Request at `seq` reported.
+/// Whether a Change Notification at `seq` is still parked. Test/diagnostic.
+#[cfg(test)]
+pub fn change_notification_pending(seq: u32) -> bool {
+    pending_change_notifications()
+        .lock()
+        .map(|m| m.contains_key(&seq))
+        .unwrap_or(false)
+}
+
 pub fn take_pending_change_notification(seq: u32) -> Option<u64> {
     pending_change_notifications().lock().ok()?.remove(&seq)
 }
