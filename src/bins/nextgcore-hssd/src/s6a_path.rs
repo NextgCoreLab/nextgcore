@@ -420,7 +420,25 @@ pub struct PendingRequest {
     /// True while the peer is disconnected: the request waits for reconnection
     /// rather than counting down its retries against a socket that does not exist.
     pub awaiting_peer: bool,
+    /// When the request was first sent to a connected peer since it last
+    /// waited for one; `None` while it waits (#967 review). Bounds its
+    /// lifetime in service ([`HSS_INITIATED_MAX_AGE`]) once "busy" answers no
+    /// longer spend attempts. A request queued for a disconnected MME is not
+    /// aged at all (the #56 requeue), and its clock restarts when it is
+    /// delivered on reconnect.
+    pub in_service_since: Option<std::time::Instant>,
+    /// DIAMETER_TOO_BUSY / UNABLE_TO_DELIVER answers received (#899 review).
+    pub busy_answers: u32,
 }
+
+/// The longest an HSS-initiated request is kept in service with a connected
+/// MME, whatever its answers (#899 review). Time spent waiting for a
+/// disconnected MME does not count (#967 review). A 3004/3002 answer (an MME whose re-established connection is still
+/// in RFC 3539 REOPEN) does not spend one of the [`HSS_INITIATED_MAX_ATTEMPTS`],
+/// so this is what bounds a peer that is busy forever. Five minutes covers
+/// several REOPEN periods of the MME's default Tw (30 s), including a lost
+/// watchdog answer, with room to spare.
+pub const HSS_INITIATED_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(300);
 
 type PendingTable = HashMap<String, PendingRequest>;
 
@@ -471,6 +489,8 @@ fn send_tracked(dest_host: &str, msg: DiameterMessage) -> Result<(), String> {
                 attempts: if awaiting_peer { 0 } else { 1 },
                 last_sent: std::time::Instant::now(),
                 awaiting_peer,
+                in_service_since: (!awaiting_peer).then(std::time::Instant::now),
+                busy_answers: 0,
             },
         );
     }
@@ -561,7 +581,8 @@ pub fn sweep_pending_requests() -> (usize, usize) {
     // Decide under the read lock, act after it drops: `send_to_mme` takes the peer
     // registry lock, and holding the pending-table write lock across it is the
     // AB-BA shape this crate already documents elsewhere.
-    let decisions: Vec<(String, PendingAction)> = {
+    // (Session-Id, action, abandoned by the age cap, waiting for its peer).
+    let decisions: Vec<(String, PendingAction, bool, bool)> = {
         let pending = match pending_requests().read() {
             Ok(p) => p,
             Err(_) => return (0, 0),
@@ -569,24 +590,45 @@ pub fn sweep_pending_requests() -> (usize, usize) {
         pending
             .values()
             .map(|req| {
-                let action = decide_pending_action(
-                    req.attempts,
-                    now.saturating_duration_since(req.last_sent),
-                    peer_connected(&req.dest_host),
-                    req.awaiting_peer,
-                    period,
-                    HSS_INITIATED_MAX_ATTEMPTS,
-                );
-                (req.session_id.clone(), action)
+                let connected = peer_connected(&req.dest_host);
+                // #967 review: a request waiting for its peer is not aged; the
+                // age cap only bounds a connected peer that keeps answering busy.
+                let waiting = req.awaiting_peer || !connected;
+                let aged = !waiting
+                    && req
+                        .in_service_since
+                        .is_some_and(|t| now.saturating_duration_since(t) >= HSS_INITIATED_MAX_AGE);
+                let action = if aged {
+                    PendingAction::Abandon
+                } else {
+                    decide_pending_action(
+                        req.attempts,
+                        now.saturating_duration_since(req.last_sent),
+                        connected,
+                        req.awaiting_peer,
+                        period,
+                        HSS_INITIATED_MAX_ATTEMPTS,
+                    )
+                };
+                (req.session_id.clone(), action, aged, waiting)
             })
             .collect()
     };
 
     let mut retransmitted = 0usize;
     let mut abandoned = 0usize;
-    for (session_id, action) in decisions {
+    for (session_id, action, aged, waiting) in decisions {
         match action {
-            PendingAction::Wait => {}
+            PendingAction::Wait => {
+                // Its clock restarts when it is next sent to a connected peer.
+                if waiting {
+                    if let Ok(mut pending) = pending_requests().write() {
+                        if let Some(req) = pending.get_mut(&session_id) {
+                            req.in_service_since = None;
+                        }
+                    }
+                }
+            }
             PendingAction::Retransmit => {
                 let to_send = {
                     let pending = pending_requests()
@@ -603,6 +645,7 @@ pub fn sweep_pending_requests() -> (usize, usize) {
                                 if let Some(req) = pending.get_mut(&session_id) {
                                     req.attempts += 1;
                                     req.last_sent = std::time::Instant::now();
+                                    req.in_service_since.get_or_insert(req.last_sent);
                                 }
                             }
                             retransmitted += 1;
@@ -614,6 +657,7 @@ pub fn sweep_pending_requests() -> (usize, usize) {
                             if let Ok(mut pending) = pending_requests().write() {
                                 if let Some(req) = pending.get_mut(&session_id) {
                                     req.awaiting_peer = true;
+                                    req.in_service_since = None;
                                 }
                             }
                             log::warn!("S6a retransmission to {dest_host} deferred: {e}");
@@ -624,6 +668,20 @@ pub fn sweep_pending_requests() -> (usize, usize) {
             PendingAction::Abandon => {
                 if let Some(req) = complete_pending(&session_id) {
                     abandoned += 1;
+                    if aged {
+                        log::error!(
+                            "S6a request (cmd={}) to {} abandoned: in service for the age cap \
+                             ({HSS_INITIATED_MAX_AGE:?}) with {} DIAMETER_TOO_BUSY / \
+                             UNABLE_TO_DELIVER answer(s) (an MME connection held in RFC 3539 \
+                             REOPEN) and {} unanswered attempt(s). MME subscriber state may \
+                             now diverge from the HSS",
+                            req.command_code,
+                            req.dest_host,
+                            req.busy_answers,
+                            req.attempts
+                        );
+                        continue;
+                    }
                     log::error!(
                         "S6a request (cmd={}) to {} abandoned after {} attempts with no answer: \
                          MME subscriber state may now diverge from the HSS",
@@ -667,6 +725,8 @@ pub fn requeue_for_peer(dest_host: &str) -> usize {
                     req.awaiting_peer = false;
                     req.attempts += 1;
                     req.last_sent = std::time::Instant::now();
+                    // #967 review: the age clock starts with the delivery.
+                    req.in_service_since = Some(req.last_sent);
                 }
             }
             sent += 1;
@@ -794,7 +854,8 @@ pub fn handle_air(
     if let Some((auts_rand, auts)) = resync {
         log::debug!("[{imsi_bcd}] Performing AUTS-based SQN re-synchronisation");
         let sqn_ms = process_resync(&opc, &auth_info.k, &auts_rand, &auts)?;
-        log::debug!("[{imsi_bcd}] Re-sync OK: SQN_HE={sqn:#x} -> SQN_MS={sqn_ms:#x}");
+        // SQN values are authentication state: never logged.
+        log::debug!("[{imsi_bcd}] Re-sync OK");
         sqn = sqn_ms;
     }
 
@@ -1426,6 +1487,17 @@ pub fn handle_s6a_answer(answer: &DiameterMessage) {
              retransmitted in {HSS_INITIATED_RETRANSMIT_SECS} s",
             answer.header.command_code
         );
+        // Not an attempt spent: the request was not served. It is retransmitted
+        // at the next period, and HSS_INITIATED_MAX_AGE bounds a peer that stays
+        // busy.
+        if let Some(sid) = message_session_id(answer) {
+            if let Ok(mut pending) = pending_requests().write() {
+                if let Some(req) = pending.get_mut(&sid) {
+                    req.attempts = req.attempts.saturating_sub(1);
+                    req.busy_answers += 1;
+                }
+            }
+        }
         return;
     }
     let correlated = message_session_id(answer).and_then(|sid| complete_pending(&sid));
@@ -3212,8 +3284,142 @@ mod tests {
                 1,
                 "{code}: kept for retransmission"
             );
+            let req = pending_requests()
+                .read()
+                .unwrap()
+                .values()
+                .next()
+                .cloned()
+                .unwrap();
+            assert_eq!(
+                req.attempts, 0,
+                "{code}: not an attempt spent (#899 review)"
+            );
+            assert_eq!(req.busy_answers, 1);
+            // Past the age cap, the sweep abandons it whatever its attempts.
+            if let Some(r) = pending_requests().write().unwrap().values_mut().next() {
+                r.in_service_since = Some(std::time::Instant::now() - HSS_INITIATED_MAX_AGE);
+            }
+            let (_, abandoned) = sweep_pending_requests();
+            assert_eq!(abandoned, 1, "{code}: bounded by age");
             unregister_mme_peer(host);
         }
+        clear_pending_requests();
+    }
+
+    /// The single outstanding request (tests hold `PEER_TEST_LOCK`).
+    fn only_pending() -> PendingRequest {
+        pending_requests()
+            .read()
+            .unwrap()
+            .values()
+            .next()
+            .cloned()
+            .expect("one outstanding request")
+    }
+
+    fn rewind_age(by: std::time::Duration) {
+        if let Some(r) = pending_requests().write().unwrap().values_mut().next() {
+            r.in_service_since = Some(std::time::Instant::now() - by);
+            r.last_sent = std::time::Instant::now() - by.min(secs(29));
+        }
+    }
+
+    /// #967 review MAJOR: a CLR queued for a disconnected MME is not aged while
+    /// it waits, however long the outage (the #56 requeue), and is delivered on
+    /// reconnect. Before, its clock started when it was parked, and the sweep
+    /// abandoned it at 300 s with the MME still down.
+    #[tokio::test]
+    async fn a_clr_queued_through_a_long_outage_is_not_aged_and_is_delivered_on_reconnect() {
+        let _guard = PEER_TEST_LOCK.lock().expect("peer test lock");
+        disarm_restart_reset();
+        clear_pending_requests();
+        let host = "mme-outage.epc.example.org";
+        let clr = build_clr_request(
+            "001010000000967",
+            host,
+            "epc.example.org",
+            CancellationType::SubscriptionWithdrawal,
+            None,
+        );
+        send_tracked(host, clr).expect("queued");
+        assert_eq!(only_pending().in_service_since, None, "not in service yet");
+        // Even a clock already past the cap does not age a waiting request.
+        rewind_age(HSS_INITIATED_MAX_AGE + secs(600));
+        let (_, abandoned) = sweep_pending_requests();
+        assert_eq!(abandoned, 0, "waiting for its peer: not aged");
+        assert_eq!(pending_request_count(), 1);
+        assert_eq!(only_pending().in_service_since, None, "the clock restarts");
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        register_mme_peer(host, tx);
+        let delivered = rx.try_recv().expect("delivered on reconnect");
+        assert_eq!(
+            delivered.header.command_code,
+            nextgcore_diameter::s6a::cmd::CANCEL_LOCATION
+        );
+        let (_, abandoned) = sweep_pending_requests();
+        assert_eq!(abandoned, 0);
+        assert_eq!(pending_request_count(), 1, "outstanding until answered");
+        unregister_mme_peer(host);
+        clear_pending_requests();
+    }
+
+    /// #967 review MAJOR: the age clock starts when a parked request is
+    /// delivered on reconnect, so a CLR parked for most of the cap still gets
+    /// the whole cap to ride out the MME's REOPEN (3004 answers). Before, a CLR
+    /// parked 290 s was dropped 11 s after one 3004.
+    #[tokio::test]
+    async fn a_parked_clr_gets_the_full_age_cap_after_reconnect() {
+        let _guard = PEER_TEST_LOCK.lock().expect("peer test lock");
+        disarm_restart_reset();
+        clear_pending_requests();
+        let host = "mme-parked.epc.example.org";
+        let clr = build_clr_request(
+            "001010000000968",
+            host,
+            "epc.example.org",
+            CancellationType::SubscriptionWithdrawal,
+            None,
+        );
+        send_tracked(host, clr).expect("queued");
+        // A clock that ran through 290 s of outage, as it did before the fix.
+        rewind_age(secs(290));
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        register_mme_peer(host, tx);
+        let sent = rx.try_recv().expect("delivered on reconnect");
+        let since = only_pending().in_service_since.expect("in service");
+        assert!(
+            since.elapsed() < secs(5),
+            "the clock starts at the delivery"
+        );
+
+        // The MME is still in REOPEN.
+        let mut busy = DiameterMessage::new_answer(&sent);
+        busy.header.set_error();
+        busy.add_avp(Avp::mandatory(
+            avp_code::SESSION_ID,
+            AvpData::Utf8String(sent.session_id().unwrap().to_string()),
+        ));
+        busy.add_avp(Avp::mandatory(
+            avp_code::RESULT_CODE,
+            AvpData::Unsigned32(RESULT_TOO_BUSY),
+        ));
+        handle_s6a_answer(&busy);
+        // 11 s later.
+        if let Some(r) = pending_requests().write().unwrap().values_mut().next() {
+            r.in_service_since = Some(since - secs(11));
+        }
+        let (_, abandoned) = sweep_pending_requests();
+        assert_eq!(abandoned, 0, "11 s in service is far inside the cap");
+        assert_eq!(pending_request_count(), 1);
+
+        // The cap still bounds a peer that stays busy.
+        rewind_age(HSS_INITIATED_MAX_AGE);
+        let (_, abandoned) = sweep_pending_requests();
+        assert_eq!(abandoned, 1, "bounded by age in service");
+        unregister_mme_peer(host);
         clear_pending_requests();
     }
 

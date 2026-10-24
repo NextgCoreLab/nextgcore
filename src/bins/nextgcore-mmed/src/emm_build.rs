@@ -686,7 +686,12 @@ pub fn build_tau_accept(
     if eps_bearer_status != 0 {
         buf.write_u8(0x57); // EPS bearer context status IEI
         buf.write_u8(2); // Length
-        buf.write_u16(eps_bearer_status);
+                         // TS 24.301 §9.9.2.1: octet 3 holds EBI(7)..EBI(0), octet 4 EBI(15)..
+                         // EBI(8). The bitmap has bit n for EBI n, so the LOW byte goes first: a
+                         // big-endian u16 put EBIs 5-7 where the UE reads EBIs 13-15, and a UE
+                         // deactivates the bearers the status leaves out (§5.5.3.2.4) (#961).
+        buf.write_u8((eps_bearer_status & 0xff) as u8);
+        buf.write_u8((eps_bearer_status >> 8) as u8);
     }
 
     buf.into_vec()
@@ -1074,7 +1079,9 @@ mod tests {
             .position(|w| w[0] == 0x57)
             .expect("the EPS bearer context status IE must be present");
         assert_eq!(msg[iei + 1], 2, "the IE is two octets long");
-        assert_eq!(u16::from_be_bytes([msg[iei + 2], msg[iei + 3]]), status);
+        // TS 24.301 §9.9.2.1: octet 3 is EBI(7)..EBI(0), octet 4 EBI(15)..EBI(8).
+        assert_eq!(msg[iei + 2], (1 << 5) | (1 << 6), "EBIs 5 and 6 in octet 3");
+        assert_eq!(msg[iei + 3], 0, "nothing in EBI 8-15");
     }
 
     /// EBIs 0-4 are reserved (TS 24.007 §11.2.3.1.5), so they can never appear in the

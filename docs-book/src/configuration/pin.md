@@ -35,7 +35,7 @@ The docker deployment mounts this file at `/etc/nextgcore/pin.yaml` (read-only) 
 
 Because the daemon never reads the file, **every field in the shipped example YAML is decorative**:
 
-- **`logger.level` is inert.** The log level comes from the CLI flag `-e/--log-level` (default `info`) or the `RUST_LOG` environment variable.
+- **`logger.level` is read.** The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691).
 - **`pin.sbi.server[]` (address/advertise/port) is inert.** The SBI bind address and port come from `--sbi-addr`/`--sbi-port`. Note the example file says port `7777` while the docker deployment actually launches the daemon with `--sbi-port 7815` — the YAML value is not consulted.
 - **`pin.nrf.uri` is inert.** The NRF location comes from `--nrf-uri`, and is used only to locate the NRF JWKS endpoint when OAuth2 enforcement is on (the daemon does not register with the NRF at all).
 
@@ -47,7 +47,7 @@ From the clap `Args` struct in `src/bins/nextgcore-pind/src/main.rs`:
 |---|---|---|---|
 | `-c, --config` | path | `/etc/nextgcore/pin.yaml` | Configuration file path. **Accepted but never read** — the daemon performs no YAML parsing. |
 | `-l, --log-file` | path | unset | Declared but not applied — the field is never read after parsing; logging goes to env_logger's default output. |
-| `-e, --log-level` | string | `info` | Log level, used as the env_logger default filter. `RUST_LOG`, when set, takes precedence. |
+| `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-m, --no-color` | flag | off | Declared but not applied — the field is never read after parsing. |
 | `--sbi-addr` | string | `0.0.0.0` | Server bind address (docker passes `172.23.0.35`). |
 | `--sbi-port` | u16 | `7815` | Server port. The docker deployment also uses `7815` (not `7777` like most NFs). |

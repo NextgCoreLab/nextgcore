@@ -73,6 +73,11 @@ docker compose -f docker-compose-epc.yml up -d
 docker compose -f docker-compose-epc.yml ps
 ./epc-attach-check.sh 10.45.0.1 20
 
+# Idle mode as well (#956): S1 release, mobile-originated and network-triggered
+# SERVICE REQUEST. Needs an eNB with a user-inactivity release and LTE paging
+# (nextgsim #350, #351); off by default until then.
+EPC_IDLE_MODE=1 ./epc-attach-check.sh 10.45.0.1 20
+
 # View logs
 docker compose -f docker-compose-epc.yml logs -f
 ```
@@ -178,12 +183,13 @@ docker compose up -d amf smf upf gnb ue
 
 ### Environment Variables
 
-There is no `.env` file; the compose files set each NF's environment inline.
+The compose files set each NF's environment inline. `docker/rust/.env` (gitignored) holds the one secret compose needs, `GRAFANA_ADMIN_PASSWORD`.
 Common ones:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `RUST_LOG` | Log filter. Honoured by 13 of the 28 NFs; the others take `--log-level` only (#691) | `info` |
+| `GRAFANA_ADMIN_PASSWORD` | Grafana `admin` password. **Required**: `docker compose` refuses to start without it (#837); put `GRAFANA_ADMIN_PASSWORD=...` in `docker/rust/.env` (gitignored) | none |
+| `RUST_LOG` | Log filter for every NF (env_logger syntax, e.g. `info,nextgcore_amfd=debug`). When set and not blank it replaces the NF's level entirely; unset, the level is `--log-level`, else the config's `logger.level`, else `info`, for all targets (#691) | `info` |
 | `NEXTGCORE_SBI_PROFILE` | SBI security profile for amf/smf/ausf/udm; the compose files set `dev` (h2c, no mTLS) | `production` when unset |
 | `NEXTGCORE_SBI_OAUTH2_REQUIRE` | Force OAuth2 enforcement on an NF's SBI server (the `oauth2` overlay sets it) | unset |
 
@@ -368,6 +374,14 @@ services:
 
 ### Port Mappings
 
+Host publishes are bound to `127.0.0.1` in both compose files; the NFs, the
+simulated RAN and the UEs talk over the compose networks and need none of them.
+The TCP tools (mongosh, the NRF SBI, Prometheus, Grafana, Jaeger) can be reached
+from another machine through an SSH tunnel. An SSH tunnel does not carry SCTP or
+GTP-U, so a real external eNB/gNB uses the opt-in `NEXTGCORE_RAN_PUBLISH_ADDR`
+instead (#837): set it to the host's address on the private RAN-facing interface
+(not `0.0.0.0`), and only the S1AP/NGAP and GTP-U publishes follow it.
+
 | Service | Protocol | Port | Description |
 |---------|----------|------|-------------|
 | NRF | HTTP/2 | 7777 | SBI interface |
@@ -385,7 +399,7 @@ services:
 | HSS | TCP | 3868 | Diameter (S6a) |
 | MongoDB | TCP | 27017 | Database |
 | Prometheus | TCP | 9090 | Metrics |
-| Grafana | TCP | 3000 | Dashboards (admin/nextgcore) |
+| Grafana | TCP | 3000 | Dashboards, on 127.0.0.1 only. Login `admin` with the password you set as `GRAFANA_ADMIN_PASSWORD` |
 | Jaeger | TCP | 16686 | Tracing UI |
 
 ## Validation

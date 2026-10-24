@@ -378,8 +378,14 @@ async fn run_session(
                 // the sender keeps it and retries; a silent drop leaves the
                 // sender to its own retransmission timer, and hssd's runs out
                 // after three attempts 30 s apart. REOPEN here normally lasts
-                // three watchdog round trips (each DWA asks for the next proof
-                // at once), but can last a Tw or more against a slow peer.
+                // three watchdog round trips: the first DWR goes the moment the
+                // connection is up (`run_session`, not after Tw) and each DWA asks
+                // for the next proof at once
+                // (`a_reopened_connection_returns_to_service_well_within_tw`). A
+                // late DWA, one arriving within the grace Tw after an expiry
+                // (NumDWA = -1, no new DWR), adds up to one Tw; a lost one closes
+                // the connection at the next expiry, about 2·Tw after the DWR
+                // (RFC 3539 §3.4.1). A slow peer adds a round trip per watchdog.
                 // Base-protocol messages (DWR, DPR) still reach the state
                 // machine, which must answer them.
                 if !watchdog.carries_traffic()
@@ -1458,6 +1464,54 @@ mod tests {
             .unwrap()
             .expect("the retry, in service, is delivered");
         assert_eq!(delivered.session_id(), Some("hss;899;1"));
+    }
+
+    /// #899 review: REOPEN does not wait a Tw for its first watchdog. With Tw =
+    /// 2 s, the three DWR/DWA exchanges and the held AIR complete in well under
+    /// one Tw.
+    #[tokio::test]
+    async fn a_reopened_connection_returns_to_service_well_within_tw() {
+        let listener = DiameterListener::bind(([127, 0, 0, 1], 0).into())
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cfg = config("hss.example.com", 30);
+        let _hss = tokio::spawn(async move {
+            let transport = listener.accept().await.unwrap();
+            let mut peer = DiameterPeer::new_responder(transport, &cfg);
+            peer.start().await.unwrap();
+            let _cer = peer.next_event().await.unwrap();
+            while let Ok(msg) = peer.recv_raw().await {
+                if msg.header.command_code == AIR {
+                    let mut answer = DiameterMessage::new_answer(&msg);
+                    answer.add_avp(Avp::mandatory(268, AvpData::Unsigned32(2001)));
+                    peer.send_message(&answer).await.unwrap();
+                } else if peer.handle_message(msg).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let mut client = DiameterClient::new(config("mme.example.com", 5), addr);
+        client.connect().await.unwrap();
+        let tw = Duration::from_secs(2);
+        let (session, _reader) = DiameterSession::start_with(
+            client,
+            SessionOptions {
+                tw,
+                start: WatchdogStart::Reopen,
+            },
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        session
+            .send_request(&DiameterMessage::new_request(AIR, S6A_APP))
+            .await
+            .expect("answered once back in service");
+        assert!(
+            started.elapsed() < tw / 2,
+            "REOPEN took {:?}, not three round trips",
+            started.elapsed()
+        );
     }
 
     /// RFC 3539 §3.4.1 REOPEN: a re-established connection whose peer does not

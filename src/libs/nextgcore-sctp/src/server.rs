@@ -101,6 +101,10 @@ pub enum ServerEvent {
     },
     /// Association closed
     AssociationClosed { association_id: u64, reason: String },
+    /// The peer restarted the association (RFC 9260 §5.2.2; kernel `SCTP_RESTART`): the
+    /// association id is unchanged, but the peer is a new endpoint instance and the stream
+    /// counts were negotiated afresh, so nothing cached about the old instance holds.
+    AssociationRestarted { association_id: u64 },
     /// Data received from an association
     DataReceived {
         association_id: u64,
@@ -526,6 +530,16 @@ impl SctpServer {
             }
         }
         Ok(())
+    }
+
+    /// The negotiated number of outbound streams of `association_id` (RFC 9260 §5.1.1):
+    /// stream identifiers `0..n` are valid toward the peer. `None` for an unknown
+    /// association (#813).
+    pub fn outbound_streams(&self, association_id: u64) -> Option<u16> {
+        let handle = self.id_to_handle.get(&association_id)?;
+        self.associations
+            .get(handle)
+            .map(|managed| managed.association.max_num_outbound_streams())
     }
 
     /// Send data to a specific association with the server's configured PPID
