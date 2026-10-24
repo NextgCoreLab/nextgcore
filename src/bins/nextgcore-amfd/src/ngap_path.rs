@@ -5776,6 +5776,10 @@ impl NgapServer {
     /// arrives under a fresh id (#518, #609).
     fn rekey_ue_sessions(&mut self, old_id: u64, new_id: u64) {
         self.sbi_offload.rekey_ue(old_id, new_id);
+        // #778 follow-up: the old ID's NG connection is gone, so what was active on it
+        // is not active on the new one; each session the new connection sets up marks
+        // itself again.
+        self.clear_up_active_for_ue(old_id);
         {
             let ctx = crate::context::amf_self();
             let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
@@ -13033,6 +13037,11 @@ impl NgapServer {
             );
         }
         let sessions_relayed = self.complete_handover_at_smfs(ue, &handed_over);
+        // #778 follow-up: on the target only the handed-over sessions have a user plane.
+        // A session the HANDOVER COMMAND released, or the target never admitted, does
+        // not, so a later downlink-data setup for it must be sent, not suppressed.
+        self.up_active
+            .retain(|(u, psi)| *u != ue || handed_over.contains(psi));
         self.handover_target_transfers.retain(|(u, _), _| *u != ue);
         if let Some(psis) = self.handover_target_release_psis.remove(&ue) {
             match crate::ngap_asn1::build_pdu_session_resource_release_command_asn1(
@@ -14481,6 +14490,11 @@ impl NgapServer {
         let (racs_id, _) = self.racs_ies_for(amf_ue_ngap_id);
         match ack_bytes {
             Some(bytes) => {
+                // #778 follow-up: the sessions this Acknowledge releases have no user
+                // plane on the target.
+                for psi in &not_switched {
+                    self.clear_up_active(amf_ue_ngap_id, *psi);
+                }
                 // #570: the UE Radio Capability ID, when the UE has one (TS 38.413 §9.2.3.9).
                 let bytes = crate::racs::add_capability_ies(bytes, racs_id.as_deref(), None);
                 self.send_to_association(association_id, &bytes).await?;
@@ -14557,6 +14571,7 @@ impl NgapServer {
     ) -> Result<()> {
         use crate::ngap_asn1::InitialContextSetupOutcomeDecode::{Decoded, Failed, Undecodable};
         let ics_setup_sessions: Vec<(u8, Vec<u8>)>;
+        let ics_failed_sessions: Vec<(u8, Vec<u8>)>;
         let (amf_ue_ngap_id, ran_ue_ngap_id) =
             match crate::ngap_asn1::decode_initial_context_setup_response_asn1(data) {
                 Decoded {
@@ -14564,9 +14579,11 @@ impl NgapServer {
                     ran_ue_ngap_id,
                     error_indication,
                     setup_sessions,
+                    failed_sessions,
                     ..
                 } => {
                     ics_setup_sessions = setup_sessions;
+                    ics_failed_sessions = failed_sessions;
                     // Best effort: the report must not stop the procedure.
                     if let Some(report) = error_indication {
                         if let Err(e) = self
@@ -14617,6 +14634,22 @@ impl NgapServer {
                 "PDU_RES_SETUP_RSP",
                 transfer,
                 "InitialContextSetupResponse",
+            )
+            .await;
+        }
+        // #778 follow-up: a session the gNB could not set up (TS 38.413 §8.3.1.2, the
+        // PDU Session Resource Failed to Setup List) has no user plane on this connection
+        // -- so a later downlink-data setup for it must not be suppressed -- and its SMF
+        // is told, with the gNB's Unsuccessful Transfer, so it stops forwarding to a
+        // tunnel that does not exist (TS 23.502 §4.2.3.2 step 12).
+        for (psi, transfer) in &ics_failed_sessions {
+            self.clear_up_active(amf_ue_ngap_id, *psi);
+            self.relay_n2_sm_to_smf(
+                amf_ue_ngap_id,
+                *psi,
+                "PDU_RES_SETUP_FAIL",
+                transfer,
+                "InitialContextSetupResponse (failed to set up)",
             )
             .await;
         }
@@ -15552,6 +15585,8 @@ impl NgapServer {
             .await;
         }
         for item in &notify.released_list {
+            // #778 follow-up: the NG-RAN released the session's resources.
+            self.clear_up_active(notify.amf_ue_ngap_id, item.pdu_session_id);
             // #582, TS 23.502 §4.3.4.2 step 1d -> 3a -> 4: when the SMF releases the
             // session the NG-RAN reported released, its answer carries the PDU Session
             // Release Command and no N2 resource release (the NG-RAN's resources are
@@ -25863,6 +25898,169 @@ mod tests {
             "A's preparation is cancelled before B's PREPARING"
         );
         server.forget_ue(ue);
+    }
+
+    /// An INITIAL CONTEXT SETUP RESPONSE for `(amf, ran)` setting up `setup` and failing
+    /// `failed`, each session's transfer the one octet `[psi]` (generated codec).
+    fn ics_response_pdu(amf: u64, ran: u32, setup: &[u8], failed: &[u8]) -> Vec<u8> {
+        use g::InitialContextSetupResponseProtocolIEs_EntryValue as Ie;
+        use nextgcore_ngap_gen::generated as g;
+        let entry = |id: u16, value| g::InitialContextSetupResponseProtocolIEs_Entry {
+            id: g::ProtocolIE_ID(id),
+            criticality: g::Criticality(g::Criticality::IGNORE),
+            value,
+        };
+        let mut ies = vec![
+            entry(
+                g::ID_AMF_UE_NGAP_ID,
+                Ie::Id_AMF_UE_NGAP_ID(g::AMF_UE_NGAP_ID(amf)),
+            ),
+            entry(
+                g::ID_RAN_UE_NGAP_ID,
+                Ie::Id_RAN_UE_NGAP_ID(g::RAN_UE_NGAP_ID(ran)),
+            ),
+        ];
+        if !setup.is_empty() {
+            ies.push(entry(
+                g::ID_PDU_SESSION_RESOURCE_SETUP_LIST_CXT_RES,
+                Ie::Id_PDUSessionResourceSetupListCxtRes(g::PDUSessionResourceSetupListCxtRes(
+                    setup
+                        .iter()
+                        .map(|&psi| g::PDUSessionResourceSetupItemCxtRes {
+                            pdu_session_id: g::PDUSessionID(psi),
+                            pdu_session_resource_setup_response_transfer:
+                                g::PDUSessionResourceSetupItemCxtResPDUSessionResourceSetupResponseTransfer(
+                                    vec![psi],
+                                ),
+                            ie_extensions: None,
+                        })
+                        .collect(),
+                )),
+            ));
+        }
+        if !failed.is_empty() {
+            ies.push(entry(
+                g::ID_PDU_SESSION_RESOURCE_FAILED_TO_SETUP_LIST_CXT_RES,
+                Ie::Id_PDUSessionResourceFailedToSetupListCxtRes(
+                    g::PDUSessionResourceFailedToSetupListCxtRes(
+                        failed
+                            .iter()
+                            .map(|&psi| g::PDUSessionResourceFailedToSetupItemCxtRes {
+                                pdu_session_id: g::PDUSessionID(psi),
+                                pdu_session_resource_setup_unsuccessful_transfer:
+                                    g::PDUSessionResourceFailedToSetupItemCxtResPDUSessionResourceSetupUnsuccessfulTransfer(
+                                        vec![psi],
+                                    ),
+                                ie_extensions: None,
+                            })
+                            .collect(),
+                    ),
+                ),
+            ));
+        }
+        nextgcore_ngap_gen::encode(&g::NGAP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
+            procedure_code: g::ProcedureCode(g::ID_INITIAL_CONTEXT_SETUP),
+            criticality: g::Criticality(g::Criticality::REJECT),
+            value: g::SuccessfulOutcomeValue::Id_InitialContextSetup(
+                g::InitialContextSetupResponse {
+                    protocol_i_es: g::InitialContextSetupResponseProtocolIEs(ies),
+                },
+            ),
+        }))
+        .expect("encode InitialContextSetupResponse")
+    }
+
+    /// **#778 review follow-up.** The per-session "user plane active on this NG
+    /// connection" flag ends where the user plane does, so a later downlink-data setup
+    /// for the session is sent rather than suppressed:
+    /// - a session in an Initial Context Setup Response's Failed to Setup List -- whose
+    ///   SMF is now also told, `PDU_RES_SETUP_FAIL` with the gNB's transfer (it used to
+    ///   hear nothing: the list was never decoded);
+    /// - a session a PDU Session Resource Notify reports released;
+    /// - every session of an AMF UE NGAP ID a Service Request re-keys away from;
+    /// - at a Handover Notify, every session the handover did not carry.
+    ///
+    /// REVERT-VERIFIED: without each clear, its assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_up_active_flag_ends_where_the_user_plane_does() {
+        let (_smf, smf_port, seen) = handover_smf().await;
+        let mut server = capturing_ngap_server().await;
+        let (assoc, target) = (97_778u64, 97_779u64);
+        seed_gnb_session(&server, assoc).await;
+        seed_gnb_session(&server, target).await;
+        let ue = 7_778_101u64;
+        let mut state = UeNasContext::new(ue, 11, assoc, false);
+        state.registered = true;
+        server.ue_auth_state.insert(ue, state);
+        for psi in 1u8..=4 {
+            server
+                .sm_context_refs
+                .insert((ue, psi), format!("up778-{psi}"));
+            server
+                .sm_context_smfs
+                .insert((ue, psi), ("127.0.0.1".to_string(), smf_port));
+            server.mark_up_active(ue, psi);
+        }
+
+        // The ICS sets up PSI 1 and fails PSI 2.
+        server
+            .handle_initial_context_setup_response(assoc, &ics_response_pdu(ue, 11, &[1], &[2]))
+            .await
+            .expect("handled");
+        assert!(server.up_active.contains(&(ue, 1)));
+        assert!(!server.up_active.contains(&(ue, 2)), "the failed session");
+        assert!(
+            seen.lock()
+                .expect("sink")
+                .iter()
+                .any(|s| s.0 == "up778-2" && s.2 == "PDU_RES_SETUP_FAIL" && s.3 == vec![2]),
+            "the SMF is told of the failure, with the gNB's transfer"
+        );
+
+        // The gNB reports PSI 3 released.
+        let notify = nextgcore_ngap::builder::build_pdu_session_resource_notify(
+            &nextgcore_ngap::types::PduSessionResourceNotify {
+                amf_ue_ngap_id: ue,
+                ran_ue_ngap_id: 11,
+                notify_list: vec![],
+                released_list: vec![nextgcore_ngap::types::PduSessionResourceReleasedItem {
+                    pdu_session_id: 3,
+                    transfer: vec![0x03],
+                }],
+            },
+        )
+        .expect("build Notify");
+        server
+            .handle_pdu_session_resource_notify(assoc, &notify)
+            .await
+            .expect("handled");
+        assert!(!server.up_active.contains(&(ue, 3)), "the released session");
+
+        // A handover that carries PSI 1 only.
+        server.handover_target_assoc.insert(ue, (target, 12));
+        server.handover_target_transfers.insert((ue, 1), vec![0xA1]);
+        server
+            .handle_handover_notify(target, &handover_notify_pdu(ue, 12))
+            .await
+            .expect("handled");
+        let left: Vec<u8> = (1u8..=4)
+            .filter(|psi| server.up_active.contains(&(ue, *psi)))
+            .collect();
+        assert_eq!(
+            left,
+            vec![1],
+            "only the handed-over session is active on the target"
+        );
+
+        // A Service Request re-keys the UE to a new AMF UE NGAP ID.
+        server.rekey_ue_sessions(ue, ue + 1);
+        assert!(
+            !server.up_active.iter().any(|(u, _)| *u == ue),
+            "nothing of the old connection is left"
+        );
+        drive_sbi(&mut server).await;
+        server.forget_ue(ue);
+        server.forget_ue(ue + 1);
     }
 
     /// **#742 review, MAJOR-2.** A UE ended mid-handover takes its preparation state with

@@ -861,6 +861,8 @@ async fn a_session_the_smf_does_not_switch_is_released_in_the_acknowledge() {
     server.ue_auth_state.insert(ue, state);
     hold_session(&mut server, ue, 5, "ps745-ok-5", port);
     hold_session(&mut server, ue, 6, "fail-ps745-6", port);
+    server.mark_up_active(ue, 5);
+    server.mark_up_active(ue, 6);
     server
         .handle_path_switch_request(target, &path_switch_request_pdu(ue, 68, &[5, 6]))
         .await
@@ -880,6 +882,10 @@ async fn a_session_the_smf_does_not_switch_is_released_in_the_acknowledge() {
             ("fail-ps745-6".to_string(), "PATH_SWITCH_REQ".to_string())
         ]
     );
+    // #778 follow-up: the session the Acknowledge releases has no user plane on the
+    // target; the switched one keeps its flag.
+    assert!(server.up_active.contains(&(ue, 5)));
+    assert!(!server.up_active.contains(&(ue, 6)), "the released session");
     let after = server.ue_auth_state.get(ue).expect("UE");
     assert_eq!(
         (after.association_id, after.ran_ue_ngap_id),
