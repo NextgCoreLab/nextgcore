@@ -75,10 +75,9 @@ async fn the_callback_token_never_reaches_the_log() {
         .await;
         assert_eq!(matches!(sent, NotifySendResult::Success), status == 204);
     }
-    let closed = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        l.local_addr().expect("addr")
-    };
+    // A port that refuses for certain: a dropped probe listener's port could be handed
+    // to another listener meanwhile, which would then answer the notify.
+    let closed = nextgcore_sbi::test_support::refused_addr();
     let sub = subscription(format!(
         "http://{closed}/namf-callback/v1/nf-status-notify/{TOKEN}"
     ));

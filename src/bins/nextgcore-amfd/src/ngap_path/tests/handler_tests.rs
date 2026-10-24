@@ -996,12 +996,9 @@ fn make_establishments_due(server: &mut NgapServer) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
 async fn an_establishment_while_the_smf_restarts_is_retried_and_succeeds() {
-    // The SMF is down: its port is bound but not listening, so a connection is refused
-    // -- and, unlike a dropped listener's port, no other test's stand-in can be handed
-    // it meanwhile (#1050: that answered the "down" SMF's CreateSMContext).
-    let down = tokio::net::TcpSocket::new_v4().expect("socket");
-    down.bind("127.0.0.1:0".parse().unwrap()).expect("bind");
-    let port = down.local_addr().expect("addr").port();
+    // The SMF is down: its port is held but not listening (#1050).
+    let down = nextgcore_sbi::test_support::down_port();
+    let port = down.port();
     let _env = super::SmfEnvGuard::acquire(port).await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_796_001u64, 96);
@@ -1019,11 +1016,7 @@ async fn an_establishment_while_the_smf_restarts_is_retried_and_succeeds() {
     assert!(server.pending_establishments.contains_key(&(ue, 5)));
 
     // The SMF comes back on the same address: the reserved socket starts listening.
-    let listener = down
-        .listen(64)
-        .expect("listen")
-        .into_std()
-        .expect("a std listener");
+    let listener = down.listen();
     let (_smf, seen) = creating_smf_on(listener).await;
     make_establishments_due(&mut server);
     settle_establishments(&mut server).await;
@@ -1058,9 +1051,9 @@ async fn an_establishment_while_the_smf_restarts_is_retried_and_succeeds() {
 #[allow(clippy::await_holding_lock)]
 async fn a_retried_establishment_carries_its_first_origination_timestamp() {
     use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    drop(listener); // the SMF is down
+    // The SMF is down: its port is held but not listening (#1050).
+    let down = nextgcore_sbi::test_support::down_port();
+    let port = down.port();
     let _env = super::SmfEnvGuard::acquire(port).await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_980_001u64, 98);
@@ -1097,7 +1090,7 @@ async fn a_retried_establishment_carries_its_first_origination_timestamp() {
     // The SMF comes back and records the header of what it receives.
     let stamps: Arc<std::sync::Mutex<Vec<Option<String>>>> = Arc::default();
     let sink = Arc::clone(&stamps);
-    let rebound = std::net::TcpListener::bind(("127.0.0.1", port)).expect("rebind");
+    let rebound = down.listen();
     let addr = rebound.local_addr().expect("addr");
     let smf = nextgcore_sbi::server::SbiServer::on_listener(
         nextgcore_sbi::server::SbiServerConfig::new(addr),
@@ -1141,10 +1134,9 @@ async fn a_retried_establishment_carries_its_first_origination_timestamp() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
 async fn an_establishment_with_no_smf_back_in_the_window_gets_payload_not_forwarded() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    drop(listener);
-    let _env = super::SmfEnvGuard::acquire(port).await;
+    // The SMF is down, and stays down: its port is held but never listens (#1050).
+    let down = nextgcore_sbi::test_support::down_port();
+    let _env = super::SmfEnvGuard::acquire(down.port()).await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_796_002u64, 97);
     ue_ready_for_sessions(&mut server, ue, ran);
@@ -1555,10 +1547,9 @@ async fn the_window_runs_from_arrival_through_the_uplink_nas_handler() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
 async fn going_cm_idle_cancels_an_attempt_that_never_started() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    drop(listener);
-    let _env = super::SmfEnvGuard::acquire(port).await;
+    // The SMF is down, and stays down: its port is held but never listens (#1050).
+    let down = nextgcore_sbi::test_support::down_port();
+    let _env = super::SmfEnvGuard::acquire(down.port()).await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_796_021u64, 106);
     ue_ready_for_sessions(&mut server, ue, ran);
