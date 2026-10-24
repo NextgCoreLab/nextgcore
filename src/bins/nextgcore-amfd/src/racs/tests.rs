@@ -583,8 +583,12 @@ fn a_creation_notice_that_names_no_id_clears_every_negative() {
 fn a_deletion_by_tac_retires_the_ids_under_it() {
     let _g = guard();
     let other = [0x01, 0x05, 0x00, 0x00, 0x00, 0x00, 0x20];
+    // Manufacturer-assigned (Type Field digit 0) under the deleted TAC: a
+    // PLMN-assigned-ID deletion does not touch it (#1046 review m4).
+    let manufacturer = [0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x40];
     cache_put_with_tac(&ID, &[0xAA], "35693803");
     cache_put_with_tac(&other, &[0xBB], "86000000");
+    cache_put_with_tac(&manufacturer, &[0xCC], "35693803");
     assert_eq!(take_reassignment(), None, "nothing retired yet");
     let retired = apply_notification(&serde_json::json!({
         "eventType": "DELETION_OF_PLMN_ASSIGNED_IDS",
@@ -596,6 +600,8 @@ fn a_deletion_by_tac_retires_the_ids_under_it() {
     assert_eq!(cache_get(&ID), None);
     assert!(!is_retired(&other));
     assert_eq!(cache_get(&other), Some(vec![0xBB]));
+    assert!(!is_retired(&manufacturer));
+    assert_eq!(cache_get(&manufacturer), Some(vec![0xCC]));
     assert_eq!(take_reassignment(), Some(vec!["35693803".to_string()]));
     assert_eq!(take_reassignment(), None, "taken once");
 }

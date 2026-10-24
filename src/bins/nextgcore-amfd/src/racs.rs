@@ -245,14 +245,6 @@ pub fn take_reassignment() -> Option<Vec<String>> {
     with_cache(|c| c.reassignment.take())
 }
 
-/// #748: ask the NGAP task to look for UEs needing a new ID again (an Assign
-/// answered with an ID a later notification has already retired).
-pub fn request_reassignment() {
-    with_cache(|c| {
-        c.reassignment.get_or_insert_with(Vec::new);
-    });
-}
-
 impl Cache {
     /// Record that the UCMF has no entry for the manufacturer-assigned `id`
     /// right now (#925 review MAJOR 1): a bounded negative cache entry that

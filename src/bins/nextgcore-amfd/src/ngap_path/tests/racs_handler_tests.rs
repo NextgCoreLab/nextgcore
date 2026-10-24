@@ -6,6 +6,7 @@ use super::handler_tests::{
     decode_sent, dl_nas_message_type, secured_registered_ue, ue_protect, uplink_nas_transport,
     Sent, ASSOC,
 };
+use super::racs_mapping_tests::UcmfEnvGuard;
 use super::*;
 
 /// PLMN-assigned, Version ID 05 (TS 23.003 §29.2), as `racs/tests.rs` uses.
@@ -69,8 +70,6 @@ fn carries_the_id(nas: &[u8]) -> bool {
 /// T3550 and its Registration Accept stay in the slot, and the Registration
 /// Complete delivers the ID with T3555.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-// The RACS cache lock is held across the awaits: the cache is process-global.
-#[allow(clippy::await_holding_lock)]
 async fn an_id_assigned_during_a_registration_waits_for_the_registration_complete() {
     let _racs = crate::racs::tests::guard();
     let mut server = capturing_ngap_server().await;
@@ -110,8 +109,6 @@ async fn an_id_assigned_during_a_registration_waits_for_the_registration_complet
 /// pending. The configuration update is not started (TS 24.501 §5.4.4.6), so
 /// T3522's retransmission and its exhaustion teardown stay armed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-// The RACS cache lock is held across the awaits: the cache is process-global.
-#[allow(clippy::await_holding_lock)]
 async fn a_pending_deregistration_is_not_replaced() {
     let _racs = crate::racs::tests::guard();
     let mut server = capturing_ngap_server().await;
@@ -134,8 +131,6 @@ async fn a_pending_deregistration_is_not_replaced() {
 /// the ID waits for its Configuration Update Complete, then goes in a command of
 /// its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-// The RACS cache lock is held across the awaits: the cache is process-global.
-#[allow(clippy::await_holding_lock)]
 async fn an_id_waits_for_the_configuration_update_in_flight() {
     let _racs = crate::racs::tests::guard();
     let mut server = capturing_ngap_server().await;
@@ -176,8 +171,6 @@ async fn an_id_waits_for_the_configuration_update_in_flight() {
 
 /// With nothing pending the command goes out at once, as before.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-// The RACS cache lock is held across the awaits: the cache is process-global.
-#[allow(clippy::await_holding_lock)]
 async fn with_nothing_pending_the_id_goes_at_once() {
     let _racs = crate::racs::tests::guard();
     let mut server = capturing_ngap_server().await;
@@ -207,6 +200,18 @@ async fn assigning_ucmf() -> (
     u16,
     std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 ) {
+    ucmf_answering(|_| Some(NEW_ID.to_vec())).await
+}
+
+/// A stand-in UCMF whose `n`th Assign (from 0) is answered with `answer(n)`'s
+/// ID, or 500 for `None`. Records the TACs it was asked for.
+async fn ucmf_answering(
+    answer: fn(usize) -> Option<Vec<u8>>,
+) -> (
+    nextgcore_sbi::server::SbiServer,
+    u16,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
     use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
     nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -230,9 +235,16 @@ async fn assigning_ucmf() -> (
                     .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
                     .and_then(|j| j["typeAllocationCode"].as_str().map(str::to_string))
                     .unwrap_or_default();
-                sink.lock().expect("sink").push(tac);
+                let n = {
+                    let mut seen = sink.lock().expect("sink");
+                    seen.push(tac);
+                    seen.len() - 1
+                };
+                let Some(id) = answer(n) else {
+                    return SResp::with_status(500);
+                };
                 let body = serde_json::json!({
-                    "plmnAssiUeRadioCapId": crate::racs::to_nucmf(&NEW_ID),
+                    "plmnAssiUeRadioCapId": crate::racs::to_nucmf(&id),
                 })
                 .to_string();
                 SResp::with_status(201).with_body(body, "application/json")
@@ -247,26 +259,6 @@ async fn assigning_ucmf() -> (
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     (server, addr.port(), seen)
-}
-
-/// Points the AMF's UCMF calls at `port` while held.
-struct UcmfEnvGuard(#[allow(dead_code)] tokio::sync::MutexGuard<'static, ()>);
-
-impl UcmfEnvGuard {
-    /// Async: the lock is a tokio mutex (#643), held across the test's awaits.
-    async fn acquire(port: u16) -> Self {
-        let guard = crate::test_support::UCMF_ENV_LOCK.lock().await;
-        std::env::set_var("UCMF_SBI_ADDR", "127.0.0.1");
-        std::env::set_var("UCMF_SBI_PORT", port.to_string());
-        Self(guard)
-    }
-}
-
-impl Drop for UcmfEnvGuard {
-    fn drop(&mut self) {
-        std::env::remove_var("UCMF_SBI_ADDR");
-        std::env::remove_var("UCMF_SBI_PORT");
-    }
 }
 
 /// A registered RACS UE holding [`ID`], which it knows, with a stored
@@ -302,7 +294,6 @@ async fn reassign(server: &mut NgapServer) {
 /// TAC) and gets it in a CONFIGURATION UPDATE COMMAND, supervised by T3555
 /// (TS 23.501 §5.4.4.1a).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[allow(clippy::await_holding_lock)]
 async fn a_new_version_id_reassigns_the_id_by_a_configuration_update() {
     let _racs = crate::racs::tests::guard();
     let (_ucmf, port, assigns) = assigning_ucmf().await;
@@ -336,7 +327,6 @@ async fn a_new_version_id_reassigns_the_id_by_a_configuration_update() {
 /// the AMF's cache, so only the UE's PEI ties it to the TAC: it is retired, and
 /// the UE re-assigned.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[allow(clippy::await_holding_lock)]
 async fn a_deletion_by_tac_reassigns_a_ue_held_id() {
     let _racs = crate::racs::tests::guard();
     let (_ucmf, port, assigns) = assigning_ucmf().await;
@@ -362,7 +352,6 @@ async fn a_deletion_by_tac_reassigns_a_ue_held_id() {
 
 /// A deletion under another TAC leaves the UE alone: no Assign, no command.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[allow(clippy::await_holding_lock)]
 async fn a_deletion_by_another_tac_leaves_the_ue_alone() {
     let _racs = crate::racs::tests::guard();
     let (_ucmf, port, assigns) = assigning_ucmf().await;
@@ -389,7 +378,6 @@ async fn a_deletion_by_another_tac_leaves_the_ue_alone() {
 /// its next Registration Accept (TS 23.501 §5.4.4.1a "or when these UEs perform
 /// a Registration").
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[allow(clippy::await_holding_lock)]
 async fn an_idle_ue_gets_the_new_id_at_its_next_registration() {
     let _racs = crate::racs::tests::guard();
     let (_ucmf, port, _assigns) = assigning_ucmf().await;
@@ -424,7 +412,6 @@ async fn an_idle_ue_gets_the_new_id_at_its_next_registration() {
 /// Assign, and a second notice while it is in flight adds none. Both UEs get
 /// the one answer, each in its own CONFIGURATION UPDATE COMMAND.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[allow(clippy::await_holding_lock)]
 async fn ues_of_one_model_share_one_assign_and_a_second_notice_adds_none() {
     let _racs = crate::racs::tests::guard();
     let (_ucmf, port, assigns) = assigning_ucmf().await;
@@ -463,4 +450,85 @@ async fn ues_of_one_model_share_one_assign_and_a_second_notice_adds_none() {
         server.forget_ue(ue);
     }
     assert!(server.racs_assigns.is_empty());
+}
+
+/// #1046 review m1/m2: an Assign that fails, or answers an ID a later notice has
+/// already retired, is retried with a doubling backoff, not on every NGAP
+/// tick, and gives up after [`RACS_ASSIGN_ATTEMPTS`] attempts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unusable_assign_is_retried_with_backoff_then_given_up() {
+    let _racs = crate::racs::tests::guard();
+    // First a 500, then an ID under the retired Version ID 05, then 500 again.
+    let (_ucmf, port, assigns) = ucmf_answering(|n| (n == 1).then(|| ID.to_vec())).await;
+    let _env = UcmfEnvGuard::acquire(port).await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_748_021u64, 66);
+    racs_ue_holding_id(&mut server, ue, ran, false);
+    crate::racs::apply_notification(&serde_json::json!({
+        "eventType": "NEW_VERSION_ID_OF_PLMN_ASSIGNED_IDs",
+        "versionId": 6,
+    }));
+    let key = ("35693803".to_string(), vec![0xC0, 0xFF, 0xEE]);
+
+    for attempt in 1..=RACS_ASSIGN_ATTEMPTS as usize {
+        reassign(&mut server).await;
+        assert_eq!(assigns.lock().expect("assigns").len(), attempt);
+        if attempt < RACS_ASSIGN_ATTEMPTS as usize {
+            let a = &server.racs_assigns[&key];
+            assert_eq!(a.failures as usize, attempt);
+            assert!(a.retry_at.is_some(), "a backoff, not an immediate retry");
+            // Not due yet: another tick sends nothing.
+            reassign(&mut server).await;
+            assert_eq!(assigns.lock().expect("assigns").len(), attempt);
+            server.racs_assigns.get_mut(&key).expect("waiting").retry_at =
+                Some(std::time::Instant::now());
+        }
+    }
+    assert!(
+        !server.racs_assigns.contains_key(&key),
+        "given up after {RACS_ASSIGN_ATTEMPTS} attempts"
+    );
+    reassign(&mut server).await;
+    assert_eq!(
+        assigns.lock().expect("assigns").len(),
+        RACS_ASSIGN_ATTEMPTS as usize
+    );
+    assert!(
+        take_sent_ngap(&mut server).is_empty(),
+        "no unusable ID reaches the UE"
+    );
+    server.forget_ue(ue);
+}
+
+/// #1046 review m3: the answer is for one capability. A UE whose capability
+/// changed while the Assign ran (a UE Radio Capability Info Indication) does
+/// not get an ID that maps to its old one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_answer_for_a_capability_the_ue_no_longer_has_is_not_applied() {
+    let _racs = crate::racs::tests::guard();
+    let (_ucmf, port, _assigns) = assigning_ucmf().await;
+    let _env = UcmfEnvGuard::acquire(port).await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_748_031u64, 67);
+    racs_ue_holding_id(&mut server, ue, ran, false);
+    crate::racs::apply_notification(&serde_json::json!({
+        "eventType": "NEW_VERSION_ID_OF_PLMN_ASSIGNED_IDs",
+        "versionId": 6,
+    }));
+    server.process_racs_reassignments();
+    // The capability changes before the answer is applied.
+    server
+        .ue_auth_state
+        .with_mut(ue, |s| s.amf_ue.ue_radio_capability = vec![0xBE, 0xEF]);
+    server.sbi_offload.settle().await;
+    server.process_sbi_outcomes().await;
+
+    let s = server.ue_auth_state.get(ue).expect("UE held");
+    assert_ne!(
+        s.amf_ue.ue_radio_capability_id.as_deref(),
+        Some(&NEW_ID[..]),
+        "the ID for the old capability is not installed"
+    );
+    assert!(take_sent_ngap(&mut server).is_empty());
+    server.forget_ue(ue);
 }

@@ -993,7 +993,7 @@ pub struct NgapServer {
     /// capability), with the UEs waiting on each. A UE joins the one in flight for
     /// its pair instead of asking again, so N UEs of one model cost one Assign and
     /// a second notice adds none (#1046 review).
-    racs_assigns: HashMap<(String, Vec<u8>), std::collections::BTreeSet<u64>>,
+    racs_assigns: HashMap<(String, Vec<u8>), RacsAssign>,
     /// AMF UE NGAP IDs this AMF allocated to an NG connection that has no NAS
     /// context, with the (association, RAN UE NGAP ID) they were allocated on (#758).
     /// Today that is a CM-IDLE Service Request answered SERVICE REJECT #9: the UE,
@@ -1051,6 +1051,26 @@ pub(crate) struct EstablishmentAttempt {
 /// for the same session (#754, with #877's bounded `settle_key`): inside the UE's T3517
 /// (15 s), so the Service Accept still arrives in time.
 const NG_RESET_SETTLE_MAX_WAIT: Duration = Duration::from_secs(5);
+
+/// #748: one coalesced UCMF Assign for a (TAC, UE radio capability).
+#[derive(Debug, Default)]
+struct RacsAssign {
+    /// The UEs waiting for its answer.
+    ues: std::collections::BTreeSet<u64>,
+    /// Attempts that came back unusable (failed, or answered an already retired
+    /// ID).
+    failures: u32,
+    /// `None` while an attempt is in flight; otherwise when the next one is due
+    /// (#1046 review m1/m2: backoff, not one per NGAP tick).
+    retry_at: Option<std::time::Instant>,
+}
+
+/// At most this many Assign attempts per (TAC, capability) for one
+/// re-assignment (#1046 review m1/m2). After that the UEs keep no ID until a
+/// later UE Radio Capability Info Indication or notification.
+const RACS_ASSIGN_ATTEMPTS: u32 = 3;
+/// The wait before the first retry; doubled per further failure.
+const RACS_ASSIGN_BACKOFF: Duration = Duration::from_secs(2);
 
 /// How many SBI exchanges run off the NGAP task at once (#796 review M1).
 const MAX_OFFLOADED_SBI: usize = 16;
@@ -6800,6 +6820,20 @@ impl NgapServer {
     /// that pair ([`NgapServer::racs_assigns`]), applied in
     /// [`Self::apply_racs_reassignment`].
     fn process_racs_reassignments(&mut self) {
+        // Retries whose backoff has passed (#1046 review m1/m2).
+        let now = std::time::Instant::now();
+        let due: Vec<(String, Vec<u8>)> = self
+            .racs_assigns
+            .iter_mut()
+            .filter(|(_, a)| a.retry_at.is_some_and(|at| at <= now))
+            .map(|(key, a)| {
+                a.retry_at = None;
+                key.clone()
+            })
+            .collect();
+        for (tac, capability) in due {
+            self.spawn_racs_assign(tac, capability);
+        }
         let Some(deleted_tacs) = crate::racs::take_reassignment() else {
             return;
         };
@@ -6824,9 +6858,10 @@ impl NgapServer {
             };
             let key = (tac, amf_ue.ue_radio_capability.clone());
             if let Some(waiting) = self.racs_assigns.get_mut(&key) {
-                // One Assign per (TAC, capability) at a time: this UE takes its
-                // answer. A second notice for a UE already waiting adds nothing.
-                waiting.insert(ue);
+                // One Assign per (TAC, capability) at a time, in flight or waiting
+                // to retry: this UE takes its answer. A second notice for a UE
+                // already waiting adds nothing.
+                waiting.ues.insert(ue);
                 continue;
             }
             log::info!(
@@ -6834,71 +6869,104 @@ impl NgapServer {
                  (TAC {}, TS 23.501 §5.4.4.1a)",
                 key.0
             );
-            self.racs_assigns
-                .insert(key.clone(), std::collections::BTreeSet::from([ue]));
-            let (tac, capability) = key;
-            // Unordered rather than keyed: the Assign serves every UE of the pair,
-            // so no one UE's `cancel_ue` may drop it, and nothing else for these
-            // UEs is ordered behind it.
-            self.sbi_offload.spawn(async move {
-                let result = crate::racs::ucmf_assign(&tac, &capability).await;
-                Some(crate::sbi_offload::SbiOutcome::RacsAssigned {
-                    tac,
-                    capability,
-                    result,
-                })
-            });
+            self.racs_assigns.insert(
+                key.clone(),
+                RacsAssign {
+                    ues: std::collections::BTreeSet::from([ue]),
+                    ..Default::default()
+                },
+            );
+            self.spawn_racs_assign(key.0, key.1);
         }
     }
 
+    /// One UCMF Assign for (TAC, capability), off the NGAP task (#748). Unordered
+    /// rather than keyed: the Assign serves every UE of the pair, so no one UE's
+    /// `cancel_ue` may drop it, and nothing else for these UEs is ordered behind it.
+    fn spawn_racs_assign(&mut self, tac: String, capability: Vec<u8>) {
+        self.sbi_offload.spawn(async move {
+            let result = crate::racs::ucmf_assign(&tac, &capability).await;
+            Some(crate::sbi_offload::SbiOutcome::RacsAssigned {
+                tac,
+                capability,
+                result,
+            })
+        });
+    }
+
     /// #748: a UCMF Assign for a (TAC, capability) came back. Each UE waiting on it
-    /// whose ID is still retired keeps the new ID. A registered, CM-CONNECTED UE
-    /// gets it in a CONFIGURATION UPDATE COMMAND now, deferred by
-    /// [`Self::send_racs_configuration_update`] while another NAS procedure runs.
-    /// Any other UE gets it at its next Registration Accept.
+    /// whose ID is still retired and whose capability is still the one assigned for
+    /// keeps the new ID. A registered, CM-CONNECTED UE gets it in a CONFIGURATION
+    /// UPDATE COMMAND now, deferred by [`Self::send_racs_configuration_update`]
+    /// while another NAS procedure runs. Any other UE gets it at its next
+    /// Registration Accept.
     ///
-    /// An answer that is itself retired by then (a further Version ID change while
-    /// it ran) is not handed out: the re-assignment is asked for again.
+    /// An unusable answer is retried with a doubling backoff, at most
+    /// [`RACS_ASSIGN_ATTEMPTS`] times (#1046 review m1/m2). Unusable means an
+    /// error, or an ID that a later notice has already retired.
     async fn apply_racs_reassignment(
         &mut self,
         tac: String,
         capability: Vec<u8>,
         result: Result<Vec<u8>, String>,
     ) {
-        let ues = self
-            .racs_assigns
-            .remove(&(tac.clone(), capability))
-            .unwrap_or_default();
+        let key = (tac, capability);
         let id = match result {
-            Ok(id) if crate::racs::is_retired(&id) => {
-                log::info!("UCMF assigned {id:02x?} for TAC {tac}, already retired; asking again");
-                crate::racs::request_reassignment();
-                return;
-            }
-            Ok(id) => id,
-            Err(e) => {
-                log::warn!(
-                    "No new UE radio capability ID for TAC {tac} ({} UE(s)): {e}",
-                    ues.len()
-                );
+            Ok(id) if !crate::racs::is_retired(&id) => id,
+            unusable => {
+                let why = match unusable {
+                    Ok(id) => format!("answered {id:02x?}, already retired"),
+                    Err(e) => e,
+                };
+                let Some(a) = self.racs_assigns.get_mut(&key) else {
+                    return;
+                };
+                a.failures += 1;
+                if a.failures >= RACS_ASSIGN_ATTEMPTS {
+                    log::warn!(
+                        "No new UE radio capability ID for TAC {} ({} UE(s)) after {} \
+                         attempts: {why}; they get one at a later UE Radio Capability Info \
+                         Indication",
+                        key.0,
+                        a.ues.len(),
+                        a.failures
+                    );
+                    self.racs_assigns.remove(&key);
+                } else {
+                    let wait = RACS_ASSIGN_BACKOFF * 2u32.pow(a.failures - 1);
+                    log::info!(
+                        "UCMF Assign for TAC {} unusable ({why}); retrying in {wait:?}",
+                        key.0
+                    );
+                    a.retry_at = Some(std::time::Instant::now() + wait);
+                }
                 return;
             }
         };
+        let ues = self
+            .racs_assigns
+            .remove(&key)
+            .map(|a| a.ues)
+            .unwrap_or_default();
+        let capability = key.1;
         for amf_ue_ngap_id in ues {
             let connection = self
                 .ue_auth_state
                 .with_mut(amf_ue_ngap_id, |s| {
-                    // Something newer may have given the UE a usable ID meanwhile.
+                    // Something newer may have given the UE a usable ID meanwhile,
+                    // or a UE Radio Capability Info Indication a different
+                    // capability, which this ID does not map to (#1046 review m3).
                     let stale = s
                         .amf_ue
                         .ue_radio_capability_id
                         .as_deref()
                         .is_none_or(crate::racs::is_retired);
-                    if stale {
+                    let applies = stale && s.amf_ue.ue_radio_capability == capability;
+                    if applies {
                         s.amf_ue.ue_radio_capability_id = Some(id.clone());
                         s.amf_ue.ue_radio_capability_id_known_to_ue = false;
                     }
-                    (stale && !s.is_cm_idle()).then_some((s.association_id, s.ran_ue_ngap_id))
+                    (applies && !s.is_cm_idle()).then_some((s.association_id, s.ran_ue_ngap_id))
                 })
                 .flatten();
             log::info!(
@@ -6906,7 +6974,7 @@ impl NgapServer {
                 if connection.is_some() {
                     ""
                 } else {
-                    " (delivered at its next registration)"
+                    " (if still applicable, delivered at its next registration)"
                 }
             );
             if let Some((association_id, ran_ue_ngap_id)) = connection {
