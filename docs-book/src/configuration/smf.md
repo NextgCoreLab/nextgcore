@@ -153,7 +153,11 @@ back into each `PfcpClient` before the association loop starts, so the first
 Association Setup after a reload compares the UPF's reported stamp against it:
 a changed stamp means the UPF restarted while the SMF was down, and the restored
 sessions are flushed (TS 29.244 §5.22, TS 23.527 §4.2) instead of being believed
-in. An unchanged stamp means they are genuinely still valid.
+in. An unchanged stamp means they are genuinely still valid. A UPF named by
+hostname has its stamp kept under the configured `host:port`, lower-cased and
+without a trailing dot, so it is found again after the UPF moves (#722). A stamp
+a pre-#722 snapshot kept under the UPF's address is read once, moved to the name,
+and the address entry removed. A UPF hostname must name exactly one UPF.
 
 **Limits worth knowing:**
 

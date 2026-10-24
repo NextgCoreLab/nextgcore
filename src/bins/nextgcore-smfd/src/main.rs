@@ -853,11 +853,8 @@ async fn main() -> Result<()> {
     // flushes the restored sessions if the UPF restarted while the SMF was down.
     // A no-op when no state file is configured (the map has no entries).
     for client in &pfcp_clients {
-        let stored = smf_self()
-            .read()
-            .ok()
-            .and_then(|ctx| ctx.upf_recovery_time_stamp(&client.peer().to_string()));
-        if let Some(rts) = stored {
+        // #722: keyed by the configured name for a hostname UPF, not its address.
+        if let Some(rts) = client.stored_recovery_time_stamp() {
             client.seed_peer_recovery_time_stamp(rts).await;
         }
     }
