@@ -8308,7 +8308,8 @@ impl NgapServer {
                 "LCS: relaying uplink LPP N1 ({} B, amf_ue_ngap_id {amf_ue_ngap_id}) to LMF \
                  callback {callback_uri} (sub={})",
                 lpp.len(),
-                sub.subscription_id
+                sub.subscription_id,
+                callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
             );
             crate::namf_server::send_n1_message_notify(
                 callback_uri,
@@ -8397,7 +8398,8 @@ impl NgapServer {
                 "UE policy: relaying uplink UE-policy N1 ({} B, amf_ue_ngap_id {amf_ue_ngap_id}) \
                  to PCF callback {callback_uri} (sub={})",
                 container.len(),
-                sub.subscription_id
+                sub.subscription_id,
+                callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
             );
             crate::namf_server::send_n1_message_notify(
                 callback_uri,
@@ -10519,7 +10521,8 @@ impl NgapServer {
             "LCS: relaying uplink UE-associated NRPPa ({} B, amf_ue_ngap_id \
              {amf_ue_ngap_id}) to LMF callback {callback_uri} (sub={})",
             ul.nrppa_pdu.len(),
-            sub.subscription_id
+            sub.subscription_id,
+            callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
         );
         crate::namf_server::send_n2_info_notify(
             callback_uri,
@@ -10639,7 +10642,8 @@ impl NgapServer {
             "LCS: relaying uplink non-UE-associated NRPPa ({} B) to LMF \
              callback {callback_uri} (sub={})",
             ul.nrppa_pdu.len(),
-            sub.subscription_id
+            sub.subscription_id,
+            callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
         );
         crate::namf_server::send_n2_info_notify(
             callback_uri,
