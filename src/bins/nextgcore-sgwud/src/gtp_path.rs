@@ -927,9 +927,14 @@ fn apply_far_once(
         if accepted {
             let _ = measure_and_report(pdr, payload.len() as u64);
         }
-        // First buffered packet triggers a Downlink Data Report unless the
-        // SGW-C suppressed notification (NOCP)
-        if count == 1 && accepted && far.apply_action & apply_action::NOCP == 0 {
+        // The first buffered packet triggers a Downlink Data Report when the
+        // SGW-C asked to be notified: TS 29.244 §8.2.26, "NOCP (Notify the CP
+        // function): when set to 1, this indicates a request to notify the CP
+        // function about the arrival of a first downlink packet being buffered"
+        // (§5.2.3.1). #972: this read NOCP inverted, so the BUFF|NOCP an SGW-C
+        // sets after Release Access Bearers never produced a report, and an
+        // ECM-IDLE UE was never paged.
+        if count == 1 && accepted && far.apply_action & apply_action::NOCP != 0 {
             if let Some(sess) = ctx.sess_find_by_id(pdr.sess_id) {
                 let report = UserPlaneReport {
                     downlink_data_report: true,
@@ -1235,7 +1240,7 @@ mod tests {
             0x1002,
             SgwuFar {
                 far_id: 20,
-                apply_action: apply_action::BUFF,
+                apply_action: apply_action::BUFF | apply_action::NOCP,
                 destination_interface: 0,
                 outer_header_creation: None,
                 ..Default::default()
@@ -1244,7 +1249,7 @@ mod tests {
 
         let pdr = ctx.pdr_find_by_teid(0x1002).unwrap();
 
-        // First buffered packet triggers a Downlink Data Report
+        // First buffered packet triggers a Downlink Data Report (NOCP set)
         let gpdu1 = Gtp1Message::gpdu(0x1002, Bytes::from_static(&[1, 1]));
         let result =
             handle_gtpu_packet(&server, &gpdu1.encode(), "127.0.0.1:9999".parse().unwrap());
@@ -1260,6 +1265,36 @@ mod tests {
         assert_eq!(far.buffered.len(), 2);
         let _ = pdr;
 
+        server.close();
+    }
+
+    /// #972, TS 29.244 §8.2.26: BUFF without NOCP buffers silently; the CP
+    /// function did not ask to be notified.
+    #[test]
+    fn a_far_buffering_without_nocp_does_not_report() {
+        let _buffer_env = crate::context::MAX_BUFFERED_PACKETS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let server = test_server(GTPV1_U_UDP_PORT);
+        let ctx = sgwu_self();
+        let (sess_id, far_id) = provision(
+            0xA972,
+            0x1972,
+            SgwuFar {
+                far_id: 72,
+                apply_action: apply_action::BUFF,
+                destination_interface: 0,
+                outer_header_creation: None,
+                ..Default::default()
+            },
+        );
+        let gpdu = Gtp1Message::gpdu(0x1972, Bytes::from_static(&[9, 7, 2]));
+        let result = handle_gtpu_packet(&server, &gpdu.encode(), "127.0.0.1:9999".parse().unwrap());
+        assert!(
+            matches!(result, GtpuRecvResult::Buffered),
+            "buffered, no Downlink Data Report"
+        );
+        assert_eq!(ctx.far_find(sess_id, far_id).unwrap().buffered.len(), 1);
         server.close();
     }
 
