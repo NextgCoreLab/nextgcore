@@ -31,6 +31,14 @@
 #   2 - infrastructure failure (preflight refusal, build, startup)
 
 set -uo pipefail
+# docker-compose.yml requires GRAFANA_ADMIN_PASSWORD (#837). Taken from the
+# environment or docker/rust/.env; this script starts no Grafana, so a
+# throwaway value is used when neither sets it.
+if [[ -z "${GRAFANA_ADMIN_PASSWORD:-}" ]] && ! grep -qs '^GRAFANA_ADMIN_PASSWORD=' "$(dirname "${BASH_SOURCE[0]}")/.env"; then
+  # Never used to log in, and Grafana is published on 127.0.0.1 only, so a
+  # throwaway value is enough; it only satisfies compose's fail-fast check.
+  export GRAFANA_ADMIN_PASSWORD="unused-$RANDOM$RANDOM"
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"

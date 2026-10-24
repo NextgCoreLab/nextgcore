@@ -1803,8 +1803,9 @@ pub struct SmfContext {
     /// tell an AMF about a context it released long ago.
     pub unrestorable_sessions: RwLock<Vec<UnrestorableSession>>,
 
-    /// Last Recovery Time Stamp each UPF peer reported, keyed by the peer's
-    /// socket address (issue #191).
+    /// Last Recovery Time Stamp each UPF peer reported (issue #191), keyed by
+    /// `PfcpClient::recovery_time_stamp_key`: the configured `host:port` for a UPF
+    /// named by hostname (#722), the socket address for a literal one.
     ///
     /// Persisted with the session map because it is what makes restoring that map
     /// safe: on the first Association Setup after a reload, `check_peer_restart`
@@ -2159,7 +2160,10 @@ impl SmfContext {
                         match serde_json::from_value::<PolicyBinding>(v) {
                             Ok(b) => Some((k, b)),
                             Err(e) => {
-                                log::warn!("skipping unreadable SMF policy binding {k}: {e}");
+                                let binding_ref = &k;
+                                log::warn!(
+                                    "skipping unreadable SMF policy binding {binding_ref}: {e}"
+                                );
                                 unrestorable.push(UnrestorableSession {
                                     sm_context_ref: k,
                                     status_uri: salvaged,
@@ -2314,10 +2318,8 @@ impl SmfContext {
         }
     }
 
-    /// Record the Recovery Time Stamp a UPF peer reported, and persist it.
-    ///
-    /// Keyed by the peer socket address as `PfcpClient::peer()` renders it, which
-    /// is what `main` uses to seed the value back after a restart.
+    /// Record the Recovery Time Stamp a UPF peer reported under `peer`, its key
+    /// (`PfcpClient::recovery_time_stamp_key`), and persist it.
     pub fn note_upf_recovery_time_stamp(&self, peer: &str, rts: u32) {
         let changed = {
             match self.upf_recovery_time_stamps.write() {
@@ -2329,6 +2331,17 @@ impl SmfContext {
         // every heartbeat, and rewriting the whole snapshot every 10s per peer
         // for an unchanged value is pure write amplification.
         if changed {
+            self.persist();
+        }
+    }
+
+    /// Forget the stamp recorded under `key`, persisting the change (#722 review M3).
+    pub fn forget_upf_recovery_time_stamp(&self, key: &str) {
+        let removed = match self.upf_recovery_time_stamps.write() {
+            Ok(mut map) => map.remove(key).is_some(),
+            Err(_) => false,
+        };
+        if removed {
             self.persist();
         }
     }

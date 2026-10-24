@@ -165,7 +165,8 @@ fn metrics_addr() -> SocketAddr {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(9090);
-    SocketAddr::from(([0, 0, 0, 0], port))
+    // Loopback unless NEXTGCORE_METRICS_BIND says otherwise (#837).
+    nextgcore_metrics::nes_energy::metrics_bind_addr(port)
 }
 
 /// Render this UPF/PGW-U's runtime state in Prometheus text format (#380).
@@ -435,6 +436,12 @@ async fn main() -> Result<()> {
                 // a backstop if this event is dropped (the URR's `threshold_exceeded` is
                 // also set), so the report cannot be lost, only duplicated -- and a
                 // duplicate carries its own UR-SEQN, which is what §8.2.60 exists for.
+                // #935: N3 path failure/recovery -> PFCP Node Report (§7.4.5.1).
+                data_plane::UpfReportEvent::PathReport { failure, peers } => {
+                    if let Err(e) = pfcp_for_reports.send_node_report(failure, &peers).await {
+                        log::warn!("User-plane path report for {peers:?} was NOT sent: {e}");
+                    }
+                }
                 data_plane::UpfReportEvent::QuotaExhausted {
                     upf_seid,
                     smf_seid,
@@ -1497,6 +1504,10 @@ mod tests {
         // healthcheck curls. A default that drifted from those would leave the gate
         // polling a closed socket.
         assert_eq!(metrics_addr().port(), 9090);
+        // #837: unauthenticated, so loopback unless the deployment opts in.
+        if std::env::var_os(nextgcore_metrics::nes_energy::METRICS_BIND_ENV).is_none() {
+            assert!(metrics_addr().ip().is_loopback(), "{}", metrics_addr());
+        }
     }
 
     // ------------------------------------------------------------------

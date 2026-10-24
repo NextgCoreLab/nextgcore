@@ -1448,7 +1448,7 @@ pub const MM_CONTEXT_NCC_AT_HANDOVER: u8 = 2;
 /// Forward Relocation Request"* (`:28234-28236`) — not in a Context Response over
 /// N26. Emitting them as zeroes-with-meaning would assert values this core does not
 /// hold.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct Gtp2MmContextIe {
     /// `KSI_ASME` (octet 5, bits 3..1) — the eKSI of the (mapped) EPS context.
     pub ksi_asme: u8,
@@ -1489,6 +1489,32 @@ pub struct Gtp2MmContextIe {
     pub mei: Vec<u8>,
     /// Access restriction flags octet (`r+1`): `ECNA NBNA HNNA ENA INA GANA GENA UNA`.
     pub access_restriction: u8,
+}
+
+/// Manual `Debug` (no-auth-material-in-logs): the authentication material in
+/// this type (nh, kasme) prints as `<redacted>`, so a future
+/// `{:?}` in a log line cannot leak it.
+impl std::fmt::Debug for Gtp2MmContextIe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("Gtp2MmContextIe");
+        d.field("ksi_asme", &self.ksi_asme);
+        d.field("nhi", &self.nhi);
+        d.field("nh", &"<redacted>");
+        d.field("ncc", &self.ncc);
+        d.field(
+            "used_nas_integrity_algorithm",
+            &self.used_nas_integrity_algorithm,
+        );
+        d.field("used_nas_cipher", &self.used_nas_cipher);
+        d.field("nas_downlink_count", &self.nas_downlink_count);
+        d.field("nas_uplink_count", &self.nas_uplink_count);
+        d.field("kasme", &"<redacted>");
+        d.field("ue_network_capability", &self.ue_network_capability);
+        d.field("ms_network_capability", &self.ms_network_capability);
+        d.field("mei", &self.mei);
+        d.field("access_restriction", &self.access_restriction);
+        d.finish()
+    }
 }
 
 impl Gtp2MmContextIe {

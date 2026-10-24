@@ -3147,7 +3147,8 @@ pub async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest)
         for (i, b) in ue.sqn.iter_mut().enumerate() {
             *b = ((new_sqn >> ((5 - i) * 8)) & 0xFF) as u8;
         }
-        log::info!("[{supi}] SQN resynchronized (new SQN=0x{new_sqn:012x})");
+        // The SQN value is authentication state: never logged.
+        log::info!("[{supi}] SQN resynchronized");
     }
 
     // Step 4: Generate RAND and compute the AV with Milenage
@@ -3209,7 +3210,7 @@ pub async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest)
     let new_sqn_hex: String = new_sqn_arr.iter().map(|b| format!("{b:02x}")).collect();
     match crate::udm_nudr_dr_send_auth_subscription_patch(&supi, &new_sqn_hex, 0, 0).await {
         Ok(r) if r.is_success() || r.status == 204 => {
-            log::debug!("[{supi}] SQN advanced to 0x{new_sqn_hex}");
+            log::debug!("[{supi}] SQN advanced");
         }
         Ok(r) => {
             // ANY failed advance withholds the AV, not only a 5xx (#84).
