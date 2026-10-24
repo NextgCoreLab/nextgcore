@@ -53,6 +53,9 @@ use tokio::task::JoinHandle;
 pub(crate) enum SbiOutcome {
     /// #796: a re-selection attempt for a waiting PDU Session Establishment.
     Establishment(crate::ngap_path::EstablishmentAttempt),
+    /// #964: the SMF's answer to an N2 handover step (PREPARING or PREPARED) for one
+    /// PDU session.
+    N2Handover(crate::ngap_path::N2HandoverAnswer),
 }
 
 /// What keyed work is serialised on: (AMF UE NGAP ID, PDU session ID).

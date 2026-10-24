@@ -948,6 +948,57 @@ pub(crate) async fn handle_prepared(sm_context_ref: &str, transfer: &[u8]) -> Sb
             gnb_addr[3],
         );
         root["epsBearerSetup"] = serde_json::json!(elements);
+    } else {
+        // #964, TS 29.502 §5.2.2.3.4.2, TS 23.502 §4.9.1.3.2 step 11: an intra-5GS
+        // handover's PREPARED answer carries the source's Handover Command Transfer
+        // (`HANDOVER_CMD`). With a direct forwarding path (the source's Handover Required
+        // Transfer said so at PREPARING) and a forwarding tunnel from the target, it names
+        // that tunnel and the QoS flows the target accepted for forwarding; otherwise the
+        // source forwards nothing.
+        let forwarding = sess
+            .handover
+            .direct_data_forwarding
+            .then_some(ack.dl_forwarding.as_ref())
+            .flatten()
+            .and_then(|t| t.ipv4().map(|addr| (t.teid, addr)));
+        let command = match crate::n2_transfer::handover_command_transfer(
+            forwarding.map(|tunnel| (tunnel, ack.forwarding_accepted_qfis.as_slice())),
+        ) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                log::error!(
+                    "SM Context Update (PREPARED) for ref={sm_context_ref}: \
+                     HandoverCommandTransfer encode failed: {e:?}"
+                );
+                return crate::problem_response(
+                    500,
+                    "SYSTEM_FAILURE",
+                    "N2 SM information encode failed",
+                );
+            }
+        };
+        log::info!(
+            "SM Context Update (PREPARED) for ref={sm_context_ref}: target DL N3 \
+             {}.{}.{}.{} TEID 0x{gnb_teid:08x}, accepted QFIs {accepted:?}, direct \
+             forwarding {forwarding:?} for QFIs {:?}; DL still on the source until COMPLETED",
+            gnb_addr[0],
+            gnb_addr[1],
+            gnb_addr[2],
+            gnb_addr[3],
+            ack.forwarding_accepted_qfis,
+        );
+        if let Ok(ctx) = smf_self().read() {
+            ctx.sess_update(&sess);
+        }
+        root["n2SmInfoType"] = serde_json::json!("HANDOVER_CMD");
+        root["n2SmInfo"] = serde_json::json!({ "contentId": "n2SmInfo" });
+        return SbiResponse::with_status(200)
+            .with_body(root.to_string(), "application/json")
+            .with_part(nextgcore_sbi::message::SbiPart::with_content(
+                "n2SmInfo",
+                nextgcore_sbi::constants::content_type::APPLICATION_NGAP,
+                bytes::Bytes::from(command),
+            ));
     }
     if let Ok(ctx) = smf_self().read() {
         ctx.sess_update(&sess);

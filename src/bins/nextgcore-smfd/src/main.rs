@@ -4409,6 +4409,152 @@ fn activation_response(sm_context_ref: &str) -> SbiResponse {
         ))
 }
 
+/// Answer an intra-5GS `HANDOVER_REQUIRED` (#964, TS 29.502 §5.2.2.3.4.2): `hoState:
+/// PREPARING` with the target's Handover Request Transfer as `PDU_RES_SETUP_REQ`, built
+/// from what establishment recorded -- the UPF's N3 uplink endpoint (the target sends
+/// uplink to the same UPF) and the session's QoS flow. The source's Handover Required
+/// Transfer says whether a direct forwarding path exists; with one, the transfer tells
+/// the target so, and without one Data Forwarding Not Possible is set, because this SMF
+/// sets up no indirect forwarding for an intra-5GS handover.
+///
+/// 500 SYSTEM_FAILURE when establishment recorded no UPF endpoint or binding: the AMF
+/// then leaves the session out of the handover.
+fn handover_preparing_response(sm_context_ref: &str, required: Option<&[u8]>) -> SbiResponse {
+    use nextgcore_sbi::constants::content_type;
+    use nextgcore_sbi::message::SbiPart;
+    let Some(mut sess) = smf_self()
+        .read()
+        .ok()
+        .and_then(|ctx| ctx.sess_find_by_sm_context_ref(sm_context_ref))
+    else {
+        return problem_response(
+            404,
+            "CONTEXT_NOT_FOUND",
+            "No SM context for this smContextRef",
+        );
+    };
+    let (Some((upf_teid, upf_addr)), Some(binding)) = (
+        lookup_upf_ul_endpoint(sm_context_ref),
+        lookup_policy_binding(sm_context_ref),
+    ) else {
+        log::warn!(
+            "SM Context Update (HANDOVER_REQUIRED) for ref={sm_context_ref}: no recorded UPF \
+             endpoint or binding, so the session cannot be handed over"
+        );
+        return problem_response(500, "SYSTEM_FAILURE", "No user plane recorded to hand over");
+    };
+    let direct = match required.map(n2_transfer::parse_handover_required_transfer) {
+        Some(Ok(direct)) => direct,
+        Some(Err(e)) => {
+            log::warn!(
+                "SM Context Update (HANDOVER_REQUIRED) for ref={sm_context_ref}: undecodable \
+                 HandoverRequiredTransfer: {e:?}"
+            );
+            return problem_400("N2_SM_ERROR", "n2SmInfo is not a HandoverRequiredTransfer");
+        }
+        None => false,
+    };
+    let n2 = match n2_transfer::setup_request_transfer(&n2_transfer::SetupRequest {
+        ambr: None,
+        ul_tunnel: (upf_teid, upf_addr),
+        data_forwarding_not_possible: !direct,
+        direct_forwarding_path_availability: direct,
+        flows: vec![n2_transfer::QosFlowSetup {
+            qfi: binding.qfi,
+            five_qi: u16::from(binding.five_qi),
+            arp: n2_transfer::Arp {
+                priority_level: binding.arp_priority_level,
+                may_trigger_pre_emption: false,
+                pre_emptable: false,
+            },
+            gbr: None,
+            e_rab_id: None,
+        }],
+    }) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            log::error!(
+                "HANDOVER_REQUIRED for ref={sm_context_ref}: transfer encode failed: {e:?}"
+            );
+            return problem_response(500, "SYSTEM_FAILURE", "N2 SM information encode failed");
+        }
+    };
+    // A new preparation starts from nothing: what an earlier, abandoned one learned
+    // about its target must not be switched to.
+    sess.handover = context::HandoverInfo {
+        direct_data_forwarding: direct,
+        ..Default::default()
+    };
+    if let Ok(ctx) = smf_self().read() {
+        ctx.sess_update(&sess);
+    }
+    log::info!(
+        "SM Context Update (HANDOVER_REQUIRED) for ref={sm_context_ref}: PREPARING, Handover \
+         Request Transfer with UPF N3 TEID {upf_teid:#x}, direct forwarding path {direct}; \
+         user plane untouched"
+    );
+    let body = serde_json::json!({
+        "hoState": "PREPARING",
+        "n2SmInfoType": "PDU_RES_SETUP_REQ",
+        "n2SmInfo": { "contentId": "n2SmInfo" },
+    });
+    SbiResponse::with_status(200)
+        .with_body(body.to_string(), content_type::APPLICATION_JSON)
+        .with_part(SbiPart::with_content(
+            "n2SmInfo",
+            content_type::APPLICATION_NGAP,
+            bytes::Bytes::from(n2),
+        ))
+}
+
+/// Answer `HANDOVER_RES_ALLOC_FAIL` (#964, TS 29.502 §5.2.2.3.4.2): `hoState: CANCELLED`
+/// with a Handover Preparation Unsuccessful Transfer (`HANDOVER_PREP_FAIL`) carrying the
+/// target's cause. The session's preparation is dropped; its user plane stays as it is.
+fn handover_allocation_failed_response(sm_context_ref: &str, alloc_fail: &[u8]) -> SbiResponse {
+    use nextgcore_sbi::constants::content_type;
+    use nextgcore_sbi::message::SbiPart;
+    let Some(mut sess) = smf_self()
+        .read()
+        .ok()
+        .and_then(|ctx| ctx.sess_find_by_sm_context_ref(sm_context_ref))
+    else {
+        return problem_response(
+            404,
+            "CONTEXT_NOT_FOUND",
+            "No SM context for this smContextRef",
+        );
+    };
+    let n2 = match n2_transfer::handover_preparation_unsuccessful_transfer(alloc_fail) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            log::error!(
+                "HANDOVER_RES_ALLOC_FAIL for ref={sm_context_ref}: transfer encode failed: {e:?}"
+            );
+            return problem_response(500, "SYSTEM_FAILURE", "N2 SM information encode failed");
+        }
+    };
+    sess.handover = context::HandoverInfo::default();
+    if let Ok(ctx) = smf_self().read() {
+        ctx.sess_update(&sess);
+    }
+    log::warn!(
+        "SM Context Update (HANDOVER_RES_ALLOC_FAIL) for ref={sm_context_ref}: the target \
+         could not admit the session; CANCELLED, the session stays on the source"
+    );
+    let body = serde_json::json!({
+        "hoState": "CANCELLED",
+        "n2SmInfoType": "HANDOVER_PREP_FAIL",
+        "n2SmInfo": { "contentId": "n2SmInfo" },
+    });
+    SbiResponse::with_status(200)
+        .with_body(body.to_string(), content_type::APPLICATION_JSON)
+        .with_part(SbiPart::with_content(
+            "n2SmInfo",
+            content_type::APPLICATION_NGAP,
+            bytes::Bytes::from(n2),
+        ))
+}
+
 /// The UPF's N3 uplink endpoint for an SM context, if establishment recorded one (#70).
 fn lookup_upf_ul_endpoint(sm_context_ref: &str) -> Option<(u32, [u8; 4])> {
     smf_self().read().ok().and_then(|ctx| {
@@ -4819,7 +4965,17 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
 
         // AN failed to set up (or path-switch / handover resource allocation
         // failed): the DL tunnel is invalid — buffer downlink again.
-        "PDU_RES_SETUP_FAIL" | "PATH_SWITCH_SETUP_FAIL" | "HANDOVER_RES_ALLOC_FAIL" => {
+        "HANDOVER_RES_ALLOC_FAIL" => {
+            // #964, TS 29.502 §5.2.2.3.4.2, TS 23.502 §4.9.1.3.2 step 10: the target could
+            // not admit this session. The source still serves the UE, so the user plane
+            // is NOT touched here (deactivating the DL FAR now would cut the downlink the
+            // source is still delivering); the AMF deactivates the session once the UE has
+            // moved. The answer is `hoState: CANCELLED` with the Handover Preparation
+            // Unsuccessful Transfer the HANDOVER COMMAND's release list carries.
+            let alloc_fail = resolve_binary_ref(request, &req_body["n2SmInfo"]).unwrap_or_default();
+            handover_allocation_failed_response(sm_context_ref, &alloc_fail)
+        }
+        "PDU_RES_SETUP_FAIL" | "PATH_SWITCH_SETUP_FAIL" => {
             log::warn!("SM Context Update ({n2_sm_info_type}): AN resource failure for ref={sm_context_ref}");
             if let Some(upf_seid) = lookup_upf_seid(sm_context_ref) {
                 if let Err(e) =
@@ -5025,17 +5181,14 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
         // PREPARING and PREPARED must NOT touch the user plane, and COMPLETED is
         // where the switch belongs.
         "HANDOVER_REQUIRED" => {
-            // Source side asks the SMF to prepare. TS 29.502 §5.2.2.3.4: the
-            // response carries `hoState: PREPARING` and the N2 SM information the
-            // target needs. This SMF has no target-side N2 container to build (that
-            // is amfd/NGAP territory, #70), so it acknowledges the state transition
-            // and holds the session rather than refusing the handover outright.
-            log::info!(
-                "SM Context Update (HANDOVER_REQUIRED, hoState={ho_state}) for \
-                 ref={sm_context_ref}: preparing, user plane untouched"
-            );
-            let response_body = serde_json::json!({ "hoState": "PREPARING" });
-            SbiResponse::with_status(200).with_body(response_body.to_string(), "application/json")
+            // #964, TS 29.502 §5.2.2.3.4.2, TS 23.502 §4.9.1.3.2 steps 3-6: the source
+            // asks the SMF to prepare. The answer carries `hoState: PREPARING` and the
+            // target's Handover Request Transfer (a PDUSessionResourceSetupRequestTransfer,
+            // TS 38.413 §9.2.3.4) as `PDU_RES_SETUP_REQ`. The user plane is untouched.
+            handover_preparing_response(
+                sm_context_ref,
+                resolve_binary_ref(request, &req_body["n2SmInfo"]).as_deref(),
+            )
         }
         "HANDOVER_REQ_ACK" => {
             // The target gNB accepted. The DL tunnel is NOT switched here: until the
@@ -13031,6 +13184,9 @@ mod tests {
     async fn n2_handover_states_are_processed_not_refused() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let reference = seed_registered_session("imsi-001010000000081", 5, "internet");
+        // #964: PREPARING builds the target's Handover Request Transfer from the
+        // session's recorded UPF endpoint and policy binding.
+        seed_user_plane(&reference, (0x0008_1000, [10, 45, 0, 81]));
 
         for (info_type, requested, expected) in [
             ("HANDOVER_REQUIRED", "PREPARING", "PREPARING"),
@@ -13062,6 +13218,238 @@ mod tests {
         // And the session survives every one of them: a handover that dropped the
         // context would be worse than one that was refused.
         assert!(sm_context_exists(&reference));
+    }
+
+    /// Record a UPF N3 uplink endpoint and a default policy binding for `reference`, as
+    /// establishment does.
+    fn seed_user_plane(reference: &str, ul: (u32, [u8; 4])) {
+        let ctx = smf_self();
+        let ctx = ctx.read().expect("ctx");
+        ctx.upf_ul_endpoints
+            .write()
+            .expect("w")
+            .insert(reference.to_string(), ul);
+        let mut b = context::PolicyBinding::snapshot_default();
+        b.qfi = 1;
+        b.five_qi = 9;
+        b.arp_priority_level = 8;
+        ctx.policy_bindings
+            .write()
+            .expect("w")
+            .insert(reference.to_string(), b);
+    }
+
+    /// An SM Context Update to `reference` with `body` and, when given, `n2` as the
+    /// `n2SmInfo` part.
+    fn ho_update(reference: &str, body: serde_json::Value, n2: Option<Vec<u8>>) -> SbiRequest {
+        let mut req = SbiRequest::post(format!(
+            "/nsmf-pdusession/v1/sm-contexts/{reference}/modify"
+        ))
+        .with_body(body.to_string(), "application/json");
+        if let Some(n2) = n2 {
+            req = req.with_part(nextgcore_sbi::message::SbiPart::with_content(
+                "n2SmInfo",
+                nextgcore_sbi::constants::content_type::APPLICATION_NGAP,
+                bytes::Bytes::from(n2),
+            ));
+        }
+        req
+    }
+
+    /// A response's JSON root and its `n2SmInfo` part.
+    fn ho_answer(
+        resp: &nextgcore_sbi::message::SbiResponse,
+    ) -> (serde_json::Value, Option<Vec<u8>>) {
+        let root = serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("json");
+        let n2 = resp
+            .http
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some("n2SmInfo"))
+            .map(|p| p.data.to_vec());
+        (root, n2)
+    }
+
+    /// **#964.** The SMF's side of the N2 handover round trips (TS 29.502 §5.2.2.3.4.2,
+    /// TS 23.502 §4.9.1.3.2):
+    ///
+    /// - PREPARING with the source's Handover Required Transfer is answered with the
+    ///   target's Handover Request Transfer (`PDU_RES_SETUP_REQ`): the UPF's N3 uplink
+    ///   and the session's QoS flow, and, because the source reports a direct
+    ///   forwarding path, Direct Forwarding Path Availability; without one, Data
+    ///   Forwarding Not Possible;
+    /// - PREPARED with the target's Acknowledge Transfer is answered with the source's
+    ///   Handover Command Transfer (`HANDOVER_CMD`) naming the target's forwarding tunnel
+    ///   and the flow it accepted for forwarding; the target DL tunnel is recorded and
+    ///   the UPF is not touched;
+    /// - `HANDOVER_RES_ALLOC_FAIL` is answered CANCELLED with a Handover Preparation
+    ///   Unsuccessful Transfer carrying the target's cause, and the session's DL is
+    ///   left alone (it used to be deactivated, cutting the source's downlink).
+    #[tokio::test]
+    async fn n2_handover_steps_answer_with_the_transfers_each_side_needs() {
+        use nextgcore_ngap_gen::generated as g;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let reference = seed_registered_session("imsi-001010000000964", 5, "internet");
+        let ul = (0x0009_6400, [10, 45, 0, 96]);
+        seed_user_plane(&reference, ul);
+        let expected_request = |direct: bool| {
+            n2_transfer::setup_request_transfer(&n2_transfer::SetupRequest {
+                ambr: None,
+                ul_tunnel: ul,
+                data_forwarding_not_possible: !direct,
+                direct_forwarding_path_availability: direct,
+                flows: vec![n2_transfer::QosFlowSetup {
+                    qfi: 1,
+                    five_qi: 9,
+                    arp: n2_transfer::Arp {
+                        priority_level: 8,
+                        may_trigger_pre_emption: false,
+                        pre_emptable: false,
+                    },
+                    gbr: None,
+                    e_rab_id: None,
+                }],
+            })
+            .expect("encodes")
+        };
+
+        for direct in [false, true] {
+            let required = nextgcore_ngap_gen::encode_contained(&g::HandoverRequiredTransfer {
+                direct_forwarding_path_availability: direct.then_some(
+                    g::DirectForwardingPathAvailability(
+                        g::DirectForwardingPathAvailability::DIRECT_PATH_AVAILABLE,
+                    ),
+                ),
+                ie_extensions: None,
+            })
+            .expect("encodes");
+            let resp = handle_sm_context_update(
+                &reference,
+                &ho_update(
+                    &reference,
+                    serde_json::json!({
+                        "hoState": "PREPARING",
+                        "n2SmInfoType": "HANDOVER_REQUIRED",
+                        "n2SmInfo": { "contentId": "n2SmInfo" },
+                    }),
+                    Some(required),
+                ),
+            )
+            .await;
+            assert_eq!(resp.status, 200);
+            let (root, n2) = ho_answer(&resp);
+            assert_eq!(root["hoState"], "PREPARING");
+            assert_eq!(root["n2SmInfoType"], "PDU_RES_SETUP_REQ");
+            assert_eq!(n2, Some(expected_request(direct)), "direct={direct}");
+        }
+
+        // PREPARED, after the direct-path PREPARING.
+        let (target_dl, target_fwd) = (
+            (0x0000_D1D1u32, [10, 9, 6, 4]),
+            (0x0000_F1F1u32, [10, 9, 6, 5]),
+        );
+        let ack = nextgcore_ngap_gen::encode_contained(&g::HandoverRequestAcknowledgeTransfer {
+            dl_ngu_up_tnl_information: n2_transfer::gtp_tunnel(target_dl),
+            dl_forwarding_up_tnl_information: Some(n2_transfer::gtp_tunnel(target_fwd)),
+            security_result: None,
+            qos_flow_setup_response_list: g::QosFlowListWithDataForwarding(vec![
+                g::QosFlowItemWithDataForwarding {
+                    qos_flow_identifier: g::QosFlowIdentifier(1),
+                    data_forwarding_accepted: Some(g::DataForwardingAccepted(
+                        g::DataForwardingAccepted::DATA_FORWARDING_ACCEPTED,
+                    )),
+                    ie_extensions: None,
+                },
+            ]),
+            qos_flow_failed_to_setup_list: None,
+            data_forwarding_response_drb_list: None,
+            ie_extensions: None,
+        })
+        .expect("encodes");
+        let resp = handle_sm_context_update(
+            &reference,
+            &ho_update(
+                &reference,
+                serde_json::json!({
+                    "hoState": "PREPARED",
+                    "n2SmInfoType": "HANDOVER_REQ_ACK",
+                    "n2SmInfo": { "contentId": "n2SmInfo" },
+                }),
+                Some(ack),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+        let (root, n2) = ho_answer(&resp);
+        assert_eq!(root["hoState"], "PREPARED");
+        assert_eq!(root["n2SmInfoType"], "HANDOVER_CMD");
+        assert_eq!(
+            n2,
+            Some(
+                n2_transfer::handover_command_transfer(Some((target_fwd, &[1]))).expect("encodes")
+            ),
+            "the Command Transfer names the target's forwarding tunnel and QFI 1"
+        );
+        let sess = smf_self()
+            .read()
+            .unwrap()
+            .sess_find_by_sm_context_ref(&reference)
+            .expect("session");
+        assert!(sess.handover.prepared && sess.handover.target_dl_known);
+        assert_eq!(sess.handover.gnb_n3_teid, target_dl.0);
+        assert_eq!(sess.up_cnx_state, context::UpCnxState::Activated);
+
+        // A session the target could not admit.
+        let alloc_fail = nextgcore_ngap_gen::encode_contained(
+            &g::HandoverResourceAllocationUnsuccessfulTransfer {
+                cause: g::Cause::RadioNetwork(g::CauseRadioNetwork(
+                    g::CauseRadioNetwork::RADIO_RESOURCES_NOT_AVAILABLE,
+                )),
+                criticality_diagnostics: None,
+                ie_extensions: None,
+            },
+        )
+        .expect("encodes");
+        let resp = handle_sm_context_update(
+            &reference,
+            &ho_update(
+                &reference,
+                serde_json::json!({
+                    "hoState": "PREPARED",
+                    "n2SmInfoType": "HANDOVER_RES_ALLOC_FAIL",
+                    "n2SmInfo": { "contentId": "n2SmInfo" },
+                }),
+                Some(alloc_fail.clone()),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+        let (root, n2) = ho_answer(&resp);
+        assert_eq!(root["hoState"], "CANCELLED");
+        assert_eq!(root["n2SmInfoType"], "HANDOVER_PREP_FAIL");
+        let unsuccessful = n2.expect("the Unsuccessful Transfer");
+        let decoded = nextgcore_ngap_gen::decode_contained::<
+            g::HandoverPreparationUnsuccessfulTransfer,
+        >(&unsuccessful)
+        .expect("decodes");
+        assert_eq!(
+            decoded.cause,
+            g::Cause::RadioNetwork(g::CauseRadioNetwork(
+                g::CauseRadioNetwork::RADIO_RESOURCES_NOT_AVAILABLE
+            )),
+            "the target's cause"
+        );
+        let sess = smf_self()
+            .read()
+            .unwrap()
+            .sess_find_by_sm_context_ref(&reference)
+            .expect("session");
+        assert!(!sess.handover.prepared, "the preparation is dropped");
+        assert_eq!(
+            sess.up_cnx_state,
+            context::UpCnxState::Activated,
+            "the source still serves the session"
+        );
     }
 
     /// A HANDOVER_COMPLETE with no decodable target endpoint still completes, and
