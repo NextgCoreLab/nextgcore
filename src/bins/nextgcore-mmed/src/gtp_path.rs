@@ -2822,6 +2822,8 @@ mod tests {
     #[test]
     fn a_lost_counter_confirmed_by_echo_over_the_socket_is_re_based() {
         let _guard = lock_s11();
+        // Only this test's restart is in the record (#1000 review).
+        S11_RESTARTS_SEEN.lock().unwrap().clear();
         let (server, peer, peer_addr) = spawn_server_and_peer(Gtp2XactConfig::default());
         assert!(!note_peer_recovery(&server.inner, peer_addr, 100));
         assert!(!note_peer_recovery(&server.inner, peer_addr, 1), "stale");

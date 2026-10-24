@@ -1187,7 +1187,13 @@ impl SgwcContext {
         self.tunnel_find_by_interface_type(bearer_id, gtp_interface::S1_U_SGW_GTP_U)
     }
 
-    /// Update tunnel in context
+    /// Update tunnel in context.
+    ///
+    /// A changed remote endpoint, or a generation the writer advanced, is a new
+    /// generation (the Modify Bearer rollback compares it, #987/#991). Writers
+    /// must therefore re-read the tunnel just before updating it: writing back
+    /// an older clone counts as a write and blocks a legitimate rollback (and
+    /// would clobber the endpoint anyway).
     pub fn tunnel_update(&self, tunnel: &SgwcTunnel) -> bool {
         if let Ok(mut list) = self.tunnel_list.write() {
             let mut tunnel = tunnel.clone();
