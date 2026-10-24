@@ -22528,6 +22528,104 @@ mod tests {
         assert!(!server.handover_target_assoc.contains_key(&ue));
     }
 
+    /// **#804, TS 23.502 §4.9.1.4 / §4.11.1.2.3.** A HANDOVER CANCEL releases what the
+    /// handover prepared:
+    /// - after the target's Acknowledge, a UE Context Release Command to the target,
+    ///   under the target's id pair, cause handover-cancelled, and `hoState: CANCELLED`
+    ///   (cause `HO_CANCEL`, TS 29.502 §5.2.2.3.4.4) to the SMF for each offered session;
+    /// - before it, the Release Command names the AMF UE NGAP ID alone, so a target still
+    ///   preparing releases too;
+    /// - with no handover in flight, only the Acknowledge goes out.
+    ///
+    /// REVERT-VERIFIED: without `release_cancelled_handover_target` only the Acknowledge is
+    /// sent and the SMF hears nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_handover_cancel_releases_the_prepared_target_and_tells_the_smf() {
+        let (_smf, port, calls) = handler_tests::activating_smf().await;
+        let mut server = capturing_ngap_server().await;
+        let (source, target) = (98_041u64, 98_042u64);
+        seed_gnb_session(&server, source).await;
+        seed_gnb_session(&server, target).await;
+        let cancel = |ue: u64, ran: u32| {
+            nextgcore_ngap::builder::build_handover_cancel(&nextgcore_ngap::types::HandoverCancel {
+                amf_ue_ngap_id: ue,
+                ran_ue_ngap_id: ran,
+                cause: nextgcore_ngap::types::Cause::RadioNetwork(
+                    nextgcore_ngap::types::CauseRadioNetwork::HandoverCancelled,
+                ),
+            })
+            .expect("build HandoverCancel")
+        };
+        let cancelled = Some(nextgcore_ngap_gen::generated::CauseRadioNetwork::HANDOVER_CANCELLED);
+
+        // After the Acknowledge.
+        let ue = 7_804_001u64;
+        server
+            .ue_auth_state
+            .insert(ue, UeNasContext::new(ue, 11, source, false));
+        server.handover_target_assoc.insert(ue, (target, 77));
+        server.handover_prepared_psis.insert(ue, vec![5]);
+        server
+            .sm_context_refs
+            .insert((ue, 5), "ref-804-5".to_string());
+        server
+            .sm_context_smfs
+            .insert((ue, 5), ("127.0.0.1".to_string(), port));
+        server
+            .handle_handover_cancel(source, &cancel(ue, 11))
+            .await
+            .expect("handled");
+        drive_sbi(&mut server).await;
+        let sent = take_sent_ngap(&mut server);
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert_eq!(sent[0].0, target, "the target is released first");
+        assert_eq!(
+            decoded_release_command(&sent[0].1),
+            Some((ue, Some(77), cancelled))
+        );
+        assert_eq!(sent[1].0, source, "then the source's Acknowledge");
+        let calls = calls.lock().expect("calls").clone();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(calls[0].0.contains("/sm-contexts/ref-804-5/modify"));
+        assert_eq!(calls[0].1["hoState"], "CANCELLED");
+        assert_eq!(calls[0].1["cause"], "HO_CANCEL");
+        assert!(!server.handover_prepared_psis.contains_key(&ue));
+
+        // Before the Acknowledge: the target is named by the AMF UE NGAP ID alone.
+        let ue2 = 7_804_002u64;
+        server
+            .ue_auth_state
+            .insert(ue2, UeNasContext::new(ue2, 12, source, false));
+        server.handover_pending_target.insert(ue2, target);
+        server
+            .handle_handover_cancel(source, &cancel(ue2, 12))
+            .await
+            .expect("handled");
+        let sent = take_sent_ngap(&mut server);
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert_eq!(sent[0].0, target);
+        assert_eq!(
+            decoded_release_command(&sent[0].1),
+            Some((ue2, None, cancelled))
+        );
+
+        // Nothing in flight: only the Acknowledge.
+        let ue3 = 7_804_003u64;
+        server
+            .ue_auth_state
+            .insert(ue3, UeNasContext::new(ue3, 13, source, false));
+        server
+            .handle_handover_cancel(source, &cancel(ue3, 13))
+            .await
+            .expect("handled");
+        let sent = take_sent_ngap(&mut server);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].0, source);
+        for id in [ue, ue2, ue3] {
+            server.ue_auth_state.remove(id);
+        }
+    }
+
     /// **#742 review, MAJOR-2.** A UE ended mid-handover takes its preparation state with
     /// it: after the Acknowledge, an NG Reset from the source naming the (not yet
     /// registered) UE drops it through `forget_ue`, and no pending target, relay target or
