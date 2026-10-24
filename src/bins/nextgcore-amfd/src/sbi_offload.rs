@@ -56,6 +56,9 @@ pub(crate) enum SbiOutcome {
     /// #964: the SMF's answer to an N2 handover step (PREPARING or PREPARED) for one
     /// PDU session.
     N2Handover(crate::ngap_path::N2HandoverAnswer),
+    /// #774: one ReleaseSMContext of a superseded registration has reported back
+    /// (whatever its result), for the barrier with this id.
+    SupersedeReleased { barrier: u64 },
 }
 
 /// What keyed work is serialised on: (AMF UE NGAP ID, PDU session ID).

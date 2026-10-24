@@ -6,7 +6,10 @@
 //! that matches the stored HXRES*, against a stand-in AUSF that confirms the
 //! SUPI, and a stand-in SMF that records the releases.
 
-use super::handler_tests::{activating_smf, hold_session, secured_registered_ue, SmfCall, ASSOC};
+use super::handler_tests::{
+    activating_smf, decode_sent, establishment_request, hanging_smf, hold_session,
+    secured_registered_ue, Sent, SmfCall, ASSOC,
+};
 use super::*;
 
 /// The RES* every UE here answers with.
@@ -200,6 +203,8 @@ async fn an_initial_registration_releases_the_sessions_of_the_earlier_registrati
         .handle_authentication_response_nas(ASSOC, new, 42, &authentication_response())
         .await
         .expect("authentication response handled");
+    // #774 review M1: the releases run off the NGAP task.
+    server.sbi_offload.settle().await;
 
     assert_eq!(
         released_refs(&seen),
@@ -258,6 +263,8 @@ async fn a_connected_earlier_registration_also_gets_its_n2_connection_released()
         .handle_authentication_response_nas(ASSOC, new, 52, &authentication_response())
         .await
         .expect("authentication response handled");
+    // #774 review M1: the releases run off the NGAP task.
+    server.sbi_offload.settle().await;
 
     assert_eq!(released_refs(&seen), vec!["774-c5".to_string()]);
     assert!(!server.ue_auth_state.contains(old));
@@ -301,6 +308,8 @@ async fn a_reused_ran_ue_ngap_id_is_not_released() {
         .handle_authentication_response_nas(ASSOC, new, 61, &authentication_response())
         .await
         .expect("authentication response handled");
+    // #774 review M1: the releases run off the NGAP task.
+    server.sbi_offload.settle().await;
 
     assert_eq!(released_refs(&seen), vec!["774-r1".to_string()]);
     assert!(!server.ue_auth_state.contains(old));
@@ -329,6 +338,7 @@ async fn a_failed_authentication_keeps_the_earlier_registration() {
     let _ = server
         .handle_authentication_response_nas(ASSOC, new, 72, &authentication_response())
         .await;
+    server.sbi_offload.settle().await;
 
     assert_eq!(released_refs(&seen), Vec::<String>::new());
     assert!(server.ue_auth_state.contains(old));
@@ -358,6 +368,8 @@ async fn a_mobility_registration_does_not_release_the_earlier_sessions() {
         .handle_authentication_response_nas(ASSOC, new, 82, &authentication_response())
         .await
         .expect("authentication response handled");
+    // #774 review M1: the releases run off the NGAP task.
+    server.sbi_offload.settle().await;
 
     assert_eq!(released_refs(&seen), Vec::<String>::new());
     assert!(server.ue_auth_state.contains(old));
@@ -390,6 +402,8 @@ async fn sessions_carried_into_the_initial_registration_are_released() {
         .handle_authentication_response_nas(ASSOC, ue, 91, &authentication_response())
         .await
         .expect("authentication response handled");
+    // #774 review M1: the releases run off the NGAP task.
+    server.sbi_offload.settle().await;
 
     assert_eq!(released_refs(&seen), vec!["774-s3".to_string()]);
     assert_eq!(session_state(&server, ue), (0, 0));
@@ -398,4 +412,172 @@ async fn sessions_carried_into_the_initial_registration_are_released() {
         "the registration goes on"
     );
     assert_eq!(release_commands(&mut server), vec![]);
+}
+
+/// The CreateSMContext requests the stand-in SMF has seen, as their PSIs.
+fn created_psis(seen: &std::sync::Mutex<Vec<SmfCall>>) -> Vec<u64> {
+    seen.lock()
+        .expect("smf calls")
+        .iter()
+        .filter(|(uri, _)| uri.ends_with("/nsmf-pdusession/v1/sm-contexts"))
+        .map(|(_, body)| body["pduSessionId"].as_u64().unwrap_or_default())
+        .collect()
+}
+
+/// Whether the AMF sent a DOWNLINK NAS TRANSPORT (here: the Security Mode
+/// Command that follows a successful authentication).
+fn sent_downlink_nas(server: &mut NgapServer) -> bool {
+    take_sent_ngap(server)
+        .iter()
+        .any(|(_, pdu)| matches!(decode_sent(pdu), Sent::DownlinkNas { .. }))
+}
+
+/// #774 review M1. The earlier registration's SMF is blackholed (it never
+/// answers). The authentication response is still handled at once and the
+/// Security Mode Command goes out, because the releases run off the NGAP task.
+/// The new UE's PDU Session Establishment waits for them, but only up to the
+/// barrier's bound; then it goes to the SMF anyway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// The SMF and AUSF environment guards are held across the awaits on purpose:
+// both addresses are process environment variables.
+#[allow(clippy::await_holding_lock)]
+async fn a_blackholed_smf_holds_neither_the_registration_nor_the_new_sessions_for_long() {
+    let (_smf, smf_port, seen) = activating_smf().await;
+    let _smf_env = super::SmfEnvGuard::set(smf_port);
+    let (_blackhole, blackhole_port) = hanging_smf();
+    let supi = "imsi-001010000774007";
+    let (_ausf, ausf_port) = confirming_ausf("AUTHENTICATION_SUCCESS", supi).await;
+    let _env = AusfEnvGuard::set(ausf_port);
+    let mut server = capturing_ngap_server().await;
+    server.supersede_barrier_max = Duration::from_millis(400);
+    let (old, new) = (7_774_061u64, 7_774_062u64);
+    earlier_registration(
+        &mut server,
+        old,
+        93,
+        supi,
+        true,
+        &[(1, "774-b1"), (2, "774-b2")],
+        blackhole_port,
+    );
+    authenticating_ue(
+        &mut server,
+        new,
+        94,
+        crate::gmm_build::registration_type::INITIAL,
+    );
+
+    let started = std::time::Instant::now();
+    server
+        .handle_authentication_response_nas(ASSOC, new, 94, &authentication_response())
+        .await
+        .expect("authentication response handled");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the NGAP task did not wait for the blackholed SMF: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        sent_downlink_nas(&mut server),
+        "the Security Mode Command goes out without waiting for the releases"
+    );
+    assert!(
+        !server.ue_auth_state.contains(old),
+        "the earlier context is gone"
+    );
+    assert_eq!(
+        server.supersede_barriers.get(&new).map(|b| b.outstanding),
+        Some(2),
+        "both releases are still out"
+    );
+
+    server
+        .handle_5gsm_message(ASSOC, new, 94, &establishment_request(1), None)
+        .await
+        .expect("establishment handled");
+    server.process_sbi_outcomes().await;
+    server.process_supersede_barriers().await;
+    assert_eq!(
+        created_psis(&seen),
+        Vec::<u64>::new(),
+        "the establishment waits while the earlier sessions are being released"
+    );
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    server.process_sbi_outcomes().await;
+    server.process_supersede_barriers().await;
+    assert_eq!(
+        created_psis(&seen),
+        vec![1],
+        "past the bound the establishment goes to the SMF anyway"
+    );
+    assert!(server.supersede_barriers.is_empty());
+    server.forget_ue(new);
+}
+
+/// #774 review M1. The barrier keeps the order the inline release gave: the
+/// new UE's establishment reaches the SMF only after every ReleaseSMContext of
+/// the registration it superseded has reported back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn the_new_establishments_reach_the_smf_after_the_earlier_releases() {
+    let (_smf, smf_port, seen) = activating_smf().await;
+    let _smf_env = super::SmfEnvGuard::set(smf_port);
+    let supi = "imsi-001010000774008";
+    let (_ausf, ausf_port) = confirming_ausf("AUTHENTICATION_SUCCESS", supi).await;
+    let _env = AusfEnvGuard::set(ausf_port);
+    let mut server = capturing_ngap_server().await;
+    let (old, new) = (7_774_071u64, 7_774_072u64);
+    earlier_registration(
+        &mut server,
+        old,
+        95,
+        supi,
+        true,
+        &[(1, "774-o1"), (2, "774-o2")],
+        smf_port,
+    );
+    authenticating_ue(
+        &mut server,
+        new,
+        96,
+        crate::gmm_build::registration_type::INITIAL,
+    );
+
+    server
+        .handle_authentication_response_nas(ASSOC, new, 96, &authentication_response())
+        .await
+        .expect("authentication response handled");
+    // Before the releases' outcomes are back on the NGAP task.
+    server
+        .handle_5gsm_message(ASSOC, new, 96, &establishment_request(1), None)
+        .await
+        .expect("establishment handled");
+    assert_eq!(created_psis(&seen), Vec::<u64>::new(), "it waits");
+
+    server.sbi_offload.settle().await;
+    server.process_sbi_outcomes().await;
+    server.process_supersede_barriers().await;
+
+    let calls: Vec<String> = seen
+        .lock()
+        .expect("smf calls")
+        .iter()
+        .map(|(uri, _)| uri.clone())
+        .collect();
+    let create = calls
+        .iter()
+        .position(|u| u.ends_with("/nsmf-pdusession/v1/sm-contexts"))
+        .expect("the establishment went to the SMF once the releases were done");
+    let last_release = calls
+        .iter()
+        .rposition(|u| u.ends_with("/release"))
+        .expect("released");
+    assert!(last_release < create, "release before create: {calls:?}");
+    assert_eq!(
+        released_refs(&seen),
+        vec!["774-o1".to_string(), "774-o2".to_string()]
+    );
+    assert!(server.supersede_barriers.is_empty());
+    server.forget_ue(new);
 }
