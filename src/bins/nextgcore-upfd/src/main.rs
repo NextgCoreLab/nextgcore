@@ -82,9 +82,10 @@ struct Args {
     #[arg(short = 'l', long)]
     log_file: Option<String>,
 
-    /// Log level (trace, debug, info, warn, error)
-    #[arg(short = 'e', long, default_value = "info")]
-    log_level: String,
+    /// Log level (trace, debug, info, warn, error). Without it, the config
+    /// file's `logger.level`, else `info`; `RUST_LOG` overrides (#691).
+    #[arg(short = 'e', long)]
+    log_level: Option<String>,
 
     /// Disable color output
     #[arg(short = 'm', long)]
@@ -102,6 +103,17 @@ struct Args {
     /// PFCP server port
     #[arg(long, default_value = "8805")]
     pfcp_port: u16,
+
+    /// CP functions (SMF / PGW-C) allowed to set up a PFCP association: IP addresses,
+    /// CIDR prefixes or host names, comma-separated (e.g. `172.23.0.4`, `10.0.0.0/8`,
+    /// `smf-pfcp.nextg-system.svc.cluster.local`; names are re-resolved every 10 s).
+    /// Only the source IP is compared, never the port. A listed host may also replace
+    /// or move a live association (CP failover). FAIL CLOSED: unset refuses every
+    /// Association Setup; `0.0.0.0/0` / `::/0` admit any host (labs only). Security,
+    /// TS 29.244 §6.2.6 / TS 33.501 §9.9. `UPF_PFCP_ALLOWED_PEERS` is read when this
+    /// flag is not given.
+    #[arg(long, default_value = "")]
+    pfcp_allowed_peers: String,
 
     /// GTP-U address
     #[arg(long, default_value = "127.0.0.4")]
@@ -139,6 +151,20 @@ struct Args {
     /// path is unchanged.
     #[arg(long, default_value = "")]
     nrf_uri: String,
+}
+
+/// The PFCP peer allowlist (#968): `--pfcp-allowed-peers`, else `UPF_PFCP_ALLOWED_PEERS`.
+/// A bad entry is an error, so the UPF refuses to start rather than run open.
+fn allowed_peers_setting(
+    flag: &str,
+    env: Option<String>,
+) -> Result<nextgcore_pfcp::peer_policy::PeerAllowlist, String> {
+    let list = if flag.trim().is_empty() {
+        env.unwrap_or_default()
+    } else {
+        flag.to_string()
+    };
+    nextgcore_pfcp::peer_policy::PeerAllowlist::parse(&list)
 }
 
 /// Global shutdown flag
@@ -196,6 +222,7 @@ fn render_metrics() -> String {
         Some(src) => src.data_plane.stats.render_prometheus(),
         None => data_plane::DataPlaneStats::default().render_prometheus(),
     };
+    let unauthorized = pfcp_path::PFCP_UNAUTHORIZED.load(Ordering::Relaxed);
     let mut body = format!(
         "# HELP upf_pfcp_associations Associated CP peers on N4/Sxb (0 or 1: TS 29.244 6.2.6 scopes an association to one CP/UP function pair)\n\
          # TYPE upf_pfcp_associations gauge\n\
@@ -203,6 +230,9 @@ fn render_metrics() -> String {
          # HELP upf_pfcp_sessions Number of PFCP sessions held on N4/Sxb\n\
          # TYPE upf_pfcp_sessions gauge\n\
          upf_pfcp_sessions {sessions}\n\
+         # HELP upf_pfcp_unauthorized_messages_total PFCP messages refused for not coming from the associated CP function\n\
+         # TYPE upf_pfcp_unauthorized_messages_total counter\n\
+         upf_pfcp_unauthorized_messages_total {unauthorized}\n\
          # HELP upf_up 1 when the UPF runtime is serving\n\
          # TYPE upf_up gauge\n\
          upf_up 1\n"
@@ -352,6 +382,23 @@ async fn main() -> Result<()> {
     let pfcp_server = PfcpServer::new(pfcp_addr, shutdown.clone(), pfcp_session_tx)
         .await
         .context("Failed to create PFCP server")?;
+    let allowed_peers = allowed_peers_setting(
+        &args.pfcp_allowed_peers,
+        std::env::var("UPF_PFCP_ALLOWED_PEERS").ok(),
+    )
+    .map_err(|e| anyhow::anyhow!("Invalid --pfcp-allowed-peers / UPF_PFCP_ALLOWED_PEERS: {e}"))?;
+    if allowed_peers.is_configured() {
+        log::info!("PFCP associations accepted only from: {allowed_peers}");
+    } else {
+        log::error!(
+            "--pfcp-allowed-peers / UPF_PFCP_ALLOWED_PEERS is not set: EVERY PFCP \
+             Association Setup will be refused, so no SMF can use this UPF. Set it to the \
+             SMF/PGW-C address(es), CIDR or host name (0.0.0.0/0 admits any host)."
+        );
+    }
+    // Host-name entries are re-resolved off the receive path (#968).
+    allowed_peers.spawn_host_refresh(std::time::Duration::from_secs(10));
+    pfcp_server.set_allowed_peers(allowed_peers);
     let pfcp_server = Arc::new(pfcp_server);
 
     // #325: point the NFProfile/LCI load gauge at the N4 session census. It used to
@@ -535,7 +582,11 @@ async fn main() -> Result<()> {
     let pfcp_for_urr = pfcp_server.clone();
     let shutdown_urr = shutdown.clone();
     let urr_check_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+        // #772: every second, so a periodic report goes out within 1 s of its period
+        // boundary (it was up to 10 s, and the old reset-anchored check added that
+        // lateness to every following period). Detection is a read of atomics and one
+        // instant per URR; nothing is taken unless a report is due.
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
         loop {
             interval.tick().await;
             if shutdown_urr.load(Ordering::SeqCst) {
@@ -705,7 +756,10 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
 /// Initialize logging based on command line arguments
 fn init_logging(args: &Args) -> Result<()> {
     // RUST_LOG if set, else --log-level: the same for every NF (#691).
-    let mut builder = nextgcore_core::log::nf_log_builder(&args.log_level);
+    let mut builder = nextgcore_core::log::nf_log_builder(&nextgcore_core::log::nf_log_level(
+        args.log_level.as_deref(),
+        Some(&args.config),
+    ));
 
     if args.no_color {
         builder.write_style(env_logger::WriteStyle::Never);
@@ -1356,7 +1410,7 @@ mod tests {
     fn test_args_default() {
         let args = Args::parse_from(["nextgcore-upfd"]);
         assert_eq!(args.config, "/etc/nextgcore/upf.yaml");
-        assert_eq!(args.log_level, "info");
+        assert_eq!(args.log_level, None);
         assert_eq!(args.pfcp_addr, "127.0.0.4");
         assert_eq!(args.pfcp_port, 8805);
         assert_eq!(args.gtpu_addr, "127.0.0.4");
@@ -1389,13 +1443,37 @@ mod tests {
             "2048",
         ]);
         assert_eq!(args.config, "/custom/upf.yaml");
-        assert_eq!(args.log_level, "debug");
+        assert_eq!(args.log_level.as_deref(), Some("debug"));
         assert_eq!(args.pfcp_addr, "10.0.0.1");
         assert_eq!(args.pfcp_port, 8806);
         assert_eq!(args.gtpu_addr, "10.0.0.2");
         assert_eq!(args.gtpu_port, 2153);
         assert_eq!(args.tun_ifname, "mytun");
         assert_eq!(args.max_sessions, 2048);
+    }
+
+    #[test]
+    fn the_pfcp_allowed_peers_come_from_the_flag_then_the_environment() {
+        let args = Args::parse_from([
+            "nextgcore-upfd",
+            "--pfcp-allowed-peers",
+            "172.23.0.4,10.0.0.0/8",
+        ]);
+        let a = allowed_peers_setting(&args.pfcp_allowed_peers, Some("192.0.2.1".into())).unwrap();
+        assert!(a.permits("10.1.2.3".parse().unwrap()));
+        assert!(!a.permits("192.0.2.1".parse().unwrap()), "the flag wins");
+
+        let args = Args::parse_from(["nextgcore-upfd"]);
+        let a = allowed_peers_setting(&args.pfcp_allowed_peers, Some("192.0.2.1".into())).unwrap();
+        assert!(a.permits("192.0.2.1".parse().unwrap()));
+        assert!(!a.permits("192.0.2.2".parse().unwrap()));
+        assert!(!allowed_peers_setting("", None).unwrap().is_configured());
+        assert!(allowed_peers_setting("10.0.0.0/33", None).is_err());
+        assert_eq!(
+            allowed_peers_setting("smf.example", None).unwrap().hosts(),
+            ["smf.example"],
+            "a host name is an entry"
+        );
     }
 
     #[test]

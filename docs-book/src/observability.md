@@ -13,8 +13,8 @@ NextGCore ships a Docker-based observability stack (Prometheus, Grafana, Jaeger)
 | NF daemon | Metrics served on `/metrics` | Port |
 |---|---|---|
 | `nextgcore-smfd` | `smf_n4_associations`, `smf_n4_peers`, `smf_sessions`, `smf_up` (and the PGW-C S5/S8 binding) | 9090, or `SMF_METRICS_PORT` |
-| `nextgcore-upfd` | `upf_pfcp_associations`, `upf_pfcp_sessions`, `upf_up`, `upf_dataplane_{ul,dl}_{packets,bytes}_total` and dropped/oversize/spoofed packet counters | 9090, or `UPF_METRICS_PORT` |
-| `nextgcore-sgwud` | `sgwu_pfcp_sessions`, `sgwu_pfcp_associations`, `sgwu_up` | 9090, or `SGWU_METRICS_PORT` |
+| `nextgcore-upfd` | `upf_pfcp_associations`, `upf_pfcp_sessions`, `upf_pfcp_unauthorized_messages_total`, `upf_up`, `upf_dataplane_{ul,dl}_{packets,bytes}_total` and dropped/oversize/spoofed packet counters | 9090, or `UPF_METRICS_PORT` |
+| `nextgcore-sgwud` | `sgwu_pfcp_sessions`, `sgwu_pfcp_associations`, `sgwu_pfcp_unauthorized_messages_total`, `sgwu_up` | 9090, or `SGWU_METRICS_PORT` |
 | `nextgcore-udmd` | NES energy gauges, only with `--features nes` | NES `metrics_port` (default 9090) |
 | `nextgcore-nsacfd` | slice-SLA observe gauges, only with `--features sla-observe` | its `metrics_port` when > 0 |
 
@@ -111,11 +111,11 @@ All NFs log to **stdout/stderr** via `env_logger`. Every NF binary uses millisec
 | AMF-style | `-l, --log-level` (default `info`), `--no-color`, `-d, --daemon` — **no** log-file flag | `nextgcore-amfd`, `nextgcore-mmed`, `nextgcore-sgwcd` |
 | ucmfd | `-e, --log-level` only; no log-file or no-color flag | `nextgcore-ucmfd` |
 
-`nextgcore-smfd` and `nextgcore-sgwud` have no clap parser. smfd — scans `std::env::args()` only for `-c <config>` (and `--state-file`) and takes its log level purely from `RUST_LOG` (default `info`); sgwud scans for `-c` and `-l/--log-level`.
+`nextgcore-smfd` and `nextgcore-sgwud` have no clap parser. smfd scans `std::env::args()` for `-c/--config`, `-e/--log-level` (and `--state-file`); sgwud scans for `-c` and `-l/--log-level`.
 
-**`RUST_LOG` precedence is the same in every NF.** Every NF builds its logger with `nextgcore_core::log::nf_log_builder` (#691): `RUST_LOG`, when set, is the filter; otherwise the `--log-level` flag applies (an unknown value means `info`). `RUST_LOG_STYLE` sets the colour style; `--no-color` overrides it.
+**The level is chosen the same way in every NF.** Every NF builds its logger with `nextgcore_core::log::nf_log_builder` (#691): `RUST_LOG`, when set, is the filter; otherwise the level is `--log-level` when given, else the config file's `logger.level`, else `info` (`nextgcore_core::log::nf_log_level`; an unknown value means `info`). `RUST_LOG_STYLE` sets the colour style; `--no-color` overrides it.
 
-Precedence, in full: a set, non-blank `RUST_LOG` **replaces** `--log-level`; the two are not merged. So `RUST_LOG=nextgcore_amfd=debug` alone logs only amfd's own targets (at debug) and silences every other target. Include a default level, as the compose files do (`info,nextgcore_amfd=debug`), to keep the rest at `info`. A blank `RUST_LOG=` counts as unset. `src/libs/nextgcore-core/tests/nf_logging_init.rs` fails if a daemon builds its own logger.
+Precedence, in full: a set, non-blank `RUST_LOG` **replaces** the resolved level (`--log-level` / `logger.level` / `info`); they are not merged. So `RUST_LOG=nextgcore_amfd=debug` alone logs only amfd's own targets (at debug) and silences every other target. Include a default level, as the compose files do (`info,nextgcore_amfd=debug`), to keep the rest at `info`. A blank `RUST_LOG=` counts as unset. `src/libs/nextgcore-core/tests/nf_logging_init.rs` fails if a daemon builds its own logger, skips `nf_log_level`, or gives its `log_level` flag a clap default (which would hide `logger.level`).
 
 **`--log-file` is accepted but not wired.** 22 binary crates (ausfd, bsfd, dccfd, easdfd, eesd, hssd, lmfd, mbsmfd, nefd, nrfd, nsacfd, nssfd, nwdafd, pcfd, pcrfd, pind, scpd, seppd, tsctsf, udmd, udrd, upfd — `grep -rl log_file src/bins/*/src/*.rs`) declare a `log_file` CLI arg, but in none of them is the parsed value ever consumed by the logging setup — e.g. nrfd's `init_logging()` never references `args.log_file`. Logs always go to stdout/stderr; rely on `docker logs` or shell redirection.
 

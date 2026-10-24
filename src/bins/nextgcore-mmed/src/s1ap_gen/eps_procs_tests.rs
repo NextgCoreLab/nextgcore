@@ -668,6 +668,48 @@ fn a_late_modify_bearer_response_does_not_overwrite_newer_state() {
 /// E-RAB ID twice, or leaving out an E-RAB of the UE context, triggers the UE
 /// Context Release procedure (cause multiple-E-RAB-ID-instances, resp.
 /// unspecified); nothing is switched.
+/// #949 review: an E-RAB being deactivated (#863) may be left out of an E-RAB
+/// MODIFICATION INDICATION without that being the §8.2.4.4 "does not contain
+/// all the E-RABs" case: the UE context is not released.
+#[test]
+fn an_indication_omitting_an_erab_being_deactivated_is_not_abnormal() {
+    let _guard = crate::gtp_path::lock_s11();
+    crate::bearer_deactivation::clear_for_test();
+    let (ctx, enb_id) = setup();
+    let (_, mme_ue_id, mme, enb, ids) = ue_with_bearers(&ctx, enb_id);
+    assert!(
+        crate::bearer_deactivation::start(
+            &ctx,
+            mme_ue_id,
+            "127.0.0.1:2123".parse().unwrap(),
+            0x949,
+            1,
+            crate::bearer_deactivation::DeleteBearerAnswer::Ebis(vec![6]),
+            None,
+            &[6],
+            false,
+        ),
+        "E-RAB 6 is being deactivated"
+    );
+    assert!(ctx.bearer_find_by_id(ids[1]).is_some());
+    let out = handle_s1ap_message(
+        &ctx,
+        enb_id,
+        &erab_modification_indication(mme, enb, Some(&[(5, 0x5151)])),
+    );
+    assert!(
+        out.iter().all(|s| !matches!(
+            nextgcore_s1ap_gen::decode(&s.pdu),
+            Ok(g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+                value: g::InitiatingMessageValue::Id_UEContextRelease(_),
+                ..
+            }))
+        )),
+        "no UE Context Release"
+    );
+    crate::bearer_deactivation::clear_for_test();
+}
+
 #[test]
 fn an_abnormal_erab_modification_indication_releases_the_ue_context() {
     let _guard = crate::gtp_path::lock_s11();

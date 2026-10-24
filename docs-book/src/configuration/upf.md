@@ -62,11 +62,12 @@ Defaults below are the real clap `default_value`s from the source.
 |-----------|------|---------|-------------|
 | `-c, --config` | string | `/etc/nextgcore/upf.yaml` | Configuration file path. Read if present, but contents are not applied (see note above). |
 | `-l, --log-file` | string | *(none)* | Log file path. |
-| `-e, --log-level` | string | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error`. |
+| `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-m, --no-color` | bool | `false` | Disable colored log output. |
 | `-k, --kill` | bool | `false` | Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor. |
 | `--pfcp-addr` | string | `127.0.0.4` | N4 PFCP server bind address. |
 | `--pfcp-port` | u16 | `8805` | N4 PFCP server port. |
+| `--pfcp-allowed-peers` | list | empty | SMF/PGW-C hosts allowed to set up the PFCP association: IPs, CIDR prefixes or host names (re-resolved every 10 s, and at once -- at most once a second -- when a Setup comes from an unresolved address; a failed lookup keeps the last good addresses), comma-separated; `UPF_PFCP_ALLOWED_PEERS` when the flag is not given. Only the source IP is compared. A listed host may move a live association only as the same CP function (one of its hosts, or the same Node ID); a different CP function is refused until the association is released or times out. The Node ID is sender-written, so a broad entry (a pod CIDR, `0.0.0.0/0`) lets any host in range that knows the SMF's Node ID take the association over: prefer the SMF's own address or headless Service name. **Fail closed:** empty refuses every Association Setup (logged as an error at startup); `0.0.0.0/0` / `::/0` admit any host (labs only). The shipped compose, Helm, k8s and EKS deployments set it. Every PFCP message other than Heartbeat and Association Setup is accepted only from the associated SMF's hosts (its Setup source, its IPv4/IPv6 Node ID, or the addresses its FQDN Node ID resolves to); refusals count in `upf_pfcp_unauthorized_messages_total`. |
 | `--gtpu-addr` | string | `127.0.0.4` | N3 GTP-U bind address. |
 | `--gtpu-port` | u16 | `2152` | N3 GTP-U port. |
 | `--tun-ifname` | string | `ogstun` | TUN interface name for the user-plane subnet. |

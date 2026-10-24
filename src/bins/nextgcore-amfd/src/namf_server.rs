@@ -45,7 +45,10 @@ const NOTIFY_REQUEST_TIMEOUT_SECS: u64 = 3;
 pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.clone();
     let uri = request.header.uri.clone();
-    log::debug!("AMF SBI request: {method} {uri}");
+    log::debug!(
+        "AMF SBI request: {method} {}",
+        nextgcore_sbi::log_redact::redact_callback_tokens(&uri)
+    );
 
     let path = uri.split('?').next().unwrap_or(&uri);
     let parts: Vec<&str> = path
@@ -250,6 +253,15 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
         //   POST /namf-callback/v1/ucmf-notify
         "namf-callback" if parts.len() == 3 && parts[2] == "ucmf-notify" && method == "POST" => {
             handle_ucmf_notify_callback(&request)
+        }
+        // Namf_Callback: Nnrf_NFManagement NFStatusNotify (#668, TS 29.510
+        // §5.2.2.6), POSTed to the nfStatusNotificationUri of the AMF's
+        // NF status subscriptions (`nrf_subscription`).
+        //   POST /namf-callback/v1/nf-status-notify/{token}
+        "namf-callback"
+            if parts.len() == 4 && parts[2] == "nf-status-notify" && method == "POST" =>
+        {
+            handle_nf_status_notify_callback(parts[3], &request).await
         }
         //   POST /namf-callback/v1/{supi}/dereg-notify/{token}   (#753)
         //   POST /namf-callback/v1/{supi}/dereg-notify           (registrations
@@ -474,6 +486,37 @@ fn handle_ucmf_notify_callback(request: &SbiRequest) -> SbiResponse {
         retired.len()
     );
     SbiResponse::no_content()
+}
+
+/// NFStatusNotify callback (#668, TS 29.510 §5.2.2.6).
+///
+/// `token` names the subscription the notification belongs to; one the AMF
+/// does not hold gets 404 and changes nothing (#940 review M2). Otherwise the
+/// named NF instance is dropped from the discovery cache, or re-discovered when
+/// it is the last of its type, when it deregistered or an attribute the cache
+/// uses changed, at most once per instance per `EVICT_HOLD`. The body's
+/// `nfProfile` is never read: the next request re-discovers (see
+/// `nrf_subscription`). 204 on success, 400 for a body without `event` or
+/// `nfInstanceUri`.
+async fn handle_nf_status_notify_callback(token: &str, request: &SbiRequest) -> SbiResponse {
+    use crate::nrf_subscription::{
+        apply_notification, classify_notification, token_nf_type, NotifyError,
+    };
+    let Some(nf_type) = token_nf_type(token) else {
+        log::warn!("NF status notification on a subscription this AMF does not hold; refused");
+        return SbiResponse::with_status(404);
+    };
+    let Some(body) = parse_json_body(request) else {
+        return malformed_body();
+    };
+    match classify_notification(&body) {
+        Ok(action) => {
+            apply_notification(&nf_type, &action).await;
+            SbiResponse::no_content()
+        }
+        Err(NotifyError::Missing(attr)) => mandatory_ie_missing(attr),
+        Err(NotifyError::Incorrect(attr, detail)) => mandatory_ie_incorrect(attr, &detail),
+    }
 }
 
 /// Nudm_UECM DeregistrationNotification callback (WSB-4, TS 29.503 §5.3.2.3.2).
