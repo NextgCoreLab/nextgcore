@@ -1328,10 +1328,19 @@ fn released_s1u_releases_are_bounded_per_window() {
         .get_mut(&ue.mme_ue_id)
         .unwrap()
         .stale_s1u_releases = vec![now - Duration::from_secs(20), now - Duration::from_secs(5)];
+    let capped0 =
+        crate::s11_handler::DDN_RELEASES_CAPPED_TOTAL.load(std::sync::atomic::Ordering::Relaxed);
     let (cause, sent) = notify(&sgw, mme, &ue, 5, 0x1023);
-    assert_eq!(cause, 16);
+    assert_eq!(cause, 90, "Unable to page UE (TS 29.274 Table 8.4-1)");
     assert!(sent.is_empty(), "no Release Access Bearers");
     assert!(untouched(&ue), "bounded: no third release in the window");
+    assert_eq!(
+        crate::s11_handler::DDN_RELEASES_CAPPED_TOTAL.load(std::sync::atomic::Ordering::Relaxed),
+        capped0 + 1,
+        "counted"
+    );
+    assert!(crate::s11_handler::render_metrics()
+        .contains("# TYPE mme_ddn_released_s1u_capped_total counter"));
 
     // The window has passed: released again.
     ctx.mme_ue_pool

@@ -1695,6 +1695,15 @@ fn dispatch_s5c_create_session_response(msg: &Gtp2Message, peer: SocketAddr) {
             "no Sxa association to provision it when the PGW answered",
         );
         ctx.sess_remove(sess.id);
+        // #1052 review: a UE whose first PDN connection this was has nothing left;
+        // its context goes too, as it would have had the request been refused at
+        // once.
+        if ctx
+            .ue_find_by_id(sess.sgwc_ue_id)
+            .is_some_and(|ue| ue.sess_ids.is_empty())
+        {
+            ctx.ue_remove(sess.sgwc_ue_id);
+        }
     }
 }
 
@@ -2011,6 +2020,33 @@ pub(crate) fn release_s1u_bearers(ue: &crate::context::SgwcUe, xact: u64) -> usi
     sent
 }
 
+/// Delete Session Requests relayed from the MME to the PGW over S5/S8 (#1025).
+pub static S5_DELETES_RELAYED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// S5/S8 Delete Session Responses the PGW answered Request accepted (#1025).
+pub static S5_DELETES_ACCEPTED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Prometheus lines for the S5/S8 Delete Session counters (#1052 review: the EPC
+/// E2E detach stage reads these rather than log text).
+pub(crate) fn render_s5_delete_metrics(out: &mut String) {
+    use std::fmt::Write;
+    let _ = writeln!(
+        out,
+        "# HELP sgwc_s5_delete_session_relayed_total Delete Session Requests relayed to \
+         the PGW\n# TYPE sgwc_s5_delete_session_relayed_total counter\n\
+         sgwc_s5_delete_session_relayed_total {}",
+        S5_DELETES_RELAYED_TOTAL.load(Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        out,
+        "# HELP sgwc_s5_delete_session_accepted_total S5/S8 Delete Session Responses with \
+         Request accepted\n# TYPE sgwc_s5_delete_session_accepted_total counter\n\
+         sgwc_s5_delete_session_accepted_total {}",
+        S5_DELETES_ACCEPTED_TOTAL.load(Ordering::Relaxed)
+    );
+}
+
 /// A Delete Session Request sent to the PGW, waiting for its answer (#1025), by the
 /// S5/S8 sequence number: the session, and the MME request to answer when it is a
 /// relay. `mme` is `None` for a session the SGW-C abandons itself after the PGW
@@ -2114,6 +2150,7 @@ fn relay_delete_session_to_pgw(
         take_pending_s5c_delete(s5c_seq);
         return false;
     }
+    S5_DELETES_RELAYED_TOTAL.fetch_add(1, Ordering::Relaxed);
     log::info!(
         "Delete Session Request for session {} relayed to the PGW {pgw} (seq={s5c_seq})",
         sess.id
@@ -2226,6 +2263,9 @@ fn dispatch_s5c_delete_session_response(msg: &Gtp2Message, peer: SocketAddr) {
         "S5/S8 Delete Session Response from {peer} (seq={}) cause={cause}",
         msg.header.sequence_number
     );
+    if cause == gtp_cause::REQUEST_ACCEPTED {
+        S5_DELETES_ACCEPTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
     continue_delete_session_after_pgw(msg.header.sequence_number, Some(cause));
 }
 
@@ -4490,12 +4530,8 @@ mod tests {
         let deletes = pgw_deletes(&pgw, 1).await;
         assert_eq!(deletes, vec![(Some(0x0BEE_F001), Some(5), true)]);
         assert!(
-            sgwc_self()
-                .ue_find_by_imsi(&imsi)
-                .unwrap()
-                .sess_ids
-                .is_empty(),
-            "the local session is removed"
+            sgwc_self().ue_find_by_imsi(&imsi).is_none(),
+            "the first PDN connection's UE context is removed with its session"
         );
         sgwc_self().set_pgw_s5c_peer(None);
         server.close();
@@ -4539,6 +4575,11 @@ mod tests {
             vec![(Some(0x0BEE_F001), Some(5), true)],
             "relayed once, to the PGW's S5/S8-C TEID, with the LBI and OI"
         );
+        // #1052 review: what the EPC E2E detach stage reads.
+        let metrics = crate::main_render_metrics_for_test();
+        assert!(metrics.contains("# TYPE sgwc_s5_delete_session_relayed_total counter"));
+        assert!(S5_DELETES_RELAYED_TOTAL.load(Ordering::Relaxed) >= 1);
+        assert!(S5_DELETES_ACCEPTED_TOTAL.load(Ordering::Relaxed) >= 1);
         assert_eq!(sgwu.received(54), 1, "the SGW-U's session is deleted");
         let ue = sgwc_self().ue_find_by_imsi(&imsi).unwrap();
         assert!(ue.sess_ids.is_empty(), "the session is gone");

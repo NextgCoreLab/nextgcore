@@ -48,7 +48,10 @@ pub fn gtp_cause_from_pfcp(pfcp_cause: u8, gtp_version: u8) -> u8 {
     match gtp_version {
         1 => match pfcp_cause {
             c if c == PfcpCause::RequestAccepted as u8 => gtp1_cause::REQUEST_ACCEPTED,
-            c if c == PfcpCause::RequestRejected as u8 => gtp1_cause::REJ_MS_NOT_GPRS_RESPONDING,
+            // #1055 review: GTPv1 has no "request rejected, reason not specified"
+            // (TS 29.060 §7.7.1); 196 says the MS is not GPRS-responding, which is
+            // false. A UP function's unspecified refusal is a system failure (204).
+            c if c == PfcpCause::RequestRejected as u8 => gtp1_cause::SYSTEM_FAILURE,
             c if c == PfcpCause::SessionContextNotFound as u8 => gtp1_cause::CONTEXT_NOT_FOUND,
             c if c == PfcpCause::MandatoryIeMissing as u8 => gtp1_cause::MANDATORY_IE_MISSING,
             c if c == PfcpCause::ConditionalIeMissing as u8 => gtp1_cause::MANDATORY_IE_MISSING,
@@ -64,6 +67,9 @@ pub fn gtp_cause_from_pfcp(pfcp_cause: u8, gtp_version: u8) -> u8 {
             c if c == PfcpCause::NoEstablishedPfcpAssociation as u8 => {
                 gtp1_cause::NO_RESOURCES_AVAILABLE
             }
+            // The rules the UP function failed to create are the PDP context's
+            // packet filters (its TFT), so 215 Semantic error in the TFT operation,
+            // as the GTPv2 mapping below gives (TS 29.274 cause 74).
             c if c == PfcpCause::RuleCreationModificationFailure as u8 => {
                 gtp1_cause::SEMANTIC_ERR_TFT_OPERATION
             }
@@ -766,12 +772,14 @@ mod tests {
     fn pfcp_causes_map_to_their_ts_29_060_octets() {
         for (pfcp, octet) in [
             (PfcpCause::RequestAccepted, 128u8),
-            (PfcpCause::RequestRejected, 196),
+            // 204 System failure: not 196 "MS is not GPRS Responding" (#1055 review).
+            (PfcpCause::RequestRejected, 204),
             (PfcpCause::SessionContextNotFound, 210),
             (PfcpCause::MandatoryIeMissing, 202),
             (PfcpCause::MandatoryIeIncorrect, 201),
             (PfcpCause::InvalidLength, 193),
             (PfcpCause::NoResourcesAvailable, 199),
+            // 215 Semantic error in the TFT operation, as GTPv2's 74.
             (PfcpCause::RuleCreationModificationFailure, 215),
             (PfcpCause::PfcpEntityInCongestion, 229),
             (PfcpCause::ServiceNotSupported, 200),
@@ -780,6 +788,11 @@ mod tests {
         ] {
             assert_eq!(gtp_cause_from_pfcp(pfcp as u8, 1), octet, "{pfcp:?}");
         }
+        // The TFT mapping matches GTPv2's (TS 29.274 Table 8.4-1, 74).
+        assert_eq!(
+            gtp_cause_from_pfcp(PfcpCause::RuleCreationModificationFailure as u8, 2),
+            74
+        );
         // On the wire: a Delete PDP Context Response refusing for a missing
         // context carries the Cause IE (TV, type 1) with 210.
         assert_eq!(

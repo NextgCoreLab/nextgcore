@@ -452,13 +452,13 @@ fn notify_backoff(attempt: u32) -> std::time::Duration {
 /// resending the same bytes cannot help — only transport failures and 5xx are
 /// worth another attempt (TS 29.500 §6.10).
 async fn deliver_notification(
-    uri: &str,
+    notification_uri: &str,
     alternates: &[String],
     suffix: &str,
     body: &serde_json::Value,
     what: &str,
 ) -> bool {
-    for (endpoint_idx, endpoint) in std::iter::once(uri)
+    for (endpoint_idx, notify_uri) in std::iter::once(notification_uri)
         .chain(alternates.iter().map(String::as_str))
         .enumerate()
     {
@@ -467,32 +467,32 @@ async fn deliver_notification(
             if !backoff.is_zero() {
                 tokio::time::sleep(backoff).await;
             }
-            match send_notification_post(endpoint, suffix, body).await {
+            match send_notification_post(notify_uri, suffix, body).await {
                 Ok(status) if (200..300).contains(&status) => {
                     log::info!(
-                        "{what} notification delivered ({status}) to {endpoint}{suffix} \
-                         (endpoint {endpoint_idx}, attempt {attempt})"
+                        "{what} notification delivered ({status}) to {notify_uri}{suffix} \
+                         (notify_uri {endpoint_idx}, attempt {attempt})", notify_uri = nextgcore_sbi::log_redact::redact_last_segment(notify_uri)
                     );
                     return true;
                 }
                 Ok(status) if (400..500).contains(&status) => {
                     log::warn!(
-                        "{what} notification rejected ({status}) by {endpoint}{suffix}; not retrying"
+                        "{what} notification rejected ({status}) by {notify_uri}{suffix}; not retrying", notify_uri = nextgcore_sbi::log_redact::redact_last_segment(notify_uri)
                     );
                     break;
                 }
                 Ok(status) => log::warn!(
-                    "{what} notification got {status} from {endpoint}{suffix} (attempt {attempt})"
+                    "{what} notification got {status} from {notify_uri}{suffix} (attempt {attempt})", notify_uri = nextgcore_sbi::log_redact::redact_last_segment(notify_uri)
                 ),
                 Err(e) => {
                     log::warn!(
-                        "{what} notification to {endpoint}{suffix} failed: {e} (attempt {attempt})"
+                        "{what} notification to {notify_uri}{suffix} failed: {e} (attempt {attempt})", notify_uri = nextgcore_sbi::log_redact::redact_last_segment(notify_uri)
                     )
                 }
             }
         }
     }
-    log::warn!("{what} notification undelivered after every endpoint and retry");
+    log::warn!("{what} notification undelivered after every notify_uri and retry");
     false
 }
 
@@ -880,11 +880,13 @@ fn notify_unrestorable_associations(
             entry.notification_uri.as_deref(),
             entry.sm_policy_id.as_deref(),
         ) {
-            (Some(uri), Some(id)) => {
+            (Some(notification_uri), Some(id)) => {
                 log::warn!(
                     "boot restoration: SM policy association {id} cannot be served ({}); \
-                     terminating it toward {uri}",
-                    entry.reason
+                     terminating it toward {notification_uri}",
+                    entry.reason,
+                    notification_uri =
+                        nextgcore_sbi::log_redact::redact_last_segment(notification_uri)
                 );
                 // TS 29.512 TerminationNotification: the resource the consumer
                 // holds, plus a cause. UNSPECIFIED because none of the enumerated
@@ -894,7 +896,12 @@ fn notify_unrestorable_associations(
                     "resourceUri": format!("/npcf-smpolicycontrol/v1/sm-policies/{id}"),
                     "cause": "UNSPECIFIED",
                 });
-                if spawn_notification(uri.to_string(), "/terminate", body, "SM policy terminate") {
+                if spawn_notification(
+                    notification_uri.to_string(),
+                    "/terminate",
+                    body,
+                    "SM policy terminate",
+                ) {
                     notified += 1;
                 } else {
                     unnotifiable += 1;
@@ -1513,7 +1520,9 @@ pub async fn pcf_subscribe_udr_policy_data() -> Option<String> {
             log::info!(
                 "Subscribed to UDR policy-data changes; notifications arrive at \
                  {notification_uri} (subscription {})",
-                location.as_deref().unwrap_or("<no Location>")
+                location.as_deref().unwrap_or("<no Location>"),
+                notification_uri =
+                    nextgcore_sbi::log_redact::redact_last_segment(&notification_uri)
             );
             location
         }

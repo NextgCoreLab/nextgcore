@@ -697,7 +697,7 @@ pub fn handle_event_subscribe(
     log::info!(
         "Event subscription request: event={:?}, callback={}",
         subscription.event_type,
-        callback_uri
+        nextgcore_sbi::log_redact::redact_last_segment(callback_uri)
     );
 
     // Validate subscription

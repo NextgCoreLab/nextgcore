@@ -46,7 +46,8 @@ use tokio::sync::mpsc;
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueuedNotification {
     /// Absolute callback URI (`notificationDestination`) to POST to.
-    pub uri: String,
+    /// The consumer's callback URI; logged only redacted (#1047 review).
+    pub callback_uri: String,
     /// The serialized spec notification body (`application/json`).
     pub body: serde_json::Value,
     /// Schema name of `body` (e.g. `"ACRInfoNotification"`), for logs/metrics.
@@ -79,7 +80,7 @@ impl Notifier for QueueNotifier {
         log::info!(
             "notification queued (D5 stub — delivery lands in D6): kind={} uri={}",
             item.kind,
-            item.uri
+            nextgcore_sbi::log_redact::redact_last_segment(&item.callback_uri)
         );
         if let Ok(mut q) = self.queue.write() {
             q.push(item);
@@ -120,7 +121,11 @@ pub fn set_notifier(n: Arc<dyn Notifier>) {
 
 /// Build a [`QueuedNotification`] and hand it to the current notifier.
 pub fn enqueue(uri: String, body: serde_json::Value, kind: &'static str) {
-    notifier().enqueue(QueuedNotification { uri, body, kind });
+    notifier().enqueue(QueuedNotification {
+        callback_uri: uri,
+        body,
+        kind,
+    });
 }
 
 // ===========================================================================
@@ -212,7 +217,7 @@ impl Notifier for SbiNotifier {
             log::warn!(
                 "EES notifier dropping {} to {} ({reason})",
                 dropped.kind,
-                dropped.uri
+                nextgcore_sbi::log_redact::redact_last_segment(&dropped.callback_uri)
             );
             self.dropped.fetch_add(1, Ordering::SeqCst);
         }
@@ -239,10 +244,17 @@ pub fn install_sbi_notifier(config: SbiNotifierConfig) {
 /// (logged + counted). Never panics; never blocks a caller (runs on the
 /// background worker).
 async fn deliver(item: QueuedNotification, config: &SbiNotifierConfig, dropped: &AtomicU64) {
-    let QueuedNotification { uri, body, kind } = item;
+    let QueuedNotification {
+        callback_uri,
+        body,
+        kind,
+    } = item;
 
-    let Some((scheme, host, port, path)) = parse_callback_uri(&uri) else {
-        log::error!("EES notifier: unparseable callback URI {uri:?} for {kind}; dropping");
+    let Some((scheme, host, port, path)) = parse_callback_uri(&callback_uri) else {
+        log::error!(
+            "EES notifier: unparseable callback URI {callback_uri:?} for {kind}; dropping",
+            callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
+        );
         dropped.fetch_add(1, Ordering::SeqCst);
         return;
     };
@@ -263,21 +275,24 @@ async fn deliver(item: QueuedNotification, config: &SbiNotifierConfig, dropped: 
             SbiRequest::post(path.clone()).with_body(body_str.clone(), "application/json");
         match client.send_request(request).await {
             Ok(resp) if resp.status == 204 => {
-                log::debug!("EES notifier delivered {kind} to {uri} (204, attempt {attempt})");
+                log::debug!(
+                    "EES notifier delivered {kind} to {callback_uri} (204, attempt {attempt})",
+                    callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
+                );
                 return;
             }
             Ok(resp) if resp.status == 200 => {
                 log::warn!(
-                    "EES notifier: {kind} to {uri} answered 200 (spec expects 204); accepting"
+                    "EES notifier: {kind} to {callback_uri} answered 200 (spec expects 204); accepting", callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
                 );
                 return;
             }
             Ok(resp) => {
                 if attempt >= max {
                     log::error!(
-                        "EES notifier: giving up on {kind} to {uri} after {attempt} attempt(s) \
+                        "EES notifier: giving up on {kind} to {callback_uri} after {attempt} attempt(s) \
                          (last status {})",
-                        resp.status
+                        resp.status, callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
                     );
                     dropped.fetch_add(1, Ordering::SeqCst);
                     return;
@@ -289,8 +304,8 @@ async fn deliver(item: QueuedNotification, config: &SbiNotifierConfig, dropped: 
             Err(e) => {
                 if attempt >= max {
                     log::error!(
-                        "EES notifier: giving up on {kind} to {uri} after {attempt} attempt(s) \
-                         (transport error: {e})"
+                        "EES notifier: giving up on {kind} to {callback_uri} after {attempt} attempt(s) \
+                         (transport error: {e})", callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
                     );
                     dropped.fetch_add(1, Ordering::SeqCst);
                     return;
@@ -375,18 +390,18 @@ mod tests {
         let n = QueueNotifier::default();
         assert!(n.drain().is_empty());
         n.enqueue(QueuedNotification {
-            uri: "http://cb/1".into(),
+            callback_uri: "http://cb/1".into(),
             body: serde_json::json!({"subId":"s1"}),
             kind: "ACRInfoNotification",
         });
         n.enqueue(QueuedNotification {
-            uri: "http://cb/2".into(),
+            callback_uri: "http://cb/2".into(),
             body: serde_json::json!({"subId":"s2"}),
             kind: "ACRInfoNotification",
         });
         let drained = n.drain();
         assert_eq!(drained.len(), 2);
-        assert_eq!(drained[0].uri, "http://cb/1");
+        assert_eq!(drained[0].callback_uri, "http://cb/1");
         // drain clears the queue.
         assert!(n.drain().is_empty());
     }
@@ -556,7 +571,7 @@ mod tests {
             ..Default::default()
         });
         n.enqueue(QueuedNotification {
-            uri: format!("http://127.0.0.1:{port}/acr-cb"),
+            callback_uri: format!("http://127.0.0.1:{port}/acr-cb"),
             body: notif_body(),
             kind: "ACRInfoNotification",
         });
@@ -599,7 +614,7 @@ mod tests {
             ..Default::default()
         });
         n.enqueue(QueuedNotification {
-            uri: format!("http://127.0.0.1:{port}/acr-cb"),
+            callback_uri: format!("http://127.0.0.1:{port}/acr-cb"),
             body: notif_body(),
             kind: "ACRInfoNotification",
         });
@@ -635,7 +650,7 @@ mod tests {
             ..Default::default()
         });
         n.enqueue(QueuedNotification {
-            uri: format!("http://127.0.0.1:{port}/acr-cb"),
+            callback_uri: format!("http://127.0.0.1:{port}/acr-cb"),
             body: notif_body(),
             kind: "ACRInfoNotification",
         });
@@ -679,7 +694,7 @@ mod tests {
         });
         let start = std::time::Instant::now();
         n.enqueue(QueuedNotification {
-            uri: format!("http://127.0.0.1:{port}/acr-cb"),
+            callback_uri: format!("http://127.0.0.1:{port}/acr-cb"),
             body: notif_body(),
             kind: "ACRInfoNotification",
         });
