@@ -505,6 +505,13 @@ async fn a_blackholed_smf_holds_neither_the_registration_nor_the_new_sessions_fo
     tokio::time::sleep(Duration::from_millis(500)).await;
     server.process_sbi_outcomes().await;
     server.process_supersede_barriers().await;
+    // #922: the released establishment's CreateSMContext runs off the NGAP task.
+    for _ in 0..200 {
+        if !created_psis(&seen).is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     assert_eq!(
         created_psis(&seen),
         vec![1],
@@ -557,6 +564,9 @@ async fn the_new_establishments_reach_the_smf_after_the_earlier_releases() {
     server.sbi_offload.settle().await;
     server.process_sbi_outcomes().await;
     server.process_supersede_barriers().await;
+    // #922: the released establishment's CreateSMContext runs off the NGAP task.
+    server.sbi_offload.settle().await;
+    server.process_sbi_outcomes().await;
 
     let calls: Vec<String> = seen
         .lock()
