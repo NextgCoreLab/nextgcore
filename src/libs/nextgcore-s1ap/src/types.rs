@@ -1118,12 +1118,24 @@ pub struct UeSecurityCapabilities {
 }
 
 /// Security Context (for handover)
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SecurityContext {
     /// Next Hop Chaining Count (0..7)
     pub next_hop_chaining_count: u8,
     /// Next Hop parameter (NH, 256 bits)
     pub next_hop_parameter: [u8; 32],
+}
+
+/// Manual `Debug` (no-auth-material-in-logs): the authentication material in
+/// this type (next_hop_parameter) prints as `<redacted>`, so a future
+/// `{:?}` in a log line cannot leak it.
+impl std::fmt::Debug for SecurityContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("SecurityContext");
+        d.field("next_hop_chaining_count", &self.next_hop_chaining_count);
+        d.field("next_hop_parameter", &"<redacted>");
+        d.finish()
+    }
 }
 
 /// Target ID for handover - CHOICE

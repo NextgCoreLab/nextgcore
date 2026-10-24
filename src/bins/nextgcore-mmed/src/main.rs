@@ -7,6 +7,7 @@ use clap::Parser;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+pub mod bearer_deactivation;
 pub mod config;
 pub mod context;
 pub mod emm_build;
@@ -308,6 +309,10 @@ impl MmeApp {
             for send in s1ap_handler::expire_handover_preparations(ctx, std::time::Instant::now()) {
                 s1ap_path::s1ap_send(send);
             }
+            // A UE-AMBR change deferred behind a handover that just expired (#869).
+            for send in s6a_handler::deferred_ue_ambr_sends(ctx) {
+                s1ap_path::s1ap_send(send);
+            }
 
             // Signal or lift S1AP overload if the attached-UE count crossed the
             // configured threshold (TS 36.413 §8.7.6). A no-op unless
@@ -428,19 +433,8 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     // Initialize logging
-    let log_level = match args.log_level.to_lowercase().as_str() {
-        "trace" => log::LevelFilter::Trace,
-        "debug" => log::LevelFilter::Debug,
-        "info" => log::LevelFilter::Info,
-        "warn" => log::LevelFilter::Warn,
-        "error" => log::LevelFilter::Error,
-        _ => log::LevelFilter::Info,
-    };
-
-    env_logger::Builder::new()
-        .filter_level(log_level)
-        .format_timestamp_millis()
-        .init();
+    // RUST_LOG if set, else --log-level: the same for every NF (#691).
+    nextgcore_core::log::nf_log_builder(&args.log_level).init();
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = nextgcore_metrics::otel::init_otel(
         nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
@@ -477,7 +471,7 @@ async fn main() -> Result<()> {
                  received in RFC 3539 REOPEN and not delivered (requests answered 3004)\n\
                  # TYPE mme_diameter_reopen_discards_total counter\n\
                  mme_diameter_reopen_discards_total {}\n",
-                handover_switch::render_metrics(),
+                handover_switch::render_metrics() + &s1ap_handler::render_metrics(),
                 nextgcore_diameter::session::reopen_discards()
             )
         }),
