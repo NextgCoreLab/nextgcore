@@ -1185,7 +1185,13 @@ fn emm_tau_request(
         let was = mme_ue.paging.type_;
         mme_ue.t3413.stop();
         mme_ue.paging.type_ = crate::context::PagingType::None;
-        was == crate::context::PagingType::DownlinkDataNotification
+        // #984 review: a paging for a deactivation parked behind it (#862)
+        // needs the user plane too: its steps 4c-8 run on the ICS response.
+        matches!(
+            was,
+            crate::context::PagingType::DownlinkDataNotification
+                | crate::context::PagingType::DeleteBearer
+        )
     } else {
         false
     };

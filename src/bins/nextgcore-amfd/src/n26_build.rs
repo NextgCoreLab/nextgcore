@@ -41,7 +41,7 @@ use nextgcore_gtp::v2::{
 };
 
 /// GTPv2-C cause `Request accepted` (TS 29.274 Table 8.4-1).
-pub const CAUSE_REQUEST_ACCEPTED: u8 = 16;
+pub use nextgcore_gtp::v2::cause::REQUEST_ACCEPTED as CAUSE_REQUEST_ACCEPTED;
 
 /// GTPv2-C cause `Relocation failure` (TS 29.274 Table 8.4-1).
 ///
@@ -53,7 +53,7 @@ pub const CAUSE_REQUEST_ACCEPTED: u8 = 16;
 /// **81**, read off its own Table 8.4-1 row (`29274-j60.txt:25480`). The first draft of this
 /// constant said 75 -- which is *"Syntactic error in the TFT operation"* -- and the revert-check
 /// against the table caught it. #401's lesson: read the row, never count to it.
-pub const CAUSE_RELOCATION_FAILURE: u8 = 81;
+pub use nextgcore_gtp::v2::cause::RELOCATION_FAILURE as CAUSE_RELOCATION_FAILURE;
 
 /// Instance of the `SGW S11/S4 IP Address and TEID for Control Plane` IE in a Forward
 /// Relocation Request (Table 7.3.1-1, `29274-j60.txt:17839`).
