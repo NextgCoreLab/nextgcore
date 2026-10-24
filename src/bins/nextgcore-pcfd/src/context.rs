@@ -450,6 +450,30 @@ pub struct UnrestorableAssociation {
     pub reason: String,
 }
 
+/// What [`PcfContext::sess_create_for_supi`] did.
+#[derive(Debug)]
+pub struct SessCreated {
+    /// The session the create answers with.
+    pub sess: PcfSess,
+    /// The colliding association it replaced (TS 29.512 §4.2.7 NOTE 2), with
+    /// its AF app sessions: the caller deregisters its BSF binding and
+    /// terminates the apps toward their AFs (TS 29.514 §4.2.5.3).
+    pub replaced: Option<(PcfSess, Vec<PcfApp>)>,
+    /// The create was the same request again (equal origination timestamps):
+    /// `sess` is the existing association, unchanged.
+    pub reused: bool,
+}
+
+/// Why [`PcfContext::sess_create_for_supi`] refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessCreateError {
+    /// TS 29.512 §4.2.7: older than the existing association for the same SUPI
+    /// and PDU session id; answered 403 LATE_OVERLAPPING_REQUEST.
+    LateOverlapping,
+    /// The UE SM or session limit.
+    Limit,
+}
+
 /// Port of pcf_sess_t from context.h
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PcfSess {
@@ -532,6 +556,12 @@ pub struct PcfSess {
     /// `access_type`.
     #[serde(default)]
     pub tsc_containers: crate::npcf_handler::TscManagementContainers,
+    /// The create's `3gpp-Sbi-Origination-Timestamp`, in ms since the epoch,
+    /// when it carried one: what a colliding create for the same SUPI and PDU
+    /// session id is compared against (TS 29.512 §4.2.7). `#[serde(default)]`
+    /// for the same snapshot reason as `access_type`.
+    #[serde(default)]
+    pub origination_ms: Option<i64>,
 }
 
 impl PcfSess {
@@ -564,6 +594,7 @@ impl PcfSess {
             access_type: None,
             policy_dnn_data: None,
             tsc_containers: Default::default(),
+            origination_ms: None,
         }
     }
 
@@ -2072,7 +2103,11 @@ impl PcfContext {
 
     // UE SM management
 
-    pub fn ue_sm_add(&self, supi: &str) -> Option<PcfUeSm> {
+    /// Test-only (#944 review): production resolves the UE SM together with the
+    /// session (`sess_add_for_supi` / `sess_create_for_supi`), because a UE SM
+    /// added on its own goes nowhere until a session joins it.
+    #[cfg(test)]
+    pub(crate) fn ue_sm_add(&self, supi: &str) -> Option<PcfUeSm> {
         let mut ue_sm_list = write_through_poison(&self.ue_sm_list);
         let mut supi_sm_hash = write_through_poison(&self.supi_sm_hash);
 
@@ -2199,7 +2234,10 @@ impl PcfContext {
     /// its UE SM to a concurrent delete in between; here no delete can run
     /// between the two steps. A UE SM added for a session that then cannot be
     /// added (session limit) is taken out again, so a refusal leaves nothing.
-    pub fn sess_add_for_supi(&self, supi: &str, psi: u8) -> Option<PcfSess> {
+    /// Test-only: production creates through [`Self::sess_create_for_supi`],
+    /// which also applies TS 29.512 §4.2.7 to a colliding create.
+    #[cfg(test)]
+    pub(crate) fn sess_add_for_supi(&self, supi: &str, psi: u8) -> Option<PcfSess> {
         // sess_list -> sm_policy_id_hash -> ue_sm_list -> supi_sm_hash: the order
         // of `sess_remove_inner`, and ue_sm_list before supi_sm_hash as in
         // `ue_sm_add` / `ue_sm_find_by_supi`.
@@ -2247,6 +2285,146 @@ impl PcfContext {
             }
             None => None,
         }
+    }
+
+    /// `Npcf_SMPolicyControl_Create` for `(supi, psi)` under one set of guards,
+    /// applying TS 29.512 §4.2.7 to a create that collides with an existing SM
+    /// Policy Association for the same SUPI and PDU session id:
+    ///
+    /// - the new request is accepted only if its origination timestamp is more
+    ///   recent than the stored one, or if either of the two has none; the
+    ///   existing association is then deleted locally (NOTE 2) and returned in
+    ///   [`SessCreated::replaced`] with its AF app sessions, for the caller to
+    ///   deregister and terminate;
+    /// - a less recent one is refused ([`LateOverlappingRequest`], 403
+    ///   LATE_OVERLAPPING_REQUEST);
+    /// - an EQUAL timestamp is neither: it is the same request again (an SMF
+    ///   retransmission after a lost answer), so the existing association is
+    ///   returned unchanged rather than replaced or refused.
+    ///
+    /// The decision and the replacement happen under the session guards, so two
+    /// colliding creates cannot both win, and a delete cannot run in between.
+    pub fn sess_create_for_supi(
+        &self,
+        supi: &str,
+        psi: u8,
+        origination_ms: Option<i64>,
+    ) -> Result<SessCreated, SessCreateError> {
+        // The order of `sess_remove_inner`.
+        let mut sess_list = write_through_poison(&self.sess_list);
+        let mut sm_policy_id_hash = write_through_poison(&self.sm_policy_id_hash);
+        let mut ipv4addr_hash = write_through_poison(&self.ipv4addr_hash);
+        let mut ipv6prefix_hash = write_through_poison(&self.ipv6prefix_hash);
+        let mut ue_sm_list = write_through_poison(&self.ue_sm_list);
+        let mut supi_sm_hash = write_through_poison(&self.supi_sm_hash);
+
+        let existing_ue = supi_sm_hash
+            .get(supi)
+            .copied()
+            .filter(|id| ue_sm_list.contains_key(id));
+        let (ue_sm_id, ue_sm_added) = match existing_ue {
+            Some(id) => (id, false),
+            None => {
+                if ue_sm_list.len() >= self.max_num_of_ue {
+                    log::error!("Maximum number of UE SMs [{}] reached", self.max_num_of_ue);
+                    return Err(SessCreateError::Limit);
+                }
+                let id = self.next_ue_sm_id.fetch_add(1, Ordering::SeqCst) as u64;
+                supi_sm_hash.insert(supi.to_string(), id);
+                ue_sm_list.insert(id, PcfUeSm::new(id, supi));
+                log::debug!("[{supi}] PCF UE SM added (id={id})");
+                (id, true)
+            }
+        };
+
+        let colliding = sess_list
+            .values()
+            .find(|s| s.pcf_ue_sm_id == ue_sm_id && s.psi == psi)
+            .cloned();
+        let mut replaced = None;
+        if let Some(old) = colliding {
+            match (origination_ms, old.origination_ms) {
+                (Some(new), Some(stored)) if new < stored => {
+                    log::info!(
+                        "[{supi}] SM policy create for PDU session {psi} refused: \
+                         origination {new} ms is older than the existing association's \
+                         {stored} ms (TS 29.512 §4.2.7)"
+                    );
+                    return Err(SessCreateError::LateOverlapping);
+                }
+                (Some(new), Some(stored)) if new == stored => {
+                    return Ok(SessCreated {
+                        sess: old,
+                        replaced: None,
+                        reused: true,
+                    });
+                }
+                _ => {
+                    // Locally delete the existing association (NOTE 2). The UE SM
+                    // stays: the new session joins it below.
+                    sess_list.remove(&old.id);
+                    sm_policy_id_hash.remove(&old.sm_policy_id);
+                    if old.ipv4addr != 0 && ipv4addr_hash.get(&old.ipv4addr) == Some(&old.id) {
+                        ipv4addr_hash.remove(&old.ipv4addr);
+                    }
+                    if let Some(ref prefix) = old.ipv6prefix_string {
+                        if ipv6prefix_hash.get(prefix) == Some(&old.id) {
+                            ipv6prefix_hash.remove(prefix);
+                        }
+                    }
+                    if let Some(ue_sm) = ue_sm_list.get_mut(&ue_sm_id) {
+                        ue_sm.sess_ids.retain(|&sid| sid != old.id);
+                    }
+                    log::info!(
+                        "[{supi}] SM policy create for PDU session {psi} replaces association \
+                         {} (TS 29.512 §4.2.7)",
+                        old.sm_policy_id
+                    );
+                    replaced = Some(old);
+                }
+            }
+        }
+
+        let inserted = self.sess_insert_locked(
+            &mut sess_list,
+            &mut sm_policy_id_hash,
+            &mut ue_sm_list,
+            ue_sm_id,
+            psi,
+        );
+        let Some((mut sess, _)) = inserted else {
+            // Session limit (the old one, if any, is already gone, so a replacement
+            // never hits it). A UE SM added for this create goes again.
+            if ue_sm_added {
+                ue_sm_list.remove(&ue_sm_id);
+                supi_sm_hash.remove(supi);
+            }
+            return Err(SessCreateError::Limit);
+        };
+        sess.origination_ms = origination_ms;
+        if let Some(stored) = sess_list.get_mut(&sess.id) {
+            stored.origination_ms = origination_ms;
+        }
+        drop((
+            sess_list,
+            sm_policy_id_hash,
+            ipv4addr_hash,
+            ipv6prefix_hash,
+            ue_sm_list,
+            supi_sm_hash,
+        ));
+        // The replaced association's app sessions, outside the session guards in
+        // the canonical sess_list -> app_list order (as `sess_remove_inner`).
+        let replaced = replaced.map(|old| {
+            let apps = self.app_remove_all_for_sess(old.id);
+            (old, apps)
+        });
+        self.persist();
+        Ok(SessCreated {
+            sess,
+            replaced,
+            reused: false,
+        })
     }
 
     /// The body of [`Self::sess_add`], under the caller's guards. Returns the
@@ -3382,6 +3560,112 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// TS 29.512 §4.2.7: a create colliding with an existing association for the
+    /// same SUPI and PDU session id is accepted only if more recent (or if
+    /// either has no origination timestamp), replacing the old one locally with
+    /// its AF app sessions handed back; an older one is refused; an equal one is
+    /// the same request again.
+    ///
+    /// Revert-verified: without the older-timestamp refusal this test fails.
+    #[test]
+    fn a_colliding_create_follows_the_origination_timestamp() {
+        let mut ctx = PcfContext::new();
+        ctx.init(64, 64);
+        let supi = "imsi-001010000000742";
+        let first = ctx
+            .sess_create_for_supi(supi, 5, Some(1_000))
+            .expect("first");
+        assert!(first.replaced.is_none() && !first.reused);
+        let first = first.sess;
+        let app = ctx.app_add(first.id).expect("app");
+
+        // Older: refused, and the existing association is untouched.
+        assert_eq!(
+            ctx.sess_create_for_supi(supi, 5, Some(999)).unwrap_err(),
+            SessCreateError::LateOverlapping
+        );
+        assert_eq!(
+            ctx.sess_find_by_sm_policy_id(&first.sm_policy_id)
+                .map(|s| s.id),
+            Some(first.id)
+        );
+        assert_eq!(ctx.app_count(), 1);
+
+        // Equal: the same request again; the same association, nothing replaced.
+        let again = ctx
+            .sess_create_for_supi(supi, 5, Some(1_000))
+            .expect("equal");
+        assert!(again.reused && again.replaced.is_none());
+        assert_eq!(again.sess.id, first.id);
+
+        // Newer: accepted, and the old one is gone with its app session.
+        let newer = ctx
+            .sess_create_for_supi(supi, 5, Some(1_001))
+            .expect("newer");
+        let (old, apps) = newer.replaced.expect("replaced");
+        assert_eq!(old.id, first.id);
+        assert_eq!(apps.iter().map(|a| a.id).collect::<Vec<_>>(), vec![app.id]);
+        assert_ne!(newer.sess.id, first.id);
+        assert_eq!(newer.sess.origination_ms, Some(1_001));
+        assert!(ctx.sess_find_by_sm_policy_id(&first.sm_policy_id).is_none());
+        assert_eq!(ctx.app_count(), 0);
+        assert_eq!(ctx.sess_count(), 1);
+        assert_eq!(ctx.ue_sm_count(), 1, "the UE SM stays for the new session");
+        assert_eq!(
+            ctx.ue_sm_find_by_supi(supi).map(|u| u.sess_ids),
+            Some(vec![newer.sess.id])
+        );
+
+        // Either timestamp absent: accepted as more recent, both ways round.
+        let no_new = ctx.sess_create_for_supi(supi, 5, None).expect("no new ts");
+        assert_eq!(no_new.replaced.map(|(o, _)| o.id), Some(newer.sess.id));
+        let no_old = ctx
+            .sess_create_for_supi(supi, 5, Some(1))
+            .expect("no stored ts");
+        assert_eq!(no_old.replaced.map(|(o, _)| o.id), Some(no_new.sess.id));
+        assert_eq!(ctx.sess_count(), 1);
+
+        // Another PDU session id of the same UE never collides.
+        let other = ctx.sess_create_for_supi(supi, 6, Some(0)).expect("psi 6");
+        assert!(other.replaced.is_none());
+        assert_eq!(ctx.sess_count(), 2);
+    }
+
+    /// §4.2.7 race-safety: concurrent colliding creates with distinct
+    /// timestamps leave exactly one association, carrying the most recent
+    /// timestamp, whatever the arrival order.
+    #[test]
+    fn concurrent_colliding_creates_keep_the_most_recent() {
+        let mut ctx = PcfContext::new();
+        ctx.init(64, 64);
+        let ctx = std::sync::Arc::new(ctx);
+        let clock = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(1));
+        let supi = "imsi-001010000000743";
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let (ctx, clock) = (std::sync::Arc::clone(&ctx), std::sync::Arc::clone(&clock));
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        let ts = clock.fetch_add(1, Ordering::SeqCst);
+                        match ctx.sess_create_for_supi(supi, 5, Some(ts)) {
+                            Ok(_) | Err(SessCreateError::LateOverlapping) => {}
+                            Err(e) => panic!("{e:?}"),
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("thread");
+        }
+        let max = clock.load(Ordering::SeqCst) - 1;
+        assert_eq!(ctx.sess_count(), 1);
+        let ue = ctx.ue_sm_find_by_supi(supi).expect("ue sm");
+        let sess = ctx.sess_find_by_psi(ue.id, 5).expect("the association");
+        assert_eq!(sess.origination_ms, Some(max));
+        assert_eq!(ue.sess_ids, vec![sess.id]);
     }
 
     /// #892: a UE SM goes with its last session, and only then; its SUPI index

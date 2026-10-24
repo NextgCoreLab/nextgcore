@@ -2331,6 +2331,26 @@ fn parse_subs_sess_ambr(v: Option<&serde_json::Value>) -> Option<crate::context:
     })
 }
 
+/// TS 29.502 §6.1.2.3.2 custom header, forwarded by the SMF (TS 29.512 §5.2.3.2).
+const ORIGINATION_TIMESTAMP_HEADER: &str = "3gpp-Sbi-Origination-Timestamp";
+
+/// `403 LATE_OVERLAPPING_REQUEST` (TS 29.512 §4.2.7, Table 5.7.3-1): the create
+/// collides with an existing SM Policy Association whose origination timestamp
+/// is more recent.
+fn late_overlapping_request(supi: &str, pdu_session_id: u8) -> SbiResponse {
+    SbiResponse::with_status(403)
+        .with_json_body(&serde_json::json!({
+            "title": "Forbidden",
+            "status": 403,
+            "cause": "LATE_OVERLAPPING_REQUEST",
+            "detail": format!(
+                "an SM policy association for {supi} PDU session {pdu_session_id} with a more \
+                 recent origination timestamp exists"
+            ),
+        }))
+        .unwrap_or_else(|_| SbiResponse::with_status(403))
+}
+
 pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
     log::info!("SM Policy Create");
 
@@ -2408,15 +2428,53 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
     // subscribed bound to authorise against.
     let subs_sess_ambr = parse_subs_sess_ambr(policy_data.get("subsSessAmbr"));
 
+    // TS 29.512 §4.2.7 / §5.2.3.2: the SMF forwards the AMF's origination
+    // timestamp. A value that is present but unreadable is refused rather than
+    // treated as absent: absent means "accept as more recent", so a garbled
+    // late request would otherwise replace a newer association.
+    let origination_ms = match request.http.get_header(ORIGINATION_TIMESTAMP_HEADER) {
+        None => None,
+        Some(v) => match nextgcore_sbi::datetime::origination_timestamp_to_epoch_ms(v) {
+            Some(ms) => Some(ms),
+            None => {
+                return send_bad_request(
+                    &format!("{ORIGINATION_TIMESTAMP_HEADER} is not a TS 29.502 timestamp"),
+                    Some("INVALID_MSG_FORMAT"),
+                )
+            }
+        },
+    };
+
     let ctx = pcf_self();
 
-    // Get or create the UE SM and the session in one step (#892): the UE SM goes
-    // with its last session, so resolving it first and adding the session after
-    // could lose it to a concurrent delete in between.
-    let sess = ctx
-        .read()
-        .ok()
-        .and_then(|context| context.sess_add_for_supi(supi, pdu_session_id));
+    // Resolve the UE SM, apply the collision rule and add the session in one
+    // step (#892, TS 29.512 §4.2.7).
+    let created = match ctx.read() {
+        Ok(context) => context.sess_create_for_supi(supi, pdu_session_id, origination_ms),
+        Err(_) => Err(crate::context::SessCreateError::Limit),
+    };
+    let sess = match created {
+        Ok(created) => {
+            if let Some((old, apps)) = created.replaced {
+                // The existing association was deleted locally (§4.2.7 NOTE 2):
+                // the same follow-ups as an SM policy delete.
+                sbi_path::pcf_sess_deregister_bsf_binding(
+                    old.binding.id.clone().unwrap_or_default(),
+                );
+                let terminated = terminate_af_app_sessions(&apps);
+                log::info!(
+                    "SM Policy {} replaced by a more recent create ({terminated} AF app \
+                     session(s) terminated)",
+                    old.sm_policy_id
+                );
+            }
+            Some(created.sess)
+        }
+        Err(crate::context::SessCreateError::LateOverlapping) => {
+            return late_overlapping_request(supi, pdu_session_id)
+        }
+        Err(crate::context::SessCreateError::Limit) => None,
+    };
 
     match sess {
         Some(mut sess) => {
@@ -7062,6 +7120,75 @@ mod tests {
     /// A `ueIpv6` binds the session whose PREFIX contains it — the AF sends a full
     /// address while the session holds a prefix, so an exact-string lookup would
     /// never match.
+    /// TS 29.512 §4.2.7 through the SBI handler: a create carrying an older
+    /// `3gpp-Sbi-Origination-Timestamp` than the existing association gets 403
+    /// LATE_OVERLAPPING_REQUEST, a newer one replaces it (201, new id, the old
+    /// id gone), and an unreadable header is a 400.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn sm_policy_create_applies_the_origination_timestamp_rule() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        pcf_context_init(64, 64);
+        let supi = "imsi-001010000000744";
+        let create = |ts: &str| {
+            make_request(
+                "POST",
+                "/npcf-smpolicycontrol/v1/sm-policies",
+                Some(full_create_body(supi, 5)),
+            )
+            .with_header(ORIGINATION_TIMESTAMP_HEADER, ts)
+        };
+        let policy_id = |resp: &SbiResponse| {
+            resp.http
+                .get_header("Location")
+                .and_then(|l| l.rsplit('/').next().map(str::to_string))
+                .expect("Location")
+        };
+
+        let resp = pcf_sbi_request_handler(create("Fri, 23 Oct 2026 10:00:00.500 GMT")).await;
+        assert_eq!(resp.status, 201);
+        let first = policy_id(&resp);
+
+        let resp = pcf_sbi_request_handler(create("Fri, 23 Oct 2026 10:00:00.499 GMT")).await;
+        assert_eq!(resp.status, 403);
+        assert_eq!(
+            problem_cause_of(&resp).as_deref(),
+            Some("LATE_OVERLAPPING_REQUEST")
+        );
+        assert!(pcf_self()
+            .read()
+            .unwrap()
+            .sess_find_by_sm_policy_id(&first)
+            .is_some());
+
+        let resp = pcf_sbi_request_handler(create("Fri, 23 Oct 2026 10:00:00.501 GMT")).await;
+        assert_eq!(resp.status, 201);
+        let second = policy_id(&resp);
+        assert_ne!(second, first);
+        let ctx = pcf_self();
+        assert!(ctx
+            .read()
+            .unwrap()
+            .sess_find_by_sm_policy_id(&first)
+            .is_none());
+        assert!(ctx
+            .read()
+            .unwrap()
+            .sess_find_by_sm_policy_id(&second)
+            .is_some());
+
+        let resp = pcf_sbi_request_handler(create("yesterday")).await;
+        assert_eq!(resp.status, 400);
+        assert!(ctx
+            .read()
+            .unwrap()
+            .sess_find_by_sm_policy_id(&second)
+            .is_some());
+    }
+
     /// #892: through the SBI handlers, SM policy create then delete leaves no
     /// UE SM behind, and the SUPI's next create works.
     ///
