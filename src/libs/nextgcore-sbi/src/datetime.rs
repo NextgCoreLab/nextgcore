@@ -233,15 +233,105 @@ pub fn rfc3339_to_epoch_signed(text: &str) -> Option<i64> {
         return None;
     }
 
-    // days_from_civil, the inverse of civil_from_days above.
+    Some(
+        days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second
+            - offset_secs,
+    )
+}
+
+/// Days since 1970-01-01 for a valid proleptic Gregorian date, the inverse of
+/// [`civil_from_days`].
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let y = if month <= 2 { year - 1 } else { year };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400;
     let mp = if month > 2 { month - 3 } else { month + 9 };
     let doy = (153 * mp + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    Some(days * 86_400 + hour * 3600 + minute * 60 + second - offset_secs)
+    era * 146_097 + doe - 719_468
+}
+
+/// Format milliseconds since the epoch as a `3gpp-Sbi-Origination-Timestamp`
+/// header value (TS 29.502 §6.1.2.3.2), e.g. `Sun, 06 Nov 1994 08:49:37.123 GMT`;
+/// the inverse of [`origination_timestamp_to_epoch_ms`].
+pub fn epoch_ms_to_origination_timestamp(ms: i64) -> String {
+    const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let secs = ms.div_euclid(1000);
+    let millis = ms.rem_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    format!(
+        "{}, {d:02} {} {y:04} {:02}:{:02}:{:02}.{millis:03} GMT",
+        DAYS[days.rem_euclid(7) as usize],
+        MONTHS[(m - 1) as usize],
+        tod / 3600,
+        tod % 3600 / 60,
+        tod % 60
+    )
+}
+
+/// The current time as a `3gpp-Sbi-Origination-Timestamp` header value.
+pub fn now_origination_timestamp() -> String {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0);
+    epoch_ms_to_origination_timestamp(ms)
+}
+
+/// Parse a `3gpp-Sbi-Origination-Timestamp` header value into milliseconds
+/// since the Unix epoch.
+///
+/// TS 29.502 §6.1.2.3.2 / `TS29502_CustomHeaders.abnf`:
+/// `day-name "," SP date1 SP time-of-day "." milliseconds SP "GMT"`, e.g.
+/// `Sun, 06 Nov 1994 08:49:37.123 GMT`. Every field is fixed-width and
+/// case-sensitive, as in that ABNF; OWS around the value is allowed. Strict
+/// like [`rfc3339_to_epoch_signed`]: a value from a peer never panics and
+/// never wraps, and a date that does not exist (`31 Feb`) or a day-name
+/// that does not match the date is refused.
+pub fn origination_timestamp_to_epoch_ms(text: &str) -> Option<i64> {
+    const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"]; // 1970-01-01 was a Thursday
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let t = text.trim_matches([' ', '\t']);
+    if !t.is_ascii() {
+        return None;
+    }
+    // Fixed layout: "Sun, 06 Nov 1994 08:49:37.123 GMT" is 33 octets.
+    let b = t.as_bytes();
+    if b.len() != 33
+        || &t[3..5] != ", "
+        || b[7] != b' '
+        || b[11] != b' '
+        || b[16] != b' '
+        || b[19] != b':'
+        || b[22] != b':'
+        || b[25] != b'.'
+        || &t[29..] != " GMT"
+    {
+        return None;
+    }
+    let day_name = &t[0..3];
+    let day = digits(&t[5..7], 2)?;
+    let month = MONTHS.iter().position(|m| *m == &t[8..11])? as i64 + 1;
+    let year = digits(&t[12..16], 4)?;
+    let hour = digits(&t[17..19], 2)?;
+    let minute = digits(&t[20..22], 2)?;
+    let second = digits(&t[23..25], 2)?;
+    let millis = digits(&t[26..29], 3)?;
+    if !(1..=days_in_month(year, month)).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    if DAYS[days.rem_euclid(7) as usize] != day_name {
+        return None;
+    }
+    Some((days * 86_400 + hour * 3600 + minute * 60 + second) * 1000 + millis)
 }
 
 /// Parse an RFC 3339 date-time into seconds since the epoch, the inverse of
@@ -264,6 +354,56 @@ pub fn now_epoch_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// The formatter is the parser's inverse, across a leap day, the epoch and
+    /// a millisecond boundary.
+    #[test]
+    fn origination_timestamp_round_trips() {
+        assert_eq!(
+            epoch_ms_to_origination_timestamp(784_111_777_123),
+            "Sun, 06 Nov 1994 08:49:37.123 GMT"
+        );
+        for ms in [0, 1, 999, 1_000, 1_709_251_199_999, 1_792_771_200_000] {
+            let text = epoch_ms_to_origination_timestamp(ms);
+            assert_eq!(origination_timestamp_to_epoch_ms(&text), Some(ms), "{text}");
+        }
+        assert!(origination_timestamp_to_epoch_ms(&now_origination_timestamp()).is_some());
+    }
+
+    /// TS 29.502 §6.1.2.3.2: the ABNF's example shape, OWS, and every refusal.
+    #[test]
+    fn origination_timestamp_is_parsed_strictly() {
+        assert_eq!(
+            origination_timestamp_to_epoch_ms("Sun, 06 Nov 1994 08:49:37.123 GMT"),
+            Some(784_111_777_123)
+        );
+        assert_eq!(
+            origination_timestamp_to_epoch_ms(" \tThu, 01 Jan 1970 00:00:00.000 GMT "),
+            Some(0)
+        );
+        assert_eq!(
+            origination_timestamp_to_epoch_ms("Thu, 29 Feb 2024 23:59:59.999 GMT"),
+            Some(1_709_251_199_999)
+        );
+        for bad in [
+            "",
+            "Sun, 06 Nov 1994 08:49:37 GMT",     // no milliseconds
+            "Sun, 06 Nov 1994 08:49:37.12 GMT",  // two-digit milliseconds
+            "Sun, 6 Nov 1994 08:49:37.123 GMT",  // one-digit day
+            "Sun, 06 nov 1994 08:49:37.123 GMT", // case-sensitive month
+            "Sun, 06 Nov 1994 08:49:37.123 UTC", // not GMT
+            "Mon, 06 Nov 1994 08:49:37.123 GMT", // wrong day-name
+            "Fri, 31 Feb 2023 08:49:37.123 GMT", // no such date
+            "Sun, 06 Nov 1994 24:00:00.000 GMT", // hour
+            "Sun, 06 Nov 1994 08:49:37.+12 GMT", // sign
+            "Sun, 06 Nov 1994 08:49:37.123 GMT x",
+            "Sun,\u{e9}06 Nov 1994 08:49:37.123 GMT", // non-ASCII: no panic
+            "2026-01-01T00:00:00Z",
+        ] {
+            assert_eq!(origination_timestamp_to_epoch_ms(bad), None, "{bad:?}");
+        }
+    }
+
     use super::*;
 
     #[test]

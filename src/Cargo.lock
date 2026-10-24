@@ -2529,6 +2529,7 @@ dependencies = [
  "proptest",
  "rand 0.9.2",
  "serde_json",
+ "serde_yaml",
  "thiserror 1.0.69",
  "tokio",
  "uuid",
@@ -2842,6 +2843,7 @@ dependencies = [
  "nextgcore-gtp",
  "nextgcore-metrics",
  "nextgcore-nas",
+ "nextgcore-ngap",
  "nextgcore-s1ap",
  "nextgcore-s1ap-gen",
  "nextgcore-sctp",
@@ -3092,6 +3094,7 @@ name = "nextgcore-pfcp"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "log",
  "nextgcore-core",
  "proptest",
  "thiserror 1.0.69",

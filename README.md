@@ -167,8 +167,8 @@ For the 4G EPC with nextgsim's LTE eNB and UE, use `docker-compose-epc.yml`
 
 ```bash
 RUST_BACKTRACE=1        # Enable backtraces for debugging
-RUST_LOG=info           # Log filter, honoured by 13 of the 28 NFs (#691);
-                        # every NF but smfd also takes --log-level
+RUST_LOG=info           # Log filter for every NF; overrides --log-level
+                        # (every NF but smfd takes --log-level)
 ```
 
 Per-NF environment variables are documented in the
@@ -466,6 +466,13 @@ Two subscriber-management front ends ship, and neither has a default account
 - **Node.js WebUI** (`webui/`, port 9999 by default, `PORT` to change). Create
   the first admin with `node server/bin/create-admin.js <username>`; the password
   is read from the terminal or `WEBUI_ADMIN_PASSWORD`, at least 12 characters.
+  It needs a `SECRET_KEY` of at least 32 characters (no fallback) and listens
+  on `127.0.0.1` unless `WEBUI_BIND_ADDR` says otherwise; the container's
+  `HOSTNAME` is never used. The `docker/webui` image therefore needs
+  `-e WEBUI_BIND_ADDR=0.0.0.0` to be reachable through its published port.
+  Set it only when the container sits on a private network, and publish to
+  loopback (`-p 127.0.0.1:9999:9999`) with an SSH tunnel for remote access,
+  never on all interfaces.
 - **`nextgcore-webui`** (Rust, `src/bins/nextgcore-webui`). Listens on
   `127.0.0.1:3000` by default (`--listen`, `--port`) and requires an API token
   (`--api-token-file` or `NEXTGCORE_WEBUI_API_TOKEN`); `--tls-cert`/`--tls-key`

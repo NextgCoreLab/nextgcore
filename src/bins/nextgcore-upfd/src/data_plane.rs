@@ -73,8 +73,9 @@ pub struct GtpuPeerState {
 /// What an Echo Response meant to the [`GtpuPathTable`] (#887).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EchoResponse {
-    /// It answered our outstanding request: the path is alive.
-    Answered,
+    /// It answered our outstanding request: the path is alive. `recovered` when the
+    /// path had been declared FAILED, so the CP function is told it recovered (#935).
+    Answered { recovered: bool },
     /// Not an answer to anything we sent (unknown peer, no outstanding request, or a
     /// sequence number that does not match). Ignored.
     Unsolicited,
@@ -155,8 +156,8 @@ impl GtpuPathTable {
         state.pending_seq = None;
         state.miss_count = 0;
         state.last_success = Some(std::time::Instant::now());
-        state.path_failed = false;
-        EchoResponse::Answered
+        let recovered = std::mem::replace(&mut state.path_failed, false);
+        EchoResponse::Answered { recovered }
     }
 
     /// Advance the state machine by one echo interval tick.
@@ -768,7 +769,9 @@ pub struct DataPlaneFar {
     /// Outer header creation: DL TEID for GTP-U encap
     pub ohc_teid: Option<u32>,
     /// Outer header creation: peer address
-    pub ohc_addr: Option<Ipv4Addr>,
+    /// Outer Header Creation peer address, IPv4 or IPv6 (§8.2.56; #918: it was
+    /// IPv4-only, so a FAR could not point at an IPv6 gNB).
+    pub ohc_addr: Option<IpAddr>,
     /// Buffering Action Rule reference (TS 29.244 8.2.74)
     pub bar_id: Option<u8>,
 }
@@ -793,7 +796,7 @@ pub enum FarDecision {
     /// FORW — forward, optionally re-encapsulating via Outer Header Creation
     Forward {
         ohc_teid: Option<u32>,
-        ohc_addr: Option<Ipv4Addr>,
+        ohc_addr: Option<IpAddr>,
     },
     /// DROP — discard the packet
     Drop,
@@ -2100,6 +2103,11 @@ impl DataPlaneUrr {
         self.measure_duration.store(duration, Ordering::Relaxed);
     }
 
+    /// Whether this URR measures time (DURAT) and so reports a Duration Measurement.
+    pub fn measures_duration(&self) -> bool {
+        self.measure_duration.load(Ordering::Relaxed)
+    }
+
     /// Put back the time measurement of a report that was not delivered (#818, with
     /// [`Self::restore_usage`]): the next report covers it -- its Start Time and Duration
     /// Measurement reach back over the undelivered one.
@@ -2951,6 +2959,13 @@ pub enum UpfReportEvent {
         smf_seid: u64,
         urr_id: u32,
     },
+    /// N3 user-plane paths declared FAILED (`failure`) or RECOVERED, to be reported
+    /// to the CP function in a PFCP Node Report (#935, TS 29.244 §7.4.5.1). They used
+    /// to be only logged, so the SMF never learnt a gNB path was down or back.
+    PathReport {
+        failure: bool,
+        peers: Vec<std::net::IpAddr>,
+    },
 }
 
 /// Data plane runtime context
@@ -2959,6 +2974,9 @@ pub struct DataPlane {
     pub tun: Option<TunDevice>,
     /// GTP-U socket
     pub gtpu_socket: Option<Arc<TokioUdpSocket>>,
+    /// IPv6 GTP-U socket, when the UPF has an IPv6 N3 address (`--gtpu-addr6`, #918).
+    /// G-PDUs, Echo and End Markers to an IPv6 peer go out on it; it is also read.
+    pub gtpu_socket6: Option<Arc<TokioUdpSocket>>,
     /// Session manager
     pub sessions: SessionManager,
     /// Shutdown flag
@@ -3093,6 +3111,7 @@ impl DataPlane {
         Self {
             tun: None,
             gtpu_socket: None,
+            gtpu_socket6: None,
             sessions: SessionManager::new(),
             shutdown,
             stats: DataPlaneStats::default(),
@@ -3197,6 +3216,44 @@ impl DataPlane {
         Ok(())
     }
 
+    /// The GTP-U socket for a destination of `dst`'s address family (#918).
+    pub fn socket_for(&self, dst: &SocketAddr) -> Option<&Arc<TokioUdpSocket>> {
+        if dst.is_ipv6() {
+            self.gtpu_socket6.as_ref()
+        } else {
+            self.gtpu_socket.as_ref()
+        }
+    }
+
+    /// The N3 paths in use that this UPF can actually probe (#960 review).
+    ///
+    /// An IPv6 gNB with no IPv6 GTP-U socket (`--gtpu-addr6` unset) cannot be sent an
+    /// Echo Request. Tracking it anyway counted a miss every round, declared the path
+    /// failed and reported a User Plane Path Failure for a path never probed. It is
+    /// left out instead, and that is logged once.
+    pub fn probeable_paths(&self, mut in_use: HashSet<SocketAddr>) -> HashSet<SocketAddr> {
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if self.gtpu_socket6.is_none() {
+            let before = in_use.len();
+            in_use.retain(|p| p.is_ipv4());
+            if in_use.len() != before && !WARNED.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    "{} IPv6 N3 path(s) in use are not probed: no IPv6 GTP-U socket \
+                     (set --gtpu-addr6)",
+                    before - in_use.len()
+                );
+            }
+        }
+        in_use
+    }
+
+    /// Bind the IPv6 GTP-U socket (#918).
+    pub async fn bind_gtpu6(&mut self, addr: SocketAddr) -> io::Result<()> {
+        log::info!("Binding IPv6 GTP-U socket on {addr}");
+        self.gtpu_socket6 = Some(Arc::new(TokioUdpSocket::bind(addr).await?));
+        Ok(())
+    }
+
     /// Run the data plane forwarding loops
     pub async fn run(&self) -> io::Result<()> {
         let tun = self.tun.as_ref().ok_or_else(|| {
@@ -3243,6 +3300,29 @@ impl DataPlane {
                     }
                 }
             }
+        });
+
+        // #918: the IPv6 GTP-U socket feeds the same uplink queue.
+        let gtpu6_recv_task = self.gtpu_socket6.clone().map(|sock6| {
+            let ul_tx6 = ul_tx.clone();
+            let shutdown6 = shutdown.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; MAX_PACKET_SIZE];
+                log::info!("IPv6 GTP-U receive task started");
+                while !shutdown6.load(Ordering::Relaxed) {
+                    match sock6.recv_from(&mut buf).await {
+                        Ok((len, from)) if len > 0 => {
+                            let _ = ul_tx6.send((buf[..len].to_vec(), from)).await;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            if e.kind() != io::ErrorKind::WouldBlock {
+                                log::error!("IPv6 GTP-U recv error: {e}");
+                            }
+                        }
+                    }
+                }
+            })
         });
 
         // Spawn TUN read task (downlink: TUN -> UPF -> gNB)
@@ -3312,6 +3392,9 @@ impl DataPlane {
 
         // Cleanup
         gtpu_recv_task.abort();
+        if let Some(t) = gtpu6_recv_task {
+            t.abort();
+        }
         tun_read_task.abort();
 
         Ok(())
@@ -3333,7 +3416,7 @@ impl DataPlane {
             gtpu_msg_type::ECHO_REQUEST => {
                 log::debug!("GTP-U Echo Request from {from}");
                 let response = build_gtpu_echo_response(header.seq_num);
-                if let Some(sock) = &self.gtpu_socket {
+                if let Some(sock) = self.socket_for(&from) {
                     let _ = sock.send_to(&response, from).await;
                 }
                 return;
@@ -3387,8 +3470,18 @@ impl DataPlane {
                     .write()
                     .unwrap()
                     .on_echo_response(from, header.seq_num);
-                if outcome == EchoResponse::Unsolicited {
-                    log::debug!("GTP-U Echo Response from {from} answers nothing we sent: ignored");
+                match outcome {
+                    EchoResponse::Unsolicited => log::debug!(
+                        "GTP-U Echo Response from {from} answers nothing we sent: ignored"
+                    ),
+                    EchoResponse::Answered { recovered: true } => {
+                        log::warn!("GTP-U path to {from} RECOVERED");
+                        self.send_report_event(UpfReportEvent::PathReport {
+                            failure: false,
+                            peers: vec![from.ip()],
+                        });
+                    }
+                    EchoResponse::Answered { recovered: false } => {}
                 }
                 return;
             }
@@ -3448,7 +3541,7 @@ impl DataPlane {
                     );
                     let local = *self.local_gtpu_addr.read().unwrap();
                     let err_ind = build_gtpu_error_indication(header.teid, local);
-                    if let Some(sock) = &self.gtpu_socket {
+                    if let Some(sock) = self.socket_for(&from) {
                         let _ = sock.send_to(&err_ind, from).await;
                     }
                 } else {
@@ -3486,8 +3579,8 @@ impl DataPlane {
             if let Some((Some(teid), Some(addr))) = relay {
                 let qfi = qer_id.and_then(|q| session.qers.read().unwrap().get(&q)?.qfi);
                 let out = encapsulate_dl_gpdu(ip_payload, teid, qfi);
-                let to = SocketAddr::new(IpAddr::V4(addr), GTPU_PORT);
-                match &self.gtpu_socket {
+                let to = SocketAddr::new(addr, GTPU_PORT);
+                match self.socket_for(&to) {
                     Some(sock) => match sock.send_to(&out, to).await {
                         Ok(_) => {
                             self.stats.dl_packets.fetch_add(1, Ordering::Relaxed);
@@ -3767,7 +3860,7 @@ impl DataPlane {
                 FarDecision::Forward { ohc_teid, ohc_addr } => {
                     let teid = ohc_teid.unwrap_or(session.dl_teid());
                     let addr = ohc_addr
-                        .map(|ip| SocketAddr::new(IpAddr::V4(ip), GTPU_PORT))
+                        .map(|ip| SocketAddr::new(ip, GTPU_PORT))
                         .unwrap_or(session.gnb_addr());
                     (teid, addr)
                 }
@@ -3862,8 +3955,23 @@ impl DataPlane {
         let gtpu_pkt =
             encapsulate_dl_gpdu_marked(pkt, dl_teid, qfi_to_apply, rqi_to_apply, ppi_to_apply);
 
-        // Send to gNB
-        match gtpu.send_to(&gtpu_pkt, gnb_addr).await {
+        // Send to gNB -- on the IPv6 socket for an IPv6 gNB (#918).
+        let sock = if gnb_addr.is_ipv6() {
+            match self.gtpu_socket6.as_deref() {
+                Some(s) => s,
+                None => {
+                    log::warn!(
+                        "DL G-PDU to IPv6 gNB {gnb_addr} dropped: no IPv6 GTP-U socket \
+                         (start upfd with --gtpu-addr6)"
+                    );
+                    self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            }
+        } else {
+            gtpu
+        };
+        match sock.send_to(&gtpu_pkt, gnb_addr).await {
             Ok(_) => {
                 session.dl_packets.fetch_add(1, Ordering::Relaxed);
                 session.dl_bytes.fetch_add(payload_len, Ordering::Relaxed);
@@ -3917,7 +4025,7 @@ impl DataPlane {
         };
         let teid = ohc_teid.unwrap_or(session.dl_teid());
         let addr = ohc_addr
-            .map(|ip| SocketAddr::new(IpAddr::V4(ip), GTPU_PORT))
+            .map(|ip| SocketAddr::new(ip, GTPU_PORT))
             .unwrap_or(session.gnb_addr());
         let qfi = session.qfi;
         // Buffered packets are flushed against the SESSION's QFI rather than a
@@ -3943,7 +4051,15 @@ impl DataPlane {
         for pkt in pkts {
             let len = pkt.len() as u64;
             let gtpu_pkt = encapsulate_dl_gpdu_marked(&pkt, teid, qfi, rqi, ppi);
-            match gtpu.send_to(&gtpu_pkt, addr).await {
+            let Some(sock) = (if addr.is_ipv6() {
+                self.gtpu_socket6.as_ref()
+            } else {
+                Some(&gtpu)
+            }) else {
+                self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            match sock.send_to(&gtpu_pkt, addr).await {
                 Ok(_) => {
                     sent += 1;
                     session.dl_packets.fetch_add(1, Ordering::Relaxed);
@@ -3965,7 +4081,7 @@ impl DataPlane {
     /// change (TS 23.502 handover, TS 29.281 7.3.2). Triggered by the SNDEM
     /// flag in the PFCP Session Modification Request.
     pub async fn send_end_marker(&self, old_teid: u32, old_addr: SocketAddr) {
-        if let Some(gtpu) = &self.gtpu_socket {
+        if let Some(gtpu) = self.socket_for(&old_addr) {
             let pkt = build_gtpu_end_marker(old_teid);
             match gtpu.send_to(&pkt, old_addr).await {
                 Ok(_) => log::info!("Sent GTP-U End Marker TEID=0x{old_teid:x} to {old_addr}"),
@@ -4033,10 +4149,7 @@ impl DataPlane {
                 apply_action: FAR_ACTION_FORW,
                 destination_interface: SRC_INTF_ACCESS,
                 ohc_teid: Some(dl_teid),
-                ohc_addr: match gnb_addr.ip() {
-                    IpAddr::V4(ip) => Some(ip),
-                    _ => None,
-                },
+                ohc_addr: Some(gnb_addr.ip()),
                 bar_id: None,
             },
         );
@@ -4096,14 +4209,10 @@ impl DataPlane {
                         if let Some(teid) = dl_teid {
                             far.ohc_teid = Some(teid);
                         }
-                        match gnb_addr.map(|a| a.ip()) {
-                            Some(IpAddr::V4(ip)) => far.ohc_addr = Some(ip),
-                            // #883: the FAR endpoint is IPv4-only. Keeping the stale IPv4
-                            // address would forward to the gNB the session just LEFT;
-                            // cleared, the downlink falls back to the session tunnel,
-                            // which carries the IPv6 address.
-                            Some(IpAddr::V6(_)) => far.ohc_addr = None,
-                            None => {}
+                        // #918: IPv4 or IPv6 -- the FAR endpoint carries either now
+                        // (#883 had to clear it for an IPv6 gNB).
+                        if let Some(addr) = gnb_addr {
+                            far.ohc_addr = Some(addr.ip());
                         }
                     }
                 }
@@ -4316,6 +4425,39 @@ impl DataPlane {
         }
     }
 
+    /// Newly FAILED N3 paths: log them with the sessions they carry, and report them
+    /// to the CP function in one Node Report (#935, TS 29.244 §7.4.5.1).
+    fn on_paths_failed(&self, failed: &[SocketAddr], miss_threshold: u32) {
+        for peer in failed {
+            log::warn!(
+                "GTP-U path to {peer} declared failed after {miss_threshold} missed responses"
+            );
+            let affected: Vec<u64> = {
+                let map = self.sessions.seid_map.read().unwrap();
+                map.values()
+                    .filter(|s| &s.gnb_addr() == peer)
+                    .map(|s| s.upf_seid)
+                    .collect()
+            };
+            if !affected.is_empty() {
+                log::warn!(
+                    "  {} session(s) affected (SEIDs: {:x?}); the SMF is told by a \
+                     Node Report (User Plane Path Failure Report)",
+                    affected.len(),
+                    affected
+                );
+            }
+        }
+        // #935 (TS 29.244 §7.4.5.1): tell the CP function, in ONE Node Report for
+        // every path that failed in this round.
+        if !failed.is_empty() {
+            self.send_report_event(UpfReportEvent::PathReport {
+                failure: true,
+                peers: failed.iter().map(|p| p.ip()).collect(),
+            });
+        }
+    }
+
     /// GTP-U N3 path management periodic task (upfd-04).
     ///
     /// Sends Echo Requests to all active gNB addresses at `echo_interval_secs`
@@ -4356,6 +4498,7 @@ impl DataPlane {
                 let map = self.sessions.seid_map.read().unwrap();
                 map.values().map(|s| s.gnb_addr()).collect()
             };
+            let active_peers = self.probeable_paths(active_peers);
 
             // #887 review: the table tracks exactly the paths in use; a peer whose last
             // session went is dropped, not probed forever.
@@ -4368,30 +4511,14 @@ impl DataPlane {
             let (to_send, failed) = self.path_table.write().unwrap().tick();
 
             // Handle newly-failed paths
-            for peer in &failed {
-                log::warn!(
-                    "GTP-U path to {peer} declared failed after {miss_threshold} missed responses"
-                );
-                let affected: Vec<u64> = {
-                    let map = self.sessions.seid_map.read().unwrap();
-                    map.values()
-                        .filter(|s| &s.gnb_addr() == peer)
-                        .map(|s| s.upf_seid)
-                        .collect()
-                };
-                if !affected.is_empty() {
-                    log::warn!(
-                        "  {} session(s) affected (SEIDs: {:x?}) — flagged; \
-                         SMF teardown deferred pending E2E validation",
-                        affected.len(),
-                        affected
-                    );
-                }
-            }
+            self.on_paths_failed(&failed, miss_threshold);
 
             // Send Echo Requests
-            if let Some(sock) = &self.gtpu_socket {
+            {
                 for (peer, seq) in to_send {
+                    let Some(sock) = self.socket_for(&peer) else {
+                        continue;
+                    };
                     let req = build_gtpu_echo_request(seq);
                     if let Err(e) = sock.send_to(&req, peer).await {
                         log::debug!("GTP-U Echo Request to {peer} failed: {e}");
@@ -5187,7 +5314,7 @@ mod tests {
                 apply_action: FAR_ACTION_FORW,
                 destination_interface: SRC_INTF_ACCESS,
                 ohc_teid: Some(0x1234),
-                ohc_addr: Some(Ipv4Addr::new(192, 168, 1, 1)),
+                ohc_addr: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))),
                 bar_id: None,
             },
         );
@@ -5196,7 +5323,7 @@ mod tests {
             session.apply_far(1),
             FarDecision::Forward {
                 ohc_teid: Some(0x1234),
-                ohc_addr: Some(Ipv4Addr::new(192, 168, 1, 1)),
+                ohc_addr: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))),
             }
         );
     }
@@ -5262,7 +5389,7 @@ mod tests {
                 apply_action: FAR_ACTION_FORW,
                 destination_interface: SRC_INTF_ACCESS,
                 ohc_teid: Some(dl_teid),
-                ohc_addr: Some(gnb),
+                ohc_addr: Some(IpAddr::V4(gnb)),
                 bar_id: None,
             },
         );
@@ -5282,7 +5409,7 @@ mod tests {
         let (teid, addr) = match session.apply_far(far_id.unwrap()) {
             FarDecision::Forward { ohc_teid, ohc_addr } => (
                 ohc_teid.unwrap_or(session.dl_teid()),
-                ohc_addr.unwrap_or(gnb),
+                ohc_addr.unwrap_or(IpAddr::V4(gnb)),
             ),
             other => panic!("expected Forward, got {other:?}"),
         };
@@ -5803,7 +5930,7 @@ mod tests {
                 apply_action: FAR_ACTION_FORW,
                 destination_interface: SRC_INTF_ACCESS,
                 ohc_teid: Some(0xF0D),
-                ohc_addr: Some(Ipv4Addr::new(127, 58, 3, 1)),
+                ohc_addr: Some(IpAddr::V4(Ipv4Addr::new(127, 58, 3, 1))),
                 bar_id: None,
             },
         );
@@ -7063,9 +7190,96 @@ mod tests {
         assert!(next[0].ur_seqn > lost[0].ur_seqn);
     }
 
-    /// #883: a DL-tunnel modification to an IPv6 gNB clears the DL FAR's IPv4 endpoint,
-    /// so the downlink follows the session tunnel to the NEW gNB instead of forwarding
-    /// to the IPv4 gNB the session just left; an IPv4 move still updates the FAR.
+    /// #918: downlink to an IPv6 gNB goes out on the IPv6 GTP-U socket and reaches the
+    /// gNB; without one it is dropped and counted (it used to be sent nowhere: the FAR
+    /// could not hold the address and the only socket was IPv4).
+    /// A socket on `[::1]`. A host with no IPv6 loopback FAILS the calling test rather
+    /// than passing it vacuously (#960 review); `NEXTGCORE_NO_IPV6=1` opts out
+    /// explicitly, and then the test is skipped with a note.
+    async fn ipv6_loopback_socket() -> Option<TokioUdpSocket> {
+        match TokioUdpSocket::bind("[::1]:0").await {
+            Ok(s) => Some(s),
+            Err(e) if std::env::var_os("NEXTGCORE_NO_IPV6").is_some() => {
+                eprintln!("no IPv6 loopback ({e}); skipped because NEXTGCORE_NO_IPV6 is set");
+                None
+            }
+            Err(e) => panic!(
+                "cannot bind [::1]: {e}. This test needs IPv6 loopback; set NEXTGCORE_NO_IPV6=1 \
+                 to skip it explicitly"
+            ),
+        }
+    }
+
+    /// #960 review: with no IPv6 GTP-U socket an IPv6 gNB's path cannot be probed, so
+    /// it is not tracked -- it would otherwise collect a miss every round and be
+    /// reported failed without ever having been probed. IPv4 paths are untouched, and
+    /// with an IPv6 socket the IPv6 path is tracked.
+    #[tokio::test]
+    async fn an_ipv6_path_is_probed_only_when_there_is_an_ipv6_socket() {
+        let v4: SocketAddr = "192.0.2.1:2152".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::1]:2152".parse().unwrap();
+        let in_use: HashSet<SocketAddr> = [v4, v6].into_iter().collect();
+        let mut dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        assert_eq!(
+            dp.probeable_paths(in_use.clone()),
+            [v4].into_iter().collect::<HashSet<_>>()
+        );
+        let Some(sock6) = ipv6_loopback_socket().await else {
+            return;
+        };
+        dp.gtpu_socket6 = Some(Arc::new(sock6));
+        assert_eq!(dp.probeable_paths(in_use.clone()), in_use);
+    }
+
+    #[tokio::test]
+    async fn downlink_to_an_ipv6_gnb_is_sent_on_the_ipv6_socket() {
+        let Some(gnb) = ipv6_loopback_socket().await else {
+            return;
+        };
+        let gnb_addr = gnb.local_addr().unwrap();
+        let ue_ip = Ipv4Addr::new(10, 45, 9, 18);
+        let v4 = Arc::new(TokioUdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mut dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        dp.gtpu_socket = Some(Arc::clone(&v4));
+        dp.add_session_from_pfcp(
+            0x918,
+            0x1918,
+            ue_ip,
+            0x9181,
+            0x9182,
+            gnb_addr,
+            Some(5),
+            Some(9),
+        );
+        let session = dp.sessions.find_by_seid(0x918).unwrap();
+        for far in session.fars.write().unwrap().values_mut() {
+            // Use the session tunnel's exact (ephemeral) port.
+            far.ohc_addr = None;
+        }
+        let mut pkt = make_ipv4_udp_packet([8, 8, 8, 8], ue_ip.octets(), 53, 1234);
+        finalize_ipv4(&mut pkt);
+
+        // No IPv6 socket: dropped and counted.
+        dp.handle_downlink_packet(&pkt, &v4).await;
+        assert_eq!(dp.stats.dropped_packets.load(Ordering::Relaxed), 1);
+
+        dp.bind_gtpu6("[::1]:0".parse().unwrap()).await.unwrap();
+        dp.handle_downlink_packet(&pkt, &v4).await;
+        let mut buf = [0u8; 2048];
+        let (n, from) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), gnb.recv_from(&mut buf))
+                .await
+                .expect("the G-PDU reaches the IPv6 gNB")
+                .unwrap();
+        assert!(from.is_ipv6(), "sent from the IPv6 GTP-U socket");
+        let hdr = parse_gtpu_header(&buf[..n]).unwrap();
+        assert_eq!(hdr.teid, 0x9182, "on the session's DL tunnel");
+        assert_eq!(dp.stats.dl_packets.load(Ordering::Relaxed), 1);
+    }
+
+    /// #883/#918: a DL-tunnel modification to an IPv6 gNB moves the DL FAR's endpoint
+    /// to that IPv6 address (#918; #883 could only clear the IPv4-only endpoint), so the
+    /// downlink goes to the NEW gNB, never the IPv4 gNB the session just left.
     #[test]
     fn a_dl_tunnel_move_to_an_ipv6_gnb_does_not_leave_the_far_on_the_old_gnb() {
         let dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
@@ -7091,18 +7305,22 @@ mod tests {
         let far_addr = || session.fars.read().unwrap()[&dl_far_id].ohc_addr;
 
         dp.update_session_from_pfcp(0x883, Some(0x1), Some("127.0.0.9:2152".parse().unwrap()));
-        assert_eq!(far_addr(), Some(Ipv4Addr::new(127, 0, 0, 9)));
+        assert_eq!(far_addr(), Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 9))));
 
         let v6: SocketAddr = "[2001:db8::9]:2152".parse().unwrap();
         dp.update_session_from_pfcp(0x883, Some(0x2), Some(v6));
-        assert_eq!(far_addr(), None, "no stale IPv4 endpoint left on the FAR");
+        assert_eq!(
+            far_addr(),
+            Some(v6.ip()),
+            "the FAR now points at the IPv6 gNB"
+        );
         assert_eq!(session.dl_tunnel(), (0x2, v6));
         match session.apply_far(dl_far_id) {
             FarDecision::Forward { ohc_teid, ohc_addr } => {
                 assert_eq!(ohc_teid, Some(0x2));
                 assert_eq!(
                     ohc_addr
-                        .map(|ip| SocketAddr::new(IpAddr::V4(ip), GTPU_PORT))
+                        .map(|ip| SocketAddr::new(ip, GTPU_PORT))
                         .unwrap_or(session.gnb_addr()),
                     v6,
                     "the downlink resolves to the new IPv6 gNB"
@@ -7853,7 +8071,10 @@ mod tests {
         assert!(failed.is_empty());
         let seq = to_send[0].1;
 
-        assert_eq!(pt.on_echo_response(peer, Some(seq)), EchoResponse::Answered);
+        assert_eq!(
+            pt.on_echo_response(peer, Some(seq)),
+            EchoResponse::Answered { recovered: false }
+        );
 
         // After response the peer must not be failed.
         let state = pt.peers.get(&peer).unwrap();
@@ -7898,9 +8119,15 @@ mod tests {
         // Answers carrying any Recovery value keep the path alive: the value is not
         // even read (#873, §8.2), only the sequence number matters (#887).
         let seq = pt.tick().0[0].1;
-        assert_eq!(pt.on_echo_response(peer, Some(seq)), EchoResponse::Answered);
+        assert_eq!(
+            pt.on_echo_response(peer, Some(seq)),
+            EchoResponse::Answered { recovered: false }
+        );
         let seq = pt.tick().0[0].1;
-        assert_eq!(pt.on_echo_response(peer, Some(seq)), EchoResponse::Answered);
+        assert_eq!(
+            pt.on_echo_response(peer, Some(seq)),
+            EchoResponse::Answered { recovered: false }
+        );
         let state = pt.peers.get(&peer).unwrap();
         assert_eq!(state.miss_count, 0);
         assert!(!state.path_failed);
@@ -7945,9 +8172,52 @@ mod tests {
         assert_eq!(pt.peers[&peer].miss_count, 1, "the miss stands");
         assert_eq!(
             pt.on_echo_response(peer, outstanding),
-            EchoResponse::Answered
+            EchoResponse::Answered { recovered: false }
         );
         assert_eq!(pt.peers[&peer].miss_count, 0);
+    }
+
+    /// #935 (TS 29.244 §7.4.5.1): a path FAILURE and a path RECOVERY each raise a
+    /// path report toward the PFCP layer (which sends the Node Report). Before, both
+    /// were only logged and the SMF never learnt that a gNB path was down or back.
+    #[tokio::test]
+    async fn path_failure_and_recovery_raise_node_reports() {
+        let dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        let (tx, mut rx) = mpsc::channel(8);
+        dp.set_report_channel(tx);
+        let gnb: SocketAddr = "127.0.0.1:2152".parse().unwrap();
+
+        dp.on_paths_failed(&[gnb], 3);
+        match rx.try_recv() {
+            Ok(UpfReportEvent::PathReport {
+                failure: true,
+                peers,
+            }) => {
+                assert_eq!(peers, vec![gnb.ip()])
+            }
+            other => panic!("expected a failure path report, got {other:?}"),
+        }
+
+        // The failed peer answers an outstanding probe: a recovery report.
+        let seq = {
+            let mut pt = dp.path_table.write().unwrap();
+            pt.sync_peers(&HashSet::from([gnb]));
+            pt.miss_threshold = 1;
+            pt.tick();
+            let _ = pt.tick(); // failed
+            pt.tick().0[0].1 // still probed
+        };
+        dp.handle_uplink_packet(&build_gtpu_echo_response(Some(seq)), gnb, -1)
+            .await;
+        match rx.try_recv() {
+            Ok(UpfReportEvent::PathReport {
+                failure: false,
+                peers,
+            }) => {
+                assert_eq!(peers, vec![gnb.ip()])
+            }
+            other => panic!("expected a recovery path report, got {other:?}"),
+        }
     }
 
     /// #887 review: only paths IN USE are tracked and probed (TS 29.281 §7.2.1). A
@@ -7992,7 +8262,8 @@ mod tests {
         assert!(refailed.is_empty(), "declared failed only once");
         assert_eq!(
             pt.on_echo_response(peer, Some(again[0].1)),
-            EchoResponse::Answered
+            EchoResponse::Answered { recovered: true },
+            "#935: the answer reports the recovery"
         );
         assert!(!pt.peers[&peer].path_failed, "the answer recovers the path");
     }

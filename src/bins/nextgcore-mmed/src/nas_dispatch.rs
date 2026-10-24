@@ -193,9 +193,8 @@ fn resolve_mme_ue(ctx: &MmeContext, enb_ue: &EnbUe, s_tmsi: Option<(u8, u32)>) -
     // MME recover the context for a Service Request or paging response instead
     // of treating the UE as new.
     //
-    // Nothing allocates GUTIs yet (#46), so `current.m_tmsi` is never set and
-    // this lookup cannot hit in production today. It is implemented rather than
-    // skipped so the path is correct the moment GUTI allocation lands.
+    // `current.m_tmsi` is the GUTI committed at ATTACH COMPLETE / TAU COMPLETE
+    // / GUTI REALLOCATION COMPLETE (#46, #956).
     if let Some((mme_code, m_tmsi)) = s_tmsi {
         if let Some(mme_ue_id) = ctx.mme_ue_find_by_s_tmsi(mme_code, m_tmsi) {
             log::info!(
@@ -280,7 +279,7 @@ fn dispatch_emm(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, pdu: &[u8]) {
         return;
     }
 
-    let plain = if security_header_type == 0 {
+    let (plain, integrity_verified) = if security_header_type == 0 {
         // TS 24.301 §4.4.4.2: outside an enumerated allowlist, an EMM message
         // that is not integrity protected must not be processed, nor forwarded
         // to the ESM entity.
@@ -293,10 +292,10 @@ fn dispatch_emm(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, pdu: &[u8]) {
             );
             return;
         }
-        pdu.to_vec()
+        (pdu.to_vec(), false)
     } else {
         match decode_protected(ctx, mme_ue_id, security_header_type, pdu) {
-            Some(plain) => plain,
+            Some(decoded) => decoded,
             None => return,
         }
     };
@@ -375,7 +374,9 @@ fn dispatch_emm(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, pdu: &[u8]) {
         // because the AMF integrity-checks those exact octets (TS 29.274 Table 7.3.5-1,
         // `29274-j60.txt:19759`). Re-encoding the body from the parsed fields would fail
         // that check and the UE would be refused (#347).
-        emm_type::TAU_REQUEST => emm_tau_request(ctx, enb_ue, mme_ue_id, body, &plain),
+        emm_type::TAU_REQUEST => {
+            emm_tau_request(ctx, enb_ue, mme_ue_id, body, &plain, integrity_verified)
+        }
         emm_type::EXTENDED_SERVICE_REQUEST => {
             emm_extended_service_request(ctx, enb_ue, mme_ue_id, body);
         }
@@ -474,12 +475,15 @@ fn dispatch_emm(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, pdu: &[u8]) {
 /// Verify and decrypt a security-protected EMM message.
 ///
 /// Returns the plain NAS message, or `None` when the message must be discarded.
+/// The plain message of a security-protected PDU, and whether its integrity was
+/// verified against the UE's NAS security context (#961 review: the TS 24.301
+/// §4.4.4.3 messages processed without a verified MAC report `false`).
 fn decode_protected(
     ctx: &MmeContext,
     mme_ue_id: u64,
     security_header_type: u8,
     pdu: &[u8],
-) -> Option<Vec<u8>> {
+) -> Option<(Vec<u8>, bool)> {
     let flags = SecurityHeaderTypeFlags::from_header_type(security_header_type);
     let mut message = pdu.to_vec();
 
@@ -507,7 +511,7 @@ fn decode_protected(
                 mme_ue.imsi_bcd,
                 plain[1]
             );
-            return Some(plain);
+            return Some((plain, false));
         }
         if matches!(security_header_type, 2 | 4) {
             // TS 24.301 §4.4.5: a UE ciphers only once the secure exchange is
@@ -551,7 +555,7 @@ fn decode_protected(
                  subscriber will be re-authenticated (TS 24.301 4.4.4.3)",
                 mme_ue.imsi_bcd
             );
-            return Some(plain);
+            return Some((plain, false));
         }
     }
     if let Err(e) = decoded {
@@ -562,7 +566,9 @@ fn decode_protected(
         return None;
     }
 
-    Some(message)
+    // EIA0 "verifies" every message: it is no integrity protection.
+    let verified = !mac_failed && mme_ue.selected_int_algorithm != 0;
+    Some((message, verified))
 }
 
 // ============================================================================
@@ -719,6 +725,13 @@ fn emm_attach_complete(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, body: &
             }
         }
     };
+
+    // TS 24.301 §5.5.1.2.4: "Upon receiving an ATTACH COMPLETE message, the MME
+    // ... shall consider the GUTI sent in the ATTACH ACCEPT message as valid"
+    // (#956). Without this the S-TMSI an idle UE returns with (SERVICE REQUEST,
+    // paging response) matched no context, the SERVICE REQUEST could not be
+    // verified, and every return from ECM-IDLE ended in a re-attach.
+    ctx.commit_staged_guti(mme_ue_id);
 
     // TS 24.301 §5.5.1.2.4: the ESM container carries ACTIVATE DEFAULT EPS
     // BEARER CONTEXT ACCEPT, which belongs to the ESM entity.
@@ -1008,6 +1021,7 @@ fn emm_tau_request(
     mme_ue_id: u64,
     body: &[u8],
     whole_pdu: &[u8],
+    integrity_verified: bool,
 ) {
     let mut pool = ctx.mme_ue_pool.write().unwrap();
     let Some(mme_ue) = pool.get_mut(&mme_ue_id) else {
@@ -1155,6 +1169,27 @@ fn emm_tau_request(
         parsed.update_type,
         parsed.active_flag
     );
+    // #961 review, TS 24.301 §5.6.2.2.1: a TAU REQUEST that passed the
+    // integrity check answers paging, so paging stops; when the paging was for
+    // downlink data, the user plane is brought up with the TAU ACCEPT as with
+    // the active flag (TS 23.401 §5.3.3.1 step 20, §5.3.4.3), so the buffered
+    // downlink reaches the UE instead of a DDN Failure Indication discarding it.
+    // The integrity result the dispatcher established for THIS message (#961
+    // review): a plain TAU REQUEST, or one processed without a verifiable MAC,
+    // answers nothing, so T3413 keeps running and no user plane is set up on a
+    // K_eNB from an unverified COUNT.
+    let verified = integrity_verified;
+    let paged_for_data = if verified
+        && (mme_ue.t3413.is_running() || mme_ue.paging.type_ != crate::context::PagingType::None)
+    {
+        let was = mme_ue.paging.type_;
+        mme_ue.t3413.stop();
+        mme_ue.paging.type_ = crate::context::PagingType::None;
+        was == crate::context::PagingType::DownlinkDataNotification
+    } else {
+        false
+    };
+    let restore_user_plane = verified && (parsed.active_flag || paged_for_data);
     // TS 24.301 §5.5.3.2.4: the TAU accept may reallocate the GUTI, and rotating it
     // on mobility is what keeps the temporary identity temporary (#46).
     ctx.allocate_guti(mme_ue_id);
@@ -1175,14 +1210,41 @@ fn emm_tau_request(
                 .collect::<Vec<_>>()
         })
         .collect();
-    if let Err(e) = nas_path::nas_eps_send_tau_accept(
+    // The user plane, when it is restored: the bearers established at the
+    // Serving GW, under a K_eNB from the TAU REQUEST's uplink COUNT (TS 33.401
+    // §7.2.6.2, A.3). The response then sends the Modify Bearer Request
+    // (`service_request_ics_pending`), as for a SERVICE REQUEST.
+    let restore = restore_user_plane && bearers.iter().any(|b| b.sgw_s1u_teid != 0);
+    if restore {
+        mme_ue.kenb = nextgcore_crypt::kdf::nextgcore_kdf_kenb(&mme_ue.kasme, mme_ue.ul_count);
+        mme_ue.nhcc = 0;
+        mme_ue.nh = [0; 32];
+    }
+    // Every bearer the MME keeps goes in the EPS bearer context status, so the
+    // UE does not delete one the MME still holds (#961 review); the Initial
+    // Context Setup carries only those established at the Serving GW
+    // (`nas_eps_send_tau_accept`).
+    match nas_path::nas_eps_send_tau_accept(
         mme_ue,
         enb_ue,
-        false,
+        restore,
         &bearers,
         s1ap_build::ue_ambr_of(ctx, mme_ue),
     ) {
-        log::error!("[{}] TAU Accept send failed: {e}", mme_ue.imsi_bcd);
+        Ok(()) if restore => {
+            mme_ue.service_request_ics_pending = true;
+            log::info!(
+                "[{}] TAU Accept in an Initial Context Setup Request: user plane restored ({})",
+                mme_ue.imsi_bcd,
+                if paged_for_data {
+                    "paging answered"
+                } else {
+                    "active flag"
+                }
+            );
+        }
+        Ok(()) => {}
+        Err(e) => log::error!("[{}] TAU Accept send failed: {e}", mme_ue.imsi_bcd),
     }
 }
 
@@ -1336,6 +1398,8 @@ fn emm_service_request(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, pdu: &[
         ) {
             log::error!("Service Reject send failed: {e}");
         }
+        drop(pool);
+        crate::paging::service_rejected(ctx, mme_ue_id);
         release_after_service_reject(ctx, enb_ue);
         return;
     }
@@ -1366,16 +1430,70 @@ fn emm_service_request(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, pdu: &[
         ) {
             log::error!("Service Reject send failed: {e}");
         }
+        drop(pool);
+        crate::paging::service_rejected(ctx, mme_ue_id);
         release_after_service_reject(ctx, enb_ue);
         return;
     }
 
-    // Re-establishing the radio bearers is the Initial Context Setup path (#47).
-    log::info!(
-        "[{}] SERVICE REQUEST accepted; Initial Context Setup for the active bearers is not \
-         implemented (#47)",
-        mme_ue.imsi_bcd
-    );
+    drop(pool);
+    service_request_initial_context_setup(ctx, enb_ue, mme_ue_id);
+}
+
+/// SERVICE REQUEST accepted (TS 23.401 §5.3.4.1 step 4, #956): the radio and
+/// S1 bearers of every active EPS bearer are set up again with an INITIAL
+/// CONTEXT SETUP REQUEST, with no NAS-PDU (a SERVICE REQUEST has no NAS
+/// answer; the AS security mode is its acceptance, TS 24.301 §5.6.1.4).
+///
+/// K_eNB is derived afresh from K_ASME and the uplink NAS COUNT of the SERVICE
+/// REQUEST (TS 33.401 §7.2.8.1, Annex A.3), and the NH chain restarts from it.
+/// A paging the UE answered stops (TS 24.301 §5.6.2.2.1).
+fn service_request_initial_context_setup(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64) {
+    let was_paged = crate::paging::answered(ctx, mme_ue_id) != crate::context::PagingType::None;
+    // The bearers established at the Serving GW (an S1-U SGW TEID): the ones a
+    // never-connected subscription session lacks.
+    let bearers: Vec<crate::context::MmeBearer> = crate::gtp_path::bearers_of_ue(ctx, mme_ue_id)
+        .into_iter()
+        .filter(|b| b.sgw_s1u_teid != 0)
+        .collect();
+    let mut pool = ctx.mme_ue_pool.write().unwrap();
+    let Some(mme_ue) = pool.get_mut(&mme_ue_id) else {
+        return;
+    };
+    mme_ue.kenb = nextgcore_crypt::kdf::nextgcore_kdf_kenb(&mme_ue.kasme, mme_ue.ul_count);
+    mme_ue.nhcc = 0;
+    mme_ue.nh = [0; 32];
+    let ue_ambr = crate::s1ap_build::ue_ambr_of(ctx, mme_ue);
+    match crate::s1ap_build::build_initial_context_setup_request(
+        mme_ue, enb_ue, &bearers, None, ue_ambr,
+    ) {
+        Ok(pdu) => {
+            mme_ue.service_request_ics_pending = true;
+            // #869: a UE-AMBR change waits behind this setup, which carries the
+            // value computed here.
+            mme_ue.ics_pending_on = enb_ue.id;
+            if let Err(e) = nas_path::nas_eps_send_to_enb(mme_ue, enb_ue, pdu) {
+                mme_ue.service_request_ics_pending = false;
+                mme_ue.ics_pending_on = 0;
+                log::error!(
+                    "[{}] SERVICE REQUEST: Initial Context Setup not sent: {e}",
+                    mme_ue.imsi_bcd
+                );
+                return;
+            }
+            log::info!(
+                "[{}] SERVICE REQUEST accepted: Initial Context Setup Request for E-RABs {:?} \
+                 (TS 23.401 §5.3.4.1 step 4){}",
+                mme_ue.imsi_bcd,
+                bearers.iter().map(|b| b.ebi).collect::<Vec<_>>(),
+                if was_paged { "; paging stopped" } else { "" }
+            );
+        }
+        Err(e) => log::error!(
+            "[{}] SERVICE REQUEST: Initial Context Setup Request not built: {e:?}",
+            mme_ue.imsi_bcd
+        ),
+    }
 }
 
 fn emm_extended_service_request(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, body: &[u8]) {
@@ -1395,6 +1513,32 @@ fn emm_extended_service_request(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64
             return;
         }
     };
+
+    // #956, TS 24.301 §5.6.1.1 / Table 9.9.3.27.1: service type "packet
+    // services via S1" (8, and the unused 9-11 read as it) is a SERVICE REQUEST
+    // in all but the message: the user plane is set up again. It was refused
+    // as a CS fallback with no SGs association.
+    if service_type >= 8 {
+        drop(pool);
+        if !ctx.mme_ue_have_active_eps_bearers(mme_ue_id) {
+            let mut pool = ctx.mme_ue_pool.write().unwrap();
+            if let Some(mme_ue) = pool.get_mut(&mme_ue_id) {
+                if let Err(e) = nas_path::nas_eps_send_service_reject(
+                    enb_ue,
+                    mme_ue,
+                    EmmCause::NoEpsBearerContextActivated,
+                ) {
+                    log::error!("Service Reject send failed: {e}");
+                }
+            }
+            drop(pool);
+            crate::paging::service_rejected(ctx, mme_ue_id);
+            release_after_service_reject(ctx, enb_ue);
+            return;
+        }
+        service_request_initial_context_setup(ctx, enb_ue, mme_ue_id);
+        return;
+    }
 
     if mme_ue.csmap_id == NEXTGCORE_INVALID_POOL_ID {
         // TS 24.301 §5.6.1.5: CSFB needs an SGs association with a VLR.
@@ -1928,11 +2072,17 @@ pub fn handle_esm_message(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue: &MmeUe, esm:
             match esm_handler::handle_deactivate_bearer_context_accept(
                 enb_ue, mme_ue, &sess, &bearer, body,
             ) {
-                Ok(()) => log::info!(
-                    "[{}] EPS bearer (ebi={}) deactivated by the UE",
-                    mme_ue.imsi_bcd,
-                    bearer.ebi
-                ),
+                Ok(()) => {
+                    log::info!(
+                        "[{}] EPS bearer (ebi={}) deactivated by the UE",
+                        mme_ue.imsi_bcd,
+                        bearer.ebi
+                    );
+                    // #734, TS 23.401 §5.4.4.1 step 7: a PDN GW initiated
+                    // deactivation completes; the Serving GW is answered when
+                    // its last bearer is done.
+                    crate::bearer_deactivation::on_accept(ctx, mme_ue.id, bearer.ebi);
+                }
                 Err(e) => log::warn!("[{}] Deactivate accept rejected: {e}", mme_ue.imsi_bcd),
             }
         }
@@ -2621,6 +2771,55 @@ mod tests {
         ];
         pdu.extend_from_slice(&[0xaa; 8]);
         pdu
+    }
+
+    /// #734: the ESM DEACTIVATE EPS BEARER CONTEXT ACCEPT reaches the PDN GW
+    /// initiated deactivation, which deletes the bearer and settles the request.
+    #[test]
+    fn a_deactivate_accept_settles_the_bearer_deactivation() {
+        let _guard = crate::gtp_path::lock_s11();
+        crate::bearer_deactivation::clear_for_test();
+        let ctx = test_ctx();
+        let enb_ue_id = enb_with_connection(&ctx);
+        let mme_ue_id = ue_with_vector(&ctx, enb_ue_id);
+        let sess_id = ctx.sess_add(mme_ue_id, 1);
+        for ebi in [5u8, 6] {
+            let id = ctx.bearer_add(sess_id, mme_ue_id);
+            ctx.bearer_pool.write().unwrap().get_mut(&id).unwrap().ebi = ebi;
+            ctx.sess_pool
+                .write()
+                .unwrap()
+                .get_mut(&sess_id)
+                .unwrap()
+                .bearer_list
+                .push(id);
+        }
+        ctx.mme_ue_pool
+            .write()
+            .unwrap()
+            .get_mut(&mme_ue_id)
+            .unwrap()
+            .sess_list
+            .push(sess_id);
+        assert!(crate::bearer_deactivation::start(
+            &ctx,
+            mme_ue_id,
+            "127.0.0.1:2123".parse().unwrap(),
+            0x734,
+            0x5ca1,
+            crate::bearer_deactivation::DeleteBearerAnswer::Ebis(vec![6]),
+            None,
+            &[6],
+            false,
+        ));
+        assert_eq!(crate::bearer_deactivation::pending_count(), 1);
+        let enb_ue = ctx.enb_ue_find_by_id(enb_ue_id).unwrap();
+        let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        // DEACTIVATE EPS BEARER CONTEXT ACCEPT, EBI 6.
+        handle_esm_message(&ctx, &enb_ue, &mme_ue, &[0x62, 0x00, 0xce]);
+        assert_eq!(crate::bearer_deactivation::pending_count(), 0);
+        assert!(ctx.bearer_find_by_ebi(mme_ue_id, 6).is_none());
+        assert!(ctx.bearer_find_by_ebi(mme_ue_id, 5).is_some());
     }
 
     /// A UE in a network-initiated detach of `detach_type`, DETACH REQUEST sent
@@ -3872,6 +4071,66 @@ mod tests {
             &[
                 NAS_PROTOCOL_DISCRIMINATOR_EMM,
                 NasEpsMessageType::GutiReallocationComplete as u8,
+            ],
+        );
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &complete));
+
+        assert_eq!(
+            ctx.mme_ue_find_by_s_tmsi(mme_code, staged),
+            Some(mme_ue_id),
+            "the acknowledged GUTI must resolve the UE by S-TMSI"
+        );
+    }
+
+    /// #956, TS 24.301 §5.5.1.2.4: ATTACH COMPLETE makes the GUTI of the ATTACH
+    /// ACCEPT valid, so the UE is resolvable by its S-TMSI when it returns from
+    /// ECM-IDLE (SERVICE REQUEST, paging response).
+    #[test]
+    fn attach_complete_commits_the_staged_guti() {
+        // Its OWN context with a served GUMMEI: `test_ctx()` has none, and adding one
+        // there would change the ambient state every other test in this module runs
+        // against.
+        let mut ctx = test_ctx();
+        ctx.served_gummei = vec![crate::context::ServedGummei {
+            num_of_plmn_id: 1,
+            plmn_id: vec![crate::context::PlmnId::new("001", "01")],
+            num_of_mme_gid: 1,
+            mme_gid: vec![2],
+            num_of_mme_code: 1,
+            mme_code: vec![1],
+        }];
+        ctx.num_of_served_gummei = 1;
+        let ctx = ctx;
+        let enb_ue_id = enb_with_connection(&ctx);
+        let mme_ue_id = ue_with_vector(&ctx, enb_ue_id);
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &authentication_response()));
+
+        assert!(
+            ctx.allocate_guti(mme_ue_id),
+            "the fixture's served GUMMEI must allow an allocation"
+        );
+        let staged = ctx
+            .mme_ue_find_by_id(mme_ue_id)
+            .unwrap()
+            .next
+            .m_tmsi
+            .expect("staged");
+        let mme_code = ctx.mme_ue_find_by_id(mme_ue_id).unwrap().next.guti.mme_code;
+        assert_eq!(
+            ctx.mme_ue_find_by_s_tmsi(mme_code, staged),
+            None,
+            "a staged GUTI must not resolve before the UE acknowledges it"
+        );
+
+        let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        let complete = protect_uplink(
+            &mme_ue,
+            1,
+            &[
+                NAS_PROTOCOL_DISCRIMINATOR_EMM,
+                NasEpsMessageType::AttachComplete as u8,
+                0x00,
+                0x00,
             ],
         );
         nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &complete));

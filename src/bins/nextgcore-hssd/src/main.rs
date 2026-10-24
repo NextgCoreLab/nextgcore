@@ -31,9 +31,10 @@ struct Args {
     #[arg(short = 'l', long)]
     log_file: Option<String>,
 
-    /// Log level (trace, debug, info, warn, error)
-    #[arg(short = 'e', long, default_value = "info")]
-    log_level: String,
+    /// Log level (trace, debug, info, warn, error). Without it, the config
+    /// file's `logger.level`, else `info`; `RUST_LOG` overrides (#691).
+    #[arg(short = 'e', long)]
+    log_level: Option<String>,
 
     /// Disable color output
     #[arg(short = 'm', long)]
@@ -393,21 +394,11 @@ fn open_subscriber_store(db_uri: &str, attempts: u32, backoff: std::time::Durati
 
 /// Initialize logging based on command line arguments
 fn init_logging(args: &Args) -> Result<()> {
-    let mut builder = env_logger::Builder::new();
-
-    // Set log level
-    let level = match args.log_level.to_lowercase().as_str() {
-        "trace" => log::LevelFilter::Trace,
-        "debug" => log::LevelFilter::Debug,
-        "info" => log::LevelFilter::Info,
-        "warn" => log::LevelFilter::Warn,
-        "error" => log::LevelFilter::Error,
-        _ => log::LevelFilter::Info,
-    };
-    builder.filter_level(level);
-
-    // Configure format
-    builder.format_timestamp_millis();
+    // RUST_LOG if set, else --log-level: the same for every NF (#691).
+    let mut builder = nextgcore_core::log::nf_log_builder(&nextgcore_core::log::nf_log_level(
+        args.log_level.as_deref(),
+        Some(&args.config),
+    ));
 
     if args.no_color {
         builder.write_style(env_logger::WriteStyle::Never);
@@ -628,7 +619,7 @@ mod tests {
     fn test_args_default() {
         let args = Args::parse_from(["nextgcore-hssd"]);
         assert_eq!(args.config, "/etc/nextgcore/hss.yaml");
-        assert_eq!(args.log_level, "info");
+        assert_eq!(args.log_level, None);
         assert_eq!(args.diameter_config, "/etc/nextgcore/freeDiameter/hss.conf");
         assert_eq!(args.max_ue, 1024);
         assert_eq!(args.db_name, "nextgcore");
@@ -687,7 +678,7 @@ mod tests {
             "custom_db",
         ]);
         assert_eq!(args.config, "/custom/hss.yaml");
-        assert_eq!(args.log_level, "debug");
+        assert_eq!(args.log_level.as_deref(), Some("debug"));
         assert_eq!(args.diameter_config, "/custom/hss.conf");
         assert_eq!(args.max_ue, 2048);
         assert_eq!(args.db_uri, Some("mongodb://localhost:27017".to_string()));

@@ -27,6 +27,7 @@ use nextgcore_pfcp::message::{
     PfcpMessage as PfcpLibMessage, SessionEstablishmentRequest as LibSessionEstablishmentRequest,
     SessionModificationRequest as LibSessionModificationRequest,
 };
+use nextgcore_pfcp::peer_policy::{is_request_type, same_host, PeerAllowlist, RefusalLog};
 use nextgcore_pfcp::types::{
     ApplyAction as LibApplyAction, CreateFar as LibCreateFar, CreatePdr as LibCreatePdr,
     CreateQer as LibCreateQer, CreateUrr as LibCreateUrr, FSeid as LibFSeid, FTeid as LibFTeid,
@@ -367,6 +368,27 @@ pub fn sxa_node() -> Option<Arc<SxaNode>> {
     SXA_NODE.read().ok()?.clone()
 }
 
+/// PFCP messages refused because they did not come from an associated SGW-C, or a
+/// response from a host our request did not go to. Rendered as
+/// `sgwu_pfcp_unauthorized_messages_total`.
+pub static PFCP_UNAUTHORIZED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Rate limit for the refusal log lines (#968 review): the counter counts every
+/// refusal; the log speaks once per interval so a spoofed flood is not a log flood.
+static REFUSAL_LOG: RefusalLog = RefusalLog::new();
+
+/// Count one refused PFCP message and log it, rate-limited.
+fn note_refusal(what: std::fmt::Arguments<'_>) {
+    PFCP_UNAUTHORIZED.fetch_add(1, Ordering::Relaxed);
+    if let Some(suppressed) = REFUSAL_LOG.note() {
+        if suppressed > 0 {
+            log::warn!("{what} ({suppressed} earlier refusal(s) not logged)");
+        } else {
+            log::warn!("{what}");
+        }
+    }
+}
+
 /// The SGW-U's PFCP endpoint on Sxa: one UDP socket, transactions matched on
 /// sequence number, peers tracked for heartbeat-driven failure detection.
 pub struct SxaNode {
@@ -377,7 +399,9 @@ pub struct SxaNode {
     /// every Association Setup Response and Heartbeat (TS 29.244 §8.2.65).
     pub recovery_time_stamp: u32,
     seq: AtomicU32,
-    pending: Mutex<HashMap<u32, oneshot::Sender<(u8, Vec<u8>)>>>,
+    /// Outstanding requests by sequence number, with the address each was sent to:
+    /// only a response FROM that address completes it (security, see `on_datagram`).
+    pending: Mutex<HashMap<u32, (SocketAddr, oneshot::Sender<(u8, Vec<u8>)>)>>,
     peers: RwLock<HashMap<SocketAddr, SxaPeer>>,
     /// Associated-peer count, readable without awaiting.
     ///
@@ -387,7 +411,151 @@ pub struct SxaNode {
     /// every mutation of `peers`, which is the only way the two can disagree.
     associated_peers: std::sync::atomic::AtomicUsize,
     timers: SgwuTimerConfigs,
+    /// The SGW-C hosts an Association Setup is accepted from (security, #968).
+    /// Fail closed: empty refuses every Setup.
+    allowed_peers: std::sync::RwLock<PeerAllowlist>,
+    /// The most sessions one SGW-C may hold (0 = only the global capacity), so one
+    /// peer cannot take every session slot from the others (#968).
+    max_sessions_per_peer: std::sync::atomic::AtomicUsize,
+    /// The responses this node sent, for answering a retransmitted request with the
+    /// ORIGINAL response instead of executing it again (#905, TS 29.244 §6.4). A std
+    /// mutex held only to look up or file bytes, never across `.await`.
+    response_cache: std::sync::Mutex<ResponseCache>,
 }
+
+/// A cached request/response key: (peer, request sequence number, request type).
+type CacheKey = (SocketAddr, u32, u8);
+
+/// The PFCP response cache (#905, TS 29.244 §6.4).
+///
+/// - A retransmission is "the same message content, including the same PFCP header"
+///   (§6.4), so a request is matched on (peer, sequence number, type) AND a digest
+///   of the WHOLE datagram. Matching on the body alone let two Deletions for
+///   different SEIDs (whose bodies are both empty) collide.
+/// - Expiry is amortized O(1): every insertion is queued in order, and only the
+///   expired front of the queue is examined. A full sweep per message made the
+///   node's cost grow with the cache.
+/// - The cache is bounded (`cap`): beyond it the oldest answers are dropped first.
+///   Only associated peers' session/association requests are cached (not
+///   Heartbeats), so an unassociated sender cannot fill it.
+/// - A request still being handled when its retransmission arrives is reported as
+///   IN FLIGHT, so the retransmission is dropped rather than executed a second time.
+pub(crate) struct ResponseCache {
+    ttl: std::time::Duration,
+    cap: usize,
+    answered: HashMap<CacheKey, CachedResponse>,
+    in_flight: HashMap<CacheKey, (std::time::Instant, u64)>,
+    order: std::collections::VecDeque<(std::time::Instant, CacheKey)>,
+}
+
+struct CachedResponse {
+    at: std::time::Instant,
+    /// Digest of the whole request datagram it answered.
+    request_digest: u64,
+    bytes: Vec<u8>,
+}
+
+/// What a cache lookup decided for an incoming request.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CacheLookup {
+    /// A retransmission of an answered request: re-send these bytes.
+    Replay(Vec<u8>),
+    /// A retransmission of a request still being handled: drop it.
+    InFlight,
+    /// A new request: handle it (its response will be filed).
+    New,
+}
+
+impl ResponseCache {
+    pub(crate) fn new(ttl: std::time::Duration, cap: usize) -> Self {
+        Self {
+            ttl,
+            cap,
+            answered: HashMap::new(),
+            in_flight: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Pop the expired front of the queue; a queue item whose key was re-filed later
+    /// (a newer instant) is skipped. Amortized O(1) per insertion.
+    fn expire(&mut self, now: std::time::Instant) {
+        while let Some(&(at, key)) = self.order.front() {
+            if now.duration_since(at) < self.ttl && self.answered.len() <= self.cap {
+                break;
+            }
+            self.order.pop_front();
+            if self.answered.get(&key).is_some_and(|c| c.at == at) {
+                self.answered.remove(&key);
+            }
+            if self.in_flight.get(&key).is_some_and(|(t, _)| *t == at) {
+                self.in_flight.remove(&key);
+            }
+        }
+    }
+
+    pub(crate) fn on_request(
+        &mut self,
+        key: CacheKey,
+        datagram: &[u8],
+        now: std::time::Instant,
+    ) -> CacheLookup {
+        self.expire(now);
+        let digest = digest(datagram);
+        if let Some(c) = self.answered.get(&key) {
+            if c.request_digest == digest {
+                return CacheLookup::Replay(c.bytes.clone());
+            }
+        }
+        if self.in_flight.get(&key).is_some_and(|(_, d)| *d == digest) {
+            return CacheLookup::InFlight;
+        }
+        self.answered.remove(&key);
+        self.in_flight.insert(key, (now, digest));
+        self.order.push_back((now, key));
+        CacheLookup::New
+    }
+
+    /// File the response to the in-flight request `key`.
+    pub(crate) fn on_response(&mut self, key: CacheKey, bytes: &[u8], now: std::time::Instant) {
+        let Some((_, request_digest)) = self.in_flight.remove(&key) else {
+            return;
+        };
+        self.answered.insert(
+            key,
+            CachedResponse {
+                at: now,
+                request_digest,
+                bytes: bytes.to_vec(),
+            },
+        );
+        self.order.push_back((now, key));
+        self.expire(now);
+    }
+
+    /// Forget a peer: it restarted (new Association Setup, changed Recovery Time
+    /// Stamp), so its new requests -- numbered from 1 again -- must never hit answers
+    /// given to the old instance. O(n), but only on a restart.
+    pub(crate) fn flush_peer(&mut self, peer: SocketAddr) {
+        self.answered.retain(|(p, _, _), _| *p != peer);
+        self.in_flight.retain(|(p, _, _), _| *p != peer);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.answered.len()
+    }
+}
+
+fn digest(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
+}
+
+/// At most this many cached answers (#908 review): the oldest go first beyond it.
+const RESPONSE_CACHE_CAP: usize = 65_536;
 
 impl SxaNode {
     /// Bind the Sxa PFCP socket and install the process-wide node.
@@ -410,10 +578,9 @@ impl SxaNode {
     ) -> std::io::Result<Arc<Self>> {
         let socket = UdpSocket::bind(bind).await?;
         let bound = socket.local_addr()?;
-        let recovery_time_stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as u32)
-            .unwrap_or(1);
+        // #995: NTP-era seconds (TS 29.244 §8.2.65), not Unix seconds.
+        let recovery_time_stamp = nextgcore_pfcp::recovery_time::now();
+        let cache_ttl = timers.no_heartbeat.duration * (timers.no_heartbeat.max_count.max(2) + 2);
         let node = Arc::new(Self {
             socket: Arc::new(socket),
             local_ip,
@@ -423,6 +590,15 @@ impl SxaNode {
             peers: RwLock::new(HashMap::new()),
             associated_peers: std::sync::atomic::AtomicUsize::new(0),
             timers,
+            allowed_peers: std::sync::RwLock::new(PeerAllowlist::default()),
+            max_sessions_per_peer: std::sync::atomic::AtomicUsize::new(0),
+            // #908 review: the window is this node's own T1 x (N1 + 1) plus one T1 of
+            // margin -- the SGW-C is assumed to retransmit on the same timers; there is
+            // no way to learn the peer's.
+            response_cache: std::sync::Mutex::new(ResponseCache::new(
+                cache_ttl,
+                RESPONSE_CACHE_CAP,
+            )),
         });
         log::info!(
             "PFCP/Sxa listening on {bound} (Node ID {local_ip}, Recovery Time Stamp \
@@ -432,6 +608,43 @@ impl SxaNode {
             *slot = Some(node.clone());
         }
         Ok(node)
+    }
+
+    /// Set the SGW-C addresses an Association Setup Request is accepted from
+    /// (`sgwu.pfcp.allowed_peers` / `SGWU_PFCP_ALLOWED_PEERS`, security #968).
+    pub fn set_allowed_peers(&self, allowlist: PeerAllowlist) {
+        if let Ok(mut a) = self.allowed_peers.write() {
+            *a = allowlist;
+        }
+    }
+
+    /// Set the per-SGW-C session cap (0 = only the global capacity).
+    pub fn set_max_sessions_per_peer(&self, cap: usize) {
+        self.max_sessions_per_peer.store(cap, Ordering::Relaxed);
+    }
+
+    fn allowed_peers(&self) -> PeerAllowlist {
+        self.allowed_peers
+            .read()
+            .map(|a| a.clone())
+            .unwrap_or_default()
+    }
+
+    /// The associated peer on host `ip`: its map key and its node id.
+    ///
+    /// By IP, never by port (#968 review, MAJOR 3): the association is the CP
+    /// function's (TS 29.244 §6.2.6), so an SGW-C that sends a request from another
+    /// source port, or whose NAT binding moved, is still that peer. Association Setup
+    /// keeps at most one peer per host (see `handle_association_setup_request`), so
+    /// two SGW-Cs behind ONE IP address are one peer here: they must use distinct
+    /// addresses (a known limitation; keying on (IP, Node ID) would lift it).
+    async fn peer_on_host(&self, ip: IpAddr) -> Option<(SocketAddr, u64)> {
+        self.peers
+            .read()
+            .await
+            .iter()
+            .find(|(addr, _)| same_host(addr.ip(), ip))
+            .map(|(addr, p)| (*addr, p.node_id))
     }
 
     /// The bound local address.
@@ -502,6 +715,15 @@ impl SxaNode {
         let mut buf = BytesMut::with_capacity(4 + after_length + body.len());
         header.encode(&mut buf);
         buf.extend_from_slice(body);
+        // #905: remember a RESPONSE so a retransmission of its request (same peer, same
+        // sequence number) is answered with it. PFCP request types are the response
+        // types minus one (Table 7.3-1). Expired entries are swept on the way in.
+        if is_response_type(msg_type) && msg_type != pfcp_msg_type::VERSION_NOT_SUPPORTED_RESPONSE {
+            // Filed only if the request was registered as in flight (i.e. cacheable).
+            if let Ok(mut cache) = self.response_cache.lock() {
+                cache.on_response((to, seq, msg_type - 1), &buf, std::time::Instant::now());
+            }
+        }
         self.socket
             .send_to(&buf, to)
             .await
@@ -540,7 +762,7 @@ impl SxaNode {
         loop {
             attempt += 1;
             let (tx, rx) = oneshot::channel();
-            self.pending.lock().await.insert(seq, tx);
+            self.pending.lock().await.insert(seq, (to, tx));
 
             if let Err(e) = self.send(msg_type, seid, seq, body, to).await {
                 self.pending.lock().await.remove(&seq);
@@ -703,8 +925,23 @@ impl SxaNode {
 
         // Responses complete the transaction that is waiting for them.
         if is_response_type(msg_type) {
-            if let Some(tx) = self.pending.lock().await.remove(&header.sequence_number) {
-                let _ = tx.send((msg_type, body));
+            let mut pending = self.pending.lock().await;
+            let ours = pending
+                .get(&header.sequence_number)
+                .is_some_and(|(to, _)| same_host(to.ip(), from.ip()));
+            if ours {
+                if let Some((_, tx)) = pending.remove(&header.sequence_number) {
+                    let _ = tx.send((msg_type, body));
+                }
+            } else if pending.contains_key(&header.sequence_number) {
+                // SECURITY: a response from a host our request did not go to cannot
+                // complete it (it would acknowledge a report the SGW-C never saw, or
+                // keep a dead peer's heartbeat looking answered).
+                note_refusal(format_args!(
+                    "PFCP response type={msg_type} seq={} from {from}, which is not where \
+                     the request went: dropped",
+                    header.sequence_number
+                ));
             } else {
                 log::debug!(
                     "PFCP response type={msg_type} seq={} with no pending transaction",
@@ -714,27 +951,116 @@ impl SxaNode {
             return;
         }
 
+        // SECURITY (#968): only an ASSOCIATED SGW-C may send anything but Heartbeat
+        // Request and Association Setup Request (TS 29.244 §5.8.3, cause 72). Before, a
+        // Session Modification or Deletion from any source was executed on a guessed
+        // SEID, and an Establishment from an unassociated host created a session no
+        // restart would ever flush. Matched by host, not port (see `peer_on_host`).
+        let peer = self.peer_on_host(from.ip()).await;
+        if peer.is_none()
+            && !matches!(
+                msg_type,
+                pfcp_msg_type::HEARTBEAT_REQUEST | pfcp_msg_type::ASSOCIATION_SETUP_REQUEST
+            )
+        {
+            if !is_request_type(msg_type) {
+                // Unknown message type: ignored (TS 29.244 §7.6), never answered.
+                note_refusal(format_args!(
+                    "PFCP message of unknown type {msg_type} from {from}: ignored"
+                ));
+                return;
+            }
+            note_refusal(format_args!(
+                "PFCP request type={msg_type} from {from}, which is not an associated SGW-C: \
+                 rejected (cause 72), not executed"
+            ));
+            let seid = header.seid.map(|_| 0);
+            let mut rej = Vec::new();
+            rej.extend_from_slice(&19u16.to_be_bytes());
+            rej.extend_from_slice(&1u16.to_be_bytes());
+            rej.push(sxa_build::pfcp_cause::NO_ESTABLISHED_PFCP_ASSOCIATION);
+            // `msg_type` is a Table 7.3-1 request type, so `+ 1` is its response.
+            let _ = self
+                .send(msg_type + 1, seid, header.sequence_number, &rej, from)
+                .await;
+            return;
+        }
+        // The peer's map key (its Setup source) and node id, for the handlers below.
+        let peer_key = peer.map(|(k, _)| k).unwrap_or(from);
+        let peer_node = peer.map(|(_, n)| n);
+
+        // #905 (TS 29.244 §6.4): a request we already answered is a RETRANSMISSION --
+        // the peer lost our response. It is answered with that response and NOT
+        // executed again: re-running an Establishment re-installed its rules on the
+        // live session, and a Modification applied its changes twice.
+        // Only an ASSOCIATED peer's session/association requests are cached (#908
+        // review): Heartbeats are idempotent, and an unassociated sender must not be
+        // able to fill the cache.
+        let cacheable = msg_type != pfcp_msg_type::HEARTBEAT_REQUEST && peer.is_some();
+        if cacheable {
+            let key = (from, header.sequence_number, msg_type);
+            let lookup = self
+                .response_cache
+                .lock()
+                .map(|mut c| c.on_request(key, pkt, std::time::Instant::now()))
+                .unwrap_or(CacheLookup::New);
+            match lookup {
+                CacheLookup::Replay(bytes) => {
+                    log::info!(
+                        "PFCP type={msg_type} seq={} from {from} is a retransmission: \
+                         re-sending the original response",
+                        header.sequence_number
+                    );
+                    if let Err(e) = self.socket.send_to(&bytes, from).await {
+                        log::warn!("Failed to re-send PFCP response to {from}: {e}");
+                    }
+                    return;
+                }
+                CacheLookup::InFlight => {
+                    log::info!(
+                        "PFCP type={msg_type} seq={} from {from} is a retransmission of a \
+                         request still being handled: dropped",
+                        header.sequence_number
+                    );
+                    return;
+                }
+                CacheLookup::New => {}
+            }
+            // A NEW Association Setup from a peer is a restart: nothing it sent before
+            // may be answered from the cache again.
+            if msg_type == pfcp_msg_type::ASSOCIATION_SETUP_REQUEST {
+                if let Ok(mut c) = self.response_cache.lock() {
+                    c.flush_peer(from);
+                    // ...but this request's own answer is still filed.
+                    let _ = c.on_request(key, pkt, std::time::Instant::now());
+                }
+            }
+        }
+
         match msg_type {
             pfcp_msg_type::HEARTBEAT_REQUEST => {
-                self.handle_heartbeat_request(&header, &body, from).await;
+                self.handle_heartbeat_request(&header, &body, from, peer_key)
+                    .await;
             }
             pfcp_msg_type::ASSOCIATION_SETUP_REQUEST => {
                 self.handle_association_setup_request(&header, &body, from)
                     .await;
             }
             pfcp_msg_type::ASSOCIATION_RELEASE_REQUEST => {
-                self.handle_association_release_request(&header, from).await;
+                self.handle_association_release_request(&header, from, peer_key)
+                    .await;
             }
             pfcp_msg_type::SESSION_ESTABLISHMENT_REQUEST => {
-                self.handle_session_establishment_request(&header, &body, from)
+                self.handle_session_establishment_request(&header, &body, from, peer_node)
                     .await;
             }
             pfcp_msg_type::SESSION_MODIFICATION_REQUEST => {
-                self.handle_session_modification_request(&header, &body, from)
+                self.handle_session_modification_request(&header, &body, from, peer_node)
                     .await;
             }
             pfcp_msg_type::SESSION_DELETION_REQUEST => {
-                self.handle_session_deletion_request(&header, from).await;
+                self.handle_session_deletion_request(&header, from, peer_node)
+                    .await;
             }
             other => {
                 log::warn!("PFCP message type {other} from {from} is not handled on Sxa");
@@ -747,11 +1073,17 @@ impl SxaNode {
     ///
     /// The peer's Recovery Time Stamp is compared on the way through: a change means
     /// the SGW-C restarted and holds none of the sessions we do (TS 23.007 §19A).
-    async fn handle_heartbeat_request(&self, header: &PfcpHeader, body: &[u8], from: SocketAddr) {
+    async fn handle_heartbeat_request(
+        &self,
+        header: &PfcpHeader,
+        body: &[u8],
+        from: SocketAddr,
+        peer_key: SocketAddr,
+    ) {
         let mut cursor = Bytes::copy_from_slice(body);
         match HeartbeatRequest::decode(&mut cursor) {
             Ok(req) => {
-                self.note_peer_recovery_time_stamp(from, req.recovery_time_stamp)
+                self.note_peer_recovery_time_stamp(peer_key, req.recovery_time_stamp)
                     .await
             }
             Err(e) => log::warn!("Heartbeat Request from {from} is malformed: {e}"),
@@ -782,6 +1114,36 @@ impl SxaNode {
         body: &[u8],
         from: SocketAddr,
     ) {
+        // SECURITY (#968): an association is accepted only from a configured SGW-C. A
+        // refused Setup changes nothing.
+        let allowed = self.allowed_peers();
+        if !allowed.permits(from.ip()) {
+            // A restarted SGW-C may be at an IP the last resolution predates: ask for
+            // an early re-resolution (rate-limited) for its next attempt.
+            allowed.kick_refresh();
+            note_refusal(format_args!(
+                "PFCP Association Setup Request from {from}, which is not an allowed SGW-C \
+                 ({allowed}): rejected (cause 64)"
+            ));
+            let mut buf = BytesMut::new();
+            PfcpLibMessage::AssociationSetupResponse(AssociationSetupResponse::new(
+                NodeId::new_ipv4(self.local_ip.octets()),
+                PfcpCause::RequestRejected,
+                self.recovery_time_stamp,
+            ))
+            .encode_body(&mut buf);
+            let _ = self
+                .send(
+                    pfcp_msg_type::ASSOCIATION_SETUP_RESPONSE,
+                    None,
+                    header.sequence_number,
+                    &buf,
+                    from,
+                )
+                .await;
+            return;
+        }
+
         let mut cursor = Bytes::copy_from_slice(body);
         let req = match AssociationSetupRequest::decode(&mut cursor) {
             Ok(req) => req,
@@ -809,6 +1171,22 @@ impl SxaNode {
 
         let restarted = {
             let mut peers = self.peers.write().await;
+            // One peer per host (#968 review, MAJOR 3): a Setup from a host that is
+            // already a peer, on another source port, is that peer re-associating, so
+            // its entry (node id, sessions, RTS) moves to the new address rather than a
+            // second peer appearing for the same SGW-C.
+            let moved = peers
+                .keys()
+                .find(|addr| **addr != from && same_host(addr.ip(), from.ip()))
+                .copied();
+            if let Some(old) = moved {
+                if let Some(mut peer) = peers.remove(&old) {
+                    log::info!("SGW-C {old} re-associates from {from}");
+                    peer.addr = from;
+                    peer.fsm.set_node_addr(&from.to_string());
+                    peers.insert(from, peer);
+                }
+            }
             let next_id = NEXT_NODE_ID.fetch_add(1, Ordering::SeqCst) as u64;
             let peer = peers.entry(from).or_insert_with(|| {
                 let mut fsm = PfcpStateMachine::new(next_id);
@@ -823,9 +1201,11 @@ impl SxaNode {
                     fsm,
                 }
             });
-            let restarted = matches!(peer.recovery_time_stamp, Some(stored) if stored != req.recovery_time_stamp);
+            // #995: in the NTP reading (a pre-#995 SGW-C sends Unix seconds).
+            let rts = nextgcore_pfcp::recovery_time::normalize_received(req.recovery_time_stamp);
+            let restarted = matches!(peer.recovery_time_stamp, Some(stored) if stored != rts);
             peer.state = PfcpNodeState::Associated;
-            peer.recovery_time_stamp = Some(req.recovery_time_stamp);
+            peer.recovery_time_stamp = Some(rts);
             peer.missed_heartbeats = 0;
             // Drive the FSM the same way the association just went on the wire:
             // Initial -> WillAssociate -> Associated. Keeping it in step is what lets
@@ -895,7 +1275,12 @@ impl SxaNode {
     }
 
     /// TS 29.244 §6.2.9: acknowledge, then drop the peer and its sessions.
-    async fn handle_association_release_request(&self, header: &PfcpHeader, from: SocketAddr) {
+    async fn handle_association_release_request(
+        &self,
+        header: &PfcpHeader,
+        from: SocketAddr,
+        peer_key: SocketAddr,
+    ) {
         let mut buf = BytesMut::new();
         PfcpLibMessage::AssociationReleaseResponse(AssociationReleaseResponse::new(
             NodeId::new_ipv4(self.local_ip.octets()),
@@ -911,12 +1296,14 @@ impl SxaNode {
                 from,
             )
             .await;
-        self.declare_peer_failure(from, "association released by peer")
+        self.declare_peer_failure(peer_key, "association released by peer")
             .await;
     }
 
     /// Record a peer's Recovery Time Stamp, flushing its sessions if it changed.
     async fn note_peer_recovery_time_stamp(&self, from: SocketAddr, rts: u32) {
+        // #995: in the NTP reading, as stored at association.
+        let rts = nextgcore_pfcp::recovery_time::normalize_received(rts);
         let restarted = {
             let mut peers = self.peers.write().await;
             let Some(peer) = peers.get_mut(&from) else {
@@ -940,6 +1327,11 @@ impl SxaNode {
     /// detected on a heartbeat or a re-association): its sessions are gone on the CP
     /// side, but the peer itself is still there to talk to.
     async fn run_restoration(&self, from: SocketAddr) {
+        // #908 review: the peer restarted, so none of its old answers may be replayed
+        // to the new instance (whose sequence numbers start again).
+        if let Ok(mut c) = self.response_cache.lock() {
+            c.flush_peer(from);
+        }
         let mut peers = self.peers.write().await;
         let Some(peer) = peers.get_mut(&from) else {
             return;
@@ -1016,7 +1408,7 @@ impl SxaNode {
                     .encode_body(&mut buf);
                 let seq = self.alloc_seq();
                 let (tx, rx) = oneshot::channel();
-                self.pending.lock().await.insert(seq, tx);
+                self.pending.lock().await.insert(seq, (peer, tx));
                 if let Err(e) = self
                     .send(pfcp_msg_type::HEARTBEAT_REQUEST, None, seq, &buf, peer)
                     .await
@@ -1155,6 +1547,7 @@ impl SxaNode {
         header: &PfcpHeader,
         body: &[u8],
         from: SocketAddr,
+        node_id: Option<u64>,
     ) {
         let mut cursor = Bytes::copy_from_slice(body);
         let req = match LibSessionEstablishmentRequest::decode(&mut cursor) {
@@ -1173,7 +1566,6 @@ impl SxaNode {
             }
         };
 
-        let node_id = self.peers.read().await.get(&from).map(|p| p.node_id);
         let cp_f_seid = f_seid_from_lib(&req.cp_f_seid);
         let ctx = sgwu_self();
         // #700: by the whole CP F-SEID, not its SEID. A SEID is unique only within the
@@ -1183,10 +1575,31 @@ impl SxaNode {
         // answered from the OLD SGW-C's session, still tagged with the old node, and
         // that node's restoration then deleted the new UE's rules.
         let parsed = establishment_from_lib(&req, &cp_f_seid);
-        let outcome = establish_session(ctx, &cp_f_seid, node_id, |sess| {
+        let cap = self.max_sessions_per_peer.load(Ordering::Relaxed);
+        let outcome = establish_session(ctx, &cp_f_seid, node_id, cap, |sess| {
             crate::sxa_handler::handle_session_establishment_request(Some(sess), 0, &parsed)
         });
         match outcome {
+            Establishment::Conflict => {
+                // Mandatory IE incorrect, Offending IE = the CP F-SEID (TS 29.244
+                // §7.5.3.1, §8.2.1): it identifies a session this sender does not own.
+                let mut body = Vec::new();
+                body.extend_from_slice(&19u16.to_be_bytes());
+                body.extend_from_slice(&1u16.to_be_bytes());
+                body.push(sxa_build::pfcp_cause::MANDATORY_IE_INCORRECT);
+                body.extend_from_slice(&40u16.to_be_bytes());
+                body.extend_from_slice(&2u16.to_be_bytes());
+                body.extend_from_slice(&57u16.to_be_bytes());
+                let _ = self
+                    .send(
+                        pfcp_msg_type::SESSION_ESTABLISHMENT_RESPONSE,
+                        Some(cp_f_seid.seid),
+                        header.sequence_number,
+                        &body,
+                        from,
+                    )
+                    .await;
+            }
             Establishment::NoResources => {
                 log::error!(
                     "Cannot add SGW-U session for CP F-SEID 0x{:x}",
@@ -1237,6 +1650,7 @@ impl SxaNode {
         header: &PfcpHeader,
         body: &[u8],
         from: SocketAddr,
+        peer_node: Option<u64>,
     ) {
         let mut cursor = Bytes::copy_from_slice(body);
         let req = match LibSessionModificationRequest::decode(&mut cursor) {
@@ -1261,6 +1675,7 @@ impl SxaNode {
         let Some(sess) = header
             .seid
             .and_then(|seid| ctx.sess_find_by_sgwu_sxa_seid(seid))
+            .filter(|sess| owned_by(sess, peer_node, from))
         else {
             log::warn!(
                 "Session Modification for unknown SEID {:?} from {from}",
@@ -1331,11 +1746,17 @@ impl SxaNode {
     /// TS 29.244 Table 7.5.6.1-1: no IEs in the request; the response carries the
     /// final Usage Reports, which `send_session_deletion_response` drains BEFORE the
     /// session is removed (#215).
-    async fn handle_session_deletion_request(&self, header: &PfcpHeader, from: SocketAddr) {
+    async fn handle_session_deletion_request(
+        &self,
+        header: &PfcpHeader,
+        from: SocketAddr,
+        peer_node: Option<u64>,
+    ) {
         let ctx = sgwu_self();
         let Some(sess) = header
             .seid
             .and_then(|seid| ctx.sess_find_by_sgwu_sxa_seid(seid))
+            .filter(|sess| owned_by(sess, peer_node, from))
         else {
             log::warn!(
                 "Session Deletion for unknown SEID {:?} from {from}",
@@ -1403,6 +1824,23 @@ impl SxaNode {
     }
 }
 
+/// Whether `sess` belongs to the associated peer `peer_node` (#968 review, BLOCKER
+/// 1b). One SGW-C must not modify or delete another's session: the gate only proves
+/// the sender is SOME associated peer. A session of another peer is answered exactly
+/// like an unknown SEID (cause 65, Session context not found), so a peer cannot probe
+/// which SEIDs other peers hold.
+fn owned_by(sess: &SgwuSess, peer_node: Option<u64>, from: SocketAddr) -> bool {
+    let owned = peer_node.is_some() && sess.pfcp_node_id == peer_node;
+    if !owned {
+        note_refusal(format_args!(
+            "PFCP session request from {from} for SEID {:#x}, a session of another \
+             SGW-C: answered as unknown (cause 65), not executed",
+            sess.sgwu_sxa_seid
+        ));
+    }
+    owned
+}
+
 // ============================================================================
 // Library type → sxa_handler type mapping
 // ============================================================================
@@ -1452,6 +1890,8 @@ fn gate_status_octet(gate: &LibGateStatus) -> u8 {
 enum Establishment {
     /// The session could not be created at all.
     NoResources,
+    /// The CP F-SEID names a session another SGW-C owns (#968): nothing installed.
+    Conflict,
     /// The request was rejected with this cause. A session this request CREATED has
     /// been removed again, with every rule and TEID it had installed (#836).
     Rejected(u8),
@@ -1472,6 +1912,7 @@ fn establish_session(
     ctx: &crate::context::SgwuContext,
     cp_f_seid: &crate::context::FSeid,
     node_id: Option<u64>,
+    per_peer_cap: usize,
     install: impl FnOnce(
         &SgwuSess,
     ) -> (
@@ -1480,8 +1921,21 @@ fn establish_session(
     ),
 ) -> Establishment {
     let (sess, created_here) = match ctx.sess_find_by_sgwc_sxa_f_seid(cp_f_seid) {
+        // SECURITY (#968 re-review, BLOCKER A): the CP F-SEID is data in the message,
+        // and CP SEIDs are sequential at a known SGW-C address, so an Establishment
+        // naming ANOTHER peer's F-SEID used to run `install` on that peer's session --
+        // its rules rewritten, its user plane re-pointed. A session owned by another
+        // node is a conflict: nothing is installed.
+        Some(existing) if existing.pfcp_node_id != node_id => {
+            note_refusal(format_args!(
+                "Session Establishment for CP F-SEID 0x{:x}, a session of another SGW-C: \
+                 rejected (cause 69), nothing installed",
+                cp_f_seid.seid
+            ));
+            return Establishment::Conflict;
+        }
         Some(existing) => (existing, false),
-        None => match ctx.sess_add_for_node(cp_f_seid, node_id) {
+        None => match ctx.sess_add_for_node_capped(cp_f_seid, node_id, per_peer_cap) {
             Some(sess) => (sess, true),
             None => return Establishment::NoResources,
         },
@@ -1793,9 +2247,57 @@ pub async fn pfcp_open() -> Result<Arc<SxaNode>, String> {
         Ipv4Addr::LOCALHOST,
     )
     .map_err(|e| format!("PFCP_NODE_IP: {e}"))?;
-    SxaNode::open(bind, local_ip)
+    // The SGW-Cs allowed to associate (security, #968): SGWU_PFCP_ALLOWED_PEERS, then
+    // `sgwu.pfcp.allowed_peers`. A bad entry refuses to start rather than run open.
+    let allowed = match std::env::var("SGWU_PFCP_ALLOWED_PEERS") {
+        Ok(v) => PeerAllowlist::parse(&v).map_err(|e| format!("SGWU_PFCP_ALLOWED_PEERS: {e}"))?,
+        Err(_) => PeerAllowlist::from_entries(crate::config::config().pfcp_allowed_peers)
+            .map_err(|e| format!("sgwu.pfcp.allowed_peers: {e}"))?,
+    };
+    if allowed.is_configured() {
+        log::info!("PFCP associations accepted only from: {allowed}");
+    } else {
+        log::error!(
+            "sgwu.pfcp.allowed_peers / SGWU_PFCP_ALLOWED_PEERS is not set: EVERY PFCP \
+             Association Setup will be refused, so no SGW-C can use this SGW-U. Set it to \
+             the SGW-C address(es), CIDR or host name (0.0.0.0/0 admits any host)."
+        );
+    }
+    // Host-name entries are re-resolved off the receive path.
+    allowed.spawn_host_refresh(std::time::Duration::from_secs(10));
+    let cap = per_peer_session_cap(
+        std::env::var("SGWU_PFCP_MAX_SESSIONS_PER_PEER").ok(),
+        crate::config::config().pfcp_max_sessions_per_peer,
+    )?;
+    if cap == 0 {
+        log::info!(
+            "No per-SGW-C session cap (global capacity {}); set \
+             sgwu.pfcp.max_sessions_per_peer to add one",
+            sgwu_self().sess_capacity()
+        );
+    } else {
+        log::info!("PFCP sessions per SGW-C: at most {cap}");
+    }
+    let node = SxaNode::open(bind, local_ip)
         .await
-        .map_err(|e| format!("failed to bind PFCP socket on {bind}: {e}"))
+        .map_err(|e| format!("failed to bind PFCP socket on {bind}: {e}"))?;
+    node.set_allowed_peers(allowed);
+    node.set_max_sessions_per_peer(cap);
+    Ok(node)
+}
+
+/// The per-SGW-C session cap (#968): `SGWU_PFCP_MAX_SESSIONS_PER_PEER`, then
+/// `sgwu.pfcp.max_sessions_per_peer`, else NONE (0): an operator setting, enforced
+/// when set. With fail-closed allowlists only listed SGW-Cs hold sessions, so a
+/// default that reserves capacity would cost more than it protects.
+fn per_peer_session_cap(env: Option<String>, file: Option<usize>) -> Result<usize, String> {
+    if let Some(v) = env {
+        return v
+            .trim()
+            .parse()
+            .map_err(|e| format!("SGWU_PFCP_MAX_SESSIONS_PER_PEER '{v}': {e}"));
+    }
+    Ok(file.unwrap_or(0))
 }
 
 /// Close the Sxa PFCP path. The socket closes with the node; this drops the
@@ -1859,6 +2361,25 @@ pub enum PathReport {
     Recovery,
 }
 
+/// The Remote GTP-U Peers of a path report (#957).
+fn peer_list(peers: &[IpAddr]) -> LibUserPlanePathFailureReport {
+    LibUserPlanePathFailureReport {
+        remote_gtpu_peers: peers
+            .iter()
+            .map(|ip| match ip {
+                IpAddr::V4(v4) => LibRemoteGtpUPeer {
+                    ipv4: Some(v4.octets()),
+                    ipv6: None,
+                },
+                IpAddr::V6(v6) => LibRemoteGtpUPeer {
+                    ipv4: None,
+                    ipv6: Some(v6.octets()),
+                },
+            })
+            .collect(),
+    }
+}
+
 /// Report a GTP-U user-plane path failure (or recovery) to the SGW-C with a PFCP
 /// Node Report Request (TS 23.007 §20.3.4, TS 29.244 §7.4.5). Issue #217.
 ///
@@ -1896,24 +2417,12 @@ pub fn send_node_report_request(peers: &[IpAddr], report: PathReport) -> Result<
     let request = NodeReportRequest {
         node_id: NodeId::new_ipv4(node.local_ip.octets()),
         node_report_type,
-        // TS 29.244 Table 7.4.5.1-1 carries the peer list in a User Plane Path
-        // Failure Report for both directions; §8.2.83's Remote GTP-U Peer is the
-        // member that names which path.
-        user_plane_path_failure_report: Some(LibUserPlanePathFailureReport {
-            remote_gtpu_peers: peers
-                .iter()
-                .map(|ip| match ip {
-                    IpAddr::V4(v4) => LibRemoteGtpUPeer {
-                        ipv4: Some(v4.octets()),
-                        ipv6: None,
-                    },
-                    IpAddr::V6(v6) => LibRemoteGtpUPeer {
-                        ipv4: None,
-                        ipv6: Some(v6.octets()),
-                    },
-                })
-                .collect(),
-        }),
+        // #957 (TS 29.244 Table 7.4.5.1-1): a FAILURE lists the peers in a User Plane
+        // Path Failure Report (IE 102), a RECOVERY in a User Plane Path Recovery Report
+        // (IE 187). Recovery used to ride in a Failure Report too, so a conformant
+        // SGW-C read recovered paths as failed. §8.2.70's Remote GTP-U Peer names each.
+        user_plane_path_failure_report: (report == PathReport::Failure).then(|| peer_list(peers)),
+        user_plane_path_recovery_report: (report == PathReport::Recovery).then(|| peer_list(peers)),
     };
     let mut body = BytesMut::new();
     request.encode(&mut body);
@@ -1997,10 +2506,7 @@ fn sess_report_response_received(sess_id: u64, resp_type: u8, body: &[u8]) {
 
 /// Is this message type a response (solicited by one of our requests)?
 fn is_response_type(msg_type: u8) -> bool {
-    matches!(
-        msg_type,
-        2 | 4 | 6 | 8 | 10 | 11 | 13 | 15 | 51 | 53 | 55 | 57
-    )
+    nextgcore_pfcp::peer_policy::is_response_type(msg_type)
 }
 
 // ============================================================================
@@ -2048,7 +2554,6 @@ mod tests {
     };
     use nextgcore_pfcp::types::{CreateQer, CreateUrr};
 
-    /// A bound node plus a socket standing in for the SGW-C.
     /// #836: a rejected Establishment removes the session IT created, with the PDR
     /// and TEID installed before the failing IE; a rejected RETRANSMISSION leaves the
     /// session the earlier request established alone. A private context, so the
@@ -2070,7 +2575,7 @@ mod tests {
             )
         };
 
-        let out = establish_session(&ctx, &f_seid, Some(7), install_then_fail);
+        let out = establish_session(&ctx, &f_seid, Some(7), 0, install_then_fail);
         assert!(
             matches!(out, Establishment::Rejected(c) if c == sxa_build::pfcp_cause::SYSTEM_FAILURE)
         );
@@ -2078,18 +2583,764 @@ mod tests {
         assert!(ctx.pdr_find_by_teid(0x8361).is_none(), "and so is its TEID");
 
         // Established for real, then a retransmission of it is rejected.
-        let ok = establish_session(&ctx, &f_seid, Some(7), |_| {
+        let ok = establish_session(&ctx, &f_seid, Some(7), 0, |_| {
             (crate::sxa_handler::HandlerResult::Ok, Vec::new())
         });
         let Establishment::Accepted(sess, _) = ok else {
             panic!("accepted");
         };
         assert_eq!(sess.pfcp_node_id, Some(7));
-        let again = establish_session(&ctx, &f_seid, Some(7), install_then_fail);
+        let again = establish_session(&ctx, &f_seid, Some(7), 0, install_then_fail);
         assert!(matches!(again, Establishment::Rejected(_)));
         assert!(
             ctx.sess_find_by_id(sess.id).is_some(),
             "a rejected retransmission must not tear down the established session"
+        );
+    }
+
+    /// Associate `peer` with `node` (session messages need an association, §5.8.3);
+    /// returns the node id its sessions are tagged with.
+    async fn associate_from(node: &SxaNode, peer: &UdpSocket) -> u64 {
+        let mut assoc = BytesMut::new();
+        PfcpLibMessage::AssociationSetupRequest(AssociationSetupRequest::new(
+            NodeId::new_ipv4([127, 0, 0, 9]),
+            1000,
+        ))
+        .encode_body(&mut assoc);
+        deliver(
+            node,
+            peer,
+            &wire(pfcp_msg_type::ASSOCIATION_SETUP_REQUEST, None, 1, &assoc),
+        )
+        .await;
+        let _ = recv_decoded(peer).await;
+        node.peer_on_host(peer.local_addr().unwrap().ip())
+            .await
+            .expect("associated")
+            .1
+    }
+
+    /// SECURITY: a response completes our request only if it comes from the host the
+    /// request went to; one from anywhere else is dropped and counted.
+    #[tokio::test]
+    async fn a_response_from_the_wrong_host_does_not_complete_a_request() {
+        let (_guard, node, peer) = node_and_peer().await;
+        let (tx, mut rx) = oneshot::channel();
+        node.pending
+            .lock()
+            .await
+            .insert(99, (peer.local_addr().unwrap(), tx));
+        let mut body = BytesMut::new();
+        PfcpLibMessage::HeartbeatResponse(HeartbeatResponse::new(1)).encode_body(&mut body);
+        let resp = wire(pfcp_msg_type::HEARTBEAT_RESPONSE, None, 99, &body);
+
+        let attacker = UdpSocket::bind("127.0.0.66:0").await.unwrap();
+        deliver(&node, &attacker, &resp).await;
+        assert!(rx.try_recv().is_err(), "not completed by the wrong host");
+        assert!(node.pending.lock().await.contains_key(&99));
+
+        deliver(&node, &peer, &resp).await;
+        assert!(rx.try_recv().is_ok(), "completed by the right one");
+    }
+
+    /// SECURITY: an SGW-C that is not associated cannot drive sessions. A Session
+    /// Deletion and a Session Modification for a LIVE session, sent from a host that is
+    /// not associated, are rejected with cause 72 (§5.8.3) and not executed; a
+    /// Session Establishment from it creates nothing. Before, all three were executed.
+    #[tokio::test]
+    async fn session_messages_from_an_unassociated_host_are_refused() {
+        let (_guard, node, peer) = node_and_peer().await;
+        associate_from(&node, &peer).await;
+        let ctx = sgwu_self();
+        let sess = ctx
+            .sess_add(&FSeid::with_ipv4(0x5EC1, Ipv4Addr::new(127, 0, 0, 9)))
+            .expect("add");
+        let before = PFCP_UNAUTHORIZED.load(Ordering::Relaxed);
+
+        let attacker = UdpSocket::bind("127.0.0.66:0").await.unwrap();
+        for (seq, msg) in [
+            (70, pfcp_msg_type::SESSION_DELETION_REQUEST),
+            (71, pfcp_msg_type::SESSION_MODIFICATION_REQUEST),
+        ] {
+            let body = if msg == pfcp_msg_type::SESSION_MODIFICATION_REQUEST {
+                let mut b = BytesMut::new();
+                LibSessionModificationRequest::new().encode(&mut b);
+                b.to_vec()
+            } else {
+                Vec::new()
+            };
+            deliver(
+                &node,
+                &attacker,
+                &wire(msg, Some(sess.sgwu_sxa_seid), seq, &body),
+            )
+            .await;
+            let (_, resp) = recv_decoded(&attacker).await;
+            assert_eq!(
+                find_cause(&resp),
+                Some(sxa_build::pfcp_cause::NO_ESTABLISHED_PFCP_ASSOCIATION)
+            );
+        }
+        assert!(
+            ctx.sess_find_by_id(sess.id).is_some(),
+            "the session survives"
+        );
+
+        let n = ctx.sess_count();
+        let req = LibSessionEstablishmentRequest::new(
+            NodeId::new_ipv4([127, 0, 0, 66]),
+            LibFSeid::new_ipv4(0xBAD, [127, 0, 0, 66]),
+        );
+        let mut body = BytesMut::new();
+        req.encode(&mut body);
+        deliver(
+            &node,
+            &attacker,
+            &wire(
+                pfcp_msg_type::SESSION_ESTABLISHMENT_REQUEST,
+                Some(0),
+                72,
+                &body,
+            ),
+        )
+        .await;
+        let (_, resp) = recv_decoded(&attacker).await;
+        assert_eq!(
+            find_cause(&resp),
+            Some(sxa_build::pfcp_cause::NO_ESTABLISHED_PFCP_ASSOCIATION)
+        );
+        assert_eq!(ctx.sess_count(), n, "no session created");
+        assert!(
+            PFCP_UNAUTHORIZED.load(Ordering::Relaxed) >= before + 3,
+            "counted"
+        );
+        ctx.sess_remove(sess.id);
+    }
+
+    /// Send a Session Deletion (or an empty Session Modification) for `seid` from
+    /// `from` and return the response cause.
+    async fn session_request_cause(node: &SxaNode, from: &UdpSocket, msg: u8, seid: u64) -> u8 {
+        let body = if msg == pfcp_msg_type::SESSION_MODIFICATION_REQUEST {
+            let mut b = BytesMut::new();
+            LibSessionModificationRequest::new().encode(&mut b);
+            b.to_vec()
+        } else {
+            Vec::new()
+        };
+        deliver(node, from, &wire(msg, Some(seid), 40, &body)).await;
+        let (_, resp) = recv_decoded(from).await;
+        find_cause(&resp).expect("a cause")
+    }
+
+    /// SECURITY (#968 review, BLOCKER 1b): an SGW-C that IS associated still cannot
+    /// modify or delete ANOTHER SGW-C's session. Before, a stranger associated (it just
+    /// became a second peer) and then deleted another peer's session with cause 1. Now
+    /// it is answered exactly like an unknown SEID (cause 65), and the owner is served.
+    #[tokio::test]
+    async fn an_associated_peer_cannot_touch_another_peers_session() {
+        let (_guard, node, owner) = node_and_peer().await;
+        let owner_node = associate_from(&node, &owner).await;
+        let ctx = sgwu_self();
+        let sess = ctx
+            .sess_add(&FSeid::with_ipv4(0x0A01, Ipv4Addr::new(127, 0, 0, 9)))
+            .expect("add");
+        ctx.sess_set_pfcp_node(sess.id, owner_node);
+
+        let stranger = UdpSocket::bind("127.0.0.66:0").await.unwrap();
+        let stranger_node = associate_from(&node, &stranger).await;
+        assert_ne!(stranger_node, owner_node, "a peer of its own");
+        let before = PFCP_UNAUTHORIZED.load(Ordering::Relaxed);
+        for msg in [
+            pfcp_msg_type::SESSION_MODIFICATION_REQUEST,
+            pfcp_msg_type::SESSION_DELETION_REQUEST,
+        ] {
+            assert_eq!(
+                session_request_cause(&node, &stranger, msg, sess.sgwu_sxa_seid).await,
+                sxa_build::pfcp_cause::SESSION_CONTEXT_NOT_FOUND,
+                "type {msg}"
+            );
+        }
+        assert!(
+            ctx.sess_find_by_id(sess.id).is_some(),
+            "the session survives"
+        );
+        assert!(PFCP_UNAUTHORIZED.load(Ordering::Relaxed) >= before + 2);
+
+        assert_eq!(
+            session_request_cause(
+                &node,
+                &owner,
+                pfcp_msg_type::SESSION_DELETION_REQUEST,
+                sess.sgwu_sxa_seid
+            )
+            .await,
+            sxa_build::pfcp_cause::REQUEST_ACCEPTED
+        );
+        assert!(ctx.sess_find_by_id(sess.id).is_none());
+    }
+
+    /// SECURITY (#968 review, BLOCKER 1a): with `sgwu.pfcp.allowed_peers` set, a host
+    /// that is not on it cannot associate (cause 64) and so is still refused session
+    /// messages (cause 72). A listed SGW-C associates as before.
+    #[tokio::test]
+    async fn with_an_allowlist_a_stranger_cannot_associate() {
+        let (_guard, node, peer) = node_and_peer().await;
+        node.set_allowed_peers(PeerAllowlist::parse("127.0.0.1").unwrap());
+        let stranger = UdpSocket::bind("127.0.0.66:0").await.unwrap();
+        let mut assoc = BytesMut::new();
+        PfcpLibMessage::AssociationSetupRequest(AssociationSetupRequest::new(
+            NodeId::new_ipv4([127, 0, 0, 66]),
+            1000,
+        ))
+        .encode_body(&mut assoc);
+        deliver(
+            &node,
+            &stranger,
+            &wire(pfcp_msg_type::ASSOCIATION_SETUP_REQUEST, None, 1, &assoc),
+        )
+        .await;
+        let (_, resp) = recv_decoded(&stranger).await;
+        assert_eq!(
+            find_cause(&resp),
+            Some(PfcpCause::RequestRejected as u8),
+            "refused"
+        );
+        assert!(node.peers().await.is_empty(), "no peer was added");
+        assert_eq!(
+            session_request_cause(&node, &stranger, pfcp_msg_type::SESSION_DELETION_REQUEST, 1)
+                .await,
+            sxa_build::pfcp_cause::NO_ESTABLISHED_PFCP_ASSOCIATION
+        );
+
+        associate_from(&node, &peer).await;
+        assert_eq!(node.peers().await.len(), 1, "the listed SGW-C associates");
+    }
+
+    /// #968 review, MAJOR 3: the peer is its host, not one source port. A session
+    /// request from the associated SGW-C's host on ANOTHER port is served, and a
+    /// re-association from another port is the same peer (same node id, one entry).
+    #[tokio::test]
+    async fn an_associated_sgwc_is_its_host_not_one_port() {
+        let (_guard, node, peer) = node_and_peer().await;
+        let peer_node = associate_from(&node, &peer).await;
+        let ctx = sgwu_self();
+        let sess = ctx
+            .sess_add(&FSeid::with_ipv4(0x0B01, Ipv4Addr::new(127, 0, 0, 9)))
+            .expect("add");
+        ctx.sess_set_pfcp_node(sess.id, peer_node);
+
+        let other_port = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        assert_eq!(
+            session_request_cause(
+                &node,
+                &other_port,
+                pfcp_msg_type::SESSION_DELETION_REQUEST,
+                sess.sgwu_sxa_seid
+            )
+            .await,
+            sxa_build::pfcp_cause::REQUEST_ACCEPTED,
+            "served from another source port"
+        );
+        assert!(ctx.sess_find_by_id(sess.id).is_none());
+
+        assert_eq!(
+            associate_from(&node, &other_port).await,
+            peer_node,
+            "a re-association from another port is the same peer"
+        );
+        assert_eq!(node.peers().await.len(), 1, "one peer per host");
+    }
+
+    /// A Session Establishment for CP F-SEID `seid`@`cp_ip` with one Create PDR
+    /// `pdr_id` (CH F-TEID) and FAR 1.
+    fn establishment_wire(seq: u32, seid: u64, cp_ip: [u8; 4], pdr_id: u16) -> Vec<u8> {
+        let mut req = LibSessionEstablishmentRequest::new(
+            NodeId::new_ipv4(cp_ip),
+            LibFSeid::new_ipv4(seid, cp_ip),
+        );
+        let mut pdi = Pdi::new(SourceInterface::Access);
+        let mut f_teid = FTeid::new_ipv4(0, [127, 0, 0, 1]);
+        f_teid.ch = true;
+        pdi.local_f_teid = Some(f_teid);
+        let mut pdr = CreatePdr::new(pdr_id, 100, pdi);
+        pdr.far_id = Some(1);
+        req.create_pdrs.push(pdr);
+        let mut far = CreateFar::new(1, ApplyAction::forward());
+        far.forwarding_parameters = Some(ForwardingParameters::new(DestinationInterface::Core));
+        req.create_fars.push(far);
+        let mut body = BytesMut::new();
+        req.encode(&mut body);
+        wire(
+            pfcp_msg_type::SESSION_ESTABLISHMENT_REQUEST,
+            Some(0),
+            seq,
+            &body,
+        )
+    }
+
+    /// SECURITY (#968 re-review, BLOCKER A): an associated SGW-C that sends a Session
+    /// Establishment naming ANOTHER SGW-C's CP F-SEID gets cause 69 (Mandatory IE
+    /// incorrect, Offending IE = F-SEID) and installs NOTHING on that session. Before,
+    /// it was accepted (cause 1) and the victim's session gained the attacker's PDR 9
+    /// while still owned by the victim's node.
+    #[tokio::test]
+    async fn an_establishment_naming_another_peers_f_seid_installs_nothing() {
+        let (_guard, node, owner) = node_and_peer().await;
+        let owner_node = associate_from(&node, &owner).await;
+        const CP: [u8; 4] = [127, 0, 0, 9];
+        deliver(&node, &owner, &establishment_wire(5, 0x9681, CP, 1)).await;
+        let (_, resp) = recv_decoded(&owner).await;
+        assert_eq!(
+            find_cause(&resp),
+            Some(sxa_build::pfcp_cause::REQUEST_ACCEPTED)
+        );
+        let ctx = sgwu_self();
+        let sess = ctx
+            .sess_find_by_sgwc_sxa_f_seid(&FSeid::with_ipv4(0x9681, Ipv4Addr::from(CP)))
+            .expect("the owner's session");
+        assert_eq!(sess.pfcp_node_id, Some(owner_node));
+
+        let attacker = UdpSocket::bind("127.0.0.66:0").await.unwrap();
+        associate_from(&node, &attacker).await;
+        let before = PFCP_UNAUTHORIZED.load(Ordering::Relaxed);
+        deliver(&node, &attacker, &establishment_wire(6, 0x9681, CP, 9)).await;
+        let (_, resp) = recv_decoded(&attacker).await;
+        assert_eq!(
+            find_cause(&resp),
+            Some(sxa_build::pfcp_cause::MANDATORY_IE_INCORRECT)
+        );
+        assert!(
+            ctx.pdr_find(sess.id, 9).is_none(),
+            "PDR 9 was not installed"
+        );
+        assert!(
+            ctx.pdr_find(sess.id, 1).is_some(),
+            "the owner's PDR is intact"
+        );
+        assert_eq!(
+            ctx.sess_find_by_id(sess.id).unwrap().pfcp_node_id,
+            Some(owner_node)
+        );
+        assert!(
+            PFCP_UNAUTHORIZED.load(Ordering::Relaxed) > before,
+            "counted"
+        );
+
+        // The owner re-establishing its own F-SEID is still served.
+        deliver(&node, &owner, &establishment_wire(7, 0x9681, CP, 2)).await;
+        let (_, resp) = recv_decoded(&owner).await;
+        assert_eq!(
+            find_cause(&resp),
+            Some(sxa_build::pfcp_cause::REQUEST_ACCEPTED)
+        );
+        ctx.sess_remove(sess.id);
+    }
+
+    /// #968 re-review: one SGW-C cannot take every session slot. At its per-peer cap
+    /// a further Establishment is NO_RESOURCES, while another SGW-C is still served.
+    #[tokio::test]
+    async fn one_sgwc_cannot_take_every_session_slot() {
+        let (_guard, node, a) = node_and_peer().await;
+        node.set_max_sessions_per_peer(1);
+        associate_from(&node, &a).await;
+        let b = UdpSocket::bind("127.0.0.67:0").await.unwrap();
+        associate_from(&node, &b).await;
+
+        deliver(&node, &a, &establishment_wire(10, 0xC1, [127, 0, 0, 1], 1)).await;
+        assert_eq!(
+            find_cause(&recv_decoded(&a).await.1),
+            Some(sxa_build::pfcp_cause::REQUEST_ACCEPTED)
+        );
+        deliver(&node, &a, &establishment_wire(11, 0xC2, [127, 0, 0, 1], 1)).await;
+        assert_eq!(
+            find_cause(&recv_decoded(&a).await.1),
+            Some(sxa_build::pfcp_cause::NO_RESOURCES_AVAILABLE),
+            "A is at its cap"
+        );
+        deliver(&node, &b, &establishment_wire(12, 0xC1, [127, 0, 0, 67], 1)).await;
+        assert_eq!(
+            find_cause(&recv_decoded(&b).await.1),
+            Some(sxa_build::pfcp_cause::REQUEST_ACCEPTED),
+            "B still has room"
+        );
+        let ctx = sgwu_self();
+        for (seid, ip) in [(0xC1, [127, 0, 0, 1]), (0xC1, [127, 0, 0, 67])] {
+            if let Some(s) =
+                ctx.sess_find_by_sgwc_sxa_f_seid(&FSeid::with_ipv4(seid, Ipv4Addr::from(ip)))
+            {
+                ctx.sess_remove(s.id);
+            }
+        }
+    }
+
+    /// The per-peer cap is an operator setting: env, then file, else none.
+    #[test]
+    fn the_per_peer_session_cap_is_off_unless_configured() {
+        assert_eq!(per_peer_session_cap(None, None), Ok(0));
+        assert_eq!(per_peer_session_cap(None, Some(100)), Ok(100));
+        assert_eq!(per_peer_session_cap(Some("7".into()), Some(100)), Ok(7));
+        assert!(per_peer_session_cap(Some("x".into()), None).is_err());
+    }
+
+    /// #968 round 3: `sgwu_context_init`'s capacity is applied -- before, it was only
+    /// logged, so the context was unlimited. A context of capacity 2 refuses a third
+    /// session, and the per-node cap refuses within it.
+    #[test]
+    fn a_context_with_a_capacity_refuses_beyond_it() {
+        let ctx = crate::context::SgwuContext::with_capacity(2);
+        assert_eq!(ctx.sess_capacity(), 2);
+        let ip = Ipv4Addr::new(127, 0, 0, 9);
+        assert!(ctx
+            .sess_add_for_node_capped(&FSeid::with_ipv4(1, ip), Some(1), 1)
+            .is_some());
+        assert!(
+            ctx.sess_add_for_node_capped(&FSeid::with_ipv4(2, ip), Some(1), 1)
+                .is_none(),
+            "node 1 is at its cap of 1"
+        );
+        assert!(ctx
+            .sess_add_for_node_capped(&FSeid::with_ipv4(3, ip), Some(2), 1)
+            .is_some());
+        assert!(
+            ctx.sess_add_for_node(&FSeid::with_ipv4(4, ip), Some(3))
+                .is_none(),
+            "the context is at its capacity of 2"
+        );
+    }
+
+    /// SECURITY (#968 re-review, fail closed): with no allowlist, no SGW-C can
+    /// associate.
+    #[tokio::test]
+    async fn without_an_allowlist_no_sgwc_can_associate() {
+        let (_guard, node, peer) = node_and_peer().await;
+        node.set_allowed_peers(PeerAllowlist::default());
+        let mut assoc = BytesMut::new();
+        PfcpLibMessage::AssociationSetupRequest(AssociationSetupRequest::new(
+            NodeId::new_ipv4([127, 0, 0, 1]),
+            1000,
+        ))
+        .encode_body(&mut assoc);
+        deliver(
+            &node,
+            &peer,
+            &wire(pfcp_msg_type::ASSOCIATION_SETUP_REQUEST, None, 1, &assoc),
+        )
+        .await;
+        let (_, resp) = recv_decoded(&peer).await;
+        assert_eq!(find_cause(&resp), Some(PfcpCause::RequestRejected as u8));
+        assert!(node.peers().await.is_empty());
+    }
+
+    /// #905 (TS 29.244 §6.4): a retransmitted request -- same peer, same sequence
+    /// number, because our response was lost -- is answered with the ORIGINAL response
+    /// and not executed again. Before, a duplicate Establishment re-ran on the live
+    /// session (a second CH F-TEID was allocated, so the "same" answer differed) and a
+    /// duplicate Deletion answered "context not found".
+    #[tokio::test]
+    async fn a_retransmitted_request_is_answered_from_the_cache_not_re_executed() {
+        let (_guard, node, peer) = node_and_peer().await;
+        let mut assoc = BytesMut::new();
+        PfcpLibMessage::AssociationSetupRequest(AssociationSetupRequest::new(
+            NodeId::new_ipv4([127, 0, 0, 9]),
+            1000,
+        ))
+        .encode_body(&mut assoc);
+        deliver(
+            &node,
+            &peer,
+            &wire(pfcp_msg_type::ASSOCIATION_SETUP_REQUEST, None, 1, &assoc),
+        )
+        .await;
+        let _ = recv_decoded(&peer).await;
+
+        let cp_seid = 0x0000_0000_0000_0905u64;
+        let mut req = LibSessionEstablishmentRequest::new(
+            NodeId::new_ipv4([127, 0, 0, 9]),
+            LibFSeid::new_ipv4(cp_seid, [127, 0, 0, 9]),
+        );
+        let mut pdi = Pdi::new(SourceInterface::Access);
+        let mut f_teid = FTeid::new_ipv4(0, [127, 0, 0, 1]);
+        f_teid.ch = true;
+        pdi.local_f_teid = Some(f_teid);
+        let mut pdr = CreatePdr::new(1, 100, pdi);
+        pdr.far_id = Some(1);
+        req.create_pdrs.push(pdr);
+        let mut far = CreateFar::new(1, ApplyAction::forward());
+        far.forwarding_parameters = Some(ForwardingParameters::new(DestinationInterface::Core));
+        req.create_fars.push(far);
+        let mut body = BytesMut::new();
+        req.encode(&mut body);
+        let establishment = wire(
+            pfcp_msg_type::SESSION_ESTABLISHMENT_REQUEST,
+            Some(0),
+            21,
+            &body,
+        );
+
+        deliver(&node, &peer, &establishment).await;
+        let (h1, b1) = recv_decoded(&peer).await;
+        assert_eq!(
+            find_cause(&b1),
+            Some(sxa_build::pfcp_cause::REQUEST_ACCEPTED)
+        );
+        let ctx = sgwu_self();
+        let sess = ctx
+            .sess_find_by_sgwc_sxa_seid(cp_seid)
+            .expect("established");
+        let teid = ctx.pdr_find(sess.id, 1).expect("PDR installed").local_teid;
+
+        deliver(&node, &peer, &establishment).await;
+        let (h2, b2) = recv_decoded(&peer).await;
+        assert_eq!(h2.sequence_number, h1.sequence_number);
+        assert_eq!(b2, b1, "the retransmission gets the ORIGINAL response");
+        assert_eq!(
+            ctx.pdr_find(sess.id, 1).unwrap().local_teid,
+            teid,
+            "and was not executed again (no second F-TEID allocated)"
+        );
+
+        let deletion = wire(
+            pfcp_msg_type::SESSION_DELETION_REQUEST,
+            Some(sess.sgwu_sxa_seid),
+            22,
+            &[],
+        );
+        deliver(&node, &peer, &deletion).await;
+        let (_, d1) = recv_decoded(&peer).await;
+        assert_eq!(
+            find_cause(&d1),
+            Some(sxa_build::pfcp_cause::REQUEST_ACCEPTED)
+        );
+        deliver(&node, &peer, &deletion).await;
+        let (_, d2) = recv_decoded(&peer).await;
+        assert_eq!(
+            find_cause(&d2),
+            Some(sxa_build::pfcp_cause::REQUEST_ACCEPTED),
+            "a duplicate Deletion repeats the acceptance, not 'context not found'"
+        );
+        assert_eq!(d2, d1);
+    }
+
+    /// #908 review M1 (TS 29.244 §6.4: a retransmission has "the same message content,
+    /// including the same PFCP header"): two Deletions with the same sequence number
+    /// but different SEIDs are DIFFERENT requests. Digesting only the (empty) body made
+    /// the second one -- for the real session -- be answered from the first one's cache
+    /// entry (cause 65, the wrong SEID), and the session was never deleted.
+    #[tokio::test]
+    async fn requests_differing_only_in_the_header_are_not_retransmissions() {
+        let (_guard, node, peer) = node_and_peer().await;
+        let mut assoc = BytesMut::new();
+        PfcpLibMessage::AssociationSetupRequest(AssociationSetupRequest::new(
+            NodeId::new_ipv4([127, 0, 0, 9]),
+            1000,
+        ))
+        .encode_body(&mut assoc);
+        deliver(
+            &node,
+            &peer,
+            &wire(pfcp_msg_type::ASSOCIATION_SETUP_REQUEST, None, 1, &assoc),
+        )
+        .await;
+        let _ = recv_decoded(&peer).await;
+        // Owned by the peer (#968: a session request is served only for its own sessions).
+        let owner = node
+            .peer_on_host(peer.local_addr().unwrap().ip())
+            .await
+            .map(|p| p.1);
+        let ctx = sgwu_self();
+        let sess = ctx
+            .sess_add_for_node(
+                &FSeid::with_ipv4(0x9081, Ipv4Addr::new(127, 0, 0, 9)),
+                owner,
+            )
+            .unwrap();
+
+        let unknown = wire(
+            pfcp_msg_type::SESSION_DELETION_REQUEST,
+            Some(0xDEAD),
+            30,
+            &[],
+        );
+        deliver(&node, &peer, &unknown).await;
+        let (_, b1) = recv_decoded(&peer).await;
+        assert_eq!(
+            find_cause(&b1),
+            Some(sxa_build::pfcp_cause::SESSION_CONTEXT_NOT_FOUND)
+        );
+
+        let real = wire(
+            pfcp_msg_type::SESSION_DELETION_REQUEST,
+            Some(sess.sgwu_sxa_seid),
+            30,
+            &[],
+        );
+        deliver(&node, &peer, &real).await;
+        let (h2, b2) = recv_decoded(&peer).await;
+        assert_eq!(
+            find_cause(&b2),
+            Some(sxa_build::pfcp_cause::REQUEST_ACCEPTED)
+        );
+        assert_ne!(
+            h2.seid,
+            Some(0xDEAD),
+            "not the cached answer for the other SEID"
+        );
+        assert!(
+            ctx.sess_find_by_id(sess.id).is_none(),
+            "the real session was deleted"
+        );
+    }
+
+    /// #908 review M2: Heartbeats and requests from unassociated peers are not cached,
+    /// so nobody can fill the cache by sending them.
+    #[tokio::test]
+    async fn heartbeats_and_unassociated_requests_are_not_cached() {
+        let (_guard, node, peer) = node_and_peer().await;
+        for seq in 0..50u32 {
+            let mut body = BytesMut::new();
+            PfcpLibMessage::HeartbeatRequest(HeartbeatRequest::new(100)).encode_body(&mut body);
+            deliver(
+                &node,
+                &peer,
+                &wire(pfcp_msg_type::HEARTBEAT_REQUEST, None, seq, &body),
+            )
+            .await;
+            let _ = recv_decoded(&peer).await;
+        }
+        // An unassociated peer's session request is answered but not cached.
+        deliver(
+            &node,
+            &peer,
+            &wire(
+                pfcp_msg_type::SESSION_DELETION_REQUEST,
+                Some(0xBEEF),
+                99,
+                &[],
+            ),
+        )
+        .await;
+        let _ = recv_decoded(&peer).await;
+        assert_eq!(node.response_cache.lock().unwrap().len(), 0);
+    }
+
+    fn ck(seq: u32) -> CacheKey {
+        (
+            "127.0.0.9:8805".parse().unwrap(),
+            seq,
+            pfcp_msg_type::SESSION_MODIFICATION_REQUEST,
+        )
+    }
+
+    /// #908 review: a retransmission that arrives while the original is still being
+    /// handled is dropped (IN FLIGHT), not executed a second time; once answered it is
+    /// replayed; a peer restart flushes the peer.
+    #[test]
+    fn the_response_cache_drops_in_flight_retransmissions_and_replays_answers() {
+        let now = std::time::Instant::now();
+        let mut c = ResponseCache::new(std::time::Duration::from_secs(30), 16);
+        assert_eq!(c.on_request(ck(1), b"req", now), CacheLookup::New);
+        assert_eq!(c.on_request(ck(1), b"req", now), CacheLookup::InFlight);
+        c.on_response(ck(1), b"resp", now);
+        assert_eq!(
+            c.on_request(ck(1), b"req", now),
+            CacheLookup::Replay(b"resp".to_vec())
+        );
+        assert_eq!(
+            c.on_request(ck(1), b"other", now),
+            CacheLookup::New,
+            "different bytes"
+        );
+        c.on_response(ck(1), b"resp2", now);
+        c.flush_peer("127.0.0.9:8805".parse().unwrap());
+        assert_eq!(
+            c.on_request(ck(1), b"other", now),
+            CacheLookup::New,
+            "flushed"
+        );
+    }
+
+    /// #908 review M2: expiry is amortized O(1) and the cache is bounded. 300 000
+    /// answers, then lookups: each lookup only pops the expired front instead of
+    /// scanning the whole cache (it used to cost ~17 ms per message at this size), and
+    /// past `cap` the oldest answers go.
+    #[test]
+    fn the_response_cache_is_bounded_and_expires_in_amortized_constant_time() {
+        let t0 = std::time::Instant::now();
+        let mut c = ResponseCache::new(std::time::Duration::from_secs(30), 300_000);
+        for seq in 0..300_000u32 {
+            assert_eq!(c.on_request(ck(seq), b"r", t0), CacheLookup::New);
+            c.on_response(ck(seq), b"a", t0);
+        }
+        assert_eq!(c.len(), 300_000);
+        let start = std::time::Instant::now();
+        for seq in 300_000..300_100u32 {
+            c.on_request(ck(seq), b"r", t0);
+        }
+        let per = start.elapsed() / 100;
+        assert!(
+            per < std::time::Duration::from_millis(1),
+            "per message: {per:?}"
+        );
+
+        // Everything expires at once, in one pass over the queue.
+        let later = t0 + std::time::Duration::from_secs(31);
+        c.on_request(ck(1), b"r", later);
+        assert_eq!(c.len(), 0, "expired answers are gone");
+
+        let mut small = ResponseCache::new(std::time::Duration::from_secs(30), 3);
+        for seq in 0..5u32 {
+            small.on_request(ck(seq), b"r", t0);
+            small.on_response(ck(seq), b"a", t0);
+        }
+        assert_eq!(small.len(), 3, "bounded by cap");
+        assert_eq!(
+            small.on_request(ck(4), b"r", t0),
+            CacheLookup::Replay(b"a".to_vec())
+        );
+        assert_eq!(
+            small.on_request(ck(0), b"r", t0),
+            CacheLookup::New,
+            "oldest dropped"
+        );
+    }
+
+    /// A bound node plus a socket standing in for the SGW-C.
+    /// #995: the SGW-U's own Recovery Time Stamp is NTP-era seconds (TS 29.244
+    /// §8.2.65), and a pre-#995 SGW-C's Unix-seconds stamp is stored in the NTP
+    /// reading, so the same SGW-C re-associating with it is not a restart.
+    #[tokio::test]
+    async fn recovery_time_stamps_are_ntp_seconds() {
+        let (_guard, node, peer) = node_and_peer().await;
+        let now = nextgcore_pfcp::recovery_time::now();
+        assert!(now.wrapping_sub(node.recovery_time_stamp) < 60);
+
+        let unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 3600;
+        let mut assoc = BytesMut::new();
+        PfcpLibMessage::AssociationSetupRequest(AssociationSetupRequest::new(
+            NodeId::new_ipv4([127, 0, 0, 9]),
+            unix as u32,
+        ))
+        .encode_body(&mut assoc);
+        deliver(
+            &node,
+            &peer,
+            &wire(pfcp_msg_type::ASSOCIATION_SETUP_REQUEST, None, 1, &assoc),
+        )
+        .await;
+        let _ = recv_decoded(&peer).await;
+        let stored = node
+            .peers()
+            .await
+            .into_iter()
+            .find(|p| p.addr == peer.local_addr().unwrap())
+            .and_then(|p| p.recovery_time_stamp);
+        assert_eq!(
+            stored,
+            Some(nextgcore_pfcp::recovery_time::from_unix_secs(unix))
         );
     }
 
@@ -2104,6 +3355,8 @@ mod tests {
         let node = SxaNode::open("127.0.0.1:0".parse().unwrap(), Ipv4Addr::new(127, 0, 0, 1))
             .await
             .expect("bind Sxa socket");
+        // Fail closed (#968): the tests' SGW-Cs live on 127/8.
+        node.set_allowed_peers(PeerAllowlist::parse("127.0.0.0/8").unwrap());
         let peer = UdpSocket::bind("127.0.0.1:0").await.expect("bind peer");
         (guard, node, peer)
     }
@@ -2277,7 +3530,7 @@ mod tests {
     #[tokio::test]
     async fn a_restarted_sgwc_reusing_a_cp_seid_gets_its_own_session() {
         let (_guard, node, old_peer) = node_and_peer().await;
-        let new_peer = UdpSocket::bind("127.0.0.1:0").await.expect("bind new peer");
+        let new_peer = UdpSocket::bind("127.0.0.8:0").await.expect("bind new peer");
 
         let associate = |node_ip: [u8; 4]| {
             let mut assoc = BytesMut::new();
@@ -2442,6 +3695,113 @@ mod tests {
             ctx.pdr_find(sess.id, 1).is_some(),
             "the Create PDR must have been INSTALLED on the session, not just parsed"
         );
+    }
+
+    /// #871 review: Update FAR leaving BUFF, end to end over the Sxa socket. A buffering
+    /// downlink FAR switched to FORW is accepted, forwards, and its buffer is emptied
+    /// with no flush left running; switched back to BUFF and then to DROP, the buffer
+    /// is discarded rather than kept until the session goes.
+    #[tokio::test]
+    async fn an_update_far_leaving_buff_over_the_wire_empties_the_buffer() {
+        let (_guard, node, peer) = node_and_peer().await;
+        let mut assoc = BytesMut::new();
+        PfcpLibMessage::AssociationSetupRequest(AssociationSetupRequest::new(
+            NodeId::new_ipv4([127, 0, 0, 9]),
+            3000,
+        ))
+        .encode_body(&mut assoc);
+        deliver(
+            &node,
+            &peer,
+            &wire(pfcp_msg_type::ASSOCIATION_SETUP_REQUEST, None, 1, &assoc),
+        )
+        .await;
+        let _ = recv_decoded(&peer).await;
+
+        let cp_seid = 0x0000_0000_0000_0871u64;
+        let mut req = LibSessionEstablishmentRequest::new(
+            NodeId::new_ipv4([127, 0, 0, 9]),
+            LibFSeid::new_ipv4(cp_seid, [127, 0, 0, 9]),
+        );
+        let mut pdi = Pdi::new(SourceInterface::Core);
+        let mut f_teid = FTeid::new_ipv4(0, [127, 0, 0, 1]);
+        f_teid.ch = true;
+        pdi.local_f_teid = Some(f_teid);
+        let mut pdr = CreatePdr::new(1, 100, pdi);
+        pdr.far_id = Some(1);
+        req.create_pdrs.push(pdr);
+        let mut far = CreateFar::new(1, ApplyAction::buffer());
+        far.forwarding_parameters = Some(ForwardingParameters::new(DestinationInterface::Access));
+        req.create_fars.push(far);
+        let mut body = BytesMut::new();
+        req.encode(&mut body);
+        deliver(
+            &node,
+            &peer,
+            &wire(
+                pfcp_msg_type::SESSION_ESTABLISHMENT_REQUEST,
+                Some(0),
+                2,
+                &body,
+            ),
+        )
+        .await;
+        let _ = recv_decoded(&peer).await;
+        let ctx = sgwu_self();
+        let sess = ctx
+            .sess_find_by_sgwc_sxa_seid(cp_seid)
+            .expect("established");
+        let buff = crate::context::apply_action::BUFF;
+        assert_eq!(ctx.far_find(sess.id, 1).unwrap().apply_action & buff, buff);
+
+        let update = |seq: u32, action: ApplyAction| {
+            let mut m = LibSessionModificationRequest::new();
+            let mut u = nextgcore_pfcp::types::UpdateFar::new(1);
+            u.apply_action = Some(action);
+            m.update_fars.push(u);
+            let mut b = BytesMut::new();
+            m.encode(&mut b);
+            wire(
+                pfcp_msg_type::SESSION_MODIFICATION_REQUEST,
+                Some(sess.sgwu_sxa_seid),
+                seq,
+                &b,
+            )
+        };
+
+        // BUFF -> FORW: accepted, forwarding, buffer emptied, no flush left running.
+        ctx.far_buffer_packet(sess.id, 1, b"buffered".to_vec(), 8);
+        deliver(&node, &peer, &update(3, ApplyAction::forward())).await;
+        let (_, resp) = recv_decoded(&peer).await;
+        assert_eq!(
+            find_cause(&resp),
+            Some(sxa_build::pfcp_cause::REQUEST_ACCEPTED)
+        );
+        let far = ctx.far_find(sess.id, 1).unwrap();
+        assert_ne!(far.apply_action & crate::context::apply_action::FORW, 0);
+        assert!(
+            far.buffered.is_empty() && !far.flushing,
+            "flushed (or dropped), not left"
+        );
+
+        // Back to BUFF, buffer, then BUFF -> DROP: the buffer is discarded.
+        deliver(&node, &peer, &update(4, ApplyAction::buffer())).await;
+        let _ = recv_decoded(&peer).await;
+        ctx.far_buffer_packet(sess.id, 1, b"doomed".to_vec(), 8);
+        assert_eq!(ctx.far_find(sess.id, 1).unwrap().buffered.len(), 1);
+        let mut drop = ApplyAction::default();
+        drop.drop = true;
+        deliver(&node, &peer, &update(5, drop)).await;
+        let (_, resp) = recv_decoded(&peer).await;
+        assert_eq!(
+            find_cause(&resp),
+            Some(sxa_build::pfcp_cause::REQUEST_ACCEPTED)
+        );
+        assert!(
+            ctx.far_find(sess.id, 1).unwrap().buffered.is_empty(),
+            "BUFF -> DROP discards the buffer"
+        );
+        ctx.sess_remove(sess.id);
     }
 
     /// #304: an Update QER closing a gate and a Remove URR arrive OVER THE WIRE and
@@ -2811,10 +4171,12 @@ mod tests {
     #[tokio::test]
     async fn a_session_deletion_is_answered_and_an_unknown_seid_is_refused() {
         let (_guard, node, peer) = node_and_peer().await;
+        let peer_node = associate_from(&node, &peer).await;
         let ctx = sgwu_self();
         let sess = ctx
             .sess_add(&FSeid::with_ipv4(0xDD01, Ipv4Addr::new(127, 0, 0, 9)))
             .expect("add");
+        ctx.sess_set_pfcp_node(sess.id, peer_node);
         let up_seid = sess.sgwu_sxa_seid;
 
         deliver(
@@ -2960,15 +4322,24 @@ mod tests {
             );
             peer.send_to(&pkt, from).await.expect("answer the report");
 
-            let names_it = report
-                .user_plane_path_failure_report
-                .as_ref()
-                .is_some_and(|r| {
-                    r.remote_gtpu_peers.iter().any(|p| match about {
-                        IpAddr::V4(v4) => p.ipv4 == Some(v4.octets()),
-                        IpAddr::V6(v6) => p.ipv6 == Some(v6.octets()),
-                    })
-                });
+            // #957: the peer list lives in the Failure Report (UPFR) or in the Recovery
+            // Report (UPRR, IE 187) -- each in its own IE, never the other's.
+            let list = if report.node_report_type.uprr {
+                assert!(
+                    report.user_plane_path_failure_report.is_none(),
+                    "a recovery must not carry a Path FAILURE Report"
+                );
+                report.user_plane_path_recovery_report.as_ref()
+            } else {
+                assert!(report.user_plane_path_recovery_report.is_none());
+                report.user_plane_path_failure_report.as_ref()
+            };
+            let names_it = list.is_some_and(|r| {
+                r.remote_gtpu_peers.iter().any(|p| match about {
+                    IpAddr::V4(v4) => p.ipv4 == Some(v4.octets()),
+                    IpAddr::V6(v6) => p.ipv6 == Some(v6.octets()),
+                })
+            });
             if names_it {
                 matched += 1;
                 kind = Some(report.node_report_type);
