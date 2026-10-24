@@ -883,11 +883,7 @@ pub fn build_initial_context_setup_request(
                 ),
                 ie(
                     ID_UE_AMBR,
-                    V::Id_uEaggregateMaximumBitrate(g::UEAggregateMaximumBitrate {
-                        u_eaggregate_maximum_bit_rate_dl: g::BitRate(req.ue_ambr.dl),
-                        u_eaggregate_maximum_bit_rate_ul: g::BitRate(req.ue_ambr.ul),
-                        ie_extensions: None,
-                    }),
+                    V::Id_uEaggregateMaximumBitrate(ambr(&req.ue_ambr)),
                 ),
                 ie(
                     ID_ERAB_TO_BE_SETUP_LIST_CTXT_SU_REQ,
@@ -1399,11 +1395,37 @@ const ID_ERAB_TO_BE_MODIFIED_ITEM_BEARER_MOD_REQ: u16 = 36;
 const ID_ERAB_TO_BE_RELEASED_LIST: u16 = 33;
 const ID_ERAB_ITEM: u16 = 35;
 
+/// The largest legacy Bit Rate (TS 36.413 §9.2.1.20, BitRate ::= INTEGER
+/// (0..10000000000)).
+const MAX_BIT_RATE: u64 = 10_000_000_000;
+
+/// The UE Aggregate Maximum Bit Rate IE (TS 36.413 §9.2.1.20). A direction above
+/// 10 Gbit/s puts the legacy Bit Rate at its maximum and adds the Rel-15
+/// Extended UE Aggregate Maximum Bit Rate for that direction (criticality
+/// ignore, so a legacy eNB reads the maximum and an EN-DC one the real value).
 fn ambr(a: &nextgcore_s1ap::UeAmbr) -> g::UEAggregateMaximumBitrate {
+    use g::UEAggregateMaximumBitrateIE_Extensions_EntryExtensionValue as X;
+    let mut ext = Vec::new();
+    for (v, id, value) in [
+        (
+            a.dl,
+            259,
+            X::Id_extended_uEaggregateMaximumBitRateDL as fn(_) -> X,
+        ),
+        (a.ul, 260, X::Id_extended_uEaggregateMaximumBitRateUL),
+    ] {
+        if v > MAX_BIT_RATE {
+            ext.push(g::UEAggregateMaximumBitrateIE_Extensions_Entry {
+                id: g::ProtocolExtensionID(id),
+                criticality: g::Criticality(IGNORE),
+                extension_value: value(g::ExtendedBitRate(v)),
+            });
+        }
+    }
     g::UEAggregateMaximumBitrate {
-        u_eaggregate_maximum_bit_rate_dl: g::BitRate(a.dl),
-        u_eaggregate_maximum_bit_rate_ul: g::BitRate(a.ul),
-        ie_extensions: None,
+        u_eaggregate_maximum_bit_rate_dl: g::BitRate(a.dl.min(MAX_BIT_RATE)),
+        u_eaggregate_maximum_bit_rate_ul: g::BitRate(a.ul.min(MAX_BIT_RATE)),
+        ie_extensions: (!ext.is_empty()).then_some(g::UEAggregateMaximumBitrateIE_Extensions(ext)),
     }
 }
 
