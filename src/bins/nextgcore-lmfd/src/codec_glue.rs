@@ -411,6 +411,39 @@ pub fn classify_ue_capability(caps: &lpp::ProvideCapabilities) -> UeLppCapabilit
     }
 }
 
+/// Which E-CID flavours a UE reported (#834 review): E-UTRA
+/// `ecid-ProvideCapabilities` and/or Rel-16 `nr-ECID-ProvideCapabilities-r16`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EcidFlavours {
+    pub eutra: bool,
+    pub nr: bool,
+}
+
+/// The E-CID flavours of a decoded `ProvideCapabilities`.
+pub fn ecid_flavours(caps: &lpp::ProvideCapabilities) -> EcidFlavours {
+    match &caps.critical_extensions {
+        lpp::ProvideCapabilitiesCriticalExtensions::C1(
+            lpp::ProvideCapabilitiesCriticalExtensions_c1::ProvideCapabilities_r9(ies),
+        ) => EcidFlavours {
+            eutra: ies.ecid_provide_capabilities.is_some(),
+            nr: ies.extensions.nr_ecid_provide_capabilities_r16.is_some(),
+        },
+        _ => EcidFlavours::default(),
+    }
+}
+
+/// The capability class and E-CID flavours of an uplink LPP PDU that is a
+/// `ProvideCapabilities`, else `None` (#834 review).
+pub fn decode_lpp_provide_capabilities(bytes: &[u8]) -> Option<(UeLppCapability, EcidFlavours)> {
+    let msg = decode_lpp(bytes).ok()?;
+    match c1(&msg) {
+        Some(lpp::LPP_MessageBody_c1::ProvideCapabilities(caps)) => {
+            Some((classify_ue_capability(caps), ecid_flavours(caps)))
+        }
+        _ => None,
+    }
+}
+
 /// Minimum reference points a multilateration method needs.
 ///
 /// Three: both Multi-RTT trilateration and DL-TDOA hyperbolic multilateration need
@@ -459,6 +492,18 @@ impl AccessRat {
             AccessRat::Eutra => LppMethod::Ecid,
         }
     }
+
+    /// The E-CID method for this access and what the UE reported it supports
+    /// (#834 review): a UE that reported exactly one flavour is asked for that
+    /// one, since asking for the other gets an error or an empty report. With
+    /// both or neither reported, the access decides.
+    pub fn ecid_for(self, flavours: EcidFlavours) -> LppMethod {
+        match (flavours.eutra, flavours.nr) {
+            (true, false) => LppMethod::Ecid,
+            (false, true) => LppMethod::NrEcid,
+            _ => self.ecid(),
+        }
+    }
 }
 
 /// Choose the LPP method for a positioning request (#103 criterion 4).
@@ -501,14 +546,15 @@ pub fn select_lpp_method(
     reference_points: usize,
     capability: UeLppCapability,
     access: AccessRat,
+    flavours: EcidFlavours,
 ) -> LppMethod {
     use crate::context::PositioningQos;
 
     if reference_points < MIN_POINTS_FOR_MULTILATERATION {
-        return access.ecid();
+        return access.ecid_for(flavours);
     }
     if capability == UeLppCapability::EcidOnly {
-        return access.ecid();
+        return access.ecid_for(flavours);
     }
     match qos {
         PositioningQos::HighAccuracy | PositioningQos::Emergency => {
@@ -518,7 +564,7 @@ pub fn select_lpp_method(
                 LppMethod::DlTdoa
             }
         }
-        PositioningQos::LowLatency | PositioningQos::BestEffort => access.ecid(),
+        PositioningQos::LowLatency | PositioningQos::BestEffort => access.ecid_for(flavours),
     }
 }
 
@@ -868,9 +914,12 @@ pub fn decode_lpp_ecid_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasurement>
 // LPP NR E-CID adapter (#715)
 // ---------------------------------------------------------------------------
 
-/// TS 38.133 §10.1.6.1 SS-RSRP report mapping: `SS-RSRP_v` covers
-/// `−157 + v ≤ RSRP < −156 + v` dBm (0 is below −156, 127 is −31 and above).
-/// The upper bound is used, the same convention as the E-UTRA `v − 140`.
+/// TS 38.133 §10.1.6.1 SS-RSRP report mapping, read as `v − 156` dBm: the upper
+/// edge of the bin, the same convention as the E-UTRA `v − 140`. The lowest and
+/// highest report values are open-ended bins, so they are reported at their
+/// inner edge. RSRP only ranks cells here (the serving-cell choice) and never
+/// enters a range, so an open-ended value is kept rather than dropped (#834
+/// review: the old comment's "127 is −31 and above" disagreed with this formula).
 fn nr_rsrp_dbm(v: u8) -> i16 {
     i16::from(v) - 156
 }
