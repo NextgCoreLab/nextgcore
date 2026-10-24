@@ -429,7 +429,7 @@ fn the_built_service_request_carries_the_uplink_data_status_it_names() {
 
 /// Drive a connected UE's protected Service Request through the Uplink NAS
 /// Transport dispatch, and return the decoded NGAP it caused.
-async fn connected_service_request(
+pub(super) async fn connected_service_request(
     server: &mut NgapServer,
     ue: u64,
     ran: u32,
@@ -440,6 +440,8 @@ async fn connected_service_request(
         .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &sr))
         .await
         .expect("the Service Request is handled");
+    // #922: the re-activations run off the NGAP task; their answers are applied here.
+    settle_offloaded_sbi(server).await;
     take_sent_ngap(server)
         .into_iter()
         .map(|(a, p)| (a, decode_sent(&p)))
@@ -1599,7 +1601,7 @@ async fn going_cm_idle_cancels_an_attempt_that_never_started() {
 // ---------------------------------------------------------------------------
 
 /// Give the UE a SUPI, so the Namf surface resolves it.
-fn with_supi(server: &mut NgapServer, amf_ue_ngap_id: u64, supi: &str) {
+pub(super) fn with_supi(server: &mut NgapServer, amf_ue_ngap_id: u64, supi: &str) {
     server.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
         s.amf_ue.supi = Some(supi.to_string());
     });
@@ -1608,7 +1610,7 @@ fn with_supi(server: &mut NgapServer, amf_ue_ngap_id: u64, supi: &str) {
 /// An N1N2MessageTransfer through the live Namf request handler. `n2` is the
 /// `ngapIeType` and the transfer octets (absent: no `ngapData`, as smfd's
 /// downlink-data request sends it). `n1` is the N1 SM message.
-async fn n1n2_transfer(
+pub(super) async fn n1n2_transfer(
     supi: &str,
     psi: u8,
     n2: Option<(&str, Option<&[u8]>)>,
@@ -1664,7 +1666,7 @@ fn cause_of(resp: &nextgcore_sbi::SbiResponse) -> String {
 
 /// The captured PDUs that concern `ue`, decoded. Other tests may enqueue
 /// transfers for their own UEs on the shared queue, and the pump delivers those too.
-fn sent_to(server: &mut NgapServer, ue: u64) -> Vec<Sent> {
+pub(super) fn sent_to(server: &mut NgapServer, ue: u64) -> Vec<Sent> {
     take_sent_ngap(server)
         .into_iter()
         .map(|(_, p)| decode_sent(&p))
@@ -1701,6 +1703,7 @@ async fn a_downlink_data_setup_request_for_a_connected_ue_activates_and_reaches_
     assert_eq!(cause_of(&resp), "N1_N2_TRANSFER_INITIATED");
 
     server.process_connected_downlinks().await;
+    settle_offloaded_sbi(&mut server).await;
     let calls = calls.lock().expect("calls").clone();
     assert_eq!(calls.len(), 1, "{calls:?}");
     assert!(calls[0].0.ends_with("/sm-contexts/n1n2-757-setup/modify"));
@@ -1732,6 +1735,7 @@ async fn a_setup_request_with_a_transfer_is_sent_without_asking_the_smf() {
     let resp = n1n2_transfer(supi, 3, Some(("PDU_RES_SETUP_REQ", Some(&transfer))), None).await;
     assert_eq!(resp.status, 200);
     server.process_connected_downlinks().await;
+    settle_offloaded_sbi(&mut server).await;
     assert!(calls.lock().expect("calls").is_empty());
     assert_eq!(
         sent_to(&mut server, ue),
@@ -1768,6 +1772,7 @@ async fn a_network_requested_modification_reaches_a_connected_ue_as_a_modify_req
     assert_eq!(resp.status, 200);
     assert_eq!(cause_of(&resp), "N1_N2_TRANSFER_INITIATED");
     server.process_connected_downlinks().await;
+    settle_offloaded_sbi(&mut server).await;
 
     let sent = sent_to(&mut server, ue);
     assert_eq!(sent.len(), 1, "{sent:?}");
@@ -1867,6 +1872,7 @@ async fn a_transfer_queued_before_the_ue_went_idle_pages_it_instead_of_sending()
     assert_eq!(resp.status, 200);
     server.ue_auth_state.with_mut(ue, |s| s.cm_idle = true);
     server.process_connected_downlinks().await;
+    settle_offloaded_sbi(&mut server).await;
 
     assert!(
         sent_to(&mut server, ue).is_empty(),
@@ -2039,6 +2045,7 @@ async fn a_queued_downlink_setup_for_a_session_the_service_request_activated_is_
         "the Service Request's own setup: {sr:?}"
     );
     server.process_connected_downlinks().await;
+    settle_offloaded_sbi(&mut server).await;
 
     let calls = calls.lock().expect("calls").clone();
     assert_eq!(
@@ -2066,11 +2073,14 @@ async fn after_an_an_release_a_downlink_setup_is_sent_again() {
     server.mark_up_active(ue, 2);
     // The AN release ends the user plane (and deactivates it at the SMF).
     server.deactivate_up_connections(ue).await;
+    // #922: the DEACTIVATED runs off the NGAP task.
+    settle_offloaded_sbi(&mut server).await;
     calls.lock().expect("calls").clear();
 
     let resp = n1n2_transfer(supi, 2, Some(("PDU_RES_SETUP_REQ", None)), None).await;
     assert_eq!(resp.status, 200);
     server.process_connected_downlinks().await;
+    settle_offloaded_sbi(&mut server).await;
     assert_eq!(
         up_cnx_states(&calls.lock().expect("calls"), "dup-778-again"),
         vec!["ACTIVATING".to_string()]
@@ -2101,6 +2111,7 @@ async fn an_unprotectable_n1_does_not_activate_the_user_plane() {
     let resp = n1n2_transfer(supi, 2, Some(("PDU_RES_SETUP_REQ", None)), Some(&n1)).await;
     assert_eq!(resp.status, 200);
     server.process_connected_downlinks().await;
+    settle_offloaded_sbi(&mut server).await;
     assert!(
         calls.lock().expect("calls").is_empty(),
         "no ACTIVATING for a setup that cannot carry its N1"
@@ -2126,6 +2137,7 @@ async fn a_setup_that_does_not_go_out_rolls_the_activation_back() {
     assert_eq!(resp.status, 200);
     server.fail_next_sends = 1;
     server.process_connected_downlinks().await;
+    settle_offloaded_sbi(&mut server).await;
     assert_eq!(
         up_cnx_states(&calls.lock().expect("calls"), "rollback-778"),
         vec!["ACTIVATING".to_string(), "DEACTIVATED".to_string()]
@@ -2161,6 +2173,7 @@ async fn a_setup_requests_n1_rides_the_items_pdu_session_nas_pdu() {
     .await;
     assert_eq!(resp.status, 200);
     server.process_connected_downlinks().await;
+    settle_offloaded_sbi(&mut server).await;
     let mine: Vec<Vec<u8>> = take_sent_ngap(&mut server)
         .into_iter()
         .map(|(_, p)| p)
@@ -2187,10 +2200,10 @@ async fn a_setup_requests_n1_rides_the_items_pdu_session_nas_pdu() {
 
 /// Serve one GUAMI for the paged-modification tests' Initial Context Setup,
 /// restoring the previous list on drop.
-struct ServeOneGuami(Vec<crate::context::Guami>);
+pub(super) struct ServeOneGuami(Vec<crate::context::Guami>);
 
 impl ServeOneGuami {
-    fn install() -> Self {
+    pub(super) fn install() -> Self {
         let ctx = crate::context::amf_self();
         let mut guard = ctx.write().unwrap_or_else(|e| e.into_inner());
         let previous = std::mem::replace(
@@ -2246,6 +2259,7 @@ async fn paged_modification_answered(
     let pdu =
         super::service_request_initial_ue(super::protected_service_request([0; 4], old_id as u32));
     let _ = server.handle_initial_ue_message(ASSOC, &pdu).await;
+    settle_offloaded_sbi(&mut server).await;
     let sent = take_sent_ngap(&mut server)
         .into_iter()
         .map(|(_, p)| {
@@ -2343,7 +2357,7 @@ fn session_state_of(server: &NgapServer, ue: u64) -> (usize, usize, usize) {
 }
 
 /// A UE-initiated (switch-off) DEREGISTRATION REQUEST, TS 24.501 §8.2.12.
-fn switch_off_deregistration_request() -> Vec<u8> {
+pub(super) fn switch_off_deregistration_request() -> Vec<u8> {
     vec![
         0x7E,
         security_header::PLAIN_NAS_MESSAGE,
@@ -2382,6 +2396,8 @@ async fn a_deregistered_ue_leaves_no_session_state_behind() {
         .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &dereg))
         .await
         .expect("handled");
+    // #922: the releases run off the NGAP task.
+    settle_offloaded_sbi(&mut server).await;
 
     let released: Vec<String> = calls
         .lock()
@@ -2588,6 +2604,8 @@ async fn an_implicit_deregistration_releases_at_the_smf_then_prunes() {
         .process_reachability_timers()
         .await
         .expect("implicit deregistration");
+    // #922: the releases run off the NGAP task.
+    settle_offloaded_sbi(&mut server).await;
 
     let mut released: Vec<String> = calls
         .lock()
@@ -4016,6 +4034,8 @@ async fn an_ics_failure_after_an_idle_update_keeps_the_ue_registered_and_idle() 
         .handle_initial_context_setup_failure(ASSOC, &failure)
         .await
         .expect("handled");
+    // #922: the DEACTIVATED runs off the NGAP task; its answer is applied here.
+    settle_offloaded_sbi(&mut server).await;
 
     let ue = server
         .ue_auth_state
