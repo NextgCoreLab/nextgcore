@@ -152,10 +152,14 @@ struct TestClient {
 
 impl TestClient {
     async fn connect(remote: SocketAddr) -> Self {
+        Self::connect_with(remote, ClientConfig::new()).await
+    }
+
+    async fn connect_with(remote: SocketAddr, config: ClientConfig) -> Self {
         let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
         let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::new()), None);
         let (handle, association) = endpoint
-            .connect(ClientConfig::new(), remote)
+            .connect(config, remote)
             .expect("initiate association");
         let mut client = Self {
             socket,
@@ -336,6 +340,69 @@ async fn send_uses_the_configured_ppid() {
         !s2c.is_empty() && s2c.iter().all(|&p| p == NEXTGCORE_SCTP_S1AP_PPID),
         "server -> client PPIDs on the wire: {s2c:?}"
     );
+}
+
+/// **#813.** `outbound_streams` reports the NEGOTIATED count: the server's configured
+/// maximum lowered to the inbound streams the peer offered (RFC 9260 §5.1.1), which is
+/// the bound amfd keeps UE-associated NGAP streams under (TS 38.412 §7). And a message
+/// the server sends on stream `n - 1` reaches the peer on that stream.
+#[tokio::test]
+async fn outbound_streams_is_the_negotiated_count() {
+    for (server_max, client_inbound, negotiated) in [(4u16, 3u16, 3u16), (4, 16, 4), (2, 1, 1)] {
+        let config = SctpServerConfig {
+            max_outbound_streams: server_max,
+            ..SctpServerConfig::default()
+        };
+        let mut server = SctpServer::bind("127.0.0.1:0".parse().expect("addr"), config)
+            .await
+            .expect("bind server");
+        let server_addr = server.local_addr();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        server.set_event_sender(tx);
+        let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
+        let server_task = tokio::spawn(async move {
+            loop {
+                if server.recv(Duration::from_millis(10)).await.is_err() {
+                    return;
+                }
+                while let Ok(ev) = rx.try_recv() {
+                    if let ServerEvent::DataReceived { association_id, .. } = ev {
+                        let n = server.outbound_streams(association_id);
+                        let _ = seen_tx.send(n);
+                        if let Some(n) = n {
+                            let _ = server.send(association_id, n - 1, b"last").await;
+                        }
+                    }
+                }
+                assert_eq!(
+                    server.outbound_streams(u64::MAX),
+                    None,
+                    "unknown association"
+                );
+            }
+        });
+        let transport = sctp_proto::TransportConfig::default()
+            .with_max_num_inbound_streams(client_inbound)
+            .with_max_num_outbound_streams(2);
+        let mut client_config = ClientConfig::new();
+        client_config.transport = Arc::new(transport);
+        let mut client = TestClient::connect_with(server_addr, client_config).await;
+        client.send(0, b"hello", NGAP_PPID).await;
+        let reported = loop {
+            if let Ok(n) = seen_rx.try_recv() {
+                break n;
+            }
+            client.pump(Duration::from_millis(20)).await;
+        };
+        assert_eq!(
+            reported,
+            Some(negotiated),
+            "server max {server_max}, client inbound {client_inbound}"
+        );
+        let (data, _) = client.recv_on(negotiated - 1).await;
+        assert_eq!(&data[..], b"last", "delivered on the highest valid stream");
+        server_task.abort();
+    }
 }
 
 #[test]

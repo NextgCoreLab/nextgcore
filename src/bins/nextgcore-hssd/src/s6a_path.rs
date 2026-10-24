@@ -794,7 +794,8 @@ pub fn handle_air(
     if let Some((auts_rand, auts)) = resync {
         log::debug!("[{imsi_bcd}] Performing AUTS-based SQN re-synchronisation");
         let sqn_ms = process_resync(&opc, &auth_info.k, &auts_rand, &auts)?;
-        log::debug!("[{imsi_bcd}] Re-sync OK: SQN_HE={sqn:#x} -> SQN_MS={sqn_ms:#x}");
+        // SQN values are authentication state: never logged.
+        log::debug!("[{imsi_bcd}] Re-sync OK");
         sqn = sqn_ms;
     }
 

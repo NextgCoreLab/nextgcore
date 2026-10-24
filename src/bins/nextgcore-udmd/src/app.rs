@@ -3147,7 +3147,8 @@ pub async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest)
         for (i, b) in ue.sqn.iter_mut().enumerate() {
             *b = ((new_sqn >> ((5 - i) * 8)) & 0xFF) as u8;
         }
-        log::info!("[{supi}] SQN resynchronized (new SQN=0x{new_sqn:012x})");
+        // The SQN value is authentication state: never logged.
+        log::info!("[{supi}] SQN resynchronized");
     }
 
     // Step 4: Generate RAND and compute the AV with Milenage
@@ -3209,7 +3210,7 @@ pub async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest)
     let new_sqn_hex: String = new_sqn_arr.iter().map(|b| format!("{b:02x}")).collect();
     match crate::udm_nudr_dr_send_auth_subscription_patch(&supi, &new_sqn_hex, 0, 0).await {
         Ok(r) if r.is_success() || r.status == 204 => {
-            log::debug!("[{supi}] SQN advanced to 0x{new_sqn_hex}");
+            log::debug!("[{supi}] SQN advanced");
         }
         Ok(r) => {
             // ANY failed advance withholds the AV, not only a 5xx (#84).
@@ -3501,21 +3502,8 @@ pub async fn handle_delete_auth(
 
 /// Initialize logging based on command line arguments
 fn init_logging(args: &Args) -> Result<()> {
-    let mut builder = env_logger::Builder::new();
-
-    // Set log level
-    let level = match args.log_level.to_lowercase().as_str() {
-        "trace" => log::LevelFilter::Trace,
-        "debug" => log::LevelFilter::Debug,
-        "info" => log::LevelFilter::Info,
-        "warn" => log::LevelFilter::Warn,
-        "error" => log::LevelFilter::Error,
-        _ => log::LevelFilter::Info,
-    };
-    builder.filter_level(level);
-
-    // Configure format
-    builder.format_timestamp_millis();
+    // RUST_LOG if set, else --log-level: the same for every NF (#691).
+    let mut builder = nextgcore_core::log::nf_log_builder(&args.log_level);
 
     if args.no_color {
         builder.write_style(env_logger::WriteStyle::Never);

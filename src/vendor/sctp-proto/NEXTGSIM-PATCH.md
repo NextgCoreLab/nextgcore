@@ -38,7 +38,11 @@ decodes 60 or 18 as its own `Unknown` and keeps working. Its sends still carry
 and lints are not counted as nextgsim's. Its own suite passes with the patch:
 `cargo test --manifest-path vendor/sctp-proto/Cargo.toml`, 105 passed.
 
-**Diff against upstream:**
+**Second change (nextgcore #813):** `Association::max_num_outbound_streams()`,
+and the INIT / INIT ACK stream-count negotiation per RFC 9260 §5.1.1 (outbound
+bounded by the peer's MIS, inbound by the peer's OS). See `HOME.md`.
+
+**Diff against upstream (the PPID patch):**
 
 ```diff
 --- a/src/chunk/chunk_payload_data.rs	2026-10-19 22:44:50.113642539 +0000
