@@ -487,6 +487,9 @@ pub struct PfcpClient {
     /// address, or every address its Node ID FQDN, or the hostname it was configured
     /// by, resolves to. Learnt at each Association Setup.
     node_addrs: Arc<std::sync::RwLock<Vec<std::net::IpAddr>>>,
+    /// The latest `node_addrs` lookup started (#1091 review E): only its result is
+    /// installed, so an older lookup that finishes last cannot overwrite it.
+    node_addrs_generation: Arc<std::sync::atomic::AtomicU64>,
     pending: Mutex<HashMap<u32, oneshot::Sender<(u8, Vec<u8>)>>>,
     assoc: RwLock<AssociationState>,
     /// Synchronously-readable projection of `assoc.associated` (#380).
@@ -575,6 +578,29 @@ pub(crate) fn clear_global_upf_for_test() {
     }
 }
 
+/// Install `addrs` as a UPF's other addresses, learnt by lookup `generation`, unless a
+/// later Association Setup started a newer lookup meanwhile (#1091 review E). The
+/// lookups run detached, so after a re-association they can finish in either order;
+/// the older set, installed last, would refuse the UPF's new secondary addresses
+/// until the next association. Returns whether `addrs` was installed.
+fn commit_node_addresses(
+    known: &std::sync::RwLock<Vec<std::net::IpAddr>>,
+    latest: &std::sync::atomic::AtomicU64,
+    generation: u64,
+    addrs: Vec<std::net::IpAddr>,
+) -> bool {
+    let Ok(mut known) = known.write() else {
+        return false;
+    };
+    // Under the write lock: a newer lookup has bumped `latest` before it can write.
+    if latest.load(std::sync::atomic::Ordering::SeqCst) != generation {
+        log::debug!("a stale UPF address lookup finished after a newer one; dropped");
+        return false;
+    }
+    *known = addrs;
+    true
+}
+
 /// Drop the durable Recovery Time Stamps keyed by an address that no literal pool
 /// member owns (#930 review n1). Run after the boot seed, so a hostname member's
 /// legacy address key has already been read and migrated. Left in place, such an
@@ -582,7 +608,23 @@ pub(crate) fn clear_global_upf_for_test() {
 /// would win over a correct name key the next time the name resolves to that
 /// address, and declare a false restart. A later rollback then misses the seed,
 /// which is the safe direction. Returns how many were dropped.
+///
+/// #1091 review F: nothing is dropped while a hostname member has not resolved. Its
+/// stamp may still be under a legacy address key, which the seed could not migrate
+/// without an address, and dropping it would start that UPF's restart detection
+/// from nothing. The next boot prunes.
 pub fn prune_orphan_address_keys(pool: &[Arc<PfcpClient>]) -> usize {
+    if let Some(unresolved) = pool
+        .iter()
+        .find(|c| c.peer_host.is_some() && !c.has_resolved_peer())
+    {
+        log::info!(
+            "UPF {} did not resolve at boot; address-keyed Recovery Time Stamps are kept \
+             (#930, #1091)",
+            unresolved.recovery_time_stamp_key()
+        );
+        return 0;
+    }
     let orphans: Vec<String> = match smf_self().read() {
         Ok(ctx) => ctx
             .upf_recovery_time_stamps
@@ -998,6 +1040,7 @@ impl PfcpClient {
             node_id: NodeId::new_ipv4(node_ip),
             recovery_time_stamp,
             node_addrs: Arc::new(std::sync::RwLock::new(Vec::new())),
+            node_addrs_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pending: Mutex::new(HashMap::new()),
             assoc: RwLock::new(AssociationState::default()),
             associated_gauge: std::sync::atomic::AtomicBool::new(false),
@@ -1155,6 +1198,8 @@ impl PfcpClient {
             names.push(host.clone());
         }
         let known = self.node_addrs.clone();
+        let latest = self.node_addrs_generation.clone();
+        let generation = latest.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         let own = self.peer();
         tokio::spawn(async move {
             for name in names {
@@ -1179,9 +1224,7 @@ impl PfcpClient {
                 .collect();
             addrs.sort();
             addrs.dedup();
-            if let Ok(mut known) = known.write() {
-                *known = addrs;
-            }
+            commit_node_addresses(&known, &latest, generation, addrs);
         })
     }
 
@@ -3086,6 +3129,21 @@ mod tests {
         );
     }
 
+    /// #1091 review E: of two lookups for one UPF, the one started later wins, also
+    /// when the older one finishes last.
+    #[test]
+    fn a_stale_address_lookup_cannot_overwrite_a_newer_one() {
+        let known = std::sync::RwLock::new(Vec::new());
+        let latest = std::sync::atomic::AtomicU64::new(0);
+        let older = latest.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let newer = latest.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let moved: std::net::IpAddr = "10.0.0.9".parse().unwrap();
+        let before: std::net::IpAddr = "10.0.0.7".parse().unwrap();
+        assert!(commit_node_addresses(&known, &latest, newer, vec![moved]));
+        assert!(!commit_node_addresses(&known, &latest, older, vec![before]));
+        assert_eq!(*known.read().unwrap(), vec![moved]);
+    }
+
     /// #974 review n2: a learnt address that another pool member is dialled at is
     /// dropped: this UPF cannot vouch for its sibling's address.
     #[tokio::test]
@@ -3563,6 +3621,31 @@ mod tests {
         }
         assert!(pruned >= 1);
         assert_eq!(left, vec![Some(1), Some(2), None]);
+    }
+
+    /// #1091 review F: while a hostname UPF is unresolved, its legacy address-keyed
+    /// stamp may be among the "orphans"; none is dropped.
+    #[tokio::test]
+    async fn no_address_key_is_pruned_while_a_hostname_upf_is_unresolved() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
+        let legacy = "127.0.0.1:47929";
+        let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let pool = vec![Arc::new(
+            PfcpClient::new(local, "0.0.0.0:47929".parse().unwrap(), [127, 0, 0, 1])
+                .with_peer_hostname("upf-1091.invalid", 47929),
+        )];
+        assert!(!pool[0].has_resolved_peer());
+        if let Ok(ctx) = smf_self().read() {
+            ctx.note_upf_recovery_time_stamp(legacy, 4);
+        }
+        let pruned = prune_orphan_address_keys(&pool);
+        let left = smf_self().read().unwrap().upf_recovery_time_stamp(legacy);
+        if let Ok(ctx) = smf_self().read() {
+            ctx.forget_upf_recovery_time_stamp(legacy);
+        }
+        assert_eq!(pruned, 0);
+        assert_eq!(left, Some(4), "the unresolved UPF's legacy stamp is kept");
     }
 
     /// #928 review: two endpoints are one PFCP node when their canonical IP is the

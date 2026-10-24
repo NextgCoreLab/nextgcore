@@ -175,7 +175,9 @@ and the address entry removed. When both entries exist, the address entry wins:
 an older binary wrote it after this one retired it (an upgrade, a rollback, then
 a re-upgrade), so it is the newer record. After the seed, every address-keyed
 stamp that no literal UPF of this SMF owns is dropped, so an orphan cannot win
-over a correct name key later (#930). A UPF hostname must name exactly one UPF.
+over a correct name key later (#930). Nothing is dropped while a hostname UPF
+has not resolved at boot, since its stamp may still be under its old address; the
+next boot prunes. A UPF hostname must name exactly one UPF.
 The snapshot also records which UPF each session was established on, by the
 same key, so in a UPF pool a restored session keeps signalling the UPF that
 holds it, and that UPF can still report on it (#1031). A session whose UPF is no

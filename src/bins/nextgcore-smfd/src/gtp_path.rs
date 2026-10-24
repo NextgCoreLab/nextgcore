@@ -26,6 +26,30 @@ use crate::gtp_build::{
 /// Default GTP-C port
 pub const GTPC_PORT: u16 = 2123;
 
+/// A test's SGW-C port in place of [`GTPC_PORT`]; 0 for none (#1091 review A).
+/// Tests that set it hold [`crate::context::PROCESS_STATE_TEST_LOCK`].
+#[cfg(test)]
+static SGW_PORT_FOR_TEST: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+/// The port the SGW-C's S5/S8 GTP-C is addressed at: [`GTPC_PORT`] (TS 29.274 §4.1),
+/// or, in a test, an ephemeral one.
+pub fn sgw_port() -> u16 {
+    #[cfg(test)]
+    {
+        let port = SGW_PORT_FOR_TEST.load(std::sync::atomic::Ordering::SeqCst);
+        if port != 0 {
+            return port;
+        }
+    }
+    GTPC_PORT
+}
+
+/// Address the SGW-C at `port` (`None`: [`GTPC_PORT`] again).
+#[cfg(test)]
+pub(crate) fn set_sgw_port_for_test(port: Option<u16>) {
+    SGW_PORT_FOR_TEST.store(port.unwrap_or(0), std::sync::atomic::Ordering::SeqCst);
+}
+
 /// Default GTP-U port
 pub const GTPU_PORT: u16 = 2152;
 

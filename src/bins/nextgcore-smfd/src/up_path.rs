@@ -628,6 +628,26 @@ pub fn on_node_report(upf_key: &str, scope: SessionScope, report: NodeReport) {
 
 /// Start the hold timer for a failed path.
 fn arm_hold(upf_key: &str, ip: IpAddr, generation: u64, hold: Duration) {
+    arm_hold_unless(crate::shutting_down(), upf_key, ip, generation, hold);
+}
+
+/// [`arm_hold`], but not once the SMF is shutting down (#1028 review): the hold's
+/// #39 releases would only meet NF_FAILOVER. The failed path stays in the snapshot,
+/// so the next incarnation re-arms it. Returns whether a hold was armed.
+fn arm_hold_unless(
+    shutting_down: bool,
+    upf_key: &str,
+    ip: IpAddr,
+    generation: u64,
+    hold: Duration,
+) -> bool {
+    if shutting_down {
+        log::info!(
+            "UPF {upf_key}: GTP-U path to {ip} failed during the shutdown; no hold is armed, \
+             the next start re-arms it"
+        );
+        return false;
+    }
     let upf_key = upf_key.to_string();
     let timer = tokio::spawn(async move {
         tokio::time::sleep(hold).await;
@@ -637,6 +657,7 @@ fn arm_hold(upf_key: &str, ip: IpAddr, generation: u64, hold: Duration) {
         holds.retain(|h| !h.is_finished());
         holds.push(timer.abort_handle());
     }
+    true
 }
 
 fn unix_now() -> u64 {
@@ -746,12 +767,26 @@ fn arm_rearmed_hold(upf_key: String, ip: IpAddr, generation: u64, left: Duration
                 .find(|c| c.recovery_time_stamp_key() == upf_key)
             {
                 Some(c) => c.is_associated().await,
-                None => return,
+                None => {
+                    log::info!(
+                        "UPF {upf_key} left the pool; the restored hold for its path to {ip} \
+                         is dropped"
+                    );
+                    return;
+                }
             };
             if associated {
                 break;
             }
             if tokio::time::Instant::now() >= give_up {
+                // #1028 review: say so, rather than let the hold vanish silently. The
+                // path stays in the snapshot, so the next start re-arms it.
+                log::warn!(
+                    "UPF {upf_key} was not associated again within {} s; the restored hold \
+                     for its GTP-U path to {ip} is given up, and its sessions are not released \
+                     by it",
+                    MAX_HOLD.as_secs()
+                );
                 return;
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -948,6 +983,19 @@ mod tests {
     }
 
     /// #994: the FAR peers of a session follow its Create, Update and Remove FARs.
+    /// #1028 review: a path that fails during the shutdown arms no hold (its #39s
+    /// would meet NF_FAILOVER); the next start re-arms it from the snapshot.
+    #[tokio::test]
+    async fn no_hold_is_armed_once_the_smf_is_shutting_down() {
+        let _state = UP_PATH_TEST_LOCK.lock().await;
+        let ip: IpAddr = "10.10.91.1".parse().unwrap();
+        let before = pending_hold_count();
+        let armed = arm_hold_unless(true, "upf-1091:8805", ip, 1, Duration::from_secs(60));
+        let after = pending_hold_count();
+        assert!(!armed);
+        assert_eq!(after, before, "no hold timer pending");
+    }
+
     #[test]
     fn far_peers_follow_create_update_and_remove() {
         let mut fars = BTreeMap::new();
