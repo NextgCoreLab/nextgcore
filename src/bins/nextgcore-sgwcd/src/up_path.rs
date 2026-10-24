@@ -18,7 +18,7 @@
 //!   path failure duration (default 120 s, at most 3600 s; TS 23.007 §20.3.1 NOTE 2
 //!   says "few minutes at most"). A Modify Bearer that points a bearer at the peer
 //!   inside the hold is answered and the UE's S1-U bearers are released at once
-//!   ([`release_if_toward_failed`]). If the path is still down when the hold
+//!   ([`toward_failed`], [`release_toward_failed`]). If the path is still down when the hold
 //!   expires, any bearer pointed at it is released, and the record is dropped, so a
 //!   later report starts afresh. A repeated failure report for a peer that is
 //!   already failed starts no second hold.
@@ -126,13 +126,12 @@ pub fn release_s1u_toward(peer: IpAddr) -> usize {
     released
 }
 
-/// After a Modify Bearer Request was answered (#1014 review): a bearer it pointed at
-/// a peer recorded as failed would black-hole downlink until the hold expired, so
-/// the UE's S1-U bearers are released at once, as for the failure itself. Returns
-/// whether they were.
-pub fn release_if_toward_failed(bearer_ids: &[u64]) -> bool {
+/// Whether a Modify Bearer Request points one of `bearer_ids` at a peer recorded
+/// as failed (#1014 review): the UE and that peer, decided before the response
+/// goes so the decision does not depend on what happens while it is sent.
+pub fn toward_failed(bearer_ids: &[u64]) -> Option<(u64, IpAddr)> {
     let ctx = sgwc_self();
-    let toward_failed = bearer_ids.iter().find_map(|b| {
+    bearer_ids.iter().find_map(|b| {
         let dl = ctx.dl_tunnel_in_bearer(*b)?;
         if dl.remote_teid == 0 {
             return None;
@@ -145,10 +144,14 @@ pub fn release_if_toward_failed(bearer_ids: &[u64]) -> bool {
             .chain(dl.remote_ip.ipv6.map(IpAddr::from))
             .find(|p| is_failed(*p))?;
         Some((ctx.bearer_find_by_id(*b)?.sgwc_ue_id, failed))
-    });
-    let Some((ue_id, peer)) = toward_failed else {
-        return false;
-    };
+    })
+}
+
+/// Release the S1-U bearers of UE `ue_id`, which a Modify Bearer pointed at the
+/// failed `peer` ([`toward_failed`]): at once, as for the failure itself, rather
+/// than black-holing downlink until the hold expires. Returns whether they were.
+pub fn release_toward_failed(ue_id: u64, peer: IpAddr) -> bool {
+    let ctx = sgwc_self();
     let Some(ue) = ctx.ue_find_by_id(ue_id) else {
         return false;
     };

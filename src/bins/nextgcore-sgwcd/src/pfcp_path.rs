@@ -208,6 +208,27 @@ pub enum S11Continuation {
     /// steps 3-4: the SGW answers after switching the downlink path). `join`
     /// names the pending answer in `sxa_response`.
     ModifyBearer { join: u64, sess_id: u64 },
+    /// A session established again on a restarted SGW-U (#1010 review): no MME
+    /// waits, but a refused or unanswered restoration is counted and logged
+    /// ([`RESTORATIONS_FAILED`]).
+    Restoration { sess_id: u64 },
+}
+
+/// Sessions whose restoration on a restarted SGW-U failed: not sent, refused, or
+/// unanswered (#1010 review). Each is also logged with its CP F-SEID.
+pub static RESTORATIONS_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record one failed restoration of `sess_id`.
+pub fn restoration_failed(sess_id: u64, why: &str) {
+    RESTORATIONS_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let seid = crate::context::sgwc_self()
+        .sess_find_by_id(sess_id)
+        .map(|s| s.sgwc_sxa_seid)
+        .unwrap_or(0);
+    log::error!(
+        "PFCP session {sess_id} (CP F-SEID 0x{seid:x}) NOT restored on the restarted SGW-U: \
+         {why}; its user plane is gone until the session is set up again"
+    );
 }
 
 /// An outbound PFCP request queued by a synchronous caller.
@@ -396,6 +417,12 @@ impl SxaNode {
     /// Associated peers, readable from a synchronous context.
     pub fn associated_peer_count(&self) -> usize {
         self.associated_peers.load(Ordering::Relaxed)
+    }
+
+    /// Drop the association with `peer` as a lost one would be (tests).
+    #[cfg(test)]
+    pub async fn drop_association_for_test(&self, peer: SocketAddr) {
+        self.mark_association_lost(peer, "test").await;
     }
 
     /// T1 of this node's transactions.
@@ -665,25 +692,125 @@ impl SxaNode {
     /// is recorded from each response. Returns the number of sessions sent.
     pub fn restore_sessions(&self) -> usize {
         let ctx = crate::context::sgwc_self();
-        let mut sent = 0usize;
+        let (mut sent, mut unsent) = (0usize, 0usize);
         for sess in ctx.sess_list_all() {
             if sess.sgwu_sxa_seid == 0 {
                 // Never established: the procedure creating it is still running.
                 continue;
             }
-            match send_session_establishment_request(&sess, 0, None, 0, S11Continuation::None) {
+            match send_session_establishment_request(
+                &sess,
+                0,
+                None,
+                0,
+                S11Continuation::Restoration { sess_id: sess.id },
+            ) {
                 Ok(()) => sent += 1,
-                Err(e) => log::error!(
-                    "PFCP session 0x{:x} not restored on the restarted SGW-U: {e}",
-                    sess.sgwc_sxa_seid
-                ),
+                Err(e) => {
+                    unsent += 1;
+                    restoration_failed(sess.id, &format!("not sent ({e})"));
+                }
             }
         }
-        log::warn!(
-            "SGW-U restarted: {sent} PFCP session(s) established again with their F-TEIDs \
-             (TS 23.007, CUPS user plane restart)"
-        );
+        if unsent > 0 {
+            log::error!(
+                "SGW-U restarted: {sent} PFCP session(s) sent for restoration, {unsent} could \
+                 not be sent (TS 23.007, CUPS user plane restart)"
+            );
+        } else {
+            log::warn!(
+                "SGW-U restarted: {sent} PFCP session(s) sent for restoration with their \
+                 F-TEIDs (TS 23.007, CUPS user plane restart); each answer is checked"
+            );
+        }
         sent
+    }
+
+    /// An Association Setup Request from the UP function (TS 29.244 §6.2.6.2.1:
+    /// either function may set the association up; #1010 review). The configured
+    /// SGW-U is answered Request accepted, with this node's Node ID and Recovery
+    /// Time Stamp, and recorded as associated; anyone else is refused (Request
+    /// rejected). A newer Recovery Time Stamp than the association had is a
+    /// restart: its sessions are restored, as for one seen in a heartbeat.
+    async fn handle_association_setup_request(
+        &self,
+        header: &PfcpHeader,
+        body: &[u8],
+        from: SocketAddr,
+    ) {
+        use nextgcore_pfcp::recovery_time::{is_newer, normalize_received};
+        let configured = configured_sgwu_addr();
+        let decoded = AssociationSetupRequest::decode(&mut Bytes::copy_from_slice(body));
+        let cause = if from.ip() != configured.ip() {
+            log::warn!(
+                "Association Setup Request from {from}, which is not the SGW-U {configured}"
+            );
+            PfcpCause::RequestRejected
+        } else {
+            match &decoded {
+                Ok(_) => PfcpCause::RequestAccepted,
+                Err(nextgcore_pfcp::error::PfcpError::MissingMandatoryIe(_)) => {
+                    PfcpCause::MandatoryIeMissing
+                }
+                Err(e) => {
+                    log::warn!("Association Setup Request from {from} is malformed: {e}");
+                    PfcpCause::MandatoryIeIncorrect
+                }
+            }
+        };
+        let mut buf = BytesMut::new();
+        AssociationSetupResponse::new(
+            NodeId::new_ipv4(self.local_ip.octets()),
+            cause,
+            self.recovery_time_stamp,
+        )
+        .encode(&mut buf);
+        let _ = self
+            .send(
+                pfcp_msg_type::ASSOCIATION_SETUP_RESPONSE,
+                None,
+                header.sequence_number,
+                &buf,
+                from,
+            )
+            .await;
+        let (PfcpCause::RequestAccepted, Ok(req)) = (cause, decoded) else {
+            return;
+        };
+        let reported = normalize_received(req.recovery_time_stamp);
+        let features = req.up_function_features.as_ref();
+        let restarted = {
+            let mut peers = self.peers.write().await;
+            let restarted = peers
+                .get(&configured)
+                .and_then(|p| p.recovery_time_stamp)
+                .is_some_and(|stored| is_newer(reported, stored));
+            peers.insert(
+                configured,
+                SxaPeer {
+                    addr: configured,
+                    state: PfcpNodeState::Associated,
+                    recovery_time_stamp: Some(reported),
+                    up_function_features: UpFunctionFeatures {
+                        ftup: features.map(|f| f.ftup).unwrap_or(false),
+                        empu: features.map(|f| f.empu).unwrap_or(false),
+                        bucp: features.map(|f| f.bucp).unwrap_or(false),
+                        ddnd: features.map(|f| f.ddnd).unwrap_or(false),
+                        dlbd: features.map(|f| f.dlbd).unwrap_or(false),
+                        ..Default::default()
+                    },
+                },
+            );
+            restarted
+        };
+        self.refresh_peer_gauge().await;
+        log::info!(
+            "PFCP association set up by SGW-U {from} (Recovery Time Stamp {reported}{})",
+            if restarted { ", a restart" } else { "" }
+        );
+        if restarted || self.restore_pending.swap(false, Ordering::SeqCst) {
+            self.restore_sessions();
+        }
     }
 
     /// Keep the association with `peer` up for the life of the node (#1001).
@@ -886,6 +1013,10 @@ impl SxaNode {
         }
 
         match msg_type {
+            pfcp_msg_type::ASSOCIATION_SETUP_REQUEST => {
+                self.handle_association_setup_request(&header, &body, from)
+                    .await;
+            }
             pfcp_msg_type::HEARTBEAT_REQUEST => {
                 // #1001: the peer's own heartbeat reports its Recovery Time Stamp too; a
                 // changed one is a restart, noticed here before our next heartbeat.
@@ -1926,6 +2057,13 @@ mod tests {
             !sent.iter().any(|(_, s)| *s == pending.sgwc_sxa_seid),
             "a session still being set up is left to its procedure"
         );
+        // #1010 review: the stand-in never answers the restoration: after T1 x
+        // (N1 + 1) it is counted (and logged) as failed.
+        let failed0 = RESTORATIONS_FAILED.load(Ordering::Relaxed);
+        eventually("the unanswered restoration counted", || {
+            RESTORATIONS_FAILED.load(Ordering::Relaxed) > failed0
+        })
+        .await;
         let _ = stop.send(true);
         std::env::remove_var("SGWC_SGWU_ADDR");
         ctx.ue_remove(ue.id);
@@ -2472,5 +2610,73 @@ mod tests {
         assert_eq!(ctx.ue_ids_with_downlink_toward(b), vec![ue]);
         ctx.ue_remove(ue);
         assert!(ctx.ue_ids_with_downlink_toward(b).is_empty(), "removed");
+    }
+
+    /// #1010 review, TS 29.244 §6.2.6.2.1: the SGW-U may set the association up
+    /// itself. The configured SGW-U's Association Setup Request is answered
+    /// Request accepted with this node's Node ID and Recovery Time Stamp, and the
+    /// association is recorded; anyone else's is refused (Request rejected).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_sgwu_initiated_association_setup_is_answered() {
+        let _guard = process_state_test_guard().await;
+        let up = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up.local_addr().unwrap();
+        std::env::set_var("SGWC_SGWU_ADDR", up_addr.to_string());
+        let node = SxaNode::open("127.0.0.1:0".parse().unwrap(), Ipv4Addr::LOCALHOST)
+            .await
+            .unwrap();
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(node.clone().run(rx));
+        let setup = |seq: u32| {
+            let mut body = BytesMut::new();
+            AssociationSetupRequest::new(
+                NodeId::new_ipv4([127, 0, 0, 9]),
+                nextgcore_pfcp::recovery_time::now(),
+            )
+            .encode(&mut body);
+            let mut out = BytesMut::new();
+            let mut h = PfcpHeader::new(PfcpMessageType::AssociationSetupRequest, seq);
+            h.length = (4 + body.len()) as u16;
+            h.encode(&mut out);
+            out.extend_from_slice(&body);
+            out
+        };
+        async fn answer(sock: &UdpSocket) -> (PfcpHeader, AssociationSetupResponse) {
+            let mut buf = [0u8; 512];
+            let (len, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), sock.recv_from(&mut buf))
+                    .await
+                    .expect("answered")
+                    .unwrap();
+            let mut cursor = Bytes::copy_from_slice(&buf[..len]);
+            let header = PfcpHeader::decode(&mut cursor).unwrap();
+            let rsp = AssociationSetupResponse::decode(&mut cursor).unwrap();
+            (header, rsp)
+        }
+
+        up.send_to(&setup(0x51), node.local_addr()).await.unwrap();
+        let (header, rsp) = answer(&up).await;
+        assert_eq!(
+            header.message_type as u8,
+            pfcp_msg_type::ASSOCIATION_SETUP_RESPONSE
+        );
+        assert_eq!(header.sequence_number, 0x51);
+        assert_eq!(rsp.cause, PfcpCause::RequestAccepted);
+        assert_eq!(rsp.recovery_time_stamp, node.recovery_time_stamp);
+        assert!(node.is_associated_with(up_addr).await, "recorded");
+        assert_eq!(node.associated_peer_count(), 1);
+
+        let stranger = UdpSocket::bind("127.0.0.2:0").await;
+        if let Ok(stranger) = stranger {
+            stranger
+                .send_to(&setup(0x52), node.local_addr())
+                .await
+                .unwrap();
+            let (_, rsp) = answer(&stranger).await;
+            assert_eq!(rsp.cause, PfcpCause::RequestRejected, "not the SGW-U");
+            assert_eq!(node.associated_peer_count(), 1);
+        }
+        std::env::remove_var("SGWC_SGWU_ADDR");
+        let _ = stop.send(true);
     }
 }
