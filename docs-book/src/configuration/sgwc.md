@@ -48,6 +48,8 @@ Parsed by `src/bins/nextgcore-sgwcd/src/config.rs`. Every field is optional; a m
 
 Not read: `logger.*` (use `-l/--log-level`) and `global.max.*`.
 
+> **Clock:** this NF refuses to start when the local clock reads before 2020-01-01, because its PFCP Recovery Time Stamp would be wrong. See [A set clock is required](overview.md#a-set-clock-is-required-pfcp-nfs) for the remedy on RTC-less hosts.
+
 ## Command-line flags
 
 From the clap `Args` struct in `src/bins/nextgcore-sgwcd/src/main.rs`:
@@ -61,6 +63,50 @@ From the clap `Args` struct in `src/bins/nextgcore-sgwcd/src/main.rs`:
 
 ## Behavior notes
 
+- **Sxa association** (TS 29.244 §6.2.6, #1001):
+  - The SGW-C sets up the association with its SGW-U at startup.
+  - While there is no association, it retries the Association Setup every 10 s (T1 3 s,
+    N1 2 per attempt). This covers an SGW-U that comes up later, and one that refuses the
+    first Setup because its allowlist has not yet resolved the SGW-C's address.
+  - Once associated, it sends the SGW-U a Heartbeat Request every 10 s.
+  - No Heartbeat Response after T1 x (N1 + 1) is a PFCP path failure. The association and
+    its sessions are kept, and heartbeating continues. Setting the association up again over
+    a path that only blinked would make a conformant SGW-U drop every session (TS 29.244
+    §6.2.6.2.2).
+  - A newer Recovery Time Stamp means the SGW-U restarted. The stamp is carried in its
+    Heartbeat Response and in its own Heartbeat Request. It is normalised to NTP seconds
+    (#995), so a pre-#995 SGW-U's Unix seconds do not read as a restart, and an older stamp
+    from a reordered message is ignored. After a restart:
+    - the association is set up again;
+    - every established PFCP session is established again with the same CP F-SEID, F-TEIDs,
+      PDRs and FARs. The SGW-C allocates them all, so the MME and the PGW keep their
+      endpoints.
+  - While there is no association, the SGW-C sends no PFCP session message (TS 29.244 §6.2.6.1).
+    A Create Session Request is refused with No resources available before it is relayed to
+    the PGW. Other S11 requests that need a PFCP session message are answered with a failure.
+- **User plane path failure** (TS 23.007 §20.3.4, TS 29.244 §7.4.5, #994):
+  - The SGW-U reports a GTP-U path toward a remote peer as failed or recovered in a PFCP Node
+    Report Request. The SGW-C answers it:
+    - Request accepted;
+    - 72 if the report is not from its associated SGW-U;
+    - 66 (with the Offending IE) if the Node ID or the Node Report Type is missing;
+    - 67 (with the Offending IE) if the report the Node Report Type announces is missing;
+    - 69 if the request cannot be decoded.
+  - On a failure, every UE whose downlink S1-U endpoint is that eNodeB has its S1-U bearers
+    released with Release Access Bearers semantics. The FARs go to BUFF + NOCP and the EPS
+    bearers are kept, so downlink data is buffered, notified (DDN) and the UE paged.
+  - The peer stays marked failed for the maximum path failure duration,
+    `SGWC_UP_PATH_FAILURE_HOLD_SECS` (default 120, at most 3600). If the path is still down
+    when that expires, the record is dropped. A Modify Bearer that points a bearer at a failed
+    peer inside the hold is answered, and the UE's S1-U bearers are released at once.
+  - A recovery report clears the record.
+  - The optional S1-U path failure notification to the MME (cause "S1-U Path Failure",
+    §20.3.5) is not used, because it needs MME support (S1UN).
+- **Metrics:** `http://127.0.0.1:9090/metrics`. The port is set by `SGWC_METRICS_PORT`; the
+  bind is loopback unless `NEXTGCORE_METRICS_BIND` is set (#837). The metrics are:
+  - `sgwc_up`, `sgwc_pfcp_associations`, `sgwc_ues`;
+  - `sgwc_up_path_failures_total`, `sgwc_up_path_recoveries_total`, `sgwc_up_paths_failed`;
+  - `sgwc_up_path_ues_released_total`, `sgwc_up_path_holds_expired_total`.
 - **Environment variables** (read in `gtp_path.rs` / `pfcp_path.rs` / `main.rs`):
 
   | Variable | Default | Effect |

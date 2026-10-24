@@ -40,14 +40,24 @@ static FORCED: AtomicBool = AtomicBool::new(false);
 /// file's `mod tests` could not order against it. #346 is the same defect in nssfd: three
 /// guards over one global, none of which ordered against the others.
 #[cfg(test)]
-pub(crate) static CONGESTION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static CONGESTION_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Serialise on [`CONGESTION_TEST_LOCK`] and hand the caller a known-clean posture.
 #[cfg(test)]
-pub(crate) fn congestion_test_guard() -> std::sync::MutexGuard<'static, ()> {
-    let guard = CONGESTION_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+pub(crate) async fn congestion_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    reset_congestion_posture(CONGESTION_TEST_LOCK.lock().await)
+}
+
+/// [`congestion_test_guard`] for a synchronous `#[test]` (outside any runtime).
+#[cfg(test)]
+pub(crate) fn congestion_test_guard_blocking() -> tokio::sync::MutexGuard<'static, ()> {
+    reset_congestion_posture(CONGESTION_TEST_LOCK.blocking_lock())
+}
+
+#[cfg(test)]
+fn reset_congestion_posture(
+    guard: tokio::sync::MutexGuard<'static, ()>,
+) -> tokio::sync::MutexGuard<'static, ()> {
     set_forced(false);
     std::env::remove_var("AMF_NAS_CONGESTION");
     std::env::remove_var("AMF_NAS_CONGESTION_THRESHOLD");
@@ -142,7 +152,7 @@ fn env_flag(var: &str) -> bool {
 mod tests {
     use super::*;
 
-    use super::congestion_test_guard as guard;
+    use super::congestion_test_guard_blocking as guard;
 
     #[test]
     fn the_shipped_default_is_never_congested() {

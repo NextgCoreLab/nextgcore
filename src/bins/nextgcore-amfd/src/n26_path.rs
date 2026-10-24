@@ -2253,6 +2253,61 @@ mod tests {
         assert!(xact.mgr.lookup_cached_response(peer, 0x7554).is_some());
     }
 
+    /// **#755 (review of #851, MINOR A).** The response cache is purged where in-flight
+    /// entries expire, on every initial request: a response held past its hold is gone
+    /// once the next request from any peer is handled, so the cache does not keep every
+    /// response ever sent. A 1 ms hold stands in for the 30 s one.
+    ///
+    /// REVERT-VERIFIED: without `expire_responses` in `handle_datagram` the expired
+    /// response is still cached.
+    #[tokio::test]
+    async fn an_expired_cached_response_is_purged_by_the_next_request() {
+        let server = N26Server::open("127.0.0.1:0".parse().unwrap(), 1)
+            .await
+            .expect("N26 socket");
+        server.xact.lock().await.mgr = Gtp2XactMgr::new(Gtp2XactConfig {
+            response_hold: std::time::Duration::from_millis(1),
+            ..Gtp2XactConfig::default()
+        });
+        let sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = sink.local_addr().unwrap();
+        let rsp = Gtp2Message::new(Gtp2Header::new(
+            Gtp2MessageType::ForwardRelocationResponse as u8,
+            0,
+            0x7555,
+        ));
+        server.send_to_mme(peer, &rsp).await;
+        assert!(
+            server
+                .xact
+                .lock()
+                .await
+                .mgr
+                .lookup_cached_response(peer, 0x7555)
+                .is_some(),
+            "precondition: the response is cached"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // The next initial request -- an Echo Request, from another peer.
+        let other = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo = Gtp2Message::new(Gtp2Header::new(
+            Gtp2MessageType::EchoRequest as u8,
+            0,
+            0x7556,
+        ));
+        let other_peer = other.local_addr().unwrap();
+        server.handle_datagram(&echo.encode(), other_peer).await;
+        // `lookup_cached_response` already hides an expired entry, so the purge shows only
+        // in what the cache still HOLDS: the Echo Response it just cached (every response
+        // is), and not the expired Forward Relocation Response.
+        assert_eq!(
+            server.xact.lock().await.mgr.cached_response_count(),
+            1,
+            "the expired Forward Relocation Response is purged, not merely hidden"
+        );
+    }
+
     /// The AMF's F-TEID interface type, against Table 8.22-1 and against smfd's constant.
     #[test]
     fn n26_amf_fteid_interface_type_matches_ts29274_table_8_22_1() {
@@ -2271,9 +2326,7 @@ mod tests {
     /// MME would hold a key this AMF still uses for its own NAS.
     #[test]
     fn the_mm_context_carries_a_derived_kasme_not_the_kamf() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.blocking_lock();
 
         let mut ue = AmfUe::new(0x347_0001, 1);
         ue.kamf = [0x5A; 32];
@@ -2365,9 +2418,7 @@ mod tests {
     /// An accepted Context Response carries every Table 7.3.6-1 IE the AMF can supply.
     #[test]
     fn an_accepted_context_response_carries_its_table_7_3_6_1_ies() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.blocking_lock();
 
         let mut ue = AmfUe::new(0x347_0002, 2);
         ue.supi = Some("imsi-001010000000002".to_string());
@@ -2431,9 +2482,7 @@ mod tests {
     /// Several PDN connections share instance 0 (TS 29.274 §8.39).
     #[test]
     fn several_pdn_connections_are_all_carried_at_instance_zero() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.blocking_lock();
 
         let ue = AmfUe::new(0x347_0003, 3);
         let pdns: Vec<Gtp2PdnConnectionIe> = [5u8, 6]
@@ -2498,9 +2547,7 @@ mod tests {
     /// procedure would answer "IMSI/IMEI not known" for every UE.
     #[test]
     fn a_natively_registered_ue_is_found_by_the_guti_an_mme_maps_from_its_5g_guti() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.blocking_lock();
         crate::test_support::init_context();
 
         // A distinct 5G-TMSI, so this test cannot collide with a sibling's UE: the AMF
@@ -2586,9 +2633,7 @@ mod tests {
     /// The switch reads back in both directions, and nothing is bound when it is off.
     #[test]
     fn the_n26_switch_reads_back_in_both_directions() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.blocking_lock();
         set_for_test(true);
         assert!(enabled());
         set_for_test(false);

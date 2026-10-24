@@ -23,8 +23,9 @@ use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 use nextgcore_pfcp::header::{PfcpHeader, PfcpMessageType};
 use nextgcore_pfcp::message::{
-    AssociationSetupRequest, AssociationSetupResponse, HeartbeatResponse,
-    PfcpMessage as PfcpLibMessage, SessionReportRequest, SessionReportResponse,
+    AssociationSetupRequest, AssociationSetupResponse, HeartbeatRequest, HeartbeatResponse,
+    NodeReportRequest, NodeReportResponse, PfcpMessage as PfcpLibMessage, SessionReportRequest,
+    SessionReportResponse,
 };
 use nextgcore_pfcp::types::{NodeId, PfcpCause};
 use tokio::net::UdpSocket;
@@ -45,6 +46,16 @@ const SEQ_MASK: u32 = 0x00FF_FFFF;
 const T1: std::time::Duration = std::time::Duration::from_secs(3);
 const N1: u32 = 2;
 
+/// How often an SGW-C with no association to its SGW-U tries the Association Setup
+/// again (#1001), each attempt with T1/N1 (TS 29.244 §6.2.6.1). The same 10 s smfd
+/// uses (`reassociate_holdoff`).
+pub const ASSOCIATION_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How often the SGW-C sends an associated SGW-U a Heartbeat Request (TS 29.244
+/// §6.2.2, §7.4.2), so a peer that went away or restarted is noticed without a
+/// session request failing first. The same 10 s smfd uses.
+pub const HEARTBEAT_PERIOD: std::time::Duration = std::time::Duration::from_secs(10);
+
 // ============================================================================
 // PFCP Message Types
 // ============================================================================
@@ -56,6 +67,9 @@ pub mod pfcp_msg_type {
     pub const ASSOCIATION_SETUP_RESPONSE: u8 = 6;
     pub const ASSOCIATION_RELEASE_REQUEST: u8 = 9;
     pub const ASSOCIATION_RELEASE_RESPONSE: u8 = 10;
+    /// TS 29.244 §7.4.5: user plane path failure and recovery reports (#994).
+    pub const NODE_REPORT_REQUEST: u8 = 12;
+    pub const NODE_REPORT_RESPONSE: u8 = 13;
     /// TS 29.244 §7.2.2.1: answered when the version octet is not 1.
     pub const VERSION_NOT_SUPPORTED_RESPONSE: u8 = 11;
     pub const SESSION_ESTABLISHMENT_REQUEST: u8 = 50;
@@ -194,6 +208,27 @@ pub enum S11Continuation {
     /// steps 3-4: the SGW answers after switching the downlink path). `join`
     /// names the pending answer in `sxa_response`.
     ModifyBearer { join: u64, sess_id: u64 },
+    /// A session established again on a restarted SGW-U (#1010 review): no MME
+    /// waits, but a refused or unanswered restoration is counted and logged
+    /// ([`RESTORATIONS_FAILED`]).
+    Restoration { sess_id: u64 },
+}
+
+/// Sessions whose restoration on a restarted SGW-U failed: not sent, refused, or
+/// unanswered (#1010 review). Each is also logged with its CP F-SEID.
+pub static RESTORATIONS_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record one failed restoration of `sess_id`.
+pub fn restoration_failed(sess_id: u64, why: &str) {
+    RESTORATIONS_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let seid = crate::context::sgwc_self()
+        .sess_find_by_id(sess_id)
+        .map(|s| s.sgwc_sxa_seid)
+        .unwrap_or(0);
+    log::error!(
+        "PFCP session {sess_id} (CP F-SEID 0x{seid:x}) NOT restored on the restarted SGW-U: \
+         {why}; its user plane is gone until the session is set up again"
+    );
 }
 
 /// An outbound PFCP request queued by a synchronous caller.
@@ -333,6 +368,11 @@ pub struct SxaNode {
     peers: RwLock<HashMap<SocketAddr, SxaPeer>>,
     /// Associated peers, readable synchronously (the S11 dispatch cannot await).
     associated_peers: AtomicUsize,
+    /// T1 of every transaction, in milliseconds ([`T1`] unless a test shortens it).
+    t1_ms: std::sync::atomic::AtomicU64,
+    /// The SGW-U restarted (#1010 review): once the association is set up again,
+    /// its PFCP sessions are established again ([`Self::restore_sessions`]).
+    restore_pending: std::sync::atomic::AtomicBool,
 }
 
 impl SxaNode {
@@ -350,6 +390,8 @@ impl SxaNode {
             pending: Mutex::new(HashMap::new()),
             peers: RwLock::new(HashMap::new()),
             associated_peers: AtomicUsize::new(0),
+            t1_ms: std::sync::atomic::AtomicU64::new(T1.as_millis() as u64),
+            restore_pending: std::sync::atomic::AtomicBool::new(false),
         });
         log::info!(
             "PFCP/Sxa listening on {bound} (Node ID {local_ip}, Recovery Time Stamp \
@@ -375,6 +417,23 @@ impl SxaNode {
     /// Associated peers, readable from a synchronous context.
     pub fn associated_peer_count(&self) -> usize {
         self.associated_peers.load(Ordering::Relaxed)
+    }
+
+    /// Drop the association with `peer` as a lost one would be (tests).
+    #[cfg(test)]
+    pub async fn drop_association_for_test(&self, peer: SocketAddr) {
+        self.mark_association_lost(peer, "test").await;
+    }
+
+    /// T1 of this node's transactions.
+    fn t1(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.t1_ms.load(Ordering::Relaxed))
+    }
+
+    /// Shorten T1 (tests: a heartbeat loss is T1 x (N1 + 1)).
+    #[cfg(test)]
+    pub fn set_t1_for_test(&self, t1: std::time::Duration) {
+        self.t1_ms.store(t1.as_millis() as u64, Ordering::Relaxed);
     }
 
     pub async fn is_associated(&self) -> bool {
@@ -464,7 +523,7 @@ impl SxaNode {
                 );
             }
 
-            match tokio::time::timeout(T1, rx).await {
+            match tokio::time::timeout(self.t1(), rx).await {
                 Ok(Ok(response)) => return Ok(response),
                 Ok(Err(_)) => {
                     return Err(PfcpRequestError::Local("response channel closed".into()))
@@ -541,6 +600,299 @@ impl SxaNode {
             features.map(|f| f.ftup).unwrap_or(false)
         );
         Ok(())
+    }
+
+    /// Whether the association with `peer` is up.
+    pub async fn is_associated_with(&self, peer: SocketAddr) -> bool {
+        self.peers
+            .read()
+            .await
+            .get(&peer)
+            .is_some_and(|p| p.state == PfcpNodeState::Associated)
+    }
+
+    /// The association with `peer` is gone (#1001): its record is dropped, so session
+    /// requests are refused until [`Self::maintain_association`] sets it up again.
+    async fn mark_association_lost(&self, peer: SocketAddr, why: &str) {
+        let was = self.peers.write().await.remove(&peer).is_some();
+        self.refresh_peer_gauge().await;
+        if was {
+            log::warn!(
+                "PFCP association with SGW-U {peer} lost: {why}; setting it up again \
+                 (TS 29.244 §6.2.6)"
+            );
+        }
+    }
+
+    /// One Heartbeat Request to `peer` (TS 29.244 §7.4.2), with T1/N1. Returns the
+    /// peer's Recovery Time Stamp.
+    pub async fn heartbeat(&self, peer: SocketAddr) -> Result<u32, String> {
+        let mut body = BytesMut::new();
+        PfcpLibMessage::HeartbeatRequest(HeartbeatRequest::new(self.recovery_time_stamp))
+            .encode_body(&mut body);
+        let (resp_type, resp_body) = self
+            .request(pfcp_msg_type::HEARTBEAT_REQUEST, None, &body, peer)
+            .await
+            .map_err(|e| e.to_string())?;
+        if resp_type != pfcp_msg_type::HEARTBEAT_RESPONSE {
+            return Err(format!(
+                "unexpected response type {resp_type} to a Heartbeat Request"
+            ));
+        }
+        let mut cursor = Bytes::copy_from_slice(&resp_body);
+        HeartbeatResponse::decode(&mut cursor)
+            .map(|r| r.recovery_time_stamp)
+            .map_err(|e| format!("malformed Heartbeat Response from {peer}: {e}"))
+    }
+
+    /// A Recovery Time Stamp `peer` reported (TS 29.244 §8.2.65). Normalised to
+    /// the NTP reading as the stored one is (#995), so a pre-#995 SGW-U's Unix
+    /// seconds do not read as a restart on every heartbeat. Only a stamp NEWER
+    /// than the stored one (RFC 1982, wrap-aware) is a restart: the SGW-U lost
+    /// the association and every session (TS 29.244 §6.2.2, TS 23.007 §19A), so
+    /// the association is set up again and its sessions restored. An older one
+    /// (a reordered message from before a restart already seen) is ignored.
+    async fn check_peer_recovery(&self, peer: SocketAddr, reported: u32) {
+        use nextgcore_pfcp::recovery_time::{is_newer, normalize_received};
+        if reported == 0 {
+            return;
+        }
+        let reported = normalize_received(reported);
+        let stored = self
+            .peers
+            .read()
+            .await
+            .get(&peer)
+            .filter(|p| p.state == PfcpNodeState::Associated)
+            .and_then(|p| p.recovery_time_stamp);
+        let Some(stored) = stored else {
+            return;
+        };
+        if is_newer(reported, stored) {
+            self.restore_pending.store(true, Ordering::SeqCst);
+            self.mark_association_lost(
+                peer,
+                &format!("the SGW-U restarted (Recovery Time Stamp {stored} -> {reported})"),
+            )
+            .await;
+        } else if reported != stored {
+            log::debug!(
+                "SGW-U {peer} reported Recovery Time Stamp {reported}, older than the \
+                 associated {stored}: a reordered message, not a restart"
+            );
+        }
+    }
+
+    /// Establish every PFCP session of this SGW-C again on the SGW-U, after it
+    /// restarted and the association was set up anew (#1010 review). The SGW-C
+    /// allocates every F-TEID, PDR and FAR itself, and its CP F-SEID is
+    /// unchanged, so the restored sessions are the ones the MME and PGW hold:
+    /// the same S1-U and S5/S8-U endpoints, with each FAR forwarding or
+    /// buffering as the bearer's current state says. The SGW-U's new UP F-SEID
+    /// is recorded from each response. Returns the number of sessions sent.
+    pub fn restore_sessions(&self) -> usize {
+        let ctx = crate::context::sgwc_self();
+        let (mut sent, mut unsent) = (0usize, 0usize);
+        for sess in ctx.sess_list_all() {
+            if sess.sgwu_sxa_seid == 0 {
+                // Never established: the procedure creating it is still running.
+                continue;
+            }
+            match send_session_establishment_request(
+                &sess,
+                0,
+                None,
+                0,
+                S11Continuation::Restoration { sess_id: sess.id },
+            ) {
+                Ok(()) => sent += 1,
+                Err(e) => {
+                    unsent += 1;
+                    restoration_failed(sess.id, &format!("not sent ({e})"));
+                }
+            }
+        }
+        if unsent > 0 {
+            log::error!(
+                "SGW-U restarted: {sent} PFCP session(s) sent for restoration, {unsent} could \
+                 not be sent (TS 23.007, CUPS user plane restart)"
+            );
+        } else {
+            log::warn!(
+                "SGW-U restarted: {sent} PFCP session(s) sent for restoration with their \
+                 F-TEIDs (TS 23.007, CUPS user plane restart); each answer is checked"
+            );
+        }
+        sent
+    }
+
+    /// An Association Setup Request from the UP function (TS 29.244 §6.2.6.2.1:
+    /// either function may set the association up; #1010 review). The configured
+    /// SGW-U is answered Request accepted, with this node's Node ID and Recovery
+    /// Time Stamp, and recorded as associated; anyone else is refused (Request
+    /// rejected). A newer Recovery Time Stamp than the association had is a
+    /// restart: its sessions are restored, as for one seen in a heartbeat.
+    async fn handle_association_setup_request(
+        &self,
+        header: &PfcpHeader,
+        body: &[u8],
+        from: SocketAddr,
+    ) {
+        use nextgcore_pfcp::recovery_time::{is_newer, normalize_received};
+        let configured = configured_sgwu_addr();
+        let decoded = AssociationSetupRequest::decode(&mut Bytes::copy_from_slice(body));
+        let cause = if from.ip() != configured.ip() {
+            log::warn!(
+                "Association Setup Request from {from}, which is not the SGW-U {configured}"
+            );
+            PfcpCause::RequestRejected
+        } else {
+            match &decoded {
+                Ok(_) => PfcpCause::RequestAccepted,
+                Err(nextgcore_pfcp::error::PfcpError::MissingMandatoryIe(_)) => {
+                    PfcpCause::MandatoryIeMissing
+                }
+                Err(e) => {
+                    log::warn!("Association Setup Request from {from} is malformed: {e}");
+                    PfcpCause::MandatoryIeIncorrect
+                }
+            }
+        };
+        let mut buf = BytesMut::new();
+        AssociationSetupResponse::new(
+            NodeId::new_ipv4(self.local_ip.octets()),
+            cause,
+            self.recovery_time_stamp,
+        )
+        .encode(&mut buf);
+        let _ = self
+            .send(
+                pfcp_msg_type::ASSOCIATION_SETUP_RESPONSE,
+                None,
+                header.sequence_number,
+                &buf,
+                from,
+            )
+            .await;
+        let (PfcpCause::RequestAccepted, Ok(req)) = (cause, decoded) else {
+            return;
+        };
+        let reported = normalize_received(req.recovery_time_stamp);
+        let features = req.up_function_features.as_ref();
+        let restarted = {
+            let mut peers = self.peers.write().await;
+            let restarted = peers
+                .get(&configured)
+                .and_then(|p| p.recovery_time_stamp)
+                .is_some_and(|stored| is_newer(reported, stored));
+            peers.insert(
+                configured,
+                SxaPeer {
+                    addr: configured,
+                    state: PfcpNodeState::Associated,
+                    recovery_time_stamp: Some(reported),
+                    up_function_features: UpFunctionFeatures {
+                        ftup: features.map(|f| f.ftup).unwrap_or(false),
+                        empu: features.map(|f| f.empu).unwrap_or(false),
+                        bucp: features.map(|f| f.bucp).unwrap_or(false),
+                        ddnd: features.map(|f| f.ddnd).unwrap_or(false),
+                        dlbd: features.map(|f| f.dlbd).unwrap_or(false),
+                        ..Default::default()
+                    },
+                },
+            );
+            restarted
+        };
+        self.refresh_peer_gauge().await;
+        log::info!(
+            "PFCP association set up by SGW-U {from} (Recovery Time Stamp {reported}{})",
+            if restarted { ", a restart" } else { "" }
+        );
+        if restarted || self.restore_pending.swap(false, Ordering::SeqCst) {
+            self.restore_sessions();
+        }
+    }
+
+    /// Keep the association with `peer` up for the life of the node (#1001).
+    ///
+    /// While unassociated the Association Setup is tried every `retry`: a refused or
+    /// unanswered first Setup (an SGW-U that comes up later, or one whose allowlist has
+    /// not yet resolved a restarted SGW-C's new address) no longer leaves the SGW-C
+    /// unassociated until a session request happens to need it. While associated a
+    /// Heartbeat Request goes every `heartbeat` (TS 29.244 §6.2.2).
+    ///
+    /// No Heartbeat Response after T1/N1 is a PFCP PATH failure, not the loss of
+    /// the association (#1010 review): the association and its sessions are kept
+    /// and heartbeating goes on. Setting the association up again over a path that
+    /// merely blinked would make a conformant SGW-U drop every session it was not
+    /// told to retain (TS 29.244 §6.2.6.2.2). Only a newer Recovery Time Stamp, in
+    /// a Heartbeat Response or the SGW-U's own Heartbeat Request, says the SGW-U
+    /// restarted: then the association is set up again and its sessions restored
+    /// ([`Self::restore_sessions`]).
+    pub async fn maintain_association(
+        self: Arc<Self>,
+        peer: SocketAddr,
+        retry: std::time::Duration,
+        heartbeat: std::time::Duration,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        let mut failing = false;
+        let mut path_failed = false;
+        loop {
+            if *shutdown.borrow() {
+                return;
+            }
+            if !self.is_associated_with(peer).await {
+                match self.associate(peer).await {
+                    Ok(()) => {
+                        failing = false;
+                        path_failed = false;
+                        if self.restore_pending.swap(false, Ordering::SeqCst) {
+                            self.restore_sessions();
+                        }
+                    }
+                    Err(e) if !failing => {
+                        failing = true;
+                        log::warn!(
+                            "No PFCP association with SGW-U {peer} ({e}); session requests \
+                             are refused until it is set up; retrying every {}s",
+                            retry.as_secs_f32()
+                        );
+                    }
+                    Err(e) => log::debug!("PFCP Association Setup with {peer} still failing: {e}"),
+                }
+            }
+            let associated = self.is_associated_with(peer).await;
+            let wait = if associated { heartbeat } else { retry };
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                }
+            }
+            if associated && self.is_associated_with(peer).await {
+                match self.heartbeat(peer).await {
+                    Ok(reported) => {
+                        if std::mem::take(&mut path_failed) {
+                            log::info!("PFCP path to SGW-U {peer} restored");
+                        }
+                        self.check_peer_recovery(peer, reported).await
+                    }
+                    Err(e) => {
+                        if !path_failed {
+                            path_failed = true;
+                            log::warn!(
+                                "PFCP path to SGW-U {peer} failed: no Heartbeat Response \
+                                 ({e}); the association and its sessions are kept and \
+                                 heartbeating continues (TS 29.244 §6.2.2)"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// The receive loop, plus the drain of the synchronous senders' queue.
@@ -661,7 +1013,17 @@ impl SxaNode {
         }
 
         match msg_type {
+            pfcp_msg_type::ASSOCIATION_SETUP_REQUEST => {
+                self.handle_association_setup_request(&header, &body, from)
+                    .await;
+            }
             pfcp_msg_type::HEARTBEAT_REQUEST => {
+                // #1001: the peer's own heartbeat reports its Recovery Time Stamp too; a
+                // changed one is a restart, noticed here before our next heartbeat.
+                if let Ok(req) = HeartbeatRequest::decode(&mut Bytes::copy_from_slice(&body)) {
+                    self.check_peer_recovery(from, req.recovery_time_stamp)
+                        .await;
+                }
                 // TS 29.244 §6.2.2.2: answer at any time. A CP function that does not is
                 // declared down by the UP function's own heartbeat monitor.
                 let mut buf = BytesMut::new();
@@ -681,8 +1043,115 @@ impl SxaNode {
                 self.handle_session_report_request(&header, &body, from)
                     .await;
             }
+            pfcp_msg_type::NODE_REPORT_REQUEST => {
+                self.handle_node_report_request(&header, &body, from).await;
+            }
             other => {
                 log::warn!("PFCP message type {other} from {from} is not handled on Sxa (CP side)");
+            }
+        }
+    }
+
+    /// An inbound Node Report Request (TS 29.244 §7.4.5.1, #994): the SGW-U reports a
+    /// GTP-U path toward a remote peer as failed or recovered (TS 23.007 §20.3.4).
+    ///
+    /// The Node Report Response carries our Node ID and a Cause, and is sent before
+    /// anything is acted on:
+    /// - 72 No established PFCP Association when the sender is not the SGW-U this
+    ///   SGW-C is associated with (§6.2.6.1);
+    /// - 66 Mandatory IE missing, with the Offending IE, when the Node ID or the
+    ///   Node Report Type is absent;
+    /// - 67 Conditional IE missing, with the Offending IE, when the report the Node
+    ///   Report Type announces (UPFR, UPRR) is absent;
+    /// - 69 Mandatory IE incorrect when the message cannot be decoded;
+    /// - 1 Request accepted otherwise.
+    ///
+    /// [`crate::up_path`] then handles the reported peers.
+    async fn handle_node_report_request(&self, header: &PfcpHeader, body: &[u8], from: SocketAddr) {
+        use nextgcore_pfcp::ie::IeType;
+        let decoded = NodeReportRequest::decode(&mut Bytes::copy_from_slice(body));
+        let (cause, offending, request) = if !self.is_associated_with(from).await {
+            log::warn!("Node Report Request from {from}, which is not an associated SGW-U");
+            (PfcpCause::NoEstablishedPfcpAssociation, None, None)
+        } else {
+            match decoded {
+                Ok(req) => {
+                    let missing = if req.node_report_type.upfr
+                        && req.user_plane_path_failure_report.is_none()
+                    {
+                        Some(IeType::UserPlanePathFailureReport)
+                    } else if req.node_report_type.uprr
+                        && req.user_plane_path_recovery_report.is_none()
+                    {
+                        Some(IeType::UserPlanePathRecoveryReport)
+                    } else {
+                        None
+                    };
+                    match missing {
+                        // A report the Node Report Type announces is a
+                        // conditional IE (TS 29.244 Table 7.4.5.1-1): cause 67.
+                        Some(ie) => (PfcpCause::ConditionalIeMissing, Some(ie as u16), None),
+                        None => (PfcpCause::RequestAccepted, None, Some(req)),
+                    }
+                }
+                Err(nextgcore_pfcp::error::PfcpError::MissingMandatoryIe(name)) => {
+                    let ie = if name.contains("Report Type") {
+                        IeType::NodeReportType
+                    } else {
+                        IeType::NodeId
+                    };
+                    (PfcpCause::MandatoryIeMissing, Some(ie as u16), None)
+                }
+                Err(e) => {
+                    log::warn!("Node Report Request from {from} is malformed: {e}");
+                    (PfcpCause::MandatoryIeIncorrect, None, None)
+                }
+            }
+        };
+        let mut buf = BytesMut::new();
+        NodeReportResponse {
+            node_id: NodeId::new_ipv4(self.local_ip.octets()),
+            cause,
+            offending_ie: offending,
+        }
+        .encode(&mut buf);
+        let _ = self
+            .send(
+                pfcp_msg_type::NODE_REPORT_RESPONSE,
+                None,
+                header.sequence_number,
+                &buf,
+                from,
+            )
+            .await;
+        let Some(req) = request else {
+            return;
+        };
+
+        let peers_of = |report: &Option<nextgcore_pfcp::types::UserPlanePathFailureReport>| {
+            report
+                .iter()
+                .flat_map(|r| r.remote_gtpu_peers.iter())
+                .flat_map(|p| {
+                    p.ipv4
+                        .map(std::net::IpAddr::from)
+                        .into_iter()
+                        .chain(p.ipv6.map(std::net::IpAddr::from))
+                })
+                .collect::<Vec<_>>()
+        };
+        if req.node_report_type.uprr {
+            crate::up_path::on_recovery(&peers_of(&req.user_plane_path_recovery_report));
+        }
+        if req.node_report_type.upfr {
+            let hold = crate::up_path::hold();
+            for (peer, generation) in
+                crate::up_path::on_failure(&peers_of(&req.user_plane_path_failure_report))
+            {
+                tokio::spawn(async move {
+                    tokio::time::sleep(hold).await;
+                    crate::up_path::on_hold_expired(peer, generation);
+                });
             }
         }
     }
@@ -858,10 +1327,25 @@ pub async fn pfcp_close() {
 // PFCP Send Functions (SGWC -> SGWU)
 // ============================================================================
 
+/// Whether the Sxa association with the SGW-U is up, so a PFCP session message
+/// can be sent (TS 29.244 §6.2.6.1). Synchronous, for the S11 dispatch.
+pub fn sgwu_associated() -> bool {
+    sxa_node().is_some_and(|n| n.associated_peer_count() > 0)
+}
+
 /// Enqueue an outbound request. Callable from the synchronous S11 dispatch.
 fn enqueue(msg: &PfcpMessage, sess_id: u64, continuation: S11Continuation) -> Result<(), String> {
     let tx = outbound()
         .ok_or_else(|| "PFCP path is not running: no Sxa transport to send on".to_string())?;
+    // TS 29.244 §6.2.6.1: no PFCP session message before the association is set up
+    // (#1001). `maintain_association` sets it up, and sets it up again when it is lost.
+    if !sgwu_associated() {
+        return Err(format!(
+            "no PFCP association with the SGW-U {}: session messages wait for it \
+             (TS 29.244 §6.2.6.1)",
+            configured_sgwu_addr()
+        ));
+    }
     tx.send(QueuedRequest {
         msg_type: msg.msg_type,
         seid: msg.seid,
@@ -1251,5 +1735,995 @@ mod tests {
             err.contains("not running"),
             "the error must name why nothing was sent, got {err}"
         );
+    }
+
+    /// A stand-in SGW-U for the association tests: Association Setup Requests are
+    /// answered in turn from `refusals` (true = refused) and then accepted, each with
+    /// the current `rts`; Heartbeat Requests are answered with `rts` too.
+    struct AssocSgwu {
+        addr: SocketAddr,
+        sock: Arc<UdpSocket>,
+        setups: Arc<AtomicU32>,
+        heartbeats: Arc<AtomicU32>,
+        rts: Arc<AtomicU32>,
+        /// Node Report Responses received: (sequence number, body).
+        node_report_responses: Arc<std::sync::Mutex<Vec<(u32, Vec<u8>)>>>,
+        /// Session Modification Request bodies received (each answered accepted).
+        modifications: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        /// (sequence number, CP F-SEID) of the Session Establishment Requests
+        /// received, retransmissions included; they are not answered.
+        establishments: Arc<std::sync::Mutex<Vec<(u32, u64)>>>,
+    }
+
+    async fn assoc_sgwu(refusals: Vec<bool>) -> AssocSgwu {
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = sock.local_addr().unwrap();
+        let setups = Arc::new(AtomicU32::new(0));
+        let heartbeats = Arc::new(AtomicU32::new(0));
+        let rts = Arc::new(AtomicU32::new(100));
+        let establishments = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (s, h, r, up, est) = (
+            setups.clone(),
+            heartbeats.clone(),
+            rts.clone(),
+            sock.clone(),
+            establishments.clone(),
+        );
+        let node_report_responses = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let modifications = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (nrr, mods) = (node_report_responses.clone(), modifications.clone());
+        tokio::spawn(async move {
+            let mut refusals = std::collections::VecDeque::from(refusals);
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let Ok((len, from)) = up.recv_from(&mut buf).await else {
+                    return;
+                };
+                let mut cursor = Bytes::copy_from_slice(&buf[..len]);
+                let Ok(header) = PfcpHeader::decode(&mut cursor) else {
+                    continue;
+                };
+                let mut body = BytesMut::new();
+                match header.message_type as u8 {
+                    pfcp_msg_type::NODE_REPORT_RESPONSE => {
+                        nrr.lock()
+                            .unwrap()
+                            .push((header.sequence_number, cursor.to_vec()));
+                        continue;
+                    }
+                    pfcp_msg_type::SESSION_MODIFICATION_REQUEST => {
+                        mods.lock().unwrap().push(cursor.to_vec());
+                        nextgcore_pfcp::message::SessionModificationResponse::new(
+                            PfcpCause::RequestAccepted,
+                        )
+                        .encode(&mut body);
+                        let mut out = BytesMut::new();
+                        let mut h = PfcpHeader::new_with_seid(
+                            PfcpMessageType::SessionModificationResponse,
+                            header.seid.unwrap_or(0),
+                            header.sequence_number,
+                        );
+                        h.length = (12 + body.len()) as u16;
+                        h.encode(&mut out);
+                        out.extend_from_slice(&body);
+                        let _ = up.send_to(&out, from).await;
+                        continue;
+                    }
+                    _ => {}
+                }
+                let resp_type = match header.message_type as u8 {
+                    pfcp_msg_type::ASSOCIATION_SETUP_REQUEST => {
+                        s.fetch_add(1, Ordering::SeqCst);
+                        let cause = if refusals.pop_front().unwrap_or(false) {
+                            PfcpCause::RequestRejected
+                        } else {
+                            PfcpCause::RequestAccepted
+                        };
+                        AssociationSetupResponse::new(
+                            NodeId::new_ipv4([127, 0, 0, 9]),
+                            cause,
+                            r.load(Ordering::SeqCst),
+                        )
+                        .encode(&mut body);
+                        PfcpMessageType::AssociationSetupResponse
+                    }
+                    pfcp_msg_type::SESSION_ESTABLISHMENT_REQUEST => {
+                        if let Ok(req) =
+                            nextgcore_pfcp::message::SessionEstablishmentRequest::decode(
+                                &mut cursor,
+                            )
+                        {
+                            est.lock()
+                                .unwrap()
+                                .push((header.sequence_number, req.cp_f_seid.seid));
+                        }
+                        continue;
+                    }
+                    pfcp_msg_type::HEARTBEAT_REQUEST => {
+                        h.fetch_add(1, Ordering::SeqCst);
+                        HeartbeatResponse::new(r.load(Ordering::SeqCst)).encode(&mut body);
+                        PfcpMessageType::HeartbeatResponse
+                    }
+                    _ => continue,
+                };
+                let mut out = BytesMut::new();
+                let mut h = PfcpHeader::new(resp_type, header.sequence_number);
+                h.length = (4 + body.len()) as u16;
+                h.encode(&mut out);
+                out.extend_from_slice(&body);
+                let _ = up.send_to(&out, from).await;
+            }
+        });
+        AssocSgwu {
+            addr,
+            sock,
+            setups,
+            heartbeats,
+            rts,
+            node_report_responses,
+            modifications,
+            establishments,
+        }
+    }
+
+    /// A relay in front of `real` that drops every request from the SGW-C while
+    /// `silent` is set, counting what it dropped. Returns its address.
+    async fn silenceable_relay(
+        real: SocketAddr,
+        silent: Arc<std::sync::atomic::AtomicBool>,
+        dropped: Arc<AtomicU32>,
+    ) -> SocketAddr {
+        let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let relay_addr = relay.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut client = None;
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let Ok((len, from)) = relay.recv_from(&mut buf).await else {
+                    return;
+                };
+                if from == real {
+                    if let Some(c) = client {
+                        let _ = relay.send_to(&buf[..len], c).await;
+                    }
+                } else if silent.load(Ordering::SeqCst) {
+                    dropped.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    client = Some(from);
+                    let _ = relay.send_to(&buf[..len], real).await;
+                }
+            }
+        });
+        relay_addr
+    }
+
+    /// #1010 review, TS 29.244 §6.2.2 / §6.2.6.2.2: an SGW-U that stops answering
+    /// heartbeats (T1 x (N1 + 1)) is a PFCP path failure. The association and the
+    /// sessions are kept, heartbeating goes on, and no new Association Setup is
+    /// sent when the path comes back: a re-Setup would make a conformant SGW-U
+    /// drop every session it was not told to retain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unanswered_heartbeat_is_a_path_failure_that_keeps_the_association() {
+        let guard = process_state_test_guard().await;
+        let real = assoc_sgwu(Vec::new()).await;
+        let silent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dropped = Arc::new(AtomicU32::new(0));
+        let relay = silenceable_relay(real.addr, silent.clone(), dropped.clone()).await;
+        let (node, stop) = maintained_node(
+            &guard,
+            relay,
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+        let (setups, heartbeats) = (real.setups.clone(), real.heartbeats.clone());
+        eventually("a heartbeat", || heartbeats.load(Ordering::SeqCst) >= 1).await;
+
+        // More than one whole unanswered heartbeat (N1 + 1 transmissions).
+        silent.store(true, Ordering::SeqCst);
+        let d = dropped.clone();
+        eventually("two unanswered heartbeats", || {
+            d.load(Ordering::SeqCst) > 2 * (N1 + 1)
+        })
+        .await;
+        assert_eq!(node.associated_peer_count(), 1, "the association is kept");
+        assert!(node.is_associated_with(relay).await);
+
+        silent.store(false, Ordering::SeqCst);
+        let before = heartbeats.load(Ordering::SeqCst);
+        eventually("heartbeats answered again", || {
+            heartbeats.load(Ordering::SeqCst) > before + 1
+        })
+        .await;
+        assert_eq!(setups.load(Ordering::SeqCst), 1, "no new Association Setup");
+        assert_eq!(node.associated_peer_count(), 1);
+        let _ = stop.send(true);
+    }
+
+    /// #1010 review: a pre-#995 SGW-U reports its Recovery Time Stamp in Unix
+    /// seconds. Normalised as the stored stamp is, it compares equal on every
+    /// heartbeat: the association does not flap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_unix_seconds_recovery_time_stamp_is_not_a_restart() {
+        let guard = process_state_test_guard().await;
+        let sgwu = assoc_sgwu(Vec::new()).await;
+        let unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as u32
+            - 3600;
+        sgwu.rts.store(unix, Ordering::SeqCst);
+        let (node, stop) = maintained_node(
+            &guard,
+            sgwu.addr,
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(20),
+        )
+        .await;
+        let heartbeats = sgwu.heartbeats.clone();
+        eventually("five heartbeats", || heartbeats.load(Ordering::SeqCst) >= 5).await;
+        assert_eq!(sgwu.setups.load(Ordering::SeqCst), 1, "no re-Setup");
+        assert_eq!(
+            node.peers().await[0].recovery_time_stamp,
+            Some(nextgcore_pfcp::recovery_time::from_unix_secs(u64::from(
+                unix
+            ))),
+            "kept in the NTP reading"
+        );
+        let _ = stop.send(true);
+    }
+
+    /// #1010 review, TS 23.007: a restarted SGW-U (a newer Recovery Time Stamp)
+    /// is associated again and every established PFCP session is established on
+    /// it again, with the SGW-C's own CP F-SEID. A session still being set up is
+    /// left to its own procedure, and an older stamp (a reordered message) is
+    /// not a restart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restarted_sgwu_gets_its_sessions_back() {
+        let guard = process_state_test_guard().await;
+        let ctx = sgwc_self();
+        let ue = ctx
+            .ue_add(&[0x21, 0x43, 0x65, 0x87, 0x09, 0x10, 0xf0])
+            .unwrap();
+        let mut established = ctx.sess_add(ue.id, "internet").unwrap();
+        established.sgwu_sxa_seid = 0x5555_0001;
+        ctx.sess_update(&established);
+        let pending = ctx.sess_add(ue.id, "ims").unwrap();
+        assert_eq!(pending.sgwu_sxa_seid, 0);
+
+        let sgwu = assoc_sgwu(Vec::new()).await;
+        let sock = sgwu.sock.clone();
+        // Session messages go to the configured SGW-U.
+        std::env::set_var("SGWC_SGWU_ADDR", sgwu.addr.to_string());
+        let (node, stop) = maintained_node(
+            &guard,
+            sgwu.addr,
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+        let setups = sgwu.setups.clone();
+        eventually("the association", || setups.load(Ordering::SeqCst) >= 1).await;
+        eventually("associated", || node.associated_peer_count() == 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // An older stamp in the SGW-U's own Heartbeat Request: not a restart.
+        let hb = |rts: u32| {
+            let mut body = BytesMut::new();
+            HeartbeatRequest::new(rts).encode(&mut body);
+            let mut out = BytesMut::new();
+            let mut h = PfcpHeader::new(PfcpMessageType::HeartbeatRequest, 0x99);
+            h.length = (4 + body.len()) as u16;
+            h.encode(&mut out);
+            out.extend_from_slice(&body);
+            out
+        };
+        sock.send_to(&hb(50), node.local_addr()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            setups.load(Ordering::SeqCst),
+            1,
+            "an older stamp is no restart"
+        );
+
+        // The restart; the stand-in now records the requests it ignores.
+        sgwu.rts.store(400, Ordering::SeqCst);
+        sock.send_to(&hb(400), node.local_addr()).await.unwrap();
+        eventually("the Setup after the restart", || {
+            setups.load(Ordering::SeqCst) >= 2
+        })
+        .await;
+        let establishments = sgwu.establishments.clone();
+        let seid = established.sgwc_sxa_seid;
+        eventually("the restored session", || {
+            establishments
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, s)| *s == seid)
+        })
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // (The context is process-wide: other tests' sessions may be restored too.)
+        let sent = establishments.lock().unwrap().clone();
+        let mut requests: Vec<u32> = sent
+            .iter()
+            .filter(|(_, s)| *s == seid)
+            .map(|(q, _)| *q)
+            .collect();
+        requests.dedup();
+        assert_eq!(requests.len(), 1, "restored once, with its own CP F-SEID");
+        assert!(
+            !sent.iter().any(|(_, s)| *s == pending.sgwc_sxa_seid),
+            "a session still being set up is left to its procedure"
+        );
+        // #1010 review: the stand-in never answers the restoration: after T1 x
+        // (N1 + 1) it is counted (and logged) as failed.
+        let failed0 = RESTORATIONS_FAILED.load(Ordering::Relaxed);
+        eventually("the unanswered restoration counted", || {
+            RESTORATIONS_FAILED.load(Ordering::Relaxed) > failed0
+        })
+        .await;
+        let _ = stop.send(true);
+        std::env::remove_var("SGWC_SGWU_ADDR");
+        ctx.ue_remove(ue.id);
+    }
+
+    /// #1001, TS 29.244 §6.2.6.1: no PFCP session message goes before the association
+    /// is set up; with the transport running but unassociated the send is an error that
+    /// says so, and once associated it goes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_session_message_before_the_association() {
+        let _guard = process_state_test_guard().await;
+        let sgwu = assoc_sgwu(Vec::new()).await;
+        std::env::set_var("SGWC_SGWU_ADDR", sgwu.addr.to_string());
+        let node = SxaNode::open("127.0.0.1:0".parse().unwrap(), Ipv4Addr::LOCALHOST)
+            .await
+            .unwrap();
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(node.clone().run(rx));
+        let sess = SgwcSess {
+            id: 1,
+            sgwc_sxa_seid: 0x1000,
+            sgwu_sxa_seid: 0x2000,
+            ..Default::default()
+        };
+        let mut err = String::new();
+        for _ in 0..200 {
+            match send_session_deletion_request(&sess, 0, None, S11Continuation::None) {
+                Err(e) if e.contains("not running") => {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await
+                }
+                Err(e) => {
+                    err = e;
+                    break;
+                }
+                Ok(()) => panic!("sent with no association"),
+            }
+        }
+        assert!(err.contains("no PFCP association"), "got {err:?}");
+        node.associate(sgwu.addr).await.unwrap();
+        assert!(send_session_deletion_request(&sess, 0, None, S11Continuation::None).is_ok());
+        std::env::remove_var("SGWC_SGWU_ADDR");
+        let _ = stop.send(true);
+    }
+
+    /// The SGW-C's node, running, with the association kept by `maintain_association`.
+    async fn maintained_node(
+        _ambient: &ProcessStateGuard,
+        peer: SocketAddr,
+        retry: std::time::Duration,
+        heartbeat: std::time::Duration,
+    ) -> (Arc<SxaNode>, tokio::sync::watch::Sender<bool>) {
+        let node = SxaNode::open("127.0.0.1:0".parse().unwrap(), Ipv4Addr::LOCALHOST)
+            .await
+            .unwrap();
+        // A heartbeat loss is T1 x (N1 + 1): 300 ms rather than 9 s.
+        node.set_t1_for_test(std::time::Duration::from_millis(100));
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(node.clone().run(rx.clone()));
+        tokio::spawn(
+            node.clone()
+                .maintain_association(peer, retry, heartbeat, rx),
+        );
+        (node, tx)
+    }
+
+    async fn eventually(what: &str, mut cond: impl FnMut() -> bool) {
+        for _ in 0..300 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// #1001 acceptance: an SGW-C whose first Association Setup is refused (an SGW-U
+    /// whose allowlist has not resolved it yet) associates on the next retry, with no
+    /// session request to prompt it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_association_setup_is_retried_on_the_timer() {
+        let guard = process_state_test_guard().await;
+        let sgwu = assoc_sgwu(vec![true]).await;
+        let (node, stop) = maintained_node(
+            &guard,
+            sgwu.addr,
+            std::time::Duration::from_millis(200),
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+        let setups = sgwu.setups.clone();
+        eventually("the first Setup", || setups.load(Ordering::SeqCst) >= 1).await;
+        assert!(!node.is_associated_with(sgwu.addr).await, "refused");
+        assert_eq!(node.associated_peer_count(), 0);
+        let mut associated = false;
+        for _ in 0..300 {
+            if node.is_associated_with(sgwu.addr).await {
+                associated = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(associated, "associated on the retry");
+        assert_eq!(sgwu.setups.load(Ordering::SeqCst), 2);
+        assert_eq!(node.associated_peer_count(), 1);
+        let _ = stop.send(true);
+    }
+
+    /// #1001: an associated SGW-U is heartbeated, and one that restarted (a new
+    /// Recovery Time Stamp, TS 23.007 §19A) has lost the association: it is set up
+    /// again. A restart its own Heartbeat Request reports is noticed the same way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restarted_sgwu_is_associated_again() {
+        let guard = process_state_test_guard().await;
+        let sgwu = assoc_sgwu(Vec::new()).await;
+        let (node, stop) = maintained_node(
+            &guard,
+            sgwu.addr,
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        let (setups, heartbeats) = (sgwu.setups.clone(), sgwu.heartbeats.clone());
+        eventually("a heartbeat on the association", || {
+            heartbeats.load(Ordering::SeqCst) >= 1
+        })
+        .await;
+        assert_eq!(setups.load(Ordering::SeqCst), 1, "same peer: no new Setup");
+
+        // Restart seen by our heartbeat.
+        sgwu.rts.store(200, Ordering::SeqCst);
+        eventually("the Setup after the restart", || {
+            setups.load(Ordering::SeqCst) >= 2
+        })
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let peer = node.peers().await;
+        assert_eq!(peer.len(), 1);
+        assert_eq!(peer[0].state, PfcpNodeState::Associated);
+        assert_eq!(peer[0].recovery_time_stamp, Some(200));
+
+        // Restart reported by the SGW-U's own Heartbeat Request (our heartbeats
+        // still see 200, so only the inbound report can trigger this Setup).
+        let mut body = BytesMut::new();
+        HeartbeatRequest::new(300).encode(&mut body);
+        let mut out = BytesMut::new();
+        let mut h = PfcpHeader::new(PfcpMessageType::HeartbeatRequest, 0x77);
+        h.length = (4 + body.len()) as u16;
+        h.encode(&mut out);
+        out.extend_from_slice(&body);
+        let before = setups.load(Ordering::SeqCst);
+        sgwu.sock.send_to(&out, node.local_addr()).await.unwrap();
+        eventually("the Setup after the reported restart", || {
+            setups.load(Ordering::SeqCst) > before
+        })
+        .await;
+        let _ = stop.send(true);
+    }
+
+    /// A Node Report Request with a failure and/or recovery report for the peers.
+    fn node_report(seq: u32, failed: &[[u8; 4]], recovered: &[[u8; 4]]) -> Vec<u8> {
+        use nextgcore_pfcp::types::{NodeReportType, RemoteGtpUPeer, UserPlanePathFailureReport};
+        let report = |ips: &[[u8; 4]]| {
+            (!ips.is_empty()).then(|| UserPlanePathFailureReport {
+                remote_gtpu_peers: ips
+                    .iter()
+                    .map(|ip| RemoteGtpUPeer {
+                        ipv4: Some(*ip),
+                        ipv6: None,
+                    })
+                    .collect(),
+            })
+        };
+        node_report_pdu(
+            seq,
+            NodeReportRequest {
+                node_id: NodeId::new_ipv4([127, 0, 0, 9]),
+                node_report_type: NodeReportType {
+                    upfr: !failed.is_empty(),
+                    uprr: !recovered.is_empty(),
+                    ..Default::default()
+                },
+                user_plane_path_failure_report: report(failed),
+                user_plane_path_recovery_report: report(recovered),
+            },
+        )
+    }
+
+    fn node_report_pdu(seq: u32, req: NodeReportRequest) -> Vec<u8> {
+        let mut body = BytesMut::new();
+        req.encode(&mut body);
+        let mut out = BytesMut::new();
+        let mut h = PfcpHeader::new(PfcpMessageType::NodeReportRequest, seq);
+        h.length = (4 + body.len()) as u16;
+        h.encode(&mut out);
+        out.extend_from_slice(&body);
+        out.to_vec()
+    }
+
+    /// A UE with one bearer whose downlink S1-U endpoint is `enb`.
+    fn ue_toward(imsi: &[u8], enb: [u8; 4]) -> (u64, u64) {
+        let ctx = sgwc_self();
+        let ue = ctx.ue_add(imsi).expect("ue");
+        let sess = ctx.sess_add(ue.id, "internet").expect("sess");
+        let mut bearer = ctx.bearer_add(sess.id).expect("bearer");
+        bearer.ebi = 5;
+        ctx.bearer_update(&bearer);
+        let mut dl = ctx.dl_tunnel_in_bearer(bearer.id).expect("dl tunnel");
+        dl.far_id = Some(0x0994);
+        dl.remote_teid = 0x9940;
+        dl.remote_ip.ipv4 = Some(Ipv4Addr::from(enb));
+        ctx.tunnel_update(&dl);
+        (ue.id, bearer.id)
+    }
+
+    /// The SGW-C's node, running and associated with `sgwu` (no maintenance task).
+    async fn associated_node(
+        _ambient: &ProcessStateGuard,
+        sgwu: &AssocSgwu,
+    ) -> (Arc<SxaNode>, tokio::sync::watch::Sender<bool>) {
+        std::env::set_var("SGWC_SGWU_ADDR", sgwu.addr.to_string());
+        let node = SxaNode::open("127.0.0.1:0".parse().unwrap(), Ipv4Addr::LOCALHOST)
+            .await
+            .unwrap();
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(node.clone().run(rx));
+        node.associate(sgwu.addr).await.unwrap();
+        // `run` installs the outbound queue in its own body.
+        for _ in 0..200 {
+            if outbound().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        (node, stop)
+    }
+
+    fn response_cause(body: &[u8]) -> (PfcpCause, Option<u16>) {
+        let rsp = NodeReportResponse::decode(&mut Bytes::copy_from_slice(body)).unwrap();
+        (rsp.cause, rsp.offending_ie)
+    }
+
+    /// #994, TS 29.244 §7.4.5 / TS 23.007 §20.3.4: a User Plane Path Failure Report
+    /// from the associated SGW-U is answered Request accepted (its sequence number
+    /// echoed). The UE whose downlink S1-U endpoint is the failed eNodeB has its S1-U
+    /// bearers released with Release Access Bearers semantics: the endpoint is
+    /// forgotten, and its downlink FAR goes to BUFF + NOCP at the SGW-U, so downlink
+    /// data is buffered and notified (DDN, paging). A UE on another eNodeB is left
+    /// alone. A repeated report changes nothing, and the Recovery Report clears the
+    /// peer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_path_failure_report_releases_the_s1u_bearers_toward_that_enb() {
+        let guard = process_state_test_guard().await;
+        crate::up_path::clear_for_test();
+        let sgwu = assoc_sgwu(Vec::new()).await;
+        let (node, stop) = associated_node(&guard, &sgwu).await;
+        let (ue_a, bearer_a) = ue_toward(b"001010994000001", [10, 0, 0, 50]);
+        let (ue_b, bearer_b) = ue_toward(b"001010994000002", [10, 0, 0, 51]);
+        let ctx = sgwc_self();
+        let failures0 = crate::up_path::FAILURES_TOTAL.load(Ordering::Relaxed);
+        let to = node.local_addr();
+
+        sgwu.sock
+            .send_to(&node_report(0x99_0001, &[[10, 0, 0, 50]], &[]), to)
+            .await
+            .unwrap();
+        let responses = sgwu.node_report_responses.clone();
+        eventually("the Node Report Response", || {
+            !responses.lock().unwrap().is_empty()
+        })
+        .await;
+        let (seq, body) = responses.lock().unwrap()[0].clone();
+        assert_eq!(seq, 0x99_0001, "the sequence number is echoed");
+        assert_eq!(response_cause(&body).0, PfcpCause::RequestAccepted);
+
+        let mods = sgwu.modifications.clone();
+        eventually("the deactivation", || !mods.lock().unwrap().is_empty()).await;
+        let req = nextgcore_pfcp::message::SessionModificationRequest::decode(
+            &mut Bytes::copy_from_slice(&mods.lock().unwrap()[0]),
+        )
+        .unwrap();
+        let far = req
+            .update_fars
+            .iter()
+            .find(|f| f.far_id == 0x0994)
+            .expect("the downlink FAR is updated");
+        let aa = far.apply_action.expect("with an Apply Action");
+        assert!(aa.buff && aa.nocp && !aa.forw, "BUFF + NOCP: {aa:?}");
+        let dl_a = ctx.dl_tunnel_in_bearer(bearer_a).unwrap();
+        assert_eq!((dl_a.remote_teid, dl_a.remote_ip.ipv4), (0, None));
+        let dl_b = ctx.dl_tunnel_in_bearer(bearer_b).unwrap();
+        assert_eq!(
+            dl_b.remote_ip.ipv4,
+            Some(Ipv4Addr::new(10, 0, 0, 51)),
+            "the UE on another eNodeB is untouched"
+        );
+        assert_eq!(mods.lock().unwrap().len(), 1, "one session modified");
+        assert!(crate::up_path::is_failed("10.0.0.50".parse().unwrap()));
+        assert_eq!(
+            crate::up_path::FAILURES_TOTAL.load(Ordering::Relaxed),
+            failures0 + 1
+        );
+
+        // Repeated: answered, no second count.
+        sgwu.sock
+            .send_to(&node_report(0x99_0002, &[[10, 0, 0, 50]], &[]), to)
+            .await
+            .unwrap();
+        eventually("the second response", || {
+            responses.lock().unwrap().len() >= 2
+        })
+        .await;
+        assert_eq!(
+            crate::up_path::FAILURES_TOTAL.load(Ordering::Relaxed),
+            failures0 + 1
+        );
+
+        // Recovered.
+        sgwu.sock
+            .send_to(&node_report(0x99_0003, &[], &[[10, 0, 0, 50]]), to)
+            .await
+            .unwrap();
+        eventually("the third response", || {
+            responses.lock().unwrap().len() >= 3
+        })
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!crate::up_path::is_failed("10.0.0.50".parse().unwrap()));
+        assert!(crate::main_render_metrics_for_test().contains("sgwc_up_paths_failed 0"));
+        ctx.ue_remove(ue_a);
+        ctx.ue_remove(ue_b);
+        std::env::remove_var("SGWC_SGWU_ADDR");
+        let _ = stop.send(true);
+    }
+
+    /// #994: a Node Report from anyone but the associated SGW-U is refused with cause
+    /// 72 (TS 29.244 §6.2.6.1) and not acted on; one announcing a failure report it
+    /// does not carry is refused with 67 Conditional IE missing and the Offending IE.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_report_from_a_stranger_or_without_its_report_is_refused() {
+        let guard = process_state_test_guard().await;
+        crate::up_path::clear_for_test();
+        let sgwu = assoc_sgwu(Vec::new()).await;
+        let (node, stop) = associated_node(&guard, &sgwu).await;
+        let (ue, bearer) = ue_toward(b"001010994000003", [10, 0, 0, 52]);
+        let ctx = sgwc_self();
+
+        let stranger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        stranger
+            .send_to(&node_report(7, &[[10, 0, 0, 52]], &[]), node.local_addr())
+            .await
+            .unwrap();
+        let mut buf = [0u8; 512];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stranger.recv_from(&mut buf),
+        )
+        .await
+        .expect("answered")
+        .unwrap();
+        let mut cursor = Bytes::copy_from_slice(&buf[..len]);
+        let header = PfcpHeader::decode(&mut cursor).unwrap();
+        assert_eq!(
+            header.message_type as u8,
+            pfcp_msg_type::NODE_REPORT_RESPONSE
+        );
+        assert_eq!(header.sequence_number, 7);
+        assert_eq!(
+            response_cause(&cursor).0,
+            PfcpCause::NoEstablishedPfcpAssociation
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!crate::up_path::is_failed("10.0.0.52".parse().unwrap()));
+        assert_eq!(
+            ctx.dl_tunnel_in_bearer(bearer).unwrap().remote_teid,
+            0x9940,
+            "not released"
+        );
+
+        // UPFR set, report absent.
+        let pkt = node_report_pdu(
+            8,
+            NodeReportRequest {
+                node_id: NodeId::new_ipv4([127, 0, 0, 9]),
+                node_report_type: nextgcore_pfcp::types::NodeReportType {
+                    upfr: true,
+                    ..Default::default()
+                },
+                user_plane_path_failure_report: None,
+                user_plane_path_recovery_report: None,
+            },
+        );
+        sgwu.sock.send_to(&pkt, node.local_addr()).await.unwrap();
+        let responses = sgwu.node_report_responses.clone();
+        eventually("the response", || !responses.lock().unwrap().is_empty()).await;
+        let (seq, body) = responses.lock().unwrap()[0].clone();
+        assert_eq!(seq, 8);
+        assert_eq!(
+            response_cause(&body),
+            (
+                PfcpCause::ConditionalIeMissing,
+                Some(nextgcore_pfcp::ie::IeType::UserPlanePathFailureReport as u16)
+            )
+        );
+        assert!(!crate::up_path::is_failed("10.0.0.52".parse().unwrap()));
+        ctx.ue_remove(ue);
+        std::env::remove_var("SGWC_SGWU_ADDR");
+        let _ = stop.send(true);
+    }
+
+    /// #994, TS 23.007 §20.3.1: a path still down when the maximum path failure
+    /// duration expires has its record dropped, and a bearer a later Modify Bearer
+    /// pointed at it again is released then. A recovery inside the hold voids it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_hold_expires_only_for_a_path_still_down() {
+        let guard = process_state_test_guard().await;
+        crate::up_path::clear_for_test();
+        std::env::set_var("SGWC_UP_PATH_FAILURE_HOLD_SECS", "1");
+        let sgwu = assoc_sgwu(Vec::new()).await;
+        let (node, stop) = associated_node(&guard, &sgwu).await;
+        let (ue, bearer) = ue_toward(b"001010994000004", [10, 0, 0, 53]);
+        let ctx = sgwc_self();
+        let expired0 = crate::up_path::HOLDS_EXPIRED_TOTAL.load(Ordering::Relaxed);
+        let mods = sgwu.modifications.clone();
+        let to = node.local_addr();
+
+        sgwu.sock
+            .send_to(&node_report(1, &[[10, 0, 0, 53], [10, 0, 0, 54]], &[]), to)
+            .await
+            .unwrap();
+        eventually("the release", || mods.lock().unwrap().len() == 1).await;
+        // 10.0.0.54 recovers inside the hold.
+        sgwu.sock
+            .send_to(&node_report(2, &[], &[[10, 0, 0, 54]]), to)
+            .await
+            .unwrap();
+        // A Modify Bearer points the UE at the failed eNodeB again.
+        let mut dl = ctx.dl_tunnel_in_bearer(bearer).unwrap();
+        dl.remote_teid = 0x9941;
+        dl.remote_ip.ipv4 = Some(Ipv4Addr::new(10, 0, 0, 53));
+        ctx.tunnel_update(&dl);
+        assert!(crate::up_path::is_failed("10.0.0.53".parse().unwrap()));
+
+        let mut released_again = false;
+        for _ in 0..300 {
+            if mods.lock().unwrap().len() >= 2 {
+                released_again = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(released_again, "released again at the hold's expiry");
+        assert_eq!(ctx.dl_tunnel_in_bearer(bearer).unwrap().remote_teid, 0);
+        assert!(
+            !crate::up_path::is_failed("10.0.0.53".parse().unwrap()),
+            "dropped"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            crate::up_path::HOLDS_EXPIRED_TOTAL.load(Ordering::Relaxed),
+            expired0 + 1,
+            "only the path still down expired"
+        );
+        ctx.ue_remove(ue);
+        std::env::remove_var("SGWC_UP_PATH_FAILURE_HOLD_SECS");
+        std::env::remove_var("SGWC_SGWU_ADDR");
+        let _ = stop.send(true);
+    }
+
+    /// #1014 review: a Modify Bearer that points a bearer at an eNodeB whose user
+    /// plane path is failed is answered, and the UE's S1-U bearers are released at
+    /// once (downlink buffered for a DDN), not black-holed until the hold expires.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_modify_bearer_toward_a_failed_enb_is_released_at_once() {
+        let guard = process_state_test_guard().await;
+        crate::up_path::clear_for_test();
+        let sgwu = assoc_sgwu(Vec::new()).await;
+        let (node, stop) = associated_node(&guard, &sgwu).await;
+        let (ue, bearer) = ue_toward(b"001010994000005", [10, 0, 0, 60]);
+        let ctx = sgwc_self();
+        let mods = sgwu.modifications.clone();
+        // 10.0.0.61 fails; the UE is on 10.0.0.60, so nothing is released yet.
+        sgwu.sock
+            .send_to(&node_report(1, &[[10, 0, 0, 61]], &[]), node.local_addr())
+            .await
+            .unwrap();
+        eventually("the failure", || {
+            crate::up_path::is_failed("10.0.0.61".parse().unwrap())
+        })
+        .await;
+        assert!(mods.lock().unwrap().is_empty());
+
+        // The MME moves the UE's downlink to the failed eNodeB.
+        let mut dl = ctx.dl_tunnel_in_bearer(bearer).unwrap();
+        dl.remote_teid = 0x9961;
+        dl.remote_ip.ipv4 = Some(Ipv4Addr::new(10, 0, 0, 61));
+        ctx.tunnel_update(&dl);
+        crate::sxa_response::answer_modify_bearer(
+            &crate::sxa_response::PendingModifyBearer {
+                peer: "127.0.0.1:2123".parse().unwrap(),
+                seq: 1,
+                mme_teid: 1,
+                waiting: Default::default(),
+                modified: vec![(bearer, 5)],
+                marked_for_removal: Vec::new(),
+            },
+            None,
+        );
+        assert_eq!(
+            ctx.dl_tunnel_in_bearer(bearer).unwrap().remote_teid,
+            0,
+            "released at once"
+        );
+        eventually("the BUFF + NOCP modification", || {
+            mods.lock().unwrap().len() == 1
+        })
+        .await;
+        ctx.ue_remove(ue);
+        std::env::remove_var("SGWC_SGWU_ADDR");
+        let _ = stop.send(true);
+    }
+
+    /// #1014 review: the release finds the UEs toward an eNodeB through the
+    /// downlink-peer index, which follows every tunnel update and removal.
+    #[test]
+    fn the_downlink_peer_index_follows_the_tunnels() {
+        let ctx = sgwc_self();
+        let (ue, bearer) = ue_toward(b"001010994000006", [10, 0, 0, 70]);
+        let a: std::net::IpAddr = "10.0.0.70".parse().unwrap();
+        let b: std::net::IpAddr = "10.0.0.71".parse().unwrap();
+        assert_eq!(ctx.ue_ids_with_downlink_toward(a), vec![ue]);
+        let mut dl = ctx.dl_tunnel_in_bearer(bearer).unwrap();
+        dl.remote_ip.ipv4 = Some(Ipv4Addr::new(10, 0, 0, 71));
+        ctx.tunnel_update(&dl);
+        assert!(ctx.ue_ids_with_downlink_toward(a).is_empty(), "moved");
+        assert_eq!(ctx.ue_ids_with_downlink_toward(b), vec![ue]);
+        dl.remote_teid = 0;
+        ctx.tunnel_update(&dl);
+        assert!(
+            ctx.ue_ids_with_downlink_toward(b).is_empty(),
+            "an S1-U released forwards nowhere"
+        );
+        dl.remote_teid = 0x9971;
+        ctx.tunnel_update(&dl);
+        assert_eq!(ctx.ue_ids_with_downlink_toward(b), vec![ue]);
+        ctx.ue_remove(ue);
+        assert!(ctx.ue_ids_with_downlink_toward(b).is_empty(), "removed");
+    }
+
+    /// #1010 review, TS 29.244 §6.2.6.2.1: the SGW-U may set the association up
+    /// itself. The configured SGW-U's Association Setup Request is answered
+    /// Request accepted with this node's Node ID and Recovery Time Stamp, and the
+    /// association is recorded; anyone else's is refused (Request rejected).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_sgwu_initiated_association_setup_is_answered() {
+        let _guard = process_state_test_guard().await;
+        let up = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up.local_addr().unwrap();
+        std::env::set_var("SGWC_SGWU_ADDR", up_addr.to_string());
+        let node = SxaNode::open("127.0.0.1:0".parse().unwrap(), Ipv4Addr::LOCALHOST)
+            .await
+            .unwrap();
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(node.clone().run(rx));
+        let setup = |seq: u32| {
+            let mut body = BytesMut::new();
+            AssociationSetupRequest::new(
+                NodeId::new_ipv4([127, 0, 0, 9]),
+                nextgcore_pfcp::recovery_time::now(),
+            )
+            .encode(&mut body);
+            let mut out = BytesMut::new();
+            let mut h = PfcpHeader::new(PfcpMessageType::AssociationSetupRequest, seq);
+            h.length = (4 + body.len()) as u16;
+            h.encode(&mut out);
+            out.extend_from_slice(&body);
+            out
+        };
+        async fn answer(sock: &UdpSocket) -> (PfcpHeader, AssociationSetupResponse) {
+            let mut buf = [0u8; 512];
+            let (len, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), sock.recv_from(&mut buf))
+                    .await
+                    .expect("answered")
+                    .unwrap();
+            let mut cursor = Bytes::copy_from_slice(&buf[..len]);
+            let header = PfcpHeader::decode(&mut cursor).unwrap();
+            let rsp = AssociationSetupResponse::decode(&mut cursor).unwrap();
+            (header, rsp)
+        }
+
+        up.send_to(&setup(0x51), node.local_addr()).await.unwrap();
+        let (header, rsp) = answer(&up).await;
+        assert_eq!(
+            header.message_type as u8,
+            pfcp_msg_type::ASSOCIATION_SETUP_RESPONSE
+        );
+        assert_eq!(header.sequence_number, 0x51);
+        assert_eq!(rsp.cause, PfcpCause::RequestAccepted);
+        assert_eq!(rsp.recovery_time_stamp, node.recovery_time_stamp);
+        assert!(node.is_associated_with(up_addr).await, "recorded");
+        assert_eq!(node.associated_peer_count(), 1);
+
+        let stranger = UdpSocket::bind("127.0.0.2:0").await;
+        if let Ok(stranger) = stranger {
+            stranger
+                .send_to(&setup(0x52), node.local_addr())
+                .await
+                .unwrap();
+            let (_, rsp) = answer(&stranger).await;
+            assert_eq!(rsp.cause, PfcpCause::RequestRejected, "not the SGW-U");
+            assert_eq!(node.associated_peer_count(), 1);
+        }
+        std::env::remove_var("SGWC_SGWU_ADDR");
+        let _ = stop.send(true);
+    }
+
+    /// #1014 / #1028 review, TS 29.244 §7.4.5.1 and §8.2.70 (Figure 8.2.70-1):
+    /// a Node Report Request built byte by byte as an SGW-U sends it, not
+    /// through the library's encoder. The Remote GTP-U Peer flags octet carries
+    /// V4 as bit 2 (0x02), then the IPv4 address. The SGW-C reads 10.0.0.80 as
+    /// the failed peer and releases the S1-U bearers toward it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_report_in_spec_bytes_releases_the_s1u_toward_its_ipv4_peer() {
+        let guard = process_state_test_guard().await;
+        crate::up_path::clear_for_test();
+        let sgwu = assoc_sgwu(Vec::new()).await;
+        let (node, stop) = associated_node(&guard, &sgwu).await;
+        let (ue, bearer) = ue_toward(b"001010994000080", [10, 0, 0, 80]);
+        let body: Vec<u8> = vec![
+            0x00, 0x3c, 0x00, 0x05, 0x00, 127, 0, 0, 9, // Node ID (60): IPv4 127.0.0.9
+            0x00, 0x65, 0x00, 0x01, 0x01, // Node Report Type (101): UPFR
+            0x00, 0x66, 0x00, 0x09, // User Plane Path Failure Report (102), grouped:
+            0x00, 0x67, 0x00, 0x05, 0x02, 10, 0, 0, 80, // Remote GTP-U Peer (103): V4
+        ];
+        let mut pdu = vec![0x20, 0x0c]; // version 1, no SEID; Node Report Request (12)
+        pdu.extend_from_slice(&((body.len() + 4) as u16).to_be_bytes());
+        pdu.extend_from_slice(&[0x00, 0x10, 0x14, 0x00]); // sequence 0x001014, spare
+        pdu.extend_from_slice(&body);
+        sgwu.sock.send_to(&pdu, node.local_addr()).await.unwrap();
+
+        let responses = sgwu.node_report_responses.clone();
+        eventually("the Node Report Response", || {
+            !responses.lock().unwrap().is_empty()
+        })
+        .await;
+        let (seq, rsp) = responses.lock().unwrap()[0].clone();
+        assert_eq!(seq, 0x00_1014);
+        assert_eq!(response_cause(&rsp).0, PfcpCause::RequestAccepted);
+        eventually("the IPv4 peer recorded failed", || {
+            crate::up_path::is_failed("10.0.0.80".parse().unwrap())
+        })
+        .await;
+        let mods = sgwu.modifications.clone();
+        eventually("the S1-U release", || !mods.lock().unwrap().is_empty()).await;
+        assert_eq!(
+            sgwc_self().dl_tunnel_in_bearer(bearer).unwrap().remote_teid,
+            0
+        );
+        sgwc_self().ue_remove(ue);
+        std::env::remove_var("SGWC_SGWU_ADDR");
+        let _ = stop.send(true);
     }
 }
