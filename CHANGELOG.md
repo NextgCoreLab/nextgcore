@@ -12,7 +12,14 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Changed
+- amfd refuses to start on a `plmn_support` entry with no usable S-NSSAI, meaning none
+  configured or every one `sst: 0`. It used to start an AMF that failed every NG Setup, because
+  the NG Setup Response's Slice Support List must hold at least one slice (TS 38.413 §9.3.1.17).
+  The error names the file and the PLMN as MCC/MNC. This is the one exception to lenient config
+  loading (#1060, #1070).
+- amfd: a `guami`, `tai`, `plmn_support`, `integrity_order` or `ciphering_order` list in the
+  config replaces the AMF's list instead of being appended to it (#1070).
 
 ## [0.2.0] — Unreleased (draft for operator review)
 
@@ -118,6 +125,8 @@ before the tag. The validation line is filled from the release run, not carried 
   event fire points (#398, #402, #407, #410), UDM dereg-notify handling (#605, #626), AM policy
   termination on every deregistration (#640), one UE id space (#644), several lock-order and
   deadlock fixes (#604, #638, #646, #647).
+- amfd **refuses to start** on a `plmn_support` entry with no usable S-NSSAI (none, or only
+  `sst: 0`; TS 38.413 §9.3.1.17). Check configs before upgrading (#1060, #1070).
 - smfd: UE-initiated 5GSM procedures (#224), SM context registration/404s/N2 handover/DDN paging
   (#283), UDM interaction and event exposure (#292, #298), durable PFCP/binding/IP-pool store
   (#279), URR quotas over N4 (#376), dual connectivity and Notify-released sessions (#633), UPF
