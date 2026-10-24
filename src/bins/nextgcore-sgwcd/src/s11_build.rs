@@ -1079,7 +1079,7 @@ mod tests {
         let msg = build_downlink_data_notification(
             &bearer,
             7,
-            Some(gtp_cause::ERROR_INDICATION_FROM_RNC_ENODEB),
+            Some(gtp_cause::ERROR_INDICATION_RECEIVED),
         )
         .unwrap();
         let decoded = round_trip(&msg);
