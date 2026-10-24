@@ -217,6 +217,8 @@ async fn main() -> Result<()> {
 
     // Initialize logging
     init_logging(&args)?;
+    // #1004 review: an unset clock makes a wrong PFCP Recovery Time Stamp.
+    nextgcore_pfcp::recovery_time::check_local_clock().map_err(|e| anyhow::anyhow!(e))?;
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = nextgcore_metrics::otel::init_otel(
         nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
