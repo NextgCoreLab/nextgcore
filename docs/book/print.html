@@ -3484,7 +3484,7 @@ sepp:
 <p><strong>Honesty note:</strong> the nightly <code>Docker E2E (EPC)</code> job attaches a real LTE UE through nextgsim’s eNB to this MME and pings through the default bearer with 0% loss (<code>docker/rust/epc-attach-check.sh</code>). Dedicated bearers, handover, idle mode/paging and IPv6 PDN are not asserted there. This is the project’s own matched-simulator validation, not third-party certification.</p>
 </blockquote>
 <h2 id="example-configuration-17"><a class="header" href="#example-configuration-17">Example configuration</a></h2>
-<p>From <code>nextgcore/docker/rust/configs/epc/mme.yaml</code> (mounted by <code>docker-compose-epc.yml</code>, which runs the daemon as <code>-c /etc/nextgcore/mme.yaml</code> at <code>172.24.0.5</code> and publishes <code>36412/sctp</code>; abridged, the shipped file also carries a commented-out <code>overload:</code> block):</p>
+<p>From <code>nextgcore/docker/rust/configs/epc/mme.yaml</code> (mounted by <code>docker-compose-epc.yml</code>, which runs the daemon as <code>-c /etc/nextgcore/mme.yaml</code> at <code>172.24.0.5</code> and publishes <code>36412/sctp</code> on <code>127.0.0.1</code>, or on <code>NEXTGCORE_RAN_PUBLISH_ADDR</code> for an external eNB; abridged, the shipped file also carries a commented-out <code>overload:</code> block):</p>
 <pre><code class="language-yaml"># NextGCore MME Configuration for Docker EPC Deployment
 # Rust implementation
 
