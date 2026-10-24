@@ -451,6 +451,146 @@ pub async fn send_n2_nrppa_transfer(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Non-UE-associated NRPPa (#807; TS 29.518 §5.2.2.4.1.2 and §5.2.2.4.4.2)
+// ---------------------------------------------------------------------------
+
+/// Content-Id of the NRPPa part of a NonUeN2MessageTransfer.
+pub const NON_UE_NRPPA_CONTENT_ID: &str = "nrppa-non-ue";
+
+/// Build a `NonUeN2MessageTransfer` (TS 29.518 §5.2.2.4.1.2) carrying a
+/// non-UE-associated NRPPa PDU to one NG-RAN node:
+/// `POST /namf-comm/v1/non-ue-n2-messages/transfer` with an
+/// `N2InformationTransferReqData` whose `n2Information` is of class NRPPa.
+///
+/// §5.2.2.4.1.2 step 1: the body carries "the NG RAN node identifier(s) to which the
+/// transfer needs to be initiated" (`globalRanNodeList`) and "the NF Instance
+/// Identifier of the NF Service Consumer (e.g. LMF) in "nfId"" (`nrppaInfo.nfId`,
+/// mandatory in `NrppaInformation`). The AMF puts the nfId in the NGAP Routing ID,
+/// which is how the gNB's answer finds this LMF again.
+pub fn build_non_ue_nrppa_transfer_request(
+    node: &crate::site_config::NgRanNode,
+    nf_id: &str,
+    nrppa_pdu: Vec<u8>,
+) -> SbiRequest {
+    let body = serde_json::json!({
+        "globalRanNodeList": [node.global_ran_node_id()],
+        "n2Information": {
+            "n2InformationClass": "NRPPa",
+            "nrppaInfo": {
+                "nfId": nf_id,
+                "nrppaPdu": {
+                    "ngapIeType": "NRPPA_PDU",
+                    "ngapData": { "contentId": NON_UE_NRPPA_CONTENT_ID },
+                },
+            },
+        },
+    });
+    SbiRequest::post("/namf-comm/v1/non-ue-n2-messages/transfer")
+        .with_body(body.to_string(), "application/json")
+        .with_part(SbiPart::with_content(
+            NON_UE_NRPPA_CONTENT_ID,
+            N2_CONTENT_TYPE,
+            Bytes::from(nrppa_pdu),
+        ))
+}
+
+/// POST a NonUeN2MessageTransfer. 200 `N2_INFO_TRANSFER_INITIATED` is
+/// [`TransferOutcome::Initiated`]; `PARTIAL_N2_INFO_TRANSFER` cannot happen for the
+/// single node this sends to, and anything else is a failure.
+pub async fn send_non_ue_nrppa_transfer(
+    amf: &DiscoveredAmf,
+    node: &crate::site_config::NgRanNode,
+    nf_id: &str,
+    nrppa_pdu: Vec<u8>,
+) -> TransferOutcome {
+    let client = client_for(amf);
+    let request = build_non_ue_nrppa_transfer_request(node, nf_id, nrppa_pdu);
+    match client.send_request(request).await {
+        Ok(resp) if resp.status == 200 => {
+            let result = resp
+                .http
+                .content
+                .as_deref()
+                .and_then(|b| serde_json::from_str::<Value>(b).ok())
+                .and_then(|v| v.get("result").and_then(Value::as_str).map(String::from));
+            if result.as_deref() == Some("N2_INFO_TRANSFER_INITIATED") {
+                TransferOutcome::Initiated
+            } else {
+                TransferOutcome::Failed(format!("NonUeN2MessageTransfer result {result:?}"))
+            }
+        }
+        Ok(resp) => {
+            TransferOutcome::Failed(format!("NonUeN2MessageTransfer status {}", resp.status))
+        }
+        Err(e) => TransferOutcome::Failed(format!("NonUeN2MessageTransfer: {e}")),
+    }
+}
+
+/// Build a `NonUeN2InfoSubscribe` (TS 29.518 §5.2.2.4.2) for the NRPPa class, so
+/// the AMF has a notification URI for this LMF's non-UE-associated NRPPa answers
+/// (§5.2.2.4.4.2). The nfId lets the AMF pick this LMF's subscription by the NGAP
+/// Routing ID the answer comes back with.
+pub fn build_non_ue_nrppa_subscription_request(nf_id: &str, callback_base: &str) -> SbiRequest {
+    let base = callback_base.trim_end_matches('/');
+    let body = serde_json::json!({
+        "n2InformationClass": "NRPPa",
+        "n2NotifyCallbackUri": format!("{base}{N2_NOTIFY_PATH}"),
+        "nfId": nf_id,
+    });
+    SbiRequest::post("/namf-comm/v1/non-ue-n2-messages/subscriptions")
+        .with_body(body.to_string(), "application/json")
+}
+
+/// Ensure this LMF has a non-UE NRPPa subscription on `amf`, cached per AMF.
+/// Best-effort: without one the AMF falls back to a UE's N1N2 NRPPa subscription,
+/// whose callback is the same route.
+pub async fn ensure_non_ue_nrppa_subscription(amf: &DiscoveredAmf, nf_id: &str) {
+    let key = format!("{}:{}|non-ue-nrppa", amf.host, amf.port);
+    let (cached, callback_base) = match lmf_self().read() {
+        Ok(c) => (c.amf_subscription_get(&key), c.callback_base()),
+        Err(_) => (None, None),
+    };
+    if cached.is_some() {
+        return;
+    }
+    let Some(base) = callback_base else {
+        log::warn!("Multi-RTT: no callback base configured; no non-UE NRPPa subscription");
+        return;
+    };
+    let client = client_for(amf);
+    match client
+        .send_request(build_non_ue_nrppa_subscription_request(nf_id, &base))
+        .await
+    {
+        Ok(resp) if resp.status == 201 => {
+            let id = resp
+                .http
+                .content
+                .as_deref()
+                .and_then(|b| serde_json::from_str::<Value>(b).ok())
+                .and_then(|v| {
+                    v.get("n2NotifySubscriptionId")
+                        .and_then(Value::as_str)
+                        .map(String::from)
+                });
+            match id {
+                Some(id) => {
+                    log::info!("Multi-RTT: non-UE NRPPa subscription on the AMF: {id}");
+                    if let Ok(c) = lmf_self().read() {
+                        c.amf_subscription_set(key, id);
+                    }
+                }
+                None => {
+                    log::warn!("Multi-RTT: NonUeN2InfoSubscribe 201 without n2NotifySubscriptionId")
+                }
+            }
+        }
+        Ok(resp) => log::warn!("Multi-RTT: NonUeN2InfoSubscribe returned {}", resp.status),
+        Err(e) => log::warn!("Multi-RTT: NonUeN2InfoSubscribe failed: {e}"),
+    }
+}
+
 pub async fn send_n1n2_transfer(
     amf: &DiscoveredAmf,
     ue_context_id: &str,
