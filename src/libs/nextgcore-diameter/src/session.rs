@@ -382,8 +382,10 @@ async fn run_session(
                 // connection is up (`run_session`, not after Tw) and each DWA asks
                 // for the next proof at once
                 // (`a_reopened_connection_returns_to_service_well_within_tw`). A
-                // lost DWA adds one Tw (the grace expiry, NumDWA = -1), and a
-                // slow peer a round trip per watchdog.
+                // late DWA, one arriving within the grace Tw after an expiry
+                // (NumDWA = -1, no new DWR), adds up to one Tw; a lost one closes
+                // the connection at the next expiry, about 2·Tw after the DWR
+                // (RFC 3539 §3.4.1). A slow peer adds a round trip per watchdog.
                 // Base-protocol messages (DWR, DPR) still reach the state
                 // machine, which must answer them.
                 if !watchdog.carries_traffic()
