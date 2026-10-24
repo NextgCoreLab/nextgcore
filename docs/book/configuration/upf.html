@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-df495bb2.js";
+            window.path_to_searchindex_js = "../searchindex-0f4a9f77.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -237,11 +237,12 @@ upf:
 <tbody>
 <tr><td><code>-c, --config</code></td><td>string</td><td><code>/etc/nextgcore/upf.yaml</code></td><td>Configuration file path. Read if present, but contents are not applied (see note above).</td></tr>
 <tr><td><code>-l, --log-file</code></td><td>string</td><td><em>(none)</em></td><td>Log file path.</td></tr>
-<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level: <code>trace</code>, <code>debug</code>, <code>info</code>, <code>warn</code>, <code>error</code>.</td></tr>
+<tr><td><code>-e, --log-level</code></td><td>string</td><td><code>logger.level</code>, else <code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else is <code>info</code>). Without the flag, the config’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code> overrides both (#691).</td></tr>
 <tr><td><code>-m, --no-color</code></td><td>bool</td><td><code>false</code></td><td>Disable colored log output.</td></tr>
 <tr><td><code>-k, --kill</code></td><td>bool</td><td><code>false</code></td><td>Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor.</td></tr>
 <tr><td><code>--pfcp-addr</code></td><td>string</td><td><code>127.0.0.4</code></td><td>N4 PFCP server bind address.</td></tr>
 <tr><td><code>--pfcp-port</code></td><td>u16</td><td><code>8805</code></td><td>N4 PFCP server port.</td></tr>
+<tr><td><code>--pfcp-allowed-peers</code></td><td>list</td><td>empty</td><td>SMF/PGW-C hosts allowed to set up the PFCP association: IPs, CIDR prefixes or host names (re-resolved every 10 s, and at once – at most once a second – when a Setup comes from an unresolved address; a failed lookup keeps the last good addresses), comma-separated; <code>UPF_PFCP_ALLOWED_PEERS</code> when the flag is not given. Only the source IP is compared. A listed host may move a live association only as the same CP function (one of its hosts, or the same Node ID); a different CP function is refused until the association is released or times out. The Node ID is sender-written, so a broad entry (a pod CIDR, <code>0.0.0.0/0</code>) lets any host in range that knows the SMF’s Node ID take the association over: prefer the SMF’s own address or headless Service name. <strong>Fail closed:</strong> empty refuses every Association Setup (logged as an error at startup); <code>0.0.0.0/0</code> / <code>::/0</code> admit any host (labs only). The shipped compose, Helm, k8s and EKS deployments set it. Every PFCP message other than Heartbeat and Association Setup is accepted only from the associated SMF’s hosts (its Setup source, its IPv4/IPv6 Node ID, or the addresses its FQDN Node ID resolves to); refusals count in <code>upf_pfcp_unauthorized_messages_total</code>.</td></tr>
 <tr><td><code>--gtpu-addr</code></td><td>string</td><td><code>127.0.0.4</code></td><td>N3 GTP-U bind address.</td></tr>
 <tr><td><code>--gtpu-port</code></td><td>u16</td><td><code>2152</code></td><td>N3 GTP-U port.</td></tr>
 <tr><td><code>--tun-ifname</code></td><td>string</td><td><code>ogstun</code></td><td>TUN interface name for the user-plane subnet.</td></tr>
@@ -260,11 +261,15 @@ upf:
 <tr><th>Variable</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>UPF_METRICS_PORT</code></td><td><code>9090</code></td><td>Prometheus <code>/metrics</code> port (bound on <code>0.0.0.0</code>), including the TUN-path data-plane counters (#581).</td></tr>
+<tr><td><code>UPF_METRICS_PORT</code></td><td><code>9090</code></td><td>Prometheus <code>/metrics</code> port, including the TUN-path data-plane counters (#581).</td></tr>
+<tr><td><code>NEXTGCORE_METRICS_BIND</code></td><td><code>127.0.0.1</code></td><td>Host the unauthenticated <code>/metrics</code> listener binds to (#837). The compose files and manifests set <code>0.0.0.0</code> inside the private container/pod network.</td></tr>
 <tr><td><code>OTEL_EXPORTER_OTLP_ENDPOINT</code></td><td><code>http://jaeger:4317</code></td><td>OTLP endpoint for OpenTelemetry tracing (initialization is best-effort; failure is ignored).</td></tr>
 </tbody>
 </table>
 </div>
+<blockquote>
+<p><strong>Clock:</strong> this NF refuses to start when the local clock reads before 2020-01-01, because its PFCP Recovery Time Stamp would be wrong. See <a href="overview.html#a-set-clock-is-required-pfcp-nfs">A set clock is required</a> for the remedy on RTC-less hosts.</p>
+</blockquote>
 <h2 id="behavior-notes"><a class="header" href="#behavior-notes">Behavior notes</a></h2>
 <ul>
 <li><strong>PFCP heartbeats:</strong> the UPF also initiates PFCP heartbeats toward the associated CP function every 10 seconds (code comment cites TS 29.244 §6.2.2: either node may initiate).</li>

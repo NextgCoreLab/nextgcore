@@ -84,9 +84,11 @@ Data model and infrastructure are in place. All actual Diameter protocol handlin
 | S11 (MME-SGW) | 3GPP TS 29.274 | **Partial** (handlers done, session builds stubbed) |
 | S6a (MME-HSS) | 3GPP TS 29.272 | **Partial** (response handlers done, send stubbed) |
 | SGsAP (MME-VLR) | 3GPP TS 29.118 | **Fully implemented** |
-| SBc-AP (MME-CBC) | 3GPP TS 29.168 | **Partial** |
+| SBc-AP (MME-CBC) | 3GPP TS 29.168 | **Not implemented**: data structures and handlers only, no SBc-AP transport or codec, no CBC (#1071) |
 
 ### Completeness: ~75%
+
+Recomputed for #1071 by counting a fully implemented interface as 1, a partial one as ½, and one not implemented as 0. Five of the eight interfaces are fully implemented (S1AP, NAS EMM, NAS ESM, NAS security, SGsAP); S11 and S6a are partial; SBc-AP is not implemented. That gives (5 + ½ + ½ + 0) / 8 = 75%.
 
 The most complete NF. NAS layer (EMM + ESM + Security) is production-quality. Main gaps are
 in Diameter and GTP-C outgoing message construction. 25 proptest properties.
