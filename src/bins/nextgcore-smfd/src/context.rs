@@ -1645,6 +1645,17 @@ impl PolicyBinding {
 ///
 /// EPC sessions take their CP SEID from `n4_seid_generator`, which counts from 1,
 /// so 5G SEIDs live above 2^48 and the two can never meet.
+/// One FAR's GTP-U peer (#994): the Outer Header Creation address the FAR sends to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FarPeer {
+    /// The remote GTP-U peer (gNB/eNB, SGW-U, or another UPF).
+    pub ip: std::net::IpAddr,
+    /// Destination Interface Access (TS 29.244 §8.2.24): the AN side, N3 or S1-U/S5-U.
+    pub access: bool,
+    /// Whether the FAR forwards (Apply Action FORW); a buffering FAR sends nothing.
+    pub forwarding: bool,
+}
+
 pub const FIVE_G_CP_SEID_BASE: u64 = 1 << 48;
 
 /// The PFCP CP SEID of a 5G SM context with no recorded one in `cp_n4_seids`
@@ -1791,6 +1802,13 @@ pub struct SmfContext {
     /// does not have. Persisted with the session map for the same reason that map is.
     pub cp_n4_seids: RwLock<HashMap<String, u64>>,
 
+    /// The GTP-U peer of each FAR of each PFCP session, by SMF-side N4 SEID, then FAR
+    /// ID (#994). Learnt from every accepted Session Establishment and Modification
+    /// Request. A UPF's Node Report names the remote GTP-U peer of a failed or recovered
+    /// path (TS 29.244 §5.10A); this map says which sessions use it. Persisted per SM
+    /// context with the session map, so a restored session is still found.
+    pub far_peers: RwLock<HashMap<u64, std::collections::BTreeMap<u32, FarPeer>>>,
+
     /// SM policy bindings: sm_context_ref -> PCF policy association + GSM FSM
     pub policy_bindings: RwLock<HashMap<String, PolicyBinding>>,
 
@@ -1919,6 +1937,7 @@ impl SmfContext {
             pfcp_sessions: RwLock::new(HashMap::new()),
             upf_ul_endpoints: RwLock::new(HashMap::new()),
             cp_n4_seids: RwLock::new(HashMap::new()),
+            far_peers: RwLock::new(HashMap::new()),
             unrestorable_sessions: RwLock::new(Vec::new()),
             policy_bindings: RwLock::new(HashMap::new()),
             upf_recovery_time_stamps: RwLock::new(HashMap::new()),
@@ -2071,6 +2090,34 @@ impl SmfContext {
             .read()
             .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())
             .unwrap_or_default();
+        // #994: per SM context, keyed by the reference like `cpN4Seids`. EPC sessions
+        // are not durable, so theirs are not written.
+        let far_peers: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<u32, FarPeer>,
+        > = {
+            let seids: Vec<(String, u64)> = pfcp_sessions
+                .keys()
+                .map(|r| {
+                    (
+                        r.clone(),
+                        cp_n4_seids
+                            .get(r)
+                            .copied()
+                            .unwrap_or_else(|| derive_cp_n4_seid(r)),
+                    )
+                })
+                .collect();
+            self.far_peers
+                .read()
+                .map(|m| {
+                    seids
+                        .into_iter()
+                        .filter_map(|(r, seid)| m.get(&seid).map(|f| (r, f.clone())))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
         // Ascending already (see `Ipv4Pool::allocated_addrs`), and as strings so
         // the file is readable by an operator diagnosing a double assignment.
         let ipv4_allocations: Vec<String> = self
@@ -2090,6 +2137,7 @@ impl SmfContext {
             "ipv4Allocations": ipv4_allocations,
             "upfRecoveryTimeStamps": upf_rts,
             "cpN4Seids": cp_n4_seids,
+            "farPeers": far_peers,
             "bootEpoch": self.boot_epoch.load(Ordering::SeqCst),
         })
     }
@@ -2255,6 +2303,23 @@ impl SmfContext {
         let n_bindings = policy_bindings.len();
         let n_rts = upf_rts.len();
 
+        // #994: absent before it existed; then nothing is known about the restored
+        // sessions' GTP-U peers until their next modification, as before.
+        let far_peers: HashMap<String, std::collections::BTreeMap<u32, FarPeer>> = doc
+            .get("farPeers")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        let far_peers: Vec<(u64, std::collections::BTreeMap<u32, FarPeer>)> = far_peers
+            .into_iter()
+            .filter(|(r, _)| pfcp_sessions.contains_key(r))
+            .map(|(r, f)| {
+                let seid = cp_n4_seids
+                    .get(&r)
+                    .copied()
+                    .unwrap_or_else(|| derive_cp_n4_seid(&r));
+                (seid, f)
+            })
+            .collect();
         // One lock at a time, as in `snapshot`.
         if let Ok(mut map) = self.pfcp_sessions.write() {
             map.extend(pfcp_sessions);
@@ -2267,6 +2332,9 @@ impl SmfContext {
         }
         if let Ok(mut map) = self.cp_n4_seids.write() {
             map.extend(cp_n4_seids);
+        }
+        if let Ok(mut map) = self.far_peers.write() {
+            map.extend(far_peers);
         }
         let mut n_addrs = 0usize;
         for addr in &ipv4_allocations {
@@ -3964,6 +4032,56 @@ mod tests {
                 .is_empty(),
             "with no session there is no stranded resource, so notifying would invent one"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #994: the GTP-U peers of a restored session's FARs come back with it, under its
+    /// SMF-side SEID, so a Node Report after a restart still finds the session. A
+    /// session the snapshot does not restore leaves none behind.
+    #[test]
+    fn far_peers_survive_a_restore() {
+        let path = temp_state_path("far-peers");
+        let peer = FarPeer {
+            ip: "10.0.0.5".parse().unwrap(),
+            access: true,
+            forwarding: true,
+        };
+        let (derived, inherited) = {
+            let ctx = ctx_with_state(&path);
+            ctx.pfcp_sessions
+                .write()
+                .unwrap()
+                .insert("9941".to_string(), 0x0994);
+            ctx.pfcp_sessions
+                .write()
+                .unwrap()
+                .insert("9942".to_string(), 0x0995);
+            ctx.cp_n4_seids
+                .write()
+                .unwrap()
+                .insert("9942".to_string(), 0x0042);
+            let derived = derive_cp_n4_seid("9941");
+            {
+                let mut m = ctx.far_peers.write().unwrap();
+                m.insert(derived, std::collections::BTreeMap::from([(2, peer)]));
+                m.insert(0x0042, std::collections::BTreeMap::from([(2, peer)]));
+                // An EPC session's: not durable, not written.
+                m.insert(0x0777, std::collections::BTreeMap::from([(2, peer)]));
+            }
+            ctx.persist();
+            (derived, 0x0042u64)
+        };
+
+        let restored = ctx_with_state(&path);
+        let m = restored.far_peers.read().unwrap();
+        assert_eq!(m.get(&derived).and_then(|f| f.get(&2)), Some(&peer));
+        assert_eq!(
+            m.get(&inherited).and_then(|f| f.get(&2)),
+            Some(&peer),
+            "under the inherited SEID"
+        );
+        assert!(!m.contains_key(&0x0777), "only restored sessions' peers");
+        drop(m);
         let _ = std::fs::remove_file(&path);
     }
 

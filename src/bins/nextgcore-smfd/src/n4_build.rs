@@ -451,6 +451,18 @@ pub mod interface {
 // ============================================================================
 
 /// PFCP apply action flags
+/// The [`apply_action`] flags of an Apply Action IE value as
+/// [`PfcpMessageBuilder::add_apply_action`] writes it: the inverse of that encoder,
+/// so a reader of this SMF's own requests (#994) agrees with it whatever its octet
+/// order (#1008). A one-octet value is the first octet.
+pub fn decode_apply_action(value: &[u8]) -> u16 {
+    match value {
+        [a, b, ..] => u16::from_be_bytes([*a, *b]),
+        [a] => u16::from(*a),
+        [] => 0,
+    }
+}
+
 pub mod apply_action {
     pub const DROP: u16 = 1 << 0;
     pub const FORW: u16 = 1 << 1;
