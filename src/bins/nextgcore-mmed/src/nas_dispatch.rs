@@ -1630,7 +1630,7 @@ enum CsfbPriority {
 }
 
 fn emm_detach_request(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, body: &[u8]) {
-    {
+    let switch_off = {
         let mut pool = ctx.mme_ue_pool.write().unwrap();
         let Some(mme_ue) = pool.get_mut(&mme_ue_id) else {
             return;
@@ -1654,19 +1654,91 @@ fn emm_detach_request(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, body: &[
             mme_ue.imsi_bcd
         );
 
-        // TS 24.301 §5.5.2.2.2: no DETACH ACCEPT is sent when the UE detached
-        // because it is switching off — it is no longer listening.
-        if !switch_off {
-            if let Err(e) = nas_path::nas_eps_send_detach_accept(mme_ue, enb_ue) {
-                log::error!("[{}] Detach Accept send failed: {e}", mme_ue.imsi_bcd);
+        switch_off
+    };
+
+    // A retransmission (T3421, TS 24.301 §5.5.2.2.4) while the first Detach
+    // Request's Delete Session Requests are unanswered is the same detach: it
+    // keeps waiting rather than completing ahead of the Serving GW.
+    if crate::gtp_path::detach_deletes_outstanding(mme_ue_id) {
+        log::info!(
+            "UE {mme_ue_id}: Detach Request retransmitted while its Delete Session Requests are \
+             unanswered; still waiting"
+        );
+        return;
+    }
+
+    // TS 23.401 §5.3.8.2.1 step 2 (#1103): the gateways' sessions go first, by
+    // a Delete Session Request (Operation Indication set, so the Serving GW
+    // relays it to the PDN GW, step 3) per PDN connection. Before #1103 none
+    // was sent and every detach leaked its sessions at the SGW and the PGW.
+    // The PDN connections are released locally at once: the responses (or
+    // their N3 exhaustion, so an unresponsive Serving GW cannot hold the detach
+    // up) only complete the detach (steps 7-8, `on_detach_delete_answered`).
+    let pending = crate::gtp_path::PendingDetach {
+        mme_ue_id,
+        enb_ue_id: enb_ue.id,
+        switch_off,
+    };
+    let in_flight = crate::gtp_path::send_delete_all_sessions_for_detach(ctx, pending);
+    crate::network_detach::delete_pdn_connections_locally(ctx, mme_ue_id);
+    if in_flight == 0 {
+        complete_ue_detach(ctx, pending);
+    } else {
+        log::info!(
+            "UE {mme_ue_id}: {in_flight} Delete Session Request(s) sent; the detach completes \
+             on their responses"
+        );
+    }
+}
+
+/// A Delete Session Request of a UE-initiated detach was answered, or its
+/// retransmissions ran out (#1103): with none left outstanding the detach
+/// completes.
+pub(crate) fn on_detach_delete_answered(ctx: &MmeContext, pending: crate::gtp_path::PendingDetach) {
+    if crate::gtp_path::detach_deletes_outstanding(pending.mme_ue_id) {
+        return;
+    }
+    let still_detaching = ctx
+        .mme_ue_find_by_id(pending.mme_ue_id)
+        .is_some_and(|ue| ue.nas_eps.type_ == MmeEpsType::DetachRequestFromUe);
+    if !still_detaching {
+        // The context is gone (a retransmitted Detach Request completed the
+        // detach, or a re-attach replaced it) or another procedure took it
+        // over: there is nothing left to complete.
+        log::info!(
+            "UE {}: Delete Session Responses in, but the detach is no longer the procedure",
+            pending.mme_ue_id
+        );
+        return;
+    }
+    complete_ue_detach(ctx, pending);
+}
+
+/// TS 23.401 §5.3.8.2.1 steps 7-8: DETACH ACCEPT (none for a switch-off, TS
+/// 24.301 §5.5.2.2.2: the UE is no longer listening), then the UE context and
+/// the S1 connection go.
+fn complete_ue_detach(ctx: &MmeContext, pending: crate::gtp_path::PendingDetach) {
+    // Only the S1 connection the detach came on, and only while it still
+    // belongs to this UE.
+    let enb_ue = ctx
+        .enb_ue_find_by_id(pending.enb_ue_id)
+        .filter(|e| e.mme_ue_id == pending.mme_ue_id);
+    if let Some(enb_ue) = &enb_ue {
+        if !pending.switch_off {
+            let mut pool = ctx.mme_ue_pool.write().unwrap();
+            if let Some(mme_ue) = pool.get_mut(&pending.mme_ue_id) {
+                if let Err(e) = nas_path::nas_eps_send_detach_accept(mme_ue, enb_ue) {
+                    log::error!("[{}] Detach Accept send failed: {e}", mme_ue.imsi_bcd);
+                }
             }
         }
     }
-
-    // TS 23.401 §5.3.8.2.1: the MME releases the UE context and the S1
-    // connection once the detach procedure completes, switch-off or not.
-    ctx.mme_ue_remove(mme_ue_id);
-    release_ue_context(ctx, enb_ue);
+    // Also drops whatever Delete Session records of this detach remain.
+    ctx.mme_ue_remove(pending.mme_ue_id);
+    if let Some(enb_ue) = enb_ue {
+        release_ue_context(ctx, &enb_ue);
+    }
 }
 
 /// Send an authentication challenge, or say why it cannot be sent.
@@ -1727,6 +1799,18 @@ fn index_imsi(ctx: &MmeContext, mme_ue_id: u64, imsi_bcd: &str) {
             .mme_ue_find_by_id(stale_id)
             .map(|ue| ue.enb_ue_id)
             .filter(|id| *id != NEXTGCORE_INVALID_POOL_ID);
+        // TS 23.401 §5.3.2.1 step 4 (#1103): "the new MME deletes these bearer
+        // contexts by sending Delete Session Request messages to the GWs
+        // involved". Before #1103 the old context was only forgotten, so every
+        // re-attach leaked a PDN connection at the SGW and the PGW. The new
+        // attach proceeds; only its Create Session Request waits for them
+        // (`gtp_path::defer_create_while_replaced`).
+        if let Err(e) =
+            crate::gtp_path::send_delete_all_sessions_for_replaced(ctx, stale_id, imsi_bcd)
+        {
+            log::warn!("[{imsi_bcd}] Re-attach: Delete Session Requests not all sent: {e}");
+        }
+        crate::network_detach::delete_pdn_connections_locally(ctx, stale_id);
         ctx.mme_ue_remove(stale_id);
         if let Some(stale_enb_ue) = stale_enb_ue.and_then(|id| ctx.enb_ue_find_by_id(id)) {
             release_ue_context(ctx, &stale_enb_ue);
@@ -2345,6 +2429,22 @@ fn send_s11_create_session(
         CreateAction::InHandover => S11CreateAction::PathSwitchRequest,
     };
 
+    // #1103: a request for this IMSI must not reach the Serving GW ahead of the
+    // deletions of the context its re-attach replaced.
+    if gtp_path::defer_create_while_replaced(
+        &mme_ue.imsi_bcd,
+        mme_ue.id,
+        enb_ue_id,
+        sess_id,
+        gtp_action,
+    ) {
+        log::info!(
+            "[{}] S11 Create Session Request held until the replaced context's Delete Session \
+             Requests are answered",
+            mme_ue.imsi_bcd
+        );
+        return;
+    }
     match gtp_path::send_create_session_request(ctx, enb_ue_id, sess_id, gtp_action) {
         Ok(xact) => log::info!(
             "[{}] S11 Create Session Request sent to the SGW (action={gtp_action:?}, \

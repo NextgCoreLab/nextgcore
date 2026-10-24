@@ -382,13 +382,31 @@ pub fn dispatch_triggered(raw: &[u8], msg_type: u8, sequence_number: u32, peer: 
             Ok(data) => apply_change_notification_response(&data, sequence_number, peer),
             Err(e) => log::error!("S11 Change Notification Response from {peer} unparsable: {e:?}"),
         },
-        mt::DELETE_SESSION_RESPONSE => match handle_delete_session_response(raw) {
-            Ok(data) => log::info!(
-                "S11 Delete Session Response from {peer} (seq={sequence_number}) cause={}",
-                data.cause
-            ),
-            Err(e) => log::error!("S11 Delete Session Response from {peer} unparsable: {e:?}"),
-        },
+        mt::DELETE_SESSION_RESPONSE => {
+            match handle_delete_session_response(raw) {
+                Ok(data) => {
+                    log::info!(
+                        "S11 Delete Session Response from {peer} (seq={sequence_number}) \
+                         cause={}",
+                        data.cause
+                    );
+                    let counter = if data.cause == crate::s11_build::GtpCause::RequestAccepted as u8
+                    {
+                        &crate::gtp_path::DELETE_SESSION_ACCEPTED_TOTAL
+                    } else {
+                        &crate::gtp_path::DELETE_SESSION_REJECTED_TOTAL
+                    };
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(e) => {
+                    log::error!("S11 Delete Session Response from {peer} unparsable: {e:?}")
+                }
+            }
+            // #1103, TS 23.401 §5.3.8.2.1 steps 2-8: a UE-initiated detach (or a
+            // re-attach's Create Session) waits on this response, whatever it
+            // says: the PDN connection is already released locally.
+            crate::gtp_path::on_delete_session_settled(crate::context::mme_self(), sequence_number);
+        }
         mt::RELEASE_ACCESS_BEARERS_RESPONSE => match handle_release_access_bearers_response(raw) {
             Ok(data) => {
                 log::info!(
@@ -1186,8 +1204,9 @@ pub fn render_metrics() -> String {
          connected UE whose S1-U the Serving GW released, answered Unable to page UE because \
          the UE already had its S1 releases for the window\n\
          # TYPE mme_ddn_released_s1u_capped_total counter\n\
-         mme_ddn_released_s1u_capped_total {}\n",
-        DDN_RELEASES_CAPPED_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+         mme_ddn_released_s1u_capped_total {}\n{}",
+        DDN_RELEASES_CAPPED_TOTAL.load(std::sync::atomic::Ordering::Relaxed),
+        crate::gtp_path::render_delete_session_metrics()
     )
 }
 const STALE_S1U_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);

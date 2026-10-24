@@ -209,6 +209,10 @@ pub enum ClrAction {
     },
     /// Remove the UE context silently (UE moved to another MME/SGSN)
     RemoveContext,
+    /// The UE attached afresh at another MME (#1103, TS 23.401 §5.3.2.1 step
+    /// 8): delete its PDN connections at the gateways, then remove the context
+    /// silently.
+    DeleteSessionsAndRemove,
     /// No action required
     NoAction,
 }
@@ -252,9 +256,14 @@ pub fn mme_s6a_handle_clr(mme_ue: &mut MmeUe, clr_message: &ClrMessage) -> S6aRe
             ClrAction::DetachUe { reattach_required }
         }
         cancellation_type::INITIAL_ATTACH_PROCEDURE => {
-            // UE attached at another MME: remove the local context
+            // UE attached at another MME (TS 23.401 §5.3.2.1 step 8): "If the
+            // Cancellation Type indicates Initial Attach and there are active
+            // bearer contexts in the old MME ... the old MME releases the bearer
+            // contexts by sending Delete Session Request messages to the GWs
+            // involved" (#1103). The other types move the PDN connections with
+            // the UE, so they are not deleted.
             log::debug!("CLR: Initial attach at another MME");
-            ClrAction::RemoveContext
+            ClrAction::DeleteSessionsAndRemove
         }
         cancellation_type::UPDATE_PROCEDURE_IWF => {
             log::debug!("CLR: Update procedure IWF");
@@ -357,6 +366,32 @@ pub fn mme_s6a_process_inbound(inbound: &crate::fd_path::InboundS6aRequest) -> S
                 }
                 ClrAction::RemoveContext => {
                     ctx.mme_ue_remove(ue_id);
+                }
+                ClrAction::DeleteSessionsAndRemove => {
+                    if let Err(e) = crate::gtp_path::send_delete_all_sessions(
+                        ctx,
+                        None,
+                        ue_id,
+                        crate::s11_build::GtpDeleteAction::NoAction,
+                    ) {
+                        log::warn!(
+                            "[{}] Cancel Location (initial attach elsewhere): Delete Session \
+                             Requests not all sent: {e}",
+                            inbound.imsi_bcd
+                        );
+                    }
+                    let enb_ue = ctx
+                        .mme_ue_find_by_id(ue_id)
+                        .map(|ue| ue.enb_ue_id)
+                        .and_then(|id| ctx.enb_ue_find_by_id(id))
+                        .filter(|e| e.mme_ue_id == ue_id);
+                    crate::network_detach::delete_pdn_connections_locally(ctx, ue_id);
+                    ctx.mme_ue_remove(ue_id);
+                    // The UE is at the other MME: an S1 connection left here is
+                    // stale.
+                    if let Some(enb_ue) = enb_ue {
+                        crate::nas_dispatch::release_ue_context(ctx, &enb_ue);
+                    }
                 }
                 ClrAction::NoAction => {}
             }
@@ -1573,6 +1608,96 @@ mod tests {
         assert_eq!(ue.t3422.retry_count, retries);
         assert_eq!(ue.t3422.pkbuf, stored);
         crate::network_detach::complete_mme_initiated_detach(ctx, mme_ue_id);
+    }
+
+    /// #1103, TS 23.401 §5.3.2.1 step 8: a Cancel Location for an initial
+    /// attach at another MME deletes the UE's PDN connections at the Serving
+    /// GW (OI set) before the context goes; an MME update moves them with the
+    /// UE, so it deletes none. Before #1103 both only dropped the context.
+    #[test]
+    fn a_cancel_location_for_an_initial_attach_elsewhere_deletes_the_pdn_connections() {
+        use nextgcore_gtp::v2::{Gtp2IeType, Gtp2IndicationIe, Gtp2Message};
+        let _guard = crate::gtp_path::lock_s11();
+        let sgw = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sgw.set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .unwrap();
+        let server = crate::gtp_path::GtpcServer::open(
+            "127.0.0.1:0",
+            nextgcore_gtp::v2::xact::Gtp2XactConfig::default(),
+            7,
+        )
+        .unwrap();
+        let _route = crate::gtp_path::route_s11_for_test(server, sgw.local_addr().unwrap());
+        let ctx = crate::context::mme_self();
+        for (imsi, s1ap_id, cancellation, expected) in [
+            (
+                "999990000011031",
+                11031,
+                cancellation_type::INITIAL_ATTACH_PROCEDURE,
+                vec![(5u8, true)],
+            ),
+            (
+                "999990000011032",
+                11032,
+                cancellation_type::MME_UPDATE_PROCEDURE,
+                vec![],
+            ),
+        ] {
+            let mme_ue_id = seed_connected_ue(imsi, s1ap_id);
+            let sgw_ue_id = ctx.sgw_ue_add(mme_ue_id);
+            ctx.sgw_ue_pool
+                .write()
+                .unwrap()
+                .get_mut(&sgw_ue_id)
+                .unwrap()
+                .sgw_s11_teid = 0x1103_0001;
+            let sess_id = ctx.sess_add(mme_ue_id, 1);
+            let bearer_id = ctx.bearer_add(sess_id, mme_ue_id);
+            ctx.bearer_pool
+                .write()
+                .unwrap()
+                .get_mut(&bearer_id)
+                .unwrap()
+                .ebi = 5;
+            ctx.sess_pool
+                .write()
+                .unwrap()
+                .get_mut(&sess_id)
+                .unwrap()
+                .bearer_list
+                .push(bearer_id);
+            {
+                let mut pool = ctx.mme_ue_pool.write().unwrap();
+                let ue = pool.get_mut(&mme_ue_id).unwrap();
+                ue.sgw_ue_id = sgw_ue_id;
+                ue.sess_list = vec![sess_id];
+            }
+
+            mme_s6a_process_inbound(&clr(imsi, cancellation)).expect("applied");
+
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 4096];
+            while let Ok((len, _)) = sgw.recv_from(&mut buf) {
+                let msg =
+                    Gtp2Message::decode(&mut bytes::Bytes::copy_from_slice(&buf[..len])).unwrap();
+                if msg.header.message_type == 36 {
+                    assert_eq!(msg.header.teid, Some(0x1103_0001));
+                    let ind = msg.get_ie(Gtp2IeType::Indication as u8, 0).unwrap();
+                    seen.push((
+                        msg.get_ie(Gtp2IeType::Ebi as u8, 0).unwrap().value[0],
+                        Gtp2IndicationIe::decode(&ind.value).unwrap().oi,
+                    ));
+                }
+            }
+            assert_eq!(seen, expected, "cancellation type {cancellation}");
+            assert!(
+                ctx.mme_ue_find_by_id(mme_ue_id).is_none(),
+                "context removed"
+            );
+            ctx.sess_remove(sess_id);
+            ctx.bearer_pool.write().unwrap().remove(&bearer_id);
+            ctx.sgw_ue_pool.write().unwrap().remove(&sgw_ue_id);
+        }
     }
 
     /// #828 follow-up: the duplicate-CLR guard covers only a detach a CLR started. A first
