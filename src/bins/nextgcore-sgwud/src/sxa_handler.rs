@@ -242,6 +242,9 @@ pub struct SessionModificationRequest {
     /// the handler refuses a request carrying both rather than guessing which the
     /// CP function meant.
     pub query_all_urrs: bool,
+    /// PFCPSMReq-Flags DROBU (TS 29.244 §8.2.31, #1041): drop the session's buffered
+    /// packets BEFORE the FARs are applied, so a BUFF -> FORW update forwards none.
+    pub drop_buffered: bool,
     /// Create BAR
     pub create_bar: Option<CreateBarRequest>,
     /// Remove BAR
@@ -428,6 +431,16 @@ pub fn handle_session_modification_request(
     };
 
     let mut created_pdrs = Vec::new();
+
+    // #1041, TS 29.244 §8.2.31: DROBU drops what is buffered "prior to further
+    // applying the action specified in the Apply Action value of the FARs".
+    if req.drop_buffered {
+        let dropped = sgwu_self().sess_drop_buffered(sess.id);
+        log::info!(
+            "DROBU: dropped {dropped} buffered packet(s) of session {}",
+            sess.id
+        );
+    }
 
     // #215: URR provisioning first, for the same reason as at establishment — a
     // Create PDR in the same message may name a URR ID.

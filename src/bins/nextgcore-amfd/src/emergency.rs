@@ -82,15 +82,14 @@ static ALLOW_UNAUTHENTICATED_EMERGENCY: std::sync::atomic::AtomicBool =
 /// #361 tests set this posture too, and a lock private to this file's test module could not
 /// order against them. A second lock over one variable has hung this suite before.
 #[cfg(test)]
-pub(crate) static EMERGENCY_POLICY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static EMERGENCY_POLICY_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
 
 /// Serialise on [`EMERGENCY_POLICY_TEST_LOCK`] and hand the caller the shipped default
 /// posture, so a test that forgets to set one is not reading its predecessor's.
 #[cfg(test)]
-pub(crate) fn emergency_policy_test_guard() -> std::sync::MutexGuard<'static, ()> {
-    let guard = EMERGENCY_POLICY_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+pub(crate) async fn emergency_policy_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    let guard = EMERGENCY_POLICY_TEST_LOCK.lock().await;
     set_allow_unauthenticated_emergency(EmergencyPolicy::default());
     guard
 }
