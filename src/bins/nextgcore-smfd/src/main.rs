@@ -450,7 +450,8 @@ fn epco_config() -> (&'static [std::net::Ipv4Addr], Option<u16>) {
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // RUST_LOG if set, else info (smfd has no --log-level): #691.
+    nextgcore_core::log::nf_log_builder("info").init();
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = nextgcore_metrics::otel::init_otel(
         nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(

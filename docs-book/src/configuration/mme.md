@@ -114,4 +114,4 @@ S1-MME runs **only** over native Linux kernel SCTP: mmed offers no userspace (sc
 | `MME_METRICS_ADDR` | unset | Full `ip:port` of the unauthenticated `/metrics` listener (handover failure counters). Wins over `NEXTGCORE_METRICS_BIND`. |
 | `NEXTGCORE_METRICS_BIND` | `127.0.0.1` | Host of the `/metrics` listener on port 9090 when `MME_METRICS_ADDR` is unset (#837). `docker-compose-epc.yml` and the EKS EPC overlay set `0.0.0.0` inside the private network; no metrics port is published on the host. |
 
-`RUST_LOG` is **not** honoured: the logger is built with `env_logger::Builder::new().filter_level(...)`, so the level comes only from `-l/--log-level`, and the `RUST_LOG: info` in `docker-compose-epc.yml` has no effect on the MME.
+`RUST_LOG` overrides `-l/--log-level` when set (the `RUST_LOG: info` in `docker-compose-epc.yml` applies).

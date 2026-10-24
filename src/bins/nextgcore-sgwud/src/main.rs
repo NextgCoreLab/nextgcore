@@ -83,9 +83,7 @@ async fn main() -> Result<()> {
         config::log_level_from_args(std::env::args()),
         config_path.as_deref(),
     );
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level))
-        .format_timestamp_millis()
-        .init();
+    nextgcore_core::log::nf_log_builder(&level).init();
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = nextgcore_metrics::otel::init_otel(
         nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(

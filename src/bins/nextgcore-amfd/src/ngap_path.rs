@@ -564,7 +564,7 @@ struct Reachability {
 /// replayed UE security capabilities, GUTI) so that all downlink NAS is
 /// built by gmm_build and protected by nas_security — there is no inline
 /// plain-NAS path.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UeNasContext {
     /// Full AMF UE context (security keys, capabilities, GUTI, NSSAI).
     ///
@@ -629,6 +629,42 @@ pub struct UeNasContext {
     /// belongs to is created later in the procedure, and because it must survive the
     /// authentication round trips in between.
     ue_policy_container: Option<Vec<u8>>,
+}
+
+/// Manual `Debug` (no-auth-material-in-logs): the authentication material in
+/// this type (autn) prints as `<redacted>`, so a future
+/// `{:?}` in a log line cannot leak it.
+impl std::fmt::Debug for UeNasContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("UeNasContext");
+        d.field("amf_ue", &self.amf_ue);
+        d.field("auth_ctx_id", &self.auth_ctx_id);
+        d.field("ran_ue_ngap_id", &self.ran_ue_ngap_id);
+        d.field("association_id", &self.association_id);
+        d.field("suci", &self.suci);
+        d.field("autn", &"<redacted>");
+        d.field("registered", &self.registered);
+        d.field("pei_requested", &self.pei_requested);
+        d.field("auth_failure_count", &self.auth_failure_count);
+        d.field("retx", &self.retx);
+        d.field("reachability", &self.reachability);
+        d.field("cm_idle", &self.cm_idle);
+        d.field("sdm_subscription_id", &self.sdm_subscription_id);
+        d.field("policy_association_id", &self.policy_association_id);
+        d.field("ue_policy_association_id", &self.ue_policy_association_id);
+        d.field("gmm_fsm", &self.gmm_fsm);
+        d.field(
+            "initial_context_setup_request_sent",
+            &self.initial_context_setup_request_sent,
+        );
+        d.field(
+            "initial_context_setup_response_received",
+            &self.initial_context_setup_response_received,
+        );
+        d.field("registration_accept_sent", &self.registration_accept_sent);
+        d.field("ue_policy_container", &self.ue_policy_container);
+        d.finish()
+    }
 }
 
 impl UeNasContext {
@@ -815,6 +851,12 @@ pub struct NgapServer {
     /// and before #70 nothing kept it: HandoverNotify mutated in-memory serving state and
     /// told the SMF nothing at all.
     handover_target_transfers: HashMap<(u64, u8), Vec<u8>>,
+    /// The target association the current intra-5GS HANDOVER REQUEST of a UE went to,
+    /// keyed by AMF-UE-NGAP-ID (#742 review). Recorded when the request is sent; an
+    /// Acknowledge or a Failure from any OTHER association -- a target whose
+    /// preparation was cancelled or superseded answering late -- is ignored, so it can
+    /// neither command the source nor bring back that target's session transfers.
+    handover_pending_target: HashMap<u64, u64>,
     /// EPS→5GS handovers in flight, keyed by the AMF UE NGAP ID allocated for the
     /// arriving UE (#418).
     ///
@@ -938,6 +980,7 @@ impl NgapServer {
             sm_context_smfs: HashMap::new(),
             handover_target_assoc: HashMap::new(),
             handover_target_transfers: HashMap::new(),
+            handover_pending_target: HashMap::new(),
             eps_ho_in_flight: HashMap::new(),
             emergency: crate::emergency::EmergencyHandler::new(),
             ngap_overload_declared: false,
@@ -8704,9 +8747,19 @@ impl NgapServer {
             }
         }
         // TS 24.501 §5.3.7: for a UE that is still REGISTERED this is the moment the
-        // mobile reachable timer starts.
-        self.start_reachability_supervision(association_id, amf_ue_ngap_id)
-            .await;
+        // mobile reachable timer starts. A Complete that names no UE (undecodable, or
+        // a not-comprehended reject IE handled locally, TS 38.413 §10.3.4.2) ended no
+        // N1 connection this AMF can identify, so it arms nobody (#802 follow-up):
+        // the association's other UEs are either CONNECTED, or idle since an earlier
+        // release that already armed them, and re-arming those would extend their
+        // supervision and send a false CM-CONNECTED -> CM-IDLE report each time.
+        match amf_ue_ngap_id {
+            Some(id) => self.start_reachability_supervision(id).await,
+            None => log::warn!(
+                "UE Context Release Complete on association {association_id} names no \
+                 usable UE; no mobile reachable timer is started"
+            ),
+        }
         Ok(())
     }
 
@@ -8739,20 +8792,9 @@ impl NgapServer {
         }
     }
 
-    /// Start mobile-reachable supervision for every registered UE whose N1 connection
-    /// this release complete ended (TS 24.501 §5.3.7).
-    ///
-    /// `amf_ue_ngap_id` is the UE the Release Complete names, when it could be used. A
-    /// Release Complete that cannot (undecodable, or a not-comprehended reject IE, which
-    /// TS 38.413 §10.3.4.2 has handled locally) names nobody, so it falls back to the
-    /// association's UEs that are ALREADY CM-IDLE and unsupervised -- never a CONNECTED
-    /// one (#802). Arming every registered UE of the association put the connected UEs
-    /// on the gNB on the path to implicit deregistration on one malformed PDU.
-    async fn start_reachability_supervision(
-        &mut self,
-        association_id: u64,
-        amf_ue_ngap_id: Option<u64>,
-    ) {
+    /// Start mobile-reachable supervision for a registered UE whose N1 connection was
+    /// just released (TS 24.501 §5.3.7).
+    async fn start_reachability_supervision(&mut self, amf_ue_ngap_id: u64) {
         let Some(config) = self.timer_configs.get(AmfTimerId::MobileReachable).cloned() else {
             return;
         };
@@ -8760,21 +8802,7 @@ impl NgapServer {
             log::debug!("Mobile reachable timer disabled by configuration; not supervising");
             return;
         }
-        let targets: Vec<u64> = match amf_ue_ngap_id {
-            Some(amf_ue_ngap_id) => vec![amf_ue_ngap_id],
-            None => self
-                .ue_auth_state
-                .snapshot()
-                .into_iter()
-                .filter(|(_, s)| {
-                    s.association_id == association_id
-                        && s.registered
-                        && s.cm_idle
-                        && s.reachability.is_none()
-                })
-                .map(|(id, _)| id)
-                .collect(),
-        };
+        let targets = [amf_ue_ngap_id];
         let deadline = Instant::now() + config.duration;
         for amf_ue_ngap_id in targets {
             // Await-free, so the arming happens under one lock acquisition: a
@@ -9141,6 +9169,9 @@ impl NgapServer {
     /// `handle_handover_notify` documents why it must not use `release_ue` either.
     fn forget_ue(&mut self, amf_ue_ngap_id: u64) {
         self.ue_auth_state.remove(amf_ue_ngap_id);
+        // #742 review: a UE ended mid-handover (release, NG Reset, implicit
+        // deregistration) takes its preparation state with it.
+        self.forget_handover_preparation(amf_ue_ngap_id);
         // Logged at info, and only when there WAS one: the overwhelming majority of
         // releases are for ordinary UEs, and a line per release saying "no emergency
         // context" would bury the ones that matter. `active_count` is included because
@@ -9381,6 +9412,23 @@ impl NgapServer {
     // N2 Handover (TS 38.413 Section 8.4) and Xn Path Switch (Section 8.4.4)
     // ========================================================================
 
+    /// Drop everything an N2 handover preparation of `amf_ue_ngap_id` left behind: the
+    /// target the HandoverRequest went to, the relay target and every per-session target
+    /// transfer (#742).
+    ///
+    /// Called whenever a preparation ends without a HandoverNotify (Cancel, Failure, a
+    /// refusal), before a new one starts, and from `forget_ue` (release, NG Reset,
+    /// implicit deregistration). Leaving the transfers was not a leak only: the next
+    /// handover's Notify relays EVERY stored transfer of the UE to the SMF as
+    /// HANDOVER_COMPLETE, so a session the new target did not admit was switched to the
+    /// DL tunnel of a target the UE never reached.
+    fn forget_handover_preparation(&mut self, amf_ue_ngap_id: u64) {
+        self.handover_pending_target.remove(&amf_ue_ngap_id);
+        self.handover_target_assoc.remove(&amf_ue_ngap_id);
+        self.handover_target_transfers
+            .retain(|(ue, _psi), _| *ue != amf_ue_ngap_id);
+    }
+
     /// Handle a HandoverRequired from the source gNB (TS 38.413 Section 8.4.1).
     ///
     /// For an intra-AMF / Xn-less N2 handover the AMF would forward the
@@ -9501,9 +9549,7 @@ impl NgapServer {
             // Dropped BEFORE the failure is sent, so a failed send cannot leave a
             // stale relay target that a later Uplink RAN Status Transfer would follow
             // to a gNB this UE is not moving to.
-            self.handover_target_assoc.remove(&required.amf_ue_ngap_id);
-            self.handover_target_transfers
-                .retain(|(ue, _psi), _| *ue != required.amf_ue_ngap_id);
+            self.forget_handover_preparation(required.amf_ue_ngap_id);
             if let Some(bytes) = crate::ngap_asn1::build_handover_preparation_failure_asn1(&failure)
             {
                 self.send_to_association(association_id, &bytes).await?;
@@ -9687,6 +9733,10 @@ impl NgapServer {
             },
         };
 
+        // #742: a new preparation starts from nothing. An earlier one that ended without
+        // a Notify must not contribute a session transfer the new target never admitted.
+        self.forget_handover_preparation(required.amf_ue_ngap_id);
+
         // #417: the GENERATED codec.
         let (racs_id, _) = self.racs_ies_for(required.amf_ue_ngap_id);
         match crate::ngap_asn1::build_handover_request_generated(&ho_request).ok_or(()) {
@@ -9694,6 +9744,8 @@ impl NgapServer {
                 // #570: the UE Radio Capability ID, when the UE has one (TS 38.413 §9.2.3.4).
                 let bytes = crate::racs::add_capability_ies(bytes, racs_id.as_deref(), None);
                 self.send_to_association(target_assoc, &bytes).await?;
+                self.handover_pending_target
+                    .insert(required.amf_ue_ngap_id, target_assoc);
                 log::info!(
                     "HandoverRequest forwarded to target association {target_assoc} \
                      for UE {}",
@@ -9878,9 +9930,7 @@ impl NgapServer {
             cause: nextgcore_ngap::types::Cause::RadioNetwork(cause),
             criticality_diagnostics: None,
         };
-        self.handover_target_assoc.remove(&required.amf_ue_ngap_id);
-        self.handover_target_transfers
-            .retain(|(ue, _psi), _| *ue != required.amf_ue_ngap_id);
+        self.forget_handover_preparation(required.amf_ue_ngap_id);
         if let Some(bytes) = crate::ngap_asn1::build_handover_preparation_failure_asn1(&failure) {
             self.send_to_association(association_id, &bytes).await?;
         }
@@ -9932,6 +9982,21 @@ impl NgapServer {
         if self.eps_ho_in_flight.contains_key(&ack.amf_ue_ngap_id) {
             self.complete_eps_to_5gs_preparation(association_id, &ack)
                 .await;
+            return Ok(());
+        }
+
+        // #742 review: only the target the CURRENT preparation's HandoverRequest went to
+        // may answer it. A late Acknowledge from a target whose preparation was cancelled
+        // or superseded would otherwise send the source a HandoverCommand for a handover
+        // it abandoned and restore that target's session transfers, which the next
+        // Notify relays as HANDOVER_COMPLETE.
+        if self.handover_pending_target.get(&ack.amf_ue_ngap_id) != Some(&association_id) {
+            log::warn!(
+                "HandoverRequestAcknowledge for UE {} from association {association_id}, \
+                 which is not the target of its current preparation ({:?}); ignored",
+                ack.amf_ue_ngap_id,
+                self.handover_pending_target.get(&ack.amf_ue_ngap_id)
+            );
             return Ok(());
         }
 
@@ -10161,12 +10226,23 @@ impl NgapServer {
             .await;
             return Ok(());
         }
+        // #742 review: a Failure from a target that is not the current preparation's
+        // (a late answer to a cancelled or superseded one) must not abort the current one.
+        if self.handover_pending_target.get(&failure.amf_ue_ngap_id) != Some(&association_id) {
+            log::warn!(
+                "HandoverFailure for UE {} from association {association_id}, which is not \
+                 the target of its current preparation; ignored",
+                failure.amf_ue_ngap_id
+            );
+            return Ok(());
+        }
         // The target refused the UE, so there is no longer anywhere to relay a RAN
         // status transfer to. Dropped first and unconditionally: a stale entry
         // would misroute the NEXT handover's status transfer for this UE to a gNB
         // that already rejected it, and that must not hinge on whether the
-        // preparation failure reached the source.
-        self.handover_target_assoc.remove(&failure.amf_ue_ngap_id);
+        // preparation failure reached the source. The per-session transfers go with
+        // it (#742).
+        self.forget_handover_preparation(failure.amf_ue_ngap_id);
         let source = self
             .ue_auth_state
             .get(failure.amf_ue_ngap_id)
@@ -10425,6 +10501,7 @@ impl NgapServer {
         // separate target record has served its purpose. Leaving it would keep the
         // relay pointing at the (now serving) gNB after the procedure ended.
         self.handover_target_assoc.remove(&notify.amf_ue_ngap_id);
+        self.handover_pending_target.remove(&notify.amf_ue_ngap_id);
         Ok(HandoverCompletion {
             sessions_relayed,
             source_context: source,
@@ -10668,9 +10745,7 @@ impl NgapServer {
         };
         // The relay target and any per-session transfers of the preparation are done with
         // either way.
-        self.handover_target_assoc.remove(&answer.amf_ue_ngap_id);
-        self.handover_target_transfers
-            .retain(|(ue, _psi), _| *ue != answer.amf_ue_ngap_id);
+        self.forget_handover_preparation(answer.amf_ue_ngap_id);
         match inter_system_handover_command(&answer.outcome) {
             Some(command) => {
                 let pdu = crate::ngap_asn1::build_fivegs_to_eps_handover_command_asn1(
@@ -11387,8 +11462,8 @@ impl NgapServer {
         );
         // The source abandoned the handover; nothing further will be relayed.
         // Dropped BEFORE the acknowledgement is sent, so a failed ack cannot leave
-        // a stale relay target behind.
-        self.handover_target_assoc.remove(&cancel.amf_ue_ngap_id);
+        // a stale relay target behind. The per-session transfers go with it (#742).
+        self.forget_handover_preparation(cancel.amf_ue_ngap_id);
         match crate::ngap_asn1::build_handover_cancel_acknowledge_asn1(
             cancel.amf_ue_ngap_id,
             cancel.ran_ue_ngap_id,
@@ -20370,6 +20445,450 @@ mod tests {
         }
     }
 
+    /// A HANDOVER REQUIRED (intra-5GS) toward the gNB with `target_gnb_id`, listing
+    /// `psis` with a one-octet Handover Required Transfer each.
+    fn handover_required_pdu(
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        target_gnb_id: u32,
+        psis: &[u8],
+    ) -> Vec<u8> {
+        nextgcore_ngap::builder::build_handover_required(&nextgcore_ngap::types::HandoverRequired {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            handover_type: nextgcore_ngap::types::HandoverType::Intra5gs,
+            cause: nextgcore_ngap::types::Cause::RadioNetwork(
+                nextgcore_ngap::types::CauseRadioNetwork::HandoverDesirableForRadioReason,
+            ),
+            target_id: nextgcore_ngap::types::TargetId::TargetRanNodeId {
+                global_ran_node_id: nextgcore_ngap::types::GlobalRanNodeId::GlobalGnbId {
+                    plmn_identity: plmn_id_to_ngap_bytes(&PlmnId::new("001", "01")),
+                    gnb_id: target_gnb_id,
+                    gnb_id_len: 22,
+                },
+                selected_tai: nextgcore_ngap::types::TaiListItem {
+                    tai_plmn: plmn_id_to_ngap_bytes(&PlmnId::new("001", "01")),
+                    tai_tac: [0x00, 0x00, 0x01],
+                },
+            },
+            pdu_session_list: psis
+                .iter()
+                .map(|&psi| nextgcore_ngap::types::PduSessionResourceItemHoRqd {
+                    pdu_session_id: psi,
+                    transfer: vec![0x00],
+                })
+                .collect(),
+            source_to_target_container: vec![0xAB; 4],
+            direct_forwarding_path_availability: None,
+        })
+        .expect("build HandoverRequired")
+    }
+
+    /// A HANDOVER REQUEST ACKNOWLEDGE admitting `admitted` as `(psi, transfer)`.
+    fn handover_ack_pdu(
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        admitted: &[(u8, Vec<u8>)],
+    ) -> Vec<u8> {
+        nextgcore_ngap::builder::build_handover_request_acknowledge(
+            &nextgcore_ngap::types::HandoverRequestAcknowledge {
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                admitted_list: admitted
+                    .iter()
+                    .map(|(psi, transfer)| {
+                        nextgcore_ngap::types::PduSessionResourceAdmittedItemHoAck {
+                            pdu_session_id: *psi,
+                            transfer: transfer.clone(),
+                        }
+                    })
+                    .collect(),
+                failed_list: None,
+                target_to_source_container: vec![0xC0, 0xFE],
+            },
+        )
+        .expect("build HandoverRequestAcknowledge")
+    }
+
+    /// Seed a gNB session whose Global gNB ID is `gnb_id`, so a HandoverRequired
+    /// can name it as the target.
+    async fn seed_gnb_session_with_id(server: &NgapServer, association_id: u64, gnb_id: u32) {
+        seed_gnb_session(server, association_id).await;
+        server
+            .sessions
+            .write()
+            .await
+            .get_mut(&association_id)
+            .expect("seeded")
+            .gnb
+            .gnb_id = gnb_id;
+    }
+
+    /// **#742.** A handover preparation that ends without a HandoverNotify -- Cancel
+    /// from the source, Failure from the target, or simply a new HandoverRequired --
+    /// leaves no per-session target transfer behind. Before, only the relay target was
+    /// dropped: the next handover's Notify relayed every stored transfer as
+    /// HANDOVER_COMPLETE, so PSI 2, which the second target never admitted, was
+    /// switched to the FIRST target's DL tunnel (TS 23.502 §4.9.1.3.3 step 12 names
+    /// only the sessions the target accepted).
+    ///
+    /// Driven through the handlers with the sent NGAP captured and a fake SMF recording
+    /// each relay's ref, type and N2 octets. REVERT-VERIFIED per arm: without the
+    /// cleanup in that handler (or at the start of a new preparation) the SMF also
+    /// receives `ref-2` with target A's transfer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_abandoned_preparation_leaves_no_session_transfer_for_the_next_handover() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (_smf, smf_port, seen) = fake_smf_typed().await;
+        let mut server = capturing_ngap_server().await;
+        let (source, target_a, target_b) = (97_421u64, 97_422u64, 97_423u64);
+        let (gnb_a, gnb_b) = (0x7_4201u32, 0x7_4202u32);
+        seed_gnb_session_with_id(&server, source, 0x7_4200).await;
+        seed_gnb_session_with_id(&server, target_a, gnb_a).await;
+        seed_gnb_session_with_id(&server, target_b, gnb_b).await;
+
+        enum Abandon {
+            Cancel,
+            Failure,
+            NewPreparation,
+        }
+        for (n, abandon) in [Abandon::Cancel, Abandon::Failure, Abandon::NewPreparation]
+            .into_iter()
+            .enumerate()
+        {
+            let ue = 7_742_001u64 + n as u64;
+            let source_ran = 42u32;
+            let mut state = UeNasContext::new(ue, source_ran, source, false);
+            state.registered = true;
+            // The HandoverRequest's Allowed NSSAI is SIZE(1..8): one slice to send.
+            state.amf_ue.allowed_nssai = vec![SNssai { sst: 1, sd: None }];
+            server.ue_auth_state.insert(ue, state);
+            for (psi, r) in [(1u8, "ref-1"), (2, "ref-2")] {
+                server.sm_context_refs.insert((ue, psi), format!("{r}-{n}"));
+                server
+                    .sm_context_smfs
+                    .insert((ue, psi), ("127.0.0.1".to_string(), smf_port));
+            }
+
+            // Preparation toward A, which admits both sessions.
+            server
+                .handle_handover_required(
+                    source,
+                    &handover_required_pdu(ue, source_ran, gnb_a, &[1, 2]),
+                )
+                .await
+                .expect("handled");
+            server
+                .handle_handover_request_acknowledge(
+                    target_a,
+                    &handover_ack_pdu(ue, 501, &[(1, vec![0xA1]), (2, vec![0xA2])]),
+                )
+                .await
+                .expect("handled");
+            let sent = take_sent_ngap(&mut server);
+            assert_eq!(
+                sent.iter().map(|(a, _)| *a).collect::<Vec<_>>(),
+                vec![target_a, source],
+                "HandoverRequest to A, HandoverCommand to the source"
+            );
+
+            match abandon {
+                Abandon::Cancel => {
+                    let cancel = nextgcore_ngap::builder::build_handover_cancel(
+                        &nextgcore_ngap::types::HandoverCancel {
+                            amf_ue_ngap_id: ue,
+                            ran_ue_ngap_id: source_ran,
+                            cause: nextgcore_ngap::types::Cause::RadioNetwork(
+                                nextgcore_ngap::types::CauseRadioNetwork::HandoverCancelled,
+                            ),
+                        },
+                    )
+                    .expect("build HandoverCancel");
+                    server
+                        .handle_handover_cancel(source, &cancel)
+                        .await
+                        .expect("handled");
+                }
+                Abandon::Failure => {
+                    let failure = nextgcore_ngap::builder::build_handover_failure(
+                        &nextgcore_ngap::types::HandoverFailure {
+                            amf_ue_ngap_id: ue,
+                            cause: nextgcore_ngap::types::Cause::RadioNetwork(
+                                nextgcore_ngap::types::CauseRadioNetwork::Unspecified,
+                            ),
+                            criticality_diagnostics: None,
+                        },
+                    )
+                    .expect("build HandoverFailure");
+                    server
+                        .handle_handover_failure(target_a, &failure)
+                        .await
+                        .expect("handled");
+                }
+                Abandon::NewPreparation => {}
+            }
+            // What the abandon itself put on the wire, end to end: Cancel is acknowledged
+            // to the source; a target's Failure becomes a HandoverPreparationFailure to the
+            // source (both UNSUCCESSFUL/SUCCESSFUL outcomes of their procedures).
+            let sent = take_sent_ngap(&mut server);
+            let outcome: Vec<(u64, u8, u8)> = sent.iter().map(|(a, p)| (*a, p[0], p[1])).collect();
+            match abandon {
+                Abandon::Cancel => assert_eq!(
+                    outcome,
+                    vec![(
+                        source,
+                        0x20,
+                        nextgcore_ngap_gen::generated::ID_HANDOVER_CANCEL as u8
+                    )],
+                    "HandoverCancelAcknowledge to the source"
+                ),
+                Abandon::Failure => assert_eq!(
+                    outcome,
+                    vec![(
+                        source,
+                        0x40,
+                        nextgcore_ngap_gen::generated::ID_HANDOVER_PREPARATION as u8
+                    )],
+                    "HandoverPreparationFailure to the source"
+                ),
+                Abandon::NewPreparation => assert!(outcome.is_empty()),
+            }
+            // A Cancel or a Failure ends the preparation by itself: nothing of it may
+            // be left even before another one starts.
+            let left: Vec<u8> = server
+                .handover_target_transfers
+                .keys()
+                .filter(|(u, _)| *u == ue)
+                .map(|(_, psi)| *psi)
+                .collect();
+            let expected: Vec<u8> = match abandon {
+                Abandon::NewPreparation => vec![1, 2],
+                _ => vec![],
+            };
+            let mut left = left;
+            left.sort_unstable();
+            assert_eq!(left, expected, "arm {n}: transfers left after the abandon");
+
+            // The next handover, toward B, admits PSI 1 only; the UE arrives at B.
+            server
+                .handle_handover_required(
+                    source,
+                    &handover_required_pdu(ue, source_ran, gnb_b, &[1, 2]),
+                )
+                .await
+                .expect("handled");
+            server
+                .handle_handover_request_acknowledge(
+                    target_b,
+                    &handover_ack_pdu(ue, 502, &[(1, vec![0xB1])]),
+                )
+                .await
+                .expect("handled");
+            server
+                .handle_handover_notify(target_b, &handover_notify_pdu(ue, 502))
+                .await
+                .expect("handled");
+
+            let relays: Vec<TypedRelay> = std::mem::take(&mut *seen.lock().expect("sink"));
+            assert_eq!(
+                relays,
+                vec![(
+                    format!("ref-1-{n}"),
+                    "HANDOVER_COMPLETE".to_string(),
+                    vec![0xB1]
+                )],
+                "arm {n}: only the session B admitted is switched, to B's tunnel"
+            );
+            assert!(!server
+                .handover_target_transfers
+                .keys()
+                .any(|(u, _)| *u == ue));
+            take_sent_ngap(&mut server);
+        }
+    }
+
+    /// **#742 review, MAJOR-1.** Only the target the CURRENT preparation's
+    /// HandoverRequest went to may answer it. Sequence: Required to A, Cancel, Required to
+    /// B, A's LATE Acknowledge (PSI 1 and 2), B's Acknowledge (PSI 1), Notify from B. A's
+    /// Ack must send nothing (no HandoverCommand for the cancelled handover) and restore
+    /// nothing, so the SMF gets exactly B's PSI 1. Then a late Failure from A, while B's
+    /// preparation runs, must not abort B's.
+    ///
+    /// REVERT-VERIFIED: without the pending-target check the late Ack commands the source
+    /// and the SMF also gets ref-2 with A's transfer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_late_answer_from_an_abandoned_target_is_ignored() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (_smf, smf_port, seen) = fake_smf_typed().await;
+        let mut server = capturing_ngap_server().await;
+        let (source, target_a, target_b) = (97_461u64, 97_462u64, 97_463u64);
+        let (gnb_a, gnb_b) = (0x7_4601u32, 0x7_4602u32);
+        seed_gnb_session_with_id(&server, source, 0x7_4600).await;
+        seed_gnb_session_with_id(&server, target_a, gnb_a).await;
+        seed_gnb_session_with_id(&server, target_b, gnb_b).await;
+        let (ue, source_ran) = (7_742_101u64, 46u32);
+        let mut state = UeNasContext::new(ue, source_ran, source, false);
+        state.registered = true;
+        state.amf_ue.allowed_nssai = vec![SNssai { sst: 1, sd: None }];
+        server.ue_auth_state.insert(ue, state);
+        for (psi, r) in [(1u8, "late-1"), (2, "late-2")] {
+            server.sm_context_refs.insert((ue, psi), r.to_string());
+            server
+                .sm_context_smfs
+                .insert((ue, psi), ("127.0.0.1".to_string(), smf_port));
+        }
+        let cancel = nextgcore_ngap::builder::build_handover_cancel(
+            &nextgcore_ngap::types::HandoverCancel {
+                amf_ue_ngap_id: ue,
+                ran_ue_ngap_id: source_ran,
+                cause: nextgcore_ngap::types::Cause::RadioNetwork(
+                    nextgcore_ngap::types::CauseRadioNetwork::TngrelocprepExpiry,
+                ),
+            },
+        )
+        .expect("build HandoverCancel");
+
+        server
+            .handle_handover_required(
+                source,
+                &handover_required_pdu(ue, source_ran, gnb_a, &[1, 2]),
+            )
+            .await
+            .expect("handled");
+        server
+            .handle_handover_cancel(source, &cancel)
+            .await
+            .expect("handled");
+        server
+            .handle_handover_required(
+                source,
+                &handover_required_pdu(ue, source_ran, gnb_b, &[1, 2]),
+            )
+            .await
+            .expect("handled");
+        take_sent_ngap(&mut server);
+
+        // A answers late.
+        server
+            .handle_handover_request_acknowledge(
+                target_a,
+                &handover_ack_pdu(ue, 601, &[(1, vec![0xA1]), (2, vec![0xA2])]),
+            )
+            .await
+            .expect("handled");
+        assert!(
+            take_sent_ngap(&mut server).is_empty(),
+            "no HandoverCommand for the cancelled handover"
+        );
+        // A late Failure from A must not abort B's preparation either.
+        let failure = nextgcore_ngap::builder::build_handover_failure(
+            &nextgcore_ngap::types::HandoverFailure {
+                amf_ue_ngap_id: ue,
+                cause: nextgcore_ngap::types::Cause::RadioNetwork(
+                    nextgcore_ngap::types::CauseRadioNetwork::Unspecified,
+                ),
+                criticality_diagnostics: None,
+            },
+        )
+        .expect("build HandoverFailure");
+        server
+            .handle_handover_failure(target_a, &failure)
+            .await
+            .expect("handled");
+        assert!(
+            take_sent_ngap(&mut server).is_empty(),
+            "no PreparationFailure for B's"
+        );
+        assert_eq!(server.handover_pending_target.get(&ue), Some(&target_b));
+
+        server
+            .handle_handover_request_acknowledge(
+                target_b,
+                &handover_ack_pdu(ue, 602, &[(1, vec![0xB1])]),
+            )
+            .await
+            .expect("handled");
+        assert_eq!(
+            take_sent_ngap(&mut server)
+                .iter()
+                .map(|(a, _)| *a)
+                .collect::<Vec<_>>(),
+            vec![source],
+            "B's Ack commands the source"
+        );
+        server
+            .handle_handover_notify(target_b, &handover_notify_pdu(ue, 602))
+            .await
+            .expect("handled");
+        let relays: Vec<TypedRelay> = std::mem::take(&mut *seen.lock().expect("sink"));
+        assert_eq!(
+            relays,
+            vec![(
+                "late-1".to_string(),
+                "HANDOVER_COMPLETE".to_string(),
+                vec![0xB1]
+            )],
+            "only B's PSI 1, to B's tunnel"
+        );
+        assert!(!server.handover_pending_target.contains_key(&ue));
+    }
+
+    /// **#742 review, MAJOR-2.** A UE ended mid-handover takes its preparation state with
+    /// it: after the Acknowledge, an NG Reset from the source naming the (not yet
+    /// registered) UE drops it through `forget_ue`, and no pending target, relay target or
+    /// session transfer is left for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ue_dropped_mid_handover_leaves_no_preparation_state() {
+        let mut server = capturing_ngap_server().await;
+        let (source, target, gnb_t) = (97_471u64, 97_472u64, 0x7_4701u32);
+        seed_gnb_session_with_id(&server, source, 0x7_4700).await;
+        seed_gnb_session_with_id(&server, target, gnb_t).await;
+        let (ue, source_ran) = (7_742_201u64, 47u32);
+        let mut state = UeNasContext::new(ue, source_ran, source, false);
+        state.amf_ue.allowed_nssai = vec![SNssai { sst: 1, sd: None }];
+        server.ue_auth_state.insert(ue, state);
+        server
+            .handle_handover_required(source, &handover_required_pdu(ue, source_ran, gnb_t, &[1]))
+            .await
+            .expect("handled");
+        server
+            .handle_handover_request_acknowledge(
+                target,
+                &handover_ack_pdu(ue, 701, &[(1, vec![0xC1])]),
+            )
+            .await
+            .expect("handled");
+        assert!(server.handover_target_transfers.contains_key(&(ue, 1)));
+
+        let reset = nextgcore_ngap::builder::build_ng_reset(&nextgcore_ngap::types::NgReset {
+            cause: nextgcore_ngap::types::Cause::Transport(
+                nextgcore_ngap::types::CauseTransport::TransportResourceUnavailable,
+            ),
+            reset_type: nextgcore_ngap::types::ResetType::PartOfNgInterface(vec![
+                nextgcore_ngap::types::UeAssociatedLogicalNgConnectionItem {
+                    amf_ue_ngap_id: Some(ue),
+                    ran_ue_ngap_id: Some(source_ran),
+                },
+            ]),
+        })
+        .expect("build NG Reset");
+        server
+            .handle_ng_reset(source, &reset)
+            .await
+            .expect("handled");
+
+        assert!(
+            !server.ue_auth_state.contains(ue),
+            "precondition: the UE was dropped"
+        );
+        assert!(!server.handover_pending_target.contains_key(&ue));
+        assert!(!server.handover_target_assoc.contains_key(&ue));
+        assert!(!server
+            .handover_target_transfers
+            .keys()
+            .any(|(u, _)| *u == ue));
+    }
+
     /// The `(amf_ue_ngap_id, ran_ue_ngap_id)` a DOWNLINK RAN STATUS TRANSFER carries,
     /// decoded with the generated codec; `None` for any other PDU.
     fn decoded_downlink_ran_status_ids(pdu: &[u8]) -> Option<(u64, u32)> {
@@ -20433,6 +20952,11 @@ mod tests {
             },
         )
         .expect("build HandoverRequestAcknowledge");
+        // The HandoverRequest of this preparation went to `target`: only it may answer
+        // (#742 review).
+        server
+            .handover_pending_target
+            .insert(amf_ue_ngap_id, target);
         server
             .handle_handover_request_acknowledge(target, &ack)
             .await
@@ -20530,6 +21054,9 @@ mod tests {
         // handover's status transfer to a gNB that already rejected the UE.
         let ue_failure = 78_003u64;
         server.handover_target_assoc.insert(ue_failure, (target, 1));
+        // The HandoverRequest of the current preparation went to `target` (#742 review:
+        // only that association may answer it).
+        server.handover_pending_target.insert(ue_failure, target);
         let failure = nextgcore_ngap::builder::build_handover_failure(
             &nextgcore_ngap::types::HandoverFailure {
                 amf_ue_ngap_id: ue_failure,
@@ -21256,7 +21783,8 @@ mod tests {
     // ---- outbound capture: what amfd SENDS, not just what it stores ----
 
     /// A test server whose `send_to_association` records each NGAP PDU as
-    /// `(association_id, pdu)` instead of writing it to SCTP (see `sent_ngap`).
+    /// `(association_id, sctp_stream_id, pdu)` instead of writing it to SCTP (see
+    /// `sent_ngap`).
     async fn capturing_ngap_server() -> NgapServer {
         let mut server = test_ngap_server().await;
         server.sent_ngap = Some(Vec::new());
@@ -25563,13 +26091,17 @@ mod tests {
 
     /// **#802.** A UE Context Release Complete that names no usable UE -- undecodable,
     /// or carrying a not-comprehended IE marked reject (TS 38.413 §10.3.4.2) -- must not
-    /// arm the mobile reachable timer for a CONNECTED UE of the sending gNB. Before, the
+    /// arm the mobile reachable timer for any UE of the sending gNB. Before #802 the
     /// fallback armed every registered UE of the association, so one malformed PDU put
-    /// every connected UE on the gNB on the path to implicit deregistration. An idle,
-    /// unsupervised UE there is still supervised (the reason the fallback exists).
+    /// every connected UE on the gNB on the path to implicit deregistration. #802 narrowed
+    /// it to idle, unsupervised UEs; the follow-up arms nobody, because those UEs' N1
+    /// connections ended at an EARLIER release (TS 24.501 §5.3.7 starts the timer then),
+    /// and re-arming them extended their supervision and sent a false CM-CONNECTED ->
+    /// CM-IDLE report each time. A UE already in implicit-deregistration supervision keeps
+    /// its phase and deadline.
     ///
-    /// REVERT-VERIFIED: with the fallback's old association-only filter the connected
-    /// UE is armed and this fails.
+    /// REVERT-VERIFIED: with #802's fallback the idle unsupervised UE is armed; with the
+    /// original one the connected UE is too.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unusable_release_complete_never_supervises_a_connected_ue() {
         crate::context::amf_context_init(64, 1024, 4096);
@@ -25592,6 +26124,16 @@ mod tests {
             i.registered = true;
             i.cm_idle = true;
             ngap.ue_auth_state.insert(idle, i);
+            let dereg = 7_802_003u64 + 10 * n as u64;
+            let dereg_deadline = Instant::now() + Duration::from_secs(600);
+            let mut d = UeNasContext::new(dereg, 3, assoc, false);
+            d.registered = true;
+            d.cm_idle = true;
+            d.reachability = Some(Reachability {
+                phase: ReachabilityPhase::ImplicitDeregistration,
+                deadline: dereg_deadline,
+            });
+            ngap.ue_auth_state.insert(dereg, d);
 
             ngap.handle_ue_context_release_complete(assoc, &pdu)
                 .await
@@ -25611,11 +26153,20 @@ mod tests {
             assert!(!ngap.ue_auth_state.get(connected).unwrap().is_cm_idle());
             assert_eq!(
                 phase(idle),
-                Some(ReachabilityPhase::MobileReachable),
-                "case {n}: the idle, unsupervised UE of the association is"
+                None,
+                "case {n}: an idle UE whose N1 connection this Complete did not end is not"
             );
-            ngap.ue_auth_state.remove(connected);
-            ngap.ue_auth_state.remove(idle);
+            assert_eq!(
+                ngap.ue_auth_state
+                    .get(dereg)
+                    .and_then(|s| s.reachability)
+                    .map(|r| (r.phase, r.deadline)),
+                Some((ReachabilityPhase::ImplicitDeregistration, dereg_deadline)),
+                "case {n}: an implicit-deregistration supervision is left as it was"
+            );
+            for id in [connected, idle, dereg] {
+                ngap.ue_auth_state.remove(id);
+            }
         }
     }
 

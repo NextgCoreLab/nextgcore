@@ -8,7 +8,7 @@ use crate::error::{NasError, NasResult};
 use bytes::{BufMut, BytesMut};
 
 /// NAS security context
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct NasSecurityContext {
     /// Selected NAS security algorithms
     pub algorithms: SecurityAlgorithms,
@@ -27,6 +27,23 @@ pub struct NasSecurityContext {
     dl_established: bool,
     /// True once an uplink message has been successfully verified.
     ul_established: bool,
+}
+
+/// Manual `Debug` (no-auth-material-in-logs): the authentication material in
+/// this type (knas_enc, knas_int) prints as `<redacted>`, so a future
+/// `{:?}` in a log line cannot leak it.
+impl std::fmt::Debug for NasSecurityContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("NasSecurityContext");
+        d.field("algorithms", &self.algorithms);
+        d.field("knas_enc", &"<redacted>");
+        d.field("knas_int", &"<redacted>");
+        d.field("dl_count", &self.dl_count);
+        d.field("ul_count", &self.ul_count);
+        d.field("dl_established", &self.dl_established);
+        d.field("ul_established", &self.ul_established);
+        d.finish()
+    }
 }
 
 impl NasSecurityContext {
@@ -625,5 +642,22 @@ mod tests {
             unprotect_nas_message(&mut rx, 1, &f0, false),
             Err(NasError::ReplayedSequenceNumber)
         ));
+    }
+}
+
+#[cfg(test)]
+mod debug_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn nas_security_context_debug_prints_no_keys() {
+        let ctx = NasSecurityContext {
+            knas_enc: [0xe5; 16],
+            knas_int: [0xf6; 16],
+            ..Default::default()
+        };
+        let shown = format!("{ctx:?}");
+        assert!(!shown.contains("229") && !shown.contains("246"), "{shown}");
+        assert!(shown.contains("<redacted>"));
     }
 }

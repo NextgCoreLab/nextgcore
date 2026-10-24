@@ -138,7 +138,7 @@ docker/rust/configs/
 └── tls/            # SBI TLS material (see also docker/rust/certs/)
 ```
 
-Kubernetes configuration lives in `k8s/base/` and `k8s/manifests/`. NFs log at `info` by default, tunable via `--log-level` (and `RUST_LOG` in 13 of the 28 NFs; see the [configuration overview](configuration/overview.md)).
+Kubernetes configuration lives in `k8s/base/` and `k8s/manifests/`. NFs log at `info` by default, tunable via `--log-level` or `RUST_LOG`, which overrides it (see the [configuration overview](configuration/overview.md)).
 
 ## Next Steps
 
