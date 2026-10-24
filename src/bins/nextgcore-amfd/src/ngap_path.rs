@@ -3194,7 +3194,7 @@ impl NgapServer {
                 );
                 // TS 24.501 Section 5.4.2.5: abort the procedure; the network
                 // releases the N1 signalling connection.
-                self.release_ue(
+                self.abort_release_ue(
                     association_id,
                     ul_nas.amf_ue_ngap_id,
                     ul_nas.ran_ue_ngap_id,
@@ -11593,7 +11593,7 @@ impl NgapServer {
                     // funnel, or #356's emergency context leaks again the next time a path
                     // is added beside it.
                     self.ue_auth_state.insert(amf_ue_ngap_id, state);
-                    self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+                    self.abort_release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
                         .await?;
                 }
                 NasProcTimer::T3570 => {
@@ -11607,7 +11607,7 @@ impl NgapServer {
                         // SUCI identification aborted: release. `release_ue` -> `forget_ue`
                         // owns the removal; see the T3560 arm.
                         self.ue_auth_state.insert(amf_ue_ngap_id, state);
-                        self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+                        self.abort_release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
                             .await?;
                     }
                 }
@@ -11887,8 +11887,96 @@ impl NgapServer {
             "the NAS reject",
         )
         .await;
+        self.abort_release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, nas_cause)
+            .await
+    }
+
+    /// [`Self::release_ue`] for a procedure the AMF ABORTS (#845): a registration
+    /// reject, T3560 / T3570 exhaustion, a Security Mode Reject, an Initial
+    /// Context Setup Failure. Unlike a deregistration, nothing released the UE's
+    /// PDU sessions first, and `forget_ue` drops their refs (#756), after which
+    /// nothing in the AMF could ever release them: the SM contexts, PFCP sessions,
+    /// TEIDs and UE IP addresses would leak at the SMF and UPF. So every session
+    /// the UE still holds is released at its SMF first (TS 23.502 §4.2.2.3.2: a
+    /// UE context the AMF deletes has its PDU sessions released), off the NGAP
+    /// task ([`Self::offload_release_held_sessions`]).
+    async fn abort_release_ue(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        nas_cause: u8,
+    ) -> Result<()> {
+        self.offload_release_held_sessions(amf_ue_ngap_id);
         self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, nas_cause)
             .await
+    }
+
+    /// Nsmf_PDUSession_ReleaseSMContext for every PDU session `amf_ue_ngap_id`
+    /// still holds, through `sbi_offload` (#845). Durable and keyed on (UE, PSI):
+    /// the `forget_ue` that follows must not drop a release, and a release reaches
+    /// the SMF before any later exchange for the same session. Each goes to the
+    /// SMF that holds the context (#669). One whose SMF is not recorded is sent to
+    /// the SMF discovery selects, and skipped with a log when there is none rather
+    /// than sent to a guessed address.
+    fn offload_release_held_sessions(&mut self, amf_ue_ngap_id: u64) {
+        let mut held: std::collections::BTreeMap<u8, String> = self
+            .sm_context_refs
+            .iter()
+            .filter(|((ue, _), _)| *ue == amf_ue_ngap_id)
+            .map(|((_, psi), r)| (*psi, r.clone()))
+            .collect();
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            for sess in guard.sess_list_for_ue(amf_ue_ngap_id) {
+                if let Some(r) = sess.sm_context_ref {
+                    held.entry(sess.psi).or_insert(r);
+                }
+            }
+        }
+        if held.is_empty() {
+            return;
+        }
+        log::info!(
+            "UE {amf_ue_ngap_id}: the aborted procedure ends the UE context; releasing its {} \
+             PDU session(s) at the SMF first (TS 23.502 §4.2.2.3.2)",
+            held.len()
+        );
+        for (psi, sm_ref) in held {
+            let owner = self.sm_context_smfs.get(&(amf_ue_ngap_id, psi)).cloned();
+            self.sbi_offload
+                .spawn_keyed_durable((amf_ue_ngap_id, psi), move || async move {
+                    let (host, port) = match owner {
+                        Some(owner) => owner,
+                        None => match crate::sbi_path::resolve_nf_endpoint_async(
+                            crate::sbi_path::SbiServiceType::NsmfPdusession,
+                        )
+                        .await
+                        {
+                            Ok(ep) => ep,
+                            Err(e) => {
+                                log::warn!(
+                                    "UE {amf_ue_ngap_id}: no SMF to release SM context \
+                                     {sm_ref} (PSI={psi}) at: {e}"
+                                );
+                                return None;
+                            }
+                        },
+                    };
+                    match crate::sbi_path::call_smf_release_sm_context(&host, port, &sm_ref).await {
+                        Ok(()) => log::info!(
+                            "SMF SM Context Released: {sm_ref} (PSI={psi}) of UE \
+                             {amf_ue_ngap_id}, whose procedure was aborted"
+                        ),
+                        Err(e) => log::warn!(
+                            "UE {amf_ue_ngap_id}: SMF release of {sm_ref} (PSI={psi}) \
+                             failed: {e}"
+                        ),
+                    }
+                    None
+                });
+        }
     }
 
     /// Send a UEContextReleaseCommand with a NAS cause and drop the UE's
@@ -14672,30 +14760,27 @@ impl NgapServer {
             crate::context::nas_security_canary(),
         );
         seed_eps_to_5gs_ue(&mut state.amf_ue, &prep);
-        let default_nssai = {
+        let sessions: Vec<crate::ngap_asn1::HandoverRequestSession> = {
             let ctx = crate::context::amf_self();
             let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
-            guard
-                .plmn_support
-                .first()
-                .and_then(|p| p.s_nssai.first().cloned())
-        };
-        let sessions: Vec<crate::ngap_asn1::HandoverRequestSession> = prep
-            .sessions
-            .iter()
-            .filter_map(|sess| {
-                let s_nssai = sess
-                    .created
-                    .s_nssai
-                    .map(|(sst, sd)| crate::context::SNssai { sst, sd })
-                    .or_else(|| default_nssai.clone())?;
-                Some(crate::ngap_asn1::HandoverRequestSession {
-                    pdu_session_id: sess.created.pdu_session_id,
-                    s_nssai,
-                    transfer: sess.created.n2_sm_info.clone(),
+            prep.sessions
+                .iter()
+                .map(|sess| {
+                    // #920 follow-up: an SMF that names no S-NSSAI, or SST 0, gets the
+                    // default slice, which the session is then recorded under below.
+                    let s_nssai = guard.usable_s_nssai(
+                        sess.created
+                            .s_nssai
+                            .map(|(sst, sd)| crate::context::SNssai { sst, sd }),
+                    );
+                    crate::ngap_asn1::HandoverRequestSession {
+                        pdu_session_id: sess.created.pdu_session_id,
+                        s_nssai,
+                        transfer: sess.created.n2_sm_info.clone(),
+                    }
                 })
-            })
-            .collect();
+                .collect()
+        };
         let mut allowed_nssai: Vec<crate::context::SNssai> = Vec::new();
         for sess in &sessions {
             if !allowed_nssai
@@ -15777,7 +15862,7 @@ impl NgapServer {
         });
         // NAS cause #22 "congestion" is not appropriate; use #9 (UE identity
         // cannot be derived) so the UE re-registers (TS 24.501 Annex).
-        self.release_ue(
+        self.abort_release_ue(
             association_id,
             amf_ue_ngap_id,
             ran_ue_ngap_id,
@@ -35675,6 +35760,106 @@ mod eps_to_5gs_tests {
         );
         assert!(crate::n26_path::drain_eps_to_5gs_preparations().is_empty());
 
+        crate::sbi_path::set_pgw_discovery_nrf_for_test(None);
+        restore_guami(previous_guami);
+    }
+
+    /// **#920 review, MINOR 2 (and MINOR 1 for SST 0).** An EPS→5GS session whose SMF
+    /// named no S-NSSAI -- or named SST 0, which is no slice -- goes to the target gNB
+    /// under this AMF's default S-NSSAI and is RECORDED under it, so a later N2 handover,
+    /// Initial Context Setup or PDU Session Resource Setup carries a slice and never SST 0.
+    ///
+    /// REVERT-VERIFIED: with the old writer the recorded S-NSSAI is SST 0.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    // CONTEXT_GUARD is held across the awaits on purpose, as in the end-to-end test.
+    async fn an_eps_to_5gs_session_without_a_usable_slice_is_recorded_under_the_default() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::test_support::init_context();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let previous_guami = serve_guami_999_70();
+        let default = crate::context::amf_self().read().unwrap().default_s_nssai();
+        assert_ne!(default.sst, 0, "precondition: the default names a slice");
+
+        for (n, named) in [None, Some((0u8, Some(0x0920)))].into_iter().enumerate() {
+            let _ = crate::n26_path::drain_eps_to_5gs_preparations();
+            let (_smf, smf_port, mut smf_rx) = start_smf().await;
+            let (_nrf, nrf_port, _nrf_rx) = start_nrf(smf_port, PGW_FQDN).await;
+            crate::sbi_path::set_pgw_discovery_nrf_for_test(Some(format!(
+                "http://127.0.0.1:{nrf_port}"
+            )));
+            let n26 = crate::n26_path::N26Server::open("127.0.0.1:0".parse().unwrap(), 1)
+                .await
+                .expect("N26 socket");
+            let mme = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            mme.send_to(
+                &forward_relocation_request([127, 0, 0, 1]),
+                n26.local_addr(),
+            )
+            .await
+            .unwrap();
+            let _create = recv_smf(&mut smf_rx).await;
+            let mut prep = drained_preparation().await;
+            for sess in prep.sessions.iter_mut() {
+                sess.created.s_nssai = named;
+            }
+
+            let mut ngap = NgapServer::new(
+                "127.0.0.1:0".parse().unwrap(),
+                SctpBackend::Userspace,
+                mpsc::channel(64).0,
+            )
+            .await
+            .unwrap();
+            let assoc = 0x920 + n as u64;
+            let mut session = GnbSession::new(assoc, assoc, "127.0.0.1:38412".parse().unwrap());
+            session.gnb.gnb_id = GNB_ID;
+            session.gnb.gnb_id_len = 22;
+            session.gnb.gnb_id_presence = true;
+            session.gnb.plmn_id = PlmnId::new("999", "70");
+            ngap.sessions.write().await.insert(assoc, session);
+
+            let (amf_ue_ngap_id, _, request) = ngap
+                .prepare_eps_to_5gs_handover_request(prep)
+                .await
+                .expect("the HandoverRequest is prepared");
+            let hr = match nextgcore_ngap_gen::decode(&request).unwrap() {
+                nextgcore_ngap_gen::NGAP_PDU::InitiatingMessage(m) => m,
+                other => panic!("{other:?}"),
+            };
+            let nextgcore_ngap_gen::generated::InitiatingMessageValue::Id_HandoverResourceAllocation(
+                req,
+            ) = hr.value
+            else {
+                panic!("HandoverRequest expected");
+            };
+            let sst_sent = req.protocol_i_es.0.iter().find_map(|ie| match &ie.value {
+                nextgcore_ngap_gen::generated::HandoverRequestProtocolIEs_EntryValue::Id_PDUSessionResourceSetupListHOReq(l) => {
+                    l.0.first().map(|item| item.s_nssai.sst.0.clone())
+                }
+                _ => None,
+            });
+            assert_eq!(
+                sst_sent,
+                Some(vec![default.sst]),
+                "case {n}: the default goes out"
+            );
+            let stored = crate::context::amf_self()
+                .read()
+                .unwrap()
+                .sess_list_for_ue(amf_ue_ngap_id);
+            assert_eq!(stored.len(), 1, "case {n}");
+            assert_eq!(
+                (stored[0].s_nssai.sst, stored[0].s_nssai.sd),
+                (default.sst, default.sd),
+                "case {n}: recorded under the default S-NSSAI the HandoverRequest carried"
+            );
+            ngap.sbi_offload.cancel_ue(amf_ue_ngap_id);
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap();
+            for sess in guard.sess_list_for_ue(amf_ue_ngap_id) {
+                guard.sess_remove(sess.id);
+            }
+        }
         crate::sbi_path::set_pgw_discovery_nrf_for_test(None);
         restore_guami(previous_guami);
     }

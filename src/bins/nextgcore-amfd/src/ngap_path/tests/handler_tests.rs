@@ -4272,6 +4272,142 @@ async fn a_session_reactivated_by_a_registration_update_gets_no_second_setup() {
     server.forget_ue(ue);
 }
 
+// ---------------------------------------------------------------------------
+// #845: an aborted procedure releases the UE's PDU sessions before forgetting it
+// ---------------------------------------------------------------------------
+
+/// The SM context refs the stand-in SMF was asked to release, sorted.
+fn released_sm_refs(calls: &std::sync::Mutex<Vec<SmfCall>>) -> Vec<String> {
+    let mut refs: Vec<String> = calls
+        .lock()
+        .expect("calls")
+        .iter()
+        .filter_map(|(uri, _)| {
+            let rest = uri.split("/sm-contexts/").nth(1)?;
+            let (sm_ref, op) = rest.split_once('/')?;
+            (op == "release").then(|| sm_ref.to_string())
+        })
+        .collect();
+    refs.sort();
+    refs
+}
+
+/// The abort paths #845 names, each driven through its real handler.
+#[derive(Clone, Copy, Debug)]
+enum Abort {
+    RegistrationReject,
+    T3560Exhausted,
+    T3570Exhausted,
+    SecurityModeReject,
+    InitialContextSetupFailure,
+}
+
+/// A registered UE holding PSIs 1 and 2 at the stand-in SMF, whose procedure
+/// `abort` ends. Returns the refs released at the SMF, what is left of the
+/// UE's session state, and whether the UE is still held.
+async fn abort_with_sessions(
+    abort: Abort,
+    ue: u64,
+    ran: u32,
+) -> (Vec<String>, (usize, usize, usize), bool) {
+    let (_smf, port, calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    secured_registered_ue(&mut server, ue, ran);
+    hold_session(&mut server, ue, 1, &format!("abort-845-{ue}-1"), port);
+    hold_session(&mut server, ue, 2, &format!("abort-845-{ue}-2"), port);
+    match abort {
+        Abort::RegistrationReject => {
+            let reject = gmm_build::build_registration_reject(GmmCause::IllegalUe);
+            server
+                .reject_and_release(ASSOC, ue, ran, &reject, 1)
+                .await
+                .expect("rejected");
+        }
+        Abort::T3560Exhausted => {
+            server.ue_auth_state.with_mut(ue, |s| {
+                s.retx = Some(NasRetx {
+                    timer: NasProcTimer::T3560,
+                    deadline: Instant::now() - Duration::from_secs(1),
+                    retries: 100,
+                    ngap_pdu: vec![0x00],
+                });
+            });
+            server.process_nas_timers().await.expect("timers");
+        }
+        Abort::T3570Exhausted => {
+            // A SUCI identification (not the PEI one) that went unanswered.
+            server.ue_auth_state.with_mut(ue, |s| {
+                s.pei_requested = false;
+                s.retx = Some(NasRetx {
+                    timer: NasProcTimer::T3570,
+                    deadline: Instant::now() - Duration::from_secs(1),
+                    retries: 100,
+                    ngap_pdu: vec![0x00],
+                });
+            });
+            server.process_nas_timers().await.expect("timers");
+        }
+        Abort::SecurityModeReject => {
+            let reject = ue_protect(&[0x7E, 0x00, message_type::SECURITY_MODE_REJECT, 0x18], 0);
+            server
+                .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &reject))
+                .await
+                .expect("handled");
+        }
+        Abort::InitialContextSetupFailure => {
+            // The abort case is the ICS of an INITIAL registration: the UE is not
+            // registered yet. Since #826 (review M1) a registered UE whose ICS fails
+            // stays registered and keeps its sessions, so nothing is aborted.
+            server.ue_auth_state.with_mut(ue, |s| s.registered = false);
+            let failure = crate::ngap_asn1::tests::ics_failure_pdu(
+                ue,
+                ran,
+                nextgcore_ngap::types::Cause::RadioNetwork(
+                    nextgcore_ngap::types::CauseRadioNetwork::Unspecified,
+                ),
+            );
+            server
+                .handle_initial_context_setup_failure(ASSOC, &failure)
+                .await
+                .expect("handled");
+        }
+    }
+    // The releases run off the NGAP task.
+    server.sbi_offload.settle().await;
+    let held = server.ue_auth_state.contains(ue);
+    let state = session_state_of(&server, ue);
+    server.forget_ue(ue);
+    (released_sm_refs(&calls), state, held)
+}
+
+/// #845: every abort path that ends a UE context releases each PDU session it
+/// held at the SMF (TS 23.502 §4.2.2.3.2), and only then is nothing left: no
+/// UE, no refs, no `sess_list` entry. Before the fix the refs went with
+/// `forget_ue` and nothing released them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_aborted_procedure_releases_the_sessions_before_forgetting_the_ue() {
+    for (n, abort) in [
+        Abort::RegistrationReject,
+        Abort::T3560Exhausted,
+        Abort::T3570Exhausted,
+        Abort::SecurityModeReject,
+        Abort::InitialContextSetupFailure,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ue = 7_845_001 + n as u64;
+        let (released, state, held) = abort_with_sessions(abort, ue, 70 + n as u32).await;
+        assert_eq!(
+            released,
+            vec![format!("abort-845-{ue}-1"), format!("abort-845-{ue}-2")],
+            "{abort:?}: each session is released at the SMF holding it"
+        );
+        assert_eq!(state, (0, 0, 0), "{abort:?}: nothing is left");
+        assert!(!held, "{abort:?}: the UE context is gone");
+    }
+}
+
 /// #749 over the Namf surface: smfd's downlink-data N1N2 for PSI 2 pages the
 /// idle UE (202). The one for PSI 1, while that paging is ongoing, is answered
 /// 409 with `N1N2MessageTransferError` cause HIGHER_PRIORITY_REQUEST_ONGOING and
