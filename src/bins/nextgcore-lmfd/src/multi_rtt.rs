@@ -44,6 +44,155 @@ pub trait NrppaTransport: Send + Sync {
     }
 }
 
+/// The DL-PRS assistance data of a session (#911), and the TRPs it names.
+pub struct Assistance {
+    pub built: crate::dl_prs_assistance::Built,
+    /// DL-PRS ID → registry key of its TRP, for the session's measurements.
+    pub keys: std::collections::HashMap<u8, String>,
+    /// The TRPs described, with their DL-PRS IDs.
+    pub trps: Vec<(NgRanNode, u16, u8)>,
+}
+
+/// Build the DL-PRS assistance data (TS 38.305 §8.10.3.2 step 7, §8.12) from the
+/// TRP Information of the configured nodes, learning it first where it is
+/// missing (#911). `serving` is the AMF's serving cell, whose TRP becomes the
+/// reference and the a-priori UE position. `None` when no TRP reported a PRS
+/// configuration this LMF can describe: the UE is then asked without one, as
+/// before.
+pub async fn prepare_assistance<T: NrppaTransport>(
+    t: &T,
+    timeout: Duration,
+    serving: Option<&crate::nlmf::Ncgi>,
+) -> Option<Assistance> {
+    use crate::dl_prs_assistance::{build, APriori, TrpPrs};
+    ensure_trp_information(t, timeout).await;
+    let ctx = lmf_self();
+    let c = ctx.read().ok()?;
+    let all = c.trp_information();
+    let ambiguous = answers::ambiguous_pcis(all.iter().map(|(_, t)| t));
+    let registry = c.build_trp_registry();
+    let mut trps: Vec<TrpPrs> = Vec::new();
+    let mut named: Vec<(NgRanNode, u16, u8)> = Vec::new();
+    for (node, info) in &all {
+        let Some(prs) = info.prs.clone() else {
+            continue;
+        };
+        let Some(dl_prs_id) = c.dl_prs_id_assign(node, info.trp_id) else {
+            log::warn!("DL-PRS assistance: all 256 DL-PRS IDs are assigned; TRP {} of {node:?} is not described", info.trp_id);
+            continue;
+        };
+        // The position: what the gNB reported, else what the operator configured
+        // for its CGI, or for its PCI when no other TRP has that PCI.
+        let key = crate::context::trp_key(node, info.trp_id);
+        let coord = info
+            .coord
+            .or_else(|| info.nr_cgi.as_deref().and_then(|k| registry.lookup(k)))
+            .or_else(|| {
+                info.pci
+                    .filter(|p| !ambiguous.contains(p))
+                    .and_then(|p| registry.lookup(&format!("pci-{p}")))
+            });
+        // #990 review: a position NG-RAN corrects later replaces the one learned
+        // before. The key is this LMF's own, never configured.
+        if let Some(coord) = coord {
+            match registry.lookup(&key) {
+                Some(old) if old == coord => {}
+                Some(old) => {
+                    log::info!("DL-PRS assistance: {key} moved from {old:?} to {coord:?}");
+                    c.set_cell_coord(key.clone(), coord);
+                }
+                None => c.set_cell_coord(key.clone(), coord),
+            }
+        }
+        trps.push(TrpPrs {
+            dl_prs_id,
+            pci: info.pci,
+            ncgi: info.ncgi.clone(),
+            arfcn: info.arfcn,
+            coord,
+            sfn_init: info.sfn_init,
+            prs,
+        });
+        named.push((node.clone(), info.trp_id, dl_prs_id));
+    }
+    drop(c);
+    if trps.is_empty() {
+        log::info!("DL-PRS assistance: no TRP reported a PRS configuration; none is sent");
+        return None;
+    }
+    // The serving TRP is the reference, and the UE is within reach of it: as far
+    // as its nearest neighbour TRP, at least 100 m. Without it, the centroid, and
+    // as far as the farthest TRP.
+    let serving_index = serving.and_then(|s| {
+        trps.iter().position(|t| {
+            t.ncgi
+                .as_ref()
+                .is_some_and(|n| n.matches(&s.plmn_id.mcc, &s.plmn_id.mnc, &s.nr_cell_id))
+        })
+    });
+    let coords: Vec<crate::positioning::TrpCoord> = trps.iter().filter_map(|t| t.coord).collect();
+    let distance = |a: crate::positioning::TrpCoord, b: crate::positioning::TrpCoord| {
+        let p = crate::positioning::geodetic_to_enu(b, a);
+        (p.e * p.e + p.n * p.n + p.u * p.u).sqrt()
+    };
+    let a_priori = match serving_index.and_then(|i| trps[i].coord) {
+        Some(here) => {
+            let nearest = coords
+                .iter()
+                .map(|c| distance(here, *c))
+                .filter(|d| *d > 1.0)
+                .fold(f64::INFINITY, f64::min);
+            Some(APriori {
+                coord: here,
+                radius_m: if nearest.is_finite() {
+                    nearest.max(100.0)
+                } else {
+                    1_000.0
+                },
+            })
+        }
+        None if !coords.is_empty() => {
+            let n = coords.len() as f64;
+            let centroid = crate::positioning::TrpCoord::new(
+                coords.iter().map(|c| c.lat_deg).sum::<f64>() / n,
+                coords.iter().map(|c| c.lon_deg).sum::<f64>() / n,
+                coords.iter().map(|c| c.height_m).sum::<f64>() / n,
+            );
+            let farthest = coords
+                .iter()
+                .map(|c| distance(centroid, *c))
+                .fold(0.0, f64::max);
+            Some(APriori {
+                coord: centroid,
+                radius_m: farthest.max(100.0),
+            })
+        }
+        None => None,
+    };
+    let built = match build(&trps, serving_index.unwrap_or(0), a_priori) {
+        Ok(b) => b,
+        Err(e) => {
+            log::warn!("DL-PRS assistance: {e}; none is sent");
+            return None;
+        }
+    };
+    named.retain(|(_, _, id)| built.dl_prs_ids.contains(id));
+    let keys = named
+        .iter()
+        .map(|(node, trp, id)| (*id, crate::context::trp_key(node, *trp)))
+        .collect();
+    log::info!(
+        "DL-PRS assistance: {} TRP(s), reference DL-PRS ID {}",
+        named.len(),
+        built.reference
+    );
+    Some(Assistance {
+        built,
+        keys,
+        trps: named,
+    })
+}
+
 /// One MEASUREMENT REQUEST in flight.
 pub struct PendingMeasurement {
     node: NgRanNode,
@@ -57,6 +206,8 @@ pub struct PreparedGnbLeg {
     measurements: Vec<PendingMeasurement>,
     /// The SRS that was activated, to deactivate afterwards.
     activated: Option<SrsActivation>,
+    /// The TRPs the session's assistance data named, with their DL-PRS IDs (#911).
+    assisted: Vec<(NgRanNode, u16, u8)>,
 }
 
 /// Send `pdu` and wait up to `timeout` for the answer to `procedure`/`txn`.
@@ -91,14 +242,19 @@ async fn exchange(
     }
 }
 
-/// Learn the TRPs of every configured node that has not told us yet.
-async fn ensure_trp_information<T: NrppaTransport>(t: &T, timeout: Duration) {
+/// Learn the TRPs of every configured node that has not told us yet, or told us
+/// more than [`crate::context::TRP_INFORMATION_MAX_AGE`] ago.
+pub async fn ensure_trp_information<T: NrppaTransport>(t: &T, timeout: Duration) {
     let (nodes, known) = match lmf_self().read() {
         Ok(c) => (c.ng_ran_nodes(), c.trp_information()),
         Err(_) => return,
     };
     for node in nodes {
-        if known.iter().any(|(n, _)| *n == node) {
+        // #990 review: asked again once its answer is TRP_INFORMATION_MAX_AGE old.
+        let stale = lmf_self()
+            .read()
+            .is_ok_and(|c| c.trp_information_stale(&node));
+        if known.iter().any(|(n, _)| *n == node) && !stale {
             continue;
         }
         if lmf_self()
@@ -145,10 +301,15 @@ async fn ensure_trp_information<T: NrppaTransport>(t: &T, timeout: Duration) {
 ///
 /// `step_timeout` bounds each exchange; `response_time_ms` is what the gNBs are
 /// told they have to measure in.
+///
+/// `assisted` are the TRPs the session's DL-PRS assistance data named (#911).
+/// They are measured even when their PCI is on another TRP too, because the
+/// UE names them by their DL-PRS ID.
 pub async fn prepare<T: NrppaTransport>(
     t: &T,
     step_timeout: Duration,
     response_time_ms: u32,
+    assisted: &[(NgRanNode, u16, u8)],
 ) -> Result<PreparedGnbLeg, String> {
     ensure_trp_information(t, step_timeout).await;
     let all = lmf_self()
@@ -163,13 +324,19 @@ pub async fn prepare<T: NrppaTransport>(
             "Multi-RTT: PCIs {ambiguous:?} are on more than one TRP; those TRPs are not measured"
         );
     }
+    let is_assisted =
+        |node: &NgRanNode, trp: u16| assisted.iter().any(|(n, t, _)| n == node && *t == trp);
     let trps: Vec<(NgRanNode, u16)> = all
         .into_iter()
-        .filter(|(_, info)| info.pci.is_some_and(|p| !ambiguous.contains(&p)))
+        .filter(|(node, info)| {
+            is_assisted(node, info.trp_id) || info.pci.is_some_and(|p| !ambiguous.contains(&p))
+        })
         .map(|(node, info)| (node, info.trp_id))
         .collect();
     if trps.is_empty() {
-        return Err("no NG-RAN node reported a TRP with an NR PCI".to_string());
+        return Err(
+            "no NG-RAN node reported a TRP with an unambiguous NR PCI or a DL-PRS ID".to_string(),
+        );
     }
 
     let session = t.session();
@@ -254,6 +421,7 @@ pub async fn prepare<T: NrppaTransport>(
     Ok(PreparedGnbLeg {
         measurements,
         activated,
+        assisted: assisted.to_vec(),
     })
 }
 
@@ -305,6 +473,27 @@ pub async fn collect<T: NrppaTransport>(
         match answers::decode_measurement_response(&bytes, m.lmf_measurement_id) {
             Ok(halves) => {
                 for h in halves {
+                    // #911: a TRP the assistance data named is keyed by its TRP.
+                    if let Some((_, _, id)) = prepared
+                        .assisted
+                        .iter()
+                        .find(|(n, t, _)| *n == m.node && *t == h.trp_id)
+                    {
+                        match h.rx_tx_ns {
+                            Some(rx_tx) => cells.push(CellMeasurement {
+                                nr_cgi: crate::context::trp_key(&m.node, h.trp_id),
+                                dl_prs_id: Some(*id),
+                                ..gnb_half(0, rx_tx, h.time)
+                            }),
+                            None => log::warn!(
+                                "Multi-RTT: TRP {} of {:?}: an open-ended gNB Rx-Tx report; \
+                                 not used",
+                                h.trp_id,
+                                m.node
+                            ),
+                        }
+                        continue;
+                    }
                     let pci = trps
                         .iter()
                         .find(|(n, info)| *n == m.node && info.trp_id == h.trp_id)

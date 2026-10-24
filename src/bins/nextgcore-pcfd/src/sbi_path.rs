@@ -965,6 +965,13 @@ pub fn pcf_sbi_send_policyauthorization_terminate_notify_for(app: &crate::contex
 /// SM-policy delete must remove first and notify after, so an AF Delete racing
 /// the notification never finds a live app; this records the ordering
 /// deterministically, with no race to win. Beside the sender it observes.
+/// Every BSF binding deregistration started in tests (#980 review), so a test
+/// can see that a path deregisters without a BSF to receive it. Beside the
+/// sender it observes.
+#[cfg(test)]
+pub(crate) static BSF_DEREGISTRATIONS_FOR_TEST: std::sync::Mutex<Vec<String>> =
+    std::sync::Mutex::new(Vec::new());
+
 #[cfg(test)]
 pub(crate) static TERMINATES_SENT_FOR_TEST: std::sync::Mutex<Vec<(String, bool)>> =
     std::sync::Mutex::new(Vec::new());
@@ -2380,6 +2387,11 @@ pub fn pcf_sess_deregister_bsf_binding(binding_id: String) {
     if binding_id.is_empty() {
         return;
     }
+    #[cfg(test)]
+    BSF_DEREGISTRATIONS_FOR_TEST
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(binding_id.clone());
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn(async move {
             match pcf_deregister_bsf_binding(&binding_id).await {

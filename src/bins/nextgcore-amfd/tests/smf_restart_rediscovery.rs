@@ -38,6 +38,7 @@ fn test_identity() -> SmContextIdentity {
             }
         })),
         gpsi: Some("msisdn-491234567890".to_string()),
+        origination_timestamp: None,
     }
 }
 

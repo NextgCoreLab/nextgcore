@@ -12,6 +12,7 @@ thiserror.workspace = true
 # Issue #66: the shared NF state store persists full-store JSON snapshots, the
 # format the four NFs that already had one all used.
 serde_json.workspace = true
+serde_yaml.workspace = true
 bytes.workspace = true
 bitflags.workspace = true
 libc.workspace = true

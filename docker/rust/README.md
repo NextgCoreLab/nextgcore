@@ -73,6 +73,11 @@ docker compose -f docker-compose-epc.yml up -d
 docker compose -f docker-compose-epc.yml ps
 ./epc-attach-check.sh 10.45.0.1 20
 
+# Idle mode as well (#956): S1 release, mobile-originated and network-triggered
+# SERVICE REQUEST. Needs an eNB with a user-inactivity release and LTE paging
+# (nextgsim #350, #351); off by default until then.
+EPC_IDLE_MODE=1 ./epc-attach-check.sh 10.45.0.1 20
+
 # View logs
 docker compose -f docker-compose-epc.yml logs -f
 ```
@@ -184,7 +189,7 @@ Common ones:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `GRAFANA_ADMIN_PASSWORD` | Grafana `admin` password. **Required**: `docker compose` refuses to start without it (#837); put `GRAFANA_ADMIN_PASSWORD=...` in `docker/rust/.env` (gitignored) | none |
-| `RUST_LOG` | Log filter for every NF (env_logger syntax, e.g. `info,nextgcore_amfd=debug`). When set and not blank it replaces the NF's `--log-level` entirely; unset, `--log-level` applies to all targets (#691) | `info` |
+| `RUST_LOG` | Log filter for every NF (env_logger syntax, e.g. `info,nextgcore_amfd=debug`). When set and not blank it replaces the NF's level entirely; unset, the level is `--log-level`, else the config's `logger.level`, else `info`, for all targets (#691) | `info` |
 | `NEXTGCORE_SBI_PROFILE` | SBI security profile for amf/smf/ausf/udm; the compose files set `dev` (h2c, no mTLS) | `production` when unset |
 | `NEXTGCORE_SBI_OAUTH2_REQUIRE` | Force OAuth2 enforcement on an NF's SBI server (the `oauth2` overlay sets it) | unset |
 
@@ -368,6 +373,14 @@ services:
 ```
 
 ### Port Mappings
+
+Host publishes are bound to `127.0.0.1` in both compose files; the NFs, the
+simulated RAN and the UEs talk over the compose networks and need none of them.
+The TCP tools (mongosh, the NRF SBI, Prometheus, Grafana, Jaeger) can be reached
+from another machine through an SSH tunnel. An SSH tunnel does not carry SCTP or
+GTP-U, so a real external eNB/gNB uses the opt-in `NEXTGCORE_RAN_PUBLISH_ADDR`
+instead (#837): set it to the host's address on the private RAN-facing interface
+(not `0.0.0.0`), and only the S1AP/NGAP and GTP-U publishes follow it.
 
 | Service | Protocol | Port | Description |
 |---------|----------|------|-------------|

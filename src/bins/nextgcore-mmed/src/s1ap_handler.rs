@@ -18,15 +18,15 @@ use crate::s1ap_build::{
 };
 use nextgcore_s1ap::{
     BroadcastCancelledAreaList, BroadcastCompletedAreaList, Cause, CauseRadioNetwork,
-    CriticalityDiagnostics, EnbConfigurationUpdate, EnbId, EnbStatusTransfer,
-    ErabDataForwardingItem, ErabToBeSetupItemHoReq, ErrorIndication, HandoverCancel,
-    HandoverCancelAcknowledge, HandoverCommand, HandoverFailure, HandoverNotify,
-    HandoverPreparationFailure, HandoverRequest, HandoverRequestAcknowledge, HandoverRequired,
-    HandoverType as S1apHandoverType, InitialContextSetupFailure, InitialContextSetupResponse,
-    InitialUeMessage, KillResponse, MmeStatusTransfer, NasNonDeliveryIndication, PathSwitchRequest,
-    PathSwitchRequestFailure, Reset, ResetAcknowledge, ResetType, S1SetupRequest, S1apMessage,
-    SecurityContext, TargetId, TimeToWait, UeCapabilityInfoIndication, UeContextReleaseComplete,
-    UeContextReleaseRequest, UlNasTransport, WriteReplaceWarningResponse,
+    CriticalityDiagnostics, EnbConfigurationUpdate, EnbStatusTransfer, ErabDataForwardingItem,
+    ErabToBeSetupItemHoReq, ErrorIndication, HandoverCancel, HandoverCancelAcknowledge,
+    HandoverCommand, HandoverFailure, HandoverNotify, HandoverPreparationFailure, HandoverRequest,
+    HandoverRequestAcknowledge, HandoverRequired, HandoverType as S1apHandoverType,
+    InitialContextSetupFailure, InitialContextSetupResponse, InitialUeMessage, KillResponse,
+    MmeStatusTransfer, NasNonDeliveryIndication, PathSwitchRequest, PathSwitchRequestFailure,
+    Reset, ResetAcknowledge, ResetType, S1SetupRequest, S1apMessage, SecurityContext, TargetId,
+    TimeToWait, UeCapabilityInfoIndication, UeContextReleaseComplete, UeContextReleaseRequest,
+    UlNasTransport, WriteReplaceWarningResponse,
 };
 
 // ============================================================================
@@ -1938,16 +1938,54 @@ pub fn handle_initial_context_setup_failure(
         Err(out) => return out,
     };
 
+    // #869/#961: the setup is over, whichever kind it was.
     if let Some(mme_ue_id) = ctx.enb_ue_find_by_id(enb_ue_id).map(|e| e.mme_ue_id) {
         if let Some(ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&mme_ue_id) {
             ue.ics_pending_on = 0;
+            // #916 review: the S1 connection is being released; a UE-AMBR
+            // change deferred behind this setup is carried by the next one,
+            // not sent to a context on its way out.
+            ue.ue_ambr_deferred = false;
+        }
+    }
+    // #956: a failed Initial Context Setup of a SERVICE REQUEST releases S1
+    // only; the UE stays registered and ECM-IDLE (TS 23.401 §5.3.4.1).
+    let service_request = ctx
+        .enb_ue_find_by_id(enb_ue_id)
+        .map(|e| e.mme_ue_id)
+        .and_then(|id| {
+            ctx.mme_ue_pool
+                .write()
+                .unwrap()
+                .get_mut(&id)
+                .map(|ue| std::mem::take(&mut ue.service_request_ics_pending))
+        })
+        .unwrap_or(false);
+    // #961 review: the Serving GW still buffers for a SERVICE REQUEST whose user
+    // plane did not come up. Release Access Bearers returns it to the idle
+    // state, so the next downlink packet is notified afresh.
+    if service_request {
+        if let Some(mme_ue_id) = ctx.enb_ue_find_by_id(enb_ue_id).map(|e| e.mme_ue_id) {
+            if let Err(e) = crate::gtp_path::send_release_access_bearers_request(
+                ctx,
+                enb_ue_id,
+                mme_ue_id,
+                crate::s11_build::GtpReleaseAction::S1ContextRemove,
+            ) {
+                log::error!("UE {mme_ue_id}: Release Access Bearers Request not sent: {e}");
+            }
+            crate::gtp_path::clear_enb_endpoints(ctx, mme_ue_id);
         }
     }
     let cause = cause_from_s1ap(&msg.cause);
     if let Some(enb_ue) = ctx.enb_ue_pool.write().unwrap().get_mut(&enb_ue_id) {
         enb_ue.relcause.group = cause.group;
         enb_ue.relcause.cause = cause.cause;
-        enb_ue.ue_ctx_rel_action = UeCtxRelAction::UeContextRemove;
+        enb_ue.ue_ctx_rel_action = if service_request {
+            UeCtxRelAction::S1ContextRemove
+        } else {
+            UeCtxRelAction::UeContextRemove
+        };
     }
 
     match s1ap_build::build_ue_context_release_command(
@@ -2068,19 +2106,60 @@ pub fn handle_ue_context_release_request(
     };
 
     let cause = cause_from_s1ap(&msg.cause);
-    if let Some(enb_ue) = ctx.enb_ue_pool.write().unwrap().get_mut(&enb_ue_id) {
+    let mme_ue_id = {
+        let mut pool = ctx.enb_ue_pool.write().unwrap();
+        let Some(enb_ue) = pool.get_mut(&enb_ue_id) else {
+            return Vec::new();
+        };
         enb_ue.relcause.group = cause.group;
         enb_ue.relcause.cause = cause.cause;
         enb_ue.ue_ctx_rel_action = UeCtxRelAction::S1ContextRemove;
-    }
+        enb_ue.mme_ue_id
+    };
 
+    // #956, TS 23.401 §5.3.5 step 2: a UE with PDN connections at a Serving GW
+    // goes ECM-IDLE. Its S1-U bearers are released at the Serving GW first, so
+    // downlink is buffered and notified (§5.3.4.3) rather than tunnelled to an
+    // eNB that has dropped the UE. The UE CONTEXT RELEASE COMMAND (step 5)
+    // follows the Release Access Bearers Response.
+    let has_session = ctx
+        .mme_ue_find_by_id(mme_ue_id)
+        .filter(|ue| ue.enb_ue_id == enb_ue_id)
+        .and_then(|ue| ctx.sgw_ue_find_by_id(ue.sgw_ue_id))
+        .is_some_and(|sgw| sgw.sgw_s11_teid != 0);
+    if has_session {
+        match crate::gtp_path::release_access_bearers_for_s1_release(ctx, enb_ue_id, mme_ue_id) {
+            Ok(seq) => {
+                log::info!(
+                    "UE Context Release Request (cause {:?}): Release Access Bearers Request \
+                     (seq={seq}) to the Serving GW; the UE goes ECM-IDLE (TS 23.401 §5.3.5)",
+                    msg.cause
+                );
+                return Vec::new();
+            }
+            Err(e) => log::error!(
+                "UE Context Release Request: Release Access Bearers Request not sent ({e}); \
+                 releasing S1 now"
+            ),
+        }
+    }
+    s1_release_command(ctx, enb_ue_id)
+}
+
+/// The UE CONTEXT RELEASE COMMAND of an S1 release for `enb_ue_id`, with the
+/// cause recorded from the request (TS 23.401 §5.3.5 step 5, TS 36.413 §8.3.3).
+/// Empty when the context is gone.
+pub fn s1_release_command(ctx: &MmeContext, enb_ue_id: u64) -> Vec<S1apSend> {
+    let Some(enb_ue) = ctx.enb_ue_find_by_id(enb_ue_id) else {
+        return Vec::new();
+    };
     match s1ap_build::build_ue_context_release_command(
-        Some(msg.enb_ue_s1ap_id),
-        msg.mme_ue_s1ap_id,
-        cause.group,
-        cause.cause,
+        Some(enb_ue.enb_ue_s1ap_id),
+        enb_ue.mme_ue_s1ap_id,
+        enb_ue.relcause.group,
+        enb_ue.relcause.cause,
     ) {
-        Ok(pdu) => S1apSend::to_origin(enb_id, pdu),
+        Ok(pdu) => S1apSend::to_origin(enb_ue.enb_id, pdu),
         Err(e) => {
             log::error!("Failed to build UE Context Release Command: {e}");
             Vec::new()
@@ -2232,6 +2311,7 @@ fn release_all_s1_connections(ctx: &MmeContext, enb_id: u64) -> usize {
 }
 
 fn release_s1_connection(ctx: &MmeContext, enb_ue_id: u64) {
+    let mut idle_ue = None;
     if let Some(enb_ue) = ctx.enb_ue_find_by_id(enb_ue_id) {
         if enb_ue.mme_ue_id != NEXTGCORE_INVALID_POOL_ID {
             let still_attached = ctx
@@ -2239,10 +2319,42 @@ fn release_s1_connection(ctx: &MmeContext, enb_ue_id: u64) {
                 .is_some_and(|mme_ue| mme_ue.enb_ue_id == enb_ue_id);
             if still_attached {
                 ctx.enb_ue_deassociate_mme_ue(enb_ue_id, enb_ue.mme_ue_id);
+                idle_ue = Some(enb_ue.mme_ue_id);
             }
         }
     }
     ctx.enb_ue_remove(enb_ue_id);
+    let Some(mme_ue_id) = idle_ue else {
+        return;
+    };
+    // #961 review: the UE is ECM-IDLE now. An Initial Context Setup of a
+    // SERVICE REQUEST that was still outstanding is void, and a Downlink Data
+    // Notification that arrived during the release pages the UE now.
+    let page = ctx
+        .mme_ue_pool
+        .write()
+        .unwrap()
+        .get_mut(&mme_ue_id)
+        .is_some_and(|ue| {
+            ue.service_request_ics_pending = false;
+            ue.ics_pending_on = 0;
+            std::mem::take(&mut ue.ddn_pending_after_release)
+        });
+    if page
+        && crate::paging::page_ue(
+            ctx,
+            mme_ue_id,
+            crate::context::PagingType::DownlinkDataNotification,
+        ) == 0
+    {
+        if let Err(e) = crate::gtp_path::send_downlink_data_notification_failure_indication(
+            ctx,
+            mme_ue_id,
+            crate::s11_build::GtpCause::UeNotResponding,
+        ) {
+            log::error!("UE {mme_ue_id}: DDN Failure Indication not sent: {e}");
+        }
+    }
 }
 
 // ============================================================================
@@ -4421,14 +4533,20 @@ fn erab_modification_abnormal(
             return Some(format!("duplicate E-RAB ID {}", item.erab_id));
         }
     }
-    let missing: Vec<u8> = ctx
-        .bearer_pool
-        .read()
-        .unwrap()
-        .values()
-        .filter(|b| b.mme_ue_id == mme_ue_id && b.enb_s1u_teid != 0 && !b.released_by_enb)
+    // The UE's own bearers, through its sessions rather than a scan of the
+    // whole pool (#949 review). A bearer being deactivated (#863) is on its way
+    // out: an eNB, e.g. an EN-DC one, may already omit it, and that is not the
+    // §8.2.4.4 case. The PENDING check is taken after the pool reads, per
+    // `bearer_deactivation`'s lock order.
+    let held: Vec<u8> = crate::gtp_path::bearers_of_ue(ctx, mme_ue_id)
+        .into_iter()
+        .filter(|b| b.enb_s1u_teid != 0 && !b.released_by_enb)
         .map(|b| b.ebi)
         .filter(|ebi| !listed.contains(ebi))
+        .collect();
+    let missing: Vec<u8> = held
+        .into_iter()
+        .filter(|ebi| !crate::bearer_deactivation::already_deactivating(ctx, mme_ue_id, *ebi))
         .collect();
     (!missing.is_empty()).then(|| format!("E-RABs {missing:?} of the UE context are not listed"))
 }
@@ -4723,8 +4841,64 @@ pub fn handle_initial_context_setup_response(
     }
     log_erab_failures(enb_id, &msg.erab_failed_list);
 
+    // #956, TS 23.401 §5.3.4.1 steps 7-8: the Initial Context Setup of a SERVICE
+    // REQUEST. The Serving GW gets the eNB S1-U endpoints of the E-RABs set up;
+    // the ones the eNB failed are deactivated at the core (Delete Bearer
+    // Command, the E-RAB release path of §5.4.4.2).
+    let service_request = ctx
+        .mme_ue_pool
+        .write()
+        .unwrap()
+        .get_mut(&enb_ue.mme_ue_id)
+        .is_some_and(|ue| std::mem::take(&mut ue.service_request_ics_pending));
+    if service_request {
+        service_request_context_set_up(ctx, enb_ue.mme_ue_id, &msg.erab_failed_list);
+        return;
+    }
+
     // TS 23.401 §5.3.2.1 step 23 needs this response AND the ATTACH COMPLETE (#495).
     crate::nas_dispatch::modify_bearer_after_attach(ctx, enb_ue_id, enb_ue.mme_ue_id);
+}
+
+/// The Initial Context Setup of a SERVICE REQUEST succeeded (TS 23.401
+/// §5.3.4.1 steps 7-8, #956): Modify Bearer Request for the E-RABs set up, and a
+/// Delete Bearer Command for those the eNB failed.
+fn service_request_context_set_up(
+    ctx: &MmeContext,
+    mme_ue_id: u64,
+    failed: &[nextgcore_s1ap::ErabFailedItem],
+) {
+    let failed_ebis: Vec<u8> = failed.iter().map(|f| f.erab_id).collect();
+    if !failed_ebis.is_empty() {
+        for ebi in &failed_ebis {
+            if let Some(id) = ctx.bearer_find_by_ebi(mme_ue_id, *ebi) {
+                if let Some(b) = ctx.bearer_pool.write().unwrap().get_mut(&id) {
+                    b.enb_s1u_teid = 0;
+                    b.released_by_enb = true;
+                }
+            }
+        }
+        match crate::gtp_path::send_delete_bearer_command(ctx, mme_ue_id, &failed_ebis) {
+            Ok(seq) => log::warn!(
+                "UE {mme_ue_id}: the eNB did not set up E-RABs {failed_ebis:?} of the SERVICE \
+                 REQUEST; Delete Bearer Command (seq={seq}) for them (TS 23.401 §5.3.4.1)"
+            ),
+            Err(e) => log::error!(
+                "UE {mme_ue_id}: Delete Bearer Command for the failed E-RABs {failed_ebis:?} not \
+                 sent: {e}"
+            ),
+        }
+    }
+    match crate::gtp_path::send_modify_bearer_request_for_service_request(ctx, mme_ue_id) {
+        Ok(seq) => log::info!(
+            "UE {mme_ue_id}: SERVICE REQUEST user plane up; Modify Bearer Request (seq={seq}) \
+             with the eNB S1-U F-TEIDs (TS 23.401 §5.3.4.1 step 8)"
+        ),
+        Err(e) => log::error!(
+            "UE {mme_ue_id}: SERVICE REQUEST Modify Bearer Request not sent ({e}); the Serving \
+             GW keeps buffering downlink"
+        ),
+    }
 }
 
 fn handle_erab_setup_response(
@@ -4866,6 +5040,7 @@ mod tests {
     use super::*;
     use crate::context::{Bitrate, MmeUe, PlmnId, ServedGummei};
     use crate::s1ap_gen::test_codec::{builder, decode_s1ap_pdu};
+    use nextgcore_s1ap::EnbId;
     use nextgcore_s1ap::{
         CauseRadioNetwork, ErabSwitchedItem, GlobalEnbId, STmsi, SupportedTaItem,
         UeAssociatedLogicalS1Connection, UeSecurityCapabilities,
@@ -7250,6 +7425,56 @@ mod tests {
             !take_ue_ambr_modification(&ctx, enb_id + 1, mme_ue_s1ap_id),
             "only from the eNB serving the UE"
         );
+    }
+    /// #961 review: the "setup in progress" also ends with an INITIAL CONTEXT
+    /// SETUP FAILURE and with the S1 release (UE CONTEXT RELEASE COMPLETE), so a
+    /// UE-AMBR change is not deferred behind a setup that will never be answered.
+    #[test]
+    fn an_ics_failure_or_an_s1_release_ends_the_setup_in_progress() {
+        let ctx = MmeContext::new();
+        ctx.init();
+        let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+        let connect = |s1ap_id: u32, mme_ue_id: Option<u64>| {
+            let enb_ue_id = ctx.enb_ue_add(enb_id, s1ap_id);
+            let mme_ue_id = mme_ue_id.unwrap_or_else(|| ctx.mme_ue_add(enb_ue_id));
+            ctx.enb_ue_associate_mme_ue(enb_ue_id, mme_ue_id);
+            ctx.mme_ue_pool
+                .write()
+                .unwrap()
+                .get_mut(&mme_ue_id)
+                .unwrap()
+                .ics_pending_on = enb_ue_id;
+            let mme_ue_s1ap_id = ctx.enb_ue_find_by_id(enb_ue_id).unwrap().mme_ue_s1ap_id;
+            (enb_ue_id, mme_ue_id, mme_ue_s1ap_id)
+        };
+        let (_, mme_ue_id, mme_ue_s1ap_id) = connect(9612, None);
+        let _ = handle_initial_context_setup_failure(
+            &ctx,
+            enb_id,
+            &nextgcore_s1ap::InitialContextSetupFailure {
+                mme_ue_s1ap_id,
+                enb_ue_s1ap_id: 9612,
+                cause: Cause::RadioNetwork(CauseRadioNetwork::Unspecified),
+            },
+        );
+        assert_eq!(
+            ctx.mme_ue_find_by_id(mme_ue_id).unwrap().ics_pending_on,
+            0,
+            "cleared by the failure"
+        );
+
+        let (_, mme_ue_id, mme_ue_s1ap_id) = connect(9613, Some(mme_ue_id));
+        handle_ue_context_release_complete(
+            &ctx,
+            enb_id,
+            &nextgcore_s1ap::UeContextReleaseComplete {
+                mme_ue_s1ap_id,
+                enb_ue_s1ap_id: 9613,
+            },
+        );
+        let ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert_eq!(ue.enb_ue_id, NEXTGCORE_INVALID_POOL_ID, "ECM-IDLE");
+        assert_eq!(ue.ics_pending_on, 0, "cleared by the release");
     }
     /// #869 review: the Initial Context Setup Response ends the "setup in
     /// progress" that defers a UE-AMBR change.

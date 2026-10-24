@@ -129,4 +129,26 @@ spec:
   selector:
     app.kubernetes.io/name: smf
     app.kubernetes.io/instance: {{ .Release.Name }}-smf
+---
+# #968/#983: the name the UPF's PFCP peer allowlist resolves. Headless, so it
+# resolves to the SMF pod's own IP (the source address of its PFCP), not a
+# ClusterIP; publishNotReadyAddresses so the SMF can associate before it is Ready.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-smf-pfcp
+  labels:
+    app.kubernetes.io/name: smf
+    {{- include "nextgcore.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - port: {{ .Values.smf.service.pfcpPort }}
+      targetPort: pfcp
+      protocol: UDP
+      name: pfcp
+  selector:
+    app.kubernetes.io/name: smf
+    app.kubernetes.io/instance: {{ .Release.Name }}-smf
 {{- end }}

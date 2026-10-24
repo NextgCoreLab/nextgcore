@@ -1706,10 +1706,18 @@ fn dispatch_modify_bearer_request(server: &GtpcServer, msg: &Gtp2Message, peer: 
             marked_for_removal.push((*ebi, gtp_cause::CONTEXT_NOT_FOUND));
             continue;
         };
+        let mut written = (enb_teid, crate::context::IpAddr::default());
         if let Some(mut dl_tunnel) = ctx.dl_tunnel_in_bearer(bearer.id) {
             dl_tunnel.remote_ip.ipv4 = enb_fteid.ipv4_addr.map(Ipv4Addr::from);
             ctx.tunnel_update(&dl_tunnel);
+            written = (dl_tunnel.remote_teid, dl_tunnel.remote_ip.clone());
         }
+        // The generation this request's writes left (TEID by the handler, IP
+        // above).
+        let written = ctx
+            .dl_tunnel_in_bearer(bearer.id)
+            .map(|t| t.generation)
+            .unwrap_or(0);
         per_session
             .entry(bearer.sess_id)
             .or_default()
@@ -1717,6 +1725,7 @@ fn dispatch_modify_bearer_request(server: &GtpcServer, msg: &Gtp2Message, peer: 
                 bearer_id: bearer.id,
                 ebi: *ebi,
                 previous,
+                written,
             });
         // Settled as modified only when the SGW-U confirms (#838).
     }

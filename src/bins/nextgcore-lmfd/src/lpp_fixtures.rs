@@ -386,3 +386,32 @@ pub(crate) fn ecid_capabilities(transaction_number: u8, eutra: bool, nr: bool) -
     }
     nextgcore_lpp_gen::encode(&msg).expect("encode LPP fixture")
 }
+
+/// An uplink LPP `Abort` (TS 37.355 §5.4) on transaction `transaction_number`,
+/// cause targetDeviceAbort (#998).
+pub(crate) fn target_abort(transaction_number: u8) -> Vec<u8> {
+    let msg = lpp::LPP_Message {
+        transaction_id: Some(lpp::LPP_TransactionID {
+            initiator: lpp::Initiator(lpp::Initiator::LOCATION_SERVER),
+            transaction_number: lpp::TransactionNumber(transaction_number),
+        }),
+        end_transaction: lpp::LPP_MessageEndTransaction(true),
+        sequence_number: None,
+        acknowledgement: None,
+        lpp_message_body: Some(lpp::LPP_MessageBody::C1(lpp::LPP_MessageBody_c1::Abort(
+            lpp::Abort {
+                critical_extensions: lpp::AbortCriticalExtensions::C1(
+                    lpp::AbortCriticalExtensions_c1::Abort_r9(lpp::Abort_r9_IEs {
+                        common_i_es_abort: Some(lpp::CommonIEsAbort {
+                            abort_cause: lpp::CommonIEsAbortAbortCause(
+                                lpp::CommonIEsAbortAbortCause::TARGET_DEVICE_ABORT,
+                            ),
+                        }),
+                        extensions: Default::default(),
+                    }),
+                ),
+            },
+        ))),
+    };
+    nextgcore_lpp_gen::encode(&msg).expect("encode LPP fixture")
+}

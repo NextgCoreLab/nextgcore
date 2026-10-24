@@ -22,7 +22,7 @@ There are two cooperating layers.
 **1. Per-NF binary (clap).** Each NF binary (e.g. `nextgcore-amfd`) parses CLI args and loads its YAML with `serde_yaml`. From `src/bins/nextgcore-amfd/src/lib.rs`:
 
 - `-c / --config <path>` — config file, default `/etc/nextgcore/amf.yaml`
-- `--log-level <level>` — `trace|debug|info|warn|error`, default `info`. The short form is `-l` in amfd, mmed, sgwcd and sgwud; most other NFs follow Open5GS and use `-e` for the level and `-l` for `--log-file`. smfd has no log-level flag (it reads `RUST_LOG`, default `info`). Run `<binary> --help` for the rest of an NF's flags
+- `--log-level <level>` — `trace|debug|info|warn|error`. Without it, the config file's `logger.level`, else `info`. The short form is `-l` in amfd, mmed, sgwcd and sgwud; most other NFs, smfd included, follow Open5GS and use `-e` for the level and `-l` for `--log-file`. Run `<binary> --help` for the rest of an NF's flags
 - `--ngap-addr` (AMF only) — NGAP bind address, default `0.0.0.0:38412`
 - `--sctp-backend` (AMF only) — `userspace` (default, sctp-proto over UDP) or `kernel` (Linux kernel SCTP, needs the `kernel-sctp` build feature)
 
@@ -41,7 +41,7 @@ logger:
   level: info
 ```
 
-`--log-level` works for every NF but smfd (which defaults to `info`). Every NF builds its logger with `nextgcore_core::log::nf_log_builder` (#691): `RUST_LOG`, when set, is the filter; otherwise the `--log-level` flag applies (an unknown value means `info`).
+Every NF picks its level the same way (#691): `RUST_LOG`, when set and not blank, is the filter; otherwise `--log-level` when given, else the config file's `logger.level`, else `info` (`nextgcore_core::log::nf_log_level`). An unknown value means `info`; the C configs' `fatal` and `none` mean `error` and `off`. The logger is built with `nextgcore_core::log::nf_log_builder`.
 
 ### `global`
 
@@ -70,7 +70,7 @@ Common sub-blocks seen in the Docker configs:
 
 | Variable | Effect | Source |
 |---|---|---|
-| `RUST_LOG` | Overrides `--log-level` in every NF (env_logger filter syntax) | `nextgcore_core::log::nf_log_builder` |
+| `RUST_LOG` | Overrides `--log-level` and `logger.level` in every NF (env_logger filter syntax) | `nextgcore_core::log::nf_log_builder` |
 | `DB_URI` | Overrides the YAML `db_uri` (MongoDB) | `init.rs` stage 4 |
 | `<NF>_SBI_ADDR` / `<NF>_SBI_PORT` | SBI bind address/port (e.g. `AMF_SBI_ADDR`, `UDM_SBI_PORT`); defaults `127.0.0.1:7777` | each NF `lib.rs` |
 | `NRF_URI`, `PCF_URI`, `NSACF_URI` | Peer NF discovery URIs | NF binaries |
