@@ -1182,10 +1182,15 @@ fn plain_uri_in_notification_structs(rel: &str, text: &str) -> Vec<String> {
         .into_iter()
         .filter(|i| i.kind == "struct")
         .filter(|i| {
+            // A subscription carries its consumer's callback too (#1047 review):
+            // `subscription` anywhere, or `Sub`/`Subs` as a whole camel-case word
+            // (`EeSub`, `SubsData`), never a substring (`Subnet`).
             let n = i.name.to_ascii_lowercase();
-            ["notif", "notify", "callback"]
+            let words = snake(&i.name);
+            ["notif", "notify", "callback", "subscription"]
                 .iter()
                 .any(|k| n.contains(k))
+                || words.split('_').any(|w| w == "sub" || w == "subs")
         })
         .filter(|i| i.fields.iter().any(|(f, _)| *f == "uri" || *f == "url"))
         .map(|i| {
@@ -1269,6 +1274,10 @@ fn the_callback_uri_scan_sees_its_shapes() {
     // and a local copied from the renamed field is tracked.
     let src = "pub struct QueuedNotification {\n    pub uri: String,\n    pub kind: &'static str,\n}\npub struct QueuedOk {\n    pub callback_uri: String,\n}\n";
     assert_eq!(plain_uri_in_notification_structs("t.rs", src).len(), 1);
+    let src = "pub struct EeSubscription {\n    pub uri: String,\n}\npub struct PolicySub {\n    pub url: String,\n}\npub struct SubnetConfig {\n    pub uri: String,\n}\n";
+    let names: Vec<String> = plain_uri_in_notification_structs("t.rs", src);
+    assert_eq!(names.len(), 2, "{names:?}");
+    assert!(names.iter().all(|n| !n.contains("SubnetConfig")));
     let src = "fn d() {\n    let target = dropped.callback_uri.clone();\n}\n";
     let names: Vec<String> = tainted_bindings(src)
         .into_iter()
