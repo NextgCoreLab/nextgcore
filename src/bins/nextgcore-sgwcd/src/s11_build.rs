@@ -328,7 +328,7 @@ pub fn build_modify_bearer_response_per_bearer(
     mme_s11_teid: u32,
     sequence_number: u32,
     cause: u8,
-    modified: &[u64],
+    modified: &[(u64, u8)],
     marked_for_removal: &[(u8, u8)],
 ) -> Gtp2Message {
     let ctx = sgwc_self();
@@ -338,14 +338,11 @@ pub fn build_modify_bearer_response_per_bearer(
         sequence_number,
     );
     msg.add_ie(Gtp2CauseIe::new(cause).to_ie(0));
-    for bearer_id in modified {
-        let Some(bearer) = ctx.bearer_find_by_id(*bearer_id) else {
-            continue;
-        };
+    for (bearer_id, ebi) in modified {
         let mut bc = Gtp2BearerContextIe::new();
-        bc.set_ebi(bearer.ebi);
+        bc.set_ebi(*ebi);
         bc.set_cause(&Gtp2CauseIe::new(gtp_cause::REQUEST_ACCEPTED));
-        if let Some(ul_tunnel) = ctx.ul_tunnel_in_bearer(bearer.id) {
+        if let Some(ul_tunnel) = ctx.ul_tunnel_in_bearer(*bearer_id) {
             if let Ok(ft) = fteid_from_tunnel(f_teid_interface::S1_U_SGW_GTP_U, &ul_tunnel) {
                 bc.set_fteid(0, &ft);
             }
