@@ -1756,7 +1756,11 @@ mod tests {
         let ue = seed(&[5]);
         let ctx = crate::context::mme_self();
         let target = ctx.enb_add(enb_addr());
-        ctx.enb_set_enb_id(target, 0x7301);
+        ctx.enb_set_s1_connected_for_test(
+            target,
+            &[0x13, 0x00, 0x14],
+            nextgcore_s1ap::EnbId::Macro(0x7301),
+        );
         crate::s1ap_path::tap_enb_for_test(target);
 
         // X2 first: its MBR is outstanding.

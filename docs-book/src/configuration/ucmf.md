@@ -66,7 +66,7 @@ Parsed by `UcmfYaml` / `UcmfSection` in `src/bins/nextgcore-ucmfd/src/main.rs`. 
 |---|---|---|
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://jaeger:4317` | OpenTelemetry OTLP exporter. |
 | `RUST_LOG` | unset | Overrides the log level. |
-| `UCMF_METRICS_ADDR` | `127.0.0.1:9096` | Where `GET /metrics` (Prometheus text) listens. It is unauthenticated, so it defaults to loopback; set a private address deliberately to scrape it from another host. Port 9096, not 9090, which mmed, sgwud and upfd default to. A value that does not parse is logged at warn and the default is used. Series: `ucmf_state_lock_poison_recoveries_total` (a request panicked while holding the state lock; a defect to report), `ucmf_dictionary_full_refusals_total` (Assign only), `ucmf_subscription_limit_refusals_total` (the two subscription limits only), `ucmf_dictionary_entries`, `ucmf_subscriptions`. |
+| `UCMF_METRICS_ADDR` | `127.0.0.1:9096` | Where `GET /metrics` (Prometheus text) listens (`ip:port`). Unset, the host is `NEXTGCORE_METRICS_BIND` if set, else `127.0.0.1`, as for every NF. It is unauthenticated, so it defaults to loopback; set a private address deliberately to scrape it from another host. Port 9096, not 9090, which mmed, sgwud and upfd default to. A value that does not parse is logged at warn and the default is used. Series: `ucmf_state_lock_poison_recoveries_total` (a request panicked while holding the state lock; a defect to report), `ucmf_dictionary_full_refusals_total` (Assign only), `ucmf_subscription_limit_refusals_total` (the two subscription limits only), `ucmf_dictionary_entries`, `ucmf_subscriptions`. |
 
 ## How the AMF reaches it
 

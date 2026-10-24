@@ -73,8 +73,9 @@ pub struct GtpuPeerState {
 /// What an Echo Response meant to the [`GtpuPathTable`] (#887).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EchoResponse {
-    /// It answered our outstanding request: the path is alive.
-    Answered,
+    /// It answered our outstanding request: the path is alive. `recovered` when the
+    /// path had been declared FAILED, so the CP function is told it recovered (#935).
+    Answered { recovered: bool },
     /// Not an answer to anything we sent (unknown peer, no outstanding request, or a
     /// sequence number that does not match). Ignored.
     Unsolicited,
@@ -155,8 +156,8 @@ impl GtpuPathTable {
         state.pending_seq = None;
         state.miss_count = 0;
         state.last_success = Some(std::time::Instant::now());
-        state.path_failed = false;
-        EchoResponse::Answered
+        let recovered = std::mem::replace(&mut state.path_failed, false);
+        EchoResponse::Answered { recovered }
     }
 
     /// Advance the state machine by one echo interval tick.
@@ -1281,6 +1282,12 @@ pub struct DataPlaneUrr {
     /// Private (#724): read it through [`Self::last_report_time`], which copies the
     /// value out, so no guard on it can outlive a [`Self::reset_counters`] call.
     last_report_time: RwLock<Option<std::time::Instant>>,
+    /// Start of the CURRENT Measurement Period (#772). Periodic reports are due at
+    /// `period_start + k * period` -- a schedule anchored at the period boundaries,
+    /// not at whenever the last report of any kind happened -- and a PERIO report
+    /// advances it by whole periods. Private: read and advanced only through
+    /// [`Self::claim_period`] / [`Self::period_due`], under its own lock.
+    period_start: std::sync::Mutex<std::time::Instant>,
     /// Whether a threshold has been exceeded (needs reporting)
     pub threshold_exceeded: AtomicBool,
     /// Monotonic UR-SEQN per URR (TS 29.244 8.2.60) — incremented for every
@@ -1578,8 +1585,46 @@ impl DataPlaneUrr {
         {
             self.rebase_time_threshold_to_ongoing();
         }
-        self.measurement_period_secs_raw
-            .store(sec(measurement_period_secs), Ordering::Relaxed);
+        let previous = self
+            .measurement_period_secs_raw
+            .swap(sec(measurement_period_secs), Ordering::Relaxed);
+        // #772: a NEW Measurement Period starts its schedule now; re-provisioning the
+        // same period leaves the running schedule alone.
+        if previous != sec(measurement_period_secs) {
+            *self.period_start.lock().unwrap() = std::time::Instant::now();
+        }
+    }
+
+    /// Whether a Measurement Period has ended (#772) -- detection only.
+    pub fn period_due(&self) -> bool {
+        let Some(period) = self.measurement_period_secs() else {
+            return false;
+        };
+        let start = *self.period_start.lock().unwrap();
+        start.elapsed() >= std::time::Duration::from_secs(period as u64)
+    }
+
+    /// Claim the periodic report for the period(s) that have ended, if any (#772).
+    ///
+    /// Advances the schedule by WHOLE periods, so the next report is due at the next
+    /// period boundary however late this harvest ran: lateness never accumulates (the
+    /// old check compared against the reset instant, so every report slid a harvest
+    /// tick later than the last). If several periods passed unreported, one report
+    /// covers them and the schedule realigns to the boundary still ahead. Check and
+    /// advance happen under one lock, so two harvests cannot both claim one period.
+    pub fn claim_period(&self) -> bool {
+        let Some(period) = self.measurement_period_secs() else {
+            return false;
+        };
+        let period = std::time::Duration::from_secs(period as u64);
+        let mut start = self.period_start.lock().unwrap();
+        let elapsed = start.elapsed();
+        if elapsed < period {
+            return false;
+        }
+        let whole = (elapsed.as_nanos() / period.as_nanos()) as u32;
+        *start += period * whole;
+        true
     }
 
     /// Apply an Update URR's reporting IEs (#842 review, TS 29.244 §7.5.4): an ABSENT
@@ -1615,7 +1660,10 @@ impl DataPlaneUrr {
             }
         }
         if let Some(p) = measurement_period_secs {
-            self.measurement_period_secs_raw.store(p, Ordering::Relaxed);
+            // #772: a changed Measurement Period starts its schedule now.
+            if self.measurement_period_secs_raw.swap(p, Ordering::Relaxed) != p {
+                *self.period_start.lock().unwrap() = std::time::Instant::now();
+            }
         }
     }
 
@@ -1649,6 +1697,7 @@ impl DataPlaneUrr {
             time_threshold_hit: AtomicBool::new(false),
             first_pkt_time: RwLock::new(None),
             last_report_time: RwLock::new(Some(std::time::Instant::now())),
+            period_start: std::sync::Mutex::new(std::time::Instant::now()),
             threshold_exceeded: AtomicBool::new(false),
             ur_seqn: std::sync::atomic::AtomicU32::new(0),
         }
@@ -1874,14 +1923,28 @@ impl DataPlaneUrr {
         if self.threshold_exceeded.load(Ordering::SeqCst) {
             return Some(self.report_reason());
         }
-        // #724: the instant is COPIED out (`last_report_time()` returns the value), so
-        // no guard on it is alive across `take_usage`, which writes it.
-        let period_elapsed = self.measurement_period_secs().is_some_and(|period| {
-            self.last_report_time()
-                .is_some_and(|last| last.elapsed().as_secs() >= period as u64)
-        });
-        (period_elapsed && self.acc_total_bytes.load(Ordering::Acquire) > 0)
-            .then_some(UrrReportReason::Periodic)
+        // #772: PERIO on the period schedule, and WITH ZERO USAGE too: TS 29.244
+        // §5.2.2.2.1 provisions the Measurement Period as "the period to generate
+        // periodic usage reports", and a period with no traffic is still a period.
+        // Skipping empty periods left the schedule unrestarted, so the first packet
+        // after an idle spell triggered an immediate report spanning several periods.
+        self.period_due().then_some(UrrReportReason::Periodic)
+    }
+
+    /// Like [`Self::report_due`], but CLAIMS a periodic report (advancing the period
+    /// schedule), for the path that is about to take the usage (#772).
+    pub fn claim_report(&self) -> Option<UrrReportReason> {
+        if self.threshold_exceeded.load(Ordering::SeqCst) {
+            return Some(self.report_reason());
+        }
+        self.claim_period().then_some(UrrReportReason::Periodic)
+    }
+
+    /// Move the period schedule back by `by` (tests: reach a period boundary without
+    /// waiting for it).
+    #[cfg(test)]
+    pub(crate) fn backdate_period(&self, by: std::time::Duration) {
+        *self.period_start.lock().unwrap() -= by;
     }
 
     /// A non-resetting read of the usage counted since the last report.
@@ -2590,6 +2653,13 @@ pub enum UpfReportEvent {
         smf_seid: u64,
         urr_id: u32,
     },
+    /// N3 user-plane paths declared FAILED (`failure`) or RECOVERED, to be reported
+    /// to the CP function in a PFCP Node Report (#935, TS 29.244 §7.4.5.1). They used
+    /// to be only logged, so the SMF never learnt a gNB path was down or back.
+    PathReport {
+        failure: bool,
+        peers: Vec<std::net::IpAddr>,
+    },
 }
 
 /// Data plane runtime context
@@ -3026,8 +3096,18 @@ impl DataPlane {
                     .write()
                     .unwrap()
                     .on_echo_response(from, header.seq_num);
-                if outcome == EchoResponse::Unsolicited {
-                    log::debug!("GTP-U Echo Response from {from} answers nothing we sent: ignored");
+                match outcome {
+                    EchoResponse::Unsolicited => log::debug!(
+                        "GTP-U Echo Response from {from} answers nothing we sent: ignored"
+                    ),
+                    EchoResponse::Answered { recovered: true } => {
+                        log::warn!("GTP-U path to {from} RECOVERED");
+                        self.send_report_event(UpfReportEvent::PathReport {
+                            failure: false,
+                            peers: vec![from.ip()],
+                        });
+                    }
+                    EchoResponse::Answered { recovered: false } => {}
                 }
                 return;
             }
@@ -3887,7 +3967,7 @@ impl DataPlane {
             .collect();
         urrs.into_iter()
             .filter_map(|(urr_id, urr)| {
-                let trigger = urr.report_due()?;
+                let trigger = urr.claim_report()?;
                 // A report triggered by EITHER threshold re-applies the thresholds.
                 let usage = if matches!(
                     trigger,
@@ -3958,6 +4038,39 @@ impl DataPlane {
         }
     }
 
+    /// Newly FAILED N3 paths: log them with the sessions they carry, and report them
+    /// to the CP function in one Node Report (#935, TS 29.244 §7.4.5.1).
+    fn on_paths_failed(&self, failed: &[SocketAddr], miss_threshold: u32) {
+        for peer in failed {
+            log::warn!(
+                "GTP-U path to {peer} declared failed after {miss_threshold} missed responses"
+            );
+            let affected: Vec<u64> = {
+                let map = self.sessions.seid_map.read().unwrap();
+                map.values()
+                    .filter(|s| &s.gnb_addr() == peer)
+                    .map(|s| s.upf_seid)
+                    .collect()
+            };
+            if !affected.is_empty() {
+                log::warn!(
+                    "  {} session(s) affected (SEIDs: {:x?}); the SMF is told by a \
+                     Node Report (User Plane Path Failure Report)",
+                    affected.len(),
+                    affected
+                );
+            }
+        }
+        // #935 (TS 29.244 §7.4.5.1): tell the CP function, in ONE Node Report for
+        // every path that failed in this round.
+        if !failed.is_empty() {
+            self.send_report_event(UpfReportEvent::PathReport {
+                failure: true,
+                peers: failed.iter().map(|p| p.ip()).collect(),
+            });
+        }
+    }
+
     /// GTP-U N3 path management periodic task (upfd-04).
     ///
     /// Sends Echo Requests to all active gNB addresses at `echo_interval_secs`
@@ -4010,26 +4123,7 @@ impl DataPlane {
             let (to_send, failed) = self.path_table.write().unwrap().tick();
 
             // Handle newly-failed paths
-            for peer in &failed {
-                log::warn!(
-                    "GTP-U path to {peer} declared failed after {miss_threshold} missed responses"
-                );
-                let affected: Vec<u64> = {
-                    let map = self.sessions.seid_map.read().unwrap();
-                    map.values()
-                        .filter(|s| &s.gnb_addr() == peer)
-                        .map(|s| s.upf_seid)
-                        .collect()
-                };
-                if !affected.is_empty() {
-                    log::warn!(
-                        "  {} session(s) affected (SEIDs: {:x?}) — flagged; \
-                         SMF teardown deferred pending E2E validation",
-                        affected.len(),
-                        affected
-                    );
-                }
-            }
+            self.on_paths_failed(&failed, miss_threshold);
 
             // Send Echo Requests
             if let Some(sock) = &self.gtpu_socket {
@@ -6020,8 +6114,7 @@ mod tests {
                     // Read BEFORE the harvest so the final pass runs after the
                     // recorder finished and every pass is a real race until then.
                     let last = done.load(Ordering::SeqCst);
-                    *urr.last_report_time.write().unwrap() =
-                        Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
+                    urr.backdate_period(std::time::Duration::from_secs(5));
                     reports.extend(dp.collect_urr_reports());
                     if last {
                         break reports;
@@ -6139,8 +6232,7 @@ mod tests {
                 loop {
                     let last = done.load(Ordering::SeqCst);
                     if pass.is_multiple_of(2) {
-                        *urr.last_report_time.write().unwrap() =
-                            Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
+                        urr.backdate_period(std::time::Duration::from_secs(5));
                         reports.extend(dp.collect_urr_reports());
                     } else {
                         reports.extend(dp.take_urr_reports(0x821, None));
@@ -6537,6 +6629,83 @@ mod tests {
         );
     }
 
+    /// #772: the periodic schedule is anchored at the period boundaries. A late claim
+    /// advances it by WHOLE periods -- to exactly `start + k * period` -- so lateness
+    /// never accumulates, a claim cannot fire twice for one period, and the next report
+    /// is due at the next boundary. The old check compared against the instant of the
+    /// last reset, so each report slid one 10 s harvest tick later than the previous.
+    #[test]
+    fn the_periodic_schedule_advances_by_whole_periods_without_drift() {
+        let urr = DataPlaneUrr::new(1);
+        urr.set_reporting(None, None, None, None, Some(10));
+        let period = std::time::Duration::from_secs(10);
+        // 2.5 periods ago: the harvest is late by half a period.
+        urr.backdate_period(period * 5 / 2);
+        let start = *urr.period_start.lock().unwrap();
+
+        assert!(urr.claim_period(), "two periods have ended");
+        assert_eq!(
+            *urr.period_start.lock().unwrap(),
+            start + period * 2,
+            "realigned to the boundary, not to the claim instant"
+        );
+        assert!(!urr.claim_period(), "one claim per period");
+        assert!(!urr.period_due(), "the next boundary is half a period away");
+        urr.backdate_period(period / 2);
+        assert!(
+            urr.period_due(),
+            "and is due exactly one period after the last boundary"
+        );
+    }
+
+    /// #772: a Measurement Period with NO traffic still produces its periodic report
+    /// (TS 29.244 §5.2.2.2.1: the Measurement Period is "the period to generate
+    /// periodic usage reports"), with zero volume, and restarts the period. Before, an
+    /// empty period was skipped and the schedule left unrestarted.
+    #[test]
+    fn an_empty_measurement_period_is_still_reported() {
+        let dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        dp.add_session_from_pfcp(
+            0x772,
+            0x1772,
+            Ipv4Addr::new(10, 45, 7, 72),
+            0x7721,
+            0x7722,
+            "127.0.0.1:2152".parse().unwrap(),
+            Some(5),
+            Some(9),
+        );
+        let session = dp.sessions.find_by_seid(0x772).expect("session");
+        let urr = Arc::new(DataPlaneUrr::new(1));
+        urr.set_reporting(None, None, None, None, Some(30));
+        session.urrs.write().unwrap().insert(1, Arc::clone(&urr));
+
+        assert!(
+            dp.collect_urr_reports().is_empty(),
+            "the period has not ended yet"
+        );
+        urr.backdate_period(std::time::Duration::from_secs(31));
+        assert_eq!(dp.due_urr_sessions(), vec![(0x772, 0x1772)]);
+        let reports = dp.collect_urr_reports();
+        assert_eq!(reports.len(), 1, "an idle period is still reported");
+        assert_eq!(reports[0].trigger, UrrReportReason::Periodic);
+        assert_eq!((reports[0].total_bytes, reports[0].total_pkts), (0, 0));
+        assert!(!urr.period_due(), "and the next period has started");
+    }
+
+    /// #772: an Update URR with a NEW Measurement Period starts the schedule afresh;
+    /// re-provisioning the SAME period leaves the running schedule alone.
+    #[test]
+    fn only_a_changed_measurement_period_restarts_the_schedule() {
+        let urr = DataPlaneUrr::new(1);
+        urr.set_reporting(None, None, None, None, Some(10));
+        urr.backdate_period(std::time::Duration::from_secs(11));
+        urr.set_reporting(None, None, None, None, Some(10));
+        assert!(urr.period_due(), "same period: the schedule kept running");
+        urr.set_reporting(None, None, None, None, Some(20));
+        assert!(!urr.period_due(), "new period: the schedule restarted");
+    }
+
     /// Run `f` on a thread of its own and hand back a receiver for its result, so a
     /// test can wait on it with `recv_timeout` -- the only way to observe a deadlock
     /// as a failure instead of a hung test binary. A thread that does hang is leaked,
@@ -6592,9 +6761,8 @@ mod tests {
         session.urrs.write().unwrap().insert(1, Arc::clone(&urr));
         assert_eq!(urr.record(600, true), UrrOutcome::Continue);
         assert_eq!(urr.record(400, false), UrrOutcome::Continue);
-        // Back-date the last report past the period instead of sleeping through it.
-        let backdated = std::time::Instant::now() - std::time::Duration::from_secs(5);
-        *urr.last_report_time.write().unwrap() = Some(backdated);
+        // Move the period schedule back past a boundary instead of sleeping to it.
+        urr.backdate_period(std::time::Duration::from_secs(5));
 
         let deadline = std::time::Duration::from_secs(5);
         let dp_h = Arc::clone(&dp);
@@ -6638,8 +6806,8 @@ mod tests {
         // The report restarted the measurement: counters zeroed, period re-armed.
         assert_eq!(urr.acc_total_bytes.load(Ordering::Relaxed), 0);
         assert!(
-            urr.last_report_time().expect("set by the reset") > backdated,
-            "the reset must restart the measurement period"
+            !urr.period_due(),
+            "the report must advance the period schedule to the next boundary"
         );
         // So the very next harvest has nothing to say -- and also returns.
         let dp_h = Arc::clone(&dp);
@@ -7149,7 +7317,10 @@ mod tests {
         assert!(failed.is_empty());
         let seq = to_send[0].1;
 
-        assert_eq!(pt.on_echo_response(peer, Some(seq)), EchoResponse::Answered);
+        assert_eq!(
+            pt.on_echo_response(peer, Some(seq)),
+            EchoResponse::Answered { recovered: false }
+        );
 
         // After response the peer must not be failed.
         let state = pt.peers.get(&peer).unwrap();
@@ -7194,9 +7365,15 @@ mod tests {
         // Answers carrying any Recovery value keep the path alive: the value is not
         // even read (#873, §8.2), only the sequence number matters (#887).
         let seq = pt.tick().0[0].1;
-        assert_eq!(pt.on_echo_response(peer, Some(seq)), EchoResponse::Answered);
+        assert_eq!(
+            pt.on_echo_response(peer, Some(seq)),
+            EchoResponse::Answered { recovered: false }
+        );
         let seq = pt.tick().0[0].1;
-        assert_eq!(pt.on_echo_response(peer, Some(seq)), EchoResponse::Answered);
+        assert_eq!(
+            pt.on_echo_response(peer, Some(seq)),
+            EchoResponse::Answered { recovered: false }
+        );
         let state = pt.peers.get(&peer).unwrap();
         assert_eq!(state.miss_count, 0);
         assert!(!state.path_failed);
@@ -7241,9 +7418,52 @@ mod tests {
         assert_eq!(pt.peers[&peer].miss_count, 1, "the miss stands");
         assert_eq!(
             pt.on_echo_response(peer, outstanding),
-            EchoResponse::Answered
+            EchoResponse::Answered { recovered: false }
         );
         assert_eq!(pt.peers[&peer].miss_count, 0);
+    }
+
+    /// #935 (TS 29.244 §7.4.5.1): a path FAILURE and a path RECOVERY each raise a
+    /// path report toward the PFCP layer (which sends the Node Report). Before, both
+    /// were only logged and the SMF never learnt that a gNB path was down or back.
+    #[tokio::test]
+    async fn path_failure_and_recovery_raise_node_reports() {
+        let dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        let (tx, mut rx) = mpsc::channel(8);
+        dp.set_report_channel(tx);
+        let gnb: SocketAddr = "127.0.0.1:2152".parse().unwrap();
+
+        dp.on_paths_failed(&[gnb], 3);
+        match rx.try_recv() {
+            Ok(UpfReportEvent::PathReport {
+                failure: true,
+                peers,
+            }) => {
+                assert_eq!(peers, vec![gnb.ip()])
+            }
+            other => panic!("expected a failure path report, got {other:?}"),
+        }
+
+        // The failed peer answers an outstanding probe: a recovery report.
+        let seq = {
+            let mut pt = dp.path_table.write().unwrap();
+            pt.sync_peers(&HashSet::from([gnb]));
+            pt.miss_threshold = 1;
+            pt.tick();
+            let _ = pt.tick(); // failed
+            pt.tick().0[0].1 // still probed
+        };
+        dp.handle_uplink_packet(&build_gtpu_echo_response(Some(seq)), gnb, -1)
+            .await;
+        match rx.try_recv() {
+            Ok(UpfReportEvent::PathReport {
+                failure: false,
+                peers,
+            }) => {
+                assert_eq!(peers, vec![gnb.ip()])
+            }
+            other => panic!("expected a recovery path report, got {other:?}"),
+        }
     }
 
     /// #887 review: only paths IN USE are tracked and probed (TS 29.281 §7.2.1). A
@@ -7288,7 +7508,8 @@ mod tests {
         assert!(refailed.is_empty(), "declared failed only once");
         assert_eq!(
             pt.on_echo_response(peer, Some(again[0].1)),
-            EchoResponse::Answered
+            EchoResponse::Answered { recovered: true },
+            "#935: the answer reports the recovery"
         );
         assert!(!pt.peers[&peer].path_failed, "the answer recovers the path");
     }

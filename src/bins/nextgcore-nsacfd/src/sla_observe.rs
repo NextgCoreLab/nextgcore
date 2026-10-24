@@ -444,7 +444,7 @@ pub(crate) fn spawn_if_enabled(raw: Option<serde_yaml::Value>) {
         settings.slices.len(),
         settings.poll_interval_secs,
         if settings.metrics_port > 0 {
-            format!("0.0.0.0:{}", settings.metrics_port)
+            nextgcore_metrics::nes_energy::metrics_bind_addr(settings.metrics_port).to_string()
         } else {
             "disabled".to_string()
         }
@@ -455,7 +455,8 @@ pub(crate) fn spawn_if_enabled(raw: Option<serde_yaml::Value>) {
 async fn run_sla_observe_loop(settings: SlaSettings) {
     let mut observer = SlaObserver::new(settings.clone());
     if settings.metrics_port > 0 {
-        let addr: std::net::SocketAddr = ([0, 0, 0, 0], settings.metrics_port).into();
+        // Loopback unless NEXTGCORE_METRICS_BIND says otherwise (#837).
+        let addr = nextgcore_metrics::nes_energy::metrics_bind_addr(settings.metrics_port);
         let gauges = observer.gauges();
         match nextgcore_metrics::nes_energy::serve_metrics(
             addr,
