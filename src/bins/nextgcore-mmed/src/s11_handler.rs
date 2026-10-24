@@ -316,6 +316,12 @@ pub fn dispatch_triggered(raw: &[u8], msg_type: u8, sequence_number: u32, peer: 
                     "S11 Modify Bearer Response from {peer} (seq={sequence_number}) cause={}",
                     data.cause
                 );
+                // #1015: what the Serving GW now holds of the eNB's S1-U.
+                crate::gtp_path::confirm_mbr_endpoints(
+                    crate::context::mme_self(),
+                    sequence_number,
+                    &data,
+                );
                 // #730: a Path Switch Request (or a completed S1 handover)
                 // waits on this response (TS 23.401 §5.5.1.1.2 step 5).
                 if let Some(pending) =
@@ -1019,8 +1025,11 @@ pub fn dispatch_initial(raw: &[u8], msg_type: u8, sequence_number: u32, peer: So
                     .unwrap_or(0);
                 // #956, TS 23.401 §5.3.4.3: an ECM-IDLE UE is paged. The Ack is
                 // addressed to the Serving GW's TEID, not echoed back with ours.
-                let (sgw_teid, cause) =
-                    downlink_data_notification(crate::context::mme_self(), local_teid);
+                let (sgw_teid, cause) = downlink_data_notification_for_bearer(
+                    crate::context::mme_self(),
+                    local_teid,
+                    (data.ebi != 0).then_some(data.ebi),
+                );
                 if let Err(e) = crate::gtp_path::send_downlink_data_notification_ack_to(
                     peer,
                     sgw_teid,
@@ -1040,16 +1049,35 @@ pub fn dispatch_initial(raw: &[u8], msg_type: u8, sequence_number: u32, peer: So
     }
 }
 
-/// Act on a Downlink Data Notification for the UE whose S11 TEID is
-/// `mme_s11_teid` (TS 23.401 §5.3.4.3 steps 2-3, #956). Returns the Serving GW
-/// TEID and the cause of the Acknowledge:
-/// - no such UE: Context not found, TEID 0 (TS 29.274 §5.5.2);
-/// - ECM-CONNECTED, or already being paged: Request accepted, nothing more;
-/// - ECM-IDLE: paged on every eNB serving its tracking area (TS 36.413 §8.5),
-///   Request accepted, or Unable to page UE when no eNB serves it.
+/// [`downlink_data_notification_for_bearer`] for a notification that names no
+/// bearer: every bearer of the UE stands for it.
 pub fn downlink_data_notification(
     ctx: &crate::context::MmeContext,
     mme_s11_teid: u32,
+) -> (u32, crate::s11_build::GtpCause) {
+    downlink_data_notification_for_bearer(ctx, mme_s11_teid, None)
+}
+
+/// Act on a Downlink Data Notification for the UE whose S11 TEID is
+/// `mme_s11_teid`, for the bearer `ebi` when the notification names one
+/// (TS 23.401 §5.3.4.3 steps 2-3, #956). Returns the Serving GW TEID and the
+/// cause of the Acknowledge:
+/// - no such UE: Context not found, TEID 0 (TS 29.274 §5.5.2);
+/// - ECM-CONNECTED, and the Serving GW held the eNB's S1-U F-TEID for the
+///   bearer (#1015): the Serving GW has released the S1-U bearers (an S1-U
+///   path failure, TS 23.007 §20.3.4) while S1-MME is up. The S1 connection
+///   is released as for an S1 release (TS 23.401 §5.3.5, cause Transport
+///   resource unavailable) and the UE is paged when it completes; Request
+///   accepted;
+/// - ECM-CONNECTED otherwise (S1-U still being set up, a Modify Bearer Request
+///   unanswered, a handover or release running), or already being paged:
+///   Request accepted, nothing more;
+/// - ECM-IDLE: paged on every eNB serving its tracking area (TS 36.413 §8.5),
+///   Request accepted, or Unable to page UE when no eNB serves it.
+pub fn downlink_data_notification_for_bearer(
+    ctx: &crate::context::MmeContext,
+    mme_s11_teid: u32,
+    ebi: Option<u8>,
 ) -> (u32, crate::s11_build::GtpCause) {
     use crate::s11_build::GtpCause;
     let Some(mme_ue) = ctx
@@ -1078,6 +1106,16 @@ pub fn downlink_data_notification(
                 "[{}] Downlink Data Notification during the S1 release: paging when it completes",
                 mme_ue.imsi_bcd
             );
+        } else if s1u_released_at_sgw(ctx, &mme_ue, &enb_ue, ebi) {
+            log::warn!(
+                "[{}] Downlink Data Notification (EBI {ebi:?}) for an ECM-CONNECTED UE whose \
+                 S1-U the Serving GW held: its S1-U is released; releasing the S1 connection \
+                 and paging (TS 23.401 §5.3.5, §5.3.4.3)",
+                mme_ue.imsi_bcd
+            );
+            for send in crate::s1ap_handler::release_for_released_s1u(ctx, enb_ue.id, mme_ue.id) {
+                crate::s1ap_path::s1ap_send(send);
+            }
         }
         return (sgw_teid, GtpCause::RequestAccepted);
     }
@@ -1098,6 +1136,57 @@ pub fn downlink_data_notification(
     } else {
         (sgw_teid, GtpCause::RequestAccepted)
     }
+}
+
+/// Whether a Downlink Data Notification for the ECM-CONNECTED `mme_ue` on
+/// `enb_ue` says the Serving GW released S1-U it held (#1015), rather than that
+/// S1-U is still being set up. True only when no procedure that legitimately
+/// leaves the Serving GW without the eNB's F-TEIDs is running:
+/// - no S1 release or other UE context release ([`UeCtxRelAction`] unset);
+/// - no Initial Context Setup outstanding (attach, SERVICE REQUEST);
+/// - no Modify Bearer Request unanswered (attach step 23, SERVICE REQUEST
+///   step 8, E-RAB modification, handover);
+/// - no S1 handover in preparation or execution;
+///
+/// and the Serving GW did hold them: every bearer the notification is for
+/// (`ebi`, else every bearer of the UE) has an eNB S1-U F-TEID that an
+/// accepted Modify Bearer or Create Bearer Response gave the Serving GW.
+///
+/// [`UeCtxRelAction`]: crate::context::UeCtxRelAction
+fn s1u_released_at_sgw(
+    ctx: &crate::context::MmeContext,
+    mme_ue: &crate::context::MmeUe,
+    enb_ue: &crate::context::EnbUe,
+    ebi: Option<u8>,
+) -> bool {
+    use crate::context::{UeCtxRelAction, NEXTGCORE_INVALID_POOL_ID};
+    if enb_ue.ue_ctx_rel_action != UeCtxRelAction::Invalid
+        || mme_ue.ics_pending_on != 0
+        || mme_ue.service_request_ics_pending
+        || enb_ue.target_ue_id != NEXTGCORE_INVALID_POOL_ID
+        || enb_ue.handover_prep_deadline.is_some()
+        || enb_ue.pending_handover_command.is_some()
+        || crate::gtp_path::modify_bearer_in_flight(mme_ue.id)
+    {
+        return false;
+    }
+    let handover_target = ctx.enb_ue_pool.read().unwrap().values().any(|t| {
+        t.mme_ue_id == mme_ue.id
+            && t.id != enb_ue.id
+            && (t.handover_prep_deadline.is_some() || t.pending_handover_command.is_some())
+    });
+    if handover_target {
+        return false;
+    }
+    let bearers: Vec<crate::context::MmeBearer> = crate::gtp_path::bearers_of_ue(ctx, mme_ue.id)
+        .into_iter()
+        .filter(|b| ebi.is_none_or(|e| b.ebi == e))
+        .collect();
+    !bearers.is_empty()
+        && bearers.iter().all(|b| {
+            b.enb_s1u_teid != 0
+                && b.enb_s1u_at_sgw.as_ref() == Some(&(b.enb_s1u_teid, b.enb_s1u_ip.clone()))
+        })
 }
 
 /// A Delete Bearer Request from the Serving GW (TS 29.274 §7.2.9.2).

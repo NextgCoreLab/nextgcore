@@ -192,7 +192,7 @@ pub struct EpsGuti {
 }
 
 /// IP address
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IpAddr {
     /// IPv4 address
     pub ipv4: Option<[u8; 4]>,
@@ -1570,6 +1570,13 @@ pub struct MmeBearer {
     pub enb_s1u_teid: u32,
     /// eNB S1-U IP
     pub enb_s1u_ip: IpAddr,
+    /// The eNB S1-U F-TEID the Serving GW holds for this bearer: the one an
+    /// accepted Modify Bearer Response or an accepted Create Bearer Response
+    /// carried (#1015). `None` once a Release Access Bearers Request released
+    /// the S1-U bearers. When it equals (`enb_s1u_teid`, `enb_s1u_ip`) the
+    /// Serving GW can tunnel downlink to the eNB, so a Downlink Data
+    /// Notification for the bearer means the Serving GW released its S1-U.
+    pub enb_s1u_at_sgw: Option<(u32, IpAddr)>,
     /// SGW S1-U TEID
     pub sgw_s1u_teid: u32,
     /// SGW S1-U IP
