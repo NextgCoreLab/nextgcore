@@ -656,7 +656,7 @@ async fn a_setup_whose_send_fails_hands_the_accept_to_the_next_setup() {
 /// A stand-in SMF for Path Switch: records `(ref, n2SmInfoType)` of every update and
 /// answers `PATH_SWITCH_REQ` with 200 and `n2SmInfo` = `transfer_for(ref)` (the
 /// acknowledge transfer the AMF relays), except a `fail-*` ref, which gets 500.
-async fn path_switch_smf() -> (
+pub(super) async fn path_switch_smf() -> (
     nextgcore_sbi::server::SbiServer,
     u16,
     Arc<std::sync::Mutex<Vec<(String, String)>>>,
@@ -1924,6 +1924,9 @@ async fn ue_associated_messages_for_a_ue_the_sender_does_not_serve_are_refused()
     server.ue_auth_state.insert(idle, state);
     let unknown = ngap_gen::CauseRadioNetwork::UNKNOWN_LOCAL_UE_NGAP_ID;
     let inconsistent = ngap_gen::CauseRadioNetwork::INCONSISTENT_REMOTE_UE_NGAP_ID;
+    let refused_before =
+        crate::metrics::global().get(crate::metrics::GlobalMetric::UeAssociatedRefused);
+    let mut refused = 0u64;
 
     let cases = [
         (intruder, ue, ran, unknown, "another gNB"),
@@ -1950,7 +1953,34 @@ async fn ue_associated_messages_for_a_ue_the_sender_does_not_serve_are_refused()
                 Some((Some(amf), Some(r), Some(cause))),
                 "{name} from {what}: Error Indication naming the received ids"
             );
+            refused += 1;
         }
+    }
+    // #1009 review: each refusal is counted in the exported metric (process-wide, so at
+    // least this test's own).
+    assert!(
+        crate::metrics::global().get(crate::metrics::GlobalMetric::UeAssociatedRefused)
+            >= refused_before + refused,
+        "amf_ngap_ue_associated_refused counts the {refused} refusals"
+    );
+    // #1009 review, M1: a HANDOVER NOTIFY is exempt from the gate (the target allocates
+    // its own RAN UE NGAP ID) and its handler checks it against the recorded target
+    // (#803): with no handover in progress, a gNB naming a connected UE is refused with
+    // an Error Indication and takes nothing over -- no relocation, no release of the
+    // serving gNB.
+    for (from, r) in [(intruder, 99u32), (intruder, ran), (serving, ran + 1)] {
+        server
+            .process_ngap_message(from, &super::handover_notify_pdu(ue, r))
+            .await
+            .expect("handled");
+        let sent = take_sent_ngap(&mut server);
+        assert_eq!(sent.len(), 1, "stray Notify from {from}: {sent:?}");
+        assert_eq!(sent[0].0, from, "only the sender hears of it");
+        assert_eq!(
+            decoded_error_indication(&sent[0].1),
+            Some((Some(ue), Some(r), Some(unknown))),
+            "stray Notify from {from}"
+        );
     }
     for (id, ran, idle_now) in [(ue, ran, false), (idle, idle_ran, true)] {
         let state = server.ue_auth_state.get(id).expect("untouched");
@@ -1980,6 +2010,69 @@ async fn ue_associated_messages_for_a_ue_the_sender_does_not_serve_are_refused()
     );
     server.ue_auth_state.remove(ue);
     server.ue_auth_state.remove(idle);
+}
+
+/// **#1009 review, M2.** A PATH SWITCH REQUEST is exempt from the gate (it comes from the
+/// new gNB), so its handler refuses a UE that is not CM-CONNECTED -- an Xn handover
+/// presupposes one -- with PATH SWITCH REQUEST FAILURE, unknown-local-UE-NGAP-ID, before
+/// any SMF call; and only an Acknowledge moves the UE and advances its NH chain. Here a
+/// CM-IDLE UE is named by a stray gNB; it used to have its serving pair moved to that gNB
+/// and its NH advanced even though the request failed.
+///
+/// REVERT-VERIFIED: without the CM-CONNECTED check the SMF is asked to switch the
+/// session; without commit-on-Acknowledge the failed request still moves the UE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_path_switch_for_a_ue_that_is_not_connected_changes_nothing() {
+    crate::context::amf_context_init(64, 1024, 4096);
+    let (_smf, port, calls) = path_switch_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (serving, stray) = (97_393u64, 97_394u64);
+    seed_gnb_session(&server, serving).await;
+    seed_gnb_session(&server, stray).await;
+    let ue = 7_739_201u64;
+    let mut state = UeNasContext::new(ue, 21, serving, false);
+    state.registered = true;
+    state.cm_idle = true;
+    server.ue_auth_state.insert(ue, state);
+    hold_session(&mut server, ue, 5, "ps1009-idle-5", port);
+    let before = server.ue_auth_state.get(ue).expect("UE").amf_ue.clone();
+
+    server
+        .process_ngap_message(stray, &super::path_switch_request_pdu(ue, 77, &[5]))
+        .await
+        .expect("handled");
+
+    let sent = take_sent_ngap(&mut server);
+    forget_amf_sessions(ue);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].0, stray);
+    let (amf, ran, released) =
+        super::decoded_path_switch_failure(&sent[0].1).expect("a PATH SWITCH REQUEST FAILURE");
+    assert_eq!((amf, ran), (ue, 77));
+    assert_eq!(
+        released.iter().map(|(psi, _)| *psi).collect::<Vec<_>>(),
+        vec![5]
+    );
+    assert!(
+        calls.lock().expect("calls").is_empty(),
+        "no SMF is asked to switch a CM-IDLE UE's session"
+    );
+    let after = server.ue_auth_state.get(ue).expect("UE");
+    assert_eq!(
+        (
+            after.association_id,
+            after.ran_ue_ngap_id,
+            after.is_cm_idle()
+        ),
+        (serving, 21, true),
+        "the UE keeps its stored pair"
+    );
+    assert_eq!(
+        (after.amf_ue.nhcc, after.amf_ue.nh),
+        (before.nhcc, before.nh),
+        "and its NH chain"
+    );
+    server.ue_auth_state.remove(ue);
 }
 
 /// An INITIAL CONTEXT SETUP RESPONSE for `(amf, ran)` reporting `sessions` as set up,
