@@ -379,9 +379,11 @@ pub fn nrf_nnrf_nfm_send_nf_status_notify(
         }
     };
 
+    // The subscriber's callback URI may carry its bearer token (#940): logged
+    // with the last segment redacted, as the queued line below (#1026 review).
     log::debug!(
         "Sending NF status notify to {} (event={:?}, nf_instance={})",
-        request.uri,
+        nextgcore_sbi::log_redact::redact_last_segment(&request.uri),
         event,
         nf_instance.nf_instance_id
     );
@@ -1369,6 +1371,46 @@ mod tests {
             NotifySendResult::Success => {}
             _ => panic!("Expected success"),
         }
+    }
+
+    /// #1026 review: the subscriber's notification URI (here carrying an AMF
+    /// NF status token, #940) never reaches a log line whole. The positive
+    /// half (both lines were captured for this NF instance) comes first.
+    ///
+    /// Revert-verified: logging `request.uri` whole fails this test.
+    #[test]
+    fn the_status_notify_callback_token_is_not_logged() {
+        assert!(
+            nextgcore_core::test_log::init(),
+            "the capture logger is installed"
+        );
+        let token = "nf-status-tok-1026";
+        let mut subscription = create_test_subscription(Some("AMF"));
+        subscription.notification_uri =
+            format!("http://10.0.0.7:7777/namf-callback/v1/nf-status-notify/{token}");
+        let mut profile = create_test_profile();
+        profile.nf_instance_id = "nf-1026-capture".to_string();
+
+        let _ = nrf_nnrf_nfm_send_nf_status_notify(
+            &subscription,
+            NotificationEventType::NfRegistered,
+            &profile,
+            "http://nrf.example.com",
+        );
+
+        let lines = nextgcore_core::test_log::captured("nf-1026-capture");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Sending NF status notify to")
+                    && l.contains("nf-status-notify/<redacted>")),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("NF status notify queued")),
+            "{lines:#?}"
+        );
+        assert!(lines.iter().all(|l| !l.contains(token)), "{lines:#?}");
     }
 
     #[test]
