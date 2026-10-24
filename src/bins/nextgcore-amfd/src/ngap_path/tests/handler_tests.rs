@@ -3987,9 +3987,9 @@ async fn a_cm_idle_updates_ics_response_reaches_the_smf_for_the_reactivated_sess
 /// **#1102, the page** (TS 24.501 §5.6.2.2.1, TS 23.502 §4.2.3.3 step 6). The SMF's
 /// downlink data paged the CM-IDLE UE for PSI 1, and the UE answers with a mobility
 /// update instead of a Service Request, reporting PSI 1 active but sending no Uplink
-/// data status. The verified REGISTRATION REQUEST stops T3513: the page leaves the
-/// paging map, so it is not retransmitted for the old connection and its requester
-/// is not told UE_NOT_RESPONDING. And PSI 1, which the page was for, is re-activated
+/// data status. The verified REGISTRATION REQUEST answers the page, and the update
+/// Accept takes it out of the paging map, so it is not retransmitted for the old
+/// connection and its requester is not told UE_NOT_RESPONDING. And PSI 1, which the page was for, is re-activated
 /// at its SMF and rides the Initial Context Setup, so the buffered downlink is
 /// delivered.
 ///
@@ -4025,7 +4025,7 @@ async fn a_registration_update_from_cm_idle_answers_the_page_and_sets_its_sessio
         let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
         assert!(
             guard.paging_find(old_id).is_none() && guard.paging_find(new_id).is_none(),
-            "the registration stops T3513"
+            "the registration answers the page and its Accept takes it"
         );
     }
     let calls = calls.lock().expect("calls").clone();
@@ -4047,7 +4047,6 @@ async fn a_registration_update_from_cm_idle_answers_the_page_and_sets_its_sessio
     );
     let resumed = server.ue_auth_state.get(new_id).expect("the resumed UE");
     assert_eq!(resumed.ics_requested_psis, vec![1]);
-    assert!(resumed.answered_page.is_none(), "the page is consumed");
     drop(resumed);
     forget_update_test(&mut server, old_id, new_id);
 }
@@ -4100,6 +4099,117 @@ async fn a_pages_setup_transfer_rides_the_registration_updates_initial_context_s
         .unwrap()
         .paging_find(old_id)
         .is_none());
+    forget_update_test(&mut server, old_id, new_id);
+}
+
+/// **#1102 (#1105 review m2): a page answered by an update with no session IE.** The
+/// CM-IDLE UE sends a periodic update with neither PDU session status nor Uplink data
+/// status, so the request has nothing to reconcile on its own. The page it answered
+/// still is: its session (PSI 1, a DDN page) is re-activated and rides the ICS.
+///
+/// REVERT-VERIFIED: without the `(None, Some(_))` arm in `send_registration_accept`,
+/// the ICS carries no session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn a_page_answered_by_an_update_without_session_ies_still_sets_its_session_up() {
+    let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    let _guami = ServeFixtureGuami::install();
+    let (_smf, port, calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (old_id, new_id, tmsi) = (7_110_601u64, 7_110_602u64, 0x1102_0601u32);
+    let stored = idle_ue_for_update(old_id, tmsi);
+    let ue_keys = stored.amf_ue.clone();
+    server.ue_auth_state.insert(old_id, stored);
+    hold_session(&mut server, old_id, 1, "reg1102-noies-1", port);
+    assert!(crate::context::amf_self()
+        .read()
+        .unwrap()
+        .paging_add(page_for(old_id, tmsi, 1)));
+    server.forced_amf_ue_ngap_id = Some(new_id);
+
+    let cleartext = super::guti_registration_request(
+        crate::gmm_build::registration_type::PERIODIC_UPDATING,
+        tmsi,
+    );
+    let pdu = super::service_request_initial_ue(super::protected_initial_registration(
+        &ue_keys, &cleartext, &cleartext, 5,
+    ));
+    server
+        .handle_initial_ue_message(ASSOC, &pdu)
+        .await
+        .expect("the update is handled");
+
+    let calls = calls.lock().expect("calls").clone();
+    assert!(
+        calls
+            .iter()
+            .any(|(u, b)| u.ends_with("/sm-contexts/reg1102-noies-1/modify")
+                && b["upCnxState"] == "ACTIVATING"),
+        "{calls:?}"
+    );
+    let sent = take_sent_ngap(&mut server);
+    let ics = sent
+        .iter()
+        .find_map(|(_, p)| decode_ics(p))
+        .unwrap_or_else(|| panic!("an Initial Context Setup Request: {sent:?}"));
+    assert_eq!(
+        ics.items,
+        vec![setup_item(1, transfer_for("reg1102-noies-1"))]
+    );
+    assert!(crate::context::amf_self()
+        .read()
+        .unwrap()
+        .paging_find(old_id)
+        .is_none());
+    forget_update_test(&mut server, old_id, new_id);
+}
+
+/// **#1102 (#1105 review m1): an answered page no update Accept takes.** A paged
+/// CM-IDLE UE answers with a verified INITIAL registration, which is not an update
+/// and takes no page. The page is marked answered by the new connection, so it is
+/// not sent again, but it stays in the paging map. There it runs out on T3513's
+/// schedule and is abandoned, and its requester is told UE_NOT_RESPONDING as
+/// before. It is not silently dropped. The expiry of an answered page is pinned in
+/// `context::tests::an_answered_page_is_not_sent_but_still_expires`.
+///
+/// REVERT-VERIFIED: removing the page when the registration answers it (the first
+/// cut of this fix) fails the "still in the map" assert.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn a_page_answered_by_an_initial_registration_is_kept_for_abandonment() {
+    let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    let _guami = ServeFixtureGuami::install();
+    let (_smf, port, _calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (old_id, new_id, tmsi) = (7_110_701u64, 7_110_702u64, 0x1102_0701u32);
+    let stored = idle_ue_for_update(old_id, tmsi);
+    let ue_keys = stored.amf_ue.clone();
+    server.ue_auth_state.insert(old_id, stored);
+    hold_session(&mut server, old_id, 1, "reg1102-initial-1", port);
+    let mut page = page_for(old_id, tmsi, 1);
+    page.failure_notify_uri = Some(format!("http://127.0.0.1:{port}/n1n2-fail-1102"));
+    assert!(crate::context::amf_self().read().unwrap().paging_add(page));
+    server.forced_amf_ue_ngap_id = Some(new_id);
+
+    let cleartext =
+        super::guti_registration_request(crate::gmm_build::registration_type::INITIAL, tmsi);
+    let pdu = super::service_request_initial_ue(super::protected_initial_registration(
+        &ue_keys, &cleartext, &cleartext, 5,
+    ));
+    let _ = server.handle_initial_ue_message(ASSOC, &pdu).await;
+
+    let kept = crate::context::amf_self()
+        .read()
+        .unwrap()
+        .paging_find(old_id)
+        .expect("the answered page is still in the map");
+    assert_eq!(kept.answered_by, Some(new_id));
+    assert!(
+        kept.failure_notify_uri.is_some(),
+        "its requester can still be told"
+    );
     forget_update_test(&mut server, old_id, new_id);
 }
 

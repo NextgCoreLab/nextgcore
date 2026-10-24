@@ -708,12 +708,6 @@ pub struct UeNasContext {
     /// completes, because the UE set no follow-on request and no user plane was
     /// re-established (TS 24.501 §5.3.1.3 b), the conditions of the UE's T3540).
     release_after_registration: bool,
-    /// #1102: the page a REGISTRATION REQUEST from CM-IDLE answered (TS 24.501
-    /// §5.6.2.2.1: either message stops T3513). Taken out of the paging map when
-    /// the request is verified, so PAGING is not retransmitted for the UE's old
-    /// connection, and taken from here by `send_registration_accept`, which
-    /// delivers what the page held as the Service Request path does.
-    answered_page: Option<crate::context::PagingContext>,
 }
 
 /// Manual `Debug` (no-auth-material-in-logs): the authentication material in
@@ -848,7 +842,6 @@ impl UeNasContext {
             registration_session_ies: None,
             registration_follow_on: false,
             release_after_registration: false,
-            answered_page: None,
             cm_idle: false,
         }
     }
@@ -6168,7 +6161,13 @@ impl NgapServer {
         let update = state.registered && state.amf_ue.security_context_available;
         // #1102: the page this request answered, if any. Its session rides the
         // Accept's Initial Context Setup, and its N1 or N2 release / modify follows it.
-        let page = state.answered_page.take();
+        let page = if update {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.paging_take_answered(amf_ue_ngap_id)
+        } else {
+            None
+        };
         let reconciled = match (state.registration_session_ies.take(), &page) {
             (Some(ies), _) if update => Some(
                 self.reconcile_update_sessions(amf_ue_ngap_id, ies, page.as_ref())
@@ -6743,21 +6742,29 @@ impl NgapServer {
             cell_id: initial_ue.nr_cell_identity,
         };
         // #1102, TS 24.501 §5.6.2.2.1: a verified REGISTRATION REQUEST answers a page
-        // as a SERVICE REQUEST does, so T3513 stops here. Left in the paging map, the
-        // page kept going out for the old connection until it was abandoned, and its
-        // requester was told UE_NOT_RESPONDING for a UE that had answered. What it
-        // held is delivered with the Registration Accept. Taken before the sessions
+        // as a SERVICE REQUEST does, so PAGING stops here. Unanswered, the page kept
+        // going out for the old connection until it was abandoned, and its requester
+        // was told UE_NOT_RESPONDING for a UE that had answered. The page is marked,
+        // not removed: the update Accept takes it and delivers what it held
+        // (`send_registration_accept`), and a registration that never gets there
+        // leaves it to run out on T3513's schedule and be abandoned, so the
+        // requester is still told (#1105 review m1). Marked before the sessions
         // move, so the session's paging state is cleared under the id it was set on.
-        state.answered_page = {
+        let answered = {
             let g = &state.amf_ue.current_guti;
             let ctx = crate::context::amf_self();
             let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
-            guard.paging_take_by_s_tmsi(g.amf_set_id, g.amf_pointer, g.tmsi)
+            guard.paging_mark_answered_by_s_tmsi(
+                g.amf_set_id,
+                g.amf_pointer,
+                g.tmsi,
+                amf_ue_ngap_id,
+            )
         };
-        if let Some(p) = &state.answered_page {
+        if let Some(p) = &answered {
             clear_session_paging(p);
             log::info!(
-                "UE {old_id}: the Registration Request answers its page (PSI {:?}), T3513 \
+                "UE {old_id}: the Registration Request answers its page (PSI {:?}), PAGING \
                  stopped",
                 p.pdu_session_id
             );

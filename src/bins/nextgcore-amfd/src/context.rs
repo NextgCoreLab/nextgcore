@@ -2342,16 +2342,23 @@ impl AmfContext {
         };
         let mut expired_ids = Vec::new();
         for (id, ctx) in paging_map.iter_mut() {
+            // #1102: an answered page keeps T3513's schedule, so one its registration
+            // never takes is abandoned on time, but it is not sent again.
+            let send = ctx.answered_by.is_none();
             match ctx.last_sent {
                 None => {
                     ctx.last_sent = Some(now);
-                    due.send.push(ctx.clone());
+                    if send {
+                        due.send.push(ctx.clone());
+                    }
                 }
                 Some(sent) if now.duration_since(sent) >= t3513 => {
                     if ctx.retransmit_count < ctx.max_retransmit {
                         ctx.retransmit_count += 1;
                         ctx.last_sent = Some(now);
-                        due.send.push(ctx.clone());
+                        if send {
+                            due.send.push(ctx.clone());
+                        }
                     } else {
                         expired_ids.push(*id);
                     }
@@ -2386,6 +2393,37 @@ impl AmfContext {
             .find(|(_, c)| {
                 c.tmsi == tmsi && c.amf_set_id == amf_set_id && c.amf_pointer == amf_pointer
             })
+            .map(|(id, _)| *id)?;
+        paging_map.remove(&id)
+    }
+
+    /// #1102: mark the page of the UE with this 5G-S-TMSI as answered by the
+    /// REGISTRATION REQUEST on connection `by` (TS 24.501 §5.6.2.2.1), and return a
+    /// copy. `None` when no unanswered page is running for it.
+    pub fn paging_mark_answered_by_s_tmsi(
+        &self,
+        amf_set_id: u16,
+        amf_pointer: u8,
+        tmsi: u32,
+        by: u64,
+    ) -> Option<PagingContext> {
+        let mut paging_map = self.paging_map.write().ok()?;
+        let ctx = paging_map.values_mut().find(|c| {
+            c.answered_by.is_none()
+                && c.tmsi == tmsi
+                && c.amf_set_id == amf_set_id
+                && c.amf_pointer == amf_pointer
+        })?;
+        ctx.answered_by = Some(by);
+        Some(ctx.clone())
+    }
+
+    /// #1102: remove and return the page connection `by`'s registration answered.
+    pub fn paging_take_answered(&self, by: u64) -> Option<PagingContext> {
+        let mut paging_map = self.paging_map.write().ok()?;
+        let id = paging_map
+            .iter()
+            .find(|(_, c)| c.answered_by == Some(by))
             .map(|(id, _)| *id)?;
         paging_map.remove(&id)
     }
@@ -4659,6 +4697,12 @@ pub struct PagingContext {
     pub n1n2_msg_data_uri: String,
     /// SUPI of the paged UE, used to clear the session's paging state.
     pub supi: Option<String>,
+    /// #1102: the AMF UE NGAP ID of the connection whose verified REGISTRATION
+    /// REQUEST answered this page (TS 24.501 §5.6.2.2.1). An answered page is not
+    /// sent again. It stays in the map until that registration's Accept takes it
+    /// ([`AmfContext::paging_take_answered`]); one never taken runs out on T3513's
+    /// schedule and is abandoned, so its requester is still told.
+    pub answered_by: Option<u64>,
 }
 
 /// What one paging pump pass decided (TS 24.501 §5.6.2.2.1 / §5.6.2.2.2).
@@ -4695,6 +4739,7 @@ impl Default for PagingContext {
             failure_notify_uri: None,
             n1n2_msg_data_uri: String::new(),
             supi: None,
+            answered_by: None,
         }
     }
 }
@@ -5611,6 +5656,56 @@ mod tests {
 
         sess.clear_session_context();
         assert!(!sess.session_context_in_smf());
+    }
+
+    /// #1102 (#1105 review m1): a page a registration answered is not sent again,
+    /// but it keeps T3513's schedule. A page no update Accept takes is abandoned on
+    /// its last expiry, so the pump notifies its requester as before. Only the
+    /// Accept removes it early (`paging_take_answered`).
+    #[test]
+    fn an_answered_page_is_not_sent_but_still_expires() {
+        let mut ctx = AmfContext::new();
+        ctx.init(64, 1024, 4096);
+        let paging = PagingContext {
+            amf_ue_ngap_id: 7,
+            tmsi: 0x0110_2001,
+            amf_set_id: 1,
+            amf_pointer: 2,
+            max_retransmit: 1,
+            ..Default::default()
+        };
+        assert!(ctx.paging_add(paging));
+        assert!(ctx
+            .paging_mark_answered_by_s_tmsi(1, 2, 0x0110_2001, 70)
+            .is_some());
+        assert!(
+            ctx.paging_mark_answered_by_s_tmsi(1, 2, 0x0110_2001, 71)
+                .is_none(),
+            "answered once"
+        );
+        let zero = std::time::Duration::ZERO;
+        for _ in 0..2 {
+            let due = ctx.paging_take_due(zero);
+            assert!(due.send.is_empty() && due.expired.is_empty(), "{due:?}");
+        }
+        let due = ctx.paging_take_due(zero);
+        assert!(due.send.is_empty());
+        assert_eq!(due.expired.len(), 1, "abandoned on schedule");
+        assert_eq!(due.expired[0].answered_by, Some(70));
+
+        // Taken by its Accept, it is gone at once.
+        assert!(ctx.paging_add(PagingContext {
+            amf_ue_ngap_id: 8,
+            tmsi: 0x0110_2002,
+            ..Default::default()
+        }));
+        assert!(ctx.paging_take_answered(80).is_none());
+        ctx.paging_mark_answered_by_s_tmsi(0, 0, 0x0110_2002, 80);
+        assert_eq!(
+            ctx.paging_take_answered(80).map(|p| p.amf_ue_ngap_id),
+            Some(8)
+        );
+        assert_eq!(ctx.paging_count(), 0);
     }
 
     #[test]
