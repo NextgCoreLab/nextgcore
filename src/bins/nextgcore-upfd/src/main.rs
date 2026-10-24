@@ -123,6 +123,11 @@ struct Args {
     #[arg(long, default_value = "2152")]
     gtpu_port: u16,
 
+    /// IPv6 GTP-U address (N3 over IPv6, #918). Optional: without it, downlink to an
+    /// IPv6 gNB is dropped and counted.
+    #[arg(long)]
+    gtpu_addr6: Option<std::net::Ipv6Addr>,
+
     /// TUN interface name
     #[arg(long, default_value = "ogstun")]
     tun_ifname: String,
@@ -363,6 +368,12 @@ async fn main() -> Result<()> {
             .init(&args.tun_ifname, tun_ip, args.tun_prefix, gtpu_addr)
             .await
             .context("Failed to initialize data plane")?;
+        if let Some(addr6) = args.gtpu_addr6 {
+            data_plane
+                .bind_gtpu6(SocketAddr::new(std::net::IpAddr::V6(addr6), args.gtpu_port))
+                .await
+                .context("Failed to bind the IPv6 GTP-U socket")?;
+        }
     } else {
         log::warn!("Data plane disabled (--no-dataplane flag set)");
         log::warn!("UPF running in control plane only mode - no user traffic forwarding");
@@ -905,11 +916,39 @@ fn data_plane_pdr_from_parsed(p: &crate::n4_build::ParsedCreatePdr) -> data_plan
     }
 }
 
+/// A FAR as the data plane holds it, from a PFCP Create FAR or Update FAR (#918).
+///
+/// The Outer Header Creation endpoint is the IPv4 address when the OHC carries one,
+/// else the IPv6 address. TS 29.244 §8.2.56 lets an OHC carry both and leaves the
+/// choice to the UP function; IPv4 wins because the IPv4 N3 socket always exists,
+/// while the IPv6 one exists only with `--gtpu-addr6`.
+fn data_plane_far_from_parsed(f: &crate::n4_build::ParsedCreateFar) -> data_plane::DataPlaneFar {
+    let ohc = f
+        .forwarding_parameters
+        .as_ref()
+        .and_then(|fp| fp.outer_header_creation.as_ref());
+    data_plane::DataPlaneFar {
+        far_id: f.far_id,
+        apply_action: f.apply_action,
+        destination_interface: f
+            .forwarding_parameters
+            .as_ref()
+            .map(|fp| fp.destination_interface)
+            .unwrap_or(data_plane::SRC_INTF_CORE),
+        ohc_teid: ohc.map(|ohc| ohc.teid),
+        ohc_addr: ohc.and_then(|ohc| {
+            ohc.ipv4
+                .map(std::net::IpAddr::V4)
+                .or(ohc.ipv6.map(std::net::IpAddr::V6))
+        }),
+        bar_id: f.bar_id,
+    }
+}
+
 /// Handle PFCP session events (connect PFCP to data plane)
 async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEvent) {
     use data_plane::{
-        DataPlaneBar, DataPlaneFar, DataPlanePdr, DataPlaneQer, DataPlaneUrr, FAR_ACTION_FORW,
-        GTPU_PORT, SRC_INTF_CORE,
+        DataPlaneBar, DataPlanePdr, DataPlaneQer, DataPlaneUrr, FAR_ACTION_FORW, GTPU_PORT,
     };
     use std::net::IpAddr;
     use std::sync::Arc;
@@ -962,28 +1001,7 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                     if !fars.is_empty() {
                         let mut dp_fars = std::collections::HashMap::new();
                         for f in &fars {
-                            let ohc_teid = f.forwarding_parameters.as_ref().and_then(|fp| {
-                                fp.outer_header_creation.as_ref().map(|ohc| ohc.teid)
-                            });
-                            let ohc_addr = f.forwarding_parameters.as_ref().and_then(|fp| {
-                                fp.outer_header_creation.as_ref().and_then(|ohc| ohc.ipv4)
-                            });
-                            let dest_if = f
-                                .forwarding_parameters
-                                .as_ref()
-                                .map(|fp| fp.destination_interface)
-                                .unwrap_or(SRC_INTF_CORE);
-                            dp_fars.insert(
-                                f.far_id,
-                                DataPlaneFar {
-                                    far_id: f.far_id,
-                                    apply_action: f.apply_action,
-                                    destination_interface: dest_if,
-                                    ohc_teid,
-                                    ohc_addr,
-                                    bar_id: f.bar_id,
-                                },
-                            );
+                            dp_fars.insert(f.far_id, data_plane_far_from_parsed(f));
                         }
                         *session.fars.write().unwrap() = dp_fars;
                     }
@@ -1282,32 +1300,10 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                 if !far_writes.is_empty() {
                     let mut dp_fars = session.fars.write().unwrap();
                     for f in &far_writes {
-                        let ohc_teid = f
-                            .forwarding_parameters
-                            .as_ref()
-                            .and_then(|fp| fp.outer_header_creation.as_ref().map(|ohc| ohc.teid));
-                        let ohc_addr = f.forwarding_parameters.as_ref().and_then(|fp| {
-                            fp.outer_header_creation.as_ref().and_then(|ohc| ohc.ipv4)
-                        });
-                        let dest_if = f
-                            .forwarding_parameters
-                            .as_ref()
-                            .map(|fp| fp.destination_interface)
-                            .unwrap_or(SRC_INTF_CORE);
                         if f.apply_action & FAR_ACTION_FORW != 0 {
                             any_far_forwards = true;
                         }
-                        dp_fars.insert(
-                            f.far_id,
-                            DataPlaneFar {
-                                far_id: f.far_id,
-                                apply_action: f.apply_action,
-                                destination_interface: dest_if,
-                                ohc_teid,
-                                ohc_addr,
-                                bar_id: f.bar_id,
-                            },
-                        );
+                        dp_fars.insert(f.far_id, data_plane_far_from_parsed(f));
                     }
                     log::info!("Installed {} FARs for SEID={upf_seid:#x}", far_writes.len());
                 }
@@ -1405,6 +1401,113 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Create/Update FAR whose Outer Header Creation carries `v4` and/or `v6`.
+    fn far_with_ohc(
+        far_id: u32,
+        v4: Option<Ipv4Addr>,
+        v6: Option<std::net::Ipv6Addr>,
+    ) -> crate::n4_build::ParsedCreateFar {
+        crate::n4_build::ParsedCreateFar {
+            far_id,
+            apply_action: data_plane::FAR_ACTION_FORW,
+            forwarding_parameters: Some(crate::n4_build::ParsedForwardingParameters {
+                destination_interface: 0, // Access
+                network_instance: None,
+                outer_header_creation: Some(crate::n4_build::ParsedOuterHeaderCreation {
+                    description: if v6.is_some() { 0x0200 } else { 0x0100 },
+                    teid: 0x4000 + far_id,
+                    ipv4: v4,
+                    ipv6: v6,
+                    port: None,
+                }),
+            }),
+            bar_id: None,
+        }
+    }
+
+    /// #960 review, MAJOR 1: the PFCP -> data-plane FAR wiring carries an IPv6 gNB
+    /// endpoint, on Create FAR at establishment, Create FAR on a modification and
+    /// Update FAR. An IPv6-only OHC yields the IPv6 address (before #918 the FAR got no
+    /// endpoint at all), and an OHC carrying both yields the IPv4 one (§8.2.56 leaves
+    /// the choice to the UP function; the IPv4 N3 socket always exists).
+    #[tokio::test]
+    async fn create_and_update_far_carry_an_ipv6_ohc_into_the_data_plane() {
+        use std::net::{IpAddr, Ipv6Addr};
+        let v4 = Ipv4Addr::new(192, 0, 2, 10);
+        let v6: Ipv6Addr = "2001:db8::10".parse().unwrap();
+        let dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        let seid = 0x918;
+        handle_pfcp_session_event(
+            &dp,
+            PfcpSessionEvent::SessionEstablished {
+                upf_seid: seid,
+                smf_seid: 0x1918,
+                ue_ipv4: Some(Ipv4Addr::new(10, 45, 9, 18)),
+                ul_teid: 0x100,
+                dl_teid: 0x200,
+                gnb_addr: None,
+                pdrs: Vec::new(),
+                fars: vec![
+                    far_with_ohc(1, None, Some(v6)),
+                    far_with_ohc(2, Some(v4), Some(v6)),
+                ],
+                qers: Vec::new(),
+                urrs: Vec::new(),
+                bars: Vec::new(),
+            },
+        )
+        .await;
+        let session = dp.sessions.find_by_seid(seid).expect("installed");
+        let ohc = |id: u32| session.fars.read().unwrap()[&id].ohc_addr;
+        assert_eq!(ohc(1), Some(IpAddr::V6(v6)), "Create FAR, IPv6-only OHC");
+        assert_eq!(
+            ohc(2),
+            Some(IpAddr::V4(v4)),
+            "Create FAR, dual OHC: IPv4 wins"
+        );
+
+        let v6b: Ipv6Addr = "2001:db8::20".parse().unwrap();
+        handle_pfcp_session_event(
+            &dp,
+            PfcpSessionEvent::SessionModified {
+                upf_seid: seid,
+                dl_teid: None,
+                gnb_addr: None,
+                removed_pdr_ids: Vec::new(),
+                removed_far_ids: Vec::new(),
+                removed_qer_ids: Vec::new(),
+                removed_urr_ids: Vec::new(),
+                created_pdrs: Vec::new(),
+                created_fars: vec![far_with_ohc(3, None, Some(v6b))],
+                created_qers: Vec::new(),
+                created_urrs: Vec::new(),
+                updated_pdrs: Vec::new(),
+                updated_fars: vec![
+                    far_with_ohc(2, None, Some(v6b)),
+                    far_with_ohc(1, Some(v4), Some(v6b)),
+                ],
+                updated_qers: Vec::new(),
+                updated_urrs: Vec::new(),
+                updated_bars: Vec::new(),
+                send_end_marker: false,
+                drop_buffered: false,
+                old_dl_tunnel: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            ohc(3),
+            Some(IpAddr::V6(v6b)),
+            "Create FAR on a modification"
+        );
+        assert_eq!(ohc(2), Some(IpAddr::V6(v6b)), "Update FAR, IPv6-only OHC");
+        assert_eq!(
+            ohc(1),
+            Some(IpAddr::V4(v4)),
+            "Update FAR, dual OHC: IPv4 wins"
+        );
+    }
 
     #[test]
     fn test_args_default() {
