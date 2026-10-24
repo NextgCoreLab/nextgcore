@@ -4129,6 +4129,60 @@ async fn unverified_session_ies_are_not_recorded() {
     server.ue_auth_state.remove(ue);
 }
 
+/// #826 review n1, TS 24.501 §4.4.4.3: a CM-CONNECTED UE's mobility update whose
+/// MAC fails is not discarded but processed as unprotected, so its Uplink data
+/// status and PDU session status are ignored: no session is released or
+/// re-activated at the SMF, and none is recorded for the Accept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connected_update_whose_mac_fails_has_its_session_ies_ignored() {
+    let (_smf, port, calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_759_701u64, 67);
+    registered_ue_with_guti(&mut server, ue, ran);
+    hold_session(&mut server, ue, 1, "reg759-mac-1", port);
+    hold_session(&mut server, ue, 2, "reg759-mac-2", port);
+
+    // The §4.4.4.3 exception path: the request decoded, its MAC failed.
+    let plain = update_registration_request(
+        crate::gmm_build::registration_type::MOBILITY_UPDATING,
+        Some(1 << 1),
+        Some(1 << 1),
+    );
+    let ul_nas = crate::ngap_asn1::UplinkNasTransportData {
+        amf_ue_ngap_id: ue,
+        ran_ue_ngap_id: ran,
+        nas_pdu: ue_protect(&plain, 0),
+        user_location_info: None,
+    };
+    let _ = server
+        .handle_integrity_check_failure(
+            ASSOC,
+            &ul_nas,
+            &plain,
+            security_header::INTEGRITY_PROTECTED,
+        )
+        .await;
+
+    assert!(
+        calls.lock().expect("calls").is_empty(),
+        "no session is released or re-activated: {:?}",
+        calls.lock().expect("calls")
+    );
+    {
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+        assert!(guard.sess_find_by_psi(ue, 2).is_some(), "PSI 2 is kept");
+    }
+    assert_eq!(
+        server
+            .ue_auth_state
+            .get(ue)
+            .and_then(|s| s.registration_session_ies),
+        None
+    );
+    server.forget_ue(ue);
+}
+
 /// #826 review m1, the always-overwritten rule. IEs left on the context by an
 /// earlier request (one that never reached an Accept) must not be applied to
 /// the Accept of a later request that carries none. The later request
