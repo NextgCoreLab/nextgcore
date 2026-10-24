@@ -316,8 +316,11 @@ services:
     networks:
       epc:
         ipv4_address: 172.24.0.5
+    # S1AP towards an eNB. The compose eNB reaches 172.24.0.5 over the epc
+    # network and needs no publish; this one is for an eNB run on the host, and
+    # is loopback-bound so S1-MME is not offered to every host interface.
     ports:
-      - "36412:36412/sctp"  # S1AP towards eNB
+      - "127.0.0.1:36412:36412/sctp"
     depends_on:
       hss:
         condition: service_healthy

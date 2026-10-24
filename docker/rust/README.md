@@ -368,6 +368,9 @@ services:
 
 ### Port Mappings
 
+Host publishes are bound to `127.0.0.1` in both compose files (the NFs talk over
+the compose networks); reach them from another machine through an SSH tunnel.
+
 | Service | Protocol | Port | Description |
 |---------|----------|------|-------------|
 | NRF | HTTP/2 | 7777 | SBI interface |

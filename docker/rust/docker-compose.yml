@@ -58,8 +58,12 @@ services:
     networks:
       core:
         ipv4_address: 172.23.0.2
+    # Every published port is loopback-bound: the stack talks over its own
+    # network, and host-side tools (mongosh, the SBI, Prometheus, Grafana,
+    # Jaeger) reach it on 127.0.0.1. Reach it from another machine through an
+    # SSH tunnel rather than a wider publish.
     ports:
-      - "27017:27017"
+      - "127.0.0.1:27017:27017"
     healthcheck:
       test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
       interval: 10s
@@ -87,7 +91,7 @@ services:
       core:
         ipv4_address: 172.23.0.10
     ports:
-      - "7777:7777"
+      - "127.0.0.1:7777:7777"
     depends_on:
       mongodb:
         condition: service_healthy
@@ -268,7 +272,7 @@ services:
       core:
         ipv4_address: 172.23.0.5
     ports:
-      - "38412:38412/udp"
+      - "127.0.0.1:38412:38412/udp"
     depends_on:
       nrf:
         condition: service_healthy
@@ -308,7 +312,7 @@ services:
       core:
         ipv4_address: 172.23.0.4
     ports:
-      - "8805:8805/udp"
+      - "127.0.0.1:8805:8805/udp"
     depends_on:
       nrf:
         condition: service_healthy
@@ -347,7 +351,7 @@ services:
       core:
         ipv4_address: 172.23.0.7
     ports:
-      - "2152:2152/udp"
+      - "127.0.0.1:2152:2152/udp"
     healthcheck:
       test: ["CMD-SHELL", "kill -0 1"]
       interval: 10s
@@ -592,7 +596,7 @@ services:
       core:
         ipv4_address: 172.23.0.200
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     healthcheck:
       test: ["CMD", "wget", "-q", "--tries=1", "-O", "/dev/null", "http://localhost:9090/-/healthy"]
       interval: 15s
@@ -617,7 +621,7 @@ services:
       core:
         ipv4_address: 172.23.0.201
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     depends_on:
       prometheus:
         condition: service_healthy
@@ -637,9 +641,9 @@ services:
       core:
         ipv4_address: 172.23.0.202
     ports:
-      - "16686:16686"   # Jaeger UI
-      - "4317:4317"     # OTLP gRPC
-      - "4318:4318"     # OTLP HTTP
+      - "127.0.0.1:16686:16686"   # Jaeger UI
+      - "127.0.0.1:4317:4317"     # OTLP gRPC
+      - "127.0.0.1:4318:4318"     # OTLP HTTP
     healthcheck:
       test: ["CMD", "wget", "-q", "--tries=1", "-O", "/dev/null", "http://localhost:14269/"]
       interval: 15s
