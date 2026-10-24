@@ -1054,6 +1054,10 @@ impl NgapServer {
         // NG-RAN nodes the consumer targeted. Dormant when none pending.
         self.process_pws_n2_transfers().await;
 
+        // Relay non-UE-associated NRPPa an LMF handed the Namf transfer handler
+        // (#807, TS 29.518 §5.2.2.4.1.2 / TS 38.413 §8.15.4). Dormant when none.
+        self.process_non_ue_nrppa_transfers().await;
+
         // Page every CM-IDLE UE a Namf N1N2MessageTransfer queued (#512, TS 23.502
         // §4.2.3.3): PAGING to the gNBs serving its registration area, T3513
         // retransmission, and the failure notification on final expiry.
@@ -7847,6 +7851,57 @@ impl NgapServer {
         }
     }
 
+    /// Drain the non-UE-associated NRPPa relays (#807) and send each as a
+    /// DOWNLINK NON UE ASSOCIATED NRPPA TRANSPORT (TS 38.413 §8.15.4) to the
+    /// connected gNBs named in `globalRanNodeList`, with the LMF's nfId as the
+    /// Routing ID. Resolved against the live sessions, like the PWS relay.
+    pub(crate) async fn process_non_ue_nrppa_transfers(&mut self) {
+        let pending = {
+            let ctx = crate::context::amf_self();
+            let Ok(guard) = ctx.read() else {
+                return;
+            };
+            guard.non_ue_nrppa_drain()
+        };
+        for item in pending {
+            let Some(pdu) = crate::positioning::build_nrppa_dl_non_ue_associated(
+                &item.routing_id,
+                &item.nrppa_pdu,
+            ) else {
+                log::warn!(
+                    "Non-UE NRPPa relay: DOWNLINK NON UE ASSOCIATED NRPPA TRANSPORT encode failed"
+                );
+                continue;
+            };
+            let targets: Vec<(u32, u64)> = {
+                let sessions = self.sessions.read().await;
+                sessions
+                    .values()
+                    .filter(|s| item.target_gnb_ids.contains(&s.gnb.gnb_id))
+                    .map(|s| (s.gnb.gnb_id, s.association_id))
+                    .collect()
+            };
+            for gnb in &item.target_gnb_ids {
+                if !targets.iter().any(|(g, _)| g == gnb) {
+                    log::warn!(
+                        "Non-UE NRPPa relay: gNB {gnb:#x} is not connected; the NRPPa PDU \
+                         ({} B) was not delivered to it",
+                        item.nrppa_pdu.len()
+                    );
+                }
+            }
+            for (gnb, association_id) in targets {
+                match self.send_to_association(association_id, &pdu).await {
+                    Ok(()) => log::info!(
+                        "Non-UE NRPPa relay: {} B to gNB {gnb:#x} (association {association_id})",
+                        item.nrppa_pdu.len()
+                    ),
+                    Err(e) => log::warn!("Non-UE NRPPa relay to gNB {gnb:#x} failed: {e}"),
+                }
+            }
+        }
+    }
+
     /// Resolve the SCTP associations a PWS transfer targets, applying the IE
     /// precedence of TS 29.518 §5.2.2.4.1.3 (`29518-k00.txt:4152-4159`):
     ///
@@ -8492,6 +8547,44 @@ impl NgapServer {
             }
         };
 
+        let nf_id = String::from_utf8(ul.routing_id.clone())
+            .ok()
+            .filter(|s| !s.is_empty());
+
+        // #807, TS 29.518 §5.2.2.4.4.2: the answer goes to the LMF the Routing ID
+        // names, through its non-UE NRPPa subscription, with the responding node's
+        // identity. Only without one does the any-UE N1N2 fallback below apply.
+        let non_ue = {
+            let ctx = crate::context::amf_self();
+            let Ok(guard) = ctx.read() else {
+                return Ok(());
+            };
+            guard.non_ue_nrppa_subscription_find(nf_id.as_deref())
+        };
+        if let Some(sub) = non_ue {
+            let ran_node_id = self.sessions.read().await.get(&association_id).map(|s| {
+                crate::namf_server::global_ran_node_id_json(
+                    &s.gnb.plmn_id,
+                    s.gnb.gnb_id,
+                    s.gnb.gnb_id_len,
+                )
+            });
+            log::info!(
+                "LCS: relaying uplink non-UE-associated NRPPa ({} B) to LMF {nf_id:?} via \
+                 non-UE subscription {}",
+                ul.nrppa_pdu.len(),
+                sub.subscription_id
+            );
+            crate::namf_server::send_non_ue_nrppa_info_notify(
+                sub.n2_notify_callback_uri,
+                sub.subscription_id,
+                nf_id,
+                ran_node_id,
+                ul.nrppa_pdu,
+            );
+            return Ok(());
+        }
+
         let sub = {
             let ctx = crate::context::amf_self();
             let Ok(guard) = ctx.read() else {
@@ -8509,10 +8602,6 @@ impl NgapServer {
             return Ok(());
         };
         let sub = sub.expect("callback_uri implies subscription");
-
-        let nf_id = String::from_utf8(ul.routing_id.clone())
-            .ok()
-            .filter(|s| !s.is_empty());
 
         log::info!(
             "LCS: relaying uplink non-UE-associated NRPPa ({} B) to LMF \
@@ -19467,6 +19556,134 @@ mod tests {
             1,
             "the fail-closed drop is counted"
         );
+    }
+
+    /// #807: the pump sends each queued non-UE NRPPa PDU as a DOWNLINK NON UE
+    /// ASSOCIATED NRPPA TRANSPORT (TS 38.413 §8.15.4) with the LMF's Routing ID,
+    /// to the named connected gNB only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_non_ue_nrppa_pump_sends_to_the_named_gnb_only() {
+        let _serial = crate::namf_server::non_ue_nrppa_queue_test_lock()
+            .lock()
+            .await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        ngap.sent_ngap = Some(Vec::new());
+        insert_pws_test_gnb(
+            &ngap,
+            8071,
+            0x807,
+            crate::context::RatType::Nr,
+            &[("001", "01", 1)],
+        )
+        .await;
+        insert_pws_test_gnb(
+            &ngap,
+            8072,
+            0x808,
+            crate::context::RatType::Nr,
+            &[("001", "01", 1)],
+        )
+        .await;
+        let nrppa = vec![0x00u8, 0x0b, 0x00, 0x00, 0x05, 0x00];
+        {
+            let ctx = crate::context::amf_self();
+            let g = ctx.read().unwrap();
+            let _ = g.non_ue_nrppa_drain();
+            assert!(g.non_ue_nrppa_add(crate::context::PendingNonUeNrppa {
+                nrppa_pdu: nrppa.clone(),
+                routing_id: b"lmf-807".to_vec(),
+                target_gnb_ids: vec![0x807, 0x999],
+            }));
+        }
+        ngap.process_non_ue_nrppa_transfers().await;
+        let sent: Vec<(u64, Vec<u8>)> = ngap
+            .sent_ngap
+            .take()
+            .unwrap()
+            .into_iter()
+            .map(|(association, _stream, pdu)| (association, pdu))
+            .collect();
+        assert_eq!(
+            sent,
+            vec![(
+                8071,
+                crate::positioning::build_nrppa_dl_non_ue_associated(b"lmf-807", &nrppa).unwrap()
+            )],
+            "only the named, connected gNB 0x807; 0x808 was not named, 0x999 is not connected"
+        );
+        assert_eq!(sent[0].1[1], 5, "NGAP procedure 5");
+    }
+
+    /// #807, TS 29.518 §5.2.2.4.4.2: an uplink non-UE NRPPa answer goes to the LMF
+    /// its Routing ID names, through that LMF's non-UE NRPPa subscription, with
+    /// the answering node as `ranNodeId` and no `lcsCorrelationId` (it belongs to
+    /// no UE).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_uplink_non_ue_nrppa_answer_goes_to_the_lmf_its_routing_id_names() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        use nextgcore_asn1c::ngap::ies::{NrppaPdu, RoutingId};
+        use nextgcore_asn1c::ngap::pdu::build_uplink_non_ue_associated_nrppa_transport;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (_sink, port, mut rx) = start_lmf_callback_sink().await;
+        let sub_id = "nonuen2sub-807-routing";
+        {
+            let ctx = crate::context::amf_self();
+            let g = ctx.read().unwrap();
+            assert!(
+                g.non_ue_n2_subscription_add(crate::context::NonUeN2InfoSubscription {
+                    subscription_id: sub_id.to_string(),
+                    n2_information_class: "NRPPa".to_string(),
+                    n2_notify_callback_uri: format!(
+                        "http://127.0.0.1:{port}/nlmf-loc/v1/notify/n2"
+                    ),
+                    nf_id: Some("lmf-routing-807".to_string()),
+                    notif_correlation_id: None,
+                    global_ran_node_gnb_ids: Vec::new(),
+                    an_type_list: Vec::new(),
+                    supported_features: None,
+                })
+            );
+        }
+        let mut ngap = test_ngap_server().await;
+        insert_pws_test_gnb(
+            &ngap,
+            1,
+            0x807,
+            crate::context::RatType::Nr,
+            &[("001", "01", 1)],
+        )
+        .await;
+        let nrppa = vec![0x20u8, 0x0b, 0x00, 0x00, 0x05, 0x00];
+        let bytes = encode_ngap_pdu(
+            &build_uplink_non_ue_associated_nrppa_transport(
+                RoutingId::new(b"lmf-routing-807".to_vec()),
+                NrppaPdu::new(nrppa.clone()),
+            )
+            .unwrap(),
+        );
+        ngap.process_ngap_message(1, &bytes).await.unwrap();
+        let (_, json_root, parts) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("NonUeN2InfoNotify within 5s")
+            .unwrap();
+        crate::context::amf_self()
+            .read()
+            .unwrap()
+            .non_ue_n2_subscription_remove(sub_id);
+        let body: serde_json::Value = serde_json::from_str(&json_root).unwrap();
+        assert_eq!(body["n2NotifySubscriptionId"], sub_id);
+        assert!(body.get("lcsCorrelationId").is_none());
+        assert_eq!(
+            u32::from_str_radix(body["ranNodeId"]["gNbId"]["gNBValue"].as_str().unwrap(), 16),
+            Ok(0x807),
+            "the answering node"
+        );
+        assert_eq!(
+            body["n2InfoContainer"]["nrppaInfo"]["nfId"],
+            "lmf-routing-807"
+        );
+        assert_eq!(parts[0].data.as_ref(), nrppa.as_slice());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

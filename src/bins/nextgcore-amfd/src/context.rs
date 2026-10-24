@@ -659,6 +659,14 @@ pub struct AmfContext {
     /// against the live session map.
     pws_n2_queue: RwLock<Vec<PendingPwsN2Transfer>>,
 
+    /// Non-UE-associated NRPPa an LMF handed the AMF over
+    /// `POST /namf-comm/v1/non-ue-n2-messages/transfer` (#807, TS 29.518
+    /// §5.2.2.4.1.2), for egress as DOWNLINK NON UE ASSOCIATED NRPPA TRANSPORT
+    /// (TS 38.413 §8.15.4) to the named NG-RAN nodes. Same shape and reason as
+    /// `pws_n2_queue`: the NGAP task owns the SCTP associations and resolves the
+    /// targets against its live sessions.
+    non_ue_nrppa_queue: RwLock<Vec<PendingNonUeNrppa>>,
+
     /// Non-UE N2 information subscriptions (#399, TS 29.518 §5.2.2.4.2), keyed
     /// by the AMF-minted `n2NotifySubscriptionId` — the Document resource's URI
     /// variable (§6.1.3.10.2, `29518-k00.txt:10111`). A CBCF/PWS-IWF creates one
@@ -815,6 +823,22 @@ pub struct PendingPwsN2Transfer {
     pub target_tais: Vec<(PlmnId, u32)>,
     /// `ratSelector`. `None` means the IE was absent, so no RAT filter applies.
     pub rat_selector: Option<PwsRatSelector>,
+}
+
+/// The most non-UE NRPPa PDUs awaiting the NGAP pump (#903 review).
+pub const MAX_PENDING_NON_UE_NRPPA: usize = 1024;
+
+/// A non-UE-associated NRPPa PDU to relay to NG-RAN nodes (#807, TS 29.518
+/// §5.2.2.4.1.2, TS 38.413 §8.15.4).
+#[derive(Debug, Clone)]
+pub struct PendingNonUeNrppa {
+    /// The NRPPa PDU, verbatim.
+    pub nrppa_pdu: Vec<u8>,
+    /// The NGAP Routing ID: the LMF's `nfId`, so the node's answer (UPLINK NON UE
+    /// ASSOCIATED NRPPA TRANSPORT carries the Routing ID back) finds that LMF.
+    pub routing_id: Vec<u8>,
+    /// The gNB IDs of `globalRanNodeList`.
+    pub target_gnb_ids: Vec<u32>,
 }
 
 /// A non-UE N2 information subscription a consumer (e.g. CBCF/PWS-IWF) created
@@ -1236,6 +1260,7 @@ impl AmfContext {
             network_dereg_queue: RwLock::new(Vec::new()),
             connected_downlink_queue: RwLock::new(Vec::new()),
             pws_n2_queue: RwLock::new(Vec::new()),
+            non_ue_nrppa_queue: RwLock::new(Vec::new()),
             non_ue_n2_subscriptions: RwLock::new(HashMap::new()),
             pws_response_requests: RwLock::new(HashMap::new()),
         }
@@ -2145,6 +2170,45 @@ impl AmfContext {
         if let Ok(mut q) = self.pws_n2_queue.write() {
             q.push(item);
         }
+    }
+
+    /// Enqueue a non-UE-associated NRPPa relay (#807). `false` when the queue
+    /// already holds [`MAX_PENDING_NON_UE_NRPPA`] PDUs (#903 review): the pump
+    /// drains it every loop, so a full queue means the NGAP task is not keeping
+    /// up, and the transfer is refused rather than queued without bound.
+    pub fn non_ue_nrppa_add(&self, item: PendingNonUeNrppa) -> bool {
+        match self.non_ue_nrppa_queue.write() {
+            Ok(mut q) if q.len() < MAX_PENDING_NON_UE_NRPPA => {
+                q.push(item);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Drain the pending non-UE-associated NRPPa relays (NGAP server pump).
+    pub fn non_ue_nrppa_drain(&self) -> Vec<PendingNonUeNrppa> {
+        match self.non_ue_nrppa_queue.write() {
+            Ok(mut q) => std::mem::take(&mut *q),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// The non-UE N2 subscription for the NRPPa class that an LMF's answer goes to
+    /// (#807, TS 29.518 §5.2.2.4.4.2): the one created by the LMF whose nfId is
+    /// the NGAP Routing ID. A subscription that named no nfId is used only when
+    /// the answer names none either (#903 review): it may belong to another
+    /// consumer, and an answer that names its LMF must not go elsewhere. No PWS
+    /// fallback.
+    pub fn non_ue_nrppa_subscription_find(
+        &self,
+        nf_id: Option<&str>,
+    ) -> Option<NonUeN2InfoSubscription> {
+        let subs = self.non_ue_n2_subscriptions.read().ok()?;
+        subs.values()
+            .filter(|s| s.n2_information_class == "NRPPa" && s.nf_id.as_deref() == nf_id)
+            .max_by(|a, b| a.subscription_id.cmp(&b.subscription_id))
+            .cloned()
     }
 
     /// Drain all pending PWS warning relays (called by the NGAP server pump).
