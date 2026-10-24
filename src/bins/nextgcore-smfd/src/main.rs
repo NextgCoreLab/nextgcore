@@ -478,6 +478,8 @@ async fn main() -> Result<()> {
         Some(&config_path),
     ))
     .init();
+    // #1004 review: an unset clock makes a wrong PFCP Recovery Time Stamp.
+    nextgcore_pfcp::recovery_time::check_local_clock().map_err(|e| anyhow::anyhow!(e))?;
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = nextgcore_metrics::otel::init_otel(
         nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
@@ -9297,7 +9299,19 @@ mod tests {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
         let fx = restart_fixture("92804", Duration::ZERO).await;
-        heartbeat_request_from_a(&fx, 50, 0x9284).await;
+        // Real start times (#1004 follow-up): a stored stamp in the future is not a
+        // reference for ordering, so the fixture's synthetic 100 (an era-1, 2036
+        // value) cannot stand in for "the current incarnation" here.
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        fx.a.seed_peer_recovery_time_stamp(nextgcore_pfcp::recovery_time::from_unix_secs(
+            now_unix - 60,
+        ))
+        .await;
+        let older = nextgcore_pfcp::recovery_time::from_unix_secs(now_unix - 86_400);
+        heartbeat_request_from_a(&fx, older, 0x9284).await;
         let kept = fx.session_kept();
         fx.teardown().await;
         assert!(

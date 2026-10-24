@@ -1257,6 +1257,8 @@ impl PfcpServer {
     /// from any other address says nothing about whether THIS association's
     /// peer restarted.
     async fn check_peer_recovery(&self, src_addr: SocketAddr, rts: u32) {
+        // #995: in the NTP reading, as stored at association.
+        let rts = nextgcore_pfcp::recovery_time::normalize_received(rts);
         let restarted = {
             let assoc = self.association.read().await;
             match assoc.as_ref() {
@@ -1359,7 +1361,8 @@ impl PfcpServer {
                 .map_err(|e| format!("Send error: {e}"))?;
             return Ok(());
         }
-        let rts = rts.unwrap();
+        // #995: kept in the NTP reading (a pre-#995 SMF sends Unix seconds).
+        let rts = nextgcore_pfcp::recovery_time::normalize_received(rts.unwrap());
         let node_id = ParsedIe::find_ie(&ies, pfcp_ie::NODE_ID)
             .map(|ie| ie.value.clone())
             .unwrap_or_default();
@@ -5795,7 +5798,7 @@ mod tests {
     /// §8.2.65), and a pre-#995 peer's Unix-seconds stamp is read in the NTP reading.
     #[tokio::test]
     async fn recovery_time_stamps_are_ntp_seconds() {
-        let (server, _smf, _addr, _rx) = spawn_test_server().await;
+        let (server, smf, addr, _rx) = spawn_test_server().await;
         let now = nextgcore_pfcp::recovery_time::now();
         assert!(now.wrapping_sub(server.recovery_time_stamp) < 60);
         let unix = std::time::SystemTime::now()
@@ -5807,7 +5810,21 @@ mod tests {
         b.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, unix as u32);
         assert_eq!(
             crate::n4_build::parse_recovery_time_stamp(&b.build()),
-            Some(nextgcore_pfcp::recovery_time::from_unix_secs(unix))
+            Some(unix as u32),
+            "the parser returns the wire value"
+        );
+        // ... and the association stores it in the NTP reading.
+        let assoc = build_association_setup_request_payload(Some(unix as u32));
+        let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+        assert_eq!(
+            server
+                .association
+                .read()
+                .await
+                .as_ref()
+                .unwrap()
+                .recovery_time_stamp,
+            nextgcore_pfcp::recovery_time::from_unix_secs(unix)
         );
     }
 
