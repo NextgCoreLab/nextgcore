@@ -613,20 +613,24 @@ async fn main() -> Result<()> {
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty());
     if let Some(path) = state_file {
-        let ctx = smf_self();
-        let mut guard = ctx
-            .write()
-            .map_err(|_| anyhow::anyhow!("SMF context lock poisoned"))?;
         // Fail STARTUP on a snapshot that cannot be read or is from a newer build.
         // Coming up with an empty IPv4 pool is the one failure mode here that is
         // worse than not starting: it re-issues addresses live UEs still hold, and
         // nothing logs the collision. The store would then also refuse every later
         // write to protect the file, so the run would be silently non-durable too.
-        let restored = guard.set_state_file(std::path::PathBuf::from(&path))?;
+        //
+        // #884: the write guard lives in this block only. It must be gone before the
+        // notifier below is awaited: the notifier takes its own read guard, and
+        // `std::sync::RwLock` is not reentrant. A guard held across an `.await` also
+        // blocks the executor thread for whatever that await does.
+        let restored = {
+            let ctx = smf_self();
+            let mut guard = ctx
+                .write()
+                .map_err(|_| anyhow::anyhow!("SMF context lock poisoned"))?;
+            guard.set_state_file(std::path::PathBuf::from(&path))?
+        };
         log::info!("SMF durable state: {path} ({restored} record(s) restored)");
-        // The context lock must be released before the notifier runs: it takes its
-        // own read guard, and `std::sync::RwLock` is not reentrant.
-        drop(guard);
         // #193: a restored session whose policy binding did not survive is unusable
         // and its consumer still believes in it. This is the ONE restoration signal
         // that belongs at boot -- it needs no evidence from the UPF -- and it runs
@@ -7948,6 +7952,8 @@ mod tests {
         use nextgcore_ngap::transfer::{
             PduSessionResourceModifyConfirmTransfer, UpTransportLayerInformation,
         };
+        // #779 review m1: process-wide SMF context state, ambient lock first.
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let upf = pfcp_path::stand_in::install_stand_in_upf().await;
         upf.client.associate().await.expect("association");
         upf.clear_seen();
@@ -7981,6 +7987,8 @@ mod tests {
     async fn an_initiated_modification_it_cannot_carry_out_is_answered_ind_fail() {
         use nextgcore_asn1c::ngap::cause::{Cause, CauseMisc, CauseProtocol};
         use nextgcore_ngap::transfer::PduSessionResourceModifyIndicationUnsuccessfulTransfer as Unsuccessful;
+        // #779 review m1: process-wide SMF context state, ambient lock first.
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let upf = pfcp_path::stand_in::install_stand_in_upf().await;
         upf.client.associate().await.expect("association");
         upf.clear_seen();
@@ -11970,6 +11978,10 @@ mod tests {
     /// PDU_RES_SETUP_RSP marks it ACTIVATED again.
     #[tokio::test]
     async fn an_up_deactivation_is_recorded_for_the_downlink_data_report() {
+        // #779: this test reads and writes the process-wide SMF context (sessions,
+        // policy bindings), so it holds the ambient lock like every other reader and
+        // writer (the #308 rule); `smf_context_init` checks that it is held.
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let reference = seed_registered_session("imsi-999700000540001", 1, "internet");
         let req = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts/x/modify").with_body(
             serde_json::json!({ "upCnxState": "DEACTIVATED" }).to_string(),
@@ -13089,6 +13101,10 @@ mod tests {
     /// by `retrieve_answers_200_with_ue_eps_pdn_connection`, which fails without it.
     #[tokio::test]
     async fn the_sm_context_lifecycle_round_trips_through_the_router() {
+        // #779: this test reads and writes the process-wide SMF context (sessions,
+        // policy bindings), so it holds the ambient lock like every other reader and
+        // writer (the #308 rule); `smf_context_init` checks that it is held.
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let reference = seed_registered_session("imsi-001010000000083", 4, "internet");
 
         // Retrieve
@@ -13427,6 +13443,10 @@ mod oauth2_h8_tests {
 
     #[tokio::test]
     async fn test_oauth2_missing_token_rejected_401() {
+        // #779: this test reads and writes the process-wide SMF context (sessions,
+        // policy bindings), so it holds the ambient lock like every other reader and
+        // writer (the #308 rule); `smf_context_init` checks that it is held.
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let sk = p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
         let (server, port) = start_server(jwks_for(&sk, "nrf-es256")).await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
@@ -13443,6 +13463,10 @@ mod oauth2_h8_tests {
 
     #[tokio::test]
     async fn test_oauth2_wrong_audience_rejected_401() {
+        // #779: this test reads and writes the process-wide SMF context (sessions,
+        // policy bindings), so it holds the ambient lock like every other reader and
+        // writer (the #308 rule); `smf_context_init` checks that it is held.
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let sk = p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
         let (server, port) = start_server(jwks_for(&sk, "nrf-es256")).await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
@@ -13459,6 +13483,10 @@ mod oauth2_h8_tests {
 
     #[tokio::test]
     async fn test_oauth2_valid_token_reaches_handler() {
+        // #779: this test reads and writes the process-wide SMF context (sessions,
+        // policy bindings), so it holds the ambient lock like every other reader and
+        // writer (the #308 rule); `smf_context_init` checks that it is held.
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let sk = p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
         let (server, port) = start_server(jwks_for(&sk, "nrf-es256")).await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
@@ -13548,6 +13576,8 @@ mod path_switch_ack_tests {
         use nextgcore_ngap::transfer::{
             PduSessionResourceSetupRequestTransfer, UpTransportLayerInformation,
         };
+        // #779 review m1: process-wide SMF context state, ambient lock first.
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let r = "act-518-ref";
         {
             let ctx = smf_self();
