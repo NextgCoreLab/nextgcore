@@ -9,7 +9,7 @@
 # gitignored); build them first (README "Prerequisites"):
 #   nextgcore/binaries/nextgcore-*         (the workspace builds 28 NF daemons
 #                                          plus webui; 5g packages 10, epc 7)
-#   nextgsim/docker/binaries/nr-gnb,nr-ue  (5g)
+#   nextgsim/binaries/nr-gnb,nr-ue         (5g)
 #   nextgsim/binaries/lte-enb,lte-ue       (epc)
 #
 # Images are tagged by the git SHA of the repository they are built from, not
@@ -241,10 +241,9 @@ for entry in "${PROFILE_SIM_IMAGES[@]}"; do
     continue
   fi
   log "building ${node}"
-  # For gnb/ue the context is nextgsim/docker, NOT nextgsim: those Dockerfiles
-  # do `COPY binaries/nr-gnb`, and the binaries live in
-  # nextgsim/docker/binaries/. The LTE Dockerfiles also COPY config/ and
-  # scripts/, so their context is the repo root (with nextgsim/binaries/).
+  # The context is the profile's (nextgsim's repo root for both profiles):
+  # the Dockerfiles COPY binaries/ and, Dockerfile.ue-local since nextgsim
+  # #373 and the LTE ones, scripts/ or config/ too (#1099).
   docker build \
     -f "${SIM_DIR}/${dockerfile}" \
     -t "${remote}" \

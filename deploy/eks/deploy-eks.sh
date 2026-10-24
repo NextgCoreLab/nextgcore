@@ -4,7 +4,8 @@
 # The EKS counterpart of nextgcore/k8s/deploy.sh, minus everything Kind-specific
 # (no `kind create cluster`, no `kind load docker-image`), plus the things EKS
 # needs that Kind did not: an image registry, the UDM hnet Secret, a bound
-# StorageClass, and a namespace Pod Security label.
+# StorageClass, and a namespace Pod Security label. Like k8s/deploy.sh it also
+# creates the grafana-admin Secret when it is absent (#1100).
 #
 # Usage:
 #   ./deploy-eks.sh                              # fresh: control plane only;
@@ -569,6 +570,36 @@ else
   die "hnet keys not found under ${HNET_DIR}. The UDM will crash-loop without them."
 fi
 
+# --- Grafana admin secret (#1100) ------------------------------------------
+
+# k8s/monitoring/grafana.yaml takes its admin password from Secret
+# grafana-admin and has no fallback (#837), so without it the pod sits in
+# CreateContainerConfigError. Created as k8s/deploy.sh does: a generated
+# password, only when the Secret is absent -- an existing one (the operator's
+# own, or an earlier run's) is never overwritten. Keyed on the render, not the
+# profile, so a profile without Grafana creates nothing.
+GRAFANA_SECRET=false
+if grep -q 'name: grafana-admin$' "${RENDERED}"; then
+  GRAFANA_SECRET=true
+  # --ignore-not-found: empty output means absent; any other failure (RBAC,
+  # API) exits here rather than falling through to a create.
+  existing="$(kubectl get secret grafana-admin -n "${NAMESPACE}" -o name --ignore-not-found)" \
+    || die "cannot read Secret grafana-admin in ${NAMESPACE}"
+  if [[ -n "${existing}" ]]; then
+    log "keeping the existing grafana-admin Secret"
+  else
+    command -v openssl >/dev/null || die "openssl not found (needed to generate the Grafana admin password)"
+    log "creating grafana-admin Secret with a generated password..."
+    # Piped, never in argv: an argv value shows in `ps` and under `bash -x`.
+    # `kubectl create` refuses an existing Secret, so a concurrent run cannot
+    # replace one either.
+    openssl rand -base64 24 | tr -d '\n' \
+      | kubectl create secret generic grafana-admin -n "${NAMESPACE}" \
+          --from-file=password=/dev/stdin >/dev/null \
+      || die "could not create Secret grafana-admin"
+  fi
+fi
+
 # --- apply -----------------------------------------------------------------
 
 log "applying manifests..."
@@ -661,3 +692,11 @@ echo
 kubectl get svc -n "${NAMESPACE}"
 
 profile_summary
+
+if [[ "${GRAFANA_SECRET}" == "true" ]]; then
+  cat <<EOS
+
+Grafana login: user admin; the password is in Secret grafana-admin:
+  kubectl -n ${NAMESPACE} get secret grafana-admin -o jsonpath='{.data.password}' | base64 -d
+EOS
+fi

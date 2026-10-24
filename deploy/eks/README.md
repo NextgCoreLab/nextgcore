@@ -292,7 +292,7 @@ aws sts get-caller-identity          # must succeed
 ```
 
 The binaries must be built first. They are not committed: `nextgcore/binaries/`
-and `nextgsim/docker/binaries/` are gitignored, and `build-and-push.sh` fails
+and `nextgsim/binaries/` are gitignored, and `build-and-push.sh` fails
 listing whatever is missing, with the commands to build it, before any AWS
 call (#716).
 
@@ -301,8 +301,11 @@ call (#716).
   plus `nextgcore-webui`; PROFILE=5g packages 10 of them, PROFILE=epc 7.
   PROFILE=epc: mmed must be the kernel-sctp build (see PROFILE=epc above); the
   default build starts but binds nothing on 36412.
-- `nextgsim/docker/binaries/nr-gnb`, `nr-ue` (PROFILE=5g), or
-  `nextgsim/binaries/lte-enb`, `lte-ue` (PROFILE=epc, see above).
+- `nextgsim/binaries/nr-gnb`, `nr-ue` (PROFILE=5g), or `lte-enb`, `lte-ue`
+  (PROFILE=epc, see above). Both profiles build from the nextgsim repo root,
+  as nextgsim's own CI does: `Dockerfile.ue-local` also COPYs
+  `scripts/nr-ue-deregister.sh` (nextgsim #373, #1099). `nr-cli` is optional;
+  the UE image ships it when `binaries/nr-cli` is present.
 
 ## Deploy
 
@@ -423,6 +426,13 @@ Workload:
   overlay (the Kind manifests reference `/etc/nextgcore/hnet/*.key` but never
   mount them, so the UDM crash-loops). A Secret is still base64, not
   encrypted — a real deployment wants KMS or an external secrets store.
+- Grafana's admin password is in Secret `grafana-admin`, which `deploy-eks.sh`
+  creates with a generated password when it is absent and never overwrites
+  (#1100; no credential is in any manifest). To use your own password, create
+  that Secret (key `password`) before the first deploy. To read it:
+  `kubectl -n nextg-system get secret grafana-admin -o jsonpath='{.data.password}' | base64 -d`.
+  Grafana, Prometheus and Jaeger are ClusterIP Services on EKS, not the Kind
+  manifests' NodePorts; reach them with `kubectl port-forward`.
 - Single replica per NF. The NFs hold per-UE state in a process-global context
   and the NRF is the source of truth for topology; `replicas: 2` has not been
   validated and is not expected to work.

@@ -47,7 +47,7 @@
 # callers, because a dirty tag is not reproducible from the SHA alone.
 #
 # Note both repos gitignore their staged binary output directories
-# (nextgcore/binaries/, nextgsim/docker/binaries/), so populating those for a
+# (nextgcore/binaries/, nextgsim/binaries/), so populating those for a
 # build does not by itself make a tree dirty.
 #
 # $1: repository path. Prints the tag; returns non-zero if $1 is not a git repo.

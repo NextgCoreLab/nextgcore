@@ -239,6 +239,69 @@ jobs:
           echo "$out" | grep -q 'amf.replicas > 1 is not supported' \
             || { echo "failed for another reason: $out"; exit 1; }
 
+  manifests:
+    # #1098: the #968 squash committed git conflict markers into
+    # k8s/manifests/upf.yaml, which broke every kustomize render (k8s/ and both
+    # EKS profiles) and no job noticed: nothing rendered them. This job fails on
+    # any committed conflict marker, renders every kustomization in the repo,
+    # and runs deploy-eks.sh DRY_RUN for every EKS profile -- the profile's own
+    # kustomize flags, post-render and offline validation, no cluster.
+    #
+    # Two checkouts side by side: the 5g profile renders ../nextgsim/k8s and the
+    # epc profile nextgsim/config, as deploy-eks.sh expects the repos laid out.
+    name: Manifests render
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: nextgcore
+      - name: No committed conflict markers
+        working-directory: nextgcore
+        run: |
+          # -I skips binary files. A `=======` line on its own is a marker
+          # only between the other two, but nothing in the repo needs one.
+          if git grep -nI -E '^(<<<<<<<|>>>>>>>)( |$)|^=======$'; then
+            echo "committed git conflict markers (above); resolve them (#1098)"
+            exit 1
+          fi
+      - name: Checkout nextgsim
+        uses: actions/checkout@v4
+        with:
+          repository: NextgCoreLab/nextgsim
+          # Tracks main, as the nightly E2E jobs do: deploy-eks.sh renders
+          # against the nextgsim checkout beside it, which is current main.
+          ref: main
+          path: nextgsim
+      - uses: azure/setup-kubectl@v4
+      - name: Render every kustomization
+        working-directory: nextgcore
+        run: |
+          set -euo pipefail
+          # Profiles are rendered by deploy-eks.sh below, with their own flags.
+          n=0
+          while IFS= read -r k; do
+            d="$(dirname "$k")"
+            case "$d" in deploy/eks/profiles/*) continue ;; esac
+            echo "::group::kubectl kustomize $d"
+            kubectl kustomize "$d" > /dev/null
+            echo "::endgroup::"
+            n=$((n + 1))
+          done < <(git ls-files '*kustomization.yaml')
+          [ "$n" -gt 0 ] || { echo "no kustomization rendered"; exit 1; }
+      - name: deploy-eks.sh DRY_RUN, every profile
+        working-directory: nextgcore/deploy/eks
+        run: |
+          set -euo pipefail
+          n=0
+          for p in profiles/*/; do
+            p="$(basename "$p")"
+            echo "::group::PROFILE=$p"
+            DRY_RUN=true PROFILE="$p" ./deploy-eks.sh
+            echo "::endgroup::"
+            n=$((n + 1))
+          done
+          [ "$n" -gt 0 ] || { echo "no profile rendered"; exit 1; }
+
   fuzz-build:
     name: Fuzz targets build
     # #587: `src/fuzz` is its own workspace (the cargo-fuzz layout), so neither
