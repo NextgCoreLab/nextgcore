@@ -3144,9 +3144,7 @@ fn registration_accept_of_plain(plain: &[u8]) -> nextgcore_nas::fiveg::message::
 // process-global and this test needs its own for the whole exchange.
 #[allow(clippy::await_holding_lock)]
 async fn a_mobility_update_from_cm_idle_rides_an_initial_context_setup_with_its_sessions() {
-    let _guard = crate::test_support::CONTEXT_GUARD
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
     let _guami = ServeFixtureGuami::install();
     let (_smf, port, calls) = activating_smf().await;
@@ -3243,9 +3241,7 @@ async fn a_mobility_update_from_cm_idle_rides_an_initial_context_setup_with_its_
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
 async fn a_periodic_update_from_cm_idle_without_session_ies_still_sets_up_the_ue_context() {
-    let _guard = crate::test_support::CONTEXT_GUARD
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
     let _guami = ServeFixtureGuami::install();
     let (_smf, port, calls) = activating_smf().await;
@@ -3304,9 +3300,7 @@ async fn a_periodic_update_from_cm_idle_without_session_ies_still_sets_up_the_ue
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
 async fn an_update_from_cm_idle_whose_initial_context_setup_cannot_encode_still_gets_its_accept() {
-    let _guard = crate::test_support::CONTEXT_GUARD
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
     let _guami = ServeFixtureGuami::install();
     let mut server = capturing_ngap_server().await;
@@ -3364,9 +3358,7 @@ async fn an_update_from_cm_idle_whose_initial_context_setup_cannot_encode_still_
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
 async fn an_ics_failure_after_an_idle_update_keeps_the_ue_registered_and_idle() {
-    let _guard = crate::test_support::CONTEXT_GUARD
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
     let _guami = ServeFixtureGuami::install();
     let (_smf, port, calls) = activating_smf().await;
