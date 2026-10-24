@@ -1780,7 +1780,6 @@ pub struct MmeContext {
 
     /// Hash tables
     pub enb_addr_hash: RwLock<HashMap<String, u64>>,
-    pub enb_id_hash: RwLock<HashMap<u32, u64>>,
     pub imsi_ue_hash: RwLock<HashMap<String, u64>>,
     pub guti_ue_hash: RwLock<HashMap<EpsGuti, u64>>,
     pub mme_s11_teid_hash: RwLock<HashMap<u32, u64>>,
@@ -2163,8 +2162,9 @@ impl MmeContext {
     /// The S1-connected eNB with this Global eNB ID (TS 36.413 §9.2.1.37): same PLMN,
     /// same ENB-ID alternative (its length in bits) and same value, S1 Setup complete
     /// (#741, #882). A macro eNB `0x12345` and a home eNB `0x0012345`, or two eNBs of
-    /// different PLMNs, are different eNBs; [`Self::enb_find_by_enb_id`] cannot tell them
-    /// apart.
+    /// different PLMNs, are different eNBs. It is the only eNB lookup by identity: the
+    /// value-only `enb_find_by_enb_id` could not tell them apart and is gone (#858 review,
+    /// MINOR D).
     pub fn enb_find_by_global_enb_id(
         &self,
         plmn_id: &PlmnId,
@@ -2199,18 +2199,11 @@ impl MmeContext {
         }
     }
 
-    /// Find eNB by eNB ID value alone, whatever its ENB-ID alternative or PLMN. Prefer
-    /// [`Self::enb_find_by_global_enb_id`] wherever the full Global eNB ID is known.
-    pub fn enb_find_by_enb_id(&self, enb_id: u32) -> Option<u64> {
-        self.enb_id_hash.read().unwrap().get(&enb_id).copied()
-    }
-
     /// Set eNB ID
     pub fn enb_set_enb_id(&self, id: u64, enb_id: u32) -> bool {
         if let Some(enb) = self.enb_pool.write().unwrap().get_mut(&id) {
             enb.enb_id = enb_id;
             enb.enb_id_presence = true;
-            self.enb_id_hash.write().unwrap().insert(enb_id, id);
             true
         } else {
             false
@@ -2787,6 +2780,35 @@ pub fn mme_context_final() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **#858 review, MINOR B.** `enb_find_by_global_enb_id` matches the PLMN: with only
+    /// another PLMN's eNB of the same kind and value S1-connected, nothing is found, and
+    /// the right PLMN finds it. (The S1 HO test's twins cannot pin this: the pool is a
+    /// HashMap, so which twin `find` meets first is arbitrary.)
+    ///
+    /// REVERT-VERIFIED: without the PLMN comparison the other PLMN's eNB is returned.
+    #[test]
+    fn the_global_enb_lookup_matches_the_plmn() {
+        let ctx = MmeContext::new();
+        ctx.init();
+        let twin = ctx.enb_add("127.0.0.1:36413".parse().unwrap());
+        ctx.enb_set_s1_connected_for_test(
+            twin,
+            &[0x13, 0x00, 0x14],
+            nextgcore_s1ap::EnbId::Macro(0x858),
+        );
+        let wanted = crate::s1ap_build::decode_plmn_id(&[0x00, 0xF1, 0x10]);
+        assert_eq!(
+            ctx.enb_find_by_global_enb_id(&wanted, nextgcore_s1ap::EnbId::Macro(0x858)),
+            None,
+            "another PLMN's eNB of the same id is not it"
+        );
+        let twins_plmn = crate::s1ap_build::decode_plmn_id(&[0x13, 0x00, 0x14]);
+        assert_eq!(
+            ctx.enb_find_by_global_enb_id(&twins_plmn, nextgcore_s1ap::EnbId::Macro(0x858)),
+            Some(twin)
+        );
+    }
 
     /// #479: the IMSI is stored as TBCD octets (TS 29.274 §8.3) with `imsi_len`
     /// the octet count, so S11 carries the subscriber rather than zeros.

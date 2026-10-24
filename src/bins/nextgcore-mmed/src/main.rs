@@ -481,7 +481,9 @@ async fn main() -> Result<()> {
                  received in RFC 3539 REOPEN and not delivered (requests answered 3004)\n\
                  # TYPE mme_diameter_reopen_discards_total counter\n\
                  mme_diameter_reopen_discards_total {}\n",
-                handover_switch::render_metrics() + &s1ap_handler::render_metrics(),
+                handover_switch::render_metrics()
+                    + &s1ap_handler::render_metrics()
+                    + &n26_path::render_metrics(),
                 nextgcore_diameter::session::reopen_discards()
             )
         }),
