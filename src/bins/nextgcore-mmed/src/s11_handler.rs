@@ -1130,14 +1130,19 @@ pub fn downlink_data_notification_for_bearer(
                     crate::s1ap_path::s1ap_send(send);
                 }
             } else {
+                // #1049 review: the UE will not be paged for this data, so the
+                // Serving GW is told so (TS 29.274 §7.2.11.2, Table 8.4-1 cause
+                // 90) rather than left buffering for a page that never comes.
+                DDN_RELEASES_CAPPED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 log::error!(
                     "[{}] Downlink Data Notification for an ECM-CONNECTED UE whose S1-U was \
                      released again: {STALE_S1U_RELEASES_PER_WINDOW} S1 releases in {}s did \
-                     not restore it (a user plane path that stays failed); not releasing again \
-                     until the window passes",
+                     not restore it (a user plane path that stays failed); not releasing or \
+                     paging again until the window passes: Unable to page UE",
                     mme_ue.imsi_bcd,
                     STALE_S1U_WINDOW.as_secs()
                 );
+                return (sgw_teid, GtpCause::UnableToPageUe);
             }
         }
         return (sgw_teid, GtpCause::RequestAccepted);
@@ -1168,6 +1173,23 @@ pub fn downlink_data_notification_for_bearer(
 /// bound the UE would cycle release, paging, SERVICE REQUEST for as long as the
 /// failure lasts.
 const STALE_S1U_RELEASES_PER_WINDOW: usize = 2;
+
+/// Downlink Data Notifications answered Unable to page UE because the UE hit
+/// [`STALE_S1U_RELEASES_PER_WINDOW`] (#1049 review).
+pub static DDN_RELEASES_CAPPED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Prometheus lines for this module's counters.
+pub fn render_metrics() -> String {
+    format!(
+        "# HELP mme_ddn_released_s1u_capped_total Downlink Data Notifications for a \
+         connected UE whose S1-U the Serving GW released, answered Unable to page UE because \
+         the UE already had its S1 releases for the window\n\
+         # TYPE mme_ddn_released_s1u_capped_total counter\n\
+         mme_ddn_released_s1u_capped_total {}\n",
+        DDN_RELEASES_CAPPED_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+    )
+}
 const STALE_S1U_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Whether another S1 release for a released S1-U is allowed for `mme_ue_id`

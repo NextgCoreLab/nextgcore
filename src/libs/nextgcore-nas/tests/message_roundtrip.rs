@@ -323,6 +323,7 @@ fn gmm_registration_accept() {
         tai_list: Some(test_tai_list()),
         allowed_nssai: Some(test_nssai()),
         pdu_session_status: Some(test_pdu_session_status()),
+        pdu_session_reactivation_result: Some(1 << 5),
         t3512_value: Some(GprsTimer3::new(GprsTimer3::UNIT_1_HOUR, 1)),
         t3502_value: Some(GprsTimer2::new(12)),
         ..Default::default()
@@ -438,6 +439,7 @@ fn gmm_registration_accept_full_ie_roundtrip() {
             ims_vops_3gpp: true,
         }),
         pdu_session_status: Some(test_pdu_session_status()),
+        pdu_session_reactivation_result: Some((1 << 1) | (1 << 9)),
         t3512_value: Some(GprsTimer3::new(GprsTimer3::UNIT_1_HOUR, 1)),
         t3502_value: Some(GprsTimer2::new(12)),
     }));

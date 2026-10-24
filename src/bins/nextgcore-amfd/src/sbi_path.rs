@@ -2672,7 +2672,7 @@ pub async fn notify_amf_status_change(status_change: &str) {
         let Some((host, port, path)) = split_absolute_uri(&sub.amf_status_uri) else {
             log::warn!(
                 "AMFStatusChangeNotify: cannot address amfStatusUri {}",
-                sub.amf_status_uri
+                nextgcore_sbi::log_redact::redact_last_segment(&sub.amf_status_uri)
             );
             continue;
         };
@@ -2688,20 +2688,20 @@ pub async fn notify_amf_status_change(status_change: &str) {
         {
             Ok(Ok(resp)) if resp.is_success() => log::info!(
                 "AMFStatusChangeNotify({status_change}) delivered to {}",
-                sub.amf_status_uri
+                nextgcore_sbi::log_redact::redact_last_segment(&sub.amf_status_uri)
             ),
             Ok(Ok(resp)) => log::warn!(
                 "AMFStatusChangeNotify to {} returned {}",
-                sub.amf_status_uri,
+                nextgcore_sbi::log_redact::redact_last_segment(&sub.amf_status_uri),
                 resp.status
             ),
             Ok(Err(e)) => log::warn!(
                 "AMFStatusChangeNotify to {} failed: {e}",
-                sub.amf_status_uri
+                nextgcore_sbi::log_redact::redact_last_segment(&sub.amf_status_uri)
             ),
             Err(_) => log::warn!(
                 "AMFStatusChangeNotify to {} timed out; the shutdown path will not wait longer",
-                sub.amf_status_uri
+                nextgcore_sbi::log_redact::redact_last_segment(&sub.amf_status_uri)
             ),
         }
     }
