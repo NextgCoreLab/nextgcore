@@ -87,16 +87,16 @@ From the clap `Args` struct in `src/bins/nextgcore-sgwcd/src/main.rs`:
     Report Request. The SGW-C answers it:
     - Request accepted;
     - 72 if the report is not from its associated SGW-U;
-    - 66 (with the Offending IE) if the Node ID, the Node Report Type, or the announced report
-      is missing;
+    - 66 (with the Offending IE) if the Node ID or the Node Report Type is missing;
+    - 67 (with the Offending IE) if the report the Node Report Type announces is missing;
     - 69 if the request cannot be decoded.
   - On a failure, every UE whose downlink S1-U endpoint is that eNodeB has its S1-U bearers
     released with Release Access Bearers semantics. The FARs go to BUFF + NOCP and the EPS
     bearers are kept, so downlink data is buffered, notified (DDN) and the UE paged.
   - The peer stays marked failed for the maximum path failure duration,
     `SGWC_UP_PATH_FAILURE_HOLD_SECS` (default 120, at most 3600). If the path is still down
-    when that expires, bearers pointed at the peer again are released too, and the record is
-    dropped.
+    when that expires, the record is dropped. A Modify Bearer that points a bearer at a failed
+    peer inside the hold is answered, and the UE's S1-U bearers are released at once.
   - A recovery report clears the record.
   - The optional S1-U path failure notification to the MME (cause "S1-U Path Failure",
     §20.3.5) is not used, because it needs MME support (S1UN).

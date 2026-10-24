@@ -928,8 +928,10 @@ impl SxaNode {
     /// anything is acted on:
     /// - 72 No established PFCP Association when the sender is not the SGW-U this
     ///   SGW-C is associated with (§6.2.6.1);
-    /// - 66 Mandatory IE missing, with the Offending IE, when the Node ID, the Node
-    ///   Report Type, or the report the type announces is absent;
+    /// - 66 Mandatory IE missing, with the Offending IE, when the Node ID or the
+    ///   Node Report Type is absent;
+    /// - 67 Conditional IE missing, with the Offending IE, when the report the Node
+    ///   Report Type announces (UPFR, UPRR) is absent;
     /// - 69 Mandatory IE incorrect when the message cannot be decoded;
     /// - 1 Request accepted otherwise.
     ///
@@ -955,7 +957,9 @@ impl SxaNode {
                         None
                     };
                     match missing {
-                        Some(ie) => (PfcpCause::MandatoryIeMissing, Some(ie as u16), None),
+                        // A report the Node Report Type announces is a
+                        // conditional IE (TS 29.244 Table 7.4.5.1-1): cause 67.
+                        Some(ie) => (PfcpCause::ConditionalIeMissing, Some(ie as u16), None),
                         None => (PfcpCause::RequestAccepted, None, Some(req)),
                     }
                 }
@@ -2258,7 +2262,7 @@ mod tests {
 
     /// #994: a Node Report from anyone but the associated SGW-U is refused with cause
     /// 72 (TS 29.244 §6.2.6.1) and not acted on; one announcing a failure report it
-    /// does not carry is refused with 66 and the Offending IE.
+    /// does not carry is refused with 67 Conditional IE missing and the Offending IE.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_node_report_from_a_stranger_or_without_its_report_is_refused() {
         let guard = process_state_test_guard().await;
@@ -2321,7 +2325,7 @@ mod tests {
         assert_eq!(
             response_cause(&body),
             (
-                PfcpCause::MandatoryIeMissing,
+                PfcpCause::ConditionalIeMissing,
                 Some(nextgcore_pfcp::ie::IeType::UserPlanePathFailureReport as u16)
             )
         );
@@ -2388,5 +2392,85 @@ mod tests {
         std::env::remove_var("SGWC_UP_PATH_FAILURE_HOLD_SECS");
         std::env::remove_var("SGWC_SGWU_ADDR");
         let _ = stop.send(true);
+    }
+
+    /// #1014 review: a Modify Bearer that points a bearer at an eNodeB whose user
+    /// plane path is failed is answered, and the UE's S1-U bearers are released at
+    /// once (downlink buffered for a DDN), not black-holed until the hold expires.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_modify_bearer_toward_a_failed_enb_is_released_at_once() {
+        let guard = process_state_test_guard().await;
+        crate::up_path::clear_for_test();
+        let sgwu = assoc_sgwu(Vec::new()).await;
+        let (node, stop) = associated_node(&guard, &sgwu).await;
+        let (ue, bearer) = ue_toward(b"001010994000005", [10, 0, 0, 60]);
+        let ctx = sgwc_self();
+        let mods = sgwu.modifications.clone();
+        // 10.0.0.61 fails; the UE is on 10.0.0.60, so nothing is released yet.
+        sgwu.sock
+            .send_to(&node_report(1, &[[10, 0, 0, 61]], &[]), node.local_addr())
+            .await
+            .unwrap();
+        eventually("the failure", || {
+            crate::up_path::is_failed("10.0.0.61".parse().unwrap())
+        })
+        .await;
+        assert!(mods.lock().unwrap().is_empty());
+
+        // The MME moves the UE's downlink to the failed eNodeB.
+        let mut dl = ctx.dl_tunnel_in_bearer(bearer).unwrap();
+        dl.remote_teid = 0x9961;
+        dl.remote_ip.ipv4 = Some(Ipv4Addr::new(10, 0, 0, 61));
+        ctx.tunnel_update(&dl);
+        crate::sxa_response::answer_modify_bearer(
+            &crate::sxa_response::PendingModifyBearer {
+                peer: "127.0.0.1:2123".parse().unwrap(),
+                seq: 1,
+                mme_teid: 1,
+                waiting: Default::default(),
+                modified: vec![(bearer, 5)],
+                marked_for_removal: Vec::new(),
+            },
+            None,
+        );
+        assert_eq!(
+            ctx.dl_tunnel_in_bearer(bearer).unwrap().remote_teid,
+            0,
+            "released at once"
+        );
+        eventually("the BUFF + NOCP modification", || {
+            mods.lock().unwrap().len() == 1
+        })
+        .await;
+        ctx.ue_remove(ue);
+        std::env::remove_var("SGWC_SGWU_ADDR");
+        let _ = stop.send(true);
+    }
+
+    /// #1014 review: the release finds the UEs toward an eNodeB through the
+    /// downlink-peer index, which follows every tunnel update and removal.
+    #[test]
+    fn the_downlink_peer_index_follows_the_tunnels() {
+        let ctx = sgwc_self();
+        let (ue, bearer) = ue_toward(b"001010994000006", [10, 0, 0, 70]);
+        let a: std::net::IpAddr = "10.0.0.70".parse().unwrap();
+        let b: std::net::IpAddr = "10.0.0.71".parse().unwrap();
+        assert_eq!(ctx.ue_ids_with_downlink_toward(a), vec![ue]);
+        let mut dl = ctx.dl_tunnel_in_bearer(bearer).unwrap();
+        dl.remote_ip.ipv4 = Some(Ipv4Addr::new(10, 0, 0, 71));
+        ctx.tunnel_update(&dl);
+        assert!(ctx.ue_ids_with_downlink_toward(a).is_empty(), "moved");
+        assert_eq!(ctx.ue_ids_with_downlink_toward(b), vec![ue]);
+        dl.remote_teid = 0;
+        ctx.tunnel_update(&dl);
+        assert!(
+            ctx.ue_ids_with_downlink_toward(b).is_empty(),
+            "an S1-U released forwards nowhere"
+        );
+        dl.remote_teid = 0x9971;
+        ctx.tunnel_update(&dl);
+        assert_eq!(ctx.ue_ids_with_downlink_toward(b), vec![ue]);
+        ctx.ue_remove(ue);
+        assert!(ctx.ue_ids_with_downlink_toward(b).is_empty(), "removed");
     }
 }

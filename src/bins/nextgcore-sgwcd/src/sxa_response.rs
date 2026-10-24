@@ -383,20 +383,24 @@ pub fn answer_modify_bearer(pending: &PendingModifyBearer, last_failure: Option<
         pending.modified.len(),
         pending.marked_for_removal
     );
-    let Some(server) = gtp_path::s11_server() else {
-        log::error!("S11 server not open: cannot answer {}", pending.peer);
-        return;
-    };
-    let response = s11_build::build_modify_bearer_response_per_bearer(
-        pending.mme_teid,
-        pending.seq,
-        cause,
-        &pending.modified,
-        &pending.marked_for_removal,
-    );
-    if let Err(e) = server.send_response(pending.peer, &response) {
-        log::error!("Modify Bearer Response to {} failed: {e}", pending.peer);
+    match gtp_path::s11_server() {
+        Some(server) => {
+            let response = s11_build::build_modify_bearer_response_per_bearer(
+                pending.mme_teid,
+                pending.seq,
+                cause,
+                &pending.modified,
+                &pending.marked_for_removal,
+            );
+            if let Err(e) = server.send_response(pending.peer, &response) {
+                log::error!("Modify Bearer Response to {} failed: {e}", pending.peer);
+            }
+        }
+        None => log::error!("S11 server not open: cannot answer {}", pending.peer),
     }
+    // #1014 review: an endpoint on a failed path is released now, not at hold expiry.
+    let modified: Vec<u64> = pending.modified.iter().map(|(b, _)| *b).collect();
+    crate::up_path::release_if_toward_failed(&modified);
 }
 
 fn establishment_response(sess_id: u64, continuation: S11Continuation, body: &[u8]) {

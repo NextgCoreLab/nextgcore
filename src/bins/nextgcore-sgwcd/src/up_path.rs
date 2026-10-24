@@ -16,10 +16,15 @@
 //!   peer is recorded as failed.
 //! - **Hold.** `SGWC_UP_PATH_FAILURE_HOLD_SECS` is the operator-configurable maximum
 //!   path failure duration (default 120 s, at most 3600 s; TS 23.007 §20.3.1 NOTE 2
-//!   says "few minutes at most"). If the path is still down when the hold expires,
-//!   any bearer that a later Modify Bearer pointed at the peer again is released too.
-//!   The record is then dropped, so a later report starts afresh. A repeated failure
-//!   report for a peer that is already failed starts no second hold.
+//!   says "few minutes at most"). A Modify Bearer that points a bearer at the peer
+//!   inside the hold is answered and the UE's S1-U bearers are released at once
+//!   ([`release_if_toward_failed`]). If the path is still down when the hold
+//!   expires, any bearer pointed at it is released, and the record is dropped, so a
+//!   later report starts afresh. A repeated failure report for a peer that is
+//!   already failed starts no second hold.
+//! - **Finding the UEs.** The context indexes downlink tunnels by their remote peer
+//!   (`SgwcContext::ue_ids_with_downlink_toward`), so a failure costs the UEs toward
+//!   that eNodeB, not a scan of every UE.
 //! - **Recovery.** The peer's record is cleared, which voids its pending hold.
 //!   Nothing is re-activated: the next Service Request does that, through the Modify
 //!   Bearer Request.
@@ -103,35 +108,58 @@ pub fn is_failed(peer: IpAddr) -> bool {
     with_failed(|m| m.contains_key(&peer))
 }
 
-fn tunnel_ip_is(ip: &crate::context::IpAddr, peer: IpAddr) -> bool {
-    match peer {
-        IpAddr::V4(v4) => ip.ipv4 == Some(v4),
-        IpAddr::V6(v6) => ip.ipv6 == Some(v6),
-    }
-}
-
 /// Release, with Release Access Bearers semantics, the S1-U bearers of every UE whose
-/// downlink endpoint is `peer`. Returns the UEs released.
+/// downlink endpoint is `peer`, found through the context's downlink-peer index.
+/// Returns the UEs released.
 pub fn release_s1u_toward(peer: IpAddr) -> usize {
     let ctx = sgwc_self();
     let mut released = 0;
-    for ue_id in ctx.ue_ids() {
+    for ue_id in ctx.ue_ids_with_downlink_toward(peer) {
         let Some(ue) = ctx.ue_find_by_id(ue_id) else {
             continue;
         };
-        let toward = ue.sess_ids.iter().any(|sess_id| {
-            ctx.sess_find_by_id(*sess_id).is_some_and(|sess| {
-                sess.bearer_ids.iter().any(|b| {
-                    ctx.dl_tunnel_in_bearer(*b)
-                        .is_some_and(|t| t.remote_teid != 0 && tunnel_ip_is(&t.remote_ip, peer))
-                })
-            })
-        });
-        if toward && crate::gtp_path::release_s1u_bearers(&ue, 0) > 0 {
+        if crate::gtp_path::release_s1u_bearers(&ue, 0) > 0 {
             released += 1;
         }
     }
     UES_RELEASED_TOTAL.fetch_add(released as u64, Ordering::Relaxed);
+    released
+}
+
+/// After a Modify Bearer Request was answered (#1014 review): a bearer it pointed at
+/// a peer recorded as failed would black-hole downlink until the hold expired, so
+/// the UE's S1-U bearers are released at once, as for the failure itself. Returns
+/// whether they were.
+pub fn release_if_toward_failed(bearer_ids: &[u64]) -> bool {
+    let ctx = sgwc_self();
+    let toward_failed = bearer_ids.iter().find_map(|b| {
+        let dl = ctx.dl_tunnel_in_bearer(*b)?;
+        if dl.remote_teid == 0 {
+            return None;
+        }
+        let failed = dl
+            .remote_ip
+            .ipv4
+            .map(IpAddr::from)
+            .into_iter()
+            .chain(dl.remote_ip.ipv6.map(IpAddr::from))
+            .find(|p| is_failed(*p))?;
+        Some((ctx.bearer_find_by_id(*b)?.sgwc_ue_id, failed))
+    });
+    let Some((ue_id, peer)) = toward_failed else {
+        return false;
+    };
+    let Some(ue) = ctx.ue_find_by_id(ue_id) else {
+        return false;
+    };
+    let released = crate::gtp_path::release_s1u_bearers(&ue, 0) > 0;
+    if released {
+        UES_RELEASED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        log::warn!(
+            "Modify Bearer pointed UE {ue_id} at {peer}, whose user plane path is failed: its \
+             S1-U bearers are released at once (TS 23.007 §20.3.4)"
+        );
+    }
     released
 }
 
