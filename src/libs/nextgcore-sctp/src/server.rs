@@ -528,6 +528,16 @@ impl SctpServer {
         Ok(())
     }
 
+    /// The negotiated number of outbound streams of `association_id` (RFC 9260 §5.1.1):
+    /// stream identifiers `0..n` are valid toward the peer. `None` for an unknown
+    /// association (#813).
+    pub fn outbound_streams(&self, association_id: u64) -> Option<u16> {
+        let handle = self.id_to_handle.get(&association_id)?;
+        self.associations
+            .get(handle)
+            .map(|managed| managed.association.max_num_outbound_streams())
+    }
+
     /// Send data to a specific association with the server's configured PPID
     /// ([`SctpServerConfig::ppid`]: NGAP 60 by default, S1AP 18 for S1-MME).
     pub async fn send(&mut self, association_id: u64, stream_id: u16, data: &[u8]) -> Result<()> {

@@ -396,7 +396,7 @@ pub fn tuak_f1star(
 /// All four come out of a SINGLE permutation, from different ranges of `OUT` — which is
 /// why they are returned together rather than as four functions that would each redo the
 /// same work.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct TuakF2345 {
     /// f2 output: RES (4, 8, 16 or 32 bytes).
     pub res: Vec<u8>,
@@ -406,6 +406,20 @@ pub struct TuakF2345 {
     pub ik: Vec<u8>,
     /// f5 output: AK (always 48 bits).
     pub ak: [u8; 6],
+}
+
+/// Manual `Debug` (no-auth-material-in-logs): the authentication material in
+/// this type (res, ck, ik, ak) prints as `<redacted>`, so a future
+/// `{:?}` in a log line cannot leak it.
+impl std::fmt::Debug for TuakF2345 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("TuakF2345");
+        d.field("res", &"<redacted>");
+        d.field("ck", &"<redacted>");
+        d.field("ik", &"<redacted>");
+        d.field("ak", &"<redacted>");
+        d.finish()
+    }
 }
 
 /// f2, f3, f4 and f5 in one evaluation (TS 35.231 §6.4).

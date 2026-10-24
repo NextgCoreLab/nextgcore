@@ -179,9 +179,27 @@ pub struct SessionScope {
 
 /// [`notify_sessions_unrecoverable`] for the sessions in `scope` only (#720).
 pub async fn notify_sessions_unrecoverable_in(reason: &str, scope: Option<&SessionScope>) -> usize {
+    let (total, releases) = begin_unrecoverable_release(reason, scope);
+    let _ = releases.await;
+    total
+}
+
+/// Start releasing the sessions in `scope` (all, for `None`) that can no longer be
+/// honoured, and return at once: `(how many are being released, the fan-out)`.
+///
+/// #721: which sessions, and their callbacks, are decided here, synchronously, so
+/// the caller may flush the session map as soon as this returns. The per-session
+/// work (an N1N2MessageTransfer per UE, up to its connect and request timeouts)
+/// runs in the returned task. A caller on the N4 receive task drops the handle:
+/// awaiting it there stalled every PFCP message from every UPF, and the restarted
+/// UPF's own Heartbeat Response, for the length of the whole fan-out.
+pub fn begin_unrecoverable_release(
+    reason: &str,
+    scope: Option<&SessionScope>,
+) -> (usize, tokio::task::JoinHandle<()>) {
     let (notifiable, silent) = notifiable_sessions(scope);
     if notifiable.is_empty() && silent == 0 {
-        return 0;
+        return (0, tokio::spawn(async {}));
     }
     log::warn!(
         "PFCP restoration ({reason}): {} PDU session(s) can no longer be honoured; notifying \
@@ -191,35 +209,38 @@ pub async fn notify_sessions_unrecoverable_in(reason: &str, scope: Option<&Sessi
         notifiable.len(),
         silent
     );
+    let total = notifiable.len();
+    let reason = reason.to_string();
     // #718 review m2: a bounded parallel fan-out. One sequential POST per session
     // could not finish inside a pod's termination grace period with many UEs, and
     // the UEs after the SIGKILL heard nothing. Progress is logged, so an operator
     // can see how many were left if it is cut short anyway.
-    let total = notifiable.len();
-    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(RELEASE_FANOUT));
-    let mut releases = tokio::task::JoinSet::new();
-    for (sm_context_ref, uri) in notifiable {
-        let Ok(permit) = permits.clone().acquire_owned().await else {
-            break;
-        };
-        let reason = reason.to_string();
-        releases.spawn(async move {
-            let _permit = permit;
-            release_one_unrecoverable(&sm_context_ref, &uri, &reason).await;
-        });
-    }
-    let mut done = 0usize;
-    while releases.join_next().await.is_some() {
-        done += 1;
-        if done.is_multiple_of(100) || done == total {
-            log::info!(
-                "PFCP restoration ({reason}): {done}/{total} PDU session release(s) sent, \
-                 {} remaining",
-                total - done
-            );
+    let fan_out = tokio::spawn(async move {
+        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(RELEASE_FANOUT));
+        let mut releases = tokio::task::JoinSet::new();
+        for (sm_context_ref, uri) in notifiable {
+            let Ok(permit) = permits.clone().acquire_owned().await else {
+                break;
+            };
+            let reason = reason.clone();
+            releases.spawn(async move {
+                let _permit = permit;
+                release_one_unrecoverable(&sm_context_ref, &uri, &reason).await;
+            });
         }
-    }
-    total
+        let mut done = 0usize;
+        while releases.join_next().await.is_some() {
+            done += 1;
+            if done.is_multiple_of(100) || done == total {
+                log::info!(
+                    "PFCP restoration ({reason}): {done}/{total} PDU session release(s) sent, \
+                     {} remaining",
+                    total - done
+                );
+            }
+        }
+    });
+    (total, fan_out)
 }
 
 /// How many PDU session releases [`notify_sessions_unrecoverable`] has in flight at
