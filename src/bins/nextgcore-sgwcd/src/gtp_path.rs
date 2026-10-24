@@ -1851,6 +1851,15 @@ fn dispatch_delete_session_request(server: &GtpcServer, msg: &Gtp2Message, peer:
                     // is relayed to the PGW first; the SGW-U's session goes when the
                     // PGW has answered. A Serving GW relocation (SI) or a request
                     // without OI deletes the local resources only.
+                    // The MME's retransmission while its request waits for the
+                    // PGW is answered by that request, not relayed again.
+                    if delete_relay_in_flight(peer, seq) {
+                        log::debug!(
+                            "Delete Session Request seq={seq} from {peer} is waiting for the \
+                             PGW; retransmission absorbed"
+                        );
+                        return;
+                    }
                     let forward = matches!(result, HandlerResult::ForwardToPgw)
                         && parsed.operation_indication;
                     if forward
@@ -1898,6 +1907,16 @@ struct PendingS5cDelete {
 }
 
 static PENDING_S5C_DELETE: Mutex<Option<HashMap<u32, PendingS5cDelete>>> = Mutex::new(None);
+
+/// Whether the MME's Delete Session Request `mme_seq` from `mme` is relayed and
+/// waiting for the PGW.
+fn delete_relay_in_flight(mme: SocketAddr, mme_seq: u32) -> bool {
+    PENDING_S5C_DELETE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|m| m.values().any(|p| p.mme == mme && p.mme_seq == mme_seq))
+}
 
 fn take_pending_s5c_delete(seq: u32) -> Option<PendingS5cDelete> {
     PENDING_S5C_DELETE
@@ -4123,6 +4142,12 @@ mod tests {
             recv_s11(&sock).await.is_none(),
             "no answer while the PGW may still answer"
         );
+        // The MME retransmits: absorbed, not relayed a second time.
+        sock.send_to(
+            &delete_session(sgw_teid, 0x2522, true, false).encode(),
+            server.local_addr(),
+        )
+        .unwrap();
         assert_eq!(
             sgwu.received(54),
             0,
@@ -4135,7 +4160,7 @@ mod tests {
         assert_eq!(
             pgw.deletes.lock().unwrap().len(),
             2,
-            "sent, then retransmitted once"
+            "sent, then retransmitted once on T3; the MME's retransmission is not relayed"
         );
         assert_eq!(sgwu.received(54), 1);
         sgwc_self().set_pgw_s5c_peer(None);
