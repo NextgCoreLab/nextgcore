@@ -2851,6 +2851,28 @@ impl DataPlane {
         }
     }
 
+    /// The N3 paths in use that this UPF can actually probe (#960 review).
+    ///
+    /// An IPv6 gNB with no IPv6 GTP-U socket (`--gtpu-addr6` unset) cannot be sent an
+    /// Echo Request. Tracking it anyway counted a miss every round, declared the path
+    /// failed and reported a User Plane Path Failure for a path never probed. It is
+    /// left out instead, and that is logged once.
+    pub fn probeable_paths(&self, mut in_use: HashSet<SocketAddr>) -> HashSet<SocketAddr> {
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if self.gtpu_socket6.is_none() {
+            let before = in_use.len();
+            in_use.retain(|p| p.is_ipv4());
+            if in_use.len() != before && !WARNED.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    "{} IPv6 N3 path(s) in use are not probed: no IPv6 GTP-U socket \
+                     (set --gtpu-addr6)",
+                    before - in_use.len()
+                );
+            }
+        }
+        in_use
+    }
+
     /// Bind the IPv6 GTP-U socket (#918).
     pub async fn bind_gtpu6(&mut self, addr: SocketAddr) -> io::Result<()> {
         log::info!("Binding IPv6 GTP-U socket on {addr}");
@@ -4062,6 +4084,7 @@ impl DataPlane {
                 let map = self.sessions.seid_map.read().unwrap();
                 map.values().map(|s| s.gnb_addr()).collect()
             };
+            let active_peers = self.probeable_paths(active_peers);
 
             // #887 review: the table tracks exactly the paths in use; a peer whose last
             // session went is dropped, not probed forever.
@@ -6505,10 +6528,47 @@ mod tests {
     /// #918: downlink to an IPv6 gNB goes out on the IPv6 GTP-U socket and reaches the
     /// gNB; without one it is dropped and counted (it used to be sent nowhere: the FAR
     /// could not hold the address and the only socket was IPv4).
+    /// A socket on `[::1]`. A host with no IPv6 loopback FAILS the calling test rather
+    /// than passing it vacuously (#960 review); `NEXTGCORE_NO_IPV6=1` opts out
+    /// explicitly, and then the test is skipped with a note.
+    async fn ipv6_loopback_socket() -> Option<TokioUdpSocket> {
+        match TokioUdpSocket::bind("[::1]:0").await {
+            Ok(s) => Some(s),
+            Err(e) if std::env::var_os("NEXTGCORE_NO_IPV6").is_some() => {
+                eprintln!("no IPv6 loopback ({e}); skipped because NEXTGCORE_NO_IPV6 is set");
+                None
+            }
+            Err(e) => panic!(
+                "cannot bind [::1]: {e}. This test needs IPv6 loopback; set NEXTGCORE_NO_IPV6=1 \
+                 to skip it explicitly"
+            ),
+        }
+    }
+
+    /// #960 review: with no IPv6 GTP-U socket an IPv6 gNB's path cannot be probed, so
+    /// it is not tracked -- it would otherwise collect a miss every round and be
+    /// reported failed without ever having been probed. IPv4 paths are untouched, and
+    /// with an IPv6 socket the IPv6 path is tracked.
+    #[tokio::test]
+    async fn an_ipv6_path_is_probed_only_when_there_is_an_ipv6_socket() {
+        let v4: SocketAddr = "192.0.2.1:2152".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::1]:2152".parse().unwrap();
+        let in_use: HashSet<SocketAddr> = [v4, v6].into_iter().collect();
+        let mut dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        assert_eq!(
+            dp.probeable_paths(in_use.clone()),
+            [v4].into_iter().collect::<HashSet<_>>()
+        );
+        let Some(sock6) = ipv6_loopback_socket().await else {
+            return;
+        };
+        dp.gtpu_socket6 = Some(Arc::new(sock6));
+        assert_eq!(dp.probeable_paths(in_use.clone()), in_use);
+    }
+
     #[tokio::test]
     async fn downlink_to_an_ipv6_gnb_is_sent_on_the_ipv6_socket() {
-        let Ok(gnb) = TokioUdpSocket::bind("[::1]:0").await else {
-            eprintln!("no IPv6 loopback here; skipping");
+        let Some(gnb) = ipv6_loopback_socket().await else {
             return;
         };
         let gnb_addr = gnb.local_addr().unwrap();
