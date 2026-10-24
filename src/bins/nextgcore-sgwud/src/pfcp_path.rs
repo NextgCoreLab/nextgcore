@@ -479,9 +479,17 @@ impl ResponseCache {
 
     /// Pop the expired front of the queue; a queue item whose key was re-filed later
     /// (a newer instant) is skipped. Amortized O(1) per insertion.
+    ///
+    /// The cap counts in-flight entries too (#908 review follow-up): a request that is
+    /// never answered (no response built) stayed in `in_flight` until its TTL, so an
+    /// associated source could hold any number of them. The live in-flight entry is
+    /// the newest (requests are handled inline, one at a time), at the BACK of the
+    /// queue, so eviction from the front reaches it only when the cap is below 2.
     fn expire(&mut self, now: std::time::Instant) {
         while let Some(&(at, key)) = self.order.front() {
-            if now.duration_since(at) < self.ttl && self.answered.len() <= self.cap {
+            if now.duration_since(at) < self.ttl
+                && self.answered.len() + self.in_flight.len() <= self.cap
+            {
                 break;
             }
             self.order.pop_front();
@@ -545,6 +553,11 @@ impl ResponseCache {
     pub(crate) fn len(&self) -> usize {
         self.answered.len()
     }
+
+    #[cfg(test)]
+    pub(crate) fn in_flight_len(&self) -> usize {
+        self.in_flight.len()
+    }
 }
 
 fn digest(bytes: &[u8]) -> u64 {
@@ -554,7 +567,8 @@ fn digest(bytes: &[u8]) -> u64 {
     h.finish()
 }
 
-/// At most this many cached answers (#908 review): the oldest go first beyond it.
+/// At most this many cached answers and in-flight requests together (#908 review):
+/// the oldest go first beyond it. At least 2, so the live in-flight entry survives.
 const RESPONSE_CACHE_CAP: usize = 65_536;
 
 impl SxaNode {
@@ -996,7 +1010,18 @@ impl SxaNode {
         // Only an ASSOCIATED peer's session/association requests are cached (#908
         // review): Heartbeats are idempotent, and an unassociated sender must not be
         // able to fill the cache.
-        let cacheable = msg_type != pfcp_msg_type::HEARTBEAT_REQUEST && peer.is_some();
+        //
+        // Only the request types this node answers (#908 review follow-up): an
+        // unhandled type never gets a response filed, so registering it only filled
+        // `in_flight` until the TTL.
+        let cacheable = matches!(
+            msg_type,
+            pfcp_msg_type::ASSOCIATION_SETUP_REQUEST
+                | pfcp_msg_type::ASSOCIATION_RELEASE_REQUEST
+                | pfcp_msg_type::SESSION_ESTABLISHMENT_REQUEST
+                | pfcp_msg_type::SESSION_MODIFICATION_REQUEST
+                | pfcp_msg_type::SESSION_DELETION_REQUEST
+        ) && peer.is_some();
         if cacheable {
             let key = (from, header.sequence_number, msg_type);
             let lookup = self
@@ -1879,9 +1904,11 @@ fn apply_action_octet(action: &LibApplyAction) -> u8 {
         | ((action.dupl as u8) << 4)
 }
 
-/// TS 29.244 §8.2.7: bits 1-2 are the UL gate and bits 3-4 the DL gate, each
-/// `0` = OPEN and `1` = CLOSED — the packing `SgwuQer.gate_status` documents. The
-/// library models the two as `true` = open, so both are inverted here.
+/// The INTERNAL packing `SgwuQer.gate_status` documents: bits 1-2 the UL gate, bits
+/// 3-4 the DL gate, each `0` = OPEN and `1` = CLOSED. This is NOT the TS 29.244
+/// §8.2.7 wire layout, where bits 1-2 are the DL gate and bits 3-4 the UL gate (the
+/// library's `GateStatus` encodes that); it is filled from the decoded booleans,
+/// which the library models as `true` = open, so both are inverted here.
 fn gate_status_octet(gate: &LibGateStatus) -> u8 {
     ((!gate.ul_gate) as u8) | (((!gate.dl_gate) as u8) << 2)
 }
@@ -2195,7 +2222,10 @@ fn modification_from_lib(
             .map(|far| crate::sxa_handler::UpdateFarRequest {
                 far_id: far.far_id,
                 apply_action: far.apply_action.as_ref().map(apply_action_octet),
-                smreq_flags: Default::default(),
+                // PFCPSMReq-Flags bit 2 = SNDEM (§8.2.31, #1041): it was ignored.
+                smreq_flags: crate::sxa_handler::SmreqFlags {
+                    send_end_marker_packets: req.pfcp_smreq_flags.is_some_and(|f| f & 0x02 != 0),
+                },
                 update_forwarding_parameters: far.forwarding_parameters.as_ref().map(|fp| {
                     crate::sxa_handler::ForwardingParameters {
                         destination_interface: fp.destination_interface as u8,
@@ -2220,6 +2250,8 @@ fn modification_from_lib(
         query_urrs: req.query_urrs.iter().map(|q| q.urr_id).collect(),
         // PFCPSMReq-Flags bit 3 = QAURR (§8.2.31, `29244-k00.txt:30557`).
         query_all_urrs: req.pfcp_smreq_flags.is_some_and(|f| f & 0x04 != 0),
+        // Bit 1 = DROBU (§8.2.31, #1041): it was ignored, so a buffer was never dropped.
+        drop_buffered: req.pfcp_smreq_flags.is_some_and(|f| f & 0x01 != 0),
         create_bar: None,
         remove_bar: None,
     }
@@ -3304,6 +3336,152 @@ mod tests {
         );
     }
 
+    /// #908 review follow-up: requests that are never answered count against the cap,
+    /// so an associated source cannot grow `in_flight` without bound.
+    #[test]
+    fn unanswered_requests_count_against_the_cap() {
+        let t0 = std::time::Instant::now();
+        let mut c = ResponseCache::new(std::time::Duration::from_secs(30), 16);
+        for seq in 0..10_000u32 {
+            c.on_request(ck(seq), b"never answered", t0);
+        }
+        assert!(c.in_flight_len() + c.len() <= 17, "{}", c.in_flight_len());
+        // The newest request is still in flight and gets its answer filed.
+        c.on_response(ck(9_999), b"a", t0);
+        assert_eq!(
+            c.on_request(ck(9_999), b"never answered", t0),
+            CacheLookup::Replay(b"a".to_vec())
+        );
+    }
+
+    /// Deliver `msg` from `peer` and return the response cause.
+    async fn cause_of(node: &SxaNode, peer: &UdpSocket, msg: &[u8]) -> Option<u8> {
+        deliver(node, peer, msg).await;
+        find_cause(&recv_decoded(peer).await.1)
+    }
+
+    /// An Association Setup Request body with Recovery Time Stamp `rts`.
+    fn setup_with_rts(rts: u32) -> Vec<u8> {
+        let mut assoc = BytesMut::new();
+        PfcpLibMessage::AssociationSetupRequest(AssociationSetupRequest::new(
+            NodeId::new_ipv4([127, 0, 0, 9]),
+            rts,
+        ))
+        .encode_body(&mut assoc);
+        assoc.to_vec()
+    }
+
+    /// #908 review follow-up: the response cache is flushed when the peer restarts, on
+    /// BOTH paths -- a new Association Setup (same Recovery Time Stamp: only the
+    /// Setup's own flush runs) and a Heartbeat Request with a changed stamp (the
+    /// restoration's flush). After either, the old instance's request bytes are
+    /// EXECUTED again (a deleted session: cause 65), not replayed (cause 1).
+    #[tokio::test]
+    async fn a_peer_restart_flushes_its_cached_answers() {
+        for via_heartbeat in [false, true] {
+            let (_guard, node, peer) = node_and_peer().await;
+            let rts = 5000u32;
+            deliver(
+                &node,
+                &peer,
+                &wire(
+                    pfcp_msg_type::ASSOCIATION_SETUP_REQUEST,
+                    None,
+                    1,
+                    &setup_with_rts(rts),
+                ),
+            )
+            .await;
+            let _ = recv_decoded(&peer).await;
+            let ctx = sgwu_self();
+            let sess = ctx
+                .sess_add(&FSeid::with_ipv4(
+                    0x908 + via_heartbeat as u64,
+                    Ipv4Addr::new(127, 0, 0, 9),
+                ))
+                .expect("add");
+            // Owned by the peer (#968: session requests are served for its own only).
+            let owner = node
+                .peer_on_host(peer.local_addr().unwrap().ip())
+                .await
+                .expect("associated")
+                .1;
+            ctx.sess_set_pfcp_node(sess.id, owner);
+            let deletion = wire(
+                pfcp_msg_type::SESSION_DELETION_REQUEST,
+                Some(sess.sgwu_sxa_seid),
+                7,
+                &[],
+            );
+            assert_eq!(
+                cause_of(&node, &peer, &deletion).await,
+                Some(sxa_build::pfcp_cause::REQUEST_ACCEPTED)
+            );
+            assert_eq!(
+                cause_of(&node, &peer, &deletion).await,
+                Some(sxa_build::pfcp_cause::REQUEST_ACCEPTED),
+                "a retransmission is replayed"
+            );
+
+            if via_heartbeat {
+                let mut hb = BytesMut::new();
+                PfcpLibMessage::HeartbeatRequest(HeartbeatRequest::new(rts + 1))
+                    .encode_body(&mut hb);
+                deliver(
+                    &node,
+                    &peer,
+                    &wire(pfcp_msg_type::HEARTBEAT_REQUEST, None, 8, &hb),
+                )
+                .await;
+                let _ = recv_decoded(&peer).await;
+            } else {
+                deliver(
+                    &node,
+                    &peer,
+                    &wire(
+                        pfcp_msg_type::ASSOCIATION_SETUP_REQUEST,
+                        None,
+                        9,
+                        &setup_with_rts(rts),
+                    ),
+                )
+                .await;
+                let _ = recv_decoded(&peer).await;
+            }
+            assert_eq!(
+                cause_of(&node, &peer, &deletion).await,
+                Some(sxa_build::pfcp_cause::SESSION_CONTEXT_NOT_FOUND),
+                "after the restart (heartbeat: {via_heartbeat}) the old bytes are executed, \
+                 not replayed"
+            );
+        }
+    }
+
+    /// An unhandled request type from an associated peer is not registered in the
+    /// cache (#908 review follow-up).
+    #[tokio::test]
+    async fn an_unhandled_request_type_is_not_cached() {
+        let (_guard, node, peer) = node_and_peer().await;
+        deliver(
+            &node,
+            &peer,
+            &wire(
+                pfcp_msg_type::ASSOCIATION_SETUP_REQUEST,
+                None,
+                1,
+                &setup_with_rts(1),
+            ),
+        )
+        .await;
+        let _ = recv_decoded(&peer).await;
+        let before = node.response_cache.lock().unwrap().in_flight_len();
+        for seq in 10..20u32 {
+            // Node Report Request (12): not handled on the SGW-U's Sxa.
+            deliver(&node, &peer, &wire(12, None, seq, &[])).await;
+        }
+        assert_eq!(node.response_cache.lock().unwrap().in_flight_len(), before);
+    }
+
     /// A bound node plus a socket standing in for the SGW-C.
     /// #995: the SGW-U's own Recovery Time Stamp is NTP-era seconds (TS 29.244
     /// §8.2.65), and a pre-#995 SGW-C's Unix-seconds stamp is stored in the NTP
@@ -3695,6 +3873,116 @@ mod tests {
             ctx.pdr_find(sess.id, 1).is_some(),
             "the Create PDR must have been INSTALLED on the session, not just parsed"
         );
+    }
+
+    /// #1041: the PFCPSMReq-Flags bits are read as TS 29.244 §8.2.31 lays them out:
+    /// bit 1 DROBU, bit 2 SNDEM (per Update FAR), bit 3 QAURR. DROBU and SNDEM used to
+    /// be ignored.
+    #[test]
+    fn pfcpsmreq_flags_are_read_bit_by_bit() {
+        for (flags, drobu, sndem, qaurr) in [
+            (0x01u8, true, false, false),
+            (0x02, false, true, false),
+            (0x04, false, false, true),
+            (0x07, true, true, true),
+        ] {
+            let mut m = LibSessionModificationRequest::new();
+            m.pfcp_smreq_flags = Some(flags);
+            m.update_fars.push(nextgcore_pfcp::types::UpdateFar::new(1));
+            let parsed = modification_from_lib(&m);
+            assert_eq!(parsed.drop_buffered, drobu, "{flags:#x} DROBU");
+            assert_eq!(
+                parsed.update_fars[0].smreq_flags.send_end_marker_packets, sndem,
+                "{flags:#x} SNDEM"
+            );
+            assert_eq!(parsed.query_all_urrs, qaurr, "{flags:#x} QAURR");
+        }
+    }
+
+    /// #1041, over the wire: a Session Modification with DROBU drops the packets the
+    /// session has buffered (TS 29.244 §8.2.31). Before, DROBU was ignored and they
+    /// stayed queued -- to be flushed to the UE later.
+    #[tokio::test]
+    async fn drobu_over_the_wire_drops_the_buffered_packets() {
+        let (_guard, node, peer) = node_and_peer().await;
+        let mut assoc = BytesMut::new();
+        PfcpLibMessage::AssociationSetupRequest(AssociationSetupRequest::new(
+            NodeId::new_ipv4([127, 0, 0, 9]),
+            3000,
+        ))
+        .encode_body(&mut assoc);
+        deliver(
+            &node,
+            &peer,
+            &wire(pfcp_msg_type::ASSOCIATION_SETUP_REQUEST, None, 1, &assoc),
+        )
+        .await;
+        let _ = recv_decoded(&peer).await;
+        let cp_seid = 0x0000_0000_0000_1041u64;
+        let mut req = LibSessionEstablishmentRequest::new(
+            NodeId::new_ipv4([127, 0, 0, 9]),
+            LibFSeid::new_ipv4(cp_seid, [127, 0, 0, 9]),
+        );
+        let mut pdi = Pdi::new(SourceInterface::Core);
+        let mut f_teid = FTeid::new_ipv4(0, [127, 0, 0, 1]);
+        f_teid.ch = true;
+        pdi.local_f_teid = Some(f_teid);
+        let mut pdr = CreatePdr::new(1, 100, pdi);
+        pdr.far_id = Some(1);
+        req.create_pdrs.push(pdr);
+        let mut far = CreateFar::new(1, ApplyAction::buffer());
+        far.forwarding_parameters = Some(ForwardingParameters::new(DestinationInterface::Access));
+        req.create_fars.push(far);
+        let mut body = BytesMut::new();
+        req.encode(&mut body);
+        deliver(
+            &node,
+            &peer,
+            &wire(
+                pfcp_msg_type::SESSION_ESTABLISHMENT_REQUEST,
+                Some(0),
+                2,
+                &body,
+            ),
+        )
+        .await;
+        let _ = recv_decoded(&peer).await;
+        let ctx = sgwu_self();
+        let sess = ctx
+            .sess_find_by_sgwc_sxa_seid(cp_seid)
+            .expect("established");
+        ctx.far_buffer_packet(sess.id, 1, b"one".to_vec(), 8);
+        ctx.far_buffer_packet(sess.id, 1, b"two".to_vec(), 8);
+        assert_eq!(ctx.far_find(sess.id, 1).unwrap().buffered.len(), 2);
+
+        let mut m = LibSessionModificationRequest::new();
+        m.pfcp_smreq_flags = Some(0x01); // DROBU
+        let mut b = BytesMut::new();
+        m.encode(&mut b);
+        deliver(
+            &node,
+            &peer,
+            &wire(
+                pfcp_msg_type::SESSION_MODIFICATION_REQUEST,
+                Some(sess.sgwu_sxa_seid),
+                3,
+                &b,
+            ),
+        )
+        .await;
+        let (_, resp) = recv_decoded(&peer).await;
+        assert_eq!(
+            find_cause(&resp),
+            Some(sxa_build::pfcp_cause::REQUEST_ACCEPTED)
+        );
+        let far = ctx.far_find(sess.id, 1).unwrap();
+        assert!(
+            far.buffered.is_empty(),
+            "DROBU dropped the buffered packets"
+        );
+        let buff = crate::context::apply_action::BUFF;
+        assert_eq!(far.apply_action & buff, buff, "the FAR still buffers");
+        ctx.sess_remove(sess.id);
     }
 
     /// #871 review: Update FAR leaving BUFF, end to end over the Sxa socket. A buffering

@@ -43,6 +43,8 @@ Everything else in the shipped example file is decorative for this binary — th
 - **`mbsmf.sbi.server[]` (address/advertise/port) is inert.** The SBI bind address and port come exclusively from `--sbi-addr`/`--sbi-port`. No advertise address is read.
 - **`mbsmf.nrf.uri` is inert.** Unlike some other NFs (e.g. NSACF, which falls back YAML→CLI), the MB-SMF takes its NRF URI only from the `--nrf-uri` flag; the docker deployment passes it on the command line and the YAML entry merely mirrors it.
 
+> **Clock:** this NF refuses to start when the local clock reads before 2020-01-01, because its PFCP Recovery Time Stamp would be wrong. See [A set clock is required](overview.md#a-set-clock-is-required-pfcp-nfs) for the remedy on RTC-less hosts.
+
 ## Command-line flags
 
 Runtime knobs with real defaults from the clap `Args` struct in `main.rs`:

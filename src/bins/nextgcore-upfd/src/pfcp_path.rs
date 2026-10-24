@@ -805,6 +805,28 @@ pub struct SessionRuleIds {
     pub urr_ids: std::collections::HashSet<u32>,
 }
 
+/// The time IEs of a usage report, from the times taken with its usage (#818, TS
+/// 29.244 Table 7.5.8.3-1): Start Time and End Time always; Duration Measurement when
+/// the URR measures time; Time of First / Last Packet when traffic was seen.
+fn report_time_ies(
+    t: &crate::data_plane::ReportTimes,
+) -> (
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+) {
+    use crate::data_plane::ntp_secs;
+    (
+        Some(ntp_secs(t.start)),
+        Some(ntp_secs(t.end)),
+        t.duration.map(|d| d.as_secs().min(u32::MAX as u64) as u32),
+        t.first_pkt.map(ntp_secs),
+        t.last_pkt.map(ntp_secs),
+    )
+}
+
 impl PfcpServer {
     /// Create a new PFCP server
     pub async fn new(
@@ -1235,6 +1257,8 @@ impl PfcpServer {
     /// from any other address says nothing about whether THIS association's
     /// peer restarted.
     async fn check_peer_recovery(&self, src_addr: SocketAddr, rts: u32) {
+        // #995: in the NTP reading, as stored at association.
+        let rts = nextgcore_pfcp::recovery_time::normalize_received(rts);
         let restarted = {
             let assoc = self.association.read().await;
             match assoc.as_ref() {
@@ -1337,7 +1361,8 @@ impl PfcpServer {
                 .map_err(|e| format!("Send error: {e}"))?;
             return Ok(());
         }
-        let rts = rts.unwrap();
+        // #995: kept in the NTP reading (a pre-#995 SMF sends Unix seconds).
+        let rts = nextgcore_pfcp::recovery_time::normalize_received(rts.unwrap());
         let node_id = ParsedIe::find_ie(&ies, pfcp_ie::NODE_ID)
             .map(|ie| ie.value.clone())
             .unwrap_or_default();
@@ -2680,6 +2705,7 @@ impl PfcpServer {
                     UsageReportReason::Termination => trigger.termination_report = true,
                     UsageReportReason::Immediate => trigger.immediate_report = true,
                 }
+                let times = report_time_ies(&r.times);
                 crate::n4_build::UsageReport {
                     urr_id: r.urr_id,
                     ur_seqn: r.ur_seqn,
@@ -2692,7 +2718,11 @@ impl PfcpServer {
                         uplink_packets: Some(r.ul_pkts),
                         downlink_packets: Some(r.dl_pkts),
                     }),
-                    ..Default::default()
+                    start_time: times.0,
+                    end_time: times.1,
+                    duration_measurement: times.2,
+                    time_of_first_packet: times.3,
+                    time_of_last_packet: times.4,
                 }
             })
             .collect()
@@ -2955,6 +2985,7 @@ impl PfcpServer {
                     },
                 };
 
+                let times = report_time_ies(&r.times);
                 crate::n4_build::UsageReport {
                     urr_id: r.urr_id,
                     ur_seqn: r.ur_seqn,
@@ -2967,7 +2998,11 @@ impl PfcpServer {
                         uplink_packets: Some(r.ul_pkts),
                         downlink_packets: Some(r.dl_pkts),
                     }),
-                    ..Default::default()
+                    start_time: times.0,
+                    end_time: times.1,
+                    duration_measurement: times.2,
+                    time_of_first_packet: times.3,
+                    time_of_last_packet: times.4,
                 }
             })
             .collect();
@@ -3060,6 +3095,7 @@ impl PfcpServer {
             },
         };
 
+        let times = report_time_ies(&report.times);
         let user_plane_report = UserPlaneReport {
             report_type: crate::n4_build::ReportType {
                 usage_report: true,
@@ -3077,7 +3113,11 @@ impl PfcpServer {
                     uplink_packets: Some(report.ul_pkts),
                     downlink_packets: Some(report.dl_pkts),
                 }),
-                ..Default::default()
+                start_time: times.0,
+                end_time: times.1,
+                duration_measurement: times.2,
+                time_of_first_packet: times.3,
+                time_of_last_packet: times.4,
             }],
             ..Default::default()
         };
@@ -4142,6 +4182,7 @@ mod tests {
                 ul_pkts: 2,
                 dl_pkts: 1,
                 trigger,
+                times: Default::default(),
             };
 
         // ---- PERIO ----
@@ -4229,6 +4270,126 @@ mod tests {
         let t = &report_triggers_in(&buf[..len])[0];
         assert_eq!(t[0] & 0x04, 0x04, "TIMTH");
         assert_eq!(t[0] & 0x02, 0x00, "and not VOLTH");
+    }
+
+    /// The IE types inside the first Usage Report of a Session Report Request.
+    fn usage_report_ie_types(req: &[u8]) -> Vec<u16> {
+        usage_report_ie_types_in(req, pfcp_ie::USAGE_REPORT_SRR)
+    }
+
+    /// The IE types inside the first Usage Report (carrier `ie`) of a PFCP message.
+    fn usage_report_ie_types_in(msg: &[u8], ie: u16) -> Vec<u16> {
+        let (_, body) = ParsedPfcpHeader::parse(msg).unwrap();
+        let ies = ParsedIe::parse_all(body);
+        let ur = ParsedIe::find_ie(&ies, ie).expect("a Usage Report");
+        ParsedIe::parse_all(&ur.value)
+            .iter()
+            .map(|ie| ie.ie_type)
+            .collect()
+    }
+
+    fn assert_time_ies(types: &[u16], what: &str) {
+        for (ie, name) in [
+            (crate::n4_build::pfcp_ie::START_TIME, "Start Time"),
+            (crate::n4_build::pfcp_ie::END_TIME, "End Time"),
+            (
+                crate::n4_build::pfcp_ie::DURATION_MEASUREMENT,
+                "Duration Measurement",
+            ),
+            (
+                crate::n4_build::pfcp_ie::TIME_OF_FIRST_PACKET,
+                "Time of First Packet",
+            ),
+            (
+                crate::n4_build::pfcp_ie::TIME_OF_LAST_PACKET,
+                "Time of Last Packet",
+            ),
+        ] {
+            assert!(types.contains(&ie), "{what}: {name} missing: {types:?}");
+        }
+    }
+
+    /// #953 review: the time IEs reach the wire on EVERY send path -- the TERMR in a
+    /// Session Deletion Response (the final billing record), the IMMER in a QAURR
+    /// Modification Response, and the quota-exhausted Session Report Request.
+    #[tokio::test]
+    async fn every_report_path_carries_the_time_ies() {
+        // QAURR -> Modification Response (IMMER).
+        let (_server, smf, addr, _rx, dp, upf_seid) = established_session().await;
+        let urr = urr1(&dp, upf_seid);
+        urr.set_measure_duration(true);
+        urr.record(100, true);
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_u8(pfcp_ie::PFCPSMREQ_FLAGS, pfcpsmreq_flags::QAURR);
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 90, &b.build())).await;
+        assert_time_ies(
+            &usage_report_ie_types_in(&resp, pfcp_ie::USAGE_REPORT_SMR),
+            "IMMER",
+        );
+
+        // Deletion -> Deletion Response (TERMR).
+        urr.record(100, true);
+        let resp = exchange(&smf, addr, &encode_pfcp(54, Some(upf_seid), 91, &[])).await;
+        assert_time_ies(
+            &usage_report_ie_types_in(&resp, crate::n4_build::pfcp_ie::USAGE_REPORT_SDR),
+            "TERMR",
+        );
+
+        // Quota exhaustion -> Session Report Request (VOLQU).
+        let (server, smf, _addr, _rx, dp, upf_seid) = established_session().await;
+        let urr = urr1(&dp, upf_seid);
+        urr.set_measure_duration(true);
+        urr.set_quotas(Some(100), None, None, None);
+        urr.record(500, true);
+        server
+            .send_quota_exhausted_report(upf_seid, 0x4242, 1)
+            .await
+            .expect("sent");
+        let mut buf = vec![0u8; 4096];
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), smf.recv_from(&mut buf))
+                .await
+                .expect("arrives")
+                .expect("recv");
+        assert_time_ies(&usage_report_ie_types(&buf[..len]), "VOLQU");
+    }
+
+    /// #818 (Table 7.5.8.3-1) on the wire: a harvested report carries Start Time and End
+    /// Time, a Duration Measurement (the fixture's URR measures DURAT), and Time of
+    /// First / Last Packet.
+    #[tokio::test]
+    async fn a_usage_report_carries_its_time_ies_on_the_wire() {
+        let (server, smf, _addr, _rx, dp, upf_seid) = established_session().await;
+        let urr = urr1(&dp, upf_seid);
+        urr.set_measure_duration(true);
+        urr.set_reporting(Some(1), None, None, None, None);
+        urr.record(300, true);
+        assert_eq!(server.send_due_urr_reports(upf_seid, 0x4242).await, Ok(1));
+        let mut buf = vec![0u8; 4096];
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), smf.recv_from(&mut buf))
+                .await
+                .expect("the report reaches the SMF")
+                .expect("recv");
+        let types = usage_report_ie_types(&buf[..len]);
+        for (ie, name) in [
+            (crate::n4_build::pfcp_ie::START_TIME, "Start Time"),
+            (crate::n4_build::pfcp_ie::END_TIME, "End Time"),
+            (
+                crate::n4_build::pfcp_ie::DURATION_MEASUREMENT,
+                "Duration Measurement",
+            ),
+            (
+                crate::n4_build::pfcp_ie::TIME_OF_FIRST_PACKET,
+                "Time of First Packet",
+            ),
+            (
+                crate::n4_build::pfcp_ie::TIME_OF_LAST_PACKET,
+                "Time of Last Packet",
+            ),
+        ] {
+            assert!(types.contains(&ie), "{name} missing: {types:?}");
+        }
     }
 
     /// #80 criterion 5 (wire half): the event-driven quota report reaches the SMF with
@@ -5637,7 +5798,7 @@ mod tests {
     /// §8.2.65), and a pre-#995 peer's Unix-seconds stamp is read in the NTP reading.
     #[tokio::test]
     async fn recovery_time_stamps_are_ntp_seconds() {
-        let (server, _smf, _addr, _rx) = spawn_test_server().await;
+        let (server, smf, addr, _rx) = spawn_test_server().await;
         let now = nextgcore_pfcp::recovery_time::now();
         assert!(now.wrapping_sub(server.recovery_time_stamp) < 60);
         let unix = std::time::SystemTime::now()
@@ -5649,7 +5810,21 @@ mod tests {
         b.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, unix as u32);
         assert_eq!(
             crate::n4_build::parse_recovery_time_stamp(&b.build()),
-            Some(nextgcore_pfcp::recovery_time::from_unix_secs(unix))
+            Some(unix as u32),
+            "the parser returns the wire value"
+        );
+        // ... and the association stores it in the NTP reading.
+        let assoc = build_association_setup_request_payload(Some(unix as u32));
+        let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+        assert_eq!(
+            server
+                .association
+                .read()
+                .await
+                .as_ref()
+                .unwrap()
+                .recovery_time_stamp,
+            nextgcore_pfcp::recovery_time::from_unix_secs(unix)
         );
     }
 

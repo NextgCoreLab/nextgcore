@@ -55,7 +55,7 @@ pub const RAT_TYPE_EUTRAN: u8 = 6;
 pub const COMPLETE_REQUEST_TAU: u8 = 1;
 
 /// GTPv2-C cause `Request accepted` (TS 29.274 Table 8.4-1).
-pub const CAUSE_REQUEST_ACCEPTED: u8 = 16;
+pub use nextgcore_gtp::v2::cause::REQUEST_ACCEPTED as CAUSE_REQUEST_ACCEPTED;
 
 /// GTPv2-C cause `IMSI/IMEI not known` (TS 29.274 Table 8.4-1: 96,
 /// `29274-j60.txt:25511`; 92 is "User authentication failed", which this was
@@ -64,7 +64,7 @@ pub const CAUSE_REQUEST_ACCEPTED: u8 = 16;
 /// One of the four message-specific causes §7.3.6 names for a Context Response
 /// (`29274-j60.txt:19878`), and the one §7.3.17 names for a Relocation Cancel
 /// Response.
-pub const CAUSE_IMSI_IMEI_NOT_KNOWN: u8 = 96;
+pub use nextgcore_gtp::v2::cause::IMSI_IMEI_NOT_KNOWN as CAUSE_IMSI_IMEI_NOT_KNOWN;
 
 /// GTPv2-C cause `Context Not Found` (TS 29.274 Table 8.4-1: 64, `29274-j60.txt:25444`).
 ///
@@ -72,10 +72,10 @@ pub const CAUSE_IMSI_IMEI_NOT_KNOWN: u8 = 96;
 /// known "shall respond with "Context not found" Cause in the corresponding response message
 /// to the sender, the TEID used in the GTPv2-C header in the response message shall be then
 /// set to zero."
-pub const CAUSE_CONTEXT_NOT_FOUND: u8 = 64;
+pub use nextgcore_gtp::v2::cause::CONTEXT_NOT_FOUND as CAUSE_CONTEXT_NOT_FOUND;
 
 /// GTPv2-C cause `Request rejected` (TS 29.274 Table 8.4-1).
-pub const CAUSE_REQUEST_REJECTED: u8 = 94;
+pub use nextgcore_gtp::v2::cause::REQUEST_REJECTED_REASON_NOT_SPECIFIED as CAUSE_REQUEST_REJECTED;
 
 /// GTPv2-C cause `Relocation failure` (TS 29.274 Table 8.4-1), #408.
 ///
@@ -90,17 +90,17 @@ pub const CAUSE_REQUEST_REJECTED: u8 = 94;
 /// **81**, read off its own Table 8.4-1 row (`29274-j60.txt:25480`), not counted to from a
 /// neighbour — row 75 is *"Syntactic error in the TFT operation"* and an early draft of this
 /// constant had it (#401's lesson).
-pub const CAUSE_RELOCATION_FAILURE: u8 = 81;
+pub use nextgcore_gtp::v2::cause::RELOCATION_FAILURE as CAUSE_RELOCATION_FAILURE;
 
 /// GTPv2-C cause `Mandatory IE incorrect` (TS 29.274 Table 8.4-1: 69, `29274-j60.txt:25456`).
 ///
 /// §7.7.8 (`29274-j60.txt:23425-23432`): a request with a mandatory or verifiable
 /// conditional IE carrying a semantically invalid value is answered with this cause and the
 /// type and instance of the offending IE.
-pub const CAUSE_MANDATORY_IE_INCORRECT: u8 = 69;
+pub use nextgcore_gtp::v2::cause::MANDATORY_IE_INCORRECT as CAUSE_MANDATORY_IE_INCORRECT;
 
 /// GTPv2-C cause `Conditional IE missing` (TS 29.274 Table 8.4-1: 103, `29274-j60.txt:25525`).
-pub const CAUSE_CONDITIONAL_IE_MISSING: u8 = 103;
+pub use nextgcore_gtp::v2::cause::CONDITIONAL_IE_MISSING as CAUSE_CONDITIONAL_IE_MISSING;
 
 /// `Target Type` = `Macro eNodeB ID` (TS 29.274 Table 8.51-1).
 pub const TARGET_TYPE_MACRO_ENODEB: u8 = 1;

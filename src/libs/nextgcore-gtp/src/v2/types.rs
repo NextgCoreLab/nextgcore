@@ -48,10 +48,17 @@ pub enum Gtp2PduType {
     UlPduSessionInformation = 1,
 }
 
-/// GTPv2 Cause Values (TS 29.274 Section 8.4)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// GTPv2 Cause Values (TS 29.274 §8.4, Table 8.4-1).
+///
+/// The one table every nextgcore GTPv2 node uses (#1024, #1037): sgwcd, smfd and
+/// mmed each kept their own, and each had values off the table. Every value is
+/// pinned against Table 8.4-1 in `tests::every_cause_is_its_table_8_4_1_value`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum Gtp2Cause {
+    /// 0 is reserved (Table 8.4-1); also what [`Gtp2Cause::from_wire`] gives a
+    /// value the table does not define.
+    #[default]
     UndefinedValue = 0,
     LocalDetach = 2,
     CompleteDetach = 3,
@@ -66,6 +73,7 @@ pub enum Gtp2Cause {
     PgwNotResponding = 12,
     NetworkFailure = 13,
     QosParameterMismatch = 14,
+    EpsTo5gsMobility = 15,
     RequestAccepted = 16,
     RequestAcceptedPartially = 17,
     NewPdnTypeDueToNetworkPreference = 18,
@@ -130,6 +138,132 @@ pub enum Gtp2Cause {
     UeNotAuthorisedByOcsOrExternalAaaServer = 125,
     MultipleAccessesToAPdnConnectionNotAllowed = 126,
     RequestRejectedDueToUeCapability = 127,
+    S1uPathFailure = 128,
+    FiveGcNotAllowed = 129,
+    PgwMismatchWithNetworkSliceSubscribedByTheUe = 130,
+    RejectionDueToPagingRestriction = 131,
+}
+
+/// The [`Gtp2Cause`] values as octets, for match patterns and for code that
+/// carries the cause as a `u8` (#1024, #1037). Derived from the enum, so the two
+/// cannot disagree; nodes import this rather than keeping their own table.
+pub mod cause {
+    use super::Gtp2Cause;
+
+    pub const UNDEFINED_VALUE: u8 = Gtp2Cause::UndefinedValue as u8;
+    pub const LOCAL_DETACH: u8 = Gtp2Cause::LocalDetach as u8;
+    pub const COMPLETE_DETACH: u8 = Gtp2Cause::CompleteDetach as u8;
+    pub const RAT_CHANGED_FROM_3GPP_TO_NON_3GPP: u8 = Gtp2Cause::RatChangedFrom3gppToNon3gpp as u8;
+    pub const ISR_DEACTIVATION: u8 = Gtp2Cause::IsrDeactivation as u8;
+    pub const ERROR_INDICATION_RECEIVED: u8 = Gtp2Cause::ErrorIndicationReceived as u8;
+    pub const IMSI_DETACH_ONLY: u8 = Gtp2Cause::ImsiDetachOnly as u8;
+    pub const REACTIVATION_REQUESTED: u8 = Gtp2Cause::ReactivationRequested as u8;
+    pub const PDN_RECONNECTION_TO_THIS_APN_DISALLOWED: u8 =
+        Gtp2Cause::PdnReconnectionToThisApnDisallowed as u8;
+    pub const ACCESS_CHANGED_FROM_NON_3GPP_TO_3GPP: u8 =
+        Gtp2Cause::AccessChangedFromNon3gppTo3gpp as u8;
+    pub const PDN_CONNECTION_INACTIVITY_TIMER_EXPIRES: u8 =
+        Gtp2Cause::PdnConnectionInactivityTimerExpires as u8;
+    pub const PGW_NOT_RESPONDING: u8 = Gtp2Cause::PgwNotResponding as u8;
+    pub const NETWORK_FAILURE: u8 = Gtp2Cause::NetworkFailure as u8;
+    pub const QOS_PARAMETER_MISMATCH: u8 = Gtp2Cause::QosParameterMismatch as u8;
+    pub const EPS_TO_5GS_MOBILITY: u8 = Gtp2Cause::EpsTo5gsMobility as u8;
+    pub const REQUEST_ACCEPTED: u8 = Gtp2Cause::RequestAccepted as u8;
+    pub const REQUEST_ACCEPTED_PARTIALLY: u8 = Gtp2Cause::RequestAcceptedPartially as u8;
+    pub const NEW_PDN_TYPE_DUE_TO_NETWORK_PREFERENCE: u8 =
+        Gtp2Cause::NewPdnTypeDueToNetworkPreference as u8;
+    pub const NEW_PDN_TYPE_DUE_TO_SINGLE_ADDRESS_BEARER_ONLY: u8 =
+        Gtp2Cause::NewPdnTypeDueToSingleAddressBearerOnly as u8;
+    pub const CONTEXT_NOT_FOUND: u8 = Gtp2Cause::ContextNotFound as u8;
+    pub const INVALID_MESSAGE_FORMAT: u8 = Gtp2Cause::InvalidMessageFormat as u8;
+    pub const VERSION_NOT_SUPPORTED_BY_NEXT_PEER: u8 =
+        Gtp2Cause::VersionNotSupportedByNextPeer as u8;
+    pub const INVALID_LENGTH: u8 = Gtp2Cause::InvalidLength as u8;
+    pub const SERVICE_NOT_SUPPORTED: u8 = Gtp2Cause::ServiceNotSupported as u8;
+    pub const MANDATORY_IE_INCORRECT: u8 = Gtp2Cause::MandatoryIeIncorrect as u8;
+    pub const MANDATORY_IE_MISSING: u8 = Gtp2Cause::MandatoryIeMissing as u8;
+    pub const SYSTEM_FAILURE: u8 = Gtp2Cause::SystemFailure as u8;
+    pub const NO_RESOURCES_AVAILABLE: u8 = Gtp2Cause::NoResourcesAvailable as u8;
+    pub const SEMANTIC_ERROR_IN_THE_TFT_OPERATION: u8 =
+        Gtp2Cause::SemanticErrorInTheTftOperation as u8;
+    pub const SYNTACTIC_ERROR_IN_THE_TFT_OPERATION: u8 =
+        Gtp2Cause::SyntacticErrorInTheTftOperation as u8;
+    pub const SEMANTIC_ERRORS_IN_PACKET_FILTER: u8 = Gtp2Cause::SemanticErrorsInPacketFilter as u8;
+    pub const SYNTACTIC_ERRORS_IN_PACKET_FILTER: u8 =
+        Gtp2Cause::SyntacticErrorsInPacketFilter as u8;
+    pub const MISSING_OR_UNKNOWN_APN: u8 = Gtp2Cause::MissingOrUnknownApn as u8;
+    pub const GRE_KEY_NOT_FOUND: u8 = Gtp2Cause::GreKeyNotFound as u8;
+    pub const RELOCATION_FAILURE: u8 = Gtp2Cause::RelocationFailure as u8;
+    pub const DENIED_IN_RAT: u8 = Gtp2Cause::DeniedInRat as u8;
+    pub const PREFERRED_PDN_TYPE_NOT_SUPPORTED: u8 = Gtp2Cause::PreferredPdnTypeNotSupported as u8;
+    pub const ALL_DYNAMIC_ADDRESSES_ARE_OCCUPIED: u8 =
+        Gtp2Cause::AllDynamicAddressesAreOccupied as u8;
+    pub const UE_CONTEXT_WITHOUT_TFT_ALREADY_ACTIVATED: u8 =
+        Gtp2Cause::UeContextWithoutTftAlreadyActivated as u8;
+    pub const PROTOCOL_TYPE_NOT_SUPPORTED: u8 = Gtp2Cause::ProtocolTypeNotSupported as u8;
+    pub const UE_NOT_RESPONDING: u8 = Gtp2Cause::UeNotResponding as u8;
+    pub const UE_REFUSES: u8 = Gtp2Cause::UeRefuses as u8;
+    pub const SERVICE_DENIED: u8 = Gtp2Cause::ServiceDenied as u8;
+    pub const UNABLE_TO_PAGE_UE: u8 = Gtp2Cause::UnableToPageUe as u8;
+    pub const NO_MEMORY_AVAILABLE: u8 = Gtp2Cause::NoMemoryAvailable as u8;
+    pub const USER_AUTHENTICATION_FAILED: u8 = Gtp2Cause::UserAuthenticationFailed as u8;
+    pub const APN_ACCESS_DENIED_NO_SUBSCRIPTION: u8 =
+        Gtp2Cause::ApnAccessDeniedNoSubscription as u8;
+    pub const REQUEST_REJECTED_REASON_NOT_SPECIFIED: u8 =
+        Gtp2Cause::RequestRejectedReasonNotSpecified as u8;
+    pub const P_TMSI_SIGNATURE_MISMATCH: u8 = Gtp2Cause::PTmsiSignatureMismatch as u8;
+    pub const IMSI_IMEI_NOT_KNOWN: u8 = Gtp2Cause::ImsiImeiNotKnown as u8;
+    pub const SEMANTIC_ERROR_IN_THE_TAD_OPERATION: u8 =
+        Gtp2Cause::SemanticErrorInTheTadOperation as u8;
+    pub const SYNTACTIC_ERROR_IN_THE_TAD_OPERATION: u8 =
+        Gtp2Cause::SyntacticErrorInTheTadOperation as u8;
+    pub const REMOTE_PEER_NOT_RESPONDING: u8 = Gtp2Cause::RemotePeerNotResponding as u8;
+    pub const COLLISION_WITH_NETWORK_INITIATED_REQUEST: u8 =
+        Gtp2Cause::CollisionWithNetworkInitiatedRequest as u8;
+    pub const UNABLE_TO_PAGE_UE_DUE_TO_SUSPENSION: u8 =
+        Gtp2Cause::UnableToPageUeDueToSuspension as u8;
+    pub const CONDITIONAL_IE_MISSING: u8 = Gtp2Cause::ConditionalIeMissing as u8;
+    pub const APN_RESTRICTION_TYPE_INCOMPATIBLE: u8 =
+        Gtp2Cause::ApnRestrictionTypeIncompatible as u8;
+    pub const INVALID_OVERALL_LENGTH: u8 = Gtp2Cause::InvalidOverallLength as u8;
+    pub const DATA_FORWARDING_NOT_SUPPORTED: u8 = Gtp2Cause::DataForwardingNotSupported as u8;
+    pub const INVALID_REPLY_FROM_REMOTE_PEER: u8 = Gtp2Cause::InvalidReplyFromRemotePeer as u8;
+    pub const FALLBACK_TO_GTPV1: u8 = Gtp2Cause::FallbackToGtpv1 as u8;
+    pub const INVALID_PEER: u8 = Gtp2Cause::InvalidPeer as u8;
+    pub const TEMPORARILY_REJECTED_DUE_TO_HANDOVER_IN_PROGRESS: u8 =
+        Gtp2Cause::TemporarilyRejectedDueToHandoverInProgress as u8;
+    pub const MODIFICATIONS_NOT_LIMITED_TO_S1U_BEARERS: u8 =
+        Gtp2Cause::ModificationsNotLimitedToS1uBearers as u8;
+    pub const REQUEST_REJECTED_FOR_A_PMIPV6_REASON: u8 =
+        Gtp2Cause::RequestRejectedForAPmipv6Reason as u8;
+    pub const APN_CONGESTION: u8 = Gtp2Cause::ApnCongestion as u8;
+    pub const BEARER_HANDLING_NOT_SUPPORTED: u8 = Gtp2Cause::BearerHandlingNotSupported as u8;
+    pub const UE_ALREADY_RE_ATTACHED: u8 = Gtp2Cause::UeAlreadyReAttached as u8;
+    pub const MULTIPLE_PDN_CONNECTIONS_FOR_A_GIVEN_APN_NOT_ALLOWED: u8 =
+        Gtp2Cause::MultiplePdnConnectionsForAGivenApnNotAllowed as u8;
+    pub const TARGET_ACCESS_RESTRICTED_FOR_THE_SUBSCRIBER: u8 =
+        Gtp2Cause::TargetAccessRestrictedForTheSubscriber as u8;
+    pub const MME_SGSN_REFUSES_DUE_TO_VPLMN_POLICY: u8 =
+        Gtp2Cause::MmeSgsnRefusesDueToVplmnPolicy as u8;
+    pub const GTP_C_ENTITY_CONGESTION: u8 = Gtp2Cause::GtpCEntityCongestion as u8;
+    pub const LATE_OVERLAPPING_REQUEST: u8 = Gtp2Cause::LateOverlappingRequest as u8;
+    pub const TIMED_OUT_REQUEST: u8 = Gtp2Cause::TimedOutRequest as u8;
+    pub const UE_IS_TEMPORARILY_NOT_REACHABLE_DUE_TO_POWER_SAVING: u8 =
+        Gtp2Cause::UeIsTemporarilyNotReachableDueToPowerSaving as u8;
+    pub const RELOCATION_FAILURE_DUE_TO_NAS_MESSAGE_REDIRECTION: u8 =
+        Gtp2Cause::RelocationFailureDueToNasMessageRedirection as u8;
+    pub const UE_NOT_AUTHORISED_BY_OCS_OR_EXTERNAL_AAA_SERVER: u8 =
+        Gtp2Cause::UeNotAuthorisedByOcsOrExternalAaaServer as u8;
+    pub const MULTIPLE_ACCESSES_TO_A_PDN_CONNECTION_NOT_ALLOWED: u8 =
+        Gtp2Cause::MultipleAccessesToAPdnConnectionNotAllowed as u8;
+    pub const REQUEST_REJECTED_DUE_TO_UE_CAPABILITY: u8 =
+        Gtp2Cause::RequestRejectedDueToUeCapability as u8;
+    pub const S1U_PATH_FAILURE: u8 = Gtp2Cause::S1uPathFailure as u8;
+    pub const FIVE_GC_NOT_ALLOWED: u8 = Gtp2Cause::FiveGcNotAllowed as u8;
+    pub const PGW_MISMATCH_WITH_NETWORK_SLICE_SUBSCRIBED_BY_THE_UE: u8 =
+        Gtp2Cause::PgwMismatchWithNetworkSliceSubscribedByTheUe as u8;
+    pub const REJECTION_DUE_TO_PAGING_RESTRICTION: u8 =
+        Gtp2Cause::RejectionDueToPagingRestriction as u8;
 }
 
 impl TryFrom<u8> for Gtp2Cause {
@@ -151,6 +285,7 @@ impl TryFrom<u8> for Gtp2Cause {
             12 => Ok(Self::PgwNotResponding),
             13 => Ok(Self::NetworkFailure),
             14 => Ok(Self::QosParameterMismatch),
+            15 => Ok(Self::EpsTo5gsMobility),
             16 => Ok(Self::RequestAccepted),
             17 => Ok(Self::RequestAcceptedPartially),
             18 => Ok(Self::NewPdnTypeDueToNetworkPreference),
@@ -215,12 +350,27 @@ impl TryFrom<u8> for Gtp2Cause {
             125 => Ok(Self::UeNotAuthorisedByOcsOrExternalAaaServer),
             126 => Ok(Self::MultipleAccessesToAPdnConnectionNotAllowed),
             127 => Ok(Self::RequestRejectedDueToUeCapability),
+            128 => Ok(Self::S1uPathFailure),
+            129 => Ok(Self::FiveGcNotAllowed),
+            130 => Ok(Self::PgwMismatchWithNetworkSliceSubscribedByTheUe),
+            131 => Ok(Self::RejectionDueToPagingRestriction),
             _ => Err(GtpError::InvalidCause(value)),
         }
     }
 }
 
 impl Gtp2Cause {
+    /// The cause a received octet names, or [`Gtp2Cause::UndefinedValue`] for one
+    /// the table leaves spare or reserved.
+    pub fn from_wire(value: u8) -> Self {
+        Self::try_from(value).unwrap_or(Self::UndefinedValue)
+    }
+
+    /// The octet this cause is sent as.
+    pub const fn value(self) -> u8 {
+        self as u8
+    }
+
     /// Check if cause indicates success
     pub fn is_success(&self) -> bool {
         matches!(
@@ -650,6 +800,110 @@ impl Gtp2Arp {
             pre_emption_vulnerability: (byte >> 6) & 0x01 != 0,
             priority_level: (byte >> 2) & 0x0F,
             pre_emption_capability: byte & 0x01 != 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Gtp2Cause as C;
+
+    /// #1024 / #1037: every cause against TS 29.274 Table 8.4-1, as the literal
+    /// octet the table gives it; and every defined octet decodes to its cause.
+    #[test]
+    fn every_cause_is_its_table_8_4_1_value() {
+        let table: &[(C, u8)] = &[
+            (C::UndefinedValue, 0),
+            (C::LocalDetach, 2),
+            (C::CompleteDetach, 3),
+            (C::RatChangedFrom3gppToNon3gpp, 4),
+            (C::IsrDeactivation, 5),
+            (C::ErrorIndicationReceived, 6),
+            (C::ImsiDetachOnly, 7),
+            (C::ReactivationRequested, 8),
+            (C::PdnReconnectionToThisApnDisallowed, 9),
+            (C::AccessChangedFromNon3gppTo3gpp, 10),
+            (C::PdnConnectionInactivityTimerExpires, 11),
+            (C::PgwNotResponding, 12),
+            (C::NetworkFailure, 13),
+            (C::QosParameterMismatch, 14),
+            (C::EpsTo5gsMobility, 15),
+            (C::RequestAccepted, 16),
+            (C::RequestAcceptedPartially, 17),
+            (C::NewPdnTypeDueToNetworkPreference, 18),
+            (C::NewPdnTypeDueToSingleAddressBearerOnly, 19),
+            (C::ContextNotFound, 64),
+            (C::InvalidMessageFormat, 65),
+            (C::VersionNotSupportedByNextPeer, 66),
+            (C::InvalidLength, 67),
+            (C::ServiceNotSupported, 68),
+            (C::MandatoryIeIncorrect, 69),
+            (C::MandatoryIeMissing, 70),
+            (C::SystemFailure, 72),
+            (C::NoResourcesAvailable, 73),
+            (C::SemanticErrorInTheTftOperation, 74),
+            (C::SyntacticErrorInTheTftOperation, 75),
+            (C::SemanticErrorsInPacketFilter, 76),
+            (C::SyntacticErrorsInPacketFilter, 77),
+            (C::MissingOrUnknownApn, 78),
+            (C::GreKeyNotFound, 80),
+            (C::RelocationFailure, 81),
+            (C::DeniedInRat, 82),
+            (C::PreferredPdnTypeNotSupported, 83),
+            (C::AllDynamicAddressesAreOccupied, 84),
+            (C::UeContextWithoutTftAlreadyActivated, 85),
+            (C::ProtocolTypeNotSupported, 86),
+            (C::UeNotResponding, 87),
+            (C::UeRefuses, 88),
+            (C::ServiceDenied, 89),
+            (C::UnableToPageUe, 90),
+            (C::NoMemoryAvailable, 91),
+            (C::UserAuthenticationFailed, 92),
+            (C::ApnAccessDeniedNoSubscription, 93),
+            (C::RequestRejectedReasonNotSpecified, 94),
+            (C::PTmsiSignatureMismatch, 95),
+            (C::ImsiImeiNotKnown, 96),
+            (C::SemanticErrorInTheTadOperation, 97),
+            (C::SyntacticErrorInTheTadOperation, 98),
+            (C::RemotePeerNotResponding, 100),
+            (C::CollisionWithNetworkInitiatedRequest, 101),
+            (C::UnableToPageUeDueToSuspension, 102),
+            (C::ConditionalIeMissing, 103),
+            (C::ApnRestrictionTypeIncompatible, 104),
+            (C::InvalidOverallLength, 105),
+            (C::DataForwardingNotSupported, 106),
+            (C::InvalidReplyFromRemotePeer, 107),
+            (C::FallbackToGtpv1, 108),
+            (C::InvalidPeer, 109),
+            (C::TemporarilyRejectedDueToHandoverInProgress, 110),
+            (C::ModificationsNotLimitedToS1uBearers, 111),
+            (C::RequestRejectedForAPmipv6Reason, 112),
+            (C::ApnCongestion, 113),
+            (C::BearerHandlingNotSupported, 114),
+            (C::UeAlreadyReAttached, 115),
+            (C::MultiplePdnConnectionsForAGivenApnNotAllowed, 116),
+            (C::TargetAccessRestrictedForTheSubscriber, 117),
+            (C::MmeSgsnRefusesDueToVplmnPolicy, 119),
+            (C::GtpCEntityCongestion, 120),
+            (C::LateOverlappingRequest, 121),
+            (C::TimedOutRequest, 122),
+            (C::UeIsTemporarilyNotReachableDueToPowerSaving, 123),
+            (C::RelocationFailureDueToNasMessageRedirection, 124),
+            (C::UeNotAuthorisedByOcsOrExternalAaaServer, 125),
+            (C::MultipleAccessesToAPdnConnectionNotAllowed, 126),
+            (C::RequestRejectedDueToUeCapability, 127),
+            (C::S1uPathFailure, 128),
+            (C::FiveGcNotAllowed, 129),
+            (C::PgwMismatchWithNetworkSliceSubscribedByTheUe, 130),
+            (C::RejectionDueToPagingRestriction, 131),
+        ];
+        for (cause, octet) in table {
+            assert_eq!(cause.value(), *octet, "{cause:?}");
+            assert_eq!(C::from_wire(*octet), *cause, "octet {octet}");
+        }
+        // Spare / "shall not be used" values read as undefined.
+        for spare in [1u8, 20, 63, 71, 79, 99, 118, 132, 255] {
+            assert_eq!(C::from_wire(spare), C::UndefinedValue, "octet {spare}");
         }
     }
 }

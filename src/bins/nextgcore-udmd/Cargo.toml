@@ -46,6 +46,8 @@ ctrlc.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# The capturing logger for log-content tests (#1026).
+nextgcore-core = { workspace = true, features = ["test-log"] }
 p256 = { workspace = true, features = ["ecdsa"] }
 base64.workspace = true
 # Wave-6 H3 (strict-peer conversion): drive amfd's REAL Nudm_UECM

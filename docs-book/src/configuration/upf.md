@@ -85,6 +85,8 @@ Defaults below are the real clap `default_value`s from the source.
 | `NEXTGCORE_METRICS_BIND` | `127.0.0.1` | Host the unauthenticated `/metrics` listener binds to (#837). The compose files and manifests set `0.0.0.0` inside the private container/pod network. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://jaeger:4317` | OTLP endpoint for OpenTelemetry tracing (initialization is best-effort; failure is ignored). |
 
+> **Clock:** this NF refuses to start when the local clock reads before 2020-01-01, because its PFCP Recovery Time Stamp would be wrong. See [A set clock is required](overview.md#a-set-clock-is-required-pfcp-nfs) for the remedy on RTC-less hosts.
+
 ## Behavior notes
 
 - **PFCP heartbeats:** the UPF also initiates PFCP heartbeats toward the associated CP function every 10 seconds (code comment cites TS 29.244 §6.2.2: either node may initiate).

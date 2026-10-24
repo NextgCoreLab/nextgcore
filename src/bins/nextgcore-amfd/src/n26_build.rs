@@ -41,7 +41,7 @@ use nextgcore_gtp::v2::{
 };
 
 /// GTPv2-C cause `Request accepted` (TS 29.274 Table 8.4-1).
-pub const CAUSE_REQUEST_ACCEPTED: u8 = 16;
+pub use nextgcore_gtp::v2::cause::REQUEST_ACCEPTED as CAUSE_REQUEST_ACCEPTED;
 
 /// GTPv2-C cause `Relocation failure` (TS 29.274 Table 8.4-1).
 ///
@@ -53,7 +53,7 @@ pub const CAUSE_REQUEST_ACCEPTED: u8 = 16;
 /// **81**, read off its own Table 8.4-1 row (`29274-j60.txt:25480`). The first draft of this
 /// constant said 75 -- which is *"Syntactic error in the TFT operation"* -- and the revert-check
 /// against the table caught it. #401's lesson: read the row, never count to it.
-pub const CAUSE_RELOCATION_FAILURE: u8 = 81;
+pub use nextgcore_gtp::v2::cause::RELOCATION_FAILURE as CAUSE_RELOCATION_FAILURE;
 
 /// Instance of the `SGW S11/S4 IP Address and TEID for Control Plane` IE in a Forward
 /// Relocation Request (Table 7.3.1-1, `29274-j60.txt:17839`).
@@ -626,9 +626,7 @@ mod tests {
     /// instances, with the right message type — and **no Indication IE**.
     #[test]
     fn forward_relocation_request_carries_its_table_7_3_1_1_ies() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.blocking_lock();
 
         let mut ue = AmfUe::new(0x408_0001, 1);
         ue.supi = Some("imsi-001010000000408".to_string());
@@ -1021,9 +1019,7 @@ mod tests {
     /// with a MAC failure pointing nowhere near here.
     #[test]
     fn the_handover_kasme_is_bound_to_the_downlink_count_before_the_increment() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.blocking_lock();
 
         const KAMF: [u8; 32] = [0x74; 32];
         const DL_BEFORE: u32 = 0x0408_00AA;

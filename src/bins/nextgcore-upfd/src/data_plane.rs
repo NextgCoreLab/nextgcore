@@ -1230,6 +1230,58 @@ pub struct TimeMeter {
     quota_anchor: std::time::Duration,
     /// Measured time at the last usage report (the ongoing measurement's start).
     report_anchor: std::time::Duration,
+    /// Wall time the ongoing measurement started: the last report, or the URR's
+    /// creation (#818: a report's Start Time). `None` until the URR is provisioned.
+    report_wall: Option<std::time::SystemTime>,
+    /// Wall time of the first and the last packet since the last report (#818: Time of
+    /// First / Last Packet).
+    first_pkt_wall: Option<std::time::SystemTime>,
+    last_pkt_wall: Option<std::time::SystemTime>,
+    /// Reports generated so far: lets a restore tell whether a NEWER report has gone
+    /// out since the undelivered one (#953 review).
+    report_gen: u64,
+}
+
+/// The time IEs of one usage report (#818, TS 29.244 Table 7.5.8.3-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReportTimes {
+    /// Start Time (§8.2.38): start of the measurement this report covers.
+    pub start: std::time::SystemTime,
+    /// End Time (§8.2.39): when the report was generated.
+    pub end: std::time::SystemTime,
+    /// Duration Measurement (§8.2.43), present only when the URR measures DURAT: the
+    /// MEASURED time (#820) this report covers.
+    pub duration: Option<std::time::Duration>,
+    /// Time of First / Last Packet (§8.2.44/§8.2.45), when traffic was seen.
+    pub first_pkt: Option<std::time::SystemTime>,
+    pub last_pkt: Option<std::time::SystemTime>,
+    /// Which report this was (the URR's report count after it).
+    pub gen: u64,
+}
+
+impl Default for ReportTimes {
+    fn default() -> Self {
+        let now = std::time::SystemTime::now();
+        Self {
+            start: now,
+            end: now,
+            duration: None,
+            first_pkt: None,
+            last_pkt: None,
+            gen: 0,
+        }
+    }
+}
+
+/// A 3GPP NTP timestamp (§8.2.38: seconds since 1900-01-01, the first four octets
+/// of the RFC 5905 64-bit format). The `as u32` truncation is the NTP era wrap: values
+/// are era 0 until 2036-02-07, then wrap to era 1 exactly as RFC 5905 §6 specifies.
+pub fn ntp_secs(t: std::time::SystemTime) -> u32 {
+    const NTP_UNIX_OFFSET: u64 = 2_208_988_800;
+    let unix = t
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    (unix + NTP_UNIX_OFFSET) as u32
 }
 
 impl TimeMeter {
@@ -1260,6 +1312,9 @@ impl TimeMeter {
             _ => {}
         }
         self.last_pkt = Some(now);
+        let wall = std::time::SystemTime::now();
+        self.first_pkt_wall.get_or_insert(wall);
+        self.last_pkt_wall = Some(wall);
     }
 
     /// ISTM: start metering now, without waiting for a packet.
@@ -1357,6 +1412,9 @@ pub struct DataPlaneUrr {
     /// event: metering starts at the first packet (or at once, with ISTM), and is
     /// suspended after an Inactivity Detection Time with no packets.
     meter: std::sync::Mutex<TimeMeter>,
+    /// The URR measures time (Measurement Method DURAT, §8.2.40): its reports carry a
+    /// Duration Measurement (#818).
+    measure_duration: AtomicBool,
     /// Raised by `record()` when the TIME threshold is crossed, so the report says
     /// TIMTH (#842 review); cleared by every report.
     time_threshold_hit: AtomicBool,
@@ -1581,6 +1639,8 @@ impl DataPlaneUrr {
     }
 
     fn rebase_volume_quota_to_ongoing(&self) {
+        // #902: under the meter lock, which `record` holds for its counter updates.
+        let _meter = self.meter.lock().unwrap();
         for (dst, src) in [
             (&self.quota_used_total, &self.acc_total_bytes),
             (&self.quota_used_ul, &self.acc_ul_bytes),
@@ -1597,6 +1657,8 @@ impl DataPlaneUrr {
 
     /// The same for a newly received volume threshold.
     fn rebase_volume_threshold_to_ongoing(&self) {
+        // #902: under the meter lock, which `record` holds for its counter updates.
+        let _meter = self.meter.lock().unwrap();
         for (dst, src) in [
             (&self.thr_used_total, &self.acc_total_bytes),
             (&self.thr_used_ul, &self.acc_ul_bytes),
@@ -1775,7 +1837,11 @@ impl DataPlaneUrr {
             thr_used_total: AtomicU64::new(0),
             thr_used_ul: AtomicU64::new(0),
             thr_used_dl: AtomicU64::new(0),
-            meter: std::sync::Mutex::new(TimeMeter::default()),
+            meter: std::sync::Mutex::new(TimeMeter {
+                report_wall: Some(std::time::SystemTime::now()),
+                ..Default::default()
+            }),
+            measure_duration: AtomicBool::new(false),
             time_threshold_hit: AtomicBool::new(false),
             first_pkt_time: RwLock::new(None),
             last_report_time: RwLock::new(Some(std::time::Instant::now())),
@@ -1823,6 +1889,12 @@ impl DataPlaneUrr {
         if self.quota_exhausted.load(Ordering::Relaxed) {
             return UrrOutcome::QuotaAlreadyExhausted;
         }
+        // #902: every counter of this packet is updated under the meter lock (already
+        // taken per packet for the time measurement), so a quota/threshold re-base --
+        // which copies the ongoing counts under the same lock -- can never overwrite a
+        // concurrent packet's add. Released before any limit is evaluated: those
+        // evaluations take the lock themselves.
+        let mut meter = self.meter.lock().unwrap();
         self.acc_total_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.acc_total_pkts.fetch_add(1, Ordering::Relaxed);
         // #842 review: the quota and the thresholds are measured on their OWN counters,
@@ -1869,6 +1941,9 @@ impl DataPlaneUrr {
             )
         };
 
+        meter.on_packet(std::time::Instant::now());
+        drop(meter);
+
         // Track first packet time. Before the early returns below, so the time of the
         // first packet is recorded even for a session whose very first packet crosses
         // something -- a usage report with no Time of First Packet is a report the CP
@@ -1879,10 +1954,6 @@ impl DataPlaneUrr {
                 *fpt = Some(std::time::Instant::now());
             }
         }
-        self.meter
-            .lock()
-            .unwrap()
-            .on_packet(std::time::Instant::now());
 
         // ---- Volume quotas: per direction, then total (§8.2.40) ----
         let volume_quota_hit = dir_quota.is_some_and(|q| directional >= q)
@@ -1965,6 +2036,17 @@ impl DataPlaneUrr {
     }
 
     fn take_usage_for(&self, threshold_report: bool) -> UrrUsage {
+        self.take_report_for(threshold_report).0
+    }
+
+    /// Take the usage AND the time IEs of one report (#818), atomically with respect to
+    /// each other: the Start/End Time, Duration Measurement and first/last packet times
+    /// describe exactly the measurement whose volume this report carries.
+    pub fn take_report(&self, threshold_report: bool) -> (UrrUsage, ReportTimes) {
+        self.take_report_for(threshold_report)
+    }
+
+    fn take_report_for(&self, threshold_report: bool) -> (UrrUsage, ReportTimes) {
         self.threshold_exceeded.store(false, Ordering::SeqCst);
         self.time_threshold_hit.store(false, Ordering::SeqCst);
         *self.first_pkt_time.write().unwrap() = None;
@@ -1979,16 +2061,31 @@ impl DataPlaneUrr {
             .fetch_sub(usage.total_bytes(), Ordering::AcqRel);
         self.acc_total_pkts
             .fetch_sub(usage.total_pkts(), Ordering::AcqRel);
-        {
+        let times = {
             // #820: the next report's measurement starts here on the measured clock; a
             // threshold report re-applies the time threshold from here too.
             let mut m = self.meter.lock().unwrap();
             let now = m.measured(std::time::Instant::now());
+            let wall = std::time::SystemTime::now();
+            let times = ReportTimes {
+                start: m.report_wall.unwrap_or(wall),
+                end: wall,
+                duration: self
+                    .measure_duration
+                    .load(Ordering::Relaxed)
+                    .then(|| now.saturating_sub(m.report_anchor)),
+                first_pkt: m.first_pkt_wall.take(),
+                last_pkt: m.last_pkt_wall.take(),
+                gen: m.report_gen + 1,
+            };
+            m.report_gen += 1;
             m.report_anchor = now;
+            m.report_wall = Some(wall);
             if threshold_report {
                 m.thr_anchor = now;
             }
-        }
+            times
+        };
         if threshold_report {
             // Read AFTER the swaps: a packet whose bytes this report took has already
             // added to these counters, so it is subtracted; one recorded after the read
@@ -1998,7 +2095,39 @@ impl DataPlaneUrr {
                 c.fetch_sub(v, Ordering::AcqRel);
             }
         }
-        usage
+        (usage, times)
+    }
+
+    /// Set whether this URR measures time (DURAT), from its Measurement Method (#818).
+    pub fn set_measure_duration(&self, duration: bool) {
+        self.measure_duration.store(duration, Ordering::Relaxed);
+    }
+
+    /// Whether this URR measures time (DURAT) and so reports a Duration Measurement.
+    pub fn measures_duration(&self) -> bool {
+        self.measure_duration.load(Ordering::Relaxed)
+    }
+
+    /// Put back the time measurement of a report that was not delivered (#818, with
+    /// [`Self::restore_usage`]): the next report covers it -- its Start Time and Duration
+    /// Measurement reach back over the undelivered one.
+    pub fn restore_times(&self, times: &ReportTimes) {
+        let mut m = self.meter.lock().unwrap();
+        if let Some(d) = times.duration {
+            m.report_anchor = m.report_anchor.saturating_sub(d);
+        }
+        // #953 review: the window reaches back only if no NEWER report has gone out
+        // since -- otherwise the next report's Start Time would overlap a window already
+        // reported. The duration (and the volume) are still carried, so the totals sum.
+        if m.report_gen == times.gen {
+            m.report_wall = Some(m.report_wall.map_or(times.start, |w| w.min(times.start)));
+            if let Some(f) = times.first_pkt {
+                m.first_pkt_wall = Some(m.first_pkt_wall.map_or(f, |w| w.min(f)));
+            }
+            if m.last_pkt_wall.is_none() {
+                m.last_pkt_wall = times.last_pkt;
+            }
+        }
     }
 
     /// Why this URR must report now, or `None` (#821): a crossed threshold or quota
@@ -4143,7 +4272,7 @@ impl DataPlane {
         let session = self.sessions.find_by_seid(upf_seid)?;
         let urr = session.urrs.read().unwrap().get(&urr_id).cloned()?;
         let reason = urr.report_reason();
-        let usage = urr.take_usage();
+        let usage = urr.take_report(false);
         Some(UrrReportEntry::new(
             &session,
             urr_id,
@@ -4175,7 +4304,7 @@ impl DataPlane {
         urrs.into_iter()
             .map(|(urr_id, urr)| {
                 let reason = urr.report_reason();
-                let usage = urr.take_usage();
+                let usage = urr.take_report(false);
                 UrrReportEntry::new(&session, urr_id, urr.next_ur_seqn(), usage, reason)
             })
             .collect()
@@ -4230,14 +4359,10 @@ impl DataPlane {
             .filter_map(|(urr_id, urr)| {
                 let trigger = urr.claim_report()?;
                 // A report triggered by EITHER threshold re-applies the thresholds.
-                let usage = if matches!(
+                let usage = urr.take_report(matches!(
                     trigger,
                     UrrReportReason::VolumeThreshold | UrrReportReason::TimeThreshold
-                ) {
-                    urr.take_usage_for_threshold()
-                } else {
-                    urr.take_usage()
-                };
+                ));
                 Some(UrrReportEntry::new(
                     session,
                     urr_id,
@@ -4284,6 +4409,7 @@ impl DataPlane {
             let urr = session.urrs.read().unwrap().get(&r.urr_id).cloned();
             if let Some(urr) = urr {
                 urr.restore_usage(&r.usage());
+                urr.restore_times(&r.times);
                 self.stats
                     .urr_reports_restored
                     .fetch_add(1, Ordering::Relaxed);
@@ -4450,15 +4576,17 @@ pub struct UrrReportEntry {
     /// function reading the trigger to decide whether to top a subscriber up was being
     /// told the wrong thing.
     pub trigger: UrrReportReason,
+    /// The report's time IEs (#818).
+    pub times: ReportTimes,
 }
 
 impl UrrReportEntry {
-    /// A report carrying `usage` taken from URR `urr_id` of `session`.
+    /// A report carrying `usage` and `times` taken from URR `urr_id` of `session`.
     pub fn new(
         session: &DataPlaneSession,
         urr_id: u32,
         ur_seqn: u32,
-        usage: UrrUsage,
+        (usage, times): (UrrUsage, ReportTimes),
         trigger: UrrReportReason,
     ) -> Self {
         Self {
@@ -4473,6 +4601,7 @@ impl UrrReportEntry {
             ul_pkts: usage.ul_pkts,
             dl_pkts: usage.dl_pkts,
             trigger,
+            times,
         }
     }
 
@@ -6795,6 +6924,180 @@ mod tests {
         assert!(
             eager.meter.lock().unwrap().running_since.is_some(),
             "ISTM starts metering without a packet"
+        );
+    }
+
+    /// #818 (TS 29.244 Table 7.5.8.3-1): every report carries the times of the
+    /// measurement it covers -- Start Time (the previous report, or the URR's creation),
+    /// End Time (now), a Duration Measurement of MEASURED time when the URR measures
+    /// DURAT, and the times of its first and last packet -- and the next report starts
+    /// where this one ended.
+    #[test]
+    fn a_report_carries_the_times_of_its_measurement() {
+        let urr = DataPlaneUrr::new(1);
+        urr.set_measure_duration(true);
+        let created = std::time::SystemTime::now();
+        assert_eq!(urr.record(100, true), UrrOutcome::Continue);
+        urr.advance_measured(std::time::Duration::from_secs(7));
+        let (_, t) = urr.take_report(false);
+        assert!(t.start <= created + std::time::Duration::from_millis(50));
+        assert!(t.end >= t.start);
+        assert_eq!(
+            t.duration.map(|d| d.as_secs()),
+            Some(7),
+            "measured time, DURAT"
+        );
+        assert!(
+            t.first_pkt.is_some() && t.last_pkt.is_some(),
+            "traffic was seen"
+        );
+
+        let (_, t2) = urr.take_report(false);
+        assert_eq!(
+            t2.start, t.end,
+            "the next measurement starts where this ended"
+        );
+        assert_eq!(t2.first_pkt, None, "no traffic in it");
+
+        let plain = DataPlaneUrr::new(2);
+        let (_, t) = plain.take_report(false);
+        assert_eq!(t.duration, None, "no Duration Measurement without DURAT");
+    }
+
+    /// #953 review: the restore wiring through `DataPlane::restore_urr_usage` (what a
+    /// failed send or an N1 give-up calls) puts the times back -- the next report's
+    /// Start Time reaches back over the undelivered one -- but NOT when a newer report
+    /// has gone out meanwhile, which would make two reported windows overlap.
+    #[test]
+    fn restored_times_reach_back_only_if_no_newer_report_went_out() {
+        let dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        dp.add_session_from_pfcp(
+            0x953,
+            0x1953,
+            Ipv4Addr::new(10, 45, 9, 53),
+            0x9531,
+            0x9532,
+            "127.0.0.1:2152".parse().unwrap(),
+            Some(5),
+            Some(9),
+        );
+        let session = dp.sessions.find_by_seid(0x953).unwrap();
+        let urr = Arc::new(DataPlaneUrr::new(1));
+        urr.set_reporting(Some(1), None, None, None, None);
+        session.urrs.write().unwrap().insert(1, Arc::clone(&urr));
+
+        urr.record(10, true);
+        let lost = dp.collect_urr_reports();
+        dp.restore_urr_usage(&lost);
+        urr.record(10, true);
+        let next = dp.collect_urr_reports();
+        assert_eq!(next[0].times.start, lost[0].times.start, "reaches back");
+
+        // Now: A is lost, B goes out, THEN A is restored.
+        urr.record(10, true);
+        let a = dp.collect_urr_reports();
+        urr.record(10, true);
+        let b = dp.collect_urr_reports();
+        dp.restore_urr_usage(&a);
+        urr.record(10, true);
+        let c = dp.collect_urr_reports();
+        assert_eq!(
+            c[0].times.start, b[0].times.end,
+            "no overlap with B's window"
+        );
+        assert_eq!(c[0].total_bytes, 20, "but A's volume is carried");
+    }
+
+    /// #818: a report that was not delivered gives its time back with its usage: the
+    /// next report's Start Time and Duration reach back over it.
+    #[test]
+    fn an_undelivered_reports_times_are_carried_by_the_next_one() {
+        let urr = DataPlaneUrr::new(1);
+        urr.set_measure_duration(true);
+        urr.record(10, true);
+        urr.advance_measured(std::time::Duration::from_secs(4));
+        let (usage, lost) = urr.take_report(false);
+        urr.restore_usage(&usage);
+        urr.restore_times(&lost);
+        urr.advance_measured(std::time::Duration::from_secs(3));
+        let (_, next) = urr.take_report(false);
+        assert_eq!(next.start, lost.start);
+        assert_eq!(next.duration.map(|d| d.as_secs()), Some(7));
+        assert_eq!(next.first_pkt, lost.first_pkt);
+    }
+
+    /// #902, deterministically: a re-base waits for a packet that is mid-record. The
+    /// test plays the recorder -- holding the meter lock between the quota add and the
+    /// ongoing add, exactly where `record` holds it -- while a re-grant runs on another
+    /// thread. The re-grant must wait for the lock and then copy the COMPLETE ongoing
+    /// count; without the lock it copied the count from between the two adds and the
+    /// packet was lost from the quota for good.
+    #[test]
+    fn a_re_base_waits_for_a_packet_that_is_being_recorded() {
+        let urr = Arc::new(DataPlaneUrr::new(1));
+        urr.set_quotas(Some(1_000_000), None, None, None);
+        let meter = urr.meter.lock().unwrap();
+        urr.quota_used_total.fetch_add(500, Ordering::SeqCst);
+        let regrant = {
+            let urr = Arc::clone(&urr);
+            on_thread("regrant", move || {
+                urr.update_quotas(Some(2_000_000), None, None, None)
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        urr.acc_total_bytes.fetch_add(500, Ordering::SeqCst);
+        drop(meter);
+        regrant
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the re-grant completes once the packet is recorded");
+        assert_eq!(
+            urr.quota_used_total.load(Ordering::SeqCst),
+            500,
+            "the packet in flight counts against the new quota"
+        );
+    }
+
+    /// #902: re-basing a quota/threshold to the ongoing counts while packets are being
+    /// recorded loses none of them. A recorder records 200 000 packets while another
+    /// thread re-grants the quota and re-sets the threshold over and over; with no
+    /// report in between, the quota and threshold counts must end EXACTLY equal to the
+    /// ongoing count. Before, `store(acc.load())` overwrote concurrent adds.
+    #[test]
+    fn re_basing_while_packets_are_recorded_loses_no_bytes() {
+        let urr = Arc::new(DataPlaneUrr::new(1));
+        urr.set_quotas(Some(u64::MAX / 2), None, None, None);
+        urr.set_reporting(Some(u64::MAX / 2), None, None, None, None);
+        let done = Arc::new(AtomicBool::new(false));
+        let rebaser = {
+            let (urr, done) = (Arc::clone(&urr), Arc::clone(&done));
+            on_thread("rebaser", move || {
+                let mut n = 0u64;
+                while !done.load(Ordering::SeqCst) {
+                    urr.update_quotas(Some(u64::MAX / 2 - (n % 2)), None, None, None);
+                    urr.update_reporting(Some(u64::MAX / 2 - (n % 2)), None, None, None, None);
+                    n += 1;
+                }
+                n
+            })
+        };
+        for i in 0..200_000u64 {
+            urr.record(1 + (i % 7), i % 2 == 0);
+        }
+        done.store(true, Ordering::SeqCst);
+        let rounds = rebaser
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("rebaser stops");
+        assert!(rounds > 10, "the race was exercised: {rounds}");
+        let ongoing = urr.acc_total_bytes.load(Ordering::SeqCst);
+        assert_eq!(
+            urr.quota_used_total.load(Ordering::SeqCst),
+            ongoing,
+            "quota count"
+        );
+        assert_eq!(
+            urr.thr_used_total.load(Ordering::SeqCst),
+            ongoing,
+            "threshold count"
         );
     }
 
