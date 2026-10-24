@@ -33,6 +33,22 @@ pub struct DiameterConfig {
     /// not going to be answered.
     pub request_timeout: u32,
 
+    /// Watchdog timer Tw, in seconds (RFC 3539 §3.4.1, RFC 6733 §5.5): when
+    /// nothing has been received from the peer for Tw, a Device-Watchdog-Request
+    /// is sent, and when nothing answers it within another Tw the connection is
+    /// closed, so the application can redial. Default 30; values below the
+    /// RFC's 6-second floor are raised to it.
+    ///
+    /// The session has one peer, so RFC 3539's SUSPECT (whose action is
+    /// failover) closes the connection: it never returns from SUSPECT to OKAY.
+    /// A connection re-established after a failure starts in REOPEN and
+    /// carries application traffic only after three watchdog answers. Every
+    /// write is bounded by Tw and the socket's TCP_USER_TIMEOUT is 2 x Tw, so a
+    /// peer that stops reading cannot hold a write either. Against a server
+    /// peer that drops idle connections after 3 x Tc (e.g. one built on
+    /// `DiameterServer`), keep Tw below that; hssd drops none.
+    pub timer_tw: u32,
+
     /// Applications this node advertises in CER/CEA, and the vendors whose AVPs
     /// it understands (RFC 6733 §5.3).
     ///
@@ -66,6 +82,7 @@ impl Default for DiameterConfig {
             port_tls: crate::DIAMETER_TLS_PORT,
             timer_tc: 30,
             request_timeout: 30,
+            timer_tw: 30,
             // Empty: no application advertised, no peer refused. A daemon opts
             // in by populating this.
             applications: crate::applications::ApplicationRegistry::default(),

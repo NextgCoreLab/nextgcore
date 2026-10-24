@@ -55,7 +55,7 @@ From the clap `Args` struct in `src/bins/nextgcore-sgwcd/src/main.rs`:
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `-c, --config` | string | `/etc/nextgcore/sgwc.yaml` | Configuration file path. |
-| `-l, --log-level` | string | `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`); unrecognized values fall back to `info`. |
+| `-l, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `--no-color` | flag | off | Parsed but never read — currently has no effect. |
 | `-d, --daemon` | flag | off | Parsed but never read — currently has no effect. |
 
@@ -83,4 +83,4 @@ From the clap `Args` struct in `src/bins/nextgcore-sgwcd/src/main.rs`:
 - **Rejection semantics on S11** (per TS 29.274 tables cited in `s11_parse.rs` comments): a missing mandatory IE triggers a response with cause `MANDATORY_IE_MISSING` plus the offending IE type; an unknown header TEID gets `CONTEXT_NOT_FOUND`; Bearer Resource, Modify Bearer and Delete Bearer Commands are relayed to the PGW over S5/S8 (#606).
 - **GTPv2-C reliability defaults** come from `Gtp2XactConfig::default()` in `libs/nextgcore-gtp/src/v2/xact.rs`: T3-RESPONSE 3 s, N3-REQUESTS 3, responses cached for 12 s so retransmitted requests are answered identically without creating duplicate sessions. N3 exhaustion marks the peer path `Failed` (TS 29.274 §7.6 per code comment); a changed peer Recovery counter logs a stale-contexts warning and resets the path to `Idle` (TS 23.007 §18 per code comment).
 - **No NRF, no session store.** As an EPC NF the SGW-C has no SBI server and performs no NRF registration or heartbeat; UE/session/bearer/tunnel state is in-memory and lost on restart. Only the restart counter is persisted (`SGWC_RESTART_COUNTER_FILE`).
-- **`RUST_LOG` is ignored.** Logging is initialized via `env_logger::Builder::new().filter_level(...)` without env parsing, so the `RUST_LOG=info` set by the Docker compose files has no effect on this daemon; use `-l/--log-level`.
+- **`RUST_LOG` overrides `-l/--log-level`** when set, as in every NF.

@@ -82,9 +82,10 @@ struct Args {
     #[arg(short = 'l', long)]
     log_file: Option<String>,
 
-    /// Log level (trace, debug, info, warn, error)
-    #[arg(short = 'e', long, default_value = "info")]
-    log_level: String,
+    /// Log level (trace, debug, info, warn, error). Without it, the config
+    /// file's `logger.level`, else `info`; `RUST_LOG` overrides (#691).
+    #[arg(short = 'e', long)]
+    log_level: Option<String>,
 
     /// Disable color output
     #[arg(short = 'm', long)]
@@ -165,7 +166,8 @@ fn metrics_addr() -> SocketAddr {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(9090);
-    SocketAddr::from(([0, 0, 0, 0], port))
+    // Loopback unless NEXTGCORE_METRICS_BIND says otherwise (#837).
+    nextgcore_metrics::nes_energy::metrics_bind_addr(port)
 }
 
 /// Render this UPF/PGW-U's runtime state in Prometheus text format (#380).
@@ -435,6 +437,12 @@ async fn main() -> Result<()> {
                 // a backstop if this event is dropped (the URR's `threshold_exceeded` is
                 // also set), so the report cannot be lost, only duplicated -- and a
                 // duplicate carries its own UR-SEQN, which is what §8.2.60 exists for.
+                // #935: N3 path failure/recovery -> PFCP Node Report (§7.4.5.1).
+                data_plane::UpfReportEvent::PathReport { failure, peers } => {
+                    if let Err(e) = pfcp_for_reports.send_node_report(failure, &peers).await {
+                        log::warn!("User-plane path report for {peers:?} was NOT sent: {e}");
+                    }
+                }
                 data_plane::UpfReportEvent::QuotaExhausted {
                     upf_seid,
                     smf_seid,
@@ -528,43 +536,24 @@ async fn main() -> Result<()> {
     let pfcp_for_urr = pfcp_server.clone();
     let shutdown_urr = shutdown.clone();
     let urr_check_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+        // #772: every second, so a periodic report goes out within 1 s of its period
+        // boundary (it was up to 10 s, and the old reset-anchored check added that
+        // lateness to every following period). Detection is a read of atomics and one
+        // instant per URR; nothing is taken unless a report is due.
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
         loop {
             interval.tick().await;
             if shutdown_urr.load(Ordering::SeqCst) {
                 break;
             }
-            let reports = dp_for_urr.collect_urr_reports();
-            if reports.is_empty() {
-                continue;
-            }
-
-            // Group reports by (upf_seid, smf_seid) for batching
-            let mut grouped: std::collections::HashMap<
-                (u64, u64),
-                Vec<data_plane::UrrReportEntry>,
-            > = std::collections::HashMap::new();
-            for report in reports {
-                grouped
-                    .entry((report.upf_seid, report.smf_seid))
-                    .or_default()
-                    .push(report);
-            }
-
-            for ((upf_seid, smf_seid), session_reports) in grouped {
-                log::info!(
-                    "Sending {} URR reports for SEID={upf_seid:#x}",
-                    session_reports.len()
-                );
-                // The usage in these reports was TAKEN from the URRs (#771); a report
-                // that cannot be sent hands it back, so the next report carries it
-                // instead of it being lost (#780 review m2).
-                if let Err(e) = pfcp_for_urr
-                    .send_urr_report(upf_seid, smf_seid, session_reports.clone())
-                    .await
-                {
-                    log::error!("Failed to send URR report: {e}");
-                    dp_for_urr.restore_urr_usage(&session_reports);
+            // #821: detect here, TAKE inside the PFCP server while it holds the session,
+            // so a Session Deletion cannot slip between the take and the send.
+            for (upf_seid, smf_seid) in dp_for_urr.due_urr_sessions() {
+                match pfcp_for_urr.send_due_urr_reports(upf_seid, smf_seid).await {
+                    Ok(0) => {}
+                    Ok(n) => log::info!("Sent {n} URR reports for SEID={upf_seid:#x}"),
+                    // The usage was handed back to its URRs (#780 m2).
+                    Err(e) => log::error!("Failed to send URR report: {e}"),
                 }
             }
         }
@@ -720,21 +709,11 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
 
 /// Initialize logging based on command line arguments
 fn init_logging(args: &Args) -> Result<()> {
-    let mut builder = env_logger::Builder::new();
-
-    // Set log level
-    let level = match args.log_level.to_lowercase().as_str() {
-        "trace" => log::LevelFilter::Trace,
-        "debug" => log::LevelFilter::Debug,
-        "info" => log::LevelFilter::Info,
-        "warn" => log::LevelFilter::Warn,
-        "error" => log::LevelFilter::Error,
-        _ => log::LevelFilter::Info,
-    };
-    builder.filter_level(level);
-
-    // Configure format
-    builder.format_timestamp_millis();
+    // RUST_LOG if set, else --log-level: the same for every NF (#691).
+    let mut builder = nextgcore_core::log::nf_log_builder(&nextgcore_core::log::nf_log_level(
+        args.log_level.as_deref(),
+        Some(&args.config),
+    ));
 
     if args.no_color {
         builder.write_style(env_logger::WriteStyle::Never);
@@ -1204,7 +1183,11 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                     for u in &updated_urrs {
                         match dp_urrs.get(&u.urr_id) {
                             Some(urr) => {
-                                urr.set_reporting(
+                                // #842 review (TS 29.244 §7.5.4): only the IEs the Update
+                                // URR CARRIES change; an absent one is unchanged. Applying
+                                // it through the Create setters turned every absent IE
+                                // into "unprovisioned".
+                                urr.update_reporting(
                                     u.volume_threshold_total,
                                     u.volume_threshold_ul,
                                     u.volume_threshold_dl,
@@ -1217,7 +1200,7 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                                 // forwarding. That is what makes a quota a quota rather
                                 // than a teardown, and it is the reason the latch lives
                                 // where a re-provision can reach it.
-                                urr.set_quotas(
+                                urr.update_quotas(
                                     u.volume_quota_total,
                                     u.volume_quota_ul,
                                     u.volume_quota_dl,
@@ -1381,7 +1364,7 @@ mod tests {
     fn test_args_default() {
         let args = Args::parse_from(["nextgcore-upfd"]);
         assert_eq!(args.config, "/etc/nextgcore/upf.yaml");
-        assert_eq!(args.log_level, "info");
+        assert_eq!(args.log_level, None);
         assert_eq!(args.pfcp_addr, "127.0.0.4");
         assert_eq!(args.pfcp_port, 8805);
         assert_eq!(args.gtpu_addr, "127.0.0.4");
@@ -1414,7 +1397,7 @@ mod tests {
             "2048",
         ]);
         assert_eq!(args.config, "/custom/upf.yaml");
-        assert_eq!(args.log_level, "debug");
+        assert_eq!(args.log_level.as_deref(), Some("debug"));
         assert_eq!(args.pfcp_addr, "10.0.0.1");
         assert_eq!(args.pfcp_port, 8806);
         assert_eq!(args.gtpu_addr, "10.0.0.2");
@@ -1529,6 +1512,10 @@ mod tests {
         // healthcheck curls. A default that drifted from those would leave the gate
         // polling a closed socket.
         assert_eq!(metrics_addr().port(), 9090);
+        // #837: unauthenticated, so loopback unless the deployment opts in.
+        if std::env::var_os(nextgcore_metrics::nes_energy::METRICS_BIND_ENV).is_none() {
+            assert!(metrics_addr().ip().is_loopback(), "{}", metrics_addr());
+        }
     }
 
     // ------------------------------------------------------------------

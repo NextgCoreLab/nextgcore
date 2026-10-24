@@ -535,7 +535,8 @@ impl AttachReject {
                     buf.skip(1)?;
                     set_first(&mut msg.t3402_value, optional_tlv(buf, GprsTimer2::decode)?);
                 }
-                _ => break,
+                // An unknown IE is ignored, not the end of the message (§7.6.1, #810).
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
 
@@ -648,7 +649,20 @@ impl TrackingAreaUpdateAccept {
                     buf.skip(1)?;
                     set_first(&mut msg.tai_list, optional_tlv(buf, EpsTaiList::decode)?);
                 }
-                _ => break,
+                // Location area (TV 6): not modelled; type 3, so skipped by its
+                // fixed length (TS 24.301 clause 8, #810).
+                0x13 => buf.skip(6)?,
+                // EMM cause (TV 2): not modelled; type 3, so skipped by its
+                // fixed length (TS 24.301 clause 8, #810).
+                0x53 => buf.skip(2)?,
+                // T3402 value (TV 2): not modelled; type 3, so skipped by its
+                // fixed length (TS 24.301 clause 8, #810).
+                0x17 => buf.skip(2)?,
+                // T3423 value (TV 2): not modelled; type 3, so skipped by its
+                // fixed length (TS 24.301 clause 8, #810).
+                0x59 => buf.skip(2)?,
+                // An unknown IE is ignored, not the end of the message (§7.6.1, #810).
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
 
@@ -774,7 +788,8 @@ impl EpsAuthenticationFailure {
                         optional_tlv(buf, |b| Ok(b.read_lv(IeLen::Exact(14))?.to_vec()))?,
                     );
                 }
-                _ => break,
+                // An unknown IE is ignored, not the end of the message (§7.6.1, #810).
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
 
@@ -842,7 +857,8 @@ impl EpsSecurityModeCommand {
                     buf.read_into(&mut nonce)?;
                     msg.nonce_mme = Some(nonce);
                 }
-                _ => break,
+                // An unknown IE is ignored, not the end of the message (§7.6.1, #810).
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
 
@@ -871,7 +887,8 @@ impl EpsSecurityModeComplete {
                     buf.skip(1)?;
                     set_first(&mut msg.imeisv, Some(opaque_tlv(buf)?));
                 }
-                _ => break,
+                // An unknown IE is ignored, not the end of the message (§7.6.1, #810).
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
 
@@ -995,7 +1012,9 @@ pub struct ExtendedServiceRequest {
     pub m_tmsi: EpsMobileIdentity,
     /// CSFB response
     pub csfb_response: Option<u8>,
-    /// EPS bearer context status
+    /// EPS bearer context status: bit n is EBI n (TS 24.301 §9.9.2.1; octet 3
+    /// carries EBI(7)..EBI(0), octet 4 EBI(15)..EBI(8)), the convention mmed's
+    /// `emm_build::eps_bearer_context_status` uses.
     pub eps_bearer_context_status: Option<u16>,
 }
 
@@ -1009,7 +1028,9 @@ impl ExtendedServiceRequest {
         if let Some(status) = self.eps_bearer_context_status {
             buf.put_u8(0x57); // IEI
             buf.put_u8(2); // Length
-            buf.put_u16(status);
+                           // §9.9.2.1: octet 3 first, EBI(7)..EBI(0): the low byte (#961).
+            buf.put_u8((status & 0xff) as u8);
+            buf.put_u8((status >> 8) as u8);
         }
     }
 
@@ -1044,7 +1065,12 @@ impl ExtendedServiceRequest {
                     buf.skip(1)?;
                     set_first(
                         &mut msg.eps_bearer_context_status,
-                        optional_tlv(buf, |b| b.read_lv(IeLen::Exact(2))?.read_u16())?,
+                        optional_tlv(buf, |b| {
+                            let mut v = b.read_lv(IeLen::Exact(2))?;
+                            let octet3 = v.read_u8()?;
+                            let octet4 = v.read_u8()?;
+                            Ok(u16::from_le_bytes([octet3, octet4]))
+                        })?,
                     );
                 }
                 _ => skip_unknown_ie(buf, iei)?,
@@ -1101,7 +1127,11 @@ impl EpsServiceReject {
                     buf.skip(1)?;
                     set_first(&mut msg.t3448_value, optional_tlv(buf, GprsTimer2::decode)?);
                 }
-                _ => break,
+                // T3442 value (TV 2): not modelled; type 3, so skipped by its
+                // fixed length (TS 24.301 clause 8, #810).
+                0x5B => buf.skip(2)?,
+                // An unknown IE is ignored, not the end of the message (§7.6.1, #810).
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -1139,7 +1169,8 @@ impl GutiReallocationCommand {
                     buf.skip(1)?;
                     set_first(&mut msg.tai_list, optional_tlv(buf, EpsTaiList::decode)?);
                 }
-                _ => break,
+                // An unknown IE is ignored, not the end of the message (§7.6.1, #810).
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -1224,7 +1255,8 @@ impl EmmInformation {
                         optional_tlv(buf, |b| b.read_lv(IeLen::Exact(1))?.read_u8())?,
                     );
                 }
-                _ => break,
+                // An unknown IE is ignored, not the end of the message (§7.6.1, #810).
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -1890,7 +1922,11 @@ impl ModifyEpsBearerContextRequest {
                     buf.skip(1)?;
                     set_first(&mut msg.tft, Some(opaque_tlv(buf)?));
                 }
-                _ => break,
+                // Negotiated LLC (TV 2): not modelled; type 3, so skipped by its
+                // fixed length (TS 24.301 clause 8, #810).
+                0x32 => buf.skip(2)?,
+                // An unknown IE is ignored, not the end of the message (§7.6.1, #810).
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -1925,7 +1961,8 @@ impl ModifyEpsBearerContextAccept {
                         Some(opaque_tlv(buf)?),
                     );
                 }
-                _ => break,
+                // An unknown IE is ignored, not the end of the message (§7.6.1, #810).
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -2012,7 +2049,8 @@ impl EsmInformationResponse {
                         Some(opaque_tlv(buf)?),
                     );
                 }
-                _ => break,
+                // An unknown IE is ignored, not the end of the message (§7.6.1, #810).
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)

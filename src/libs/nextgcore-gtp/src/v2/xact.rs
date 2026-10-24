@@ -314,6 +314,12 @@ impl Gtp2XactMgr {
         }
     }
 
+    /// Whether a locally originated request to `peer` at `sequence_number` is
+    /// outstanding (a new one there would replace it).
+    pub fn is_outstanding(&self, peer: SocketAddr, sequence_number: u32) -> bool {
+        self.local.contains_key(&(peer, sequence_number))
+    }
+
     /// Number of outstanding locally originated requests
     pub fn outstanding(&self) -> usize {
         self.local.len()
@@ -360,6 +366,17 @@ impl Gtp2XactMgr {
                 expires: Instant::now() + self.config.response_hold,
             },
         );
+    }
+
+    /// Drop the cached responses whose hold has expired, without touching the
+    /// locally originated requests [`Self::poll`] would also retransmit.
+    pub fn expire_responses(&mut self, now: Instant) {
+        self.responses.retain(|_, cached| cached.expires > now);
+    }
+
+    /// The number of cached responses, expired or not.
+    pub fn cached_response_count(&self) -> usize {
+        self.responses.len()
     }
 
     /// Look up a previously sent response for a (possibly retransmitted)

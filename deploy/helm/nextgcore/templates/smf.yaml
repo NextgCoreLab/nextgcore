@@ -1,4 +1,7 @@
 {{- if .Values.smf.enabled }}
+{{- if gt (int .Values.smf.replicas) 1 }}
+{{- fail "smf.replicas must be 1: every SMF pod signals the same PFCP Node ID, and a UPF keeps one association per Node ID (TS 29.244 §6.2.6.2.2), so a second pod would replace the first one's association and delete its sessions (#718)" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -10,6 +13,14 @@ metadata:
     {{- include "nextgcore.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.smf.replicas }}
+  # #718: never two SMF pods at once. Both signal the same PFCP Node ID (the
+  # Service FQDN, #797), and a UPF that receives an Association Setup for a Node
+  # ID it already has an association with replaces it, deleting the existing
+  # association's sessions unless retention is requested (TS 29.244 §6.2.6.2.2).
+  # A RollingUpdate surge pod holds no sessions, so it would delete every session
+  # of the pod still serving the UEs. Recreate stops the old pod first.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: smf
@@ -22,6 +33,10 @@ spec:
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
     spec:
+      # #718: a graceful SMF shutdown releases each UPF association (up to
+      # T1 x N1 = 9 s when a UPF is gone), sends every UE #39 and keeps
+      # retransmitting its S5/S8 Delete Bearer Requests for up to 12 s.
+      terminationGracePeriodSeconds: 45
       initContainers:
         {{- include "nextgcore.advertiseInit" (dict "nf" "smf") | nindent 8 }}
         {{- include "nextgcore.waitForNrf" . | nindent 8 }}
@@ -57,8 +72,25 @@ spec:
               value: {{ .Values.global.logLevel }}
             - name: RUST_BACKTRACE
               value: "1"
+            # /metrics defaults to 127.0.0.1 (#837); in the pod it must accept the
+            # pod IP for Prometheus and the kubelet. Not exposed beyond the cluster.
+            - name: NEXTGCORE_METRICS_BIND
+              value: "0.0.0.0"
             - name: SMF_PFCP_ADDR
               value: "0.0.0.0"
+            # #797: the PFCP Node ID identifies this CP function (TS 29.244
+            # §5.8.1). The Service FQDN survives a pod restart; 0.0.0.0 identified
+            # nothing and the pod IP changes on every restart.
+            - name: SMF_PFCP_NODE_ID
+              value: "{{ .Release.Name }}-smf.{{ .Release.Namespace }}.svc.cluster.local"
+            # The CP F-SEID carries this pod's IP, which the UPF sends Session
+            # Report Requests to (TS 29.244 §8.2.37).
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: SMF_PFCP_ADVERTISE_ADDR
+              value: "$(POD_IP)"
             {{- if .Values.upf.enabled }}
             # A hostname is re-resolved on every Association Setup attempt
             # (#658), so a restarted UPF pod at a new IP is found again.

@@ -57,12 +57,12 @@
 
 // Helper functions
 
-/// Convert hex string to bytes
+/// Convert hex string to bytes. Empty for malformed input (odd length or a
+/// non-hex character): every caller checks the decoded length, so a bad
+/// value is refused there rather than panicking here (#765). Before #765 an
+/// odd length or a multi-byte character panicked, and bad pairs were dropped.
 pub fn hex_to_bytes(hex: &str) -> Vec<u8> {
-    (0..hex.len())
-        .step_by(2)
-        .filter_map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
-        .collect()
+    nextgcore_core::conv::hex_decode(hex).unwrap_or_default()
 }
 
 /// Convert bytes to hex string

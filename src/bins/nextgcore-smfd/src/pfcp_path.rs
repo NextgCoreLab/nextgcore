@@ -19,7 +19,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes};
 use nextgcore_pfcp::message::{
     build_message, AssociationReleaseRequest, AssociationSetupRequest, AssociationSetupResponse,
     HeartbeatRequest, HeartbeatResponse, PfcpMessage,
@@ -266,7 +266,13 @@ pub struct PfcpClient {
     /// The hostname and port `peer` was resolved from, when the operator named
     /// the UPF rather than giving a literal address (#658).
     peer_host: Option<(String, u16)>,
+    /// The IPv4 address carried in every CP F-SEID (TS 29.244 §8.2.37): the
+    /// routable address the UPF sends this SMF's session-level requests to (#797).
     node_ip: [u8; 4],
+    /// The PFCP Node ID that identifies this CP function (TS 29.244 §5.8.1,
+    /// §8.2.38). Separate from `node_ip` since #797: on k8s it is the Service FQDN,
+    /// stable across restarts, while the F-SEID address is the pod IP.
+    node_id: NodeId,
     /// Our own Recovery Time Stamp (seconds since the epoch at startup)
     pub recovery_time_stamp: u32,
     pending: Mutex<HashMap<u32, oneshot::Sender<(u8, Vec<u8>)>>>,
@@ -623,13 +629,17 @@ pub fn parse_upf_peer(entry: &str, default_port: u16) -> Result<UpfPeerSpec, Str
 pub async fn client_for_peer(
     socket: Arc<UdpSocket>,
     spec: &UpfPeerSpec,
-    node_ip: [u8; 4],
+    identity: &crate::n4_identity::N4Identity,
 ) -> PfcpClient {
+    let node_ip = identity.f_seid_ipv4;
     match spec {
-        UpfPeerSpec::Literal(sa) => PfcpClient::new(socket, *sa, node_ip),
+        UpfPeerSpec::Literal(sa) => {
+            PfcpClient::new(socket, *sa, node_ip).with_node_id(identity.node_id.clone())
+        }
         UpfPeerSpec::Hostname(host, port) => {
             let unresolved = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), *port);
             let client = PfcpClient::new(socket, unresolved, node_ip)
+                .with_node_id(identity.node_id.clone())
                 .with_peer_hostname(host.clone(), *port);
             if client.reresolve_peer().await.is_none() {
                 log::warn!(
@@ -655,15 +665,14 @@ pub async fn try_associate(client: &PfcpClient) -> Result<(), PfcpRequestError> 
 impl PfcpClient {
     /// Create a client bound to an existing N4 socket.
     pub fn new(socket: Arc<UdpSocket>, peer: SocketAddr, node_ip: [u8; 4]) -> Self {
-        let recovery_time_stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as u32)
-            .unwrap_or(1);
+        // #995: NTP-era seconds (TS 29.244 §8.2.65), not Unix seconds.
+        let recovery_time_stamp = nextgcore_pfcp::recovery_time::now();
         Self {
             socket,
             peer: std::sync::RwLock::new(peer),
             peer_host: None,
             node_ip,
+            node_id: NodeId::new_ipv4(node_ip),
             recovery_time_stamp,
             pending: Mutex::new(HashMap::new()),
             assoc: RwLock::new(AssociationState::default()),
@@ -766,9 +775,21 @@ impl PfcpClient {
         Some(resolved)
     }
 
-    /// Our Node ID address.
+    /// The IPv4 address of this SMF's CP F-SEID (#797: not necessarily the Node ID).
     pub fn node_ip(&self) -> [u8; 4] {
         self.node_ip
+    }
+
+    /// The PFCP Node ID this SMF signals (TS 29.244 §8.2.38).
+    pub fn node_id(&self) -> &NodeId {
+        &self.node_id
+    }
+
+    /// Signal `node_id` as this SMF's PFCP Node ID instead of the F-SEID address
+    /// (#797).
+    pub fn with_node_id(mut self, node_id: NodeId) -> Self {
+        self.node_id = node_id;
+        self
     }
 
     /// Whether the N4 association is currently established.
@@ -794,12 +815,16 @@ impl PfcpClient {
     /// Deliberately does **not** set `associated`: the association still has to be
     /// established on the wire. Only the restart-detection input is restored.
     pub async fn seed_peer_recovery_time_stamp(&self, rts: u32) {
+        // #995: a pre-#995 snapshot holds the stamp a pre-#995 UPF sent, in Unix
+        // seconds; compared raw with an NTP one it would read as a restart (or, on a
+        // Heartbeat Request, as 70 years older and be discarded).
+        let rts = nextgcore_pfcp::recovery_time::normalize_received(rts);
         let mut assoc = self.assoc.write().await;
         assoc.peer_recovery_time_stamp = Some(rts);
         log::info!(
             "PFCP {}: seeded peer Recovery Time Stamp {rts} from durable state; a different \
              stamp at Association Setup will flush the restored sessions",
-            self.peer()
+            self.recovery_time_stamp_key()
         );
     }
 
@@ -953,13 +978,6 @@ impl PfcpClient {
         // Node-level requests handled by the engine
         match header.msg_type {
             pfcp_message_type::HEARTBEAT_REQUEST => {
-                // Staleness detection on the peer's Recovery Time Stamp
-                if let Some(rts) = find_ie(body, 96)
-                    .filter(|v| v.len() >= 4)
-                    .map(|v| u32::from_be_bytes([v[0], v[1], v[2], v[3]]))
-                {
-                    self.check_peer_restart(rts).await;
-                }
                 // Issue #20: the UPF may piggy-back its load metric (Load
                 // Control Information) on the heartbeat. Store it for
                 // load-aware selection, discarding stale sequence numbers.
@@ -988,21 +1006,56 @@ impl PfcpClient {
                 } else {
                     log::debug!("Heartbeat Response sent to {from}");
                 }
+                // #721: staleness detection on the peer's Recovery Time Stamp, AFTER
+                // the response: the restarted UPF must not declare this SMF dead
+                // while its sessions are released, and the releases themselves run
+                // off this task.
+                //
+                // #928 review M3: and only for this client's own UPF. TS 23.007 §19A
+                // associates the stamp with the PFCP entity at the message's source
+                // address; a Heartbeat Request from anyone else is answered (above, as
+                // §19A requires even for unknown peers) but tears nothing down. The
+                // listener routes an unknown source to pool slot 0, so before this any
+                // host reaching N4 could release every UE on that UPF.
+                if same_pfcp_node(from, self.peer()) {
+                    if let Some(rts) = find_ie(body, 96)
+                        .filter(|v| v.len() >= 4)
+                        .map(|v| u32::from_be_bytes([v[0], v[1], v[2], v[3]]))
+                    {
+                        self.check_peer_restart_detached(rts, StampSource::Request)
+                            .await;
+                    }
+                }
                 true
             }
             pfcp_message_type::ASSOCIATION_RELEASE_REQUEST => {
-                log::warn!("PFCP Association Release Request from {from}");
-                // Respond Node ID + Cause accepted via the library codec
+                // #928 review M3: only the associated UPF can release its association.
+                let ours = same_pfcp_node(from, self.peer());
+                log::warn!(
+                    "PFCP Association Release Request from {from}{}",
+                    if ours {
+                        ""
+                    } else {
+                        " (not this association's UPF: refused)"
+                    }
+                );
+                let cause = if ours {
+                    nextgcore_pfcp::types::PfcpCause::RequestAccepted
+                } else {
+                    nextgcore_pfcp::types::PfcpCause::NoEstablishedPfcpAssociation
+                };
                 let msg = PfcpMessage::AssociationReleaseResponse(
                     nextgcore_pfcp::message::AssociationReleaseResponse::new(
-                        NodeId::new_ipv4(self.node_ip),
-                        nextgcore_pfcp::types::PfcpCause::RequestAccepted,
+                        self.node_id.clone(),
+                        cause,
                     ),
                 );
                 let resp = build_message(&msg, header.sequence_number, None);
                 let _ = self.socket.send_to(&resp, from).await;
-                self.teardown_association("association released by peer")
-                    .await;
+                if ours {
+                    // #721: the per-session releases run off the receive task.
+                    track_restart_fanout(self.begin_teardown("association released by peer").await);
+                }
                 true
             }
             _ => false, // e.g. Session Report Request — handled by main.rs
@@ -1012,22 +1065,89 @@ impl PfcpClient {
     /// Compare a peer Recovery Time Stamp with the stored value; a change
     /// means the UPF restarted: all sessions on it are gone (TS 23.527 4.2).
     pub async fn check_peer_restart(&self, rts: u32) {
-        let restarted = {
-            let assoc = self.assoc.read().await;
-            matches!(assoc.peer_recovery_time_stamp, Some(stored) if stored != rts)
-        };
-        if restarted {
-            log::error!(
-                "UPF {} restarted (recovery time stamp changed to {rts})",
-                self.peer()
-            );
-            self.teardown_association("peer restarted").await;
-            // Remember the new incarnation so re-association succeeds
-            self.assoc.write().await.peer_recovery_time_stamp = Some(rts);
-            // Issue #191: durably too, so a restart detected on a heartbeat is not
-            // re-detected (or worse, missed) after an SMF restart.
-            self.record_peer_recovery_time_stamp(rts);
+        if let Some(releases) = self.detect_peer_restart(rts, StampSource::Response).await {
+            let _ = releases.await;
         }
+    }
+
+    /// [`Self::check_peer_restart`] for the N4 receive task (#721): the teardown
+    /// itself (association down, this UPF's sessions flushed) is done when this
+    /// returns, but the per-session releases run on in their own task. Awaiting them
+    /// here stalled every PFCP message from every UPF for the whole fan-out.
+    async fn check_peer_restart_detached(&self, rts: u32, source: StampSource) {
+        if let Some(releases) = self.detect_peer_restart(rts, source).await {
+            track_restart_fanout(releases);
+        }
+    }
+
+    /// Detect a peer restart and tear the association down. `Some(fan-out)` when a
+    /// restart was detected, the per-session releases still running in it.
+    async fn detect_peer_restart(
+        &self,
+        rts: u32,
+        source: StampSource,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        // #995: compared in the NTP reading, whatever the UPF's nextgcore version.
+        let rts = nextgcore_pfcp::recovery_time::normalize_received(rts);
+        // TS 23.007 §19A, under one write guard (#928 review m2): the new stamp is
+        // stored at once, so a second path seeing the same stamp (the receive task's
+        // Heartbeat Request and the maintenance task's Heartbeat Response) finds it
+        // stored and tears nothing down twice. With none stored, the received one is
+        // stored.
+        //
+        // Which change is a restart (#928 round 2, B1):
+        // - in the RESPONSE to our own request, any change: the UPF answering now is a
+        //   different incarnation, whatever its clock says. Discarding a smaller stamp
+        //   there kept a UPF that came back with its clock behind, or past the 2036
+        //   wrap, "associated" for good, with every new session refused;
+        // - in an unsolicited Heartbeat REQUEST, a stamp NEWER than the stored one in
+        //   serial arithmetic (RFC 1982, so the 2036 wrap counts as newer). An older
+        //   one is "a possible race condition (newer message arriving before the older
+        //   one)": discarded and logged.
+        let restarted = {
+            let mut assoc = self.assoc.write().await;
+            match assoc.peer_recovery_time_stamp {
+                Some(stored) if rts == stored => false,
+                Some(stored) => match source {
+                    StampSource::Response => {
+                        assoc.peer_recovery_time_stamp = Some(rts);
+                        true
+                    }
+                    StampSource::Request if stamp_is_newer(rts, stored) => {
+                        assoc.peer_recovery_time_stamp = Some(rts);
+                        true
+                    }
+                    StampSource::Request => {
+                        log::error!(
+                            "UPF {}: Recovery Time Stamp {rts} in a Heartbeat Request is older \
+                             than the stored {stored}; discarded as a reordered message \
+                             (TS 23.007 §19A)",
+                            self.peer()
+                        );
+                        false
+                    }
+                },
+                None => {
+                    assoc.peer_recovery_time_stamp = Some(rts);
+                    false
+                }
+            }
+        };
+        if !restarted {
+            return None;
+        }
+        log::error!(
+            "UPF {} restarted (recovery time stamp changed to {rts})",
+            self.peer()
+        );
+        let releases = self.begin_teardown("peer restarted").await;
+        // Remember the new incarnation so re-association succeeds (already stored
+        // above; written again in case the teardown's state update raced it).
+        self.assoc.write().await.peer_recovery_time_stamp = Some(rts);
+        // Issue #191: durably too, so a restart detected on a heartbeat is not
+        // re-detected (or worse, missed) after an SMF restart.
+        self.record_peer_recovery_time_stamp(rts);
+        Some(releases)
     }
 
     /// Mark the association down and flush all PFCP session state.
@@ -1039,11 +1159,27 @@ impl PfcpClient {
     /// Previously this cleared the map, logged a count, and left every AMF
     /// believing in contexts that could not carry a packet.
     async fn teardown_association(&self, reason: &str) {
+        let releases = self.begin_teardown(reason).await;
+        let _ = releases.await;
+    }
+
+    /// [`Self::teardown_association`] up to the per-session releases, which are
+    /// returned still running (#721).
+    async fn begin_teardown(&self, reason: &str) -> tokio::task::JoinHandle<()> {
         #[cfg(test)]
         assert_teardown_is_serialised();
-        let notified = crate::restoration::notify_sessions_unrecoverable(reason).await;
+        #[cfg(test)]
+        TEARDOWNS_FOR_TEST.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // #720: only the sessions on THIS UPF. A pool member's restart, release or
+        // heartbeat loss says nothing about the sessions on the other members, which
+        // are alive; releasing them sent every UE in the pool a #39 and orphaned
+        // their sessions on the healthy UPFs.
+        let scope = self.session_scope();
+        let (notified, releases) =
+            crate::restoration::begin_unrecoverable_release(reason, Some(&scope));
         // #687: the EPC PDN connections on this PGW-U, which have no SM context.
-        let epc_released = crate::restoration::release_epc_pdn_connections(reason).await;
+        let epc_released =
+            crate::restoration::release_epc_pdn_connections_in(reason, Some(&scope)).await;
         {
             let mut assoc = self.assoc.write().await;
             assoc.associated = false;
@@ -1055,24 +1191,38 @@ impl PfcpClient {
             assoc.peer_load_seq = None;
             self.publish_associated(&assoc);
         }
-        let cleared = clear_pfcp_sessions();
+        let cleared = clear_pfcp_sessions_in(&scope);
         log::warn!(
-            "PFCP association torn down ({reason}); {cleared} stale sessions flushed, \
+            "PFCP association with {} torn down ({reason}); {cleared} stale sessions flushed, \
              {notified} AMF status callback(s) notified, {epc_released} EPC PDN \
-             connection(s) deleted toward the SGW"
+             connection(s) deleted toward the SGW",
+            self.peer()
         );
+        releases
     }
 
     /// Run the PFCP Association Setup procedure (TS 29.244 6.2.6).
     pub async fn associate(&self) -> Result<(), PfcpRequestError> {
-        let mut req =
-            AssociationSetupRequest::new(NodeId::new_ipv4(self.node_ip), self.recovery_time_stamp);
+        let mut req = AssociationSetupRequest::new(self.node_id.clone(), self.recovery_time_stamp);
         // CP Function Features: none of the optional CP features (LOAD,
         // OVRL, …) are implemented, so all bits are honestly zero.
         req.cp_function_features = Some(CpFunctionFeatures::default());
         let msg = PfcpMessage::AssociationSetupRequest(req);
         let mut buf = bytes::BytesMut::new();
         msg.encode_body(&mut buf);
+        // #718, TS 29.244 §6.2.6.2.1: a CP function that holds PFCP sessions asks
+        // the UP function to keep them. Without the IE a conformant UP function
+        // deletes every session of an existing association for this Node ID
+        // (§6.2.6.2.2). That is right for a fresh incarnation, which knows none of
+        // them, and wrong for one that restored them from durable state, or for this
+        // same incarnation re-associating after a lost heartbeat. Empty, so every
+        // session is kept (Table 7.4.4.1-2): the IE's CP PFCP Entity IP Addresses
+        // name CP F-SEID addresses, and every session here carries this one node's.
+        let retention_requested = holds_pfcp_sessions_on(self);
+        if retention_requested {
+            buf.put_u16(PFCP_SESSION_RETENTION_INFORMATION);
+            buf.put_u16(0);
+        }
 
         let (resp_type, resp_body) = self
             .request(pfcp_message_type::ASSOCIATION_SETUP_REQUEST, None, &buf)
@@ -1095,12 +1245,40 @@ impl PfcpClient {
         }
 
         // Restart detection against any previously stored timestamp
-        self.check_peer_restart(resp.recovery_time_stamp).await;
+        // #928 review M1: the teardown (association down, this UPF's sessions flushed)
+        // is done when this returns, but its #39 fan-out runs on, tracked. Awaiting it
+        // here held the one association/heartbeat task, which serves every pool
+        // member, for the whole fan-out, and kept this UPF unassociated while the UEs
+        // that got #39 came back to re-establish.
+        // #995: the stamp in the NTP reading (a pre-#995 UPF sends Unix seconds).
+        let peer_rts = nextgcore_pfcp::recovery_time::normalize_received(resp.recovery_time_stamp);
+        let restarted = match self
+            .detect_peer_restart(peer_rts, StampSource::Response)
+            .await
+        {
+            Some(releases) => {
+                track_restart_fanout(releases);
+                true
+            }
+            None => false,
+        };
+        // #718: retention was asked for and the UP function did not confirm it
+        // (PSREI, TS 29.244 §8.2.134). The sessions are gone there: it deleted them,
+        // or it never had them. Believing them anyway would leave every one dead
+        // until the UE noticed, so release them as a restart would.
+        if retention_requested && !restarted && !sessions_retained(&resp_body) {
+            log::warn!(
+                "UPF {} did not retain the PFCP sessions this SMF holds (no PSREI in the \
+                 Association Setup Response)",
+                self.peer()
+            );
+            track_restart_fanout(self.begin_teardown("UPF did not retain the sessions").await);
+        }
 
         {
             let mut assoc = self.assoc.write().await;
             assoc.associated = true;
-            assoc.peer_recovery_time_stamp = Some(resp.recovery_time_stamp);
+            assoc.peer_recovery_time_stamp = Some(peer_rts);
             assoc.up_function_features = resp.up_function_features;
             self.publish_associated(&assoc);
             log::info!(
@@ -1116,16 +1294,99 @@ impl PfcpClient {
         // Issue #191: record the stamp durably so the NEXT process can compare
         // against it. Scoped after the async guard drops, and the std lock is not
         // held across an await.
-        self.record_peer_recovery_time_stamp(resp.recovery_time_stamp);
+        self.record_peer_recovery_time_stamp(peer_rts);
         Ok(())
     }
 
     /// Store the peer's Recovery Time Stamp in the SMF context so it reaches the
     /// durable snapshot (issue #191). A no-op when persistence is disabled.
     fn record_peer_recovery_time_stamp(&self, rts: u32) {
-        let peer = self.peer().to_string();
+        let key = self.recovery_time_stamp_key();
         if let Ok(ctx) = smf_self().read() {
-            ctx.note_upf_recovery_time_stamp(&peer, rts);
+            ctx.note_upf_recovery_time_stamp(&key, rts);
+        }
+        self.retire_address_key();
+    }
+
+    /// The key of this UPF's durable Recovery Time Stamp (#722): the configured
+    /// `host:port` for a UPF named by hostname, the address otherwise.
+    ///
+    /// Keyed by the resolved address, a UPF that moved while the SMF was down (a pod
+    /// rescheduled in the same node drain), or whose name did not resolve yet at
+    /// startup (`0.0.0.0:8805`), found no seed. Without one the first Association
+    /// Setup could not detect the restart, and the restored sessions it no longer held
+    /// were believed in. The name is lower-cased and loses a trailing root dot, so a
+    /// cosmetic configuration edit does not drop the seed (#930 review m2).
+    ///
+    /// A hostname must name exactly one UPF: TS 23.007 §19A ties a remote stamp to one
+    /// PFCP entity, and a name resolving to several pods would share one durable seed.
+    pub fn recovery_time_stamp_key(&self) -> String {
+        match &self.peer_host {
+            Some((host, port)) => {
+                let host = host.trim_end_matches('.').to_ascii_lowercase();
+                format!("{host}:{port}")
+            }
+            None => self.peer().to_string(),
+        }
+    }
+
+    /// The address key a pre-#722 snapshot kept a hostname UPF's stamp under.
+    /// `None` for a literal UPF, whose key is the address, and when a literal pool
+    /// member owns that address (its key, not a legacy one).
+    fn legacy_address_key(&self) -> Option<String> {
+        self.peer_host.as_ref()?;
+        let addr = self.peer();
+        if addr.ip().is_unspecified() {
+            return None;
+        }
+        let owned_by_literal = global_pool()
+            .iter()
+            .any(|c| c.peer_host.is_none() && c.peer() == addr);
+        (!owned_by_literal).then(|| addr.to_string())
+    }
+
+    /// Remove the legacy address key once the name key is authoritative (#930 review
+    /// M3). Left in place, a stale stamp there declared a false restart, releasing
+    /// every UE on the UPF, after a rollback or a switch to the literal address.
+    fn retire_address_key(&self) {
+        if let Some(key) = self.legacy_address_key() {
+            if let Ok(ctx) = smf_self().read() {
+                ctx.forget_upf_recovery_time_stamp(&key);
+            }
+        }
+    }
+
+    /// This UPF's durable Recovery Time Stamp, if the snapshot has one (#722).
+    ///
+    /// A hostname UPF's stamp written by a pre-#722 binary is under its address. When
+    /// that key exists it wins over the name key and is migrated to it (#930 review
+    /// M3, round 2 N1). On the first boot after the upgrade this can seed a stamp
+    /// from another UPF that took the old address meanwhile: no worse than the
+    /// address keying it replaces.
+    pub fn stored_recovery_time_stamp(&self) -> Option<u32> {
+        let key = self.recovery_time_stamp_key();
+        let (by_name, by_address) = {
+            let ctx = smf_self();
+            let ctx = ctx.read().ok()?;
+            (
+                ctx.upf_recovery_time_stamp(&key),
+                self.legacy_address_key()
+                    .and_then(|old| ctx.upf_recovery_time_stamp(&old)),
+            )
+        };
+        // #930 round 2, N1: an address key next to the name key was written by an
+        // older binary AFTER this one retired it (an upgrade, a rollback, then this
+        // re-upgrade): it is the newer record, and the name key is stale. Seeding the
+        // stale one declared a false restart and released every UE on the UPF.
+        match by_address {
+            Some(rts) => {
+                if let Ok(ctx) = smf_self().read() {
+                    ctx.note_upf_recovery_time_stamp(&key, rts);
+                }
+                self.retire_address_key();
+                Some(rts)
+            }
+            None => by_name,
         }
     }
 
@@ -1134,18 +1395,21 @@ impl PfcpClient {
         if !self.is_associated().await {
             return Ok(());
         }
+        // The association's sessions are deleted locally FIRST (TS 29.244 §6.2.9):
+        // the UEs (#39) and the SGWs (Delete Bearer) are told before the request
+        // waits on the UPF, which can take T1 x N1 when the UPF is gone (#718 review
+        // m5). Before, they were told only after that wait, and a short termination
+        // grace period cut them off.
+        self.teardown_association("association release requested locally")
+            .await;
         let msg = PfcpMessage::AssociationReleaseRequest(AssociationReleaseRequest::new(
-            NodeId::new_ipv4(self.node_ip),
+            self.node_id.clone(),
         ));
         let mut buf = bytes::BytesMut::new();
         msg.encode_body(&mut buf);
 
         let result = self
             .request(pfcp_message_type::ASSOCIATION_RELEASE_REQUEST, None, &buf)
-            .await;
-
-        // Whether the peer answered or not, the association is gone locally
-        self.teardown_association("association release requested locally")
             .await;
 
         match result {
@@ -1173,7 +1437,9 @@ impl PfcpClient {
             .filter(|v| v.len() >= 4)
             .map(|v| u32::from_be_bytes([v[0], v[1], v[2], v[3]]))
         {
-            self.check_peer_restart(rts).await;
+            // #928 review M1: off the association/heartbeat task, like the rest.
+            self.check_peer_restart_detached(rts, StampSource::Response)
+                .await;
         } else {
             log::warn!("Heartbeat Response missing Recovery Time Stamp (mandatory IE)");
         }
@@ -1181,9 +1447,265 @@ impl PfcpClient {
     }
 }
 
+/// The restart/release fan-outs still running (#928 review m1): the #39 releases a
+/// teardown started off the receive or the association task. A graceful shutdown
+/// drains them, bounded, before the runtime goes; their sessions are already flushed,
+/// so nothing else would tell those UEs.
+fn restart_fanouts() -> &'static std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>> {
+    static FANOUTS: OnceLock<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> = OnceLock::new();
+    FANOUTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Keep `releases` for [`drain_restart_fanouts`], forgetting finished ones.
+fn track_restart_fanout(releases: tokio::task::JoinHandle<()>) {
+    let mut fanouts = restart_fanouts().lock().unwrap_or_else(|e| e.into_inner());
+    fanouts.retain(|h| !h.is_finished());
+    fanouts.push(releases);
+}
+
+/// [`track_restart_fanout`] for tests.
+#[cfg(test)]
+pub(crate) fn track_restart_fanout_for_test(releases: tokio::task::JoinHandle<()>) {
+    track_restart_fanout(releases);
+}
+
+/// Wait, at most `budget`, for every tracked fan-out (#928 review m1).
+pub async fn drain_restart_fanouts(budget: Duration) {
+    let pending: Vec<_> =
+        std::mem::take(&mut *restart_fanouts().lock().unwrap_or_else(|e| e.into_inner()));
+    if pending.is_empty() {
+        return;
+    }
+    let n = pending.len();
+    let all = async {
+        for h in pending {
+            let _ = h.await;
+        }
+    };
+    if tokio::time::timeout(budget, all).await.is_err() {
+        log::warn!(
+            "Shutdown: {n} restart release fan-out(s) still running after {budget:?}; the rest \
+             of their UEs are not told"
+        );
+    }
+}
+
+/// How many teardowns ran, for the #928 compare-and-set test.
+#[cfg(test)]
+pub(crate) static TEARDOWNS_FOR_TEST: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Where a peer Recovery Time Stamp came from (#928 round 2, B1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StampSource {
+    /// The response to a request of ours: any change is a restart.
+    Response,
+    /// An unsolicited Heartbeat Request: an older stamp may be a reordered message.
+    Request,
+}
+
+/// Whether Recovery Time Stamp `a` is newer than `b` in serial-number arithmetic
+/// (RFC 1982): the 32-bit NTP seconds field wraps in February 2036, and a stamp just
+/// past the wrap is newer than one just before it.
+fn stamp_is_newer(a: u32, b: u32) -> bool {
+    nextgcore_pfcp::recovery_time::is_newer(a, b)
+}
+
+/// Whether two PFCP endpoints are the same PFCP node (#928 round 2, m1): the IP
+/// address, canonical (an IPv4-mapped IPv6 address is the IPv4 one), not the port.
+/// TS 29.244 §4.2.2: a request may come from any source port; TS 23.007 §19A ties
+/// the Recovery Time Stamp to the source IP address.
+pub fn same_pfcp_node(a: SocketAddr, b: SocketAddr) -> bool {
+    a.ip().to_canonical() == b.ip().to_canonical()
+}
+
+/// PFCP Session Retention Information (TS 29.244 Table 7.4.4.1-2), grouped (#718).
+const PFCP_SESSION_RETENTION_INFORMATION: u16 = 183;
+/// PFCPASRsp-Flags (TS 29.244 §8.2.134); bit 1 is PSREI (#718).
+const PFCPASRSP_FLAGS: u16 = 184;
+
+/// Whether an Association Setup Response body says the UP function retained the
+/// sessions (PSREI, TS 29.244 §8.2.134).
+fn sessions_retained(body: &[u8]) -> bool {
+    find_ie(body, PFCPASRSP_FLAGS)
+        .and_then(|v| v.first().copied())
+        .is_some_and(|flags| flags & 0x01 != 0)
+}
+
+/// Whether this SMF holds any PFCP session it expects a UPF to still have (#718):
+/// a 5G PDU session in `pfcp_sessions`, or an EPC PDN connection (which has no
+/// `pfcp_sessions` entry, #687).
+#[cfg(test)]
+fn holds_pfcp_sessions() -> bool {
+    !held_session_seids().is_empty()
+}
+
+/// The SMF-side N4 SEIDs of every PFCP session this SMF holds: the 5G PDU
+/// sessions in `pfcp_sessions` and the EPC PDN connections with a UPF SEID.
+///
+/// One read guard for the whole walk, released before returning; the 5G SEID is
+/// resolved as `smf_n4_seid_for` resolves it (`cp_n4_seids` first, then the
+/// derivation), against the guard already held.
+fn held_session_seids() -> Vec<u64> {
+    let global = smf_self();
+    let Ok(ctx) = global.read() else {
+        return Vec::new();
+    };
+    let inherited = ctx
+        .cp_n4_seids
+        .read()
+        .map(|m| m.clone())
+        .unwrap_or_default();
+    let mut seids: Vec<u64> = ctx
+        .pfcp_sessions
+        .read()
+        .map(|m| {
+            m.keys()
+                .map(|r| {
+                    inherited
+                        .get(r)
+                        .copied()
+                        .unwrap_or_else(|| crate::context::derive_cp_n4_seid(r))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    seids.extend(
+        ctx.sess_find_all_by(|s| s.epc && s.upf_n4_seid != 0)
+            .into_iter()
+            .map(|s| s.smf_n4_seid),
+    );
+    seids
+}
+
+/// Whether `client` is the UPF the session with SMF-side N4 SEID `seid` lives on.
+///
+/// The recorded peer when it is this client's. Otherwise the routing
+/// [`client_for_session`] applies: a session with no record (restored from durable
+/// state, where the binding is not persisted), or whose recorded peer no pool
+/// member has any more (a hostname UPF re-resolved), goes to the default client.
+fn session_served_by(seid: u64, client: &PfcpClient) -> bool {
+    let recorded = session_peers()
+        .read()
+        .ok()
+        .and_then(|map| map.get(&seid).copied());
+    if recorded == Some(client.peer()) {
+        return true;
+    }
+    let routed_elsewhere =
+        recorded.is_some_and(|peer| global_pool().iter().any(|c| c.peer() == peer));
+    !routed_elsewhere && global_client().is_some_and(|c| std::ptr::eq(Arc::as_ptr(&c), client))
+}
+
+/// Whether this SMF holds a PFCP session on `client`'s UPF (#718 review M1).
+///
+/// Scoped to the peer. In a UPF pool, a member that associates late, or again
+/// after its own heartbeat loss, holds none of the sessions on the other members;
+/// asking it to retain them, and then releasing them all when it answered without
+/// PSREI, released every UE on the healthy UPFs.
+fn holds_pfcp_sessions_on(client: &PfcpClient) -> bool {
+    held_session_seids()
+        .into_iter()
+        .any(|seid| session_served_by(seid, client))
+}
+
+impl PfcpClient {
+    /// The sessions whose PFCP session lives on this client's UPF (#720), by the
+    /// routing [`session_served_by`] applies. Computed with no guard held across
+    /// the ownership check, which takes the N4 maps' own locks.
+    pub(crate) fn session_scope(&self) -> crate::restoration::SessionScope {
+        let (five_g, epc): (Vec<(String, u64)>, Vec<(u64, u64)>) = match smf_self().read() {
+            Ok(ctx) => {
+                let inherited = ctx
+                    .cp_n4_seids
+                    .read()
+                    .map(|m| m.clone())
+                    .unwrap_or_default();
+                let five_g = ctx
+                    .pfcp_sessions
+                    .read()
+                    .map(|m| {
+                        m.keys()
+                            .map(|r| {
+                                let seid = inherited
+                                    .get(r)
+                                    .copied()
+                                    .unwrap_or_else(|| crate::context::derive_cp_n4_seid(r));
+                                (r.clone(), seid)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let epc = ctx
+                    .sess_find_all_by(|s| s.epc)
+                    .into_iter()
+                    .map(|s| (s.id, s.smf_n4_seid))
+                    .collect();
+                (five_g, epc)
+            }
+            Err(_) => (Vec::new(), Vec::new()),
+        };
+        let five_g: Vec<(String, u64)> = five_g
+            .into_iter()
+            .filter(|(_, seid)| session_served_by(*seid, self))
+            .collect();
+        let epc: Vec<(u64, u64)> = epc
+            .into_iter()
+            .filter(|(_, seid)| session_served_by(*seid, self))
+            .collect();
+        crate::restoration::SessionScope {
+            seids: five_g
+                .iter()
+                .map(|(_, seid)| *seid)
+                .chain(epc.iter().map(|(_, seid)| *seid))
+                .collect(),
+            refs: five_g.into_iter().map(|(r, _)| r).collect(),
+            epc_sess_ids: epc.into_iter().map(|(id, _)| id).collect(),
+        }
+    }
+}
+
+/// Flush the stored PFCP sessions in `scope` (#720): one UPF's sessions, after it
+/// restarted or its association was lost. Returns the number removed.
+pub fn clear_pfcp_sessions_in(scope: &crate::restoration::SessionScope) -> usize {
+    // #779 (review of #879, m2): the production flush, scoped since #809, removes from
+    // the process-wide map too, so a test reaching it holds both locks.
+    #[cfg(test)]
+    assert_teardown_is_serialised();
+    let n = match smf_self().read() {
+        Ok(ctx) => {
+            let n = match ctx.pfcp_sessions.write() {
+                Ok(mut sessions) => {
+                    let before = sessions.len();
+                    sessions.retain(|r, _| !scope.refs.contains(r));
+                    before - sessions.len()
+                }
+                Err(_) => 0,
+            };
+            // Issue #191: after the write guard drops, as in `clear_pfcp_sessions`.
+            if n > 0 {
+                ctx.persist();
+            }
+            n
+        }
+        Err(_) => 0,
+    };
+    // The sessions are gone at that UPF, and so is their binding to it.
+    for seid in &scope.seids {
+        forget_session_peer(*seid);
+    }
+    n
+}
+
 /// Flush all stored PFCP sessions (UPF restarted / association lost).
 /// Returns the number of sessions removed.
+#[cfg(test)]
 pub fn clear_pfcp_sessions() -> usize {
+    // #779: the flush empties the process-wide map, whatever the caller. An unlocked
+    // teardown reaching it (the #665 hostname test, fixed by #762) is what made the
+    // eps_to_5gs end-to-end test lose its N4 session.
+    #[cfg(test)]
+    assert_teardown_is_serialised();
     if let Ok(ctx) = smf_self().read() {
         let n = {
             match ctx.pfcp_sessions.write() {
@@ -1317,6 +1839,15 @@ pub(crate) mod stand_in {
         /// lets one drive the SMF's cause-65 reconciliation over a real round trip
         /// rather than by calling the reconciler directly.
         session_cause: Arc<std::sync::atomic::AtomicU8>,
+        /// How long the stand-in waits before answering a Session Modification
+        /// (#750): a slow UPF, so a test can interleave another request.
+        modification_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+        /// Answer Session Modifications with no Created PDR (#751): an incomplete
+        /// answer to a request that created PDRs with CHOOSE.
+        omit_created_pdrs: Arc<std::sync::atomic::AtomicBool>,
+        /// Reject the Nth Session Modification from now (1-based; 0 = none) with
+        /// cause 64, accepting the others (#751).
+        reject_modification: Arc<std::sync::atomic::AtomicU64>,
         /// Bodies of the Session Modification Requests this stand-in received, in
         /// order (#321).
         ///
@@ -1380,6 +1911,24 @@ pub(crate) mod stand_in {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone()
+        }
+
+        /// Answer every Session Modification after `ms` milliseconds (#750).
+        pub(crate) fn delay_modifications(&self, ms: u64) {
+            self.modification_delay_ms
+                .store(ms, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// Answer Session Modifications with no Created PDR (#751).
+        pub(crate) fn omit_created_pdrs(&self, omit: bool) {
+            self.omit_created_pdrs
+                .store(omit, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// Reject the `n`th Session Modification from now with cause 64 (#751).
+        pub(crate) fn reject_modification(&self, n: u64) {
+            self.reject_modification
+                .store(n, std::sync::atomic::Ordering::SeqCst);
         }
 
         /// Answer the next Session Modification / Deletion with `cause` (#193).
@@ -1458,10 +2007,29 @@ pub(crate) mod stand_in {
     /// (issue #289) so both `pfcp_path`'s own tests and the stand-in build their
     /// clients the same way.
     pub(crate) async fn client_with_silent_peer() -> (Arc<PfcpClient>, UdpSocket) {
+        client_with_silent_peer_as(&default_identity()).await
+    }
+
+    /// The N4 identity every stand-in client signals unless a test chooses one.
+    pub(crate) fn default_identity() -> crate::n4_identity::N4Identity {
+        crate::n4_identity::N4Identity {
+            node_id: NodeId::new_ipv4([127, 0, 0, 1]),
+            f_seid_ipv4: [127, 0, 0, 1],
+            node_id_explicit: true,
+        }
+    }
+
+    /// [`client_with_silent_peer`] signalling `identity` (#797).
+    pub(crate) async fn client_with_silent_peer_as(
+        identity: &crate::n4_identity::N4Identity,
+    ) -> (Arc<PfcpClient>, UdpSocket) {
         let peer_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let peer_addr = peer_sock.local_addr().unwrap();
         let local = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let client = Arc::new(PfcpClient::new(Arc::new(local), peer_addr, [127, 0, 0, 1]));
+        let client = Arc::new(
+            PfcpClient::new(Arc::new(local), peer_addr, identity.f_seid_ipv4)
+                .with_node_id(identity.node_id.clone()),
+        );
 
         // Pump incoming datagrams into the engine
         let c = client.clone();
@@ -1498,8 +2066,16 @@ pub(crate) mod stand_in {
     pub(crate) async fn install_stand_in_upf_with_features(
         features: UpFunctionFeatures,
     ) -> StandInUpf {
+        install_stand_in_upf_as(features, &default_identity()).await
+    }
+
+    /// Install a stand-in UPF whose SMF client signals `identity` (#797).
+    pub(crate) async fn install_stand_in_upf_as(
+        features: UpFunctionFeatures,
+        identity: &crate::n4_identity::N4Identity,
+    ) -> StandInUpf {
         let n4_guard = N4_TEST_LOCK.lock().await;
-        let (client, upf_sock) = client_with_silent_peer().await;
+        let (client, upf_sock) = client_with_silent_peer_as(identity).await;
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let modification_bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
         let establishment_bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1514,6 +2090,12 @@ pub(crate) mod stand_in {
             pfcp_cause::REQUEST_ACCEPTED,
         ));
         let answered_cause = session_cause.clone();
+        let modification_delay_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let omit_created_pdrs = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let delay_ms = modification_delay_ms.clone();
+        let omit = omit_created_pdrs.clone();
+        let reject_modification = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let reject_nth = reject_modification.clone();
         tokio::spawn(async move {
             let rts = 0x5EED_0289_u32;
             let mut buf = vec![0u8; 8192];
@@ -1549,11 +2131,23 @@ pub(crate) mod stand_in {
                             rts,
                         );
                         resp.up_function_features = Some(features);
-                        Some(Vec::from(build_message(
-                            &PfcpMessage::AssociationSetupResponse(resp),
-                            h.sequence_number,
+                        let mut body = bytes::BytesMut::new();
+                        PfcpMessage::AssociationSetupResponse(resp).encode_body(&mut body);
+                        // #718: a conformant UPF that holds the sessions the test seeded
+                        // retains them when asked, and says so with PSREI.
+                        if find_ie(&buf[h.body_offset..len], PFCP_SESSION_RETENTION_INFORMATION)
+                            .is_some()
+                        {
+                            body.put_u16(PFCPASRSP_FLAGS);
+                            body.put_u16(1);
+                            body.put_u8(0x01);
+                        }
+                        Some(encode_wire_message(
+                            pfcp_message_type::ASSOCIATION_SETUP_RESPONSE,
                             None,
-                        )))
+                            h.sequence_number,
+                            &body,
+                        ))
                     }
                     pfcp_message_type::HEARTBEAT_REQUEST => Some(Vec::from(build_message(
                         &PfcpMessage::HeartbeatResponse(HeartbeatResponse::new(rts)),
@@ -1579,13 +2173,26 @@ pub(crate) mod stand_in {
                         &establishment_response_body(upf_seid, upf_teid, upf_ip),
                     )),
                     pfcp_message_type::SESSION_MODIFICATION_REQUEST => {
-                        let cause = answered_cause.load(std::sync::atomic::Ordering::SeqCst);
+                        let mut cause = answered_cause.load(std::sync::atomic::Ordering::SeqCst);
+                        let nth = reject_nth.load(std::sync::atomic::Ordering::SeqCst);
+                        if nth > 0 {
+                            if nth == 1 {
+                                cause = 64; // PFCP: Request rejected (reason not specified)
+                            }
+                            reject_nth.store(nth - 1, std::sync::atomic::Ordering::SeqCst);
+                        }
                         let mut body = tlv(19, &[cause]);
                         // #475: a modification that CREATES a PDR whose F-TEID the UP
                         // function chooses is answered with a Created PDR carrying the
                         // allocated F-TEID (TS 29.244 §7.5.5.2), as the establishment is.
                         let req_body = &buf[h.body_offset..len];
-                        if cause == pfcp_cause::REQUEST_ACCEPTED {
+                        let delay = delay_ms.load(std::sync::atomic::Ordering::SeqCst);
+                        if delay > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                        }
+                        if cause == pfcp_cause::REQUEST_ACCEPTED
+                            && !omit.load(std::sync::atomic::Ordering::SeqCst)
+                        {
                             // #583: EVERY Create PDR whose F-TEID is to be chosen (TEID 0)
                             // gets its own, N3_STAND_IN_TEID first; a message naming none
                             // that way keeps the #475 answer for its first Create PDR.
@@ -1653,6 +2260,9 @@ pub(crate) mod stand_in {
             upf_teid,
             upf_ip,
             session_cause,
+            modification_delay_ms,
+            omit_created_pdrs,
+            reject_modification,
             modification_bodies,
             establishment_bodies,
             _n4_guard: n4_guard,
@@ -1722,6 +2332,24 @@ pub(crate) mod stand_in {
     /// states itself explicitly.
     pub(crate) async fn associated_upf_with_features(features: UpFunctionFeatures) -> StandInUpf {
         let upf = install_stand_in_upf_with_features(features).await;
+        upf.client
+            .associate()
+            .await
+            .expect("the stand-in UPF must accept the association");
+        upf.clear_seen();
+        upf
+    }
+
+    /// An associated stand-in UPF whose SMF client signals `identity` (#797).
+    pub(crate) async fn associated_upf_as(identity: &crate::n4_identity::N4Identity) -> StandInUpf {
+        let upf = install_stand_in_upf_as(
+            UpFunctionFeatures {
+                ftup: true,
+                ..Default::default()
+            },
+            identity,
+        )
+        .await;
         upf.client
             .associate()
             .await
@@ -1805,6 +2433,11 @@ mod tests {
     /// UP Function Features).
     #[tokio::test]
     async fn test_association_setup_roundtrip() {
+        // #718: `associate` asks for session retention when this process holds
+        // sessions, and tears them down when the peer does not confirm it, so it
+        // reads (and may flush) process-global session state.
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
         let (client, upf) = make_client_with_peer().await;
 
         tokio::spawn(async move {
@@ -1894,6 +2527,85 @@ mod tests {
         upf.send_to(&pkt, from).await.unwrap();
     }
 
+    /// The Node ID IE value (TS 29.244 §8.2.38) of a PFCP message body.
+    fn node_id_ie(body: &[u8]) -> Vec<u8> {
+        let mut off = 0usize;
+        while off + 4 <= body.len() {
+            let t = u16::from_be_bytes([body[off], body[off + 1]]);
+            let l = usize::from(u16::from_be_bytes([body[off + 2], body[off + 3]]));
+            if t == 60 {
+                return body[off + 4..off + 4 + l].to_vec();
+            }
+            off += 4 + l;
+        }
+        panic!("no Node ID IE in {body:02x?}")
+    }
+
+    /// #797: the Node ID the SMF signals in Association Setup and Association Release
+    /// is the configured one (here the Service FQDN), not the F-SEID address. Before
+    /// #797 the Node ID was the N4 bind address, 0.0.0.0 on k8s. The FQDN is RFC 1035
+    /// labels without the trailing zero byte (§8.2.38).
+    #[tokio::test]
+    async fn the_association_signals_the_configured_fqdn_node_id() {
+        // #723: the release reaches `teardown_association`, which is process-wide.
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
+        let upf = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client = pumped_client(
+            PfcpClient::new(local, upf.local_addr().unwrap(), [10, 1, 2, 3])
+                .with_node_id(NodeId::new_fqdn("smf.nextg.svc".into())),
+        )
+        .await;
+        let expected: &[u8] = &[
+            2, 3, b's', b'm', b'f', 5, b'n', b'e', b'x', b't', b'g', 3, b's', b'v', b'c',
+        ];
+
+        let answer = tokio::spawn(async move {
+            let mut bodies = Vec::new();
+            let mut buf = vec![0u8; 4096];
+            for _ in 0..2 {
+                let (len, from) = upf.recv_from(&mut buf).await.unwrap();
+                let h = parse_wire_header(&buf[..len]).unwrap();
+                bodies.push((h.msg_type, buf[h.body_offset..len].to_vec()));
+                let msg = if h.msg_type == pfcp_message_type::ASSOCIATION_SETUP_REQUEST {
+                    PfcpMessage::AssociationSetupResponse(AssociationSetupResponse::new(
+                        NodeId::new_ipv4([127, 0, 0, 4]),
+                        nextgcore_pfcp::types::PfcpCause::RequestAccepted,
+                        5,
+                    ))
+                } else {
+                    PfcpMessage::AssociationReleaseResponse(
+                        nextgcore_pfcp::message::AssociationReleaseResponse::new(
+                            NodeId::new_ipv4([127, 0, 0, 4]),
+                            nextgcore_pfcp::types::PfcpCause::RequestAccepted,
+                        ),
+                    )
+                };
+                upf.send_to(&build_message(&msg, h.sequence_number, None), from)
+                    .await
+                    .unwrap();
+            }
+            bodies
+        });
+
+        client.associate().await.expect("association must succeed");
+        client
+            .release_association()
+            .await
+            .expect("release must succeed");
+        let bodies = answer.await.unwrap();
+        assert_eq!(bodies[0].0, pfcp_message_type::ASSOCIATION_SETUP_REQUEST);
+        assert_eq!(node_id_ie(&bodies[0].1), expected);
+        assert_eq!(bodies[1].0, pfcp_message_type::ASSOCIATION_RELEASE_REQUEST);
+        assert_eq!(node_id_ie(&bodies[1].1), expected);
+        assert_eq!(
+            client.node_ip(),
+            [10, 1, 2, 3],
+            "the F-SEID address is separate"
+        );
+    }
+
     /// Bind a client to `peer`, pumping its socket into the engine.
     async fn pumped_client(client: PfcpClient) -> Arc<PfcpClient> {
         let client = Arc::new(client);
@@ -1962,6 +2674,565 @@ mod tests {
         );
     }
 
+    /// #930 review M1: the SMF itself records a hostname UPF's stamp under the name,
+    /// and writes no address key. The seed test above plants the name key by hand.
+    #[tokio::test]
+    async fn a_hostname_upfs_stamp_is_recorded_under_its_name() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
+        let upf = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = upf.local_addr().unwrap().port();
+        let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let unresolved = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), port);
+        let client = pumped_client(
+            PfcpClient::new(local, unresolved, [127, 0, 0, 1])
+                .with_peer_hostname("LocalHost.", port),
+        )
+        .await;
+        let answered = tokio::spawn(answer_association_setup(upf, 321, false));
+        try_associate(&client).await.expect("association");
+        let _ = answered.await;
+        let name = format!("localhost:{port}");
+        let address = format!("127.0.0.1:{port}");
+        let (by_name, by_address) = {
+            let ctx = smf_self();
+            let ctx = ctx.read().unwrap();
+            (
+                ctx.upf_recovery_time_stamp(&name),
+                ctx.upf_recovery_time_stamp(&address),
+            )
+        };
+        if let Ok(ctx) = smf_self().read() {
+            ctx.forget_upf_recovery_time_stamp(&name);
+        }
+        assert_eq!(by_name, Some(321), "recorded under the normalised name");
+        assert_eq!(by_address, None, "and not under the address");
+    }
+
+    /// #930 review M2, M3: a pre-#722 snapshot keeps a hostname UPF's stamp under its
+    /// address. It still seeds, and it is migrated: the name key gets it and the
+    /// address key goes, so a stale entry cannot later declare a false restart. A
+    /// literal UPF never reads a name key.
+    #[tokio::test]
+    async fn a_legacy_address_keyed_stamp_seeds_once_and_is_migrated() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
+        let port = 47_922u16;
+        let address = format!("127.0.0.1:{port}");
+        let name = format!("localhost:{port}");
+        let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let resolved: SocketAddr = address.parse().unwrap();
+        let hostname = PfcpClient::new(local.clone(), resolved, [127, 0, 0, 1])
+            .with_peer_hostname("localhost", port);
+        smf_self()
+            .read()
+            .unwrap()
+            .note_upf_recovery_time_stamp(&address, 100);
+
+        let seeded = hostname.stored_recovery_time_stamp();
+        let (by_name, by_address) = {
+            let ctx = smf_self();
+            let ctx = ctx.read().unwrap();
+            (
+                ctx.upf_recovery_time_stamp(&name),
+                ctx.upf_recovery_time_stamp(&address),
+            )
+        };
+        // A literal client at another address does not read the name key.
+        let literal = PfcpClient::new(local, "127.0.0.1:47923".parse().unwrap(), [127, 0, 0, 1]);
+        smf_self()
+            .read()
+            .unwrap()
+            .note_upf_recovery_time_stamp("localhost:47923", 555);
+        let literal_seed = literal.stored_recovery_time_stamp();
+        if let Ok(ctx) = smf_self().read() {
+            for k in [name.as_str(), address.as_str(), "localhost:47923"] {
+                ctx.forget_upf_recovery_time_stamp(k);
+            }
+        }
+
+        assert_eq!(seeded, Some(100), "the legacy address key still seeds");
+        assert_eq!(by_name, Some(100), "migrated to the name key");
+        assert_eq!(by_address, None, "and the address key removed");
+        assert_eq!(literal_seed, None, "a literal UPF never reads a name key");
+    }
+
+    /// #930 round 2 N1: upgrade, rollback, re-upgrade. The rolled-back binary wrote
+    /// the address key (300) after this one had recorded the name key (200). The
+    /// address key is the newer record: it seeds, is migrated, and the stale name
+    /// key is overwritten, so the UPF answering 300 is not taken for a restart.
+    #[tokio::test]
+    async fn after_a_rollback_the_address_key_wins_over_a_stale_name_key() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
+        let port = 47_924u16;
+        let address = format!("127.0.0.1:{port}");
+        let name = format!("localhost:{port}");
+        let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client = PfcpClient::new(local, address.parse().unwrap(), [127, 0, 0, 1])
+            .with_peer_hostname("localhost", port);
+        if let Ok(ctx) = smf_self().read() {
+            ctx.note_upf_recovery_time_stamp(&name, 200);
+            ctx.note_upf_recovery_time_stamp(&address, 300);
+        }
+        let seeded = client.stored_recovery_time_stamp();
+        let (by_name, by_address) = {
+            let ctx = smf_self();
+            let ctx = ctx.read().unwrap();
+            (
+                ctx.upf_recovery_time_stamp(&name),
+                ctx.upf_recovery_time_stamp(&address),
+            )
+        };
+        if let Ok(ctx) = smf_self().read() {
+            ctx.forget_upf_recovery_time_stamp(&name);
+            ctx.forget_upf_recovery_time_stamp(&address);
+        }
+        assert_eq!(seeded, Some(300), "the newer address-key record seeds");
+        assert_eq!((by_name, by_address), (Some(300), None), "and is migrated");
+    }
+
+    /// #930 round 2 N2: recording a hostname UPF's stamp retires the legacy address
+    /// key, and leaves it when a LITERAL pool member owns that exact address (it is
+    /// that member's key, not a legacy one).
+    #[tokio::test]
+    async fn recording_retires_the_address_key_unless_a_literal_member_owns_it() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
+        let port = 47_925u16;
+        let address = format!("127.0.0.1:{port}");
+        let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let hostname = Arc::new(
+            PfcpClient::new(local.clone(), address.parse().unwrap(), [127, 0, 0, 1])
+                .with_peer_hostname("localhost", port),
+        );
+        // No literal member: the address key goes.
+        smf_self()
+            .read()
+            .unwrap()
+            .note_upf_recovery_time_stamp(&address, 111);
+        let _pool = InstalledPool::new(vec![hostname.clone()]);
+        hostname.record_peer_recovery_time_stamp(112);
+        let retired = smf_self()
+            .read()
+            .unwrap()
+            .upf_recovery_time_stamp(&address)
+            .is_none();
+        drop(_pool);
+        // A literal member at that very address: its key stays.
+        let literal = Arc::new(PfcpClient::new(
+            local,
+            address.parse().unwrap(),
+            [127, 0, 0, 1],
+        ));
+        smf_self()
+            .read()
+            .unwrap()
+            .note_upf_recovery_time_stamp(&address, 113);
+        let _pool = InstalledPool::new(vec![hostname.clone(), literal]);
+        hostname.record_peer_recovery_time_stamp(114);
+        let kept = smf_self().read().unwrap().upf_recovery_time_stamp(&address);
+        if let Ok(ctx) = smf_self().read() {
+            ctx.forget_upf_recovery_time_stamp(&address);
+            ctx.forget_upf_recovery_time_stamp(&format!("localhost:{port}"));
+        }
+        assert!(retired, "the legacy address key is retired on record");
+        assert_eq!(kept, Some(113), "a literal member's own key is left alone");
+    }
+
+    /// #722: a UPF named by hostname moved while the SMF was down. Its durable
+    /// Recovery Time Stamp is keyed by the configured name, so the restarted SMF still
+    /// finds the seed although the name now resolves elsewhere, detects the UPF's new
+    /// incarnation at the first Association Setup, and flushes and releases (#39) the
+    /// restored session. Keyed by the address, the lookup missed and the restart went
+    /// undetected.
+    #[tokio::test]
+    async fn a_hostname_upfs_stamp_survives_the_upf_moving_while_the_smf_was_down() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
+        // UPF B, the new incarnation, is where "localhost" now points.
+        let upf_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port_b = upf_b.local_addr().unwrap().port();
+        let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let unresolved = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), port_b);
+        let client = pumped_client(
+            PfcpClient::new(local, unresolved, [127, 0, 0, 1])
+                .with_peer_hostname("localhost", port_b),
+        )
+        .await;
+        let _pool = InstalledPool::new(vec![client.clone()]);
+        let key = format!("localhost:{port_b}");
+        assert_eq!(client.recovery_time_stamp_key(), key);
+        // What the previous SMF incarnation recorded, when the UPF was at A.
+        smf_self()
+            .read()
+            .unwrap()
+            .note_upf_recovery_time_stamp(&key, 100);
+        let seed = client.stored_recovery_time_stamp();
+        if let Some(rts) = seed {
+            client.seed_peer_recovery_time_stamp(rts).await;
+        }
+        // A restored session (no recorded UPF), with a UE to release it through.
+        seed_pfcp_session("72201", 0x722);
+        let mut b = crate::context::PolicyBinding::snapshot_default();
+        b.supi = "imsi-001010000000722".to_string();
+        b.psi = 5;
+        b.sm_context_status_uri = Some("http://127.0.0.1:1/sm-status".to_string());
+        smf_self()
+            .read()
+            .unwrap()
+            .policy_bindings
+            .write()
+            .unwrap()
+            .insert("72201".to_string(), b);
+
+        let answered = tokio::spawn(answer_association_setup(upf_b, 200, false));
+        try_associate(&client).await.expect("association with B");
+        let _ = answered.await;
+        // #928: the restart's #39 fan-out runs off the association task; wait for it.
+        drain_restart_fanouts(Duration::from_secs(5)).await;
+        let kept = pfcp_session_present("72201");
+        let released = crate::cancel_gsm_timer_for_test("72201");
+        forget_pfcp_session("72201");
+        if let Ok(ctx) = smf_self().read() {
+            ctx.policy_bindings.write().unwrap().remove("72201");
+        }
+
+        if let Ok(ctx) = smf_self().read() {
+            ctx.forget_upf_recovery_time_stamp(&key);
+        }
+        assert_eq!(seed, Some(100), "the seed is found by name");
+        assert!(!kept, "the restored session is flushed");
+        assert!(released, "and released through the UE (#39)");
+        assert_eq!(client.peer().port(), port_b);
+    }
+
+    /// Answer one Association Setup Request on `upf` with Request Accepted, the
+    /// Recovery Time Stamp `rts`, and PSREI when `psrei`; returns the request body.
+    async fn answer_association_setup(upf: UdpSocket, rts: u32, psrei: bool) -> Vec<u8> {
+        let mut buf = vec![0u8; 4096];
+        let (len, from) = upf.recv_from(&mut buf).await.unwrap();
+        let h = parse_wire_header(&buf[..len]).unwrap();
+        assert_eq!(h.msg_type, pfcp_message_type::ASSOCIATION_SETUP_REQUEST);
+        let request = buf[h.body_offset..len].to_vec();
+        let resp = AssociationSetupResponse::new(
+            NodeId::new_ipv4([127, 0, 0, 4]),
+            nextgcore_pfcp::types::PfcpCause::RequestAccepted,
+            rts,
+        );
+        let mut body = bytes::BytesMut::new();
+        PfcpMessage::AssociationSetupResponse(resp).encode_body(&mut body);
+        if psrei {
+            body.put_u16(PFCPASRSP_FLAGS);
+            body.put_u16(1);
+            body.put_u8(0x01);
+        }
+        let pkt = encode_wire_message(
+            pfcp_message_type::ASSOCIATION_SETUP_RESPONSE,
+            None,
+            h.sequence_number,
+            &body,
+        );
+        upf.send_to(&pkt, from).await.unwrap();
+        request
+    }
+
+    fn seed_pfcp_session(sm_context_ref: &str, upf_seid: u64) {
+        smf_self()
+            .read()
+            .unwrap()
+            .pfcp_sessions
+            .write()
+            .unwrap()
+            .insert(sm_context_ref.to_string(), upf_seid);
+    }
+
+    fn pfcp_session_present(sm_context_ref: &str) -> bool {
+        smf_self()
+            .read()
+            .unwrap()
+            .pfcp_sessions
+            .read()
+            .unwrap()
+            .contains_key(sm_context_ref)
+    }
+
+    /// #718: an SMF with no sessions (a fresh incarnation without durable state)
+    /// does not ask the UPF to retain anything, so a conformant UPF deletes whatever
+    /// the previous incarnation left under this Node ID (TS 29.244 §6.2.6.2.2).
+    #[tokio::test]
+    async fn an_smf_holding_no_sessions_asks_the_upf_to_retain_nothing() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
+        // Leftovers of earlier tests in this process; both locks are held, so they
+        // belong to nobody running now.
+        clear_pfcp_sessions();
+        if let Ok(ctx) = smf_self().read() {
+            for sess in ctx.sess_find_all_by(|s| s.epc && s.upf_n4_seid != 0) {
+                ctx.sess_remove(sess.id);
+            }
+        }
+        assert!(
+            !holds_pfcp_sessions(),
+            "precondition: no 5G or EPC session is held"
+        );
+        let (client, upf) = make_client_with_peer().await;
+        let answered = tokio::spawn(answer_association_setup(upf, 500, false));
+        client.associate().await.expect("association");
+        let request = answered.await.unwrap();
+        assert!(
+            find_ie(&request, 60).is_some(),
+            "the request is the real one"
+        );
+        assert!(
+            find_ie(&request, PFCP_SESSION_RETENTION_INFORMATION).is_none(),
+            "no PFCP Session Retention Information without sessions to keep"
+        );
+    }
+
+    /// #718: an SMF that holds sessions (restored from durable state, or kept
+    /// across a lost heartbeat) asks for all of them to be retained, and keeps them
+    /// when the UPF confirms with PSREI.
+    #[tokio::test]
+    async fn an_smf_holding_sessions_asks_for_them_and_keeps_them_when_retained() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
+        seed_pfcp_session("71801", 0x718a);
+        let (client, upf) = make_client_with_peer().await;
+        let seid = crate::context::derive_cp_n4_seid("71801");
+        record_session_peer(seid, client.peer());
+        client.seed_peer_recovery_time_stamp(600).await;
+        let answered = tokio::spawn(answer_association_setup(upf, 600, true));
+        client.associate().await.expect("association");
+        let request = answered.await.unwrap();
+        let kept = pfcp_session_present("71801");
+        forget_pfcp_session("71801");
+        forget_session_peer(seid);
+
+        assert_eq!(
+            find_ie(&request, PFCP_SESSION_RETENTION_INFORMATION),
+            Some(&[][..]),
+            "an empty retention IE: keep every session (TS 29.244 Table 7.4.4.1-2)"
+        );
+        assert!(
+            kept,
+            "PSREI: the UPF retained the session, so the SMF keeps it"
+        );
+        assert!(client.is_associated().await);
+    }
+
+    /// #718: retention was asked for and the UPF did not confirm it. Its sessions
+    /// are gone there, so the SMF must not keep believing in them: it releases them,
+    /// as it would after a UPF restart.
+    #[tokio::test]
+    async fn sessions_the_upf_did_not_retain_are_released() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
+        seed_pfcp_session("71802", 0x718b);
+        let (client, upf) = make_client_with_peer().await;
+        let seid = crate::context::derive_cp_n4_seid("71802");
+        record_session_peer(seid, client.peer());
+        // The same UPF incarnation: no restart, so only PSREI can tell.
+        client.seed_peer_recovery_time_stamp(700).await;
+        let answered = tokio::spawn(answer_association_setup(upf, 700, false));
+        client.associate().await.expect("association");
+        let request = answered.await.unwrap();
+        let kept = pfcp_session_present("71802");
+        forget_pfcp_session("71802");
+        forget_session_peer(seid);
+
+        assert!(find_ie(&request, PFCP_SESSION_RETENTION_INFORMATION).is_some());
+        assert!(!kept, "no PSREI: the session is released, not believed");
+        assert!(
+            client.is_associated().await,
+            "the association itself stands; only the sessions were lost"
+        );
+    }
+
+    /// #718 review M1: in a UPF pool, a member that holds none of the SMF's sessions
+    /// asks for no retention, and its answer without PSREI releases nothing. Before,
+    /// the check was process-wide: a pool member associating late asked to retain the
+    /// sessions on the OTHER UPF, got no PSREI, and every UE on the healthy UPF was
+    /// released with #39.
+    #[tokio::test]
+    async fn a_pool_member_holding_none_of_the_sessions_asks_for_none_and_releases_none() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
+        // The session lives on UPF A.
+        seed_pfcp_session("71803", 0x718c);
+        let (client_a, _upf_a) = make_client_with_peer().await;
+        let seid = crate::context::derive_cp_n4_seid("71803");
+        record_session_peer(seid, client_a.peer());
+        // UPF B associates late: it never had an association, so no PSREI.
+        let (client_b, upf_b) = make_client_with_peer().await;
+        let answered = tokio::spawn(answer_association_setup(upf_b, 800, false));
+        client_b.associate().await.expect("association");
+        let request = answered.await.unwrap();
+        let kept = pfcp_session_present("71803");
+        forget_pfcp_session("71803");
+        forget_session_peer(seid);
+
+        assert!(
+            find_ie(&request, PFCP_SESSION_RETENTION_INFORMATION).is_none(),
+            "UPF B holds none of the sessions, so it is asked to retain none"
+        );
+        assert!(
+            kept,
+            "the session on UPF A is untouched by UPF B's association"
+        );
+        assert!(client_b.is_associated().await);
+    }
+
+    /// #718 review M1: a session with no recorded UPF (restored from durable state)
+    /// is the default client's, exactly as `client_for_session` routes it; a client
+    /// that is not the default does not claim it.
+    #[tokio::test]
+    async fn a_restored_session_belongs_to_the_default_client_only() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = stand_in::install_stand_in_upf().await;
+        let (other, _peer) = make_client_with_peer().await;
+        let seid = crate::context::derive_cp_n4_seid("71804");
+        assert!(session_served_by(seid, &upf.client));
+        assert!(!session_served_by(seid, &other));
+        // Recorded on a pool member: that member's, not the default client's.
+        record_session_peer(seid, upf.client.peer());
+        assert!(session_served_by(seid, &upf.client));
+        assert!(!session_served_by(seid, &other));
+        forget_session_peer(seid);
+    }
+
+    /// #720: a UPF restart affects only that UPF's sessions. Two UPFs in the pool;
+    /// a session on each. UPF B restarts (a changed Recovery Time Stamp on its
+    /// heartbeat). B's session is released through the UE (#39, T3592 armed) and
+    /// flushed; A's session gets no release and stays in the map, as does its
+    /// binding. Before #720 the teardown walked every session in the process, so a
+    /// restart of B released every UE on A and orphaned A's sessions in A.
+    #[tokio::test]
+    async fn a_upf_restart_releases_only_that_upfs_sessions() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
+        let (client_a, _upf_a) = make_client_with_peer().await;
+        let (client_b, _upf_b) = make_client_with_peer().await;
+        set_global_pool(vec![client_a.clone(), client_b.clone()]);
+        let seed = |r: &str, upf_seid: u64, client: &PfcpClient, psi: u8| {
+            seed_pfcp_session(r, upf_seid);
+            record_session_peer(crate::context::derive_cp_n4_seid(r), client.peer());
+            let mut b = crate::context::PolicyBinding::snapshot_default();
+            b.supi = "imsi-001010000000720".to_string();
+            b.psi = psi;
+            // Unreachable: the release is still sent and T3592 armed.
+            b.sm_context_status_uri = Some("http://127.0.0.1:1/sm-status".to_string());
+            smf_self()
+                .read()
+                .unwrap()
+                .policy_bindings
+                .write()
+                .unwrap()
+                .insert(r.to_string(), b);
+        };
+        seed("72001", 0x720a, &client_a, 5);
+        seed("72002", 0x720b, &client_b, 6);
+
+        // B restarts: a changed stamp after the one it associated with.
+        client_b.seed_peer_recovery_time_stamp(100).await;
+        client_b.check_peer_restart(200).await;
+
+        let a_kept = pfcp_session_present("72001");
+        let b_kept = pfcp_session_present("72002");
+        let a_released = crate::cancel_gsm_timer_for_test("72001");
+        let b_released = crate::cancel_gsm_timer_for_test("72002");
+        let a_binding = crate::lookup_policy_binding_for_test("72001");
+        for r in ["72001", "72002"] {
+            forget_pfcp_session(r);
+            forget_session_peer(crate::context::derive_cp_n4_seid(r));
+            smf_self()
+                .read()
+                .unwrap()
+                .policy_bindings
+                .write()
+                .unwrap()
+                .remove(r);
+        }
+        clear_global_upf_for_test();
+
+        assert!(b_released, "B's session is released through the UE (#39)");
+        assert!(!b_kept, "and flushed");
+        assert!(!a_released, "A's session gets no release");
+        assert!(a_kept, "A's session stays in the map");
+        assert!(a_binding, "A's binding stays");
+    }
+
+    /// #720: the scope of one UPF's teardown, including EPC PDN connections: only
+    /// the sessions recorded on that UPF, and a restored (unrecorded) session is the
+    /// default client's.
+    #[tokio::test]
+    async fn a_upfs_teardown_scope_is_its_own_sessions() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
+        crate::context::smf_context_init(64, 256, 512);
+        let (client_a, _upf_a) = make_client_with_peer().await;
+        let (client_b, _upf_b) = make_client_with_peer().await;
+        set_global_pool(vec![client_a.clone(), client_b.clone()]);
+        seed_pfcp_session("72011", 1);
+        record_session_peer(crate::context::derive_cp_n4_seid("72011"), client_b.peer());
+        seed_pfcp_session("72012", 2); // restored: no recorded peer
+        let (epc_a, epc_b) = {
+            let ctx = smf_self();
+            let ctx = ctx.read().unwrap();
+            let ue = ctx.ue_add_by_imsi(b"001010000072010").expect("ue");
+            let a = ctx.sess_add_by_apn(ue.id, "internet", 6).expect("a");
+            let b = ctx.sess_add_by_apn(ue.id, "ims", 6).expect("b");
+            record_session_peer(a.smf_n4_seid, client_a.peer());
+            record_session_peer(b.smf_n4_seid, client_b.peer());
+            (a, b)
+        };
+
+        let scope_a = client_a.session_scope();
+        let scope_b = client_b.session_scope();
+        for r in ["72011", "72012"] {
+            forget_pfcp_session(r);
+            forget_session_peer(crate::context::derive_cp_n4_seid(r));
+        }
+        if let Ok(ctx) = smf_self().read() {
+            for s in [&epc_a, &epc_b] {
+                forget_session_peer(s.smf_n4_seid);
+                ctx.sess_remove(s.id);
+            }
+        }
+        clear_global_upf_for_test();
+
+        assert!(scope_b.refs.contains("72011") && !scope_a.refs.contains("72011"));
+        assert!(scope_a.refs.contains("72012") && !scope_b.refs.contains("72012"));
+        assert!(scope_a.epc_sess_ids.contains(&epc_a.id));
+        assert!(!scope_a.epc_sess_ids.contains(&epc_b.id));
+        assert!(scope_b.epc_sess_ids.contains(&epc_b.id));
+        assert!(!scope_b.epc_sess_ids.contains(&epc_a.id));
+    }
+
+    /// Install `clients` as the process pool for a test, and uninstall on drop.
+    struct InstalledPool;
+    impl InstalledPool {
+        fn new(clients: Vec<Arc<PfcpClient>>) -> Self {
+            set_global_pool(clients);
+            InstalledPool
+        }
+    }
+    impl Drop for InstalledPool {
+        fn drop(&mut self) {
+            clear_global_upf_for_test();
+        }
+    }
+
+    fn forget_pfcp_session(sm_context_ref: &str) {
+        smf_self()
+            .read()
+            .unwrap()
+            .pfcp_sessions
+            .write()
+            .unwrap()
+            .remove(sm_context_ref);
+    }
+
     /// #658: a hostname that does not resolve at startup is not fatal and is
     /// never dialled as 0.0.0.0; the request fails locally instead.
     #[tokio::test]
@@ -1970,7 +3241,11 @@ mod tests {
         let client = client_for_peer(
             local,
             &UpfPeerSpec::Hostname("upf.invalid".into(), 8805),
-            [127, 0, 0, 1],
+            &crate::n4_identity::N4Identity {
+                node_id: NodeId::new_ipv4([127, 0, 0, 1]),
+                f_seid_ipv4: [127, 0, 0, 1],
+                node_id_explicit: true,
+            },
         )
         .await;
         assert!(!client.has_resolved_peer());
@@ -1983,6 +3258,11 @@ mod tests {
     /// A rejected Association Setup must surface the real cause value.
     #[tokio::test]
     async fn test_association_setup_rejected_cause() {
+        // #718: `associate` asks for session retention when this process holds
+        // sessions, and tears them down when the peer does not confirm it, so it
+        // reads (and may flush) process-global session state.
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
         let (client, upf) = make_client_with_peer().await;
 
         tokio::spawn(async move {
@@ -2433,6 +3713,63 @@ mod tests {
     // each of these asserts only about its own uniquely-named key rather than
     // about the map being empty.
 
+    /// #995: across the upgrade, stamps compare in the NTP reading. A UPF still on a
+    /// pre-#995 binary keeps sending the Unix-seconds stamp the (migrated) seed was
+    /// taken from: no restart, on either path. An UPGRADED UPF -- a real restart --
+    /// sends an NTP stamp; unnormalized, that is 70 years "older" than the Unix seed in
+    /// serial arithmetic, so a Heartbeat Request carrying it was discarded as reordered
+    /// and the restart went unseen.
+    #[tokio::test]
+    async fn stamps_compare_across_the_995_upgrade() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
+        let (client, _upf) = make_client_with_peer().await;
+        let _pool = InstalledPool::new(vec![client.clone()]);
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let legacy = (now_unix - 86_400) as u32; // a pre-#995 UPF up for a day
+        client.seed_peer_recovery_time_stamp(legacy).await;
+        client.set_assoc_state_for_test(true, None, None).await;
+
+        for source in [StampSource::Request, StampSource::Response] {
+            assert!(
+                client.detect_peer_restart(legacy, source).await.is_none(),
+                "the same pre-#995 UPF is not a restart ({source:?})"
+            );
+        }
+        assert!(client.is_associated().await);
+
+        let upgraded = nextgcore_pfcp::recovery_time::from_unix_secs(now_unix - 60);
+        let fanout = client
+            .detect_peer_restart(upgraded, StampSource::Request)
+            .await;
+        assert!(
+            fanout.is_some(),
+            "an upgraded UPF's newer NTP stamp in a Heartbeat Request is a restart"
+        );
+        if let Some(f) = fanout {
+            let _ = f.await;
+        }
+        assert_eq!(
+            client.association().await.peer_recovery_time_stamp,
+            Some(upgraded)
+        );
+    }
+
+    /// #995: this SMF's own stamp is NTP-era seconds (TS 29.244 §8.2.65).
+    #[tokio::test]
+    async fn the_smf_recovery_time_stamp_is_ntp_seconds() {
+        let (client, _upf) = make_client_with_peer().await;
+        let now = nextgcore_pfcp::recovery_time::now();
+        assert!(
+            now.wrapping_sub(client.recovery_time_stamp) < 60,
+            "{}",
+            client.recovery_time_stamp
+        );
+    }
+
     /// A stamp restored from a snapshot must participate in restart detection.
     /// Without the seed a fresh process holds `None`, no restart is detectable,
     /// and the restored sessions are never questioned.
@@ -2443,6 +3780,8 @@ mod tests {
         // process-global session map (see N4_TEST_LOCK).
         let _map_guard = N4_TEST_LOCK.lock().await;
         let (client, _upf) = make_client_with_peer().await;
+        // #720: the teardown is this UPF's; the client is the pool, as in production.
+        let _pool = InstalledPool::new(vec![client.clone()]);
         client.seed_peer_recovery_time_stamp(100).await;
         client.set_assoc_state_for_test(true, None, None).await;
         if let Ok(ctx) = smf_self().read() {
@@ -2564,6 +3903,8 @@ mod tests {
         let status_uri = format!("http://127.0.0.1:{}/callbacks/sm-status", amf_addr.port());
 
         let (client, _upf) = make_client_with_peer().await;
+        // #720: the teardown is this UPF's; the client is the pool, as in production.
+        let _pool = InstalledPool::new(vec![client.clone()]);
         client.seed_peer_recovery_time_stamp(4242).await;
         client.set_assoc_state_for_test(true, None, None).await;
         {

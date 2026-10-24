@@ -238,11 +238,27 @@ pub struct PendingModifyBearer {
     pub seq: u32,
     pub mme_teid: u32,
     /// Sessions still waiting for the SGW-U, with the bearers each switches.
-    pub waiting: std::collections::BTreeMap<u64, Vec<u64>>,
-    /// Bearers already settled as modified.
-    pub modified: Vec<u64>,
+    pub waiting: std::collections::BTreeMap<u64, Vec<SwitchedBearer>>,
+    /// (bearer id, EBI) of the bearers already settled as modified. The EBI is
+    /// kept from when the request was parked, so a bearer deleted meanwhile is
+    /// still named in the answer (#839 review).
+    pub modified: Vec<(u64, u8)>,
     /// (EBI, cause) of the bearers not modified.
     pub marked_for_removal: Vec<(u8, u8)>,
+}
+
+/// A bearer a parked Modify Bearer Request switches, with the downlink endpoint
+/// it had before, restored if the SGW-U does not switch it (#839 review).
+#[derive(Debug, Clone)]
+pub struct SwitchedBearer {
+    pub bearer_id: u64,
+    pub ebi: u8,
+    /// The DL tunnel's (remote TEID, remote IP) before the request.
+    pub previous: Option<(u32, crate::context::IpAddr)>,
+    /// What this request wrote into the DL tunnel: the rollback restores
+    /// `previous` only while the tunnel still holds this (#937 review), so a
+    /// later request that changed the endpoint meanwhile is not undone.
+    pub written: (u32, crate::context::IpAddr),
 }
 
 static PENDING_MODIFY_BEARER: std::sync::Mutex<
@@ -295,14 +311,45 @@ pub fn modify_bearer_session_done(join: u64, sess_id: u64, failure: Option<u8>) 
         let Some(bearers) = pending.waiting.remove(&sess_id) else {
             return;
         };
+        let ctx = sgwc_self();
         match failure {
-            None => pending.modified.extend(bearers),
-            Some(cause) => {
-                let ctx = sgwc_self();
-                for bearer_id in bearers {
-                    if let Some(b) = ctx.bearer_find_by_id(bearer_id) {
-                        pending.marked_for_removal.push((b.ebi, cause));
+            None => {
+                for b in bearers {
+                    if ctx.bearer_find_by_id(b.bearer_id).is_some() {
+                        pending.modified.push((b.bearer_id, b.ebi));
+                    } else {
+                        // Deleted while the modification was pending.
+                        pending
+                            .marked_for_removal
+                            .push((b.ebi, gtp_cause::CONTEXT_NOT_FOUND));
                     }
+                }
+            }
+            Some(cause) => {
+                for b in bearers {
+                    // #839 review: the SGW-U kept its FAR and the MME keeps the
+                    // old eNB endpoint, so the SGW-C does too. Otherwise a later
+                    // PFCP modification built from this tunnel would push an
+                    // endpoint the MME never confirmed.
+                    if let (Some((teid, ip)), Some(mut dl)) =
+                        (b.previous, ctx.dl_tunnel_in_bearer(b.bearer_id))
+                    {
+                        let still_ours = dl.remote_teid == b.written.0
+                            && dl.remote_ip.ipv4 == b.written.1.ipv4
+                            && dl.remote_ip.ipv6 == b.written.1.ipv6;
+                        if still_ours {
+                            dl.remote_teid = teid;
+                            dl.remote_ip = ip;
+                            ctx.tunnel_update(&dl);
+                        } else {
+                            log::info!(
+                                "EBI {}: the DL endpoint changed after this Modify Bearer \
+                                 Request; its refusal leaves the newer one",
+                                b.ebi
+                            );
+                        }
+                    }
+                    pending.marked_for_removal.push((b.ebi, cause));
                 }
             }
         }
@@ -315,6 +362,16 @@ pub fn modify_bearer_session_done(join: u64, sess_id: u64, failure: Option<u8>) 
     if let Some(pending) = done {
         answer_modify_bearer(&pending, failure);
     }
+}
+
+/// The parked Modify Bearer answer `join`, if still waiting. Test/diagnostic.
+#[cfg(test)]
+pub fn modify_bearer_pending(join: u64) -> Option<PendingModifyBearer> {
+    PENDING_MODIFY_BEARER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&join)
+        .cloned()
 }
 
 /// Send the Modify Bearer Response for a settled request.
@@ -704,5 +761,110 @@ fn answer(
     let msg = s11_build::build_error_response(response_type as u8, teid, seq, cause, None);
     if let Err(e) = server.send_response(peer, &msg) {
         log::error!("Failed to answer {peer}: {e}");
+    }
+}
+
+#[cfg(test)]
+mod modify_bearer_tests {
+    use super::*;
+
+    /// #839 review: a bearer deleted while its PFCP modification was pending is
+    /// still named in the answer, by the EBI kept when the request was parked,
+    /// and as not found rather than modified.
+    #[test]
+    fn a_bearer_deleted_while_pending_is_named_by_its_parked_ebi() {
+        // Real contexts (#937 review): a bearer that existed when the request
+        // was parked and was deleted before the SGW-U answered. The parked
+        // map is process-wide: serialised with the tests that count it.
+        let _ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let ctx = sgwc_self();
+        let ue = ctx.ue_add(b"001010937000001").expect("ue");
+        let sess = ctx.sess_add(ue.id, "internet").expect("sess");
+        let mut bearer = ctx.bearer_add(sess.id).expect("bearer");
+        bearer.ebi = 7;
+        ctx.bearer_update(&bearer);
+        let other = ctx.sess_add(ue.id, "ims").expect("sess");
+        let gone = SwitchedBearer {
+            bearer_id: bearer.id,
+            ebi: 7,
+            previous: None,
+            written: (0, Default::default()),
+        };
+        let join = park_modify_bearer(PendingModifyBearer {
+            peer: "127.0.0.1:2123".parse().unwrap(),
+            seq: 0x839,
+            mme_teid: 1,
+            waiting: [(sess.id, vec![gone]), (other.id, vec![])]
+                .into_iter()
+                .collect(),
+            modified: Vec::new(),
+            marked_for_removal: Vec::new(),
+        });
+        ctx.bearer_remove(bearer.id);
+        modify_bearer_session_done(join, sess.id, None);
+        let pending = modify_bearer_pending(join).expect("one session still waiting");
+        assert!(pending.modified.is_empty(), "not reported modified");
+        assert_eq!(
+            pending.marked_for_removal,
+            vec![(7, gtp_cause::CONTEXT_NOT_FOUND)]
+        );
+        modify_bearer_session_done(join, other.id, None);
+        assert!(modify_bearer_pending(join).is_none());
+        ctx.ue_remove(ue.id);
+    }
+
+    /// #937 review: a refusal rolls the DL endpoint back only while the tunnel
+    /// still holds what this request wrote; an endpoint a later request set
+    /// meanwhile stays.
+    #[test]
+    fn a_refusal_does_not_undo_a_newer_endpoint() {
+        let _ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let ctx = sgwc_self();
+        let ue = ctx.ue_add(b"001010937000002").expect("ue");
+        let sess = ctx.sess_add(ue.id, "internet").expect("sess");
+        let mut bearer = ctx.bearer_add(sess.id).expect("bearer");
+        bearer.ebi = 5;
+        ctx.bearer_update(&bearer);
+        let mut dl = ctx.dl_tunnel_in_bearer(bearer.id).expect("a DL tunnel");
+        let park = |written_teid: u32| {
+            park_modify_bearer(PendingModifyBearer {
+                peer: "127.0.0.1:2123".parse().unwrap(),
+                seq: 0x937,
+                mme_teid: 1,
+                waiting: [(
+                    sess.id,
+                    vec![SwitchedBearer {
+                        bearer_id: bearer.id,
+                        ebi: 5,
+                        previous: Some((0x1111, Default::default())),
+                        written: (written_teid, Default::default()),
+                    }],
+                )]
+                .into_iter()
+                .collect(),
+                modified: Vec::new(),
+                marked_for_removal: Vec::new(),
+            })
+        };
+        // Still ours: rolled back.
+        dl.remote_teid = 0x2222;
+        ctx.tunnel_update(&dl);
+        let join = park(0x2222);
+        modify_bearer_session_done(join, sess.id, Some(gtp_cause::SYSTEM_FAILURE));
+        assert_eq!(
+            ctx.dl_tunnel_in_bearer(bearer.id).unwrap().remote_teid,
+            0x1111
+        );
+        // Changed since: left alone.
+        dl.remote_teid = 0x3333;
+        ctx.tunnel_update(&dl);
+        let join = park(0x2222);
+        modify_bearer_session_done(join, sess.id, Some(gtp_cause::SYSTEM_FAILURE));
+        assert_eq!(
+            ctx.dl_tunnel_in_bearer(bearer.id).unwrap().remote_teid,
+            0x3333,
+            "the newer endpoint stays"
+        );
+        ctx.ue_remove(ue.id);
     }
 }

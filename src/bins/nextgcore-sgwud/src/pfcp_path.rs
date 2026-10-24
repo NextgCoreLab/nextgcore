@@ -387,7 +387,145 @@ pub struct SxaNode {
     /// every mutation of `peers`, which is the only way the two can disagree.
     associated_peers: std::sync::atomic::AtomicUsize,
     timers: SgwuTimerConfigs,
+    /// The responses this node sent, for answering a retransmitted request with the
+    /// ORIGINAL response instead of executing it again (#905, TS 29.244 §6.4). A std
+    /// mutex held only to look up or file bytes, never across `.await`.
+    response_cache: std::sync::Mutex<ResponseCache>,
 }
+
+/// A cached request/response key: (peer, request sequence number, request type).
+type CacheKey = (SocketAddr, u32, u8);
+
+/// The PFCP response cache (#905, TS 29.244 §6.4).
+///
+/// - A retransmission is "the same message content, including the same PFCP header"
+///   (§6.4), so a request is matched on (peer, sequence number, type) AND a digest
+///   of the WHOLE datagram. Matching on the body alone let two Deletions for
+///   different SEIDs (whose bodies are both empty) collide.
+/// - Expiry is amortized O(1): every insertion is queued in order, and only the
+///   expired front of the queue is examined. A full sweep per message made the
+///   node's cost grow with the cache.
+/// - The cache is bounded (`cap`): beyond it the oldest answers are dropped first.
+///   Only associated peers' session/association requests are cached (not
+///   Heartbeats), so an unassociated sender cannot fill it.
+/// - A request still being handled when its retransmission arrives is reported as
+///   IN FLIGHT, so the retransmission is dropped rather than executed a second time.
+pub(crate) struct ResponseCache {
+    ttl: std::time::Duration,
+    cap: usize,
+    answered: HashMap<CacheKey, CachedResponse>,
+    in_flight: HashMap<CacheKey, (std::time::Instant, u64)>,
+    order: std::collections::VecDeque<(std::time::Instant, CacheKey)>,
+}
+
+struct CachedResponse {
+    at: std::time::Instant,
+    /// Digest of the whole request datagram it answered.
+    request_digest: u64,
+    bytes: Vec<u8>,
+}
+
+/// What a cache lookup decided for an incoming request.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CacheLookup {
+    /// A retransmission of an answered request: re-send these bytes.
+    Replay(Vec<u8>),
+    /// A retransmission of a request still being handled: drop it.
+    InFlight,
+    /// A new request: handle it (its response will be filed).
+    New,
+}
+
+impl ResponseCache {
+    pub(crate) fn new(ttl: std::time::Duration, cap: usize) -> Self {
+        Self {
+            ttl,
+            cap,
+            answered: HashMap::new(),
+            in_flight: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Pop the expired front of the queue; a queue item whose key was re-filed later
+    /// (a newer instant) is skipped. Amortized O(1) per insertion.
+    fn expire(&mut self, now: std::time::Instant) {
+        while let Some(&(at, key)) = self.order.front() {
+            if now.duration_since(at) < self.ttl && self.answered.len() <= self.cap {
+                break;
+            }
+            self.order.pop_front();
+            if self.answered.get(&key).is_some_and(|c| c.at == at) {
+                self.answered.remove(&key);
+            }
+            if self.in_flight.get(&key).is_some_and(|(t, _)| *t == at) {
+                self.in_flight.remove(&key);
+            }
+        }
+    }
+
+    pub(crate) fn on_request(
+        &mut self,
+        key: CacheKey,
+        datagram: &[u8],
+        now: std::time::Instant,
+    ) -> CacheLookup {
+        self.expire(now);
+        let digest = digest(datagram);
+        if let Some(c) = self.answered.get(&key) {
+            if c.request_digest == digest {
+                return CacheLookup::Replay(c.bytes.clone());
+            }
+        }
+        if self.in_flight.get(&key).is_some_and(|(_, d)| *d == digest) {
+            return CacheLookup::InFlight;
+        }
+        self.answered.remove(&key);
+        self.in_flight.insert(key, (now, digest));
+        self.order.push_back((now, key));
+        CacheLookup::New
+    }
+
+    /// File the response to the in-flight request `key`.
+    pub(crate) fn on_response(&mut self, key: CacheKey, bytes: &[u8], now: std::time::Instant) {
+        let Some((_, request_digest)) = self.in_flight.remove(&key) else {
+            return;
+        };
+        self.answered.insert(
+            key,
+            CachedResponse {
+                at: now,
+                request_digest,
+                bytes: bytes.to_vec(),
+            },
+        );
+        self.order.push_back((now, key));
+        self.expire(now);
+    }
+
+    /// Forget a peer: it restarted (new Association Setup, changed Recovery Time
+    /// Stamp), so its new requests -- numbered from 1 again -- must never hit answers
+    /// given to the old instance. O(n), but only on a restart.
+    pub(crate) fn flush_peer(&mut self, peer: SocketAddr) {
+        self.answered.retain(|(p, _, _), _| *p != peer);
+        self.in_flight.retain(|(p, _, _), _| *p != peer);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.answered.len()
+    }
+}
+
+fn digest(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
+}
+
+/// At most this many cached answers (#908 review): the oldest go first beyond it.
+const RESPONSE_CACHE_CAP: usize = 65_536;
 
 impl SxaNode {
     /// Bind the Sxa PFCP socket and install the process-wide node.
@@ -410,10 +548,9 @@ impl SxaNode {
     ) -> std::io::Result<Arc<Self>> {
         let socket = UdpSocket::bind(bind).await?;
         let bound = socket.local_addr()?;
-        let recovery_time_stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as u32)
-            .unwrap_or(1);
+        // #995: NTP-era seconds (TS 29.244 §8.2.65), not Unix seconds.
+        let recovery_time_stamp = nextgcore_pfcp::recovery_time::now();
+        let cache_ttl = timers.no_heartbeat.duration * (timers.no_heartbeat.max_count.max(2) + 2);
         let node = Arc::new(Self {
             socket: Arc::new(socket),
             local_ip,
@@ -423,6 +560,13 @@ impl SxaNode {
             peers: RwLock::new(HashMap::new()),
             associated_peers: std::sync::atomic::AtomicUsize::new(0),
             timers,
+            // #908 review: the window is this node's own T1 x (N1 + 1) plus one T1 of
+            // margin -- the SGW-C is assumed to retransmit on the same timers; there is
+            // no way to learn the peer's.
+            response_cache: std::sync::Mutex::new(ResponseCache::new(
+                cache_ttl,
+                RESPONSE_CACHE_CAP,
+            )),
         });
         log::info!(
             "PFCP/Sxa listening on {bound} (Node ID {local_ip}, Recovery Time Stamp \
@@ -502,6 +646,15 @@ impl SxaNode {
         let mut buf = BytesMut::with_capacity(4 + after_length + body.len());
         header.encode(&mut buf);
         buf.extend_from_slice(body);
+        // #905: remember a RESPONSE so a retransmission of its request (same peer, same
+        // sequence number) is answered with it. PFCP request types are the response
+        // types minus one (Table 7.3-1). Expired entries are swept on the way in.
+        if is_response_type(msg_type) && msg_type != pfcp_msg_type::VERSION_NOT_SUPPORTED_RESPONSE {
+            // Filed only if the request was registered as in flight (i.e. cacheable).
+            if let Ok(mut cache) = self.response_cache.lock() {
+                cache.on_response((to, seq, msg_type - 1), &buf, std::time::Instant::now());
+            }
+        }
         self.socket
             .send_to(&buf, to)
             .await
@@ -714,6 +867,55 @@ impl SxaNode {
             return;
         }
 
+        // #905 (TS 29.244 §6.4): a request we already answered is a RETRANSMISSION --
+        // the peer lost our response. It is answered with that response and NOT
+        // executed again: re-running an Establishment re-installed its rules on the
+        // live session, and a Modification applied its changes twice.
+        // Only an ASSOCIATED peer's session/association requests are cached (#908
+        // review): Heartbeats are idempotent, and an unassociated sender must not be
+        // able to fill the cache.
+        let cacheable = msg_type != pfcp_msg_type::HEARTBEAT_REQUEST
+            && self.peers.read().await.contains_key(&from);
+        if cacheable {
+            let key = (from, header.sequence_number, msg_type);
+            let lookup = self
+                .response_cache
+                .lock()
+                .map(|mut c| c.on_request(key, pkt, std::time::Instant::now()))
+                .unwrap_or(CacheLookup::New);
+            match lookup {
+                CacheLookup::Replay(bytes) => {
+                    log::info!(
+                        "PFCP type={msg_type} seq={} from {from} is a retransmission: \
+                         re-sending the original response",
+                        header.sequence_number
+                    );
+                    if let Err(e) = self.socket.send_to(&bytes, from).await {
+                        log::warn!("Failed to re-send PFCP response to {from}: {e}");
+                    }
+                    return;
+                }
+                CacheLookup::InFlight => {
+                    log::info!(
+                        "PFCP type={msg_type} seq={} from {from} is a retransmission of a \
+                         request still being handled: dropped",
+                        header.sequence_number
+                    );
+                    return;
+                }
+                CacheLookup::New => {}
+            }
+            // A NEW Association Setup from a peer is a restart: nothing it sent before
+            // may be answered from the cache again.
+            if msg_type == pfcp_msg_type::ASSOCIATION_SETUP_REQUEST {
+                if let Ok(mut c) = self.response_cache.lock() {
+                    c.flush_peer(from);
+                    // ...but this request's own answer is still filed.
+                    let _ = c.on_request(key, pkt, std::time::Instant::now());
+                }
+            }
+        }
+
         match msg_type {
             pfcp_msg_type::HEARTBEAT_REQUEST => {
                 self.handle_heartbeat_request(&header, &body, from).await;
@@ -823,9 +1025,11 @@ impl SxaNode {
                     fsm,
                 }
             });
-            let restarted = matches!(peer.recovery_time_stamp, Some(stored) if stored != req.recovery_time_stamp);
+            // #995: in the NTP reading (a pre-#995 SGW-C sends Unix seconds).
+            let rts = nextgcore_pfcp::recovery_time::normalize_received(req.recovery_time_stamp);
+            let restarted = matches!(peer.recovery_time_stamp, Some(stored) if stored != rts);
             peer.state = PfcpNodeState::Associated;
-            peer.recovery_time_stamp = Some(req.recovery_time_stamp);
+            peer.recovery_time_stamp = Some(rts);
             peer.missed_heartbeats = 0;
             // Drive the FSM the same way the association just went on the wire:
             // Initial -> WillAssociate -> Associated. Keeping it in step is what lets
@@ -917,6 +1121,8 @@ impl SxaNode {
 
     /// Record a peer's Recovery Time Stamp, flushing its sessions if it changed.
     async fn note_peer_recovery_time_stamp(&self, from: SocketAddr, rts: u32) {
+        // #995: in the NTP reading, as stored at association.
+        let rts = nextgcore_pfcp::recovery_time::normalize_received(rts);
         let restarted = {
             let mut peers = self.peers.write().await;
             let Some(peer) = peers.get_mut(&from) else {
@@ -940,6 +1146,11 @@ impl SxaNode {
     /// detected on a heartbeat or a re-association): its sessions are gone on the CP
     /// side, but the peer itself is still there to talk to.
     async fn run_restoration(&self, from: SocketAddr) {
+        // #908 review: the peer restarted, so none of its old answers may be replayed
+        // to the new instance (whose sequence numbers start again).
+        if let Ok(mut c) = self.response_cache.lock() {
+            c.flush_peer(from);
+        }
         let mut peers = self.peers.write().await;
         let Some(peer) = peers.get_mut(&from) else {
             return;
@@ -1182,38 +1393,26 @@ impl SxaNode {
         // its sessions from 1 again; matched by SEID alone, its first Establishment was
         // answered from the OLD SGW-C's session, still tagged with the old node, and
         // that node's restoration then deleted the new UE's rules.
-        let sess = match ctx.sess_find_by_sgwc_sxa_f_seid(&cp_f_seid) {
-            // A repeated Establishment for a CP F-SEID we already hold is the CP
-            // retransmitting: answer from the existing session rather than allocating a
-            // second one for the same UE.
-            Some(existing) => existing,
-            None => match ctx.sess_add_for_node(&cp_f_seid, node_id) {
-                Some(sess) => sess,
-                None => {
-                    log::error!(
-                        "Cannot add SGW-U session for CP F-SEID 0x{:x}",
-                        cp_f_seid.seid
-                    );
-                    self.reply_error(
-                        header,
-                        pfcp_msg_type::SESSION_ESTABLISHMENT_RESPONSE,
-                        cp_f_seid.seid,
-                        sxa_build::pfcp_cause::NO_RESOURCES_AVAILABLE,
-                        from,
-                    )
-                    .await;
-                    return;
-                }
-            },
-        };
-
         let parsed = establishment_from_lib(&req, &cp_f_seid);
-        let (result, created_pdrs) =
-            crate::sxa_handler::handle_session_establishment_request(Some(&sess), 0, &parsed);
-        // Re-read: the handler installs PDRs/FARs/QERs/URRs on the stored session.
-        let sess = ctx.sess_find_by_id(sess.id).unwrap_or(sess);
-        match result {
-            crate::sxa_handler::HandlerResult::Error(cause) => {
+        let outcome = establish_session(ctx, &cp_f_seid, node_id, |sess| {
+            crate::sxa_handler::handle_session_establishment_request(Some(sess), 0, &parsed)
+        });
+        match outcome {
+            Establishment::NoResources => {
+                log::error!(
+                    "Cannot add SGW-U session for CP F-SEID 0x{:x}",
+                    cp_f_seid.seid
+                );
+                self.reply_error(
+                    header,
+                    pfcp_msg_type::SESSION_ESTABLISHMENT_RESPONSE,
+                    cp_f_seid.seid,
+                    sxa_build::pfcp_cause::NO_RESOURCES_AVAILABLE,
+                    from,
+                )
+                .await;
+            }
+            Establishment::Rejected(cause) => {
                 self.reply_error(
                     header,
                     pfcp_msg_type::SESSION_ESTABLISHMENT_RESPONSE,
@@ -1223,7 +1422,7 @@ impl SxaNode {
                 )
                 .await;
             }
-            _ => {
+            Establishment::Accepted(sess, created_pdrs) => {
                 let Some(msg) =
                     sxa_build::build_session_establishment_response(&sess, &created_pdrs)
                 else {
@@ -1458,6 +1657,65 @@ fn apply_action_octet(action: &LibApplyAction) -> u8 {
 /// library models the two as `true` = open, so both are inverted here.
 fn gate_status_octet(gate: &LibGateStatus) -> u8 {
     ((!gate.ul_gate) as u8) | (((!gate.dl_gate) as u8) << 2)
+}
+
+/// The outcome of [`establish_session`].
+enum Establishment {
+    /// The session could not be created at all.
+    NoResources,
+    /// The request was rejected with this cause. A session this request CREATED has
+    /// been removed again, with every rule and TEID it had installed (#836).
+    Rejected(u8),
+    /// Accepted: the session as stored after the rules were installed.
+    Accepted(Box<SgwuSess>, Vec<sxa_build::CreatedPdr>),
+}
+
+/// Find or create the session for an Establishment and run `install` on it (#836).
+///
+/// A repeated Establishment for a CP F-SEID already held is the CP retransmitting, so
+/// it is answered from the existing session (#700: matched by the whole F-SEID). A
+/// session created HERE whose installation is rejected is removed again: the SGW-C
+/// was told the Establishment failed, so it will never delete it, and before this the
+/// session -- and the PDRs, TEIDs and URRs installed before the failing IE -- stayed
+/// until a CP peer restart flushed it. A retransmitted Establishment that fails leaves
+/// the existing session alone: it was established by an earlier request.
+fn establish_session(
+    ctx: &crate::context::SgwuContext,
+    cp_f_seid: &crate::context::FSeid,
+    node_id: Option<u64>,
+    install: impl FnOnce(
+        &SgwuSess,
+    ) -> (
+        crate::sxa_handler::HandlerResult,
+        Vec<sxa_build::CreatedPdr>,
+    ),
+) -> Establishment {
+    let (sess, created_here) = match ctx.sess_find_by_sgwc_sxa_f_seid(cp_f_seid) {
+        Some(existing) => (existing, false),
+        None => match ctx.sess_add_for_node(cp_f_seid, node_id) {
+            Some(sess) => (sess, true),
+            None => return Establishment::NoResources,
+        },
+    };
+    let (result, created_pdrs) = install(&sess);
+    match result {
+        crate::sxa_handler::HandlerResult::Error(cause) => {
+            if created_here {
+                log::warn!(
+                    "Session Establishment for CP F-SEID 0x{:x} rejected (cause {cause}): \
+                     removing the session it created",
+                    cp_f_seid.seid
+                );
+                ctx.sess_remove(sess.id);
+            }
+            Establishment::Rejected(cause)
+        }
+        // Re-read: the handler installs PDRs/FARs/QERs/URRs on the stored session.
+        _ => Establishment::Accepted(
+            Box::new(ctx.sess_find_by_id(sess.id).unwrap_or(sess)),
+            created_pdrs,
+        ),
+    }
 }
 
 /// Scan a flat TLV body for the Cause IE (type 19).
@@ -1812,6 +2070,25 @@ pub enum PathReport {
     Recovery,
 }
 
+/// The Remote GTP-U Peers of a path report (#957).
+fn peer_list(peers: &[IpAddr]) -> LibUserPlanePathFailureReport {
+    LibUserPlanePathFailureReport {
+        remote_gtpu_peers: peers
+            .iter()
+            .map(|ip| match ip {
+                IpAddr::V4(v4) => LibRemoteGtpUPeer {
+                    ipv4: Some(v4.octets()),
+                    ipv6: None,
+                },
+                IpAddr::V6(v6) => LibRemoteGtpUPeer {
+                    ipv4: None,
+                    ipv6: Some(v6.octets()),
+                },
+            })
+            .collect(),
+    }
+}
+
 /// Report a GTP-U user-plane path failure (or recovery) to the SGW-C with a PFCP
 /// Node Report Request (TS 23.007 §20.3.4, TS 29.244 §7.4.5). Issue #217.
 ///
@@ -1849,24 +2126,12 @@ pub fn send_node_report_request(peers: &[IpAddr], report: PathReport) -> Result<
     let request = NodeReportRequest {
         node_id: NodeId::new_ipv4(node.local_ip.octets()),
         node_report_type,
-        // TS 29.244 Table 7.4.5.1-1 carries the peer list in a User Plane Path
-        // Failure Report for both directions; §8.2.83's Remote GTP-U Peer is the
-        // member that names which path.
-        user_plane_path_failure_report: Some(LibUserPlanePathFailureReport {
-            remote_gtpu_peers: peers
-                .iter()
-                .map(|ip| match ip {
-                    IpAddr::V4(v4) => LibRemoteGtpUPeer {
-                        ipv4: Some(v4.octets()),
-                        ipv6: None,
-                    },
-                    IpAddr::V6(v6) => LibRemoteGtpUPeer {
-                        ipv4: None,
-                        ipv6: Some(v6.octets()),
-                    },
-                })
-                .collect(),
-        }),
+        // #957 (TS 29.244 Table 7.4.5.1-1): a FAILURE lists the peers in a User Plane
+        // Path Failure Report (IE 102), a RECOVERY in a User Plane Path Recovery Report
+        // (IE 187). Recovery used to ride in a Failure Report too, so a conformant
+        // SGW-C read recovered paths as failed. §8.2.70's Remote GTP-U Peer names each.
+        user_plane_path_failure_report: (report == PathReport::Failure).then(|| peer_list(peers)),
+        user_plane_path_recovery_report: (report == PathReport::Recovery).then(|| peer_list(peers)),
     };
     let mut body = BytesMut::new();
     request.encode(&mut body);
@@ -2001,7 +2266,355 @@ mod tests {
     };
     use nextgcore_pfcp::types::{CreateQer, CreateUrr};
 
+    /// #836: a rejected Establishment removes the session IT created, with the PDR
+    /// and TEID installed before the failing IE; a rejected RETRANSMISSION leaves the
+    /// session the earlier request established alone. A private context, so the
+    /// counts are this test's own.
+    #[test]
+    fn a_rejected_establishment_removes_only_the_session_it_created() {
+        let ctx = crate::context::SgwuContext::with_first_sess_id(0x8360_0000);
+        let f_seid = crate::context::FSeid::with_ipv4(0x836, Ipv4Addr::new(10, 8, 3, 6));
+        let install_then_fail = |sess: &SgwuSess| {
+            ctx.pdr_install(crate::context::SgwuPdr {
+                sess_id: sess.id,
+                pdr_id: 1,
+                local_teid: 0x8361,
+                ..Default::default()
+            });
+            (
+                crate::sxa_handler::HandlerResult::Error(sxa_build::pfcp_cause::SYSTEM_FAILURE),
+                Vec::new(),
+            )
+        };
+
+        let out = establish_session(&ctx, &f_seid, Some(7), install_then_fail);
+        assert!(
+            matches!(out, Establishment::Rejected(c) if c == sxa_build::pfcp_cause::SYSTEM_FAILURE)
+        );
+        assert_eq!(ctx.sess_count(), 0, "the half-built session is gone");
+        assert!(ctx.pdr_find_by_teid(0x8361).is_none(), "and so is its TEID");
+
+        // Established for real, then a retransmission of it is rejected.
+        let ok = establish_session(&ctx, &f_seid, Some(7), |_| {
+            (crate::sxa_handler::HandlerResult::Ok, Vec::new())
+        });
+        let Establishment::Accepted(sess, _) = ok else {
+            panic!("accepted");
+        };
+        assert_eq!(sess.pfcp_node_id, Some(7));
+        let again = establish_session(&ctx, &f_seid, Some(7), install_then_fail);
+        assert!(matches!(again, Establishment::Rejected(_)));
+        assert!(
+            ctx.sess_find_by_id(sess.id).is_some(),
+            "a rejected retransmission must not tear down the established session"
+        );
+    }
+
+    /// #905 (TS 29.244 §6.4): a retransmitted request -- same peer, same sequence
+    /// number, because our response was lost -- is answered with the ORIGINAL response
+    /// and not executed again. Before, a duplicate Establishment re-ran on the live
+    /// session (a second CH F-TEID was allocated, so the "same" answer differed) and a
+    /// duplicate Deletion answered "context not found".
+    #[tokio::test]
+    async fn a_retransmitted_request_is_answered_from_the_cache_not_re_executed() {
+        let (_guard, node, peer) = node_and_peer().await;
+        let mut assoc = BytesMut::new();
+        PfcpLibMessage::AssociationSetupRequest(AssociationSetupRequest::new(
+            NodeId::new_ipv4([127, 0, 0, 9]),
+            1000,
+        ))
+        .encode_body(&mut assoc);
+        deliver(
+            &node,
+            &peer,
+            &wire(pfcp_msg_type::ASSOCIATION_SETUP_REQUEST, None, 1, &assoc),
+        )
+        .await;
+        let _ = recv_decoded(&peer).await;
+
+        let cp_seid = 0x0000_0000_0000_0905u64;
+        let mut req = LibSessionEstablishmentRequest::new(
+            NodeId::new_ipv4([127, 0, 0, 9]),
+            LibFSeid::new_ipv4(cp_seid, [127, 0, 0, 9]),
+        );
+        let mut pdi = Pdi::new(SourceInterface::Access);
+        let mut f_teid = FTeid::new_ipv4(0, [127, 0, 0, 1]);
+        f_teid.ch = true;
+        pdi.local_f_teid = Some(f_teid);
+        let mut pdr = CreatePdr::new(1, 100, pdi);
+        pdr.far_id = Some(1);
+        req.create_pdrs.push(pdr);
+        let mut far = CreateFar::new(1, ApplyAction::forward());
+        far.forwarding_parameters = Some(ForwardingParameters::new(DestinationInterface::Core));
+        req.create_fars.push(far);
+        let mut body = BytesMut::new();
+        req.encode(&mut body);
+        let establishment = wire(
+            pfcp_msg_type::SESSION_ESTABLISHMENT_REQUEST,
+            Some(0),
+            21,
+            &body,
+        );
+
+        deliver(&node, &peer, &establishment).await;
+        let (h1, b1) = recv_decoded(&peer).await;
+        assert_eq!(
+            find_cause(&b1),
+            Some(sxa_build::pfcp_cause::REQUEST_ACCEPTED)
+        );
+        let ctx = sgwu_self();
+        let sess = ctx
+            .sess_find_by_sgwc_sxa_seid(cp_seid)
+            .expect("established");
+        let teid = ctx.pdr_find(sess.id, 1).expect("PDR installed").local_teid;
+
+        deliver(&node, &peer, &establishment).await;
+        let (h2, b2) = recv_decoded(&peer).await;
+        assert_eq!(h2.sequence_number, h1.sequence_number);
+        assert_eq!(b2, b1, "the retransmission gets the ORIGINAL response");
+        assert_eq!(
+            ctx.pdr_find(sess.id, 1).unwrap().local_teid,
+            teid,
+            "and was not executed again (no second F-TEID allocated)"
+        );
+
+        let deletion = wire(
+            pfcp_msg_type::SESSION_DELETION_REQUEST,
+            Some(sess.sgwu_sxa_seid),
+            22,
+            &[],
+        );
+        deliver(&node, &peer, &deletion).await;
+        let (_, d1) = recv_decoded(&peer).await;
+        assert_eq!(
+            find_cause(&d1),
+            Some(sxa_build::pfcp_cause::REQUEST_ACCEPTED)
+        );
+        deliver(&node, &peer, &deletion).await;
+        let (_, d2) = recv_decoded(&peer).await;
+        assert_eq!(
+            find_cause(&d2),
+            Some(sxa_build::pfcp_cause::REQUEST_ACCEPTED),
+            "a duplicate Deletion repeats the acceptance, not 'context not found'"
+        );
+        assert_eq!(d2, d1);
+    }
+
+    /// #908 review M1 (TS 29.244 §6.4: a retransmission has "the same message content,
+    /// including the same PFCP header"): two Deletions with the same sequence number
+    /// but different SEIDs are DIFFERENT requests. Digesting only the (empty) body made
+    /// the second one -- for the real session -- be answered from the first one's cache
+    /// entry (cause 65, the wrong SEID), and the session was never deleted.
+    #[tokio::test]
+    async fn requests_differing_only_in_the_header_are_not_retransmissions() {
+        let (_guard, node, peer) = node_and_peer().await;
+        let mut assoc = BytesMut::new();
+        PfcpLibMessage::AssociationSetupRequest(AssociationSetupRequest::new(
+            NodeId::new_ipv4([127, 0, 0, 9]),
+            1000,
+        ))
+        .encode_body(&mut assoc);
+        deliver(
+            &node,
+            &peer,
+            &wire(pfcp_msg_type::ASSOCIATION_SETUP_REQUEST, None, 1, &assoc),
+        )
+        .await;
+        let _ = recv_decoded(&peer).await;
+        let ctx = sgwu_self();
+        let sess = ctx
+            .sess_add_for_node(&FSeid::with_ipv4(0x9081, Ipv4Addr::new(127, 0, 0, 9)), None)
+            .unwrap();
+
+        let unknown = wire(
+            pfcp_msg_type::SESSION_DELETION_REQUEST,
+            Some(0xDEAD),
+            30,
+            &[],
+        );
+        deliver(&node, &peer, &unknown).await;
+        let (_, b1) = recv_decoded(&peer).await;
+        assert_eq!(
+            find_cause(&b1),
+            Some(sxa_build::pfcp_cause::SESSION_CONTEXT_NOT_FOUND)
+        );
+
+        let real = wire(
+            pfcp_msg_type::SESSION_DELETION_REQUEST,
+            Some(sess.sgwu_sxa_seid),
+            30,
+            &[],
+        );
+        deliver(&node, &peer, &real).await;
+        let (h2, b2) = recv_decoded(&peer).await;
+        assert_eq!(
+            find_cause(&b2),
+            Some(sxa_build::pfcp_cause::REQUEST_ACCEPTED)
+        );
+        assert_ne!(
+            h2.seid,
+            Some(0xDEAD),
+            "not the cached answer for the other SEID"
+        );
+        assert!(
+            ctx.sess_find_by_id(sess.id).is_none(),
+            "the real session was deleted"
+        );
+    }
+
+    /// #908 review M2: Heartbeats and requests from unassociated peers are not cached,
+    /// so nobody can fill the cache by sending them.
+    #[tokio::test]
+    async fn heartbeats_and_unassociated_requests_are_not_cached() {
+        let (_guard, node, peer) = node_and_peer().await;
+        for seq in 0..50u32 {
+            let mut body = BytesMut::new();
+            PfcpLibMessage::HeartbeatRequest(HeartbeatRequest::new(100)).encode_body(&mut body);
+            deliver(
+                &node,
+                &peer,
+                &wire(pfcp_msg_type::HEARTBEAT_REQUEST, None, seq, &body),
+            )
+            .await;
+            let _ = recv_decoded(&peer).await;
+        }
+        // An unassociated peer's session request is answered but not cached.
+        deliver(
+            &node,
+            &peer,
+            &wire(
+                pfcp_msg_type::SESSION_DELETION_REQUEST,
+                Some(0xBEEF),
+                99,
+                &[],
+            ),
+        )
+        .await;
+        let _ = recv_decoded(&peer).await;
+        assert_eq!(node.response_cache.lock().unwrap().len(), 0);
+    }
+
+    fn ck(seq: u32) -> CacheKey {
+        (
+            "127.0.0.9:8805".parse().unwrap(),
+            seq,
+            pfcp_msg_type::SESSION_MODIFICATION_REQUEST,
+        )
+    }
+
+    /// #908 review: a retransmission that arrives while the original is still being
+    /// handled is dropped (IN FLIGHT), not executed a second time; once answered it is
+    /// replayed; a peer restart flushes the peer.
+    #[test]
+    fn the_response_cache_drops_in_flight_retransmissions_and_replays_answers() {
+        let now = std::time::Instant::now();
+        let mut c = ResponseCache::new(std::time::Duration::from_secs(30), 16);
+        assert_eq!(c.on_request(ck(1), b"req", now), CacheLookup::New);
+        assert_eq!(c.on_request(ck(1), b"req", now), CacheLookup::InFlight);
+        c.on_response(ck(1), b"resp", now);
+        assert_eq!(
+            c.on_request(ck(1), b"req", now),
+            CacheLookup::Replay(b"resp".to_vec())
+        );
+        assert_eq!(
+            c.on_request(ck(1), b"other", now),
+            CacheLookup::New,
+            "different bytes"
+        );
+        c.on_response(ck(1), b"resp2", now);
+        c.flush_peer("127.0.0.9:8805".parse().unwrap());
+        assert_eq!(
+            c.on_request(ck(1), b"other", now),
+            CacheLookup::New,
+            "flushed"
+        );
+    }
+
+    /// #908 review M2: expiry is amortized O(1) and the cache is bounded. 300 000
+    /// answers, then lookups: each lookup only pops the expired front instead of
+    /// scanning the whole cache (it used to cost ~17 ms per message at this size), and
+    /// past `cap` the oldest answers go.
+    #[test]
+    fn the_response_cache_is_bounded_and_expires_in_amortized_constant_time() {
+        let t0 = std::time::Instant::now();
+        let mut c = ResponseCache::new(std::time::Duration::from_secs(30), 300_000);
+        for seq in 0..300_000u32 {
+            assert_eq!(c.on_request(ck(seq), b"r", t0), CacheLookup::New);
+            c.on_response(ck(seq), b"a", t0);
+        }
+        assert_eq!(c.len(), 300_000);
+        let start = std::time::Instant::now();
+        for seq in 300_000..300_100u32 {
+            c.on_request(ck(seq), b"r", t0);
+        }
+        let per = start.elapsed() / 100;
+        assert!(
+            per < std::time::Duration::from_millis(1),
+            "per message: {per:?}"
+        );
+
+        // Everything expires at once, in one pass over the queue.
+        let later = t0 + std::time::Duration::from_secs(31);
+        c.on_request(ck(1), b"r", later);
+        assert_eq!(c.len(), 0, "expired answers are gone");
+
+        let mut small = ResponseCache::new(std::time::Duration::from_secs(30), 3);
+        for seq in 0..5u32 {
+            small.on_request(ck(seq), b"r", t0);
+            small.on_response(ck(seq), b"a", t0);
+        }
+        assert_eq!(small.len(), 3, "bounded by cap");
+        assert_eq!(
+            small.on_request(ck(4), b"r", t0),
+            CacheLookup::Replay(b"a".to_vec())
+        );
+        assert_eq!(
+            small.on_request(ck(0), b"r", t0),
+            CacheLookup::New,
+            "oldest dropped"
+        );
+    }
+
     /// A bound node plus a socket standing in for the SGW-C.
+    /// #995: the SGW-U's own Recovery Time Stamp is NTP-era seconds (TS 29.244
+    /// §8.2.65), and a pre-#995 SGW-C's Unix-seconds stamp is stored in the NTP
+    /// reading, so the same SGW-C re-associating with it is not a restart.
+    #[tokio::test]
+    async fn recovery_time_stamps_are_ntp_seconds() {
+        let (_guard, node, peer) = node_and_peer().await;
+        let now = nextgcore_pfcp::recovery_time::now();
+        assert!(now.wrapping_sub(node.recovery_time_stamp) < 60);
+
+        let unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 3600;
+        let mut assoc = BytesMut::new();
+        PfcpLibMessage::AssociationSetupRequest(AssociationSetupRequest::new(
+            NodeId::new_ipv4([127, 0, 0, 9]),
+            unix as u32,
+        ))
+        .encode_body(&mut assoc);
+        deliver(
+            &node,
+            &peer,
+            &wire(pfcp_msg_type::ASSOCIATION_SETUP_REQUEST, None, 1, &assoc),
+        )
+        .await;
+        let _ = recv_decoded(&peer).await;
+        let stored = node
+            .peers()
+            .await
+            .into_iter()
+            .find(|p| p.addr == peer.local_addr().unwrap())
+            .and_then(|p| p.recovery_time_stamp);
+        assert_eq!(
+            stored,
+            Some(nextgcore_pfcp::recovery_time::from_unix_secs(unix))
+        );
+    }
+
     async fn node_and_peer() -> (SxaTestGuard, Arc<SxaNode>, UdpSocket) {
         let guard = sxa_test_guard().await;
         sgwu_context_init(1024);
@@ -2351,6 +2964,113 @@ mod tests {
             ctx.pdr_find(sess.id, 1).is_some(),
             "the Create PDR must have been INSTALLED on the session, not just parsed"
         );
+    }
+
+    /// #871 review: Update FAR leaving BUFF, end to end over the Sxa socket. A buffering
+    /// downlink FAR switched to FORW is accepted, forwards, and its buffer is emptied
+    /// with no flush left running; switched back to BUFF and then to DROP, the buffer
+    /// is discarded rather than kept until the session goes.
+    #[tokio::test]
+    async fn an_update_far_leaving_buff_over_the_wire_empties_the_buffer() {
+        let (_guard, node, peer) = node_and_peer().await;
+        let mut assoc = BytesMut::new();
+        PfcpLibMessage::AssociationSetupRequest(AssociationSetupRequest::new(
+            NodeId::new_ipv4([127, 0, 0, 9]),
+            3000,
+        ))
+        .encode_body(&mut assoc);
+        deliver(
+            &node,
+            &peer,
+            &wire(pfcp_msg_type::ASSOCIATION_SETUP_REQUEST, None, 1, &assoc),
+        )
+        .await;
+        let _ = recv_decoded(&peer).await;
+
+        let cp_seid = 0x0000_0000_0000_0871u64;
+        let mut req = LibSessionEstablishmentRequest::new(
+            NodeId::new_ipv4([127, 0, 0, 9]),
+            LibFSeid::new_ipv4(cp_seid, [127, 0, 0, 9]),
+        );
+        let mut pdi = Pdi::new(SourceInterface::Core);
+        let mut f_teid = FTeid::new_ipv4(0, [127, 0, 0, 1]);
+        f_teid.ch = true;
+        pdi.local_f_teid = Some(f_teid);
+        let mut pdr = CreatePdr::new(1, 100, pdi);
+        pdr.far_id = Some(1);
+        req.create_pdrs.push(pdr);
+        let mut far = CreateFar::new(1, ApplyAction::buffer());
+        far.forwarding_parameters = Some(ForwardingParameters::new(DestinationInterface::Access));
+        req.create_fars.push(far);
+        let mut body = BytesMut::new();
+        req.encode(&mut body);
+        deliver(
+            &node,
+            &peer,
+            &wire(
+                pfcp_msg_type::SESSION_ESTABLISHMENT_REQUEST,
+                Some(0),
+                2,
+                &body,
+            ),
+        )
+        .await;
+        let _ = recv_decoded(&peer).await;
+        let ctx = sgwu_self();
+        let sess = ctx
+            .sess_find_by_sgwc_sxa_seid(cp_seid)
+            .expect("established");
+        let buff = crate::context::apply_action::BUFF;
+        assert_eq!(ctx.far_find(sess.id, 1).unwrap().apply_action & buff, buff);
+
+        let update = |seq: u32, action: ApplyAction| {
+            let mut m = LibSessionModificationRequest::new();
+            let mut u = nextgcore_pfcp::types::UpdateFar::new(1);
+            u.apply_action = Some(action);
+            m.update_fars.push(u);
+            let mut b = BytesMut::new();
+            m.encode(&mut b);
+            wire(
+                pfcp_msg_type::SESSION_MODIFICATION_REQUEST,
+                Some(sess.sgwu_sxa_seid),
+                seq,
+                &b,
+            )
+        };
+
+        // BUFF -> FORW: accepted, forwarding, buffer emptied, no flush left running.
+        ctx.far_buffer_packet(sess.id, 1, b"buffered".to_vec(), 8);
+        deliver(&node, &peer, &update(3, ApplyAction::forward())).await;
+        let (_, resp) = recv_decoded(&peer).await;
+        assert_eq!(
+            find_cause(&resp),
+            Some(sxa_build::pfcp_cause::REQUEST_ACCEPTED)
+        );
+        let far = ctx.far_find(sess.id, 1).unwrap();
+        assert_ne!(far.apply_action & crate::context::apply_action::FORW, 0);
+        assert!(
+            far.buffered.is_empty() && !far.flushing,
+            "flushed (or dropped), not left"
+        );
+
+        // Back to BUFF, buffer, then BUFF -> DROP: the buffer is discarded.
+        deliver(&node, &peer, &update(4, ApplyAction::buffer())).await;
+        let _ = recv_decoded(&peer).await;
+        ctx.far_buffer_packet(sess.id, 1, b"doomed".to_vec(), 8);
+        assert_eq!(ctx.far_find(sess.id, 1).unwrap().buffered.len(), 1);
+        let mut drop = ApplyAction::default();
+        drop.drop = true;
+        deliver(&node, &peer, &update(5, drop)).await;
+        let (_, resp) = recv_decoded(&peer).await;
+        assert_eq!(
+            find_cause(&resp),
+            Some(sxa_build::pfcp_cause::REQUEST_ACCEPTED)
+        );
+        assert!(
+            ctx.far_find(sess.id, 1).unwrap().buffered.is_empty(),
+            "BUFF -> DROP discards the buffer"
+        );
+        ctx.sess_remove(sess.id);
     }
 
     /// #304: an Update QER closing a gate and a Remove URR arrive OVER THE WIRE and
@@ -2869,15 +3589,24 @@ mod tests {
             );
             peer.send_to(&pkt, from).await.expect("answer the report");
 
-            let names_it = report
-                .user_plane_path_failure_report
-                .as_ref()
-                .is_some_and(|r| {
-                    r.remote_gtpu_peers.iter().any(|p| match about {
-                        IpAddr::V4(v4) => p.ipv4 == Some(v4.octets()),
-                        IpAddr::V6(v6) => p.ipv6 == Some(v6.octets()),
-                    })
-                });
+            // #957: the peer list lives in the Failure Report (UPFR) or in the Recovery
+            // Report (UPRR, IE 187) -- each in its own IE, never the other's.
+            let list = if report.node_report_type.uprr {
+                assert!(
+                    report.user_plane_path_failure_report.is_none(),
+                    "a recovery must not carry a Path FAILURE Report"
+                );
+                report.user_plane_path_recovery_report.as_ref()
+            } else {
+                assert!(report.user_plane_path_recovery_report.is_none());
+                report.user_plane_path_failure_report.as_ref()
+            };
+            let names_it = list.is_some_and(|r| {
+                r.remote_gtpu_peers.iter().any(|p| match about {
+                    IpAddr::V4(v4) => p.ipv4 == Some(v4.octets()),
+                    IpAddr::V6(v6) => p.ipv6 == Some(v6.octets()),
+                })
+            });
             if names_it {
                 matched += 1;
                 kind = Some(report.node_report_type);
@@ -2896,10 +3625,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_failed_gtpu_path_is_reported_once_over_the_wire() {
         let (_guard, node, peer) = node_and_peer().await;
+        // #827 (after SXA_TEST_LOCK, the documented order): this test writes the
+        // process-global GTP-U path table.
+        let _paths = crate::gtp_path::GTPU_PATH_TEST_LOCK.lock().await;
         let _shutdown = associate_and_run(&node, &peer).await;
 
         let failed = IpAddr::V4(Ipv4Addr::new(10, 217, 0, 1));
         crate::gtp_path::forget_gtpu_path(failed);
+        let _forget = crate::gtp_path::ForgetPathOnDrop(failed);
 
         // Four unanswered Echoes EXCEED the default N3-REQUESTS of 3, which is the
         // transition (TS 23.007 §20.3.1).
@@ -2942,10 +3675,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_recovered_gtpu_path_is_reported_with_uprr() {
         let (_guard, node, peer) = node_and_peer().await;
+        // #827 (after SXA_TEST_LOCK, the documented order): this test writes the
+        // process-global GTP-U path table.
+        let _paths = crate::gtp_path::GTPU_PATH_TEST_LOCK.lock().await;
         let _shutdown = associate_and_run(&node, &peer).await;
 
         let path = IpAddr::V4(Ipv4Addr::new(10, 217, 0, 2));
         crate::gtp_path::forget_gtpu_path(path);
+        let _forget = crate::gtp_path::ForgetPathOnDrop(path);
 
         // An answered Echo on a HEALTHY path is not a transition and reports nothing.
         crate::gtp_path::note_echo_answered(path);
@@ -2987,6 +3724,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_path_failure_with_no_associated_peer_reports_to_nobody_and_says_so() {
         let (_guard, node, peer) = node_and_peer().await;
+        // #827 (after SXA_TEST_LOCK, the documented order): this test writes the
+        // process-global GTP-U path table.
+        let _paths = crate::gtp_path::GTPU_PATH_TEST_LOCK.lock().await;
         let (_tx, rx) = tokio::sync::watch::channel(false);
         let pump = node.clone();
         tokio::spawn(async move { pump.run(rx).await });
@@ -3012,6 +3752,7 @@ mod tests {
         );
 
         crate::gtp_path::forget_gtpu_path(failed);
+        let _forget = crate::gtp_path::ForgetPathOnDrop(failed);
         for _ in 0..4 {
             crate::gtp_path::note_echo_unanswered(failed);
         }

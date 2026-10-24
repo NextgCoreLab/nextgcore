@@ -214,7 +214,8 @@ impl N4mbPfcpNode {
             socket,
             upf_dest,
             cp_addr,
-            recovery_time_stamp: crate::context::now_unix() as u32,
+            // #995: NTP-era seconds (TS 29.244 §8.2.65), not Unix seconds.
+            recovery_time_stamp: nextgcore_pfcp::recovery_time::now(),
             seq: AtomicU32::new(1),
             associated: AtomicBool::new(false),
             pending: Arc::new(Mutex::new(HashMap::new())),
@@ -700,9 +701,11 @@ mod tests {
              correlates on exactly that"
         );
         match msg {
-            PfcpMessage::HeartbeatResponse(r) => assert_ne!(
-                r.recovery_time_stamp, 0,
-                "the response must carry this node's own Recovery Time Stamp"
+            // #995: this node's own stamp, in NTP-era seconds.
+            PfcpMessage::HeartbeatResponse(r) => assert!(
+                nextgcore_pfcp::recovery_time::now().wrapping_sub(r.recovery_time_stamp) < 60,
+                "the response must carry this node's own NTP Recovery Time Stamp, got {}",
+                r.recovery_time_stamp
             ),
             other => panic!("expected a HeartbeatResponse, got {other:?}"),
         }

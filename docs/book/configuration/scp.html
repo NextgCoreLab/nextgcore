@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-c2411517.js";
+            window.path_to_searchindex_js = "../searchindex-df495bb2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -241,7 +241,7 @@ scp:
 <p>All of the <code>scp</code>-level keys are shipped <strong>commented out</strong>, so the built-in defaults apply unless an operator uncomments them.</p>
 <p><strong>Inert</strong> — present in the shipped file and not read anywhere:</p>
 <ul>
-<li><strong><code>logger.file.path</code> and <code>logger.level</code>.</strong> The log level comes from the CLI flag <code>-e/--log-level</code> (default <code>info</code>); <code>init_logging</code> builds <code>env_logger</code> with an explicit filter level, so even <code>RUST_LOG</code> (set to <code>info</code> by the compose file’s common environment) is not consulted. There is no working log-file output (<code>-l/--log-file</code> is accepted but unused).</li>
+<li><strong><code>logger.file.path</code> and <code>logger.level</code>.</strong> The log level comes from <code>RUST_LOG</code> when set, else the CLI flag <code>-e/--log-level</code> (default <code>info</code>). There is no working log-file output (<code>-l/--log-file</code> is accepted but unused).</li>
 <li><strong><code>global.max.ue</code> / <code>global.max.peer</code>.</strong> Not read; <code>scp_context_init()</code> takes no size.</li>
 <li><strong><code>scp.sbi.tls.ca</code> and <code>scp.sbi.tls.min_version</code>.</strong> There is no CA-bundle or minimum-version knob in the code; the rest of the <code>tls</code> block <em>is</em> read.</li>
 </ul>

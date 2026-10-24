@@ -276,6 +276,12 @@ impl Guti5gs {
     /// guess at.
     pub fn from_context_id(ue_context_id: &str) -> Option<Self> {
         let rest = ue_context_id.strip_prefix("5g-guti-")?;
+        // The ueContextId arrives raw in the URI path. A non-ASCII character is
+        // never valid here, and `split_at` below would panic if its cut landed
+        // inside one (#765 review).
+        if !rest.is_ascii() {
+            return None;
+        }
         // 14 trailing hex digits, so the leading decimal run is everything else.
         if rest.len() < 5 + 14 {
             return None;
@@ -653,6 +659,14 @@ pub struct AmfContext {
     /// against the live session map.
     pws_n2_queue: RwLock<Vec<PendingPwsN2Transfer>>,
 
+    /// Non-UE-associated NRPPa an LMF handed the AMF over
+    /// `POST /namf-comm/v1/non-ue-n2-messages/transfer` (#807, TS 29.518
+    /// §5.2.2.4.1.2), for egress as DOWNLINK NON UE ASSOCIATED NRPPA TRANSPORT
+    /// (TS 38.413 §8.15.4) to the named NG-RAN nodes. Same shape and reason as
+    /// `pws_n2_queue`: the NGAP task owns the SCTP associations and resolves the
+    /// targets against its live sessions.
+    non_ue_nrppa_queue: RwLock<Vec<PendingNonUeNrppa>>,
+
     /// Non-UE N2 information subscriptions (#399, TS 29.518 §5.2.2.4.2), keyed
     /// by the AMF-minted `n2NotifySubscriptionId` — the Document resource's URI
     /// variable (§6.1.3.10.2, `29518-k00.txt:10111`). A CBCF/PWS-IWF creates one
@@ -809,6 +823,22 @@ pub struct PendingPwsN2Transfer {
     pub target_tais: Vec<(PlmnId, u32)>,
     /// `ratSelector`. `None` means the IE was absent, so no RAT filter applies.
     pub rat_selector: Option<PwsRatSelector>,
+}
+
+/// The most non-UE NRPPa PDUs awaiting the NGAP pump (#903 review).
+pub const MAX_PENDING_NON_UE_NRPPA: usize = 1024;
+
+/// A non-UE-associated NRPPa PDU to relay to NG-RAN nodes (#807, TS 29.518
+/// §5.2.2.4.1.2, TS 38.413 §8.15.4).
+#[derive(Debug, Clone)]
+pub struct PendingNonUeNrppa {
+    /// The NRPPa PDU, verbatim.
+    pub nrppa_pdu: Vec<u8>,
+    /// The NGAP Routing ID: the LMF's `nfId`, so the node's answer (UPLINK NON UE
+    /// ASSOCIATED NRPPA TRANSPORT carries the Routing ID back) finds that LMF.
+    pub routing_id: Vec<u8>,
+    /// The gNB IDs of `globalRanNodeList`.
+    pub target_gnb_ids: Vec<u32>,
 }
 
 /// A non-UE N2 information subscription a consumer (e.g. CBCF/PWS-IWF) created
@@ -1230,6 +1260,7 @@ impl AmfContext {
             network_dereg_queue: RwLock::new(Vec::new()),
             connected_downlink_queue: RwLock::new(Vec::new()),
             pws_n2_queue: RwLock::new(Vec::new()),
+            non_ue_nrppa_queue: RwLock::new(Vec::new()),
             non_ue_n2_subscriptions: RwLock::new(HashMap::new()),
             pws_response_requests: RwLock::new(HashMap::new()),
         }
@@ -2147,6 +2178,45 @@ impl AmfContext {
         if let Ok(mut q) = self.pws_n2_queue.write() {
             q.push(item);
         }
+    }
+
+    /// Enqueue a non-UE-associated NRPPa relay (#807). `false` when the queue
+    /// already holds [`MAX_PENDING_NON_UE_NRPPA`] PDUs (#903 review): the pump
+    /// drains it every loop, so a full queue means the NGAP task is not keeping
+    /// up, and the transfer is refused rather than queued without bound.
+    pub fn non_ue_nrppa_add(&self, item: PendingNonUeNrppa) -> bool {
+        match self.non_ue_nrppa_queue.write() {
+            Ok(mut q) if q.len() < MAX_PENDING_NON_UE_NRPPA => {
+                q.push(item);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Drain the pending non-UE-associated NRPPa relays (NGAP server pump).
+    pub fn non_ue_nrppa_drain(&self) -> Vec<PendingNonUeNrppa> {
+        match self.non_ue_nrppa_queue.write() {
+            Ok(mut q) => std::mem::take(&mut *q),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// The non-UE N2 subscription for the NRPPa class that an LMF's answer goes to
+    /// (#807, TS 29.518 §5.2.2.4.4.2): the one created by the LMF whose nfId is
+    /// the NGAP Routing ID. A subscription that named no nfId is used only when
+    /// the answer names none either (#903 review): it may belong to another
+    /// consumer, and an answer that names its LMF must not go elsewhere. No PWS
+    /// fallback.
+    pub fn non_ue_nrppa_subscription_find(
+        &self,
+        nf_id: Option<&str>,
+    ) -> Option<NonUeN2InfoSubscription> {
+        let subs = self.non_ue_n2_subscriptions.read().ok()?;
+        subs.values()
+            .filter(|s| s.n2_information_class == "NRPPa" && s.nf_id.as_deref() == nf_id)
+            .max_by(|a, b| a.subscription_id.cmp(&b.subscription_id))
+            .cloned()
     }
 
     /// Drain all pending PWS warning relays (called by the NGAP server pump).
@@ -3107,7 +3177,7 @@ impl Default for RanUe {
 // ============================================================================
 
 /// AMF UE memento (backup of security context)
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct AmfUeMemento {
     /// UE security capability
     pub ue_security_capability: UeSecurityCapability,
@@ -3153,6 +3223,35 @@ pub struct AmfUeMemento {
     pub selected_enc_algorithm: u8,
     /// Selected integrity algorithm
     pub selected_int_algorithm: u8,
+}
+
+/// Manual `Debug` (no-auth-material-in-logs): the authentication material in
+/// this type (rand, autn, xres_star, hxres_star, kamf, knas_int, knas_enc, kgnb, nh) prints as `<redacted>`, so a future
+/// `{:?}` in a log line cannot leak it.
+impl std::fmt::Debug for AmfUeMemento {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("AmfUeMemento");
+        d.field("ue_security_capability", &self.ue_security_capability);
+        d.field("ue_network_capability", &self.ue_network_capability);
+        d.field("rand", &"<redacted>");
+        d.field("autn", &"<redacted>");
+        d.field("xres_star", &"<redacted>");
+        d.field("abba", &self.abba);
+        d.field("abba_len", &self.abba_len);
+        d.field("hxres_star", &"<redacted>");
+        d.field("kamf", &"<redacted>");
+        d.field("knas_int", &"<redacted>");
+        d.field("knas_enc", &"<redacted>");
+        d.field("dl_count", &self.dl_count);
+        d.field("ul_count", &self.ul_count);
+        d.field("ul_count_established", &self.ul_count_established);
+        d.field("kgnb", &"<redacted>");
+        d.field("nh", &"<redacted>");
+        d.field("nhcc", &self.nhcc);
+        d.field("selected_enc_algorithm", &self.selected_enc_algorithm);
+        d.field("selected_int_algorithm", &self.selected_int_algorithm);
+        d.finish()
+    }
 }
 
 impl AmfUeMemento {
@@ -3322,7 +3421,7 @@ pub struct AssignedEbi {
 pub const EBI_ASSIGNABLE: std::ops::RangeInclusive<u8> = 5..=15;
 
 /// AMF UE context
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AmfUe {
     /// Unique pool ID
     pub id: u64,
@@ -3593,6 +3692,137 @@ pub struct AmfUe {
     pub ntn_timing_advance: Option<nextgcore_proto::TimingAdvance>,
 }
 
+/// Manual `Debug` (no-auth-material-in-logs): the authentication material in
+/// this type (rand, xres_star, hxres_star, kamf, knas_int, knas_enc, kgnb, nh, autn) prints as `<redacted>`, so a future
+/// `{:?}` in a log line cannot leak it.
+impl std::fmt::Debug for AmfUe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("AmfUe");
+        d.field("id", &self.id);
+        d.field("uecm_dereg_token", &self.uecm_dereg_token);
+        d.field("nas", &self.nas);
+        d.field("suci", &self.suci);
+        d.field("supi", &self.supi);
+        d.field("home_plmn_id", &self.home_plmn_id);
+        d.field("pei", &self.pei);
+        d.field("gpsi", &self.gpsi);
+        d.field("assigned_ebis", &self.assigned_ebis);
+        d.field("masked_imeisv", &self.masked_imeisv);
+        d.field("masked_imeisv_len", &self.masked_imeisv_len);
+        d.field("imeisv_bcd", &self.imeisv_bcd);
+        d.field("num_of_msisdn", &self.num_of_msisdn);
+        d.field("msisdn", &self.msisdn);
+        d.field("current_m_tmsi", &self.current_m_tmsi);
+        d.field("current_guti", &self.current_guti);
+        d.field("next_m_tmsi", &self.next_m_tmsi);
+        d.field("next_guti", &self.next_guti);
+        d.field("old_guti", &self.old_guti);
+        d.field("mapped_eps_guti", &self.mapped_eps_guti);
+        d.field(
+            "amf_ue_context_transfer_state",
+            &self.amf_ue_context_transfer_state,
+        );
+        d.field("guami_index", &self.guami_index);
+        d.field("gnb_ostream_id", &self.gnb_ostream_id);
+        d.field("nr_tai", &self.nr_tai);
+        d.field("nr_cgi", &self.nr_cgi);
+        d.field("ue_location_timestamp", &self.ue_location_timestamp);
+        d.field("last_visited_plmn_id", &self.last_visited_plmn_id);
+        d.field("requested_nssai", &self.requested_nssai);
+        d.field("allowed_nssai", &self.allowed_nssai);
+        d.field("rejected_nssai", &self.rejected_nssai);
+        d.field("policy_association", &self.policy_association);
+        d.field("ue_policy_association", &self.ue_policy_association);
+        d.field("gmm_capability", &self.gmm_capability);
+        d.field(
+            "security_context_available",
+            &self.security_context_available,
+        );
+        d.field("mac_failed", &self.mac_failed);
+        d.field("can_restore_context", &self.can_restore_context);
+        d.field("memento", &self.memento);
+        d.field("ue_security_capability", &self.ue_security_capability);
+        d.field("ue_network_capability", &self.ue_network_capability);
+        d.field("confirmation_for_5g_aka", &self.confirmation_for_5g_aka);
+        d.field("rand", &"<redacted>");
+        d.field("xres_star", &"<redacted>");
+        d.field("abba", &self.abba);
+        d.field("abba_len", &self.abba_len);
+        d.field("hxres_star", &"<redacted>");
+        d.field("kamf", &"<redacted>");
+        d.field("auth_result", &self.auth_result);
+        d.field("knas_int", &"<redacted>");
+        d.field("knas_enc", &"<redacted>");
+        d.field("dl_count", &self.dl_count);
+        d.field("ul_count", &self.ul_count);
+        d.field(
+            "use_nextgcore_nas_security",
+            &self.use_nextgcore_nas_security,
+        );
+        d.field("ul_count_established", &self.ul_count_established);
+        d.field("kgnb", &"<redacted>");
+        d.field("nhcc", &self.nhcc);
+        d.field("nh", &"<redacted>");
+        d.field("selected_enc_algorithm", &self.selected_enc_algorithm);
+        d.field("selected_int_algorithm", &self.selected_int_algorithm);
+        d.field("ue_ambr", &self.ue_ambr);
+        d.field("num_of_slice", &self.num_of_slice);
+        d.field("slice", &self.slice);
+        d.field(
+            "am_policy_control_features",
+            &self.am_policy_control_features,
+        );
+        d.field("ran_ue_id", &self.ran_ue_id);
+        d.field("ran_ue_holding_id", &self.ran_ue_holding_id);
+        d.field("ue_radio_capability", &self.ue_radio_capability);
+        d.field("racs_supported", &self.racs_supported);
+        d.field("ue_radio_capability_id", &self.ue_radio_capability_id);
+        d.field(
+            "ue_radio_capability_id_known_to_ue",
+            &self.ue_radio_capability_id_known_to_ue,
+        );
+        d.field("handover", &self.handover);
+        d.field("data_change_subscription", &self.data_change_subscription);
+        d.field("explicit_de_registered", &self.explicit_de_registered);
+        d.field("access_type", &self.access_type);
+        d.field("registration_type", &self.registration_type);
+        d.field("nas_message_type", &self.nas_message_type);
+        d.field("nas_tsc", &self.nas_tsc);
+        d.field("nas_ksi", &self.nas_ksi);
+        d.field("nas_ue_tsc", &self.nas_ue_tsc);
+        d.field("nas_ue_ksi", &self.nas_ue_ksi);
+        d.field(
+            "pdu_session_status_present",
+            &self.pdu_session_status_present,
+        );
+        d.field("pdu_session_status", &self.pdu_session_status);
+        d.field(
+            "uplink_data_status_present",
+            &self.uplink_data_status_present,
+        );
+        d.field("uplink_data_status", &self.uplink_data_status);
+        d.field("switch_off", &self.switch_off);
+        d.field("t3560_running", &self.t3560_running);
+        d.field("imeisv", &self.imeisv);
+        d.field("pending_n1_sm_msg", &self.pending_n1_sm_msg);
+        d.field("pending_psi", &self.pending_psi);
+        d.field("sessions", &self.sessions);
+        d.field("autn", &"<redacted>");
+        d.field("unauthenticated_emergency", &self.unauthenticated_emergency);
+        d.field("redcap_indication", &self.redcap_indication);
+        d.field("snpn_nid", &self.snpn_nid);
+        d.field("cag_id", &self.cag_id);
+        d.field("slice_admission_granted", &self.slice_admission_granted);
+        d.field("ursp_rules", &self.ursp_rules);
+        d.field("prose_capable", &self.prose_capable);
+        d.field("pin_role", &self.pin_role);
+        d.field("uav_auth", &self.uav_auth);
+        #[cfg(feature = "ntn")]
+        d.field("ntn_timing_advance", &self.ntn_timing_advance);
+        d.finish()
+    }
+}
+
 /// URSP policy rule for UE policy delivery (TS 24.526)
 #[derive(Debug, Clone, Default)]
 pub struct UrspPolicyRule {
@@ -3624,7 +3854,7 @@ pub struct SnpnAuthContext {
 }
 
 /// SNPN subscription credentials
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct SnpnSubscriptionCredentials {
     /// K (128-bit authentication key)
     pub k: [u8; 16],
@@ -3634,6 +3864,20 @@ pub struct SnpnSubscriptionCredentials {
     pub amf: [u8; 2],
     /// SQN (6 bytes)
     pub sqn: [u8; 6],
+}
+
+/// Manual `Debug` (no-auth-material-in-logs): the authentication material in
+/// this type (k, opc, sqn) prints as `<redacted>`, so a future
+/// `{:?}` in a log line cannot leak it.
+impl std::fmt::Debug for SnpnSubscriptionCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("SnpnSubscriptionCredentials");
+        d.field("k", &"<redacted>");
+        d.field("opc", &"<redacted>");
+        d.field("amf", &self.amf);
+        d.field("sqn", &"<redacted>");
+        d.finish()
+    }
 }
 
 /// SNPN onboarding state
@@ -4853,6 +5097,19 @@ mod tests {
             "5g-guti-1234567020040deadbeef", // 7 PLMN digits: no such pattern
             "5g-guti-1010020040deadbeef",    // 4 PLMN digits
             "",
+        ] {
+            let bad = bad.replace(' ', "");
+            assert!(
+                Guti5gs::from_context_id(&bad).is_none(),
+                "{bad:?} is not a conformant 5g-guti ueContextId and must be refused"
+            );
+        }
+        // #765 review: a multi-byte character where `split_at(len - 14)` cuts
+        // used to panic the Namf handler; raw UTF-8 reaches it from the path.
+        for bad in [
+            "5g-guti-0010\u{e9}0000000000000",
+            "5g-guti-\u{e9}\u{e9}\u{e9}0000000000000",
+            "5g-guti-00101\u{e9}deadbeef00000",
         ] {
             let bad = bad.replace(' ', "");
             assert!(

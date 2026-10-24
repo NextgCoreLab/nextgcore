@@ -62,7 +62,7 @@ Defaults below are the real clap `default_value`s from the source.
 |-----------|------|---------|-------------|
 | `-c, --config` | string | `/etc/nextgcore/upf.yaml` | Configuration file path. Read if present, but contents are not applied (see note above). |
 | `-l, --log-file` | string | *(none)* | Log file path. |
-| `-e, --log-level` | string | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error`. |
+| `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-m, --no-color` | bool | `false` | Disable colored log output. |
 | `-k, --kill` | bool | `false` | Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor. |
 | `--pfcp-addr` | string | `127.0.0.4` | N4 PFCP server bind address. |
@@ -80,7 +80,8 @@ Defaults below are the real clap `default_value`s from the source.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `UPF_METRICS_PORT` | `9090` | Prometheus `/metrics` port (bound on `0.0.0.0`), including the TUN-path data-plane counters (#581). |
+| `UPF_METRICS_PORT` | `9090` | Prometheus `/metrics` port, including the TUN-path data-plane counters (#581). |
+| `NEXTGCORE_METRICS_BIND` | `127.0.0.1` | Host the unauthenticated `/metrics` listener binds to (#837). The compose files and manifests set `0.0.0.0` inside the private container/pod network. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://jaeger:4317` | OTLP endpoint for OpenTelemetry tracing (initialization is best-effort; failure is ignored). |
 
 ## Behavior notes

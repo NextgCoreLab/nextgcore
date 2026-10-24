@@ -1427,7 +1427,10 @@ impl NwdafContext {
                         Some(level) => {
                             levels.insert(k.clone(), level);
                         }
-                        None => log::warn!("skipping unreadable NWDAF event level for key {k}"),
+                        None => {
+                            let key = &k;
+                            log::warn!("skipping unreadable NWDAF event level for key {key}");
+                        }
                     }
                 }
             }
