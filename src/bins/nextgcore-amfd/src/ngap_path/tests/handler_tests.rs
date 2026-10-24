@@ -1173,7 +1173,7 @@ async fn an_establishment_with_no_smf_back_in_the_window_gets_payload_not_forwar
 /// sits in the backlog and the request waits for the client's timeout. Locally
 /// deterministic stand-in for a blackholed address (a stale pod IP, a lost node).
 /// Keep the listener alive.
-fn hanging_smf() -> (std::net::TcpListener, u16) {
+pub(super) fn hanging_smf() -> (std::net::TcpListener, u16) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
     (listener, port)
@@ -2204,9 +2204,7 @@ async fn paged_modification_answered(
 // process-global and this exchange needs its own.
 #[allow(clippy::await_holding_lock)]
 async fn a_paged_modification_rides_after_an_ics_that_set_its_session_up() {
-    let _guard = crate::test_support::CONTEXT_GUARD
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
     let _guami = ServeOneGuami::install();
     let (sent, calls) = paged_modification_answered(7_778_011, 7_778_012, "pmod-778-ok").await;
@@ -2235,9 +2233,7 @@ async fn a_paged_modification_rides_after_an_ics_that_set_its_session_up() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
 async fn a_paged_modification_of_a_session_not_set_up_sends_only_the_n1() {
-    let _guard = crate::test_support::CONTEXT_GUARD
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
     let _guami = ServeOneGuami::install();
     let (sent, _calls) = paged_modification_answered(7_778_021, 7_778_022, "fail-pmod-778").await;
@@ -2397,7 +2393,7 @@ async fn the_sweep_drops_orphaned_session_state_and_keeps_live_state() {
 
 /// A raw 5GSM PDU SESSION ESTABLISHMENT REQUEST for `psi` (the legacy 0x2E
 /// path): PTI 1, integrity protection maximum data rate full.
-fn establishment_request(psi: u8) -> Vec<u8> {
+pub(super) fn establishment_request(psi: u8) -> Vec<u8> {
     vec![0x2E, psi, 0x01, 0xC1, 0xFF, 0xFF]
 }
 
@@ -2413,7 +2409,7 @@ async fn establish_psi_5(
     ran: u32,
 ) -> (Vec<SmfCall>, Vec<Sent>, (usize, usize, usize)) {
     let (_smf, port, calls) = activating_smf().await;
-    let _env = super::SmfEnvGuard::set(port);
+    let _env = super::SmfEnvGuard::acquire(port).await;
     let mut server = capturing_ngap_server().await;
     secured_registered_ue(&mut server, ue, ran);
     server.ue_auth_state.with_mut(ue, |s| {
@@ -2502,9 +2498,7 @@ async fn a_recorded_session_is_established() {
 // walks the shared store, and no sibling sweep may run in between.
 #[allow(clippy::await_holding_lock)]
 async fn an_implicit_deregistration_releases_at_the_smf_then_prunes() {
-    let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK.lock().await;
     let (_smf, port, calls) = activating_smf().await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_756_021u64, 63);

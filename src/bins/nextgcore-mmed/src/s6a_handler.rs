@@ -1322,6 +1322,55 @@ mod tests {
         ctx.mme_ue_remove(mme_ue_id);
     }
 
+    /// #1005 review MINOR: the UE context release (`UeContextRemove`) blocks the
+    /// UE-AMBR modification as the S1 release does. After an attach's INITIAL
+    /// CONTEXT SETUP FAILURE the UE CONTEXT RELEASE COMMAND is sent and the
+    /// context stays linked until its COMPLETE: a change arriving then sends
+    /// nothing and is not deferred.
+    #[test]
+    fn a_ue_context_release_in_progress_takes_no_ue_ambr_modification() {
+        let _guard = crate::gtp_path::lock_s11();
+        let (mme_ue_id, enb_ue_id, isd, ue_ctx_mods) = ue_ambr_fixture("999990000010051", 10051);
+        let ctx = crate::context::mme_self();
+        ctx.mme_ue_pool
+            .write()
+            .unwrap()
+            .get_mut(&mme_ue_id)
+            .unwrap()
+            .ics_pending_on = enb_ue_id;
+        let enb_ue = ctx.enb_ue_find_by_id(enb_ue_id).unwrap();
+        let out = crate::s1ap_handler::handle_initial_context_setup_failure(
+            ctx,
+            enb_ue.enb_id,
+            &nextgcore_s1ap::InitialContextSetupFailure {
+                mme_ue_s1ap_id: enb_ue.mme_ue_s1ap_id,
+                enb_ue_s1ap_id: enb_ue.enb_ue_s1ap_id,
+                cause: nextgcore_s1ap::Cause::RadioNetwork(
+                    nextgcore_s1ap::CauseRadioNetwork::Unspecified,
+                ),
+            },
+        );
+        assert!(!out.is_empty(), "the UE CONTEXT RELEASE COMMAND");
+        let released = ctx.enb_ue_find_by_id(enb_ue_id).unwrap();
+        assert_eq!(
+            released.ue_ctx_rel_action,
+            crate::context::UeCtxRelAction::UeContextRemove,
+            "an attach's setup failure removes the UE context"
+        );
+        assert_eq!(released.mme_ue_id, mme_ue_id, "still linked until COMPLETE");
+
+        mme_s6a_process_inbound(&isd(30_000_000, 6_000_000)).unwrap();
+        let ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert!(!ue.ue_ambr_deferred, "not deferred");
+        assert!(
+            ue_ctx_mods().is_empty(),
+            "nothing to a context on its way out"
+        );
+        assert!(deferred_ue_ambr_sends(ctx).is_empty());
+        ctx.enb_ue_remove(enb_ue_id);
+        ctx.mme_ue_remove(mme_ue_id);
+    }
+
     fn clr(imsi: &str, cancellation_type: u32) -> crate::fd_path::InboundS6aRequest {
         crate::fd_path::InboundS6aRequest {
             imsi_bcd: imsi.to_string(),
