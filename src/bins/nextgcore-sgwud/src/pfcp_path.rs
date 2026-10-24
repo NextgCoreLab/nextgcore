@@ -1652,9 +1652,11 @@ fn apply_action_octet(action: &LibApplyAction) -> u8 {
         | ((action.dupl as u8) << 4)
 }
 
-/// TS 29.244 §8.2.7: bits 1-2 are the UL gate and bits 3-4 the DL gate, each
-/// `0` = OPEN and `1` = CLOSED — the packing `SgwuQer.gate_status` documents. The
-/// library models the two as `true` = open, so both are inverted here.
+/// The INTERNAL packing `SgwuQer.gate_status` documents: bits 1-2 the UL gate, bits
+/// 3-4 the DL gate, each `0` = OPEN and `1` = CLOSED. This is NOT the TS 29.244
+/// §8.2.7 wire layout, where bits 1-2 are the DL gate and bits 3-4 the UL gate (the
+/// library's `GateStatus` encodes that); it is filled from the decoded booleans,
+/// which the library models as `true` = open, so both are inverted here.
 fn gate_status_octet(gate: &LibGateStatus) -> u8 {
     ((!gate.ul_gate) as u8) | (((!gate.dl_gate) as u8) << 2)
 }
@@ -1952,7 +1954,10 @@ fn modification_from_lib(
             .map(|far| crate::sxa_handler::UpdateFarRequest {
                 far_id: far.far_id,
                 apply_action: far.apply_action.as_ref().map(apply_action_octet),
-                smreq_flags: Default::default(),
+                // PFCPSMReq-Flags bit 2 = SNDEM (§8.2.31, #1041): it was ignored.
+                smreq_flags: crate::sxa_handler::SmreqFlags {
+                    send_end_marker_packets: req.pfcp_smreq_flags.is_some_and(|f| f & 0x02 != 0),
+                },
                 update_forwarding_parameters: far.forwarding_parameters.as_ref().map(|fp| {
                     crate::sxa_handler::ForwardingParameters {
                         destination_interface: fp.destination_interface as u8,
@@ -1977,6 +1982,8 @@ fn modification_from_lib(
         query_urrs: req.query_urrs.iter().map(|q| q.urr_id).collect(),
         // PFCPSMReq-Flags bit 3 = QAURR (§8.2.31, `29244-k00.txt:30557`).
         query_all_urrs: req.pfcp_smreq_flags.is_some_and(|f| f & 0x04 != 0),
+        // Bit 1 = DROBU (§8.2.31, #1041): it was ignored, so a buffer was never dropped.
+        drop_buffered: req.pfcp_smreq_flags.is_some_and(|f| f & 0x01 != 0),
         create_bar: None,
         remove_bar: None,
     }
@@ -2964,6 +2971,116 @@ mod tests {
             ctx.pdr_find(sess.id, 1).is_some(),
             "the Create PDR must have been INSTALLED on the session, not just parsed"
         );
+    }
+
+    /// #1041: the PFCPSMReq-Flags bits are read as TS 29.244 §8.2.31 lays them out:
+    /// bit 1 DROBU, bit 2 SNDEM (per Update FAR), bit 3 QAURR. DROBU and SNDEM used to
+    /// be ignored.
+    #[test]
+    fn pfcpsmreq_flags_are_read_bit_by_bit() {
+        for (flags, drobu, sndem, qaurr) in [
+            (0x01u8, true, false, false),
+            (0x02, false, true, false),
+            (0x04, false, false, true),
+            (0x07, true, true, true),
+        ] {
+            let mut m = LibSessionModificationRequest::new();
+            m.pfcp_smreq_flags = Some(flags);
+            m.update_fars.push(nextgcore_pfcp::types::UpdateFar::new(1));
+            let parsed = modification_from_lib(&m);
+            assert_eq!(parsed.drop_buffered, drobu, "{flags:#x} DROBU");
+            assert_eq!(
+                parsed.update_fars[0].smreq_flags.send_end_marker_packets, sndem,
+                "{flags:#x} SNDEM"
+            );
+            assert_eq!(parsed.query_all_urrs, qaurr, "{flags:#x} QAURR");
+        }
+    }
+
+    /// #1041, over the wire: a Session Modification with DROBU drops the packets the
+    /// session has buffered (TS 29.244 §8.2.31). Before, DROBU was ignored and they
+    /// stayed queued -- to be flushed to the UE later.
+    #[tokio::test]
+    async fn drobu_over_the_wire_drops_the_buffered_packets() {
+        let (_guard, node, peer) = node_and_peer().await;
+        let mut assoc = BytesMut::new();
+        PfcpLibMessage::AssociationSetupRequest(AssociationSetupRequest::new(
+            NodeId::new_ipv4([127, 0, 0, 9]),
+            3000,
+        ))
+        .encode_body(&mut assoc);
+        deliver(
+            &node,
+            &peer,
+            &wire(pfcp_msg_type::ASSOCIATION_SETUP_REQUEST, None, 1, &assoc),
+        )
+        .await;
+        let _ = recv_decoded(&peer).await;
+        let cp_seid = 0x0000_0000_0000_1041u64;
+        let mut req = LibSessionEstablishmentRequest::new(
+            NodeId::new_ipv4([127, 0, 0, 9]),
+            LibFSeid::new_ipv4(cp_seid, [127, 0, 0, 9]),
+        );
+        let mut pdi = Pdi::new(SourceInterface::Core);
+        let mut f_teid = FTeid::new_ipv4(0, [127, 0, 0, 1]);
+        f_teid.ch = true;
+        pdi.local_f_teid = Some(f_teid);
+        let mut pdr = CreatePdr::new(1, 100, pdi);
+        pdr.far_id = Some(1);
+        req.create_pdrs.push(pdr);
+        let mut far = CreateFar::new(1, ApplyAction::buffer());
+        far.forwarding_parameters = Some(ForwardingParameters::new(DestinationInterface::Access));
+        req.create_fars.push(far);
+        let mut body = BytesMut::new();
+        req.encode(&mut body);
+        deliver(
+            &node,
+            &peer,
+            &wire(
+                pfcp_msg_type::SESSION_ESTABLISHMENT_REQUEST,
+                Some(0),
+                2,
+                &body,
+            ),
+        )
+        .await;
+        let _ = recv_decoded(&peer).await;
+        let ctx = sgwu_self();
+        let sess = ctx
+            .sess_find_by_sgwc_sxa_seid(cp_seid)
+            .expect("established");
+        ctx.far_buffer_packet(sess.id, 1, b"one".to_vec(), 8);
+        ctx.far_buffer_packet(sess.id, 1, b"two".to_vec(), 8);
+        assert_eq!(ctx.far_find(sess.id, 1).unwrap().buffered.len(), 2);
+
+        let mut m = LibSessionModificationRequest::new();
+        m.pfcp_smreq_flags = Some(0x01); // DROBU
+        let mut b = BytesMut::new();
+        m.encode(&mut b);
+        deliver(
+            &node,
+            &peer,
+            &wire(
+                pfcp_msg_type::SESSION_MODIFICATION_REQUEST,
+                Some(sess.sgwu_sxa_seid),
+                3,
+                &b,
+            ),
+        )
+        .await;
+        let (_, resp) = recv_decoded(&peer).await;
+        assert_eq!(
+            find_cause(&resp),
+            Some(sxa_build::pfcp_cause::REQUEST_ACCEPTED)
+        );
+        let far = ctx.far_find(sess.id, 1).unwrap();
+        assert!(
+            far.buffered.is_empty(),
+            "DROBU dropped the buffered packets"
+        );
+        let buff = crate::context::apply_action::BUFF;
+        assert_eq!(far.apply_action & buff, buff, "the FAR still buffers");
+        ctx.sess_remove(sess.id);
     }
 
     /// #871 review: Update FAR leaving BUFF, end to end over the Sxa socket. A buffering
