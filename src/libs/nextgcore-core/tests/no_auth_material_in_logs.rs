@@ -828,3 +828,115 @@ fn manual_debug_impls_redact_authentication_material() {
     assert!(checked > 20, "only {checked} Debug impls found");
     assert!(problems.is_empty(), "\n{}", problems.join("\n"));
 }
+
+/// Whether an identifier chain names a callback URI (#1018): its last segment
+/// ends in `uri`/`url` and names a notification or callback target
+/// (`notification_uri`, `notif_uri`, `sub.notify_uri`, `dereg_callback_uri`,
+/// `event_notify_uri`), or is a bare `callback` / `callback_reference`.
+fn is_callback_uri(ident: &str) -> bool {
+    let last = ident.rsplit('.').next().unwrap_or(ident);
+    if !last.chars().any(|c| c.is_ascii_lowercase()) {
+        return false; // a constant (`custom_header::CALLBACK`), not a URI value
+    }
+    let last = last.to_ascii_lowercase();
+    if [
+        "callback",
+        "callback_reference",
+        "callback_ref",
+        "callback_uris",
+    ]
+    .contains(&last.as_str())
+    {
+        return true;
+    }
+    let uri_like = last.ends_with("uri") || last.ends_with("url");
+    uri_like
+        && ["notif", "notify", "callback", "dereg"]
+            .iter()
+            .any(|k| last.contains(k))
+}
+
+/// #1018: a log macro never interpolates a consumer-supplied callback URI
+/// whole. A third party's callback URI may carry a secret anywhere in its path
+/// or query (the AMF's own carry a bearer token, #940/#1026), so an NF that
+/// calls or stores one logs it through `nextgcore_sbi::log_redact` (any
+/// `redact_` call in the macro counts).
+#[test]
+fn no_log_macro_prints_a_callback_uri_whole() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut files = Vec::new();
+    rust_files(&src.join("bins"), &mut files);
+    rust_files(&src.join("libs"), &mut files);
+    let mut problems = Vec::new();
+    for file in &files {
+        let full = fs::read_to_string(file).unwrap_or_default();
+        let text = production(&full);
+        for mac in MACROS {
+            let mut from = 0;
+            while let Some(at) = text[from..].find(mac) {
+                let start = from + at;
+                from = start + mac.len();
+                let before = text[..start].chars().last().unwrap_or(' ');
+                if before.is_alphanumeric() || before == '_' {
+                    continue;
+                }
+                let body = macro_body(text, from);
+                if body.contains("redact_") {
+                    continue;
+                }
+                let code = interpolated_and_args(body);
+                let hits: Vec<&str> = identifiers(&code)
+                    .into_iter()
+                    .filter(|w| is_callback_uri(w))
+                    .collect();
+                if !hits.is_empty() {
+                    let line = text[..start].matches('\n').count() + 1;
+                    problems.push(format!(
+                        "{}:{line}: {mac} logs {hits:?} whole",
+                        file.strip_prefix(&src).unwrap_or(file).display()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "\n{}\n({} sites)",
+        problems.join("\n"),
+        problems.len()
+    );
+}
+
+#[test]
+fn the_callback_uri_scan_sees_its_shapes() {
+    for flagged in [
+        "notification_uri",
+        "sub.notification_uri",
+        "notif_uri",
+        "event_notify_uri",
+        "dereg_callback_uri",
+        "callback",
+        "s.callback_reference",
+        "notify_url",
+    ] {
+        assert!(is_callback_uri(flagged), "{flagged}");
+    }
+    for fine in [
+        "uri",
+        "nrf_uri",
+        "self_sbi_uri",
+        "callbacks_sent",
+        "notify_count",
+        "api_root",
+        "custom_header::CALLBACK",
+        "CALLBACK",
+    ] {
+        assert!(!is_callback_uri(fine), "{fine}");
+    }
+    let code =
+        interpolated_and_args("\"to {} for {supi}\", redact_last_segment(&sub.notification_uri)");
+    assert!(
+        identifiers(&code).iter().any(|w| is_callback_uri(w)),
+        "found, then skipped by redact_"
+    );
+}

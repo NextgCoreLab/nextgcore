@@ -1513,7 +1513,9 @@ pub async fn pcf_subscribe_udr_policy_data() -> Option<String> {
             log::info!(
                 "Subscribed to UDR policy-data changes; notifications arrive at \
                  {notification_uri} (subscription {})",
-                location.as_deref().unwrap_or("<no Location>")
+                location.as_deref().unwrap_or("<no Location>"),
+                notification_uri =
+                    nextgcore_sbi::log_redact::redact_last_segment(&notification_uri)
             );
             location
         }

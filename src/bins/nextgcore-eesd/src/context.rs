@@ -1396,7 +1396,7 @@ impl EesContext {
         log::info!(
             "ACTStatusSubsc created: subscriptionId={id} easId={} notificationUri={}",
             sub.eas_id,
-            sub.notification_uri
+            nextgcore_sbi::log_redact::redact_last_segment(&sub.notification_uri)
         );
         Some(id)
     }

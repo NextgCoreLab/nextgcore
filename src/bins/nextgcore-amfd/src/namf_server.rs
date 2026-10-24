@@ -1506,7 +1506,8 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
 
     log::info!(
         "Event subscription created: id={subscription_id}, events={:?}, notifyUri={notify_uri}",
-        sub.event_types
+        sub.event_types,
+        notify_uri = nextgcore_sbi::log_redact::redact_last_segment(notify_uri)
     );
 
     let mut response_body = json!({
@@ -2917,7 +2918,10 @@ pub fn send_n1n2_failure_notification(notify_uri: String, cause: &str, n1n2_msg_
     };
     handle.spawn(async move {
         let Some((host, port, path)) = parse_http_uri(&notify_uri) else {
-            log::warn!("Invalid n1n2FailureTxfNotifURI: {notify_uri}");
+            log::warn!(
+                "Invalid n1n2FailureTxfNotifURI: {notify_uri}",
+                notify_uri = nextgcore_sbi::log_redact::redact_last_segment(&notify_uri)
+            );
             return;
         };
         let body = json!({
@@ -2927,15 +2931,22 @@ pub fn send_n1n2_failure_notification(notify_uri: String, cause: &str, n1n2_msg_
         let client = notify_client(&host, port);
         match client.post_json(&path, &body).await {
             Ok(resp) if resp.is_success() => {
-                log::info!("N1N2 failure notification delivered to {notify_uri}");
+                log::info!(
+                    "N1N2 failure notification delivered to {notify_uri}",
+                    notify_uri = nextgcore_sbi::log_redact::redact_last_segment(&notify_uri)
+                );
             }
             Ok(resp) => {
                 log::warn!(
                     "N1N2 failure notification to {notify_uri} returned {}",
-                    resp.status
+                    resp.status,
+                    notify_uri = nextgcore_sbi::log_redact::redact_last_segment(&notify_uri)
                 );
             }
-            Err(e) => log::warn!("N1N2 failure notification to {notify_uri} failed: {e}"),
+            Err(e) => log::warn!(
+                "N1N2 failure notification to {notify_uri} failed: {e}",
+                notify_uri = nextgcore_sbi::log_redact::redact_last_segment(&notify_uri)
+            ),
         }
     });
 }
@@ -3045,7 +3056,10 @@ pub fn send_non_ue_nrppa_info_notify(
     };
     handle.spawn(async move {
         let Some((host, port, path)) = parse_http_uri(&callback_uri) else {
-            log::warn!("Invalid n2NotifyCallbackUri: {callback_uri}");
+            log::warn!(
+                "Invalid n2NotifyCallbackUri: {callback_uri}",
+                callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
+            );
             return;
         };
         let request = match build_non_ue_nrppa_info_notify_request(
@@ -3064,13 +3078,18 @@ pub fn send_non_ue_nrppa_info_notify(
         match notify_client(&host, port).send_request(request).await {
             Ok(resp) if resp.is_success() => log::info!(
                 "NonUeN2InfoNotify (NRPPa) delivered to {callback_uri} \
-                 (sub={n2_notify_subscription_id})"
+                 (sub={n2_notify_subscription_id})",
+                callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
             ),
             Ok(resp) => log::warn!(
                 "NonUeN2InfoNotify (NRPPa) to {callback_uri} returned {}",
-                resp.status
+                resp.status,
+                callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
             ),
-            Err(e) => log::warn!("NonUeN2InfoNotify (NRPPa) to {callback_uri} failed: {e}"),
+            Err(e) => log::warn!(
+                "NonUeN2InfoNotify (NRPPa) to {callback_uri} failed: {e}",
+                callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
+            ),
         }
     });
 }
@@ -3093,7 +3112,10 @@ pub fn send_n2_info_notify(
     };
     handle.spawn(async move {
         let Some((host, port, path)) = parse_http_uri(&callback_uri) else {
-            log::warn!("Invalid n2NotifyCallbackUri: {callback_uri}");
+            log::warn!(
+                "Invalid n2NotifyCallbackUri: {callback_uri}",
+                callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
+            );
             return;
         };
         let request = match build_n2_info_notify_request(
@@ -3114,17 +3136,22 @@ pub fn send_n2_info_notify(
             Ok(resp) if resp.is_success() => {
                 log::info!(
                     "N2InfoNotify delivered to {callback_uri} \
-                     (sub={n2_notify_subscription_id})"
+                     (sub={n2_notify_subscription_id})",
+                    callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
                 );
             }
             Ok(resp) => {
                 log::warn!(
                     "N2InfoNotify to {callback_uri} returned {} \
                      (sub={n2_notify_subscription_id})",
-                    resp.status
+                    resp.status,
+                    callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
                 );
             }
-            Err(e) => log::warn!("N2InfoNotify to {callback_uri} failed: {e}"),
+            Err(e) => log::warn!(
+                "N2InfoNotify to {callback_uri} failed: {e}",
+                callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
+            ),
         }
     });
 }
@@ -3244,7 +3271,10 @@ pub fn send_non_ue_n2_info_notify(
     };
     handle.spawn(async move {
         let Some((host, port, path)) = parse_http_uri(&callback_uri) else {
-            log::warn!("Invalid n2NotifyCallbackUri: {callback_uri}");
+            log::warn!(
+                "Invalid n2NotifyCallbackUri: {callback_uri}",
+                callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
+            );
             return;
         };
         let request = match build_non_ue_n2_info_notify_request(
@@ -3272,17 +3302,22 @@ pub fn send_non_ue_n2_info_notify(
                     "NonUeN2InfoNotify ({n2_information_class}) delivered to {callback_uri} \
                      (sub={n2_notify_subscription_id} \
                      messageIdentifier={message_identifier:#06x} \
-                     serialNumber={serial_number:#06x})"
+                     serialNumber={serial_number:#06x})",
+                    callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
                 );
             }
             Ok(resp) => {
                 log::warn!(
                     "NonUeN2InfoNotify to {callback_uri} returned {} \
                      (sub={n2_notify_subscription_id})",
-                    resp.status
+                    resp.status,
+                    callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
                 );
             }
-            Err(e) => log::warn!("NonUeN2InfoNotify to {callback_uri} failed: {e}"),
+            Err(e) => log::warn!(
+                "NonUeN2InfoNotify to {callback_uri} failed: {e}",
+                callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
+            ),
         }
     });
 }
@@ -3381,7 +3416,10 @@ pub fn send_n1_message_notify(
     };
     handle.spawn(async move {
         let Some((host, port, path)) = parse_http_uri(&callback_uri) else {
-            log::warn!("Invalid n1NotifyCallbackUri: {callback_uri}");
+            log::warn!(
+                "Invalid n1NotifyCallbackUri: {callback_uri}",
+                callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
+            );
             return;
         };
         let request = match build_n1_message_notify_request(
@@ -3401,12 +3439,22 @@ pub fn send_n1_message_notify(
         let client = notify_client(&host, port);
         match client.send_request(request).await {
             Ok(resp) if resp.is_success() => {
-                log::info!("N1MessageNotify delivered to {callback_uri}");
+                log::info!(
+                    "N1MessageNotify delivered to {callback_uri}",
+                    callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
+                );
             }
             Ok(resp) => {
-                log::warn!("N1MessageNotify to {callback_uri} returned {}", resp.status)
+                log::warn!(
+                    "N1MessageNotify to {callback_uri} returned {}",
+                    resp.status,
+                    callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
+                )
             }
-            Err(e) => log::warn!("N1MessageNotify to {callback_uri} failed: {e}"),
+            Err(e) => log::warn!(
+                "N1MessageNotify to {callback_uri} failed: {e}",
+                callback_uri = nextgcore_sbi::log_redact::redact_last_segment(&callback_uri)
+            ),
         }
     });
 }
@@ -5954,7 +6002,9 @@ fn handle_non_ue_n2_info_subscribe(request: &SbiRequest) -> SbiResponse {
 
     log::info!(
         "NonUeN2InfoSubscribe: id={subscription_id} class={n2_information_class} \
-         callback={n2_notify_callback_uri} nfId={nf_id:?}"
+         callback={n2_notify_callback_uri} nfId={nf_id:?}",
+        n2_notify_callback_uri =
+            nextgcore_sbi::log_redact::redact_last_segment(n2_notify_callback_uri)
     );
 
     // `NonUeN2InfoSubscriptionCreatedData` (`yaml:2597-2607`):

@@ -542,7 +542,7 @@ async fn handle_dm_subscribe(req: &SbiRequest) -> SbiResponse {
     log::info!(
         "[DCCF] DataManagement subscribe sub_id={sub_id} notifCorrId={} notificURI={} events={:?}",
         sub.notif_corr_id,
-        sub.notific_uri,
+        nextgcore_sbi::log_redact::redact_last_segment(&sub.notific_uri),
         scope.events
     );
 
@@ -657,7 +657,10 @@ async fn handle_dm_notify(req: &SbiRequest) -> SbiResponse {
     let timestamp = rfc3339_now();
     for (sub_id, notify_uri, notif_corr_id) in targets {
         let Some((host, port)) = parse_host_port(&notify_uri) else {
-            log::warn!("[DCCF] subscriber {sub_id} has unparseable notificURI: {notify_uri}");
+            log::warn!(
+                "[DCCF] subscriber {sub_id} has unparseable notificURI: {notify_uri}",
+                notify_uri = nextgcore_sbi::log_redact::redact_last_segment(&notify_uri)
+            );
             continue;
         };
         let path = notify_uri
