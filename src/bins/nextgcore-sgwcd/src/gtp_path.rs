@@ -1712,6 +1712,12 @@ fn dispatch_modify_bearer_request(server: &GtpcServer, msg: &Gtp2Message, peer: 
             ctx.tunnel_update(&dl_tunnel);
             written = (dl_tunnel.remote_teid, dl_tunnel.remote_ip.clone());
         }
+        // The generation this request's writes left (TEID by the handler, IP
+        // above).
+        let written = ctx
+            .dl_tunnel_in_bearer(bearer.id)
+            .map(|t| t.generation)
+            .unwrap_or(0);
         per_session
             .entry(bearer.sess_id)
             .or_default()
