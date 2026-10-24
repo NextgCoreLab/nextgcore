@@ -1920,6 +1920,10 @@ pub fn handle_initial_context_setup_failure(
     if let Some(mme_ue_id) = ctx.enb_ue_find_by_id(enb_ue_id).map(|e| e.mme_ue_id) {
         if let Some(ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&mme_ue_id) {
             ue.ics_pending_on = 0;
+            // #916 review: the S1 connection is being released; a UE-AMBR
+            // change deferred behind this setup is carried by the next one,
+            // not sent to a context on its way out.
+            ue.ue_ambr_deferred = false;
         }
     }
     let cause = cause_from_s1ap(&msg.cause);

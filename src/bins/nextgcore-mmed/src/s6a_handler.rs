@@ -388,14 +388,12 @@ fn ue_ambr_blocked(
     if mme_ue.ics_pending_on == enb_ue.id {
         return Some("an Initial Context Setup is in progress");
     }
-    let handover = enb_ue.target_ue_id != crate::context::NEXTGCORE_INVALID_POOL_ID
-        || ctx
-            .enb_ue_pool
-            .read()
-            .unwrap()
-            .values()
-            .any(|t| t.mme_ue_id == mme_ue.id && t.handover_prep_deadline.is_some());
-    handover.then_some("an S1 handover is in progress")
+    // The source context names its target for the whole preparation (set at
+    // HANDOVER REQUIRED, cleared at Notify, Cancel, Failure and expiry), so no
+    // scan of the pool is needed (#916 review).
+    let _ = ctx;
+    (enb_ue.target_ue_id != crate::context::NEXTGCORE_INVALID_POOL_ID)
+        .then_some("an S1 handover is in progress")
 }
 
 /// Tell the eNB serving `ue_id` its current UE-AMBR (TS 23.401 §5.4.2.2, UE
@@ -415,9 +413,21 @@ pub fn signal_ue_ambr(
         .enb_ue_find_by_id(mme_ue.enb_ue_id)
         .filter(|e| e.mme_ue_id == ue_id)
     else {
-        log::info!(
-            "[{imsi}] UE-AMBR changed while ECM-IDLE: the next Initial Context Setup carries it"
-        );
+        // #916 review: nothing is left to defer either. A change deferred
+        // before the UE went ECM-IDLE is dropped here, once: the next Initial
+        // Context Setup carries the current value, and a deferral kept would
+        // log on every pass and send a redundant modification later.
+        let was_deferred = ctx
+            .mme_ue_pool
+            .write()
+            .unwrap()
+            .get_mut(&ue_id)
+            .is_some_and(|ue| std::mem::take(&mut ue.ue_ambr_deferred));
+        if !was_deferred {
+            log::info!(
+                "[{imsi}] UE-AMBR changed while ECM-IDLE: the next Initial Context Setup carries it"
+            );
+        }
         return Vec::new();
     };
     if let Some(why) = ue_ambr_blocked(ctx, &mme_ue, &enb_ue) {
@@ -1146,6 +1156,80 @@ mod tests {
         }
         assert_eq!(deferred_ue_ambr_sends(ctx).len(), 1, "signalled after it");
         ctx.enb_ue_remove(target);
+        ctx.mme_ue_remove(mme_ue_id);
+    }
+
+    /// #916 review: a change deferred behind an Initial Context Setup is dropped
+    /// when that setup fails (no modification to a context being released) and
+    /// when the UE goes ECM-IDLE (the next setup carries the value); either way
+    /// the deferral index empties instead of being retried on every pass.
+    #[test]
+    fn a_deferred_ue_ambr_change_is_dropped_on_ics_failure_or_idle() {
+        let _guard = crate::gtp_path::lock_s11();
+        let (mme_ue_id, enb_ue_id, isd, ue_ctx_mods) = ue_ambr_fixture("999990000009161", 9161);
+        let ctx = crate::context::mme_self();
+        let defer = || {
+            ctx.mme_ue_pool
+                .write()
+                .unwrap()
+                .get_mut(&mme_ue_id)
+                .unwrap()
+                .ics_pending_on = enb_ue_id;
+        };
+        defer();
+        mme_s6a_process_inbound(&isd(10_000_000, 5_000_000)).unwrap();
+        assert!(ctx.mme_ue_find_by_id(mme_ue_id).unwrap().ue_ambr_deferred);
+        let enb_ue = ctx.enb_ue_find_by_id(enb_ue_id).unwrap();
+        let _ = crate::s1ap_handler::handle_initial_context_setup_failure(
+            ctx,
+            enb_ue.enb_id,
+            &nextgcore_s1ap::InitialContextSetupFailure {
+                mme_ue_s1ap_id: enb_ue.mme_ue_s1ap_id,
+                enb_ue_s1ap_id: enb_ue.enb_ue_s1ap_id,
+                cause: nextgcore_s1ap::Cause::RadioNetwork(
+                    nextgcore_s1ap::CauseRadioNetwork::Unspecified,
+                ),
+            },
+        );
+        assert!(
+            deferred_ue_ambr_sends(ctx).is_empty(),
+            "nothing sent after the failure"
+        );
+        assert!(!ctx.mme_ue_find_by_id(mme_ue_id).unwrap().ue_ambr_deferred);
+
+        // Deferred again, then the UE goes ECM-IDLE.
+        if let Some(e) = ctx.enb_ue_pool.write().unwrap().get_mut(&enb_ue_id) {
+            e.mme_ue_id = mme_ue_id;
+        }
+        ctx.mme_ue_pool
+            .write()
+            .unwrap()
+            .get_mut(&mme_ue_id)
+            .unwrap()
+            .enb_ue_id = enb_ue_id;
+        defer();
+        mme_s6a_process_inbound(&isd(20_000_000, 5_000_000)).unwrap();
+        assert!(ctx.mme_ue_find_by_id(mme_ue_id).unwrap().ue_ambr_deferred);
+        ctx.mme_ue_pool
+            .write()
+            .unwrap()
+            .get_mut(&mme_ue_id)
+            .unwrap()
+            .enb_ue_id = crate::context::NEXTGCORE_INVALID_POOL_ID;
+        assert!(deferred_ue_ambr_sends(ctx).is_empty());
+        assert!(
+            !ctx.mme_ue_find_by_id(mme_ue_id).unwrap().ue_ambr_deferred,
+            "dropped"
+        );
+        assert!(
+            UE_AMBR_DEFERRED
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|id| *id != mme_ue_id),
+            "out of the index"
+        );
+        assert!(ue_ctx_mods().is_empty());
         ctx.mme_ue_remove(mme_ue_id);
     }
 
