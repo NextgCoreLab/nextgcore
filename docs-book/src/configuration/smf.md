@@ -176,6 +176,10 @@ an older binary wrote it after this one retired it (an upgrade, a rollback, then
 a re-upgrade), so it is the newer record. After the seed, every address-keyed
 stamp that no literal UPF of this SMF owns is dropped, so an orphan cannot win
 over a correct name key later (#930). A UPF hostname must name exactly one UPF.
+The snapshot also records which UPF each session was established on, by the
+same key, so in a UPF pool a restored session keeps signalling the UPF that
+holds it, and that UPF can still report on it (#1031). A session whose UPF is no
+longer configured goes to the default UPF, and a warning at boot says how many.
 
 **Limits worth knowing:**
 
@@ -202,7 +206,9 @@ The SMF learns which sessions use which peer from its own accepted Session Estab
 - **Recovery:** the failed state is cleared, and the pending hold does nothing. Sessions stay deactivated until their next Service Request or paging.
 - **A peer GTP-U restart** (Peer UP Restart Report) and a session-level **Error Indication Report** deactivate the user plane in the same way, with no hold.
 
-A repeated failure report for a peer that is already failed starts no second hold. A graceful shutdown stops the pending holds; the next process learns the path state from the UPF again.
+A repeated failure report for a peer that is already failed starts no second hold. The failed paths are durable (`failedUpPaths` in the snapshot). A graceful shutdown stops the pending holds first, and the next process re-arms each one once its UPF is associated again, for what is left of it and at least 10 s. A path whose UPF is no longer configured is forgotten.
+
+A recovery the UPF reported while the SMF was down is lost, because the UPF stops retransmitting after N1. Such a path still counts as failed, so its sessions are released with #39 when the hold runs out, and the UEs re-establish them. That is the safe direction.
 
 Metrics:
 - `smf_up_path_failures_total` and `smf_up_path_recoveries_total`;
