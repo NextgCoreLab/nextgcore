@@ -27055,9 +27055,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_ng_setup_releases_the_ue_contexts_of_the_gnbs_previous_incarnation() {
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         serve_tai_999_70_tac_1();
         let saved = {
             let ctx_arc = crate::context::amf_self();
@@ -27142,18 +27140,11 @@ mod tests {
         seed_gnb_session(&server, assoc).await;
         let ue = 7_103_961u64;
         connected_ue_on(&mut server, assoc, ue, 9, "m6-1", smf_port);
-        // A slow step in flight for the session, a handover CANCELLED queued behind it.
+        // A slow step in flight for the session -- no SMF exchange of its own, so nothing
+        // about the stand-in's connection handling can shorten it -- and a handover
+        // CANCELLED queued behind it.
         server.sbi_offload.spawn_keyed((ue, 1), move || async move {
-            let _ = crate::sbi_path::call_smf_n2_handover(
-                "127.0.0.1",
-                smf_port,
-                "m6-1",
-                "PROBE",
-                None,
-                None,
-                None,
-            )
-            .await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
             None
         });
         server.cancel_sessions_at_smfs(ue, &[1], "HO_CANCEL");
@@ -27184,11 +27175,7 @@ mod tests {
             .collect();
         assert_eq!(
             order,
-            vec![
-                "PROBE".to_string(),
-                "CANCELLED".to_string(),
-                "up:DEACTIVATED".to_string()
-            ],
+            vec!["CANCELLED".to_string(), "up:DEACTIVATED".to_string()],
             "the CANCELLED survives both resets, and the second reset adds no duplicate"
         );
         server.forget_ue(ue);
