@@ -1883,6 +1883,67 @@ async fn a_transfer_queued_before_the_ue_went_idle_pages_it_instead_of_sending()
     assert_eq!(paged.pending_n1.as_deref(), Some(&MOD_CMD[..]));
 }
 
+/// #749: the same drain-time race while the UE is ALREADY being paged for
+/// another transfer. The queued one does not overwrite that paging context
+/// (that would lose the other transfer); it stays queued, and once the UE
+/// answers the page it goes to the CM-CONNECTED UE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_queued_transfer_waits_for_a_paging_already_ongoing() {
+    let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
+    let (_smf, port, _calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran, supi) = (7_749_011u64, 64, "imsi-001010007490011");
+    secured_registered_ue(&mut server, ue, ran);
+    with_supi(&mut server, ue, supi);
+    hold_session(&mut server, ue, 1, "n1n2-749-queued", port);
+
+    let resp = n1n2_transfer(
+        supi,
+        1,
+        Some(("PDU_RES_MOD_REQ", Some(&MOD_TRANSFER))),
+        Some(&MOD_CMD),
+    )
+    .await;
+    assert_eq!(resp.status, 200);
+    // The UE went idle and is already paged for PSI 2's downlink data.
+    server.ue_auth_state.with_mut(ue, |s| s.cm_idle = true);
+    crate::context::amf_self()
+        .read()
+        .unwrap()
+        .paging_add(crate::context::PagingContext {
+            amf_ue_ngap_id: ue,
+            pdu_session_id: Some(2),
+            pending_n2: Some(vec![0x02]),
+            ..Default::default()
+        });
+    server.process_connected_downlinks().await;
+
+    let paged = crate::context::amf_self()
+        .read()
+        .unwrap()
+        .paging_find(ue)
+        .expect("still paged");
+    assert_eq!(
+        paged.pdu_session_id,
+        Some(2),
+        "PSI 2's paging is not overwritten"
+    );
+    assert!(sent_to(&mut server, ue).is_empty());
+
+    // The UE answers: it is CM-CONNECTED, and the waiting transfer goes out.
+    crate::context::amf_self().read().unwrap().paging_remove(ue);
+    server.ue_auth_state.with_mut(ue, |s| s.cm_idle = false);
+    server.process_connected_downlinks().await;
+    let sent = sent_to(&mut server, ue);
+    assert!(
+        sent.iter().any(
+            |s| matches!(s, Sent::ModifyRequest { amf_ue_ngap_id, .. } if *amf_ue_ngap_id == ue)
+        ),
+        "the waiting modification reaches the connected UE: {sent:?}"
+    );
+    server.forget_ue(ue);
+}
+
 /// A paged modification is delivered after the Service Request as its own
 /// MODIFY REQUEST. Delivering it as a bare DL NAS Transport would lose the N2 half.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4291,4 +4352,40 @@ async fn an_aborted_procedure_releases_the_sessions_before_forgetting_the_ue() {
         assert_eq!(state, (0, 0, 0), "{abort:?}: nothing is left");
         assert!(!held, "{abort:?}: the UE context is gone");
     }
+}
+
+/// #749 over the Namf surface: smfd's downlink-data N1N2 for PSI 2 pages the
+/// idle UE (202). The one for PSI 1, while that paging is ongoing, is answered
+/// 409 with `N1N2MessageTransferError` cause HIGHER_PRIORITY_REQUEST_ONGOING and
+/// `errInfo.retryAfter` (TS 29.518 §5.2.2.3.1), and leaves PSI 2's paging as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_downlink_data_transfer_while_paging_gets_409_with_retry_after() {
+    let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
+    let (_smf, port, _calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran, supi) = (7_749_021u64, 65, "imsi-001010007490021");
+    secured_registered_ue(&mut server, ue, ran);
+    with_supi(&mut server, ue, supi);
+    hold_session(&mut server, ue, 1, "n1n2-749-a", port);
+    hold_session(&mut server, ue, 2, "n1n2-749-b", port);
+    server.ue_auth_state.with_mut(ue, |s| s.cm_idle = true);
+
+    let first = n1n2_transfer(supi, 2, Some(("PDU_RES_SETUP_REQ", None)), None).await;
+    assert_eq!(first.status, 202, "the first one pages");
+    let second = n1n2_transfer(supi, 1, Some(("PDU_RES_SETUP_REQ", None)), None).await;
+    assert_eq!(second.status, 409);
+    let body: serde_json::Value =
+        serde_json::from_str(second.http.content.as_deref().unwrap_or("{}")).unwrap_or_default();
+    assert_eq!(body["error"]["cause"], "HIGHER_PRIORITY_REQUEST_ONGOING");
+    assert_eq!(
+        body["errInfo"]["retryAfter"].as_u64(),
+        Some(crate::namf_handler::PAGING_ONGOING_RETRY_AFTER_S)
+    );
+    let paged = crate::context::amf_self()
+        .read()
+        .unwrap()
+        .paging_remove(ue)
+        .expect("paging for PSI 2");
+    assert_eq!(paged.pdu_session_id, Some(2));
+    server.forget_ue(ue);
 }

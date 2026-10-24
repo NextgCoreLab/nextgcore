@@ -9293,6 +9293,22 @@ impl NgapServer {
     ) {
         use crate::context::ConnectedN2;
         use crate::namf_handler::PagedN2;
+        // #749: the UE is already being paged for another transfer. Its paging
+        // context holds that one, and this transfer was already answered 200, so
+        // it can neither overwrite it nor be refused. It waits in the queue: once
+        // the UE answers it is CM-CONNECTED and delivered as such, and if the page
+        // fails it pages for itself.
+        if crate::namf_handler::paging_ongoing(item.amf_ue_ngap_id) {
+            log::info!(
+                "UE {}: N1N2 transfer for PSI {} waits for the paging already ongoing",
+                item.amf_ue_ngap_id,
+                item.pdu_session_id
+            );
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.connected_downlink_add(item);
+            return;
+        }
         let (n2, paged) = match item.n2 {
             ConnectedN2::None => (None, PagedN2::Setup),
             ConnectedN2::Release => (None, PagedN2::Release),

@@ -3654,6 +3654,12 @@ fn try_ue_policy_relay(
         if !registered_idle {
             return Some(ue_not_reachable_error(ue_context_id, failure_uri));
         }
+        // #749: paging is ongoing for another transfer; overwriting its context
+        // would lose that one, so this one is refused for the PCF to retry.
+        if crate::namf_handler::paging_ongoing(ue.id) {
+            log::info!("[{ue_context_id}] UE policy: the UE is already being paged; 409");
+            return Some(paging_ongoing_error());
+        }
         let location = crate::namf_handler::page_idle_ue_for_n1(
             ue,
             updp_pdu,
@@ -3910,12 +3916,39 @@ pub fn handle_n1_n2_message_transfer_request(
             }
         },
         Err(namf_handler::NamfHandlerError::MissingField(f)) => mandatory_ie_missing(&f),
+        Err(namf_handler::NamfHandlerError::PagingOngoing) => {
+            log::info!(
+                "[{ue_context_id}] N1N2 transfer for PSI {psi} refused: the UE is already being \
+                 paged (409 HIGHER_PRIORITY_REQUEST_ONGOING, retry after {}s)",
+                namf_handler::PAGING_ONGOING_RETRY_AFTER_S
+            );
+            paging_ongoing_error()
+        }
         Err(e) => send_error(
             500,
             "Internal Server Error",
             &format!("N1N2 transfer failed: {e:?}"),
             None,
         ),
+    }
+}
+
+/// #749: 409 `HIGHER_PRIORITY_REQUEST_ONGOING` for an N1N2MessageTransfer to a UE
+/// already being paged (TS 29.518 §5.2.2.3.1, TS 23.502 §4.2.3.3 step 3b). The
+/// body is the `N1N2MessageTransferError`: the ProblemDetails, and in `errInfo`
+/// the `retryAfter` before which the consumer must not try again.
+fn paging_ongoing_error() -> SbiResponse {
+    let problem = ProblemDetails::with_status(409)
+        .with_title("Conflict")
+        .with_detail("A paging procedure is ongoing for the UE")
+        .with_cause("HIGHER_PRIORITY_REQUEST_ONGOING");
+    let body = json!({
+        "error": problem,
+        "errInfo": { "retryAfter": namf_handler::PAGING_ONGOING_RETRY_AFTER_S },
+    });
+    match SbiResponse::with_status(409).with_json_body(&body) {
+        Ok(resp) => resp.with_header("content-type", "application/problem+json"),
+        Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
     }
 }
 
@@ -7323,6 +7356,39 @@ mod tests {
         assert_eq!(
             paged.pending_n1_container_type,
             crate::gmm_handler::payload_container_type::UE_POLICY_CONTAINER
+        );
+
+        // #749: a second UPDP while that paging is ongoing is refused, 409
+        // HIGHER_PRIORITY_REQUEST_ONGOING with a retryAfter (TS 29.518
+        // §5.2.2.3.1), and the first one's paging context is untouched.
+        let second = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"))
+            .with_json_body(&body)
+            .expect("json")
+            .with_part(SbiPart::with_content(
+                "updp-pdu",
+                "application/vnd.3gpp.5gnas",
+                bytes::Bytes::from_static(&[0x80, 0x02, 0x00]),
+            ));
+        let resp = try_ue_policy_relay(supi, &ue, &second, &body).expect("a UE-policy relay");
+        assert_eq!(resp.status, 409);
+        let refusal = body_json(&resp);
+        assert_eq!(
+            refusal["error"]["cause"].as_str(),
+            Some("HIGHER_PRIORITY_REQUEST_ONGOING")
+        );
+        assert_eq!(
+            refusal["errInfo"]["retryAfter"].as_u64(),
+            Some(crate::namf_handler::PAGING_ONGOING_RETRY_AFTER_S)
+        );
+        let still = amf_self()
+            .read()
+            .unwrap()
+            .paging_find(ue.id)
+            .expect("still paging");
+        assert_eq!(
+            still.pending_n1.as_deref(),
+            Some(&[0x80, 0x01, 0x00][..]),
+            "the first UPDP is not overwritten"
         );
         amf_self().read().unwrap().paging_remove(ue.id);
         amf_self().read().unwrap().amf_ue_unpublish(ue.id);
