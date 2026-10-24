@@ -50,6 +50,7 @@ pub mod heartbeat;
 #[cfg(feature = "http3")]
 pub mod http3; // HTTP/3 SBI transport prototype (issue #15, non-normative)
 pub mod json_patch; // RFC 6902 JSON Patch engine (shared from nssfd, issue #96)
+pub mod log_redact; // callback tokens never reach a log line (#940)
 pub mod message;
 pub mod multipart;
 pub mod nes; // NES idle/sleep state machine (issue #22, non-normative)
