@@ -8903,6 +8903,65 @@ mod tests {
         assert_eq!(pfcp_cause_of(&from_a.expect("A answered")), Some(65));
     }
 
+    /// #1059 round 2, M1, m1: the write side. A real establishment records the UPF's
+    /// identity; once the in-memory endpoint record is gone (a restart) and the UPF
+    /// is no longer the default member, the session still routes to it; and taking
+    /// the SM context forgets the identity.
+    #[tokio::test]
+    async fn an_established_sessions_upf_identity_survives_the_endpoint_record() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        smf_context_init(64, 256, 512);
+        let reference = seed_registered_session("imsi-001010000010311", 5, "internet");
+        let seid = smf_n4_seid_for(&reference);
+        let qos = SessionQos {
+            qfi: 9,
+            ambr_ul_bps: 100_000_000,
+            ambr_dl_bps: 100_000_000,
+            xr_flow: None,
+        };
+        let result = pfcp_session_establish(seid, [10, 45, 3, 11], "internet", 1, &qos)
+            .await
+            .expect("established");
+        smf_self()
+            .read()
+            .unwrap()
+            .pfcp_sessions
+            .write()
+            .unwrap()
+            .insert(reference.clone(), result.upf_seid);
+        let recorded = smf_self()
+            .read()
+            .unwrap()
+            .session_upfs
+            .read()
+            .unwrap()
+            .get(&seid)
+            .cloned();
+
+        // A restart: the endpoint record is gone; and B is no longer the default.
+        pfcp_path::forget_session_endpoint_for_test(seid);
+        let other = std::sync::Arc::new(pfcp_path::PfcpClient::new(
+            std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            "127.0.0.5:8805".parse().unwrap(),
+            [127, 0, 0, 1],
+        ));
+        pfcp_path::set_global_pool(vec![other, upf.client.clone()]);
+        let routed = pfcp_path::client_for_session(seid).map(|c| c.peer());
+        let _ = take_sm_context(&reference);
+        let forgotten = !smf_self()
+            .read()
+            .unwrap()
+            .session_upfs
+            .read()
+            .unwrap()
+            .contains_key(&seid);
+
+        assert_eq!(recorded, Some(upf.client.recovery_time_stamp_key()));
+        assert_eq!(routed, Some(upf.client.peer()), "by its identity");
+        assert!(forgotten, "take_sm_context forgets the identity");
+    }
+
     /// #974 review M2, m6, #971: a stranger's Association Release Request is refused
     /// with cause 72 (TS 29.244 §8.2.1) and counted; UPF A stays associated with its
     /// session. Before the gate, it released A's association.

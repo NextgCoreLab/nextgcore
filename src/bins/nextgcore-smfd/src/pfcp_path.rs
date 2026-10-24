@@ -618,7 +618,19 @@ pub fn record_session_peer(smf_n4_seid: u64, peer: SocketAddr) {
     }
 }
 
+/// Forget only the in-memory endpoint record, as a restart does (#1059 tests).
+#[cfg(test)]
+pub(crate) fn forget_session_endpoint_for_test(smf_n4_seid: u64) {
+    if let Ok(mut map) = session_peers().write() {
+        map.remove(&smf_n4_seid);
+    }
+}
+
 /// Drop the session → UPF binding once the session is deleted.
+///
+/// Takes the SMF context's read guard: never call it while holding that guard (a
+/// recursive read on a `std::sync::RwLock` deadlocks behind a queued writer, the
+/// #636 class).
 pub fn forget_session_peer(smf_n4_seid: u64) {
     if let Ok(mut map) = session_peers().write() {
         map.remove(&smf_n4_seid);
@@ -651,21 +663,27 @@ pub fn record_session_upf(smf_n4_seid: u64, client: &PfcpClient) {
 /// moved). `None` when no record names a current member.
 fn recorded_client(smf_n4_seid: u64) -> Option<Arc<PfcpClient>> {
     let pool = global_pool();
+    // #1059 round 2, m2: the identity first. An endpoint can be reused: a hostname
+    // UPF that moved left its old address to another member, and a session recorded
+    // there would route to that one. The endpoint decides only with no identity.
+    let key = {
+        let ctx = smf_self();
+        let key = ctx
+            .read()
+            .ok()
+            .and_then(|ctx| ctx.session_upfs.read().ok()?.get(&smf_n4_seid).cloned());
+        key
+    };
+    if let Some(key) = key {
+        return pool
+            .into_iter()
+            .find(|c| c.recovery_time_stamp_key() == key);
+    }
     let peer = session_peers()
         .read()
         .ok()
-        .and_then(|map| map.get(&smf_n4_seid).copied());
-    if let Some(client) = peer.and_then(|peer| pool.iter().find(|c| c.peer() == peer)) {
-        return Some(client.clone());
-    }
-    let key = {
-        let ctx = smf_self();
-        let ctx = ctx.read().ok()?;
-        let key = ctx.session_upfs.read().ok()?.get(&smf_n4_seid).cloned();
-        key
-    }?;
-    pool.into_iter()
-        .find(|c| c.recovery_time_stamp_key() == key)
+        .and_then(|map| map.get(&smf_n4_seid).copied())?;
+    pool.into_iter().find(|c| c.peer() == peer)
 }
 
 /// The 5GS bridge info a TSC-capable UPF reported per session (#321), keyed by the
@@ -1963,7 +1981,22 @@ fn held_session_seids() -> Vec<u64> {
 /// state, where the binding is not persisted), or whose recorded peer no pool
 /// member has any more (a hostname UPF re-resolved), goes to the default client.
 fn session_served_by(seid: u64, client: &PfcpClient) -> bool {
-    // This client's own record: its endpoint, or (#1031) its identity.
+    let is_default = || global_client().is_some_and(|c| std::ptr::eq(Arc::as_ptr(&c), client));
+    // #1031, #1059 round 2 m2: the identity first, as `recorded_client` does.
+    let identity = smf_self()
+        .read()
+        .ok()
+        .and_then(|ctx| ctx.session_upfs.read().ok()?.get(&seid).cloned());
+    if let Some(key) = identity {
+        if key == client.recovery_time_stamp_key() {
+            return true;
+        }
+        // It names another current member: that one's. It names none: the default.
+        let named = global_pool()
+            .iter()
+            .any(|c| c.recovery_time_stamp_key() == key);
+        return !named && is_default();
+    }
     let recorded = session_peers()
         .read()
         .ok()
@@ -1971,17 +2004,9 @@ fn session_served_by(seid: u64, client: &PfcpClient) -> bool {
     if recorded == Some(client.peer()) {
         return true;
     }
-    let identity = smf_self()
-        .read()
-        .ok()
-        .and_then(|ctx| ctx.session_upfs.read().ok()?.get(&seid).cloned());
-    if identity.is_some_and(|k| k == client.recovery_time_stamp_key()) {
-        return true;
-    }
     // A record naming another current member routes there; anything else goes to
     // the default client.
-    recorded_client(seid).is_none()
-        && global_client().is_some_and(|c| std::ptr::eq(Arc::as_ptr(&c), client))
+    recorded_client(seid).is_none() && is_default()
 }
 
 /// Whether this SMF holds a PFCP session on `client`'s UPF (#718 review M1).
@@ -2797,6 +2822,22 @@ mod tests {
         }
         // `moved` was recorded at an address b no longer has.
         record_session_peer(moved, "127.0.0.1:40000".parse().unwrap());
+        // #1059 round 2, m2: `reused` was recorded at an endpoint A serves now, but
+        // its identity is B's: the identity wins.
+        let reused = 0x1031_0004u64;
+        record_session_peer(reused, a.peer());
+        if let Ok(ctx) = smf_self().read() {
+            ctx.session_upfs
+                .write()
+                .unwrap()
+                .insert(reused, b.recovery_time_stamp_key());
+        }
+        let reused_to = (
+            client_for_session(reused).map(|c| c.peer()),
+            session_served_by(reused, &b),
+            session_served_by(reused, &a),
+        );
+        forget_session_peer(reused);
 
         let to = |seid| client_for_session(seid).map(|c| c.peer());
         let routed = (to(restored), to(moved));
@@ -2825,6 +2866,11 @@ mod tests {
         // Other tests' sessions may name other gone UPFs; this one is counted once.
         assert_eq!(unknown.get("gone.example:8805"), Some(&1));
         assert!(!unknown.contains_key(&b.recovery_time_stamp_key()));
+        assert_eq!(
+            reused_to,
+            (Some(b.peer()), true, false),
+            "identity before endpoint"
+        );
         assert_eq!(routed, (Some(b.peer()), Some(b.peer())));
         assert_eq!(served, (true, false));
         assert!(!forgotten, "forgetting the session forgets its UPF");
@@ -3663,9 +3709,13 @@ mod tests {
             forget_pfcp_session(r);
             forget_session_peer(crate::context::derive_cp_n4_seid(r));
         }
+        // #1059 round 2, m3: not under the context guard (forget_session_peer takes
+        // it, and a recursive std read deadlocks behind a queued writer).
+        for s in [&epc_a, &epc_b] {
+            forget_session_peer(s.smf_n4_seid);
+        }
         if let Ok(ctx) = smf_self().read() {
             for s in [&epc_a, &epc_b] {
-                forget_session_peer(s.smf_n4_seid);
                 ctx.sess_remove(s.id);
             }
         }
