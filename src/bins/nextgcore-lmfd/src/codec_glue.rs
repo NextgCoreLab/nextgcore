@@ -432,16 +432,93 @@ pub fn ecid_flavours(caps: &lpp::ProvideCapabilities) -> EcidFlavours {
     }
 }
 
-/// The capability class and E-CID flavours of an uplink LPP PDU that is a
-/// `ProvideCapabilities`, else `None` (#834 review).
-pub fn decode_lpp_provide_capabilities(bytes: &[u8]) -> Option<(UeLppCapability, EcidFlavours)> {
+/// Which NR multilateration methods a UE reported (#906): Rel-16
+/// `nr-Multi-RTT-ProvideCapabilities-r16` and `nr-DL-TDOA-ProvideCapabilities-r16`,
+/// extension additions of `ProvideCapabilities-r9-IEs` (TS 37.355 §6.3).
+///
+/// Read only when the UE's class is [`UeLppCapability::AdvancedMethods`]: with no
+/// capability report there is nothing to say a method is unsupported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NrMethods {
+    pub multi_rtt: bool,
+    pub dl_tdoa: bool,
+}
+
+/// The NR multilateration methods of a decoded `ProvideCapabilities`.
+pub fn nr_methods(caps: &lpp::ProvideCapabilities) -> NrMethods {
+    match &caps.critical_extensions {
+        lpp::ProvideCapabilitiesCriticalExtensions::C1(
+            lpp::ProvideCapabilitiesCriticalExtensions_c1::ProvideCapabilities_r9(ies),
+        ) => NrMethods {
+            multi_rtt: ies
+                .extensions
+                .nr_multi_rtt_provide_capabilities_r16
+                .is_some(),
+            dl_tdoa: ies.extensions.nr_dl_tdoa_provide_capabilities_r16.is_some(),
+        },
+        _ => NrMethods::default(),
+    }
+}
+
+/// What an uplink `ProvideCapabilities` said (#834 review, #906).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReportedCapabilities {
+    pub class: UeLppCapability,
+    pub ecid: EcidFlavours,
+    pub nr: NrMethods,
+    /// The `LPP-TransactionID` number, which answers a `RequestCapabilities`
+    /// on the same transaction (TS 37.355 §5.1.1). `None` when absent.
+    pub transaction: Option<u8>,
+}
+
+/// The capabilities of an uplink LPP PDU that is a `ProvideCapabilities`, else
+/// `None`.
+pub fn decode_lpp_provide_capabilities(bytes: &[u8]) -> Option<ReportedCapabilities> {
     let msg = decode_lpp(bytes).ok()?;
     match c1(&msg) {
-        Some(lpp::LPP_MessageBody_c1::ProvideCapabilities(caps)) => {
-            Some((classify_ue_capability(caps), ecid_flavours(caps)))
-        }
+        Some(lpp::LPP_MessageBody_c1::ProvideCapabilities(caps)) => Some(ReportedCapabilities {
+            class: classify_ue_capability(caps),
+            ecid: ecid_flavours(caps),
+            nr: nr_methods(caps),
+            transaction: msg.transaction_id.as_ref().map(|t| t.transaction_number.0),
+        }),
         _ => None,
     }
+}
+
+/// Encode an LMF-initiated LPP `RequestCapabilities` (#906; TS 37.355 §5.1.1 step
+/// 1, §6.3) asking for the capability types method selection reads: E-UTRA E-CID
+/// (`ecid-RequestCapabilities`) and the Rel-16 NR E-CID, NR Multi-RTT and NR
+/// DL-TDOA requests (extension additions of `RequestCapabilities-r9-IEs`).
+///
+/// TS 37.355 §5.1.1: the target's capabilities "shall correspond to any
+/// capability types specified in step 1", so a type not asked for here is one
+/// the answer may leave out. `endTransaction` is FALSE: the target ends the
+/// transaction with its `ProvideCapabilities`.
+pub fn build_lpp_request_capabilities(transaction_number: u8) -> Result<Vec<u8>, String> {
+    let mut ies = lpp::RequestCapabilities_r9_IEs {
+        common_i_es_request_capabilities: None,
+        a_gnss_request_capabilities: None,
+        otdoa_request_capabilities: None,
+        ecid_request_capabilities: Some(lpp::ECID_RequestCapabilities {}),
+        epdu_request_capabilities: None,
+        extensions: Default::default(),
+    };
+    ies.extensions.nr_ecid_request_capabilities_r16 = Some(lpp::NR_ECID_RequestCapabilities_r16 {});
+    ies.extensions.nr_multi_rtt_request_capabilities_r16 =
+        Some(lpp::NR_Multi_RTT_RequestCapabilities_r16 {});
+    ies.extensions.nr_dl_tdoa_request_capabilities_r16 =
+        Some(lpp::NR_DL_TDOA_RequestCapabilities_r16 {});
+    let msg = message(
+        transaction(lpp::Initiator::LOCATION_SERVER, transaction_number),
+        false,
+        lpp::LPP_MessageBody_c1::RequestCapabilities(lpp::RequestCapabilities {
+            critical_extensions: lpp::RequestCapabilitiesCriticalExtensions::C1(
+                lpp::RequestCapabilitiesCriticalExtensions_c1::RequestCapabilities_r9(ies),
+            ),
+        }),
+    );
+    encode(&msg, "RequestCapabilities")
 }
 
 /// Minimum reference points a multilateration method needs.
@@ -452,15 +529,24 @@ pub fn decode_lpp_provide_capabilities(bytes: &[u8]) -> Option<(UeLppCapability,
 /// solve for would spend a UE measurement campaign to arrive at no fix.
 pub const MIN_POINTS_FOR_MULTILATERATION: usize = 3;
 
-/// Whether this LMF can obtain the gNB half of a Multi-RTT measurement (#713).
+/// Whether this build can obtain the gNB half of a Multi-RTT measurement (#713,
+/// #807).
 ///
 /// TS 38.305 §8.10: a Multi-RTT range is UE Rx–Tx plus gNB Rx–Tx for the same TRP.
-/// The gNB half comes from the NRPPa Measurement procedure (TS 38.455), after the
-/// serving gNB has configured the UE's SRS through Positioning Information
-/// Exchange and Positioning Activation. This LMF implements none of those, so a
-/// Multi-RTT request would collect UE halves that can never be ranged. Until it
-/// does (#807), Multi-RTT is not requested.
-pub const MULTI_RTT_GNB_HALF_AVAILABLE: bool = false;
+/// The gNB half comes from the NRPPa Measurement procedure (TS 38.455 §8.5.1),
+/// after the serving gNB has configured the UE's SRS through Positioning
+/// Information Exchange and Positioning Activation. Since #807 `multi_rtt` runs
+/// all of them. Whether a given request can use them is the runtime half of the
+/// decision, [`multi_rtt_gnb_half_ready`].
+pub const MULTI_RTT_GNB_HALF_AVAILABLE: bool = true;
+
+/// Whether the gNB half can be obtained in this deployment: the NRPPa downlink is
+/// enabled (`LMF_NRPPA_DOWNLINK=1`) and `lmf.positioning.ngRanNodes` names the
+/// gNBs whose TRPs are measured. Without both, a Multi-RTT request would collect UE
+/// halves that can never be ranged, so DL-TDOA is asked for instead.
+pub fn multi_rtt_gnb_half_ready(nrppa_downlink: bool, ng_ran_nodes: usize) -> bool {
+    MULTI_RTT_GNB_HALF_AVAILABLE && nrppa_downlink && ng_ran_nodes > 0
+}
 
 /// The radio access the target UE is served on, which decides the E-CID flavour
 /// (#715).
@@ -525,7 +611,8 @@ impl AccessRat {
 /// 2. **The UE reported E-CID only ⇒ E-CID.** Asking a UE for a method it has said
 ///    it cannot perform gets an error or an empty report.
 /// 3. **High-accuracy or emergency QoS ⇒ a multilateration method.** Multi-RTT
-///    when the gNB Rx–Tx half can be obtained ([`MULTI_RTT_GNB_HALF_AVAILABLE`]),
+///    when the gNB Rx–Tx half can be obtained (`gnb_half_ready`, from
+///    [`multi_rtt_gnb_half_ready`]),
 ///    because its two-sided measurement cancels the clock offset. Otherwise
 ///    NR DL-TDOA (TS 38.305 §8.12), whose RSTDs the UE measures alone and which
 ///    needs no gNB measurement (#713). This depends on #714, the DL-TDOA
@@ -540,13 +627,22 @@ impl AccessRat {
 /// answering a ≤10 m request with E-CID would commit to an accuracy the method
 /// cannot deliver, which is worse than asking a UE a question it might decline.
 /// The absence of a fallback *retry* when that request does come back empty is
-/// stated as a ceiling rather than hidden here.
+/// stated as a ceiling rather than hidden here. Since #906 a capability is asked
+/// for (LPP `RequestCapabilities`) before the first request to a UE, so `Unknown`
+/// remains only for a UE that did not answer.
+///
+/// With [`UeLppCapability::AdvancedMethods`] the UE named which NR methods it
+/// supports (`nr`, #906), and step 3 picks among those only: Multi-RTT needs the
+/// UE's support and the gNB half, DL-TDOA the UE's support. A UE that supports
+/// neither usable method gets E-CID.
 pub fn select_lpp_method(
     qos: crate::context::PositioningQos,
     reference_points: usize,
     capability: UeLppCapability,
     access: AccessRat,
     flavours: EcidFlavours,
+    nr: NrMethods,
+    gnb_half_ready: bool,
 ) -> LppMethod {
     use crate::context::PositioningQos;
 
@@ -556,15 +652,32 @@ pub fn select_lpp_method(
     if capability == UeLppCapability::EcidOnly {
         return access.ecid_for(flavours);
     }
+    let supported = ue_nr_methods(capability, nr);
     match qos {
         PositioningQos::HighAccuracy | PositioningQos::Emergency => {
-            if MULTI_RTT_GNB_HALF_AVAILABLE {
+            if gnb_half_ready && supported.multi_rtt {
                 LppMethod::MultiRtt
-            } else {
+            } else if supported.dl_tdoa {
                 LppMethod::DlTdoa
+            } else {
+                access.ecid_for(flavours)
             }
         }
         PositioningQos::LowLatency | PositioningQos::BestEffort => access.ecid_for(flavours),
+    }
+}
+
+/// The NR methods a UE may be asked for (#906): what it reported when it reported
+/// [`UeLppCapability::AdvancedMethods`]; both while its capability is `Unknown`,
+/// since nothing says either is unsupported.
+pub fn ue_nr_methods(capability: UeLppCapability, nr: NrMethods) -> NrMethods {
+    match capability {
+        UeLppCapability::AdvancedMethods => nr,
+        UeLppCapability::Unknown => NrMethods {
+            multi_rtt: true,
+            dl_tdoa: true,
+        },
+        UeLppCapability::EcidOnly => NrMethods::default(),
     }
 }
 
@@ -578,7 +691,31 @@ pub fn select_lpp_method(
 /// The NR bodies are Rel-16 extension additions of `RequestLocationInformation-r9-IEs`
 /// (TS 37.355 §6.2), which the generated codec carries since nextgsim #253.
 pub fn build_lpp_request(method: LppMethod, transaction_number: u8) -> Result<Vec<u8>, String> {
-    let ies = match method {
+    encode(
+        &request_location(transaction_number, request_ies(method)),
+        &format!("RequestLocationInformation ({method:?})"),
+    )
+}
+
+/// A Multi-RTT request that also asks for NR DL-TDOA (#903 review): both are
+/// members of the same Rel-16 extension group of `RequestLocationInformation-r9-IEs`
+/// (TS 37.355 §6.2), and a UE measures both on the same DL-PRS. The DL-TDOA RSTDs
+/// let the solver fall back when no Multi-RTT pair forms: the gNB answered
+/// MEASUREMENT FAILURE, never answered, or its halves did not pair. The fix states
+/// which method produced it.
+pub fn build_lpp_multi_rtt_with_dl_tdoa_request(transaction_number: u8) -> Result<Vec<u8>, String> {
+    let mut ies = request_ies(LppMethod::MultiRtt);
+    ies.extensions.nr_dl_tdoa_request_location_information_r16 = request_ies(LppMethod::DlTdoa)
+        .extensions
+        .nr_dl_tdoa_request_location_information_r16;
+    encode(
+        &request_location(transaction_number, ies),
+        "RequestLocationInformation (Multi-RTT + DL-TDOA)",
+    )
+}
+
+fn request_ies(method: LppMethod) -> lpp::RequestLocationInformation_r9_IEs {
+    match method {
         LppMethod::Ecid => ecid_request_ies(),
         LppMethod::NrEcid => nr_ecid_request_ies(),
         LppMethod::MultiRtt => {
@@ -599,9 +736,10 @@ pub fn build_lpp_request(method: LppMethod, transaction_number: u8) -> Result<Ve
                         lpp::NR_Multi_RTT_RequestLocationInformation_r16Nr_RequestedMeasurements_r16(
                             bits(&[true]),
                         ),
-                    // This LMF provides no PRS assistance data, so it must not claim
-                    // availability -- a UE told assistance is available and given
-                    // none reports nothing.
+                    // TS 37.355: "whether the target device may request additional
+                    // DL-PRS assistance data from the server". FALSE: the DL-PRS
+                    // assistance data this LMF has is sent before the request
+                    // (#911), and it answers no NR RequestAssistanceData.
                     nr_assistance_availability_r16:
                         lpp::NR_Multi_RTT_RequestLocationInformation_r16Nr_AssistanceAvailability_r16(
                             false,
@@ -634,6 +772,8 @@ pub fn build_lpp_request(method: LppMethod, transaction_number: u8) -> Result<Ve
                         lpp::NR_DL_TDOA_RequestLocationInformation_r16Nr_RequestedMeasurements_r16(
                             bits(&[true]),
                         ),
+                    // As for Multi-RTT: no additional DL-PRS assistance data
+                    // can be requested (#911).
                     nr_assistance_availability_r16:
                         lpp::NR_DL_TDOA_RequestLocationInformation_r16Nr_AssistanceAvailability_r16(
                             false,
@@ -644,11 +784,7 @@ pub fn build_lpp_request(method: LppMethod, transaction_number: u8) -> Result<Ve
                 });
             ies
         }
-    };
-    encode(
-        &request_location(transaction_number, ies),
-        &format!("RequestLocationInformation ({method:?})"),
-    )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -866,6 +1002,7 @@ fn measured_results_element_to_cell(elem: &lpp::MeasuredResultsElement) -> CellM
         ecid_rtt_ns: rtt.map(|(mid, _)| mid),
         ecid_rtt_width_ns: rtt.map(|(_, width)| width),
         gnb_rx_tx_ns: None,
+        meas_time: None,
         dl_prs_id: None,
         eutra: true,
     }
@@ -958,6 +1095,7 @@ fn nr_measured_results_element_to_cell(
         ecid_rtt_ns: None,
         ecid_rtt_width_ns: None,
         gnb_rx_tx_ns: None,
+        meas_time: None,
         rstd_reference: None,
         dl_prs_id: None,
         eutra: false,
@@ -1043,11 +1181,29 @@ pub fn lpp_multi_rtt_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<Cell
                 ecid_rtt_ns: None,
                 ecid_rtt_width_ns: None,
                 gnb_rx_tx_ns: None,
+                meas_time: Some(lpp_time_stamp(&elem.nr_time_stamp_r16)),
                 dl_prs_id: Some(elem.dl_prs_id_r16.0),
                 eutra: false,
             }
         })
         .collect()
+}
+
+/// A TS 37.355 `NR-TimeStamp-r16` as a [`SlotTime`](crate::nrppa_positioning::SlotTime):
+/// the SFN and slot of the TRP the measurement was made on (#807).
+fn lpp_time_stamp(t: &lpp::NR_TimeStamp_r16) -> crate::nrppa_positioning::SlotTime {
+    use lpp::NR_TimeStamp_r16Nr_Slot_r16 as S;
+    let (slot, slots_per_frame) = match &t.nr_slot_r16 {
+        S::Scs15_r16(s) => (s.0, 10),
+        S::Scs30_r16(s) => (s.0, 20),
+        S::Scs60_r16(s) => (s.0, 40),
+        S::Scs120_r16(s) => (s.0, 80),
+    };
+    crate::nrppa_positioning::SlotTime {
+        sfn: t.nr_sfn_r16.0,
+        slot,
+        slots_per_frame,
+    }
 }
 
 /// Extract the LPP transaction number as a correlation request-id.
@@ -1116,6 +1272,7 @@ pub fn lpp_dl_tdoa_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<CellMe
         ecid_rtt_ns: None,
         ecid_rtt_width_ns: None,
         gnb_rx_tx_ns: None,
+        meas_time: None,
         dl_prs_id: Some(sig.dl_prs_reference_info_r16.dl_prs_id_r16.0),
         eutra: false,
     });
@@ -1145,6 +1302,7 @@ pub fn lpp_dl_tdoa_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<CellMe
             ecid_rtt_ns: None,
             ecid_rtt_width_ns: None,
             gnb_rx_tx_ns: None,
+            meas_time: None,
             dl_prs_id: Some(elem.dl_prs_id_r16.0),
             eutra: false,
         });
@@ -1181,12 +1339,12 @@ pub fn decode_lpp_provide_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasureme
     let cells = if !ecid.is_empty() {
         ecid
     } else {
-        let multi_rtt = lpp_multi_rtt_provide_to_measurements(&msg);
-        if multi_rtt.is_empty() {
-            lpp_dl_tdoa_provide_to_measurements(&msg)
-        } else {
-            multi_rtt
-        }
+        // #903 review: a report answering a Multi-RTT + DL-TDOA request carries both
+        // sets. Both are kept, so the solver falls back to DL-TDOA when the
+        // Multi-RTT halves do not pair.
+        let mut cells = lpp_multi_rtt_provide_to_measurements(&msg);
+        cells.extend(lpp_dl_tdoa_provide_to_measurements(&msg));
+        cells
     };
     Ok((request_id, cells))
 }

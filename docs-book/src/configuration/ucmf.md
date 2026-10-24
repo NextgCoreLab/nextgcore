@@ -44,14 +44,14 @@ Parsed by `UcmfYaml` / `UcmfSection` in `src/bins/nextgcore-ucmfd/src/main.rs`. 
 | `ucmf.limits.max_subscriptions_per_consumer` | integer | `16` | Most subscriptions per consumer. A subscription counts against its `nfId` and against its notification URI's `host:port`, and either reaching the limit refuses, so a consumer cannot sidestep it by varying the self-declared `nfId` (#843 review). |
 | `ucmf.sbi.oauth2.require` | bool | `false` | Require an OAuth2 token on the SBI. `--oauth2-require` overrides it. |
 
-`logger.level` is not read; use `-e/--log-level` or `RUST_LOG`.
+The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691).
 
 ## Command-line flags
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `-c, --config` | path | `/etc/nextgcore/ucmf.yaml` | Configuration file path. |
-| `-e, --log-level` | string | `info` | Log level; `RUST_LOG` overrides it. |
+| `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `--sbi-addr` / `--sbi-port` | string / u16 | `0.0.0.0` / `7777` | SBI bind address and port. |
 | `--tls`, `--tls-cert`, `--tls-key` | flag, path, path | off | TLS on the SBI listener. |
 | `--nrf-uri` | string | `http://127.0.0.1:7777` | NRF base URI, used when the YAML names none. |
@@ -66,7 +66,7 @@ Parsed by `UcmfYaml` / `UcmfSection` in `src/bins/nextgcore-ucmfd/src/main.rs`. 
 |---|---|---|
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://jaeger:4317` | OpenTelemetry OTLP exporter. |
 | `RUST_LOG` | unset | Overrides the log level. |
-| `UCMF_METRICS_ADDR` | `127.0.0.1:9096` | Where `GET /metrics` (Prometheus text) listens. It is unauthenticated, so it defaults to loopback; set a private address deliberately to scrape it from another host. Port 9096, not 9090, which mmed, sgwud and upfd default to. A value that does not parse is logged at warn and the default is used. Series: `ucmf_state_lock_poison_recoveries_total` (a request panicked while holding the state lock; a defect to report), `ucmf_dictionary_full_refusals_total` (Assign only), `ucmf_subscription_limit_refusals_total` (the two subscription limits only), `ucmf_dictionary_entries`, `ucmf_subscriptions`. |
+| `UCMF_METRICS_ADDR` | `127.0.0.1:9096` | Where `GET /metrics` (Prometheus text) listens (`ip:port`). Unset, the host is `NEXTGCORE_METRICS_BIND` if set, else `127.0.0.1`, as for every NF. It is unauthenticated, so it defaults to loopback; set a private address deliberately to scrape it from another host. Port 9096, not 9090, which mmed, sgwud and upfd default to. A value that does not parse is logged at warn and the default is used. Series: `ucmf_state_lock_poison_recoveries_total` (a request panicked while holding the state lock; a defect to report), `ucmf_dictionary_full_refusals_total` (Assign only), `ucmf_subscription_limit_refusals_total` (the two subscription limits only), `ucmf_dictionary_entries`, `ucmf_subscriptions`. |
 
 ## How the AMF reaches it
 

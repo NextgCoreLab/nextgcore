@@ -76,7 +76,7 @@ These are the fields actually deserialized by the daemon (`#[derive(Deserialize)
 
 Unknown YAML keys are silently ignored by serde. In the shipped example file:
 
-- **`logger.file.path` and `logger.level` are inert.** The log level comes solely from the CLI flag `-e/--log-level`; `init_logging` builds `env_logger::Builder::new()` with an explicit filter, so even `RUST_LOG` is not consulted, and no file logging is wired (see `--log-file` below).
+- **`logger.level` is read; `logger.file.path` is inert.** The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691). No file logging is wired (see `--log-file` below).
 - **`global.max.ue` / `global.max.peer` are inert** — no `global` section exists in the deserialize structs; the only pool cap is CLI `--max-nf`.
 - **`nssf.sbi.client.nsi[]` (uri, s_nssai, optional nsi_id) is LOADED** (#93). Each entry installs one Network Slice Instance into the context, which is what `slice-info-request-for-pdu-session` and `slice-info-request-for-other-purpose` resolve against. Until #93 `SbiClientYaml` declared only `nrf`, so this block — present in every shipped config — deserialised into nothing, `nsi_add` had no production caller, and **every** PDU-session selection was answered `403`. An entry with no `s_nssai` is skipped with a warning rather than installed under a guessed SST. With no entries at all the daemon logs an ERROR at startup naming the consequence (it still serves the registration and NSSAI-availability scenarios, which do not consult the NSI table, so it does not refuse to boot).
 - **`nssf.sbi.tls.*` (enabled/cert/key/ca/min_version) is inert.** TLS is CLI-flag-only, and even those flags only populate a legacy config (next section).
@@ -91,7 +91,7 @@ From the clap `Args` struct in `src/bins/nextgcore-nssfd/src/main.rs`:
 |---|---|---|---|
 | `-c, --config` | path | `/etc/nextgcore/nssf.yaml` | Configuration file path. |
 | `-l, --log-file` | path | unset | **Parsed but never used** — no file-logging sink is wired; logs go to the `env_logger` default (stderr). |
-| `-e, --log-level` | string | `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; unknown values fall back to `info`). |
+| `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-m, --no-color` | flag | off | Disable color output. |
 | `-k, --kill` | flag | off | Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor. |
 | `--sbi-addr` | string | `0.0.0.0` | SBI bind address — **overridden** by `nssf.sbi.server[0].address` when the YAML sets it. |

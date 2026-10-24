@@ -26,8 +26,10 @@ pub mod ngap_handler;
 pub mod ngap_mcast; // MBS: NGAP multicast session procedures (TS 38.413 / TS 23.247)
 pub mod ngap_path;
 pub mod ngap_sm;
+pub mod nrf_subscription; // #668: NF status subscriptions at the NRF (TS 29.510 §5.2.2.5)
 pub mod positioning; // LCS: LMF positioning relay (NRPPa N2 / LPP N1) — TS 23.273
 pub mod racs; // #570: RACS on the AMF (TS 23.501 §5.4.4.1a, TS 29.673)
+pub(crate) mod sbi_offload; // #796: SBI work off the NGAP task
 pub mod sbi_path;
 pub mod snpn; // Rel-16: SNPN authentication (TS 23.501 §5.30)
 pub mod timer;
@@ -315,9 +317,10 @@ struct Args {
     #[arg(short, long, default_value = "/etc/nextgcore/amf.yaml")]
     config: String,
 
-    /// Log level (trace, debug, info, warn, error)
-    #[arg(short, long, default_value = "info")]
-    log_level: String,
+    /// Log level (trace, debug, info, warn, error). Without it, the config
+    /// file's `logger.level`, else `info`; `RUST_LOG` overrides (#691).
+    #[arg(short, long)]
+    log_level: Option<String>,
 
     /// Disable color output
     #[arg(long)]
@@ -853,6 +856,9 @@ impl AmfApp {
         // handing this profile to consumers instead of waiting out its
         // supervision timer. Only the async path can do it — the sync
         // `shutdown()` above cannot await, and has no caller.
+        // #668: NFStatusUnsubscribe before NFDeregister, bounded.
+        nrf_subscription::shutdown().await;
+
         nextgcore_sbi::heartbeat::deregister_self().await;
 
         // Close NGAP
@@ -901,19 +907,12 @@ pub async fn run() -> Result<()> {
     let args = Args::parse();
 
     // Initialize logging
-    let log_level = match args.log_level.to_lowercase().as_str() {
-        "trace" => log::LevelFilter::Trace,
-        "debug" => log::LevelFilter::Debug,
-        "info" => log::LevelFilter::Info,
-        "warn" => log::LevelFilter::Warn,
-        "error" => log::LevelFilter::Error,
-        _ => log::LevelFilter::Info,
-    };
-
-    env_logger::Builder::new()
-        .filter_level(log_level)
-        .format_timestamp_millis()
-        .init();
+    // RUST_LOG if set, else --log-level: the same for every NF (#691).
+    nextgcore_core::log::nf_log_builder(&nextgcore_core::log::nf_log_level(
+        args.log_level.as_deref(),
+        Some(&args.config),
+    ))
+    .init();
 
     log::info!("NextGCore AMF v{}", env!("CARGO_PKG_VERSION"));
     log::info!("Configuration: {}", args.config);
@@ -1072,6 +1071,13 @@ pub async fn run() -> Result<()> {
             log::warn!("NRF registration failed (will operate without NRF): {e}");
         }
     }
+
+    // #668: subscribe at the NRF to status changes of every NF type the
+    // discovery cache holds, and keep the subscriptions renewed, so a
+    // deregistered or moved peer is dropped from the cache when the NRF says
+    // so instead of on the first failed request. Its own task: a slow or
+    // blackholed NRF delays nothing else.
+    let _nrf_status_maintainer = nrf_subscription::spawn_maintainer(amf_nf_instance_id.clone());
 
     // #664: a request that cannot reach a cached peer re-discovers through this
     // and is resent once, instead of failing the UE's procedure.

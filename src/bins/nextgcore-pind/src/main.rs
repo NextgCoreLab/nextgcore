@@ -64,8 +64,8 @@ struct Args {
     #[arg(short = 'l', long)]
     log_file: Option<String>,
 
-    #[arg(short = 'e', long, default_value = "info")]
-    log_level: String,
+    #[arg(short = 'e', long)]
+    log_level: Option<String>,
 
     #[arg(short = 'm', long)]
     no_color: bool,
@@ -128,9 +128,7 @@ struct Args {
 }
 
 fn init_logging(level: &str) {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level))
-        .format_timestamp_millis()
-        .init();
+    nextgcore_core::log::nf_log_builder(level).init();
 }
 
 fn setup_signal_handlers(shutdown: Arc<AtomicBool>) {
@@ -144,7 +142,10 @@ fn setup_signal_handlers(shutdown: Arc<AtomicBool>) {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    init_logging(&args.log_level);
+    init_logging(&nextgcore_core::log::nf_log_level(
+        args.log_level.as_deref(),
+        Some(&args.config),
+    ));
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = nextgcore_metrics::otel::init_otel(
         nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(

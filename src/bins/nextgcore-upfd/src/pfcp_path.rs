@@ -350,10 +350,8 @@ pub fn pfcp_open(ctx: &mut PfcpPathContext, local_addr: SocketAddr) -> Result<()
         SocketAddr::V4(addr) => NodeId::Ipv4(*addr.ip()),
         SocketAddr::V6(addr) => NodeId::Ipv6(*addr.ip()),
     };
-    ctx.recovery_time_stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as u32)
-        .unwrap_or(0);
+    // #995: NTP-era seconds (TS 29.244 §8.2.65).
+    ctx.recovery_time_stamp = nextgcore_pfcp::recovery_time::now();
 
     log::info!("PFCP path opened on {local_addr}");
     Ok(())
@@ -710,10 +708,8 @@ impl PfcpServer {
             SocketAddr::V6(addr) => NodeId::Ipv6(*addr.ip()),
         };
 
-        let recovery_time_stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as u32)
-            .unwrap_or(0);
+        // #995: NTP-era seconds (TS 29.244 §8.2.65), not Unix seconds.
+        let recovery_time_stamp = nextgcore_pfcp::recovery_time::now();
 
         Ok(Self {
             socket: Arc::new(socket),
@@ -985,6 +981,20 @@ impl PfcpServer {
             pfcp_type::SESSION_DELETION_REQUEST => {
                 self.handle_session_deletion_request(&header, payload, src_addr)
                     .await?;
+            }
+            pfcp_type::NODE_REPORT_RESPONSE => {
+                // #935: the CP function acknowledged a path Node Report; stop T1/N1.
+                let removed = self
+                    .pending_reports
+                    .lock()
+                    .await
+                    .remove(&header.sequence_number)
+                    .is_some();
+                log::debug!(
+                    "Node Report Response (seq={}, tracked={removed})",
+                    header.sequence_number
+                );
+                return Ok(());
             }
             pfcp_type::SESSION_REPORT_RESPONSE => {
                 // Response to a UPF-initiated Session Report Request: clear the
@@ -2414,6 +2424,47 @@ impl PfcpServer {
 
     /// Send a Session Report Request carrying a Downlink Data Report
     /// (TS 29.244 7.5.8.2) when the first DL packet is buffered under a
+    /// Report N3/N9 user-plane path FAILURE or RECOVERY for `peers` to the CP
+    /// function in a PFCP Node Report Request (#935, TS 29.244 §7.4.5.1), tracked for
+    /// T1/N1 retransmission like a Session Report Request until its Node Report
+    /// Response arrives. Without an association there is nobody to report to.
+    pub async fn send_node_report(
+        &self,
+        failure: bool,
+        peers: &[std::net::IpAddr],
+    ) -> Result<(), String> {
+        if peers.is_empty() {
+            return Err("no peers to report".to_string());
+        }
+        let Some(peer) = self.association.read().await.as_ref().map(|a| a.peer_addr) else {
+            return Err("no PFCP association: no CP function to report the path to".to_string());
+        };
+        let payload =
+            crate::n4_build::build_node_report_request(&self.local_node_id, failure, peers);
+        let seq = self.alloc_seq();
+        let message = self.build_response(pfcp_type::NODE_REPORT_REQUEST, 0, seq, &payload, false);
+        self.pending_reports.lock().await.insert(
+            seq,
+            PendingReport {
+                message: message.clone(),
+                dest: peer,
+                upf_seid: 0,
+                attempts: 0,
+                last_sent: std::time::Instant::now(),
+                usage: Vec::new(),
+            },
+        );
+        if let Err(e) = self.socket.send_to(&message, peer).await {
+            self.pending_reports.lock().await.remove(&seq);
+            return Err(format!("Failed to send Node Report Request: {e}"));
+        }
+        log::info!(
+            "Sent Node Report Request to {peer}: user-plane path {} for {peers:?}",
+            if failure { "FAILURE" } else { "RECOVERY" }
+        );
+        Ok(())
+    }
+
     /// BUFF+NOCP FAR.
     pub async fn send_downlink_data_report(
         &self,
@@ -3078,6 +3129,81 @@ mod tests {
         assert!(rts > 0, "recovery time stamp must be real, not hardcoded 0");
     }
 
+    /// #935 (TS 29.244 §7.4.5.1, Tables 7.4.5.1.2-1/7.4.5.1.3-1) on the wire: a path
+    /// failure goes out as a Node Report Request with UPFR and a User Plane Path Failure
+    /// Report naming the peer; a recovery with UPRR and a User Plane Path Recovery
+    /// Report; the Node Report Response stops T1/N1; without an association nothing
+    /// is sent.
+    #[tokio::test]
+    async fn path_reports_go_out_as_node_reports() {
+        let (server, smf, addr, _rx) = spawn_test_server().await;
+        assert!(server
+            .send_node_report(true, &["10.0.0.1".parse().unwrap()])
+            .await
+            .is_err());
+
+        let payload = build_association_setup_request_payload(Some(0x5000_0000));
+        let resp = exchange(&smf, addr, &encode_pfcp(5, None, 1, &payload)).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+
+        for (failure, nrt, ie) in [
+            (
+                true,
+                0x01u8,
+                crate::n4_build::pfcp_ie::USER_PLANE_PATH_FAILURE_REPORT,
+            ),
+            (
+                false,
+                0x02u8,
+                crate::n4_build::pfcp_ie::USER_PLANE_PATH_RECOVERY_REPORT,
+            ),
+        ] {
+            server
+                .send_node_report(failure, &["10.0.0.1".parse().unwrap()])
+                .await
+                .expect("sent");
+            let mut buf = vec![0u8; 2048];
+            let (len, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), smf.recv_from(&mut buf))
+                    .await
+                    .expect("a Node Report arrives")
+                    .expect("recv");
+            let (hdr, body) = ParsedPfcpHeader::parse(&buf[..len]).unwrap();
+            assert_eq!(buf[1], pfcp_type::NODE_REPORT_REQUEST);
+            let ies = ParsedIe::parse_all(body);
+            let t = ParsedIe::find_ie(&ies, crate::n4_build::pfcp_ie::NODE_REPORT_TYPE).unwrap();
+            assert_eq!(t.value[0], nrt);
+            let report = ParsedIe::find_ie(&ies, ie).expect("the path report IE");
+            let inner = ParsedIe::parse_all(&report.value);
+            let peer =
+                ParsedIe::find_ie(&inner, crate::n4_build::pfcp_ie::REMOTE_GTP_U_PEER).unwrap();
+            assert_eq!(peer.value, vec![0x02, 10, 0, 0, 1], "V4 flag + 10.0.0.1");
+            assert_eq!(server.pending_report_count().await, 1, "tracked for T1/N1");
+
+            // The SMF answers; the request stops being tracked.
+            let mut ok = crate::n4_build::PfcpMessageBuilder::new();
+            ok.add_u8(pfcp_ie::CAUSE, PfcpCause::RequestAccepted as u8);
+            smf.send_to(
+                &encode_pfcp(
+                    pfcp_type::NODE_REPORT_RESPONSE,
+                    None,
+                    hdr.sequence_number,
+                    &ok.build(),
+                ),
+                addr,
+            )
+            .await
+            .unwrap();
+            for _ in 0..50 {
+                if server.pending_report_count().await == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(server.pending_report_count().await, 0, "acknowledged");
+        }
+    }
+
     #[tokio::test]
     async fn test_association_setup_missing_recovery_ts_rejected() {
         let (_server, smf, addr, _rx) = spawn_test_server().await;
@@ -3196,7 +3322,11 @@ mod tests {
     fn far_body(id: u32, apply_action: u16) -> Vec<u8> {
         let mut b = crate::n4_build::PfcpMessageBuilder::new();
         b.add_u32(pfcp_ie::FAR_ID, id);
-        b.add_u16(pfcp_ie::APPLY_ACTION, apply_action);
+        // #1008: octet 5 first, as a conformant SMF sends it.
+        b.add_tlv(
+            pfcp_ie::APPLY_ACTION,
+            &[apply_action as u8, (apply_action >> 8) as u8],
+        );
         b.build()
     }
 
@@ -3362,7 +3492,7 @@ mod tests {
         );
         let mut far = crate::n4_build::PfcpMessageBuilder::new();
         far.add_u32(pfcp_ie::FAR_ID, 0x50);
-        far.add_u16(pfcp_ie::APPLY_ACTION, 0x02);
+        far.add_tlv(pfcp_ie::APPLY_ACTION, &[0x02, 0x00]); // FORW, octet 5
         far.add_tlv(pfcp_ie::FORWARDING_PARAMETERS, &fp.build());
         let mut b = crate::n4_build::PfcpMessageBuilder::new();
         b.add_tlv(pfcp_ie::CREATE_PDR, &pdr.build());
@@ -4886,6 +5016,26 @@ mod tests {
             .keys()
             .find(|k| !before.contains(k))
             .expect("the accepted establishment must be held")
+    }
+
+    /// #995: the UPF's own Recovery Time Stamp is NTP-era seconds (TS 29.244
+    /// §8.2.65), and a pre-#995 peer's Unix-seconds stamp is read in the NTP reading.
+    #[tokio::test]
+    async fn recovery_time_stamps_are_ntp_seconds() {
+        let (server, _smf, _addr, _rx) = spawn_test_server().await;
+        let now = nextgcore_pfcp::recovery_time::now();
+        assert!(now.wrapping_sub(server.recovery_time_stamp) < 60);
+        let unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 3600;
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, unix as u32);
+        assert_eq!(
+            crate::n4_build::parse_recovery_time_stamp(&b.build()),
+            Some(nextgcore_pfcp::recovery_time::from_unix_secs(unix))
+        );
     }
 
     /// The UPF's sessions as (UPF SEID, CP SEID, address it reports to).

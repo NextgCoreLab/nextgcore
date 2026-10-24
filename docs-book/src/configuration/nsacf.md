@@ -61,7 +61,7 @@ These are the fields actually deserialized by the daemon (`#[derive(Deserialize)
 
 The daemon deserializes only the fields above; unknown YAML keys are silently ignored by serde. In particular, in the shipped example files:
 
-- **`logger.level` is inert.** The log level comes from the CLI flag `-e/--log-level` (default `info`) or `RUST_LOG`, not the YAML.
+- **`logger.level` is read.** The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691).
 - **`nsacf.sbi.server[]` (address/port) is inert.** The SBI bind address and port come from the CLI flags `--sbi-addr`/`--sbi-port`; the YAML `server` list exists for visual consistency with other NF configs but is not read by `nextgcore-nsacfd`.
 
 ## Command-line flags
@@ -71,7 +71,7 @@ Runtime knobs with real defaults from the clap `Args` struct in `main.rs`:
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `-c, --config` | path | `/etc/nextgcore/nsacf.yaml` | Configuration file path. |
-| `-e, --log-level` | string | `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`). |
+| `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-l, --log-file` | path | unset | Log file path. |
 | `-m, --no-color` | flag | off | Disable color output. |
 | `--sbi-addr` | string | `0.0.0.0` | SBI server bind address. |
