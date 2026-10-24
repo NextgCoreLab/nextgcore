@@ -138,7 +138,8 @@ jobs:
         # module rots uncompiled -- the reason this project normally prefers a
         # runtime switch to a cargo feature. easdfd's `dns-udp` listener (#276)
         # has to be a feature (it binds a privileged port), so it gets an
-        # explicit build+test here instead. Add a line per gated feature.
+        # explicit build+test here instead. Add a line per gated feature;
+        # 6G and research features go in the research-features job instead.
         run: cd src && cargo test -p nextgcore-easdfd --features dns-udp
 
       - name: cargo test (kernel SCTP)
@@ -153,11 +154,15 @@ jobs:
           sudo apt-get install -y -qq libsctp-dev
           if sudo modprobe sctp 2>/dev/null || grep -qw '^sctp' /proc/modules; then
             cd src && cargo test -p nextgcore-sctp --features kernel \
-              && cargo test -p nextgcore-amfd --features kernel-sctp
+              && cargo test -p nextgcore-amfd --features kernel-sctp \
+              && cargo test -p nextgcore-mmed --features kernel-sctp \
+              && cargo test -p nextgcore-diameter --features kernel-sctp
           else
             echo "::notice::kernel SCTP module unavailable on this runner; kernel-sctp tests built, not run"
             cd src && cargo test -p nextgcore-sctp --features kernel --no-run \
-              && cargo test -p nextgcore-amfd --features kernel-sctp --no-run
+              && cargo test -p nextgcore-amfd --features kernel-sctp --no-run \
+              && cargo test -p nextgcore-mmed --features kernel-sctp --no-run \
+              && cargo test -p nextgcore-diameter --features kernel-sctp --no-run
           fi
 
       - name: Peak memory
@@ -187,16 +192,77 @@ jobs:
 
       - name: cargo clippy (non-default features)
         # Same reasoning as the test job's non-default step: a gated module is
-        # invisible to a default-feature lint. One line per gated feature.
+        # invisible to a default-feature lint. One line per gated feature
+        # (research features: see the research-features job).
         run: cd src && cargo clippy -p nextgcore-easdfd --features dns-udp --all-targets -- -D warnings
 
       - name: cargo clippy (kernel SCTP)
         # The kernel-sctp backend (see the test job): linted like the default one.
-        # Clippy does not link, so libsctp is not needed here.
+        # Clippy does not link, so libsctp is not needed here. mmed's S1-MME and
+        # diameter's RFC 6733 transport use the same backend.
         run: >-
           cd src && cargo clippy -p nextgcore-amfd -p nextgcore-sctp
-          --features nextgcore-amfd/kernel-sctp,nextgcore-sctp/kernel
+          -p nextgcore-mmed -p nextgcore-diameter
+          --features nextgcore-amfd/kernel-sctp,nextgcore-sctp/kernel,nextgcore-mmed/kernel-sctp,nextgcore-diameter/kernel-sctp
           --all-targets -- -D warnings
+
+  research-features:
+    name: 6G / research features
+    # The 6G and research code is behind cargo features that no other job
+    # enables, so the default test and clippy runs never see it. The Check job's
+    # `--all-features` build only compiles it, and does not deny warnings. That
+    # is how the http3 test module carried an unused import nobody saw. This job
+    # tests and lints each feature on its own crate, the way an operator would
+    # build it. It mirrors nextgsim's "6G crates (feature-gated)" job.
+    #
+    # One list drives both loops, so the tested set and the linted set cannot
+    # drift apart. Each entry is `crate:feature`, built with `-p`, so one
+    # crate's feature cannot pull in another crate's. Add a line per new gated
+    # research feature.
+    runs-on: ubuntu-latest
+    needs: check
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      RESEARCH_FEATURES: >-
+        nextgcore-app:6g-extensions
+        nextgcore-sbi:6g-extensions
+        nextgcore-sbi:http3
+        nextgcore-sbi:pqc-tls
+        nextgcore-nwdafd:sensing
+        nextgcore-nwdafd:onnx-model
+        nextgcore-pcfd:intent-loop
+        nextgcore-amfd:ntn
+        nextgcore-nsacfd:sla-observe
+        nextgcore-smfd:compute-aware-upf
+        nextgcore-upfd:compute-aware-upf
+        nextgcore-udmd:nes
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src
+      - name: cargo test (per crate and feature)
+        run: |
+          set -eu
+          cd src
+          for entry in $RESEARCH_FEATURES; do
+            echo "::group::cargo test -p ${entry%%:*} --features ${entry#*:}"
+            cargo test -p "${entry%%:*}" --features "${entry#*:}"
+            echo "::endgroup::"
+          done
+      - name: cargo clippy (per crate and feature)
+        run: |
+          set -eu
+          cd src
+          for entry in $RESEARCH_FEATURES; do
+            echo "::group::cargo clippy -p ${entry%%:*} --features ${entry#*:}"
+            cargo clippy -p "${entry%%:*}" --features "${entry#*:}" --all-targets -- -D warnings
+            echo "::endgroup::"
+          done
 
   fmt:
     name: Format

@@ -404,7 +404,6 @@ impl Http3Client {
 mod tests {
     use super::*;
     use crate::message::SbiResponse;
-    use crate::server::{SbiServer, SbiServerConfig};
     use crate::SbiClient;
 
     const BODY: &str = r#"{"transport":"parity","payload":"0123456789abcdef"}"#;
