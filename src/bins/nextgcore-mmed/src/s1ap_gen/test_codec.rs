@@ -58,6 +58,12 @@ fn enb_id_g(id: &GlobalEnbId) -> g::Global_ENB_ID {
         enb_id: match id.enb_id {
             EnbId::Macro(v) => g::ENB_ID::MacroENB_ID(g::ENB_ID_macroENB_ID(u32_to_bits(v, 20))),
             EnbId::Home(v) => g::ENB_ID::HomeENB_ID(g::ENB_ID_homeENB_ID(u32_to_bits(v, 28))),
+            EnbId::ShortMacro(v) => {
+                g::ENB_ID::Short_macroENB_ID(g::ENB_ID_short_macroENB_ID(u32_to_bits(v, 18)))
+            }
+            EnbId::LongMacro(v) => {
+                g::ENB_ID::Long_macroENB_ID(g::ENB_ID_long_macroENB_ID(u32_to_bits(v, 21)))
+            }
         },
         ie_extensions: None,
     }
@@ -1994,7 +2000,8 @@ fn initiating_d(v: g::InitiatingMessageValue) -> S1apResult<S1apMessage> {
             let enb_id = match &id.enb_id {
                 g::ENB_ID::MacroENB_ID(b) => EnbId::Macro(bits_to_u32(&b.0)),
                 g::ENB_ID::HomeENB_ID(b) => EnbId::Home(bits_to_u32(&b.0)),
-                _ => return Err(bad("ENB-ID")),
+                g::ENB_ID::Short_macroENB_ID(b) => EnbId::ShortMacro(bits_to_u32(&b.0)),
+                g::ENB_ID::Long_macroENB_ID(b) => EnbId::LongMacro(bits_to_u32(&b.0)),
             };
             S1apMessage::S1SetupRequest(d::S1SetupRequest {
                 global_enb_id: GlobalEnbId {

@@ -690,6 +690,14 @@ impl Association {
         }
     }
 
+    /// The number of outbound streams this endpoint may use: its own maximum, lowered to
+    /// the peer's inbound-stream count once the INIT / INIT ACK exchange has been
+    /// processed (RFC 9260 §5.1.1). A stream identifier at or above it is invalid at the
+    /// peer (RFC 9260 §6.5). nextgcore patch (#813).
+    pub fn max_num_outbound_streams(&self) -> u16 {
+        self.my_max_num_outbound_streams
+    }
+
     /// bytes_sent returns the number of bytes sent
     pub(crate) fn bytes_sent(&self) -> usize {
         self.bytes_sent
@@ -905,10 +913,14 @@ impl Association {
         }
 
         // Should we be setting any of these permanently until we've ACKed further?
+        // RFC 9260 §5.1.1: this endpoint's outbound streams are bounded by the peer's
+        // MIS ("Number of Inbound Streams"), its inbound streams by the peer's OS.
+        // Upstream compared like with like (inbound with inbound), which reported the
+        // peer's OS as this endpoint's usable outbound count. nextgcore patch (#813).
         self.my_max_num_inbound_streams =
-            std::cmp::min(i.num_inbound_streams, self.my_max_num_inbound_streams);
+            std::cmp::min(i.num_outbound_streams, self.my_max_num_inbound_streams);
         self.my_max_num_outbound_streams =
-            std::cmp::min(i.num_outbound_streams, self.my_max_num_outbound_streams);
+            std::cmp::min(i.num_inbound_streams, self.my_max_num_outbound_streams);
         self.peer_verification_tag = i.initiate_tag;
         self.source_port = p.common_header.destination_port;
         self.destination_port = p.common_header.source_port;
@@ -989,10 +1001,14 @@ impl Association {
             return Ok(vec![]);
         }
 
+        // RFC 9260 §5.1.1: this endpoint's outbound streams are bounded by the peer's
+        // MIS ("Number of Inbound Streams"), its inbound streams by the peer's OS.
+        // Upstream compared like with like (inbound with inbound), which reported the
+        // peer's OS as this endpoint's usable outbound count. nextgcore patch (#813).
         self.my_max_num_inbound_streams =
-            std::cmp::min(i.num_inbound_streams, self.my_max_num_inbound_streams);
+            std::cmp::min(i.num_outbound_streams, self.my_max_num_inbound_streams);
         self.my_max_num_outbound_streams =
-            std::cmp::min(i.num_outbound_streams, self.my_max_num_outbound_streams);
+            std::cmp::min(i.num_inbound_streams, self.my_max_num_outbound_streams);
         self.peer_verification_tag = i.initiate_tag;
         self.peer_last_tsn = if i.initial_tsn == 0 {
             u32::MAX

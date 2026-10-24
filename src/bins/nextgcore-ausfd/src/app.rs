@@ -969,7 +969,8 @@ pub async fn handle_5g_aka_confirmation(auth_ctx_id: &str, request: &SbiRequest)
 
     // resStar is present and non-null from here on
     let res_star_hex = res_star_hex_opt.expect("value expected");
-    log::info!("5G-AKA Confirmation: RES*={res_star_hex}");
+    // RES* is authentication material: never logged.
+    log::info!("[{}] 5G-AKA Confirmation received", ausf_ue.suci);
 
     if ausf_ue.supi.is_none() {
         return send_bad_request("No SUPI available for UE", Some("MISSING_SUPI"));
