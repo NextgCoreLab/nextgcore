@@ -1287,8 +1287,21 @@ impl NgapServer {
                 association_id,
                 remote_addr,
             } => {
+                // #870 follow-up: a new association has its own negotiated streams; a
+                // count cached under a reused id is not its count.
+                self.outbound_streams.remove(&association_id);
                 self.handle_new_association(association_id, remote_addr)
                     .await?;
+            }
+            ServerEvent::AssociationRestarted { association_id } => {
+                // RFC 9260 §5.2.2: the peer restarted and the streams were negotiated
+                // afresh, so the cached count is asked again. The gNB itself restarted:
+                // it re-runs NG Setup, and the UE contexts it served are gone with it.
+                self.outbound_streams.remove(&association_id);
+                log::warn!(
+                    "NG association {association_id} restarted by the gNB; its outbound \
+                     stream count is re-read"
+                );
             }
             ServerEvent::AssociationClosed {
                 association_id,
@@ -2113,21 +2126,23 @@ impl NgapServer {
                 return Ok(());
             }
             crate::ngap_asn1::RanConfigurationUpdateDecode::Undecodable => {
+                // #752: TS 38.413 §10.2, a Transfer Syntax Error is reported with the
+                // Error Indication procedure, not with the procedure's own failure
+                // message: an undecodable message has no procedure the AMF could
+                // say it failed.
                 log::warn!(
                     "Undecodable RAN Configuration Update from association {association_id}; \
-                     sending RAN CONFIGURATION UPDATE FAILURE"
+                     sending Error Indication (transfer-syntax-error, TS 38.413 §10.2)"
                 );
-                if let Some(failure) =
-                    crate::ngap_asn1::build_ran_configuration_update_failure_generated(
-                        nextgcore_ngap::types::Cause::Protocol(
-                            nextgcore_ngap::types::CauseProtocol::TransferSyntaxError,
-                        ),
-                        None,
-                        &[],
-                    )
-                {
-                    self.send_to_association(association_id, &failure).await?;
-                }
+                self.send_error_indication(
+                    association_id,
+                    None,
+                    None,
+                    ngap_gen::Cause::Protocol(ngap_gen::CauseProtocol(
+                        ngap_gen::CauseProtocol::TRANSFER_SYNTAX_ERROR,
+                    )),
+                )
+                .await?;
                 return Ok(());
             }
         };
@@ -12900,6 +12915,10 @@ impl NgapServer {
         });
 
         let mut bearers = Vec::new();
+        // #946: the sessions that do not move, each with why. Their SMFs are told CANCELLED
+        // and the AMF forgets them once the relocation is known to go ahead, so execution
+        // never sends them COMPLETED and the AMF holds no session the MME did not hand over.
+        let mut not_moved: Vec<(&crate::n26_path::EpsHoSession, &str)> = Vec::new();
         for sess in &sessions {
             let psi = sess.created.pdu_session_id;
             let (host, port) = (&sess.smf.0, sess.smf.1);
@@ -12924,25 +12943,30 @@ impl NgapServer {
                                 })
                                 .collect();
                             if from_smf.is_empty() {
-                                // No EPS Bearer Setup List element from the SMF: the
-                                // bearers it allocated EBIs for are the ones moved.
-                                let ebis = if sess.created.allocated_ebis.is_empty() {
-                                    vec![sess.linked_ebi]
-                                } else {
-                                    sess.created.allocated_ebis.clone()
-                                };
-                                bearers.extend(
-                                    ebis.into_iter()
-                                        .map(crate::n26_eps_to_5gs::bearer_context_for_ebi),
+                                // #946, TS 23.502 §4.11.1.2.2.2 step 12: the EPS Bearer
+                                // Setup list "is generated based on the list of accepted
+                                // QFI(s)". It is the SMF's statement of which bearers moved,
+                                // so an answer without one (or with none usable) confirmed
+                                // no bearer. Reporting the allocated EBIs instead told the
+                                // MME to hand over bearers the SMF never accepted.
+                                log::warn!(
+                                    "EPS→5GS (seq={seq}): SMF {host}:{port} answered PREPARED for \
+                                     PDU session {psi} with no EPS Bearer Setup List; none of its \
+                                     bearers is reported as set up"
                                 );
+                                not_moved.push((sess, "no EPS bearer confirmed by the SMF"));
                             } else {
                                 bearers.extend(from_smf);
                             }
                         }
-                        Err(e) => log::warn!(
-                            "EPS→5GS (seq={seq}): SMF {host}:{port} did not take PDU session \
-                             {psi}'s target tunnel ({e}); its bearers are NOT reported as set up"
-                        ),
+                        Err(e) => {
+                            log::warn!(
+                                "EPS→5GS (seq={seq}): SMF {host}:{port} did not take PDU \
+                                 session {psi}'s target tunnel ({e}); its bearers are NOT \
+                                 reported as set up"
+                            );
+                            not_moved.push((sess, "the SMF did not take the target tunnel"));
+                        }
                     }
                 }
                 None => {
@@ -12950,14 +12974,7 @@ impl NgapServer {
                         "EPS→5GS (seq={seq}): the target gNB did not admit PDU session {psi}; \
                          its SMF is told the handover is CANCELLED for it"
                     );
-                    let _ = crate::sbi_path::call_smf_update_sm_context_ho_state(
-                        host,
-                        port,
-                        &sess.created.sm_context_ref,
-                        "CANCELLED",
-                        None,
-                    )
-                    .await;
+                    not_moved.push((sess, "not admitted by the target gNB"));
                 }
             }
         }
@@ -12969,12 +12986,20 @@ impl NgapServer {
                 "EPS→5GS (seq={seq}): no bearer could be moved, or this AMF has no IPv4 N26 \
                  F-TEID to give; refusing the relocation"
             );
+            // The abandon cancels every session at its SMF, the unmoved ones included.
             if let Some(in_flight) = self.eps_ho_in_flight.remove(&ack.amf_ue_ngap_id) {
                 self.abandon_eps_to_5gs_handover(ack.amf_ue_ngap_id, in_flight, "nothing moved")
                     .await;
             }
             return Vec::new();
         };
+        let unmoved: Vec<(crate::n26_path::EpsHoSession, String)> = not_moved
+            .into_iter()
+            .map(|(sess, why)| (sess.clone(), why.to_string()))
+            .collect();
+        for (sess, why) in unmoved {
+            self.drop_unmoved_eps_session(ack.amf_ue_ngap_id, &sess, &why);
+        }
         let response = crate::n26_eps_to_5gs::build_eps_to_5gs_forward_relocation_response(
             seq,
             mme_teid,
@@ -12994,6 +13019,69 @@ impl NgapServer {
             ack.target_to_source_container.len()
         );
         ebis
+    }
+
+    /// A PDU session an EPS→5GS relocation goes ahead without (#946): not admitted by the
+    /// target gNB, refused by its SMF, or with no EPS bearer the SMF confirmed. Its SMF is
+    /// told CANCELLED (TS 29.502 §5.2.2.3.4.4), off the NGAP task and durably, since nothing
+    /// else will release that preparation. The AMF forgets the session: execution sends
+    /// COMPLETED only to the sessions that moved, and the AMF keeps no session, SM context
+    /// or EBI the MME was not told was set up.
+    fn drop_unmoved_eps_session(
+        &mut self,
+        amf_ue_ngap_id: u64,
+        sess: &crate::n26_path::EpsHoSession,
+        why: &str,
+    ) {
+        let psi = sess.created.pdu_session_id;
+        let (host, port, sm_ref) = (
+            sess.smf.0.clone(),
+            sess.smf.1,
+            sess.created.sm_context_ref.clone(),
+        );
+        self.sbi_offload
+            .spawn_keyed_durable((amf_ue_ngap_id, psi), move || async move {
+                if let Err(e) = crate::sbi_path::call_smf_update_sm_context_ho_state(
+                    &host,
+                    port,
+                    &sm_ref,
+                    "CANCELLED",
+                    None,
+                )
+                .await
+                {
+                    log::warn!(
+                        "EPS→5GS: SMF {host}:{port} did not confirm the cancel of SM context \
+                         {sm_ref}: {e}"
+                    );
+                }
+                None
+            });
+        if let Some(in_flight) = self.eps_ho_in_flight.get_mut(&amf_ue_ngap_id) {
+            in_flight
+                .sessions
+                .retain(|s| s.created.pdu_session_id != psi);
+        }
+        self.sm_context_refs.remove(&(amf_ue_ngap_id, psi));
+        let _ = self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
+            state
+                .amf_ue
+                .assigned_ebis
+                .retain(|e| e.pdu_session_id != psi);
+        });
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            for amf_sess in guard.sess_list_for_ue(amf_ue_ngap_id) {
+                if amf_sess.psi == psi {
+                    guard.sess_remove(amf_sess.id);
+                }
+            }
+        }
+        log::info!(
+            "EPS→5GS: PDU session {psi} of UE {amf_ue_ngap_id} does not move ({why}); its SMF \
+             is told CANCELLED and the AMF forgets it"
+        );
     }
 
     /// The execution phase's AMF half (TS 23.502 §4.11.1.2.2.3): the UE arrived.
@@ -14507,9 +14595,20 @@ impl NgapServer {
                 return Ok(());
             }
             crate::ngap_asn1::NasTransportDecode::Undecodable => {
+                // #752: TS 38.413 §10.2.
                 log::warn!(
-                    "Failed to decode PDU Session Resource Notify from association {association_id}"
+                    "Failed to decode PDU Session Resource Notify from association \
+                     {association_id}; sending Error Indication (transfer-syntax-error)"
                 );
+                self.send_error_indication(
+                    association_id,
+                    None,
+                    None,
+                    ngap_gen::Cause::Protocol(ngap_gen::CauseProtocol(
+                        ngap_gen::CauseProtocol::TRANSFER_SYNTAX_ERROR,
+                    )),
+                )
+                .await?;
                 return Ok(());
             }
         };
@@ -16996,6 +17095,7 @@ mod tests {
     mod handler_tests;
     mod racs_handler_tests;
     mod racs_mapping_tests;
+    mod reject_path_tests;
 
     use super::*;
     use crate::context::AmfContext;
@@ -21751,7 +21851,11 @@ mod tests {
         );
 
         // Each accepted gNB-initiated procedure returns Ok (no Error Indication).
-        for pc in [19u8, 27, 30, 44, 48, 49, 52] {
+        // Not 30 (PDU Session Resource Notify) any more: these three octets do not
+        // decode, and since #752 an undecodable Notify gets the TS 38.413 §10.2
+        // Error Indication. `reject_path_tests::a_well_formed_notify_gets_no_answer`
+        // keeps #71's point for it.
+        for pc in [19u8, 27, 44, 48, 49, 52] {
             ngap.process_ngap_message(1, &[0x00u8, pc, 0x00])
                 .await
                 .unwrap_or_else(|e| {
@@ -25439,6 +25543,41 @@ mod tests {
             !server.outbound_streams.contains_key(&assoc),
             "a closed association's count is forgotten"
         );
+    }
+
+    /// #870 follow-up: a cached stream count is also forgotten when an association id
+    /// arrives as a NEW association (the id reused) and when the peer RESTARTS the
+    /// association (RFC 9260 §5.2.2: streams negotiated afresh).
+    ///
+    /// REVERT-VERIFIED: without either removal its assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_new_or_restarted_association_rereads_its_stream_count() {
+        let mut server = test_ngap_server().await;
+        let assoc = 98_142u64;
+        server.outbound_streams.insert(assoc, Some(9));
+        server
+            .handle_server_event(ServerEvent::AssociationRestarted {
+                association_id: assoc,
+            })
+            .await
+            .expect("handled");
+        assert!(
+            !server.outbound_streams.contains_key(&assoc),
+            "a restarted association's count is re-read"
+        );
+        server.outbound_streams.insert(assoc, Some(9));
+        server
+            .handle_server_event(ServerEvent::NewAssociation {
+                association_id: assoc,
+                remote_addr: "127.0.0.1:38412".parse().unwrap(),
+            })
+            .await
+            .expect("handled");
+        assert!(
+            !server.outbound_streams.contains_key(&assoc),
+            "a new association under a reused id starts with no count"
+        );
+        server.sessions.write().await.remove(&assoc);
     }
 
     #[test]
@@ -31011,15 +31150,316 @@ mod eps_to_5gs_tests {
                         .ok()
                         .and_then(|v| v["hoState"].as_str().map(str::to_string))
                         .unwrap_or_default();
-                    SbiResponse::with_status(200).with_body(
-                        serde_json::json!({ "hoState": ho_state }).to_string(),
-                        "application/json",
-                    )
+                    let mut answer = serde_json::json!({ "hoState": ho_state });
+                    if ho_state == "PREPARED" {
+                        // Step 12: the SMF confirms EBI 5, the bearer it allocated (#946).
+                        answer["epsBearerSetup"] = serde_json::json!([eps_bearer_setup(5)]);
+                    }
+                    SbiResponse::with_status(200).with_body(answer.to_string(), "application/json")
                 }
             })
             .await
             .expect("SMF stand-in");
         (server, port, rx)
+    }
+
+    /// One `epsBearerSetup` element (TS 29.502 `EpsBearerContainer`): a base64 Bearer
+    /// Context IE naming `ebi`, as smfd sends it.
+    fn eps_bearer_setup(ebi: u8) -> String {
+        use base64::Engine as _;
+        let mut buf = bytes::BytesMut::new();
+        crate::n26_eps_to_5gs::bearer_context_for_ebi(ebi)
+            .to_ie(0)
+            .encode(&mut buf);
+        base64::engine::general_purpose::STANDARD.encode(&buf)
+    }
+
+    /// A stand-in SMF for #946: PREPARED for SM context `946-ok` confirms EBI 5, PREPARED
+    /// for any other answers `{"hoState":"PREPARED"}` with no EPS Bearer Setup List; every
+    /// other update is echoed. Reports `(SM context ref, hoState)` for each request.
+    async fn start_smf_946() -> (SbiServer, u16, mpsc::Receiver<(String, String)>) {
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = addr.port();
+        let (tx, rx) = mpsc::channel(32);
+        let server = SbiServer::on_listener(
+            SbiServerConfig::new(format!("127.0.0.1:{port}").parse().unwrap()),
+            listener,
+        );
+        server
+            .start(move |req: SbiRequest| {
+                let tx = tx.clone();
+                async move {
+                    let sm_ref = req
+                        .header
+                        .uri
+                        .trim_end_matches("/modify")
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    let ho_state = req
+                        .http
+                        .content
+                        .as_deref()
+                        .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+                        .and_then(|v| v["hoState"].as_str().map(str::to_string))
+                        .unwrap_or_default();
+                    let _ = tx.send((sm_ref.clone(), ho_state.clone())).await;
+                    let mut answer = serde_json::json!({ "hoState": ho_state });
+                    if ho_state == "PREPARED" && sm_ref == "946-ok" {
+                        answer["epsBearerSetup"] = serde_json::json!([eps_bearer_setup(5)]);
+                    }
+                    SbiResponse::with_status(200).with_body(answer.to_string(), "application/json")
+                }
+            })
+            .await
+            .expect("SMF stand-in");
+        (server, port, rx)
+    }
+
+    fn ho_session_946(port: u16, psi: u8, sm_ref: &str) -> crate::n26_path::EpsHoSession {
+        crate::n26_path::EpsHoSession {
+            smf: ("127.0.0.1".to_string(), port),
+            linked_ebi: psi,
+            apn_ambr_kbps: None,
+            created: crate::sbi_path::EpsHandoverCreated {
+                sm_context_ref: sm_ref.to_string(),
+                pdu_session_id: psi,
+                allocated_ebis: vec![psi],
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Prepare `sessions` for UE `ue` as `prepare_eps_to_5gs_handover_request` leaves
+    /// them, and the acknowledge admitting every one.
+    async fn prepared_946(
+        ngap: &mut NgapServer,
+        ue: u64,
+        sessions: Vec<crate::n26_path::EpsHoSession>,
+        mme: &tokio::net::UdpSocket,
+    ) -> nextgcore_ngap::types::HandoverRequestAcknowledge {
+        let n26 = crate::n26_path::N26Server::open("127.0.0.1:0".parse().unwrap(), 1)
+            .await
+            .expect("N26 socket");
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            for sess in &sessions {
+                ngap.sm_context_refs.insert(
+                    (ue, sess.created.pdu_session_id),
+                    sess.created.sm_context_ref.clone(),
+                );
+                if let Some(mut amf_sess) = guard.sess_add(ue, sess.created.pdu_session_id) {
+                    amf_sess.sm_context_ref = Some(sess.created.sm_context_ref.clone());
+                    guard.sess_update(&amf_sess);
+                }
+            }
+        }
+        let admitted_list = sessions
+            .iter()
+            .map(
+                |s| nextgcore_ngap::types::PduSessionResourceAdmittedItemHoAck {
+                    pdu_session_id: s.created.pdu_session_id,
+                    transfer: vec![0x00, 0x03, 0xE0, 0x0A],
+                },
+            )
+            .collect();
+        ngap.eps_ho_in_flight.insert(
+            ue,
+            EpsHoInFlight {
+                server: n26,
+                seq: 946,
+                mme_peer: mme.local_addr().unwrap(),
+                mme_teid: MME_TEID,
+                sessions,
+                answered: false,
+            },
+        );
+        nextgcore_ngap::types::HandoverRequestAcknowledge {
+            amf_ue_ngap_id: ue,
+            ran_ue_ngap_id: 946,
+            admitted_list,
+            failed_list: None,
+            target_to_source_container: vec![0xC0, 0xFE],
+        }
+    }
+
+    async fn recv_946(rx: &mut mpsc::Receiver<(String, String)>) -> (String, String) {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the SMF must be called")
+            .expect("open")
+    }
+
+    fn psis_held(ue: u64) -> Vec<u8> {
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+        let mut psis: Vec<u8> = guard.sess_list_for_ue(ue).iter().map(|s| s.psi).collect();
+        psis.sort();
+        psis
+    }
+
+    /// #946, TS 23.502 §4.11.1.2.2.2 step 12: of two admitted sessions, the SMF confirms
+    /// EBI 5 for one and answers the other's PREPARED with no EPS Bearer Setup List. The
+    /// Forward Relocation Response lists only EBI 5; the other session's SMF is told
+    /// CANCELLED and the AMF forgets the session, so execution sends COMPLETED only for
+    /// the one that moved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // CONTEXT_GUARD: the AMF session list is global
+    async fn a_prepared_answer_without_an_eps_bearer_setup_list_moves_no_bearer() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::test_support::init_context();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (_smf, port, mut smf_rx) = start_smf_946().await;
+        let mme = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut ngap = NgapServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            SctpBackend::Userspace,
+            mpsc::channel(64).0,
+        )
+        .await
+        .unwrap();
+        const UE: u64 = 946_001;
+        let ack = prepared_946(
+            &mut ngap,
+            UE,
+            vec![
+                ho_session_946(port, 5, "946-ok"),
+                ho_session_946(port, 6, "946-none"),
+            ],
+            &mme,
+        )
+        .await;
+
+        let ebis = ngap.complete_eps_to_5gs_preparation(0x946, &ack).await;
+        assert_eq!(ebis, vec![5], "only the bearer the SMF confirmed");
+        let response = recv_gtp(&mme).await;
+        assert_eq!(
+            response.header.message_type, 134,
+            "Forward Relocation Response"
+        );
+        let cause =
+            Gtp2CauseIe::decode(&response.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value)
+                .unwrap();
+        assert_eq!(cause.cause, 16, "Request accepted");
+        let set_up: Vec<u8> = response
+            .get_ies(Gtp2IeType::BearerContext as u8)
+            .iter()
+            .map(|ie| {
+                Gtp2BearerContextIe::decode(&ie.value)
+                    .unwrap()
+                    .ebi()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            set_up,
+            vec![5],
+            "the EPS Bearer Setup List the MME hands over"
+        );
+
+        let mut seen = vec![
+            recv_946(&mut smf_rx).await,
+            recv_946(&mut smf_rx).await,
+            recv_946(&mut smf_rx).await,
+        ];
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                ("946-none".to_string(), "CANCELLED".to_string()),
+                ("946-none".to_string(), "PREPARED".to_string()),
+                ("946-ok".to_string(), "PREPARED".to_string()),
+            ]
+        );
+        assert!(ngap.sm_context_refs.contains_key(&(UE, 5)));
+        assert!(!ngap.sm_context_refs.contains_key(&(UE, 6)));
+        assert_eq!(
+            psis_held(UE),
+            vec![5],
+            "the AMF forgets the session that did not move"
+        );
+
+        // Execution: COMPLETED reaches the session that moved, and only it.
+        let in_flight = ngap.eps_ho_in_flight.remove(&UE).unwrap();
+        ngap.finish_eps_to_5gs_handover(UE, in_flight).await;
+        assert_eq!(
+            recv_946(&mut smf_rx).await,
+            ("946-ok".to_string(), "COMPLETED".to_string())
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), smf_rx.recv())
+                .await
+                .is_err(),
+            "no COMPLETED for a session the MME did not hand over"
+        );
+        ngap.sm_context_refs.retain(|(ue, _), _| *ue != UE);
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+        for sess in guard.sess_list_for_ue(UE) {
+            guard.sess_remove(sess.id);
+        }
+    }
+
+    /// #946: when the only session's SMF confirms no bearer, nothing moves and the
+    /// relocation is refused, as when the SMF refuses outright.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // CONTEXT_GUARD: the AMF session list is global
+    async fn no_confirmed_bearer_at_all_refuses_the_relocation() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::test_support::init_context();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (_smf, port, mut smf_rx) = start_smf_946().await;
+        let mme = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut ngap = NgapServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            SctpBackend::Userspace,
+            mpsc::channel(64).0,
+        )
+        .await
+        .unwrap();
+        const UE: u64 = 946_002;
+        let ack = prepared_946(
+            &mut ngap,
+            UE,
+            vec![ho_session_946(port, 6, "946-none")],
+            &mme,
+        )
+        .await;
+
+        assert!(ngap
+            .complete_eps_to_5gs_preparation(0x946, &ack)
+            .await
+            .is_empty());
+        let response = recv_gtp(&mme).await;
+        assert_eq!(
+            response.header.message_type, 134,
+            "Forward Relocation Response"
+        );
+        let cause =
+            Gtp2CauseIe::decode(&response.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value)
+                .unwrap();
+        assert_eq!(
+            cause.cause,
+            crate::n26_eps_to_5gs::CAUSE_RELOCATION_FAILURE,
+            "refused"
+        );
+        assert!(response.get_ies(Gtp2IeType::BearerContext as u8).is_empty());
+        assert_eq!(
+            recv_946(&mut smf_rx).await,
+            ("946-none".to_string(), "PREPARED".to_string())
+        );
+        assert_eq!(
+            recv_946(&mut smf_rx).await,
+            ("946-none".to_string(), "CANCELLED".to_string())
+        );
+        assert!(!ngap.eps_ho_in_flight.contains_key(&UE));
+        assert!(psis_held(UE).is_empty());
     }
 
     /// A stand-in NRF that knows one SMF, declaring `declared_pgw` as its PGW-C FQDN.

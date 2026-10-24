@@ -331,6 +331,11 @@ impl S1apServer {
                     self.transmit(out).await;
                 }
             }
+            ServerEvent::AssociationRestarted { association_id } => {
+                log::warn!(
+                    "S1 association {association_id} restarted by the eNB (RFC 9260 §5.2.2)"
+                );
+            }
             ServerEvent::AssociationClosed {
                 association_id,
                 reason,

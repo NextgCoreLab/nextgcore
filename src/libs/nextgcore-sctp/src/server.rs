@@ -101,6 +101,10 @@ pub enum ServerEvent {
     },
     /// Association closed
     AssociationClosed { association_id: u64, reason: String },
+    /// The peer restarted the association (RFC 9260 §5.2.2; kernel `SCTP_RESTART`): the
+    /// association id is unchanged, but the peer is a new endpoint instance and the stream
+    /// counts were negotiated afresh, so nothing cached about the old instance holds.
+    AssociationRestarted { association_id: u64 },
     /// Data received from an association
     DataReceived {
         association_id: u64,
