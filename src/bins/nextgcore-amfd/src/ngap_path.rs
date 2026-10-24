@@ -13037,11 +13037,16 @@ impl NgapServer {
             );
         }
         let sessions_relayed = self.complete_handover_at_smfs(ue, &handed_over);
-        // #778 follow-up: on the target only the handed-over sessions have a user plane.
-        // A session the HANDOVER COMMAND released, or the target never admitted, does
-        // not, so a later downlink-data setup for it must be sent, not suppressed.
-        self.up_active
-            .retain(|(u, psi)| *u != ue || handed_over.contains(psi));
+        // #778 follow-up: on the target exactly the handed-over sessions have a user
+        // plane, set up by the HANDOVER REQUEST and admitted in the Acknowledge. A
+        // session the HANDOVER COMMAND released, or the target never admitted, does not,
+        // so a later downlink-data setup for it must be sent, not suppressed. A
+        // handed-over session is marked even if the source never recorded it (#1067
+        // review m1).
+        self.clear_up_active_for_ue(ue);
+        for &psi in &handed_over {
+            self.mark_up_active(ue, psi);
+        }
         self.handover_target_transfers.retain(|(u, _), _| *u != ue);
         if let Some(psis) = self.handover_target_release_psis.remove(&ue) {
             match crate::ngap_asn1::build_pdu_session_resource_release_command_asn1(
@@ -22963,11 +22968,10 @@ mod tests {
             "both Acknowledges"
         );
         assert!(ngap.ue_auth_state.get(b).expect("kept").is_cm_idle());
-        assert_eq!(
-            ngap.sbi_offload.in_flight(),
-            1,
-            "the SMF call is still hanging"
-        );
+        // The SMF call is still hanging: it holds its permit. Waited for rather than read
+        // once, because the spawned job takes the permit only when it is first polled,
+        // which under load can be after the resets above return.
+        until_in_flight(&ngap, 1).await;
         holder.abort();
         for id in [a, b] {
             ngap.ue_auth_state.remove(id);
@@ -23596,6 +23600,9 @@ mod tests {
     /// Env vars are process-global, so the tests that point the AMF at a fake SMF
     /// serialize on this. Same reasoning as `CONTEXT_GUARD`: the alternative is a
     /// race that shows up as an unrelated test seeing the wrong SMF port.
+    ///
+    /// A test that resolves an SMF takes [`SmfEnvGuard`], not this lock alone: the NF
+    /// discovery cache is consulted first (see `test_support::SMF_ENV_LOCK`).
     fn smf_env_test_lock() -> &'static tokio::sync::Mutex<()> {
         &crate::test_support::SMF_ENV_LOCK
     }
@@ -25975,7 +25982,8 @@ mod tests {
     ///   hear nothing: the list was never decoded);
     /// - a session a PDU Session Resource Notify reports released;
     /// - every session of an AMF UE NGAP ID a Service Request re-keys away from;
-    /// - at a Handover Notify, every session the handover did not carry.
+    /// - at a Handover Notify, every session the handover did not carry. Every session
+    ///   it did carry is marked (#1067 review m1), whatever the source recorded.
     ///
     /// REVERT-VERIFIED: without each clear, its assertion fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -26033,7 +26041,9 @@ mod tests {
             .expect("handled");
         assert!(!server.up_active.contains(&(ue, 3)), "the released session");
 
-        // A handover that carries PSI 1 only.
+        // A handover that carries PSI 1 only. PSI 1 is unmarked on the source first (a
+        // session set up before #778 tracked it): the target still has its user plane.
+        server.clear_up_active(ue, 1);
         server.handover_target_assoc.insert(ue, (target, 12));
         server.handover_target_transfers.insert((ue, 1), vec![0xA1]);
         server
@@ -26046,7 +26056,8 @@ mod tests {
         assert_eq!(
             left,
             vec![1],
-            "only the handed-over session is active on the target"
+            "exactly the handed-over session is active on the target: PSI 1 marked even \
+             though the source had not, PSI 4 (still marked, not carried) cleared"
         );
 
         // A Service Request re-keys the UE to a new AMF UE NGAP ID.
@@ -27365,11 +27376,28 @@ mod tests {
         connected_ue_on(&mut server, assoc, ue, 9, "m6-1", smf_port);
         // A slow step in flight for the session -- no SMF exchange of its own, so nothing
         // about the stand-in's connection handling can shorten it -- and a handover
-        // CANCELLED queued behind it.
+        // CANCELLED queued behind it. `entered` is the step's first action and `done` its
+        // last. The resets wait for `entered`: a job that holds its permit but has not
+        // started can still legitimately be cancelled, which would make `done` race.
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (started, finished) = (Arc::clone(&entered), Arc::clone(&done));
         server.sbi_offload.spawn_keyed((ue, 1), move || async move {
+            started.store(true, std::sync::atomic::Ordering::Release);
             tokio::time::sleep(Duration::from_millis(300)).await;
+            finished.store(true, std::sync::atomic::Ordering::Release);
             None
         });
+        for _ in 0..400 {
+            if entered.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            entered.load(std::sync::atomic::Ordering::Acquire),
+            "the slow step must start"
+        );
         server.cancel_sessions_at_smfs(ue, &[1], "HO_CANCEL");
         let reset = nextgcore_ngap::builder::build_ng_reset(&nextgcore_ngap::types::NgReset {
             cause: nextgcore_ngap::types::Cause::Misc(
@@ -27400,6 +27428,12 @@ mod tests {
             order,
             vec!["CANCELLED".to_string(), "up:DEACTIVATED".to_string()],
             "the CANCELLED survives both resets, and the second reset adds no duplicate"
+        );
+        // #1048 re-review m1: a reset supersedes only QUEUED work. The step that was
+        // already running is not aborted; it runs to its end.
+        assert!(
+            done.load(std::sync::atomic::Ordering::Acquire),
+            "the in-flight step must run to completion, not be aborted by the reset"
         );
         server.forget_ue(ue);
     }

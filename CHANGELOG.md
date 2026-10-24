@@ -13,11 +13,16 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 ## [Unreleased]
 
 ### Changed
-- amfd refuses to start on a `plmn_support` entry with no usable S-NSSAI, meaning none
-  configured or every one `sst: 0`. It used to start an AMF that failed every NG Setup, because
-  the NG Setup Response's Slice Support List must hold at least one slice (TS 38.413 §9.3.1.17).
-  The error names the file and the PLMN as MCC/MNC. This is the one exception to lenient config
-  loading (#1060, #1070).
+- amfd refuses to start on a config it cannot serve NG Setup with. It used to start an AMF
+  that failed every NG Setup. The cases:
+  - a `plmn_support` entry with no usable S-NSSAI, meaning none configured or every one
+    `sst: 0`. The Slice Support List must hold at least one slice (TS 38.413 §9.3.1.17);
+  - a `plmn_support` or `guami` list that resolves to nothing: empty, or no entry with a
+    usable PLMN ID. The NG Setup Response's PLMN Support List and Served GUAMI List are
+    SIZE(1..) (TS 38.413 §9.2.6.2).
+
+  The error names the file, and the PLMN as MCC/MNC. A refused config applies nothing. These
+  are the exceptions to lenient config loading (#1060, #1070).
 - amfd: a `guami`, `tai`, `plmn_support`, `integrity_order` or `ciphering_order` list in the
   config replaces the AMF's list instead of being appended to it (#1070).
 
@@ -125,8 +130,12 @@ before the tag. The validation line is filled from the release run, not carried 
   event fire points (#398, #402, #407, #410), UDM dereg-notify handling (#605, #626), AM policy
   termination on every deregistration (#640), one UE id space (#644), several lock-order and
   deadlock fixes (#604, #638, #646, #647).
-- amfd **refuses to start** on a `plmn_support` entry with no usable S-NSSAI (none, or only
-  `sst: 0`; TS 38.413 §9.3.1.17). Check configs before upgrading (#1060, #1070).
+- amfd **refuses to start** in two cases:
+  - a `plmn_support` entry with no usable S-NSSAI (none, or only `sst: 0`; TS 38.413
+    §9.3.1.17);
+  - a `plmn_support` or `guami` list that resolves to nothing (TS 38.413 §9.2.6.2).
+
+  Check configs before upgrading (#1060, #1070).
 - smfd: UE-initiated 5GSM procedures (#224), SM context registration/404s/N2 handover/DDN paging
   (#283), UDM interaction and event exposure (#292, #298), durable PFCP/binding/IP-pool store
   (#279), URR quotas over N4 (#376), dual connectivity and Notify-released sessions (#633), UPF
