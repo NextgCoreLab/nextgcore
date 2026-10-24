@@ -2326,7 +2326,8 @@ mod tests {
                     ipv4: Some([10, 45, 0, 7]),
                     ipv6: None,
                 }],
-            }),            user_plane_path_recovery_report: None,
+            }),
+            user_plane_path_recovery_report: None,
         };
         let mut buf = BytesMut::new();
         msg.encode(&mut buf);
@@ -2341,6 +2342,36 @@ mod tests {
                 .ipv4,
             Some([10, 45, 0, 7])
         );
+    }
+
+    /// #957 (Table 7.4.5.1-1): a recovery Node Report carries its peers in a User Plane
+    /// Path Recovery Report (IE 187), which round-trips as its own IE.
+    #[test]
+    fn a_node_report_request_carries_a_path_recovery_report() {
+        let msg = NodeReportRequest {
+            node_id: NodeId::new_ipv4([10, 0, 0, 1]),
+            node_report_type: NodeReportType {
+                uprr: true,
+                ..Default::default()
+            },
+            user_plane_path_failure_report: None,
+            user_plane_path_recovery_report: Some(UserPlanePathFailureReport {
+                remote_gtpu_peers: vec![RemoteGtpUPeer {
+                    ipv4: Some([10, 45, 0, 9]),
+                    ipv6: None,
+                }],
+            }),
+        };
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf);
+        let bytes = buf.freeze();
+        assert!(
+            bytes.windows(2).any(|w| w == 187u16.to_be_bytes()),
+            "IE 187 on the wire"
+        );
+        let decoded = NodeReportRequest::decode(&mut bytes.clone()).unwrap();
+        assert_eq!(decoded, msg);
+        assert!(decoded.user_plane_path_failure_report.is_none());
     }
 
     #[test]
