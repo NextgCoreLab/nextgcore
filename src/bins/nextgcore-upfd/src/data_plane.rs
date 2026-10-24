@@ -70,6 +70,16 @@ pub struct GtpuPeerState {
     pub path_failed: bool,
 }
 
+/// What an Echo Response meant to the [`GtpuPathTable`] (#887).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EchoResponse {
+    /// It answered our outstanding request: the path is alive.
+    Answered,
+    /// Not an answer to anything we sent (unknown peer, no outstanding request, or a
+    /// sequence number that does not match). Ignored.
+    Unsolicited,
+}
+
 /// Per-N3-peer path management table.
 ///
 /// Tracks Echo Request/Response exchanges for each gNB address derived from
@@ -79,9 +89,6 @@ pub struct GtpuPathTable {
     peers: HashMap<SocketAddr, GtpuPeerState>,
     /// Rolling sequence counter for outbound Echo Requests (never zero).
     next_seq: u16,
-    /// Our own restart counter included in outbound Echo Requests. Fixed at 0
-    /// for a fresh UPF process (incremented on restart by an operator).
-    pub restart_counter: u8,
     /// Consecutive missed responses before declaring path failure (default 3).
     pub miss_threshold: u32,
     /// Echo interval in seconds (default 60, per TS 23.007).
@@ -95,7 +102,6 @@ impl Default for GtpuPathTable {
         Self {
             peers: HashMap::new(),
             next_seq: 1,
-            restart_counter: 0,
             miss_threshold: 3,
             echo_interval_secs: 60,
             enabled: true,
@@ -114,20 +120,43 @@ impl GtpuPathTable {
         self.peers.remove(peer);
     }
 
-    /// Called on receiving an Echo Response from `peer`: the path is alive.
+    /// Track exactly the paths IN USE (#887 review, TS 29.281 §7.2.1: "Echo Request
+    /// messages may be sent for each path in use ... if at least one ... PDU Session
+    /// ... uses the path"): add the peers of `in_use` and DROP every other one. Before,
+    /// a peer was only ever added, so the table kept every gNB address ever used --
+    /// and now that a failed path keeps being probed (to see it recover), a gNB that
+    /// left would otherwise be probed for the life of the process.
+    pub fn sync_peers(&mut self, in_use: &HashSet<SocketAddr>) {
+        self.peers.retain(|peer, _| in_use.contains(peer));
+        for &peer in in_use {
+            self.add_peer(peer);
+        }
+    }
+
+    /// Called on receiving an Echo Response from `peer` carrying sequence number `seq`.
     ///
-    /// The Recovery IE it carries says nothing about a restart. TS 29.281 §8.2:
-    /// "The value of the restart counter shall be set to 0 by the sending entity
-    /// and ignored by the receiving entity" (#798 review). GTP-U restarts are
-    /// learnt through the control plane (TS 23.007), not from this counter, so
-    /// before #798's follow-up a peer sending a non-zero value was misread as
-    /// restarting on every change.
-    pub fn on_echo_response(&mut self, peer: SocketAddr) {
-        let state = self.peers.entry(peer).or_default();
+    /// #887: only an ANSWER is accepted -- a response from a peer this table probes,
+    /// whose sequence number matches the Echo Request outstanding to it (TS 29.281
+    /// §7.2.2: the response copies the request's sequence number). Anything else is
+    /// unsolicited and changes nothing. This used to create an entry for any source
+    /// address, so a spoofed response grew the table without bound -- and every entry
+    /// it created was then PROBED, making the UPF send Echo Requests to addresses of
+    /// the sender's choosing.
+    ///
+    /// The Recovery IE an answer carries says nothing about a restart (#873, TS 29.281
+    /// §8.2: "set to 0 by the sending entity and ignored by the receiving entity").
+    pub fn on_echo_response(&mut self, peer: SocketAddr, seq: Option<u16>) -> EchoResponse {
+        let Some(state) = self.peers.get_mut(&peer) else {
+            return EchoResponse::Unsolicited;
+        };
+        if seq.is_none() || state.pending_seq != seq {
+            return EchoResponse::Unsolicited;
+        }
         state.pending_seq = None;
         state.miss_count = 0;
         state.last_success = Some(std::time::Instant::now());
         state.path_failed = false;
+        EchoResponse::Answered
     }
 
     /// Advance the state machine by one echo interval tick.
@@ -142,18 +171,17 @@ impl GtpuPathTable {
         let mut failed = Vec::new();
 
         for (peer, state) in self.peers.iter_mut() {
-            if state.path_failed {
-                continue;
-            }
             // An outstanding request that wasn't answered counts as a miss.
             if state.pending_seq.is_some() {
-                state.miss_count += 1;
-                if state.miss_count >= self.miss_threshold {
+                state.miss_count = state.miss_count.saturating_add(1);
+                if !state.path_failed && state.miss_count >= self.miss_threshold {
                     state.path_failed = true;
                     failed.push(*peer);
-                    continue;
                 }
             }
+            // #887: a FAILED path keeps being probed. Recovery is now learned only
+            // from an answer that matches an outstanding request, so a peer that is no
+            // longer probed could never be seen to recover.
             // Issue the next Echo Request.
             let seq = self.next_seq;
             self.next_seq = self.next_seq.wrapping_add(1);
@@ -655,21 +683,19 @@ pub fn build_gtpu_echo_response(seq: Option<u16>) -> Vec<u8> {
     pkt
 }
 
-/// Build GTP-U Echo Request with Recovery IE (TS 29.281 §7.2.1).
-///
-/// Structure mirrors Echo Response: S=1, TEID=0, Recovery IE appended.
-pub fn build_gtpu_echo_request(seq: u16, restart_counter: u8) -> Vec<u8> {
-    let mut pkt = vec![0u8; 14];
+/// Build a GTP-U Echo Request (TS 29.281 §7.2.1): S=1, TEID=0, and NO information
+/// element -- §7.2.1 lists only the Private Extension (#887; the Recovery IE belongs
+/// to the Echo Response, §7.2.2).
+pub fn build_gtpu_echo_request(seq: u16) -> Vec<u8> {
+    let mut pkt = vec![0u8; 12];
     pkt[0] = 0x32; // Version=1, PT=1, S=1
     pkt[1] = gtpu_msg_type::ECHO_REQUEST;
-    // length = 4 (seq/npdu/next-ext) + 2 (Recovery IE) = 6
-    pkt[2..4].copy_from_slice(&6u16.to_be_bytes());
+    // length = 4: the sequence number, N-PDU number and next-extension octets.
+    pkt[2..4].copy_from_slice(&4u16.to_be_bytes());
     pkt[4..8].copy_from_slice(&0u32.to_be_bytes()); // TEID=0
     pkt[8..10].copy_from_slice(&seq.to_be_bytes());
     pkt[10] = 0; // N-PDU number
     pkt[11] = 0; // next extension header type = None
-    pkt[12] = GTPU_IE_RECOVERY;
-    pkt[13] = restart_counter;
     pkt
 }
 
@@ -1208,6 +1234,9 @@ pub struct TimeMeter {
     /// First / Last Packet).
     first_pkt_wall: Option<std::time::SystemTime>,
     last_pkt_wall: Option<std::time::SystemTime>,
+    /// Reports generated so far: lets a restore tell whether a NEWER report has gone
+    /// out since the undelivered one (#953 review).
+    report_gen: u64,
 }
 
 /// The time IEs of one usage report (#818, TS 29.244 Table 7.5.8.3-1).
@@ -1223,6 +1252,8 @@ pub struct ReportTimes {
     /// Time of First / Last Packet (§8.2.44/§8.2.45), when traffic was seen.
     pub first_pkt: Option<std::time::SystemTime>,
     pub last_pkt: Option<std::time::SystemTime>,
+    /// Which report this was (the URR's report count after it).
+    pub gen: u64,
 }
 
 impl Default for ReportTimes {
@@ -1234,12 +1265,14 @@ impl Default for ReportTimes {
             duration: None,
             first_pkt: None,
             last_pkt: None,
+            gen: 0,
         }
     }
 }
 
 /// A 3GPP NTP timestamp (§8.2.38: seconds since 1900-01-01, the first four octets
-/// of the RFC 5905 64-bit format).
+/// of the RFC 5905 64-bit format). The `as u32` truncation is the NTP era wrap: values
+/// are era 0 until 2036-02-07, then wrap to era 1 exactly as RFC 5905 §6 specifies.
 pub fn ntp_secs(t: std::time::SystemTime) -> u32 {
     const NTP_UNIX_OFFSET: u64 = 2_208_988_800;
     let unix = t
@@ -2040,7 +2073,9 @@ impl DataPlaneUrr {
                     .then(|| now.saturating_sub(m.report_anchor)),
                 first_pkt: m.first_pkt_wall.take(),
                 last_pkt: m.last_pkt_wall.take(),
+                gen: m.report_gen + 1,
             };
+            m.report_gen += 1;
             m.report_anchor = now;
             m.report_wall = Some(wall);
             if threshold_report {
@@ -2073,12 +2108,17 @@ impl DataPlaneUrr {
         if let Some(d) = times.duration {
             m.report_anchor = m.report_anchor.saturating_sub(d);
         }
-        m.report_wall = Some(m.report_wall.map_or(times.start, |w| w.min(times.start)));
-        if let Some(f) = times.first_pkt {
-            m.first_pkt_wall = Some(m.first_pkt_wall.map_or(f, |w| w.min(f)));
-        }
-        if m.last_pkt_wall.is_none() {
-            m.last_pkt_wall = times.last_pkt;
+        // #953 review: the window reaches back only if no NEWER report has gone out
+        // since -- otherwise the next report's Start Time would overlap a window already
+        // reported. The duration (and the volume) are still carried, so the totals sum.
+        if m.report_gen == times.gen {
+            m.report_wall = Some(m.report_wall.map_or(times.start, |w| w.min(times.start)));
+            if let Some(f) = times.first_pkt {
+                m.first_pkt_wall = Some(m.first_pkt_wall.map_or(f, |w| w.min(f)));
+            }
+            if m.last_pkt_wall.is_none() {
+                m.last_pkt_wall = times.last_pkt;
+            }
         }
     }
 
@@ -3338,10 +3378,18 @@ impl DataPlane {
                     None
                 };
                 log::debug!(
-                    "GTP-U Echo Response from {from}, Recovery={recovery:?} (ignored, TS 29.281 \
-                     §8.2)"
+                    "GTP-U Echo Response from {from}, seq={:?}, Recovery={recovery:?} \
+                     (ignored, TS 29.281 §8.2)",
+                    header.seq_num
                 );
-                self.path_table.write().unwrap().on_echo_response(from);
+                let outcome = self
+                    .path_table
+                    .write()
+                    .unwrap()
+                    .on_echo_response(from, header.seq_num);
+                if outcome == EchoResponse::Unsolicited {
+                    log::debug!("GTP-U Echo Response from {from} answers nothing we sent: ignored");
+                }
                 return;
             }
             gtpu_msg_type::END_MARKER => {
@@ -4024,42 +4072,49 @@ impl DataPlane {
             let new_dl_teid = dl_teid.unwrap_or(old_teid);
             let new_gnb_addr = gnb_addr.unwrap_or(old_addr);
 
-            // Update the downlink FAR's outer header creation if present
+            // #583: only the FARs the session's DOWNLINK (Core-source) PDRs use. A FAR
+            // toward the access side that an uplink-side PDR uses -- an indirect
+            // forwarding tunnel to the target NG-RAN -- has its own endpoint, which the
+            // session's DL tunnel moving must not overwrite.
+            let dl_fars: std::collections::HashSet<u32> = session
+                .pdrs
+                .read()
+                .unwrap()
+                .iter()
+                .filter(|p| p.source_interface == SRC_INTF_CORE)
+                .filter_map(|p| p.far_id)
+                .collect();
+            // #883: the FARs' endpoint and the session's tunnel move in ONE critical
+            // section (lock order `fars` -> `dl_tunnel`; nothing takes them the other
+            // way), so a downlink packet never pairs the new FAR endpoint with the old
+            // tunnel or the reverse.
+            let mut fars = session.fars.write().unwrap();
             if dl_teid.is_some() || gnb_addr.is_some() {
-                // #583: only the FARs the session's DOWNLINK (Core-source) PDRs use. A FAR
-                // toward the access side that an uplink-side PDR uses -- an indirect
-                // forwarding tunnel to the target NG-RAN -- has its own endpoint, which the
-                // session's DL tunnel moving must not overwrite.
-                let dl_fars: std::collections::HashSet<u32> = session
-                    .pdrs
-                    .read()
-                    .unwrap()
-                    .iter()
-                    .filter(|p| p.source_interface == SRC_INTF_CORE)
-                    .filter_map(|p| p.far_id)
-                    .collect();
-                let mut fars = session.fars.write().unwrap();
                 for far in fars.values_mut() {
                     if far.destination_interface == SRC_INTF_ACCESS && dl_fars.contains(&far.far_id)
                     {
                         if let Some(teid) = dl_teid {
                             far.ohc_teid = Some(teid);
                         }
-                        if let Some(addr) = gnb_addr {
-                            if let IpAddr::V4(ip) = addr.ip() {
-                                far.ohc_addr = Some(ip);
-                            }
+                        match gnb_addr.map(|a| a.ip()) {
+                            Some(IpAddr::V4(ip)) => far.ohc_addr = Some(ip),
+                            // #883: the FAR endpoint is IPv4-only. Keeping the stale IPv4
+                            // address would forward to the gNB the session just LEFT;
+                            // cleared, the downlink falls back to the session tunnel,
+                            // which carries the IPv6 address.
+                            Some(IpAddr::V6(_)) => far.ohc_addr = None,
+                            None => {}
                         }
                     }
                 }
             }
-
             // #822: moved IN PLACE. This used to `mem::take` the PDRs, FARs, QERs, URRs,
             // BARs and DL buffer out of the live session and re-add a rebuilt one, so a
             // packet already holding the old `Arc` found no rules (dropped, or forwarded
             // unmeasured) and a concurrent TERMR/QAURR found no session -- on every
             // DL-tunnel modification (handover, Service Request) under traffic.
             session.set_dl_tunnel(new_dl_teid, new_gnb_addr);
+            drop(fars);
             log::info!(
                 "Updated data plane session: SEID={upf_seid:#x}, DL_TEID=0x{new_dl_teid:x}, gNB={new_gnb_addr}"
             );
@@ -4296,25 +4351,19 @@ impl DataPlane {
                 break;
             }
 
-            // Derive current N3 peer set from active sessions (additive only:
-            // stale peers with miss_count > 0 age out naturally via tick()).
+            // The N3 peer set in use, derived from the live sessions.
             let active_peers: HashSet<SocketAddr> = {
                 let map = self.sessions.seid_map.read().unwrap();
                 map.values().map(|s| s.gnb_addr()).collect()
             };
 
+            // #887 review: the table tracks exactly the paths in use; a peer whose last
+            // session went is dropped, not probed forever.
+            self.path_table.write().unwrap().sync_peers(&active_peers);
             if active_peers.is_empty() {
                 continue;
             }
 
-            {
-                let mut pt = self.path_table.write().unwrap();
-                for &peer in &active_peers {
-                    pt.add_peer(peer);
-                }
-            }
-
-            let restart_counter = self.path_table.read().unwrap().restart_counter;
             let miss_threshold = self.path_table.read().unwrap().miss_threshold;
             let (to_send, failed) = self.path_table.write().unwrap().tick();
 
@@ -4343,7 +4392,7 @@ impl DataPlane {
             // Send Echo Requests
             if let Some(sock) = &self.gtpu_socket {
                 for (peer, seq) in to_send {
-                    let req = build_gtpu_echo_request(seq, restart_counter);
+                    let req = build_gtpu_echo_request(seq);
                     if let Err(e) = sock.send_to(&req, peer).await {
                         log::debug!("GTP-U Echo Request to {peer} failed: {e}");
                     } else {
@@ -6788,6 +6837,50 @@ mod tests {
         assert_eq!(t.duration, None, "no Duration Measurement without DURAT");
     }
 
+    /// #953 review: the restore wiring through `DataPlane::restore_urr_usage` (what a
+    /// failed send or an N1 give-up calls) puts the times back -- the next report's
+    /// Start Time reaches back over the undelivered one -- but NOT when a newer report
+    /// has gone out meanwhile, which would make two reported windows overlap.
+    #[test]
+    fn restored_times_reach_back_only_if_no_newer_report_went_out() {
+        let dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        dp.add_session_from_pfcp(
+            0x953,
+            0x1953,
+            Ipv4Addr::new(10, 45, 9, 53),
+            0x9531,
+            0x9532,
+            "127.0.0.1:2152".parse().unwrap(),
+            Some(5),
+            Some(9),
+        );
+        let session = dp.sessions.find_by_seid(0x953).unwrap();
+        let urr = Arc::new(DataPlaneUrr::new(1));
+        urr.set_reporting(Some(1), None, None, None, None);
+        session.urrs.write().unwrap().insert(1, Arc::clone(&urr));
+
+        urr.record(10, true);
+        let lost = dp.collect_urr_reports();
+        dp.restore_urr_usage(&lost);
+        urr.record(10, true);
+        let next = dp.collect_urr_reports();
+        assert_eq!(next[0].times.start, lost[0].times.start, "reaches back");
+
+        // Now: A is lost, B goes out, THEN A is restored.
+        urr.record(10, true);
+        let a = dp.collect_urr_reports();
+        urr.record(10, true);
+        let b = dp.collect_urr_reports();
+        dp.restore_urr_usage(&a);
+        urr.record(10, true);
+        let c = dp.collect_urr_reports();
+        assert_eq!(
+            c[0].times.start, b[0].times.end,
+            "no overlap with B's window"
+        );
+        assert_eq!(c[0].total_bytes, 20, "but A's volume is carried");
+    }
+
     /// #818: a report that was not delivered gives its time back with its usage: the
     /// next report's Start Time and Duration reach back over it.
     #[test]
@@ -6968,6 +7061,55 @@ mod tests {
             "the next report carries the undelivered usage plus the new"
         );
         assert!(next[0].ur_seqn > lost[0].ur_seqn);
+    }
+
+    /// #883: a DL-tunnel modification to an IPv6 gNB clears the DL FAR's IPv4 endpoint,
+    /// so the downlink follows the session tunnel to the NEW gNB instead of forwarding
+    /// to the IPv4 gNB the session just left; an IPv4 move still updates the FAR.
+    #[test]
+    fn a_dl_tunnel_move_to_an_ipv6_gnb_does_not_leave_the_far_on_the_old_gnb() {
+        let dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        dp.add_session_from_pfcp(
+            0x883,
+            0x1883,
+            Ipv4Addr::new(10, 45, 8, 83),
+            0x8831,
+            0x8832,
+            "127.0.0.1:2152".parse().unwrap(),
+            Some(5),
+            Some(9),
+        );
+        let session = dp.sessions.find_by_seid(0x883).expect("session");
+        let dl_far_id = session
+            .pdrs
+            .read()
+            .unwrap()
+            .iter()
+            .find(|p| p.source_interface == SRC_INTF_CORE)
+            .and_then(|p| p.far_id)
+            .expect("a downlink PDR with a FAR");
+        let far_addr = || session.fars.read().unwrap()[&dl_far_id].ohc_addr;
+
+        dp.update_session_from_pfcp(0x883, Some(0x1), Some("127.0.0.9:2152".parse().unwrap()));
+        assert_eq!(far_addr(), Some(Ipv4Addr::new(127, 0, 0, 9)));
+
+        let v6: SocketAddr = "[2001:db8::9]:2152".parse().unwrap();
+        dp.update_session_from_pfcp(0x883, Some(0x2), Some(v6));
+        assert_eq!(far_addr(), None, "no stale IPv4 endpoint left on the FAR");
+        assert_eq!(session.dl_tunnel(), (0x2, v6));
+        match session.apply_far(dl_far_id) {
+            FarDecision::Forward { ohc_teid, ohc_addr } => {
+                assert_eq!(ohc_teid, Some(0x2));
+                assert_eq!(
+                    ohc_addr
+                        .map(|ip| SocketAddr::new(IpAddr::V4(ip), GTPU_PORT))
+                        .unwrap_or(session.gnb_addr()),
+                    v6,
+                    "the downlink resolves to the new IPv6 gNB"
+                );
+            }
+            other => panic!("expected Forward, got {other:?}"),
+        }
     }
 
     /// #822: a DL-tunnel modification moves the tunnel IN PLACE. A packet that already
@@ -7675,25 +7817,27 @@ mod tests {
     // upfd-04: Echo Request builder and GtpuPathTable state machine
     // =========================================================================
 
-    /// TS 29.281 §7.2.1: Echo Request layout mirrors Echo Response.
+    /// TS 29.281 §7.2.1: an Echo Request is the 12-byte header with S=1 and no IE
+    /// (#887: the Recovery IE it used to carry belongs to the Echo Response).
     #[test]
     fn test_gtpu_echo_request_layout() {
-        let req = build_gtpu_echo_request(0xABCD, 42);
-        assert_eq!(req.len(), 14, "Echo Request must be 14 bytes");
+        let req = build_gtpu_echo_request(0xABCD);
+        assert_eq!(req.len(), 12, "Echo Request must be 12 bytes: header only");
         assert_eq!(
             req[1],
             gtpu_msg_type::ECHO_REQUEST,
             "msg type must be ECHO_REQUEST (1)"
         );
         let length = u16::from_be_bytes([req[2], req[3]]);
-        assert_eq!(length, 6, "length must be 6");
+        assert_eq!(
+            length, 4,
+            "length covers only the seq/N-PDU/next-ext octets"
+        );
         assert_eq!(req[0] & 0x02, 0x02, "S flag must be set");
         let teid = u32::from_be_bytes([req[4], req[5], req[6], req[7]]);
         assert_eq!(teid, 0, "TEID must be 0");
         let seq = u16::from_be_bytes([req[8], req[9]]);
         assert_eq!(seq, 0xABCD, "sequence number must be as passed");
-        assert_eq!(req[12], GTPU_IE_RECOVERY, "Recovery IE type must be 14");
-        assert_eq!(req[13], 42, "restart counter must be as passed");
     }
 
     /// Successful response resets miss_count and returns false (no restart).
@@ -7707,8 +7851,9 @@ mod tests {
         let (to_send, failed) = pt.tick();
         assert_eq!(to_send.len(), 1);
         assert!(failed.is_empty());
+        let seq = to_send[0].1;
 
-        pt.on_echo_response(peer);
+        assert_eq!(pt.on_echo_response(peer, Some(seq)), EchoResponse::Answered);
 
         // After response the peer must not be failed.
         let state = pt.peers.get(&peer).unwrap();
@@ -7750,13 +7895,106 @@ mod tests {
         let peer: SocketAddr = "10.0.0.2:2152".parse().unwrap();
         let mut pt = GtpuPathTable::default();
         pt.add_peer(peer);
-        let _ = pt.tick();
-        pt.on_echo_response(peer);
-        let _ = pt.tick();
-        pt.on_echo_response(peer);
+        // Answers carrying any Recovery value keep the path alive: the value is not
+        // even read (#873, §8.2), only the sequence number matters (#887).
+        let seq = pt.tick().0[0].1;
+        assert_eq!(pt.on_echo_response(peer, Some(seq)), EchoResponse::Answered);
+        let seq = pt.tick().0[0].1;
+        assert_eq!(pt.on_echo_response(peer, Some(seq)), EchoResponse::Answered);
         let state = pt.peers.get(&peer).unwrap();
         assert_eq!(state.miss_count, 0);
         assert!(!state.path_failed);
+    }
+
+    /// #887: an Echo Response that answers nothing we sent changes nothing. 1000
+    /// spoofed responses from unknown addresses add no peer (so none is probed), and
+    /// from a known peer a missing or wrong sequence number neither clears its miss
+    /// count nor recovers it.
+    #[test]
+    fn unsolicited_echo_responses_change_nothing() {
+        let mut pt = GtpuPathTable::default();
+        for i in 0..1000u32 {
+            let spoofed = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(0x0A_88_00_00 | i)), 2152);
+            assert_eq!(
+                pt.on_echo_response(spoofed, Some(1)),
+                EchoResponse::Unsolicited
+            );
+        }
+        assert_eq!(
+            pt.peer_count(),
+            0,
+            "no peer is learned from an unsolicited response"
+        );
+        assert!(pt.tick().0.is_empty(), "so nothing is probed");
+
+        let peer: SocketAddr = "10.88.1.1:2152".parse().unwrap();
+        pt.add_peer(peer);
+        let seq = pt.tick().0[0].1;
+        pt.tick(); // that request missed; a new one is outstanding
+        let outstanding = pt.peers[&peer].pending_seq;
+        assert_eq!(
+            pt.on_echo_response(peer, Some(seq)),
+            EchoResponse::Unsolicited,
+            "a stale seq"
+        );
+        assert_eq!(
+            pt.on_echo_response(peer, None),
+            EchoResponse::Unsolicited,
+            "no seq"
+        );
+        assert_eq!(pt.peers[&peer].miss_count, 1, "the miss stands");
+        assert_eq!(
+            pt.on_echo_response(peer, outstanding),
+            EchoResponse::Answered
+        );
+        assert_eq!(pt.peers[&peer].miss_count, 0);
+    }
+
+    /// #887 review: only paths IN USE are tracked and probed (TS 29.281 §7.2.1). A
+    /// peer whose last session went -- failed or not -- is dropped from the table and
+    /// no longer probed; a failed peer still in use keeps being probed.
+    #[test]
+    fn a_peer_that_loses_its_last_session_is_no_longer_probed() {
+        let a: SocketAddr = "10.88.3.1:2152".parse().unwrap();
+        let b: SocketAddr = "10.88.3.2:2152".parse().unwrap();
+        let mut pt = GtpuPathTable::default();
+        pt.miss_threshold = 1;
+        pt.sync_peers(&HashSet::from([a, b]));
+        pt.tick();
+        let (_, failed) = pt.tick();
+        assert_eq!(failed.len(), 2, "both paths failed");
+
+        // b's sessions are gone.
+        pt.sync_peers(&HashSet::from([a]));
+        assert_eq!(pt.peer_count(), 1, "b is dropped from the table");
+        let (probed, _) = pt.tick();
+        assert_eq!(
+            probed.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+            vec![a],
+            "only the failed path still in use is probed"
+        );
+    }
+
+    /// #887: a failed path is still probed, so a matching answer can recover it.
+    #[test]
+    fn a_failed_path_keeps_being_probed_and_recovers_on_an_answer() {
+        let peer: SocketAddr = "10.88.2.1:2152".parse().unwrap();
+        let mut pt = GtpuPathTable::default();
+        pt.miss_threshold = 2;
+        pt.add_peer(peer);
+        pt.tick();
+        pt.tick();
+        let (_, failed) = pt.tick();
+        assert_eq!(failed, vec![peer]);
+        // AFTER the failure, rounds keep probing it (and do not re-declare it).
+        let (again, refailed) = pt.tick();
+        assert_eq!(again.len(), 1, "the failed peer is probed again");
+        assert!(refailed.is_empty(), "declared failed only once");
+        assert_eq!(
+            pt.on_echo_response(peer, Some(again[0].1)),
+            EchoResponse::Answered
+        );
+        assert!(!pt.peers[&peer].path_failed, "the answer recovers the path");
     }
 
     /// Recovery IE parser: finds IE type 14 in a 2-byte TV payload.

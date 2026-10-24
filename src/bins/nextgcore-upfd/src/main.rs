@@ -1216,6 +1216,10 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                                 // forwarding. That is what makes a quota a quota rather
                                 // than a teardown, and it is the reason the latch lives
                                 // where a re-provision can reach it.
+                                // #953 review: a Measurement Method in the Update URR changes DURAT.
+                                if u.measurement_method_present {
+                                    urr.set_measure_duration(u.measure_duration);
+                                }
                                 urr.update_time_metering(
                                     u.inactivity_detection_secs,
                                     u.immediate_start_time_metering,

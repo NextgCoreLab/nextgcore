@@ -3863,13 +3863,84 @@ mod tests {
 
     /// The IE types inside the first Usage Report of a Session Report Request.
     fn usage_report_ie_types(req: &[u8]) -> Vec<u16> {
-        let (_, body) = ParsedPfcpHeader::parse(req).unwrap();
+        usage_report_ie_types_in(req, pfcp_ie::USAGE_REPORT_SRR)
+    }
+
+    /// The IE types inside the first Usage Report (carrier `ie`) of a PFCP message.
+    fn usage_report_ie_types_in(msg: &[u8], ie: u16) -> Vec<u16> {
+        let (_, body) = ParsedPfcpHeader::parse(msg).unwrap();
         let ies = ParsedIe::parse_all(body);
-        let ur = ParsedIe::find_ie(&ies, pfcp_ie::USAGE_REPORT_SRR).expect("a Usage Report");
+        let ur = ParsedIe::find_ie(&ies, ie).expect("a Usage Report");
         ParsedIe::parse_all(&ur.value)
             .iter()
             .map(|ie| ie.ie_type)
             .collect()
+    }
+
+    fn assert_time_ies(types: &[u16], what: &str) {
+        for (ie, name) in [
+            (crate::n4_build::pfcp_ie::START_TIME, "Start Time"),
+            (crate::n4_build::pfcp_ie::END_TIME, "End Time"),
+            (
+                crate::n4_build::pfcp_ie::DURATION_MEASUREMENT,
+                "Duration Measurement",
+            ),
+            (
+                crate::n4_build::pfcp_ie::TIME_OF_FIRST_PACKET,
+                "Time of First Packet",
+            ),
+            (
+                crate::n4_build::pfcp_ie::TIME_OF_LAST_PACKET,
+                "Time of Last Packet",
+            ),
+        ] {
+            assert!(types.contains(&ie), "{what}: {name} missing: {types:?}");
+        }
+    }
+
+    /// #953 review: the time IEs reach the wire on EVERY send path -- the TERMR in a
+    /// Session Deletion Response (the final billing record), the IMMER in a QAURR
+    /// Modification Response, and the quota-exhausted Session Report Request.
+    #[tokio::test]
+    async fn every_report_path_carries_the_time_ies() {
+        // QAURR -> Modification Response (IMMER).
+        let (_server, smf, addr, _rx, dp, upf_seid) = established_session().await;
+        let urr = urr1(&dp, upf_seid);
+        urr.set_measure_duration(true);
+        urr.record(100, true);
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_u8(pfcp_ie::PFCPSMREQ_FLAGS, pfcpsmreq_flags::QAURR);
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 90, &b.build())).await;
+        assert_time_ies(
+            &usage_report_ie_types_in(&resp, pfcp_ie::USAGE_REPORT_SMR),
+            "IMMER",
+        );
+
+        // Deletion -> Deletion Response (TERMR).
+        urr.record(100, true);
+        let resp = exchange(&smf, addr, &encode_pfcp(54, Some(upf_seid), 91, &[])).await;
+        assert_time_ies(
+            &usage_report_ie_types_in(&resp, crate::n4_build::pfcp_ie::USAGE_REPORT_SDR),
+            "TERMR",
+        );
+
+        // Quota exhaustion -> Session Report Request (VOLQU).
+        let (server, smf, _addr, _rx, dp, upf_seid) = established_session().await;
+        let urr = urr1(&dp, upf_seid);
+        urr.set_measure_duration(true);
+        urr.set_quotas(Some(100), None, None, None);
+        urr.record(500, true);
+        server
+            .send_quota_exhausted_report(upf_seid, 0x4242, 1)
+            .await
+            .expect("sent");
+        let mut buf = vec![0u8; 4096];
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), smf.recv_from(&mut buf))
+                .await
+                .expect("arrives")
+                .expect("recv");
+        assert_time_ies(&usage_report_ie_types(&buf[..len]), "VOLQU");
     }
 
     /// #818 (Table 7.5.8.3-1) on the wire: a harvested report carries Start Time and End
