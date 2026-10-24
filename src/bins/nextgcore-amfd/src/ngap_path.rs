@@ -1003,6 +1003,14 @@ pub struct NgapServer {
     pending_establishments: HashMap<(u64, u8), PendingEstablishment>,
     /// SBI work run off this task (#796 review M1): the re-selection attempts.
     sbi_offload: crate::sbi_offload::SbiOffload,
+    /// #774 review M1: per new AMF UE NGAP ID, the ReleaseSMContexts of the
+    /// registration it superseded that are still running off this task, and the
+    /// PDU Session Establishment Requests waiting for them. See
+    /// [`NgapServer::process_supersede_barriers`].
+    supersede_barriers: HashMap<u64, SupersedeBarrier>,
+    /// How long a [`SupersedeBarrier`] holds establishments at most;
+    /// [`SUPERSEDE_RELEASE_BARRIER`] outside tests.
+    supersede_barrier_max: Duration,
     /// AMF UE NGAP IDs this AMF allocated to an NG connection that has no NAS
     /// context, with the (association, RAN UE NGAP ID) they were allocated on (#758).
     /// Today that is a CM-IDLE Service Request answered SERVICE REJECT #9: the UE,
@@ -1036,6 +1044,32 @@ struct PendingEstablishment {
     /// review, TS 29.502 §6.1.2.3.2).
     origination_timestamp: String,
 }
+
+/// #774 review M1: the earlier registration's sessions are being released at
+/// their SMFs, off the NGAP task, so the superseding UE's new establishments wait
+/// (TS 23.502 §4.2.2.2.2 step 14d: the old contexts are released before the new
+/// ones are set up, or an SMF can hold two contexts for the same PSI).
+#[derive(Debug)]
+struct SupersedeBarrier {
+    /// Matches [`crate::sbi_offload::SbiOutcome::SupersedeReleased`].
+    id: u64,
+    /// Releases not yet reported back.
+    outstanding: usize,
+    /// Past this the establishments go ahead regardless: a blackholed SMF must
+    /// not cost the UE its new sessions.
+    deadline: std::time::Instant,
+    /// Waiting establishments by PSI, as `(5GSM PDU, DNN)`. A UE retransmission
+    /// (T3580) replaces its PSI's entry.
+    parked: std::collections::BTreeMap<u8, (Vec<u8>, Option<String>)>,
+}
+
+/// Source of [`SupersedeBarrier::id`].
+static SUPERSEDE_BARRIER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The longest a [`SupersedeBarrier`] holds the new establishments (#774 review
+/// M1): one SBI connect timeout (5 s) with a margin, so a release that reached
+/// the SMF has reported back, and well inside the UE's T3580 (16 s).
+const SUPERSEDE_RELEASE_BARRIER: Duration = Duration::from_secs(6);
 
 /// Source of [`PendingEstablishment::generation`].
 static ESTABLISHMENT_GENERATION: std::sync::atomic::AtomicU64 =
@@ -1212,6 +1246,8 @@ impl NgapServer {
             up_active: std::collections::HashSet::new(),
             last_session_sweep: std::time::Instant::now(),
             pending_establishments: HashMap::new(),
+            supersede_barriers: HashMap::new(),
+            supersede_barrier_max: SUPERSEDE_RELEASE_BARRIER,
             sbi_offload: crate::sbi_offload::SbiOffload::new(MAX_OFFLOADED_SBI),
             contextless_ue_ids: std::collections::VecDeque::new(),
             timer_configs: {
@@ -1282,6 +1318,7 @@ impl NgapServer {
         self.process_connected_downlinks().await;
 
         self.process_sbi_outcomes().await;
+        self.process_supersede_barriers().await;
         self.process_handover_deadlines().await;
         self.process_pending_establishments().await;
 
@@ -4516,6 +4553,22 @@ impl NgapServer {
         };
         state.amf_ue.supi = Some(supi.clone());
 
+        // #774: an initial registration of a GENUINE UE supersedes whatever this AMF
+        // still holds for the subscriber. Done here, at the first point the UE is proven
+        // genuine (TS 24.501 §5.5.1.2.8 f), NOTE 1), so a UE that fails 5G-AKA never
+        // costs the real subscriber its sessions. Authentication is started only from a
+        // registration, and `registration_type` is written from each request, so this
+        // test is "this authentication belongs to an initial registration".
+        if state.amf_ue.registration_type == crate::gmm_build::registration_type::INITIAL {
+            self.supersede_earlier_registration(
+                association_id,
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                &supi,
+            )
+            .await;
+        }
+
         let abba_len = state.amf_ue.abba_len as usize;
         let kamf = nextgcore_crypt::kdf::nextgcore_kdf_kamf(
             &supi,
@@ -6068,6 +6121,9 @@ impl NgapServer {
     /// arrives under a fresh id (#518, #609).
     fn rekey_ue_sessions(&mut self, old_id: u64, new_id: u64) {
         self.sbi_offload.rekey_ue(old_id, new_id);
+        if let Some(b) = self.supersede_barriers.remove(&old_id) {
+            self.supersede_barriers.insert(new_id, b);
+        }
         {
             let ctx = crate::context::amf_self();
             let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
@@ -7709,11 +7765,40 @@ impl NgapServer {
              (UE_INITIAL_REGISTRATION, TS 23.502 §4.2.2.2.2 step 14d); no NAS is sent",
             state.amf_ue.supi.as_deref().unwrap_or("unknown")
         );
+        self.drop_registration_locally(amf_ue_ngap_id, &state, true, None)
+            .await;
+        Ok(())
+    }
 
-        self.release_all_pdu_sessions(amf_ue_ngap_id).await;
+    /// The body of a local deregistration, shared by [`Self::local_deregistration`]
+    /// (another AMF now serves the UE) and [`Self::supersede_earlier_registration`]
+    /// (the UE registered afresh here, #774). No NAS is sent: the UE the context
+    /// belonged to has, in both cases, already left it.
+    ///
+    /// `release_n2` is false when the old N2 connection must NOT be addressed, because
+    /// the gNB has already reused its RAN UE NGAP ID for the UE's new connection. A
+    /// UE Context Release Command for that pair would then be an inconsistent ID pair
+    /// at the gNB (TS 38.413 §10.6), and the local release it triggers could take the
+    /// new connection down with it.
+    ///
+    /// `superseded_by` is the UE whose initial registration supersedes this one
+    /// (#774). Its sessions are then released off the NGAP task, and that UE's new
+    /// establishments wait for them ([`Self::offload_superseded_releases`]).
+    /// Otherwise (#602) they are released here.
+    async fn drop_registration_locally(
+        &mut self,
+        amf_ue_ngap_id: u64,
+        state: &UeNasContext,
+        release_n2: bool,
+        superseded_by: Option<u64>,
+    ) {
+        match superseded_by {
+            Some(new_ue) => self.offload_superseded_releases(amf_ue_ngap_id, new_ue),
+            None => self.release_all_pdu_sessions(amf_ue_ngap_id).await,
+        }
 
         self.deregistered_ue_cleanup(amf_ue_ngap_id);
-        if state.cm_idle {
+        if state.cm_idle || !release_n2 {
             self.forget_ue(amf_ue_ngap_id);
         } else if let Err(e) = self
             .release_ue(
@@ -7744,8 +7829,216 @@ impl NgapServer {
                 .filter(|id| *id != crate::context::NEXTGCORE_INVALID_POOL_ID)
                 .unwrap_or(state.amf_ue.id);
             ctx.amf_ue_remove(amf_ue_id);
+        };
+    }
+
+    /// #774: an initial registration of a genuine UE ends everything this AMF still
+    /// holds for that subscriber. Called once 5G-AKA has proven the UE genuine.
+    ///
+    /// A UE registers for initial registration only from 5GMM-DEREGISTERED (or after
+    /// losing its state, e.g. a power cycle without a Deregistration Request), and a
+    /// deregistered UE holds no PDU session. So:
+    /// - TS 24.501 §5.5.1.2.8 f): "if it turned out that the REGISTRATION REQUEST
+    ///   message was sent by a genuine UE that has already been registered, the 5GMM
+    ///   context, if any, are deleted and the new REGISTRATION REQUEST is progressed".
+    /// - TS 23.502 §4.2.2.2.2 step 14d / §4.2.2.3.2: for an Initial Registration the
+    ///   AMF that held the old context invokes Nsmf_PDUSession_ReleaseSMContext toward
+    ///   every SMF of the UE, and "the SMF(s) shall release the PDU Session". Here the
+    ///   old and the new AMF are the same one, so the UDM notifies nobody and this AMF
+    ///   has to do it itself.
+    ///
+    /// Two places can hold the old state:
+    /// 1. Another context with this SUPI (the UE came back by SUCI, or by a 5G-GUTI
+    ///    resolved without its MAC verifying). It is locally deregistered: its SM
+    ///    contexts released at their SMFs, its policy associations terminated, and its
+    ///    N2 connection, if it still has one, released (TS 38.413 §8.3.3.1: "release of
+    ///    the old UE-associated logical NG-connection when the UE has initiated the
+    ///    establishment of a new UE-associated logical NG-connection").
+    /// 2. This context itself: an integrity-verified initial registration from
+    ///    5GMM-IDLE moves the stored context, sessions included, onto the new AMF UE
+    ///    NGAP ID (`open_idle_registration_request`). Those sessions are released and
+    ///    forgotten; the registration goes on.
+    ///
+    /// A UE that fails authentication never reaches this, so a replayed or forged
+    /// initial registration leaves the real subscriber's context unchanged (§5.5.1.2.8
+    /// f), the "not sent by a genuine UE" half).
+    async fn supersede_earlier_registration(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        supi: &str,
+    ) {
+        for (old_id, old) in self.ue_auth_state.find_all_by_supi(supi) {
+            if old_id == amf_ue_ngap_id {
+                continue;
+            }
+            // The gNB reuses a RAN UE NGAP ID once it has dropped the connection that
+            // held it. Then the old connection is already gone at the gNB.
+            let n2_reused = !old.cm_idle
+                && old.association_id == association_id
+                && old.ran_ue_ngap_id == ran_ue_ngap_id;
+            log::info!(
+                "[{supi}] Initial registration of a genuine UE (now UE {amf_ue_ngap_id}): \
+                 deleting its earlier context UE {old_id} ({}, {} PDU session(s)) and \
+                 releasing its sessions at the SMF (TS 24.501 §5.5.1.2.8 f), TS 23.502 \
+                 §4.2.2.2.2 step 14d)",
+                if old.cm_idle {
+                    "CM-IDLE"
+                } else if n2_reused {
+                    "its N2 connection already gone at the gNB"
+                } else {
+                    "CM-CONNECTED, N2 connection released"
+                },
+                self.held_session_count(old_id)
+            );
+            self.drop_registration_locally(old_id, &old, !n2_reused, Some(amf_ue_ngap_id))
+                .await;
         }
-        Ok(())
+
+        let carried = self.held_session_count(amf_ue_ngap_id);
+        if carried > 0 {
+            log::info!(
+                "[{supi}] Initial registration of UE {amf_ue_ngap_id} carries {carried} PDU \
+                 session(s) from its earlier registration: released at the SMF \
+                 (TS 23.502 §4.2.2.2.2 step 14d)"
+            );
+            self.offload_superseded_releases(amf_ue_ngap_id, amf_ue_ngap_id);
+            self.forget_ue_sessions(amf_ue_ngap_id);
+        }
+    }
+
+    /// #774 review M1: release every PDU session `owner` holds at its SMF, OFF the
+    /// NGAP task, and hold `new_ue`'s PDU Session Establishments until those
+    /// releases have reported back (or [`Self::supersede_barrier_max`] has passed).
+    ///
+    /// Off the task because an initial registration is the worst place to wait: an
+    /// SMF that drops connection attempts cost the connect timeout per session
+    /// before the Security Mode Command went out, with every gNB unserved and the
+    /// UE's T3510 running. The barrier keeps what the inline release gave for free:
+    /// an old context is released before the new one is created. Keyed FIFO alone
+    /// would not, because the old and new contexts have different AMF UE NGAP IDs.
+    ///
+    /// Durable, keyed on (owner, PSI): forgetting `owner` must not drop a release,
+    /// or the context leaks at the SMF and UPF.
+    fn offload_superseded_releases(&mut self, owner: u64, new_ue: u64) {
+        let releases: Vec<(u8, String, Option<(String, u16)>)> = {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            let amf_ue_id = guard
+                .ran_ue_find_by_amf_ue_ngap_id(owner)
+                .map(|ran_ue| ran_ue.amf_ue_id)
+                .unwrap_or(owner);
+            guard
+                .sess_list_for_ue(amf_ue_id)
+                .iter()
+                .filter_map(|sess| {
+                    let sm_ref = sess.sm_context_ref.clone()?;
+                    // #669: each context is released at the SMF that holds it.
+                    let smf = self.sm_context_smfs.get(&(owner, sess.psi)).cloned();
+                    Some((sess.psi, sm_ref, smf))
+                })
+                .collect()
+        };
+        if releases.is_empty() {
+            return;
+        }
+        let deadline = std::time::Instant::now() + self.supersede_barrier_max;
+        let barrier = self
+            .supersede_barriers
+            .entry(new_ue)
+            .or_insert_with(|| SupersedeBarrier {
+                id: SUPERSEDE_BARRIER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                outstanding: 0,
+                deadline,
+                parked: std::collections::BTreeMap::new(),
+            });
+        barrier.outstanding += releases.len();
+        barrier.deadline = deadline;
+        let id = barrier.id;
+        for (psi, sm_ref, smf) in releases {
+            self.sbi_offload
+                .spawn_keyed_durable((owner, psi), move || async move {
+                    let (host, port) = match smf {
+                        Some(owner_smf) => owner_smf,
+                        None => crate::sbi_path::resolve_nf_endpoint_async(
+                            crate::sbi_path::SbiServiceType::NsmfPdusession,
+                        )
+                        .await
+                        .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777)),
+                    };
+                    match crate::sbi_path::call_smf_release_sm_context(&host, port, &sm_ref).await {
+                        Ok(()) => log::info!(
+                            "SMF SM Context Released: {sm_ref} (PSI={psi}) of UE {owner}, \
+                             superseded by UE {new_ue}"
+                        ),
+                        Err(e) => log::warn!(
+                            "SMF release of {sm_ref} (PSI={psi}) of UE {owner}, superseded \
+                             by UE {new_ue}, failed: {e}"
+                        ),
+                    }
+                    Some(crate::sbi_offload::SbiOutcome::SupersedeReleased { barrier: id })
+                });
+        }
+    }
+
+    /// #774 review M1: lift every [`SupersedeBarrier`] whose releases have all
+    /// reported back or whose deadline has passed, and send the establishments it
+    /// held, in PSI order, on the UE's current NG connection.
+    async fn process_supersede_barriers(&mut self) {
+        if self.supersede_barriers.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let lifted: Vec<u64> = self
+            .supersede_barriers
+            .iter()
+            .filter(|(_, b)| b.outstanding == 0 || now >= b.deadline)
+            .map(|(ue, _)| *ue)
+            .collect();
+        for ue in lifted {
+            let Some(b) = self.supersede_barriers.remove(&ue) else {
+                continue;
+            };
+            if b.outstanding > 0 {
+                log::warn!(
+                    "UE {ue}: {} release(s) of its earlier registration still unanswered \
+                     after {:?}; its new PDU session establishments go ahead",
+                    b.outstanding,
+                    self.supersede_barrier_max
+                );
+            }
+            let connection = self
+                .ue_auth_state
+                .get(ue)
+                .filter(|s| !s.is_cm_idle())
+                .map(|s| (s.association_id, s.ran_ue_ngap_id));
+            let Some((association_id, ran_ue_ngap_id)) = connection else {
+                // Gone or idle: nothing to deliver an answer on. The UE asks again.
+                continue;
+            };
+            for (psi, (sm_pdu, dnn)) in b.parked {
+                if let Err(e) = self
+                    .handle_5gsm_message(
+                        association_id,
+                        ue,
+                        ran_ue_ngap_id,
+                        &sm_pdu,
+                        dnn.as_deref(),
+                    )
+                    .await
+                {
+                    log::warn!("UE {ue}: held PDU session establishment PSI={psi} failed: {e}");
+                }
+            }
+        }
+    }
+
+    /// How many PDU sessions the context holds for `amf_ue_ngap_id`.
+    fn held_session_count(&self, amf_ue_ngap_id: u64) -> usize {
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+        guard.sess_list_for_ue(amf_ue_ngap_id).len()
     }
 
     /// Network-initiated Deregistration Request (TS 24.501 Section 5.5.2.3).
@@ -8131,6 +8424,19 @@ impl NgapServer {
             // PDU Session Establishment Request
             0xC1 => {
                 log::info!("PDU Session Establishment Request from UE: PSI={psi}, PTI={pti}");
+                // #774 review M1: the registration this UE superseded is still having
+                // its sessions released at their SMFs. The new establishment waits for
+                // them (bounded), and goes out from `process_supersede_barriers`.
+                if let Some(b) = self.supersede_barriers.get_mut(&amf_ue_ngap_id) {
+                    b.parked
+                        .insert(psi, (sm_pdu.to_vec(), dnn_override.map(str::to_string)));
+                    log::info!(
+                        "UE {amf_ue_ngap_id}: PDU session establishment PSI={psi} waits for \
+                         the release of its earlier registration's {} session(s)",
+                        b.outstanding
+                    );
+                    return Ok(());
+                }
                 // #877 m1: the re-selection window runs from the request's arrival,
                 // so a first attempt that takes the connect timeout to fail does not
                 // push the #90 past the UE's T3580.
@@ -9307,6 +9613,17 @@ impl NgapServer {
                 crate::sbi_offload::SbiOutcome::Establishment(attempt) => {
                     if let Err(e) = self.apply_establishment_attempt(attempt).await {
                         log::warn!("Establishment retry outcome not applied: {e}");
+                    }
+                }
+                crate::sbi_offload::SbiOutcome::SupersedeReleased { barrier } => {
+                    // A barrier already lifted (deadline, or its UE gone) has nobody
+                    // left to tell.
+                    if let Some(b) = self
+                        .supersede_barriers
+                        .values_mut()
+                        .find(|b| b.id == barrier)
+                    {
+                        b.outstanding = b.outstanding.saturating_sub(1);
                     }
                 }
                 crate::sbi_offload::SbiOutcome::MappingResponse { id, capability } => {
@@ -11061,6 +11378,8 @@ impl NgapServer {
         // #796: nothing waits for an SMF on behalf of a UE that is gone.
         self.pending_establishments
             .retain(|(ue, _), _| *ue != amf_ue_ngap_id);
+        // #774: nor for its superseded registration's releases (they still run).
+        self.supersede_barriers.remove(&amf_ue_ngap_id);
         // #742 review: a UE ended mid-handover (release, NG Reset, implicit
         // deregistration) takes its preparation state with it.
         self.forget_handover_preparation(amf_ue_ngap_id);
@@ -18479,6 +18798,7 @@ fn abort_on_ng_release(amf_ue_ngap_id: u64, state: &mut UeNasContext) -> Aborted
 mod tests {
     /// Handler-level tests asserting what amfd SENDS (#760, ...), in their own file.
     mod handler_tests;
+    mod initial_registration_tests;
     mod racs_handler_tests;
     mod racs_mapping_tests;
     mod reject_path_tests;
