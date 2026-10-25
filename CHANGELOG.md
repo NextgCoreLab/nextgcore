@@ -22,7 +22,9 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   or 504 PEER_NOT_RESPONDING when it did not answer. Causes now come from the TS 29.502 / 29.500
   tables: SSC_NOT_SUPPORTED, PDUTYPE_NOT_SUPPORTED, 500 INSUFFICIENT_RESOURCES_SLICE (an NSACF refusal),
   SUBSCRIPTION_DENIED (a PCF refusal) and PEER_NOT_RESPONDING (no PCF answer). A third-party AMF
-  that read a top-level `cause` must read `error.cause` (#1097).
+  that read a top-level `cause` must read `error.cause` (#1097). The UE's PDU SESSION
+  ESTABLISHMENT REJECT for an NSACF refusal carries 5GSM #69 "insufficient resources for
+  specific slice" (TS 24.501 §4.6.3.1, §6.2.8); it was #67, the S-NSSAI+DNN cause.
 - amfd refuses to start on a config it cannot serve NG Setup with. It used to start an AMF
   that failed every NG Setup. The cases:
   - a `plmn_support` entry with no usable S-NSSAI, meaning none configured or every one

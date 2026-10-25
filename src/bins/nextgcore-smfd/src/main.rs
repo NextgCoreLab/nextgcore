@@ -19566,6 +19566,66 @@ mod tests {
         }
     }
 
+    /// #1144 review round 4: an NSACF that refuses the new session's slice admission
+    /// gets the create answered 500 INSUFFICIENT_RESOURCES_SLICE (TS 29.502 Table
+    /// 6.1.3.2.3.1-3), with a PDU SESSION ESTABLISHMENT REJECT #69 "insufficient
+    /// resources for specific slice" (TS 24.501 §4.6.3.1, §6.2.8) in its N1, and no
+    /// SM context left behind.
+    #[tokio::test]
+    async fn an_nsacf_refusal_is_insufficient_resources_slice() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let (nsacf, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(|_req: SbiRequest| async {
+                SbiResponse::with_status(403)
+            })
+            .await;
+        std::env::set_var("NSACF_URI", format!("http://127.0.0.1:{}", addr.port()));
+        let supi = "imsi-001010000011443";
+        let resp = handle_sm_context_create(&create_request(
+            supi,
+            7,
+            &n1(
+                7,
+                3,
+                gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+                &[0x91, 0x00],
+            ),
+        ))
+        .await;
+        std::env::remove_var("NSACF_URI");
+        nsacf.stop().await.ok();
+        let left = smf_self()
+            .read()
+            .unwrap()
+            .policy_bindings
+            .read()
+            .unwrap()
+            .values()
+            .any(|b| b.supi == supi && b.psi == 7);
+
+        assert_eq!(resp.status, 500, "{:?}", resp.http.content);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["error"]["cause"], "INSUFFICIENT_RESOURCES_SLICE");
+        let reject = resp
+            .http
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some("n1SmMsg"))
+            .expect("the N1 reject")
+            .data
+            .to_vec();
+        assert_eq!(
+            &reject[..5],
+            &[0x2E, 7, 3, 0xC3, 69],
+            "REJECT #69: {reject:02x?}"
+        );
+        assert!(!left, "no SM context left after the rollback");
+    }
+
     /// #1097 review M4, the guard over every site: no SM Context Create or Update
     /// path answers an error any other way than through `eps_to_5gs::sm_context_*`
     /// (or the N1-bearing `sm_context_create_error`). A bare ProblemDetails or an
