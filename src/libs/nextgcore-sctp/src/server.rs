@@ -12,7 +12,7 @@
 use bytes::Bytes;
 use sctp_proto::{
     Association, AssociationHandle, DatagramEvent, Endpoint, EndpointConfig, Event, Payload,
-    PayloadProtocolIdentifier, ServerConfig, Transmit, TransportConfig,
+    PayloadProtocolIdentifier, ServerConfig, StreamEvent, Transmit, TransportConfig,
 };
 use std::{
     collections::{HashMap, VecDeque},
@@ -361,16 +361,23 @@ impl SctpServer {
         event: sctp_proto::AssociationEvent,
     ) -> Result<()> {
         // First, handle the event and collect all necessary info
-        let (events_to_process, check_data) = {
+        let (events_to_process, check_data, readable) = {
             if let Some(managed) = self.associations.get_mut(&handle) {
                 managed.association.handle_event(event);
 
                 // Collect events
                 let mut events = Vec::new();
                 let mut need_data_check = false;
+                let mut readable: Vec<u16> = Vec::new();
 
                 while let Some(evt) = managed.association.poll() {
                     match &evt {
+                        Event::Stream(StreamEvent::Readable { id }) => {
+                            need_data_check = true;
+                            if !readable.contains(id) {
+                                readable.push(*id);
+                            }
+                        }
                         Event::Stream(_) | Event::DatagramReceived => {
                             need_data_check = true;
                         }
@@ -384,7 +391,7 @@ impl SctpServer {
                     managed.pending_transmits.push_back(transmit);
                 }
 
-                (events, need_data_check)
+                (events, need_data_check, readable)
             } else {
                 return Ok(());
             }
@@ -415,88 +422,77 @@ impl SctpServer {
 
         // Check for data if needed
         if check_data {
-            self.check_for_data(handle)?;
+            self.check_for_data(handle, readable)?;
         }
 
         Ok(())
     }
 
-    /// Check for and handle received data
-    fn check_for_data(&mut self, handle: AssociationHandle) -> Result<()> {
+    /// Deliver every message waiting on the association's inbound streams.
+    ///
+    /// `readable` holds the streams sctp-proto reported as readable
+    /// (`StreamEvent::Readable`) in this batch of events. Newly accepted streams are
+    /// read as well. Each stream is drained, not read once: one batch can carry several
+    /// messages on the same stream. Before #864 only a newly accepted stream and the
+    /// fixed streams 0 and 1 were read, so a second message on stream 2 or higher stayed
+    /// queued in sctp-proto and was never delivered (TS 38.412 §7 and TS 36.412 §7 allow
+    /// a peer to use every negotiated stream).
+    fn check_for_data(&mut self, handle: AssociationHandle, readable: Vec<u16>) -> Result<()> {
         let configured_ppid = self.config.ppid;
-        if let Some(managed) = self.associations.get_mut(&handle) {
-            // First, accept any new streams
-            while let Some(mut stream) = managed.association.accept_stream() {
-                let stream_id = stream.stream_identifier();
-                debug!("Accepted stream {} on association {:?}", stream_id, handle);
+        let Some(managed) = self.associations.get_mut(&handle) else {
+            return Ok(());
+        };
+        let association_id = self.handle_to_id.get(&handle).copied();
 
-                if let Ok(Some(chunks)) = stream.read() {
-                    let total_len = chunks.len();
-                    if total_len > 0 {
-                        let mut buf = vec![0u8; total_len];
-                        if chunks.read(&mut buf).is_ok() {
-                            let ppid = received_ppid(chunks.ppi, configured_ppid);
-
-                            let message = ReceivedMessage {
-                                stream_id,
-                                data: Bytes::from(buf),
-                                ppid,
-                            };
-
-                            debug!(
-                                "Received {} bytes on stream {} from {:?}",
-                                message.data.len(),
-                                stream_id,
-                                handle
-                            );
-
-                            if let Some(&id) = self.handle_to_id.get(&handle) {
-                                if let Some(tx) = &self.event_tx {
-                                    let _ = tx.send(ServerEvent::DataReceived {
-                                        association_id: id,
-                                        message,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
+        // Newly opened streams first, then the ones reported readable, each once, in
+        // the order sctp-proto reported them.
+        let mut stream_ids: Vec<u16> = Vec::new();
+        while let Some(stream) = managed.association.accept_stream() {
+            let stream_id = stream.stream_identifier();
+            debug!("Accepted stream {} on association {:?}", stream_id, handle);
+            if !stream_ids.contains(&stream_id) {
+                stream_ids.push(stream_id);
             }
+        }
+        for stream_id in readable {
+            if !stream_ids.contains(&stream_id) {
+                stream_ids.push(stream_id);
+            }
+        }
 
-            // Also check existing streams for data (stream 0 and 1 for NGAP)
-            for stream_id in [0u16, 1] {
-                if let Ok(mut stream) = managed.association.stream(stream_id) {
-                    if let Ok(Some(chunks)) = stream.read() {
-                        let total_len = chunks.len();
-                        if total_len > 0 {
-                            let mut buf = vec![0u8; total_len];
-                            if chunks.read(&mut buf).is_ok() {
-                                let ppid = received_ppid(chunks.ppi, configured_ppid);
-
-                                let message = ReceivedMessage {
-                                    stream_id,
-                                    data: Bytes::from(buf),
-                                    ppid,
-                                };
-
-                                debug!(
-                                    "Received {} bytes on existing stream {} from {:?}",
-                                    message.data.len(),
-                                    stream_id,
-                                    handle
-                                );
-
-                                if let Some(&id) = self.handle_to_id.get(&handle) {
-                                    if let Some(tx) = &self.event_tx {
-                                        let _ = tx.send(ServerEvent::DataReceived {
-                                            association_id: id,
-                                            message,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
+        for stream_id in stream_ids {
+            let Ok(mut stream) = managed.association.stream(stream_id) else {
+                continue;
+            };
+            while let Ok(Some(chunks)) = stream.read() {
+                let total_len = chunks.len();
+                if total_len == 0 {
+                    continue;
+                }
+                let mut buf = vec![0u8; total_len];
+                if let Err(e) = chunks.read(&mut buf) {
+                    warn!(
+                        "Dropped a {total_len}-byte message on stream {stream_id} of {handle:?}: \
+                         reading its chunks failed: {e}"
+                    );
+                    continue;
+                }
+                let message = ReceivedMessage {
+                    stream_id,
+                    data: Bytes::from(buf),
+                    ppid: received_ppid(chunks.ppi, configured_ppid),
+                };
+                debug!(
+                    "Received {} bytes on stream {} from {:?}",
+                    message.data.len(),
+                    stream_id,
+                    handle
+                );
+                if let (Some(id), Some(tx)) = (association_id, &self.event_tx) {
+                    let _ = tx.send(ServerEvent::DataReceived {
+                        association_id: id,
+                        message,
+                    });
                 }
             }
         }

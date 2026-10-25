@@ -1,0 +1,18 @@
+# Overlay: the AMF's UE context store (#686), so an AMF restart keeps every
+# registered UE's context, PDU sessions and 5G-GUTI (TS 23.501 §5.21.2.3).
+#
+# The storage entity is the stack's MongoDB (the UDR's), collection
+# amf_ue_contexts. The AMF's nfInstanceId is already pinned in
+# docker-compose.yml (NEXTGCORE_AMF_INSTANCE_ID), which restoration needs: only
+# records written under the same instance are restored.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.ue-context-store.yml up -d
+#   ./ue-flow-check.sh amf-restart
+services:
+  amf:
+    environment:
+      AMF_UE_CONTEXT_DB_URI: mongodb://172.23.0.2:27017/nextgcore
+    depends_on:
+      mongodb:
+        condition: service_healthy
