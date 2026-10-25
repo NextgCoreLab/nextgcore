@@ -1768,3 +1768,65 @@ fn a_create_bearer_request_is_refused_service_not_supported() {
     }
     release(&ue);
 }
+
+/// #891, TS 23.401 §5.3.5 step 2: a local S1 release of an ECM-CONNECTED UE
+/// (here a partial RESET from its eNB, TS 36.413 §8.7.1) sends the Serving GW a
+/// Release Access Bearers Request and forgets the eNB S1-U endpoints. Before,
+/// the SGW kept forwarding downlink to the released eNB and never notified, so
+/// the data was lost and the UE was not paged.
+#[test]
+fn a_local_s1_release_releases_the_access_bearers_at_the_serving_gw() {
+    let _guard = lock_s11();
+    let (sgw, _route) = sgw(Gtp2XactConfig::default());
+    let ue = seed(0x0891, &[5]);
+    let ctx = mme_self();
+    let enb_ue = ctx.enb_ue_find_by_id(ue.enb_ue_id).unwrap();
+    crate::s1ap_handler::handle_reset(
+        ctx,
+        ue.enb_id,
+        &nextgcore_s1ap::Reset {
+            cause: nextgcore_s1ap::Cause::RadioNetwork(
+                nextgcore_s1ap::CauseRadioNetwork::Unspecified,
+            ),
+            reset_type: nextgcore_s1ap::ResetType::PartOfS1Interface(vec![
+                nextgcore_s1ap::UeAssociatedLogicalS1Connection {
+                    mme_ue_s1ap_id: Some(enb_ue.mme_ue_s1ap_id),
+                    enb_ue_s1ap_id: Some(enb_ue.enb_ue_s1ap_id),
+                },
+            ]),
+        },
+    );
+    let (rab, _) = recv(&sgw, 170);
+    assert_eq!(rab.header.teid, Some(SGW_S11_TEID));
+    let b5 = ctx
+        .bearer_find_by_ebi(ue.mme_ue_id, 5)
+        .and_then(|id| ctx.bearer_find_by_id(id))
+        .unwrap();
+    assert_eq!(b5.enb_s1u_teid, 0, "the eNB endpoint is forgotten");
+    release(&ue);
+}
+
+/// #891: the S1 release procedure sends exactly one Release Access Bearers
+/// Request: the UE CONTEXT RELEASE COMPLETE, which also ends in the local
+/// release, finds the endpoints already cleared and sends none.
+#[test]
+fn an_s1_release_procedure_sends_one_release_access_bearers_request() {
+    let _guard = lock_s11();
+    let (sgw, _route) = sgw(Gtp2XactConfig::default());
+    let ue = seed(0x0892, &[5]);
+    let ctx = mme_self();
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    let complete = release_to_command(&ue, &sgw);
+    crate::s1ap_handler::handle_ue_context_release_complete(ctx, ue.enb_id, &complete);
+    sgw.set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    let mut buf = [0u8; 4096];
+    let mut again = 0;
+    while let Ok((len, _)) = sgw.recv_from(&mut buf) {
+        if buf[..len].get(1) == Some(&170) {
+            again += 1;
+        }
+    }
+    assert_eq!(again, 0, "no second Release Access Bearers Request");
+    release(&ue);
+}
