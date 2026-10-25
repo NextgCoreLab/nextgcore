@@ -1610,6 +1610,12 @@ pub struct PolicyBinding {
     /// TS 29.536) at create (#959). Its release then sends the DECREASE, or the
     /// slice's PDU-session count at the NSACF only ever grows.
     pub nsac_admitted: bool,
+    /// The `nfId` the admission's INCREASE carried (#1075, #1072 round 2 m3), so its
+    /// DECREASE names the same SMF instance: the NSACF tells one UE's entries apart by
+    /// it (TS 23.502 §4.2.11.2). `None` for a snapshot written before it existed; the
+    /// DECREASE then uses this instance's current id.
+    #[serde(default)]
+    pub nsac_nf_id: Option<String>,
 }
 
 impl PolicyBinding {
@@ -1645,9 +1651,13 @@ impl PolicyBinding {
             sd: None,
             sdm_subscription_id: None,
             nsac_admitted: false,
+            nsac_nf_id: None,
         }
     }
 }
+
+/// How long a [`SmfContext::persist_soon`] waits, gathering changes, before it writes.
+pub const PERSIST_COALESCE: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// The base of every 5G SM context's PFCP CP SEID (#718 review M2).
 ///
@@ -1841,6 +1851,15 @@ pub struct SmfContext {
     /// holding it got its modifications nowhere and its Session Reports refused.
     /// Persisted per SM context with the session map.
     pub session_upfs: RwLock<HashMap<u64, String>>,
+    /// A [`SmfContext::persist_soon`] write is scheduled (#1075).
+    pub persist_pending: std::sync::atomic::AtomicBool,
+    /// Snapshot writes this context made: the coalescing's observable (#1075).
+    pub persist_writes: std::sync::atomic::AtomicU64,
+    /// Serialises taking a snapshot with writing it (#1150 review m2).
+    persist_lock: std::sync::Mutex<()>,
+    /// Whether this is the process-global context, the one a scheduled write flushes.
+    /// A context of its own (a test's) persists at once instead.
+    is_global: bool,
 
     /// SM policy bindings: sm_context_ref -> PCF policy association + GSM FSM
     pub policy_bindings: RwLock<HashMap<String, PolicyBinding>>,
@@ -1976,6 +1995,10 @@ impl SmfContext {
             far_peers: RwLock::new(HashMap::new()),
             failed_up_paths: RwLock::new(HashMap::new()),
             session_upfs: RwLock::new(HashMap::new()),
+            persist_pending: std::sync::atomic::AtomicBool::new(false),
+            persist_writes: std::sync::atomic::AtomicU64::new(0),
+            persist_lock: std::sync::Mutex::new(()),
+            is_global: false,
             unrestorable_sessions: RwLock::new(Vec::new()),
             policy_bindings: RwLock::new(HashMap::new()),
             upf_recovery_time_stamps: RwLock::new(HashMap::new()),
@@ -2044,6 +2067,12 @@ impl SmfContext {
     /// An unreadable snapshot is an **error**: the caller should refuse to start
     /// rather than come up with an empty IPv4 pool that will re-issue addresses
     /// live UEs still hold.
+    /// Disarm the state file again (a test that armed one on the global context).
+    #[cfg(test)]
+    pub(crate) fn clear_state_file_for_test(&mut self) {
+        self.state = nextgcore_core::state_store::StateStore::disabled();
+    }
+
     pub fn set_state_file(&mut self, path: std::path::PathBuf) -> Result<usize, SmfStateError> {
         use nextgcore_core::state_store::{Loaded, StateStore};
         self.state = StateStore::new(Some(path.clone()));
@@ -2537,30 +2566,81 @@ impl SmfContext {
             map.get(&smf_seid) != before.as_ref()
         };
         if changed && self.is_durable_session_seid(smf_seid) {
-            self.persist();
+            self.persist_soon();
         }
         changed
     }
 
     /// Whether `smf_seid` is a 5G session's, the kind the snapshot carries.
+    ///
+    /// #1075: answered from the SEID itself, not from clones of `pfcp_sessions` and
+    /// `cp_n4_seids`. A SEID minted by [`derive_cp_n4_seid`] (at or above
+    /// [`FIVE_G_CP_SEID_BASE`]) names its reference directly; only the SEIDs a
+    /// session inherited (a version-1 snapshot's, an EPS→5GS handover's EPC one) are
+    /// looked up, among the inherited ones alone.
     fn is_durable_session_seid(&self, smf_seid: u64) -> bool {
-        let refs: Vec<String> = self
-            .pfcp_sessions
-            .read()
-            .map(|m| m.keys().cloned().collect())
-            .unwrap_or_default();
-        let inherited = self
-            .cp_n4_seids
-            .read()
-            .map(|m| m.clone())
-            .unwrap_or_default();
-        refs.iter().any(|r| {
-            inherited
-                .get(r)
-                .copied()
-                .unwrap_or_else(|| derive_cp_n4_seid(r))
-                == smf_seid
-        })
+        let Ok(sessions) = self.pfcp_sessions.read() else {
+            return false;
+        };
+        let Ok(inherited) = self.cp_n4_seids.read() else {
+            return false;
+        };
+        if smf_seid >= FIVE_G_CP_SEID_BASE {
+            let reference = (smf_seid & (FIVE_G_CP_SEID_BASE - 1)).to_string();
+            if sessions.contains_key(&reference)
+                && inherited
+                    .get(&reference)
+                    .is_none_or(|&seid| seid == smf_seid)
+            {
+                return true;
+            }
+        }
+        inherited
+            .iter()
+            .any(|(r, &seid)| seid == smf_seid && sessions.contains_key(r))
+    }
+
+    /// Persist soon rather than now (#1075, #1028 round 2 m2): a FAR-peer change on the
+    /// N4 response path -- every Service Request and handover -- marks the snapshot
+    /// dirty, and one write follows within [`PERSIST_COALESCE`], however many changes
+    /// came meanwhile. Outside a runtime it persists at once. A graceful shutdown
+    /// flushes what is pending ([`Self::flush_pending_persist`]).
+    pub fn persist_soon(&self) {
+        if !self.state.is_enabled() {
+            return;
+        }
+        let runtime = match tokio::runtime::Handle::try_current() {
+            Ok(runtime) if self.is_global => runtime,
+            // No runtime to write later on, or a context of its own: now.
+            _ => {
+                self.persist();
+                return;
+            }
+        };
+        if self
+            .persist_pending
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return; // a write is already scheduled
+        }
+        runtime.spawn(async {
+            tokio::time::sleep(PERSIST_COALESCE).await;
+            // #1150 review m3: a poisoned lock still clears the pending flag and
+            // writes, or every later coalesced write would be skipped silently.
+            let handle = smf_self();
+            let ctx = handle.read().unwrap_or_else(|e| e.into_inner());
+            ctx.flush_pending_persist();
+        });
+    }
+
+    /// Write the snapshot if a [`Self::persist_soon`] is pending.
+    pub fn flush_pending_persist(&self) {
+        if self
+            .persist_pending
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.persist();
+        }
     }
 
     /// Write the snapshot after a mutation. A no-op with no state file, and
@@ -2575,6 +2655,12 @@ impl SmfContext {
         if !self.state.is_enabled() {
             return;
         }
+        // #1150 review m2: the snapshot and its write under one lock, so a coalesced
+        // write racing a synchronous one cannot rename an older snapshot over a
+        // newer one (they share the store's temp file).
+        let _writing = self.persist_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.persist_writes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let doc = self.snapshot();
         if let Err(e) = self.state.persist(&doc) {
             // The session exists in memory but not on disk: the request was
@@ -3635,7 +3721,11 @@ static GLOBAL_SMF_CONTEXT: std::sync::OnceLock<Arc<RwLock<SmfContext>>> =
 /// Get the global SMF context
 pub fn smf_self() -> Arc<RwLock<SmfContext>> {
     GLOBAL_SMF_CONTEXT
-        .get_or_init(|| Arc::new(RwLock::new(SmfContext::new())))
+        .get_or_init(|| {
+            let mut ctx = SmfContext::new();
+            ctx.is_global = true;
+            Arc::new(RwLock::new(ctx))
+        })
         .clone()
 }
 
