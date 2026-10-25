@@ -1447,6 +1447,16 @@ fn recovery_conditional(msg_type: u8) -> bool {
 
 /// Track the peer's restart counter and act on a confirmed restart
 /// (TS 23.007 Section 18 / Section 16.1A.1.1).
+///
+/// Restart state is keyed by the peer's IP alone (#1208). A GTP-C entity has one
+/// restart counter per node (TS 23.007 §18), and a combined node that restarts
+/// has lost both roles' contexts, so a changed counter deletes everything
+/// anchored at that IP: the UEs of an MME there and the PDN connections of a PGW
+/// there. Two *separate* nodes sharing one IP (an MME and a PGW on one host in a
+/// test bed) each have their own counter, so their alternating Recovery values
+/// read as restarts and tear each other's contexts down. Give such nodes distinct
+/// addresses; telling them apart would need the peer's role, which an Echo does
+/// not carry.
 fn note_peer_recovery(inner: &Arc<GtpcInner>, peer: SocketAddr, restart_counter: u8) {
     let previous = {
         let mut peer_restart = match inner.peer_restart.lock() {
@@ -2119,6 +2129,9 @@ fn dispatch_s5c_create_session_response(msg: &Gtp2Message, peer: SocketAddr) {
             sess.paa.ipv6_addr = paa.ipv6_addr.map(std::net::Ipv6Addr::from);
             if let Some(ft) = pgw_c.as_ref() {
                 sess.pgw_addr = ft.ipv4_addr.map(std::net::Ipv4Addr::from);
+                // #1208: an IPv6 (or dual-stack) PGW is matched on restart and
+                // path failure too.
+                sess.pgw_addr6 = ft.ipv6_addr.map(std::net::Ipv6Addr::from);
             }
             ctx.sess_update(&sess);
             log::info!(
@@ -2899,14 +2912,22 @@ fn release_replaced_session(old: &crate::context::SgwcSess, new_pgw: Option<Sock
             ),
         }
     }
-    let Some(old_pgw) = old.pgw_addr else {
+    // #1208: the old PGW's address in the family the S5/S8 peer uses, else
+    // whichever it has.
+    let v4 = old.pgw_addr.map(IpAddr::V4);
+    let v6 = old.pgw_addr6.map(IpAddr::V6);
+    let old_pgw = match new_pgw.map(|p| p.ip()) {
+        Some(IpAddr::V6(_)) => v6.or(v4),
+        _ => v4.or(v6),
+    };
+    let Some(old_pgw) = old_pgw else {
         return;
     };
-    let same_pgw = new_pgw.is_some_and(|p| p.ip() == std::net::IpAddr::V4(old_pgw));
+    let same_pgw = new_pgw.is_some_and(|p| old.anchored_at(p.ip()));
     if old.pgw_s5c_teid != 0 && !same_pgw {
         let port = new_pgw.map(|p| p.port()).unwrap_or(2123);
         abandon_pgw_session_at(
-            SocketAddr::new(std::net::IpAddr::V4(old_pgw), port),
+            SocketAddr::new(old_pgw, port),
             old.pgw_s5c_teid,
             lbi,
             "a new Create Session Request replaces it and goes to another PGW",
@@ -9436,6 +9457,83 @@ mod tests {
             "the PDN connection is gone"
         );
         assert!(ctx.ue_find_by_id(ue_id).is_none(), "and its UE");
+        assert!(
+            ctx.sess_find_by_id(other_sess).is_some(),
+            "a PDN connection at another PGW survives"
+        );
+        ctx.ue_remove(other_ue);
+        server.close();
+    }
+
+    /// #1208, TS 23.007 §16.1A.2: a PGW reached over IPv6 S5/S8-C restarts. The
+    /// PDN connections whose PGW F-TEID carries that IPv6 address are deleted (at
+    /// the SGW-U, and locally with their UE); one at another IPv6 PGW survives.
+    /// Before, only an IPv4 `pgw_addr` was matched and nothing went.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_ipv6_pgw_restart_deletes_its_pdn_connections() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let Ok(pgw) = UdpSocket::bind("[::1]:0") else {
+            eprintln!("no IPv6 loopback here; skipped");
+            return;
+        };
+        let sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let _deletion = RestartDeletionOn::new(&ambient);
+        let server = GtpcServer::open(
+            "[::1]:0",
+            Gtp2XactConfig {
+                t3_response: Duration::from_millis(1000),
+                n3_requests: 1,
+                response_hold: Duration::from_secs(5),
+            },
+            7,
+        )
+        .unwrap();
+        set_s11_server(server.clone());
+        // The MME is elsewhere (IPv4): only the PGW's restart can remove these.
+        let mme: SocketAddr = "192.0.2.10:2123".parse().unwrap();
+        let at = |imsi: &[u8], v6: std::net::Ipv6Addr| {
+            let (ue_id, _, _) = ue_with_pgw_session(mme, imsi);
+            let ctx = sgwc_self();
+            let mut sess = ctx.sess_list_for_ue(ue_id).remove(0);
+            sess.pgw_addr = None;
+            sess.pgw_addr6 = Some(v6);
+            ctx.sess_update(&sess);
+            (ue_id, sess.id)
+        };
+        let (ue_id, sess_id) = at(b"001011208000001", std::net::Ipv6Addr::LOCALHOST);
+        let (other_ue, other_sess) = at(b"001011208000002", "2001:db8::5".parse().unwrap());
+        let deletions = sgwu.received(54);
+        let echo = |seq: u32, counter: u8| {
+            let mut m = Gtp2Message::echo_request(seq);
+            m.add_ie(Gtp2Ie::from_slice(
+                Gtp2IeType::Recovery as u8,
+                0,
+                &[counter],
+            ));
+            m.encode()
+        };
+        pgw.send_to(&echo(0x1208, 4), server.local_addr()).unwrap();
+        pgw.send_to(&echo(0x1209, 5), server.local_addr()).unwrap();
+
+        wait_ue_removed(ue_id).await;
+        let ctx = sgwc_self();
+        assert!(ctx.ue_find_by_id(ue_id).is_none(), "the UE is removed");
+        assert!(
+            ctx.sess_find_by_id(sess_id).is_none(),
+            "with its PDN connection"
+        );
+        for _ in 0..300 {
+            if sgwu.received(54) > deletions {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(sgwu.received(54) > deletions, "and its SGW-U session");
         assert!(
             ctx.sess_find_by_id(other_sess).is_some(),
             "a PDN connection at another PGW survives"
