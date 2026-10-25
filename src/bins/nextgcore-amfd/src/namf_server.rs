@@ -305,6 +305,19 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
         }
 
         // --------------------------------------------------------------
+        // Namf_Callback: Npcf_AMPolicyControl_UpdateNotify (#1247, TS 29.507 §4.2.4).
+        // The PCF POSTs a PolicyUpdate to `{notificationUri}/update` (§4.2.4.2) or a
+        // TerminationNotification to `{notificationUri}/terminate` (§4.2.4.3), where
+        // `notificationUri` is `sbi_path::am_policy_notification_uri`.
+        //   POST /namf-callback/v1/{supi}/am-policy-notify/{update|terminate}
+        // --------------------------------------------------------------
+        "namf-callback"
+            if method == "POST" && parts.len() == 5 && parts[3] == "am-policy-notify" =>
+        {
+            handle_am_policy_notify_callback(parts[2], parts[4], &request)
+        }
+
+        // --------------------------------------------------------------
         // Namf_MBSCommunication (TS 29.518 §5.7, TS 23.247 §7.2.5.2)
         //   POST /namf-mbs-comm/v1/n2-messages/transfer
         //
@@ -725,7 +738,15 @@ fn handle_ue_policy_notify_callback(
                 "[{supi}] Npcf_UEPolicyControl terminate notification (resourceUri={resource_uri}); \
                  releasing the stored UE policy association id"
             );
-            clear_ue_policy_association(supi);
+            // #1247, TS 29.525 §4.2.4.3: the association is forgotten, and then
+            // "any NF service consumer except for the V-PCF shall invoke the
+            // Npcf_UEPolicyControl_Delete". Only an association this UE holds: the id
+            // is the last segment of `resourceUri`.
+            if let Some(id) = forget_policy_association(supi, &resource_uri, PolicyKind::Ue) {
+                spawn_policy_delete(id, PolicyKind::Ue);
+            } else {
+                clear_ue_policy_association(supi);
+            }
         }
         Some("update") | None => {
             log::info!(
@@ -746,6 +767,129 @@ fn handle_ue_policy_notify_callback(
     }
 
     SbiResponse::no_content()
+}
+
+/// Which of the PCF's per-UE policy associations (#1247).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PolicyKind {
+    /// Npcf_AMPolicyControl (TS 29.507).
+    Am,
+    /// Npcf_UEPolicyControl (TS 29.525).
+    Ue,
+}
+
+/// #1247: Npcf_AMPolicyControl_UpdateNotify at the AMF (TS 29.507 §4.2.4).
+///
+/// - `update` (§4.2.4.2): the PCF changed the UE's AM policy or its triggers. This
+///   AMF does not enforce AM policies: neither the create's nor an update's servAreaRes
+///   or rfsp is applied. So the update is acknowledged with 204 ("otherwise, a 204 No
+///   Content response code shall be returned") and logged with the members it carried.
+/// - `terminate` (§4.2.4.3): answered 204, then "the NF service consumer shall remove
+///   the context related to the policy association ... and invoke the
+///   Npcf_AMPolicyControl_Delete". Only for an association the UE holds: the
+///   TerminationNotification's `resourceUri` names it.
+///
+/// A UE this AMF does not hold is 404 CONTEXT_NOT_FOUND (§5.7). So is an unknown
+/// operation, which is no resource of this API.
+fn handle_am_policy_notify_callback(
+    supi: &str,
+    operation: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
+    if !matches!(operation, "update" | "terminate") {
+        return send_error(
+            404,
+            "Not Found",
+            &format!("no AM policy notification '{operation}'"),
+            None,
+        );
+    }
+    if find_ue_by_context_id(supi).is_none() {
+        return context_not_found(supi);
+    }
+    let body = parse_json_body(request).unwrap_or_default();
+    if operation == "update" {
+        let members: Vec<&str> = body
+            .as_object()
+            .map(|o| o.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        log::info!(
+            "[{supi}] Npcf_AMPolicyControl UpdateNotify ({members:?}): acknowledged; this AMF \
+             does not enforce AM policies"
+        );
+        return SbiResponse::no_content();
+    }
+    let resource_uri = body["resourceUri"].as_str().unwrap_or_default();
+    log::info!(
+        "[{supi}] Npcf_AMPolicyControl termination request (resourceUri={resource_uri}, \
+         cause={})",
+        body["cause"].as_str().unwrap_or("-")
+    );
+    if let Some(id) = forget_policy_association(supi, resource_uri, PolicyKind::Am) {
+        spawn_policy_delete(id, PolicyKind::Am);
+    }
+    SbiResponse::no_content()
+}
+
+/// Forget the `kind` association the TerminationNotification's `resource_uri` names, if
+/// the UE `supi` holds it; its id, for the Delete. The id is the URI's last segment
+/// (`.../policies/{polAssoId}`). The AMF deletes it at its own PCF, never at a URI the
+/// notification supplied.
+fn forget_policy_association(supi: &str, resource_uri: &str, kind: PolicyKind) -> Option<String> {
+    let id = resource_uri
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|id| !id.is_empty())?
+        .to_string();
+    let ue = find_ue_by_context_id(supi)?;
+    let ctx = amf_self();
+    let guard = ctx.read().ok()?;
+    let forgot = guard
+        .ue_store()
+        .with_mut(ue.id, |state| match kind {
+            PolicyKind::Am => state.forget_am_policy_association(&id),
+            PolicyKind::Ue => state.forget_ue_policy_association(&id),
+        })
+        .unwrap_or(false);
+    if !forgot {
+        log::warn!(
+            "[{supi}] {kind:?} policy termination for {resource_uri}, which this UE does not \
+             hold; nothing deleted"
+        );
+    }
+    forgot.then_some(id)
+}
+
+/// The Delete a termination request asks for (#1247), off the request's task.
+fn spawn_policy_delete(pol_asso_id: String, kind: PolicyKind) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    handle.spawn(async move {
+        let (host, port) = match crate::sbi_path::resolve_nf_endpoint_async(
+            crate::sbi_path::SbiServiceType::NpcfAmPolicyControl,
+        )
+        .await
+        {
+            Ok(ep) => ep,
+            Err(e) => {
+                log::warn!("{kind:?} policy association {pol_asso_id} not deleted: {e}");
+                return;
+            }
+        };
+        let result = match kind {
+            PolicyKind::Am => {
+                crate::sbi_path::call_pcf_am_policy_delete(&host, port, &pol_asso_id).await
+            }
+            PolicyKind::Ue => {
+                crate::sbi_path::call_pcf_ue_policy_delete(&host, port, &pol_asso_id).await
+            }
+        };
+        if let Err(e) = result {
+            log::warn!("{kind:?} policy association {pol_asso_id}: Delete failed: {e}");
+        }
+    });
 }
 
 /// Forget the UE-policy association id held for `supi` (#92), after the PCF says it

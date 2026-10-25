@@ -18,6 +18,15 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   said PREEMPTABLE, so the AMF could revoke the EBI for a higher-priority request that the RAN
   would never pre-empt (TS 23.502 §4.11.1.4.1). Both now come from one source,
   `n2_transfer::Arp::default_flow` (#1179).
+- smfd's N1N2MessageTransfer for a network-triggered Service Request (buffered downlink data)
+  now carries the session's PDUSessionResourceSetupRequestTransfer, as an
+  `application/vnd.3gpp.ngap` part that `ngapData` references. It includes the UPF N3 tunnel,
+  every QoS flow and the Session-AMBR (TS 23.502 §4.2.3.3 step 3a, TS 29.518 §6.1.6.2.27). It
+  also carries the paged flow's `5qi` and `arp` (§6.1.6.2.18). The non-conformant JSON
+  `ngapData: {qfi}` is gone. With no recorded user plane, no policy binding, or a transfer that
+  fails to encode, no N1N2MessageTransfer is sent: paging a UE for a session that cannot be
+  activated only drains its battery, and an `n2InfoContent` without `ngapData` (M) is malformed.
+  The data stays buffered and the error names the session (#1162).
 - smfd (PGW-C): a Create Session Request for the [IMSI, EBI, interface type] of an existing PDN
   connection deletes that connection first, at the PGW-U too, and frees its PDN address (TS
   29.274 §7.2.1). If the EBI belongs to a dedicated bearer, only that bearer and its PGW-U rules
