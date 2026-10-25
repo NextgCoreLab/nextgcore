@@ -15745,6 +15745,9 @@ mod tests {
                 m.remove(&self.seid);
             }
             ctx.clear_state_file_for_test();
+            // A coalesced write scheduled on the test's runtime died with it: its
+            // pending flag would make every later `persist_soon` return early.
+            ctx.persist_pending.store(false, Ordering::SeqCst);
             let _ = std::fs::remove_file(&self.path);
         }
     }
