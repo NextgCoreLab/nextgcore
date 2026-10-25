@@ -1107,12 +1107,23 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
     // one's admission.
     let nsac_sst = sess.s_nssai.sst;
     let nsac_sd = sess.s_nssai.sd.map(|sd| format!("{sd:06x}"));
-    let (nsac_admitted, nsac_nf_id) = if existing.is_some() {
+    let nsac_plmn = sess.serving_plmn_id.mcc_mnc();
+    let (nsac_admitted, nsac_nf_id, nsac_nsacf) = if existing.is_some() {
         crate::lookup_policy_binding(&sm_context_ref)
-            .map(|b| (b.nsac_admitted, b.nsac_nf_id))
-            .unwrap_or((false, None))
+            .map(|b| (b.nsac_admitted, b.nsac_nf_id, b.nsac_nsacf))
+            .unwrap_or((false, None, None))
     } else {
-        match crate::nsac_admit_migrated_session(supi, psi, nsac_sst, nsac_sd.as_deref()).await {
+        match crate::nsac_admit_migrated_session(
+            supi,
+            psi,
+            nsac_sst,
+            nsac_sd.as_deref(),
+            nsac_plmn
+                .as_ref()
+                .map(|(mcc, mnc)| (mcc.as_str(), mnc.as_str())),
+        )
+        .await
+        {
             Some(admitted) => admitted,
             None => {
                 return sm_context_error(
@@ -1133,6 +1144,7 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
                 crate::rollback_nsac_as(
                     nsac_admitted,
                     nsac_nf_id.as_deref(),
+                    nsac_nsacf.as_ref(),
                     supi,
                     psi,
                     nsac_sst,
@@ -1174,6 +1186,7 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
             crate::rollback_nsac_as(
                 nsac_admitted,
                 nsac_nf_id.as_deref(),
+                nsac_nsacf.as_ref(),
                 supi,
                 psi,
                 nsac_sst,
@@ -1202,6 +1215,7 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
                 crate::rollback_nsac_as(
                     nsac_admitted,
                     nsac_nf_id.as_deref(),
+                    nsac_nsacf.as_ref(),
                     supi,
                     psi,
                     nsac_sst,
@@ -1291,6 +1305,7 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
                         sdm_subscription_id: None,
                         nsac_admitted,
                         nsac_nf_id: nsac_nf_id.clone(),
+                        nsac_nsacf: nsac_nsacf.clone(),
                     },
                 );
             }
@@ -1955,7 +1970,7 @@ async fn handle_cancelled_inner(sm_context_ref: &str) -> SbiResponse {
                     counted = m
                         .remove(sm_context_ref)
                         .filter(|b| b.nsac_admitted)
-                        .map(|b| (b.supi, b.psi, b.sst, b.sd, b.nsac_nf_id));
+                        .map(|b| (b.supi, b.psi, b.sst, b.sd, b.nsac_nf_id, b.nsac_nsacf));
                 }
                 sess.psi = 0;
                 sess.sm_context_ref = None;
@@ -1964,9 +1979,17 @@ async fn handle_cancelled_inner(sm_context_ref: &str) -> SbiResponse {
             }
             // #1072 round 2 m8: and the 5G count the preparation took is given back,
             // under the handover lock, so a retried preparation counts in after it.
-            if let Some((supi, psi, sst, sd, nf_id)) = counted {
-                crate::rollback_nsac_as(true, nf_id.as_deref(), &supi, psi, sst, sd.as_deref())
-                    .await;
+            if let Some((supi, psi, sst, sd, nf_id, nsacf)) = counted {
+                crate::rollback_nsac_as(
+                    true,
+                    nf_id.as_deref(),
+                    nsacf.as_ref(),
+                    &supi,
+                    psi,
+                    sst,
+                    sd.as_deref(),
+                )
+                .await;
             }
             log::info!(
                 "SM Context Update (CANCELLED) for ref={sm_context_ref}: EPS→5GS handover \
