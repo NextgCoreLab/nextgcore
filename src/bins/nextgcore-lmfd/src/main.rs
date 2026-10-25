@@ -8394,6 +8394,15 @@ mod positioning_chain_strict_peer {
         lmf_context_init(1024);
         prime_lmf_self();
         nrppa_downlink::set_for_test(true);
+        // Turned off again however the test ends, a failed assertion included, so
+        // the flag cannot leak into the next test (#1131 review).
+        struct NrppaDownlinkOff;
+        impl Drop for NrppaDownlinkOff {
+            fn drop(&mut self) {
+                nrppa_downlink::set_for_test(false);
+            }
+        }
+        let _downlink_off = NrppaDownlinkOff;
         let node = crate::site_config::NgRanNode {
             mcc: "001".into(),
             mnc: "01".into(),
@@ -8535,7 +8544,6 @@ mod positioning_chain_strict_peer {
         let _ = tokio::time::timeout(Duration::from_secs(10), det)
             .await
             .expect("DetermineLocation did not hang");
-        nrppa_downlink::set_for_test(false);
         answering.abort();
         assert!(
             tap_rx.try_recv().is_err(),
