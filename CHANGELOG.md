@@ -170,6 +170,21 @@ before the tag. The validation line is filled from the release run, not carried 
     the shared `nextgcore-pfcp` codec: sgwud with sgwcd, and upfd with smfd, for the
     PFCP Node Report (#994, #1028).
   A rolling upgrade must move each CP/UP pair at the same time.
+- **Deploy together (GTPv2-C S5/S8):** smfd (PGW-C) and sgwcd (SGW-C) now put every
+  F-TEID at the IE instance TS 29.274 gives it, and a new and an old peer disagree until both
+  are upgraded (#1113):
+  - smfd's Create Session Response carries the PGW S5/S8-C F-TEID at instance 1 (Table
+    7.2.2-1); it was at 0, so sgwcd stored PGW TEID 0, relayed no Delete Session on detach
+    and the PGW session, its PGW-U PFCP session and the UE address leaked;
+  - smfd's Create Bearer Request carries the S5/S8-U PGW F-TEID at instance 1 (Table
+    7.2.3-2), not 0, and the S2b interface types 32/33 are no longer truncated to 0/1;
+  - sgwcd's S5/S8 Modify Bearer Request carries the S5/S8-U SGW F-TEID at instance 1 (Table
+    7.2.7-2), not 2, and smfd no longer falls back to reading the eNodeB's instance 0.
+
+  A mixed pair is no worse than today, but only both together are fixed. The detach leak
+  ends when smfd is upgraded (sgwcd already read instance 1). The S5/S8 Modify Bearer's SGW-U
+  endpoint reaches the PGW only when sgwcd is upgraded. Upgrade smfd and sgwcd in the same
+  rollout.
 - smfd answers PFCP Node Reports and acts on user plane path failure and recovery; a
   path still down after `SMF_UP_PATH_FAILURE_HOLD_SECS` (default 120 s) releases its
   sessions with #39 (#994, #1028).

@@ -1012,15 +1012,19 @@ fn parse_create_session_request(msg: &Gtp2Message) -> Result<CreateSessionReques
         .bearer_qos()
         .map_err(|_| Gtp2Cause::MandatoryIeIncorrect)?
         .ok_or(Gtp2Cause::MandatoryIeMissing)?;
-    // The SGW's S5/S8-U endpoint, at instance 2 (TS 29.274 Table 7.2.1-2). This is the
-    // downlink tunnel the PGW-U forwards to.
-    let s5u = bc.fteid(2).ok().flatten().map(|ft| {
+    // The access-side user-plane endpoint the PGW-U forwards downlink to, at its
+    // TS 29.274 Table 7.2.1-2 instance: the SGW's S5/S8-U F-TEID at 2 and, over S2b,
+    // the ePDG's S2b-U F-TEID at 5. The ePDG's was never read (#1113 audit), so an S2b
+    // establishment off the wire was always refused for want of it.
+    let to_fteid = |ft: Gtp2FTeidIe| {
         FTeid::new_ipv4(
             ft.interface_type,
             ft.teid,
             std::net::Ipv4Addr::from(ft.ipv4_addr.unwrap_or([0, 0, 0, 0])),
         )
-    });
+    };
+    let s5u = bc.fteid(2).ok().flatten().map(to_fteid);
+    let s2b_u = bc.fteid(5).ok().flatten().map(to_fteid);
     req.bearer_contexts.push(BearerContextToCreate {
         ebi,
         bearer_qos: Some(BearerQos {
@@ -1034,7 +1038,7 @@ fn parse_create_session_request(msg: &Gtp2Message) -> Result<CreateSessionReques
             dl_gbr: qos.gbr_dl,
         }),
         s5u_sgw_f_teid: s5u,
-        s2b_u_epdg_f_teid: None,
+        s2b_u_epdg_f_teid: s2b_u,
     });
 
     req.pco = msg
@@ -1110,27 +1114,24 @@ fn parse_modify_bearer_request(msg: &Gtp2Message) -> ModifyBearerRequest {
         bearer_contexts: Vec::new(),
     };
 
-    // Bearer Contexts to be modified. The S1-U/S4-U eNodeB F-TEID sits at instance 1 in this
+    // Bearer Contexts to be modified. The S5/S8-U SGW F-TEID sits at instance 1 in this
     // message (TS 29.274 Table 7.2.7-2), unlike the Create Session Request's instance 2 — the
     // field name `s4u_sgsn_f_teid` is the pre-existing struct's, and it is the downlink
-    // endpoint the PGW-U forwards to either way.
+    // endpoint the PGW-U forwards to. Instance 0 is the S1-U eNodeB F-TEID, an S11 IE: it
+    // used to be read as a fallback, which would have pointed the PGW-U's downlink at an
+    // eNodeB past the SGW (#1113 audit).
     if let Some(bc_ie) = msg.get_ie(Gtp2IeType::BearerContext as u8, 0) {
         if let Ok(bc) = Gtp2BearerContextIe::decode(&bc_ie.value) {
             if let Ok(ebi) = bc.ebi() {
                 req.bearer_contexts.push(BearerContextToModify {
                     ebi,
-                    s4u_sgsn_f_teid: bc
-                        .fteid(1)
-                        .ok()
-                        .flatten()
-                        .or(bc.fteid(0).ok().flatten())
-                        .map(|ft| {
-                            FTeid::new_ipv4(
-                                ft.interface_type,
-                                ft.teid,
-                                std::net::Ipv4Addr::from(ft.ipv4_addr.unwrap_or([0, 0, 0, 0])),
-                            )
-                        }),
+                    s4u_sgsn_f_teid: bc.fteid(1).ok().flatten().map(|ft| {
+                        FTeid::new_ipv4(
+                            ft.interface_type,
+                            ft.teid,
+                            std::net::Ipv4Addr::from(ft.ipv4_addr.unwrap_or([0, 0, 0, 0])),
+                        )
+                    }),
                 });
             }
         }
@@ -2206,6 +2207,155 @@ mod tests {
     use std::net::Ipv4Addr;
 
     // ================================================================
+    // #1113: S5/S8 cross-NF, against the SGW-C's real codecs
+    // ================================================================
+
+    fn decode_gtp(encoded: &[u8]) -> Gtp2Message {
+        let mut bytes = bytes::Bytes::copy_from_slice(encoded);
+        Gtp2Message::decode(&mut bytes).expect("decode")
+    }
+
+    /// #1113: the S5/S8 leg of an attach and a detach, each message built by one NF and
+    /// read by the other's own code. The SGW-C's Create Session Request is parsed here;
+    /// this PGW-C's Create Session Response is parsed by sgwcd's
+    /// `parse_s5c_create_session_response` and applied by its real
+    /// `handle_create_session_response`, which must store this node's S5-C TEID -- it
+    /// stored 0, because the F-TEID went out at instance 0 and the SGW-C reads 1. The
+    /// SGW-C's Delete Session Request is then addressed to that TEID, and its Modify
+    /// Bearer Request carries the S5/S8-U SGW F-TEID where this node reads it.
+    ///
+    /// One test, because it is the only one in this crate that touches sgwcd's
+    /// process-global context and address slots.
+    #[test]
+    fn sgwcd_and_smfd_agree_on_every_s5_ie_instance() {
+        use nextgcore_sgwcd::context::sgwc_self;
+        use nextgcore_sgwcd::{gtp_path, s11_build, s5c_handler};
+
+        // The SGW-C's side of the session, as its dispatcher leaves it.
+        let sgwc = sgwc_self();
+        sgwc.set_s5c_address(Some(Ipv4Addr::new(10, 10, 0, 65)));
+        let ue = sgwc
+            .ue_add(&[0x09, 0x91, 0x07, 0x00, 0x00, 0x11, 0x13])
+            .unwrap();
+        let mut ue = sgwc.ue_find_by_id(ue.id).unwrap();
+        ue.mme_s11_teid = 0x0a0b_0c0d;
+        ue.rat_type = gtp2_rat_type::EUTRAN;
+        sgwc.ue_update(&ue);
+        let sgw_sess = sgwc.sess_add(ue.id, "internet").unwrap();
+        let mut sgw_sess = sgwc.sess_find_by_id(sgw_sess.id).unwrap();
+        sgw_sess.paa.pdn_type = 1;
+        sgwc.sess_update(&sgw_sess);
+        let sgw_bearer = sgwc.bearer_add(sgw_sess.id).unwrap();
+        let mut sgw_bearer = sgwc.bearer_find_by_id(sgw_bearer.id).unwrap();
+        sgw_bearer.ebi = 5;
+        sgw_bearer.qci = 9;
+        sgw_bearer.arp_priority_level = 8;
+        sgwc.bearer_update(&sgw_bearer);
+        for tunnel_id in &sgw_bearer.tunnel_ids {
+            let mut tunnel = sgwc.tunnel_find_by_id(*tunnel_id).unwrap();
+            tunnel.local_teid = 0x1113_0000 + *tunnel_id as u32;
+            tunnel.local_addr = Some(Ipv4Addr::new(10, 10, 0, 65));
+            sgwc.tunnel_update(&tunnel);
+        }
+        let sgw_sess = sgwc.sess_find_by_id(sgw_sess.id).unwrap();
+        let sgw_s5u = sgwc.dl_tunnel_in_bearer(sgw_bearer.id).unwrap().local_teid;
+
+        // SGW-C -> PGW-C: Create Session Request.
+        let csr = s11_build::build_s5c_create_session_request(&sgw_sess, 7)
+            .unwrap()
+            .encode();
+        let req = parse_create_session_request(&decode_gtp(&csr)).expect("smfd parses it");
+        let sender = req.sender_f_teid.expect("the Sender F-TEID, instance 0");
+        assert_eq!(sender.teid, sgw_sess.sgw_s5c_teid);
+        assert_eq!(
+            sender.interface_type,
+            crate::gtp_build::gtp2_f_teid_interface::S5_S8_SGW_GTP_C
+        );
+        let sgw_u = req.bearer_contexts[0]
+            .s5u_sgw_f_teid
+            .as_ref()
+            .expect("the S5/S8-U SGW F-TEID, Bearer Context instance 2");
+        assert_eq!(sgw_u.teid, sgw_s5u);
+
+        // PGW-C -> SGW-C: Create Session Response, from this node's builder.
+        let mut pgw_sess = SmfSess::default();
+        pgw_sess.sgw_s5c_teid = sender.teid;
+        pgw_sess.smf_n4_teid = 0x0000_1113;
+        pgw_sess.gtp_rat_type = gtp2_rat_type::EUTRAN;
+        pgw_sess.ue_session_type = pgw_sess.session_type as u8;
+        pgw_sess.ipv4_addr = Some(Ipv4Addr::new(10, 45, 0, 4));
+        let mut pgw_bearer = SmfBearer::new(1, pgw_sess.id);
+        pgw_bearer.ebi = 5;
+        pgw_bearer.pgw_s5u_teid = 0x0000_0099;
+        pgw_bearer.pgw_s5u_addr = Some(Ipv4Addr::new(10, 10, 0, 67));
+        let csrsp = crate::gtp_build::build_create_session_response(
+            &pgw_sess,
+            &[pgw_bearer],
+            Some(Ipv4Addr::new(10, 10, 0, 66)),
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+        );
+        let answer = gtp_path::parse_s5c_create_session_response(&decode_gtp(&csrsp));
+        assert_eq!(answer.cause, 16);
+        let pgw_c = answer
+            .pgw_c
+            .expect("sgwcd finds the PGW's control F-TEID at instance 1");
+        assert_eq!(pgw_c.teid, 0x0000_1113);
+        assert_eq!(pgw_c.ipv4_addr, Some([10, 10, 0, 66]));
+        let pgw_u = answer
+            .pgw_u
+            .expect("and the PGW-U's at Bearer Context instance 2");
+        assert_eq!(pgw_u.teid, 0x0000_0099);
+        let result = s5c_handler::handle_create_session_response(
+            Some(&sgw_sess),
+            0,
+            &[],
+            answer.cause,
+            pgw_c.teid,
+            pgw_u.teid,
+            pgw_u.ipv4_addr.map(Ipv4Addr::from),
+        );
+        assert!(
+            matches!(result, s5c_handler::HandlerResult::SendPfcp),
+            "{result:?}"
+        );
+        let sgw_sess = sgwc.sess_find_by_id(sgw_sess.id).unwrap();
+        assert_eq!(
+            sgw_sess.pgw_s5c_teid, 0x0000_1113,
+            "the SGW-C stores this node's S5-C TEID, not 0"
+        );
+
+        // SGW-C -> PGW-C: the detach's Delete Session Request reaches this session.
+        let dsr = s11_build::build_s5c_delete_session_request(&sgw_sess, 8)
+            .unwrap()
+            .encode();
+        let dsr = decode_gtp(&dsr);
+        assert_eq!(dsr.header.teid, Some(pgw_sess.smf_n4_teid));
+        assert_eq!(parse_delete_session_request(&dsr).linked_ebi, Some(5));
+
+        // SGW-C -> PGW-C: Modify Bearer Request, the S5/S8-U SGW F-TEID at instance 1.
+        let mbr = s11_build::build_s5c_modify_bearer_request(&sgw_sess, 9)
+            .unwrap()
+            .encode();
+        let mbr = parse_modify_bearer_request(&decode_gtp(&mbr));
+        assert_eq!(
+            mbr.bearer_contexts[0]
+                .s4u_sgsn_f_teid
+                .as_ref()
+                .map(|f| f.teid),
+            Some(sgw_s5u),
+            "smfd reads the S5/S8-U SGW F-TEID sgwcd sends"
+        );
+
+        sgwc.ue_remove(ue.id);
+        sgwc.set_s5c_address(None);
+    }
+
+    // ================================================================
     // #52: the PGW-C role on the wire
     // ================================================================
 
@@ -2392,7 +2542,7 @@ mod tests {
         // The session as the CONTEXT holds it, found the way the wire finds it: by the TEID
         // this node advertised in the response's F-TEID.
         let advertised = resp
-            .get_ie(Gtp2IeType::FTeid as u8, 0)
+            .get_ie(Gtp2IeType::FTeid as u8, 1)
             .and_then(|ie| nextgcore_gtp::v2::Gtp2FTeidIe::decode(&ie.value).ok())
             .expect("the response carries the PGW's control F-TEID")
             .teid;

@@ -347,8 +347,10 @@ impl FTeid {
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = BytesMut::with_capacity(25);
 
-        // Flags byte: V4 | V6 | Interface Type (5 bits)
-        let mut flags = self.interface_type & 0x1f;
+        // Flags byte: V4 | V6 | Interface Type (6 bits, TS 29.274 §8.22). It was masked
+        // to 5, which sent the S2b PGW GTP-C (32) and S2b-U PGW GTP-U (33) types as 0
+        // and 1, the S1-U eNodeB and S1-U SGW (#1113 audit).
+        let mut flags = self.interface_type & 0x3f;
         if self.teid_present {
             flags |= 0x80; // TEID present
         }
@@ -938,6 +940,26 @@ impl BearerContextBuilder {
 
 use crate::context::{PduSessionType, Qos, SmfBearer, SmfSess};
 
+/// IE instances of the Create Session Response, TS 29.274 Tables 7.2.2-1 and 7.2.2-2.
+pub mod csr_instance {
+    /// "PGW S5/S8/S2a/S2b F-TEID for PMIP based interface or for GTP based Control
+    /// Plane interface" (Table 7.2.2-1).
+    pub const PGW_CONTROL_F_TEID: u8 = 1;
+    /// "S5/S8-U PGW F-TEID" in Bearer Context created (Table 7.2.2-2).
+    pub const BC_S5_S8_U_PGW_F_TEID: u8 = 2;
+    /// "S2b-U PGW F-TEID" in Bearer Context created (Table 7.2.2-2).
+    pub const BC_S2B_U_PGW_F_TEID: u8 = 4;
+}
+
+/// IE instances in the Bearer Context of a Create Bearer Request, TS 29.274
+/// Table 7.2.3-2. Instance 0 is the S1-U SGW F-TEID, which only an SGW writes.
+pub mod cbr_instance {
+    /// "S5/S8-U PGW F-TEID".
+    pub const BC_S5_S8_U_PGW_F_TEID: u8 = 1;
+    /// "S2b-U PGW F-TEID".
+    pub const BC_S2B_U_PGW_F_TEID: u8 = 4;
+}
+
 /// Build Create Session Response message
 /// Port of smf_s5c_build_create_session_response
 pub fn build_create_session_response(
@@ -962,7 +984,13 @@ pub fn build_create_session_response(
     };
     builder = builder.add_cause(cause);
 
-    // Control Plane F-TEID (SMF S5C)
+    // The PGW's own control-plane F-TEID, "PGW S5/S8/S2a/S2b F-TEID for PMIP based
+    // interface or for GTP based Control Plane interface", is instance 1 of TS 29.274
+    // Table 7.2.2-1. Instance 0 is the "Sender F-TEID for Control Plane", which is sent
+    // on S11/S4 only ("For the S5/S8/S2a/S2b interfaces it is not needed"), so a PGW
+    // sends no instance-0 F-TEID at all. It was written at instance 0, where the SGW-C
+    // reading instance 1 found nothing, stored PGW S5-C TEID 0 and relayed no Delete
+    // Session: the PGW session leaked on every detach (#1113).
     let interface_type = match sess.gtp_rat_type {
         gtp2_rat_type::EUTRAN => gtp2_f_teid_interface::S5_S8_PGW_GTP_C,
         gtp2_rat_type::WLAN => gtp2_f_teid_interface::S2B_PGW_GTP_C,
@@ -971,10 +999,10 @@ pub fn build_create_session_response(
 
     if let Some(addr) = smf_addr {
         let f_teid = FTeid::new_ipv4(interface_type, sess.smf_n4_teid, addr);
-        builder = builder.add_f_teid(&f_teid, 0);
+        builder = builder.add_f_teid(&f_teid, csr_instance::PGW_CONTROL_F_TEID);
     } else if let Some(addr) = smf_addr6 {
         let f_teid = FTeid::new_ipv6(interface_type, sess.smf_n4_teid, addr);
-        builder = builder.add_f_teid(&f_teid, 0);
+        builder = builder.add_f_teid(&f_teid, csr_instance::PGW_CONTROL_F_TEID);
     }
 
     // PAA (PDN Address Allocation)
@@ -1065,8 +1093,8 @@ pub fn build_create_session_response(
         // SGW-C reading instance 2 (as sgwcd does, per the table) found no PGW-U
         // endpoint and provisioned an uplink that forwarded nowhere (#303).
         let pgw_u_instance = match sess.gtp_rat_type {
-            gtp2_rat_type::WLAN => 4,
-            _ => 2,
+            gtp2_rat_type::WLAN => csr_instance::BC_S2B_U_PGW_F_TEID,
+            _ => csr_instance::BC_S5_S8_U_PGW_F_TEID,
         };
         if let Some(addr) = bearer.pgw_s5u_addr {
             let f_teid = FTeid::new_ipv4(bearer_f_teid_interface, bearer.pgw_s5u_teid, addr);
@@ -1124,11 +1152,13 @@ pub fn build_modify_bearer_response(
             builder = builder.add_msisdn(msisdn_data);
         }
 
-        // Add bearer contexts modified
+        // Bearer Contexts modified (instance 0). Cause is mandatory in each one
+        // (TS 29.274 Table 7.2.8-2), and was missing (#1113 audit).
         for bearer in bearers {
             let bc_builder = builder
                 .start_bearer_context(0)
                 .add_ebi(bearer.ebi)
+                .add_cause(Gtp2Cause::RequestAccepted)
                 .add_charging_id(sess.charging.id);
             builder = bc_builder.end();
         }
@@ -1172,13 +1202,18 @@ pub fn build_create_bearer_request(
         .add_ebi(bearer.ebi)
         .add_bearer_qos(&bearer_qos);
 
-    // PGW S5U F-TEID
+    // The PGW user-plane F-TEID, at its Table 7.2.3-2 instance: 1 for S5/S8-U and 4
+    // for S2b-U. It was written at instance 0, the S1-U SGW F-TEID's slot (#1113).
+    let pgw_u_instance = match sess.gtp_rat_type {
+        gtp2_rat_type::WLAN => cbr_instance::BC_S2B_U_PGW_F_TEID,
+        _ => cbr_instance::BC_S5_S8_U_PGW_F_TEID,
+    };
     if let Some(addr) = bearer.pgw_s5u_addr {
         let f_teid = FTeid::new_ipv4(bearer_f_teid_interface, bearer.pgw_s5u_teid, addr);
-        bc_builder = bc_builder.add_f_teid(&f_teid, 0);
+        bc_builder = bc_builder.add_f_teid(&f_teid, pgw_u_instance);
     } else if let Some(addr) = bearer.pgw_s5u_addr6 {
         let f_teid = FTeid::new_ipv6(bearer_f_teid_interface, bearer.pgw_s5u_teid, addr);
-        bc_builder = bc_builder.add_f_teid(&f_teid, 0);
+        bc_builder = bc_builder.add_f_teid(&f_teid, pgw_u_instance);
     }
 
     // TFT
@@ -1469,6 +1504,157 @@ mod tests {
         assert_eq!(Gtp2Cause::from_wire(69), Gtp2Cause::MandatoryIeIncorrect);
         assert_eq!(Gtp2Cause::from_wire(70), Gtp2Cause::MandatoryIeMissing);
         assert_eq!(Gtp2Cause::from_wire(255), Gtp2Cause::UndefinedValue);
+    }
+
+    /// A session and its default bearer with every value the S5/S8 builders put on
+    /// the wire chosen, so the golden bytes below are fully determined (#1113).
+    fn golden_session(rat: u8) -> (SmfSess, SmfBearer) {
+        let mut sess = SmfSess::default();
+        sess.sgw_s5c_teid = 0x0000_0003;
+        sess.smf_n4_teid = 0x0000_0042;
+        sess.gtp_rat_type = rat;
+        sess.session_type = PduSessionType::Ipv4;
+        sess.ue_session_type = PduSessionType::Ipv4 as u8;
+        sess.ipv4_addr = Some(Ipv4Addr::new(10, 45, 0, 4));
+        sess.charging.id = 0x0000_0007;
+        let mut bearer = SmfBearer::new(1, sess.id);
+        bearer.ebi = 5;
+        bearer.pgw_s5u_teid = 0x0000_0099;
+        bearer.pgw_s5u_addr = Some(Ipv4Addr::new(10, 10, 0, 67));
+        (sess, bearer)
+    }
+
+    const GOLDEN_SMF_ADDR: Ipv4Addr = Ipv4Addr::new(10, 10, 0, 66);
+
+    /// #1113, TS 29.274 Tables 7.2.2-1 / 7.2.2-2: the S5/S8 Create Session Response,
+    /// golden bytes. The PGW's control F-TEID is the instance-1 IE ("PGW S5/S8/S2a/S2b
+    /// F-TEID ... for GTP based Control Plane interface"); a PGW sends no instance-0
+    /// "Sender F-TEID", which is an S11/S4 IE. The PGW-U F-TEID is instance 2 of the
+    /// Bearer Context created. It went out at instance 0, the SGW-C stored PGW S5-C TEID
+    /// 0, and every detach left the PGW session behind.
+    #[test]
+    fn s5_create_session_response_is_table_7_2_2_1_on_the_wire() {
+        let (sess, bearer) = golden_session(gtp2_rat_type::EUTRAN);
+        let msg = build_create_session_response(
+            &sess,
+            &[bearer],
+            Some(GOLDEN_SMF_ADDR),
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+        );
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            // Header: v2, T=1; type 33; length 77; SGW S5-C TEID 3; sequence 0.
+            0x48, 0x21, 0x00, 0x4d, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00,
+            // Cause (2), instance 0: Request accepted (16).
+            0x02, 0x00, 0x02, 0x00, 0x10, 0x00,
+            // F-TEID (87), INSTANCE 1: V4, interface 7 (S5/S8 PGW GTP-C), TEID 0x42, 10.10.0.66.
+            0x57, 0x00, 0x09, 0x01, 0x87, 0x00, 0x00, 0x00, 0x42, 0x0a, 0x0a, 0x00, 0x42,
+            // PAA (79), instance 0: IPv4, 10.45.0.4.
+            0x4f, 0x00, 0x05, 0x00, 0x01, 0x0a, 0x2d, 0x00, 0x04,
+            // APN Restriction (127), instance 0: no restriction.
+            0x7f, 0x00, 0x01, 0x00, 0x00,
+            // Bearer Context (93), instance 0 ("Bearer Contexts created"), 32 octets:
+            0x5d, 0x00, 0x20, 0x00,
+            //   EBI (73): 5.
+            0x49, 0x00, 0x01, 0x00, 0x05,
+            //   Cause: Request accepted.
+            0x02, 0x00, 0x02, 0x00, 0x10, 0x00,
+            //   Charging ID (94): 7.
+            0x5e, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x07,
+            //   F-TEID, INSTANCE 2: V4, interface 5 (S5/S8 PGW GTP-U), TEID 0x99, 10.10.0.67.
+            0x57, 0x00, 0x09, 0x02, 0x85, 0x00, 0x00, 0x00, 0x99, 0x0a, 0x0a, 0x00, 0x43,
+        ];
+        assert_eq!(msg, expected);
+    }
+
+    /// #1113: over S2b the same Table 7.2.2-1 IE carries the PGW's S2b control F-TEID,
+    /// still at instance 1, and the PGW-U's S2b-U F-TEID is instance 4 of the Bearer
+    /// Context created (Table 7.2.2-2).
+    #[test]
+    fn s2b_create_session_response_uses_instances_1_and_4() {
+        let (sess, bearer) = golden_session(gtp2_rat_type::WLAN);
+        let msg = build_create_session_response(
+            &sess,
+            &[bearer],
+            Some(GOLDEN_SMF_ADDR),
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+        );
+        // F-TEID, instance 1, interface 32 (S2b PGW GTP-C), right after the Cause.
+        assert_eq!(
+            &msg[18..31],
+            &[0x57, 0x00, 0x09, 0x01, 0xa0, 0x00, 0x00, 0x00, 0x42, 0x0a, 0x0a, 0x00, 0x42]
+        );
+        // No APN Restriction off E-UTRAN, so the Bearer Context follows the PAA; its last
+        // IE is the F-TEID at instance 4, interface 33 (S2b-U PGW GTP-U).
+        assert_eq!(
+            &msg[msg.len() - 13..],
+            &[0x57, 0x00, 0x09, 0x04, 0xa1, 0x00, 0x00, 0x00, 0x99, 0x0a, 0x0a, 0x00, 0x43]
+        );
+        assert!(
+            !msg.windows(4).any(|w| w == [0x57, 0x00, 0x09, 0x00]),
+            "no F-TEID at instance 0 anywhere: that is the S11/S4 Sender F-TEID"
+        );
+    }
+
+    /// #1113 audit, TS 29.274 Table 7.2.3-2: the PGW's user-plane F-TEID in a Create
+    /// Bearer Request's Bearer Context is instance 1 (S5/S8-U PGW) -- instance 0 is the
+    /// S1-U SGW F-TEID, which only the SGW writes. Golden bytes from the bearer context on.
+    #[test]
+    fn create_bearer_request_carries_the_pgw_s5u_fteid_at_instance_1() {
+        let (sess, mut bearer) = golden_session(gtp2_rat_type::EUTRAN);
+        bearer.ebi = 0;
+        bearer.qos.index = 9;
+        bearer.qos.arp_priority_level = 1;
+        let msg = build_create_bearer_request(&sess, &bearer, 5, None);
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            // Header: type 95; length 61; SGW S5-C TEID 3.
+            0x48, 0x5f, 0x00, 0x3d, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00,
+            // Linked EBI (73), instance 0: 5.
+            0x49, 0x00, 0x01, 0x00, 0x05,
+            // Bearer Context (93), instance 0, 44 octets:
+            0x5d, 0x00, 0x2c, 0x00,
+            //   EBI: 0 (the MME assigns it).
+            0x49, 0x00, 0x01, 0x00, 0x00,
+            //   Bearer QoS (80): PL 1, QCI 9, rates 0.
+            0x50, 0x00, 0x16, 0x00, 0x04, 0x09,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            //   F-TEID, INSTANCE 1: interface 5 (S5/S8 PGW GTP-U), TEID 0x99, 10.10.0.67.
+            0x57, 0x00, 0x09, 0x01, 0x85, 0x00, 0x00, 0x00, 0x99, 0x0a, 0x0a, 0x00, 0x43,
+        ];
+        assert_eq!(msg, expected);
+    }
+
+    /// #1113 audit, TS 29.274 Table 7.2.8-2: each "Bearer Context modified" of a
+    /// Modify Bearer Response carries a Cause, which is mandatory there.
+    #[test]
+    fn modify_bearer_response_bearer_context_carries_its_cause() {
+        let (sess, bearer) = golden_session(gtp2_rat_type::EUTRAN);
+        let msg = build_modify_bearer_response(&sess, &[bearer], None, true);
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            // Header: type 35; length 37; SGW S5-C TEID 3.
+            0x48, 0x23, 0x00, 0x25, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00,
+            // Cause: Request accepted.
+            0x02, 0x00, 0x02, 0x00, 0x10, 0x00,
+            // Bearer Context (93), instance 0, 19 octets: EBI 5, Cause, Charging ID 7.
+            0x5d, 0x00, 0x13, 0x00,
+            0x49, 0x00, 0x01, 0x00, 0x05,
+            0x02, 0x00, 0x02, 0x00, 0x10, 0x00,
+            0x5e, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x07,
+        ];
+        assert_eq!(msg, expected);
     }
 
     #[test]

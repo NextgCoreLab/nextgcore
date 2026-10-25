@@ -1543,6 +1543,44 @@ fn created_lbi(msg: &Gtp2Message) -> u8 {
         .unwrap_or(5)
 }
 
+/// What the SGW-C takes from an S5/S8 Create Session Response.
+#[derive(Debug, Clone)]
+pub struct S5cCreateSessionAnswer {
+    /// The Cause (instance 0); System failure when absent.
+    pub cause: u8,
+    /// The PGW's S5/S8-C F-TEID: "PGW S5/S8/S2a/S2b F-TEID ... for GTP based Control
+    /// Plane interface", instance 1 of TS 29.274 Table 7.2.2-1. Instance 0 is the
+    /// S11/S4 Sender F-TEID, which a PGW does not send.
+    pub pgw_c: Option<Gtp2FTeidIe>,
+    /// The PGW-U's S5/S8-U F-TEID: instance 2 of the Bearer Context created
+    /// (Table 7.2.2-2).
+    pub pgw_u: Option<Gtp2FTeidIe>,
+    /// The PDN address the PGW allocated.
+    pub paa: Option<Gtp2PaaIe>,
+}
+
+/// Decode an S5/S8 Create Session Response at the IE instances TS 29.274 Tables
+/// 7.2.2-1 / 7.2.2-2 give them. Public so the PGW-C's tests can read the response
+/// it builds with this, the SGW-C's own decoder (#1113).
+pub fn parse_s5c_create_session_response(msg: &Gtp2Message) -> S5cCreateSessionAnswer {
+    S5cCreateSessionAnswer {
+        cause: msg
+            .get_ie(Gtp2IeType::Cause as u8, 0)
+            .and_then(|ie| ie.value.first().copied())
+            .unwrap_or(gtp_cause::SYSTEM_FAILURE),
+        pgw_c: msg
+            .get_ie(Gtp2IeType::FTeid as u8, 1)
+            .and_then(|ie| Gtp2FTeidIe::decode(&ie.value).ok()),
+        pgw_u: msg
+            .get_ie(Gtp2IeType::BearerContext as u8, 0)
+            .and_then(|ie| Gtp2BearerContextIe::decode(&ie.value).ok())
+            .and_then(|bc| bc.fteid(2).ok().flatten()),
+        paa: msg
+            .get_ie(Gtp2IeType::Paa as u8, 0)
+            .and_then(|ie| Gtp2PaaIe::decode(&ie.value).ok()),
+    }
+}
+
 /// The PGW answered our S5/S8 Create Session Request (#52 criteria 5 and 7).
 ///
 /// This is where the SGW-C stops inventing an answer. The PAA, the PGW's control and
@@ -1561,21 +1599,12 @@ fn dispatch_s5c_create_session_response(msg: &Gtp2Message, peer: SocketAddr) {
     };
 
     let ctx = sgwc_self();
-    let cause = msg
-        .get_ie(Gtp2IeType::Cause as u8, 0)
-        .and_then(|ie| ie.value.first().copied())
-        .unwrap_or(gtp_cause::SYSTEM_FAILURE);
-
-    // The PGW's control-plane F-TEID is at instance 1 (TS 29.274 Table 7.2.2-1); the
-    // SGW's own echo is at instance 0.
-    let pgw_c = msg
-        .get_ie(Gtp2IeType::FTeid as u8, 1)
-        .and_then(|ie| Gtp2FTeidIe::decode(&ie.value).ok());
-    // The PGW-U endpoint lives in the Bearer Context at instance 2.
-    let pgw_u = msg
-        .get_ie(Gtp2IeType::BearerContext as u8, 0)
-        .and_then(|ie| Gtp2BearerContextIe::decode(&ie.value).ok())
-        .and_then(|bc| bc.fteid(2).ok().flatten());
+    let S5cCreateSessionAnswer {
+        cause,
+        pgw_c,
+        pgw_u,
+        paa,
+    } = parse_s5c_create_session_response(msg);
 
     // ---- criterion 5: the SGW-C stops inventing the answer ----
     //
@@ -1584,10 +1613,7 @@ fn dispatch_s5c_create_session_response(msg: &Gtp2Message, peer: SocketAddr) {
     // builds the S11 Create Session Response from. Before #52 the PAA was COPIED from
     // the MME's request (`parsed.paa` into `sess.paa`), so the UE was handed back the
     // address it had asked about with no node having allocated anything.
-    if let Some(paa) = msg
-        .get_ie(Gtp2IeType::Paa as u8, 0)
-        .and_then(|ie| Gtp2PaaIe::decode(&ie.value).ok())
-    {
+    if let Some(paa) = paa {
         if let Some(mut sess) = ctx.sess_find_by_id(sess_id) {
             sess.paa.pdn_type = paa.pdn_type;
             sess.paa.ipv4_addr = paa.ipv4_addr.map(std::net::Ipv4Addr::from);
