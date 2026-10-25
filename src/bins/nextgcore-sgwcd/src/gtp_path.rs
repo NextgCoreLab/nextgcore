@@ -414,12 +414,14 @@ impl GtpcServer {
     /// Send a triggered (response) message bound to the request's sequence
     /// number, caching it so retransmitted requests are answered identically.
     pub fn send_response(&self, peer: SocketAddr, msg: &Gtp2Message) -> Result<(), String> {
-        if msg.header.message_type == Gtp2MessageType::CreateSessionResponse as u8 {
-            end_create_session(peer, msg.header.sequence_number);
-        }
         let encoded = Bytes::from(msg.encode().to_vec());
         if let Ok(mut xact) = self.inner.xact.lock() {
             xact.cache_response(peer, msg.header.sequence_number, encoded.clone());
+        }
+        // After the cache (#1121 review m1): a retransmission arriving in between is
+        // answered from it, not processed again as a new request.
+        if msg.header.message_type == Gtp2MessageType::CreateSessionResponse as u8 {
+            end_create_session(peer, msg.header.sequence_number);
         }
         self.inner
             .socket
@@ -2403,6 +2405,21 @@ fn resolve_create_session_collision(
             ue.imsi_bcd,
             old.id
         );
+        // Its PDRs and FARs go from the SGW-U too (#1121 review m6), while the
+        // bearer's tunnels still name them.
+        if old.sgwu_sxa_seid != 0 {
+            if let Err(e) = pfcp_path::send_bearer_modification_request(
+                bearer.id,
+                0,
+                None,
+                crate::sxa_handler::pfcp_modify::REMOVE,
+            ) {
+                log::warn!(
+                    "Bearer EBI {ebi} of session {}: its SGW-U rules were not removed: {e}",
+                    old.id
+                );
+            }
+        }
         ctx.bearer_remove(bearer.id);
         return;
     }
@@ -3215,7 +3232,7 @@ mod tests {
         cause: u8,
         delay: Duration,
     ) -> StandInSgwu {
-        stand_in_sgwu_scripted(ambient, cause, delay, Vec::new()).await
+        stand_in_sgwu_scripted(ambient, cause, delay, Vec::new(), 0x5555_0001).await
     }
 
     /// [`stand_in_sgwu`] whose Session Modification Responses follow `script`
@@ -3227,6 +3244,7 @@ mod tests {
         cause: u8,
         delay: Duration,
         script: Vec<(u8, Duration)>,
+        seid_base: u64,
     ) -> StandInSgwu {
         use nextgcore_pfcp::header::PfcpHeader as PHeader;
         use nextgcore_pfcp::message::{
@@ -3303,12 +3321,10 @@ mod tests {
                         // Conditional-mandatory on acceptance (TS 29.244 §7.5.3): the
                         // UP F-SEID the SGW-C stores and addresses the session by.
                         if pfcp_cause == PfcpCause::RequestAccepted {
-                            // A distinct UP SEID per session, from 0x5555_0001, so a
+                            // A distinct UP SEID per session, from `seid_base`, so a
                             // test can tell which one a deletion names.
-                            rsp.up_f_seid = Some(FSeid::new_ipv4(
-                                0x0000_0000_5555_0001 + established,
-                                [127, 0, 0, 9],
-                            ));
+                            rsp.up_f_seid =
+                                Some(FSeid::new_ipv4(seid_base + established, [127, 0, 0, 9]));
                             established += 1;
                         }
                         rsp.encode(&mut body);
@@ -3652,14 +3668,34 @@ mod tests {
         msg
     }
 
-    /// The SEIDs of the Session Deletion Requests the stand-in SGW-U received.
-    fn sgwu_deletions(sgwu: &StandInSgwu) -> Vec<u64> {
+    /// A stand-in SGW-U whose UP SEIDs are `tag << 32` + 1, 2, ..., so a test can
+    /// tell its own sessions' deletions from a late one an earlier test's sessions
+    /// sent to the process-wide SGW-U address (#1121 review m5).
+    async fn own_stand_in_sgwu(
+        ambient: &crate::pfcp_path::ProcessStateGuard,
+        tag: u64,
+        delay: Duration,
+    ) -> StandInSgwu {
+        stand_in_sgwu_scripted(
+            ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            delay,
+            Vec::new(),
+            (tag << 32) | 1,
+        )
+        .await
+    }
+
+    /// The SEIDs of the Session Deletion Requests the stand-in SGW-U received for
+    /// sessions it tagged `tag` ([`own_stand_in_sgwu`]).
+    fn sgwu_deletions(sgwu: &StandInSgwu, tag: u64) -> Vec<u64> {
         sgwu.seen
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter(|(t, _, _)| *t == 54)
             .filter_map(|(_, seid, _)| *seid)
+            .filter(|seid| seid >> 32 == tag)
             .collect()
     }
 
@@ -3690,12 +3726,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_colliding_create_deletes_the_old_pdn_connection_on_the_sgwu() {
         let ambient = crate::pfcp_path::process_state_test_guard().await;
-        let sgwu = stand_in_sgwu(
-            &ambient,
-            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
-            Duration::from_millis(0),
-        )
-        .await;
+        let sgwu = own_stand_in_sgwu(&ambient, 0x77, Duration::from_millis(0)).await;
         let pgw = with_stand_in_pgw().await;
         let server = test_server(&ambient, 1000, 1);
         set_s11_server(server.clone());
@@ -3718,9 +3749,9 @@ mod tests {
         assert!(accepted(&recv_s11(&sock).await.expect("second")));
 
         assert!(
-            eventually(|| sgwu_deletions(&sgwu) == vec![old.sgwu_sxa_seid]).await,
+            eventually(|| sgwu_deletions(&sgwu, 0x77) == vec![old.sgwu_sxa_seid]).await,
             "the OLD SGW-U session is deleted, and only it: {:?}",
-            sgwu_deletions(&sgwu)
+            sgwu_deletions(&sgwu, 0x77)
         );
         let sessions = ctx.sess_list_for_ue(ue.id);
         assert_eq!(sessions.len(), 1, "one PDN connection");
@@ -3742,12 +3773,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_colliding_create_toward_another_pgw_deletes_the_old_pgw_session() {
         let ambient = crate::pfcp_path::process_state_test_guard().await;
-        let _sgwu = stand_in_sgwu(
-            &ambient,
-            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
-            Duration::from_millis(0),
-        )
-        .await;
+        let _sgwu = own_stand_in_sgwu(&ambient, 0x78, Duration::from_millis(0)).await;
         let old_pgw = with_stand_in_pgw().await;
         let server = test_server(&ambient, 1000, 1);
         set_s11_server(server.clone());
@@ -3803,12 +3829,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_collision_is_by_ebi_not_by_apn() {
         let ambient = crate::pfcp_path::process_state_test_guard().await;
-        let sgwu = stand_in_sgwu(
-            &ambient,
-            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
-            Duration::from_millis(0),
-        )
-        .await;
+        let sgwu = own_stand_in_sgwu(&ambient, 0x79, Duration::from_millis(0)).await;
         let _pgw = with_stand_in_pgw().await;
         let server = test_server(&ambient, 1000, 1);
         set_s11_server(server.clone());
@@ -3829,7 +3850,7 @@ mod tests {
         assert!(accepted(&recv_s11(&sock).await.expect("PDN 2")));
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
-            sgwu_deletions(&sgwu).is_empty(),
+            sgwu_deletions(&sgwu, 0x79).is_empty(),
             "no collision: nothing deleted"
         );
         assert_eq!(ctx.sess_list_for_ue(ue.id).len(), 2);
@@ -3845,7 +3866,7 @@ mod tests {
         )
         .unwrap();
         assert!(accepted(&recv_s11(&sock).await.expect("PDN 3")));
-        assert!(eventually(|| sgwu_deletions(&sgwu) == vec![pdn2.sgwu_sxa_seid]).await);
+        assert!(eventually(|| sgwu_deletions(&sgwu, 0x79) == vec![pdn2.sgwu_sxa_seid]).await);
         let apns: Vec<String> = ctx
             .sess_list_for_ue(ue.id)
             .iter()
@@ -3861,12 +3882,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_collision_with_a_dedicated_bearer_deletes_only_that_bearer() {
         let ambient = crate::pfcp_path::process_state_test_guard().await;
-        let sgwu = stand_in_sgwu(
-            &ambient,
-            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
-            Duration::from_millis(0),
-        )
-        .await;
+        let sgwu = own_stand_in_sgwu(&ambient, 0x7a, Duration::from_millis(0)).await;
         let _pgw = with_stand_in_pgw().await;
         let server = test_server(&ambient, 1000, 1);
         set_s11_server(server.clone());
@@ -3883,6 +3899,13 @@ mod tests {
         let mut dedicated = ctx.bearer_find_by_id(dedicated.id).unwrap();
         dedicated.ebi = 7;
         ctx.bearer_update(&dedicated);
+        // Its rules on the SGW-U, as its establishment would have installed them.
+        for (i, tunnel_id) in dedicated.tunnel_ids.iter().enumerate() {
+            let mut tunnel = ctx.tunnel_find_by_id(*tunnel_id).unwrap();
+            tunnel.pdr_id = Some(0x70 + i as u16);
+            tunnel.far_id = Some(0x70 + i as u32);
+            ctx.tunnel_update(&tunnel);
+        }
 
         sock.send_to(
             &csr_for(0x7a02, &imsi, 7, "ims", ue.sgw_s11_teid).encode(),
@@ -3892,11 +3915,26 @@ mod tests {
         assert!(accepted(&recv_s11(&sock).await.expect("PDN 2")));
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(ctx.sess_find_by_id(pdn1.id).is_some(), "PDN 1 stays");
-        assert!(sgwu_deletions(&sgwu).is_empty());
+        assert!(sgwu_deletions(&sgwu, 0x7a).is_empty());
         assert!(
             ctx.bearer_find_by_sess_ebi(pdn1.id, 7).is_none(),
             "its bearer 7 went"
         );
+        // ...from the SGW-U too (#1121 review m6): a Session Modification on PDN 1's
+        // session, removing the bearer's PDRs (Remove PDR, IE 15, with PDR ID 0x70).
+        let removal = sgwu
+            .seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|(t, seid, body)| {
+                *t == 52
+                    && *seid == Some(pdn1.sgwu_sxa_seid)
+                    && body
+                        .windows(10)
+                        .any(|w| w == [0x00, 0x0f, 0x00, 0x06, 0x00, 0x38, 0x00, 0x02, 0x00, 0x70])
+            });
+        assert!(removal, "the bearer's rules are removed on the SGW-U");
         assert_eq!(ctx.sess_list_for_ue(ue.id).len(), 2);
         ctx.ue_remove(ue.id);
     }
@@ -3907,12 +3945,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_create_session_retransmitted_in_flight_is_not_processed_again() {
         let ambient = crate::pfcp_path::process_state_test_guard().await;
-        let _sgwu = stand_in_sgwu(
-            &ambient,
-            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
-            Duration::from_millis(0),
-        )
-        .await;
+        let _sgwu = own_stand_in_sgwu(&ambient, 0x7b, Duration::from_millis(0)).await;
         let pgw = with_stand_in_pgw().await;
         pgw.create_delay_ms
             .store(800, std::sync::atomic::Ordering::SeqCst);
@@ -3957,12 +3990,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_session_removed_mid_establishment_is_deleted_on_the_sgwu() {
         let ambient = crate::pfcp_path::process_state_test_guard().await;
-        let sgwu = stand_in_sgwu(
-            &ambient,
-            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
-            Duration::from_millis(600),
-        )
-        .await;
+        let sgwu = own_stand_in_sgwu(&ambient, 0x7c, Duration::from_millis(600)).await;
         let _pgw = with_stand_in_pgw().await;
         let server = test_server(&ambient, 1000, 1);
         set_s11_server(server.clone());
@@ -3996,14 +4024,14 @@ mod tests {
         let _ = recv_s11(&sock).await;
         let _ = recv_s11(&sock).await;
         assert!(
-            eventually(|| sgwu_deletions(&sgwu).contains(&0x5555_0001)).await,
+            eventually(|| sgwu_deletions(&sgwu, 0x7c).contains(&0x7c_0000_0001)).await,
             "{:?}",
-            sgwu_deletions(&sgwu)
+            sgwu_deletions(&sgwu, 0x7c)
         );
         let sessions = ctx.sess_list_for_ue(ue.id);
         assert_eq!(sessions.len(), 1);
         assert_ne!(
-            sessions[0].sgwu_sxa_seid, 0x5555_0001,
+            sessions[0].sgwu_sxa_seid, 0x7c_0000_0001,
             "the survivor is the second"
         );
         ctx.ue_remove(ue.id);
@@ -5711,6 +5739,7 @@ mod tests {
                 crate::sxa_handler::pfcp_cause::REQUEST_REJECTED,
                 Duration::from_millis(300),
             )],
+            0x5555_0001,
         )
         .await;
         let server = test_server(&ambient, 1000, 1);
