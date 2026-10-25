@@ -675,15 +675,14 @@ impl Drop for HandoverLock {
     }
 }
 
-/// An SM context error answer (#1072 round 3 m11): SmContextCreateError (TS 29.502
-/// §6.1.6.2.35, Table 6.1.3.2.3.1-3) for the EPS→5GS create, and SmContextUpdateError
-/// (§6.1.6.2.36, Table 6.1.3.3.4.2.2-2) for PREPARED, COMPLETED and CANCELLED. Both
-/// carry the ProblemDetails, with its "cause", in "error", as application/json. A
-/// bare ProblemDetails is for errors an SCP originates.
-///
-/// #1097: the one helper for every error the SMF itself originates on SM Context
-/// Create and Update, in `main.rs` as well as here. Retrieve and Release keep the
-/// ProblemDetails their own tables list.
+/// The error answer of an SM Context Create or Update the SMF itself originates:
+/// SmContextCreateError (TS 29.502 §6.1.6.2.35, Table 6.1.3.2.3.1-3) or
+/// SmContextUpdateError (§6.1.6.2.36, Table 6.1.3.3.4.2.2-2), the ProblemDetails
+/// with its "cause" in the mandatory "error", as application/json (#1072 round 3
+/// m11, #1097). Every create and update error goes through this, or through
+/// [`sm_context_update_error_with`] when the error carries more than the
+/// ProblemDetails. A bare ProblemDetails is for errors an SCP originates; 401, 411,
+/// 413, 415 and 429 and the Retrieve and Release errors keep theirs.
 pub(crate) fn sm_context_error(status: u16, cause: &str, detail: &str) -> SbiResponse {
     let body = serde_json::json!({
         "error": { "status": status, "cause": cause, "detail": detail },
@@ -692,6 +691,44 @@ pub(crate) fn sm_context_error(status: u16, cause: &str, detail: &str) -> SbiRes
         body.to_string(),
         nextgcore_sbi::constants::content_type::APPLICATION_JSON,
     )
+}
+
+/// [`sm_context_error`] with more SmContextUpdateError attributes beside "error"
+/// (#1097 review M2, M3): `upCnxState: DEACTIVATED` when a user-plane activation
+/// failed (TS 29.502 §5.2.2.3.2.2 step 2b), `hoState: NONE` when a handover
+/// preparation did (§5.2.2.3.4.2 step 2b), and with `n2` the N2 SM information
+/// (`n2SmInfo` + `n2SmInfoType`) as a binary NGAP part.
+pub(crate) fn sm_context_update_error_with(
+    status: u16,
+    cause: &str,
+    detail: &str,
+    extra: serde_json::Value,
+    n2: Option<(&str, Vec<u8>)>,
+) -> SbiResponse {
+    let mut body = serde_json::json!({
+        "error": { "status": status, "cause": cause, "detail": detail },
+    });
+    if let (Some(root), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
+        for (k, v) in extra {
+            root.insert(k.clone(), v.clone());
+        }
+    }
+    if let Some((n2_type, _)) = &n2 {
+        body["n2SmInfo"] = serde_json::json!({ "contentId": "n2SmInfo" });
+        body["n2SmInfoType"] = serde_json::json!(n2_type);
+    }
+    let mut resp = SbiResponse::with_status(status).with_body(
+        body.to_string(),
+        nextgcore_sbi::constants::content_type::APPLICATION_JSON,
+    );
+    if let Some((_, bytes)) = n2 {
+        resp = resp.with_part(nextgcore_sbi::message::SbiPart::with_content(
+            "n2SmInfo",
+            nextgcore_sbi::constants::content_type::APPLICATION_NGAP,
+            bytes::Bytes::from(bytes),
+        ));
+    }
+    resp
 }
 
 /// TS 29.502 §5.2.2.2.3: the SMF's answer to an EPS→5GS handover preparation.
@@ -1440,7 +1477,11 @@ async fn handle_completed_inner(
     };
     if let Err(e) = switched {
         log::warn!("SM Context Update (COMPLETED) for ref={sm_context_ref}: DL switch failed: {e}");
-        return SbiResponse::with_status(504);
+        return sm_context_error(
+            504,
+            "UPF_NOT_RESPONDING",
+            "the UPF did not switch the downlink to the target",
+        );
     }
     // #750: onto the session as it is now, not the copy read before the UPF round trip.
     let mut sess = sess.and_then(|old| {

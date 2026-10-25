@@ -1703,8 +1703,21 @@ impl DefaultDnnError {
             // The consumer's request is incomplete for THIS network: it named no
             // DNN and the subscription does not supply one either.
             Self::NoSubscribedDnn | Self::AmbiguousDefault(_) => "MANDATORY_IE_MISSING",
-            // Not the consumer's fault — the SMF could not reach the data it needs.
-            Self::NoUdmEndpoint | Self::SdmRequestFailed(_) => "SUBSCRIPTION_DATA_NOT_AVAILABLE",
+            // Not the consumer's fault -- the SMF could not reach the data it needs
+            // (#1097 review m2: TS 29.500 Table 5.2.7.2-1 causes, at 500 / 504).
+            Self::NoUdmEndpoint => "NETWORK_FAILURE",
+            Self::SdmRequestFailed(_) => "PEER_NOT_RESPONDING",
+        }
+    }
+
+    /// The HTTP status that goes with [`Self::cause`]: 400 for the consumer's
+    /// incomplete request; 500 with no UDM to ask; 504 when the UDM did not answer
+    /// (#1097 review m2).
+    fn status(&self) -> u16 {
+        match self {
+            Self::NoSubscribedDnn | Self::AmbiguousDefault(_) => 400,
+            Self::NoUdmEndpoint => 500,
+            Self::SdmRequestFailed(_) => 504,
         }
     }
 
@@ -3517,8 +3530,10 @@ fn validate_sm_context_create_data(body: &serde_json::Value) -> Option<&'static 
     // n1SmMsg (C — required at establishment): present either as a
     // RefToBinaryData pointer ({contentId}) or as a legacy base64 string.
     let n1 = &body["n1SmMsg"];
+    // #1097 review m1: a missing mandatory IE is a 400 MANDATORY_IE_MISSING
+    // (TS 29.500 Table 5.2.7.2-1); N1_SM_ERROR is a 403 cause, for an erroneous one.
     if n1["contentId"].as_str().is_none() && n1.as_str().is_none() {
-        return Some("N1_SM_ERROR");
+        return Some("MANDATORY_IE_MISSING");
     }
     None
 }
@@ -3638,7 +3653,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                 Ok(d) => d,
                 Err(e) => {
                     log::warn!("[{supi}] no DNN for this session: {}", e.detail());
-                    return eps_to_5gs::sm_context_error(400, e.cause(), &e.detail());
+                    return eps_to_5gs::sm_context_error(e.status(), e.cause(), &e.detail());
                 }
             }
         }
@@ -3699,7 +3714,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                 }
                 None => {
                     return eps_to_5gs::sm_context_error(
-                        400,
+                        403,
                         "N1_SM_ERROR",
                         "n1SmMsg is not a PDU Session Establishment Request",
                     )
@@ -3710,7 +3725,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                 // binary part is absent / not decodable — reject (smfd-06).
                 log::error!("SmContextCreateData n1SmMsg present but binary part missing/invalid");
                 return eps_to_5gs::sm_context_error(
-                    400,
+                    403,
                     "N1_SM_ERROR",
                     "n1SmMsg binary part missing or invalid",
                 );
@@ -3819,7 +3834,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
             }
         }
     } else {
-        return SbiResponse::with_status(500);
+        return eps_to_5gs::sm_context_error(500, "SYSTEM_FAILURE", "SMF context unavailable");
     }
 
     log::info!(
@@ -4709,10 +4724,12 @@ fn activation_response(sm_context_ref: &str) -> SbiResponse {
         lookup_policy_binding(sm_context_ref),
     ) else {
         log::warn!("UP activation for ref={sm_context_ref}: no recorded UPF endpoint or binding");
-        return eps_to_5gs::sm_context_error(
+        return eps_to_5gs::sm_context_update_error_with(
             500,
             "SYSTEM_FAILURE",
             "No user plane recorded to activate",
+            serde_json::json!({ "upCnxState": "DEACTIVATED" }),
+            None,
         );
     };
     let n2 = match build_setup_request_transfer(
@@ -4725,10 +4742,12 @@ fn activation_response(sm_context_ref: &str) -> SbiResponse {
         Ok(bytes) => bytes,
         Err(e) => {
             log::error!("UP activation for ref={sm_context_ref}: transfer encode failed: {e:?}");
-            return eps_to_5gs::sm_context_error(
+            return eps_to_5gs::sm_context_update_error_with(
                 500,
                 "SYSTEM_FAILURE",
                 "N2 SM information encode failed",
+                serde_json::json!({ "upCnxState": "DEACTIVATED" }),
+                None,
             );
         }
     };
@@ -4759,6 +4778,21 @@ fn activation_response(sm_context_ref: &str) -> SbiResponse {
 ///
 /// 500 SYSTEM_FAILURE when establishment recorded no UPF endpoint or binding: the AMF
 /// then leaves the session out of the handover.
+/// The SmContextUpdateError of a HANDOVER_REQUIRED the SMF cannot prepare (#1097
+/// review M3, TS 29.502 §5.2.2.3.4.2 step 2b): `hoState: NONE`, and the N2 SM
+/// information a Handover Preparation Unsuccessful Transfer (TS 38.413 §9.3.4.18)
+/// for the AMF to put in the Handover Preparation Failure.
+fn handover_preparation_failed(status: u16, cause: &str, detail: &str) -> SbiResponse {
+    let n2 = n2_transfer::handover_preparation_unsuccessful_transfer(&[]).ok();
+    eps_to_5gs::sm_context_update_error_with(
+        status,
+        cause,
+        detail,
+        serde_json::json!({ "hoState": "NONE" }),
+        n2.map(|bytes| ("HANDOVER_PREP_FAIL", bytes)),
+    )
+}
+
 fn handover_preparing_response(sm_context_ref: &str, required: Option<&[u8]>) -> SbiResponse {
     use nextgcore_sbi::constants::content_type;
     use nextgcore_sbi::message::SbiPart;
@@ -4781,7 +4815,7 @@ fn handover_preparing_response(sm_context_ref: &str, required: Option<&[u8]>) ->
             "SM Context Update (HANDOVER_REQUIRED) for ref={sm_context_ref}: no recorded UPF \
              endpoint or binding, so the session cannot be handed over"
         );
-        return eps_to_5gs::sm_context_error(
+        return handover_preparation_failed(
             500,
             "SYSTEM_FAILURE",
             "No user plane recorded to hand over",
@@ -4794,8 +4828,9 @@ fn handover_preparing_response(sm_context_ref: &str, required: Option<&[u8]>) ->
                 "SM Context Update (HANDOVER_REQUIRED) for ref={sm_context_ref}: undecodable \
                  HandoverRequiredTransfer: {e:?}"
             );
-            return eps_to_5gs::sm_context_error(
-                400,
+            // #1097 review m1: N2_SM_ERROR is a 403 cause (TS 29.502 Table 6.1.7.3-1).
+            return handover_preparation_failed(
+                403,
                 "N2_SM_ERROR",
                 "n2SmInfo is not a HandoverRequiredTransfer",
             );
@@ -4824,7 +4859,7 @@ fn handover_preparing_response(sm_context_ref: &str, required: Option<&[u8]>) ->
             log::error!(
                 "HANDOVER_REQUIRED for ref={sm_context_ref}: transfer encode failed: {e:?}"
             );
-            return eps_to_5gs::sm_context_error(
+            return handover_preparation_failed(
                 500,
                 "SYSTEM_FAILURE",
                 "N2 SM information encode failed",
@@ -5218,7 +5253,7 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
             // base64 string — `resolve_binary_ref` accepts both.
             let Some(n2_bytes) = resolve_binary_ref(request, &req_body["n2SmInfo"]) else {
                 return eps_to_5gs::sm_context_error(
-                    400,
+                    403,
                     "N2_SM_ERROR",
                     "n2SmInfo missing or not valid base64",
                 );
@@ -5233,7 +5268,7 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
             };
             let Some((gnb_teid, gnb_addr, qfi)) = endpoint else {
                 return eps_to_5gs::sm_context_error(
-                    400,
+                    403,
                     "N2_SM_ERROR",
                     "could not decode gNB DL F-TEID from N2 SM transfer",
                 );
@@ -5254,7 +5289,13 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                 // No N4 session exists for this context — fabricating a SEID
                 // would target an unrelated session
                 log::error!("No stored UPF SEID for ref={sm_context_ref}");
-                return SbiResponse::with_status(404);
+                return eps_to_5gs::sm_context_update_error_with(
+                    404,
+                    "CONTEXT_NOT_FOUND",
+                    "no N4 session for this SM context",
+                    serde_json::json!({ "upCnxState": "DEACTIVATED" }),
+                    None,
+                );
             };
             match pfcp_session_modify(
                 smf_n4_seid_for(sm_context_ref),
@@ -5271,7 +5312,14 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                 }
                 Err(e) => {
                     log::error!("PFCP Session Modification failed: {e}");
-                    return SbiResponse::with_status(504);
+                    // #1097 review M2: the activation failed (TS 29.502 §5.2.2.3.2.2).
+                    return eps_to_5gs::sm_context_update_error_with(
+                        504,
+                        "UPF_NOT_RESPONDING",
+                        "the UPF did not activate the downlink",
+                        serde_json::json!({ "upCnxState": "DEACTIVATED" }),
+                        None,
+                    );
                 }
             }
 
@@ -5364,14 +5412,14 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
             // base64 string — `resolve_binary_ref` accepts both.
             let Some(n1_sm_msg) = resolve_binary_ref(request, &req_body["n1SmMsg"]) else {
                 return eps_to_5gs::sm_context_error(
-                    400,
+                    403,
                     "N1_SM_ERROR",
                     "n1SmMsg missing or not valid base64",
                 );
             };
             let Some(hdr) = policy::parse_n1_sm_header(&n1_sm_msg) else {
                 return eps_to_5gs::sm_context_error(
-                    400,
+                    403,
                     "N1_SM_ERROR",
                     "n1SmMsg is not a 5GSM message",
                 );
@@ -5458,7 +5506,11 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                 .await
                 {
                     log::error!("{e}");
-                    return SbiResponse::with_status(504);
+                    return eps_to_5gs::sm_context_error(
+                        504,
+                        "UPF_NOT_RESPONDING",
+                        "the UPF did not apply the modification",
+                    );
                 }
                 // Persist the new authorized AMBR in the binding
                 if let Ok(ctx) = smf_self().read() {
@@ -5486,7 +5538,11 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                 Ok(bytes) => bytes,
                 Err(e) => {
                     log::error!("Failed to encode PDUSessionResourceModifyRequestTransfer: {e:?}");
-                    return SbiResponse::with_status(500);
+                    return eps_to_5gs::sm_context_error(
+                        500,
+                        "SYSTEM_FAILURE",
+                        "N2 SM information encode failed",
+                    );
                 }
             };
 
@@ -5518,7 +5574,11 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                         pfcp_deactivate_dl_far(smf_n4_seid_for(sm_context_ref), upf_seid).await
                     {
                         log::warn!("DL FAR deactivation failed: {e}");
-                        return SbiResponse::with_status(504);
+                        return eps_to_5gs::sm_context_error(
+                            504,
+                            "UPF_NOT_RESPONDING",
+                            "the UPF did not deactivate the downlink",
+                        );
                     }
                 }
                 // #540: record it. The Downlink Data Report handler pages only for a
@@ -5611,7 +5671,7 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
         "PDU_RES_MOD_IND" => {
             let Some(n2_bytes) = resolve_binary_ref(request, &req_body["n2SmInfo"]) else {
                 return eps_to_5gs::sm_context_error(
-                    400,
+                    403,
                     "N2_SM_ERROR",
                     "n2SmInfo missing or not valid base64",
                 );
@@ -5651,7 +5711,7 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
         other => {
             log::warn!("SM Context Update: unsupported n2SmInfoType '{other}'");
             eps_to_5gs::sm_context_error(
-                400,
+                403,
                 "N2_SM_ERROR",
                 &format!("unsupported n2SmInfoType {other}"),
             )
@@ -7854,7 +7914,7 @@ fn classify_n1_sm_message(n1: &[u8]) -> Option<N1SmIntent> {
 async fn handle_n1_sm_message(sm_context_ref: &str, n1: &[u8]) -> SbiResponse {
     let Some(intent) = classify_n1_sm_message(n1) else {
         return eps_to_5gs::sm_context_error(
-            400,
+            403,
             "N1_SM_ERROR",
             "n1SmMsg is not a 5GSM message (EPD is not 0x2E, or it is too short)",
         );
@@ -7955,7 +8015,7 @@ async fn handle_n1_sm_message(sm_context_ref: &str, n1: &[u8]) -> SbiResponse {
                  is not handled on /modify"
             );
             eps_to_5gs::sm_context_error(
-                400,
+                403,
                 "N1_SM_ERROR",
                 &format!("unhandled 5GSM message type {message_type:#04x}"),
             )
@@ -12650,7 +12710,10 @@ mod tests {
 
         let mut no_n1 = matched_sim.clone();
         no_n1["n1SmMsg"] = serde_json::Value::Null;
-        assert_eq!(validate_sm_context_create_data(&no_n1), Some("N1_SM_ERROR"));
+        assert_eq!(
+            validate_sm_context_create_data(&no_n1),
+            Some("MANDATORY_IE_MISSING")
+        );
     }
 
     // ------------------------------- #204 -------------------------------
@@ -12763,13 +12826,18 @@ mod tests {
             "MANDATORY_IE_MISSING"
         );
         assert_eq!(
-            DefaultDnnError::NoUdmEndpoint.cause(),
-            "SUBSCRIPTION_DATA_NOT_AVAILABLE"
+            (
+                DefaultDnnError::NoUdmEndpoint.cause(),
+                DefaultDnnError::NoUdmEndpoint.status()
+            ),
+            ("NETWORK_FAILURE", 500)
         );
+        let failed = DefaultDnnError::SdmRequestFailed("boom".into());
         assert_eq!(
-            DefaultDnnError::SdmRequestFailed("boom".into()).cause(),
-            "SUBSCRIPTION_DATA_NOT_AVAILABLE"
+            (failed.cause(), failed.status()),
+            ("PEER_NOT_RESPONDING", 504)
         );
+        assert_eq!(DefaultDnnError::NoSubscribedDnn.status(), 400);
 
         // Every detail says which failure it was, and none of them says "internet".
         for e in [
@@ -13213,10 +13281,11 @@ mod tests {
             .with_body(body.to_string(), "application/json");
         let resp = handle_sm_context_create(&request).await;
 
-        assert_eq!(resp.status, 400, "an unresolvable DNN refuses the session");
+        // #1097 review m2: no UDM to ask is the SMF's failure, not a bad request.
+        assert_eq!(resp.status, 500, "an unresolvable DNN refuses the session");
         let content = resp.http.content.as_deref().unwrap_or("");
         assert!(
-            content.contains("SUBSCRIPTION_DATA_NOT_AVAILABLE"),
+            content.contains("NETWORK_FAILURE"),
             "the cause must name the real problem, got {content}"
         );
         assert!(
@@ -17888,7 +17957,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn n1_message_for_an_unknown_context_is_404_and_a_malformed_one_400() {
+    async fn n1_message_for_an_unknown_context_is_404_and_a_malformed_one_403() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         smf_context_init(64, 256, 512);
         let resp = handle_n1_sm_message(
@@ -17908,7 +17977,8 @@ mod tests {
         // Not a 5GSM container at all: refused as malformed rather than silently
         // ignored, which is what the old handler did to every N1 message.
         let resp = handle_n1_sm_message(reference, &[0x7E, 0x00, 0x41, 0x09]).await;
-        assert_eq!(resp.status, 400);
+        // #1097 review m1: N1_SM_ERROR is a 403 cause (TS 29.502 Table 6.1.7.3-1).
+        assert_eq!(resp.status, 403);
     }
 
     // ---- criterion 4: T3591/T3592 retransmit and exhaust ----
@@ -19258,6 +19328,175 @@ mod tests {
             body["detail"].is_string(),
             "a ProblemDetails must carry a detail a consumer can log"
         );
+    }
+
+    /// The error body of an SM Context Create/Update answer, checked for the
+    /// SmContextCreateError / SmContextUpdateError shape (#1097): the ProblemDetails
+    /// in "error", as application/json, no top-level cause.
+    fn sm_context_error_of(resp: &SbiResponse) -> serde_json::Value {
+        assert_eq!(
+            resp.http.get_header("Content-Type").map(String::as_str),
+            Some(nextgcore_sbi::constants::content_type::APPLICATION_JSON),
+            "status {}",
+            resp.status
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("a body")).expect("json");
+        assert!(
+            body.get("cause").is_none(),
+            "not a bare ProblemDetails: {body}"
+        );
+        assert_eq!(
+            body["error"]["status"],
+            serde_json::json!(resp.status),
+            "{body}"
+        );
+        body
+    }
+
+    /// #1097 review M4: the SMF's own SM Context Create and Update errors, a row per
+    /// kind, are each an SmContextCreateError / SmContextUpdateError with the right
+    /// status and cause -- with `upCnxState: DEACTIVATED` on a failed activation and
+    /// `hoState: NONE` plus a Handover Preparation Unsuccessful Transfer on a failed
+    /// handover preparation (TS 29.502 §5.2.2.3.2.2, §5.2.2.3.4.2).
+    #[tokio::test]
+    async fn sm_context_errors_are_create_and_update_errors() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        smf_context_init(64, 256, 512);
+        let post = |path: &str, body: &str| {
+            SbiRequest::post(path).with_body(body.to_string(), "application/json")
+        };
+        let create = "/nsmf-pdusession/v1/sm-contexts";
+        let rows: Vec<(&str, SbiResponse, u16, &str)> = vec![
+            (
+                "create: not JSON",
+                handle_sm_context_create(&post(create, "{")).await,
+                400,
+                "INVALID_MSG_FORMAT",
+            ),
+            (
+                "create: no pduSessionId",
+                handle_sm_context_create(&post(
+                    create,
+                    &serde_json::json!({ "sNssai": { "sst": 1 }, "n1SmMsg": { "contentId": "n1SmMsg" } }).to_string(),
+                ))
+                .await,
+                400,
+                "MANDATORY_IE_INCORRECT",
+            ),
+            (
+                "create: no n1SmMsg",
+                handle_sm_context_create(&post(
+                    create,
+                    &serde_json::json!({ "pduSessionId": 5, "sNssai": { "sst": 1 } }).to_string(),
+                ))
+                .await,
+                400,
+                "MANDATORY_IE_MISSING",
+            ),
+            (
+                "update: not JSON",
+                handle_sm_context_update("no-such-1097", &post("/x/modify", "{")).await,
+                400,
+                "INVALID_MSG_FORMAT",
+            ),
+            (
+                "update: unknown ref",
+                handle_sm_context_update("no-such-1097", &post("/x/modify", "{}")).await,
+                404,
+                "CONTEXT_NOT_FOUND",
+            ),
+        ];
+        let known = seed_registered_session("imsi-001010000010970", 9, "internet");
+        let rows2: Vec<(&str, SbiResponse, u16, &str)> = vec![
+            (
+                "update: unsupported n2SmInfoType",
+                handle_sm_context_update(
+                    &known,
+                    &post(
+                        "/x/modify",
+                        r#"{"n2SmInfoType":"NO_SUCH_TYPE","n2SmInfo":{"contentId":"n2SmInfo"}}"#,
+                    ),
+                )
+                .await,
+                403,
+                "N2_SM_ERROR",
+            ),
+            (
+                "update: PDU_RES_MOD_REQ without its N1",
+                handle_sm_context_update(
+                    &known,
+                    &post("/x/modify", r#"{"n2SmInfoType":"PDU_RES_MOD_REQ"}"#),
+                )
+                .await,
+                403,
+                "N1_SM_ERROR",
+            ),
+        ];
+        for (what, resp, status, cause) in rows.iter().chain(rows2.iter()) {
+            assert_eq!(resp.status, *status, "{what}: {:?}", resp.http.content);
+            let body = sm_context_error_of(resp);
+            assert_eq!(body["error"]["cause"], *cause, "{what}");
+        }
+
+        // A failed activation says the user plane is DEACTIVATED.
+        let activation = activation_response(&known);
+        assert_eq!(activation.status, 500);
+        let body = sm_context_error_of(&activation);
+        assert_eq!(body["upCnxState"], "DEACTIVATED");
+
+        // A failed handover preparation: hoState NONE and the N2 Handover Preparation
+        // Unsuccessful Transfer.
+        let handover = handover_preparing_response(&known, None);
+        assert_eq!(handover.status, 500);
+        let body = sm_context_error_of(&handover);
+        assert_eq!(body["hoState"], "NONE");
+        assert_eq!(body["n2SmInfoType"], "HANDOVER_PREP_FAIL");
+        assert!(handover
+            .http
+            .parts
+            .iter()
+            .any(|p| p.content_id.as_deref() == Some("n2SmInfo") && !p.data.is_empty()));
+
+        if let Ok(ctx) = smf_self().read() {
+            if let Some(sess) = ctx.sess_find_by_sm_context_ref(&known) {
+                ctx.sess_remove(sess.id);
+            }
+        }
+    }
+
+    /// #1097 review M4, the guard over every site: no SM Context Create or Update
+    /// path answers an error any other way than through `eps_to_5gs::sm_context_*`
+    /// (or the N1-bearing `sm_context_create_error`). A bare ProblemDetails or an
+    /// empty error body reintroduced at any of them fails this.
+    #[test]
+    fn no_create_or_update_path_answers_a_bare_problem_details() {
+        let source = include_str!("main.rs");
+        for function in [
+            "async fn handle_sm_context_create(",
+            "async fn handle_sm_context_update(",
+            "fn activation_response(",
+            "fn handover_preparing_response(",
+            "fn handover_allocation_failed_response(",
+            "async fn handle_n1_sm_message(",
+            "async fn ran_released_session(",
+        ] {
+            let start = source
+                .find(function)
+                .unwrap_or_else(|| panic!("{function} exists"));
+            let end = start + source[start..].find("\n}\n").expect("its end");
+            let body = &source[start..end];
+            for bare in ["problem_400(", "problem_404(", "problem_response("] {
+                assert!(!body.contains(bare), "{function} answers through {bare}");
+            }
+            for status in 400..600 {
+                let empty = format!("SbiResponse::with_status({status});");
+                assert!(
+                    !body.contains(&empty),
+                    "{function} answers {status} with no body"
+                );
+            }
+        }
     }
 
     /// #78 criterion 3: Update on an unknown ref is 404 + ProblemDetails, and on a
