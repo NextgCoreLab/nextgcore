@@ -2225,7 +2225,8 @@ struct SessionRouting {
 }
 
 /// How many times the routing state was read (#1150 review m5): a scope must read
-/// it once, however many sessions it covers.
+/// it once, however many sessions it covers. Process-global: a test that measures
+/// it holds `PROCESS_STATE_TEST_LOCK` (#1150 review round 2 n1).
 #[cfg(test)]
 pub(crate) static SESSION_ROUTING_READS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);

@@ -15707,6 +15707,175 @@ mod tests {
         assert_eq!(after, 2, "the failed NSACF is discovered again");
     }
 
+    /// #1150 review round 2 N1: an NSACF that answers an INCREASE or a DECREASE with
+    /// a 5xx is dropped from the discovery cache too, not only one that does not
+    /// answer.
+    ///
+    /// REVERT-VERIFIED: without the 5xx forgets the NSACF is reused for its whole
+    /// validity.
+    #[tokio::test]
+    async fn an_nsacf_answering_5xx_is_discovered_again() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        std::env::remove_var("NSACF_URI");
+        let (nsacf, nsacf_addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(|_req: SbiRequest| async {
+                SbiResponse::with_status(503)
+            })
+            .await;
+        let nsacf_port = nsacf_addr.port();
+        let discoveries = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = discoveries.clone();
+        let (nrf, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |_req: SbiRequest| {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    SbiResponse::with_status(200)
+                        .with_json_body(&serde_json::json!({
+                            "validityPeriod": 3600,
+                            "nfInstances": [{
+                                "nfInstanceId": "nsacf-1150-503",
+                                "nfType": "NSACF",
+                                "ipv4Addresses": ["127.0.0.1"],
+                                "nfServices": [{
+                                    "serviceName": "nnsacf-nsac",
+                                    "ipEndPoints": [{ "port": nsacf_port }],
+                                }],
+                            }],
+                        }))
+                        .unwrap()
+                }
+            })
+            .await;
+        global_context()
+            .set_nrf_uri(format!("http://127.0.0.1:{}", addr.port()))
+            .await;
+        let count = || discoveries.load(std::sync::atomic::Ordering::SeqCst);
+        let found = policy::resolve_nsacf_endpoint().await.expect("discovered");
+        let first = count();
+        let admission =
+            policy::nsac_pdu_session_admit(&found, "smf-1150", "imsi-001010000011501", 5, 1, None)
+                .await;
+        let found = policy::resolve_nsacf_endpoint()
+            .await
+            .expect("discovered again");
+        let after_increase = count();
+        let decreased = policy::nsac_pdu_session_release(
+            &found,
+            "smf-1150",
+            "imsi-001010000011501",
+            5,
+            1,
+            None,
+        )
+        .await;
+        let _ = policy::resolve_nsacf_endpoint().await;
+        let after_decrease = count();
+        global_context().clear_nrf_uri().await;
+        nrf.stop().await.ok();
+        nsacf.stop().await.ok();
+        assert_eq!(first, 1);
+        assert_eq!(admission, policy::NsacAdmission::Unavailable);
+        assert_eq!(after_increase, 2, "a 5xx INCREASE drops the cached NSACF");
+        assert!(!decreased);
+        assert_eq!(after_decrease, 3, "a 5xx DECREASE drops it too");
+    }
+
+    /// #1150 review round 2 N2: a FAR-peer change still waiting for its coalesced
+    /// write is written by the graceful shutdown, at once, not lost with the runtime
+    /// before the 200 ms writer fires.
+    ///
+    /// REVERT-VERIFIED: without the shutdown's flush nothing is written before the
+    /// writer's delay.
+    #[tokio::test]
+    async fn the_shutdown_writes_a_pending_coalesced_change() {
+        use crate::n4_build::{build_session_modification_request, SessionModificationParams};
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        smf_context_init(64, 256, 512);
+        let path = std::env::temp_dir().join(format!(
+            "nextgcore-smf-state-{}-1150-flush-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let reference = "11501".to_string();
+        let seid = context::derive_cp_n4_seid(&reference);
+        let handle = smf_self();
+        {
+            let mut ctx = handle.write().unwrap();
+            ctx.set_state_file(path.clone()).expect("state file");
+            ctx.pfcp_sessions
+                .write()
+                .unwrap()
+                .insert(reference.clone(), 0x1150);
+        }
+        let accepted = [0u8, 19, 0, 1, 1];
+        let far = crate::n4_build::build_create_far(&crate::n4_build::FarParams {
+            far_id: 2,
+            apply_action: crate::n4_build::apply_action::FORW,
+            destination_interface: Some(0),
+            outer_header_creation: Some((0x0100, 0x77, Some([10, 0, 0, 5]), None)),
+            network_instance: None,
+        });
+        let mut est = crate::n4_build::PfcpMessageBuilder::new();
+        est.add_tlv(crate::n4_build::pfcp_ie::CREATE_FAR, &far);
+        let before = handle
+            .read()
+            .unwrap()
+            .persist_writes
+            .load(Ordering::Relaxed);
+        let started = std::time::Instant::now();
+        assert!(handle
+            .read()
+            .unwrap()
+            .note_far_edits(seid, 50, &est.build(), &accepted));
+        let moved = build_session_modification_request(&SessionModificationParams {
+            update_fars_activate: vec![(
+                2,
+                0,
+                Some((0x0100, 0x78, Some([10, 0, 0, 6]), None)),
+                false,
+            )],
+            ..Default::default()
+        });
+        assert!(handle
+            .read()
+            .unwrap()
+            .note_far_edits(seid, 52, &moved, &accepted));
+        let listener = tokio::spawn(async {});
+        graceful_shutdown(
+            async {},
+            &[],
+            false,
+            listener,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .await;
+        let written = handle
+            .read()
+            .unwrap()
+            .persist_writes
+            .load(Ordering::Relaxed)
+            - before;
+        let took = started.elapsed();
+        {
+            let mut ctx = handle.write().unwrap();
+            ctx.pfcp_sessions.write().unwrap().remove(&reference);
+            ctx.far_peers.write().unwrap().remove(&seid);
+            ctx.clear_state_file_for_test();
+        }
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            took < context::PERSIST_COALESCE,
+            "measured before the writer's own delay: {took:?}"
+        );
+        assert_eq!(written, 1, "the shutdown wrote the pending change");
+    }
+
     /// #1075 (#1028 round 2 m2): a burst of FAR-peer changes on durable sessions is
     /// written once, not once per change, and a pending write is not lost: it lands
     /// within the coalescing delay.

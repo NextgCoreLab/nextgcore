@@ -550,7 +550,9 @@ pub async fn resolve_nsacf_endpoint() -> Option<NsacfEndpoint> {
 }
 
 /// The NSACF discovered through each NRF, until its result's validity ends
-/// (#1075). Keyed by the NRF URI, so a different NRF is asked afresh.
+/// (#1075). Keyed by the NRF URI, so a different NRF is asked afresh. Process-
+/// global: a test that sets an NRF and resolves through it holds
+/// `PROCESS_STATE_TEST_LOCK` (#1150 review round 2 n1).
 static NSACF_DISCOVERY_CACHE: std::sync::Mutex<
     Option<std::collections::HashMap<String, (NsacfEndpoint, std::time::Instant)>>,
 > = std::sync::Mutex::new(None);
