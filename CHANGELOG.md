@@ -26,6 +26,19 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 - amfd: a `guami`, `tai`, `plmn_support`, `integrity_order` or `ciphering_order` list in the
   config replaces the AMF's list instead of being appended to it (#1070).
 
+### Upgrade notes
+- **PFCP Recovery Time Stamp, 0.1.0 peers (#1033).** TS 29.244 §8.2.65 defines the Recovery
+  Time Stamp only as NTP-era seconds (since 1900-01-01). 0.1.0 sent Unix seconds; 0.2.0 sends
+  NTP seconds (#995). 0.2.0 still accepts a 0.1.0 peer's Unix-seconds stamp: smfd, sgwcd,
+  sgwud and upfd read a received or stored stamp in whichever era is closer to the local clock
+  (`nextgcore_pfcp::recovery_time::normalize_received`), so a 0.1.0 to 0.2.0 rolling upgrade
+  detects peer restarts correctly (TS 23.007 §19A). smfd converts the `upfRecoveryTimeStamps`
+  a 0.1.0 snapshot holds on load and persists them in NTP form, so one smfd restart under 0.2.0
+  fixes the stored stamps. The shim will be removed in a later release, announced in that
+  release's upgrade notes. From then on a peer's Unix-seconds stamp reads as a time ~70 years
+  off, so its restarts are missed or falsely detected. Every PFCP function must run 0.2.0 or
+  later before any of them moves past that release.
+
 ## [0.2.0] — Unreleased (draft for operator review)
 
 Draft built from the PRs merged into `main` since the 0.1.0 tag (2026-07-02), cross-checked
@@ -170,6 +183,15 @@ before the tag. The validation line is filled from the release run, not carried 
     the shared `nextgcore-pfcp` codec: sgwud with sgwcd, and upfd with smfd, for the
     PFCP Node Report (#994, #1028).
   A rolling upgrade must move each CP/UP pair at the same time.
+- **Operational change:** smfd registers with the NRF as `UNDISCOVERABLE`. It turns `REGISTERED`
+  only once the N4 association its new sessions use is up, and goes back to `UNDISCOVERABLE`
+  while that association is down (TS 29.510 Table 6.1.6.3.7-1, §5.2.2.3.2). A restarted SMF
+  is no longer discovered before it has a UPF.
+  - amfd re-selects an SMF on a 504 UPF_NOT_RESPONDING within the #796 window, instead of
+    answering 5GSM #26.
+  - upfd holds a Setup from an address its host-named PFCP allowlist does not list, while the
+    names are re-resolved off the receive task, and judges it against the fresh answer. Still
+    fail-closed (#1112).
 - **Deploy together (GTPv2-C S5/S8):** smfd (PGW-C) and sgwcd (SGW-C) now put every
   F-TEID at the IE instance TS 29.274 gives it (#1113):
   - smfd's Create Session Response carries the PGW S5/S8-C F-TEID at instance 1 (Table
@@ -193,7 +215,9 @@ before the tag. The validation line is filled from the release run, not carried 
   clock reads before 2020-01-01, because their PFCP Recovery Time Stamp, now NTP-era seconds per
   TS 29.244 §8.2.65 (#995, #1004), would be wrong. On RTC-less hosts, start them after
   `time-sync.target`, give the pod an NTP-wait init container, or rely on the restart policy
-  (#1040). See the configuration overview, "A set clock is required".
+  (#1040). See the configuration overview, "A set clock is required". 0.2.0 still reads a
+  0.1.0 peer's Unix-seconds stamp; see "Upgrade notes" under [Unreleased] for when that ends
+  (#1033).
 - EKS overlay for the matched-pair E2E on a shared cluster (#127), image tags by git SHA (#146,
   #431), rollout reporting (#439).
 - `deploy/eks` script interface `PROFILE=5g|epc|6g` (#656), `e2e-internet.sh` UE-to-internet
