@@ -202,13 +202,13 @@ pub struct BearerResourceCommand {
 pub struct FlowQos {
     /// QCI
     pub qci: u8,
-    /// Maximum Bit Rate Uplink
+    /// Maximum Bit Rate Uplink (kbit/s: TS 29.274 §8.16)
     pub ul_mbr: u64,
-    /// Maximum Bit Rate Downlink
+    /// Maximum Bit Rate Downlink (kbit/s)
     pub dl_mbr: u64,
-    /// Guaranteed Bit Rate Uplink
+    /// Guaranteed Bit Rate Uplink (kbit/s)
     pub ul_gbr: u64,
-    /// Guaranteed Bit Rate Downlink
+    /// Guaranteed Bit Rate Downlink (kbit/s)
     pub dl_gbr: u64,
 }
 
@@ -820,10 +820,12 @@ pub fn handle_bearer_resource_command(
 
     // Update bearer QoS if flow QoS present
     if let Some(ref flow_qos) = cmd.flow_qos {
-        bearer.qos.mbr_uplink = flow_qos.ul_mbr;
-        bearer.qos.mbr_downlink = flow_qos.dl_mbr;
-        bearer.qos.gbr_uplink = flow_qos.ul_gbr;
-        bearer.qos.gbr_downlink = flow_qos.dl_gbr;
+        // #1165: Flow QoS rates are kbit/s on the wire (TS 29.274 §8.16), bit/s here.
+        use crate::gtp_build::gtp2_kbps_to_bps;
+        bearer.qos.mbr_uplink = gtp2_kbps_to_bps(flow_qos.ul_mbr);
+        bearer.qos.mbr_downlink = gtp2_kbps_to_bps(flow_qos.dl_mbr);
+        bearer.qos.gbr_uplink = gtp2_kbps_to_bps(flow_qos.ul_gbr);
+        bearer.qos.gbr_downlink = gtp2_kbps_to_bps(flow_qos.dl_gbr);
     }
 
     // Determine result based on operations
@@ -1443,16 +1445,8 @@ async fn create_session(
     let qos = bc.bearer_qos.as_ref().expect("checked by the parser");
     let mut bearer = crate::context::SmfBearer {
         ebi: bc.ebi,
-        qos: crate::context::Qos {
-            index: qos.qci,
-            arp_priority_level: qos.priority_level,
-            arp_preempt_cap: qos.pre_emption_capability,
-            arp_preempt_vuln: qos.pre_emption_vulnerability,
-            mbr_uplink: qos.ul_mbr,
-            mbr_downlink: qos.dl_mbr,
-            gbr_uplink: qos.ul_gbr,
-            gbr_downlink: qos.dl_gbr,
-        },
+        // #1165: the Bearer QoS's kbit/s (TS 29.274 §8.15) as the bit/s N4 and N2 read.
+        qos: qos.to_qos(),
         ..Default::default()
     };
     if let Some(ref s5u) = bc.s5u_sgw_f_teid {
@@ -2311,10 +2305,10 @@ fn new_bearer_request(
             arp_priority_level: pl,
             arp_preempt_cap: cap,
             arp_preempt_vuln: vuln,
-            mbr_uplink: flow_qos.ul_mbr * 1000,
-            mbr_downlink: flow_qos.dl_mbr * 1000,
-            gbr_uplink: flow_qos.ul_gbr * 1000,
-            gbr_downlink: flow_qos.dl_gbr * 1000,
+            mbr_uplink: crate::gtp_build::gtp2_kbps_to_bps(flow_qos.ul_mbr),
+            mbr_downlink: crate::gtp_build::gtp2_kbps_to_bps(flow_qos.dl_mbr),
+            gbr_uplink: crate::gtp_build::gtp2_kbps_to_bps(flow_qos.ul_gbr),
+            gbr_downlink: crate::gtp_build::gtp2_kbps_to_bps(flow_qos.dl_gbr),
         },
         filters: tad.filters,
         pcc_rule_name: None,
@@ -2605,9 +2599,24 @@ mod tests {
 
     /// Build an S5/S8 Create Session Request the way sgwcd's builder does.
     fn s5c_csr(seq: u32, sgw_c_teid: u32, requested_paa: [u8; 4]) -> bytes::BytesMut {
+        s5c_csr_with_qos(
+            seq,
+            sgw_c_teid,
+            requested_paa,
+            &nextgcore_gtp::v2::Gtp2BearerQosIe::new(9, 0, 0, 0, 0),
+        )
+    }
+
+    /// [`s5c_csr`] with the default bearer's Bearer QoS given (#1165).
+    fn s5c_csr_with_qos(
+        seq: u32,
+        sgw_c_teid: u32,
+        requested_paa: [u8; 4],
+        bearer_qos: &nextgcore_gtp::v2::Gtp2BearerQosIe,
+    ) -> bytes::BytesMut {
         use nextgcore_gtp::v2::{
-            Gtp2ApnIe, Gtp2BearerContextIe, Gtp2BearerQosIe, Gtp2FTeidIe, Gtp2Header, Gtp2Message,
-            Gtp2PaaIe, Gtp2RatTypeIe,
+            Gtp2ApnIe, Gtp2BearerContextIe, Gtp2FTeidIe, Gtp2Header, Gtp2Message, Gtp2PaaIe,
+            Gtp2RatTypeIe,
         };
         let mut msg = Gtp2Message::new(Gtp2Header::new(
             gtp2_message_type::CREATE_SESSION_REQUEST,
@@ -2649,7 +2658,7 @@ mod tests {
         msg.add_ie(Gtp2PaaIe::ipv4(requested_paa).to_ie(0));
         let mut bc = Gtp2BearerContextIe::new();
         bc.set_ebi(5);
-        bc.set_bearer_qos(&Gtp2BearerQosIe::new(9, 0, 0, 0, 0));
+        bc.set_bearer_qos(bearer_qos);
         bc.set_fteid(2, &Gtp2FTeidIe::new_ipv4(4, 0x0505_0505, [127, 0, 0, 1]));
         msg.add_bearer_context(0, &bc);
         msg.encode()
@@ -2926,6 +2935,85 @@ mod tests {
         server.close();
     }
 
+    /// #1165: the Create Session Request's Bearer QoS rates are kbit/s (TS 29.274 §8.15)
+    /// and are stored in the bit/s `context::Qos` holds for N4 and N2; the Create Session
+    /// Response codes them back in kbit/s. They were stored unconverted, so N4 and the
+    /// EPS→5GS mapping read them 1000 times too low. A default bearer is non-GBR (TS
+    /// 23.401 §4.7.2.1) and a conformant SGW sends zero rates for it; non-zero ones here
+    /// are what make the unit observable at the boundary.
+    #[tokio::test]
+    async fn the_bearer_qos_rates_are_kbps_on_s5s8_and_bps_in_the_store() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _upf = crate::pfcp_path::stand_in::associated_upf().await;
+        crate::context::smf_context_init(64, 256, 512);
+        let server = crate::gtp_path::S5S8Server::open("127.0.0.1:0".parse().unwrap(), 3)
+            .await
+            .expect("bind");
+        let sgw = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind sgw");
+        // kbit/s: MBR 128 / 256, GBR 64 / 96.
+        let qos = nextgcore_gtp::v2::Gtp2BearerQosIe::new(9, 128, 256, 64, 96);
+        let mut csr = s5c_csr_with_qos(0x79, 0x1165_0001, [10, 99, 99, 99], &qos);
+        // IMSI ...0x65 is this test's alone (see `establish_over_the_wire`).
+        let imsi_pos = csr
+            .windows(8)
+            .position(|w| w == [0x09, 0x91, 0x07, 0x00, 0x00, 0x00, 0x00, 0x01])
+            .expect("fixture IMSI");
+        csr[imsi_pos + 7] = 0x65;
+        sgw.send_to(&csr, server.local_addr())
+            .await
+            .expect("send csr");
+        let mut buf = vec![0u8; 4096];
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), sgw.recv_from(&mut buf))
+                .await
+                .expect("the PGW-C must answer")
+                .expect("recv");
+        let mut bytes = bytes::Bytes::copy_from_slice(&buf[..len]);
+        let resp = nextgcore_gtp::v2::Gtp2Message::decode(&mut bytes).expect("decode");
+        assert_eq!(
+            resp.get_ie(Gtp2IeType::Cause as u8, 0)
+                .and_then(|ie| ie.value.first().copied()),
+            Some(16)
+        );
+        let sent = resp
+            .bearer_context(0)
+            .expect("bearer context decodes")
+            .expect("Bearer Context Created present")
+            .bearer_qos()
+            .expect("Bearer QoS decodes")
+            .expect("the response carries the bearer's QoS");
+        assert_eq!(
+            (sent.mbr_ul, sent.mbr_dl, sent.gbr_ul, sent.gbr_dl),
+            (128, 256, 64, 96),
+            "kbit/s on the wire, as received"
+        );
+
+        let advertised = resp
+            .get_ie(Gtp2IeType::FTeid as u8, 1)
+            .and_then(|ie| nextgcore_gtp::v2::Gtp2FTeidIe::decode(&ie.value).ok())
+            .expect("the PGW's control F-TEID")
+            .teid;
+        let sess = session_for_teid(Some(advertised)).expect("the stored session");
+        let bearer = crate::context::smf_self()
+            .read()
+            .expect("context")
+            .bearer_find_by_ebi(sess.id, 5)
+            .expect("the default bearer");
+        assert_eq!(
+            (
+                bearer.qos.mbr_uplink,
+                bearer.qos.mbr_downlink,
+                bearer.qos.gbr_uplink,
+                bearer.qos.gbr_downlink
+            ),
+            (128_000, 256_000, 64_000, 96_000),
+            "bit/s in the store"
+        );
+        server.close();
+    }
+
     /// #223 criterion 2, the release half: `gsm_handler::handle_pdu_session_release_request`
     /// runs over a session the CONTEXT holds, and its mutation is observable there.
     ///
@@ -3198,9 +3286,12 @@ mod tests {
         let (server, sgw, sess) = establish_over_the_wire(6, 0x34, 0x3400_0004).await;
 
         // The establishment's Bearer QoS carried all-zero rates, so a non-zero MBR here can
-        // only have come from this command.
-        const GRANTED_UL_MBR: u64 = 3_000;
-        const GRANTED_DL_MBR: u64 = 7_000;
+        // only have come from this command. Flow QoS codes them in kbit/s (TS 29.274
+        // §8.16); the store holds bit/s, as N4 and N2 read them (#1165).
+        const GRANTED_UL_MBR_KBPS: u64 = 3_000;
+        const GRANTED_DL_MBR_KBPS: u64 = 7_000;
+        const GRANTED_UL_MBR: u64 = 3_000_000;
+        const GRANTED_DL_MBR: u64 = 7_000_000;
 
         let brc = {
             use nextgcore_gtp::v2::{Gtp2Header, Gtp2Message};
@@ -3230,7 +3321,7 @@ mod tests {
             // Flow QoS (§8.16): QCI then four 5-octet rates, and NO ARP octet — which is what
             // makes it a different IE from Bearer QoS (§8.15).
             let mut flow_qos = vec![9u8];
-            for rate in [GRANTED_UL_MBR, GRANTED_DL_MBR, 0u64, 0u64] {
+            for rate in [GRANTED_UL_MBR_KBPS, GRANTED_DL_MBR_KBPS, 0u64, 0u64] {
                 flow_qos.extend_from_slice(&rate.to_be_bytes()[3..8]);
             }
             msg.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::from_slice(
@@ -4454,6 +4545,7 @@ mod tests {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _upf = crate::pfcp_path::stand_in::associated_upf().await;
         let (server, sgw, sess) = establish_over_the_wire(7, 0x63, 0x6300_0001).await;
+        let upf = _upf;
 
         const CMD_SEQ: u32 = 0x4242;
         let brc = {
@@ -4509,6 +4601,23 @@ mod tests {
             cbr.get_ie(Gtp2IeType::Pti as u8, 0).map(|ie| ie.value[0]),
             Some(7),
             "and the UE's PTI"
+        );
+        // #1165: kbit/s on S5/S8 both ways, and in the QER's GBR (TS 29.244 §8.2.9),
+        // from the bit/s the bearer holds.
+        let q = cbr
+            .bearer_context(0)
+            .expect("decodes")
+            .expect("a bearer context")
+            .bearer_qos()
+            .expect("decodes")
+            .expect("a Bearer QoS");
+        assert_eq!((q.mbr_ul, q.mbr_dl, q.gbr_ul, q.gbr_dl), (96, 96, 32, 48));
+        let gbr_ie = [0x00, 0x1b, 0x00, 0x0a, 0, 0, 0, 0, 32, 0, 0, 0, 0, 48];
+        assert!(
+            upf.modification_bodies()
+                .iter()
+                .any(|b| b.windows(gbr_ie.len()).any(|w| w == gbr_ie)),
+            "the bearer's QER carries GBR 32/48 kbit/s"
         );
 
         // A retransmission of the Command must not be served again.
