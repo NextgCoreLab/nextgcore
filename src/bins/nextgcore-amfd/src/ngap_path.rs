@@ -1570,8 +1570,10 @@ impl NgapServer {
         self.sessions.read().await.len()
     }
 
-    /// Poll for incoming NGAP messages and server events
-    pub async fn poll(&mut self) -> Result<bool> {
+    /// The timers of this server's own UEs, run first on every [`Self::poll`]. Unlike
+    /// the rest of `poll`, nothing here drains a process-global queue, so a unit test
+    /// can drive it without taking work other tests own (#1120 review).
+    async fn process_local_timers(&mut self) -> Result<()> {
         // Check GMM procedure timers (T3550/T3555/T3560/T3570/T3522 retransmission)
         self.process_nas_timers().await?;
 
@@ -1581,6 +1583,15 @@ impl NgapServer {
 
         // #806: source NG-RAN releases waiting for the step 6a timer.
         self.process_pending_source_releases().await;
+
+        // #923: Release Commands whose Release Complete did not come.
+        self.process_release_guards().await;
+        Ok(())
+    }
+
+    /// Poll for incoming NGAP messages and server events
+    pub async fn poll(&mut self) -> Result<bool> {
+        self.process_local_timers().await?;
 
         // Keep the RAN's view of overload in step with the NAS congestion posture.
         // A no-op unless the posture just changed, and the posture is off by default.
@@ -1607,7 +1618,6 @@ impl NgapServer {
         self.process_supersede_barriers().await;
         self.process_handover_deadlines().await;
         self.process_pending_establishments().await;
-        self.process_release_guards().await;
 
         // Relay any PWS warning containers the Namf non-UE N2 transfer handler
         // enqueued (#396, TS 29.518 §5.2.2.4.1.3 / TS 38.413 §8.12) to the
@@ -35200,9 +35210,9 @@ mod tests {
     /// [`RELEASE_COMPLETE_GUARD`] each release is completed locally (CM-IDLE, mobile
     /// reachable timer). A UE whose matching Complete came is not touched again.
     ///
-    /// REVERT-VERIFIED: without `process_release_guards` in `poll` both UEs stay
-    /// CM-CONNECTED; without the cleanup in `forget_ue` the forgotten UE keeps its
-    /// entry.
+    /// REVERT-VERIFIED: without `process_release_guards` in `process_local_timers`
+    /// both UEs stay CM-CONNECTED; without the cleanup in `forget_ue` the forgotten
+    /// UE keeps its entry.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_release_command_with_no_usable_complete_is_completed_at_the_guard() {
         crate::context::amf_context_init(64, 1024, 4096);
@@ -35238,7 +35248,7 @@ mod tests {
             );
         }
         // Before the guard, nothing either.
-        let _ = ngap.poll().await;
+        ngap.process_local_timers().await.expect("timers");
         assert_eq!(ngap.outstanding_releases.len(), 2);
 
         // A UE forgotten meanwhile (e.g. de-registered) takes its entry with it.
@@ -35253,11 +35263,11 @@ mod tests {
         ngap.forget_ue(gone);
         assert!(!ngap.outstanding_releases.contains_key(&(assoc, gone)));
 
-        // The NGAP task's poll runs the guard.
+        // The NGAP task's local timers run the guard.
         for r in ngap.outstanding_releases.values_mut() {
             r.deadline = Instant::now();
         }
-        let _ = ngap.poll().await;
+        ngap.process_local_timers().await.expect("timers");
         for (ue, _) in &ues[..2] {
             let s = ngap.ue_auth_state.get(*ue).expect("UE kept");
             assert!(s.is_cm_idle(), "UE {ue}: completed locally");
