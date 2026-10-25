@@ -1282,6 +1282,23 @@ async fn a_lookup_waits_for_duplicates_and_yields_to_a_ue_registered_meanwhile()
         settle_offloaded_sbi(&mut peer).await;
     }
     assert!(peer.pending_takeovers.is_empty(), "both were processed");
+    // Both were processed: no UE here holds their 5G-S-TMSI (the fetched context was not
+    // installed beside the fresh registration), so each is answered SERVICE REJECT #9.
+    let sent: Vec<super::handler_tests::Sent> = peer
+        .sent_ngap
+        .take()
+        .unwrap_or_default()
+        .iter()
+        .map(|(_, _, pdu)| super::handler_tests::decode_sent(pdu))
+        .collect();
+    let rejects = sent
+        .iter()
+        .filter(|s| {
+            matches!(s, super::handler_tests::Sent::DownlinkNas { nas_pdu, .. }
+                if nas_pdu[..] == [0x7E, 0x00, 0x4D, 0x09])
+        })
+        .count();
+    assert_eq!(rejects, 2, "each held message is answered: {sent:?}");
     let held: Vec<u64> = peer
         .ue_auth_state
         .snapshot()
@@ -1390,6 +1407,87 @@ async fn a_live_old_amf_forgets_a_taken_over_ue_without_releasing_it() {
     assert_eq!(backend.get(supi).expect("record").amf_instance_id, PEER);
     assert_eq!(backend.get(supi2).expect("record").amf_instance_id, PEER);
     for id in [6_861_701, 6_861_702] {
+        crash(&mut old, id);
+    }
+}
+
+/// **#1185 review m1.** The implicit deregistration timer is the third path that releases
+/// a UE's sessions and policies. At a live old AMF that missed the UDM's notification, a
+/// taken-over UE's timer expires all the same: the store says the UE moved, so it is only
+/// forgotten. A UE whose record is still this AMF's is implicitly deregistered as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_implicit_deregistration_of_a_taken_over_ue_releases_nothing() {
+    use super::super::ue_context_store::UeContextBackend as _;
+    let (_smf, port, seen) = fake_activating_smf().await;
+    let _env = SmfEnvGuard::acquire(port).await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    const OLD: &str = "00000000-0000-4000-8000-0000000001e0";
+    const PEER: &str = "00000000-0000-4000-8000-0000000001e1";
+    let backend = Arc::new(MemoryBackend::default());
+    let mut old = restoring_server().await;
+    old.instance_override = Some(OLD.to_string());
+    old.attach_ue_context_store(Arc::clone(&backend) as Arc<dyn UeContextBackend>);
+    let (moved, kept) = (
+        (6_861_801u64, 0x0686_1801u32),
+        (6_861_802u64, 0x0686_1802u32),
+    );
+    seed_registered_ue(
+        &mut old,
+        moved.0,
+        moved.1,
+        "imsi-001010000686181",
+        "ref-686-z1",
+        port,
+        false,
+    );
+    seed_registered_ue(
+        &mut old,
+        kept.0,
+        kept.1,
+        "imsi-001010000686182",
+        "ref-686-z2",
+        port,
+        false,
+    );
+    store_now(&mut old).await;
+    backend
+        .take_over((0x155, 0x2A, moved.1), PEER)
+        .expect("lookup")
+        .expect("claimed");
+    for id in [moved.0, kept.0] {
+        old.ue_auth_state.with_mut(id, |s| {
+            s.reachability = Some(Reachability {
+                phase: ReachabilityPhase::ImplicitDeregistration,
+                deadline: Instant::now() - Duration::from_millis(1),
+            })
+        });
+    }
+    old.process_reachability_timers().await.expect("timers");
+    for _ in 0..3 {
+        settle_offloaded_sbi(&mut old).await;
+    }
+    assert!(
+        !old.ue_auth_state.contains(moved.0),
+        "the moved UE is forgotten"
+    );
+    assert!(
+        !old.ue_auth_state.contains(kept.0),
+        "the other is deregistered"
+    );
+    let calls = seen.lock().unwrap().clone();
+    assert!(
+        !calls
+            .iter()
+            .any(|(uri, _)| uri.contains("ref-686-z1/release")),
+        "the moved UE's session is not released: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|(uri, _)| uri.contains("ref-686-z2/release")),
+        "the UE still this AMF's is released as before: {calls:?}"
+    );
+    for id in [moved.0, kept.0] {
         crash(&mut old, id);
     }
 }

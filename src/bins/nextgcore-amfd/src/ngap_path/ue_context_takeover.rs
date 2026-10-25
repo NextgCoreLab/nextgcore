@@ -66,6 +66,19 @@ pub(crate) struct DeregOwnerAnswer {
     pub(crate) amf_ue_ngap_id: u64,
     /// The record names another AMF instance: the UE was taken over.
     pub(crate) moved: bool,
+    /// What runs when it was not.
+    pub(crate) then: AfterOwnerCheck,
+}
+
+/// The deregistration an owner check stands before (#1185 review M1, m1). Both release
+/// the UE's PDU sessions and policy associations, which a taken-over UE's are not this
+/// AMF's to release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AfterOwnerCheck {
+    /// The local deregistration a Nudm_UECM_DeregistrationNotification asks for (#602).
+    LocalDeregistration,
+    /// The implicit deregistration timer expired (TS 24.501 §5.3.7).
+    ImplicitDeregistration,
 }
 
 /// Which message a taken-over UE came back with: it decides how its new 5G-GUTI goes out.
@@ -226,9 +239,14 @@ impl NgapServer {
             .pending_takeovers
             .remove(&answer.s_tmsi)
             .unwrap_or_default();
+        // Each held message is processed; one that fails does not drop the others.
         for (association_id, message) in waiting {
-            self.handle_initial_ue_message_with(association_id, &message, false)
-                .await?;
+            if let Err(e) = self
+                .handle_initial_ue_message_with(association_id, &message, false)
+                .await
+            {
+                log::warn!("A held Initial UE Message was not processed: {e}");
+            }
         }
         Ok(())
     }
@@ -417,10 +435,17 @@ impl NgapServer {
         self.forget_global_ue_entries(id, &state);
     }
 
-    /// Before a local deregistration (#602) with the store armed: ask, off the NGAP task,
-    /// whose the UE's record is. `true` when the question was asked (the answer decides,
-    /// [`Self::apply_dereg_owner`]); `false` when the deregistration goes ahead now.
-    pub(super) fn check_owner_before_local_dereg(&mut self, amf_ue_ngap_id: u64) -> bool {
+    /// Before a deregistration that releases the UE's sessions and policies (`then`),
+    /// with the store armed: ask, off the NGAP task, whose the UE's record is. `true` when
+    /// the question was asked (the answer decides, [`Self::apply_dereg_owner`]); `false`
+    /// when the deregistration goes ahead now. A lookup that fails counts as "not moved",
+    /// so the deregistration still runs: an unreachable store must not keep a UE this AMF
+    /// serves registered forever.
+    pub(super) fn check_owner_before(
+        &mut self,
+        amf_ue_ngap_id: u64,
+        then: AfterOwnerCheck,
+    ) -> bool {
         let Some(store) = self.ue_context_store.as_ref() else {
             return false;
         };
@@ -440,6 +465,7 @@ impl NgapServer {
                 DeregOwnerAnswer {
                     amf_ue_ngap_id,
                     moved,
+                    then,
                 },
             ))
         });
@@ -456,11 +482,20 @@ impl NgapServer {
             {
                 self.forget_moved_ue(&supi).await;
             }
-        } else if let Err(e) = self.local_deregistration(answer.amf_ue_ngap_id).await {
-            log::warn!(
-                "Local deregistration for UE {} failed: {e}",
-                answer.amf_ue_ngap_id
-            );
+        } else {
+            match answer.then {
+                AfterOwnerCheck::LocalDeregistration => {
+                    if let Err(e) = self.local_deregistration(answer.amf_ue_ngap_id).await {
+                        log::warn!(
+                            "Local deregistration for UE {} failed: {e}",
+                            answer.amf_ue_ngap_id
+                        );
+                    }
+                }
+                AfterOwnerCheck::ImplicitDeregistration => {
+                    self.implicit_deregistration(answer.amf_ue_ngap_id).await;
+                }
+            }
         }
     }
 }

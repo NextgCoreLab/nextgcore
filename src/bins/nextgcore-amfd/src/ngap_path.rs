@@ -11586,7 +11586,10 @@ impl NgapServer {
                 // taken over by another AMF of the set: its context, sessions and
                 // policy associations moved with it. Asked of the store off the NGAP
                 // task first.
-                if self.check_owner_before_local_dereg(item.amf_ue_ngap_id) {
+                if self.check_owner_before(
+                    item.amf_ue_ngap_id,
+                    ue_context_takeover::AfterOwnerCheck::LocalDeregistration,
+                ) {
                     continue;
                 }
                 if let Err(e) = self.local_deregistration(item.amf_ue_ngap_id).await {
@@ -13084,35 +13087,51 @@ impl NgapServer {
                     // due and start a second implicit deregistration.
                     self.ue_auth_state
                         .with_mut(amf_ue_ngap_id, |s| s.reachability = None);
-                    self.release_all_pdu_sessions(amf_ue_ngap_id).await;
-                    // #622: an implicit deregistration is a deregistration, so the PCF's
-                    // policy associations end with it (TS 23.502 §4.16.3.2). Before
-                    // `forget_ue`, which drops the ids.
-                    self.terminate_policy_associations(amf_ue_ngap_id);
-                    // `forget_ue`, not a bare remove (#356): this path never reaches
-                    // `release_ue` -- deliberately, since no NAS message can be sent to an
-                    // unreachable UE -- so it is the third place an emergency context has
-                    // to be freed.
-                    self.forget_ue(amf_ue_ngap_id);
-                    // The global context's RAN UE and AMF UE entries go too, or the
-                    // implicit deregistration would free the NAS state and leave the NGAP
-                    // one behind -- a UE that is deregistered and still occupies an id.
-                    let handle = crate::context::amf_self();
-                    let ids = handle
-                        .read()
-                        .ok()
-                        .and_then(|ctx| ctx.ran_ue_find_by_amf_ue_ngap_id(amf_ue_ngap_id))
-                        .map(|ran_ue| (ran_ue.id, ran_ue.amf_ue_id));
-                    if let Some((ran_ue_id, amf_ue_id)) = ids {
-                        if let Ok(ctx) = handle.read() {
-                            ctx.ran_ue_remove(ran_ue_id);
-                            ctx.amf_ue_remove(amf_ue_id);
-                        }
+                    // #1185 review m1: with the UE context store, a UE gone quiet here may
+                    // have been taken over by another AMF of the set; its sessions and
+                    // policies are then not this AMF's to release.
+                    if self.check_owner_before(
+                        amf_ue_ngap_id,
+                        ue_context_takeover::AfterOwnerCheck::ImplicitDeregistration,
+                    ) {
+                        continue;
                     }
+                    self.implicit_deregistration(amf_ue_ngap_id).await;
                 }
             }
         }
         Ok(())
+    }
+
+    /// The implicit deregistration of UE `amf_ue_ngap_id` (TS 24.501 §5.3.7): its PDU
+    /// sessions and policy associations are released and its context dropped. No NAS
+    /// message: the UE is unreachable.
+    async fn implicit_deregistration(&mut self, amf_ue_ngap_id: u64) {
+        self.release_all_pdu_sessions(amf_ue_ngap_id).await;
+        // #622: an implicit deregistration is a deregistration, so the PCF's
+        // policy associations end with it (TS 23.502 §4.16.3.2). Before
+        // `forget_ue`, which drops the ids.
+        self.terminate_policy_associations(amf_ue_ngap_id);
+        // `forget_ue`, not a bare remove (#356): this path never reaches
+        // `release_ue` -- deliberately, since no NAS message can be sent to an
+        // unreachable UE -- so it is the third place an emergency context has
+        // to be freed.
+        self.forget_ue(amf_ue_ngap_id);
+        // The global context's RAN UE and AMF UE entries go too, or the
+        // implicit deregistration would free the NAS state and leave the NGAP
+        // one behind -- a UE that is deregistered and still occupies an id.
+        let handle = crate::context::amf_self();
+        let ids = handle
+            .read()
+            .ok()
+            .and_then(|ctx| ctx.ran_ue_find_by_amf_ue_ngap_id(amf_ue_ngap_id))
+            .map(|ran_ue| (ran_ue.id, ran_ue.amf_ue_id));
+        if let Some((ran_ue_id, amf_ue_id)) = ids {
+            if let Ok(ctx) = handle.read() {
+                ctx.ran_ue_remove(ran_ue_id);
+                ctx.amf_ue_remove(amf_ue_id);
+            }
+        }
     }
 
     /// Process GMM procedure timers: retransmit up to the configured maximum,
