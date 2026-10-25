@@ -742,10 +742,13 @@ fn handle_ue_policy_notify_callback(
             // "any NF service consumer except for the V-PCF shall invoke the
             // Npcf_UEPolicyControl_Delete". Only an association this UE holds: the id
             // is the last segment of `resourceUri`.
-            if let Some(id) = forget_policy_association(supi, &resource_uri, PolicyKind::Ue) {
-                spawn_policy_delete(id, PolicyKind::Ue);
-            } else {
-                clear_ue_policy_association(supi);
+            //
+            // A notification naming an association this UE does not hold changes
+            // nothing and is refused (#1247 review): clearing the UE's real one would
+            // orphan it at the PCF, since no Delete would follow.
+            match forget_policy_association(supi, &resource_uri, PolicyKind::Ue) {
+                Ok(id) => spawn_policy_delete(id, PolicyKind::Ue),
+                Err(refusal) => return refusal.response(supi),
             }
         }
         Some("update") | None => {
@@ -825,26 +828,65 @@ fn handle_am_policy_notify_callback(
          cause={})",
         body["cause"].as_str().unwrap_or("-")
     );
-    if let Some(id) = forget_policy_association(supi, resource_uri, PolicyKind::Am) {
-        spawn_policy_delete(id, PolicyKind::Am);
+    match forget_policy_association(supi, resource_uri, PolicyKind::Am) {
+        Ok(id) => spawn_policy_delete(id, PolicyKind::Am),
+        Err(refusal) => return refusal.response(supi),
     }
     SbiResponse::no_content()
+}
+
+/// Why a termination request was not acted on (#1247 review).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminateRefusal {
+    /// The TerminationNotification has no usable `resourceUri`, which is mandatory
+    /// (TS 29.507 / TS 29.525 Table 5.6.2.x TerminationNotification): 400.
+    NoResourceUri,
+    /// No UE context for the SUPI: 404 CONTEXT_NOT_FOUND.
+    UnknownUe,
+    /// The UE holds no association with that id: 404, and nothing changes. The
+    /// notification is misrouted or forged, and must not drop the UE's real one.
+    NotHeld,
+}
+
+impl TerminateRefusal {
+    fn response(self, supi: &str) -> SbiResponse {
+        match self {
+            Self::NoResourceUri => send_error(
+                400,
+                "Bad Request",
+                "TerminationNotification without a resourceUri",
+                Some("MANDATORY_IE_MISSING"),
+            ),
+            Self::UnknownUe => context_not_found(supi),
+            Self::NotHeld => send_error(
+                404,
+                "Not Found",
+                "no policy association with that resourceUri for this UE",
+                Some("RESOURCE_URI_STRUCTURE_NOT_FOUND"),
+            ),
+        }
+    }
 }
 
 /// Forget the `kind` association the TerminationNotification's `resource_uri` names, if
 /// the UE `supi` holds it; its id, for the Delete. The id is the URI's last segment
 /// (`.../policies/{polAssoId}`). The AMF deletes it at its own PCF, never at a URI the
 /// notification supplied.
-fn forget_policy_association(supi: &str, resource_uri: &str, kind: PolicyKind) -> Option<String> {
+fn forget_policy_association(
+    supi: &str,
+    resource_uri: &str,
+    kind: PolicyKind,
+) -> Result<String, TerminateRefusal> {
     let id = resource_uri
         .trim_end_matches('/')
         .rsplit('/')
         .next()
-        .filter(|id| !id.is_empty())?
+        .filter(|id| !id.is_empty() && *id != "<none>")
+        .ok_or(TerminateRefusal::NoResourceUri)?
         .to_string();
-    let ue = find_ue_by_context_id(supi)?;
+    let ue = find_ue_by_context_id(supi).ok_or(TerminateRefusal::UnknownUe)?;
     let ctx = amf_self();
-    let guard = ctx.read().ok()?;
+    let guard = ctx.read().map_err(|_| TerminateRefusal::UnknownUe)?;
     let forgot = guard
         .ue_store()
         .with_mut(ue.id, |state| match kind {
@@ -858,7 +900,11 @@ fn forget_policy_association(supi: &str, resource_uri: &str, kind: PolicyKind) -
              hold; nothing deleted"
         );
     }
-    forgot.then_some(id)
+    if forgot {
+        Ok(id)
+    } else {
+        Err(TerminateRefusal::NotHeld)
+    }
 }
 
 /// The Delete a termination request asks for (#1247), off the request's task.
@@ -890,30 +936,6 @@ fn spawn_policy_delete(pol_asso_id: String, kind: PolicyKind) {
             log::warn!("{kind:?} policy association {pol_asso_id}: Delete failed: {e}");
         }
     });
-}
-
-/// Forget the UE-policy association id held for `supi` (#92), after the PCF says it
-/// terminated the association.
-///
-/// Best-effort and silent on a missing UE: a terminate for a UE the AMF has already
-/// released is the ordinary race (the PCF's notification and the AMF's own
-/// deregistration cross), not an error worth a WARN on every deregistration.
-fn clear_ue_policy_association(supi: &str) {
-    let Some(mut ue) = find_ue_by_context_id(supi) else {
-        log::debug!(
-            "[{supi}] UE policy terminate notification for a UE this AMF no longer holds; \
-             nothing to clear"
-        );
-        return;
-    };
-    // The context's own clearer, not a hand-rolled field assignment: it also drops
-    // `resource_uri`, and `pcf_ue_policy_associated` reads `id` — leaving a resource URI
-    // behind for an association that no longer exists is how a later DELETE ends up
-    // addressing a released resource.
-    ue.pcf_ue_policy_clear();
-    if let Ok(guard) = amf_self().read() {
-        guard.amf_ue_update(&ue);
-    }
 }
 
 /// Encode a PlmnId as TS 29.571 JSON ({"mcc": "...", "mnc": "..."})
