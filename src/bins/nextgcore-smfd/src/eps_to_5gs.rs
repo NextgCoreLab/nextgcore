@@ -929,8 +929,7 @@ pub(crate) fn sm_context_error(status: u16, cause: &str, detail: &str) -> SbiRes
 
 /// [`sm_context_error`] with more SmContextUpdateError attributes beside "error"
 /// (#1097 review M2, M3): `upCnxState: DEACTIVATED` when a user-plane activation
-/// failed (TS 29.502 §5.2.2.3.2.2 step 2b), `hoState: NONE` when a handover
-/// preparation did (§5.2.2.3.4.2 step 2b), and with `n2` the N2 SM information
+/// failed (TS 29.502 §5.2.2.3.2.2 step 2b), and with `n2` the N2 SM information
 /// (`n2SmInfo` + `n2SmInfoType`) as a binary NGAP part.
 pub(crate) fn sm_context_update_error_with(
     status: u16,
