@@ -17216,11 +17216,21 @@ impl NgapServer {
         sessions
             .iter()
             .find(|(_, s)| match global_ran_node_id {
-                // A gNB target never matches an ng-eNB, whose `gnb_id` is unset (#876).
-                // TODO(#1140): a gNB target still matches on `gnb_id` alone, not on its
-                // PLMN and bit length (TS 38.413 §9.3.1.6).
-                GlobalRanNodeId::GlobalGnbId { gnb_id, .. } => {
-                    s.gnb.ng_enb_id.is_none() && s.gnb.gnb_id == *gnb_id
+                // #1140, TS 38.413 §9.3.1.6: the whole Global gNB ID -- PLMN, gNB ID and
+                // its bit length -- as the gNB named itself at NG Setup, the match the NG
+                // Setup replacement (#1039) and the EPS→5GS target lookup already make. A
+                // gNB ID is unique only within its PLMN and at its own length. A gNB
+                // target never matches an ng-eNB (#876).
+                GlobalRanNodeId::GlobalGnbId {
+                    plmn_identity,
+                    gnb_id,
+                    gnb_id_len,
+                } => {
+                    s.gnb.ng_enb_id.is_none()
+                        && s.gnb.gnb_id_presence
+                        && s.gnb.gnb_id == *gnb_id
+                        && s.gnb.gnb_id_len == *gnb_id_len
+                        && s.gnb.plmn_id == crate::ngap_asn1::decode_plmn_id(plmn_identity)
                 }
                 // #876, TS 38.413 §9.3.1.8: (PLMN, ngENB-ID alternative, value), as the
                 // ng-eNB named itself at NG Setup. Two ids of equal value and different
@@ -27439,15 +27449,7 @@ mod tests {
         let mut server = capturing_ngap_server().await;
         let (source, target, target_gnb) = (97_431u64, 97_432u64, 0x7_4302u32);
         seed_gnb_session(&server, source).await;
-        seed_gnb_session(&server, target).await;
-        server
-            .sessions
-            .write()
-            .await
-            .get_mut(&target)
-            .expect("seeded")
-            .gnb
-            .gnb_id = target_gnb;
+        seed_gnb_session_with_id(&server, target, target_gnb).await;
         let ue = 7_743_001u64;
         let mut state = UeNasContext::new(ue, 9, source, false);
         state.registered = true;
@@ -27581,6 +27583,42 @@ mod tests {
         target_gnb_id: u32,
         psis: &[u8],
     ) -> Vec<u8> {
+        handover_required_pdu_full(
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            &PlmnId::new("001", "01"),
+            target_gnb_id,
+            22,
+            psis,
+        )
+    }
+
+    /// A HANDOVER REQUIRED for PSI 1 naming the gNB `(plmn, gnb_id, gnb_id_len)`.
+    fn handover_required_pdu_to(
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        plmn: &PlmnId,
+        gnb_id: u32,
+        gnb_id_len: u8,
+    ) -> Vec<u8> {
+        handover_required_pdu_full(
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            plmn,
+            gnb_id,
+            gnb_id_len,
+            &[1],
+        )
+    }
+
+    fn handover_required_pdu_full(
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        plmn: &PlmnId,
+        target_gnb_id: u32,
+        target_gnb_id_len: u8,
+        psis: &[u8],
+    ) -> Vec<u8> {
         nextgcore_ngap::builder::build_handover_required(&nextgcore_ngap::types::HandoverRequired {
             amf_ue_ngap_id,
             ran_ue_ngap_id,
@@ -27590,9 +27628,9 @@ mod tests {
             ),
             target_id: nextgcore_ngap::types::TargetId::TargetRanNodeId {
                 global_ran_node_id: nextgcore_ngap::types::GlobalRanNodeId::GlobalGnbId {
-                    plmn_identity: plmn_id_to_ngap_bytes(&PlmnId::new("001", "01")),
+                    plmn_identity: plmn_id_to_ngap_bytes(plmn),
                     gnb_id: target_gnb_id,
-                    gnb_id_len: 22,
+                    gnb_id_len: target_gnb_id_len,
                 },
                 selected_tai: nextgcore_ngap::types::TaiListItem {
                     tai_plmn: plmn_id_to_ngap_bytes(&PlmnId::new("001", "01")),
@@ -27639,6 +27677,8 @@ mod tests {
             let mut sessions = server.sessions.write().await;
             let gnb = &mut sessions.get_mut(assoc).expect("seeded").gnb;
             gnb.gnb_id = if ng_enb_id.is_none() { value } else { 0 };
+            gnb.gnb_id_presence = ng_enb_id.is_none();
+            gnb.gnb_id_len = 22;
             gnb.ng_enb_id = *ng_enb_id;
             gnb.plmn_id = (*node_plmn).clone();
         }
@@ -27711,6 +27751,54 @@ mod tests {
             gnb_id_len: 22,
         });
         assert_eq!(server.find_association_for_target(&zero).await, None);
+    }
+
+    /// **#1140, TS 38.413 §9.3.1.6.** A handover's gNB target is matched on the whole
+    /// Global gNB ID the gNB gave at NG Setup -- PLMN, gNB ID and its bit length. Three
+    /// gNBs share the value: one at 22 bits in 001/01, one at 32 bits in 001/01, one at 22
+    /// bits in 999/70. Each target resolves to its own gNB, from real HANDOVER REQUIRED
+    /// bytes; a gNB that never completed NG Setup is never a target.
+    ///
+    /// REVERT-VERIFIED: matching on the value alone resolves all three targets to one gNB.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_gnb_target_is_matched_by_plmn_length_and_value() {
+        let server = test_ngap_server().await;
+        let (plmn, other_plmn) = (PlmnId::new("001", "01"), PlmnId::new("999", "70"));
+        let value = 0x2_1140u32;
+        for (assoc, len, node_plmn, presence) in [
+            (11_401u64, 22u8, &plmn, true),
+            (11_402, 32, &plmn, true),
+            (11_403, 22, &other_plmn, true),
+            (11_404, 24, &plmn, false), // no NG Setup completed
+        ] {
+            seed_gnb_session(&server, assoc).await;
+            let mut sessions = server.sessions.write().await;
+            let gnb = &mut sessions.get_mut(&assoc).expect("seeded").gnb;
+            gnb.gnb_id = value;
+            gnb.gnb_id_len = len;
+            gnb.gnb_id_presence = presence;
+            gnb.plmn_id = node_plmn.clone();
+        }
+        let target_of = |p: &PlmnId, len: u8| {
+            let bytes = handover_required_pdu_to(1, 1, p, value, len);
+            match crate::ngap_asn1::decode_handover_required_asn1(&bytes) {
+                crate::ngap_asn1::NasTransportDecode::Proceed { message, .. } => message.target_id,
+                _ => panic!("HANDOVER REQUIRED decodes"),
+            }
+        };
+        for (p, len, want) in [
+            (&plmn, 22u8, Some(11_401u64)),
+            (&plmn, 32, Some(11_402)),
+            (&other_plmn, 22, Some(11_403)),
+            (&other_plmn, 32, None),
+            (&plmn, 24, None),
+        ] {
+            assert_eq!(
+                server.find_association_for_target(&target_of(p, len)).await,
+                want,
+                "target {p:?} / {len} bits"
+            );
+        }
     }
 
     /// One N2 handover call a [`handover_smf`] saw (#964): `(sm_context_ref, state,
@@ -27930,16 +28018,16 @@ mod tests {
 
     /// Seed a gNB session whose Global gNB ID is `gnb_id`, so a HandoverRequired
     /// can name it as the target.
+    /// A gNB that completed NG Setup as Global gNB ID (001/01, `gnb_id`, 22 bits): the
+    /// target [`handover_required_pdu`] names (#1140 matches the whole ID).
     async fn seed_gnb_session_with_id(server: &NgapServer, association_id: u64, gnb_id: u32) {
         seed_gnb_session(server, association_id).await;
-        server
-            .sessions
-            .write()
-            .await
-            .get_mut(&association_id)
-            .expect("seeded")
-            .gnb
-            .gnb_id = gnb_id;
+        let mut sessions = server.sessions.write().await;
+        let gnb = &mut sessions.get_mut(&association_id).expect("seeded").gnb;
+        gnb.gnb_id = gnb_id;
+        gnb.gnb_id_len = 22;
+        gnb.gnb_id_presence = true;
+        gnb.plmn_id = PlmnId::new("001", "01");
     }
 
     /// **#742.** A handover preparation that ends without a HandoverNotify -- Cancel
