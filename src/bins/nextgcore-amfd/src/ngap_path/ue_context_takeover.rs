@@ -44,9 +44,9 @@ use super::*;
 /// What a takeover lookup found, applied on the NGAP task.
 #[derive(Debug)]
 pub(crate) struct TakeoverAnswer {
-    pub(crate) association_id: u64,
-    /// The Initial UE Message to process again once the lookup is applied.
-    pub(crate) initial_ue_message: Vec<u8>,
+    /// The identity looked up: every Initial UE Message held for it is processed again
+    /// once the lookup is applied (`NgapServer::pending_takeovers`).
+    pub(crate) s_tmsi: STmsi,
     pub(crate) record: Option<Box<StoredUeContext>>,
 }
 
@@ -57,6 +57,15 @@ pub(crate) struct TakeoverUecmAnswer {
     /// The `deregCallbackUri` token registered, kept only if the UDM accepted it (#753).
     pub(crate) token: String,
     pub(crate) accepted: bool,
+}
+
+/// Whether another AMF instance's record holds a UE this AMF was told to deregister
+/// locally (#1185 review M1).
+#[derive(Debug)]
+pub(crate) struct DeregOwnerAnswer {
+    pub(crate) amf_ue_ngap_id: u64,
+    /// The record names another AMF instance: the UE was taken over.
+    pub(crate) moved: bool,
 }
 
 /// Which message a taken-over UE came back with: it decides how its new 5G-GUTI goes out.
@@ -104,10 +113,30 @@ impl NgapServer {
         if !served.is_empty() && !served.iter().any(|(_, _, s, _)| *s == set) {
             return None;
         }
-        let held = self.ue_auth_state.snapshot().into_iter().any(|(_, st)| {
-            let g = &st.amf_ue.current_guti;
-            st.registered && g.amf_set_id == set && g.amf_pointer == pointer && g.tmsi == tmsi
-        });
+        // #1185 review m3: looked up by 5G-GUTI under each served GUAMI of the set, not by
+        // copying every UE context.
+        let held = if served.is_empty() {
+            self.ue_auth_state.snapshot().into_iter().any(|(_, st)| {
+                let g = &st.amf_ue.current_guti;
+                st.registered && g.amf_set_id == set && g.amf_pointer == pointer && g.tmsi == tmsi
+            })
+        } else {
+            served
+                .iter()
+                .filter(|(_, _, s, _)| *s == set)
+                .any(|(plmn, region, _, _)| {
+                    let guti = crate::context::Guti5gs {
+                        plmn_id: plmn.clone(),
+                        amf_region_id: *region,
+                        amf_set_id: set,
+                        amf_pointer: pointer,
+                        tmsi,
+                    };
+                    self.ue_auth_state
+                        .find_by_guti(&guti)
+                        .is_some_and(|(_, st)| st.registered)
+                })
+        };
         (!held).then_some(s_tmsi)
     }
 
@@ -119,13 +148,20 @@ impl NgapServer {
         initial_ue_message: Vec<u8>,
         s_tmsi: STmsi,
     ) {
+        // #1185 review m2: a second Initial UE Message for an identity being looked up
+        // (a retransmission, a second RRC attempt) waits for the same lookup, rather than
+        // finding the record already claimed and being rejected.
+        if let Some(waiting) = self.pending_takeovers.get_mut(&s_tmsi) {
+            waiting.push((association_id, initial_ue_message));
+            return;
+        }
         let Some(store) = self.ue_context_store.as_ref() else {
             return;
         };
         let backend = Arc::clone(&store.backend);
-        let instance =
-            nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf)
-                .to_string();
+        self.pending_takeovers
+            .insert(s_tmsi, vec![(association_id, initial_ue_message)]);
+        let instance = self.amf_instance();
         log::info!(
             "Initial UE Message names 5G-S-TMSI {:#05x}/{:#04x}/{:#010x} of this AMF Set, held \
              by no UE here: looking for its stored context (TS 23.501 §5.21.2.3)",
@@ -148,8 +184,7 @@ impl NgapServer {
                 }
             };
             Some(crate::sbi_offload::SbiOutcome::Takeover(TakeoverAnswer {
-                association_id,
-                initial_ue_message,
+                s_tmsi,
                 record,
             }))
         });
@@ -187,12 +222,15 @@ impl NgapServer {
         } else {
             log::info!("No stored context claimed for the Initial UE Message; processed as is");
         }
-        self.handle_initial_ue_message_with(
-            answer.association_id,
-            &answer.initial_ue_message,
-            false,
-        )
-        .await
+        let waiting = self
+            .pending_takeovers
+            .remove(&answer.s_tmsi)
+            .unwrap_or_default();
+        for (association_id, message) in waiting {
+            self.handle_initial_ue_message_with(association_id, &message, false)
+                .await?;
+        }
+        Ok(())
     }
 
     /// The takeover's peer updates for UE `amf_ue_ngap_id`, once its message verified
@@ -234,9 +272,7 @@ impl NgapServer {
         let Some(supi) = state.amf_ue.supi.clone() else {
             return;
         };
-        let instance =
-            nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf)
-                .to_string();
+        let instance = self.amf_instance();
         let (plmn, region, set, pointer) = our.unwrap_or((
             state.amf_ue.nr_tai.plmn_id.clone(),
             state.amf_ue.current_guti.amf_region_id,
@@ -346,5 +382,85 @@ impl NgapServer {
             return Some(udm.clone());
         }
         None
+    }
+
+    /// A UE another AMF of the set took over (#1185 review M1): forgotten here, with no
+    /// NAS message, no SM context release and no policy termination. Its context,
+    /// sessions and policy associations belong to the new AMF (TS 23.502 §4.2.2.2.2
+    /// step 14d: SM contexts are released only for an Initial Registration, and policy
+    /// associations only when not transferred). A UE with an N2 connection here has it
+    /// released (AN release, same step).
+    pub(super) async fn forget_moved_ue(&mut self, supi: &str) {
+        let Some((id, state)) = self.ue_auth_state.find_by_supi(supi) else {
+            return;
+        };
+        log::info!(
+            "UE {id} ({supi}) is served by another AMF of the set now; its context is \
+             forgotten here, its sessions and policies stay with the new AMF"
+        );
+        if !state.cm_idle && state.is_bound() {
+            if let Err(e) = self
+                .release_ue(
+                    state.association_id,
+                    id,
+                    state.ran_ue_ngap_id,
+                    // Cause: NAS deregister (TS 38.413 Section 9.3.1.2, CauseNas value 2)
+                    2,
+                )
+                .await
+            {
+                log::warn!("UE Context Release Command for UE {id} not sent: {e}");
+            }
+        } else {
+            self.forget_ue(id);
+        }
+        self.forget_global_ue_entries(id, &state);
+    }
+
+    /// Before a local deregistration (#602) with the store armed: ask, off the NGAP task,
+    /// whose the UE's record is. `true` when the question was asked (the answer decides,
+    /// [`Self::apply_dereg_owner`]); `false` when the deregistration goes ahead now.
+    pub(super) fn check_owner_before_local_dereg(&mut self, amf_ue_ngap_id: u64) -> bool {
+        let Some(store) = self.ue_context_store.as_ref() else {
+            return false;
+        };
+        let Some(supi) = self
+            .ue_auth_state
+            .get(amf_ue_ngap_id)
+            .and_then(|s| s.amf_ue.supi.clone())
+        else {
+            return false;
+        };
+        let backend = Arc::clone(&store.backend);
+        let instance = self.amf_instance();
+        self.sbi_offload.spawn(async move {
+            let owner = tokio::task::spawn_blocking(move || backend.owner(&supi)).await;
+            let moved = matches!(owner, Ok(Ok(Some(o))) if o != instance);
+            Some(crate::sbi_offload::SbiOutcome::DeregOwner(
+                DeregOwnerAnswer {
+                    amf_ue_ngap_id,
+                    moved,
+                },
+            ))
+        });
+        true
+    }
+
+    /// Apply [`Self::check_owner_before_local_dereg`]'s answer.
+    pub(super) async fn apply_dereg_owner(&mut self, answer: DeregOwnerAnswer) {
+        if answer.moved {
+            if let Some(supi) = self
+                .ue_auth_state
+                .get(answer.amf_ue_ngap_id)
+                .and_then(|s| s.amf_ue.supi.clone())
+            {
+                self.forget_moved_ue(&supi).await;
+            }
+        } else if let Err(e) = self.local_deregistration(answer.amf_ue_ngap_id).await {
+            log::warn!(
+                "Local deregistration for UE {} failed: {e}",
+                answer.amf_ue_ngap_id
+            );
+        }
     }
 }

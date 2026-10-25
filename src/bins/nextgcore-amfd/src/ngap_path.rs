@@ -1110,6 +1110,9 @@ pub struct NgapServer {
     last_session_sweep: std::time::Instant,
     /// #686: the UE context storage, when armed ([`ue_context_store`]).
     ue_context_store: Option<ue_context_store::UeContextStore>,
+    /// #686 PR 2: the Initial UE Messages held for each 5G-S-TMSI whose stored context is
+    /// being looked up, as (association, message), in arrival order.
+    pending_takeovers: HashMap<ue_context_store::STmsi, Vec<(u64, Vec<u8>)>>,
     /// Test seam (#686): the served GUAMIs a restore checks stored GUTIs against, instead
     /// of the process-global configuration other tests change.
     #[cfg(test)]
@@ -1117,6 +1120,9 @@ pub struct NgapServer {
     /// Test seam (#686 PR 2): the UDM a takeover registers with.
     #[cfg(test)]
     udm_override: Option<(String, u16)>,
+    /// Test seam (#1185 review M1): this AMF's nfInstanceId, for two AMFs in one process.
+    #[cfg(test)]
+    instance_override: Option<String>,
     /// PDU Session Establishment Requests whose CreateSMContext found no SMF
     /// reachable (#796), keyed by (AMF UE NGAP ID, PSI), retried until
     /// [`ESTABLISHMENT_RETRY_WINDOW`] has passed. See
@@ -1646,10 +1652,13 @@ impl NgapServer {
             up_active: std::collections::HashSet::new(),
             last_session_sweep: std::time::Instant::now(),
             ue_context_store: None,
+            pending_takeovers: HashMap::new(),
             #[cfg(test)]
             served_guami_override: None,
             #[cfg(test)]
             udm_override: None,
+            #[cfg(test)]
+            instance_override: None,
             pending_establishments: HashMap::new(),
             outstanding_releases: HashMap::new(),
             racs_assigns: HashMap::new(),
@@ -1786,8 +1795,11 @@ impl NgapServer {
         }
 
         // #686: store what changed in the stable UE contexts (at most once a second,
-        // handed to the writer thread; no store round trip here).
-        self.persist_ue_contexts(false);
+        // handed to the writer thread; no store round trip here). A UE another AMF of
+        // the set took over is forgotten here (#1185 review M1).
+        for supi in self.persist_ue_contexts(false).lost {
+            self.forget_moved_ue(&supi).await;
+        }
 
         // Process any pending server events
         while let Ok(event) = self.server_event_rx.try_recv() {
@@ -9133,6 +9145,11 @@ impl NgapServer {
             log::warn!("UE Context Release Command for UE {amf_ue_ngap_id} not sent: {e}");
         }
 
+        self.forget_global_ue_entries(amf_ue_ngap_id, state);
+    }
+
+    /// The global RAN UE and AMF UE entries of a UE this AMF no longer holds.
+    fn forget_global_ue_entries(&self, amf_ue_ngap_id: u64, state: &UeNasContext) {
         let handle = crate::context::amf_self();
         if let Ok(ctx) = handle.read() {
             let ran_ue = ctx.ran_ue_find_by_amf_ue_ngap_id(amf_ue_ngap_id);
@@ -11148,6 +11165,9 @@ impl NgapServer {
                 crate::sbi_offload::SbiOutcome::TakeoverUecm(answer) => {
                     self.apply_takeover_uecm(answer);
                 }
+                crate::sbi_offload::SbiOutcome::DeregOwner(answer) => {
+                    Box::pin(self.apply_dereg_owner(answer)).await;
+                }
             }
         }
     }
@@ -11562,6 +11582,13 @@ impl NgapServer {
         };
         for item in pending {
             if item.local {
+                // #1185 review M1: with the UE context store, the UE may have been
+                // taken over by another AMF of the set: its context, sessions and
+                // policy associations moved with it. Asked of the store off the NGAP
+                // task first.
+                if self.check_owner_before_local_dereg(item.amf_ue_ngap_id) {
+                    continue;
+                }
                 if let Err(e) = self.local_deregistration(item.amf_ue_ngap_id).await {
                     log::warn!(
                         "Local deregistration for UE {} failed: {e}",
