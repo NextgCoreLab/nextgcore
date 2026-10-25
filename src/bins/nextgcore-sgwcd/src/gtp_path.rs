@@ -242,6 +242,11 @@ impl GtpcServer {
                             if xact.message_type == Gtp2MessageType::DeleteSessionRequest as u8 {
                                 continue_delete_session_after_pgw(xact.sequence_number, None);
                             }
+                            // #1152: a PGW that never answers a relayed Create
+                            // Session leaves the MME answered and nothing behind.
+                            if xact.message_type == Gtp2MessageType::CreateSessionRequest as u8 {
+                                abandon_create_session_without_pgw(xact.sequence_number);
+                            }
                             // A failed path leaves the same stale contexts a
                             // restart does, so run the same cleanup rather than
                             // only recording the state (TS 23.007 Section 20).
@@ -1701,6 +1706,31 @@ fn take_pending_s5c(seq: u32) -> Option<(u64, pfcp_path::S11Continuation)> {
         .lock()
         .ok()
         .and_then(|mut map| map.as_mut().and_then(|m| m.remove(&seq)))
+}
+
+/// The S5/S8 Create Session Request at S5-C `seq` ran out its N3 (#1152, TS
+/// 29.274 §7.6): the PGW is not answering. The MME is answered Remote peer not
+/// responding (§8.4, cause 100) through the parked continuation, and the local
+/// session goes, with its UE when it has no other. No SGW-U session exists yet:
+/// the PFCP establishment follows the PGW's answer.
+fn abandon_create_session_without_pgw(seq: u32) {
+    let Some((sess_id, continuation)) = take_pending_s5c(seq) else {
+        return;
+    };
+    log::error!(
+        "S5/S8 Create Session Request seq={seq} unanswered after N3: the MME is answered \
+         Remote peer not responding and session {sess_id} is removed"
+    );
+    crate::sxa_response::fail_with_cause(continuation, gtp_cause::REMOTE_PEER_NOT_RESPONDING);
+    let ctx = sgwc_self();
+    if let Some(sess) = ctx.sess_remove(sess_id) {
+        if ctx
+            .ue_find_by_id(sess.sgwc_ue_id)
+            .is_some_and(|ue| ue.sess_ids.is_empty())
+        {
+            ctx.ue_remove(sess.sgwc_ue_id);
+        }
+    }
 }
 
 /// The EBI of the default bearer a Create Session Response's Bearer Context names
@@ -5007,6 +5037,44 @@ mod tests {
         );
         let ue = sgwc_self().ue_find_by_imsi(&imsi).unwrap();
         sgwc_self().ue_remove(ue.id);
+        sgwc_self().set_pgw_s5c_peer(None);
+        server.close();
+    }
+
+    /// #1152, TS 29.274 §7.6 / §8.4: a PGW that never answers the relayed Create
+    /// Session Request (N3 exhausted) leaves the MME answered Remote peer not
+    /// responding under its own number, and the session and UE removed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unanswered_s5_create_session_is_answered_and_removed() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let _sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let pgw = with_stand_in_pgw().await;
+        // The PGW sits on the request far longer than T3 x (N3 + 1).
+        pgw.create_delay_ms
+            .store(10_000, std::sync::atomic::Ordering::SeqCst);
+        let server = test_server(&ambient, 100, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x52, 0xf1];
+        sock.send_to(&csr(0x1152, &imsi).encode(), server.local_addr())
+            .unwrap();
+        let rsp = recv_s11(&sock).await.expect("the MME is answered");
+        assert_eq!(
+            rsp.header.message_type,
+            Gtp2MessageType::CreateSessionResponse as u8
+        );
+        assert_eq!(rsp.header.sequence_number, 0x1152);
+        assert_eq!(cause_of(&rsp), gtp_cause::REMOTE_PEER_NOT_RESPONDING);
+        assert!(
+            sgwc_self().ue_find_by_imsi(&imsi).is_none(),
+            "the session and the UE are removed"
+        );
         sgwc_self().set_pgw_s5c_peer(None);
         server.close();
     }
