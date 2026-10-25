@@ -1491,3 +1491,70 @@ async fn an_implicit_deregistration_of_a_taken_over_ue_releases_nothing() {
         crash(&mut old, id);
     }
 }
+
+/// **#1185 review m1 (round 3).** The owner check before an implicit deregistration is a
+/// store round trip. A UE that comes back in it (a new N1 connection, so CM-CONNECTED,
+/// or idle again with its supervision restarted) is not deregistered when the answer
+/// arrives. A returning UE normally moves to a new AMF UE NGAP ID, which leaves nothing
+/// under the old one; here its context comes back under the same id, the case that
+/// would otherwise release its sessions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_ue_back_during_the_owner_check_is_not_implicitly_deregistered() {
+    let (_smf, port, seen) = fake_activating_smf().await;
+    let _env = SmfEnvGuard::acquire(port).await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    let backend = Arc::new(MemoryBackend::default());
+    let mut amf = storing_server(&backend).await;
+    let (back, again) = (
+        (6_861_901u64, 0x0686_1901u32),
+        (6_861_902u64, 0x0686_1902u32),
+    );
+    seed_registered_ue(
+        &mut amf,
+        back.0,
+        back.1,
+        "imsi-001010000686191",
+        "ref-686-q1",
+        port,
+        false,
+    );
+    seed_registered_ue(
+        &mut amf,
+        again.0,
+        again.1,
+        "imsi-001010000686192",
+        "ref-686-q2",
+        port,
+        false,
+    );
+    store_now(&mut amf).await;
+    for id in [back.0, again.0] {
+        amf.ue_auth_state.with_mut(id, |s| {
+            s.reachability = Some(Reachability {
+                phase: ReachabilityPhase::ImplicitDeregistration,
+                deadline: Instant::now() - Duration::from_millis(1),
+            })
+        });
+    }
+    amf.process_reachability_timers().await.expect("timers");
+    // In the round trip: one is connected again, the other supervised again.
+    amf.ue_auth_state.with_mut(back.0, |s| s.cm_idle = false);
+    amf.ue_auth_state.with_mut(again.0, |s| {
+        s.reachability = Some(Reachability {
+            phase: ReachabilityPhase::MobileReachable,
+            deadline: Instant::now() + Duration::from_secs(3600),
+        })
+    });
+    for _ in 0..3 {
+        settle_offloaded_sbi(&mut amf).await;
+    }
+    assert!(amf.ue_auth_state.contains(back.0) && amf.ue_auth_state.contains(again.0));
+    let calls = seen.lock().unwrap().clone();
+    assert!(
+        !calls.iter().any(|(uri, _)| uri.contains("/release")),
+        "nothing released: {calls:?}"
+    );
+    for id in [back.0, again.0] {
+        crash(&mut amf, id);
+    }
+}

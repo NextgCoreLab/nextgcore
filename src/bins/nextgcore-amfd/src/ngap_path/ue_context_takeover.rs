@@ -493,7 +493,22 @@ impl NgapServer {
                     }
                 }
                 AfterOwnerCheck::ImplicitDeregistration => {
-                    self.implicit_deregistration(answer.amf_ue_ngap_id).await;
+                    // #1185 review m1 (round 3): the timer expired a store round trip ago.
+                    // A UE that came back meanwhile, or was supervised again, is not
+                    // deregistered on that stale expiry.
+                    let still_due = self
+                        .ue_auth_state
+                        .get(answer.amf_ue_ngap_id)
+                        .is_some_and(|s| s.registered && s.cm_idle && s.reachability.is_none());
+                    if still_due {
+                        self.implicit_deregistration(answer.amf_ue_ngap_id).await;
+                    } else {
+                        log::info!(
+                            "UE {} came back during the owner check; its implicit \
+                             deregistration is dropped",
+                            answer.amf_ue_ngap_id
+                        );
+                    }
                 }
             }
         }
