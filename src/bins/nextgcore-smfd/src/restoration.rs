@@ -4,9 +4,10 @@
 //! # The gap this closes
 //!
 //! The SMF already *detects* that a UPF has gone: `check_peer_restart` compares
-//! the peer's Recovery Time Stamp, `teardown_association` flushes the PFCP
-//! session map, and #191 made both survive an SMF restart by persisting the
-//! stamps alongside the sessions. What none of that did was tell **anyone**.
+//! the peer's Heartbeat Recovery Time Stamp, an Association Setup without PSREI
+//! says the sessions were not retained (#718, #966), `teardown_association`
+//! flushes the PFCP session map, and #191 made the map survive an SMF restart.
+//! What none of that did was tell **anyone**.
 //!
 //! The AMF holds an `smContextStatusUri` for every PDU session it created. When
 //! the UPF restarts, every one of those sessions is gone at the user plane — and
@@ -461,9 +462,8 @@ pub async fn release_epc_pdn_connections_scoped(
 /// Reconcile one session the UPF says it does not have (TS 29.244 §7.5.3.1
 /// cause 65): drop it locally, persist the smaller map, and tell the AMF.
 ///
-/// This is the disagreement #191 made reachable. A restored session map plus an
-/// UNCHANGED peer Recovery Time Stamp means no restart was detected, so the SMF
-/// keeps every restored session — and it is still possible for one of them to be
+/// This is the disagreement #191 made reachable. A restored session map the UPF
+/// confirmed retaining (PSREI, #718) is kept whole — and it is still possible for one of them to be
 /// absent at the UPF: the UPF was reconfigured, the session was removed out of
 /// band, or the snapshot predates a UPF-side deletion the SMF never saw. The
 /// only evidence is the UPF's own cause code on the next request that touches it,
@@ -876,9 +876,9 @@ mod tests {
     /// the UPF does not have must stop being treated as live, and the AMF must be
     /// told.
     ///
-    /// This is the case an unchanged Recovery Time Stamp cannot catch: no restart
-    /// happened, so #191's interlock leaves the session in place, and the UPF's
-    /// own cause code is the only evidence.
+    /// This is the case the association cannot catch: the UPF confirmed retention,
+    /// so the session stays in place, and the UPF's own cause code is the only
+    /// evidence.
     #[tokio::test]
     async fn a_session_the_upf_does_not_have_is_dropped_and_the_amf_told() {
         let _state = PROCESS_STATE_TEST_LOCK.lock().await;
