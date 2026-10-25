@@ -746,8 +746,16 @@ fn handle_ue_policy_notify_callback(
             // A notification naming an association this UE does not hold changes
             // nothing and is refused (#1247 review): clearing the UE's real one would
             // orphan it at the PCF, since no Delete would follow.
+            //
+            // A UE this AMF no longer holds is the ordinary race (the PCF's notification
+            // and the AMF's own deregistration cross): there is nothing to forget, so it
+            // stays a 204, as since #92.
             match forget_policy_association(supi, &resource_uri, PolicyKind::Ue) {
                 Ok(id) => spawn_policy_delete(id, PolicyKind::Ue),
+                Err(TerminateRefusal::UnknownUe) => log::debug!(
+                    "[{supi}] UE policy terminate notification for a UE this AMF no longer \
+                     holds; nothing to clear"
+                ),
                 Err(refusal) => return refusal.response(supi),
             }
         }
