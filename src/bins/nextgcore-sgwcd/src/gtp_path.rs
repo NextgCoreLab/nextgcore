@@ -3920,21 +3920,37 @@ mod tests {
             ctx.bearer_find_by_sess_ebi(pdn1.id, 7).is_none(),
             "its bearer 7 went"
         );
-        // ...from the SGW-U too (#1121 review m6): a Session Modification on PDN 1's
-        // session, removing the bearer's PDRs (Remove PDR, IE 15, with PDR ID 0x70).
-        let removal = sgwu
+        // ...from the SGW-U too (#1121 review m6, m7): one Session Modification on
+        // PDN 1's session removing exactly the bearer's rules -- both tunnels' PDRs
+        // and FARs -- and creating or updating nothing.
+        let modifications: Vec<nextgcore_pfcp::message::SessionModificationRequest> = sgwu
             .seen
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .any(|(t, seid, body)| {
-                *t == 52
-                    && *seid == Some(pdn1.sgwu_sxa_seid)
-                    && body
-                        .windows(10)
-                        .any(|w| w == [0x00, 0x0f, 0x00, 0x06, 0x00, 0x38, 0x00, 0x02, 0x00, 0x70])
-            });
-        assert!(removal, "the bearer's rules are removed on the SGW-U");
+            .filter(|(t, seid, _)| *t == 52 && *seid == Some(pdn1.sgwu_sxa_seid))
+            .map(|(_, _, body)| {
+                nextgcore_pfcp::message::SessionModificationRequest::decode(
+                    &mut Bytes::copy_from_slice(body),
+                )
+                .expect("a Session Modification Request")
+            })
+            .collect();
+        assert_eq!(modifications.len(), 1, "one Session Modification");
+        let m = &modifications[0];
+        let mut pdrs: Vec<u16> = m.remove_pdrs.iter().map(|r| r.pdr_id).collect();
+        let mut fars: Vec<u32> = m.remove_fars.iter().map(|r| r.far_id).collect();
+        pdrs.sort_unstable();
+        fars.sort_unstable();
+        assert_eq!(pdrs, vec![0x70, 0x71], "both tunnels' PDRs");
+        assert_eq!(fars, vec![0x70, 0x71], "both tunnels' FARs");
+        assert!(
+            m.create_pdrs.is_empty()
+                && m.create_fars.is_empty()
+                && m.update_pdrs.is_empty()
+                && m.update_fars.is_empty(),
+            "removal only"
+        );
         assert_eq!(ctx.sess_list_for_ue(ue.id).len(), 2);
         ctx.ue_remove(ue.id);
     }
