@@ -3878,7 +3878,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     // Before committing PCF/PFCP resources, ask the NSACF (if deployed) whether
     // a new PDU session may be admitted for this S-NSSAI. A rejection
     // (admittedFlag=false) is a slice-quota exhaustion → reject the session
-    // with 5GSM cause #67 (insufficient resources for specific slice). The
+    // with 5GSM cause #69 (insufficient resources for specific slice). The
     // NSACF is optional: when none is configured/discoverable we skip the check
     // (fail-open), and a transport/HTTP failure also fails open so a missing
     // NSACF never blocks the basic data path.
@@ -3910,7 +3910,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                 policy::NsacAdmission::Rejected => {
                     log::warn!(
                         "NSACF rejected PDU session for S-NSSAI[SST:{sst}] — \
-                         rejecting (5GSM cause 67)"
+                         rejecting (5GSM cause 69)"
                     );
                     rollback();
                     // #1144 round 3: TS 29.502 Table 6.1.3.2.3.1-3 answers an NSAC

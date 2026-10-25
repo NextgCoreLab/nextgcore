@@ -530,7 +530,7 @@ pub enum NsacAdmission {
     /// PDU session admitted (HTTP 204) — proceed with establishment.
     Admitted,
     /// PDU session rejected (HTTP 403, or 200 with this SUPI in acuFailureList)
-    /// — reject with 5GSM cause #67.
+    /// — reject with 5GSM cause #69.
     Rejected,
     /// NSACF returned an unexpected status, or the request provably never left
     /// (no connection). The caller decides the fail-open vs fail-closed policy.
@@ -598,7 +598,7 @@ pub async fn nsac_pdu_session_admit(
     match resp.status {
         // All requested S-NSSAIs for this PDU session admitted.
         204 => NsacAdmission::Admitted,
-        // Total failure (ProblemDetails) -> reject with 5GSM cause #67.
+        // Total failure (ProblemDetails) -> reject with 5GSM cause #69.
         403 => {
             log::info!(
                 "NSACF rejected PDU session for S-NSSAI[SST:{sst} SD:{sd:?}] (403 total failure)"
@@ -1499,7 +1499,7 @@ const DEFAULT_BACK_OFF_MINUTES: u8 = 10;
 /// (TS 24.501 §8.3.3 Table 8.3.3.1.1).
 ///
 /// For congestion-related causes (#26 insufficient resources, #27 missing/
-/// unknown DNN, #67 insufficient resources for the slice) a Back-off timer
+/// unknown DNN, #69 insufficient resources for specific slice) a Back-off timer
 /// value (T3396, GPRS timer 3, IEI 0x37) is appended so the UE applies the
 /// mandated back-off (TS 24.501 §6.2.8). smfd-08.
 pub fn build_establishment_reject(psi: u8, pti: u8, cause_5gsm: u8) -> Vec<u8> {
