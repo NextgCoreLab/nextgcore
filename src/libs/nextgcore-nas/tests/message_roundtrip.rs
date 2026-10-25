@@ -1232,6 +1232,23 @@ fn emm_detach_request() {
     }));
 }
 
+/// #931: TS 24.301 Table 8.2.11.1.1 defines no optional IE for the UE's
+/// DETACH REQUEST; anything after the mandatory part is consumed, not left.
+#[test]
+fn detach_request_consumes_trailing_ies() {
+    let msg = DetachRequest {
+        detach_type: 0x01,
+        nas_key_set_identifier: KeySetIdentifier::new(0, 1),
+        eps_mobile_identity: EpsMobileIdentity::Guti(test_eps_guti()),
+    };
+    let mut wire = BytesMut::new();
+    msg.encode(&mut wire);
+    wire.extend_from_slice(&[0x4F, 0x02, 0xAA, 0xBB, 0x81]);
+    let mut bytes = wire.freeze();
+    assert_eq!(DetachRequest::decode(&mut bytes).unwrap(), msg);
+    assert!(bytes.is_empty(), "the trailing IEs are consumed");
+}
+
 #[test]
 fn emm_detach_accept() {
     roundtrip_emm(EmmMessage::DetachAccept);
@@ -1245,8 +1262,105 @@ fn emm_tracking_area_update_request() {
             nas_key_set_identifier: KeySetIdentifier::new(0, 1),
             old_guti: EpsMobileIdentity::Guti(test_eps_guti()),
             presencemask: 0,
+            ..Default::default()
         },
     ));
+}
+
+/// #931, TS 24.301 Table 8.2.29.1: every modelled optional IE of a TRACKING
+/// AREA UPDATE REQUEST survives a round trip, the type 1 and type 3 (TV) ones
+/// included.
+#[test]
+fn emm_tracking_area_update_request_all_optional_ies() {
+    roundtrip_emm(EmmMessage::TrackingAreaUpdateRequest(
+        TrackingAreaUpdateRequest {
+            eps_update_type: 0x00,
+            nas_key_set_identifier: KeySetIdentifier::new(0, 1),
+            old_guti: EpsMobileIdentity::Guti(test_eps_guti()),
+            presencemask: 0,
+            non_current_native_nas_ksi: Some(0x02),
+            old_p_tmsi_signature: Some([0xAA, 0xBB, 0xCC]),
+            additional_guti: Some(EpsMobileIdentity::Guti(test_eps_guti())),
+            nonce_ue: Some([1, 2, 3, 4]),
+            ue_network_capability: Some(test_ue_network_capability()),
+            last_visited_tai: Some(EpsTai {
+                plmn_id: test_plmn(),
+                tac: 0x0007,
+            }),
+            drx_parameter: Some([0x0A, 0x00]),
+            ue_radio_capability_update_needed: Some(0x01),
+            eps_bearer_context_status: Some(1 << 5 | 1 << 6),
+            ms_network_capability: Some(vec![0xE5, 0xE0]),
+            tmsi_status: Some(0x01),
+            additional_update_type: Some(0x01),
+            voice_domain_preference: Some(vec![0x01]),
+            old_guti_type: Some(0x01),
+            device_properties: Some(0x01),
+            t3324_value: Some(vec![0x21]),
+            t3412_extended_value: Some(vec![0x45]),
+            extended_drx_parameters: Some(vec![0x52]),
+            ue_additional_security_capability: Some(vec![0x80, 0x00, 0x80, 0x00]),
+            ue_status: Some(vec![0x01]),
+        },
+    ));
+}
+
+/// #931: the octet order of the EPS bearer context status (§9.9.2.1: octet 3
+/// is EBI(7)..EBI(0)), on the wire.
+#[test]
+fn tau_request_eps_bearer_context_status_octet_order() {
+    let mut wire = BytesMut::new();
+    TrackingAreaUpdateRequest {
+        old_guti: EpsMobileIdentity::Guti(test_eps_guti()),
+        eps_bearer_context_status: Some(1 << 5 | 1 << 9),
+        ..Default::default()
+    }
+    .encode(&mut wire);
+    let at = wire.windows(2).position(|w| w == [0x57, 0x02]).unwrap();
+    assert_eq!(&wire[at + 2..at + 4], &[1 << 5, 1 << 1]);
+}
+
+/// #931, TS 24.301 §7.6.1: an IE the decoder does not model, of each framing,
+/// is skipped and the modelled IEs after it are still read.
+#[test]
+fn tau_request_skips_unmodelled_ies_and_reads_on() {
+    let mut wire = BytesMut::new();
+    TrackingAreaUpdateRequest {
+        old_guti: EpsMobileIdentity::Guti(test_eps_guti()),
+        ..Default::default()
+    }
+    .encode(&mut wire);
+    // Old LAI (TV 6), Additional information requested (TV 2), GPRS ciphering
+    // key sequence number (type 1), Supported Codecs (TLV), an unknown TLV.
+    wire.extend_from_slice(&[0x13, 1, 2, 3, 4, 5]);
+    wire.extend_from_slice(&[0x17, 0x01]);
+    wire.extend_from_slice(&[0x81]);
+    wire.extend_from_slice(&[0x40, 0x03, 9, 9, 9]);
+    wire.extend_from_slice(&[0x4F, 0x01, 0x00]);
+    wire.extend_from_slice(&[0x57, 0x02, 0x20, 0x00]);
+    let decoded = TrackingAreaUpdateRequest::decode(&mut wire.freeze()).unwrap();
+    assert_eq!(decoded.eps_bearer_context_status, Some(1 << 5));
+}
+
+/// #1173 review: Additional information requested (0x17) is TV 2. Read as a
+/// TLV, its value octet (here 0x02) would be taken as a length and swallow the
+/// UE status IE that follows.
+#[test]
+fn tau_request_additional_information_requested_is_tv2() {
+    let mut wire = BytesMut::new();
+    TrackingAreaUpdateRequest {
+        old_guti: EpsMobileIdentity::Guti(test_eps_guti()),
+        ..Default::default()
+    }
+    .encode(&mut wire);
+    wire.extend_from_slice(&[0x17, 0x02]);
+    wire.extend_from_slice(&[0x6D, 0x01, 0x01]);
+    let decoded = TrackingAreaUpdateRequest::decode(&mut wire.freeze()).unwrap();
+    assert_eq!(
+        decoded.ue_status,
+        Some(vec![0x01]),
+        "the IE after 0x17 is read"
+    );
 }
 
 #[test]
@@ -1473,6 +1587,20 @@ fn emm_uplink_nas_transport() {
 fn emm_cs_service_notification() {
     roundtrip_emm(EmmMessage::CsServiceNotification(CsServiceNotification {
         paging_identity: 0x01,
+        ..Default::default()
+    }));
+}
+
+/// #931, TS 24.301 Table 8.2.9.1: CLI, SS Code (TV 2), LCS indicator (TV 2)
+/// and LCS client identity.
+#[test]
+fn emm_cs_service_notification_all_optional_ies() {
+    roundtrip_emm(EmmMessage::CsServiceNotification(CsServiceNotification {
+        paging_identity: 0x01,
+        cli: Some(vec![0x91, 0x21, 0x43]),
+        ss_code: Some(0x21),
+        lcs_indicator: Some(0x01),
+        lcs_client_identity: Some(vec![0x01, 0x02]),
     }));
 }
 
@@ -1678,6 +1806,31 @@ fn esm_bearer_resource_modification_request() {
             eps_bearer_identity: 5,
             traffic_flow_aggregate: vec![0x21, 0x10],
             pti: 0,
+            ..Default::default()
+        }),
+    );
+}
+
+/// #931, TS 24.301 Table 8.3.10.1: every optional IE of a BEARER RESOURCE
+/// MODIFICATION REQUEST, ESM cause (TV 2), device properties (type 1) and the
+/// extended PCO (TLV-E) included.
+#[test]
+fn esm_bearer_resource_modification_request_all_optional_ies() {
+    roundtrip_esm(
+        0,
+        4,
+        EsmMessage::BearerResourceModificationRequest(BearerResourceModificationRequest {
+            eps_bearer_identity: 5,
+            traffic_flow_aggregate: vec![0x21, 0x10],
+            pti: 0,
+            required_traffic_flow_qos: Some(vec![0x09]),
+            esm_cause: Some(36),
+            protocol_configuration_options: Some(vec![0x80]),
+            device_properties: Some(0x01),
+            nbifom_container: Some(vec![0x01]),
+            header_compression_configuration: Some(vec![0x00, 0x01, 0x02]),
+            extended_protocol_configuration_options: Some(vec![0x80, 0x00]),
+            extended_eps_qos: Some(vec![0; 10]),
         }),
     );
 }
