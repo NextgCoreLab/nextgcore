@@ -1137,6 +1137,9 @@ pub struct NgapServer {
     /// Test seam (#686 PR 2): the UDM a takeover registers with.
     #[cfg(test)]
     udm_override: Option<(String, u16)>,
+    /// Test seam (#1210): the PCF a takeover re-points the policy associations at.
+    #[cfg(test)]
+    pcf_override: Option<(String, u16)>,
     /// Test seam (#1185 review M1): this AMF's nfInstanceId, for two AMFs in one process.
     #[cfg(test)]
     instance_override: Option<String>,
@@ -1674,6 +1677,8 @@ impl NgapServer {
             served_guami_override: None,
             #[cfg(test)]
             udm_override: None,
+            #[cfg(test)]
+            pcf_override: None,
             #[cfg(test)]
             instance_override: None,
             pending_establishments: HashMap::new(),

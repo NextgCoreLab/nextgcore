@@ -3539,7 +3539,7 @@ pub async fn call_udm_sdm_subscribe(
 
     let body = serde_json::json!({
         "nfInstanceId": amf_instance_id,
-        "callbackReference": format!("/namf-callback/v1/{supi}/sdmsubscription-notify"),
+        "callbackReference": sdm_callback_reference(supi),
         "monitoredResourceUris": [format!("/nudm-sdm/v2/{supi}/am-data")],
         "implicitUnsubscribe": true
     });
@@ -3590,7 +3590,7 @@ pub async fn call_pcf_am_policy_create(
     );
 
     let body = serde_json::json!({
-        "notificationUri": format!("/namf-callback/v1/{supi}/am-policy-notify"),
+        "notificationUri": am_policy_notification_uri(supi),
         "supi": supi,
         "servingPlmn": { "mcc": serving_plmn_mcc, "mnc": serving_plmn_mnc },
         "suppFeat": ""
@@ -3762,6 +3762,130 @@ pub async fn call_pcf_ue_policy_delete(
     }
 
     log::info!("Npcf_UEPolicyControl_Delete OK (polAssoId={pol_asso_id})");
+    Ok(())
+}
+
+/// The absolute `callbackReference` of this AMF's SDM subscription for `supi`
+/// (TS 29.503 §6.1.6.2.3 `SdmSubscription`), built from [`advertised_sbi_base`] as
+/// [`ue_policy_notification_uri`] is (#1210). It used to be a relative path, which a UDM
+/// cannot POST to.
+pub fn sdm_callback_reference(supi: &str) -> String {
+    format!(
+        "{}/namf-callback/v1/{supi}/sdmsubscription-notify",
+        advertised_sbi_base()
+    )
+}
+
+/// The absolute AM policy `notificationUri` for `supi` (TS 29.507 §5.6.2.3), as
+/// [`sdm_callback_reference`] (#1210).
+pub fn am_policy_notification_uri(supi: &str) -> String {
+    format!(
+        "{}/namf-callback/v1/{supi}/am-policy-notify",
+        advertised_sbi_base()
+    )
+}
+
+/// Npcf_AMPolicyControl_Update toward a new serving AMF (#1210): POST
+/// `/npcf-am-policy-control/v1/policies/{polAssoId}/update` with the new
+/// `notificationUri` and `guami` (TS 29.507 §4.2.3.1: an AMF that "knows by
+/// implementation specific means that the UE context has been transferred to an AMF
+/// with another GUAMI within the AMF set ... may also invoke this procedure to update
+/// the Notification URI and the GUAMI"; items 1 and 13).
+pub async fn call_pcf_am_policy_update_serving_amf(
+    pcf_host: &str,
+    pcf_port: u16,
+    pol_asso_id: &str,
+    notification_uri: &str,
+    guami: &serde_json::Value,
+) -> SbiResult<()> {
+    let client = crate::attach_oauth2(
+        SbiClient::for_peer(pcf_host, pcf_port),
+        nextgcore_sbi::types::NfType::Pcf,
+    );
+    let body = serde_json::json!({ "notificationUri": notification_uri, "guami": guami });
+    let response = client
+        .post_json(
+            &format!("/npcf-am-policy-control/v1/policies/{pol_asso_id}/update"),
+            &body,
+        )
+        .await
+        .map_err(|e| SbiError::RequestFailed(format!("AM policy update failed: {e}")))?;
+    if !response.is_success() {
+        return Err(SbiError::RequestFailed(format!(
+            "AM policy update returned status {}",
+            response.status
+        )));
+    }
+    log::info!("Npcf_AMPolicyControl_Update OK (polAssoId={pol_asso_id}): new serving AMF");
+    Ok(())
+}
+
+/// Npcf_UEPolicyControl_Update toward a new serving AMF (#1210): POST
+/// `/npcf-ue-policy-control/v1/policies/{polAssoId}/update` with the new
+/// `notificationUri`, and the `guami` and `servingNfId` that identify this AMF
+/// (TS 29.525 §4.2.3.1: the AMF that knows the UE context moved within the AMF set
+/// "may also invoke this procedure to update the Notification URI";
+/// PolicyAssociationUpdateRequest, §5.6.2.4).
+pub async fn call_pcf_ue_policy_update_serving_amf(
+    pcf_host: &str,
+    pcf_port: u16,
+    pol_asso_id: &str,
+    notification_uri: &str,
+    guami: &serde_json::Value,
+    serving_nf_id: &str,
+) -> SbiResult<()> {
+    let client = crate::attach_oauth2(
+        SbiClient::for_peer(pcf_host, pcf_port),
+        nextgcore_sbi::types::NfType::Pcf,
+    );
+    let body = serde_json::json!({
+        "notificationUri": notification_uri,
+        "guami": guami,
+        "servingNfId": serving_nf_id,
+    });
+    let response = client
+        .post_json(
+            &format!("/npcf-ue-policy-control/v1/policies/{pol_asso_id}/update"),
+            &body,
+        )
+        .await
+        .map_err(|e| SbiError::RequestFailed(format!("UE policy update failed: {e}")))?;
+    if !response.is_success() {
+        return Err(SbiError::RequestFailed(format!(
+            "UE policy update returned status {}",
+            response.status
+        )));
+    }
+    log::info!("Npcf_UEPolicyControl_Update OK (polAssoId={pol_asso_id}): new serving AMF");
+    Ok(())
+}
+
+/// Nudm_SDM_Unsubscribe: DELETE `/nudm-sdm/v2/{supi}/sdm-subscriptions/{subscriptionId}`
+/// (TS 29.503 §5.2.2.4.2). A 404 counts as done: the UDM may already have removed the
+/// subscription itself (`implicitUnsubscribe`, §6.1.6.2.3).
+pub async fn call_udm_sdm_unsubscribe(
+    udm_host: &str,
+    udm_port: u16,
+    supi: &str,
+    subscription_id: &str,
+) -> SbiResult<()> {
+    let client = crate::attach_oauth2(
+        SbiClient::for_peer(udm_host, udm_port),
+        nextgcore_sbi::types::NfType::Udm,
+    );
+    let response = client
+        .delete(&format!(
+            "/nudm-sdm/v2/{supi}/sdm-subscriptions/{subscription_id}"
+        ))
+        .await
+        .map_err(|e| SbiError::RequestFailed(format!("SDM unsubscribe failed: {e}")))?;
+    if !response.is_success() && response.status != 404 {
+        return Err(SbiError::RequestFailed(format!(
+            "SDM unsubscribe returned status {}",
+            response.status
+        )));
+    }
+    log::info!("[{supi}] Nudm_SDM_Unsubscribe OK (subscriptionId={subscription_id})");
     Ok(())
 }
 
@@ -5244,6 +5368,38 @@ mod tests {
             .http
             .get_header(ORIGINATION_TIMESTAMP_HEADER)
             .is_none());
+    }
+
+    /// #1210: an SDM subscription the UDM already removed (404, e.g. through
+    /// `implicitUnsubscribe`) is unsubscribed; any other refusal is an error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_sdm_unsubscribe_takes_a_404_as_done() {
+        use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let udm = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        udm.start(|req: SReq| async move {
+            match req.header.uri.rsplit('/').next() {
+                Some("gone") => SResp::with_status(404),
+                Some("kept") => SResp::no_content(),
+                _ => SResp::with_status(500),
+            }
+        })
+        .await
+        .expect("stand-in UDM starts");
+        let supi = "imsi-001010001210902";
+        for (id, ok) in [("gone", true), ("kept", true), ("broken", false)] {
+            assert_eq!(
+                call_udm_sdm_unsubscribe("127.0.0.1", addr.port(), supi, id)
+                    .await
+                    .is_ok(),
+                ok,
+                "{id}"
+            );
+        }
     }
 
     fn test_identity() -> SmContextIdentity {
