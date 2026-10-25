@@ -1691,7 +1691,10 @@ fn spawn_n4_nf_status_watcher(nf_instance_id: String) {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            if shutting_down() || nextgcore_sbi::heartbeat::heartbeat_paused() {
+            // A shutdown aborts this task before it deregisters
+            // (`abort_n4_nf_status_watcher`); an NF that paused its own heartbeats
+            // (NES) is not PATCHed behind their back either.
+            if nextgcore_sbi::heartbeat::heartbeat_paused() {
                 return;
             }
             let associated = pfcp_path::session_upf_associated();
@@ -11791,13 +11794,12 @@ mod tests {
     ///
     /// REVERT-VERIFIED: with the profile rewrite removed, the recorded profile
     /// stays REGISTERED while the SMF is UNDISCOVERABLE.
-    #[tokio::test]
-    async fn reconciling_the_n4_status_changes_the_advertised_status_once() {
+    #[test]
+    fn reconciling_the_n4_status_changes_the_advertised_status_once() {
         use nextgcore_sbi::context::NfStatus;
         use nextgcore_sbi::heartbeat as hb;
-        // The heartbeat status and profile are process-global; in this crate only
-        // the #1112 tests touch them, and they all hold the ambient lock.
-        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        // The heartbeat globals' own lock, declared beside them in nextgcore-sbi.
+        let _registration = hb::lock_registration_state_for_test();
         let before = (hb::self_nf_status(), hb::registered_profile());
         hb::set_self_nf_status(NfStatus::Registered);
         hb::set_registered_profile(&build_smf_nf_profile("smf-1112", "10.45.0.6", 7777));
@@ -11837,16 +11839,26 @@ mod tests {
     /// REVERT-VERIFIED: registering REGISTERED fails the PUT assertion, and without
     /// the watcher spawn no PATCH arrives.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // the heartbeat globals' std lock, see below
     async fn the_nrf_is_told_the_n4_state_once_per_change() {
         use nextgcore_sbi::context::NfStatus;
         use nextgcore_sbi::heartbeat as hb;
         use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        // The heartbeat globals' own (std) lock, beside them in nextgcore-sbi. Held
+        // across this test's awaits on purpose: it serialises the globals, and no
+        // other task of this test takes it.
+        let _registration = hb::lock_registration_state_for_test();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         // Installed, not associated, before the registration: the N4 lock is held for
         // the whole test, so no sibling's UPF is what the watcher sees.
         let upf = pfcp_path::stand_in::unassociated_upf().await;
-        let before = (hb::self_nf_status(), hb::registered_profile());
+        // Everything this test sets process-wide is restored when it ends, whether it
+        // passes or panics (#1115 review n4).
+        let _restore = N4StatusTestRestore {
+            status: hb::self_nf_status(),
+            profile: hb::registered_profile(),
+        };
 
         let seen: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>> = Arc::default();
         let recorded = Arc::clone(&seen);
@@ -11913,15 +11925,13 @@ mod tests {
         // Several more ticks: no further PATCH.
         tokio::time::sleep(N4_NF_STATUS_POLL * 3).await;
         let all = patches(&seen);
-
-        abort_n4_nf_status_watcher();
-        global_context().clear_nrf_uri().await;
+        // An NF that paused its own heartbeats (NES) is not PATCHed behind them.
+        hb::set_heartbeat_paused(true);
+        upf.client.associate().await.expect("association");
+        tokio::time::sleep(N4_NF_STATUS_POLL * 3).await;
+        let while_paused = patches(&seen);
+        hb::set_heartbeat_paused(false);
         nrf.stop().await.ok();
-        hb::set_self_nf_status(before.0);
-        match before.1 {
-            Some(p) => hb::set_registered_profile(&p),
-            None => hb::clear_registered_profile(),
-        }
 
         assert!(registered.is_ok(), "{registered:?}");
         assert_eq!(put, Some(serde_json::json!("UNDISCOVERABLE")));
@@ -11930,6 +11940,75 @@ mod tests {
             all,
             vec!["REGISTERED", "UNDISCOVERABLE"],
             "one PATCH per change"
+        );
+        assert_eq!(
+            while_paused, all,
+            "no PATCH while the heartbeats are paused"
+        );
+    }
+
+    /// Restores what `the_nrf_is_told_the_n4_state_once_per_change` set process-wide:
+    /// the watcher, the NRF URI, the pause flag, the advertised status and profile.
+    struct N4StatusTestRestore {
+        status: nextgcore_sbi::context::NfStatus,
+        profile: Option<serde_json::Value>,
+    }
+
+    impl Drop for N4StatusTestRestore {
+        fn drop(&mut self) {
+            use nextgcore_sbi::heartbeat as hb;
+            abort_n4_nf_status_watcher();
+            hb::set_heartbeat_paused(false);
+            hb::set_self_nf_status(self.status);
+            match self.profile.take() {
+                Some(p) => hb::set_registered_profile(&p),
+                None => hb::clear_registered_profile(),
+            }
+            // The URI is behind an async lock; cleared on a runtime of its own, on a
+            // scoped thread, since this may run while the test's runtime unwinds.
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .expect("cleanup runtime")
+                        .block_on(global_context().clear_nrf_uri());
+                });
+            });
+        }
+    }
+
+    /// #1115 review n1: the shutdown stops the N4 status watcher before it
+    /// deregisters, so the association release that follows PATCHes no instance the
+    /// NRF has dropped.
+    ///
+    /// REVERT-VERIFIED: without `abort_n4_nf_status_watcher` in `graceful_shutdown`,
+    /// the watcher is still running when the deregistration starts.
+    #[tokio::test]
+    async fn the_shutdown_stops_the_n4_status_watcher_before_it_deregisters() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        spawn_n4_nf_status_watcher("smf-1115-shutdown".to_string());
+        let running_at_deregister = std::sync::Arc::new(AtomicBool::new(true));
+        let probe = running_at_deregister.clone();
+        let listener = tokio::spawn(async {});
+        graceful_shutdown(
+            async move {
+                let running = N4_NF_STATUS_WATCHER
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .is_some_and(|w| !w.is_finished());
+                probe.store(running, Ordering::SeqCst);
+            },
+            &[],
+            false,
+            listener,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .await;
+        abort_n4_nf_status_watcher();
+        assert!(
+            !running_at_deregister.load(Ordering::SeqCst),
+            "the watcher is stopped before the deregistration"
         );
     }
 

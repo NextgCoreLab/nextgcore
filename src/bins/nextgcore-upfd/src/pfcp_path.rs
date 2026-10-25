@@ -653,6 +653,9 @@ pub struct PfcpServer {
     admission: std::sync::Mutex<PendingAdmission>,
     /// Set while a held Setup is judged again, so it is answered, not held twice.
     rejudging: AtomicBool,
+    /// How a held Setup's re-resolution resolves: [`PeerAllowlist::resolve_hosts`],
+    /// or a test's stand-in for a slow resolver.
+    resolver: std::sync::RwLock<fn(&PeerAllowlist)>,
     /// Heartbeat state: outstanding request sequence numbers and how many
     /// heartbeat rounds in a row went unanswered (TS 23.007 §19A).
     ///
@@ -895,6 +898,9 @@ impl PfcpServer {
             allowed_peers: std::sync::RwLock::new(PeerAllowlist::default()),
             admission: std::sync::Mutex::new(PendingAdmission::default()),
             rejudging: AtomicBool::new(false),
+            resolver: std::sync::RwLock::new(|list: &PeerAllowlist| {
+                list.resolve_hosts();
+            }),
             n3_ipv6: std::sync::RwLock::new(None),
         })
     }
@@ -1395,6 +1401,12 @@ impl PfcpServer {
             return false;
         }
         let mut pending = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+        // One held Setup per source (#1115 review n3): a retransmission is answered
+        // once, and one host cannot fill the queue with Setups under new sequence
+        // numbers and so push a real CP function's Setup past the cap.
+        if pending.held.iter().any(|(_, from)| *from == src_addr) {
+            return true;
+        }
         if pending.held.len() >= ADMISSION_MAX_HELD {
             return false;
         }
@@ -1403,23 +1415,9 @@ impl PfcpServer {
                 return false;
             }
             let list = allowed.clone();
-            let lookup = tokio::task::spawn_blocking(move || {
-                list.resolve_hosts();
-            });
+            let resolve = *self.resolver.read().unwrap_or_else(|e| e.into_inner());
+            let lookup = tokio::task::spawn_blocking(move || resolve(&list));
             pending.lookup = Some((lookup, std::time::Instant::now()));
-        }
-        // A retransmission of a held Setup is held once: it is answered once.
-        let seq = ParsedPfcpHeader::parse(datagram)
-            .map(|(h, _)| h.sequence_number)
-            .ok();
-        if pending.held.iter().any(|(d, from)| {
-            *from == src_addr
-                && ParsedPfcpHeader::parse(d)
-                    .ok()
-                    .map(|(h, _)| h.sequence_number)
-                    == seq
-        }) {
-            return true;
         }
         log::info!(
             "PFCP Association Setup Request from {src_addr}, not in the last resolution of \
@@ -1428,6 +1426,12 @@ impl PfcpServer {
         );
         pending.held.push((datagram.to_vec(), src_addr));
         true
+    }
+
+    /// Resolve held Setups' names with `resolver` instead (a slow DNS, in a test).
+    #[cfg(test)]
+    fn set_resolver_for_test(&self, resolver: fn(&PeerAllowlist)) {
+        *self.resolver.write().unwrap_or_else(|e| e.into_inner()) = resolver;
     }
 
     /// Judge again the Setups held for a resolution that has ended, or has taken
@@ -6072,6 +6076,132 @@ mod tests {
                 .is_empty(),
             "nothing left held"
         );
+    }
+
+    /// A resolver as slow as a DNS outage: longer than the hold's bound
+    /// ([`ADMISSION_LOOKUP_MAX`]) and the resolution slot's interval.
+    fn slow_resolver(list: &PeerAllowlist) {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        list.resolve_hosts();
+    }
+
+    /// #1115 review n2: a Setup held for a resolution slower than the hold's bound is
+    /// judged without it, and refused once: being judged again, it is not held again.
+    ///
+    /// REVERT-VERIFIED: without the `rejudging` guard the Setup is held again, and
+    /// again, and never answered.
+    #[tokio::test]
+    async fn a_setup_held_past_a_slow_resolution_is_refused_not_held_again() {
+        let (server, _smf, upf, _rx) = spawn_test_server().await;
+        server.set_allowed_peers(PeerAllowlist::parse("localhost").unwrap());
+        server.set_resolver_for_test(slow_resolver);
+        let stranger = UdpSocket::bind("127.0.0.66:0").await.unwrap();
+        stranger
+            .send_to(
+                &encode_pfcp(
+                    5,
+                    None,
+                    7,
+                    &association_setup(Ipv4Addr::new(127, 0, 0, 66), 7, None),
+                ),
+                upf,
+            )
+            .await
+            .unwrap();
+        // Answered once the hold's bound passes, before the slow lookup ends.
+        let mut buf = vec![0u8; 2048];
+        let (len, _) = tokio::time::timeout(
+            ADMISSION_LOOKUP_MAX + std::time::Duration::from_millis(900),
+            stranger.recv_from(&mut buf),
+        )
+        .await
+        .expect("answered, not held again")
+        .unwrap();
+        assert_eq!(
+            response_cause(&buf[..len]),
+            PfcpCause::RequestRejected as u8
+        );
+    }
+
+    /// #1115 review n2, n3: at most [`ADMISSION_MAX_HELD`] Setups are held, one per
+    /// source. A host retransmitting, or re-sending under new sequence numbers, holds
+    /// one place and is answered once; past the cap a Setup is refused at once.
+    ///
+    /// REVERT-VERIFIED: without the cap the 65th is held too; deduplicating by
+    /// (source, sequence) lets one host take many places.
+    #[tokio::test]
+    async fn held_setups_are_capped_and_one_per_source() {
+        let (server, _smf, upf, _rx) = spawn_test_server().await;
+        server.set_allowed_peers(PeerAllowlist::parse("localhost").unwrap());
+        server.set_resolver_for_test(slow_resolver);
+        // One host, three Setups (a retransmission and a new sequence number).
+        let repeat = UdpSocket::bind("127.0.0.70:0").await.unwrap();
+        for seq in [1, 1, 2] {
+            repeat
+                .send_to(
+                    &encode_pfcp(
+                        5,
+                        None,
+                        seq,
+                        &association_setup(Ipv4Addr::new(127, 0, 0, 70), seq, None),
+                    ),
+                    upf,
+                )
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(server.admission.lock().unwrap().held.len(), 1, "one place");
+        // 63 more sources fill the queue.
+        let mut fillers = Vec::new();
+        for host in 2u8..65 {
+            let sock = UdpSocket::bind((Ipv4Addr::new(127, 0, 1, host), 0))
+                .await
+                .unwrap();
+            sock.send_to(
+                &encode_pfcp(
+                    5,
+                    None,
+                    9,
+                    &association_setup(Ipv4Addr::new(127, 0, 1, host), 9, None),
+                ),
+                upf,
+            )
+            .await
+            .unwrap();
+            fillers.push(sock);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            server.admission.lock().unwrap().held.len(),
+            ADMISSION_MAX_HELD
+        );
+        // The next source is past the cap: refused at once, not held.
+        let late = UdpSocket::bind("127.0.0.71:0").await.unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            setup_cause(&late, upf, Ipv4Addr::new(127, 0, 0, 71), 3).await,
+            PfcpCause::RequestRejected as u8
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "at once"
+        );
+        // The repeating host is answered exactly once.
+        let mut buf = vec![0u8; 2048];
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            repeat.recv_from(&mut buf),
+        )
+        .await
+        .expect("answered");
+        assert!(first.is_ok());
+        let second = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            repeat.recv_from(&mut buf),
+        )
+        .await;
+        assert!(second.is_err(), "once");
     }
 
     /// SECURITY (#968 re-review, fail closed): with NO allowlist configured, no host
