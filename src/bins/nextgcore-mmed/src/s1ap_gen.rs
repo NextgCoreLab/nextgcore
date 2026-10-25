@@ -1001,10 +1001,10 @@ fn erab_qos(q: &nextgcore_s1ap::ErabLevelQosParameters) -> g::E_RABLevelQoSParam
             ie_extensions: None,
         },
         gbr_qos_information: q.gbr_qos_info.as_ref().map(|gbr| g::GBR_QosInformation {
-            e_rab_maximum_bitrate_dl: g::BitRate(gbr.erab_max_bitrate_dl),
-            e_rab_maximum_bitrate_ul: g::BitRate(gbr.erab_max_bitrate_ul),
-            e_rab_guaranteed_bitrate_dl: g::BitRate(gbr.erab_guaranteed_bitrate_dl),
-            e_rab_guaranteed_bitrate_ul: g::BitRate(gbr.erab_guaranteed_bitrate_ul),
+            e_rab_maximum_bitrate_dl: erab_bit_rate(gbr.erab_max_bitrate_dl),
+            e_rab_maximum_bitrate_ul: erab_bit_rate(gbr.erab_max_bitrate_ul),
+            e_rab_guaranteed_bitrate_dl: erab_bit_rate(gbr.erab_guaranteed_bitrate_dl),
+            e_rab_guaranteed_bitrate_ul: erab_bit_rate(gbr.erab_guaranteed_bitrate_ul),
             ie_extensions: None,
         }),
         ie_extensions: None,
@@ -1573,6 +1573,22 @@ const ID_ERAB_ITEM: u16 = 35;
 /// The largest legacy Bit Rate (TS 36.413 §9.2.1.20, BitRate ::= INTEGER
 /// (0..10000000000)).
 const MAX_BIT_RATE: u64 = 10_000_000_000;
+
+/// An E-RAB GBR QoS Information bit rate (TS 36.413 §9.2.1.18/§9.2.1.19,
+/// `BitRate ::= INTEGER (0..10000000000)`, not extensible) for `value` bit/s:
+/// `value`, or [`MAX_BIT_RATE`] past it, with a warning (#1204, as #1192 does
+/// for NGAP). Encoded raw, a value past the range failed the whole message.
+fn erab_bit_rate(value: u64) -> g::BitRate {
+    if value > MAX_BIT_RATE {
+        log::warn!(
+            "E-RAB Bit Rate {value} bit/s is past TS 36.413 §9.2.1.19's {MAX_BIT_RATE}; sent as \
+             {MAX_BIT_RATE}"
+        );
+        g::BitRate(MAX_BIT_RATE)
+    } else {
+        g::BitRate(value)
+    }
+}
 
 /// The UE Aggregate Maximum Bit Rate IE (TS 36.413 §9.2.1.20). A direction above
 /// 10 Gbit/s puts the legacy Bit Rate at its maximum and adds the Rel-15
