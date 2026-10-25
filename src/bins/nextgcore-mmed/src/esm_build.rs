@@ -351,97 +351,98 @@ fn encode_bitrate_ext(kbps: u64) -> u8 {
 // APN-AMBR Building
 // ============================================================================
 
-/// Build APN-AMBR IE
-pub fn apn_ambr_build(dl: u64, ul: u64) -> Vec<u8> {
+/// The APN-AMBR IE contents (TS 24.301 §9.9.4.2) for `dl_bps` / `ul_bps`, which
+/// are in **bit/s**: the session AMBR is the HSS's (TS 29.272 §7.3.41), stored
+/// unchanged. The IE is coded in kbit/s, rounded up so the UE is never given
+/// less than its subscription (#1181). The contents are octets 3-4, 3-6 when
+/// either direction needs the extended octet, or 3-8 when either needs the
+/// extended-2 one (an IE of 4, 6 or 8 octets).
+pub fn apn_ambr_build(dl_bps: u64, ul_bps: u64) -> Vec<u8> {
+    let dl = apn_ambr_octets(dl_bps.div_ceil(1000));
+    let ul = apn_ambr_octets(ul_bps.div_ceil(1000));
     let mut buf = NasBuffer::new();
-
-    // APN-AMBR for downlink
-    buf.write_u8(encode_apn_ambr(dl));
-    // APN-AMBR for uplink
-    buf.write_u8(encode_apn_ambr(ul));
-
-    // Extended values
-    let dl_ext = encode_apn_ambr_ext(dl);
-    let ul_ext = encode_apn_ambr_ext(ul);
-
-    if dl_ext > 0 || ul_ext > 0 {
-        buf.write_u8(dl_ext);
-        buf.write_u8(ul_ext);
-
-        // Extended-2 values
-        let dl_ext2 = encode_apn_ambr_ext2(dl);
-        let ul_ext2 = encode_apn_ambr_ext2(ul);
-
-        if dl_ext2 > 0 || ul_ext2 > 0 {
-            buf.write_u8(dl_ext2);
-            buf.write_u8(ul_ext2);
+    buf.write_u8(dl.0);
+    buf.write_u8(ul.0);
+    if dl.1 != 0 || ul.1 != 0 || dl.2 != 0 || ul.2 != 0 {
+        buf.write_u8(dl.1);
+        buf.write_u8(ul.1);
+        if dl.2 != 0 || ul.2 != 0 {
+            buf.write_u8(dl.2);
+            buf.write_u8(ul.2);
         }
     }
-
     buf.into_vec()
 }
 
-/// Encode APN-AMBR value (3GPP TS 24.301 9.9.4.2)
-fn encode_apn_ambr(kbps: u64) -> u8 {
+/// APN-AMBR above which the extended-2 octet is needed: 256 Mbit/s, in kbit/s.
+const APN_AMBR_EXT_MAX_KBPS: u64 = 256_000;
+
+/// One direction's (octet 3, octet 5, octet 7) of Table 9.9.4.2.1 for `kbps`:
+/// the smallest coded value not below it, capped at 65280 Mbit/s.
+fn apn_ambr_octets(kbps: u64) -> (u8, u8, u8) {
     if kbps == 0 {
-        return 0xff;
+        // "1 1 1 1 1 1 1 1 0kbps"
+        return (0xff, 0, 0);
     }
-
-    // 1-63: value * 1 kbps
-    if kbps <= 63 {
-        return kbps as u8;
+    if kbps <= APN_AMBR_EXT_MAX_KBPS {
+        let (o3, o5) = apn_ambr_base(kbps);
+        return (o3, o5, 0);
     }
-
-    // 64-127: 64 + (value - 64) * 8 kbps
-    if kbps <= 568 {
-        return (64 + (kbps - 64) / 8) as u8;
+    // Extended-2: (octet 7) * 256 Mbps + the value of octets 3 and 5, with
+    // octets 3/5 carrying the rest (more than 0, at most 256 Mbps).
+    let o7 = kbps.div_ceil(APN_AMBR_EXT_MAX_KBPS) - 1;
+    if o7 > 0xfe {
+        // 65280 Mbps: octet 5 "11111010", octet 7 "11111110" (§9.9.4.2).
+        return (0xfe, 0xfa, 0xfe);
     }
-
-    // 128-254: 576 + (value - 128) * 64 kbps
-    if kbps <= 8640 {
-        return (128 + (kbps - 576) / 64) as u8;
-    }
-
-    0xfe
+    let (o3, o5) = apn_ambr_base(kbps - o7 * APN_AMBR_EXT_MAX_KBPS);
+    (o3, o5, o7 as u8)
 }
 
-/// Encode APN-AMBR extended value
-fn encode_apn_ambr_ext(kbps: u64) -> u8 {
-    if kbps <= 8640 {
-        return 0;
+/// Octets 3 and 5 for 1..=256000 kbit/s, rounding up to the next step.
+fn apn_ambr_base(kbps: u64) -> (u8, u8) {
+    match kbps {
+        // 1-63 kbps in 1 kbps steps.
+        1..=63 => (kbps as u8, 0),
+        // 64-568 kbps in 8 kbps steps: 64 + (v - 0b0100_0000) * 8.
+        64..=568 => ((0x40 + (kbps - 64).div_ceil(8)) as u8, 0),
+        // 569-575 kbps fall between the 8 and the 64 kbps ranges: the next step
+        // up is 576 kbps (the underflow #1181 found was here).
+        569..=8640 => ((0x80 + kbps.saturating_sub(576).div_ceil(64)) as u8, 0),
+        // Above 8640 kbps octet 3 says 8640 ("11111110") and octet 5 holds the
+        // value: 8600 + v * 100 kbps (8700-16000), 16 Mbps + (v - 0b0100_1010)
+        // * 1 Mbps (17-128 Mbps), 128 Mbps + (v - 0b1011_1010) * 2 Mbps
+        // (130-256 Mbps).
+        8641..=16_000 => (0xfe, (kbps - 8600).div_ceil(100) as u8),
+        16_001..=128_000 => (0xfe, (0x4a + (kbps - 16_000).div_ceil(1000)) as u8),
+        _ => (
+            0xfe,
+            (0xba + (kbps.min(APN_AMBR_EXT_MAX_KBPS) - 128_000).div_ceil(2000)) as u8,
+        ),
     }
-
-    // 1-74: 8600 + value * 100 kbps
-    if kbps <= 16000 {
-        return ((kbps - 8600) / 100) as u8;
-    }
-
-    // 75-186: 16000 + (value - 74) * 1000 kbps
-    if kbps <= 128000 {
-        return (74 + (kbps - 16000) / 1000) as u8;
-    }
-
-    // 187-250: 128000 + (value - 186) * 2000 kbps
-    if kbps <= 256000 {
-        return (186 + (kbps - 128000) / 2000) as u8;
-    }
-
-    0xfa
 }
 
-/// Encode APN-AMBR extended-2 value
-fn encode_apn_ambr_ext2(kbps: u64) -> u8 {
-    if kbps <= 256000 {
-        return 0;
-    }
-
-    // 1-254: 256 Mbps + value * 4 Mbps
-    if kbps <= 1272000 {
-        return ((kbps - 256000) / 4000) as u8;
-    }
-
-    // 255: 1280 Mbps
-    0xff
+/// The kbit/s that (octet 3, octet 5, octet 7) of Table 9.9.4.2.1 stand for.
+#[cfg(test)]
+fn apn_ambr_kbps(o3: u8, o5: u8, o7: u8) -> u64 {
+    let base = if o5 != 0 {
+        let v = u64::from(o5.min(0xfa));
+        match v {
+            1..=0x4a => 8600 + v * 100,
+            0x4b..=0xba => 16_000 + (v - 0x4a) * 1000,
+            _ => 128_000 + (v - 0xba) * 2000,
+        }
+    } else {
+        let v = u64::from(o3);
+        match v {
+            0xff => 0,
+            1..=0x3f => v,
+            0x40..=0x7f => 64 + (v - 0x40) * 8,
+            _ => 576 + (v - 0x80) * 64,
+        }
+    };
+    let o7 = if o7 == 0xff { 0 } else { u64::from(o7) };
+    o7 * 256_000 + base
 }
 
 // ============================================================================
@@ -881,18 +882,107 @@ mod tests {
 
     #[test]
     fn test_encode_apn_ambr() {
-        // 0 kbps
-        assert_eq!(encode_apn_ambr(0), 0xff);
+        // Table 9.9.4.2.1 boundaries, in kbit/s.
+        assert_eq!(apn_ambr_octets(0), (0xff, 0, 0));
+        assert_eq!(apn_ambr_octets(1), (1, 0, 0));
+        assert_eq!(apn_ambr_octets(63), (63, 0, 0));
+        assert_eq!(apn_ambr_octets(64), (0x40, 0, 0));
+        assert_eq!(apn_ambr_octets(568), (0x7f, 0, 0));
+        assert_eq!(apn_ambr_octets(576), (0x80, 0, 0));
+        assert_eq!(apn_ambr_octets(8640), (0xfe, 0, 0));
+        assert_eq!(apn_ambr_octets(8700), (0xfe, 0x01, 0));
+        assert_eq!(apn_ambr_octets(16_000), (0xfe, 0x4a, 0));
+        assert_eq!(apn_ambr_octets(17_000), (0xfe, 0x4b, 0));
+        assert_eq!(apn_ambr_octets(128_000), (0xfe, 0xba, 0));
+        assert_eq!(apn_ambr_octets(130_000), (0xfe, 0xbb, 0));
+        assert_eq!(apn_ambr_octets(256_000), (0xfe, 0xfa, 0));
+        // 512 Mbps = 1 * 256 Mbps + 256 Mbps.
+        assert_eq!(apn_ambr_octets(512_000), (0xfe, 0xfa, 0x01));
+        // 65280 Mbps is the ceiling.
+        assert_eq!(apn_ambr_octets(65_280_000), (0xfe, 0xfa, 0xfe));
+        assert_eq!(apn_ambr_octets(99_000_000), (0xfe, 0xfa, 0xfe));
+    }
 
-        // 1-63 kbps
-        assert_eq!(encode_apn_ambr(1), 1);
-        assert_eq!(encode_apn_ambr(63), 63);
+    /// #1181: 569-575 kbit/s no longer underflow; they take the 576 kbit/s step.
+    #[test]
+    fn apn_ambr_between_the_8_and_64_kbps_ranges_is_576() {
+        for kbps in 569..=575 {
+            assert_eq!(apn_ambr_octets(kbps), (0x80, 0, 0), "{kbps} kbit/s");
+        }
+        // Hand-worked: 570 kbit/s = 570_000 bit/s -> octet 3 "10000000".
+        assert_eq!(apn_ambr_build(570_000, 570_000), vec![0x80, 0x80]);
+    }
 
-        // 64-568 kbps
-        assert_eq!(encode_apn_ambr(64), 64);
+    /// #1181: every coded value is the smallest one not below the request, over
+    /// the whole range (no step lost, no rounding down).
+    #[test]
+    fn apn_ambr_rounds_up_to_the_next_coded_value() {
+        let mut kbps = 1u64;
+        while kbps <= 66_000_000 {
+            let (o3, o5, o7) = apn_ambr_octets(kbps);
+            let coded = apn_ambr_kbps(o3, o5, o7);
+            if kbps <= 65_280_000 {
+                assert!(coded >= kbps, "{kbps} kbit/s coded as {coded}");
+                if kbps > 1 {
+                    let (p3, p5, p7) = apn_ambr_octets(kbps - 1);
+                    let below = apn_ambr_kbps(p3, p5, p7);
+                    assert!(below < kbps || below == coded, "{kbps}: not the smallest");
+                }
+            } else {
+                assert_eq!(coded, 65_280_000);
+            }
+            kbps += if kbps < 20_000 { 1 } else { 997 };
+        }
+    }
 
-        // 576-8640 kbps
-        assert_eq!(encode_apn_ambr(576), 128);
+    /// #1181: the session AMBR is in bit/s (the HSS's, TS 29.272 §7.3.41): a
+    /// 10 Mbit/s subscription is coded as 10000 kbit/s, by hand: octet 3
+    /// "11111110" (8640 kbps), octet 5 = (10000 - 8600) / 100 = 14 = 0x0e.
+    #[test]
+    fn test_apn_ambr_build() {
+        // 10 Mbit/s DL: octet 3 "11111110" (8640 kbps), octet 5 = (10000 - 8600)
+        // / 100 = 14. 5 Mbit/s UL: 576 + 70 * 64 = 5056 kbps, the first step not
+        // below 5000, so octet 4 = 0x80 + 70 = 0xc6; its octet 6 is 0.
+        assert_eq!(
+            apn_ambr_build(10_000_000, 5_000_000),
+            vec![0xfe, 0xc6, 0x0e, 0x00]
+        );
+        // Below 8640 kbit/s both ways, 4 octets: 1000 kbps -> 576 + 7 * 64 =
+        // 1024 (0x87); 500 kbps -> 64 + 55 * 8 = 504 (0x77).
+        assert_eq!(apn_ambr_build(1_000_000, 500_000), vec![0x87, 0x77]);
+        // 1 Gbit/s downlink needs extended-2: 3 * 256 Mbps + 232 Mbps.
+        let ambr = apn_ambr_build(1_000_000_000, 1_000_000);
+        assert_eq!(ambr.len(), 6, "contents octets 3-8");
+        assert_eq!(apn_ambr_kbps(ambr[0], ambr[2], ambr[4]), 1_000_000);
+        assert_eq!(
+            apn_ambr_kbps(ambr[1], ambr[3], ambr[5]),
+            1024,
+            "1000 rounded up"
+        );
+    }
+
+    /// #1181, TS 24.301 §8.3.6: a 10 / 5 Mbit/s session (bit/s, as the HSS
+    /// gives it) reaches the UE in ACTIVATE DEFAULT EPS BEARER CONTEXT REQUEST as
+    /// APN-AMBR 5E 04 FE C6 0E 00, not 1000 times higher.
+    #[test]
+    fn the_default_bearer_request_carries_the_apn_ambr_in_kbps() {
+        let mut sess = MmeSess::default();
+        sess.ambr.downlink = 10_000_000;
+        sess.ambr.uplink = 5_000_000;
+        let bearer = MmeBearer {
+            ebi: 5,
+            ..Default::default()
+        };
+        let msg = build_activate_default_bearer_context_request_with_params(
+            &sess,
+            &bearer,
+            CreateAction::InAttachRequest,
+        );
+        assert!(
+            msg.windows(6)
+                .any(|w| w == [0x5e, 0x04, 0xfe, 0xc6, 0x0e, 0x00]),
+            "APN-AMBR IE in {msg:02x?}"
+        );
     }
 
     #[test]
@@ -906,12 +996,6 @@ mod tests {
         let qos = eps_qos_build(1, 64, 64, 32, 32);
         assert_eq!(qos.len(), 5);
         assert_eq!(qos[0], 1); // QCI
-    }
-
-    #[test]
-    fn test_apn_ambr_build() {
-        let ambr = apn_ambr_build(1000, 500);
-        assert!(ambr.len() >= 2);
     }
 
     #[test]
