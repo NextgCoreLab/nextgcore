@@ -26,6 +26,16 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 - amfd: a `guami`, `tai`, `plmn_support`, `integrity_order` or `ciphering_order` list in the
   config replaces the AMF's list instead of being appended to it (#1070).
 
+### Upgrade notes
+- **PFCP Recovery Time Stamp, 0.1.0 peers (#1033).** TS 29.244 §8.2.65 defines the Recovery
+  Time Stamp only as NTP-era seconds (since 1900-01-01). 0.1.0 sent Unix seconds; 0.2.0 sends
+  NTP seconds (#995). 0.2.0 still accepts a 0.1.0 peer's Unix-seconds stamp: smfd, sgwcd,
+  sgwud and upfd read a received or stored stamp in whichever era is closer to the local clock
+  (`nextgcore_pfcp::recovery_time::normalize_received`), so a 0.1.0 to 0.2.0 rolling upgrade
+  detects peer restarts correctly (TS 23.007 §19A). The shim will be removed in 0.3.0. From
+  then on a Unix-seconds stamp reads as a time ~70 years off, so a peer's restarts are missed
+  or falsely detected. Upgrade every PFCP function to 0.2.0 before any of them moves to 0.3.0.
+
 ## [0.2.0] — Unreleased (draft for operator review)
 
 Draft built from the PRs merged into `main` since the 0.1.0 tag (2026-07-02), cross-checked
