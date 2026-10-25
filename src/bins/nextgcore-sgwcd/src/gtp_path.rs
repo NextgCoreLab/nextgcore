@@ -7476,9 +7476,16 @@ mod tests {
         .unwrap();
         let dsrsp = recv_s11(&sock).await.expect("delete session response");
         assert_eq!(cause_of(&dsrsp), gtp_cause::REQUEST_ACCEPTED);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(pgw.deletes.lock().unwrap().is_empty(), "not relayed");
+        // #1219: the stand-in SGW-U records the deletion on its own task; wait
+        // for it rather than for a fixed 100 ms.
+        for _ in 0..300 {
+            if sgwu.received(54) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert_eq!(sgwu.received(54), 1, "deleted locally");
+        assert!(pgw.deletes.lock().unwrap().is_empty(), "not relayed");
         sgwc_self().set_pgw_s5c_peer(None);
         server.close();
     }
@@ -7530,22 +7537,24 @@ mod tests {
         let dsrsp = recv_s11(&sock).await.expect("answered after N3");
         assert_eq!(dsrsp.header.sequence_number, 0x2522);
         assert_eq!(cause_of(&dsrsp), gtp_cause::REQUEST_ACCEPTED);
-        // At most the request and its N3 = 1 retransmission (a retransmission
-        // thread delayed past 2 x T3 may end the transaction without the
-        // retransmission, TS 29.274 §7.6). What matters: the MME's own
-        // retransmission is not relayed as a further request (#1209).
-        let relayed = pgw.deletes.lock().unwrap().len();
-        assert!(
-            (1..=2).contains(&relayed),
-            "sent, at most retransmitted once on T3 ({relayed})"
+        // #1209 review: the stand-in PGW records what it receives on its own
+        // task, which can lag. Wait positively for the request and its N3 = 1
+        // T3 retransmission (xact polling always sends the retransmission before
+        // it can exhaust), then settle past T3 x (N3 + 1) so any further request
+        // (a relayed MME retransmission and its own retransmission) has arrived
+        // too, then pin the exact count.
+        pgw_wait(&pgw, Gtp2MessageType::DeleteSessionRequest, 2).await;
+        tokio::time::sleep(Duration::from_millis(300 * 2 + 300)).await;
+        let got = pgw_got(&pgw, Gtp2MessageType::DeleteSessionRequest);
+        assert_eq!(
+            got.len(),
+            2,
+            "sent, then retransmitted once on T3; the MME's retransmission is not relayed"
         );
         // A T3 retransmission keeps the request's sequence number; relaying the
         // MME's retransmission would allocate a new one.
         let seqs: std::collections::HashSet<u32> =
-            pgw_got(&pgw, Gtp2MessageType::DeleteSessionRequest)
-                .iter()
-                .map(|m| m.header.sequence_number)
-                .collect();
+            got.iter().map(|m| m.header.sequence_number).collect();
         assert_eq!(
             seqs.len(),
             1,
