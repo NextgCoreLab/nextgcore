@@ -25344,11 +25344,12 @@ mod tests {
     /// session is released at the SMF and the UE is forgotten.
     ///
     /// REVERT-VERIFIED: without the abort the armed PDUs are retransmitted and the
-    /// T3522 UE is kept.
+    /// T3522 UE is kept; without `terminate_policy_associations` no PCF DELETE comes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_release_complete_aborts_the_ues_nas_procedure() {
         let (_nf, port, seen) = recording_nf().await;
         let _env = SmfEnvGuard::acquire(port).await;
+        set_pcf_env(port);
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = capturing_ngap_server().await;
         let assoc = 885_001u64;
@@ -25372,6 +25373,10 @@ mod tests {
             ngap.ue_auth_state.insert(ue, state);
         }
         let dereg = ues[4].0;
+        ngap.ue_auth_state.with_mut(dereg, |s| {
+            s.policy_association_id = Some("am-pol-885".to_string());
+            s.ue_policy_association_id = Some("ue-pol-885".to_string());
+        });
         ngap.sm_context_refs
             .insert((dereg, 5), "smctx-885-dereg".to_string());
         ngap.sm_context_smfs
@@ -25409,9 +25414,28 @@ mod tests {
             !ngap.ue_auth_state.contains(dereg),
             "TS 24.501 §5.5.2.3.5 b): 5GMM-DEREGISTERED"
         );
+        // Its policy associations end at the PCF (TS 23.502 §4.2.2.3.3 step 6).
+        let am = nf_saw(
+            &seen,
+            "DELETE /npcf-am-policy-control/v1/policies/am-pol-885",
+        )
+        .await;
+        let ue_pol = nf_saw(
+            &seen,
+            "DELETE /npcf-ue-policy-control/v1/policies/ue-pol-885",
+        )
+        .await;
+        clear_pcf_env();
+        let seen = seen.lock().expect("seen").clone();
+        assert!(
+            am && ue_pol,
+            "both policy associations are deleted: {seen:?}"
+        );
         assert_eq!(
-            seen.lock().expect("seen").clone(),
-            vec!["POST /nsmf-pdusession/v1/sm-contexts/smctx-885-dereg/release".to_string()],
+            seen.iter()
+                .filter(|s| !s.starts_with("DELETE /npcf-"))
+                .collect::<Vec<_>>(),
+            vec!["POST /nsmf-pdusession/v1/sm-contexts/smctx-885-dereg/release"],
             "the deregistered UE's session is released; nothing else is called"
         );
         for (ue, _, _) in &ues[..4] {
