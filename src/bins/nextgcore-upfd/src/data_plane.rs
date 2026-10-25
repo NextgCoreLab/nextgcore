@@ -3293,7 +3293,26 @@ impl DataPlane {
     }
 
     /// Bind the IPv6 GTP-U socket (#918).
+    ///
+    /// The address is also what the UPF advertises: the IPv6 address of the local
+    /// F-TEIDs it assigns, and the GTP-U Peer Address of its Error Indications
+    /// (#985). So it must be one a gNB can send to. The unspecified address `::`
+    /// (bind every interface) and a multicast address are refused (#985 review);
+    /// advertising `::` would hand the SMF and the gNB an unusable N3 endpoint.
     pub async fn bind_gtpu6(&mut self, addr: SocketAddr) -> io::Result<()> {
+        match addr.ip() {
+            IpAddr::V6(ip) if !ip.is_unspecified() && !ip.is_multicast() => {}
+            ip => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "--gtpu-addr6 {ip}: the IPv6 N3 address is advertised in F-TEIDs \
+                         and Error Indications, so it must be a unicast IPv6 address of \
+                         this host, not unspecified or multicast"
+                    ),
+                ));
+            }
+        }
         log::info!("Binding IPv6 GTP-U socket on {addr}");
         let sock = TokioUdpSocket::bind(addr).await?;
         if let IpAddr::V6(ip) = sock.local_addr()?.ip() {
@@ -7453,6 +7472,28 @@ mod tests {
             socket_int_opt(&v4, libc::IPPROTO_IP, libc::IP_TOS),
             0,
             "the IPv4 socket is not touched by an IPv6 send"
+        );
+    }
+
+    /// #985 review: `--gtpu-addr6 ::` (or a multicast address) is refused at bind,
+    /// because the address is advertised as the N3 endpoint. No socket is bound and
+    /// no address is recorded for the F-TEIDs to carry.
+    #[tokio::test]
+    async fn an_unspecified_or_multicast_ipv6_n3_address_is_refused() {
+        let mut dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        for bad in ["[::]:0", "[ff02::1]:0", "127.0.0.1:0"] {
+            let err = dp.bind_gtpu6(bad.parse().unwrap()).await.expect_err(bad);
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{bad}");
+            assert!(dp.gtpu_socket6.is_none(), "{bad}");
+            assert!(dp.local_gtpu_addr6.read().unwrap().is_none(), "{bad}");
+        }
+        if ipv6_loopback_socket().await.is_none() {
+            return;
+        }
+        dp.bind_gtpu6("[::1]:0".parse().unwrap()).await.unwrap();
+        assert_eq!(
+            *dp.local_gtpu_addr6.read().unwrap(),
+            Some(Ipv6Addr::LOCALHOST)
         );
     }
 

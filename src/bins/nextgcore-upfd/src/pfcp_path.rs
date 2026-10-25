@@ -878,34 +878,35 @@ impl PfcpServer {
     }
 
     /// The addresses of a local F-TEID the UP function assigns (TS 29.244 §8.2.3,
-    /// #985). With CH set, V4 / V6 say which family to assign; both may be set. The
-    /// IPv4 address is the Node ID's, as before. An IPv6 address is given only when
-    /// the UPF has an IPv6 GTP-U socket; asked for IPv6 alone without one, the UPF
-    /// falls back to IPv4 (what it always answered) and logs it. No flag at all (this
-    /// tree's SMF asks with a zero TEID and no address) means IPv4.
+    /// #985). With CH set, "the UP function shall assign an F-TEID with an IPv4 or an
+    /// IPv6 address if the V4 or V6 bit is set respectively", and both may be set.
+    /// The IPv4 address is the Node ID's, as before. An IPv6 address is given only
+    /// when the UPF has an IPv6 GTP-U socket. No flag at all (this tree's SMF asks
+    /// with a zero TEID and no address) means IPv4.
+    ///
+    /// `None` when IPv6 alone is asked for and the UPF has no IPv6 N3 address: the
+    /// request cannot be met, so the caller refuses the rule rather than answering
+    /// with an IPv4 F-TEID the CP function did not ask for (#985 review). With V4 and
+    /// V6 both set, IPv4 alone meets it.
     fn local_f_teid_addrs(
         &self,
         req: &crate::n4_build::ParsedFTeid,
-    ) -> (Option<Ipv4Addr>, Option<Ipv6Addr>) {
+    ) -> Option<(Option<Ipv4Addr>, Option<Ipv6Addr>)> {
         let node_v4 = match &self.local_node_id {
             NodeId::Ipv4(addr) => Some(*addr),
             _ => None,
         };
         let n3_v6 = self.n3_ipv6.read().ok().and_then(|a| *a);
-        let want_v4 = req.v4 || !req.v6;
         let ipv6 = if req.v6 { n3_v6 } else { None };
-        let ipv4 = if want_v4 || ipv6.is_none() {
-            if req.v6 && !req.v4 && ipv6.is_none() {
-                log::warn!(
-                    "F-TEID with IPv6 requested but the UPF has no IPv6 GTP-U socket \
-                     (set --gtpu-addr6): assigning IPv4"
-                );
-            }
-            node_v4
-        } else {
-            None
-        };
-        (ipv4, ipv6)
+        let ipv4 = if req.v4 || !req.v6 { node_v4 } else { None };
+        if req.v6 && !req.v4 && ipv6.is_none() {
+            log::warn!(
+                "F-TEID with IPv6 only requested, but the UPF has no IPv6 GTP-U socket \
+                 (set --gtpu-addr6): the PDR is refused"
+            );
+            return None;
+        }
+        Some((ipv4, ipv6))
     }
 
     /// Allocate a new SEID
@@ -1796,12 +1797,31 @@ impl PfcpServer {
                     // uplink GTP-U traffic matches.
                     let local_f_teid = if let Some(ref fteid) = pdr.pdi.local_f_teid {
                         if fteid.ch || fteid.teid == 0 {
+                            let Some((ipv4, ipv6)) = self.local_f_teid_addrs(fteid) else {
+                                // #985 review: an IPv6-only F-TEID this UPF cannot
+                                // assign refuses the establishment (§7.5.3.1).
+                                let resp_payload = build_failure_response(
+                                    PfcpCause::RuleCreationModificationFailure,
+                                    Some(pfcp_ie::CREATE_PDR),
+                                );
+                                let response = self.build_response(
+                                    pfcp_type::SESSION_ESTABLISHMENT_RESPONSE,
+                                    smf_seid,
+                                    header.sequence_number,
+                                    &resp_payload,
+                                    true,
+                                );
+                                self.socket
+                                    .send_to(&response, src_addr)
+                                    .await
+                                    .map_err(|e| format!("Send error: {e}"))?;
+                                return Ok(());
+                            };
                             ul_teid = self.alloc_teid();
                             log::debug!(
                                 "Allocated uplink F-TEID: teid={ul_teid:#x} (ch={})",
                                 fteid.ch
                             );
-                            let (ipv4, ipv6) = self.local_f_teid_addrs(fteid);
                             Some(FTeid {
                                 teid: ul_teid,
                                 ipv4,
@@ -2135,13 +2155,21 @@ impl PfcpServer {
                 if !(fteid.ch || fteid.teid == 0) {
                     continue;
                 }
+                let Some((ipv4, ipv6)) = self.local_f_teid_addrs(fteid) else {
+                    // #985 review: refused, not answered with an IPv4 F-TEID.
+                    note_first_failure(
+                        &mut failure,
+                        PfcpCause::RuleCreationModificationFailure,
+                        pfcp_ie::CREATE_PDR,
+                    );
+                    continue;
+                };
                 let teid = match (fteid.chid, fteid.choose_id) {
                     (true, Some(id)) => {
                         *by_choose_id.entry(id).or_insert_with(|| self.alloc_teid())
                     }
                     _ => self.alloc_teid(),
                 };
-                let (ipv4, ipv6) = self.local_f_teid_addrs(fteid);
                 *fteid = crate::n4_build::ParsedFTeid {
                     teid,
                     ipv4,
@@ -3951,9 +3979,25 @@ mod tests {
         let n3_v6: Ipv6Addr = "2001:db8::985".parse().unwrap();
         let node_v4 = Ipv4Addr::LOCALHOST;
 
-        // No IPv6 socket yet: CH+V6 falls back to IPv4, as before.
-        let resp = modify_creating_pdr(&smf, addr, upf_seid, 3, 0x60, &[0x06]).await;
-        let f = created_f_teid(&resp, 0x60);
+        // No IPv6 socket yet: CH+V6 cannot be met, so the PDR is refused (#985
+        // review) rather than answered with an IPv4 F-TEID; CH+V4+V6 gets IPv4.
+        let mut pdi = crate::n4_build::PfcpMessageBuilder::new();
+        pdi.add_u8(pfcp_ie::SOURCE_INTERFACE, 0);
+        pdi.add_tlv(pfcp_ie::F_TEID, &[0x06]);
+        let mut pdr = crate::n4_build::PfcpMessageBuilder::new();
+        pdr.add_pdr_id(0x60);
+        pdr.add_u32(pfcp_ie::PRECEDENCE, 10);
+        pdr.add_tlv(pfcp_ie::PDI, &pdi.build());
+        pdr.add_u32(pfcp_ie::FAR_ID, 1);
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(pfcp_ie::CREATE_PDR, &pdr.build());
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &b.build())).await;
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::RuleCreationModificationFailure as u8
+        );
+        let resp = modify_creating_pdr(&smf, addr, upf_seid, 8, 0x65, &[0x07]).await;
+        let f = created_f_teid(&resp, 0x65);
         assert_eq!((f.ipv4, f.ipv6), (Some(node_v4), None));
 
         server.set_n3_ipv6(Some(n3_v6));
@@ -3972,15 +4016,44 @@ mod tests {
     }
 
     /// #985: the establishment path assigns the same way: CH+V6 with an IPv6 GTP-U
-    /// socket gives an IPv6-only local F-TEID in the Created PDR.
+    /// socket gives an IPv6-only local F-TEID in the Created PDR, and without one the
+    /// establishment is refused (#985 review).
     #[tokio::test]
     async fn an_establishment_chosen_f_teid_can_be_ipv6() {
         let (server, smf, addr, _rx) = spawn_test_server().await;
         let n3_v6: Ipv6Addr = "2001:db8::986".parse().unwrap();
-        server.set_n3_ipv6(Some(n3_v6));
         let assoc = build_association_setup_request_payload(Some(1));
         let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+        let refused = exchange(
+            &smf,
+            addr,
+            &encode_pfcp(50, Some(0), 2, &establishment_ch_v6()),
+        )
+        .await;
+        assert_eq!(
+            response_cause(&refused),
+            PfcpCause::RuleCreationModificationFailure as u8,
+            "no IPv6 N3 address: CH+V6 cannot be met"
+        );
+        assert!(
+            server.sessions.read().await.is_empty(),
+            "no session was created"
+        );
+        server.set_n3_ipv6(Some(n3_v6));
+        let resp = exchange(
+            &smf,
+            addr,
+            &encode_pfcp(50, Some(0), 3, &establishment_ch_v6()),
+        )
+        .await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        let f = created_f_teid(&resp, 1);
+        assert_ne!(f.teid, 0);
+        assert_eq!((f.ipv4, f.ipv6), (None, Some(n3_v6)));
+    }
 
+    /// A Session Establishment Request with one Access PDR whose F-TEID is CH+V6.
+    fn establishment_ch_v6() -> Vec<u8> {
         let mut pdi = crate::n4_build::PfcpMessageBuilder::new();
         pdi.add_u8(pfcp_ie::SOURCE_INTERFACE, 0);
         pdi.add_tlv(pfcp_ie::F_TEID, &[0x06]); // CH + V6
@@ -3998,11 +4071,7 @@ mod tests {
         });
         b.add_tlv(pfcp_ie::CREATE_PDR, &pdr.build());
         b.add_tlv(pfcp_ie::CREATE_FAR, &far_body(1, 0x02));
-        let resp = exchange(&smf, addr, &encode_pfcp(50, Some(0), 2, &b.build())).await;
-        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
-        let f = created_f_teid(&resp, 1);
-        assert_ne!(f.teid, 0);
-        assert_eq!((f.ipv4, f.ipv6), (None, Some(n3_v6)));
+        b.build()
     }
 
     /// #985 (TS 29.244 §7.5.8.4, §8.2.3): an Error Indication about an IPv6 gNB is
