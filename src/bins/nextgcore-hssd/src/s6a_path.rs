@@ -570,6 +570,18 @@ fn peer_connected(dest_host: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// `msg` as it goes out again (#1021): a request already transmitted at least
+/// once carries the T (potentially retransmitted) flag, so the MME can detect
+/// a duplicate by its End-to-End Identifier and Origin-Host (RFC 6733 §3,
+/// §5.5.4). Hop-by-Hop, End-to-End and Session-Id are unchanged. A request
+/// queued before any transmission goes out as a first one, without T.
+fn for_resend(mut msg: DiameterMessage, attempts: u32) -> DiameterMessage {
+    if attempts > 0 {
+        msg.header.flags |= nextgcore_diameter::message::cmd_flags::RETRANSMIT;
+    }
+    msg
+}
+
 /// Sweep the outstanding-request table once: retransmit what is due, abandon what
 /// has exhausted its attempts (#56, RFC 6733 §5.5.4).
 ///
@@ -634,9 +646,12 @@ pub fn sweep_pending_requests() -> (usize, usize) {
                     let pending = pending_requests()
                         .read()
                         .expect("pending request table lock poisoned");
-                    pending
-                        .get(&session_id)
-                        .map(|r| (r.dest_host.clone(), r.message.clone()))
+                    pending.get(&session_id).map(|r| {
+                        (
+                            r.dest_host.clone(),
+                            for_resend(r.message.clone(), r.attempts),
+                        )
+                    })
                 };
                 if let Some((dest_host, msg)) = to_send {
                     match send_to_mme(&dest_host, msg) {
@@ -710,7 +725,12 @@ pub fn requeue_for_peer(dest_host: &str) -> usize {
         pending
             .values()
             .filter(|r| r.awaiting_peer && r.dest_host == dest_host)
-            .map(|r| (r.session_id.clone(), r.message.clone()))
+            .map(|r| {
+                (
+                    r.session_id.clone(),
+                    for_resend(r.message.clone(), r.attempts),
+                )
+            })
             .collect()
     };
     if queued.is_empty() {
@@ -3419,6 +3439,96 @@ mod tests {
         rewind_age(HSS_INITIATED_MAX_AGE);
         let (_, abandoned) = sweep_pending_requests();
         assert_eq!(abandoned, 1, "bounded by age in service");
+        unregister_mme_peer(host);
+        clear_pending_requests();
+    }
+
+    /// #1021, RFC 6733 §3 / §5.5.4: a CLR the sweep retransmits carries the T
+    /// flag, with its Hop-by-Hop and End-to-End Identifiers and Session-Id
+    /// unchanged; the first transmission does not.
+    #[tokio::test]
+    async fn a_swept_retransmission_carries_the_t_flag() {
+        let _guard = PEER_TEST_LOCK.lock().expect("peer test lock");
+        disarm_restart_reset();
+        clear_pending_requests();
+        let host = "mme-tflag-sweep.epc.example.org";
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        register_mme_peer(host, tx);
+        let clr = build_clr_request(
+            "001010000001021",
+            host,
+            "epc.example.org",
+            CancellationType::SubscriptionWithdrawal,
+            None,
+        );
+        send_tracked(host, clr).expect("sent");
+        let first = rx.try_recv().expect("first transmission");
+        assert_eq!(
+            first.header.flags & nextgcore_diameter::message::cmd_flags::RETRANSMIT,
+            0
+        );
+        if let Some(r) = pending_requests().write().unwrap().values_mut().next() {
+            r.last_sent = std::time::Instant::now() - secs(HSS_INITIATED_RETRANSMIT_SECS + 1);
+        }
+        let (retransmitted, _) = sweep_pending_requests();
+        assert_eq!(retransmitted, 1);
+        let again = rx.try_recv().expect("retransmission");
+        assert_ne!(
+            again.header.flags & nextgcore_diameter::message::cmd_flags::RETRANSMIT,
+            0,
+            "T set"
+        );
+        assert_eq!(again.header.hop_by_hop_id, first.header.hop_by_hop_id);
+        assert_eq!(again.header.end_to_end_id, first.header.end_to_end_id);
+        assert_eq!(again.session_id(), first.session_id());
+        unregister_mme_peer(host);
+        clear_pending_requests();
+    }
+
+    /// #1021: a CLR sent, then parked when its MME dropped, is redelivered on
+    /// reconnect with the T flag (a resend after a transport failure). A CLR
+    /// queued before any transmission is delivered as a first one, without it.
+    #[tokio::test]
+    async fn a_requeued_retransmission_carries_the_t_flag_a_first_delivery_does_not() {
+        let _guard = PEER_TEST_LOCK.lock().expect("peer test lock");
+        disarm_restart_reset();
+        clear_pending_requests();
+        let host = "mme-tflag-requeue.epc.example.org";
+        let clr = |imsi: &str| {
+            build_clr_request(
+                imsi,
+                host,
+                "epc.example.org",
+                CancellationType::SubscriptionWithdrawal,
+                None,
+            )
+        };
+        // Never sent: queued for a disconnected MME.
+        send_tracked(host, clr("001010000001022")).expect("queued");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        register_mme_peer(host, tx);
+        let first = rx.try_recv().expect("delivered on connect");
+        assert_eq!(
+            first.header.flags & nextgcore_diameter::message::cmd_flags::RETRANSMIT,
+            0,
+            "a first transmission"
+        );
+        // It is now in flight; the MME drops and the request is parked.
+        if let Some(r) = pending_requests().write().unwrap().values_mut().next() {
+            r.awaiting_peer = true;
+        }
+        unregister_mme_peer(host);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        register_mme_peer(host, tx);
+        let again = rx.try_recv().expect("redelivered on reconnect");
+        assert_ne!(
+            again.header.flags & nextgcore_diameter::message::cmd_flags::RETRANSMIT,
+            0,
+            "T set on the resend"
+        );
+        assert_eq!(again.header.hop_by_hop_id, first.header.hop_by_hop_id);
+        assert_eq!(again.header.end_to_end_id, first.header.end_to_end_id);
+        assert_eq!(again.session_id(), first.session_id());
         unregister_mme_peer(host);
         clear_pending_requests();
     }
