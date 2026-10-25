@@ -475,12 +475,14 @@ fn ue_ng_connected(ue: &AmfUe) -> bool {
 
 /// Whether the UE can be paged: its live NGAP record says registered and CM-IDLE,
 /// so it holds the 5G-S-TMSI and the registration area paging needs.
-fn ue_pageable(ue: &AmfUe) -> bool {
+pub(crate) fn ue_pageable(ue: &AmfUe) -> bool {
     amf_self()
         .read()
         .ok()
         .and_then(|g| g.ue_store().get(ue.id))
-        .is_some_and(|state| state.is_registered() && state.is_cm_idle() && state.is_bound())
+        .is_some_and(|state| {
+            state.is_registered() && state.is_cm_idle() && state.has_registration_area()
+        })
 }
 
 /// The pool's RAN UE context of a UE with no live NGAP record (see

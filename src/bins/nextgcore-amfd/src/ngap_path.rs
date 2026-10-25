@@ -248,6 +248,9 @@ const ACCESS_TYPE_3GPP: u8 = 0x01;
 /// procedure dispatch. Sourced from the generated ASN.1 constants (#417) so
 /// the wire byte we read at `data[1]` is matched against spec constants, not
 /// magic numbers.
+/// #686: UE contexts survive an AMF restart.
+pub mod ue_context_store;
+
 mod proc_code {
     use nextgcore_ngap_gen::generated as g;
     pub const ERROR_INDICATION: u16 = g::ID_ERROR_INDICATION as u16;
@@ -727,6 +730,9 @@ pub struct UeNasContext {
     /// completes, because the UE set no follow-on request and no user plane was
     /// re-established (TS 24.501 §5.3.1.3 b), the conditions of the UE's T3540).
     release_after_registration: bool,
+    /// #686: restored from the UE context store after an AMF restart. Such a UE has no
+    /// NG association yet but does have a registration area, so it can be paged.
+    restored: bool,
 }
 
 /// Manual `Debug` (no-auth-material-in-logs): the authentication material in
@@ -830,6 +836,13 @@ impl UeNasContext {
         self.association_id != 0
     }
 
+    /// Whether the UE has a registration area to be paged in: it registered over an NG
+    /// association, or its registration was restored after an AMF restart (#686). A
+    /// context created over Namf for a UE no gNB has signalled for has neither.
+    pub(crate) fn has_registration_area(&self) -> bool {
+        self.is_bound() || self.restored
+    }
+
     /// Create a per-UE NAS context. `use_nextgcore_nas_security` is the Wave-6
     /// H9 runtime canary applied to the fresh `AmfUe`: the production caller
     /// passes `crate::context::nas_security_canary()` (the process-wide setting,
@@ -867,6 +880,7 @@ impl UeNasContext {
             registration_follow_on: false,
             release_after_registration: false,
             cm_idle: false,
+            restored: false,
         }
     }
 
@@ -1084,6 +1098,12 @@ pub struct NgapServer {
     up_active: std::collections::HashSet<(u64, u8)>,
     /// When `sweep_orphaned_session_state` last ran (#756).
     last_session_sweep: std::time::Instant,
+    /// #686: the UE context storage, when armed ([`ue_context_store`]).
+    ue_context_store: Option<ue_context_store::UeContextStore>,
+    /// Test seam (#686): the served GUAMIs a restore checks stored GUTIs against, instead
+    /// of the process-global configuration other tests change.
+    #[cfg(test)]
+    served_guami_override: Option<Vec<ue_context_store::ServedGuami>>,
     /// PDU Session Establishment Requests whose CreateSMContext found no SMF
     /// reachable (#796), keyed by (AMF UE NGAP ID, PSI), retried until
     /// [`ESTABLISHMENT_RETRY_WINDOW`] has passed. See
@@ -1602,6 +1622,9 @@ impl NgapServer {
             ngap_overload_declared: false,
             up_active: std::collections::HashSet::new(),
             last_session_sweep: std::time::Instant::now(),
+            ue_context_store: None,
+            #[cfg(test)]
+            served_guami_override: None,
             pending_establishments: HashMap::new(),
             outstanding_releases: HashMap::new(),
             racs_assigns: HashMap::new(),
@@ -1736,6 +1759,10 @@ impl NgapServer {
                 log::info!("Dropped {dropped} orphaned per-session entries (#756)");
             }
         }
+
+        // #686: store what changed in the stable UE contexts (at most once a second,
+        // handed to the writer thread; no store round trip here).
+        self.persist_ue_contexts(false);
 
         // Process any pending server events
         while let Ok(event) = self.server_event_rx.try_recv() {
@@ -20905,12 +20932,29 @@ pub async fn amf_ngap_open(
     });
 
     let handle = NgapServerHandle::new(addr, backend, event_tx).await?;
+    // #686: the stored UE contexts are restored before the first poll accepts an NG
+    // association, so a returning UE finds its context.
+    {
+        let mut server = handle.inner.lock().await;
+        ue_context_store::open_from_env(&mut server).await;
+    }
     let local_addr = handle.local_addr().await;
 
     let _ = NGAP_SERVER.set(handle);
 
     log::info!("NGAP path opened on {local_addr} ({})", backend.label());
     Ok(())
+}
+
+/// #686: store the UE contexts one last time before shutdown, waiting at most
+/// [`ue_context_store::SHUTDOWN_FLUSH_TIMEOUT`].
+pub async fn amf_ngap_flush_ue_contexts() {
+    if let Some(handle) = NGAP_SERVER.get() {
+        let mut server = handle.inner.lock().await;
+        server
+            .flush_ue_contexts(ue_context_store::SHUTDOWN_FLUSH_TIMEOUT)
+            .await;
+    }
 }
 
 /// Close NGAP path
@@ -21146,6 +21190,8 @@ mod tests {
     mod racs_handler_tests;
     mod racs_mapping_tests;
     mod reject_path_tests;
+    /// #686: UE contexts survive an AMF restart.
+    mod ue_context_store_tests;
     /// #999: every handler's undecodable arm answers TS 38.413 §10.2.
     mod undecodable_tests;
 

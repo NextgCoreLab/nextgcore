@@ -63,7 +63,7 @@ pub const NEXTGCORE_NAS_KSI_NO_KEY_IS_AVAILABLE: u8 = 7;
 // ============================================================================
 
 /// PLMN ID
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct PlmnId {
     /// MCC digit 1
     pub mcc1: u8,
@@ -146,7 +146,7 @@ pub struct Guami {
 }
 
 /// 5GS TAI (Tracking Area Identity)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Tai5gs {
     /// PLMN ID
     pub plmn_id: PlmnId,
@@ -155,7 +155,7 @@ pub struct Tai5gs {
 }
 
 /// NR CGI (NR Cell Global Identity)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct NrCgi {
     /// PLMN ID
     pub plmn_id: PlmnId,
@@ -164,7 +164,7 @@ pub struct NrCgi {
 }
 
 /// S-NSSAI (Single Network Slice Selection Assistance Information)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SNssai {
     /// SST (Slice/Service Type)
     pub sst: u8,
@@ -173,7 +173,7 @@ pub struct SNssai {
 }
 
 /// Bitrate
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Bitrate {
     /// Downlink bitrate (bps)
     pub downlink: u64,
@@ -198,7 +198,7 @@ pub struct NetworkName {
 }
 
 /// UE security capability
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct UeSecurityCapability {
     /// 5G-EA algorithms (bitmap)
     pub ea: u8,
@@ -211,7 +211,7 @@ pub struct UeSecurityCapability {
 }
 
 /// UE network capability
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct UeNetworkCapability {
     /// EEA algorithms (bitmap)
     pub eea: u8,
@@ -220,7 +220,7 @@ pub struct UeNetworkCapability {
 }
 
 /// 5GS GUTI
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Guti5gs {
     /// PLMN ID
     pub plmn_id: PlmnId,
@@ -3452,7 +3452,7 @@ pub struct NasState {
 }
 
 /// GMM capability
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GmmCapability {
     /// LTE positioning protocol capability
     pub lte_positioning_protocol_capability: bool,
@@ -3463,7 +3463,7 @@ pub struct GmmCapability {
 }
 
 /// Policy association
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PolicyAssociation {
     /// Resource URI
     pub resource_uri: Option<String>,
@@ -3521,7 +3521,7 @@ pub struct ExplicitDeRegistered {
 /// schema. Presence is therefore enforced (both are `required` in `Arp`) and the
 /// value is not, which is the same stance this tree took for other extensible
 /// enumerations, and it means an ARP is echoed back exactly as the SMF stated it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EbiArp {
     /// `priorityLevel`, 1..=15 (1 is highest). Validated on ingest.
     pub priority_level: u8,
@@ -3536,7 +3536,7 @@ pub struct EbiArp {
 /// TS 23.502 §4.11.1.4.1: for a PDU session that may move to EPS, the SMF asks
 /// the AMF for an EBI per QoS flow that needs one, supplying that flow's ARP; the
 /// AMF owns the identity space and answers with the values it allocated.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AssignedEbi {
     /// The allocated EBI, always in [`EBI_ASSIGNABLE`].
     pub ebi: u8,
