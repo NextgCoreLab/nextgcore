@@ -982,6 +982,10 @@ impl AmfApp {
 
         nextgcore_sbi::heartbeat::deregister_self().await;
 
+        // #686: the UE contexts' last stable state reaches the store before the NG
+        // associations go.
+        ngap_path::amf_ngap_flush_ue_contexts().await;
+
         // Close NGAP
         ngap_path::amf_ngap_close().await;
 
