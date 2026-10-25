@@ -1107,8 +1107,44 @@ mod tests {
     use super::*;
     use crate::context::{FSeid, SgwuFar, SgwuPdr};
 
-    fn test_server(peer_port: u16) -> GtpuServer {
-        GtpuServer::open("127.0.0.1:0", peer_port).unwrap()
+    /// A test's GTP-U server, closed when the test ends, pass or fail (#1135).
+    ///
+    /// A server left open keeps its receive thread for the rest of the process,
+    /// and that thread runs an Echo round every `SGWU_GTPU_ECHO_INTERVAL_SECS`
+    /// (60 s by default). Once a slow suite passes that mark, the round prunes
+    /// the path table and counts misses toward every FAR peer, without
+    /// [`GTPU_PATH_TEST_LOCK`]. The path-table tests then see their peer pruned
+    /// or a stranger failed.
+    struct TestServer(GtpuServer);
+
+    impl std::ops::Deref for TestServer {
+        type Target = GtpuServer;
+        fn deref(&self) -> &GtpuServer {
+            &self.0
+        }
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            self.0.close();
+        }
+    }
+
+    fn test_server(peer_port: u16) -> TestServer {
+        TestServer(GtpuServer::open("127.0.0.1:0", peer_port).unwrap())
+    }
+
+    /// #1135: a test server stops its receive (and Echo) thread when dropped,
+    /// even if the test never closes it.
+    #[test]
+    fn a_test_server_stops_its_thread_when_dropped() {
+        let server = test_server(GTPV1_U_UDP_PORT);
+        let inner = server.inner.clone();
+        drop(server);
+        assert!(
+            !inner.running.load(Ordering::SeqCst),
+            "the receive loop is told to stop"
+        );
     }
 
     fn client() -> UdpSocket {
