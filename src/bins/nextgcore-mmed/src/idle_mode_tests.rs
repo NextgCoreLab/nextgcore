@@ -1722,6 +1722,148 @@ fn an_unprotected_tau_does_not_answer_a_deactivation_paging() {
     release(&ue);
 }
 
+/// [`tau_request`] with `extra` optional IEs after the mandatory part.
+fn tau_request_with(sqn: u8, count: u32, extra: &[u8]) -> Vec<u8> {
+    let mut plain = vec![
+        0x07u8, 0x48, 0x00, 0x0b, 0xf6, 0x99, 0xf9, 0x07, 0x00, 0x02, 0x01, 0x00, 0x00, 0x09, 0x61,
+    ];
+    plain.extend_from_slice(extra);
+    let mut signed = vec![sqn];
+    signed.extend_from_slice(&plain);
+    let mac = crate::nas_security::nas_mac_calculate(2, &KNAS_INT, count, 0, 0, &signed);
+    let mut pdu = vec![0x17u8];
+    pdu.extend_from_slice(&mac);
+    pdu.extend_from_slice(&signed);
+    pdu
+}
+
+/// The EPS bearer context status bitmap of a TAU ACCEPT in a DOWNLINK NAS
+/// TRANSPORT (EEA0, so readable), if it carries one.
+fn tau_accept_status(pdu: &g::S1AP_PDU) -> Option<Option<u16>> {
+    let g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+        value: g::InitiatingMessageValue::Id_downlinkNASTransport(dl),
+        ..
+    }) = pdu
+    else {
+        return None;
+    };
+    dl.protocol_i_es.0.iter().find_map(|ie| match &ie.value {
+        g::DownlinkNASTransportProtocolIEs_EntryValue::Id_NAS_PDU(nas) => {
+            let nas = &nas.0;
+            // 6-octet security header, then 0x07 and the message type.
+            if nas.get(7) != Some(&0x49) {
+                return None;
+            }
+            Some(
+                nas[8..]
+                    .windows(4)
+                    .find(|w| w[0] == 0x57 && w[1] == 0x02)
+                    .map(|w| u16::from(w[2]) | (u16::from(w[3]) << 8)),
+            )
+        }
+        _ => None,
+    })
+}
+
+/// #993, TS 24.301 §5.5.3.2.4: a TRACKING AREA UPDATE REQUEST's EPS bearer
+/// context status reports dedicated bearer 6 and the default bearer 7 of a
+/// second PDN connection inactive. Both are deactivated locally, with no NAS
+/// to the UE. The Serving GW gets a Delete Bearer Command for 6 and a Delete
+/// Session Request for the second PDN connection, which is removed. The TAU
+/// ACCEPT's status lists only EBI 5.
+#[test]
+fn a_tau_bearer_status_deactivates_what_the_ue_reports_inactive() {
+    let _guard = lock_s11();
+    let (sgw, _route) = sgw(Gtp2XactConfig::default());
+    let ue = seed(0x0993, &[5, 6]);
+    let sess7 = add_pdn(&ue, 7);
+    let ctx = mme_self();
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    let _ = crate::s1ap_path::take_tapped_for_test(ue.enb_id);
+    if let Some(e) = ctx.enb_ue_pool.write().unwrap().get_mut(&ue.enb_ue_id) {
+        e.saved.tai = ue.tai.clone();
+    }
+    // Octet 3 = EBI(7)..EBI(0): only EBI 5 active.
+    crate::nas_dispatch::nas_eps_handle_uplink(
+        ctx,
+        crate::nas_dispatch::UplinkNas {
+            enb_ue_id: ue.enb_ue_id,
+            nas_pdu: &tau_request_with(0, 0, &[0x57, 0x02, 1 << 5, 0x00]),
+            s_tmsi: None,
+        },
+    );
+    let status = wait_pdu(ue.enb_id, tau_accept_status);
+    assert_eq!(status, Some(1 << 5), "the accept lists only EBI 5");
+
+    let mut types = Vec::new();
+    let mut dbc_ebis = Vec::new();
+    let mut buf = [0u8; 4096];
+    sgw.set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    while let Ok((len, _)) = sgw.recv_from(&mut buf) {
+        let msg = Gtp2Message::decode(&mut bytes::Bytes::copy_from_slice(&buf[..len])).unwrap();
+        if msg.header.message_type == 66 {
+            dbc_ebis.extend(
+                msg.get_ies(Gtp2IeType::BearerContext as u8)
+                    .into_iter()
+                    .filter_map(|ie| Gtp2BearerContextIe::decode(&ie.value).ok()?.ebi().ok()),
+            );
+        }
+        types.push(msg.header.message_type);
+    }
+    assert!(
+        types.contains(&36),
+        "Delete Session Request for PDN 7: {types:?}"
+    );
+    assert_eq!(dbc_ebis, vec![6], "Delete Bearer Command for EBI 6");
+    assert!(
+        ctx.sess_find_by_id(sess7).is_none(),
+        "the second PDN connection is removed"
+    );
+    assert!(!ctx
+        .mme_ue_find_by_id(ue.mme_ue_id)
+        .unwrap()
+        .sess_list
+        .contains(&sess7));
+    let b6 = ctx
+        .bearer_find_by_ebi(ue.mme_ue_id, 6)
+        .and_then(|id| ctx.bearer_find_by_id(id))
+        .expect("6 waits for the Serving GW's Delete Bearer Request");
+    assert!(b6.released_by_enb, "answered then without NAS signalling");
+    release(&ue);
+}
+
+/// #993: the default bearer of the last remaining PDN connection is kept even
+/// when the UE reports it inactive (no EMM-REGISTERED without PDN connection);
+/// only the other PDN connection goes.
+#[test]
+fn a_tau_bearer_status_keeps_the_last_pdn_connection() {
+    let _guard = lock_s11();
+    let (sgw, _route) = sgw(Gtp2XactConfig::default());
+    let ue = seed(0x0994, &[5]);
+    let sess7 = add_pdn(&ue, 7);
+    let ctx = mme_self();
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    let _ = crate::s1ap_path::take_tapped_for_test(ue.enb_id);
+    if let Some(e) = ctx.enb_ue_pool.write().unwrap().get_mut(&ue.enb_ue_id) {
+        e.saved.tai = ue.tai.clone();
+    }
+    crate::nas_dispatch::nas_eps_handle_uplink(
+        ctx,
+        crate::nas_dispatch::UplinkNas {
+            enb_ue_id: ue.enb_ue_id,
+            nas_pdu: &tau_request_with(0, 0, &[0x57, 0x02, 0x00, 0x00]),
+            s_tmsi: None,
+        },
+    );
+    let status = wait_pdu(ue.enb_id, tau_accept_status);
+    assert_eq!(status, Some(1 << 5), "the first PDN connection is kept");
+    let (_, _) = recv(&sgw, 36);
+    assert!(ctx.sess_find_by_id(sess7).is_none());
+    assert!(ctx.sess_find_by_id(ue.sess_id).is_some());
+    release(&ue);
+}
+
 /// #641 stop-gap, TS 29.274 §7.2.4 / §8.4: this MME cannot activate a dedicated
 /// bearer, so a Create Bearer Request is answered at once with "Service not
 /// supported", under the request's sequence number and addressed to the Serving
