@@ -7731,7 +7731,34 @@ async fn trigger_network_initiated_service_request(seid: u64, qfi: Option<u8>) {
                         .as_deref()
                         .is_some_and(|r| pfcp_seid(r) == seid)
                 })
-            })?;
+            });
+            let Some(sess) = sess else {
+                // #1230: an SM context restored from the snapshot has its PFCP session,
+                // policy binding and uplink endpoint, and no in-memory session. Its
+                // binding names the UE, the PDU session and the AMF. Its user plane is
+                // taken as deactivated: the UPF reports downlink data only for a FAR
+                // that buffers (TS 29.244 §7.5.8.2), and a UE connected at the restart
+                // is carried by the gNB's tunnel without the SMF.
+                let reference = ctx
+                    .pfcp_sessions
+                    .read()
+                    .ok()?
+                    .keys()
+                    .find(|r| pfcp_seid(r) == seid)
+                    .cloned()?;
+                let binding = ctx
+                    .policy_bindings
+                    .read()
+                    .ok()
+                    .and_then(|b| b.get(&reference).cloned())?;
+                return Some((
+                    reference,
+                    binding.supi.clone(),
+                    binding.psi,
+                    binding.sm_context_status_uri.clone(),
+                    true,
+                ));
+            };
             let reference = sess.sm_context_ref.clone()?;
             let binding = ctx
                 .policy_bindings
@@ -22730,6 +22757,143 @@ mod tests {
         );
 
         amf.stop().await.expect("stop");
+    }
+
+    /// #1230: an SM context restored from the snapshot keeps its UPF N3 uplink endpoint,
+    /// so after a restart its user plane can still be activated and the UE paged.
+    ///
+    /// A version-3 snapshot is restored into the SMF context (`set_state_file`, the boot
+    /// path). It holds one SM context: its PFCP session, its binding and its uplink
+    /// endpoint, with no in-memory session, as after a restart. Then:
+    /// - the AMF's ACTIVATING is answered 200 with a PDU Session Resource Setup Request
+    ///   Transfer naming the restored UL F-TEID (it was 500, "No user plane recorded");
+    /// - a Downlink Data Report for the restored session's CP SEID pages the UE through
+    ///   the AMF (it "matched no SM context").
+    #[tokio::test]
+    async fn a_restored_session_is_activated_and_paged_on_its_uplink_endpoint() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        use nextgcore_sbi::message::SbiResponse;
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let amf = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+        amf.start(move |req: SbiRequest| {
+            let sink = sink.clone();
+            async move {
+                let mut bytes = req.http.content.clone().unwrap_or_default().into_bytes();
+                for p in &req.http.parts {
+                    bytes.extend_from_slice(&p.data);
+                }
+                sink.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((req.header.uri.clone(), bytes));
+                SbiResponse::with_status(200)
+            }
+        })
+        .await
+        .expect("amf start");
+
+        const REF: &str = "91230";
+        const SUPI: &str = "imsi-001010000091230";
+        const UL_TEID: u32 = 0x1230_0123;
+        let mut b = crate::context::PolicyBinding::snapshot_default();
+        b.supi = SUPI.into();
+        b.psi = 6;
+        b.ue_ip = [10, 45, 123, 0];
+        b.dnn = "internet".into();
+        b.qfi = 1;
+        b.five_qi = 9;
+        b.arp_priority_level = 8;
+        b.sm_context_status_uri = Some(format!(
+            "http://127.0.0.1:{}/namf-callback/v1/smContextStatus/{REF}",
+            addr.port()
+        ));
+        let doc = serde_json::json!({
+            "version": 3,
+            "pfcpSessions": { REF: 0x0123_0000u64 },
+            "policyBindings": { REF: b },
+            "upfUlEndpoints": { REF: { "teid": UL_TEID, "addr": "10.45.0.123" } },
+        });
+        let path = std::env::temp_dir().join(format!(
+            "nextgcore-smf-1230-{}-{:?}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
+        {
+            let handle = smf_self();
+            let mut ctx = handle.write().unwrap();
+            ctx.set_state_file(path.clone()).expect("restore");
+            ctx.clear_state_file_for_test();
+        }
+        let _ = std::fs::remove_file(&path);
+        let cleanup = || {
+            if let Ok(ctx) = smf_self().read() {
+                ctx.pfcp_sessions.write().unwrap().remove(REF);
+                ctx.policy_bindings.write().unwrap().remove(REF);
+                ctx.upf_ul_endpoints.write().unwrap().remove(REF);
+            }
+        };
+        assert!(
+            smf_self()
+                .read()
+                .unwrap()
+                .sess_find_by_sm_context_ref(REF)
+                .is_none_or(|s| s.sm_context_ref.as_deref() != Some(REF)),
+            "no in-memory session: only what the snapshot holds"
+        );
+
+        // The UE's Service Request: the user plane is activated on the restored F-TEID.
+        let activate = SbiRequest::post(format!("/nsmf-pdusession/v1/sm-contexts/{REF}/modify"))
+            .with_body(
+                serde_json::json!({ "upCnxState": "ACTIVATING" }).to_string(),
+                "application/json",
+            );
+        let resp = handle_sm_context_update(REF, &activate).await;
+        let teid = UL_TEID.to_be_bytes();
+        let n2 = resp
+            .http
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some("n2SmInfo"))
+            .map(|p| p.data.to_vec());
+        let activated = (resp.status, n2.clone());
+
+        // Downlink data for the idle UE: paged.
+        let upf = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let smf_sock =
+            std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let upf_addr = upf.local_addr().unwrap();
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        pfcp_path::set_global_pool(vec![std::sync::Arc::new(pfcp_path::PfcpClient::new(
+            smf_sock.clone(),
+            upf_addr,
+            [127, 0, 0, 1],
+        ))]);
+        let seid = context::derive_cp_n4_seid(REF);
+        handle_pfcp_session_report(&smf_sock, &dldr_report_packet(seid, 1), upf_addr).await;
+        pfcp_path::clear_global_upf_for_test();
+        let requests = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        cleanup();
+        amf.stop().await.expect("stop");
+
+        assert_eq!(
+            activated.0, 200,
+            "the restored session's user plane is activated"
+        );
+        let n2 = activated.1.expect("the Setup Request Transfer");
+        assert!(
+            n2.windows(4).any(|w| w == teid),
+            "the transfer names the restored UL F-TEID {UL_TEID:#x}: {n2:02x?}"
+        );
+        let paging = requests
+            .iter()
+            .find(|(uri, _)| uri.contains(&format!("/ue-contexts/{SUPI}/n1-n2-messages")))
+            .unwrap_or_else(|| panic!("the restored session's UE is paged: {requests:?}"));
+        let _ = paging;
     }
 
     /// The other half: a DLDR for a session whose user plane is UP must NOT page.

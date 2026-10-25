@@ -561,6 +561,29 @@ pub async fn notify_unrestorable_at_boot() -> (usize, usize) {
                     entry.sm_context_ref
                 );
             }
+            // #1230: a session released for want of its uplink endpoint still has its
+            // binding and the per-SEID records; they go with it, so the binding does not
+            // keep naming the address freed below. A session with no readable binding
+            // (#193) has none of these to drop.
+            let r = &entry.sm_context_ref;
+            let seid = ctx
+                .cp_n4_seids
+                .write()
+                .ok()
+                .and_then(|mut m| m.remove(r))
+                .unwrap_or_else(|| crate::context::derive_cp_n4_seid(r));
+            if let Ok(mut m) = ctx.policy_bindings.write() {
+                m.remove(r);
+            }
+            if let Ok(mut m) = ctx.upf_ul_endpoints.write() {
+                m.remove(r);
+            }
+            if let Ok(mut m) = ctx.far_peers.write() {
+                m.remove(&seid);
+            }
+            if let Ok(mut m) = ctx.session_upfs.write() {
+                m.remove(&seid);
+            }
             // #912 review M3: the restored allocation goes back too; nothing else
             // holds it, since the binding that named it could not be read.
             if let Some(ip) = entry.ue_ip {
@@ -1145,6 +1168,60 @@ mod tests {
         assert_eq!(first, (1, 0));
         assert_eq!(second, (0, 0), "the list must be drained, not re-read");
         assert_eq!(posts, 1);
+    }
+
+    /// #1230: a session released at boot for want of its uplink endpoint still had a
+    /// binding and per-SEID records. They go with it, and its consumer is told.
+    #[tokio::test]
+    async fn boot_drops_the_binding_of_a_session_released_for_its_endpoint() {
+        let _state = PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = N4_TEST_LOCK.lock().await;
+        let sink = start_status_sink().await;
+        let r = "boot-1230-ref";
+        let seid = crate::context::derive_cp_n4_seid(r);
+        {
+            let global = crate::context::smf_self();
+            let ctx = global.read().expect("smf context");
+            ctx.pfcp_sessions
+                .write()
+                .unwrap()
+                .insert(r.to_string(), 0x1230);
+            let mut b = crate::context::PolicyBinding::snapshot_default();
+            b.sm_context_status_uri = Some(sink.uri.clone());
+            ctx.policy_bindings
+                .write()
+                .unwrap()
+                .insert(r.to_string(), b);
+            ctx.session_upfs
+                .write()
+                .unwrap()
+                .insert(seid, "upf.example:8805".into());
+            ctx.unrestorable_sessions
+                .write()
+                .unwrap()
+                .push(crate::context::UnrestorableSession {
+                    sm_context_ref: r.to_string(),
+                    status_uri: Some(sink.uri.clone()),
+                    reason: "no uplink endpoint: test".into(),
+                    ue_ip: None,
+                    nsac: None,
+                });
+        }
+        let (notified, _) = notify_unrestorable_at_boot().await;
+        let (binding, upf) = {
+            let global = crate::context::smf_self();
+            let ctx = global.read().expect("smf context");
+            let binding = ctx.policy_bindings.read().unwrap().contains_key(r);
+            let upf = ctx.session_upfs.read().unwrap().contains_key(&seid);
+            (binding, upf)
+        };
+        let still_live = session_is_live(r);
+        forget_session(r);
+        sink.server.stop().await.expect("stop sink");
+        assert_eq!(notified, 1);
+        assert!(!still_live, "the session is gone");
+        assert!(!binding, "and its binding");
+        assert!(!upf, "and its UPF identity");
     }
 
     /// #912 review N3: boot frees the restored address of a session whose binding could

@@ -2049,7 +2049,10 @@ impl SmfContext {
     /// - 2 (#718 review M2): it is [`derive_cp_n4_seid`]. A version-1 session is
     ///   restored under its legacy SEID, recorded in `cp_n4_seids`, because that is
     ///   the SEID the UPF holds it under.
-    pub const SNAPSHOT_VERSION: u64 = 2;
+    /// - 3 (#1230): every SM context carries its UPF N3 uplink endpoint
+    ///   (`upfUlEndpoints`). An older snapshot has none, and its SM contexts are
+    ///   released at boot (see [`restore_from`](Self::restore_from)).
+    pub const SNAPSHOT_VERSION: u64 = 3;
 
     /// Point this context at a snapshot file and restore any prior state,
     /// returning how many records were installed.
@@ -2195,6 +2198,24 @@ impl SmfContext {
                 .filter_map(|(r, seid)| m.get(&seid).map(|k| (r, k.clone())))
                 .collect()
         };
+        // #1230: per SM context, keyed by the reference like `cpN4Seids`: the UPF's N3
+        // uplink F-TEID, which the UP activation, the network-triggered Service
+        // Request, a handover and a path switch all have to name, and which the UPF
+        // gave only at establishment.
+        let upf_ul_endpoints: std::collections::BTreeMap<String, serde_json::Value> =
+            read_through(&self.upf_ul_endpoints, "upf_ul_endpoints")
+                .iter()
+                .filter(|(r, _)| pfcp_sessions.contains_key(*r))
+                .map(|(r, (teid, addr))| {
+                    (
+                        r.clone(),
+                        serde_json::json!({
+                            "teid": teid,
+                            "addr": Ipv4Addr::from(*addr).to_string(),
+                        }),
+                    )
+                })
+                .collect();
         // Ascending already (see `Ipv4Pool::allocated_addrs`), and as strings so
         // the file is readable by an operator diagnosing a double assignment.
         let ipv4_allocations: Vec<String> = self
@@ -2215,6 +2236,7 @@ impl SmfContext {
             "cpN4Seids": cp_n4_seids,
             "farPeers": far_peers,
             "sessionUpfs": session_upfs,
+            "upfUlEndpoints": upf_ul_endpoints,
             "failedUpPaths": read_through(&self.failed_up_paths, "failed_up_paths")
                 .iter()
                 .map(|(k, v)| (k.clone(), *v))
@@ -2431,6 +2453,7 @@ impl SmfContext {
                 (seid, key)
             })
             .collect();
+        let restored_refs: Vec<String> = pfcp_sessions.keys().cloned().collect();
         // One lock at a time, as in `snapshot`.
         if let Ok(mut map) = self.pfcp_sessions.write() {
             map.extend(pfcp_sessions);
@@ -2454,6 +2477,67 @@ impl SmfContext {
         }
         if let Ok(mut map) = self.session_upfs.write() {
             map.extend(session_upfs);
+        }
+        // #1230: the UPF N3 uplink endpoint of each restored SM context. A record that
+        // does not read is skipped, and its session is then handled like one from an
+        // older snapshot, below.
+        let upf_ul_endpoints: HashMap<String, (u32, [u8; 4])> = doc
+            .get("upfUlEndpoints")
+            .and_then(|v| v.as_object().cloned())
+            .map(|obj| {
+                obj.into_iter()
+                    .filter(|(r, _)| restored_refs.contains(r))
+                    .filter_map(|(r, v)| {
+                        let teid = u32::try_from(v.get("teid")?.as_u64()?).ok()?;
+                        let addr: Ipv4Addr = v.get("addr")?.as_str()?.parse().ok()?;
+                        Some((r, (teid, addr.octets())))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // An SM context with no endpoint (from a snapshot before version 3, which
+        // wrote none) can never have its user plane re-activated, be paged for
+        // downlink data, or be handed over: each of those has to name the uplink
+        // tunnel, and the UPF reported it only at establishment. It is released at boot,
+        // with its AMF told (the #193 path), rather than kept as a session that silently
+        // drops every downlink packet once the UE goes idle. The UE re-establishes it
+        // (TS 24.501 §6.4.1).
+        // From version 3 on, every SM context is written with its endpoint.
+        let missing_endpoint: Vec<UnrestorableSession> = if found >= 3 {
+            Vec::new()
+        } else {
+            let bindings = read_through(&self.policy_bindings, "policy_bindings").clone();
+            restored_refs
+                .iter()
+                .filter(|r| !upf_ul_endpoints.contains_key(*r))
+                .filter_map(|r| {
+                    // A session with no binding is already on the unrestorable list.
+                    let b = bindings.get(r)?;
+                    Some(UnrestorableSession {
+                        sm_context_ref: r.clone(),
+                        status_uri: b.sm_context_status_uri.clone(),
+                        reason: "the SMF restored this SM context without its UPF N3 \
+                                 uplink endpoint (a snapshot from before #1230), so its \
+                                 user plane can no longer be activated"
+                            .into(),
+                        ue_ip: Some(b.ue_ip).filter(|ip| *ip != [0; 4]),
+                        nsac: b
+                            .nsac_admitted
+                            .then(|| (b.supi.clone(), b.psi, b.sst, b.sd.clone())),
+                    })
+                })
+                .collect()
+        };
+        if !missing_endpoint.is_empty() {
+            log::warn!(
+                "{} restored SM context(s) have no UPF N3 uplink endpoint (snapshot version \
+                 {found}); they are released at boot",
+                missing_endpoint.len()
+            );
+            unrestorable.extend(missing_endpoint);
+        }
+        if let Ok(mut map) = self.upf_ul_endpoints.write() {
+            map.extend(upf_ul_endpoints);
         }
         let mut n_addrs = 0usize;
         for addr in &ipv4_allocations {
@@ -4561,6 +4645,77 @@ mod tests {
             written.get("upfRecoveryTimeStamps").is_none(),
             "no remote stamp is persisted: {written}"
         );
+    }
+
+    /// #1230: an SM context's UPF N3 uplink endpoint is in the snapshot and comes back
+    /// on restore, so a restored session can still name the uplink tunnel (UP
+    /// activation, network-triggered Service Request, handover). One of a session
+    /// that is gone is not written.
+    #[test]
+    fn the_upf_uplink_endpoint_survives_a_restart() {
+        let path = temp_state_path("ul-endpoint");
+        {
+            let ctx = ctx_with_state(&path);
+            ctx.pfcp_sessions.write().unwrap().insert("12".into(), 0x0C);
+            {
+                let mut m = ctx.upf_ul_endpoints.write().unwrap();
+                m.insert("12".into(), (0x1230_0012, [10, 45, 12, 30]));
+                m.insert("gone".into(), (0x0BAD, [10, 0, 0, 1]));
+            }
+            ctx.persist();
+            let written: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(written["version"], 3);
+            assert_eq!(
+                written["upfUlEndpoints"],
+                serde_json::json!({ "12": { "teid": 0x1230_0012u32, "addr": "10.45.12.30" } })
+            );
+        }
+        let restored = ctx_with_state(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            restored.upf_ul_endpoints.read().unwrap().get("12").copied(),
+            Some((0x1230_0012, [10, 45, 12, 30]))
+        );
+        assert!(restored.unrestorable_sessions.read().unwrap().is_empty());
+    }
+
+    /// #1230: a snapshot from before version 3 wrote no uplink endpoint. Its SM
+    /// contexts can no longer have their user plane activated, so they are put on the
+    /// boot release list with their AMF callback, address and NSAC admission. A
+    /// session with no binding is on that list already, for its binding (#193).
+    #[test]
+    fn a_pre_1230_snapshots_sessions_are_released_at_boot() {
+        let path = temp_state_path("ul-endpoint-v2");
+        let mut b = binding(
+            "imsi-001010000001230",
+            5,
+            [10, 45, 12, 31],
+            crate::gsm_sm::GsmState::Operational,
+        );
+        b.sm_context_status_uri = Some("http://amf.example/status/7".into());
+        b.nsac_admitted = true;
+        b.sst = 1;
+        let doc = serde_json::json!({
+            "version": 2,
+            "pfcpSessions": { "7": 0x07u64 },
+            "policyBindings": { "7": b },
+            "ipv4Allocations": ["10.45.12.31"],
+        });
+        std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
+        let ctx = ctx_with_state(&path);
+        let _ = std::fs::remove_file(&path);
+        let pending = ctx.unrestorable_sessions.read().unwrap().clone();
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        let u = &pending[0];
+        assert_eq!(u.sm_context_ref, "7");
+        assert_eq!(u.status_uri.as_deref(), Some("http://amf.example/status/7"));
+        assert_eq!(u.ue_ip, Some([10, 45, 12, 31]));
+        assert_eq!(
+            u.nsac,
+            Some(("imsi-001010000001230".to_string(), 5, 1, None))
+        );
+        assert!(u.reason.contains("uplink endpoint"), "{}", u.reason);
     }
 
     /// A version-1 snapshot's sessions keep the legacy CP SEID (`ref | 0x1000`): the
