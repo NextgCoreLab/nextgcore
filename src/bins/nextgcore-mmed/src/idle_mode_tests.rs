@@ -1863,3 +1863,50 @@ fn a_tau_bearer_status_keeps_the_last_pdn_connection() {
     assert!(ctx.sess_find_by_id(ue.sess_id).is_some());
     release(&ue);
 }
+
+/// #641 stop-gap, TS 29.274 §7.2.4 / §8.4: this MME cannot activate a dedicated
+/// bearer, so a Create Bearer Request is answered at once with "Service not
+/// supported", under the request's sequence number and addressed to the Serving
+/// GW's S11 TEID, with every bearer of the request listed; one for a TEID naming
+/// no UE is answered "Context not found". Before, both were dropped and ran out
+/// the Serving GW's N3.
+#[test]
+fn a_create_bearer_request_is_refused_service_not_supported() {
+    let _guard = lock_s11();
+    let (sgw, route) = sgw(Gtp2XactConfig::default());
+    let ue = seed(0x0641, &[5]);
+    let mme = route.server.local_addr();
+    let cbr = |teid: u32, seq: u32| {
+        let mut m = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(95, teid, seq));
+        m.add_ie(nextgcore_gtp::v2::Gtp2EbiIe::new(5).to_ie(0));
+        let mut bc = nextgcore_gtp::v2::Gtp2BearerContextIe::new();
+        bc.set_ebi(0);
+        m.add_bearer_context(0, &bc);
+        m.encode()
+    };
+    for (teid, seq, cause, sgw_teid) in [
+        (ue.local_teid, 0x0641, 68u8, SGW_S11_TEID),
+        (0x00FF_0641, 0x0642, 64, 0),
+    ] {
+        sgw.send_to(&cbr(teid, seq), mme).unwrap();
+        let (rsp, _) = recv(&sgw, 96);
+        assert_eq!(rsp.header.sequence_number, seq, "the request's number");
+        assert_eq!(rsp.header.teid, Some(sgw_teid));
+        assert_eq!(
+            Gtp2CauseIe::decode(&rsp.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value)
+                .unwrap()
+                .cause,
+            cause
+        );
+        let bcs: Vec<(u8, u8)> = rsp
+            .get_ies(Gtp2IeType::BearerContext as u8)
+            .into_iter()
+            .map(|ie| {
+                let bc = nextgcore_gtp::v2::Gtp2BearerContextIe::decode(&ie.value).unwrap();
+                (bc.ebi().unwrap(), bc.cause().unwrap().unwrap().cause)
+            })
+            .collect();
+        assert_eq!(bcs, vec![(0, cause)], "every bearer of the request");
+    }
+    release(&ue);
+}
