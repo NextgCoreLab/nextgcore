@@ -798,6 +798,34 @@ pub struct PfcpSessionInfo {
     pub tsn_bridge: Option<crate::context::TsnBridge>,
 }
 
+/// The FARs a Session Modification creates with a tunnel of their own (#619): each
+/// one a PDR created by the same message uses, and created with an Outer Header
+/// Creation.
+///
+/// That is #583's indirect forwarding tunnel (an Access PDR's FAR toward the target
+/// RAN) or a dedicated EPS bearer's S5/S8-U tunnel (a Core PDR's FAR toward the SGW,
+/// TS 23.401 §5.4.1). Neither is the session's downlink tunnel. A FAR created with no
+/// endpoint (FAR 2 buffering until the access side is known) is the session's, and
+/// its first Update sets the session's tunnel. The PFCP layer and the data plane
+/// both apply this one rule, each to its own store.
+pub(crate) fn own_tunnel_fars_created(
+    created_pdrs: &[crate::n4_build::ParsedCreatePdr],
+    created_fars: &[crate::n4_build::ParsedCreateFar],
+) -> std::collections::HashSet<u32> {
+    let used: std::collections::HashSet<u32> =
+        created_pdrs.iter().filter_map(|p| p.far_id).collect();
+    created_fars
+        .iter()
+        .filter(|f| used.contains(&f.far_id))
+        .filter(|f| {
+            f.forwarding_parameters
+                .as_ref()
+                .is_some_and(|fp| fp.outer_header_creation.is_some())
+        })
+        .map(|f| f.far_id)
+        .collect()
+}
+
 /// The rule ids a session holds, by kind (TS 29.244 §7.5.4, #306).
 #[derive(Debug, Clone, Default)]
 pub struct SessionRuleIds {
@@ -805,6 +833,12 @@ pub struct SessionRuleIds {
     pub far_ids: std::collections::HashSet<u32>,
     pub qer_ids: std::collections::HashSet<u32>,
     pub urr_ids: std::collections::HashSet<u32>,
+    /// FARs with a tunnel endpoint of their own, not the session's downlink tunnel
+    /// (#619): a FAR created by a Session Modification together with a PDR that uses
+    /// it. That is #583's indirect forwarding tunnel (Access PDR) or a dedicated EPS
+    /// bearer's S5/S8-U tunnel (Core PDR, TS 23.401 §5.4.1). An Update FAR on one of
+    /// these moves that FAR only, never the session's tunnel.
+    pub own_tunnel_far_ids: std::collections::HashSet<u32>,
 }
 
 /// The time IEs of a usage report, from the times taken with its usage (#818, TS
@@ -1991,6 +2025,7 @@ impl PfcpServer {
                 far_ids: parsed_fars.iter().map(|f| f.far_id).collect(),
                 qer_ids: parsed_qers.iter().map(|q| q.qer_id).collect(),
                 urr_ids: parsed_urrs.iter().map(|u| u.urr_id).collect(),
+                own_tunnel_far_ids: Default::default(),
             },
             // #321: no bridge until the SMF configures one. An establishment
             // deliberately does not create an empty one — `Some(empty bridge)` and
@@ -2230,26 +2265,29 @@ impl PfcpServer {
         // #583: except a FAR created together with an ACCESS-source PDR that uses it --
         // a tunnel relaying toward the access side (indirect data forwarding), whose
         // endpoint is its own and not the session's downlink.
-        let relay_fars: std::collections::HashSet<u32> = created_pdrs
-            .iter()
-            .filter(|p| p.pdi.source_interface == 0)
-            .filter_map(|p| p.far_id)
-            .collect();
-        for far in created_fars
-            .iter()
-            .filter(|f| !relay_fars.contains(&f.far_id))
-            .chain(mod_fars.iter())
-        {
-            if let Some(ohc) = far
-                .forwarding_parameters
+        //
+        // #619: and likewise a FAR created together with a CORE-source PDR that uses
+        // it: a second downlink tunnel of the session (a dedicated EPS bearer's own
+        // S5/S8-U tunnel, TS 23.401 §5.4.1). Counting it as the session's tunnel
+        // moving re-pointed the default bearer's FAR at the dedicated bearer's TEID.
+        // Such a FAR is remembered (`own_tunnel_far_ids`, and the data plane's
+        // `DataPlaneSession::own_tunnel_fars`), so a later Update FAR on it moves that
+        // FAR alone, and a move of the session's tunnel leaves it where it points. Which Updates move the session's tunnel therefore
+        // depends on the session, and is decided under its lock below.
+        let own_tunnel_fars = own_tunnel_fars_created(&created_pdrs, &created_fars);
+        let tunnel_of = |far: &crate::n4_build::ParsedCreateFar| {
+            far.forwarding_parameters
                 .as_ref()
                 .and_then(|fp| fp.outer_header_creation.as_ref())
-            {
-                updated_dl_teid = Some(ohc.teid);
-                updated_gnb_addr = ohc.ipv4;
-                log::debug!("Updated downlink: TEID={:#x}, gNB={:?}", ohc.teid, ohc.ipv4);
-            }
-        }
+                .map(|ohc| (far.far_id, ohc.teid, ohc.ipv4))
+        };
+        let created_tunnels: Vec<(u32, u32, Option<Ipv4Addr>)> = created_fars
+            .iter()
+            .filter(|f| !own_tunnel_fars.contains(&f.far_id))
+            .filter_map(tunnel_of)
+            .collect();
+        let updated_tunnels: Vec<(u32, u32, Option<Ipv4Addr>)> =
+            mod_fars.iter().filter_map(tunnel_of).collect();
 
         // Parse Create/Update BARs
         let mut mod_bars = Vec::new();
@@ -2324,6 +2362,26 @@ impl PfcpServer {
             let mut sessions = self.sessions.write().await;
             if let Some(session) = sessions.get_mut(&upf_seid) {
                 let old_tunnel = session.gnb_addr.map(|addr| (session.dl_teid, addr));
+                for id in &removed_far_ids {
+                    session.rules.own_tunnel_far_ids.remove(id);
+                }
+                for f in &created_fars {
+                    if own_tunnel_fars.contains(&f.far_id) {
+                        session.rules.own_tunnel_far_ids.insert(f.far_id);
+                    } else {
+                        // A re-created id that is now an ordinary FAR.
+                        session.rules.own_tunnel_far_ids.remove(&f.far_id);
+                    }
+                }
+                for &(far_id, teid, ipv4) in created_tunnels.iter().chain(
+                    updated_tunnels
+                        .iter()
+                        .filter(|(id, ..)| !session.rules.own_tunnel_far_ids.contains(id)),
+                ) {
+                    updated_dl_teid = Some(teid);
+                    updated_gnb_addr = ipv4;
+                    log::debug!("Updated downlink: FAR {far_id}, TEID={teid:#x}, gNB={ipv4:?}");
+                }
                 if let Some(teid) = updated_dl_teid {
                     session.dl_teid = teid;
                 }
@@ -4110,6 +4168,158 @@ mod tests {
             assert_eq!(f.teid, 0xABCD);
             assert_eq!((f.ipv4, f.ipv6), want, "peer {peer}");
         }
+    }
+
+    /// A Core-source PDR and a FAR forwarding to the access side toward `ohc`
+    /// (`(teid, addr)`); `None` for a buffering FAR.
+    fn downlink_rule(pdr_id: u16, far_id: u32, ohc: Option<(u32, [u8; 4])>) -> Vec<u8> {
+        let mut pdi = crate::n4_build::PfcpMessageBuilder::new();
+        pdi.add_u8(pfcp_ie::SOURCE_INTERFACE, 1); // Core
+        let mut pdr = crate::n4_build::PfcpMessageBuilder::new();
+        pdr.add_pdr_id(pdr_id);
+        pdr.add_u32(pfcp_ie::PRECEDENCE, 50);
+        pdr.add_tlv(pfcp_ie::PDI, &pdi.build());
+        pdr.add_u32(pfcp_ie::FAR_ID, far_id);
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(pfcp_ie::CREATE_PDR, &pdr.build());
+        b.add_tlv(pfcp_ie::CREATE_FAR, &forwarding_far(far_id, ohc, false));
+        b.build()
+    }
+
+    /// A FAR (or Update FAR, `update`) body forwarding to Access toward `ohc`, or
+    /// buffering when `ohc` is `None`.
+    fn forwarding_far(far_id: u32, ohc: Option<(u32, [u8; 4])>, update: bool) -> Vec<u8> {
+        let mut far = crate::n4_build::PfcpMessageBuilder::new();
+        far.add_u32(pfcp_ie::FAR_ID, far_id);
+        match ohc {
+            Some((teid, addr)) => {
+                let mut fp = crate::n4_build::PfcpMessageBuilder::new();
+                fp.add_u8(pfcp_ie::DESTINATION_INTERFACE, 0);
+                let mut v = vec![0x01, 0x00];
+                v.extend_from_slice(&teid.to_be_bytes());
+                v.extend_from_slice(&addr);
+                fp.add_tlv(pfcp_ie::OUTER_HEADER_CREATION, &v);
+                far.add_u16(pfcp_ie::APPLY_ACTION, 0x02);
+                far.add_tlv(
+                    if update {
+                        pfcp_ie::UPDATE_FORWARDING_PARAMETERS
+                    } else {
+                        pfcp_ie::FORWARDING_PARAMETERS
+                    },
+                    &fp.build(),
+                );
+            }
+            None => {
+                far.add_u16(pfcp_ie::APPLY_ACTION, 0x04);
+            }
+        }
+        far.build()
+    }
+
+    /// #619: a dedicated EPS bearer's downlink tunnel is its own.
+    ///
+    /// The PGW-C creates the bearer's downlink as a Core PDR with a FAR of its own
+    /// toward the SGW's per-bearer S5/S8-U tunnel (TS 23.401 §5.4.1). That must not
+    /// move the session's downlink tunnel (FAR 2); a later move of the session's
+    /// tunnel must not overwrite it; and an Update FAR moving the dedicated tunnel
+    /// moves it alone. Before #619 the first two did: the default bearer's downlink
+    /// went into the dedicated bearer's tunnel, and then the dedicated bearer's into
+    /// the default's.
+    #[tokio::test]
+    async fn a_second_downlink_tunnel_keeps_its_endpoint_across_a_move() {
+        const DEFAULT: (u32, [u8; 4]) = (0x0000_0A0A, [127, 58, 3, 1]);
+        const DEDICATED: (u32, [u8; 4]) = (0x0606_0606, [127, 58, 3, 6]);
+        const MOVED: (u32, [u8; 4]) = (0x0000_0C0C, [127, 58, 3, 12]);
+        const DEDICATED_MOVED: (u32, [u8; 4]) = (0x0707_0707, [127, 58, 3, 7]);
+        let (server, smf, addr, mut rx, dp, upf_seid) = established_session().await;
+        let far = |id: u32| {
+            dp.sessions
+                .find_by_seid(upf_seid)
+                .and_then(|s| s.fars.read().unwrap().get(&id).cloned())
+                .map(|f| (f.ohc_teid, f.ohc_addr.map(|a| a.to_string())))
+        };
+        let at =
+            |t: (u32, [u8; 4])| Some((Some(t.0), Some(std::net::Ipv4Addr::from(t.1).to_string())));
+        let mut seq = 3;
+        let mut modify = |body: Vec<u8>| {
+            seq += 1;
+            encode_pfcp(52, Some(upf_seid), seq, &body)
+        };
+        let update_far = |id: u32, ohc: Option<(u32, [u8; 4])>| {
+            let mut b = crate::n4_build::PfcpMessageBuilder::new();
+            b.add_tlv(pfcp_ie::UPDATE_FAR, &forwarding_far(id, ohc, true));
+            b.build()
+        };
+        let session_tunnel = || async { server.sessions.read().await[&upf_seid].dl_teid };
+
+        // The default bearer's downlink, then the session's tunnel set by Update FAR
+        // 2 -- what smfd's Create Session does.
+        let resp = exchange(&smf, addr, &modify(downlink_rule(2, 2, None))).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+        let resp = exchange(&smf, addr, &modify(update_far(2, Some(DEFAULT)))).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+        assert_eq!(far(2), at(DEFAULT));
+
+        // The dedicated bearer's downlink.
+        let resp = exchange(
+            &smf,
+            addr,
+            &modify(downlink_rule(0x81, 0x81, Some(DEDICATED))),
+        )
+        .await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+        assert_eq!(
+            far(2),
+            at(DEFAULT),
+            "the default bearer's downlink must stay on its own tunnel"
+        );
+        assert_eq!(far(0x81), at(DEDICATED));
+        assert_eq!(
+            session_tunnel().await,
+            DEFAULT.0,
+            "creating a second tunnel does not move the session's"
+        );
+
+        // The session's tunnel moves.
+        let resp = exchange(&smf, addr, &modify(update_far(2, Some(MOVED)))).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+        assert_eq!(far(2), at(MOVED));
+        assert_eq!(
+            far(0x81),
+            at(DEDICATED),
+            "the move must not overwrite the dedicated bearer's tunnel"
+        );
+
+        // The dedicated tunnel moves alone.
+        let resp = exchange(&smf, addr, &modify(update_far(0x81, Some(DEDICATED_MOVED)))).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+        assert_eq!(far(0x81), at(DEDICATED_MOVED));
+        assert_eq!(
+            far(2),
+            at(MOVED),
+            "moving the dedicated tunnel moves it alone"
+        );
+        assert_eq!(session_tunnel().await, MOVED.0);
+
+        // The dedicated FAR buffers (no endpoint), then the session's tunnel moves
+        // back: the buffering FAR is not handed the default bearer's endpoint.
+        let resp = exchange(&smf, addr, &modify(update_far(0x81, None))).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+        let resp = exchange(&smf, addr, &modify(update_far(2, Some(DEFAULT)))).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+        assert_eq!(far(2), at(DEFAULT));
+        assert_eq!(
+            far(0x81),
+            Some((None, None)),
+            "a buffering dedicated FAR keeps no endpoint across the session's move"
+        );
     }
 
     /// Criterion 1: provisioning charging mid-session is the normal way it is added,

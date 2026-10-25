@@ -2338,6 +2338,10 @@ pub struct DataPlaneSession {
     pub pdrs: RwLock<Vec<DataPlanePdr>>,
     /// FAR rules (keyed by far_id)
     pub fars: RwLock<HashMap<u32, DataPlaneFar>>,
+    /// The FARs with a tunnel of their own (#619, `pfcp_path::own_tunnel_fars_created`):
+    /// a dedicated EPS bearer's S5/S8-U tunnel, or an indirect forwarding tunnel. A
+    /// move of the session's downlink tunnel leaves them where they point.
+    pub own_tunnel_fars: RwLock<std::collections::HashSet<u32>>,
     /// QER rules (keyed by qer_id)
     pub qers: RwLock<HashMap<u32, DataPlaneQer>>,
     /// URR rules (keyed by urr_id)
@@ -2403,6 +2407,7 @@ impl DataPlaneSession {
             dl_bytes: AtomicU64::new(0),
             pdrs: RwLock::new(Vec::new()),
             fars: RwLock::new(HashMap::new()),
+            own_tunnel_fars: RwLock::new(Default::default()),
             qers: RwLock::new(HashMap::new()),
             urrs: RwLock::new(HashMap::new()),
             bars: RwLock::new(HashMap::new()),
@@ -4268,6 +4273,7 @@ impl DataPlane {
             // toward the access side that an uplink-side PDR uses -- an indirect
             // forwarding tunnel to the target NG-RAN -- has its own endpoint, which the
             // session's DL tunnel moving must not overwrite.
+            let own_tunnel_fars = session.own_tunnel_fars.read().unwrap();
             let dl_fars: std::collections::HashSet<u32> = session
                 .pdrs
                 .read()
@@ -4275,7 +4281,13 @@ impl DataPlane {
                 .iter()
                 .filter(|p| p.source_interface == SRC_INTF_CORE)
                 .filter_map(|p| p.far_id)
+                // #619: and of those, only the FARs that follow the session's tunnel.
+                // A FAR with a tunnel of its own (a dedicated EPS bearer's S5/S8-U
+                // tunnel, TS 23.401 §5.4.1) keeps its endpoint, whatever it is,
+                // including none while it buffers.
+                .filter(|far_id| !own_tunnel_fars.contains(far_id))
                 .collect();
+            drop(own_tunnel_fars);
             // #883: the FARs' endpoint and the session's tunnel move in ONE critical
             // section (lock order `fars` -> `dl_tunnel`; nothing takes them the other
             // way), so a downlink packet never pairs the new FAR endpoint with the old
