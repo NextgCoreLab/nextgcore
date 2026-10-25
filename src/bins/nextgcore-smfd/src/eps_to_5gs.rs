@@ -3087,6 +3087,77 @@ mod tests {
         s5.close();
     }
 
+    /// #619 review: a split PDU session whose downlink then moves as ONE tunnel (an Xn
+    /// path switch, here; an N2 handover's execution and a re-activation take the same
+    /// `pfcp_session_modify`) collapses onto FAR 2 in that modification: the additional
+    /// tunnel's FAR is removed and the dedicated flow's DL PDR re-created on FAR 2. upfd
+    /// keeps a FAR with a tunnel of its own where it points, so without this the
+    /// dedicated flow's downlink stayed on the old secondary node.
+    #[tokio::test]
+    async fn a_path_switch_collapses_a_split_pdu_session_onto_far_2() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        crate::context::smf_context_init(64, 256, 512);
+        let (s5, pgw_c, _) = establish_pdn(Some(&pco_with_psi(5))).await;
+        let reference = moved_session_with_a_dedicated_flow(pgw_c).await;
+        const MN: (u32, [u8; 4]) = (0x0000_A101, [10, 1, 2, 3]);
+        const SN: (u32, [u8; 4]) = (0x0000_B102, [10, 7, 7, 7]);
+        const TARGET: (u32, [u8; 4]) = (0x0000_C103, [10, 9, 9, 9]);
+        let resp = crate::an_initiated_modification(
+            &reference,
+            &split_indication((MN, &[5]), &[(SN, &[DEDICATED_EBI])]),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+        let sess = || {
+            crate::context::smf_self()
+                .read()
+                .ok()
+                .and_then(|ctx| ctx.sess_find_by_sm_context_ref(&reference))
+                .expect("the session")
+        };
+        assert_eq!(sess().dc_tunnel_fars, vec![0x71], "split over FAR 0x71");
+
+        upf.clear_seen();
+        let upf_seid = crate::lookup_upf_seid(&reference).expect("the N4 session");
+        crate::pfcp_session_modify(
+            crate::smf_n4_seid_for(&reference),
+            upf_seid,
+            TARGET.0,
+            TARGET.1,
+        )
+        .await
+        .expect("the path switch");
+        let mods = upf.modification_bodies();
+        assert_eq!(mods.len(), 1, "one N4 Session Modification");
+        let mut ohc = vec![0x01, 0x00];
+        ohc.extend_from_slice(&TARGET.0.to_be_bytes());
+        ohc.extend_from_slice(&TARGET.1);
+        assert!(n4_has(&mods[0], 10, &ohc), "Update FAR 2 → the target");
+        assert!(
+            n4_has(&mods[0], 16, &[0x00, 0x6C, 0x00, 0x04, 0, 0, 0, 0x71]),
+            "Remove FAR 0x71"
+        );
+        assert!(
+            n4_has(&mods[0], 15, &[0x00, 0x38, 0x00, 0x02, 0x00, 0x36])
+                && n4_has(&mods[0], 1, &[0x00, 0x6C, 0x00, 0x04, 0, 0, 0, 2]),
+            "the dedicated flow's DL PDR 0x36 re-created on FAR 2"
+        );
+        assert!(sess().dc_tunnel_fars.is_empty(), "no longer split");
+
+        // A second move of the now single-tunnel session is a plain Update FAR 2.
+        upf.clear_seen();
+        crate::pfcp_session_modify(crate::smf_n4_seid_for(&reference), upf_seid, MN.0, MN.1)
+            .await
+            .expect("the second move");
+        let mods = upf.modification_bodies();
+        assert!(
+            !n4_has(&mods[0], 16, &[0x00, 0x6C]) && !n4_has(&mods[0], 1, &[0x00, 0x38]),
+            "nothing left to collapse"
+        );
+        s5.close();
+    }
+
     /// The stand-in's modification bodies once `done` holds for them, at most 5 s.
     async fn wait_for_modifications(
         upf: &crate::pfcp_path::stand_in::StandInUpf,

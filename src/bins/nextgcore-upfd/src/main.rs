@@ -1002,6 +1002,15 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                         *session.pdrs.write().unwrap() = dp_pdrs;
                     }
 
+                    // #619 review: the FARs with a tunnel of their own, by the PFCP
+                    // layer's rule for an establishment.
+                    *session.own_tunnel_fars.write().unwrap() =
+                        crate::pfcp_path::own_tunnel_fars_established(
+                            &pdrs,
+                            &fars,
+                            (dl_teid, gnb_addr),
+                        );
+
                     // Install FARs from PFCP (replace defaults if provided)
                     if !fars.is_empty() {
                         let mut dp_fars = std::collections::HashMap::new();

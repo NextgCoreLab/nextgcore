@@ -2777,7 +2777,7 @@ async fn pfcp_session_modify(
     // Build modification: update FAR 2 (downlink) from BUFF to FORW with outer header creation (GTP-U to gNB)
     // outer_header_creation: (description, teid, ipv4, ipv6)
     // description 0x0100 = GTP-U/UDP/IPv4
-    let params = SessionModificationParams {
+    let mut params = SessionModificationParams {
         update_fars_activate: vec![(
             2,                                              // FAR ID 2 (downlink)
             0,                                              // destination_interface: Access
@@ -2786,6 +2786,19 @@ async fn pfcp_session_modify(
         )],
         ..Default::default()
     };
+    // #619 review: a split session's additional tunnels collapse onto FAR 2.
+    let split = smf_self()
+        .read()
+        .ok()
+        .and_then(|ctx| ctx.sess_find_by_seid(smf_n4_seid))
+        .filter(|s| !s.dc_tunnel_fars.is_empty());
+    if let Some(sess) = split.as_ref() {
+        split_collapse(sess, &mut params);
+        log::info!(
+            "PFCP Session Modification: the split session's tunnel FARs {:?} collapse onto              FAR 2",
+            sess.dc_tunnel_fars
+        );
+    }
 
     let payload = build_session_modification_request(&params);
 
@@ -2805,6 +2818,14 @@ async fn pfcp_session_modify(
     match pfcp_path::parse_cause(&resp_body) {
         Some(pfcp_path::pfcp_cause::REQUEST_ACCEPTED) => {
             log::info!("PFCP Session Modification successful");
+            if let Some(sess) = split {
+                if let Ok(ctx) = smf_self().read() {
+                    if let Some(mut s) = ctx.sess_find_by_id(sess.id) {
+                        s.dc_tunnel_fars.clear();
+                        ctx.sess_update(&s);
+                    }
+                }
+            }
             Ok(())
         }
         Some(cause) => {
@@ -3185,6 +3206,50 @@ async fn an_initiated_modification(sm_context_ref: &str, n2_bytes: &[u8]) -> Sbi
 /// FAR id of the `n`-th (1-based) additional NG-U tunnel of a split PDU session (#582).
 const DC_TUNNEL_FAR_BASE: u32 = 0x70;
 
+/// The session's dedicated flows with a downlink PDR of their own (`0x30 + EBI`, #583):
+/// `(QFI, downlink filters)`, the default flow (`default_qfi`) excluded.
+fn dedicated_dl_flows(sess: &context::SmfSess, default_qfi: Option<u8>) -> Vec<(u8, Vec<String>)> {
+    eps_to_5gs::session_bearers(sess)
+        .iter()
+        .filter(|b| Some(b.ebi) != default_qfi)
+        .filter_map(|b| {
+            let f = eps_to_5gs::downlink_filters(b);
+            (!f.is_empty()).then_some((b.ebi, f))
+        })
+        .collect()
+}
+
+/// #619 review: a split PDU session (#582) collapses onto FAR 2 when its downlink moves as
+/// one tunnel -- a path switch, an N2 handover's execution, or a re-activation. Each
+/// additional tunnel's FAR (`dc_tunnel_fars`) is removed and every dedicated flow's DL PDR
+/// re-created on FAR 2, in the same modification as the Update FAR 2.
+///
+/// The SMF has to say so: upfd keeps a FAR created with a tunnel of its own where it
+/// points when the session's tunnel moves (a dedicated EPS bearer's S5/S8-U tunnel needs
+/// exactly that), and an additional NG-U tunnel's FAR has the same shape.
+fn split_collapse(sess: &context::SmfSess, params: &mut n4_build::SessionModificationParams) {
+    if sess.dc_tunnel_fars.is_empty() {
+        return;
+    }
+    let default_qfi = sess
+        .sm_context_ref
+        .as_deref()
+        .and_then(lookup_policy_binding)
+        .map(|b| b.qfi);
+    let ue_ip = sess.ipv4_addr.map(|a| a.octets());
+    params
+        .remove_far_ids
+        .extend(sess.dc_tunnel_fars.iter().copied());
+    for (ebi, filters) in dedicated_dl_flows(sess, default_qfi) {
+        params
+            .remove_pdr_ids
+            .push(eps_to_5gs::dedicated_dl_pdr_id(ebi));
+        params
+            .create_pdrs
+            .push(eps_to_5gs::dedicated_dl_pdr(ebi, &filters, ue_ip, 2));
+    }
+}
+
 /// #582, TS 38.413 §8.2.5.2 / TS 23.502 §4.3.3.2: a Modify Indication for a split PDU
 /// session (dual connectivity) -- the primary DL tunnel and the Additional DL QoS Flow per
 /// TNL Information, each carrying some of the session's QoS flows.
@@ -3229,16 +3294,7 @@ async fn split_pdu_session_modification(
     let default_qfi = lookup_policy_binding(sm_context_ref).map(|b| b.qfi);
     let dedicated: Vec<(u8, Vec<String>)> = sess
         .as_ref()
-        .map(|s| {
-            eps_to_5gs::session_bearers(s)
-                .iter()
-                .filter(|b| Some(b.ebi) != default_qfi)
-                .filter_map(|b| {
-                    let f = eps_to_5gs::downlink_filters(b);
-                    (!f.is_empty()).then_some((b.ebi, f))
-                })
-                .collect()
-        })
+        .map(|s| dedicated_dl_flows(s, default_qfi))
         .unwrap_or_default();
 
     let mut default_tunnel = None;

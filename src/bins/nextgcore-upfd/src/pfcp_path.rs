@@ -826,6 +826,32 @@ pub(crate) fn own_tunnel_fars_created(
         .collect()
 }
 
+/// The FARs a Session Establishment creates with a tunnel of their own (#619 review):
+/// each one a PDR of the message uses, created with an Outer Header Creation that is not
+/// the session's downlink tunnel (`session_tunnel`, the TEID and IPv4 address the
+/// establishment takes as the session's).
+///
+/// A session established with a dedicated bearer already in it (a restoration, or an
+/// SMF that sends the whole rule set at once) has that bearer's FAR toward its own
+/// tunnel; without this, the session's first move re-pointed it.
+pub(crate) fn own_tunnel_fars_established(
+    pdrs: &[crate::n4_build::ParsedCreatePdr],
+    fars: &[crate::n4_build::ParsedCreateFar],
+    session_tunnel: (u32, Option<Ipv4Addr>),
+) -> std::collections::HashSet<u32> {
+    let used: std::collections::HashSet<u32> = pdrs.iter().filter_map(|p| p.far_id).collect();
+    fars.iter()
+        .filter(|f| used.contains(&f.far_id))
+        .filter(|f| {
+            f.forwarding_parameters
+                .as_ref()
+                .and_then(|fp| fp.outer_header_creation.as_ref())
+                .is_some_and(|ohc| (ohc.teid, ohc.ipv4) != session_tunnel)
+        })
+        .map(|f| f.far_id)
+        .collect()
+}
+
 /// The rule ids a session holds, by kind (TS 29.244 §7.5.4, #306).
 #[derive(Debug, Clone, Default)]
 pub struct SessionRuleIds {
@@ -2025,7 +2051,11 @@ impl PfcpServer {
                 far_ids: parsed_fars.iter().map(|f| f.far_id).collect(),
                 qer_ids: parsed_qers.iter().map(|q| q.qer_id).collect(),
                 urr_ids: parsed_urrs.iter().map(|u| u.urr_id).collect(),
-                own_tunnel_far_ids: Default::default(),
+                own_tunnel_far_ids: own_tunnel_fars_established(
+                    &parsed_pdrs,
+                    &parsed_fars,
+                    (dl_teid, gnb_addr),
+                ),
             },
             // #321: no bridge until the SMF configures one. An establishment
             // deliberately does not create an empty one — `Some(empty bridge)` and
@@ -4319,6 +4349,68 @@ mod tests {
             far(0x81),
             Some((None, None)),
             "a buffering dedicated FAR keeps no endpoint across the session's move"
+        );
+    }
+
+    /// #619 review: a session ESTABLISHED with a dedicated bearer's downlink already in it
+    /// (a restoration, or an SMF that sends the whole rule set at once) keeps that
+    /// tunnel's endpoint when the session's tunnel moves, as one a modification created
+    /// does.
+    #[tokio::test]
+    async fn a_second_downlink_tunnel_in_the_establishment_keeps_its_endpoint() {
+        const DEFAULT: (u32, [u8; 4]) = (0x0000_0A0A, [127, 58, 4, 1]);
+        const DEDICATED: (u32, [u8; 4]) = (0x0606_0606, [127, 58, 4, 6]);
+        const MOVED: (u32, [u8; 4]) = (0x0000_0C0C, [127, 58, 4, 12]);
+        let (server, smf, addr, mut rx) = spawn_test_server().await;
+        let dp = Arc::new(crate::data_plane::DataPlane::new(Arc::new(
+            AtomicBool::new(false),
+        )));
+        server.set_data_plane(dp.clone());
+        let assoc = build_association_setup_request_payload(Some(1));
+        let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
+        b.add_f_seid(&crate::n4_build::FSeid {
+            seid: 0x4343,
+            ipv4: Some(Ipv4Addr::new(127, 0, 0, 9)),
+            ipv6: None,
+        });
+        b.add_tlv(pfcp_ie::CREATE_PDR, &pdr_body(1, 100, 1, 1, 1));
+        b.add_tlv(pfcp_ie::CREATE_FAR, &far_body(1, 0x02));
+        b.add_tlv(pfcp_ie::CREATE_QER, &qer_body(1, 5));
+        let mut body = b.build();
+        body.extend(downlink_rule(0x81, 0x81, Some(DEDICATED)));
+        body.extend(downlink_rule(2, 2, Some(DEFAULT)));
+        let resp = exchange(&smf, addr, &encode_pfcp(50, Some(0), 2, &body)).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        let upf_seid = server
+            .sessions
+            .read()
+            .await
+            .keys()
+            .copied()
+            .next()
+            .expect("the session");
+        apply_next(&mut rx, &dp).await;
+        let far = |id: u32| {
+            dp.sessions
+                .find_by_seid(upf_seid)
+                .and_then(|s| s.fars.read().unwrap().get(&id).cloned())
+                .map(|f| (f.ohc_teid, f.ohc_addr.map(|a| a.to_string())))
+        };
+        let at = |t: (u32, [u8; 4])| Some((Some(t.0), Some(Ipv4Addr::from(t.1).to_string())));
+        assert_eq!(far(0x81), at(DEDICATED));
+
+        let mut m = crate::n4_build::PfcpMessageBuilder::new();
+        m.add_tlv(pfcp_ie::UPDATE_FAR, &forwarding_far(2, Some(MOVED), true));
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &m.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+        assert_eq!(far(2), at(MOVED));
+        assert_eq!(
+            far(0x81),
+            at(DEDICATED),
+            "the move must not overwrite the established dedicated tunnel"
         );
     }
 
