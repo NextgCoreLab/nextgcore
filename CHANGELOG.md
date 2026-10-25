@@ -34,9 +34,10 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   (`nextgcore_pfcp::recovery_time::normalize_received`), so a 0.1.0 to 0.2.0 rolling upgrade
   detects peer restarts correctly (TS 23.007 §19A). smfd converts the `upfRecoveryTimeStamps`
   a 0.1.0 snapshot holds on load and persists them in NTP form, so one smfd restart under 0.2.0
-  fixes the stored stamps. The shim will be removed in 0.3.0. From then on a peer's
-  Unix-seconds stamp reads as a time ~70 years off, so its restarts are missed or falsely
-  detected. Upgrade every PFCP function to 0.2.0 before any of them moves to 0.3.0.
+  fixes the stored stamps. The shim will be removed in a later release, announced in that
+  release's upgrade notes. From then on a peer's Unix-seconds stamp reads as a time ~70 years
+  off, so its restarts are missed or falsely detected. Every PFCP function must run 0.2.0 or
+  later before any of them moves past that release.
 
 ## [0.2.0] — Unreleased (draft for operator review)
 
