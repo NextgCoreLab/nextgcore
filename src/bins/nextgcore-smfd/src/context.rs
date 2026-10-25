@@ -1071,6 +1071,16 @@ pub struct SmfSess {
     pub sgw_s5c_teid: u32,
     /// SGW S5C IP
     pub sgw_s5c_ip: IpAddr,
+    /// #1194: the interface type of the SGW-C's (sender) F-TEID for control plane,
+    /// part of what identifies a PDN connection at the PGW (TS 29.274 §7.2.1).
+    pub sgw_s5c_interface_type: u8,
+    /// #1198 review B1: the SGW-C Restart counter this PDN connection was set up under
+    /// (the Create Session Request's Recovery IE), `None` when it carried none.
+    pub sgw_restart_counter: Option<u8>,
+    /// #1198 review B1: when the PDN connection was set up through, or moved to, its
+    /// current SGW-C. With no counter, it is the old incarnation's only if this is no
+    /// later than that incarnation's last proof of life.
+    pub sgw_attached_at: Option<std::time::Instant>,
     /// SMF N4 SEID
     pub smf_n4_seid: u64,
     /// UPF N4 SEID
@@ -1234,6 +1244,9 @@ impl SmfSess {
             smf_n4_teid: 0,
             sgw_s5c_teid: 0,
             sgw_s5c_ip: IpAddr::default(),
+            sgw_s5c_interface_type: 0,
+            sgw_restart_counter: None,
+            sgw_attached_at: None,
             smf_n4_seid: 0,
             upf_n4_seid: 0,
             local_dl_teid: 0,
