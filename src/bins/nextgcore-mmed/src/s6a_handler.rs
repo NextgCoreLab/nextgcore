@@ -492,7 +492,8 @@ pub fn signal_ue_ambr(
             ue.ue_ambr_deferred = true;
         }
         // #1109: the index belongs to the process-wide context (ids of other
-        // contexts overlap its own).
+        // contexts overlap its own). Another context (a unit test's own) keeps
+        // only the flag; nothing sweeps it, so its deferral is never sent.
         if std::ptr::eq(ctx, crate::context::mme_self()) {
             let mut index = UE_AMBR_DEFERRED.lock().unwrap_or_else(|e| e.into_inner());
             if !index.contains(&ue_id) {
@@ -1203,6 +1204,33 @@ mod tests {
         let _guard = crate::gtp_path::lock_s11();
         let (mme_ue_id, enb_ue_id, isd, ue_ctx_mods) = ue_ambr_fixture("999990000011091", 11091);
         let ctx = crate::context::mme_self();
+
+        // A deferral on another context stays out of the process index: its id
+        // can name a process-context UE.
+        let other = crate::context::MmeContext::new();
+        let other_enb = other.enb_add("127.0.0.1:36412".parse().unwrap());
+        let other_enb_ue = other.enb_ue_add(other_enb, 11092);
+        let other_ue = other.mme_ue_add(other_enb_ue);
+        other.enb_ue_associate_mme_ue(other_enb_ue, other_ue);
+        other
+            .mme_ue_pool
+            .write()
+            .unwrap()
+            .get_mut(&other_ue)
+            .unwrap()
+            .ics_pending_on = other_enb_ue;
+        let index_before = UE_AMBR_DEFERRED.lock().unwrap().clone();
+        assert!(signal_ue_ambr(&other, other_ue, "999990000011092").is_empty());
+        assert!(
+            other.mme_ue_find_by_id(other_ue).unwrap().ue_ambr_deferred,
+            "deferred on the other context"
+        );
+        assert_eq!(
+            *UE_AMBR_DEFERRED.lock().unwrap(),
+            index_before,
+            "but not indexed"
+        );
+
         ctx.mme_ue_pool
             .write()
             .unwrap()
@@ -1211,8 +1239,8 @@ mod tests {
             .ics_pending_on = enb_ue_id;
         mme_s6a_process_inbound(&isd(10_000_000, 5_000_000)).unwrap();
         assert!(ue_ctx_mods().is_empty(), "deferred");
-        let local = crate::context::MmeContext::new();
-        assert!(deferred_ue_ambr_sends(&local).is_empty(), "not its UE");
+        let empty = crate::context::MmeContext::new();
+        assert!(deferred_ue_ambr_sends(&empty).is_empty(), "not its UE");
         assert!(
             UE_AMBR_DEFERRED.lock().unwrap().contains(&mme_ue_id),
             "still indexed"
