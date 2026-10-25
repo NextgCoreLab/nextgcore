@@ -1686,8 +1686,10 @@ async fn smf_nrf_register(sbi_addr: &str, sbi_port: u16) -> std::result::Result<
 enum DefaultDnnError {
     /// No UDM address could be determined (no NRF, no discovery hit, no env).
     NoUdmEndpoint,
-    /// The Nudm_SDM_Get failed at the transport or returned a non-2xx.
+    /// The Nudm_SDM_Get got no answer: the UDM did not respond.
     SdmRequestFailed(String),
+    /// The UDM answered, but with an error or a body that is not smf-select-data.
+    SdmAnswerUnusable(String),
     /// The subscription carries no DNN at all for this S-NSSAI.
     NoSubscribedDnn,
     /// Several DNNs are subscribed for this S-NSSAI and none carries
@@ -1705,7 +1707,9 @@ impl DefaultDnnError {
             Self::NoSubscribedDnn | Self::AmbiguousDefault(_) => "MANDATORY_IE_MISSING",
             // Not the consumer's fault -- the SMF could not reach the data it needs
             // (#1097 review m2: TS 29.500 Table 5.2.7.2-1 causes, at 500 / 504).
-            Self::NoUdmEndpoint => "NETWORK_FAILURE",
+            // #1144 round 2 A: NETWORK_FAILURE is a 504 cause (TS 29.502 Table
+            // 6.1.7.3-1) and PEER_NOT_RESPONDING means no answer at all.
+            Self::NoUdmEndpoint | Self::SdmAnswerUnusable(_) => "SYSTEM_FAILURE",
             Self::SdmRequestFailed(_) => "PEER_NOT_RESPONDING",
         }
     }
@@ -1716,7 +1720,7 @@ impl DefaultDnnError {
     fn status(&self) -> u16 {
         match self {
             Self::NoSubscribedDnn | Self::AmbiguousDefault(_) => 400,
-            Self::NoUdmEndpoint => 500,
+            Self::NoUdmEndpoint | Self::SdmAnswerUnusable(_) => 500,
             Self::SdmRequestFailed(_) => 504,
         }
     }
@@ -1726,7 +1730,7 @@ impl DefaultDnnError {
             Self::NoUdmEndpoint => "no dnn in SmContextCreateData and no UDM endpoint is known \
                  (set UDM_SBI_ADDR or register a UDM with the NRF)"
                 .to_string(),
-            Self::SdmRequestFailed(e) => format!(
+            Self::SdmRequestFailed(e) | Self::SdmAnswerUnusable(e) => format!(
                 "no dnn in SmContextCreateData and the subscribed default could not be \
                  retrieved: {e}"
             ),
@@ -1983,16 +1987,16 @@ async fn fetch_subscribed_default_dnn(
         DefaultDnnError::SdmRequestFailed(format!("Nudm_SDM_Get smf-select-data failed: {e}"))
     })?;
     if !response.is_success() {
-        return Err(DefaultDnnError::SdmRequestFailed(format!(
+        return Err(DefaultDnnError::SdmAnswerUnusable(format!(
             "Nudm_SDM_Get smf-select-data returned status {}",
             response.status
         )));
     }
     let body = response.http.content.as_deref().ok_or_else(|| {
-        DefaultDnnError::SdmRequestFailed("empty smf-select-data body".to_string())
+        DefaultDnnError::SdmAnswerUnusable("empty smf-select-data body".to_string())
     })?;
     let json: serde_json::Value = serde_json::from_str(body).map_err(|e| {
-        DefaultDnnError::SdmRequestFailed(format!("smf-select-data is not valid JSON: {e}"))
+        DefaultDnnError::SdmAnswerUnusable(format!("smf-select-data is not valid JSON: {e}"))
     })?;
     select_default_dnn(&json, sst, sd)
 }
@@ -3470,7 +3474,7 @@ fn sm_context_create_ssc_error(psi: u8, pti: u8, allowed_ssc_bitmap: u8) -> SbiR
         Some(allowed_ssc_bitmap),
     );
     let body = serde_json::json!({
-        "error": { "status": 403, "cause": "SSC_MODE_NOT_SUPPORTED" },
+        "error": { "status": 403, "cause": "SSC_NOT_SUPPORTED" },
         "n1SmMsg": { "contentId": "n1SmMsg" },
     });
     SbiResponse::with_status(403)
@@ -3742,7 +3746,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
             log::warn!("Unsupported requested PDU session type {other} — rejecting (cause 50)");
             return sm_context_create_error(
                 403,
-                "PDU_SESSION_TYPE_NOT_SUPPORTED",
+                "PDUTYPE_NOT_SUPPORTED",
                 pdu_session_id,
                 pti,
                 policy::gsm_cause::PDU_SESSION_TYPE_IPV4_ONLY_ALLOWED,
@@ -3911,7 +3915,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     rollback();
                     return sm_context_create_error(
                         403,
-                        "NSAC_PDU_SESSION_REJECTED",
+                        "S_NSSAI_UNAVAILABLE_DUE_TO_NSAC",
                         pdu_session_id,
                         pti,
                         policy::gsm_cause::INSUFFICIENT_RESOURCES_FOR_SPECIFIC_SLICE,
@@ -4180,7 +4184,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     .await;
                     return sm_context_create_error(
                         403,
-                        "POLICY_REJECTED",
+                        "SUBSCRIPTION_DENIED",
                         pdu_session_id,
                         pti,
                         policy::gsm_cause::USER_AUTHENTICATION_OR_AUTHORIZATION_FAILED,
@@ -4203,7 +4207,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     .await;
                     return sm_context_create_error(
                         504,
-                        "PCF_NOT_RESPONDING",
+                        "PEER_NOT_RESPONDING",
                         pdu_session_id,
                         pti,
                         policy::gsm_cause::NETWORK_FAILURE,
@@ -4778,6 +4782,18 @@ fn activation_response(sm_context_ref: &str) -> SbiResponse {
 ///
 /// 500 SYSTEM_FAILURE when establishment recorded no UPF endpoint or binding: the AMF
 /// then leaves the session out of the handover.
+/// The answer to an SM Context Update whose `ie` (n1SmMsg or n2SmInfo) could not be
+/// read (#1144 review round 2 C): 400 MANDATORY_IE_MISSING when the request names
+/// none, 403 `cause` (N1_SM_ERROR / N2_SM_ERROR, TS 29.502 Table 6.1.7.3-1) when it
+/// names one that does not resolve or decode.
+fn missing_or_erroneous(value: &serde_json::Value, ie: &str, cause: &str) -> SbiResponse {
+    if value.is_null() {
+        eps_to_5gs::sm_context_error(400, "MANDATORY_IE_MISSING", &format!("{ie} is missing"))
+    } else {
+        eps_to_5gs::sm_context_error(403, cause, &format!("{ie} is not valid"))
+    }
+}
+
 /// The SmContextUpdateError of a HANDOVER_REQUIRED the SMF cannot prepare (#1097
 /// review M3, TS 29.502 §5.2.2.3.4.2 step 2b): `hoState: NONE`, and the N2 SM
 /// information a Handover Preparation Unsuccessful Transfer (TS 38.413 §9.3.4.18)
@@ -5252,11 +5268,9 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
             // N2 SM transfer: multipart ngap part (RefToBinaryData) or legacy
             // base64 string — `resolve_binary_ref` accepts both.
             let Some(n2_bytes) = resolve_binary_ref(request, &req_body["n2SmInfo"]) else {
-                return eps_to_5gs::sm_context_error(
-                    403,
-                    "N2_SM_ERROR",
-                    "n2SmInfo missing or not valid base64",
-                );
+                // #1144 round 2 C: absent is a missing IE (400); present but
+                // unreadable is erroneous SM information (403).
+                return missing_or_erroneous(&req_body["n2SmInfo"], "n2SmInfo", "N2_SM_ERROR");
             };
 
             // Real-APER decode of the gNB DL N3 endpoint via the nextgcore-ngap
@@ -5289,9 +5303,11 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                 // No N4 session exists for this context — fabricating a SEID
                 // would target an unrelated session
                 log::error!("No stored UPF SEID for ref={sm_context_ref}");
+                // #1144 round 2 B: the context exists, its N4 session is what is
+                // missing -- not a 404, which would tell the AMF the session is gone.
                 return eps_to_5gs::sm_context_update_error_with(
-                    404,
-                    "CONTEXT_NOT_FOUND",
+                    500,
+                    "SYSTEM_FAILURE",
                     "no N4 session for this SM context",
                     serde_json::json!({ "upCnxState": "DEACTIVATED" }),
                     None,
@@ -5411,11 +5427,9 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
             // N1 SM container: multipart 5gnas part (RefToBinaryData) or legacy
             // base64 string — `resolve_binary_ref` accepts both.
             let Some(n1_sm_msg) = resolve_binary_ref(request, &req_body["n1SmMsg"]) else {
-                return eps_to_5gs::sm_context_error(
-                    403,
-                    "N1_SM_ERROR",
-                    "n1SmMsg missing or not valid base64",
-                );
+                // #1144 round 2 C: absent is a missing IE (400); present but
+                // unreadable is erroneous SM information (403).
+                return missing_or_erroneous(&req_body["n1SmMsg"], "n1SmMsg", "N1_SM_ERROR");
             };
             let Some(hdr) = policy::parse_n1_sm_header(&n1_sm_msg) else {
                 return eps_to_5gs::sm_context_error(
@@ -5467,7 +5481,7 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                                         );
                                         return sm_context_create_error(
                                             403,
-                                            "POLICY_REJECTED",
+                                            "SUBSCRIPTION_DENIED",
                                             psi,
                                             pti,
                                             policy::gsm_cause::USER_AUTHENTICATION_OR_AUTHORIZATION_FAILED,
@@ -5574,10 +5588,14 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                         pfcp_deactivate_dl_far(smf_n4_seid_for(sm_context_ref), upf_seid).await
                     {
                         log::warn!("DL FAR deactivation failed: {e}");
-                        return eps_to_5gs::sm_context_error(
+                        // #1144 round 2: upCnxState is required whenever the user plane
+                        // was to be activated or deactivated (Table 6.1.6.2.36-1).
+                        return eps_to_5gs::sm_context_update_error_with(
                             504,
                             "UPF_NOT_RESPONDING",
                             "the UPF did not deactivate the downlink",
+                            serde_json::json!({ "upCnxState": "DEACTIVATED" }),
+                            None,
                         );
                     }
                 }
@@ -5670,11 +5688,9 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
         // indication labelled PDU_RES_SETUP_RSP.
         "PDU_RES_MOD_IND" => {
             let Some(n2_bytes) = resolve_binary_ref(request, &req_body["n2SmInfo"]) else {
-                return eps_to_5gs::sm_context_error(
-                    403,
-                    "N2_SM_ERROR",
-                    "n2SmInfo missing or not valid base64",
-                );
+                // #1144 round 2 C: absent is a missing IE (400); present but
+                // unreadable is erroneous SM information (403).
+                return missing_or_erroneous(&req_body["n2SmInfo"], "n2SmInfo", "N2_SM_ERROR");
             };
             an_initiated_modification(sm_context_ref, &n2_bytes).await
         }
@@ -12496,7 +12512,7 @@ mod tests {
     /// Establishment Reject as a 5gnas binary part referenced by RefToBinaryData.
     #[test]
     fn sm_context_create_error_carries_n1_reject_part() {
-        let resp = sm_context_create_error(403, "PDU_SESSION_TYPE_NOT_SUPPORTED", 5, 2, 50);
+        let resp = sm_context_create_error(403, "PDUTYPE_NOT_SUPPORTED", 5, 2, 50);
         assert_eq!(resp.status, 403);
         let root: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
@@ -12830,13 +12846,15 @@ mod tests {
                 DefaultDnnError::NoUdmEndpoint.cause(),
                 DefaultDnnError::NoUdmEndpoint.status()
             ),
-            ("NETWORK_FAILURE", 500)
+            ("SYSTEM_FAILURE", 500)
         );
         let failed = DefaultDnnError::SdmRequestFailed("boom".into());
         assert_eq!(
             (failed.cause(), failed.status()),
             ("PEER_NOT_RESPONDING", 504)
         );
+        let refused = DefaultDnnError::SdmAnswerUnusable("status 503".into());
+        assert_eq!((refused.cause(), refused.status()), ("SYSTEM_FAILURE", 500));
         assert_eq!(DefaultDnnError::NoSubscribedDnn.status(), 400);
 
         // Every detail says which failure it was, and none of them says "internet".
@@ -13285,7 +13303,7 @@ mod tests {
         assert_eq!(resp.status, 500, "an unresolvable DNN refuses the session");
         let content = resp.http.content.as_deref().unwrap_or("");
         assert!(
-            content.contains("NETWORK_FAILURE"),
+            content.contains("SYSTEM_FAILURE"),
             "the cause must name the real problem, got {content}"
         );
         assert!(
@@ -19429,6 +19447,19 @@ mod tests {
                     &post("/x/modify", r#"{"n2SmInfoType":"PDU_RES_MOD_REQ"}"#),
                 )
                 .await,
+                400,
+                "MANDATORY_IE_MISSING",
+            ),
+            (
+                "update: PDU_RES_MOD_REQ naming an N1 part that is not there",
+                handle_sm_context_update(
+                    &known,
+                    &post(
+                        "/x/modify",
+                        r#"{"n2SmInfoType":"PDU_RES_MOD_REQ","n1SmMsg":{"contentId":"absent"}}"#,
+                    ),
+                )
+                .await,
                 403,
                 "N1_SM_ERROR",
             ),
@@ -19465,14 +19496,87 @@ mod tests {
         }
     }
 
+    /// #1144 round 2: a user-plane activation that fails says the user plane is
+    /// DEACTIVATED (TS 29.502 Table 6.1.6.2.36-1): when the UPF refuses the
+    /// downlink (504 UPF_NOT_RESPONDING), and when the context has no N4 session
+    /// (500 SYSTEM_FAILURE, not a 404 -- the context exists).
+    ///
+    /// REVERT-VERIFIED: without upCnxState on the UPF-refusal 504, this fails.
+    #[tokio::test]
+    async fn a_failed_activation_answers_deactivated() {
+        use base64::Engine as _;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        smf_context_init(64, 256, 512);
+        let setup_rsp = serde_json::json!({
+            "n2SmInfoType": "PDU_RES_SETUP_RSP",
+            "n2SmInfo": base64::engine::general_purpose::STANDARD.encode(GNB_SETUP_RESPONSE_TRANSFER),
+        })
+        .to_string();
+        let post =
+            || SbiRequest::post("/x/modify").with_body(setup_rsp.clone(), "application/json");
+
+        // The UPF refuses the downlink.
+        let refused = seed_established_session(
+            "imsi-001010000011441",
+            5,
+            std::net::Ipv4Addr::new(10, 45, 11, 41),
+        );
+        upf.answer_sessions_with(69);
+        let resp = handle_sm_context_update(&refused, &post()).await;
+        upf.answer_sessions_with(1);
+        assert_eq!(resp.status, 504, "{:?}", resp.http.content);
+        let body = sm_context_error_of(&resp);
+        assert_eq!(body["error"]["cause"], "UPF_NOT_RESPONDING");
+        assert_eq!(body["upCnxState"], "DEACTIVATED");
+
+        // No N4 session for the context.
+        let no_n4 = seed_registered_session("imsi-001010000011442", 6, "internet");
+        let resp = handle_sm_context_update(&no_n4, &post()).await;
+        assert_eq!(resp.status, 500, "{:?}", resp.http.content);
+        let body = sm_context_error_of(&resp);
+        assert_eq!(body["error"]["cause"], "SYSTEM_FAILURE");
+        assert_eq!(body["upCnxState"], "DEACTIVATED");
+
+        if let Ok(ctx) = smf_self().read() {
+            for r in [&refused, &no_n4] {
+                if let Some(sess) = ctx.sess_find_by_sm_context_ref(r) {
+                    ctx.sess_remove(sess.id);
+                }
+                ctx.policy_bindings.write().unwrap().remove(r);
+                ctx.pfcp_sessions.write().unwrap().remove(r);
+            }
+            ctx.ipv4_pool
+                .release(std::net::Ipv4Addr::new(10, 45, 11, 41));
+        }
+    }
+
     /// #1097 review M4, the guard over every site: no SM Context Create or Update
     /// path answers an error any other way than through `eps_to_5gs::sm_context_*`
     /// (or the N1-bearing `sm_context_create_error`). A bare ProblemDetails or an
     /// empty error body reintroduced at any of them fails this.
     #[test]
     fn no_create_or_update_path_answers_a_bare_problem_details() {
-        let source = include_str!("main.rs");
-        for function in [
+        // An error status not followed by a body (`.with_body`/`.with_part`): a bare
+        // `with_status(4xx|5xx)` in any of its forms.
+        fn empty_error_answers(body: &str) -> Vec<String> {
+            let mut found = Vec::new();
+            for (at, _) in body.match_indices("with_status(") {
+                let rest = &body[at + "with_status(".len()..];
+                let Some(close) = rest.find(')') else {
+                    continue;
+                };
+                let Ok(status) = rest[..close].trim().parse::<u16>() else {
+                    continue;
+                };
+                let after = rest[close + 1..].trim_start();
+                if (400..600).contains(&status) && !after.starts_with('.') {
+                    found.push(format!("with_status({status})"));
+                }
+            }
+            found
+        }
+        let main_rs: &[&str] = &[
             "async fn handle_sm_context_create(",
             "async fn handle_sm_context_update(",
             "fn activation_response(",
@@ -19480,20 +19584,30 @@ mod tests {
             "fn handover_allocation_failed_response(",
             "async fn handle_n1_sm_message(",
             "async fn ran_released_session(",
+        ];
+        let eps_to_5gs_rs: &[&str] = &[
+            "async fn handle_create_inner(",
+            "async fn handle_prepared_inner(",
+            "async fn handle_completed_inner(",
+            "async fn handle_cancelled_inner(",
+        ];
+        for (source, functions) in [
+            (include_str!("main.rs"), main_rs),
+            (include_str!("eps_to_5gs.rs"), eps_to_5gs_rs),
         ] {
-            let start = source
-                .find(function)
-                .unwrap_or_else(|| panic!("{function} exists"));
-            let end = start + source[start..].find("\n}\n").expect("its end");
-            let body = &source[start..end];
-            for bare in ["problem_400(", "problem_404(", "problem_response("] {
-                assert!(!body.contains(bare), "{function} answers through {bare}");
-            }
-            for status in 400..600 {
-                let empty = format!("SbiResponse::with_status({status});");
+            for function in functions {
+                let start = source
+                    .find(function)
+                    .unwrap_or_else(|| panic!("{function} exists"));
+                let end = start + source[start..].find("\n}\n").expect("its end");
+                let body = &source[start..end];
+                for bare in ["problem_400(", "problem_404(", "problem_response("] {
+                    assert!(!body.contains(bare), "{function} answers through {bare}");
+                }
                 assert!(
-                    !body.contains(&empty),
-                    "{function} answers {status} with no body"
+                    empty_error_answers(body).is_empty(),
+                    "{function} answers with no body: {:?}",
+                    empty_error_answers(body)
                 );
             }
         }
