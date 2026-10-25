@@ -310,21 +310,29 @@ pub(crate) fn bearer_qos(bearer: &MmeBearer) -> Gtp2BearerQosIe {
         bearer.qos.gbr.downlink,
     );
     qos.pl = bearer.qos.arp.priority_level;
-    // The context stores the NAS/GTP spelling (0 = enabled), and the library IE takes
-    // booleans, so the conversion happens here rather than being assumed either way.
-    qos.pci = bearer.qos.arp.pre_emption_capability == 0;
-    qos.pvi = bearer.qos.arp.pre_emption_vulnerability == 0;
+    // The context stores the GTP spelling (TS 29.274 §8.15: PCI/PVI 1 =
+    // disabled), and the library IE's `pci`/`pvi` are those raw bits (`true`
+    // sets 0x40 / 0x01), so they are copied as they are (#1186 review: `== 0`
+    // inverted them, opposite to what S1AP now says).
+    qos.pci = bearer.qos.arp.pre_emption_capability != 0;
+    qos.pvi = bearer.qos.arp.pre_emption_vulnerability != 0;
     qos
+}
+
+/// An F-TEID carrying whichever address families `ip` has (#948, TS 29.274
+/// §8.22: IPv4, IPv6 or both), or `None` without an address.
+fn fteid_of(interface_type: u8, teid: u32, ip: &crate::context::IpAddr) -> Option<Gtp2FTeidIe> {
+    match (ip.ipv4, ip.ipv6) {
+        (Some(v4), Some(v6)) => Some(Gtp2FTeidIe::new_dual(interface_type, teid, v4, v6)),
+        (Some(v4), None) => Some(Gtp2FTeidIe::new_ipv4(interface_type, teid, v4)),
+        (None, Some(v6)) => Some(Gtp2FTeidIe::new_ipv6(interface_type, teid, v6)),
+        (None, None) => None,
+    }
 }
 
 /// The eNB's S1-U F-TEID for a bearer, or `None` when none has been saved yet.
 fn enb_s1u_fteid(bearer: &MmeBearer, interface_type: u8) -> Option<Gtp2FTeidIe> {
-    let ipv4 = bearer.enb_s1u_ip.ipv4?;
-    Some(Gtp2FTeidIe::new_ipv4(
-        interface_type,
-        bearer.enb_s1u_teid,
-        ipv4,
-    ))
+    fteid_of(interface_type, bearer.enb_s1u_teid, &bearer.enb_s1u_ip)
 }
 
 /// An F-TEID from an explicit TEID and context address, for the data-forwarding
@@ -337,8 +345,7 @@ fn forwarding_fteid(
     if teid == 0 {
         return None;
     }
-    let ipv4 = ip.ipv4?;
-    Some(Gtp2FTeidIe::new_ipv4(interface_type, teid, ipv4))
+    fteid_of(interface_type, teid, ip)
 }
 
 /// Build Create Session Request (TS 29.274 §7.2.1)
@@ -836,6 +843,34 @@ pub fn build_delete_bearer_response_for_ebis(
     Ok(msg)
 }
 
+/// Create Bearer Response refusing every bearer of the request (#641 stop-gap,
+/// TS 29.274 §7.2.4, Table 7.2.4-1): the message Cause, and one Bearer Context
+/// per bearer of the request (Bearer Contexts are mandatory and "all the bearer
+/// contexts included in the corresponding Create Bearer Request shall be
+/// included"), each with its EBI and the same Cause.
+pub fn build_create_bearer_refusal(
+    sgw_s11_teid: u32,
+    ebis: &[u8],
+    cause_value: GtpCause,
+    sequence_number: u32,
+) -> S11BuildResult<Gtp2Message> {
+    let mut msg = new_message(
+        message_type::CREATE_BEARER_RESPONSE,
+        sgw_s11_teid,
+        sequence_number,
+    );
+    msg.add_ie(typed_ie(|buf| {
+        Gtp2CauseIe::new(cause_value as u8).encode(buf, 0)
+    })?);
+    for ebi in ebis {
+        let mut bc = Gtp2BearerContextIe::new();
+        bc.set_ebi(*ebi);
+        bc.set_cause(&Gtp2CauseIe::new(cause_value as u8));
+        msg.add_bearer_context(0, &bc);
+    }
+    Ok(msg)
+}
+
 /// Delete Bearer Response for a request that named a PDN connection by its
 /// Linked EPS Bearer ID (TS 29.274 Table 7.2.10.2-1: the LBI is included "if
 /// the request contained" it, and Bearer Contexts only for EBIs it named) (#688).
@@ -979,19 +1014,17 @@ pub fn build_bearer_resource_command(
     if !tad.is_empty() {
         msg.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Tad as u8, 0, tad));
     }
-    // Flow QoS (C). The library's Bearer QoS IE has the same 22-octet layout as
-    // Flow QoS minus the leading ARP octet's position, so it is encoded here and
-    // re-tagged rather than hand-built a second time.
+    // Flow QoS (C, TS 29.274 §8.16): QCI then the four bit rates, 21 octets. It
+    // is the Bearer QoS layout WITHOUT the leading ARP octet, so the library's
+    // Bearer QoS is encoded and its first octet dropped (#1186 review: it was
+    // sent whole, so the PGW read the ARP octet as the QCI).
     if let Some(q) = qos {
-        let mut flow = Gtp2BearerQosIe::new(q.qci, q.ul_mbr, q.dl_mbr, q.ul_gbr, q.dl_gbr);
-        flow.pl = q.priority_level;
-        flow.pci = q.pre_emption_capability == 0;
-        flow.pvi = q.pre_emption_vulnerability == 0;
+        let flow = Gtp2BearerQosIe::new(q.qci, q.ul_mbr, q.dl_mbr, q.ul_gbr, q.dl_gbr);
         let encoded = typed_ie(|buf| flow.encode(buf, 0))?;
         msg.add_ie(Gtp2Ie::from_slice(
             Gtp2IeType::FlowQos as u8,
             0,
-            &encoded.value,
+            &encoded.value[1..],
         ));
     }
 
@@ -1014,6 +1047,54 @@ fn encode_apn_dns(apn: &str) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+
+    /// #1186 review, TS 29.274 §8.15: the Bearer QoS ARP octet carries the
+    /// context's GTP PCI/PVI as they are (1 = disabled): PCI 1 / PVI 0 sets bit 7
+    /// (0x40) and clears bit 1, and the reverse.
+    #[test]
+    fn bearer_qos_arp_bits_are_the_gtp_coding() {
+        for (pci, pvi, arp_bits) in [(1u8, 0u8, 0x40u8), (0, 1, 0x01)] {
+            let mut bearer = crate::context::MmeBearer::default();
+            bearer.qos.qci = 9;
+            bearer.qos.arp.priority_level = 8;
+            bearer.qos.arp.pre_emption_capability = pci;
+            bearer.qos.arp.pre_emption_vulnerability = pvi;
+            let ie = super::typed_ie(|buf| super::bearer_qos(&bearer).encode(buf, 0)).unwrap();
+            assert_eq!(ie.value[0] & 0x41, arp_bits, "PCI {pci} PVI {pvi}");
+            assert_eq!((ie.value[0] >> 2) & 0x0f, 8, "priority level");
+        }
+    }
+
+    /// #1186 review, TS 29.274 §8.16: the Bearer Resource Command's Flow QoS is
+    /// QCI then the four rates (21 octets), with no ARP octet.
+    #[test]
+    fn flow_qos_has_no_arp_octet() {
+        let qos = super::Gtp2BearerQos {
+            qci: 3,
+            priority_level: 8,
+            ul_mbr: 64,
+            dl_mbr: 128,
+            ..Default::default()
+        };
+        let msg = super::build_bearer_resource_command(
+            &crate::context::MmeBearer::default(),
+            &crate::context::MmeUe::default(),
+            &crate::context::SgwUe::default(),
+            5,
+            1,
+            &[],
+            Some(&qos),
+            0x1186,
+        )
+        .unwrap();
+        let flow = msg
+            .get_ie(nextgcore_gtp::v2::Gtp2IeType::FlowQos as u8, 0)
+            .expect("a Flow QoS");
+        assert_eq!(flow.value.len(), 21, "QCI and four 5-octet rates");
+        assert_eq!(flow.value[0], 3, "octet 5 is the QCI");
+        assert_eq!(&flow.value[1..6], &[0, 0, 0, 0, 64], "UL MBR");
+        assert_eq!(&flow.value[6..11], &[0, 0, 0, 0, 128], "DL MBR");
+    }
 
     /// #48: the F-TEID interface types are wire values from TS 29.274 §8.22, read from
     /// `6g_docs/specs/29274-j60.txt`, and two of them were WRONG while their only user

@@ -307,7 +307,8 @@ services:
       # Nudm_SDM_Get(smf-select-data) when SmContextCreateData carries no `dnn`.
       # NRF discovery is tried first; this is the fallback for a deployment with no
       # NRF, and it is what makes a DNN-less PDU session establish here rather than
-      # be refused with SUBSCRIPTION_DATA_NOT_AVAILABLE.
+      # be refused with 500 SYSTEM_FAILURE (504 PEER_NOT_RESPONDING if the UDM does
+      # not answer).
       UDM_SBI_ADDR: 172.23.0.12
       UDM_SBI_PORT: "7777"
       TLS_CERT: /etc/nextgcore/certs/smf.crt

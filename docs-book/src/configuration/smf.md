@@ -116,7 +116,7 @@ Every refused datagram increments `smf_pfcp_unauthorized_messages_total`. This i
 
 **Durable state is a one-way upgrade.** The snapshot format is versioned. This release writes version 2 (5G CP SEIDs `1<<48 | ref`; a version-1 session keeps its legacy `ref | 0x1000` SEID). An older binary refuses a newer snapshot rather than misread it, so rolling smfd back across this change with a state file fails to start. Remove the file (the sessions are then released) or roll forward.
 | `SMF_SBI_ADVERTISE_URI` | derived from SBI server address/port | Externally reachable base URI used in PCF callback (`notificationUri`) URIs. |
-| `UDM_SBI_ADDR` / `UDM_SBI_PORT` | unset / `7777` | UDM address for `Nudm_SDM_Get(smf-select-data)`, used only to resolve the **subscribed default DNN** (#204). Tried **after** NRF discovery, so it is the fallback for a deployment with no NRF. With neither available, a `SmContextCreateData` carrying no `dnn` is refused with `SUBSCRIPTION_DATA_NOT_AVAILABLE`. |
+| `UDM_SBI_ADDR` / `UDM_SBI_PORT` | unset / `7777` | UDM address for `Nudm_SDM_Get(smf-select-data)`, used only to resolve the **subscribed default DNN** (#204). Tried **after** NRF discovery, so it is the fallback for a deployment with no NRF. With neither available, a `SmContextCreateData` carrying no `dnn` is refused with `500 SYSTEM_FAILURE` (`504 PEER_NOT_RESPONDING` when the UDM does not answer). |
 | `NRF_URI` | unset | NRF URI, used when the YAML names none. |
 | `PCF_URI` / `NSACF_URI` | unset | PCF / NSACF endpoint, tried before NRF discovery. With no NSACF configured or discoverable, slice admission control is skipped. |
 | `SMF_METRICS_PORT` | `9090` | Prometheus endpoint port. |
@@ -199,7 +199,7 @@ A UPF reports a GTP-U path to a gNB, eNB, SGW-U or another UPF failing or recove
 - cause 72 from any other host;
 - cause 66 or 67, with the Offending IE, when the Node ID, the Node Report Type or a report the type announces is missing.
 
-The SMF learns which sessions use which peer from its own accepted Session Establishment and Modification Requests: the Outer Header Creation address of each FAR. The durable snapshot carries this (`farPeers`), so a restored session is still found.
+The SMF learns which sessions use which peer from its own accepted Session Establishment and Modification Requests: the Outer Header Creation address of each FAR. The durable snapshot carries this (`farPeers`), so a restored session is still found. A change of a session's peers (a Service Request, a handover) is written to the snapshot within 200 ms rather than at once: changes in that window are coalesced into one write, and a graceful shutdown writes what is pending. An SMF killed inside the window restores the peers from before it (#1075).
 
 - **Path failure:** the UP connection of every session with a forwarding FAR toward the peer is deactivated (TS 23.502 §4.3.7, steps 4 and 5). Those FARs are set to BUFF|NOCP, so downlink data is buffered and reported and the UE is paged. For an N3 FAR, the NG-RAN gets an N2-only PDU Session Resource Release Command (cause transport-resource-unavailable) through the AMF.
 - **Still down after `SMF_UP_PATH_FAILURE_HOLD_SECS`** (TS 23.007 §20.3.1):
@@ -302,7 +302,7 @@ Resolution, in order:
 3. If exactly **one** DNN is subscribed for the S-NSSAI and none is flagged, that one is used — unambiguous.
 4. Otherwise the session is **refused** with `400 MANDATORY_IE_MISSING`, listing the candidate DNNs. Choosing among several unflagged DNNs would invent an answer the subscription does not give.
 
-Failure causes are distinct so an operator can tell a provisioning gap from an unreachable UDM: `MANDATORY_IE_MISSING` for "the subscription supplies no usable default", `SUBSCRIPTION_DATA_NOT_AVAILABLE` for "no UDM endpoint" or "the Nudm_SDM_Get failed".
+Failure causes are distinct so an operator can tell a provisioning gap from an unreachable UDM: `MANDATORY_IE_MISSING` for "the subscription supplies no usable default", `500 SYSTEM_FAILURE` for "no UDM endpoint" or "the UDM answered with an error or an unusable body", and `504 PEER_NOT_RESPONDING` for "the UDM did not answer" (#1097).
 
 **Limit worth knowing:** nothing in this tree emits `defaultDnnIndicator` — the subscription DB has no such field and `udrd`'s `build_smf_selection_data` writes only the DNN name. So against this tree's own UDM/UDR, rule 3 is what makes it work, and a subscriber with **two or more DNNs on one S-NSSAI cannot establish a DNN-less PDU session** (it is refused, with the candidates named). Tracked as issue #264 (`decision`).
 

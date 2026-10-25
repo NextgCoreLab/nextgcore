@@ -121,6 +121,11 @@ pub fn fail_with_cause(continuation: S11Continuation, cause: u8) {
         S11Continuation::Restoration { sess_id } => {
             crate::pfcp_path::restoration_failed(sess_id, &format!("cause {cause}"))
         }
+        S11Continuation::ReleasePdn { sess_id } => release_pdn_unconfirmed(
+            sess_id,
+            None,
+            &format!("the deletion failed (cause {cause})"),
+        ),
         S11Continuation::CreateSession { peer, seq, teid } => {
             answer(
                 peer,
@@ -169,6 +174,11 @@ pub fn fail(continuation: S11Continuation, reason: &str) {
         S11Continuation::Restoration { sess_id } => {
             crate::pfcp_path::restoration_failed(sess_id, &format!("no answer ({reason})"))
         }
+        S11Continuation::ReleasePdn { sess_id } => release_pdn_unconfirmed(
+            sess_id,
+            None,
+            &format!("the SGW-U never answered the deletion ({reason})"),
+        ),
         S11Continuation::CreateSession { peer, seq, teid } => {
             log::error!(
                 "Create Session Response to {peer} carries a failure: the SGW-U never answered \
@@ -446,6 +456,22 @@ fn establishment_response(sess_id: u64, continuation: S11Continuation, body: &[u
         }
     };
 
+    // The session went while the SGW-U was establishing it -- a colliding Create
+    // Session Request replaced it, say. The SGW-U holds a session nothing here can
+    // address any more, so it is deleted now rather than left to leak.
+    if sess.is_none() && pfcp_cause == sxa_handler::pfcp_cause::REQUEST_ACCEPTED && up_f_seid != 0 {
+        match crate::pfcp_path::send_session_deletion_for_seid(up_f_seid, sess_id) {
+            Ok(()) => log::warn!(
+                "Session {sess_id} was removed while the SGW-U established it: deleting SGW-U \
+                 session {up_f_seid:#x}"
+            ),
+            Err(e) => log::error!(
+                "Session {sess_id} was removed while the SGW-U established it, and SGW-U \
+                 session {up_f_seid:#x} could not be deleted: {e}"
+            ),
+        }
+    }
+
     let result =
         sxa_handler::handle_session_establishment_response(sess.as_ref(), 0, pfcp_cause, up_f_seid);
 
@@ -546,6 +572,18 @@ fn deletion_response(sess_id: u64, continuation: S11Continuation, body: &[u8]) {
 
     let result = sxa_handler::handle_session_deletion_response(sess.as_ref(), 0, pfcp_cause);
 
+    if let S11Continuation::ReleasePdn { sess_id } = continuation {
+        // #1146 review: refused means the SGW-U said no. A session already gone
+        // locally (a same-APN Create Session replaced it) makes the handler
+        // answer Context not found, but the SGW-U's deletion still succeeded.
+        release_pdn_done(
+            sess_id,
+            sess.as_ref().map(|s| s.sgwc_ue_id),
+            pfcp_cause != sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+        );
+        return;
+    }
+
     let S11Continuation::DeleteSession {
         peer,
         seq,
@@ -586,6 +624,61 @@ fn deletion_response(sess_id: u64, continuation: S11Continuation, body: &[u8]) {
                 seq,
                 gtp_cause::REQUEST_ACCEPTED,
             );
+        }
+    }
+}
+
+/// The SGW-U answered the deletion of a PDN connection a Delete Bearer Response
+/// released (#710). Accepted: the session goes, and the UE context with it when it
+/// has no other. Refused: it goes all the same, logged and counted as unconfirmed
+/// ([`release_pdn_unconfirmed`]): the PGW and the MME have both released it, so
+/// nobody would ever ask to delete it again (#1146 review).
+fn release_pdn_done(sess_id: u64, ue_id: Option<u64>, refused: bool) {
+    if refused {
+        release_pdn_unconfirmed(sess_id, ue_id, "the SGW-U refused the deletion");
+        return;
+    }
+    let ctx = sgwc_self();
+    // `handle_session_deletion_response` has removed the session already.
+    ctx.sess_remove(sess_id);
+    log::info!("Session {sess_id} removed after the SGW-U confirmed the deletion");
+    remove_ue_if_empty(ue_id);
+}
+
+/// PDN connections released by a Delete Bearer Response whose SGW-U deletion was
+/// refused or never answered (#1146 review): removed locally anyway.
+pub static PDN_RELEASES_UNCONFIRMED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// #1146 review: unlike a refused Delete Session (the MME can retry it), nobody
+/// will ask again for a PDN connection the PGW and the MME have both released,
+/// and keeping it would leak it (a later Create Session for the APN replaces it
+/// locally without any PFCP deletion). It goes locally, as a session abandoned
+/// after the PGW anchored it does (#1032), logged with its CP F-SEID and counted.
+pub(crate) fn release_pdn_unconfirmed(sess_id: u64, ue_id: Option<u64>, why: &str) {
+    let ctx = sgwc_self();
+    let ue_id = ue_id.or_else(|| ctx.sess_find_by_id(sess_id).map(|s| s.sgwc_ue_id));
+    let seid = ctx
+        .sess_find_by_id(sess_id)
+        .map(|s| s.sgwc_sxa_seid)
+        .unwrap_or(0);
+    PDN_RELEASES_UNCONFIRMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    log::error!(
+        "PDN connection session {sess_id} (CP F-SEID 0x{seid:x}) released by the PGW and the \
+         MME, but {why}: removed locally; the SGW-U may still hold it"
+    );
+    ctx.sess_remove(sess_id);
+    remove_ue_if_empty(ue_id);
+}
+
+fn remove_ue_if_empty(ue_id: Option<u64>) {
+    let ctx = sgwc_self();
+    if let Some(ue_id) = ue_id {
+        if ctx
+            .ue_find_by_id(ue_id)
+            .is_some_and(|ue| ue.sess_ids.is_empty())
+        {
+            ctx.ue_remove(ue_id);
         }
     }
 }

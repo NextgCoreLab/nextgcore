@@ -742,6 +742,12 @@ impl PfcpMessageBuilder {
     }
 
     /// Add F-TEID IE
+    ///
+    /// With `choose_id` the UP function is asked to CHOOSE the F-TEID (TS 29.244 §8.2.3):
+    /// CH and CHID are set, the TEID and address fields are absent ("If the CH bit is set
+    /// to 1, TEID, IPv4 address and IPv6 address fields shall not be present"), V4 / V6
+    /// name the address family to choose from (`ipv4` / `ipv6` being `Some`, their value
+    /// unused), and PDRs sharing a CHOOSE ID get the same F-TEID (§5.5.3).
     pub fn add_f_teid(
         &mut self,
         teid: u32,
@@ -750,6 +756,13 @@ impl PfcpMessageBuilder {
         choose_id: Option<u8>,
     ) -> &mut Self {
         let mut value = BytesMut::new();
+        if let Some(id) = choose_id {
+            // #982: V4 (0x01) / V6 (0x02), CH (0x04), CHID (0x08), then the CHOOSE ID.
+            let flags = u8::from(ipv4.is_some()) | (u8::from(ipv6.is_some()) << 1) | 0x0C;
+            value.put_u8(flags);
+            value.put_u8(id);
+            return self.add_tlv(pfcp_ie::F_TEID, &value);
+        }
         let mut flags: u8 = 0;
 
         // TS 29.244 §8.2.3 Fig 8.2.3-1, octet 5: Bit1=V4 (0x01), Bit2=V6 (0x02),
@@ -762,9 +775,6 @@ impl PfcpMessageBuilder {
         if ipv6.is_some() {
             flags |= 0x02; // V6 flag (Bit2)
         }
-        if choose_id.is_some() {
-            flags |= 0x04; // CH flag (CHOOSE)
-        }
 
         value.put_u8(flags);
         value.put_u32(teid);
@@ -774,9 +784,6 @@ impl PfcpMessageBuilder {
         }
         if let Some(addr) = ipv6 {
             value.put_slice(&addr);
-        }
-        if let Some(id) = choose_id {
-            value.put_u8(id);
         }
 
         self.add_tlv(pfcp_ie::F_TEID, &value)
@@ -1363,6 +1370,9 @@ pub struct PdrParams {
     pub sdf_filters: Vec<String>,
     pub qfi: Option<u8>,
     pub network_instance: Option<String>,
+    /// #982: ask the UP function to CHOOSE an IPv4 F-TEID with this CHOOSE ID (TS 29.244
+    /// §8.2.3, §5.5.3), instead of `f_teid`. PDRs sharing the CHOOSE ID share the F-TEID.
+    pub f_teid_choose: Option<u8>,
 }
 
 /// Build Create PDR IE
@@ -1382,7 +1392,9 @@ pub fn build_create_pdr(params: &PdrParams) -> Vec<u8> {
     pdi_builder.add_source_interface(params.source_interface);
 
     // F-TEID
-    if let Some((teid, ipv4, ipv6)) = params.f_teid {
+    if let Some(id) = params.f_teid_choose {
+        pdi_builder.add_f_teid(0, Some([0; 4]), None, Some(id));
+    } else if let Some((teid, ipv4, ipv6)) = params.f_teid {
         pdi_builder.add_f_teid(teid, ipv4, ipv6, None);
     }
 
@@ -2079,6 +2091,28 @@ mod tests {
         let mut b = PfcpMessageBuilder::new();
         b.add_f_teid(0x0003_0003, Some([10, 0, 0, 1]), Some([0u8; 16]), None);
         assert_eq!(b.build()[4], 0x03, "dual-stack F-TEID octet-5 must be 0x03");
+    }
+
+    /// #982, TS 29.244 §8.2.3: a CHOOSE F-TEID with a CHOOSE ID is the flags octet (V4,
+    /// CH, CHID) and the CHOOSE ID, with no TEID or address -- the shape upfd's parser
+    /// reads, so PDRs sharing the CHOOSE ID get one F-TEID.
+    #[test]
+    fn a_choose_f_teid_with_a_choose_id_carries_no_teid_or_address() {
+        let mut b = PfcpMessageBuilder::new();
+        b.add_f_teid(0, Some([0; 4]), None, Some(0x82));
+        assert_eq!(b.build(), vec![0, 21, 0, 2, 0x0D, 0x82]);
+        let pdr = build_create_pdr(&PdrParams {
+            pdr_id: 0x55,
+            f_teid: Some((0x1234, Some([1, 2, 3, 4]), None)),
+            f_teid_choose: Some(7),
+            ..Default::default()
+        });
+        let pdi = crate::pfcp_path::find_ie(&pdr, pfcp_ie::PDI).expect("PDI");
+        assert_eq!(
+            crate::pfcp_path::find_ie(pdi, pfcp_ie::F_TEID),
+            Some(&[0x0D, 7][..]),
+            "the CHOOSE wins over a fixed F-TEID"
+        );
     }
 
     #[test]

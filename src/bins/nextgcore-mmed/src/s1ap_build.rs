@@ -223,12 +223,13 @@ pub fn cause_from_s1ap(cause: &Cause) -> S1apCause {
 
 /// Convert a context IP address into an S1AP TransportLayerAddress payload
 pub fn ip_to_transport_address(ip: &IpAddr) -> Vec<u8> {
-    if let Some(v4) = ip.ipv4 {
-        v4.to_vec()
-    } else if let Some(v6) = ip.ipv6 {
-        v6.to_vec()
-    } else {
-        Vec::new()
+    match (ip.ipv4, ip.ipv6) {
+        // #1175, TS 36.413 §9.2.2.1: a dual-stack endpoint is 160 bits, the IPv4
+        // address then the IPv6 one, so an IPv6-only eNB can still reach it.
+        (Some(v4), Some(v6)) => [v4.as_slice(), v6.as_slice()].concat(),
+        (Some(v4), None) => v4.to_vec(),
+        (None, Some(v6)) => v6.to_vec(),
+        (None, None) => Vec::new(),
     }
 }
 
@@ -242,6 +243,15 @@ pub fn transport_address_to_ip(addr: &[u8]) -> IpAddr {
     } else if addr.len() == 16 {
         let mut v6 = [0u8; 16];
         v6.copy_from_slice(addr);
+        ip.ipv6 = Some(v6);
+    } else if addr.len() == 20 {
+        // #948, TS 36.413 §9.2.2.1: 160 bits, the IPv4 address then the IPv6
+        // one (a dual-stack endpoint).
+        let mut v4 = [0u8; 4];
+        v4.copy_from_slice(&addr[..4]);
+        let mut v6 = [0u8; 16];
+        v6.copy_from_slice(&addr[4..]);
+        ip.ipv4 = Some(v4);
         ip.ipv6 = Some(v6);
     }
     ip
@@ -276,8 +286,11 @@ pub fn erab_qos_from_bearer(bearer: &MmeBearer) -> ErabLevelQosParameters {
         qci: bearer.qos.qci,
         arp: AllocationRetentionPriority {
             priority_level: bearer.qos.arp.priority_level,
-            pre_emption_capability: bearer.qos.arp.pre_emption_capability != 0,
-            pre_emption_vulnerability: bearer.qos.arp.pre_emption_vulnerability != 0,
+            // #1180: the context holds the GTP/NAS coding (TS 29.274 §8.15: PCI or
+            // PVI 1 = disabled); TS 36.413 §9.2.1.60 codes 1 as
+            // may-trigger-pre-emption / pre-emptable. A 0 here is enabled.
+            pre_emption_capability: bearer.qos.arp.pre_emption_capability == 0,
+            pre_emption_vulnerability: bearer.qos.arp.pre_emption_vulnerability == 0,
         },
         gbr_qos_info,
     }
@@ -1130,7 +1143,10 @@ mod tests {
                 assert_eq!(req.erab_list[0].gtp_teid, 0x1234_5678);
                 assert_eq!(req.erab_list[0].transport_layer_address, vec![10, 0, 0, 1]);
                 assert_eq!(req.erab_list[0].erab_qos.qci, 9);
-                assert!(req.erab_list[0].erab_qos.arp.pre_emption_capability);
+                // #1180: test_bearer has PCI 1 (GTP: disabled) and PVI 0 (enabled):
+                // shall-not-trigger-pre-emption, pre-emptable (TS 36.413 §9.2.1.60).
+                assert!(!req.erab_list[0].erab_qos.arp.pre_emption_capability);
+                assert!(req.erab_list[0].erab_qos.arp.pre_emption_vulnerability);
                 assert_eq!(
                     req.erab_list[0].nas_pdu.as_deref(),
                     Some(nas_pdu.as_slice())
@@ -1142,6 +1158,84 @@ mod tests {
             }
             other => panic!("unexpected message: {other:?}"),
         }
+    }
+
+    /// #1180, TS 36.413 §9.2.1.60 / TS 29.274 §8.15: an E-RAB SETUP REQUEST's ARP
+    /// on the wire. A bearer whose PGW said PCI 0 (may pre-empt), PVI 1 (not
+    /// pre-emptable) is sent as may-trigger-pre-emption (1), not-pre-emptable
+    /// (0), and the reverse.
+    #[test]
+    fn erab_arp_flags_follow_ts36413_coding() {
+        use nextgcore_s1ap_gen::generated as g;
+        let enb_ue = test_enb_ue();
+        for (pci, pvi, cap, vul) in [(0u8, 1u8, 1u8, 0u8), (1, 0, 0, 1)] {
+            let mut bearer = test_bearer();
+            bearer.qos.arp.pre_emption_capability = pci;
+            bearer.qos.arp.pre_emption_vulnerability = pvi;
+            let bytes = build_e_rab_setup_request(&enb_ue, &bearer, &[0x27], None).unwrap();
+            let pdu = nextgcore_s1ap_gen::decode(&bytes).unwrap();
+            let g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+                value: g::InitiatingMessageValue::Id_E_RABSetup(req),
+                ..
+            }) = pdu
+            else {
+                panic!("not an E-RAB SETUP REQUEST");
+            };
+            let arp = req
+                .protocol_i_es
+                .0
+                .iter()
+                .find_map(|ie| match &ie.value {
+                    g::E_RABSetupRequestProtocolIEs_EntryValue::Id_E_RABToBeSetupListBearerSUReq(l) => {
+                        l.0.first().map(|e| {
+                            let g::E_RABToBeSetupListBearerSUReq_EntryValue::Id_E_RABToBeSetupItemBearerSUReq(i) = &e.value;
+                            i.e_ra_blevel_qo_s_parameters.allocation_retention_priority.clone()
+                        })
+                    }
+                    _ => None,
+                })
+                .expect("an E-RAB to be set up");
+            assert_eq!(
+                (
+                    arp.pre_emption_capability.0,
+                    arp.pre_emption_vulnerability.0
+                ),
+                (cap, vul),
+                "GTP PCI {pci} PVI {pvi}"
+            );
+        }
+    }
+
+    /// #1175, TS 36.413 §9.2.2.1: a dual-stack SGW S1-U endpoint reaches the eNB
+    /// as a 160-bit Transport Layer Address (IPv4 then IPv6) in the Initial
+    /// Context Setup, and reads back as both families.
+    #[test]
+    fn a_dual_stack_sgw_endpoint_is_a_160_bit_transport_address() {
+        let mme_ue = test_mme_ue();
+        let enb_ue = test_enb_ue();
+        let v6 = [
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0x75,
+        ];
+        let mut bearer = test_bearer();
+        bearer.sgw_s1u_ip.ipv6 = Some(v6);
+        let ambr = ue_ambr(&mme_ue.ambr, []);
+        let bytes =
+            build_initial_context_setup_request(&mme_ue, &enb_ue, &[bearer], None, ambr).unwrap();
+        let S1apMessage::InitialContextSetupRequest(req) = decode_s1ap_pdu(&bytes).unwrap() else {
+            panic!("not an Initial Context Setup Request");
+        };
+        let addr = &req.erab_list[0].transport_layer_address;
+        assert_eq!(addr.len(), 20, "160 bits");
+        assert_eq!(&addr[..4], &[10, 0, 0, 1]);
+        assert_eq!(&addr[4..], &v6);
+        let back = transport_address_to_ip(addr);
+        assert_eq!((back.ipv4, back.ipv6), (Some([10, 0, 0, 1]), Some(v6)));
+        // A single family stays 32 or 128 bits.
+        let only6 = IpAddr {
+            ipv4: None,
+            ipv6: Some(v6),
+        };
+        assert_eq!(ip_to_transport_address(&only6), v6.to_vec());
     }
 
     #[test]

@@ -71,6 +71,9 @@ bytes = "1.5"
 once_cell = "1.19"
 base64.workspace = true
 hex.workspace = true
+# #686: the UE context storage entity (TS 23.501 §5.21.2.3, Annex C), in the MongoDB
+# the UDR already uses, through the same driver as nextgcore-dbi.
+mongodb = { workspace = true }
 
 [dev-dependencies]
 nextgcore-asn1c = { workspace = true }

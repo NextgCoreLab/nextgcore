@@ -80,6 +80,12 @@ pub(crate) enum SbiOutcome {
     /// #922 part 2: an SMF answer an NGAP step waits for (a modification, a
     /// re-activation, an EPS→5GS PREPARED).
     Smf(crate::ngap_path::SmfAnswer),
+    /// #686 PR 2: an AMF Set takeover's store lookup, and the Initial UE Message it held.
+    Takeover(crate::ngap_path::ue_context_takeover::TakeoverAnswer),
+    /// #686 PR 2: the UDM's answer to a takeover's UECM registration.
+    TakeoverUecm(crate::ngap_path::ue_context_takeover::TakeoverUecmAnswer),
+    /// #1185 review M1: whose a UE's stored record is, before a local deregistration.
+    DeregOwner(crate::ngap_path::ue_context_takeover::DeregOwnerAnswer),
 }
 
 /// What keyed work is serialised on: (AMF UE NGAP ID, PDU session ID).
@@ -408,6 +414,24 @@ impl SbiOffload {
             }
         }
         None
+    }
+
+    /// Wait until an outcome is ready for [`SbiOffload::try_recv`], or a keyed
+    /// exchange has finished (#981). `NgapServer::poll` races its SCTP receive
+    /// against this, so an SMF answer is applied as soon as it arrives instead of
+    /// after the receive timeout, and the next exchange queued on a finished key is
+    /// started at once. Cancel-safe: the only await is the channel's `recv`, and a
+    /// report it returns is kept (`ready`) or acted on before this returns.
+    pub(crate) async fn report_arrived(&mut self) {
+        if !self.ready.is_empty() {
+            return;
+        }
+        match self.rx.recv().await {
+            Some(Report::Outcome(outcome)) => self.ready.push_back(outcome),
+            Some(Report::KeyDone { job }) => self.key_done(job),
+            // The sender lives in `self`, so the channel never closes.
+            None => std::future::pending().await,
+        }
     }
 
     /// How many exchanges hold a permit right now.

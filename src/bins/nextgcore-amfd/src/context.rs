@@ -63,7 +63,7 @@ pub const NEXTGCORE_NAS_KSI_NO_KEY_IS_AVAILABLE: u8 = 7;
 // ============================================================================
 
 /// PLMN ID
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct PlmnId {
     /// MCC digit 1
     pub mcc1: u8,
@@ -146,7 +146,7 @@ pub struct Guami {
 }
 
 /// 5GS TAI (Tracking Area Identity)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Tai5gs {
     /// PLMN ID
     pub plmn_id: PlmnId,
@@ -155,7 +155,7 @@ pub struct Tai5gs {
 }
 
 /// NR CGI (NR Cell Global Identity)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct NrCgi {
     /// PLMN ID
     pub plmn_id: PlmnId,
@@ -164,7 +164,7 @@ pub struct NrCgi {
 }
 
 /// S-NSSAI (Single Network Slice Selection Assistance Information)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SNssai {
     /// SST (Slice/Service Type)
     pub sst: u8,
@@ -173,7 +173,7 @@ pub struct SNssai {
 }
 
 /// Bitrate
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Bitrate {
     /// Downlink bitrate (bps)
     pub downlink: u64,
@@ -198,7 +198,7 @@ pub struct NetworkName {
 }
 
 /// UE security capability
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct UeSecurityCapability {
     /// 5G-EA algorithms (bitmap)
     pub ea: u8,
@@ -211,7 +211,7 @@ pub struct UeSecurityCapability {
 }
 
 /// UE network capability
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct UeNetworkCapability {
     /// EEA algorithms (bitmap)
     pub eea: u8,
@@ -220,7 +220,7 @@ pub struct UeNetworkCapability {
 }
 
 /// 5GS GUTI
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Guti5gs {
     /// PLMN ID
     pub plmn_id: PlmnId,
@@ -639,6 +639,10 @@ pub struct AmfContext {
     /// N1N2MessageTransfers for CM-CONNECTED UEs awaiting NGAP egress (#666).
     /// Same shape and reason as `network_dereg_queue`.
     connected_downlink_queue: RwLock<Vec<PendingConnectedDownlink>>,
+    /// The RAT of each NG-RAN node's association, as its NG Setup established it
+    /// (#997 review m2): an ng-eNB is E-UTRA. Read with a UE's live association to
+    /// tell the LMF selection what serves the UE.
+    association_rat: RwLock<HashMap<u64, RatType>>,
 
     /// PWS N2 relay queue (#396, TS 29.518 §5.2.2.4.1.3 / TS 38.413 §8.12):
     /// warning containers a CBCF/PWS-IWF handed the AMF over
@@ -1294,6 +1298,7 @@ impl AmfContext {
             amf_status_subscriptions: RwLock::new(HashMap::new()),
             network_dereg_queue: RwLock::new(Vec::new()),
             connected_downlink_queue: RwLock::new(Vec::new()),
+            association_rat: RwLock::new(HashMap::new()),
             pws_n2_queue: RwLock::new(Vec::new()),
             non_ue_nrppa_queue: RwLock::new(Vec::new()),
             non_ue_n2_subscriptions: RwLock::new(HashMap::new()),
@@ -1710,6 +1715,37 @@ impl AmfContext {
         }?;
         let amf_ue_list = self.amf_ue_list.read().ok()?;
         amf_ue_list.get(&id).cloned()
+    }
+
+    /// Record the RAT of the node on `association_id` (#997 review m2).
+    pub fn association_rat_set(&self, association_id: u64, rat: RatType) {
+        if let Ok(mut m) = self.association_rat.write() {
+            m.insert(association_id, rat);
+        }
+    }
+
+    /// Forget a closed association's RAT.
+    pub fn association_rat_remove(&self, association_id: u64) {
+        if let Ok(mut m) = self.association_rat.write() {
+            m.remove(&association_id);
+        }
+    }
+
+    /// The RAT of the node serving the UE `amf_ue_ngap_id`, from the association its
+    /// live record is bound to (NR when either is unknown).
+    pub fn serving_rat_of_ue(&self, amf_ue_ngap_id: u64) -> RatType {
+        let Some(association_id) = self
+            .ue_store
+            .get(amf_ue_ngap_id)
+            .map(|s| s.association_id())
+        else {
+            return RatType::default();
+        };
+        self.association_rat
+            .read()
+            .ok()
+            .and_then(|m| m.get(&association_id).copied())
+            .unwrap_or_default()
     }
 
     /// The live-UE store, shared rather than copied (#341).
@@ -3141,6 +3177,9 @@ pub struct AmfGnb {
     /// 32 until NG Setup completes; a node that never completed NG Setup cannot
     /// be a notification source.
     pub gnb_id_len: u8,
+    /// The ngENB-ID, with its length, of a node that set up NG as an ng-eNB
+    /// (TS 38.413 §9.3.1.8, #876); `None` for a gNB.
+    pub ng_enb_id: Option<nextgcore_ngap::types::NgEnbId>,
     /// PLMN ID (received from gNB)
     pub plmn_id: PlmnId,
     /// gNB state
@@ -3166,6 +3205,7 @@ impl AmfGnb {
             gnb_id_presence: false,
             gnb_id: 0,
             gnb_id_len: 32,
+            ng_enb_id: None,
             plmn_id: PlmnId::default(),
             state: GnbState::default(),
             max_num_of_ostreams: 0,
@@ -3412,7 +3452,7 @@ pub struct NasState {
 }
 
 /// GMM capability
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GmmCapability {
     /// LTE positioning protocol capability
     pub lte_positioning_protocol_capability: bool,
@@ -3423,7 +3463,7 @@ pub struct GmmCapability {
 }
 
 /// Policy association
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PolicyAssociation {
     /// Resource URI
     pub resource_uri: Option<String>,
@@ -3481,7 +3521,7 @@ pub struct ExplicitDeRegistered {
 /// schema. Presence is therefore enforced (both are `required` in `Arp`) and the
 /// value is not, which is the same stance this tree took for other extensible
 /// enumerations, and it means an ARP is echoed back exactly as the SMF stated it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EbiArp {
     /// `priorityLevel`, 1..=15 (1 is highest). Validated on ingest.
     pub priority_level: u8,
@@ -3496,7 +3536,7 @@ pub struct EbiArp {
 /// TS 23.502 §4.11.1.4.1: for a PDU session that may move to EPS, the SMF asks
 /// the AMF for an EBI per QoS flow that needs one, supplying that flow's ARP; the
 /// AMF owns the identity space and answers with the values it allocated.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AssignedEbi {
     /// The allocated EBI, always in [`EBI_ASSIGNABLE`].
     pub ebi: u8,
@@ -3694,6 +3734,12 @@ pub struct AmfUe {
     /// RACS (#570): the UE already holds `ue_radio_capability_id` (it presented it,
     /// or the AMF sent it), so it need not be sent again.
     pub ue_radio_capability_id_known_to_ue: bool,
+    /// RACS (#889): a retired ID was dropped, and the UE has not yet acknowledged
+    /// a UE radio capability ID deletion indication (TS 24.501 §9.11.3.69).
+    pub ue_radio_capability_id_deletion_owed: bool,
+    /// RACS (#889): what the last REGISTRATION ACCEPT or CONFIGURATION UPDATE
+    /// COMMAND built carried, committed only by its COMPLETE.
+    pub racs_in_flight: Option<crate::racs::RacsInFlight>,
     /// Handover info
     pub handover: HandoverInfo,
     /// Data change subscription
@@ -3876,6 +3922,11 @@ impl std::fmt::Debug for AmfUe {
             "ue_radio_capability_id_known_to_ue",
             &self.ue_radio_capability_id_known_to_ue,
         );
+        d.field(
+            "ue_radio_capability_id_deletion_owed",
+            &self.ue_radio_capability_id_deletion_owed,
+        );
+        d.field("racs_in_flight", &self.racs_in_flight);
         d.field("handover", &self.handover);
         d.field("data_change_subscription", &self.data_change_subscription);
         d.field("explicit_de_registered", &self.explicit_de_registered);
@@ -4411,6 +4462,8 @@ impl AmfUe {
             racs_supported: false,
             ue_radio_capability_id: None,
             ue_radio_capability_id_known_to_ue: false,
+            ue_radio_capability_id_deletion_owed: false,
+            racs_in_flight: None,
             handover: HandoverInfo::default(),
             data_change_subscription: DataChangeSubscription::default(),
             explicit_de_registered: ExplicitDeRegistered::default(),

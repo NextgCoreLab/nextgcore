@@ -43,10 +43,13 @@ pub mod gsm_cause {
     /// anchored it restarted and holds none of its state (#667, TS 23.527 §4.2).
     pub const REACTIVATION_REQUESTED: u8 = 39;
     pub const PDU_SESSION_TYPE_IPV4_ONLY_ALLOWED: u8 = 50;
-    /// #67 Insufficient resources for specific slice (TS 24.501 §9.11.4.2).
+    /// #69 Insufficient resources for specific slice (TS 24.501 §9.11.4.2).
     /// Used when the NSACF declines a PDU-session admission for the S-NSSAI
-    /// (slice PDU-session quota exhausted: NSACF 403, or 200 acuFailureList).
-    pub const INSUFFICIENT_RESOURCES_FOR_SPECIFIC_SLICE: u8 = 67;
+    /// (slice PDU-session quota exhausted: NSACF 403, or 200 acuFailureList):
+    /// TS 24.501 §4.6.3.1 rejects it with S-NSSAI based congestion control
+    /// (§6.2.8, §6.4.1.4.2), which is #69. It was 67, "insufficient resources for
+    /// specific slice and DNN", the S-NSSAI+DNN cause (#1144 review round 4).
+    pub const INSUFFICIENT_RESOURCES_FOR_SPECIFIC_SLICE: u8 = 69;
     /// #68 Not supported SSC mode (TS 24.501 §9.11.4.2). Paired with the Allowed
     /// SSC mode IE so the UE knows what to request instead.
     pub const NOT_SUPPORTED_SSC_MODE: u8 = 68;
@@ -336,6 +339,12 @@ pub enum PolicyError {
     Rejected { status: u16, detail: String },
     /// Transport-level failure (PCF unreachable / timeout)
     Transport(String),
+    /// The PCF is overloaded (TS 29.500 §5.2.7.2: 429, or 503 with Retry-After): the
+    /// request may be retried, after `retry_after` when the PCF said (#874).
+    Overloaded {
+        status: u16,
+        retry_after: Option<Duration>,
+    },
 }
 
 impl std::fmt::Display for PolicyError {
@@ -346,6 +355,13 @@ impl std::fmt::Display for PolicyError {
                 write!(f, "PCF rejected SM policy: status={status} ({detail})")
             }
             PolicyError::Transport(e) => write!(f, "PCF transport failure: {e}"),
+            PolicyError::Overloaded {
+                status,
+                retry_after,
+            } => write!(
+                f,
+                "PCF overloaded: status={status}, Retry-After {retry_after:?}"
+            ),
         }
     }
 }
@@ -478,10 +494,15 @@ pub async fn resolve_nsacf_endpoint() -> Option<NsacfEndpoint> {
         log::warn!("NSACF_URI '{uri}' is not a valid URI — ignoring");
     }
 
-    // NRF discovery
+    // NRF discovery, answered from the cache while the last result is valid (#1075,
+    // #1072 round 2 m5): a releasing shutdown sends N DECREASEs, and each one used
+    // to run its own discovery.
     let nrf_uri = nextgcore_sbi::context::global_context()
         .get_nrf_uri()
         .await?;
+    if let Some(cached) = cached_nsacf(&nrf_uri) {
+        return Some(cached);
+    }
     let (nrf_host, nrf_port) = split_host_port(&nrf_uri)?;
     let client = SbiClient::new(
         nextgcore_sbi::security::sbi_peer_client_config(&nrf_host, nrf_port)
@@ -518,7 +539,69 @@ pub async fn resolve_nsacf_endpoint() -> Option<NsacfEndpoint> {
         .and_then(|p| p.as_u64())
         .map(|p| p as u16)
         .unwrap_or(7813);
-    Some(NsacfEndpoint { host, port })
+    let endpoint = NsacfEndpoint { host, port };
+    // TS 29.510 §6.2.6.2.2 SearchResult.validityPeriod, in seconds; without one, a
+    // short default rather than for ever.
+    let validity = body
+        .get("validityPeriod")
+        .and_then(|v| v.as_u64())
+        .map(Duration::from_secs)
+        .unwrap_or(NSACF_DISCOVERY_DEFAULT_VALIDITY)
+        .min(NSACF_DISCOVERY_MAX_VALIDITY);
+    cache_nsacf(&nrf_uri, &endpoint, validity);
+    Some(endpoint)
+}
+
+/// The NSACF discovered through each NRF, until its result's validity ends
+/// (#1075). Keyed by the NRF URI, so a different NRF is asked afresh. Process-
+/// global: a test that sets an NRF and resolves through it holds
+/// `PROCESS_STATE_TEST_LOCK` (#1150 review round 2 n1).
+static NSACF_DISCOVERY_CACHE: std::sync::Mutex<
+    Option<std::collections::HashMap<String, (NsacfEndpoint, std::time::Instant)>>,
+> = std::sync::Mutex::new(None);
+
+/// How long a discovery result without a `validityPeriod` is reused.
+const NSACF_DISCOVERY_DEFAULT_VALIDITY: Duration = Duration::from_secs(60);
+/// The longest a discovered NSACF is reused, whatever the NRF says.
+const NSACF_DISCOVERY_MAX_VALIDITY: Duration = Duration::from_secs(3600);
+
+fn cached_nsacf(nrf_uri: &str) -> Option<NsacfEndpoint> {
+    let mut cache = NSACF_DISCOVERY_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let map = cache.as_mut()?;
+    match map.get(nrf_uri) {
+        Some((endpoint, until)) if std::time::Instant::now() < *until => Some(endpoint.clone()),
+        Some(_) => {
+            map.remove(nrf_uri);
+            None
+        }
+        None => None,
+    }
+}
+
+/// Drop every cached discovery that named `endpoint` (#1150 review M1): it failed a
+/// transaction, so the next resolution asks the NRF again -- after an NSACF failover
+/// the NRF names the new one.
+fn forget_cached_nsacf(endpoint: &NsacfEndpoint) {
+    if let Some(map) = NSACF_DISCOVERY_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+    {
+        map.retain(|_, (cached, _)| cached.host != endpoint.host || cached.port != endpoint.port);
+    }
+}
+
+fn cache_nsacf(nrf_uri: &str, endpoint: &NsacfEndpoint, validity: Duration) {
+    NSACF_DISCOVERY_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(
+            nrf_uri.to_string(),
+            (endpoint.clone(), std::time::Instant::now() + validity),
+        );
 }
 
 /// Outcome of an Nnsacf_NSAC PDU-session admission query (TS 29.536).
@@ -527,7 +610,7 @@ pub enum NsacAdmission {
     /// PDU session admitted (HTTP 204) — proceed with establishment.
     Admitted,
     /// PDU session rejected (HTTP 403, or 200 with this SUPI in acuFailureList)
-    /// — reject with 5GSM cause #67.
+    /// — reject with 5GSM cause #69.
     Rejected,
     /// NSACF returned an unexpected status, or the request provably never left
     /// (no connection). The caller decides the fail-open vs fail-closed policy.
@@ -578,6 +661,9 @@ pub async fn nsac_pdu_session_admit(
         Err(e) => {
             log::warn!("NSACF PDU-session admission query failed: {e}");
             client.close().await;
+            // #1150 review M1: a discovered NSACF that does not answer is
+            // discovered again next time, not reused for its whole validity.
+            forget_cached_nsacf(nsacf);
             // #1072 review m2: a request that provably never left (the connect
             // or the TLS handshake failed, #664) changed no count. Anything
             // later may have reached the NSACF and been applied.
@@ -591,11 +677,14 @@ pub async fn nsac_pdu_session_admit(
         }
     };
     client.close().await;
+    if resp.status >= 500 {
+        forget_cached_nsacf(nsacf);
+    }
 
     match resp.status {
         // All requested S-NSSAIs for this PDU session admitted.
         204 => NsacAdmission::Admitted,
-        // Total failure (ProblemDetails) -> reject with 5GSM cause #67.
+        // Total failure (ProblemDetails) -> reject with 5GSM cause #69.
         403 => {
             log::info!(
                 "NSACF rejected PDU session for S-NSSAI[SST:{sst} SD:{sd:?}] (403 total failure)"
@@ -694,6 +783,11 @@ async fn nsac_decrease(
     let client = nsacf.client();
     let result = client.post_json("/nnsacf-nsac/v1/slices/pdus", &body).await;
     client.close().await;
+    // #1150 review M1: an NSACF that does not answer, or answers 5xx, is not
+    // reused from the discovery cache.
+    if result.as_ref().map_or(true, |resp| resp.status >= 500) {
+        forget_cached_nsacf(nsacf);
+    }
     let failure = match result {
         Ok(resp) if (200..300).contains(&resp.status) => return true,
         Ok(resp) => format!(
@@ -947,8 +1041,25 @@ pub async fn sm_policy_delete(pcf: &PcfEndpoint, sm_policy_id: &str) -> Result<(
         .post_json(&path, &serde_json::json!({}))
         .await
         .map_err(|e| PolicyError::Transport(e.to_string()))?;
+    // #874: TS 29.500 §5.2.7.2 makes 429, and 503 with Retry-After, an overload the
+    // consumer may retry; Retry-After (RFC 9110 §10.2.3) is honoured when it is
+    // delta-seconds.
+    let retry_after = resp
+        .http
+        .get_header("retry-after")
+        .or_else(|| resp.http.get_header("Retry-After"))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_secs);
     match resp.status {
         204 | 200 => Ok(()),
+        429 => Err(PolicyError::Overloaded {
+            status: 429,
+            retry_after,
+        }),
+        503 if retry_after.is_some() => Err(PolicyError::Overloaded {
+            status: 503,
+            retry_after,
+        }),
         s => Err(PolicyError::Rejected {
             status: s,
             detail: resp.http.content.clone().unwrap_or_default(),
@@ -1496,7 +1607,7 @@ const DEFAULT_BACK_OFF_MINUTES: u8 = 10;
 /// (TS 24.501 §8.3.3 Table 8.3.3.1.1).
 ///
 /// For congestion-related causes (#26 insufficient resources, #27 missing/
-/// unknown DNN, #67 insufficient resources for the slice) a Back-off timer
+/// unknown DNN, #69 insufficient resources for specific slice) a Back-off timer
 /// value (T3396, GPRS timer 3, IEI 0x37) is appended so the UE applies the
 /// mandated back-off (TS 24.501 §6.2.8). smfd-08.
 pub fn build_establishment_reject(psi: u8, pti: u8, cause_5gsm: u8) -> Vec<u8> {
@@ -2575,8 +2686,8 @@ mod tests {
 
     #[test]
     fn nsac_reject_uses_slice_specific_5gsm_cause() {
-        // TS 24.501 §9.11.4.2 cause #67 (insufficient resources for slice).
-        assert_eq!(gsm_cause::INSUFFICIENT_RESOURCES_FOR_SPECIFIC_SLICE, 67);
+        // TS 24.501 §9.11.4.2 cause #69 (insufficient resources for specific slice).
+        assert_eq!(gsm_cause::INSUFFICIENT_RESOURCES_FOR_SPECIFIC_SLICE, 69);
     }
 
     /// Wave-6 H8 Phase A: OAuth2 consumer enforcement is OFF by default, so the

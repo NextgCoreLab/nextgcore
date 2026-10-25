@@ -1689,7 +1689,7 @@ mod tests {
             ]),
             global_ran_node_id: types::GlobalRanNodeId::GlobalNgEnbId {
                 plmn_identity: [0x02, 0xF8, 0x39],
-                ng_enb_id: 0xABCDE,
+                ng_enb_id: types::NgEnbId::Macro(0xABCDE),
             },
         };
 

@@ -17,7 +17,7 @@ use nextgcore_pfcp::peer_policy::{
     is_request_type, is_response_type, same_host, PeerAllowlist, RefusalLog,
 };
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -649,6 +649,13 @@ pub struct PfcpServer {
     /// for T1/N1 retransmission (TS 29.244 §7.2.2.3). Currently used for
     /// Session Report Requests (Downlink Data / Error Indication Reports).
     pending_reports: tokio::sync::Mutex<HashMap<u32, PendingReport>>,
+    /// Setups from unlisted addresses waiting for a re-resolution (#1112).
+    admission: std::sync::Mutex<PendingAdmission>,
+    /// Set while a held Setup is judged again, so it is answered, not held twice.
+    rejudging: AtomicBool,
+    /// How a held Setup's re-resolution resolves: [`PeerAllowlist::resolve_hosts`],
+    /// or a test's stand-in for a slow resolver.
+    resolver: std::sync::RwLock<fn(&PeerAllowlist)>,
     /// Heartbeat state: outstanding request sequence numbers and how many
     /// heartbeat rounds in a row went unanswered (TS 23.007 §19A).
     ///
@@ -659,6 +666,8 @@ pub struct PfcpServer {
     /// The CP-function hosts an Association Setup is accepted from (security, #968).
     /// Fail closed: empty refuses every Setup.
     allowed_peers: std::sync::RwLock<PeerAllowlist>,
+    /// The IPv6 N3 GTP-U address, set once the IPv6 GTP-U socket is bound (#985).
+    n3_ipv6: std::sync::RwLock<Option<Ipv6Addr>>,
 }
 
 /// Outstanding-heartbeat bookkeeping for peer-failure detection.
@@ -796,6 +805,60 @@ pub struct PfcpSessionInfo {
     pub tsn_bridge: Option<crate::context::TsnBridge>,
 }
 
+/// The FARs a Session Modification creates with a tunnel of their own (#619): each
+/// one a PDR created by the same message uses, and created with an Outer Header
+/// Creation.
+///
+/// That is #583's indirect forwarding tunnel (an Access PDR's FAR toward the target
+/// RAN) or a dedicated EPS bearer's S5/S8-U tunnel (a Core PDR's FAR toward the SGW,
+/// TS 23.401 §5.4.1). Neither is the session's downlink tunnel. A FAR created with no
+/// endpoint (FAR 2 buffering until the access side is known) is the session's, and
+/// its first Update sets the session's tunnel. The PFCP layer and the data plane
+/// both apply this one rule, each to its own store.
+pub(crate) fn own_tunnel_fars_created(
+    created_pdrs: &[crate::n4_build::ParsedCreatePdr],
+    created_fars: &[crate::n4_build::ParsedCreateFar],
+) -> std::collections::HashSet<u32> {
+    let used: std::collections::HashSet<u32> =
+        created_pdrs.iter().filter_map(|p| p.far_id).collect();
+    created_fars
+        .iter()
+        .filter(|f| used.contains(&f.far_id))
+        .filter(|f| {
+            f.forwarding_parameters
+                .as_ref()
+                .is_some_and(|fp| fp.outer_header_creation.is_some())
+        })
+        .map(|f| f.far_id)
+        .collect()
+}
+
+/// The FARs a Session Establishment creates with a tunnel of their own (#619 review):
+/// each one a PDR of the message uses, created with an Outer Header Creation that is not
+/// the session's downlink tunnel (`session_tunnel`, the TEID and IPv4 address the
+/// establishment takes as the session's).
+///
+/// A session established with a dedicated bearer already in it (a restoration, or an
+/// SMF that sends the whole rule set at once) has that bearer's FAR toward its own
+/// tunnel; without this, the session's first move re-pointed it.
+pub(crate) fn own_tunnel_fars_established(
+    pdrs: &[crate::n4_build::ParsedCreatePdr],
+    fars: &[crate::n4_build::ParsedCreateFar],
+    session_tunnel: (u32, Option<Ipv4Addr>),
+) -> std::collections::HashSet<u32> {
+    let used: std::collections::HashSet<u32> = pdrs.iter().filter_map(|p| p.far_id).collect();
+    fars.iter()
+        .filter(|f| used.contains(&f.far_id))
+        .filter(|f| {
+            f.forwarding_parameters
+                .as_ref()
+                .and_then(|fp| fp.outer_header_creation.as_ref())
+                .is_some_and(|ohc| (ohc.teid, ohc.ipv4) != session_tunnel)
+        })
+        .map(|f| f.far_id)
+        .collect()
+}
+
 /// The rule ids a session holds, by kind (TS 29.244 §7.5.4, #306).
 #[derive(Debug, Clone, Default)]
 pub struct SessionRuleIds {
@@ -803,6 +866,12 @@ pub struct SessionRuleIds {
     pub far_ids: std::collections::HashSet<u32>,
     pub qer_ids: std::collections::HashSet<u32>,
     pub urr_ids: std::collections::HashSet<u32>,
+    /// FARs with a tunnel endpoint of their own, not the session's downlink tunnel
+    /// (#619): a FAR created by a Session Modification together with a PDR that uses
+    /// it. That is #583's indirect forwarding tunnel (Access PDR) or a dedicated EPS
+    /// bearer's S5/S8-U tunnel (Core PDR, TS 23.401 §5.4.1). An Update FAR on one of
+    /// these moves that FAR only, never the session's tunnel.
+    pub own_tunnel_far_ids: std::collections::HashSet<u32>,
 }
 
 /// The time IEs of a usage report, from the times taken with its usage (#818, TS
@@ -826,6 +895,30 @@ fn report_time_ies(
         t.last_pkt.map(ntp_secs),
     )
 }
+
+/// Association Setup Requests from addresses the last resolution of the allowlist's
+/// host names does not contain, held while those names are re-resolved (#1112).
+///
+/// A restarted SMF pod is at an IP the periodic refresh may not have seen yet: it was
+/// refused cause 64 and admitted only on its retry, 10 s later, while it took creates
+/// it had no UPF for. Now its Setup waits for a fresh resolution and is judged
+/// against it. The lookup runs off the receive task, so nobody's PFCP traffic
+/// waits for DNS; the held Setups are judged again by the receive loop when it
+/// ends (or after [`ADMISSION_LOOKUP_MAX`]). Still fail-closed: an address the fresh
+/// answer does not list is refused, as is one beyond [`ADMISSION_MAX_HELD`].
+#[derive(Default)]
+struct PendingAdmission {
+    /// The resolution in flight, and when it began.
+    lookup: Option<(tokio::task::JoinHandle<()>, std::time::Instant)>,
+    /// The Setups waiting for it: (datagram, source).
+    held: Vec<(Vec<u8>, SocketAddr)>,
+}
+
+/// How long held Setups wait for a resolution before they are judged without it.
+const ADMISSION_LOOKUP_MAX: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How many Setups may wait at once; beyond it they are refused at once.
+const ADMISSION_MAX_HELD: usize = 64;
 
 impl PfcpServer {
     /// Create a new PFCP server
@@ -863,7 +956,53 @@ impl PfcpServer {
             pending_reports: tokio::sync::Mutex::new(HashMap::new()),
             heartbeat: tokio::sync::Mutex::new(HeartbeatState::default()),
             allowed_peers: std::sync::RwLock::new(PeerAllowlist::default()),
+            admission: std::sync::Mutex::new(PendingAdmission::default()),
+            rejudging: AtomicBool::new(false),
+            resolver: std::sync::RwLock::new(|list: &PeerAllowlist| {
+                list.resolve_hosts();
+            }),
+            n3_ipv6: std::sync::RwLock::new(None),
         })
+    }
+
+    /// The UPF's IPv6 N3 GTP-U address, once its IPv6 GTP-U socket is bound
+    /// (`--gtpu-addr6`, #985). Only then may a local F-TEID carry an IPv6 address.
+    pub fn set_n3_ipv6(&self, addr: Option<Ipv6Addr>) {
+        if let Ok(mut a) = self.n3_ipv6.write() {
+            *a = addr;
+        }
+    }
+
+    /// The addresses of a local F-TEID the UP function assigns (TS 29.244 §8.2.3,
+    /// #985). With CH set, "the UP function shall assign an F-TEID with an IPv4 or an
+    /// IPv6 address if the V4 or V6 bit is set respectively", and both may be set.
+    /// The IPv4 address is the Node ID's, as before. An IPv6 address is given only
+    /// when the UPF has an IPv6 GTP-U socket. No flag at all (this tree's SMF asks
+    /// with a zero TEID and no address) means IPv4.
+    ///
+    /// `None` when IPv6 alone is asked for and the UPF has no IPv6 N3 address: the
+    /// request cannot be met, so the caller refuses the rule rather than answering
+    /// with an IPv4 F-TEID the CP function did not ask for (#985 review). With V4 and
+    /// V6 both set, IPv4 alone meets it.
+    fn local_f_teid_addrs(
+        &self,
+        req: &crate::n4_build::ParsedFTeid,
+    ) -> Option<(Option<Ipv4Addr>, Option<Ipv6Addr>)> {
+        let node_v4 = match &self.local_node_id {
+            NodeId::Ipv4(addr) => Some(*addr),
+            _ => None,
+        };
+        let n3_v6 = self.n3_ipv6.read().ok().and_then(|a| *a);
+        let ipv6 = if req.v6 { n3_v6 } else { None };
+        let ipv4 = if req.v4 || !req.v6 { node_v4 } else { None };
+        if req.v6 && !req.v4 && ipv6.is_none() {
+            log::warn!(
+                "F-TEID with IPv6 only requested, but the UPF has no IPv6 GTP-U socket \
+                 (set --gtpu-addr6): the PDR is refused"
+            );
+            return None;
+        }
+        Some((ipv4, ipv6))
     }
 
     /// Allocate a new SEID
@@ -1082,6 +1221,8 @@ impl PfcpServer {
             // 100ms recv timeout gives this a sub-second polling cadence,
             // well under the multi-second T1 window.
             self.retransmit_pending_reports().await;
+            // #1112: Setups held for a re-resolution of the allowed CP names.
+            self.rejudge_held_setups().await;
         }
 
         Ok(())
@@ -1184,7 +1325,7 @@ impl PfcpServer {
                 }
             }
             pfcp_type::ASSOCIATION_SETUP_REQUEST => {
-                self.handle_association_setup_request(&header, payload, src_addr)
+                self.handle_association_setup_request(&header, payload, data, src_addr)
                     .await?;
             }
             pfcp_type::ASSOCIATION_RELEASE_REQUEST => {
@@ -1306,11 +1447,82 @@ impl PfcpServer {
         Ok(())
     }
 
+    /// Hold the Setup `datagram` from the unlisted `src_addr` for a re-resolution of
+    /// the allowlist's host names (#1112): `true` when held, `false` when it is to be
+    /// refused now -- it is being judged again already, the list names no host, a
+    /// resolution just ran (its answer decides), or too many are held.
+    fn hold_for_resolution(
+        &self,
+        allowed: &PeerAllowlist,
+        datagram: &[u8],
+        src_addr: SocketAddr,
+    ) -> bool {
+        if self.rejudging.load(Ordering::SeqCst) || allowed.hosts().is_empty() {
+            return false;
+        }
+        let mut pending = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+        // One held Setup per source (#1115 review n3): a retransmission is answered
+        // once, and one host cannot fill the queue with Setups under new sequence
+        // numbers and so push a real CP function's Setup past the cap.
+        if pending.held.iter().any(|(_, from)| *from == src_addr) {
+            return true;
+        }
+        if pending.held.len() >= ADMISSION_MAX_HELD {
+            return false;
+        }
+        if pending.lookup.is_none() {
+            if !allowed.try_begin_resolution() {
+                return false;
+            }
+            let list = allowed.clone();
+            let resolve = *self.resolver.read().unwrap_or_else(|e| e.into_inner());
+            let lookup = tokio::task::spawn_blocking(move || resolve(&list));
+            pending.lookup = Some((lookup, std::time::Instant::now()));
+        }
+        log::info!(
+            "PFCP Association Setup Request from {src_addr}, not in the last resolution of \
+             {:?}: held while they are re-resolved",
+            allowed.hosts()
+        );
+        pending.held.push((datagram.to_vec(), src_addr));
+        true
+    }
+
+    /// Resolve held Setups' names with `resolver` instead (a slow DNS, in a test).
+    #[cfg(test)]
+    fn set_resolver_for_test(&self, resolver: fn(&PeerAllowlist)) {
+        *self.resolver.write().unwrap_or_else(|e| e.into_inner()) = resolver;
+    }
+
+    /// Judge again the Setups held for a resolution that has ended, or has taken
+    /// longer than [`ADMISSION_LOOKUP_MAX`] (#1112). Called by the receive loop.
+    async fn rejudge_held_setups(&self) {
+        let held = {
+            let mut pending = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+            let due = pending.lookup.as_ref().is_some_and(|(lookup, began)| {
+                lookup.is_finished() || began.elapsed() >= ADMISSION_LOOKUP_MAX
+            });
+            if !due {
+                return;
+            }
+            pending.lookup = None;
+            std::mem::take(&mut pending.held)
+        };
+        self.rejudging.store(true, Ordering::SeqCst);
+        for (datagram, src_addr) in held {
+            if let Err(e) = self.handle_message(&datagram, src_addr).await {
+                log::error!("PFCP held Association Setup from {src_addr}: {e}");
+            }
+        }
+        self.rejudging.store(false, Ordering::SeqCst);
+    }
+
     /// Handle Association Setup Request
     async fn handle_association_setup_request(
         &self,
         header: &ParsedPfcpHeader,
         payload: &[u8],
+        datagram: &[u8],
         src_addr: SocketAddr,
     ) -> Result<(), String> {
         log::info!("Handling Association Setup Request from {src_addr}");
@@ -1319,9 +1531,13 @@ impl PfcpServer {
         // A refused Setup changes nothing: the live association and its sessions stay.
         let allowed = self.allowed_peers();
         if !allowed.permits(src_addr.ip()) {
-            // A restarted CP pod may be at an IP the last resolution predates: ask for
-            // an early re-resolution (rate-limited) so its NEXT attempt is judged
-            // against current DNS.
+            // #1112: held for a fresh resolution of the allowed names, and judged again
+            // when it ends, instead of refused on a resolution that predates the peer.
+            if self.hold_for_resolution(&allowed, datagram, src_addr) {
+                return Ok(());
+            }
+            // Refused. The background refresh is still kicked (rate-limited, sharing the
+            // slot above) so a later attempt is judged against current DNS.
             allowed.kick_refresh();
             note_refusal(format_args!(
                 "PFCP Association Setup Request from {src_addr}, which is not an allowed CP \
@@ -1754,6 +1970,26 @@ impl PfcpServer {
                     // uplink GTP-U traffic matches.
                     let local_f_teid = if let Some(ref fteid) = pdr.pdi.local_f_teid {
                         if fteid.ch || fteid.teid == 0 {
+                            let Some((ipv4, ipv6)) = self.local_f_teid_addrs(fteid) else {
+                                // #985 review: an IPv6-only F-TEID this UPF cannot
+                                // assign refuses the establishment (§7.5.3.1).
+                                let resp_payload = build_failure_response(
+                                    PfcpCause::RuleCreationModificationFailure,
+                                    Some(pfcp_ie::CREATE_PDR),
+                                );
+                                let response = self.build_response(
+                                    pfcp_type::SESSION_ESTABLISHMENT_RESPONSE,
+                                    smf_seid,
+                                    header.sequence_number,
+                                    &resp_payload,
+                                    true,
+                                );
+                                self.socket
+                                    .send_to(&response, src_addr)
+                                    .await
+                                    .map_err(|e| format!("Send error: {e}"))?;
+                                return Ok(());
+                            };
                             ul_teid = self.alloc_teid();
                             log::debug!(
                                 "Allocated uplink F-TEID: teid={ul_teid:#x} (ch={})",
@@ -1761,11 +1997,8 @@ impl PfcpServer {
                             );
                             Some(FTeid {
                                 teid: ul_teid,
-                                ipv4: match &self.local_node_id {
-                                    NodeId::Ipv4(addr) => Some(*addr),
-                                    _ => None,
-                                },
-                                ipv6: None,
+                                ipv4,
+                                ipv6,
                                 choose: false,
                                 choose_id: None,
                             })
@@ -1821,6 +2054,29 @@ impl PfcpServer {
                     log::warn!("Failed to parse FAR: {e}");
                 }
             }
+        }
+
+        // #619 (#1170 review): the session's downlink tunnel is the one its catch-all
+        // downlink takes -- the FAR of the Core-source PDR with no SDF filter (the
+        // default bearer's / flow's). A dedicated bearer's Core PDR carries its TFT's
+        // filters and a FAR toward its own tunnel; taking the last OHC on the wire
+        // made that FAR the session's whenever it came after the default one. With no
+        // such PDR the last OHC stands, as before.
+        if let Some((teid, addr)) = parsed_pdrs
+            .iter()
+            .filter(|p| p.pdi.source_interface == 1 && p.pdi.sdf_flow_description.is_none())
+            .filter_map(|p| p.far_id)
+            .find_map(|id| {
+                parsed_fars
+                    .iter()
+                    .find(|f| f.far_id == id)
+                    .and_then(|f| f.forwarding_parameters.as_ref())
+                    .and_then(|fp| fp.outer_header_creation.as_ref())
+                    .map(|ohc| (ohc.teid, ohc.ipv4))
+            })
+        {
+            dl_teid = teid;
+            gnb_addr = addr;
         }
 
         // Parse Create QERs
@@ -1931,6 +2187,11 @@ impl PfcpServer {
                 far_ids: parsed_fars.iter().map(|f| f.far_id).collect(),
                 qer_ids: parsed_qers.iter().map(|q| q.qer_id).collect(),
                 urr_ids: parsed_urrs.iter().map(|u| u.urr_id).collect(),
+                own_tunnel_far_ids: own_tunnel_fars_established(
+                    &parsed_pdrs,
+                    &parsed_fars,
+                    (dl_teid, gnb_addr),
+                ),
             },
             // #321: no bridge until the SMF configures one. An establishment
             // deliberately does not create an empty one — `Some(empty bridge)` and
@@ -2088,10 +2349,6 @@ impl PfcpServer {
         let mut allocated_pdrs = Vec::new();
         {
             let mut by_choose_id: HashMap<u8, u32> = HashMap::new();
-            let local_ipv4 = match &self.local_node_id {
-                NodeId::Ipv4(addr) => Some(*addr),
-                _ => None,
-            };
             for pdr in created_pdrs.iter_mut() {
                 let Some(fteid) = pdr.pdi.local_f_teid.as_mut() else {
                     continue;
@@ -2099,6 +2356,15 @@ impl PfcpServer {
                 if !(fteid.ch || fteid.teid == 0) {
                     continue;
                 }
+                let Some((ipv4, ipv6)) = self.local_f_teid_addrs(fteid) else {
+                    // #985 review: refused, not answered with an IPv4 F-TEID.
+                    note_first_failure(
+                        &mut failure,
+                        PfcpCause::RuleCreationModificationFailure,
+                        pfcp_ie::CREATE_PDR,
+                    );
+                    continue;
+                };
                 let teid = match (fteid.chid, fteid.choose_id) {
                     (true, Some(id)) => {
                         *by_choose_id.entry(id).or_insert_with(|| self.alloc_teid())
@@ -2107,8 +2373,10 @@ impl PfcpServer {
                 };
                 *fteid = crate::n4_build::ParsedFTeid {
                     teid,
-                    ipv4: local_ipv4,
-                    ipv6: None,
+                    ipv4,
+                    ipv6,
+                    v4: ipv4.is_some(),
+                    v6: ipv6.is_some(),
                     ch: false,
                     chid: false,
                     choose_id: None,
@@ -2121,8 +2389,8 @@ impl PfcpServer {
                     pdr_id: pdr.pdr_id,
                     local_f_teid: Some(FTeid {
                         teid,
-                        ipv4: local_ipv4,
-                        ipv6: None,
+                        ipv4,
+                        ipv6,
                         choose: false,
                         choose_id: None,
                     }),
@@ -2163,26 +2431,29 @@ impl PfcpServer {
         // #583: except a FAR created together with an ACCESS-source PDR that uses it --
         // a tunnel relaying toward the access side (indirect data forwarding), whose
         // endpoint is its own and not the session's downlink.
-        let relay_fars: std::collections::HashSet<u32> = created_pdrs
-            .iter()
-            .filter(|p| p.pdi.source_interface == 0)
-            .filter_map(|p| p.far_id)
-            .collect();
-        for far in created_fars
-            .iter()
-            .filter(|f| !relay_fars.contains(&f.far_id))
-            .chain(mod_fars.iter())
-        {
-            if let Some(ohc) = far
-                .forwarding_parameters
+        //
+        // #619: and likewise a FAR created together with a CORE-source PDR that uses
+        // it: a second downlink tunnel of the session (a dedicated EPS bearer's own
+        // S5/S8-U tunnel, TS 23.401 §5.4.1). Counting it as the session's tunnel
+        // moving re-pointed the default bearer's FAR at the dedicated bearer's TEID.
+        // Such a FAR is remembered (`own_tunnel_far_ids`, and the data plane's
+        // `DataPlaneSession::own_tunnel_fars`), so a later Update FAR on it moves that
+        // FAR alone, and a move of the session's tunnel leaves it where it points. Which Updates move the session's tunnel therefore
+        // depends on the session, and is decided under its lock below.
+        let own_tunnel_fars = own_tunnel_fars_created(&created_pdrs, &created_fars);
+        let tunnel_of = |far: &crate::n4_build::ParsedCreateFar| {
+            far.forwarding_parameters
                 .as_ref()
                 .and_then(|fp| fp.outer_header_creation.as_ref())
-            {
-                updated_dl_teid = Some(ohc.teid);
-                updated_gnb_addr = ohc.ipv4;
-                log::debug!("Updated downlink: TEID={:#x}, gNB={:?}", ohc.teid, ohc.ipv4);
-            }
-        }
+                .map(|ohc| (far.far_id, ohc.teid, ohc.ipv4))
+        };
+        let created_tunnels: Vec<(u32, u32, Option<Ipv4Addr>)> = created_fars
+            .iter()
+            .filter(|f| !own_tunnel_fars.contains(&f.far_id))
+            .filter_map(tunnel_of)
+            .collect();
+        let updated_tunnels: Vec<(u32, u32, Option<Ipv4Addr>)> =
+            mod_fars.iter().filter_map(tunnel_of).collect();
 
         // Parse Create/Update BARs
         let mut mod_bars = Vec::new();
@@ -2257,6 +2528,26 @@ impl PfcpServer {
             let mut sessions = self.sessions.write().await;
             if let Some(session) = sessions.get_mut(&upf_seid) {
                 let old_tunnel = session.gnb_addr.map(|addr| (session.dl_teid, addr));
+                for id in &removed_far_ids {
+                    session.rules.own_tunnel_far_ids.remove(id);
+                }
+                for f in &created_fars {
+                    if own_tunnel_fars.contains(&f.far_id) {
+                        session.rules.own_tunnel_far_ids.insert(f.far_id);
+                    } else {
+                        // A re-created id that is now an ordinary FAR.
+                        session.rules.own_tunnel_far_ids.remove(&f.far_id);
+                    }
+                }
+                for &(far_id, teid, ipv4) in created_tunnels.iter().chain(
+                    updated_tunnels
+                        .iter()
+                        .filter(|(id, ..)| !session.rules.own_tunnel_far_ids.contains(id)),
+                ) {
+                    updated_dl_teid = Some(teid);
+                    updated_gnb_addr = ipv4;
+                    log::debug!("Updated downlink: FAR {far_id}, TEID={teid:#x}, gNB={ipv4:?}");
+                }
                 if let Some(teid) = updated_dl_teid {
                     session.dl_teid = teid;
                 }
@@ -2824,7 +3115,7 @@ impl PfcpServer {
         upf_seid: u64,
         smf_seid: u64,
         remote_teid: u32,
-        peer_ipv4: Option<Ipv4Addr>,
+        peer: Option<IpAddr>,
     ) -> Result<(), String> {
         let smf_addr = {
             let sessions = self.sessions.read().await;
@@ -2838,10 +3129,18 @@ impl PfcpServer {
                 ..Default::default()
             },
             error_indication_report: Some(ErrorIndicationReport {
+                // §7.5.8.4 / §8.2.3: the Remote F-TEID carries the peer's address
+                // in its own family, so an IPv6 gNB is reported as V6 (#985).
                 remote_f_teid: FTeid {
                     teid: remote_teid,
-                    ipv4: peer_ipv4,
-                    ipv6: None,
+                    ipv4: match peer {
+                        Some(IpAddr::V4(a)) => Some(a),
+                        _ => None,
+                    },
+                    ipv6: match peer {
+                        Some(IpAddr::V6(a)) => Some(a),
+                        _ => None,
+                    },
                     choose: false,
                     choose_id: None,
                 },
@@ -3848,6 +4147,439 @@ mod tests {
             server.sessions.read().await[&upf_seid].dl_teid,
             dl_before,
             "a relay FAR's endpoint is not the session's downlink tunnel"
+        );
+    }
+
+    /// The F-TEID of the Created PDR for `pdr_id` in a session response.
+    fn created_f_teid(resp: &[u8], pdr_id: u16) -> crate::n4_build::ParsedFTeid {
+        let (_, body) = ParsedPfcpHeader::parse(resp).unwrap();
+        let ies = ParsedIe::parse_all(body);
+        for created in ParsedIe::find_all_ies(&ies, pfcp_ie::CREATED_PDR) {
+            let inner = ParsedIe::parse_all(&created.value);
+            let id = ParsedIe::find_ie(&inner, pfcp_ie::PDR_ID).unwrap();
+            if id.value[..] == pdr_id.to_be_bytes() {
+                return crate::n4_build::ParsedFTeid::parse(
+                    &ParsedIe::find_ie(&inner, pfcp_ie::F_TEID).unwrap().value,
+                )
+                .unwrap();
+            }
+        }
+        panic!("no Created PDR {pdr_id}");
+    }
+
+    /// A Session Modification creating Access PDR `pdr_id` whose F-TEID IE value is
+    /// `f_teid`; returns the response.
+    async fn modify_creating_pdr(
+        smf: &UdpSocket,
+        addr: SocketAddr,
+        upf_seid: u64,
+        seq: u32,
+        pdr_id: u16,
+        f_teid: &[u8],
+    ) -> Vec<u8> {
+        let mut pdi = crate::n4_build::PfcpMessageBuilder::new();
+        pdi.add_u8(pfcp_ie::SOURCE_INTERFACE, 0);
+        pdi.add_tlv(pfcp_ie::F_TEID, f_teid);
+        let mut pdr = crate::n4_build::PfcpMessageBuilder::new();
+        pdr.add_pdr_id(pdr_id);
+        pdr.add_u32(pfcp_ie::PRECEDENCE, 10);
+        pdr.add_tlv(pfcp_ie::PDI, &pdi.build());
+        pdr.add_u8(pfcp_ie::OUTER_HEADER_REMOVAL, 0);
+        pdr.add_u32(pfcp_ie::FAR_ID, 1);
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(pfcp_ie::CREATE_PDR, &pdr.build());
+        let resp = exchange(smf, addr, &encode_pfcp(52, Some(upf_seid), seq, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        resp
+    }
+
+    /// #985 (TS 29.244 §8.2.3): with CH set, V4 / V6 say which address family the UP
+    /// function assigns. With an IPv6 GTP-U socket the UPF now answers CH+V6 with its
+    /// IPv6 address (it always answered IPv4, so an IPv6 gNB sent uplink to IPv4);
+    /// CH+V4+V6 gets both; CH+V4 and this tree's zero-TEID request stay IPv4 only.
+    #[tokio::test]
+    async fn a_chosen_f_teid_carries_the_ipv6_n3_address_when_v6_is_asked_for() {
+        let (server, smf, addr, _rx, _dp, upf_seid) = established_session().await;
+        let n3_v6: Ipv6Addr = "2001:db8::985".parse().unwrap();
+        let node_v4 = Ipv4Addr::LOCALHOST;
+
+        // No IPv6 socket yet: CH+V6 cannot be met, so the PDR is refused (#985
+        // review) rather than answered with an IPv4 F-TEID; CH+V4+V6 gets IPv4.
+        let mut pdi = crate::n4_build::PfcpMessageBuilder::new();
+        pdi.add_u8(pfcp_ie::SOURCE_INTERFACE, 0);
+        pdi.add_tlv(pfcp_ie::F_TEID, &[0x06]);
+        let mut pdr = crate::n4_build::PfcpMessageBuilder::new();
+        pdr.add_pdr_id(0x60);
+        pdr.add_u32(pfcp_ie::PRECEDENCE, 10);
+        pdr.add_tlv(pfcp_ie::PDI, &pdi.build());
+        pdr.add_u32(pfcp_ie::FAR_ID, 1);
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(pfcp_ie::CREATE_PDR, &pdr.build());
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &b.build())).await;
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::RuleCreationModificationFailure as u8
+        );
+        let resp = modify_creating_pdr(&smf, addr, upf_seid, 8, 0x65, &[0x07]).await;
+        let f = created_f_teid(&resp, 0x65);
+        assert_eq!((f.ipv4, f.ipv6), (Some(node_v4), None));
+
+        server.set_n3_ipv6(Some(n3_v6));
+        for (seq, pdr_id, flags, want) in [
+            (4, 0x61, vec![0x06], (None, Some(n3_v6))), // CH + V6
+            (5, 0x62, vec![0x07], (Some(node_v4), Some(n3_v6))), // CH + V4 + V6
+            (6, 0x63, vec![0x05], (Some(node_v4), None)), // CH + V4
+            (7, 0x64, vec![0x00, 0, 0, 0, 0], (Some(node_v4), None)), // zero TEID, no flag
+        ] {
+            let resp = modify_creating_pdr(&smf, addr, upf_seid, seq, pdr_id, &flags).await;
+            let f = created_f_teid(&resp, pdr_id);
+            assert_ne!(f.teid, 0);
+            assert_eq!((f.ipv4, f.ipv6), want, "F-TEID request flags {flags:02x?}");
+            assert_eq!((f.v4, f.v6), (want.0.is_some(), want.1.is_some()));
+        }
+    }
+
+    /// #985: the establishment path assigns the same way: CH+V6 with an IPv6 GTP-U
+    /// socket gives an IPv6-only local F-TEID in the Created PDR, and without one the
+    /// establishment is refused (#985 review).
+    #[tokio::test]
+    async fn an_establishment_chosen_f_teid_can_be_ipv6() {
+        let (server, smf, addr, _rx) = spawn_test_server().await;
+        let n3_v6: Ipv6Addr = "2001:db8::986".parse().unwrap();
+        let assoc = build_association_setup_request_payload(Some(1));
+        let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+        let refused = exchange(
+            &smf,
+            addr,
+            &encode_pfcp(50, Some(0), 2, &establishment_ch_v6()),
+        )
+        .await;
+        assert_eq!(
+            response_cause(&refused),
+            PfcpCause::RuleCreationModificationFailure as u8,
+            "no IPv6 N3 address: CH+V6 cannot be met"
+        );
+        assert!(
+            server.sessions.read().await.is_empty(),
+            "no session was created"
+        );
+        server.set_n3_ipv6(Some(n3_v6));
+        let resp = exchange(
+            &smf,
+            addr,
+            &encode_pfcp(50, Some(0), 3, &establishment_ch_v6()),
+        )
+        .await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        let f = created_f_teid(&resp, 1);
+        assert_ne!(f.teid, 0);
+        assert_eq!((f.ipv4, f.ipv6), (None, Some(n3_v6)));
+    }
+
+    /// A Session Establishment Request with one Access PDR whose F-TEID is CH+V6.
+    fn establishment_ch_v6() -> Vec<u8> {
+        let mut pdi = crate::n4_build::PfcpMessageBuilder::new();
+        pdi.add_u8(pfcp_ie::SOURCE_INTERFACE, 0);
+        pdi.add_tlv(pfcp_ie::F_TEID, &[0x06]); // CH + V6
+        let mut pdr = crate::n4_build::PfcpMessageBuilder::new();
+        pdr.add_pdr_id(1);
+        pdr.add_u32(pfcp_ie::PRECEDENCE, 100);
+        pdr.add_tlv(pfcp_ie::PDI, &pdi.build());
+        pdr.add_u32(pfcp_ie::FAR_ID, 1);
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
+        b.add_f_seid(&crate::n4_build::FSeid {
+            seid: 0x4986,
+            ipv4: Some(Ipv4Addr::new(127, 0, 0, 9)),
+            ipv6: None,
+        });
+        b.add_tlv(pfcp_ie::CREATE_PDR, &pdr.build());
+        b.add_tlv(pfcp_ie::CREATE_FAR, &far_body(1, 0x02));
+        b.build()
+    }
+
+    /// #985 (TS 29.244 §7.5.8.4, §8.2.3): an Error Indication about an IPv6 gNB is
+    /// reported with a V6 Remote F-TEID carrying that address, not an F-TEID with no
+    /// address at all. IPv4 still gives a V4 one.
+    #[tokio::test]
+    async fn an_error_indication_report_carries_an_ipv6_remote_f_teid() {
+        let (server, smf, _addr, _rx, _dp, upf_seid) = established_session().await;
+        let gnb6: Ipv6Addr = "2001:db8::7".parse().unwrap();
+        for (peer, want) in [
+            (IpAddr::V6(gnb6), (None, Some(gnb6))),
+            (
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)),
+                (Some(Ipv4Addr::new(192, 0, 2, 7)), None),
+            ),
+        ] {
+            server
+                .send_error_indication_report(upf_seid, 0x4242, 0xABCD, Some(peer))
+                .await
+                .unwrap();
+            let mut buf = [0u8; 2048];
+            let (n, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), smf.recv_from(&mut buf))
+                    .await
+                    .expect("a Session Report Request")
+                    .unwrap();
+            assert_eq!(buf[1], pfcp_type::SESSION_REPORT_REQUEST);
+            let (_, body) = ParsedPfcpHeader::parse(&buf[..n]).unwrap();
+            let ies = ParsedIe::parse_all(body);
+            let eir = ParsedIe::find_ie(&ies, 99).expect("Error Indication Report");
+            let inner = ParsedIe::parse_all(&eir.value);
+            let f = crate::n4_build::ParsedFTeid::parse(
+                &ParsedIe::find_ie(&inner, pfcp_ie::F_TEID).unwrap().value,
+            )
+            .unwrap();
+            assert_eq!(f.teid, 0xABCD);
+            assert_eq!((f.ipv4, f.ipv6), want, "peer {peer}");
+        }
+    }
+
+    /// A Core-source PDR and a FAR forwarding to the access side toward `ohc`
+    /// (`(teid, addr)`); `None` for a buffering FAR.
+    ///
+    /// A dedicated bearer's PDR (any id but 2) carries its TFT's downlink filter as an
+    /// SDF Filter; PDR 2 is the catch-all default downlink.
+    fn downlink_rule(pdr_id: u16, far_id: u32, ohc: Option<(u32, [u8; 4])>) -> Vec<u8> {
+        let mut pdi = crate::n4_build::PfcpMessageBuilder::new();
+        pdi.add_u8(pfcp_ie::SOURCE_INTERFACE, 1); // Core
+        if pdr_id != 2 {
+            let fd = b"permit out 17 from 198.51.100.7 5004 to assigned";
+            let mut sdf = vec![0x01, 0x00];
+            sdf.extend_from_slice(&(fd.len() as u16).to_be_bytes());
+            sdf.extend_from_slice(fd);
+            pdi.add_tlv(pfcp_ie::SDF_FILTER, &sdf);
+        }
+        let mut pdr = crate::n4_build::PfcpMessageBuilder::new();
+        pdr.add_pdr_id(pdr_id);
+        pdr.add_u32(pfcp_ie::PRECEDENCE, 50);
+        pdr.add_tlv(pfcp_ie::PDI, &pdi.build());
+        pdr.add_u32(pfcp_ie::FAR_ID, far_id);
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(pfcp_ie::CREATE_PDR, &pdr.build());
+        b.add_tlv(pfcp_ie::CREATE_FAR, &forwarding_far(far_id, ohc, false));
+        b.build()
+    }
+
+    /// A FAR (or Update FAR, `update`) body forwarding to Access toward `ohc`, or
+    /// buffering when `ohc` is `None`.
+    fn forwarding_far(far_id: u32, ohc: Option<(u32, [u8; 4])>, update: bool) -> Vec<u8> {
+        let mut far = crate::n4_build::PfcpMessageBuilder::new();
+        far.add_u32(pfcp_ie::FAR_ID, far_id);
+        match ohc {
+            Some((teid, addr)) => {
+                let mut fp = crate::n4_build::PfcpMessageBuilder::new();
+                fp.add_u8(pfcp_ie::DESTINATION_INTERFACE, 0);
+                let mut v = vec![0x01, 0x00];
+                v.extend_from_slice(&teid.to_be_bytes());
+                v.extend_from_slice(&addr);
+                fp.add_tlv(pfcp_ie::OUTER_HEADER_CREATION, &v);
+                far.add_u16(pfcp_ie::APPLY_ACTION, 0x02);
+                far.add_tlv(
+                    if update {
+                        pfcp_ie::UPDATE_FORWARDING_PARAMETERS
+                    } else {
+                        pfcp_ie::FORWARDING_PARAMETERS
+                    },
+                    &fp.build(),
+                );
+            }
+            None => {
+                far.add_u16(pfcp_ie::APPLY_ACTION, 0x04);
+            }
+        }
+        far.build()
+    }
+
+    /// #619: a dedicated EPS bearer's downlink tunnel is its own.
+    ///
+    /// The PGW-C creates the bearer's downlink as a Core PDR with a FAR of its own
+    /// toward the SGW's per-bearer S5/S8-U tunnel (TS 23.401 §5.4.1). That must not
+    /// move the session's downlink tunnel (FAR 2); a later move of the session's
+    /// tunnel must not overwrite it; and an Update FAR moving the dedicated tunnel
+    /// moves it alone. Before #619 the first two did: the default bearer's downlink
+    /// went into the dedicated bearer's tunnel, and then the dedicated bearer's into
+    /// the default's.
+    #[tokio::test]
+    async fn a_second_downlink_tunnel_keeps_its_endpoint_across_a_move() {
+        const DEFAULT: (u32, [u8; 4]) = (0x0000_0A0A, [127, 58, 3, 1]);
+        const DEDICATED: (u32, [u8; 4]) = (0x0606_0606, [127, 58, 3, 6]);
+        const MOVED: (u32, [u8; 4]) = (0x0000_0C0C, [127, 58, 3, 12]);
+        const DEDICATED_MOVED: (u32, [u8; 4]) = (0x0707_0707, [127, 58, 3, 7]);
+        let (server, smf, addr, mut rx, dp, upf_seid) = established_session().await;
+        let far = |id: u32| {
+            dp.sessions
+                .find_by_seid(upf_seid)
+                .and_then(|s| s.fars.read().unwrap().get(&id).cloned())
+                .map(|f| (f.ohc_teid, f.ohc_addr.map(|a| a.to_string())))
+        };
+        let at =
+            |t: (u32, [u8; 4])| Some((Some(t.0), Some(std::net::Ipv4Addr::from(t.1).to_string())));
+        let mut seq = 3;
+        let mut modify = |body: Vec<u8>| {
+            seq += 1;
+            encode_pfcp(52, Some(upf_seid), seq, &body)
+        };
+        let update_far = |id: u32, ohc: Option<(u32, [u8; 4])>| {
+            let mut b = crate::n4_build::PfcpMessageBuilder::new();
+            b.add_tlv(pfcp_ie::UPDATE_FAR, &forwarding_far(id, ohc, true));
+            b.build()
+        };
+        let session_tunnel = || async { server.sessions.read().await[&upf_seid].dl_teid };
+
+        // The default bearer's downlink, then the session's tunnel set by Update FAR
+        // 2 -- what smfd's Create Session does.
+        let resp = exchange(&smf, addr, &modify(downlink_rule(2, 2, None))).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+        let resp = exchange(&smf, addr, &modify(update_far(2, Some(DEFAULT)))).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+        assert_eq!(far(2), at(DEFAULT));
+
+        // The dedicated bearer's downlink.
+        let resp = exchange(
+            &smf,
+            addr,
+            &modify(downlink_rule(0x81, 0x81, Some(DEDICATED))),
+        )
+        .await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+        assert_eq!(
+            far(2),
+            at(DEFAULT),
+            "the default bearer's downlink must stay on its own tunnel"
+        );
+        assert_eq!(far(0x81), at(DEDICATED));
+        assert_eq!(
+            session_tunnel().await,
+            DEFAULT.0,
+            "creating a second tunnel does not move the session's"
+        );
+
+        // The session's tunnel moves.
+        let resp = exchange(&smf, addr, &modify(update_far(2, Some(MOVED)))).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+        assert_eq!(far(2), at(MOVED));
+        assert_eq!(
+            far(0x81),
+            at(DEDICATED),
+            "the move must not overwrite the dedicated bearer's tunnel"
+        );
+
+        // The dedicated tunnel moves alone.
+        let resp = exchange(&smf, addr, &modify(update_far(0x81, Some(DEDICATED_MOVED)))).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+        assert_eq!(far(0x81), at(DEDICATED_MOVED));
+        assert_eq!(
+            far(2),
+            at(MOVED),
+            "moving the dedicated tunnel moves it alone"
+        );
+        assert_eq!(session_tunnel().await, MOVED.0);
+
+        // The dedicated FAR buffers (no endpoint), then the session's tunnel moves
+        // back: the buffering FAR is not handed the default bearer's endpoint.
+        let resp = exchange(&smf, addr, &modify(update_far(0x81, None))).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+        let resp = exchange(&smf, addr, &modify(update_far(2, Some(DEFAULT)))).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+        assert_eq!(far(2), at(DEFAULT));
+        assert_eq!(
+            far(0x81),
+            Some((None, None)),
+            "a buffering dedicated FAR keeps no endpoint across the session's move"
+        );
+    }
+
+    /// #619 review: a session ESTABLISHED with a dedicated bearer's downlink already in it
+    /// (a restoration, or an SMF that sends the whole rule set at once) keeps that
+    /// tunnel's endpoint when the session's tunnel moves, as one a modification created
+    /// does.
+    #[tokio::test]
+    async fn a_second_downlink_tunnel_in_the_establishment_keeps_its_endpoint() {
+        // Either order on the wire (#1170 review: the dedicated FAR after FAR 2 used to
+        // become the session's tunnel).
+        for dedicated_first in [true, false] {
+            establishment_with_a_second_downlink_tunnel(dedicated_first).await;
+        }
+    }
+
+    async fn establishment_with_a_second_downlink_tunnel(dedicated_first: bool) {
+        const DEFAULT: (u32, [u8; 4]) = (0x0000_0A0A, [127, 58, 4, 1]);
+        const DEDICATED: (u32, [u8; 4]) = (0x0606_0606, [127, 58, 4, 6]);
+        const MOVED: (u32, [u8; 4]) = (0x0000_0C0C, [127, 58, 4, 12]);
+        let (server, smf, addr, mut rx) = spawn_test_server().await;
+        let dp = Arc::new(crate::data_plane::DataPlane::new(Arc::new(
+            AtomicBool::new(false),
+        )));
+        server.set_data_plane(dp.clone());
+        let assoc = build_association_setup_request_payload(Some(1));
+        let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
+        b.add_f_seid(&crate::n4_build::FSeid {
+            seid: 0x4343,
+            ipv4: Some(Ipv4Addr::new(127, 0, 0, 9)),
+            ipv6: None,
+        });
+        b.add_tlv(pfcp_ie::CREATE_PDR, &pdr_body(1, 100, 1, 1, 1));
+        b.add_tlv(pfcp_ie::CREATE_FAR, &far_body(1, 0x02));
+        b.add_tlv(pfcp_ie::CREATE_QER, &qer_body(1, 5));
+        let mut body = b.build();
+        if dedicated_first {
+            body.extend(downlink_rule(0x81, 0x81, Some(DEDICATED)));
+            body.extend(downlink_rule(2, 2, Some(DEFAULT)));
+        } else {
+            body.extend(downlink_rule(2, 2, Some(DEFAULT)));
+            body.extend(downlink_rule(0x81, 0x81, Some(DEDICATED)));
+        }
+        let resp = exchange(&smf, addr, &encode_pfcp(50, Some(0), 2, &body)).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        let upf_seid = server
+            .sessions
+            .read()
+            .await
+            .keys()
+            .copied()
+            .next()
+            .expect("the session");
+        apply_next(&mut rx, &dp).await;
+        let far = |id: u32| {
+            dp.sessions
+                .find_by_seid(upf_seid)
+                .and_then(|s| s.fars.read().unwrap().get(&id).cloned())
+                .map(|f| (f.ohc_teid, f.ohc_addr.map(|a| a.to_string())))
+        };
+        let at = |t: (u32, [u8; 4])| Some((Some(t.0), Some(Ipv4Addr::from(t.1).to_string())));
+        assert_eq!(far(0x81), at(DEDICATED));
+        assert_eq!(
+            server.sessions.read().await[&upf_seid].dl_teid,
+            DEFAULT.0,
+            "the session's tunnel is the catch-all downlink's (dedicated first: {dedicated_first})"
+        );
+
+        let mut m = crate::n4_build::PfcpMessageBuilder::new();
+        m.add_tlv(pfcp_ie::UPDATE_FAR, &forwarding_far(2, Some(MOVED), true));
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &m.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+        assert_eq!(far(2), at(MOVED));
+        assert_eq!(
+            far(0x81),
+            at(DEDICATED),
+            "the move must not overwrite the established dedicated tunnel"
+        );
+        assert_eq!(
+            server.sessions.read().await[&upf_seid].dl_teid,
+            MOVED.0,
+            "the session's tunnel moved (dedicated first: {dedicated_first})"
         );
     }
 
@@ -5642,6 +6374,192 @@ mod tests {
         );
         let resp = exchange(&smf, upf, &encode_pfcp(54, Some(x), 10, &[])).await;
         assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+    }
+
+    /// #1112: a CP function named by host name whose address the last resolution
+    /// predates -- an SMF pod that just restarted -- is admitted on its FIRST Setup:
+    /// the Setup is held while the names are re-resolved, off the receive task, and
+    /// judged against the fresh answer.
+    ///
+    /// REVERT-VERIFIED: without the hold the SMF's first Setup is refused with cause
+    /// 64 (the name was never resolved here, as on a pod the periodic refresh has not
+    /// caught up with).
+    #[tokio::test]
+    async fn an_unresolved_cp_name_is_re_resolved_before_its_setup_is_refused() {
+        let (server, smf, upf, _rx) = spawn_test_server().await;
+        // `localhost` -> 127.0.0.1, the stand-in SMF's address. Never resolved:
+        // no `spawn_host_refresh`.
+        let allowed = PeerAllowlist::parse("localhost").unwrap();
+        assert!(!allowed.permits(smf.local_addr().unwrap().ip()));
+        server.set_allowed_peers(allowed);
+        assert_eq!(
+            setup_cause(&smf, upf, SMF_NODE, 6).await,
+            PfcpCause::RequestAccepted as u8,
+            "admitted on its first Setup"
+        );
+        assert!(server.is_associated().await);
+
+        // A stranger right after: the resolution the SMF's Setup started is fresh, so
+        // it is judged by it, without a lookup of its own, and refused.
+        let stranger = UdpSocket::bind("127.0.0.66:0").await.unwrap();
+        assert_eq!(
+            setup_cause(&stranger, upf, Ipv4Addr::new(127, 0, 0, 66), 7).await,
+            PfcpCause::RequestRejected as u8,
+            "fail-closed: judged by the fresh resolution, and refused"
+        );
+        assert_eq!(
+            server.association.read().await.as_ref().unwrap().peer_addr,
+            smf.local_addr().unwrap()
+        );
+    }
+
+    /// #1112, fail closed: a stranger whose Setup itself starts the re-resolution is
+    /// held for it and refused once the fresh answer does not list it.
+    #[tokio::test]
+    async fn a_stranger_held_for_a_re_resolution_is_refused_after_it() {
+        let (server, _smf, upf, _rx) = spawn_test_server().await;
+        server.set_allowed_peers(PeerAllowlist::parse("localhost").unwrap());
+        let stranger = UdpSocket::bind("127.0.0.66:0").await.unwrap();
+        assert_eq!(
+            setup_cause(&stranger, upf, Ipv4Addr::new(127, 0, 0, 66), 7).await,
+            PfcpCause::RequestRejected as u8
+        );
+        assert!(!server.is_associated().await);
+        assert!(
+            server
+                .admission
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .held
+                .is_empty(),
+            "nothing left held"
+        );
+    }
+
+    /// A resolver as slow as a DNS outage: longer than the hold's bound
+    /// ([`ADMISSION_LOOKUP_MAX`]) and the resolution slot's interval.
+    fn slow_resolver(list: &PeerAllowlist) {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        list.resolve_hosts();
+    }
+
+    /// #1115 review n2: a Setup held for a resolution slower than the hold's bound is
+    /// judged without it, and refused once: being judged again, it is not held again.
+    ///
+    /// REVERT-VERIFIED: without the `rejudging` guard the Setup is held again, and
+    /// again, and never answered.
+    #[tokio::test]
+    async fn a_setup_held_past_a_slow_resolution_is_refused_not_held_again() {
+        let (server, _smf, upf, _rx) = spawn_test_server().await;
+        server.set_allowed_peers(PeerAllowlist::parse("localhost").unwrap());
+        server.set_resolver_for_test(slow_resolver);
+        let stranger = UdpSocket::bind("127.0.0.66:0").await.unwrap();
+        stranger
+            .send_to(
+                &encode_pfcp(
+                    5,
+                    None,
+                    7,
+                    &association_setup(Ipv4Addr::new(127, 0, 0, 66), 7, None),
+                ),
+                upf,
+            )
+            .await
+            .unwrap();
+        // Answered once the hold's bound passes, before the slow lookup ends.
+        let mut buf = vec![0u8; 2048];
+        let (len, _) = tokio::time::timeout(
+            ADMISSION_LOOKUP_MAX + std::time::Duration::from_millis(900),
+            stranger.recv_from(&mut buf),
+        )
+        .await
+        .expect("answered, not held again")
+        .unwrap();
+        assert_eq!(
+            response_cause(&buf[..len]),
+            PfcpCause::RequestRejected as u8
+        );
+    }
+
+    /// #1115 review n2, n3: at most [`ADMISSION_MAX_HELD`] Setups are held, one per
+    /// source. A host retransmitting, or re-sending under new sequence numbers, holds
+    /// one place and is answered once; past the cap a Setup is refused at once.
+    ///
+    /// REVERT-VERIFIED: without the cap the 65th is held too; deduplicating by
+    /// (source, sequence) lets one host take many places.
+    #[tokio::test]
+    async fn held_setups_are_capped_and_one_per_source() {
+        let (server, _smf, upf, _rx) = spawn_test_server().await;
+        server.set_allowed_peers(PeerAllowlist::parse("localhost").unwrap());
+        server.set_resolver_for_test(slow_resolver);
+        // One host, three Setups (a retransmission and a new sequence number).
+        let repeat = UdpSocket::bind("127.0.0.70:0").await.unwrap();
+        for seq in [1, 1, 2] {
+            repeat
+                .send_to(
+                    &encode_pfcp(
+                        5,
+                        None,
+                        seq,
+                        &association_setup(Ipv4Addr::new(127, 0, 0, 70), seq, None),
+                    ),
+                    upf,
+                )
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(server.admission.lock().unwrap().held.len(), 1, "one place");
+        // 63 more sources fill the queue.
+        let mut fillers = Vec::new();
+        for host in 2u8..65 {
+            let sock = UdpSocket::bind((Ipv4Addr::new(127, 0, 1, host), 0))
+                .await
+                .unwrap();
+            sock.send_to(
+                &encode_pfcp(
+                    5,
+                    None,
+                    9,
+                    &association_setup(Ipv4Addr::new(127, 0, 1, host), 9, None),
+                ),
+                upf,
+            )
+            .await
+            .unwrap();
+            fillers.push(sock);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            server.admission.lock().unwrap().held.len(),
+            ADMISSION_MAX_HELD
+        );
+        // The next source is past the cap: refused at once, not held.
+        let late = UdpSocket::bind("127.0.0.71:0").await.unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            setup_cause(&late, upf, Ipv4Addr::new(127, 0, 0, 71), 3).await,
+            PfcpCause::RequestRejected as u8
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "at once"
+        );
+        // The repeating host is answered exactly once.
+        let mut buf = vec![0u8; 2048];
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            repeat.recv_from(&mut buf),
+        )
+        .await
+        .expect("answered");
+        assert!(first.is_ok());
+        let second = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            repeat.recv_from(&mut buf),
+        )
+        .await;
+        assert!(second.is_err(), "once");
     }
 
     /// SECURITY (#968 re-review, fail closed): with NO allowlist configured, no host

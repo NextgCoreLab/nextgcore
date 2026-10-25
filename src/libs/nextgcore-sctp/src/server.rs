@@ -89,6 +89,17 @@ impl Default for SctpServerConfig {
     }
 }
 
+/// How [`SctpServer::recv_or_wake`] (and the kernel backend's twin) ended (#981).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecvOutcome {
+    /// A datagram was received and processed.
+    Data,
+    /// The receive timeout elapsed with nothing to read.
+    Timeout,
+    /// The caller's wake future completed first.
+    Woken,
+}
+
 /// Events from the server
 #[derive(Debug, Clone)]
 pub enum ServerEvent {
@@ -235,25 +246,50 @@ impl SctpServer {
 
     /// Receive and process incoming data (blocking with timeout)
     pub async fn recv(&mut self, recv_timeout: Duration) -> Result<bool> {
+        self.recv_or_wake(recv_timeout, std::future::pending())
+            .await
+            .map(|r| r == RecvOutcome::Data)
+    }
+
+    /// [`Self::recv`], ended early when `wake` completes (#981): the caller has other
+    /// work ready (an off-task SBI answer) and must not sit out the receive timeout.
+    ///
+    /// Only the socket read itself is raced against `wake` and the timeout, and
+    /// `recv_from` is cancel-safe; a datagram that was read is always processed in
+    /// full, because the processing runs after the race, not inside it.
+    pub async fn recv_or_wake(
+        &mut self,
+        recv_timeout: Duration,
+        wake: impl std::future::Future<Output = ()>,
+    ) -> Result<RecvOutcome> {
         if !self.running {
             return Err(ServerError::NotRunning);
         }
 
         let mut buf = vec![0u8; self.config.receive_buffer_size as usize];
 
-        match timeout(recv_timeout, self.socket.recv_from(&mut buf)).await {
-            Ok(Ok((len, from))) => {
+        let read = tokio::select! {
+            r = timeout(recv_timeout, self.socket.recv_from(&mut buf)) => Some(r),
+            () = wake => None,
+        };
+        match read {
+            Some(Ok(Ok((len, from)))) => {
                 buf.truncate(len);
                 trace!("Received {} bytes from {}", len, from);
 
                 self.handle_datagram(from, Bytes::from(buf)).await?;
-                Ok(true)
+                Ok(RecvOutcome::Data)
             }
-            Ok(Err(e)) => Err(ServerError::Io(e)),
-            Err(_) => {
+            Some(Ok(Err(e))) => Err(ServerError::Io(e)),
+            Some(Err(_)) => {
                 // Timeout, process any pending timeouts
                 self.process_timeouts().await?;
-                Ok(false)
+                Ok(RecvOutcome::Timeout)
+            }
+            None => {
+                // Woken early: the association timers still run, as on a timeout.
+                self.process_timeouts().await?;
+                Ok(RecvOutcome::Woken)
             }
         }
     }
@@ -728,6 +764,29 @@ mod tests {
         let server = server.unwrap();
         assert!(server.is_running());
         assert_eq!(server.num_associations(), 0);
+    }
+
+    /// #981: a completed wake ends the receive wait at once; without one the
+    /// receive times out as before.
+    #[tokio::test]
+    async fn recv_or_wake_ends_on_the_wake_or_the_timeout() {
+        let mut server =
+            SctpServer::bind("127.0.0.1:0".parse().unwrap(), SctpServerConfig::default())
+                .await
+                .unwrap();
+        let started = std::time::Instant::now();
+        let woken = server
+            .recv_or_wake(Duration::from_secs(30), std::future::ready(()))
+            .await
+            .unwrap();
+        assert_eq!(woken, RecvOutcome::Woken);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let quiet = server
+            .recv_or_wake(Duration::from_millis(20), std::future::pending())
+            .await
+            .unwrap();
+        assert_eq!(quiet, RecvOutcome::Timeout);
+        assert!(!server.recv(Duration::from_millis(20)).await.unwrap());
     }
 
     #[tokio::test]
