@@ -161,23 +161,23 @@ fsynced + `0600` writes, and a snapshot that cannot be read is **never
 overwritten**. An unreadable snapshot, or one written by a newer build,
 **fails startup** rather than coming up with an empty pool.
 
-**The restored PFCP session map is checked, not trusted.** The snapshot also
-carries the last Recovery Time Stamp each UPF reported. That value is seeded
-back into each `PfcpClient` before the association loop starts, so the first
-Association Setup after a reload compares the UPF's reported stamp against it:
-a changed stamp means the UPF restarted while the SMF was down, and the restored
-sessions are flushed (TS 29.244 §5.22, TS 23.527 §4.2) instead of being believed
-in. An unchanged stamp means they are genuinely still valid. A UPF named by
-hostname has its stamp kept under the configured `host:port`, lower-cased and
-without a trailing dot, so it is found again after the UPF moves (#722). A stamp
-a pre-#722 snapshot kept under the UPF's address is read once, moved to the name,
-and the address entry removed. When both entries exist, the address entry wins:
-an older binary wrote it after this one retired it (an upgrade, a rollback, then
-a re-upgrade), so it is the newer record. After the seed, every address-keyed
-stamp that no literal UPF of this SMF owns is dropped, so an orphan cannot win
-over a correct name key later (#930). Nothing is dropped while a hostname UPF
-has not resolved at boot, since its stamp may still be under its old address; the
-next boot prunes. A UPF hostname must name exactly one UPF.
+**The restored PFCP session map is checked, not trusted.** The first
+Association Setup after a reload asks each UPF to retain the PFCP sessions this
+SMF holds on it (PFCP Session Retention Information, TS 29.244 §6.2.6.2.1). A
+UPF that confirms it (PSREI, §8.2.134) keeps them, and so does the SMF. A UPF
+that does not, because it restarted while the SMF was down or does not support
+retention, has its restored sessions flushed and released (TS 23.527 §4.2)
+instead of believed in. A UPF's Recovery Time Stamp is not part of the snapshot
+(#966). TS 23.007 §19A keeps it in volatile memory and has the Association
+Setup's stamp ignored, so each association's first Heartbeat stamp is its
+baseline, and the stamp is forgotten when the association goes down. A UPF that
+restarts after the Association Setup is caught by a changed Heartbeat stamp, or
+by cause 72 "No established PFCP Association" on a session request; either
+tears the association down and releases its sessions. A snapshot written before
+#966 may still hold `upfRecoveryTimeStamps`: it is ignored on load and dropped
+at the next write. A UPF named by hostname is identified by the configured
+`host:port`, lower-cased and without a trailing dot, so it is found again after
+the UPF moves (#722). A UPF hostname must name exactly one UPF.
 The snapshot also records which UPF each session was established on, by the
 same key, so in a UPF pool a restored session keeps signalling the UPF that
 holds it, and that UPF can still report on it (#1031). A session whose UPF is no

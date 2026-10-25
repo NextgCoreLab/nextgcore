@@ -11,6 +11,8 @@
 #   ./e2e.sh --quick                 # reuse existing binaries (build.sh --skip-rust)
 #   ./e2e.sh --overlay oauth2        # baseline suite with OAuth2 enforcement overlay
 #   ./e2e.sh --overlay kernel-sctp   # baseline suite over native kernel SCTP N2
+#   ./e2e.sh --overlay ue-context-store  # baseline suite with the AMF's UE context
+#                                    # store armed (#686); then ue-flow-check.sh amf-restart
 #   ./e2e.sh --overlay features      # baseline E2E, then the Rel-17/18 feature
 #                                    # harness (feature-e2e-test.sh, all scenarios)
 #   ./e2e.sh --keep                  # leave the stack running afterwards

@@ -149,6 +149,17 @@ amf:
       - sst: 1
     # T3512 periodic registration timer, seconds. 540 = 9 min.
     t3512: 540
+  # #686: the UE context store (TS 23.501 §5.21.2.3). The AMF writes every
+  # registered UE's context to MongoDB (collection amf_ue_contexts) and restores
+  # it after a restart, so a returning UE keeps its 5G-GUTI, security context and
+  # PDU sessions instead of registering again. Off by default. Restoration needs
+  # the stable nfInstanceId above (only records of the same instance come back).
+  # The records hold NAS keys in clear: the MongoDB needs the access control the
+  # UDR's subscriber keys already need.
+  ueContextStore:
+    enabled: false
+    # Empty: the chart's MongoDB (the same URI the UDR uses).
+    dbUri: ""
 
 # SMF - Session Management Function
 smf:

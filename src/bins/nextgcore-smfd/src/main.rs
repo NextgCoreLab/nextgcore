@@ -1086,20 +1086,6 @@ async fn main() -> Result<()> {
         return Err(anyhow::anyhow!("S5/S8 bind failed: {e}"));
     }
 
-    // #191: hand each client the Recovery Time Stamp the durable snapshot recorded
-    // for its peer, BEFORE the association loop is spawned. This is what turns the
-    // restored PFCP session map from a claim into a checked one: the first
-    // Association Setup compares the UPF's reported stamp against this seed and
-    // flushes the restored sessions if the UPF restarted while the SMF was down.
-    // A no-op when no state file is configured (the map has no entries).
-    for client in &pfcp_clients {
-        // #722: keyed by the configured name for a hostname UPF, not its address.
-        if let Some(rts) = client.stored_recovery_time_stamp() {
-            client.seed_peer_recovery_time_stamp(rts).await;
-        }
-    }
-    // #930 review n1: after the seed, which migrated what it needed.
-    pfcp_path::prune_orphan_address_keys(&pfcp_clients);
     // #1031: restored sessions whose UPF is no longer configured.
     pfcp_path::unknown_session_upfs(&pfcp_clients);
     // #1028 review m2: paths still failed at the last shutdown are held again.
@@ -22934,6 +22920,86 @@ mod path_switch_ack_tests {
             t.pdu_session_aggregate_maximum_bit_rate.is_some(),
             "establishment"
         );
+
+        let ctx = smf_self();
+        let ctx = ctx.read().expect("ctx");
+        ctx.policy_bindings.write().expect("w").remove(&r);
+        ctx.upf_ul_endpoints.write().expect("w").remove(&r);
+        if let Some(sess) = ctx.sess_find_by_sm_context_ref(&r) {
+            ctx.sess_remove(sess.id);
+        }
+    }
+
+    /// #1163: a Session-AMBR or a flow bit rate past TS 38.413 §9.3.1.4's
+    /// 4000000000000 used to go out as an extension value of BitRate, and past
+    /// `i64::MAX` neither decoder could read it back ("Invalid unconstrained
+    /// integer length: 9"). It is now sent as 4000000000000, a root value
+    /// every receiver decodes, here through both codecs.
+    #[tokio::test]
+    async fn a_bit_rate_past_the_ngap_root_is_sent_as_its_maximum() {
+        const MAX: u64 = 4_000_000_000_000;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let r = crate::tests::seed_registered_session("imsi-001010000001163", 6, "internet");
+        {
+            let ctx = smf_self();
+            let ctx = ctx.read().expect("ctx");
+            ctx.upf_ul_endpoints
+                .write()
+                .expect("w")
+                .insert(r.clone(), (0x0011_6300, [10, 45, 1, 163]));
+            let mut b = context::PolicyBinding::snapshot_default();
+            b.qfi = 1;
+            b.five_qi = 9;
+            b.arp_priority_level = 8;
+            b.ambr_dl_bps = u64::MAX;
+            b.ambr_ul_bps = MAX + 1;
+            ctx.policy_bindings.write().expect("w").insert(r.clone(), b);
+            let sess = ctx.sess_find_by_sm_context_ref(&r).expect("sess");
+            let mut dedicated = ctx.bearer_add(sess.id).expect("bearer");
+            dedicated.qfi = 2;
+            dedicated.qos.index = 1;
+            dedicated.qos.arp_priority_level = 2;
+            dedicated.qos.gbr_downlink = MAX;
+            dedicated.qos.gbr_uplink = MAX + 1;
+            dedicated.qos.mbr_downlink = u64::MAX;
+            dedicated.qos.mbr_uplink = MAX - 1;
+            ctx.bearer_update(&dedicated);
+        }
+
+        for (what, response) in [
+            ("ACTIVATING", activation_response(&r)),
+            ("HANDOVER_REQUIRED", handover_preparing_response(&r, None)),
+        ] {
+            assert_eq!(response.status, 200, "{what}: {:?}", response.http.content);
+            let t = setup_transfer_of(&response);
+            let ambr = t.pdu_session_aggregate_maximum_bit_rate.expect("AMBR");
+            assert_eq!((ambr.dl, ambr.ul), (MAX, MAX), "{what}: the Session-AMBR");
+            let gbr = t.qos_flow_setup_request_list[1]
+                .qos_flow_level_qos_parameters
+                .gbr_qos_information
+                .clone()
+                .expect("GBR");
+            assert_eq!(
+                (
+                    gbr.maximum_flow_bit_rate_dl,
+                    gbr.maximum_flow_bit_rate_ul,
+                    gbr.guaranteed_flow_bit_rate_dl,
+                    gbr.guaranteed_flow_bit_rate_ul,
+                ),
+                (MAX, MAX - 1, MAX, MAX),
+                "{what}: the GBR flow"
+            );
+            let n2 = response
+                .http
+                .parts
+                .iter()
+                .find(|p| p.content_id.as_deref() == Some("n2SmInfo"))
+                .expect("n2SmInfo part");
+            let g = nextgcore_ngap_gen::decode_contained::<
+                nextgcore_ngap_gen::generated::PDUSessionResourceSetupRequestTransfer,
+            >(&n2.data);
+            assert!(g.is_ok(), "{what}: the generated codec reads it: {g:?}");
+        }
 
         let ctx = smf_self();
         let ctx = ctx.read().expect("ctx");

@@ -160,7 +160,7 @@ fn protected_idle_service_request(ue: &AmfUe, tmsi: u32, count: u32) -> Vec<u8> 
 /// (`upCnxState: ACTIVATING`, TS 29.502 §5.2.2.3.2.2). No re-registration and no new
 /// PDU session.
 ///
-/// The downlink NAS COUNT moves on by 255 (TS 24.501 §4.4.3.1). The uplink one is the
+/// The downlink NAS COUNT moves on by 127 (TS 24.501 §4.4.3.1). The uplink one is the
 /// stored one, so the UE's next COUNT verifies.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restored_ue_s_service_request_reactivates_its_stored_session() {
@@ -223,7 +223,7 @@ async fn a_restored_ue_s_service_request_reactivates_its_stored_session() {
     assert_eq!(
         a.dl_count,
         b.dl_count + DL_COUNT_RESTORE_MARGIN,
-        "the downlink COUNT moves on by 255"
+        "the downlink COUNT moves on by 127"
     );
     assert_eq!(a.allowed_nssai, b.allowed_nssai);
     assert_eq!(a.ue_ambr, b.ue_ambr);
@@ -1557,4 +1557,62 @@ async fn a_ue_back_during_the_owner_check_is_not_implicitly_deregistered() {
     for id in [back.0, again.0] {
         crash(&mut amf, id);
     }
+}
+
+/// The downlink COUNT a UE estimates from a received SN (TS 24.501 §4.4.3.1), given
+/// `last`, the largest COUNT it verified, as a conformant UE does it: the smallest COUNT
+/// above `last` with that SN.
+fn estimate_conformant(last: u32, sn: u32) -> u32 {
+    let candidate = (last & !0xFF) | sn;
+    if candidate > last {
+        candidate
+    } else {
+        candidate + 0x100
+    }
+}
+
+/// The same, as a UE with a replay window: an SN step forward of at most half the SN
+/// space (128) is the next COUNT, wrapping the overflow if the SN is lower; anything
+/// else is a replay (`None`). nextgsim's UE does this.
+fn estimate_windowed(last: u32, sn: u32) -> Option<u32> {
+    let step = sn.wrapping_sub(last & 0xFF) & 0xFF;
+    if step == 0 || step > 128 {
+        return None;
+    }
+    Some(last + step)
+}
+
+/// **#686.** The restored downlink COUNT, the stored next COUNT plus the margin:
+/// - is above every COUNT used before the restart, for up to 127 unrecorded downlink
+///   messages;
+/// - is estimated exactly by a conformant UE and by one with a half-space replay window,
+///   whatever the stored COUNT and however many of those messages it received.
+///
+/// A margin of 254 is a replay to the windowed UE, which is what the real-binary restart
+/// proof found.
+#[test]
+fn the_restored_downlink_count_is_estimated_right_by_any_ue() {
+    for stored_next in [1u32, 0x0102, 0x01FF, 0x0200, 0x1234, 0xFFFF00] {
+        let restored = (stored_next + DL_COUNT_RESTORE_MARGIN) & 0x00FF_FFFF;
+        for unrecorded in 0..=DL_COUNT_RESTORE_MARGIN {
+            let last = stored_next - 1 + unrecorded; // the largest COUNT the UE verified
+            assert!(
+                restored > last,
+                "never reused ({stored_next:#x}, +{unrecorded})"
+            );
+            let sn = restored & 0xFF;
+            assert_eq!(estimate_conformant(last, sn), restored);
+            assert_eq!(
+                estimate_windowed(last, sn),
+                Some(restored),
+                "{stored_next:#x} +{unrecorded}"
+            );
+        }
+    }
+    let stored_next = 0x0102u32;
+    assert_eq!(
+        estimate_windowed(stored_next - 1, (stored_next + 254) & 0xFF),
+        None,
+        "254 is a replay to a windowed UE"
+    );
 }
