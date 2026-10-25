@@ -5288,7 +5288,7 @@ fn handover_preparing_response(sm_context_ref: &str, required: Option<&[u8]>) ->
 /// Answer `HANDOVER_RES_ALLOC_FAIL` (#964, #1203, TS 29.502 §5.2.2.3.4.2 step 4b): the SMF
 /// cannot proceed with the handover of this session, so it sets the hoState to NONE and
 /// answers 403 SmContextUpdateError, cause `HANDOVER_RESOURCE_ALLOCATION_FAILURE` (Table
-/// 6.1.3.3.4.2.2-2), with `hoState: NONE` and a Handover Preparation Unsuccessful Transfer
+/// 6.1.3.3.4.2.2-2), with a Handover Preparation Unsuccessful Transfer
 /// (`HANDOVER_PREP_FAIL`) carrying the target's cause. The session's preparation is
 /// dropped; its user plane stays as it is.
 fn handover_allocation_failed_response(sm_context_ref: &str, alloc_fail: &[u8]) -> SbiResponse {
@@ -5328,7 +5328,9 @@ fn handover_allocation_failed_response(sm_context_ref: &str, alloc_fail: &[u8]) 
         403,
         "HANDOVER_RESOURCE_ALLOCATION_FAILURE",
         "the target 5G-AN failed to establish resources for the PDU session",
-        serde_json::json!({ "hoState": "NONE" }),
+        // TS 29.502 Table 6.1.6.2.36-1: SmContextUpdateError carries no hoState; the
+        // AMF regards the hoState as NONE on any 4xx/5xx (§5.2.2.3.4.2).
+        serde_json::json!({}),
         Some(("HANDOVER_PREP_FAIL", n2)),
     )
 }
@@ -5791,9 +5793,9 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
             // not admit this session. The source still serves the UE, so the user plane
             // is NOT touched here (deactivating the DL FAR now would cut the downlink the
             // source is still delivering); the AMF deactivates the session once the UE has
-            // moved. The answer is the step 4b SmContextUpdateError (403, `hoState: NONE`,
-            // #1203) with the Handover Preparation Unsuccessful Transfer the HANDOVER
-            // COMMAND's release list carries.
+            // moved. The answer is the step 4b SmContextUpdateError (403, #1203) with the
+            // Handover Preparation Unsuccessful Transfer the HANDOVER COMMAND's release
+            // list carries.
             let alloc_fail = resolve_binary_ref(request, &req_body["n2SmInfo"]).unwrap_or_default();
             handover_allocation_failed_response(sm_context_ref, &alloc_fail)
         }
@@ -21915,7 +21917,7 @@ mod tests {
     ///   and the flow it accepted for forwarding; the target DL tunnel is recorded and
     ///   the UPF is not touched;
     /// - `HANDOVER_RES_ALLOC_FAIL` is answered with the step 4b SmContextUpdateError
-    ///   (403 `HANDOVER_RESOURCE_ALLOCATION_FAILURE`, `hoState: NONE`, #1203) with a
+    ///   (403 `HANDOVER_RESOURCE_ALLOCATION_FAILURE`, #1203) with a
     ///   Handover Preparation Unsuccessful Transfer carrying the target's cause, and the
     ///   session's DL is
     ///   left alone (it used to be deactivated, cutting the source's downlink).
@@ -22066,7 +22068,10 @@ mod tests {
             root["error"]["cause"],
             "HANDOVER_RESOURCE_ALLOCATION_FAILURE"
         );
-        assert_eq!(root["hoState"], "NONE");
+        assert!(
+            root.get("hoState").is_none(),
+            "not an SmContextUpdateError attribute (Table 6.1.6.2.36-1)"
+        );
         assert_eq!(root["n2SmInfoType"], "HANDOVER_PREP_FAIL");
         assert_eq!(root["n2SmInfo"]["contentId"], "n2SmInfo");
         let unsuccessful = n2.expect("the Unsuccessful Transfer");
