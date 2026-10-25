@@ -1086,20 +1086,6 @@ async fn main() -> Result<()> {
         return Err(anyhow::anyhow!("S5/S8 bind failed: {e}"));
     }
 
-    // #191: hand each client the Recovery Time Stamp the durable snapshot recorded
-    // for its peer, BEFORE the association loop is spawned. This is what turns the
-    // restored PFCP session map from a claim into a checked one: the first
-    // Association Setup compares the UPF's reported stamp against this seed and
-    // flushes the restored sessions if the UPF restarted while the SMF was down.
-    // A no-op when no state file is configured (the map has no entries).
-    for client in &pfcp_clients {
-        // #722: keyed by the configured name for a hostname UPF, not its address.
-        if let Some(rts) = client.stored_recovery_time_stamp() {
-            client.seed_peer_recovery_time_stamp(rts).await;
-        }
-    }
-    // #930 review n1: after the seed, which migrated what it needed.
-    pfcp_path::prune_orphan_address_keys(&pfcp_clients);
     // #1031: restored sessions whose UPF is no longer configured.
     pfcp_path::unknown_session_upfs(&pfcp_clients);
     // #1028 review m2: paths still failed at the last shutdown are held again.
