@@ -171,7 +171,13 @@ fn render_metrics() -> String {
          smf_nsac_decrease_failures_total {}\n\
          # HELP smf_ipv4_pool_stale_releases_total UE IPv4 addresses released while already free: each is a double free\n\
          # TYPE smf_ipv4_pool_stale_releases_total counter\n\
-         smf_ipv4_pool_stale_releases_total {}\n",
+         smf_ipv4_pool_stale_releases_total {}\n\
+         # HELP smf_s5s8_sgw_restart_pdn_deleted_total PDN connections deleted because their SGW-C restarted (TS 23.007 §17.1A.1)\n\
+         # TYPE smf_s5s8_sgw_restart_pdn_deleted_total counter\n\
+         smf_s5s8_sgw_restart_pdn_deleted_total {}\n\
+         # HELP smf_s5s8_sgw_restart_deletions_running Restarted SGW-Cs whose PDN connections are still being deleted\n\
+         # TYPE smf_s5s8_sgw_restart_deletions_running gauge\n\
+         smf_s5s8_sgw_restart_deletions_running {}\n",
         pool.len(),
         pfcp_path::PFCP_UNAUTHORIZED.load(Ordering::Relaxed),
         SM_POLICY_DELETE_FAILURES.load(Ordering::Relaxed),
@@ -185,6 +191,8 @@ fn render_metrics() -> String {
             .read()
             .map(|ctx| ctx.ipv4_pool.stale_releases())
             .unwrap_or(0),
+        gtp_handler::SGW_RESTART_PDN_CONNECTIONS_DELETED.load(Ordering::Relaxed),
+        gtp_handler::SGW_RESTART_DELETIONS_RUNNING.load(Ordering::Relaxed),
     )
 }
 
@@ -304,8 +312,16 @@ async fn self_nf_id() -> String {
         .unwrap_or_else(|| "nextgcore-smf".to_string())
 }
 
-/// An admission taken for its count-out: SUPI, PSI, SST, SD and the INCREASE's nfId.
-type NsacTaken = (String, u8, u8, Option<String>, Option<String>);
+/// An admission taken for its count-out: SUPI, PSI, SST, SD, the INCREASE's nfId and
+/// the NSACF it went to (#1164 follow-up).
+type NsacTaken = (
+    String,
+    u8,
+    u8,
+    Option<String>,
+    Option<String>,
+    Option<policy::NsacfEndpoint>,
+);
 
 /// Count out at the NSACF every session still admitted there (#959), at most
 /// `budget`, 16 at once. Each admission is taken first (its binding's
@@ -330,6 +346,7 @@ async fn nsac_count_out_unreleased(budget: std::time::Duration) -> usize {
                             b.sst,
                             b.sd.clone(),
                             b.nsac_nf_id.clone(),
+                            b.nsac_nsacf.clone(),
                         )
                     })
                     .collect()
@@ -346,7 +363,7 @@ async fn nsac_count_out_unreleased(budget: std::time::Duration) -> usize {
     let total = admitted.len();
     let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
     let mut sends = tokio::task::JoinSet::new();
-    for (supi, psi, sst, sd, nf_id) in admitted {
+    for (supi, psi, sst, sd, nf_id, nsacf) in admitted {
         let Ok(Ok(permit)) =
             tokio::time::timeout_at(deadline, permits.clone().acquire_owned()).await
         else {
@@ -354,7 +371,16 @@ async fn nsac_count_out_unreleased(budget: std::time::Duration) -> usize {
         };
         sends.spawn(async move {
             let _permit = permit;
-            rollback_nsac_as(true, nf_id.as_deref(), &supi, psi, sst, sd.as_deref()).await
+            rollback_nsac_as(
+                true,
+                nf_id.as_deref(),
+                nsacf.as_ref(),
+                &supi,
+                psi,
+                sst,
+                sd.as_deref(),
+            )
+            .await
         });
     }
     let mut accepted = 0;
@@ -376,6 +402,9 @@ async fn nsac_count_out_unreleased(budget: std::time::Duration) -> usize {
     accepted
 }
 
+/// An NSAC outcome: whether admitted, the INCREASE's nfId, and the NSACF it went to.
+pub(crate) type NsacAdmitted = (bool, Option<String>, Option<policy::NsacfEndpoint>);
+
 /// NSAC for a PDN connection moving from EPC to 5GC (#1072 review m4, m9): an
 /// INCREASE. `Some(admitted)` decides `nsac_admitted`; `None` is a rejection. This
 /// SMF+PGW-C does no EPS counting, so per TS 23.501 §5.15.11.5 the NSAC "is performed
@@ -388,13 +417,14 @@ pub(crate) async fn nsac_admit_migrated_session(
     psi: u8,
     sst: u8,
     sd: Option<&str>,
-) -> Option<(bool, Option<String>)> {
-    let Some(nsacf) = policy::resolve_nsacf_endpoint().await else {
-        return Some((false, None));
+    plmn: Option<(&str, &str)>,
+) -> Option<NsacAdmitted> {
+    let Some(nsacf) = policy::resolve_nsacf_endpoint(sst, sd, plmn).await else {
+        return Some((false, None, None));
     };
     let nf_id = self_nf_id().await;
     match policy::nsac_pdu_session_admit(&nsacf, &nf_id, supi, psi, sst, sd).await {
-        policy::NsacAdmission::Admitted => Some((true, Some(nf_id))),
+        policy::NsacAdmission::Admitted => Some((true, Some(nf_id), Some(nsacf))),
         policy::NsacAdmission::Rejected => {
             log::warn!(
                 "[{supi}] NSACF rejected the EPS→5GS PDU session {psi} on S-NSSAI[SST:{sst} \
@@ -402,12 +432,12 @@ pub(crate) async fn nsac_admit_migrated_session(
             );
             None
         }
-        policy::NsacAdmission::Unavailable => Some((false, None)),
+        policy::NsacAdmission::Unavailable => Some((false, None, None)),
         policy::NsacAdmission::NoAnswer => {
             let _ =
                 policy::nsac_pdu_session_release_precautionary(&nsacf, &nf_id, supi, psi, sst, sd)
                     .await;
-            Some((false, None))
+            Some((false, None, None))
         }
     }
 }
@@ -424,28 +454,46 @@ pub(crate) async fn rollback_nsac(
     sst: u8,
     sd: Option<&str>,
 ) -> bool {
-    let recorded = recorded_nsac_nf_id(supi, psi);
-    rollback_nsac_as(admitted, recorded.as_deref(), supi, psi, sst, sd).await
+    let (recorded, recorded_nsacf) = recorded_nsac(supi, psi);
+    rollback_nsac_as(
+        admitted,
+        recorded.as_deref(),
+        recorded_nsacf.as_ref(),
+        supi,
+        psi,
+        sst,
+        sd,
+    )
+    .await
 }
 
-/// The `nfId` the INCREASE of `supi`'s PDU session `psi` carried, from its live
-/// binding (#1075).
-fn recorded_nsac_nf_id(supi: &str, psi: u8) -> Option<String> {
-    smf_self().read().ok().and_then(|ctx| {
-        ctx.policy_bindings.read().ok().and_then(|m| {
-            m.values()
-                .find(|b| b.supi == supi && b.psi == psi)
-                .and_then(|b| b.nsac_nf_id.clone())
+/// The `nfId` the INCREASE of `supi`'s PDU session `psi` carried (#1075), and the
+/// NSACF it went to (#1164 follow-up), from its live binding.
+fn recorded_nsac(supi: &str, psi: u8) -> (Option<String>, Option<policy::NsacfEndpoint>) {
+    smf_self()
+        .read()
+        .ok()
+        .and_then(|ctx| {
+            ctx.policy_bindings.read().ok().and_then(|m| {
+                m.values()
+                    .find(|b| b.supi == supi && b.psi == psi)
+                    .map(|b| (b.nsac_nf_id.clone(), b.nsac_nsacf.clone()))
+            })
         })
-    })
+        .unwrap_or_default()
 }
 
 /// [`rollback_nsac`] naming `nf_id` in the DECREASE: the one the INCREASE carried
 /// (#1075, #1072 round 2 m3), so both name the same SMF instance (TS 23.502
 /// §4.2.11.2). `None` uses this instance's current id.
+///
+/// #1164 follow-up: to `nsacf`, the NSACF the INCREASE went to, when known; a fresh
+/// discovery could name another NSACF of the same slice, and the count would leak on
+/// the first.
 pub(crate) async fn rollback_nsac_as(
     admitted: bool,
     nf_id: Option<&str>,
+    nsacf: Option<&policy::NsacfEndpoint>,
     supi: &str,
     psi: u8,
     sst: u8,
@@ -454,7 +502,12 @@ pub(crate) async fn rollback_nsac_as(
     if !admitted {
         return true;
     }
-    match policy::resolve_nsacf_endpoint().await {
+    let pinned = nsacf.cloned();
+    let resolved = match pinned {
+        Some(nsacf) => Some(nsacf),
+        None => policy::resolve_nsacf_endpoint(sst, sd, None).await,
+    };
+    match resolved {
         Some(nsacf) => {
             let nf_id = match nf_id {
                 Some(id) => id.to_string(),
@@ -3947,6 +4000,15 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
         return eps_to_5gs::sm_context_error(400, "MANDATORY_IE_MISSING", "sNssai.sst is required");
     };
     let snssai_sd = req_body["sNssai"]["sd"].as_str().map(str::to_string);
+    // #1164 follow-up, TS 29.571 §5.4.4.2: an SD is 6 hex digits. A malformed one would
+    // reach the NRF query and the NSACF discovery cache's key.
+    if snssai_sd.as_deref().is_some_and(|sd| !policy::valid_sd(sd)) {
+        return eps_to_5gs::sm_context_error(
+            400,
+            "INVALID_MSG_FORMAT",
+            "sNssai.sd is not 6 hexadecimal digits",
+        );
+    }
     // Issue #73: `supi` is conditional-mandatory for a non-emergency session
     // (TS 29.502 §6.1.6.2.2), and it is now REJECTED when absent.
     //
@@ -4219,7 +4281,29 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     // NSACF never blocks the basic data path.
     // #1075: the nfId the INCREASE carried, recorded so the DECREASE names it too.
     let mut nsac_nf_id: Option<String> = None;
-    let nsac_admitted = match policy::resolve_nsacf_endpoint().await {
+    // #1164 follow-up: and the NSACF it went to, for the DECREASE.
+    let mut nsac_nsacf: Option<policy::NsacfEndpoint> = None;
+    // The serving PLMN, for an NSACF profile's perPlmnSnssaiList (TS 29.510 §6.1.6.2.2).
+    let nsac_plmn: Option<(String, String)> = ["servingNetwork", "guami"].iter().find_map(|k| {
+        let p = if *k == "guami" {
+            &req_body[k]["plmnId"]
+        } else {
+            &req_body[k]
+        };
+        Some((
+            p["mcc"].as_str()?.to_string(),
+            p["mnc"].as_str()?.to_string(),
+        ))
+    });
+    let nsac_admitted = match policy::resolve_nsacf_endpoint(
+        sst,
+        snssai_sd.as_deref(),
+        nsac_plmn
+            .as_ref()
+            .map(|(mcc, mnc)| (mcc.as_str(), mnc.as_str())),
+    )
+    .await
+    {
         // #1072 review m6: counted in already, by the released session it replaces.
         _ if nsac_carried => true,
         None => {
@@ -4243,6 +4327,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                         "NSACF admitted PDU session for S-NSSAI[SST:{sst} SD:{snssai_sd:?}]"
                     );
                     nsac_nf_id = Some(nf_id.clone());
+                    nsac_nsacf = Some(nsacf.clone());
                     true
                 }
                 policy::NsacAdmission::Rejected => {
@@ -4518,6 +4603,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     rollback_nsac_as(
                         nsac_admitted,
                         nsac_nf_id.as_deref(),
+                        nsac_nsacf.as_ref(),
                         &supi,
                         pdu_session_id,
                         sst,
@@ -4542,6 +4628,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     rollback_nsac_as(
                         nsac_admitted,
                         nsac_nf_id.as_deref(),
+                        nsac_nsacf.as_ref(),
                         &supi,
                         pdu_session_id,
                         sst,
@@ -4703,6 +4790,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                 rollback_nsac_as(
                     nsac_admitted,
                     nsac_nf_id.as_deref(),
+                    nsac_nsacf.as_ref(),
                     &supi,
                     pdu_session_id,
                     sst,
@@ -4907,6 +4995,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     sdm_subscription_id: sdm_subscription_id.clone(),
                     nsac_admitted,
                     nsac_nf_id: nsac_nf_id.clone(),
+                    nsac_nsacf: nsac_nsacf.clone(),
                 },
             );
         }
@@ -5285,12 +5374,13 @@ fn handover_preparing_response(sm_context_ref: &str, required: Option<&[u8]>) ->
         ))
 }
 
-/// Answer `HANDOVER_RES_ALLOC_FAIL` (#964, TS 29.502 §5.2.2.3.4.2): `hoState: CANCELLED`
-/// with a Handover Preparation Unsuccessful Transfer (`HANDOVER_PREP_FAIL`) carrying the
-/// target's cause. The session's preparation is dropped; its user plane stays as it is.
+/// Answer `HANDOVER_RES_ALLOC_FAIL` (#964, #1203, TS 29.502 §5.2.2.3.4.2 step 4b): the SMF
+/// cannot proceed with the handover of this session, so it sets the hoState to NONE and
+/// answers 403 SmContextUpdateError, cause `HANDOVER_RESOURCE_ALLOCATION_FAILURE` (Table
+/// 6.1.3.3.4.2.2-2), with a Handover Preparation Unsuccessful Transfer
+/// (`HANDOVER_PREP_FAIL`) carrying the target's cause. The session's preparation is
+/// dropped; its user plane stays as it is.
 fn handover_allocation_failed_response(sm_context_ref: &str, alloc_fail: &[u8]) -> SbiResponse {
-    use nextgcore_sbi::constants::content_type;
-    use nextgcore_sbi::message::SbiPart;
     let Some(mut sess) = smf_self()
         .read()
         .ok()
@@ -5321,20 +5411,17 @@ fn handover_allocation_failed_response(sm_context_ref: &str, alloc_fail: &[u8]) 
     }
     log::warn!(
         "SM Context Update (HANDOVER_RES_ALLOC_FAIL) for ref={sm_context_ref}: the target \
-         could not admit the session; CANCELLED, the session stays on the source"
+         could not admit the session; hoState NONE, the session stays on the source"
     );
-    let body = serde_json::json!({
-        "hoState": "CANCELLED",
-        "n2SmInfoType": "HANDOVER_PREP_FAIL",
-        "n2SmInfo": { "contentId": "n2SmInfo" },
-    });
-    SbiResponse::with_status(200)
-        .with_body(body.to_string(), content_type::APPLICATION_JSON)
-        .with_part(SbiPart::with_content(
-            "n2SmInfo",
-            content_type::APPLICATION_NGAP,
-            bytes::Bytes::from(n2),
-        ))
+    eps_to_5gs::sm_context_update_error_with(
+        403,
+        "HANDOVER_RESOURCE_ALLOCATION_FAILURE",
+        "the target 5G-AN failed to establish resources for the PDU session",
+        // TS 29.502 Table 6.1.6.2.36-1: SmContextUpdateError carries no hoState; the
+        // AMF regards the hoState as NONE on any 4xx/5xx (§5.2.2.3.4.2).
+        serde_json::json!({}),
+        Some(("HANDOVER_PREP_FAIL", n2)),
+    )
 }
 
 /// The UPF's N3 uplink endpoint for an SM context, if establishment recorded one (#70).
@@ -5795,8 +5882,9 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
             // not admit this session. The source still serves the UE, so the user plane
             // is NOT touched here (deactivating the DL FAR now would cut the downlink the
             // source is still delivering); the AMF deactivates the session once the UE has
-            // moved. The answer is `hoState: CANCELLED` with the Handover Preparation
-            // Unsuccessful Transfer the HANDOVER COMMAND's release list carries.
+            // moved. The answer is the step 4b SmContextUpdateError (403, #1203) with the
+            // Handover Preparation Unsuccessful Transfer the HANDOVER COMMAND's release
+            // list carries.
             let alloc_fail = resolve_binary_ref(request, &req_body["n2SmInfo"]).unwrap_or_default();
             handover_allocation_failed_response(sm_context_ref, &alloc_fail)
         }
@@ -6174,6 +6262,25 @@ fn gsm_procedure_timers(
         "GSM_PROCEDURE_TIMERS",
     );
     GSM_PROCEDURE_TIMERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// The SM context references with an armed 5GSM timer, for the test census
+/// (`context::SeededState`, #1200 review m1).
+#[cfg(test)]
+pub(crate) fn gsm_timer_refs_for_test() -> std::collections::HashSet<String> {
+    gsm_procedure_timers()
+        .lock()
+        .map(|t| t.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Cancels every armed 5GSM timer whose reference is not in `kept`, for
+/// `context::SeededState` (#1200 review m1).
+#[cfg(test)]
+pub(crate) fn retain_gsm_timers_for_test(kept: &std::collections::HashSet<String>) {
+    if let Ok(mut timers) = gsm_procedure_timers().lock() {
+        timers.retain(|k, _| kept.contains(k));
+    }
 }
 
 /// Arm T3591 / T3592 for `sm_context_ref` after sending `command`.
@@ -7147,6 +7254,7 @@ async fn release_nsac_admission(binding: &context::PolicyBinding, entry: Option<
             rollback_nsac_as(
                 true,
                 binding.nsac_nf_id.as_deref(),
+                binding.nsac_nsacf.as_ref(),
                 &binding.supi,
                 binding.psi,
                 binding.sst,
@@ -9995,6 +10103,7 @@ mod tests {
     #[tokio::test]
     async fn the_shutdown_deletes_epc_sessions_through_the_live_listener_without_retransmitting() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
         smf_context_init(64, 256, 512);
         let (upf, seen, upf_task) = raw_upf(None).await;
@@ -10190,6 +10299,7 @@ mod tests {
     #[tokio::test]
     async fn the_epc_shutdown_tells_the_sgw_first_and_deletes_in_parallel() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
         smf_context_init(64, 256, 512);
         let arrivals = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -10545,6 +10655,7 @@ mod tests {
     #[tokio::test]
     async fn a_late_create_failure_releases_the_session_without_announcing_it() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _g = event_exposure::lock_store();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         event_exposure::clear_for_test();
@@ -10695,6 +10806,7 @@ mod tests {
     #[tokio::test]
     async fn the_epc_shutdown_keeps_its_deadline_with_a_dead_pgw_u() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
         smf_context_init(64, 256, 512);
         // A PGW-U that reads and never answers.
@@ -11238,6 +11350,7 @@ mod tests {
     #[tokio::test]
     async fn an_established_sessions_upf_identity_survives_the_endpoint_record() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = pfcp_path::stand_in::associated_upf().await;
         smf_context_init(64, 256, 512);
         let reference = seed_registered_session("imsi-001010000010311", 5, "internet");
@@ -11822,17 +11935,79 @@ mod tests {
         assert!(!kept, "0x10 after 0xFFFFFF00 is a newer incarnation");
     }
 
-    /// #928 round 2 B2: the stamp's compare-and-set under one write guard. On a
-    /// multi-thread runtime, two detectors released together by a barrier see each
-    /// new stamp; exactly one tears down per stamp.
+    /// #928 round 2 B2: the stamp's compare-and-set under one write guard. Two
+    /// detectors of one new stamp tear down once.
+    ///
+    /// #1229: since #966 (review m3) the teardown clears the stored stamp with the
+    /// association, after an await. So the second detector of a stamp finds one of two
+    /// things, and neither may tear down again:
+    /// - the new stamp, when it runs inside the first detector's teardown, before the
+    ///   clear. This is driven deterministically by holding the teardown there
+    ///   (`TEARDOWN_HOLD_FOR_TEST`);
+    /// - no stamp, when it runs after the clear. It stores the stamp as a baseline.
+    ///
+    /// The test then races two detectors in 20 rounds, as before. Each round now
+    /// starts from what a re-association and its first Heartbeat leave: associated,
+    /// with the old incarnation's stamp (100) stored. When the rounds chained (round
+    /// i's stamp was round i + 1's baseline), a round tore down only if the round
+    /// before had cleared after its second detector ran. That made the count `19 != 20`
+    /// in CI, depending on how the previous round's two detectors were ordered.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_detectors_of_one_new_stamp_tear_down_once() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
         let fx = restart_fixture("92807", Duration::ZERO).await;
-        let before = pfcp_path::TEARDOWNS_FOR_TEST.load(Ordering::SeqCst);
+        let teardowns = || pfcp_path::TEARDOWNS_FOR_TEST.load(Ordering::SeqCst);
+        let rebaseline = || async {
+            fx.a.set_assoc_state_for_test(true, None, None).await;
+            fx.a.seed_peer_recovery_time_stamp(100).await;
+        };
+
+        // Inside the teardown, before the clear: the stored stamp is the new one.
+        rebaseline().await;
+        let (reached, proceed) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        *pfcp_path::TEARDOWN_HOLD_FOR_TEST.lock().unwrap() =
+            Some((reached.clone(), proceed.clone()));
+        let before = teardowns();
+        let first = {
+            let a = fx.a.clone();
+            tokio::spawn(async move { a.check_peer_restart(900).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), reached.notified())
+            .await
+            .expect("the first detector tears down");
+        *pfcp_path::TEARDOWN_HOLD_FOR_TEST.lock().unwrap() = None;
+        fx.a.check_peer_restart(900).await;
+        let inside = teardowns() - before;
+        proceed.notify_one();
+        first.await.unwrap();
+        assert_eq!(
+            inside, 1,
+            "the second detector, inside the teardown, does not tear down"
+        );
+        assert_eq!(teardowns() - before, 1);
+
+        // After the clear: no stamp stored; the second detector records a baseline.
+        rebaseline().await;
+        let before = teardowns();
+        fx.a.check_peer_restart(901).await;
+        assert_eq!(
+            fx.a.peer_recovery_time_stamp_for_test().await,
+            None,
+            "cleared"
+        );
+        fx.a.check_peer_restart(901).await;
+        assert_eq!(teardowns() - before, 1, "after the clear, a baseline");
+
+        // Raced, round by round.
         let rounds = 20u32;
+        let mut per_round = Vec::new();
         for i in 0..rounds {
+            rebaseline().await;
+            let before = teardowns();
             let stamp = 1000 + i;
             let barrier = Arc::new(tokio::sync::Barrier::new(2));
             let mut tasks = Vec::new();
@@ -11847,10 +12022,20 @@ mod tests {
             for t in tasks {
                 t.await.unwrap();
             }
+            per_round.push(teardowns() - before);
+            let left = fx.a.peer_recovery_time_stamp_for_test().await;
+            assert!(
+                left.is_none()
+                    || left == Some(nextgcore_pfcp::recovery_time::normalize_received(stamp)),
+                "round {i}: the teardown's clear, or the new stamp as a baseline: {left:?}"
+            );
         }
-        let teardowns = pfcp_path::TEARDOWNS_FOR_TEST.load(Ordering::SeqCst) - before;
         fx.teardown().await;
-        assert_eq!(teardowns, rounds as usize, "one teardown per new stamp");
+        assert_eq!(
+            per_round,
+            vec![1; rounds as usize],
+            "one teardown per new stamp, in every round"
+        );
     }
 
     /// #928 round 2 M2: an Association Release Request from a host that is not the
@@ -12052,6 +12237,7 @@ mod tests {
     #[tokio::test]
     async fn the_epc_shutdown_counts_what_was_deleted_when_out_of_time() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
         smf_context_init(64, 256, 512);
         let upf = std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -12125,6 +12311,7 @@ mod tests {
     #[tokio::test]
     async fn a_shutdown_that_keeps_the_association_deletes_the_epc_sessions() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         smf_context_init(64, 256, 512);
         let upf = pfcp_path::stand_in::associated_upf().await;
         let sess_id = {
@@ -12244,6 +12431,7 @@ mod tests {
         };
         // #779 review m1: process-wide SMF context state, ambient lock first.
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = pfcp_path::stand_in::install_stand_in_upf().await;
         upf.client.associate().await.expect("association");
         upf.clear_seen();
@@ -14248,6 +14436,7 @@ mod tests {
                         sdm_subscription_id: None,
                         nsac_admitted: false,
                         nsac_nf_id: None,
+                        nsac_nsacf: None,
                     },
                 );
             }
@@ -14265,6 +14454,7 @@ mod tests {
     #[tokio::test]
     async fn easdf_dns_report_is_attributed_to_its_session() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         seed_binding("easdf-report-ref", 7);
         // Give that session a DNS context id to be matched against.
         if let Ok(ctx) = smf_self().read() {
@@ -14356,6 +14546,7 @@ mod tests {
         // Lock order (see `context::PROCESS_STATE_TEST_LOCK`): ambient state first,
         // N4 second — `stand_in` takes the N4 lock on this test's behalf.
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _upf = pfcp_path::stand_in::unassociated_upf().await;
         let (nrf, easdf_srv, seen) = easdf::tests::spawn_nrf_and_easdf().await;
         smf_context_init(64, 256, 512);
@@ -14422,6 +14613,7 @@ mod tests {
         // Lock order (see `context::PROCESS_STATE_TEST_LOCK`): ambient state first,
         // N4 second — `stand_in` takes the N4 lock on this test's behalf.
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = pfcp_path::stand_in::associated_upf().await;
         let (nrf, easdf_srv, seen) = easdf::tests::spawn_nrf_and_easdf().await;
         smf_context_init(64, 256, 512);
@@ -14788,6 +14980,7 @@ mod tests {
     #[tokio::test]
     async fn a_container_on_a_create_changes_nothing_when_the_leg_is_off() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _upf = pfcp_path::stand_in::associated_upf().await;
         eps_iwk::set_for_test(false);
@@ -14887,6 +15080,7 @@ mod tests {
     #[tokio::test]
     async fn the_create_subscribes_to_sm_data_and_the_release_deregisters_and_unsubscribes() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let upf = pfcp_path::stand_in::associated_upf().await;
         let (udm_srv, seen) = spawn_recording_udm(sm_data_with("100 Mbps", "500 Mbps", 7)).await;
@@ -14996,6 +15190,7 @@ mod tests {
     #[tokio::test]
     async fn a_sdm_notification_applies_the_changed_ambr_to_a_live_session() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         // The UDM now answers with DIFFERENT values from the ones the session holds.
         let (udm_srv, seen) = spawn_recording_udm(sm_data_with("40 Mbps", "80 Mbps", 6)).await;
@@ -15163,6 +15358,7 @@ mod tests {
     #[tokio::test]
     async fn the_establishment_carries_the_node_id_and_a_routable_f_seid() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let identity = n4_identity::N4Identity {
             node_id: nextgcore_pfcp::types::NodeId::new_fqdn(
                 "smf.nextg-system.svc.cluster.local".into(),
@@ -15218,6 +15414,7 @@ mod tests {
     #[tokio::test]
     async fn the_establishment_request_provisions_a_urr_bound_to_both_pdrs() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = pfcp_path::stand_in::associated_upf().await;
         std::env::set_var("SMF_URR_VOLUME_QUOTA", "5000000");
         std::env::set_var("SMF_URR_TIME_QUOTA", "900");
@@ -15332,6 +15529,7 @@ mod tests {
     #[tokio::test]
     async fn an_unconfigured_quota_provisions_measurement_without_enforcement() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = pfcp_path::stand_in::associated_upf().await;
         for k in ["SMF_URR_VOLUME_QUOTA", "SMF_URR_TIME_QUOTA"] {
             std::env::remove_var(k);
@@ -15599,6 +15797,7 @@ mod tests {
     #[tokio::test]
     async fn an_established_sessions_address_is_freed_once() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         smf_context_init(64, 256, 512);
         let ip = std::net::Ipv4Addr::new(10, 45, 9, 12);
         let reference = seed_established_session("imsi-001010000009121", 5, ip);
@@ -15630,6 +15829,7 @@ mod tests {
     #[tokio::test]
     async fn a_release_frees_only_the_sessions_address() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         smf_context_init(64, 256, 512);
         let a_ip = std::net::Ipv4Addr::new(10, 45, 9, 17);
         let b_ip = std::net::Ipv4Addr::new(10, 45, 9, 18);
@@ -15664,6 +15864,7 @@ mod tests {
     #[tokio::test]
     async fn a_session_the_upf_does_not_know_is_released_completely() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         smf_context_init(64, 256, 512);
         let ip = std::net::Ipv4Addr::new(10, 45, 9, 19);
         let reference = seed_established_session("imsi-001010000009127", 12, ip);
@@ -15687,6 +15888,7 @@ mod tests {
     #[tokio::test]
     async fn an_identity_less_session_is_released_completely_on_a_upf_restart() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
         smf_context_init(64, 256, 512);
         let ip = std::net::Ipv4Addr::new(10, 45, 9, 20);
@@ -15717,6 +15919,7 @@ mod tests {
     #[tokio::test]
     async fn an_amf_release_racing_t3592_frees_the_address_once() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
         let (udm_srv, _seen) = spawn_slow_udm(std::time::Duration::from_millis(800)).await;
@@ -15755,6 +15958,7 @@ mod tests {
     #[tokio::test]
     async fn a_new_session_waits_for_the_previous_release_of_its_psi() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
         let (udm_srv, seen) = spawn_slow_udm(std::time::Duration::from_millis(400)).await;
@@ -15831,6 +16035,7 @@ mod tests {
     #[tokio::test]
     async fn a_create_registers_only_after_the_old_deregistration_is_answered() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
@@ -15917,6 +16122,7 @@ mod tests {
     #[tokio::test]
     async fn the_release_side_effect_drain_is_bounded() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
         let (udm_srv, seen) = spawn_slow_udm(std::time::Duration::from_millis(800)).await;
@@ -15955,6 +16161,7 @@ mod tests {
     #[tokio::test]
     async fn ue_requested_and_t3592_releases_tell_the_udm() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
         let (udm_srv, seen) = spawn_slow_udm(std::time::Duration::ZERO).await;
@@ -16026,6 +16233,7 @@ mod tests {
     #[tokio::test]
     async fn a_deregistration_the_udm_never_answers_holds_a_create_only_for_its_bound() {
         let _state = RELEASE_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
         let (udm_srv, _seen) = spawn_slow_udm(std::time::Duration::from_secs(20)).await;
@@ -16080,6 +16288,7 @@ mod tests {
     #[tokio::test]
     async fn the_udm_cleanup_is_not_held_behind_the_release_fanout() {
         let _state = RELEASE_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
         let (udm_srv, seen) = spawn_slow_udm(std::time::Duration::ZERO).await;
@@ -16124,6 +16333,7 @@ mod tests {
     #[tokio::test]
     async fn a_release_queued_for_the_udm_is_superseded_not_waited_for() {
         let _state = RELEASE_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
         let (udm_srv, seen) = spawn_slow_udm(std::time::Duration::ZERO).await;
@@ -16225,6 +16435,7 @@ mod tests {
     #[tokio::test]
     async fn no_t3592_for_a_context_the_user_plane_release_completed() {
         let _state = RELEASE_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
@@ -16289,6 +16500,7 @@ mod tests {
     #[tokio::test]
     async fn a_create_rollback_removes_its_binding_and_frees_the_address() {
         let _state = RELEASE_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         smf_context_init(64, 256, 512);
         let held = std::net::Ipv4Addr::new(10, 45, 9, 36);
         let reference = seed_established_session("imsi-001010000009136", 16, held);
@@ -16331,6 +16543,7 @@ mod tests {
     #[tokio::test]
     async fn the_nsacf_decrease_names_the_nf_id_of_the_increase() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -16415,17 +16628,107 @@ mod tests {
             .set_nrf_uri(format!("http://127.0.0.1:{}", addr.port()))
             .await;
         for _ in 0..5 {
-            let found = policy::resolve_nsacf_endpoint().await.expect("discovered");
+            let found = policy::resolve_nsacf_endpoint(1, None, None)
+                .await
+                .expect("discovered");
             assert_eq!(found.port, 17813);
         }
         let within = discoveries.load(std::sync::atomic::Ordering::SeqCst);
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-        let _ = policy::resolve_nsacf_endpoint().await;
+        let _ = policy::resolve_nsacf_endpoint(1, None, None).await;
         let after = discoveries.load(std::sync::atomic::Ordering::SeqCst);
         global_context().clear_nrf_uri().await;
         nrf.stop().await.ok();
         assert_eq!(within, 1, "five resolutions, one discovery");
         assert_eq!(after, 2, "asked again once the validity ended");
+    }
+
+    /// #1164: an NSACF serves specific S-NSSAIs (TS 23.501 §5.15.11). The discovery
+    /// names the session's S-NSSAI (TS 29.510 §6.2.3.2.3.1 `snssais`), the instance
+    /// taken is one whose profile serves it (here the NRF names both NSACFs for every
+    /// query, so the SMF's own filter decides), and the cache is per S-NSSAI.
+    ///
+    /// REVERT-VERIFIED: taking the first instance sends slice 2's INCREASE to slice
+    /// 1's NSACF; a cache keyed by the NRF alone reuses slice 1's for slice 2.
+    #[tokio::test]
+    async fn each_slice_is_admitted_by_the_nsacf_serving_it() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        std::env::remove_var("NSACF_URI");
+        let queries = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = queries.clone();
+        let (nrf, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let seen = seen.clone();
+                async move {
+                    if let Some(q) = req.http.params.get("snssais") {
+                        seen.lock().unwrap().push(q.clone());
+                    }
+                    SbiResponse::with_status(200)
+                        .with_json_body(&serde_json::json!({
+                            "validityPeriod": 3600,
+                            "nfInstances": [
+                                {
+                                    "nfInstanceId": "nsacf-1164-a",
+                                    "nfType": "NSACF",
+                                    "ipv4Addresses": ["127.0.0.1"],
+                                    "sNssais": [{ "sst": 1 }],
+                                    "nfServices": [{
+                                        "serviceName": "nnsacf-nsac",
+                                        "ipEndPoints": [{ "port": 11641 }],
+                                    }],
+                                },
+                                {
+                                    "nfInstanceId": "nsacf-1164-b",
+                                    "nfType": "NSACF",
+                                    "ipv4Addresses": ["127.0.0.1"],
+                                    "sNssais": [{ "sst": 2, "sd": "000002" }],
+                                    "nfServices": [{
+                                        "serviceName": "nnsacf-nsac",
+                                        "ipEndPoints": [{ "port": 11642 }],
+                                    }],
+                                },
+                            ],
+                        }))
+                        .unwrap()
+                }
+            })
+            .await;
+        global_context()
+            .set_nrf_uri(format!("http://127.0.0.1:{}", addr.port()))
+            .await;
+        let a = policy::resolve_nsacf_endpoint(1, None, None)
+            .await
+            .map(|e| e.port);
+        let b = policy::resolve_nsacf_endpoint(2, Some("000002"), None)
+            .await
+            .map(|e| e.port);
+        let b_again = policy::resolve_nsacf_endpoint(2, Some("000002"), None)
+            .await
+            .map(|e| e.port);
+        let none = policy::resolve_nsacf_endpoint(3, None, None)
+            .await
+            .map(|e| e.port);
+        let asked = queries.lock().unwrap().clone();
+        global_context().clear_nrf_uri().await;
+        nrf.stop().await.ok();
+        assert_eq!(a, Some(11641), "slice 1's NSACF");
+        assert_eq!(b, Some(11642), "slice 2's NSACF, not the first instance");
+        assert_eq!(b_again, Some(11642), "cached per slice");
+        assert_eq!(none, None, "no NSACF serves slice 3");
+        let parsed: Vec<serde_json::Value> = asked
+            .iter()
+            .map(|q| serde_json::from_str(q).expect("a JSON array"))
+            .collect();
+        assert_eq!(
+            parsed,
+            vec![
+                serde_json::json!([{ "sst": 1 }]),
+                serde_json::json!([{ "sst": 2, "sd": "000002" }]),
+                serde_json::json!([{ "sst": 3 }]),
+            ],
+            "one discovery per slice, each naming it"
+        );
     }
 
     /// #1150 review M1: a discovered NSACF that fails a transaction is dropped from
@@ -16468,13 +16771,15 @@ mod tests {
         global_context()
             .set_nrf_uri(format!("http://127.0.0.1:{}", addr.port()))
             .await;
-        let nsacf = policy::resolve_nsacf_endpoint().await.expect("discovered");
-        let _ = policy::resolve_nsacf_endpoint().await;
+        let nsacf = policy::resolve_nsacf_endpoint(1, None, None)
+            .await
+            .expect("discovered");
+        let _ = policy::resolve_nsacf_endpoint(1, None, None).await;
         let cached = discoveries.load(std::sync::atomic::Ordering::SeqCst);
         let admission =
             policy::nsac_pdu_session_admit(&nsacf, "smf-1150", "imsi-001010000011500", 5, 1, None)
                 .await;
-        let _ = policy::resolve_nsacf_endpoint().await;
+        let _ = policy::resolve_nsacf_endpoint(1, None, None).await;
         let after = discoveries.load(std::sync::atomic::Ordering::SeqCst);
         global_context().clear_nrf_uri().await;
         nrf.stop().await.ok();
@@ -16573,12 +16878,14 @@ mod tests {
             .set_nrf_uri(format!("http://127.0.0.1:{}", addr.port()))
             .await;
         let count = || discoveries.load(std::sync::atomic::Ordering::SeqCst);
-        let found = policy::resolve_nsacf_endpoint().await.expect("discovered");
+        let found = policy::resolve_nsacf_endpoint(1, None, None)
+            .await
+            .expect("discovered");
         let first = count();
         let admission =
             policy::nsac_pdu_session_admit(&found, "smf-1150", "imsi-001010000011501", 5, 1, None)
                 .await;
-        let found = policy::resolve_nsacf_endpoint()
+        let found = policy::resolve_nsacf_endpoint(1, None, None)
             .await
             .expect("discovered again");
         let after_increase = count();
@@ -16591,7 +16898,7 @@ mod tests {
             None,
         )
         .await;
-        let _ = policy::resolve_nsacf_endpoint().await;
+        let _ = policy::resolve_nsacf_endpoint(1, None, None).await;
         let after_decrease = count();
         global_context().clear_nrf_uri().await;
         nrf.stop().await.ok();
@@ -16817,6 +17124,7 @@ mod tests {
     #[tokio::test]
     async fn a_release_sends_the_nsacf_decrease_for_an_admitted_session() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -16889,6 +17197,7 @@ mod tests {
     #[tokio::test]
     async fn a_releasing_shutdown_counts_out_the_unreleased_sessions_once() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -17007,6 +17316,7 @@ mod tests {
     #[tokio::test]
     async fn a_reestablishment_counts_in_after_the_old_session_counts_out() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
@@ -17127,6 +17437,7 @@ mod tests {
     #[tokio::test]
     async fn a_reestablishment_takes_over_a_decrease_not_yet_sent() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
@@ -17185,6 +17496,7 @@ mod tests {
     #[tokio::test]
     async fn a_reestablishment_on_another_slice_neither_waits_nor_takes_over() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
@@ -17250,6 +17562,7 @@ mod tests {
     #[tokio::test]
     async fn a_releasing_shutdown_counts_out_while_the_release_runs_out_its_time() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
@@ -17322,6 +17635,7 @@ mod tests {
     #[tokio::test]
     async fn the_shutdown_count_out_reports_only_accepted_decreases() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
         let zero = std::time::Duration::ZERO;
@@ -17351,6 +17665,7 @@ mod tests {
     #[tokio::test]
     async fn a_create_failing_at_the_n2_encode_counts_out_once() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
@@ -17408,6 +17723,7 @@ mod tests {
     #[tokio::test]
     async fn an_unanswered_increase_is_reconciled_with_a_decrease() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
@@ -17480,6 +17796,7 @@ mod tests {
     #[tokio::test]
     async fn a_created_and_released_session_is_counted_in_and_out_at_the_nsacf() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
@@ -17546,6 +17863,152 @@ mod tests {
         let decrease: serde_json::Value =
             serde_json::from_str(bodies.iter().find(|b| b.contains("DECREASE")).unwrap()).unwrap();
         assert_eq!(decrease["nfId"], increase["nfId"]);
+    }
+
+    /// #1164 follow-up: the DECREASE goes to the NSACF that admitted the session, not to
+    /// the one a fresh discovery names at release. Two NSACFs serve slice 1/010203; the NRF
+    /// names A first at create and B first afterwards (its results valid for 0 s).
+    /// The INCREASE goes to A, and so does the release's DECREASE. Before, it went to
+    /// B and the count leaked on A.
+    #[tokio::test]
+    async fn the_decrease_goes_to_the_nsacf_that_admitted_the_session() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        std::env::remove_var("NSACF_URI");
+        type Bodies = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+        let nsacf = || async {
+            let seen: Bodies = Default::default();
+            let sink = seen.clone();
+            let (srv, addr) =
+                nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                    let sink = sink.clone();
+                    async move {
+                        sink.lock()
+                            .unwrap()
+                            .push(req.http.content.clone().unwrap_or_default());
+                        SbiResponse::with_status(204)
+                    }
+                })
+                .await;
+            (srv, addr.port(), seen)
+        };
+        let (a, a_port, a_seen) = nsacf().await;
+        let (b, b_port, b_seen) = nsacf().await;
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = asked.clone();
+        let (nrf, nrf_addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let count = count.clone();
+                async move {
+                    if req.http.params.get("target-nf-type").map(String::as_str) != Some("NSACF") {
+                        return SbiResponse::with_status(404);
+                    }
+                    let instance = |id: &str, port: u16| {
+                        serde_json::json!({
+                            "nfInstanceId": id, "nfType": "NSACF",
+                            "ipv4Addresses": ["127.0.0.1"],
+                            "sNssais": [{ "sst": 1, "sd": "010203" }],
+                            "nfServices": [{ "serviceName": "nnsacf-nsac",
+                                             "ipEndPoints": [{ "port": port }] }],
+                        })
+                    };
+                    let first = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                    let order = if first {
+                        vec![instance("nsacf-a", a_port), instance("nsacf-b", b_port)]
+                    } else {
+                        vec![instance("nsacf-b", b_port), instance("nsacf-a", a_port)]
+                    };
+                    SbiResponse::with_status(200)
+                        .with_json_body(&serde_json::json!({
+                            "validityPeriod": 0, "nfInstances": order,
+                        }))
+                        .unwrap()
+                }
+            })
+            .await;
+        global_context()
+            .set_nrf_uri(format!("http://127.0.0.1:{}", nrf_addr.port()))
+            .await;
+        let supi = "imsi-001010000011645";
+        let resp = handle_sm_context_create(&create_request(
+            supi,
+            9,
+            &n1(
+                9,
+                1,
+                gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+                &[0x91, 0x00],
+            ),
+        ))
+        .await;
+        let reference = smf_self()
+            .read()
+            .unwrap()
+            .policy_bindings
+            .read()
+            .unwrap()
+            .iter()
+            .find(|(_, b)| b.supi == supi && b.psi == 9)
+            .map(|(r, b)| (r.clone(), b.nsac_nsacf.clone()));
+        if let Some((r, _)) = &reference {
+            let _ = handle_sm_context_release(r, None).await;
+        }
+        side_effects_settled().await;
+        global_context().clear_nrf_uri().await;
+        let ops = |seen: &Bodies| {
+            let bodies = seen.lock().unwrap();
+            (
+                bodies.iter().filter(|b| b.contains("INCREASE")).count(),
+                bodies.iter().filter(|b| b.contains("DECREASE")).count(),
+            )
+        };
+        let (at_a, at_b) = (ops(&a_seen), ops(&b_seen));
+        for srv in [a, b, nrf] {
+            srv.stop().await.ok();
+        }
+
+        assert_eq!(resp.status, 201);
+        assert_eq!(
+            reference.and_then(|(_, n)| n).map(|n| n.port),
+            Some(a_port),
+            "the binding records the admitting NSACF"
+        );
+        assert_eq!(at_a, (1, 1), "counted in and out at A");
+        assert_eq!(at_b, (0, 0), "B never counted this session");
+    }
+
+    /// #1164 follow-up, TS 29.571 §5.4.4.2: an SM Context Create whose S-NSSAI SD is
+    /// not 6 hex digits is refused 400, before it reaches the NRF query or the NSACF
+    /// discovery cache.
+    #[tokio::test]
+    async fn a_malformed_sd_is_refused() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        smf_context_init(64, 256, 512);
+        let mut request = create_request(
+            "imsi-001010000011646",
+            9,
+            &n1(
+                9,
+                1,
+                gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+                &[0x91, 0x00],
+            ),
+        );
+        let mut body: serde_json::Value =
+            serde_json::from_str(request.http.content.as_deref().unwrap()).unwrap();
+        body["sNssai"] = serde_json::json!({ "sst": 1, "sd": "zz0001" });
+        request.http.content = Some(body.to_string());
+        let resp = handle_sm_context_create(&request).await;
+        assert_eq!(resp.status, 400, "{:?}", resp.http.content);
+        assert!(resp
+            .http
+            .content
+            .as_deref()
+            .is_some_and(|c| c.contains("INVALID_MSG_FORMAT")));
     }
 
     // ---- #994: PFCP Node Report: user plane path failure and recovery ----
@@ -17706,6 +18169,7 @@ mod tests {
     #[tokio::test]
     async fn a_node_report_deactivates_the_sessions_toward_the_failed_peer() {
         let _state = up_path::UP_PATH_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         up_path::reset_for_test();
@@ -17761,6 +18225,7 @@ mod tests {
     #[tokio::test]
     async fn a_node_report_from_another_host_is_refused() {
         let _state = up_path::UP_PATH_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         up_path::reset_for_test();
@@ -17843,6 +18308,7 @@ mod tests {
     #[tokio::test]
     async fn a_recovery_report_cancels_the_hold() {
         let _state = up_path::UP_PATH_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         up_path::reset_for_test();
@@ -17898,6 +18364,7 @@ mod tests {
     #[tokio::test]
     async fn an_error_indication_report_deactivates_the_sessions_user_plane() {
         let _state = up_path::UP_PATH_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         up_path::reset_for_test();
@@ -17998,6 +18465,7 @@ mod tests {
     #[tokio::test]
     async fn a_restored_failed_path_is_held_again_and_released() {
         let _state = up_path::UP_PATH_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         up_path::reset_for_test();
@@ -18045,6 +18513,7 @@ mod tests {
     #[tokio::test]
     async fn a_restored_hold_waits_for_the_association_and_drops_unknown_upfs() {
         let _state = up_path::UP_PATH_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         up_path::reset_for_test();
@@ -18104,6 +18573,7 @@ mod tests {
     #[tokio::test]
     async fn a_shutdown_stops_the_holds_before_deregistering() {
         let _state = up_path::UP_PATH_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         up_path::reset_for_test();
@@ -18153,6 +18623,7 @@ mod tests {
     #[tokio::test]
     async fn with_no_hold_a_failure_releases_without_a_separate_deactivation() {
         let _state = up_path::UP_PATH_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         up_path::reset_for_test();
@@ -18201,6 +18672,7 @@ mod tests {
     #[tokio::test]
     async fn a_create_that_fails_after_a_supersede_removes_its_udm_records() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
@@ -18894,6 +19366,7 @@ mod tests {
     #[tokio::test]
     async fn the_shutdown_terminates_pending_release_policies_and_counts_the_unlanded() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
@@ -19082,6 +19555,7 @@ mod tests {
     #[tokio::test]
     async fn a_sdm_notification_reports_se_ambr_ch_to_the_pcf_and_applies_the_answer() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         // The UDM reports 40/80 Mbps; the session holds 100/100.
         let (udm_srv, _seen) = spawn_recording_udm(sm_data_with("40 Mbps", "80 Mbps", 6)).await;
@@ -19165,6 +19639,7 @@ mod tests {
     #[tokio::test]
     async fn an_sdm_notification_that_changes_nothing_reports_nothing_to_the_pcf() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         // The UDM reports exactly what `seed_binding` already holds (100/100, 5QI 9).
         let (udm_srv, _seen) = spawn_recording_udm(sm_data_with("100 Mbps", "100 Mbps", 9)).await;
@@ -19215,6 +19690,7 @@ mod tests {
     #[tokio::test]
     async fn a_pcf_that_rejects_the_se_ambr_ch_report_leaves_the_session_as_authorised() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (udm_srv, _seen) = spawn_recording_udm(sm_data_with("40 Mbps", "80 Mbps", 6)).await;
         // The PCF refuses the re-authorisation.
@@ -19346,6 +19822,7 @@ mod tests {
     #[tokio::test]
     async fn the_establishment_transfer_carries_the_authorised_session_ambr() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
@@ -19489,6 +19966,7 @@ mod tests {
     #[tokio::test]
     async fn modify_with_only_an_n1_container_runs_the_release_procedure() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let reference = "n77-release";
         seed_binding(reference, 5);
 
@@ -19680,6 +20158,7 @@ mod tests {
     async fn modification_request_arms_t3591_and_complete_stops_it() {
         // #761: arms T3591 in GSM_PROCEDURE_TIMERS and seeds `policy_bindings`.
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let reference = "n77-modify";
         seed_binding(reference, 7);
 
@@ -19737,6 +20216,7 @@ mod tests {
     #[tokio::test]
     async fn n1_message_for_an_unknown_context_is_404_and_a_malformed_one_403() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         smf_context_init(64, 256, 512);
         let resp = handle_n1_sm_message(
             "n77-absent",
@@ -20089,6 +20569,7 @@ mod tests {
         // policy bindings), so it holds the ambient lock like every other reader and
         // writer (the #308 rule); `smf_context_init` checks that it is held.
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let reference = seed_registered_session("imsi-999700000540001", 1, "internet");
         let req = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts/x/modify").with_body(
             serde_json::json!({ "upCnxState": "DEACTIVATED" }).to_string(),
@@ -20158,6 +20639,7 @@ mod tests {
         use nextgcore_sbi::message::SbiResponse;
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _upf = pfcp_path::stand_in::unassociated_upf().await;
         smf_context_init(64, 256, 512);
@@ -20221,6 +20703,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_create_leaves_no_registered_sm_context() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _upf = pfcp_path::stand_in::unassociated_upf().await;
         smf_context_init(64, 256, 512);
         let supi = "imsi-001010000000086";
@@ -20398,6 +20881,7 @@ mod tests {
     #[tokio::test]
     async fn a_successful_create_registers_an_activated_session_and_its_binding() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = pfcp_path::stand_in::associated_upf().await;
         smf_context_init(64, 256, 512);
         let supi = "imsi-001010000000290";
@@ -20476,6 +20960,7 @@ mod tests {
     #[test]
     fn register_sm_context_returns_the_reference_that_resolves_to_it() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.blocking_lock();
+        let _seeded = crate::context::SeededState::track();
         smf_context_init(64, 256, 512);
         let ctx = smf_self();
         let context = ctx.read().expect("context");
@@ -20524,6 +21009,7 @@ mod tests {
     #[test]
     fn a_registered_session_resolves_by_the_reference_it_minted() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.blocking_lock();
+        let _seeded = crate::context::SeededState::track();
         smf_context_init(64, 256, 512);
         let ctx = smf_self();
         let context = ctx.read().expect("context");
@@ -20565,6 +21051,7 @@ mod tests {
     #[tokio::test]
     async fn the_retrieved_ue_eps_pdn_connection_carries_a_mapped_qci_not_the_raw_5qi() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         use base64::Engine as _;
 
         // Decode the QoS octet out of the container. Layout (#78, positional):
@@ -20631,6 +21118,7 @@ mod tests {
     #[tokio::test]
     async fn the_retrieved_ue_eps_pdn_connection_names_the_assigned_ebi() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         use base64::Engine as _;
 
         let without = seed_registered_session("imsi-001010000000123", 7, "internet");
@@ -21061,6 +21549,7 @@ mod tests {
     #[tokio::test]
     async fn retrieve_answers_200_with_ue_eps_pdn_connection() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let reference = seed_registered_session("imsi-001010000000078", 7, "internet");
 
         let resp = handle_sm_context_retrieve(&reference).await;
@@ -21140,6 +21629,7 @@ mod tests {
     #[tokio::test]
     async fn sm_context_errors_are_create_and_update_errors() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         smf_context_init(64, 256, 512);
         let post = |path: &str, body: &str| {
             SbiRequest::post(path).with_body(body.to_string(), "application/json")
@@ -21267,6 +21757,7 @@ mod tests {
     async fn a_failed_activation_answers_deactivated() {
         use base64::Engine as _;
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = pfcp_path::stand_in::associated_upf().await;
         smf_context_init(64, 256, 512);
         let setup_rsp = serde_json::json!({
@@ -21331,6 +21822,7 @@ mod tests {
     #[tokio::test]
     async fn an_nsacf_refusal_is_insufficient_resources_slice() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
@@ -21451,6 +21943,7 @@ mod tests {
     #[tokio::test]
     async fn update_rejects_an_unknown_ref_and_still_serves_a_known_one() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let reference = seed_registered_session("imsi-001010000000079", 9, "internet");
 
         let unknown = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts/nope-78/modify").with_body(
@@ -21490,6 +21983,7 @@ mod tests {
     #[tokio::test]
     async fn release_rejects_an_unknown_ref_and_parses_release_data() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let reference = seed_registered_session("imsi-001010000000080", 3, "internet");
 
         let unknown = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts/gone-78/release")
@@ -21559,6 +22053,7 @@ mod tests {
     #[tokio::test]
     async fn n2_handover_states_are_processed_not_refused() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let reference = seed_registered_session("imsi-001010000000081", 5, "internet");
         // #964: PREPARING builds the target's Handover Request Transfer from the
         // session's recorded UPF endpoint and policy binding.
@@ -21608,6 +22103,7 @@ mod tests {
     #[tokio::test]
     async fn a_handover_completed_after_a_deactivation_reactivates_onto_the_target() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = pfcp_path::stand_in::install_stand_in_upf().await;
         upf.client.associate().await.expect("association");
         let reference = seed_registered_session("imsi-001010000000805", 7, "internet");
@@ -21729,13 +22225,16 @@ mod tests {
     ///   Handover Command Transfer (`HANDOVER_CMD`) naming the target's forwarding tunnel
     ///   and the flow it accepted for forwarding; the target DL tunnel is recorded and
     ///   the UPF is not touched;
-    /// - `HANDOVER_RES_ALLOC_FAIL` is answered CANCELLED with a Handover Preparation
-    ///   Unsuccessful Transfer carrying the target's cause, and the session's DL is
+    /// - `HANDOVER_RES_ALLOC_FAIL` is answered with the step 4b SmContextUpdateError
+    ///   (403 `HANDOVER_RESOURCE_ALLOCATION_FAILURE`, #1203) with a
+    ///   Handover Preparation Unsuccessful Transfer carrying the target's cause, and the
+    ///   session's DL is
     ///   left alone (it used to be deactivated, cutting the source's downlink).
     #[tokio::test]
     async fn n2_handover_steps_answer_with_the_transfers_each_side_needs() {
         use nextgcore_ngap_gen::generated as g;
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let reference = seed_registered_session("imsi-001010000000964", 5, "internet");
         let ul = (0x0009_6400, [10, 45, 0, 96]);
         seed_user_plane(&reference, ul);
@@ -21870,10 +22369,20 @@ mod tests {
             ),
         )
         .await;
-        assert_eq!(resp.status, 200);
+        // #1203, TS 29.502 §5.2.2.3.4.2 step 4b: an SmContextUpdateError, not a 200.
+        assert_eq!(resp.status, 403);
         let (root, n2) = ho_answer(&resp);
-        assert_eq!(root["hoState"], "CANCELLED");
+        assert_eq!(root["error"]["status"], 403);
+        assert_eq!(
+            root["error"]["cause"],
+            "HANDOVER_RESOURCE_ALLOCATION_FAILURE"
+        );
+        assert!(
+            root.get("hoState").is_none(),
+            "not an SmContextUpdateError attribute (Table 6.1.6.2.36-1)"
+        );
         assert_eq!(root["n2SmInfoType"], "HANDOVER_PREP_FAIL");
+        assert_eq!(root["n2SmInfo"]["contentId"], "n2SmInfo");
         let unsuccessful = n2.expect("the Unsuccessful Transfer");
         let decoded = nextgcore_ngap_gen::decode_contained::<
             g::HandoverPreparationUnsuccessfulTransfer,
@@ -21896,6 +22405,73 @@ mod tests {
             sess.up_cnx_state,
             context::UpCnxState::Activated,
             "the source still serves the session"
+        );
+    }
+
+    /// #1203 strict peer, TS 29.502 §5.2.2.3.4.2 step 4b: amfd's real N2 handover client
+    /// (`call_smf_n2_handover_step`) sends this SMF's real SBI handler, over HTTP/2, the
+    /// target's Handover Resource Allocation Unsuccessful Transfer as PREPARED /
+    /// HANDOVER_RES_ALLOC_FAIL. What comes back is a refusal: a 403 SmContextUpdateError
+    /// whose cause is HANDOVER_RESOURCE_ALLOCATION_FAILURE, and whose multipart
+    /// `n2SmInfo` is a Handover Preparation Unsuccessful Transfer (TS 38.413
+    /// §9.3.4.18) carrying the target's cause. It was a 200 with `hoState: CANCELLED`.
+    #[tokio::test]
+    async fn the_amf_gets_the_step_4b_refusal_for_a_session_the_target_refused() {
+        use nextgcore_ngap_gen::generated as g;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let reference = seed_registered_session("imsi-001010000001203", 5, "internet");
+        seed_user_plane(&reference, (0x0012_0300, [10, 45, 12, 3]));
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        server
+            .start(smf_sbi_request_handler)
+            .await
+            .expect("the SMF serves");
+
+        let alloc_fail = nextgcore_ngap_gen::encode_contained(
+            &g::HandoverResourceAllocationUnsuccessfulTransfer {
+                cause: g::Cause::RadioNetwork(g::CauseRadioNetwork(
+                    g::CauseRadioNetwork::RADIO_RESOURCES_NOT_AVAILABLE,
+                )),
+                criticality_diagnostics: None,
+                ie_extensions: None,
+            },
+        )
+        .expect("encodes");
+        let answer = nextgcore_amfd::sbi_path::call_smf_n2_handover_step(
+            "127.0.0.1",
+            addr.port(),
+            &reference,
+            "PREPARED",
+            Some(("HANDOVER_RES_ALLOC_FAIL", &alloc_fail)),
+            None,
+            None,
+        )
+        .await;
+        let _ = server.stop().await;
+
+        let refusal = answer.expect_err("step 4b is an error response");
+        assert!(refusal.reason.contains("403"), "{refusal:?}");
+        assert!(
+            refusal
+                .reason
+                .contains("HANDOVER_RESOURCE_ALLOCATION_FAILURE"),
+            "{refusal:?}"
+        );
+        let transfer = refusal
+            .preparation_unsuccessful_transfer()
+            .expect("HANDOVER_PREP_FAIL n2SmInfo");
+        assert_eq!(
+            nextgcore_amfd::ngap_asn1::handover_preparation_unsuccessful_cause(transfer),
+            Some(nextgcore_ngap::types::Cause::RadioNetwork(
+                nextgcore_ngap::types::CauseRadioNetwork::RadioResourcesNotAvailable
+            )),
+            "the target's cause"
         );
     }
 
@@ -22033,6 +22609,7 @@ mod tests {
     #[tokio::test]
     async fn an_n2_handover_without_a_direct_path_forwards_through_the_upf() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         std::env::remove_var("SMF_N2_INDIRECT_FORWARDING");
         std::env::set_var("SMF_INDIRECT_FORWARDING_TIMER_MS", "400");
         let upf = pfcp_path::stand_in::install_stand_in_upf().await;
@@ -22172,6 +22749,7 @@ mod tests {
     #[tokio::test]
     async fn no_indirect_connectivity_is_data_forwarding_not_possible() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         std::env::set_var("SMF_N2_INDIRECT_FORWARDING", "off");
         let upf = pfcp_path::stand_in::install_stand_in_upf().await;
         upf.client.associate().await.expect("association");
@@ -22212,6 +22790,7 @@ mod tests {
     async fn a_upf_ignoring_the_choose_id_leaves_no_forwarding_behind() {
         use nextgcore_ngap_gen::generated as g;
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         std::env::remove_var("SMF_N2_INDIRECT_FORWARDING");
         let upf = pfcp_path::stand_in::install_stand_in_upf().await;
         upf.client.associate().await.expect("association");
@@ -22277,6 +22856,7 @@ mod tests {
     #[tokio::test]
     async fn an_amf_change_re_points_the_sm_context_status_uri() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let reference = seed_registered_session("imsi-001010000006862", 5, "internet");
         seed_user_plane(&reference, (0x0006_8620, [10, 45, 0, 68]));
         let new_uri =
@@ -22319,6 +22899,7 @@ mod tests {
     #[tokio::test]
     async fn a_handover_completed_without_a_target_endpoint_is_an_error() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let reference = seed_registered_session("imsi-001010000000082", 6, "internet");
         for body in [
             serde_json::json!({ "n2SmInfoType": "HANDOVER_COMPLETE", "hoState": "COMPLETED" }),
@@ -22350,6 +22931,7 @@ mod tests {
         // policy bindings), so it holds the ambient lock like every other reader and
         // writer (the #308 rule); `smf_context_init` checks that it is held.
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let reference = seed_registered_session("imsi-001010000000083", 4, "internet");
 
         // Retrieve
@@ -22430,6 +23012,7 @@ mod tests {
     #[tokio::test]
     async fn a_downlink_data_report_pages_the_ue_via_the_amf() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         // Drives production peer-call code against a loopback PLAINTEXT peer, i.e. a
         // dev-profile deployment. Declared rather than inherited: the default
         // `SbiProfile` is Production, which would refuse the plaintext connection and
@@ -22543,6 +23126,7 @@ mod tests {
     #[tokio::test]
     async fn a_downlink_data_report_for_an_active_connection_does_not_page() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         // Drives production peer-call code against a loopback PLAINTEXT peer, i.e. a
         // dev-profile deployment. Declared rather than inherited: the default
         // `SbiProfile` is Production, which would refuse the plaintext connection and
@@ -22844,6 +23428,7 @@ mod path_switch_ack_tests {
     #[tokio::test]
     async fn rebuilt_setup_transfers_carry_the_session_ambr_and_every_flow() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let r = crate::tests::seed_registered_session("imsi-001010000000992", 6, "internet");
         {
             let ctx = smf_self();
@@ -22930,6 +23515,66 @@ mod path_switch_ack_tests {
         }
     }
 
+    /// #1171 strict peer: the AMF reads the N2 SM information of this SMF's
+    /// SmContextUpdateError for a HANDOVER_REQUIRED it cannot prepare (TS 29.502
+    /// §5.2.2.3.4.2 step 2b). The real SM Context Update handler is served over
+    /// HTTP/2. amfd's `call_smf_n2_handover_step` gets the refusal, with the
+    /// multipart `n2SmInfo` decoding as a Handover Preparation Unsuccessful Transfer
+    /// (TS 38.413 §9.3.4.18) and its cause. The session has no UPF endpoint
+    /// recorded, so it cannot be handed over.
+    #[tokio::test]
+    async fn the_amf_reads_the_handover_preparation_refusal_of_this_smf() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        // #1200's census: the seeded UE goes with the test (main was red on it).
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let r = crate::tests::seed_registered_session("imsi-001010000001171", 5, "internet");
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        server
+            .start(smf_sbi_request_handler)
+            .await
+            .expect("the SMF serves");
+
+        let answer = nextgcore_amfd::sbi_path::call_smf_n2_handover_step(
+            "127.0.0.1",
+            addr.port(),
+            &r,
+            "PREPARING",
+            Some(("HANDOVER_REQUIRED", &[0x00])),
+            Some(&serde_json::json!({
+                "ranNodeId": {
+                    "plmnId": { "mcc": "001", "mnc": "01" },
+                    "gNbId": { "bitLength": 22, "gNBValue": "000001" },
+                },
+                "tai": { "plmnId": { "mcc": "001", "mnc": "01" }, "tac": "000001" },
+            })),
+            None,
+        )
+        .await;
+        let refusal = answer.expect_err("the SMF cannot prepare the session");
+        assert!(refusal.reason.contains("500"), "{refusal:?}");
+        let transfer = refusal
+            .preparation_unsuccessful_transfer()
+            .expect("HANDOVER_PREP_FAIL n2SmInfo");
+        assert_eq!(
+            nextgcore_amfd::ngap_asn1::handover_preparation_unsuccessful_cause(transfer),
+            Some(nextgcore_ngap::types::Cause::RadioNetwork(
+                nextgcore_ngap::types::CauseRadioNetwork::HoFailureInTarget5gcNgranNodeOrTargetSystem
+            ))
+        );
+
+        let _ = server.stop().await;
+        let ctx = smf_self();
+        let ctx = ctx.read().expect("ctx");
+        if let Some(sess) = ctx.sess_find_by_sm_context_ref(&r) {
+            ctx.sess_remove(sess.id);
+        }
+    }
+
     /// #1163: a Session-AMBR or a flow bit rate past TS 38.413 §9.3.1.4's
     /// 4000000000000 used to go out as an extension value of BitRate, and past
     /// `i64::MAX` neither decoder could read it back ("Invalid unconstrained
@@ -22939,6 +23584,7 @@ mod path_switch_ack_tests {
     async fn a_bit_rate_past_the_ngap_root_is_sent_as_its_maximum() {
         const MAX: u64 = 4_000_000_000_000;
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let r = crate::tests::seed_registered_session("imsi-001010000001163", 6, "internet");
         {
             let ctx = smf_self();
@@ -23024,6 +23670,7 @@ mod path_switch_ack_tests {
     #[tokio::test]
     async fn bearers_map_onto_setup_flows() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let r = crate::tests::seed_registered_session("imsi-001010000011471", 7, "internet");
         let mut binding = context::PolicyBinding::snapshot_default();
         binding.qfi = 5;
@@ -23091,6 +23738,7 @@ mod path_switch_ack_tests {
     #[tokio::test]
     async fn a_native_session_keeps_its_default_arp_on_rebuild() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let r = crate::tests::seed_registered_session("imsi-001010000011472", 8, "internet");
         let sess_id = smf_self()
             .read()
@@ -23130,6 +23778,7 @@ mod path_switch_ack_tests {
         };
         // #779 review m1: process-wide SMF context state, ambient lock first.
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let r = "act-518-ref";
         {
             let ctx = smf_self();

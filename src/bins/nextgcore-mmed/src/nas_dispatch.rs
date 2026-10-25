@@ -738,6 +738,9 @@ fn emm_attach_complete(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, body: &
     forward_to_esm(ctx, enb_ue, mme_ue_id, &esm_message);
 
     modify_bearer_after_attach(ctx, enb_ue.id, mme_ue_id);
+
+    // #641, TS 23.401 Annex F NOTE 2: dedicated bearers held for the Attach.
+    crate::bearer_activation::on_attach_complete(ctx, mme_ue_id);
 }
 
 /// TS 23.401 §5.3.2.1 step 23: once BOTH the Initial Context Setup Response (step
@@ -1187,10 +1190,13 @@ fn emm_tau_request(
         mme_ue.paging.type_ = crate::context::PagingType::None;
         // #984 review: a paging for a deactivation parked behind it (#862)
         // needs the user plane too: its steps 4c-8 run on the ICS response.
+        // #1216 review M2: so does an activation parked behind it (#641): its
+        // E-RAB SETUP follows the ICS response (`bearer_activation::on_connected`).
         matches!(
             was,
             crate::context::PagingType::DownlinkDataNotification
                 | crate::context::PagingType::DeleteBearer
+                | crate::context::PagingType::CreateBearer
         )
     } else {
         false
@@ -2181,11 +2187,15 @@ pub fn handle_esm_message(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue: &MmeUe, esm:
             match esm_handler::handle_activate_dedicated_bearer_context_accept(
                 enb_ue, mme_ue, &sess, &bearer, body,
             ) {
-                Ok(()) => log::info!(
-                    "[{}] Dedicated EPS bearer (ebi={}) activated by the UE",
-                    mme_ue.imsi_bcd,
-                    bearer.ebi
-                ),
+                Ok(()) => {
+                    log::info!(
+                        "[{}] Dedicated EPS bearer (ebi={}) activated by the UE",
+                        mme_ue.imsi_bcd,
+                        bearer.ebi
+                    );
+                    // #641, TS 23.401 §5.4.1 step 7.
+                    crate::bearer_activation::on_accept(ctx, mme_ue.id, bearer.ebi);
+                }
                 Err(e) => log::warn!(
                     "[{}] Activate Dedicated accept rejected: {e}",
                     mme_ue.imsi_bcd
@@ -2196,10 +2206,14 @@ pub fn handle_esm_message(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue: &MmeUe, esm:
             match esm_handler::handle_activate_dedicated_bearer_context_reject(
                 enb_ue, mme_ue, &sess, &bearer, body,
             ) {
-                Ok(cause) => log::warn!(
-                    "[{}] Dedicated EPS bearer rejected by the UE: {cause:?}",
-                    mme_ue.imsi_bcd
-                ),
+                Ok(cause) => {
+                    log::warn!(
+                        "[{}] Dedicated EPS bearer rejected by the UE: {cause:?}",
+                        mme_ue.imsi_bcd
+                    );
+                    // #641, TS 24.301 §6.4.2.5.
+                    crate::bearer_activation::on_reject(ctx, mme_ue.id, bearer.ebi);
+                }
                 Err(e) => log::warn!(
                     "[{}] Activate Dedicated reject malformed: {e}",
                     mme_ue.imsi_bcd

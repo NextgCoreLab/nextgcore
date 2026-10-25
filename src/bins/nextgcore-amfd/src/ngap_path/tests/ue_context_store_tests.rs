@@ -1617,3 +1617,121 @@ fn the_restored_downlink_count_is_estimated_right_by_any_ue() {
         "254 is a replay to a windowed UE"
     );
 }
+
+/// **#1210, TS 23.501 §5.21.2.3.** "When there is a transaction with the UE, the new AMF
+/// updates the peer NFs ... with the new AMF information". Besides the UECM registration
+/// and the SMFs, the AMF that took the UE over:
+/// - subscribes to the UE's SDM data under its own, absolute `callbackReference`
+///   (TS 23.502 §4.2.2.2.2 step 14c), AFTER the UECM registration, then removes the old
+///   AMF's subscription (TS 29.503 §5.2.2.4.2), and keeps the new subscription's id;
+/// - updates the PCF's AM policy association with its `notificationUri` and GUAMI
+///   (TS 29.507 §4.2.3.1);
+/// - updates the UE policy association with its `notificationUri`, GUAMI and
+///   `servingNfId` (TS 29.525 §4.2.3.1).
+///
+/// REVERT-VERIFIED: without the SDM re-subscription, or without either policy update,
+/// the request it asserts never reaches the stand-in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_takeover_points_the_sdm_subscription_and_the_policy_associations_at_the_new_amf() {
+    let (_smf, port, _seen) = fake_activating_smf().await;
+    let (_selected, selected_port, _selected_seen) = fake_activating_smf().await;
+    let (_udm, udm_port, udm_seen) = fake_activating_smf().await;
+    let (_pcf, pcf_port, pcf_seen) = fake_activating_smf().await;
+    let _env = SmfEnvGuard::acquire(selected_port).await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    let backend = Arc::new(MemoryBackend::default());
+    let (old_id, tmsi) = (12_100_901u64, 0x1210_0901u32);
+    let supi = "imsi-001010001210901";
+
+    let mut failed = storing_server(&backend).await;
+    seed_registered_ue(&mut failed, old_id, tmsi, supi, "ref-1210-t", port, false);
+    failed.ue_auth_state.with_mut(old_id, |s| {
+        s.amf_ue.policy_association.id = Some("am-pol-1210".to_string());
+        s.policy_association_id = Some("am-pol-1210".to_string());
+        s.amf_ue.ue_policy_association.id = Some("ue-pol-1210".to_string());
+        s.ue_policy_association_id = Some("ue-pol-1210".to_string());
+    });
+    let original = failed.ue_auth_state.get(old_id).expect("seeded");
+    let old_sdm = original
+        .sdm_subscription_id
+        .clone()
+        .expect("seeded with one");
+    store_now(&mut failed).await;
+    crash(&mut failed, old_id);
+    drop(failed);
+    let backend = only(&backend, supi);
+    stored_by(&backend, supi, DEAD_AMF);
+
+    let mut peer = set_peer_server(&backend).await;
+    peer.udm_override = Some(("127.0.0.1".to_string(), udm_port));
+    peer.pcf_override = Some(("127.0.0.1".to_string(), pcf_port));
+    peer.sent_ngap = Some(Vec::new());
+    let nas = protected_idle_service_request(&original.amf_ue, tmsi, original.amf_ue.ul_count + 1);
+    peer.handle_initial_ue_message(1, &service_request_initial_ue(nas))
+        .await
+        .expect("handled");
+    for _ in 0..3 {
+        settle_offloaded_sbi(&mut peer).await;
+    }
+    let instance = nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf);
+
+    let udm = udm_seen.lock().unwrap().clone();
+    let at = |suffix: &str| udm.iter().position(|(uri, _)| uri.ends_with(suffix));
+    let uecm = at(&format!(
+        "/nudm-uecm/v1/{supi}/registrations/amf-3gpp-access"
+    ))
+    .unwrap_or_else(|| panic!("UECM registration: {udm:?}"));
+    let subscribe = at(&format!("/nudm-sdm/v2/{supi}/sdm-subscriptions"))
+        .unwrap_or_else(|| panic!("an SDM subscription of this AMF: {udm:?}"));
+    let unsubscribe = at(&format!("/nudm-sdm/v2/{supi}/sdm-subscriptions/{old_sdm}"))
+        .unwrap_or_else(|| panic!("the old AMF's SDM subscription is removed: {udm:?}"));
+    assert!(
+        uecm < subscribe && subscribe < unsubscribe,
+        "registered, then subscribed, then the old subscription removed: {udm:?}"
+    );
+    let sub: serde_json::Value = serde_json::from_str(&udm[subscribe].1).expect("json");
+    assert_eq!(sub["nfInstanceId"], instance);
+    assert_eq!(
+        sub["callbackReference"],
+        crate::sbi_path::sdm_callback_reference(supi)
+    );
+    assert!(
+        sub["callbackReference"]
+            .as_str()
+            .is_some_and(|c| c.starts_with("http")),
+        "absolute: {sub}"
+    );
+    let (_, ue) = peer.ue_auth_state.find_by_supi(supi).expect("taken over");
+    assert_eq!(
+        ue.sdm_subscription_id.as_deref(),
+        Some("1"),
+        "the stand-in's subscription id replaces the old AMF's"
+    );
+
+    let pcf = pcf_seen.lock().unwrap().clone();
+    let body_of = |suffix: &str| -> serde_json::Value {
+        let (_, body) = pcf
+            .iter()
+            .find(|(uri, _)| uri.ends_with(suffix))
+            .unwrap_or_else(|| panic!("{suffix} at the PCF: {pcf:?}"));
+        serde_json::from_str(body).expect("json")
+    };
+    let am = body_of("/npcf-am-policy-control/v1/policies/am-pol-1210/update");
+    assert_eq!(
+        am["notificationUri"],
+        crate::sbi_path::am_policy_notification_uri(supi)
+    );
+    assert_eq!(
+        am["guami"]["amfId"], "02556b",
+        "this AMF's GUAMI (pointer 0x2B)"
+    );
+    let uep = body_of("/npcf-ue-policy-control/v1/policies/ue-pol-1210/update");
+    assert_eq!(
+        uep["notificationUri"],
+        crate::sbi_path::ue_policy_notification_uri(supi)
+    );
+    assert_eq!(uep["guami"]["amfId"], "02556b");
+    assert_eq!(uep["servingNfId"], instance);
+    let (id, _) = peer.ue_auth_state.find_by_supi(supi).expect("taken over");
+    crash(&mut peer, id);
+}

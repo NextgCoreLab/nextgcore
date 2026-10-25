@@ -321,7 +321,11 @@ pub(crate) fn bearer_qos(bearer: &MmeBearer) -> Gtp2BearerQosIe {
 
 /// An F-TEID carrying whichever address families `ip` has (#948, TS 29.274
 /// §8.22: IPv4, IPv6 or both), or `None` without an address.
-fn fteid_of(interface_type: u8, teid: u32, ip: &crate::context::IpAddr) -> Option<Gtp2FTeidIe> {
+pub(crate) fn fteid_of(
+    interface_type: u8,
+    teid: u32,
+    ip: &crate::context::IpAddr,
+) -> Option<Gtp2FTeidIe> {
     match (ip.ipv4, ip.ipv6) {
         (Some(v4), Some(v6)) => Some(Gtp2FTeidIe::new_dual(interface_type, teid, v4, v6)),
         (Some(v4), None) => Some(Gtp2FTeidIe::new_ipv4(interface_type, teid, v4)),
