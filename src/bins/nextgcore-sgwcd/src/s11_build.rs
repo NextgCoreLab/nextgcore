@@ -217,7 +217,7 @@ pub fn build_create_session_response(
             f_teid_interface::S5_S8_PGW_GTP_C,
             sess.pgw_s5c_teid,
             sess.pgw_addr,
-            None,
+            sess.pgw_addr6,
         ) {
             msg.add_ie(pgw_fteid.to_ie(1));
         }
@@ -991,6 +991,29 @@ mod tests {
             Some([10, 99, 0, 2]),
             "the builder re-reads the global slot, so a write after provision() is what \
              the message carries -- this is the impurity that made the round trip flake"
+        );
+    }
+
+    /// #1208: the S11 Create Session Response's PGW S5/S8-C F-TEID (instance 1)
+    /// carries the PGW's IPv6 address too, as the PGW gave it.
+    #[test]
+    fn the_pgw_s5c_fteid_to_the_mme_keeps_the_pgws_ipv6_address() {
+        let ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let (_, mut sess) = provision(&ambient, &[0x11, 0x11, 0x11, 0x11, 0x11, 0x12, 0x08]);
+        sess.pgw_s5c_teid = 0x5c5c;
+        sess.pgw_addr = Some(Ipv4Addr::new(10, 0, 0, 3));
+        sess.pgw_addr6 = Some("2001:db8::3".parse().unwrap());
+        let msg = build_create_session_response(&sess, 0x1208, 7).unwrap();
+        let ie = round_trip(&msg)
+            .get_ie(Gtp2IeType::FTeid as u8, 1)
+            .expect("the PGW S5/S8-C F-TEID")
+            .clone();
+        let ft = Gtp2FTeidIe::decode(&ie.value).unwrap();
+        assert_eq!(ft.teid, 0x5c5c);
+        assert_eq!(ft.ipv4_addr, Some([10, 0, 0, 3]));
+        assert_eq!(
+            ft.ipv6_addr,
+            Some("2001:db8::3".parse::<Ipv6Addr>().unwrap().octets())
         );
     }
 
