@@ -7,6 +7,7 @@
 
 pub mod config;
 pub mod context;
+pub mod dedicated_bearer;
 pub mod event;
 pub mod gtp_path;
 pub mod pfcp_path;
