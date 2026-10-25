@@ -165,6 +165,18 @@ pub struct CellMeasurement {
     /// or an NRPPa E-CID report whose serving cell is an E-UTRA CGI). It decides
     /// whether an E-CID fix is reported as `ECID` or `NR_ECID` (TS 29.572, #715).
     pub eutra: bool,
+    /// The NR E-CID report values of an NRPPa E-CID report (NR-TADV, UE Rx-Tx Time
+    /// Difference, SS/CSI RSRP and RSRQ, AoA NR; TS 38.455 §9.2.5), as reported
+    /// (#859). Their mappings to physical quantities (TS 38.133, TS 38.215) are not
+    /// implemented, so the solver does not read them. `None` when none was reported.
+    pub nr_ecid: Option<crate::nrppa_uplink::NrEcidReport>,
+}
+
+/// #859: the Value Timing Advance NR a gNB reported among `cells`, which has no
+/// mapping yet (TS 38.133). The NRPPa cell can be anywhere in a joint session's
+/// measurements (the LPP leg often comes first), so every cell is looked at.
+fn unmapped_nr_tadv(cells: &[CellMeasurement]) -> Option<u16> {
+    cells.iter().find_map(|c| c.nr_ecid.as_ref()?.nr_tadv)
 }
 
 /// Positioning QoS requirements
@@ -795,6 +807,7 @@ impl LmfContext {
         // Build the registry snapshot while holding only the cell_registry read
         // lock; drop it before acquiring the write locks below to avoid deadlock.
         let registry = self.build_trp_registry();
+        let unmapped_nr_tadv = unmapped_nr_tadv(&cell_measurements);
 
         // Scope the store locks so the session completion below runs lock-free.
         let strict_fix = {
@@ -830,10 +843,19 @@ impl LmfContext {
                 location.longitude,
                 location.horizontal_accuracy
             ),
-            None => log::info!(
-                "Measurement report processed: id={request_id} — no location fix solvable \
-                 (empty TRP registry or no solvable measurement set); reporting no fix"
-            ),
+            None => {
+                log::info!(
+                    "Measurement report processed: id={request_id} — no location fix solvable \
+                     (empty TRP registry or no solvable measurement set); reporting no fix"
+                );
+                if let Some(v) = unmapped_nr_tadv {
+                    log::warn!(
+                        "Measurement report {request_id}: the gNB reported Value Timing Advance \
+                         NR {v} (TS 38.455 §9.2.5), but its report mapping (TS 38.133) is not \
+                         implemented, so it gives no E-CID timing term (#859)"
+                    );
+                }
+            }
         }
 
         // A2: complete a pending DetermineLocation session (if any) with the
@@ -2664,6 +2686,7 @@ mod tests {
 
         // Submit report
         let cells = vec![CellMeasurement {
+            nr_ecid: None,
             nr_cgi: "001-01-0001-01".to_string(),
             rsrp: Some(-80),
             rsrq: Some(-10),
@@ -2713,6 +2736,7 @@ mod tests {
 
         let cells = vec![
             CellMeasurement {
+                nr_ecid: None,
                 nr_cgi: "001-01-0002-01".to_string(),
                 rsrp: Some(-75),
                 rsrq: Some(-8),
@@ -2730,6 +2754,7 @@ mod tests {
                 eutra: false,
             },
             CellMeasurement {
+                nr_ecid: None,
                 nr_cgi: "001-01-0002-02".to_string(),
                 rsrp: Some(-85),
                 rsrq: Some(-12),
@@ -2855,6 +2880,7 @@ mod tests {
         // Empty registry -> placeholder path (lat/lon 0.0, coarse accuracy).
         let registry = TrpRegistry::from_entries(std::iter::empty());
         let cells = vec![CellMeasurement {
+            nr_ecid: None,
             nr_cgi: "test-cell".to_string(),
             rsrp: Some(-70),
             rsrq: None,
@@ -2882,6 +2908,7 @@ mod tests {
         // Empty registry -> placeholder path.
         let registry = TrpRegistry::from_entries(std::iter::empty());
         let cells = vec![CellMeasurement {
+            nr_ecid: None,
             nr_cgi: "test-cell".to_string(),
             rsrp: None,
             rsrq: None,
@@ -3012,6 +3039,7 @@ mod tests_real_solve {
                 // rtt_ns is round-trip; rtt_ns_to_range_m divides by 2.
                 let rtt_ns = (range_m * 2.0 / SPEED_OF_LIGHT_M_S * 1e9) as u64;
                 CellMeasurement {
+                    nr_ecid: None,
                     nr_cgi: id.clone(),
                     rsrp: Some(-80),
                     rsrq: Some(-10),
@@ -3057,6 +3085,7 @@ mod tests_real_solve {
                 let range_m = exact_range_m(*coord, true_enu, origin);
                 let rstd_ns = (range_m - ref_range) / SPEED_OF_LIGHT_M_S * 1e9;
                 CellMeasurement {
+                    nr_ecid: None,
                     nr_cgi: id.clone(),
                     rsrp: Some(-80),
                     rsrq: None,
@@ -3102,6 +3131,7 @@ mod tests_real_solve {
         let cell_a_coord = entries.iter().find(|(id, _)| id == "cell-a").unwrap().1;
         let ta = 50u32;
         let cells = vec![CellMeasurement {
+            nr_ecid: None,
             nr_cgi: "cell-a".to_string(),
             rsrp: Some(-75),
             rsrq: Some(-8),
@@ -3152,6 +3182,7 @@ mod tests_real_solve {
                 let dn = true_enu.n - p.n;
                 let azimuth_deg = de.atan2(dn).to_degrees();
                 CellMeasurement {
+                    nr_ecid: None,
                     nr_cgi: id.clone(),
                     rsrp: Some(-80),
                     rsrq: Some(-10),
@@ -3195,6 +3226,7 @@ mod tests_real_solve {
                 let p = geodetic_to_enu(*coord, origin);
                 let azimuth_deg = (true_enu.e - p.e).atan2(true_enu.n - p.n).to_degrees();
                 CellMeasurement {
+                    nr_ecid: None,
                     nr_cgi: id.clone(),
                     rsrp: Some(-80),
                     rsrq: None,
@@ -3227,6 +3259,7 @@ mod tests_real_solve {
     fn test_empty_registry_placeholder_fallback() {
         let registry = TrpRegistry::from_entries(std::iter::empty());
         let cells = vec![CellMeasurement {
+            nr_ecid: None,
             nr_cgi: "cell-x".to_string(),
             rsrp: Some(-80),
             rsrq: None,
@@ -3276,6 +3309,7 @@ mod tests_real_solve {
             req.request_id,
         );
         let cells = vec![CellMeasurement {
+            nr_ecid: None,
             nr_cgi: "cell-a".to_string(),
             rsrp: Some(-75),
             rsrq: Some(-8),
@@ -3450,6 +3484,7 @@ mod tests_real_solve {
             .unwrap();
         let (corr, mut rx) = ctx.positioning_session_register(None, 11, req.request_id);
         let cells = vec![CellMeasurement {
+            nr_ecid: None,
             nr_cgi: "unregistered-cell".to_string(),
             rsrp: Some(-80),
             rsrq: None,
@@ -3571,6 +3606,7 @@ mod tests_multi_rtt_two_sided {
     fn gnb_report() -> Vec<CellMeasurement> {
         TRPS.iter()
             .map(|(pci, e, n)| CellMeasurement {
+                nr_ecid: None,
                 nr_cgi: format!("pci-{pci}"),
                 rsrp: None,
                 rsrq: None,
@@ -4032,6 +4068,7 @@ mod tests_dl_tdoa_reference {
         // to a reference (DL-PRS 7) no other report names, so it shares no TRP with A.
         let mut cells = report_with(0, &[1, 2], 1);
         cells.push(CellMeasurement {
+            nr_ecid: None,
             nr_cgi: "pci-4".into(),
             rsrp: None,
             rsrq: None,
@@ -4124,6 +4161,7 @@ mod tests_ecid_label {
 
     fn serving(eutra: bool) -> CellMeasurement {
         CellMeasurement {
+            nr_ecid: None,
             nr_cgi: "cell-1".into(),
             rsrp: Some(-80),
             rsrq: None,
@@ -4318,6 +4356,7 @@ mod tests_session_legs {
 
     fn cell(rsrp: Option<i16>, ta: Option<u32>) -> CellMeasurement {
         CellMeasurement {
+            nr_ecid: None,
             nr_cgi: "pci-77".to_string(),
             rsrp,
             rsrq: None,
@@ -4465,6 +4504,7 @@ mod tests_multi_rtt_shared_pci {
 
     fn half(prs: Option<u8>, ue: Option<f64>, gnb: Option<f64>) -> CellMeasurement {
         CellMeasurement {
+            nr_ecid: None,
             nr_cgi: "pci-201".into(),
             rsrp: None,
             rsrq: None,
@@ -4523,6 +4563,7 @@ mod tests_multi_rtt_aliasing {
 
     fn half(key: &str, prs: Option<u8>, ue: Option<f64>, gnb: Option<f64>) -> CellMeasurement {
         CellMeasurement {
+            nr_ecid: None,
             nr_cgi: key.into(),
             rsrp: None,
             rsrq: None,
@@ -4616,6 +4657,7 @@ mod tests_session_bounds {
 
     fn cell(eutra: bool, ta: Option<f64>) -> CellMeasurement {
         CellMeasurement {
+            nr_ecid: None,
             nr_cgi: "pci-7".to_string(),
             rsrp: Some(-80),
             rsrq: None,
@@ -4728,6 +4770,37 @@ mod tests_session_bounds {
             .get(&corr)
             .map(|s| s.accumulated.len());
         assert_eq!(held, Some(MAX_SESSION_MEASUREMENTS));
+    }
+
+    /// #859 review: the unmapped NR-TADV is found wherever the NRPPa cell sits; in a
+    /// joint session the LPP NR E-CID cell, which has no `nr_ecid`, comes first.
+    #[test]
+    fn the_unmapped_nr_tadv_is_found_behind_an_lpp_cell() {
+        let cell = |nr_ecid: Option<crate::nrppa_uplink::NrEcidReport>| CellMeasurement {
+            nr_ecid,
+            nr_cgi: "pci-7".into(),
+            rsrp: Some(-80),
+            rsrq: None,
+            timing_advance: None,
+            ecid_rtt_ns: None,
+            ecid_rtt_width_ns: None,
+            aoa: None,
+            rtt_ns: None,
+            rstd_ns: None,
+            rstd_reference: None,
+            ue_rx_tx_ns: None,
+            gnb_rx_tx_ns: None,
+            meas_time: None,
+            dl_prs_id: None,
+            eutra: false,
+        };
+        let nrppa = cell(Some(crate::nrppa_uplink::NrEcidReport {
+            nr_tadv: Some(321),
+            ..Default::default()
+        }));
+        assert_eq!(unmapped_nr_tadv(&[cell(None), nrppa.clone()]), Some(321));
+        assert_eq!(unmapped_nr_tadv(&[nrppa]), Some(321));
+        assert_eq!(unmapped_nr_tadv(&[cell(None)]), None);
     }
 
     /// A session older than the reap age goes, with its measurement-store entry;

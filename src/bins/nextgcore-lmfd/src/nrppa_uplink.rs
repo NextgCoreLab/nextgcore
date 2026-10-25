@@ -193,7 +193,111 @@ fn tadv_ns(v: u16) -> Option<(f64, f64)> {
     crate::positioning::eutra_time_report_to_ns(u32::from(v), crate::positioning::EUTRA_TADV_MAX)
 }
 
+/// One NR cell of a Result SS-RSRP / SS-RSRQ / CSI-RSRP / CSI-RSRQ list (TS 38.455
+/// §9.2.5): its PCI, NR-ARFCN and cell-level report value (0..127), when given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NrCellResult {
+    pub pci: u16,
+    pub arfcn: u32,
+    pub value: Option<u8>,
+}
+
+/// The NR E-CID quantities a gNB reports in the Measured Results extension IEs (TS
+/// 38.455 §9.2.5, Rel-16/17 `MeasuredResultsValue` choice-Extension), held as the
+/// report values they are on the wire (#859).
+///
+/// They are not physical quantities. Each one's meaning is a report mapping in TS
+/// 38.133 (Value Timing Advance NR, RSRP/RSRQ, AoA) or TS 38.215 (UE Rx-Tx Time
+/// Difference), and neither spec is in this tree's vendored set. So none of them
+/// feeds the solver yet: an NR E-CID fix still needs a timing term, which NR-TADV
+/// would give once its mapping is implemented.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NrEcidReport {
+    /// Value Timing Advance NR, `NR-TADV ::= INTEGER (0..7690)` (id 94).
+    pub nr_tadv: Option<u16>,
+    /// Value UE Rx-Tx Time Difference, `INTEGER (0..61565)` (id 118).
+    pub ue_rx_tx_time_diff: Option<u16>,
+    /// Result SS-RSRP (id 32), cell level.
+    pub ss_rsrp: Vec<NrCellResult>,
+    /// Result SS-RSRQ (id 33), cell level.
+    pub ss_rsrq: Vec<NrCellResult>,
+    /// Result CSI-RSRP (id 34), cell level.
+    pub csi_rsrp: Vec<NrCellResult>,
+    /// Result CSI-RSRQ (id 35), cell level.
+    pub csi_rsrq: Vec<NrCellResult>,
+    /// Angle of Arrival NR (id 36, UL AoA §9.2.38): azimuth 0..3599, zenith 0..1799.
+    pub aoa_nr: Option<(u16, Option<u16>)>,
+}
+
+impl NrEcidReport {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Take one Measured Results extension. As for the E-UTRA arms, the first value
+    /// of a quantity wins; the lists are kept as reported.
+    fn note(&mut self, value: &nrppa::MeasuredResultsValue_choice_ExtensionValue) {
+        use nrppa::MeasuredResultsValue_choice_ExtensionValue as X;
+        match value {
+            X::Id_NR_TADV(v) => {
+                self.nr_tadv.get_or_insert(v.0);
+            }
+            X::Id_UE_Rx_Tx_Time_Diff(v) => {
+                self.ue_rx_tx_time_diff.get_or_insert(v.0);
+            }
+            X::Id_ResultSS_RSRP(l) if self.ss_rsrp.is_empty() => {
+                self.ss_rsrp =
+                    l.0.iter()
+                        .map(|i| NrCellResult {
+                            pci: i.nr_pci.0,
+                            arfcn: i.nr_arfcn.0,
+                            value: i.value_ss_rsrp_cell.as_ref().map(|v| v.0),
+                        })
+                        .collect();
+            }
+            X::Id_ResultSS_RSRQ(l) if self.ss_rsrq.is_empty() => {
+                self.ss_rsrq =
+                    l.0.iter()
+                        .map(|i| NrCellResult {
+                            pci: i.nr_pci.0,
+                            arfcn: i.nr_arfcn.0,
+                            value: i.value_ss_rsrq_cell.as_ref().map(|v| v.0),
+                        })
+                        .collect();
+            }
+            X::Id_ResultCSI_RSRP(l) if self.csi_rsrp.is_empty() => {
+                self.csi_rsrp =
+                    l.0.iter()
+                        .map(|i| NrCellResult {
+                            pci: i.nr_pci.0,
+                            arfcn: i.nr_arfcn.0,
+                            value: i.value_csi_rsrp_cell.as_ref().map(|v| v.0),
+                        })
+                        .collect();
+            }
+            X::Id_ResultCSI_RSRQ(l) if self.csi_rsrq.is_empty() => {
+                self.csi_rsrq =
+                    l.0.iter()
+                        .map(|i| NrCellResult {
+                            pci: i.nr_pci.0,
+                            arfcn: i.nr_arfcn.0,
+                            value: i.value_csi_rsrq_cell.as_ref().map(|v| v.0),
+                        })
+                        .collect();
+            }
+            X::Id_AngleOfArrivalNR(a) => {
+                self.aoa_nr
+                    .get_or_insert((a.azimuth_ao_a.0, a.zenith_ao_a.as_ref().map(|z| z.0)));
+            }
+            // Repeated lists after the first, and the per-TRP AoA (id 167), which
+            // names TRPs rather than the serving cell.
+            _ => {}
+        }
+    }
+}
+
 fn to_cell(result: &nrppa::E_CID_MeasurementResult) -> CellMeasurement {
+    let mut nr = NrEcidReport::default();
     let mut rsrp: Option<i16> = None;
     let mut rsrq: Option<i16> = None;
     let mut tadv1: Option<(f64, f64)> = None;
@@ -228,10 +332,10 @@ fn to_cell(result: &nrppa::E_CID_MeasurementResult) -> CellMeasurement {
                         rsrq.get_or_insert(i16::from(best));
                     }
                 }
-                // NR measurement extensions (AoA-NR etc.) carry no field the
-                // E-CID solver reads; the pre-#515 decoder refused the whole
-                // report on them.
-                M::Choice_Extension(_) => {}
+                // #859: the NR quantities, kept as report values (see
+                // `NrEcidReport`). The pre-#515 decoder refused the whole report
+                // on them.
+                M::Choice_Extension(ext) => nr.note(&ext.value),
             }
         }
     }
@@ -258,6 +362,7 @@ fn to_cell(result: &nrppa::E_CID_MeasurementResult) -> CellMeasurement {
             result.serving_cell_id.ng_ra_ncell,
             nrppa::NG_RANCell::EUTRA_CellID(_)
         ),
+        nr_ecid: (!nr.is_empty()).then_some(nr),
     }
 }
 
@@ -421,6 +526,134 @@ pub mod test_support {
     pub fn aoa(v: u16) -> nrppa::MeasuredResultsValue {
         nrppa::MeasuredResultsValue::ValueAngleOfArrival_EUTRA(
             nrppa::MeasuredResultsValue_valueAngleOfArrival_EUTRA(v),
+        )
+    }
+
+    /// A Measured Results extension IE (TS 38.455 §9.2.5), criticality ignore as the
+    /// ASN.1 object set has it.
+    pub fn nr_ext(
+        id: u16,
+        value: nrppa::MeasuredResultsValue_choice_ExtensionValue,
+    ) -> nrppa::MeasuredResultsValue {
+        nrppa::MeasuredResultsValue::Choice_Extension(
+            nrppa::MeasuredResultsValue_choice_Extension {
+                id: nrppa::ProtocolIE_ID(id),
+                criticality: nrppa::Criticality(super::IGNORE),
+                value,
+            },
+        )
+    }
+
+    pub fn nr_tadv(v: u16) -> nrppa::MeasuredResultsValue {
+        nr_ext(
+            94,
+            nrppa::MeasuredResultsValue_choice_ExtensionValue::Id_NR_TADV(nrppa::NR_TADV(v)),
+        )
+    }
+
+    pub fn ue_rx_tx(v: u16) -> nrppa::MeasuredResultsValue {
+        nr_ext(
+            118,
+            nrppa::MeasuredResultsValue_choice_ExtensionValue::Id_UE_Rx_Tx_Time_Diff(
+                nrppa::UE_Rx_Tx_Time_Diff(v),
+            ),
+        )
+    }
+
+    /// Result SS-RSRP with one item per `(pci, arfcn, cell value)`.
+    pub fn ss_rsrp(items: &[(u16, u32, Option<u8>)]) -> nrppa::MeasuredResultsValue {
+        nr_ext(
+            32,
+            nrppa::MeasuredResultsValue_choice_ExtensionValue::Id_ResultSS_RSRP(
+                nrppa::ResultSS_RSRP(
+                    items
+                        .iter()
+                        .map(|(pci, arfcn, v)| nrppa::ResultSS_RSRP_Item {
+                            nr_pci: nrppa::NR_PCI(*pci),
+                            nr_arfcn: nrppa::NR_ARFCN(*arfcn),
+                            cgi_nr: None,
+                            value_ss_rsrp_cell: v.map(nrppa::ValueRSRP_NR),
+                            ss_rsrp_per_ssb: None,
+                            ie_extensions: None,
+                        })
+                        .collect(),
+                ),
+            ),
+        )
+    }
+
+    pub fn ss_rsrq(items: &[(u16, u32, Option<u8>)]) -> nrppa::MeasuredResultsValue {
+        nr_ext(
+            33,
+            nrppa::MeasuredResultsValue_choice_ExtensionValue::Id_ResultSS_RSRQ(
+                nrppa::ResultSS_RSRQ(
+                    items
+                        .iter()
+                        .map(|(pci, arfcn, v)| nrppa::ResultSS_RSRQ_Item {
+                            nr_pci: nrppa::NR_PCI(*pci),
+                            nr_arfcn: nrppa::NR_ARFCN(*arfcn),
+                            cgi_nr: None,
+                            value_ss_rsrq_cell: v.map(nrppa::ValueRSRQ_NR),
+                            ss_rsrq_per_ssb: None,
+                            ie_extensions: None,
+                        })
+                        .collect(),
+                ),
+            ),
+        )
+    }
+
+    pub fn csi_rsrp(items: &[(u16, u32, Option<u8>)]) -> nrppa::MeasuredResultsValue {
+        nr_ext(
+            34,
+            nrppa::MeasuredResultsValue_choice_ExtensionValue::Id_ResultCSI_RSRP(
+                nrppa::ResultCSI_RSRP(
+                    items
+                        .iter()
+                        .map(|(pci, arfcn, v)| nrppa::ResultCSI_RSRP_Item {
+                            nr_pci: nrppa::NR_PCI(*pci),
+                            nr_arfcn: nrppa::NR_ARFCN(*arfcn),
+                            cgi_nr: None,
+                            value_csi_rsrp_cell: v.map(nrppa::ValueRSRP_NR),
+                            csi_rsrp_per_csi_rs: None,
+                            ie_extensions: None,
+                        })
+                        .collect(),
+                ),
+            ),
+        )
+    }
+
+    pub fn csi_rsrq(items: &[(u16, u32, Option<u8>)]) -> nrppa::MeasuredResultsValue {
+        nr_ext(
+            35,
+            nrppa::MeasuredResultsValue_choice_ExtensionValue::Id_ResultCSI_RSRQ(
+                nrppa::ResultCSI_RSRQ(
+                    items
+                        .iter()
+                        .map(|(pci, arfcn, v)| nrppa::ResultCSI_RSRQ_Item {
+                            nr_pci: nrppa::NR_PCI(*pci),
+                            nr_arfcn: nrppa::NR_ARFCN(*arfcn),
+                            cgi_nr: None,
+                            value_csi_rsrq_cell: v.map(nrppa::ValueRSRQ_NR),
+                            csi_rsrq_per_csi_rs: None,
+                            ie_extensions: None,
+                        })
+                        .collect(),
+                ),
+            ),
+        )
+    }
+
+    pub fn aoa_nr(azimuth: u16, zenith: Option<u16>) -> nrppa::MeasuredResultsValue {
+        nr_ext(
+            36,
+            nrppa::MeasuredResultsValue_choice_ExtensionValue::Id_AngleOfArrivalNR(nrppa::UL_AoA {
+                azimuth_ao_a: nrppa::UL_AoAAzimuthAoA(azimuth),
+                zenith_ao_a: zenith.map(nrppa::UL_AoAZenithAoA),
+                lcs_to_gcs_translation: None,
+                ie_extensions: None,
+            }),
         )
     }
 
