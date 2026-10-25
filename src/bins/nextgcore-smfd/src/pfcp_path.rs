@@ -2223,39 +2223,92 @@ fn held_session_seids() -> Vec<u64> {
     seids
 }
 
+/// One read of the state that decides which pool member a session lives on (#1075,
+/// #1059 round 2 m4): the default client, each member's identity and endpoint, and
+/// the per-session identity and endpoint records. A scope over every session asks it
+/// once per session; before, each question took the context and `session_upfs`
+/// locks and cloned the pool, so a teardown or an association setup cost
+/// O(sessions) lock pairs and pool clones.
+struct SessionRouting {
+    default: Option<*const PfcpClient>,
+    /// Each pool member's (identity, endpoint).
+    members: Vec<(String, SocketAddr)>,
+    upfs: HashMap<u64, String>,
+    peers: HashMap<u64, SocketAddr>,
+}
+
+/// How many times the routing state was read (#1150 review m5): a scope must read
+/// it once, however many sessions it covers. Process-global: a test that measures
+/// it holds `PROCESS_STATE_TEST_LOCK` (#1150 review round 2 n1).
+#[cfg(test)]
+pub(crate) static SESSION_ROUTING_READS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+impl SessionRouting {
+    fn now() -> Self {
+        #[cfg(test)]
+        SESSION_ROUTING_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let upfs = smf_self()
+            .read()
+            .ok()
+            .and_then(|ctx| ctx.session_upfs.read().ok().map(|m| m.clone()))
+            .unwrap_or_default();
+        let peers = session_peers()
+            .read()
+            .map(|m| m.clone())
+            .unwrap_or_default();
+        Self {
+            default: global_client().map(|c| Arc::as_ptr(&c)),
+            members: global_pool()
+                .iter()
+                .map(|c| (c.recovery_time_stamp_key(), c.peer()))
+                .collect(),
+            upfs,
+            peers,
+        }
+    }
+
+    /// Whether a current member is the one `seid` was recorded on: by its identity
+    /// when one is recorded (it decides alone, as in [`recorded_client`]), else by
+    /// its endpoint.
+    fn names_a_member(&self, seid: u64) -> bool {
+        if let Some(key) = self.upfs.get(&seid) {
+            return self.members.iter().any(|(k, _)| k == key);
+        }
+        self.peers
+            .get(&seid)
+            .is_some_and(|peer| self.members.iter().any(|(_, p)| p == peer))
+    }
+
+    /// [`session_served_by`], answered from this read.
+    fn served_by(&self, seid: u64, client: &PfcpClient) -> bool {
+        let is_default = || self.default == Some(client as *const PfcpClient);
+        // #1031, #1059 round 2 m2: the identity first, as `recorded_client` does.
+        if let Some(key) = self.upfs.get(&seid) {
+            if *key == client.recovery_time_stamp_key() {
+                return true;
+            }
+            // It names another current member: that one's. It names none: the default.
+            return !self.members.iter().any(|(k, _)| k == key) && is_default();
+        }
+        if self.peers.get(&seid) == Some(&client.peer()) {
+            return true;
+        }
+        // A record naming another current member routes there; anything else goes to
+        // the default client.
+        !self.names_a_member(seid) && is_default()
+    }
+}
+
 /// Whether `client` is the UPF the session with SMF-side N4 SEID `seid` lives on.
 ///
 /// The recorded peer when it is this client's. Otherwise the routing
 /// [`client_for_session`] applies: a session with no record (restored from durable
 /// state, where the binding is not persisted), or whose recorded peer no pool
 /// member has any more (a hostname UPF re-resolved), goes to the default client.
+#[cfg(test)]
 fn session_served_by(seid: u64, client: &PfcpClient) -> bool {
-    let is_default = || global_client().is_some_and(|c| std::ptr::eq(Arc::as_ptr(&c), client));
-    // #1031, #1059 round 2 m2: the identity first, as `recorded_client` does.
-    let identity = smf_self()
-        .read()
-        .ok()
-        .and_then(|ctx| ctx.session_upfs.read().ok()?.get(&seid).cloned());
-    if let Some(key) = identity {
-        if key == client.recovery_time_stamp_key() {
-            return true;
-        }
-        // It names another current member: that one's. It names none: the default.
-        let named = global_pool()
-            .iter()
-            .any(|c| c.recovery_time_stamp_key() == key);
-        return !named && is_default();
-    }
-    let recorded = session_peers()
-        .read()
-        .ok()
-        .and_then(|map| map.get(&seid).copied());
-    if recorded == Some(client.peer()) {
-        return true;
-    }
-    // A record naming another current member routes there; anything else goes to
-    // the default client.
-    recorded_client(seid).is_none() && is_default()
+    SessionRouting::now().served_by(seid, client)
 }
 
 /// Whether this SMF holds a PFCP session on `client`'s UPF (#718 review M1).
@@ -2265,9 +2318,10 @@ fn session_served_by(seid: u64, client: &PfcpClient) -> bool {
 /// asking it to retain them, and then releasing them all when it answered without
 /// PSREI, released every UE on the healthy UPFs.
 fn holds_pfcp_sessions_on(client: &PfcpClient) -> bool {
+    let routing = SessionRouting::now();
     held_session_seids()
         .into_iter()
-        .any(|seid| session_served_by(seid, client))
+        .any(|seid| routing.served_by(seid, client))
 }
 
 impl PfcpClient {
@@ -2306,13 +2360,15 @@ impl PfcpClient {
             }
             Err(_) => (Vec::new(), Vec::new()),
         };
+        // #1075: one read of the routing state for every session.
+        let routing = SessionRouting::now();
         let five_g: Vec<(String, u64)> = five_g
             .into_iter()
-            .filter(|(_, seid)| session_served_by(*seid, self))
+            .filter(|(_, seid)| routing.served_by(*seid, self))
             .collect();
         let epc: Vec<(u64, u64)> = epc
             .into_iter()
-            .filter(|(_, seid)| session_served_by(*seid, self))
+            .filter(|(_, seid)| routing.served_by(*seid, self))
             .collect();
         crate::restoration::SessionScope {
             seids: five_g

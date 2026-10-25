@@ -199,7 +199,7 @@ A UPF reports a GTP-U path to a gNB, eNB, SGW-U or another UPF failing or recove
 - cause 72 from any other host;
 - cause 66 or 67, with the Offending IE, when the Node ID, the Node Report Type or a report the type announces is missing.
 
-The SMF learns which sessions use which peer from its own accepted Session Establishment and Modification Requests: the Outer Header Creation address of each FAR. The durable snapshot carries this (`farPeers`), so a restored session is still found.
+The SMF learns which sessions use which peer from its own accepted Session Establishment and Modification Requests: the Outer Header Creation address of each FAR. The durable snapshot carries this (`farPeers`), so a restored session is still found. A change of a session's peers (a Service Request, a handover) is written to the snapshot within 200 ms rather than at once: changes in that window are coalesced into one write, and a graceful shutdown writes what is pending. An SMF killed inside the window restores the peers from before it (#1075).
 
 - **Path failure:** the UP connection of every session with a forwarding FAR toward the peer is deactivated (TS 23.502 §4.3.7, steps 4 and 5). Those FARs are set to BUFF|NOCP, so downlink data is buffered and reported and the UE is paged. For an N3 FAR, the NG-RAN gets an N2-only PDU Session Resource Release Command (cause transport-resource-unavailable) through the AMF.
 - **Still down after `SMF_UP_PATH_FAILURE_HOLD_SECS`** (TS 23.007 §20.3.1):

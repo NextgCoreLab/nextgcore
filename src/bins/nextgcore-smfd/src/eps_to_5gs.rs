@@ -1051,8 +1051,10 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
     // one's admission.
     let nsac_sst = sess.s_nssai.sst;
     let nsac_sd = sess.s_nssai.sd.map(|sd| format!("{sd:06x}"));
-    let nsac_admitted = if existing.is_some() {
-        crate::lookup_policy_binding(&sm_context_ref).is_some_and(|b| b.nsac_admitted)
+    let (nsac_admitted, nsac_nf_id) = if existing.is_some() {
+        crate::lookup_policy_binding(&sm_context_ref)
+            .map(|b| (b.nsac_admitted, b.nsac_nf_id))
+            .unwrap_or((false, None))
     } else {
         match crate::nsac_admit_migrated_session(supi, psi, nsac_sst, nsac_sd.as_deref()).await {
             Some(admitted) => admitted,
@@ -1072,7 +1074,15 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
             Ok(endpoint) => endpoint,
             Err(e) => {
                 log::error!("[{supi}] EPS→5GS step 6: the UPF did not allocate the N3 tunnel: {e}");
-                crate::rollback_nsac(nsac_admitted, supi, psi, nsac_sst, nsac_sd.as_deref()).await;
+                crate::rollback_nsac_as(
+                    nsac_admitted,
+                    nsac_nf_id.as_deref(),
+                    supi,
+                    psi,
+                    nsac_sst,
+                    nsac_sd.as_deref(),
+                )
+                .await;
                 return sm_context_error(
                     504,
                     "UPF_NOT_RESPONDING",
@@ -1105,7 +1115,15 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
             // keep the N3 uplink PDR in place too.
             let ebis: Vec<u8> = dedicated.iter().map(|b| b.ebi).collect();
             remove_dedicated_uplinks(smf_n4_seid, upf_seid, &ebis).await;
-            crate::rollback_nsac(nsac_admitted, supi, psi, nsac_sst, nsac_sd.as_deref()).await;
+            crate::rollback_nsac_as(
+                nsac_admitted,
+                nsac_nf_id.as_deref(),
+                supi,
+                psi,
+                nsac_sst,
+                nsac_sd.as_deref(),
+            )
+            .await;
             return sm_context_error(
                 504,
                 "UPF_NOT_RESPONDING",
@@ -1125,7 +1143,15 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
                 if let Err(e) = pfcp_remove_n3_uplink(smf_n4_seid, upf_seid, &ebis, &[]).await {
                     log::warn!("[{supi}] and the step-6 rules were not removed: {e}");
                 }
-                crate::rollback_nsac(nsac_admitted, supi, psi, nsac_sst, nsac_sd.as_deref()).await;
+                crate::rollback_nsac_as(
+                    nsac_admitted,
+                    nsac_nf_id.as_deref(),
+                    supi,
+                    psi,
+                    nsac_sst,
+                    nsac_sd.as_deref(),
+                )
+                .await;
             }
             return sm_context_error(500, "SYSTEM_FAILURE", "N2 SM information encoding failed");
         }
@@ -1208,6 +1234,7 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
                         sd: sd_hex.clone(),
                         sdm_subscription_id: None,
                         nsac_admitted,
+                        nsac_nf_id: nsac_nf_id.clone(),
                     },
                 );
             }
@@ -1850,7 +1877,7 @@ async fn handle_cancelled_inner(sm_context_ref: &str) -> SbiResponse {
                     counted = m
                         .remove(sm_context_ref)
                         .filter(|b| b.nsac_admitted)
-                        .map(|b| (b.supi, b.psi, b.sst, b.sd));
+                        .map(|b| (b.supi, b.psi, b.sst, b.sd, b.nsac_nf_id));
                 }
                 sess.psi = 0;
                 sess.sm_context_ref = None;
@@ -1859,8 +1886,9 @@ async fn handle_cancelled_inner(sm_context_ref: &str) -> SbiResponse {
             }
             // #1072 round 2 m8: and the 5G count the preparation took is given back,
             // under the handover lock, so a retried preparation counts in after it.
-            if let Some((supi, psi, sst, sd)) = counted {
-                crate::rollback_nsac(true, &supi, psi, sst, sd.as_deref()).await;
+            if let Some((supi, psi, sst, sd, nf_id)) = counted {
+                crate::rollback_nsac_as(true, nf_id.as_deref(), &supi, psi, sst, sd.as_deref())
+                    .await;
             }
             log::info!(
                 "SM Context Update (CANCELLED) for ref={sm_context_ref}: EPS→5GS handover \
