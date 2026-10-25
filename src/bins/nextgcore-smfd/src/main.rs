@@ -1616,6 +1616,119 @@ fn build_smf_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> 
     profile
 }
 
+// ---------------------------------------------------------------------------
+// #1112: discoverable only with a UPF behind it
+// ---------------------------------------------------------------------------
+
+/// How often the N4 status watcher re-reads the association state.
+const N4_NF_STATUS_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The `nfStatus` this SMF advertises for its N4 state (#1112): REGISTERED while the
+/// UPF a new session would use is associated, UNDISCOVERABLE otherwise. TS 29.510
+/// Table 6.1.6.3.7-1: an UNDISCOVERABLE NF is "operative but cannot be discovered by
+/// other NFs ... can process existing sessions but cannot accept new session
+/// establishment", which is an SMF with no N4 association (TS 29.244 §6.2.6.2: no
+/// session signalling without one). SUSPENDED would say "not operative" and may
+/// trigger restoration. §5.2.2.3.2 lets the heartbeat PATCH set either. It was
+/// REGISTERED from the start: a restarted SMF was discovered and answered every
+/// create 504 UPF_NOT_RESPONDING until its first association came up.
+fn nf_status_for_n4(upf_associated: bool) -> nextgcore_sbi::context::NfStatus {
+    if upf_associated {
+        nextgcore_sbi::context::NfStatus::Registered
+    } else {
+        nextgcore_sbi::context::NfStatus::Undiscoverable
+    }
+}
+
+/// `profile` with its `nfStatus` set to `status`.
+fn with_nf_status(
+    mut profile: serde_json::Value,
+    status: nextgcore_sbi::context::NfStatus,
+) -> serde_json::Value {
+    profile["nfStatus"] = serde_json::json!(nextgcore_sbi::heartbeat::nf_status_wire(status));
+    profile
+}
+
+/// One step of the N4 status watcher: when the N4 state calls for a status other
+/// than the advertised one, adopt it and return it so the caller PATCHes the NRF
+/// at once. The heartbeat worker carries it from then on, and the profile a 404
+/// heartbeat re-registers carries it too, so a re-registration does not undo it.
+fn reconcile_n4_nf_status(upf_associated: bool) -> Option<nextgcore_sbi::context::NfStatus> {
+    let wanted = nf_status_for_n4(upf_associated);
+    if wanted == nextgcore_sbi::heartbeat::self_nf_status() {
+        return None;
+    }
+    nextgcore_sbi::heartbeat::set_self_nf_status(wanted);
+    if let Some(profile) = nextgcore_sbi::heartbeat::registered_profile() {
+        nextgcore_sbi::heartbeat::set_registered_profile(&with_nf_status(profile, wanted));
+    }
+    Some(wanted)
+}
+
+/// The N4 status watcher, so the shutdown stops it before it deregisters.
+static N4_NF_STATUS_WATCHER: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> =
+    std::sync::Mutex::new(None);
+
+/// Stop the N4 status watcher (#1115 review m1): first in the shutdown, before the
+/// NFDeregister, or the association release that follows it would have the watcher
+/// PATCH an instance the NRF no longer holds.
+fn abort_n4_nf_status_watcher() {
+    if let Some(watcher) = N4_NF_STATUS_WATCHER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
+        watcher.abort();
+    }
+}
+
+/// Keep the NRF's view of this SMF in step with its N4 association (#1112):
+/// REGISTERED when the UPF a new session would use is associated, UNDISCOVERABLE
+/// when it is not. Replaces a watcher already running.
+fn spawn_n4_nf_status_watcher(nf_instance_id: String) {
+    let watcher = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(N4_NF_STATUS_POLL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            // A shutdown aborts this task before it deregisters
+            // (`abort_n4_nf_status_watcher`); an NF that paused its own heartbeats
+            // (NES) is not PATCHed behind their back either.
+            if nextgcore_sbi::heartbeat::heartbeat_paused() {
+                return;
+            }
+            let associated = pfcp_path::session_upf_associated();
+            let Some(status) = reconcile_n4_nf_status(associated) else {
+                continue;
+            };
+            let wire = nextgcore_sbi::heartbeat::nf_status_wire(status);
+            if associated {
+                log::info!("An N4 association is up: NRF status {wire}");
+            } else {
+                log::warn!("No N4 association is up: NRF status {wire} until one is");
+            }
+            let load = smf_self()
+                .read()
+                .map(|c| c.get_load())
+                .unwrap_or(0)
+                .clamp(0, 100) as u8;
+            if let Err(e) =
+                nextgcore_sbi::heartbeat::patch_nf_status(&nf_instance_id, status, load).await
+            {
+                // The next heartbeat carries the status anyway.
+                log::warn!("nfStatus {wire} PATCH failed ({e}); the next heartbeat carries it");
+            }
+        }
+    });
+    if let Some(previous) = N4_NF_STATUS_WATCHER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace(watcher)
+    {
+        previous.abort();
+    }
+}
+
 /// Register SMF NF instance with NRF
 ///
 /// Sends PUT /nnrf-nfm/v1/nf-instances/{nfInstanceId} to NRF
@@ -1643,7 +1756,22 @@ async fn smf_nrf_register(sbi_addr: &str, sbi_port: u16) -> std::result::Result<
         nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Smf)
             .to_string();
 
-    let nf_profile = build_smf_nf_profile(&nf_instance_id, sbi_addr, sbi_port);
+    // #1112: UNDISCOVERABLE until an N4 association is up. Registration runs before
+    // the PFCP clients exist, so a starting SMF registers UNDISCOVERABLE, and the
+    // watcher spawned on success makes it REGISTERED once a UPF answers.
+    let upf_associated = pfcp_path::session_upf_associated();
+    let status = nf_status_for_n4(upf_associated);
+    nextgcore_sbi::heartbeat::set_self_nf_status(status);
+    if !upf_associated {
+        log::info!(
+            "No N4 association is up yet: registering with the NRF as UNDISCOVERABLE, so \
+             no consumer discovers an SMF without a UPF (TS 29.510 Table 6.1.6.3.7-1)"
+        );
+    }
+    let nf_profile = with_nf_status(
+        build_smf_nf_profile(&nf_instance_id, sbi_addr, sbi_port),
+        status,
+    );
 
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     log::debug!("NRF registration: PUT {path}");
@@ -1664,6 +1792,10 @@ async fn smf_nrf_register(sbi_addr: &str, sbi_port: u16) -> std::result::Result<
             sbi_ctx
                 .set_self_instance(build_smf_nf_instance(&nf_instance_id, sbi_addr, sbi_port))
                 .await;
+
+            // #1112: REGISTERED once an N4 association is up, UNDISCOVERABLE while none
+            // is. Started here, with the registration it maintains.
+            spawn_n4_nf_status_watcher(nf_instance_id.clone());
 
             Ok(nf_instance_id)
         }
@@ -7519,6 +7651,9 @@ async fn graceful_shutdown(
     // NF_FAILOVER. The failed paths are durable, and the next incarnation re-arms
     // what is left of each hold.
     up_path::abort_hold_timers();
+    // #1115 review m1: and the N4 status watcher, so it PATCHes no deregistered
+    // instance when the association goes below.
+    abort_n4_nf_status_watcher();
     // #941 review M2: every phase is bounded by what is left of ONE deadline, taken
     // when the shutdown started. A blackholed NRF held the deregistration for its
     // 30 s request timeout and pushed the rest past the SIGKILL.
@@ -11835,6 +11970,260 @@ mod tests {
     /// an event-exposure producer by matching `serviceName` against
     /// `eventexposure`/`evts` (`dccfd`'s `coordination.rs`), so this SMF was
     /// invisible to data collection.
+    /// #1112 (TS 29.510 Table 6.1.6.3.7-1): an SMF with no N4 association registers
+    /// UNDISCOVERABLE, so discovery does not return it, and REGISTERED once one is up.
+    #[test]
+    fn the_registered_nf_status_follows_the_n4_association() {
+        use nextgcore_sbi::context::NfStatus;
+        assert_eq!(nf_status_for_n4(false), NfStatus::Undiscoverable);
+        assert_eq!(nf_status_for_n4(true), NfStatus::Registered);
+        let profile = build_smf_nf_profile("smf-1112", "10.45.0.6", 7777);
+        assert_eq!(profile["nfStatus"], "REGISTERED");
+        let undiscoverable = with_nf_status(profile, NfStatus::Undiscoverable);
+        assert_eq!(undiscoverable["nfStatus"], "UNDISCOVERABLE");
+        assert_eq!(
+            undiscoverable["nfServices"][0]["nfServiceStatus"], "REGISTERED",
+            "the services keep their own status; the NF-level one gates discovery"
+        );
+    }
+
+    /// #1112: the watcher's step. It adopts the status the N4 state calls for once,
+    /// so the heartbeat PATCHes carry it, and rewrites the profile a 404 heartbeat
+    /// re-registers, so a re-registration does not undo it.
+    ///
+    /// REVERT-VERIFIED: with the profile rewrite removed, the recorded profile
+    /// stays REGISTERED while the SMF is UNDISCOVERABLE.
+    #[test]
+    fn reconciling_the_n4_status_changes_the_advertised_status_once() {
+        use nextgcore_sbi::context::NfStatus;
+        use nextgcore_sbi::heartbeat as hb;
+        // The heartbeat globals' own lock, declared beside them in nextgcore-sbi.
+        let _registration = hb::lock_registration_state_for_test();
+        let before = (hb::self_nf_status(), hb::registered_profile());
+        hb::set_self_nf_status(NfStatus::Registered);
+        hb::set_registered_profile(&build_smf_nf_profile("smf-1112", "10.45.0.6", 7777));
+
+        assert_eq!(
+            reconcile_n4_nf_status(false),
+            Some(NfStatus::Undiscoverable)
+        );
+        assert_eq!(hb::self_nf_status(), NfStatus::Undiscoverable);
+        assert_eq!(
+            hb::registered_profile().unwrap()["nfStatus"],
+            "UNDISCOVERABLE"
+        );
+        assert_eq!(
+            hb::build_load_patch(0)[0]["value"],
+            "UNDISCOVERABLE",
+            "the heartbeat says so too"
+        );
+        assert_eq!(reconcile_n4_nf_status(false), None, "no PATCH per tick");
+
+        assert_eq!(reconcile_n4_nf_status(true), Some(NfStatus::Registered));
+        assert_eq!(hb::registered_profile().unwrap()["nfStatus"], "REGISTERED");
+        assert_eq!(reconcile_n4_nf_status(true), None);
+
+        hb::set_self_nf_status(before.0);
+        match before.1 {
+            Some(p) => hb::set_registered_profile(&p),
+            None => hb::clear_registered_profile(),
+        }
+    }
+
+    /// #1112 (#1115 review M2), against a stand-in NRF: with no N4 association the
+    /// registration PUT says UNDISCOVERABLE, and the watcher it starts then PATCHes
+    /// the NRF exactly once per association change -- REGISTERED when the UPF
+    /// associates, UNDISCOVERABLE when it goes -- and not on every tick.
+    ///
+    /// REVERT-VERIFIED: registering REGISTERED fails the PUT assertion, and without
+    /// the watcher spawn no PATCH arrives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // the heartbeat globals' std lock, see below
+    async fn the_nrf_is_told_the_n4_state_once_per_change() {
+        use nextgcore_sbi::context::NfStatus;
+        use nextgcore_sbi::heartbeat as hb;
+        use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        // The heartbeat globals' own (std) lock, beside them in nextgcore-sbi. Held
+        // across this test's awaits on purpose: it serialises the globals, and no
+        // other task of this test takes it.
+        let _registration = hb::lock_registration_state_for_test();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        // Installed, not associated, before the registration: the N4 lock is held for
+        // the whole test, so no sibling's UPF is what the watcher sees.
+        let upf = pfcp_path::stand_in::unassociated_upf().await;
+        // Everything this test sets process-wide is restored when it ends, whether it
+        // passes or panics (#1115 review n4).
+        let _restore = N4StatusTestRestore {
+            status: hb::self_nf_status(),
+            profile: hb::registered_profile(),
+        };
+
+        let seen: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>> = Arc::default();
+        let recorded = Arc::clone(&seen);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let nrf = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        nrf.start(move |req: SReq| {
+            let recorded = Arc::clone(&recorded);
+            async move {
+                let body = req
+                    .http
+                    .content
+                    .as_deref()
+                    .and_then(|c| serde_json::from_str(c).ok())
+                    .unwrap_or(serde_json::Value::Null);
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push((req.header.method.clone(), body));
+                if req.header.method == "PUT" {
+                    SResp::with_status(201)
+                } else {
+                    SResp::with_status(204)
+                }
+            }
+        })
+        .await
+        .expect("stand-in NRF");
+        global_context().set_nrf_uri(format!("http://{addr}")).await;
+        hb::set_self_nf_status(NfStatus::Registered);
+
+        let registered = smf_nrf_register("127.0.0.1", 7777).await;
+        let patches = |seen: &std::sync::Mutex<Vec<(String, serde_json::Value)>>| -> Vec<String> {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|(m, _)| m == "PATCH")
+                .map(|(_, b)| b[0]["value"].as_str().unwrap_or("").to_string())
+                .collect()
+        };
+        let wait_for = |n: usize| {
+            let seen = Arc::clone(&seen);
+            async move {
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+                while patches(&seen).len() < n && tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
+        };
+        let put = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(m, _)| m == "PUT")
+            .map(|(_, b)| b["nfStatus"].clone());
+
+        upf.client.associate().await.expect("association");
+        wait_for(1).await;
+        let after_association = patches(&seen);
+        upf.client.set_assoc_state_for_test(false, None, None).await;
+        wait_for(2).await;
+        // Several more ticks: no further PATCH.
+        tokio::time::sleep(N4_NF_STATUS_POLL * 3).await;
+        let all = patches(&seen);
+        // An NF that paused its own heartbeats (NES) is not PATCHed behind them.
+        hb::set_heartbeat_paused(true);
+        upf.client.associate().await.expect("association");
+        tokio::time::sleep(N4_NF_STATUS_POLL * 3).await;
+        let while_paused = patches(&seen);
+        hb::set_heartbeat_paused(false);
+        nrf.stop().await.ok();
+
+        assert!(registered.is_ok(), "{registered:?}");
+        assert_eq!(put, Some(serde_json::json!("UNDISCOVERABLE")));
+        assert_eq!(after_association, vec!["REGISTERED"]);
+        assert_eq!(
+            all,
+            vec!["REGISTERED", "UNDISCOVERABLE"],
+            "one PATCH per change"
+        );
+        assert_eq!(
+            while_paused, all,
+            "no PATCH while the heartbeats are paused"
+        );
+    }
+
+    /// Restores what `the_nrf_is_told_the_n4_state_once_per_change` set process-wide:
+    /// the watcher, the NRF URI, the pause flag, the advertised status and profile.
+    struct N4StatusTestRestore {
+        status: nextgcore_sbi::context::NfStatus,
+        profile: Option<serde_json::Value>,
+    }
+
+    impl Drop for N4StatusTestRestore {
+        fn drop(&mut self) {
+            use nextgcore_sbi::heartbeat as hb;
+            abort_n4_nf_status_watcher();
+            hb::set_heartbeat_paused(false);
+            hb::set_self_nf_status(self.status);
+            match self.profile.take() {
+                Some(p) => hb::set_registered_profile(&p),
+                None => hb::clear_registered_profile(),
+            }
+            // The URI is behind an async lock; cleared on a runtime of its own, on a
+            // scoped thread, since this may run while the test's runtime unwinds.
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .expect("cleanup runtime")
+                        .block_on(global_context().clear_nrf_uri());
+                });
+            });
+        }
+    }
+
+    /// #1115 review n1: the shutdown stops the N4 status watcher before it
+    /// deregisters, so the association release that follows PATCHes no instance the
+    /// NRF has dropped.
+    ///
+    /// REVERT-VERIFIED: without `abort_n4_nf_status_watcher` in `graceful_shutdown`,
+    /// the watcher is still running when the deregistration starts.
+    #[tokio::test]
+    async fn the_shutdown_stops_the_n4_status_watcher_before_it_deregisters() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        spawn_n4_nf_status_watcher("smf-1115-shutdown".to_string());
+        let running_at_deregister = std::sync::Arc::new(AtomicBool::new(true));
+        let probe = running_at_deregister.clone();
+        let listener = tokio::spawn(async {});
+        graceful_shutdown(
+            async move {
+                let running = N4_NF_STATUS_WATCHER
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .is_some_and(|w| !w.is_finished());
+                probe.store(running, Ordering::SeqCst);
+            },
+            &[],
+            false,
+            listener,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .await;
+        abort_n4_nf_status_watcher();
+        assert!(
+            !running_at_deregister.load(Ordering::SeqCst),
+            "the watcher is stopped before the deregistration"
+        );
+    }
+
+    /// #1112: what the watcher polls, read off the association of the UPF a new
+    /// session would use.
+    #[tokio::test]
+    async fn session_upf_associated_follows_the_n4_association() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = pfcp_path::stand_in::unassociated_upf().await;
+        assert!(!pfcp_path::session_upf_associated());
+        upf.client.associate().await.expect("association");
+        assert!(pfcp_path::session_upf_associated());
+        upf.client.set_assoc_state_for_test(false, None, None).await;
+        assert!(!pfcp_path::session_upf_associated());
+    }
+
     #[test]
     fn the_smf_profile_advertises_both_routed_nsmf_services() {
         let profile = build_smf_nf_profile("smf-test-instance", "10.45.0.6", 7777);
