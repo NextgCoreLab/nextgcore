@@ -6710,10 +6710,26 @@ mod tests {
         let dsrsp = recv_s11(&sock).await.expect("answered after N3");
         assert_eq!(dsrsp.header.sequence_number, 0x2522);
         assert_eq!(cause_of(&dsrsp), gtp_cause::REQUEST_ACCEPTED);
+        // At most the request and its N3 = 1 retransmission (a retransmission
+        // thread delayed past 2 x T3 may end the transaction without the
+        // retransmission, TS 29.274 §7.6). What matters: the MME's own
+        // retransmission is not relayed as a further request (#1209).
+        let relayed = pgw.deletes.lock().unwrap().len();
+        assert!(
+            (1..=2).contains(&relayed),
+            "sent, at most retransmitted once on T3 ({relayed})"
+        );
+        // A T3 retransmission keeps the request's sequence number; relaying the
+        // MME's retransmission would allocate a new one.
+        let seqs: std::collections::HashSet<u32> =
+            pgw_got(&pgw, Gtp2MessageType::DeleteSessionRequest)
+                .iter()
+                .map(|m| m.header.sequence_number)
+                .collect();
         assert_eq!(
-            pgw.deletes.lock().unwrap().len(),
-            2,
-            "sent, then retransmitted once on T3; the MME's retransmission is not relayed"
+            seqs.len(),
+            1,
+            "the MME's retransmission is not relayed: {seqs:?}"
         );
         assert_eq!(sgwu.received(54), 1);
         sgwc_self().set_pgw_s5c_peer(None);
