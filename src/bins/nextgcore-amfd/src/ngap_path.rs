@@ -250,6 +250,8 @@ const ACCESS_TYPE_3GPP: u8 = 0x01;
 /// magic numbers.
 /// #686: UE contexts survive an AMF restart.
 pub mod ue_context_store;
+/// #686 PR 2: an AMF of the AMF Set takes over a UE whose AMF failed.
+pub mod ue_context_takeover;
 
 mod proc_code {
     use nextgcore_ngap_gen::generated as g;
@@ -733,6 +735,12 @@ pub struct UeNasContext {
     /// #686: restored from the UE context store after an AMF restart. Such a UE has no
     /// NG association yet but does have a registration area, so it can be paged.
     restored: bool,
+    /// #686 PR 2: taken over from another AMF of the set; the peer updates are owed until
+    /// its first message verifies ([`ue_context_takeover`]).
+    taken_over: bool,
+    /// #686 PR 2: a 5G-GUTI of this AMF's GUAMI is owed after the Service Accept, whatever
+    /// `AMF_GUTI_REALLOCATION` says (TS 23.501 §5.21.2.3).
+    guti_reallocation_owed: bool,
 }
 
 /// Manual `Debug` (no-auth-material-in-logs): the authentication material in
@@ -881,6 +889,8 @@ impl UeNasContext {
             release_after_registration: false,
             cm_idle: false,
             restored: false,
+            taken_over: false,
+            guti_reallocation_owed: false,
         }
     }
 
@@ -1104,6 +1114,9 @@ pub struct NgapServer {
     /// of the process-global configuration other tests change.
     #[cfg(test)]
     served_guami_override: Option<Vec<ue_context_store::ServedGuami>>,
+    /// Test seam (#686 PR 2): the UDM a takeover registers with.
+    #[cfg(test)]
+    udm_override: Option<(String, u16)>,
     /// PDU Session Establishment Requests whose CreateSMContext found no SMF
     /// reachable (#796), keyed by (AMF UE NGAP ID, PSI), retried until
     /// [`ESTABLISHMENT_RETRY_WINDOW`] has passed. See
@@ -1635,6 +1648,8 @@ impl NgapServer {
             ue_context_store: None,
             #[cfg(test)]
             served_guami_override: None,
+            #[cfg(test)]
+            udm_override: None,
             pending_establishments: HashMap::new(),
             outstanding_releases: HashMap::new(),
             racs_assigns: HashMap::new(),
@@ -3088,6 +3103,18 @@ impl NgapServer {
     }
 
     async fn handle_initial_ue_message(&mut self, association_id: u64, data: &[u8]) -> Result<()> {
+        self.handle_initial_ue_message_with(association_id, data, true)
+            .await
+    }
+
+    /// [`Self::handle_initial_ue_message`]; `allow_takeover` is false when the message is
+    /// processed again after a takeover lookup (#686 PR 2), which is done once.
+    async fn handle_initial_ue_message_with(
+        &mut self,
+        association_id: u64,
+        data: &[u8],
+        allow_takeover: bool,
+    ) -> Result<()> {
         log::info!(
             "Initial UE Message from association {} ({} bytes)",
             association_id,
@@ -3146,6 +3173,16 @@ impl NgapServer {
             return Ok(());
         }
         let msg_type = nas[2];
+
+        // #686 PR 2: a UE of this AMF Set whose context is not here may have been served
+        // by an AMF that failed; its stored context is looked up first (TS 23.501
+        // §5.21.2.3), and this message processed again with whatever was found.
+        if allow_takeover {
+            if let Some(s_tmsi) = self.takeover_candidate(&nas) {
+                self.start_takeover(association_id, data.to_vec(), s_tmsi);
+                return Ok(());
+            }
+        }
 
         // A SERVICE REQUEST in an Initial UE Message is a UE coming back from
         // CM-IDLE -- possibly answering a page (#512). It is sent integrity
@@ -7200,6 +7237,11 @@ impl NgapServer {
         }
         self.ue_auth_state.insert(amf_ue_ngap_id, state);
         self.rekey_ue_sessions(old_id, amf_ue_ngap_id);
+        // #686 PR 2: a taken-over UE's peers learn of this AMF before the update goes on.
+        self.complete_takeover(
+            amf_ue_ngap_id,
+            ue_context_takeover::TakeoverVia::Registration,
+        );
         (full, true)
     }
 
@@ -7443,6 +7485,8 @@ impl NgapServer {
         state.initial_context_setup_request_sent = true;
         state.initial_context_setup_response_received = false;
         self.ue_auth_state.insert(amf_ue_ngap_id, state);
+        // #686 PR 2: a taken-over UE's SMFs learn of this AMF before its ACTIVATINGs.
+        self.complete_takeover(amf_ue_ngap_id, ue_context_takeover::TakeoverVia::Service);
 
         // TS 23.502 §4.2.3.2 steps 4-11: each session with uplink data is activated
         // at its SMF (upCnxState ACTIVATING), and its answer, the N2 SM information,
@@ -8153,7 +8197,11 @@ impl NgapServer {
         amf_ue_ngap_id: u64,
         ran_ue_ngap_id: u32,
     ) -> Result<()> {
-        if !guti_reallocation_enabled() {
+        let owed = self
+            .ue_auth_state
+            .get(amf_ue_ngap_id)
+            .is_some_and(|s| s.guti_reallocation_owed);
+        if !guti_reallocation_enabled() && !owed {
             return Ok(());
         }
         let Some(plain) = self.build_guti_reallocation_command(amf_ue_ngap_id) else {
@@ -8684,6 +8732,8 @@ impl NgapServer {
     /// context (a UCU is integrity protected, so without one there is nothing to protect
     /// it with).
     fn build_guti_reallocation_command(&mut self, amf_ue_ngap_id: u64) -> Option<Vec<u8>> {
+        // #686 PR 2: a taken-over UE gets a 5G-GUTI of this AMF's GUAMI.
+        let ours = self.served_guamis().first().cloned();
         // `with_mut`: `generate_new_guti` allocates the next 5G-TMSI onto the UE's
         // context, and that allocation must persist or the COMPLETE the UE returns
         // would be matched against a `next_guti` the AMF no longer holds -- the UE
@@ -8700,6 +8750,14 @@ impl NgapServer {
             // (TS 23.003 §2.10.1: the 5G-TMSI must not be predictable).
             state.amf_ue.next_guti = state.amf_ue.current_guti.clone();
             state.amf_ue.generate_new_guti();
+            if std::mem::take(&mut state.guti_reallocation_owed) {
+                if let Some((plmn, region, set, pointer)) = ours {
+                    state.amf_ue.next_guti.plmn_id = plmn;
+                    state.amf_ue.next_guti.amf_region_id = region;
+                    state.amf_ue.next_guti.amf_set_id = set;
+                    state.amf_ue.next_guti.amf_pointer = pointer;
+                }
+            }
             let param = crate::gmm_build::ConfigurationUpdateCommandParam {
                 // Acknowledgement requested: without it there is no COMPLETE, so the
                 // AMF could never know whether the UE adopted the new identity.
@@ -11081,6 +11139,14 @@ impl NgapServer {
                     if let Err(e) = self.apply_smf_answer(answer).await {
                         log::warn!("SMF answer not applied: {e}");
                     }
+                }
+                crate::sbi_offload::SbiOutcome::Takeover(answer) => {
+                    if let Err(e) = Box::pin(self.apply_takeover(answer)).await {
+                        log::warn!("Takeover outcome not applied: {e}");
+                    }
+                }
+                crate::sbi_offload::SbiOutcome::TakeoverUecm(answer) => {
+                    self.apply_takeover_uecm(answer);
                 }
             }
         }
@@ -17500,6 +17566,22 @@ impl NgapServer {
         });
         if updated.is_none() {
             log::warn!("Initial Context Setup Response for unknown UE {amf_ue_ngap_id}; ignoring");
+        }
+        // #686 PR 2: a UE taken over from a failed AMF of the set gets a 5G-GUTI of this
+        // AMF's GUAMI once its context is set up (TS 23.501 §5.21.2.3: the backup AMF
+        // "shall not use old GUAMI to allocate 5G-GUTI").
+        if let Some(ran_ue_ngap_id) = self
+            .ue_auth_state
+            .get(amf_ue_ngap_id)
+            .filter(|s| s.guti_reallocation_owed)
+            .map(|s| s.ran_ue_ngap_id)
+        {
+            self.reallocate_guti_via_configuration_update(
+                association_id,
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+            )
+            .await?;
         }
         // #653: an update Accept with no new 5G-GUTI asks for no Registration
         // Complete, so the registration is complete with the UE context set up.

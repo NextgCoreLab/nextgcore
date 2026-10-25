@@ -10,7 +10,7 @@
 
 use super::super::ue_context_store::{
     guti_served, open_with, MemoryBackend, ServedGuami, StoredUeContext, UeContextBackend,
-    UeContextWriter, DL_COUNT_RESTORE_MARGIN, RECORD_VERSION,
+    DL_COUNT_RESTORE_MARGIN, RECORD_VERSION,
 };
 use super::*;
 use std::sync::Arc;
@@ -96,9 +96,7 @@ async fn restoring_server() -> NgapServer {
 /// An AMF storing into `backend`, as `amf_ngap_open` arms it.
 async fn storing_server(backend: &Arc<MemoryBackend>) -> NgapServer {
     let mut server = restoring_server().await;
-    server.attach_ue_context_store(UeContextWriter::spawn(
-        Arc::clone(backend) as Arc<dyn UeContextBackend>
-    ));
+    server.attach_ue_context_store(Arc::clone(backend) as Arc<dyn UeContextBackend>);
     server
 }
 
@@ -355,6 +353,13 @@ impl UeContextBackend for RecordingBackend {
     fn load(&self, amf_instance_id: &str) -> Result<Vec<StoredUeContext>, String> {
         self.inner.load(amf_instance_id)
     }
+    fn take_over(
+        &self,
+        s_tmsi: super::super::ue_context_store::STmsi,
+        to_instance: &str,
+    ) -> Result<Option<StoredUeContext>, String> {
+        self.inner.take_over(s_tmsi, to_instance)
+    }
 }
 
 /// **#686.** What the sweep writes for a UE:
@@ -370,9 +375,7 @@ async fn the_sweep_writes_changes_only_and_deletes_ues_no_longer_held() {
     let (id, tmsi) = (6_860_301u64, 0x0686_0301u32);
     let supi = "imsi-001010000686301";
     let mut server = test_ngap_server().await;
-    server.attach_ue_context_store(UeContextWriter::spawn(
-        Arc::clone(&backend) as Arc<dyn UeContextBackend>
-    ));
+    server.attach_ue_context_store(Arc::clone(&backend) as Arc<dyn UeContextBackend>);
     seed_registered_ue(&mut server, id, tmsi, supi, "ref-686-c", 7777, false);
 
     server.persist_ue_contexts(true);
@@ -601,8 +604,35 @@ fn the_mongodb_backend_stores_loads_and_deletes() {
         .load("00000000-0000-4000-8000-0000006860bb")
         .expect("load other")
         .is_empty());
-    backend.delete(&rec.supi).expect("delete");
+    // #686 PR 2: another AMF of the set claims it by 5G-S-TMSI, once.
+    const PEER: &str = "00000000-0000-4000-8000-0000006860cc";
+    let s_tmsi = (
+        changed.guti.amf_set_id,
+        changed.guti.amf_pointer,
+        changed.guti.tmsi,
+    );
+    assert!(backend
+        .take_over((s_tmsi.0, s_tmsi.1, s_tmsi.2 + 1), PEER)
+        .expect("lookup")
+        .is_none());
+    let claimed = backend
+        .take_over(s_tmsi, PEER)
+        .expect("lookup")
+        .expect("claimed");
+    assert_eq!(claimed.amf_instance_id, PEER);
+    assert!(claimed.security == changed.security, "the stored context");
+    assert!(
+        backend.take_over(s_tmsi, PEER).expect("lookup").is_none(),
+        "once"
+    );
+    assert_eq!(
+        backend.load(PEER).expect("load").len(),
+        1,
+        "it names the claimer"
+    );
     assert!(backend.load(&rec.amf_instance_id).expect("load").is_empty());
+    backend.delete(&rec.supi).expect("delete");
+    assert!(backend.load(PEER).expect("load").is_empty());
 }
 
 /// Only a 5G-GUTI of a served GUAMI can bring its UE back to this AMF: a record whose
@@ -670,6 +700,13 @@ impl UeContextBackend for FlakyBackend {
     fn load(&self, amf_instance_id: &str) -> Result<Vec<StoredUeContext>, String> {
         self.inner.load(amf_instance_id)
     }
+    fn take_over(
+        &self,
+        s_tmsi: super::super::ue_context_store::STmsi,
+        to_instance: &str,
+    ) -> Result<Option<StoredUeContext>, String> {
+        self.inner.take_over(s_tmsi, to_instance)
+    }
 }
 
 const FLAKY_SUPI: &str = "imsi-001010000686701";
@@ -683,9 +720,7 @@ async fn a_refused_write_or_delete_is_retried_by_the_next_sweep() {
     let backend = Arc::new(FlakyBackend::refusing(1));
     let id = 6_860_701u64;
     let mut server = restoring_server().await;
-    server.attach_ue_context_store(UeContextWriter::spawn(
-        Arc::clone(&backend) as Arc<dyn UeContextBackend>
-    ));
+    server.attach_ue_context_store(Arc::clone(&backend) as Arc<dyn UeContextBackend>);
     seed_registered_ue(
         &mut server,
         id,
@@ -735,9 +770,7 @@ async fn ues_in_a_state_not_worth_restoring_are_not_written() {
     crate::context::amf_context_init(64, 1024, 4096);
     let backend = Arc::new(RecordingBackend::default());
     let mut server = restoring_server().await;
-    server.attach_ue_context_store(UeContextWriter::spawn(
-        Arc::clone(&backend) as Arc<dyn UeContextBackend>
-    ));
+    server.attach_ue_context_store(Arc::clone(&backend) as Arc<dyn UeContextBackend>);
     let cases: [(u64, &str, fn(&mut UeNasContext)); 3] = [
         (6_860_801, "imsi-001010000686801", |s| {
             s.amf_ue.unauthenticated_emergency = true
@@ -758,4 +791,300 @@ async fn ues_in_a_state_not_worth_restoring_are_not_written() {
         assert!(backend.ops_for(supi).is_empty(), "{supi} is not stored");
         crash(&mut server, id);
     }
+}
+
+/// A server of the fixture's AMF Set under another AMF Pointer (0x2B): another AMF of
+/// the set, the one a UE of the failed 0x2A AMF is sent to (TS 23.501 §5.21.2.3).
+async fn set_peer_server(backend: &Arc<MemoryBackend>) -> NgapServer {
+    let mut server = test_ngap_server().await;
+    server.served_guami_override = Some(vec![(
+        crate::context::PlmnId::new("001", "01"),
+        0x02,
+        0x155,
+        0x2B,
+    )]);
+    server.attach_ue_context_store(Arc::clone(backend) as Arc<dyn UeContextBackend>);
+    server
+}
+
+/// What `amf_ue` stored, as the failed AMF instance `dead` wrote it.
+fn stored_by(backend: &MemoryBackend, supi: &str, dead: &str) -> StoredUeContext {
+    let mut rec = backend.get(supi).expect("stored");
+    rec.amf_instance_id = dead.to_string();
+    backend.put(&rec).expect("put");
+    rec
+}
+
+const DEAD_AMF: &str = "00000000-0000-4000-8000-00000000dead";
+
+/// **#686 PR 2, TS 23.501 §5.21.2.3.** The UE of an AMF that failed comes back with a
+/// SERVICE REQUEST to another AMF of its AMF Set. That AMF:
+/// - claims the UE's stored context (the record now names it);
+/// - verifies the request under the stored keys;
+/// - registers with the UDM as the serving AMF, under its own nfInstanceId
+///   (TS 29.503 §5.3.2.2.2), and keeps the new `deregCallbackUri` token;
+/// - tells the SMF holding the session that it serves it (`servingNfId`,
+///   `smContextStatusUri`, TS 29.502 Table 6.1.6.2.2-1), BEFORE the session's
+///   ACTIVATING;
+/// - owes, and starts, a 5G-GUTI reallocation to its own GUAMI ("shall not use old GUAMI
+///   to allocate 5G-GUTI").
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_ue_of_a_failed_amf_is_taken_over_by_its_service_request() {
+    let (_smf, port, seen) = fake_activating_smf().await;
+    let (_selected, selected_port, selected_seen) = fake_activating_smf().await;
+    let (_udm, udm_port, udm_seen) = fake_activating_smf().await;
+    let _env = SmfEnvGuard::acquire(selected_port).await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    let backend = Arc::new(MemoryBackend::default());
+    let (old_id, tmsi) = (6_860_901u64, 0x0686_0901u32);
+    let supi = "imsi-001010000686901";
+
+    // The failed AMF (pointer 0x2A) stored the UE, then went away.
+    let mut failed = storing_server(&backend).await;
+    seed_registered_ue(&mut failed, old_id, tmsi, supi, "ref-686-t", port, false);
+    let original = failed.ue_auth_state.get(old_id).expect("seeded");
+    store_now(&mut failed).await;
+    crash(&mut failed, old_id);
+    drop(failed);
+    let backend = only(&backend, supi);
+    stored_by(&backend, supi, DEAD_AMF);
+
+    let mut peer = set_peer_server(&backend).await;
+    peer.udm_override = Some(("127.0.0.1".to_string(), udm_port));
+    peer.sent_ngap = Some(Vec::new());
+    let nas = protected_idle_service_request(&original.amf_ue, tmsi, original.amf_ue.ul_count + 1);
+    peer.handle_initial_ue_message(1, &service_request_initial_ue(nas))
+        .await
+        .expect("handled");
+    for _ in 0..3 {
+        settle_offloaded_sbi(&mut peer).await;
+    }
+
+    let instance = nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf);
+    assert_eq!(
+        backend.get(supi).expect("record").amf_instance_id,
+        instance,
+        "the stored context is claimed"
+    );
+    let (id, ue) = peer.ue_auth_state.find_by_supi(supi).expect("taken over");
+    assert!(
+        !ue.cm_idle,
+        "the Service Request was verified and the UE is connected"
+    );
+    assert!(!ue.taken_over, "the peer updates went out once");
+
+    let udm = udm_seen.lock().unwrap().clone();
+    let put = udm
+        .iter()
+        .find(|(uri, _)| {
+            uri.contains(&format!(
+                "/nudm-uecm/v1/{supi}/registrations/amf-3gpp-access"
+            ))
+        })
+        .unwrap_or_else(|| panic!("UECM registration at the UDM: {udm:?}"));
+    let body: serde_json::Value = serde_json::from_str(&put.1).expect("json");
+    assert_eq!(body["amfInstanceId"], instance, "as the serving AMF");
+    assert!(
+        ue.amf_ue.uecm_dereg_token.as_deref() != original.amf_ue.uecm_dereg_token.as_deref()
+            && ue.amf_ue.uecm_dereg_token.is_some(),
+        "the accepted registration's token is the UE's"
+    );
+
+    let calls = seen.lock().unwrap().clone();
+    let serving = calls
+        .iter()
+        .position(|(uri, body)| {
+            uri.contains("/sm-contexts/ref-686-t/modify") && body.contains("servingNfId")
+        })
+        .unwrap_or_else(|| panic!("the SMF is told of the new AMF: {calls:?}"));
+    let serving_body: serde_json::Value = serde_json::from_str(&calls[serving].1).expect("json");
+    assert_eq!(serving_body["servingNfId"], instance);
+    assert_eq!(
+        serving_body["smContextStatusUri"],
+        crate::sbi_path::sm_context_status_uri(supi, 5)
+    );
+    assert_eq!(
+        serving_body["guami"]["amfId"], "02556b",
+        "this AMF's GUAMI (pointer 0x2B)"
+    );
+    let activating = calls
+        .iter()
+        .position(|(uri, body)| {
+            uri.contains("/sm-contexts/ref-686-t/modify") && body.contains("ACTIVATING")
+        })
+        .unwrap_or_else(|| panic!("the session is re-activated: {calls:?}"));
+    assert!(
+        serving < activating,
+        "the SMF learns of the new AMF first: {calls:?}"
+    );
+    assert!(selected_seen.lock().unwrap().is_empty(), "no other SMF");
+    assert!(ue.guti_reallocation_owed, "a new 5G-GUTI is owed");
+    // The gNB set the UE context up: the new 5G-GUTI goes out.
+    peer.handle_initial_context_setup_response(1, &ics_response_pdu(id, 512, &[], &[]))
+        .await
+        .expect("ICS Response");
+    let ue = peer.ue_auth_state.get(id).expect("UE");
+    assert!(
+        !ue.guti_reallocation_owed
+            && ue.amf_ue.next_guti.amf_pointer == 0x2B
+            && ue.amf_ue.next_guti.tmsi != tmsi,
+        "a UE Configuration Update gives it a 5G-GUTI of this AMF's GUAMI"
+    );
+    assert!(
+        matches!(ue.retx.as_ref().map(|r| r.timer), Some(NasProcTimer::T3555)),
+        "supervised by T3555"
+    );
+    crash(&mut peer, id);
+}
+
+/// **#686 PR 2.** A takeover claims a record written by ANOTHER AMF instance, and only
+/// one whose 5G-S-TMSI matches. Once claimed, the record names the claimer, so the same
+/// AMF does not take it over again. A UE with no stored context is processed as before:
+/// its SERVICE REQUEST gets SERVICE REJECT #9.
+#[tokio::test]
+async fn a_takeover_claims_another_instance_s_record_and_without_one_nothing_changes() {
+    use super::super::ue_context_store::UeContextBackend as _;
+    crate::context::amf_context_init(64, 1024, 4096);
+    let backend = Arc::new(MemoryBackend::default());
+    let mut failed = storing_server(&backend).await;
+    let (old_id, tmsi, supi) = (6_861_001u64, 0x0686_1001u32, "imsi-001010000686100");
+    seed_registered_ue(&mut failed, old_id, tmsi, supi, "ref-686-u", 7777, false);
+    store_now(&mut failed).await;
+    crash(&mut failed, old_id);
+    let backend = only(&backend, supi);
+    stored_by(&backend, supi, DEAD_AMF);
+    const ME: &str = "00000000-0000-4000-8000-0000000000a1";
+    assert!(
+        backend
+            .take_over((0x155, 0x2A, tmsi + 1), ME)
+            .expect("lookup")
+            .is_none(),
+        "another 5G-S-TMSI"
+    );
+    assert!(
+        backend
+            .take_over((0x155, 0x2B, tmsi), ME)
+            .expect("lookup")
+            .is_none(),
+        "another AMF Pointer"
+    );
+    let claimed = backend
+        .take_over((0x155, 0x2A, tmsi), ME)
+        .expect("lookup")
+        .expect("the failed AMF's record");
+    assert_eq!(claimed.amf_instance_id, ME);
+    assert_eq!(backend.get(supi).expect("stored").amf_instance_id, ME);
+    assert!(
+        backend
+            .take_over((0x155, 0x2A, tmsi), ME)
+            .expect("lookup")
+            .is_none(),
+        "its own record is not taken over again"
+    );
+
+    let mut peer = set_peer_server(&Arc::new(MemoryBackend::default())).await;
+    peer.sent_ngap = Some(Vec::new());
+    let nas = protected_service_request([0; 4], 0x0686_1099);
+    peer.handle_initial_ue_message(1, &service_request_initial_ue(nas))
+        .await
+        .expect("handled");
+    assert!(
+        peer.sent_ngap.as_ref().unwrap().is_empty(),
+        "held for the lookup"
+    );
+    for _ in 0..3 {
+        settle_offloaded_sbi(&mut peer).await;
+    }
+    assert!(
+        !peer.sent_ngap.as_ref().unwrap().is_empty(),
+        "processed as before once nothing was found (SERVICE REJECT #9)"
+    );
+}
+
+/// **#686 PR 2, TS 23.502 §4.2.2.2.2 step 4.** The UE of a failed AMF comes back with an
+/// integrity-protected periodic REGISTRATION REQUEST (TS 24.501 §4.4.6) to another AMF of
+/// its set. Its context is taken over, the request is verified, the UDM and the SMF learn
+/// of the new AMF, and the Registration Accept's 5G-GUTI is one of this AMF's GUAMI.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_ue_of_a_failed_amf_is_taken_over_by_its_registration_request() {
+    let (_smf, port, seen) = fake_activating_smf().await;
+    let (_udm, udm_port, udm_seen) = fake_activating_smf().await;
+    let _env = SmfEnvGuard::acquire(port).await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    let backend = Arc::new(MemoryBackend::default());
+    let (old_id, tmsi) = (6_861_101u64, 0x0686_1101u32);
+    let supi = "imsi-001010000686111";
+    let mut failed = storing_server(&backend).await;
+    seed_registered_ue(&mut failed, old_id, tmsi, supi, "ref-686-r", port, false);
+    let original = failed.ue_auth_state.get(old_id).expect("seeded");
+    store_now(&mut failed).await;
+    crash(&mut failed, old_id);
+    drop(failed);
+    let backend = only(&backend, supi);
+    stored_by(&backend, supi, DEAD_AMF);
+
+    let mut peer = set_peer_server(&backend).await;
+    peer.udm_override = Some(("127.0.0.1".to_string(), udm_port));
+    peer.sent_ngap = Some(Vec::new());
+    let rr =
+        guti_registration_request(crate::gmm_build::registration_type::PERIODIC_UPDATING, tmsi);
+    let nas =
+        protected_initial_registration(&original.amf_ue, &rr, &rr, original.amf_ue.ul_count + 1);
+    peer.handle_initial_ue_message(1, &service_request_initial_ue(nas))
+        .await
+        .expect("handled");
+    for _ in 0..3 {
+        settle_offloaded_sbi(&mut peer).await;
+    }
+    let (id, ue) = peer.ue_auth_state.find_by_supi(supi).expect("taken over");
+    assert!(!ue.cm_idle && !ue.taken_over, "verified, peer updates sent");
+    assert_eq!(ue.amf_ue.next_guti.amf_pointer, 0x2B, "this AMF's GUAMI");
+    assert_ne!(ue.amf_ue.next_guti.tmsi, tmsi, "a new 5G-TMSI");
+    assert!(
+        udm_seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(uri, _)| uri.contains("registrations/amf-3gpp-access")),
+        "UECM registration"
+    );
+    assert!(
+        seen.lock()
+            .unwrap()
+            .iter()
+            .any(|(uri, body)| uri.contains("/sm-contexts/ref-686-r/modify")
+                && body.contains("servingNfId")),
+        "the SMF learns of the new AMF"
+    );
+    crash(&mut peer, id);
+}
+
+/// **#686 PR 2.** No store lookup for a UE this AMF holds, or for an identity of another
+/// AMF Set: those take the existing paths at once.
+#[tokio::test]
+async fn no_takeover_for_a_ue_held_here_or_of_another_amf_set() {
+    crate::context::amf_context_init(64, 1024, 4096);
+    let backend = Arc::new(MemoryBackend::default());
+    let mut peer = set_peer_server(&backend).await;
+    let tmsi = 0x0686_1201u32;
+    let held = protected_service_request([0; 4], tmsi);
+    assert_eq!(
+        peer.takeover_candidate(&held),
+        Some((0x155, 0x2A, tmsi)),
+        "a 5G-S-TMSI of this set held by no UE here is looked up"
+    );
+    let mut ue = idle_registered_ue(6_861_201);
+    ue.amf_ue.current_guti.tmsi = tmsi;
+    peer.ue_auth_state.insert(6_861_201, ue);
+    assert_eq!(peer.takeover_candidate(&held), None, "held here");
+    peer.ue_auth_state.remove(6_861_201);
+    peer.served_guami_override = Some(vec![(
+        crate::context::PlmnId::new("001", "01"),
+        0x02,
+        0x156,
+        0x2B,
+    )]);
+    assert_eq!(peer.takeover_candidate(&held), None, "another AMF Set");
+    let off = test_ngap_server().await;
+    assert_eq!(off.takeover_candidate(&held), None, "storage off");
 }
