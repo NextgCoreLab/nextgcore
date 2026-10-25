@@ -190,14 +190,49 @@ impl std::fmt::Debug for StoredUeContext {
     }
 }
 
+/// What a write found (#1185 review M1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Written {
+    Stored,
+    /// The record names another AMF instance: that AMF took the UE over, and this one
+    /// no longer serves it.
+    Lost,
+}
+
 /// Where the records live.
+///
+/// Writes and deletes are conditional on ownership (#1185 review M1): an AMF writes or
+/// deletes only a record that names it (or none). After another AMF of the set took a
+/// UE over, the old one, if it is alive after all, cannot undo the claim or delete the
+/// new owner's record.
 pub trait UeContextBackend: Send + Sync + 'static {
-    /// Write (insert or replace) the record of `rec.supi`.
-    fn put(&self, rec: &StoredUeContext) -> Result<(), String>;
-    /// Delete the record of `supi`, if any.
-    fn delete(&self, supi: &str) -> Result<(), String>;
+    /// Write (insert or replace) the record of `rec.supi`, unless it names another
+    /// instance than `rec.amf_instance_id`.
+    fn put(&self, rec: &StoredUeContext) -> Result<Written, String>;
+    /// Delete the record of `supi`, if it names `amf_instance_id`.
+    fn delete(&self, supi: &str, amf_instance_id: &str) -> Result<(), String>;
+    /// The instance the record of `supi` names, if there is one.
+    fn owner(&self, supi: &str) -> Result<Option<String>, String>;
     /// Every record written by the AMF instance `amf_instance_id`.
     fn load(&self, amf_instance_id: &str) -> Result<Vec<StoredUeContext>, String>;
+    /// #686 PR 2, the AMF Set takeover (TS 23.501 §5.21.2.3): the record holding the
+    /// 5G-S-TMSI `s_tmsi` that another AMF instance wrote, claimed for `to_instance`.
+    /// The claim is a compare-and-set on the writer instance (Annex C item 3 leaves
+    /// the race to the implementation), so of two AMFs taking one UE over only one gets
+    /// it. `None`: no such record, or another AMF claimed it first.
+    fn take_over(
+        &self,
+        s_tmsi: STmsi,
+        to_instance: &str,
+    ) -> Result<Option<StoredUeContext>, String>;
+}
+
+/// A 5G-S-TMSI as `(AMF Set ID, AMF Pointer, 5G-TMSI)` (TS 23.003 §2.11): how a UE in
+/// 5GMM-IDLE names itself.
+pub type STmsi = (u16, u8, u32);
+
+fn holds(rec: &StoredUeContext, (set, pointer, tmsi): STmsi) -> bool {
+    rec.guti.amf_set_id == set && rec.guti.amf_pointer == pointer && rec.guti.tmsi == tmsi
 }
 
 /// The MongoDB storage entity: one document per SUPI in [`COLLECTION`], `_id` = SUPI,
@@ -223,37 +258,115 @@ impl MongoBackend {
             .unwrap_or_else(|| client.database("nextgcore"));
         db.run_command(mongodb::bson::doc! { "ping": 1 }, None)
             .map_err(|e| e.to_string())?;
-        Ok(Self {
-            collection: db.collection(COLLECTION),
-        })
+        let collection: mongodb::sync::Collection<mongodb::bson::Document> =
+            db.collection(COLLECTION);
+        // #1185 review m3: a takeover looks a record up by its 5G-S-TMSI, a restart by
+        // its writer instance.
+        for keys in [
+            mongodb::bson::doc! {
+                "record.guti.amf_set_id": 1,
+                "record.guti.amf_pointer": 1,
+                "record.guti.tmsi": 1,
+            },
+            mongodb::bson::doc! { "amf_instance_id": 1 },
+        ] {
+            if let Err(e) =
+                collection.create_index(mongodb::IndexModel::builder().keys(keys).build(), None)
+            {
+                log::warn!("UE context store index not created: {e}");
+            }
+        }
+        Ok(Self { collection })
     }
 }
 
 impl UeContextBackend for MongoBackend {
-    fn put(&self, rec: &StoredUeContext) -> Result<(), String> {
+    fn take_over(
+        &self,
+        (set, pointer, tmsi): STmsi,
+        to_instance: &str,
+    ) -> Result<Option<StoredUeContext>, String> {
+        use mongodb::bson::doc;
+        let found = self
+            .collection
+            .find_one(
+                doc! {
+                    "record.guti.amf_set_id": i32::from(set),
+                    "record.guti.amf_pointer": i32::from(pointer),
+                    "record.guti.tmsi": i64::from(tmsi),
+                    "amf_instance_id": { "$ne": to_instance },
+                },
+                None,
+            )
+            .map_err(|e| e.to_string())?;
+        let Some(doc) = found else {
+            return Ok(None);
+        };
+        let from = doc
+            .get_str("amf_instance_id")
+            .unwrap_or_default()
+            .to_string();
+        let mut rec: StoredUeContext = doc
+            .get("record")
+            .cloned()
+            .ok_or_else(|| "stored UE context without a record".to_string())
+            .and_then(|r| mongodb::bson::from_bson(r).map_err(|e| e.to_string()))?;
+        let claimed = self
+            .collection
+            .update_one(
+                doc! { "_id": &rec.supi, "amf_instance_id": &from },
+                doc! { "$set": {
+                    "amf_instance_id": to_instance,
+                    "record.amf_instance_id": to_instance,
+                } },
+                None,
+            )
+            .map_err(|e| e.to_string())?;
+        if claimed.modified_count != 1 {
+            return Ok(None);
+        }
+        rec.amf_instance_id = to_instance.to_string();
+        Ok(Some(rec))
+    }
+
+    fn put(&self, rec: &StoredUeContext) -> Result<Written, String> {
         use mongodb::bson::doc;
         let record = mongodb::bson::to_bson(rec).map_err(|e| e.to_string())?;
+        // Matched on the owner too: a record of another instance does not match, and
+        // the upsert then collides with its `_id`, which is how a lost UE shows.
+        match self.collection.replace_one(
+            doc! { "_id": &rec.supi, "amf_instance_id": &rec.amf_instance_id },
+            doc! {
+                "_id": &rec.supi,
+                "amf_instance_id": &rec.amf_instance_id,
+                "record": record,
+            },
+            mongodb::options::ReplaceOptions::builder()
+                .upsert(true)
+                .build(),
+        ) {
+            Ok(_) => Ok(Written::Stored),
+            Err(e) if is_duplicate_key(&e) => Ok(Written::Lost),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    fn delete(&self, supi: &str, amf_instance_id: &str) -> Result<(), String> {
         self.collection
-            .replace_one(
-                doc! { "_id": &rec.supi },
-                doc! {
-                    "_id": &rec.supi,
-                    "amf_instance_id": &rec.amf_instance_id,
-                    "record": record,
-                },
-                mongodb::options::ReplaceOptions::builder()
-                    .upsert(true)
-                    .build(),
+            .delete_one(
+                mongodb::bson::doc! { "_id": supi, "amf_instance_id": amf_instance_id },
+                None,
             )
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
 
-    fn delete(&self, supi: &str) -> Result<(), String> {
-        self.collection
-            .delete_one(mongodb::bson::doc! { "_id": supi }, None)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+    fn owner(&self, supi: &str) -> Result<Option<String>, String> {
+        Ok(self
+            .collection
+            .find_one(mongodb::bson::doc! { "_id": supi }, None)
+            .map_err(|e| e.to_string())?
+            .and_then(|d| d.get_str("amf_instance_id").ok().map(str::to_string)))
     }
 
     fn load(&self, amf_instance_id: &str) -> Result<Vec<StoredUeContext>, String> {
@@ -282,6 +395,15 @@ impl UeContextBackend for MongoBackend {
     }
 }
 
+/// Whether `e` is MongoDB's duplicate key error (11000).
+fn is_duplicate_key(e: &mongodb::error::Error) -> bool {
+    use mongodb::error::{ErrorKind, WriteFailure};
+    matches!(
+        e.kind.as_ref(),
+        ErrorKind::Write(WriteFailure::WriteError(w)) if w.code == 11000
+    )
+}
+
 /// An in-process backend, for tests and for a deployment that wants none persisted
 /// across processes.
 #[derive(Default)]
@@ -290,6 +412,15 @@ pub struct MemoryBackend {
 }
 
 impl MemoryBackend {
+    /// Store `rec` whoever the stored record names: a test standing in for another AMF.
+    #[cfg(test)]
+    pub fn force(&self, rec: StoredUeContext) {
+        self.records
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(rec.supi.clone(), rec);
+    }
+
     /// The record of `supi`, if stored.
     pub fn get(&self, supi: &str) -> Option<StoredUeContext> {
         self.records
@@ -301,20 +432,51 @@ impl MemoryBackend {
 }
 
 impl UeContextBackend for MemoryBackend {
-    fn put(&self, rec: &StoredUeContext) -> Result<(), String> {
-        self.records
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(rec.supi.clone(), rec.clone());
+    fn take_over(
+        &self,
+        s_tmsi: STmsi,
+        to_instance: &str,
+    ) -> Result<Option<StoredUeContext>, String> {
+        let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(records
+            .values_mut()
+            .find(|r| holds(r, s_tmsi) && r.amf_instance_id != to_instance)
+            .map(|r| {
+                r.amf_instance_id = to_instance.to_string();
+                r.clone()
+            }))
+    }
+
+    fn put(&self, rec: &StoredUeContext) -> Result<Written, String> {
+        let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
+        if records
+            .get(&rec.supi)
+            .is_some_and(|r| r.amf_instance_id != rec.amf_instance_id)
+        {
+            return Ok(Written::Lost);
+        }
+        records.insert(rec.supi.clone(), rec.clone());
+        Ok(Written::Stored)
+    }
+
+    fn delete(&self, supi: &str, amf_instance_id: &str) -> Result<(), String> {
+        let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
+        if records
+            .get(supi)
+            .is_some_and(|r| r.amf_instance_id == amf_instance_id)
+        {
+            records.remove(supi);
+        }
         Ok(())
     }
 
-    fn delete(&self, supi: &str) -> Result<(), String> {
-        self.records
+    fn owner(&self, supi: &str) -> Result<Option<String>, String> {
+        Ok(self
+            .records
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(supi);
-        Ok(())
+            .get(supi)
+            .map(|r| r.amf_instance_id.clone()))
     }
 
     fn load(&self, amf_instance_id: &str) -> Result<Vec<StoredUeContext>, String> {
@@ -331,7 +493,8 @@ impl UeContextBackend for MemoryBackend {
 
 enum WriterOp {
     Put(Box<StoredUeContext>),
-    Delete(String),
+    /// (SUPI, this AMF's instance).
+    Delete(String, String),
     Flush(tokio::sync::oneshot::Sender<()>),
 }
 
@@ -343,13 +506,17 @@ enum WriterOp {
 pub struct UeContextWriter {
     tx: std::sync::mpsc::Sender<WriterOp>,
     failed: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// SUPIs whose record another AMF instance holds now (#1185 review M1).
+    lost: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
 impl UeContextWriter {
     pub fn spawn(backend: Arc<dyn UeContextBackend>) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<WriterOp>();
         let failed: Arc<std::sync::Mutex<HashSet<String>>> = Arc::default();
+        let lost: Arc<std::sync::Mutex<HashSet<String>>> = Arc::default();
         let report = Arc::clone(&failed);
+        let report_lost = Arc::clone(&lost);
         let spawned = std::thread::Builder::new()
             .name("amf-ue-store".into())
             .spawn(move || {
@@ -367,8 +534,23 @@ impl UeContextWriter {
                 };
                 for op in rx {
                     match op {
-                        WriterOp::Put(rec) => outcome(&rec.supi, backend.put(&rec), "stored"),
-                        WriterOp::Delete(supi) => outcome(&supi, backend.delete(&supi), "deleted"),
+                        WriterOp::Put(rec) => {
+                            let written = backend.put(&rec);
+                            if let Ok(Written::Lost) = written {
+                                log::info!(
+                                    "UE context of {}: another AMF of the set holds it now",
+                                    rec.supi
+                                );
+                                report_lost
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .insert(rec.supi.clone());
+                            }
+                            outcome(&rec.supi, written.map(|_| ()), "stored")
+                        }
+                        WriterOp::Delete(supi, instance) => {
+                            outcome(&supi, backend.delete(&supi, &instance), "deleted")
+                        }
                         WriterOp::Flush(done) => {
                             let _ = done.send(());
                         }
@@ -378,7 +560,12 @@ impl UeContextWriter {
         if let Err(e) = spawned {
             log::error!("The UE context writer thread did not start: {e}");
         }
-        Self { tx, failed }
+        Self { tx, failed, lost }
+    }
+
+    /// The SUPIs another AMF instance took over, taken.
+    fn take_lost(&self) -> HashSet<String> {
+        std::mem::take(&mut *self.lost.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// The SUPIs whose last write or delete failed, taken.
@@ -390,8 +577,10 @@ impl UeContextWriter {
         let _ = self.tx.send(WriterOp::Put(Box::new(rec)));
     }
 
-    fn delete(&self, supi: &str) {
-        let _ = self.tx.send(WriterOp::Delete(supi.to_string()));
+    fn delete(&self, supi: &str, instance: &str) {
+        let _ = self
+            .tx
+            .send(WriterOp::Delete(supi.to_string(), instance.to_string()));
     }
 
     /// Resolves once everything enqueued before it reached the store.
@@ -405,15 +594,18 @@ impl UeContextWriter {
 /// The storage state an [`NgapServer`] keeps.
 pub(super) struct UeContextStore {
     writer: UeContextWriter,
+    /// The store itself, for the reads an AMF Set takeover makes off the NGAP task.
+    pub(super) backend: Arc<dyn UeContextBackend>,
     /// What was last written per SUPI (or restored), compared on each sweep.
     persisted: HashMap<String, StoredUeContext>,
     last_sweep: std::time::Instant,
 }
 
 impl UeContextStore {
-    pub(super) fn new(writer: UeContextWriter) -> Self {
+    pub(super) fn new(writer: UeContextWriter, backend: Arc<dyn UeContextBackend>) -> Self {
         Self {
             writer,
+            backend,
             persisted: HashMap::new(),
             last_sweep: std::time::Instant::now(),
         }
@@ -425,6 +617,9 @@ impl UeContextStore {
 pub struct PersistSummary {
     pub written: usize,
     pub deleted: usize,
+    /// UEs another AMF of the set took over (#1185 review M1): the caller forgets them
+    /// here, without releasing anything at the SMFs or the PCF.
+    pub lost: Vec<String>,
 }
 
 /// What [`NgapServer::restore_ue_contexts`] did.
@@ -443,8 +638,9 @@ fn key<const N: usize>(bytes: &[u8]) -> Option<[u8; N]> {
 
 impl NgapServer {
     /// Arm the UE context storage (#686): records are written from now on.
-    pub(super) fn attach_ue_context_store(&mut self, writer: UeContextWriter) {
-        self.ue_context_store = Some(UeContextStore::new(writer));
+    pub(super) fn attach_ue_context_store(&mut self, backend: Arc<dyn UeContextBackend>) {
+        let writer = UeContextWriter::spawn(Arc::clone(&backend));
+        self.ue_context_store = Some(UeContextStore::new(writer, backend));
     }
 
     /// Every UE's stored PDU sessions, by AMF UE NGAP ID: one pass over the SM context
@@ -558,8 +754,8 @@ impl NgapServer {
         if !due {
             return summary;
         }
-        let instance =
-            nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf);
+        let instance = self.amf_instance();
+        let instance = instance.as_str();
         let mut sessions = self.stored_sessions_by_ue();
         let mut current: HashMap<String, StoredUeContext> = HashMap::new();
         let mut held: HashSet<String> = HashSet::new();
@@ -579,16 +775,23 @@ impl NgapServer {
             return summary;
         };
         store.last_sweep = std::time::Instant::now();
+        for supi in store.writer.take_lost() {
+            store.persisted.remove(&supi);
+            summary.lost.push(supi);
+        }
         // A refused write is written again below (its record no longer matches), and a
         // refused delete of a UE still gone is sent again.
         for supi in store.writer.take_failed() {
             store.persisted.remove(&supi);
             if !held.contains(&supi) {
-                store.writer.delete(&supi);
+                store.writer.delete(&supi, instance);
                 summary.deleted += 1;
             }
         }
         for (supi, rec) in current {
+            if summary.lost.contains(&supi) {
+                continue;
+            }
             if store.persisted.get(&supi) != Some(&rec) {
                 store.writer.put(rec.clone());
                 store.persisted.insert(supi, rec);
@@ -602,7 +805,7 @@ impl NgapServer {
             .cloned()
             .collect();
         for supi in gone {
-            store.writer.delete(&supi);
+            store.writer.delete(&supi, instance);
             store.persisted.remove(&supi);
             summary.deleted += 1;
         }
@@ -651,8 +854,7 @@ impl NgapServer {
         &mut self,
         records: Vec<StoredUeContext>,
     ) -> RestoreSummary {
-        let instance =
-            nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf);
+        let instance = self.amf_instance();
         let served = self.served_guamis();
         let mut summary = RestoreSummary::default();
         let mut connected = Vec::new();
@@ -680,32 +882,11 @@ impl NgapServer {
                 summary.skipped += 1;
                 continue;
             }
-            let id = self.allocate_amf_ue_ngap_id();
-            let Some(state) = restored_ue(id, &rec) else {
-                log::warn!(
-                    "Stored UE context of {} has malformed keys; not restored",
-                    rec.supi
-                );
+            let Some(id) = self.install_restored(&rec) else {
                 summary.skipped += 1;
                 continue;
             };
-            self.ue_auth_state.insert(id, state);
             held.insert(rec.supi.clone());
-            for s in &rec.sessions {
-                self.sm_context_refs
-                    .insert((id, s.psi), s.sm_context_ref.clone());
-                if let Some(smf) = &s.smf {
-                    self.sm_context_smfs.insert((id, s.psi), smf.clone());
-                }
-                let ctx = crate::context::amf_self();
-                let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
-                if let Some(mut sess) = guard.sess_add(id, s.psi) {
-                    sess.sm_context_ref = Some(s.sm_context_ref.clone());
-                    sess.s_nssai = s.s_nssai.clone();
-                    sess.dnn = s.dnn.clone();
-                    guard.sess_update(&sess);
-                }
-            }
             log::info!(
                 "UE context of {} restored as UE {id}: {} PDU session(s), CM-{} when stored",
                 rec.supi,
@@ -754,9 +935,49 @@ pub(super) fn guti_served(served: &[ServedGuami], guti: &Guti5gs) -> bool {
 }
 
 impl NgapServer {
+    /// Put the UE of `rec` back into this AMF as a registered UE with its PDU sessions,
+    /// under a new AMF UE NGAP ID (returned). `None` when a stored key is malformed.
+    pub(super) fn install_restored(&mut self, rec: &StoredUeContext) -> Option<u64> {
+        let id = self.allocate_amf_ue_ngap_id();
+        let Some(state) = restored_ue(id, rec) else {
+            log::warn!(
+                "Stored UE context of {} has malformed keys; not restored",
+                rec.supi
+            );
+            return None;
+        };
+        self.ue_auth_state.insert(id, state);
+        for s in &rec.sessions {
+            self.sm_context_refs
+                .insert((id, s.psi), s.sm_context_ref.clone());
+            if let Some(smf) = &s.smf {
+                self.sm_context_smfs.insert((id, s.psi), smf.clone());
+            }
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(mut sess) = guard.sess_add(id, s.psi) {
+                sess.sm_context_ref = Some(s.sm_context_ref.clone());
+                sess.s_nssai = s.s_nssai.clone();
+                sess.dnn = s.dnn.clone();
+                guard.sess_update(&sess);
+            }
+        }
+        Some(id)
+    }
+
     /// This AMF's served GUAMIs. Tests fix them with `served_guami_override`, because the
     /// configured ones are process-global and other tests set them.
-    fn served_guamis(&self) -> Vec<ServedGuami> {
+    /// This AMF's nfInstanceId, the writer instance of its records. Tests run two AMFs in
+    /// one process with `instance_override` (the real one is process-global).
+    pub(super) fn amf_instance(&self) -> String {
+        #[cfg(test)]
+        if let Some(id) = &self.instance_override {
+            return id.clone();
+        }
+        nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf).to_string()
+    }
+
+    pub(super) fn served_guamis(&self) -> Vec<ServedGuami> {
         #[cfg(test)]
         if let Some(fixed) = &self.served_guami_override {
             return fixed.clone();
@@ -885,13 +1106,13 @@ pub(super) async fn open_from_env(server: &mut NgapServer) {
 
 /// Restore from `backend`, then arm it for writing (#686).
 pub(super) async fn open_with(server: &mut NgapServer, backend: Arc<dyn UeContextBackend>) {
-    let instance = nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf);
+    let instance = server.amf_instance();
     let loader = Arc::clone(&backend);
-    let records = tokio::task::spawn_blocking(move || loader.load(instance))
+    let records = tokio::task::spawn_blocking(move || loader.load(&instance))
         .await
         .map_err(|e| e.to_string())
         .and_then(|r| r);
-    server.attach_ue_context_store(UeContextWriter::spawn(backend));
+    server.attach_ue_context_store(backend);
     match records {
         Ok(records) => {
             let found = records.len();

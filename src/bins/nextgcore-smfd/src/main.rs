@@ -5076,6 +5076,33 @@ fn lookup_upf_seid(sm_context_ref: &str) -> Option<u64> {
     })
 }
 
+/// #686 PR 2: an AMF change for `sm_context_ref` (TS 29.502 §5.2.2.3.1): the new serving
+/// AMF's `smContextStatusUri` replaces the old one on the policy binding and the session.
+fn record_serving_amf(sm_context_ref: &str, serving_nf_id: &str, status_uri: &str) {
+    let handle = smf_self();
+    let Ok(ctx) = handle.read() else {
+        return;
+    };
+    if let Ok(mut bindings) = ctx.policy_bindings.write() {
+        if let Some(b) = bindings.get_mut(sm_context_ref) {
+            b.sm_context_status_uri = Some(status_uri.to_string());
+        }
+    }
+    if let Some(mut sess) = ctx
+        .sess_find_by_sm_context_ref(sm_context_ref)
+        .filter(|s| s.sm_context_ref.as_deref() == Some(sm_context_ref))
+    {
+        sess.sm_context_status_uri = Some(status_uri.to_string());
+        ctx.sess_update(&sess);
+    }
+    ctx.persist();
+    log::info!(
+        "SM Context Update for ref={sm_context_ref}: serving AMF is now {serving_nf_id} \
+         (status notifications to {})",
+        nextgcore_sbi::log_redact::redact_last_segment(status_uri)
+    );
+}
+
 /// Answer `upCnxState: ACTIVATING` (#518, TS 29.502 §5.2.2.3.2.2): rebuild the
 /// session's PDUSessionResourceSetupRequestTransfer from what establishment
 /// recorded and return it as `n2SmInfo` with `n2SmInfoType: PDU_RES_SETUP_REQ`.
@@ -5587,6 +5614,24 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
     }
 
     let n2_sm_info_type = req_body["n2SmInfoType"].as_str().unwrap_or("");
+
+    // #686 PR 2, TS 29.502 Table 6.1.6.2.2-1: `servingNfId` "shall be present upon
+    // inter-AMF change", with the new AMF's `smContextStatusUri`. The status
+    // notifications, and the N1N2 transfers this SMF addresses at that URI's authority,
+    // go to the new AMF from now on: the old one failed or handed the UE over.
+    if let (Some(serving), Some(status_uri)) = (
+        req_body["servingNfId"].as_str(),
+        req_body["smContextStatusUri"].as_str(),
+    ) {
+        record_serving_amf(sm_context_ref, serving, status_uri);
+        let nothing_else = n2_sm_info_type.is_empty()
+            && req_body["upCnxState"].is_null()
+            && req_body["n1SmMsg"].is_null()
+            && req_body["hoState"].is_null();
+        if nothing_else {
+            return SbiResponse::with_status(204);
+        }
+    }
     // #78 / TS 29.502 §5.2.2.3.4: `hoState` drives the N2 handover state machine
     // and was never read (grep found no occurrence in this file before #78).
     let ho_state = req_body["hoState"].as_str().unwrap_or("");
@@ -22237,6 +22282,48 @@ mod tests {
             .expect("session");
         assert!(sess.handover.forwarding_ids.is_empty());
         unseed_session(&reference);
+    }
+
+    /// **#686 PR 2, TS 29.502 Table 6.1.6.2.2-1.** An UpdateSMContext with `servingNfId`
+    /// and `smContextStatusUri` is an AMF change: the new AMF's URI replaces the old one on
+    /// the policy binding and the session, so status notifications and N1N2 transfers reach
+    /// the AMF that serves the UE now. With nothing else in the request it is answered 204.
+    #[tokio::test]
+    async fn an_amf_change_re_points_the_sm_context_status_uri() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let reference = seed_registered_session("imsi-001010000006862", 5, "internet");
+        seed_user_plane(&reference, (0x0006_8620, [10, 45, 0, 68]));
+        let new_uri =
+            "http://amf-b.example/namf-callback/v1/imsi-001010000006862/sm-context-status/5";
+        let resp = handle_sm_context_update(
+            &reference,
+            &ho_update(
+                &reference,
+                serde_json::json!({
+                    "servingNfId": "00000000-0000-4000-8000-0000000006b2",
+                    "smContextStatusUri": new_uri,
+                    "guami": { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": "02556b" },
+                    "servingNetwork": { "mcc": "001", "mnc": "01" },
+                }),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(resp.status, 204);
+        let ctx = smf_self();
+        let ctx = ctx.read().unwrap();
+        let binding = ctx
+            .policy_bindings
+            .read()
+            .unwrap()
+            .get(&reference)
+            .cloned()
+            .expect("binding");
+        assert_eq!(binding.sm_context_status_uri.as_deref(), Some(new_uri));
+        let sess = ctx
+            .sess_find_by_sm_context_ref(&reference)
+            .expect("session");
+        assert_eq!(sess.sm_context_status_uri.as_deref(), Some(new_uri));
     }
 
     /// A COMPLETED the SMF cannot carry out -- no target endpoint was learned at
