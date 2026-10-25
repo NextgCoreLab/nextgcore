@@ -1339,10 +1339,44 @@ fn smf_unreachable(e: &crate::sbi_path::SbiError) -> bool {
         | SbiError::NfInstanceNotFound
         | SbiError::ServiceNotFound(_) => true,
         // `call_smf_create_sm_context` reports a transport failure as "SMF request
-        // failed: ..." and an SMF that answered as "SMF returned status ...".
+        // failed: ..." and an SMF that answered as `SmfRefused`.
         SbiError::RequestFailed(m) => m.starts_with("SMF request failed"),
         _ => false,
     }
+}
+
+/// Whether an SMF's answer to a CreateSMContext asks the AMF to go elsewhere
+/// (#1101). TS 29.500 Table 5.2.7.2-1: with 500 NF_FAILOVER and with 503
+/// (NF_SERVICE_FAILOVER, or the service unavailable for now) the requester may
+/// re-select an alternative NF at once, or retry after a new discovery. smfd
+/// answers NF_FAILOVER from the moment it starts shutting down (#718 review M3).
+/// Re-selected for in the #796 window, like an unreachable SMF; any other answer
+/// is a refusal.
+fn smf_failing_over(e: &crate::sbi_path::SbiError) -> bool {
+    match e {
+        crate::sbi_path::SbiError::SmfRefused { status: 503, .. } => true,
+        crate::sbi_path::SbiError::SmfRefused {
+            status: 500,
+            cause: Some(c),
+        } => c == "NF_FAILOVER",
+        _ => false,
+    }
+}
+
+/// The Back-off timer value IE (TS 24.501 §9.11.2.5, GPRS timer 3, IEI 0x37) on a
+/// PDU SESSION ESTABLISHMENT REJECT #26 the AMF builds for a refused CreateSMContext
+/// (#1101): 10 s (unit 2 s, value 5). TS 24.501 §6.4.1.4.3: with it the UE starts
+/// T3396 and may ask again once it expires. Without it, the UE was left to its own
+/// default, and the devtest1 UE re-asked only after T3512, 7 min later.
+const ESTABLISHMENT_REJECT_BACK_OFF: [u8; 3] = [0x37, 0x01, (0b011 << 5) | 5];
+
+/// The PDU SESSION ESTABLISHMENT REJECT #26 "insufficient resources" the AMF sends
+/// when an SMF refused the CreateSMContext (TS 24.501 §8.3.3), with the
+/// [`ESTABLISHMENT_REJECT_BACK_OFF`] timer (#1101).
+fn establishment_reject_insufficient_resources(psi: u8, pti: u8) -> Vec<u8> {
+    let mut reject = vec![0x2E, psi, pti, 0xC3, 0x1A];
+    reject.extend_from_slice(&ESTABLISHMENT_REJECT_BACK_OFF);
+    reject
 }
 
 /// What [`NgapServer::take_contextless_ue_id`] found (#758).
@@ -10842,26 +10876,45 @@ impl NgapServer {
                 Ok(())
             }
             (Err(e), Some(p), Some((association_id, ran_ue_ngap_id))) => {
-                if smf_unreachable(&e) {
+                let failing_over = smf_failing_over(&e);
+                if failing_over {
+                    // #1101: this SMF asked to be replaced. Its endpoint sorts last in
+                    // the next selection (#664 hold-down), and its cached profile is
+                    // dropped, so the retry re-runs NRF discovery instead of picking it
+                    // again (TS 29.500 §5.2.7.2: "retry ... after a new discovery").
+                    let (host, port) = &a.smf;
+                    let ctx = nextgcore_sbi::context::global_context();
+                    ctx.note_endpoint_failure(host, *port, true);
+                    let evicted = ctx.evict_nf_instances_at_endpoint(host, *port).await;
+                    log::info!(
+                        "UE {}: SMF {host}:{port} answered PSI={} with {e}; re-selecting \
+                         (evicted {evicted:?})",
+                        a.amf_ue_ngap_id,
+                        a.psi
+                    );
+                }
+                if failing_over || smf_unreachable(&e) {
                     if let Some(w) = self.pending_establishments.get_mut(&key) {
                         w.in_flight = false;
                         w.next_attempt = std::time::Instant::now() + ESTABLISHMENT_RETRY_INTERVAL;
                     }
                     log::warn!(
-                        "UE {}: establishment retry PSI={} reached no SMF ({e})",
+                        "UE {}: establishment retry PSI={} reached no SMF that takes it ({e})",
                         a.amf_ue_ngap_id,
                         a.psi
                     );
                     return Ok(());
                 }
-                // An SMF answered and refused: as for a first attempt, 5GSM #26.
+                // An SMF answered and refused: as for a first attempt, 5GSM #26, with a
+                // back-off timer so the UE asks again (TS 24.501 §6.4.1.4.3).
                 self.pending_establishments.remove(&key);
                 log::warn!(
-                    "SMF SM Context Create failed ({e}); rejecting PSI={}",
+                    "SMF SM Context Create failed ({e}); rejecting PSI={} with 5GSM #26 and a \
+                     back-off timer",
                     a.psi
                 );
                 let pti = p.sm_pdu.get(2).copied().unwrap_or(0);
-                let reject = vec![0x2E, a.psi, pti, 0xC3, 0x1A];
+                let reject = establishment_reject_insufficient_resources(a.psi, pti);
                 self.send_n1_sm_to_ue(
                     association_id,
                     a.amf_ue_ngap_id,
@@ -19974,6 +20027,13 @@ fn gmm_cause_from_sbi_error(err: &crate::sbi_path::SbiError) -> GmmCause {
                 GmmCause::PayloadWasNotForwarded
             }
         }
+        // #1101: the SMF's status, mapped as the "returned status" text was.
+        SbiError::SmfRefused { status, .. } => match status {
+            404 => GmmCause::UeIdentityCannotBeDerivedByTheNetwork,
+            403 => GmmCause::FiveGsServicesNotAllowed,
+            400 => GmmCause::SemanticallyIncorrectMessage,
+            _ => GmmCause::PayloadWasNotForwarded,
+        },
         SbiError::Timeout | SbiError::GatewayTimeout => GmmCause::PayloadWasNotForwarded,
         SbiError::NfInstanceNotFound | SbiError::ServiceNotFound(_) => {
             GmmCause::PayloadWasNotForwarded
