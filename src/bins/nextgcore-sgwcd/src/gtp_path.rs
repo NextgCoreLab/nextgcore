@@ -5011,6 +5011,52 @@ mod tests {
         server.close();
     }
 
+    /// #1132, TS 29.274 Table 7.2.2-2: the S11 Create Session Response's Bearer
+    /// Context created carries the S5/S8-U PGW F-TEID at instance 2 (interface
+    /// type 5): the endpoint the stand-in PGW gave (TEID 0x0BEE_F002 at
+    /// 127.0.0.1). Golden bytes of the F-TEID IE: type 0x57, length 9, instance
+    /// 2, V4 | interface 5, TEID, IPv4. mmed's parser reads this instance and type
+    /// (`s11_handler::tests::bearer_contexts_created_parse_as_sgwcd_encodes_them`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_s11_create_session_response_carries_the_pgw_s5u_fteid() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let _sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let _pgw = with_stand_in_pgw().await;
+        let server = test_server(&ambient, 1000, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x32, 0xf1];
+        sock.send_to(&csr(0x1132, &imsi).encode(), server.local_addr())
+            .unwrap();
+        let rsp = recv_s11(&sock).await.expect("create session response");
+        assert_eq!(cause_of(&rsp), gtp_cause::REQUEST_ACCEPTED);
+        let bc_ie = rsp
+            .get_ie(Gtp2IeType::BearerContext as u8, 0)
+            .expect("a Bearer Context created");
+        let bc = Gtp2BearerContextIe::decode(&bc_ie.value).unwrap();
+        let pgw_u = bc.fteid(2).unwrap().expect("the S5/S8-U PGW F-TEID");
+        assert_eq!(pgw_u.interface_type, 5, "S5/S8 PGW GTP-U");
+        assert_eq!(pgw_u.teid, 0x0BEE_F002);
+        assert_eq!(pgw_u.ipv4_addr, Some([127, 0, 0, 1]));
+        let golden = [
+            0x57, 0x00, 0x09, 0x02, 0x85, 0x0B, 0xEE, 0xF0, 0x02, 0x7F, 0x00, 0x00, 0x01,
+        ];
+        assert!(
+            bc_ie.value.windows(golden.len()).any(|w| w == golden),
+            "the F-TEID IE on the wire: {:02x?}",
+            &bc_ie.value[..]
+        );
+        let ue = sgwc_self().ue_find_by_imsi(&imsi).unwrap();
+        sgwc_self().ue_remove(ue.id);
+        sgwc_self().set_pgw_s5c_peer(None);
+        server.close();
+    }
+
     /// #54 criterion 2: a non-accepted PFCP cause yields a MAPPED GTP cause, not a
     /// hard-coded `REQUEST_ACCEPTED`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
