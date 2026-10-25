@@ -644,3 +644,238 @@ async fn an_an_release_during_the_join_sends_no_initial_context_setup() {
     server.forced_amf_ue_ngap_id = None;
     server.forget_ue(new);
 }
+
+// ---------------------------------------------------------------------------
+// #922 part 3: the N2 SM relays, the Path Switch, the Modify Indication and the
+// registration update's sessions
+// ---------------------------------------------------------------------------
+
+/// The PDU sessions a PDU SESSION RESOURCE MODIFY CONFIRM reports failed, or `None`
+/// when `pdu` is not a Modify Confirm.
+fn modify_confirm_failed_psis(pdu: &[u8]) -> Option<Vec<u8>> {
+    use g::PDUSessionResourceModifyConfirmProtocolIEs_EntryValue as Ie;
+    use nextgcore_ngap_gen::generated as g;
+    let Ok(g::NGAP_PDU::SuccessfulOutcome(out)) = nextgcore_ngap_gen::decode(pdu) else {
+        return None;
+    };
+    let g::SuccessfulOutcomeValue::Id_PDUSessionResourceModifyIndication(confirm) = out.value
+    else {
+        return None;
+    };
+    let mut failed = Vec::new();
+    for e in confirm.protocol_i_es.0 {
+        if let Ie::Id_PDUSessionResourceFailedToModifyListModCfm(l) = e.value {
+            failed.extend(l.0.into_iter().map(|i| i.pdu_session_id.0));
+        }
+    }
+    Some(failed)
+}
+
+/// TS 23.502 §4.9.1.2.2 steps 2-7: a PATH SWITCH REQUEST whose session is held at a
+/// blackholed SMF does not hold the NGAP task. Another UE's Path Switch is acknowledged
+/// meanwhile. The first is answered only when the AMF stops waiting: nothing was
+/// switched, so a PATH SWITCH REQUEST FAILURE (TS 38.413 §8.4.4.3), and the UE stays on
+/// its source.
+///
+/// REVERT-VERIFIED: with the Update SM Context awaited on the NGAP task, the handler
+/// takes the connect timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_path_switch_to_a_blackholed_smf_does_not_hold_the_ngap_task() {
+    crate::context::amf_context_init(64, 1024, 4096);
+    let (_smf, port, _calls) = path_switch_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (source, target) = (97_923_001u64, 97_923_002u64);
+    seed_gnb_session(&server, source).await;
+    seed_gnb_session(&server, target).await;
+    let (dead, live) = (7_923_011u64, 7_923_012u64);
+    for (ue, ran) in [(dead, 31u32), (live, 32)] {
+        let mut state = UeNasContext::new(ue, ran, source, false);
+        state.registered = true;
+        server.ue_auth_state.insert(ue, state);
+    }
+    hold_blackholed(&mut server, dead, 5, "ps922-dead-5");
+    hold_session(&mut server, live, 5, "ps922-live-5", port);
+
+    let started = Instant::now();
+    for (ue, ran) in [(dead, 41u32), (live, 42)] {
+        server
+            .handle_path_switch_request(target, &path_switch_request_pdu(ue, ran, &[5]))
+            .await
+            .expect("handled");
+    }
+    assert!(
+        started.elapsed() < AT_ONCE,
+        "the handler waited {:?} for the SMF",
+        started.elapsed()
+    );
+    // The answered UE is acknowledged and moved to the target.
+    let mut acks = Vec::new();
+    for _ in 0..300 {
+        server.process_sbi_outcomes().await;
+        acks.extend(take_sent_ngap(&mut server));
+        if !acks.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(acks.len(), 1, "{acks:?}");
+    let (switched, _) = decoded_path_switch_ack(&acks[0].1).expect("an Acknowledge");
+    assert_eq!(switched, vec![(5, transfer_for("ps922-live-5"))]);
+    assert_eq!(
+        server.ue_auth_state.get(live).expect("UE").association_id,
+        target
+    );
+    // The blackholed one: nothing yet, and still on its source.
+    assert_eq!(
+        server.ue_auth_state.get(dead).expect("UE").association_id,
+        source
+    );
+
+    joins_due(&mut server);
+    server.process_smf_join_deadlines().await;
+    let sent = take_sent_ngap(&mut server);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    let (amf, ran, released) =
+        decoded_path_switch_failure(&sent[0].1).expect("a PATH SWITCH REQUEST FAILURE");
+    assert_eq!((amf, ran, released.len()), (dead, 41, 1));
+    assert_eq!(
+        server.ue_auth_state.get(dead).expect("UE").association_id,
+        source
+    );
+    forget_amf_sessions(dead);
+    forget_amf_sessions(live);
+    server.forget_ue(dead);
+    server.forget_ue(live);
+}
+
+/// TS 38.413 §8.2.4: a PDU SESSION RESOURCE MODIFY INDICATION for a session at a
+/// blackholed SMF does not hold the NGAP task, and its Modify Confirm waits for the
+/// SMF. When the AMF stops waiting, the session is reported failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_modify_indication_to_a_blackholed_smf_does_not_hold_the_ngap_task() {
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_923_021u64, 51u32);
+    secured_registered_ue(&mut server, ue, ran);
+    hold_blackholed(&mut server, ue, 5, "mi922-dead-5");
+    let indication = crate::ngap_asn1::tests::modify_indication_bytes(ue, ran, &[(5, vec![0x51])]);
+
+    let started = Instant::now();
+    server
+        .handle_pdu_session_resource_modify_indication(ASSOC, &indication)
+        .await
+        .expect("handled");
+    assert!(started.elapsed() < AT_ONCE, "{:?}", started.elapsed());
+    server.process_sbi_outcomes().await;
+    assert!(
+        take_sent_ngap(&mut server).is_empty(),
+        "no Confirm before the SMF answers"
+    );
+
+    joins_due(&mut server);
+    server.process_smf_join_deadlines().await;
+    let sent = take_sent_ngap(&mut server);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].0, ASSOC);
+    assert_eq!(modify_confirm_failed_psis(&sent[0].1), Some(vec![5]));
+    forget_amf_sessions(ue);
+    server.forget_ue(ue);
+}
+
+/// TS 23.502 §4.2.2.2.2 step 21: a connected UE's registration update re-activating a
+/// session at a blackholed SMF does not hold the NGAP task, and the Accept waits for
+/// the SMF. When the AMF stops waiting, the Accept goes on its own, reporting the
+/// re-activation failed (TS 24.501 §8.2.7.15).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_registration_update_to_a_blackholed_smf_does_not_hold_the_ngap_task() {
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_923_031u64, 61u32);
+    registered_ue_with_guti(&mut server, ue, ran);
+    hold_blackholed(&mut server, ue, 1, "ru922-dead-1");
+    let rr = ue_protect(
+        &update_registration_request(
+            crate::gmm_build::registration_type::PERIODIC_UPDATING,
+            Some(1 << 1),
+            None,
+        ),
+        0,
+    );
+
+    let started = Instant::now();
+    let _ = server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &rr))
+        .await;
+    assert!(started.elapsed() < AT_ONCE, "{:?}", started.elapsed());
+    server.process_sbi_outcomes().await;
+    assert!(
+        take_sent_ngap(&mut server).is_empty(),
+        "no Accept before the SMF answers"
+    );
+
+    joins_due(&mut server);
+    server.process_smf_join_deadlines().await;
+    let sent: Vec<Sent> = take_sent_ngap(&mut server)
+        .into_iter()
+        .map(|(_, p)| decode_sent(&p))
+        .collect();
+    let [Sent::DownlinkNas { nas_pdu, .. }] = sent.as_slice() else {
+        panic!("a standalone Accept: {sent:?}");
+    };
+    let accept = registration_accept_of(nas_pdu);
+    assert_eq!(accept.pdu_session_reactivation_result, Some(1 << 1));
+    forget_amf_sessions(ue);
+    server.forget_ue(ue);
+}
+
+/// The N2 SM containers nothing waits for -- a Setup Response's failed session, a
+/// Notify's notified and released sessions -- are relayed off the NGAP task: against
+/// a blackholed SMF the handlers return at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn n2_sm_relays_to_a_blackholed_smf_do_not_hold_the_ngap_task() {
+    use nextgcore_ngap::{builder as b, types as t};
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_923_041u64, 71u32);
+    secured_registered_ue(&mut server, ue, ran);
+    for psi in [1u8, 2, 3] {
+        hold_blackholed(&mut server, ue, psi, &format!("relay922-{psi}"));
+    }
+    let setup = b::build_pdu_session_resource_setup_response(&t::PduSessionResourceSetupResponse {
+        amf_ue_ngap_id: ue,
+        ran_ue_ngap_id: ran,
+        setup_list: vec![],
+        failed_list: vec![t::PduSessionResourceFailedItem {
+            pdu_session_id: 1,
+            transfer: vec![0x11],
+        }],
+    })
+    .expect("setup response");
+    let notify = b::build_pdu_session_resource_notify(&t::PduSessionResourceNotify {
+        amf_ue_ngap_id: ue,
+        ran_ue_ngap_id: ran,
+        notify_list: vec![t::PduSessionResourceNotifyItem {
+            pdu_session_id: 2,
+            transfer: vec![0x21],
+        }],
+        released_list: vec![t::PduSessionResourceReleasedItem {
+            pdu_session_id: 3,
+            transfer: vec![0x31],
+        }],
+    })
+    .expect("notify");
+
+    let started = Instant::now();
+    server
+        .handle_pdu_session_resource_setup_response(ASSOC, &setup)
+        .await
+        .expect("handled");
+    server
+        .handle_pdu_session_resource_notify(ASSOC, &notify)
+        .await
+        .expect("handled");
+    assert!(started.elapsed() < AT_ONCE, "{:?}", started.elapsed());
+    assert!(
+        (1..=3).all(|psi| server.sbi_offload.key_busy((ue, psi))),
+        "each relay is queued on its session"
+    );
+    forget_amf_sessions(ue);
+    server.forget_ue(ue);
+}

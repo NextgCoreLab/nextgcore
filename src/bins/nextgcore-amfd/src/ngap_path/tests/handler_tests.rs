@@ -551,7 +551,7 @@ async fn two_activated_sessions_carry_the_accept_exactly_once() {
 
     let sent = connected_service_request(&mut server, ue, ran, Some((1 << 1) | (1 << 2))).await;
 
-    assert_eq!(calls.lock().expect("calls").len(), 2);
+    assert_eq!(calls.lock().expect("calls").len(), 2, "{:?}", calls.lock().expect("calls"));
     let mut psis = Vec::new();
     let mut accepts = 0;
     for (_, s) in &sent {
@@ -741,7 +741,9 @@ pub(super) async fn path_switch_smf() -> (
 /// A PATH SWITCH REQUEST ACKNOWLEDGE's switched `[(psi, transfer)]` and released
 /// `[(psi, unsuccessful transfer)]` lists, decoded with the generated codec.
 #[allow(clippy::type_complexity)]
-fn decoded_path_switch_ack(pdu: &[u8]) -> Option<(Vec<(u8, Vec<u8>)>, Vec<(u8, Vec<u8>)>)> {
+pub(super) fn decoded_path_switch_ack(
+    pdu: &[u8],
+) -> Option<(Vec<(u8, Vec<u8>)>, Vec<(u8, Vec<u8>)>)> {
     let g::NGAP_PDU::SuccessfulOutcome(m) = nextgcore_ngap_gen::decode(pdu).ok()? else {
         return None;
     };
@@ -782,7 +784,7 @@ fn decoded_path_switch_ack(pdu: &[u8]) -> Option<(Vec<(u8, Vec<u8>)>, Vec<(u8, V
     Some((switched, released))
 }
 
-fn forget_amf_sessions(ue: u64) {
+pub(super) fn forget_amf_sessions(ue: u64) {
     let ctx = crate::context::amf_self();
     let guard = ctx.read().unwrap();
     for sess in guard.sess_list_for_ue(ue) {
@@ -869,6 +871,8 @@ async fn a_session_the_smf_does_not_switch_is_released_in_the_acknowledge() {
         .handle_path_switch_request(target, &path_switch_request_pdu(ue, 68, &[5, 6]))
         .await
         .expect("handled");
+    // #922 part 3: the N11 calls run off the NGAP task.
+    drive_sbi(&mut server).await;
     let sent = take_sent_ngap(&mut server);
     forget_amf_sessions(ue);
     assert_eq!(sent.len(), 1, "{sent:?}");
@@ -877,11 +881,14 @@ async fn a_session_the_smf_does_not_switch_is_released_in_the_acknowledge() {
         decoded_path_switch_ack(&sent[0].1).expect("a PATH SWITCH REQUEST ACKNOWLEDGE");
     assert_eq!(switched, vec![(5, transfer_for("ps745-ok-5"))]);
     assert_eq!(released, vec![(6, unswitched.clone())]);
+    // #922 part 3: the two sessions' updates run concurrently: compare sorted.
+    let mut seen_calls = calls.lock().expect("calls").clone();
+    seen_calls.sort();
     assert_eq!(
-        calls.lock().expect("calls").clone(),
+        seen_calls,
         vec![
+            ("fail-ps745-6".to_string(), "PATH_SWITCH_REQ".to_string()),
             ("ps745-ok-5".to_string(), "PATH_SWITCH_REQ".to_string()),
-            ("fail-ps745-6".to_string(), "PATH_SWITCH_REQ".to_string())
         ]
     );
     // #778 follow-up: the session the Acknowledge releases has no user plane on the
@@ -906,6 +913,7 @@ async fn a_session_the_smf_does_not_switch_is_released_in_the_acknowledge() {
         .handle_path_switch_request(target, &path_switch_request_pdu(ue, 69, &[5, 6]))
         .await
         .expect("handled");
+    drive_sbi(&mut server).await;
     let sent = take_sent_ngap(&mut server);
     forget_amf_sessions(ue);
     assert_eq!(sent.len(), 1, "{sent:?}");
@@ -3605,6 +3613,8 @@ async fn an_ics_response_relays_only_the_sessions_the_request_set_up() {
         .process_ngap_message(ASSOC, &ics_response_with_sessions(ue, ran, &[1, 2]))
         .await
         .expect("handled");
+    // #922 part 3: the N11 calls run off the NGAP task.
+    drive_sbi(&mut server).await;
 
     let calls = calls.lock().expect("calls").clone();
     let refs: Vec<&str> = calls
@@ -3769,7 +3779,11 @@ async fn a_ue_requested_release_does_not_wait_for_the_smf() {
 
 /// A plain mobility (or periodic) REGISTRATION REQUEST under the UE's 5G-GUTI,
 /// with Uplink data status (0x40) and PDU session status (0x50) when given.
-fn update_registration_request(reg_type: u8, uds: Option<u16>, pss: Option<u16>) -> Vec<u8> {
+pub(super) fn update_registration_request(
+    reg_type: u8,
+    uds: Option<u16>,
+    pss: Option<u16>,
+) -> Vec<u8> {
     let mut rr = super::guti_registration_request(reg_type, 0x0759_0001);
     if let Some(b) = uds {
         rr.extend_from_slice(&[0x40, 0x02, b as u8, (b >> 8) as u8]);
@@ -3782,7 +3796,7 @@ fn update_registration_request(reg_type: u8, uds: Option<u16>, pss: Option<u16>)
 
 /// A registered, connected UE whose current 5G-GUTI is the one
 /// [`update_registration_request`] names.
-fn registered_ue_with_guti(server: &mut NgapServer, ue: u64, ran: u32) {
+pub(super) fn registered_ue_with_guti(server: &mut NgapServer, ue: u64, ran: u32) {
     secured_registered_ue(server, ue, ran);
     let guti = parse_registration_request_pdu(&update_registration_request(
         crate::gmm_build::registration_type::MOBILITY_UPDATING,
@@ -3798,7 +3812,9 @@ fn registered_ue_with_guti(server: &mut NgapServer, ue: u64, ran: u32) {
 }
 
 /// The decoded REGISTRATION ACCEPT inside a protected DL NAS PDU (NEA0).
-fn registration_accept_of(nas: &[u8]) -> nextgcore_nas::fiveg::message::RegistrationAccept {
+pub(super) fn registration_accept_of(
+    nas: &[u8],
+) -> nextgcore_nas::fiveg::message::RegistrationAccept {
     registration_accept_of_plain(&nas[7..])
 }
 
@@ -3829,6 +3845,8 @@ async fn a_mobility_update_releases_inactive_and_reactivates_uplink_sessions() {
     let _ = server
         .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &rr))
         .await;
+    // #922 part 3: the N11 calls run off the NGAP task.
+    drive_sbi(&mut server).await;
 
     let calls = calls.lock().expect("calls").clone();
     assert!(
@@ -3888,6 +3906,8 @@ async fn a_failed_reactivation_is_reported_in_a_standalone_accept() {
     let _ = server
         .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &rr))
         .await;
+    // #922 part 3: the N11 calls run off the NGAP task.
+    drive_sbi(&mut server).await;
     let sent: Vec<Sent> = take_sent_ngap(&mut server)
         .into_iter()
         .map(|(_, p)| decode_sent(&p))
@@ -4118,6 +4138,8 @@ async fn a_mobility_update_from_cm_idle_rides_an_initial_context_setup_with_its_
         .handle_initial_ue_message(ASSOC, &super::service_request_initial_ue(nas))
         .await
         .expect("the update is handled");
+    // #922 part 3: the N11 calls run off the NGAP task.
+    drive_sbi(&mut server).await;
 
     let calls = calls.lock().expect("calls").clone();
     assert_eq!(calls.len(), 2, "one release and one activation: {calls:?}");
@@ -4280,6 +4302,8 @@ async fn a_cm_idle_updates_ics_response_reaches_the_smf_for_the_reactivated_sess
         .handle_initial_ue_message(ASSOC, &pdu)
         .await
         .expect("the update is handled");
+    // #922 part 3: the N11 calls run off the NGAP task.
+    drive_sbi(&mut server).await;
     let sent = take_sent_ngap(&mut server);
     let ics = sent
         .iter()
@@ -4300,6 +4324,7 @@ async fn a_cm_idle_updates_ics_response_reaches_the_smf_for_the_reactivated_sess
         .process_ngap_message(ASSOC, &ics_response_with_sessions(new_id, 512, &[1]))
         .await
         .expect("handled");
+    drive_sbi(&mut server).await;
 
     let calls = calls.lock().expect("calls").clone();
     let uris = setup_response_uris(&calls);
@@ -4343,6 +4368,8 @@ async fn a_registration_update_from_cm_idle_answers_the_page_and_sets_its_sessio
         .handle_initial_ue_message(ASSOC, &pdu)
         .await
         .expect("the update is handled");
+    // #922 part 3: the N11 calls run off the NGAP task.
+    drive_sbi(&mut server).await;
 
     {
         let ctx = crate::context::amf_self();
@@ -4463,6 +4490,8 @@ async fn a_page_answered_by_an_update_without_session_ies_still_sets_its_session
         .handle_initial_ue_message(ASSOC, &pdu)
         .await
         .expect("the update is handled");
+    // #922 part 3: the N11 calls run off the NGAP task.
+    drive_sbi(&mut server).await;
 
     let calls = calls.lock().expect("calls").clone();
     assert!(
@@ -4748,6 +4777,8 @@ async fn an_ics_failure_after_an_idle_update_keeps_the_ue_registered_and_idle() 
         .handle_initial_ue_message(ASSOC, &super::service_request_initial_ue(nas))
         .await
         .expect("the update is handled");
+    // #922 part 3: the N11 calls run off the NGAP task.
+    drive_sbi(&mut server).await;
     let sent = take_sent_ngap(&mut server);
     assert!(decode_ics(&sent[0].1).is_some(), "the ICS went out");
 
@@ -4999,6 +5030,8 @@ async fn a_session_reactivated_by_a_registration_update_gets_no_second_setup() {
     let _ = server
         .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &rr))
         .await;
+    // #922 part 3: the N11 calls run off the NGAP task.
+    drive_sbi(&mut server).await;
     let first: Vec<Sent> = sent_to(&mut server, ue)
         .into_iter()
         .filter(|s| matches!(s, Sent::SetupRequest { .. }))
