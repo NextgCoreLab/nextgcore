@@ -669,7 +669,9 @@ pub fn nas_eps_send_tau_accept(
         return Err(NasError::EnbUeNotFound);
     }
 
-    log::debug!("[{}] Tracking area update accept", mme_ue.imsi_bcd);
+    // Info, not debug: the one line an operator (and the nextgsim real-binary
+    // TAU check) has that the accept went out (#1249).
+    log::info!("[{}] Tracking area update accept", mme_ue.imsi_bcd);
 
     let tai_list = vec![mme_ue.tai.clone()];
     // The EPS bearer context status is built from the bearers the caller passed, so
