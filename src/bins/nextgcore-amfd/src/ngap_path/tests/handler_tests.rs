@@ -1150,6 +1150,174 @@ async fn a_retried_establishment_carries_its_first_origination_timestamp() {
     server.forget_ue(ue);
 }
 
+/// A protected UL NAS TRANSPORT carrying `sm` (N1 SM information) for PSI
+/// `sm[1]`, with Request type "initial request" (TS 24.501 §8.2.10).
+fn ul_nas_transport_initial_request(sm: &[u8], count: u8) -> Vec<u8> {
+    let mut inner = vec![0x7E, 0x00, 0x67, 0x01];
+    inner.extend_from_slice(&(sm.len() as u16).to_be_bytes());
+    inner.extend_from_slice(sm);
+    inner.extend_from_slice(&[0x12, sm[1], 0x81]);
+    ue_protect(&inner, count)
+}
+
+/// #1036, TS 24.501 §5.4.5.2.5 a) 12). The UE retransmits its PDU SESSION
+/// ESTABLISHMENT REQUEST (Request type "initial request") after the AMF's
+/// CreateSMContext for it succeeded, e.g. because the Accept was lost on the
+/// radio. The AMF holds a routing context for the PSI, so it releases that
+/// session first: at the SMF (ReleaseSMContext, before the new create), and at
+/// the gNB (PDU SESSION RESOURCE RELEASE COMMAND), whose resources for the PSI
+/// would refuse the new setup. Then the request is a new establishment. Before,
+/// a second create overwrote the AMF's ref and orphaned the first SM context.
+///
+/// Revert-verified: without the release, the SMF sees create, create.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn an_initial_request_for_a_held_psi_releases_the_session_first() {
+    let (_smf, port, seen) = releasing_smf().await;
+    let _env = super::SmfEnvGuard::acquire(port).await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_103_601u64, 99);
+    ue_ready_for_sessions(&mut server, ue, ran);
+    establish_psi5_with_initial_request(&mut server, ue, ran).await;
+    let _ = take_sent_ngap(&mut server);
+
+    // T3580 expires at the UE: the same request again.
+    let request = [0x2E, 0x05, 0x01, 0xC1, 0xFF, 0xFF];
+    server
+        .handle_uplink_nas_transport(
+            ASSOC,
+            &uplink_nas_transport(ue, ran, &ul_nas_transport_initial_request(&request, 1)),
+        )
+        .await
+        .expect("handled");
+    settle_establishments(&mut server).await;
+    server.sbi_offload.settle().await;
+
+    let uris = seen.lock().expect("seen").clone();
+    assert_eq!(uris.len(), 3, "{uris:?}");
+    assert!(
+        uris[1].ends_with("/sm-contexts/est-1036-1/release"),
+        "the held SM context is released before the new create: {uris:?}"
+    );
+    assert!(uris[2].ends_with("/sm-contexts"), "{uris:?}");
+    assert_eq!(
+        server.sm_context_refs.get(&(ue, 5)).map(String::as_str),
+        Some("est-1036-3"),
+        "the new establishment holds the PSI"
+    );
+    let sent: Vec<Sent> = take_sent_ngap(&mut server)
+        .into_iter()
+        .map(|(_, p)| decode_sent(&p))
+        .collect();
+    let release = sent
+        .iter()
+        .position(|s| matches!(s, Sent::ReleaseCommand { psis, .. } if psis == &[5]));
+    let setup = sent.iter().position(|s| {
+        matches!(s, Sent::SetupRequest { items, .. }
+            if items.first().map(|i| i.psi) == Some(5))
+    });
+    assert!(
+        matches!((release, setup), (Some(r), Some(s)) if r < s),
+        "the gNB releases PSI 5 before its new setup: {sent:?}"
+    );
+    server.forget_ue(ue);
+}
+
+/// #1118 review n1: the release of the held SM context is durable. The UE goes
+/// away right after its colliding request (de-registered, released): its new
+/// establishment is dropped, but the SMF still gets the release, or the first SM
+/// context leaks there.
+///
+/// Revert-verified: with a non-durable release the SMF sees only the first create.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn the_release_of_a_held_psi_survives_the_ue_leaving() {
+    let (_smf, port, seen) = releasing_smf().await;
+    let _env = super::SmfEnvGuard::acquire(port).await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_103_602u64, 98);
+    ue_ready_for_sessions(&mut server, ue, ran);
+    establish_psi5_with_initial_request(&mut server, ue, ran).await;
+
+    let request = [0x2E, 0x05, 0x01, 0xC1, 0xFF, 0xFF];
+    server
+        .handle_uplink_nas_transport(
+            ASSOC,
+            &uplink_nas_transport(ue, ran, &ul_nas_transport_initial_request(&request, 1)),
+        )
+        .await
+        .expect("handled");
+    server.forget_ue(ue);
+    server.sbi_offload.settle().await;
+
+    let uris = seen.lock().expect("seen").clone();
+    assert!(
+        uris.iter()
+            .any(|u| u.ends_with("/sm-contexts/est-1036-1/release")),
+        "the held SM context is released at the SMF: {uris:?}"
+    );
+}
+
+/// A stand-in SMF that answers a create 201 with `smContextRef` "est-1036-<n>"
+/// (n = the request's position) and a release 204, recording each URI.
+async fn releasing_smf() -> (
+    nextgcore_sbi::server::SbiServer,
+    u16,
+    Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
+    let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+    let sink = Arc::clone(&seen);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let smf = nextgcore_sbi::server::SbiServer::on_listener(
+        nextgcore_sbi::server::SbiServerConfig::new(listener.local_addr().expect("addr")),
+        listener,
+    );
+    smf.start(move |req: SReq| {
+        let sink = Arc::clone(&sink);
+        async move {
+            let uri = req.header.uri.clone();
+            sink.lock().expect("sink").push(uri.clone());
+            if uri.ends_with("/release") {
+                return SResp::with_status(204);
+            }
+            let n = sink.lock().expect("sink").len();
+            let sm_ref = format!("est-1036-{n}");
+            let body = serde_json::json!({
+                "smContextRef": sm_ref,
+                "n1SmMsg": base64::engine::general_purpose::STANDARD
+                    .encode([0x2E, 0x05, 0x01, 0xC2]),
+                "n2SmInfo": base64::engine::general_purpose::STANDARD
+                    .encode(transfer_for(&sm_ref)),
+            });
+            SResp::with_status(201).with_body(body.to_string(), "application/json")
+        }
+    })
+    .await
+    .expect("stand-in SMF starts");
+    (smf, port, seen)
+}
+
+/// The UE establishes PSI 5 (Request type "initial request", uplink NAS COUNT
+/// 0) and the SMF's first create, "est-1036-1", is applied.
+async fn establish_psi5_with_initial_request(server: &mut NgapServer, ue: u64, ran: u32) {
+    let request = [0x2E, 0x05, 0x01, 0xC1, 0xFF, 0xFF];
+    server
+        .handle_uplink_nas_transport(
+            ASSOC,
+            &uplink_nas_transport(ue, ran, &ul_nas_transport_initial_request(&request, 0)),
+        )
+        .await
+        .expect("handled");
+    settle_establishments(server).await;
+    assert_eq!(
+        server.sm_context_refs.get(&(ue, 5)).map(String::as_str),
+        Some("est-1036-1"),
+        "the first create succeeded"
+    );
+}
+
 /// When no SMF comes back within the window, the UE is answered as TS 24.501
 /// prescribes for a routing failure (§5.4.5.2.5 a) 1), §5.4.5.3.1 e)): a DL NAS
 /// TRANSPORT carrying its own 5GSM message back, with 5GMM #90. The AMF does

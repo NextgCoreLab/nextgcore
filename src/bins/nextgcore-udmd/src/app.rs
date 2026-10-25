@@ -580,7 +580,7 @@ pub async fn run() -> Result<()> {
     log::info!("SBI HTTP/2 server stopped");
 
     // Close legacy SBI server
-    udm_sbi_close();
+    udm_sbi_close().await;
     log::info!("SBI server closed");
 
     // Cleanup state machine

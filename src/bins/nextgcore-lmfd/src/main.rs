@@ -2832,6 +2832,7 @@ async fn handle_nrppa_report(request: &SbiRequest) -> SbiResponse {
         .map(|arr| {
             arr.iter()
                 .map(|c| CellMeasurement {
+                    nr_ecid: None,
                     nr_cgi: c
                         .get("nrCgi")
                         .and_then(|v| v.as_str())
@@ -4420,6 +4421,7 @@ mod tests {
             guard.measurement_report(
                 req.request_id,
                 vec![CellMeasurement {
+                    nr_ecid: None,
                     nr_cgi: "001-01-424242-01".to_string(),
                     rsrp: Some(-70),
                     rsrq: Some(-9),
@@ -5313,6 +5315,7 @@ lmf:
             .measurement_report(
                 request_id,
                 vec![context::CellMeasurement {
+                    nr_ecid: None,
                     nr_cgi: "pci-501".to_string(),
                     rsrp: Some(-80),
                     rsrq: None,
@@ -8373,6 +8376,182 @@ mod positioning_chain_strict_peer {
         );
         let err = (fix.e - ue.0).hypot(fix.n - ue.1);
         assert!(err < 2.0, "the fix is {err:.2} m off, from all four TRPs");
+        let _ = amf_server.stop().await;
+        let _ = nrf_server.stop().await;
+    }
+
+    /// #1013, end to end through real amfd: a UE that reported Multi-RTT and not
+    /// DL-TDOA, NRPPa downlink on, and an NG-RAN node that answers TRP Information
+    /// with PRS configurations. The serving gNB does not answer Positioning
+    /// Information, so the gNB half fails and the session falls back to NR E-CID
+    /// (#906). The DL-PRS assistance data is built, but an E-CID session gets none of
+    /// it (#911): the only downlink LPP is the E-CID RequestLocationInformation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_ecid_fallback_session_sends_no_dl_prs_assistance_data() {
+        use crate::nrppa_positioning::test_support as gnb;
+        use nextgcore_nrppa_gen::generated as nrppa;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _serial = chain_lock().lock().await;
+        let supi = "imsi-001010000001013".to_string();
+        lmf_context_init(1024);
+        prime_lmf_self();
+        nrppa_downlink::set_for_test(true);
+        // Turned off again however the test ends, a failed assertion included, so
+        // the flag cannot leak into the next test (#1131 review).
+        struct NrppaDownlinkOff;
+        impl Drop for NrppaDownlinkOff {
+            fn drop(&mut self) {
+                nrppa_downlink::set_for_test(false);
+            }
+        }
+        let _downlink_off = NrppaDownlinkOff;
+        let node = crate::site_config::NgRanNode {
+            mcc: "001".into(),
+            mnc: "01".into(),
+            gnb_id: 0x1013,
+            bit_length: 22,
+        };
+        let origin = crate::positioning::TrpCoord::new(40.1, -74.5, 0.0);
+        let at = move |e: f64, n: f64| {
+            crate::positioning::enu_to_geodetic(
+                crate::positioning::EnuPoint { e, n, u: 0.0 },
+                origin,
+            )
+        };
+        let trps = [
+            (1u16, 77u16, 0.0, 0.0),
+            (2, 78, 1000.0, 0.0),
+            (3, 79, 0.0, 1000.0),
+        ];
+        {
+            let ctx = lmf_self();
+            let g = ctx.read().unwrap();
+            g.set_ng_ran_nodes(vec![node.clone()]);
+            for (k, e, n) in [
+                ("pci-78", 1000.0, 0.0),
+                ("pci-79", 0.0, 1000.0),
+                ("pci-80", 9.0, 9.0),
+            ] {
+                g.set_cell_coord(k, at(e, n));
+            }
+            // Multi-RTT and not DL-TDOA: without the gNB half, E-CID (#906).
+            g.note_ue_capabilities(
+                &supi,
+                &codec_glue::ReportedCapabilities {
+                    class: codec_glue::UeLppCapability::AdvancedMethods,
+                    ecid: codec_glue::EcidFlavours::default(),
+                    nr: codec_glue::NrMethods {
+                        multi_rtt: true,
+                        dl_tdoa: false,
+                    },
+                    transaction: None,
+                },
+            );
+        }
+        seed_amf_connected_ue(&supi);
+        let _ = amf_self().read().unwrap().non_ue_nrppa_drain();
+        // The NG-RAN node answers TRP Information with PRS configurations, and
+        // nothing else (Positioning Information goes unanswered).
+        let trp_info_answered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let answered = std::sync::Arc::clone(&trp_info_answered);
+        let answering = tokio::spawn(async move {
+            let scale = f64::from(1u32 << 31);
+            for _ in 0..500 {
+                for d in amf_self().read().unwrap().non_ue_nrppa_drain() {
+                    let Ok(nrppa::NRPPA_PDU::InitiatingMessage(m)) =
+                        nextgcore_nrppa_gen::decode(&d.nrppa_pdu)
+                    else {
+                        continue;
+                    };
+                    if m.procedure_code.0 != nrppa::ID_T_RP_INFORMATION_EXCHANGE {
+                        continue;
+                    }
+                    use nrppa::TRPInformationTypeResponseItem as I;
+                    let items = trps
+                        .iter()
+                        .map(|(id, pci, e, n)| {
+                            let c = at(*e, *n);
+                            (
+                                *id,
+                                vec![
+                                    I::PCI_NR(nrppa::TRPInformationTypeResponseItem_pCI_NR(*pci)),
+                                    I::PRSConfiguration(crate::dl_prs_assistance::tests::config(
+                                        vec![crate::dl_prs_assistance::tests::set(
+                                            0,
+                                            1,
+                                            5,
+                                            0,
+                                            0,
+                                            620_000,
+                                            &[(*id, 0)],
+                                        )],
+                                    )),
+                                    gnb::geographical(
+                                        (c.lat_deg * scale / 90.0).floor() as i32,
+                                        (c.lon_deg * scale / 180.0).floor() as i32,
+                                        0,
+                                    ),
+                                ],
+                            )
+                        })
+                        .collect();
+                    let answer =
+                        gnb::trp_information_response_items(m.nrppatransaction_id.0, items);
+                    lmf_self().read().unwrap().nrppa_deliver(
+                        nrppa::ID_T_RP_INFORMATION_EXCHANGE,
+                        m.nrppatransaction_id.0,
+                        None,
+                        answer,
+                    );
+                    answered.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        let (amf_server, nrf_server, mut tap_rx) = start_positioning_harness(supi.clone()).await;
+
+        let body = format!(
+            r#"{{"supi":"{supi}","supportedGADShapes":["POINT_UNCERTAINTY_CIRCLE"],
+                "locationQoS":{{"hAccuracy":5}},"maxRespTime":3,
+                "ncgi":{{"plmnId":{{"mcc":"001","mnc":"01"}},"nrCellId":"000000001"}}}}"#
+        );
+        let req =
+            SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json");
+        let det = tokio::spawn(async move { handle_determine_location(&req).await });
+
+        // The first downlink LPP is the E-CID request, not a ProvideAssistanceData.
+        let (_corr, dl) = tokio::time::timeout(Duration::from_secs(5), tap_rx.recv())
+            .await
+            .expect("a downlink LPP within budget")
+            .expect("captured");
+        assert!(
+            trp_info_answered.load(std::sync::atomic::Ordering::SeqCst),
+            "the assistance data was built (TRP Information answered), so only the method \
+             guard keeps it from the UE"
+        );
+        let txn = nextgcore_lpp_gen::decode(&dl)
+            .expect("decodes")
+            .transaction_id
+            .expect("a transactionID")
+            .transaction_number
+            .0;
+        assert_eq!(
+            dl,
+            codec_glue::build_lpp_request(codec_glue::LppMethod::NrEcid, txn).unwrap(),
+            "the only downlink is the NR E-CID RequestLocationInformation: {:?}",
+            nextgcore_lpp_gen::decode(&dl)
+        );
+
+        // Nothing else goes to the UE while the session runs out its budget.
+        let _ = tokio::time::timeout(Duration::from_secs(10), det)
+            .await
+            .expect("DetermineLocation did not hang");
+        answering.abort();
+        assert!(
+            tap_rx.try_recv().is_err(),
+            "no further downlink LPP (no ProvideAssistanceData after the request)"
+        );
         let _ = amf_server.stop().await;
         let _ = nrf_server.stop().await;
     }
