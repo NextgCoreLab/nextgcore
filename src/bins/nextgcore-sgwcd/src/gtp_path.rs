@@ -5814,7 +5814,19 @@ mod tests {
         let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x10, 0xf4];
         sock.send_to(&csr(0x1011, &imsi).encode(), server.local_addr())
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // #1197: wait until the Create is at the PGW (it holds it 300 ms), not
+        // for a fixed 100 ms: under load the S5/S8 relay can come later.
+        for _ in 0..300 {
+            if pgw
+                .seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&(Gtp2MessageType::CreateSessionRequest as u8))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         // The Create is at the PGW: the association goes.
         crate::pfcp_path::sxa_node()
             .unwrap()
@@ -5829,6 +5841,14 @@ mod tests {
         assert_eq!(cause_of(&rsp), gtp_cause::NO_RESOURCES_AVAILABLE);
         let deletes = pgw_deletes(&pgw, 1).await;
         assert_eq!(deletes, vec![(Some(0x0BEE_F001), Some(5), true)]);
+        // #1197: the PGW's Delete Session goes out before the local session and
+        // UE are removed, so its arrival is no proof they are gone yet: wait.
+        for _ in 0..300 {
+            if sgwc_self().ue_find_by_imsi(&imsi).is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         assert!(
             sgwc_self().ue_find_by_imsi(&imsi).is_none(),
             "the first PDN connection's UE context is removed with its session"
