@@ -124,14 +124,28 @@ jobs:
           cd src && cargo test --workspace
 
       - name: cargo test smfd, one test thread (test-isolation guards)
-        # #723: smfd's `require_test_lock` guards (teardown_association, the 5GSM
-        # timer map) can name a test that forgot PROCESS_STATE_TEST_LOCK /
-        # N4_TEST_LOCK only when no sibling holds the lock, i.e. in a serial run.
-        # The parallel run above cannot see such a test until it flakes a
-        # sibling. `--workspace --bin` keeps the workspace's feature unification,
-        # so this reuses the build above instead of rebuilding smfd's dependency
-        # graph with `-p`'s features; about 20 s.
+        # #723, #979: smfd's `require_test_lock` guards (teardown_association, the
+        # 5GSM timer map) check that the CALLER's test holds PROCESS_STATE_TEST_LOCK
+        # / N4_TEST_LOCK, by the holder's thread. On a runtime worker thread (a
+        # multi_thread test's spawned task) no holder can be named, and the check
+        # is only "someone holds it", exact in a serial run. #1092: releasing
+        # PROCESS_STATE_TEST_LOCK fails a test that left UEs, sessions or policy
+        # bindings behind ("TEST STATE LEAK"); this run names it. `--workspace
+        # --bin` keeps the workspace's feature unification, so this reuses the
+        # build above instead of rebuilding smfd's dependency graph with `-p`'s
+        # features; about 20 s.
         run: cd src && cargo test --workspace --bin nextgcore-smfd -- --test-threads=1
+
+      - name: cargo test smfd, 20 parallel runs (nightly)
+        # #979 option C: the interleavings a serial run cannot produce. Nightly
+        # and on demand only: about 20 x 4 min.
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: |
+          cd src
+          for i in $(seq 1 20); do
+            echo "smfd parallel run $i/20"
+            cargo test --workspace --bin nextgcore-smfd
+          done
 
       - name: cargo test (non-default features)
         # Feature-gated paths are invisible to the default build, so a gated

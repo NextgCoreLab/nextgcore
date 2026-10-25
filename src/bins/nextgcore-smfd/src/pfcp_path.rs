@@ -2485,7 +2485,7 @@ pub fn clear_pfcp_sessions() -> usize {
 /// [`stand_in::associated_upf`] takes THIS lock on the caller's behalf, so a test
 /// that wants both must take the ambient one itself and let the stand-in take this.
 #[cfg(test)]
-pub(crate) static N4_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(crate) static N4_TEST_LOCK: crate::context::TestLock = crate::context::TestLock::new();
 
 /// #723: a test that reaches [`PfcpClient::teardown_association`] must hold BOTH
 /// [`crate::context::PROCESS_STATE_TEST_LOCK`] and [`N4_TEST_LOCK`].
@@ -2593,7 +2593,7 @@ pub(crate) mod stand_in {
         /// usage-reporting capability was silently missing.
         pub(crate) establishment_bodies: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
         /// Serialises every N4 test against every other; released with this value.
-        _n4_guard: tokio::sync::MutexGuard<'static, ()>,
+        _n4_guard: crate::context::TestLockGuard,
     }
 
     impl Drop for StandInUpf {
@@ -3025,7 +3025,7 @@ pub(crate) mod stand_in {
     /// the stand-in.
     #[must_use = "the UPF client is uninstalled as soon as it is dropped"]
     pub(crate) struct RealUpf {
-        _n4_guard: tokio::sync::MutexGuard<'static, ()>,
+        _n4_guard: crate::context::TestLockGuard,
     }
 
     impl Drop for RealUpf {
@@ -4183,6 +4183,7 @@ mod tests {
     #[tokio::test]
     async fn a_upfs_teardown_scope_is_its_own_sessions() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _map_guard = N4_TEST_LOCK.lock().await;
         crate::context::smf_context_init(64, 256, 512);
         let (client_a, _upf_a) = make_client_with_peer().await;
