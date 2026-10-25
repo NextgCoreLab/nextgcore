@@ -323,6 +323,22 @@ impl GtpcServer {
         self.inner.local_addr
     }
 
+    /// Use `n3` for requests of `message_types` (TS 29.274 §7.6, #1228).
+    pub fn set_n3_for(&self, message_types: &[u8], n3: u32) {
+        if let Ok(mut xact) = self.inner.xact.lock() {
+            xact.set_n3_for(message_types, n3);
+        }
+    }
+
+    /// The N3 a request of `message_type` gets.
+    pub fn n3_for(&self, message_type: u8) -> u32 {
+        self.inner
+            .xact
+            .lock()
+            .map(|x| x.n3_for(message_type))
+            .unwrap_or(0)
+    }
+
     /// Local restart counter advertised in Recovery IEs
     pub fn restart_counter(&self) -> u8 {
         self.inner.restart_counter
@@ -663,6 +679,18 @@ fn advertised_addresses(
 
 /// Open the S11 GTP-C server socket
 /// Port of sgwc_gtp_open
+/// The S11/S5 GTP-C server as the process runs it: default T3/N3, except the
+/// paging-dependent bearer Requests relayed to the MME, whose transaction lasts
+/// T3 x (N3 + 1) = 54 s (#1228, TS 29.274 §7.6), beyond the MME's answer budget
+/// and inside the PGW's S5/S8 one (`nextgcore_gtp::v2::xact` documents the
+/// three).
+pub fn open_s11_server(bind: &str, restart_counter: u8) -> Result<GtpcServer, String> {
+    use nextgcore_gtp::v2::xact::{BEARER_PROCEDURE_REQUESTS, SGW_BEARER_PROCEDURE_N3};
+    let server = GtpcServer::open(bind, Gtp2XactConfig::default(), restart_counter)?;
+    server.set_n3_for(&BEARER_PROCEDURE_REQUESTS, SGW_BEARER_PROCEDURE_N3);
+    Ok(server)
+}
+
 pub fn gtp_open() -> Result<(), String> {
     if s11_server().is_some() {
         return Ok(());
@@ -686,7 +714,7 @@ pub fn gtp_open() -> Result<(), String> {
         None => advance_persistent_restart_counter(&restart_counter_path()),
     };
 
-    let server = GtpcServer::open(&bind, Gtp2XactConfig::default(), restart_counter)?;
+    let server = open_s11_server(&bind, restart_counter)?;
 
     let ctx = sgwc_self();
     // Advertised control-plane address: the bound address unless wildcard,

@@ -44,25 +44,21 @@ pub const T3485_DURATION: Duration = Duration::from_secs(8);
 /// Retransmissions before the fifth expiry aborts the procedure (§6.4.2.6).
 const T3485_RETRANSMISSIONS: u32 = 4;
 
-/// How long before the Serving GW's own deadline the answer must be out: the
-/// S11 one-way delay and the SGW's poll granularity, with room to spare.
-const ANSWER_MARGIN: Duration = Duration::from_secs(2);
-
-/// How long the MME may take to answer a Create Bearer Request (#1216 review M5).
+/// How long the MME may take to answer a Create Bearer Request (#1216 review M5,
+/// #1228).
 ///
-/// The Serving GW relays the request under its S11 transaction, T3 x (N3 + 1)
-/// (TS 29.274 §7.6; nextgcore-sgwcd uses the GTP library default, 3 s x 4 =
-/// 12 s), and gives up after it: it removes the bearer at the SGW-U and answers
-/// the PDN GW "Remote peer not responding" (sgwcd `dedicated_bearer::mme_silent`).
-/// An answer after that would set the bearer up in the MME, the eNB and the UE
-/// only. So the MME answers within that window less [`ANSWER_MARGIN`] (10 s):
-/// whatever is unsettled by then fails, paging "Unable to page UE", anything
-/// else "UE not responding". T3485 x 5 (40 s, TS 24.301 §6.4.2.6) and paging
-/// are cut short by it; a per-procedure T3/N3 on the SGW/PGW legs is tracked
-/// separately.
+/// The Serving GW relays the request under its S11 transaction and gives up
+/// after it: it removes the bearer at the SGW-U and answers the PDN GW "Remote
+/// peer not responding" (sgwcd `dedicated_bearer::mme_silent`). An answer after
+/// that would set the bearer up in the MME, the eNB and the UE only. sgwcd runs
+/// the paging-dependent bearer Requests with their own N3 (TS 29.274 §7.6),
+/// 3 s x (17 + 1) = 54 s, and the PGW its S5/S8 one for 60 s; the MME answers
+/// within `nextgcore_gtp::v2::xact::MME_BEARER_PROCEDURE_BUDGET` (50 s), which
+/// covers T3485 x 5 (40 s, TS 24.301 §6.4.2.6) and about 10 s of paging.
+/// Whatever is unsettled by then fails, paging "Unable to page UE", anything
+/// else "UE not responding".
 pub fn answer_budget() -> Duration {
-    let sgw = nextgcore_gtp::v2::xact::Gtp2XactConfig::default();
-    (sgw.t3_response * (sgw.n3_requests + 1)).saturating_sub(ANSWER_MARGIN)
+    nextgcore_gtp::v2::xact::MME_BEARER_PROCEDURE_BUDGET
 }
 
 /// Whether `ue` is in an Attach that has not completed (Annex F NOTE 2). A UE
