@@ -4684,7 +4684,10 @@ mod tests {
     #[test]
     fn a_create_session_response_stops_the_requests_retransmission() {
         let ambient = crate::pfcp_path::process_state_test_guard_blocking();
-        let server = test_server(&ambient, 50, 3);
+        // N3 = 100 (about 5 s of T3): a response delayed by load still finds its
+        // transaction rather than one already exhausted, and the wait below
+        // ends long before exhaustion could empty the table.
+        let server = test_server(&ambient, 50, 100);
         let pgw = client();
         let pgw_addr = pgw.local_addr().unwrap();
 
@@ -4707,6 +4710,21 @@ mod tests {
         response.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Cause as u8, 0, &[109, 0]));
         pgw.send_to(&response.encode(), server.local_addr())
             .unwrap();
+
+        // #909: wait until the response has completed the transaction. Under
+        // load, T3 (50 ms) can expire before the receive thread gets to the
+        // response; a retransmission sent before that is legitimate. Drain those.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while server.inner.xact.lock().unwrap().outstanding() != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the response completes the transaction"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        pgw.set_nonblocking(true).unwrap();
+        while pgw.recv_from(&mut buf).is_ok() {}
+        pgw.set_nonblocking(false).unwrap();
 
         // Several T3 periods later, nothing more has arrived.
         pgw.set_read_timeout(Some(Duration::from_millis(400)))
