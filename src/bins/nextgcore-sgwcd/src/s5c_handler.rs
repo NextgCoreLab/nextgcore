@@ -35,7 +35,7 @@ pub fn handle_create_session_response(
     session_cause: u8,
     pgw_s5c_teid: u32,
     pgw_s5u_teid: u32,
-    pgw_s5u_addr: Option<std::net::Ipv4Addr>,
+    pgw_s5u_addr: crate::context::IpAddr,
 ) -> HandlerResult {
     log::info!("Create Session Response");
 
@@ -83,18 +83,18 @@ pub fn handle_create_session_response(
             // forwards to nowhere: every uplink G-PDU failed "FAR has no outer header
             // creation". Bring-up never sent a packet, so only the first real attach's
             // ping showed it.
-            if let Some(addr) = pgw_s5u_addr {
-                ul_tunnel.remote_ip = crate::context::IpAddr {
-                    ipv4: Some(addr),
-                    ipv6: None,
-                };
+            // #1156, TS 29.274 §8.22: whichever families the PGW's F-TEID
+            // carries (an IPv6-only PGW-U included); `outer_header_creation`
+            // picks IPv4 when there is one, else IPv6.
+            if pgw_s5u_addr.ipv4.is_some() || pgw_s5u_addr.ipv6.is_some() {
+                ul_tunnel.remote_ip = pgw_s5u_addr;
             }
             ctx.tunnel_update(&ul_tunnel);
             log::info!(
                 "    SGW_S5U_TEID[{}] PGW_S5U_TEID[{}] PGW_S5U_ADDR[{:?}]",
                 ul_tunnel.local_teid,
                 ul_tunnel.remote_teid,
-                ul_tunnel.remote_ip.ipv4
+                ul_tunnel.remote_ip
             );
         }
     }
@@ -478,7 +478,7 @@ mod tests {
             gtp_cause::REQUEST_ACCEPTED,
             100,
             200,
-            None,
+            crate::context::IpAddr::default(),
         );
         matches!(result, HandlerResult::Error(gtp_cause::CONTEXT_NOT_FOUND));
     }

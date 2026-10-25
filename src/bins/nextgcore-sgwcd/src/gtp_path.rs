@@ -1775,10 +1775,16 @@ fn dispatch_s5c_create_session_response(msg: &Gtp2Message, peer: SocketAddr) {
         cause,
         pgw_c.as_ref().map(|ft| ft.teid).unwrap_or(0),
         pgw_u.as_ref().map(|ft| ft.teid).unwrap_or(0),
-        pgw_u
-            .as_ref()
-            .and_then(|ft| ft.ipv4_addr)
-            .map(std::net::Ipv4Addr::from),
+        crate::context::IpAddr {
+            ipv4: pgw_u
+                .as_ref()
+                .and_then(|ft| ft.ipv4_addr)
+                .map(std::net::Ipv4Addr::from),
+            ipv6: pgw_u
+                .as_ref()
+                .and_then(|ft| ft.ipv6_addr)
+                .map(std::net::Ipv6Addr::from),
+        },
     ) {
         crate::s5c_handler::HandlerResult::Error(cause) => {
             log::error!(
@@ -3709,6 +3715,9 @@ mod tests {
         delete_cause: std::sync::Arc<std::sync::atomic::AtomicU8>,
         /// How long a Create Session Request waits for its answer, in ms.
         create_delay_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        /// When set, the S5/S8-U F-TEID the Create Session Response gives is
+        /// IPv6-only, at this address (#1156).
+        s5u_ipv6: std::sync::Arc<std::sync::Mutex<Option<[u8; 16]>>>,
     }
 
     /// The address this stand-in allocates. Not in 10.45.0.0/16 and not anything a test
@@ -3730,6 +3739,8 @@ mod tests {
             gtp_cause::REQUEST_ACCEPTED,
         ));
         let create_delay_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let s5u_ipv6 = std::sync::Arc::new(std::sync::Mutex::new(None::<[u8; 16]>));
+        let s5u_v6 = s5u_ipv6.clone();
         let creates_seen = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let (dels, answer_dels) = (deletes.clone(), answer_deletes.clone());
         let (del_cause, create_delay) = (delete_cause.clone(), create_delay_ms.clone());
@@ -3813,7 +3824,11 @@ mod tests {
                 resp.add_ie(Gtp2PaaIe::ipv4(PGW_ALLOCATED_ADDR).to_ie(0));
                 let mut bc = Gtp2BearerContextIe::new();
                 bc.set_ebi(5);
-                bc.set_fteid(2, &Gtp2FTeidIe::new_ipv4(6, 0x0BEE_F002, [127, 0, 0, 1]));
+                let s5u = match *s5u_v6.lock().unwrap_or_else(|e| e.into_inner()) {
+                    Some(v6) => Gtp2FTeidIe::new_ipv6(6, 0x0BEE_F002, v6),
+                    None => Gtp2FTeidIe::new_ipv4(6, 0x0BEE_F002, [127, 0, 0, 1]),
+                };
+                bc.set_fteid(2, &s5u);
                 resp.add_bearer_context(0, &bc);
 
                 let _ = handle.send_to(&resp.encode(), from).await;
@@ -3827,6 +3842,7 @@ mod tests {
             answer_deletes,
             delete_cause,
             create_delay_ms,
+            s5u_ipv6,
         }
     }
 
@@ -4671,6 +4687,59 @@ mod tests {
              127.0.0.1); FARs carried {headers:?}"
         );
 
+        server.close();
+    }
+
+    /// #1156, TS 29.274 §8.22, TS 29.244 §8.2.56: a PGW-U S5/S8-U F-TEID carrying
+    /// only IPv6 gives the uplink FAR a GTP-U/UDP/IPv6 Outer Header Creation to
+    /// that address. Before, only the IPv4 half was stored and the FAR had none.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_ipv6_pgw_s5u_fteid_is_the_uplink_outer_header() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let pgw = with_stand_in_pgw().await;
+        let v6: [u8; 16] = [
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0x56,
+        ];
+        *pgw.s5u_ipv6.lock().unwrap() = Some(v6);
+        let server = test_server(&ambient, 1000, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x56, 0xf1];
+        sock.send_to(&csr(0x1156, &imsi).encode(), server.local_addr())
+            .unwrap();
+        let _ = recv_s11(&sock).await.expect("create session response");
+
+        let establishment = sgwu
+            .requests(50)
+            .into_iter()
+            .next()
+            .expect("a Session Establishment Request reached the SGW-U");
+        let decoded = nextgcore_pfcp::message::SessionEstablishmentRequest::decode(
+            &mut Bytes::from(establishment),
+        )
+        .expect("decodable establishment");
+        let uplink: Vec<_> = decoded
+            .create_fars
+            .iter()
+            .filter_map(|f| f.forwarding_parameters.as_ref())
+            .filter_map(|fp| fp.outer_header_creation.as_ref())
+            .filter(|ohc| ohc.teid == Some(0x0BEE_F002))
+            .map(|ohc| (ohc.description.gtpu_udp_ipv6, ohc.ipv6_addr, ohc.ipv4_addr))
+            .collect();
+        assert_eq!(
+            uplink,
+            vec![(true, Some(v6), None)],
+            "IPv6 outer header to the PGW-U"
+        );
+        let ue = sgwc_self().ue_find_by_imsi(&imsi).unwrap();
+        sgwc_self().ue_remove(ue.id);
+        sgwc_self().set_pgw_s5c_peer(None);
         server.close();
     }
 
