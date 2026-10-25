@@ -649,6 +649,10 @@ pub struct PfcpServer {
     /// for T1/N1 retransmission (TS 29.244 §7.2.2.3). Currently used for
     /// Session Report Requests (Downlink Data / Error Indication Reports).
     pending_reports: tokio::sync::Mutex<HashMap<u32, PendingReport>>,
+    /// Setups from unlisted addresses waiting for a re-resolution (#1112).
+    admission: std::sync::Mutex<PendingAdmission>,
+    /// Set while a held Setup is judged again, so it is answered, not held twice.
+    rejudging: AtomicBool,
     /// Heartbeat state: outstanding request sequence numbers and how many
     /// heartbeat rounds in a row went unanswered (TS 23.007 §19A).
     ///
@@ -827,38 +831,29 @@ fn report_time_ies(
     )
 }
 
-/// How long a Setup from an unlisted address waits for the allowlist's host names
-/// to be re-resolved (#1112). The PFCP receive loop waits with it, so it is short:
-/// cluster DNS answers in milliseconds, and a lookup that takes longer is left to the
-/// background refresh and the CP function's retry.
-const SETUP_RESOLVE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
-
-/// Whether a Setup from `src_addr`, which the last resolution does not list, is
-/// admitted once the host names are re-resolved (#1112). A restarted SMF pod is at
-/// an IP the periodic refresh may not have seen yet: it was refused cause 64 and
-/// admitted only on its retry, 10 s later, while it took creates it had no UPF for.
-/// Fail-closed as before: a stranger, a lookup that fails or one slower than
-/// [`SETUP_RESOLVE_WAIT`] still refuses.
-async fn admitted_after_resolving(allowed: &PeerAllowlist, src_addr: SocketAddr) -> bool {
-    if allowed.hosts().is_empty() {
-        return false;
-    }
-    let list = allowed.clone();
-    let ip = src_addr.ip();
-    let lookup = tokio::task::spawn_blocking(move || list.permits_resolving(ip));
-    let admitted = matches!(
-        tokio::time::timeout(SETUP_RESOLVE_WAIT, lookup).await,
-        Ok(Ok(true))
-    );
-    if admitted {
-        log::info!(
-            "PFCP Association Setup Request from {src_addr}: admitted after re-resolving \
-             the allowed CP function names {:?}",
-            allowed.hosts()
-        );
-    }
-    admitted
+/// Association Setup Requests from addresses the last resolution of the allowlist's
+/// host names does not contain, held while those names are re-resolved (#1112).
+///
+/// A restarted SMF pod is at an IP the periodic refresh may not have seen yet: it was
+/// refused cause 64 and admitted only on its retry, 10 s later, while it took creates
+/// it had no UPF for. Now its Setup waits for a fresh resolution and is judged
+/// against it. The lookup runs off the receive task, so nobody's PFCP traffic
+/// waits for DNS; the held Setups are judged again by the receive loop when it
+/// ends (or after [`ADMISSION_LOOKUP_MAX`]). Still fail-closed: an address the fresh
+/// answer does not list is refused, as is one beyond [`ADMISSION_MAX_HELD`].
+#[derive(Default)]
+struct PendingAdmission {
+    /// The resolution in flight, and when it began.
+    lookup: Option<(tokio::task::JoinHandle<()>, std::time::Instant)>,
+    /// The Setups waiting for it: (datagram, source).
+    held: Vec<(Vec<u8>, SocketAddr)>,
 }
+
+/// How long held Setups wait for a resolution before they are judged without it.
+const ADMISSION_LOOKUP_MAX: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How many Setups may wait at once; beyond it they are refused at once.
+const ADMISSION_MAX_HELD: usize = 64;
 
 impl PfcpServer {
     /// Create a new PFCP server
@@ -896,6 +891,8 @@ impl PfcpServer {
             pending_reports: tokio::sync::Mutex::new(HashMap::new()),
             heartbeat: tokio::sync::Mutex::new(HeartbeatState::default()),
             allowed_peers: std::sync::RwLock::new(PeerAllowlist::default()),
+            admission: std::sync::Mutex::new(PendingAdmission::default()),
+            rejudging: AtomicBool::new(false),
         })
     }
 
@@ -1115,6 +1112,8 @@ impl PfcpServer {
             // 100ms recv timeout gives this a sub-second polling cadence,
             // well under the multi-second T1 window.
             self.retransmit_pending_reports().await;
+            // #1112: Setups held for a re-resolution of the allowed CP names.
+            self.rejudge_held_setups().await;
         }
 
         Ok(())
@@ -1217,7 +1216,7 @@ impl PfcpServer {
                 }
             }
             pfcp_type::ASSOCIATION_SETUP_REQUEST => {
-                self.handle_association_setup_request(&header, payload, src_addr)
+                self.handle_association_setup_request(&header, payload, data, src_addr)
                     .await?;
             }
             pfcp_type::ASSOCIATION_RELEASE_REQUEST => {
@@ -1339,11 +1338,84 @@ impl PfcpServer {
         Ok(())
     }
 
+    /// Hold the Setup `datagram` from the unlisted `src_addr` for a re-resolution of
+    /// the allowlist's host names (#1112): `true` when held, `false` when it is to be
+    /// refused now -- it is being judged again already, the list names no host, a
+    /// resolution just ran (its answer decides), or too many are held.
+    fn hold_for_resolution(
+        &self,
+        allowed: &PeerAllowlist,
+        datagram: &[u8],
+        src_addr: SocketAddr,
+    ) -> bool {
+        if self.rejudging.load(Ordering::SeqCst) || allowed.hosts().is_empty() {
+            return false;
+        }
+        let mut pending = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+        if pending.held.len() >= ADMISSION_MAX_HELD {
+            return false;
+        }
+        if pending.lookup.is_none() {
+            if !allowed.try_begin_resolution() {
+                return false;
+            }
+            let list = allowed.clone();
+            let lookup = tokio::task::spawn_blocking(move || {
+                list.resolve_hosts();
+            });
+            pending.lookup = Some((lookup, std::time::Instant::now()));
+        }
+        // A retransmission of a held Setup is held once: it is answered once.
+        let seq = ParsedPfcpHeader::parse(datagram)
+            .map(|(h, _)| h.sequence_number)
+            .ok();
+        if pending.held.iter().any(|(d, from)| {
+            *from == src_addr
+                && ParsedPfcpHeader::parse(d)
+                    .ok()
+                    .map(|(h, _)| h.sequence_number)
+                    == seq
+        }) {
+            return true;
+        }
+        log::info!(
+            "PFCP Association Setup Request from {src_addr}, not in the last resolution of \
+             {:?}: held while they are re-resolved",
+            allowed.hosts()
+        );
+        pending.held.push((datagram.to_vec(), src_addr));
+        true
+    }
+
+    /// Judge again the Setups held for a resolution that has ended, or has taken
+    /// longer than [`ADMISSION_LOOKUP_MAX`] (#1112). Called by the receive loop.
+    async fn rejudge_held_setups(&self) {
+        let held = {
+            let mut pending = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+            let due = pending.lookup.as_ref().is_some_and(|(lookup, began)| {
+                lookup.is_finished() || began.elapsed() >= ADMISSION_LOOKUP_MAX
+            });
+            if !due {
+                return;
+            }
+            pending.lookup = None;
+            std::mem::take(&mut pending.held)
+        };
+        self.rejudging.store(true, Ordering::SeqCst);
+        for (datagram, src_addr) in held {
+            if let Err(e) = self.handle_message(&datagram, src_addr).await {
+                log::error!("PFCP held Association Setup from {src_addr}: {e}");
+            }
+        }
+        self.rejudging.store(false, Ordering::SeqCst);
+    }
+
     /// Handle Association Setup Request
     async fn handle_association_setup_request(
         &self,
         header: &ParsedPfcpHeader,
         payload: &[u8],
+        datagram: &[u8],
         src_addr: SocketAddr,
     ) -> Result<(), String> {
         log::info!("Handling Association Setup Request from {src_addr}");
@@ -1351,10 +1423,14 @@ impl PfcpServer {
         // SECURITY (#968): an association is accepted only from a configured CP function.
         // A refused Setup changes nothing: the live association and its sessions stay.
         let allowed = self.allowed_peers();
-        if !allowed.permits(src_addr.ip()) && !admitted_after_resolving(&allowed, src_addr).await {
-            // A restarted CP pod may be at an IP the last resolution predates: ask for
-            // an early re-resolution (rate-limited) so its NEXT attempt is judged
-            // against current DNS, should the bounded one above not have answered.
+        if !allowed.permits(src_addr.ip()) {
+            // #1112: held for a fresh resolution of the allowed names, and judged again
+            // when it ends, instead of refused on a resolution that predates the peer.
+            if self.hold_for_resolution(&allowed, datagram, src_addr) {
+                return Ok(());
+            }
+            // Refused. The background refresh is still kicked (rate-limited, sharing the
+            // slot above) so a later attempt is judged against current DNS.
             allowed.kick_refresh();
             note_refusal(format_args!(
                 "PFCP Association Setup Request from {src_addr}, which is not an allowed CP \
@@ -5679,11 +5755,12 @@ mod tests {
 
     /// #1112: a CP function named by host name whose address the last resolution
     /// predates -- an SMF pod that just restarted -- is admitted on its FIRST Setup:
-    /// the names are re-resolved before refusing. A stranger is still refused.
+    /// the Setup is held while the names are re-resolved, off the receive task, and
+    /// judged against the fresh answer.
     ///
-    /// REVERT-VERIFIED: without the re-resolution the SMF's first Setup is refused
-    /// with cause 64 (the name was never resolved here, as on a pod the periodic
-    /// refresh has not caught up with).
+    /// REVERT-VERIFIED: without the hold the SMF's first Setup is refused with cause
+    /// 64 (the name was never resolved here, as on a pod the periodic refresh has not
+    /// caught up with).
     #[tokio::test]
     async fn an_unresolved_cp_name_is_re_resolved_before_its_setup_is_refused() {
         let (server, smf, upf, _rx) = spawn_test_server().await;
@@ -5699,15 +5776,40 @@ mod tests {
         );
         assert!(server.is_associated().await);
 
+        // A stranger right after: the resolution the SMF's Setup started is fresh, so
+        // it is judged by it, without a lookup of its own, and refused.
         let stranger = UdpSocket::bind("127.0.0.66:0").await.unwrap();
         assert_eq!(
             setup_cause(&stranger, upf, Ipv4Addr::new(127, 0, 0, 66), 7).await,
             PfcpCause::RequestRejected as u8,
-            "fail-closed: a stranger is refused after the lookup"
+            "fail-closed: judged by the fresh resolution, and refused"
         );
         assert_eq!(
             server.association.read().await.as_ref().unwrap().peer_addr,
             smf.local_addr().unwrap()
+        );
+    }
+
+    /// #1112, fail closed: a stranger whose Setup itself starts the re-resolution is
+    /// held for it and refused once the fresh answer does not list it.
+    #[tokio::test]
+    async fn a_stranger_held_for_a_re_resolution_is_refused_after_it() {
+        let (server, _smf, upf, _rx) = spawn_test_server().await;
+        server.set_allowed_peers(PeerAllowlist::parse("localhost").unwrap());
+        let stranger = UdpSocket::bind("127.0.0.66:0").await.unwrap();
+        assert_eq!(
+            setup_cause(&stranger, upf, Ipv4Addr::new(127, 0, 0, 66), 7).await,
+            PfcpCause::RequestRejected as u8
+        );
+        assert!(!server.is_associated().await);
+        assert!(
+            server
+                .admission
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .held
+                .is_empty(),
+            "nothing left held"
         );
     }
 
