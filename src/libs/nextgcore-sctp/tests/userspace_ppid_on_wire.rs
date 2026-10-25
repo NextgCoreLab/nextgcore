@@ -415,3 +415,72 @@ fn the_relay_parser_reads_the_ppid_field() {
     ]);
     assert_eq!(data_chunk_ppids(&pkt), vec![60]);
 }
+
+/// An SCTP server that records `(stream, payload)` for every message it delivers.
+async fn spawn_recording_server(
+    config: SctpServerConfig,
+) -> (SocketAddr, Arc<Mutex<Vec<(u16, Vec<u8>)>>>) {
+    let mut server = SctpServer::bind("127.0.0.1:0".parse().expect("addr"), config)
+        .await
+        .expect("bind server");
+    let addr = server.local_addr();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    server.set_event_sender(tx);
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&received);
+    tokio::spawn(async move {
+        loop {
+            if server.recv(Duration::from_millis(10)).await.is_err() {
+                return;
+            }
+            while let Ok(ev) = rx.try_recv() {
+                if let ServerEvent::DataReceived { message, .. } = ev {
+                    log.lock()
+                        .expect("server log")
+                        .push((message.stream_id, message.data.to_vec()));
+                }
+            }
+        }
+    });
+    (addr, received)
+}
+
+/// #864: every message on every negotiated inbound stream is delivered, not only the
+/// first one on a stream above 1. A gNB may carry each UE's signalling on its own
+/// stream (TS 38.412 §7), so a second message on stream 2 or 3 must arrive too.
+#[tokio::test]
+async fn every_message_on_every_inbound_stream_is_delivered() {
+    let config = SctpServerConfig {
+        max_inbound_streams: 4,
+        max_outbound_streams: 4,
+        ..SctpServerConfig::default()
+    };
+    let (server_addr, received) = spawn_recording_server(config).await;
+    let mut client = TestClient::connect(server_addr).await;
+
+    let mut expected = Vec::new();
+    for round in 0..2u8 {
+        for stream in 0..4u16 {
+            let payload = vec![b'm', stream as u8, round];
+            client.send(stream, &payload, NGAP_PPID).await;
+            expected.push((stream, payload));
+        }
+    }
+
+    // Keep the client's side of the association running (SACKs, retransmissions)
+    // until the server has delivered all eight messages.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while received.lock().expect("server log").len() < expected.len() {
+        assert!(
+            Instant::now() < deadline,
+            "all eight messages within 5 s; got {:?}",
+            received.lock().expect("server log")
+        );
+        client.pump(Duration::from_millis(20)).await;
+    }
+
+    let mut got = received.lock().expect("server log").clone();
+    got.sort();
+    expected.sort();
+    assert_eq!(got, expected, "two messages on each of streams 0..=3");
+}
