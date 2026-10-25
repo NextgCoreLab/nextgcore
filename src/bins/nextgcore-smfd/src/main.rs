@@ -1616,6 +1616,119 @@ fn build_smf_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> 
     profile
 }
 
+// ---------------------------------------------------------------------------
+// #1112: discoverable only with a UPF behind it
+// ---------------------------------------------------------------------------
+
+/// How often the N4 status watcher re-reads the association state.
+const N4_NF_STATUS_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The `nfStatus` this SMF advertises for its N4 state (#1112): REGISTERED while the
+/// UPF a new session would use is associated, UNDISCOVERABLE otherwise. TS 29.510
+/// Table 6.1.6.3.7-1: an UNDISCOVERABLE NF is "operative but cannot be discovered by
+/// other NFs ... can process existing sessions but cannot accept new session
+/// establishment", which is an SMF with no N4 association (TS 29.244 §6.2.6.2: no
+/// session signalling without one). SUSPENDED would say "not operative" and may
+/// trigger restoration. §5.2.2.3.2 lets the heartbeat PATCH set either. It was
+/// REGISTERED from the start: a restarted SMF was discovered and answered every
+/// create 504 UPF_NOT_RESPONDING until its first association came up.
+fn nf_status_for_n4(upf_associated: bool) -> nextgcore_sbi::context::NfStatus {
+    if upf_associated {
+        nextgcore_sbi::context::NfStatus::Registered
+    } else {
+        nextgcore_sbi::context::NfStatus::Undiscoverable
+    }
+}
+
+/// `profile` with its `nfStatus` set to `status`.
+fn with_nf_status(
+    mut profile: serde_json::Value,
+    status: nextgcore_sbi::context::NfStatus,
+) -> serde_json::Value {
+    profile["nfStatus"] = serde_json::json!(nextgcore_sbi::heartbeat::nf_status_wire(status));
+    profile
+}
+
+/// One step of the N4 status watcher: when the N4 state calls for a status other
+/// than the advertised one, adopt it and return it so the caller PATCHes the NRF
+/// at once. The heartbeat worker carries it from then on, and the profile a 404
+/// heartbeat re-registers carries it too, so a re-registration does not undo it.
+fn reconcile_n4_nf_status(upf_associated: bool) -> Option<nextgcore_sbi::context::NfStatus> {
+    let wanted = nf_status_for_n4(upf_associated);
+    if wanted == nextgcore_sbi::heartbeat::self_nf_status() {
+        return None;
+    }
+    nextgcore_sbi::heartbeat::set_self_nf_status(wanted);
+    if let Some(profile) = nextgcore_sbi::heartbeat::registered_profile() {
+        nextgcore_sbi::heartbeat::set_registered_profile(&with_nf_status(profile, wanted));
+    }
+    Some(wanted)
+}
+
+/// The N4 status watcher, so the shutdown stops it before it deregisters.
+static N4_NF_STATUS_WATCHER: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> =
+    std::sync::Mutex::new(None);
+
+/// Stop the N4 status watcher (#1115 review m1): first in the shutdown, before the
+/// NFDeregister, or the association release that follows it would have the watcher
+/// PATCH an instance the NRF no longer holds.
+fn abort_n4_nf_status_watcher() {
+    if let Some(watcher) = N4_NF_STATUS_WATCHER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
+        watcher.abort();
+    }
+}
+
+/// Keep the NRF's view of this SMF in step with its N4 association (#1112):
+/// REGISTERED when the UPF a new session would use is associated, UNDISCOVERABLE
+/// when it is not. Replaces a watcher already running.
+fn spawn_n4_nf_status_watcher(nf_instance_id: String) {
+    let watcher = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(N4_NF_STATUS_POLL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            // A shutdown aborts this task before it deregisters
+            // (`abort_n4_nf_status_watcher`); an NF that paused its own heartbeats
+            // (NES) is not PATCHed behind their back either.
+            if nextgcore_sbi::heartbeat::heartbeat_paused() {
+                return;
+            }
+            let associated = pfcp_path::session_upf_associated();
+            let Some(status) = reconcile_n4_nf_status(associated) else {
+                continue;
+            };
+            let wire = nextgcore_sbi::heartbeat::nf_status_wire(status);
+            if associated {
+                log::info!("An N4 association is up: NRF status {wire}");
+            } else {
+                log::warn!("No N4 association is up: NRF status {wire} until one is");
+            }
+            let load = smf_self()
+                .read()
+                .map(|c| c.get_load())
+                .unwrap_or(0)
+                .clamp(0, 100) as u8;
+            if let Err(e) =
+                nextgcore_sbi::heartbeat::patch_nf_status(&nf_instance_id, status, load).await
+            {
+                // The next heartbeat carries the status anyway.
+                log::warn!("nfStatus {wire} PATCH failed ({e}); the next heartbeat carries it");
+            }
+        }
+    });
+    if let Some(previous) = N4_NF_STATUS_WATCHER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace(watcher)
+    {
+        previous.abort();
+    }
+}
+
 /// Register SMF NF instance with NRF
 ///
 /// Sends PUT /nnrf-nfm/v1/nf-instances/{nfInstanceId} to NRF
@@ -1643,7 +1756,22 @@ async fn smf_nrf_register(sbi_addr: &str, sbi_port: u16) -> std::result::Result<
         nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Smf)
             .to_string();
 
-    let nf_profile = build_smf_nf_profile(&nf_instance_id, sbi_addr, sbi_port);
+    // #1112: UNDISCOVERABLE until an N4 association is up. Registration runs before
+    // the PFCP clients exist, so a starting SMF registers UNDISCOVERABLE, and the
+    // watcher spawned on success makes it REGISTERED once a UPF answers.
+    let upf_associated = pfcp_path::session_upf_associated();
+    let status = nf_status_for_n4(upf_associated);
+    nextgcore_sbi::heartbeat::set_self_nf_status(status);
+    if !upf_associated {
+        log::info!(
+            "No N4 association is up yet: registering with the NRF as UNDISCOVERABLE, so \
+             no consumer discovers an SMF without a UPF (TS 29.510 Table 6.1.6.3.7-1)"
+        );
+    }
+    let nf_profile = with_nf_status(
+        build_smf_nf_profile(&nf_instance_id, sbi_addr, sbi_port),
+        status,
+    );
 
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     log::debug!("NRF registration: PUT {path}");
@@ -1664,6 +1792,10 @@ async fn smf_nrf_register(sbi_addr: &str, sbi_port: u16) -> std::result::Result<
             sbi_ctx
                 .set_self_instance(build_smf_nf_instance(&nf_instance_id, sbi_addr, sbi_port))
                 .await;
+
+            // #1112: REGISTERED once an N4 association is up, UNDISCOVERABLE while none
+            // is. Started here, with the registration it maintains.
+            spawn_n4_nf_status_watcher(nf_instance_id.clone());
 
             Ok(nf_instance_id)
         }
@@ -5807,6 +5939,8 @@ static SM_POLICY_DELETE_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// left to its own supervision, and the metric above says so.
 const SM_POLICY_DELETE_ATTEMPTS: u32 = 2;
 const SM_POLICY_DELETE_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
+/// The longest Retry-After an overloaded PCF can make a termination wait (#874).
+const SM_POLICY_DELETE_MAX_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Take the SM policy id out of `sm_context_ref`'s binding, so whichever release
 /// step reaches the termination first is the only one that sends it (#719).
@@ -5828,8 +5962,8 @@ fn take_sm_policy_id(sm_context_ref: &str) -> Option<String> {
 
 /// Npcf_SMPolicyControl_Delete for `pol_id` (TS 29.512 §4.2.5.2), at most
 /// [`SM_POLICY_DELETE_ATTEMPTS`] times. A 4xx is final: the PCF has answered, and
-/// a 404 means the association is already gone. A transport error or a 5xx is
-/// tried again once.
+/// a 404 means the association is already gone. A transport error, a 5xx, or an
+/// overload answer (429, or 503 with Retry-After; #874) is tried again once.
 ///
 /// The body is an empty SmPolicyDeleteData. Every attribute is optional, and the
 /// ones that would describe this release (`ranNasRelCauses`, §4.2.5.4) belong to
@@ -5845,6 +5979,21 @@ async fn delete_sm_policy(pol_id: &str) {
             Ok(()) => {
                 log::info!("SM policy association {pol_id} deleted at PCF");
                 return;
+            }
+            Err(policy::PolicyError::Overloaded {
+                status,
+                retry_after,
+            }) if attempt < SM_POLICY_DELETE_ATTEMPTS => {
+                // #874: an overload answer is retried like a 5xx, after the PCF's
+                // Retry-After, capped.
+                let pause = retry_after
+                    .unwrap_or(SM_POLICY_DELETE_RETRY_PAUSE)
+                    .min(SM_POLICY_DELETE_MAX_RETRY_AFTER);
+                log::warn!(
+                    "SM policy delete for {pol_id}: the PCF is overloaded ({status}); \
+                     retrying in {pause:?} (attempt {attempt}/{SM_POLICY_DELETE_ATTEMPTS})"
+                );
+                tokio::time::sleep(pause).await;
             }
             Err(policy::PolicyError::Rejected { status, detail }) if status < 500 => {
                 log::warn!(
@@ -5882,7 +6031,97 @@ async fn delete_sm_policy(pol_id: &str) {
 /// shutdown check, so N sessions times a blackholed PCF stalled all of them. The
 /// handle is for tests; production drops it.
 fn spawn_sm_policy_delete(pol_id: String) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move { delete_sm_policy(&pol_id).await })
+    // #874: bounded, and tracked, so a graceful shutdown drains what is in flight.
+    // The guard moves into the task, so the count drops however the task ends:
+    // finished, aborted, or dropped unpolled with its runtime.
+    struct Running;
+    impl Drop for Running {
+        fn drop(&mut self) {
+            SM_POLICY_DELETES_RUNNING.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    SM_POLICY_DELETES_RUNNING.fetch_add(1, Ordering::SeqCst);
+    let running = Running;
+    let task = tokio::spawn(async move {
+        let _running = running;
+        let Ok(_permit) = sm_policy_delete_permits().clone().acquire_owned().await else {
+            return;
+        };
+        delete_sm_policy(&pol_id).await
+    });
+    if let Ok(mut tasks) = sm_policy_delete_tasks().lock() {
+        tasks.retain(|t| !t.is_finished());
+        tasks.push(task.abort_handle());
+    }
+    task
+}
+
+/// How many SM Policy Association terminations run at once (#874): a UPF restart
+/// or a T3592 storm otherwise opens one PCF connection per session at the same
+/// instant.
+const SM_POLICY_DELETE_FANOUT: usize = 16;
+
+fn sm_policy_delete_permits() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static PERMITS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    PERMITS
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(SM_POLICY_DELETE_FANOUT)))
+}
+
+/// SM Policy Association terminations still running (#874).
+///
+/// Process-global, with the task list and the semaphores beside it: a test that
+/// starts terminations, or drains them, holds `PROCESS_STATE_TEST_LOCK` and lets
+/// its own settle (`settle_sm_policy_deletes_for_test`) before releasing it, so no
+/// sibling's drain counts or aborts them (#1145 review E).
+static SM_POLICY_DELETES_RUNNING: AtomicU64 = AtomicU64::new(0);
+
+/// Wait (bounded) until no SM Policy Association termination is running: a test's
+/// own, before it releases `PROCESS_STATE_TEST_LOCK` or before it measures.
+#[cfg(test)]
+pub(crate) async fn settle_sm_policy_deletes_for_test() {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while SM_POLICY_DELETES_RUNNING.load(Ordering::SeqCst) > 0
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    if let Ok(mut tasks) = sm_policy_delete_tasks().lock() {
+        tasks.retain(|t| !t.is_finished());
+    }
+}
+
+fn sm_policy_delete_tasks() -> &'static std::sync::Mutex<Vec<tokio::task::AbortHandle>> {
+    static TASKS: std::sync::OnceLock<std::sync::Mutex<Vec<tokio::task::AbortHandle>>> =
+        std::sync::OnceLock::new();
+    TASKS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Wait, at most `budget`, for the SM Policy Association terminations in flight
+/// (#874): a SIGTERM right after an AMF-driven release used to drop its DELETE with
+/// the runtime. What is left at the end is aborted and counted in
+/// `smf_sm_policy_delete_failures_total`. Returns how many were abandoned.
+async fn drain_sm_policy_deletes(budget: std::time::Duration) -> u64 {
+    let deadline = tokio::time::Instant::now() + budget;
+    while SM_POLICY_DELETES_RUNNING.load(Ordering::SeqCst) > 0
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let left = SM_POLICY_DELETES_RUNNING.load(Ordering::SeqCst);
+    if left > 0 {
+        if let Ok(mut tasks) = sm_policy_delete_tasks().lock() {
+            for t in tasks.drain(..) {
+                t.abort();
+            }
+        }
+        SM_POLICY_DELETE_FAILURES.fetch_add(left, Ordering::Relaxed);
+        log::warn!(
+            "Shutdown: {left} SM Policy Association termination(s) still running after \
+             {budget:?}; abandoned, their associations stay at the PCF"
+        );
+    }
+    left
 }
 
 /// SM Policy Association Termination for `sm_context_ref`: takes the id (so one
@@ -6934,14 +7173,36 @@ async fn run_gsm_timer_tick() {
                      command (attempt {attempt})",
                     entry.timer_id.name()
                 );
-                send_n1_n2_message_transfer(
-                    entry.amf_uri.as_deref(),
-                    &entry.supi,
-                    entry.psi,
-                    &entry.command,
-                    &sm_context_ref,
-                )
-                .await;
+                // #874: off the tick, like the abandon. A UPF restart arms T3592 for
+                // every session at one instant, so they all retransmit on one tick, and
+                // with a blackholed AMF each transfer waits its connect and request
+                // timeouts; awaited here, they held the tick, and every other timer and
+                // the shutdown check, for that long times N.
+                let sm_ref = sm_context_ref.clone();
+                let timer_id = entry.timer_id;
+                spawn_gsm_expiry(async move {
+                    // #1145 review: decided at the expiry, sent once a slot is free.
+                    // By then the procedure may have ended -- the UE's COMPLETE, or
+                    // the abandon -- and the UE re-established the same PSI, which a
+                    // stale RELEASE COMMAND (PTI 0) would release. So the timer must
+                    // still be this one, at this attempt.
+                    if !gsm_timer_still_at(&sm_ref, timer_id, attempt) {
+                        log::info!(
+                            "{} attempt {attempt} for ref={sm_ref} not sent: the procedure \
+                             ended while it waited for a slot",
+                            timer_id.name()
+                        );
+                        return;
+                    }
+                    send_n1_n2_message_transfer(
+                        entry.amf_uri.as_deref(),
+                        &entry.supi,
+                        entry.psi,
+                        &entry.command,
+                        &sm_ref,
+                    )
+                    .await;
+                });
             }
             GsmTimerExpiry::Exhausted => {
                 // TS 24.501 §6.3.2.2/§6.3.3: on the final expiry the network
@@ -6957,12 +7218,46 @@ async fn run_gsm_timer_tick() {
                 // the tick owns every other T3591/T3592 and the shutdown check, so
                 // a slow AMF (or, before the delete moved to its own task, a slow
                 // PCF) times N exhausted sessions stalled all of them.
-                tokio::spawn(async move {
+                spawn_gsm_expiry(async move {
                     abandon_gsm_procedure(&sm_context_ref, entry.timer_id).await;
                 });
             }
         }
     }
+}
+
+/// How many 5GSM timer expiries (retransmissions and abandons) run at once (#874).
+const GSM_EXPIRY_FANOUT: usize = 16;
+
+fn gsm_expiry_permits() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static PERMITS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(GSM_EXPIRY_FANOUT)))
+}
+
+/// Whether `sm_context_ref`'s armed 5GSM timer is still `timer_id` at `attempts`:
+/// the expiry a queued retransmission was decided at (#1145 review).
+fn gsm_timer_still_at(sm_context_ref: &str, timer_id: timer::SmfTimerId, attempts: u32) -> bool {
+    gsm_procedure_timers()
+        .lock()
+        .ok()
+        .and_then(|timers| {
+            timers
+                .get(sm_context_ref)
+                .map(|t| t.timer_id == timer_id && t.attempts == attempts)
+        })
+        .unwrap_or(false)
+}
+
+/// Run one 5GSM expiry's AMF work in its own task, at most [`GSM_EXPIRY_FANOUT`] at
+/// once (#874): 2N simultaneous AMF and PCF connections otherwise.
+fn spawn_gsm_expiry(work: impl std::future::Future<Output = ()> + Send + 'static) {
+    tokio::spawn(async move {
+        let Ok(_permit) = gsm_expiry_permits().clone().acquire_owned().await else {
+            return;
+        };
+        work.await;
+    });
 }
 
 /// Drive the Network Triggered Service Request for a buffered downlink packet
@@ -7356,6 +7651,9 @@ async fn graceful_shutdown(
     // NF_FAILOVER. The failed paths are durable, and the next incarnation re-arms
     // what is left of each hold.
     up_path::abort_hold_timers();
+    // #1115 review m1: and the N4 status watcher, so it PATCHes no deregistered
+    // instance when the association goes below.
+    abort_n4_nf_status_watcher();
     // #941 review M2: every phase is bounded by what is left of ONE deadline, taken
     // when the shutdown started. A blackholed NRF held the deregistration for its
     // 30 s request timeout and pushed the rest past the SIGKILL.
@@ -7434,13 +7732,49 @@ async fn graceful_shutdown(
     tokio::join!(fanouts, n4, nsac);
     pfcp_listener.abort();
     log::info!("SMF N4 PFCP listener stopped");
+    // #874, #1145 review A/B: last, so it covers every SM Policy Association this
+    // shutdown leaves. The releases still waiting for the UE's COMPLETE or for T3592
+    // (this shutdown's #39 fan-out, a UPF-restart release, an AMF /release) would
+    // start their DELETE only then, after the process is gone, so they start it now;
+    // then the DELETEs in flight get what is left, ALONGSIDE the S5/S8 drain rather
+    // than out of its reserve, and what does not land is counted.
+    let started = terminate_policies_of_pending_releases();
+    if started > 0 {
+        log::info!(
+            "Shutdown: {started} SM Policy Association termination(s) started for \
+             releases still waiting on the UE"
+        );
+    }
     // #718 review m2: the Delete Bearer Requests sent above, on either path, are
     // retransmitted until answered or N3 is exhausted.
-    drain_s5s8_requests(
-        gtp_path::s5s8_server().map(|s| s.as_ref()),
-        left().min(SHUTDOWN_GTP_DRAIN),
-    )
-    .await;
+    tokio::join!(
+        drain_s5s8_requests(
+            gtp_path::s5s8_server().map(|s| s.as_ref()),
+            left().min(SHUTDOWN_GTP_DRAIN),
+        ),
+        drain_sm_policy_deletes(left().min(SHUTDOWN_GTP_DRAIN)),
+    );
+}
+
+/// Start the SM Policy Association termination of every session whose network-
+/// initiated release still waits on the UE (an armed T3592), at shutdown (#1145
+/// review A): its DELETE would otherwise start only on the COMPLETE or the final
+/// expiry, after the process. Returns how many were started.
+fn terminate_policies_of_pending_releases() -> usize {
+    let pending: Vec<String> = gsm_procedure_timers()
+        .lock()
+        .map(|timers| {
+            timers
+                .iter()
+                .filter(|(_, t)| t.timer_id == timer::SmfTimerId::T3592)
+                .map(|(r, _)| r.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    pending
+        .iter()
+        .filter_map(|r| terminate_sm_policy_association(r))
+        .count()
 }
 
 /// Whether a graceful shutdown releases the PFCP association (#677, #718).
@@ -11636,6 +11970,260 @@ mod tests {
     /// an event-exposure producer by matching `serviceName` against
     /// `eventexposure`/`evts` (`dccfd`'s `coordination.rs`), so this SMF was
     /// invisible to data collection.
+    /// #1112 (TS 29.510 Table 6.1.6.3.7-1): an SMF with no N4 association registers
+    /// UNDISCOVERABLE, so discovery does not return it, and REGISTERED once one is up.
+    #[test]
+    fn the_registered_nf_status_follows_the_n4_association() {
+        use nextgcore_sbi::context::NfStatus;
+        assert_eq!(nf_status_for_n4(false), NfStatus::Undiscoverable);
+        assert_eq!(nf_status_for_n4(true), NfStatus::Registered);
+        let profile = build_smf_nf_profile("smf-1112", "10.45.0.6", 7777);
+        assert_eq!(profile["nfStatus"], "REGISTERED");
+        let undiscoverable = with_nf_status(profile, NfStatus::Undiscoverable);
+        assert_eq!(undiscoverable["nfStatus"], "UNDISCOVERABLE");
+        assert_eq!(
+            undiscoverable["nfServices"][0]["nfServiceStatus"], "REGISTERED",
+            "the services keep their own status; the NF-level one gates discovery"
+        );
+    }
+
+    /// #1112: the watcher's step. It adopts the status the N4 state calls for once,
+    /// so the heartbeat PATCHes carry it, and rewrites the profile a 404 heartbeat
+    /// re-registers, so a re-registration does not undo it.
+    ///
+    /// REVERT-VERIFIED: with the profile rewrite removed, the recorded profile
+    /// stays REGISTERED while the SMF is UNDISCOVERABLE.
+    #[test]
+    fn reconciling_the_n4_status_changes_the_advertised_status_once() {
+        use nextgcore_sbi::context::NfStatus;
+        use nextgcore_sbi::heartbeat as hb;
+        // The heartbeat globals' own lock, declared beside them in nextgcore-sbi.
+        let _registration = hb::lock_registration_state_for_test();
+        let before = (hb::self_nf_status(), hb::registered_profile());
+        hb::set_self_nf_status(NfStatus::Registered);
+        hb::set_registered_profile(&build_smf_nf_profile("smf-1112", "10.45.0.6", 7777));
+
+        assert_eq!(
+            reconcile_n4_nf_status(false),
+            Some(NfStatus::Undiscoverable)
+        );
+        assert_eq!(hb::self_nf_status(), NfStatus::Undiscoverable);
+        assert_eq!(
+            hb::registered_profile().unwrap()["nfStatus"],
+            "UNDISCOVERABLE"
+        );
+        assert_eq!(
+            hb::build_load_patch(0)[0]["value"],
+            "UNDISCOVERABLE",
+            "the heartbeat says so too"
+        );
+        assert_eq!(reconcile_n4_nf_status(false), None, "no PATCH per tick");
+
+        assert_eq!(reconcile_n4_nf_status(true), Some(NfStatus::Registered));
+        assert_eq!(hb::registered_profile().unwrap()["nfStatus"], "REGISTERED");
+        assert_eq!(reconcile_n4_nf_status(true), None);
+
+        hb::set_self_nf_status(before.0);
+        match before.1 {
+            Some(p) => hb::set_registered_profile(&p),
+            None => hb::clear_registered_profile(),
+        }
+    }
+
+    /// #1112 (#1115 review M2), against a stand-in NRF: with no N4 association the
+    /// registration PUT says UNDISCOVERABLE, and the watcher it starts then PATCHes
+    /// the NRF exactly once per association change -- REGISTERED when the UPF
+    /// associates, UNDISCOVERABLE when it goes -- and not on every tick.
+    ///
+    /// REVERT-VERIFIED: registering REGISTERED fails the PUT assertion, and without
+    /// the watcher spawn no PATCH arrives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // the heartbeat globals' std lock, see below
+    async fn the_nrf_is_told_the_n4_state_once_per_change() {
+        use nextgcore_sbi::context::NfStatus;
+        use nextgcore_sbi::heartbeat as hb;
+        use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        // The heartbeat globals' own (std) lock, beside them in nextgcore-sbi. Held
+        // across this test's awaits on purpose: it serialises the globals, and no
+        // other task of this test takes it.
+        let _registration = hb::lock_registration_state_for_test();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        // Installed, not associated, before the registration: the N4 lock is held for
+        // the whole test, so no sibling's UPF is what the watcher sees.
+        let upf = pfcp_path::stand_in::unassociated_upf().await;
+        // Everything this test sets process-wide is restored when it ends, whether it
+        // passes or panics (#1115 review n4).
+        let _restore = N4StatusTestRestore {
+            status: hb::self_nf_status(),
+            profile: hb::registered_profile(),
+        };
+
+        let seen: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>> = Arc::default();
+        let recorded = Arc::clone(&seen);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let nrf = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        nrf.start(move |req: SReq| {
+            let recorded = Arc::clone(&recorded);
+            async move {
+                let body = req
+                    .http
+                    .content
+                    .as_deref()
+                    .and_then(|c| serde_json::from_str(c).ok())
+                    .unwrap_or(serde_json::Value::Null);
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push((req.header.method.clone(), body));
+                if req.header.method == "PUT" {
+                    SResp::with_status(201)
+                } else {
+                    SResp::with_status(204)
+                }
+            }
+        })
+        .await
+        .expect("stand-in NRF");
+        global_context().set_nrf_uri(format!("http://{addr}")).await;
+        hb::set_self_nf_status(NfStatus::Registered);
+
+        let registered = smf_nrf_register("127.0.0.1", 7777).await;
+        let patches = |seen: &std::sync::Mutex<Vec<(String, serde_json::Value)>>| -> Vec<String> {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|(m, _)| m == "PATCH")
+                .map(|(_, b)| b[0]["value"].as_str().unwrap_or("").to_string())
+                .collect()
+        };
+        let wait_for = |n: usize| {
+            let seen = Arc::clone(&seen);
+            async move {
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+                while patches(&seen).len() < n && tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
+        };
+        let put = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(m, _)| m == "PUT")
+            .map(|(_, b)| b["nfStatus"].clone());
+
+        upf.client.associate().await.expect("association");
+        wait_for(1).await;
+        let after_association = patches(&seen);
+        upf.client.set_assoc_state_for_test(false, None, None).await;
+        wait_for(2).await;
+        // Several more ticks: no further PATCH.
+        tokio::time::sleep(N4_NF_STATUS_POLL * 3).await;
+        let all = patches(&seen);
+        // An NF that paused its own heartbeats (NES) is not PATCHed behind them.
+        hb::set_heartbeat_paused(true);
+        upf.client.associate().await.expect("association");
+        tokio::time::sleep(N4_NF_STATUS_POLL * 3).await;
+        let while_paused = patches(&seen);
+        hb::set_heartbeat_paused(false);
+        nrf.stop().await.ok();
+
+        assert!(registered.is_ok(), "{registered:?}");
+        assert_eq!(put, Some(serde_json::json!("UNDISCOVERABLE")));
+        assert_eq!(after_association, vec!["REGISTERED"]);
+        assert_eq!(
+            all,
+            vec!["REGISTERED", "UNDISCOVERABLE"],
+            "one PATCH per change"
+        );
+        assert_eq!(
+            while_paused, all,
+            "no PATCH while the heartbeats are paused"
+        );
+    }
+
+    /// Restores what `the_nrf_is_told_the_n4_state_once_per_change` set process-wide:
+    /// the watcher, the NRF URI, the pause flag, the advertised status and profile.
+    struct N4StatusTestRestore {
+        status: nextgcore_sbi::context::NfStatus,
+        profile: Option<serde_json::Value>,
+    }
+
+    impl Drop for N4StatusTestRestore {
+        fn drop(&mut self) {
+            use nextgcore_sbi::heartbeat as hb;
+            abort_n4_nf_status_watcher();
+            hb::set_heartbeat_paused(false);
+            hb::set_self_nf_status(self.status);
+            match self.profile.take() {
+                Some(p) => hb::set_registered_profile(&p),
+                None => hb::clear_registered_profile(),
+            }
+            // The URI is behind an async lock; cleared on a runtime of its own, on a
+            // scoped thread, since this may run while the test's runtime unwinds.
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .expect("cleanup runtime")
+                        .block_on(global_context().clear_nrf_uri());
+                });
+            });
+        }
+    }
+
+    /// #1115 review n1: the shutdown stops the N4 status watcher before it
+    /// deregisters, so the association release that follows PATCHes no instance the
+    /// NRF has dropped.
+    ///
+    /// REVERT-VERIFIED: without `abort_n4_nf_status_watcher` in `graceful_shutdown`,
+    /// the watcher is still running when the deregistration starts.
+    #[tokio::test]
+    async fn the_shutdown_stops_the_n4_status_watcher_before_it_deregisters() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        spawn_n4_nf_status_watcher("smf-1115-shutdown".to_string());
+        let running_at_deregister = std::sync::Arc::new(AtomicBool::new(true));
+        let probe = running_at_deregister.clone();
+        let listener = tokio::spawn(async {});
+        graceful_shutdown(
+            async move {
+                let running = N4_NF_STATUS_WATCHER
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .is_some_and(|w| !w.is_finished());
+                probe.store(running, Ordering::SeqCst);
+            },
+            &[],
+            false,
+            listener,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .await;
+        abort_n4_nf_status_watcher();
+        assert!(
+            !running_at_deregister.load(Ordering::SeqCst),
+            "the watcher is stopped before the deregistration"
+        );
+    }
+
+    /// #1112: what the watcher polls, read off the association of the UPF a new
+    /// session would use.
+    #[tokio::test]
+    async fn session_upf_associated_follows_the_n4_association() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = pfcp_path::stand_in::unassociated_upf().await;
+        assert!(!pfcp_path::session_upf_associated());
+        upf.client.associate().await.expect("association");
+        assert!(pfcp_path::session_upf_associated());
+        upf.client.set_assoc_state_for_test(false, None, None).await;
+        assert!(!pfcp_path::session_upf_associated());
+    }
+
     #[test]
     fn the_smf_profile_advertises_both_routed_nsmf_services() {
         let profile = build_smf_nf_profile("smf-test-instance", "10.45.0.6", 7777);
@@ -17108,6 +17696,332 @@ mod tests {
             dropped,
             "both contexts dropped within 2 s, well inside one PCF timeout"
         );
+    }
+
+    /// Insert `n` 5GSM timers due now, at `attempts`, toward `amf_uri`.
+    fn due_gsm_timers(prefix: &str, n: usize, attempts: u32, amf_uri: &str) -> Vec<String> {
+        let refs: Vec<String> = (0..n).map(|i| format!("{prefix}-{i}")).collect();
+        if let Ok(mut timers) = gsm_procedure_timers().lock() {
+            for (i, r) in refs.iter().enumerate() {
+                timers.insert(
+                    r.clone(),
+                    GsmProcedureTimer {
+                        timer_id: timer::SmfTimerId::T3592,
+                        command: vec![0x2e, 5, 0, 0xd3, 36],
+                        supi: format!("imsi-0010100000874{i:02}"),
+                        psi: 5,
+                        amf_uri: Some(amf_uri.to_string()),
+                        attempts,
+                        deadline: std::time::Instant::now() - std::time::Duration::from_millis(1),
+                    },
+                );
+            }
+        }
+        refs
+    }
+
+    /// #874 item 1: a retransmission is off the tick. Twenty T3592s retransmit on
+    /// one tick toward an AMF that accepts and never answers; the tick returns at
+    /// once. Before, it awaited each transfer's connect and request timeouts.
+    #[tokio::test]
+    async fn a_blackholed_amf_does_not_stall_the_5gsm_retransmissions() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let blackhole = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = blackhole.local_addr().unwrap().port();
+        let held = tokio::spawn(async move {
+            let mut conns = Vec::new();
+            while let Ok((c, _)) = blackhole.accept().await {
+                conns.push(c);
+            }
+        });
+        let refs = due_gsm_timers("n874-rtx", 20, 0, &format!("http://127.0.0.1:{port}"));
+
+        let started = std::time::Instant::now();
+        run_gsm_timer_tick().await;
+        let tick = started.elapsed();
+        if let Ok(mut timers) = gsm_procedure_timers().lock() {
+            for r in &refs {
+                timers.remove(r);
+            }
+        }
+        held.abort();
+
+        assert!(
+            tick < std::time::Duration::from_millis(200),
+            "the tick returned at once: {tick:?}"
+        );
+    }
+
+    /// #874 item 2: the expiry fan-out is bounded. Forty retransmissions toward an
+    /// AMF that takes 300 ms each all arrive, never more than 16 at once.
+    #[tokio::test]
+    async fn the_5gsm_expiry_fanout_is_bounded() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let now = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (n, p, d) = (now.clone(), peak.clone(), done.clone());
+        let (amf, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |_req: SbiRequest| {
+                let (n, p, d) = (n.clone(), p.clone(), d.clone());
+                async move {
+                    let in_flight = n.fetch_add(1, Ordering::SeqCst) + 1;
+                    p.fetch_max(in_flight, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    n.fetch_sub(1, Ordering::SeqCst);
+                    d.fetch_add(1, Ordering::SeqCst);
+                    SbiResponse::with_status(200)
+                }
+            })
+            .await;
+        let refs = due_gsm_timers(
+            "n874-fan",
+            40,
+            0,
+            &format!("http://127.0.0.1:{}", addr.port()),
+        );
+
+        run_gsm_timer_tick().await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while done.load(Ordering::SeqCst) < 40 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        if let Ok(mut timers) = gsm_procedure_timers().lock() {
+            for r in &refs {
+                timers.remove(r);
+            }
+        }
+        amf.stop().await.ok();
+
+        assert_eq!(
+            done.load(Ordering::SeqCst),
+            40,
+            "every retransmission arrived"
+        );
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(peak <= 16, "at most 16 at once: {peak}");
+        assert!(peak > 1, "and they do run in parallel: {peak}");
+    }
+
+    /// #874 item 3, TS 29.500 §5.2.7.2: a 429 from the PCF is an overload the SMF
+    /// retries, after the Retry-After it carries; the retry succeeds and nothing is
+    /// counted as failed.
+    #[tokio::test]
+    async fn an_overloaded_pcf_delete_is_retried_after_retry_after() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::<std::time::Instant>::new()));
+        let sink = hits.clone();
+        let (pcf, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |_req: SbiRequest| {
+                let sink = sink.clone();
+                async move {
+                    let first = {
+                        let mut h = sink.lock().unwrap();
+                        h.push(std::time::Instant::now());
+                        h.len() == 1
+                    };
+                    if first {
+                        SbiResponse::with_status(429).with_header("Retry-After", "1")
+                    } else {
+                        SbiResponse::with_status(204)
+                    }
+                }
+            })
+            .await;
+        std::env::set_var("PCF_URI", format!("http://127.0.0.1:{}", addr.port()));
+        let failures = SM_POLICY_DELETE_FAILURES.load(Ordering::SeqCst);
+
+        delete_sm_policy("pol-874-429").await;
+        let hits = hits.lock().unwrap().clone();
+        std::env::remove_var("PCF_URI");
+        pcf.stop().await.ok();
+
+        assert_eq!(hits.len(), 2, "the 429 is retried");
+        assert!(
+            hits[1].duration_since(hits[0]) >= std::time::Duration::from_millis(950),
+            "after the Retry-After: {:?}",
+            hits[1].duration_since(hits[0])
+        );
+        assert_eq!(SM_POLICY_DELETE_FAILURES.load(Ordering::SeqCst), failures);
+    }
+
+    /// #874 item 4: a graceful shutdown waits for the SM Policy Association
+    /// terminations in flight, and counts the ones it has to abandon.
+    #[tokio::test]
+    async fn the_shutdown_drains_policy_deletes_and_counts_the_abandoned() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        // #1145 review E: a sibling's terminations, if any are still running, are not
+        // this test's to drain or count.
+        settle_sm_policy_deletes_for_test().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let answered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let a = answered.clone();
+        let (pcf, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let a = a.clone();
+                async move {
+                    if req.header.uri.contains("pol-874-slow") {
+                        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                        a.fetch_add(1, Ordering::SeqCst);
+                        SbiResponse::with_status(204)
+                    } else {
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        SbiResponse::with_status(204)
+                    }
+                }
+            })
+            .await;
+        std::env::set_var("PCF_URI", format!("http://127.0.0.1:{}", addr.port()));
+
+        drop(spawn_sm_policy_delete("pol-874-slow".to_string()));
+        let waited = drain_sm_policy_deletes(std::time::Duration::from_secs(5)).await;
+        let landed = answered.load(Ordering::SeqCst);
+        let failures = SM_POLICY_DELETE_FAILURES.load(Ordering::SeqCst);
+        drop(spawn_sm_policy_delete("pol-874-stuck".to_string()));
+        let abandoned = drain_sm_policy_deletes(std::time::Duration::from_millis(200)).await;
+        let counted = SM_POLICY_DELETE_FAILURES.load(Ordering::SeqCst) - failures;
+        std::env::remove_var("PCF_URI");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), pcf.stop()).await;
+
+        assert_eq!((waited, landed), (0, 1), "the slow DELETE was waited for");
+        assert_eq!(
+            (abandoned, counted),
+            (1, 1),
+            "the stuck one is abandoned and counted"
+        );
+    }
+
+    /// #1145 review MAJOR: a retransmission decided at an expiry but still waiting
+    /// for one of the 16 slots is not sent once its procedure has ended -- the UE's
+    /// COMPLETE, or the abandon -- or a stale RELEASE COMMAND (PTI 0) would release
+    /// the session the UE has since re-established on the same PSI.
+    ///
+    /// REVERT-VERIFIED: without the re-check under the timer lock, the AMF still
+    /// receives the retransmission.
+    #[tokio::test]
+    async fn a_queued_retransmission_is_not_sent_once_its_procedure_ended() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let received = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r = received.clone();
+        let (amf, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |_req: SbiRequest| {
+                let r = r.clone();
+                async move {
+                    r.fetch_add(1, Ordering::SeqCst);
+                    SbiResponse::with_status(200)
+                }
+            })
+            .await;
+        // Every slot taken, as by sixteen sends to a slow AMF.
+        let slots = gsm_expiry_permits()
+            .clone()
+            .acquire_many_owned(16)
+            .await
+            .expect("the slots");
+        let refs = due_gsm_timers(
+            "n1145-stale",
+            1,
+            0,
+            &format!("http://127.0.0.1:{}", addr.port()),
+        );
+        run_gsm_timer_tick().await;
+        // The UE answered while the retransmission waited: the procedure is over.
+        assert!(cancel_gsm_timer(&refs[0], timer::SmfTimerId::T3592));
+        drop(slots);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        amf.stop().await.ok();
+        assert_eq!(
+            received.load(Ordering::SeqCst),
+            0,
+            "the stale retransmission is not sent"
+        );
+    }
+
+    /// #1145 review A, B, D: the graceful shutdown, last, starts the SM Policy
+    /// Association termination of a release still waiting on the UE (an armed T3592,
+    /// whose DELETE would otherwise start after the process), and counts a DELETE
+    /// that does not land within what is left.
+    ///
+    /// REVERT-VERIFIED: without the shutdown's pending-release terminations the PCF
+    /// sees no DELETE; without its drain nothing is counted.
+    #[tokio::test]
+    async fn the_shutdown_terminates_pending_release_policies_and_counts_the_unlanded() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        settle_sm_policy_deletes_for_test().await;
+        let deletes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let d = deletes.clone();
+        let (pcf, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let d = d.clone();
+                async move {
+                    d.lock().unwrap().push(req.header.uri.clone());
+                    // Never in time: the shutdown must count it.
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await;
+        std::env::set_var("PCF_URI", format!("http://127.0.0.1:{}", addr.port()));
+        // A release waiting on the UE: its T3592 armed, its policy association held.
+        let reference = seed_established_session(
+            "imsi-001010000011451",
+            5,
+            std::net::Ipv4Addr::new(10, 45, 11, 45),
+        );
+        if let Some(b) = smf_self()
+            .read()
+            .unwrap()
+            .policy_bindings
+            .write()
+            .unwrap()
+            .get_mut(&reference)
+        {
+            b.sm_policy_id = Some("pol-1145-pending".to_string());
+        }
+        if let Ok(mut timers) = gsm_procedure_timers().lock() {
+            timers.insert(
+                reference.clone(),
+                GsmProcedureTimer {
+                    timer_id: timer::SmfTimerId::T3592,
+                    command: vec![0x2e, 5, 0, 0xd3, 36],
+                    supi: "imsi-001010000011451".to_string(),
+                    psi: 5,
+                    amf_uri: None,
+                    attempts: 0,
+                    deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
+                },
+            );
+        }
+        let failures = SM_POLICY_DELETE_FAILURES.load(Ordering::SeqCst);
+        let listener = tokio::spawn(async {});
+        graceful_shutdown(
+            async {},
+            &[],
+            false,
+            listener,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+        )
+        .await;
+        let counted = SM_POLICY_DELETE_FAILURES.load(Ordering::SeqCst) - failures;
+        let seen = deletes.lock().unwrap().clone();
+        cancel_gsm_timer(&reference, timer::SmfTimerId::T3592);
+        std::env::remove_var("PCF_URI");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), pcf.stop()).await;
+        assert!(
+            seen.iter().any(|u| u.contains("pol-1145-pending")),
+            "the pending release's association is terminated: {seen:?}"
+        );
+        assert_eq!(counted, 1, "the DELETE that did not land is counted");
     }
 
     /// A loopback PCF that records every `/update` body and answers with the
