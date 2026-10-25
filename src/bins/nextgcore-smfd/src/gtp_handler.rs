@@ -5109,6 +5109,7 @@ mod tests {
     #[tokio::test]
     async fn a_create_session_colliding_with_a_default_bearer_replaces_the_pdn_connection() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = crate::pfcp_path::stand_in::associated_upf().await;
         let (server, sgw) = s5s8_pair().await;
         create_over_the_wire(
@@ -5158,6 +5159,7 @@ mod tests {
     #[tokio::test]
     async fn a_create_session_on_another_ebi_keeps_the_existing_pdn_connection() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _upf = crate::pfcp_path::stand_in::associated_upf().await;
         let (server, sgw) = s5s8_pair().await;
         create_over_the_wire(
@@ -5184,6 +5186,7 @@ mod tests {
     #[tokio::test]
     async fn a_retransmitted_create_session_request_gets_the_same_response() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _upf = crate::pfcp_path::stand_in::associated_upf().await;
         let (server, sgw) = s5s8_pair().await;
         let csr = csr_for(0x0011_9421, 0x43, 0x4300_0001, 5, None);
@@ -5207,6 +5210,7 @@ mod tests {
     #[tokio::test]
     async fn an_sgw_c_restart_counter_change_deletes_its_pdn_connections() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _upf = crate::pfcp_path::stand_in::associated_upf().await;
         let (server, sgw) = s5s8_pair().await;
         create_over_the_wire(
@@ -5250,6 +5254,7 @@ mod tests {
     #[tokio::test]
     async fn an_echo_with_a_new_restart_counter_deletes_the_sgw_c_pdn_connections() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _upf = crate::pfcp_path::stand_in::associated_upf().await;
         let (server, sgw) = s5s8_pair().await;
         create_over_the_wire(
@@ -5316,6 +5321,7 @@ mod tests {
     #[tokio::test]
     async fn an_echo_restart_keeps_the_new_incarnations_pdn_connections() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _upf = crate::pfcp_path::stand_in::associated_upf().await;
         let (server, sgw) = s5s8_pair().await;
         // The old incarnation: one connection with no counter, one under counter 7.
@@ -5364,6 +5370,7 @@ mod tests {
     #[tokio::test]
     async fn a_restart_shown_by_a_create_session_is_answered_before_the_cleanup() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = crate::pfcp_path::stand_in::associated_upf().await;
         let (server, sgw) = s5s8_pair().await;
         for (i, last) in [0x4C_u8, 0x4D].into_iter().enumerate() {
@@ -5417,6 +5424,7 @@ mod tests {
     #[tokio::test]
     async fn a_restart_and_a_collision_on_one_pdn_connection_delete_it_once() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = crate::pfcp_path::stand_in::associated_upf().await;
         let (server, sgw) = s5s8_pair().await;
         create_over_the_wire(
@@ -5460,6 +5468,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_create_sessions_for_one_imsi_leave_one_pdn_connection() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _upf = crate::pfcp_path::stand_in::associated_upf().await;
         let (server, sgw) = s5s8_pair().await;
         let first = csr_for(0x0011_9481, 0x4F, 0x4F00_0001, 5, None);
@@ -5485,6 +5494,7 @@ mod tests {
     #[tokio::test]
     async fn a_panicking_request_still_ends_its_number() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let (server, _sgw) = s5s8_pair().await;
         let peer: std::net::SocketAddr = "127.0.0.1:2123".parse().unwrap();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -5506,6 +5516,7 @@ mod tests {
     #[tokio::test]
     async fn a_create_session_colliding_with_a_dedicated_bearer_deletes_the_bearer() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = crate::pfcp_path::stand_in::associated_upf().await;
         let (server, sgw, _port, sess, pgw_c_teid) =
             pdn_with_local_rules(0x48, vec![voice_rule()]).await;
