@@ -4828,7 +4828,8 @@ fn record_serving_amf(sm_context_ref: &str, serving_nf_id: &str, status_uri: &st
     ctx.persist();
     log::info!(
         "SM Context Update for ref={sm_context_ref}: serving AMF is now {serving_nf_id} \
-         (status notifications to {status_uri})"
+         (status notifications to {})",
+        nextgcore_sbi::log_redact::redact_last_segment(status_uri)
     );
 }
 
