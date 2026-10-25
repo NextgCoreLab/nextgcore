@@ -1205,6 +1205,14 @@ fn emm_tau_request(
     // holds bearers worth reporting. Initial Context Setup is still not requested
     // from here — that is the attach path's job, and it has no caller yet (#51's
     // ceiling).
+    // #993, TS 24.301 §5.5.3.2.4: the EPS bearer contexts the UE reports
+    // inactive are deactivated locally, without peer-to-peer signalling to the
+    // UE, and left out of the accept's status and of any Initial Context Setup.
+    // The core is told after the accept (`release_lost_bearers`, below).
+    let (inactive, released): (Vec<u8>, Vec<u8>) = parsed
+        .eps_bearer_context_status
+        .map(|status| reported_inactive(ctx, mme_ue, status))
+        .unwrap_or_default();
     let bearers: Vec<crate::context::MmeBearer> = mme_ue
         .sess_list
         .iter()
@@ -1215,6 +1223,7 @@ fn emm_tau_request(
                 .filter_map(|id| ctx.bearer_find_by_id(*id))
                 .collect::<Vec<_>>()
         })
+        .filter(|b| !released.contains(&b.ebi))
         .collect();
     // The user plane, when it is restored: the bearers established at the
     // Serving GW, under a K_eNB from the TAU REQUEST's uplink COUNT (TS 33.401
@@ -1252,6 +1261,68 @@ fn emm_tau_request(
         Ok(()) => {}
         Err(e) => log::error!("[{}] TAU Accept send failed: {e}", mme_ue.imsi_bcd),
     }
+    if !inactive.is_empty() {
+        log::info!(
+            "[{}] TAU Request reports EBI(s) {inactive:?} inactive: deactivated locally (TS \
+             24.301 §5.5.3.2.4); the Serving GW is told",
+            mme_ue.imsi_bcd
+        );
+        // Off the UE pool lock: the release reads the UE back.
+        drop(pool);
+        crate::handover_switch::release_lost_bearers(ctx, mme_ue_id, &inactive);
+    }
+}
+
+/// The EPS bearer contexts of `mme_ue` that a TRACKING AREA UPDATE REQUEST's EPS
+/// bearer context status (`status`, bit n for EBI n) reports inactive (#993, TS
+/// 24.301 §5.5.3.2.4). Returns (the EBIs to deactivate, every EBI that goes with
+/// them, including the dedicated bearers of a PDN connection whose default
+/// bearer goes).
+///
+/// The default bearer of the last remaining PDN connection is kept: this MME
+/// does not support EMM-REGISTERED without PDN connection, and §5.5.3.2.4 then
+/// deactivates a default bearer only when its PDN connection is not the last.
+/// The first PDN connection of the UE is the one kept when the UE reports every
+/// default bearer inactive.
+fn reported_inactive(
+    ctx: &MmeContext,
+    mme_ue: &crate::context::MmeUe,
+    status: u16,
+) -> (Vec<u8>, Vec<u8>) {
+    let active = |ebi: u8| ebi < 16 && status & (1 << ebi) != 0;
+    // (PDN connection's bearers, its default EBI) in the UE's order.
+    let pdns: Vec<(Vec<u8>, u8)> = mme_ue
+        .sess_list
+        .iter()
+        .filter_map(|sess_id| {
+            let sess = ctx.sess_find_by_id(*sess_id)?;
+            let ebis: Vec<u8> = sess
+                .bearer_list
+                .iter()
+                .filter_map(|id| ctx.bearer_find_by_id(*id))
+                .map(|b| b.ebi)
+                .collect();
+            let default = *ebis.iter().min()?;
+            Some((ebis, default))
+        })
+        .collect();
+    // Every default bearer reported inactive: the first PDN connection stays.
+    let keep_first = pdns.iter().all(|(_, default)| !active(*default));
+    let mut inactive = Vec::new();
+    let mut released = Vec::new();
+    for (i, (ebis, default)) in pdns.iter().enumerate() {
+        let kept = active(*default) || (keep_first && i == 0);
+        if !kept {
+            inactive.push(*default);
+            released.extend_from_slice(ebis);
+            continue;
+        }
+        for ebi in ebis.iter().filter(|e| **e != *default && !active(**e)) {
+            inactive.push(*ebi);
+            released.push(*ebi);
+        }
+    }
+    (inactive, released)
 }
 
 /// Finish an inter-system TAU once the old AMF's context has been installed (#347).
