@@ -482,11 +482,18 @@ impl NsacfEndpoint {
     }
 }
 
-/// Resolve the NSACF endpoint: `NSACF_URI` env var first, then NRF discovery
-/// (GET /nnrf-disc/v1/nf-instances?target-nf-type=NSACF&requester-nf-type=SMF).
-/// Returns `None` when no NSACF is configured/discoverable, so the caller can
-/// treat slice admission control as not deployed (skip the check).
-pub async fn resolve_nsacf_endpoint() -> Option<NsacfEndpoint> {
+/// Resolve the NSACF serving S-NSSAI `(sst, sd)`: the `NSACF_URI` env var first, then
+/// NRF discovery (GET /nnrf-disc/v1/nf-instances?target-nf-type=NSACF&
+/// requester-nf-type=SMF&snssais=[{sst, sd}]). Returns `None` when no NSACF is
+/// configured/discoverable, so the caller can treat slice admission control as not
+/// deployed (skip the check).
+///
+/// #1164: an NSACF serves specific S-NSSAIs (TS 23.501 §5.15.11), so the discovery
+/// names the session's (TS 29.510 §6.2.3.2.3.1 `snssais`) and the instance taken is
+/// one whose profile serves it. TS 29.510 §6.1.6.2.2 NFProfile `sNssais`: "If not
+/// provided, the NF can serve any S-NSSAI". The first instance was taken before,
+/// whatever slice the INCREASE or DECREASE was for.
+pub async fn resolve_nsacf_endpoint(sst: u8, sd: Option<&str>) -> Option<NsacfEndpoint> {
     if let Ok(uri) = std::env::var("NSACF_URI") {
         if let Some((host, port)) = split_host_port(&uri) {
             return Some(NsacfEndpoint { host, port });
@@ -496,11 +503,12 @@ pub async fn resolve_nsacf_endpoint() -> Option<NsacfEndpoint> {
 
     // NRF discovery, answered from the cache while the last result is valid (#1075,
     // #1072 round 2 m5): a releasing shutdown sends N DECREASEs, and each one used
-    // to run its own discovery.
+    // to run its own discovery. Keyed by the S-NSSAI too (#1164).
     let nrf_uri = nextgcore_sbi::context::global_context()
         .get_nrf_uri()
         .await?;
-    if let Some(cached) = cached_nsacf(&nrf_uri) {
+    let key = nsacf_cache_key(&nrf_uri, sst, sd);
+    if let Some(cached) = cached_nsacf(&key) {
         return Some(cached);
     }
     let (nrf_host, nrf_port) = split_host_port(&nrf_uri)?;
@@ -509,16 +517,34 @@ pub async fn resolve_nsacf_endpoint() -> Option<NsacfEndpoint> {
             .with_connect_timeout(Duration::from_secs(2))
             .with_request_timeout(Duration::from_secs(3)),
     );
-    let resp = client
-        .get("/nnrf-disc/v1/nf-instances?target-nf-type=NSACF&requester-nf-type=SMF")
-        .await
-        .ok()?;
+    let mut snssai = serde_json::json!({ "sst": sst });
+    if let Some(sd) = sd {
+        snssai["sd"] = serde_json::json!(sd);
+    }
+    let mut request = nextgcore_sbi::message::SbiRequest::get("/nnrf-disc/v1/nf-instances");
+    request.http.set_param("target-nf-type", "NSACF");
+    request.http.set_param("requester-nf-type", "SMF");
+    request
+        .http
+        .set_param("snssais", serde_json::json!([snssai]).to_string());
+    let resp = client.send_request(request).await.ok()?;
     if resp.status != 200 {
         log::debug!("NRF NSACF discovery returned status {}", resp.status);
         return None;
     }
     let body: serde_json::Value = serde_json::from_str(resp.http.content.as_deref()?).ok()?;
-    let inst = body.get("nfInstances")?.as_array()?.first()?;
+    let Some(inst) = body
+        .get("nfInstances")?
+        .as_array()?
+        .iter()
+        .find(|inst| profile_serves_snssai(inst, sst, sd))
+    else {
+        log::warn!(
+            "NRF named no NSACF serving S-NSSAI[SST:{sst} SD:{sd:?}]; slice admission \
+             control is skipped for it"
+        );
+        return None;
+    };
     let host = inst
         .get("ipv4Addresses")
         .and_then(|a| a.as_array())
@@ -548,12 +574,78 @@ pub async fn resolve_nsacf_endpoint() -> Option<NsacfEndpoint> {
         .map(Duration::from_secs)
         .unwrap_or(NSACF_DISCOVERY_DEFAULT_VALIDITY)
         .min(NSACF_DISCOVERY_MAX_VALIDITY);
-    cache_nsacf(&nrf_uri, &endpoint, validity);
+    cache_nsacf(&key, &endpoint, validity);
     Some(endpoint)
 }
 
-/// The NSACF discovered through each NRF, until its result's validity ends
-/// (#1075). Keyed by the NRF URI, so a different NRF is asked afresh. Process-
+/// The discovery cache key (#1164): the NRF and the S-NSSAI, SD lower-cased.
+fn nsacf_cache_key(nrf_uri: &str, sst: u8, sd: Option<&str>) -> String {
+    format!(
+        "{nrf_uri}|{sst}|{}",
+        sd.map(str::to_ascii_lowercase).unwrap_or_default()
+    )
+}
+
+/// Whether an NF profile serves S-NSSAI `(sst, sd)` (TS 29.510 §6.1.6.2.2). Its
+/// `perPlmnSnssaiList`, when present, overrides `sNssais` (any of its PLMNs counts
+/// here); with neither, "the NF can serve any S-NSSAI". An ExtSnssai entry (TS
+/// 29.571 §5.4.5.1) serves it with the same SST and the same SD (none with none), or
+/// any SD when `wildcardSd` is set, or an SD inside one of its `sdRanges`.
+fn profile_serves_snssai(profile: &serde_json::Value, sst: u8, sd: Option<&str>) -> bool {
+    let per_plmn: Option<Vec<&serde_json::Value>> = profile
+        .get("perPlmnSnssaiList")
+        .and_then(|v| v.as_array())
+        .map(|plmns| {
+            plmns
+                .iter()
+                .filter_map(|p| p.get("sNssaiList").and_then(|l| l.as_array()))
+                .flatten()
+                .collect()
+        });
+    let list: Vec<&serde_json::Value> = match per_plmn {
+        Some(list) => list,
+        None => match profile.get("sNssais").and_then(|v| v.as_array()) {
+            Some(list) => list.iter().collect(),
+            None => return true,
+        },
+    };
+    let sd = sd.map(str::to_ascii_lowercase);
+    list.iter().any(|e| {
+        if e.get("sst").and_then(|v| v.as_u64()) != Some(u64::from(sst)) {
+            return false;
+        }
+        if e.get("wildcardSd").and_then(|v| v.as_bool()) == Some(true) {
+            return true;
+        }
+        let entry_sd = e
+            .get("sd")
+            .and_then(|v| v.as_str())
+            .map(str::to_ascii_lowercase);
+        if entry_sd == sd {
+            return true;
+        }
+        let (Some(sd), Some(ranges)) =
+            (sd.as_deref(), e.get("sdRanges").and_then(|v| v.as_array()))
+        else {
+            return false;
+        };
+        let Ok(value) = u32::from_str_radix(sd, 16) else {
+            return false;
+        };
+        ranges.iter().any(|r| {
+            let bound = |k: &str| {
+                r.get(k)
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| u32::from_str_radix(s, 16).ok())
+            };
+            matches!((bound("start"), bound("end")), (Some(a), Some(b)) if a <= value && value <= b)
+        })
+    })
+}
+
+/// The NSACF discovered through each NRF for each S-NSSAI, until its result's
+/// validity ends (#1075, #1164). Keyed by the NRF URI and the S-NSSAI
+/// ([`nsacf_cache_key`]), so a different NRF, or another slice, is asked afresh. Process-
 /// global: a test that sets an NRF and resolves through it holds
 /// `PROCESS_STATE_TEST_LOCK` (#1150 review round 2 n1).
 static NSACF_DISCOVERY_CACHE: std::sync::Mutex<
@@ -565,15 +657,15 @@ const NSACF_DISCOVERY_DEFAULT_VALIDITY: Duration = Duration::from_secs(60);
 /// The longest a discovered NSACF is reused, whatever the NRF says.
 const NSACF_DISCOVERY_MAX_VALIDITY: Duration = Duration::from_secs(3600);
 
-fn cached_nsacf(nrf_uri: &str) -> Option<NsacfEndpoint> {
+fn cached_nsacf(key: &str) -> Option<NsacfEndpoint> {
     let mut cache = NSACF_DISCOVERY_CACHE
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let map = cache.as_mut()?;
-    match map.get(nrf_uri) {
+    match map.get(key) {
         Some((endpoint, until)) if std::time::Instant::now() < *until => Some(endpoint.clone()),
         Some(_) => {
-            map.remove(nrf_uri);
+            map.remove(key);
             None
         }
         None => None,
@@ -593,13 +685,13 @@ fn forget_cached_nsacf(endpoint: &NsacfEndpoint) {
     }
 }
 
-fn cache_nsacf(nrf_uri: &str, endpoint: &NsacfEndpoint, validity: Duration) {
+fn cache_nsacf(key: &str, endpoint: &NsacfEndpoint, validity: Duration) {
     NSACF_DISCOVERY_CACHE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get_or_insert_with(std::collections::HashMap::new)
         .insert(
-            nrf_uri.to_string(),
+            key.to_string(),
             (endpoint.clone(), std::time::Instant::now() + validity),
         );
 }
@@ -1682,6 +1774,49 @@ pub fn build_release_command(psi: u8, pti: u8, cause_5gsm: u8) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1164, TS 29.510 §6.1.6.2.2 and TS 29.571 §5.4.5.1: which slices a profile
+    /// serves.
+    #[test]
+    fn a_profile_serves_the_slices_it_lists() {
+        use serde_json::json;
+        let any = json!({});
+        assert!(
+            profile_serves_snssai(&any, 7, Some("abcdef")),
+            "no list: any S-NSSAI"
+        );
+        let listed = json!({ "sNssais": [{ "sst": 1 }, { "sst": 2, "sd": "00000A" }] });
+        assert!(profile_serves_snssai(&listed, 1, None));
+        assert!(
+            !profile_serves_snssai(&listed, 1, Some("000001")),
+            "SD differs"
+        );
+        assert!(
+            profile_serves_snssai(&listed, 2, Some("00000a")),
+            "SD case-insensitive"
+        );
+        assert!(!profile_serves_snssai(&listed, 3, None));
+        let wildcard = json!({ "sNssais": [{ "sst": 1, "sd": "000001", "wildcardSd": true }] });
+        assert!(profile_serves_snssai(&wildcard, 1, Some("123456")));
+        let ranged = json!({ "sNssais": [{
+            "sst": 1, "sd": "000010",
+            "sdRanges": [{ "start": "000010", "end": "00001f" }],
+        }] });
+        assert!(profile_serves_snssai(&ranged, 1, Some("00001A")));
+        assert!(!profile_serves_snssai(&ranged, 1, Some("000020")));
+        let per_plmn = json!({
+            "sNssais": [{ "sst": 1 }],
+            "perPlmnSnssaiList": [{
+                "plmnId": { "mcc": "001", "mnc": "01" },
+                "sNssaiList": [{ "sst": 2 }],
+            }],
+        });
+        assert!(
+            profile_serves_snssai(&per_plmn, 2, None),
+            "perPlmnSnssaiList overrides"
+        );
+        assert!(!profile_serves_snssai(&per_plmn, 1, None));
+    }
 
     // ------------------------- N1 SM codec ------------------------------
 

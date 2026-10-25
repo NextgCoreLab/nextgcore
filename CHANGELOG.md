@@ -13,6 +13,11 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 ## [Unreleased]
 
 ### Changed
+- smfd discovers the NSACF per S-NSSAI. NRF discovery carries the session's `snssais` (TS 29.510
+  §6.2.3.2.3.1), and the instance taken is one whose `sNssais` or `perPlmnSnssaiList` serves it.
+  A profile with neither serves any slice (§6.1.6.2.2). The discovery cache is keyed by the
+  S-NSSAI too. Before, the first NSACF was used for every slice (TS 23.501 §5.15.11). `NSACF_URI`
+  still names one NSACF for all slices (#1164).
 - smfd answers its own SM Context Create and Update errors as SmContextCreateError /
   SmContextUpdateError (TS 29.502 Tables 6.1.3.2.3.1-3, 6.1.3.3.4.2.2-2): the ProblemDetails is
   under `error`, at `application/json`. A failed activation adds `upCnxState: DEACTIVATED`, and a

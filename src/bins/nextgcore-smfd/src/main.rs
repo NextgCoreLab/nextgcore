@@ -389,7 +389,7 @@ pub(crate) async fn nsac_admit_migrated_session(
     sst: u8,
     sd: Option<&str>,
 ) -> Option<(bool, Option<String>)> {
-    let Some(nsacf) = policy::resolve_nsacf_endpoint().await else {
+    let Some(nsacf) = policy::resolve_nsacf_endpoint(sst, sd).await else {
         return Some((false, None));
     };
     let nf_id = self_nf_id().await;
@@ -454,7 +454,7 @@ pub(crate) async fn rollback_nsac_as(
     if !admitted {
         return true;
     }
-    match policy::resolve_nsacf_endpoint().await {
+    match policy::resolve_nsacf_endpoint(sst, sd).await {
         Some(nsacf) => {
             let nf_id = match nf_id {
                 Some(id) => id.to_string(),
@@ -4233,7 +4233,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     // NSACF never blocks the basic data path.
     // #1075: the nfId the INCREASE carried, recorded so the DECREASE names it too.
     let mut nsac_nf_id: Option<String> = None;
-    let nsac_admitted = match policy::resolve_nsacf_endpoint().await {
+    let nsac_admitted = match policy::resolve_nsacf_endpoint(sst, snssai_sd.as_deref()).await {
         // #1072 review m6: counted in already, by the released session it replaces.
         _ if nsac_carried => true,
         None => {
@@ -16429,17 +16429,107 @@ mod tests {
             .set_nrf_uri(format!("http://127.0.0.1:{}", addr.port()))
             .await;
         for _ in 0..5 {
-            let found = policy::resolve_nsacf_endpoint().await.expect("discovered");
+            let found = policy::resolve_nsacf_endpoint(1, None)
+                .await
+                .expect("discovered");
             assert_eq!(found.port, 17813);
         }
         let within = discoveries.load(std::sync::atomic::Ordering::SeqCst);
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-        let _ = policy::resolve_nsacf_endpoint().await;
+        let _ = policy::resolve_nsacf_endpoint(1, None).await;
         let after = discoveries.load(std::sync::atomic::Ordering::SeqCst);
         global_context().clear_nrf_uri().await;
         nrf.stop().await.ok();
         assert_eq!(within, 1, "five resolutions, one discovery");
         assert_eq!(after, 2, "asked again once the validity ended");
+    }
+
+    /// #1164: an NSACF serves specific S-NSSAIs (TS 23.501 §5.15.11). The discovery
+    /// names the session's S-NSSAI (TS 29.510 §6.2.3.2.3.1 `snssais`), the instance
+    /// taken is one whose profile serves it (here the NRF names both NSACFs for every
+    /// query, so the SMF's own filter decides), and the cache is per S-NSSAI.
+    ///
+    /// REVERT-VERIFIED: taking the first instance sends slice 2's INCREASE to slice
+    /// 1's NSACF; a cache keyed by the NRF alone reuses slice 1's for slice 2.
+    #[tokio::test]
+    async fn each_slice_is_admitted_by_the_nsacf_serving_it() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        std::env::remove_var("NSACF_URI");
+        let queries = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = queries.clone();
+        let (nrf, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let seen = seen.clone();
+                async move {
+                    if let Some(q) = req.http.params.get("snssais") {
+                        seen.lock().unwrap().push(q.clone());
+                    }
+                    SbiResponse::with_status(200)
+                        .with_json_body(&serde_json::json!({
+                            "validityPeriod": 3600,
+                            "nfInstances": [
+                                {
+                                    "nfInstanceId": "nsacf-1164-a",
+                                    "nfType": "NSACF",
+                                    "ipv4Addresses": ["127.0.0.1"],
+                                    "sNssais": [{ "sst": 1 }],
+                                    "nfServices": [{
+                                        "serviceName": "nnsacf-nsac",
+                                        "ipEndPoints": [{ "port": 11641 }],
+                                    }],
+                                },
+                                {
+                                    "nfInstanceId": "nsacf-1164-b",
+                                    "nfType": "NSACF",
+                                    "ipv4Addresses": ["127.0.0.1"],
+                                    "sNssais": [{ "sst": 2, "sd": "000002" }],
+                                    "nfServices": [{
+                                        "serviceName": "nnsacf-nsac",
+                                        "ipEndPoints": [{ "port": 11642 }],
+                                    }],
+                                },
+                            ],
+                        }))
+                        .unwrap()
+                }
+            })
+            .await;
+        global_context()
+            .set_nrf_uri(format!("http://127.0.0.1:{}", addr.port()))
+            .await;
+        let a = policy::resolve_nsacf_endpoint(1, None)
+            .await
+            .map(|e| e.port);
+        let b = policy::resolve_nsacf_endpoint(2, Some("000002"))
+            .await
+            .map(|e| e.port);
+        let b_again = policy::resolve_nsacf_endpoint(2, Some("000002"))
+            .await
+            .map(|e| e.port);
+        let none = policy::resolve_nsacf_endpoint(3, None)
+            .await
+            .map(|e| e.port);
+        let asked = queries.lock().unwrap().clone();
+        global_context().clear_nrf_uri().await;
+        nrf.stop().await.ok();
+        assert_eq!(a, Some(11641), "slice 1's NSACF");
+        assert_eq!(b, Some(11642), "slice 2's NSACF, not the first instance");
+        assert_eq!(b_again, Some(11642), "cached per slice");
+        assert_eq!(none, None, "no NSACF serves slice 3");
+        let parsed: Vec<serde_json::Value> = asked
+            .iter()
+            .map(|q| serde_json::from_str(q).expect("a JSON array"))
+            .collect();
+        assert_eq!(
+            parsed,
+            vec![
+                serde_json::json!([{ "sst": 1 }]),
+                serde_json::json!([{ "sst": 2, "sd": "000002" }]),
+                serde_json::json!([{ "sst": 3 }]),
+            ],
+            "one discovery per slice, each naming it"
+        );
     }
 
     /// #1150 review M1: a discovered NSACF that fails a transaction is dropped from
@@ -16482,13 +16572,15 @@ mod tests {
         global_context()
             .set_nrf_uri(format!("http://127.0.0.1:{}", addr.port()))
             .await;
-        let nsacf = policy::resolve_nsacf_endpoint().await.expect("discovered");
-        let _ = policy::resolve_nsacf_endpoint().await;
+        let nsacf = policy::resolve_nsacf_endpoint(1, None)
+            .await
+            .expect("discovered");
+        let _ = policy::resolve_nsacf_endpoint(1, None).await;
         let cached = discoveries.load(std::sync::atomic::Ordering::SeqCst);
         let admission =
             policy::nsac_pdu_session_admit(&nsacf, "smf-1150", "imsi-001010000011500", 5, 1, None)
                 .await;
-        let _ = policy::resolve_nsacf_endpoint().await;
+        let _ = policy::resolve_nsacf_endpoint(1, None).await;
         let after = discoveries.load(std::sync::atomic::Ordering::SeqCst);
         global_context().clear_nrf_uri().await;
         nrf.stop().await.ok();
@@ -16587,12 +16679,14 @@ mod tests {
             .set_nrf_uri(format!("http://127.0.0.1:{}", addr.port()))
             .await;
         let count = || discoveries.load(std::sync::atomic::Ordering::SeqCst);
-        let found = policy::resolve_nsacf_endpoint().await.expect("discovered");
+        let found = policy::resolve_nsacf_endpoint(1, None)
+            .await
+            .expect("discovered");
         let first = count();
         let admission =
             policy::nsac_pdu_session_admit(&found, "smf-1150", "imsi-001010000011501", 5, 1, None)
                 .await;
-        let found = policy::resolve_nsacf_endpoint()
+        let found = policy::resolve_nsacf_endpoint(1, None)
             .await
             .expect("discovered again");
         let after_increase = count();
@@ -16605,7 +16699,7 @@ mod tests {
             None,
         )
         .await;
-        let _ = policy::resolve_nsacf_endpoint().await;
+        let _ = policy::resolve_nsacf_endpoint(1, None).await;
         let after_decrease = count();
         global_context().clear_nrf_uri().await;
         nrf.stop().await.ok();
