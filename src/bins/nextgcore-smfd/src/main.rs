@@ -3939,7 +3939,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
 
     // ---- SmContextCreateData attributes (TS 29.502 Table 6.1.6.2.2-1) ----
     // #1188: whether a reject may carry a Back-off timer (TS 24.501 §6.4.1.4.1).
-    let reject_to = policy::RejectTo::from_create_data(&req_body);
+    let reject_to = policy::RejectTo::from_create(request.http.message_priority(), &req_body);
     let Some(pdu_session_id) = req_body["pduSessionId"]
         .as_u64()
         .filter(|p| (1..=15).contains(p))
@@ -21593,7 +21593,11 @@ mod tests {
 
     /// The N1 PDU SESSION ESTABLISHMENT REJECT of an NSACF-refused (#69) create whose
     /// SmContextCreateData carries `extra` (#1188).
-    async fn nsacf_refused_reject_with(supi: &str, extra: serde_json::Value) -> Vec<u8> {
+    async fn nsacf_refused_reject_with(
+        supi: &str,
+        extra: serde_json::Value,
+        message_priority: Option<&str>,
+    ) -> Vec<u8> {
         let (nsacf, addr) =
             nextgcore_sbi::test_support::sbi_server_on_free_port(|_req: SbiRequest| async {
                 SbiResponse::with_status(403)
@@ -21616,6 +21620,10 @@ mod tests {
             body[k] = v.clone();
         }
         request.http.content = Some(body.to_string());
+        if let Some(p) = message_priority {
+            // The header as it arrives over HTTP/2, lower-cased (TS 29.500 §5.2.3.2.2).
+            request.http.set_header("3gpp-sbi-message-priority", p);
+        }
         let resp = handle_sm_context_create(&request).await;
         std::env::remove_var("NSACF_URI");
         nsacf.stop().await.ok();
@@ -21631,25 +21639,39 @@ mod tests {
 
     /// #1188, TS 24.501 §6.4.1.4.1: a #69 reject carries the Back-off timer value IE
     /// (0x37) to an ordinary UE, and leaves it out for an emergency request
-    /// (`requestType` INITIAL_EMERGENCY_REQUEST, TS 29.502) and for a UE the AMF reports
-    /// as a priority user (`priorityUserInd`): "the network shall not include a
-    /// Back-off timer value IE", so the UE may retry at once.
+    /// (`requestType` INITIAL_EMERGENCY_REQUEST, TS 29.502) and for a UE configured for
+    /// high priority access: "the network shall not include a Back-off timer value IE",
+    /// so the UE may retry at once. #1188 follow-up, #1222: high priority access is the
+    /// AMF's `3gpp-Sbi-Message-Priority` above the default 24 (TS 23.502 §4.3.2.2.1 step
+    /// 3, TS 29.500 §6.8.4), or `priorityUserInd` (TS 29.502, home-routed and V-SMF).
     #[tokio::test]
     async fn a_slice_refusal_backs_off_only_an_ordinary_request() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _upf = pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         smf_context_init(64, 256, 512);
         let ordinary =
-            nsacf_refused_reject_with("imsi-001010000011881", serde_json::json!({})).await;
+            nsacf_refused_reject_with("imsi-001010000011881", serde_json::json!({}), None).await;
         let emergency = nsacf_refused_reject_with(
             "imsi-001010000011882",
             serde_json::json!({ "requestType": "INITIAL_EMERGENCY_REQUEST" }),
+            None,
         )
         .await;
-        let priority = nsacf_refused_reject_with(
-            "imsi-001010000011883",
+        // #1188 follow-up, #1222: high priority access is the AMF's Message Priority
+        // header (TS 23.502 §4.3.2.2.1 step 3, TS 29.500 §6.8.4), above the default 24.
+        let priority =
+            nsacf_refused_reject_with("imsi-001010000011883", serde_json::json!({}), Some("5"))
+                .await;
+        let at_default =
+            nsacf_refused_reject_with("imsi-001010000011884", serde_json::json!({}), Some("24"))
+                .await;
+        // The H-SMF's secondary signal (TS 29.502 priorityUserInd).
+        let priority_user = nsacf_refused_reject_with(
+            "imsi-001010000011885",
             serde_json::json!({ "priorityUserInd": true }),
+            None,
         )
         .await;
         // The UEs the creates added (#1092).
@@ -21658,6 +21680,8 @@ mod tests {
                 "imsi-001010000011881",
                 "imsi-001010000011882",
                 "imsi-001010000011883",
+                "imsi-001010000011884",
+                "imsi-001010000011885",
             ] {
                 if let Some(ue) = ctx.ue_find_by_supi(supi) {
                     ctx.ue_remove(ue.id);
@@ -21679,6 +21703,16 @@ mod tests {
             priority,
             vec![0x2E, 7, 3, 0xC3, 69],
             "no back-off for high priority access"
+        );
+        assert_eq!(
+            at_default.get(5),
+            Some(&0x37),
+            "the default priority 24 is not high priority access: {at_default:02x?}"
+        );
+        assert_eq!(
+            priority_user,
+            vec![0x2E, 7, 3, 0xC3, 69],
+            "no back-off for a priority user"
         );
     }
 
