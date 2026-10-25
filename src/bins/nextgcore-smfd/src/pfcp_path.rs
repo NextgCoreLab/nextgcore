@@ -2501,6 +2501,9 @@ pub(crate) mod stand_in {
         /// Answer Session Modifications with no Created PDR (#751): an incomplete
         /// answer to a request that created PDRs with CHOOSE.
         omit_created_pdrs: Arc<std::sync::atomic::AtomicBool>,
+        /// #982 review m1: give every CHOOSE PDR its own F-TEID, as a UPF that does not
+        /// honour the CHOOSE ID would.
+        ignore_choose_id: Arc<std::sync::atomic::AtomicBool>,
         /// Reject the Nth Session Modification from now (1-based; 0 = none) with
         /// cause 64, accepting the others (#751).
         reject_modification: Arc<std::sync::atomic::AtomicU64>,
@@ -2573,6 +2576,12 @@ pub(crate) mod stand_in {
         pub(crate) fn delay_modifications(&self, ms: u64) {
             self.modification_delay_ms
                 .store(ms, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// #982 review m1: answer each CHOOSE PDR with its own F-TEID, CHOOSE ID or not.
+        pub(crate) fn ignore_choose_id(&self, ignore: bool) {
+            self.ignore_choose_id
+                .store(ignore, std::sync::atomic::Ordering::SeqCst);
         }
 
         /// Answer Session Modifications with no Created PDR (#751).
@@ -2750,6 +2759,8 @@ pub(crate) mod stand_in {
         let omit_created_pdrs = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let delay_ms = modification_delay_ms.clone();
         let omit = omit_created_pdrs.clone();
+        let ignore_choose_id = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ignore_chid = ignore_choose_id.clone();
         let reject_modification = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let reject_nth = reject_modification.clone();
         tokio::spawn(async move {
@@ -2880,8 +2891,9 @@ pub(crate) mod stand_in {
                                     continue;
                                 };
                                 let mut teid = N3_STAND_IN_TEID + k as u32;
-                                if let Some(f) =
-                                    pdr_f_teid(pdr).filter(|f| f.len() >= 2 && f[0] & 0x0C == 0x0C)
+                                let honour = !ignore_chid.load(std::sync::atomic::Ordering::SeqCst);
+                                if let Some(f) = pdr_f_teid(pdr)
+                                    .filter(|f| honour && f.len() >= 2 && f[0] & 0x0C == 0x0C)
                                 {
                                     teid = *by_choose_id.entry(f[1]).or_insert(teid);
                                 }
@@ -2930,6 +2942,7 @@ pub(crate) mod stand_in {
             session_cause,
             modification_delay_ms,
             omit_created_pdrs,
+            ignore_choose_id,
             reject_modification,
             modification_bodies,
             establishment_bodies,

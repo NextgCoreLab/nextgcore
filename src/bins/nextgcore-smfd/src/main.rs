@@ -19936,6 +19936,73 @@ mod tests {
         unseed_session(&reference);
     }
 
+    /// **#982 review m1.** The Handover Command Transfer carries ONE forwarding tunnel per
+    /// session (TS 38.413 §9.3.4.10), which is why the forwarding PDRs share a CHOOSE ID
+    /// (TS 29.244 §5.5.3). A UPF that ignores it, and gives each QFI its own F-TEID, has
+    /// installed rules the source can never be told about: they are removed, and the
+    /// source is told to forward nothing.
+    #[tokio::test]
+    async fn a_upf_ignoring_the_choose_id_leaves_no_forwarding_behind() {
+        use nextgcore_ngap_gen::generated as g;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        std::env::remove_var("SMF_N2_INDIRECT_FORWARDING");
+        let upf = pfcp_path::stand_in::install_stand_in_upf().await;
+        upf.client.associate().await.expect("association");
+        upf.ignore_choose_id(true);
+        let reference = seed_registered_session("imsi-001010000009821", 5, "internet");
+        seed_user_plane(&reference, (0x0009_8202, [10, 45, 0, 98]));
+        seed_session(&reference, Some(upf.upf_seid), None);
+        upf.clear_seen();
+
+        prepare_without_direct_path(&reference).await;
+        let flow = |qfi: u8| g::QosFlowItemWithDataForwarding {
+            qos_flow_identifier: g::QosFlowIdentifier(qfi),
+            data_forwarding_accepted: Some(g::DataForwardingAccepted(
+                g::DataForwardingAccepted::DATA_FORWARDING_ACCEPTED,
+            )),
+            ie_extensions: None,
+        };
+        let ack = nextgcore_ngap_gen::encode_contained(&g::HandoverRequestAcknowledgeTransfer {
+            dl_ngu_up_tnl_information: n2_transfer::gtp_tunnel((0x0000_D984, [10, 9, 8, 6])),
+            dl_forwarding_up_tnl_information: Some(n2_transfer::gtp_tunnel((
+                0x0000_F984,
+                [10, 9, 8, 7],
+            ))),
+            security_result: None,
+            qos_flow_setup_response_list: g::QosFlowListWithDataForwarding(vec![flow(1), flow(2)]),
+            qos_flow_failed_to_setup_list: None,
+            data_forwarding_response_drb_list: None,
+            ie_extensions: None,
+        })
+        .expect("encodes");
+        let command = prepared_command(&reference, ack).await;
+        upf.ignore_choose_id(false);
+        assert_eq!(
+            command,
+            n2_transfer::handover_command_transfer(None).expect("encodes"),
+            "no forwarding tunnel for the source"
+        );
+        let mods = upf.modification_bodies();
+        assert_eq!(mods.len(), 2, "install, then remove: {mods:02x?}");
+        assert_eq!(
+            mods[1],
+            n4_build::build_session_modification_request(&n4_build::SessionModificationParams {
+                remove_pdr_ids: vec![0x51, 0x52],
+                remove_far_ids: vec![0x50],
+                remove_qer_ids: vec![0x51, 0x52],
+                ..Default::default()
+            }),
+            "the rules installed for QFIs 1 and 2 are removed"
+        );
+        let sess = smf_self()
+            .read()
+            .unwrap()
+            .sess_find_by_sm_context_ref(&reference)
+            .expect("session");
+        assert!(sess.handover.forwarding_ids.is_empty());
+        unseed_session(&reference);
+    }
+
     /// A COMPLETED the SMF cannot carry out -- no target endpoint was learned at
     /// PREPARED, and no N4 session -- is an error, not `200 COMPLETED` (#964 review): the
     /// downlink was not switched, and a success would hide that from the AMF, which

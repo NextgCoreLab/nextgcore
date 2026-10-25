@@ -3439,6 +3439,90 @@ mod tests {
         s5.close();
     }
 
+    /// Point `sm_context_ref` at the N4 session `upf_seid`, as establishment does.
+    fn seed_n4_session(sm_context_ref: &str, upf_seid: u64) {
+        smf_self()
+            .read()
+            .unwrap()
+            .pfcp_sessions
+            .write()
+            .unwrap()
+            .insert(sm_context_ref.to_string(), upf_seid);
+    }
+
+    fn unseed_n4_session(sm_context_ref: &str) {
+        smf_self()
+            .read()
+            .unwrap()
+            .pfcp_sessions
+            .write()
+            .unwrap()
+            .remove(sm_context_ref);
+    }
+
+    /// **#982 review m2.** A forwarding timer releases only the tunnels it was started
+    /// for. When a later timer for the same SM context replaced its entry, the earlier
+    /// one finds that entry on expiry and leaves it for its own timer: no Session
+    /// Modification, and the entry stays.
+    #[tokio::test]
+    async fn an_earlier_forwarding_timer_leaves_a_newer_entry_alone() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        let reference = "n2ho-982-m2";
+        seed_n4_session(reference, upf.upf_seid);
+        upf.clear_seen();
+        std::env::set_var("SMF_INDIRECT_FORWARDING_TIMER_MS", "100");
+        start_forwarding_release_timer(reference, 0x982, upf.upf_seid, vec![1]);
+        std::env::set_var("SMF_INDIRECT_FORWARDING_TIMER_MS", "60000");
+        start_forwarding_release_timer(reference, 0x982, upf.upf_seid, vec![2]);
+        std::env::remove_var("SMF_INDIRECT_FORWARDING_TIMER_MS");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mods = upf.modification_bodies();
+        let left = pending_forwarding_releases()
+            .lock()
+            .unwrap()
+            .remove(reference)
+            .map(|p| p.ids);
+        unseed_n4_session(reference);
+        assert!(
+            mods.is_empty(),
+            "the stale timer released nothing: {mods:02x?}"
+        );
+        assert_eq!(
+            left,
+            Some(vec![2]),
+            "the newer entry is kept for its own timer"
+        );
+    }
+
+    /// **#982 review m3.** A forwarding timer whose session went away before it expired --
+    /// released, or now on another N4 session -- sends no Session Modification: the
+    /// rules went with the old N4 session, and the SEID may name another session now.
+    #[tokio::test]
+    async fn a_forwarding_timer_of_a_released_or_moved_session_sends_nothing() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        let (released, moved) = ("n2ho-982-m3-released", "n2ho-982-m3-moved");
+        seed_n4_session(released, upf.upf_seid);
+        seed_n4_session(moved, upf.upf_seid);
+        upf.clear_seen();
+        std::env::set_var("SMF_INDIRECT_FORWARDING_TIMER_MS", "100");
+        start_forwarding_release_timer(released, 0x983, upf.upf_seid, vec![1]);
+        start_forwarding_release_timer(moved, 0x983, upf.upf_seid, vec![1]);
+        std::env::remove_var("SMF_INDIRECT_FORWARDING_TIMER_MS");
+        unseed_n4_session(released);
+        seed_n4_session(moved, upf.upf_seid + 1);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mods = upf.modification_bodies();
+        unseed_n4_session(moved);
+        let gone = {
+            let map = pending_forwarding_releases().lock().unwrap();
+            !map.contains_key(released) && !map.contains_key(moved)
+        };
+        assert!(mods.is_empty(), "nothing released: {mods:02x?}");
+        assert!(gone, "both entries are consumed by their timers");
+    }
+
     /// A PDUSessionResourceModifyIndicationTransfer (TS 38.413 §9.3.4.20, generated
     /// codec): the primary DL tunnel and the Additional DL QoS Flow per TNL Information of
     /// a split PDU session, each `((TEID, IPv4), QFIs)`.
