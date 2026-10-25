@@ -3861,6 +3861,422 @@ async fn a_mobility_update_from_cm_idle_rides_an_initial_context_setup_with_its_
     server.ue_auth_state.remove(new_id);
 }
 
+// ---------------------------------------------------------------------------
+// #1102: a registration update's Initial Context Setup records its sessions, and
+// the registration answers the UE's page
+// ---------------------------------------------------------------------------
+
+/// The protected mobility update `tmsi`'s UE sends from CM-IDLE, its full request
+/// carrying `extra` (session IEs) in the NAS message container.
+fn idle_mobility_update(ue_keys: &crate::context::AmfUe, tmsi: u32, extra: &[u8]) -> Vec<u8> {
+    let cleartext = super::guti_registration_request(
+        crate::gmm_build::registration_type::MOBILITY_UPDATING,
+        tmsi,
+    );
+    let mut full = cleartext.clone();
+    full.extend_from_slice(extra);
+    super::service_request_initial_ue(super::protected_initial_registration(
+        ue_keys, &cleartext, &full, 5,
+    ))
+}
+
+/// A page for `old_id`'s UE, identified by the fixture GUTI's 5G-S-TMSI with `tmsi`.
+fn page_for(old_id: u64, tmsi: u32, psi: u8) -> crate::context::PagingContext {
+    crate::context::PagingContext {
+        amf_ue_ngap_id: old_id,
+        tmsi,
+        amf_set_id: 0x155,
+        amf_pointer: 0x2A,
+        plmn_id: PlmnId::new("001", "01"),
+        tac: 0x74,
+        max_retransmit: 4,
+        pdu_session_id: Some(psi),
+        ..Default::default()
+    }
+}
+
+/// Drop what a #1102 test left in the process-global context.
+fn forget_update_test(server: &mut NgapServer, old_id: u64, new_id: u64) {
+    let ctx = crate::context::amf_self();
+    let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+    guard.paging_remove(old_id);
+    guard.paging_remove(new_id);
+    for id in [old_id, new_id] {
+        for sess in guard.sess_list_for_ue(id) {
+            guard.sess_remove(sess.id);
+        }
+    }
+    drop(guard);
+    server.forget_ue(new_id);
+    server.ue_auth_state.remove(old_id);
+}
+
+/// The n2SmInfoType=PDU_RES_SETUP_RSP calls the SMF received.
+fn setup_response_uris(calls: &[SmfCall]) -> Vec<String> {
+    calls
+        .iter()
+        .filter(|(_, body)| body["n2SmInfoType"] == "PDU_RES_SETUP_RSP")
+        .map(|(uri, _)| uri.clone())
+        .collect()
+}
+
+/// **#1102** (TS 23.502 §4.2.2.2.2 step 21, §4.2.3.2 steps 12-14). A CM-IDLE UE
+/// comes back on a new gNB with a mobility update whose Uplink data status
+/// re-activates PSI 1. The Accept rides an Initial Context Setup with PSI 1, and
+/// the gNB's Response reports PSI 1 set up: its Setup Response Transfer, the new
+/// downlink tunnel, reaches PSI 1's SMF. Before the fix the update's ICS left
+/// `ics_requested_psis` as the initial registration's ICS had (empty), so the #739
+/// gate dropped the transfer and the downlink stayed on the old gNB for minutes.
+///
+/// REVERT-VERIFIED: without `record_ics_request(sessions)` in
+/// `send_update_accept_in_initial_context_setup`, no PDU_RES_SETUP_RSP reaches the SMF.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// CONTEXT_GUARD is held across the awaits on purpose: `served_guami` is
+// process-global and this test needs its own for the whole exchange.
+#[allow(clippy::await_holding_lock)]
+async fn a_cm_idle_updates_ics_response_reaches_the_smf_for_the_reactivated_session() {
+    let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    let _guami = ServeFixtureGuami::install();
+    let (_smf, port, calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (old_id, new_id, tmsi) = (7_110_201u64, 7_110_202u64, 0x1102_0201u32);
+    let stored = idle_ue_for_update(old_id, tmsi);
+    let ue_keys = stored.amf_ue.clone();
+    server.ue_auth_state.insert(old_id, stored);
+    hold_session(&mut server, old_id, 1, "reg1102-1", port);
+    server.forced_amf_ue_ngap_id = Some(new_id);
+
+    let pdu = idle_mobility_update(
+        &ue_keys,
+        tmsi,
+        &[0x40, 0x02, 1 << 1, 0x00, 0x50, 0x02, 1 << 1, 0x00],
+    );
+    server
+        .handle_initial_ue_message(ASSOC, &pdu)
+        .await
+        .expect("the update is handled");
+    let sent = take_sent_ngap(&mut server);
+    let ics = sent
+        .iter()
+        .find_map(|(_, p)| decode_ics(p))
+        .unwrap_or_else(|| panic!("an Initial Context Setup Request: {sent:?}"));
+    assert_eq!(ics.items, vec![setup_item(1, transfer_for("reg1102-1"))]);
+    assert_eq!(
+        server
+            .ue_auth_state
+            .get(new_id)
+            .expect("the resumed UE")
+            .ics_requested_psis,
+        vec![1],
+        "the Request's sessions are recorded"
+    );
+
+    server
+        .process_ngap_message(ASSOC, &ics_response_with_sessions(new_id, 512, &[1]))
+        .await
+        .expect("handled");
+
+    let calls = calls.lock().expect("calls").clone();
+    let uris = setup_response_uris(&calls);
+    assert_eq!(uris.len(), 1, "{calls:?}");
+    assert!(uris[0].contains("/sm-contexts/reg1102-1/"), "{uris:?}");
+    forget_update_test(&mut server, old_id, new_id);
+}
+
+/// **#1102, the page** (TS 24.501 §5.6.2.2.1, TS 23.502 §4.2.3.3 step 6). The SMF's
+/// downlink data paged the CM-IDLE UE for PSI 1, and the UE answers with a mobility
+/// update instead of a Service Request, reporting PSI 1 active but sending no Uplink
+/// data status. The verified REGISTRATION REQUEST answers the page, and the update
+/// Accept takes it out of the paging map, so it is not retransmitted for the old
+/// connection and its requester is not told UE_NOT_RESPONDING. And PSI 1, which the page was for, is re-activated
+/// at its SMF and rides the Initial Context Setup, so the buffered downlink is
+/// delivered.
+///
+/// REVERT-VERIFIED: without taking the page in `open_idle_registration_request`, the
+/// page stays in the map and PSI 1 is not activated (no ICS item).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn a_registration_update_from_cm_idle_answers_the_page_and_sets_its_session_up() {
+    let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    let _guami = ServeFixtureGuami::install();
+    let (_smf, port, calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (old_id, new_id, tmsi) = (7_110_301u64, 7_110_302u64, 0x1102_0301u32);
+    let stored = idle_ue_for_update(old_id, tmsi);
+    let ue_keys = stored.amf_ue.clone();
+    server.ue_auth_state.insert(old_id, stored);
+    hold_session(&mut server, old_id, 1, "reg1102-paged-1", port);
+    assert!(crate::context::amf_self()
+        .read()
+        .unwrap()
+        .paging_add(page_for(old_id, tmsi, 1)));
+    server.forced_amf_ue_ngap_id = Some(new_id);
+
+    let pdu = idle_mobility_update(&ue_keys, tmsi, &[0x50, 0x02, 1 << 1, 0x00]);
+    server
+        .handle_initial_ue_message(ASSOC, &pdu)
+        .await
+        .expect("the update is handled");
+
+    {
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            guard.paging_find(old_id).is_none() && guard.paging_find(new_id).is_none(),
+            "the registration answers the page and its Accept takes it"
+        );
+    }
+    let calls = calls.lock().expect("calls").clone();
+    assert!(
+        calls
+            .iter()
+            .any(|(u, b)| u.ends_with("/sm-contexts/reg1102-paged-1/modify")
+                && b["upCnxState"] == "ACTIVATING"),
+        "the paged session is re-activated: {calls:?}"
+    );
+    let sent = take_sent_ngap(&mut server);
+    let ics = sent
+        .iter()
+        .find_map(|(_, p)| decode_ics(p))
+        .unwrap_or_else(|| panic!("an Initial Context Setup Request: {sent:?}"));
+    assert_eq!(
+        ics.items,
+        vec![setup_item(1, transfer_for("reg1102-paged-1"))]
+    );
+    let resumed = server.ue_auth_state.get(new_id).expect("the resumed UE");
+    assert_eq!(resumed.ics_requested_psis, vec![1]);
+    drop(resumed);
+    forget_update_test(&mut server, old_id, new_id);
+}
+
+/// **#1102, a page with its own setup transfer.** A page whose N1N2 transfer brought
+/// PSI 1's PDU Session Resource Setup Request Transfer is answered by a mobility
+/// update. That transfer rides the Initial Context Setup as it is, as it would ride a
+/// Service Request's: the SMF is not asked to activate PSI 1 a second time.
+///
+/// REVERT-VERIFIED: without the page in `reconcile_update_sessions`, the ICS carries
+/// no session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn a_pages_setup_transfer_rides_the_registration_updates_initial_context_setup() {
+    let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    let _guami = ServeFixtureGuami::install();
+    let (_smf, port, calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (old_id, new_id, tmsi) = (7_110_401u64, 7_110_402u64, 0x1102_0401u32);
+    let stored = idle_ue_for_update(old_id, tmsi);
+    let ue_keys = stored.amf_ue.clone();
+    server.ue_auth_state.insert(old_id, stored);
+    hold_session(&mut server, old_id, 1, "reg1102-paged-n2-1", port);
+    let transfer = transfer_for("paged-n2-transfer");
+    let mut page = page_for(old_id, tmsi, 1);
+    page.pending_n2 = Some(transfer.clone());
+    assert!(crate::context::amf_self().read().unwrap().paging_add(page));
+    server.forced_amf_ue_ngap_id = Some(new_id);
+
+    let pdu = idle_mobility_update(&ue_keys, tmsi, &[0x50, 0x02, 1 << 1, 0x00]);
+    server
+        .handle_initial_ue_message(ASSOC, &pdu)
+        .await
+        .expect("the update is handled");
+
+    let calls = calls.lock().expect("calls").clone();
+    assert!(
+        !calls.iter().any(|(u, _)| u.contains("reg1102-paged-n2-1")),
+        "no second activation and no release: {calls:?}"
+    );
+    let sent = take_sent_ngap(&mut server);
+    let ics = sent
+        .iter()
+        .find_map(|(_, p)| decode_ics(p))
+        .unwrap_or_else(|| panic!("an Initial Context Setup Request: {sent:?}"));
+    assert_eq!(ics.items, vec![setup_item(1, transfer)]);
+    assert!(crate::context::amf_self()
+        .read()
+        .unwrap()
+        .paging_find(old_id)
+        .is_none());
+    forget_update_test(&mut server, old_id, new_id);
+}
+
+/// **#1102 (#1105 review m2): a page answered by an update with no session IE.** The
+/// CM-IDLE UE sends a periodic update with neither PDU session status nor Uplink data
+/// status, so the request has nothing to reconcile on its own. The page it answered
+/// still is: its session (PSI 1, a DDN page) is re-activated and rides the ICS.
+///
+/// REVERT-VERIFIED: without the `(None, Some(_))` arm in `send_registration_accept`,
+/// the ICS carries no session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn a_page_answered_by_an_update_without_session_ies_still_sets_its_session_up() {
+    let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    let _guami = ServeFixtureGuami::install();
+    let (_smf, port, calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (old_id, new_id, tmsi) = (7_110_601u64, 7_110_602u64, 0x1102_0601u32);
+    let stored = idle_ue_for_update(old_id, tmsi);
+    let ue_keys = stored.amf_ue.clone();
+    server.ue_auth_state.insert(old_id, stored);
+    hold_session(&mut server, old_id, 1, "reg1102-noies-1", port);
+    assert!(crate::context::amf_self()
+        .read()
+        .unwrap()
+        .paging_add(page_for(old_id, tmsi, 1)));
+    server.forced_amf_ue_ngap_id = Some(new_id);
+
+    let cleartext = super::guti_registration_request(
+        crate::gmm_build::registration_type::PERIODIC_UPDATING,
+        tmsi,
+    );
+    let pdu = super::service_request_initial_ue(super::protected_initial_registration(
+        &ue_keys, &cleartext, &cleartext, 5,
+    ));
+    server
+        .handle_initial_ue_message(ASSOC, &pdu)
+        .await
+        .expect("the update is handled");
+
+    let calls = calls.lock().expect("calls").clone();
+    assert!(
+        calls
+            .iter()
+            .any(|(u, b)| u.ends_with("/sm-contexts/reg1102-noies-1/modify")
+                && b["upCnxState"] == "ACTIVATING"),
+        "{calls:?}"
+    );
+    let sent = take_sent_ngap(&mut server);
+    let ics = sent
+        .iter()
+        .find_map(|(_, p)| decode_ics(p))
+        .unwrap_or_else(|| panic!("an Initial Context Setup Request: {sent:?}"));
+    assert_eq!(
+        ics.items,
+        vec![setup_item(1, transfer_for("reg1102-noies-1"))]
+    );
+    assert!(crate::context::amf_self()
+        .read()
+        .unwrap()
+        .paging_find(old_id)
+        .is_none());
+    forget_update_test(&mut server, old_id, new_id);
+}
+
+/// **#1102 (#1105 review m1): an answered page no update Accept takes.** A paged
+/// CM-IDLE UE answers with a verified INITIAL registration, which is not an update
+/// and takes no page. The page is marked answered by the new connection, so it is
+/// not sent again, but it stays in the paging map. There it runs out on T3513's
+/// schedule and is abandoned, and its requester is told UE_NOT_RESPONDING as
+/// before. It is not silently dropped. The expiry of an answered page is pinned in
+/// `context::tests::an_answered_page_is_not_sent_but_still_expires`.
+///
+/// REVERT-VERIFIED: removing the page when the registration answers it (the first
+/// cut of this fix) fails the "still in the map" assert.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn a_page_answered_by_an_initial_registration_is_kept_for_abandonment() {
+    let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    let _guami = ServeFixtureGuami::install();
+    let (_smf, port, _calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (old_id, new_id, tmsi) = (7_110_701u64, 7_110_702u64, 0x1102_0701u32);
+    let stored = idle_ue_for_update(old_id, tmsi);
+    let ue_keys = stored.amf_ue.clone();
+    server.ue_auth_state.insert(old_id, stored);
+    hold_session(&mut server, old_id, 1, "reg1102-initial-1", port);
+    let mut page = page_for(old_id, tmsi, 1);
+    page.failure_notify_uri = Some(format!("http://127.0.0.1:{port}/n1n2-fail-1102"));
+    assert!(crate::context::amf_self().read().unwrap().paging_add(page));
+    server.forced_amf_ue_ngap_id = Some(new_id);
+
+    let cleartext =
+        super::guti_registration_request(crate::gmm_build::registration_type::INITIAL, tmsi);
+    let pdu = super::service_request_initial_ue(super::protected_initial_registration(
+        &ue_keys, &cleartext, &cleartext, 5,
+    ));
+    let _ = server.handle_initial_ue_message(ASSOC, &pdu).await;
+
+    let kept = crate::context::amf_self()
+        .read()
+        .unwrap()
+        .paging_find(old_id)
+        .expect("the answered page is still in the map");
+    assert_eq!(kept.answered_by, Some(new_id));
+    assert!(
+        kept.failure_notify_uri.is_some(),
+        "its requester can still be told"
+    );
+    forget_update_test(&mut server, old_id, new_id);
+}
+
+/// **#1102, a paged release.** A page that carries PSI 1's release (an N2 Release
+/// Command transfer and the N1 PDU SESSION RELEASE COMMAND) is answered by a mobility
+/// update. The Accept's Initial Context Setup does not set PSI 1 up, and the release
+/// follows it, as after a Service Accept (#518): a PDU SESSION RESOURCE RELEASE
+/// COMMAND for PSI 1, then the N1 in a DOWNLINK NAS TRANSPORT, both on the new
+/// connection.
+///
+/// REVERT-VERIFIED: without the delivery in `send_registration_accept`, only the
+/// Initial Context Setup goes out and the release is lost with the page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn a_paged_release_follows_the_registration_updates_initial_context_setup() {
+    let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    let _guami = ServeFixtureGuami::install();
+    let (_smf, port, calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (old_id, new_id, tmsi) = (7_110_501u64, 7_110_502u64, 0x1102_0501u32);
+    let stored = idle_ue_for_update(old_id, tmsi);
+    let ue_keys = stored.amf_ue.clone();
+    server.ue_auth_state.insert(old_id, stored);
+    hold_session(&mut server, old_id, 1, "reg1102-paged-rel-1", port);
+    let mut page = page_for(old_id, tmsi, 1);
+    page.pending_n2 = Some(vec![0x00]);
+    page.pending_n2_release = true;
+    page.pending_n1 = Some(vec![0x2E, 0x01, 0x00, 0xD3, 0x24]);
+    page.pending_n1_container_type = 0x01;
+    assert!(crate::context::amf_self().read().unwrap().paging_add(page));
+    server.forced_amf_ue_ngap_id = Some(new_id);
+
+    let pdu = idle_mobility_update(&ue_keys, tmsi, &[0x50, 0x02, 1 << 1, 0x00]);
+    server
+        .handle_initial_ue_message(ASSOC, &pdu)
+        .await
+        .expect("the update is handled");
+
+    let calls = calls.lock().expect("calls").clone();
+    assert!(
+        !calls.iter().any(|(u, _)| u.contains("reg1102-paged-rel-1")),
+        "a paged release is not activated: {calls:?}"
+    );
+    let sent = take_sent_ngap(&mut server);
+    assert_eq!(sent.len(), 3, "ICS, Release Command, DL NAS: {sent:?}");
+    let ics = decode_ics(&sent[0].1).expect("the Initial Context Setup goes first");
+    assert!(ics.items.is_empty(), "{:?}", ics.items);
+    assert!(
+        matches!(
+            decode_sent(&sent[1].1),
+            Sent::ReleaseCommand { amf_ue_ngap_id, ref psis } if amf_ue_ngap_id == new_id && psis == &[1]
+        ),
+        "{:?}",
+        decode_sent(&sent[1].1)
+    );
+    assert!(
+        matches!(
+            decode_sent(&sent[2].1),
+            Sent::DownlinkNas { amf_ue_ngap_id, .. } if amf_ue_ngap_id == new_id
+        ),
+        "{:?}",
+        decode_sent(&sent[2].1)
+    );
+    forget_update_test(&mut server, old_id, new_id);
+}
+
 /// A periodic update from CM-IDLE with no session IE still sets up the UE's
 /// context on the new connection: an Initial Context Setup with no session and
 /// the Accept, no N11 call. Otherwise a PDU session the UE establishes next on

@@ -845,6 +845,15 @@ impl UeNasContext {
             cm_idle: false,
         }
     }
+
+    /// #739 / #1102: record the PDU sessions an INITIAL CONTEXT SETUP REQUEST about to
+    /// go to the gNB carries. Its Response is relayed to the SMFs for these only, so
+    /// every Request is recorded, with sessions or without: one left unrecorded has
+    /// its sessions' Setup Response Transfers dropped and their downlink left on the
+    /// previous gNB (TS 23.502 §4.2.3.2 steps 12-14).
+    fn record_ics_request(&mut self, sessions: &[crate::ngap_asn1::CxtReqSession]) {
+        self.ics_requested_psis = sessions.iter().map(|s| s.pdu_session_id).collect();
+    }
 }
 
 /// What [`NgapServer::create_ue_policy_association`] decided (#91).
@@ -5869,11 +5878,17 @@ impl NgapServer {
     /// - each held PSI the PDU session status reports inactive is released at its
     ///   SMF and forgotten;
     /// - each PSI in the Uplink data status is activated at its SMF
-    ///   (upCnxState ACTIVATING), and its transfer is returned for the gNB.
+    ///   (upCnxState ACTIVATING), and its transfer is returned for the gNB;
+    /// - #1102: the session of the page the request answered is set up too, with the
+    ///   page's own setup transfer when it carried one, else activated at its SMF
+    ///   like an uplink-data session (TS 23.502 §4.2.3.3 step 6), so its buffered
+    ///   downlink is delivered. A paged release or modification is not a setup; it
+    ///   follows the Accept.
     async fn reconcile_update_sessions(
         &mut self,
         amf_ue_ngap_id: u64,
         ies: ServiceRequestSessionIes,
+        page: Option<&crate::context::PagingContext>,
     ) -> UpdateSessionOutcome {
         let held: Vec<(u8, Option<String>, crate::context::SNssai)> = {
             let ctx = crate::context::amf_self();
@@ -5891,11 +5906,43 @@ impl NgapServer {
                 })
                 .collect()
         };
-        let plan = plan_service_request_sessions(
+        // The page's own setup transfer rides the ICS as it is (the Service Request's
+        // #518 rule): that session is neither released nor activated again.
+        let mut activated = Vec::new();
+        if let Some(p) = page.filter(|p| !p.pending_n2_release && !p.pending_n2_modify) {
+            if let (Some(psi), Some(transfer)) = (p.pdu_session_id, p.pending_n2.clone()) {
+                match held.iter().find(|(h, _, _)| *h == psi) {
+                    Some((_, _, s_nssai)) => activated.push(crate::ngap_asn1::CxtReqSession {
+                        pdu_session_id: psi,
+                        s_nssai: s_nssai.clone(),
+                        transfer,
+                    }),
+                    None => log::warn!(
+                        "UE {amf_ue_ngap_id}: paged PDU session {psi} no longer exists; its \
+                         N2 SM information is dropped"
+                    ),
+                }
+            }
+        }
+        let already: Vec<u8> = activated.iter().map(|s| s.pdu_session_id).collect();
+        let mut plan = plan_service_request_sessions(
             &held.iter().map(|(psi, _, _)| *psi).collect::<Vec<_>>(),
             ies,
-            &[],
+            &already,
         );
+        // A page that named a session but brought no setup transfer (smfd's Downlink
+        // Data Report paging) re-activates it, as the Service Request path does (#540).
+        if let Some(p) = page {
+            if let (Some(psi), false) = (p.pdu_session_id, p.pending_n2_release) {
+                if !already.contains(&psi)
+                    && !plan.activate.contains(&psi)
+                    && !plan.release.contains(&psi)
+                    && held.iter().any(|(h, _, _)| *h == psi)
+                {
+                    plan.activate.push(psi);
+                }
+            }
+        }
         for psi in &plan.release {
             let (smf_host, smf_port) = self.smf_target_for(amf_ue_ngap_id, *psi);
             if let Some(r) = held
@@ -5920,7 +5967,6 @@ impl NgapServer {
                  inactive (TS 24.501 §5.5.1.3.4)"
             );
         }
-        let mut activated = Vec::new();
         let mut failed: u16 = 0;
         for psi in &plan.activate {
             let found = held.iter().find(|(p, _, _)| p == psi).cloned();
@@ -6012,6 +6058,8 @@ impl NgapServer {
                  re-activated session(s) get no user plane on this connection",
                 sessions.len()
             );
+            // No Request went, so no Response may report a session.
+            state.record_ics_request(&[]);
             self.ue_auth_state.insert(amf_ue_ngap_id, state);
             self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, protected)
                 .await?;
@@ -6021,6 +6069,11 @@ impl NgapServer {
         state.amf_ue.init_next_hop_chain();
         state.initial_context_setup_request_sent = true;
         state.initial_context_setup_response_received = false;
+        // #1102: the gNB's Setup Response Transfers for these sessions carry their
+        // new downlink tunnels, which must reach the SMFs (TS 23.502 §4.2.2.2.2 step
+        // 21, §4.2.3.2 steps 12-14). Unrecorded, the #739 gate dropped them and the
+        // downlink stayed on the previous gNB until the SMF's path-failure release.
+        state.record_ics_request(sessions);
         self.ue_auth_state.insert(amf_ue_ngap_id, state);
         let (racs_id, racs_cap) = self.racs_ies_for(amf_ue_ngap_id);
         let ics = crate::racs::add_capability_ies(ics, racs_id.as_deref(), racs_cap.as_deref());
@@ -6106,8 +6159,28 @@ impl NgapServer {
         // status releases what the UE no longer has, and its Uplink data status
         // re-activates user planes. Both outcomes are reported in the Accept.
         let update = state.registered && state.amf_ue.security_context_available;
-        let reconciled = match state.registration_session_ies.take() {
-            Some(ies) if update => Some(self.reconcile_update_sessions(amf_ue_ngap_id, ies).await),
+        // #1102: the page this request answered, if any. Its session rides the
+        // Accept's Initial Context Setup, and its N1 or N2 release / modify follows it.
+        let page = if update {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.paging_take_answered(amf_ue_ngap_id)
+        } else {
+            None
+        };
+        let reconciled = match (state.registration_session_ies.take(), &page) {
+            (Some(ies), _) if update => Some(
+                self.reconcile_update_sessions(amf_ue_ngap_id, ies, page.as_ref())
+                    .await,
+            ),
+            (None, Some(_)) if update => Some(
+                self.reconcile_update_sessions(
+                    amf_ue_ngap_id,
+                    ServiceRequestSessionIes::default(),
+                    page.as_ref(),
+                )
+                .await,
+            ),
             _ => None,
         };
         let Some(mut plain) = gmm_build::build_registration_accept_for_sessions(
@@ -6204,6 +6277,18 @@ impl NgapServer {
                 "Registration Accept (update) sent to UE {amf_ue_ngap_id} \
                  (5G-TMSI=0x{tmsi:08x}, {reactivated} re-activated PDU session(s))"
             );
+            // #1102: what the answered page held and the Initial Context Setup did not
+            // carry -- an N1, or a paged release or modification -- follows the Accept,
+            // as it follows a Service Accept (#518, TS 23.502 §4.2.3.3 step 5).
+            if let Some(p) = &page {
+                self.deliver_paged_after_service_request(
+                    association_id,
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    p,
+                )
+                .await?;
+            }
             // #91: AFTER the Accept is on the wire, never before.
             self.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
                 s.registration_accept_sent = true;
@@ -6301,7 +6386,7 @@ impl NgapServer {
 
         // #739: this Request sets up no PDU session, so its Response may report none.
         self.ue_auth_state
-            .with_mut(amf_ue_ngap_id, |s| s.ics_requested_psis.clear());
+            .with_mut(amf_ue_ngap_id, |s| s.record_ics_request(&[]));
         self.send_to_association(association_id, &ics).await?;
         // Arm T3550 against the ICS PDU: until the gNB confirms with an ICS
         // Response, the retransmission carries the whole request (Registration
@@ -6656,6 +6741,34 @@ impl NgapServer {
             plmn_id: initial_ue.plmn_id.clone(),
             cell_id: initial_ue.nr_cell_identity,
         };
+        // #1102, TS 24.501 §5.6.2.2.1: a verified REGISTRATION REQUEST answers a page
+        // as a SERVICE REQUEST does, so PAGING stops here. Unanswered, the page kept
+        // going out for the old connection until it was abandoned, and its requester
+        // was told UE_NOT_RESPONDING for a UE that had answered. The page is marked,
+        // not removed: the update Accept takes it and delivers what it held
+        // (`send_registration_accept`), and a registration that never gets there
+        // leaves it to run out on T3513's schedule and be abandoned, so the
+        // requester is still told (#1105 review m1). Marked before the sessions
+        // move, so the session's paging state is cleared under the id it was set on.
+        let answered = {
+            let g = &state.amf_ue.current_guti;
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.paging_mark_answered_by_s_tmsi(
+                g.amf_set_id,
+                g.amf_pointer,
+                g.tmsi,
+                amf_ue_ngap_id,
+            )
+        };
+        if let Some(p) = &answered {
+            clear_session_paging(p);
+            log::info!(
+                "UE {old_id}: the Registration Request answers its page (PSI {:?}), PAGING \
+                 stopped",
+                p.pdu_session_id
+            );
+        }
         self.ue_auth_state.insert(amf_ue_ngap_id, state);
         self.rekey_ue_sessions(old_id, amf_ue_ngap_id);
         (full, true)
@@ -7049,10 +7162,8 @@ impl NgapServer {
         };
         let (racs_id, racs_cap) = self.racs_ies_for(amf_ue_ngap_id);
         let ics = crate::racs::add_capability_ies(ics, racs_id.as_deref(), racs_cap.as_deref());
-        let requested: Vec<u8> = sessions.iter().map(|s| s.pdu_session_id).collect();
-        self.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
-            s.ics_requested_psis = requested;
-        });
+        self.ue_auth_state
+            .with_mut(amf_ue_ngap_id, |s| s.record_ics_request(&sessions));
         self.send_to_association(association_id, &ics).await?;
         for s in &sessions {
             self.mark_up_active(amf_ue_ngap_id, s.pdu_session_id);

@@ -889,6 +889,7 @@ pub(crate) fn initiate_paging_for_idle_ue(
             amf_ue.supi.as_deref().unwrap_or("unknown")
         ),
         supi: amf_ue.supi.clone(),
+        answered_by: None,
     };
 
     // Mark session as paging ongoing; keep the consumer's failure-notify
