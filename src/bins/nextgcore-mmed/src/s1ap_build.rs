@@ -285,8 +285,11 @@ pub fn erab_qos_from_bearer(bearer: &MmeBearer) -> ErabLevelQosParameters {
         qci: bearer.qos.qci,
         arp: AllocationRetentionPriority {
             priority_level: bearer.qos.arp.priority_level,
-            pre_emption_capability: bearer.qos.arp.pre_emption_capability != 0,
-            pre_emption_vulnerability: bearer.qos.arp.pre_emption_vulnerability != 0,
+            // #1180: the context holds the GTP/NAS coding (TS 29.274 §8.15: PCI or
+            // PVI 1 = disabled); TS 36.413 §9.2.1.60 codes 1 as
+            // may-trigger-pre-emption / pre-emptable. A 0 here is enabled.
+            pre_emption_capability: bearer.qos.arp.pre_emption_capability == 0,
+            pre_emption_vulnerability: bearer.qos.arp.pre_emption_vulnerability == 0,
         },
         gbr_qos_info,
     }
@@ -1139,7 +1142,10 @@ mod tests {
                 assert_eq!(req.erab_list[0].gtp_teid, 0x1234_5678);
                 assert_eq!(req.erab_list[0].transport_layer_address, vec![10, 0, 0, 1]);
                 assert_eq!(req.erab_list[0].erab_qos.qci, 9);
-                assert!(req.erab_list[0].erab_qos.arp.pre_emption_capability);
+                // #1180: test_bearer has PCI 1 (GTP: disabled) and PVI 0 (enabled):
+                // shall-not-trigger-pre-emption, pre-emptable (TS 36.413 §9.2.1.60).
+                assert!(!req.erab_list[0].erab_qos.arp.pre_emption_capability);
+                assert!(req.erab_list[0].erab_qos.arp.pre_emption_vulnerability);
                 assert_eq!(
                     req.erab_list[0].nas_pdu.as_deref(),
                     Some(nas_pdu.as_slice())
@@ -1150,6 +1156,52 @@ mod tests {
                 assert_eq!(req.security_key, [0xAB; 32]);
             }
             other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    /// #1180, TS 36.413 §9.2.1.60 / TS 29.274 §8.15: an E-RAB SETUP REQUEST's ARP
+    /// on the wire. A bearer whose PGW said PCI 0 (may pre-empt), PVI 1 (not
+    /// pre-emptable) is sent as may-trigger-pre-emption (1), not-pre-emptable
+    /// (0), and the reverse.
+    #[test]
+    fn erab_arp_flags_follow_ts36413_coding() {
+        use nextgcore_s1ap_gen::generated as g;
+        let enb_ue = test_enb_ue();
+        for (pci, pvi, cap, vul) in [(0u8, 1u8, 1u8, 0u8), (1, 0, 0, 1)] {
+            let mut bearer = test_bearer();
+            bearer.qos.arp.pre_emption_capability = pci;
+            bearer.qos.arp.pre_emption_vulnerability = pvi;
+            let bytes = build_e_rab_setup_request(&enb_ue, &bearer, &[0x27], None).unwrap();
+            let pdu = nextgcore_s1ap_gen::decode(&bytes).unwrap();
+            let g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+                value: g::InitiatingMessageValue::Id_E_RABSetup(req),
+                ..
+            }) = pdu
+            else {
+                panic!("not an E-RAB SETUP REQUEST");
+            };
+            let arp = req
+                .protocol_i_es
+                .0
+                .iter()
+                .find_map(|ie| match &ie.value {
+                    g::E_RABSetupRequestProtocolIEs_EntryValue::Id_E_RABToBeSetupListBearerSUReq(l) => {
+                        l.0.first().map(|e| {
+                            let g::E_RABToBeSetupListBearerSUReq_EntryValue::Id_E_RABToBeSetupItemBearerSUReq(i) = &e.value;
+                            i.e_ra_blevel_qo_s_parameters.allocation_retention_priority.clone()
+                        })
+                    }
+                    _ => None,
+                })
+                .expect("an E-RAB to be set up");
+            assert_eq!(
+                (
+                    arp.pre_emption_capability.0,
+                    arp.pre_emption_vulnerability.0
+                ),
+                (cap, vul),
+                "GTP PCI {pci} PVI {pvi}"
+            );
         }
     }
 
