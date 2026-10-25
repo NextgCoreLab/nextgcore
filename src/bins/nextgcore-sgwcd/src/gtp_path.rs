@@ -245,7 +245,7 @@ impl GtpcServer {
                             // #1152: a PGW that never answers a relayed Create
                             // Session leaves the MME answered and nothing behind.
                             if xact.message_type == Gtp2MessageType::CreateSessionRequest as u8 {
-                                abandon_create_session_without_pgw(xact.sequence_number);
+                                abandon_create_session_without_pgw(xact.peer, xact.sequence_number);
                             }
                             // A failed path leaves the same stale contexts a
                             // restart does, so run the same cleanup rather than
@@ -1708,15 +1708,46 @@ fn take_pending_s5c(seq: u32) -> Option<(u64, pfcp_path::S11Continuation)> {
         .and_then(|mut map| map.as_mut().and_then(|m| m.remove(&seq)))
 }
 
+/// S5-C sequence numbers of Create Session Requests abandoned after N3 (#1152),
+/// with when, so a late accepted answer still gets its PDN connection deleted at
+/// the PGW (#1190 review). Kept for [`ABANDONED_S5C_HOLD`].
+static ABANDONED_S5C: std::sync::Mutex<Vec<(SocketAddr, u32, Instant)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// How long an abandoned Create's sequence number is remembered: far beyond any
+/// PGW's own T3 x N3.
+const ABANDONED_S5C_HOLD: Duration = Duration::from_secs(60);
+
+fn remember_abandoned_s5c(pgw: SocketAddr, seq: u32) {
+    let now = Instant::now();
+    if let Ok(mut list) = ABANDONED_S5C.lock() {
+        list.retain(|(_, _, at)| now.duration_since(*at) < ABANDONED_S5C_HOLD);
+        list.push((pgw, seq, now));
+    }
+}
+
+fn take_abandoned_s5c(pgw: SocketAddr, seq: u32) -> bool {
+    let now = Instant::now();
+    ABANDONED_S5C.lock().is_ok_and(|mut list| {
+        list.retain(|(_, _, at)| now.duration_since(*at) < ABANDONED_S5C_HOLD);
+        let found = list.iter().position(|(p, s, _)| *p == pgw && *s == seq);
+        if let Some(i) = found {
+            list.remove(i);
+        }
+        found.is_some()
+    })
+}
+
 /// The S5/S8 Create Session Request at S5-C `seq` ran out its N3 (#1152, TS
 /// 29.274 §7.6): the PGW is not answering. The MME is answered Remote peer not
 /// responding (§8.4, cause 100) through the parked continuation, and the local
 /// session goes, with its UE when it has no other. No SGW-U session exists yet:
 /// the PFCP establishment follows the PGW's answer.
-fn abandon_create_session_without_pgw(seq: u32) {
+fn abandon_create_session_without_pgw(pgw: SocketAddr, seq: u32) {
     let Some((sess_id, continuation)) = take_pending_s5c(seq) else {
         return;
     };
+    remember_abandoned_s5c(pgw, seq);
     log::error!(
         "S5/S8 Create Session Request seq={seq} unanswered after N3: the MME is answered \
          Remote peer not responding and session {sess_id} is removed"
@@ -1805,6 +1836,22 @@ pub fn parse_s5c_create_session_response(msg: &Gtp2Message) -> S5cCreateSessionA
 fn dispatch_s5c_create_session_response(msg: &Gtp2Message, peer: SocketAddr) {
     let seq = msg.header.sequence_number;
     let Some((sess_id, continuation)) = take_pending_s5c(seq) else {
+        // #1190 review: the answer to a Create this SGW-C gave up on after N3
+        // (#1152). The MME was refused and the session removed; if the PGW
+        // accepted after all, it holds a PDN connection nobody else knows of,
+        // so it is deleted at the S5/S8-C TEID the answer gives.
+        if take_abandoned_s5c(peer, seq) {
+            let answer = parse_s5c_create_session_response(msg);
+            if answer.cause == gtp_cause::REQUEST_ACCEPTED {
+                abandon_pgw_session_at(
+                    peer,
+                    answer.pgw_c.as_ref().map(|ft| ft.teid).unwrap_or(0),
+                    created_lbi(msg),
+                    "the PGW answered the Create after N3 ran out",
+                );
+            }
+            return;
+        }
         log::warn!(
             "S5/S8 Create Session Response from {peer} (seq={seq}) matches no pending request; \
              dropping rather than acting on a datagram this SGW-C did not ask for"
@@ -5074,6 +5121,44 @@ mod tests {
         assert!(
             sgwc_self().ue_find_by_imsi(&imsi).is_none(),
             "the session and the UE are removed"
+        );
+        sgwc_self().set_pgw_s5c_peer(None);
+        server.close();
+    }
+
+    /// #1190 review: the PGW accepts the Create only after N3 ran out. The MME was
+    /// refused and the session removed, so the PGW's PDN connection is deleted
+    /// with a Delete Session Request to the S5/S8-C TEID its answer gives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_late_pgw_answer_after_n3_deletes_the_pgw_session() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let _sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let pgw = with_stand_in_pgw().await;
+        // Longer than T3 x (N3 + 1) = 200 ms, then the PGW accepts.
+        pgw.create_delay_ms
+            .store(600, std::sync::atomic::Ordering::SeqCst);
+        let server = test_server(&ambient, 100, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x90, 0xf1];
+        sock.send_to(&csr(0x1190, &imsi).encode(), server.local_addr())
+            .unwrap();
+        let rsp = recv_s11(&sock).await.expect("the MME is answered");
+        assert_eq!(cause_of(&rsp), gtp_cause::REMOTE_PEER_NOT_RESPONDING);
+        // At least one: the stand-in is still sleeping on the retransmitted
+        // Create, so the Delete Session may itself be retransmitted (T3 100 ms).
+        let deletes = pgw_deletes(&pgw, 1).await;
+        assert!(
+            deletes
+                .iter()
+                .all(|d| *d == (Some(0x0BEE_F001), Some(5), true)),
+            "the PGW's late PDN connection is deleted at its S5/S8-C TEID: {deletes:?}"
         );
         sgwc_self().set_pgw_s5c_peer(None);
         server.close();
