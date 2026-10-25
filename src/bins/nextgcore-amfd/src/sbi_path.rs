@@ -648,9 +648,22 @@ async fn amf_nrf_discover_qualified(
     service_name: &str,
     extra: &[(&str, String)],
 ) -> Result<(), String> {
+    amf_nrf_discover_qualified_at(None, target_nf_type, service_name, extra).await
+}
+
+/// [`amf_nrf_discover_qualified`] against `nrf_uri`, or the AMF's NRF when `None`.
+async fn amf_nrf_discover_qualified_at(
+    nrf_uri: Option<String>,
+    target_nf_type: &str,
+    service_name: &str,
+    extra: &[(&str, String)],
+) -> Result<(), String> {
     let sbi_ctx = global_context();
 
-    let nrf_uri = sbi_ctx.get_nrf_uri().await;
+    let nrf_uri = match nrf_uri {
+        Some(uri) => Some(uri),
+        None => sbi_ctx.get_nrf_uri().await,
+    };
     let nrf_uri = match nrf_uri {
         Some(uri) => uri,
         None => return Ok(()),
@@ -2908,33 +2921,82 @@ pub async fn call_lmf_determine_location(
     Ok(location)
 }
 
+/// The Nlmf_Location endpoint of the LMF an **LMF identification** names (TS 23.273
+/// §6.3.3 step 5, #1157). In this core an LMF identifies itself by its NF instance ID
+/// (lmfd's `servingLMFIdentification`), so it is looked up in the discovery cache by
+/// instance, then by an NRF discovery for that instance (`target-nf-instance-id`,
+/// TS 29.510 §6.2.3.2.3.1). Never a fresh selection: any other LMF holds no state for
+/// the request. `None` when no such LMF is known.
+/// The NRF [`resolve_lmf_by_identification`] asks, when a test has redirected it.
+/// Declared beside its one reader, as `PGW_DISCOVERY_NRF_OVERRIDE` is (#308): pointing
+/// the global NRF URI at a stand-in would redirect every other test's discovery too.
+/// Callers that set it hold [`nf_cache_test_lock`]. Production never sets it.
+static LMF_INSTANCE_DISCOVERY_NRF_OVERRIDE: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
+
+/// Test-only: point [`resolve_lmf_by_identification`]'s NRF discovery at `uri`.
+#[doc(hidden)]
+pub fn set_lmf_instance_discovery_nrf_for_test(uri: Option<String>) {
+    *LMF_INSTANCE_DISCOVERY_NRF_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = uri;
+}
+
+pub async fn resolve_lmf_by_identification(lmf_identification: &str) -> Option<(String, u16)> {
+    let service = nextgcore_sbi::types::SbiServiceType::NlmfLoc;
+    let sbi_ctx = global_context();
+    if let Some(ep) = sbi_ctx
+        .get_nf_instance(lmf_identification)
+        .await
+        .and_then(|i| i.endpoint_for(service))
+    {
+        return Some(ep);
+    }
+    let extra = [(
+        "target-nf-instance-id",
+        nextgcore_sbi::uri_encode::encode_query_value(lmf_identification),
+    )];
+    let nrf_override = LMF_INSTANCE_DISCOVERY_NRF_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    amf_nrf_discover_qualified_at(nrf_override, "LMF", "nlmf-loc", &extra)
+        .await
+        .ok()?;
+    sbi_ctx
+        .get_nf_instance(lmf_identification)
+        .await
+        .and_then(|i| i.endpoint_for(service))
+}
+
 /// `Nlmf_Location_CancelLocation`: POST /nlmf-loc/v1/cancel-location
 /// (TS 29.572 §6.1.4.3), driven by Namf_Location CancelLocation (TS 29.518
-/// §5.5.2.5.1).
+/// §5.5.2.5.1, TS 23.273 §6.3.3 step 5).
 ///
-/// `CancelLocData` (lmfd's `nlmf::CancelLocData`) requires `hgmlcCallBackURI` and
-/// `ldrReference`; `lcsCorrelationID` is optional and carried when the AMF holds one.
+/// Sent to `lmf`, the LMF that holds the location request (#1157), never to a freshly
+/// selected one. `CancelLocData` (TS29572_Nlmf_Location.yaml:1402-1416) requires
+/// `hgmlcCallBackURI` and `ldrReference`; `lcsCorrelationID` (a TS 29.572
+/// `CorrelationID`) is carried when the AMF holds one.
 pub async fn call_lmf_cancel_location(
+    lmf: (&str, u16),
     supi: &str,
     ldr_reference: &str,
     hgmlc_callback_uri: &str,
-    serving_lmf_identification: Option<&str>,
+    lcs_correlation_id: Option<&str>,
 ) -> Result<(), String> {
-    let (lmf_host, lmf_port) = resolve_lmf_endpoint().await.ok_or_else(|| {
-        "no LMF endpoint (NRF discovery found none, LMF_SBI_ADDR unset)".to_string()
-    })?;
+    let (lmf_host, lmf_port) = lmf;
 
     let mut body = serde_json::json!({
         "hgmlcCallBackURI": hgmlc_callback_uri,
         "ldrReference": ldr_reference,
     });
-    if let Some(lmf_id) = serving_lmf_identification {
-        body["lcsCorrelationID"] = serde_json::json!(lmf_id);
+    if let Some(corr) = lcs_correlation_id {
+        body["lcsCorrelationID"] = serde_json::json!(corr);
     }
     log::debug!("Cancelling LDR [{ldr_reference}] for [{supi}] at LMF {lmf_host}:{lmf_port}");
 
     let client = crate::attach_oauth2(
-        SbiClient::for_peer(&lmf_host, lmf_port),
+        SbiClient::for_peer(lmf_host, lmf_port),
         nextgcore_sbi::types::NfType::Lmf,
     );
     let response = client
