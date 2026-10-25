@@ -358,12 +358,14 @@ pub enum GlobalRanNodeId {
         /// gNB ID bit length (22..32)
         gnb_id_len: u8,
     },
-    /// Global ng-eNB ID
+    /// Global ng-eNB ID (TS 38.413 §9.3.1.8)
     GlobalNgEnbId {
         /// PLMN Identity (3 bytes)
         plmn_identity: [u8; 3],
-        /// ng-eNB ID value
-        ng_enb_id: u32,
+        /// The ngENB-ID CHOICE, with its length kept (#876): a macro (20 bits), short
+        /// macro (18) and long macro (21) id are different identities even when their
+        /// values are equal.
+        ng_enb_id: NgEnbId,
     },
 }
 

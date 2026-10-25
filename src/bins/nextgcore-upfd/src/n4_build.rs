@@ -1089,6 +1089,10 @@ pub struct ParsedFTeid {
     pub teid: u32,
     pub ipv4: Option<Ipv4Addr>,
     pub ipv6: Option<Ipv6Addr>,
+    /// The V4 / V6 flags as sent (§8.2.3). With CH set no address follows, and these
+    /// say which address family the UP function shall assign (#985).
+    pub v4: bool,
+    pub v6: bool,
     pub ch: bool,   // CHOOSE flag
     pub chid: bool, // CHOOSE ID flag
     pub choose_id: Option<u8>,
@@ -1159,6 +1163,8 @@ impl ParsedFTeid {
             teid,
             ipv4,
             ipv6,
+            v4,
+            v6,
             ch,
             chid,
             choose_id,

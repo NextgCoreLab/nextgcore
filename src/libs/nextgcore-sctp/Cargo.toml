@@ -17,7 +17,7 @@ kernel = ["nix", "libc"]
 nextgcore-core = { workspace = true }
 thiserror.workspace = true
 log.workspace = true
-tokio = { workspace = true, features = ["net", "sync", "time", "rt"] }
+tokio = { workspace = true, features = ["net", "sync", "time", "rt", "macros"] }
 bytes.workspace = true
 async-trait.workspace = true
 

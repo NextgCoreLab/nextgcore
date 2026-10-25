@@ -32,7 +32,19 @@ fn racs_ue_with_pending(server: &mut NgapServer, ue: u64, ran: u32, pending: Opt
     });
 }
 
-/// `(pending timer, its PDU, whether the UE has been sent the ID)`.
+/// #889: the last command carried `id`, and its timer supervises it.
+fn assert_id_in_flight(server: &NgapServer, ue: u64, id: &[u8]) {
+    let s = server.ue_auth_state.get(ue).expect("UE held");
+    assert_eq!(
+        s.amf_ue.racs_in_flight,
+        Some(crate::racs::RacsInFlight {
+            delivery: crate::racs::RacsDelivery::Id(id.to_vec()),
+            armed: true,
+        })
+    );
+}
+
+/// `(pending timer, its PDU, whether the UE has acknowledged the ID)`.
 fn slot(server: &NgapServer, ue: u64) -> (Option<NasProcTimer>, Option<Vec<u8>>, bool) {
     let s = server.ue_auth_state.get(ue).expect("UE held");
     (
@@ -102,7 +114,9 @@ async fn an_id_assigned_during_a_registration_waits_for_the_registration_complet
     assert!(carries_the_id(&cucs[0]), "{:02x?}", cucs[0]);
     let (timer, _, known) = slot(&server, ue);
     assert_eq!(timer, Some(NasProcTimer::T3555));
-    assert!(known);
+    // #889: sent, not yet acknowledged.
+    assert!(!known);
+    assert_id_in_flight(&server, ue, &ID);
 }
 
 /// The issue's second trigger: a network-initiated deregistration (T3522) is
@@ -166,7 +180,9 @@ async fn an_id_waits_for_the_configuration_update_in_flight() {
         Some(PENDING_PDU.to_vec()),
         "a new command is supervised"
     );
-    assert!(known);
+    // #889: sent, not yet acknowledged.
+    assert!(!known);
+    assert_id_in_flight(&server, ue, &ID);
 }
 
 /// With nothing pending the command goes out at once, as before.
@@ -319,7 +335,9 @@ async fn a_new_version_id_reassigns_the_id_by_a_configuration_update() {
     );
     let (timer, _, known) = slot(&server, ue);
     assert_eq!(timer, Some(NasProcTimer::T3555));
-    assert!(known, "the UE is now sent the new ID");
+    // #889: known only once the UE acknowledges it.
+    assert!(!known, "the UE is sent the new ID, not yet acknowledged");
+    assert_id_in_flight(&server, ue, &NEW_ID);
     server.forget_ue(ue);
 }
 

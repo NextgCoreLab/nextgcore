@@ -410,6 +410,24 @@ impl SbiOffload {
         None
     }
 
+    /// Wait until an outcome is ready for [`SbiOffload::try_recv`], or a keyed
+    /// exchange has finished (#981). `NgapServer::poll` races its SCTP receive
+    /// against this, so an SMF answer is applied as soon as it arrives instead of
+    /// after the receive timeout, and the next exchange queued on a finished key is
+    /// started at once. Cancel-safe: the only await is the channel's `recv`, and a
+    /// report it returns is kept (`ready`) or acted on before this returns.
+    pub(crate) async fn report_arrived(&mut self) {
+        if !self.ready.is_empty() {
+            return;
+        }
+        match self.rx.recv().await {
+            Some(Report::Outcome(outcome)) => self.ready.push_back(outcome),
+            Some(Report::KeyDone { job }) => self.key_done(job),
+            // The sender lives in `self`, so the channel never closes.
+            None => std::future::pending().await,
+        }
+    }
+
     /// How many exchanges hold a permit right now.
     pub(crate) fn in_flight(&self) -> usize {
         self.max_in_flight - self.permits.available_permits()
