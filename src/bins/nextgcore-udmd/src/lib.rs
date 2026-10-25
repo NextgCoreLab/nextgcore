@@ -57,6 +57,11 @@ pub mod test_support {
 
     /// Process-wide lock so strict-peer tests that touch the global UDM context
     /// run serially (the UDM context is process-global; parallel tests race).
+    ///
+    /// It also serializes udmd's tests that write the process-global SBI NF-instance
+    /// cache (`nextgcore_sbi::context::global_context()`): registering NF profiles,
+    /// evicting them, and `udm_sbi_close`, which clears it (#898). A test that does any
+    /// of these must hold it.
     pub static CONTEXT_GUARD: Mutex<()> = Mutex::new(());
 
     /// Initialize the process-global UDM context for in-process strict-peer

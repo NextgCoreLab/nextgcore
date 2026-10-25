@@ -5781,15 +5781,28 @@ async fn handle_cancel_location(ue_context_id: &str, request: &SbiRequest) -> Sb
     // AMF must not keep routing this UE's uplink positioning to the old LMF. Keyed by
     // the UE's own context identity, the way `lcs_correlation_set` writes it.
     let correlation_key = ue.supi.clone().unwrap_or_else(|| supi.to_string());
-    let serving_lmf = {
+    let record = {
         let ctx = amf_self();
         let Ok(guard) = ctx.read() else {
             return send_error(500, "Internal Server Error", "context lock poisoned", None);
         };
         let record = guard.lcs_correlation_find(&correlation_key);
         guard.lcs_correlation_remove(&correlation_key);
-        record.and_then(|r| r.serving_lmf_identification)
+        record
     };
+    // #1157, TS 23.273 §6.3.3 steps 4-5: the cancel goes to the LMF the GMLC named
+    // (`servingLMFIdentification`, TS29518_Namf_Location.yaml:604-605), else to the
+    // LMF this AMF last relayed the UE's positioning for. Never a freshly selected
+    // LMF, which holds nothing for this request.
+    let lmf_identification = body
+        .get("servingLMFIdentification")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            record
+                .as_ref()
+                .and_then(|r| r.serving_lmf_identification.clone())
+        });
 
     if nrppa_periodic {
         log::info!(
@@ -5797,24 +5810,40 @@ async fn handle_cancel_location(ue_context_id: &str, request: &SbiRequest) -> Sb
              procedure toward the UE is SKIPPED (TS 29.518 §5.5.2.5.1 step 2a); the LDR \
              [{ldr_reference}] correlation is dropped"
         );
-    } else {
-        match crate::sbi_path::call_lmf_cancel_location(
-            &correlation_key,
-            ldr_reference,
-            hgmlc_callback,
-            serving_lmf.as_deref(),
-        )
-        .await
-        {
-            Ok(()) => log::info!(
-                "[{ue_context_id}] CancelLocation: LDR [{ldr_reference}] cancelled at the LMF"
+    } else if let Some(lmf_id) = lmf_identification {
+        match crate::sbi_path::resolve_lmf_by_identification(&lmf_id).await {
+            None => log::warn!(
+                "[{ue_context_id}] CancelLocation: LMF [{lmf_id}] holding LDR \
+                 [{ldr_reference}] is not known to this AMF (not cached, not discoverable); \
+                 the AMF's own correlation is dropped regardless"
             ),
-            Err(e) => log::warn!(
-                "[{ue_context_id}] CancelLocation: the LMF could not be told to cancel LDR \
-                 [{ldr_reference}] ({e}); the AMF's own correlation is dropped regardless, so \
-                 this AMF has stopped reporting"
-            ),
+            Some((host, port)) => match crate::sbi_path::call_lmf_cancel_location(
+                (&host, port),
+                &correlation_key,
+                ldr_reference,
+                hgmlc_callback,
+                record.as_ref().map(|r| r.lcs_correlation_id.as_str()),
+            )
+            .await
+            {
+                Ok(()) => log::info!(
+                    "[{ue_context_id}] CancelLocation: LDR [{ldr_reference}] cancelled at \
+                     LMF [{lmf_id}]"
+                ),
+                Err(e) => log::warn!(
+                    "[{ue_context_id}] CancelLocation: LMF [{lmf_id}] could not be told to \
+                     cancel LDR [{ldr_reference}] ({e}); the AMF's own correlation is dropped \
+                     regardless, so this AMF has stopped reporting"
+                ),
+            },
         }
+    } else {
+        // Step 5 is conditional on an LMF identification: with none, no LMF holds a
+        // request this AMF knows of.
+        log::info!(
+            "[{ue_context_id}] CancelLocation: no LMF identification for LDR \
+             [{ldr_reference}]; no Nlmf_Location_CancelLocation (TS 23.273 §6.3.3 step 5)"
+        );
     }
 
     SbiResponse::no_content()
@@ -11873,6 +11902,247 @@ mod tests {
         .await;
         assert_eq!(resp.status, 404);
         assert_eq!(problem_cause(&resp), "CONTEXT_NOT_FOUND");
+    }
+
+    /// A stand-in LMF recording each request as `(uri, body)`.
+    async fn recording_lmf() -> (
+        SbiServer,
+        u16,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>,
+    ) {
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>> =
+            std::sync::Arc::default();
+        let sink = std::sync::Arc::clone(&seen);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = addr.port();
+        let lmf = SbiServer::on_listener(
+            SbiServerConfig::new(format!("127.0.0.1:{port}").parse().expect("addr")),
+            listener,
+        );
+        lmf.start(move |req: SbiRequest| {
+            let sink = std::sync::Arc::clone(&sink);
+            async move {
+                let body = req
+                    .http
+                    .content
+                    .as_deref()
+                    .and_then(|b| serde_json::from_str(b).ok())
+                    .unwrap_or(Value::Null);
+                sink.lock()
+                    .expect("sink")
+                    .push((req.header.uri.clone(), body));
+                SbiResponse::with_status(204)
+            }
+        })
+        .await
+        .expect("stand-in LMF start");
+        (lmf, port, seen)
+    }
+
+    /// **#1157, TS 23.273 §6.3.3 steps 4-5.** A CancelLocation goes to the LMF that
+    /// holds the location request -- the one the GMLC names in
+    /// `servingLMFIdentification`, else the one this AMF recorded with the UE's LCS
+    /// correlation -- and carries the stored correlation ID as `lcsCorrelationID`. Two
+    /// LMFs are cached; the other one, which #997's selection prefers (priority), hears
+    /// nothing.
+    ///
+    /// REVERT-VERIFIED: with the cancel sent to `resolve_lmf_endpoint()`, both cancels
+    /// reach the preferred LMF, and `lcsCorrelationID` carries the LMF identification.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_location_reaches_the_lmf_holding_the_request() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        let _cache = crate::sbi_path::nf_cache_test_lock().lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (_preferred, preferred_port, preferred_seen) = recording_lmf().await;
+        let (_holder, holder_port, holder_seen) = recording_lmf().await;
+        let lmf = |id: &str, port: u16, priority: u16| {
+            let mut i =
+                nextgcore_sbi::context::NfInstance::new(id, nextgcore_sbi::types::NfType::Lmf);
+            let mut svc = nextgcore_sbi::context::NfService::new(
+                "nlmf-loc",
+                nextgcore_sbi::types::SbiServiceType::NlmfLoc,
+            );
+            svc.ip_addresses = vec!["127.0.0.1".into()];
+            svc.port = port;
+            i.add_service(svc);
+            i.priority = priority;
+            i
+        };
+        let sbi_ctx = nextgcore_sbi::context::global_context();
+        // Removed however the test ends (#1159 review m1): a leftover preferred LMF
+        // would win a sibling positioning test's selection.
+        let _seeded = SeededLmfs(&["lmf-1157-preferred", "lmf-1157-holder"]);
+        // Lower value = preferred (TS 29.510): a fresh selection takes this one.
+        sbi_ctx
+            .add_nf_instance(lmf("lmf-1157-preferred", preferred_port, 1))
+            .await;
+        sbi_ctx
+            .add_nf_instance(lmf("lmf-1157-holder", holder_port, 100))
+            .await;
+
+        let cases = [
+            // The GMLC names the LMF (step 4).
+            ("imsi-001010000115701", Some("lmf-1157-holder"), None),
+            // It does not; the AMF's own correlation record names it.
+            ("imsi-001010000115702", None, Some("lmf-1157-holder")),
+        ];
+        for (n, (supi, named, recorded)) in cases.into_iter().enumerate() {
+            let _ue = setup_ue(supi, true, true);
+            {
+                let ctx = amf_self();
+                let guard = ctx.read().expect("ctx lock");
+                guard.lcs_correlation_set(
+                    supi,
+                    LcsCorrelationRecord {
+                        lcs_correlation_id: format!("corr-1157-{n}"),
+                        serving_lmf_identification: recorded.map(str::to_string),
+                    },
+                );
+            }
+            let mut body = json!({
+                "supi": supi,
+                "hgmlcCallBackURI": "http://127.0.0.1:19157/hgmlc",
+                "ldrReference": format!("ldr-1157-{n}"),
+            });
+            if let Some(id) = named {
+                body["servingLMFIdentification"] = json!(id);
+            }
+            let resp = namf_request_handler(
+                SbiRequest::post(format!("/namf-loc/v1/{supi}/cancel-pos-info"))
+                    .with_json_body(&body)
+                    .expect("json"),
+            )
+            .await;
+            assert_eq!(resp.status, 204, "case {n}");
+            let seen = holder_seen.lock().expect("seen").clone();
+            let (uri, cancel) = seen.get(n).unwrap_or_else(|| panic!("case {n}: {seen:?}"));
+            assert!(uri.ends_with("/nlmf-loc/v1/cancel-location"), "{uri}");
+            assert_eq!(cancel["ldrReference"], format!("ldr-1157-{n}"));
+            assert_eq!(cancel["hgmlcCallBackURI"], "http://127.0.0.1:19157/hgmlc");
+            assert_eq!(
+                cancel["lcsCorrelationID"],
+                format!("corr-1157-{n}"),
+                "case {n}: the stored correlation ID, not the LMF identification"
+            );
+        }
+        assert!(
+            preferred_seen.lock().expect("seen").is_empty(),
+            "an LMF that holds no request is never asked: {:?}",
+            preferred_seen.lock().expect("seen")
+        );
+    }
+
+    /// Removes the NF instances a test cached, however the test ends.
+    struct SeededLmfs(&'static [&'static str]);
+
+    impl Drop for SeededLmfs {
+        fn drop(&mut self) {
+            let ids = self.0;
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .expect("cleanup runtime");
+                    rt.block_on(async {
+                        let ctx = nextgcore_sbi::context::global_context();
+                        for id in ids {
+                            ctx.remove_nf_instance(id).await;
+                        }
+                    });
+                });
+            });
+            crate::sbi_path::set_lmf_instance_discovery_nrf_for_test(None);
+        }
+    }
+
+    /// **#1159 review m2, TS 23.273 §6.3.3 step 5.** The LMF holding the request is not
+    /// in this AMF's discovery cache: it is found by an NRF discovery for that instance
+    /// (`target-nf-instance-id`, TS 29.510 §6.2.3.2.3.1) and the cancel reaches it.
+    ///
+    /// REVERT-VERIFIED: with the NRF fallback removed, the cancel reaches no LMF.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_location_discovers_an_uncached_lmf_by_its_instance_id() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        let _cache = crate::sbi_path::nf_cache_test_lock().lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (_holder, holder_port, holder_seen) = recording_lmf().await;
+        let lmf_id = "lmf-1157-uncached";
+        let _seeded = SeededLmfs(&["lmf-1157-uncached"]);
+        // A stand-in NRF answering the instance discovery with the holder's profile.
+        let queries: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let sink = std::sync::Arc::clone(&queries);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let nrf_port = addr.port();
+        let nrf = SbiServer::on_listener(
+            SbiServerConfig::new(format!("127.0.0.1:{nrf_port}").parse().expect("addr")),
+            listener,
+        );
+        nrf.start(move |req: SbiRequest| {
+            let sink = std::sync::Arc::clone(&sink);
+            async move {
+                let asked = req
+                    .http
+                    .get_param("target-nf-instance-id")
+                    .cloned()
+                    .unwrap_or_default();
+                sink.lock().expect("sink").push(asked);
+                SbiResponse::with_status(200)
+                    .with_json_body(&json!({
+                        "validityPeriod": 60,
+                        "nfInstances": [{
+                            "nfInstanceId": lmf_id,
+                            "nfType": "LMF",
+                            "nfStatus": "REGISTERED",
+                            "nfServices": [{
+                                "serviceInstanceId": "nlmf-loc-1",
+                                "serviceName": "nlmf-loc",
+                                "versions": [{ "apiVersionInUri": "v1", "apiFullVersion": "1.0.0" }],
+                                "scheme": "http",
+                                "nfServiceStatus": "REGISTERED",
+                                "ipEndPoints": [{ "ipv4Address": "127.0.0.1", "port": holder_port }],
+                            }],
+                        }],
+                    }))
+                    .expect("json")
+            }
+        })
+        .await
+        .expect("stand-in NRF start");
+        crate::sbi_path::set_lmf_instance_discovery_nrf_for_test(Some(format!(
+            "http://127.0.0.1:{nrf_port}"
+        )));
+        let sbi_ctx = nextgcore_sbi::context::global_context();
+        assert!(
+            sbi_ctx.get_nf_instance(lmf_id).await.is_none(),
+            "precondition"
+        );
+
+        let supi = "imsi-001010000115703";
+        let _ue = setup_ue(supi, true, true);
+        let resp = namf_request_handler(
+            SbiRequest::post(format!("/namf-loc/v1/{supi}/cancel-pos-info"))
+                .with_json_body(&json!({
+                    "supi": supi,
+                    "hgmlcCallBackURI": "http://127.0.0.1:19157/hgmlc",
+                    "ldrReference": "ldr-1157-nrf",
+                    "servingLMFIdentification": lmf_id,
+                }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(resp.status, 204);
+        let queries = queries.lock().expect("queries").clone();
+        assert!(
+            queries.iter().any(|q| q == lmf_id),
+            "the NRF is asked for that instance (target-nf-instance-id): {queries:?}"
+        );
+        let seen = holder_seen.lock().expect("seen").clone();
+        assert!(
+            matches!(seen.as_slice(), [(uri, body)]
+                if uri.ends_with("/nlmf-loc/v1/cancel-location")
+                    && body["ldrReference"] == "ldr-1157-nrf"),
+            "the cancel reaches the discovered LMF: {seen:?}"
+        );
     }
 
     /// #74 criterion 6: `POST /namf-loc/v1/{id}/cancel-pos-info` (CancelLocation) is

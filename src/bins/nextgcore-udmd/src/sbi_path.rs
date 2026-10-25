@@ -308,19 +308,16 @@ pub async fn udm_nrf_discover(
 
 /// Close SBI server
 ///
-/// Port of udm_sbi_close()
-pub fn udm_sbi_close() {
+/// Port of udm_sbi_close(). The SBI clients and the NF-instance cache are cleared
+/// before this returns. They used to be cleared from a detached task (#898), which
+/// could run at any later point, so a caller could not tell when its cache entries
+/// would vanish. In tests that wiped NF profiles another test had just registered.
+pub async fn udm_sbi_close() {
     log::info!("Closing UDM SBI server");
 
-    // Clear SBI client connections
     let sbi_ctx = global_context();
-    if let Ok(_handle) = tokio::runtime::Handle::try_current() {
-        // Use spawn instead of block_on to avoid panicking when called from async context
-        tokio::spawn(async move {
-            sbi_ctx.clear_clients().await;
-            sbi_ctx.clear_nf_instances().await;
-        });
-    }
+    sbi_ctx.clear_clients().await;
+    sbi_ctx.clear_nf_instances().await;
 
     SBI_RUNNING.store(false, Ordering::SeqCst);
 
@@ -1186,14 +1183,49 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
     async fn test_sbi_open_close() {
+        // Closing clears the process-global NF-instance cache, which every test that
+        // registers an NF profile relies on, so this runs under the same lock (#898).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         assert!(!udm_sbi_is_running());
 
         udm_sbi_open(None).unwrap();
         assert!(udm_sbi_is_running());
 
-        udm_sbi_close();
+        udm_sbi_close().await;
         assert!(!udm_sbi_is_running());
+    }
+
+    /// #898: the NF-instance cache is empty when `udm_sbi_close` returns, not at
+    /// some later point. A current-thread runtime makes the old detached clear
+    /// observable: the spawned task could not run before the assertion.
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
+    async fn close_clears_the_nf_cache_before_it_returns() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let instance_id = "udmd-898-close-clears";
+        global_context()
+            .add_nf_instance(NfInstance::new(instance_id, NfType::Ausf))
+            .await;
+        assert!(global_context()
+            .get_nf_instance(instance_id)
+            .await
+            .is_some());
+
+        udm_sbi_close().await;
+
+        assert!(
+            global_context()
+                .get_nf_instance(instance_id)
+                .await
+                .is_none(),
+            "the cache must be cleared by the time udm_sbi_close returns"
+        );
     }
 
     #[test]

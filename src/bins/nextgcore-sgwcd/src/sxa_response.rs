@@ -446,6 +446,22 @@ fn establishment_response(sess_id: u64, continuation: S11Continuation, body: &[u
         }
     };
 
+    // The session went while the SGW-U was establishing it -- a colliding Create
+    // Session Request replaced it, say. The SGW-U holds a session nothing here can
+    // address any more, so it is deleted now rather than left to leak.
+    if sess.is_none() && pfcp_cause == sxa_handler::pfcp_cause::REQUEST_ACCEPTED && up_f_seid != 0 {
+        match crate::pfcp_path::send_session_deletion_for_seid(up_f_seid, sess_id) {
+            Ok(()) => log::warn!(
+                "Session {sess_id} was removed while the SGW-U established it: deleting SGW-U \
+                 session {up_f_seid:#x}"
+            ),
+            Err(e) => log::error!(
+                "Session {sess_id} was removed while the SGW-U established it, and SGW-U \
+                 session {up_f_seid:#x} could not be deleted: {e}"
+            ),
+        }
+    }
+
     let result =
         sxa_handler::handle_session_establishment_response(sess.as_ref(), 0, pfcp_cause, up_f_seid);
 

@@ -237,6 +237,21 @@ impl PeerAllowlist {
     /// [`KICK_INTERVAL`] and non-blocking, so a flood of strangers costs at most one
     /// lookup a second. Returns whether this call kicked.
     pub fn kick_refresh(&self) -> bool {
+        if !self.try_begin_resolution() {
+            return false;
+        }
+        let (flag, cv) = &*self.wake;
+        *flag.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        cv.notify_one();
+        true
+    }
+
+    /// Take the one early re-resolution allowed per [`KICK_INTERVAL`], shared by
+    /// [`Self::kick_refresh`] and a caller that resolves itself before judging an
+    /// unlisted address (#1112). `false` when no host name is configured, or when a
+    /// resolution began within the interval -- whose answer is then fresh enough to
+    /// judge by. So strangers cost at most one lookup per interval.
+    pub fn try_begin_resolution(&self) -> bool {
         if self.hosts.is_empty() {
             return false;
         }
@@ -249,17 +264,9 @@ impl PeerAllowlist {
         if last != 0 && now.saturating_sub(last) < KICK_INTERVAL.as_millis() as u64 {
             return false;
         }
-        if self
-            .last_kick_ms
+        self.last_kick_ms
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-            .is_err()
-        {
-            return false;
-        }
-        let (flag, cv) = &*self.wake;
-        *flag.lock().unwrap_or_else(|e| e.into_inner()) = true;
-        cv.notify_one();
-        true
+            .is_ok()
     }
 
     /// Spawn a thread that re-resolves the host names every `interval`, or at once
@@ -469,6 +476,27 @@ mod tests {
             !a.clone().kick_refresh(),
             "a second within the interval is dropped"
         );
+    }
+
+    /// #1112: one resolution per interval, shared by the kick and a caller that
+    /// resolves before judging; none at all for an IP-only list. A resolution
+    /// re-judges a stale address against the fresh answer, and a stranger stays
+    /// refused after it.
+    #[test]
+    fn a_resolution_slot_is_rate_limited_and_refreshes_a_stale_address() {
+        let new_pod = ip("10.10.15.26");
+        let a = PeerAllowlist::parse("smf-pfcp.nextg.svc").unwrap();
+        a.set_resolved(vec![ip("10.10.15.9")]);
+        assert!(!a.permits(new_pod));
+        assert!(a.try_begin_resolution(), "the first resolution");
+        a.resolve_hosts_with(|_| Ok(vec![new_pod]));
+        assert!(a.permits(new_pod), "judged against the fresh answer");
+        assert!(!a.permits(ip("192.0.2.7")), "fail-closed after the lookup");
+        assert!(!a.try_begin_resolution(), "rate-limited");
+        assert!(!a.clone().kick_refresh(), "the kick shares the slot");
+        assert!(!PeerAllowlist::parse("10.0.0.1")
+            .unwrap()
+            .try_begin_resolution());
     }
 
     /// A kick wakes the refresh thread before its interval: a name that resolves to
