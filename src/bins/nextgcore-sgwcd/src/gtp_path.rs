@@ -2955,6 +2955,29 @@ fn dispatch_change_notification_request(server: &GtpcServer, msg: &Gtp2Message, 
     let lbi = msg
         .get_ie(Gtp2IeType::Ebi as u8, 0)
         .and_then(|ie| ie.value.first().map(|v| v & 0x0f));
+    // #1161 review: no LBI and several PDN connections names none of them.
+    // Relaying it to an arbitrary one would report location for the wrong
+    // charging session; the LBI is conditional (Table 7.3.14-1: "shall be sent
+    // by the MME/SGSN on S11/S4"), so it is answered Conditional IE missing.
+    if let (None, Some(u)) = (lbi, ue.as_ref()) {
+        if ctx.sess_list_for_ue(u.id).len() > 1 {
+            log::warn!(
+                "Change Notification Request from {peer} (seq={seq}) has no LBI and the UE \
+                 has several PDN connections: answered Conditional IE missing"
+            );
+            let rsp = s11_build::build_error_response(
+                Gtp2MessageType::ChangeNotificationResponse as u8,
+                mme_teid,
+                seq,
+                gtp_cause::CONDITIONAL_IE_MISSING,
+                Some(Gtp2IeType::Ebi as u8),
+            );
+            if let Err(e) = server.send_response(peer, &rsp) {
+                log::error!("Change Notification Response to {peer} failed: {e}");
+            }
+            return;
+        }
+    }
     let sess = ue.as_ref().and_then(|u| match lbi {
         Some(lbi) => ctx
             .bearer_find_by_ue_ebi(u.id, lbi)
@@ -6343,6 +6366,70 @@ mod tests {
             rsp.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value[0],
             gtp_cause::SERVICE_NOT_SUPPORTED
         );
+        sgwc_self().ue_remove(ue_id);
+        server.close();
+    }
+
+    /// #1161 review: the PGW's Recovery in its answer is not relayed to the MME as
+    /// this SGW's (TS 23.007 §18). A CNR without an LBI goes to the UE's only PDN
+    /// connection; with several, it names none, and is answered Conditional IE
+    /// missing (offending IE: EBI) instead of reaching an arbitrary PGW session.
+    #[test]
+    fn a_change_notification_answer_and_the_lbi_less_request() {
+        let ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let server = test_server(&ambient, 2000, 3);
+        let mme = client();
+        let pgw = client();
+        sgwc_self().set_pgw_s5c_peer(Some(pgw.local_addr().unwrap()));
+        let (ue_id, s11_teid, s5c_teid) =
+            ue_with_pgw_session(mme.local_addr().unwrap(), b"001010614000002");
+        let cnr = |seq: u32| {
+            let mut m = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+                Gtp2MessageType::ChangeNotificationRequest as u8,
+                s11_teid,
+                seq,
+            ));
+            m.add_ie(Gtp2Ie::from_slice(Gtp2IeType::RatType as u8, 0, &[6]));
+            m.encode()
+        };
+        // One PDN connection, no LBI: relayed to it.
+        mme.send_to(&cnr(0x0617), server.local_addr()).unwrap();
+        let at_pgw = recv_msg(&pgw);
+        assert_eq!(at_pgw.header.teid, Some(0x0000_5c5c));
+        let mut rsp = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+            Gtp2MessageType::ChangeNotificationResponse as u8,
+            s5c_teid,
+            at_pgw.header.sequence_number,
+        ));
+        rsp.add_ie(Gtp2CauseIe::new(gtp_cause::REQUEST_ACCEPTED).to_ie(0));
+        rsp.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Recovery as u8, 0, &[7]));
+        pgw.send_to(&rsp.encode(), server.local_addr()).unwrap();
+        let at_mme = recv_msg(&mme);
+        assert_eq!(at_mme.header.sequence_number, 0x0617);
+        assert!(
+            at_mme.get_ie(Gtp2IeType::Recovery as u8, 0).is_none(),
+            "the PGW's Recovery is not this SGW's"
+        );
+
+        // A second PDN connection: no LBI names none of them.
+        let ctx = sgwc_self();
+        let mut sess2 = ctx.sess_add(ue_id, "ims").expect("sess");
+        sess2.pgw_s5c_teid = 0x0000_6c6c;
+        ctx.sess_update(&sess2);
+        let mut b6 = ctx.bearer_add(sess2.id).expect("bearer");
+        b6.ebi = 6;
+        ctx.bearer_update(&b6);
+        mme.send_to(&cnr(0x0618), server.local_addr()).unwrap();
+        let rsp = recv_msg(&mme);
+        let cause =
+            Gtp2CauseIe::decode(&rsp.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value).unwrap();
+        assert_eq!(cause.cause, gtp_cause::CONDITIONAL_IE_MISSING);
+        assert_eq!(cause.offending_ie_type, Some(Gtp2IeType::Ebi as u8));
+        pgw.set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        let mut buf = [0u8; 2048];
+        assert!(pgw.recv_from(&mut buf).is_err(), "not relayed to either");
+        sgwc_self().set_pgw_s5c_peer(None);
         sgwc_self().ue_remove(ue_id);
         server.close();
     }
