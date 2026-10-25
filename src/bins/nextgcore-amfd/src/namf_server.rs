@@ -11969,6 +11969,9 @@ mod tests {
             i
         };
         let sbi_ctx = nextgcore_sbi::context::global_context();
+        // Removed however the test ends (#1159 review m1): a leftover preferred LMF
+        // would win a sibling positioning test's selection.
+        let _seeded = SeededLmfs(&["lmf-1157-preferred", "lmf-1157-holder"]);
         // Lower value = preferred (TS 29.510): a fresh selection takes this one.
         sbi_ctx
             .add_nf_instance(lmf("lmf-1157-preferred", preferred_port, 1))
@@ -12027,8 +12030,119 @@ mod tests {
             "an LMF that holds no request is never asked: {:?}",
             preferred_seen.lock().expect("seen")
         );
-        sbi_ctx.remove_nf_instance("lmf-1157-preferred").await;
-        sbi_ctx.remove_nf_instance("lmf-1157-holder").await;
+    }
+
+    /// Removes the NF instances a test cached, however the test ends.
+    struct SeededLmfs(&'static [&'static str]);
+
+    impl Drop for SeededLmfs {
+        fn drop(&mut self) {
+            let ids = self.0;
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .expect("cleanup runtime");
+                    rt.block_on(async {
+                        let ctx = nextgcore_sbi::context::global_context();
+                        for id in ids {
+                            ctx.remove_nf_instance(id).await;
+                        }
+                    });
+                });
+            });
+            crate::sbi_path::set_lmf_instance_discovery_nrf_for_test(None);
+        }
+    }
+
+    /// **#1159 review m2, TS 23.273 §6.3.3 step 5.** The LMF holding the request is not
+    /// in this AMF's discovery cache: it is found by an NRF discovery for that instance
+    /// (`target-nf-instance-id`, TS 29.510 §6.2.3.2.3.1) and the cancel reaches it.
+    ///
+    /// REVERT-VERIFIED: with the NRF fallback removed, the cancel reaches no LMF.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_location_discovers_an_uncached_lmf_by_its_instance_id() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        let _cache = crate::sbi_path::nf_cache_test_lock().lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (_holder, holder_port, holder_seen) = recording_lmf().await;
+        let lmf_id = "lmf-1157-uncached";
+        let _seeded = SeededLmfs(&["lmf-1157-uncached"]);
+        // A stand-in NRF answering the instance discovery with the holder's profile.
+        let queries: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let sink = std::sync::Arc::clone(&queries);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let nrf_port = addr.port();
+        let nrf = SbiServer::on_listener(
+            SbiServerConfig::new(format!("127.0.0.1:{nrf_port}").parse().expect("addr")),
+            listener,
+        );
+        nrf.start(move |req: SbiRequest| {
+            let sink = std::sync::Arc::clone(&sink);
+            async move {
+                let asked = req
+                    .http
+                    .get_param("target-nf-instance-id")
+                    .cloned()
+                    .unwrap_or_default();
+                sink.lock().expect("sink").push(asked);
+                SbiResponse::with_status(200)
+                    .with_json_body(&json!({
+                        "validityPeriod": 60,
+                        "nfInstances": [{
+                            "nfInstanceId": lmf_id,
+                            "nfType": "LMF",
+                            "nfStatus": "REGISTERED",
+                            "nfServices": [{
+                                "serviceInstanceId": "nlmf-loc-1",
+                                "serviceName": "nlmf-loc",
+                                "versions": [{ "apiVersionInUri": "v1", "apiFullVersion": "1.0.0" }],
+                                "scheme": "http",
+                                "nfServiceStatus": "REGISTERED",
+                                "ipEndPoints": [{ "ipv4Address": "127.0.0.1", "port": holder_port }],
+                            }],
+                        }],
+                    }))
+                    .expect("json")
+            }
+        })
+        .await
+        .expect("stand-in NRF start");
+        crate::sbi_path::set_lmf_instance_discovery_nrf_for_test(Some(format!(
+            "http://127.0.0.1:{nrf_port}"
+        )));
+        let sbi_ctx = nextgcore_sbi::context::global_context();
+        assert!(
+            sbi_ctx.get_nf_instance(lmf_id).await.is_none(),
+            "precondition"
+        );
+
+        let supi = "imsi-001010000115703";
+        let _ue = setup_ue(supi, true, true);
+        let resp = namf_request_handler(
+            SbiRequest::post(format!("/namf-loc/v1/{supi}/cancel-pos-info"))
+                .with_json_body(&json!({
+                    "supi": supi,
+                    "hgmlcCallBackURI": "http://127.0.0.1:19157/hgmlc",
+                    "ldrReference": "ldr-1157-nrf",
+                    "servingLMFIdentification": lmf_id,
+                }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(resp.status, 204);
+        let queries = queries.lock().expect("queries").clone();
+        assert!(
+            queries.iter().any(|q| q == lmf_id),
+            "the NRF is asked for that instance (target-nf-instance-id): {queries:?}"
+        );
+        let seen = holder_seen.lock().expect("seen").clone();
+        assert!(
+            matches!(seen.as_slice(), [(uri, body)]
+                if uri.ends_with("/nlmf-loc/v1/cancel-location")
+                    && body["ldrReference"] == "ldr-1157-nrf"),
+            "the cancel reaches the discovered LMF: {seen:?}"
+        );
     }
 
     /// #74 criterion 6: `POST /namf-loc/v1/{id}/cancel-pos-info` (CancelLocation) is

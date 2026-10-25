@@ -648,9 +648,22 @@ async fn amf_nrf_discover_qualified(
     service_name: &str,
     extra: &[(&str, String)],
 ) -> Result<(), String> {
+    amf_nrf_discover_qualified_at(None, target_nf_type, service_name, extra).await
+}
+
+/// [`amf_nrf_discover_qualified`] against `nrf_uri`, or the AMF's NRF when `None`.
+async fn amf_nrf_discover_qualified_at(
+    nrf_uri: Option<String>,
+    target_nf_type: &str,
+    service_name: &str,
+    extra: &[(&str, String)],
+) -> Result<(), String> {
     let sbi_ctx = global_context();
 
-    let nrf_uri = sbi_ctx.get_nrf_uri().await;
+    let nrf_uri = match nrf_uri {
+        Some(uri) => Some(uri),
+        None => sbi_ctx.get_nrf_uri().await,
+    };
     let nrf_uri = match nrf_uri {
         Some(uri) => uri,
         None => return Ok(()),
@@ -2914,6 +2927,21 @@ pub async fn call_lmf_determine_location(
 /// instance, then by an NRF discovery for that instance (`target-nf-instance-id`,
 /// TS 29.510 §6.2.3.2.3.1). Never a fresh selection: any other LMF holds no state for
 /// the request. `None` when no such LMF is known.
+/// The NRF [`resolve_lmf_by_identification`] asks, when a test has redirected it.
+/// Declared beside its one reader, as `PGW_DISCOVERY_NRF_OVERRIDE` is (#308): pointing
+/// the global NRF URI at a stand-in would redirect every other test's discovery too.
+/// Callers that set it hold [`nf_cache_test_lock`]. Production never sets it.
+static LMF_INSTANCE_DISCOVERY_NRF_OVERRIDE: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
+
+/// Test-only: point [`resolve_lmf_by_identification`]'s NRF discovery at `uri`.
+#[doc(hidden)]
+pub fn set_lmf_instance_discovery_nrf_for_test(uri: Option<String>) {
+    *LMF_INSTANCE_DISCOVERY_NRF_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = uri;
+}
+
 pub async fn resolve_lmf_by_identification(lmf_identification: &str) -> Option<(String, u16)> {
     let service = nextgcore_sbi::types::SbiServiceType::NlmfLoc;
     let sbi_ctx = global_context();
@@ -2928,7 +2956,11 @@ pub async fn resolve_lmf_by_identification(lmf_identification: &str) -> Option<(
         "target-nf-instance-id",
         nextgcore_sbi::uri_encode::encode_query_value(lmf_identification),
     )];
-    amf_nrf_discover_qualified("LMF", "nlmf-loc", &extra)
+    let nrf_override = LMF_INSTANCE_DISCOVERY_NRF_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    amf_nrf_discover_qualified_at(nrf_override, "LMF", "nlmf-loc", &extra)
         .await
         .ok()?;
     sbi_ctx
