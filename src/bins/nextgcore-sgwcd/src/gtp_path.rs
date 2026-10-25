@@ -324,19 +324,19 @@ impl GtpcServer {
     }
 
     /// Use `n3` for requests of `message_types` (TS 29.274 §7.6, #1228).
-    pub fn set_n3_for(&self, message_types: &[u8], n3: u32) {
+    pub fn set_t3_for(&self, message_types: &[u8], t3: Duration) {
         if let Ok(mut xact) = self.inner.xact.lock() {
-            xact.set_n3_for(message_types, n3);
+            xact.set_t3_for(message_types, t3);
         }
     }
 
     /// The N3 a request of `message_type` gets.
-    pub fn n3_for(&self, message_type: u8) -> u32 {
+    pub fn t3_for(&self, message_type: u8) -> Duration {
         self.inner
             .xact
             .lock()
-            .map(|x| x.n3_for(message_type))
-            .unwrap_or(0)
+            .map(|x| x.t3_for(message_type))
+            .unwrap_or_default()
     }
 
     /// Local restart counter advertised in Recovery IEs
@@ -710,9 +710,9 @@ fn advertised_addresses(
 /// and inside the PGW's S5/S8 one (`nextgcore_gtp::v2::xact` documents the
 /// three).
 pub fn open_s11_server(bind: &str, restart_counter: u8) -> Result<GtpcServer, String> {
-    use nextgcore_gtp::v2::xact::{BEARER_PROCEDURE_REQUESTS, SGW_BEARER_PROCEDURE_N3};
+    use nextgcore_gtp::v2::xact::{BEARER_PROCEDURE_REQUESTS, SGW_BEARER_PROCEDURE_T3};
     let server = GtpcServer::open(bind, Gtp2XactConfig::default(), restart_counter)?;
-    server.set_n3_for(&BEARER_PROCEDURE_REQUESTS, SGW_BEARER_PROCEDURE_N3);
+    server.set_t3_for(&BEARER_PROCEDURE_REQUESTS, SGW_BEARER_PROCEDURE_T3);
     Ok(server)
 }
 
@@ -962,12 +962,15 @@ fn handle_datagram(inner: &Arc<GtpcInner>, data: &[u8], peer: SocketAddr) {
     };
 
     // Restart-counter staleness detection on any message carrying Recovery
+    // #1248 review: the answer marks the peer as told first, so a restart that
+    // this same answer reveals then clears the mark, and the next request to
+    // the restarted peer carries this node's Recovery again.
+    note_recovery_received(inner, peer, msg.header.message_type);
     if let Some(rec_ie) = msg.get_ie_by_type(Gtp2IeType::Recovery as u8) {
         if let Ok(rec) = Gtp2RecoveryIe::decode(&rec_ie.value) {
             note_peer_recovery(inner, peer, rec.restart_counter);
         }
     }
-    note_recovery_received(inner, peer, msg.header.message_type);
 
     if let Ok(mut states) = inner.peer_state.lock() {
         states.entry(peer).or_insert(GtpPathState::Active);
@@ -6340,6 +6343,82 @@ mod tests {
             recovery(&at_pgw[2]),
             Some(vec![own]),
             "re-indicated after the PGW's restart"
+        );
+        sgwc_self().set_pgw_s5c_peer(None);
+        server.close();
+    }
+
+    /// #1248 review: a PGW's Create Session Response revealing its restart (a
+    /// changed Recovery) clears the "told" mark that the answer itself set, so
+    /// the next Create Session Request to it carries this SGW's Recovery again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restart_seen_in_an_answer_resends_recovery() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let _sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let pgw = UdpSocket::bind("127.0.0.1:0").unwrap();
+        pgw.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let pgw_addr = pgw.local_addr().unwrap();
+        sgwc_self().set_pgw_s5c_peer(Some(pgw_addr));
+        let server = test_server(&ambient, 1000, 1);
+        set_s11_server(server.clone());
+        let mme = client();
+        mme.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let own = server.restart_counter();
+        let next_csr = |pgw: &UdpSocket| loop {
+            let mut buf = [0u8; 4096];
+            let (len, from) = pgw.recv_from(&mut buf).expect("a request at the PGW");
+            let m = Gtp2Message::decode(&mut Bytes::copy_from_slice(&buf[..len])).unwrap();
+            if m.header.message_type == Gtp2MessageType::CreateSessionRequest as u8 {
+                return (m, from);
+            }
+        };
+        let refuse = |pgw: &UdpSocket, req: &Gtp2Message, to: SocketAddr, recovery: u8| {
+            let mut answer = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+                Gtp2MessageType::CreateSessionResponse as u8,
+                0,
+                req.header.sequence_number,
+            ));
+            answer.add_ie(Gtp2CauseIe::new(gtp_cause::NO_RESOURCES_AVAILABLE).to_ie(0));
+            answer.add_ie(Gtp2Ie::from_slice(
+                Gtp2IeType::Recovery as u8,
+                0,
+                &[recovery],
+            ));
+            pgw.send_to(&answer.encode(), to).unwrap();
+        };
+        let recovery = |m: &Gtp2Message| {
+            m.get_ie(Gtp2IeType::Recovery as u8, 0)
+                .map(|ie| ie.value.to_vec())
+        };
+        let imsi = |n: u8| [0x31, 0x31, 0x31, 0x31, 0x31, 0x26, n];
+
+        // The PGW answers with counter 4: told, and its counter known.
+        mme.send_to(&csr(0x1261, &imsi(0x01)).encode(), server.local_addr())
+            .unwrap();
+        let (first, from) = next_csr(&pgw);
+        assert_eq!(recovery(&first), Some(vec![own]));
+        refuse(&pgw, &first, from, 4);
+        let _ = recv_s11(&mme).await.expect("answered");
+        // Already told; this answer carries counter 5: the PGW restarted.
+        mme.send_to(&csr(0x1262, &imsi(0x02)).encode(), server.local_addr())
+            .unwrap();
+        let (second, from) = next_csr(&pgw);
+        assert_eq!(recovery(&second), None, "told");
+        refuse(&pgw, &second, from, 5);
+        let _ = recv_s11(&mme).await.expect("answered");
+        // The restarted PGW is told again.
+        mme.send_to(&csr(0x1263, &imsi(0x03)).encode(), server.local_addr())
+            .unwrap();
+        let (third, _) = next_csr(&pgw);
+        assert_eq!(
+            recovery(&third),
+            Some(vec![own]),
+            "the restarted PGW gets this SGW's Recovery again"
         );
         sgwc_self().set_pgw_s5c_peer(None);
         server.close();
