@@ -298,7 +298,21 @@ impl SctpServer {
     async fn handle_datagram(&mut self, from: SocketAddr, data: Bytes) -> Result<()> {
         let now = Instant::now();
 
-        if let Some((handle, event)) = self.endpoint.handle(now, from, None, None, data) {
+        let raw = data.clone();
+        let Some((handle, event)) = self.endpoint.handle(now, from, None, None, data) else {
+            // #1142, RFC 9260 §8.4: a packet no association claims. A peer still
+            // talking on an association this endpoint no longer has (it restarted)
+            // is told with an ABORT, so it sets up a new one at once.
+            if let Some(answer) = crate::ootb::ootb_response(&raw) {
+                debug!("Out-of-the-blue packet from {from}: answered (RFC 9260 §8.4)");
+                if let Err(e) = self.socket.send_to(&answer, from).await {
+                    warn!("Out-of-the-blue answer to {from} not sent: {e}");
+                }
+            }
+            self.flush_all_transmits().await?;
+            return Ok(());
+        };
+        {
             match event {
                 DatagramEvent::NewAssociation(association) => {
                     self.handle_new_association(handle, association, from)
@@ -665,6 +679,43 @@ impl SctpServer {
                 info!("Closed association {}", association_id);
             }
         }
+        Ok(())
+    }
+
+    /// End every association with a SHUTDOWN (RFC 9260 §9.2) before the server stops
+    /// (#1142), waiting at most `wait` for the peers' SHUTDOWN ACKs. A peer that does
+    /// not answer in time is left to the closed socket: it then gets an ABORT from the
+    /// restarted endpoint's out-of-the-blue handling (§8.4) on its next packet.
+    pub async fn shutdown_gracefully(&mut self, wait: Duration) -> Result<()> {
+        let now = Instant::now();
+        for managed in self.associations.values_mut() {
+            if let Err(e) = managed.association.shutdown() {
+                debug!("Association to {} not shut down: {e}", managed.remote_addr);
+            }
+            while let Some(transmit) = managed.association.poll_transmit(now) {
+                managed.pending_transmits.push_back(transmit);
+            }
+        }
+        self.flush_all_transmits().await?;
+        let deadline = Instant::now() + wait;
+        while Instant::now() < deadline
+            && self
+                .associations
+                .values()
+                .any(|m| !m.association.is_closed())
+        {
+            let left = deadline.saturating_duration_since(Instant::now());
+            self.recv(left.min(Duration::from_millis(20))).await?;
+        }
+        let open = self
+            .associations
+            .values()
+            .filter(|m| !m.association.is_closed())
+            .count();
+        if open > 0 {
+            warn!("{open} SCTP association(s) not shut down within {wait:?}");
+        }
+        self.stop();
         Ok(())
     }
 

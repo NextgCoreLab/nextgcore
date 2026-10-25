@@ -115,6 +115,23 @@ enum NgapTransport {
 }
 
 impl NgapTransport {
+    /// End every NG association before the AMF stops (#1142, RFC 9260 §9.2), so the
+    /// gNBs set NG up again at once rather than discovering it after
+    /// Association.Max.Retrans. Userspace: a SHUTDOWN per association, waiting at
+    /// most `wait` for the answers. Kernel: closing the sockets has the kernel SCTP
+    /// stack send the SHUTDOWN (and it answers out-of-the-blue packets itself, §8.4).
+    async fn shutdown(&mut self, wait: Duration) {
+        match self {
+            Self::Userspace(s) => {
+                if let Err(e) = s.shutdown_gracefully(wait).await {
+                    log::warn!("NG associations not shut down: {e}");
+                }
+            }
+            #[cfg(feature = "kernel-sctp")]
+            Self::Kernel(s) => s.stop(),
+        }
+    }
+
     async fn bind(
         backend: SctpBackend,
         addr: SocketAddr,
@@ -21097,10 +21114,15 @@ pub async fn amf_ngap_flush_ue_contexts() {
 
 /// Close NGAP path
 pub async fn amf_ngap_close() {
-    if let Some(_server) = NGAP_SERVER.get() {
+    if let Some(handle) = NGAP_SERVER.get() {
+        let mut server = handle.inner.lock().await;
+        server.transport.shutdown(NG_SHUTDOWN_WAIT).await;
         log::info!("NGAP path closed");
     }
 }
+
+/// How long the AMF's shutdown waits for the gNBs' SHUTDOWN ACKs (#1142).
+const NG_SHUTDOWN_WAIT: Duration = Duration::from_secs(1);
 
 /// Get the NGAP server (if initialized)
 pub fn get_ngap_server() -> Option<&'static NgapServerHandle> {

@@ -327,11 +327,12 @@ scenario_amf_restart() {
     local f; f=$(logs_since "$AMF")
     grep -qE 'UE context storage armed: [1-9][0-9]* of' "$f" \
         || fail "the restarted AMF restored no UE context: $(grep -F 'UE context storage armed:' "$f" | head -1)"
-    # The restarted AMF has no NG association. The gNB does not notice by itself:
-    # the restarted AMF drops its out-of-the-blue SCTP packets instead of answering
-    # ABORT (nextgcore #1142, RFC 9260 §8.4), so the gNB keeps sending on the old
-    # association. It is restarted here to run NG Setup again, as a gNB that detects
-    # the failure does (TS 23.501 §5.21.2.3).
+    # The AMF ended its NG associations with a SHUTDOWN as it stopped, and a restarted
+    # AMF answers an old association's packets with an ABORT (#1142, RFC 9260 §9.2,
+    # §8.4). nextgsim's gNB notices the closed association only when it next sends,
+    # and loses that first NAS with it (nextgsim #411); until that is fixed the gNB is
+    # restarted here to set NG up again, as a gNB that reacts to the SHUTDOWN does
+    # (TS 23.501 §5.21.2.3).
     docker restart -t 2 "$GNB" >/dev/null
     wait_for "$GNB" 'Received NG Setup Response' 60 || fail "the gNB never set NG up with the restarted AMF"
     # The UE comes back on the restarted gNB's cell: a mobility registration update
