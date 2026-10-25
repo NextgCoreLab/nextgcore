@@ -246,7 +246,13 @@ impl Ipv4Pool {
     pub fn allocated_addrs(&self) -> Vec<Ipv4Addr> {
         // #1178: through a poison. An empty list here is a durable snapshot with no
         // allocation, and after a restart the pool hands out addresses live UEs hold.
-        let bm = self.bitmap.lock().unwrap_or_else(|e| e.into_inner());
+        // #1178 follow-up: and the poison is cleared, so `allocate`/`release` (which
+        // skip a poisoned bitmap) resume; a word a panic interrupted is still a word.
+        let bm = self.bitmap.lock().unwrap_or_else(|e| {
+            log::error!("IPv4 pool: the bitmap lock was poisoned; read through it and cleared");
+            self.bitmap.clear_poison();
+            e.into_inner()
+        });
         let mut out = Vec::new();
         for (word_idx, word) in bm.iter().enumerate() {
             if *word == 0 {
@@ -641,6 +647,24 @@ mod tests {
         }));
         assert!(pool.bitmap.is_poisoned());
         assert!(pool.allocated_addrs().contains(&addr));
+    }
+
+    /// #1178 follow-up: reading a poisoned pool for the snapshot clears the poison, so
+    /// it allocates again; left poisoned, `allocate` refused every new UE an address.
+    #[test]
+    fn a_poisoned_pool_allocates_again_after_the_snapshot() {
+        let pool = Ipv4Pool::new(10, 45);
+        let first = pool.allocate().expect("an address");
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = pool.bitmap.lock().unwrap();
+            panic!("poison the bitmap");
+        }));
+        assert!(pool.allocated_addrs().contains(&first));
+        let next = pool.allocate();
+        assert!(
+            next.is_some_and(|a| a != first),
+            "a new, distinct address: {next:?}"
+        );
     }
 
     // -- IPv6 Dual-Stack tests --
