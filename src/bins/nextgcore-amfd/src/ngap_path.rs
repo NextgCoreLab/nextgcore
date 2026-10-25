@@ -38081,7 +38081,8 @@ mod fivegs_to_eps_tests {
     /// stand-in MME. Header TEID the MME's, IMSI in TBCD; retransmitted after T3 while
     /// unanswered, and not after the Relocation Cancel Response.
     ///
-    /// Revert-verified: without the retransmission loop the MME sees one copy.
+    /// Revert-verified: without the retransmission loop the MME sees one copy; closing by
+    /// sequence number alone lets the stranger's response stop it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_relocation_cancel_request_is_retransmitted_until_answered() {
         let n26 = crate::n26_path::N26Server::open("127.0.0.1:0".parse().unwrap(), 1)
@@ -38119,6 +38120,23 @@ mod fivegs_to_eps_tests {
             seq,
         ));
         answer.add_ie(Gtp2CauseIe::new(16).to_ie(0));
+        // #1143 review: the same sequence number from another address is not this
+        // transaction's answer (TS 29.274 §7.6: a transaction is peer and sequence).
+        let stranger = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        stranger
+            .send_to(&answer.encode(), n26.local_addr())
+            .await
+            .unwrap();
+        let third = recv_gtp(&mme).await;
+        assert_eq!(
+            third.encode(),
+            first.encode(),
+            "a stranger's response closes nothing: retransmitted again"
+        );
+        assert!(crate::n26_path::relocation_cancel_outstanding(
+            cancel.peer,
+            seq
+        ));
         mme.send_to(&answer.encode(), n26.local_addr())
             .await
             .unwrap();

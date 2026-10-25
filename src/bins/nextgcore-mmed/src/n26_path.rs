@@ -2756,7 +2756,7 @@ mod tests {
         };
         let wait_closed = |seq: u32| async move {
             for _ in 0..200 {
-                if !nextgcore_amfd::n26_path::relocation_cancel_outstanding(seq) {
+                if !nextgcore_amfd::n26_path::relocation_cancel_outstanding(mme_addr, seq) {
                     return true;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;

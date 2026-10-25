@@ -431,23 +431,28 @@ pub fn take_fivegs_to_eps_relocation(amf_ue_ngap_id: u64) -> Option<FivegsToEpsC
     }
 }
 
-/// Relocation Cancel Requests this AMF sent and has no response to yet, by sequence number
-/// (#963). Removed by the response, or once the retransmissions run out.
-static RELOCATION_CANCELS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+/// Relocation Cancel Requests this AMF sent and has no response to yet, as (MME, sequence
+/// number): a GTPv2-C transaction is the pair (TS 29.274 §7.6), so only the MME it went to
+/// can close one (#963, #1143 review). Removed by the response, or once the
+/// retransmissions run out.
+static RELOCATION_CANCELS: std::sync::Mutex<Vec<(SocketAddr, u32)>> =
+    std::sync::Mutex::new(Vec::new());
 
-/// Whether Relocation Cancel Request `seq` is still waiting for its response (#963).
-pub fn relocation_cancel_outstanding(seq: u32) -> bool {
+/// Whether the Relocation Cancel Request `seq` to `peer` is still waiting for its response
+/// (#963).
+pub fn relocation_cancel_outstanding(peer: SocketAddr, seq: u32) -> bool {
     RELOCATION_CANCELS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .contains(&seq)
+        .contains(&(peer, seq))
 }
 
-/// Close the outstanding Relocation Cancel Request `seq`; whether it was outstanding.
-fn close_relocation_cancel(seq: u32) -> bool {
+/// Close the outstanding Relocation Cancel Request `seq` to `peer`; whether it was
+/// outstanding.
+fn close_relocation_cancel(peer: SocketAddr, seq: u32) -> bool {
     let mut cancels = RELOCATION_CANCELS.lock().unwrap_or_else(|e| e.into_inner());
     let before = cancels.len();
-    cancels.retain(|s| *s != seq);
+    cancels.retain(|t| *t != (peer, seq));
     cancels.len() != before
 }
 
@@ -780,12 +785,12 @@ impl N26Server {
         RELOCATION_CANCELS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(seq);
+            .push((cancel.peer, seq));
         let config = n26_xact_config();
         let server = Arc::clone(self);
         tokio::spawn(async move {
             for attempt in 0..=config.n3_requests {
-                if !relocation_cancel_outstanding(seq) {
+                if !relocation_cancel_outstanding(cancel.peer, seq) {
                     return;
                 }
                 if attempt > 0 {
@@ -799,7 +804,7 @@ impl N26Server {
                 server.send(cancel.peer, &msg).await;
                 tokio::time::sleep(config.t3_response).await;
             }
-            if close_relocation_cancel(seq) {
+            if close_relocation_cancel(cancel.peer, seq) {
                 log::warn!(
                     "N26 Relocation Cancel Request (seq={seq}) to MME {}: no response after {} \
                      retransmissions; the MME releases the prepared context on its own timer",
@@ -1092,10 +1097,10 @@ impl N26Server {
                 .get_ie(Gtp2IeType::Cause as u8, 0)
                 .and_then(|ie| Gtp2CauseIe::decode(&ie.value).ok())
                 .map(|c| c.cause);
-            if !close_relocation_cancel(seq) {
+            if !close_relocation_cancel(peer, seq) {
                 log::debug!(
                     "N26 Relocation Cancel Response from {peer} (seq={seq}) answers no \
-                     outstanding request; a duplicate"
+                     request outstanding to that peer; a duplicate or a stray"
                 );
             } else if cause == Some(CAUSE_REQUEST_ACCEPTED) {
                 log::info!(
