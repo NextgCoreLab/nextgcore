@@ -1326,6 +1326,65 @@ async fn a_503_answer_is_retried_not_rejected() {
     server.forget_ue(ue);
 }
 
+/// **#1112** (TS 29.502 §6.1.7.3). A restarted SMF takes the create before its first
+/// N4 association is up and answers 504 UPF_NOT_RESPONDING; a second later the
+/// association is up and it creates. The establishment stays in the #796 window and
+/// the retry is created; nothing reaches the UE in between.
+///
+/// REVERT-VERIFIED: without the 504 arm of `smf_failing_over` the UE gets 5GSM #26
+/// at once and no second CreateSMContext is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_504_upf_not_responding_answer_is_retried_not_rejected() {
+    let (_smf, port, creates) = scripted_create_smf(vec![(504, Some("UPF_NOT_RESPONDING"))]).await;
+    let _env = super::SmfEnvGuard::acquire(port).await;
+    let _seeded = SeededSmfs {
+        ids: &[],
+        held_down: ("127.0.0.1", port),
+    };
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_111_201u64, 1201);
+    ue_ready_for_sessions(&mut server, ue, ran);
+
+    request_psi_5(&mut server, ue, ran).await;
+    assert_eq!(creates.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(
+        take_sent_ngap(&mut server).is_empty(),
+        "no 5GSM reject, no DL NAS Transport"
+    );
+    assert!(server.pending_establishments.contains_key(&(ue, 5)));
+    assert!(
+        nextgcore_sbi::context::global_context().endpoint_held_down("127.0.0.1", port),
+        "the SMF whose UPF is not up sorts last in the next selection"
+    );
+
+    make_establishments_due(&mut server);
+    settle_establishments(&mut server).await;
+    assert_eq!(creates.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(server.pending_establishments.is_empty());
+    assert!(sets_up(&take_sent_ngap(&mut server), 5));
+    server.forget_ue(ue);
+}
+
+/// **#1112**, the other 504s. A 504 with any other cause (here NETWORK_FAILURE) is
+/// still the SMF's refusal: #26 with the back-off timer at once, no retry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_504_with_another_cause_is_still_rejected_26() {
+    let (_smf, port, creates) = scripted_create_smf(vec![(504, Some("NETWORK_FAILURE"))]).await;
+    let _env = super::SmfEnvGuard::acquire(port).await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_111_202u64, 1202);
+    ue_ready_for_sessions(&mut server, ue, ran);
+
+    request_psi_5(&mut server, ue, ran).await;
+    assert_eq!(creates.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(server.pending_establishments.is_empty());
+    assert_eq!(
+        delivered_n1(&take_sent_ngap(&mut server)),
+        vec![0x2E, 0x05, 0x01, 0xC3, 0x1A, 0x37, 0x01, 0x65]
+    );
+    server.forget_ue(ue);
+}
+
 /// SMF instances a test put in the process-global discovery cache, and the endpoint
 /// its NF_FAILOVER held down. Drop removes both (#1107 review m1), so neither a
 /// cached profile nor a hold-down outlives the test: the port is freed and may be
@@ -1479,6 +1538,11 @@ fn which_smf_answers_are_re_selected_for() {
     assert!(!smf_failing_over(&refused(500, Some("SYSTEM_FAILURE"))));
     assert!(!smf_failing_over(&refused(500, None)));
     assert!(!smf_failing_over(&refused(403, Some("NF_FAILOVER"))));
+    // #1112: an SMF whose UPF path is not up yet.
+    assert!(smf_failing_over(&refused(504, Some("UPF_NOT_RESPONDING"))));
+    assert!(!smf_failing_over(&refused(504, Some("NETWORK_FAILURE"))));
+    assert!(!smf_failing_over(&refused(504, None)));
+    assert!(!smf_failing_over(&refused(500, Some("UPF_NOT_RESPONDING"))));
     assert!(!smf_failing_over(&RequestFailed(
         "SMF request failed: refused".into()
     )));

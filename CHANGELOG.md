@@ -170,6 +170,12 @@ before the tag. The validation line is filled from the release run, not carried 
     the shared `nextgcore-pfcp` codec: sgwud with sgwcd, and upfd with smfd, for the
     PFCP Node Report (#994, #1028).
   A rolling upgrade must move each CP/UP pair at the same time.
+- **Operational change:** smfd registers with the NRF as `SUSPENDED` and turns `REGISTERED`
+  only once the N4 association its new sessions use is up, and back to `SUSPENDED` while it
+  is down (TS 29.510 §6.1.6.3.2). A restarted SMF is no longer discovered before it has a
+  UPF. amfd re-selects an SMF on a 504 UPF_NOT_RESPONDING within the #796 window instead of
+  answering 5GSM #26, and upfd re-resolves its host-named PFCP allowlist before refusing a
+  Setup from an unlisted address, still fail-closed (#1112).
 - smfd answers PFCP Node Reports and acts on user plane path failure and recovery; a
   path still down after `SMF_UP_PATH_FAILURE_HOLD_SECS` (default 120 s) releases its
   sessions with #39 (#994, #1028).

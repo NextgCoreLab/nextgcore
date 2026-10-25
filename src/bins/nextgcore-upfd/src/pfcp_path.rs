@@ -827,6 +827,39 @@ fn report_time_ies(
     )
 }
 
+/// How long a Setup from an unlisted address waits for the allowlist's host names
+/// to be re-resolved (#1112). The PFCP receive loop waits with it, so it is short:
+/// cluster DNS answers in milliseconds, and a lookup that takes longer is left to the
+/// background refresh and the CP function's retry.
+const SETUP_RESOLVE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Whether a Setup from `src_addr`, which the last resolution does not list, is
+/// admitted once the host names are re-resolved (#1112). A restarted SMF pod is at
+/// an IP the periodic refresh may not have seen yet: it was refused cause 64 and
+/// admitted only on its retry, 10 s later, while it took creates it had no UPF for.
+/// Fail-closed as before: a stranger, a lookup that fails or one slower than
+/// [`SETUP_RESOLVE_WAIT`] still refuses.
+async fn admitted_after_resolving(allowed: &PeerAllowlist, src_addr: SocketAddr) -> bool {
+    if allowed.hosts().is_empty() {
+        return false;
+    }
+    let list = allowed.clone();
+    let ip = src_addr.ip();
+    let lookup = tokio::task::spawn_blocking(move || list.permits_resolving(ip));
+    let admitted = matches!(
+        tokio::time::timeout(SETUP_RESOLVE_WAIT, lookup).await,
+        Ok(Ok(true))
+    );
+    if admitted {
+        log::info!(
+            "PFCP Association Setup Request from {src_addr}: admitted after re-resolving \
+             the allowed CP function names {:?}",
+            allowed.hosts()
+        );
+    }
+    admitted
+}
+
 impl PfcpServer {
     /// Create a new PFCP server
     pub async fn new(
@@ -1318,10 +1351,10 @@ impl PfcpServer {
         // SECURITY (#968): an association is accepted only from a configured CP function.
         // A refused Setup changes nothing: the live association and its sessions stay.
         let allowed = self.allowed_peers();
-        if !allowed.permits(src_addr.ip()) {
+        if !allowed.permits(src_addr.ip()) && !admitted_after_resolving(&allowed, src_addr).await {
             // A restarted CP pod may be at an IP the last resolution predates: ask for
             // an early re-resolution (rate-limited) so its NEXT attempt is judged
-            // against current DNS.
+            // against current DNS, should the bounded one above not have answered.
             allowed.kick_refresh();
             note_refusal(format_args!(
                 "PFCP Association Setup Request from {src_addr}, which is not an allowed CP \
@@ -5642,6 +5675,40 @@ mod tests {
         );
         let resp = exchange(&smf, upf, &encode_pfcp(54, Some(x), 10, &[])).await;
         assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+    }
+
+    /// #1112: a CP function named by host name whose address the last resolution
+    /// predates -- an SMF pod that just restarted -- is admitted on its FIRST Setup:
+    /// the names are re-resolved before refusing. A stranger is still refused.
+    ///
+    /// REVERT-VERIFIED: without the re-resolution the SMF's first Setup is refused
+    /// with cause 64 (the name was never resolved here, as on a pod the periodic
+    /// refresh has not caught up with).
+    #[tokio::test]
+    async fn an_unresolved_cp_name_is_re_resolved_before_its_setup_is_refused() {
+        let (server, smf, upf, _rx) = spawn_test_server().await;
+        // `localhost` -> 127.0.0.1, the stand-in SMF's address. Never resolved:
+        // no `spawn_host_refresh`.
+        let allowed = PeerAllowlist::parse("localhost").unwrap();
+        assert!(!allowed.permits(smf.local_addr().unwrap().ip()));
+        server.set_allowed_peers(allowed);
+        assert_eq!(
+            setup_cause(&smf, upf, SMF_NODE, 6).await,
+            PfcpCause::RequestAccepted as u8,
+            "admitted on its first Setup"
+        );
+        assert!(server.is_associated().await);
+
+        let stranger = UdpSocket::bind("127.0.0.66:0").await.unwrap();
+        assert_eq!(
+            setup_cause(&stranger, upf, Ipv4Addr::new(127, 0, 0, 66), 7).await,
+            PfcpCause::RequestRejected as u8,
+            "fail-closed: a stranger is refused after the lookup"
+        );
+        assert_eq!(
+            server.association.read().await.as_ref().unwrap().peer_addr,
+            smf.local_addr().unwrap()
+        );
     }
 
     /// SECURITY (#968 re-review, fail closed): with NO allowlist configured, no host

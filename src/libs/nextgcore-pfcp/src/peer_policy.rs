@@ -237,6 +237,19 @@ impl PeerAllowlist {
     /// [`KICK_INTERVAL`] and non-blocking, so a flood of strangers costs at most one
     /// lookup a second. Returns whether this call kicked.
     pub fn kick_refresh(&self) -> bool {
+        if !self.take_resolution_slot() {
+            return false;
+        }
+        let (flag, cv) = &*self.wake;
+        *flag.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        cv.notify_one();
+        true
+    }
+
+    /// Take the one early re-resolution allowed per [`KICK_INTERVAL`], shared by
+    /// [`Self::kick_refresh`] and [`Self::permits_resolving`]. `false` when no host
+    /// name is configured or another caller took it within the interval.
+    fn take_resolution_slot(&self) -> bool {
         if self.hosts.is_empty() {
             return false;
         }
@@ -249,17 +262,39 @@ impl PeerAllowlist {
         if last != 0 && now.saturating_sub(last) < KICK_INTERVAL.as_millis() as u64 {
             return false;
         }
-        if self
-            .last_kick_ms
+        self.last_kick_ms
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-            .is_err()
-        {
+            .is_ok()
+    }
+
+    /// Like [`Self::permits`], but an address the last resolution does not contain
+    /// first has the host names re-resolved, and is judged against the fresh answer
+    /// (#1112). A CP pod that restarted at a new IP is then admitted on its FIRST
+    /// Setup, instead of being refused and admitted only on its retry -- 10 s later
+    /// for smfd. [`Self::kick_refresh`] only made that retry succeed.
+    ///
+    /// Still fail-closed: an address outside every entry is refused after the lookup
+    /// exactly as before, and a failed lookup keeps the last good addresses. The
+    /// lookup shares the kick's rate limit, so strangers cost at most one lookup per
+    /// [`KICK_INTERVAL`]; within it the last resolution decides. Blocking (DNS): call
+    /// it off the async receive path, or with a bound on the wait.
+    pub fn permits_resolving(&self, ip: IpAddr) -> bool {
+        self.permits_resolving_with(ip, |a| a.resolve_hosts())
+    }
+
+    fn permits_resolving_with(
+        &self,
+        ip: IpAddr,
+        resolve: impl FnOnce(&Self) -> Vec<IpAddr>,
+    ) -> bool {
+        if self.permits(ip) {
+            return true;
+        }
+        if !self.take_resolution_slot() {
             return false;
         }
-        let (flag, cv) = &*self.wake;
-        *flag.lock().unwrap_or_else(|e| e.into_inner()) = true;
-        cv.notify_one();
-        true
+        resolve(self);
+        self.permits(ip)
     }
 
     /// Spawn a thread that re-resolves the host names every `interval`, or at once
@@ -469,6 +504,48 @@ mod tests {
             !a.clone().kick_refresh(),
             "a second within the interval is dropped"
         );
+    }
+
+    /// #1112: an address the last resolution predates is re-resolved and judged
+    /// against the fresh answer, so a restarted CP pod is admitted on its first Setup.
+    /// A stranger is still refused after the lookup, an IP-only list never looks
+    /// anything up, and the lookups are rate-limited.
+    #[test]
+    fn a_stale_resolution_is_refreshed_before_refusing() {
+        let new_pod = ip("10.10.15.26");
+        let a = PeerAllowlist::parse("smf-pfcp.nextg.svc").unwrap();
+        a.set_resolved(vec![ip("10.10.15.9")]);
+        let lookups = std::cell::Cell::new(0);
+        let resolve = |l: &PeerAllowlist| {
+            lookups.set(lookups.get() + 1);
+            l.resolve_hosts_with(|_| Ok(vec![new_pod]))
+        };
+        assert!(
+            a.permits_resolving_with(new_pod, resolve),
+            "admitted at once"
+        );
+        assert_eq!(lookups.get(), 1);
+        assert!(
+            a.permits_resolving_with(new_pod, resolve),
+            "now listed: no lookup"
+        );
+        assert_eq!(lookups.get(), 1);
+        assert!(
+            !a.permits_resolving_with(ip("192.0.2.7"), resolve),
+            "a stranger within the interval is refused without a lookup"
+        );
+        assert_eq!(lookups.get(), 1, "rate-limited");
+
+        let b = PeerAllowlist::parse("smf-pfcp.nextg.svc").unwrap();
+        assert!(
+            !b.permits_resolving_with(ip("192.0.2.7"), |l| l
+                .resolve_hosts_with(|_| Ok(vec![new_pod]))),
+            "fail-closed: still refused after a fresh lookup"
+        );
+        assert!(!b.permits(ip("192.0.2.7")));
+
+        let c = PeerAllowlist::parse("10.0.0.1").unwrap();
+        assert!(!c.permits_resolving_with(new_pod, |_| panic!("no host name: no lookup")));
     }
 
     /// A kick wakes the refresh thread before its interval: a name that resolves to
