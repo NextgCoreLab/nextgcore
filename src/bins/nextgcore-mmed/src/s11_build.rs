@@ -310,10 +310,12 @@ pub(crate) fn bearer_qos(bearer: &MmeBearer) -> Gtp2BearerQosIe {
         bearer.qos.gbr.downlink,
     );
     qos.pl = bearer.qos.arp.priority_level;
-    // The context stores the NAS/GTP spelling (0 = enabled), and the library IE takes
-    // booleans, so the conversion happens here rather than being assumed either way.
-    qos.pci = bearer.qos.arp.pre_emption_capability == 0;
-    qos.pvi = bearer.qos.arp.pre_emption_vulnerability == 0;
+    // The context stores the GTP spelling (TS 29.274 §8.15: PCI/PVI 1 =
+    // disabled), and the library IE's `pci`/`pvi` are those raw bits (`true`
+    // sets 0x40 / 0x01), so they are copied as they are (#1186 review: `== 0`
+    // inverted them, opposite to what S1AP now says).
+    qos.pci = bearer.qos.arp.pre_emption_capability != 0;
+    qos.pvi = bearer.qos.arp.pre_emption_vulnerability != 0;
     qos
 }
 
@@ -1012,19 +1014,17 @@ pub fn build_bearer_resource_command(
     if !tad.is_empty() {
         msg.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Tad as u8, 0, tad));
     }
-    // Flow QoS (C). The library's Bearer QoS IE has the same 22-octet layout as
-    // Flow QoS minus the leading ARP octet's position, so it is encoded here and
-    // re-tagged rather than hand-built a second time.
+    // Flow QoS (C, TS 29.274 §8.16): QCI then the four bit rates, 21 octets. It
+    // is the Bearer QoS layout WITHOUT the leading ARP octet, so the library's
+    // Bearer QoS is encoded and its first octet dropped (#1186 review: it was
+    // sent whole, so the PGW read the ARP octet as the QCI).
     if let Some(q) = qos {
-        let mut flow = Gtp2BearerQosIe::new(q.qci, q.ul_mbr, q.dl_mbr, q.ul_gbr, q.dl_gbr);
-        flow.pl = q.priority_level;
-        flow.pci = q.pre_emption_capability == 0;
-        flow.pvi = q.pre_emption_vulnerability == 0;
+        let flow = Gtp2BearerQosIe::new(q.qci, q.ul_mbr, q.dl_mbr, q.ul_gbr, q.dl_gbr);
         let encoded = typed_ie(|buf| flow.encode(buf, 0))?;
         msg.add_ie(Gtp2Ie::from_slice(
             Gtp2IeType::FlowQos as u8,
             0,
-            &encoded.value,
+            &encoded.value[1..],
         ));
     }
 
@@ -1047,6 +1047,54 @@ fn encode_apn_dns(apn: &str) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+
+    /// #1186 review, TS 29.274 §8.15: the Bearer QoS ARP octet carries the
+    /// context's GTP PCI/PVI as they are (1 = disabled): PCI 1 / PVI 0 sets bit 7
+    /// (0x40) and clears bit 1, and the reverse.
+    #[test]
+    fn bearer_qos_arp_bits_are_the_gtp_coding() {
+        for (pci, pvi, arp_bits) in [(1u8, 0u8, 0x40u8), (0, 1, 0x01)] {
+            let mut bearer = crate::context::MmeBearer::default();
+            bearer.qos.qci = 9;
+            bearer.qos.arp.priority_level = 8;
+            bearer.qos.arp.pre_emption_capability = pci;
+            bearer.qos.arp.pre_emption_vulnerability = pvi;
+            let ie = super::typed_ie(|buf| super::bearer_qos(&bearer).encode(buf, 0)).unwrap();
+            assert_eq!(ie.value[0] & 0x41, arp_bits, "PCI {pci} PVI {pvi}");
+            assert_eq!((ie.value[0] >> 2) & 0x0f, 8, "priority level");
+        }
+    }
+
+    /// #1186 review, TS 29.274 §8.16: the Bearer Resource Command's Flow QoS is
+    /// QCI then the four rates (21 octets), with no ARP octet.
+    #[test]
+    fn flow_qos_has_no_arp_octet() {
+        let qos = super::Gtp2BearerQos {
+            qci: 3,
+            priority_level: 8,
+            ul_mbr: 64,
+            dl_mbr: 128,
+            ..Default::default()
+        };
+        let msg = super::build_bearer_resource_command(
+            &crate::context::MmeBearer::default(),
+            &crate::context::MmeUe::default(),
+            &crate::context::SgwUe::default(),
+            5,
+            1,
+            &[],
+            Some(&qos),
+            0x1186,
+        )
+        .unwrap();
+        let flow = msg
+            .get_ie(nextgcore_gtp::v2::Gtp2IeType::FlowQos as u8, 0)
+            .expect("a Flow QoS");
+        assert_eq!(flow.value.len(), 21, "QCI and four 5-octet rates");
+        assert_eq!(flow.value[0], 3, "octet 5 is the QCI");
+        assert_eq!(&flow.value[1..6], &[0, 0, 0, 0, 64], "UL MBR");
+        assert_eq!(&flow.value[6..11], &[0, 0, 0, 0, 128], "DL MBR");
+    }
 
     /// #48: the F-TEID interface types are wire values from TS 29.274 §8.22, read from
     /// `6g_docs/specs/29274-j60.txt`, and two of them were WRONG while their only user
