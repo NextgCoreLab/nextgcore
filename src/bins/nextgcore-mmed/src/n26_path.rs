@@ -904,6 +904,14 @@ fn handle_datagram(inner: &Arc<N26Inner>, data: &[u8], peer: SocketAddr) {
         return;
     }
 
+    // #963: the source AMF cancels a 5GS to EPS handover this MME is the target of
+    // (TS 23.502 §4.11.1.2.3 step 2). An initial message, so it is answered here.
+    if msg_type == Gtp2MessageType::RelocationCancelRequest as u8 {
+        let response = handle_relocation_cancel_request(mme_self(), &msg, peer);
+        send_response_from(inner, peer, &response);
+        return;
+    }
+
     log::info!(
         "N26 message type={msg_type} seq={seq} from {peer} matches no outstanding \
          transaction. Implemented: Context Request/Response/Acknowledge as the NEW node \
@@ -911,6 +919,103 @@ fn handle_datagram(inner: &Arc<N26Inner>, data: &[u8], peer: SocketAddr) {
          (#408). Anything else is either an initial message this MME does not serve or a late \
          duplicate response."
     );
+}
+
+/// Handle a **Relocation Cancel Request** (TS 29.274 §7.3.16, type 139) from the source
+/// AMF of a 5GS to EPS handover this MME is preparing as the target (TS 23.502 §4.11.1.2.3
+/// step 2, #963), and return the Relocation Cancel Response.
+///
+/// The relocation is found among this MME's N26 arrivals not yet completed, from `peer`:
+/// - by the header TEID, which is the TEID this MME gave in its Forward Relocation
+///   Response (the MME UE id);
+/// - or, with TEID 0 (the AMF had no response yet, §5.5.2), by the IMSI.
+///
+/// The UE context [`handle_forward_relocation_request`] installed is released: its bearers,
+/// PDN connections, the eNB UE context and the MME UE. This MME creates no Serving GW
+/// session for an N26 arrival before the UE lands, so there is none to delete. Answered
+/// "Request accepted", or "IMSI/IMEI not known" (§7.3.17) when nothing matches.
+pub fn handle_relocation_cancel_request(
+    ctx: &MmeContext,
+    msg: &Gtp2Message,
+    peer: SocketAddr,
+) -> Gtp2Message {
+    let seq = msg.header.sequence_number;
+    let teid = msg.header.teid.unwrap_or(0);
+    let imsi = n26_build::relocation_cancel_request_imsi(msg);
+    let candidates: Vec<(u64, ForwardRelocationSource)> = forward_relocation_sources()
+        .lock()
+        .map(|m| {
+            m.iter()
+                .filter(|(_, s)| s.peer == peer)
+                .map(|(id, s)| (*id, *s))
+                .collect()
+        })
+        .unwrap_or_default();
+    let found = candidates.into_iter().find(|(id, _)| {
+        if teid != 0 {
+            *id as u32 == teid
+        } else {
+            imsi.as_deref().is_some_and(|imsi| {
+                ctx.mme_ue_find_by_id(*id)
+                    .is_some_and(|ue| ue.imsi_bcd == imsi)
+            })
+        }
+    });
+    let Some((mme_ue_id, source)) = found else {
+        log::info!(
+            "N26 Relocation Cancel Request from {peer} (seq={seq}, TEID {teid:#x}, IMSI \
+             {imsi:?}) matches no 5GS to EPS relocation in flight: answered 'IMSI/IMEI not \
+             known'"
+        );
+        return n26_build::build_relocation_cancel_response(
+            seq,
+            0,
+            n26_build::CAUSE_IMSI_IMEI_NOT_KNOWN,
+        );
+    };
+    take_forward_relocation_source(mme_ue_id);
+    // By owner, from the pools: what the install added, whether or not it reached the UE's
+    // and the sessions' lists.
+    let bearers: Vec<u64> = ctx
+        .bearer_pool
+        .read()
+        .map(|p| {
+            p.iter()
+                .filter(|(_, b)| b.mme_ue_id == mme_ue_id)
+                .map(|(id, _)| *id)
+                .collect()
+        })
+        .unwrap_or_default();
+    for id in bearers {
+        ctx.bearer_remove(id);
+    }
+    let sessions: Vec<u64> = ctx
+        .sess_pool
+        .read()
+        .map(|p| {
+            p.iter()
+                .filter(|(_, s)| s.mme_ue_id == mme_ue_id)
+                .map(|(id, _)| *id)
+                .collect()
+        })
+        .unwrap_or_default();
+    for id in sessions {
+        ctx.sess_remove(id);
+    }
+    if let Some(ue) = ctx.mme_ue_find_by_id(mme_ue_id) {
+        ctx.enb_ue_remove(ue.enb_ue_id);
+        ctx.mme_ue_remove(mme_ue_id);
+    }
+    log::info!(
+        "N26 Relocation Cancel Request from AMF {peer} (seq={seq}): the 5GS to EPS handover of \
+         UE {mme_ue_id} is cancelled; its prepared context and bearers are released \
+         (TS 23.502 §4.11.1.2.3 step 2)"
+    );
+    n26_build::build_relocation_cancel_response(
+        seq,
+        source.amf_teid,
+        n26_build::CAUSE_REQUEST_ACCEPTED,
+    )
 }
 
 /// Handle a **Forward Relocation Request** (TS 29.274 §7.3.1, type 133), #408.
@@ -2545,6 +2650,168 @@ mod tests {
         );
         server.close();
         ctx.enb_remove(bystander);
+    }
+
+    /// **#963**, TS 23.502 §4.11.1.2.3 step 2: the source AMF cancels a 5GS to EPS
+    /// handover this MME is preparing. amfd's own N26 server and this MME's talk over real
+    /// sockets:
+    /// - amfd sends the Forward Relocation Request; this MME installs the UE context;
+    /// - amfd's Relocation Cancel Request, at the TEID this MME gave, releases it, and the
+    ///   Relocation Cancel Response ("Request accepted", at the AMF's TEID) ends amfd's
+    ///   retransmissions;
+    /// - a second relocation is cancelled at TEID 0 by its IMSI (the AMF had no response);
+    /// - a cancel for nothing is "IMSI/IMEI not known".
+    ///
+    /// Revert-verified: without the handler the context stays and amfd retransmits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_relocation_cancel_from_the_source_amf_releases_the_prepared_context() {
+        use nextgcore_gtp::v2::{Gtp2FTeidIe, Gtp2IeType};
+        let _guard = lock_s11();
+        let ctx = mme_self();
+        ctx.init();
+        clear_forward_relocation_sources_for_test();
+        let target = ctx.enb_add("127.0.0.1:49631".parse().unwrap());
+        ctx.enb_set_enb_id(target, 0x9_6301);
+        if let Some(enb) = ctx.enb_pool.write().unwrap().get_mut(&target) {
+            enb.plmn_id = crate::s11_build::decode_plmn_bcd(&[0x00, 0xF1, 0x10]).unwrap();
+            enb.enb_id_bits = 20;
+            enb.state.s1_setup_success = true;
+        }
+        let server =
+            N26Server::open("127.0.0.1:0".parse().unwrap(), Gtp2XactConfig::default(), 3).unwrap();
+        let mme_addr = server.local_addr();
+        let amf = nextgcore_amfd::n26_path::N26Server::open("127.0.0.1:0".parse().unwrap(), 1)
+            .await
+            .expect("amfd N26");
+
+        let mm = nextgcore_gtp::v2::Gtp2MmContextIe {
+            kasme: [0x63; 32],
+            ..Default::default()
+        };
+        let mut pdn = nextgcore_gtp::v2::Gtp2PdnConnectionIe::new();
+        pdn.add_ie(nextgcore_gtp::v2::Gtp2ApnIe::from_string("n26t963").to_ie(0));
+        pdn.add_ie(nextgcore_gtp::v2::Gtp2EbiIe::new(5).to_ie(0));
+        pdn.add_ie(Gtp2FTeidIe::new_ipv4(7, 0x0963_0BC1, [10, 9, 6, 3]).to_ie(0));
+        let mut bearer = nextgcore_gtp::v2::Gtp2BearerContextIe::new();
+        bearer.set_ebi(5);
+        bearer.set_bearer_qos(&nextgcore_gtp::v2::Gtp2BearerQosIe::new(9, 0, 0, 0, 0));
+        pdn.add_ie(bearer.to_ie(0));
+        pdn.add_ie(nextgcore_gtp::v2::Gtp2AmbrIe::new(1_000, 2_000).to_ie(0));
+        let named = nextgcore_amfd::n26_build::encode_enb_target_identification(
+            &[0x00, 0xF1, 0x10],
+            nextgcore_ngap::types::NgEnbId::Macro(0x9_6301),
+            [0x00, 0x01],
+        )
+        .unwrap();
+        // The source AMF prepares a handover for `imsi`; the MME UE id it installed.
+        let prepare = |seq: u32, imsi: &'static str| {
+            let amf = &amf;
+            let named = &named;
+            let mm = &mm;
+            let pdn = &pdn;
+            async move {
+                let request = nextgcore_amfd::n26_build::build_forward_relocation_request(
+                    seq,
+                    Some(imsi),
+                    &amf.local_fteid(0x963).expect("IPv4"),
+                    mm,
+                    std::slice::from_ref(pdn),
+                    &[0xA9, 0x63],
+                    named,
+                    &[0x00, 0xF1, 0x10],
+                );
+                amf.send_to_mme(mme_addr, &request).await;
+                for _ in 0..200 {
+                    let installed = ctx
+                        .mme_ue_pool
+                        .read()
+                        .unwrap()
+                        .values()
+                        .find(|ue| ue.imsi_bcd == imsi)
+                        .map(|ue| ue.id);
+                    if let Some(id) = installed.filter(|id| forward_relocation_in_flight(*id)) {
+                        return id;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                panic!("the MME installs the relocated context");
+            }
+        };
+        let released = |id: u64| {
+            ctx.mme_ue_find_by_id(id).is_none()
+                && !forward_relocation_in_flight(id)
+                && !ctx
+                    .sess_pool
+                    .read()
+                    .unwrap()
+                    .values()
+                    .any(|s| s.mme_ue_id == id)
+                && !ctx
+                    .bearer_pool
+                    .read()
+                    .unwrap()
+                    .values()
+                    .any(|b| b.mme_ue_id == id)
+        };
+        let wait_closed = |seq: u32| async move {
+            for _ in 0..200 {
+                if !nextgcore_amfd::n26_path::relocation_cancel_outstanding(seq) {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            false
+        };
+
+        // At the TEID the MME gave (its MME UE id, the Sender's F-TEID it answered with).
+        let first = prepare(0x9_6301, "001010000009631").await;
+        let seq = amf
+            .send_relocation_cancel(
+                nextgcore_amfd::n26_path::FivegsToEpsCancel {
+                    peer: mme_addr,
+                    mme_teid: Some(first as u32),
+                },
+                Some("001010000009631"),
+            )
+            .await;
+        assert!(
+            wait_closed(seq).await,
+            "the Relocation Cancel Response closes it"
+        );
+        assert!(
+            released(first),
+            "the prepared context and bearers are released"
+        );
+
+        // At TEID 0, by the IMSI.
+        let second = prepare(0x9_6302, "001010000009632").await;
+        let seq = amf
+            .send_relocation_cancel(
+                nextgcore_amfd::n26_path::FivegsToEpsCancel {
+                    peer: mme_addr,
+                    mme_teid: None,
+                },
+                Some("001010000009632"),
+            )
+            .await;
+        assert!(wait_closed(seq).await);
+        assert!(released(second));
+
+        // Nothing in flight: "IMSI/IMEI not known", at TEID 0.
+        let request = nextgcore_amfd::n26_build::build_relocation_cancel_request(
+            0x9_6303,
+            None,
+            Some("001010000009633"),
+        );
+        let response = handle_relocation_cancel_request(ctx, &request, amf.local_addr());
+        assert_eq!(response.header.teid, Some(0));
+        let cause = response.get_ie(Gtp2IeType::Cause as u8, 0).expect("Cause");
+        assert_eq!(cause.value[0], crate::n26_build::CAUSE_IMSI_IMEI_NOT_KNOWN);
+
+        server.close();
+        ctx.enb_remove(target);
+        clear_forward_relocation_sources_for_test();
     }
 
     /// **#741.** The target is the S1-connected eNB with the named PLMN, ENB-ID alternative

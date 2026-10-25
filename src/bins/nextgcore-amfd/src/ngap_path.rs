@@ -16264,6 +16264,12 @@ impl NgapServer {
         // and the SMF never heard.
         self.release_cancelled_handover_target(cancel.amf_ue_ngap_id, "HO_CANCEL")
             .await;
+        // #963, TS 23.502 §4.11.1.2.3 step 2: a 5GS→EPS preparation's target MME is told
+        // with a Relocation Cancel Request, so it releases the UE context and bearers it
+        // installed. Step 7b (the SMF's indirect forwarding resources) does not apply: this
+        // AMF never asks for indirect forwarding (see `handle_handover_required`).
+        self.cancel_fivegs_to_eps_relocation(cancel.amf_ue_ngap_id)
+            .await;
         // The source abandoned the handover; nothing further will be relayed.
         // Dropped BEFORE the acknowledgement is sent, so a failed ack cannot leave
         // a stale relay target behind. The per-session transfers go with it (#742).
@@ -16283,6 +16289,37 @@ impl NgapServer {
             None => log::error!("Failed to build HandoverCancelAcknowledge"),
         }
         Ok(())
+    }
+
+    /// End a 5GS→EPS preparation the source gNB cancelled (#963): the target MME, if one
+    /// was asked, gets a Relocation Cancel Request with the UE's IMSI. Returns the MME told.
+    async fn cancel_fivegs_to_eps_relocation(
+        &mut self,
+        amf_ue_ngap_id: u64,
+    ) -> Option<crate::n26_path::FivegsToEpsCancel> {
+        let target = crate::n26_path::take_fivegs_to_eps_relocation(amf_ue_ngap_id)?;
+        let supi = self
+            .ue_auth_state
+            .get(amf_ue_ngap_id)
+            .and_then(|s| s.amf_ue.supi.clone());
+        let imsi = supi.as_deref().and_then(|s| s.strip_prefix("imsi-"));
+        match crate::n26_path::server() {
+            Some(server) => {
+                let seq = server.send_relocation_cancel(target, imsi).await;
+                log::info!(
+                    "5GS→EPS handover of UE {amf_ue_ngap_id} cancelled: Relocation Cancel \
+                     Request (seq={seq}, TEID {:#x}) to MME {} (TS 23.502 §4.11.1.2.3 step 2)",
+                    target.mme_teid.unwrap_or(0),
+                    target.peer
+                );
+            }
+            None => log::warn!(
+                "5GS→EPS handover of UE {amf_ue_ngap_id} cancelled, but no N26 socket is bound: \
+                 MME {} is not told and releases its preparation on its own timer",
+                target.peer
+            ),
+        }
+        Some(target)
     }
 
     /// Handle a PathSwitchRequest from the target gNB after an Xn handover
@@ -37831,6 +37868,7 @@ mod fivegs_to_eps_tests {
             crate::n26_path::PendingForwardRelocation {
                 amf_ue_ngap_id: UE,
                 dl_count_used: 0x1234_56AB,
+                peer: "127.0.0.1:2123".parse().unwrap(),
             },
         );
         let n26 = crate::n26_path::N26Server::open("127.0.0.1:0".parse().unwrap(), 1)
@@ -37905,6 +37943,190 @@ mod fivegs_to_eps_tests {
         assert_eq!(
             out.procedure_code.0,
             nextgcore_ngap_gen::generated::ID_HANDOVER_PREPARATION
+        );
+    }
+
+    /// A HANDOVER CANCEL (TS 38.413 §9.2.3.11) from the source gNB for [`UE`].
+    fn handover_cancel() -> Vec<u8> {
+        nextgcore_ngap::builder::build_handover_cancel(&nextgcore_ngap::types::HandoverCancel {
+            amf_ue_ngap_id: UE,
+            ran_ue_ngap_id: RAN_UE,
+            cause: nextgcore_ngap::types::Cause::RadioNetwork(
+                nextgcore_ngap::types::CauseRadioNetwork::TngrelocprepExpiry,
+            ),
+        })
+        .expect("build HandoverCancel")
+    }
+
+    /// A source-gNB NGAP server holding [`UE`], with its NGAP egress captured.
+    async fn source_server() -> NgapServer {
+        let mut ngap = NgapServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            SctpBackend::Userspace,
+            mpsc::channel(64).0,
+        )
+        .await
+        .unwrap();
+        ngap.sent_ngap = Some(Vec::new());
+        let mut state = UeNasContext::new(UE, RAN_UE, SOURCE_ASSOC, false);
+        state.amf_ue.supi = Some("imsi-001010000009630".to_string());
+        ngap.ue_auth_state.insert(UE, state);
+        ngap
+    }
+
+    /// #963, TS 23.502 §4.11.1.2.3: the source gNB cancels a 5GS→EPS handover.
+    ///
+    /// - While the Forward Relocation Request is unanswered: the MME it went to is the one
+    ///   to tell, at TEID 0, and the late response then continues nothing (no HANDOVER
+    ///   COMMAND after the HANDOVER CANCEL ACKNOWLEDGE).
+    /// - Once accepted: the MME is told at the TEID its response gave, and the answer
+    ///   queued for the NGAP layer is dropped.
+    ///
+    /// Revert-verified: without the cancel the MME is told nothing, and the accepted
+    /// case still sends the source gNB a HANDOVER COMMAND.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_handover_cancel_ends_the_5gs_to_eps_preparation() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::test_support::init_context();
+        let n26 = crate::n26_path::N26Server::open("127.0.0.1:0".parse().unwrap(), 1)
+            .await
+            .expect("N26");
+        let mme = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mme_addr = mme.local_addr().unwrap();
+
+        // Unanswered.
+        crate::n26_path::clear_forward_relocation_state_for_test();
+        let _ = crate::n26_path::drain_fivegs_to_eps_answers();
+        crate::n26_path::record_pending_forward_relocation_for_test(
+            0x9631,
+            crate::n26_path::PendingForwardRelocation {
+                amf_ue_ngap_id: UE,
+                dl_count_used: 7,
+                peer: mme_addr,
+            },
+        );
+        let mut ngap = source_server().await;
+        ngap.handle_handover_cancel(SOURCE_ASSOC, &handover_cancel())
+            .await
+            .expect("handled");
+        assert_eq!(
+            crate::n26_path::take_fivegs_to_eps_relocation(UE),
+            None,
+            "the cancel took the preparation"
+        );
+        // The MME's late accept continues nothing.
+        mme.send_to(
+            &response(0x9631, 16, Some(&[0x03, 0xC0, 0xFE])),
+            n26.local_addr(),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(crate::n26_path::drain_fivegs_to_eps_answers().is_empty());
+
+        // Accepted, the answer still queued for the NGAP layer.
+        crate::n26_path::clear_forward_relocation_state_for_test();
+        crate::n26_path::record_pending_forward_relocation_for_test(
+            0x9632,
+            crate::n26_path::PendingForwardRelocation {
+                amf_ue_ngap_id: UE,
+                dl_count_used: 7,
+                peer: mme_addr,
+            },
+        );
+        mme.send_to(
+            &response(0x9632, 16, Some(&[0x03, 0xC0, 0xFE])),
+            n26.local_addr(),
+        )
+        .await
+        .unwrap();
+        for _ in 0..100 {
+            if crate::n26_path::forward_relocation_answered_for_test(UE) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            ngap.cancel_fivegs_to_eps_relocation(UE).await,
+            Some(crate::n26_path::FivegsToEpsCancel {
+                peer: mme_addr,
+                mme_teid: Some(0x0476_BBBB),
+            }),
+            "an accepted relocation names the MME's TEID"
+        );
+        assert!(!crate::n26_path::forward_relocation_answered_for_test(UE));
+        assert!(
+            crate::n26_path::drain_fivegs_to_eps_answers().is_empty(),
+            "the queued answer is dropped with it"
+        );
+        let sent = std::mem::take(ngap.sent_ngap.as_mut().unwrap());
+        assert_eq!(
+            sent.len(),
+            1,
+            "only the HANDOVER CANCEL ACKNOWLEDGE: {sent:?}"
+        );
+    }
+
+    /// The next GTPv2-C message on `sock`, within five seconds.
+    async fn recv_gtp(sock: &tokio::net::UdpSocket) -> Gtp2Message {
+        let mut buf = vec![0u8; 2048];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
+            .await
+            .expect("a datagram")
+            .unwrap();
+        Gtp2Message::decode(&mut bytes::Bytes::copy_from_slice(&buf[..len])).unwrap()
+    }
+
+    /// #963, TS 29.274 §7.3.16 / §7.6: the Relocation Cancel Request on the wire to a
+    /// stand-in MME. Header TEID the MME's, IMSI in TBCD; retransmitted after T3 while
+    /// unanswered, and not after the Relocation Cancel Response.
+    ///
+    /// Revert-verified: without the retransmission loop the MME sees one copy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relocation_cancel_request_is_retransmitted_until_answered() {
+        let n26 = crate::n26_path::N26Server::open("127.0.0.1:0".parse().unwrap(), 1)
+            .await
+            .expect("N26");
+        let mme = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let cancel = crate::n26_path::FivegsToEpsCancel {
+            peer: mme.local_addr().unwrap(),
+            mme_teid: Some(0x0000_0963),
+        };
+        let seq = n26
+            .send_relocation_cancel(cancel, Some("001010000009630"))
+            .await;
+
+        let mut buf = vec![0u8; 2048];
+        let first = recv_gtp(&mme).await;
+        assert_eq!(
+            first.header.message_type,
+            Gtp2MessageType::RelocationCancelRequest as u8
+        );
+        assert_eq!(first.header.teid, Some(0x0000_0963));
+        assert_eq!(first.header.sequence_number, seq);
+        let imsi = first.get_ie(Gtp2IeType::Imsi as u8, 0).expect("IMSI");
+        assert_eq!(
+            imsi.value.as_ref(),
+            crate::n26_path::string_to_bcd("001010000009630").as_slice()
+        );
+        // Unanswered: T3 later it comes again, the same request.
+        let second = recv_gtp(&mme).await;
+        assert_eq!(second.encode(), first.encode());
+
+        let mut answer = Gtp2Message::new(Gtp2Header::new(
+            Gtp2MessageType::RelocationCancelResponse as u8,
+            0,
+            seq,
+        ));
+        answer.add_ie(Gtp2CauseIe::new(16).to_ie(0));
+        mme.send_to(&answer.encode(), n26.local_addr())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(3500), mme.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "answered: no further retransmission"
         );
     }
 

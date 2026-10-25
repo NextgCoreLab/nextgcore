@@ -271,6 +271,9 @@ pub struct PendingForwardRelocation {
     /// downlink NAS COUNT value used in K_(ASME)' derivation in step 2"*. Re-reading would
     /// report the next message's COUNT — the nextgsim-#203 defect.
     pub dl_count_used: u32,
+    /// The target MME's N26 address, which a Relocation Cancel Request goes to if the source
+    /// gNB cancels before the MME answers (#963).
+    pub peer: SocketAddr,
 }
 
 /// What a Forward Relocation preparation concluded with (#408).
@@ -377,6 +380,77 @@ fn mark_forward_relocation_complete(peer: SocketAddr) {
     }
 }
 
+/// The target MME of a 5GS→EPS preparation the source gNB cancelled (#963).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FivegsToEpsCancel {
+    /// The MME's N26 address.
+    pub peer: SocketAddr,
+    /// Its control-plane TEID, once its Forward Relocation Response gave one.
+    pub mme_teid: Option<u32>,
+}
+
+/// End `amf_ue_ngap_id`'s 5GS→EPS preparation because the source gNB cancelled it
+/// (TS 23.502 §4.11.1.2.3, #963), and say which MME has to be told.
+///
+/// - A Forward Relocation Request still unanswered: its record is dropped, so the late
+///   response continues nothing, and the MME is told with TEID 0 (it has not given one).
+/// - An accepted relocation: its outcome is dropped, so no Complete Notification is
+///   acknowledged for it, and the MME is told at its TEID.
+/// - A refusal: nothing was prepared there, so nobody is told.
+///
+/// An answer still queued for the NGAP layer is dropped too, so the source gNB that
+/// cancelled gets no HANDOVER COMMAND after its HANDOVER CANCEL ACKNOWLEDGE.
+pub fn take_fivegs_to_eps_relocation(amf_ue_ngap_id: u64) -> Option<FivegsToEpsCancel> {
+    FIVEGS_TO_EPS_ANSWERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|a| a.amf_ue_ngap_id != amf_ue_ngap_id);
+    let answered = forward_relocation_outcomes()
+        .lock()
+        .ok()
+        .and_then(|mut map| map.remove(&amf_ue_ngap_id));
+    let unanswered = pending_forward_relocations()
+        .lock()
+        .ok()
+        .and_then(|mut map| {
+            let seq = map
+                .iter()
+                .find(|(_, p)| p.amf_ue_ngap_id == amf_ue_ngap_id)
+                .map(|(seq, _)| *seq)?;
+            map.remove(&seq)
+        });
+    match (answered, unanswered) {
+        (Some(ForwardRelocationOutcome::Accepted { mme_teid, peer, .. }), _) => {
+            Some(FivegsToEpsCancel { peer, mme_teid })
+        }
+        (_, Some(p)) => Some(FivegsToEpsCancel {
+            peer: p.peer,
+            mme_teid: None,
+        }),
+        _ => None,
+    }
+}
+
+/// Relocation Cancel Requests this AMF sent and has no response to yet, by sequence number
+/// (#963). Removed by the response, or once the retransmissions run out.
+static RELOCATION_CANCELS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether Relocation Cancel Request `seq` is still waiting for its response (#963).
+pub fn relocation_cancel_outstanding(seq: u32) -> bool {
+    RELOCATION_CANCELS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&seq)
+}
+
+/// Close the outstanding Relocation Cancel Request `seq`; whether it was outstanding.
+fn close_relocation_cancel(seq: u32) -> bool {
+    let mut cancels = RELOCATION_CANCELS.lock().unwrap_or_else(|e| e.into_inner());
+    let before = cancels.len();
+    cancels.retain(|s| *s != seq);
+    cancels.len() != before
+}
+
 /// Record a pending Forward Relocation without sending anything. Test-only.
 ///
 /// The response path's behaviour turns entirely on whether a record exists and which UE it
@@ -386,6 +460,15 @@ fn mark_forward_relocation_complete(peer: SocketAddr) {
 #[cfg(test)]
 pub fn record_pending_forward_relocation_for_test(seq: u32, pending: PendingForwardRelocation) {
     record_pending_forward_relocation(seq, pending);
+}
+
+/// Whether the target MME's answer for `amf_ue_ngap_id` has been recorded. Test-only;
+/// declared beside the map.
+#[cfg(test)]
+pub fn forward_relocation_answered_for_test(amf_ue_ngap_id: u64) -> bool {
+    forward_relocation_outcomes()
+        .lock()
+        .is_ok_and(|m| m.contains_key(&amf_ue_ngap_id))
 }
 
 /// Drop every pending record and outcome. Declared beside the maps, not in a `mod tests`.
@@ -682,6 +765,52 @@ pub(crate) fn preparation_in_progress_for_test(supi: &str) -> Option<(u32, bool)
 }
 
 impl N26Server {
+    /// Send a **Relocation Cancel Request** (TS 29.274 §7.3.16) for a cancelled 5GS→EPS
+    /// handover (TS 23.502 §4.11.1.2.3 step 2, #963), retransmitted every T3-RESPONSE up to
+    /// N3-REQUESTS times until its Relocation Cancel Response arrives (§7.6). Returns the
+    /// sequence number.
+    pub async fn send_relocation_cancel(
+        self: &Arc<Self>,
+        cancel: FivegsToEpsCancel,
+        imsi_digits: Option<&str>,
+    ) -> u32 {
+        let seq = self.alloc_sequence().await;
+        let msg =
+            crate::n26_build::build_relocation_cancel_request(seq, cancel.mme_teid, imsi_digits);
+        RELOCATION_CANCELS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(seq);
+        let config = n26_xact_config();
+        let server = Arc::clone(self);
+        tokio::spawn(async move {
+            for attempt in 0..=config.n3_requests {
+                if !relocation_cancel_outstanding(seq) {
+                    return;
+                }
+                if attempt > 0 {
+                    log::info!(
+                        "N26 Relocation Cancel Request (seq={seq}) to MME {}: no response, \
+                         retransmission {attempt}/{}",
+                        cancel.peer,
+                        config.n3_requests
+                    );
+                }
+                server.send(cancel.peer, &msg).await;
+                tokio::time::sleep(config.t3_response).await;
+            }
+            if close_relocation_cancel(seq) {
+                log::warn!(
+                    "N26 Relocation Cancel Request (seq={seq}) to MME {}: no response after {} \
+                     retransmissions; the MME releases the prepared context on its own timer",
+                    cancel.peer,
+                    config.n3_requests
+                );
+            }
+        });
+        seq
+    }
+
     /// Send `msg` to `peer` from this server's socket (#418): step 14's Forward Relocation
     /// Response and the Complete Notification leave from the NGAP layer, which holds the
     /// preparation's server handle.
@@ -953,6 +1082,32 @@ impl N26Server {
         if msg_type == Gtp2MessageType::ForwardRelocationCompleteNotification as u8 {
             self.handle_forward_relocation_complete_notification(&msg, seq, peer)
                 .await;
+            return;
+        }
+
+        // #963: the target MME answers this AMF's Relocation Cancel Request for a 5GS→EPS
+        // handover the source gNB cancelled (TS 23.502 §4.11.1.2.3 step 2).
+        if msg_type == Gtp2MessageType::RelocationCancelResponse as u8 {
+            let cause = msg
+                .get_ie(Gtp2IeType::Cause as u8, 0)
+                .and_then(|ie| Gtp2CauseIe::decode(&ie.value).ok())
+                .map(|c| c.cause);
+            if !close_relocation_cancel(seq) {
+                log::debug!(
+                    "N26 Relocation Cancel Response from {peer} (seq={seq}) answers no \
+                     outstanding request; a duplicate"
+                );
+            } else if cause == Some(CAUSE_REQUEST_ACCEPTED) {
+                log::info!(
+                    "N26 Relocation Cancel Response from MME {peer} (seq={seq}): the target \
+                     released its preparation"
+                );
+            } else {
+                log::warn!(
+                    "N26 Relocation Cancel Response from MME {peer} (seq={seq}) cause \
+                     {cause:?}: the target did not confirm the release"
+                );
+            }
             return;
         }
 
@@ -1388,8 +1543,9 @@ impl N26Server {
         // accepted toward E-UTRAN, and the HANDOVER COMMAND cannot be built without it
         // (§9.2.3.2 makes Target to Source Transparent Container mandatory). An accept without
         // one — or with one of the wrong Container Type — cannot complete, so the source gNB is
-        // answered with a preparation failure. The MME is not told: this core has no Relocation
-        // Cancel, so it releases what it reserved on its own timer.
+        // answered with a preparation failure. The MME is not told, so it releases what it
+        // reserved on its own timer. (A Relocation Cancel, #963, is for a handover the source
+        // gNB cancels; this preparation is refused by the AMF instead.)
         if data.target_to_source_container.is_none() {
             log::warn!(
                 "N26 Forward Relocation Response from {peer} (seq={seq}) accepted UE {} but \
@@ -1886,6 +2042,7 @@ pub async fn send_forward_relocation_request(
         PendingForwardRelocation {
             amf_ue_ngap_id,
             dl_count_used,
+            peer,
         },
     );
 
