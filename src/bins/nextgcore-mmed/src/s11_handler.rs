@@ -1348,6 +1348,16 @@ fn handle_delete_bearer_request(raw: &[u8], sequence_number: u32, peer: SocketAd
                 ebis: to_deactivate,
                 reactivation,
             } => {
+                // #641 follow-up, TS 24.301 §6.4.2.6 b): the PDN GW deletes the whole
+                // PDN connection; a dedicated bearer activation on it ends locally.
+                if let crate::bearer_deactivation::DeleteBearerAnswer::Lbi(lbi) = &answer {
+                    crate::bearer_activation::settle_for_pdn(
+                        ctx,
+                        mme_ue_id,
+                        *lbi,
+                        GtpCause::ContextNotFound,
+                    );
+                }
                 // #863 review: bearers already being deactivated (by an earlier
                 // request, or with their PDN connection) are not deactivated a
                 // second time; a request naming only such bearers is answered

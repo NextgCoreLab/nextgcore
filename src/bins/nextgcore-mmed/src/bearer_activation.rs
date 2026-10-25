@@ -108,6 +108,10 @@ enum Parked {
     Paging,
     /// The Attach has not completed (Annex F NOTE 2).
     Attach,
+    /// A handover is running (TS 23.401 §5.5.1.1.2, §5.5.1.2.2): the E-RAB SETUP
+    /// is paused, or the eNB refused it as "handover triggered" (TS 36.413
+    /// §9.2.1.3), and is re-attempted when the handover is over.
+    Handover,
 }
 
 /// A Create Bearer Request whose answer waits for the eNB and the UE.
@@ -125,6 +129,11 @@ struct PendingActivation {
     parked: Parked,
     /// When the request arrived: the answer is due by [`answer_budget`] after it.
     received: Instant,
+    /// For [`Parked::Handover`]: the S1 connection the request was parked on, and
+    /// when to re-attempt anyway (an X2 handover the MME only sees at its Path
+    /// Switch, or one that failed: "known by expiry of the timer guarding the NAS
+    /// procedure", §5.5.1.1.2).
+    handover_park: Option<(u64, Instant)>,
 }
 
 /// The activations in progress. Process-global like `bearer_deactivation`'s;
@@ -371,6 +380,7 @@ pub fn handle_create_bearer_request(raw: &[u8], seq: u32, peer: SocketAddr) {
         items,
         parked: Parked::No,
         received: Instant::now(),
+        handover_park: None,
     };
     if p.items.iter().all(|i| i.refused.is_some()) {
         answer(ctx, &p);
@@ -416,8 +426,34 @@ pub fn handle_create_bearer_request(raw: &[u8], seq: u32, peer: SocketAddr) {
         pending().push(p);
         return;
     }
+    if s1_handover_in_progress(ctx, &ue) {
+        // TS 23.401 §5.5.1.2.2: "the MME should pause non-handover related S1
+        // interface procedures (e.g. ... E-RAB Setup ...) while a handover is
+        // ongoing ... and continue them once the Handover procedure has
+        // completed".
+        log::info!(
+            "[{}] Create Bearer Request for EBIs {:?} during an S1 handover: E-RAB SETUP paused",
+            ue.imsi_bcd,
+            ebis_of(&p)
+        );
+        p.parked = Parked::Handover;
+        p.handover_park = Some((ue.enb_ue_id, Instant::now()));
+        pending().push(p);
+        return;
+    }
     signal(ctx, &mut p);
     finish_or_keep(ctx, p);
+}
+
+/// Whether `ue`'s S1 connection is the source of an S1 handover in preparation
+/// or execution (a target context is allocated, TS 36.413 §8.4.1-§8.4.3).
+fn s1_handover_in_progress(ctx: &MmeContext, ue: &crate::context::MmeUe) -> bool {
+    ctx.enb_ue_find_by_id(ue.enb_ue_id)
+        .filter(|e| e.mme_ue_id == ue.id)
+        .is_some_and(|e| {
+            e.target_ue_id != crate::context::NEXTGCORE_INVALID_POOL_ID
+                && ctx.enb_ue_find_by_id(e.target_ue_id).is_some()
+        })
 }
 
 fn ebis_of(p: &PendingActivation) -> Vec<u8> {
@@ -452,7 +488,13 @@ fn signal(ctx: &MmeContext, p: &mut PendingActivation) {
         fail_unsignalled(p, GtpCause::UeNotResponding);
         return;
     };
-    for item in p.items.iter_mut().filter(|i| i.outcome().is_none()) {
+    // Only the bearers not signalled yet: after a handover pause some of a
+    // request's bearers may already be out (#641 follow-up).
+    for item in p
+        .items
+        .iter_mut()
+        .filter(|i| i.outcome().is_none() && i.pkbuf.is_empty())
+    {
         let Some(bearer) = ctx.bearer_find_by_id(item.bearer_id) else {
             item.refused = Some(GtpCause::SystemFailure);
             continue;
@@ -515,7 +557,7 @@ fn update(ctx: &MmeContext, mme_ue_id: u64, ebi: u8, f: impl FnOnce(&mut Item)) 
         let mut list = pending();
         let Some(i) = list.iter().position(|p| {
             p.mme_ue_id == mme_ue_id
-                && p.parked == Parked::No
+                && matches!(p.parked, Parked::No | Parked::Handover)
                 && p.items.iter().any(|it| it.ebi == ebi && it.bearer_id != 0)
         }) else {
             return false;
@@ -541,17 +583,60 @@ fn update(ctx: &MmeContext, mme_ue_id: u64, ebi: u8, f: impl FnOnce(&mut Item)) 
 
 /// Step 5: the E-RAB SETUP RESPONSE of `mme_ue_id`: `set_up` E-RAB ids (the eNB's
 /// F-TEIDs are already stored by `s1ap_handler`) and `failed` ones.
-pub fn on_erab_setup(ctx: &MmeContext, mme_ue_id: u64, set_up: &[u8], failed: &[u8]) {
+///
+/// `failed` carries, per E-RAB, whether the eNB's cause was a handover being
+/// triggered (TS 36.413 §9.2.1.3: S1 intra/inter-system or X2 handover
+/// triggered). Such a refusal is re-attempted once the handover is over (TS 23.401
+/// §5.5.1.1.2, §5.5.1.2.2: "the MME shall reattempt the same ... procedure
+/// either when the handover is complete or the handover is deemed to have
+/// failed"), not reported as a failure.
+pub fn on_erab_setup(ctx: &MmeContext, mme_ue_id: u64, set_up: &[u8], failed: &[(u8, bool)]) {
     for &ebi in set_up {
         update(ctx, mme_ue_id, ebi, |i| i.erab = Some(Ok(())));
     }
-    for &ebi in failed {
+    for &(ebi, handover) in failed {
+        if handover && requeue_for_handover(ctx, mme_ue_id, ebi) {
+            continue;
+        }
         // The eNB could not set the radio bearer up; the NAS request it carried may
         // never reach the UE, so the bearer is not waited for any further.
         update(ctx, mme_ue_id, ebi, |i| {
             i.erab = Some(Err(GtpCause::RequestRejectedReasonNotSpecified))
         });
     }
+}
+
+/// The eNB refused `ebi`'s E-RAB SETUP because a handover is triggered: the
+/// bearer goes back to "not signalled" and its request waits for the handover.
+fn requeue_for_handover(ctx: &MmeContext, mme_ue_id: u64, ebi: u8) -> bool {
+    let enb_ue_id = ctx
+        .mme_ue_find_by_id(mme_ue_id)
+        .map(|u| u.enb_ue_id)
+        .unwrap_or(0);
+    let mut list = pending();
+    let Some(p) = list.iter_mut().find(|p| {
+        p.mme_ue_id == mme_ue_id
+            && matches!(p.parked, Parked::No | Parked::Handover)
+            && p.items.iter().any(|it| it.ebi == ebi && it.bearer_id != 0)
+    }) else {
+        return false;
+    };
+    if let Some(item) = p
+        .items
+        .iter_mut()
+        .find(|it| it.ebi == ebi && it.bearer_id != 0 && it.outcome().is_none())
+    {
+        item.pkbuf.clear();
+        item.retries = 0;
+        item.erab = None;
+        item.nas = None;
+    }
+    p.parked = Parked::Handover;
+    p.handover_park = Some((enb_ue_id, Instant::now() + T3485_DURATION));
+    log::info!(
+        "UE {mme_ue_id}: E-RAB SETUP for EBI {ebi} refused as handover triggered; re-attempted          after the handover (TS 23.401 §5.5.1.1.2)"
+    );
+    true
 }
 
 /// Step 7: ACTIVATE DEDICATED EPS BEARER CONTEXT ACCEPT for `ebi`. Returns whether it
@@ -723,6 +808,11 @@ fn answer(ctx: &MmeContext, p: &PendingActivation) {
                         release.push(item.ebi);
                     }
                     remove_bearer(ctx, item.bearer_id);
+                    // The UE got the ACTIVATE request and has not answered: a late
+                    // ACCEPT may still come (#641 follow-up).
+                    if !item.pkbuf.is_empty() && item.nas.is_none() {
+                        remember_refused(p.mme_ue_id, item.ebi);
+                    }
                 }
             }
         }
@@ -772,8 +862,14 @@ pub fn sweep(ctx: &MmeContext, now: Instant) {
             let p = &mut list[i];
             let ue = ctx.mme_ue_find_by_id(p.mme_ue_id);
             let late = now.saturating_duration_since(p.received) >= budget;
+            // #641 follow-up: the PDN connection went (a PDN GW initiated
+            // deactivation of the whole PDN, a detach) while this waited.
+            let pdn_gone = ue
+                .as_ref()
+                .is_some_and(|u| !pdn_exists(ctx, u, p.linked_ebi));
             let cause = match (&ue, p.parked) {
                 (None, _) => Some(GtpCause::ContextNotFound),
+                (Some(_), _) if pdn_gone => Some(GtpCause::ContextNotFound),
                 (Some(_), Parked::Paging) if late => Some(GtpCause::UnableToPageUe),
                 (Some(_), _) if late => Some(GtpCause::UeNotResponding),
                 _ => None,
@@ -781,6 +877,18 @@ pub fn sweep(ctx: &MmeContext, now: Instant) {
             if let Some(cause) = cause {
                 fail_unsignalled(p, cause);
                 done.push(list.remove(i));
+                continue;
+            }
+            if p.parked == Parked::Handover
+                && ue.as_ref().is_some_and(|u| {
+                    let (parked_on, retry_at) = p.handover_park.unwrap_or((u.enb_ue_id, now));
+                    !s1_handover_in_progress(ctx, u)
+                        && (u.enb_ue_id != parked_on || now >= retry_at)
+                })
+            {
+                // The handover is over: completed (a new S1 connection), failed or
+                // cancelled (none in progress), or deemed failed at the guard.
+                to_signal.push(list.remove(i));
                 continue;
             }
             if p.parked == Parked::Attach && ue.as_ref().is_some_and(|u| !attach_in_progress(u)) {
@@ -850,6 +958,129 @@ pub(crate) fn expire_for_test(mme_ue_id: u64) {
         for i in p.items.iter_mut() {
             i.deadline = Instant::now() - Duration::from_millis(1);
         }
+        if let Some((_, at)) = p.handover_park.as_mut() {
+            *at = Instant::now() - Duration::from_millis(1);
+        }
+    }
+}
+
+/// Whether `ue` still has the PDN connection whose default bearer is `linked_ebi`.
+fn pdn_exists(ctx: &MmeContext, ue: &crate::context::MmeUe, linked_ebi: u8) -> bool {
+    ue.sess_list
+        .iter()
+        .filter_map(|id| ctx.sess_find_by_id(*id))
+        .any(|s| {
+            s.bearer_list
+                .first()
+                .and_then(|b| ctx.bearer_find_by_id(*b))
+                .is_some_and(|b| b.ebi == linked_ebi)
+        })
+}
+
+/// TS 24.301 §6.4.2.6 b): a PDN disconnection collides with the activation of a
+/// bearer of that PDN connection. The activation is terminated locally: its
+/// bearers are removed and the Serving GW is answered `cause`.
+pub fn settle_for_pdn(ctx: &MmeContext, mme_ue_id: u64, linked_ebi: u8, cause: GtpCause) {
+    let taken: Vec<PendingActivation> = {
+        let mut list = pending();
+        let (taken, kept): (Vec<_>, Vec<_>) = list
+            .drain(..)
+            .partition(|p| p.mme_ue_id == mme_ue_id && p.linked_ebi == linked_ebi);
+        *list = kept;
+        taken
+    };
+    for mut p in taken {
+        log::info!(
+            "UE {mme_ue_id}: the PDN connection of LBI {linked_ebi} is going; its dedicated              bearer activation (EBIs {:?}) ends (TS 24.301 §6.4.2.6 b)",
+            ebis_of(&p)
+        );
+        fail_unsignalled(&mut p, cause);
+        answer(ctx, &p);
+    }
+}
+
+/// Bearers whose activation failed after the UE was sent the request, by (UE,
+/// EBI), with when: a late ACTIVATE DEDICATED EPS BEARER CONTEXT ACCEPT for one of
+/// them is answered with a deactivation (#641 follow-up). Process-global, like
+/// [`PENDING`].
+static REFUSED: Mutex<Vec<(u64, u8, Instant)>> = Mutex::new(Vec::new());
+
+/// How long a refused bearer is remembered: past T3485 x 5.
+const REFUSED_HOLD: Duration = Duration::from_secs(60);
+
+fn remember_refused(mme_ue_id: u64, ebi: u8) {
+    let now = Instant::now();
+    let mut list = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+    list.retain(|(_, _, at)| now.saturating_duration_since(*at) < REFUSED_HOLD);
+    list.retain(|(u, e, _)| !(*u == mme_ue_id && *e == ebi));
+    list.push((mme_ue_id, ebi, now));
+}
+
+/// An ACTIVATE DEDICATED EPS BEARER CONTEXT ACCEPT for `ebi`, which no bearer of
+/// `mme_ue_id` has.
+///
+/// TS 24.301 §7.3.2 g): an ESM message naming no existing EPS bearer context is
+/// ignored by the network. When it answers an activation this MME already
+/// refused to the Serving GW (T3485 or the answer budget ran out, the eNB
+/// failed the E-RAB), the UE now holds a context the network does not, so it is
+/// sent DEACTIVATE EPS BEARER CONTEXT REQUEST, cause #36 "regular deactivation"
+/// (§6.4.4.2), once. Its ACCEPT names no context either and is ignored. Returns
+/// whether a deactivation was sent.
+pub fn on_unknown_accept(ctx: &MmeContext, mme_ue_id: u64, ebi: u8) -> bool {
+    let now = Instant::now();
+    let known = {
+        let mut list = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+        list.retain(|(_, _, at)| now.saturating_duration_since(*at) < REFUSED_HOLD);
+        match list
+            .iter()
+            .position(|(u, e, _)| *u == mme_ue_id && *e == ebi)
+        {
+            Some(i) => {
+                list.remove(i);
+                true
+            }
+            None => false,
+        }
+    };
+    if !known {
+        log::warn!(
+            "UE {mme_ue_id}: ACTIVATE DEDICATED EPS BEARER CONTEXT ACCEPT for EBI {ebi}, which              has no bearer; ignored (TS 24.301 §7.3.2 g)"
+        );
+        return false;
+    }
+    let Some((mme_ue, enb_ue)) = ctx.mme_ue_find_by_id(mme_ue_id).and_then(|u| {
+        ctx.enb_ue_find_by_id(u.enb_ue_id)
+            .filter(|e| e.mme_ue_id == mme_ue_id)
+            .map(|e| (u, e))
+    }) else {
+        return false;
+    };
+    let plain = crate::esm_build::build_deactivate_bearer_context_request_with_params(
+        ebi,
+        crate::esm_build::PTI_UNASSIGNED,
+        crate::esm_build::EsmCause::RegularDeactivation,
+    );
+    let sent = crate::nas_path::protect_esm(ctx, mme_ue_id, &plain)
+        .map_err(|e| format!("{e:?}"))
+        .and_then(|esm| {
+            crate::nas_path::nas_eps_send_to_downlink_nas_transport(&enb_ue, esm)
+                .map_err(|e| format!("{e:?}"))
+        });
+    match sent {
+        Ok(_) => {
+            log::warn!(
+                "[{}] late ACTIVATE DEDICATED EPS BEARER CONTEXT ACCEPT for EBI {ebi}, whose                  activation was already refused: DEACTIVATE EPS BEARER CONTEXT REQUEST sent",
+                mme_ue.imsi_bcd
+            );
+            true
+        }
+        Err(e) => {
+            log::error!(
+                "[{}] DEACTIVATE EPS BEARER CONTEXT REQUEST for EBI {ebi} not sent: {e}",
+                mme_ue.imsi_bcd
+            );
+            false
+        }
     }
 }
 
@@ -865,4 +1096,5 @@ pub(crate) fn age_for_test(mme_ue_id: u64, by: Duration) {
 #[cfg(test)]
 pub(crate) fn clear_for_test() {
     pending().clear();
+    REFUSED.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }

@@ -5147,7 +5147,23 @@ pub(crate) fn handle_erab_setup_response(
     }
     // #641, TS 23.401 §5.4.1 step 5: the E-RAB half of a dedicated bearer activation.
     let set_up: Vec<u8> = erab_setup_list.iter().map(|i| i.erab_id).collect();
-    let failed: Vec<u8> = erab_failed_list.iter().map(|i| i.erab_id).collect();
+    // #641 follow-up: a refusal because a handover is triggered (TS 36.413
+    // §9.2.1.3) is re-attempted after the handover (TS 23.401 §5.5.1.1.2).
+    let failed: Vec<(u8, bool)> = erab_failed_list
+        .iter()
+        .map(|i| {
+            use nextgcore_s1ap::CauseRadioNetwork as R;
+            let handover = matches!(
+                i.cause,
+                nextgcore_s1ap::Cause::RadioNetwork(
+                    R::S1IntraSystemHandoverTriggered
+                        | R::S1InterSystemHandoverTriggered
+                        | R::X2HandoverTriggered
+                )
+            );
+            (i.erab_id, handover)
+        })
+        .collect();
     crate::bearer_activation::on_erab_setup(ctx, enb_ue.mme_ue_id, &set_up, &failed);
 }
 
