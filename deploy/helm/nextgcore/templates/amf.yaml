@@ -37,7 +37,9 @@ spec:
     spec:
       initContainers:
         {{- include "nextgcore.waitForNrf" . | nindent 8 }}
-        {{- if .Values.amf.ueContextStore.enabled }}
+        {{- /* Only for the chart's own MongoDB: an external one or a dbUri override has
+        no <release>-mongodb Service to wait on (#1201 review m1). */}}
+        {{- if and .Values.amf.ueContextStore.enabled .Values.mongodb.enabled (not .Values.mongodb.externalUri) (not .Values.amf.ueContextStore.dbUri) }}
         {{- include "nextgcore.waitForMongo" . | nindent 8 }}
         {{- end }}
       containers:
