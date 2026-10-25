@@ -214,8 +214,8 @@ pub(crate) struct SetupRequest {
 
 fn ambr((dl, ul): (u64, u64)) -> g::PDUSessionAggregateMaximumBitRate {
     g::PDUSessionAggregateMaximumBitRate {
-        pdu_session_aggregate_maximum_bit_rate_dl: g::BitRate(dl),
-        pdu_session_aggregate_maximum_bit_rate_ul: g::BitRate(ul),
+        pdu_session_aggregate_maximum_bit_rate_dl: nextgcore_ngap_gen::bit_rate(dl),
+        pdu_session_aggregate_maximum_bit_rate_ul: nextgcore_ngap_gen::bit_rate(ul),
         ie_extensions: None,
     }
 }
@@ -256,10 +256,10 @@ fn setup_item(
                 ie_extensions: None,
             },
             gbr_qos_information: flow.gbr.map(|gbr| g::GBR_QosInformation {
-                maximum_flow_bit_rate_dl: g::BitRate(gbr.mfbr_dl),
-                maximum_flow_bit_rate_ul: g::BitRate(gbr.mfbr_ul),
-                guaranteed_flow_bit_rate_dl: g::BitRate(gbr.gfbr_dl),
-                guaranteed_flow_bit_rate_ul: g::BitRate(gbr.gfbr_ul),
+                maximum_flow_bit_rate_dl: nextgcore_ngap_gen::bit_rate(gbr.mfbr_dl),
+                maximum_flow_bit_rate_ul: nextgcore_ngap_gen::bit_rate(gbr.mfbr_ul),
+                guaranteed_flow_bit_rate_dl: nextgcore_ngap_gen::bit_rate(gbr.gfbr_dl),
+                guaranteed_flow_bit_rate_ul: nextgcore_ngap_gen::bit_rate(gbr.gfbr_ul),
                 notification_control: None,
                 maximum_packet_loss_rate_dl: None,
                 maximum_packet_loss_rate_ul: None,

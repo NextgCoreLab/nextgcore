@@ -36,8 +36,10 @@ const IE_ID_UL_NGU_UP_TNL_MODIFY_LIST: u16 = 140;
 const IE_ID_QOS_FLOW_ADD_OR_MODIFY_REQUEST_LIST: u16 = 135;
 const IE_ID_QOS_FLOW_TO_RELEASE_LIST: u16 = 137;
 
-// BitRate ::= INTEGER (0..4000000000000, ...)
-const BIT_RATE_MAX: i64 = 4_000_000_000_000;
+/// The largest Bit Rate (bit/s) TS 38.413 §9.3.1.4 defines:
+/// `BitRate ::= INTEGER (0..4000000000000, ...)`, and no release defines a
+/// value past the root.
+pub const BIT_RATE_MAX: u64 = 4_000_000_000_000;
 
 // ============================================================================
 // Shared primitive helpers
@@ -72,12 +74,71 @@ pub(crate) fn decode_ext_constrained(
     }
 }
 
-fn encode_bit_rate(encoder: &mut AperEncoder, value: u64) -> NgapResult<()> {
-    encode_ext_constrained(encoder, value as i64, 0, BIT_RATE_MAX)
+/// The Bit Rate a sender puts on the wire for `value` (#1163): `value`, or
+/// [`BIT_RATE_MAX`] for anything past it.
+///
+/// A value past the root of `BitRate ::= INTEGER (0..4000000000000, ...)`
+/// would go out as an extension value (X.691 §12.1), which no release of
+/// TS 38.413 defines. A receiver treats an undefined value as an Abstract
+/// Syntax Error and acts on the IE's criticality (§10.3.1 case 2) -- `reject`
+/// for the PDU Session AMBR and the QoS flow lists -- so the session would
+/// fail. 4 Tbit/s is the largest rate NGAP expresses, and nothing reaches it,
+/// so the clamped rate limits nothing the requested one would not.
+pub fn clamp_bit_rate(value: u64) -> u64 {
+    if value > BIT_RATE_MAX {
+        log::warn!("Bit Rate {value} bit/s is past TS 38.413 §9.3.1.4's {BIT_RATE_MAX}; sent as {BIT_RATE_MAX}");
+        BIT_RATE_MAX
+    } else {
+        value
+    }
 }
 
-fn decode_bit_rate(decoder: &mut AperDecoder) -> NgapResult<u64> {
-    Ok(decode_ext_constrained(decoder, 0, BIT_RATE_MAX)? as u64)
+/// Encode a Bit Rate (TS 38.413 §9.3.1.4), clamped by [`clamp_bit_rate`]:
+/// always a root value, so the extension bit is 0.
+pub(crate) fn encode_bit_rate(encoder: &mut AperEncoder, value: u64) -> NgapResult<()> {
+    encode_ext_constrained(
+        encoder,
+        clamp_bit_rate(value) as i64,
+        0,
+        BIT_RATE_MAX as i64,
+    )
+}
+
+/// Decode a Bit Rate (TS 38.413 §9.3.1.4): a root value, or an extension
+/// value a later release's peer may send, in the unconstrained form of X.691
+/// §12.2.6 (a length, then the two's-complement octets). An extension value
+/// past `i64::MAX` takes nine octets, the first 0x00, and every `u64` is
+/// read; a negative one, or one past `u64::MAX`, is not a rate and is refused.
+pub(crate) fn decode_bit_rate(decoder: &mut AperDecoder) -> NgapResult<u64> {
+    if !decoder.read_bit()? {
+        let constraint = Constraint::new(0, BIT_RATE_MAX as i64);
+        return Ok(decoder.decode_constrained_whole_number(&constraint)? as u64);
+    }
+    let len = decoder.decode_length_determinant()?;
+    decoder.align();
+    let bytes = decoder.read_bytes(len)?;
+    let rate = match bytes.split_first() {
+        Some((&first, rest)) if first & 0x80 == 0 => {
+            // A leading 0x00 is the sign octet of a value with its top bit set.
+            let magnitude = if first == 0 && !rest.is_empty() {
+                rest
+            } else {
+                &bytes[..]
+            };
+            (magnitude.len() <= 8).then(|| {
+                magnitude
+                    .iter()
+                    .fold(0u64, |acc, &b| (acc << 8) | u64::from(b))
+            })
+        }
+        _ => None,
+    };
+    rate.ok_or_else(|| {
+        invalid(
+            "BitRate",
+            format!("extension value {bytes:02x?} is not a rate in 0..=u64::MAX"),
+        )
+    })
 }
 
 pub(crate) fn invalid(ie_name: &'static str, reason: String) -> NgapError {
@@ -3458,5 +3519,100 @@ mod tests {
         let decoded = PduSessionResourceSetupRequestTransfer::decode(&with).unwrap();
         assert!(decoded.direct_forwarding_path_availability);
         assert_eq!(decoded, transfer);
+    }
+
+    fn ambr_bytes(dl: u64, ul: u64) -> Vec<u8> {
+        let mut encoder = AperEncoder::new();
+        PduSessionAggregateMaximumBitRate { dl, ul }
+            .encode(&mut encoder)
+            .expect("encode");
+        encoder.align();
+        encoder.into_bytes().to_vec()
+    }
+
+    fn ambr_of(bytes: &[u8]) -> NgapResult<(u64, u64)> {
+        let mut decoder = AperDecoder::new(bytes);
+        PduSessionAggregateMaximumBitRate::decode(&mut decoder).map(|a| (a.dl, a.ul))
+    }
+
+    /// #1163: BitRate ::= INTEGER (0..4000000000000, ...) (TS 38.413 §9.3.1.4).
+    /// A rate past the root goes out as 4000000000000 -- the root's bytes, which
+    /// decode -- where it used to be refused by this encoder and sent as an
+    /// extension value by the generated one.
+    #[test]
+    fn a_bit_rate_past_the_root_round_trips_as_the_maximum() {
+        let max = ambr_bytes(BIT_RATE_MAX, 1);
+        assert_eq!(ambr_of(&max).unwrap(), (BIT_RATE_MAX, 1));
+        for past in [BIT_RATE_MAX + 1, i64::MAX as u64 + 1, u64::MAX] {
+            let bytes = ambr_bytes(past, 1);
+            assert_eq!(bytes, max, "{past}: the root's bytes for the maximum");
+            assert_eq!(ambr_of(&bytes).unwrap(), (BIT_RATE_MAX, 1), "{past}");
+        }
+        let gbr = GbrQosInformation {
+            maximum_flow_bit_rate_dl: u64::MAX,
+            maximum_flow_bit_rate_ul: BIT_RATE_MAX + 1,
+            guaranteed_flow_bit_rate_dl: BIT_RATE_MAX,
+            guaranteed_flow_bit_rate_ul: 7,
+            notification_control: false,
+            maximum_packet_loss_rate_dl: None,
+            maximum_packet_loss_rate_ul: None,
+        };
+        let mut encoder = AperEncoder::new();
+        gbr.encode(&mut encoder).expect("encode");
+        encoder.align();
+        let back = GbrQosInformation::decode(&mut AperDecoder::new(&encoder.into_bytes()))
+            .expect("decode");
+        assert_eq!(
+            (
+                back.maximum_flow_bit_rate_dl,
+                back.maximum_flow_bit_rate_ul,
+                back.guaranteed_flow_bit_rate_dl,
+                back.guaranteed_flow_bit_rate_ul
+            ),
+            (BIT_RATE_MAX, BIT_RATE_MAX, BIT_RATE_MAX, 7)
+        );
+    }
+
+    /// #1163: an extension value of BitRate (X.691 §12.1: extension bit 1, then
+    /// the unconstrained form of §12.2.6, a length and the two's-complement
+    /// octets), which a later release's peer may send, is read across the whole
+    /// `u64`; a negative one, or one past `u64::MAX`, is refused.
+    #[test]
+    fn an_extension_bit_rate_is_read_up_to_u64_max() {
+        // AMBR preamble 00, DL extension bit 1 -> 0x20; then the length and the
+        // octets; then UL = 1 in the root form (`0 000` + `01`).
+        let with_dl = |octets: &[u8]| {
+            let mut b = vec![0x20, octets.len() as u8];
+            b.extend_from_slice(octets);
+            b.extend_from_slice(&[0x00, 0x01]);
+            b
+        };
+        for (octets, rate) in [
+            (&[0x03, 0xa3, 0x52, 0x94, 0x40, 0x01][..], BIT_RATE_MAX + 1),
+            (
+                &[0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff][..],
+                i64::MAX as u64,
+            ),
+            (&[0x00, 0x80, 0, 0, 0, 0, 0, 0, 0][..], i64::MAX as u64 + 1),
+            (
+                &[0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff][..],
+                u64::MAX,
+            ),
+        ] {
+            assert_eq!(
+                ambr_of(&with_dl(octets)).unwrap(),
+                (rate, 1),
+                "{octets:02x?}"
+            );
+        }
+        for octets in [
+            &[0xff][..],                                                       // -1
+            &[0x80, 0, 0, 0, 0, 0, 0, 0][..],                                  // i64::MIN
+            &[0x01, 0, 0, 0, 0, 0, 0, 0, 0][..],                               // 2^64
+            &[0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff][..], // ten octets
+            &[][..],                                                           // no octets
+        ] {
+            assert!(ambr_of(&with_dl(octets)).is_err(), "{octets:02x?}");
+        }
     }
 }

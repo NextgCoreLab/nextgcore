@@ -1387,6 +1387,38 @@ pub async fn call_smf_deactivate_up_connection(
     Ok(())
 }
 
+/// #686 PR 2, an AMF change (TS 29.502 §5.2.2.3.1, Table 6.1.6.2.2-1): tell the SMF that
+/// this AMF now serves the SM context. The UpdateSMContext carries the new AMF's
+/// `servingNfId`, with the `smContextStatusUri`, `guami` and `servingNetwork` the table
+/// makes conditional on it. The SMF's notifications and N1N2 transfers then come here
+/// rather than to the AMF that failed (TS 23.501 §5.21.2.3: the new AMF updates the
+/// peers).
+pub async fn call_smf_update_serving_amf(
+    smf_host: &str,
+    smf_port: u16,
+    sm_context_ref: &str,
+    serving: &serde_json::Value,
+) -> SbiResult<()> {
+    let client = crate::attach_oauth2(
+        SbiClient::for_peer(smf_host, smf_port),
+        nextgcore_sbi::types::NfType::Smf,
+    );
+    let path = format!("/nsmf-pdusession/v1/sm-contexts/{sm_context_ref}/modify");
+    let request =
+        SbiRequest::post(&path).with_body(serving.to_string(), content_type::APPLICATION_JSON);
+    let response = client
+        .send_request(request)
+        .await
+        .map_err(|e| SbiError::RequestFailed(format!("SMF serving-AMF update failed: {e}")))?;
+    if !response.is_success() {
+        return Err(SbiError::RequestFailed(format!(
+            "SMF serving-AMF update returned status {}",
+            response.status
+        )));
+    }
+    Ok(())
+}
+
 /// Ask the SMF to re-activate a session's user plane (#518): Nsmf_PDUSession_
 /// UpdateSMContext with `upCnxState: ACTIVATING` (TS 29.502 §5.2.2.3.2.2, TS 23.502
 /// §4.2.3.2 step 4). Returns the `n2SmInfo` the SMF answers with -- the
