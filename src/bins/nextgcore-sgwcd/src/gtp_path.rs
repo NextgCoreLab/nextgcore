@@ -3180,7 +3180,9 @@ mod tests {
     /// after `delay`, which is what makes "no Create Session Response until the SGW-U
     /// answers" observable rather than asserted.
     struct StandInSgwu {
-        /// Requests the stand-in received, as (msg_type, seid, body).
+        /// Datagrams the stand-in received, as (msg_type, seid, body): one entry
+        /// per datagram, PFCP T1 retransmissions included. To count or index
+        /// requests use [`Self::received`] and [`Self::requests`] (#1160 review).
         seen: std::sync::Arc<std::sync::Mutex<Vec<(u8, Option<u64>, Vec<u8>)>>>,
         /// The stand-in's own socket, so a test can push a Session Report Request at the
         /// SGW-C the way a real SGW-U reports buffered downlink data.
@@ -3202,6 +3204,23 @@ mod tests {
         /// How many distinct requests of `msg_type` the stand-in received: a PFCP
         /// T1 retransmission keeps its sequence number and is the same request
         /// (#1158: counting it made `received(54) == 1` flake under load).
+        /// The bodies of the distinct requests of `msg_type`, in arrival order: a
+        /// T1 retransmission (same sequence number) is not a second request
+        /// (#1160 review). Indexes agree with [`Self::received`].
+        fn requests(&self, msg_type: u8) -> Vec<Vec<u8>> {
+            let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+            let seqs = self.seqs.lock().unwrap_or_else(|e| e.into_inner());
+            let mut taken: Vec<u32> = Vec::new();
+            let mut bodies = Vec::new();
+            for ((t, _, body), (_, seq)) in seen.iter().zip(seqs.iter()) {
+                if *t == msg_type && !taken.contains(seq) {
+                    taken.push(*seq);
+                    bodies.push(body.clone());
+                }
+            }
+            bodies
+        }
+
         fn received(&self, msg_type: u8) -> usize {
             let mut numbers: Vec<u32> = self
                 .seqs
@@ -3460,6 +3479,11 @@ mod tests {
             "all three datagrams arrived"
         );
         assert_eq!(sgwu.received(54), 2, "the retransmission counts once");
+        assert_eq!(
+            sgwu.requests(54).len(),
+            2,
+            "requests() agrees with received(), so it can be indexed by it"
+        );
     }
 
     /// Receive one S11 message with a bounded wait, from a blocking socket inside an async
@@ -5798,13 +5822,9 @@ mod tests {
             assert_eq!(dl.remote_ip.ipv4, expect_v4);
 
             let body = sgwu
-                .seen
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|(t, _, _)| *t == 52)
+                .requests(52)
+                .into_iter()
                 .nth(before)
-                .map(|(_, _, b)| b.clone())
                 .expect("the Session Modification reached the SGW-U");
             let req =
                 nextgcore_pfcp::message::SessionModificationRequest::decode(&mut Bytes::from(body))
