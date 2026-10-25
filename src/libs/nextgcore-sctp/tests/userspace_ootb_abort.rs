@@ -294,6 +294,10 @@ fn reseal(mut packet: Vec<u8>) -> Vec<u8> {
 /// at most the burst plus the refill in ABORTs, not one ABORT per packet. The rest is
 /// counted as suppressed.
 ///
+/// The ABORTs are read off the flooding socket as they come, after every packet, so
+/// they never queue in its receive buffer: a buffer that overflowed would drop some
+/// and break `received == answered` on a loaded machine (#1246 review).
+///
 /// REVERT-VERIFIED: with no limit, every one of the 300 packets is answered.
 #[tokio::test]
 async fn a_flood_of_out_of_the_blue_packets_is_answered_at_the_bounded_rate() {
@@ -305,6 +309,15 @@ async fn a_flood_of_out_of_the_blue_packets_is_answered_at_the_bounded_rate() {
     let flood = UdpSocket::bind("127.0.0.1:0").await.expect("bind flooder");
     const PACKETS: u32 = 300;
     let started = Instant::now();
+    let mut aborts = 0u64;
+    let mut buf = [0u8; 64];
+    let mut count_aborts = |flood: &UdpSocket, aborts: &mut u64| {
+        while let Ok((n, _)) = flood.try_recv_from(&mut buf) {
+            if n >= 16 && buf[12] == 6 {
+                *aborts += 1;
+            }
+        }
+    };
     for vtag in 0..PACKETS {
         // A DATA chunk (type 0) under a tag no association has.
         let mut p = vec![0x13, 0x88, 0x96, 0x2C];
@@ -315,6 +328,7 @@ async fn a_flood_of_out_of_the_blue_packets_is_answered_at_the_bounded_rate() {
         set_checksum(&mut p);
         flood.send_to(&p, addr).await.expect("send");
         let _ = server.recv(Duration::from_millis(5)).await;
+        count_aborts(&flood, &mut aborts);
     }
     while server
         .recv(Duration::from_millis(20))
@@ -323,12 +337,15 @@ async fn a_flood_of_out_of_the_blue_packets_is_answered_at_the_bounded_rate() {
     {}
     let elapsed = started.elapsed().as_secs_f64();
 
-    let mut aborts = 0u64;
-    let mut buf = [0u8; 64];
-    while let Ok(Ok((n, _))) = timeout(Duration::from_millis(200), flood.recv_from(&mut buf)).await
+    // The last answers: wait for the socket, then read what it holds.
+    while timeout(Duration::from_millis(200), flood.readable())
+        .await
+        .is_ok_and(|r| r.is_ok())
     {
-        if n >= 16 && buf[12] == 6 {
-            aborts += 1;
+        let before = aborts;
+        count_aborts(&flood, &mut aborts);
+        if aborts == before {
+            break;
         }
     }
     let (answered, suppressed) = server.ootb_answer_counts();
