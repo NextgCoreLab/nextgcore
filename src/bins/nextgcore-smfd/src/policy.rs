@@ -587,6 +587,11 @@ fn nsacf_cache_key(nrf_uri: &str, sst: u8, sd: Option<&str>, plmn: Option<(&str,
     )
 }
 
+/// An owned `(mcc, mnc)` as the borrowed pair the NSACF resolution takes.
+pub fn plmn_ref(plmn: &Option<(String, String)>) -> Option<(&str, &str)> {
+    plmn.as_ref().map(|(mcc, mnc)| (mcc.as_str(), mnc.as_str()))
+}
+
 /// TS 29.571 §5.4.4.2 Snssai `sd`: `^[A-Fa-f0-9]{6}$` (#1164 follow-up).
 pub fn valid_sd(sd: &str) -> bool {
     sd.len() == 6 && sd.bytes().all(|b| b.is_ascii_hexdigit())

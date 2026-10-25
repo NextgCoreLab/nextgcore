@@ -1666,6 +1666,11 @@ pub struct PolicyBinding {
     /// `NSACF_URI`; the DECREASE then resolves the NSACF again.
     #[serde(default)]
     pub nsac_nsacf: Option<crate::policy::NsacfEndpoint>,
+    /// The serving PLMN `(mcc, mnc)` the admission's NSACF was resolved for (#1164
+    /// follow-up 2), so a DECREASE that has to resolve the NSACF again reads the same
+    /// `perPlmnSnssaiList` entry.
+    #[serde(default)]
+    pub nsac_plmn: Option<(String, String)>,
 }
 
 impl PolicyBinding {
@@ -1703,6 +1708,7 @@ impl PolicyBinding {
             nsac_admitted: false,
             nsac_nf_id: None,
             nsac_nsacf: None,
+            nsac_plmn: None,
         }
     }
 }

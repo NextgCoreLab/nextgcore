@@ -41,7 +41,11 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   §6.1.6.2.3), reads a `perPlmnSnssaiList` for the serving PLMN only, skips an instance whose
   endpoint cannot be read (and reaches an FQDN-only one by its FQDN) rather than giving up, and
   an SM Context Create whose S-NSSAI SD is not 6 hex digits (TS 29.571 §5.4.4.2) is answered 400
-  INVALID_MSG_FORMAT (#1164).
+  INVALID_MSG_FORMAT (#1164). That answer is an SmContextCreateError carrying the N1 PDU SESSION
+  ESTABLISHMENT REJECT (5GSM cause #31) when the request carried an N1 SM message (TS 29.502
+  §5.2.2.2.1), so the UE is answered at once rather than running out T3580. A DECREASE that has to
+  resolve its NSACF again (no NSACF recorded) resolves it for the serving PLMN the session was
+  admitted in, which the policy binding now records (#1164).
 - smfd ignores the Recovery Time Stamp in a PFCP Association Setup Response, and keeps a UPF's
   Recovery Time Stamp in memory only (TS 23.007 §19A; TS 29.244 Table 7.4.4.2-1 NOTE). A new
   association starts with no stored stamp, and its first Heartbeat stamp is the baseline. Whether
