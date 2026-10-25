@@ -1089,6 +1089,10 @@ pub struct NgapServer {
     /// [`ESTABLISHMENT_RETRY_WINDOW`] has passed. See
     /// [`NgapServer::process_pending_establishments`].
     pending_establishments: HashMap<(u64, u8), PendingEstablishment>,
+    /// #923: the UE Context Release Commands sent for a UE the AMF keeps
+    /// (registered, to go CM-IDLE), keyed by (association, AMF UE NGAP ID), until
+    /// their Release Complete. See [`NgapServer::process_release_guards`].
+    outstanding_releases: HashMap<(u64, u64), OutstandingRelease>,
     /// SBI work run off this task (#796 review M1): the re-selection attempts.
     sbi_offload: crate::sbi_offload::SbiOffload,
     /// #748: the UCMF Assigns in flight for re-assignment, one per (TAC, UE radio
@@ -1401,6 +1405,21 @@ const MAX_OFFLOADED_SBI: usize = 16;
 /// an answer before it retransmits. An SMF restarting in place is back well
 /// within it.
 const ESTABLISHMENT_RETRY_WINDOW: Duration = Duration::from_secs(12);
+
+/// A UE Context Release Command waiting for its Release Complete (#923).
+#[derive(Debug, Clone, Copy)]
+struct OutstandingRelease {
+    ran_ue_ngap_id: u32,
+    /// Past this the release is completed locally.
+    deadline: Instant,
+}
+
+/// How long the AMF waits for the UE Context Release Complete of a Release
+/// Command it sent for a UE it keeps (#923). TS 38.413 §8.3.3 defines no timer:
+/// the NG-RAN node answers once it has released the UE context, well within
+/// this. Past it, the release is completed locally, as the Complete would have
+/// (CM-IDLE, user plane DEACTIVATED, mobile reachable timer).
+const RELEASE_COMPLETE_GUARD: Duration = Duration::from_secs(5);
 /// The spacing of the re-selection attempts within the window.
 const ESTABLISHMENT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 /// At most this many establishments wait at once. Beyond it, one is answered
@@ -1582,6 +1601,7 @@ impl NgapServer {
             up_active: std::collections::HashSet::new(),
             last_session_sweep: std::time::Instant::now(),
             pending_establishments: HashMap::new(),
+            outstanding_releases: HashMap::new(),
             racs_assigns: HashMap::new(),
             supersede_barriers: HashMap::new(),
             held_positioning: Vec::new(),
@@ -1628,8 +1648,10 @@ impl NgapServer {
         self.sessions.read().await.len()
     }
 
-    /// Poll for incoming NGAP messages and server events
-    pub async fn poll(&mut self) -> Result<bool> {
+    /// The timers of this server's own UEs, run first on every [`Self::poll`]. Unlike
+    /// the rest of `poll`, nothing here drains a process-global queue, so a unit test
+    /// can drive it without taking work other tests own (#1120 review).
+    async fn process_local_timers(&mut self) -> Result<()> {
         // Check GMM procedure timers (T3550/T3555/T3560/T3570/T3522 retransmission)
         self.process_nas_timers().await?;
 
@@ -1639,6 +1661,15 @@ impl NgapServer {
 
         // #806: source NG-RAN releases waiting for the step 6a timer.
         self.process_pending_source_releases().await;
+
+        // #923: Release Commands whose Release Complete did not come.
+        self.process_release_guards().await;
+        Ok(())
+    }
+
+    /// Poll for incoming NGAP messages and server events
+    pub async fn poll(&mut self) -> Result<bool> {
+        self.process_local_timers().await?;
 
         // Keep the RAN's view of overload in step with the NAS congestion posture.
         // A no-op unless the posture just changed, and the posture is off by default.
@@ -12348,6 +12379,97 @@ impl NgapServer {
                     (None, None)
                 }
             };
+        self.apply_release_complete(association_id, amf_ue_ngap_id, ran_ue_ngap_id)
+            .await
+    }
+
+    /// Record a UE Context Release Command sent on `association_id` for a UE the
+    /// AMF keeps (#923), so a lost or unusable Release Complete cannot leave it
+    /// CM-CONNECTED.
+    fn note_release_command(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+    ) {
+        self.outstanding_releases.insert(
+            (association_id, amf_ue_ngap_id),
+            OutstandingRelease {
+                ran_ue_ngap_id,
+                deadline: Instant::now() + RELEASE_COMPLETE_GUARD,
+            },
+        );
+    }
+
+    /// Complete locally every outstanding Release Command whose Complete has not
+    /// come within [`RELEASE_COMPLETE_GUARD`] (#923), as the Complete would have.
+    async fn process_release_guards(&mut self) {
+        if self.outstanding_releases.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let expired: Vec<((u64, u64), OutstandingRelease)> = self
+            .outstanding_releases
+            .iter()
+            .filter(|(_, r)| r.deadline <= now)
+            .map(|(k, r)| (*k, *r))
+            .collect();
+        for ((association_id, amf_ue_ngap_id), r) in expired {
+            log::warn!(
+                "UE {amf_ue_ngap_id}: no UE Context Release Complete from association \
+                 {association_id} (ran_ue_ngap_id={}) within {RELEASE_COMPLETE_GUARD:?}; \
+                 the release is completed locally",
+                r.ran_ue_ngap_id
+            );
+            if let Err(e) = self
+                .apply_release_complete(
+                    association_id,
+                    Some(amf_ue_ngap_id),
+                    Some(r.ran_ue_ngap_id),
+                )
+                .await
+            {
+                log::warn!("UE {amf_ue_ngap_id}: local release completion failed: {e}");
+            }
+        }
+    }
+
+    /// What a UE Context Release Complete naming `amf_ue_ngap_id` (and
+    /// `ran_ue_ngap_id`) on `association_id` does. One that names no UE completes
+    /// the association's only outstanding Release Command, if it has exactly one
+    /// (#923): that is the command it answers.
+    async fn apply_release_complete(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: Option<u64>,
+        ran_ue_ngap_id: Option<u32>,
+    ) -> Result<()> {
+        let (amf_ue_ngap_id, ran_ue_ngap_id) = match amf_ue_ngap_id {
+            Some(id) => {
+                self.outstanding_releases.remove(&(association_id, id));
+                (Some(id), ran_ue_ngap_id)
+            }
+            None => {
+                let mut on_association = self
+                    .outstanding_releases
+                    .iter()
+                    .filter(|((assoc, _), _)| *assoc == association_id)
+                    .map(|((_, id), r)| (*id, r.ran_ue_ngap_id));
+                match (on_association.next(), on_association.next()) {
+                    (Some((id, ran)), None) => {
+                        self.outstanding_releases.remove(&(association_id, id));
+                        log::warn!(
+                            "UE Context Release Complete on association {association_id} \
+                             names no usable UE; it answers the association's only \
+                             outstanding Release Command, for UE {id} \
+                             (ran_ue_ngap_id={ran})"
+                        );
+                        (Some(id), Some(ran))
+                    }
+                    _ => (None, None),
+                }
+            }
+        };
         // #758: the released NG connection's contextless allocation goes with it, so
         // the gNB cannot later mint a context under the released ID.
         if let Some(id) = amf_ue_ngap_id {
@@ -12967,6 +13089,9 @@ impl NgapServer {
         // the permits it held for other UEs.
         self.sbi_offload.cancel_ue(amf_ue_ngap_id);
 
+        // #923: nor a Release Command's Complete.
+        self.outstanding_releases
+            .retain(|(_, ue), _| *ue != amf_ue_ngap_id);
         // #796: nothing waits for an SMF on behalf of a UE that is gone.
         self.pending_establishments
             .retain(|(ue, _), _| *ue != amf_ue_ngap_id);
@@ -17228,6 +17353,7 @@ impl NgapServer {
             return Ok(());
         };
         self.send_to_association(association_id, &cmd).await?;
+        self.note_release_command(association_id, amf_ue_ngap_id, ran_ue_ngap_id);
         log::info!(
             "UE {amf_ue_ngap_id}: registration update complete with no follow-on request and \
              no user plane; NAS signalling connection released (TS 24.501 §5.3.1.3)"
@@ -18550,6 +18676,7 @@ impl NgapServer {
             );
             if let Some(cmd) = release_cmd {
                 self.send_to_association(association_id, &cmd).await?;
+                self.note_release_command(association_id, amf_id, ran_id);
                 log::info!("UE Context Release Command sent to gNB");
             }
         }
@@ -35904,6 +36031,144 @@ mod tests {
             for id in [connected, idle, dereg] {
                 ngap.ue_auth_state.remove(id);
             }
+        }
+    }
+
+    /// **#923.** The gNB asks for a UE's release; the AMF's UE Context Release
+    /// Command is answered by a Release Complete the AMF cannot use (undecodable,
+    /// or a not-comprehended IE marked reject, TS 38.413 §10.3.4.2). It is the only
+    /// Release Command outstanding on the association, so it is the one answered:
+    /// the UE goes CM-IDLE under the mobile reachable timer (TS 24.501 §5.3.7), as
+    /// the matching Complete would have put it.
+    ///
+    /// REVERT-VERIFIED: without the outstanding-command match the UE stays
+    /// CM-CONNECTED and unsupervised.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unusable_release_complete_answers_the_only_outstanding_command() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = capturing_ngap_server().await;
+        let assoc = 99_231u64;
+        let valid = nextgcore_ngap::builder::build_ue_context_release_complete(
+            &nextgcore_ngap::types::UeContextReleaseComplete {
+                amf_ue_ngap_id: 7_923_999,
+                ran_ue_ngap_id: 9,
+            },
+        )
+        .expect("encode");
+        let reject_ie = crate::ngap_asn1::tests::with_unknown_ie(&valid, 9_999, 0x00);
+        for (n, unusable) in [vec![0x20, 0x29, 0x00], reject_ie].into_iter().enumerate() {
+            let (ue, ran) = (7_923_001u64 + n as u64, 31 + n as u32);
+            let mut state = UeNasContext::new(ue, ran, assoc, false);
+            state.registered = true;
+            ngap.ue_auth_state.insert(ue, state);
+            ngap.handle_ue_context_release(assoc, &release_request_pdu(ue, ran))
+                .await
+                .expect("handled");
+            assert!(
+                !take_sent_ngap(&mut ngap).is_empty(),
+                "case {n}: the Release Command went out"
+            );
+            assert!(!ngap.ue_auth_state.get(ue).unwrap().is_cm_idle());
+
+            ngap.handle_ue_context_release_complete(assoc, &unusable)
+                .await
+                .expect("handled");
+
+            let s = ngap.ue_auth_state.get(ue).expect("UE kept");
+            assert!(s.is_cm_idle(), "case {n}: the release is complete");
+            assert_eq!(
+                s.reachability.map(|r| r.phase),
+                Some(ReachabilityPhase::MobileReachable),
+                "case {n}: the mobile reachable timer runs"
+            );
+            assert!(ngap.outstanding_releases.is_empty());
+            ngap.forget_ue(ue);
+        }
+    }
+
+    /// **#923.** With two Release Commands outstanding on the association, an
+    /// unusable Release Complete cannot say which it answers, and completes
+    /// neither. Nor does a Complete that never comes leave them CM-CONNECTED: past
+    /// [`RELEASE_COMPLETE_GUARD`] each release is completed locally (CM-IDLE, mobile
+    /// reachable timer). A UE whose matching Complete came is not touched again.
+    ///
+    /// REVERT-VERIFIED: without `process_release_guards` in `process_local_timers`
+    /// both UEs stay CM-CONNECTED; without the cleanup in `forget_ue` the forgotten
+    /// UE keeps its entry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_release_command_with_no_usable_complete_is_completed_at_the_guard() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = capturing_ngap_server().await;
+        let assoc = 99_232u64;
+        let ues = [(7_923_101u64, 41u32), (7_923_102, 42), (7_923_103, 43)];
+        for (ue, ran) in ues {
+            let mut state = UeNasContext::new(ue, ran, assoc, false);
+            state.registered = true;
+            ngap.ue_auth_state.insert(ue, state);
+            ngap.handle_ue_context_release(assoc, &release_request_pdu(ue, ran))
+                .await
+                .expect("handled");
+        }
+        let _ = take_sent_ngap(&mut ngap);
+        // The third UE's Complete comes; then one that names no UE.
+        ngap.handle_ue_context_release_complete(assoc, &release_complete_pdu(ues[2].0, Some(43)))
+            .await
+            .expect("handled");
+        let third_deadline = ngap
+            .ue_auth_state
+            .get(ues[2].0)
+            .and_then(|s| s.reachability)
+            .map(|r| r.deadline)
+            .expect("supervised");
+        ngap.handle_ue_context_release_complete(assoc, &[0x20, 0x29, 0x00])
+            .await
+            .expect("handled");
+        for (ue, _) in &ues[..2] {
+            assert!(
+                !ngap.ue_auth_state.get(*ue).unwrap().is_cm_idle(),
+                "UE {ue}: an ambiguous Complete completes nothing"
+            );
+        }
+        // Before the guard, nothing either.
+        ngap.process_local_timers().await.expect("timers");
+        assert_eq!(ngap.outstanding_releases.len(), 2);
+
+        // A UE forgotten meanwhile (e.g. de-registered) takes its entry with it.
+        let gone = 7_923_104u64;
+        let mut state = UeNasContext::new(gone, 44, assoc, false);
+        state.registered = true;
+        ngap.ue_auth_state.insert(gone, state);
+        ngap.handle_ue_context_release(assoc, &release_request_pdu(gone, 44))
+            .await
+            .expect("handled");
+        assert!(ngap.outstanding_releases.contains_key(&(assoc, gone)));
+        ngap.forget_ue(gone);
+        assert!(!ngap.outstanding_releases.contains_key(&(assoc, gone)));
+
+        // The NGAP task's local timers run the guard.
+        for r in ngap.outstanding_releases.values_mut() {
+            r.deadline = Instant::now();
+        }
+        ngap.process_local_timers().await.expect("timers");
+        for (ue, _) in &ues[..2] {
+            let s = ngap.ue_auth_state.get(*ue).expect("UE kept");
+            assert!(s.is_cm_idle(), "UE {ue}: completed locally");
+            assert_eq!(
+                s.reachability.map(|r| r.phase),
+                Some(ReachabilityPhase::MobileReachable)
+            );
+        }
+        assert!(ngap.outstanding_releases.is_empty());
+        assert_eq!(
+            ngap.ue_auth_state
+                .get(ues[2].0)
+                .and_then(|s| s.reachability)
+                .map(|r| r.deadline),
+            Some(third_deadline),
+            "the UE whose Complete came is not re-armed"
+        );
+        for (ue, _) in ues {
+            ngap.forget_ue(ue);
         }
     }
 
