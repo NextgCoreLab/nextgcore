@@ -121,6 +121,9 @@ pub fn fail_with_cause(continuation: S11Continuation, cause: u8) {
         S11Continuation::Restoration { sess_id } => {
             crate::pfcp_path::restoration_failed(sess_id, &format!("cause {cause}"))
         }
+        S11Continuation::ReleasePdn { sess_id } => {
+            log::warn!("Deleting session {sess_id} failed (cause {cause}): it is KEPT")
+        }
         S11Continuation::CreateSession { peer, seq, teid } => {
             answer(
                 peer,
@@ -168,6 +171,9 @@ pub fn fail(continuation: S11Continuation, reason: &str) {
         S11Continuation::None => {}
         S11Continuation::Restoration { sess_id } => {
             crate::pfcp_path::restoration_failed(sess_id, &format!("no answer ({reason})"))
+        }
+        S11Continuation::ReleasePdn { sess_id } => {
+            log::warn!("SGW-U never answered deleting session {sess_id} ({reason}): it is KEPT")
         }
         S11Continuation::CreateSession { peer, seq, teid } => {
             log::error!(
@@ -546,6 +552,15 @@ fn deletion_response(sess_id: u64, continuation: S11Continuation, body: &[u8]) {
 
     let result = sxa_handler::handle_session_deletion_response(sess.as_ref(), 0, pfcp_cause);
 
+    if let S11Continuation::ReleasePdn { sess_id } = continuation {
+        release_pdn_done(
+            sess_id,
+            sess.as_ref().map(|s| s.sgwc_ue_id),
+            matches!(result, HandlerResult::Error(_)),
+        );
+        return;
+    }
+
     let S11Continuation::DeleteSession {
         peer,
         seq,
@@ -586,6 +601,29 @@ fn deletion_response(sess_id: u64, continuation: S11Continuation, body: &[u8]) {
                 seq,
                 gtp_cause::REQUEST_ACCEPTED,
             );
+        }
+    }
+}
+
+/// The SGW-U answered the deletion of a PDN connection a Delete Bearer Response
+/// released (#710). Accepted: the session goes, and the UE context with it when it
+/// has no other. Refused: it is kept, like a refused Delete Session, so it can still
+/// be deleted.
+fn release_pdn_done(sess_id: u64, ue_id: Option<u64>, refused: bool) {
+    let ctx = sgwc_self();
+    if refused {
+        log::warn!("SGW-U refused deleting session {sess_id}: it is KEPT");
+        return;
+    }
+    // `handle_session_deletion_response` has removed the session already.
+    ctx.sess_remove(sess_id);
+    log::info!("Session {sess_id} removed after the SGW-U confirmed the deletion");
+    if let Some(ue_id) = ue_id {
+        if ctx
+            .ue_find_by_id(ue_id)
+            .is_some_and(|ue| ue.sess_ids.is_empty())
+        {
+            ctx.ue_remove(ue_id);
         }
     }
 }
