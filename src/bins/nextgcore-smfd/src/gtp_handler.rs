@@ -444,6 +444,9 @@ pub fn handle_create_session_request(
             sess.sgw_s5c_ip.ipv6 = Some(addr);
         }
     }
+    // #1198 review B1: which SGW-C incarnation this PDN connection belongs to.
+    sess.sgw_restart_counter = req.recovery;
+    sess.sgw_attached_at = Some(std::time::Instant::now());
 
     log::debug!(
         "    SGW_S5C_TEID[0x{:x}] SMF_N4_TEID[0x{:x}]",
@@ -541,11 +544,17 @@ pub fn handle_modify_bearer_request(
     // Update SGW S5C TEID if present
     let sgw_relocation = if let Some(ref f_teid) = req.sender_f_teid {
         sess.sgw_s5c_teid = f_teid.teid;
+        let before = (sess.sgw_s5c_ip.ipv4, sess.sgw_s5c_ip.ipv6);
         if let Some(addr) = f_teid.ipv4_addr {
             sess.sgw_s5c_ip.ipv4 = Some(addr);
         }
         if let Some(addr) = f_teid.ipv6_addr {
             sess.sgw_s5c_ip.ipv6 = Some(addr);
+        }
+        if before != (sess.sgw_s5c_ip.ipv4, sess.sgw_s5c_ip.ipv6) {
+            // #1198 review B1: moved to another SGW-C, of an incarnation not known yet.
+            sess.sgw_restart_counter = None;
+            sess.sgw_attached_at = Some(std::time::Instant::now());
         }
         log::debug!(
             "    SGW_S5C_TEID[0x{:x}] SMF_N4_TEID[0x{:x}]",
@@ -1245,7 +1254,7 @@ pub async fn dispatch_s5s8_request(
             // #1194, TS 29.274 §7.6: a retransmitted request is answered with the
             // response already sent, not served again. Served again, it would now
             // collide with the PDN connection its first copy created and delete it.
-            if !server.begin_command(peer, sequence_number) {
+            let Some(_serving) = server.begin_command_guard(peer, sequence_number) else {
                 match server.cached_response(peer, sequence_number) {
                     Some(response) => {
                         log::debug!(
@@ -1260,9 +1269,9 @@ pub async fn dispatch_s5s8_request(
                     ),
                 }
                 return;
-            }
+            };
+            // #1198 review m3: `_serving` ends the request, even if this panics.
             create_session(server, sequence_number, raw, peer).await;
-            server.end_command(peer, sequence_number);
         }
         // #223: the EPS procedures that make the session model's own handlers reachable.
         // Before this, every one of these fell into the `other` arm below and was answered
@@ -1388,30 +1397,108 @@ async fn delete_pdn_connection_locally(sess: &crate::context::SmfSess, reason: &
     );
 }
 
-/// Delete every EPC PDN connection set up through the SGW-C at `sgw` (TS 23.007
-/// §17.1A.1: "delete all PDN connection table data/MM bearer contexts associated with
-/// the peer node that fails as well as freeing any internal PGW resources"). #1194.
-pub(crate) async fn delete_pdn_connections_of_sgw(sgw: std::net::IpAddr, reason: &str) -> usize {
-    let stale: Vec<crate::context::SmfSess> = match crate::context::smf_self().read() {
-        Ok(ctx) => ctx.sess_find_all_by(|s| {
-            s.epc
-                && match sgw {
-                    std::net::IpAddr::V4(a) => s.sgw_s5c_ip.ipv4 == Some(a),
-                    std::net::IpAddr::V6(a) => s.sgw_s5c_ip.ipv6 == Some(a),
-                }
-        }),
-        Err(_) => return 0,
+/// PDN connection deletions of restarted SGW-Cs still running (#1198 review MAJOR).
+pub(crate) static SGW_RESTART_DELETIONS_RUNNING: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// PDN connections deleted because their SGW-C restarted (#1198 review MAJOR).
+pub(crate) static SGW_RESTART_PDN_CONNECTIONS_DELETED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// How many of one restart's PGW-U Session Deletions run at once (#1198 review MAJOR).
+const SGW_RESTART_DELETE_CONCURRENCY: usize = 16;
+
+/// The EPC PDN connections of the SGW-C at `sgw` that belong to the incarnation before
+/// `restart` (#1194, #1198 review B1).
+///
+/// TS 23.007 §16.1.1/§17.1A.1 have the PGW delete the PDN connections "associated with
+/// the peer node that fails", i.e. the old incarnation's. The new incarnation's must
+/// survive, and they exist before its first Echo whenever its Create Session Requests
+/// carry no Recovery IE (conditional, TS 29.274 Table 7.2.1-1). So a connection is
+/// stale when:
+/// - it was set up under a Restart counter other than the new one, or
+/// - it was set up with no counter known no later than the last message that showed
+///   the OLD counter. One set up after that proof of life is of unknown incarnation
+///   and kept: the old SGW-C's last message precedes its restart, so no connection the
+///   new incarnation set up can be dated before it (short of a pre-restart datagram
+///   delayed past a post-restart one). A kept connection that was in fact the old
+///   one's is cleaned up when its UE re-attaches, by the §7.2.1 collision rule.
+pub(crate) fn stale_pdn_connections_of_sgw(
+    sgw: std::net::IpAddr,
+    restart: &crate::gtp_path::SgwRestart,
+) -> Vec<crate::context::SmfSess> {
+    let handle = crate::context::smf_self();
+    let Ok(ctx) = handle.read() else {
+        return Vec::new();
     };
-    for sess in &stale {
-        delete_pdn_connection_locally(sess, reason).await;
+    ctx.sess_find_all_by(|s| {
+        s.epc
+            && match sgw {
+                std::net::IpAddr::V4(a) => s.sgw_s5c_ip.ipv4 == Some(a),
+                std::net::IpAddr::V6(a) => s.sgw_s5c_ip.ipv6 == Some(a),
+            }
+            && match s.sgw_restart_counter {
+                Some(counter) => counter != restart.current,
+                None => s.sgw_attached_at.is_some_and(|t| t <= restart.old_seen_at),
+            }
+    })
+}
+
+/// Delete the old incarnation's PDN connections of the restarted SGW-C at `sgw` (TS
+/// 23.007 §17.1A.1: "delete all PDN connection table data/MM bearer contexts associated
+/// with the peer node that fails as well as freeing any internal PGW resources"). #1194.
+///
+/// #1198 review MAJOR: the stale set is taken now, so a connection set up afterwards is
+/// not in it; the PGW-U Session Deletions run in a background task, at most
+/// [`SGW_RESTART_DELETE_CONCURRENCY`] at once, so the Create Session Request or Echo
+/// that showed the restart is answered without waiting for thousands of them.
+pub(crate) fn delete_pdn_connections_of_sgw(
+    sgw: std::net::IpAddr,
+    restart: crate::gtp_path::SgwRestart,
+    reason: &'static str,
+) -> tokio::task::JoinHandle<usize> {
+    use std::sync::atomic::Ordering;
+    let stale = stale_pdn_connections_of_sgw(sgw, &restart);
+    SGW_RESTART_DELETIONS_RUNNING.fetch_add(1, Ordering::SeqCst);
+    tokio::spawn(async move {
+        let n = stale.len();
+        if n > 0 {
+            log::warn!(
+                "S5/S8: deleting {n} PDN connection(s) of SGW-C {sgw} (Restart counter {} -> \
+                 {}): {reason}",
+                restart.previous,
+                restart.current
+            );
+        }
+        let permits =
+            std::sync::Arc::new(tokio::sync::Semaphore::new(SGW_RESTART_DELETE_CONCURRENCY));
+        let mut tasks = tokio::task::JoinSet::new();
+        for sess in stale {
+            let Ok(permit) = permits.clone().acquire_owned().await else {
+                break;
+            };
+            tasks.spawn(async move {
+                delete_pdn_connection_locally(&sess, reason).await;
+                SGW_RESTART_PDN_CONNECTIONS_DELETED.fetch_add(1, Ordering::Relaxed);
+                drop(permit);
+            });
+        }
+        while tasks.join_next().await.is_some() {}
+        if n > 0 {
+            log::warn!("S5/S8: {n} PDN connection(s) of SGW-C {sgw} deleted ({reason})");
+        }
+        SGW_RESTART_DELETIONS_RUNNING.fetch_sub(1, Ordering::SeqCst);
+        n
+    })
+}
+
+/// Wait (bounded) until no restarted SGW-C's deletions are running (#1198 review MAJOR).
+#[cfg(test)]
+pub(crate) async fn settle_sgw_restart_deletions_for_test() {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while SGW_RESTART_DELETIONS_RUNNING.load(std::sync::atomic::Ordering::SeqCst) > 0
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    if !stale.is_empty() {
-        log::warn!(
-            "S5/S8: {} PDN connection(s) of SGW-C {sgw} deleted ({reason})",
-            stale.len()
-        );
-    }
-    stale.len()
 }
 
 /// TS 29.274 §7.2.1: the existing context a Create Session Request collides with, by
@@ -1534,10 +1621,14 @@ async fn create_session(
     // #1194, TS 23.007 §18 and §17.1A.1: the Recovery IE is the Restart counter of the
     // GTP-C entity named by the sender F-TEID. A restarted SGW-C holds none of the PDN
     // connections it set up before, so they are deleted here, before this one is set up.
+    // #1198 review m1: one request per IMSI from here to the new connection's creation.
+    let _imsi = server.csr_lock(&req.imsi).await;
     let sgw_entity = sgw_entity(&req, peer);
     if let Some(counter) = req.recovery {
-        if server.note_sgw_restart_counter(sgw_entity, counter) {
-            delete_pdn_connections_of_sgw(sgw_entity, "the SGW-C restarted").await;
+        if let Some(restart) = server.note_sgw_restart_counter(sgw_entity, counter) {
+            // #1198 review MAJOR: the stale set is taken here, the deletions run in the
+            // background and this request is answered without waiting for them.
+            delete_pdn_connections_of_sgw(sgw_entity, restart, "the SGW-C restarted");
         }
     }
     // #1194, TS 29.274 §7.2.1: a request for an [IMSI, EBI, interface type] that already
@@ -2339,16 +2430,16 @@ async fn bearer_resource(
     // so it carries the UE's PTI and the Command's sequence number.
     if let Some(mut request) = new_bearer_request(&cmd, &sess) {
         request.command = Some((peer, sequence_number));
-        if !server.begin_command(peer, sequence_number) {
+        let Some(serving) = server.begin_command_guard(peer, sequence_number) else {
             log::debug!(
                 "S5/S8 Bearer Resource Command seq={sequence_number} from {peer} is a \
                  retransmission of one being served; its Create Bearer Request retransmits on \
                  its own"
             );
             return;
-        }
+        };
         let outcome = crate::eps_bearer::activate(server, sess.id, request).await;
-        server.end_command(peer, sequence_number);
+        drop(serving);
         match outcome {
             Ok(bearer) => log::info!(
                 "S5/S8 Bearer Resource Command for TEID {teid_str}, PTI {}: dedicated bearer \
@@ -5051,6 +5142,8 @@ mod tests {
             &csr_for(0x0011_9433, 0x46, 0x4600_0001, 5, Some(2)),
         )
         .await;
+        // #1198 review MAJOR: the deletions run after the answer.
+        settle_sgw_restart_deletions_for_test().await;
         let gone = (sessions_of(0x44).len(), sessions_of(0x45).len());
         let new = sessions_of(0x46);
         forget_ues(&[0x44, 0x45, 0x46]);
@@ -5103,6 +5196,176 @@ mod tests {
         server.close();
         assert_eq!(kept, 1, "the same counter deletes nothing");
         assert!(gone, "a new counter deletes the SGW-C's PDN connections");
+    }
+
+    /// An Echo Request from `sgw` carrying Restart counter `counter`, answered.
+    async fn echo_with(
+        server: &crate::gtp_path::S5S8Server,
+        sgw: &tokio::net::UdpSocket,
+        seq: u32,
+        counter: u8,
+    ) {
+        let mut echo = nextgcore_gtp::v2::Gtp2Message::echo_request(seq);
+        echo.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::from_slice(
+            Gtp2IeType::Recovery as u8,
+            0,
+            &[counter],
+        ));
+        sgw.send_to(&echo.encode(), server.local_addr())
+            .await
+            .expect("send");
+        let _ = recv_type(sgw, gtp2_message_type::ECHO_RESPONSE).await;
+    }
+
+    /// #1198 review B1, TS 23.007 §16.1.1/§17.1A.1: an Echo-detected restart deletes
+    /// only the OLD incarnation's PDN connections. The same-IP SGW-C restarts (an EKS
+    /// liveness restart keeps the pod IP) and its UE re-attaches with a Create Session
+    /// Request carrying no Recovery IE, before its first Echo shows the new counter.
+    /// That connection is after the old incarnation's last proof of life (Echo 7), so it
+    /// survives Echo 8. One set up before Echo 7 with no counter, and one set up under
+    /// counter 7, are the old incarnation's and go. Before, every connection of the
+    /// SGW-C's address went, the live one included.
+    #[tokio::test]
+    async fn an_echo_restart_keeps_the_new_incarnations_pdn_connections() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _upf = crate::pfcp_path::stand_in::associated_upf().await;
+        let (server, sgw) = s5s8_pair().await;
+        // The old incarnation: one connection with no counter, one under counter 7.
+        create_over_the_wire(
+            &server,
+            &sgw,
+            &csr_for(0x0011_9461, 0x4A, 0x4A00_0001, 5, None),
+        )
+        .await;
+        create_over_the_wire(
+            &server,
+            &sgw,
+            &csr_for(0x0011_9462, 0x4B, 0x4B00_0001, 5, Some(7)),
+        )
+        .await;
+        echo_with(&server, &sgw, 0x0011_9463, 7).await;
+        // The SGW-C restarts as 8; its UE re-attaches, the request carries no Recovery.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        create_over_the_wire(
+            &server,
+            &sgw,
+            &csr_for(0x0011_9464, 0x49, 0x4900_0001, 5, None),
+        )
+        .await;
+        echo_with(&server, &sgw, 0x0011_9465, 8).await;
+        settle_sgw_restart_deletions_for_test().await;
+        let left = (
+            sessions_of(0x49).len(),
+            sessions_of(0x4A).len(),
+            sessions_of(0x4B).len(),
+        );
+        forget_ues(&[0x49, 0x4A, 0x4B]);
+        server.close();
+        assert_eq!(
+            left,
+            (1, 0, 0),
+            "the new incarnation's live PDN connection survives; the old ones go"
+        );
+    }
+
+    /// #1198 review MAJOR: a Create Session Request that shows its SGW-C restarted is
+    /// answered without waiting for the old incarnation's PGW-U Session Deletions, which
+    /// with thousands of connections, or a slow PGW-U, outlast the SGW-C's T3 x N3. Here
+    /// the PGW-U answers each deletion after 2 s; the request is answered well within
+    /// that, and the old connections are still deleted afterwards.
+    #[tokio::test]
+    async fn a_restart_shown_by_a_create_session_is_answered_before_the_cleanup() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        let (server, sgw) = s5s8_pair().await;
+        for (i, last) in [0x4C_u8, 0x4D].into_iter().enumerate() {
+            create_over_the_wire(
+                &server,
+                &sgw,
+                &csr_for(
+                    0x0011_9471 + i as u32,
+                    last,
+                    0x4C00_0001 + i as u32,
+                    5,
+                    Some(3),
+                ),
+            )
+            .await;
+        }
+        upf.delay_deletions(2_000);
+        let started = std::time::Instant::now();
+        create_over_the_wire(
+            &server,
+            &sgw,
+            &csr_for(0x0011_9475, 0x4E, 0x4E00_0001, 5, Some(4)),
+        )
+        .await;
+        let answered_in = started.elapsed();
+        settle_sgw_restart_deletions_for_test().await;
+        let left = (
+            sessions_of(0x4C).len(),
+            sessions_of(0x4D).len(),
+            sessions_of(0x4E).len(),
+        );
+        upf.delay_deletions(0);
+        forget_ues(&[0x4C, 0x4D, 0x4E]);
+        server.close();
+        assert!(
+            answered_in < std::time::Duration::from_millis(1_500),
+            "answered before the deletions finish: {answered_in:?}"
+        );
+        assert_eq!(
+            left,
+            (0, 0, 1),
+            "the old connections are deleted afterwards"
+        );
+    }
+
+    /// #1198 review m1: two Create Session Requests for the same [IMSI, EBI] (an MME
+    /// retry under a new sequence number) arriving together are served one after the
+    /// other, so the second collides with the first's PDN connection and replaces it.
+    /// Served at once, both passed the collision check and the UE held two.
+    #[tokio::test]
+    async fn concurrent_create_sessions_for_one_imsi_leave_one_pdn_connection() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _upf = crate::pfcp_path::stand_in::associated_upf().await;
+        let (server, sgw) = s5s8_pair().await;
+        let first = csr_for(0x0011_9481, 0x4F, 0x4F00_0001, 5, None);
+        let second = csr_for(0x0011_9482, 0x4F, 0x4F00_0002, 5, None);
+        sgw.send_to(&first, server.local_addr())
+            .await
+            .expect("send");
+        sgw.send_to(&second, server.local_addr())
+            .await
+            .expect("send");
+        for _ in 0..2 {
+            let _ = recv_type(&sgw, gtp2_message_type::CREATE_SESSION_RESPONSE).await;
+        }
+        let held = sessions_of(0x4F).len();
+        forget_ues(&[0x4F]);
+        server.close();
+        assert_eq!(held, 1, "one PDN connection for [IMSI, EBI 5]");
+    }
+
+    /// #1198 review m3: a request being served is ended when its guard drops, even by a
+    /// panic, so its retransmissions are answered from the cache or dropped for the
+    /// hold only, not for ever.
+    #[tokio::test]
+    async fn a_panicking_request_still_ends_its_number() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let (server, _sgw) = s5s8_pair().await;
+        let peer: std::net::SocketAddr = "127.0.0.1:2123".parse().unwrap();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _serving = server.begin_command_guard(peer, 0x1198).expect("new");
+            panic!("the procedure panics");
+        }));
+        let ended = server.command_ended(peer, 0x1198);
+        assert!(
+            server.begin_command_guard(peer, 0x1198).is_none(),
+            "a retransmission within the hold is still not served again"
+        );
+        server.close();
+        assert!(ended, "the number is ended, not left in progress");
     }
 
     /// #1194, TS 29.274 §7.2.1: a Create Session Request whose EBI is a dedicated bearer's

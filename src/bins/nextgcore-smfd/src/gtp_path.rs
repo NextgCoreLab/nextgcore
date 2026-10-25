@@ -833,9 +833,13 @@ pub struct S5S8Server {
     /// dedicated bearers when a PDN connection is established.
     local_pcc_rules: std::sync::RwLock<Vec<crate::eps_bearer::LocalPccRule>>,
     /// #1194, TS 23.007 §18: the remote Restart counter of each SGW-C, by the GTP-C
-    /// entity's address (the sender F-TEID's, or an Echo's source). Volatile, as §18
-    /// requires.
-    peer_restart: std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, u8>>,
+    /// entity's address (the sender F-TEID's, or an Echo's source), with when a message
+    /// last showed it (#1198 review B1). Volatile, as §18 requires.
+    peer_restart: std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, PeerRestart>>,
+    /// #1198 review m1: one Create Session Request at a time per IMSI, so two for the
+    /// same [IMSI, EBI] cannot both pass the TS 29.274 §7.2.1 collision check before
+    /// either is created.
+    csr_by_imsi: std::sync::Mutex<std::collections::HashMap<Vec<u8>, Arc<tokio::sync::Mutex<()>>>>,
     /// #1194, TS 29.274 §7.6: the response sent to a request tracked by
     /// [`Self::begin_command`], by (peer, sequence number), kept for the hold; a
     /// retransmission of the request is answered with it rather than served again.
@@ -874,6 +878,7 @@ impl S5S8Server {
             command_hold: Gtp2XactConfig::default().response_hold,
             local_pcc_rules: std::sync::RwLock::new(Vec::new()),
             peer_restart: std::sync::Mutex::new(std::collections::HashMap::new()),
+            csr_by_imsi: std::sync::Mutex::new(std::collections::HashMap::new()),
             responses: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
 
@@ -991,37 +996,92 @@ impl S5S8Server {
     }
 
     /// Note an SGW-C's Restart counter (TS 23.007 §18), for the GTP-C entity at `entity`.
-    /// `true` when it says the SGW-C restarted since the stored one: its PDN connections
-    /// are then stale (§17.1A.1). The first value is stored; a value behind the stored
-    /// one is a reordered datagram, discarded.
-    pub(crate) fn note_sgw_restart_counter(&self, entity: std::net::IpAddr, counter: u8) -> bool {
+    /// `Some` when it says the SGW-C restarted since the stored one: the PDN connections
+    /// of the old incarnation are then stale (§17.1A.1). The first value is stored; a
+    /// value behind the stored one is a reordered datagram, discarded.
+    ///
+    /// #1198 review B1: every message showing the stored counter refreshes when it was
+    /// last seen, the old incarnation's last proof of life that [`SgwRestart`] carries.
+    pub(crate) fn note_sgw_restart_counter(
+        &self,
+        entity: std::net::IpAddr,
+        counter: u8,
+    ) -> Option<SgwRestart> {
         use nextgcore_gtp::v2::RestartOrder;
-        let Ok(mut seen) = self.peer_restart.lock() else {
-            return false;
+        let now = std::time::Instant::now();
+        let mut seen = self.peer_restart.lock().ok()?;
+        let Some(peer) = seen.get_mut(&entity) else {
+            seen.insert(
+                entity,
+                PeerRestart {
+                    counter,
+                    seen_at: now,
+                    stale_logged: None,
+                },
+            );
+            return None;
         };
-        let mut stored = seen.get(&entity).copied();
-        let previous = stored;
-        let order = nextgcore_gtp::v2::note_restart_counter(&mut stored, counter);
-        if let Some(value) = stored {
-            seen.insert(entity, value);
+        match nextgcore_gtp::v2::restart_counter_order(peer.counter, counter) {
+            RestartOrder::Unchanged => {
+                peer.seen_at = now;
+                None
+            }
+            RestartOrder::Restarted => {
+                let restart = SgwRestart {
+                    previous: peer.counter,
+                    current: counter,
+                    old_seen_at: peer.seen_at,
+                };
+                *peer = PeerRestart {
+                    counter,
+                    seen_at: now,
+                    stale_logged: None,
+                };
+                drop(seen);
+                log::warn!(
+                    "S5/S8: SGW-C {entity} restarted (Restart counter {} -> {counter}); \
+                     its PDN connections of the old incarnation are stale (TS 23.007 §18, \
+                     §17.1A.1)",
+                    restart.previous
+                );
+                Some(restart)
+            }
+            RestartOrder::Stale => {
+                // #1198 review m4: an SGW-C that does not persist its counter sends the
+                // lower value in every Echo; said once per value, not every minute.
+                let first = peer.stale_logged != Some(counter);
+                peer.stale_logged = Some(counter);
+                let stored = peer.counter;
+                drop(seen);
+                if first {
+                    log::warn!(
+                        "S5/S8: SGW-C {entity} Restart counter {counter} is behind the stored \
+                         {stored}: discarded as a reordered message (TS 23.007 §18)"
+                    );
+                } else {
+                    log::debug!(
+                        "S5/S8: SGW-C {entity} Restart counter {counter} still behind {stored}"
+                    );
+                }
+                None
+            }
         }
-        drop(seen);
-        match (order, previous) {
-            (RestartOrder::Restarted, Some(previous)) => {
-                log::warn!(
-                    "S5/S8: SGW-C {entity} restarted (Restart counter {previous} -> {counter}); \
-                     its PDN connections are stale (TS 23.007 §18, §17.1A.1)"
-                );
-                true
-            }
-            (RestartOrder::Stale, Some(previous)) => {
-                log::warn!(
-                    "S5/S8: SGW-C {entity} Restart counter {counter} is behind the stored \
-                     {previous}: discarded as a reordered message (TS 23.007 §18)"
-                );
-                false
-            }
-            _ => false,
+    }
+
+    /// Serialise Create Session Requests for `imsi` (#1198 review m1): held for the
+    /// whole of one, from the collision check to the new PDN connection's creation.
+    pub(crate) async fn csr_lock(&self, imsi: &[u8]) -> CsrGuard<'_> {
+        let lock = self
+            .csr_by_imsi
+            .lock()
+            .map(|mut m| m.entry(imsi.to_vec()).or_default().clone())
+            .unwrap_or_default();
+        let guard = lock.clone().lock_owned().await;
+        CsrGuard {
+            server: self,
+            imsi: imsi.to_vec(),
+            lock,
+            _guard: Some(guard),
         }
     }
 
@@ -1130,6 +1190,22 @@ impl S5S8Server {
         true
     }
 
+    /// [`Self::begin_command`], ended when the returned guard drops, so a procedure that
+    /// panics does not leave its number "being served" for ever and every
+    /// retransmission dropped (#1198 review m3).
+    pub(crate) fn begin_command_guard(
+        &self,
+        peer: SocketAddr,
+        seq: u32,
+    ) -> Option<CommandGuard<'_>> {
+        // `then`, not `then_some`: a guard built for a refused number would end it.
+        self.begin_command(peer, seq).then(|| CommandGuard {
+            server: self,
+            peer,
+            seq,
+        })
+    }
+
     /// The Command's procedure finished (#619); its number is remembered for the hold.
     pub(crate) fn end_command(&self, peer: SocketAddr, seq: u32) {
         if let Ok(mut seen) = self.commands_seen.lock() {
@@ -1180,9 +1256,13 @@ impl S5S8Server {
         else {
             return;
         };
-        if self.note_sgw_restart_counter(peer.ip(), counter) {
-            crate::gtp_handler::delete_pdn_connections_of_sgw(peer.ip(), "the SGW-C restarted")
-                .await;
+        if let Some(restart) = self.note_sgw_restart_counter(peer.ip(), counter) {
+            // #1198 review MAJOR: in the background, not in this datagram's task.
+            crate::gtp_handler::delete_pdn_connections_of_sgw(
+                peer.ip(),
+                restart,
+                "the SGW-C restarted",
+            );
         }
     }
 
@@ -1235,6 +1315,61 @@ impl S5S8Server {
 
         // An initial message from the SGW-C.
         crate::gtp_handler::dispatch_s5s8_request(self, msg_type, seq, data, peer).await;
+    }
+}
+
+/// What an SGW-C's Restart counter was last seen as (#1194, #1198 review B1).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PeerRestart {
+    counter: u8,
+    /// When a message last carried `counter`.
+    seen_at: std::time::Instant,
+    /// The stale value last warned about (#1198 review m4).
+    stale_logged: Option<u8>,
+}
+
+/// An SGW-C restart (TS 23.007 §18): its old and new Restart counters, and when a
+/// message last showed the old one (#1198 review B1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SgwRestart {
+    pub previous: u8,
+    pub current: u8,
+    /// The old incarnation's last proof of life: a PDN connection of unknown
+    /// incarnation set up after it may be the new one's, and is kept.
+    pub old_seen_at: std::time::Instant,
+}
+
+/// A Command or request being served (#1198 review m3): ends it on drop.
+pub(crate) struct CommandGuard<'a> {
+    server: &'a S5S8Server,
+    peer: SocketAddr,
+    seq: u32,
+}
+
+impl Drop for CommandGuard<'_> {
+    fn drop(&mut self) {
+        self.server.end_command(self.peer, self.seq);
+    }
+}
+
+/// One IMSI's Create Session Request being served (#1198 review m1). On drop the
+/// IMSI's lock leaves the map once no other request waits on it.
+pub(crate) struct CsrGuard<'a> {
+    server: &'a S5S8Server,
+    imsi: Vec<u8>,
+    lock: Arc<tokio::sync::Mutex<()>>,
+    _guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for CsrGuard<'_> {
+    fn drop(&mut self) {
+        self._guard = None;
+        if let Ok(mut m) = self.server.csr_by_imsi.lock() {
+            // The map's and this guard's references: nobody else waits.
+            if Arc::strong_count(&self.lock) == 2 {
+                m.remove(&self.imsi);
+            }
+        }
     }
 }
 

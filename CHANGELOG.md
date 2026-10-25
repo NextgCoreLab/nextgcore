@@ -17,10 +17,18 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   connection deletes that connection first, at the PGW-U too, and frees its PDN address (TS
   29.274 §7.2.1). If the EBI belongs to a dedicated bearer, only that bearer and its PGW-U rules
   are deleted. Before, every MME or SGW-C restart left one more PGW-U session and address for
-  the same UE. An SGW-C whose Restart counter moves ahead has its PDN connections deleted (TS
-  23.007 §18, §17.1A.1). The counter is read from the Recovery IE of a Create Session Request
-  or an Echo. A retransmitted Create Session Request is answered with the response already sent
-  (TS 29.274 §7.6) and is not served again (#1194).
+  the same UE. A dedicated bearer whose rules this PGW-C did not install (one that came over
+  N26) cannot be removed alone, so its whole PDN connection goes: a deviation from §7.2.1, which
+  deletes only the bearer. An SGW-C whose Restart counter moves ahead has the PDN connections of
+  its old incarnation deleted (TS 23.007 §18, §17.1A.1): those set up under another counter, and
+  those set up with no Recovery IE no later than the last message that showed the old counter.
+  One set up after that, of unknown incarnation, is kept, so a same-address restart does not
+  delete the new incarnation's live connections. The deletions run in the background, 16 at a
+  time, after the message that showed the restart is answered
+  (`smf_s5s8_sgw_restart_pdn_deleted_total`, `smf_s5s8_sgw_restart_deletions_running`). The
+  counter is read from the Recovery IE of a Create Session Request or an Echo. Create Session
+  Requests are served one at a time per IMSI. A retransmitted Create Session Request is answered
+  with the response already sent (TS 29.274 §7.6) and is not served again (#1194).
 - smfd ignores the Recovery Time Stamp in a PFCP Association Setup Response, and keeps a UPF's
   Recovery Time Stamp in memory only (TS 23.007 §19A; TS 29.244 Table 7.4.4.2-1 NOTE). A new
   association starts with no stored stamp, and its first Heartbeat stamp is the baseline. Whether

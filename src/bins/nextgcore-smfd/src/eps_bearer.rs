@@ -776,10 +776,10 @@ pub async fn deactivate_on_command(
         server.send_response_public(peer, &fi).await;
         return;
     }
-    if !server.begin_command(peer, seq) {
+    let Some(serving) = server.begin_command_guard(peer, seq) else {
         log::debug!("S5/S8 Delete Bearer Command seq={seq} from {peer} is a retransmission");
         return;
-    }
+    };
     let mut b = crate::gtp_build::Gtp2MessageBuilder::new(gtp2_message_type::DELETE_BEARER_REQUEST)
         .teid(sess.sgw_s5c_teid);
     for bearer in &bearers {
@@ -799,7 +799,7 @@ pub async fn deactivate_on_command(
             Some(seq),
         )
         .await;
-    server.end_command(peer, seq);
+    drop(serving);
     // Which bearers the answer refused; the rest go. An unanswered request still
     // deletes them: the MME asked for it, and the SGW-C has nothing to keep them for.
     let kept: Vec<u8> = match answer {

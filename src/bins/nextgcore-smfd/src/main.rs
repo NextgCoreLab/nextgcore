@@ -171,7 +171,13 @@ fn render_metrics() -> String {
          smf_nsac_decrease_failures_total {}\n\
          # HELP smf_ipv4_pool_stale_releases_total UE IPv4 addresses released while already free: each is a double free\n\
          # TYPE smf_ipv4_pool_stale_releases_total counter\n\
-         smf_ipv4_pool_stale_releases_total {}\n",
+         smf_ipv4_pool_stale_releases_total {}\n\
+         # HELP smf_s5s8_sgw_restart_pdn_deleted_total PDN connections deleted because their SGW-C restarted (TS 23.007 §17.1A.1)\n\
+         # TYPE smf_s5s8_sgw_restart_pdn_deleted_total counter\n\
+         smf_s5s8_sgw_restart_pdn_deleted_total {}\n\
+         # HELP smf_s5s8_sgw_restart_deletions_running Restarted SGW-Cs whose PDN connections are still being deleted\n\
+         # TYPE smf_s5s8_sgw_restart_deletions_running gauge\n\
+         smf_s5s8_sgw_restart_deletions_running {}\n",
         pool.len(),
         pfcp_path::PFCP_UNAUTHORIZED.load(Ordering::Relaxed),
         SM_POLICY_DELETE_FAILURES.load(Ordering::Relaxed),
@@ -185,6 +191,8 @@ fn render_metrics() -> String {
             .read()
             .map(|ctx| ctx.ipv4_pool.stale_releases())
             .unwrap_or(0),
+        gtp_handler::SGW_RESTART_PDN_CONNECTIONS_DELETED.load(Ordering::Relaxed),
+        gtp_handler::SGW_RESTART_DELETIONS_RUNNING.load(Ordering::Relaxed),
     )
 }
 
