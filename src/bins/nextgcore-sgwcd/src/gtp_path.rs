@@ -3000,6 +3000,10 @@ mod tests {
         sock: std::sync::Arc<tokio::net::UdpSocket>,
         /// Where the SGW-C's Sxa socket is listening.
         sgwc_addr: SocketAddr,
+        /// (msg_type, PFCP sequence number) of each request received, so a T1
+        /// retransmission (same number, TS 29.244 §7.6) is not counted twice
+        /// (#1158).
+        seqs: std::sync::Arc<std::sync::Mutex<Vec<(u8, u32)>>>,
     }
 
     impl StandInSgwu {
@@ -3008,14 +3012,21 @@ mod tests {
             self.sock.local_addr().unwrap()
         }
 
-        /// Bodies the stand-in received for a message type, in order.
+        /// How many distinct requests of `msg_type` the stand-in received: a PFCP
+        /// T1 retransmission keeps its sequence number and is the same request
+        /// (#1158: counting it made `received(54) == 1` flake under load).
         fn received(&self, msg_type: u8) -> usize {
-            self.seen
+            let mut numbers: Vec<u32> = self
+                .seqs
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .iter()
-                .filter(|(t, _, _)| *t == msg_type)
-                .count()
+                .filter(|(t, _)| *t == msg_type)
+                .map(|(_, seq)| *seq)
+                .collect();
+            numbers.sort_unstable();
+            numbers.dedup();
+            numbers.len()
         }
 
         /// Send a Session Report Request carrying a Downlink Data Report for `seid`.
@@ -3078,6 +3089,8 @@ mod tests {
         std::env::set_var("SGWC_SGWU_ADDR", up_addr.to_string());
         std::env::set_var("SGWC_PFCP_NODE_IP", "127.0.0.1");
 
+        let seqs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let numbered = seqs.clone();
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = seen.clone();
         let handle = up.clone();
@@ -3100,6 +3113,10 @@ mod tests {
                     header.seid,
                     cursor.to_vec(),
                 ));
+                numbered
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((msg_type, header.sequence_number));
 
                 // #1001: the SGW-C sends no session message before the association
                 // (TS 29.244 §6.2.6.1), so the stand-in accepts the Association Setup.
@@ -3196,7 +3213,61 @@ mod tests {
             seen,
             sock: up,
             sgwc_addr: node.local_addr(),
+            seqs,
         }
+    }
+
+    /// #1158: a PFCP request sent twice under the same sequence number (a T1
+    /// retransmission) counts once; another number counts again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_stand_in_counts_a_retransmission_once() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let cp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let deletion = |seq: u32| {
+            let mut out = bytes::BytesMut::new();
+            let mut h = nextgcore_pfcp::header::PfcpHeader::new_with_seid(
+                nextgcore_pfcp::header::PfcpMessageType::SessionDeletionRequest,
+                0x1158,
+                seq,
+            );
+            h.length = 12;
+            h.encode(&mut out);
+            out
+        };
+        for seq in [0x1158, 0x1158, 0x1159] {
+            cp.send_to(&deletion(seq), sgwu.addr()).await.unwrap();
+        }
+        for _ in 0..300 {
+            if sgwu
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(t, _, _)| *t == 54)
+                .count()
+                == 3
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            sgwu.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(t, _, _)| *t == 54)
+                .count(),
+            3,
+            "all three datagrams arrived"
+        );
+        assert_eq!(sgwu.received(54), 2, "the retransmission counts once");
     }
 
     /// Receive one S11 message with a bounded wait, from a blocking socket inside an async
