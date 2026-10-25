@@ -878,13 +878,22 @@ async fn main() -> Result<()> {
         // that belongs at boot -- it needs no evidence from the UPF -- and it runs
         // before the SBI server accepts anything, so no update can arrive for a
         // session that is about to be dropped.
-        let (notified, unnotifiable) = restoration::notify_unrestorable_at_boot().await;
-        if notified + unnotifiable > 0 {
-            log::warn!(
-                "SMF boot restoration signalling: {notified} consumer(s) notified, \
-                 {unnotifiable} unreachable"
-            );
-        }
+        // #1230 review b: the sessions are dropped here; their AMFs are told in the
+        // background, bounded, so an unreachable AMF does not hold the boot.
+        let notifying = restoration::begin_unrestorable_at_boot();
+        tokio::spawn(async move {
+            if let Ok((notified, unnotifiable)) = notifying.await {
+                if notified + unnotifiable > 0 {
+                    log::warn!(
+                        "SMF boot restoration signalling: {notified} consumer(s) notified, \
+                         {unnotifiable} unreachable"
+                    );
+                }
+            }
+        });
+        // #1230: the EPS→5GS contexts restored without their uplink endpoint go with
+        // #39, so their UEs re-establish them.
+        drop(restoration::begin_reactivation_at_boot());
     } else {
         log::info!(
             "SMF durable state disabled (no --state-file / NEXTGCORE_SMF_STATE_FILE): PFCP \
@@ -3449,7 +3458,8 @@ async fn an_initiated_modification(sm_context_ref: &str, n2_bytes: &[u8]) -> Sbi
     let Some(upf_seid) = lookup_upf_seid(sm_context_ref) else {
         return fail(SmfCause::MiscUnspecified, "no N4 session for this context");
     };
-    let Some((ul_teid, ul_addr)) = lookup_upf_ul_endpoint(sm_context_ref) else {
+    // #1230: recovered from the UPF for a restored context that lacks it.
+    let Some((ul_teid, ul_addr)) = recover_upf_ul_endpoint(sm_context_ref).await else {
         return fail(
             SmfCause::MiscUnspecified,
             "no recorded UPF uplink endpoint to confirm",
@@ -5337,6 +5347,88 @@ fn handover_allocation_failed_response(sm_context_ref: &str, alloc_fail: &[u8]) 
         ))
 }
 
+/// The UPF's N3 uplink endpoint of an SM context, recovered from the UPF when the SMF
+/// does not know it (#1230). That is a native 5G SM context restored from a snapshot
+/// written before #1230, or rewritten by a rolled-back 0.1.x.
+///
+/// The UPF chose the F-TEID at establishment and reported it only then (TS 29.244
+/// §5.5.3). So PDR 1, the session's N3 uplink PDR, is removed and created again with
+/// CHOOSE, as at establishment, from the policy binding (UE address, QFI, QER), and
+/// the new F-TEID is recorded and persisted. This is two N4 Session Modifications,
+/// remove and then create, so that a UP function that applies a message's Create
+/// before its Remove still takes it.
+///
+/// It runs where the endpoint is needed:
+/// - the UP activation of a Service Request, and the paging for downlink data. There
+///   the UE is idle and no gNB uses the old tunnel;
+/// - a handover preparation, and a Modify Indication. There the source gNB's uplink
+///   to the old F-TEID stops when PDR 1 is removed, until the UE moves.
+///
+/// A path switch needs nothing: the UL NG-U tunnel is optional in its acknowledge
+/// (TS 38.413 §9.3.4.9).
+async fn recover_upf_ul_endpoint(sm_context_ref: &str) -> Option<(u32, [u8; 4])> {
+    if let Some(known) = lookup_upf_ul_endpoint(sm_context_ref) {
+        return Some(known);
+    }
+    let binding = lookup_policy_binding(sm_context_ref)?;
+    let upf_seid = lookup_upf_seid(sm_context_ref)?;
+    let smf_seid = smf_n4_seid_for(sm_context_ref);
+    // As at establishment (`pfcp_session_establish`): an XR 5QI's flow uses QER 2.
+    let xr = (82..=85).contains(&binding.five_qi);
+    let ul_pdr = n4_build::PdrParams {
+        pdr_id: 1,
+        precedence: 100,
+        source_interface: 0,
+        f_teid: Some((0, None, None)),
+        ue_ip_address: Some((Some(binding.ue_ip), None, true)),
+        outer_header_removal: Some(0),
+        far_id: Some(1),
+        qer_id: Some(if xr { 2 } else { 1 }),
+        qfi: Some(if xr {
+            binding.five_qi & 0x3F
+        } else {
+            binding.qfi
+        }),
+        urr_ids: vec![SESSION_URR_ID],
+        ..Default::default()
+    };
+    log::warn!(
+        "ref={sm_context_ref}: no UPF N3 uplink endpoint recorded (restored from an older \
+         snapshot); asking the UPF to choose one for PDR 1"
+    );
+    let remove = n4_build::SessionModificationParams {
+        remove_pdr_ids: vec![1],
+        ..Default::default()
+    };
+    if let Err(e) = pfcp_modify_with(smf_seid, upf_seid, &remove).await {
+        log::error!("ref={sm_context_ref}: uplink PDR 1 was not removed for recovery: {e}");
+        return None;
+    }
+    let create = n4_build::SessionModificationParams {
+        create_pdrs: vec![ul_pdr],
+        ..Default::default()
+    };
+    let endpoint = match pfcp_modify_with(smf_seid, upf_seid, &create).await {
+        Ok(body) => parse_created_pdr_fteid(&body),
+        Err(e) => {
+            log::error!("ref={sm_context_ref}: uplink PDR 1 was not created again: {e}");
+            None
+        }
+    }?;
+    if let Ok(ctx) = smf_self().read() {
+        if let Ok(mut m) = ctx.upf_ul_endpoints.write() {
+            m.insert(sm_context_ref.to_string(), endpoint);
+        }
+        // After the write guard drops: `persist` reads the same map.
+        ctx.persist();
+    }
+    log::info!(
+        "ref={sm_context_ref}: UPF N3 uplink endpoint recovered: TEID {:#x}",
+        endpoint.0
+    );
+    Some(endpoint)
+}
+
 /// The UPF's N3 uplink endpoint for an SM context, if establishment recorded one (#70).
 fn lookup_upf_ul_endpoint(sm_context_ref: &str) -> Option<(u32, [u8; 4])> {
     smf_self().read().ok().and_then(|ctx| {
@@ -6009,6 +6101,8 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                 // FAR is re-activated when the gNB's PDU_RES_SETUP_RSP comes back.
                 // Before #518 this fell to the default below and answered ACTIVATED
                 // with no N2 at all, so the AMF had nothing to put in the ICS.
+                // #1230: a restored context whose uplink endpoint is unknown gets one.
+                recover_upf_ul_endpoint(sm_context_ref).await;
                 return activation_response(sm_context_ref);
             }
             // Default: treat as activation confirmation
@@ -6032,6 +6126,8 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
             // asks the SMF to prepare. The answer carries `hoState: PREPARING` and the
             // target's Handover Request Transfer (a PDUSessionResourceSetupRequestTransfer,
             // TS 38.413 §9.2.3.4) as `PDU_RES_SETUP_REQ`. The user plane is untouched.
+            // #1230: a restored context whose uplink endpoint is unknown gets one.
+            recover_upf_ul_endpoint(sm_context_ref).await;
             handover_preparing_response(
                 sm_context_ref,
                 resolve_binary_ref(request, &req_body["n2SmInfo"]).as_deref(),
@@ -7809,6 +7905,9 @@ async fn trigger_network_initiated_service_request(seid: u64, qfi: Option<u8>) {
         return;
     };
 
+    // #1230: the paging's Setup Request Transfer names the uplink endpoint (TS 38.413
+    // §9.3.4.1); a restored context that lacks it gets one first.
+    recover_upf_ul_endpoint(&sm_context_ref).await;
     send_n1_n2_paging_request(&amf_uri, &supi, psi, qfi, &sm_context_ref).await;
 }
 
@@ -22762,7 +22861,7 @@ mod tests {
     /// #1230: an SM context restored from the snapshot keeps its UPF N3 uplink endpoint,
     /// so after a restart its user plane can still be activated and the UE paged.
     ///
-    /// A version-3 snapshot is restored into the SMF context (`set_state_file`, the boot
+    /// A snapshot with `upfUlEndpoints` is restored into the SMF context (`set_state_file`, the boot
     /// path). It holds one SM context: its PFCP session, its binding and its uplink
     /// endpoint, with no in-memory session, as after a restart. Then:
     /// - the AMF's ACTIVATING is answered 200 with a PDU Session Resource Setup Request
@@ -22812,7 +22911,7 @@ mod tests {
             addr.port()
         ));
         let doc = serde_json::json!({
-            "version": 3,
+            "version": 2,
             "pfcpSessions": { REF: 0x0123_0000u64 },
             "policyBindings": { REF: b },
             "upfUlEndpoints": { REF: { "teid": UL_TEID, "addr": "10.45.0.123" } },
@@ -22894,6 +22993,140 @@ mod tests {
             .find(|(uri, _)| uri.contains(&format!("/ue-contexts/{SUPI}/n1-n2-messages")))
             .unwrap_or_else(|| panic!("the restored session's UE is paged: {requests:?}"));
         let _ = paging;
+    }
+
+    /// #1230 review: a native 5G SM context restored from a snapshot without its uplink
+    /// endpoint (written before #1230, or by a rolled-back 0.1.x) is kept, not released.
+    /// The endpoint is recovered from the UPF on first need.
+    ///
+    /// A version-2 snapshot with no `upfUlEndpoints` is restored. The AMF's
+    /// ACTIVATING then makes the SMF remove PDR 1 at the UPF and create it again with
+    /// a TEID of 0, which is this tree's CHOOSE (the UPF allocates the TEID). Two
+    /// modifications go out, in that order. The answer is 200 with a Setup Request
+    /// Transfer naming the F-TEID the UPF chose, and that F-TEID is recorded. A
+    /// second ACTIVATING sends nothing more to the UPF. A Downlink Data Report for the
+    /// session pages the UE.
+    #[tokio::test]
+    async fn a_restored_session_without_its_endpoint_recovers_it_from_the_upf() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        use nextgcore_sbi::message::SbiResponse;
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        let pages = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink = pages.clone();
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let amf = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+        amf.start(move |req: SbiRequest| {
+            let sink = sink.clone();
+            async move {
+                if req.header.uri.contains("/n1-n2-messages") {
+                    sink.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                SbiResponse::with_status(200)
+            }
+        })
+        .await
+        .expect("amf start");
+
+        const REF: &str = "91231";
+        let mut b = crate::context::PolicyBinding::snapshot_default();
+        b.supi = "imsi-001010000091231".into();
+        b.psi = 7;
+        b.ue_ip = [10, 45, 123, 1];
+        b.dnn = "internet".into();
+        b.qfi = 1;
+        b.five_qi = 9;
+        b.arp_priority_level = 8;
+        b.sm_context_status_uri = Some(format!(
+            "http://127.0.0.1:{}/namf-callback/v1/smContextStatus/{REF}",
+            addr.port()
+        ));
+        let doc = serde_json::json!({
+            "version": 2,
+            "pfcpSessions": { REF: upf.upf_seid },
+            "policyBindings": { REF: b },
+        });
+        let path = std::env::temp_dir().join(format!(
+            "nextgcore-smf-1230b-{}-{:?}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
+        {
+            let handle = smf_self();
+            let mut ctx = handle.write().unwrap();
+            ctx.set_state_file(path.clone()).expect("restore");
+            ctx.clear_state_file_for_test();
+        }
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            smf_self()
+                .read()
+                .unwrap()
+                .unrestorable_sessions
+                .read()
+                .unwrap()
+                .is_empty(),
+            "nothing is released"
+        );
+        assert_eq!(lookup_upf_ul_endpoint(REF), None);
+        upf.clear_seen();
+
+        let activate = || {
+            SbiRequest::post(format!("/nsmf-pdusession/v1/sm-contexts/{REF}/modify")).with_body(
+                serde_json::json!({ "upCnxState": "ACTIVATING" }).to_string(),
+                "application/json",
+            )
+        };
+        let resp = handle_sm_context_update(REF, &activate()).await;
+        let mods = upf.modification_bodies();
+        let n2 = resp
+            .http
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some("n2SmInfo"))
+            .map(|p| p.data.to_vec());
+        let recovered = lookup_upf_ul_endpoint(REF);
+        let again = handle_sm_context_update(REF, &activate()).await;
+        let mods_after = upf.modification_bodies().len();
+
+        // Downlink data for the idle UE: paged, from the UPF serving it.
+        let smf_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        handle_pfcp_session_report(
+            &smf_sock,
+            &dldr_report_packet(context::derive_cp_n4_seid(REF), 1),
+            upf.client.peer(),
+        )
+        .await;
+        let paged = pages.load(std::sync::atomic::Ordering::SeqCst);
+        amf.stop().await.expect("stop");
+
+        let pdr_1 = [0x00, 0x38, 0x00, 0x02, 0x00, 0x01];
+        assert_eq!(mods.len(), 2, "remove, then create: {mods:02x?}");
+        assert!(
+            mods[0].windows(4).any(|w| w == [0x00, 0x0f, 0x00, 0x06])
+                && mods[0].windows(6).any(|w| w == pdr_1),
+            "Remove PDR 1 first"
+        );
+        assert!(
+            mods[1].windows(2).any(|w| w == [0x00, 0x01])
+                && mods[1].windows(6).any(|w| w == pdr_1)
+                && !mods[1].windows(4).any(|w| w == [0x00, 0x0f, 0x00, 0x06]),
+            "then Create PDR 1 alone"
+        );
+        let (teid, addr) = recovered.expect("recorded");
+        assert!(teid != 0 && addr == upf.upf_ip, "the F-TEID the UPF chose");
+        assert_eq!(resp.status, 200);
+        let n2 = n2.expect("the Setup Request Transfer");
+        assert!(
+            n2.windows(4).any(|w| w == teid.to_be_bytes()),
+            "the transfer names the UPF's new F-TEID {teid:#x}"
+        );
+        assert_eq!(again.status, 200);
+        assert_eq!(mods_after, 2, "a known endpoint is not recovered again");
+        assert_eq!(paged, 1, "and the idle UE is paged for downlink data");
     }
 
     /// The other half: a DLDR for a session whose user plane is UP must NOT page.

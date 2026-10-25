@@ -525,12 +525,25 @@ async fn reconcile_one(upf_seid: u64, sm_context_ref: String) {
 /// Drains the pending list, so a second call is a no-op: re-notifying on a later
 /// boot would tell an AMF about a context it released long ago.
 ///
-/// Returns `(notified, unnotifiable)`.
+/// Returns `(notified, unnotifiable)`, once every notification has been sent.
 pub async fn notify_unrestorable_at_boot() -> (usize, usize) {
+    begin_unrestorable_at_boot().await.unwrap_or((0, 0))
+}
+
+/// [`notify_unrestorable_at_boot`], returning as soon as the sessions are dropped
+/// (#1230 review b).
+///
+/// The drop runs here, before the SBI server starts, so that no update can arrive
+/// for a session that is going away. It is one pass over the maps with one
+/// `persist`; the persist used to run for every session, which made the boot
+/// O(N²) in snapshot writes. The AMF notifications are left in the returned task,
+/// [`RELEASE_FANOUT`] at a time, so the SBI timeout of an unreachable AMF does not
+/// delay the boot once per session.
+pub fn begin_unrestorable_at_boot() -> tokio::task::JoinHandle<(usize, usize)> {
     let global = smf_self();
     let pending: Vec<crate::context::UnrestorableSession> = {
         let Ok(ctx) = global.read() else {
-            return (0, 0);
+            return tokio::spawn(async { (0, 0) });
         };
         let taken = match ctx.unrestorable_sessions.write() {
             Ok(mut p) => std::mem::take(&mut *p),
@@ -539,33 +552,24 @@ pub async fn notify_unrestorable_at_boot() -> (usize, usize) {
         taken
     };
     if pending.is_empty() {
-        return (0, 0);
+        return tokio::spawn(async { (0, 0) });
     }
 
-    let mut notified = 0usize;
-    let mut unnotifiable = 0usize;
-    for entry in &pending {
-        // Drop the session first: it is unusable either way, and leaving it in the
-        // map after telling the AMF it is RELEASED would be the two ends
-        // disagreeing in the opposite direction.
-        if let Ok(ctx) = global.read() {
-            let removed = {
-                match ctx.pfcp_sessions.write() {
-                    Ok(mut sessions) => sessions.remove(&entry.sm_context_ref).is_some(),
-                    Err(_) => false,
-                }
+    // Drop the sessions first: each is unusable either way, and leaving one in the
+    // maps after telling its AMF it is RELEASED would have the two ends disagree the
+    // other way round.
+    let mut nsac = Vec::new();
+    if let Ok(ctx) = global.read() {
+        for entry in &pending {
+            let r = &entry.sm_context_ref;
+            let removed = match ctx.pfcp_sessions.write() {
+                Ok(mut sessions) => sessions.remove(r).is_some(),
+                Err(_) => false,
             };
             if !removed {
-                log::debug!(
-                    "unrestorable session {} was already gone",
-                    entry.sm_context_ref
-                );
+                log::debug!("unrestorable session {r} was already gone");
             }
-            // #1230: a session released for want of its uplink endpoint still has its
-            // binding and the per-SEID records; they go with it, so the binding does not
-            // keep naming the address freed below. A session with no readable binding
-            // (#193) has none of these to drop.
-            let r = &entry.sm_context_ref;
+            // #1230: and its per-session records, so the snapshot holds none for it.
             let seid = ctx
                 .cp_n4_seids
                 .write()
@@ -590,31 +594,25 @@ pub async fn notify_unrestorable_at_boot() -> (usize, usize) {
                 ctx.ipv4_pool.release(std::net::Ipv4Addr::from(ip));
             }
             // #1072 review m1: and its NSACF admission is counted out.
-            if let Some((supi, psi, sst, sd)) = entry.nsac.clone() {
-                tokio::spawn(async move {
-                    crate::rollback_nsac(true, &supi, psi, sst, sd.as_deref()).await;
-                });
+            if let Some(n) = entry.nsac.clone() {
+                nsac.push(n);
             }
-            // After the write guard drops: `persist` re-reads the same map.
-            ctx.persist();
         }
-        match entry.status_uri.as_deref() {
-            Some(status_uri) => {
-                log::warn!(
-                    "boot restoration: sm_context_ref={} cannot be served ({}); telling {status_uri} it \
-                     is released",
-                    entry.sm_context_ref,
-                    entry.reason, status_uri = nextgcore_sbi::log_redact::redact_last_segment(status_uri)
-                );
-                crate::send_sm_context_status_notification(
-                    Some(status_uri),
-                    RESOURCE_STATUS_RELEASED,
-                    Some(&entry.reason),
-                )
-                .await;
-                notified += 1;
-            }
-            None => {
+        // Once, after every write guard has dropped: `persist` re-reads these maps.
+        ctx.persist();
+    }
+    for (supi, psi, sst, sd) in nsac {
+        tokio::spawn(async move {
+            crate::rollback_nsac(true, &supi, psi, sst, sd.as_deref()).await;
+        });
+    }
+
+    tokio::spawn(async move {
+        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(RELEASE_FANOUT));
+        let mut sends = tokio::task::JoinSet::new();
+        let mut unnotifiable = 0usize;
+        for entry in pending.iter().cloned() {
+            let Some(status_uri) = entry.status_uri.clone() else {
                 log::error!(
                     "boot restoration: sm_context_ref={} cannot be served ({}) and NO status \
                      callback could be salvaged from its record, so its AMF will not learn of \
@@ -623,15 +621,80 @@ pub async fn notify_unrestorable_at_boot() -> (usize, usize) {
                     entry.reason
                 );
                 unnotifiable += 1;
-            }
+                continue;
+            };
+            let Ok(permit) = permits.clone().acquire_owned().await else {
+                break;
+            };
+            sends.spawn(async move {
+                let _permit = permit;
+                log::warn!(
+                    "boot restoration: sm_context_ref={} cannot be served ({}); telling \
+                     {status_uri} it is released",
+                    entry.sm_context_ref,
+                    entry.reason,
+                    status_uri = nextgcore_sbi::log_redact::redact_last_segment(&status_uri)
+                );
+                crate::send_sm_context_status_notification(
+                    Some(&status_uri),
+                    RESOURCE_STATUS_RELEASED,
+                    Some(&entry.reason),
+                )
+                .await;
+            });
         }
-    }
-    log::warn!(
-        "boot restoration: {} unusable session(s) dropped, {notified} consumer(s) notified, \
-         {unnotifiable} with no reachable consumer",
-        pending.len()
-    );
-    (notified, unnotifiable)
+        let mut notified = 0usize;
+        while sends.join_next().await.is_some() {
+            notified += 1;
+        }
+        log::warn!(
+            "boot restoration: {} unusable session(s) dropped, {notified} consumer(s) notified, \
+             {unnotifiable} with no reachable consumer",
+            pending.len()
+        );
+        (notified, unnotifiable)
+    })
+}
+
+/// #1230: release with #39 "reactivation requested" (TS 24.501 §6.3.3) the restored
+/// SM contexts listed in `reactivate_at_boot`: EPS→5GS-migrated contexts whose
+/// snapshot kept no UPF uplink endpoint and whose uplink PDRs cannot be re-chosen
+/// generically. The UE gets a PDU SESSION RELEASE COMMAND through its AMF and
+/// re-establishes the session. Runs in the returned task, [`RELEASE_FANOUT`] at a
+/// time, like any other release the SMF starts for sessions it cannot honour.
+/// Returns how many releases finished.
+pub fn begin_reactivation_at_boot() -> tokio::task::JoinHandle<usize> {
+    let global = smf_self();
+    let notifiable: Vec<(String, String)> = {
+        let Ok(ctx) = global.read() else {
+            return tokio::spawn(async { 0 });
+        };
+        let refs = match ctx.reactivate_at_boot.write() {
+            Ok(mut p) => std::mem::take(&mut *p),
+            Err(_) => Vec::new(),
+        };
+        let bindings = match ctx.policy_bindings.read() {
+            Ok(b) => b.clone(),
+            Err(_) => Default::default(),
+        };
+        refs.into_iter()
+            .filter_map(|r| {
+                let uri = bindings.get(&r)?.sm_context_status_uri.clone()?;
+                Some((r, uri))
+            })
+            .collect()
+    };
+    tokio::spawn(async move {
+        if notifiable.is_empty() {
+            return 0;
+        }
+        unrecoverable_fan_out(
+            notifiable,
+            "restored without its UPF uplink endpoint".into(),
+            None,
+        )
+        .await
+    })
 }
 
 /// Whether a PFCP cause means "this session does not exist at the UPF", and the
@@ -1222,6 +1285,53 @@ mod tests {
         assert!(!still_live, "the session is gone");
         assert!(!binding, "and its binding");
         assert!(!upf, "and its UPF identity");
+    }
+
+    /// #1230 review a: an EPS→5GS context restored without its uplink endpoint is
+    /// released through its UE: an N1N2MessageTransfer to its AMF carrying the PDU
+    /// SESSION RELEASE COMMAND (#39, TS 24.501 §6.3.3), not only a status notify.
+    #[tokio::test]
+    async fn boot_releases_an_unrecoverable_eps_context_with_39() {
+        let _state = PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _n4 = N4_TEST_LOCK.lock().await;
+        let sink = start_status_sink().await;
+        let r = "boot-1230-eps";
+        {
+            let global = crate::context::smf_self();
+            let ctx = global.read().expect("smf context");
+            ctx.pfcp_sessions
+                .write()
+                .unwrap()
+                .insert(r.to_string(), 0x1230_0eb5);
+            let mut b = crate::context::PolicyBinding::snapshot_default();
+            b.supi = "imsi-001010000012305".into();
+            b.psi = 5;
+            b.sm_context_status_uri = Some(sink.uri.clone());
+            ctx.policy_bindings
+                .write()
+                .unwrap()
+                .insert(r.to_string(), b);
+            ctx.reactivate_at_boot.write().unwrap().push(r.to_string());
+        }
+        let done = begin_reactivation_at_boot().await.expect("the fan-out");
+        let requests = sink.requests.lock().unwrap().clone();
+        forget_session(r);
+        sink.server.stop().await.expect("stop sink");
+        assert_eq!(done, 1);
+        let transfer = requests
+            .iter()
+            .find(|(uri, _)| uri.contains("/ue-contexts/imsi-001010000012305/n1-n2-messages"))
+            .unwrap_or_else(|| panic!("an N1N2MessageTransfer to the UE: {requests:?}"));
+        let n1 = transfer
+            .1
+            .iter()
+            .find(|(id, _)| id == "n1SmMsg" || id.contains("n1"))
+            .map(|(_, d)| d.clone())
+            .expect("the N1 SM message");
+        // TS 24.501 §8.3.14: PDU SESSION RELEASE COMMAND (0xD3), cause #39.
+        assert!(n1.contains(&0xD3), "a release command: {n1:02x?}");
+        assert!(n1.contains(&39), "cause #39: {n1:02x?}");
     }
 
     /// #912 review N3: boot frees the restored address of a session whose binding could

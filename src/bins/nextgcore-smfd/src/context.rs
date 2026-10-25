@@ -1881,6 +1881,9 @@ pub struct SmfContext {
     /// restore, not durable state, and re-notifying on every subsequent boot would
     /// tell an AMF about a context it released long ago.
     pub unrestorable_sessions: RwLock<Vec<UnrestorableSession>>,
+    /// #1230: restored SM contexts to release with #39 at boot: EPS→5GS-migrated ones
+    /// the snapshot kept no uplink endpoint for. Not persisted, like the list above.
+    pub reactivate_at_boot: RwLock<Vec<String>>,
 
     /// Durable snapshot of the PFCP session map, the policy bindings and the
     /// IPv4 pool's allocations (issue #191). Disabled unless a state file is
@@ -1996,6 +1999,7 @@ impl SmfContext {
             persist_lock: std::sync::Mutex::new(()),
             is_global: false,
             unrestorable_sessions: RwLock::new(Vec::new()),
+            reactivate_at_boot: RwLock::new(Vec::new()),
             policy_bindings: RwLock::new(HashMap::new()),
             state: nextgcore_core::state_store::StateStore::disabled(),
         }
@@ -2049,10 +2053,13 @@ impl SmfContext {
     /// - 2 (#718 review M2): it is [`derive_cp_n4_seid`]. A version-1 session is
     ///   restored under its legacy SEID, recorded in `cp_n4_seids`, because that is
     ///   the SEID the UPF holds it under.
-    /// - 3 (#1230): every SM context carries its UPF N3 uplink endpoint
-    ///   (`upfUlEndpoints`). An older snapshot has none, and its SM contexts are
-    ///   released at boot (see [`restore_from`](Self::restore_from)).
-    pub const SNAPSHOT_VERSION: u64 = 3;
+    ///
+    /// #1230 adds `upfUlEndpoints` (each SM context's UPF N3 uplink F-TEID) as an
+    /// optional field, not a new version. A 0.1.x build ignores it and can still read
+    /// the file after a rollback. A snapshot without it (from 0.1.x, or rewritten by
+    /// one) has its endpoints recovered on first need; see
+    /// [`restore_from`](Self::restore_from).
+    pub const SNAPSHOT_VERSION: u64 = 2;
 
     /// Point this context at a snapshot file and restore any prior state,
     /// returning how many records were installed.
@@ -2383,6 +2390,11 @@ impl SmfContext {
         // #718 review M2: a version-1 session was established under the legacy
         // derivation. The UPF holds it under that SEID, so it keeps it, recorded
         // explicitly; only new sessions use the collision-free derivation.
+        // #1230: the SM contexts that inherited their CP SEID from an EPS PDN connection
+        // (an EPS→5GS handover), as the snapshot recorded them, before the version-1
+        // fill below adds the legacy ones.
+        let inherited_refs: std::collections::HashSet<String> =
+            cp_n4_seids.keys().cloned().collect();
         if found < 2 {
             for r in pfcp_sessions.keys() {
                 cp_n4_seids
@@ -2495,46 +2507,37 @@ impl SmfContext {
                     .collect()
             })
             .unwrap_or_default();
-        // An SM context with no endpoint (from a snapshot before version 3, which
-        // wrote none) can never have its user plane re-activated, be paged for
-        // downlink data, or be handed over: each of those has to name the uplink
-        // tunnel, and the UPF reported it only at establishment. It is released at boot,
-        // with its AMF told (the #193 path), rather than kept as a session that silently
-        // drops every downlink packet once the UE goes idle. The UE re-establishes it
-        // (TS 24.501 §6.4.1).
-        // From version 3 on, every SM context is written with its endpoint.
-        let missing_endpoint: Vec<UnrestorableSession> = if found >= 3 {
-            Vec::new()
-        } else {
-            let bindings = read_through(&self.policy_bindings, "policy_bindings").clone();
-            restored_refs
-                .iter()
-                .filter(|r| !upf_ul_endpoints.contains_key(*r))
-                .filter_map(|r| {
-                    // A session with no binding is already on the unrestorable list.
-                    let b = bindings.get(r)?;
-                    Some(UnrestorableSession {
-                        sm_context_ref: r.clone(),
-                        status_uri: b.sm_context_status_uri.clone(),
-                        reason: "the SMF restored this SM context without its UPF N3 \
-                                 uplink endpoint (a snapshot from before #1230), so its \
-                                 user plane can no longer be activated"
-                            .into(),
-                        ue_ip: Some(b.ue_ip).filter(|ip| *ip != [0; 4]),
-                        nsac: b
-                            .nsac_admitted
-                            .then(|| (b.supi.clone(), b.psi, b.sst, b.sd.clone())),
-                    })
-                })
-                .collect()
-        };
-        if !missing_endpoint.is_empty() {
+        // No endpoint: a snapshot written before #1230 (or by a rolled-back 0.1.x), or
+        // a record that does not read. A native 5G SM context keeps everything else,
+        // and its endpoint is recovered the first time one is needed: the UPF chooses
+        // a new uplink F-TEID for PDR 1 (`recover_upf_ul_endpoint` in main). An
+        // EPS→5GS-migrated one (an inherited CP SEID) has its uplink on other PDRs
+        // (the N3 PDR and one per dedicated bearer). It is released at boot with #39
+        // "reactivation requested" (TS 24.501 §6.3.3), so its UE re-establishes it.
+        let reactivate: Vec<String> = restored_refs
+            .iter()
+            .filter(|r| !upf_ul_endpoints.contains_key(*r) && inherited_refs.contains(*r))
+            .cloned()
+            .collect();
+        let n_recover = restored_refs
+            .iter()
+            .filter(|r| !upf_ul_endpoints.contains_key(*r) && !inherited_refs.contains(*r))
+            .count();
+        if n_recover > 0 {
             log::warn!(
-                "{} restored SM context(s) have no UPF N3 uplink endpoint (snapshot version \
-                 {found}); they are released at boot",
-                missing_endpoint.len()
+                "{n_recover} restored SM context(s) have no UPF N3 uplink endpoint in the \
+                 snapshot; each is recovered from the UPF on first need"
             );
-            unrestorable.extend(missing_endpoint);
+        }
+        if !reactivate.is_empty() {
+            log::warn!(
+                "{} restored EPS→5GS SM context(s) have no UPF N3 uplink endpoint; they are \
+                 released for reactivation at boot",
+                reactivate.len()
+            );
+            if let Ok(mut pending) = self.reactivate_at_boot.write() {
+                pending.extend(reactivate);
+            }
         }
         if let Ok(mut map) = self.upf_ul_endpoints.write() {
             map.extend(upf_ul_endpoints);
@@ -4665,7 +4668,10 @@ mod tests {
             ctx.persist();
             let written: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-            assert_eq!(written["version"], 3);
+            assert_eq!(
+                written["version"], 2,
+                "no new version: 0.1.x can read it back"
+            );
             assert_eq!(
                 written["upfUlEndpoints"],
                 serde_json::json!({ "12": { "teid": 0x1230_0012u32, "addr": "10.45.12.30" } })
@@ -4680,42 +4686,40 @@ mod tests {
         assert!(restored.unrestorable_sessions.read().unwrap().is_empty());
     }
 
-    /// #1230: a snapshot from before version 3 wrote no uplink endpoint. Its SM
-    /// contexts can no longer have their user plane activated, so they are put on the
-    /// boot release list with their AMF callback, address and NSAC admission. A
-    /// session with no binding is on that list already, for its binding (#193).
+    /// #1230: a snapshot written before #1230 (or by a rolled-back 0.1.x) has no
+    /// uplink endpoints. A native 5G SM context is kept whole, its endpoint left to
+    /// be recovered on first need: nothing is released. An EPS→5GS-migrated one (an
+    /// inherited CP SEID) is listed for release with #39 at boot.
     #[test]
-    fn a_pre_1230_snapshots_sessions_are_released_at_boot() {
-        let path = temp_state_path("ul-endpoint-v2");
-        let mut b = binding(
+    fn a_snapshot_without_endpoints_keeps_its_sessions() {
+        let path = temp_state_path("ul-endpoint-absent");
+        let b = binding(
             "imsi-001010000001230",
             5,
             [10, 45, 12, 31],
             crate::gsm_sm::GsmState::Operational,
         );
-        b.sm_context_status_uri = Some("http://amf.example/status/7".into());
-        b.nsac_admitted = true;
-        b.sst = 1;
         let doc = serde_json::json!({
             "version": 2,
-            "pfcpSessions": { "7": 0x07u64 },
-            "policyBindings": { "7": b },
+            "pfcpSessions": { "7": 0x07u64, "8": 0x08u64 },
+            "policyBindings": { "7": b.clone(), "8": b },
+            "cpN4Seids": { "8": 0x0123_0008u64 },
             "ipv4Allocations": ["10.45.12.31"],
         });
         std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
         let ctx = ctx_with_state(&path);
         let _ = std::fs::remove_file(&path);
-        let pending = ctx.unrestorable_sessions.read().unwrap().clone();
-        assert_eq!(pending.len(), 1, "{pending:?}");
-        let u = &pending[0];
-        assert_eq!(u.sm_context_ref, "7");
-        assert_eq!(u.status_uri.as_deref(), Some("http://amf.example/status/7"));
-        assert_eq!(u.ue_ip, Some([10, 45, 12, 31]));
+        assert!(ctx.unrestorable_sessions.read().unwrap().is_empty());
         assert_eq!(
-            u.nsac,
-            Some(("imsi-001010000001230".to_string(), 5, 1, None))
+            *ctx.reactivate_at_boot.read().unwrap(),
+            vec!["8".to_string()]
         );
-        assert!(u.reason.contains("uplink endpoint"), "{}", u.reason);
+        assert!(ctx.pfcp_sessions.read().unwrap().contains_key("7"), "kept");
+        assert!(
+            ctx.policy_bindings.read().unwrap().contains_key("7"),
+            "kept"
+        );
+        assert!(ctx.upf_ul_endpoints.read().unwrap().get("7").is_none());
     }
 
     /// A version-1 snapshot's sessions keep the legacy CP SEID (`ref | 0x1000`): the
