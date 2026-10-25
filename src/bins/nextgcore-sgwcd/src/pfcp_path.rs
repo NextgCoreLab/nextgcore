@@ -758,6 +758,42 @@ impl SxaNode {
                 }
             }
         };
+        // #1126: an accepted association is recorded before it is answered, so
+        // a message the SGW-U sends right after the response finds it
+        // (TS 29.244 §6.2.6.2.1). Session restoration still follows the response.
+        let restarted = match (cause, &decoded) {
+            (PfcpCause::RequestAccepted, Ok(req)) => {
+                let reported = normalize_received(req.recovery_time_stamp);
+                let features = req.up_function_features.as_ref();
+                let restarted = {
+                    let mut peers = self.peers.write().await;
+                    let restarted = peers
+                        .get(&configured)
+                        .and_then(|p| p.recovery_time_stamp)
+                        .is_some_and(|stored| is_newer(reported, stored));
+                    peers.insert(
+                        configured,
+                        SxaPeer {
+                            addr: configured,
+                            state: PfcpNodeState::Associated,
+                            recovery_time_stamp: Some(reported),
+                            up_function_features: UpFunctionFeatures {
+                                ftup: features.map(|f| f.ftup).unwrap_or(false),
+                                empu: features.map(|f| f.empu).unwrap_or(false),
+                                bucp: features.map(|f| f.bucp).unwrap_or(false),
+                                ddnd: features.map(|f| f.ddnd).unwrap_or(false),
+                                dlbd: features.map(|f| f.dlbd).unwrap_or(false),
+                                ..Default::default()
+                            },
+                        },
+                    );
+                    restarted
+                };
+                self.refresh_peer_gauge().await;
+                Some((reported, restarted))
+            }
+            _ => None,
+        };
         let mut buf = BytesMut::new();
         AssociationSetupResponse::new(
             NodeId::new_ipv4(self.local_ip.octets()),
@@ -774,36 +810,9 @@ impl SxaNode {
                 from,
             )
             .await;
-        let (PfcpCause::RequestAccepted, Ok(req)) = (cause, decoded) else {
+        let Some((reported, restarted)) = restarted else {
             return;
         };
-        let reported = normalize_received(req.recovery_time_stamp);
-        let features = req.up_function_features.as_ref();
-        let restarted = {
-            let mut peers = self.peers.write().await;
-            let restarted = peers
-                .get(&configured)
-                .and_then(|p| p.recovery_time_stamp)
-                .is_some_and(|stored| is_newer(reported, stored));
-            peers.insert(
-                configured,
-                SxaPeer {
-                    addr: configured,
-                    state: PfcpNodeState::Associated,
-                    recovery_time_stamp: Some(reported),
-                    up_function_features: UpFunctionFeatures {
-                        ftup: features.map(|f| f.ftup).unwrap_or(false),
-                        empu: features.map(|f| f.empu).unwrap_or(false),
-                        bucp: features.map(|f| f.bucp).unwrap_or(false),
-                        ddnd: features.map(|f| f.ddnd).unwrap_or(false),
-                        dlbd: features.map(|f| f.dlbd).unwrap_or(false),
-                        ..Default::default()
-                    },
-                },
-            );
-            restarted
-        };
-        self.refresh_peer_gauge().await;
         log::info!(
             "PFCP association set up by SGW-U {from} (Recovery Time Stamp {reported}{})",
             if restarted { ", a restart" } else { "" }
@@ -1502,6 +1511,17 @@ pub fn send_session_deletion_request(
         gtp_xact_id
     );
     enqueue(&msg, sess.id, continuation)
+}
+
+/// Delete the SGW-U session `up_seid` that no local session holds any more: one
+/// whose Establishment Response arrived after its session was removed. No MME
+/// waits for it.
+pub fn send_session_deletion_for_seid(up_seid: u64, sess_id: u64) -> Result<(), String> {
+    let mut msg = PfcpMessage::new(sxa_build::pfcp_type::SESSION_DELETION_REQUEST, up_seid);
+    let mut body = bytes::BytesMut::new();
+    nextgcore_pfcp::message::SessionDeletionRequest::new().encode(&mut body);
+    msg.data = body.to_vec();
+    enqueue(&msg, sess_id, S11Continuation::None)
 }
 
 /// Send Session Report Response to SGW-U
@@ -2654,7 +2674,21 @@ mod tests {
             (header, rsp)
         }
 
+        // #1126: the response follows the recording. While the peer table is
+        // held the SGW-C cannot record the association, so it must not answer.
+        let held = node.peers.read().await;
         up.send_to(&setup(0x51), node.local_addr()).await.unwrap();
+        let mut probe = [0u8; 512];
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                up.recv_from(&mut probe)
+            )
+            .await
+            .is_err(),
+            "not answered before the association is recorded"
+        );
+        drop(held);
         let (header, rsp) = answer(&up).await;
         assert_eq!(
             header.message_type as u8,

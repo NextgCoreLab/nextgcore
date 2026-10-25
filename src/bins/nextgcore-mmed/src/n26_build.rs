@@ -1112,6 +1112,29 @@ pub fn build_relocation_cancel_request(
     msg
 }
 
+/// The IMSI digits of a Relocation Cancel Request (TS 29.274 Table 7.3.16-1), #963: this
+/// MME is the target of a 5GS to EPS handover the source AMF cancels.
+pub fn relocation_cancel_request_imsi(msg: &Gtp2Message) -> Option<String> {
+    let ie = msg.get_ie(Gtp2IeType::Imsi as u8, 0)?;
+    Some(bcd_to_string(&ie.value)).filter(|d| !d.is_empty())
+}
+
+/// Build a **Relocation Cancel Response** (TS 29.274 §7.3.17, type 140), #963: the Cause
+/// alone (Table 7.3.17-1), addressed to the source AMF's TEID when known, else 0 (§5.5.2).
+pub fn build_relocation_cancel_response(
+    sequence_number: u32,
+    amf_teid: u32,
+    cause: u8,
+) -> Gtp2Message {
+    let mut msg = Gtp2Message::new(Gtp2Header::new(
+        Gtp2MessageType::RelocationCancelResponse as u8,
+        amf_teid,
+        sequence_number,
+    ));
+    msg.add_ie(Gtp2CauseIe::new(cause).to_ie(0));
+    msg
+}
+
 /// The Cause of a Relocation Cancel Response (TS 29.274 §7.3.17, Table 7.3.17-1).
 pub fn relocation_cancel_response_cause(msg: &Gtp2Message) -> Option<u8> {
     let ie = msg.get_ie(Gtp2IeType::Cause as u8, 0)?;

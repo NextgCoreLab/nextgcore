@@ -313,10 +313,28 @@ mod tests {
     /// `mmed::config`'s tests use.
     const SHIPPED_CONFIG: &str = "../../../docker/rust/configs/epc/sgwc.yaml";
 
-    fn write_temp(name: &str, content: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(name);
+    /// A temporary config file, removed when dropped.
+    struct TempConfig(std::path::PathBuf);
+
+    impl std::ops::Deref for TempConfig {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempConfig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn write_temp(name: &str, content: &str) -> TempConfig {
+        // Per process, so concurrent test processes (the parallel flake loops,
+        // #1111) do not overwrite each other's file.
+        let path = std::env::temp_dir().join(format!("{}-{name}", std::process::id()));
         std::fs::write(&path, content).unwrap();
-        path
+        TempConfig(path)
     }
 
     /// The headline fix: the shipped file's `pfcp.client.sgwu` resolves to the SGW-U's
