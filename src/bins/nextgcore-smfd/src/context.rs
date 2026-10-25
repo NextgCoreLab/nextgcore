@@ -1882,19 +1882,6 @@ pub struct SmfContext {
     /// tell an AMF about a context it released long ago.
     pub unrestorable_sessions: RwLock<Vec<UnrestorableSession>>,
 
-    /// Last Recovery Time Stamp each UPF peer reported (issue #191), keyed by
-    /// `PfcpClient::recovery_time_stamp_key`: the configured `host:port` for a UPF
-    /// named by hostname (#722), the socket address for a literal one.
-    ///
-    /// Persisted with the session map because it is what makes restoring that map
-    /// safe: on the first Association Setup after a reload, `check_peer_restart`
-    /// compares the freshly reported value against this one and flushes the
-    /// restored sessions if the UPF restarted while the SMF was down (TS 29.244
-    /// §5.22, TS 23.527 §4.2). Without it the restored `peer_recovery_time_stamp`
-    /// is `None`, no restart is detectable, and the SMF believes in N4 sessions
-    /// the UPF has already discarded.
-    pub upf_recovery_time_stamps: RwLock<HashMap<String, u32>>,
-
     /// Durable snapshot of the PFCP session map, the policy bindings and the
     /// IPv4 pool's allocations (issue #191). Disabled unless a state file is
     /// configured, in which case behaviour is byte-identical to before.
@@ -2010,7 +1997,6 @@ impl SmfContext {
             is_global: false,
             unrestorable_sessions: RwLock::new(Vec::new()),
             policy_bindings: RwLock::new(HashMap::new()),
-            upf_recovery_time_stamps: RwLock::new(HashMap::new()),
             state: nextgcore_core::state_store::StateStore::disabled(),
         }
     }
@@ -2146,26 +2132,25 @@ impl SmfContext {
     /// wedging the NF, which no amount of snapshot precision is worth.
     fn snapshot(&self) -> serde_json::Value {
         // Each of these acquires and releases before the next begins.
-        let pfcp_sessions: std::collections::BTreeMap<String, u64> = self
-            .pfcp_sessions
-            .read()
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())
-            .unwrap_or_default();
-        let policy_bindings: std::collections::BTreeMap<String, PolicyBinding> = self
-            .policy_bindings
-            .read()
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-            .unwrap_or_default();
-        let upf_rts: std::collections::BTreeMap<String, u32> = self
-            .upf_recovery_time_stamps
-            .read()
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())
-            .unwrap_or_default();
-        let cp_n4_seids: std::collections::BTreeMap<String, u64> = self
-            .cp_n4_seids
-            .read()
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())
-            .unwrap_or_default();
+        // #1178: a poisoned map is read through the poison. Its contents are what the
+        // panicking writer left, which is the state the SMF runs on; the empty default
+        // written instead replaced the last good snapshot with nothing, and the next
+        // restart restored no session.
+        let pfcp_sessions: std::collections::BTreeMap<String, u64> =
+            read_through(&self.pfcp_sessions, "pfcp_sessions")
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect();
+        let policy_bindings: std::collections::BTreeMap<String, PolicyBinding> =
+            read_through(&self.policy_bindings, "policy_bindings")
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+        let cp_n4_seids: std::collections::BTreeMap<String, u64> =
+            read_through(&self.cp_n4_seids, "cp_n4_seids")
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect();
         // #994: per SM context, keyed by the reference like `cpN4Seids`. EPC sessions
         // are not durable, so theirs are not written.
         let far_peers: std::collections::BTreeMap<
@@ -2184,15 +2169,11 @@ impl SmfContext {
                     )
                 })
                 .collect();
-            self.far_peers
-                .read()
-                .map(|m| {
-                    seids
-                        .into_iter()
-                        .filter_map(|(r, seid)| m.get(&seid).map(|f| (r, f.clone())))
-                        .collect()
-                })
-                .unwrap_or_default()
+            let m = read_through(&self.far_peers, "far_peers");
+            seids
+                .into_iter()
+                .filter_map(|(r, seid)| m.get(&seid).map(|f| (r, f.clone())))
+                .collect()
         };
         // #1031: per SM context, keyed by the reference like `cpN4Seids`.
         let session_upfs: std::collections::BTreeMap<String, String> = {
@@ -2208,15 +2189,11 @@ impl SmfContext {
                     )
                 })
                 .collect();
-            self.session_upfs
-                .read()
-                .map(|m| {
-                    seids
-                        .into_iter()
-                        .filter_map(|(r, seid)| m.get(&seid).map(|k| (r, k.clone())))
-                        .collect()
-                })
-                .unwrap_or_default()
+            let m = read_through(&self.session_upfs, "session_upfs");
+            seids
+                .into_iter()
+                .filter_map(|(r, seid)| m.get(&seid).map(|k| (r, k.clone())))
+                .collect()
         };
         // Ascending already (see `Ipv4Pool::allocated_addrs`), and as strings so
         // the file is readable by an operator diagnosing a double assignment.
@@ -2235,15 +2212,13 @@ impl SmfContext {
             "pfcpSessions": pfcp_sessions,
             "policyBindings": policy_bindings,
             "ipv4Allocations": ipv4_allocations,
-            "upfRecoveryTimeStamps": upf_rts,
             "cpN4Seids": cp_n4_seids,
             "farPeers": far_peers,
             "sessionUpfs": session_upfs,
-            "failedUpPaths": self
-                .failed_up_paths
-                .read()
-                .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect::<std::collections::BTreeMap<_, _>>())
-                .unwrap_or_default(),
+            "failedUpPaths": read_through(&self.failed_up_paths, "failed_up_paths")
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect::<std::collections::BTreeMap<_, _>>(),
             "bootEpoch": self.boot_epoch.load(Ordering::SeqCst),
         })
     }
@@ -2264,12 +2239,14 @@ impl SmfContext {
     ///
     /// A restored `sm_context_ref -> SEID` mapping is SMF-side bookkeeping about
     /// state that lives on the UPF, and the UPF may have restarted while the SMF
-    /// was down. That is why `upfRecoveryTimeStamps` is part of the same document:
-    /// seeding it back into each `PfcpClient` (see `main`) makes the existing
-    /// `check_peer_restart` comparison fire on the first Association Setup after a
-    /// reload, which tears the association down and flushes exactly these restored
-    /// sessions. Reconciling *which* sessions survived, and telling peers about the
-    /// ones that did not, is TS 23.527 restoration signalling and belongs to #193.
+    /// was down. The first Association Setup after a reload asks the UPF to retain
+    /// the sessions this SMF holds (#718, TS 29.244 §6.2.6.2.1); one that does not
+    /// confirm it (PSREI) tears the association down and flushes exactly these
+    /// restored sessions. A peer Recovery Time Stamp is not persisted for this
+    /// (#966): TS 23.007 §19A keeps it in volatile memory and has the Association
+    /// Setup's stamp ignored. Reconciling *which* sessions survived, and telling
+    /// peers about the ones that did not, is TS 23.527 restoration signalling and
+    /// belongs to #193.
     fn restore_from(
         &self,
         doc: &serde_json::Value,
@@ -2370,10 +2347,10 @@ impl SmfContext {
                     .collect()
             })
             .unwrap_or_default();
-        let upf_rts: HashMap<String, u32> = doc
-            .get("upfRecoveryTimeStamps")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
+        // #966: a pre-#966 snapshot's `upfRecoveryTimeStamps` is not read. TS 23.007
+        // §19A keeps a peer's Recovery Time Stamp in volatile memory, cleared at a
+        // restart; whether the UPF still holds the restored sessions is the session
+        // retention's answer at the first Association Setup (#718), not a stamp's.
 
         // #475: absent in every snapshot written before it existed, which is exactly the
         // set with no EPS→5GS-migrated contexts in it, so an empty default is correct.
@@ -2419,7 +2396,6 @@ impl SmfContext {
 
         let n_sessions = pfcp_sessions.len();
         let n_bindings = policy_bindings.len();
-        let n_rts = upf_rts.len();
 
         // #994: absent before it existed; then nothing is known about the restored
         // sessions' GTP-U peers until their next modification, as before.
@@ -2461,16 +2437,6 @@ impl SmfContext {
         }
         if let Ok(mut map) = self.policy_bindings.write() {
             map.extend(policy_bindings);
-        }
-        if let Ok(mut map) = self.upf_recovery_time_stamps.write() {
-            // #995, one-way migration: a pre-#995 snapshot holds Unix-seconds stamps.
-            // They are loaded in the NTP reading (and written back so on the next
-            // persist), so a UPF that did not restart is not taken for one that did.
-            map.extend(
-                upf_rts
-                    .into_iter()
-                    .map(|(k, v)| (k, nextgcore_pfcp::recovery_time::normalize_received(v))),
-            );
         }
         if let Ok(mut map) = self.cp_n4_seids.write() {
             map.extend(cp_n4_seids);
@@ -2524,9 +2490,9 @@ impl SmfContext {
         let restored = n_sessions + n_bindings + n_addrs;
         log::info!(
             "SMF durable state restored: {n_sessions} PFCP session(s), {n_bindings} policy \
-             binding(s), {n_addrs} IPv4 allocation(s) re-marked, {n_rts} UPF recovery time \
-             stamp(s). The PFCP sessions are UNRECONCILED: they are flushed on the first \
-             Association Setup if the UPF reports a changed Recovery Time Stamp."
+             binding(s), {n_addrs} IPv4 allocation(s) re-marked. The PFCP sessions are \
+             UNRECONCILED: they are flushed on the first Association Setup if the UPF does \
+             not confirm it retained them (PSREI)."
         );
         Ok(restored)
     }
@@ -2676,43 +2642,6 @@ impl SmfContext {
             // answered and will not survive a restart.
             log::error!("SMF state was NOT persisted: {e}");
         }
-    }
-
-    /// Record the Recovery Time Stamp a UPF peer reported under `peer`, its key
-    /// (`PfcpClient::recovery_time_stamp_key`), and persist it.
-    pub fn note_upf_recovery_time_stamp(&self, peer: &str, rts: u32) {
-        let changed = {
-            match self.upf_recovery_time_stamps.write() {
-                Ok(mut map) => map.insert(peer.to_string(), rts) != Some(rts),
-                Err(_) => false,
-            }
-        };
-        // Only on a change: the association loop re-reports the same stamp on
-        // every heartbeat, and rewriting the whole snapshot every 10s per peer
-        // for an unchanged value is pure write amplification.
-        if changed {
-            self.persist();
-        }
-    }
-
-    /// Forget the stamp recorded under `key`, persisting the change (#722 review M3).
-    pub fn forget_upf_recovery_time_stamp(&self, key: &str) {
-        let removed = match self.upf_recovery_time_stamps.write() {
-            Ok(mut map) => map.remove(key).is_some(),
-            Err(_) => false,
-        };
-        if removed {
-            self.persist();
-        }
-    }
-
-    /// The Recovery Time Stamp last recorded for `peer`, if any.
-    pub fn upf_recovery_time_stamp(&self, peer: &str) -> Option<u32> {
-        self.upf_recovery_time_stamps
-            .read()
-            .ok()?
-            .get(peer)
-            .copied()
     }
 
     /// Check if context is initialized
@@ -3862,6 +3791,19 @@ pub fn smf_instance_get_load() -> i32 {
 // Tests
 // ============================================================================
 
+/// Read `lock` for the durable snapshot, through a poison (#1178): logged, and the
+/// data the panicking writer left is what is written. Falling back to an empty map
+/// wrote that over the last good snapshot.
+fn read_through<'a, T>(lock: &'a RwLock<T>, what: &str) -> std::sync::RwLockReadGuard<'a, T> {
+    lock.read().unwrap_or_else(|poisoned| {
+        log::error!(
+            "SMF state: the {what} lock is poisoned (a panic while it was held); the \
+             snapshot is taken through the poison"
+        );
+        poisoned.into_inner()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4141,32 +4083,34 @@ mod tests {
         assert!(b < FIVE_G_CP_SEID_BASE, "EPC SEIDs stay below the 5G range");
     }
 
-    /// #995, one-way migration: a pre-#995 snapshot holds UPF Recovery Time Stamps in
-    /// Unix seconds. They load in the NTP reading (TS 29.244 §8.2.65), and an NTP one
-    /// is left as it is.
+    /// #966: a pre-#966 snapshot's `upfRecoveryTimeStamps` is not read, and the next
+    /// persist does not write it back. TS 23.007 §19A keeps a peer's Recovery Time
+    /// Stamp in volatile memory; the rest of the snapshot restores as before.
     #[test]
-    fn pre_995_unix_recovery_time_stamps_load_as_ntp() {
-        let started_unix = 1_767_225_600u64; // 2026-01-01, a UPF up since then
-        let ntp = nextgcore_pfcp::recovery_time::from_unix_secs(started_unix);
-        let path = temp_state_path("995-rts");
+    fn a_pre_966_snapshots_upf_recovery_time_stamps_are_dropped() {
+        let path = temp_state_path("966-rts");
         let doc = serde_json::json!({
             "version": SmfContext::SNAPSHOT_VERSION,
-            "pfcpSessions": {},
+            "pfcpSessions": { "96610": 7 },
             "policyBindings": {},
             "ipv4Allocations": [],
-            "upfRecoveryTimeStamps": { "upf-legacy:8805": started_unix, "upf-new:8805": ntp }
+            "upfRecoveryTimeStamps": { "upf-a:8805": 3_976_214_400u32 }
         });
         std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
         let ctx = ctx_with_state(&path);
         assert_eq!(
-            ctx.upf_recovery_time_stamp("upf-legacy:8805"),
-            Some(ntp),
-            "migrated"
+            ctx.pfcp_sessions.read().unwrap().get("96610").copied(),
+            Some(7),
+            "the sessions still restore"
         );
-        assert_eq!(
-            ctx.upf_recovery_time_stamp("upf-new:8805"),
-            Some(ntp),
-            "unchanged"
+        ctx.persist();
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(written.get("pfcpSessions").is_some(), "{written}");
+        assert!(
+            written.get("upfRecoveryTimeStamps").is_none(),
+            "no remote stamp is persisted: {written}"
         );
     }
 
@@ -4518,6 +4462,56 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// #1178: a map poisoned by a panic while it was written is snapshotted through
+    /// the poison. Read with `unwrap_or_default`, it was written as empty over the last
+    /// good snapshot, and a restart restored no session and no binding.
+    #[test]
+    fn a_poisoned_map_is_snapshotted_through_the_poison() {
+        let path = temp_state_path("1178-poison");
+        let ctx = ctx_with_state(&path);
+        ctx.pfcp_sessions
+            .write()
+            .unwrap()
+            .insert("11780".to_string(), 0x1178);
+        ctx.policy_bindings
+            .write()
+            .unwrap()
+            .insert("11780".to_string(), PolicyBinding::snapshot_default());
+        let addr = ctx.ipv4_pool.allocate().expect("an address");
+        ctx.persist();
+        // A panic while each lock is held for writing.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ctx.pfcp_sessions.write().unwrap();
+            panic!("poison pfcp_sessions");
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ctx.policy_bindings.write().unwrap();
+            panic!("poison policy_bindings");
+        }));
+        assert!(ctx.pfcp_sessions.is_poisoned() && ctx.policy_bindings.is_poisoned());
+        ctx.persist();
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let restored = ctx_with_state(&path);
+        let restored_session = restored.pfcp_sessions.read().unwrap().get("11780").copied();
+        let restored_binding = restored
+            .policy_bindings
+            .read()
+            .unwrap()
+            .contains_key("11780");
+        let restored_addr = restored.ipv4_pool.allocated_addrs().contains(&addr);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(written["pfcpSessions"]["11780"], serde_json::json!(0x1178));
+        assert_eq!(
+            restored_session,
+            Some(0x1178),
+            "the session survives the poison"
+        );
+        assert!(restored_binding, "and its binding");
+        assert!(restored_addr, "and its address");
+    }
+
     /// The whole point of #191: a session created before a restart, and the
     /// address it holds, are both still there afterwards.
     #[test]
@@ -4547,7 +4541,6 @@ mod tests {
                 );
             }
             ctx.persist();
-            ctx.note_upf_recovery_time_stamp("127.0.0.1:8805", 4242);
             addr
         };
 
@@ -4585,11 +4578,6 @@ mod tests {
             b.fsm.state,
             crate::gsm_sm::GsmState::Operational,
             "a binding restored into Initial would re-run establishment for a live session"
-        );
-        assert_eq!(
-            restored_ctx.upf_recovery_time_stamp("127.0.0.1:8805"),
-            Some(4242),
-            "without the peer stamp the restored session map can never be checked"
         );
         // The allocation itself, not merely the copy of it inside the binding.
         assert!(
@@ -4713,7 +4701,6 @@ mod tests {
             sessions.insert("ref-x".to_string(), 7);
         }
         ctx.persist();
-        ctx.note_upf_recovery_time_stamp("127.0.0.1:8805", 11);
         let ue = ctx.ue_add_by_supi("imsi-001010000000002").expect("ue");
         let sess = ctx.sess_add_by_psi(ue.id, 1).expect("sess");
         ctx.sess_remove(sess.id);
