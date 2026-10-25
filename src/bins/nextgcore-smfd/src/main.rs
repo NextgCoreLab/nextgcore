@@ -5285,12 +5285,13 @@ fn handover_preparing_response(sm_context_ref: &str, required: Option<&[u8]>) ->
         ))
 }
 
-/// Answer `HANDOVER_RES_ALLOC_FAIL` (#964, TS 29.502 §5.2.2.3.4.2): `hoState: CANCELLED`
-/// with a Handover Preparation Unsuccessful Transfer (`HANDOVER_PREP_FAIL`) carrying the
-/// target's cause. The session's preparation is dropped; its user plane stays as it is.
+/// Answer `HANDOVER_RES_ALLOC_FAIL` (#964, #1203, TS 29.502 §5.2.2.3.4.2 step 4b): the SMF
+/// cannot proceed with the handover of this session, so it sets the hoState to NONE and
+/// answers 403 SmContextUpdateError, cause `HANDOVER_RESOURCE_ALLOCATION_FAILURE` (Table
+/// 6.1.3.3.4.2.2-2), with `hoState: NONE` and a Handover Preparation Unsuccessful Transfer
+/// (`HANDOVER_PREP_FAIL`) carrying the target's cause. The session's preparation is
+/// dropped; its user plane stays as it is.
 fn handover_allocation_failed_response(sm_context_ref: &str, alloc_fail: &[u8]) -> SbiResponse {
-    use nextgcore_sbi::constants::content_type;
-    use nextgcore_sbi::message::SbiPart;
     let Some(mut sess) = smf_self()
         .read()
         .ok()
@@ -5321,20 +5322,15 @@ fn handover_allocation_failed_response(sm_context_ref: &str, alloc_fail: &[u8]) 
     }
     log::warn!(
         "SM Context Update (HANDOVER_RES_ALLOC_FAIL) for ref={sm_context_ref}: the target \
-         could not admit the session; CANCELLED, the session stays on the source"
+         could not admit the session; hoState NONE, the session stays on the source"
     );
-    let body = serde_json::json!({
-        "hoState": "CANCELLED",
-        "n2SmInfoType": "HANDOVER_PREP_FAIL",
-        "n2SmInfo": { "contentId": "n2SmInfo" },
-    });
-    SbiResponse::with_status(200)
-        .with_body(body.to_string(), content_type::APPLICATION_JSON)
-        .with_part(SbiPart::with_content(
-            "n2SmInfo",
-            content_type::APPLICATION_NGAP,
-            bytes::Bytes::from(n2),
-        ))
+    eps_to_5gs::sm_context_update_error_with(
+        403,
+        "HANDOVER_RESOURCE_ALLOCATION_FAILURE",
+        "the target 5G-AN failed to establish resources for the PDU session",
+        serde_json::json!({ "hoState": "NONE" }),
+        Some(("HANDOVER_PREP_FAIL", n2)),
+    )
 }
 
 /// The UPF's N3 uplink endpoint for an SM context, if establishment recorded one (#70).
@@ -5795,8 +5791,9 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
             // not admit this session. The source still serves the UE, so the user plane
             // is NOT touched here (deactivating the DL FAR now would cut the downlink the
             // source is still delivering); the AMF deactivates the session once the UE has
-            // moved. The answer is `hoState: CANCELLED` with the Handover Preparation
-            // Unsuccessful Transfer the HANDOVER COMMAND's release list carries.
+            // moved. The answer is the step 4b SmContextUpdateError (403, `hoState: NONE`,
+            // #1203) with the Handover Preparation Unsuccessful Transfer the HANDOVER
+            // COMMAND's release list carries.
             let alloc_fail = resolve_binary_ref(request, &req_body["n2SmInfo"]).unwrap_or_default();
             handover_allocation_failed_response(sm_context_ref, &alloc_fail)
         }
@@ -21917,8 +21914,10 @@ mod tests {
     ///   Handover Command Transfer (`HANDOVER_CMD`) naming the target's forwarding tunnel
     ///   and the flow it accepted for forwarding; the target DL tunnel is recorded and
     ///   the UPF is not touched;
-    /// - `HANDOVER_RES_ALLOC_FAIL` is answered CANCELLED with a Handover Preparation
-    ///   Unsuccessful Transfer carrying the target's cause, and the session's DL is
+    /// - `HANDOVER_RES_ALLOC_FAIL` is answered with the step 4b SmContextUpdateError
+    ///   (403 `HANDOVER_RESOURCE_ALLOCATION_FAILURE`, `hoState: NONE`, #1203) with a
+    ///   Handover Preparation Unsuccessful Transfer carrying the target's cause, and the
+    ///   session's DL is
     ///   left alone (it used to be deactivated, cutting the source's downlink).
     #[tokio::test]
     async fn n2_handover_steps_answer_with_the_transfers_each_side_needs() {
@@ -22059,10 +22058,17 @@ mod tests {
             ),
         )
         .await;
-        assert_eq!(resp.status, 200);
+        // #1203, TS 29.502 §5.2.2.3.4.2 step 4b: an SmContextUpdateError, not a 200.
+        assert_eq!(resp.status, 403);
         let (root, n2) = ho_answer(&resp);
-        assert_eq!(root["hoState"], "CANCELLED");
+        assert_eq!(root["error"]["status"], 403);
+        assert_eq!(
+            root["error"]["cause"],
+            "HANDOVER_RESOURCE_ALLOCATION_FAILURE"
+        );
+        assert_eq!(root["hoState"], "NONE");
         assert_eq!(root["n2SmInfoType"], "HANDOVER_PREP_FAIL");
+        assert_eq!(root["n2SmInfo"]["contentId"], "n2SmInfo");
         let unsuccessful = n2.expect("the Unsuccessful Transfer");
         let decoded = nextgcore_ngap_gen::decode_contained::<
             g::HandoverPreparationUnsuccessfulTransfer,
@@ -22085,6 +22091,73 @@ mod tests {
             sess.up_cnx_state,
             context::UpCnxState::Activated,
             "the source still serves the session"
+        );
+    }
+
+    /// #1203 strict peer, TS 29.502 §5.2.2.3.4.2 step 4b: amfd's real N2 handover client
+    /// (`call_smf_n2_handover_step`) sends this SMF's real SBI handler, over HTTP/2, the
+    /// target's Handover Resource Allocation Unsuccessful Transfer as PREPARED /
+    /// HANDOVER_RES_ALLOC_FAIL. What comes back is a refusal: a 403 SmContextUpdateError
+    /// whose cause is HANDOVER_RESOURCE_ALLOCATION_FAILURE, and whose multipart
+    /// `n2SmInfo` is a Handover Preparation Unsuccessful Transfer (TS 38.413
+    /// §9.3.4.18) carrying the target's cause. It was a 200 with `hoState: CANCELLED`.
+    #[tokio::test]
+    async fn the_amf_gets_the_step_4b_refusal_for_a_session_the_target_refused() {
+        use nextgcore_ngap_gen::generated as g;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let reference = seed_registered_session("imsi-001010000001203", 5, "internet");
+        seed_user_plane(&reference, (0x0012_0300, [10, 45, 12, 3]));
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        server
+            .start(smf_sbi_request_handler)
+            .await
+            .expect("the SMF serves");
+
+        let alloc_fail = nextgcore_ngap_gen::encode_contained(
+            &g::HandoverResourceAllocationUnsuccessfulTransfer {
+                cause: g::Cause::RadioNetwork(g::CauseRadioNetwork(
+                    g::CauseRadioNetwork::RADIO_RESOURCES_NOT_AVAILABLE,
+                )),
+                criticality_diagnostics: None,
+                ie_extensions: None,
+            },
+        )
+        .expect("encodes");
+        let answer = nextgcore_amfd::sbi_path::call_smf_n2_handover_step(
+            "127.0.0.1",
+            addr.port(),
+            &reference,
+            "PREPARED",
+            Some(("HANDOVER_RES_ALLOC_FAIL", &alloc_fail)),
+            None,
+            None,
+        )
+        .await;
+        let _ = server.stop().await;
+
+        let refusal = answer.expect_err("step 4b is an error response");
+        assert!(refusal.reason.contains("403"), "{refusal:?}");
+        assert!(
+            refusal
+                .reason
+                .contains("HANDOVER_RESOURCE_ALLOCATION_FAILURE"),
+            "{refusal:?}"
+        );
+        let transfer = refusal
+            .preparation_unsuccessful_transfer()
+            .expect("HANDOVER_PREP_FAIL n2SmInfo");
+        assert_eq!(
+            nextgcore_amfd::ngap_asn1::handover_preparation_unsuccessful_cause(transfer),
+            Some(nextgcore_ngap::types::Cause::RadioNetwork(
+                nextgcore_ngap::types::CauseRadioNetwork::RadioResourcesNotAvailable
+            )),
+            "the target's cause"
         );
     }
 
