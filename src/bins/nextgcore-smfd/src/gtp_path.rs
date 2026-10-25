@@ -679,7 +679,7 @@ impl GtpPathManager {
         sess: &SmfSess,
         bearer: &SmfBearer,
         linked_ebi: u8,
-        tft: Option<&[u8]>,
+        tft: &[u8],
     ) -> GtpSendResult {
         let xact_id =
             self.create_local_xact(gtp2_message_type::CREATE_BEARER_REQUEST, Some(sess.id));

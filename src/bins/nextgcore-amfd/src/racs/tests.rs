@@ -328,10 +328,14 @@ fn nas_sends_an_assigned_id_once_and_only_to_a_racs_ue() {
         nas_ies_for(&mut ue, NasMessage::RegistrationAccept),
         vec![0x67, 0x07, 0x01, 0x05, 0x00, 0x00, 0x00, 0x00, 0x10]
     );
+    // #889: sent, but delivered only on the COMPLETE of the armed message.
+    assert!(!ue.ue_radio_capability_id_known_to_ue);
+    arm_in_flight(&mut ue);
+    commit_in_flight(&mut ue);
     assert!(ue.ue_radio_capability_id_known_to_ue);
     assert!(
         nas_ies_for(&mut ue, NasMessage::RegistrationAccept).is_empty(),
-        "sent once"
+        "sent once it is acknowledged"
     );
 
     let mut no_racs = crate::context::AmfUe::default();
@@ -361,7 +365,14 @@ fn a_deleted_id_becomes_the_deletion_indication() {
         vec![0xE1]
     );
     assert_eq!(ue.ue_radio_capability_id, None);
-    // Sent once: the ID is gone from the context.
+    // #889: owed until acknowledged, so a message that was not answered does
+    // not lose it.
+    assert_eq!(
+        nas_ies_for(&mut ue, NasMessage::RegistrationAccept),
+        vec![0xE1]
+    );
+    arm_in_flight(&mut ue);
+    commit_in_flight(&mut ue);
     assert!(nas_ies_for(&mut ue, NasMessage::RegistrationAccept).is_empty());
 
     // In a CONFIGURATION UPDATE COMMAND the same IE has IEI A (table 8.2.19.1.1).

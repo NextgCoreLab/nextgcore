@@ -481,6 +481,7 @@ pub async fn collect<T: NrppaTransport>(
                     {
                         match h.rx_tx_ns {
                             Some(rx_tx) => cells.push(CellMeasurement {
+                                nr_ecid: None,
                                 nr_cgi: crate::context::trp_key(&m.node, h.trp_id),
                                 dl_prs_id: Some(*id),
                                 ..gnb_half(0, rx_tx, h.time)
@@ -523,6 +524,7 @@ pub async fn collect<T: NrppaTransport>(
 /// The gNB half of TRP `pci` as a measurement.
 pub fn gnb_half(pci: u16, rx_tx_ns: f64, time: Option<answers::SlotTime>) -> CellMeasurement {
     CellMeasurement {
+        nr_ecid: None,
         nr_cgi: format!("pci-{pci}"),
         rsrp: None,
         rsrq: None,

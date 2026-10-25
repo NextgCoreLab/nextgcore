@@ -510,30 +510,100 @@ pub(crate) fn reset_for_tests() {
 // NAS
 // ---------------------------------------------------------------------------
 
+/// What a REGISTRATION ACCEPT or CONFIGURATION UPDATE COMMAND delivers (#889).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RacsDelivery {
+    /// The UE radio capability ID IE, with this ID (§9.11.3.68).
+    Id(Vec<u8>),
+    /// The UE radio capability ID deletion indication (§9.11.3.69).
+    Deletion,
+}
+
+/// The RACS IEs of the NAS message last built for a UE, until its COMPLETE (#889).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RacsInFlight {
+    pub delivery: RacsDelivery,
+    /// Set when the message's retransmission timer is armed
+    /// ([`arm_in_flight`]). A later arming for another message drops the marker.
+    pub armed: bool,
+}
+
 /// The RACS IEs to append to a REGISTRATION ACCEPT or CONFIGURATION UPDATE COMMAND
-/// for a UE (TS 24.501 §5.5.1.2.4, §5.4.4.2), and what they change on the UE.
+/// for a UE (TS 24.501 §5.5.1.2.4, §5.4.4.2).
 ///
-/// Only for a UE that set the RACS bit. A retired ID gets the deletion indication
-/// (§9.11.3.69) and is dropped from the context; an ID the UE did not present this
-/// time (one the AMF learnt from the UCMF) is sent (§9.11.3.68).
+/// Only for a UE that set the RACS bit. A retired ID is dropped from the context,
+/// and the deletion indication (§9.11.3.69) is owed until the UE acknowledges it.
+/// An ID the UE does not hold yet (one the AMF learnt from the UCMF) is sent
+/// (§9.11.3.68).
+///
+/// #889: nothing counts as delivered here. TS 24.501 §5.5.1.2.4 / §5.5.1.3.4 and
+/// §5.4.4.3 make the ID valid only on the REGISTRATION COMPLETE or CONFIGURATION
+/// UPDATE COMPLETE, so what was sent is recorded in `racs_in_flight` and
+/// committed by [`commit_in_flight`]. A command that is aborted (§5.4.4.6: a
+/// REGISTRATION REQUEST, T3555 exhaustion, a lower layer failure) leaves it owed,
+/// and the next message carries it again.
 pub fn nas_ies_for(ue: &mut crate::context::AmfUe, message: NasMessage) -> Vec<u8> {
+    ue.racs_in_flight = None;
     if !ue.racs_supported {
         return Vec::new();
     }
+    if ue.ue_radio_capability_id.as_deref().is_some_and(is_retired) {
+        ue.ue_radio_capability_id = None;
+        ue.ue_radio_capability_id_known_to_ue = false;
+        ue.ue_radio_capability_id_deletion_owed = true;
+    }
     let mut out = Vec::new();
-    if let Some(id) = ue.ue_radio_capability_id.clone() {
-        if is_retired(&id) {
-            ue.ue_radio_capability_id = None;
-            ue.ue_radio_capability_id_known_to_ue = false;
-            out.push(message.deletion_iei() | DELETION_REQUESTED);
-        } else if !ue.ue_radio_capability_id_known_to_ue && id.len() <= 255 {
+    let delivery = match ue.ue_radio_capability_id.clone() {
+        Some(id) if !ue.ue_radio_capability_id_known_to_ue && id.len() <= 255 => {
             out.push(IEI_UE_RADIO_CAPABILITY_ID);
             out.push(id.len() as u8);
             out.extend_from_slice(&id);
-            ue.ue_radio_capability_id_known_to_ue = true;
+            RacsDelivery::Id(id)
         }
-    }
+        _ if ue.ue_radio_capability_id_deletion_owed => {
+            out.push(message.deletion_iei() | DELETION_REQUESTED);
+            RacsDelivery::Deletion
+        }
+        _ => return out,
+    };
+    ue.racs_in_flight = Some(RacsInFlight {
+        delivery,
+        armed: false,
+    });
     out
+}
+
+/// The retransmission timer of a NAS message was armed (#889): RACS IEs built
+/// for it stay with it; ones left from an earlier message are dropped, because
+/// that message's procedure is over or replaced.
+pub fn arm_in_flight(ue: &mut crate::context::AmfUe) {
+    match &mut ue.racs_in_flight {
+        Some(f) if !f.armed => f.armed = true,
+        Some(_) => ue.racs_in_flight = None,
+        None => {}
+    }
+}
+
+/// The REGISTRATION COMPLETE or CONFIGURATION UPDATE COMPLETE for the pending
+/// message came (#889): what it carried is now delivered. An ID replaced since
+/// (a newer one from the UCMF) is not marked known.
+pub fn commit_in_flight(ue: &mut crate::context::AmfUe) {
+    let Some(f) = ue.racs_in_flight.take() else {
+        return;
+    };
+    if !f.armed {
+        return;
+    }
+    match f.delivery {
+        RacsDelivery::Id(id) => {
+            if ue.ue_radio_capability_id.as_deref() == Some(id.as_slice()) {
+                ue.ue_radio_capability_id_known_to_ue = true;
+            }
+            // The new ID replaces the UE's network-assigned one (§5.4.4.3).
+            ue.ue_radio_capability_id_deletion_owed = false;
+        }
+        RacsDelivery::Deletion => ue.ue_radio_capability_id_deletion_owed = false,
+    }
 }
 
 // ---------------------------------------------------------------------------

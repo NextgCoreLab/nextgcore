@@ -415,3 +415,65 @@ fn the_relay_parser_reads_the_ppid_field() {
     ]);
     assert_eq!(data_chunk_ppids(&pkt), vec![60]);
 }
+
+/// #1129 review m1: a receive ended by the caller's wake (#981) still runs the
+/// associations' timers, as a timed-out one does. The client takes the server's
+/// DATA and never acknowledges it; with the server driven only by woken receives,
+/// its T3-rtx timer must still expire and retransmit (RFC 9260 §6.3.3).
+///
+/// (In this file for its sctp-proto test client and relay.)
+#[tokio::test]
+async fn a_woken_receive_still_runs_the_association_timers() {
+    let mut server = SctpServer::bind(
+        "127.0.0.1:0".parse().expect("addr"),
+        SctpServerConfig::default(),
+    )
+    .await
+    .expect("bind server");
+    let server_addr = server.local_addr();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    server.set_event_sender(tx);
+    let (relay_addr, wire) = spawn_relay(server_addr).await;
+    let driver = tokio::spawn(async move {
+        // Ordinary receives until the client's message is in, then one reply...
+        let association_id = loop {
+            server.recv(Duration::from_millis(10)).await.expect("recv");
+            if let Ok(ServerEvent::DataReceived { association_id, .. }) = rx.try_recv() {
+                break association_id;
+            }
+        };
+        server
+            .send_with_ppid(association_id, 0, b"unacked", NEXTGCORE_SCTP_S1AP_PPID)
+            .await
+            .expect("send");
+        // ...then only receives a wake ends at once.
+        loop {
+            let outcome = server
+                .recv_or_wake(Duration::from_secs(30), std::future::ready(()))
+                .await
+                .expect("recv_or_wake");
+            assert_eq!(outcome, nextgcore_sctp::RecvOutcome::Woken);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+    let mut client = TestClient::connect(relay_addr).await;
+    client.send(0, b"ngap", NGAP_PPID).await;
+    // The client is not pumped any more: the reply is never acknowledged.
+    let replies = || {
+        wire.lock()
+            .expect("relay log")
+            .iter()
+            .filter(|(d, p)| *d == Dir::ServerToClient && *p == NEXTGCORE_SCTP_S1AP_PPID)
+            .count()
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while replies() < 2 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    driver.abort();
+    assert!(
+        replies() >= 2,
+        "the unacknowledged DATA is retransmitted by the timer: {} sent",
+        replies()
+    );
+}
