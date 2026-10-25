@@ -76,6 +76,27 @@ pub struct PlmnId {
 }
 
 impl PlmnId {
+    /// `(mcc, mnc)` as digit strings, `None` for the unset (all-zero) PLMN (#1164
+    /// follow-up). A filler `0xf` third MNC digit is a two-digit MNC.
+    pub fn mcc_mnc(&self) -> Option<(String, String)> {
+        if *self == Self::default() {
+            return None;
+        }
+        let d = |v: u8| char::from_digit(u32::from(v), 10);
+        let mcc: String = [self.mcc1, self.mcc2, self.mcc3]
+            .into_iter()
+            .map(d)
+            .collect::<Option<String>>()?;
+        let mut mnc: String = [self.mnc1, self.mnc2]
+            .into_iter()
+            .map(d)
+            .collect::<Option<String>>()?;
+        if self.mnc3 != 0xf {
+            mnc.push(d(self.mnc3)?);
+        }
+        Some((mcc, mnc))
+    }
+
     pub fn new(mcc: &str, mnc: &str) -> Self {
         let mcc_bytes: Vec<u8> = mcc
             .chars()
@@ -1625,6 +1646,13 @@ pub struct PolicyBinding {
     /// DECREASE then uses this instance's current id.
     #[serde(default)]
     pub nsac_nf_id: Option<String>,
+    /// The NSACF that admitted the session (#1164 follow-up): its DECREASE goes there,
+    /// not to whichever NSACF a fresh discovery names then. With two NSACFs for one
+    /// slice, and the NRF's order changed since, the count leaked on the first one.
+    /// `None` for a snapshot written before it existed, or an admission through
+    /// `NSACF_URI`; the DECREASE then resolves the NSACF again.
+    #[serde(default)]
+    pub nsac_nsacf: Option<crate::policy::NsacfEndpoint>,
 }
 
 impl PolicyBinding {
@@ -1661,6 +1689,7 @@ impl PolicyBinding {
             sdm_subscription_id: None,
             nsac_admitted: false,
             nsac_nf_id: None,
+            nsac_nsacf: None,
         }
     }
 }

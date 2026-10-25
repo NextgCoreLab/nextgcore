@@ -304,8 +304,16 @@ async fn self_nf_id() -> String {
         .unwrap_or_else(|| "nextgcore-smf".to_string())
 }
 
-/// An admission taken for its count-out: SUPI, PSI, SST, SD and the INCREASE's nfId.
-type NsacTaken = (String, u8, u8, Option<String>, Option<String>);
+/// An admission taken for its count-out: SUPI, PSI, SST, SD, the INCREASE's nfId and
+/// the NSACF it went to (#1164 follow-up).
+type NsacTaken = (
+    String,
+    u8,
+    u8,
+    Option<String>,
+    Option<String>,
+    Option<policy::NsacfEndpoint>,
+);
 
 /// Count out at the NSACF every session still admitted there (#959), at most
 /// `budget`, 16 at once. Each admission is taken first (its binding's
@@ -330,6 +338,7 @@ async fn nsac_count_out_unreleased(budget: std::time::Duration) -> usize {
                             b.sst,
                             b.sd.clone(),
                             b.nsac_nf_id.clone(),
+                            b.nsac_nsacf.clone(),
                         )
                     })
                     .collect()
@@ -346,7 +355,7 @@ async fn nsac_count_out_unreleased(budget: std::time::Duration) -> usize {
     let total = admitted.len();
     let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
     let mut sends = tokio::task::JoinSet::new();
-    for (supi, psi, sst, sd, nf_id) in admitted {
+    for (supi, psi, sst, sd, nf_id, nsacf) in admitted {
         let Ok(Ok(permit)) =
             tokio::time::timeout_at(deadline, permits.clone().acquire_owned()).await
         else {
@@ -354,7 +363,16 @@ async fn nsac_count_out_unreleased(budget: std::time::Duration) -> usize {
         };
         sends.spawn(async move {
             let _permit = permit;
-            rollback_nsac_as(true, nf_id.as_deref(), &supi, psi, sst, sd.as_deref()).await
+            rollback_nsac_as(
+                true,
+                nf_id.as_deref(),
+                nsacf.as_ref(),
+                &supi,
+                psi,
+                sst,
+                sd.as_deref(),
+            )
+            .await
         });
     }
     let mut accepted = 0;
@@ -376,6 +394,9 @@ async fn nsac_count_out_unreleased(budget: std::time::Duration) -> usize {
     accepted
 }
 
+/// An NSAC outcome: whether admitted, the INCREASE's nfId, and the NSACF it went to.
+pub(crate) type NsacAdmitted = (bool, Option<String>, Option<policy::NsacfEndpoint>);
+
 /// NSAC for a PDN connection moving from EPC to 5GC (#1072 review m4, m9): an
 /// INCREASE. `Some(admitted)` decides `nsac_admitted`; `None` is a rejection. This
 /// SMF+PGW-C does no EPS counting, so per TS 23.501 §5.15.11.5 the NSAC "is performed
@@ -388,13 +409,14 @@ pub(crate) async fn nsac_admit_migrated_session(
     psi: u8,
     sst: u8,
     sd: Option<&str>,
-) -> Option<(bool, Option<String>)> {
-    let Some(nsacf) = policy::resolve_nsacf_endpoint(sst, sd).await else {
-        return Some((false, None));
+    plmn: Option<(&str, &str)>,
+) -> Option<NsacAdmitted> {
+    let Some(nsacf) = policy::resolve_nsacf_endpoint(sst, sd, plmn).await else {
+        return Some((false, None, None));
     };
     let nf_id = self_nf_id().await;
     match policy::nsac_pdu_session_admit(&nsacf, &nf_id, supi, psi, sst, sd).await {
-        policy::NsacAdmission::Admitted => Some((true, Some(nf_id))),
+        policy::NsacAdmission::Admitted => Some((true, Some(nf_id), Some(nsacf))),
         policy::NsacAdmission::Rejected => {
             log::warn!(
                 "[{supi}] NSACF rejected the EPS→5GS PDU session {psi} on S-NSSAI[SST:{sst} \
@@ -402,12 +424,12 @@ pub(crate) async fn nsac_admit_migrated_session(
             );
             None
         }
-        policy::NsacAdmission::Unavailable => Some((false, None)),
+        policy::NsacAdmission::Unavailable => Some((false, None, None)),
         policy::NsacAdmission::NoAnswer => {
             let _ =
                 policy::nsac_pdu_session_release_precautionary(&nsacf, &nf_id, supi, psi, sst, sd)
                     .await;
-            Some((false, None))
+            Some((false, None, None))
         }
     }
 }
@@ -424,28 +446,46 @@ pub(crate) async fn rollback_nsac(
     sst: u8,
     sd: Option<&str>,
 ) -> bool {
-    let recorded = recorded_nsac_nf_id(supi, psi);
-    rollback_nsac_as(admitted, recorded.as_deref(), supi, psi, sst, sd).await
+    let (recorded, recorded_nsacf) = recorded_nsac(supi, psi);
+    rollback_nsac_as(
+        admitted,
+        recorded.as_deref(),
+        recorded_nsacf.as_ref(),
+        supi,
+        psi,
+        sst,
+        sd,
+    )
+    .await
 }
 
-/// The `nfId` the INCREASE of `supi`'s PDU session `psi` carried, from its live
-/// binding (#1075).
-fn recorded_nsac_nf_id(supi: &str, psi: u8) -> Option<String> {
-    smf_self().read().ok().and_then(|ctx| {
-        ctx.policy_bindings.read().ok().and_then(|m| {
-            m.values()
-                .find(|b| b.supi == supi && b.psi == psi)
-                .and_then(|b| b.nsac_nf_id.clone())
+/// The `nfId` the INCREASE of `supi`'s PDU session `psi` carried (#1075), and the
+/// NSACF it went to (#1164 follow-up), from its live binding.
+fn recorded_nsac(supi: &str, psi: u8) -> (Option<String>, Option<policy::NsacfEndpoint>) {
+    smf_self()
+        .read()
+        .ok()
+        .and_then(|ctx| {
+            ctx.policy_bindings.read().ok().and_then(|m| {
+                m.values()
+                    .find(|b| b.supi == supi && b.psi == psi)
+                    .map(|b| (b.nsac_nf_id.clone(), b.nsac_nsacf.clone()))
+            })
         })
-    })
+        .unwrap_or_default()
 }
 
 /// [`rollback_nsac`] naming `nf_id` in the DECREASE: the one the INCREASE carried
 /// (#1075, #1072 round 2 m3), so both name the same SMF instance (TS 23.502
 /// §4.2.11.2). `None` uses this instance's current id.
+///
+/// #1164 follow-up: to `nsacf`, the NSACF the INCREASE went to, when known; a fresh
+/// discovery could name another NSACF of the same slice, and the count would leak on
+/// the first.
 pub(crate) async fn rollback_nsac_as(
     admitted: bool,
     nf_id: Option<&str>,
+    nsacf: Option<&policy::NsacfEndpoint>,
     supi: &str,
     psi: u8,
     sst: u8,
@@ -454,7 +494,12 @@ pub(crate) async fn rollback_nsac_as(
     if !admitted {
         return true;
     }
-    match policy::resolve_nsacf_endpoint(sst, sd).await {
+    let pinned = nsacf.cloned();
+    let resolved = match pinned {
+        Some(nsacf) => Some(nsacf),
+        None => policy::resolve_nsacf_endpoint(sst, sd, None).await,
+    };
+    match resolved {
         Some(nsacf) => {
             let nf_id = match nf_id {
                 Some(id) => id.to_string(),
@@ -3947,6 +3992,15 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
         return eps_to_5gs::sm_context_error(400, "MANDATORY_IE_MISSING", "sNssai.sst is required");
     };
     let snssai_sd = req_body["sNssai"]["sd"].as_str().map(str::to_string);
+    // #1164 follow-up, TS 29.571 §5.4.4.2: an SD is 6 hex digits. A malformed one would
+    // reach the NRF query and the NSACF discovery cache's key.
+    if snssai_sd.as_deref().is_some_and(|sd| !policy::valid_sd(sd)) {
+        return eps_to_5gs::sm_context_error(
+            400,
+            "INVALID_MSG_FORMAT",
+            "sNssai.sd is not 6 hexadecimal digits",
+        );
+    }
     // Issue #73: `supi` is conditional-mandatory for a non-emergency session
     // (TS 29.502 §6.1.6.2.2), and it is now REJECTED when absent.
     //
@@ -4219,7 +4273,29 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     // NSACF never blocks the basic data path.
     // #1075: the nfId the INCREASE carried, recorded so the DECREASE names it too.
     let mut nsac_nf_id: Option<String> = None;
-    let nsac_admitted = match policy::resolve_nsacf_endpoint(sst, snssai_sd.as_deref()).await {
+    // #1164 follow-up: and the NSACF it went to, for the DECREASE.
+    let mut nsac_nsacf: Option<policy::NsacfEndpoint> = None;
+    // The serving PLMN, for an NSACF profile's perPlmnSnssaiList (TS 29.510 §6.1.6.2.2).
+    let nsac_plmn: Option<(String, String)> = ["servingNetwork", "guami"].iter().find_map(|k| {
+        let p = if *k == "guami" {
+            &req_body[k]["plmnId"]
+        } else {
+            &req_body[k]
+        };
+        Some((
+            p["mcc"].as_str()?.to_string(),
+            p["mnc"].as_str()?.to_string(),
+        ))
+    });
+    let nsac_admitted = match policy::resolve_nsacf_endpoint(
+        sst,
+        snssai_sd.as_deref(),
+        nsac_plmn
+            .as_ref()
+            .map(|(mcc, mnc)| (mcc.as_str(), mnc.as_str())),
+    )
+    .await
+    {
         // #1072 review m6: counted in already, by the released session it replaces.
         _ if nsac_carried => true,
         None => {
@@ -4243,6 +4319,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                         "NSACF admitted PDU session for S-NSSAI[SST:{sst} SD:{snssai_sd:?}]"
                     );
                     nsac_nf_id = Some(nf_id.clone());
+                    nsac_nsacf = Some(nsacf.clone());
                     true
                 }
                 policy::NsacAdmission::Rejected => {
@@ -4518,6 +4595,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     rollback_nsac_as(
                         nsac_admitted,
                         nsac_nf_id.as_deref(),
+                        nsac_nsacf.as_ref(),
                         &supi,
                         pdu_session_id,
                         sst,
@@ -4542,6 +4620,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     rollback_nsac_as(
                         nsac_admitted,
                         nsac_nf_id.as_deref(),
+                        nsac_nsacf.as_ref(),
                         &supi,
                         pdu_session_id,
                         sst,
@@ -4703,6 +4782,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                 rollback_nsac_as(
                     nsac_admitted,
                     nsac_nf_id.as_deref(),
+                    nsac_nsacf.as_ref(),
                     &supi,
                     pdu_session_id,
                     sst,
@@ -4907,6 +4987,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     sdm_subscription_id: sdm_subscription_id.clone(),
                     nsac_admitted,
                     nsac_nf_id: nsac_nf_id.clone(),
+                    nsac_nsacf: nsac_nsacf.clone(),
                 },
             );
         }
@@ -7166,6 +7247,7 @@ async fn release_nsac_admission(binding: &context::PolicyBinding, entry: Option<
             rollback_nsac_as(
                 true,
                 binding.nsac_nf_id.as_deref(),
+                binding.nsac_nsacf.as_ref(),
                 &binding.supi,
                 binding.psi,
                 binding.sst,
@@ -14275,6 +14357,7 @@ mod tests {
                         sdm_subscription_id: None,
                         nsac_admitted: false,
                         nsac_nf_id: None,
+                        nsac_nsacf: None,
                     },
                 );
             }
@@ -16466,14 +16549,14 @@ mod tests {
             .set_nrf_uri(format!("http://127.0.0.1:{}", addr.port()))
             .await;
         for _ in 0..5 {
-            let found = policy::resolve_nsacf_endpoint(1, None)
+            let found = policy::resolve_nsacf_endpoint(1, None, None)
                 .await
                 .expect("discovered");
             assert_eq!(found.port, 17813);
         }
         let within = discoveries.load(std::sync::atomic::Ordering::SeqCst);
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-        let _ = policy::resolve_nsacf_endpoint(1, None).await;
+        let _ = policy::resolve_nsacf_endpoint(1, None, None).await;
         let after = discoveries.load(std::sync::atomic::Ordering::SeqCst);
         global_context().clear_nrf_uri().await;
         nrf.stop().await.ok();
@@ -16535,16 +16618,16 @@ mod tests {
         global_context()
             .set_nrf_uri(format!("http://127.0.0.1:{}", addr.port()))
             .await;
-        let a = policy::resolve_nsacf_endpoint(1, None)
+        let a = policy::resolve_nsacf_endpoint(1, None, None)
             .await
             .map(|e| e.port);
-        let b = policy::resolve_nsacf_endpoint(2, Some("000002"))
+        let b = policy::resolve_nsacf_endpoint(2, Some("000002"), None)
             .await
             .map(|e| e.port);
-        let b_again = policy::resolve_nsacf_endpoint(2, Some("000002"))
+        let b_again = policy::resolve_nsacf_endpoint(2, Some("000002"), None)
             .await
             .map(|e| e.port);
-        let none = policy::resolve_nsacf_endpoint(3, None)
+        let none = policy::resolve_nsacf_endpoint(3, None, None)
             .await
             .map(|e| e.port);
         let asked = queries.lock().unwrap().clone();
@@ -16609,15 +16692,15 @@ mod tests {
         global_context()
             .set_nrf_uri(format!("http://127.0.0.1:{}", addr.port()))
             .await;
-        let nsacf = policy::resolve_nsacf_endpoint(1, None)
+        let nsacf = policy::resolve_nsacf_endpoint(1, None, None)
             .await
             .expect("discovered");
-        let _ = policy::resolve_nsacf_endpoint(1, None).await;
+        let _ = policy::resolve_nsacf_endpoint(1, None, None).await;
         let cached = discoveries.load(std::sync::atomic::Ordering::SeqCst);
         let admission =
             policy::nsac_pdu_session_admit(&nsacf, "smf-1150", "imsi-001010000011500", 5, 1, None)
                 .await;
-        let _ = policy::resolve_nsacf_endpoint(1, None).await;
+        let _ = policy::resolve_nsacf_endpoint(1, None, None).await;
         let after = discoveries.load(std::sync::atomic::Ordering::SeqCst);
         global_context().clear_nrf_uri().await;
         nrf.stop().await.ok();
@@ -16716,14 +16799,14 @@ mod tests {
             .set_nrf_uri(format!("http://127.0.0.1:{}", addr.port()))
             .await;
         let count = || discoveries.load(std::sync::atomic::Ordering::SeqCst);
-        let found = policy::resolve_nsacf_endpoint(1, None)
+        let found = policy::resolve_nsacf_endpoint(1, None, None)
             .await
             .expect("discovered");
         let first = count();
         let admission =
             policy::nsac_pdu_session_admit(&found, "smf-1150", "imsi-001010000011501", 5, 1, None)
                 .await;
-        let found = policy::resolve_nsacf_endpoint(1, None)
+        let found = policy::resolve_nsacf_endpoint(1, None, None)
             .await
             .expect("discovered again");
         let after_increase = count();
@@ -16736,7 +16819,7 @@ mod tests {
             None,
         )
         .await;
-        let _ = policy::resolve_nsacf_endpoint(1, None).await;
+        let _ = policy::resolve_nsacf_endpoint(1, None, None).await;
         let after_decrease = count();
         global_context().clear_nrf_uri().await;
         nrf.stop().await.ok();
@@ -17701,6 +17784,152 @@ mod tests {
         let decrease: serde_json::Value =
             serde_json::from_str(bodies.iter().find(|b| b.contains("DECREASE")).unwrap()).unwrap();
         assert_eq!(decrease["nfId"], increase["nfId"]);
+    }
+
+    /// #1164 follow-up: the DECREASE goes to the NSACF that admitted the session, not to
+    /// the one a fresh discovery names at release. Two NSACFs serve slice 1/010203; the NRF
+    /// names A first at create and B first afterwards (its results valid for 0 s).
+    /// The INCREASE goes to A, and so does the release's DECREASE. Before, it went to
+    /// B and the count leaked on A.
+    #[tokio::test]
+    async fn the_decrease_goes_to_the_nsacf_that_admitted_the_session() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        std::env::remove_var("NSACF_URI");
+        type Bodies = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+        let nsacf = || async {
+            let seen: Bodies = Default::default();
+            let sink = seen.clone();
+            let (srv, addr) =
+                nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                    let sink = sink.clone();
+                    async move {
+                        sink.lock()
+                            .unwrap()
+                            .push(req.http.content.clone().unwrap_or_default());
+                        SbiResponse::with_status(204)
+                    }
+                })
+                .await;
+            (srv, addr.port(), seen)
+        };
+        let (a, a_port, a_seen) = nsacf().await;
+        let (b, b_port, b_seen) = nsacf().await;
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = asked.clone();
+        let (nrf, nrf_addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let count = count.clone();
+                async move {
+                    if req.http.params.get("target-nf-type").map(String::as_str) != Some("NSACF") {
+                        return SbiResponse::with_status(404);
+                    }
+                    let instance = |id: &str, port: u16| {
+                        serde_json::json!({
+                            "nfInstanceId": id, "nfType": "NSACF",
+                            "ipv4Addresses": ["127.0.0.1"],
+                            "sNssais": [{ "sst": 1, "sd": "010203" }],
+                            "nfServices": [{ "serviceName": "nnsacf-nsac",
+                                             "ipEndPoints": [{ "port": port }] }],
+                        })
+                    };
+                    let first = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                    let order = if first {
+                        vec![instance("nsacf-a", a_port), instance("nsacf-b", b_port)]
+                    } else {
+                        vec![instance("nsacf-b", b_port), instance("nsacf-a", a_port)]
+                    };
+                    SbiResponse::with_status(200)
+                        .with_json_body(&serde_json::json!({
+                            "validityPeriod": 0, "nfInstances": order,
+                        }))
+                        .unwrap()
+                }
+            })
+            .await;
+        global_context()
+            .set_nrf_uri(format!("http://127.0.0.1:{}", nrf_addr.port()))
+            .await;
+        let supi = "imsi-001010000011645";
+        let resp = handle_sm_context_create(&create_request(
+            supi,
+            9,
+            &n1(
+                9,
+                1,
+                gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+                &[0x91, 0x00],
+            ),
+        ))
+        .await;
+        let reference = smf_self()
+            .read()
+            .unwrap()
+            .policy_bindings
+            .read()
+            .unwrap()
+            .iter()
+            .find(|(_, b)| b.supi == supi && b.psi == 9)
+            .map(|(r, b)| (r.clone(), b.nsac_nsacf.clone()));
+        if let Some((r, _)) = &reference {
+            let _ = handle_sm_context_release(r, None).await;
+        }
+        side_effects_settled().await;
+        global_context().clear_nrf_uri().await;
+        let ops = |seen: &Bodies| {
+            let bodies = seen.lock().unwrap();
+            (
+                bodies.iter().filter(|b| b.contains("INCREASE")).count(),
+                bodies.iter().filter(|b| b.contains("DECREASE")).count(),
+            )
+        };
+        let (at_a, at_b) = (ops(&a_seen), ops(&b_seen));
+        for srv in [a, b, nrf] {
+            srv.stop().await.ok();
+        }
+
+        assert_eq!(resp.status, 201);
+        assert_eq!(
+            reference.and_then(|(_, n)| n).map(|n| n.port),
+            Some(a_port),
+            "the binding records the admitting NSACF"
+        );
+        assert_eq!(at_a, (1, 1), "counted in and out at A");
+        assert_eq!(at_b, (0, 0), "B never counted this session");
+    }
+
+    /// #1164 follow-up, TS 29.571 §5.4.4.2: an SM Context Create whose S-NSSAI SD is
+    /// not 6 hex digits is refused 400, before it reaches the NRF query or the NSACF
+    /// discovery cache.
+    #[tokio::test]
+    async fn a_malformed_sd_is_refused() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        smf_context_init(64, 256, 512);
+        let mut request = create_request(
+            "imsi-001010000011646",
+            9,
+            &n1(
+                9,
+                1,
+                gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+                &[0x91, 0x00],
+            ),
+        );
+        let mut body: serde_json::Value =
+            serde_json::from_str(request.http.content.as_deref().unwrap()).unwrap();
+        body["sNssai"] = serde_json::json!({ "sst": 1, "sd": "zz0001" });
+        request.http.content = Some(body.to_string());
+        let resp = handle_sm_context_create(&request).await;
+        assert_eq!(resp.status, 400, "{:?}", resp.http.content);
+        assert!(resp
+            .http
+            .content
+            .as_deref()
+            .is_some_and(|c| c.contains("INVALID_MSG_FORMAT")));
     }
 
     // ---- #994: PFCP Node Report: user plane path failure and recovery ----
