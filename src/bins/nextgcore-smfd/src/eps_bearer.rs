@@ -235,6 +235,10 @@ fn default_ebi(ctx: &context::SmfContext, sess: &SmfSess) -> Option<u8> {
         .find_map(|b| b.assigned_ebi())
 }
 
+/// Held while a bearer's rule index is chosen and claimed (#1182 review), so two
+/// activations on one session cannot take the same one.
+static RULE_INDEX_CLAIM: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The lowest rule index no other bearer of the session uses.
 fn free_rule_index(ctx: &context::SmfContext, sess: &SmfSess) -> Option<u8> {
     let used: Vec<u8> = sess
@@ -380,21 +384,15 @@ pub async fn activate(
                 "the session has no default bearer".into(),
             )
         })?;
-        let rule_index = free_rule_index(&ctx, &sess).ok_or_else(|| {
-            NotSent(
-                Gtp2Cause::NoResourcesAvailable,
-                "the session already holds 15 dedicated bearers".into(),
-            )
-        })?;
         let ue_ipv4 = sess.ipv4_addr.ok_or_else(|| {
             NotSent(
                 Gtp2Cause::ContextNotFound,
                 "the session has no PDN address".into(),
             )
         })?;
-        (sess, peer, linked_ebi, rule_index, ue_ipv4)
+        (sess, peer, linked_ebi, ue_ipv4)
     };
-    let (sess, peer, linked_ebi, rule_index, ue_ipv4) = prepared;
+    let (sess, peer, linked_ebi, ue_ipv4) = prepared;
 
     if req.filters.is_empty() {
         return Err(NotSent(
@@ -405,11 +403,24 @@ pub async fn activate(
     let tft = eps_tft::encode(eps_tft::op::CREATE_NEW_TFT, &req.filters)
         .map_err(|e| NotSent(Gtp2Cause::SemanticErrorInTheTadOperation, e))?;
 
-    // Step 1: the bearer and its packet filters, stored with EBI 0.
-    let mut bearer = {
+    // Step 1: the bearer and its packet filters, stored with EBI 0. Its rule index is
+    // chosen and claimed in one critical section (#1182 review): two activations on
+    // one session (a local rule and a Bearer Resource Command) run on different tasks,
+    // and must not both take k, or their PGW-U rules would collide.
+    let (mut bearer, rule_index) = {
         let ctx = handle
             .read()
             .map_err(|_| NotSent(Gtp2Cause::SystemFailure, "context poisoned".into()))?;
+        let _claim = RULE_INDEX_CLAIM.lock().unwrap_or_else(|e| e.into_inner());
+        let fresh = ctx
+            .sess_find_by_id(sess.id)
+            .ok_or_else(|| NotSent(Gtp2Cause::ContextNotFound, format!("no session {sess_id}")))?;
+        let rule_index = free_rule_index(&ctx, &fresh).ok_or_else(|| {
+            NotSent(
+                Gtp2Cause::NoResourcesAvailable,
+                "the session already holds 15 dedicated bearers".into(),
+            )
+        })?;
         let mut bearer = ctx.bearer_add(sess.id).ok_or_else(|| {
             NotSent(
                 Gtp2Cause::NoResourcesAvailable,
@@ -431,7 +442,10 @@ pub async fn activate(
             }
         }
         // `pf_add` linked the filters into the stored bearer; take that copy.
-        ctx.bearer_find_by_id(bearer.id).unwrap_or(bearer)
+        (
+            ctx.bearer_find_by_id(bearer.id).unwrap_or(bearer),
+            rule_index,
+        )
     };
 
     // Step 2: the S5/S8-U uplink at the PGW-U, on an F-TEID it chooses.
@@ -522,6 +536,37 @@ pub async fn activate(
         }
     };
     let assigned = rsp.bearer_context.as_ref().map(|bc| bc.ebi).unwrap_or(0);
+    // #1182 review: once the SGW-C (and the MME behind it) has ACCEPTED the bearer under
+    // a valid EBI, every exit that does not keep it here must delete it there too (TS
+    // 23.401 §5.4.4.1), or they hold an active bearer this PGW has removed. Not for the
+    // LBI: a Delete Bearer Request naming it releases the whole PDN connection.
+    let accepted_there = matches!(
+        rsp.cause,
+        Gtp2Cause::RequestAccepted | Gtp2Cause::RequestAcceptedPartially
+    ) && rsp
+        .bearer_context
+        .as_ref()
+        .is_some_and(|bc| bc.cause == Gtp2Cause::RequestAccepted)
+        && (5..=15).contains(&assigned)
+        && assigned != linked_ebi;
+    let delete_there = |why: &'static str| {
+        let del = crate::gtp_build::build_delete_bearer_request(
+            &sess,
+            assigned,
+            linked_ebi,
+            None,
+            Some(Gtp2Cause::NoResourcesAvailable),
+        );
+        async move {
+            log::warn!(
+                "dedicated bearer EBI {assigned}: accepted by the SGW-C but not kept here \
+                 ({why}); Delete Bearer Request sent"
+            );
+            server
+                .send_request(peer, del, gtp2_message_type::DELETE_BEARER_REQUEST)
+                .await;
+        }
+    };
     let ebi_taken = handle
         .read()
         .ok()
@@ -529,6 +574,9 @@ pub async fn activate(
         .is_some_and(|b| b.id != bearer.id);
     if !(5..=15).contains(&assigned) || ebi_taken {
         roll_back(&sess, &bearer, false).await;
+        if accepted_there {
+            delete_there("its EBI is taken here").await;
+        }
         return Err(Failed(format!(
             "the Create Bearer Response assigned EBI {assigned}, which is not a free EPS \
              bearer identity of this PDN connection"
@@ -538,18 +586,35 @@ pub async fn activate(
         handle_create_bearer_response(&sess, &mut bearer, &rsp)
     {
         roll_back(&sess, &bearer, false).await;
+        if accepted_there {
+            // Accepted, but without the SGW's S5/S8-U F-TEID.
+            delete_there("no S5/S8-U SGW F-TEID").await;
+        }
         return Err(Failed(format!(
             "the Create Bearer Response refused the bearer (cause {:?}, bearer cause {:?})",
             rsp.cause,
             rsp.bearer_context.as_ref().map(|bc| bc.cause)
         )));
     }
-    let Some(sgw_addr) = bearer.sgw_s5u_ip.ipv4 else {
-        roll_back(&sess, &bearer, false).await;
-        return Err(Failed(
-            "the SGW's S5/S8-U F-TEID carries no IPv4 address".into(),
-        ));
+    // The SGW's endpoint, IPv4 or IPv6 (TS 29.244 §8.2.56: GTP-U/UDP/IPv4 is 0x0100,
+    // GTP-U/UDP/IPv6 0x0200; IPv4 when the F-TEID carries both).
+    let sgw_ohc = match (bearer.sgw_s5u_ip.ipv4, bearer.sgw_s5u_ip.ipv6) {
+        (Some(v4), _) => (0x0100u16, Some(v4.octets()), None),
+        (None, Some(v6)) => (0x0200u16, None, Some(v6.octets())),
+        (None, None) => {
+            roll_back(&sess, &bearer, false).await;
+            if accepted_there {
+                delete_there("the S5/S8-U SGW F-TEID carries no address").await;
+            }
+            return Err(Failed("the SGW's S5/S8-U F-TEID carries no address".into()));
+        }
     };
+    let sgw_addr = bearer
+        .sgw_s5u_ip
+        .ipv4
+        .map(std::net::IpAddr::V4)
+        .or(bearer.sgw_s5u_ip.ipv6.map(std::net::IpAddr::V6))
+        .expect("an address, checked above");
 
     let dl_filters = downlink_descriptions(&req.filters);
     if dl_filters.is_empty() {
@@ -565,12 +630,7 @@ pub async fn activate(
                 far_id: u32::from(dl),
                 apply_action: crate::n4_build::apply_action::FORW,
                 destination_interface: Some(0), // Access: toward the SGW-U
-                outer_header_creation: Some((
-                    0x0100,
-                    bearer.sgw_s5u_teid,
-                    Some(sgw_addr.octets()),
-                    None,
-                )),
+                outer_header_creation: Some((sgw_ohc.0, bearer.sgw_s5u_teid, sgw_ohc.1, sgw_ohc.2)),
                 network_instance: None,
             }],
             create_pdrs: vec![crate::n4_build::PdrParams {
@@ -590,16 +650,7 @@ pub async fn activate(
             roll_back(&sess, &bearer, true).await;
             // The SGW-C and the MME hold the bearer now; TS 23.401 §5.4.4.1 has the PGW
             // delete it rather than leave them a bearer it cannot carry.
-            let del = crate::gtp_build::build_delete_bearer_request(
-                &sess,
-                assigned,
-                linked_ebi,
-                None,
-                Some(Gtp2Cause::NoResourcesAvailable),
-            );
-            server
-                .send_request(peer, del, gtp2_message_type::DELETE_BEARER_REQUEST)
-                .await;
+            delete_there("the PGW-U did not install its downlink").await;
             return Err(Failed(format!(
                 "the PGW-U did not install the downlink ({e}); Delete Bearer Request sent"
             )));
@@ -641,4 +692,174 @@ pub async fn activate_local_rules(server: &S5S8Server, sess_id: u64, apn: &str) 
             ),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Deactivation on the MME's request (#1182 review)
+// ---------------------------------------------------------------------------
+
+/// The MME's Delete Bearer Command for `ebis` of session `sess_id`, relayed by the SGW-C
+/// from `peer` under `seq` (TS 23.401 §5.4.4.2, TS 29.274 §7.2.17.1).
+///
+/// The PGW answers with a Delete Bearer Request for the dedicated bearers it holds, the
+/// Command's Triggered message: under the Command's sequence number, back to its source
+/// (TS 29.274 §7.6, §4.2.1.2). Once the Delete Bearer Response comes back, or the request
+/// runs out its N3, each bearer the answer does not refuse is removed with its PGW-U
+/// rules (UL PDR/QER `0x60+k`, DL PDR/FAR `0x80+k`). A Command naming no dedicated bearer
+/// of the PDN connection gets a Delete Bearer Failure Indication instead (Table
+/// 7.2.18-1): "Context not found" for an unknown EBI, "Request rejected" for the default
+/// bearer, which a Delete Bearer Command cannot delete.
+pub async fn deactivate_on_command(
+    server: &S5S8Server,
+    sess_id: u64,
+    ebis: &[u8],
+    peer: std::net::SocketAddr,
+    seq: u32,
+) {
+    let handle = context::smf_self();
+    let Some((sess, linked_ebi, bearers, refused)) = handle.read().ok().and_then(|ctx| {
+        let sess = ctx.sess_find_by_id(sess_id)?;
+        let linked = default_ebi(&ctx, &sess)?;
+        let mut bearers = Vec::new();
+        let mut refused = Vec::new();
+        for &ebi in ebis {
+            match ctx.bearer_find_by_ebi(sess.id, ebi) {
+                _ if ebi == linked => {
+                    refused.push((ebi, Gtp2Cause::RequestRejectedReasonNotSpecified))
+                }
+                Some(b) => bearers.push(b),
+                None => refused.push((ebi, Gtp2Cause::ContextNotFound)),
+            }
+        }
+        Some((sess, linked, bearers, refused))
+    }) else {
+        return;
+    };
+    if bearers.is_empty() {
+        let cause = refused
+            .first()
+            .map(|r| r.1)
+            .unwrap_or(Gtp2Cause::MandatoryIeMissing);
+        let mut b = crate::gtp_build::Gtp2MessageBuilder::new(
+            gtp2_message_type::DELETE_BEARER_FAILURE_INDICATION,
+        )
+        .teid(sess.sgw_s5c_teid)
+        .add_cause(cause);
+        for (ebi, c) in &refused {
+            b = b.start_bearer_context(0).add_ebi(*ebi).add_cause(*c).end();
+        }
+        let fi = crate::gtp_handler::with_sequence_number(b.build(), seq);
+        log::warn!(
+            "S5/S8 Delete Bearer Command seq={seq} from {peer}: no dedicated bearer to delete \
+             ({refused:?}); Delete Bearer Failure Indication"
+        );
+        server.send_response_public(peer, &fi).await;
+        return;
+    }
+    if !server.begin_command(peer, seq) {
+        log::debug!("S5/S8 Delete Bearer Command seq={seq} from {peer} is a retransmission");
+        return;
+    }
+    let mut b = crate::gtp_build::Gtp2MessageBuilder::new(gtp2_message_type::DELETE_BEARER_REQUEST)
+        .teid(sess.sgw_s5c_teid);
+    for bearer in &bearers {
+        // Dedicated bearers: EPS Bearer IDs, instance 1 (Table 7.2.9.2-1).
+        b = b.add_ebi(bearer.ebi, 1);
+    }
+    log::info!(
+        "S5/S8 Delete Bearer Command seq={seq} from {peer}: Delete Bearer Request for EBIs {:?} \
+         (LBI {linked_ebi})",
+        bearers.iter().map(|b| b.ebi).collect::<Vec<_>>()
+    );
+    let answer = server
+        .request(
+            peer,
+            b.build(),
+            gtp2_message_type::DELETE_BEARER_REQUEST,
+            Some(seq),
+        )
+        .await;
+    server.end_command(peer, seq);
+    // Which bearers the answer refused; the rest go. An unanswered request still
+    // deletes them: the MME asked for it, and the SGW-C has nothing to keep them for.
+    let kept: Vec<u8> = match answer {
+        Ok(raw) => {
+            let mut bytes = bytes::Bytes::copy_from_slice(&raw);
+            match Gtp2Message::decode(&mut bytes) {
+                Ok(msg) => {
+                    let cause = msg
+                        .get_ie(Gtp2IeType::Cause as u8, 0)
+                        .and_then(|ie| ie.value.first().copied())
+                        .unwrap_or(0);
+                    let gone = |c: u8| matches!(c, 16 | 17 | 64);
+                    let mut kept = Vec::new();
+                    let contexts: Vec<(u8, Option<u8>)> = msg
+                        .get_ies(Gtp2IeType::BearerContext as u8)
+                        .into_iter()
+                        .filter(|ie| ie.instance == 0)
+                        .filter_map(|ie| {
+                            let bc =
+                                nextgcore_gtp::v2::Gtp2BearerContextIe::decode(&ie.value).ok()?;
+                            Some((bc.ebi().ok()?, bc.cause().ok().flatten().map(|c| c.cause)))
+                        })
+                        .collect();
+                    for bearer in &bearers {
+                        let c = contexts
+                            .iter()
+                            .find(|(e, _)| *e == bearer.ebi)
+                            .and_then(|(_, c)| *c)
+                            .unwrap_or(cause);
+                        if !gone(c) || !gone(cause) {
+                            kept.push(bearer.ebi);
+                        }
+                    }
+                    kept
+                }
+                Err(_) => Vec::new(),
+            }
+        }
+        Err(e) => {
+            log::warn!("Delete Bearer Request for the MME's Command: {e}; deleted here anyway");
+            Vec::new()
+        }
+    };
+    for bearer in bearers.iter().filter(|b| !kept.contains(&b.ebi)) {
+        if bearer.eps_rule_index != 0 {
+            // One lock at a time: `stored_filters` takes its own.
+            let stored = handle
+                .read()
+                .ok()
+                .and_then(|ctx| ctx.bearer_find_by_id(bearer.id));
+            let with_dl =
+                stored.is_some_and(|b| !downlink_descriptions(&stored_filters(&b)).is_empty());
+            roll_back(&sess, bearer, with_dl).await;
+        } else if let Ok(ctx) = handle.read() {
+            ctx.bearer_remove(bearer.id);
+        }
+        log::info!(
+            "dedicated bearer EBI {} deleted on the MME's command",
+            bearer.ebi
+        );
+    }
+}
+
+/// The packet filters stored for `bearer`, as [`PacketFilter`]s.
+fn stored_filters(bearer: &SmfBearer) -> Vec<PacketFilter> {
+    let handle = context::smf_self();
+    let Ok(ctx) = handle.read() else {
+        return Vec::new();
+    };
+    bearer
+        .pf_ids
+        .iter()
+        .filter_map(|id| ctx.pf_find_by_id(*id))
+        .filter_map(|pf| {
+            Some(PacketFilter {
+                direction: pf.direction,
+                identifier: pf.identifier,
+                precedence: pf.precedence,
+                flow_description: pf.flow_description.clone()?,
+            })
+        })
+        .collect()
 }

@@ -1248,6 +1248,12 @@ pub async fn dispatch_s5s8_request(
         gtp2_message_type::BEARER_RESOURCE_COMMAND => {
             bearer_resource(server, sequence_number, raw, peer).await
         }
+        // #1182 review: the MME's request to deactivate dedicated bearers (TS 23.401
+        // §5.4.4.2), which mmed sends for bearers the UE reports inactive (#1166) and
+        // for E-RABs a handover lost.
+        gtp2_message_type::DELETE_BEARER_COMMAND => {
+            delete_bearer_command(server, sequence_number, raw, peer).await
+        }
         other => {
             // TS 29.274 §7.7: answer with a cause rather than dropping the request, so
             // the SGW-C's transaction completes instead of expiring on T3.
@@ -1263,6 +1269,57 @@ pub async fn dispatch_s5s8_request(
             server.send_response_public(peer, &response).await;
         }
     }
+}
+
+/// A Delete Bearer Command from the SGW-C (TS 29.274 §7.2.17.1): the EBIs of its Bearer
+/// Contexts go to [`crate::eps_bearer::deactivate_on_command`].
+async fn delete_bearer_command(
+    server: &crate::gtp_path::S5S8Server,
+    sequence_number: u32,
+    raw: &[u8],
+    peer: std::net::SocketAddr,
+) {
+    let mut bytes = bytes::Bytes::copy_from_slice(raw);
+    let Ok(msg) = Gtp2Message::decode(&mut bytes) else {
+        log::error!("S5/S8 Delete Bearer Command from {peer} undecodable");
+        return;
+    };
+    let Some(sess) = session_for_teid(msg.header.teid) else {
+        reject(
+            server,
+            gtp2_message_type::DELETE_BEARER_FAILURE_INDICATION,
+            0,
+            sequence_number,
+            peer,
+            Gtp2Cause::ContextNotFound,
+        )
+        .await;
+        return;
+    };
+    let ebis: Vec<u8> = msg
+        .get_ies(Gtp2IeType::BearerContext as u8)
+        .into_iter()
+        .filter(|ie| ie.instance == 0)
+        .filter_map(|ie| {
+            nextgcore_gtp::v2::Gtp2BearerContextIe::decode(&ie.value)
+                .ok()?
+                .ebi()
+                .ok()
+        })
+        .collect();
+    if ebis.is_empty() {
+        reject(
+            server,
+            gtp2_message_type::DELETE_BEARER_FAILURE_INDICATION,
+            sess.sgw_s5c_teid,
+            sequence_number,
+            peer,
+            Gtp2Cause::MandatoryIeMissing,
+        )
+        .await;
+        return;
+    }
+    crate::eps_bearer::deactivate_on_command(server, sess.id, &ebis, peer, sequence_number).await;
 }
 
 /// Route a triggered S5/S8 message that closed one of this node's transactions.
@@ -3997,6 +4054,282 @@ mod tests {
             !sent(&upf.modification_bodies(), &far_id_ie(0x81)),
             "no downlink for a refused bearer"
         );
+        server.close();
+    }
+
+    /// A second local rule for the same APN as [`voice_rule`], on other ports.
+    fn video_rule() -> crate::eps_bearer::LocalPccRule {
+        let mut rule = voice_rule();
+        rule.name = "video".into();
+        rule.qci = 2;
+        for f in rule.flows.iter_mut() {
+            f.description = f.description.replace("5004", "5006");
+        }
+        rule
+    }
+
+    /// A PDN connection established over S5/S8 with `rules` configured, from a stand-in
+    /// SGW-C whose GTP-C port is `sgw`. Returns the server, the SGW socket, its port
+    /// guard, the session and the PGW's S5/S8-C TEID.
+    async fn pdn_with_local_rules(
+        tag: u8,
+        rules: Vec<crate::eps_bearer::LocalPccRule>,
+    ) -> (
+        std::sync::Arc<crate::gtp_path::S5S8Server>,
+        tokio::net::UdpSocket,
+        SgwPortGuard,
+        crate::context::SmfSess,
+        u32,
+    ) {
+        crate::context::smf_context_init(64, 256, 512);
+        let server = crate::gtp_path::S5S8Server::open("127.0.0.1:0".parse().unwrap(), 3)
+            .await
+            .expect("bind");
+        server.set_local_pcc_rules(rules);
+        let sgw = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind sgw");
+        let port = SgwPortGuard::set(sgw.local_addr().unwrap().port());
+        let sgw_teid = u32::from(tag) << 24 | 0x0001;
+        let mut csr = s5c_csr(u32::from(tag), sgw_teid, [10, 99, 99, 99]);
+        let imsi_pos = csr
+            .windows(8)
+            .position(|w| w == [0x09, 0x91, 0x07, 0x00, 0x00, 0x00, 0x00, 0x01])
+            .expect("IMSI");
+        csr[imsi_pos + 7] = tag;
+        sgw.send_to(&csr, server.local_addr()).await.expect("send");
+        let (csresp, _) = recv_type(&sgw, gtp2_message_type::CREATE_SESSION_RESPONSE).await;
+        let pgw_c_teid = csresp
+            .get_ie(Gtp2IeType::FTeid as u8, 1)
+            .and_then(|ie| nextgcore_gtp::v2::Gtp2FTeidIe::decode(&ie.value).ok())
+            .unwrap()
+            .teid;
+        let sess = session_for_teid(Some(pgw_c_teid)).unwrap();
+        (server, sgw, port, sess, pgw_c_teid)
+    }
+
+    /// Wait until `done` holds for the stand-in UPF's modification bodies.
+    async fn upf_until(
+        upf: &crate::pfcp_path::stand_in::StandInUpf,
+        done: impl Fn(&[Vec<u8>]) -> bool,
+    ) -> bool {
+        for _ in 0..400 {
+            if done(&upf.modification_bodies()) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        false
+    }
+
+    /// #1182 review: two dedicated bearers on one PDN connection get distinct rule
+    /// indexes, so their PGW-U rules (UL PDR/QER 0x60+k, DL PDR/FAR 0x80+k) do not
+    /// collide.
+    #[tokio::test]
+    async fn two_dedicated_bearers_on_one_pdn_connection_get_distinct_rules() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        upf.clear_seen();
+        let (server, sgw, _port, sess, pgw_c_teid) =
+            pdn_with_local_rules(0x64, vec![voice_rule(), video_rule()]).await;
+        for ebi in [6u8, 7] {
+            let (cbr, _) = recv_type(&sgw, gtp2_message_type::CREATE_BEARER_REQUEST).await;
+            let pgw_u = cbr.bearer_context(0).unwrap().unwrap().fteid(1).unwrap();
+            sgw.send_to(
+                &s5c_create_bearer_response(cbr.header.sequence_number, pgw_c_teid, ebi, 16, pgw_u),
+                server.local_addr(),
+            )
+            .await
+            .expect("send");
+            stored_bearer(sess.id, ebi).await.expect("stored");
+        }
+        assert!(
+            upf_until(&upf, |m| sent(m, &far_id_ie(0x82))).await,
+            "the second bearer's downlink"
+        );
+        let mods = upf.modification_bodies();
+        for id in [0x61u16, 0x62, 0x81, 0x82] {
+            assert!(sent(&mods, &pdr_id_ie(id)), "PDR {id:#x}");
+        }
+        let k: Vec<u8> = {
+            let handle = crate::context::smf_self();
+            let ctx = handle.read().unwrap();
+            [6u8, 7]
+                .iter()
+                .map(|e| ctx.bearer_find_by_ebi(sess.id, *e).unwrap().eps_rule_index)
+                .collect()
+        };
+        assert_eq!(k, vec![1, 2], "distinct rule indexes");
+        server.close();
+    }
+
+    /// #1182 review, TS 23.401 §5.4.4.1: a bearer the SGW-C accepted but the PGW-U could
+    /// not carry (its downlink install refused) is deleted at the SGW-C too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dedicated_bearer_whose_downlink_fails_is_deleted_at_the_sgw() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        let (server, sgw, _port, sess, pgw_c_teid) =
+            pdn_with_local_rules(0x65, vec![voice_rule()]).await;
+        let (cbr, _) = recv_type(&sgw, gtp2_message_type::CREATE_BEARER_REQUEST).await;
+        upf.reject_modification(1);
+        sgw.send_to(
+            &s5c_create_bearer_response(cbr.header.sequence_number, pgw_c_teid, 6, 16, None),
+            server.local_addr(),
+        )
+        .await
+        .expect("send");
+        let (dbr, _) = recv_type(&sgw, gtp2_message_type::DELETE_BEARER_REQUEST).await;
+        assert_eq!(dbr.header.teid, Some(0x6500_0001));
+        assert_eq!(
+            dbr.get_ie(Gtp2IeType::Ebi as u8, 1).map(|ie| ie.value[0]),
+            Some(6),
+            "the dedicated bearer, at instance 1 (Table 7.2.9.2-1)"
+        );
+        assert!(stored_bearer(sess.id, 6).await.is_none(), "removed here");
+        server.close();
+    }
+
+    /// #1182 review: an EBI the PGW-C already holds for another bearer of the PDN
+    /// connection is not kept, and the bearer the SGW-C accepted under it is deleted there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dedicated_bearer_under_a_taken_ebi_is_deleted_at_the_sgw() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        upf.clear_seen();
+        let (server, sgw, _port, sess, pgw_c_teid) =
+            pdn_with_local_rules(0x66, vec![voice_rule(), video_rule()]).await;
+        for _ in 0..2 {
+            let (cbr, _) = recv_type(&sgw, gtp2_message_type::CREATE_BEARER_REQUEST).await;
+            sgw.send_to(
+                &s5c_create_bearer_response(cbr.header.sequence_number, pgw_c_teid, 6, 16, None),
+                server.local_addr(),
+            )
+            .await
+            .expect("send");
+            stored_bearer(sess.id, 6)
+                .await
+                .expect("the first holds EBI 6");
+        }
+        let (dbr, _) = recv_type(&sgw, gtp2_message_type::DELETE_BEARER_REQUEST).await;
+        assert_eq!(
+            dbr.get_ie(Gtp2IeType::Ebi as u8, 1).map(|ie| ie.value[0]),
+            Some(6)
+        );
+        let mut remove_pdr = vec![0x00, 0x0f, 0x00, 0x06];
+        remove_pdr.extend_from_slice(&pdr_id_ie(0x62));
+        assert!(
+            upf_until(&upf, |m| sent(m, &remove_pdr)).await,
+            "the second bearer's uplink is removed"
+        );
+        let held = crate::context::smf_self()
+            .read()
+            .unwrap()
+            .sess_find_by_id(sess.id)
+            .unwrap()
+            .bearer_ids
+            .len();
+        assert_eq!(held, 2, "the default and the first dedicated bearer");
+        server.close();
+    }
+
+    /// #1182 review, TS 23.401 §5.4.4.2: the MME's Delete Bearer Command for a dedicated
+    /// bearer is answered with a Delete Bearer Request under the Command's sequence number;
+    /// once the SGW-C accepts, the bearer and its PGW-U rules go. A Command naming no
+    /// dedicated bearer gets a Delete Bearer Failure Indication, "Context not found".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_delete_bearer_command_deletes_the_dedicated_bearer() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        let (server, sgw, _port, sess, pgw_c_teid) =
+            pdn_with_local_rules(0x67, vec![voice_rule()]).await;
+        let (cbr, _) = recv_type(&sgw, gtp2_message_type::CREATE_BEARER_REQUEST).await;
+        sgw.send_to(
+            &s5c_create_bearer_response(cbr.header.sequence_number, pgw_c_teid, 6, 16, None),
+            server.local_addr(),
+        )
+        .await
+        .expect("send");
+        stored_bearer(sess.id, 6).await.expect("EBI 6 active");
+        assert!(upf_until(&upf, |m| sent(m, &far_id_ie(0x81))).await);
+        upf.clear_seen();
+
+        let dbc = |seq: u32, ebi: u8| {
+            use nextgcore_gtp::v2::{Gtp2BearerContextIe, Gtp2Header, Gtp2Message};
+            let mut m = Gtp2Message::new(Gtp2Header::new(
+                gtp2_message_type::DELETE_BEARER_COMMAND,
+                pgw_c_teid,
+                seq,
+            ));
+            let mut bc = Gtp2BearerContextIe::new();
+            bc.set_ebi(ebi);
+            m.add_bearer_context(0, &bc);
+            m.encode()
+        };
+        // An EBI the PDN connection does not hold.
+        sgw.send_to(&dbc(0x8009, 9), server.local_addr())
+            .await
+            .expect("send");
+        let (fi, _) = recv_type(&sgw, gtp2_message_type::DELETE_BEARER_FAILURE_INDICATION).await;
+        assert_eq!(fi.header.sequence_number, 0x8009);
+        assert_eq!(
+            fi.get_ie(Gtp2IeType::Cause as u8, 0).map(|ie| ie.value[0]),
+            Some(64)
+        );
+
+        sgw.send_to(&dbc(0x8006, 6), server.local_addr())
+            .await
+            .expect("send");
+        let (dbr, _) = recv_type(&sgw, gtp2_message_type::DELETE_BEARER_REQUEST).await;
+        assert_eq!(
+            dbr.header.sequence_number, 0x8006,
+            "the Command's Triggered message (TS 29.274 §7.6)"
+        );
+        assert_eq!(dbr.header.teid, Some(0x6700_0001));
+        assert_eq!(
+            dbr.get_ie(Gtp2IeType::Ebi as u8, 1).map(|ie| ie.value[0]),
+            Some(6)
+        );
+        assert!(
+            stored_bearer(sess.id, 6).await.is_some(),
+            "kept until the SGW-C answers"
+        );
+        let rsp = {
+            use nextgcore_gtp::v2::{Gtp2BearerContextIe, Gtp2CauseIe, Gtp2Header, Gtp2Message};
+            let mut m = Gtp2Message::new(Gtp2Header::new(
+                gtp2_message_type::DELETE_BEARER_RESPONSE,
+                pgw_c_teid,
+                0x8006,
+            ));
+            m.add_ie(Gtp2CauseIe::new(16).to_ie(0));
+            let mut bc = Gtp2BearerContextIe::new();
+            bc.set_ebi(6);
+            bc.set_cause(&Gtp2CauseIe::new(16));
+            m.add_bearer_context(0, &bc);
+            m.encode()
+        };
+        sgw.send_to(&rsp, server.local_addr()).await.expect("send");
+        let mut remove_far = vec![0x00, 0x10, 0x00, 0x08];
+        remove_far.extend_from_slice(&far_id_ie(0x81));
+        assert!(
+            upf_until(&upf, |m| sent(m, &remove_far)).await,
+            "Remove FAR 0x81 (and its PDRs) at the PGW-U"
+        );
+        let mut remove_ul = vec![0x00, 0x0f, 0x00, 0x06];
+        remove_ul.extend_from_slice(&pdr_id_ie(0x61));
+        assert!(
+            sent(&upf.modification_bodies(), &remove_ul),
+            "Remove PDR 0x61"
+        );
+        let held = crate::context::smf_self()
+            .read()
+            .unwrap()
+            .sess_find_by_id(sess.id)
+            .unwrap()
+            .bearer_ids
+            .len();
+        assert_eq!(held, 1, "only the default bearer is left");
+        assert_eq!(server.outstanding().await, 0);
         server.close();
     }
 
