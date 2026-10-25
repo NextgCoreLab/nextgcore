@@ -6245,6 +6245,9 @@ impl NgapServer {
         // UE from releasing on T3540 (TS 24.501 §5.3.1.3 b) 1)), and so the network.
         let racs_deletion = racs_ies.first().is_some_and(|o| o & 0xF0 == 0xE0);
         let carries_racs = !racs_ies.is_empty();
+        // `build_registration_accept_for_sessions` includes the 5G-GUTI IE whenever
+        // `next_guti` has a TMSI (gmm_build).
+        let carries_guti = state.amf_ue.next_guti.tmsi != 0;
         plain.extend(racs_ies);
         let Some(protected) = nas_security::nas_5gs_security_encode(
             &mut state.amf_ue,
@@ -6334,13 +6337,16 @@ impl NgapServer {
                 )
                 .await?;
             }
-            // #889, TS 24.501 §5.5.1.3.4: an Accept carrying the UE radio capability
-            // ID IE or its deletion indication is acknowledged by a REGISTRATION
-            // COMPLETE, under T3550, which is what delivers the ID. T3550 takes the
-            // retransmission slot, so a configuration update in flight is aborted
-            // (§5.4.4.6 c)). Retransmitted as a standalone DL NAS TRANSPORT,
-            // whichever NGAP message carried the Accept first.
-            if carries_racs {
+            // #889, TS 24.501 §5.5.1.3.4: "If a 5G-GUTI ... is included in the
+            // REGISTRATION ACCEPT message, the AMF shall start timer T3550", and the same
+            // for the UE radio capability ID IE or its deletion indication. The UE
+            // acknowledges with a REGISTRATION COMPLETE, which is what makes the GUTI and
+            // the ID valid. T3550 takes the retransmission slot, so a configuration
+            // update in flight is aborted (§5.4.4.6 c)). Retransmitted as a standalone
+            // DL NAS TRANSPORT, whichever NGAP message carried the Accept first. (The
+            // other T3550 triggers of §5.5.1.3.4 -- SOR, access category definitions,
+            // emergency numbers, CAG -- are IEs this AMF does not send in an update.)
+            if carries_racs || carries_guti {
                 match crate::ngap_asn1::build_downlink_nas_transport_asn1(
                     amf_ue_ngap_id,
                     ran_ue_ngap_id,

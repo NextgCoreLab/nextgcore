@@ -3911,6 +3911,55 @@ async fn a_registration_aborting_a_racs_cuc_carries_the_id_in_the_accept() {
     server.forget_ue(ue);
 }
 
+/// #889 review, TS 24.501 §5.5.1.3.4: an update Accept carrying a 5G-GUTI (as every
+/// one does once the UE's registration set `next_guti`), with no RACS IE, is supervised
+/// by T3550 too, and the REGISTRATION COMPLETE stops it.
+///
+/// Revert-verified: arming T3550 only for RACS IEs leaves the slot empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_update_accept_with_a_5g_guti_arms_t3550() {
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_889_003u64, 83);
+    registered_ue_with_guti(&mut server, ue, ran);
+    server.ue_auth_state.with_mut(ue, |s| {
+        s.amf_ue.next_guti = s.amf_ue.current_guti.clone();
+    });
+    let rr = update_registration_request(
+        crate::gmm_build::registration_type::MOBILITY_UPDATING,
+        None,
+        None,
+    );
+    let _ = server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &ue_protect(&rr, 0)))
+        .await;
+    let sent = take_sent_ngap(&mut server);
+    let accept = sent
+        .iter()
+        .find_map(|(_, p)| match decode_sent(p) {
+            Sent::DownlinkNas { nas_pdu, .. }
+                if dl_nas_message_type(&nas_pdu) == Some(message_type::REGISTRATION_ACCEPT) =>
+            {
+                Some(nas_pdu)
+            }
+            _ => None,
+        })
+        .expect("a Registration Accept");
+    assert!(
+        registration_accept_of(&accept).guti.is_some(),
+        "the Accept carries the 5G-GUTI"
+    );
+    let s = server.ue_auth_state.get(ue).expect("UE");
+    assert_eq!(s.retx.as_ref().map(|r| r.timer), Some(NasProcTimer::T3550));
+
+    let complete = ue_protect(&[0x7E, 0x00, message_type::REGISTRATION_COMPLETE], 1);
+    server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &complete))
+        .await
+        .expect("Registration Complete handled");
+    assert!(server.ue_auth_state.get(ue).expect("UE").retx.is_none());
+    server.forget_ue(ue);
+}
+
 /// #889, TS 24.501 §5.4.4.6 a): a RACS CONFIGURATION UPDATE COMMAND whose T3555
 /// exhausts is aborted, and the ID stays to be delivered: the next command
 /// carries it.
