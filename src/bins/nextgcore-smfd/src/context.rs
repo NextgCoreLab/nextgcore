@@ -3750,16 +3750,304 @@ pub fn smf_context_init(max_ue: usize, max_sess: usize, max_bearer: usize) {
 ///
 /// Sync `#[test]` functions take it with `blocking_lock()`, which is sound
 /// precisely because they have no runtime to block.
+///
+/// #1092: releasing it checks that the test left the SMF context's UEs, sessions
+/// and policy bindings as it found them ([`TestLock::with_census`]).
 #[cfg(test)]
-pub(crate) static PROCESS_STATE_TEST_LOCK: tokio::sync::Mutex<()> =
-    tokio::sync::Mutex::const_new(());
+pub(crate) static PROCESS_STATE_TEST_LOCK: TestLock = TestLock::with_census();
+
+/// A test lock that knows its holder (#979).
+///
+/// A `tokio::sync::Mutex<()>` cannot say who holds it, so [`require_test_lock`]
+/// could only ask whether ANYONE did: an unlocked test passed while a sibling held
+/// the lock. This records the holder's thread. A `current_thread` test (the
+/// default `#[tokio::test]`), and a sync `#[test]`, run everything, the tasks they
+/// spawn included, on that thread; so does a `multi_thread` test's own body. Code on
+/// a runtime worker thread (a `multi_thread` test's spawned tasks) has no holder
+/// to compare with, and falls back to "someone holds it", exact in CI's serial run
+/// and in the nightly parallel loop (#979 option C).
+///
+/// A plain `std::thread::spawn`ed thread is neither: it is not the holder and not a
+/// runtime worker, so guarded code it reaches (the 5GSM timer map,
+/// `teardown_association`, `smf_context_init`) is reported as unlocked, and the
+/// guard aborts the run naming the test that spawned it, even while that test holds
+/// the lock. Run such code on the test's own thread or in a runtime task instead
+/// (#1200 review m2).
+#[cfg(test)]
+pub(crate) struct TestLock {
+    inner: tokio::sync::Mutex<()>,
+    holder: std::sync::Mutex<Option<std::thread::ThreadId>>,
+    census: bool,
+}
+
+#[cfg(test)]
+impl TestLock {
+    /// A lock with no census on release.
+    pub(crate) const fn new() -> Self {
+        Self {
+            inner: tokio::sync::Mutex::const_new(()),
+            holder: std::sync::Mutex::new(None),
+            census: false,
+        }
+    }
+
+    /// A lock whose release checks the SMF context's UE, session and policy binding
+    /// counts against those at acquisition (#1092): a test that leaves its UEs
+    /// behind fails, by name, instead of filling the context for its successors.
+    pub(crate) const fn with_census() -> Self {
+        Self {
+            census: true,
+            ..Self::new()
+        }
+    }
+
+    pub(crate) async fn lock(&'static self) -> TestLockGuard {
+        let guard = self.inner.lock().await;
+        TestLockGuard::new(self, guard)
+    }
+
+    /// For a sync `#[test]`, which has no runtime to block.
+    pub(crate) fn blocking_lock(&'static self) -> TestLockGuard {
+        let guard = self.inner.blocking_lock();
+        TestLockGuard::new(self, guard)
+    }
+
+    fn holder(&self) -> Option<std::thread::ThreadId> {
+        *self.holder.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn set_holder(&self, holder: Option<std::thread::ThreadId>) {
+        *self.holder.lock().unwrap_or_else(|e| e.into_inner()) = holder;
+    }
+
+    /// Whether the code calling this runs on behalf of the lock's holder; see the
+    /// type's doc for what the answer rests on.
+    fn held_by_caller(&self) -> bool {
+        if self.inner.try_lock().is_ok() {
+            return false;
+        }
+        let me = std::thread::current();
+        // A runtime worker runs any test's spawned task: only "someone holds it".
+        if me.name() == Some("tokio-runtime-worker") {
+            return true;
+        }
+        self.holder() == Some(me.id())
+    }
+}
+
+/// The SMF context's UE, session and policy binding counts (#1092), and its
+/// per-session maps' and armed 5GSM timers' (#1200 review m1).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Census {
+    ues: usize,
+    sessions: usize,
+    bindings: usize,
+    pfcp_sessions: usize,
+    upf_ul_endpoints: usize,
+    cp_n4_seids: usize,
+    far_peers: usize,
+    session_upfs: usize,
+    gsm_timers: usize,
+}
+
+#[cfg(test)]
+impl Census {
+    fn take() -> Option<Self> {
+        let ctx = smf_self();
+        let ctx = ctx.read().ok()?;
+        let census = Self {
+            ues: ctx.ue_count(),
+            sessions: ctx.sess_count(),
+            bindings: ctx.policy_bindings.read().ok()?.len(),
+            pfcp_sessions: ctx.pfcp_sessions.read().ok()?.len(),
+            upf_ul_endpoints: ctx.upf_ul_endpoints.read().ok()?.len(),
+            cp_n4_seids: ctx.cp_n4_seids.read().ok()?.len(),
+            far_peers: ctx.far_peers.read().ok()?.len(),
+            session_upfs: ctx.session_upfs.read().ok()?.len(),
+            gsm_timers: crate::gsm_timer_refs_for_test().len(),
+        };
+        Some(census)
+    }
+
+    fn grew_from(&self, before: &Self) -> bool {
+        self.ues > before.ues
+            || self.sessions > before.sessions
+            || self.bindings > before.bindings
+            || self.pfcp_sessions > before.pfcp_sessions
+            || self.upf_ul_endpoints > before.upf_ul_endpoints
+            || self.cp_n4_seids > before.cp_n4_seids
+            || self.far_peers > before.far_peers
+            || self.session_upfs > before.session_upfs
+            || self.gsm_timers > before.gsm_timers
+    }
+}
+
+/// The keys of a keyed map, for [`SeededState`]; empty when poisoned.
+#[cfg(test)]
+fn keys_of<K: Clone + Eq + std::hash::Hash, V>(
+    map: &RwLock<HashMap<K, V>>,
+) -> std::collections::HashSet<K> {
+    map.read()
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Removes from a keyed map every key not in `kept`, for [`SeededState`].
+#[cfg(test)]
+fn retain_keys<K: Eq + std::hash::Hash, V>(
+    map: &RwLock<HashMap<K, V>>,
+    kept: &std::collections::HashSet<K>,
+) {
+    if let Ok(mut m) = map.write() {
+        m.retain(|k, _| kept.contains(k));
+    }
+}
+
+/// The UEs, sessions and policy bindings a test seeds, removed when this drops
+/// (#1092), with the per-session map entries and the armed 5GSM timers it added
+/// (#1200 review m1).
+///
+/// Taken right after [`PROCESS_STATE_TEST_LOCK`], it records what the shared SMF
+/// context already holds; on drop it removes every UE, session and policy binding
+/// added since, whether the test seeded it directly, through a `seed_*` helper, or
+/// by driving a handler that registered an SM context. So it does for the maps
+/// keyed by SM context reference or SMF N4 SEID (`pfcp_sessions`,
+/// `upf_ul_endpoints`, `cp_n4_seids`, `far_peers`, `session_upfs`), which later
+/// tests sweep (#994's path failure walks `far_peers`, #1031's routing reads
+/// `session_upfs`) and whose derived SEIDs collide with a later test's fixed refs,
+/// and it cancels the 5GSM timers armed meanwhile, which would otherwise fire into a
+/// later test. The lock serialises every writer of the context, so what was added
+/// meanwhile is this test's. Declared after the lock guard, it drops first, so the
+/// lock's census sees the context restored.
+#[cfg(test)]
+#[must_use = "the seeded state is removed when this drops"]
+pub(crate) struct SeededState {
+    ues: std::collections::HashSet<u64>,
+    sessions: std::collections::HashSet<u64>,
+    bindings: std::collections::HashSet<String>,
+    pfcp_sessions: std::collections::HashSet<String>,
+    upf_ul_endpoints: std::collections::HashSet<String>,
+    cp_n4_seids: std::collections::HashSet<String>,
+    far_peers: std::collections::HashSet<u64>,
+    session_upfs: std::collections::HashSet<u64>,
+    gsm_timers: std::collections::HashSet<String>,
+}
+
+#[cfg(test)]
+impl SeededState {
+    pub(crate) fn track() -> Self {
+        let ctx = smf_self();
+        let ctx = ctx.read().unwrap_or_else(|e| e.into_inner());
+        Self {
+            ues: keys_of(&ctx.smf_ue_list),
+            sessions: keys_of(&ctx.sess_list),
+            bindings: keys_of(&ctx.policy_bindings),
+            pfcp_sessions: keys_of(&ctx.pfcp_sessions),
+            upf_ul_endpoints: keys_of(&ctx.upf_ul_endpoints),
+            cp_n4_seids: keys_of(&ctx.cp_n4_seids),
+            far_peers: keys_of(&ctx.far_peers),
+            session_upfs: keys_of(&ctx.session_upfs),
+            gsm_timers: crate::gsm_timer_refs_for_test(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for SeededState {
+    fn drop(&mut self) {
+        let ctx = smf_self();
+        let ctx = ctx.read().unwrap_or_else(|e| e.into_inner());
+        // Collected first: removing takes the same maps' write locks.
+        let sessions: Vec<u64> = ctx
+            .sess_list
+            .read()
+            .map(|m| {
+                m.keys()
+                    .filter(|id| !self.sessions.contains(id))
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default();
+        for id in sessions {
+            ctx.sess_remove(id);
+        }
+        let ues: Vec<u64> = ctx
+            .smf_ue_list
+            .read()
+            .map(|m| {
+                m.keys()
+                    .filter(|id| !self.ues.contains(id))
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default();
+        for id in ues {
+            ctx.ue_remove(id);
+        }
+        retain_keys(&ctx.policy_bindings, &self.bindings);
+        retain_keys(&ctx.pfcp_sessions, &self.pfcp_sessions);
+        retain_keys(&ctx.upf_ul_endpoints, &self.upf_ul_endpoints);
+        retain_keys(&ctx.cp_n4_seids, &self.cp_n4_seids);
+        retain_keys(&ctx.far_peers, &self.far_peers);
+        retain_keys(&ctx.session_upfs, &self.session_upfs);
+        crate::retain_gsm_timers_for_test(&self.gsm_timers);
+    }
+}
+
+/// A held [`TestLock`]: names the holder until dropped.
+#[cfg(test)]
+pub(crate) struct TestLockGuard {
+    lock: &'static TestLock,
+    census: Option<Census>,
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl TestLockGuard {
+    fn new(lock: &'static TestLock, guard: tokio::sync::MutexGuard<'static, ()>) -> Self {
+        lock.set_holder(Some(std::thread::current().id()));
+        let census = if lock.census { Census::take() } else { None };
+        Self {
+            lock,
+            census,
+            _guard: guard,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestLockGuard {
+    fn drop(&mut self) {
+        // A failing test has already said why; its leftovers are not the news. The
+        // census is taken while this thread is still the named holder: it reads the
+        // 5GSM timer map, whose guard asks for exactly that.
+        let after = if std::thread::panicking() {
+            None
+        } else {
+            self.census.and_then(|_| Census::take())
+        };
+        // Before `_guard` unlocks, so the next holder never sees this one named.
+        self.lock.set_holder(None);
+        if let (Some(before), Some(after)) = (self.census, after) {
+            assert!(
+                !after.grew_from(&before),
+                "TEST STATE LEAK (#1092): this test left SMF context state behind \
+                 (before {before:?}, after {after:?}); remove the UEs, sessions, \
+                 policy bindings, per-session map entries and 5GSM timers it added \
+                 (see context::SeededState)"
+            );
+        }
+    }
+}
 
 /// #723: the guard for code a test may reach only while holding `lock`.
 ///
-/// A lock cannot name its holder, so this catches a missing lock only when nobody
-/// else holds it: always under `--test-threads=1` (which CI runs for this crate),
-/// and when the offending test runs on its own. A legitimate caller holds the lock
-/// and never trips it, in any run.
+/// #979: it asks whether the CALLER's test holds the lock, by the holder's thread
+/// ([`TestLock`]), not whether any test does. On a runtime worker thread, where no
+/// holder can be named, it falls back to "someone holds it", which is exact under
+/// `--test-threads=1` (which CI runs for this crate). A legitimate caller holds the
+/// lock and never trips it, in any run.
 ///
 /// It ABORTS rather than panics. Several guarded paths run in a task the test
 /// spawned (the PFCP packet pump, an SBI handler), where a panic only kills that
@@ -3767,8 +4055,8 @@ pub(crate) static PROCESS_STATE_TEST_LOCK: tokio::sync::Mutex<()> =
 /// all. An abort fails the whole run with this message on stderr, so the offender
 /// is named instead of a sibling.
 #[cfg(test)]
-pub(crate) fn require_test_lock(lock: &tokio::sync::Mutex<()>, lock_name: &str, what: &str) {
-    if lock.try_lock().is_ok() {
+pub(crate) fn require_test_lock(lock: &TestLock, lock_name: &str, what: &str) {
+    if !lock.held_by_caller() {
         // Straight to the stderr handle: libtest captures `eprintln!`, and a
         // captured line is lost with the process.
         use std::io::Write as _;
@@ -3986,6 +4274,167 @@ mod tests {
         assert_eq!(ctx.sess_count(), 0);
         assert_eq!(ctx.bearer_count(), 0);
         assert_eq!(ctx.pf_count(), 0);
+    }
+
+    // ── test locks (#979, #1092) ─────────────────────────────────────────────
+
+    /// #979: a lock held by ANOTHER test's thread is not held by the caller. The guard
+    /// passed `try_lock`'s "someone holds it" for every unlocked test while a sibling held
+    /// the lock; it now asks for the holder. This probe lock guards nothing, so it is not
+    /// a second lock over any global.
+    #[test]
+    fn a_test_lock_held_by_another_thread_is_not_held_by_the_caller() {
+        static PROBE: TestLock = TestLock::new();
+        let (held, release) = (std::sync::mpsc::channel(), std::sync::mpsc::channel::<()>());
+        let (held_tx, held_rx) = held;
+        let (release_tx, release_rx) = release;
+        let sibling = std::thread::spawn(move || {
+            let _guard = PROBE.blocking_lock();
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        held_rx.recv().unwrap();
+        let while_sibling_holds = PROBE.held_by_caller();
+        release_tx.send(()).unwrap();
+        sibling.join().unwrap();
+        let unheld = PROBE.held_by_caller();
+        let mine = {
+            let _guard = PROBE.blocking_lock();
+            PROBE.held_by_caller()
+        };
+        assert!(
+            !while_sibling_holds,
+            "a sibling's lock is not the caller's (#979)"
+        );
+        assert!(!unheld, "nobody holds it");
+        assert!(mine, "the holder holds it");
+    }
+
+    /// #1092: releasing a census lock with a UE more than at acquisition fails the
+    /// releasing test, by name; `SeededState` puts the context back so it passes.
+    #[test]
+    fn a_census_lock_fails_a_test_that_leaves_a_ue_and_seeded_state_cleans_up() {
+        static PROBE: TestLock = TestLock::with_census();
+        let _state = PROCESS_STATE_TEST_LOCK.blocking_lock();
+        let _seeded = SeededState::track();
+        smf_context_init(64, 256, 512);
+        let imsi = b"\x09\x91\x07\x00\x00\x10\x92\x01";
+
+        let leaked = std::panic::catch_unwind(|| {
+            let _probe = PROBE.blocking_lock();
+            let ctx = smf_self();
+            let ctx = ctx.read().unwrap();
+            ctx.ue_add_by_imsi(imsi).expect("ue");
+        });
+        // The probe's guard is gone with the panic; tidy the UE it left.
+        let ue = smf_self().read().unwrap().ue_find_by_imsi(imsi);
+        if let Some(ue) = ue {
+            smf_self().read().unwrap().ue_remove(ue.id);
+        }
+
+        let cleaned = std::panic::catch_unwind(|| {
+            let _probe = PROBE.blocking_lock();
+            let _seeded = SeededState::track();
+            let ctx = smf_self();
+            let ctx = ctx.read().unwrap();
+            let ue = ctx.ue_add_by_imsi(imsi).expect("ue");
+            ctx.sess_add_by_apn(ue.id, "internet", 6).expect("sess");
+            ctx.policy_bindings
+                .write()
+                .unwrap()
+                .insert("1092-probe".to_string(), PolicyBinding::snapshot_default());
+        });
+
+        assert!(leaked.is_err(), "the leaking body fails at release");
+        assert!(
+            cleaned.is_ok(),
+            "SeededState removes the UE, session and binding"
+        );
+        assert!(smf_self().read().unwrap().ue_find_by_imsi(imsi).is_none());
+    }
+
+    /// #1200 review m1: the per-session maps and the armed 5GSM timers are in the
+    /// census too, and `SeededState` removes the entries a test added to them. A body
+    /// that leaves only a FAR peer behind fails at release; one that adds an entry to
+    /// every per-session map and arms a T3591 under `SeededState` passes, and leaves
+    /// none of them.
+    #[test]
+    fn seeded_state_removes_the_per_session_entries_and_5gsm_timers_a_test_added() {
+        static PROBE: TestLock = TestLock::with_census();
+        let _state = PROCESS_STATE_TEST_LOCK.blocking_lock();
+        let _seeded = SeededState::track();
+        smf_context_init(64, 256, 512);
+        let r = "1200-m1-probe";
+        let seid = derive_cp_n4_seid(r);
+        let peer = FarPeer {
+            ip: std::net::IpAddr::from([10, 12, 0, 1]),
+            ip6: None,
+            access: true,
+            forwarding: true,
+        };
+
+        let leaked = std::panic::catch_unwind(|| {
+            let _probe = PROBE.blocking_lock();
+            let ctx = smf_self();
+            let ctx = ctx.read().unwrap();
+            ctx.far_peers
+                .write()
+                .unwrap()
+                .insert(seid, [(1u32, peer)].into_iter().collect());
+        });
+        smf_self()
+            .read()
+            .unwrap()
+            .far_peers
+            .write()
+            .unwrap()
+            .remove(&seid);
+
+        let cleaned = std::panic::catch_unwind(|| {
+            let _probe = PROBE.blocking_lock();
+            let _seeded = SeededState::track();
+            let ctx = smf_self();
+            let ctx = ctx.read().unwrap();
+            ctx.pfcp_sessions.write().unwrap().insert(r.into(), 0x1200);
+            ctx.upf_ul_endpoints
+                .write()
+                .unwrap()
+                .insert(r.into(), (0x1200, [10, 12, 0, 2]));
+            ctx.cp_n4_seids.write().unwrap().insert(r.into(), seid);
+            ctx.far_peers
+                .write()
+                .unwrap()
+                .insert(seid, [(1u32, peer)].into_iter().collect());
+            ctx.session_upfs
+                .write()
+                .unwrap()
+                .insert(seid, "upf.1200:8805".into());
+            crate::arm_gsm_timer(
+                r,
+                crate::timer::SmfTimerId::T3591,
+                &[0x2e],
+                "imsi-1200",
+                5,
+                None,
+            );
+        });
+
+        let ctx = smf_self();
+        let ctx = ctx.read().unwrap();
+        let left = (
+            ctx.pfcp_sessions.read().unwrap().contains_key(r),
+            ctx.upf_ul_endpoints.read().unwrap().contains_key(r),
+            ctx.cp_n4_seids.read().unwrap().contains_key(r),
+            ctx.far_peers.read().unwrap().contains_key(&seid),
+            ctx.session_upfs.read().unwrap().contains_key(&seid),
+            crate::gsm_timer_refs_for_test().contains(r),
+        );
+        assert!(
+            leaked.is_err(),
+            "a leaked FAR peer fails the body at release"
+        );
+        assert!(cleaned.is_ok(), "SeededState removes what the body added");
+        assert_eq!(left, (false, false, false, false, false, false));
     }
 
     // ── durable state (issue #191) ───────────────────────────────────────────

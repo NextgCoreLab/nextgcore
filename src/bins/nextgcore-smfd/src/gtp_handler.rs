@@ -2991,6 +2991,7 @@ mod tests {
     #[tokio::test]
     async fn a_create_session_request_is_answered_with_an_address_this_node_allocated() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _upf = crate::pfcp_path::stand_in::associated_upf().await;
         crate::context::smf_context_init(64, 256, 512);
 
@@ -3134,6 +3135,7 @@ mod tests {
     #[tokio::test]
     async fn a_create_session_activates_the_downlink_toward_the_sgw_s5u_endpoint() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = crate::pfcp_path::stand_in::associated_upf().await;
         upf.clear_seen();
         // IMSI ...0x37 and SGW TEID 0x3700_0001 are this test's alone.
@@ -3160,6 +3162,7 @@ mod tests {
     #[tokio::test]
     async fn the_response_carries_the_pgw_s5u_fteid_at_instance_2() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = crate::pfcp_path::stand_in::associated_upf().await;
         crate::context::smf_context_init(64, 256, 512);
         let server = crate::gtp_path::S5S8Server::open("127.0.0.1:0".parse().unwrap(), 3)
@@ -3215,6 +3218,7 @@ mod tests {
     #[tokio::test]
     async fn an_established_eps_session_is_stored_with_its_address_teid_and_bearer() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _upf = crate::pfcp_path::stand_in::associated_upf().await;
         // IMSI ...0x31 and SGW TEID 0x3100_0001 are this test's alone — see the fixture.
         let (server, _sgw, sess) = establish_over_the_wire(3, 0x31, 0x3100_0001).await;
@@ -3270,6 +3274,7 @@ mod tests {
     #[tokio::test]
     async fn a_delete_session_request_records_the_release_on_the_stored_session() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _upf = crate::pfcp_path::stand_in::associated_upf().await;
         // IMSI ...0x35, SGW TEID 0x3500_0005: distinct from every other #223 test's.
         let (server, _sgw, mut sess) = establish_over_the_wire(8, 0x35, 0x3500_0005).await;
@@ -3323,6 +3328,7 @@ mod tests {
     #[tokio::test]
     async fn a_delete_session_request_with_no_linked_ebi_still_records_the_release() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _upf = crate::pfcp_path::stand_in::associated_upf().await;
         // IMSI ...0x37, SGW TEID 0x3700_0007: distinct from every other #223 test's.
         let (server, _sgw, mut sess) = establish_over_the_wire(11, 0x37, 0x3700_0007).await;
@@ -3360,6 +3366,7 @@ mod tests {
     #[tokio::test]
     async fn a_delete_session_request_tears_the_pdn_connection_down() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _upf = crate::pfcp_path::stand_in::associated_upf().await;
         // IMSI ...0x32, SGW TEID 0x3200_0002: distinct from every other #223 test's.
         let (server, sgw, sess) = establish_over_the_wire(4, 0x32, 0x3200_0002).await;
@@ -3434,6 +3441,7 @@ mod tests {
     #[tokio::test]
     async fn a_modify_bearer_request_repoints_the_bearer_and_records_the_modification() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _upf = crate::pfcp_path::stand_in::associated_upf().await;
         // IMSI ...0x33, SGW TEID 0x3300_0003: distinct from every other #223 test's.
         let (server, sgw, sess) = establish_over_the_wire(5, 0x33, 0x3300_0003).await;
@@ -3520,6 +3528,7 @@ mod tests {
     #[tokio::test]
     async fn a_bearer_resource_command_updates_the_stored_bearers_authorized_qos() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _upf = crate::pfcp_path::stand_in::associated_upf().await;
         // IMSI ...0x34, SGW TEID 0x3400_0004: distinct from every other #223 test's.
         let (server, sgw, sess) = establish_over_the_wire(6, 0x34, 0x3400_0004).await;
@@ -4160,6 +4169,7 @@ mod tests {
     async fn a_local_pcc_rule_is_activated_as_a_dedicated_bearer_over_s5s8() {
         use nextgcore_gtp::v2::{Gtp2BearerQosIe, Gtp2FTeidIe};
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = crate::pfcp_path::stand_in::associated_upf().await;
         crate::context::smf_context_init(64, 256, 512);
         let server = crate::gtp_path::S5S8Server::open("127.0.0.1:0".parse().unwrap(), 3)
@@ -4324,6 +4334,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_create_bearer_removes_the_bearer_and_its_uplink() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = crate::pfcp_path::stand_in::associated_upf().await;
         crate::context::smf_context_init(64, 256, 512);
         let server = crate::gtp_path::S5S8Server::open("127.0.0.1:0".parse().unwrap(), 3)
@@ -4458,6 +4469,7 @@ mod tests {
     #[tokio::test]
     async fn two_dedicated_bearers_on_one_pdn_connection_get_distinct_rules() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = crate::pfcp_path::stand_in::associated_upf().await;
         upf.clear_seen();
         let (server, sgw, _port, sess, pgw_c_teid) =
@@ -4498,6 +4510,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_dedicated_bearer_whose_downlink_fails_is_deleted_at_the_sgw() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = crate::pfcp_path::stand_in::associated_upf().await;
         let (server, sgw, _port, sess, pgw_c_teid) =
             pdn_with_local_rules(0x65, vec![voice_rule()]).await;
@@ -4525,6 +4538,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_dedicated_bearer_under_a_taken_ebi_is_deleted_at_the_sgw() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = crate::pfcp_path::stand_in::associated_upf().await;
         upf.clear_seen();
         let (server, sgw, _port, sess, pgw_c_teid) =
@@ -4570,6 +4584,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_delete_bearer_command_deletes_the_dedicated_bearer() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = crate::pfcp_path::stand_in::associated_upf().await;
         let (server, sgw, _port, sess, pgw_c_teid) =
             pdn_with_local_rules(0x67, vec![voice_rule()]).await;
@@ -4670,6 +4685,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_delete_bearer_command_keeps_the_bearers_the_answer_refuses() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = crate::pfcp_path::stand_in::associated_upf().await;
         let (server, sgw, _port, sess, pgw_c_teid) =
             pdn_with_local_rules(0x6a, vec![voice_rule(), video_rule()]).await;
@@ -4779,6 +4795,7 @@ mod tests {
     #[tokio::test]
     async fn a_bearer_resource_command_is_answered_with_a_create_bearer_request() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _upf = crate::pfcp_path::stand_in::associated_upf().await;
         let (server, sgw, sess) = establish_over_the_wire(7, 0x63, 0x6300_0001).await;
 
@@ -4907,6 +4924,7 @@ mod tests {
     #[tokio::test]
     async fn a_pgwu_restart_deletes_the_epc_pdn_connection_toward_the_sgw() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _upf = crate::pfcp_path::stand_in::associated_upf().await;
         // IMSI ...0x68 and SGW TEID 0x6870_0001 are this test's alone.
         let (server, sgw, sess) = establish_over_the_wire(9, 0x68, 0x6870_0001).await;
