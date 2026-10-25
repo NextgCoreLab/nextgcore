@@ -231,7 +231,14 @@ fn every_nr_measured_result_is_kept_as_reported() {
         ss_rsrq(&[(5, 1000, None)]),
         csi_rsrp(&[(6, 2000, Some(64))]),
         csi_rsrq(&[(7, 3000, Some(1))]),
+        // Repeated lists: the first of each is kept (#1134 review).
+        ss_rsrp(&[(9, 9, Some(9))]),
+        ss_rsrq(&[(9, 9, Some(9))]),
+        csi_rsrp(&[(9, 9, Some(9))]),
+        csi_rsrq(&[(9, 9, Some(9))]),
+        ue_rx_tx(9),
         aoa_nr(3599, Some(1799)),
+        aoa_nr(1, None),
         rsrp(&[60]),
     ]);
     assert_eq!(

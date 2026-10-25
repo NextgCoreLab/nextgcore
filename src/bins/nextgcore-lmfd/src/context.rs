@@ -172,6 +172,13 @@ pub struct CellMeasurement {
     pub nr_ecid: Option<crate::nrppa_uplink::NrEcidReport>,
 }
 
+/// #859: the Value Timing Advance NR a gNB reported among `cells`, which has no
+/// mapping yet (TS 38.133). The NRPPa cell can be anywhere in a joint session's
+/// measurements (the LPP leg often comes first), so every cell is looked at.
+fn unmapped_nr_tadv(cells: &[CellMeasurement]) -> Option<u16> {
+    cells.iter().find_map(|c| c.nr_ecid.as_ref()?.nr_tadv)
+}
+
 /// Positioning QoS requirements
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PositioningQos {
@@ -800,11 +807,7 @@ impl LmfContext {
         // Build the registry snapshot while holding only the cell_registry read
         // lock; drop it before acquiring the write locks below to avoid deadlock.
         let registry = self.build_trp_registry();
-        // #859: an NR gNB's timing term, reported but not mappable yet.
-        let unmapped_nr_tadv = cell_measurements
-            .iter()
-            .find(|c| c.ecid_rtt_ns.is_none())
-            .and_then(|c| c.nr_ecid.as_ref()?.nr_tadv);
+        let unmapped_nr_tadv = unmapped_nr_tadv(&cell_measurements);
 
         // Scope the store locks so the session completion below runs lock-free.
         let strict_fix = {
@@ -4767,6 +4770,37 @@ mod tests_session_bounds {
             .get(&corr)
             .map(|s| s.accumulated.len());
         assert_eq!(held, Some(MAX_SESSION_MEASUREMENTS));
+    }
+
+    /// #859 review: the unmapped NR-TADV is found wherever the NRPPa cell sits; in a
+    /// joint session the LPP NR E-CID cell, which has no `nr_ecid`, comes first.
+    #[test]
+    fn the_unmapped_nr_tadv_is_found_behind_an_lpp_cell() {
+        let cell = |nr_ecid: Option<crate::nrppa_uplink::NrEcidReport>| CellMeasurement {
+            nr_ecid,
+            nr_cgi: "pci-7".into(),
+            rsrp: Some(-80),
+            rsrq: None,
+            timing_advance: None,
+            ecid_rtt_ns: None,
+            ecid_rtt_width_ns: None,
+            aoa: None,
+            rtt_ns: None,
+            rstd_ns: None,
+            rstd_reference: None,
+            ue_rx_tx_ns: None,
+            gnb_rx_tx_ns: None,
+            meas_time: None,
+            dl_prs_id: None,
+            eutra: false,
+        };
+        let nrppa = cell(Some(crate::nrppa_uplink::NrEcidReport {
+            nr_tadv: Some(321),
+            ..Default::default()
+        }));
+        assert_eq!(unmapped_nr_tadv(&[cell(None), nrppa.clone()]), Some(321));
+        assert_eq!(unmapped_nr_tadv(&[nrppa]), Some(321));
+        assert_eq!(unmapped_nr_tadv(&[cell(None)]), None);
     }
 
     /// A session older than the reap age goes, with its measurement-store entry;
