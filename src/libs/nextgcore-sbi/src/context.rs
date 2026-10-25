@@ -74,6 +74,9 @@ pub struct NfInstance {
     pub priority: u16,
     /// Capacity
     pub capacity: u16,
+    /// The profile's `lmfInfo` as the NRF returned it (TS 29.510 §6.1.6.2.46), for
+    /// an LMF consumer's selection (TS 23.273 §5.1, #997). `None` when absent.
+    pub lmf_info: Option<serde_json::Value>,
 }
 
 impl NfInstance {
@@ -92,6 +95,7 @@ impl NfInstance {
             load: 0,
             priority: 0,
             capacity: 100,
+            lmf_info: None,
         }
     }
 

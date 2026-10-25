@@ -683,9 +683,12 @@ pub fn build_s5c_modify_bearer_request(
         };
         let mut bc = Gtp2BearerContextIe::new();
         bc.set_ebi(bearer.ebi);
+        // S5/S8-U SGW F-TEID: instance 1 in a Modify Bearer Request's Bearer Context
+        // (TS 29.274 Table 7.2.7-2), not the Create Session Request's 2. It was written
+        // at 2, where a PGW reading the table finds nothing (#1113 audit).
         if let Some(dl_tunnel) = ctx.dl_tunnel_in_bearer(bearer.id) {
             if let Ok(ft) = fteid_from_tunnel(f_teid_interface::S5_S8_SGW_GTP_U, &dl_tunnel) {
-                bc.set_fteid(2, &ft);
+                bc.set_fteid(1, &ft);
             }
         }
         msg.add_bearer_context(0, &bc);
@@ -744,9 +747,12 @@ pub fn build_s5c_delete_session_request_to(
     msg
 }
 
-/// Build Create Bearer Response toward the PGW (TS 29.274 Section 7.2.4)
+/// Build Create Bearer Response toward the PGW (TS 29.274 Section 7.2.4) for the
+/// bearers `created` of `sess` -- the ones the PGW's Create Bearer Request asked for,
+/// not every bearer of the session (#1113 review).
 pub fn build_s5c_create_bearer_response(
     sess: &SgwcSess,
+    created: &[u64],
     sequence_number: u32,
     cause: u8,
 ) -> Result<Gtp2Message, String> {
@@ -761,9 +767,13 @@ pub fn build_s5c_create_bearer_response(
     // Cause (M)
     msg.add_ie(Gtp2CauseIe::new(cause).to_ie(0));
 
-    // Bearer Contexts (M, instance 0)
-    for bearer_id in &sess.bearer_ids {
-        let Some(bearer) = ctx.bearer_find_by_id(*bearer_id) else {
+    // Bearer Contexts (M, instance 0), Table 7.2.4-2: the S5/S8-U SGW F-TEID at 2 and
+    // the S5/S8-U PGW F-TEID at 3 (the PGW's endpoint the SGW-U tunnels uplink to).
+    for bearer_id in created {
+        let Some(bearer) = ctx
+            .bearer_find_by_id(*bearer_id)
+            .filter(|b| b.sess_id == sess.id)
+        else {
             continue;
         };
         let mut bc = Gtp2BearerContextIe::new();
@@ -772,6 +782,18 @@ pub fn build_s5c_create_bearer_response(
         if let Some(dl_tunnel) = ctx.dl_tunnel_in_bearer(bearer.id) {
             if let Ok(ft) = fteid_from_tunnel(f_teid_interface::S5_S8_SGW_GTP_U, &dl_tunnel) {
                 bc.set_fteid(2, &ft);
+            }
+        }
+        if let Some(ul_tunnel) = ctx.ul_tunnel_in_bearer(bearer.id) {
+            if ul_tunnel.remote_teid != 0 {
+                if let Ok(ft) = fteid(
+                    f_teid_interface::S5_S8_PGW_GTP_U,
+                    ul_tunnel.remote_teid,
+                    ul_tunnel.remote_ip.ipv4,
+                    ul_tunnel.remote_ip.ipv6,
+                ) {
+                    bc.set_fteid(3, &ft);
+                }
             }
         }
         msg.add_bearer_context(0, &bc);
@@ -1216,6 +1238,130 @@ mod tests {
         assert!(Gtp2IndicationIe::decode(&ind.value).unwrap().oi);
     }
 
+    /// The F-TEID IE an S5/S8 message must carry, golden: type 87, length 9, the
+    /// instance, then V4 + the interface type, the TEID and the IPv4 address
+    /// (TS 29.274 §8.22).
+    fn golden_fteid(instance: u8, iface: u8, teid: u32, addr: [u8; 4]) -> Vec<u8> {
+        let mut v = vec![0x57, 0x00, 0x09, instance, 0x80 | iface];
+        v.extend(teid.to_be_bytes());
+        v.extend(addr);
+        v
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// #1113 audit: every F-TEID the SGW-C sends the PGW is at the instance the
+    /// message's TS 29.274 table gives it.
+    /// - Create Session Request (Tables 7.2.1-1 / -2): the Sender F-TEID (S5/S8 SGW
+    ///   GTP-C) at 0 and, in the Bearer Context, the S5/S8-U SGW F-TEID at 2. Nothing at
+    ///   instance 1: "PGW S5/S8 Address for Control Plane" is an S11/S4 IE.
+    /// - Modify Bearer Request (Table 7.2.7-2): the S5/S8-U SGW F-TEID at 1 -- it was
+    ///   written at 2, where the PGW-C found nothing.
+    /// - Create Bearer Response (Table 7.2.4-2): the S5/S8-U SGW F-TEID at 2.
+    #[test]
+    fn s5_requests_put_each_fteid_at_its_table_instance() {
+        let ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let (_, sess) = provision(&ambient, &[0x11, 0x11, 0x11, 0x11, 0x11, 0x13, 0x13]);
+        let ctx = sgwc_self();
+        ctx.set_s5c_address(Some(Ipv4Addr::new(10, 11, 0, 6)));
+        let bearer = ctx.default_bearer_in_sess(sess.id).unwrap();
+        let dl = ctx.dl_tunnel_in_bearer(bearer.id).unwrap();
+        let s5u = golden_fteid(
+            2,
+            f_teid_interface::S5_S8_SGW_GTP_U,
+            dl.local_teid,
+            [10, 11, 0, 7],
+        );
+
+        let csr = build_s5c_create_session_request(&sess, 1).unwrap().encode();
+        assert!(contains(
+            &csr,
+            &golden_fteid(
+                0,
+                f_teid_interface::S5_S8_SGW_GTP_C,
+                sess.sgw_s5c_teid,
+                [10, 11, 0, 6]
+            )
+        ));
+        assert!(contains(&csr, &s5u), "the S5/S8-U SGW F-TEID at instance 2");
+        assert!(
+            !contains(&csr, &[0x57, 0x00, 0x09, 0x01]),
+            "no F-TEID at instance 1"
+        );
+
+        let mbr = build_s5c_modify_bearer_request(&sess, 2).unwrap().encode();
+        let mut s5u_at_1 = s5u.clone();
+        s5u_at_1[3] = 1;
+        assert!(
+            contains(&mbr, &s5u_at_1),
+            "the S5/S8-U SGW F-TEID at instance 1"
+        );
+        assert!(
+            !contains(&mbr, &s5u),
+            "not at the Create Session Request's instance 2"
+        );
+
+        // A dedicated bearer the PGW asked for, its uplink toward the PGW-U set.
+        let dedicated = ctx.bearer_add(sess.id).unwrap();
+        let mut dedicated = ctx.bearer_find_by_id(dedicated.id).unwrap();
+        dedicated.ebi = 6;
+        ctx.bearer_update(&dedicated);
+        for tunnel_id in &dedicated.tunnel_ids {
+            let mut tunnel = ctx.tunnel_find_by_id(*tunnel_id).unwrap();
+            tunnel.local_teid = 0x600 + *tunnel_id as u32;
+            tunnel.local_addr = Some(Ipv4Addr::new(10, 11, 0, 7));
+            ctx.tunnel_update(&tunnel);
+        }
+        let mut ul = ctx.ul_tunnel_in_bearer(dedicated.id).unwrap();
+        ul.remote_teid = 0x0bee_f006;
+        ul.remote_ip.ipv4 = Some(Ipv4Addr::new(10, 10, 0, 67));
+        ctx.tunnel_update(&ul);
+        let sess = ctx.sess_find_by_id(sess.id).unwrap();
+        let dedicated_dl = ctx.dl_tunnel_in_bearer(dedicated.id).unwrap().local_teid;
+
+        let cbr = build_s5c_create_bearer_response(
+            &sess,
+            &[dedicated.id],
+            3,
+            gtp_cause::REQUEST_ACCEPTED,
+        )
+        .unwrap();
+        assert_eq!(
+            cbr.get_ies(Gtp2IeType::BearerContext as u8).len(),
+            1,
+            "only the bearer being created, not the default one"
+        );
+        let cbr = cbr.encode();
+        assert!(
+            contains(
+                &cbr,
+                &golden_fteid(
+                    2,
+                    f_teid_interface::S5_S8_SGW_GTP_U,
+                    dedicated_dl,
+                    [10, 11, 0, 7]
+                )
+            ),
+            "the S5/S8-U SGW F-TEID at instance 2"
+        );
+        assert!(
+            contains(
+                &cbr,
+                &golden_fteid(
+                    3,
+                    f_teid_interface::S5_S8_PGW_GTP_U,
+                    0x0bee_f006,
+                    [10, 10, 0, 67]
+                )
+            ),
+            "the S5/S8-U PGW F-TEID at instance 3"
+        );
+        assert!(!contains(&cbr, &s5u), "the default bearer is not in it");
+        ctx.set_s5c_address(None);
+    }
+
     #[test]
     fn test_s5c_modify_bearer_and_create_bearer_response_round_trip() {
         let ambient = crate::pfcp_path::process_state_test_guard_blocking();
@@ -1229,7 +1375,13 @@ mod tests {
         );
         assert!(decoded.bearer_context(0).unwrap().is_some());
 
-        let msg = build_s5c_create_bearer_response(&sess, 14, gtp_cause::REQUEST_ACCEPTED).unwrap();
+        let msg = build_s5c_create_bearer_response(
+            &sess,
+            &sess.bearer_ids,
+            14,
+            gtp_cause::REQUEST_ACCEPTED,
+        )
+        .unwrap();
         let decoded = round_trip(&msg);
         assert_eq!(
             decoded.header.message_type,

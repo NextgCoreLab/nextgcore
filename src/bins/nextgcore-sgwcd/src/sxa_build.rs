@@ -156,11 +156,20 @@ fn outer_header_creation(tunnel: &SgwcTunnel) -> Option<OuterHeaderCreation> {
     // Without the peer's ADDRESS there is no header to create: a TEID alone names no
     // destination, and emitting one would make the FAR look provisioned while the SGW-U
     // had nowhere to forward to.
-    let addr = tunnel.remote_ip.ipv4?;
-    Some(OuterHeaderCreation::new_gtpu_ipv4(
-        tunnel.remote_teid,
-        addr.octets(),
-    ))
+    //
+    // #936, TS 29.244 §8.2.56: GTP-U/UDP/IPv4 when the peer has an IPv4 address,
+    // else GTP-U/UDP/IPv6 for an IPv6-only peer (an IPv6-transport eNB).
+    match (tunnel.remote_ip.ipv4, tunnel.remote_ip.ipv6) {
+        (Some(v4), _) => Some(OuterHeaderCreation::new_gtpu_ipv4(
+            tunnel.remote_teid,
+            v4.octets(),
+        )),
+        (None, Some(v6)) => Some(OuterHeaderCreation::new_gtpu_ipv6(
+            tunnel.remote_teid,
+            v6.octets(),
+        )),
+        (None, None) => None,
+    }
 }
 
 /// FORW once the peer endpoint is known; BUFF + NOCP until then.

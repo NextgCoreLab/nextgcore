@@ -101,6 +101,9 @@ enum ModifyIndicationAnswer {
     TransferSyntaxError,
     /// The Confirm could not be built: nothing to send.
     Nothing,
+    /// #922 part 3: the sessions' SMFs are being asked off the NGAP task; the Confirm
+    /// follows their answers (`finish_modify_indication`).
+    Pending,
 }
 
 enum NgapTransport {
@@ -160,14 +163,16 @@ impl NgapTransport {
         }
     }
 
-    async fn recv(
+    /// Receive for up to `timeout`, ended early by `wake` (#981).
+    async fn recv_or_wake(
         &mut self,
         timeout: Duration,
-    ) -> std::result::Result<bool, nextgcore_sctp::ServerError> {
+        wake: impl std::future::Future<Output = ()>,
+    ) -> std::result::Result<nextgcore_sctp::RecvOutcome, nextgcore_sctp::ServerError> {
         match self {
-            Self::Userspace(s) => s.recv(timeout).await,
+            Self::Userspace(s) => s.recv_or_wake(timeout, wake).await,
             #[cfg(feature = "kernel-sctp")]
-            Self::Kernel(s) => s.recv(timeout).await,
+            Self::Kernel(s) => s.recv_or_wake(timeout, wake).await,
         }
     }
 
@@ -217,6 +222,20 @@ pub const MAX_GNB_CONNECTIONS: usize = 64;
 
 /// SCTP receive timeout
 const SCTP_RECV_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// What `NgapServer::poll` returns for how its receive ended: `true` ("poll again
+/// at once") only when N2 data came in.
+///
+/// An SBI report that ended the wait (#981) is NOT "poll again at once". `run_async`
+/// (lib.rs) polls in an inner loop until `false`, and only between those loops does
+/// it drain the AMF event channel the NGAP handlers `send(..).await` into. On a busy
+/// AMF, SBI reports arrive more often than every 100 ms, so `true` would keep that
+/// loop from ending, the bounded channel would fill, and the NGAP task would park on
+/// a send only it can unblock (#1129 review M1). With `false` the next 10 ms tick
+/// applies the answer.
+fn poll_again_at_once(outcome: nextgcore_sctp::RecvOutcome) -> bool {
+    outcome == nextgcore_sctp::RecvOutcome::Data
+}
 
 /// How often the NGAP task sweeps orphaned per-session state (#756).
 const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
@@ -799,6 +818,11 @@ impl UeNasContext {
         self.registered
     }
 
+    /// The SCTP association the UE is bound to (#997 review m2).
+    pub(crate) fn association_id(&self) -> u64 {
+        self.association_id
+    }
+
     /// Whether the record names an NG association at all (#1089 review). A context
     /// created over Namf for a UE no gNB has signalled for yet has none: it is
     /// neither connected nor pageable.
@@ -810,7 +834,7 @@ impl UeNasContext {
     /// H9 runtime canary applied to the fresh `AmfUe`: the production caller
     /// passes `crate::context::nas_security_canary()` (the process-wide setting,
     /// default OFF); tests pass an explicit `false` to keep the legacy path.
-    fn new(
+    pub(crate) fn new(
         amf_ue_ngap_id: u64,
         ran_ue_ngap_id: u32,
         association_id: u64,
@@ -1065,6 +1089,10 @@ pub struct NgapServer {
     /// [`ESTABLISHMENT_RETRY_WINDOW`] has passed. See
     /// [`NgapServer::process_pending_establishments`].
     pending_establishments: HashMap<(u64, u8), PendingEstablishment>,
+    /// #923: the UE Context Release Commands sent for a UE the AMF keeps
+    /// (registered, to go CM-IDLE), keyed by (association, AMF UE NGAP ID), until
+    /// their Release Complete. See [`NgapServer::process_release_guards`].
+    outstanding_releases: HashMap<(u64, u64), OutstandingRelease>,
     /// SBI work run off this task (#796 review M1): the re-selection attempts.
     sbi_offload: crate::sbi_offload::SbiOffload,
     /// #748: the UCMF Assigns in flight for re-assignment, one per (TAC, UE radio
@@ -1201,6 +1229,16 @@ pub(crate) enum SmfAnswer {
     },
     /// #778: the ACTIVATING for a queued downlink setup of a CM-CONNECTED UE.
     DownlinkActivation(Box<DownlinkActivation>),
+    /// #922 part 3: the SMF's answer to a PDU SESSION RESOURCE NOTIFY's released
+    /// session (`PDU_RES_NTY_REL`): the N1 SM (a PDU Session Release Command) to relay
+    /// to the UE, if any (TS 23.502 §4.3.4.2 steps 1d-4, #582).
+    NotifyReleased {
+        amf_ue_ngap_id: u64,
+        psi: u8,
+        association_id: u64,
+        ran_ue_ngap_id: u32,
+        result: Result<Vec<u8>, String>,
+    },
     /// One session's answer for the [`SmfJoin`] `join`.
     JoinPart {
         join: u64,
@@ -1234,6 +1272,9 @@ pub(crate) enum JoinAnswer {
     Activated(Result<Vec<u8>, String>),
     /// A PREPARED's N2 SM answer containers, or why there are none.
     Prepared(Result<Vec<Vec<u8>>, String>),
+    /// #922 part 3: an N2 SM update's answer, `(n2SmInfoType, n2SmInfo)`, or why there
+    /// is none (a Path Switch, a Modify Indication).
+    N2Updated(Result<(Option<String>, Vec<u8>), String>),
 }
 
 /// #922 part 2: an NGAP step that waits for several sessions' SMF answers before it
@@ -1262,6 +1303,47 @@ enum JoinThen {
         sessions: Vec<(u8, String, crate::context::SNssai)>,
     },
     EpsPreparation(Box<EpsPreparationRest>),
+    /// #922 part 3: a PATH SWITCH REQUEST, acknowledged once its sessions' SMFs have
+    /// answered (TS 23.502 §4.9.1.2.2 steps 2-7).
+    PathSwitch(Box<PathSwitchRest>),
+    /// #922 part 3: a PDU SESSION RESOURCE MODIFY INDICATION, confirmed once its
+    /// sessions' SMFs have answered (TS 23.502 §4.3.3.2 step 1e, TS 38.413 §8.2.4).
+    ModifyIndication(Box<ModifyIndicationRest>),
+    /// #922 part 3: a registration update's Accept, sent once the sessions it
+    /// re-activates are answered (TS 23.502 §4.2.2.2.2 step 21).
+    RegistrationUpdate(Box<RegistrationUpdateRest>),
+}
+
+/// The rest of a registration update once its activations are answered.
+struct RegistrationUpdateRest {
+    association_id: u64,
+    ran_ue_ngap_id: u32,
+    /// The REGISTRATION REQUEST's session IEs, to tell a repeated request from a new
+    /// one (TS 24.501 §5.5.1.3.8 e)).
+    requested_ies: Option<ServiceRequestSessionIes>,
+    /// The REGISTRATION REQUEST's uplink NAS COUNT, for a new connection's K_gNB.
+    ul_count: u32,
+    /// The page the request answered (#1102).
+    page: Option<crate::context::PagingContext>,
+    outcome: UpdateSessionOutcome,
+    activate: Vec<(u8, String, crate::context::SNssai)>,
+}
+
+/// The rest of a PATH SWITCH REQUEST once its sessions' SMFs have answered.
+struct PathSwitchRest {
+    association_id: u64,
+    request: crate::ngap_asn1::PathSwitchRequestDecoded,
+    notify: Vec<crate::ngap_asn1::IeDiagnostic>,
+}
+
+/// The rest of a PDU SESSION RESOURCE MODIFY INDICATION once its sessions' SMFs have
+/// answered: the Modify Confirm, on the association the indication came on.
+struct ModifyIndicationRest {
+    association_id: u64,
+    ran_ue_ngap_id: u32,
+    /// Every session the indication named, in its order.
+    psis: Vec<u8>,
+    notify: Vec<crate::ngap_asn1::IeDiagnostic>,
 }
 
 /// The rest of a CM-IDLE Service Request once its re-activations are answered
@@ -1323,6 +1405,23 @@ const MAX_OFFLOADED_SBI: usize = 16;
 /// an answer before it retransmits. An SMF restarting in place is back well
 /// within it.
 const ESTABLISHMENT_RETRY_WINDOW: Duration = Duration::from_secs(12);
+
+/// A UE Context Release Command waiting for its Release Complete (#923).
+#[derive(Debug, Clone, Copy)]
+struct OutstandingRelease {
+    ran_ue_ngap_id: u32,
+    /// Past this the release is completed locally.
+    deadline: Instant,
+}
+
+/// How long the AMF waits for the UE Context Release Complete of a Release
+/// Command it sent for a UE it keeps (#923). TS 38.413 §8.3.3 defines no timer:
+/// the NG-RAN node answers once it has released the UE context, well within
+/// this. Past it, the release is completed locally, as the Complete would have
+/// (CM-IDLE, user plane DEACTIVATED, mobile reachable timer).
+const RELEASE_COMPLETE_GUARD: Duration = Duration::from_secs(5);
+/// Request type "initial request" (TS 24.501 §9.11.3.47).
+const REQUEST_TYPE_INITIAL_REQUEST: u8 = 0x01;
 /// The spacing of the re-selection attempts within the window.
 const ESTABLISHMENT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 /// At most this many establishments wait at once. Beyond it, one is answered
@@ -1504,6 +1603,7 @@ impl NgapServer {
             up_active: std::collections::HashSet::new(),
             last_session_sweep: std::time::Instant::now(),
             pending_establishments: HashMap::new(),
+            outstanding_releases: HashMap::new(),
             racs_assigns: HashMap::new(),
             supersede_barriers: HashMap::new(),
             held_positioning: Vec::new(),
@@ -1550,8 +1650,10 @@ impl NgapServer {
         self.sessions.read().await.len()
     }
 
-    /// Poll for incoming NGAP messages and server events
-    pub async fn poll(&mut self) -> Result<bool> {
+    /// The timers of this server's own UEs, run first on every [`Self::poll`]. Unlike
+    /// the rest of `poll`, nothing here drains a process-global queue, so a unit test
+    /// can drive it without taking work other tests own (#1120 review).
+    async fn process_local_timers(&mut self) -> Result<()> {
         // Check GMM procedure timers (T3550/T3555/T3560/T3570/T3522 retransmission)
         self.process_nas_timers().await?;
 
@@ -1561,6 +1663,15 @@ impl NgapServer {
 
         // #806: source NG-RAN releases waiting for the step 6a timer.
         self.process_pending_source_releases().await;
+
+        // #923: Release Commands whose Release Complete did not come.
+        self.process_release_guards().await;
+        Ok(())
+    }
+
+    /// Poll for incoming NGAP messages and server events
+    pub async fn poll(&mut self) -> Result<bool> {
+        self.process_local_timers().await?;
 
         // Keep the RAN's view of overload in step with the NAS congestion posture.
         // A no-op unless the posture just changed, and the posture is off by default.
@@ -1631,18 +1742,26 @@ impl NgapServer {
             self.handle_server_event(event).await?;
         }
 
-        // Poll SCTP server for incoming data
-        match self.transport.recv(SCTP_RECV_TIMEOUT).await {
-            Ok(true) => {
-                // Data was received, process any new events
-                while let Ok(event) = self.server_event_rx.try_recv() {
-                    self.handle_server_event(event).await?;
-                }
-                Ok(true)
+        let outcome = self.receive_n2_or_sbi_report().await?;
+        Ok(poll_again_at_once(outcome))
+    }
+
+    /// Wait for N2 for up to [`SCTP_RECV_TIMEOUT`], ended early by an off-task SBI
+    /// report (#981), so the next poll applies the answer within the caller's tick
+    /// rather than up to `SCTP_RECV_TIMEOUT` later.
+    async fn receive_n2_or_sbi_report(&mut self) -> Result<nextgcore_sctp::RecvOutcome> {
+        let outcome = self
+            .transport
+            .recv_or_wake(SCTP_RECV_TIMEOUT, self.sbi_offload.report_arrived())
+            .await
+            .map_err(|e| anyhow::anyhow!("SCTP receive error: {e}"))?;
+        if outcome == nextgcore_sctp::RecvOutcome::Data {
+            // Data was received, process any new events
+            while let Ok(event) = self.server_event_rx.try_recv() {
+                self.handle_server_event(event).await?;
             }
-            Ok(false) => Ok(false), // Timeout, no data
-            Err(e) => Err(anyhow::anyhow!("SCTP receive error: {e}")),
         }
+        Ok(outcome)
     }
 
     /// Handle SCTP server events
@@ -1727,6 +1846,7 @@ impl NgapServer {
 
     /// Handle SCTP association closure
     async fn handle_association_closed(&self, association_id: u64, reason: &str) -> Result<()> {
+        forget_association_rat(association_id);
         if let Some(session) = self.sessions.write().await.remove(&association_id) {
             log::info!(
                 "gNB {} disconnected (association {}): {}",
@@ -2405,7 +2525,14 @@ impl NgapServer {
 
         // Process request and build response with locks held, then release before sending.
         // `accepted` names the Global RAN Node ID of an accepted setup (#1039).
-        let mut accepted: Option<(crate::context::PlmnId, u32, u8)> = None;
+        // #876: with the ngENB-ID of an ng-eNB, whose `gnb_id` and length are unset.
+        #[allow(clippy::type_complexity)]
+        let mut accepted: Option<(
+            crate::context::PlmnId,
+            u32,
+            u8,
+            Option<nextgcore_ngap::types::NgEnbId>,
+        )> = None;
         let response_data: Option<Vec<u8>> = {
             let mut sessions = self.sessions.write().await;
             if let Some(session) = sessions.get_mut(&association_id) {
@@ -2430,7 +2557,10 @@ impl NgapServer {
                             session.gnb.plmn_id.clone(),
                             session.gnb.gnb_id,
                             session.gnb.gnb_id_len,
+                            session.gnb.ng_enb_id,
                         ));
+                        // #997 review m2: what serves the UEs of this association.
+                        ctx.association_rat_set(association_id, session.gnb.rat_type);
 
                         // Build NG Setup Response with proper ASN.1 APER encoding,
                         // reporting any "notify" IEs it ignored (§10.3.4.2).
@@ -2477,8 +2607,10 @@ impl NgapServer {
         // other association the same Global RAN Node ID still holds (the gNB restarted
         // and came back on a new one). Done before the response, so nothing the gNB sends
         // after it can name a connection of its previous incarnation.
-        if let Some((plmn, gnb_id, gnb_id_len)) = accepted {
-            // The whole Global RAN Node ID: PLMN, gNB ID and its length (§9.3.1.6).
+        if let Some((plmn, gnb_id, gnb_id_len, ng_enb_id)) = accepted {
+            // The whole Global RAN Node ID: PLMN, gNB ID and its length (§9.3.1.6), or
+            // for an ng-eNB its ngENB-ID alternative and value (§9.3.1.8, #876). A gNB
+            // never matches an ng-eNB, and two ng-eNBs of one PLMN are two nodes.
             let stale: Vec<u64> = self
                 .sessions
                 .read()
@@ -2488,6 +2620,7 @@ impl NgapServer {
                     **assoc != association_id
                         && s.gnb.gnb_id == gnb_id
                         && s.gnb.gnb_id_len == gnb_id_len
+                        && s.gnb.ng_enb_id == ng_enb_id
                         && s.gnb.plmn_id == plmn
                 })
                 .map(|(assoc, _)| *assoc)
@@ -2536,6 +2669,7 @@ impl NgapServer {
     /// association is closed, so nothing it sends is processed again: no later NG
     /// Setup on it can take the Global RAN Node ID back.
     async fn drop_replaced_association(&mut self, old: u64) {
+        forget_association_rat(old);
         self.sessions.write().await.remove(&old);
         self.assoc_to_addr.write().await.remove(&old);
         self.outbound_streams.remove(&old);
@@ -3434,10 +3568,18 @@ impl NgapServer {
                         })
                     ) {
                         state.retx = None;
+                        // #889: the UE radio capability ID (or its deletion) the
+                        // Accept carried is valid now (TS 24.501 §5.5.1.2.4).
+                        crate::racs::commit_in_flight(&mut state.amf_ue);
                     }
                     state.registered = true;
-                    state.amf_ue.current_guti = state.amf_ue.next_guti.clone();
-                    state.amf_ue.current_m_tmsi = Some(state.amf_ue.next_guti.tmsi);
+                    // #889: an update Accept with no new 5G-GUTI (`next_guti` TMSI 0,
+                    // #653) can still be acknowledged, for its UE radio capability ID
+                    // (§5.5.1.3.4). The UE keeps its 5G-GUTI then.
+                    if state.amf_ue.next_guti.tmsi != 0 {
+                        state.amf_ue.current_guti = state.amf_ue.next_guti.clone();
+                        state.amf_ue.current_m_tmsi = Some(state.amf_ue.next_guti.tmsi);
+                    }
                     log::info!(
                         "[{}] Registration Complete (5G-TMSI=0x{:08x})",
                         state.suci,
@@ -3475,6 +3617,8 @@ impl NgapServer {
                     );
                     if was_pending {
                         state.retx = None;
+                        // #889: what the command carried is delivered (§5.4.4.3).
+                        crate::racs::commit_in_flight(&mut state.amf_ue);
                         // #570: a command that only carried a UE radio capability ID
                         // left the GUTI alone; say so rather than claim a reallocation.
                         let reallocated = state.amf_ue.current_guti != state.amf_ue.next_guti;
@@ -5918,12 +6062,16 @@ impl NgapServer {
     ///   like an uplink-data session (TS 23.502 §4.2.3.3 step 6), so its buffered
     ///   downlink is delivered. A paged release or modification is not a setup; it
     ///   follows the Accept.
-    async fn reconcile_update_sessions(
+    ///
+    /// #922 part 3: the releases and the activations run off the NGAP task. A release is
+    /// durable keyed work; the activations are returned in [`UpdatePlan::activate`], and
+    /// the Accept waits for their answers ([`JoinThen::RegistrationUpdate`]).
+    fn reconcile_update_sessions(
         &mut self,
         amf_ue_ngap_id: u64,
         ies: ServiceRequestSessionIes,
         page: Option<&crate::context::PagingContext>,
-    ) -> UpdateSessionOutcome {
+    ) -> UpdatePlan {
         let held: Vec<(u8, Option<String>, crate::context::SNssai)> = {
             let ctx = crate::context::amf_self();
             let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
@@ -5978,20 +6126,29 @@ impl NgapServer {
             }
         }
         for psi in &plan.release {
-            let (smf_host, smf_port) = self.smf_target_for(amf_ue_ngap_id, *psi);
             if let Some(r) = held
                 .iter()
                 .find(|(p, _, _)| p == psi)
                 .and_then(|(_, r, _)| r.clone())
             {
-                if let Err(e) =
-                    crate::sbi_path::call_smf_release_sm_context(&smf_host, smf_port, &r).await
-                {
-                    log::warn!(
-                        "UE {amf_ue_ngap_id}: SMF release of PSI {psi} (inactive at the UE, \
-                         registration update) failed: {e}"
-                    );
-                }
+                // #922 part 3: off the NGAP task. Durable and keyed on the session, as
+                // the Service Request's: the UE no longer has it, so this release must
+                // reach the SMF whatever the UE does next.
+                let (smf_host, smf_port) = self.smf_target_for(amf_ue_ngap_id, *psi);
+                let psi = *psi;
+                self.sbi_offload
+                    .spawn_keyed_durable((amf_ue_ngap_id, psi), move || async move {
+                        if let Err(e) =
+                            crate::sbi_path::call_smf_release_sm_context(&smf_host, smf_port, &r)
+                                .await
+                        {
+                            log::warn!(
+                                "UE {amf_ue_ngap_id}: SMF release of PSI {psi} (inactive at \
+                                 the UE, registration update) failed: {e}"
+                            );
+                        }
+                        None
+                    });
             }
             // #826 review m3: #799's one funnel for a session that is over (its
             // refs, its SMF, its handover transfer and its `sess_list` entry).
@@ -6002,31 +6159,10 @@ impl NgapServer {
             );
         }
         let mut failed: u16 = 0;
+        let mut activate = Vec::new();
         for psi in &plan.activate {
-            let found = held.iter().find(|(p, _, _)| p == psi).cloned();
-            let transfer = match &found {
-                Some((_, Some(r), _)) => {
-                    let (smf_host, smf_port) = self.smf_target_for(amf_ue_ngap_id, *psi);
-                    match crate::sbi_path::call_smf_activate_up_connection(&smf_host, smf_port, r)
-                        .await
-                    {
-                        Ok(t) => Some(t),
-                        Err(e) => {
-                            log::warn!("UE {amf_ue_ngap_id}: PSI {psi} UP activation failed: {e}");
-                            None
-                        }
-                    }
-                }
-                _ => None,
-            };
-            match (transfer, found) {
-                (Some(transfer), Some((_, _, s_nssai))) => {
-                    activated.push(crate::ngap_asn1::CxtReqSession {
-                        pdu_session_id: *psi,
-                        s_nssai,
-                        transfer,
-                    })
-                }
+            match held.iter().find(|(p, _, _)| p == psi) {
+                Some((_, Some(r), s_nssai)) => activate.push((*psi, r.clone(), s_nssai.clone())),
                 _ => failed |= 1 << psi,
             }
         }
@@ -6035,11 +6171,91 @@ impl NgapServer {
             .map(|(p, _, _)| *p)
             .filter(|p| !plan.release.contains(p))
             .fold(0, |m, p| m | (1 << p));
-        UpdateSessionOutcome {
-            pdu_session_status: ies.pdu_session_status.map(|_| remaining),
-            reactivation_result: ies.uplink_data_status.map(|_| failed),
-            activated,
+        UpdatePlan {
+            outcome: UpdateSessionOutcome {
+                pdu_session_status: ies.pdu_session_status.map(|_| remaining),
+                reactivation_result: ies.uplink_data_status.map(|_| failed),
+                activated,
+            },
+            activate,
         }
+    }
+
+    /// TS 23.502 §4.2.2.2.2 step 21 (#759, #922 part 3): the registration update's
+    /// activations are answered, or the join's deadline passed. Each session the SMF
+    /// activated joins the Accept's setup; any other is reported failed in the PDU session
+    /// reactivation result, and one still unanswered is rolled back. Then the Accept goes
+    /// out, if the UE is still on the NG connection the request came on.
+    async fn finish_registration_update(
+        &mut self,
+        amf_ue_ngap_id: u64,
+        rest: RegistrationUpdateRest,
+        waiting: &std::collections::HashSet<u8>,
+        mut answers: HashMap<u8, JoinAnswer>,
+    ) -> Result<()> {
+        let RegistrationUpdateRest {
+            association_id,
+            ran_ue_ngap_id,
+            ul_count,
+            requested_ies: _,
+            page,
+            mut outcome,
+            activate,
+        } = rest;
+        // CM-IDLE too: an AN release keeps the association and RAN UE NGAP ID, but the
+        // connection the Accept was for is gone (#1138 review M1).
+        let still_there = self.ue_auth_state.get(amf_ue_ngap_id).is_some_and(|s| {
+            !s.is_cm_idle()
+                && s.association_id == association_id
+                && s.ran_ue_ngap_id == ran_ue_ngap_id
+        });
+        for (psi, sm_ref, s_nssai) in activate {
+            let answer = answers.remove(&psi);
+            if waiting.contains(&psi) {
+                self.roll_back_activation(amf_ue_ngap_id, psi, sm_ref.clone(), "unanswered");
+            }
+            match answer {
+                Some(JoinAnswer::Activated(Ok(transfer))) if still_there => {
+                    outcome.activated.push(crate::ngap_asn1::CxtReqSession {
+                        pdu_session_id: psi,
+                        s_nssai,
+                        transfer,
+                    })
+                }
+                Some(JoinAnswer::Activated(Ok(_))) => {
+                    self.roll_back_activation(amf_ue_ngap_id, psi, sm_ref, "connection gone")
+                }
+                other => {
+                    if let Some(JoinAnswer::Activated(Err(e))) = other {
+                        log::warn!("UE {amf_ue_ngap_id}: PSI {psi} UP activation failed: {e}");
+                    }
+                    if let Some(r) = outcome.reactivation_result.as_mut() {
+                        *r |= 1 << psi;
+                    }
+                }
+            }
+        }
+        if !still_there {
+            log::warn!(
+                "UE {amf_ue_ngap_id}: left the NG connection of its registration update \
+                 before the SMFs answered; no Registration Accept"
+            );
+            return Ok(());
+        }
+        let Some(state) = self.ue_auth_state.remove(amf_ue_ngap_id) else {
+            return Ok(());
+        };
+        self.send_registration_accept_reconciled(
+            association_id,
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            state,
+            true,
+            page,
+            Some(outcome),
+            ul_count,
+        )
+        .await
     }
 
     /// The Accept of a registration update on a new NG connection (from CM-IDLE),
@@ -6055,13 +6271,15 @@ impl NgapServer {
         mut state: UeNasContext,
         protected: &[u8],
         sessions: &[crate::ngap_asn1::CxtReqSession],
+        ul_count: u32,
     ) -> Result<()> {
-        // KgNB from the uplink NAS COUNT of the REGISTRATION REQUEST, as the
-        // initial registration and the idle Service Request derive it (TS 33.501
-        // Annex A.9), and the {NH, NCC} chain restarted from it (Annex A.10).
+        // KgNB from the uplink NAS COUNT of the REGISTRATION REQUEST (`ul_count`, taken
+        // when it arrived), as the initial registration and the idle Service Request
+        // derive it (TS 33.501 Annex A.9), and the {NH, NCC} chain restarted from it
+        // (Annex A.10).
         let kgnb = nextgcore_crypt::kdf::nextgcore_kdf_kgnb_and_kn3iwf(
             &state.amf_ue.kamf,
-            state.amf_ue.ul_count,
+            ul_count,
             if state.amf_ue.access_type == 0 {
                 ACCESS_TYPE_3GPP
             } else {
@@ -6193,6 +6411,50 @@ impl NgapServer {
         // status releases what the UE no longer has, and its Uplink data status
         // re-activates user planes. Both outcomes are reported in the Accept.
         let update = state.registered && state.amf_ue.security_context_available;
+        // #922 part 3, TS 24.501 §5.5.1.3.8 e): a REGISTRATION REQUEST while an earlier
+        // one's Accept still waits for its SMF answers. The same IEs on the same NG
+        // connection: the earlier procedure goes on and this request is not treated
+        // further. Otherwise the earlier one is aborted (its activations rolled back) and
+        // this one is progressed.
+        if update {
+            let pending = self.smf_joins.iter().find_map(|(id, j)| match &j.then {
+                JoinThen::RegistrationUpdate(r) if j.amf_ue_ngap_id == amf_ue_ngap_id => {
+                    Some((*id, r.requested_ies, r.association_id, r.ran_ue_ngap_id))
+                }
+                _ => None,
+            });
+            if let Some((join, requested_ies, assoc, ran)) = pending {
+                if requested_ies == state.registration_session_ies
+                    && (assoc, ran) == (association_id, ran_ue_ngap_id)
+                {
+                    log::info!(
+                        "UE {amf_ue_ngap_id}: REGISTRATION REQUEST repeated while the previous \
+                         one waits for its SMF answers; continuing the previous procedure \
+                         (TS 24.501 §5.5.1.3.8 e) 2))"
+                    );
+                    state.registration_session_ies = None;
+                    self.ue_auth_state.insert(amf_ue_ngap_id, state);
+                    return Ok(());
+                }
+                if let Some(j) = self.smf_joins.remove(&join) {
+                    if let JoinThen::RegistrationUpdate(rest) = j.then {
+                        for (psi, sm_ref, _) in rest.activate {
+                            self.roll_back_activation(
+                                amf_ue_ngap_id,
+                                psi,
+                                sm_ref,
+                                "registration update superseded",
+                            );
+                        }
+                    }
+                }
+                log::info!(
+                    "UE {amf_ue_ngap_id}: a REGISTRATION REQUEST with different IEs aborts the \
+                     previous one still waiting for its SMF answers (TS 24.501 §5.5.1.3.8 e) 1))"
+                );
+            }
+        }
+        let requested_ies = state.registration_session_ies;
         // #1102: the page this request answered, if any. Its session rides the
         // Accept's Initial Context Setup, and its N1 or N2 release / modify follows it.
         let page = if update {
@@ -6202,21 +6464,93 @@ impl NgapServer {
         } else {
             None
         };
-        let reconciled = match (state.registration_session_ies.take(), &page) {
-            (Some(ies), _) if update => Some(
-                self.reconcile_update_sessions(amf_ue_ngap_id, ies, page.as_ref())
-                    .await,
-            ),
-            (None, Some(_)) if update => Some(
-                self.reconcile_update_sessions(
-                    amf_ue_ngap_id,
-                    ServiceRequestSessionIes::default(),
-                    page.as_ref(),
-                )
-                .await,
-            ),
+        let ies = match (state.registration_session_ies.take(), &page) {
+            (Some(ies), _) if update => Some(ies),
+            (None, Some(_)) if update => Some(ServiceRequestSessionIes::default()),
             _ => None,
         };
+        // A new NG connection's K_gNB comes from this request's uplink NAS COUNT (TS
+        // 33.501 Annex A.9), taken now: the Accept may wait for SMF answers below.
+        let ul_count = state.amf_ue.ul_count;
+        let Some(ies) = ies else {
+            return self
+                .send_registration_accept_reconciled(
+                    association_id,
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    state,
+                    update,
+                    page,
+                    None,
+                    ul_count,
+                )
+                .await;
+        };
+        let plan = self.reconcile_update_sessions(amf_ue_ngap_id, ies, page.as_ref());
+        if plan.activate.is_empty() {
+            return self
+                .send_registration_accept_reconciled(
+                    association_id,
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    state,
+                    update,
+                    page,
+                    Some(plan.outcome),
+                    ul_count,
+                )
+                .await;
+        }
+        // #922 part 3: the activations (upCnxState ACTIVATING, TS 23.502 §4.2.2.2.2 step
+        // 21 / §4.2.3.2 step 4) run off the NGAP task; the Accept, which reports their
+        // results and carries their transfers, follows the answers
+        // (`finish_registration_update`).
+        self.ue_auth_state.insert(amf_ue_ngap_id, state);
+        let psis: Vec<u8> = plan.activate.iter().map(|(psi, _, _)| *psi).collect();
+        let refs: Vec<(u8, String)> = plan
+            .activate
+            .iter()
+            .map(|(psi, r, _)| (*psi, r.clone()))
+            .collect();
+        let join = self.open_smf_join(
+            amf_ue_ngap_id,
+            &psis,
+            JoinThen::RegistrationUpdate(Box::new(RegistrationUpdateRest {
+                association_id,
+                ran_ue_ngap_id,
+                requested_ies,
+                ul_count,
+                page,
+                outcome: plan.outcome,
+                activate: plan.activate,
+            })),
+        );
+        for (psi, sm_ref) in refs {
+            self.spawn_join_activation(join, amf_ue_ngap_id, psi, sm_ref);
+        }
+        log::info!(
+            "Registration update of UE {amf_ue_ngap_id}: {} PDU session(s) being re-activated \
+             at the SMF; the Registration Accept follows their answers",
+            psis.len()
+        );
+        Ok(())
+    }
+
+    /// The Registration Accept once a registration update's sessions are reconciled
+    /// (`reconciled`), or for any other registration (`None`). `ul_count` is the uplink
+    /// NAS COUNT of the REGISTRATION REQUEST, for a new connection's K_gNB.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_registration_accept_reconciled(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        mut state: UeNasContext,
+        update: bool,
+        page: Option<crate::context::PagingContext>,
+        reconciled: Option<UpdateSessionOutcome>,
+        ul_count: u32,
+    ) -> Result<()> {
         let Some(mut plain) = gmm_build::build_registration_accept_for_sessions(
             &state.amf_ue,
             reconciled.as_ref().and_then(|r| r.pdu_session_status),
@@ -6234,6 +6568,10 @@ impl NgapServer {
         // The UE radio capability ID deletion indication (half-octet IEI E) keeps the
         // UE from releasing on T3540 (TS 24.501 §5.3.1.3 b) 1)), and so the network.
         let racs_deletion = racs_ies.first().is_some_and(|o| o & 0xF0 == 0xE0);
+        let carries_racs = !racs_ies.is_empty();
+        // `build_registration_accept_for_sessions` includes the 5G-GUTI IE whenever
+        // `next_guti` has a TMSI (gmm_build).
+        let carries_guti = state.amf_ue.next_guti.tmsi != 0;
         plain.extend(racs_ies);
         let Some(protected) = nas_security::nas_5gs_security_encode(
             &mut state.amf_ue,
@@ -6283,6 +6621,7 @@ impl NgapServer {
                     state,
                     &protected,
                     &sessions,
+                    ul_count,
                 )
                 .await?;
             } else if !sessions.is_empty() {
@@ -6322,6 +6661,25 @@ impl NgapServer {
                     p,
                 )
                 .await?;
+            }
+            // #889, TS 24.501 §5.5.1.3.4: "If a 5G-GUTI ... is included in the
+            // REGISTRATION ACCEPT message, the AMF shall start timer T3550", and the same
+            // for the UE radio capability ID IE or its deletion indication. The UE
+            // acknowledges with a REGISTRATION COMPLETE, which is what makes the GUTI and
+            // the ID valid. T3550 takes the retransmission slot, so a configuration
+            // update in flight is aborted (§5.4.4.6 c)). Retransmitted as a standalone
+            // DL NAS TRANSPORT, whichever NGAP message carried the Accept first. (The
+            // other T3550 triggers of §5.5.1.3.4 -- SOR, access category definitions,
+            // emergency numbers, CAG -- are IEs this AMF does not send in an update.)
+            if carries_racs || carries_guti {
+                match crate::ngap_asn1::build_downlink_nas_transport_asn1(
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    &protected,
+                ) {
+                    Some(pdu) => self.arm_retx(amf_ue_ngap_id, NasProcTimer::T3550, pdu),
+                    None => log::error!("Failed to build the Registration Accept's T3550 PDU"),
+                }
             }
             // #91: AFTER the Accept is on the wire, never before.
             self.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
@@ -8942,6 +9300,66 @@ impl NgapServer {
         Ok(())
     }
 
+    /// TS 24.501 §5.4.5.2.5 a) 12) (#1036): the UE asks for PSI `psi` with
+    /// Request type "initial request" while the AMF holds a routing context for
+    /// it. The AMF releases the session locally and has its SMF release the SM
+    /// context, then the request goes on as a new establishment (§5.4.5.2.3).
+    ///
+    /// Without this, a second CreateSMContext went to the SMF and the AMF's ref
+    /// was overwritten, so the first SM context (its PFCP session, UE IP, PCF
+    /// association) was orphaned. The release is durable and keyed on the
+    /// session, so it reaches the SMF before the new CreateSMContext. A user plane
+    /// set up at the gNB for the PSI is released there too: TS 38.413 §8.2.1.4
+    /// has the gNB refuse a setup for a PDU session it already has.
+    async fn release_colliding_session(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        psi: u8,
+    ) -> Result<()> {
+        let key = (amf_ue_ngap_id, psi);
+        let Some(sm_context_ref) = self.sm_context_refs.get(&key).cloned() else {
+            return Ok(());
+        };
+        log::info!(
+            "UE {amf_ue_ngap_id}: PDU session establishment (initial request) for PSI={psi}, \
+             which the AMF holds (SM context {sm_context_ref}); releasing it first \
+             (TS 24.501 §5.4.5.2.5 a) 12))"
+        );
+        let owner = self.sm_context_smfs.get(&key).cloned();
+        self.sbi_offload
+            .spawn_keyed_durable(key, move || async move {
+                let (host, port) = smf_or_selected(owner).await;
+                match crate::sbi_path::call_smf_release_sm_context(&host, port, &sm_context_ref)
+                    .await
+                {
+                    Ok(()) => log::info!(
+                        "UE {amf_ue_ngap_id}: SM context {sm_context_ref} (PSI={psi}) released \
+                         before its PSI's new establishment"
+                    ),
+                    Err(e) => log::warn!(
+                        "UE {amf_ue_ngap_id}: release of SM context {sm_context_ref} \
+                         (PSI={psi}) before its PSI's new establishment failed: {e}"
+                    ),
+                }
+                None
+            });
+        self.forget_session(amf_ue_ngap_id, psi);
+        if self.up_active.contains(&key) {
+            self.clear_up_active(amf_ue_ngap_id, psi);
+            match crate::ngap_asn1::build_pdu_session_resource_release_command_asn1(
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                &[psi],
+            ) {
+                Some(release) => self.send_to_association(association_id, &release).await?,
+                None => log::error!("Failed to build PDU Session Resource Release Command"),
+            }
+        }
+        Ok(())
+    }
+
     /// Handle UL NAS TRANSPORT (0x67, TS 24.501 Section 5.4.5): route N1 SM
     /// to the SMF; reply with cause #90 for container types without a
     /// forwarding target; 5GMM Status on protocol errors
@@ -8966,6 +9384,8 @@ impl NgapServer {
         // Optional IEs after the container: PDU session ID (IEI 0x12, TV)
         let mut psi: Option<u8> = None;
         let mut dnn_value: Option<String> = None;
+        // #1036: the Request type (IEI 8-, TS 24.501 §9.11.3.47), value bits 3..1.
+        let mut request_type: Option<u8> = None;
         let mut pos = 6 + container_len;
         while pos < nas.len() {
             match nas[pos] {
@@ -8988,7 +9408,11 @@ impl NgapServer {
                     }
                     pos += 2 + l;
                 }
-                b if b & 0x80 != 0 => pos += 1, // type-1 TV (e.g. request type 0x8-)
+                b if b & 0xF0 == 0x80 => {
+                    request_type = Some(b & 0x07);
+                    pos += 1;
+                }
+                b if b & 0x80 != 0 => pos += 1, // other type-1 TV
                 _ => break,
             }
         }
@@ -9014,6 +9438,23 @@ impl NgapServer {
 
         match action {
             Ok(crate::gmm_handler::UlTransportAction::RouteToSmf { .. }) => {
+                // #1036, TS 24.501 §5.4.5.2.5 a) 12): an "initial request" for a PSI
+                // the AMF holds a routing context for, e.g. the UE retransmitting its
+                // establishment after the Accept was lost, releases that session
+                // first, locally and at its SMF.
+                if request_type == Some(REQUEST_TYPE_INITIAL_REQUEST)
+                    && container.get(3) == Some(&0xC1)
+                {
+                    if let Some(&sm_psi) = container.get(1) {
+                        self.release_colliding_session(
+                            association_id,
+                            amf_ue_ngap_id,
+                            ran_ue_ngap_id,
+                            sm_psi,
+                        )
+                        .await?;
+                    }
+                }
                 self.handle_5gsm_message(
                     association_id,
                     amf_ue_ngap_id,
@@ -10624,6 +11065,22 @@ impl NgapServer {
                 self.apply_downlink_activation(*a).await;
                 Ok(())
             }
+            SmfAnswer::NotifyReleased {
+                amf_ue_ngap_id,
+                psi,
+                association_id,
+                ran_ue_ngap_id,
+                result,
+            } => {
+                self.apply_notify_released(
+                    amf_ue_ngap_id,
+                    psi,
+                    association_id,
+                    ran_ue_ngap_id,
+                    result,
+                )
+                .await
+            }
             SmfAnswer::JoinPart { join, psi, answer } => {
                 let Some(j) = self.smf_joins.get_mut(&join) else {
                     // Finished at its deadline, or its UE is gone.
@@ -10636,6 +11093,59 @@ impl NgapServer {
                         self.finish_smf_join(j).await?;
                     }
                 }
+                Ok(())
+            }
+        }
+    }
+
+    /// #582 / #922 part 3: the SMF's answer to a released session of a PDU SESSION
+    /// RESOURCE NOTIFY. Its N1 SM (the PDU Session Release Command, TS 23.502 §4.3.4.2
+    /// step 4: the NG-RAN's resources are already gone, so the AMF "transmits the NAS
+    /// message ... to the UE") goes on the NG connection the Notify came on, while the
+    /// UE is still served there.
+    async fn apply_notify_released(
+        &mut self,
+        amf_ue_ngap_id: u64,
+        psi: u8,
+        association_id: u64,
+        ran_ue_ngap_id: u32,
+        result: Result<Vec<u8>, String>,
+    ) -> Result<()> {
+        match result {
+            Ok(n1) if !n1.is_empty() => {
+                let still_there = self.ue_auth_state.get(amf_ue_ngap_id).is_some_and(|s| {
+                    !s.is_cm_idle()
+                        && s.association_id == association_id
+                        && s.ran_ue_ngap_id == ran_ue_ngap_id
+                });
+                if !still_there {
+                    log::warn!(
+                        "PDUSessionResourceNotify (released): UE {amf_ue_ngap_id} left the NG \
+                         connection before its SMF answered for PSI {psi}; the {}-byte N1 SM is \
+                         not delivered",
+                        n1.len()
+                    );
+                    return Ok(());
+                }
+                log::info!(
+                    "PDUSessionResourceNotify (released): the SMF releases UE {amf_ue_ngap_id} \
+                     PSI {psi}; relaying its {}-byte N1 SM to the UE",
+                    n1.len()
+                );
+                self.send_n1_sm_to_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, psi, &n1)
+                    .await
+            }
+            Ok(_) => {
+                log::info!(
+                    "PDUSessionResourceNotify (released): relayed to the SMF for UE \
+                     {amf_ue_ngap_id} PSI {psi}"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                log::warn!(
+                    "PDUSessionResourceNotify (released): UE {amf_ue_ngap_id} PSI {psi}: {e}"
+                );
                 Ok(())
             }
         }
@@ -10751,6 +11261,18 @@ impl NgapServer {
                 }
                 self.finish_eps_to_5gs_preparation(*rest, prepared).await;
                 Ok(())
+            }
+            JoinThen::PathSwitch(rest) => {
+                self.finish_path_switch(amf_ue_ngap_id, *rest, answers)
+                    .await
+            }
+            JoinThen::ModifyIndication(rest) => {
+                self.finish_modify_indication(amf_ue_ngap_id, *rest, answers)
+                    .await
+            }
+            JoinThen::RegistrationUpdate(rest) => {
+                self.finish_registration_update(amf_ue_ngap_id, *rest, &waiting, answers)
+                    .await
             }
         }
     }
@@ -11404,17 +11926,10 @@ impl NgapServer {
             nextgcore_ngap::types::GlobalRanNodeId::GlobalNgEnbId {
                 plmn_identity,
                 ng_enb_id,
-            } => {
-                // TS 29.571 `NgeNbId` is a PREFIXED string, not a bare hex value:
-                // `^(MacroNGeNB-[A-Fa-f0-9]{5}|LMacroNGeNB-[A-Fa-f0-9]{6}|SMacroNGeNB-[A-Fa-f0-9]{5})$`
-                // (`TS29571_CommonData.yaml:1458`). TS 38.413 §9.3.1.8's macro form
-                // is 20 bits = 5 nibbles, which is the `MacroNGeNB-` arm.
-                let plmn = crate::ngap_asn1::decode_plmn_id(plmn_identity);
-                serde_json::json!({
-                    "plmnId": { "mcc": plmn.mcc(), "mnc": plmn.mnc() },
-                    "ngeNbId": format!("MacroNGeNB-{ng_enb_id:05X}"),
-                })
-            }
+            } => crate::namf_server::ng_enb_id_json(
+                &crate::ngap_asn1::decode_plmn_id(plmn_identity),
+                ng_enb_id,
+            ),
         };
 
         // A PWS indication carries no Message Identifier / Serial Number: its IE
@@ -11881,6 +12396,7 @@ impl NgapServer {
                 retries: 0,
                 ngap_pdu,
             });
+            crate::racs::arm_in_flight(&mut state.amf_ue);
         });
     }
 
@@ -11982,6 +12498,97 @@ impl NgapServer {
                     (None, None)
                 }
             };
+        self.apply_release_complete(association_id, amf_ue_ngap_id, ran_ue_ngap_id)
+            .await
+    }
+
+    /// Record a UE Context Release Command sent on `association_id` for a UE the
+    /// AMF keeps (#923), so a lost or unusable Release Complete cannot leave it
+    /// CM-CONNECTED.
+    fn note_release_command(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+    ) {
+        self.outstanding_releases.insert(
+            (association_id, amf_ue_ngap_id),
+            OutstandingRelease {
+                ran_ue_ngap_id,
+                deadline: Instant::now() + RELEASE_COMPLETE_GUARD,
+            },
+        );
+    }
+
+    /// Complete locally every outstanding Release Command whose Complete has not
+    /// come within [`RELEASE_COMPLETE_GUARD`] (#923), as the Complete would have.
+    async fn process_release_guards(&mut self) {
+        if self.outstanding_releases.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let expired: Vec<((u64, u64), OutstandingRelease)> = self
+            .outstanding_releases
+            .iter()
+            .filter(|(_, r)| r.deadline <= now)
+            .map(|(k, r)| (*k, *r))
+            .collect();
+        for ((association_id, amf_ue_ngap_id), r) in expired {
+            log::warn!(
+                "UE {amf_ue_ngap_id}: no UE Context Release Complete from association \
+                 {association_id} (ran_ue_ngap_id={}) within {RELEASE_COMPLETE_GUARD:?}; \
+                 the release is completed locally",
+                r.ran_ue_ngap_id
+            );
+            if let Err(e) = self
+                .apply_release_complete(
+                    association_id,
+                    Some(amf_ue_ngap_id),
+                    Some(r.ran_ue_ngap_id),
+                )
+                .await
+            {
+                log::warn!("UE {amf_ue_ngap_id}: local release completion failed: {e}");
+            }
+        }
+    }
+
+    /// What a UE Context Release Complete naming `amf_ue_ngap_id` (and
+    /// `ran_ue_ngap_id`) on `association_id` does. One that names no UE completes
+    /// the association's only outstanding Release Command, if it has exactly one
+    /// (#923): that is the command it answers.
+    async fn apply_release_complete(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: Option<u64>,
+        ran_ue_ngap_id: Option<u32>,
+    ) -> Result<()> {
+        let (amf_ue_ngap_id, ran_ue_ngap_id) = match amf_ue_ngap_id {
+            Some(id) => {
+                self.outstanding_releases.remove(&(association_id, id));
+                (Some(id), ran_ue_ngap_id)
+            }
+            None => {
+                let mut on_association = self
+                    .outstanding_releases
+                    .iter()
+                    .filter(|((assoc, _), _)| *assoc == association_id)
+                    .map(|((_, id), r)| (*id, r.ran_ue_ngap_id));
+                match (on_association.next(), on_association.next()) {
+                    (Some((id, ran)), None) => {
+                        self.outstanding_releases.remove(&(association_id, id));
+                        log::warn!(
+                            "UE Context Release Complete on association {association_id} \
+                             names no usable UE; it answers the association's only \
+                             outstanding Release Command, for UE {id} \
+                             (ran_ue_ngap_id={ran})"
+                        );
+                        (Some(id), Some(ran))
+                    }
+                    _ => (None, None),
+                }
+            }
+        };
         // #758: the released NG connection's contextless allocation goes with it, so
         // the gNB cannot later mint a context under the released ID.
         if let Some(id) = amf_ue_ngap_id {
@@ -12018,8 +12625,27 @@ impl NgapServer {
                 if s.registered {
                     s.cm_idle = true;
                 }
-                Ok((s.registered, went_idle))
+                // #885: the N1 connection's release is a lower layer failure to the
+                // NAS procedure running on it (TS 24.501), as for an NG Reset (#848):
+                // its retransmission would go out under a RAN UE NGAP ID the gNB may
+                // have given another UE.
+                Ok((s.registered, went_idle, abort_on_ng_release(id, s)))
             });
+            // TS 24.501 §5.5.2.3.5 b): a network-initiated de-registration aborted by a
+            // lower layer failure enters 5GMM-DEREGISTERED. The connection is already
+            // released, so the UE's sessions and policy associations are released and
+            // it is forgotten.
+            if let Some(Ok((_, _, AbortedProcedure::Deregistration))) = leg {
+                log::info!(
+                    "UE {id}: de-registration aborted by the release of its NG connection; \
+                     the UE is de-registered (TS 24.501 §5.5.2.3.5 b))"
+                );
+                self.offload_release_held_sessions(id);
+                self.terminate_policy_associations(id);
+                self.forget_ue(id);
+                return Ok(());
+            }
+            let leg = leg.map(|r| r.map(|(registered, went_idle, _)| (registered, went_idle)));
             let went_idle = match leg {
                 Some(Err((serving_assoc, serving_ran))) => {
                     log::info!(
@@ -12582,6 +13208,9 @@ impl NgapServer {
         // the permits it held for other UEs.
         self.sbi_offload.cancel_ue(amf_ue_ngap_id);
 
+        // #923: nor a Release Command's Complete.
+        self.outstanding_releases
+            .retain(|(_, ue), _| *ue != amf_ue_ngap_id);
         // #796: nothing waits for an SMF on behalf of a UE that is gone.
         self.pending_establishments
             .retain(|(ue, _), _| *ue != amf_ue_ngap_id);
@@ -16264,6 +16893,12 @@ impl NgapServer {
         // and the SMF never heard.
         self.release_cancelled_handover_target(cancel.amf_ue_ngap_id, "HO_CANCEL")
             .await;
+        // #963, TS 23.502 §4.11.1.2.3 step 2: a 5GS→EPS preparation's target MME is told
+        // with a Relocation Cancel Request, so it releases the UE context and bearers it
+        // installed. Step 7b (the SMF's indirect forwarding resources) does not apply: this
+        // AMF never asks for indirect forwarding (see `handle_handover_required`).
+        self.cancel_fivegs_to_eps_relocation(cancel.amf_ue_ngap_id)
+            .await;
         // The source abandoned the handover; nothing further will be relayed.
         // Dropped BEFORE the acknowledgement is sent, so a failed ack cannot leave
         // a stale relay target behind. The per-session transfers go with it (#742).
@@ -16283,6 +16918,37 @@ impl NgapServer {
             None => log::error!("Failed to build HandoverCancelAcknowledge"),
         }
         Ok(())
+    }
+
+    /// End a 5GS→EPS preparation the source gNB cancelled (#963): the target MME, if one
+    /// was asked, gets a Relocation Cancel Request with the UE's IMSI. Returns the MME told.
+    async fn cancel_fivegs_to_eps_relocation(
+        &mut self,
+        amf_ue_ngap_id: u64,
+    ) -> Option<crate::n26_path::FivegsToEpsCancel> {
+        let target = crate::n26_path::take_fivegs_to_eps_relocation(amf_ue_ngap_id)?;
+        let supi = self
+            .ue_auth_state
+            .get(amf_ue_ngap_id)
+            .and_then(|s| s.amf_ue.supi.clone());
+        let imsi = supi.as_deref().and_then(|s| s.strip_prefix("imsi-"));
+        match crate::n26_path::server() {
+            Some(server) => {
+                let seq = server.send_relocation_cancel(target, imsi).await;
+                log::info!(
+                    "5GS→EPS handover of UE {amf_ue_ngap_id} cancelled: Relocation Cancel \
+                     Request (seq={seq}, TEID {:#x}) to MME {} (TS 23.502 §4.11.1.2.3 step 2)",
+                    target.mme_teid.unwrap_or(0),
+                    target.peer
+                );
+            }
+            None => log::warn!(
+                "5GS→EPS handover of UE {amf_ue_ngap_id} cancelled, but no N26 socket is bound: \
+                 MME {} is not told and releases its preparation on its own timer",
+                target.peer
+            ),
+        }
+        Some(target)
     }
 
     /// Handle a PathSwitchRequest from the target gNB after an Xn handover
@@ -16404,55 +17070,133 @@ impl NgapServer {
             return Ok(());
         }
 
+        // #922 part 3: one Nsmf_PDUSession_UpdateSMContext per switched PDU session
+        // (TS 29.502 §5.2.2.3.3), off the NGAP task, keyed on the session. The SMF
+        // switches the UPF's DL path to the target and answers with the
+        // PathSwitchRequestAcknowledgeTransfer the Acknowledge owes the gNB, so the
+        // Acknowledge follows the answers (TS 23.502 §4.9.1.2.2 steps 2-7), sent by
+        // `finish_path_switch`. Nothing about the UE changes before then (#1009 review).
+        // #70: the switched list is built from the SMF's ANSWERS, not from the inbound
+        // transfers (TS 38.413 §9.3.4.8 vs §9.3.4.9).
+        let inbound: Vec<(u8, Vec<u8>)> = req
+            .pdu_session_list
+            .iter()
+            .map(|p| (p.pdu_session_id, p.transfer.clone()))
+            .collect();
+        let with_ref: Vec<u8> = inbound
+            .iter()
+            .map(|(psi, _)| *psi)
+            .filter(|psi| self.sm_context_refs.contains_key(&(amf_ue_ngap_id, *psi)))
+            .collect();
+        let rest = PathSwitchRest {
+            association_id,
+            request: req,
+            notify,
+        };
+        if with_ref.is_empty() {
+            return self
+                .finish_path_switch(amf_ue_ngap_id, rest, HashMap::new())
+                .await;
+        }
+        let join = self.open_smf_join(
+            amf_ue_ngap_id,
+            &with_ref,
+            JoinThen::PathSwitch(Box::new(rest)),
+        );
+        for (psi, transfer) in &inbound {
+            if with_ref.contains(psi) {
+                self.spawn_join_n2_sm_update(
+                    join,
+                    amf_ue_ngap_id,
+                    *psi,
+                    "PATH_SWITCH_REQ",
+                    transfer,
+                    "PathSwitchRequest",
+                );
+            }
+        }
+        log::info!(
+            "PathSwitchRequest for UE {amf_ue_ngap_id}: {} session(s) being switched at the \
+             SMF; the Acknowledge follows their answers",
+            with_ref.len()
+        );
+        Ok(())
+    }
+
+    /// The rest of a PATH SWITCH REQUEST once its sessions' SMFs have answered, or at the
+    /// join's deadline (#922 part 3): PATH SWITCH REQUEST ACKNOWLEDGE with the sessions the
+    /// SMF switched, the others released (TS 38.413 §8.4.4.2), or PATH SWITCH REQUEST
+    /// FAILURE when none was switched (§8.4.4.3).
+    async fn finish_path_switch(
+        &mut self,
+        amf_ue_ngap_id: u64,
+        rest: PathSwitchRest,
+        mut answers: HashMap<u8, JoinAnswer>,
+    ) -> Result<()> {
+        let PathSwitchRest {
+            association_id,
+            request: req,
+            notify,
+        } = rest;
+        let requested: Vec<u8> = req
+            .pdu_session_list
+            .iter()
+            .map(|p| p.pdu_session_id)
+            .collect();
         // What the Acknowledge needs, READ only: nothing about the UE changes until the
         // outcome is decided (#1009 review). The fresh {NCC, NH} (TS 33.501 §6.9.2.3.3 /
         // §6.9.4.1) is previewed here and committed with the association move below, only
         // for an Acknowledge -- a request that ends in a PATH SWITCH REQUEST FAILURE leaves
-        // the UE on its source with its key chain where it was.
-        let (inbound, allowed_nssai, ue_caps, (ncc, nh)) = {
-            let state = self
-                .ue_auth_state
-                .get(amf_ue_ngap_id)
-                .expect("the UE was resolved above");
-            // #70: the inbound request transfers, relayed to the SMF below. The switched
-            // list is built from the SMF's ANSWERS, not from these -- echoing the gNB's own
-            // PathSwitchRequestTransfer back as the acknowledge is the defect #70 names
-            // (TS 38.413 §9.3.4.8 vs §9.3.4.9).
-            let inbound: Vec<(u8, Vec<u8>)> = req
-                .pdu_session_list
-                .iter()
-                .map(|p| (p.pdu_session_id, p.transfer.clone()))
-                .collect();
-            let allowed_nssai = state
-                .amf_ue
-                .allowed_nssai
-                .iter()
-                .map(|s| nextgcore_ngap::types::SNssai {
-                    sst: s.sst,
-                    sd: s.sd.map(|sd| sd.to_be_bytes()[1..4].try_into().unwrap()),
-                })
-                .collect::<Vec<_>>();
-            (
-                inbound,
-                allowed_nssai,
-                ue_caps_to_ngap_for_ue(&state.amf_ue),
-                // Shared with the N2 path (AmfUe::advance_next_hop) so the two cannot
-                // derive keys differently.
-                state.amf_ue.next_hop_preview(),
-            )
+        // the UE on its source with its key chain where it was. Read now, after the SMF
+        // answers, so a UE that went CM-IDLE meanwhile is failed, not moved.
+        let Some((allowed_nssai, ue_caps, (ncc, nh))) = self
+            .ue_auth_state
+            .get(amf_ue_ngap_id)
+            .filter(|s| !s.is_cm_idle())
+            .map(|state| {
+                let allowed_nssai = state
+                    .amf_ue
+                    .allowed_nssai
+                    .iter()
+                    .map(|s| nextgcore_ngap::types::SNssai {
+                        sst: s.sst,
+                        sd: s.sd.map(|sd| sd.to_be_bytes()[1..4].try_into().unwrap()),
+                    })
+                    .collect::<Vec<_>>();
+                (
+                    allowed_nssai,
+                    ue_caps_to_ngap_for_ue(&state.amf_ue),
+                    // Shared with the N2 path (AmfUe::advance_next_hop) so the two cannot
+                    // derive keys differently.
+                    state.amf_ue.next_hop_preview(),
+                )
+            })
+        else {
+            log::warn!(
+                "PathSwitchRequest for UE {amf_ue_ngap_id}: no longer CM-CONNECTED when its \
+                 SMFs answered; failing"
+            );
+            if let Some(bytes) = path_switch_failure(
+                amf_ue_ngap_id,
+                req.ran_ue_ngap_id,
+                &requested,
+                nextgcore_ngap::types::Cause::RadioNetwork(
+                    nextgcore_ngap::types::CauseRadioNetwork::UnknownLocalUeNgapId,
+                ),
+                &[],
+            ) {
+                self.send_to_association(association_id, &bytes).await?;
+            }
+            return Ok(());
         };
 
-        // #70: Nsmf_PDUSession_UpdateSMContext per switched PDU session
-        // (TS 29.502 §5.2.2.3.3). The SMF switches the UPF's DL path to the target and
-        // answers with the PathSwitchRequestAcknowledgeTransfer this acknowledge owes the
-        // gNB. Done after the state borrow ends because it awaits.
-        //
         // A session the SMF does not acknowledge is left OUT of the switched list rather
         // than acknowledged with a fabricated transfer: TS 38.413 §9.3.4.9 makes the
         // acknowledge the core's statement about the uplink path, and inventing one would
         // point the target gNB at a tunnel no UPF serves. A gNB that finds a session
         // missing from the switched list releases it, which is the honest outcome.
-        let switched_list = self.switched_list_from_smf(amf_ue_ngap_id, &inbound).await;
+        let switched_list =
+            Self::switched_list_from_answers(amf_ue_ngap_id, &requested, &mut answers);
 
         let allowed_for_ack = if allowed_nssai.is_empty() {
             vec![nextgcore_ngap::types::SNssai { sst: 1, sd: None }]
@@ -16545,21 +17289,45 @@ impl NgapServer {
         &self,
         target_id: &nextgcore_ngap::types::TargetId,
     ) -> Option<u64> {
-        let target_gnb_id = match target_id {
-            nextgcore_ngap::types::TargetId::TargetRanNodeId {
-                global_ran_node_id, ..
-            } => match global_ran_node_id {
-                nextgcore_ngap::types::GlobalRanNodeId::GlobalGnbId { gnb_id, .. } => {
-                    Some(*gnb_id as u64)
-                }
-                _ => None,
-            },
-            nextgcore_ngap::types::TargetId::TargetGlobalNgEnbId { .. } => None,
-        }?;
+        use nextgcore_ngap::types::GlobalRanNodeId;
+        let nextgcore_ngap::types::TargetId::TargetRanNodeId {
+            global_ran_node_id, ..
+        } = target_id
+        else {
+            // targeteNB-ID names an E-UTRAN eNB, which has no NG association.
+            return None;
+        };
         let sessions = self.sessions.read().await;
         sessions
             .iter()
-            .find(|(_, s)| s.gnb.gnb_id as u64 == target_gnb_id)
+            .find(|(_, s)| match global_ran_node_id {
+                // #1140, TS 38.413 §9.3.1.6: the whole Global gNB ID -- PLMN, gNB ID and
+                // its bit length -- as the gNB named itself at NG Setup, the match the NG
+                // Setup replacement (#1039) and the EPS→5GS target lookup already make. A
+                // gNB ID is unique only within its PLMN and at its own length. A gNB
+                // target never matches an ng-eNB (#876).
+                GlobalRanNodeId::GlobalGnbId {
+                    plmn_identity,
+                    gnb_id,
+                    gnb_id_len,
+                } => {
+                    s.gnb.ng_enb_id.is_none()
+                        && s.gnb.gnb_id_presence
+                        && s.gnb.gnb_id == *gnb_id
+                        && s.gnb.gnb_id_len == *gnb_id_len
+                        && s.gnb.plmn_id == crate::ngap_asn1::decode_plmn_id(plmn_identity)
+                }
+                // #876, TS 38.413 §9.3.1.8: (PLMN, ngENB-ID alternative, value), as the
+                // ng-eNB named itself at NG Setup. Two ids of equal value and different
+                // lengths are different ng-eNBs.
+                GlobalRanNodeId::GlobalNgEnbId {
+                    plmn_identity,
+                    ng_enb_id,
+                } => {
+                    s.gnb.ng_enb_id == Some(*ng_enb_id)
+                        && s.gnb.plmn_id == crate::ngap_asn1::decode_plmn_id(plmn_identity)
+                }
+            })
             .map(|(assoc, _)| *assoc)
     }
 
@@ -16663,8 +17431,7 @@ impl NgapServer {
                 "PDU_RES_SETUP_RSP",
                 transfer,
                 "InitialContextSetupResponse",
-            )
-            .await;
+            );
         }
         // #778 follow-up: a session the gNB could not set up (TS 38.413 §8.3.1.2, the
         // PDU Session Resource Failed to Setup List) has no user plane on this connection
@@ -16679,8 +17446,7 @@ impl NgapServer {
                 "PDU_RES_SETUP_FAIL",
                 transfer,
                 "InitialContextSetupResponse (failed to set up)",
-            )
-            .await;
+            );
         }
 
         let updated = self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
@@ -16753,6 +17519,7 @@ impl NgapServer {
             return Ok(());
         };
         self.send_to_association(association_id, &cmd).await?;
+        self.note_release_command(association_id, amf_ue_ngap_id, ran_ue_ngap_id);
         log::info!(
             "UE {amf_ue_ngap_id}: registration update complete with no follow-on request and \
              no user plane; NAS signalling connection released (TS 24.501 §5.3.1.3)"
@@ -16914,19 +17681,13 @@ impl NgapServer {
         (host, port)
     }
 
-    /// Relay one per-PDU-session N2 SM container to the SMF via
-    /// Nsmf_PDUSession_UpdateSMContext (TS 23.502 §4.3.2.2.1).
-    ///
-    /// `context` names the NGAP procedure for the log line, so a failure says
-    /// which relay dropped rather than just "update failed".
-    ///
-    /// Returns whether the relay was attempted and accepted, so callers can count
-    /// what actually reached the SMF instead of assuming.
     /// Build a PathSwitchRequestAcknowledge's switched list from the SMF's ANSWERS (#70).
     ///
     /// One `Nsmf_PDUSession_UpdateSMContext` per switched session (TS 29.502 §5.2.2.3.3);
     /// the SMF switches the UPF's DL path to the target and returns the
-    /// `PathSwitchRequestAcknowledgeTransfer` the gNB is owed.
+    /// `PathSwitchRequestAcknowledgeTransfer` the gNB is owed. The calls run off the NGAP
+    /// task (#922 part 3); `answers` holds what came back, keyed by PSI, and `inbound` is
+    /// the request's order.
     ///
     /// A session the SMF does not acknowledge is left OUT rather than acknowledged with the
     /// gNB's own request transfer. That echo is the defect #70 names: TS 38.413 §9.3.4.8 and
@@ -16935,158 +17696,67 @@ impl NgapServer {
     /// other tells the target gNB to send uplink traffic to itself. A gNB that finds a
     /// session missing from the switched list releases it, which is the honest outcome when
     /// the core cannot confirm the switch.
-    ///
-    /// Extracted from `handle_path_switch_request` so the no-echo property is testable: the
-    /// acknowledge is built and immediately sent, and a harness with no live gNB association
-    /// cannot inspect what went into it.
-    async fn switched_list_from_smf(
-        &self,
+    fn switched_list_from_answers(
         amf_ue_ngap_id: u64,
-        inbound: &[(u8, Vec<u8>)],
+        inbound: &[u8],
+        answers: &mut HashMap<u8, JoinAnswer>,
     ) -> Vec<nextgcore_ngap::types::PduSessionResourceSwitchedItem> {
         let mut switched_list = Vec::with_capacity(inbound.len());
-        for (pdu_session_id, request_transfer) in inbound {
-            match self
-                .relay_n2_sm_to_smf_for_answer(
-                    amf_ue_ngap_id,
-                    *pdu_session_id,
-                    "PATH_SWITCH_REQ",
-                    request_transfer,
-                    "PathSwitchRequest",
-                )
-                .await
-            {
-                Some(ack_transfer) => {
+        for pdu_session_id in inbound {
+            match answers.remove(pdu_session_id) {
+                Some(JoinAnswer::N2Updated(Ok((_, ack_transfer)))) if !ack_transfer.is_empty() => {
                     switched_list.push(nextgcore_ngap::types::PduSessionResourceSwitchedItem {
                         pdu_session_id: *pdu_session_id,
                         transfer: ack_transfer,
                     });
                 }
-                None => log::warn!(
+                other => log::warn!(
                     "PathSwitchRequest: PSI {pdu_session_id} of UE {amf_ue_ngap_id} is NOT \
-                     in the switched list -- the SMF supplied no acknowledge transfer, and \
-                     echoing the gNB's own request transfer would point it at its own tunnel"
+                     in the switched list -- the SMF supplied no acknowledge transfer \
+                     ({}), and echoing the gNB's own request transfer would point it at its \
+                     own tunnel",
+                    match &other {
+                        Some(JoinAnswer::N2Updated(Err(e))) => e.clone(),
+                        Some(_) => "no N2 SM information".to_string(),
+                        None => "no SM context, or no answer in time".to_string(),
+                    }
                 ),
             }
         }
         switched_list
     }
 
-    /// Relay an N2 SM container to the SMF and return the container it answers with
-    /// (#70, TS 29.502 §5.2.2.3.3).
+    /// Send one per-PDU-session N2 SM container to the session's SMF in an
+    /// Nsmf_PDUSession_UpdateSMContext (TS 23.502 §4.3.2.2.1, TS 29.502 §5.2.2.3.2), off
+    /// the NGAP task (#922 part 3). Keyed on (UE, PSI), so it reaches the SMF after
+    /// anything already sent for the session; `durable` work is not dropped when the UE
+    /// goes (a report of what the NG-RAN did, which the SMF needs either way).
     ///
-    /// The mobility twin of [`Self::relay_n2_sm_to_smf`], which discards the response. On
-    /// a path switch the response is the point: it carries the
-    /// `PathSwitchRequestAcknowledgeTransfer` the target gNB is owed, and without it the
-    /// AMF has nothing conformant to put in the acknowledge — which is why the pre-#70
-    /// code echoed the gNB's own request transfer back instead.
+    /// The container is forwarded opaquely: the AMF never re-encodes N2 SM information
+    /// (TS 23.502), each container with its own n2SmInfoType (TS 29.502 §6.1.6.3.12,
+    /// #525). Always against the SMF-chosen reference from the Create response, never
+    /// `format!("{pdu_session_id}")`.
     ///
-    /// `None` means the relay failed or the SMF answered with no N2 SM part, and the caller
-    /// must decide what to do about it rather than substituting something.
-    async fn relay_n2_sm_to_smf_for_answer(
-        &self,
+    /// `then` turns the SMF's answer into the outcome applied on the NGAP task, if any.
+    /// Returns false, and sends nothing, when the session has no SM context.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_n2_sm_update<T>(
+        &mut self,
         amf_ue_ngap_id: u64,
         pdu_session_id: u8,
-        n2_sm_info_type: &str,
+        n2_sm_info_type: &'static str,
         transfer: &[u8],
-        context: &str,
-    ) -> Option<Vec<u8>> {
-        let sm_context_ref = self
-            .sm_context_refs
-            .get(&(amf_ue_ngap_id, pdu_session_id))
-            .cloned()?;
-        let (host, port) = self.smf_target_for(amf_ue_ngap_id, pdu_session_id);
-        match crate::sbi_path::call_smf_update_sm_context_n2(
-            &host,
-            port,
-            &sm_context_ref,
-            n2_sm_info_type,
-            transfer,
-        )
-        .await
-        {
-            Ok(resp) if !resp.n2_sm_info.is_empty() => {
-                log::info!(
-                    "{context}: SMF ref={sm_context_ref} answered with {} N2 SM bytes for \
-                     UE {amf_ue_ngap_id} PSI {pdu_session_id}",
-                    resp.n2_sm_info.len()
-                );
-                Some(resp.n2_sm_info)
-            }
-            Ok(_) => {
-                log::warn!(
-                    "{context}: SMF ref={sm_context_ref} accepted the update but returned \
-                     no N2 SM information for UE {amf_ue_ngap_id} PSI {pdu_session_id}"
-                );
-                None
-            }
-            Err(e) => {
-                log::warn!(
-                    "{context}: SMF update failed for UE {amf_ue_ngap_id} PSI \
-                     {pdu_session_id} (ref={sm_context_ref}): {e}"
-                );
-                None
-            }
-        }
-    }
-
-    /// Relay an N2 SM container with `n2_sm_info_type` and return the SMF's
-    /// answer as `(n2SmInfoType, n2SmInfo)`; `None` when there is no SM context
-    /// or the SMF call fails. Unlike [`Self::relay_n2_sm_to_smf_for_answer`], the
-    /// answer's type comes back too, because a Modify Indication's answer is
-    /// either a Confirm Transfer or an Unsuccessful Transfer (#525).
-    async fn relay_n2_sm_to_smf_with_answer(
-        &self,
-        amf_ue_ngap_id: u64,
-        pdu_session_id: u8,
-        n2_sm_info_type: &str,
-        transfer: &[u8],
-        context: &str,
-    ) -> Option<(Option<String>, Vec<u8>)> {
-        let Some(sm_context_ref) = self
-            .sm_context_refs
-            .get(&(amf_ue_ngap_id, pdu_session_id))
-            .cloned()
-        else {
-            log::error!(
-                "{context}: no SM context ref stored for UE {amf_ue_ngap_id} PSI \
-                 {pdu_session_id}"
-            );
-            return None;
-        };
-        let (host, port) = self.smf_target_for(amf_ue_ngap_id, pdu_session_id);
-        match crate::sbi_path::call_smf_update_sm_context_n2(
-            &host,
-            port,
-            &sm_context_ref,
-            n2_sm_info_type,
-            transfer,
-        )
-        .await
-        {
-            Ok(resp) => Some((resp.n2_sm_info_type, resp.n2_sm_info)),
-            Err(e) => {
-                log::warn!(
-                    "{context}: SMF update ({n2_sm_info_type}) for UE {amf_ue_ngap_id} PSI \
-                     {pdu_session_id} (ref={sm_context_ref}) failed: {e}"
-                );
-                None
-            }
-        }
-    }
-
-    async fn relay_n2_sm_to_smf(
-        &self,
-        amf_ue_ngap_id: u64,
-        pdu_session_id: u8,
-        n2_sm_info_type: &str,
-        transfer: &[u8],
-        context: &str,
-    ) -> bool {
-        // Always the SMF-chosen reference from the Create response, never
-        // format!("{pdu_session_id}"). The PSI is 1 for the first session of every
-        // UE while the SMF's ref is a monotonic index, so a fabricated ref sends
-        // every update to session "1".
+        context: &'static str,
+        durable: bool,
+        then: T,
+    ) -> bool
+    where
+        T: FnOnce(
+                Result<crate::sbi_path::SmContextUpdateResponse, String>,
+            ) -> Option<crate::sbi_offload::SbiOutcome>
+            + Send
+            + 'static,
+    {
         let Some(sm_context_ref) = self
             .sm_context_refs
             .get(&(amf_ue_ngap_id, pdu_session_id))
@@ -17098,36 +17768,93 @@ impl NgapServer {
             );
             return false;
         };
-
         let (host, port) = self.smf_target_for(amf_ue_ngap_id, pdu_session_id);
-        // The container is forwarded opaquely: the AMF never re-encodes N2 SM
-        // information (TS 23.502).
-        // Each container with its own n2SmInfoType (TS 29.502 §6.1.6.3.12, #525).
-        match crate::sbi_path::call_smf_update_sm_context_n2(
-            &host,
-            port,
-            &sm_context_ref,
+        let transfer = transfer.to_vec();
+        let work = move || async move {
+            let result = crate::sbi_path::call_smf_update_sm_context_n2(
+                &host,
+                port,
+                &sm_context_ref,
+                n2_sm_info_type,
+                &transfer,
+            )
+            .await
+            .map_err(|e| e.to_string());
+            match &result {
+                Ok(resp) => log::info!(
+                    "{context}: relayed {} N2 SM bytes ({n2_sm_info_type}) for UE \
+                     {amf_ue_ngap_id} PSI {pdu_session_id} to SMF ref={sm_context_ref}; it \
+                     answered {} N2 / {} N1 SM bytes",
+                    transfer.len(),
+                    resp.n2_sm_info.len(),
+                    resp.n1_sm_msg.len()
+                ),
+                Err(e) => log::warn!(
+                    "{context}: failed to relay the N2 SM container ({n2_sm_info_type}) for \
+                     UE {amf_ue_ngap_id} PSI {pdu_session_id} (ref={sm_context_ref}): {e}"
+                ),
+            }
+            then(result)
+        };
+        let key = (amf_ue_ngap_id, pdu_session_id);
+        if durable {
+            self.sbi_offload.spawn_keyed_durable(key, work);
+        } else {
+            self.sbi_offload.spawn_keyed(key, work);
+        }
+        true
+    }
+
+    /// Relay an N2 SM container whose answer nothing waits for (a Setup, Modify or
+    /// Release Response, a Notify): durable keyed work off the NGAP task (#922 part 3).
+    /// Returns whether it was queued.
+    fn relay_n2_sm_to_smf(
+        &mut self,
+        amf_ue_ngap_id: u64,
+        pdu_session_id: u8,
+        n2_sm_info_type: &'static str,
+        transfer: &[u8],
+        context: &'static str,
+    ) -> bool {
+        self.spawn_n2_sm_update(
+            amf_ue_ngap_id,
+            pdu_session_id,
             n2_sm_info_type,
             transfer,
+            context,
+            true,
+            |_| None,
         )
-        .await
-        {
-            Ok(_) => {
-                log::info!(
-                    "{context}: relayed {} N2 SM bytes for UE {amf_ue_ngap_id} PSI \
-                     {pdu_session_id} to SMF ref={sm_context_ref}",
-                    transfer.len()
-                );
-                true
-            }
-            Err(e) => {
-                log::warn!(
-                    "{context}: failed to relay the N2 SM container for UE \
-                     {amf_ue_ngap_id} PSI {pdu_session_id} (ref={sm_context_ref}): {e}"
-                );
-                false
-            }
-        }
+    }
+
+    /// An N2 SM update whose answer an [`SmfJoin`] waits for: the answer's
+    /// `(n2SmInfoType, n2SmInfo)` goes to the join `join` as [`JoinAnswer::N2Updated`].
+    fn spawn_join_n2_sm_update(
+        &mut self,
+        join: u64,
+        amf_ue_ngap_id: u64,
+        pdu_session_id: u8,
+        n2_sm_info_type: &'static str,
+        transfer: &[u8],
+        context: &'static str,
+    ) -> bool {
+        self.spawn_n2_sm_update(
+            amf_ue_ngap_id,
+            pdu_session_id,
+            n2_sm_info_type,
+            transfer,
+            context,
+            false,
+            move |r| {
+                Some(crate::sbi_offload::SbiOutcome::Smf(SmfAnswer::JoinPart {
+                    join,
+                    psi: pdu_session_id,
+                    answer: JoinAnswer::N2Updated(
+                        r.map(|resp| (resp.n2_sm_info_type, resp.n2_sm_info)),
+                    ),
+                }))
+            },
+        )
     }
 
     /// Handle a PDU SESSION RESOURCE SETUP RESPONSE (TS 38.413 §8.2.1).
@@ -17243,16 +17970,13 @@ impl NgapServer {
                 ),
             }
 
-            if self
-                .relay_n2_sm_to_smf(
-                    amf_ue_ngap_id,
-                    item.pdu_session_id,
-                    "PDU_RES_SETUP_RSP",
-                    &item.transfer,
-                    "PDUSessionResourceSetupResponse",
-                )
-                .await
-            {
+            if self.relay_n2_sm_to_smf(
+                amf_ue_ngap_id,
+                item.pdu_session_id,
+                "PDU_RES_SETUP_RSP",
+                &item.transfer,
+                "PDUSessionResourceSetupResponse",
+            ) {
                 relayed += 1;
             }
         }
@@ -17275,8 +17999,7 @@ impl NgapServer {
                 "PDU_RES_SETUP_FAIL",
                 &item.transfer,
                 "PDUSessionResourceSetupResponse (failed-to-setup)",
-            )
-            .await;
+            );
         }
 
         if setup.is_empty() && failed.is_empty() {
@@ -17287,8 +18010,8 @@ impl NgapServer {
             );
         } else {
             log::info!(
-                "PDU Session Resource Setup Response: relayed {relayed}/{} successful \
-                 and {} failed sessions to the SMF",
+                "PDU Session Resource Setup Response: {relayed}/{} successful \
+                 and {} failed sessions queued for the SMF (off the NGAP task)",
                 setup.len(),
                 failed.len()
             );
@@ -17379,8 +18102,7 @@ impl NgapServer {
                 "PDU_RES_MOD_RSP",
                 &item.transfer,
                 "PDUSessionResourceModifyResponse",
-            )
-            .await;
+            );
         }
         for item in &failed {
             log::warn!(
@@ -17393,8 +18115,7 @@ impl NgapServer {
                 "PDU_RES_MOD_FAIL",
                 &item.transfer,
                 "PDUSessionResourceModifyResponse (failed-to-modify)",
-            )
-            .await;
+            );
         }
         Ok(())
     }
@@ -17491,8 +18212,7 @@ impl NgapServer {
                 "PDU_RES_REL_RSP",
                 &item.transfer,
                 "PDUSessionResourceReleaseResponse",
-            )
-            .await;
+            );
         }
         Ok(())
     }
@@ -17516,7 +18236,7 @@ impl NgapServer {
         association_id: u64,
         data: &[u8],
     ) -> Result<()> {
-        match self.modify_indication_answer(data).await {
+        match self.modify_indication_answer(association_id, data).await {
             ModifyIndicationAnswer::Confirm(bytes) => {
                 self.send_to_association(association_id, &bytes).await?;
                 log::info!(
@@ -17535,15 +18255,19 @@ impl NgapServer {
                 )
                 .await
             }
-            ModifyIndicationAnswer::Nothing => Ok(()),
+            ModifyIndicationAnswer::Nothing | ModifyIndicationAnswer::Pending => Ok(()),
         }
     }
 
-    /// The answer to a PDU Session Resource Modify Indication: relay each
-    /// session to the SMF and build the Modify Confirm from what it says. Split
-    /// from the handler so the Confirm's content is testable without a gNB to
-    /// send it to.
-    async fn modify_indication_answer(&mut self, data: &[u8]) -> ModifyIndicationAnswer {
+    /// The answer to a PDU Session Resource Modify Indication: relay each session to the
+    /// SMF off the NGAP task (#922 part 3), the Modify Confirm following the answers
+    /// (`finish_modify_indication`). Answered at once only when it is rejected,
+    /// undecodable, or names no session with an SM context.
+    async fn modify_indication_answer(
+        &mut self,
+        association_id: u64,
+        data: &[u8],
+    ) -> ModifyIndicationAnswer {
         use crate::ngap_asn1::PduSessionResourceModifyIndicationDecode::{
             Proceed, Reject, Undecodable,
         };
@@ -17563,42 +18287,118 @@ impl NgapServer {
             "PDU Session Resource Modify Indication: UE {amf_ue_ngap_id}, {} sessions",
             sessions.len()
         );
-
-        let mut confirmed = Vec::new();
-        let mut failed = Vec::new();
+        let rest = ModifyIndicationRest {
+            association_id,
+            ran_ue_ngap_id,
+            psis: sessions.iter().map(|i| i.pdu_session_id).collect(),
+            notify,
+        };
+        let with_ref: Vec<u8> = rest
+            .psis
+            .iter()
+            .copied()
+            .filter(|psi| self.sm_context_refs.contains_key(&(amf_ue_ngap_id, *psi)))
+            .collect();
+        if with_ref.is_empty() {
+            return Self::modify_confirm(amf_ue_ngap_id, &rest, HashMap::new());
+        }
+        let join = self.open_smf_join(
+            amf_ue_ngap_id,
+            &with_ref,
+            JoinThen::ModifyIndication(Box::new(rest)),
+        );
         for item in &sessions {
-            match self
-                .relay_n2_sm_to_smf_with_answer(
+            if with_ref.contains(&item.pdu_session_id) {
+                self.spawn_join_n2_sm_update(
+                    join,
                     amf_ue_ngap_id,
                     item.pdu_session_id,
                     "PDU_RES_MOD_IND",
                     &item.transfer,
                     "PDUSessionResourceModifyIndication",
-                )
-                .await
-            {
-                Some((Some(t), n2)) if t == "PDU_RES_MOD_CFM" && !n2.is_empty() => {
+                );
+            }
+        }
+        ModifyIndicationAnswer::Pending
+    }
+
+    /// The Modify Confirm once a Modify Indication's SMFs have answered, or at the join's
+    /// deadline (#922 part 3). Sent on the association the indication came on, and only
+    /// while the UE is still served there.
+    async fn finish_modify_indication(
+        &mut self,
+        amf_ue_ngap_id: u64,
+        rest: ModifyIndicationRest,
+        answers: HashMap<u8, JoinAnswer>,
+    ) -> Result<()> {
+        let still_there = self.ue_auth_state.get(amf_ue_ngap_id).is_some_and(|s| {
+            !s.is_cm_idle()
+                && s.association_id == rest.association_id
+                && s.ran_ue_ngap_id == rest.ran_ue_ngap_id
+        });
+        if !still_there {
+            log::warn!(
+                "PDU Session Resource Modify Indication for UE {amf_ue_ngap_id}: the UE left \
+                 the NG connection it came on before its SMFs answered; no Modify Confirm"
+            );
+            return Ok(());
+        }
+        if let ModifyIndicationAnswer::Confirm(bytes) =
+            Self::modify_confirm(amf_ue_ngap_id, &rest, answers)
+        {
+            self.send_to_association(rest.association_id, &bytes)
+                .await?;
+            log::info!(
+                "PDU Session Resource Modify Confirm sent to association {}",
+                rest.association_id
+            );
+        }
+        Ok(())
+    }
+
+    /// Build the Modify Confirm from the SMFs' answers: a Confirm Transfer confirms a
+    /// session, an Unsuccessful Transfer fails it (#525), and a session with no usable
+    /// answer is reported failed rather than left without an entry.
+    fn modify_confirm(
+        amf_ue_ngap_id: u64,
+        rest: &ModifyIndicationRest,
+        mut answers: HashMap<u8, JoinAnswer>,
+    ) -> ModifyIndicationAnswer {
+        let mut confirmed = Vec::new();
+        let mut failed = Vec::new();
+        for &pdu_session_id in &rest.psis {
+            match answers.remove(&pdu_session_id) {
+                Some(JoinAnswer::N2Updated(Ok((Some(t), n2))))
+                    if t == "PDU_RES_MOD_CFM" && !n2.is_empty() =>
+                {
                     confirmed.push(crate::ngap_asn1::ModifyPduSession {
-                        pdu_session_id: item.pdu_session_id,
+                        pdu_session_id,
                         transfer: n2,
                     });
                 }
-                Some((Some(t), n2)) if t == "PDU_RES_MOD_IND_FAIL" && !n2.is_empty() => {
+                Some(JoinAnswer::N2Updated(Ok((Some(t), n2))))
+                    if t == "PDU_RES_MOD_IND_FAIL" && !n2.is_empty() =>
+                {
                     failed.push(crate::ngap_asn1::ModifyPduSession {
-                        pdu_session_id: item.pdu_session_id,
+                        pdu_session_id,
                         transfer: n2,
                     });
                 }
                 other => {
-                    // No usable answer (no SM context, SMF unreachable or refusing,
-                    // or no transfer): the gNB is told this session's modification
-                    // failed rather than left without an entry for it.
+                    // No usable answer (no SM context, SMF unreachable or refusing, no
+                    // transfer, or none in time): the gNB is told this session's
+                    // modification failed rather than left without an entry for it.
                     log::warn!(
                         "PDUSessionResourceModifyIndication: no Modify Confirm Transfer \
-                         from the SMF for UE {amf_ue_ngap_id} PSI {} ({:?}); reporting it \
-                         failed",
-                        item.pdu_session_id,
-                        other.as_ref().map(|(t, n2)| (t.clone(), n2.len()))
+                         from the SMF for UE {amf_ue_ngap_id} PSI {pdu_session_id} ({}); \
+                         reporting it failed",
+                        match &other {
+                            Some(JoinAnswer::N2Updated(Ok((t, n2)))) =>
+                                format!("{t:?}, {} bytes", n2.len()),
+                            Some(JoinAnswer::N2Updated(Err(e))) => e.clone(),
+                            Some(_) => "unexpected answer".to_string(),
+                            None => "no SM context, or no answer in time".to_string(),
+                        }
                     );
                     if let Some(transfer) =
                         crate::ngap_asn1::modify_indication_unsuccessful_transfer(
@@ -17608,7 +18408,7 @@ impl NgapServer {
                         )
                     {
                         failed.push(crate::ngap_asn1::ModifyPduSession {
-                            pdu_session_id: item.pdu_session_id,
+                            pdu_session_id,
                             transfer,
                         });
                     }
@@ -17618,10 +18418,10 @@ impl NgapServer {
 
         match crate::ngap_asn1::build_pdu_session_resource_modify_confirm_asn1(
             amf_ue_ngap_id,
-            ran_ue_ngap_id,
+            rest.ran_ue_ngap_id,
             &confirmed,
             &failed,
-            &notify,
+            &rest.notify,
         ) {
             Some(bytes) => {
                 log::info!(
@@ -17708,8 +18508,7 @@ impl NgapServer {
                 "PDU_RES_NTY",
                 &item.transfer,
                 "PDUSessionResourceNotify",
-            )
-            .await;
+            );
         }
         for item in &notify.released_list {
             // #778 follow-up: the NG-RAN released the session's resources.
@@ -17731,46 +18530,38 @@ impl NgapServer {
                 );
                 continue;
             };
+            // #922 part 3: off the NGAP task, durable (the SMF must learn the NG-RAN
+            // released the session whatever the UE does next); the N1 it answers with is
+            // delivered by `apply_notify_released`.
             let (host, port) = self.smf_target_for(notify.amf_ue_ngap_id, item.pdu_session_id);
-            match crate::sbi_path::call_smf_update_sm_context_n2(
-                &host,
-                port,
-                &sm_context_ref,
-                "PDU_RES_NTY_REL",
-                &item.transfer,
-            )
-            .await
-            {
-                Ok(resp) if !resp.n1_sm_msg.is_empty() => {
-                    log::info!(
-                        "PDUSessionResourceNotify (released): SMF ref={sm_context_ref} \
-                         releases UE {} PSI {}; relaying its {}-byte N1 SM to the UE",
-                        notify.amf_ue_ngap_id,
-                        item.pdu_session_id,
-                        resp.n1_sm_msg.len()
-                    );
-                    self.send_n1_sm_to_ue(
-                        association_id,
-                        notify.amf_ue_ngap_id,
-                        notify.ran_ue_ngap_id,
-                        item.pdu_session_id,
-                        &resp.n1_sm_msg,
+            let (ue, psi, ran) = (
+                notify.amf_ue_ngap_id,
+                item.pdu_session_id,
+                notify.ran_ue_ngap_id,
+            );
+            let transfer = item.transfer.clone();
+            self.sbi_offload
+                .spawn_keyed_durable((ue, psi), move || async move {
+                    let result = crate::sbi_path::call_smf_update_sm_context_n2(
+                        &host,
+                        port,
+                        &sm_context_ref,
+                        "PDU_RES_NTY_REL",
+                        &transfer,
                     )
-                    .await?;
-                }
-                Ok(_) => log::info!(
-                    "PDUSessionResourceNotify (released): relayed to SMF ref={sm_context_ref} \
-                     for UE {} PSI {}",
-                    notify.amf_ue_ngap_id,
-                    item.pdu_session_id
-                ),
-                Err(e) => log::warn!(
-                    "PDUSessionResourceNotify (released): SMF update for UE {} PSI {} \
-                     (ref={sm_context_ref}) failed: {e}",
-                    notify.amf_ue_ngap_id,
-                    item.pdu_session_id
-                ),
-            }
+                    .await
+                    .map(|resp| resp.n1_sm_msg)
+                    .map_err(|e| format!("SMF update (ref={sm_context_ref}) failed: {e}"));
+                    Some(crate::sbi_offload::SbiOutcome::Smf(
+                        SmfAnswer::NotifyReleased {
+                            amf_ue_ngap_id: ue,
+                            psi,
+                            association_id,
+                            ran_ue_ngap_id: ran,
+                            result,
+                        },
+                    ))
+                });
         }
         Ok(())
     }
@@ -18051,6 +18842,7 @@ impl NgapServer {
             );
             if let Some(cmd) = release_cmd {
                 self.send_to_association(association_id, &cmd).await?;
+                self.note_release_command(association_id, amf_id, ran_id);
                 log::info!("UE Context Release Command sent to gNB");
             }
         }
@@ -18288,6 +19080,7 @@ impl NgapServer {
 
     /// Close a gNB session
     pub async fn close_session(&self, association_id: u64) -> Result<()> {
+        forget_association_rat(association_id);
         if let Some(session) = self.sessions.write().await.remove(&association_id) {
             log::info!(
                 "Closed gNB session {} (association {})",
@@ -18865,6 +19658,14 @@ fn is_communication_failure_cause(group: u8, value: i64) -> bool {
 /// full onboarding-SUCI parse when onboarding credentials are productionized.
 fn is_snpn_onboarding_suci(suci: &str) -> bool {
     suci.contains("onboarding")
+}
+
+/// What `reconcile_update_sessions` planned (#759, #922 part 3): the outcome so far,
+/// and the activations still to be answered by their SMFs.
+struct UpdatePlan {
+    outcome: UpdateSessionOutcome,
+    /// (PSI, SM context, S-NSSAI) of each session to activate at its SMF.
+    activate: Vec<(u8, String, crate::context::SNssai)>,
 }
 
 /// What `reconcile_update_sessions` did (#759).
@@ -19973,6 +20774,14 @@ fn fresh_context_for_initial_registration(
     Some(state)
 }
 
+/// Drop a gone association's RAT (#997 review m2).
+fn forget_association_rat(association_id: u64) {
+    crate::context::amf_self()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .association_rat_remove(association_id);
+}
+
 fn apply_user_location(
     amf_ue: &mut AmfUe,
     location: &nextgcore_ngap::types::UserLocationInformation,
@@ -20289,9 +21098,10 @@ enum AbortedProcedure {
     Deregistration,
 }
 
-/// Abort the NAS procedure in progress for a UE whose NG connection was released by an
+/// Abort the NAS procedure in progress for a UE whose NG connection was released, by an
 /// NG Reset (TS 38.413 §8.7.4.2.2: "any other ongoing procedure ... related to a UE
-/// association ... shall be aborted"). To the NAS layer that is a lower layer failure, and
+/// association ... shall be aborted") or a UE Context Release (#885, §8.3.3). To the NAS
+/// layer that is a lower layer failure, and
 /// TS 24.501 says what each procedure does on one:
 ///
 /// | timer | procedure | lower layer failure (network side) |
@@ -20311,8 +21121,8 @@ fn abort_on_ng_release(amf_ue_ngap_id: u64, state: &mut UeNasContext) -> Aborted
         return AbortedProcedure::None;
     };
     log::info!(
-        "UE {amf_ue_ngap_id}: {:?} procedure aborted by NG Reset (lower layer failure, TS \
-         38.413 §8.7.4.2.2); its retransmission is dropped",
+        "UE {amf_ue_ngap_id}: {:?} procedure aborted by the release of its NG connection \
+         (lower layer failure); its retransmission is dropped",
         retx.timer
     );
     match retx.timer {
@@ -20331,6 +21141,7 @@ mod tests {
     mod handler_tests;
     mod initial_registration_tests;
     mod off_task_smf_tests;
+    mod poll_wake_tests;
     mod positioning_reach_tests;
     mod racs_handler_tests;
     mod racs_mapping_tests;
@@ -24404,10 +25215,17 @@ mod tests {
         .await;
         std::env::remove_var("PCF_SBI_ADDR");
         std::env::remove_var("PCF_SBI_PORT");
+        // #922: the SM context release is durable off-task work too, so it is waited for
+        // as well. Read at once, it raced the offload under a loaded suite (#1056).
+        let sm_released = nf_saw(
+            &seen,
+            "POST /nsmf-pdusession/v1/sm-contexts/smctx-602/release",
+        )
+        .await;
 
         let seen = seen.lock().expect("seen").clone();
         assert!(
-            seen.contains(&"POST /nsmf-pdusession/v1/sm-contexts/smctx-602/release".to_string()),
+            sm_released,
             "TS 23.502 §4.2.2.2.2 step 14d: Nsmf_PDUSession_ReleaseSMContext towards the \
              SMF; saw {seen:?}"
         );
@@ -24977,7 +25795,18 @@ mod tests {
         )
         .await
         .expect("handled");
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // #1056: wait for the first deactivations to reach the SMF, which holds each for
+        // `delay`, rather than a fixed 300 ms a loaded suite can overrun.
+        let ref5 = |ue: u64| format!("ref-754-{ue}-5");
+        for _ in 0..500 {
+            if ues
+                .iter()
+                .any(|&ue| seen.lock().unwrap().iter().any(|(r, _, _)| *r == ref5(ue)))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         // Which PSI 5 deactivations are on the wire now, and which are still queued.
         let arrived: Vec<String> = seen
             .lock()
@@ -24985,7 +25814,6 @@ mod tests {
             .iter()
             .map(|(r, _, _)| r.clone())
             .collect();
-        let ref5 = |ue: u64| format!("ref-754-{ue}-5");
         let in_flight = *ues
             .iter()
             .find(|&&ue| arrived.contains(&ref5(ue)))
@@ -25312,6 +26140,114 @@ mod tests {
         assert!(!ngap.handover_target_transfers.contains_key(&(cuc, 5)));
         for ue in [cuc, auth] {
             ngap.ue_auth_state.remove(ue);
+        }
+    }
+
+    /// **#885.** A UE Context Release Complete releases the N1 connection a NAS
+    /// procedure is running on, which TS 24.501 treats as a lower layer failure: the
+    /// procedure is aborted (§5.5.1.3.8 a), §5.4.4.6 b), §5.4.1.3.7 a), §5.4.2.7 a),
+    /// §5.4.3.6 a)), and its retransmission never goes out under the released RAN UE
+    /// NGAP ID. Those UEs stay registered, CM-IDLE. A network-initiated
+    /// de-registration (T3522) is aborted into 5GMM-DEREGISTERED (§5.5.2.3.5 b)): its
+    /// session is released at the SMF and the UE is forgotten.
+    ///
+    /// REVERT-VERIFIED: without the abort the armed PDUs are retransmitted and the
+    /// T3522 UE is kept; without `terminate_policy_associations` no PCF DELETE comes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_release_complete_aborts_the_ues_nas_procedure() {
+        let (_nf, port, seen) = recording_nf().await;
+        let _env = SmfEnvGuard::acquire(port).await;
+        set_pcf_env(port);
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = capturing_ngap_server().await;
+        let assoc = 885_001u64;
+        seed_gnb_session(&ngap, assoc).await;
+        let ues = [
+            (7_885_001u64, 51u32, NasProcTimer::T3550),
+            (7_885_002, 52, NasProcTimer::T3555),
+            (7_885_003, 53, NasProcTimer::T3560),
+            (7_885_004, 54, NasProcTimer::T3570),
+            (7_885_005, 55, NasProcTimer::T3522),
+        ];
+        for (ue, ran, timer) in ues {
+            let mut state = UeNasContext::new(ue, ran, assoc, false);
+            state.registered = true;
+            state.retx = Some(NasRetx {
+                timer,
+                deadline: Instant::now() + Duration::from_millis(50),
+                retries: 0,
+                ngap_pdu: vec![0x00, 0x04, 0x40, ran as u8],
+            });
+            ngap.ue_auth_state.insert(ue, state);
+        }
+        let dereg = ues[4].0;
+        ngap.ue_auth_state.with_mut(dereg, |s| {
+            s.policy_association_id = Some("am-pol-885".to_string());
+            s.ue_policy_association_id = Some("ue-pol-885".to_string());
+        });
+        ngap.sm_context_refs
+            .insert((dereg, 5), "smctx-885-dereg".to_string());
+        ngap.sm_context_smfs
+            .insert((dereg, 5), ("127.0.0.1".to_string(), port));
+
+        for (ue, ran, _) in ues {
+            ngap.handle_ue_context_release_complete(assoc, &release_complete_pdu(ue, Some(ran)))
+                .await
+                .expect("handled");
+        }
+        ngap.sbi_offload.settle().await;
+
+        // Past every retransmission deadline: nothing goes out on the released
+        // connections. The UE store is process-global (#915): only these PDUs count.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        ngap.process_nas_timers().await.expect("timers");
+        let resent: Vec<(u64, Vec<u8>)> = take_sent_ngap(&mut ngap)
+            .into_iter()
+            .filter(|(_, p)| {
+                p.len() == 4 && p[..3] == [0x00, 0x04, 0x40] && (51..=55).contains(&p[3])
+            })
+            .collect();
+        assert!(
+            resent.is_empty(),
+            "no retransmission on a released connection: {resent:?}"
+        );
+        for (ue, _, timer) in &ues[..4] {
+            let state = ngap.ue_auth_state.get(*ue).expect("kept, not released");
+            assert!(
+                state.is_cm_idle() && state.registered && state.retx.is_none(),
+                "{timer:?}: aborted, the UE kept registered and CM-IDLE"
+            );
+        }
+        assert!(
+            !ngap.ue_auth_state.contains(dereg),
+            "TS 24.501 §5.5.2.3.5 b): 5GMM-DEREGISTERED"
+        );
+        // Its policy associations end at the PCF (TS 23.502 §4.2.2.3.3 step 6).
+        let am = nf_saw(
+            &seen,
+            "DELETE /npcf-am-policy-control/v1/policies/am-pol-885",
+        )
+        .await;
+        let ue_pol = nf_saw(
+            &seen,
+            "DELETE /npcf-ue-policy-control/v1/policies/ue-pol-885",
+        )
+        .await;
+        clear_pcf_env();
+        let seen = seen.lock().expect("seen").clone();
+        assert!(
+            am && ue_pol,
+            "both policy associations are deleted: {seen:?}"
+        );
+        assert_eq!(
+            seen.iter()
+                .filter(|s| !s.starts_with("DELETE /npcf-"))
+                .collect::<Vec<_>>(),
+            vec!["POST /nsmf-pdusession/v1/sm-contexts/smctx-885-dereg/release"],
+            "the deregistered UE's session is released; nothing else is called"
+        );
+        for (ue, _, _) in &ues[..4] {
+            ngap.forget_ue(*ue);
         }
     }
 
@@ -26097,20 +27033,23 @@ mod tests {
             .await
             .expect("handled");
 
+        drive_sbi(&mut server).await;
         let calls = seen.lock().expect("seen").clone();
-        let typed: Vec<(&str, &str)> = calls
+        // #922 part 3: the relays run off the NGAP task, concurrently across sessions.
+        let mut typed: Vec<(&str, &str)> = calls
             .iter()
             .map(|(r, ty, _)| (r.as_str(), ty.as_str()))
             .collect();
+        typed.sort();
         assert_eq!(
             typed,
             vec![
-                ("ref-setup-fail", "PDU_RES_SETUP_FAIL"),
                 ("ref-mod", "PDU_RES_MOD_RSP"),
                 ("ref-mod-fail", "PDU_RES_MOD_FAIL"),
-                ("ref-rel", "PDU_RES_REL_RSP"),
                 ("ref-nty", "PDU_RES_NTY"),
                 ("ref-nty-rel", "PDU_RES_NTY_REL"),
+                ("ref-rel", "PDU_RES_REL_RSP"),
+                ("ref-setup-fail", "PDU_RES_SETUP_FAIL"),
             ],
             "{calls:?}"
         );
@@ -26130,8 +27069,12 @@ mod tests {
 
         let (_smf, port, seen) = fake_smf_typed().await;
         let _env = SmfEnvGuard::acquire(port).await;
-        let mut server = test_ngap_server().await;
+        let mut server = capturing_ngap_server().await;
         let ue = 79_526u64;
+        // The UE is served on the association the indication comes on.
+        server
+            .ue_auth_state
+            .insert(ue, UeNasContext::new(ue, 7, 9526, false));
         server
             .sm_context_refs
             .insert((ue, 2), "ref-ind-ok".to_string());
@@ -26145,25 +27088,33 @@ mod tests {
             7,
             &[(2, vec![0x21]), (3, vec![0x31]), (4, vec![0x41])],
         );
-        let ModifyIndicationAnswer::Confirm(bytes) =
-            server.modify_indication_answer(&indication).await
-        else {
-            panic!("a Modify Indication must be answered with a Modify Confirm");
+        // #922 part 3: the SMFs are asked off the NGAP task; the Confirm follows.
+        assert!(matches!(
+            server.modify_indication_answer(9526, &indication).await,
+            ModifyIndicationAnswer::Pending
+        ));
+        drive_sbi(&mut server).await;
+        let sent = take_sent_ngap(&mut server);
+        let [(9526, bytes)] = sent.as_slice() else {
+            panic!("a Modify Indication must be answered with a Modify Confirm: {sent:?}");
         };
+        let bytes = bytes.clone();
 
-        let relayed: Vec<(String, String, Vec<u8>)> = seen.lock().expect("seen").clone();
+        // Different sessions' updates run concurrently: compare sorted.
+        let mut relayed: Vec<(String, String, Vec<u8>)> = seen.lock().expect("seen").clone();
+        relayed.sort();
         assert_eq!(
             relayed,
             vec![
                 (
-                    "ref-ind-ok".to_string(),
-                    "PDU_RES_MOD_IND".to_string(),
-                    vec![0x21]
-                ),
-                (
                     "ref-ind-fail".to_string(),
                     "PDU_RES_MOD_IND".to_string(),
                     vec![0x31]
+                ),
+                (
+                    "ref-ind-ok".to_string(),
+                    "PDU_RES_MOD_IND".to_string(),
+                    vec![0x21]
                 ),
             ]
         );
@@ -26583,15 +27534,7 @@ mod tests {
         let mut server = capturing_ngap_server().await;
         let (source, target, target_gnb) = (97_431u64, 97_432u64, 0x7_4302u32);
         seed_gnb_session(&server, source).await;
-        seed_gnb_session(&server, target).await;
-        server
-            .sessions
-            .write()
-            .await
-            .get_mut(&target)
-            .expect("seeded")
-            .gnb
-            .gnb_id = target_gnb;
+        seed_gnb_session_with_id(&server, target, target_gnb).await;
         let ue = 7_743_001u64;
         let mut state = UeNasContext::new(ue, 9, source, false);
         state.registered = true;
@@ -26725,6 +27668,42 @@ mod tests {
         target_gnb_id: u32,
         psis: &[u8],
     ) -> Vec<u8> {
+        handover_required_pdu_full(
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            &PlmnId::new("001", "01"),
+            target_gnb_id,
+            22,
+            psis,
+        )
+    }
+
+    /// A HANDOVER REQUIRED for PSI 1 naming the gNB `(plmn, gnb_id, gnb_id_len)`.
+    fn handover_required_pdu_to(
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        plmn: &PlmnId,
+        gnb_id: u32,
+        gnb_id_len: u8,
+    ) -> Vec<u8> {
+        handover_required_pdu_full(
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            plmn,
+            gnb_id,
+            gnb_id_len,
+            &[1],
+        )
+    }
+
+    fn handover_required_pdu_full(
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        plmn: &PlmnId,
+        target_gnb_id: u32,
+        target_gnb_id_len: u8,
+        psis: &[u8],
+    ) -> Vec<u8> {
         nextgcore_ngap::builder::build_handover_required(&nextgcore_ngap::types::HandoverRequired {
             amf_ue_ngap_id,
             ran_ue_ngap_id,
@@ -26734,9 +27713,9 @@ mod tests {
             ),
             target_id: nextgcore_ngap::types::TargetId::TargetRanNodeId {
                 global_ran_node_id: nextgcore_ngap::types::GlobalRanNodeId::GlobalGnbId {
-                    plmn_identity: plmn_id_to_ngap_bytes(&PlmnId::new("001", "01")),
+                    plmn_identity: plmn_id_to_ngap_bytes(plmn),
                     gnb_id: target_gnb_id,
-                    gnb_id_len: 22,
+                    gnb_id_len: target_gnb_id_len,
                 },
                 selected_tai: nextgcore_ngap::types::TaiListItem {
                     tai_plmn: plmn_id_to_ngap_bytes(&PlmnId::new("001", "01")),
@@ -26754,6 +27733,157 @@ mod tests {
             direct_forwarding_path_availability: None,
         })
         .expect("build HandoverRequired")
+    }
+
+    /// **#876, TS 38.413 §9.3.1.8.** A HANDOVER REQUIRED naming an ng-eNB target
+    /// reaches the ng-eNB that named itself with the same PLMN, ngENB-ID alternative
+    /// and value at NG Setup. A macro, short macro and long macro id of equal value are
+    /// three different ng-eNBs, and a gNB whose id has that value is none of them.
+    /// The target is decoded from the HANDOVER REQUIRED's own bytes.
+    ///
+    /// REVERT-VERIFIED: with the pre-#876 lookup (gNB targets only, by value) every
+    /// ng-eNB target resolves to nothing, and the 20-bit-only codec reads the short
+    /// and long macro targets as other ids.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ng_enb_target_is_matched_by_plmn_length_and_value() {
+        use nextgcore_ngap::types::{GlobalRanNodeId, NgEnbId};
+        let server = capturing_ngap_server().await;
+        let (plmn, other_plmn) = (PlmnId::new("001", "01"), PlmnId::new("999", "70"));
+        let value = 0x1_2345u32;
+        let nodes: [(u64, Option<NgEnbId>, &PlmnId); 5] = [
+            (87_601, None, &plmn), // a gNB with the same value
+            (87_602, Some(NgEnbId::Macro(value)), &plmn),
+            (87_603, Some(NgEnbId::ShortMacro(value)), &plmn),
+            (87_604, Some(NgEnbId::LongMacro(value)), &plmn),
+            (87_605, Some(NgEnbId::ShortMacro(value)), &other_plmn),
+        ];
+        for (assoc, ng_enb_id, node_plmn) in &nodes {
+            seed_gnb_session(&server, *assoc).await;
+            let mut sessions = server.sessions.write().await;
+            let gnb = &mut sessions.get_mut(assoc).expect("seeded").gnb;
+            gnb.gnb_id = if ng_enb_id.is_none() { value } else { 0 };
+            gnb.gnb_id_presence = ng_enb_id.is_none();
+            gnb.gnb_id_len = 22;
+            gnb.ng_enb_id = *ng_enb_id;
+            gnb.plmn_id = (*node_plmn).clone();
+        }
+        let target_of = |global_ran_node_id: GlobalRanNodeId| {
+            let bytes = nextgcore_ngap::builder::build_handover_required(
+                &nextgcore_ngap::types::HandoverRequired {
+                    amf_ue_ngap_id: 1,
+                    ran_ue_ngap_id: 1,
+                    handover_type: nextgcore_ngap::types::HandoverType::Intra5gs,
+                    cause: nextgcore_ngap::types::Cause::RadioNetwork(
+                        nextgcore_ngap::types::CauseRadioNetwork::HandoverDesirableForRadioReason,
+                    ),
+                    target_id: nextgcore_ngap::types::TargetId::TargetRanNodeId {
+                        global_ran_node_id,
+                        selected_tai: nextgcore_ngap::types::TaiListItem {
+                            tai_plmn: plmn_id_to_ngap_bytes(&plmn),
+                            tai_tac: [0x00, 0x00, 0x01],
+                        },
+                    },
+                    pdu_session_list: vec![nextgcore_ngap::types::PduSessionResourceItemHoRqd {
+                        pdu_session_id: 1,
+                        transfer: vec![0x00],
+                    }],
+                    source_to_target_container: vec![0xAB; 4],
+                    direct_forwarding_path_availability: None,
+                },
+            )
+            .expect("build HandoverRequired");
+            match crate::ngap_asn1::decode_handover_required_asn1(&bytes) {
+                crate::ngap_asn1::NasTransportDecode::Proceed { message, .. } => message.target_id,
+                _ => panic!("HANDOVER REQUIRED decodes"),
+            }
+        };
+        let ng_enb = |id| GlobalRanNodeId::GlobalNgEnbId {
+            plmn_identity: plmn_id_to_ngap_bytes(&plmn),
+            ng_enb_id: id,
+        };
+        for (target, want) in [
+            (ng_enb(NgEnbId::Macro(value)), Some(87_602)),
+            (ng_enb(NgEnbId::ShortMacro(value)), Some(87_603)),
+            (ng_enb(NgEnbId::LongMacro(value)), Some(87_604)),
+            (
+                GlobalRanNodeId::GlobalNgEnbId {
+                    plmn_identity: plmn_id_to_ngap_bytes(&other_plmn),
+                    ng_enb_id: NgEnbId::ShortMacro(value),
+                },
+                Some(87_605),
+            ),
+            (ng_enb(NgEnbId::ShortMacro(value + 1)), None),
+            (
+                GlobalRanNodeId::GlobalGnbId {
+                    plmn_identity: plmn_id_to_ngap_bytes(&plmn),
+                    gnb_id: value,
+                    gnb_id_len: 22,
+                },
+                Some(87_601),
+            ),
+        ] {
+            let target_id = target_of(target.clone());
+            assert_eq!(
+                server.find_association_for_target(&target_id).await,
+                want,
+                "{target:?}"
+            );
+        }
+        // A gNB target of value 0 does not match the ng-eNBs, whose `gnb_id` is unset.
+        let zero = target_of(GlobalRanNodeId::GlobalGnbId {
+            plmn_identity: plmn_id_to_ngap_bytes(&plmn),
+            gnb_id: 0,
+            gnb_id_len: 22,
+        });
+        assert_eq!(server.find_association_for_target(&zero).await, None);
+    }
+
+    /// **#1140, TS 38.413 §9.3.1.6.** A handover's gNB target is matched on the whole
+    /// Global gNB ID the gNB gave at NG Setup -- PLMN, gNB ID and its bit length. Three
+    /// gNBs share the value: one at 22 bits in 001/01, one at 32 bits in 001/01, one at 22
+    /// bits in 999/70. Each target resolves to its own gNB, from real HANDOVER REQUIRED
+    /// bytes; a gNB that never completed NG Setup is never a target.
+    ///
+    /// REVERT-VERIFIED: matching on the value alone resolves all three targets to one gNB.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_gnb_target_is_matched_by_plmn_length_and_value() {
+        let server = test_ngap_server().await;
+        let (plmn, other_plmn) = (PlmnId::new("001", "01"), PlmnId::new("999", "70"));
+        let value = 0x2_1140u32;
+        for (assoc, len, node_plmn, presence) in [
+            (11_401u64, 22u8, &plmn, true),
+            (11_402, 32, &plmn, true),
+            (11_403, 22, &other_plmn, true),
+            (11_404, 24, &plmn, false), // no NG Setup completed
+        ] {
+            seed_gnb_session(&server, assoc).await;
+            let mut sessions = server.sessions.write().await;
+            let gnb = &mut sessions.get_mut(&assoc).expect("seeded").gnb;
+            gnb.gnb_id = value;
+            gnb.gnb_id_len = len;
+            gnb.gnb_id_presence = presence;
+            gnb.plmn_id = node_plmn.clone();
+        }
+        let target_of = |p: &PlmnId, len: u8| {
+            let bytes = handover_required_pdu_to(1, 1, p, value, len);
+            match crate::ngap_asn1::decode_handover_required_asn1(&bytes) {
+                crate::ngap_asn1::NasTransportDecode::Proceed { message, .. } => message.target_id,
+                _ => panic!("HANDOVER REQUIRED decodes"),
+            }
+        };
+        for (p, len, want) in [
+            (&plmn, 22u8, Some(11_401u64)),
+            (&plmn, 32, Some(11_402)),
+            (&other_plmn, 22, Some(11_403)),
+            (&other_plmn, 32, None),
+            (&plmn, 24, None),
+        ] {
+            assert_eq!(
+                server.find_association_for_target(&target_of(p, len)).await,
+                want,
+                "target {p:?} / {len} bits"
+            );
+        }
     }
 
     /// One N2 handover call a [`handover_smf`] saw (#964): `(sm_context_ref, state,
@@ -26792,7 +27922,8 @@ mod tests {
     /// `HANDOVER_PREP_FAIL` = [`ho_prep_fail_transfer_for`]. Everything else gets 204.
     /// A `hang-*` ref never answers PREPARING and a `hangcmd-*` ref never answers PREPARED
     /// (a blackholed SMF); a `late-*` PREPARING, a `latecmd-*` PREPARED and `hoState:
-    /// PROBE` take 300 ms; a `flaky-*` ref's first COMPLETED gets 500. Every call is
+    /// PROBE` take 300 ms, a `tardy-*` PREPARING and a `tardycmd-*` PREPARED 1.5 s; a
+    /// `flaky-*` ref's first COMPLETED gets 500. Every call is
     /// recorded when it completes. Keep the server alive.
     #[allow(clippy::type_complexity)]
     async fn handover_smf() -> (
@@ -26857,6 +27988,12 @@ mod tests {
                         || (state == "PREPARED" && sm_ref.starts_with("latecmd-"));
                     if state == "PROBE" || late {
                         tokio::time::sleep(Duration::from_millis(300)).await;
+                    }
+                    // Late by a margin a loaded suite cannot close (#1056).
+                    if (state == "PREPARING" && sm_ref.starts_with("tardy-"))
+                        || (state == "PREPARED" && sm_ref.starts_with("tardycmd-"))
+                    {
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
                     }
                     let flaky_first = state == "COMPLETED"
                         && sm_ref.starts_with("flaky-")
@@ -26966,16 +28103,16 @@ mod tests {
 
     /// Seed a gNB session whose Global gNB ID is `gnb_id`, so a HandoverRequired
     /// can name it as the target.
+    /// A gNB that completed NG Setup as Global gNB ID (001/01, `gnb_id`, 22 bits): the
+    /// target [`handover_required_pdu`] names (#1140 matches the whole ID).
     async fn seed_gnb_session_with_id(server: &NgapServer, association_id: u64, gnb_id: u32) {
         seed_gnb_session(server, association_id).await;
-        server
-            .sessions
-            .write()
-            .await
-            .get_mut(&association_id)
-            .expect("seeded")
-            .gnb
-            .gnb_id = gnb_id;
+        let mut sessions = server.sessions.write().await;
+        let gnb = &mut sessions.get_mut(&association_id).expect("seeded").gnb;
+        gnb.gnb_id = gnb_id;
+        gnb.gnb_id_len = 22;
+        gnb.gnb_id_presence = true;
+        gnb.plmn_id = PlmnId::new("001", "01");
     }
 
     /// **#742.** A handover preparation that ends without a HandoverNotify -- Cancel
@@ -27911,8 +29048,12 @@ mod tests {
     async fn a_blackholed_smf_does_not_hold_the_handover_past_the_wait() {
         let (_smf, smf_port, seen) = handover_smf().await;
         let mut server = capturing_ngap_server().await;
-        server.ho_preparation_wait = Duration::from_millis(150);
-        server.ho_command_wait = Duration::from_millis(150);
+        // #1056: waits no loaded suite can outlast; the test expires each deadline
+        // itself once the answering session is in. With 150 ms waits, PSI 1's answer
+        // came in after the PREPARING wait under load, and the HANDOVER REQUEST was
+        // already out at the "nothing before the wait has expired" check.
+        server.ho_preparation_wait = Duration::from_secs(30);
+        server.ho_command_wait = Duration::from_secs(30);
         let (source, target) = (97_970u64, 97_971u64);
         let gnb_t = 0x7_9701u32;
         seed_gnb_session_with_id(&server, source, 0x7_9700).await;
@@ -27948,7 +29089,11 @@ mod tests {
             take_sent_ngap(&mut server).is_empty(),
             "nothing before the wait has expired"
         );
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        server
+            .ho_preparations
+            .get_mut(&ue)
+            .expect("preparing")
+            .deadline = Instant::now();
         server.process_handover_deadlines().await;
         let sent = take_sent_ngap(&mut server);
         assert_eq!(sent.len(), 1, "{sent:?}");
@@ -27985,7 +29130,16 @@ mod tests {
             s.ho_commands.get(&ue).is_some_and(|c| !c.ready.is_empty())
         })
         .await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        server.process_handover_deadlines().await;
+        assert!(
+            take_sent_ngap(&mut server).is_empty(),
+            "no HANDOVER COMMAND before the wait has expired"
+        );
+        server
+            .ho_commands
+            .get_mut(&ue)
+            .expect("commanding")
+            .deadline = Instant::now();
         server.process_handover_deadlines().await;
         let sent = take_sent_ngap(&mut server);
         assert_eq!(sent.len(), 1, "{sent:?}");
@@ -28170,13 +29324,16 @@ mod tests {
     async fn a_late_session_is_cancelled_at_either_deadline() {
         let (_smf, smf_port, seen) = handover_smf().await;
         let mut server = capturing_ngap_server().await;
-        server.ho_preparation_wait = Duration::from_millis(100);
-        server.ho_command_wait = Duration::from_millis(100);
+        // #1056: the test expires each deadline itself once PSI 1 is in. With 100 ms
+        // waits and a 300 ms late answer, a loaded suite processed both answers in one
+        // batch: the step completed with both sessions and nothing was late.
+        server.ho_preparation_wait = Duration::from_secs(30);
+        server.ho_command_wait = Duration::from_secs(30);
         let (source, target) = (97_982u64, 97_983u64);
         let gnb_t = 0x7_9831u32;
         seed_gnb_session_with_id(&server, source, 0x7_9820).await;
         seed_gnb_session_with_id(&server, target, gnb_t).await;
-        for (n, refs) in [["on-1", "late-2"], ["on-1", "latecmd-2"]]
+        for (n, refs) in [["on-1", "tardy-2"], ["on-1", "tardycmd-2"]]
             .into_iter()
             .enumerate()
         {
@@ -28215,7 +29372,13 @@ mod tests {
                     || s.ho_commands.get(&ue).is_some_and(|c| !c.ready.is_empty())
             })
             .await;
-            tokio::time::sleep(Duration::from_millis(150)).await;
+            // PSI 2's wait is over.
+            if let Some(p) = server.ho_preparations.get_mut(&ue) {
+                p.deadline = Instant::now();
+            }
+            if let Some(c) = server.ho_commands.get_mut(&ue) {
+                c.deadline = Instant::now();
+            }
             server.process_handover_deadlines().await;
             let sent = take_sent_ngap(&mut server);
             assert_eq!(sent.len(), 1, "case {n}: {sent:?}");
@@ -28511,6 +29674,7 @@ mod tests {
             .handle_initial_context_setup_response(assoc, &ics_response_pdu(ue, 11, &[1], &[2]))
             .await
             .expect("handled");
+        drive_sbi(&mut server).await;
         assert!(server.up_active.contains(&(ue, 1)));
         assert!(!server.up_active.contains(&(ue, 2)), "the failed session");
         assert!(
@@ -29164,6 +30328,7 @@ mod tests {
             .await
             .expect("handled");
 
+        drive_sbi(&mut server).await;
         let calls = seen.lock().expect("seen").clone();
         assert_eq!(
             calls.len(),
@@ -29276,16 +30441,19 @@ mod tests {
         .expect("build modify indication");
         // Class 1 since #525: the handler now answers with a Modify Confirm, and
         // this test's association does not exist, so drive the answer directly.
-        let _ = server.modify_indication_answer(&indication).await;
-
-        let calls = seen.lock().expect("seen").clone();
+        let _ = server.modify_indication_answer(9401, &indication).await;
+        // #922 part 3: every relay runs off the NGAP task, concurrently across
+        // sessions: settle, and compare sorted.
+        drive_sbi(&mut server).await;
+        let mut calls = seen.lock().expect("seen").clone();
+        calls.sort();
         assert_eq!(
             calls,
             vec![
-                ("ref-mod".to_string(), vec![0x21]),
-                ("ref-rel".to_string(), vec![0x31]),
-                ("ref-notify".to_string(), vec![0x41]),
                 ("ref-ind".to_string(), vec![0x61]),
+                ("ref-mod".to_string(), vec![0x21]),
+                ("ref-notify".to_string(), vec![0x41]),
+                ("ref-rel".to_string(), vec![0x31]),
             ],
             "each procedure must relay its own container against its own SM \
              context ref, and the empty release transfer must relay nothing: {calls:?}"
@@ -29337,7 +30505,9 @@ mod tests {
                 .expect("handled");
         }
 
-        let calls = seen.lock().expect("seen").clone();
+        drive_sbi(&mut server).await;
+        let mut calls = seen.lock().expect("seen").clone();
+        calls.sort();
         assert_eq!(
             calls,
             vec![
@@ -29399,7 +30569,9 @@ mod tests {
                 .expect("handled");
         }
 
-        let calls = seen.lock().expect("seen").clone();
+        drive_sbi(&mut server).await;
+        let mut calls = seen.lock().expect("seen").clone();
+        calls.sort();
         assert_eq!(
             calls,
             vec![
@@ -29489,7 +30661,9 @@ mod tests {
             .await
             .expect("handled");
 
-        let calls = seen.lock().expect("seen").clone();
+        drive_sbi(&mut server).await;
+        let mut calls = seen.lock().expect("seen").clone();
+        calls.sort();
         assert_eq!(
             calls,
             vec![
@@ -29904,6 +31078,86 @@ mod tests {
         c.num_of_plmn_support = saved.1;
     }
 
+    /// **#876 review M1, TS 38.413 §8.7.1.1 / §9.3.1.8.** The #1039 replacement of a
+    /// node's previous association matches an ng-eNB by its ngENB-ID, not by the unset
+    /// `gnb_id`: ng-eNBs of one PLMN with different ids or id lengths all stay set up,
+    /// and only the same ng-eNB on a new association replaces its old one.
+    ///
+    /// REVERT-VERIFIED: matched on (PLMN, gnb_id, gnb_id_len) alone, each ng-eNB's setup
+    /// dropped and shut down the PLMN's other ng-eNBs.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ng_enbs_of_one_plmn_are_distinct_nodes_at_ng_setup() {
+        use nextgcore_ngap::types::{GlobalRanNodeId, NgEnbId};
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        serve_tai_999_70_tac_1();
+        let saved = {
+            let ctx_arc = crate::context::amf_self();
+            let mut c = ctx_arc.write().unwrap_or_else(|e| e.into_inner());
+            let saved = (c.plmn_support.len(), c.num_of_plmn_support);
+            c.plmn_support.push(crate::context::PlmnSupport {
+                plmn_id: PlmnId::new("999", "70"),
+                num_of_s_nssai: 1,
+                s_nssai: vec![crate::context::SNssai { sst: 1, sd: None }],
+            });
+            c.num_of_plmn_support = c.plmn_support.len();
+            saved
+        };
+        let mut server = capturing_ngap_server().await;
+        let setup_of = |id: NgEnbId| {
+            let mut ies = ngap_asn1::tests::baseline_request_ies();
+            ies.global_ran_node_id = GlobalRanNodeId::GlobalNgEnbId {
+                plmn_identity: [0x99, 0xf9, 0x07],
+                ng_enb_id: id,
+            };
+            nextgcore_ngap::builder::build_ng_setup_request(&ies).expect("build")
+        };
+        let nodes = [
+            (87_611u64, NgEnbId::Macro(0x1234)),
+            (87_612, NgEnbId::ShortMacro(0x1234)),
+            (87_613, NgEnbId::LongMacro(0x1234)),
+            (87_614, NgEnbId::Macro(0x5678)),
+        ];
+        for (assoc, id) in nodes {
+            seed_gnb_session(&server, assoc).await;
+            server
+                .handle_ng_setup_request(assoc, &setup_of(id))
+                .await
+                .expect("handled");
+        }
+        {
+            let sessions = server.sessions.read().await;
+            for (assoc, id) in nodes {
+                let gnb = &sessions.get(&assoc).expect("still set up").gnb;
+                assert!(gnb.state.ng_setup_success, "{id:?}");
+                assert_eq!(gnb.ng_enb_id, Some(id));
+            }
+        }
+        assert!(
+            server.closed_associations.is_empty(),
+            "no ng-eNB replaced another"
+        );
+
+        // The first ng-eNB again, on a new association: it replaces its old one only.
+        seed_gnb_session(&server, 87_615).await;
+        server
+            .handle_ng_setup_request(87_615, &setup_of(NgEnbId::Macro(0x1234)))
+            .await
+            .expect("handled");
+        assert_eq!(server.closed_associations, vec![87_611]);
+        let sessions = server.sessions.read().await;
+        assert!(!sessions.contains_key(&87_611));
+        for assoc in [87_612, 87_613, 87_614, 87_615] {
+            assert!(sessions.contains_key(&assoc), "{assoc} stays");
+        }
+        drop(sessions);
+        take_sent_ngap(&mut server);
+        let ctx_arc = crate::context::amf_self();
+        let mut c = ctx_arc.write().unwrap_or_else(|e| e.into_inner());
+        c.plmn_support.truncate(saved.0);
+        c.num_of_plmn_support = saved.1;
+    }
+
     /// **#978 review, m6, with #848's NG Reset.** A reset's DEACTIVATED supersedes the
     /// session's queued, non-durable work (a second reset's duplicate), but a queued
     /// handover CANCELLED is durable: the SMF still receives it, before the DEACTIVATED.
@@ -30015,22 +31269,20 @@ mod tests {
     /// #70's criterion 4, asserted where it can be: the switched list is built from the
     /// SMF's answers, so an unanswered session is ABSENT rather than echoed.
     ///
-    /// Driving `switched_list_from_smf` directly is what makes this testable — the
-    /// acknowledge is built and immediately sent, and this harness has no gNB association to
-    /// send to, so the assembled list is otherwise unobservable. Reverting the `None` arm to
-    /// push `request_transfer` makes this fail; before the extraction, nothing did.
+    /// Driving `switched_list_from_answers` directly keeps this a unit check of the list
+    /// itself; the handler-level path is covered by the #745 Path Switch tests. Reverting
+    /// the no-answer arm to push the request transfer makes this fail.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_switched_list_never_echoes_the_inbound_request_transfer() {
-        let server = test_ngap_server().await;
         let amf_ue_ngap_id = 78_005u64;
         let inbound_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        // No `sm_context_refs` entry, so the SMF cannot be addressed — the same arm a
-        // failed or empty answer takes.
-        assert!(server.sm_context_refs.is_empty());
-
-        let list = server
-            .switched_list_from_smf(amf_ue_ngap_id, &[(1u8, inbound_bytes.clone())])
-            .await;
+        // PSI 1: no SM context, so no answer; PSI 2: the SMF failed; PSI 3: it answered
+        // with no N2 SM information. None of them is switched.
+        let mut answers = HashMap::from([
+            (2u8, JoinAnswer::N2Updated(Err("refused".to_string()))),
+            (3u8, JoinAnswer::N2Updated(Ok((None, Vec::new())))),
+        ]);
+        let list = NgapServer::switched_list_from_answers(amf_ue_ngap_id, &[1, 2, 3], &mut answers);
 
         assert!(
             list.is_empty(),
@@ -32200,6 +33452,7 @@ mod tests {
             .insert((amf_ue_ngap_id, 1), ("127.0.0.1".to_string(), smf_port));
         ngap.sent_ngap = Some(Vec::new());
         let _ = ngap.handle_path_switch_request(2, &pdu).await;
+        drive_sbi(&mut ngap).await;
         let sent = take_sent_ngap(&mut ngap);
         assert_eq!(sent.len(), 1, "{sent:?}");
         assert_eq!(
@@ -35025,6 +36278,144 @@ mod tests {
         }
     }
 
+    /// **#923.** The gNB asks for a UE's release; the AMF's UE Context Release
+    /// Command is answered by a Release Complete the AMF cannot use (undecodable,
+    /// or a not-comprehended IE marked reject, TS 38.413 §10.3.4.2). It is the only
+    /// Release Command outstanding on the association, so it is the one answered:
+    /// the UE goes CM-IDLE under the mobile reachable timer (TS 24.501 §5.3.7), as
+    /// the matching Complete would have put it.
+    ///
+    /// REVERT-VERIFIED: without the outstanding-command match the UE stays
+    /// CM-CONNECTED and unsupervised.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unusable_release_complete_answers_the_only_outstanding_command() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = capturing_ngap_server().await;
+        let assoc = 99_231u64;
+        let valid = nextgcore_ngap::builder::build_ue_context_release_complete(
+            &nextgcore_ngap::types::UeContextReleaseComplete {
+                amf_ue_ngap_id: 7_923_999,
+                ran_ue_ngap_id: 9,
+            },
+        )
+        .expect("encode");
+        let reject_ie = crate::ngap_asn1::tests::with_unknown_ie(&valid, 9_999, 0x00);
+        for (n, unusable) in [vec![0x20, 0x29, 0x00], reject_ie].into_iter().enumerate() {
+            let (ue, ran) = (7_923_001u64 + n as u64, 31 + n as u32);
+            let mut state = UeNasContext::new(ue, ran, assoc, false);
+            state.registered = true;
+            ngap.ue_auth_state.insert(ue, state);
+            ngap.handle_ue_context_release(assoc, &release_request_pdu(ue, ran))
+                .await
+                .expect("handled");
+            assert!(
+                !take_sent_ngap(&mut ngap).is_empty(),
+                "case {n}: the Release Command went out"
+            );
+            assert!(!ngap.ue_auth_state.get(ue).unwrap().is_cm_idle());
+
+            ngap.handle_ue_context_release_complete(assoc, &unusable)
+                .await
+                .expect("handled");
+
+            let s = ngap.ue_auth_state.get(ue).expect("UE kept");
+            assert!(s.is_cm_idle(), "case {n}: the release is complete");
+            assert_eq!(
+                s.reachability.map(|r| r.phase),
+                Some(ReachabilityPhase::MobileReachable),
+                "case {n}: the mobile reachable timer runs"
+            );
+            assert!(ngap.outstanding_releases.is_empty());
+            ngap.forget_ue(ue);
+        }
+    }
+
+    /// **#923.** With two Release Commands outstanding on the association, an
+    /// unusable Release Complete cannot say which it answers, and completes
+    /// neither. Nor does a Complete that never comes leave them CM-CONNECTED: past
+    /// [`RELEASE_COMPLETE_GUARD`] each release is completed locally (CM-IDLE, mobile
+    /// reachable timer). A UE whose matching Complete came is not touched again.
+    ///
+    /// REVERT-VERIFIED: without `process_release_guards` in `process_local_timers`
+    /// both UEs stay CM-CONNECTED; without the cleanup in `forget_ue` the forgotten
+    /// UE keeps its entry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_release_command_with_no_usable_complete_is_completed_at_the_guard() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = capturing_ngap_server().await;
+        let assoc = 99_232u64;
+        let ues = [(7_923_101u64, 41u32), (7_923_102, 42), (7_923_103, 43)];
+        for (ue, ran) in ues {
+            let mut state = UeNasContext::new(ue, ran, assoc, false);
+            state.registered = true;
+            ngap.ue_auth_state.insert(ue, state);
+            ngap.handle_ue_context_release(assoc, &release_request_pdu(ue, ran))
+                .await
+                .expect("handled");
+        }
+        let _ = take_sent_ngap(&mut ngap);
+        // The third UE's Complete comes; then one that names no UE.
+        ngap.handle_ue_context_release_complete(assoc, &release_complete_pdu(ues[2].0, Some(43)))
+            .await
+            .expect("handled");
+        let third_deadline = ngap
+            .ue_auth_state
+            .get(ues[2].0)
+            .and_then(|s| s.reachability)
+            .map(|r| r.deadline)
+            .expect("supervised");
+        ngap.handle_ue_context_release_complete(assoc, &[0x20, 0x29, 0x00])
+            .await
+            .expect("handled");
+        for (ue, _) in &ues[..2] {
+            assert!(
+                !ngap.ue_auth_state.get(*ue).unwrap().is_cm_idle(),
+                "UE {ue}: an ambiguous Complete completes nothing"
+            );
+        }
+        // Before the guard, nothing either.
+        ngap.process_local_timers().await.expect("timers");
+        assert_eq!(ngap.outstanding_releases.len(), 2);
+
+        // A UE forgotten meanwhile (e.g. de-registered) takes its entry with it.
+        let gone = 7_923_104u64;
+        let mut state = UeNasContext::new(gone, 44, assoc, false);
+        state.registered = true;
+        ngap.ue_auth_state.insert(gone, state);
+        ngap.handle_ue_context_release(assoc, &release_request_pdu(gone, 44))
+            .await
+            .expect("handled");
+        assert!(ngap.outstanding_releases.contains_key(&(assoc, gone)));
+        ngap.forget_ue(gone);
+        assert!(!ngap.outstanding_releases.contains_key(&(assoc, gone)));
+
+        // The NGAP task's local timers run the guard.
+        for r in ngap.outstanding_releases.values_mut() {
+            r.deadline = Instant::now();
+        }
+        ngap.process_local_timers().await.expect("timers");
+        for (ue, _) in &ues[..2] {
+            let s = ngap.ue_auth_state.get(*ue).expect("UE kept");
+            assert!(s.is_cm_idle(), "UE {ue}: completed locally");
+            assert_eq!(
+                s.reachability.map(|r| r.phase),
+                Some(ReachabilityPhase::MobileReachable)
+            );
+        }
+        assert!(ngap.outstanding_releases.is_empty());
+        assert_eq!(
+            ngap.ue_auth_state
+                .get(ues[2].0)
+                .and_then(|s| s.reachability)
+                .map(|r| r.deadline),
+            Some(third_deadline),
+            "the UE whose Complete came is not re-armed"
+        );
+        for (ue, _) in ues {
+            ngap.forget_ue(ue);
+        }
+    }
+
     /// **#417 stage 4.** A UE Context Release Complete listing its released PDU
     /// sessions supervises the ONE UE it names. The hand-written parser refused it (the
     /// list is not comprehended there and carries criticality reject), and the handler's
@@ -37831,6 +39222,7 @@ mod fivegs_to_eps_tests {
             crate::n26_path::PendingForwardRelocation {
                 amf_ue_ngap_id: UE,
                 dl_count_used: 0x1234_56AB,
+                peer: "127.0.0.1:2123".parse().unwrap(),
             },
         );
         let n26 = crate::n26_path::N26Server::open("127.0.0.1:0".parse().unwrap(), 1)
@@ -37905,6 +39297,208 @@ mod fivegs_to_eps_tests {
         assert_eq!(
             out.procedure_code.0,
             nextgcore_ngap_gen::generated::ID_HANDOVER_PREPARATION
+        );
+    }
+
+    /// A HANDOVER CANCEL (TS 38.413 §9.2.3.11) from the source gNB for [`UE`].
+    fn handover_cancel() -> Vec<u8> {
+        nextgcore_ngap::builder::build_handover_cancel(&nextgcore_ngap::types::HandoverCancel {
+            amf_ue_ngap_id: UE,
+            ran_ue_ngap_id: RAN_UE,
+            cause: nextgcore_ngap::types::Cause::RadioNetwork(
+                nextgcore_ngap::types::CauseRadioNetwork::TngrelocprepExpiry,
+            ),
+        })
+        .expect("build HandoverCancel")
+    }
+
+    /// A source-gNB NGAP server holding [`UE`], with its NGAP egress captured.
+    async fn source_server() -> NgapServer {
+        let mut ngap = NgapServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            SctpBackend::Userspace,
+            mpsc::channel(64).0,
+        )
+        .await
+        .unwrap();
+        ngap.sent_ngap = Some(Vec::new());
+        let mut state = UeNasContext::new(UE, RAN_UE, SOURCE_ASSOC, false);
+        state.amf_ue.supi = Some("imsi-001010000009630".to_string());
+        ngap.ue_auth_state.insert(UE, state);
+        ngap
+    }
+
+    /// #963, TS 23.502 §4.11.1.2.3: the source gNB cancels a 5GS→EPS handover.
+    ///
+    /// - While the Forward Relocation Request is unanswered: the MME it went to is the one
+    ///   to tell, at TEID 0, and the late response then continues nothing (no HANDOVER
+    ///   COMMAND after the HANDOVER CANCEL ACKNOWLEDGE).
+    /// - Once accepted: the MME is told at the TEID its response gave, and the answer
+    ///   queued for the NGAP layer is dropped.
+    ///
+    /// Revert-verified: without the cancel the MME is told nothing, and the accepted
+    /// case still sends the source gNB a HANDOVER COMMAND.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_handover_cancel_ends_the_5gs_to_eps_preparation() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::test_support::init_context();
+        let n26 = crate::n26_path::N26Server::open("127.0.0.1:0".parse().unwrap(), 1)
+            .await
+            .expect("N26");
+        let mme = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mme_addr = mme.local_addr().unwrap();
+
+        // Unanswered.
+        crate::n26_path::clear_forward_relocation_state_for_test();
+        let _ = crate::n26_path::drain_fivegs_to_eps_answers();
+        crate::n26_path::record_pending_forward_relocation_for_test(
+            0x9631,
+            crate::n26_path::PendingForwardRelocation {
+                amf_ue_ngap_id: UE,
+                dl_count_used: 7,
+                peer: mme_addr,
+            },
+        );
+        let mut ngap = source_server().await;
+        ngap.handle_handover_cancel(SOURCE_ASSOC, &handover_cancel())
+            .await
+            .expect("handled");
+        assert_eq!(
+            crate::n26_path::take_fivegs_to_eps_relocation(UE),
+            None,
+            "the cancel took the preparation"
+        );
+        // The MME's late accept continues nothing.
+        mme.send_to(
+            &response(0x9631, 16, Some(&[0x03, 0xC0, 0xFE])),
+            n26.local_addr(),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(crate::n26_path::drain_fivegs_to_eps_answers().is_empty());
+
+        // Accepted, the answer still queued for the NGAP layer.
+        crate::n26_path::clear_forward_relocation_state_for_test();
+        crate::n26_path::record_pending_forward_relocation_for_test(
+            0x9632,
+            crate::n26_path::PendingForwardRelocation {
+                amf_ue_ngap_id: UE,
+                dl_count_used: 7,
+                peer: mme_addr,
+            },
+        );
+        mme.send_to(
+            &response(0x9632, 16, Some(&[0x03, 0xC0, 0xFE])),
+            n26.local_addr(),
+        )
+        .await
+        .unwrap();
+        for _ in 0..100 {
+            if crate::n26_path::forward_relocation_answered_for_test(UE) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            ngap.cancel_fivegs_to_eps_relocation(UE).await,
+            Some(crate::n26_path::FivegsToEpsCancel {
+                peer: mme_addr,
+                mme_teid: Some(0x0476_BBBB),
+            }),
+            "an accepted relocation names the MME's TEID"
+        );
+        assert!(!crate::n26_path::forward_relocation_answered_for_test(UE));
+        assert!(
+            crate::n26_path::drain_fivegs_to_eps_answers().is_empty(),
+            "the queued answer is dropped with it"
+        );
+        let sent = std::mem::take(ngap.sent_ngap.as_mut().unwrap());
+        assert_eq!(
+            sent.len(),
+            1,
+            "only the HANDOVER CANCEL ACKNOWLEDGE: {sent:?}"
+        );
+    }
+
+    /// The next GTPv2-C message on `sock`, within five seconds.
+    async fn recv_gtp(sock: &tokio::net::UdpSocket) -> Gtp2Message {
+        let mut buf = vec![0u8; 2048];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
+            .await
+            .expect("a datagram")
+            .unwrap();
+        Gtp2Message::decode(&mut bytes::Bytes::copy_from_slice(&buf[..len])).unwrap()
+    }
+
+    /// #963, TS 29.274 §7.3.16 / §7.6: the Relocation Cancel Request on the wire to a
+    /// stand-in MME. Header TEID the MME's, IMSI in TBCD; retransmitted after T3 while
+    /// unanswered, and not after the Relocation Cancel Response.
+    ///
+    /// Revert-verified: without the retransmission loop the MME sees one copy; closing by
+    /// sequence number alone lets the stranger's response stop it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relocation_cancel_request_is_retransmitted_until_answered() {
+        let n26 = crate::n26_path::N26Server::open("127.0.0.1:0".parse().unwrap(), 1)
+            .await
+            .expect("N26");
+        let mme = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let cancel = crate::n26_path::FivegsToEpsCancel {
+            peer: mme.local_addr().unwrap(),
+            mme_teid: Some(0x0000_0963),
+        };
+        let seq = n26
+            .send_relocation_cancel(cancel, Some("001010000009630"))
+            .await;
+
+        let mut buf = vec![0u8; 2048];
+        let first = recv_gtp(&mme).await;
+        assert_eq!(
+            first.header.message_type,
+            Gtp2MessageType::RelocationCancelRequest as u8
+        );
+        assert_eq!(first.header.teid, Some(0x0000_0963));
+        assert_eq!(first.header.sequence_number, seq);
+        let imsi = first.get_ie(Gtp2IeType::Imsi as u8, 0).expect("IMSI");
+        assert_eq!(
+            imsi.value.as_ref(),
+            crate::n26_path::string_to_bcd("001010000009630").as_slice()
+        );
+        // Unanswered: T3 later it comes again, the same request.
+        let second = recv_gtp(&mme).await;
+        assert_eq!(second.encode(), first.encode());
+
+        let mut answer = Gtp2Message::new(Gtp2Header::new(
+            Gtp2MessageType::RelocationCancelResponse as u8,
+            0,
+            seq,
+        ));
+        answer.add_ie(Gtp2CauseIe::new(16).to_ie(0));
+        // #1143 review: the same sequence number from another address is not this
+        // transaction's answer (TS 29.274 §7.6: a transaction is peer and sequence).
+        let stranger = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        stranger
+            .send_to(&answer.encode(), n26.local_addr())
+            .await
+            .unwrap();
+        let third = recv_gtp(&mme).await;
+        assert_eq!(
+            third.encode(),
+            first.encode(),
+            "a stranger's response closes nothing: retransmitted again"
+        );
+        assert!(crate::n26_path::relocation_cancel_outstanding(
+            cancel.peer,
+            seq
+        ));
+        mme.send_to(&answer.encode(), n26.local_addr())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(3500), mme.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "answered: no further retransmission"
         );
     }
 

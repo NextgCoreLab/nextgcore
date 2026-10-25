@@ -1768,7 +1768,7 @@ mod tests {
             "the PDN connection must be established"
         );
         let fteid =
-            Gtp2FTeidIe::decode(&resp.get_ie(Gtp2IeType::FTeid as u8, 0).unwrap().value).unwrap();
+            Gtp2FTeidIe::decode(&resp.get_ie(Gtp2IeType::FTeid as u8, 1).unwrap().value).unwrap();
         let pco = resp
             .get_ie(Gtp2IeType::Pco as u8, 0)
             .map(|ie| ie.value.to_vec());

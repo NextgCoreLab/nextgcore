@@ -336,6 +336,12 @@ pub enum PolicyError {
     Rejected { status: u16, detail: String },
     /// Transport-level failure (PCF unreachable / timeout)
     Transport(String),
+    /// The PCF is overloaded (TS 29.500 §5.2.7.2: 429, or 503 with Retry-After): the
+    /// request may be retried, after `retry_after` when the PCF said (#874).
+    Overloaded {
+        status: u16,
+        retry_after: Option<Duration>,
+    },
 }
 
 impl std::fmt::Display for PolicyError {
@@ -346,6 +352,13 @@ impl std::fmt::Display for PolicyError {
                 write!(f, "PCF rejected SM policy: status={status} ({detail})")
             }
             PolicyError::Transport(e) => write!(f, "PCF transport failure: {e}"),
+            PolicyError::Overloaded {
+                status,
+                retry_after,
+            } => write!(
+                f,
+                "PCF overloaded: status={status}, Retry-After {retry_after:?}"
+            ),
         }
     }
 }
@@ -1023,8 +1036,25 @@ pub async fn sm_policy_delete(pcf: &PcfEndpoint, sm_policy_id: &str) -> Result<(
         .post_json(&path, &serde_json::json!({}))
         .await
         .map_err(|e| PolicyError::Transport(e.to_string()))?;
+    // #874: TS 29.500 §5.2.7.2 makes 429, and 503 with Retry-After, an overload the
+    // consumer may retry; Retry-After (RFC 9110 §10.2.3) is honoured when it is
+    // delta-seconds.
+    let retry_after = resp
+        .http
+        .get_header("retry-after")
+        .or_else(|| resp.http.get_header("Retry-After"))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_secs);
     match resp.status {
         204 | 200 => Ok(()),
+        429 => Err(PolicyError::Overloaded {
+            status: 429,
+            retry_after,
+        }),
+        503 if retry_after.is_some() => Err(PolicyError::Overloaded {
+            status: 503,
+            retry_after,
+        }),
         s => Err(PolicyError::Rejected {
             status: s,
             detail: resp.http.content.clone().unwrap_or_default(),

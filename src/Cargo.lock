@@ -3314,6 +3314,7 @@ dependencies = [
  "nextgcore-ngap-gen",
  "nextgcore-pfcp",
  "nextgcore-sbi",
+ "nextgcore-sgwcd",
  "p256",
  "proptest",
  "serde",

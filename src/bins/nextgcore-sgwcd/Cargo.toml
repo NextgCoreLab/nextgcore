@@ -10,6 +10,12 @@ description = "NextGCore SGWC (Serving Gateway Control Plane)"
 name = "nextgcore-sgwcd"
 path = "src/main.rs"
 
+# #1113: the SGW-C is also a library, so smfd's tests can parse the PGW-C's S5/S8
+# messages with this crate's real codecs and handlers (as amfd is for its peers).
+[lib]
+name = "nextgcore_sgwcd"
+path = "src/lib.rs"
+
 [dependencies]
 nextgcore-core = { workspace = true }
 nextgcore-gtp = { workspace = true }
