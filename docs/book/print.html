@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-c642a377.js";
+            window.path_to_searchindex_js = "searchindex-d0d8730f.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-be5dca41.js"></script>
@@ -938,23 +938,23 @@ snapshots three things on every mutation and reloads them at boot:</p>
 fsynced + <code>0600</code> writes, and a snapshot that cannot be read is <strong>never
 overwritten</strong>. An unreadable snapshot, or one written by a newer build,
 <strong>fails startup</strong> rather than coming up with an empty pool.</p>
-<p><strong>The restored PFCP session map is checked, not trusted.</strong> The snapshot also
-carries the last Recovery Time Stamp each UPF reported. That value is seeded
-back into each <code>PfcpClient</code> before the association loop starts, so the first
-Association Setup after a reload compares the UPF’s reported stamp against it:
-a changed stamp means the UPF restarted while the SMF was down, and the restored
-sessions are flushed (TS 29.244 §5.22, TS 23.527 §4.2) instead of being believed
-in. An unchanged stamp means they are genuinely still valid. A UPF named by
-hostname has its stamp kept under the configured <code>host:port</code>, lower-cased and
-without a trailing dot, so it is found again after the UPF moves (#722). A stamp
-a pre-#722 snapshot kept under the UPF’s address is read once, moved to the name,
-and the address entry removed. When both entries exist, the address entry wins:
-an older binary wrote it after this one retired it (an upgrade, a rollback, then
-a re-upgrade), so it is the newer record. After the seed, every address-keyed
-stamp that no literal UPF of this SMF owns is dropped, so an orphan cannot win
-over a correct name key later (#930). Nothing is dropped while a hostname UPF
-has not resolved at boot, since its stamp may still be under its old address; the
-next boot prunes. A UPF hostname must name exactly one UPF.
+<p><strong>The restored PFCP session map is checked, not trusted.</strong> The first
+Association Setup after a reload asks each UPF to retain the PFCP sessions this
+SMF holds on it (PFCP Session Retention Information, TS 29.244 §6.2.6.2.1). A
+UPF that confirms it (PSREI, §8.2.134) keeps them, and so does the SMF. A UPF
+that does not, because it restarted while the SMF was down or does not support
+retention, has its restored sessions flushed and released (TS 23.527 §4.2)
+instead of believed in. A UPF’s Recovery Time Stamp is not part of the snapshot
+(#966). TS 23.007 §19A keeps it in volatile memory and has the Association
+Setup’s stamp ignored, so each association’s first Heartbeat stamp is its
+baseline, and the stamp is forgotten when the association goes down. A UPF that
+restarts after the Association Setup is caught by a changed Heartbeat stamp, or
+by cause 72 “No established PFCP Association” on a session request; either
+tears the association down and releases its sessions. A snapshot written before
+#966 may still hold <code>upfRecoveryTimeStamps</code>: it is ignored on load and dropped
+at the next write. A UPF named by hostname is identified by the configured
+<code>host:port</code>, lower-cased and without a trailing dot, so it is found again after
+the UPF moves (#722). A UPF hostname must name exactly one UPF.
 The snapshot also records which UPF each session was established on, by the
 same key, so in a UPF pool a restored session keeps signalling the UPF that
 holds it, and that UPF can still report on it (#1031). A session whose UPF is no
@@ -974,7 +974,7 @@ path is unchanged.</li>
 <li>cause 72 from any other host;</li>
 <li>cause 66 or 67, with the Offending IE, when the Node ID, the Node Report Type or a report the type announces is missing.</li>
 </ul>
-<p>The SMF learns which sessions use which peer from its own accepted Session Establishment and Modification Requests: the Outer Header Creation address of each FAR. The durable snapshot carries this (<code>farPeers</code>), so a restored session is still found.</p>
+<p>The SMF learns which sessions use which peer from its own accepted Session Establishment and Modification Requests: the Outer Header Creation address of each FAR. The durable snapshot carries this (<code>farPeers</code>), so a restored session is still found. A change of a session’s peers (a Service Request, a handover) is written to the snapshot within 200 ms rather than at once: changes in that window are coalesced into one write, and a graceful shutdown writes what is pending. An SMF killed inside the window restores the peers from before it (#1075).</p>
 <ul>
 <li><strong>Path failure:</strong> the UP connection of every session with a forwarding FAR toward the peer is deactivated (TS 23.502 §4.3.7, steps 4 and 5). Those FARs are set to BUFF|NOCP, so downlink data is buffered and reported and the UE is paged. For an N3 FAR, the NG-RAN gets an N2-only PDU Session Resource Release Command (cause transport-resource-unavailable) through the AMF.</li>
 <li><strong>Still down after <code>SMF_UP_PATH_FAILURE_HOLD_SECS</code></strong> (TS 23.007 §20.3.1):
