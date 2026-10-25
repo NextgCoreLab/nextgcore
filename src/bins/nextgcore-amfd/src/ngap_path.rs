@@ -23762,12 +23762,20 @@ mod tests {
     }
 
     fn service_request_initial_ue(nas: Vec<u8>) -> Vec<u8> {
+        service_request_initial_ue_with(nas, nextgcore_ngap::types::RrcEstablishmentCause::MtAccess)
+    }
+
+    /// [`service_request_initial_ue`] with the RRC Establishment Cause `cause` (#1222).
+    fn service_request_initial_ue_with(
+        nas: Vec<u8>,
+        cause: nextgcore_ngap::types::RrcEstablishmentCause,
+    ) -> Vec<u8> {
         nextgcore_ngap::builder::build_initial_ue_message(
             &nextgcore_ngap::types::InitialUeMessage {
                 ran_ue_ngap_id: 512,
                 nas_pdu: nas,
                 user_location_info: test_user_location(0x74, 0x0005_1200),
-                rrc_establishment_cause: nextgcore_ngap::types::RrcEstablishmentCause::MtAccess,
+                rrc_establishment_cause: cause,
                 ue_context_request: None,
                 allowed_nssai: Vec::new(),
             },
@@ -23834,6 +23842,67 @@ mod tests {
             "#518: the session moved with the UE to its new NGAP ID"
         );
         assert!(!guard.sess_find_by_psi(new_id, 5).unwrap().paging.ongoing);
+    }
+
+    /// #1222: an idle UE's SERVICE REQUEST brings the RRC Establishment Cause of its new
+    /// connection. With mps-PriorityAccess (access identity 1, TS 24.501 Table 4.5.6.1)
+    /// the UE's CreateSMContext carries `3gpp-Sbi-Message-Priority` (TS 23.502
+    /// §4.3.2.2.1 step 3). The UE's next connection, with mo-Data, clears the flag:
+    /// the cause describes each access attempt, so its next CreateSMContext carries no
+    /// header. The header is read off the request the create path builds, from the
+    /// moved UE's own state.
+    ///
+    /// REVERT-VERIFIED: without the call on the Service Request path, the first
+    /// assertion fails. With the flag set only, never cleared (`|=`), the second fails.
+    #[tokio::test]
+    async fn an_idle_service_request_sets_and_clears_the_priority_access() {
+        use nextgcore_ngap::types::RrcEstablishmentCause as C;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let (old_id, first, second) = (12_220_101u64, 12_220_102u64, 12_220_103u64);
+        ngap.ue_auth_state
+            .insert(old_id, idle_registered_ue(old_id));
+        let header = |ngap: &NgapServer, id: u64| {
+            let state = ngap.ue_auth_state.get(id).expect("the UE is held");
+            crate::sbi_path::build_create_sm_context_request_for_test(&build_sm_context_identity(
+                Some(&state),
+                None,
+            ))
+            .http
+            .get_header(nextgcore_sbi::constants::custom_header::MESSAGE_PRIORITY)
+            .cloned()
+        };
+
+        for (id, cause, expected) in [
+            (
+                first,
+                C::MpsPriorityAccess,
+                Some(crate::sbi_path::DEFAULT_PRIORITY_MESSAGE_PRIORITY.to_string()),
+            ),
+            (second, C::MoData, None),
+        ] {
+            ngap.forced_amf_ue_ngap_id = Some(id);
+            let pdu = service_request_initial_ue_with(
+                protected_service_request([0; 4], old_id as u32),
+                cause,
+            );
+            let _ = ngap.handle_initial_ue_message(1, &pdu).await;
+            let moved = ngap
+                .ue_auth_state
+                .get(id)
+                .unwrap_or_else(|| panic!("{cause:?}: the UE moved to its new NGAP ID"));
+            assert!(!moved.is_cm_idle(), "{cause:?}: connected");
+            assert_eq!(header(&ngap, id), expected, "{cause:?}");
+            // The connection ends; the UE is CM-IDLE again for its next access.
+            ngap.ue_auth_state.with_mut(id, |s| {
+                s.cm_idle = true;
+                s.reachability = Some(Reachability {
+                    phase: ReachabilityPhase::MobileReachable,
+                    deadline: Instant::now() + Duration::from_secs(3600),
+                });
+            });
+        }
+        ngap.ue_auth_state.remove(second);
     }
 
     /// #648: after a Service Request from CM-IDLE moves the UE to its new AMF UE NGAP

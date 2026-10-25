@@ -1199,11 +1199,39 @@ pub fn priority_message_priority(ue: &crate::context::AmfUe) -> Option<u8> {
     if !(ue.priority_access_cause || ue.priority_subscription) {
         return None;
     }
-    let configured = std::env::var("AMF_PRIORITY_MESSAGE_PRIORITY")
-        .ok()
-        .and_then(|v| v.trim().parse::<u8>().ok())
-        .filter(|v| *v <= 31);
-    Some(configured.unwrap_or(DEFAULT_PRIORITY_MESSAGE_PRIORITY))
+    static CONFIGURED: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    Some(*CONFIGURED.get_or_init(|| {
+        message_priority_from(
+            std::env::var("AMF_PRIORITY_MESSAGE_PRIORITY")
+                .ok()
+                .as_deref(),
+        )
+    }))
+}
+
+/// The value of `AMF_PRIORITY_MESSAGE_PRIORITY`: 0-31, else the default, with a warning
+/// for a value that is set but unusable (#1222 review).
+fn message_priority_from(value: Option<&str>) -> u8 {
+    let Some(value) = value else {
+        return DEFAULT_PRIORITY_MESSAGE_PRIORITY;
+    };
+    match value.trim().parse::<u8>() {
+        Ok(v) if v <= 31 => v,
+        _ => {
+            log::warn!(
+                "AMF_PRIORITY_MESSAGE_PRIORITY={value:?} is not an SBI message priority \
+                 (0-31, TS 29.500 §6.8.4); using {DEFAULT_PRIORITY_MESSAGE_PRIORITY}"
+            );
+            DEFAULT_PRIORITY_MESSAGE_PRIORITY
+        }
+    }
+}
+
+/// Tests (#1222): the CreateSMContext request the create path sends for `identity`, with
+/// fixed session parameters.
+#[cfg(test)]
+pub(crate) fn build_create_sm_context_request_for_test(identity: &SmContextIdentity) -> SbiRequest {
+    build_create_sm_context_request(5, 1, None, None, &[0x2E], false, identity)
 }
 
 /// TS 29.502 §6.1.2.3.2 custom header.
@@ -5391,6 +5419,23 @@ mod tests {
                 expected,
                 "{body}"
             );
+        }
+    }
+
+    /// #1222 review: `AMF_PRIORITY_MESSAGE_PRIORITY` takes 0-31 (TS 29.500 §6.8.4);
+    /// anything else is the default.
+    #[test]
+    fn the_configured_message_priority_is_0_to_31_or_the_default() {
+        let d = DEFAULT_PRIORITY_MESSAGE_PRIORITY;
+        for (value, expected) in [
+            (None, d),
+            (Some("0"), 0),
+            (Some(" 31 "), 31),
+            (Some("32"), d),
+            (Some("-1"), d),
+            (Some("high"), d),
+        ] {
+            assert_eq!(message_priority_from(value), expected, "{value:?}");
         }
     }
 
