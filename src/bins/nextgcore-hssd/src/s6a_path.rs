@@ -570,10 +570,6 @@ fn peer_connected(dest_host: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Sweep the outstanding-request table once: retransmit what is due, abandon what
-/// has exhausted its attempts (#56, RFC 6733 §5.5.4).
-///
-/// Returns `(retransmitted, abandoned)`.
 /// `msg` as it goes out again (#1021): a request already transmitted at least
 /// once carries the T (potentially retransmitted) flag, so the MME can detect
 /// a duplicate by its End-to-End Identifier and Origin-Host (RFC 6733 §3,
@@ -586,6 +582,10 @@ fn for_resend(mut msg: DiameterMessage, attempts: u32) -> DiameterMessage {
     msg
 }
 
+/// Sweep the outstanding-request table once: retransmit what is due, abandon what
+/// has exhausted its attempts (#56, RFC 6733 §5.5.4).
+///
+/// Returns `(retransmitted, abandoned)`.
 pub fn sweep_pending_requests() -> (usize, usize) {
     let period = std::time::Duration::from_secs(HSS_INITIATED_RETRANSMIT_SECS);
     let now = std::time::Instant::now();
