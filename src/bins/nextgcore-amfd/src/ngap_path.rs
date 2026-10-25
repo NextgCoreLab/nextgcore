@@ -2462,7 +2462,14 @@ impl NgapServer {
 
         // Process request and build response with locks held, then release before sending.
         // `accepted` names the Global RAN Node ID of an accepted setup (#1039).
-        let mut accepted: Option<(crate::context::PlmnId, u32, u8)> = None;
+        // #876: with the ngENB-ID of an ng-eNB, whose `gnb_id` and length are unset.
+        #[allow(clippy::type_complexity)]
+        let mut accepted: Option<(
+            crate::context::PlmnId,
+            u32,
+            u8,
+            Option<nextgcore_ngap::types::NgEnbId>,
+        )> = None;
         let response_data: Option<Vec<u8>> = {
             let mut sessions = self.sessions.write().await;
             if let Some(session) = sessions.get_mut(&association_id) {
@@ -2487,6 +2494,7 @@ impl NgapServer {
                             session.gnb.plmn_id.clone(),
                             session.gnb.gnb_id,
                             session.gnb.gnb_id_len,
+                            session.gnb.ng_enb_id,
                         ));
 
                         // Build NG Setup Response with proper ASN.1 APER encoding,
@@ -2534,8 +2542,10 @@ impl NgapServer {
         // other association the same Global RAN Node ID still holds (the gNB restarted
         // and came back on a new one). Done before the response, so nothing the gNB sends
         // after it can name a connection of its previous incarnation.
-        if let Some((plmn, gnb_id, gnb_id_len)) = accepted {
-            // The whole Global RAN Node ID: PLMN, gNB ID and its length (§9.3.1.6).
+        if let Some((plmn, gnb_id, gnb_id_len, ng_enb_id)) = accepted {
+            // The whole Global RAN Node ID: PLMN, gNB ID and its length (§9.3.1.6), or
+            // for an ng-eNB its ngENB-ID alternative and value (§9.3.1.8, #876). A gNB
+            // never matches an ng-eNB, and two ng-eNBs of one PLMN are two nodes.
             let stale: Vec<u64> = self
                 .sessions
                 .read()
@@ -2545,6 +2555,7 @@ impl NgapServer {
                     **assoc != association_id
                         && s.gnb.gnb_id == gnb_id
                         && s.gnb.gnb_id_len == gnb_id_len
+                        && s.gnb.ng_enb_id == ng_enb_id
                         && s.gnb.plmn_id == plmn
                 })
                 .map(|(assoc, _)| *assoc)
@@ -11733,17 +11744,10 @@ impl NgapServer {
             nextgcore_ngap::types::GlobalRanNodeId::GlobalNgEnbId {
                 plmn_identity,
                 ng_enb_id,
-            } => {
-                // TS 29.571 `NgeNbId` is a PREFIXED string, not a bare hex value:
-                // `^(MacroNGeNB-[A-Fa-f0-9]{5}|LMacroNGeNB-[A-Fa-f0-9]{6}|SMacroNGeNB-[A-Fa-f0-9]{5})$`
-                // (`TS29571_CommonData.yaml:1458`). TS 38.413 §9.3.1.8's macro form
-                // is 20 bits = 5 nibbles, which is the `MacroNGeNB-` arm.
-                let plmn = crate::ngap_asn1::decode_plmn_id(plmn_identity);
-                serde_json::json!({
-                    "plmnId": { "mcc": plmn.mcc(), "mnc": plmn.mnc() },
-                    "ngeNbId": format!("MacroNGeNB-{ng_enb_id:05X}"),
-                })
-            }
+            } => crate::namf_server::ng_enb_id_json(
+                &crate::ngap_asn1::decode_plmn_id(plmn_identity),
+                ng_enb_id,
+            ),
         };
 
         // A PWS indication carries no Message Identifier / Serial Number: its IE
@@ -16952,21 +16956,35 @@ impl NgapServer {
         &self,
         target_id: &nextgcore_ngap::types::TargetId,
     ) -> Option<u64> {
-        let target_gnb_id = match target_id {
-            nextgcore_ngap::types::TargetId::TargetRanNodeId {
-                global_ran_node_id, ..
-            } => match global_ran_node_id {
-                nextgcore_ngap::types::GlobalRanNodeId::GlobalGnbId { gnb_id, .. } => {
-                    Some(*gnb_id as u64)
-                }
-                _ => None,
-            },
-            nextgcore_ngap::types::TargetId::TargetGlobalNgEnbId { .. } => None,
-        }?;
+        use nextgcore_ngap::types::GlobalRanNodeId;
+        let nextgcore_ngap::types::TargetId::TargetRanNodeId {
+            global_ran_node_id, ..
+        } = target_id
+        else {
+            // targeteNB-ID names an E-UTRAN eNB, which has no NG association.
+            return None;
+        };
         let sessions = self.sessions.read().await;
         sessions
             .iter()
-            .find(|(_, s)| s.gnb.gnb_id as u64 == target_gnb_id)
+            .find(|(_, s)| match global_ran_node_id {
+                // A gNB target never matches an ng-eNB, whose `gnb_id` is unset (#876).
+                // TODO(#1140): a gNB target still matches on `gnb_id` alone, not on its
+                // PLMN and bit length (TS 38.413 §9.3.1.6).
+                GlobalRanNodeId::GlobalGnbId { gnb_id, .. } => {
+                    s.gnb.ng_enb_id.is_none() && s.gnb.gnb_id == *gnb_id
+                }
+                // #876, TS 38.413 §9.3.1.8: (PLMN, ngENB-ID alternative, value), as the
+                // ng-eNB named itself at NG Setup. Two ids of equal value and different
+                // lengths are different ng-eNBs.
+                GlobalRanNodeId::GlobalNgEnbId {
+                    plmn_identity,
+                    ng_enb_id,
+                } => {
+                    s.gnb.ng_enb_id == Some(*ng_enb_id)
+                        && s.gnb.plmn_id == crate::ngap_asn1::decode_plmn_id(plmn_identity)
+                }
+            })
             .map(|(assoc, _)| *assoc)
     }
 
@@ -27208,6 +27226,107 @@ mod tests {
         .expect("build HandoverRequired")
     }
 
+    /// **#876, TS 38.413 §9.3.1.8.** A HANDOVER REQUIRED naming an ng-eNB target
+    /// reaches the ng-eNB that named itself with the same PLMN, ngENB-ID alternative
+    /// and value at NG Setup. A macro, short macro and long macro id of equal value are
+    /// three different ng-eNBs, and a gNB whose id has that value is none of them.
+    /// The target is decoded from the HANDOVER REQUIRED's own bytes.
+    ///
+    /// REVERT-VERIFIED: with the pre-#876 lookup (gNB targets only, by value) every
+    /// ng-eNB target resolves to nothing, and the 20-bit-only codec reads the short
+    /// and long macro targets as other ids.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ng_enb_target_is_matched_by_plmn_length_and_value() {
+        use nextgcore_ngap::types::{GlobalRanNodeId, NgEnbId};
+        let server = capturing_ngap_server().await;
+        let (plmn, other_plmn) = (PlmnId::new("001", "01"), PlmnId::new("999", "70"));
+        let value = 0x1_2345u32;
+        let nodes: [(u64, Option<NgEnbId>, &PlmnId); 5] = [
+            (87_601, None, &plmn), // a gNB with the same value
+            (87_602, Some(NgEnbId::Macro(value)), &plmn),
+            (87_603, Some(NgEnbId::ShortMacro(value)), &plmn),
+            (87_604, Some(NgEnbId::LongMacro(value)), &plmn),
+            (87_605, Some(NgEnbId::ShortMacro(value)), &other_plmn),
+        ];
+        for (assoc, ng_enb_id, node_plmn) in &nodes {
+            seed_gnb_session(&server, *assoc).await;
+            let mut sessions = server.sessions.write().await;
+            let gnb = &mut sessions.get_mut(assoc).expect("seeded").gnb;
+            gnb.gnb_id = if ng_enb_id.is_none() { value } else { 0 };
+            gnb.ng_enb_id = *ng_enb_id;
+            gnb.plmn_id = (*node_plmn).clone();
+        }
+        let target_of = |global_ran_node_id: GlobalRanNodeId| {
+            let bytes = nextgcore_ngap::builder::build_handover_required(
+                &nextgcore_ngap::types::HandoverRequired {
+                    amf_ue_ngap_id: 1,
+                    ran_ue_ngap_id: 1,
+                    handover_type: nextgcore_ngap::types::HandoverType::Intra5gs,
+                    cause: nextgcore_ngap::types::Cause::RadioNetwork(
+                        nextgcore_ngap::types::CauseRadioNetwork::HandoverDesirableForRadioReason,
+                    ),
+                    target_id: nextgcore_ngap::types::TargetId::TargetRanNodeId {
+                        global_ran_node_id,
+                        selected_tai: nextgcore_ngap::types::TaiListItem {
+                            tai_plmn: plmn_id_to_ngap_bytes(&plmn),
+                            tai_tac: [0x00, 0x00, 0x01],
+                        },
+                    },
+                    pdu_session_list: vec![nextgcore_ngap::types::PduSessionResourceItemHoRqd {
+                        pdu_session_id: 1,
+                        transfer: vec![0x00],
+                    }],
+                    source_to_target_container: vec![0xAB; 4],
+                    direct_forwarding_path_availability: None,
+                },
+            )
+            .expect("build HandoverRequired");
+            match crate::ngap_asn1::decode_handover_required_asn1(&bytes) {
+                crate::ngap_asn1::NasTransportDecode::Proceed { message, .. } => message.target_id,
+                _ => panic!("HANDOVER REQUIRED decodes"),
+            }
+        };
+        let ng_enb = |id| GlobalRanNodeId::GlobalNgEnbId {
+            plmn_identity: plmn_id_to_ngap_bytes(&plmn),
+            ng_enb_id: id,
+        };
+        for (target, want) in [
+            (ng_enb(NgEnbId::Macro(value)), Some(87_602)),
+            (ng_enb(NgEnbId::ShortMacro(value)), Some(87_603)),
+            (ng_enb(NgEnbId::LongMacro(value)), Some(87_604)),
+            (
+                GlobalRanNodeId::GlobalNgEnbId {
+                    plmn_identity: plmn_id_to_ngap_bytes(&other_plmn),
+                    ng_enb_id: NgEnbId::ShortMacro(value),
+                },
+                Some(87_605),
+            ),
+            (ng_enb(NgEnbId::ShortMacro(value + 1)), None),
+            (
+                GlobalRanNodeId::GlobalGnbId {
+                    plmn_identity: plmn_id_to_ngap_bytes(&plmn),
+                    gnb_id: value,
+                    gnb_id_len: 22,
+                },
+                Some(87_601),
+            ),
+        ] {
+            let target_id = target_of(target.clone());
+            assert_eq!(
+                server.find_association_for_target(&target_id).await,
+                want,
+                "{target:?}"
+            );
+        }
+        // A gNB target of value 0 does not match the ng-eNBs, whose `gnb_id` is unset.
+        let zero = target_of(GlobalRanNodeId::GlobalGnbId {
+            plmn_identity: plmn_id_to_ngap_bytes(&plmn),
+            gnb_id: 0,
+            gnb_id_len: 22,
+        });
+        assert_eq!(server.find_association_for_target(&zero).await, None);
+    }
+
     /// One N2 handover call a [`handover_smf`] saw (#964): `(sm_context_ref, state,
     /// n2SmInfoType, n2SmInfo, cause)`, where `state` is the `hoState`, or
     /// `up:<upCnxState>` for a user-plane update.
@@ -30361,6 +30480,86 @@ mod tests {
         for id in [ue_a, ue_b] {
             server.forget_ue(id);
         }
+        let ctx_arc = crate::context::amf_self();
+        let mut c = ctx_arc.write().unwrap_or_else(|e| e.into_inner());
+        c.plmn_support.truncate(saved.0);
+        c.num_of_plmn_support = saved.1;
+    }
+
+    /// **#876 review M1, TS 38.413 §8.7.1.1 / §9.3.1.8.** The #1039 replacement of a
+    /// node's previous association matches an ng-eNB by its ngENB-ID, not by the unset
+    /// `gnb_id`: ng-eNBs of one PLMN with different ids or id lengths all stay set up,
+    /// and only the same ng-eNB on a new association replaces its old one.
+    ///
+    /// REVERT-VERIFIED: matched on (PLMN, gnb_id, gnb_id_len) alone, each ng-eNB's setup
+    /// dropped and shut down the PLMN's other ng-eNBs.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ng_enbs_of_one_plmn_are_distinct_nodes_at_ng_setup() {
+        use nextgcore_ngap::types::{GlobalRanNodeId, NgEnbId};
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        serve_tai_999_70_tac_1();
+        let saved = {
+            let ctx_arc = crate::context::amf_self();
+            let mut c = ctx_arc.write().unwrap_or_else(|e| e.into_inner());
+            let saved = (c.plmn_support.len(), c.num_of_plmn_support);
+            c.plmn_support.push(crate::context::PlmnSupport {
+                plmn_id: PlmnId::new("999", "70"),
+                num_of_s_nssai: 1,
+                s_nssai: vec![crate::context::SNssai { sst: 1, sd: None }],
+            });
+            c.num_of_plmn_support = c.plmn_support.len();
+            saved
+        };
+        let mut server = capturing_ngap_server().await;
+        let setup_of = |id: NgEnbId| {
+            let mut ies = ngap_asn1::tests::baseline_request_ies();
+            ies.global_ran_node_id = GlobalRanNodeId::GlobalNgEnbId {
+                plmn_identity: [0x99, 0xf9, 0x07],
+                ng_enb_id: id,
+            };
+            nextgcore_ngap::builder::build_ng_setup_request(&ies).expect("build")
+        };
+        let nodes = [
+            (87_611u64, NgEnbId::Macro(0x1234)),
+            (87_612, NgEnbId::ShortMacro(0x1234)),
+            (87_613, NgEnbId::LongMacro(0x1234)),
+            (87_614, NgEnbId::Macro(0x5678)),
+        ];
+        for (assoc, id) in nodes {
+            seed_gnb_session(&server, assoc).await;
+            server
+                .handle_ng_setup_request(assoc, &setup_of(id))
+                .await
+                .expect("handled");
+        }
+        {
+            let sessions = server.sessions.read().await;
+            for (assoc, id) in nodes {
+                let gnb = &sessions.get(&assoc).expect("still set up").gnb;
+                assert!(gnb.state.ng_setup_success, "{id:?}");
+                assert_eq!(gnb.ng_enb_id, Some(id));
+            }
+        }
+        assert!(
+            server.closed_associations.is_empty(),
+            "no ng-eNB replaced another"
+        );
+
+        // The first ng-eNB again, on a new association: it replaces its old one only.
+        seed_gnb_session(&server, 87_615).await;
+        server
+            .handle_ng_setup_request(87_615, &setup_of(NgEnbId::Macro(0x1234)))
+            .await
+            .expect("handled");
+        assert_eq!(server.closed_associations, vec![87_611]);
+        let sessions = server.sessions.read().await;
+        assert!(!sessions.contains_key(&87_611));
+        for assoc in [87_612, 87_613, 87_614, 87_615] {
+            assert!(sessions.contains_key(&assoc), "{assoc} stays");
+        }
+        drop(sessions);
+        take_sent_ngap(&mut server);
         let ctx_arc = crate::context::amf_self();
         let mut c = ctx_arc.write().unwrap_or_else(|e| e.into_inner());
         c.plmn_support.truncate(saved.0);

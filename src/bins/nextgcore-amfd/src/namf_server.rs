@@ -3388,6 +3388,26 @@ pub(crate) fn global_ran_node_id_json(
     })
 }
 
+/// A TS 29.571 `GlobalRanNodeId` for an ng-eNB (#876). `NgeNbId` is a prefixed hex
+/// string, one prefix per TS 38.413 §9.3.1.8 ngENB-ID alternative
+/// (`TS29571_CommonData.yaml:1456-1458`): `MacroNGeNB-` (20 bits, 5 nibbles),
+/// `SMacroNGeNB-` (18 bits, 5 nibbles) and `LMacroNGeNB-` (21 bits, 6 nibbles).
+pub(crate) fn ng_enb_id_json(
+    plmn: &crate::context::PlmnId,
+    ng_enb_id: &nextgcore_ngap::types::NgEnbId,
+) -> Value {
+    use nextgcore_ngap::types::NgEnbId;
+    let value = match *ng_enb_id {
+        NgEnbId::Macro(v) => format!("MacroNGeNB-{v:05X}"),
+        NgEnbId::ShortMacro(v) => format!("SMacroNGeNB-{v:05X}"),
+        NgEnbId::LongMacro(v) => format!("LMacroNGeNB-{v:06X}"),
+    };
+    json!({
+        "plmnId": { "mcc": plmn.mcc(), "mnc": plmn.mnc() },
+        "ngeNbId": value,
+    })
+}
+
 /// Content-Id of the binary N1 (LPP) part inside an N1MessageNotify multipart
 /// body (referenced from `n1MessageContainer.n1MessageContent.contentId`).
 pub(crate) const N1_MESSAGE_NOTIFY_CONTENT_ID: &str = "n1-lpp";
@@ -13457,6 +13477,24 @@ mod tests {
                 expected.len()
             );
             assert_eq!(json["gNbId"]["bitLength"].as_u64(), Some(len as u64));
+        }
+    }
+
+    /// #876: an ng-eNB's `NgeNbId` carries the prefix of its ngENB-ID alternative and
+    /// that alternative's nibble count (`TS29571_CommonData.yaml:1456-1458`); before,
+    /// every ng-eNB rendered as `MacroNGeNB-`.
+    #[test]
+    fn an_ng_enb_id_renders_with_its_alternatives_prefix() {
+        use nextgcore_ngap::types::NgEnbId;
+        let plmn = crate::context::PlmnId::new("001", "01");
+        for (id, expected) in [
+            (NgEnbId::Macro(0xABC), "MacroNGeNB-00ABC"),
+            (NgEnbId::ShortMacro(0x34B89), "SMacroNGeNB-34B89"),
+            (NgEnbId::LongMacro(0xABC), "LMacroNGeNB-000ABC"),
+        ] {
+            let json = super::ng_enb_id_json(&plmn, &id);
+            assert_eq!(json["ngeNbId"].as_str(), Some(expected), "{id:?}");
+            assert_eq!(json["plmnId"]["mcc"].as_str(), Some("001"));
         }
     }
 

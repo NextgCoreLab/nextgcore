@@ -605,6 +605,9 @@ pub fn decode_ng_setup_request_asn1(data: &[u8]) -> NgSetupRequestDecode {
         }
         GlobalRANNodeID::GlobalNgENB_ID(ng_enb) => {
             request.plmn_id = decode_plmn_id(&ng_enb.plmn_identity.0);
+            // #876: kept with its length, so a handover naming this ng-eNB as its
+            // target finds it (TS 38.413 §9.3.1.8).
+            request.ng_enb_id = ng_enb_id_variant(&ng_enb.ng_enb_id);
         }
         other => {
             log::error!("NG Setup Request from an unsupported RAN node type: {other:?}");
@@ -4050,18 +4053,6 @@ fn bits_value(bits: &bitvec::prelude::BitSlice<u8, bitvec::prelude::Msb0>) -> u3
     bits.iter().fold(0u32, |v, bit| (v << 1) | u32::from(*bit))
 }
 
-/// A generated NgENB-ID's value (macro 20, short macro 18 or long macro 21 bits).
-/// `None` for the uninhabitable choice extension.
-fn ng_enb_id_value(id: &ngap_gen::NgENB_ID) -> Option<u32> {
-    Some(match id {
-        ngap_gen::NgENB_ID::MacroNgENB_ID(b) => bits_value(&b.0),
-        ngap_gen::NgENB_ID::ShortMacroNgENB_ID(b) => bits_value(&b.0),
-        ngap_gen::NgENB_ID::LongMacroNgENB_ID(b) => bits_value(&b.0),
-        #[allow(unreachable_patterns)]
-        _ => return None,
-    })
-}
-
 /// A generated NgENB-ID as the hand-written CHOICE, keeping which length the
 /// gNB named (TS 38.413 §9.3.1.8); `None` for a choice extension.
 fn ng_enb_id_variant(id: &ngap_gen::NgENB_ID) -> Option<nextgcore_ngap::types::NgEnbId> {
@@ -4094,7 +4085,7 @@ fn hand_written_global_ran_node_id(id: &ngap_gen::GlobalRANNodeID) -> Option<Glo
         }
         ngap_gen::GlobalRANNodeID::GlobalNgENB_ID(enb) => Some(GlobalRanNodeId::GlobalNgEnbId {
             plmn_identity: enb.plmn_identity.0.as_slice().try_into().ok()?,
-            ng_enb_id: ng_enb_id_value(&enb.ng_enb_id)?,
+            ng_enb_id: ng_enb_id_variant(&enb.ng_enb_id)?,
         }),
         _ => None,
     }
@@ -6992,8 +6983,12 @@ pub(crate) mod tests {
                     result.gnb_id = *gnb_id;
                     result.gnb_id_len = *gnb_id_len;
                 }
-                GlobalRanNodeId::GlobalNgEnbId { plmn_identity, .. } => {
+                GlobalRanNodeId::GlobalNgEnbId {
+                    plmn_identity,
+                    ng_enb_id,
+                } => {
                     result.plmn_id = decode_plmn_id(plmn_identity);
+                    result.ng_enb_id = Some(*ng_enb_id);
                 }
             }
 
@@ -7691,7 +7686,7 @@ pub(crate) mod tests {
     }
 
     /// A well-formed NG Setup Request from a gNB serving TAC 1 in 999/70.
-    fn baseline_request_ies() -> NgSetupRequest {
+    pub(crate) fn baseline_request_ies() -> NgSetupRequest {
         NgSetupRequest {
             global_ran_node_id: GlobalRanNodeId::GlobalGnbId {
                 plmn_identity: [0x99, 0xf9, 0x07],
@@ -7783,12 +7778,19 @@ pub(crate) mod tests {
             };
             requests.push(ies);
         }
-        let mut ng_enb = baseline_request_ies();
-        ng_enb.global_ran_node_id = GlobalRanNodeId::GlobalNgEnbId {
-            plmn_identity: [0x00, 0xf1, 0x10],
-            ng_enb_id: 0xabcde,
-        };
-        requests.push(ng_enb);
+        // #876: all three ngENB-ID lengths.
+        for id in [
+            nextgcore_ngap::types::NgEnbId::Macro(0xabcde),
+            nextgcore_ngap::types::NgEnbId::ShortMacro(0x34b89),
+            nextgcore_ngap::types::NgEnbId::LongMacro(0x1abcde),
+        ] {
+            let mut ng_enb = baseline_request_ies();
+            ng_enb.global_ran_node_id = GlobalRanNodeId::GlobalNgEnbId {
+                plmn_identity: [0x00, 0xf1, 0x10],
+                ng_enb_id: id,
+            };
+            requests.push(ng_enb);
+        }
         for drx in [
             PagingDrx::V32,
             PagingDrx::V64,
@@ -7864,6 +7866,30 @@ pub(crate) mod tests {
         for (i, data) in inputs.iter().enumerate().take(requests.len()) {
             assert!(proceed_or_none(data).is_some(), "request {i} decodes");
         }
+    }
+
+    /// #876, TS 38.413 §9.3.1.8: an ng-eNB's NG SETUP REQUEST is decoded with its
+    /// ngENB-ID alternative and value, so the AMF can tell two ng-eNBs of equal value
+    /// and different lengths apart; a gNB's has none.
+    #[test]
+    fn an_ng_enb_setup_keeps_its_ng_enb_id_length() {
+        use nextgcore_ngap::types::NgEnbId;
+        for id in [
+            NgEnbId::Macro(0x1234),
+            NgEnbId::ShortMacro(0x1234),
+            NgEnbId::LongMacro(0x1234),
+        ] {
+            let mut ies = baseline_request_ies();
+            ies.global_ran_node_id = GlobalRanNodeId::GlobalNgEnbId {
+                plmn_identity: [0x00, 0xf1, 0x10],
+                ng_enb_id: id,
+            };
+            let data = nextgcore_ngap::builder::build_ng_setup_request(&ies).expect("build");
+            let request = proceed_or_none(&data).expect("decodes");
+            assert_eq!(request.ng_enb_id, Some(id), "{id:?}");
+        }
+        let request = proceed_or_none(&baseline_request()).expect("decodes");
+        assert_eq!(request.ng_enb_id, None, "a gNB");
     }
 
     /// §10.3.4.2 "Ignore IE": a not-comprehended IE marked ignore is dropped,

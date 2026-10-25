@@ -3141,6 +3141,9 @@ pub struct AmfGnb {
     /// 32 until NG Setup completes; a node that never completed NG Setup cannot
     /// be a notification source.
     pub gnb_id_len: u8,
+    /// The ngENB-ID, with its length, of a node that set up NG as an ng-eNB
+    /// (TS 38.413 §9.3.1.8, #876); `None` for a gNB.
+    pub ng_enb_id: Option<nextgcore_ngap::types::NgEnbId>,
     /// PLMN ID (received from gNB)
     pub plmn_id: PlmnId,
     /// gNB state
@@ -3166,6 +3169,7 @@ impl AmfGnb {
             gnb_id_presence: false,
             gnb_id: 0,
             gnb_id_len: 32,
+            ng_enb_id: None,
             plmn_id: PlmnId::default(),
             state: GnbState::default(),
             max_num_of_ostreams: 0,
