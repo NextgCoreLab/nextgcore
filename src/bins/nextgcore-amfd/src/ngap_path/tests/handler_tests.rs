@@ -3833,6 +3833,215 @@ pub(super) fn registration_accept_of(
     registration_accept_of_plain(&nas[7..])
 }
 
+/// PLMN-assigned UE radio capability ID, Version ID 05 (TS 23.003 §29.2).
+const RACS_ID_889: [u8; 7] = [0x01, 0x05, 0x00, 0x00, 0x00, 0x00, 0x10];
+
+/// Whether a (NEA0) protected NAS PDU carries the UE radio capability ID IE
+/// (IEI 0x67, TS 24.501 §9.11.3.68) with [`RACS_ID_889`].
+fn carries_racs_id_889(nas: &[u8]) -> bool {
+    let mut ie = vec![0x67, RACS_ID_889.len() as u8];
+    ie.extend_from_slice(&RACS_ID_889);
+    nas.windows(ie.len()).any(|w| w == ie.as_slice())
+}
+
+/// A registered RACS UE that [`update_registration_request`] names, with a
+/// UCMF-assigned ID it has not been told yet, sent it in a CONFIGURATION UPDATE
+/// COMMAND now pending under T3555.
+async fn racs_ue_with_cuc_in_flight(server: &mut NgapServer, ue: u64, ran: u32) {
+    registered_ue_with_guti(server, ue, ran);
+    server.ue_auth_state.with_mut(ue, |s| {
+        s.amf_ue.racs_supported = true;
+        s.amf_ue.ue_radio_capability_id = Some(RACS_ID_889.to_vec());
+        s.amf_ue.ue_radio_capability_id_known_to_ue = false;
+    });
+    server
+        .send_racs_configuration_update(ASSOC, ue, ran)
+        .await
+        .expect("handled");
+    let sent = take_sent_ngap(server);
+    assert!(
+        sent.iter().any(|(_, p)| matches!(decode_sent(p),
+            Sent::DownlinkNas { nas_pdu, .. } if carries_racs_id_889(&nas_pdu))),
+        "the CUC carries the ID: {sent:?}"
+    );
+    let s = server.ue_auth_state.get(ue).expect("UE");
+    assert_eq!(s.retx.as_ref().map(|r| r.timer), Some(NasProcTimer::T3555));
+    assert!(
+        !s.amf_ue.ue_radio_capability_id_known_to_ue,
+        "sent is not delivered"
+    );
+}
+
+/// #889, TS 24.501 §5.4.4.6 c): a mobility REGISTRATION REQUEST during a RACS
+/// CONFIGURATION UPDATE COMMAND aborts the command, and the registration goes on.
+/// The ID was never acknowledged, so the REGISTRATION ACCEPT carries it, and the
+/// REGISTRATION COMPLETE delivers it (§5.5.1.3.4).
+///
+/// Revert-verified: committing the ID when the CUC is built leaves the Accept
+/// without IE 0x67; without T3550 on the update Accept the Complete delivers
+/// nothing; without the TMSI check the Complete adopts a zero 5G-TMSI.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_registration_aborting_a_racs_cuc_carries_the_id_in_the_accept() {
+    let _racs = crate::racs::tests::guard();
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_889_001u64, 81);
+    racs_ue_with_cuc_in_flight(&mut server, ue, ran).await;
+
+    // The 5GMM capability IE with the RACS bit (octet 4 bit 8, §9.11.3.1).
+    let mut rr = update_registration_request(
+        crate::gmm_build::registration_type::MOBILITY_UPDATING,
+        None,
+        None,
+    );
+    rr.extend_from_slice(&[0x10, 0x02, 0x00, 0x80]);
+    let _ = server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &ue_protect(&rr, 0)))
+        .await;
+    let accepts: Vec<Vec<u8>> = take_sent_ngap(&mut server)
+        .into_iter()
+        .filter_map(|(_, p)| match decode_sent(&p) {
+            Sent::DownlinkNas { nas_pdu, .. }
+                if dl_nas_message_type(&nas_pdu) == Some(message_type::REGISTRATION_ACCEPT) =>
+            {
+                Some(nas_pdu)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(accepts.len(), 1, "one Registration Accept");
+    assert!(
+        carries_racs_id_889(&accepts[0]),
+        "the Accept carries IE 0x67: {:02x?}",
+        accepts[0]
+    );
+    let s = server.ue_auth_state.get(ue).expect("UE");
+    assert_eq!(s.retx.as_ref().map(|r| r.timer), Some(NasProcTimer::T3550));
+    assert!(!s.amf_ue.ue_radio_capability_id_known_to_ue);
+
+    let guti = s.amf_ue.current_guti.clone();
+
+    let complete = ue_protect(&[0x7E, 0x00, message_type::REGISTRATION_COMPLETE], 1);
+    server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &complete))
+        .await
+        .expect("Registration Complete handled");
+    let s = server.ue_auth_state.get(ue).expect("UE");
+    assert!(
+        s.amf_ue.ue_radio_capability_id_known_to_ue,
+        "the Registration Complete delivers it"
+    );
+    assert!(s.retx.is_none(), "T3550 stopped");
+    assert_eq!(
+        s.amf_ue.current_guti, guti,
+        "an Accept with no new 5G-GUTI leaves the UE's 5G-GUTI as it was"
+    );
+    assert!(
+        configuration_update_commands_in(take_sent_ngap(&mut server)).is_empty(),
+        "and no further command is needed"
+    );
+    server.forget_ue(ue);
+}
+
+/// #889 review, TS 24.501 §5.5.1.3.4: an update Accept carrying a 5G-GUTI (as every
+/// one does once the UE's registration set `next_guti`), with no RACS IE, is supervised
+/// by T3550 too, and the REGISTRATION COMPLETE stops it.
+///
+/// Revert-verified: arming T3550 only for RACS IEs leaves the slot empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_update_accept_with_a_5g_guti_arms_t3550() {
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_889_003u64, 83);
+    registered_ue_with_guti(&mut server, ue, ran);
+    server.ue_auth_state.with_mut(ue, |s| {
+        s.amf_ue.next_guti = s.amf_ue.current_guti.clone();
+    });
+    let rr = update_registration_request(
+        crate::gmm_build::registration_type::MOBILITY_UPDATING,
+        None,
+        None,
+    );
+    let _ = server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &ue_protect(&rr, 0)))
+        .await;
+    let sent = take_sent_ngap(&mut server);
+    let accept = sent
+        .iter()
+        .find_map(|(_, p)| match decode_sent(p) {
+            Sent::DownlinkNas { nas_pdu, .. }
+                if dl_nas_message_type(&nas_pdu) == Some(message_type::REGISTRATION_ACCEPT) =>
+            {
+                Some(nas_pdu)
+            }
+            _ => None,
+        })
+        .expect("a Registration Accept");
+    assert!(
+        registration_accept_of(&accept).guti.is_some(),
+        "the Accept carries the 5G-GUTI"
+    );
+    let s = server.ue_auth_state.get(ue).expect("UE");
+    assert_eq!(s.retx.as_ref().map(|r| r.timer), Some(NasProcTimer::T3550));
+
+    let complete = ue_protect(&[0x7E, 0x00, message_type::REGISTRATION_COMPLETE], 1);
+    server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &complete))
+        .await
+        .expect("Registration Complete handled");
+    assert!(server.ue_auth_state.get(ue).expect("UE").retx.is_none());
+    server.forget_ue(ue);
+}
+
+/// #889, TS 24.501 §5.4.4.6 a): a RACS CONFIGURATION UPDATE COMMAND whose T3555
+/// exhausts is aborted, and the ID stays to be delivered: the next command
+/// carries it.
+///
+/// Revert-verified: committing the ID when the CUC is built sends nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_racs_cuc_whose_t3555_exhausts_leaves_the_id_owed() {
+    let _racs = crate::racs::tests::guard();
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_889_002u64, 82);
+    racs_ue_with_cuc_in_flight(&mut server, ue, ran).await;
+
+    server.ue_auth_state.with_mut(ue, |s| {
+        let r = s.retx.as_mut().expect("T3555");
+        r.retries = u32::MAX / 2;
+        r.deadline = Instant::now();
+    });
+    server.process_nas_timers().await.expect("timers");
+    let s = server.ue_auth_state.get(ue).expect("UE kept");
+    assert!(
+        s.retx.is_none(),
+        "T3555 exhausted: the procedure is aborted"
+    );
+    assert!(!s.amf_ue.ue_radio_capability_id_known_to_ue);
+    let _ = take_sent_ngap(&mut server);
+
+    server
+        .send_racs_configuration_update(ASSOC, ue, ran)
+        .await
+        .expect("handled");
+    let cucs = configuration_update_commands_in(take_sent_ngap(&mut server));
+    assert_eq!(cucs.len(), 1, "the ID goes again");
+    assert!(carries_racs_id_889(&cucs[0]), "{:02x?}", cucs[0]);
+    server.forget_ue(ue);
+}
+
+/// The CONFIGURATION UPDATE COMMANDs among `sent`, as their NAS PDUs.
+fn configuration_update_commands_in(sent: Vec<(u64, Vec<u8>)>) -> Vec<Vec<u8>> {
+    sent.into_iter()
+        .filter_map(|(_, pdu)| match decode_sent(&pdu) {
+            Sent::DownlinkNas { nas_pdu, .. }
+                if dl_nas_message_type(&nas_pdu)
+                    == Some(message_type::CONFIGURATION_UPDATE_COMMAND) =>
+            {
+                Some(nas_pdu)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// #759: a connected UE's mobility update says PSI 1 is active and has uplink
 /// data, and PSI 2 is inactive. The AMF does the following:
 /// - releases PSI 2 at the SMF;

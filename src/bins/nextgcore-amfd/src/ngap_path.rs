@@ -3566,10 +3566,18 @@ impl NgapServer {
                         })
                     ) {
                         state.retx = None;
+                        // #889: the UE radio capability ID (or its deletion) the
+                        // Accept carried is valid now (TS 24.501 §5.5.1.2.4).
+                        crate::racs::commit_in_flight(&mut state.amf_ue);
                     }
                     state.registered = true;
-                    state.amf_ue.current_guti = state.amf_ue.next_guti.clone();
-                    state.amf_ue.current_m_tmsi = Some(state.amf_ue.next_guti.tmsi);
+                    // #889: an update Accept with no new 5G-GUTI (`next_guti` TMSI 0,
+                    // #653) can still be acknowledged, for its UE radio capability ID
+                    // (§5.5.1.3.4). The UE keeps its 5G-GUTI then.
+                    if state.amf_ue.next_guti.tmsi != 0 {
+                        state.amf_ue.current_guti = state.amf_ue.next_guti.clone();
+                        state.amf_ue.current_m_tmsi = Some(state.amf_ue.next_guti.tmsi);
+                    }
                     log::info!(
                         "[{}] Registration Complete (5G-TMSI=0x{:08x})",
                         state.suci,
@@ -3607,6 +3615,8 @@ impl NgapServer {
                     );
                     if was_pending {
                         state.retx = None;
+                        // #889: what the command carried is delivered (§5.4.4.3).
+                        crate::racs::commit_in_flight(&mut state.amf_ue);
                         // #570: a command that only carried a UE radio capability ID
                         // left the GUTI alone; say so rather than claim a reallocation.
                         let reallocated = state.amf_ue.current_guti != state.amf_ue.next_guti;
@@ -6556,6 +6566,10 @@ impl NgapServer {
         // The UE radio capability ID deletion indication (half-octet IEI E) keeps the
         // UE from releasing on T3540 (TS 24.501 §5.3.1.3 b) 1)), and so the network.
         let racs_deletion = racs_ies.first().is_some_and(|o| o & 0xF0 == 0xE0);
+        let carries_racs = !racs_ies.is_empty();
+        // `build_registration_accept_for_sessions` includes the 5G-GUTI IE whenever
+        // `next_guti` has a TMSI (gmm_build).
+        let carries_guti = state.amf_ue.next_guti.tmsi != 0;
         plain.extend(racs_ies);
         let Some(protected) = nas_security::nas_5gs_security_encode(
             &mut state.amf_ue,
@@ -6645,6 +6659,25 @@ impl NgapServer {
                     p,
                 )
                 .await?;
+            }
+            // #889, TS 24.501 §5.5.1.3.4: "If a 5G-GUTI ... is included in the
+            // REGISTRATION ACCEPT message, the AMF shall start timer T3550", and the same
+            // for the UE radio capability ID IE or its deletion indication. The UE
+            // acknowledges with a REGISTRATION COMPLETE, which is what makes the GUTI and
+            // the ID valid. T3550 takes the retransmission slot, so a configuration
+            // update in flight is aborted (§5.4.4.6 c)). Retransmitted as a standalone
+            // DL NAS TRANSPORT, whichever NGAP message carried the Accept first. (The
+            // other T3550 triggers of §5.5.1.3.4 -- SOR, access category definitions,
+            // emergency numbers, CAG -- are IEs this AMF does not send in an update.)
+            if carries_racs || carries_guti {
+                match crate::ngap_asn1::build_downlink_nas_transport_asn1(
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    &protected,
+                ) {
+                    Some(pdu) => self.arm_retx(amf_ue_ngap_id, NasProcTimer::T3550, pdu),
+                    None => log::error!("Failed to build the Registration Accept's T3550 PDU"),
+                }
             }
             // #91: AFTER the Accept is on the wire, never before.
             self.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
@@ -12278,6 +12311,7 @@ impl NgapServer {
                 retries: 0,
                 ngap_pdu,
             });
+            crate::racs::arm_in_flight(&mut state.amf_ue);
         });
     }
 
