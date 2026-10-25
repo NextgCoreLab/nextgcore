@@ -2146,26 +2146,30 @@ impl SmfContext {
     /// wedging the NF, which no amount of snapshot precision is worth.
     fn snapshot(&self) -> serde_json::Value {
         // Each of these acquires and releases before the next begins.
-        let pfcp_sessions: std::collections::BTreeMap<String, u64> = self
-            .pfcp_sessions
-            .read()
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())
-            .unwrap_or_default();
-        let policy_bindings: std::collections::BTreeMap<String, PolicyBinding> = self
-            .policy_bindings
-            .read()
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-            .unwrap_or_default();
-        let upf_rts: std::collections::BTreeMap<String, u32> = self
-            .upf_recovery_time_stamps
-            .read()
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())
-            .unwrap_or_default();
-        let cp_n4_seids: std::collections::BTreeMap<String, u64> = self
-            .cp_n4_seids
-            .read()
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())
-            .unwrap_or_default();
+        // #1178: a poisoned map is read through the poison. Its contents are what the
+        // panicking writer left, which is the state the SMF runs on; the empty default
+        // written instead replaced the last good snapshot with nothing, and the next
+        // restart restored no session.
+        let pfcp_sessions: std::collections::BTreeMap<String, u64> =
+            read_through(&self.pfcp_sessions, "pfcp_sessions")
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect();
+        let policy_bindings: std::collections::BTreeMap<String, PolicyBinding> =
+            read_through(&self.policy_bindings, "policy_bindings")
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+        let upf_rts: std::collections::BTreeMap<String, u32> =
+            read_through(&self.upf_recovery_time_stamps, "upf_recovery_time_stamps")
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect();
+        let cp_n4_seids: std::collections::BTreeMap<String, u64> =
+            read_through(&self.cp_n4_seids, "cp_n4_seids")
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect();
         // #994: per SM context, keyed by the reference like `cpN4Seids`. EPC sessions
         // are not durable, so theirs are not written.
         let far_peers: std::collections::BTreeMap<
@@ -2184,15 +2188,11 @@ impl SmfContext {
                     )
                 })
                 .collect();
-            self.far_peers
-                .read()
-                .map(|m| {
-                    seids
-                        .into_iter()
-                        .filter_map(|(r, seid)| m.get(&seid).map(|f| (r, f.clone())))
-                        .collect()
-                })
-                .unwrap_or_default()
+            let m = read_through(&self.far_peers, "far_peers");
+            seids
+                .into_iter()
+                .filter_map(|(r, seid)| m.get(&seid).map(|f| (r, f.clone())))
+                .collect()
         };
         // #1031: per SM context, keyed by the reference like `cpN4Seids`.
         let session_upfs: std::collections::BTreeMap<String, String> = {
@@ -2208,15 +2208,11 @@ impl SmfContext {
                     )
                 })
                 .collect();
-            self.session_upfs
-                .read()
-                .map(|m| {
-                    seids
-                        .into_iter()
-                        .filter_map(|(r, seid)| m.get(&seid).map(|k| (r, k.clone())))
-                        .collect()
-                })
-                .unwrap_or_default()
+            let m = read_through(&self.session_upfs, "session_upfs");
+            seids
+                .into_iter()
+                .filter_map(|(r, seid)| m.get(&seid).map(|k| (r, k.clone())))
+                .collect()
         };
         // Ascending already (see `Ipv4Pool::allocated_addrs`), and as strings so
         // the file is readable by an operator diagnosing a double assignment.
@@ -2239,11 +2235,10 @@ impl SmfContext {
             "cpN4Seids": cp_n4_seids,
             "farPeers": far_peers,
             "sessionUpfs": session_upfs,
-            "failedUpPaths": self
-                .failed_up_paths
-                .read()
-                .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect::<std::collections::BTreeMap<_, _>>())
-                .unwrap_or_default(),
+            "failedUpPaths": read_through(&self.failed_up_paths, "failed_up_paths")
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect::<std::collections::BTreeMap<_, _>>(),
             "bootEpoch": self.boot_epoch.load(Ordering::SeqCst),
         })
     }
@@ -3862,6 +3857,19 @@ pub fn smf_instance_get_load() -> i32 {
 // Tests
 // ============================================================================
 
+/// Read `lock` for the durable snapshot, through a poison (#1178): logged, and the
+/// data the panicking writer left is what is written. Falling back to an empty map
+/// wrote that over the last good snapshot.
+fn read_through<'a, T>(lock: &'a RwLock<T>, what: &str) -> std::sync::RwLockReadGuard<'a, T> {
+    lock.read().unwrap_or_else(|poisoned| {
+        log::error!(
+            "SMF state: the {what} lock is poisoned (a panic while it was held); the \
+             snapshot is taken through the poison"
+        );
+        poisoned.into_inner()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4516,6 +4524,56 @@ mod tests {
         assert!(!m.contains_key(&0x0777));
         drop(m);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// #1178: a map poisoned by a panic while it was written is snapshotted through
+    /// the poison. Read with `unwrap_or_default`, it was written as empty over the last
+    /// good snapshot, and a restart restored no session and no binding.
+    #[test]
+    fn a_poisoned_map_is_snapshotted_through_the_poison() {
+        let path = temp_state_path("1178-poison");
+        let ctx = ctx_with_state(&path);
+        ctx.pfcp_sessions
+            .write()
+            .unwrap()
+            .insert("11780".to_string(), 0x1178);
+        ctx.policy_bindings
+            .write()
+            .unwrap()
+            .insert("11780".to_string(), PolicyBinding::snapshot_default());
+        let addr = ctx.ipv4_pool.allocate().expect("an address");
+        ctx.persist();
+        // A panic while each lock is held for writing.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ctx.pfcp_sessions.write().unwrap();
+            panic!("poison pfcp_sessions");
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ctx.policy_bindings.write().unwrap();
+            panic!("poison policy_bindings");
+        }));
+        assert!(ctx.pfcp_sessions.is_poisoned() && ctx.policy_bindings.is_poisoned());
+        ctx.persist();
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let restored = ctx_with_state(&path);
+        let restored_session = restored.pfcp_sessions.read().unwrap().get("11780").copied();
+        let restored_binding = restored
+            .policy_bindings
+            .read()
+            .unwrap()
+            .contains_key("11780");
+        let restored_addr = restored.ipv4_pool.allocated_addrs().contains(&addr);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(written["pfcpSessions"]["11780"], serde_json::json!(0x1178));
+        assert_eq!(
+            restored_session,
+            Some(0x1178),
+            "the session survives the poison"
+        );
+        assert!(restored_binding, "and its binding");
+        assert!(restored_addr, "and its address");
     }
 
     /// The whole point of #191: a session created before a restart, and the
