@@ -3755,16 +3755,20 @@ fn ipv4_of(dl: &n2_transfer::DlEndpoint) -> Option<[u8; 4]> {
 
 /// Build an SmContextCreateError (TS 29.502 §6.1.6.2.4) carrying a
 /// PDU Session Establishment Reject N1 SM container with a 5GSM cause.
+///
+/// `to` decides whether the reject may carry a Back-off timer (#1188, TS 24.501
+/// §6.4.1.4.1): not to an emergency request or a high-priority-access UE.
 fn sm_context_create_error(
     status: u16,
     cause: &str,
     psi: u8,
     pti: u8,
     gsm_cause_5gsm: u8,
+    to: policy::RejectTo,
 ) -> SbiResponse {
     use nextgcore_sbi::constants::content_type;
     use nextgcore_sbi::message::SbiPart;
-    let n1 = policy::build_establishment_reject(psi, pti, gsm_cause_5gsm);
+    let n1 = policy::build_establishment_reject_ext(psi, pti, gsm_cause_5gsm, None, to);
     // N1-bearing reject: the PDU Session Establishment Reject travels as a
     // 5gnas binary part referenced by RefToBinaryData (TS 29.502 §6.1.2.4).
     let body = serde_json::json!({
@@ -3821,6 +3825,8 @@ fn sm_context_create_ssc_error(psi: u8, pti: u8, allowed_ssc_bitmap: u8) -> SbiR
         pti,
         policy::gsm_cause::NOT_SUPPORTED_SSC_MODE,
         Some(allowed_ssc_bitmap),
+        // #68 carries no Back-off timer, whoever it goes to.
+        policy::RejectTo::default(),
     );
     let body = serde_json::json!({
         "error": { "status": 403, "cause": "SSC_NOT_SUPPORTED" },
@@ -3946,6 +3952,8 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     }
 
     // ---- SmContextCreateData attributes (TS 29.502 Table 6.1.6.2.2-1) ----
+    // #1188: whether a reject may carry a Back-off timer (TS 24.501 §6.4.1.4.1).
+    let reject_to = policy::RejectTo::from_create_data(&req_body);
     let Some(pdu_session_id) = req_body["pduSessionId"]
         .as_u64()
         .filter(|p| (1..=15).contains(p))
@@ -4099,6 +4107,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                 pdu_session_id,
                 pti,
                 policy::gsm_cause::PDU_SESSION_TYPE_IPV4_ONLY_ALLOWED,
+                reject_to,
             );
         }
     };
@@ -4155,6 +4164,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     pdu_session_id,
                     pti,
                     policy::gsm_cause::INSUFFICIENT_RESOURCES,
+                    reject_to,
                 );
             }
         }
@@ -4183,6 +4193,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     pdu_session_id,
                     pti,
                     policy::gsm_cause::INSUFFICIENT_RESOURCES,
+                    reject_to,
                 );
             }
         }
@@ -4274,6 +4285,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                         pdu_session_id,
                         pti,
                         policy::gsm_cause::INSUFFICIENT_RESOURCES_FOR_SPECIFIC_SLICE,
+                        reject_to,
                     );
                 }
                 policy::NsacAdmission::Unavailable => {
@@ -4544,6 +4556,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                         pdu_session_id,
                         pti,
                         policy::gsm_cause::USER_AUTHENTICATION_OR_AUTHORIZATION_FAILED,
+                        reject_to,
                     );
                 }
                 Err(e) => {
@@ -4568,6 +4581,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                         pdu_session_id,
                         pti,
                         policy::gsm_cause::NETWORK_FAILURE,
+                        reject_to,
                     );
                 }
             }
@@ -4729,6 +4743,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     pdu_session_id,
                     pti,
                     policy::gsm_cause::INSUFFICIENT_RESOURCES,
+                    reject_to,
                 );
             }
         };
@@ -4999,6 +5014,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                 pdu_session_id,
                 pti,
                 policy::gsm_cause::NETWORK_FAILURE,
+                reject_to,
             );
         }
     };
@@ -5892,6 +5908,7 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                                             psi,
                                             pti,
                                             policy::gsm_cause::USER_AUTHENTICATION_OR_AUTHORIZATION_FAILED,
+                                            policy::RejectTo::default(),
                                         );
                                     }
                                     Err(e) => {
@@ -13387,7 +13404,14 @@ mod tests {
     /// Establishment Reject as a 5gnas binary part referenced by RefToBinaryData.
     #[test]
     fn sm_context_create_error_carries_n1_reject_part() {
-        let resp = sm_context_create_error(403, "PDUTYPE_NOT_SUPPORTED", 5, 2, 50);
+        let resp = sm_context_create_error(
+            403,
+            "PDUTYPE_NOT_SUPPORTED",
+            5,
+            2,
+            50,
+            policy::RejectTo::default(),
+        );
         assert_eq!(resp.status, 403);
         let root: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
@@ -21395,6 +21419,97 @@ mod tests {
             "REJECT #69: {reject:02x?}"
         );
         assert!(!left, "no SM context left after the rollback");
+    }
+
+    /// The N1 PDU SESSION ESTABLISHMENT REJECT of an NSACF-refused (#69) create whose
+    /// SmContextCreateData carries `extra` (#1188).
+    async fn nsacf_refused_reject_with(supi: &str, extra: serde_json::Value) -> Vec<u8> {
+        let (nsacf, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(|_req: SbiRequest| async {
+                SbiResponse::with_status(403)
+            })
+            .await;
+        std::env::set_var("NSACF_URI", format!("http://127.0.0.1:{}", addr.port()));
+        let mut request = create_request(
+            supi,
+            7,
+            &n1(
+                7,
+                3,
+                gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+                &[0x91, 0x00],
+            ),
+        );
+        let mut body: serde_json::Value =
+            serde_json::from_str(request.http.content.as_deref().unwrap()).unwrap();
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        request.http.content = Some(body.to_string());
+        let resp = handle_sm_context_create(&request).await;
+        std::env::remove_var("NSACF_URI");
+        nsacf.stop().await.ok();
+        assert_eq!(resp.status, 500, "{:?}", resp.http.content);
+        resp.http
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some("n1SmMsg"))
+            .expect("the N1 reject")
+            .data
+            .to_vec()
+    }
+
+    /// #1188, TS 24.501 §6.4.1.4.1: a #69 reject carries the Back-off timer value IE
+    /// (0x37) to an ordinary UE, and leaves it out for an emergency request
+    /// (`requestType` INITIAL_EMERGENCY_REQUEST, TS 29.502) and for a UE the AMF reports
+    /// as a priority user (`priorityUserInd`): "the network shall not include a
+    /// Back-off timer value IE", so the UE may retry at once.
+    #[tokio::test]
+    async fn a_slice_refusal_backs_off_only_an_ordinary_request() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let ordinary =
+            nsacf_refused_reject_with("imsi-001010000011881", serde_json::json!({})).await;
+        let emergency = nsacf_refused_reject_with(
+            "imsi-001010000011882",
+            serde_json::json!({ "requestType": "INITIAL_EMERGENCY_REQUEST" }),
+        )
+        .await;
+        let priority = nsacf_refused_reject_with(
+            "imsi-001010000011883",
+            serde_json::json!({ "priorityUserInd": true }),
+        )
+        .await;
+        // The UEs the creates added (#1092).
+        if let Ok(ctx) = smf_self().read() {
+            for supi in [
+                "imsi-001010000011881",
+                "imsi-001010000011882",
+                "imsi-001010000011883",
+            ] {
+                if let Some(ue) = ctx.ue_find_by_supi(supi) {
+                    ctx.ue_remove(ue.id);
+                }
+            }
+        }
+        assert_eq!(&ordinary[..5], &[0x2E, 7, 3, 0xC3, 69]);
+        assert_eq!(
+            ordinary.get(5),
+            Some(&0x37),
+            "back-off for an ordinary UE: {ordinary:02x?}"
+        );
+        assert_eq!(
+            emergency,
+            vec![0x2E, 7, 3, 0xC3, 69],
+            "no back-off for an emergency request"
+        );
+        assert_eq!(
+            priority,
+            vec![0x2E, 7, 3, 0xC3, 69],
+            "no back-off for high priority access"
+        );
     }
 
     /// #1097 review M4, the guard over every site: no SM Context Create or Update
