@@ -1247,6 +1247,68 @@ pub(crate) fn delete_contexts_for_peer(peer_ip: std::net::IpAddr) -> usize {
              SGW-U sessions (TS 23.007 Section 16.1A.1.1)"
         );
     }
+    removed + delete_pdn_connections_for_pgw(peer_ip)
+}
+
+/// TS 23.007 §16.1A.2 (#1137): the peer is a PGW that restarted or failed. Every
+/// PDN connection anchored at it goes: its SGW-U PFCP session, then the local
+/// session (and the UE context, when it had no other). The MME is told with a
+/// Delete Bearer Request for the PDN connection (its LBI), cause Reactivation
+/// requested, so it deactivates it or detaches the UE with re-attach required
+/// (TS 23.401 §5.10.3 / §5.3.8.3), as §16.1A.2's restoration describes; mmed
+/// has no PGW Restart Notification (TS 29.274 §7.9.5). Returns the number of PDN
+/// connections removed.
+fn delete_pdn_connections_for_pgw(pgw_ip: std::net::IpAddr) -> usize {
+    let ctx = sgwc_self();
+    let sessions = ctx.sess_list_for_pgw_ip(pgw_ip);
+    let server = s11_server();
+    let mut removed = 0usize;
+    for sess in sessions {
+        let ue = ctx.ue_find_by_id(sess.sgwc_ue_id);
+        let lbi = ctx.default_bearer_in_sess(sess.id).map(|b| b.ebi);
+        if let (Some(server), Some(ue), Some(lbi)) = (server.as_ref(), ue.as_ref(), lbi) {
+            if let Some(mme) = ue.mme_addr {
+                let mut dbr = Gtp2Message::new(nextgcore_gtp::v2::header::Gtp2Header::new(
+                    Gtp2MessageType::DeleteBearerRequest as u8,
+                    ue.mme_s11_teid,
+                    server.alloc_sequence_to(mme),
+                ));
+                dbr.add_ie(nextgcore_gtp::v2::ie::Gtp2EbiIe::new(lbi).to_ie(0));
+                dbr.add_ie(
+                    nextgcore_gtp::v2::ie::Gtp2CauseIe::new(gtp_cause::REACTIVATION_REQUESTED)
+                        .to_ie(0),
+                );
+                if let Err(e) = server.send_request(mme, &dbr, 0) {
+                    log::warn!("Delete Bearer Request to MME {mme} for LBI {lbi} not sent: {e}");
+                }
+            }
+        }
+        if let Err(e) = pfcp_path::send_session_deletion_request(
+            &sess,
+            0,
+            None,
+            pfcp_path::S11Continuation::None,
+        ) {
+            log::warn!(
+                "SGW-U session deletion for sess {} failed during PGW {pgw_ip} cleanup: {e}",
+                sess.id
+            );
+        }
+        ctx.sess_remove(sess.id);
+        if ue.is_some_and(|u| {
+            ctx.ue_find_by_id(u.id)
+                .is_some_and(|u| u.sess_ids.is_empty())
+        }) {
+            ctx.ue_remove(sess.sgwc_ue_id);
+        }
+        removed += 1;
+    }
+    if removed > 0 {
+        log::warn!(
+            "PGW {pgw_ip} restart/failure: deleted {removed} PDN connection(s) and their SGW-U \
+             sessions; the MMEs are told (TS 23.007 §16.1A.2)"
+        );
+    }
     removed
 }
 
@@ -7995,6 +8057,8 @@ mod tests {
     /// requires the behaviour-changing path to be gated).
     #[test]
     fn restart_deletion_is_off_by_default() {
+        // #1137: the restart tests set the variable under the process-state guard.
+        let _ambient = crate::pfcp_path::process_state_test_guard_blocking();
         // The suite runs without the variable set, which is the shipped default.
         if std::env::var("SGWC_RESTART_DELETE_CONTEXTS").is_err() {
             assert!(!restart_deletion_enabled());
@@ -8011,6 +8075,160 @@ mod tests {
                 Some(Duration::from_secs(DEFAULT_ECHO_INTERVAL_SECS))
             );
         }
+    }
+
+    /// `SGWC_RESTART_DELETE_CONTEXTS=1` for one test, removed when it ends, pass or
+    /// fail (the variable is process-wide; hold the process-state guard).
+    struct RestartDeletionOn;
+
+    impl RestartDeletionOn {
+        fn new(_ambient: &crate::pfcp_path::ProcessStateGuard) -> Self {
+            std::env::set_var("SGWC_RESTART_DELETE_CONTEXTS", "1");
+            Self
+        }
+    }
+
+    impl Drop for RestartDeletionOn {
+        fn drop(&mut self) {
+            std::env::remove_var("SGWC_RESTART_DELETE_CONTEXTS");
+        }
+    }
+
+    /// A UE whose MME is `mme`, with one PDN connection anchored at the PGW `pgw`
+    /// (its S5/S8 control address), default bearer 5. Returns (UE id, session id).
+    fn ue_with_session_at_pgw(mme: SocketAddr, pgw: Ipv4Addr, imsi: &[u8]) -> (u64, u64) {
+        let (ue_id, _, _) = ue_with_pgw_session(mme, imsi);
+        let ctx = sgwc_self();
+        let mut sess = ctx.sess_list_for_ue(ue_id).remove(0);
+        sess.pgw_addr = Some(pgw);
+        ctx.sess_update(&sess);
+        (ue_id, sess.id)
+    }
+
+    /// The Delete Bearer Request the MME at `mme` receives: (header TEID, LBI,
+    /// Cause).
+    async fn mme_dbr(mme: &UdpSocket) -> (Option<u32>, Option<u8>, Option<u8>) {
+        loop {
+            let msg = recv_s11(mme)
+                .await
+                .expect("a Delete Bearer Request to the MME");
+            if msg.header.message_type != Gtp2MessageType::DeleteBearerRequest as u8 {
+                continue;
+            }
+            return (
+                msg.header.teid,
+                msg.get_ie(Gtp2IeType::Ebi as u8, 0)
+                    .map(|ie| ie.value[0] & 0x0f),
+                msg.get_ie(Gtp2IeType::Cause as u8, 0).map(|ie| ie.value[0]),
+            );
+        }
+    }
+
+    /// #1137, TS 23.007 §16.1A.2: a confirmed PGW restart (a higher restart
+    /// counter in its Echo Request's Recovery) deletes every PDN connection
+    /// anchored at it: the SGW-U session, then the local session and UE. The MME
+    /// gets a Delete Bearer Request for the LBI, cause Reactivation requested.
+    /// A PDN connection at another PGW survives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_pgw_restart_deletes_its_pdn_connections_and_tells_the_mme() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let _deletion = RestartDeletionOn::new(&ambient);
+        let server = test_server(&ambient, 1000, 1);
+        set_s11_server(server.clone());
+        let mme = client();
+        let pgw = UdpSocket::bind("127.0.0.2:0").expect("a PGW at 127.0.0.2");
+        let (ue_id, sess_id) = ue_with_session_at_pgw(
+            mme.local_addr().unwrap(),
+            Ipv4Addr::new(127, 0, 0, 2),
+            b"001011137000001",
+        );
+        let (other_ue, other_sess) = ue_with_session_at_pgw(
+            mme.local_addr().unwrap(),
+            Ipv4Addr::new(127, 0, 0, 3),
+            b"001011137000002",
+        );
+        let deletions = sgwu.received(54);
+        let echo = |seq: u32, counter: u8| {
+            let mut m = Gtp2Message::echo_request(seq);
+            m.add_ie(Gtp2Ie::from_slice(
+                Gtp2IeType::Recovery as u8,
+                0,
+                &[counter],
+            ));
+            m.encode()
+        };
+        pgw.send_to(&echo(0x1137, 4), server.local_addr()).unwrap();
+        pgw.send_to(&echo(0x1138, 5), server.local_addr()).unwrap();
+
+        let (teid, lbi, cause) = mme_dbr(&mme).await;
+        assert_eq!(teid, Some(0x0000_0591), "to the MME's S11 TEID");
+        assert_eq!(lbi, Some(5), "the PDN connection's LBI");
+        assert_eq!(cause, Some(gtp_cause::REACTIVATION_REQUESTED));
+        for _ in 0..300 {
+            if sgwu.received(54) > deletions {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            sgwu.received(54) > deletions,
+            "the SGW-U session is deleted"
+        );
+        let ctx = sgwc_self();
+        assert!(
+            ctx.sess_find_by_id(sess_id).is_none(),
+            "the PDN connection is gone"
+        );
+        assert!(ctx.ue_find_by_id(ue_id).is_none(), "and its UE");
+        assert!(
+            ctx.sess_find_by_id(other_sess).is_some(),
+            "a PDN connection at another PGW survives"
+        );
+        ctx.ue_remove(other_ue);
+        server.close();
+    }
+
+    /// #1137, TS 23.007 §16.1A.2 / §20: an S5/S8 path failure (N3 exhausted on a
+    /// request to the PGW) deletes the PDN connections anchored at it and tells
+    /// the MME, as a restart does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_s5_path_failure_deletes_the_pgws_pdn_connections() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let _sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let _deletion = RestartDeletionOn::new(&ambient);
+        let server = test_server(&ambient, 50, 1);
+        set_s11_server(server.clone());
+        let mme = client();
+        // A PGW that never answers.
+        let pgw = UdpSocket::bind("127.0.0.2:0").expect("a PGW at 127.0.0.2");
+        let (ue_id, sess_id) = ue_with_session_at_pgw(
+            mme.local_addr().unwrap(),
+            Ipv4Addr::new(127, 0, 0, 2),
+            b"001011137000003",
+        );
+        server.send_echo_request(pgw.local_addr().unwrap()).unwrap();
+
+        let (_, lbi, cause) = mme_dbr(&mme).await;
+        assert_eq!(lbi, Some(5));
+        assert_eq!(cause, Some(gtp_cause::REACTIVATION_REQUESTED));
+        let ctx = sgwc_self();
+        assert!(
+            ctx.sess_find_by_id(sess_id).is_none(),
+            "the PDN connection is gone"
+        );
+        assert!(ctx.ue_find_by_id(ue_id).is_none());
+        server.close();
     }
 
     /// TS 23.007 Section 16.1A.1.1: a confirmed peer restart deletes that
