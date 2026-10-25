@@ -2669,6 +2669,9 @@ impl SmfContext {
     /// `policy_bindings.write()` deadlocks the calling thread. Every call site
     /// closes its `if let Ok(mut …) = ….write()` block first.
     pub fn persist(&self) {
+        // #1178 follow-up: whatever the durable state setting (off by default), so a
+        // map a panic poisoned does not stay frozen for every writer that skips on `Err`.
+        self.heal_poisoned_maps();
         if !self.state.is_enabled() {
             return;
         }
@@ -2684,6 +2687,45 @@ impl SmfContext {
             // answered and will not survive a restart.
             log::error!("SMF state was NOT persisted: {e}");
         }
+    }
+
+    /// Clear the poison of every context map a panic left poisoned (#1178 follow-up),
+    /// logged once per poisoning. Their writers skip a poisoned lock (`if let
+    /// Ok(..) = .write()`, `.write().ok()?`), so a poisoned map froze at the panic:
+    /// sessions created after it were never recorded, removals were dropped, and with
+    /// the durable state off (the default) nothing else ever cleared it. A `HashMap` a
+    /// panic interrupted is still a valid map. Takes no lock, so it is safe wherever
+    /// `persist` is called.
+    pub fn heal_poisoned_maps(&self) {
+        fn heal<T>(lock: &RwLock<T>, what: &str) {
+            if lock.is_poisoned() {
+                log::error!(
+                    "SMF state: the {what} lock was poisoned (a panic while it was held); \
+                     the poison is cleared so its writers resume"
+                );
+                lock.clear_poison();
+            }
+        }
+        heal(&self.smf_ue_list, "smf_ue_list");
+        heal(&self.sess_list, "sess_list");
+        heal(&self.bearer_list, "bearer_list");
+        heal(&self.pf_list, "pf_list");
+        heal(&self.mbs_sess_list, "mbs_sess_list");
+        heal(&self.supi_hash, "supi_hash");
+        heal(&self.imsi_hash, "imsi_hash");
+        heal(&self.ipv4_hash, "ipv4_hash");
+        heal(&self.ipv6_hash, "ipv6_hash");
+        heal(&self.smf_n4_seid_hash, "smf_n4_seid_hash");
+        heal(&self.n1n2message_hash, "n1n2message_hash");
+        heal(&self.tmgi_hash, "tmgi_hash");
+        heal(&self.pfcp_sessions, "pfcp_sessions");
+        heal(&self.upf_ul_endpoints, "upf_ul_endpoints");
+        heal(&self.cp_n4_seids, "cp_n4_seids");
+        heal(&self.far_peers, "far_peers");
+        heal(&self.failed_up_paths, "failed_up_paths");
+        heal(&self.session_upfs, "session_upfs");
+        heal(&self.policy_bindings, "policy_bindings");
+        heal(&self.unrestorable_sessions, "unrestorable_sessions");
     }
 
     /// Check if context is initialized
@@ -5044,6 +5086,33 @@ mod tests {
             written["pfcpSessions"]["11781"].is_null(),
             "the released session left the snapshot"
         );
+    }
+
+    /// #1178 follow-up, with the durable state OFF (the default): a map a panic
+    /// poisoned is healed at the next `persist()` (called after every mutation), so its
+    /// writers resume. Before, only the snapshot cleared it, and with no state file no
+    /// snapshot is ever taken: the map stayed frozen.
+    #[test]
+    fn a_poisoned_map_resumes_with_the_durable_state_off() {
+        let ctx = SmfContext::new();
+        assert!(!ctx.state.is_enabled(), "no state file");
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ctx.sess_list.write().unwrap();
+            panic!("poison sess_list");
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ctx.pfcp_sessions.write().unwrap();
+            panic!("poison pfcp_sessions");
+        }));
+        ctx.persist();
+        let recorded = if let Ok(mut m) = ctx.pfcp_sessions.write() {
+            m.insert("11783".to_string(), 0x1183);
+            true
+        } else {
+            false
+        };
+        assert!(!ctx.sess_list.is_poisoned() && !ctx.pfcp_sessions.is_poisoned());
+        assert!(recorded, "the writer that skips on Err resumes");
     }
 
     /// The whole point of #191: a session created before a restart, and the
