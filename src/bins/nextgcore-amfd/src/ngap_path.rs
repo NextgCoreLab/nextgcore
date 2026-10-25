@@ -1420,6 +1420,8 @@ struct OutstandingRelease {
 /// this. Past it, the release is completed locally, as the Complete would have
 /// (CM-IDLE, user plane DEACTIVATED, mobile reachable timer).
 const RELEASE_COMPLETE_GUARD: Duration = Duration::from_secs(5);
+/// Request type "initial request" (TS 24.501 §9.11.3.47).
+const REQUEST_TYPE_INITIAL_REQUEST: u8 = 0x01;
 /// The spacing of the re-selection attempts within the window.
 const ESTABLISHMENT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 /// At most this many establishments wait at once. Beyond it, one is answered
@@ -9298,6 +9300,66 @@ impl NgapServer {
         Ok(())
     }
 
+    /// TS 24.501 §5.4.5.2.5 a) 12) (#1036): the UE asks for PSI `psi` with
+    /// Request type "initial request" while the AMF holds a routing context for
+    /// it. The AMF releases the session locally and has its SMF release the SM
+    /// context, then the request goes on as a new establishment (§5.4.5.2.3).
+    ///
+    /// Without this, a second CreateSMContext went to the SMF and the AMF's ref
+    /// was overwritten, so the first SM context (its PFCP session, UE IP, PCF
+    /// association) was orphaned. The release is durable and keyed on the
+    /// session, so it reaches the SMF before the new CreateSMContext. A user plane
+    /// set up at the gNB for the PSI is released there too: TS 38.413 §8.2.1.4
+    /// has the gNB refuse a setup for a PDU session it already has.
+    async fn release_colliding_session(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        psi: u8,
+    ) -> Result<()> {
+        let key = (amf_ue_ngap_id, psi);
+        let Some(sm_context_ref) = self.sm_context_refs.get(&key).cloned() else {
+            return Ok(());
+        };
+        log::info!(
+            "UE {amf_ue_ngap_id}: PDU session establishment (initial request) for PSI={psi}, \
+             which the AMF holds (SM context {sm_context_ref}); releasing it first \
+             (TS 24.501 §5.4.5.2.5 a) 12))"
+        );
+        let owner = self.sm_context_smfs.get(&key).cloned();
+        self.sbi_offload
+            .spawn_keyed_durable(key, move || async move {
+                let (host, port) = smf_or_selected(owner).await;
+                match crate::sbi_path::call_smf_release_sm_context(&host, port, &sm_context_ref)
+                    .await
+                {
+                    Ok(()) => log::info!(
+                        "UE {amf_ue_ngap_id}: SM context {sm_context_ref} (PSI={psi}) released \
+                         before its PSI's new establishment"
+                    ),
+                    Err(e) => log::warn!(
+                        "UE {amf_ue_ngap_id}: release of SM context {sm_context_ref} \
+                         (PSI={psi}) before its PSI's new establishment failed: {e}"
+                    ),
+                }
+                None
+            });
+        self.forget_session(amf_ue_ngap_id, psi);
+        if self.up_active.contains(&key) {
+            self.clear_up_active(amf_ue_ngap_id, psi);
+            match crate::ngap_asn1::build_pdu_session_resource_release_command_asn1(
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                &[psi],
+            ) {
+                Some(release) => self.send_to_association(association_id, &release).await?,
+                None => log::error!("Failed to build PDU Session Resource Release Command"),
+            }
+        }
+        Ok(())
+    }
+
     /// Handle UL NAS TRANSPORT (0x67, TS 24.501 Section 5.4.5): route N1 SM
     /// to the SMF; reply with cause #90 for container types without a
     /// forwarding target; 5GMM Status on protocol errors
@@ -9322,6 +9384,8 @@ impl NgapServer {
         // Optional IEs after the container: PDU session ID (IEI 0x12, TV)
         let mut psi: Option<u8> = None;
         let mut dnn_value: Option<String> = None;
+        // #1036: the Request type (IEI 8-, TS 24.501 §9.11.3.47), value bits 3..1.
+        let mut request_type: Option<u8> = None;
         let mut pos = 6 + container_len;
         while pos < nas.len() {
             match nas[pos] {
@@ -9344,7 +9408,11 @@ impl NgapServer {
                     }
                     pos += 2 + l;
                 }
-                b if b & 0x80 != 0 => pos += 1, // type-1 TV (e.g. request type 0x8-)
+                b if b & 0xF0 == 0x80 => {
+                    request_type = Some(b & 0x07);
+                    pos += 1;
+                }
+                b if b & 0x80 != 0 => pos += 1, // other type-1 TV
                 _ => break,
             }
         }
@@ -9370,6 +9438,23 @@ impl NgapServer {
 
         match action {
             Ok(crate::gmm_handler::UlTransportAction::RouteToSmf { .. }) => {
+                // #1036, TS 24.501 §5.4.5.2.5 a) 12): an "initial request" for a PSI
+                // the AMF holds a routing context for, e.g. the UE retransmitting its
+                // establishment after the Accept was lost, releases that session
+                // first, locally and at its SMF.
+                if request_type == Some(REQUEST_TYPE_INITIAL_REQUEST)
+                    && container.get(3) == Some(&0xC1)
+                {
+                    if let Some(&sm_psi) = container.get(1) {
+                        self.release_colliding_session(
+                            association_id,
+                            amf_ue_ngap_id,
+                            ran_ue_ngap_id,
+                            sm_psi,
+                        )
+                        .await?;
+                    }
+                }
                 self.handle_5gsm_message(
                     association_id,
                     amf_ue_ngap_id,
