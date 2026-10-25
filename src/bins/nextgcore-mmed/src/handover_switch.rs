@@ -856,13 +856,18 @@ mod tests {
     /// Send a PATH SWITCH REQUEST from `target_enb_id` through the real handler,
     /// switching `ebis` to TEID 0x9000 + EBI at 10.0.0.9.
     fn path_switch(ue: &Ue, target_enb_id: u64, ebis: &[u8]) -> Vec<S1apSend> {
+        path_switch_at(ue, target_enb_id, ebis, &[10, 0, 0, 9])
+    }
+
+    /// [`path_switch`] with the target eNB's transport layer address `addr`.
+    fn path_switch_at(ue: &Ue, target_enb_id: u64, ebis: &[u8], addr: &[u8]) -> Vec<S1apSend> {
         let psr = PathSwitchRequest {
             enb_ue_s1ap_id: 200,
             erab_switched_dl_list: ebis
                 .iter()
                 .map(|ebi| ErabSwitchedItem {
                     erab_id: *ebi,
-                    transport_layer_address: vec![10, 0, 0, 9],
+                    transport_layer_address: addr.to_vec(),
                     gtp_teid: 0x9000 + u32::from(*ebi),
                 })
                 .collect(),
@@ -1055,6 +1060,15 @@ mod tests {
     /// (TEID 0x8800 + EBI at 10.0.0.8) and send its HANDOVER NOTIFY through the
     /// real handler. Returns (target eNB, target UE).
     fn notify_handover(ue: &Ue, admitted: &[u8]) -> (u64, u64) {
+        let ip = crate::context::IpAddr {
+            ipv4: Some([10, 0, 0, 8]),
+            ipv6: None,
+        };
+        notify_handover_at(ue, admitted, &ip)
+    }
+
+    /// [`notify_handover`] with the target eNB's admitted endpoint at `ip`.
+    fn notify_handover_at(ue: &Ue, admitted: &[u8], ip: &crate::context::IpAddr) -> (u64, u64) {
         let ctx = crate::context::mme_self();
         let target_enb = ctx.enb_add(enb_addr());
         let target_ue_id = ctx.enb_ue_add(target_enb, 300);
@@ -1071,7 +1085,7 @@ mod tests {
             let mut pool = ctx.bearer_pool.write().unwrap();
             let b = pool.get_mut(&bearer_id).unwrap();
             b.target_s1u_teid = 0x8800 + u32::from(*ebi);
-            b.target_s1u_ip.ipv4 = Some([10, 0, 0, 8]);
+            b.target_s1u_ip = ip.clone();
         }
         crate::s1ap_path::tap_enb_for_test(target_enb);
         let target_mme_ue_s1ap_id = ctx.enb_ue_find_by_id(target_ue_id).unwrap().mme_ue_s1ap_id;
@@ -1179,6 +1193,59 @@ mod tests {
             ue.mme_ue_id
         ));
         ctx.enb_ue_remove(target_ue_id);
+        release(&ue);
+    }
+
+    /// The S1-U eNodeB F-TEIDs (EBI, TEID, IPv4, IPv6) of a Modify Bearer Request.
+    fn enb_fteids(mbr: &Gtp2Message) -> Vec<(u8, u32, Option<[u8; 4]>, Option<[u8; 16]>)> {
+        mbr.get_ies(Gtp2IeType::BearerContext as u8)
+            .into_iter()
+            .filter(|ie| ie.instance == 0)
+            .map(|ie| {
+                let bc = Gtp2BearerContextIe::decode(&ie.value).unwrap();
+                let ft = bc.fteid(0).unwrap().expect("an S1-U eNB F-TEID");
+                (bc.ebi().unwrap(), ft.teid, ft.ipv4_addr, ft.ipv6_addr)
+            })
+            .collect()
+    }
+
+    const ENB_V6: [u8; 16] = [
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x09, 0x49,
+    ];
+
+    /// #1169 review, #948: a PATH SWITCH REQUEST whose target eNB transport
+    /// address is IPv6-only switches the E-RAB (the Modify Bearer Request carries
+    /// an IPv6 S1-U eNodeB F-TEID) instead of releasing it.
+    #[test]
+    fn an_ipv6_path_switch_is_switched_not_released() {
+        let _guard = lock_s11();
+        let (sgw, _route) = sgw(Gtp2XactConfig::default());
+        let ue = seed(&[5]);
+        let target = crate::context::mme_self().enb_add(enb_addr());
+        crate::s1ap_path::tap_enb_for_test(target);
+        let out = path_switch_at(&ue, target, &[5], &ENB_V6);
+        assert!(out.is_empty(), "not failed at once");
+        let (mbr, _) = recv(&sgw, 34);
+        assert_eq!(enb_fteids(&mbr), vec![(5, 0x9005, None, Some(ENB_V6))]);
+        release(&ue);
+    }
+
+    /// #1169 review, #948: a HANDOVER NOTIFY for a target that admitted the
+    /// bearer at an IPv6-only endpoint switches it (Modify Bearer Request with an
+    /// IPv6 S1-U eNodeB F-TEID) instead of omitting it.
+    #[test]
+    fn an_ipv6_handover_target_is_switched_not_omitted() {
+        let _guard = lock_s11();
+        let (sgw, _route) = sgw(Gtp2XactConfig::default());
+        let ue = seed(&[5]);
+        let ip = crate::context::IpAddr {
+            ipv4: None,
+            ipv6: Some(ENB_V6),
+        };
+        let (_, target_ue_id) = notify_handover_at(&ue, &[5], &ip);
+        let (mbr, _) = recv(&sgw, 34);
+        assert_eq!(enb_fteids(&mbr), vec![(5, 0x8805, None, Some(ENB_V6))]);
+        crate::context::mme_self().enb_ue_remove(target_ue_id);
         release(&ue);
     }
 
