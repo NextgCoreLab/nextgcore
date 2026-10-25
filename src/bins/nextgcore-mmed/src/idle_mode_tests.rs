@@ -2428,14 +2428,18 @@ fn an_activation_whose_ue_goes_away_is_answered() {
 /// the budget; the E-RAB the eNB set up is released.
 #[test]
 fn an_activation_is_answered_within_the_serving_gws_transaction() {
-    let sgw_window = {
-        let c = Gtp2XactConfig::default();
-        c.t3_response * (c.n3_requests + 1)
-    };
+    // #1228: sgwcd's S11 window for these Requests.
+    let sgw_window = nextgcore_gtp::v2::xact::default_t3_window(
+        nextgcore_gtp::v2::xact::SGW_BEARER_PROCEDURE_N3,
+    );
     assert!(crate::bearer_activation::answer_budget() < sgw_window);
     assert_eq!(
         crate::bearer_activation::answer_budget(),
-        Duration::from_secs(10)
+        Duration::from_secs(50)
+    );
+    assert!(
+        crate::bearer_activation::T3485_DURATION * 5 < crate::bearer_activation::answer_budget(),
+        "T3485 x 5 runs out before the budget"
     );
 
     let _guard = lock_s11();

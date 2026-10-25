@@ -10495,6 +10495,12 @@ mod tests {
         held.abort();
         upf_task.abort();
         pfcp_path::clear_global_upf_for_test();
+        // #1228: the stand-in SGW never answers, and the process-wide S5/S8
+        // server would retransmit these Delete Bearer Requests for 60 s, into
+        // the next test's shutdown drain.
+        if let Some(server) = gtp_path::s5s8_server() {
+            server.abandon_outstanding_for_test().await;
+        }
 
         assert_eq!(
             heard,

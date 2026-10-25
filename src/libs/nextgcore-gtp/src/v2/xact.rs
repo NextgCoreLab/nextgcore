@@ -58,6 +58,36 @@ impl Default for Gtp2XactConfig {
     }
 }
 
+/// The network-initiated bearer Requests whose answer waits on the radio side:
+/// paging (T3413), the E-RAB setup and the UE's NAS answer (T3485 / T3495 x 5,
+/// TS 24.301 §6.4) at the MME before the SGW, then the PGW, can be answered (#1228).
+pub const BEARER_PROCEDURE_REQUESTS: [u8; 3] = [
+    Gtp2MessageType::CreateBearerRequest as u8,
+    Gtp2MessageType::UpdateBearerRequest as u8,
+    Gtp2MessageType::DeleteBearerRequest as u8,
+];
+
+/// N3 for [`BEARER_PROCEDURE_REQUESTS`] the SGW relays to the MME on S11: with
+/// the default T3 (3 s) the S11 transaction runs T3 x (N3 + 1) = 54 s (TS 29.274
+/// §7.6: "T3 and N3 ... may be different for different message types"). The
+/// MME must answer inside it ([`MME_BEARER_PROCEDURE_BUDGET`]); the PGW's S5/S8
+/// transaction must outlast it ([`PGW_BEARER_PROCEDURE_N3`]).
+pub const SGW_BEARER_PROCEDURE_N3: u32 = 17;
+
+/// N3 for [`BEARER_PROCEDURE_REQUESTS`] the PGW sends on S5/S8: T3 x (N3 + 1) =
+/// 60 s, beyond the SGW's S11 window plus its own Sxa and relay time.
+pub const PGW_BEARER_PROCEDURE_N3: u32 = 19;
+
+/// How long the MME may take to answer a bearer Request relayed by the SGW: the
+/// SGW's S11 window less 4 s for the one-way delays and T3 granularity (50 s).
+/// Covers T3485 x 5 (40 s) plus about 10 s of paging.
+pub const MME_BEARER_PROCEDURE_BUDGET: Duration = Duration::from_secs(50);
+
+/// T3 x (N3 + 1) under the default T3: how long a transaction with `n3` lasts.
+pub fn default_t3_window(n3: u32) -> Duration {
+    Gtp2XactConfig::default().t3_response * (n3 + 1)
+}
+
 /// A locally originated request awaiting its triggered message
 #[derive(Debug, Clone)]
 pub struct Gtp2LocalXact {
@@ -209,6 +239,9 @@ pub struct Gtp2XactMgr {
     local: HashMap<(SocketAddr, u32), Gtp2LocalXact>,
     /// Cached responses for duplicate peer requests
     responses: HashMap<(SocketAddr, u32), CachedResponse>,
+    /// N3 per request message type, where it differs from the configured one
+    /// (TS 29.274 §7.6, #1228).
+    n3_by_type: HashMap<u8, u32>,
 }
 
 impl Default for Gtp2XactMgr {
@@ -225,7 +258,32 @@ impl Gtp2XactMgr {
             next_sequence: 1,
             local: HashMap::new(),
             responses: HashMap::new(),
+            n3_by_type: HashMap::new(),
         }
+    }
+
+    /// Use `n3` instead of the configured N3 for requests of `message_types`
+    /// registered from now on (TS 29.274 §7.6 allows T3/N3 per message type).
+    pub fn set_n3_for(&mut self, message_types: &[u8], n3: u32) {
+        for t in message_types {
+            self.n3_by_type.insert(*t, n3);
+        }
+    }
+
+    /// Forget every outstanding request: no retransmission, no exhaustion
+    /// reported. Returns how many there were.
+    pub fn abandon_all(&mut self) -> usize {
+        let n = self.local.len();
+        self.local.clear();
+        n
+    }
+
+    /// The N3 a request of `message_type` is registered with.
+    pub fn n3_for(&self, message_type: u8) -> u32 {
+        self.n3_by_type
+            .get(&message_type)
+            .copied()
+            .unwrap_or(self.config.n3_requests)
     }
 
     /// Allocate a sequence number for an initial message that is NOT a Command:
@@ -269,7 +327,7 @@ impl Gtp2XactMgr {
             encoded,
             data,
             deadline: Instant::now() + self.config.t3_response,
-            retries_left: self.config.n3_requests,
+            retries_left: self.n3_for(message_type),
         };
         self.local.insert((peer, sequence_number), xact);
     }
@@ -534,6 +592,61 @@ mod tests {
         assert_eq!(result.exhausted[0].sequence_number, seq);
         assert_eq!(result.exhausted[0].data, 7);
         assert_eq!(mgr.outstanding(), 0);
+    }
+
+    /// #1228, TS 29.274 §7.6: a message type can have its own N3. A Create
+    /// Bearer Request set to 4 outlives a DDN under the configured 2.
+    #[test]
+    fn a_message_type_can_have_its_own_n3() {
+        let config = Gtp2XactConfig {
+            t3_response: Duration::from_millis(10),
+            n3_requests: 2,
+            response_hold: Duration::from_secs(1),
+        };
+        let mut mgr = Gtp2XactMgr::new(config);
+        mgr.set_n3_for(&BEARER_PROCEDURE_REQUESTS, 4);
+        assert_eq!(mgr.n3_for(Gtp2MessageType::CreateBearerRequest as u8), 4);
+        assert_eq!(
+            mgr.n3_for(Gtp2MessageType::DownlinkDataNotification as u8),
+            2
+        );
+        let ddn = mgr.alloc_sequence();
+        mgr.register_request(
+            ddn,
+            Gtp2MessageType::DownlinkDataNotification as u8,
+            peer(),
+            Bytes::from_static(b"ddn"),
+            1,
+        );
+        let cbr = mgr.alloc_sequence();
+        mgr.register_request(
+            cbr,
+            Gtp2MessageType::CreateBearerRequest as u8,
+            peer(),
+            Bytes::from_static(b"cbr"),
+            2,
+        );
+        let now = Instant::now();
+        let mut exhausted = Vec::new();
+        for k in 1..=5u64 {
+            let r = mgr.poll(now + Duration::from_millis(11 * k));
+            exhausted.extend(r.exhausted.iter().map(|x| (k, x.sequence_number)));
+        }
+        assert_eq!(exhausted, vec![(3, ddn), (5, cbr)]);
+    }
+
+    /// #1228: the bearer-procedure windows nest: the MME answers inside the
+    /// SGW's S11 transaction, which ends inside the PGW's S5/S8 one.
+    #[test]
+    fn the_bearer_procedure_windows_nest() {
+        let sgw = default_t3_window(SGW_BEARER_PROCEDURE_N3);
+        let pgw = default_t3_window(PGW_BEARER_PROCEDURE_N3);
+        assert_eq!(sgw, Duration::from_secs(54));
+        assert_eq!(pgw, Duration::from_secs(60));
+        assert!(MME_BEARER_PROCEDURE_BUDGET + Duration::from_secs(4) <= sgw);
+        assert!(sgw < pgw);
+        // T3485 x 5 (TS 24.301 §6.4.2.6) fits the MME's budget.
+        assert!(Duration::from_secs(8 * 5) < MME_BEARER_PROCEDURE_BUDGET);
     }
 
     #[test]

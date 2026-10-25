@@ -847,6 +847,20 @@ pub fn s5s8_server() -> Option<&'static Arc<S5S8Server>> {
 }
 
 impl S5S8Server {
+    /// [`Self::open`] as the process runs it: the paging-dependent bearer Requests
+    /// (Create/Update/Delete Bearer) get T3 x (N3 + 1) = 60 s, beyond the SGW's
+    /// 54 s S11 transaction (#1228, TS 29.274 §7.6; `nextgcore_gtp::v2::xact`).
+    pub async fn open_pgw(bind: SocketAddr, restart_counter: u8) -> Result<Arc<Self>, String> {
+        use nextgcore_gtp::v2::xact::{BEARER_PROCEDURE_REQUESTS, PGW_BEARER_PROCEDURE_N3};
+        let server = Self::open(bind, restart_counter).await?;
+        server
+            .xact
+            .lock()
+            .await
+            .set_n3_for(&BEARER_PROCEDURE_REQUESTS, PGW_BEARER_PROCEDURE_N3);
+        Ok(server)
+    }
+
     /// Bind the S5/S8 socket and spawn the receive and T3/N3 tasks.
     pub async fn open(bind: SocketAddr, restart_counter: u8) -> Result<Arc<Self>, String> {
         let socket = tokio::net::UdpSocket::bind(bind)
@@ -1097,6 +1111,14 @@ impl S5S8Server {
         self.xact.lock().await.outstanding()
     }
 
+    /// Forget every outstanding request. Test-only: the process-wide server
+    /// outlives a test whose SGW never answers, and its Delete Bearer Requests
+    /// retransmit for 60 s (#1228) into the next test's shutdown drain.
+    #[cfg(test)]
+    pub async fn abandon_outstanding_for_test(&self) {
+        self.xact.lock().await.abandon_all();
+    }
+
     async fn handle_datagram(&self, data: &[u8], peer: SocketAddr) {
         let mut bytes = bytes::Bytes::copy_from_slice(data);
         let msg = match nextgcore_gtp::v2::Gtp2Message::decode(&mut bytes) {
@@ -1164,7 +1186,7 @@ pub async fn s5s8_open(
         );
         return Ok(());
     };
-    let server = S5S8Server::open(bind, restart_counter).await?;
+    let server = S5S8Server::open_pgw(bind, restart_counter).await?;
     if !local_pcc_rules.is_empty() {
         log::info!(
             "S5/S8: {} local PCC rule(s) will be activated as dedicated bearers",
@@ -1185,6 +1207,27 @@ pub async fn s5s8_open(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1228: the process's S5/S8 server gives the paging-dependent bearer
+    /// Requests their own N3 (60 s at the default T3); others keep the default.
+    #[tokio::test]
+    async fn the_s5s8_server_gives_bearer_requests_their_own_n3() {
+        let server = S5S8Server::open_pgw("127.0.0.1:0".parse().unwrap(), 3)
+            .await
+            .unwrap();
+        {
+            let xact = server.xact.lock().await;
+            for t in [
+                gtp2_message_type::CREATE_BEARER_REQUEST,
+                gtp2_message_type::UPDATE_BEARER_REQUEST,
+                gtp2_message_type::DELETE_BEARER_REQUEST,
+            ] {
+                assert_eq!(xact.n3_for(t), 19, "type {t}");
+            }
+            assert_eq!(xact.n3_for(gtp2_message_type::ECHO_REQUEST), 3);
+        }
+        server.running.store(false, Ordering::SeqCst);
+    }
 
     #[test]
     fn test_gtp_xact_new() {
