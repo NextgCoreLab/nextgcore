@@ -20,7 +20,7 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   Transfer. N1/N2 SM information that is missing is 400 MANDATORY_IE_MISSING, and present but
   erroneous 403 N1_SM_ERROR / N2_SM_ERROR. A UDM that cannot be reached is 500 SYSTEM_FAILURE,
   or 504 PEER_NOT_RESPONDING when it did not answer. Causes now come from the TS 29.502 / 29.500
-  tables: SSC_NOT_SUPPORTED, PDUTYPE_NOT_SUPPORTED, S_NSSAI_UNAVAILABLE_DUE_TO_NSAC,
+  tables: SSC_NOT_SUPPORTED, PDUTYPE_NOT_SUPPORTED, 500 INSUFFICIENT_RESOURCES_SLICE (an NSACF refusal),
   SUBSCRIPTION_DENIED (a PCF refusal) and PEER_NOT_RESPONDING (no PCF answer). A third-party AMF
   that read a top-level `cause` must read `error.cause` (#1097).
 - amfd refuses to start on a config it cannot serve NG Setup with. It used to start an AMF

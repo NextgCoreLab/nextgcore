@@ -3913,9 +3913,12 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                          rejecting (5GSM cause 67)"
                     );
                     rollback();
+                    // #1144 round 3: TS 29.502 Table 6.1.3.2.3.1-3 answers an NSAC
+                    // rejection of a new session 500 INSUFFICIENT_RESOURCES_SLICE (5GSM
+                    // #69 in the N1); S_NSSAI_UNAVAILABLE_DUE_TO_NSAC is for a move.
                     return sm_context_create_error(
-                        403,
-                        "S_NSSAI_UNAVAILABLE_DUE_TO_NSAC",
+                        500,
+                        "INSUFFICIENT_RESOURCES_SLICE",
                         pdu_session_id,
                         pti,
                         policy::gsm_cause::INSUFFICIENT_RESOURCES_FOR_SPECIFIC_SLICE,
@@ -19501,7 +19504,8 @@ mod tests {
     /// downlink (504 UPF_NOT_RESPONDING), and when the context has no N4 session
     /// (500 SYSTEM_FAILURE, not a 404 -- the context exists).
     ///
-    /// REVERT-VERIFIED: without upCnxState on the UPF-refusal 504, this fails.
+    /// REVERT-VERIFIED: without upCnxState on the UPF-refusal 504 of the activation,
+    /// or of the deactivation, this fails.
     #[tokio::test]
     async fn a_failed_activation_answers_deactivated() {
         use base64::Engine as _;
@@ -19524,9 +19528,20 @@ mod tests {
         );
         upf.answer_sessions_with(69);
         let resp = handle_sm_context_update(&refused, &post()).await;
+        // #1144 round 3: and a deactivation the UPF refuses (the UE went idle).
+        let deactivation = handle_sm_context_update(
+            &refused,
+            &SbiRequest::post("/x/modify")
+                .with_body(r#"{"upCnxState":"DEACTIVATED"}"#, "application/json"),
+        )
+        .await;
         upf.answer_sessions_with(1);
         assert_eq!(resp.status, 504, "{:?}", resp.http.content);
         let body = sm_context_error_of(&resp);
+        assert_eq!(body["error"]["cause"], "UPF_NOT_RESPONDING");
+        assert_eq!(body["upCnxState"], "DEACTIVATED");
+        assert_eq!(deactivation.status, 504, "{:?}", deactivation.http.content);
+        let body = sm_context_error_of(&deactivation);
         assert_eq!(body["error"]["cause"], "UPF_NOT_RESPONDING");
         assert_eq!(body["upCnxState"], "DEACTIVATED");
 
