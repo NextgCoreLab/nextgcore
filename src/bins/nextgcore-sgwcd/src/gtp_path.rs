@@ -237,10 +237,18 @@ impl GtpcServer {
                             if let Ok(mut relays) = inner.change_notifications.lock() {
                                 relays.remove(&(xact.peer, xact.sequence_number));
                             }
+                            // #607: a relayed Create Bearer Request's bearers are
+                            // removed, and the PGW told.
+                            crate::dedicated_bearer::mme_silent(xact.peer, xact.sequence_number);
                             // #1025: a PGW that never answers a relayed Delete
                             // Session does not keep the session alive here.
                             if xact.message_type == Gtp2MessageType::DeleteSessionRequest as u8 {
                                 continue_delete_session_after_pgw(xact.sequence_number, None);
+                            }
+                            // #1152: a PGW that never answers a relayed Create
+                            // Session leaves the MME answered and nothing behind.
+                            if xact.message_type == Gtp2MessageType::CreateSessionRequest as u8 {
+                                abandon_create_session_without_pgw(xact.peer, xact.sequence_number);
                             }
                             // A failed path leaves the same stale contexts a
                             // restart does, so run the same cleanup rather than
@@ -1055,7 +1063,10 @@ fn handle_datagram(inner: &Arc<GtpcInner>, data: &[u8], peer: SocketAddr) {
             // Command's S11 sequence number.
             // #607, TS 29.274 §7.6: a retransmission of a Request still being
             // relayed is discarded; the S11 transaction already retransmits it.
-            if server.pgw_request_in_flight(peer, seq, msg_type) {
+            if server.pgw_request_in_flight(peer, seq, msg_type)
+                || (msg_type == T::CreateBearerRequest as u8
+                    && crate::dedicated_bearer::in_flight(peer, seq))
+            {
                 log::info!(
                     "PGW {peer} retransmitted bearer Request type {msg_type} seq={seq}: still \
                      awaiting the MME's answer, discarded"
@@ -1063,6 +1074,17 @@ fn handle_datagram(inner: &Arc<GtpcInner>, data: &[u8], peer: SocketAddr) {
                 return;
             }
             let relay = server.close_command_relay(peer, seq, msg_type);
+            // #607: a Create Bearer Request sets up the bearer here and at the SGW-U
+            // first, and goes to the MME with this node's S1-U F-TEID.
+            if msg_type == T::CreateBearerRequest as u8 {
+                crate::dedicated_bearer::on_pgw_request(
+                    &server,
+                    &msg,
+                    peer,
+                    relay.map(|r| (r.mme_peer, r.mme_seq, r.mme_teid)),
+                );
+                return;
+            }
             forward_pgw_bearer_procedure_to_mme(inner, &msg, peer, data, relay);
         }
         // #591: a Command the PGW refused. The Failure Indication is the Command's
@@ -1765,6 +1787,62 @@ fn take_pending_s5c(seq: u32) -> Option<(u64, pfcp_path::S11Continuation)> {
         .and_then(|mut map| map.as_mut().and_then(|m| m.remove(&seq)))
 }
 
+/// S5-C sequence numbers of Create Session Requests abandoned after N3 (#1152),
+/// with when, so a late accepted answer still gets its PDN connection deleted at
+/// the PGW (#1190 review). Kept for [`ABANDONED_S5C_HOLD`].
+static ABANDONED_S5C: std::sync::Mutex<Vec<(SocketAddr, u32, Instant)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// How long an abandoned Create's sequence number is remembered: far beyond any
+/// PGW's own T3 x N3.
+const ABANDONED_S5C_HOLD: Duration = Duration::from_secs(60);
+
+fn remember_abandoned_s5c(pgw: SocketAddr, seq: u32) {
+    let now = Instant::now();
+    if let Ok(mut list) = ABANDONED_S5C.lock() {
+        list.retain(|(_, _, at)| now.duration_since(*at) < ABANDONED_S5C_HOLD);
+        list.push((pgw, seq, now));
+    }
+}
+
+fn take_abandoned_s5c(pgw: SocketAddr, seq: u32) -> bool {
+    let now = Instant::now();
+    ABANDONED_S5C.lock().is_ok_and(|mut list| {
+        list.retain(|(_, _, at)| now.duration_since(*at) < ABANDONED_S5C_HOLD);
+        let found = list.iter().position(|(p, s, _)| *p == pgw && *s == seq);
+        if let Some(i) = found {
+            list.remove(i);
+        }
+        found.is_some()
+    })
+}
+
+/// The S5/S8 Create Session Request at S5-C `seq` ran out its N3 (#1152, TS
+/// 29.274 §7.6): the PGW is not answering. The MME is answered Remote peer not
+/// responding (§8.4, cause 100) through the parked continuation, and the local
+/// session goes, with its UE when it has no other. No SGW-U session exists yet:
+/// the PFCP establishment follows the PGW's answer.
+fn abandon_create_session_without_pgw(pgw: SocketAddr, seq: u32) {
+    let Some((sess_id, continuation)) = take_pending_s5c(seq) else {
+        return;
+    };
+    remember_abandoned_s5c(pgw, seq);
+    log::error!(
+        "S5/S8 Create Session Request seq={seq} unanswered after N3: the MME is answered \
+         Remote peer not responding and session {sess_id} is removed"
+    );
+    crate::sxa_response::fail_with_cause(continuation, gtp_cause::REMOTE_PEER_NOT_RESPONDING);
+    let ctx = sgwc_self();
+    if let Some(sess) = ctx.sess_remove(sess_id) {
+        if ctx
+            .ue_find_by_id(sess.sgwc_ue_id)
+            .is_some_and(|ue| ue.sess_ids.is_empty())
+        {
+            ctx.ue_remove(sess.sgwc_ue_id);
+        }
+    }
+}
+
 /// The EBI of the default bearer a Create Session Response's Bearer Context names
 /// (5 when it names none: the first EBI an MME assigns).
 fn created_lbi(msg: &Gtp2Message) -> u8 {
@@ -1837,6 +1915,22 @@ pub fn parse_s5c_create_session_response(msg: &Gtp2Message) -> S5cCreateSessionA
 fn dispatch_s5c_create_session_response(msg: &Gtp2Message, peer: SocketAddr) {
     let seq = msg.header.sequence_number;
     let Some((sess_id, continuation)) = take_pending_s5c(seq) else {
+        // #1190 review: the answer to a Create this SGW-C gave up on after N3
+        // (#1152). The MME was refused and the session removed; if the PGW
+        // accepted after all, it holds a PDN connection nobody else knows of,
+        // so it is deleted at the S5/S8-C TEID the answer gives.
+        if take_abandoned_s5c(peer, seq) {
+            let answer = parse_s5c_create_session_response(msg);
+            if crate::s5c_handler::session_created(answer.cause) {
+                abandon_pgw_session_at(
+                    peer,
+                    answer.pgw_c.as_ref().map(|ft| ft.teid).unwrap_or(0),
+                    created_lbi(msg),
+                    "the PGW answered the Create after N3 ran out",
+                );
+            }
+            return;
+        }
         log::warn!(
             "S5/S8 Create Session Response from {peer} (seq={seq}) matches no pending request; \
              dropping rather than acting on a datagram this SGW-C did not ask for"
@@ -1895,7 +1989,7 @@ fn dispatch_s5c_create_session_response(msg: &Gtp2Message, peer: SocketAddr) {
         // #1032 review: a Delete Session that raced this Create removed the local
         // session before the PGW had a TEID to be told; if the PGW anchored it, it
         // is deleted there now.
-        if cause == gtp_cause::REQUEST_ACCEPTED {
+        if crate::s5c_handler::session_created(cause) {
             abandon_pgw_session(
                 pgw_c.as_ref().map(|ft| ft.teid).unwrap_or(0),
                 created_lbi(msg),
@@ -3348,6 +3442,13 @@ fn dispatch_bearer_response(
     let server = GtpcServer {
         inner: inner.clone(),
     };
+    // #607: the answer to a Create Bearer Request relayed by `dedicated_bearer`.
+    if msg.header.message_type == Gtp2MessageType::CreateBearerResponse as u8
+        && crate::dedicated_bearer::owns_answer(peer, seq)
+    {
+        crate::dedicated_bearer::on_mme_answer(&server, msg, peer);
+        return;
+    }
     let relay = server.take_pgw_request(peer, seq);
 
     let parsed = match s11_parse::parse_bearer_response(msg) {
@@ -4035,6 +4136,8 @@ mod tests {
         delete_cause: std::sync::Arc<std::sync::atomic::AtomicU8>,
         /// How long a Create Session Request waits for its answer, in ms.
         create_delay_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        /// The cause a Create Session Request is answered with (#1190 review).
+        create_cause: std::sync::Arc<std::sync::atomic::AtomicU8>,
         /// When set, the S5/S8-U F-TEID the Create Session Response gives is
         /// IPv6-only, at this address (#1156).
         s5u_ipv6: std::sync::Arc<std::sync::Mutex<Option<[u8; 16]>>>,
@@ -4065,6 +4168,10 @@ mod tests {
             gtp_cause::REQUEST_ACCEPTED,
         ));
         let create_delay_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let create_cause = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            gtp_cause::REQUEST_ACCEPTED,
+        ));
+        let created_cause = create_cause.clone();
         let s5u_ipv6 = std::sync::Arc::new(std::sync::Mutex::new(None::<[u8; 16]>));
         let s5u_v6 = s5u_ipv6.clone();
         let creates_seen = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -4139,8 +4246,10 @@ mod tests {
                     msg.header.sequence_number,
                 ));
                 let mut cause_buf = bytes::BytesMut::new();
-                nextgcore_gtp::v2::Gtp2CauseIe::new(gtp_cause::REQUEST_ACCEPTED)
-                    .encode(&mut cause_buf, 0);
+                nextgcore_gtp::v2::Gtp2CauseIe::new(
+                    created_cause.load(std::sync::atomic::Ordering::SeqCst),
+                )
+                .encode(&mut cause_buf, 0);
                 let mut c = cause_buf.freeze();
                 if let Ok(ie) = nextgcore_gtp::v2::ie::Gtp2Ie::decode(&mut c) {
                     resp.add_ie(ie);
@@ -4170,6 +4279,7 @@ mod tests {
             answer_deletes,
             delete_cause,
             create_delay_ms,
+            create_cause,
             s5u_ipv6,
             msgs,
             sock,
@@ -5071,6 +5181,93 @@ mod tests {
         sgwc_self().ue_remove(ue.id);
         sgwc_self().set_pgw_s5c_peer(None);
         server.close();
+    }
+
+    /// #1152, TS 29.274 §7.6 / §8.4: a PGW that never answers the relayed Create
+    /// Session Request (N3 exhausted) leaves the MME answered Remote peer not
+    /// responding under its own number, and the session and UE removed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unanswered_s5_create_session_is_answered_and_removed() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let _sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let pgw = with_stand_in_pgw().await;
+        // The PGW sits on the request far longer than T3 x (N3 + 1).
+        pgw.create_delay_ms
+            .store(10_000, std::sync::atomic::Ordering::SeqCst);
+        let server = test_server(&ambient, 100, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x52, 0xf1];
+        sock.send_to(&csr(0x1152, &imsi).encode(), server.local_addr())
+            .unwrap();
+        let rsp = recv_s11(&sock).await.expect("the MME is answered");
+        assert_eq!(
+            rsp.header.message_type,
+            Gtp2MessageType::CreateSessionResponse as u8
+        );
+        assert_eq!(rsp.header.sequence_number, 0x1152);
+        assert_eq!(cause_of(&rsp), gtp_cause::REMOTE_PEER_NOT_RESPONDING);
+        assert!(
+            sgwc_self().ue_find_by_imsi(&imsi).is_none(),
+            "the session and the UE are removed"
+        );
+        sgwc_self().set_pgw_s5c_peer(None);
+        server.close();
+    }
+
+    /// #1190 review: the PGW accepts the Create only after N3 ran out. The MME was
+    /// refused and the session removed, so the PGW's PDN connection is deleted
+    /// with a Delete Session Request to the S5/S8-C TEID its answer gives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_late_pgw_answer_after_n3_deletes_the_pgw_session() {
+        for (n, cause) in [
+            gtp_cause::REQUEST_ACCEPTED,
+            gtp_cause::NEW_PDN_TYPE_DUE_TO_SINGLE_ADDRESS_BEARER_ONLY,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let ambient = crate::pfcp_path::process_state_test_guard().await;
+            let _sgwu = stand_in_sgwu(
+                &ambient,
+                crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+                Duration::ZERO,
+            )
+            .await;
+            let pgw = with_stand_in_pgw().await;
+            // Longer than T3 x (N3 + 1) = 200 ms, then the PGW creates it.
+            pgw.create_delay_ms
+                .store(600, std::sync::atomic::Ordering::SeqCst);
+            pgw.create_cause
+                .store(cause, std::sync::atomic::Ordering::SeqCst);
+            let server = test_server(&ambient, 100, 1);
+            set_s11_server(server.clone());
+            let sock = client();
+            sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x90, 0xf1 - n as u8];
+            sock.send_to(&csr(0x1190 + n as u32, &imsi).encode(), server.local_addr())
+                .unwrap();
+            let rsp = recv_s11(&sock).await.expect("the MME is answered");
+            assert_eq!(cause_of(&rsp), gtp_cause::REMOTE_PEER_NOT_RESPONDING);
+            // At least one: the stand-in is still sleeping on the retransmitted
+            // Create, so the Delete Session may itself be retransmitted (T3 100 ms).
+            let deletes = pgw_deletes(&pgw, 1).await;
+            assert!(
+                deletes
+                    .iter()
+                    .all(|d| *d == (Some(0x0BEE_F001), Some(5), true)),
+                "cause {cause}: the PGW's late PDN connection is deleted: {deletes:?}"
+            );
+            sgwc_self().set_pgw_s5c_peer(None);
+            server.close();
+            drop(ambient);
+        }
     }
 
     /// #1132, TS 29.274 Table 7.2.2-2: the S11 Create Session Response's Bearer
@@ -6273,11 +6470,12 @@ mod tests {
 
     /// #641 stop-gap, TS 23.401 §5.4.1 step 8: the MME's refusal of a
     /// PGW-initiated Create Bearer Request ("Service not supported") reaches the
-    /// PGW under the PGW's number and S5-C TEID, with its Bearer Context.
+    /// PGW under the PGW's number and S5-C TEID, with its Bearer Context. #607: the
+    /// bearer the SGW-C set up for it is removed, here and at the SGW-U.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_refused_create_bearer_is_answered_to_the_pgw() {
         let ambient = crate::pfcp_path::process_state_test_guard().await;
-        let _sgwu = stand_in_sgwu(
+        let sgwu = stand_in_sgwu(
             &ambient,
             crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
             Duration::ZERO,
@@ -6293,15 +6491,7 @@ mod tests {
         let ue = ctx.ue_find_by_imsi(&imsi).unwrap();
         let sess = ctx.sess_list_for_ue(ue.id).remove(0);
 
-        let mut bc = Gtp2BearerContextIe::new();
-        bc.set_ebi(0);
-        let mut cbr = pgw_request(
-            Gtp2MessageType::CreateBearerRequest,
-            sess.sgw_s5c_teid,
-            0x0641,
-            &[(Gtp2IeType::Ebi as u8, 0, &[5])],
-        );
-        cbr.add_bearer_context(0, &bc);
+        let cbr = dedicated_cbr(sess.sgw_s5c_teid, 0x0641, 0x0BEE_F0D1);
         pgw.sock
             .send_to(&cbr.encode(), server.local_addr())
             .await
@@ -6310,6 +6500,11 @@ mod tests {
         assert_eq!(
             at_mme.header.message_type,
             Gtp2MessageType::CreateBearerRequest as u8
+        );
+        assert_eq!(
+            ctx.sess_find_by_id(sess.id).unwrap().bearer_ids.len(),
+            2,
+            "the dedicated bearer is held while the MME decides"
         );
         let mut rsp = Gtp2Message::new(nextgcore_gtp::v2::header::Gtp2Header::new(
             Gtp2MessageType::CreateBearerResponse as u8,
@@ -6330,43 +6525,668 @@ mod tests {
         assert_eq!(
             answered[0].get_ies(Gtp2IeType::BearerContext as u8).len(),
             1,
-            "the Bearer Context is relayed"
+            "one Bearer Context per requested bearer (Table 7.2.4-1)"
         );
         assert_eq!(
             ctx.sess_find_by_id(sess.id).unwrap().bearer_ids.len(),
             1,
-            "nothing created"
+            "the refused bearer is removed"
         );
+        let removals = sgwu_modifications(&sgwu)
+            .iter()
+            .filter(|m| m.remove_pdrs.len() == 2 && m.remove_fars.len() == 2)
+            .count();
+        assert_eq!(removals, 1, "and its rules at the SGW-U");
+        assert_eq!(crate::dedicated_bearer::pending_count(), 0);
+        ctx.ue_remove(ue.id);
+        sgwc_self().set_pgw_s5c_peer(None);
+        server.close();
+    }
 
-        // #1146 review: an ACCEPTED answer is not relayed: its Bearer Context
-        // is the MME/eNB side, not this SGW's S5/S8-U side (the #607 CB half).
-        let mut cbr2 = pgw_request(
+    /// A PGW's Create Bearer Request for one dedicated bearer (TS 29.274 Table 7.2.3-2 on
+    /// S5/S8): LBI 5, and a Bearer Context with EBI 0, a TFT, the PGW's S5/S8-U F-TEID
+    /// (`pgw_s5u_teid` at 127.0.0.1, instance 1) and a Bearer QoS.
+    fn dedicated_cbr(sgw_s5c_teid: u32, seq: u32, pgw_s5u_teid: u32) -> Gtp2Message {
+        let mut cbr = pgw_request(
             Gtp2MessageType::CreateBearerRequest,
-            sess.sgw_s5c_teid,
-            0x0642,
+            sgw_s5c_teid,
+            seq,
             &[(Gtp2IeType::Ebi as u8, 0, &[5])],
         );
-        let mut bc0 = Gtp2BearerContextIe::new();
-        bc0.set_ebi(0);
-        cbr2.add_bearer_context(0, &bc0);
+        // The PGW's restart counter, which must not reach the MME as this SGW's.
+        cbr.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Recovery as u8, 0, &[0x2a]));
+        let mut bc = Gtp2BearerContextIe::new();
+        bc.set_ebi(0);
+        // Create new TFT, one bidirectional filter: protocol UDP (TS 24.008 §10.5.6.12).
+        bc.add_ie(Gtp2Ie::from_slice(
+            Gtp2IeType::BearerTft as u8,
+            0,
+            &[0x21, 0x31, 0x00, 0x02, 0x30, 0x11],
+        ));
+        bc.set_fteid(
+            1,
+            &Gtp2FTeidIe::new_ipv4(
+                crate::s11_build::f_teid_interface::S5_S8_PGW_GTP_U,
+                pgw_s5u_teid,
+                [127, 0, 0, 1],
+            ),
+        );
+        let mut qos = nextgcore_gtp::v2::Gtp2BearerQosIe::new(1, 128, 128, 64, 64);
+        qos.pl = 2;
+        bc.set_bearer_qos(&qos);
+        cbr.add_bearer_context(0, &bc);
+        cbr
+    }
+
+    /// The Session Modification Requests the stand-in SGW-U received, decoded.
+    fn sgwu_modifications(
+        sgwu: &StandInSgwu,
+    ) -> Vec<nextgcore_pfcp::message::SessionModificationRequest> {
+        sgwu.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(t, _, _)| *t == 52)
+            .map(|(_, _, body)| {
+                let mut b = Bytes::copy_from_slice(body);
+                nextgcore_pfcp::message::SessionModificationRequest::decode(&mut b)
+                    .expect("decodable modification")
+            })
+            .collect()
+    }
+
+    /// Wait until the stand-in SGW-U has received `n` Session Modification Requests.
+    async fn sgwu_wait_modifications(sgwu: &StandInSgwu, n: usize) {
+        for _ in 0..400 {
+            if sgwu.received(52) >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!(
+            "the SGW-U received {} Session Modification(s), not {n}",
+            sgwu.received(52)
+        );
+    }
+
+    /// #607 (Create Bearer half), TS 23.401 §5.4.1 steps 2-3 and 7-8: the SGW-C sets
+    /// up the dedicated bearer at the SGW-U, relays the request to the MME with its own
+    /// S1-U F-TEID, switches the downlink to the eNB the MME names, and answers the PGW
+    /// with its S5/S8-U F-TEID (Tables 7.2.3-2, 7.2.4-2).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_create_bearer_request_sets_up_the_dedicated_bearer_on_both_legs() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let pgw = with_stand_in_pgw().await;
+        let server = test_server(&ambient, 2000, 1);
+        set_s11_server(server.clone());
+        let mme = client();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x61, 0xf7];
+        let sgw_s11_teid = created_session(&server, &mme, &imsi, 0x6071).await;
+        let ctx = sgwc_self();
+        let ue = ctx.ue_find_by_imsi(&imsi).unwrap();
+        let sess = ctx.sess_list_for_ue(ue.id).remove(0);
+        let before = sgwu.received(52);
+
+        const PGW_S5U: u32 = 0x0BEE_F0D1;
+        const ENB_S1U: u32 = 0x0E0B_0006;
+        let cbr = dedicated_cbr(sess.sgw_s5c_teid, 0x0607, PGW_S5U);
         pgw.sock
-            .send_to(&cbr2.encode(), server.local_addr())
+            .send_to(&cbr.encode(), server.local_addr())
             .await
             .unwrap();
+
+        // Step 2: both directions at the SGW-U before anything reaches the MME.
         let at_mme = recv_s11(&mme).await.expect("relayed to the MME");
-        let mut ok = Gtp2Message::new(nextgcore_gtp::v2::header::Gtp2Header::new(
+        assert_eq!(
+            at_mme.header.message_type,
+            Gtp2MessageType::CreateBearerRequest as u8
+        );
+        sgwu_wait_modifications(&sgwu, before + 1).await;
+        let install = sgwu_modifications(&sgwu).remove(before);
+        assert_eq!(install.create_pdrs.len(), 2, "an uplink and a downlink PDR");
+        assert_eq!(install.create_fars.len(), 2);
+        let bearer = ctx
+            .sess_find_by_id(sess.id)
+            .unwrap()
+            .bearer_ids
+            .iter()
+            .filter_map(|&id| ctx.bearer_find_by_id(id))
+            .find(|b| b.ebi == 0)
+            .expect("the dedicated bearer is held with EBI 0");
+        let ul = ctx.ul_tunnel_in_bearer(bearer.id).unwrap();
+        let dl = ctx.dl_tunnel_in_bearer(bearer.id).unwrap();
+        let far = |id: Option<u32>| {
+            install
+                .create_fars
+                .iter()
+                .find(|f| Some(f.far_id) == id)
+                .cloned()
+                .expect("the FAR is created")
+        };
+        let ul_far = far(ul.far_id);
+        assert_eq!(
+            ul_far
+                .forwarding_parameters
+                .as_ref()
+                .and_then(|fp| fp.outer_header_creation.as_ref())
+                .map(|o| (o.teid, o.ipv4_addr)),
+            Some((Some(PGW_S5U), Some([127, 0, 0, 1]))),
+            "the uplink tunnels to the PGW's S5/S8-U F-TEID"
+        );
+        assert!(
+            far(dl.far_id).apply_action.buff,
+            "the downlink buffers until the eNB is known"
+        );
+
+        // The S11 request: the S1-U SGW F-TEID at instance 0, the PGW's kept at 1, and no
+        // Recovery.
+        let bc = at_mme.bearer_context(0).unwrap().expect("a Bearer Context");
+        let s1u = bc
+            .fteid(0)
+            .unwrap()
+            .expect("the S1-U SGW F-TEID (instance 0)");
+        assert_eq!(
+            (s1u.interface_type, s1u.teid, s1u.ipv4_addr),
+            (
+                crate::s11_build::f_teid_interface::S1_U_SGW_GTP_U,
+                ul.local_teid,
+                Some([10, 99, 0, 1])
+            )
+        );
+        assert_eq!(bc.fteid(1).unwrap().map(|f| f.teid), Some(PGW_S5U));
+        assert!(bc.get_ie(Gtp2IeType::BearerTft as u8, 0).is_some());
+        assert_eq!(at_mme.header.teid, Some(ue.mme_s11_teid));
+        assert!(
+            at_mme.get_ie(Gtp2IeType::Recovery as u8, 0).is_none(),
+            "the PGW's Recovery is not relayed as this SGW's"
+        );
+
+        // A retransmission from the PGW while the MME decides is not relayed again.
+        pgw.sock
+            .send_to(&cbr.encode(), server.local_addr())
+            .await
+            .unwrap();
+        assert!(
+            quiet_for(&mme, 300).await,
+            "a retransmission was relayed again"
+        );
+
+        // Step 7: the MME accepts, EBI 6, with the eNB's S1-U F-TEID.
+        let mut rsp = Gtp2Message::new(nextgcore_gtp::v2::header::Gtp2Header::new(
             Gtp2MessageType::CreateBearerResponse as u8,
             sgw_s11_teid,
             at_mme.header.sequence_number,
         ));
-        ok.add_ie(Gtp2CauseIe::new(gtp_cause::REQUEST_ACCEPTED).to_ie(0));
-        mme.send_to(&ok.encode(), server.local_addr()).unwrap();
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(
-            pgw_got(&pgw, Gtp2MessageType::CreateBearerResponse).len(),
-            1,
-            "the accepted answer is not relayed"
+        rsp.add_ie(Gtp2CauseIe::new(gtp_cause::REQUEST_ACCEPTED).to_ie(0));
+        let mut bc = Gtp2BearerContextIe::new();
+        bc.set_ebi(6);
+        bc.set_cause(&Gtp2CauseIe::new(gtp_cause::REQUEST_ACCEPTED));
+        bc.set_fteid(
+            0,
+            &Gtp2FTeidIe::new_ipv4(
+                crate::s11_build::f_teid_interface::S1_U_ENODEB_GTP_U,
+                ENB_S1U,
+                [127, 0, 0, 6],
+            ),
         );
+        bc.set_fteid(1, &s1u);
+        rsp.add_bearer_context(0, &bc);
+        mme.send_to(&rsp.encode(), server.local_addr()).unwrap();
+
+        // Step 8: the PGW's answer, after the downlink switch.
+        let answered = pgw_wait(&pgw, Gtp2MessageType::CreateBearerResponse, 1).await;
+        let a = &answered[0];
+        assert_eq!(a.header.sequence_number, 0x0607);
+        assert_eq!(a.header.teid, Some(0x0BEE_F001));
+        assert_eq!(cause_of(a), gtp_cause::REQUEST_ACCEPTED);
+        let abc = a.bearer_context(0).unwrap().expect("the Bearer Context");
+        assert_eq!(abc.ebi().unwrap(), 6);
+        let sgw_s5u = abc
+            .fteid(2)
+            .unwrap()
+            .expect("the S5/S8-U SGW F-TEID (instance 2)");
+        assert_eq!(
+            (sgw_s5u.interface_type, sgw_s5u.teid),
+            (
+                crate::s11_build::f_teid_interface::S5_S8_SGW_GTP_U,
+                dl.local_teid
+            )
+        );
+        assert_eq!(abc.fteid(3).unwrap().map(|f| f.teid), Some(PGW_S5U));
+        assert!(
+            abc.fteid(0).unwrap().is_none() && abc.fteid(1).unwrap().is_none(),
+            "the S1-U F-TEIDs are S11-only"
+        );
+        let switch = sgwu_modifications(&sgwu).remove(before + 1);
+        assert!(
+            switch.update_fars.iter().any(|f| {
+                Some(f.far_id) == dl.far_id
+                    && f.forwarding_parameters
+                        .as_ref()
+                        .and_then(|fp| fp.outer_header_creation.as_ref())
+                        .is_some_and(|o| o.teid == Some(ENB_S1U))
+            }),
+            "the downlink forwards to the eNB's S1-U F-TEID"
+        );
+        let stored = ctx.bearer_find_by_id(bearer.id).unwrap();
+        assert_eq!(stored.ebi, 6);
+        assert_eq!(
+            ctx.dl_tunnel_in_bearer(bearer.id).unwrap().remote_teid,
+            ENB_S1U
+        );
+        assert_eq!(crate::dedicated_bearer::pending_count(), 0);
+
+        ctx.ue_remove(ue.id);
+        sgwc_self().set_pgw_s5c_peer(None);
+        server.close();
+    }
+
+    /// #607: an SGW-U that refuses the dedicated bearer's rules gets the PGW a refusal
+    /// ("System failure"), and the MME never hears of the bearer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_create_bearer_the_sgwu_refuses_is_refused_to_the_pgw() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        // The establishment is accepted, the bearer install (the first modification)
+        // refused.
+        let _sgwu = stand_in_sgwu_scripted(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+            vec![(
+                crate::sxa_handler::pfcp_cause::NO_RESOURCES_AVAILABLE,
+                Duration::ZERO,
+            )],
+            0x5555_0001,
+        )
+        .await;
+        let pgw = with_stand_in_pgw().await;
+        let server = test_server(&ambient, 2000, 1);
+        set_s11_server(server.clone());
+        let mme = client();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x61, 0xf8];
+        let _ = created_session(&server, &mme, &imsi, 0x6072).await;
+        let ctx = sgwc_self();
+        let ue = ctx.ue_find_by_imsi(&imsi).unwrap();
+        let sess = ctx.sess_list_for_ue(ue.id).remove(0);
+
+        let cbr = dedicated_cbr(sess.sgw_s5c_teid, 0x0608, 0x0BEE_F0D2);
+        pgw.sock
+            .send_to(&cbr.encode(), server.local_addr())
+            .await
+            .unwrap();
+        let answered = pgw_wait(&pgw, Gtp2MessageType::CreateBearerResponse, 1).await;
+        assert_eq!(answered[0].header.sequence_number, 0x0608);
+        assert_eq!(cause_of(&answered[0]), gtp_cause::SYSTEM_FAILURE);
+        assert!(quiet_for(&mme, 300).await, "the MME must not be asked");
+        assert_eq!(
+            ctx.sess_find_by_id(sess.id).unwrap().bearer_ids.len(),
+            1,
+            "nothing is kept"
+        );
+        assert_eq!(crate::dedicated_bearer::pending_count(), 0);
+
+        ctx.ue_remove(ue.id);
+        sgwc_self().set_pgw_s5c_peer(None);
+        server.close();
+    }
+
+    /// [`dedicated_cbr`] with a second Bearer Context, its PGW S5/S8-U F-TEID `second`.
+    fn two_bearer_cbr(sgw_s5c_teid: u32, seq: u32, first: u32, second: u32) -> Gtp2Message {
+        let mut cbr = dedicated_cbr(sgw_s5c_teid, seq, first);
+        let one = dedicated_cbr(sgw_s5c_teid, seq, second);
+        let bc = one.bearer_context(0).unwrap().unwrap();
+        cbr.add_bearer_context(0, &bc);
+        cbr
+    }
+
+    /// The MME's Bearer Context answering a bearer: `ebi`, `cause`, the eNB's F-TEID
+    /// `enb` (instance 0) and the echoed S1-U SGW F-TEID `s1u` (instance 1).
+    fn mme_bc(ebi: u8, cause: u8, enb: u32, s1u: &Gtp2FTeidIe) -> Gtp2BearerContextIe {
+        let mut bc = Gtp2BearerContextIe::new();
+        bc.set_ebi(ebi);
+        bc.set_cause(&Gtp2CauseIe::new(cause));
+        if cause == gtp_cause::REQUEST_ACCEPTED {
+            bc.set_fteid(
+                0,
+                &Gtp2FTeidIe::new_ipv4(
+                    crate::s11_build::f_teid_interface::S1_U_ENODEB_GTP_U,
+                    enb,
+                    [127, 0, 0, 6],
+                ),
+            );
+        }
+        bc.set_fteid(1, s1u);
+        bc
+    }
+
+    /// (EBI, cause, S5/S8-U SGW TEID at instance 2) per Bearer Context of a PGW answer.
+    fn pgw_bearers(msg: &Gtp2Message) -> Vec<(u8, u8, Option<u32>)> {
+        msg.get_ies(Gtp2IeType::BearerContext as u8)
+            .into_iter()
+            .map(|ie| {
+                let bc = Gtp2BearerContextIe::decode(&ie.value).unwrap();
+                (
+                    bc.ebi().unwrap(),
+                    bc.cause().unwrap().unwrap().cause,
+                    bc.fteid(2).unwrap().map(|f| f.teid),
+                )
+            })
+            .collect()
+    }
+
+    /// #1189 review: a two-bearer request the MME answers in REVERSE order, the first
+    /// bearer refused. Each answer is matched to its bearer by the echoed S1-U SGW
+    /// F-TEID, so the accepted bearer gets ITS eNB tunnel; the PGW hears "Request
+    /// accepted partially" with per-bearer causes; the refused bearer is removed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_two_bearer_create_bearer_answered_out_of_order_is_partially_accepted() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let _sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let pgw = with_stand_in_pgw().await;
+        let server = test_server(&ambient, 2000, 1);
+        set_s11_server(server.clone());
+        let mme = client();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x61, 0xfa];
+        let sgw_s11_teid = created_session(&server, &mme, &imsi, 0x6074).await;
+        let ctx = sgwc_self();
+        let ue = ctx.ue_find_by_imsi(&imsi).unwrap();
+        let sess = ctx.sess_list_for_ue(ue.id).remove(0);
+
+        let cbr = two_bearer_cbr(sess.sgw_s5c_teid, 0x0611, 0x0BEE_0001, 0x0BEE_0002);
+        pgw.sock
+            .send_to(&cbr.encode(), server.local_addr())
+            .await
+            .unwrap();
+        let at_mme = recv_s11(&mme).await.expect("relayed to the MME");
+        let s1u: Vec<Gtp2FTeidIe> = at_mme
+            .get_ies(Gtp2IeType::BearerContext as u8)
+            .into_iter()
+            .map(|ie| {
+                Gtp2BearerContextIe::decode(&ie.value)
+                    .unwrap()
+                    .fteid(0)
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(s1u.len(), 2);
+        assert_ne!(s1u[0].teid, s1u[1].teid, "an S1-U tunnel each");
+        // The bearers, by their S1-U TEID, before the answer renames them.
+        let bearer_of = |teid: u32| {
+            ctx.sess_find_by_id(sess.id)
+                .unwrap()
+                .bearer_ids
+                .iter()
+                .copied()
+                .find(|&id| {
+                    ctx.ul_tunnel_in_bearer(id)
+                        .is_some_and(|t| t.local_teid == teid)
+                })
+                .unwrap()
+        };
+        let (first, second) = (bearer_of(s1u[0].teid), bearer_of(s1u[1].teid));
+
+        let mut rsp = Gtp2Message::new(nextgcore_gtp::v2::header::Gtp2Header::new(
+            Gtp2MessageType::CreateBearerResponse as u8,
+            sgw_s11_teid,
+            at_mme.header.sequence_number,
+        ));
+        rsp.add_ie(Gtp2CauseIe::new(gtp_cause::REQUEST_ACCEPTED_PARTIALLY).to_ie(0));
+        rsp.add_bearer_context(
+            0,
+            &mme_bc(7, gtp_cause::REQUEST_ACCEPTED, 0x0E0B_0007, &s1u[1]),
+        );
+        rsp.add_bearer_context(0, &mme_bc(0, gtp_cause::UE_REFUSES, 0, &s1u[0]));
+        mme.send_to(&rsp.encode(), server.local_addr()).unwrap();
+
+        let answered = pgw_wait(&pgw, Gtp2MessageType::CreateBearerResponse, 1).await;
+        assert_eq!(
+            cause_of(&answered[0]),
+            gtp_cause::REQUEST_ACCEPTED_PARTIALLY,
+            "one of two bearers"
+        );
+        let dl2 = ctx.dl_tunnel_in_bearer(second).unwrap();
+        assert_eq!(
+            dl2.remote_teid, 0x0E0B_0007,
+            "the second bearer's own eNB tunnel"
+        );
+        assert_eq!(ctx.bearer_find_by_id(second).unwrap().ebi, 7);
+        assert_eq!(
+            pgw_bearers(&answered[0]),
+            vec![
+                (0, gtp_cause::UE_REFUSES, None),
+                (7, gtp_cause::REQUEST_ACCEPTED, Some(dl2.local_teid)),
+            ]
+        );
+        assert!(
+            ctx.bearer_find_by_id(first).is_none(),
+            "the refused bearer is removed"
+        );
+        assert_eq!(crate::dedicated_bearer::pending_count(), 0);
+        ctx.ue_remove(ue.id);
+        sgwc_self().set_pgw_s5c_peer(None);
+        server.close();
+    }
+
+    /// #1189 review: two bearers answered with the SAME EBI. The second is not a free EPS
+    /// bearer identity of the PDN connection, so it is refused ("Mandatory IE
+    /// incorrect") and removed; the PGW hears "Request accepted partially".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_create_bearer_answered_with_a_duplicate_ebi_refuses_the_second() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let _sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let pgw = with_stand_in_pgw().await;
+        let server = test_server(&ambient, 2000, 1);
+        set_s11_server(server.clone());
+        let mme = client();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x61, 0xfb];
+        let sgw_s11_teid = created_session(&server, &mme, &imsi, 0x6075).await;
+        let ctx = sgwc_self();
+        let ue = ctx.ue_find_by_imsi(&imsi).unwrap();
+        let sess = ctx.sess_list_for_ue(ue.id).remove(0);
+        let cbr = two_bearer_cbr(sess.sgw_s5c_teid, 0x0612, 0x0BEE_0003, 0x0BEE_0004);
+        pgw.sock
+            .send_to(&cbr.encode(), server.local_addr())
+            .await
+            .unwrap();
+        let at_mme = recv_s11(&mme).await.expect("relayed to the MME");
+        let s1u: Vec<Gtp2FTeidIe> = at_mme
+            .get_ies(Gtp2IeType::BearerContext as u8)
+            .into_iter()
+            .map(|ie| {
+                Gtp2BearerContextIe::decode(&ie.value)
+                    .unwrap()
+                    .fteid(0)
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        let mut rsp = Gtp2Message::new(nextgcore_gtp::v2::header::Gtp2Header::new(
+            Gtp2MessageType::CreateBearerResponse as u8,
+            sgw_s11_teid,
+            at_mme.header.sequence_number,
+        ));
+        rsp.add_ie(Gtp2CauseIe::new(gtp_cause::REQUEST_ACCEPTED).to_ie(0));
+        rsp.add_bearer_context(
+            0,
+            &mme_bc(6, gtp_cause::REQUEST_ACCEPTED, 0x0E0B_0016, &s1u[0]),
+        );
+        rsp.add_bearer_context(
+            0,
+            &mme_bc(6, gtp_cause::REQUEST_ACCEPTED, 0x0E0B_0026, &s1u[1]),
+        );
+        mme.send_to(&rsp.encode(), server.local_addr()).unwrap();
+        let answered = pgw_wait(&pgw, Gtp2MessageType::CreateBearerResponse, 1).await;
+        assert_eq!(
+            cause_of(&answered[0]),
+            gtp_cause::REQUEST_ACCEPTED_PARTIALLY
+        );
+        let causes: Vec<(u8, u8)> = pgw_bearers(&answered[0])
+            .iter()
+            .map(|b| (b.0, b.1))
+            .collect();
+        assert_eq!(
+            causes,
+            vec![
+                (6, gtp_cause::REQUEST_ACCEPTED),
+                (6, gtp_cause::MANDATORY_IE_INCORRECT)
+            ]
+        );
+        assert_eq!(
+            ctx.sess_find_by_id(sess.id).unwrap().bearer_ids.len(),
+            2,
+            "the default bearer and the first dedicated one"
+        );
+        ctx.ue_remove(ue.id);
+        sgwc_self().set_pgw_s5c_peer(None);
+        server.close();
+    }
+
+    /// #1189 review: the SGW-U refuses the downlink switch (the ACTIVATE) after the MME
+    /// accepted. The bearer is removed at the SGW-U and here, and the PGW is refused
+    /// "System failure" (the disclosed ceiling: the MME still holds it).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_create_bearer_whose_downlink_switch_the_sgwu_refuses_is_undone() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        // The install (first modification) accepted, the ACTIVATE (second) refused.
+        let sgwu = stand_in_sgwu_scripted(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+            vec![
+                (
+                    crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+                    Duration::ZERO,
+                ),
+                (
+                    crate::sxa_handler::pfcp_cause::NO_RESOURCES_AVAILABLE,
+                    Duration::ZERO,
+                ),
+            ],
+            0x5555_0001,
+        )
+        .await;
+        let pgw = with_stand_in_pgw().await;
+        let server = test_server(&ambient, 2000, 1);
+        set_s11_server(server.clone());
+        let mme = client();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x61, 0xfc];
+        let sgw_s11_teid = created_session(&server, &mme, &imsi, 0x6076).await;
+        let ctx = sgwc_self();
+        let ue = ctx.ue_find_by_imsi(&imsi).unwrap();
+        let sess = ctx.sess_list_for_ue(ue.id).remove(0);
+        let cbr = dedicated_cbr(sess.sgw_s5c_teid, 0x0613, 0x0BEE_0005);
+        pgw.sock
+            .send_to(&cbr.encode(), server.local_addr())
+            .await
+            .unwrap();
+        let at_mme = recv_s11(&mme).await.expect("relayed to the MME");
+        let s1u = at_mme
+            .bearer_context(0)
+            .unwrap()
+            .unwrap()
+            .fteid(0)
+            .unwrap()
+            .unwrap();
+        let mut rsp = Gtp2Message::new(nextgcore_gtp::v2::header::Gtp2Header::new(
+            Gtp2MessageType::CreateBearerResponse as u8,
+            sgw_s11_teid,
+            at_mme.header.sequence_number,
+        ));
+        rsp.add_ie(Gtp2CauseIe::new(gtp_cause::REQUEST_ACCEPTED).to_ie(0));
+        rsp.add_bearer_context(
+            0,
+            &mme_bc(6, gtp_cause::REQUEST_ACCEPTED, 0x0E0B_0036, &s1u),
+        );
+        mme.send_to(&rsp.encode(), server.local_addr()).unwrap();
+        let answered = pgw_wait(&pgw, Gtp2MessageType::CreateBearerResponse, 1).await;
+        assert_eq!(cause_of(&answered[0]), gtp_cause::SYSTEM_FAILURE);
+        assert_eq!(
+            ctx.sess_find_by_id(sess.id).unwrap().bearer_ids.len(),
+            1,
+            "the bearer is removed here"
+        );
+        let mut removed = false;
+        for _ in 0..200 {
+            if sgwu_modifications(&sgwu)
+                .iter()
+                .any(|m| m.remove_pdrs.len() == 2 && m.remove_fars.len() == 2)
+            {
+                removed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(removed, "and at the SGW-U");
+        assert_eq!(crate::dedicated_bearer::pending_count(), 0);
+        ctx.ue_remove(ue.id);
+        sgwc_self().set_pgw_s5c_peer(None);
+        server.close();
+    }
+
+    /// #607: an MME that never answers the relayed Create Bearer Request (S11 N3 runs
+    /// out) leaves no bearer behind, here or at the SGW-U, and the PGW is told
+    /// "Remote peer not responding" (TS 29.274 §8.4) rather than left to time out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_create_bearer_the_mme_never_answers_is_undone() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let pgw = with_stand_in_pgw().await;
+        let server = test_server(&ambient, 100, 1);
+        set_s11_server(server.clone());
+        let mme = client();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x61, 0xf9];
+        let _ = created_session(&server, &mme, &imsi, 0x6073).await;
+        let ctx = sgwc_self();
+        let ue = ctx.ue_find_by_imsi(&imsi).unwrap();
+        let sess = ctx.sess_list_for_ue(ue.id).remove(0);
+
+        let cbr = dedicated_cbr(sess.sgw_s5c_teid, 0x0609, 0x0BEE_F0D3);
+        pgw.sock
+            .send_to(&cbr.encode(), server.local_addr())
+            .await
+            .unwrap();
+        let _ = recv_s11(&mme)
+            .await
+            .expect("relayed to the MME, which stays silent");
+        let answered = pgw_wait(&pgw, Gtp2MessageType::CreateBearerResponse, 1).await;
+        assert_eq!(answered[0].header.sequence_number, 0x0609);
+        assert_eq!(
+            cause_of(&answered[0]),
+            gtp_cause::REMOTE_PEER_NOT_RESPONDING
+        );
+        assert_eq!(
+            ctx.sess_find_by_id(sess.id).unwrap().bearer_ids.len(),
+            1,
+            "the bearer is removed"
+        );
+        let removed = sgwu_modifications(&sgwu)
+            .iter()
+            .any(|m| m.remove_pdrs.len() == 2 && m.remove_fars.len() == 2);
+        assert!(removed, "and its rules at the SGW-U");
+        assert_eq!(crate::dedicated_bearer::pending_count(), 0);
+
         ctx.ue_remove(ue.id);
         sgwc_self().set_pgw_s5c_peer(None);
         server.close();
@@ -7763,9 +8583,14 @@ mod tests {
         let pgw = client();
         sgwc_self().set_pgw_s5c_peer(Some(pgw.local_addr().unwrap()));
 
+        // #607: a triggered Create Bearer Request is no longer relayed verbatim (it
+        // needs the SGW-U first), so a triggered Update Bearer Request carries the
+        // relay case; an incomplete triggered Create Bearer Request, refused here, gets
+        // the MME a Bearer Resource Failure Indication under the Command's number.
         for (n, triggered) in [
-            Gtp2MessageType::CreateBearerRequest,
+            Gtp2MessageType::UpdateBearerRequest,
             Gtp2MessageType::BearerResourceFailureIndication,
+            Gtp2MessageType::CreateBearerRequest,
         ]
         .into_iter()
         .enumerate()
@@ -7801,6 +8626,7 @@ mod tests {
                 s5c_seq,
             ));
             answer.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Ebi as u8, 0, &[5]));
+            answer.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Pti as u8, 0, &[9]));
             if triggered == Gtp2MessageType::BearerResourceFailureIndication {
                 answer.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Cause as u8, 0, &[73, 0]));
             }
@@ -7808,22 +8634,55 @@ mod tests {
 
             // The MME receives it under ITS number, addressed to its TEID.
             let at_mme = recv_msg(&mme);
-            assert_eq!(at_mme.header.message_type, triggered as u8);
+            let expected = if triggered == Gtp2MessageType::CreateBearerRequest {
+                Gtp2MessageType::BearerResourceFailureIndication
+            } else {
+                triggered
+            };
+            assert_eq!(at_mme.header.message_type, expected as u8);
             assert_eq!(
                 at_mme.header.sequence_number, mme_seq,
                 "{triggered:?} must reach the MME under the Command's S11 sequence number"
             );
             assert_eq!(at_mme.header.teid, Some(0x0000_0591));
-            if triggered == Gtp2MessageType::CreateBearerRequest {
+            if triggered == Gtp2MessageType::UpdateBearerRequest {
                 // The MME answers the triggered Request under the same number,
                 // which closes the SGW-C's S11 transaction for it.
                 let mut rsp = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
-                    Gtp2MessageType::CreateBearerResponse as u8,
+                    Gtp2MessageType::UpdateBearerResponse as u8,
                     s11_teid,
                     mme_seq,
                 ));
                 rsp.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Cause as u8, 0, &[16, 0]));
                 mme.send_to(&rsp.encode(), server.local_addr()).unwrap();
+            }
+            if triggered == Gtp2MessageType::CreateBearerRequest {
+                // The refusal names the cause, the LBI and the PTI (Table 7.2.6-1).
+                assert_eq!(
+                    at_mme
+                        .get_ie(Gtp2IeType::Cause as u8, 0)
+                        .map(|ie| ie.value[0]),
+                    Some(gtp_cause::MANDATORY_IE_MISSING)
+                );
+                assert_eq!(
+                    at_mme
+                        .get_ie(Gtp2IeType::Ebi as u8, 0)
+                        .map(|ie| ie.value[0]),
+                    Some(5)
+                );
+                assert_eq!(
+                    at_mme
+                        .get_ie(Gtp2IeType::Pti as u8, 0)
+                        .map(|ie| ie.value[0]),
+                    Some(9)
+                );
+                // And the PGW's request is answered with the same refusal.
+                let at_pgw = recv_msg(&pgw);
+                assert_eq!(
+                    at_pgw.header.message_type,
+                    Gtp2MessageType::CreateBearerResponse as u8
+                );
+                assert_eq!(at_pgw.header.sequence_number, s5c_seq);
             }
 
             // And the S5-C Command is not retransmitted after its answer.

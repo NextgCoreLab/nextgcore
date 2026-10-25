@@ -12,6 +12,7 @@
 #                                                #   re-run: keeps the live modes
 #   ENABLE_DATAPLANE=true ./deploy-eks.sh        # privileged UPF w/ real TUN
 #   EPHEMERAL_STORAGE=true ./deploy-eks.sh       # MongoDB on emptyDir (no EBS CSI)
+#   AMF_UE_CONTEXT_STORE=true ./deploy-eks.sh    # #686: UE contexts survive an AMF restart
 #   RECREATE_MONGODB=true ./deploy-eks.sh        # allow recreating the mongodb
 #                                                #   StatefulSet (data loss, see below)
 #   DRY_RUN=true ./deploy-eks.sh                 # render + validate, apply nothing
@@ -57,6 +58,11 @@ EPHEMERAL_STORAGE="${EPHEMERAL_STORAGE:-auto}"
 # install's claims are retained. Without this flag such a change stops the
 # script before anything is applied.
 RECREATE_MONGODB="${RECREATE_MONGODB:-false}"
+# #686: the AMF stores every registered UE's context in MongoDB (collection
+# amf_ue_contexts) and restores it after a restart (TS 23.501 §5.21.2.3). Off by
+# default. The base manifest already pins the AMF's nfInstanceId, which restoration
+# needs. The records hold NAS keys in clear, in the UDR's MongoDB.
+AMF_UE_CONTEXT_STORE="${AMF_UE_CONTEXT_STORE:-false}"
 
 log()  { printf '\033[0;32m[deploy]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn  ]\033[0m %s\n' "$*"; }
@@ -140,6 +146,7 @@ if [[ "${DRY_RUN}" != "true" ]]; then
   gnb/ue tag     : ${SIM_TAG}
   data plane     : ${ENABLE_DATAPLANE}${DATAPLANE_NOTE}
   mongo storage  : $([[ "${EPHEMERAL_STORAGE}" == "true" ]] && echo "emptyDir (EPHEMERAL - data lost on restart)" || echo "gp3 PVC")${STORAGE_NOTE}
+  AMF UE store   : ${AMF_UE_CONTEXT_STORE}
 
 EOF
   read -r -p "Apply to this cluster? [y/N] " reply
@@ -339,6 +346,45 @@ for d in yaml.safe_load_all(open(sys.argv[1])):
     out.append(d)
 if not swapped:
     sys.exit('mongodb StatefulSet not found in rendered manifests')
+yaml.safe_dump_all(out, sys.stdout, default_flow_style=False)
+PY
+  mv "${RENDERED}.tmp" "${RENDERED}"
+fi
+
+# #686: point the AMF at MongoDB for its UE context store. Post-render, like the
+# swaps around it, so the default stays as it was and the opt-in is one env var.
+if [[ "${AMF_UE_CONTEXT_STORE}" == "true" ]]; then
+  log "AMF UE context store: on (MongoDB collection amf_ue_contexts)"
+  python3 - "${RENDERED}" "${NAMESPACE}" <<'PY' > "${RENDERED}.tmp" || die "amf ue-context-store patch failed"
+import sys, yaml
+out = []
+patched = False
+for d in yaml.safe_load_all(open(sys.argv[1])):
+    if not d:
+        continue
+    if d.get('kind') == 'Deployment' and d['metadata']['name'] == 'amf':
+        ns = d['metadata'].get('namespace') or sys.argv[2]
+        uri = f'mongodb://mongodb.{ns}.svc.cluster.local:27017/nextgcore'
+        pod = d['spec']['template']['spec']
+        for c in pod['containers']:
+            if c['name'] == 'amf':
+                env = [e for e in c.get('env', []) if e.get('name') != 'AMF_UE_CONTEXT_DB_URI']
+                env.append({'name': 'AMF_UE_CONTEXT_DB_URI', 'value': uri})
+                c['env'] = env
+                patched = True
+        inits = pod.get('initContainers', [])
+        if not any(i.get('name') == 'wait-mongodb' for i in inits):
+            inits.append({
+                'name': 'wait-mongodb',
+                'image': 'busybox:1.36',
+                'command': ['sh', '-c',
+                            f'until nc -z mongodb.{ns}.svc.cluster.local 27017; do '
+                            'echo waiting for mongodb; sleep 2; done'],
+            })
+        pod['initContainers'] = inits
+    out.append(d)
+if not patched:
+    sys.exit('amf Deployment not found in rendered manifests')
 yaml.safe_dump_all(out, sys.stdout, default_flow_style=False)
 PY
   mv "${RENDERED}.tmp" "${RENDERED}"

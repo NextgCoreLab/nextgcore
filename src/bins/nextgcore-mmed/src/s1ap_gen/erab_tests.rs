@@ -423,3 +423,45 @@ fn the_production_builders_send_the_generated_bytes() {
     .unwrap();
     assert_eq!(hex(&bytes), hex(&expected));
 }
+
+/// #1204, TS 36.413 §9.2.1.19 (`BitRate ::= INTEGER (0..10000000000)`, not
+/// extensible): an E-RAB GBR bit rate past 10 Gbit/s is sent as 10 Gbit/s
+/// instead of failing the whole E-RAB SETUP REQUEST, and decodes back as the
+/// maximum; one in range is unchanged.
+#[test]
+fn an_erab_bit_rate_past_the_s1ap_range_is_sent_as_its_maximum() {
+    const MAX: u64 = 10_000_000_000;
+    let mut q = qos(1, true);
+    q.gbr_qos_info = Some(GbrQosInformation {
+        erab_max_bitrate_dl: u64::MAX,
+        erab_max_bitrate_ul: MAX + 1,
+        erab_guaranteed_bitrate_dl: MAX,
+        erab_guaranteed_bitrate_ul: 4_000_000,
+    });
+    let req = ErabSetupRequest {
+        mme_ue_s1ap_id: 1,
+        enb_ue_s1ap_id: 1,
+        ue_ambr: None,
+        erab_list: vec![ErabToBeSetupItem {
+            erab_id: 5,
+            erab_qos: q,
+            transport_layer_address: vec![10, 0, 0, 1],
+            gtp_teid: 0x1204,
+            nas_pdu: Some(vec![0x27]),
+        }],
+    };
+    let bytes = build_erab_setup_request(&req).expect("encodes");
+    let S1apMessage::ErabSetupRequest(back) = decode_s1ap_pdu(&bytes).unwrap() else {
+        panic!("not an E-RAB SETUP REQUEST");
+    };
+    let gbr = back.erab_list[0].erab_qos.gbr_qos_info.as_ref().unwrap();
+    assert_eq!(
+        (
+            gbr.erab_max_bitrate_dl,
+            gbr.erab_max_bitrate_ul,
+            gbr.erab_guaranteed_bitrate_dl,
+            gbr.erab_guaranteed_bitrate_ul
+        ),
+        (MAX, MAX, MAX, 4_000_000)
+    );
+}

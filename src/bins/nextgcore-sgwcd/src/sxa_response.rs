@@ -51,6 +51,19 @@ pub fn dispatch(sess_id: u64, continuation: S11Continuation, resp_type: u8, body
                     };
                     modify_bearer_session_done(join, sess_id, outcome);
                 }
+                // #607: a refusal is "System failure", as for the other installs.
+                S11Continuation::CreateBearer { join } => crate::dedicated_bearer::installed(
+                    join,
+                    (cause != Some(sxa_handler::pfcp_cause::REQUEST_ACCEPTED))
+                        .then_some(gtp_cause::SYSTEM_FAILURE),
+                ),
+                S11Continuation::CreateBearerAnswer { join } => {
+                    crate::dedicated_bearer::answered_by_sgwu(
+                        join,
+                        (cause != Some(sxa_handler::pfcp_cause::REQUEST_ACCEPTED))
+                            .then_some(gtp_cause::SYSTEM_FAILURE),
+                    )
+                }
                 _ => {}
             }
         }
@@ -160,6 +173,12 @@ pub fn fail_with_cause(continuation: S11Continuation, cause: u8) {
         S11Continuation::ModifyBearer { join, sess_id } => {
             modify_bearer_session_done(join, sess_id, Some(cause));
         }
+        S11Continuation::CreateBearer { join } => {
+            crate::dedicated_bearer::installed(join, Some(cause))
+        }
+        S11Continuation::CreateBearerAnswer { join } => {
+            crate::dedicated_bearer::answered_by_sgwu(join, Some(cause))
+        }
     }
 }
 
@@ -237,6 +256,17 @@ pub fn fail(continuation: S11Continuation, reason: &str) {
                  {sess_id} ({reason}); its bearers are reported not modified"
             );
             modify_bearer_session_done(join, sess_id, Some(gtp_cause::REMOTE_PEER_NOT_RESPONDING));
+        }
+        S11Continuation::CreateBearer { join } => {
+            log::error!("Create Bearer: the SGW-U never answered the install ({reason})");
+            crate::dedicated_bearer::installed(join, Some(gtp_cause::REMOTE_PEER_NOT_RESPONDING))
+        }
+        S11Continuation::CreateBearerAnswer { join } => {
+            log::error!("Create Bearer: the SGW-U never answered the downlink switch ({reason})");
+            crate::dedicated_bearer::answered_by_sgwu(
+                join,
+                Some(gtp_cause::REMOTE_PEER_NOT_RESPONDING),
+            )
         }
     }
 }
