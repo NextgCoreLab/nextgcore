@@ -705,9 +705,35 @@ pub enum UsageReportReason {
 /// First and not last, because TS 29.244 §7.5.5 gives ONE Cause and ONE Offending IE
 /// for the whole message: with several failures the CP function can only act on one,
 /// and the earliest is the one whose rejection explains the rest.
-fn note_first_failure(slot: &mut Option<(PfcpCause, u16)>, cause: PfcpCause, ie_type: u16) {
+fn note_first_failure(slot: &mut Option<N4Failure>, cause: PfcpCause, ie_type: u16) {
     if slot.is_none() {
-        *slot = Some((cause, ie_type));
+        *slot = Some(N4Failure::Ie(cause, ie_type));
+    }
+}
+
+/// [`note_first_failure`] for a rule that could not be created or modified (#1154):
+/// answered "Rule creation/modification Failure" with the Failed Rule ID, not an
+/// Offending IE (TS 29.244 Table 7.5.5.1-1).
+fn note_first_rule_failure(slot: &mut Option<N4Failure>, rule: crate::n4_build::FailedRule) {
+    if slot.is_none() {
+        *slot = Some(N4Failure::Rule(rule));
+    }
+}
+
+/// Why a Session Modification is refused: a missing or faulty IE (its Cause and
+/// Offending IE), or a rule it could not create or modify (Failed Rule ID, #1154).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum N4Failure {
+    Ie(PfcpCause, u16),
+    Rule(crate::n4_build::FailedRule),
+}
+
+impl N4Failure {
+    fn response_body(self) -> Vec<u8> {
+        match self {
+            Self::Ie(cause, ie) => build_failure_response(cause, Some(ie)),
+            Self::Rule(rule) => crate::n4_build::build_rule_failure_response(rule),
+        }
     }
 }
 
@@ -745,7 +771,7 @@ fn parse_rule_list<T>(
     ies: &[ParsedIe],
     ie_type: u16,
     parse: impl Fn(&[u8]) -> Result<T, &'static str>,
-    failure: &mut Option<(PfcpCause, u16)>,
+    failure: &mut Option<N4Failure>,
 ) -> Vec<T> {
     let mut out = Vec::new();
     for ie in ParsedIe::find_all_ies(ies, ie_type) {
@@ -1973,9 +1999,9 @@ impl PfcpServer {
                             let Some((ipv4, ipv6)) = self.local_f_teid_addrs(fteid) else {
                                 // #985 review: an IPv6-only F-TEID this UPF cannot
                                 // assign refuses the establishment (§7.5.3.1).
-                                let resp_payload = build_failure_response(
-                                    PfcpCause::RuleCreationModificationFailure,
-                                    Some(pfcp_ie::CREATE_PDR),
+                                // #1154: the Failed Rule ID, not an Offending IE.
+                                let resp_payload = crate::n4_build::build_rule_failure_response(
+                                    crate::n4_build::FailedRule::Pdr(pdr.pdr_id),
                                 );
                                 let response = self.build_response(
                                     pfcp_type::SESSION_ESTABLISHMENT_RESPONSE,
@@ -2254,7 +2280,7 @@ impl PfcpServer {
         // §7.5.5 gives ONE Cause for the whole message: a partially-applied
         // modification has no truthful per-rule answer on this message, and reporting
         // the FIRST failure is the only thing the CP function can act on.
-        let mut failure: Option<(PfcpCause, u16)> = None;
+        let mut failure: Option<N4Failure> = None;
 
         let mut updated_dl_teid: Option<u32> = None;
         let mut updated_gnb_addr: Option<Ipv4Addr> = None;
@@ -2358,10 +2384,9 @@ impl PfcpServer {
                 }
                 let Some((ipv4, ipv6)) = self.local_f_teid_addrs(fteid) else {
                     // #985 review: refused, not answered with an IPv4 F-TEID.
-                    note_first_failure(
+                    note_first_rule_failure(
                         &mut failure,
-                        PfcpCause::RuleCreationModificationFailure,
-                        pfcp_ie::CREATE_PDR,
+                        crate::n4_build::FailedRule::Pdr(pdr.pdr_id),
                     );
                     continue;
                 };
@@ -2606,10 +2631,9 @@ impl PfcpServer {
                             "Update PDR {}: no such rule on SEID {upf_seid:#x}",
                             p.pdr_id
                         );
-                        note_first_failure(
+                        note_first_rule_failure(
                             &mut failure,
-                            PfcpCause::RuleCreationModificationFailure,
-                            pfcp_ie::UPDATE_PDR,
+                            crate::n4_build::FailedRule::Pdr(p.pdr_id),
                         );
                     }
                 }
@@ -2619,10 +2643,9 @@ impl PfcpServer {
                             "Update FAR {}: no such rule on SEID {upf_seid:#x}",
                             f.far_id
                         );
-                        note_first_failure(
+                        note_first_rule_failure(
                             &mut failure,
-                            PfcpCause::RuleCreationModificationFailure,
-                            pfcp_ie::UPDATE_FAR,
+                            crate::n4_build::FailedRule::Far(f.far_id),
                         );
                     }
                 }
@@ -2632,10 +2655,9 @@ impl PfcpServer {
                             "Update QER {}: no such rule on SEID {upf_seid:#x}",
                             q.qer_id
                         );
-                        note_first_failure(
+                        note_first_rule_failure(
                             &mut failure,
-                            PfcpCause::RuleCreationModificationFailure,
-                            pfcp_ie::UPDATE_QER,
+                            crate::n4_build::FailedRule::Qer(q.qer_id),
                         );
                     }
                 }
@@ -2645,10 +2667,9 @@ impl PfcpServer {
                             "Update URR {}: no such rule on SEID {upf_seid:#x}",
                             u.urr_id
                         );
-                        note_first_failure(
+                        note_first_rule_failure(
                             &mut failure,
-                            PfcpCause::RuleCreationModificationFailure,
-                            pfcp_ie::UPDATE_URR,
+                            crate::n4_build::FailedRule::Urr(u.urr_id),
                         );
                     }
                 }
@@ -2771,12 +2792,9 @@ impl PfcpServer {
         // §7.5.5's Cause and Offending IE instead of a bare RequestAccepted — the
         // whole point of #306.
         let resp_payload = match failure {
-            Some((cause, offending_ie)) => {
-                log::warn!(
-                    "Session Modification for SEID {upf_seid:#x} rejected: cause {} offending IE {offending_ie}",
-                    cause as u8
-                );
-                build_failure_response(cause, Some(offending_ie))
+            Some(why) => {
+                log::warn!("Session Modification for SEID {upf_seid:#x} rejected: {why:?}");
+                why.response_body()
             }
             None => build_session_modification_response_full(
                 pfcp_type::SESSION_MODIFICATION_RESPONSE,
@@ -4169,6 +4187,13 @@ mod tests {
 
     /// A Session Modification creating Access PDR `pdr_id` whose F-TEID IE value is
     /// `f_teid`; returns the response.
+    /// The Failed Rule ID IE value of a response (#1154).
+    fn failed_rule_id(resp: &[u8]) -> Option<Vec<u8>> {
+        let (_, body) = ParsedPfcpHeader::parse(resp).ok()?;
+        ParsedIe::find_ie(&ParsedIe::parse_all(body), pfcp_ie::FAILED_RULE_ID)
+            .map(|ie| ie.value.to_vec())
+    }
+
     async fn modify_creating_pdr(
         smf: &UdpSocket,
         addr: SocketAddr,
@@ -4220,6 +4245,11 @@ mod tests {
             response_cause(&resp),
             PfcpCause::RuleCreationModificationFailure as u8
         );
+        assert_eq!(
+            failed_rule_id(&resp),
+            Some(vec![0x00, 0x00, 0x60]),
+            "#1154: the Failed Rule ID names PDR 0x60"
+        );
         let resp = modify_creating_pdr(&smf, addr, upf_seid, 8, 0x65, &[0x07]).await;
         let f = created_f_teid(&resp, 0x65);
         assert_eq!((f.ipv4, f.ipv6), (Some(node_v4), None));
@@ -4258,6 +4288,16 @@ mod tests {
             response_cause(&refused),
             PfcpCause::RuleCreationModificationFailure as u8,
             "no IPv6 N3 address: CH+V6 cannot be met"
+        );
+        assert_eq!(
+            failed_rule_id(&refused),
+            Some(vec![0x00, 0x00, 0x01]),
+            "#1154: the Failed Rule ID names PDR 1"
+        );
+        let (_, body) = ParsedPfcpHeader::parse(&refused).unwrap();
+        assert!(
+            ParsedIe::find_ie(&ParsedIe::parse_all(body), pfcp_ie::OFFENDING_IE).is_none(),
+            "no Offending IE for a rule failure (Table 7.5.3.1-1)"
         );
         assert!(
             server.sessions.read().await.is_empty(),
@@ -4792,29 +4832,41 @@ mod tests {
     }
 
     /// Criterion 5. An Update naming a rule the session does not hold has nowhere to
-    /// land, so §7.5.5's Cause and Offending IE are the truthful answer -- and
-    /// NOTHING is applied, because a response that refused must not be followed by
+    /// land, so §7.5.5's "Rule creation/modification Failure" is the truthful answer --
+    /// and NOTHING is applied, because a response that refused must not be followed by
     /// an event that applies.
+    ///
+    /// #1154: the response names the rule in a Failed Rule ID (TS 29.244 Table 7.5.5.1-1,
+    /// §8.2.80: Rule ID Type in octet 5, then the rule's ID as its own IE codes it), and
+    /// carries no Offending IE, which that table keeps for a missing or faulty IE.
+    /// Golden bytes, one per rule type.
     #[tokio::test]
-    async fn an_update_for_an_absent_rule_is_refused_with_an_offending_ie() {
+    async fn an_update_for_an_absent_rule_is_refused_with_its_failed_rule_id() {
         let (_server, smf, addr, mut rx, dp, upf_seid) = established_session().await;
 
-        let mut b = crate::n4_build::PfcpMessageBuilder::new();
-        b.add_tlv(pfcp_ie::UPDATE_URR, &urr_body(4242, Some(1), None, None));
-        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &b.build())).await;
-        assert_eq!(
-            response_cause(&resp),
-            PfcpCause::RuleCreationModificationFailure as u8,
-            "an unapplicable rule operation must not be answered RequestAccepted"
-        );
-        let (_, body) = ParsedPfcpHeader::parse(&resp).unwrap();
-        let ies = ParsedIe::parse_all(body);
-        let off = ParsedIe::find_ie(&ies, pfcp_ie::OFFENDING_IE)
-            .expect("§7.5.5 pairs the cause with the offending IE");
-        assert_eq!(
-            u16::from_be_bytes([off.value[0], off.value[1]]),
-            pfcp_ie::UPDATE_URR
-        );
+        #[rustfmt::skip]
+        let cases: [(u16, Vec<u8>, &[u8]); 4] = [
+            (pfcp_ie::UPDATE_URR, urr_body(4242, Some(1), None, None), &[0x03, 0x00, 0x00, 0x10, 0x92]),
+            (pfcp_ie::UPDATE_QER, qer_body(0x0A0B_0C0D, 9), &[0x02, 0x0A, 0x0B, 0x0C, 0x0D]),
+            (pfcp_ie::UPDATE_FAR, far_body(77, 0x02), &[0x01, 0x00, 0x00, 0x00, 0x4D]),
+            (pfcp_ie::UPDATE_PDR, pdr_body(0x0123, 10, 1, 1, 1), &[0x00, 0x01, 0x23]),
+        ];
+        for (seq, (ie, body, rule)) in (3u32..).zip(cases) {
+            let mut b = crate::n4_build::PfcpMessageBuilder::new();
+            b.add_tlv(ie, &body);
+            let resp = exchange(
+                &smf,
+                addr,
+                &encode_pfcp(52, Some(upf_seid), seq, &b.build()),
+            )
+            .await;
+            let (_, body) = ParsedPfcpHeader::parse(&resp).unwrap();
+            // Cause (19): 73; Failed Rule ID (114).
+            let mut expected = vec![0x00, 0x13, 0x00, 0x01, 73, 0x00, 0x72, 0x00];
+            expected.push(rule.len() as u8);
+            expected.extend_from_slice(rule);
+            assert_eq!(body, expected.as_slice(), "Update IE {ie}");
+        }
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv())
                 .await
@@ -4823,6 +4875,24 @@ mod tests {
         );
         let session = dp.sessions.find_by_seid(upf_seid).unwrap();
         assert!(!session.urrs.read().unwrap().contains_key(&4242));
+    }
+
+    /// #1154: a Failed Rule ID of each type is coded as TS 29.244 §8.2.80 has it.
+    #[test]
+    fn a_failed_rule_id_is_section_8_2_80_on_the_wire() {
+        use crate::n4_build::FailedRule;
+        assert_eq!(FailedRule::Pdr(0x0102).encode_value(), [0x00, 0x01, 0x02]);
+        assert_eq!(
+            FailedRule::Far(0x0102_0304).encode_value(),
+            [0x01, 0x01, 0x02, 0x03, 0x04]
+        );
+        assert_eq!(FailedRule::Qer(5).encode_value(), [0x02, 0, 0, 0, 5]);
+        assert_eq!(FailedRule::Urr(6).encode_value(), [0x03, 0, 0, 0, 6]);
+        assert_eq!(FailedRule::Bar(7).encode_value(), [0x04, 7]);
+        assert_eq!(
+            crate::n4_build::build_rule_failure_response(FailedRule::Pdr(0x60)),
+            [0x00, 0x13, 0x00, 0x01, 73, 0x00, 0x72, 0x00, 0x03, 0x00, 0x00, 0x60]
+        );
     }
 
     /// The other half of criterion 5's decision, stated so it is not mistaken for an

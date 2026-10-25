@@ -219,8 +219,11 @@ pub struct SgwcSess {
     pub sgwc_sxa_seid: u64,
     /// SGWU-SXA-SEID (received from peer)
     pub sgwu_sxa_seid: u64,
-    /// PGW S5/S8 control-plane address (learned from PGW F-TEID)
+    /// PGW S5/S8 control-plane IPv4 address (learned from PGW F-TEID)
     pub pgw_addr: Option<Ipv4Addr>,
+    /// PGW S5/S8 control-plane IPv6 address (learned from PGW F-TEID; #1208: a PGW
+    /// reached over IPv6, or a dual-stack F-TEID).
+    pub pgw_addr6: Option<Ipv6Addr>,
     /// APN Configuration
     pub session: SessionConfig,
     /// PDN Address Allocation
@@ -250,6 +253,14 @@ pub struct SgwcSess {
 }
 
 impl SgwcSess {
+    /// Whether `ip` is one of the PGW's S5/S8-C F-TEID addresses (#1208).
+    pub fn anchored_at(&self, ip: std::net::IpAddr) -> bool {
+        match ip {
+            std::net::IpAddr::V4(v4) => self.pgw_addr == Some(v4),
+            std::net::IpAddr::V6(v6) => self.pgw_addr6 == Some(v6),
+        }
+    }
+
     pub fn new(id: u64, sgwc_ue_id: u64) -> Self {
         Self {
             id,
@@ -258,6 +269,7 @@ impl SgwcSess {
             sgwc_sxa_seid: 0,
             sgwu_sxa_seid: 0,
             pgw_addr: None,
+            pgw_addr6: None,
             session: SessionConfig::default(),
             paa: Paa::default(),
             requested_paa: None,
@@ -779,14 +791,12 @@ impl SgwcContext {
     /// port, so matching the full socket address would find nothing.
     /// Every session anchored at the PGW whose S5/S8 control address is `ip`
     /// (#1137), cloned.
+    /// Either family of the PGW's F-TEID matches (#1208).
     pub fn sess_list_for_pgw_ip(&self, ip: std::net::IpAddr) -> Vec<SgwcSess> {
-        let std::net::IpAddr::V4(v4) = ip else {
-            return Vec::new();
-        };
         match self.sess_list.read() {
             Ok(list) => list
                 .values()
-                .filter(|s| s.pgw_addr == Some(v4))
+                .filter(|s| s.anchored_at(ip))
                 .cloned()
                 .collect(),
             Err(_) => Vec::new(),

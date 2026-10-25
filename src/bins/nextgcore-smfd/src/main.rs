@@ -171,7 +171,13 @@ fn render_metrics() -> String {
          smf_nsac_decrease_failures_total {}\n\
          # HELP smf_ipv4_pool_stale_releases_total UE IPv4 addresses released while already free: each is a double free\n\
          # TYPE smf_ipv4_pool_stale_releases_total counter\n\
-         smf_ipv4_pool_stale_releases_total {}\n",
+         smf_ipv4_pool_stale_releases_total {}\n\
+         # HELP smf_s5s8_sgw_restart_pdn_deleted_total PDN connections deleted because their SGW-C restarted (TS 23.007 §17.1A.1)\n\
+         # TYPE smf_s5s8_sgw_restart_pdn_deleted_total counter\n\
+         smf_s5s8_sgw_restart_pdn_deleted_total {}\n\
+         # HELP smf_s5s8_sgw_restart_deletions_running Restarted SGW-Cs whose PDN connections are still being deleted\n\
+         # TYPE smf_s5s8_sgw_restart_deletions_running gauge\n\
+         smf_s5s8_sgw_restart_deletions_running {}\n",
         pool.len(),
         pfcp_path::PFCP_UNAUTHORIZED.load(Ordering::Relaxed),
         SM_POLICY_DELETE_FAILURES.load(Ordering::Relaxed),
@@ -185,6 +191,8 @@ fn render_metrics() -> String {
             .read()
             .map(|ctx| ctx.ipv4_pool.stale_releases())
             .unwrap_or(0),
+        gtp_handler::SGW_RESTART_PDN_CONNECTIONS_DELETED.load(Ordering::Relaxed),
+        gtp_handler::SGW_RESTART_DELETIONS_RUNNING.load(Ordering::Relaxed),
     )
 }
 
@@ -11972,17 +11980,79 @@ mod tests {
         assert!(!kept, "0x10 after 0xFFFFFF00 is a newer incarnation");
     }
 
-    /// #928 round 2 B2: the stamp's compare-and-set under one write guard. On a
-    /// multi-thread runtime, two detectors released together by a barrier see each
-    /// new stamp; exactly one tears down per stamp.
+    /// #928 round 2 B2: the stamp's compare-and-set under one write guard. Two
+    /// detectors of one new stamp tear down once.
+    ///
+    /// #1229: since #966 (review m3) the teardown clears the stored stamp with the
+    /// association, after an await. So the second detector of a stamp finds one of two
+    /// things, and neither may tear down again:
+    /// - the new stamp, when it runs inside the first detector's teardown, before the
+    ///   clear. This is driven deterministically by holding the teardown there
+    ///   (`TEARDOWN_HOLD_FOR_TEST`);
+    /// - no stamp, when it runs after the clear. It stores the stamp as a baseline.
+    ///
+    /// The test then races two detectors in 20 rounds, as before. Each round now
+    /// starts from what a re-association and its first Heartbeat leave: associated,
+    /// with the old incarnation's stamp (100) stored. When the rounds chained (round
+    /// i's stamp was round i + 1's baseline), a round tore down only if the round
+    /// before had cleared after its second detector ran. That made the count `19 != 20`
+    /// in CI, depending on how the previous round's two detectors were ordered.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_detectors_of_one_new_stamp_tear_down_once() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
         let fx = restart_fixture("92807", Duration::ZERO).await;
-        let before = pfcp_path::TEARDOWNS_FOR_TEST.load(Ordering::SeqCst);
+        let teardowns = || pfcp_path::TEARDOWNS_FOR_TEST.load(Ordering::SeqCst);
+        let rebaseline = || async {
+            fx.a.set_assoc_state_for_test(true, None, None).await;
+            fx.a.seed_peer_recovery_time_stamp(100).await;
+        };
+
+        // Inside the teardown, before the clear: the stored stamp is the new one.
+        rebaseline().await;
+        let (reached, proceed) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        *pfcp_path::TEARDOWN_HOLD_FOR_TEST.lock().unwrap() =
+            Some((reached.clone(), proceed.clone()));
+        let before = teardowns();
+        let first = {
+            let a = fx.a.clone();
+            tokio::spawn(async move { a.check_peer_restart(900).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), reached.notified())
+            .await
+            .expect("the first detector tears down");
+        *pfcp_path::TEARDOWN_HOLD_FOR_TEST.lock().unwrap() = None;
+        fx.a.check_peer_restart(900).await;
+        let inside = teardowns() - before;
+        proceed.notify_one();
+        first.await.unwrap();
+        assert_eq!(
+            inside, 1,
+            "the second detector, inside the teardown, does not tear down"
+        );
+        assert_eq!(teardowns() - before, 1);
+
+        // After the clear: no stamp stored; the second detector records a baseline.
+        rebaseline().await;
+        let before = teardowns();
+        fx.a.check_peer_restart(901).await;
+        assert_eq!(
+            fx.a.peer_recovery_time_stamp_for_test().await,
+            None,
+            "cleared"
+        );
+        fx.a.check_peer_restart(901).await;
+        assert_eq!(teardowns() - before, 1, "after the clear, a baseline");
+
+        // Raced, round by round.
         let rounds = 20u32;
+        let mut per_round = Vec::new();
         for i in 0..rounds {
+            rebaseline().await;
+            let before = teardowns();
             let stamp = 1000 + i;
             let barrier = Arc::new(tokio::sync::Barrier::new(2));
             let mut tasks = Vec::new();
@@ -11997,10 +12067,20 @@ mod tests {
             for t in tasks {
                 t.await.unwrap();
             }
+            per_round.push(teardowns() - before);
+            let left = fx.a.peer_recovery_time_stamp_for_test().await;
+            assert!(
+                left.is_none()
+                    || left == Some(nextgcore_pfcp::recovery_time::normalize_received(stamp)),
+                "round {i}: the teardown's clear, or the new stamp as a baseline: {left:?}"
+            );
         }
-        let teardowns = pfcp_path::TEARDOWNS_FOR_TEST.load(Ordering::SeqCst) - before;
         fx.teardown().await;
-        assert_eq!(teardowns, rounds as usize, "one teardown per new stamp");
+        assert_eq!(
+            per_round,
+            vec![1; rounds as usize],
+            "one teardown per new stamp, in every round"
+        );
     }
 
     /// #928 round 2 M2: an Association Release Request from a host that is not the
@@ -23520,6 +23600,64 @@ mod path_switch_ack_tests {
         let ctx = ctx.read().expect("ctx");
         ctx.policy_bindings.write().expect("w").remove(&r);
         ctx.upf_ul_endpoints.write().expect("w").remove(&r);
+        if let Some(sess) = ctx.sess_find_by_sm_context_ref(&r) {
+            ctx.sess_remove(sess.id);
+        }
+    }
+
+    /// #1171 strict peer: the AMF reads the N2 SM information of this SMF's
+    /// SmContextUpdateError for a HANDOVER_REQUIRED it cannot prepare (TS 29.502
+    /// §5.2.2.3.4.2 step 2b). The real SM Context Update handler is served over
+    /// HTTP/2. amfd's `call_smf_n2_handover_step` gets the refusal, with the
+    /// multipart `n2SmInfo` decoding as a Handover Preparation Unsuccessful Transfer
+    /// (TS 38.413 §9.3.4.18) and its cause. The session has no UPF endpoint
+    /// recorded, so it cannot be handed over.
+    #[tokio::test]
+    async fn the_amf_reads_the_handover_preparation_refusal_of_this_smf() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let r = crate::tests::seed_registered_session("imsi-001010000001171", 5, "internet");
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        server
+            .start(smf_sbi_request_handler)
+            .await
+            .expect("the SMF serves");
+
+        let answer = nextgcore_amfd::sbi_path::call_smf_n2_handover_step(
+            "127.0.0.1",
+            addr.port(),
+            &r,
+            "PREPARING",
+            Some(("HANDOVER_REQUIRED", &[0x00])),
+            Some(&serde_json::json!({
+                "ranNodeId": {
+                    "plmnId": { "mcc": "001", "mnc": "01" },
+                    "gNbId": { "bitLength": 22, "gNBValue": "000001" },
+                },
+                "tai": { "plmnId": { "mcc": "001", "mnc": "01" }, "tac": "000001" },
+            })),
+            None,
+        )
+        .await;
+        let refusal = answer.expect_err("the SMF cannot prepare the session");
+        assert!(refusal.reason.contains("500"), "{refusal:?}");
+        let transfer = refusal
+            .preparation_unsuccessful_transfer()
+            .expect("HANDOVER_PREP_FAIL n2SmInfo");
+        assert_eq!(
+            nextgcore_amfd::ngap_asn1::handover_preparation_unsuccessful_cause(transfer),
+            Some(nextgcore_ngap::types::Cause::RadioNetwork(
+                nextgcore_ngap::types::CauseRadioNetwork::HoFailureInTarget5gcNgranNodeOrTargetSystem
+            ))
+        );
+
+        let _ = server.stop().await;
+        let ctx = smf_self();
+        let ctx = ctx.read().expect("ctx");
         if let Some(sess) = ctx.sess_find_by_sm_context_ref(&r) {
             ctx.sess_remove(sess.id);
         }

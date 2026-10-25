@@ -47,6 +47,9 @@ pub mod kernel_server;
 #[cfg(all(feature = "kernel", feature = "sctp-proto"))]
 pub use kernel_server::KernelSctpServer;
 
+/// #1142: the answer to an out-of-the-blue packet (RFC 9260 §8.4).
+pub mod ootb;
+
 // sctp-proto based server module
 #[cfg(feature = "sctp-proto")]
 pub mod server;
