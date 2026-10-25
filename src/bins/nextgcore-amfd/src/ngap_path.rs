@@ -220,6 +220,20 @@ pub const MAX_GNB_CONNECTIONS: usize = 64;
 /// SCTP receive timeout
 const SCTP_RECV_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// What `NgapServer::poll` returns for how its receive ended: `true` ("poll again
+/// at once") only when N2 data came in.
+///
+/// An SBI report that ended the wait (#981) is NOT "poll again at once". `run_async`
+/// (lib.rs) polls in an inner loop until `false`, and only between those loops does
+/// it drain the AMF event channel the NGAP handlers `send(..).await` into. On a busy
+/// AMF, SBI reports arrive more often than every 100 ms, so `true` would keep that
+/// loop from ending, the bounded channel would fill, and the NGAP task would park on
+/// a send only it can unblock (#1129 review M1). With `false` the next 10 ms tick
+/// applies the answer.
+fn poll_again_at_once(outcome: nextgcore_sctp::RecvOutcome) -> bool {
+    outcome == nextgcore_sctp::RecvOutcome::Data
+}
+
 /// How often the NGAP task sweeps orphaned per-session state (#756).
 const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -1633,30 +1647,26 @@ impl NgapServer {
             self.handle_server_event(event).await?;
         }
 
-        self.receive_n2_or_sbi_report().await
+        let outcome = self.receive_n2_or_sbi_report().await?;
+        Ok(poll_again_at_once(outcome))
     }
 
-    /// Poll the SCTP server for incoming data, for up to [`SCTP_RECV_TIMEOUT`]. An
-    /// off-task SBI report ends the wait (#981): `Ok(true)` makes the caller poll
-    /// again at once, and the top of that poll applies it, rather than up to
-    /// `SCTP_RECV_TIMEOUT` later. `Ok(false)` is a quiet timeout.
-    async fn receive_n2_or_sbi_report(&mut self) -> Result<bool> {
-        match self
+    /// Wait for N2 for up to [`SCTP_RECV_TIMEOUT`], ended early by an off-task SBI
+    /// report (#981), so the next poll applies the answer within the caller's tick
+    /// rather than up to `SCTP_RECV_TIMEOUT` later.
+    async fn receive_n2_or_sbi_report(&mut self) -> Result<nextgcore_sctp::RecvOutcome> {
+        let outcome = self
             .transport
             .recv_or_wake(SCTP_RECV_TIMEOUT, self.sbi_offload.report_arrived())
             .await
-        {
-            Ok(nextgcore_sctp::RecvOutcome::Data) => {
-                // Data was received, process any new events
-                while let Ok(event) = self.server_event_rx.try_recv() {
-                    self.handle_server_event(event).await?;
-                }
-                Ok(true)
+            .map_err(|e| anyhow::anyhow!("SCTP receive error: {e}"))?;
+        if outcome == nextgcore_sctp::RecvOutcome::Data {
+            // Data was received, process any new events
+            while let Ok(event) = self.server_event_rx.try_recv() {
+                self.handle_server_event(event).await?;
             }
-            Ok(nextgcore_sctp::RecvOutcome::Woken) => Ok(true),
-            Ok(nextgcore_sctp::RecvOutcome::Timeout) => Ok(false), // Timeout, no data
-            Err(e) => Err(anyhow::anyhow!("SCTP receive error: {e}")),
         }
+        Ok(outcome)
     }
 
     /// Handle SCTP server events
