@@ -9105,6 +9105,7 @@ mod tests {
             sgwu.received(54) > deletions,
             "the SGW-U session is deleted"
         );
+        wait_ue_removed(ue_id).await;
         let ctx = sgwc_self();
         assert!(
             ctx.sess_find_by_id(sess_id).is_none(),
@@ -9117,6 +9118,18 @@ mod tests {
         );
         ctx.ue_remove(other_ue);
         server.close();
+    }
+
+    /// #1213: `delete_pdn_connections_for_pgw` tells the MME and the SGW-U before
+    /// it removes the session and UE, so neither arrival proves they are gone:
+    /// wait for the removal itself.
+    async fn wait_ue_removed(ue_id: u64) {
+        for _ in 0..300 {
+            if sgwc_self().ue_find_by_id(ue_id).is_none() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// #1137, TS 23.007 §16.1A.2 / §20: an S5/S8 path failure (N3 exhausted on a
@@ -9147,6 +9160,7 @@ mod tests {
         let (_, lbi, cause) = mme_dbr(&mme).await;
         assert_eq!(lbi, Some(5));
         assert_eq!(cause, Some(gtp_cause::REACTIVATION_REQUESTED));
+        wait_ue_removed(ue_id).await;
         let ctx = sgwc_self();
         assert!(
             ctx.sess_find_by_id(sess_id).is_none(),
