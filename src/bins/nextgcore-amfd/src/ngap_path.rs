@@ -24404,10 +24404,17 @@ mod tests {
         .await;
         std::env::remove_var("PCF_SBI_ADDR");
         std::env::remove_var("PCF_SBI_PORT");
+        // #922: the SM context release is durable off-task work too, so it is waited for
+        // as well. Read at once, it raced the offload under a loaded suite (#1056).
+        let sm_released = nf_saw(
+            &seen,
+            "POST /nsmf-pdusession/v1/sm-contexts/smctx-602/release",
+        )
+        .await;
 
         let seen = seen.lock().expect("seen").clone();
         assert!(
-            seen.contains(&"POST /nsmf-pdusession/v1/sm-contexts/smctx-602/release".to_string()),
+            sm_released,
             "TS 23.502 §4.2.2.2.2 step 14d: Nsmf_PDUSession_ReleaseSMContext towards the \
              SMF; saw {seen:?}"
         );
@@ -24977,7 +24984,18 @@ mod tests {
         )
         .await
         .expect("handled");
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // #1056: wait for the first deactivations to reach the SMF, which holds each for
+        // `delay`, rather than a fixed 300 ms a loaded suite can overrun.
+        let ref5 = |ue: u64| format!("ref-754-{ue}-5");
+        for _ in 0..500 {
+            if ues
+                .iter()
+                .any(|&ue| seen.lock().unwrap().iter().any(|(r, _, _)| *r == ref5(ue)))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         // Which PSI 5 deactivations are on the wire now, and which are still queued.
         let arrived: Vec<String> = seen
             .lock()
@@ -24985,7 +25003,6 @@ mod tests {
             .iter()
             .map(|(r, _, _)| r.clone())
             .collect();
-        let ref5 = |ue: u64| format!("ref-754-{ue}-5");
         let in_flight = *ues
             .iter()
             .find(|&&ue| arrived.contains(&ref5(ue)))
@@ -26792,7 +26809,8 @@ mod tests {
     /// `HANDOVER_PREP_FAIL` = [`ho_prep_fail_transfer_for`]. Everything else gets 204.
     /// A `hang-*` ref never answers PREPARING and a `hangcmd-*` ref never answers PREPARED
     /// (a blackholed SMF); a `late-*` PREPARING, a `latecmd-*` PREPARED and `hoState:
-    /// PROBE` take 300 ms; a `flaky-*` ref's first COMPLETED gets 500. Every call is
+    /// PROBE` take 300 ms, a `tardy-*` PREPARING and a `tardycmd-*` PREPARED 1.5 s; a
+    /// `flaky-*` ref's first COMPLETED gets 500. Every call is
     /// recorded when it completes. Keep the server alive.
     #[allow(clippy::type_complexity)]
     async fn handover_smf() -> (
@@ -26857,6 +26875,12 @@ mod tests {
                         || (state == "PREPARED" && sm_ref.starts_with("latecmd-"));
                     if state == "PROBE" || late {
                         tokio::time::sleep(Duration::from_millis(300)).await;
+                    }
+                    // Late by a margin a loaded suite cannot close (#1056).
+                    if (state == "PREPARING" && sm_ref.starts_with("tardy-"))
+                        || (state == "PREPARED" && sm_ref.starts_with("tardycmd-"))
+                    {
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
                     }
                     let flaky_first = state == "COMPLETED"
                         && sm_ref.starts_with("flaky-")
@@ -27911,8 +27935,12 @@ mod tests {
     async fn a_blackholed_smf_does_not_hold_the_handover_past_the_wait() {
         let (_smf, smf_port, seen) = handover_smf().await;
         let mut server = capturing_ngap_server().await;
-        server.ho_preparation_wait = Duration::from_millis(150);
-        server.ho_command_wait = Duration::from_millis(150);
+        // #1056: waits no loaded suite can outlast; the test expires each deadline
+        // itself once the answering session is in. With 150 ms waits, PSI 1's answer
+        // came in after the PREPARING wait under load, and the HANDOVER REQUEST was
+        // already out at the "nothing before the wait has expired" check.
+        server.ho_preparation_wait = Duration::from_secs(30);
+        server.ho_command_wait = Duration::from_secs(30);
         let (source, target) = (97_970u64, 97_971u64);
         let gnb_t = 0x7_9701u32;
         seed_gnb_session_with_id(&server, source, 0x7_9700).await;
@@ -27948,7 +27976,11 @@ mod tests {
             take_sent_ngap(&mut server).is_empty(),
             "nothing before the wait has expired"
         );
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        server
+            .ho_preparations
+            .get_mut(&ue)
+            .expect("preparing")
+            .deadline = Instant::now();
         server.process_handover_deadlines().await;
         let sent = take_sent_ngap(&mut server);
         assert_eq!(sent.len(), 1, "{sent:?}");
@@ -27985,7 +28017,16 @@ mod tests {
             s.ho_commands.get(&ue).is_some_and(|c| !c.ready.is_empty())
         })
         .await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        server.process_handover_deadlines().await;
+        assert!(
+            take_sent_ngap(&mut server).is_empty(),
+            "no HANDOVER COMMAND before the wait has expired"
+        );
+        server
+            .ho_commands
+            .get_mut(&ue)
+            .expect("commanding")
+            .deadline = Instant::now();
         server.process_handover_deadlines().await;
         let sent = take_sent_ngap(&mut server);
         assert_eq!(sent.len(), 1, "{sent:?}");
@@ -28170,13 +28211,16 @@ mod tests {
     async fn a_late_session_is_cancelled_at_either_deadline() {
         let (_smf, smf_port, seen) = handover_smf().await;
         let mut server = capturing_ngap_server().await;
-        server.ho_preparation_wait = Duration::from_millis(100);
-        server.ho_command_wait = Duration::from_millis(100);
+        // #1056: the test expires each deadline itself once PSI 1 is in. With 100 ms
+        // waits and a 300 ms late answer, a loaded suite processed both answers in one
+        // batch: the step completed with both sessions and nothing was late.
+        server.ho_preparation_wait = Duration::from_secs(30);
+        server.ho_command_wait = Duration::from_secs(30);
         let (source, target) = (97_982u64, 97_983u64);
         let gnb_t = 0x7_9831u32;
         seed_gnb_session_with_id(&server, source, 0x7_9820).await;
         seed_gnb_session_with_id(&server, target, gnb_t).await;
-        for (n, refs) in [["on-1", "late-2"], ["on-1", "latecmd-2"]]
+        for (n, refs) in [["on-1", "tardy-2"], ["on-1", "tardycmd-2"]]
             .into_iter()
             .enumerate()
         {
@@ -28215,7 +28259,13 @@ mod tests {
                     || s.ho_commands.get(&ue).is_some_and(|c| !c.ready.is_empty())
             })
             .await;
-            tokio::time::sleep(Duration::from_millis(150)).await;
+            // PSI 2's wait is over.
+            if let Some(p) = server.ho_preparations.get_mut(&ue) {
+                p.deadline = Instant::now();
+            }
+            if let Some(c) = server.ho_commands.get_mut(&ue) {
+                c.deadline = Instant::now();
+            }
             server.process_handover_deadlines().await;
             let sent = take_sent_ngap(&mut server);
             assert_eq!(sent.len(), 1, "case {n}: {sent:?}");
