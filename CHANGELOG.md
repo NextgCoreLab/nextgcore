@@ -18,8 +18,13 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   `application/vnd.3gpp.ngap` part that `ngapData` references. It includes the UPF N3 tunnel,
   every QoS flow and the Session-AMBR (TS 23.502 §4.2.3.3 step 3a, TS 29.518 §6.1.6.2.27). It
   also carries the paged flow's `5qi` and `arp` (§6.1.6.2.18). The non-conformant JSON
-  `ngapData: {qfi}` is gone. With no recorded user plane, the N2 information names the session
-  only, as before (#1162).
+  `ngapData: {qfi}` is gone. With no recorded user plane, no policy binding, or a transfer that
+  fails to encode, no N1N2MessageTransfer is sent: paging a UE for a session that cannot be
+  activated only drains its battery, and an `n2InfoContent` without `ngapData` (M) is malformed.
+  The data stays buffered and the error names the session (#1162).
+- smfd takes its durable snapshot through a poisoned lock: the maps and the IPv4 pool are read
+  as the panicking writer left them, and the poison is logged. Before, a poisoned map was written
+  as empty over the last good snapshot, and the next restart restored nothing (#1178).
 - smfd answers its own SM Context Create and Update errors as SmContextCreateError /
   SmContextUpdateError (TS 29.502 Tables 6.1.3.2.3.1-3, 6.1.3.3.4.2.2-2): the ProblemDetails is
   under `error`, at `application/json`. A failed activation adds `upCnxState: DEACTIVATED`, and a

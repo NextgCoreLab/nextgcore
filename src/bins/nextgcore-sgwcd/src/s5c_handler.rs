@@ -26,6 +26,20 @@ pub enum HandlerResult {
 // S5-C Handlers (from PGW)
 // ============================================================================
 
+/// Whether a Create Session Response `cause` means the PGW created the PDN
+/// connection: Request accepted (16), accepted partially (17), or accepted with
+/// a new PDN type (18, 19; TS 29.274 §8.4). Shared by every check that asks
+/// whether the PGW anchored a session (#1190 review).
+pub fn session_created(cause: u8) -> bool {
+    matches!(
+        cause,
+        gtp_cause::REQUEST_ACCEPTED
+            | gtp_cause::REQUEST_ACCEPTED_PARTIALLY
+            | gtp_cause::NEW_PDN_TYPE_DUE_TO_NETWORK_PREFERENCE
+            | gtp_cause::NEW_PDN_TYPE_DUE_TO_SINGLE_ADDRESS_BEARER_ONLY
+    )
+}
+
 /// Handle Create Session Response from PGW
 /// Port of sgwc_s5c_handle_create_session_response
 pub fn handle_create_session_response(
@@ -58,11 +72,7 @@ pub fn handle_create_session_response(
     };
 
     // Check cause value
-    if session_cause != gtp_cause::REQUEST_ACCEPTED
-        && session_cause != gtp_cause::REQUEST_ACCEPTED_PARTIALLY
-        && session_cause != gtp_cause::NEW_PDN_TYPE_DUE_TO_NETWORK_PREFERENCE
-        && session_cause != gtp_cause::NEW_PDN_TYPE_DUE_TO_SINGLE_ADDRESS_BEARER_ONLY
-    {
+    if !session_created(session_cause) {
         log::error!("GTP Cause [VALUE:{session_cause}]");
         return HandlerResult::Error(session_cause);
     }

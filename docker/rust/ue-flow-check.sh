@@ -22,6 +22,13 @@
 #                  callback (nextgcore #580): the UE re-registers PROMPTLY -- no
 #                  T3510 expiry (nextgsim #265) -- re-establishes its PDU session
 #                  (nextgsim #272) and pings 20/20.
+#   amf-restart    The AMF container restarts (#686, needs the UE context store:
+#                  docker-compose.ue-context-store.yml). The restarted AMF restores
+#                  the UE from MongoDB; the UE comes back (a registration update on
+#                  the restarted gNB's cell, or a Service Request) under its stored
+#                  security context, its PDU session keeps its address, 20/20 pings are
+#                  answered and the SMF creates no new SM context. Not in `all`:
+#                  it needs the overlay.
 #   all            paging, idle-uplink, paging AGAIN, deregister, network-rereg.
 #                  The second paging round runs after idle-uplink on purpose: a
 #                  Service Request from CM-IDLE moves the UE to a new AMF UE NGAP
@@ -40,7 +47,7 @@
 # AMF_SBI / UDM_SBI (host:port), UE_SUPI, PING_TARGET, PING_COUNT, NR_CLI (host path to
 # nr-cli).
 #
-# Usage: ue-flow-check.sh <paging|idle-uplink|deregister|network-rereg|all>
+# Usage: ue-flow-check.sh <paging|idle-uplink|deregister|network-rereg|amf-restart|all>
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -306,12 +313,63 @@ scenario_network_rereg() {
     pass "re-registered in $((t1 - t0))s without T3510, PDU session re-established (${old_ip} -> $(ue_ip)), ${COUNT}/${COUNT} pings"
 }
 
+scenario_amf_restart() {
+    begin amf-restart "AMF restart with the UE context store (#686): the UE comes back under its stored context, same PDU session, no new SM context, ${COUNT}/${COUNT} ping"
+    local ip; ip=$(ue_ip)
+    [ -n "$ip" ] || fail "the UE has no PDU session address on a uesimtun interface"
+    # CM-IDLE first, so the AMF stores the UE as it will find it after the restart,
+    # then long enough for the once-a-second store sweep to write it.
+    ensure_idle
+    sleep 3
+    docker restart -t 5 "$AMF" >/dev/null
+    wait_for "$AMF" 'UE context storage armed:' 60 \
+        || fail "the restarted AMF did not arm its UE context store (is docker-compose.ue-context-store.yml applied?)"
+    local f; f=$(logs_since "$AMF")
+    grep -qE 'UE context storage armed: [1-9][0-9]* of' "$f" \
+        || fail "the restarted AMF restored no UE context: $(grep -F 'UE context storage armed:' "$f" | head -1)"
+    # The restarted AMF has no NG association. The gNB does not notice by itself:
+    # the restarted AMF drops its out-of-the-blue SCTP packets instead of answering
+    # ABORT (nextgcore #1142, RFC 9260 §8.4), so the gNB keeps sending on the old
+    # association. It is restarted here to run NG Setup again, as a gNB that detects
+    # the failure does (TS 23.501 §5.21.2.3).
+    docker restart -t 2 "$GNB" >/dev/null
+    wait_for "$GNB" 'Received NG Setup Response' 60 || fail "the gNB never set NG up with the restarted AMF"
+    # The UE comes back on the restarted gNB's cell: a mobility registration update
+    # (a new cell) or a Service Request (its uplink data), integrity protected under
+    # the NAS security context the AMF restored. Either way the restored PDU session
+    # carries the ping; an initial registration would mean the context was lost.
+    local i; for i in $(seq 1 30); do [ -n "$(ue_tun)" ] && break; sleep 1; done
+    ping_exact "$UE" "$TARGET" -I "$(ue_tun)"
+    f=$(logs_since "$UE")
+    if grep -qF 'Sending Registration Request (InitialRegistration)' "$f"; then
+        fail "the UE registered afresh: the restarted AMF did not keep its context"
+    fi
+    if grep -qF 'MAC verification failed' "$f"; then
+        fail "the UE discarded NAS from the restarted AMF: $(grep -F 'MAC verification failed' "$f" | head -1)"
+    fi
+    if grep -qF 'Service Accept received' "$f"; then
+        echo "  ok: Service Request accepted under the restored context"
+    elif grep -qE 'Sending Registration Request \((Mobility|Periodic)RegistrationUpdating\)' "$f" \
+        && grep -qF 'Received Registration Accept' "$f"; then
+        echo "  ok: registration update accepted under the restored context"
+    else
+        fail "the UE got neither a Service Accept nor a registration update accept"
+    fi
+    [ "$(ue_ip)" = "$ip" ] || fail "the PDU session address changed: ${ip} -> $(ue_ip)"
+    f=$(logs_since "$SMF")
+    if grep -qF 'SM Context Create:' "$f"; then
+        fail "the SMF created a new SM context: $(grep -F 'SM Context Create:' "$f" | head -1)"
+    fi
+    pass "restored after the AMF restart: the UE came back under its stored context, same address ${ip}, no new SM context, ${COUNT}/${COUNT} pings"
+}
+
 # ---------------------------------------------------------------------------
 case "${1:-}" in
     idle-uplink)   install_cli; scenario_idle_uplink ;;
     paging)        install_cli; scenario_paging ;;
     deregister)    install_cli; scenario_deregister ;;
     network-rereg) install_cli; scenario_network_rereg ;;
+    amf-restart)   install_cli; scenario_amf_restart ;;
     all)
         install_cli
         scenario_paging
@@ -321,5 +379,5 @@ case "${1:-}" in
         scenario_deregister
         scenario_network_rereg
         ;;
-    *) echo "usage: $0 <paging|idle-uplink|deregister|network-rereg|all>"; exit 2 ;;
+    *) echo "usage: $0 <paging|idle-uplink|deregister|network-rereg|amf-restart|all>"; exit 2 ;;
 esac

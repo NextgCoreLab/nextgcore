@@ -44,14 +44,18 @@
 //!   - A SERVICE REQUEST that still fails the check is answered SERVICE REJECT #9, with
 //!     the contexts kept (§4.4.4.3).
 //!   - A mobility or periodic REGISTRATION REQUEST that fails gets authentication and SMC.
-//! - **Downlink:** the stored value is the next COUNT to use, and the UE accepts the
-//!   smallest COUNT above the largest it has verified that has the received SN. So on
-//!   restore the AMF moves forward by [`DL_COUNT_RESTORE_MARGIN`] (255):
-//!   - no COUNT is ever used twice with K_AMF, as long as fewer than 256 downlink
-//!     messages went unrecorded;
-//!   - the UE estimates the new COUNT correctly however many of those (0..=255) it
-//!     received.
-//!   - A margin of 256 would fail the UE's estimate exactly when nothing went unrecorded.
+//! - **Downlink:** the stored value is the next COUNT to use. The UE takes the smallest
+//!   COUNT above the largest it has verified that has the received SN. So on restore the
+//!   AMF moves forward by [`DL_COUNT_RESTORE_MARGIN`] (127):
+//!   - no COUNT is ever used twice with K_AMF, as long as at most 127 downlink messages
+//!     went unrecorded (the store is written about once a second);
+//!   - a conformant UE estimates the new COUNT correctly however many of those (0..=127)
+//!     it received.
+//!   - So does a UE that only accepts a forward SN step within half the SN space and
+//!     treats a larger one as a replay. nextgsim does; the #686 restart proof found it
+//!     with a margin of 254. The step is at most 128 here.
+//!   - A larger margin breaks those UEs, and 256 breaks even a conformant UE when
+//!     nothing went unrecorded.
 //!
 //! # Scope
 //!
@@ -93,7 +97,7 @@ pub const RECORD_VERSION: u32 = 1;
 pub const PERSIST_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How far the downlink NAS COUNT moves on restore (see the module docs).
-pub const DL_COUNT_RESTORE_MARGIN: u32 = 255;
+pub const DL_COUNT_RESTORE_MARGIN: u32 = 127;
 
 /// How long the store's server selection may take at startup, unless the URI's
 /// `serverSelectionTimeoutMS` says otherwise.
