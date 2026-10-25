@@ -1438,15 +1438,18 @@ fn note_peer_recovery(inner: &Arc<GtpcInner>, peer: SocketAddr, restart_counter:
         // Only overwrite when the value is not stale, so a racing datagram
         // cannot rewrite the stored counter backwards and make the NEXT genuine
         // message look like a restart.
-        match peer_restart.get(&peer.ip()).copied() {
+        // #1208 review: an IPv4 peer reached over a dual-stack [::] socket shows
+        // as ::ffff:a.b.c.d; it is the same node as a.b.c.d.
+        let ip = peer.ip().to_canonical();
+        match peer_restart.get(&ip).copied() {
             Some(prev) => {
                 if restart_counter_order(prev, restart_counter) == RestartOrder::Restarted {
-                    peer_restart.insert(peer.ip(), restart_counter);
+                    peer_restart.insert(ip, restart_counter);
                 }
                 Some(prev)
             }
             None => {
-                peer_restart.insert(peer.ip(), restart_counter);
+                peer_restart.insert(ip, restart_counter);
                 None
             }
         }
@@ -1479,10 +1482,10 @@ fn note_peer_recovery(inner: &Arc<GtpcInner>, peer: SocketAddr, restart_counter:
             }
             // The restarted peer no longer knows this node's counter (#1220).
             if let Ok(mut set) = inner.recovery_indicated.lock() {
-                set.retain(|p| p.ip() != peer.ip());
+                set.retain(|p| p.ip().to_canonical() != peer.ip().to_canonical());
             }
             if restart_deletion_enabled() {
-                delete_contexts_for_peer(peer.ip());
+                delete_contexts_for_peer(peer.ip().to_canonical());
             } else {
                 log::warn!(
                     "Peer {} restart detected but SGWC_RESTART_DELETE_CONTEXTS is off: \
@@ -2094,17 +2097,23 @@ fn dispatch_s5c_create_session_response(msg: &Gtp2Message, peer: SocketAddr) {
     // builds the S11 Create Session Response from. Before #52 the PAA was COPIED from
     // the MME's request (`parsed.paa` into `sess.paa`), so the UE was handed back the
     // address it had asked about with no node having allocated anything.
+    // #1208 review: the PGW's control address is the session's anchor for
+    // restart and path-failure cleanup (TS 23.007 §16.1A.2), whatever the PAA:
+    // a response without one (a partial or new-PDN-type acceptance, a Non-IP
+    // PDN) still anchors the PDN connection at that PGW. Both families, so an
+    // IPv6 (or dual-stack) PGW is matched too.
+    if let Some(ft) = pgw_c.as_ref() {
+        if let Some(mut sess) = ctx.sess_find_by_id(sess_id) {
+            sess.pgw_addr = ft.ipv4_addr.map(std::net::Ipv4Addr::from);
+            sess.pgw_addr6 = ft.ipv6_addr.map(std::net::Ipv6Addr::from);
+            ctx.sess_update(&sess);
+        }
+    }
     if let Some(paa) = paa {
         if let Some(mut sess) = ctx.sess_find_by_id(sess_id) {
             sess.paa.pdn_type = paa.pdn_type;
             sess.paa.ipv4_addr = paa.ipv4_addr.map(std::net::Ipv4Addr::from);
             sess.paa.ipv6_addr = paa.ipv6_addr.map(std::net::Ipv6Addr::from);
-            if let Some(ft) = pgw_c.as_ref() {
-                sess.pgw_addr = ft.ipv4_addr.map(std::net::Ipv4Addr::from);
-                // #1208: an IPv6 (or dual-stack) PGW is matched on restart and
-                // path failure too.
-                sess.pgw_addr6 = ft.ipv6_addr.map(std::net::Ipv6Addr::from);
-            }
             ctx.sess_update(&sess);
             log::info!(
                 "S5/S8 Create Session Response from {peer}: PGW allocated PAA {:?} (pdn_type={})",
@@ -4303,6 +4312,8 @@ mod tests {
         s5u_ipv6: std::sync::Arc<std::sync::Mutex<Option<[u8; 16]>>>,
         /// Every message received, decoded (#607).
         msgs: std::sync::Arc<std::sync::Mutex<Vec<Gtp2Message>>>,
+        /// When set, the Create Session Response carries no PAA (#1208 review).
+        omit_paa: std::sync::Arc<std::sync::atomic::AtomicBool>,
         /// The stand-in's socket, so a test can send PGW-initiated Requests (#607).
         sock: std::sync::Arc<tokio::net::UdpSocket>,
     }
@@ -4334,6 +4345,8 @@ mod tests {
         let created_cause = create_cause.clone();
         let s5u_ipv6 = std::sync::Arc::new(std::sync::Mutex::new(None::<[u8; 16]>));
         let s5u_v6 = s5u_ipv6.clone();
+        let omit_paa = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let no_paa = omit_paa.clone();
         let creates_seen = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let (dels, answer_dels) = (deletes.clone(), answer_deletes.clone());
         let (del_cause, create_delay) = (delete_cause.clone(), create_delay_ms.clone());
@@ -4419,7 +4432,9 @@ mod tests {
                 let teid =
                     0x0BEE_F001 + creates_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 resp.add_ie(Gtp2FTeidIe::new_ipv4(7, teid, [127, 0, 0, 1]).to_ie(1));
-                resp.add_ie(Gtp2PaaIe::ipv4(PGW_ALLOCATED_ADDR).to_ie(0));
+                if !no_paa.load(std::sync::atomic::Ordering::SeqCst) {
+                    resp.add_ie(Gtp2PaaIe::ipv4(PGW_ALLOCATED_ADDR).to_ie(0));
+                }
                 let mut bc = Gtp2BearerContextIe::new();
                 bc.set_ebi(5);
                 let s5u = match *s5u_v6.lock().unwrap_or_else(|e| e.into_inner()) {
@@ -4442,6 +4457,7 @@ mod tests {
             create_cause,
             s5u_ipv6,
             msgs,
+            omit_paa,
             sock,
         }
     }
@@ -9444,10 +9460,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_ipv6_pgw_restart_deletes_its_pdn_connections() {
         let ambient = crate::pfcp_path::process_state_test_guard().await;
-        let Ok(pgw) = UdpSocket::bind("[::1]:0") else {
-            eprintln!("no IPv6 loopback here; skipped");
-            return;
-        };
+        // #1208 review: no silent skip. The test needs the IPv6 loopback (the
+        // CI runners and the dev hosts have it); without it, it fails and says so.
+        let pgw = UdpSocket::bind("[::1]:0")
+            .expect("this test needs the IPv6 loopback [::1] (TS 23.007 §16.1A.2 over IPv6)");
         let sgwu = stand_in_sgwu(
             &ambient,
             crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
@@ -9512,6 +9528,77 @@ mod tests {
         );
         ctx.ue_remove(other_ue);
         server.close();
+    }
+
+    /// #1208 review: a PGW answer without a PAA (here an acceptance with a new
+    /// PDN type, cause 19) still anchors the PDN connection at that PGW: its
+    /// control address is stored, so its restart or path failure finds it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_pgw_address_is_kept_when_its_answer_has_no_paa() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let _sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let pgw = with_stand_in_pgw().await;
+        pgw.omit_paa
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        pgw.create_cause.store(
+            gtp_cause::NEW_PDN_TYPE_DUE_TO_SINGLE_ADDRESS_BEARER_ONLY,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        let server = test_server(&ambient, 1000, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x12, 0x08];
+        sock.send_to(&csr(0x1208, &imsi).encode(), server.local_addr())
+            .unwrap();
+        let _ = recv_s11(&sock).await.expect("the MME is answered");
+        let ctx = sgwc_self();
+        let ue = ctx.ue_find_by_imsi(&imsi).expect("the UE");
+        let sess = ctx.sess_list_for_ue(ue.id).remove(0);
+        assert_eq!(
+            sess.pgw_addr,
+            Some(Ipv4Addr::LOCALHOST),
+            "the PGW's S5/S8-C address, without a PAA"
+        );
+        // Other tests' sessions at the stand-ins' 127.0.0.1 may be in the shared
+        // store too: this one must be among them.
+        assert!(
+            ctx.sess_list_for_pgw_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
+                .iter()
+                .any(|s| s.id == sess.id),
+            "found by the PGW cleanup"
+        );
+        ctx.ue_remove(ue.id);
+        sgwc_self().set_pgw_s5c_peer(None);
+        server.close();
+    }
+
+    /// #1208 review: an IPv4 peer reached over a dual-stack `[::]` socket shows
+    /// as `::ffff:a.b.c.d`. It is the same node: its PDN connections and its
+    /// MME's UEs are matched by the cleanup.
+    #[test]
+    fn an_ipv4_mapped_peer_address_matches_its_ipv4_contexts() {
+        let ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let mme: SocketAddr = "192.0.2.31:2123".parse().unwrap();
+        let (ue_id, sess_id) =
+            ue_with_session_at_pgw(mme, Ipv4Addr::new(192, 0, 2, 32), b"001011208000003");
+        let ctx = sgwc_self();
+        let mapped = |a: [u8; 4]| IpAddr::V6(Ipv4Addr::from(a).to_ipv6_mapped());
+        assert_eq!(
+            ctx.sess_list_for_pgw_ip(mapped([192, 0, 2, 32]))
+                .iter()
+                .map(|s| s.id)
+                .collect::<Vec<_>>(),
+            vec![sess_id]
+        );
+        assert_eq!(ctx.ue_ids_for_mme_ip(mapped([192, 0, 2, 31])), vec![ue_id]);
+        ctx.ue_remove(ue_id);
+        drop(ambient);
     }
 
     /// #1213: `delete_pdn_connections_for_pgw` tells the MME and the SGW-U before
