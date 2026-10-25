@@ -323,6 +323,22 @@ impl GtpcServer {
         self.inner.local_addr
     }
 
+    /// Use `n3` for requests of `message_types` (TS 29.274 §7.6, #1228).
+    pub fn set_n3_for(&self, message_types: &[u8], n3: u32) {
+        if let Ok(mut xact) = self.inner.xact.lock() {
+            xact.set_n3_for(message_types, n3);
+        }
+    }
+
+    /// The N3 a request of `message_type` gets.
+    pub fn n3_for(&self, message_type: u8) -> u32 {
+        self.inner
+            .xact
+            .lock()
+            .map(|x| x.n3_for(message_type))
+            .unwrap_or(0)
+    }
+
     /// Local restart counter advertised in Recovery IEs
     pub fn restart_counter(&self) -> u8 {
         self.inner.restart_counter
@@ -539,20 +555,30 @@ impl GtpcServer {
         let t = msg.header.message_type;
         let mut out = msg.clone();
         if t == Gtp2MessageType::EchoRequest as u8 || t == Gtp2MessageType::EchoResponse as u8 {
-            if let Ok(mut set) = self.inner.recovery_indicated.lock() {
-                set.insert(peer);
+            // An Echo Response is a response: it is resent from the cache for a
+            // retransmitted Echo Request. An Echo Request counts only once its
+            // Response arrives (`note_recovery_received`).
+            if t == Gtp2MessageType::EchoResponse as u8 {
+                self.mark_recovery_indicated(peer);
             }
             return out;
         }
         out.ies
             .retain(|ie| ie.ie_type != Gtp2IeType::Recovery as u8);
-        let first = recovery_conditional(t)
+        let include = recovery_conditional(t)
             && self
                 .inner
                 .recovery_indicated
                 .lock()
-                .is_ok_and(|mut set| set.insert(peer));
-        if first {
+                .is_ok_and(|set| !set.contains(&peer));
+        // #1223 review: a request (S5/S8 Create Session / Modify Bearer) may run
+        // out N3 unanswered, and then the peer never got the counter. It keeps
+        // carrying Recovery until the peer has answered one; a response is
+        // retransmitted from the cache, so it counts at once.
+        if include && !is_recovery_request(t) {
+            self.mark_recovery_indicated(peer);
+        }
+        if include {
             out.add_ie(Gtp2Ie::from_slice(
                 Gtp2IeType::Recovery as u8,
                 0,
@@ -560,6 +586,21 @@ impl GtpcServer {
             ));
         }
         out
+    }
+
+    fn mark_recovery_indicated(&self, peer: SocketAddr) {
+        if let Ok(mut set) = self.inner.recovery_indicated.lock() {
+            set.insert(peer);
+        }
+    }
+
+    /// Whether this node's Recovery has reached `peer` (it answered a request
+    /// carrying it, or was sent a response with it). Test/diagnostic.
+    pub fn recovery_indicated_to(&self, peer: SocketAddr) -> bool {
+        self.inner
+            .recovery_indicated
+            .lock()
+            .is_ok_and(|set| set.contains(&peer))
     }
 
     /// Send an Echo Request (path management, TS 29.274 Section 7.1.1)
@@ -663,6 +704,18 @@ fn advertised_addresses(
 
 /// Open the S11 GTP-C server socket
 /// Port of sgwc_gtp_open
+/// The S11/S5 GTP-C server as the process runs it: default T3/N3, except the
+/// paging-dependent bearer Requests relayed to the MME, whose transaction lasts
+/// T3 x (N3 + 1) = 54 s (#1228, TS 29.274 §7.6), beyond the MME's answer budget
+/// and inside the PGW's S5/S8 one (`nextgcore_gtp::v2::xact` documents the
+/// three).
+pub fn open_s11_server(bind: &str, restart_counter: u8) -> Result<GtpcServer, String> {
+    use nextgcore_gtp::v2::xact::{BEARER_PROCEDURE_REQUESTS, SGW_BEARER_PROCEDURE_N3};
+    let server = GtpcServer::open(bind, Gtp2XactConfig::default(), restart_counter)?;
+    server.set_n3_for(&BEARER_PROCEDURE_REQUESTS, SGW_BEARER_PROCEDURE_N3);
+    Ok(server)
+}
+
 pub fn gtp_open() -> Result<(), String> {
     if s11_server().is_some() {
         return Ok(());
@@ -686,7 +739,7 @@ pub fn gtp_open() -> Result<(), String> {
         None => advance_persistent_restart_counter(&restart_counter_path()),
     };
 
-    let server = GtpcServer::open(&bind, Gtp2XactConfig::default(), restart_counter)?;
+    let server = open_s11_server(&bind, restart_counter)?;
 
     let ctx = sgwc_self();
     // Advertised control-plane address: the bound address unless wildcard,
@@ -914,6 +967,7 @@ fn handle_datagram(inner: &Arc<GtpcInner>, data: &[u8], peer: SocketAddr) {
             note_peer_recovery(inner, peer, rec.restart_counter);
         }
     }
+    note_recovery_received(inner, peer, msg.header.message_type);
 
     if let Ok(mut states) = inner.peer_state.lock() {
         states.entry(peer).or_insert(GtpPathState::Active);
@@ -1412,9 +1466,38 @@ fn recovery_conditional(msg_type: u8) -> bool {
         T::CreateIndirectDataForwardingTunnelResponse,
         T::DeleteIndirectDataForwardingTunnelResponse,
         T::ModifyAccessBearersResponse,
+        // O in their tables (7.2.22-1, 7.2.6-1), carried under the same
+        // first-contact rule (#1223 review).
+        T::ReleaseAccessBearersResponse,
+        T::BearerResourceFailureIndication,
     ]
     .iter()
     .any(|t| *t as u8 == msg_type)
+}
+
+/// The [`recovery_conditional`] messages this node sends as requests: they
+/// count as indicated only once the peer answers one (#1223 review).
+fn is_recovery_request(msg_type: u8) -> bool {
+    msg_type == Gtp2MessageType::CreateSessionRequest as u8
+        || msg_type == Gtp2MessageType::ModifyBearerRequest as u8
+}
+
+/// The answers that prove `peer` received a request of this node's that carried
+/// its Recovery (#1223 review): until one arrives, those requests keep carrying it.
+fn note_recovery_received(inner: &Arc<GtpcInner>, peer: SocketAddr, msg_type: u8) {
+    use Gtp2MessageType as T;
+    if [
+        T::CreateSessionResponse,
+        T::ModifyBearerResponse,
+        T::EchoResponse,
+    ]
+    .iter()
+    .any(|t| *t as u8 == msg_type)
+    {
+        if let Ok(mut set) = inner.recovery_indicated.lock() {
+            set.insert(peer);
+        }
+    }
 }
 
 /// Track the peer's restart counter and act on a confirmed restart
@@ -1942,7 +2025,9 @@ fn warn_abandoned_s5c_eviction(now: Instant, total: u64) {
     }
     *last = Some(now);
     log::warn!(
-        "{ABANDONED_S5C_CAP} S5/S8 Create Session Requests abandoned after N3 are remembered;          the oldest are forgotten ({total} so far), so a late PGW answer to them leaves its PDN          connection at the PGW (sgwc_s5_abandoned_create_evicted_total)"
+        "{ABANDONED_S5C_CAP} S5/S8 Create Session Requests abandoned after N3 are remembered; \
+         the oldest are forgotten ({total} so far), so a late PGW answer to them leaves its PDN \
+         connection at the PGW (sgwc_s5_abandoned_create_evicted_total)"
     );
 }
 
@@ -6110,6 +6195,89 @@ mod tests {
             .teid
     }
 
+    /// #1223 review, TS 29.274 §7.2.0: a PGW that drops the first Create Session
+    /// Request (and its retransmission: N3 runs out) never got this SGW's
+    /// Recovery, so the next Create carries it again; once the PGW has answered
+    /// one, the following Create carries none.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recovery_is_carried_until_the_pgw_answers_a_request() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let _sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let pgw = UdpSocket::bind("127.0.0.1:0").unwrap();
+        pgw.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let pgw_addr = pgw.local_addr().unwrap();
+        sgwc_self().set_pgw_s5c_peer(Some(pgw_addr));
+        let server = test_server(&ambient, 100, 1);
+        set_s11_server(server.clone());
+        let mme = client();
+        mme.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let own = server.restart_counter();
+        let next_csr = |pgw: &UdpSocket| loop {
+            let mut buf = [0u8; 4096];
+            let (len, from) = pgw.recv_from(&mut buf).expect("a request at the PGW");
+            let m = Gtp2Message::decode(&mut Bytes::copy_from_slice(&buf[..len])).unwrap();
+            if m.header.message_type == Gtp2MessageType::CreateSessionRequest as u8 {
+                return (m, from);
+            }
+        };
+        let recovery = |m: &Gtp2Message| {
+            m.get_ie(Gtp2IeType::Recovery as u8, 0)
+                .map(|ie| ie.value.to_vec())
+        };
+
+        // 1. Dropped: the request and its one retransmission go unanswered.
+        mme.send_to(
+            &csr(0x1251, &[0x31, 0x31, 0x31, 0x31, 0x31, 0x25, 0x51]).encode(),
+            server.local_addr(),
+        )
+        .unwrap();
+        let (first, _) = next_csr(&pgw);
+        assert_eq!(recovery(&first), Some(vec![own]));
+        let (again, _) = next_csr(&pgw);
+        assert_eq!(again.header.sequence_number, first.header.sequence_number);
+        let rsp = recv_s11(&mme).await.expect("the MME is answered after N3");
+        assert_eq!(cause_of(&rsp), gtp_cause::REMOTE_PEER_NOT_RESPONDING);
+        assert!(
+            !server.recovery_indicated_to(pgw_addr),
+            "not indicated: never answered"
+        );
+
+        // 2. Carried again; this time the PGW answers (a refusal still proves
+        // the request, and its Recovery, arrived).
+        mme.send_to(
+            &csr(0x1252, &[0x31, 0x31, 0x31, 0x31, 0x31, 0x25, 0x52]).encode(),
+            server.local_addr(),
+        )
+        .unwrap();
+        let (second, from) = next_csr(&pgw);
+        assert_eq!(recovery(&second), Some(vec![own]), "carried until answered");
+        let mut answer = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+            Gtp2MessageType::CreateSessionResponse as u8,
+            0,
+            second.header.sequence_number,
+        ));
+        answer.add_ie(Gtp2CauseIe::new(gtp_cause::NO_RESOURCES_AVAILABLE).to_ie(0));
+        pgw.send_to(&answer.encode(), from).unwrap();
+        let _ = recv_s11(&mme).await.expect("the MME is answered");
+        assert!(server.recovery_indicated_to(pgw_addr));
+
+        // 3. Indicated: no Recovery any more.
+        mme.send_to(
+            &csr(0x1253, &[0x31, 0x31, 0x31, 0x31, 0x31, 0x25, 0x53]).encode(),
+            server.local_addr(),
+        )
+        .unwrap();
+        let (third, _) = next_csr(&pgw);
+        assert_eq!(recovery(&third), None, "the PGW has it");
+        sgwc_self().set_pgw_s5c_peer(None);
+        server.close();
+    }
+
     /// #1220, TS 29.274 §7.2.0 / Table 7.2.1-1: the S5/S8 Create Session Request
     /// carries this SGW's Recovery on its first contact with the PGW, and the S11
     /// Create Session Response on the first contact with the MME; not again
@@ -6174,6 +6342,38 @@ mod tests {
             "re-indicated after the PGW's restart"
         );
         sgwc_self().set_pgw_s5c_peer(None);
+        server.close();
+    }
+
+    /// #1223 review: the two responses whose Recovery row is O (Release Access
+    /// Bearers Response, Table 7.2.22-1; Bearer Resource Failure Indication,
+    /// 7.2.6-1) carry it on first contact too.
+    #[test]
+    fn the_optional_recovery_responses_carry_it_on_first_contact() {
+        let ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let server = test_server(&ambient, 1000, 1);
+        let own = server.restart_counter();
+        for (n, t) in [
+            Gtp2MessageType::ReleaseAccessBearersResponse,
+            Gtp2MessageType::BearerResourceFailureIndication,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let peer: SocketAddr = format!("192.0.2.{}:2123", 20 + n).parse().unwrap();
+            let m = Gtp2Message::new(nextgcore_gtp::v2::header::Gtp2Header::new(t as u8, 1, 1));
+            let out = server.with_own_recovery(peer, &m);
+            assert_eq!(
+                out.get_ie(Gtp2IeType::Recovery as u8, 0)
+                    .map(|ie| ie.value.to_vec()),
+                Some(vec![own]),
+                "{t:?}"
+            );
+            assert!(
+                server.recovery_indicated_to(peer),
+                "a response counts at once"
+            );
+        }
         server.close();
     }
 

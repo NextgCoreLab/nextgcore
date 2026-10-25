@@ -464,4 +464,51 @@ fn an_erab_bit_rate_past_the_s1ap_range_is_sent_as_its_maximum() {
         ),
         (MAX, MAX, MAX, 4_000_000)
     );
+    // #1250, TS 36.413 §9.2.1.18: the directions past 10 Gbit/s also travel in
+    // the Rel-15 Extended E-RAB Bit Rate IEs (criticality ignore), clamped to
+    // ExtendedBitRate's 4 Tbit/s; the ones in range get none.
+    let pdu = nextgcore_s1ap_gen::decode(&bytes).unwrap();
+    let g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+        value: g::InitiatingMessageValue::Id_E_RABSetup(req),
+        ..
+    }) = pdu
+    else {
+        panic!("not an E-RAB SETUP REQUEST");
+    };
+    let ext: Vec<(u16, u8, u64)> = req
+        .protocol_i_es
+        .0
+        .iter()
+        .find_map(|ie| match &ie.value {
+            g::E_RABSetupRequestProtocolIEs_EntryValue::Id_E_RABToBeSetupListBearerSUReq(l) => {
+                let g::E_RABToBeSetupListBearerSUReq_EntryValue::Id_E_RABToBeSetupItemBearerSUReq(
+                    item,
+                ) = &l.0[0].value;
+                item.e_ra_blevel_qo_s_parameters
+                    .gbr_qos_information
+                    .as_ref()
+                    .and_then(|g| g.ie_extensions.as_ref())
+                    .map(|x| {
+                        x.0.iter()
+                            .map(|e| {
+                                use g::GBR_QosInformationIE_Extensions_EntryExtensionValue as X;
+                                let v = match &e.extension_value {
+                                    X::Id_extended_e_RAB_MaximumBitrateDL(b)
+                                    | X::Id_extended_e_RAB_MaximumBitrateUL(b)
+                                    | X::Id_extended_e_RAB_GuaranteedBitrateDL(b)
+                                    | X::Id_extended_e_RAB_GuaranteedBitrateUL(b) => b.0,
+                                };
+                                (e.id.0, e.criticality.0, v)
+                            })
+                            .collect()
+                    })
+            }
+            _ => None,
+        })
+        .expect("the extensions");
+    assert_eq!(
+        ext,
+        vec![(255, 1, 4_000_000_000_000), (256, 1, MAX + 1)],
+        "MBR DL (clamped to 4 Tbit/s) and UL; the GBRs are in range"
+    );
 }
