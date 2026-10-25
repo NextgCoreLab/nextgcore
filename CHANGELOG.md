@@ -34,6 +34,14 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   A profile with neither serves any slice (§6.1.6.2.2). The discovery cache is keyed by the
   S-NSSAI too. Before, the first NSACF was used for every slice (TS 23.501 §5.15.11). `NSACF_URI`
   still names one NSACF for all slices (#1164).
+- smfd sends a PDU session's NSACF DECREASE to the NSACF that admitted it, recorded on its
+  policy binding (and in the durable snapshot), instead of re-discovering one: with two NSACFs
+  for a slice and the NRF's order changed, the count leaked on the first. The NSACF discovery
+  also honours the `nnsacf-nsac` service's own `sNssais` / `perPlmnSnssaiList` (TS 29.510
+  §6.1.6.2.3), reads a `perPlmnSnssaiList` for the serving PLMN only, skips an instance whose
+  endpoint cannot be read (and reaches an FQDN-only one by its FQDN) rather than giving up, and
+  an SM Context Create whose S-NSSAI SD is not 6 hex digits (TS 29.571 §5.4.4.2) is answered 400
+  INVALID_MSG_FORMAT (#1164).
 - smfd ignores the Recovery Time Stamp in a PFCP Association Setup Response, and keeps a UPF's
   Recovery Time Stamp in memory only (TS 23.007 §19A; TS 29.244 Table 7.4.4.2-1 NOTE). A new
   association starts with no stored stamp, and its first Heartbeat stamp is the baseline. Whether
@@ -44,10 +52,14 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   ignored on load and dropped at the next write. The stored stamp is forgotten when the
   association goes down. A session request answered with cause 72 "No established PFCP
   Association" (a UPF that restarted after the Association Setup) tears the association down and
-  releases that UPF's sessions, so it is set up again (#966).
+  releases that UPF's sessions, so it is set up again (#966). Only the association the request
+  was sent on: a late cause 72 answering a request sent before a re-association leaves the
+  association set up since, and its sessions, in place.
 - smfd takes its durable snapshot through a poisoned lock: the maps and the IPv4 pool are read
   as the panicking writer left them, and the poison is logged. Before, a poisoned map was written
-  as empty over the last good snapshot, and the next restart restored nothing (#1178).
+  as empty over the last good snapshot, and the next restart restored nothing (#1178). The
+  poison is then cleared, so the map's writers (which skip a poisoned lock) and the IPv4 pool's
+  allocation resume, and it is logged once per poisoning rather than at every write.
 - smfd answers its own SM Context Create and Update errors as SmContextCreateError /
   SmContextUpdateError (TS 29.502 Tables 6.1.3.2.3.1-3, 6.1.3.3.4.2.2-2): the ProblemDetails is
   under `error`, at `application/json`. A failed activation adds `upCnxState: DEACTIVATED`, and a
