@@ -858,6 +858,14 @@ pub struct SmfBearer {
     pub pf_to_delete: Vec<u8>,
     /// Parent session ID
     pub sess_id: u64,
+    /// #619: the index of this dedicated EPS bearer's PGW-U rules (1..=15), 0 for none.
+    ///
+    /// The PGW-C must install the bearer's S5/S8-U uplink PDR before it sends the Create
+    /// Bearer Request (the request carries the PGW-U F-TEID), but the EBI is assigned by
+    /// the MME and is only known from the response (TS 29.274 §7.2.3: the PGW sends EBI
+    /// 0). So the rule ids cannot be derived from the EBI as #583's are; they are derived
+    /// from this index instead, which is unique among the session's bearers.
+    pub eps_rule_index: u8,
 }
 
 impl SmfBearer {
@@ -889,6 +897,7 @@ impl SmfBearer {
             pf_ids: Vec::new(),
             pf_to_delete: Vec::new(),
             sess_id,
+            eps_rule_index: 0,
         }
     }
 
