@@ -524,16 +524,18 @@ pub fn handle_create_indirect_data_forwarding_tunnel_request(
             continue;
         };
 
-        for (interface_type, remote_teid, remote_ip) in [
+        for (interface_type, remote_teid, remote_ip, remote_ip6) in [
             (
                 gtp_interface::SGW_GTP_U_DL_DATA_FORWARDING,
                 req.enb_dl_teid,
                 req.enb_dl_ipv4,
+                req.enb_dl_ipv6,
             ),
             (
                 gtp_interface::SGW_GTP_U_UL_DATA_FORWARDING,
                 req.enb_ul_teid,
                 req.enb_ul_ipv4,
+                req.enb_ul_ipv6,
             ),
         ] {
             // A direction the MME did not ask for gets no tunnel. Allocating one anyway
@@ -551,12 +553,12 @@ pub fn handle_create_indirect_data_forwarding_tunnel_request(
             tunnel.pdr_id = Some(ctx.next_pdr_id());
             tunnel.far_id = Some(ctx.next_far_id());
             tunnel.remote_teid = remote_teid;
-            if let Some(v4) = remote_ip {
-                tunnel.remote_ip = crate::context::IpAddr {
-                    ipv4: Some(Ipv4Addr::from(v4)),
-                    ipv6: None,
-                };
-            }
+            // #1148 review: whichever families the eNB's F-TEID carries (an
+            // IPv6-only target eNB included, TS 29.274 §8.22).
+            tunnel.remote_ip = crate::context::IpAddr {
+                ipv4: remote_ip.map(Ipv4Addr::from),
+                ipv6: remote_ip6.map(std::net::Ipv6Addr::from),
+            };
             ctx.tunnel_update(&tunnel);
             allocated += 1;
         }
@@ -579,9 +581,12 @@ pub(crate) struct IndirectForwardingRequest {
     /// Target eNodeB DL data-forwarding endpoint (instance 0, interface type 19)
     pub enb_dl_teid: u32,
     pub enb_dl_ipv4: Option<[u8; 4]>,
+    /// #1148 review: the IPv6 half (TS 29.274 §8.22).
+    pub enb_dl_ipv6: Option<[u8; 16]>,
     /// Target eNodeB UL data-forwarding endpoint (instance 4, interface type 20)
     pub enb_ul_teid: u32,
     pub enb_ul_ipv4: Option<[u8; 4]>,
+    pub enb_ul_ipv6: Option<[u8; 16]>,
 }
 
 /// Parse the Bearer Contexts of a CIDFT Request (TS 29.274 Table 7.2.18-2).
@@ -611,6 +616,7 @@ pub(crate) fn parse_indirect_forwarding_request(
                 if ft.interface_type == ENB_DL_FORWARDING {
                     req.enb_dl_teid = ft.teid;
                     req.enb_dl_ipv4 = ft.ipv4_addr;
+                    req.enb_dl_ipv6 = ft.ipv6_addr;
                 } else {
                     log::debug!(
                         "CIDFT Request F-TEID at instance 0 has interface type {} (expected {} \
@@ -624,6 +630,7 @@ pub(crate) fn parse_indirect_forwarding_request(
                 if ft.interface_type == ENB_UL_FORWARDING {
                     req.enb_ul_teid = ft.teid;
                     req.enb_ul_ipv4 = ft.ipv4_addr;
+                    req.enb_ul_ipv6 = ft.ipv6_addr;
                 } else {
                     log::debug!(
                         "CIDFT Request F-TEID at instance 4 has interface type {} (expected {} \
@@ -793,6 +800,92 @@ mod tests {
         bc.set_fteid(4, &Gtp2FTeidIe::new_ipv4(20, ul_teid, [10, 0, 0, 10]));
         msg.add_bearer_context(0, &bc);
         msg
+    }
+
+    /// #1148 review, TS 29.274 §8.22, TS 29.244 §8.2.56: a target eNB's
+    /// forwarding F-TEID carrying only IPv6 (DL) or both (UL) is kept whole, and
+    /// the forwarding rules' Create FAR gets the IPv6 Outer Header Creation for
+    /// the IPv6-only one. Before, only the IPv4 half was stored, and the DL FAR
+    /// had no Outer Header Creation.
+    #[test]
+    fn cidft_forwarding_to_an_ipv6_target_enb_has_an_ipv6_outer_header() {
+        use nextgcore_gtp::v2::header::{Gtp2Header, Gtp2MessageType};
+        use nextgcore_gtp::v2::ie::Gtp2FTeidIe;
+        let _ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let ctx = sgwc_self();
+        ctx.set_gtpu_address(Some(Ipv4Addr::new(10, 11, 0, 7)));
+        let ue = ctx
+            .ue_add(&[0x48, 0x11, 0x48, 0x00, 0x00, 0x00, 0x48])
+            .unwrap();
+        let sess = ctx.sess_add(ue.id, "internet").unwrap();
+        let bearer = ctx.bearer_add(sess.id).unwrap();
+        {
+            let mut b = ctx.bearer_find_by_id(bearer.id).unwrap();
+            b.ebi = 5;
+            ctx.bearer_update(&b);
+        }
+        let ue = ctx.ue_find_by_id(ue.id).unwrap();
+        let v6: std::net::Ipv6Addr = "2001:db8::1148".parse().unwrap();
+        let mut msg = Gtp2Message::new(Gtp2Header::new(
+            Gtp2MessageType::CreateIndirectDataForwardingTunnelRequest as u8,
+            0x1234,
+            8,
+        ));
+        let mut bc = Gtp2BearerContextIe::new();
+        bc.set_ebi(5);
+        bc.set_fteid(0, &Gtp2FTeidIe::new_ipv6(19, 0xD6D6, v6.octets()));
+        bc.set_fteid(
+            4,
+            &Gtp2FTeidIe::new_dual(20, 0xE6E6, [10, 0, 0, 10], v6.octets()),
+        );
+        msg.add_bearer_context(0, &bc);
+        assert!(matches!(
+            handle_create_indirect_data_forwarding_tunnel_request(Some(&ue), 8, &msg),
+            HandlerResult::SendPfcp
+        ));
+        let tunnels: Vec<_> = ctx
+            .bearer_find_by_id(bearer.id)
+            .unwrap()
+            .tunnel_ids
+            .iter()
+            .filter_map(|t| ctx.tunnel_find_by_id(*t))
+            .collect();
+        let dl = tunnels
+            .iter()
+            .find(|t| t.interface_type == gtp_interface::SGW_GTP_U_DL_DATA_FORWARDING)
+            .unwrap();
+        let ul = tunnels
+            .iter()
+            .find(|t| t.interface_type == gtp_interface::SGW_GTP_U_UL_DATA_FORWARDING)
+            .unwrap();
+        assert_eq!((dl.remote_ip.ipv4, dl.remote_ip.ipv6), (None, Some(v6)));
+        assert_eq!(
+            (ul.remote_ip.ipv4, ul.remote_ip.ipv6),
+            (Some(Ipv4Addr::new(10, 0, 0, 10)), Some(v6))
+        );
+
+        let sess = ctx.sess_find_by_id(sess.id).unwrap();
+        let rules = crate::sxa_build::build_indirect_forwarding_rules(&sess, &[bearer.id]).unwrap();
+        let req = nextgcore_pfcp::message::SessionModificationRequest::decode(
+            &mut bytes::Bytes::from(rules.data),
+        )
+        .unwrap();
+        let ohc_of = |far_id: Option<u32>| {
+            req.create_fars
+                .iter()
+                .find(|f| Some(f.far_id) == far_id)
+                .and_then(|f| f.forwarding_parameters.as_ref())
+                .and_then(|fp| fp.outer_header_creation.clone())
+                .expect("the forwarding FAR has an Outer Header Creation")
+        };
+        let dl_ohc = ohc_of(dl.far_id);
+        assert!(dl_ohc.description.gtpu_udp_ipv6);
+        assert_eq!(dl_ohc.ipv6_addr, Some(v6.octets()));
+        assert_eq!(dl_ohc.teid, Some(0xD6D6));
+        let ul_ohc = ohc_of(ul.far_id);
+        assert!(ul_ohc.description.gtpu_udp_ipv4, "dual-stack: IPv4");
+        assert_eq!(ul_ohc.ipv4_addr, Some([10, 0, 0, 10]));
+        ctx.ue_remove(ue.id);
     }
 
     /// #48 criterion 7 and criterion 8's third assertion: a CIDFT Request allocates real
