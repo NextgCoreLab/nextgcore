@@ -3629,7 +3629,9 @@ mod tests {
     /// #417: the EPS→5GS Setup Request Transfer, now encoded by the generated codec, is
     /// byte for byte what the hand-written codec built from the same session -- over GBR and
     /// non-GBR bearers, both PCI / PVI settings, with and without a Session-AMBR, and every
-    /// forwarding indication. The oracle below is the pre-#417 builder, verbatim.
+    /// forwarding indication. The oracle below is the pre-#417 builder, with one rule
+    /// since aligned to TS 38.413 §9.3.1.12 (#1147 review m2: GBR information by the
+    /// 5QI's resource type); what it checks is the encoding.
     #[test]
     fn the_handover_setup_request_transfer_is_the_hand_written_bytes() {
         use nextgcore_ngap::transfer::{

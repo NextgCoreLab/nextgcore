@@ -20500,6 +20500,43 @@ mod path_switch_ack_tests {
         assert_eq!(session_ambr_for(&flows, 0, 0), None, "nothing authorised");
     }
 
+    /// #1147 review N1: a native 5G session with EPS interworking keeps, on every
+    /// rebuilt transfer, the default flow's ARP its establishment sent ("shall not
+    /// trigger pre-emption, not pre-emptable"), though `record_mapped_eps_bearer`
+    /// stored a bearer for it.
+    ///
+    /// REVERT-VERIFIED: with the mapped bearer's PCI/PVI left clear, the rebuilt
+    /// default flow is may-trigger and pre-emptable.
+    #[tokio::test]
+    async fn a_native_session_keeps_its_default_arp_on_rebuild() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let r = crate::tests::seed_registered_session("imsi-001010000011472", 8, "internet");
+        let sess_id = smf_self()
+            .read()
+            .unwrap()
+            .sess_find_by_sm_context_ref(&r)
+            .expect("sess")
+            .id;
+        eps_iwk::record_mapped_eps_bearer(sess_id, 5, 1, 9, 8, "imsi-001010000011472")
+            .expect("the mapped flow");
+        let mut binding = context::PolicyBinding::snapshot_default();
+        binding.qfi = 1;
+        binding.five_qi = 9;
+        binding.arp_priority_level = 8;
+        binding.mapped_eps_bearer_id = Some(5);
+        let flows = session_setup_flows(&r, &binding);
+        if let Ok(ctx) = smf_self().read() {
+            ctx.sess_remove(sess_id);
+        }
+        assert_eq!(flows.len(), 1);
+        assert_eq!(
+            flows[0].arp,
+            default_flow(1, 9, 8)[0].arp,
+            "the establishment's ARP"
+        );
+        assert_eq!(flows[0].e_rab_id, Some(5));
+    }
+
     /// #518: `upCnxState: ACTIVATING` is answered with the session's setup transfer
     /// rebuilt from what establishment recorded -- the UPF N3 uplink endpoint and the
     /// default flow's QFI / 5QI / ARP -- so the AMF can put it in the Service
