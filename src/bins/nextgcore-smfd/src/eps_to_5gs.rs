@@ -257,6 +257,11 @@ async fn pfcp_create_n3_uplink(
 /// #583: the same modification installs each dedicated bearer's downlink as a QoS flow --
 /// a PDR on its TFT's downlink filters, through FAR 2 (now the target's N3 tunnel) and the
 /// bearer's QER, so its packets leave marked with its QFI. `dedicated_dl` is `(EBI, filters)`.
+///
+/// #619: it also removes the S5/S8-U rules of the dedicated bearers the PGW-C created
+/// (`eps_rules`, their rule indexes): their uplink tunnel is gone with the S5/S8-U, and
+/// their downlink PDR would otherwise keep sending the TFT's traffic to the source SGW
+/// ahead of the new QoS flow's PDR.
 async fn pfcp_switch_to_ngran(
     smf_n4_seid: u64,
     upf_seid: u64,
@@ -264,9 +269,10 @@ async fn pfcp_switch_to_ngran(
     gnb_addr: [u8; 4],
     ue_ip: Option<[u8; 4]>,
     dedicated_dl: &[(u8, Vec<String>)],
+    eps_rules: &[(u8, bool)],
 ) -> anyhow::Result<()> {
     use crate::n4_build::SessionModificationParams;
-    let params = SessionModificationParams {
+    let mut params = SessionModificationParams {
         update_fars_activate: vec![(
             DL_FAR_ID,
             0,                                              // Access
@@ -280,6 +286,15 @@ async fn pfcp_switch_to_ngran(
             .collect(),
         ..Default::default()
     };
+    for &(k, has_dl) in eps_rules {
+        let (ul, dl) = crate::eps_bearer::rule_ids(k);
+        params.remove_pdr_ids.push(ul);
+        params.remove_qer_ids.push(u32::from(ul));
+        if has_dl {
+            params.remove_pdr_ids.push(dl);
+            params.remove_far_ids.push(u32::from(dl));
+        }
+    }
     crate::pfcp_modify_with(smf_n4_seid, upf_seid, &params)
         .await
         .map(|_| ())
@@ -1758,6 +1773,15 @@ async fn handle_completed_inner(
         .map(|s| s.handover.forwarding_ids.clone())
         .unwrap_or_default();
     let switched = if was_eps {
+        // (rule index, whether the bearer has a downlink rule): #619 installs no downlink
+        // PDR/FAR for a bearer without a downlink filter, so none is removed for it.
+        let eps_rules: Vec<(u8, bool)> = sess.as_ref().map_or(Vec::new(), |s| {
+            session_bearers(s)
+                .iter()
+                .filter(|b| b.eps_rule_index != 0)
+                .map(|b| (b.eps_rule_index, !downlink_filters(b).is_empty()))
+                .collect()
+        });
         let (ue_ip, dedicated_dl) = sess.as_ref().map_or((None, Vec::new()), |s| {
             let bearers = session_bearers(s);
             let default_ebi = bearers.first().map(|b| b.ebi);
@@ -1781,7 +1805,16 @@ async fn handle_completed_inner(
                 .collect();
             (s.ipv4_addr.map(|a| a.octets()), dedicated)
         });
-        pfcp_switch_to_ngran(smf_n4_seid, upf_seid, teid, addr, ue_ip, &dedicated_dl).await
+        pfcp_switch_to_ngran(
+            smf_n4_seid,
+            upf_seid,
+            teid,
+            addr,
+            ue_ip,
+            &dedicated_dl,
+            &eps_rules,
+        )
+        .await
     } else {
         crate::pfcp_session_modify(smf_n4_seid, upf_seid, teid, addr).await
     };

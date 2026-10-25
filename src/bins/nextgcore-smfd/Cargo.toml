@@ -30,6 +30,8 @@ nextgcore-ngap-gen = { workspace = true }
 asn1-codecs.workspace = true
 nextgcore-pfcp = { workspace = true }
 nextgcore-gtp = { workspace = true }
+# #619: flow descriptions to and from the EPS TFT packet filter components.
+nextgcore-ipfw = { workspace = true }
 nextgcore-sbi = { workspace = true }
 nextgcore-metrics = { workspace = true }
 nextgcore-diameter = { workspace = true }
