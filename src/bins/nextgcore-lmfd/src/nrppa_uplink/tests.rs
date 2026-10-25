@@ -128,6 +128,156 @@ fn measured_results_map_to_cell_measurements() {
     );
 }
 
+/// #859: the E-CID report of [`ECID_REPORT`] with its one Measured Results entry
+/// replaced by `measured` (the hand-derived octets from SIZE(1..64) on), and the two
+/// open-type lengths adjusted.
+fn ecid_report_with_measured(measured: &[u8]) -> Vec<u8> {
+    let mut out = ECID_REPORT[..36].to_vec();
+    out.extend_from_slice(measured);
+    let delta = measured.len() as isize - 9;
+    out[5] = (0x27 + delta) as u8; // initiatingMessage value length
+    out[22] = (0x16 + delta) as u8; // E-CID-MeasurementResult open type length
+    out
+}
+
+/// #859: the NR Measured Results extensions, from hand-derived X.691 octets (TS
+/// 38.455 §9.2.5, choice-Extension of `MeasuredResultsValue`). The generated encoder
+/// must produce exactly these, and the decoder must give back the report values.
+///
+/// ```text
+/// 02 80        SIZE(1..64) 0 (6 bits); CHOICE choice-Extension 5 of 6 (3 bits);
+///              pad (the IE id is 2-octet aligned)
+/// 00 5e        id-NR-TADV (94)
+/// 40           criticality ignore (2 bits), pad (aligned open-type length)
+/// 02 04 d2     length 2; NR-TADV 1234: INTEGER (0..7690), 2-octet aligned
+///
+/// 00 76 40 02 f0 7d          id-UE-Rx-Tx-Time-Diff (118); 61565, the top of 0..61565
+///
+/// 00 20 40 09                id-ResultSS-RSRP (32), ignore, length 9:
+///  02 00     SIZE(1..9) 0 (4 bits); item ext 0, opts 0 1 0 0 (valueSS-RSRP-Cell);
+///            pad (nR-PCI 0..1007 is 2-octet aligned)
+///  00 07     nR-PCI 7
+///  80        nR-ARFCN 0..3279165: octet count - 1 = 2 (2 bits), pad
+///  09 75 e0  620000
+///  a0        valueSS-RSRP-Cell 80 in 7 bits, pad
+/// ```
+#[test]
+fn nr_measured_results_decode_from_hand_derived_octets() {
+    let cases: [(&[u8], crate::nrppa_uplink::NrEcidReport); 3] = [
+        (
+            &[0x02, 0x80, 0x00, 0x5e, 0x40, 0x02, 0x04, 0xd2],
+            NrEcidReport {
+                nr_tadv: Some(1234),
+                ..NrEcidReport::default()
+            },
+        ),
+        (
+            &[0x02, 0x80, 0x00, 0x76, 0x40, 0x02, 0xf0, 0x7d],
+            NrEcidReport {
+                ue_rx_tx_time_diff: Some(61565),
+                ..NrEcidReport::default()
+            },
+        ),
+        (
+            &[
+                0x02, 0x80, 0x00, 0x20, 0x40, 0x09, 0x02, 0x00, 0x00, 0x07, 0x80, 0x09, 0x75, 0xe0,
+                0xa0,
+            ],
+            NrEcidReport {
+                ss_rsrp: vec![NrCellResult {
+                    pci: 7,
+                    arfcn: 620_000,
+                    value: Some(80),
+                }],
+                ..NrEcidReport::default()
+            },
+        ),
+    ];
+    let built = [
+        nr_tadv(1234),
+        ue_rx_tx(61565),
+        ss_rsrp(&[(7, 620_000, Some(80))]),
+    ];
+    for ((octets, want), value) in cases.iter().zip(built) {
+        let hand = ecid_report_with_measured(octets);
+        assert_eq!(
+            ecid_report(9, 3, 5, nr_cgi(PLMN, 1), TAC, Some(vec![value])),
+            hand,
+            "the generated encoder agrees with the hand-derived octets for {want:?}"
+        );
+        let (_, cells, ei) = accepted(&hand);
+        assert!(ei.is_none());
+        assert_eq!(cells[0].nr_ecid.as_ref(), Some(want));
+        assert_eq!(
+            cells[0].ecid_rtt_ns, None,
+            "no timing term: the NR-TADV mapping (TS 38.133) is not implemented"
+        );
+    }
+}
+
+/// #859: every NR quantity in one report is kept, the first of each wins, and a
+/// report with only E-UTRA arms carries no NR part.
+#[test]
+fn every_nr_measured_result_is_kept_as_reported() {
+    let cell = |measured| {
+        let (_, cells, _) = accepted(&ecid_report(1, 15, 7, nr_cgi(PLMN, 1), TAC, Some(measured)));
+        cells.into_iter().next().expect("one serving-cell entry")
+    };
+    let c = cell(vec![
+        nr_tadv(0),
+        nr_tadv(7690),
+        ue_rx_tx(0),
+        ss_rsrp(&[(0, 0, Some(0)), (1007, 3_279_165, Some(127))]),
+        ss_rsrq(&[(5, 1000, None)]),
+        csi_rsrp(&[(6, 2000, Some(64))]),
+        csi_rsrq(&[(7, 3000, Some(1))]),
+        aoa_nr(3599, Some(1799)),
+        rsrp(&[60]),
+    ]);
+    assert_eq!(
+        c.nr_ecid,
+        Some(NrEcidReport {
+            nr_tadv: Some(0),
+            ue_rx_tx_time_diff: Some(0),
+            ss_rsrp: vec![
+                NrCellResult {
+                    pci: 0,
+                    arfcn: 0,
+                    value: Some(0)
+                },
+                NrCellResult {
+                    pci: 1007,
+                    arfcn: 3_279_165,
+                    value: Some(127)
+                },
+            ],
+            ss_rsrq: vec![NrCellResult {
+                pci: 5,
+                arfcn: 1000,
+                value: None
+            }],
+            csi_rsrp: vec![NrCellResult {
+                pci: 6,
+                arfcn: 2000,
+                value: Some(64)
+            }],
+            csi_rsrq: vec![NrCellResult {
+                pci: 7,
+                arfcn: 3000,
+                value: Some(1)
+            }],
+            aoa_nr: Some((3599, Some(1799))),
+        })
+    );
+    assert_eq!(c.rsrp, Some(-80), "the E-UTRA arm is still read");
+    assert_eq!(
+        (c.ecid_rtt_ns, c.aoa),
+        (None, None),
+        "no NR value is mapped"
+    );
+    assert_eq!(cell(vec![rsrp(&[60]), ta1(10)]).nr_ecid, None);
+}
+
 #[test]
 fn extension_range_measurement_ids_decode() {
     for (lmf, ran) in [(16u16, 256u16), (200, 3)] {
