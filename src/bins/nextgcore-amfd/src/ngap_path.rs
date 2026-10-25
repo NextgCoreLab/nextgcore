@@ -1065,11 +1065,6 @@ pub struct NgapServer {
     /// [`ESTABLISHMENT_RETRY_WINDOW`] has passed. See
     /// [`NgapServer::process_pending_establishments`].
     pending_establishments: HashMap<(u64, u8), PendingEstablishment>,
-    /// #1036: the establishments whose CreateSMContext succeeded, keyed by
-    /// (AMF UE NGAP ID, PSI), kept while the UE may still retransmit the request
-    /// ([`ESTABLISHMENT_RETRANSMISSION_HORIZON`]). A retransmission reuses the
-    /// stored origination timestamp. Forgotten with the session.
-    created_establishments: HashMap<(u64, u8), CreatedEstablishment>,
     /// SBI work run off this task (#796 review M1): the re-selection attempts.
     sbi_offload: crate::sbi_offload::SbiOffload,
     /// #748: the UCMF Assigns in flight for re-assignment, one per (TAC, UE radio
@@ -1143,19 +1138,6 @@ struct PendingEstablishment {
     /// The establishment's `3gpp-Sbi-Origination-Timestamp`, stamped when its
     /// first CreateSMContext went out and sent unchanged on every retry (#980
     /// review, TS 29.502 §6.1.2.3.2).
-    origination_timestamp: String,
-}
-
-/// A PDU Session Establishment Request whose CreateSMContext succeeded (#1036).
-#[derive(Debug, Clone)]
-struct CreatedEstablishment {
-    /// The request's procedure transaction identity. A retransmission carries
-    /// the same one (TS 24.501 §6.4.1.6 a)).
-    pti: u8,
-    /// When the request first arrived. The UE retransmits for at most
-    /// [`ESTABLISHMENT_RETRANSMISSION_HORIZON`] from then.
-    arrived: std::time::Instant,
-    /// The `3gpp-Sbi-Origination-Timestamp` the successful create carried.
     origination_timestamp: String,
 }
 
@@ -1341,12 +1323,8 @@ const MAX_OFFLOADED_SBI: usize = 16;
 /// an answer before it retransmits. An SMF restarting in place is back well
 /// within it.
 const ESTABLISHMENT_RETRY_WINDOW: Duration = Duration::from_secs(12);
-/// How long after a PDU SESSION ESTABLISHMENT REQUEST arrives the UE can still
-/// retransmit it (#1036). TS 24.501 §6.4.1.6 a): the UE retransmits on each of
-/// the first four expiries of T3580 (16 s, §10.3) and aborts on the fifth, so
-/// its last retransmission is sent at 4 x 16 s. One more T3580 period is
-/// margin for the radio and the AMF's own queueing.
-const ESTABLISHMENT_RETRANSMISSION_HORIZON: Duration = Duration::from_secs(5 * 16);
+/// Request type "initial request" (TS 24.501 §9.11.3.47).
+const REQUEST_TYPE_INITIAL_REQUEST: u8 = 0x01;
 /// The spacing of the re-selection attempts within the window.
 const ESTABLISHMENT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 /// At most this many establishments wait at once. Beyond it, one is answered
@@ -1528,7 +1506,6 @@ impl NgapServer {
             up_active: std::collections::HashSet::new(),
             last_session_sweep: std::time::Instant::now(),
             pending_establishments: HashMap::new(),
-            created_establishments: HashMap::new(),
             racs_assigns: HashMap::new(),
             supersede_barriers: HashMap::new(),
             held_positioning: Vec::new(),
@@ -8967,6 +8944,66 @@ impl NgapServer {
         Ok(())
     }
 
+    /// TS 24.501 §5.4.5.2.5 a) 12) (#1036): the UE asks for PSI `psi` with
+    /// Request type "initial request" while the AMF holds a routing context for
+    /// it. The AMF releases the session locally and has its SMF release the SM
+    /// context, then the request goes on as a new establishment (§5.4.5.2.3).
+    ///
+    /// Without this, a second CreateSMContext went to the SMF and the AMF's ref
+    /// was overwritten, so the first SM context (its PFCP session, UE IP, PCF
+    /// association) was orphaned. The release is durable and keyed on the
+    /// session, so it reaches the SMF before the new CreateSMContext. A user plane
+    /// set up at the gNB for the PSI is released there too: TS 38.413 §8.2.1.4
+    /// has the gNB refuse a setup for a PDU session it already has.
+    async fn release_colliding_session(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        psi: u8,
+    ) -> Result<()> {
+        let key = (amf_ue_ngap_id, psi);
+        let Some(sm_context_ref) = self.sm_context_refs.get(&key).cloned() else {
+            return Ok(());
+        };
+        log::info!(
+            "UE {amf_ue_ngap_id}: PDU session establishment (initial request) for PSI={psi}, \
+             which the AMF holds (SM context {sm_context_ref}); releasing it first \
+             (TS 24.501 §5.4.5.2.5 a) 12))"
+        );
+        let owner = self.sm_context_smfs.get(&key).cloned();
+        self.sbi_offload
+            .spawn_keyed_durable(key, move || async move {
+                let (host, port) = smf_or_selected(owner).await;
+                match crate::sbi_path::call_smf_release_sm_context(&host, port, &sm_context_ref)
+                    .await
+                {
+                    Ok(()) => log::info!(
+                        "UE {amf_ue_ngap_id}: SM context {sm_context_ref} (PSI={psi}) released \
+                         before its PSI's new establishment"
+                    ),
+                    Err(e) => log::warn!(
+                        "UE {amf_ue_ngap_id}: release of SM context {sm_context_ref} \
+                         (PSI={psi}) before its PSI's new establishment failed: {e}"
+                    ),
+                }
+                None
+            });
+        self.forget_session(amf_ue_ngap_id, psi);
+        if self.up_active.contains(&key) {
+            self.clear_up_active(amf_ue_ngap_id, psi);
+            match crate::ngap_asn1::build_pdu_session_resource_release_command_asn1(
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                &[psi],
+            ) {
+                Some(release) => self.send_to_association(association_id, &release).await?,
+                None => log::error!("Failed to build PDU Session Resource Release Command"),
+            }
+        }
+        Ok(())
+    }
+
     /// Handle UL NAS TRANSPORT (0x67, TS 24.501 Section 5.4.5): route N1 SM
     /// to the SMF; reply with cause #90 for container types without a
     /// forwarding target; 5GMM Status on protocol errors
@@ -8991,6 +9028,8 @@ impl NgapServer {
         // Optional IEs after the container: PDU session ID (IEI 0x12, TV)
         let mut psi: Option<u8> = None;
         let mut dnn_value: Option<String> = None;
+        // #1036: the Request type (IEI 8-, TS 24.501 §9.11.3.47), value bits 3..1.
+        let mut request_type: Option<u8> = None;
         let mut pos = 6 + container_len;
         while pos < nas.len() {
             match nas[pos] {
@@ -9013,7 +9052,11 @@ impl NgapServer {
                     }
                     pos += 2 + l;
                 }
-                b if b & 0x80 != 0 => pos += 1, // type-1 TV (e.g. request type 0x8-)
+                b if b & 0xF0 == 0x80 => {
+                    request_type = Some(b & 0x07);
+                    pos += 1;
+                }
+                b if b & 0x80 != 0 => pos += 1, // other type-1 TV
                 _ => break,
             }
         }
@@ -9039,6 +9082,23 @@ impl NgapServer {
 
         match action {
             Ok(crate::gmm_handler::UlTransportAction::RouteToSmf { .. }) => {
+                // #1036, TS 24.501 §5.4.5.2.5 a) 12): an "initial request" for a PSI
+                // the AMF holds a routing context for, e.g. the UE retransmitting its
+                // establishment after the Accept was lost, releases that session
+                // first, locally and at its SMF.
+                if request_type == Some(REQUEST_TYPE_INITIAL_REQUEST)
+                    && container.get(3) == Some(&0xC1)
+                {
+                    if let Some(&sm_psi) = container.get(1) {
+                        self.release_colliding_session(
+                            association_id,
+                            amf_ue_ngap_id,
+                            ran_ue_ngap_id,
+                            sm_psi,
+                        )
+                        .await?;
+                    }
+                }
                 self.handle_5gsm_message(
                     association_id,
                     amf_ue_ngap_id,
@@ -9436,32 +9496,7 @@ impl NgapServer {
                 //
                 // #980 review: the establishment's origination timestamp, taken once
                 // here and sent unchanged on every attempt (TS 29.502 §6.1.2.3.2).
-                //
-                // #1036: a UE retransmission (same PSI and PTI, within T3580's
-                // retransmission horizon) of a request whose create already
-                // succeeded, e.g. after the Accept was lost on the radio, is the same
-                // establishment. Its CreateSMContext carries the first create's stamp,
-                // so the PCF sees the same request again and keeps the association
-                // and its AF sessions (TS 29.512 §4.2.7, pcfd's equal-stamp rule).
-                // A fresh stamp would make it a more recent create, and the PCF
-                // would replace the association and terminate its AF sessions.
-                let origination = match self.created_establishments.get(&(amf_ue_ngap_id, psi)) {
-                    Some(c)
-                        if c.pti == pti
-                            && c.arrived.elapsed() < ESTABLISHMENT_RETRANSMISSION_HORIZON =>
-                    {
-                        log::info!(
-                            "UE {amf_ue_ngap_id}: PDU session establishment PSI={psi} \
-                             PTI={pti} retransmitted after its create; it carries the \
-                             first create's origination timestamp"
-                        );
-                        c.origination_timestamp.clone()
-                    }
-                    _ => {
-                        self.created_establishments.remove(&(amf_ue_ngap_id, psi));
-                        nextgcore_sbi::datetime::now_origination_timestamp()
-                    }
-                };
+                let origination = nextgcore_sbi::datetime::now_origination_timestamp();
                 if self.pending_establishments.len() >= MAX_PENDING_ESTABLISHMENTS {
                     return self
                         .answer_payload_not_forwarded(
@@ -10876,33 +10911,18 @@ impl NgapServer {
             .map(|s| (s.association_id, s.ran_ue_ngap_id));
         match (a.result, waiting, connection) {
             (Ok(resp), Some(p), Some((association_id, ran_ue_ngap_id))) => {
-                let applied = self
-                    .apply_sm_context_created(
-                        association_id,
-                        a.amf_ue_ngap_id,
-                        ran_ue_ngap_id,
-                        a.psi,
-                        a.sst,
-                        a.sd,
-                        a.dnn.as_deref(),
-                        &p.sm_pdu,
-                        resp,
-                    )
-                    .await;
-                // #1036: a session the AMF recorded is kept for a UE retransmission
-                // of its request. One it could not record was released and answered
-                // #90, so it is not kept.
-                if self.sm_context_refs.contains_key(&key) {
-                    self.created_establishments.insert(
-                        key,
-                        CreatedEstablishment {
-                            pti: p.sm_pdu[2],
-                            arrived: p.first_failure,
-                            origination_timestamp: p.origination_timestamp.clone(),
-                        },
-                    );
-                }
-                applied
+                self.apply_sm_context_created(
+                    association_id,
+                    a.amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    a.psi,
+                    a.sst,
+                    a.sd,
+                    a.dnn.as_deref(),
+                    &p.sm_pdu,
+                    resp,
+                )
+                .await
             }
             (Ok(resp), _, _) => {
                 // The UE was answered #90, went away or went idle meanwhile: nobody
@@ -12679,8 +12699,6 @@ impl NgapServer {
     fn forget_ue_sessions(&mut self, amf_ue_ngap_id: u64) {
         self.sm_context_refs
             .retain(|(ue, _), _| *ue != amf_ue_ngap_id);
-        self.created_establishments
-            .retain(|(ue, _), _| *ue != amf_ue_ngap_id);
         self.sm_context_smfs
             .retain(|(ue, _), _| *ue != amf_ue_ngap_id);
         self.handover_target_transfers
@@ -12697,7 +12715,6 @@ impl NgapServer {
     /// address it again.
     fn forget_session(&mut self, amf_ue_ngap_id: u64, psi: u8) {
         self.sm_context_refs.remove(&(amf_ue_ngap_id, psi));
-        self.created_establishments.remove(&(amf_ue_ngap_id, psi));
         self.sm_context_smfs.remove(&(amf_ue_ngap_id, psi));
         self.handover_target_transfers
             .remove(&(amf_ue_ngap_id, psi));
@@ -12731,12 +12748,6 @@ impl NgapServer {
         let store = std::sync::Arc::clone(&self.ue_auth_state);
         self.sm_context_refs.retain(|k, _| live(k, &store));
         self.sm_context_smfs.retain(|k, _| live(k, &store));
-        // #1036: a created establishment goes with its session, and once the UE
-        // can no longer retransmit its request.
-        let refs = &self.sm_context_refs;
-        self.created_establishments.retain(|k, c| {
-            refs.contains_key(k) && c.arrived.elapsed() < ESTABLISHMENT_RETRANSMISSION_HORIZON
-        });
         before - (self.sm_context_refs.len() + self.sm_context_smfs.len())
     }
 

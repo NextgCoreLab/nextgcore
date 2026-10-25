@@ -1127,60 +1127,60 @@ async fn a_retried_establishment_carries_its_first_origination_timestamp() {
     server.forget_ue(ue);
 }
 
-/// A stand-in SMF answering every CreateSMContext 201 for `sm_ref`, recording
-/// the `3gpp-Sbi-Origination-Timestamp` of each.
-async fn stamp_recording_smf(
-    sm_ref: &'static str,
-) -> (
-    nextgcore_sbi::server::SbiServer,
-    u16,
-    Arc<std::sync::Mutex<Vec<Option<String>>>>,
-) {
+/// A protected UL NAS TRANSPORT carrying `sm` (N1 SM information) for PSI
+/// `sm[1]`, with Request type "initial request" (TS 24.501 §8.2.10).
+fn ul_nas_transport_initial_request(sm: &[u8], count: u8) -> Vec<u8> {
+    let mut inner = vec![0x7E, 0x00, 0x67, 0x01];
+    inner.extend_from_slice(&(sm.len() as u16).to_be_bytes());
+    inner.extend_from_slice(sm);
+    inner.extend_from_slice(&[0x12, sm[1], 0x81]);
+    ue_protect(&inner, count)
+}
+
+/// #1036, TS 24.501 §5.4.5.2.5 a) 12). The UE retransmits its PDU SESSION
+/// ESTABLISHMENT REQUEST (Request type "initial request") after the AMF's
+/// CreateSMContext for it succeeded, e.g. because the Accept was lost on the
+/// radio. The AMF holds a routing context for the PSI, so it releases that
+/// session first: at the SMF (ReleaseSMContext, before the new create), and at
+/// the gNB (PDU SESSION RESOURCE RELEASE COMMAND), whose resources for the PSI
+/// would refuse the new setup. Then the request is a new establishment. Before,
+/// a second create overwrote the AMF's ref and orphaned the first SM context.
+///
+/// Revert-verified: without the release, the SMF sees create, create.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn an_initial_request_for_a_held_psi_releases_the_session_first() {
     use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
-    let stamps: Arc<std::sync::Mutex<Vec<Option<String>>>> = Arc::default();
-    let sink = Arc::clone(&stamps);
+    let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+    let sink = Arc::clone(&seen);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("addr");
+    let port = listener.local_addr().expect("addr").port();
     let smf = nextgcore_sbi::server::SbiServer::on_listener(
-        nextgcore_sbi::server::SbiServerConfig::new(addr),
+        nextgcore_sbi::server::SbiServerConfig::new(listener.local_addr().expect("addr")),
         listener,
     );
     smf.start(move |req: SReq| {
         let sink = Arc::clone(&sink);
         async move {
-            sink.lock().expect("sink").push(
-                req.http
-                    .get_header(crate::sbi_path::ORIGINATION_TIMESTAMP_HEADER)
-                    .cloned(),
-            );
+            let uri = req.header.uri.clone();
+            sink.lock().expect("sink").push(uri.clone());
+            if uri.ends_with("/release") {
+                return SResp::with_status(204);
+            }
+            let n = sink.lock().expect("sink").len();
+            let sm_ref = format!("est-1036-{n}");
             let body = serde_json::json!({
                 "smContextRef": sm_ref,
                 "n1SmMsg": base64::engine::general_purpose::STANDARD
                     .encode([0x2E, 0x05, 0x01, 0xC2]),
                 "n2SmInfo": base64::engine::general_purpose::STANDARD
-                    .encode(transfer_for(sm_ref)),
+                    .encode(transfer_for(&sm_ref)),
             });
             SResp::with_status(201).with_body(body.to_string(), "application/json")
         }
     })
     .await
     .expect("stand-in SMF starts");
-    (smf, addr.port(), stamps)
-}
-
-/// #1036: the UE retransmits its PDU SESSION ESTABLISHMENT REQUEST (same PSI,
-/// same PTI) after the AMF's CreateSMContext for it already succeeded, e.g.
-/// because the Accept was lost on the radio. The retransmission's create
-/// carries the first create's `3gpp-Sbi-Origination-Timestamp`, so the PCF
-/// sees the same request again and keeps the SM policy association and its AF
-/// sessions (TS 29.512 §4.2.7). A new request for the PSI (another PTI) is a
-/// new establishment and gets a fresh stamp.
-///
-/// Revert-verified: stamping the retransmission afresh fails this test.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[allow(clippy::await_holding_lock)]
-async fn a_retransmission_after_a_successful_create_carries_the_first_stamp() {
-    let (_smf, port, stamps) = stamp_recording_smf("est-1036").await;
     let _env = super::SmfEnvGuard::acquire(port).await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_103_601u64, 99);
@@ -1188,49 +1188,59 @@ async fn a_retransmission_after_a_successful_create_carries_the_first_stamp() {
 
     let request = [0x2E, 0x05, 0x01, 0xC1, 0xFF, 0xFF];
     server
-        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &request))
+        .handle_uplink_nas_transport(
+            ASSOC,
+            &uplink_nas_transport(ue, ran, &ul_nas_transport_initial_request(&request, 0)),
+        )
         .await
         .expect("handled");
     settle_establishments(&mut server).await;
     assert_eq!(
         server.sm_context_refs.get(&(ue, 5)).map(String::as_str),
-        Some("est-1036"),
+        Some("est-1036-1"),
         "the first create succeeded"
     );
-    let first = stamps.lock().expect("stamps")[0].clone().expect("stamped");
+    let _ = take_sent_ngap(&mut server);
 
-    // T3580 expires at the UE: the same request again, a little later.
-    tokio::time::sleep(Duration::from_millis(5)).await;
+    // T3580 expires at the UE: the same request again.
     server
-        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &request))
+        .handle_uplink_nas_transport(
+            ASSOC,
+            &uplink_nas_transport(ue, ran, &ul_nas_transport_initial_request(&request, 1)),
+        )
         .await
         .expect("handled");
     settle_establishments(&mut server).await;
+    server.sbi_offload.settle().await;
 
-    // A new request for the PSI, with another PTI, is not a retransmission.
-    tokio::time::sleep(Duration::from_millis(5)).await;
-    let another = [0x2E, 0x05, 0x02, 0xC1, 0xFF, 0xFF];
-    server
-        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &another))
-        .await
-        .expect("handled");
-    settle_establishments(&mut server).await;
-
-    let seen = stamps.lock().expect("stamps").clone();
-    assert_eq!(seen.len(), 3, "{seen:?}");
-    assert_eq!(
-        seen[1].as_deref(),
-        Some(first.as_str()),
-        "the retransmission carries the first create's stamp"
-    );
-    let third = seen[2].clone().expect("stamped");
+    let uris = seen.lock().expect("seen").clone();
+    assert_eq!(uris.len(), 3, "{uris:?}");
     assert!(
-        nextgcore_sbi::datetime::origination_timestamp_to_epoch_ms(&third)
-            > nextgcore_sbi::datetime::origination_timestamp_to_epoch_ms(&first),
-        "a new establishment is stamped afresh: {first} then {third}"
+        uris[1].ends_with("/sm-contexts/est-1036-1/release"),
+        "the held SM context is released before the new create: {uris:?}"
+    );
+    assert!(uris[2].ends_with("/sm-contexts"), "{uris:?}");
+    assert_eq!(
+        server.sm_context_refs.get(&(ue, 5)).map(String::as_str),
+        Some("est-1036-3"),
+        "the new establishment holds the PSI"
+    );
+    let sent: Vec<Sent> = take_sent_ngap(&mut server)
+        .into_iter()
+        .map(|(_, p)| decode_sent(&p))
+        .collect();
+    let release = sent
+        .iter()
+        .position(|s| matches!(s, Sent::ReleaseCommand { psis, .. } if psis == &[5]));
+    let setup = sent.iter().position(|s| {
+        matches!(s, Sent::SetupRequest { items, .. }
+            if items.first().map(|i| i.psi) == Some(5))
+    });
+    assert!(
+        matches!((release, setup), (Some(r), Some(s)) if r < s),
+        "the gNB releases PSI 5 before its new setup: {sent:?}"
     );
     server.forget_ue(ue);
-    assert!(server.created_establishments.is_empty());
 }
 
 /// When no SMF comes back within the window, the UE is answered as TS 24.501
