@@ -7686,7 +7686,7 @@ pub(crate) mod tests {
     }
 
     /// A well-formed NG Setup Request from a gNB serving TAC 1 in 999/70.
-    fn baseline_request_ies() -> NgSetupRequest {
+    pub(crate) fn baseline_request_ies() -> NgSetupRequest {
         NgSetupRequest {
             global_ran_node_id: GlobalRanNodeId::GlobalGnbId {
                 plmn_identity: [0x99, 0xf9, 0x07],

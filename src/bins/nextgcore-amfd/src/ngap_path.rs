@@ -2405,7 +2405,14 @@ impl NgapServer {
 
         // Process request and build response with locks held, then release before sending.
         // `accepted` names the Global RAN Node ID of an accepted setup (#1039).
-        let mut accepted: Option<(crate::context::PlmnId, u32, u8)> = None;
+        // #876: with the ngENB-ID of an ng-eNB, whose `gnb_id` and length are unset.
+        #[allow(clippy::type_complexity)]
+        let mut accepted: Option<(
+            crate::context::PlmnId,
+            u32,
+            u8,
+            Option<nextgcore_ngap::types::NgEnbId>,
+        )> = None;
         let response_data: Option<Vec<u8>> = {
             let mut sessions = self.sessions.write().await;
             if let Some(session) = sessions.get_mut(&association_id) {
@@ -2430,6 +2437,7 @@ impl NgapServer {
                             session.gnb.plmn_id.clone(),
                             session.gnb.gnb_id,
                             session.gnb.gnb_id_len,
+                            session.gnb.ng_enb_id,
                         ));
 
                         // Build NG Setup Response with proper ASN.1 APER encoding,
@@ -2477,8 +2485,10 @@ impl NgapServer {
         // other association the same Global RAN Node ID still holds (the gNB restarted
         // and came back on a new one). Done before the response, so nothing the gNB sends
         // after it can name a connection of its previous incarnation.
-        if let Some((plmn, gnb_id, gnb_id_len)) = accepted {
-            // The whole Global RAN Node ID: PLMN, gNB ID and its length (§9.3.1.6).
+        if let Some((plmn, gnb_id, gnb_id_len, ng_enb_id)) = accepted {
+            // The whole Global RAN Node ID: PLMN, gNB ID and its length (§9.3.1.6), or
+            // for an ng-eNB its ngENB-ID alternative and value (§9.3.1.8, #876). A gNB
+            // never matches an ng-eNB, and two ng-eNBs of one PLMN are two nodes.
             let stale: Vec<u64> = self
                 .sessions
                 .read()
@@ -2488,6 +2498,7 @@ impl NgapServer {
                     **assoc != association_id
                         && s.gnb.gnb_id == gnb_id
                         && s.gnb.gnb_id_len == gnb_id_len
+                        && s.gnb.ng_enb_id == ng_enb_id
                         && s.gnb.plmn_id == plmn
                 })
                 .map(|(assoc, _)| *assoc)
@@ -16551,6 +16562,8 @@ impl NgapServer {
             .iter()
             .find(|(_, s)| match global_ran_node_id {
                 // A gNB target never matches an ng-eNB, whose `gnb_id` is unset (#876).
+                // TODO(#1140): a gNB target still matches on `gnb_id` alone, not on its
+                // PLMN and bit length (TS 38.413 §9.3.1.6).
                 GlobalRanNodeId::GlobalGnbId { gnb_id, .. } => {
                     s.gnb.ng_enb_id.is_none() && s.gnb.gnb_id == *gnb_id
                 }
@@ -30004,6 +30017,86 @@ mod tests {
         for id in [ue_a, ue_b] {
             server.forget_ue(id);
         }
+        let ctx_arc = crate::context::amf_self();
+        let mut c = ctx_arc.write().unwrap_or_else(|e| e.into_inner());
+        c.plmn_support.truncate(saved.0);
+        c.num_of_plmn_support = saved.1;
+    }
+
+    /// **#876 review M1, TS 38.413 §8.7.1.1 / §9.3.1.8.** The #1039 replacement of a
+    /// node's previous association matches an ng-eNB by its ngENB-ID, not by the unset
+    /// `gnb_id`: ng-eNBs of one PLMN with different ids or id lengths all stay set up,
+    /// and only the same ng-eNB on a new association replaces its old one.
+    ///
+    /// REVERT-VERIFIED: matched on (PLMN, gnb_id, gnb_id_len) alone, each ng-eNB's setup
+    /// dropped and shut down the PLMN's other ng-eNBs.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ng_enbs_of_one_plmn_are_distinct_nodes_at_ng_setup() {
+        use nextgcore_ngap::types::{GlobalRanNodeId, NgEnbId};
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        serve_tai_999_70_tac_1();
+        let saved = {
+            let ctx_arc = crate::context::amf_self();
+            let mut c = ctx_arc.write().unwrap_or_else(|e| e.into_inner());
+            let saved = (c.plmn_support.len(), c.num_of_plmn_support);
+            c.plmn_support.push(crate::context::PlmnSupport {
+                plmn_id: PlmnId::new("999", "70"),
+                num_of_s_nssai: 1,
+                s_nssai: vec![crate::context::SNssai { sst: 1, sd: None }],
+            });
+            c.num_of_plmn_support = c.plmn_support.len();
+            saved
+        };
+        let mut server = capturing_ngap_server().await;
+        let setup_of = |id: NgEnbId| {
+            let mut ies = ngap_asn1::tests::baseline_request_ies();
+            ies.global_ran_node_id = GlobalRanNodeId::GlobalNgEnbId {
+                plmn_identity: [0x99, 0xf9, 0x07],
+                ng_enb_id: id,
+            };
+            nextgcore_ngap::builder::build_ng_setup_request(&ies).expect("build")
+        };
+        let nodes = [
+            (87_611u64, NgEnbId::Macro(0x1234)),
+            (87_612, NgEnbId::ShortMacro(0x1234)),
+            (87_613, NgEnbId::LongMacro(0x1234)),
+            (87_614, NgEnbId::Macro(0x5678)),
+        ];
+        for (assoc, id) in nodes {
+            seed_gnb_session(&server, assoc).await;
+            server
+                .handle_ng_setup_request(assoc, &setup_of(id))
+                .await
+                .expect("handled");
+        }
+        {
+            let sessions = server.sessions.read().await;
+            for (assoc, id) in nodes {
+                let gnb = &sessions.get(&assoc).expect("still set up").gnb;
+                assert!(gnb.state.ng_setup_success, "{id:?}");
+                assert_eq!(gnb.ng_enb_id, Some(id));
+            }
+        }
+        assert!(
+            server.closed_associations.is_empty(),
+            "no ng-eNB replaced another"
+        );
+
+        // The first ng-eNB again, on a new association: it replaces its old one only.
+        seed_gnb_session(&server, 87_615).await;
+        server
+            .handle_ng_setup_request(87_615, &setup_of(NgEnbId::Macro(0x1234)))
+            .await
+            .expect("handled");
+        assert_eq!(server.closed_associations, vec![87_611]);
+        let sessions = server.sessions.read().await;
+        assert!(!sessions.contains_key(&87_611));
+        for assoc in [87_612, 87_613, 87_614, 87_615] {
+            assert!(sessions.contains_key(&assoc), "{assoc} stays");
+        }
+        drop(sessions);
+        take_sent_ngap(&mut server);
         let ctx_arc = crate::context::amf_self();
         let mut c = ctx_arc.write().unwrap_or_else(|e| e.into_inner());
         c.plmn_support.truncate(saved.0);
