@@ -223,12 +223,13 @@ pub fn cause_from_s1ap(cause: &Cause) -> S1apCause {
 
 /// Convert a context IP address into an S1AP TransportLayerAddress payload
 pub fn ip_to_transport_address(ip: &IpAddr) -> Vec<u8> {
-    if let Some(v4) = ip.ipv4 {
-        v4.to_vec()
-    } else if let Some(v6) = ip.ipv6 {
-        v6.to_vec()
-    } else {
-        Vec::new()
+    match (ip.ipv4, ip.ipv6) {
+        // #1175, TS 36.413 §9.2.2.1: a dual-stack endpoint is 160 bits, the IPv4
+        // address then the IPv6 one, so an IPv6-only eNB can still reach it.
+        (Some(v4), Some(v6)) => [v4.as_slice(), v6.as_slice()].concat(),
+        (Some(v4), None) => v4.to_vec(),
+        (None, Some(v6)) => v6.to_vec(),
+        (None, None) => Vec::new(),
     }
 }
 
@@ -1203,6 +1204,38 @@ mod tests {
                 "GTP PCI {pci} PVI {pvi}"
             );
         }
+    }
+
+    /// #1175, TS 36.413 §9.2.2.1: a dual-stack SGW S1-U endpoint reaches the eNB
+    /// as a 160-bit Transport Layer Address (IPv4 then IPv6) in the Initial
+    /// Context Setup, and reads back as both families.
+    #[test]
+    fn a_dual_stack_sgw_endpoint_is_a_160_bit_transport_address() {
+        let mme_ue = test_mme_ue();
+        let enb_ue = test_enb_ue();
+        let v6 = [
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0x75,
+        ];
+        let mut bearer = test_bearer();
+        bearer.sgw_s1u_ip.ipv6 = Some(v6);
+        let ambr = ue_ambr(&mme_ue.ambr, []);
+        let bytes =
+            build_initial_context_setup_request(&mme_ue, &enb_ue, &[bearer], None, ambr).unwrap();
+        let S1apMessage::InitialContextSetupRequest(req) = decode_s1ap_pdu(&bytes).unwrap() else {
+            panic!("not an Initial Context Setup Request");
+        };
+        let addr = &req.erab_list[0].transport_layer_address;
+        assert_eq!(addr.len(), 20, "160 bits");
+        assert_eq!(&addr[..4], &[10, 0, 0, 1]);
+        assert_eq!(&addr[4..], &v6);
+        let back = transport_address_to_ip(addr);
+        assert_eq!((back.ipv4, back.ipv6), (Some([10, 0, 0, 1]), Some(v6)));
+        // A single family stays 32 or 128 bits.
+        let only6 = IpAddr {
+            ipv4: None,
+            ipv6: Some(v6),
+        };
+        assert_eq!(ip_to_transport_address(&only6), v6.to_vec());
     }
 
     #[test]

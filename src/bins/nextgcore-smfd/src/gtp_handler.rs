@@ -2330,7 +2330,10 @@ mod tests {
             answer.cause,
             pgw_c.teid,
             pgw_u.teid,
-            pgw_u.ipv4_addr.map(Ipv4Addr::from),
+            nextgcore_sgwcd::context::IpAddr {
+                ipv4: pgw_u.ipv4_addr.map(Ipv4Addr::from),
+                ipv6: None,
+            },
         );
         assert!(
             matches!(result, s5c_handler::HandlerResult::SendPfcp),
