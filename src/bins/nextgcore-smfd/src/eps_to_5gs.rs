@@ -2410,6 +2410,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     async fn an_eps_to_5gs_handover_runs_end_to_end_against_the_real_amf() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = crate::pfcp_path::stand_in::associated_upf().await;
         let _amf_guard = nextgcore_amfd::test_support::CONTEXT_GUARD.lock().await;
         nextgcore_amfd::test_support::init_context();
@@ -2829,6 +2830,7 @@ mod tests {
     #[tokio::test]
     async fn a_pdn_connection_without_a_psi_has_no_eps_to_5gs_continuity() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = crate::pfcp_path::stand_in::associated_upf().await;
         crate::context::smf_context_init(64, 256, 512);
         let (s5, pgw_c, answered_pco) = establish_pdn(None).await;
@@ -2860,6 +2862,7 @@ mod tests {
     #[tokio::test]
     async fn a_pdn_connection_this_smf_does_not_hold_or_another_ue_owns_is_not_found() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _upf = crate::pfcp_path::stand_in::associated_upf().await;
         crate::context::smf_context_init(64, 256, 512);
         let (s5, pgw_c, _) = establish_pdn(Some(&pco_with_psi(5))).await;
@@ -2910,6 +2913,7 @@ mod tests {
     async fn direct_forwarding_returns_the_targets_per_e_rab_tunnels() {
         use nextgcore_ngap_gen::generated as g;
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = crate::pfcp_path::stand_in::associated_upf().await;
         crate::context::smf_context_init(64, 256, 512);
         let (s5, pgw_c, _) = establish_pdn(Some(&pco_with_psi(5))).await;
@@ -3700,6 +3704,7 @@ mod tests {
     async fn a_split_pdu_session_installs_and_confirms_its_additional_tunnel() {
         use nextgcore_ngap_gen::generated as g;
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = crate::pfcp_path::stand_in::associated_upf().await;
         crate::context::smf_context_init(64, 256, 512);
         let (s5, pgw_c, _) = establish_pdn(Some(&pco_with_psi(5))).await;
@@ -3813,6 +3818,7 @@ mod tests {
     #[tokio::test]
     async fn a_path_switch_collapses_a_split_pdu_session_onto_far_2() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = crate::pfcp_path::stand_in::associated_upf().await;
         crate::context::smf_context_init(64, 256, 512);
         let (s5, pgw_c, _) = establish_pdn(Some(&pco_with_psi(5))).await;
@@ -3923,6 +3929,7 @@ mod tests {
     #[tokio::test]
     async fn a_cancel_during_a_slow_prepared_leaves_no_context_and_no_forwarding() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = crate::pfcp_path::stand_in::associated_upf().await;
         crate::context::smf_context_init(64, 256, 512);
         let (s5, pgw_c, _) = establish_pdn(Some(&pco_with_psi(5))).await;
@@ -3967,6 +3974,7 @@ mod tests {
     #[tokio::test]
     async fn a_prepared_dropped_by_its_caller_still_leaves_nothing_behind() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = crate::pfcp_path::stand_in::associated_upf().await;
         crate::context::smf_context_init(64, 256, 512);
         let (s5, pgw_c, _) = establish_pdn(Some(&pco_with_psi(5))).await;
@@ -4003,6 +4011,7 @@ mod tests {
     #[tokio::test]
     async fn a_context_gone_during_prepared_is_answered_404_and_its_forwarding_removed() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = crate::pfcp_path::stand_in::associated_upf().await;
         crate::context::smf_context_init(64, 256, 512);
         let (s5, pgw_c, _) = establish_pdn(Some(&pco_with_psi(5))).await;
@@ -4037,6 +4046,7 @@ mod tests {
     #[tokio::test]
     async fn completed_after_cancelled_is_context_not_found() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _upf = crate::pfcp_path::stand_in::associated_upf().await;
         crate::context::smf_context_init(64, 256, 512);
         let (s5, pgw_c, _) = establish_pdn(Some(&pco_with_psi(5))).await;
@@ -4053,6 +4063,7 @@ mod tests {
     #[tokio::test]
     async fn an_incomplete_forwarding_answer_removes_what_was_requested() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = crate::pfcp_path::stand_in::associated_upf().await;
         crate::context::smf_context_init(64, 256, 512);
         let (s5, pgw_c, _) = establish_pdn(Some(&pco_with_psi(5))).await;
@@ -4095,6 +4106,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_step_6_removes_the_dedicated_rules_too() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = crate::pfcp_path::stand_in::associated_upf().await;
         crate::context::smf_context_init(64, 256, 512);
         let (s5, pgw_c, _) = establish_pdn(Some(&pco_with_psi(5))).await;
@@ -4148,6 +4160,7 @@ mod tests {
     #[tokio::test]
     async fn an_eps_to_5gs_move_is_counted_in_and_a_cancel_counts_it_out() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _upf = crate::pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         crate::context::smf_context_init(64, 256, 512);
@@ -4188,6 +4201,7 @@ mod tests {
     #[tokio::test]
     async fn an_eps_to_5gs_move_the_nsacf_rejects_is_not_transferred() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = crate::pfcp_path::stand_in::associated_upf().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         crate::context::smf_context_init(64, 256, 512);
@@ -4240,6 +4254,7 @@ mod tests {
     #[tokio::test]
     async fn a_cancelled_eps_to_5gs_handover_releases_the_n3_uplink_and_the_sm_context() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let upf = crate::pfcp_path::stand_in::associated_upf().await;
         crate::context::smf_context_init(64, 256, 512);
         let (s5, pgw_c, _) = establish_pdn(Some(&pco_with_psi(5))).await;

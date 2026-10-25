@@ -13,6 +13,25 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 ## [Unreleased]
 
 ### Changed
+- smfd discovers the NSACF per S-NSSAI. NRF discovery carries the session's `snssais` (TS 29.510
+  §6.2.3.2.3.1), and the instance taken is one whose `sNssais` or `perPlmnSnssaiList` serves it.
+  A profile with neither serves any slice (§6.1.6.2.2). The discovery cache is keyed by the
+  S-NSSAI too. Before, the first NSACF was used for every slice (TS 23.501 §5.15.11). `NSACF_URI`
+  still names one NSACF for all slices (#1164).
+- smfd ignores the Recovery Time Stamp in a PFCP Association Setup Response, and keeps a UPF's
+  Recovery Time Stamp in memory only (TS 23.007 §19A; TS 29.244 Table 7.4.4.2-1 NOTE). A new
+  association starts with no stored stamp, and its first Heartbeat stamp is the baseline. Whether
+  a UPF that re-associates still holds the SMF's sessions is answered by session retention: no
+  PSREI in the response releases them (#718). Before, a changed stamp at Association Setup was
+  taken as a restart, and the stamp was persisted as `upfRecoveryTimeStamps` in the durable
+  snapshot to seed that check after an SMF restart. A snapshot's `upfRecoveryTimeStamps` is now
+  ignored on load and dropped at the next write. The stored stamp is forgotten when the
+  association goes down. A session request answered with cause 72 "No established PFCP
+  Association" (a UPF that restarted after the Association Setup) tears the association down and
+  releases that UPF's sessions, so it is set up again (#966).
+- smfd takes its durable snapshot through a poisoned lock: the maps and the IPv4 pool are read
+  as the panicking writer left them, and the poison is logged. Before, a poisoned map was written
+  as empty over the last good snapshot, and the next restart restored nothing (#1178).
 - smfd answers its own SM Context Create and Update errors as SmContextCreateError /
   SmContextUpdateError (TS 29.502 Tables 6.1.3.2.3.1-3, 6.1.3.3.4.2.2-2): the ProblemDetails is
   under `error`, at `application/json`. A failed activation adds `upCnxState: DEACTIVATED`, and a
@@ -44,9 +63,8 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   NTP seconds (#995). 0.2.0 still accepts a 0.1.0 peer's Unix-seconds stamp: smfd, sgwcd,
   sgwud and upfd read a received or stored stamp in whichever era is closer to the local clock
   (`nextgcore_pfcp::recovery_time::normalize_received`), so a 0.1.0 to 0.2.0 rolling upgrade
-  detects peer restarts correctly (TS 23.007 §19A). smfd converts the `upfRecoveryTimeStamps`
-  a 0.1.0 snapshot holds on load and persists them in NTP form, so one smfd restart under 0.2.0
-  fixes the stored stamps. The shim will be removed in a later release, announced in that
+  detects peer restarts correctly (TS 23.007 §19A). smfd no longer persists peer stamps
+  (#966), so a 0.1.0 snapshot's `upfRecoveryTimeStamps` is ignored. The shim will be removed in a later release, announced in that
   release's upgrade notes. From then on a peer's Unix-seconds stamp reads as a time ~70 years
   off, so its restarts are missed or falsely detected. Every PFCP function must run 0.2.0 or
   later before any of them moves past that release.

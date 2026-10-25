@@ -1882,19 +1882,6 @@ pub struct SmfContext {
     /// tell an AMF about a context it released long ago.
     pub unrestorable_sessions: RwLock<Vec<UnrestorableSession>>,
 
-    /// Last Recovery Time Stamp each UPF peer reported (issue #191), keyed by
-    /// `PfcpClient::recovery_time_stamp_key`: the configured `host:port` for a UPF
-    /// named by hostname (#722), the socket address for a literal one.
-    ///
-    /// Persisted with the session map because it is what makes restoring that map
-    /// safe: on the first Association Setup after a reload, `check_peer_restart`
-    /// compares the freshly reported value against this one and flushes the
-    /// restored sessions if the UPF restarted while the SMF was down (TS 29.244
-    /// §5.22, TS 23.527 §4.2). Without it the restored `peer_recovery_time_stamp`
-    /// is `None`, no restart is detectable, and the SMF believes in N4 sessions
-    /// the UPF has already discarded.
-    pub upf_recovery_time_stamps: RwLock<HashMap<String, u32>>,
-
     /// Durable snapshot of the PFCP session map, the policy bindings and the
     /// IPv4 pool's allocations (issue #191). Disabled unless a state file is
     /// configured, in which case behaviour is byte-identical to before.
@@ -2010,7 +1997,6 @@ impl SmfContext {
             is_global: false,
             unrestorable_sessions: RwLock::new(Vec::new()),
             policy_bindings: RwLock::new(HashMap::new()),
-            upf_recovery_time_stamps: RwLock::new(HashMap::new()),
             state: nextgcore_core::state_store::StateStore::disabled(),
         }
     }
@@ -2146,26 +2132,25 @@ impl SmfContext {
     /// wedging the NF, which no amount of snapshot precision is worth.
     fn snapshot(&self) -> serde_json::Value {
         // Each of these acquires and releases before the next begins.
-        let pfcp_sessions: std::collections::BTreeMap<String, u64> = self
-            .pfcp_sessions
-            .read()
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())
-            .unwrap_or_default();
-        let policy_bindings: std::collections::BTreeMap<String, PolicyBinding> = self
-            .policy_bindings
-            .read()
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-            .unwrap_or_default();
-        let upf_rts: std::collections::BTreeMap<String, u32> = self
-            .upf_recovery_time_stamps
-            .read()
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())
-            .unwrap_or_default();
-        let cp_n4_seids: std::collections::BTreeMap<String, u64> = self
-            .cp_n4_seids
-            .read()
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())
-            .unwrap_or_default();
+        // #1178: a poisoned map is read through the poison. Its contents are what the
+        // panicking writer left, which is the state the SMF runs on; the empty default
+        // written instead replaced the last good snapshot with nothing, and the next
+        // restart restored no session.
+        let pfcp_sessions: std::collections::BTreeMap<String, u64> =
+            read_through(&self.pfcp_sessions, "pfcp_sessions")
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect();
+        let policy_bindings: std::collections::BTreeMap<String, PolicyBinding> =
+            read_through(&self.policy_bindings, "policy_bindings")
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+        let cp_n4_seids: std::collections::BTreeMap<String, u64> =
+            read_through(&self.cp_n4_seids, "cp_n4_seids")
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect();
         // #994: per SM context, keyed by the reference like `cpN4Seids`. EPC sessions
         // are not durable, so theirs are not written.
         let far_peers: std::collections::BTreeMap<
@@ -2184,15 +2169,11 @@ impl SmfContext {
                     )
                 })
                 .collect();
-            self.far_peers
-                .read()
-                .map(|m| {
-                    seids
-                        .into_iter()
-                        .filter_map(|(r, seid)| m.get(&seid).map(|f| (r, f.clone())))
-                        .collect()
-                })
-                .unwrap_or_default()
+            let m = read_through(&self.far_peers, "far_peers");
+            seids
+                .into_iter()
+                .filter_map(|(r, seid)| m.get(&seid).map(|f| (r, f.clone())))
+                .collect()
         };
         // #1031: per SM context, keyed by the reference like `cpN4Seids`.
         let session_upfs: std::collections::BTreeMap<String, String> = {
@@ -2208,15 +2189,11 @@ impl SmfContext {
                     )
                 })
                 .collect();
-            self.session_upfs
-                .read()
-                .map(|m| {
-                    seids
-                        .into_iter()
-                        .filter_map(|(r, seid)| m.get(&seid).map(|k| (r, k.clone())))
-                        .collect()
-                })
-                .unwrap_or_default()
+            let m = read_through(&self.session_upfs, "session_upfs");
+            seids
+                .into_iter()
+                .filter_map(|(r, seid)| m.get(&seid).map(|k| (r, k.clone())))
+                .collect()
         };
         // Ascending already (see `Ipv4Pool::allocated_addrs`), and as strings so
         // the file is readable by an operator diagnosing a double assignment.
@@ -2235,15 +2212,13 @@ impl SmfContext {
             "pfcpSessions": pfcp_sessions,
             "policyBindings": policy_bindings,
             "ipv4Allocations": ipv4_allocations,
-            "upfRecoveryTimeStamps": upf_rts,
             "cpN4Seids": cp_n4_seids,
             "farPeers": far_peers,
             "sessionUpfs": session_upfs,
-            "failedUpPaths": self
-                .failed_up_paths
-                .read()
-                .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect::<std::collections::BTreeMap<_, _>>())
-                .unwrap_or_default(),
+            "failedUpPaths": read_through(&self.failed_up_paths, "failed_up_paths")
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect::<std::collections::BTreeMap<_, _>>(),
             "bootEpoch": self.boot_epoch.load(Ordering::SeqCst),
         })
     }
@@ -2264,12 +2239,14 @@ impl SmfContext {
     ///
     /// A restored `sm_context_ref -> SEID` mapping is SMF-side bookkeeping about
     /// state that lives on the UPF, and the UPF may have restarted while the SMF
-    /// was down. That is why `upfRecoveryTimeStamps` is part of the same document:
-    /// seeding it back into each `PfcpClient` (see `main`) makes the existing
-    /// `check_peer_restart` comparison fire on the first Association Setup after a
-    /// reload, which tears the association down and flushes exactly these restored
-    /// sessions. Reconciling *which* sessions survived, and telling peers about the
-    /// ones that did not, is TS 23.527 restoration signalling and belongs to #193.
+    /// was down. The first Association Setup after a reload asks the UPF to retain
+    /// the sessions this SMF holds (#718, TS 29.244 §6.2.6.2.1); one that does not
+    /// confirm it (PSREI) tears the association down and flushes exactly these
+    /// restored sessions. A peer Recovery Time Stamp is not persisted for this
+    /// (#966): TS 23.007 §19A keeps it in volatile memory and has the Association
+    /// Setup's stamp ignored. Reconciling *which* sessions survived, and telling
+    /// peers about the ones that did not, is TS 23.527 restoration signalling and
+    /// belongs to #193.
     fn restore_from(
         &self,
         doc: &serde_json::Value,
@@ -2370,10 +2347,10 @@ impl SmfContext {
                     .collect()
             })
             .unwrap_or_default();
-        let upf_rts: HashMap<String, u32> = doc
-            .get("upfRecoveryTimeStamps")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
+        // #966: a pre-#966 snapshot's `upfRecoveryTimeStamps` is not read. TS 23.007
+        // §19A keeps a peer's Recovery Time Stamp in volatile memory, cleared at a
+        // restart; whether the UPF still holds the restored sessions is the session
+        // retention's answer at the first Association Setup (#718), not a stamp's.
 
         // #475: absent in every snapshot written before it existed, which is exactly the
         // set with no EPS→5GS-migrated contexts in it, so an empty default is correct.
@@ -2419,7 +2396,6 @@ impl SmfContext {
 
         let n_sessions = pfcp_sessions.len();
         let n_bindings = policy_bindings.len();
-        let n_rts = upf_rts.len();
 
         // #994: absent before it existed; then nothing is known about the restored
         // sessions' GTP-U peers until their next modification, as before.
@@ -2461,16 +2437,6 @@ impl SmfContext {
         }
         if let Ok(mut map) = self.policy_bindings.write() {
             map.extend(policy_bindings);
-        }
-        if let Ok(mut map) = self.upf_recovery_time_stamps.write() {
-            // #995, one-way migration: a pre-#995 snapshot holds Unix-seconds stamps.
-            // They are loaded in the NTP reading (and written back so on the next
-            // persist), so a UPF that did not restart is not taken for one that did.
-            map.extend(
-                upf_rts
-                    .into_iter()
-                    .map(|(k, v)| (k, nextgcore_pfcp::recovery_time::normalize_received(v))),
-            );
         }
         if let Ok(mut map) = self.cp_n4_seids.write() {
             map.extend(cp_n4_seids);
@@ -2524,9 +2490,9 @@ impl SmfContext {
         let restored = n_sessions + n_bindings + n_addrs;
         log::info!(
             "SMF durable state restored: {n_sessions} PFCP session(s), {n_bindings} policy \
-             binding(s), {n_addrs} IPv4 allocation(s) re-marked, {n_rts} UPF recovery time \
-             stamp(s). The PFCP sessions are UNRECONCILED: they are flushed on the first \
-             Association Setup if the UPF reports a changed Recovery Time Stamp."
+             binding(s), {n_addrs} IPv4 allocation(s) re-marked. The PFCP sessions are \
+             UNRECONCILED: they are flushed on the first Association Setup if the UPF does \
+             not confirm it retained them (PSREI)."
         );
         Ok(restored)
     }
@@ -2676,43 +2642,6 @@ impl SmfContext {
             // answered and will not survive a restart.
             log::error!("SMF state was NOT persisted: {e}");
         }
-    }
-
-    /// Record the Recovery Time Stamp a UPF peer reported under `peer`, its key
-    /// (`PfcpClient::recovery_time_stamp_key`), and persist it.
-    pub fn note_upf_recovery_time_stamp(&self, peer: &str, rts: u32) {
-        let changed = {
-            match self.upf_recovery_time_stamps.write() {
-                Ok(mut map) => map.insert(peer.to_string(), rts) != Some(rts),
-                Err(_) => false,
-            }
-        };
-        // Only on a change: the association loop re-reports the same stamp on
-        // every heartbeat, and rewriting the whole snapshot every 10s per peer
-        // for an unchanged value is pure write amplification.
-        if changed {
-            self.persist();
-        }
-    }
-
-    /// Forget the stamp recorded under `key`, persisting the change (#722 review M3).
-    pub fn forget_upf_recovery_time_stamp(&self, key: &str) {
-        let removed = match self.upf_recovery_time_stamps.write() {
-            Ok(mut map) => map.remove(key).is_some(),
-            Err(_) => false,
-        };
-        if removed {
-            self.persist();
-        }
-    }
-
-    /// The Recovery Time Stamp last recorded for `peer`, if any.
-    pub fn upf_recovery_time_stamp(&self, peer: &str) -> Option<u32> {
-        self.upf_recovery_time_stamps
-            .read()
-            .ok()?
-            .get(peer)
-            .copied()
     }
 
     /// Check if context is initialized
@@ -3808,16 +3737,304 @@ pub fn smf_context_init(max_ue: usize, max_sess: usize, max_bearer: usize) {
 ///
 /// Sync `#[test]` functions take it with `blocking_lock()`, which is sound
 /// precisely because they have no runtime to block.
+///
+/// #1092: releasing it checks that the test left the SMF context's UEs, sessions
+/// and policy bindings as it found them ([`TestLock::with_census`]).
 #[cfg(test)]
-pub(crate) static PROCESS_STATE_TEST_LOCK: tokio::sync::Mutex<()> =
-    tokio::sync::Mutex::const_new(());
+pub(crate) static PROCESS_STATE_TEST_LOCK: TestLock = TestLock::with_census();
+
+/// A test lock that knows its holder (#979).
+///
+/// A `tokio::sync::Mutex<()>` cannot say who holds it, so [`require_test_lock`]
+/// could only ask whether ANYONE did: an unlocked test passed while a sibling held
+/// the lock. This records the holder's thread. A `current_thread` test (the
+/// default `#[tokio::test]`), and a sync `#[test]`, run everything, the tasks they
+/// spawn included, on that thread; so does a `multi_thread` test's own body. Code on
+/// a runtime worker thread (a `multi_thread` test's spawned tasks) has no holder
+/// to compare with, and falls back to "someone holds it", exact in CI's serial run
+/// and in the nightly parallel loop (#979 option C).
+///
+/// A plain `std::thread::spawn`ed thread is neither: it is not the holder and not a
+/// runtime worker, so guarded code it reaches (the 5GSM timer map,
+/// `teardown_association`, `smf_context_init`) is reported as unlocked, and the
+/// guard aborts the run naming the test that spawned it, even while that test holds
+/// the lock. Run such code on the test's own thread or in a runtime task instead
+/// (#1200 review m2).
+#[cfg(test)]
+pub(crate) struct TestLock {
+    inner: tokio::sync::Mutex<()>,
+    holder: std::sync::Mutex<Option<std::thread::ThreadId>>,
+    census: bool,
+}
+
+#[cfg(test)]
+impl TestLock {
+    /// A lock with no census on release.
+    pub(crate) const fn new() -> Self {
+        Self {
+            inner: tokio::sync::Mutex::const_new(()),
+            holder: std::sync::Mutex::new(None),
+            census: false,
+        }
+    }
+
+    /// A lock whose release checks the SMF context's UE, session and policy binding
+    /// counts against those at acquisition (#1092): a test that leaves its UEs
+    /// behind fails, by name, instead of filling the context for its successors.
+    pub(crate) const fn with_census() -> Self {
+        Self {
+            census: true,
+            ..Self::new()
+        }
+    }
+
+    pub(crate) async fn lock(&'static self) -> TestLockGuard {
+        let guard = self.inner.lock().await;
+        TestLockGuard::new(self, guard)
+    }
+
+    /// For a sync `#[test]`, which has no runtime to block.
+    pub(crate) fn blocking_lock(&'static self) -> TestLockGuard {
+        let guard = self.inner.blocking_lock();
+        TestLockGuard::new(self, guard)
+    }
+
+    fn holder(&self) -> Option<std::thread::ThreadId> {
+        *self.holder.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn set_holder(&self, holder: Option<std::thread::ThreadId>) {
+        *self.holder.lock().unwrap_or_else(|e| e.into_inner()) = holder;
+    }
+
+    /// Whether the code calling this runs on behalf of the lock's holder; see the
+    /// type's doc for what the answer rests on.
+    fn held_by_caller(&self) -> bool {
+        if self.inner.try_lock().is_ok() {
+            return false;
+        }
+        let me = std::thread::current();
+        // A runtime worker runs any test's spawned task: only "someone holds it".
+        if me.name() == Some("tokio-runtime-worker") {
+            return true;
+        }
+        self.holder() == Some(me.id())
+    }
+}
+
+/// The SMF context's UE, session and policy binding counts (#1092), and its
+/// per-session maps' and armed 5GSM timers' (#1200 review m1).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Census {
+    ues: usize,
+    sessions: usize,
+    bindings: usize,
+    pfcp_sessions: usize,
+    upf_ul_endpoints: usize,
+    cp_n4_seids: usize,
+    far_peers: usize,
+    session_upfs: usize,
+    gsm_timers: usize,
+}
+
+#[cfg(test)]
+impl Census {
+    fn take() -> Option<Self> {
+        let ctx = smf_self();
+        let ctx = ctx.read().ok()?;
+        let census = Self {
+            ues: ctx.ue_count(),
+            sessions: ctx.sess_count(),
+            bindings: ctx.policy_bindings.read().ok()?.len(),
+            pfcp_sessions: ctx.pfcp_sessions.read().ok()?.len(),
+            upf_ul_endpoints: ctx.upf_ul_endpoints.read().ok()?.len(),
+            cp_n4_seids: ctx.cp_n4_seids.read().ok()?.len(),
+            far_peers: ctx.far_peers.read().ok()?.len(),
+            session_upfs: ctx.session_upfs.read().ok()?.len(),
+            gsm_timers: crate::gsm_timer_refs_for_test().len(),
+        };
+        Some(census)
+    }
+
+    fn grew_from(&self, before: &Self) -> bool {
+        self.ues > before.ues
+            || self.sessions > before.sessions
+            || self.bindings > before.bindings
+            || self.pfcp_sessions > before.pfcp_sessions
+            || self.upf_ul_endpoints > before.upf_ul_endpoints
+            || self.cp_n4_seids > before.cp_n4_seids
+            || self.far_peers > before.far_peers
+            || self.session_upfs > before.session_upfs
+            || self.gsm_timers > before.gsm_timers
+    }
+}
+
+/// The keys of a keyed map, for [`SeededState`]; empty when poisoned.
+#[cfg(test)]
+fn keys_of<K: Clone + Eq + std::hash::Hash, V>(
+    map: &RwLock<HashMap<K, V>>,
+) -> std::collections::HashSet<K> {
+    map.read()
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Removes from a keyed map every key not in `kept`, for [`SeededState`].
+#[cfg(test)]
+fn retain_keys<K: Eq + std::hash::Hash, V>(
+    map: &RwLock<HashMap<K, V>>,
+    kept: &std::collections::HashSet<K>,
+) {
+    if let Ok(mut m) = map.write() {
+        m.retain(|k, _| kept.contains(k));
+    }
+}
+
+/// The UEs, sessions and policy bindings a test seeds, removed when this drops
+/// (#1092), with the per-session map entries and the armed 5GSM timers it added
+/// (#1200 review m1).
+///
+/// Taken right after [`PROCESS_STATE_TEST_LOCK`], it records what the shared SMF
+/// context already holds; on drop it removes every UE, session and policy binding
+/// added since, whether the test seeded it directly, through a `seed_*` helper, or
+/// by driving a handler that registered an SM context. So it does for the maps
+/// keyed by SM context reference or SMF N4 SEID (`pfcp_sessions`,
+/// `upf_ul_endpoints`, `cp_n4_seids`, `far_peers`, `session_upfs`), which later
+/// tests sweep (#994's path failure walks `far_peers`, #1031's routing reads
+/// `session_upfs`) and whose derived SEIDs collide with a later test's fixed refs,
+/// and it cancels the 5GSM timers armed meanwhile, which would otherwise fire into a
+/// later test. The lock serialises every writer of the context, so what was added
+/// meanwhile is this test's. Declared after the lock guard, it drops first, so the
+/// lock's census sees the context restored.
+#[cfg(test)]
+#[must_use = "the seeded state is removed when this drops"]
+pub(crate) struct SeededState {
+    ues: std::collections::HashSet<u64>,
+    sessions: std::collections::HashSet<u64>,
+    bindings: std::collections::HashSet<String>,
+    pfcp_sessions: std::collections::HashSet<String>,
+    upf_ul_endpoints: std::collections::HashSet<String>,
+    cp_n4_seids: std::collections::HashSet<String>,
+    far_peers: std::collections::HashSet<u64>,
+    session_upfs: std::collections::HashSet<u64>,
+    gsm_timers: std::collections::HashSet<String>,
+}
+
+#[cfg(test)]
+impl SeededState {
+    pub(crate) fn track() -> Self {
+        let ctx = smf_self();
+        let ctx = ctx.read().unwrap_or_else(|e| e.into_inner());
+        Self {
+            ues: keys_of(&ctx.smf_ue_list),
+            sessions: keys_of(&ctx.sess_list),
+            bindings: keys_of(&ctx.policy_bindings),
+            pfcp_sessions: keys_of(&ctx.pfcp_sessions),
+            upf_ul_endpoints: keys_of(&ctx.upf_ul_endpoints),
+            cp_n4_seids: keys_of(&ctx.cp_n4_seids),
+            far_peers: keys_of(&ctx.far_peers),
+            session_upfs: keys_of(&ctx.session_upfs),
+            gsm_timers: crate::gsm_timer_refs_for_test(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for SeededState {
+    fn drop(&mut self) {
+        let ctx = smf_self();
+        let ctx = ctx.read().unwrap_or_else(|e| e.into_inner());
+        // Collected first: removing takes the same maps' write locks.
+        let sessions: Vec<u64> = ctx
+            .sess_list
+            .read()
+            .map(|m| {
+                m.keys()
+                    .filter(|id| !self.sessions.contains(id))
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default();
+        for id in sessions {
+            ctx.sess_remove(id);
+        }
+        let ues: Vec<u64> = ctx
+            .smf_ue_list
+            .read()
+            .map(|m| {
+                m.keys()
+                    .filter(|id| !self.ues.contains(id))
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default();
+        for id in ues {
+            ctx.ue_remove(id);
+        }
+        retain_keys(&ctx.policy_bindings, &self.bindings);
+        retain_keys(&ctx.pfcp_sessions, &self.pfcp_sessions);
+        retain_keys(&ctx.upf_ul_endpoints, &self.upf_ul_endpoints);
+        retain_keys(&ctx.cp_n4_seids, &self.cp_n4_seids);
+        retain_keys(&ctx.far_peers, &self.far_peers);
+        retain_keys(&ctx.session_upfs, &self.session_upfs);
+        crate::retain_gsm_timers_for_test(&self.gsm_timers);
+    }
+}
+
+/// A held [`TestLock`]: names the holder until dropped.
+#[cfg(test)]
+pub(crate) struct TestLockGuard {
+    lock: &'static TestLock,
+    census: Option<Census>,
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl TestLockGuard {
+    fn new(lock: &'static TestLock, guard: tokio::sync::MutexGuard<'static, ()>) -> Self {
+        lock.set_holder(Some(std::thread::current().id()));
+        let census = if lock.census { Census::take() } else { None };
+        Self {
+            lock,
+            census,
+            _guard: guard,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestLockGuard {
+    fn drop(&mut self) {
+        // A failing test has already said why; its leftovers are not the news. The
+        // census is taken while this thread is still the named holder: it reads the
+        // 5GSM timer map, whose guard asks for exactly that.
+        let after = if std::thread::panicking() {
+            None
+        } else {
+            self.census.and_then(|_| Census::take())
+        };
+        // Before `_guard` unlocks, so the next holder never sees this one named.
+        self.lock.set_holder(None);
+        if let (Some(before), Some(after)) = (self.census, after) {
+            assert!(
+                !after.grew_from(&before),
+                "TEST STATE LEAK (#1092): this test left SMF context state behind \
+                 (before {before:?}, after {after:?}); remove the UEs, sessions, \
+                 policy bindings, per-session map entries and 5GSM timers it added \
+                 (see context::SeededState)"
+            );
+        }
+    }
+}
 
 /// #723: the guard for code a test may reach only while holding `lock`.
 ///
-/// A lock cannot name its holder, so this catches a missing lock only when nobody
-/// else holds it: always under `--test-threads=1` (which CI runs for this crate),
-/// and when the offending test runs on its own. A legitimate caller holds the lock
-/// and never trips it, in any run.
+/// #979: it asks whether the CALLER's test holds the lock, by the holder's thread
+/// ([`TestLock`]), not whether any test does. On a runtime worker thread, where no
+/// holder can be named, it falls back to "someone holds it", which is exact under
+/// `--test-threads=1` (which CI runs for this crate). A legitimate caller holds the
+/// lock and never trips it, in any run.
 ///
 /// It ABORTS rather than panics. Several guarded paths run in a task the test
 /// spawned (the PFCP packet pump, an SBI handler), where a panic only kills that
@@ -3825,8 +4042,8 @@ pub(crate) static PROCESS_STATE_TEST_LOCK: tokio::sync::Mutex<()> =
 /// all. An abort fails the whole run with this message on stderr, so the offender
 /// is named instead of a sibling.
 #[cfg(test)]
-pub(crate) fn require_test_lock(lock: &tokio::sync::Mutex<()>, lock_name: &str, what: &str) {
-    if lock.try_lock().is_ok() {
+pub(crate) fn require_test_lock(lock: &TestLock, lock_name: &str, what: &str) {
+    if !lock.held_by_caller() {
         // Straight to the stderr handle: libtest captures `eprintln!`, and a
         // captured line is lost with the process.
         use std::io::Write as _;
@@ -3861,6 +4078,19 @@ pub fn smf_instance_get_load() -> i32 {
 // ============================================================================
 // Tests
 // ============================================================================
+
+/// Read `lock` for the durable snapshot, through a poison (#1178): logged, and the
+/// data the panicking writer left is what is written. Falling back to an empty map
+/// wrote that over the last good snapshot.
+fn read_through<'a, T>(lock: &'a RwLock<T>, what: &str) -> std::sync::RwLockReadGuard<'a, T> {
+    lock.read().unwrap_or_else(|poisoned| {
+        log::error!(
+            "SMF state: the {what} lock is poisoned (a panic while it was held); the \
+             snapshot is taken through the poison"
+        );
+        poisoned.into_inner()
+    })
+}
 
 #[cfg(test)]
 mod tests {
@@ -4033,6 +4263,167 @@ mod tests {
         assert_eq!(ctx.pf_count(), 0);
     }
 
+    // ── test locks (#979, #1092) ─────────────────────────────────────────────
+
+    /// #979: a lock held by ANOTHER test's thread is not held by the caller. The guard
+    /// passed `try_lock`'s "someone holds it" for every unlocked test while a sibling held
+    /// the lock; it now asks for the holder. This probe lock guards nothing, so it is not
+    /// a second lock over any global.
+    #[test]
+    fn a_test_lock_held_by_another_thread_is_not_held_by_the_caller() {
+        static PROBE: TestLock = TestLock::new();
+        let (held, release) = (std::sync::mpsc::channel(), std::sync::mpsc::channel::<()>());
+        let (held_tx, held_rx) = held;
+        let (release_tx, release_rx) = release;
+        let sibling = std::thread::spawn(move || {
+            let _guard = PROBE.blocking_lock();
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        held_rx.recv().unwrap();
+        let while_sibling_holds = PROBE.held_by_caller();
+        release_tx.send(()).unwrap();
+        sibling.join().unwrap();
+        let unheld = PROBE.held_by_caller();
+        let mine = {
+            let _guard = PROBE.blocking_lock();
+            PROBE.held_by_caller()
+        };
+        assert!(
+            !while_sibling_holds,
+            "a sibling's lock is not the caller's (#979)"
+        );
+        assert!(!unheld, "nobody holds it");
+        assert!(mine, "the holder holds it");
+    }
+
+    /// #1092: releasing a census lock with a UE more than at acquisition fails the
+    /// releasing test, by name; `SeededState` puts the context back so it passes.
+    #[test]
+    fn a_census_lock_fails_a_test_that_leaves_a_ue_and_seeded_state_cleans_up() {
+        static PROBE: TestLock = TestLock::with_census();
+        let _state = PROCESS_STATE_TEST_LOCK.blocking_lock();
+        let _seeded = SeededState::track();
+        smf_context_init(64, 256, 512);
+        let imsi = b"\x09\x91\x07\x00\x00\x10\x92\x01";
+
+        let leaked = std::panic::catch_unwind(|| {
+            let _probe = PROBE.blocking_lock();
+            let ctx = smf_self();
+            let ctx = ctx.read().unwrap();
+            ctx.ue_add_by_imsi(imsi).expect("ue");
+        });
+        // The probe's guard is gone with the panic; tidy the UE it left.
+        let ue = smf_self().read().unwrap().ue_find_by_imsi(imsi);
+        if let Some(ue) = ue {
+            smf_self().read().unwrap().ue_remove(ue.id);
+        }
+
+        let cleaned = std::panic::catch_unwind(|| {
+            let _probe = PROBE.blocking_lock();
+            let _seeded = SeededState::track();
+            let ctx = smf_self();
+            let ctx = ctx.read().unwrap();
+            let ue = ctx.ue_add_by_imsi(imsi).expect("ue");
+            ctx.sess_add_by_apn(ue.id, "internet", 6).expect("sess");
+            ctx.policy_bindings
+                .write()
+                .unwrap()
+                .insert("1092-probe".to_string(), PolicyBinding::snapshot_default());
+        });
+
+        assert!(leaked.is_err(), "the leaking body fails at release");
+        assert!(
+            cleaned.is_ok(),
+            "SeededState removes the UE, session and binding"
+        );
+        assert!(smf_self().read().unwrap().ue_find_by_imsi(imsi).is_none());
+    }
+
+    /// #1200 review m1: the per-session maps and the armed 5GSM timers are in the
+    /// census too, and `SeededState` removes the entries a test added to them. A body
+    /// that leaves only a FAR peer behind fails at release; one that adds an entry to
+    /// every per-session map and arms a T3591 under `SeededState` passes, and leaves
+    /// none of them.
+    #[test]
+    fn seeded_state_removes_the_per_session_entries_and_5gsm_timers_a_test_added() {
+        static PROBE: TestLock = TestLock::with_census();
+        let _state = PROCESS_STATE_TEST_LOCK.blocking_lock();
+        let _seeded = SeededState::track();
+        smf_context_init(64, 256, 512);
+        let r = "1200-m1-probe";
+        let seid = derive_cp_n4_seid(r);
+        let peer = FarPeer {
+            ip: std::net::IpAddr::from([10, 12, 0, 1]),
+            ip6: None,
+            access: true,
+            forwarding: true,
+        };
+
+        let leaked = std::panic::catch_unwind(|| {
+            let _probe = PROBE.blocking_lock();
+            let ctx = smf_self();
+            let ctx = ctx.read().unwrap();
+            ctx.far_peers
+                .write()
+                .unwrap()
+                .insert(seid, [(1u32, peer)].into_iter().collect());
+        });
+        smf_self()
+            .read()
+            .unwrap()
+            .far_peers
+            .write()
+            .unwrap()
+            .remove(&seid);
+
+        let cleaned = std::panic::catch_unwind(|| {
+            let _probe = PROBE.blocking_lock();
+            let _seeded = SeededState::track();
+            let ctx = smf_self();
+            let ctx = ctx.read().unwrap();
+            ctx.pfcp_sessions.write().unwrap().insert(r.into(), 0x1200);
+            ctx.upf_ul_endpoints
+                .write()
+                .unwrap()
+                .insert(r.into(), (0x1200, [10, 12, 0, 2]));
+            ctx.cp_n4_seids.write().unwrap().insert(r.into(), seid);
+            ctx.far_peers
+                .write()
+                .unwrap()
+                .insert(seid, [(1u32, peer)].into_iter().collect());
+            ctx.session_upfs
+                .write()
+                .unwrap()
+                .insert(seid, "upf.1200:8805".into());
+            crate::arm_gsm_timer(
+                r,
+                crate::timer::SmfTimerId::T3591,
+                &[0x2e],
+                "imsi-1200",
+                5,
+                None,
+            );
+        });
+
+        let ctx = smf_self();
+        let ctx = ctx.read().unwrap();
+        let left = (
+            ctx.pfcp_sessions.read().unwrap().contains_key(r),
+            ctx.upf_ul_endpoints.read().unwrap().contains_key(r),
+            ctx.cp_n4_seids.read().unwrap().contains_key(r),
+            ctx.far_peers.read().unwrap().contains_key(&seid),
+            ctx.session_upfs.read().unwrap().contains_key(&seid),
+            crate::gsm_timer_refs_for_test().contains(r),
+        );
+        assert!(
+            leaked.is_err(),
+            "a leaked FAR peer fails the body at release"
+        );
+        assert!(cleaned.is_ok(), "SeededState removes what the body added");
+        assert_eq!(left, (false, false, false, false, false, false));
+    }
+
     // ── durable state (issue #191) ───────────────────────────────────────────
     //
     // Every test here builds its own `SmfContext`, never `smf_self()`: arming a
@@ -4141,32 +4532,34 @@ mod tests {
         assert!(b < FIVE_G_CP_SEID_BASE, "EPC SEIDs stay below the 5G range");
     }
 
-    /// #995, one-way migration: a pre-#995 snapshot holds UPF Recovery Time Stamps in
-    /// Unix seconds. They load in the NTP reading (TS 29.244 §8.2.65), and an NTP one
-    /// is left as it is.
+    /// #966: a pre-#966 snapshot's `upfRecoveryTimeStamps` is not read, and the next
+    /// persist does not write it back. TS 23.007 §19A keeps a peer's Recovery Time
+    /// Stamp in volatile memory; the rest of the snapshot restores as before.
     #[test]
-    fn pre_995_unix_recovery_time_stamps_load_as_ntp() {
-        let started_unix = 1_767_225_600u64; // 2026-01-01, a UPF up since then
-        let ntp = nextgcore_pfcp::recovery_time::from_unix_secs(started_unix);
-        let path = temp_state_path("995-rts");
+    fn a_pre_966_snapshots_upf_recovery_time_stamps_are_dropped() {
+        let path = temp_state_path("966-rts");
         let doc = serde_json::json!({
             "version": SmfContext::SNAPSHOT_VERSION,
-            "pfcpSessions": {},
+            "pfcpSessions": { "96610": 7 },
             "policyBindings": {},
             "ipv4Allocations": [],
-            "upfRecoveryTimeStamps": { "upf-legacy:8805": started_unix, "upf-new:8805": ntp }
+            "upfRecoveryTimeStamps": { "upf-a:8805": 3_976_214_400u32 }
         });
         std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
         let ctx = ctx_with_state(&path);
         assert_eq!(
-            ctx.upf_recovery_time_stamp("upf-legacy:8805"),
-            Some(ntp),
-            "migrated"
+            ctx.pfcp_sessions.read().unwrap().get("96610").copied(),
+            Some(7),
+            "the sessions still restore"
         );
-        assert_eq!(
-            ctx.upf_recovery_time_stamp("upf-new:8805"),
-            Some(ntp),
-            "unchanged"
+        ctx.persist();
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(written.get("pfcpSessions").is_some(), "{written}");
+        assert!(
+            written.get("upfRecoveryTimeStamps").is_none(),
+            "no remote stamp is persisted: {written}"
         );
     }
 
@@ -4518,6 +4911,56 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// #1178: a map poisoned by a panic while it was written is snapshotted through
+    /// the poison. Read with `unwrap_or_default`, it was written as empty over the last
+    /// good snapshot, and a restart restored no session and no binding.
+    #[test]
+    fn a_poisoned_map_is_snapshotted_through_the_poison() {
+        let path = temp_state_path("1178-poison");
+        let ctx = ctx_with_state(&path);
+        ctx.pfcp_sessions
+            .write()
+            .unwrap()
+            .insert("11780".to_string(), 0x1178);
+        ctx.policy_bindings
+            .write()
+            .unwrap()
+            .insert("11780".to_string(), PolicyBinding::snapshot_default());
+        let addr = ctx.ipv4_pool.allocate().expect("an address");
+        ctx.persist();
+        // A panic while each lock is held for writing.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ctx.pfcp_sessions.write().unwrap();
+            panic!("poison pfcp_sessions");
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ctx.policy_bindings.write().unwrap();
+            panic!("poison policy_bindings");
+        }));
+        assert!(ctx.pfcp_sessions.is_poisoned() && ctx.policy_bindings.is_poisoned());
+        ctx.persist();
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let restored = ctx_with_state(&path);
+        let restored_session = restored.pfcp_sessions.read().unwrap().get("11780").copied();
+        let restored_binding = restored
+            .policy_bindings
+            .read()
+            .unwrap()
+            .contains_key("11780");
+        let restored_addr = restored.ipv4_pool.allocated_addrs().contains(&addr);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(written["pfcpSessions"]["11780"], serde_json::json!(0x1178));
+        assert_eq!(
+            restored_session,
+            Some(0x1178),
+            "the session survives the poison"
+        );
+        assert!(restored_binding, "and its binding");
+        assert!(restored_addr, "and its address");
+    }
+
     /// The whole point of #191: a session created before a restart, and the
     /// address it holds, are both still there afterwards.
     #[test]
@@ -4547,7 +4990,6 @@ mod tests {
                 );
             }
             ctx.persist();
-            ctx.note_upf_recovery_time_stamp("127.0.0.1:8805", 4242);
             addr
         };
 
@@ -4585,11 +5027,6 @@ mod tests {
             b.fsm.state,
             crate::gsm_sm::GsmState::Operational,
             "a binding restored into Initial would re-run establishment for a live session"
-        );
-        assert_eq!(
-            restored_ctx.upf_recovery_time_stamp("127.0.0.1:8805"),
-            Some(4242),
-            "without the peer stamp the restored session map can never be checked"
         );
         // The allocation itself, not merely the copy of it inside the binding.
         assert!(
@@ -4713,7 +5150,6 @@ mod tests {
             sessions.insert("ref-x".to_string(), 7);
         }
         ctx.persist();
-        ctx.note_upf_recovery_time_stamp("127.0.0.1:8805", 11);
         let ue = ctx.ue_add_by_supi("imsi-001010000000002").expect("ue");
         let sess = ctx.sess_add_by_psi(ue.id, 1).expect("sess");
         ctx.sess_remove(sess.id);
