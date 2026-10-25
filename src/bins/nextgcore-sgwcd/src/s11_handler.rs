@@ -138,9 +138,14 @@ fn handle_create_session_continue(imsi: &[u8], apn: &str, ebi: u8) -> HandlerRes
         None => return HandlerResult::Error(gtp_cause::CONTEXT_NOT_FOUND),
     };
 
-    // Check if session already exists
+    // A Create Session Request for a PDN connection this SGW-C still holds replaces
+    // it. The old one is deleted on the SGW-U and at the PGW as well as here: it was
+    // only removed from the local context, which left its SGW-U PFCP session (and its
+    // PGW session) with nothing that would ever delete them. Seen after a PGW restart
+    // and a re-attach as sgwu_pfcp_sessions 2 against upf_pfcp_sessions 1.
     if let Some(existing_sess) = ctx.sess_find_by_apn(ue.id, apn) {
         log::info!("OLD Session Release [IMSI:{},APN:{}]", ue.imsi_bcd, apn);
+        crate::gtp_path::release_replaced_session(&existing_sess);
         ctx.sess_remove(existing_sess.id);
     }
 

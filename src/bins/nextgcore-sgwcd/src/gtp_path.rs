@@ -2253,6 +2253,48 @@ fn abandon_pgw_session(pgw_s5c_teid: u32, lbi: u8, why: &str) {
     }
 }
 
+/// Delete on the SGW-U and at the PGW a PDN connection that a new Create Session
+/// Request for the same IMSI and APN replaces, before its local context is removed
+/// (TS 29.274 §7.2.1: a Create Session Request colliding with an existing PDN
+/// connection is a request for a new one, and the existing one is deleted first,
+/// at the PGW too). Nobody waits for either answer: the MME is answered for the NEW
+/// session. Without this only the local records went, and the SGW-U and PGW
+/// sessions leaked with nothing left to address them by.
+pub(crate) fn release_replaced_session(old: &crate::context::SgwcSess) {
+    let ctx = sgwc_self();
+    let lbi = ctx
+        .default_bearer_in_sess(old.id)
+        .map(|b| b.ebi)
+        .unwrap_or(5);
+    // A session the SGW-U never confirmed has no SGW-U SEID and nothing to delete.
+    if old.sgwu_sxa_seid != 0 {
+        match pfcp_path::send_session_deletion_request(
+            old,
+            0,
+            None,
+            pfcp_path::S11Continuation::None,
+        ) {
+            Ok(()) => log::info!(
+                "Replaced session {}: PFCP Session Deletion sent to the SGW-U (SEID {:#x})",
+                old.id,
+                old.sgwu_sxa_seid
+            ),
+            Err(e) => log::warn!(
+                "Replaced session {}: PFCP Session Deletion not sent ({e}); the SGW-U \
+                 keeps it",
+                old.id
+            ),
+        }
+    }
+    if old.pgw_s5c_teid != 0 {
+        abandon_pgw_session(
+            old.pgw_s5c_teid,
+            lbi,
+            "a new Create Session Request for the same APN replaces it",
+        );
+    }
+}
+
 /// The PGW's answer to a relayed Delete Session Request (#1025).
 fn dispatch_s5c_delete_session_response(msg: &Gtp2Message, peer: SocketAddr) {
     let cause = msg
@@ -3377,6 +3419,80 @@ mod tests {
             Some(PGW_ALLOCATED_ADDR),
             "the PDN address must be the one the PGW allocated, not the MME's own echoed back"
         );
+    }
+
+    /// A Create Session Request for an IMSI and APN whose PDN connection the SGW-C
+    /// still holds -- an MME re-attaching a UE whose old session it never deleted,
+    /// as after a PGW restart -- replaces the old connection, and the old one is
+    /// deleted on the SGW-U and at the PGW, not just dropped from the local context.
+    ///
+    /// REVERT-VERIFIED: with only the local removal, the SGW-U sees no Session
+    /// Deletion and the PGW no Delete Session (sgwu_pfcp_sessions 2, upf 1).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_replaced_pdn_connection_is_deleted_on_the_sgwu_and_the_pgw() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::from_millis(0),
+        )
+        .await;
+        let pgw = with_stand_in_pgw().await;
+        let server = test_server(&ambient, 1000, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x77];
+        let accepted = |r: &Gtp2Message| {
+            r.get_ie(Gtp2IeType::Cause as u8, 0)
+                .and_then(|ie| ie.value.first().copied())
+                == Some(gtp_cause::REQUEST_ACCEPTED)
+        };
+
+        sock.send_to(&csr(0x7701, &imsi).encode(), server.local_addr())
+            .unwrap();
+        let first = recv_s11(&sock).await.expect("the first response");
+        assert!(accepted(&first), "the fixture's first session is created");
+        let old_id = {
+            let ctx = sgwc_self();
+            let ue = ctx.ue_find_by_imsi(&imsi).expect("the UE");
+            ctx.sess_find_by_apn(ue.id, "internet")
+                .expect("the session")
+                .id
+        };
+        let deletions = || {
+            sgwu.seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|(t, _, _)| *t == 54)
+                .count()
+        };
+        assert_eq!(deletions(), 0);
+
+        // The same IMSI and APN again, with no Delete Session in between.
+        sock.send_to(&csr(0x7702, &imsi).encode(), server.local_addr())
+            .unwrap();
+        let second = recv_s11(&sock).await.expect("the second response");
+        assert!(accepted(&second), "the new session is created");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let pgw_deleted = || {
+            pgw.deletes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&(Some(0x0BEE_F001), Some(5), true))
+        };
+        while (deletions() == 0 || !pgw_deleted()) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(deletions(), 1, "the old SGW-U PFCP session is deleted");
+        assert!(pgw_deleted(), "and the old PGW session");
+
+        let ctx = sgwc_self();
+        let ue = ctx.ue_find_by_imsi(&imsi).expect("the UE");
+        assert!(ctx.sess_find_by_id(old_id).is_none());
+        assert_eq!(ctx.sess_list_for_ue(ue.id).len(), 1, "one PDN connection");
+        ctx.ue_remove(ue.id);
     }
 
     /// #52: the relayed S5/S8 Create Session Request carries every IE the ANCHOR requires.
