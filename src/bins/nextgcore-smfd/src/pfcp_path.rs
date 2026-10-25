@@ -2852,14 +2852,21 @@ pub(crate) mod stand_in {
                             // #583: EVERY Create PDR whose F-TEID is to be chosen (TEID 0)
                             // gets its own, N3_STAND_IN_TEID first; a message naming none
                             // that way keeps the #475 answer for its first Create PDR.
+                            //
+                            // #982: so does one with the CH flag (TS 29.244 §8.2.3), and
+                            // PDRs sharing a CHOOSE ID (CHID) share one F-TEID (§5.5.3).
                             let pdrs = create_pdrs(req_body);
+                            fn pdr_f_teid(pdr: &[u8]) -> Option<&[u8]> {
+                                find_ie(pdr, 2).and_then(|pdi| find_ie(pdi, 21))
+                            }
                             let choose: Vec<&[u8]> = pdrs
                                 .iter()
                                 .copied()
                                 .filter(|pdr| {
-                                    find_ie(pdr, 2)
-                                        .and_then(|pdi| find_ie(pdi, 21))
-                                        .is_some_and(|f| f.len() >= 5 && f[1..5] == [0; 4])
+                                    pdr_f_teid(pdr).is_some_and(|f| {
+                                        f.first().is_some_and(|flags| flags & 0x04 != 0)
+                                            || (f.len() >= 5 && f[1..5] == [0; 4])
+                                    })
                                 })
                                 .collect();
                             let answered = if choose.is_empty() {
@@ -2867,14 +2874,19 @@ pub(crate) mod stand_in {
                             } else {
                                 choose
                             };
+                            let mut by_choose_id = std::collections::HashMap::new();
                             for (k, pdr) in answered.into_iter().enumerate() {
                                 let Some(pdr_id) = find_ie(pdr, 56).filter(|v| v.len() >= 2) else {
                                     continue;
                                 };
+                                let mut teid = N3_STAND_IN_TEID + k as u32;
+                                if let Some(f) =
+                                    pdr_f_teid(pdr).filter(|f| f.len() >= 2 && f[0] & 0x0C == 0x0C)
+                                {
+                                    teid = *by_choose_id.entry(f[1]).or_insert(teid);
+                                }
                                 let mut f_teid = vec![0x01];
-                                f_teid.extend_from_slice(
-                                    &(N3_STAND_IN_TEID + k as u32).to_be_bytes(),
-                                );
+                                f_teid.extend_from_slice(&teid.to_be_bytes());
                                 f_teid.extend_from_slice(&upf_ip);
                                 let mut created = tlv(56, &pdr_id[..2]);
                                 created.extend_from_slice(&tlv(21, &f_teid));
