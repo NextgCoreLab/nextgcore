@@ -32,9 +32,11 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   NTP seconds (#995). 0.2.0 still accepts a 0.1.0 peer's Unix-seconds stamp: smfd, sgwcd,
   sgwud and upfd read a received or stored stamp in whichever era is closer to the local clock
   (`nextgcore_pfcp::recovery_time::normalize_received`), so a 0.1.0 to 0.2.0 rolling upgrade
-  detects peer restarts correctly (TS 23.007 §19A). The shim will be removed in 0.3.0. From
-  then on a Unix-seconds stamp reads as a time ~70 years off, so a peer's restarts are missed
-  or falsely detected. Upgrade every PFCP function to 0.2.0 before any of them moves to 0.3.0.
+  detects peer restarts correctly (TS 23.007 §19A). smfd converts the `upfRecoveryTimeStamps`
+  a 0.1.0 snapshot holds on load and persists them in NTP form, so one smfd restart under 0.2.0
+  fixes the stored stamps. The shim will be removed in 0.3.0. From then on a peer's
+  Unix-seconds stamp reads as a time ~70 years off, so its restarts are missed or falsely
+  detected. Upgrade every PFCP function to 0.2.0 before any of them moves to 0.3.0.
 
 ## [0.2.0] — Unreleased (draft for operator review)
 
@@ -203,7 +205,9 @@ before the tag. The validation line is filled from the release run, not carried 
   clock reads before 2020-01-01, because their PFCP Recovery Time Stamp, now NTP-era seconds per
   TS 29.244 §8.2.65 (#995, #1004), would be wrong. On RTC-less hosts, start them after
   `time-sync.target`, give the pod an NTP-wait init container, or rely on the restart policy
-  (#1040). See the configuration overview, "A set clock is required".
+  (#1040). See the configuration overview, "A set clock is required". 0.2.0 still reads a
+  0.1.0 peer's Unix-seconds stamp; see "Upgrade notes" under [Unreleased] for when that ends
+  (#1033).
 - EKS overlay for the matched-pair E2E on a shared cluster (#127), image tags by git SHA (#146,
   #431), rollout reporting (#439).
 - `deploy/eks` script interface `PROFILE=5g|epc|6g` (#656), `e2e-internet.sh` UE-to-internet
