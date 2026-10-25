@@ -540,6 +540,7 @@ fn handle_s1ap_message_inner(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<
                             msg.mme_ue_s1ap_id,
                             msg.enb_ue_s1ap_id,
                             &msg.erab_setup_list,
+                            &msg.erab_failed_list,
                         );
                         log_erab_failures(enb_id, &msg.erab_failed_list);
                         return out;
@@ -1276,6 +1277,7 @@ fn handle_s1ap_message_inner(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<
                 msg.mme_ue_s1ap_id,
                 msg.enb_ue_s1ap_id,
                 &msg.erab_setup_list,
+                &msg.erab_failed_list,
             );
             log_erab_failures(enb_id, &msg.erab_failed_list);
             Vec::new()
@@ -5114,14 +5116,17 @@ fn service_request_context_set_up(
     }
     // #862: deactivations parked while the UE was ECM-IDLE run now.
     crate::bearer_deactivation::on_connected(ctx, mme_ue_id);
+    // #641: activations parked while the UE was ECM-IDLE are signalled now.
+    crate::bearer_activation::on_connected(ctx, mme_ue_id);
 }
 
-fn handle_erab_setup_response(
+pub(crate) fn handle_erab_setup_response(
     ctx: &MmeContext,
     enb_id: u64,
     mme_ue_s1ap_id: u32,
     enb_ue_s1ap_id: u32,
     erab_setup_list: &[nextgcore_s1ap::ErabSetupItem],
+    erab_failed_list: &[nextgcore_s1ap::ErabFailedItem],
 ) {
     // #846: the sending eNB's pair, else ERROR INDICATION (TS 36.413 §10.6).
     let Some(enb_ue_id) =
@@ -5140,6 +5145,10 @@ fn handle_erab_setup_response(
             }
         }
     }
+    // #641, TS 23.401 §5.4.1 step 5: the E-RAB half of a dedicated bearer activation.
+    let set_up: Vec<u8> = erab_setup_list.iter().map(|i| i.erab_id).collect();
+    let failed: Vec<u8> = erab_failed_list.iter().map(|i| i.erab_id).collect();
+    crate::bearer_activation::on_erab_setup(ctx, enb_ue.mme_ue_id, &set_up, &failed);
 }
 
 fn log_erab_failures(enb_id: u64, failures: &[nextgcore_s1ap::ErabFailedItem]) {
@@ -5989,6 +5998,7 @@ mod tests {
                 transport_layer_address: vec![10, 0, 0, 67],
                 gtp_teid: 0x847,
             }],
+            &[],
         );
         assert_eq!(
             ctx.bearer_find_by_id(bid).unwrap().enb_s1u_teid,
