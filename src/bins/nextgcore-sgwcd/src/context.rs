@@ -777,6 +777,22 @@ impl SgwcContext {
     ///
     /// Compares the IP only: an MME that restarts may bind a different source
     /// port, so matching the full socket address would find nothing.
+    /// Every session anchored at the PGW whose S5/S8 control address is `ip`
+    /// (#1137), cloned.
+    pub fn sess_list_for_pgw_ip(&self, ip: std::net::IpAddr) -> Vec<SgwcSess> {
+        let std::net::IpAddr::V4(v4) = ip else {
+            return Vec::new();
+        };
+        match self.sess_list.read() {
+            Ok(list) => list
+                .values()
+                .filter(|s| s.pgw_addr == Some(v4))
+                .cloned()
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     pub fn ue_ids_for_mme_ip(&self, ip: std::net::IpAddr) -> Vec<u64> {
         match self.sgwc_ue_list.read() {
             Ok(list) => list
