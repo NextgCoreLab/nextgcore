@@ -2506,14 +2506,30 @@ pub struct LmfSelectionInput {
     pub tac: u32,
     /// `3GPP_ACCESS` or `NON_3GPP_ACCESS` (TS 29.571 `AccessType`).
     pub access_type: &'static str,
+    /// The serving AN node type, `GNB` or `NG_ENB` (TS 29.510 `AnNodeType`).
+    pub an_node_type: &'static str,
+    /// The RAT type, `NR` or `EUTRA` (TS 29.571 `RatType`).
+    pub rat_type: &'static str,
     /// The request's `ExternalClientType`, when it named one.
     pub client_type: Option<String>,
 }
 
 impl LmfSelectionInput {
-    /// The UE's current TAI and access type, and `client_type` from the request.
-    pub fn for_ue(ue: &AmfUe, client_type: Option<String>) -> Self {
+    /// The UE's current TAI and access type, the RAT of the node serving it
+    /// (`serving_rat`: an ng-eNB is E-UTRA, TS 38.300 §4.1), and `client_type` from
+    /// the request.
+    pub fn for_ue(
+        ue: &AmfUe,
+        serving_rat: crate::context::RatType,
+        client_type: Option<String>,
+    ) -> Self {
+        let (an_node_type, rat_type) = match serving_rat {
+            crate::context::RatType::Eutra => ("NG_ENB", "EUTRA"),
+            _ => ("GNB", "NR"),
+        };
         Self {
+            an_node_type,
+            rat_type,
             mcc: ue.nr_tai.plmn_id.mcc(),
             mnc: ue.nr_tai.plmn_id.mnc(),
             tac: ue.nr_tai.tac & 0x00FF_FFFF,
@@ -2534,6 +2550,18 @@ impl LmfSelectionInput {
             "tac": format!("{:06X}", self.tac),
         })
     }
+}
+
+/// The RAT of the NG-RAN node serving `ue`, from its RAN UE's node in the AMF
+/// context (NR when it is not known).
+fn serving_rat_type(ue: &AmfUe) -> crate::context::RatType {
+    let ctx = crate::context::amf_self();
+    let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+    guard
+        .ran_ue_find_by_id(ue.ran_ue_id)
+        .and_then(|r| guard.gnb_find_by_id(r.gnb_id))
+        .map(|g| g.rat_type)
+        .unwrap_or_default()
 }
 
 /// Does `plmn` (a `PlmnId` JSON) name the UE's PLMN?
@@ -2595,8 +2623,8 @@ fn tac_range_contains(range: &serde_json::Value, tac: u32) -> bool {
 }
 
 /// Does this LMF profile serve the UE (TS 29.510 §6.1.6.2.46 `LmfInfo`)? An absent
-/// `lmfInfo`, and each absent member of it, means "no restriction". The UE is on an
-/// NR gNB: the AMF positions it by its NCGI.
+/// `lmfInfo`, and each absent member of it, means "no restriction". A `Tai` /
+/// `TaiRange` `nid` (an SNPN, TS 29.571) is not compared: this AMF serves PLMNs only.
 fn lmf_serves(instance: &NfInstance, sel: &LmfSelectionInput) -> bool {
     let Some(info) = instance.lmf_info.as_ref() else {
         return true;
@@ -2607,8 +2635,8 @@ fn lmf_serves(instance: &NfInstance, sel: &LmfSelectionInput) -> bool {
             .is_none_or(|a| a.iter().any(|v| v.as_str() == Some(want)))
     };
     if !lists("servingAccessTypes", sel.access_type)
-        || !lists("servingAnNodeTypes", "GNB")
-        || !lists("servingRatTypes", "NR")
+        || !lists("servingAnNodeTypes", sel.an_node_type)
+        || !lists("servingRatTypes", sel.rat_type)
     {
         return false;
     }
@@ -2806,6 +2834,7 @@ pub async fn call_lmf_determine_location(
     // client type the GMLC named.
     let sel = LmfSelectionInput::for_ue(
         ue,
+        serving_rat_type(ue),
         request_pos_info
             .get("lcsClientType")
             .and_then(|v| v.as_str())
@@ -6124,6 +6153,8 @@ mod lmf_selection_tests {
             mnc: "01".into(),
             tac,
             access_type: "3GPP_ACCESS",
+            an_node_type: "GNB",
+            rat_type: "NR",
             client_type: None,
         }
     }
@@ -6183,6 +6214,16 @@ mod lmf_selection_tests {
 
     /// `LmfInfo` members: access type, AN node / RAT type, client types, TAI ranges
     /// (start/end and the TS 29.510 example pattern), PLMN.
+    /// `for_ue` takes the AN node and RAT types from the serving node's RAT.
+    #[test]
+    fn the_serving_node_decides_an_node_and_rat_type() {
+        let ue = AmfUe::new(1, 1);
+        let nr = LmfSelectionInput::for_ue(&ue, crate::context::RatType::Nr, None);
+        assert_eq!((nr.an_node_type, nr.rat_type), ("GNB", "NR"));
+        let lte = LmfSelectionInput::for_ue(&ue, crate::context::RatType::Eutra, None);
+        assert_eq!((lte.an_node_type, lte.rat_type), ("NG_ENB", "EUTRA"));
+    }
+
     #[test]
     fn lmf_info_restrictions_are_honoured() {
         let i = |info| lmf("x", 1, 0, 100, Some(info));
@@ -6199,6 +6240,20 @@ mod lmf_selection_tests {
         assert!(!lmf_serves(
             &i(json!({ "servingRatTypes": ["EUTRA"] })),
             &ue
+        ));
+        // A UE on an ng-eNB: NG_ENB / EUTRA, from the node serving it.
+        let mut on_ng_enb = ue.clone();
+        on_ng_enb.an_node_type = "NG_ENB";
+        on_ng_enb.rat_type = "EUTRA";
+        let ng_enb_only = json!({ "servingAnNodeTypes": ["NG_ENB"], "servingRatTypes": ["EUTRA"] });
+        assert!(lmf_serves(&i(ng_enb_only), &on_ng_enb));
+        assert!(!lmf_serves(
+            &i(json!({ "servingAnNodeTypes": ["GNB"] })),
+            &on_ng_enb
+        ));
+        assert!(!lmf_serves(
+            &i(json!({ "servingRatTypes": ["NR"] })),
+            &on_ng_enb
         ));
         let emergency = json!({ "servingClientTypes": ["EMERGENCY_SERVICES"] });
         assert!(!lmf_serves(&i(emergency.clone()), &ue));
