@@ -867,3 +867,293 @@ fn stored_filters(bearer: &SmfBearer) -> Vec<PacketFilter> {
         })
         .collect()
 }
+
+// ---------------------------------------------------------------------------
+// Modification on the UE's request (#619 step 4)
+// ---------------------------------------------------------------------------
+
+/// What a Bearer Resource Command asks of an existing dedicated bearer (TS 23.401
+/// §5.4.5): a change of its packet filters (the TAD), of its QoS (the Flow QoS), or both.
+#[derive(Debug, Clone)]
+pub struct ModificationRequest {
+    /// The bearer, by EBI.
+    pub ebi: u8,
+    /// The decoded TAD, when the Command carries one.
+    pub tad: Option<eps_tft::Tft>,
+    /// The new QCI and rates in bit/s (ARP unchanged), when the Command carries a Flow QoS.
+    pub qos: Option<(u8, u64, u64, u64, u64)>,
+    /// The UE's PTI.
+    pub pti: u8,
+}
+
+/// The packet filters `bearer` will have after `tad`, and the TFT the Update Bearer Request
+/// carries for it; `Err` with the cause a Bearer Resource Failure Indication gives.
+/// `Ok(None)` when the TAD would leave the bearer with no filter (deactivate it instead).
+#[allow(clippy::type_complexity)]
+fn apply_tad(
+    current: &[PacketFilter],
+    tad: &eps_tft::Tft,
+) -> Result<Option<(Vec<PacketFilter>, Vec<u8>)>, Gtp2Cause> {
+    use eps_tft::op;
+    let free = |used: &[u8]| (1..=15u8).find(|i| !used.contains(i));
+    let mut filters = current.to_vec();
+    let tft = match tad.operation {
+        op::ADD_PACKET_FILTERS | op::CREATE_NEW_TFT => {
+            if tad.operation == op::CREATE_NEW_TFT {
+                filters.clear();
+            }
+            let mut added = Vec::new();
+            for f in &tad.filters {
+                let used: Vec<u8> = filters.iter().map(|f| f.identifier).collect();
+                let id = if used.contains(&f.identifier) || f.identifier == 0 {
+                    free(&used).ok_or(Gtp2Cause::SemanticErrorsInPacketFilter)?
+                } else {
+                    f.identifier
+                };
+                let mut f = f.clone();
+                f.identifier = id;
+                filters.push(f.clone());
+                added.push(f);
+            }
+            eps_tft::encode(tad.operation, &added)
+                .map_err(|_| Gtp2Cause::SemanticErrorsInPacketFilter)?
+        }
+        op::REPLACE_PACKET_FILTERS => {
+            for f in &tad.filters {
+                let slot = filters
+                    .iter_mut()
+                    .find(|e| e.identifier == f.identifier)
+                    .ok_or(Gtp2Cause::SemanticErrorsInPacketFilter)?;
+                *slot = f.clone();
+            }
+            eps_tft::encode(op::REPLACE_PACKET_FILTERS, &tad.filters)
+                .map_err(|_| Gtp2Cause::SemanticErrorsInPacketFilter)?
+        }
+        op::DELETE_PACKET_FILTERS => {
+            for f in &tad.filters {
+                if !filters.iter().any(|e| e.identifier == f.identifier) {
+                    return Err(Gtp2Cause::SemanticErrorsInPacketFilter);
+                }
+                filters.retain(|e| e.identifier != f.identifier);
+            }
+            if filters.is_empty() {
+                return Ok(None);
+            }
+            let mut tft = vec![(op::DELETE_PACKET_FILTERS << 5) | tad.filters.len() as u8];
+            tft.extend(tad.filters.iter().map(|f| f.identifier & 0x0f));
+            tft
+        }
+        _ => return Err(Gtp2Cause::SemanticErrorInTheTadOperation),
+    };
+    if tad.operation != op::DELETE_PACKET_FILTERS && filters.is_empty() {
+        return Err(Gtp2Cause::SemanticErrorInTheTadOperation);
+    }
+    Ok(Some((filters, tft)))
+}
+
+/// Modify a dedicated bearer on the UE's Bearer Resource Command (TS 23.401 §5.4.5 step
+/// 3, §5.4.2.1). Called with the Command's `peer` and `seq`.
+///
+/// The Update Bearer Request is the Command's Triggered message: under its sequence
+/// number, back to its source, with the UE's PTI, the APN-AMBR, and the Bearer Context
+/// carrying the TFT change and/or the new Bearer QoS (Table 7.2.15-2). Nothing changes
+/// here until the SGW-C accepts; then the packet filters and QoS are stored and the
+/// PGW-U follows (QER `0x60+k` rates, DL PDR `0x80+k` filters). A TAD that would leave
+/// the bearer without a packet filter deactivates it instead (TS 24.301 §6.5.4.4: an
+/// empty TFT is not a valid result), through the Delete Bearer Request.
+///
+/// `Err` carries the cause the Command is refused with, when nothing was sent.
+pub async fn modify_on_command(
+    server: &S5S8Server,
+    sess_id: u64,
+    req: ModificationRequest,
+    peer: std::net::SocketAddr,
+    seq: u32,
+) -> Result<(), Gtp2Cause> {
+    let handle = context::smf_self();
+    let (sess, bearer, linked) = {
+        let ctx = handle.read().map_err(|_| Gtp2Cause::SystemFailure)?;
+        let sess = ctx
+            .sess_find_by_id(sess_id)
+            .ok_or(Gtp2Cause::ContextNotFound)?;
+        let linked = default_ebi(&ctx, &sess).ok_or(Gtp2Cause::ContextNotFound)?;
+        let bearer = ctx
+            .bearer_find_by_ebi(sess.id, req.ebi)
+            .ok_or(Gtp2Cause::ContextNotFound)?;
+        (sess, bearer, linked)
+    };
+    if bearer.ebi == linked || bearer.eps_rule_index == 0 {
+        // Not a dedicated bearer this PGW-C created: its rules are not 0x60+k / 0x80+k.
+        return Err(Gtp2Cause::RequestRejectedReasonNotSpecified);
+    }
+    let current = stored_filters(&bearer);
+    let change = match req
+        .tad
+        .as_ref()
+        .filter(|t| t.operation != eps_tft::op::NO_TFT_OPERATION)
+    {
+        Some(tad) => match apply_tad(&current, tad)? {
+            Some(c) => Some(c),
+            None => {
+                log::info!(
+                    "Bearer Resource Command seq={seq}: the TAD leaves EBI {} with no packet \
+                     filter; it is deactivated",
+                    bearer.ebi
+                );
+                deactivate_on_command(server, sess.id, &[bearer.ebi], peer, seq).await;
+                return Ok(());
+            }
+        },
+        None => None,
+    };
+    let mut target = bearer.clone();
+    if let Some((qci, mbr_ul, mbr_dl, gbr_ul, gbr_dl)) = req.qos {
+        target.qos.index = qci;
+        target.qos.mbr_uplink = mbr_ul;
+        target.qos.mbr_downlink = mbr_dl;
+        target.qos.gbr_uplink = gbr_ul;
+        target.qos.gbr_downlink = gbr_dl;
+    }
+    if change.is_none() && req.qos.is_none() {
+        return Err(Gtp2Cause::SemanticErrorInTheTadOperation);
+    }
+    if !server.begin_command(peer, seq) {
+        log::debug!("Bearer Resource Command seq={seq} from {peer} is a retransmission");
+        return Ok(());
+    }
+    let ubr = crate::gtp_build::build_update_bearer_request(
+        &sess,
+        &target,
+        Some(req.pti),
+        change.as_ref().map(|(_, tft)| tft.as_slice()),
+        req.qos.is_some(),
+    );
+    log::info!(
+        "S5/S8 Update Bearer Request for EBI {} (Command seq={seq}, PTI {}): TFT {}, QoS {}",
+        bearer.ebi,
+        req.pti,
+        if change.is_some() { "changed" } else { "kept" },
+        if req.qos.is_some() { "changed" } else { "kept" },
+    );
+    let answer = server
+        .request(
+            peer,
+            ubr,
+            gtp2_message_type::UPDATE_BEARER_REQUEST,
+            Some(seq),
+        )
+        .await;
+    server.end_command(peer, seq);
+    let raw = match answer {
+        Ok(raw) => raw,
+        Err(e) => {
+            log::warn!(
+                "Update Bearer Request for EBI {}: {e}; nothing changed",
+                bearer.ebi
+            );
+            return Ok(());
+        }
+    };
+    let mut bytes = bytes::Bytes::copy_from_slice(&raw);
+    let accepted = Gtp2Message::decode(&mut bytes).is_ok_and(|msg| {
+        let cause = msg
+            .get_ie(Gtp2IeType::Cause as u8, 0)
+            .and_then(|ie| ie.value.first().copied());
+        let bearer_cause = msg
+            .bearer_context(0)
+            .ok()
+            .flatten()
+            .and_then(|bc| bc.cause().ok().flatten().map(|c| c.cause));
+        cause == Some(16) && bearer_cause.is_none_or(|c| c == 16)
+    });
+    if !accepted {
+        log::warn!(
+            "Update Bearer Request for EBI {}: refused by the SGW-C; nothing changed",
+            bearer.ebi
+        );
+        return Ok(());
+    }
+
+    // The SGW-C, the MME and the UE hold the new bearer: store it, then the PGW-U.
+    let new_filters = change
+        .as_ref()
+        .map(|(f, _)| f.clone())
+        .unwrap_or_else(|| current.clone());
+    if let Ok(ctx) = handle.read() {
+        if change.is_some() {
+            for id in &bearer.pf_ids {
+                ctx.pf_remove(*id);
+            }
+            for f in &new_filters {
+                if let Some(mut pf) = ctx.pf_add(bearer.id) {
+                    pf.direction = f.direction;
+                    pf.identifier = f.identifier;
+                    pf.precedence = f.precedence;
+                    pf.flow_description = Some(f.flow_description.clone());
+                    ctx.pf_update(&pf);
+                }
+            }
+        }
+        if let Some(mut stored) = ctx.bearer_find_by_id(bearer.id) {
+            stored.qos = target.qos.clone();
+            ctx.bearer_update(&stored);
+        }
+    }
+    let (ul, dl) = rule_ids(bearer.eps_rule_index);
+    let mut params = crate::n4_build::SessionModificationParams::default();
+    if req.qos.is_some() {
+        params.update_qers.push(crate::n4_build::QerParams {
+            qer_id: u32::from(ul),
+            gate_status: (0, 0),
+            mbr: Some((target.qos.mbr_uplink, target.qos.mbr_downlink)),
+            gbr: Some((target.qos.gbr_uplink, target.qos.gbr_downlink)),
+            qfi: None,
+        });
+    }
+    if change.is_some() {
+        let had_dl = !downlink_descriptions(&current).is_empty();
+        let dl_filters = downlink_descriptions(&new_filters);
+        if had_dl {
+            params.remove_pdr_ids.push(dl);
+        }
+        match (had_dl, dl_filters.is_empty(), sess.ipv4_addr) {
+            (_, false, Some(ue_ipv4)) => {
+                if !had_dl {
+                    let (desc, v4, v6) = match (bearer.sgw_s5u_ip.ipv4, bearer.sgw_s5u_ip.ipv6) {
+                        (Some(a), _) => (0x0100u16, Some(a.octets()), None),
+                        (None, Some(a)) => (0x0200u16, None, Some(a.octets())),
+                        (None, None) => (0x0100u16, None, None),
+                    };
+                    params.create_fars.push(crate::n4_build::FarParams {
+                        far_id: u32::from(dl),
+                        apply_action: crate::n4_build::apply_action::FORW,
+                        destination_interface: Some(0),
+                        outer_header_creation: Some((desc, bearer.sgw_s5u_teid, v4, v6)),
+                        network_instance: None,
+                    });
+                }
+                params.create_pdrs.push(crate::n4_build::PdrParams {
+                    pdr_id: dl,
+                    precedence: DEDICATED_DL_PRECEDENCE,
+                    source_interface: 1,
+                    ue_ip_address: Some((Some(ue_ipv4.octets()), None, false)),
+                    sdf_filters: dl_filters,
+                    far_id: Some(u32::from(dl)),
+                    qer_id: Some(u32::from(ul)),
+                    urr_ids: vec![crate::SESSION_URR_ID],
+                    ..Default::default()
+                });
+            }
+            (true, true, _) => params.remove_far_ids.push(u32::from(dl)),
+            _ => {}
+        }
+    }
+    if let Err(e) = crate::pfcp_modify_with(sess.smf_n4_seid, sess.upf_n4_seid, &params).await {
+        log::error!(
+            "EBI {}: modified at the SGW-C, MME and UE, but the PGW-U did not follow ({e}); \
+             it keeps the previous rules",
+            bearer.ebi
+        );
+    }
+    Ok(())
+}

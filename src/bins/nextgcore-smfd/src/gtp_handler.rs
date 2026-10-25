@@ -2213,6 +2213,67 @@ async fn bearer_resource(
         return;
     }
 
+    // #619 step 4: a Command naming a dedicated bearer this PGW-C created modifies it
+    // with an Update Bearer Request (TS 23.401 §5.4.5 step 3, §5.4.2.1).
+    if let Some(ebi) = cmd.ebi.filter(|&e| e != 0 && e != cmd.linked_ebi) {
+        let ours = crate::context::smf_self()
+            .read()
+            .ok()
+            .and_then(|ctx| ctx.bearer_find_by_ebi(sess.id, ebi))
+            .is_some_and(|b| b.eps_rule_index != 0);
+        if ours {
+            let tad = match cmd.tad.as_deref().map(crate::eps_tft::decode) {
+                Some(Ok(t)) => Some(t),
+                Some(Err(_)) => {
+                    reject(
+                        server,
+                        gtp2_message_type::BEARER_RESOURCE_FAILURE_INDICATION,
+                        sess.sgw_s5c_teid,
+                        sequence_number,
+                        peer,
+                        Gtp2Cause::SyntacticErrorInTheTadOperation,
+                    )
+                    .await;
+                    return;
+                }
+                None => None,
+            };
+            let req = crate::eps_bearer::ModificationRequest {
+                ebi,
+                tad,
+                qos: cmd.flow_qos.as_ref().map(|q| {
+                    (
+                        q.qci,
+                        q.ul_mbr * 1000,
+                        q.dl_mbr * 1000,
+                        q.ul_gbr * 1000,
+                        q.dl_gbr * 1000,
+                    )
+                }),
+                pti: cmd.pti,
+            };
+            if let Err(cause) =
+                crate::eps_bearer::modify_on_command(server, sess.id, req, peer, sequence_number)
+                    .await
+            {
+                log::warn!(
+                    "S5/S8 Bearer Resource Command for EBI {ebi}, PTI {}: refused, {cause:?}",
+                    cmd.pti
+                );
+                reject(
+                    server,
+                    gtp2_message_type::BEARER_RESOURCE_FAILURE_INDICATION,
+                    sess.sgw_s5c_teid,
+                    sequence_number,
+                    peer,
+                    cause,
+                )
+                .await;
+            }
+            return;
+        }
+    }
+
     // The bearer the command names: the dedicated one when an EBI at instance 1 is present,
     // the PDN connection's default bearer otherwise (TS 23.401 §5.4.5).
     let target_ebi = cmd.ebi.filter(|&e| e != 0).unwrap_or(cmd.linked_ebi);
@@ -4441,6 +4502,209 @@ mod tests {
                 .bearer_find_by_id(foreign)
                 .is_some(),
             "refused, not dropped from the store alone"
+        );
+        server.close();
+    }
+
+    /// A Bearer Resource Command on S5/S8 for EBI `ebi` (instance 1) of LBI 5: PTI 9, the
+    /// TAD `tad`, and a Flow QoS of QCI 1 at `gbr` kbit/s when given.
+    fn s5c_brc(teid: u32, seq: u32, ebi: u8, tad: &[u8], gbr: Option<u64>) -> bytes::BytesMut {
+        use nextgcore_gtp::v2::ie::Gtp2Ie;
+        use nextgcore_gtp::v2::{Gtp2Header, Gtp2Message};
+        let mut msg = Gtp2Message::new(Gtp2Header::new(
+            gtp2_message_type::BEARER_RESOURCE_COMMAND,
+            teid,
+            seq,
+        ));
+        msg.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Ebi as u8, 0, &[5]));
+        msg.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Ebi as u8, 1, &[ebi]));
+        msg.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Pti as u8, 0, &[9]));
+        msg.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Tad as u8, 0, tad));
+        if let Some(g) = gbr {
+            let mut flow_qos = vec![1u8];
+            for kbps in [g * 2, g * 2, g, g] {
+                flow_qos.extend_from_slice(&kbps.to_be_bytes()[3..8]);
+            }
+            msg.add_ie(Gtp2Ie::from_slice(Gtp2IeType::FlowQos as u8, 0, &flow_qos));
+        }
+        msg.encode()
+    }
+
+    /// An active voice bearer, EBI 6, on a PDN connection with tag `tag`.
+    async fn pdn_with_voice_bearer(
+        tag: u8,
+    ) -> (
+        std::sync::Arc<crate::gtp_path::S5S8Server>,
+        tokio::net::UdpSocket,
+        SgwPortGuard,
+        crate::context::SmfSess,
+        u32,
+    ) {
+        let (server, sgw, port, sess, pgw_c_teid) =
+            pdn_with_local_rules(tag, vec![voice_rule()]).await;
+        let (cbr, _) = recv_type(&sgw, gtp2_message_type::CREATE_BEARER_REQUEST).await;
+        sgw.send_to(
+            &s5c_create_bearer_response(cbr.header.sequence_number, pgw_c_teid, 6, 16, None),
+            server.local_addr(),
+        )
+        .await
+        .expect("send");
+        stored_bearer(sess.id, 6).await.expect("EBI 6 active");
+        (server, sgw, port, sess, pgw_c_teid)
+    }
+
+    /// #619 step 4, TS 23.401 §5.4.5 step 3 / §5.4.2.1: a Bearer Resource Command adding a
+    /// packet filter to dedicated bearer 6 and raising its GBR gets an Update Bearer Request
+    /// under the Command's sequence number, with its PTI, the APN-AMBR and a Bearer Context
+    /// carrying the TFT change ("add", the new filter under a free identifier) and the
+    /// Bearer QoS in kbit/s. Nothing changes until the SGW-C accepts; then the store and the
+    /// PGW-U (QER 0x61, DL PDR 0x81) follow.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bearer_resource_command_modifies_a_dedicated_bearer() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        let (server, sgw, _port, sess, pgw_c_teid) = pdn_with_voice_bearer(0x68).await;
+        const NEW_DL: &str = "permit out 17 from 198.51.100.8 5008 to assigned";
+        let tad = crate::eps_tft::encode(
+            crate::eps_tft::op::ADD_PACKET_FILTERS,
+            &[crate::eps_tft::PacketFilter {
+                direction: crate::context::FlowDirection::DownlinkOnly,
+                identifier: 1, // taken: the PGW assigns a free one
+                precedence: 5,
+                flow_description: NEW_DL.into(),
+            }],
+        )
+        .unwrap();
+        upf.clear_seen();
+        sgw.send_to(
+            &s5c_brc(pgw_c_teid, 0x5150, 6, &tad, Some(96)),
+            server.local_addr(),
+        )
+        .await
+        .expect("send");
+        let (ubr, _) = recv_type(&sgw, gtp2_message_type::UPDATE_BEARER_REQUEST).await;
+        assert_eq!(ubr.header.sequence_number, 0x5150, "the Command's number");
+        assert_eq!(ubr.header.teid, Some(0x6800_0001));
+        assert_eq!(
+            ubr.get_ie(Gtp2IeType::Pti as u8, 0).map(|ie| ie.value[0]),
+            Some(9)
+        );
+        assert!(
+            ubr.get_ie(Gtp2IeType::Ambr as u8, 0).is_some(),
+            "APN-AMBR is mandatory (Table 7.2.15-1)"
+        );
+        let bc = ubr.bearer_context(0).unwrap().expect("Bearer Context");
+        assert_eq!(bc.ebi().unwrap(), 6);
+        let tft = crate::eps_tft::decode(
+            &bc.get_ie(Gtp2IeType::BearerTft as u8, 0)
+                .expect("TFT")
+                .value,
+        )
+        .unwrap();
+        assert_eq!(tft.operation, crate::eps_tft::op::ADD_PACKET_FILTERS);
+        assert_eq!(
+            tft.filters
+                .iter()
+                .map(|f| (f.identifier, f.flow_description.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(3, NEW_DL)],
+            "identifiers 1 and 2 are the voice rule's"
+        );
+        let qos: nextgcore_gtp::v2::Gtp2BearerQosIe = bc.bearer_qos().unwrap().expect("Bearer QoS");
+        assert_eq!(
+            (qos.gbr_ul, qos.gbr_dl, qos.mbr_dl),
+            (96, 96, 192),
+            "kbit/s"
+        );
+        assert!(
+            upf.modification_bodies().is_empty(),
+            "nothing at the PGW-U before the SGW-C accepts"
+        );
+
+        let rsp = {
+            use nextgcore_gtp::v2::{Gtp2BearerContextIe, Gtp2CauseIe, Gtp2Header, Gtp2Message};
+            let mut m = Gtp2Message::new(Gtp2Header::new(
+                gtp2_message_type::UPDATE_BEARER_RESPONSE,
+                pgw_c_teid,
+                0x5150,
+            ));
+            m.add_ie(Gtp2CauseIe::new(16).to_ie(0));
+            let mut bc = Gtp2BearerContextIe::new();
+            bc.set_ebi(6);
+            bc.set_cause(&Gtp2CauseIe::new(16));
+            m.add_bearer_context(0, &bc);
+            m.encode()
+        };
+        sgw.send_to(&rsp, server.local_addr()).await.expect("send");
+        assert!(
+            upf_until(&upf, |m| sent(m, NEW_DL.as_bytes())).await,
+            "DL PDR 0x81 re-created with the new downlink filter"
+        );
+        let mods = upf.modification_bodies();
+        // A top-level Update QER (IE 14) naming QER 0x61, with the new GBR (96 kbit/s).
+        let update_qer = |b: &[u8]| {
+            let mut off = 0;
+            while off + 4 <= b.len() {
+                let t = u16::from_be_bytes([b[off], b[off + 1]]);
+                let l = u16::from_be_bytes([b[off + 2], b[off + 3]]) as usize;
+                let v = &b[off + 4..(off + 4 + l).min(b.len())];
+                let mut qer_id = vec![0x00, 0x6d, 0x00, 0x04];
+                qer_id.extend_from_slice(&0x61u32.to_be_bytes());
+                if t == 14 && v.windows(8).any(|w| w == qer_id.as_slice()) {
+                    return true;
+                }
+                off += 4 + l;
+            }
+            false
+        };
+        assert!(mods.iter().any(|b| update_qer(b)), "Update QER 0x61");
+        assert!(
+            sent(&mods, VOICE_DL.as_bytes()),
+            "the old downlink filter kept"
+        );
+        let bearer = stored_bearer(sess.id, 6).await.unwrap();
+        assert_eq!(bearer.qos.gbr_downlink, 96_000);
+        assert_eq!(bearer.pf_ids.len(), 3);
+        assert_eq!(server.outstanding().await, 0);
+        server.close();
+    }
+
+    /// #619 step 4, TS 24.301 §6.5.4.4: a TAD deleting every packet filter of the bearer
+    /// deactivates it (Delete Bearer Request under the Command's number) rather than
+    /// leaving an empty TFT.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bearer_resource_command_deleting_every_filter_deactivates_the_bearer() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _upf = crate::pfcp_path::stand_in::associated_upf().await;
+        let (server, sgw, _port, _sess, pgw_c_teid) = pdn_with_voice_bearer(0x69).await;
+        // Delete packet filters 1 and 2 (TS 24.008 §10.5.6.12: identifiers only).
+        let tad = [(crate::eps_tft::op::DELETE_PACKET_FILTERS << 5) | 2, 1, 2];
+        sgw.send_to(
+            &s5c_brc(pgw_c_teid, 0x5151, 6, &tad, None),
+            server.local_addr(),
+        )
+        .await
+        .expect("send");
+        let (dbr, _) = recv_type(&sgw, gtp2_message_type::DELETE_BEARER_REQUEST).await;
+        assert_eq!(dbr.header.sequence_number, 0x5151);
+        assert_eq!(
+            dbr.get_ie(Gtp2IeType::Ebi as u8, 1).map(|ie| ie.value[0]),
+            Some(6)
+        );
+        // An unknown identifier is refused.
+        let tad = [(crate::eps_tft::op::DELETE_PACKET_FILTERS << 5) | 1, 9];
+        sgw.send_to(
+            &s5c_brc(pgw_c_teid, 0x5152, 6, &tad, None),
+            server.local_addr(),
+        )
+        .await
+        .expect("send");
+        let (fi, _) = recv_type(&sgw, gtp2_message_type::BEARER_RESOURCE_FAILURE_INDICATION).await;
+        assert_eq!(fi.header.sequence_number, 0x5152);
+        assert_eq!(
+            fi.get_ie(Gtp2IeType::Cause as u8, 0).map(|ie| ie.value[0]),
+            Some(76),
+            "Semantic errors in packet filter(s)"
         );
         server.close();
     }

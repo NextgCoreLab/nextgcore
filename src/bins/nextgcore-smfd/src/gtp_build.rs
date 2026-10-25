@@ -1249,11 +1249,9 @@ pub fn build_update_bearer_request(
     let mut builder =
         Gtp2MessageBuilder::new(gtp2_message_type::UPDATE_BEARER_REQUEST).teid(sess.sgw_s5c_teid);
 
-    // AMBR
-    if sess.session_ambr.uplink > 0 || sess.session_ambr.downlink > 0 {
-        let ambr = Ambr::from_bps(sess.session_ambr.uplink, sess.session_ambr.downlink);
-        builder = builder.add_ambr(&ambr);
-    }
+    // APN-AMBR: mandatory (TS 29.274 Table 7.2.15-1), so always sent.
+    let ambr = Ambr::from_bps(sess.session_ambr.uplink, sess.session_ambr.downlink);
+    builder = builder.add_ambr(&ambr);
 
     // PTI
     if let Some(pti_val) = pti {
@@ -1263,17 +1261,19 @@ pub fn build_update_bearer_request(
     // Bearer Context
     let mut bc_builder = builder.start_bearer_context(0).add_ebi(bearer.ebi);
 
-    // Bearer QoS
+    // Bearer QoS. #619 step 4: the bearer's rates are held in bit/s and TS 29.274 §8.15
+    // codes kbit/s, as `build_create_bearer_request` converts them.
     if include_qos {
+        let kbps = |bps: u64| bps.div_ceil(1000);
         let bearer_qos = BearerQos {
             qci: bearer.qos.index,
             priority_level: bearer.qos.arp_priority_level,
             pre_emption_capability: bearer.qos.arp_preempt_cap,
             pre_emption_vulnerability: bearer.qos.arp_preempt_vuln,
-            ul_mbr: bearer.qos.mbr_uplink,
-            dl_mbr: bearer.qos.mbr_downlink,
-            ul_gbr: bearer.qos.gbr_uplink,
-            dl_gbr: bearer.qos.gbr_downlink,
+            ul_mbr: kbps(bearer.qos.mbr_uplink),
+            dl_mbr: kbps(bearer.qos.mbr_downlink),
+            ul_gbr: kbps(bearer.qos.gbr_uplink),
+            dl_gbr: kbps(bearer.qos.gbr_downlink),
         };
         bc_builder = bc_builder.add_bearer_qos(&bearer_qos);
     }
