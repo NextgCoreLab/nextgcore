@@ -1906,9 +1906,34 @@ fn push_abandoned_s5c(
     list.retain(|(_, _, at)| now.duration_since(*at) < ABANDONED_S5C_HOLD);
     if list.len() >= ABANDONED_S5C_CAP {
         // Entries are pushed in time order, so the front is the oldest.
-        list.drain(..=list.len() - ABANDONED_S5C_CAP);
+        let evicted = list.drain(..=list.len() - ABANDONED_S5C_CAP).count() as u64;
+        let total = ABANDONED_S5C_EVICTED_TOTAL.fetch_add(evicted, Ordering::Relaxed) + evicted;
+        warn_abandoned_s5c_eviction(now, total);
     }
     list.push(entry);
+}
+
+/// Abandoned Creates forgotten at [`ABANDONED_S5C_CAP`]: a late PGW answer to
+/// one of them is dropped and its PDN connection stays at the PGW (#1218 review).
+pub static ABANDONED_S5C_EVICTED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// At most one warning per this interval, however fast entries are evicted.
+const ABANDONED_S5C_WARN_EVERY: Duration = Duration::from_secs(10);
+
+static ABANDONED_S5C_LAST_WARN: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+fn warn_abandoned_s5c_eviction(now: Instant, total: u64) {
+    let mut last = ABANDONED_S5C_LAST_WARN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if last.is_some_and(|at| now.saturating_duration_since(at) < ABANDONED_S5C_WARN_EVERY) {
+        return;
+    }
+    *last = Some(now);
+    log::warn!(
+        "{ABANDONED_S5C_CAP} S5/S8 Create Session Requests abandoned after N3 are remembered;          the oldest are forgotten ({total} so far), so a late PGW answer to them leaves its PDN          connection at the PGW (sgwc_s5_abandoned_create_evicted_total)"
+    );
 }
 
 fn take_abandoned_s5c(pgw: SocketAddr, seq: u32) -> bool {
@@ -2525,6 +2550,14 @@ pub(crate) fn render_s5_delete_metrics(out: &mut String) {
          Request accepted\n# TYPE sgwc_s5_delete_session_accepted_total counter\n\
          sgwc_s5_delete_session_accepted_total {}",
         S5_DELETES_ACCEPTED_TOTAL.load(Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        out,
+        "# HELP sgwc_s5_abandoned_create_evicted_total Abandoned S5/S8 Create Session \
+         Requests forgotten at the cap, whose late answer is no longer deleted at the PGW\n\
+         # TYPE sgwc_s5_abandoned_create_evicted_total counter\n\
+         sgwc_s5_abandoned_create_evicted_total {}",
+        ABANDONED_S5C_EVICTED_TOTAL.load(Ordering::Relaxed)
     );
 }
 
@@ -5334,9 +5367,14 @@ mod tests {
         let pgw: SocketAddr = "192.0.2.1:2123".parse().unwrap();
         let now = Instant::now();
         let mut list = Vec::new();
+        let before = ABANDONED_S5C_EVICTED_TOTAL.load(Ordering::Relaxed);
         for seq in 0..(ABANDONED_S5C_CAP as u32 + 10) {
             push_abandoned_s5c(&mut list, (pgw, seq, now));
         }
+        // #1218 review: the evictions are counted (and logged, rate-limited).
+        assert!(ABANDONED_S5C_EVICTED_TOTAL.load(Ordering::Relaxed) - before >= 10);
+        assert!(crate::main_render_metrics_for_test()
+            .contains("# TYPE sgwc_s5_abandoned_create_evicted_total counter"));
         assert_eq!(list.len(), ABANDONED_S5C_CAP);
         assert_eq!(list.first().map(|e| e.1), Some(10), "the oldest went");
         assert_eq!(
