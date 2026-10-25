@@ -1374,10 +1374,59 @@ fn sgw_entity(req: &CreateSessionRequest, peer: std::net::SocketAddr) -> std::ne
         .unwrap_or(peer.ip())
 }
 
+/// The PDN connections being deleted, by session id (#1198 review round 2).
+static PDN_DELETIONS: std::sync::Mutex<std::collections::BTreeSet<u64>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// One procedure's claim on deleting a PDN connection; released on drop.
+struct PdnDeletionClaim(u64);
+
+impl PdnDeletionClaim {
+    fn take(id: u64) -> Option<Self> {
+        let mut deleting = PDN_DELETIONS.lock().unwrap_or_else(|e| e.into_inner());
+        // Not `then_some(Self(id))`: a claim built and dropped for a refused id would
+        // release the holder's.
+        if deleting.insert(id) {
+            Some(Self(id))
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for PdnDeletionClaim {
+    fn drop(&mut self) {
+        PDN_DELETIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
+}
+
 /// Delete an EPC PDN connection here and at the PGW-U, sending nothing over S5/S8: the
 /// SGW-C has none (it collided, or the SGW-C restarted). `sess_remove` frees the PDN
 /// address and drops the bearers. #1194.
+///
+/// #1198 review round 2: the restart cleanup and the §7.2.1 collision can both pick the
+/// same connection. The first to claim it owns its deletion; the other, and one that
+/// comes after the connection is gone, sends nothing. Two PFCP Session Deletions for
+/// one session could otherwise reach a PGW-U that already reused the F-SEID for the
+/// replacement session.
 async fn delete_pdn_connection_locally(sess: &crate::context::SmfSess, reason: &str) {
+    let Some(_claim) = PdnDeletionClaim::take(sess.id) else {
+        log::debug!(
+            "PDN connection {} ({reason}): already being deleted by another procedure",
+            sess.id
+        );
+        return;
+    };
+    let present = crate::context::smf_self()
+        .read()
+        .is_ok_and(|ctx| ctx.sess_find_by_id(sess.id).is_some());
+    if !present {
+        log::debug!("PDN connection {} ({reason}): already deleted", sess.id);
+        return;
+    }
     if sess.upf_n4_seid != 0 {
         if let Err(e) = crate::pfcp_session_delete(sess.smf_n4_seid, sess.upf_n4_seid).await {
             log::warn!(
@@ -4929,7 +4978,28 @@ mod tests {
         ebi: u8,
         recovery: Option<u8>,
     ) -> bytes::BytesMut {
+        csr_for_sgw(seq, imsi_last, sgw_c_teid, ebi, recovery, [127, 0, 0, 1])
+    }
+
+    /// [`csr_for`] from the SGW-C at `sgw`: a test whose restart must not reach the
+    /// other tests' PDN connections of the shared default address.
+    fn csr_for_sgw(
+        seq: u32,
+        imsi_last: u8,
+        sgw_c_teid: u32,
+        ebi: u8,
+        recovery: Option<u8>,
+        sgw: [u8; 4],
+    ) -> bytes::BytesMut {
         let mut csr = s5c_csr_with(seq, sgw_c_teid, [10, 99, 99, 99], ebi, recovery);
+        // The sender F-TEID's address follows its TEID.
+        let mut at = sgw_c_teid.to_be_bytes().to_vec();
+        at.extend_from_slice(&[127, 0, 0, 1]);
+        let pos = csr
+            .windows(8)
+            .position(|w| w == at.as_slice())
+            .expect("the sender F-TEID");
+        csr[pos + 4..pos + 8].copy_from_slice(&sgw);
         let imsi_pos = csr
             .windows(8)
             .position(|w| w == [0x09, 0x91, 0x07, 0x00, 0x00, 0x00, 0x00, 0x01])
@@ -5319,6 +5389,50 @@ mod tests {
             (0, 0, 1),
             "the old connections are deleted afterwards"
         );
+    }
+
+    /// #1198 review round 2: a restarted SGW-C's UE re-attaches. Its Create Session
+    /// Request both shows the restart (the old connection is stale) and collides with
+    /// that connection by [IMSI, EBI] (TS 29.274 §7.2.1). The background cleanup and the
+    /// collision path pick the same connection, and exactly one PFCP Session Deletion
+    /// reaches the PGW-U. Two would hit a PGW-U that reused the F-SEID in between.
+    #[tokio::test]
+    async fn a_restart_and_a_collision_on_one_pdn_connection_delete_it_once() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        let (server, sgw) = s5s8_pair().await;
+        create_over_the_wire(
+            &server,
+            &sgw,
+            &csr_for_sgw(0x0011_9491, 0x50, 0x5000_0001, 5, Some(3), [10, 99, 1, 98]),
+        )
+        .await;
+        upf.clear_seen();
+        // A slow PGW-U, so the two paths overlap.
+        upf.delay_deletions(300);
+        create_over_the_wire(
+            &server,
+            &sgw,
+            &csr_for_sgw(0x0011_9492, 0x50, 0x5000_0002, 5, Some(4), [10, 99, 1, 98]),
+        )
+        .await;
+        settle_sgw_restart_deletions_for_test().await;
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let deletions = upf
+            .seen()
+            .iter()
+            .filter(|t| **t == crate::pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST)
+            .count();
+        let now = sessions_of(0x50);
+        upf.delay_deletions(0);
+        forget_ues(&[0x50]);
+        server.close();
+        assert_eq!(
+            deletions, 1,
+            "one PFCP Session Deletion for the old connection"
+        );
+        assert_eq!(now.len(), 1, "the replacement stands");
+        assert_eq!(now[0].sgw_s5c_teid, 0x5000_0002);
     }
 
     /// #1198 review m1: two Create Session Requests for the same [IMSI, EBI] (an MME
