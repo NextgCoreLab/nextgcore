@@ -2406,8 +2406,14 @@ impl SmfContext {
         // #1230: the SM contexts that inherited their CP SEID from an EPS PDN connection
         // (an EPS→5GS handover), as the snapshot recorded them, before the version-1
         // fill below adds the legacy ones.
-        let inherited_refs: std::collections::HashSet<String> =
-            cp_n4_seids.keys().cloned().collect();
+        // A legacy SEID (`legacy_cp_n4_seid`), whether filled below for a version-1
+        // snapshot or recorded by a later write of one, is a native 5G context's (#1230
+        // review 2).
+        let inherited_refs: std::collections::HashSet<String> = cp_n4_seids
+            .iter()
+            .filter(|(r, seid)| **seid != legacy_cp_n4_seid(r))
+            .map(|(r, _)| r.clone())
+            .collect();
         if found < 2 {
             for r in pfcp_sessions.keys() {
                 cp_n4_seids
@@ -4721,11 +4727,13 @@ mod tests {
             [10, 45, 12, 31],
             crate::gsm_sm::GsmState::Operational,
         );
+        // "9" carries the legacy SEID a version-1 snapshot's session was migrated to
+        // and a later write recorded (#1230 review 2): a native context, not EPS→5GS.
         let doc = serde_json::json!({
             "version": 2,
-            "pfcpSessions": { "7": 0x07u64, "8": 0x08u64 },
-            "policyBindings": { "7": b.clone(), "8": b },
-            "cpN4Seids": { "8": 0x0123_0008u64 },
+            "pfcpSessions": { "7": 0x07u64, "8": 0x08u64, "9": 0x09u64 },
+            "policyBindings": { "7": b.clone(), "8": b.clone(), "9": b },
+            "cpN4Seids": { "8": 0x0123_0008u64, "9": legacy_cp_n4_seid("9") },
             "ipv4Allocations": ["10.45.12.31"],
         });
         std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
@@ -4742,6 +4750,33 @@ mod tests {
             "kept"
         );
         assert!(ctx.upf_ul_endpoints.read().unwrap().get("7").is_none());
+    }
+
+    /// #1230 review 2: a version-1 snapshot's sessions get legacy SEIDs filled in on
+    /// load. They are native 5G contexts, kept for recovery, not released.
+    #[test]
+    fn a_version_1_snapshots_sessions_are_not_taken_for_eps_ones() {
+        let path = temp_state_path("ul-endpoint-v1");
+        let b = binding(
+            "imsi-001010000001231",
+            5,
+            [10, 45, 12, 32],
+            crate::gsm_sm::GsmState::Operational,
+        );
+        let doc = serde_json::json!({
+            "version": 1,
+            "pfcpSessions": { "5": 0x05u64 },
+            "policyBindings": { "5": b },
+        });
+        std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
+        let ctx = ctx_with_state(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            ctx.cp_n4_seids.read().unwrap().get("5"),
+            Some(&legacy_cp_n4_seid("5"))
+        );
+        assert!(ctx.reactivate_at_boot.read().unwrap().is_empty());
+        assert!(ctx.unrestorable_sessions.read().unwrap().is_empty());
     }
 
     /// A version-1 snapshot's sessions keep the legacy CP SEID (`ref | 0x1000`): the

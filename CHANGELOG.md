@@ -18,16 +18,18 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   or be handed over (#1230). Before, a restart lost it, and those all failed: activation was
   answered 500, and the paging transfer had no UL NG-U tunnel (TS 38.413 §9.3.4.1). A Downlink
   Data Report for a restored session now pages the UE.
-  **Upgrade:** a snapshot from 0.1.x has no endpoints, and no session is released for that. A
-  native 5G session's endpoint is recovered from the UPF the first time it is needed: PDR 1 is
-  created again with the UPF choosing the F-TEID. That happens at the UP activation, the paging,
-  a handover preparation or a Modify Indication. For a session that is still connected and
-  handed over before going idle, uplink is lost from that point until the UE has moved. An
-  EPS→5GS-migrated session from such a snapshot is released at boot with #39 "reactivation
-  requested", and its UE re-establishes it (TS 24.501 §6.3.3).
-  **Rollback:** the snapshot version stays 2, and `upfUlEndpoints` is an extra field that 0.1.x
-  ignores. 0.1.x reads the file and drops the field at its next write. The next upgrade then
-  recovers the endpoints as above.
+  **Upgrade:** smfd 0.1.0 had no durable state. The snapshots affected are 0.2.0-dev ones
+  written before #1230, which have no endpoints. No session is released for that. A native
+  5G session's endpoint is recovered from the UPF the first time it is needed: PDR 1 is
+  removed and created again with the UPF choosing the F-TEID, once per session even when
+  requests race. That happens at the UP activation, the paging, a handover preparation or
+  a Modify Indication. For a session that is still connected and handed over before going
+  idle, uplink is lost from that point until the UE has moved. An EPS→5GS-migrated session
+  from such a snapshot is released at boot with #39 "reactivation requested", and its UE
+  re-establishes it (TS 24.501 §6.3.3).
+  **Rollback:** the snapshot version stays 2, and `upfUlEndpoints` is an extra field that a
+  pre-#1230 build ignores. That build reads the file and drops the field at its next write,
+  and the next upgrade recovers the endpoints as above.
 - smfd sends a restored session's boot "RELEASED" notifications (#193) after boot,
   16 at a time, and writes the snapshot once for all of them. Before, it wrote it once per
   session and waited for each AMF in turn, all before the SMF served anything.
