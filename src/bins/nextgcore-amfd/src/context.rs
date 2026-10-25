@@ -3694,6 +3694,12 @@ pub struct AmfUe {
     /// RACS (#570): the UE already holds `ue_radio_capability_id` (it presented it,
     /// or the AMF sent it), so it need not be sent again.
     pub ue_radio_capability_id_known_to_ue: bool,
+    /// RACS (#889): a retired ID was dropped, and the UE has not yet acknowledged
+    /// a UE radio capability ID deletion indication (TS 24.501 §9.11.3.69).
+    pub ue_radio_capability_id_deletion_owed: bool,
+    /// RACS (#889): what the last REGISTRATION ACCEPT or CONFIGURATION UPDATE
+    /// COMMAND built carried, committed only by its COMPLETE.
+    pub racs_in_flight: Option<crate::racs::RacsInFlight>,
     /// Handover info
     pub handover: HandoverInfo,
     /// Data change subscription
@@ -3876,6 +3882,11 @@ impl std::fmt::Debug for AmfUe {
             "ue_radio_capability_id_known_to_ue",
             &self.ue_radio_capability_id_known_to_ue,
         );
+        d.field(
+            "ue_radio_capability_id_deletion_owed",
+            &self.ue_radio_capability_id_deletion_owed,
+        );
+        d.field("racs_in_flight", &self.racs_in_flight);
         d.field("handover", &self.handover);
         d.field("data_change_subscription", &self.data_change_subscription);
         d.field("explicit_de_registered", &self.explicit_de_registered);
@@ -4411,6 +4422,8 @@ impl AmfUe {
             racs_supported: false,
             ue_radio_capability_id: None,
             ue_radio_capability_id_known_to_ue: false,
+            ue_radio_capability_id_deletion_owed: false,
+            racs_in_flight: None,
             handover: HandoverInfo::default(),
             data_change_subscription: DataChangeSubscription::default(),
             explicit_de_registered: ExplicitDeRegistered::default(),
