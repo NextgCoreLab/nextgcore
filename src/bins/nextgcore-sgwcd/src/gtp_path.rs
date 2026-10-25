@@ -1543,6 +1543,59 @@ fn created_lbi(msg: &Gtp2Message) -> u8 {
         .unwrap_or(5)
 }
 
+/// What the SGW-C takes from an S5/S8 Create Session Response.
+#[derive(Debug, Clone)]
+pub struct S5cCreateSessionAnswer {
+    /// The Cause (instance 0); System failure when absent.
+    pub cause: u8,
+    /// The PGW's S5/S8-C F-TEID: "PGW S5/S8/S2a/S2b F-TEID ... for GTP based Control
+    /// Plane interface", instance 1 of TS 29.274 Table 7.2.2-1. Instance 0 is the
+    /// S11/S4 Sender F-TEID, which a PGW does not send.
+    pub pgw_c: Option<Gtp2FTeidIe>,
+    /// The PGW-U's S5/S8-U F-TEID: instance 2 of the Bearer Context created
+    /// (Table 7.2.2-2).
+    pub pgw_u: Option<Gtp2FTeidIe>,
+    /// The PDN address the PGW allocated.
+    pub paa: Option<Gtp2PaaIe>,
+}
+
+/// F-TEID interface type 32, S2b PGW GTP-C (TS 29.274 §8.22).
+const S2B_PGW_GTP_C: u8 = 32;
+
+/// Decode an S5/S8 Create Session Response at the IE instances TS 29.274 Tables
+/// 7.2.2-1 / 7.2.2-2 give them. Public so the PGW-C's tests can read the response
+/// it builds with this, the SGW-C's own decoder (#1113).
+pub fn parse_s5c_create_session_response(msg: &Gtp2Message) -> S5cCreateSessionAnswer {
+    S5cCreateSessionAnswer {
+        cause: msg
+            .get_ie(Gtp2IeType::Cause as u8, 0)
+            .and_then(|ie| ie.value.first().copied())
+            .unwrap_or(gtp_cause::SYSTEM_FAILURE),
+        // A PGW-C from before #1113 sent its control F-TEID at instance 0, the Sender
+        // F-TEID's slot. Its interface type still names it (S5/S8 or S2b PGW GTP-C), so
+        // it is accepted there too: a rolling upgrade does not leak sessions behind an
+        // old PGW-C.
+        pgw_c: msg
+            .get_ie(Gtp2IeType::FTeid as u8, 1)
+            .and_then(|ie| Gtp2FTeidIe::decode(&ie.value).ok())
+            .or_else(|| {
+                msg.get_ie(Gtp2IeType::FTeid as u8, 0)
+                    .and_then(|ie| Gtp2FTeidIe::decode(&ie.value).ok())
+                    .filter(|ft| {
+                        ft.interface_type == s11_build::f_teid_interface::S5_S8_PGW_GTP_C
+                            || ft.interface_type == S2B_PGW_GTP_C
+                    })
+            }),
+        pgw_u: msg
+            .get_ie(Gtp2IeType::BearerContext as u8, 0)
+            .and_then(|ie| Gtp2BearerContextIe::decode(&ie.value).ok())
+            .and_then(|bc| bc.fteid(2).ok().flatten()),
+        paa: msg
+            .get_ie(Gtp2IeType::Paa as u8, 0)
+            .and_then(|ie| Gtp2PaaIe::decode(&ie.value).ok()),
+    }
+}
+
 /// The PGW answered our S5/S8 Create Session Request (#52 criteria 5 and 7).
 ///
 /// This is where the SGW-C stops inventing an answer. The PAA, the PGW's control and
@@ -1561,21 +1614,12 @@ fn dispatch_s5c_create_session_response(msg: &Gtp2Message, peer: SocketAddr) {
     };
 
     let ctx = sgwc_self();
-    let cause = msg
-        .get_ie(Gtp2IeType::Cause as u8, 0)
-        .and_then(|ie| ie.value.first().copied())
-        .unwrap_or(gtp_cause::SYSTEM_FAILURE);
-
-    // The PGW's control-plane F-TEID is at instance 1 (TS 29.274 Table 7.2.2-1); the
-    // SGW's own echo is at instance 0.
-    let pgw_c = msg
-        .get_ie(Gtp2IeType::FTeid as u8, 1)
-        .and_then(|ie| Gtp2FTeidIe::decode(&ie.value).ok());
-    // The PGW-U endpoint lives in the Bearer Context at instance 2.
-    let pgw_u = msg
-        .get_ie(Gtp2IeType::BearerContext as u8, 0)
-        .and_then(|ie| Gtp2BearerContextIe::decode(&ie.value).ok())
-        .and_then(|bc| bc.fteid(2).ok().flatten());
+    let S5cCreateSessionAnswer {
+        cause,
+        pgw_c,
+        pgw_u,
+        paa,
+    } = parse_s5c_create_session_response(msg);
 
     // ---- criterion 5: the SGW-C stops inventing the answer ----
     //
@@ -1584,10 +1628,7 @@ fn dispatch_s5c_create_session_response(msg: &Gtp2Message, peer: SocketAddr) {
     // builds the S11 Create Session Response from. Before #52 the PAA was COPIED from
     // the MME's request (`parsed.paa` into `sess.paa`), so the UE was handed back the
     // address it had asked about with no node having allocated anything.
-    if let Some(paa) = msg
-        .get_ie(Gtp2IeType::Paa as u8, 0)
-        .and_then(|ie| Gtp2PaaIe::decode(&ie.value).ok())
-    {
+    if let Some(paa) = paa {
         if let Some(mut sess) = ctx.sess_find_by_id(sess_id) {
             sess.paa.pdn_type = paa.pdn_type;
             sess.paa.ipv4_addr = paa.ipv4_addr.map(std::net::Ipv4Addr::from);
@@ -3306,6 +3347,40 @@ mod tests {
             delete_cause,
             create_delay_ms,
         }
+    }
+
+    /// #1113: the PGW's control F-TEID is instance 1 of a Create Session Response
+    /// (TS 29.274 Table 7.2.2-1). A PGW-C from before #1113 sent it at instance 0; its
+    /// interface type (S5/S8 or S2b PGW GTP-C) still names it, so it is read there
+    /// too, and only then -- an instance-0 F-TEID of any other type is not the PGW's.
+    #[test]
+    fn the_pgw_control_fteid_is_instance_1_or_a_pgw_typed_instance_0() {
+        let csrsp = |fteids: &[(u8, u8, u32)]| {
+            let mut msg = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+                Gtp2MessageType::CreateSessionResponse as u8,
+                1,
+                1,
+            ));
+            for (instance, iface, teid) in fteids {
+                msg.add_ie(Gtp2FTeidIe::new_ipv4(*iface, *teid, [10, 0, 0, 66]).to_ie(*instance));
+            }
+            parse_s5c_create_session_response(&msg)
+                .pgw_c
+                .map(|ft| ft.teid)
+        };
+        assert_eq!(csrsp(&[(1, 7, 0x11)]), Some(0x11));
+        assert_eq!(csrsp(&[(0, 7, 0x10)]), Some(0x10), "a pre-#1113 PGW-C");
+        assert_eq!(csrsp(&[(0, 32, 0x20)]), Some(0x20), "S2b PGW GTP-C");
+        assert_eq!(
+            csrsp(&[(0, 11, 0x0b)]),
+            None,
+            "an S11 SGW F-TEID is not the PGW's"
+        );
+        assert_eq!(
+            csrsp(&[(0, 7, 0x10), (1, 7, 0x11)]),
+            Some(0x11),
+            "instance 1 wins"
+        );
     }
 
     /// Point the SGW-C at a stand-in PGW. Returns it so the test can assert what it saw.
