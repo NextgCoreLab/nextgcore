@@ -12384,8 +12384,27 @@ impl NgapServer {
                 if s.registered {
                     s.cm_idle = true;
                 }
-                Ok((s.registered, went_idle))
+                // #885: the N1 connection's release is a lower layer failure to the
+                // NAS procedure running on it (TS 24.501), as for an NG Reset (#848):
+                // its retransmission would go out under a RAN UE NGAP ID the gNB may
+                // have given another UE.
+                Ok((s.registered, went_idle, abort_on_ng_release(id, s)))
             });
+            // TS 24.501 §5.5.2.3.5 b): a network-initiated de-registration aborted by a
+            // lower layer failure enters 5GMM-DEREGISTERED. The connection is already
+            // released, so the UE's sessions and policy associations are released and
+            // it is forgotten.
+            if let Some(Ok((_, _, AbortedProcedure::Deregistration))) = leg {
+                log::info!(
+                    "UE {id}: de-registration aborted by the release of its NG connection; \
+                     the UE is de-registered (TS 24.501 §5.5.2.3.5 b))"
+                );
+                self.offload_release_held_sessions(id);
+                self.terminate_policy_associations(id);
+                self.forget_ue(id);
+                return Ok(());
+            }
+            let leg = leg.map(|r| r.map(|(registered, went_idle, _)| (registered, went_idle)));
             let went_idle = match leg {
                 Some(Err((serving_assoc, serving_ran))) => {
                     log::info!(
@@ -20786,9 +20805,10 @@ enum AbortedProcedure {
     Deregistration,
 }
 
-/// Abort the NAS procedure in progress for a UE whose NG connection was released by an
+/// Abort the NAS procedure in progress for a UE whose NG connection was released, by an
 /// NG Reset (TS 38.413 §8.7.4.2.2: "any other ongoing procedure ... related to a UE
-/// association ... shall be aborted"). To the NAS layer that is a lower layer failure, and
+/// association ... shall be aborted") or a UE Context Release (#885, §8.3.3). To the NAS
+/// layer that is a lower layer failure, and
 /// TS 24.501 says what each procedure does on one:
 ///
 /// | timer | procedure | lower layer failure (network side) |
@@ -20808,8 +20828,8 @@ fn abort_on_ng_release(amf_ue_ngap_id: u64, state: &mut UeNasContext) -> Aborted
         return AbortedProcedure::None;
     };
     log::info!(
-        "UE {amf_ue_ngap_id}: {:?} procedure aborted by NG Reset (lower layer failure, TS \
-         38.413 §8.7.4.2.2); its retransmission is dropped",
+        "UE {amf_ue_ngap_id}: {:?} procedure aborted by the release of its NG connection \
+         (lower layer failure); its retransmission is dropped",
         retx.timer
     );
     match retx.timer {
@@ -25810,6 +25830,114 @@ mod tests {
         assert!(!ngap.handover_target_transfers.contains_key(&(cuc, 5)));
         for ue in [cuc, auth] {
             ngap.ue_auth_state.remove(ue);
+        }
+    }
+
+    /// **#885.** A UE Context Release Complete releases the N1 connection a NAS
+    /// procedure is running on, which TS 24.501 treats as a lower layer failure: the
+    /// procedure is aborted (§5.5.1.3.8 a), §5.4.4.6 b), §5.4.1.3.7 a), §5.4.2.7 a),
+    /// §5.4.3.6 a)), and its retransmission never goes out under the released RAN UE
+    /// NGAP ID. Those UEs stay registered, CM-IDLE. A network-initiated
+    /// de-registration (T3522) is aborted into 5GMM-DEREGISTERED (§5.5.2.3.5 b)): its
+    /// session is released at the SMF and the UE is forgotten.
+    ///
+    /// REVERT-VERIFIED: without the abort the armed PDUs are retransmitted and the
+    /// T3522 UE is kept; without `terminate_policy_associations` no PCF DELETE comes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_release_complete_aborts_the_ues_nas_procedure() {
+        let (_nf, port, seen) = recording_nf().await;
+        let _env = SmfEnvGuard::acquire(port).await;
+        set_pcf_env(port);
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = capturing_ngap_server().await;
+        let assoc = 885_001u64;
+        seed_gnb_session(&ngap, assoc).await;
+        let ues = [
+            (7_885_001u64, 51u32, NasProcTimer::T3550),
+            (7_885_002, 52, NasProcTimer::T3555),
+            (7_885_003, 53, NasProcTimer::T3560),
+            (7_885_004, 54, NasProcTimer::T3570),
+            (7_885_005, 55, NasProcTimer::T3522),
+        ];
+        for (ue, ran, timer) in ues {
+            let mut state = UeNasContext::new(ue, ran, assoc, false);
+            state.registered = true;
+            state.retx = Some(NasRetx {
+                timer,
+                deadline: Instant::now() + Duration::from_millis(50),
+                retries: 0,
+                ngap_pdu: vec![0x00, 0x04, 0x40, ran as u8],
+            });
+            ngap.ue_auth_state.insert(ue, state);
+        }
+        let dereg = ues[4].0;
+        ngap.ue_auth_state.with_mut(dereg, |s| {
+            s.policy_association_id = Some("am-pol-885".to_string());
+            s.ue_policy_association_id = Some("ue-pol-885".to_string());
+        });
+        ngap.sm_context_refs
+            .insert((dereg, 5), "smctx-885-dereg".to_string());
+        ngap.sm_context_smfs
+            .insert((dereg, 5), ("127.0.0.1".to_string(), port));
+
+        for (ue, ran, _) in ues {
+            ngap.handle_ue_context_release_complete(assoc, &release_complete_pdu(ue, Some(ran)))
+                .await
+                .expect("handled");
+        }
+        ngap.sbi_offload.settle().await;
+
+        // Past every retransmission deadline: nothing goes out on the released
+        // connections. The UE store is process-global (#915): only these PDUs count.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        ngap.process_nas_timers().await.expect("timers");
+        let resent: Vec<(u64, Vec<u8>)> = take_sent_ngap(&mut ngap)
+            .into_iter()
+            .filter(|(_, p)| {
+                p.len() == 4 && p[..3] == [0x00, 0x04, 0x40] && (51..=55).contains(&p[3])
+            })
+            .collect();
+        assert!(
+            resent.is_empty(),
+            "no retransmission on a released connection: {resent:?}"
+        );
+        for (ue, _, timer) in &ues[..4] {
+            let state = ngap.ue_auth_state.get(*ue).expect("kept, not released");
+            assert!(
+                state.is_cm_idle() && state.registered && state.retx.is_none(),
+                "{timer:?}: aborted, the UE kept registered and CM-IDLE"
+            );
+        }
+        assert!(
+            !ngap.ue_auth_state.contains(dereg),
+            "TS 24.501 §5.5.2.3.5 b): 5GMM-DEREGISTERED"
+        );
+        // Its policy associations end at the PCF (TS 23.502 §4.2.2.3.3 step 6).
+        let am = nf_saw(
+            &seen,
+            "DELETE /npcf-am-policy-control/v1/policies/am-pol-885",
+        )
+        .await;
+        let ue_pol = nf_saw(
+            &seen,
+            "DELETE /npcf-ue-policy-control/v1/policies/ue-pol-885",
+        )
+        .await;
+        clear_pcf_env();
+        let seen = seen.lock().expect("seen").clone();
+        assert!(
+            am && ue_pol,
+            "both policy associations are deleted: {seen:?}"
+        );
+        assert_eq!(
+            seen.iter()
+                .filter(|s| !s.starts_with("DELETE /npcf-"))
+                .collect::<Vec<_>>(),
+            vec!["POST /nsmf-pdusession/v1/sm-contexts/smctx-885-dereg/release"],
+            "the deregistered UE's session is released; nothing else is called"
+        );
+        for (ue, _, _) in &ues[..4] {
+            ngap.forget_ue(*ue);
         }
     }
 
