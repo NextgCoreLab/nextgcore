@@ -4852,6 +4852,17 @@ mod tests {
         vec![0x09, 0x91, 0x07, 0x00, 0x00, 0x00, 0x11, imsi_last]
     }
 
+    /// Remove the UEs `imsi_last` (and their sessions) a test created.
+    fn forget_ues(imsi_lasts: &[u8]) {
+        let handle = crate::context::smf_self();
+        let ctx = handle.read().unwrap();
+        for last in imsi_lasts {
+            if let Some(ue) = ctx.ue_find_by_imsi(&imsi_for(*last)) {
+                ctx.ue_remove(ue.id);
+            }
+        }
+    }
+
     /// The EPC sessions the context holds for the UE `imsi_last`.
     fn sessions_of(imsi_last: u8) -> Vec<crate::context::SmfSess> {
         let handle = crate::context::smf_self();
@@ -4945,11 +4956,7 @@ mod tests {
             .ok()
             .and_then(|ctx| ctx.sess_find_by_ipv4(old_addr))
             .is_some_and(|s| s.id == old[0].id);
-        for s in &now {
-            if let Ok(ctx) = crate::context::smf_self().read() {
-                ctx.sess_remove(s.id);
-            }
-        }
+        forget_ues(&[0x41]);
         server.close();
 
         assert_eq!(
@@ -4987,11 +4994,7 @@ mod tests {
         )
         .await;
         let now = sessions_of(0x42);
-        for s in &now {
-            if let Ok(ctx) = crate::context::smf_self().read() {
-                ctx.sess_remove(s.id);
-            }
-        }
+        forget_ues(&[0x42]);
         server.close();
         assert_eq!(now.len(), 2, "two PDN connections, EBI 5 and EBI 6");
     }
@@ -5009,11 +5012,7 @@ mod tests {
         let before = sessions_of(0x43);
         let second = create_over_the_wire(&server, &sgw, &csr).await;
         let after = sessions_of(0x43);
-        for s in &after {
-            if let Ok(ctx) = crate::context::smf_self().read() {
-                ctx.sess_remove(s.id);
-            }
-        }
+        forget_ues(&[0x43]);
         server.close();
         assert_eq!(first, second, "the same response, byte for byte");
         assert_eq!(after.len(), 1);
@@ -5054,11 +5053,7 @@ mod tests {
         .await;
         let gone = (sessions_of(0x44).len(), sessions_of(0x45).len());
         let new = sessions_of(0x46);
-        for s in &new {
-            if let Ok(ctx) = crate::context::smf_self().read() {
-                ctx.sess_remove(s.id);
-            }
-        }
+        forget_ues(&[0x44, 0x45, 0x46]);
         server.close();
         assert_eq!(kept, 1, "an unchanged counter deletes nothing");
         assert_eq!(
@@ -5104,11 +5099,7 @@ mod tests {
             .expect("send");
         let _ = recv_type(&sgw, gtp2_message_type::ECHO_RESPONSE).await;
         let gone = eventually(|| sessions_of(0x47).is_empty()).await;
-        for s in sessions_of(0x47) {
-            if let Ok(ctx) = crate::context::smf_self().read() {
-                ctx.sess_remove(s.id);
-            }
-        }
+        forget_ues(&[0x47]);
         server.close();
         assert_eq!(kept, 1, "the same counter deletes nothing");
         assert!(gone, "a new counter deletes the SGW-C's PDN connections");
@@ -5155,6 +5146,13 @@ mod tests {
             .and_then(|ctx| ctx.sess_find_by_id(sess.id))
             .is_some();
         let mods = upf.modification_bodies();
+        // pdn_with_local_rules's UE, IMSI `...00 48`.
+        if let Ok(ctx) = crate::context::smf_self().read() {
+            let imsi = [0x09, 0x91, 0x07, 0x00, 0x00, 0x00, 0x00, 0x48];
+            if let Some(ue) = ctx.ue_find_by_imsi(&imsi) {
+                ctx.ue_remove(ue.id);
+            }
+        }
         server.close();
         assert!(
             dedicated.is_none(),
