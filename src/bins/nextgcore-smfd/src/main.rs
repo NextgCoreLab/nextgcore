@@ -3027,34 +3027,114 @@ fn sbi_response_with_n1_n2(
         ))
 }
 
+/// The QoS flows a `PDUSessionResourceSetupRequestTransfer` of this session sets up
+/// (#992, TS 38.413 §9.3.4.1 QoS Flow Setup Request List; TS 23.502 §4.2.3.2 and
+/// §4.9.1.3.2: the SMF provides the session's QoS flows): the default flow the
+/// policy binding authorised, then every other flow the session holds -- the
+/// dedicated bearers an EPS→5GS handover brought, with their GBR parameters. Only
+/// the default one was sent, so a re-activated or handed-over session lost the rest.
+fn session_setup_flows(
+    sm_context_ref: &str,
+    binding: &context::PolicyBinding,
+) -> Vec<n2_transfer::QosFlowSetup> {
+    let mut flows = vec![n2_transfer::QosFlowSetup {
+        qfi: binding.qfi,
+        five_qi: u16::from(binding.five_qi),
+        arp: n2_transfer::Arp {
+            priority_level: binding.arp_priority_level,
+            may_trigger_pre_emption: false,
+            pre_emptable: false,
+        },
+        gbr: None,
+        e_rab_id: None,
+    }];
+    let sess = smf_self()
+        .read()
+        .ok()
+        .and_then(|ctx| ctx.sess_find_by_sm_context_ref(sm_context_ref));
+    for bearer in sess
+        .as_ref()
+        .map(eps_to_5gs::session_bearers)
+        .unwrap_or_default()
+    {
+        // An EPS→5GS flow's QFI is its EBI (`eps_to_5gs`); a 5G flow has its own.
+        let qfi = if bearer.qfi != 0 {
+            bearer.qfi
+        } else {
+            bearer.ebi
+        };
+        if qfi == 0 || flows.iter().any(|f| f.qfi == qfi) {
+            continue;
+        }
+        flows.push(n2_transfer::QosFlowSetup {
+            qfi,
+            five_qi: u16::from(bearer.qos.index),
+            arp: n2_transfer::Arp {
+                priority_level: bearer.qos.arp_priority_level.clamp(1, 15),
+                // PCI / PVI are "disable" flags (TS 29.274 §8.15), as in `eps_to_5gs`.
+                may_trigger_pre_emption: !bearer.qos.arp_preempt_cap,
+                pre_emptable: !bearer.qos.arp_preempt_vuln,
+            },
+            gbr: (bearer.qos.gbr_uplink > 0 || bearer.qos.gbr_downlink > 0).then_some(
+                n2_transfer::Gbr {
+                    mfbr_dl: bearer.qos.mbr_downlink,
+                    mfbr_ul: bearer.qos.mbr_uplink,
+                    gfbr_dl: bearer.qos.gbr_downlink,
+                    gfbr_ul: bearer.qos.gbr_uplink,
+                },
+            ),
+            e_rab_id: None,
+        });
+    }
+    flows
+}
+
+/// The PDU Session Aggregate Maximum Bit Rate `(DL, UL)` of a transfer setting up
+/// `flows` (#992). TS 38.413 §9.3.4.1 makes it conditional, present "when at least
+/// one Non-GBR QoS flow is being setup", which the default flow always is with the
+/// standard 5QI 9 -- so it was missing from every transfer this SMF built.
+fn session_ambr_for(
+    flows: &[n2_transfer::QosFlowSetup],
+    ambr_dl_bps: u64,
+    ambr_ul_bps: u64,
+) -> Option<(u64, u64)> {
+    (flows.iter().any(|f| f.gbr.is_none()) && (ambr_dl_bps > 0 || ambr_ul_bps > 0))
+        .then_some((ambr_dl_bps, ambr_ul_bps))
+}
+
 /// Build the N2 SM `PDUSessionResourceSetupRequestTransfer` (TS 38.413
-/// §9.3.4.1) carrying the UPF N3 GTP-U F-TEID and the QoS flow setup list.
-/// Encoded by the generated NGAP codec (#417), byte for byte what the
-/// hand-written transfer codec produced (`n2_transfer` oracle tests).
+/// §9.3.4.1) carrying the UPF N3 GTP-U F-TEID, the Session-AMBR and the QoS flow
+/// setup list. Encoded by the generated NGAP codec (#417).
 fn build_setup_request_transfer(
     upf_teid: u32,
     upf_addr: [u8; 4],
-    qfi: u8,
-    five_qi: u16,
-    arp_priority_level: u8,
+    flows: Vec<n2_transfer::QosFlowSetup>,
+    ambr_dl_bps: u64,
+    ambr_ul_bps: u64,
 ) -> Result<Vec<u8>, n2_transfer::TransferError> {
     n2_transfer::setup_request_transfer(&n2_transfer::SetupRequest {
-        ambr: None,
+        ambr: session_ambr_for(&flows, ambr_dl_bps, ambr_ul_bps),
         ul_tunnel: (upf_teid, upf_addr),
         data_forwarding_not_possible: false,
         direct_forwarding_path_availability: false,
-        flows: vec![n2_transfer::QosFlowSetup {
-            qfi,
-            five_qi,
-            arp: n2_transfer::Arp {
-                priority_level: arp_priority_level,
-                may_trigger_pre_emption: false,
-                pre_emptable: false,
-            },
-            gbr: None,
-            e_rab_id: None,
-        }],
+        flows,
     })
+}
+
+/// The default QoS flow alone, as establishment sets it up (a new session holds no
+/// other flow yet).
+fn default_flow(qfi: u8, five_qi: u16, arp_priority_level: u8) -> Vec<n2_transfer::QosFlowSetup> {
+    vec![n2_transfer::QosFlowSetup {
+        qfi,
+        five_qi,
+        arp: n2_transfer::Arp {
+            priority_level: arp_priority_level,
+            may_trigger_pre_emption: false,
+            pre_emptable: false,
+        },
+        gbr: None,
+        e_rab_id: None,
+    }]
 }
 
 /// Build a `PDUSessionResourceModifyRequestTransfer` (TS 38.413 clause 9.3.4.3)
@@ -4577,9 +4657,13 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     let n2_sm_info = match build_setup_request_transfer(
         upf_teid,
         upf_addr,
-        qfi,
-        decision.def_five_qi as u16,
-        decision.arp_priority_level,
+        default_flow(
+            qfi,
+            decision.def_five_qi as u16,
+            decision.arp_priority_level,
+        ),
+        decision.sess_ambr_dl_bps,
+        decision.sess_ambr_ul_bps,
     ) {
         Ok(bytes) if !n2_setup_fails_for_test() => bytes,
         result => {
@@ -4694,9 +4778,9 @@ fn activation_response(sm_context_ref: &str) -> SbiResponse {
     let n2 = match build_setup_request_transfer(
         upf_teid,
         upf_addr,
-        binding.qfi,
-        u16::from(binding.five_qi),
-        binding.arp_priority_level,
+        session_setup_flows(sm_context_ref, &binding),
+        binding.ambr_dl_bps,
+        binding.ambr_ul_bps,
     ) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -4766,22 +4850,13 @@ fn handover_preparing_response(sm_context_ref: &str, required: Option<&[u8]>) ->
         }
         None => false,
     };
+    let flows = session_setup_flows(sm_context_ref, &binding);
     let n2 = match n2_transfer::setup_request_transfer(&n2_transfer::SetupRequest {
-        ambr: None,
+        ambr: session_ambr_for(&flows, binding.ambr_dl_bps, binding.ambr_ul_bps),
         ul_tunnel: (upf_teid, upf_addr),
         data_forwarding_not_possible: !direct,
         direct_forwarding_path_availability: direct,
-        flows: vec![n2_transfer::QosFlowSetup {
-            qfi: binding.qfi,
-            five_qi: u16::from(binding.five_qi),
-            arp: n2_transfer::Arp {
-                priority_level: binding.arp_priority_level,
-                may_trigger_pre_emption: false,
-                pre_emptable: false,
-            },
-            gbr: None,
-            e_rab_id: None,
-        }],
+        flows,
     }) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -12022,7 +12097,9 @@ mod tests {
 
     #[test]
     fn setup_request_transfer_matches_gnb_wire_bytes() {
-        let bytes = build_setup_request_transfer(0x0001_0001, [10, 45, 0, 1], 1, 9, 8).unwrap();
+        let bytes =
+            build_setup_request_transfer(0x0001_0001, [10, 45, 0, 1], default_flow(1, 9, 8), 0, 0)
+                .unwrap();
         assert_eq!(
             bytes,
             GNB_EXPECTED_SETUP_REQUEST.to_vec(),
@@ -12035,7 +12112,9 @@ mod tests {
         use nextgcore_ngap::transfer::{
             PduSessionResourceSetupRequestTransfer, UpTransportLayerInformation,
         };
-        let bytes = build_setup_request_transfer(0x0001_0001, [10, 45, 0, 1], 1, 9, 8).unwrap();
+        let bytes =
+            build_setup_request_transfer(0x0001_0001, [10, 45, 0, 1], default_flow(1, 9, 8), 0, 0)
+                .unwrap();
         let t = PduSessionResourceSetupRequestTransfer::decode(&bytes).expect("decode");
         let UpTransportLayerInformation::GtpTunnel(tun) = &t.ul_ngu_up_tnl_information;
         assert_eq!(u32::from_be_bytes(tun.gtp_teid), 0x0001_0001);
@@ -12303,7 +12382,9 @@ mod tests {
             None,
             None,
         );
-        let n2 = build_setup_request_transfer(0x0001_0001, [10, 45, 0, 1], 1, 9, 8).unwrap();
+        let n2 =
+            build_setup_request_transfer(0x0001_0001, [10, 45, 0, 1], default_flow(1, 9, 8), 0, 0)
+                .unwrap();
 
         let resp = sbi_response_with_n1_n2(
             201,
@@ -18182,7 +18263,7 @@ mod tests {
         assert_eq!(state(&reference), context::UpCnxState::Activated);
     }
 
-    fn seed_registered_session(supi: &str, psi: u8, dnn: &str) -> String {
+    pub(crate) fn seed_registered_session(supi: &str, psi: u8, dnn: &str) -> String {
         smf_context_init(64, 256, 512);
         let ctx = smf_self();
         let context = ctx.read().expect("context");
@@ -20132,6 +20213,116 @@ mod path_switch_ack_tests {
         );
     }
 
+    /// The PDUSessionResourceSetupRequestTransfer in an SM Context Update answer.
+    fn setup_transfer_of(
+        resp: &SbiResponse,
+    ) -> nextgcore_ngap::transfer::PduSessionResourceSetupRequestTransfer {
+        let n2 = resp
+            .http
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some("n2SmInfo"))
+            .expect("n2SmInfo part");
+        nextgcore_ngap::transfer::PduSessionResourceSetupRequestTransfer::decode(&n2.data)
+            .expect("decode")
+    }
+
+    /// #992, TS 38.413 §9.3.4.1: the transfers the SMF rebuilds for a session carry
+    /// its Session-AMBR (mandatory with a non-GBR flow, which the default flow is) and
+    /// every QoS flow it holds, a dedicated GBR one with its bit rates included: the
+    /// re-activation (`ACTIVATING`) and the N2 handover (`HANDOVER_REQUIRED`).
+    /// Before, both carried no AMBR and the default flow only.
+    ///
+    /// REVERT-VERIFIED: with `ambr: None` or the default flow alone, this fails.
+    #[tokio::test]
+    async fn rebuilt_setup_transfers_carry_the_session_ambr_and_every_flow() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let r = crate::tests::seed_registered_session("imsi-001010000000992", 6, "internet");
+        {
+            let ctx = smf_self();
+            let ctx = ctx.read().expect("ctx");
+            ctx.upf_ul_endpoints
+                .write()
+                .expect("w")
+                .insert(r.clone(), (0x0009_0092, [10, 45, 0, 9]));
+            let mut b = context::PolicyBinding::snapshot_default();
+            b.qfi = 1;
+            b.five_qi = 9;
+            b.arp_priority_level = 8;
+            b.ambr_dl_bps = 200_000_000;
+            b.ambr_ul_bps = 100_000_000;
+            ctx.policy_bindings.write().expect("w").insert(r.clone(), b);
+            // A dedicated GBR flow the session holds (as an EPS→5GS handover brings).
+            let sess = ctx.sess_find_by_sm_context_ref(&r).expect("sess");
+            let mut dedicated = ctx.bearer_add(sess.id).expect("bearer");
+            dedicated.qfi = 2;
+            dedicated.qos.index = 1;
+            dedicated.qos.arp_priority_level = 2;
+            dedicated.qos.gbr_downlink = 64_000;
+            dedicated.qos.gbr_uplink = 32_000;
+            dedicated.qos.mbr_downlink = 128_000;
+            dedicated.qos.mbr_uplink = 64_000;
+            ctx.bearer_update(&dedicated);
+        }
+
+        let check = |t: nextgcore_ngap::transfer::PduSessionResourceSetupRequestTransfer,
+                     what: &str| {
+            let ambr = t
+                .pdu_session_aggregate_maximum_bit_rate
+                .unwrap_or_else(|| panic!("{what}: the Session-AMBR is present"));
+            assert_eq!((ambr.dl, ambr.ul), (200_000_000, 100_000_000), "{what}");
+            let flows: Vec<(u8, Option<u64>)> = t
+                .qos_flow_setup_request_list
+                .iter()
+                .map(|f| {
+                    (
+                        f.qos_flow_identifier,
+                        f.qos_flow_level_qos_parameters
+                            .gbr_qos_information
+                            .as_ref()
+                            .map(|g| g.guaranteed_flow_bit_rate_dl),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                flows,
+                vec![(1, None), (2, Some(64_000))],
+                "{what}: every flow"
+            );
+        };
+        let activation = activation_response(&r);
+        assert_eq!(activation.status, 200);
+        check(setup_transfer_of(&activation), "ACTIVATING");
+        let handover = handover_preparing_response(&r, None);
+        assert_eq!(handover.status, 200, "{:?}", handover.http.content);
+        check(setup_transfer_of(&handover), "HANDOVER_REQUIRED");
+
+        // Establishment: the default flow, with the AMBR.
+        let t = nextgcore_ngap::transfer::PduSessionResourceSetupRequestTransfer::decode(
+            &build_setup_request_transfer(
+                0x0001_0001,
+                [10, 45, 0, 1],
+                default_flow(1, 9, 8),
+                200_000_000,
+                100_000_000,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            t.pdu_session_aggregate_maximum_bit_rate.is_some(),
+            "establishment"
+        );
+
+        let ctx = smf_self();
+        let ctx = ctx.read().expect("ctx");
+        ctx.policy_bindings.write().expect("w").remove(&r);
+        ctx.upf_ul_endpoints.write().expect("w").remove(&r);
+        if let Some(sess) = ctx.sess_find_by_sm_context_ref(&r) {
+            ctx.sess_remove(sess.id);
+        }
+    }
+
     /// #518: `upCnxState: ACTIVATING` is answered with the session's setup transfer
     /// rebuilt from what establishment recorded -- the UPF N3 uplink endpoint and the
     /// default flow's QFI / 5QI / ARP -- so the AMF can put it in the Service
@@ -20182,7 +20373,8 @@ mod path_switch_ack_tests {
             .expect("n2SmInfo part");
         assert_eq!(
             n2.data.as_ref(),
-            build_setup_request_transfer(0x0005_0007, [10, 45, 0, 9], 5, 7, 3).unwrap()
+            build_setup_request_transfer(0x0005_0007, [10, 45, 0, 9], default_flow(5, 7, 3), 0, 0)
+                .unwrap()
         );
         let t = PduSessionResourceSetupRequestTransfer::decode(&n2.data).expect("decode");
         let UpTransportLayerInformation::GtpTunnel(tun) = &t.ul_ngu_up_tnl_information;
