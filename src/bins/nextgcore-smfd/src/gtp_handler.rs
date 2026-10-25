@@ -4333,6 +4333,115 @@ mod tests {
         server.close();
     }
 
+    /// #1182 review: a Delete Bearer Response that refuses one of two bearers (cause 17,
+    /// the second Bearer Context refused) keeps that bearer and its PGW-U rules; and a
+    /// dedicated bearer this PGW-C did not create (no rule index of its own) is refused
+    /// in a Failure Indication, not dropped from the store alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_delete_bearer_command_keeps_the_bearers_the_answer_refuses() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        let (server, sgw, _port, sess, pgw_c_teid) =
+            pdn_with_local_rules(0x6a, vec![voice_rule(), video_rule()]).await;
+        for ebi in [6u8, 7] {
+            let (cbr, _) = recv_type(&sgw, gtp2_message_type::CREATE_BEARER_REQUEST).await;
+            sgw.send_to(
+                &s5c_create_bearer_response(cbr.header.sequence_number, pgw_c_teid, ebi, 16, None),
+                server.local_addr(),
+            )
+            .await
+            .expect("send");
+            stored_bearer(sess.id, ebi).await.expect("active");
+        }
+        assert!(upf_until(&upf, |m| sent(m, &far_id_ie(0x82))).await);
+        upf.clear_seen();
+        let dbc = {
+            use nextgcore_gtp::v2::{Gtp2BearerContextIe, Gtp2Header, Gtp2Message};
+            let mut m = Gtp2Message::new(Gtp2Header::new(
+                gtp2_message_type::DELETE_BEARER_COMMAND,
+                pgw_c_teid,
+                0x8106,
+            ));
+            for ebi in [6u8, 7] {
+                let mut bc = Gtp2BearerContextIe::new();
+                bc.set_ebi(ebi);
+                m.add_bearer_context(0, &bc);
+            }
+            m.encode()
+        };
+        sgw.send_to(&dbc, server.local_addr()).await.expect("send");
+        let (dbr, _) = recv_type(&sgw, gtp2_message_type::DELETE_BEARER_REQUEST).await;
+        assert_eq!(
+            dbr.get_ies(Gtp2IeType::Ebi as u8).len(),
+            2,
+            "both bearers asked for"
+        );
+        let rsp = {
+            use nextgcore_gtp::v2::{Gtp2BearerContextIe, Gtp2CauseIe, Gtp2Header, Gtp2Message};
+            let mut m = Gtp2Message::new(Gtp2Header::new(
+                gtp2_message_type::DELETE_BEARER_RESPONSE,
+                pgw_c_teid,
+                0x8106,
+            ));
+            m.add_ie(Gtp2CauseIe::new(17).to_ie(0));
+            for (ebi, cause) in [(6u8, 16u8), (7, 88)] {
+                let mut bc = Gtp2BearerContextIe::new();
+                bc.set_ebi(ebi);
+                bc.set_cause(&Gtp2CauseIe::new(cause));
+                m.add_bearer_context(0, &bc);
+            }
+            m.encode()
+        };
+        sgw.send_to(&rsp, server.local_addr()).await.expect("send");
+        let remove_far = |id: u32| {
+            let mut v = vec![0x00, 0x10, 0x00, 0x08];
+            v.extend_from_slice(&far_id_ie(id));
+            v
+        };
+        let far81 = remove_far(0x81);
+        assert!(upf_until(&upf, |m| sent(m, &far81)).await, "EBI 6 removed");
+        assert!(
+            !sent(&upf.modification_bodies(), &remove_far(0x82)),
+            "EBI 7's rules stay"
+        );
+        assert!(stored_bearer(sess.id, 7).await.is_some(), "EBI 7 stays");
+
+        // A dedicated bearer without a rule index of this module's.
+        let foreign = {
+            let handle = crate::context::smf_self();
+            let ctx = handle.read().unwrap();
+            let mut b = ctx.bearer_add(sess.id).unwrap();
+            b.ebi = 9;
+            b.qfi = 9;
+            ctx.bearer_update(&b);
+            b.id
+        };
+        let dbc9 = {
+            use nextgcore_gtp::v2::{Gtp2BearerContextIe, Gtp2Header, Gtp2Message};
+            let mut m = Gtp2Message::new(Gtp2Header::new(
+                gtp2_message_type::DELETE_BEARER_COMMAND,
+                pgw_c_teid,
+                0x8109,
+            ));
+            let mut bc = Gtp2BearerContextIe::new();
+            bc.set_ebi(9);
+            m.add_bearer_context(0, &bc);
+            m.encode()
+        };
+        sgw.send_to(&dbc9, server.local_addr()).await.expect("send");
+        let (fi, _) = recv_type(&sgw, gtp2_message_type::DELETE_BEARER_FAILURE_INDICATION).await;
+        assert_eq!(fi.header.sequence_number, 0x8109);
+        assert!(
+            crate::context::smf_self()
+                .read()
+                .unwrap()
+                .bearer_find_by_id(foreign)
+                .is_some(),
+            "refused, not dropped from the store alone"
+        );
+        server.close();
+    }
+
     /// #619: a Bearer Resource Command asking for new packet filters with a Flow QoS gets
     /// a Create Bearer Request under the COMMAND's sequence number, carrying its PTI
     /// (TS 29.274 §7.6, TS 23.401 §5.4.5). A retransmitted Command does not start a second

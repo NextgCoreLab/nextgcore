@@ -727,6 +727,13 @@ pub async fn deactivate_on_command(
                 _ if ebi == linked => {
                     refused.push((ebi, Gtp2Cause::RequestRejectedReasonNotSpecified))
                 }
+                // #1182 review: a dedicated bearer this PGW-C did not create here (one that
+                // came over N26 / EPS interworking, with #583's rule ids) is REFUSED, not
+                // deleted locally: its PGW-U rules are not this module's to remove, and
+                // dropping only the store entry would leave them steering its traffic.
+                Some(b) if b.eps_rule_index == 0 => {
+                    refused.push((ebi, Gtp2Cause::RequestRejectedReasonNotSpecified))
+                }
                 Some(b) => bearers.push(b),
                 None => refused.push((ebi, Gtp2Cause::ContextNotFound)),
             }
@@ -824,18 +831,15 @@ pub async fn deactivate_on_command(
         }
     };
     for bearer in bearers.iter().filter(|b| !kept.contains(&b.ebi)) {
-        if bearer.eps_rule_index != 0 {
-            // One lock at a time: `stored_filters` takes its own.
-            let stored = handle
-                .read()
-                .ok()
-                .and_then(|ctx| ctx.bearer_find_by_id(bearer.id));
-            let with_dl =
-                stored.is_some_and(|b| !downlink_descriptions(&stored_filters(&b)).is_empty());
-            roll_back(&sess, bearer, with_dl).await;
-        } else if let Ok(ctx) = handle.read() {
-            ctx.bearer_remove(bearer.id);
-        }
+        // Every bearer here is one of this module's (`eps_rule_index != 0`, see above).
+        // One lock at a time: `stored_filters` takes its own.
+        let stored = handle
+            .read()
+            .ok()
+            .and_then(|ctx| ctx.bearer_find_by_id(bearer.id));
+        let with_dl =
+            stored.is_some_and(|b| !downlink_descriptions(&stored_filters(&b)).is_empty());
+        roll_back(&sess, bearer, with_dl).await;
         log::info!(
             "dedicated bearer EBI {} deleted on the MME's command",
             bearer.ebi
