@@ -260,6 +260,20 @@ pub fn build_create_session_response(
                 0,
                 &fteid_from_tunnel(f_teid_interface::S1_U_SGW_GTP_U, &ul_tunnel)?,
             );
+            // #1132, TS 29.274 Table 7.2.2-2: the S5/S8-U PGW F-TEID (instance 2,
+            // interface type 5) on S11 once the PGW-U endpoint is known: the
+            // uplink tunnel's remote end (s5c_handler sets it from the PGW's
+            // Create Session Response). mmed carries it into N26.
+            if ul_tunnel.remote_teid != 0 {
+                if let Ok(pgw_u) = fteid(
+                    f_teid_interface::S5_S8_PGW_GTP_U,
+                    ul_tunnel.remote_teid,
+                    ul_tunnel.remote_ip.ipv4,
+                    ul_tunnel.remote_ip.ipv6,
+                ) {
+                    bc.set_fteid(2, &pgw_u);
+                }
+            }
         }
         msg.add_bearer_context(0, &bc);
         bearer_count += 1;
