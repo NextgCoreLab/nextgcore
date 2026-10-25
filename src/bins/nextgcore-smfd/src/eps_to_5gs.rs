@@ -680,6 +680,10 @@ impl Drop for HandoverLock {
 /// (§6.1.6.2.36, Table 6.1.3.3.4.2.2-2) for PREPARED, COMPLETED and CANCELLED. Both
 /// carry the ProblemDetails, with its "cause", in "error", as application/json. A
 /// bare ProblemDetails is for errors an SCP originates.
+///
+/// #1097: the one helper for every error the SMF itself originates on SM Context
+/// Create and Update, in `main.rs` as well as here. Retrieve and Release keep the
+/// ProblemDetails their own tables list.
 pub(crate) fn sm_context_error(status: u16, cause: &str, detail: &str) -> SbiResponse {
     let body = serde_json::json!({
         "error": { "status": status, "cause": cause, "detail": detail },
