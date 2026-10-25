@@ -5279,16 +5279,18 @@ fn missing_or_erroneous(value: &serde_json::Value, ie: &str, cause: &str) -> Sbi
 }
 
 /// The SmContextUpdateError of a HANDOVER_REQUIRED the SMF cannot prepare (#1097
-/// review M3, TS 29.502 §5.2.2.3.4.2 step 2b): `hoState: NONE`, and the N2 SM
-/// information a Handover Preparation Unsuccessful Transfer (TS 38.413 §9.3.4.18)
-/// for the AMF to put in the Handover Preparation Failure.
+/// review M3, TS 29.502 §5.2.2.3.4.2 step 2b): the N2 SM information a Handover
+/// Preparation Unsuccessful Transfer (TS 38.413 §9.3.4.18) for the AMF to put in the
+/// Handover Preparation Failure. No `hoState`: SmContextUpdateError has no such
+/// attribute (Table 6.1.6.2.36-1), and the AMF regards the hoState as NONE on any
+/// 4xx/5xx (#1252 review).
 fn handover_preparation_failed(status: u16, cause: &str, detail: &str) -> SbiResponse {
     let n2 = n2_transfer::handover_preparation_unsuccessful_transfer(&[]).ok();
     eps_to_5gs::sm_context_update_error_with(
         status,
         cause,
         detail,
-        serde_json::json!({ "hoState": "NONE" }),
+        serde_json::json!({}),
         n2.map(|bytes| ("HANDOVER_PREP_FAIL", bytes)),
     )
 }
@@ -12062,25 +12064,23 @@ mod tests {
 
         // Inside the teardown, before the clear: the stored stamp is the new one.
         rebaseline().await;
-        let (reached, proceed) = (
-            Arc::new(tokio::sync::Notify::new()),
-            Arc::new(tokio::sync::Notify::new()),
-        );
-        *pfcp_path::TEARDOWN_HOLD_FOR_TEST.lock().unwrap() =
-            Some((reached.clone(), proceed.clone()));
+        // #1239 review: released on every exit path, a failed assertion included.
+        let hold = pfcp_path::TeardownHold::arm();
         let before = teardowns();
         let first = {
             let a = fx.a.clone();
             tokio::spawn(async move { a.check_peer_restart(900).await })
         };
-        tokio::time::timeout(Duration::from_secs(5), reached.notified())
+        let reached = tokio::time::timeout(Duration::from_secs(5), hold.reached.notified())
             .await
-            .expect("the first detector tears down");
-        *pfcp_path::TEARDOWN_HOLD_FOR_TEST.lock().unwrap() = None;
+            .is_ok();
+        hold.disarm();
+        assert!(reached, "the first detector reaches its teardown");
         fx.a.check_peer_restart(900).await;
         let inside = teardowns() - before;
-        proceed.notify_one();
+        hold.release();
         first.await.unwrap();
+        drop(hold);
         assert_eq!(
             inside, 1,
             "the second detector, inside the teardown, does not tear down"
@@ -21749,7 +21749,7 @@ mod tests {
     /// #1097 review M4: the SMF's own SM Context Create and Update errors, a row per
     /// kind, are each an SmContextCreateError / SmContextUpdateError with the right
     /// status and cause -- with `upCnxState: DEACTIVATED` on a failed activation and
-    /// `hoState: NONE` plus a Handover Preparation Unsuccessful Transfer on a failed
+    /// a Handover Preparation Unsuccessful Transfer (and no `hoState`) on a failed
     /// handover preparation (TS 29.502 §5.2.2.3.2.2, §5.2.2.3.4.2).
     #[tokio::test]
     async fn sm_context_errors_are_create_and_update_errors() {
@@ -21851,12 +21851,12 @@ mod tests {
         let body = sm_context_error_of(&activation);
         assert_eq!(body["upCnxState"], "DEACTIVATED");
 
-        // A failed handover preparation: hoState NONE and the N2 Handover Preparation
-        // Unsuccessful Transfer.
+        // A failed handover preparation: the N2 Handover Preparation Unsuccessful
+        // Transfer, and no hoState (TS 29.502 Table 6.1.6.2.36-1, #1252 review).
         let handover = handover_preparing_response(&known, None);
         assert_eq!(handover.status, 500);
         let body = sm_context_error_of(&handover);
-        assert_eq!(body["hoState"], "NONE");
+        assert!(body.get("hoState").is_none(), "{body}");
         assert_eq!(body["n2SmInfoType"], "HANDOVER_PREP_FAIL");
         assert!(handover
             .http

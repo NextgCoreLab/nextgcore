@@ -2429,8 +2429,8 @@ fn an_activation_whose_ue_goes_away_is_answered() {
 #[test]
 fn an_activation_is_answered_within_the_serving_gws_transaction() {
     // #1228: sgwcd's S11 window for these Requests.
-    let sgw_window = nextgcore_gtp::v2::xact::default_t3_window(
-        nextgcore_gtp::v2::xact::SGW_BEARER_PROCEDURE_N3,
+    let sgw_window = nextgcore_gtp::v2::xact::default_n3_window(
+        nextgcore_gtp::v2::xact::SGW_BEARER_PROCEDURE_T3,
     );
     assert!(crate::bearer_activation::answer_budget() < sgw_window);
     assert_eq!(
@@ -2551,6 +2551,31 @@ fn a_late_accept_for_a_refused_bearer_deactivates_it_at_the_ue() {
         ue.mme_ue_id,
         6
     ));
+    release(&ue);
+}
+
+/// #1245 review: an EBI refused while the UE may still answer for it is not
+/// handed to the next activation within the hold: the next bearer gets 7.
+#[test]
+fn a_refused_ebi_is_not_reused_while_held() {
+    let _guard = lock_s11();
+    crate::bearer_activation::clear_for_test();
+    let (sgw, route) = sgw(Gtp2XactConfig::default());
+    let ue = attached(0x1261);
+    let ctx = mme_self();
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    let mme = route.server.local_addr();
+    sgw.send_to(&cbr(ue.local_teid, 0x1261), mme).unwrap();
+    let items = wait_pdu(ue.enb_id, erab_setup);
+    assert_eq!(items[0].0, 6);
+    crate::bearer_activation::age_for_test(ue.mme_ue_id, crate::bearer_activation::answer_budget());
+    crate::bearer_activation::sweep(ctx, Instant::now());
+    let (cause, _) = create_bearer_response(&sgw, 0x1261);
+    assert_eq!(cause, 87, "refused after the UE was signalled");
+    sgw.send_to(&cbr(ue.local_teid, 0x1262), mme).unwrap();
+    let items = wait_pdu(ue.enb_id, erab_setup);
+    assert_eq!(items[0].0, 7, "EBI 6 is held for the UE's late answer");
+    crate::bearer_activation::clear_for_test();
     release(&ue);
 }
 
