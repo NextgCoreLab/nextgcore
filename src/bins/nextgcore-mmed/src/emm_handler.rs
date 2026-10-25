@@ -1317,6 +1317,9 @@ mod tests {
                 0x19, 0xAA, 0xBB, 0xCC, // Old P-TMSI signature (TV 4)
                 0x58, 0x02, 0xF0, 0x70, // UE network capability: EEA0-3, EIA1-3
                 0x5C, 0x0A, 0x00, // DRX parameter (TV 3)
+                0x55, 0x01, 0x02, 0x03, 0x04, // Nonce_UE (TV 5)
+                0x13, 0x00, 0xF1, 0x10, 0x00, 0x01, // Old LAI (TV 6)
+                0x17, 0x02, // Additional information requested (TV 2)
                 0x57, 0x02, 0x20, 0x00, // EPS bearer context status: EBI 5
             ]),
         )
