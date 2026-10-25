@@ -7219,9 +7219,18 @@ mod tests {
             1,
             "the bearer is removed"
         );
-        let removed = sgwu_modifications(&sgwu)
-            .iter()
-            .any(|m| m.remove_pdrs.len() == 2 && m.remove_fars.len() == 2);
+        // #1224: the removal goes to the SGW-U before the PGW is answered, but
+        // the stand-in records it on its own task: wait for it.
+        let mut removed = false;
+        for _ in 0..300 {
+            removed = sgwu_modifications(&sgwu)
+                .iter()
+                .any(|m| m.remove_pdrs.len() == 2 && m.remove_fars.len() == 2);
+            if removed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert!(removed, "and its rules at the SGW-U");
         assert_eq!(crate::dedicated_bearer::pending_count(), 0);
 
