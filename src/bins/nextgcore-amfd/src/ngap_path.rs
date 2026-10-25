@@ -818,6 +818,11 @@ impl UeNasContext {
         self.registered
     }
 
+    /// The SCTP association the UE is bound to (#997 review m2).
+    pub(crate) fn association_id(&self) -> u64 {
+        self.association_id
+    }
+
     /// Whether the record names an NG association at all (#1089 review). A context
     /// created over Namf for a UE no gNB has signalled for yet has none: it is
     /// neither connected nor pageable.
@@ -829,7 +834,7 @@ impl UeNasContext {
     /// H9 runtime canary applied to the fresh `AmfUe`: the production caller
     /// passes `crate::context::nas_security_canary()` (the process-wide setting,
     /// default OFF); tests pass an explicit `false` to keep the legacy path.
-    fn new(
+    pub(crate) fn new(
         amf_ue_ngap_id: u64,
         ran_ue_ngap_id: u32,
         association_id: u64,
@@ -1808,6 +1813,7 @@ impl NgapServer {
 
     /// Handle SCTP association closure
     async fn handle_association_closed(&self, association_id: u64, reason: &str) -> Result<()> {
+        forget_association_rat(association_id);
         if let Some(session) = self.sessions.write().await.remove(&association_id) {
             log::info!(
                 "gNB {} disconnected (association {}): {}",
@@ -2520,6 +2526,8 @@ impl NgapServer {
                             session.gnb.gnb_id_len,
                             session.gnb.ng_enb_id,
                         ));
+                        // #997 review m2: what serves the UEs of this association.
+                        ctx.association_rat_set(association_id, session.gnb.rat_type);
 
                         // Build NG Setup Response with proper ASN.1 APER encoding,
                         // reporting any "notify" IEs it ignored (§10.3.4.2).
@@ -2628,6 +2636,7 @@ impl NgapServer {
     /// association is closed, so nothing it sends is processed again: no later NG
     /// Setup on it can take the Global RAN Node ID back.
     async fn drop_replaced_association(&mut self, old: u64) {
+        forget_association_rat(old);
         self.sessions.write().await.remove(&old);
         self.assoc_to_addr.write().await.remove(&old);
         self.outbound_streams.remove(&old);
@@ -18759,6 +18768,7 @@ impl NgapServer {
 
     /// Close a gNB session
     pub async fn close_session(&self, association_id: u64) -> Result<()> {
+        forget_association_rat(association_id);
         if let Some(session) = self.sessions.write().await.remove(&association_id) {
             log::info!(
                 "Closed gNB session {} (association {})",
@@ -20450,6 +20460,14 @@ fn fresh_context_for_initial_registration(
     }
     state.amf_ue.access_type = 1; // 3GPP access
     Some(state)
+}
+
+/// Drop a gone association's RAT (#997 review m2).
+fn forget_association_rat(association_id: u64) {
+    crate::context::amf_self()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .association_rat_remove(association_id);
 }
 
 fn apply_user_location(

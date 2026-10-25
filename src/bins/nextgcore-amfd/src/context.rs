@@ -639,6 +639,10 @@ pub struct AmfContext {
     /// N1N2MessageTransfers for CM-CONNECTED UEs awaiting NGAP egress (#666).
     /// Same shape and reason as `network_dereg_queue`.
     connected_downlink_queue: RwLock<Vec<PendingConnectedDownlink>>,
+    /// The RAT of each NG-RAN node's association, as its NG Setup established it
+    /// (#997 review m2): an ng-eNB is E-UTRA. Read with a UE's live association to
+    /// tell the LMF selection what serves the UE.
+    association_rat: RwLock<HashMap<u64, RatType>>,
 
     /// PWS N2 relay queue (#396, TS 29.518 §5.2.2.4.1.3 / TS 38.413 §8.12):
     /// warning containers a CBCF/PWS-IWF handed the AMF over
@@ -1294,6 +1298,7 @@ impl AmfContext {
             amf_status_subscriptions: RwLock::new(HashMap::new()),
             network_dereg_queue: RwLock::new(Vec::new()),
             connected_downlink_queue: RwLock::new(Vec::new()),
+            association_rat: RwLock::new(HashMap::new()),
             pws_n2_queue: RwLock::new(Vec::new()),
             non_ue_nrppa_queue: RwLock::new(Vec::new()),
             non_ue_n2_subscriptions: RwLock::new(HashMap::new()),
@@ -1710,6 +1715,37 @@ impl AmfContext {
         }?;
         let amf_ue_list = self.amf_ue_list.read().ok()?;
         amf_ue_list.get(&id).cloned()
+    }
+
+    /// Record the RAT of the node on `association_id` (#997 review m2).
+    pub fn association_rat_set(&self, association_id: u64, rat: RatType) {
+        if let Ok(mut m) = self.association_rat.write() {
+            m.insert(association_id, rat);
+        }
+    }
+
+    /// Forget a closed association's RAT.
+    pub fn association_rat_remove(&self, association_id: u64) {
+        if let Ok(mut m) = self.association_rat.write() {
+            m.remove(&association_id);
+        }
+    }
+
+    /// The RAT of the node serving the UE `amf_ue_ngap_id`, from the association its
+    /// live record is bound to (NR when either is unknown).
+    pub fn serving_rat_of_ue(&self, amf_ue_ngap_id: u64) -> RatType {
+        let Some(association_id) = self
+            .ue_store
+            .get(amf_ue_ngap_id)
+            .map(|s| s.association_id())
+        else {
+            return RatType::default();
+        };
+        self.association_rat
+            .read()
+            .ok()
+            .and_then(|m| m.get(&association_id).copied())
+            .unwrap_or_default()
     }
 
     /// The live-UE store, shared rather than copied (#341).
