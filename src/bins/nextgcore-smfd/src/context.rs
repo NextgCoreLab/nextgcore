@@ -986,9 +986,12 @@ pub struct HandoverInfo {
     pub n3_ul_pdr_id: Option<u16>,
     /// #583: the AMF indicated direct data forwarding (TS 29.502 `directForwardingFlag`).
     pub direct_data_forwarding: bool,
-    /// #583: the EPS bearers whose indirect forwarding tunnel this handover installed at the
-    /// UPF (TS 23.502 §4.11.1.2.2.2 step 12), released by the step-14 timer or on CANCELLED.
-    pub forwarding_ebis: Vec<u8>,
+    /// The indirect forwarding tunnels this handover installed at the UPF, released by the
+    /// indirect data forwarding timer after execution or on CANCELLED. Each id keys one
+    /// forwarding PDR and QER (`eps_to_5gs::FORWARDING_RULE_BASE` + id):
+    /// - #583, an EPS→5GS handover: the EPS bearers' EBIs (TS 23.502 §4.11.1.2.2.2 step 12);
+    /// - #982, an intra-5GS N2 handover: the QFIs forwarded (TS 23.502 §4.9.1.3.2 step 11d).
+    pub forwarding_ids: Vec<u8>,
 }
 
 /// Charging info
