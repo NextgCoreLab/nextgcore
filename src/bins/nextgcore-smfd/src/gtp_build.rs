@@ -1174,10 +1174,17 @@ pub fn build_create_bearer_request(
     bearer: &SmfBearer,
     linked_ebi: u8,
     tft: &[u8],
+    pti: Option<u8>,
 ) -> Vec<u8> {
-    let mut builder = Gtp2MessageBuilder::new(gtp2_message_type::CREATE_BEARER_REQUEST)
-        .teid(sess.sgw_s5c_teid)
-        .add_ebi(linked_ebi, 0); // Linked EPS Bearer ID
+    let mut builder =
+        Gtp2MessageBuilder::new(gtp2_message_type::CREATE_BEARER_REQUEST).teid(sess.sgw_s5c_teid);
+    // TS 29.274 Table 7.2.3-1: the PTI is present when the procedure answers a UE's
+    // Bearer Resource Command (TS 23.401 §5.4.5), so the UE can correlate the activation
+    // with its own request.
+    if let Some(pti) = pti {
+        builder = builder.add_pti(pti);
+    }
+    builder = builder.add_ebi(linked_ebi, 0); // Linked EPS Bearer ID
 
     // Bearer Context
     let bearer_f_teid_interface = match sess.gtp_rat_type {
@@ -1185,20 +1192,24 @@ pub fn build_create_bearer_request(
         gtp2_rat_type::WLAN => gtp2_f_teid_interface::S2B_U_PGW_GTP_U,
         _ => gtp2_f_teid_interface::S5_S8_PGW_GTP_U,
     };
-
+    // #619: the bearer's rates are held in bit/s, as the 5GC flows' are and as N4 and
+    // the EPS→5GS mapping (#583) read them; TS 29.274 §8.15 codes them in kbit/s.
+    let kbps = |bps: u64| bps.div_ceil(1000);
     let bearer_qos = BearerQos {
         qci: bearer.qos.index,
         priority_level: bearer.qos.arp_priority_level,
         pre_emption_capability: bearer.qos.arp_preempt_cap,
         pre_emption_vulnerability: bearer.qos.arp_preempt_vuln,
-        ul_mbr: bearer.qos.mbr_uplink,
-        dl_mbr: bearer.qos.mbr_downlink,
-        ul_gbr: bearer.qos.gbr_uplink,
-        dl_gbr: bearer.qos.gbr_downlink,
+        ul_mbr: kbps(bearer.qos.mbr_uplink),
+        dl_mbr: kbps(bearer.qos.mbr_downlink),
+        ul_gbr: kbps(bearer.qos.gbr_uplink),
+        dl_gbr: kbps(bearer.qos.gbr_downlink),
     };
 
-    // Table 7.2.3-2: the TFT is mandatory, and so is the Charging Id on S5/S8 ("shall
-    // be sent on the S5/S8 interface"); neither was (#1113 review).
+    // TS 29.274 §7.2.3: the EBI of a bearer to be created is set to 0 by the PGW. The
+    // MME assigns it and returns it in the Create Bearer Response. Table 7.2.3-2: the
+    // TFT is mandatory, and so is the Charging Id on S5/S8 ("shall be sent on the
+    // S5/S8 interface"); neither was (#1113 review).
     let mut bc_builder = builder
         .start_bearer_context(0)
         .add_ebi(bearer.ebi)
@@ -1621,7 +1632,7 @@ mod tests {
         // Create new TFT, one bidirectional filter (id 1, precedence 16): UDP
         // (TS 24.008 §10.5.6.12).
         let tft = [0x21, 0x31, 0x10, 0x02, 0x30, 0x11];
-        let msg = build_create_bearer_request(&sess, &bearer, 5, &tft);
+        let msg = build_create_bearer_request(&sess, &bearer, 5, &tft, None);
         #[rustfmt::skip]
         let expected: &[u8] = &[
             // Header: type 95; length 79; SGW S5-C TEID 3.

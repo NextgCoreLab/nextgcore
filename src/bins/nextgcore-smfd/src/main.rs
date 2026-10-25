@@ -32,7 +32,9 @@ use std::sync::Arc;
 mod binding;
 mod context;
 mod easdf; // #114: EASDF selection + DNS-context lifecycle (TS 23.501 §5.6.7)
+mod eps_bearer; // #619: PGW-C dedicated EPS bearer activation over S5/S8 (TS 23.401 §5.4.1)
 mod eps_iwk; // #117: 5GS↔EPS interworking, EBI assignment over Namf_Communication
+mod eps_tft; // #619: the EPS TFT / TAD coding (TS 24.008 §10.5.6.12)
 mod eps_to_5gs; // #475: EPS→5GS handover over N26, the PGW-C+SMF side (TS 23.502 §4.11.1.2.2)
 mod event;
 mod event_exposure; // #79: Nsmf_EventExposure resource model + notification
@@ -482,6 +484,8 @@ struct SmfSection {
     dns: Option<Vec<String>>,
     /// IPv4 link MTU signalled in the same IE.
     mtu: Option<u16>,
+    /// #619: PCC rules this PGW-C activates locally as dedicated EPS bearers.
+    pcc_rules: Option<Vec<eps_bearer::LocalPccRule>>,
 }
 
 /// Root YAML document
@@ -508,6 +512,8 @@ struct SmfConfig {
     gtpc_addr: Option<String>,
     /// S5/S8 GTP-C port. TS 29.274 §4.1 fixes GTPv2-C at UDP 2123.
     gtpc_port: u16,
+    /// #619: `smf.pcc_rules`, the local PCC rules the S5/S8 role activates.
+    pcc_rules: Vec<eps_bearer::LocalPccRule>,
 }
 
 impl Default for SmfConfig {
@@ -523,6 +529,7 @@ impl Default for SmfConfig {
             mtu: None,
             gtpc_addr: None,
             gtpc_port: 2123,
+            pcc_rules: Vec::new(),
         }
     }
 }
@@ -582,6 +589,7 @@ fn load_config(path: &str) -> SmfConfig {
             }
         }
         config.mtu = smf.mtu;
+        config.pcc_rules = smf.pcc_rules.unwrap_or_default();
 
         // S5/S8 bind address (#52). Only the first entry is bound; a second is named
         // in a warning rather than silently ignored, matching how `sbi.server` and
@@ -678,7 +686,7 @@ async fn main() -> Result<()> {
     .expect("Failed to set Ctrl+C handler");
 
     // Load configuration (the path was resolved before the logger, above).
-    let config = load_config(&config_path);
+    let mut config = load_config(&config_path);
     log::info!("Loading configuration from {config_path}");
     log::info!(
         "SBI config: address={}, port={}",
@@ -1034,7 +1042,7 @@ async fn main() -> Result<()> {
     // Recovery counter for S5/S8. Derived from the process start rather than persisted:
     // smfd has no restart-counter file, and inventing one here would be a second answer
     // to a question mmed and sgwcd already answer their own way. Stated as a ceiling.
-    if let Err(e) = gtp_path::s5s8_open(s5s8_bind, 1).await {
+    if let Err(e) = gtp_path::s5s8_open(s5s8_bind, 1, std::mem::take(&mut config.pcc_rules)).await {
         log::error!("Failed to bind the S5/S8 GTP-C socket: {e}");
         return Err(anyhow::anyhow!("S5/S8 bind failed: {e}"));
     }
@@ -10034,7 +10042,7 @@ mod tests {
         let (upf, seen, upf_task) = raw_upf(None).await;
         let (client, listener) = client_behind_the_real_listener(upf).await;
         // Process-wide, once; nothing else in the suite installs it (S5S8_SERVER).
-        gtp_path::s5s8_open(Some("127.0.0.1:0".parse().unwrap()), 1)
+        gtp_path::s5s8_open(Some("127.0.0.1:0".parse().unwrap()), 1, Vec::new())
             .await
             .expect("S5/S8");
         let sgw = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
