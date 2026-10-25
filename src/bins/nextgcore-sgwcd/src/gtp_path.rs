@@ -89,6 +89,10 @@ struct GtpcInner {
     /// Commands relayed MME -> PGW and awaiting their triggered message, keyed by
     /// (PGW peer, S5-C sequence number) (#591).
     command_relays: Mutex<HashMap<(SocketAddr, u32), CommandRelay>>,
+    /// Change Notification Requests relayed MME -> PGW and awaiting the PGW's
+    /// response, keyed by (PGW peer, S5-C sequence number) (#614). The value is
+    /// where the MME expects the answer, as for a Command.
+    change_notifications: Mutex<HashMap<(SocketAddr, u32), CommandRelay>>,
     running: AtomicBool,
 }
 
@@ -132,6 +136,7 @@ impl GtpcServer {
             peer_restart: Mutex::new(HashMap::new()),
             peer_state: Mutex::new(HashMap::new()),
             command_relays: Mutex::new(HashMap::new()),
+            change_notifications: Mutex::new(HashMap::new()),
             running: AtomicBool::new(true),
         });
 
@@ -196,6 +201,12 @@ impl GtpcServer {
                                 states.insert(xact.peer, GtpPathState::Failed);
                             }
                             if let Ok(mut relays) = inner.command_relays.lock() {
+                                relays.remove(&(xact.peer, xact.sequence_number));
+                            }
+                            // #614: a PGW that never answers a relayed Change
+                            // Notification leaves no relay behind; TS 29.274
+                            // §7.3.15 lets the MME go without the answer.
+                            if let Ok(mut relays) = inner.change_notifications.lock() {
                                 relays.remove(&(xact.peer, xact.sequence_number));
                             }
                             // #1025: a PGW that never answers a relayed Delete
@@ -347,6 +358,16 @@ impl GtpcServer {
     /// waiting for its triggered message (#606).
     fn command_relay_in_flight(&self, mme_peer: SocketAddr, mme_seq: u32) -> bool {
         self.inner.command_relays.lock().is_ok_and(|relays| {
+            relays
+                .values()
+                .any(|r| r.mme_peer == mme_peer && r.mme_seq == mme_seq)
+        })
+    }
+
+    /// Whether the MME's Change Notification at (`mme_peer`, `mme_seq`) is relayed
+    /// and not yet answered (#614).
+    fn change_notification_in_flight(&self, mme_peer: SocketAddr, mme_seq: u32) -> bool {
+        self.inner.change_notifications.lock().is_ok_and(|relays| {
             relays
                 .values()
                 .any(|r| r.mme_peer == mme_peer && r.mme_seq == mme_seq)
@@ -810,6 +831,8 @@ fn handle_datagram(inner: &Arc<GtpcInner>, data: &[u8], peer: SocketAddr) {
             || t == T::BearerResourceCommand as u8
             || t == T::DeleteBearerCommand as u8
             || t == T::ModifyBearerCommand as u8
+            // #614: an answered Change Notification gets the cached answer.
+            || t == T::ChangeNotificationRequest as u8
     );
     if is_request {
         let cached = inner
@@ -866,6 +889,13 @@ fn handle_datagram(inner: &Arc<GtpcInner>, data: &[u8], peer: SocketAddr) {
         }
         t if t == T::ModifyBearerCommand as u8 => {
             dispatch_bearer_command(&server, &msg, peer, BearerCommand::ModifyBearer);
+        }
+        // #614, TS 29.274 §7.3.14-15, TS 23.401 §5.9.2: location change reporting.
+        t if t == T::ChangeNotificationRequest as u8 => {
+            dispatch_change_notification_request(&server, &msg, peer);
+        }
+        t if t == T::ChangeNotificationResponse as u8 => {
+            relay_change_notification_response(&server, &msg, peer);
         }
         t if t == T::DownlinkDataNotificationAcknowledge as u8 => {
             let matched = inner
@@ -2900,6 +2930,165 @@ fn relay_command_to_pgw(
     }
 }
 
+/// The MME's Change Notification Request (#614, TS 29.274 §7.3.14, TS 23.401
+/// §5.9.2): relayed to the PGW of the PDN connection its LBI names, on this
+/// node's own S5-C sequence number and to the PGW's S5-C TEID. The PGW's answer
+/// comes back to the MME under the MME's number
+/// ([`relay_change_notification_response`]). A retransmission while the PGW
+/// decides is discarded; one after the answer gets the cached answer.
+///
+/// No such PDN connection: answered here with "IMSI/IMEI not known" and the CS
+/// bit 0 (§7.3.15: the SGW "shall return Change Notification Response with the
+/// CS bit set to 0", so the MME stops reporting and deletes the PDN connection
+/// locally). No PGW S5/S8 peer: "Service not supported", as for a Command.
+fn dispatch_change_notification_request(server: &GtpcServer, msg: &Gtp2Message, peer: SocketAddr) {
+    let seq = msg.header.sequence_number;
+    let ue = ue_from_header(msg);
+    let mme_teid = ue.as_ref().map(|u| u.mme_s11_teid).unwrap_or(0);
+    if server.change_notification_in_flight(peer, seq) {
+        log::debug!(
+            "Change Notification Request seq={seq} from {peer} is already relayed; discarded"
+        );
+        return;
+    }
+    let ctx = sgwc_self();
+    let lbi = msg
+        .get_ie(Gtp2IeType::Ebi as u8, 0)
+        .and_then(|ie| ie.value.first().map(|v| v & 0x0f));
+    // #1161 review: no LBI and several PDN connections names none of them.
+    // Relaying it to an arbitrary one would report location for the wrong
+    // charging session; the LBI is conditional (Table 7.3.14-1: "shall be sent
+    // by the MME/SGSN on S11/S4"), so it is answered Conditional IE missing.
+    if let (None, Some(u)) = (lbi, ue.as_ref()) {
+        if ctx.sess_list_for_ue(u.id).len() > 1 {
+            log::warn!(
+                "Change Notification Request from {peer} (seq={seq}) has no LBI and the UE \
+                 has several PDN connections: answered Conditional IE missing"
+            );
+            let rsp = s11_build::build_error_response(
+                Gtp2MessageType::ChangeNotificationResponse as u8,
+                mme_teid,
+                seq,
+                gtp_cause::CONDITIONAL_IE_MISSING,
+                Some(Gtp2IeType::Ebi as u8),
+            );
+            if let Err(e) = server.send_response(peer, &rsp) {
+                log::error!("Change Notification Response to {peer} failed: {e}");
+            }
+            return;
+        }
+    }
+    let sess = ue.as_ref().and_then(|u| match lbi {
+        Some(lbi) => ctx
+            .bearer_find_by_ue_ebi(u.id, lbi)
+            .and_then(|b| ctx.sess_find_by_id(b.sess_id)),
+        // An earlier-release MME without the LBI: unambiguous only with one PDN
+        // connection.
+        None => {
+            let mut sessions = ctx.sess_list_for_ue(u.id);
+            (sessions.len() == 1).then(|| sessions.remove(0))
+        }
+    });
+    let Some(sess) = sess else {
+        log::warn!(
+            "Change Notification Request from {peer} (seq={seq}, LBI {lbi:?}) names no PDN \
+             connection of this SGW: answered IMSI/IMEI not known, CS 0 (TS 29.274 §7.3.15)"
+        );
+        send_cause_response(
+            server,
+            peer,
+            Gtp2MessageType::ChangeNotificationResponse,
+            mme_teid,
+            seq,
+            gtp_cause::IMSI_IMEI_NOT_KNOWN,
+        );
+        return;
+    };
+    let Some(pgw_peer) = ctx.pgw_s5c_peer() else {
+        log::info!("Change Notification Request cannot be forwarded: no PGW S5/S8 peer");
+        send_cause_response(
+            server,
+            peer,
+            Gtp2MessageType::ChangeNotificationResponse,
+            mme_teid,
+            seq,
+            gtp_cause::SERVICE_NOT_SUPPORTED,
+        );
+        return;
+    };
+    let mut relayed = msg.clone();
+    relayed.header.teid = Some(sess.pgw_s5c_teid);
+    // The MME's Recovery is not this node's (TS 23.007 §18).
+    relayed
+        .ies
+        .retain(|ie| ie.ie_type != Gtp2IeType::Recovery as u8);
+    let s5c_seq = server.alloc_sequence_to(pgw_peer);
+    relayed.header.sequence_number = s5c_seq;
+    log::info!(
+        "Relaying Change Notification Request from MME {peer} to PGW {pgw_peer} (S5-C TEID \
+         {:#x}, seq {seq} -> {s5c_seq})",
+        sess.pgw_s5c_teid
+    );
+    if let Ok(mut relays) = server.inner.change_notifications.lock() {
+        relays.insert(
+            (pgw_peer, s5c_seq),
+            CommandRelay {
+                mme_peer: peer,
+                mme_seq: seq,
+                mme_teid,
+            },
+        );
+    }
+    if let Err(e) = server.send_request(pgw_peer, &relayed, sess.id) {
+        if let Ok(mut relays) = server.inner.change_notifications.lock() {
+            relays.remove(&(pgw_peer, s5c_seq));
+        }
+        log::error!("Change Notification relay to {pgw_peer} failed: {e}");
+    }
+}
+
+/// The PGW's Change Notification Response (#614): it completes this node's S5-C
+/// transaction and goes to the MME under the MME's sequence number and to its
+/// S11 TEID, cached so the MME's retransmission is answered the same way.
+fn relay_change_notification_response(server: &GtpcServer, msg: &Gtp2Message, peer: SocketAddr) {
+    let seq = msg.header.sequence_number;
+    let completed = server.inner.xact.lock().ok().and_then(|mut x| {
+        x.match_response_from(peer, seq, Gtp2MessageType::ChangeNotificationResponse as u8)
+    });
+    let relay = completed.and_then(|_| {
+        server
+            .inner
+            .change_notifications
+            .lock()
+            .ok()?
+            .remove(&(peer, seq))
+    });
+    let Some(relay) = relay else {
+        log::warn!(
+            "Change Notification Response seq={seq} from {peer} answers nothing this node \
+             relayed; dropped"
+        );
+        return;
+    };
+    let mut relayed = msg.clone();
+    relayed.header.teid = Some(relay.mme_teid);
+    relayed.header.sequence_number = relay.mme_seq;
+    relayed
+        .ies
+        .retain(|ie| ie.ie_type != Gtp2IeType::Recovery as u8);
+    log::info!(
+        "Relaying Change Notification Response from PGW {peer} to MME {} (seq {seq} -> {})",
+        relay.mme_peer,
+        relay.mme_seq
+    );
+    if let Err(e) = server.send_response(relay.mme_peer, &relayed) {
+        log::error!(
+            "Change Notification Response relay to {} failed: {e}",
+            relay.mme_peer
+        );
+    }
+}
+
 fn dispatch_bearer_resource_command(server: &GtpcServer, msg: &Gtp2Message, peer: SocketAddr) {
     let seq = msg.header.sequence_number;
     let ue = ue_from_header(msg);
@@ -3180,13 +3369,19 @@ mod tests {
     /// after `delay`, which is what makes "no Create Session Response until the SGW-U
     /// answers" observable rather than asserted.
     struct StandInSgwu {
-        /// Requests the stand-in received, as (msg_type, seid, body).
+        /// Datagrams the stand-in received, as (msg_type, seid, body): one entry
+        /// per datagram, PFCP T1 retransmissions included. To count or index
+        /// requests use [`Self::received`] and [`Self::requests`] (#1160 review).
         seen: std::sync::Arc<std::sync::Mutex<Vec<(u8, Option<u64>, Vec<u8>)>>>,
         /// The stand-in's own socket, so a test can push a Session Report Request at the
         /// SGW-C the way a real SGW-U reports buffered downlink data.
         sock: std::sync::Arc<tokio::net::UdpSocket>,
         /// Where the SGW-C's Sxa socket is listening.
         sgwc_addr: SocketAddr,
+        /// (msg_type, PFCP sequence number) of each request received, so a T1
+        /// retransmission (same number, TS 29.244 §7.6) is not counted twice
+        /// (#1158).
+        seqs: std::sync::Arc<std::sync::Mutex<Vec<(u8, u32)>>>,
     }
 
     impl StandInSgwu {
@@ -3195,14 +3390,38 @@ mod tests {
             self.sock.local_addr().unwrap()
         }
 
-        /// Bodies the stand-in received for a message type, in order.
+        /// How many distinct requests of `msg_type` the stand-in received: a PFCP
+        /// T1 retransmission keeps its sequence number and is the same request
+        /// (#1158: counting it made `received(54) == 1` flake under load).
+        /// The bodies of the distinct requests of `msg_type`, in arrival order: a
+        /// T1 retransmission (same sequence number) is not a second request
+        /// (#1160 review). Indexes agree with [`Self::received`].
+        fn requests(&self, msg_type: u8) -> Vec<Vec<u8>> {
+            let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+            let seqs = self.seqs.lock().unwrap_or_else(|e| e.into_inner());
+            let mut taken: Vec<u32> = Vec::new();
+            let mut bodies = Vec::new();
+            for ((t, _, body), (_, seq)) in seen.iter().zip(seqs.iter()) {
+                if *t == msg_type && !taken.contains(seq) {
+                    taken.push(*seq);
+                    bodies.push(body.clone());
+                }
+            }
+            bodies
+        }
+
         fn received(&self, msg_type: u8) -> usize {
-            self.seen
+            let mut numbers: Vec<u32> = self
+                .seqs
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .iter()
-                .filter(|(t, _, _)| *t == msg_type)
-                .count()
+                .filter(|(t, _)| *t == msg_type)
+                .map(|(_, seq)| *seq)
+                .collect();
+            numbers.sort_unstable();
+            numbers.dedup();
+            numbers.len()
         }
 
         /// Send a Session Report Request carrying a Downlink Data Report for `seid`.
@@ -3266,6 +3485,8 @@ mod tests {
         std::env::set_var("SGWC_SGWU_ADDR", up_addr.to_string());
         std::env::set_var("SGWC_PFCP_NODE_IP", "127.0.0.1");
 
+        let seqs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let numbered = seqs.clone();
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = seen.clone();
         let handle = up.clone();
@@ -3289,6 +3510,10 @@ mod tests {
                     header.seid,
                     cursor.to_vec(),
                 ));
+                numbered
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((msg_type, header.sequence_number));
 
                 // #1001: the SGW-C sends no session message before the association
                 // (TS 29.244 §6.2.6.1), so the stand-in accepts the Association Setup.
@@ -3388,7 +3613,66 @@ mod tests {
             seen,
             sock: up,
             sgwc_addr: node.local_addr(),
+            seqs,
         }
+    }
+
+    /// #1158: a PFCP request sent twice under the same sequence number (a T1
+    /// retransmission) counts once; another number counts again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_stand_in_counts_a_retransmission_once() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let cp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let deletion = |seq: u32| {
+            let mut out = bytes::BytesMut::new();
+            let mut h = nextgcore_pfcp::header::PfcpHeader::new_with_seid(
+                nextgcore_pfcp::header::PfcpMessageType::SessionDeletionRequest,
+                0x1158,
+                seq,
+            );
+            h.length = 12;
+            h.encode(&mut out);
+            out
+        };
+        for seq in [0x1158, 0x1158, 0x1159] {
+            cp.send_to(&deletion(seq), sgwu.addr()).await.unwrap();
+        }
+        for _ in 0..300 {
+            if sgwu
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(t, _, _)| *t == 54)
+                .count()
+                == 3
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            sgwu.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(t, _, _)| *t == 54)
+                .count(),
+            3,
+            "all three datagrams arrived"
+        );
+        assert_eq!(sgwu.received(54), 2, "the retransmission counts once");
+        assert_eq!(
+            sgwu.requests(54).len(),
+            2,
+            "requests() agrees with received(), so it can be indexed by it"
+        );
     }
 
     /// Receive one S11 message with a bounded wait, from a blocking socket inside an async
@@ -5727,13 +6011,9 @@ mod tests {
             assert_eq!(dl.remote_ip.ipv4, expect_v4);
 
             let body = sgwu
-                .seen
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|(t, _, _)| *t == 52)
+                .requests(52)
+                .into_iter()
                 .nth(before)
-                .map(|(_, _, b)| b.clone())
                 .expect("the Session Modification reached the SGW-U");
             let req =
                 nextgcore_pfcp::message::SessionModificationRequest::decode(&mut Bytes::from(body))
@@ -6075,6 +6355,174 @@ mod tests {
         bc.set_ebi(ebi);
         msg.add_bearer_context(0, &bc);
         msg
+    }
+
+    /// #614, TS 29.274 §7.3.14-15, TS 23.401 §5.9.2: the MME's Change Notification
+    /// Request reaches the PGW of the PDN connection its LBI names, on this node's
+    /// S5-C number and to the PGW's S5-C TEID, without the MME's Recovery. The
+    /// PGW's answer reaches the MME under the MME's number and S11 TEID. A
+    /// retransmission while the PGW decides is not relayed again; one after the
+    /// answer gets the same answer. An LBI naming no PDN connection is answered
+    /// here: IMSI/IMEI not known, CS 0. No PGW peer: Service not supported.
+    #[test]
+    fn a_change_notification_is_relayed_to_the_pgw_and_answered() {
+        let ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let server = test_server(&ambient, 2000, 3);
+        let mme = client();
+        let pgw = client();
+        sgwc_self().set_pgw_s5c_peer(Some(pgw.local_addr().unwrap()));
+        let (ue_id, s11_teid, s5c_teid) =
+            ue_with_pgw_session(mme.local_addr().unwrap(), b"001010614000001");
+        let cnr = |seq: u32, lbi: u8| {
+            let mut m = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+                Gtp2MessageType::ChangeNotificationRequest as u8,
+                s11_teid,
+                seq,
+            ));
+            m.add_ie(Gtp2Ie::from_slice(Gtp2IeType::RatType as u8, 0, &[6]));
+            m.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Ebi as u8, 0, &[lbi]));
+            m.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Recovery as u8, 0, &[9]));
+            m.encode()
+        };
+        let mut buf = [0u8; 2048];
+        let quiet = |sock: &UdpSocket, buf: &mut [u8]| {
+            sock.set_read_timeout(Some(Duration::from_millis(250)))
+                .unwrap();
+            let q = sock.recv_from(buf).is_err();
+            sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            q
+        };
+
+        mme.send_to(&cnr(0x0614, 5), server.local_addr()).unwrap();
+        let at_pgw = recv_msg(&pgw);
+        assert_eq!(
+            at_pgw.header.message_type,
+            Gtp2MessageType::ChangeNotificationRequest as u8
+        );
+        assert_eq!(at_pgw.header.teid, Some(0x0000_5c5c), "the PGW's S5-C TEID");
+        assert!(
+            at_pgw.get_ie(Gtp2IeType::Recovery as u8, 0).is_none(),
+            "the MME's Recovery is not this SGW's"
+        );
+        assert!(
+            at_pgw.get_ie(Gtp2IeType::Ebi as u8, 0).is_some(),
+            "the LBI is forwarded"
+        );
+        let s5c_seq = at_pgw.header.sequence_number;
+        // The MME retransmits before the PGW answers: not relayed again.
+        mme.send_to(&cnr(0x0614, 5), server.local_addr()).unwrap();
+        assert!(quiet(&pgw, &mut buf), "relayed once");
+
+        let mut rsp = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+            Gtp2MessageType::ChangeNotificationResponse as u8,
+            s5c_teid,
+            s5c_seq,
+        ));
+        rsp.add_ie(Gtp2CauseIe::new(gtp_cause::REQUEST_ACCEPTED).to_ie(0));
+        pgw.send_to(&rsp.encode(), server.local_addr()).unwrap();
+        let at_mme = recv_msg(&mme);
+        assert_eq!(
+            at_mme.header.message_type,
+            Gtp2MessageType::ChangeNotificationResponse as u8
+        );
+        assert_eq!(at_mme.header.sequence_number, 0x0614, "the MME's number");
+        assert_eq!(at_mme.header.teid, Some(0x0000_0591), "the MME's S11 TEID");
+        assert_eq!(
+            Gtp2CauseIe::decode(&at_mme.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value)
+                .unwrap()
+                .cause,
+            gtp_cause::REQUEST_ACCEPTED
+        );
+        // Retransmitted after the answer: the cached answer, nothing to the PGW.
+        mme.send_to(&cnr(0x0614, 5), server.local_addr()).unwrap();
+        assert_eq!(recv_msg(&mme).header.sequence_number, 0x0614);
+        assert!(quiet(&pgw, &mut buf), "the PGW is not asked again");
+        assert!(server.inner.change_notifications.lock().unwrap().is_empty());
+        assert_eq!(server.inner.xact.lock().unwrap().outstanding(), 0);
+
+        // No such PDN connection: answered here, IMSI/IMEI not known, CS 0.
+        mme.send_to(&cnr(0x0615, 9), server.local_addr()).unwrap();
+        let rsp = recv_msg(&mme);
+        let cause =
+            Gtp2CauseIe::decode(&rsp.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value).unwrap();
+        assert_eq!(cause.cause, gtp_cause::IMSI_IMEI_NOT_KNOWN);
+        assert!(!cause.cs, "CS 0: the PDN connection is not in the SGW");
+        assert!(quiet(&pgw, &mut buf));
+
+        // No PGW peer at all.
+        sgwc_self().set_pgw_s5c_peer(None);
+        mme.send_to(&cnr(0x0616, 5), server.local_addr()).unwrap();
+        let rsp = recv_msg(&mme);
+        assert_eq!(
+            rsp.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value[0],
+            gtp_cause::SERVICE_NOT_SUPPORTED
+        );
+        sgwc_self().ue_remove(ue_id);
+        server.close();
+    }
+
+    /// #1161 review: the PGW's Recovery in its answer is not relayed to the MME as
+    /// this SGW's (TS 23.007 §18). A CNR without an LBI goes to the UE's only PDN
+    /// connection; with several, it names none, and is answered Conditional IE
+    /// missing (offending IE: EBI) instead of reaching an arbitrary PGW session.
+    #[test]
+    fn a_change_notification_answer_and_the_lbi_less_request() {
+        let ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let server = test_server(&ambient, 2000, 3);
+        let mme = client();
+        let pgw = client();
+        sgwc_self().set_pgw_s5c_peer(Some(pgw.local_addr().unwrap()));
+        let (ue_id, s11_teid, s5c_teid) =
+            ue_with_pgw_session(mme.local_addr().unwrap(), b"001010614000002");
+        let cnr = |seq: u32| {
+            let mut m = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+                Gtp2MessageType::ChangeNotificationRequest as u8,
+                s11_teid,
+                seq,
+            ));
+            m.add_ie(Gtp2Ie::from_slice(Gtp2IeType::RatType as u8, 0, &[6]));
+            m.encode()
+        };
+        // One PDN connection, no LBI: relayed to it.
+        mme.send_to(&cnr(0x0617), server.local_addr()).unwrap();
+        let at_pgw = recv_msg(&pgw);
+        assert_eq!(at_pgw.header.teid, Some(0x0000_5c5c));
+        let mut rsp = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+            Gtp2MessageType::ChangeNotificationResponse as u8,
+            s5c_teid,
+            at_pgw.header.sequence_number,
+        ));
+        rsp.add_ie(Gtp2CauseIe::new(gtp_cause::REQUEST_ACCEPTED).to_ie(0));
+        rsp.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Recovery as u8, 0, &[7]));
+        pgw.send_to(&rsp.encode(), server.local_addr()).unwrap();
+        let at_mme = recv_msg(&mme);
+        assert_eq!(at_mme.header.sequence_number, 0x0617);
+        assert!(
+            at_mme.get_ie(Gtp2IeType::Recovery as u8, 0).is_none(),
+            "the PGW's Recovery is not this SGW's"
+        );
+
+        // A second PDN connection: no LBI names none of them.
+        let ctx = sgwc_self();
+        let mut sess2 = ctx.sess_add(ue_id, "ims").expect("sess");
+        sess2.pgw_s5c_teid = 0x0000_6c6c;
+        ctx.sess_update(&sess2);
+        let mut b6 = ctx.bearer_add(sess2.id).expect("bearer");
+        b6.ebi = 6;
+        ctx.bearer_update(&b6);
+        mme.send_to(&cnr(0x0618), server.local_addr()).unwrap();
+        let rsp = recv_msg(&mme);
+        let cause =
+            Gtp2CauseIe::decode(&rsp.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value).unwrap();
+        assert_eq!(cause.cause, gtp_cause::CONDITIONAL_IE_MISSING);
+        assert_eq!(cause.offending_ie_type, Some(Gtp2IeType::Ebi as u8));
+        pgw.set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        let mut buf = [0u8; 2048];
+        assert!(pgw.recv_from(&mut buf).is_err(), "not relayed to either");
+        sgwc_self().set_pgw_s5c_peer(None);
+        sgwc_self().ue_remove(ue_id);
+        server.close();
     }
 
     /// #606: the MME's Delete Bearer Command and Modify Bearer Command reach the PGW of

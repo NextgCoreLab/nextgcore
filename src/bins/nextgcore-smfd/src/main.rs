@@ -4914,8 +4914,11 @@ fn activation_response(sm_context_ref: &str) -> SbiResponse {
 /// from what establishment recorded -- the UPF's N3 uplink endpoint (the target sends
 /// uplink to the same UPF) and the session's QoS flow. The source's Handover Required
 /// Transfer says whether a direct forwarding path exists; with one, the transfer tells
-/// the target so, and without one Data Forwarding Not Possible is set, because this SMF
-/// sets up no indirect forwarding for an intra-5GS handover.
+/// the target so. Without one, #982, TS 23.502 §4.9.1.3.2 step 7: forwarding is indirect,
+/// through this session's UPF (steps 11d-11f, at PREPARED), so the target is told nothing
+/// and may assign a DL forwarding tunnel; Data Forwarding Not Possible is set only when
+/// the operator declared that there is no indirect connectivity
+/// ([`eps_to_5gs::n2_indirect_forwarding_connectivity`]).
 ///
 /// 500 SYSTEM_FAILURE when establishment recorded no UPF endpoint or binding: the AMF
 /// then leaves the session out of the handover.
@@ -4954,10 +4957,11 @@ fn handover_preparing_response(sm_context_ref: &str, required: Option<&[u8]>) ->
         }
         None => false,
     };
+    let indirect = !direct && eps_to_5gs::n2_indirect_forwarding_connectivity();
     let n2 = match n2_transfer::setup_request_transfer(&n2_transfer::SetupRequest {
         ambr: None,
         ul_tunnel: (upf_teid, upf_addr),
-        data_forwarding_not_possible: !direct,
+        data_forwarding_not_possible: !direct && !indirect,
         direct_forwarding_path_availability: direct,
         flows: vec![n2_transfer::QosFlowSetup {
             qfi: binding.qfi,
@@ -4980,9 +4984,13 @@ fn handover_preparing_response(sm_context_ref: &str, required: Option<&[u8]>) ->
         }
     };
     // A new preparation starts from nothing: what an earlier, abandoned one learned
-    // about its target must not be switched to.
+    // about its target must not be switched to, and the forwarding tunnels it installed
+    // are released (#982).
+    eps_to_5gs::supersede_forwarding(sm_context_ref, &sess);
     sess.handover = context::HandoverInfo {
         direct_data_forwarding: direct,
+        indirect_data_forwarding: indirect,
+        data_forwarding_not_possible: !direct && !indirect,
         ..Default::default()
     };
     if let Ok(ctx) = smf_self().read() {
@@ -4990,8 +4998,8 @@ fn handover_preparing_response(sm_context_ref: &str, required: Option<&[u8]>) ->
     }
     log::info!(
         "SM Context Update (HANDOVER_REQUIRED) for ref={sm_context_ref}: PREPARING, Handover \
-         Request Transfer with UPF N3 TEID {upf_teid:#x}, direct forwarding path {direct}; \
-         user plane untouched"
+         Request Transfer with UPF N3 TEID {upf_teid:#x}, forwarding direct={direct} \
+         indirect={indirect}; user plane untouched"
     );
     let body = serde_json::json!({
         "hoState": "PREPARING",
@@ -20418,8 +20426,8 @@ mod tests {
     /// - PREPARING with the source's Handover Required Transfer is answered with the
     ///   target's Handover Request Transfer (`PDU_RES_SETUP_REQ`): the UPF's N3 uplink
     ///   and the session's QoS flow, and, because the source reports a direct
-    ///   forwarding path, Direct Forwarding Path Availability; without one, Data
-    ///   Forwarding Not Possible;
+    ///   forwarding path, Direct Forwarding Path Availability; without one, neither
+    ///   (#982: forwarding is then indirect, through the UPF);
     /// - PREPARED with the target's Acknowledge Transfer is answered with the source's
     ///   Handover Command Transfer (`HANDOVER_CMD`) naming the target's forwarding tunnel
     ///   and the flow it accepted for forwarding; the target DL tunnel is recorded and
@@ -20438,7 +20446,7 @@ mod tests {
             n2_transfer::setup_request_transfer(&n2_transfer::SetupRequest {
                 ambr: None,
                 ul_tunnel: ul,
-                data_forwarding_not_possible: !direct,
+                data_forwarding_not_possible: false,
                 direct_forwarding_path_availability: direct,
                 flows: vec![n2_transfer::QosFlowSetup {
                     qfi: 1,
@@ -20592,6 +20600,377 @@ mod tests {
             context::UpCnxState::Activated,
             "the source still serves the session"
         );
+    }
+
+    /// The target's Handover Request Acknowledge Transfer for QFI 1: its DL N3 tunnel
+    /// and, when given, a DL forwarding tunnel with forwarding accepted for QFI 1.
+    fn ho_ack_for_qfi1(dl: (u32, [u8; 4]), forwarding: Option<(u32, [u8; 4])>) -> Vec<u8> {
+        use nextgcore_ngap_gen::generated as g;
+        nextgcore_ngap_gen::encode_contained(&g::HandoverRequestAcknowledgeTransfer {
+            dl_ngu_up_tnl_information: n2_transfer::gtp_tunnel(dl),
+            dl_forwarding_up_tnl_information: forwarding.map(n2_transfer::gtp_tunnel),
+            security_result: None,
+            qos_flow_setup_response_list: g::QosFlowListWithDataForwarding(vec![
+                g::QosFlowItemWithDataForwarding {
+                    qos_flow_identifier: g::QosFlowIdentifier(1),
+                    data_forwarding_accepted: forwarding.map(|_| {
+                        g::DataForwardingAccepted(
+                            g::DataForwardingAccepted::DATA_FORWARDING_ACCEPTED,
+                        )
+                    }),
+                    ie_extensions: None,
+                },
+            ]),
+            qos_flow_failed_to_setup_list: None,
+            data_forwarding_response_drb_list: None,
+            ie_extensions: None,
+        })
+        .expect("encodes")
+    }
+
+    /// PREPARING for `reference` with a Handover Required Transfer reporting no direct
+    /// forwarding path; the answer's Handover Request Transfer, decoded.
+    async fn prepare_without_direct_path(
+        reference: &str,
+    ) -> nextgcore_ngap_gen::generated::PDUSessionResourceSetupRequestTransfer {
+        use nextgcore_ngap_gen::generated as g;
+        let required = nextgcore_ngap_gen::encode_contained(&g::HandoverRequiredTransfer {
+            direct_forwarding_path_availability: None,
+            ie_extensions: None,
+        })
+        .expect("encodes");
+        let resp = handle_sm_context_update(
+            reference,
+            &ho_update(
+                reference,
+                serde_json::json!({
+                    "hoState": "PREPARING",
+                    "n2SmInfoType": "HANDOVER_REQUIRED",
+                    "n2SmInfo": { "contentId": "n2SmInfo" },
+                }),
+                Some(required),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+        let (_, n2) = ho_answer(&resp);
+        nextgcore_ngap_gen::decode_contained::<g::PDUSessionResourceSetupRequestTransfer>(
+            &n2.expect("the Handover Request Transfer"),
+        )
+        .expect("decodes")
+    }
+
+    /// PREPARED for `reference` with `ack`; the `HANDOVER_CMD` transfer it answers with.
+    async fn prepared_command(reference: &str, ack: Vec<u8>) -> Vec<u8> {
+        let resp = handle_sm_context_update(
+            reference,
+            &ho_update(
+                reference,
+                serde_json::json!({
+                    "hoState": "PREPARED",
+                    "n2SmInfoType": "HANDOVER_REQ_ACK",
+                    "n2SmInfo": { "contentId": "n2SmInfo" },
+                }),
+                Some(ack),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+        let (root, n2) = ho_answer(&resp);
+        assert_eq!(root["hoState"], "PREPARED");
+        assert_eq!(root["n2SmInfoType"], "HANDOVER_CMD");
+        n2.expect("the Handover Command Transfer")
+    }
+
+    /// Whether the Handover Request Transfer carries Data Forwarding Not Possible.
+    fn has_dfnp(t: &nextgcore_ngap_gen::generated::PDUSessionResourceSetupRequestTransfer) -> bool {
+        use nextgcore_ngap_gen::generated as g;
+        t.protocol_i_es.0.iter().any(|ie| {
+            matches!(
+                ie.value,
+                g::PDUSessionResourceSetupRequestTransferProtocolIEs_EntryValue::Id_DataForwardingNotPossible(_)
+            )
+        })
+    }
+
+    /// Wait (bounded) until the stand-in has recorded `n` Session Modifications.
+    async fn wait_for_n4_modifications(
+        upf: &pfcp_path::stand_in::StandInUpf,
+        n: usize,
+    ) -> Vec<Vec<u8>> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let mods = upf.modification_bodies();
+            if mods.len() >= n || std::time::Instant::now() >= deadline {
+                return mods;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The Session Modification that releases the forwarding tunnel of QFI 1: Remove PDR
+    /// 0x51, Remove FAR 0x50, Remove QER 0x51.
+    fn forwarding_release_body() -> Vec<u8> {
+        n4_build::build_session_modification_request(&n4_build::SessionModificationParams {
+            remove_pdr_ids: vec![0x51],
+            remove_far_ids: vec![0x50],
+            remove_qer_ids: vec![0x51],
+            ..Default::default()
+        })
+    }
+
+    /// **#982, TS 23.502 §4.9.1.3.2 steps 7 and 11d-11f, §4.9.1.3.3 step 11.** An
+    /// intra-5GS N2 handover whose source reports no direct forwarding path forwards
+    /// INDIRECTLY, through the session's UPF:
+    ///
+    /// - PREPARING's Handover Request Transfer carries no Data Forwarding Not Possible,
+    ///   so the target may assign a DL forwarding tunnel;
+    /// - PREPARED has the UPF allocate a forwarding tunnel (a PDR on a CHOOSE F-TEID with
+    ///   QFI 1, a QER keeping QFI 1, a FAR toward the target's forwarding tunnel), and
+    ///   the Handover Command Transfer names the UPF's tunnel and QFI 1;
+    /// - COMPLETED starts the indirect data forwarding timer, whose expiry removes the
+    ///   tunnel;
+    /// - a second preparation before the timer expires releases the first tunnel before
+    ///   installing its own, and its CANCELLED removes that; the first timer then does
+    ///   nothing.
+    #[tokio::test]
+    async fn an_n2_handover_without_a_direct_path_forwards_through_the_upf() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        std::env::remove_var("SMF_N2_INDIRECT_FORWARDING");
+        std::env::set_var("SMF_INDIRECT_FORWARDING_TIMER_MS", "400");
+        let upf = pfcp_path::stand_in::install_stand_in_upf().await;
+        upf.client.associate().await.expect("association");
+        let reference = seed_registered_session("imsi-001010000000982", 5, "internet");
+        seed_user_plane(&reference, (0x0009_8200, [10, 45, 0, 98]));
+        seed_session(&reference, Some(upf.upf_seid), None);
+        upf.clear_seen();
+        let (target_dl, target_fwd) = (
+            (0x0000_D982u32, [10, 9, 8, 2]),
+            (0x0000_F982u32, [10, 9, 8, 3]),
+        );
+
+        let request = prepare_without_direct_path(&reference).await;
+        assert!(
+            !has_dfnp(&request),
+            "indirect connectivity exists through the UPF: no Data Forwarding Not Possible"
+        );
+        let command =
+            prepared_command(&reference, ho_ack_for_qfi1(target_dl, Some(target_fwd))).await;
+        let mods = upf.modification_bodies();
+        assert_eq!(
+            mods.len(),
+            1,
+            "one N4 modification installs the tunnel: {mods:02x?}"
+        );
+        let has = |b: &[u8], needle: &[u8]| b.windows(needle.len()).any(|w| w == needle);
+        assert!(
+            has(&mods[0], &[0x00, 0x15, 0x00, 0x02, 0x0D, 0x50]),
+            "the PDR's F-TEID is CHOSEN by the UPF with the shared CHOOSE ID: {:02x?}",
+            mods[0]
+        );
+        assert!(
+            has(&mods[0], &[0x00, 0x7C, 0x00, 0x01, 0x01]),
+            "QFI 1 is detected and kept: {:02x?}",
+            mods[0]
+        );
+        assert!(
+            has(&mods[0], &[0x00, 0x00, 0xF9, 0x82, 10, 9, 8, 3]),
+            "the FAR's Outer Header Creation names the target's forwarding tunnel: {:02x?}",
+            mods[0]
+        );
+        let upf_tunnel = (pfcp_path::stand_in::N3_STAND_IN_TEID, upf.upf_ip);
+        assert_eq!(
+            command,
+            n2_transfer::handover_command_transfer(Some((upf_tunnel, &[1]))).expect("encodes"),
+            "the Command Transfer names the UPF's forwarding tunnel, not the target's"
+        );
+        let sess = smf_self()
+            .read()
+            .unwrap()
+            .sess_find_by_sm_context_ref(&reference)
+            .expect("session");
+        assert_eq!(sess.handover.forwarding_ids, vec![1]);
+
+        // Execution, then the timer's release.
+        let resp = handle_sm_context_update(
+            &reference,
+            &ho_update(
+                &reference,
+                serde_json::json!({ "hoState": "COMPLETED" }),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+        let mods = wait_for_n4_modifications(&upf, 3).await;
+        assert_eq!(mods.len(), 3, "install, DL switch, release: {mods:02x?}");
+        assert_eq!(
+            mods[2],
+            forwarding_release_body(),
+            "the timer releases the tunnel"
+        );
+
+        // A second preparation inside the timer: the first tunnel goes first.
+        upf.clear_seen();
+        std::env::set_var("SMF_INDIRECT_FORWARDING_TIMER_MS", "60000");
+        prepare_without_direct_path(&reference).await;
+        prepared_command(&reference, ho_ack_for_qfi1(target_dl, Some(target_fwd))).await;
+        let resp = handle_sm_context_update(
+            &reference,
+            &ho_update(
+                &reference,
+                serde_json::json!({ "hoState": "COMPLETED" }),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+        prepare_without_direct_path(&reference).await;
+        prepared_command(&reference, ho_ack_for_qfi1(target_dl, Some(target_fwd))).await;
+        let mods = upf.modification_bodies();
+        assert_eq!(
+            mods.len(),
+            4,
+            "install, switch, release, install: {mods:02x?}"
+        );
+        assert_eq!(
+            mods[2],
+            forwarding_release_body(),
+            "the running timer's tunnel is released before the new one is installed"
+        );
+        assert!(has(&mods[3], &[0x00, 0x15, 0x00, 0x02, 0x0D, 0x50]));
+        let resp = handle_sm_context_update(
+            &reference,
+            &ho_update(
+                &reference,
+                serde_json::json!({ "hoState": "CANCELLED" }),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+        let mods = upf.modification_bodies();
+        assert_eq!(mods.len(), 5);
+        assert_eq!(
+            mods[4],
+            forwarding_release_body(),
+            "CANCELLED releases the tunnel"
+        );
+        let sess = smf_self()
+            .read()
+            .unwrap()
+            .sess_find_by_sm_context_ref(&reference)
+            .expect("session");
+        assert!(sess.handover.forwarding_ids.is_empty());
+        std::env::remove_var("SMF_INDIRECT_FORWARDING_TIMER_MS");
+        unseed_session(&reference);
+    }
+
+    /// **#982, TS 23.502 §4.9.1.3.2 step 7.** Data Forwarding Not Possible is for an SMF
+    /// that *"knows that there is no indirect data forwarding connectivity between source
+    /// and target"*: with `SMF_N2_INDIRECT_FORWARDING=off` the Handover Request Transfer
+    /// carries it, PREPARED installs nothing at the UPF, and the Command Transfer names no
+    /// forwarding tunnel. A target that assigns a forwarding tunnel all the same without
+    /// a direct path is not given one either.
+    #[tokio::test]
+    async fn no_indirect_connectivity_is_data_forwarding_not_possible() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        std::env::set_var("SMF_N2_INDIRECT_FORWARDING", "off");
+        let upf = pfcp_path::stand_in::install_stand_in_upf().await;
+        upf.client.associate().await.expect("association");
+        let reference = seed_registered_session("imsi-001010000009820", 5, "internet");
+        seed_user_plane(&reference, (0x0009_8201, [10, 45, 0, 98]));
+        seed_session(&reference, Some(upf.upf_seid), None);
+        upf.clear_seen();
+
+        let request = prepare_without_direct_path(&reference).await;
+        std::env::remove_var("SMF_N2_INDIRECT_FORWARDING");
+        assert!(has_dfnp(&request), "Data Forwarding Not Possible");
+        let command = prepared_command(
+            &reference,
+            ho_ack_for_qfi1(
+                (0x0000_D983, [10, 9, 8, 4]),
+                Some((0x0000_F983, [10, 9, 8, 5])),
+            ),
+        )
+        .await;
+        assert_eq!(
+            command,
+            n2_transfer::handover_command_transfer(None).expect("encodes"),
+            "no forwarding tunnel for the source"
+        );
+        assert!(
+            upf.modification_bodies().is_empty(),
+            "nothing installed at the UPF"
+        );
+        unseed_session(&reference);
+    }
+
+    /// **#982 review m1.** The Handover Command Transfer carries ONE forwarding tunnel per
+    /// session (TS 38.413 §9.3.4.10), which is why the forwarding PDRs share a CHOOSE ID
+    /// (TS 29.244 §5.5.3). A UPF that ignores it, and gives each QFI its own F-TEID, has
+    /// installed rules the source can never be told about: they are removed, and the
+    /// source is told to forward nothing.
+    #[tokio::test]
+    async fn a_upf_ignoring_the_choose_id_leaves_no_forwarding_behind() {
+        use nextgcore_ngap_gen::generated as g;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        std::env::remove_var("SMF_N2_INDIRECT_FORWARDING");
+        let upf = pfcp_path::stand_in::install_stand_in_upf().await;
+        upf.client.associate().await.expect("association");
+        upf.ignore_choose_id(true);
+        let reference = seed_registered_session("imsi-001010000009821", 5, "internet");
+        seed_user_plane(&reference, (0x0009_8202, [10, 45, 0, 98]));
+        seed_session(&reference, Some(upf.upf_seid), None);
+        upf.clear_seen();
+
+        prepare_without_direct_path(&reference).await;
+        let flow = |qfi: u8| g::QosFlowItemWithDataForwarding {
+            qos_flow_identifier: g::QosFlowIdentifier(qfi),
+            data_forwarding_accepted: Some(g::DataForwardingAccepted(
+                g::DataForwardingAccepted::DATA_FORWARDING_ACCEPTED,
+            )),
+            ie_extensions: None,
+        };
+        let ack = nextgcore_ngap_gen::encode_contained(&g::HandoverRequestAcknowledgeTransfer {
+            dl_ngu_up_tnl_information: n2_transfer::gtp_tunnel((0x0000_D984, [10, 9, 8, 6])),
+            dl_forwarding_up_tnl_information: Some(n2_transfer::gtp_tunnel((
+                0x0000_F984,
+                [10, 9, 8, 7],
+            ))),
+            security_result: None,
+            qos_flow_setup_response_list: g::QosFlowListWithDataForwarding(vec![flow(1), flow(2)]),
+            qos_flow_failed_to_setup_list: None,
+            data_forwarding_response_drb_list: None,
+            ie_extensions: None,
+        })
+        .expect("encodes");
+        let command = prepared_command(&reference, ack).await;
+        upf.ignore_choose_id(false);
+        assert_eq!(
+            command,
+            n2_transfer::handover_command_transfer(None).expect("encodes"),
+            "no forwarding tunnel for the source"
+        );
+        let mods = upf.modification_bodies();
+        assert_eq!(mods.len(), 2, "install, then remove: {mods:02x?}");
+        assert_eq!(
+            mods[1],
+            n4_build::build_session_modification_request(&n4_build::SessionModificationParams {
+                remove_pdr_ids: vec![0x51, 0x52],
+                remove_far_ids: vec![0x50],
+                remove_qer_ids: vec![0x51, 0x52],
+                ..Default::default()
+            }),
+            "the rules installed for QFIs 1 and 2 are removed"
+        );
+        let sess = smf_self()
+            .read()
+            .unwrap()
+            .sess_find_by_sm_context_ref(&reference)
+            .expect("session");
+        assert!(sess.handover.forwarding_ids.is_empty());
+        unseed_session(&reference);
     }
 
     /// A COMPLETED the SMF cannot carry out -- no target endpoint was learned at
