@@ -7792,14 +7792,19 @@ async fn trigger_network_initiated_service_request(seid: u64, qfi: Option<u8>) {
 /// §6.1.6.2.27 N2InfoContent, a RefToBinaryData). The `arp` and `5qi` of the flow the
 /// buffered packet was reported for (or the default flow) go with it, for the AMF's
 /// paging priority (TS 29.518 §6.1.6.2.18 N1N2MessageTransferReqData, TS 23.501
-/// §5.4.3.3). Without an uplink endpoint or a policy binding there is no transfer to
-/// build: the N2 information then names only the session, and the AMF activates it
-/// at the SMF (upCnxState ACTIVATING) once the UE answers.
+/// §5.4.3.3).
+///
+/// None without an uplink endpoint or a policy binding, or when the transfer does not
+/// encode (#1162 review M1): there is then no N2 SM information to send, and
+/// `ngapData` is M in N2InfoContent (TS 29.518 Table 6.1.6.2.27-1). Nor would an
+/// ACTIVATING after the UE answers help, since `activation_response` needs the same
+/// endpoint and binding; paging would only wake the UE for a Service Request that
+/// fails, at every buffered packet.
 fn paging_n1n2_body(
     psi: u8,
     qfi: Option<u8>,
     sm_context_ref: &str,
-) -> (serde_json::Value, Option<Vec<u8>>) {
+) -> Option<(serde_json::Value, Vec<u8>)> {
     let mut body = serde_json::json!({
         "pduSessionId": psi,
         "n2InfoContainer": {
@@ -7816,12 +7821,12 @@ fn paging_n1n2_body(
         lookup_upf_ul_endpoint(sm_context_ref),
         lookup_policy_binding(sm_context_ref),
     ) else {
-        log::warn!(
+        log::error!(
             "Paging for ref={sm_context_ref}: no recorded UPF uplink endpoint or policy \
-             binding, so no PDUSessionResourceSetupRequestTransfer; the AMF activates the \
-             session at the SMF instead"
+             binding, so no PDUSessionResourceSetupRequestTransfer and the session cannot \
+             be activated; not paging the UE (the data stays buffered at the UPF)"
         );
-        return (body, None);
+        return None;
     };
     let flows = session_setup_flows(sm_context_ref, &binding);
     let paged = qfi
@@ -7837,8 +7842,11 @@ fn paging_n1n2_body(
     ) {
         Ok(bytes) => bytes,
         Err(e) => {
-            log::error!("Paging for ref={sm_context_ref}: transfer encode failed: {e:?}");
-            return (body, None);
+            log::error!(
+                "Paging for ref={sm_context_ref}: transfer encode failed: {e:?}; not paging \
+                 the UE (the data stays buffered at the UPF)"
+            );
+            return None;
         }
     };
     body["n2InfoContainer"]["smInfo"]["n2InfoContent"]["ngapData"] =
@@ -7852,7 +7860,7 @@ fn paging_n1n2_body(
             "preemptVuln": if arp.pre_emptable { "PREEMPTABLE" } else { "NOT_PREEMPTABLE" },
         });
     }
-    (body, Some(transfer))
+    Some((body, transfer))
 }
 
 /// Ask the AMF to page an idle UE for buffered downlink data (#78,
@@ -7881,15 +7889,16 @@ async fn send_n1_n2_paging_request(
     };
 
     let path = format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages");
-    let (body, transfer) = paging_n1n2_body(psi, qfi, sm_context_ref);
-    let mut request = SReq::post(&path).with_body(body.to_string(), content_type::APPLICATION_JSON);
-    if let Some(transfer) = transfer {
-        request = request.with_part(nextgcore_sbi::message::SbiPart::with_content(
+    let Some((body, transfer)) = paging_n1n2_body(psi, qfi, sm_context_ref) else {
+        return;
+    };
+    let request = SReq::post(&path)
+        .with_body(body.to_string(), content_type::APPLICATION_JSON)
+        .with_part(nextgcore_sbi::message::SbiPart::with_content(
             "n2SmInfo",
             content_type::APPLICATION_NGAP,
             bytes::Bytes::from(transfer),
         ));
-    }
     let config = nextgcore_sbi::security::sbi_peer_client_config(&host, port)
         .with_connect_timeout(std::time::Duration::from_secs(2))
         .with_request_timeout(std::time::Duration::from_secs(3));
@@ -13984,10 +13993,29 @@ mod tests {
         let ctx = smf_self();
         let context = ctx.read().expect("context");
         let ue = context.ue_add_by_supi(supi).expect("ue");
-        context
+        let sm_ref = context
             .sess_add_by_psi(ue.id, psi)
             .and_then(|s| s.sm_context_ref)
-            .expect("session")
+            .expect("session");
+        // #1162 review M1: a session with no transfer to send is not paged at all.
+        context
+            .upf_ul_endpoints
+            .write()
+            .expect("w")
+            .insert(sm_ref.clone(), (0x0074_9000, [10, 45, 74, 90]));
+        let mut b = context::PolicyBinding::snapshot_default();
+        b.supi = supi.to_string();
+        b.qfi = 1;
+        b.five_qi = 9;
+        b.arp_priority_level = 8;
+        b.ambr_dl_bps = 1_000_000;
+        b.ambr_ul_bps = 1_000_000;
+        context
+            .policy_bindings
+            .write()
+            .expect("w")
+            .insert(sm_ref.clone(), b);
+        sm_ref
     }
 
     fn drop_session_for_retry(sm_ref: &str) {
@@ -13999,6 +14027,8 @@ mod tests {
             // other tests share.
             context.ue_remove(sess.smf_ue_id);
         }
+        context.upf_ul_endpoints.write().expect("w").remove(sm_ref);
+        context.policy_bindings.write().expect("w").remove(sm_ref);
     }
 
     /// A stand-in AMF that refuses every N1N2MessageTransfer with 409
@@ -22574,6 +22604,17 @@ mod tests {
                 .write()
                 .expect("endpoints")
                 .insert(reference.clone(), (0x1162_0001, [10, 45, 0, 7]));
+            // #1162 review M2: a dedicated GBR flow (QFI = EBI 7) whose 5QI and ARP
+            // differ from the default flow's, with PCI and PVI both set the other way
+            // round (TS 29.274 §8.15 disable flags: cap false = may pre-empt, vuln
+            // true = not pre-emptable).
+            let mut dedicated = context.bearer_add(sess.id).expect("bearer");
+            dedicated.ebi = 7;
+            dedicated.qos.index = 1;
+            dedicated.qos.arp_priority_level = 2;
+            dedicated.qos.arp_preempt_cap = false;
+            dedicated.qos.arp_preempt_vuln = true;
+            context.bearer_update(&dedicated);
             sess.smf_n4_seid
         };
 
@@ -22600,7 +22641,8 @@ mod tests {
             upf_addr,
             [127, 0, 0, 1],
         ))]);
-        handle_pfcp_session_report(&smf_sock, &dldr_report_packet(seid, 5), upf_addr).await;
+        // The buffered packet is on the dedicated flow.
+        handle_pfcp_session_report(&smf_sock, &dldr_report_packet(seid, 7), upf_addr).await;
         pfcp_path::clear_global_upf_for_test();
 
         let requests = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -22650,17 +22692,44 @@ mod tests {
             &t.ul_ngu_up_tnl_information;
         assert_eq!(u32::from_be_bytes(tun.gtp_teid), 0x1162_0001);
         assert_eq!(tun.transport_layer_address.octets, vec![10, 45, 0, 7]);
-        assert_eq!(t.qos_flow_setup_request_list.len(), 1);
-        assert_eq!(t.qos_flow_setup_request_list[0].qos_flow_identifier, 5);
+        let qfis: Vec<u8> = t
+            .qos_flow_setup_request_list
+            .iter()
+            .map(|f| f.qos_flow_identifier)
+            .collect();
+        assert_eq!(qfis, vec![5, 7], "every flow the session holds (#992)");
         assert_eq!(
             t.pdu_session_aggregate_maximum_bit_rate
                 .map(|a| (a.dl, a.ul)),
             Some((200_000_000, 100_000_000)),
             "the Session-AMBR, as ACTIVATING's (#992)"
         );
-        // TS 29.518 §6.1.6.2.18: the paged flow's 5QI and ARP, for paging priority.
-        assert_eq!(body["5qi"], serde_json::json!(9));
-        assert_eq!(body["arp"]["priorityLevel"], serde_json::json!(8));
+        // TS 29.518 §6.1.6.2.18: the 5QI and ARP of the flow the packet was reported
+        // for (the DLDR's QFI 7), not the default flow's, for paging priority (TS
+        // 23.501 §5.4.3.3); the ARP as TS 29.571 §5.5.4.1 encodes it.
+        assert_eq!(body["5qi"], serde_json::json!(1));
+        assert_eq!(
+            body["arp"],
+            serde_json::json!({
+                "priorityLevel": 2,
+                "preemptCap": "MAY_PREEMPT",
+                "preemptVuln": "NOT_PREEMPTABLE",
+            })
+        );
+        // A QFI no flow has, or none reported: the default flow's.
+        for qfi in [Some(9), None] {
+            let (body, _) = paging_n1n2_body(8, qfi, &reference).expect("a transfer");
+            assert_eq!(body["5qi"], serde_json::json!(9), "QFI {qfi:?}");
+            assert_eq!(
+                body["arp"],
+                serde_json::json!({
+                    "priorityLevel": 8,
+                    "preemptCap": "NOT_PREEMPT",
+                    "preemptVuln": "NOT_PREEMPTABLE",
+                }),
+                "QFI {qfi:?}"
+            );
+        }
 
         if let Ok(ctx) = smf_self().read() {
             ctx.policy_bindings.write().expect("w").remove(&reference);
@@ -22669,21 +22738,32 @@ mod tests {
         amf.stop().await.expect("stop");
     }
 
-    /// #1162: with no recorded uplink endpoint or binding there is no transfer to send.
-    /// The N2 information names the session only, with no `ngapData` (the JSON
-    /// `{qfi}` it used to carry is no RefToBinaryData), and the AMF activates it at the
-    /// SMF when the UE answers.
-    #[test]
-    fn a_paging_transfer_without_a_recorded_user_plane_names_the_session_only() {
-        let _state = crate::context::PROCESS_STATE_TEST_LOCK.blocking_lock();
-        let (body, transfer) = paging_n1n2_body(9, Some(5), "no-such-ref-1162");
-        assert!(transfer.is_none());
-        assert!(body["n2InfoContainer"]["smInfo"]["n2InfoContent"]["ngapData"].is_null());
-        assert_eq!(
-            body["n2InfoContainer"]["smInfo"]["n2InfoContent"]["ngapIeType"],
-            serde_json::json!("PDU_RES_SETUP_REQ")
-        );
-        assert!(body["5qi"].is_null() && body["arp"].is_null());
+    /// #1162 review M1: with no recorded uplink endpoint or binding there is no
+    /// transfer, so no N1N2MessageTransfer: one without `ngapData` (M, TS 29.518 Table
+    /// 6.1.6.2.27-1) is malformed, and the ACTIVATING it would lead to fails for the
+    /// same missing endpoint. Paging would only wake the UE for nothing, at every
+    /// buffered packet. A stand-in AMF sees no request.
+    #[tokio::test]
+    async fn a_session_with_no_recorded_user_plane_is_not_paged() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (amf, port, seen) = always_paging_amf(1).await;
+        let supi = "imsi-001010000011621";
+        let reference = seed_registered_session(supi, 9, "internet");
+        assert!(paging_n1n2_body(9, Some(5), &reference).is_none());
+        send_n1_n2_paging_request(
+            &format!("http://127.0.0.1:{port}"),
+            supi,
+            9,
+            Some(5),
+            &reference,
+        )
+        .await;
+        // A request, had one been sent, is answered before this returns.
+        let sent = seen.load(std::sync::atomic::Ordering::SeqCst);
+        drop_session_for_retry(&reference);
+        amf.stop().await.expect("stop");
+        assert_eq!(sent, 0, "no N1N2MessageTransfer reaches the AMF");
     }
 
     /// The other half: a DLDR for a session whose user plane is UP must NOT page.
