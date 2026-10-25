@@ -2948,6 +2948,7 @@ mod tests {
     #[tokio::test]
     async fn the_bearer_qos_rates_are_kbps_on_s5s8_and_bps_in_the_store() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         let _upf = crate::pfcp_path::stand_in::associated_upf().await;
         crate::context::smf_context_init(64, 256, 512);
         let server = crate::gtp_path::S5S8Server::open("127.0.0.1:0".parse().unwrap(), 3)
