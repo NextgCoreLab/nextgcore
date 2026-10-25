@@ -1711,6 +1711,17 @@ impl PfcpClient {
         assert_teardown_is_serialised();
         #[cfg(test)]
         TEARDOWNS_FOR_TEST.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(test)]
+        {
+            let hold = TEARDOWN_HOLD_FOR_TEST
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some((reached, proceed)) = hold {
+                reached.notify_one();
+                proceed.notified().await;
+            }
+        }
         // #720: only the sessions on THIS UPF. A pool member's restart, release or
         // heartbeat loss says nothing about the sessions on the other members, which
         // are alive; releasing them sent every UE in the pool a #39 and orphaned
@@ -1978,6 +1989,15 @@ pub async fn drain_restart_fanouts(budget: Duration) {
 #[cfg(test)]
 pub(crate) static TEARDOWNS_FOR_TEST: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+/// #1229: when set, a teardown signals the first `Notify` once it has counted itself,
+/// then waits on the second before it clears the association and its stamp. A test
+/// can then run a second detector in that window deterministically. Guarded, like
+/// every teardown, by [`N4_TEST_LOCK`].
+#[cfg(test)]
+pub(crate) static TEARDOWN_HOLD_FOR_TEST: std::sync::Mutex<
+    Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+> = std::sync::Mutex::new(None);
 
 /// Where a peer Recovery Time Stamp came from (#928 round 2, B1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -11822,17 +11822,79 @@ mod tests {
         assert!(!kept, "0x10 after 0xFFFFFF00 is a newer incarnation");
     }
 
-    /// #928 round 2 B2: the stamp's compare-and-set under one write guard. On a
-    /// multi-thread runtime, two detectors released together by a barrier see each
-    /// new stamp; exactly one tears down per stamp.
+    /// #928 round 2 B2: the stamp's compare-and-set under one write guard. Two
+    /// detectors of one new stamp tear down once.
+    ///
+    /// #1229: since #966 (review m3) the teardown clears the stored stamp with the
+    /// association, after an await. So the second detector of a stamp finds one of two
+    /// things, and neither may tear down again:
+    /// - the new stamp, when it runs inside the first detector's teardown, before the
+    ///   clear. This is driven deterministically by holding the teardown there
+    ///   (`TEARDOWN_HOLD_FOR_TEST`);
+    /// - no stamp, when it runs after the clear. It stores the stamp as a baseline.
+    ///
+    /// The test then races two detectors in 20 rounds, as before. Each round now
+    /// starts from what a re-association and its first Heartbeat leave: associated,
+    /// with the old incarnation's stamp (100) stored. When the rounds chained (round
+    /// i's stamp was round i + 1's baseline), a round tore down only if the round
+    /// before had cleared after its second detector ran. That made the count `19 != 20`
+    /// in CI, depending on how the previous round's two detectors were ordered.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_detectors_of_one_new_stamp_tear_down_once() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
         let fx = restart_fixture("92807", Duration::ZERO).await;
-        let before = pfcp_path::TEARDOWNS_FOR_TEST.load(Ordering::SeqCst);
+        let teardowns = || pfcp_path::TEARDOWNS_FOR_TEST.load(Ordering::SeqCst);
+        let rebaseline = || async {
+            fx.a.set_assoc_state_for_test(true, None, None).await;
+            fx.a.seed_peer_recovery_time_stamp(100).await;
+        };
+
+        // Inside the teardown, before the clear: the stored stamp is the new one.
+        rebaseline().await;
+        let (reached, proceed) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        *pfcp_path::TEARDOWN_HOLD_FOR_TEST.lock().unwrap() =
+            Some((reached.clone(), proceed.clone()));
+        let before = teardowns();
+        let first = {
+            let a = fx.a.clone();
+            tokio::spawn(async move { a.check_peer_restart(900).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), reached.notified())
+            .await
+            .expect("the first detector tears down");
+        *pfcp_path::TEARDOWN_HOLD_FOR_TEST.lock().unwrap() = None;
+        fx.a.check_peer_restart(900).await;
+        let inside = teardowns() - before;
+        proceed.notify_one();
+        first.await.unwrap();
+        assert_eq!(
+            inside, 1,
+            "the second detector, inside the teardown, does not tear down"
+        );
+        assert_eq!(teardowns() - before, 1);
+
+        // After the clear: no stamp stored; the second detector records a baseline.
+        rebaseline().await;
+        let before = teardowns();
+        fx.a.check_peer_restart(901).await;
+        assert_eq!(
+            fx.a.peer_recovery_time_stamp_for_test().await,
+            None,
+            "cleared"
+        );
+        fx.a.check_peer_restart(901).await;
+        assert_eq!(teardowns() - before, 1, "after the clear, a baseline");
+
+        // Raced, round by round.
         let rounds = 20u32;
+        let mut per_round = Vec::new();
         for i in 0..rounds {
+            rebaseline().await;
+            let before = teardowns();
             let stamp = 1000 + i;
             let barrier = Arc::new(tokio::sync::Barrier::new(2));
             let mut tasks = Vec::new();
@@ -11847,10 +11909,20 @@ mod tests {
             for t in tasks {
                 t.await.unwrap();
             }
+            per_round.push(teardowns() - before);
+            let left = fx.a.peer_recovery_time_stamp_for_test().await;
+            assert!(
+                left.is_none()
+                    || left == Some(nextgcore_pfcp::recovery_time::normalize_received(stamp)),
+                "round {i}: the teardown's clear, or the new stamp as a baseline: {left:?}"
+            );
         }
-        let teardowns = pfcp_path::TEARDOWNS_FOR_TEST.load(Ordering::SeqCst) - before;
         fx.teardown().await;
-        assert_eq!(teardowns, rounds as usize, "one teardown per new stamp");
+        assert_eq!(
+            per_round,
+            vec![1; rounds as usize],
+            "one teardown per new stamp, in every round"
+        );
     }
 
     /// #928 round 2 M2: an Association Release Request from a host that is not the
