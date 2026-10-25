@@ -4978,6 +4978,7 @@ mod tests {
     #[tokio::test]
     async fn an_unchanged_recovery_time_stamp_leaves_restored_sessions_alone() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
         // Serialised: this test can reach a teardown, which flushes the
         // process-global session map (see N4_TEST_LOCK).
         let _map_guard = N4_TEST_LOCK.lock().await;
