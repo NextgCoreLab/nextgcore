@@ -2224,8 +2224,16 @@ struct SessionRouting {
     peers: HashMap<u64, SocketAddr>,
 }
 
+/// How many times the routing state was read (#1150 review m5): a scope must read
+/// it once, however many sessions it covers.
+#[cfg(test)]
+pub(crate) static SESSION_ROUTING_READS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 impl SessionRouting {
     fn now() -> Self {
+        #[cfg(test)]
+        SESSION_ROUTING_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let upfs = smf_self()
             .read()
             .ok()

@@ -562,6 +562,19 @@ fn cached_nsacf(nrf_uri: &str) -> Option<NsacfEndpoint> {
     }
 }
 
+/// Drop every cached discovery that named `endpoint` (#1150 review M1): it failed a
+/// transaction, so the next resolution asks the NRF again -- after an NSACF failover
+/// the NRF names the new one.
+fn forget_cached_nsacf(endpoint: &NsacfEndpoint) {
+    if let Some(map) = NSACF_DISCOVERY_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+    {
+        map.retain(|_, (cached, _)| cached.host != endpoint.host || cached.port != endpoint.port);
+    }
+}
+
 fn cache_nsacf(nrf_uri: &str, endpoint: &NsacfEndpoint, validity: Duration) {
     NSACF_DISCOVERY_CACHE
         .lock()
@@ -630,6 +643,9 @@ pub async fn nsac_pdu_session_admit(
         Err(e) => {
             log::warn!("NSACF PDU-session admission query failed: {e}");
             client.close().await;
+            // #1150 review M1: a discovered NSACF that does not answer is
+            // discovered again next time, not reused for its whole validity.
+            forget_cached_nsacf(nsacf);
             // #1072 review m2: a request that provably never left (the connect
             // or the TLS handshake failed, #664) changed no count. Anything
             // later may have reached the NSACF and been applied.
@@ -643,6 +659,9 @@ pub async fn nsac_pdu_session_admit(
         }
     };
     client.close().await;
+    if resp.status >= 500 {
+        forget_cached_nsacf(nsacf);
+    }
 
     match resp.status {
         // All requested S-NSSAIs for this PDU session admitted.
@@ -746,6 +765,11 @@ async fn nsac_decrease(
     let client = nsacf.client();
     let result = client.post_json("/nnsacf-nsac/v1/slices/pdus", &body).await;
     client.close().await;
+    // #1150 review M1: an NSACF that does not answer, or answers 5xx, is not
+    // reused from the discovery cache.
+    if result.as_ref().map_or(true, |resp| resp.status >= 500) {
+        forget_cached_nsacf(nsacf);
+    }
     let failure = match result {
         Ok(resp) if (200..300).contains(&resp.status) => return true,
         Ok(resp) => format!(

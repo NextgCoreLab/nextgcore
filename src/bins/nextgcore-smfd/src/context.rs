@@ -1852,6 +1852,8 @@ pub struct SmfContext {
     pub persist_pending: std::sync::atomic::AtomicBool,
     /// Snapshot writes this context made: the coalescing's observable (#1075).
     pub persist_writes: std::sync::atomic::AtomicU64,
+    /// Serialises taking a snapshot with writing it (#1150 review m2).
+    persist_lock: std::sync::Mutex<()>,
     /// Whether this is the process-global context, the one a scheduled write flushes.
     /// A context of its own (a test's) persists at once instead.
     is_global: bool,
@@ -1992,6 +1994,7 @@ impl SmfContext {
             session_upfs: RwLock::new(HashMap::new()),
             persist_pending: std::sync::atomic::AtomicBool::new(false),
             persist_writes: std::sync::atomic::AtomicU64::new(0),
+            persist_lock: std::sync::Mutex::new(()),
             is_global: false,
             unrestorable_sessions: RwLock::new(Vec::new()),
             policy_bindings: RwLock::new(HashMap::new()),
@@ -2619,9 +2622,11 @@ impl SmfContext {
         }
         runtime.spawn(async {
             tokio::time::sleep(PERSIST_COALESCE).await;
-            if let Ok(ctx) = smf_self().read() {
-                ctx.flush_pending_persist();
-            }
+            // #1150 review m3: a poisoned lock still clears the pending flag and
+            // writes, or every later coalesced write would be skipped silently.
+            let handle = smf_self();
+            let ctx = handle.read().unwrap_or_else(|e| e.into_inner());
+            ctx.flush_pending_persist();
         });
     }
 
@@ -2647,6 +2652,10 @@ impl SmfContext {
         if !self.state.is_enabled() {
             return;
         }
+        // #1150 review m2: the snapshot and its write under one lock, so a coalesced
+        // write racing a synchronous one cannot rename an older snapshot over a
+        // newer one (they share the store's temp file).
+        let _writing = self.persist_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.persist_writes
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let doc = self.snapshot();

@@ -15453,6 +15453,61 @@ mod tests {
         assert_eq!(after, 2, "asked again once the validity ended");
     }
 
+    /// #1150 review M1: a discovered NSACF that fails a transaction is dropped from
+    /// the discovery cache, so the next resolution asks the NRF again -- after a
+    /// failover the NRF names the new one -- instead of reusing the dead one for its
+    /// whole validity.
+    ///
+    /// REVERT-VERIFIED: without the invalidation the dead NSACF is reused.
+    #[tokio::test]
+    async fn a_failing_nsacf_is_discovered_again() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        std::env::remove_var("NSACF_URI");
+        let down = nextgcore_sbi::test_support::down_port();
+        let dead = down.port();
+        let discoveries = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = discoveries.clone();
+        let (nrf, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |_req: SbiRequest| {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    SbiResponse::with_status(200)
+                        .with_json_body(&serde_json::json!({
+                            "validityPeriod": 3600,
+                            "nfInstances": [{
+                                "nfInstanceId": "nsacf-1150",
+                                "nfType": "NSACF",
+                                "ipv4Addresses": ["127.0.0.1"],
+                                "nfServices": [{
+                                    "serviceName": "nnsacf-nsac",
+                                    "ipEndPoints": [{ "port": dead }],
+                                }],
+                            }],
+                        }))
+                        .unwrap()
+                }
+            })
+            .await;
+        global_context()
+            .set_nrf_uri(format!("http://127.0.0.1:{}", addr.port()))
+            .await;
+        let nsacf = policy::resolve_nsacf_endpoint().await.expect("discovered");
+        let _ = policy::resolve_nsacf_endpoint().await;
+        let cached = discoveries.load(std::sync::atomic::Ordering::SeqCst);
+        let admission =
+            policy::nsac_pdu_session_admit(&nsacf, "smf-1150", "imsi-001010000011500", 5, 1, None)
+                .await;
+        let _ = policy::resolve_nsacf_endpoint().await;
+        let after = discoveries.load(std::sync::atomic::Ordering::SeqCst);
+        global_context().clear_nrf_uri().await;
+        nrf.stop().await.ok();
+        assert_eq!(cached, 1, "reused while it works");
+        assert_eq!(admission, policy::NsacAdmission::Unavailable);
+        assert_eq!(after, 2, "the failed NSACF is discovered again");
+    }
+
     /// #1075 (#1028 round 2 m2): a burst of FAR-peer changes on durable sessions is
     /// written once, not once per change, and a pending write is not lost: it lands
     /// within the coalescing delay.
@@ -15566,9 +15621,11 @@ mod tests {
                 sessions.insert(r.clone(), 1);
             }
         }
+        let reads = pfcp_path::SESSION_ROUTING_READS.load(Ordering::SeqCst);
         let started = std::time::Instant::now();
         let scope = upf.client.session_scope();
         let took = started.elapsed();
+        let reads = pfcp_path::SESSION_ROUTING_READS.load(Ordering::SeqCst) - reads;
         {
             let handle = smf_self();
             let ctx = handle.read().unwrap();
@@ -15580,6 +15637,13 @@ mod tests {
         assert!(
             scope.refs.len() >= refs.len(),
             "every session is the default UPF's"
+        );
+        // #1150 review m5: the deterministic half -- one read of the routing state
+        // for the whole scope, where there was one per session (revert-checked). The
+        // time bound is a coarse guard against a quadratic regression only.
+        assert_eq!(
+            reads, 1,
+            "the routing state is read once for 10,000 sessions"
         );
         assert!(
             took < std::time::Duration::from_secs(2),
@@ -16293,8 +16357,8 @@ mod tests {
             .unwrap()
             .iter()
             .find(|(_, b)| b.supi == supi && b.psi == 8)
-            .map(|(r, b)| (r.clone(), b.nsac_admitted));
-        if let Some((r, _)) = &reference {
+            .map(|(r, b)| (r.clone(), b.nsac_admitted, b.nsac_nf_id.clone()));
+        if let Some((r, _, _)) = &reference {
             let _ = handle_sm_context_release(r, None).await;
         }
         side_effects_settled().await;
@@ -16304,12 +16368,24 @@ mod tests {
 
         assert_eq!(resp.status, 201);
         assert_eq!(
-            reference.map(|(_, a)| a),
+            reference.as_ref().map(|(_, a, _)| *a),
             Some(true),
             "admitted is recorded"
         );
         let count = |flag: &str| bodies.iter().filter(|b| b.contains(flag)).count();
         assert_eq!((count("INCREASE"), count("DECREASE")), (1, 1), "{bodies:?}");
+        // #1150 review m1: the create records the nfId its INCREASE carried, and the
+        // DECREASE names the same one.
+        let increase: serde_json::Value =
+            serde_json::from_str(bodies.iter().find(|b| b.contains("INCREASE")).unwrap()).unwrap();
+        assert_eq!(
+            reference.and_then(|(_, _, id)| id),
+            increase["nfId"].as_str().map(str::to_string),
+            "the binding records the INCREASE's nfId"
+        );
+        let decrease: serde_json::Value =
+            serde_json::from_str(bodies.iter().find(|b| b.contains("DECREASE")).unwrap()).unwrap();
+        assert_eq!(decrease["nfId"], increase["nfId"]);
     }
 
     // ---- #994: PFCP Node Report: user plane path failure and recovery ----
