@@ -162,7 +162,7 @@ fn build_handover_setup_request_transfer(
     n3_ul: (u32, [u8; 4]),
     forwarding: eps_iwk::DataForwarding,
 ) -> Result<Vec<u8>, crate::n2_transfer::TransferError> {
-    use crate::n2_transfer::{Arp, Gbr, QosFlowSetup, SetupRequest};
+    use crate::n2_transfer::{Arp, QosFlowSetup, SetupRequest};
     let flows = bearers
         .iter()
         .map(|b| QosFlowSetup {
@@ -177,12 +177,8 @@ fn build_handover_setup_request_transfer(
                 may_trigger_pre_emption: !b.qos.arp_preempt_cap,
                 pre_emptable: !b.qos.arp_preempt_vuln,
             },
-            gbr: (b.qos.gbr_uplink > 0 || b.qos.gbr_downlink > 0).then_some(Gbr {
-                mfbr_dl: b.qos.mbr_downlink,
-                mfbr_ul: b.qos.mbr_uplink,
-                gfbr_dl: b.qos.gbr_downlink,
-                gfbr_ul: b.qos.gbr_uplink,
-            }),
+            // #1147 review m2: by the 5QI's resource type, not by a non-zero rate.
+            gbr: crate::bearer_gbr(b),
             e_rab_id: Some(b.ebi),
         })
         .collect();
@@ -3652,8 +3648,12 @@ mod tests {
             let flows = bearers
                 .iter()
                 .map(|b| {
-                    let gbr = (b.qos.gbr_uplink > 0 || b.qos.gbr_downlink > 0).then_some(
-                        GbrQosInformation {
+                    // #1147 review m2: GBR by the 5QI's resource type (TS 38.413
+                    // §9.3.1.12), as the encoder under test decides it.
+                    let gbr = crate::context::QosCharacteristics::from_5qi(b.qos.index)
+                        .map(|c| c.is_gbr())
+                        .unwrap_or(b.qos.gbr_uplink > 0 || b.qos.gbr_downlink > 0)
+                        .then_some(GbrQosInformation {
                             maximum_flow_bit_rate_dl: b.qos.mbr_downlink,
                             maximum_flow_bit_rate_ul: b.qos.mbr_uplink,
                             guaranteed_flow_bit_rate_dl: b.qos.gbr_downlink,
@@ -3661,8 +3661,7 @@ mod tests {
                             notification_control: false,
                             maximum_packet_loss_rate_dl: None,
                             maximum_packet_loss_rate_ul: None,
-                        },
-                    );
+                        });
                     QosFlowSetupRequestItem {
                         qos_flow_identifier: b.ebi,
                         qos_flow_level_qos_parameters: QosFlowLevelQosParameters {

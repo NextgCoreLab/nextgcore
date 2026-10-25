@@ -3037,56 +3037,79 @@ fn session_setup_flows(
     sm_context_ref: &str,
     binding: &context::PolicyBinding,
 ) -> Vec<n2_transfer::QosFlowSetup> {
+    let bearers = smf_self()
+        .read()
+        .ok()
+        .and_then(|ctx| ctx.sess_find_by_sm_context_ref(sm_context_ref))
+        .as_ref()
+        .map(eps_to_5gs::session_bearers)
+        .unwrap_or_default();
+    // An EPS→5GS flow's QFI is its EBI (`eps_to_5gs`); a 5G flow has its own.
+    let qfi_of = |b: &context::SmfBearer| if b.qfi != 0 { b.qfi } else { b.ebi };
+    // The default flow, as the binding authorised it. When the session holds its
+    // bearer (an EPS→5GS one), that bearer's ARP pre-emption flags and EBI go with
+    // it (#1147 review m1, M1).
+    let default_bearer = bearers.iter().find(|b| qfi_of(b) == binding.qfi);
     let mut flows = vec![n2_transfer::QosFlowSetup {
         qfi: binding.qfi,
         five_qi: u16::from(binding.five_qi),
-        arp: n2_transfer::Arp {
-            priority_level: binding.arp_priority_level,
-            may_trigger_pre_emption: false,
-            pre_emptable: false,
-        },
+        arp: default_bearer.map_or(
+            n2_transfer::Arp {
+                priority_level: binding.arp_priority_level,
+                may_trigger_pre_emption: false,
+                pre_emptable: false,
+            },
+            |b| n2_transfer::Arp {
+                priority_level: binding.arp_priority_level,
+                ..bearer_arp(b)
+            },
+        ),
         gbr: None,
-        e_rab_id: None,
+        // #1147 review M1: the EBI↔QFI mapping (TS 23.502 §4.11.5.6 step 7), which
+        // the NG-RAN keeps (TS 38.413 §8.2.1.2) for a later move back to EPS.
+        e_rab_id: binding
+            .mapped_eps_bearer_id
+            .or(default_bearer.map(|b| b.ebi).filter(|&e| e != 0)),
     }];
-    let sess = smf_self()
-        .read()
-        .ok()
-        .and_then(|ctx| ctx.sess_find_by_sm_context_ref(sm_context_ref));
-    for bearer in sess
-        .as_ref()
-        .map(eps_to_5gs::session_bearers)
-        .unwrap_or_default()
-    {
-        // An EPS→5GS flow's QFI is its EBI (`eps_to_5gs`); a 5G flow has its own.
-        let qfi = if bearer.qfi != 0 {
-            bearer.qfi
-        } else {
-            bearer.ebi
-        };
+    for bearer in &bearers {
+        let qfi = qfi_of(bearer);
         if qfi == 0 || flows.iter().any(|f| f.qfi == qfi) {
             continue;
         }
         flows.push(n2_transfer::QosFlowSetup {
             qfi,
             five_qi: u16::from(bearer.qos.index),
-            arp: n2_transfer::Arp {
-                priority_level: bearer.qos.arp_priority_level.clamp(1, 15),
-                // PCI / PVI are "disable" flags (TS 29.274 §8.15), as in `eps_to_5gs`.
-                may_trigger_pre_emption: !bearer.qos.arp_preempt_cap,
-                pre_emptable: !bearer.qos.arp_preempt_vuln,
-            },
-            gbr: (bearer.qos.gbr_uplink > 0 || bearer.qos.gbr_downlink > 0).then_some(
-                n2_transfer::Gbr {
-                    mfbr_dl: bearer.qos.mbr_downlink,
-                    mfbr_ul: bearer.qos.mbr_uplink,
-                    gfbr_dl: bearer.qos.gbr_downlink,
-                    gfbr_ul: bearer.qos.gbr_uplink,
-                },
-            ),
-            e_rab_id: None,
+            arp: bearer_arp(bearer),
+            gbr: bearer_gbr(bearer),
+            e_rab_id: (bearer.ebi != 0).then_some(bearer.ebi),
         });
     }
     flows
+}
+
+/// A bearer's ARP as a QoS flow's (TS 23.501 §5.7.2.2): PCI / PVI are "disable" flags
+/// in the Bearer QoS IE (TS 29.274 §8.15), so they invert, as in `eps_to_5gs`.
+fn bearer_arp(bearer: &context::SmfBearer) -> n2_transfer::Arp {
+    n2_transfer::Arp {
+        priority_level: bearer.qos.arp_priority_level.clamp(1, 15),
+        may_trigger_pre_emption: !bearer.qos.arp_preempt_cap,
+        pre_emptable: !bearer.qos.arp_preempt_vuln,
+    }
+}
+
+/// A bearer's GBR QoS Flow Information: present for a GBR 5QI (TS 38.413 §9.3.1.12,
+/// "shall be present" for a GBR flow), whatever its rates (#1147 review m2); for a
+/// 5QI the table does not know, when it carries a guaranteed rate.
+pub(crate) fn bearer_gbr(bearer: &context::SmfBearer) -> Option<n2_transfer::Gbr> {
+    let gbr = context::QosCharacteristics::from_5qi(bearer.qos.index)
+        .map(|c| c.is_gbr())
+        .unwrap_or(bearer.qos.gbr_uplink > 0 || bearer.qos.gbr_downlink > 0);
+    gbr.then_some(n2_transfer::Gbr {
+        mfbr_dl: bearer.qos.mbr_downlink,
+        mfbr_ul: bearer.qos.mbr_uplink,
+        gfbr_dl: bearer.qos.gbr_downlink,
+        gfbr_ul: bearer.qos.gbr_uplink,
+    })
 }
 
 /// The PDU Session Aggregate Maximum Bit Rate `(DL, UL)` of a transfer setting up
@@ -3098,8 +3121,19 @@ fn session_ambr_for(
     ambr_dl_bps: u64,
     ambr_ul_bps: u64,
 ) -> Option<(u64, u64)> {
-    (flows.iter().any(|f| f.gbr.is_none()) && (ambr_dl_bps > 0 || ambr_ul_bps > 0))
-        .then_some((ambr_dl_bps, ambr_ul_bps))
+    if !flows.iter().any(|f| f.gbr.is_none()) {
+        return None;
+    }
+    if ambr_dl_bps == 0 && ambr_ul_bps == 0 {
+        // #1147 review m3: mandatory with a non-GBR flow, and there is nothing to
+        // send. Said, rather than dropped silently.
+        log::warn!(
+            "PDUSessionResourceSetupRequestTransfer with a non-GBR QoS flow but no \
+             Session-AMBR authorised: the PDU Session Aggregate Maximum Bit Rate is left out"
+        );
+        return None;
+    }
+    Some((ambr_dl_bps, ambr_ul_bps))
 }
 
 /// Build the N2 SM `PDUSessionResourceSetupRequestTransfer` (TS 38.413
@@ -17565,6 +17599,78 @@ mod tests {
         m
     }
 
+    /// #1147 review B1, TS 38.413 §9.3.4.1: the real establishment's
+    /// PDUSessionResourceSetupRequestTransfer carries the authorised Session-AMBR --
+    /// the same one the N1 PDU SESSION ESTABLISHMENT ACCEPT gives the UE.
+    ///
+    /// REVERT-VERIFIED: with the establishment passing no AMBR, this fails.
+    #[tokio::test]
+    async fn the_establishment_transfer_carries_the_authorised_session_ambr() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        std::env::remove_var("NSACF_URI");
+        let supi = "imsi-001010000011470";
+        let resp = handle_sm_context_create(&create_request(
+            supi,
+            9,
+            &n1(
+                9,
+                1,
+                gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+                &[0x91, 0x00],
+            ),
+        ))
+        .await;
+        let part = |id: &str| {
+            resp.http
+                .parts
+                .iter()
+                .find(|p| p.content_id.as_deref() == Some(id))
+                .map(|p| p.data.to_vec())
+        };
+        let (n1_accept, n2) = (part("n1SmMsg"), part("n2SmInfo"));
+        let reference = smf_self()
+            .read()
+            .unwrap()
+            .policy_bindings
+            .read()
+            .unwrap()
+            .iter()
+            .find(|(_, b)| b.supi == supi && b.psi == 9)
+            .map(|(r, _)| r.clone());
+        if let Some(r) = &reference {
+            let _ = release_sm_context_locally(r);
+        }
+        side_effects_settled().await;
+
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        let t = nextgcore_ngap::transfer::PduSessionResourceSetupRequestTransfer::decode(
+            &n2.expect("n2SmInfo"),
+        )
+        .expect("decode");
+        let ambr = t
+            .pdu_session_aggregate_maximum_bit_rate
+            .expect("the Session-AMBR is in the transfer");
+        // No PCF here: the config-default decision's 100 Mbit/s each way.
+        assert_eq!((ambr.dl, ambr.ul), (100_000_000, 100_000_000));
+        // The accept's Session-AMBR LV (TS 24.501 §9.11.4.14), as its builder writes it.
+        let (dl_unit, dl_val) = policy::encode_ambr_component(ambr.dl);
+        let (ul_unit, ul_val) = policy::encode_ambr_component(ambr.ul);
+        let mut n1_ambr = vec![0x06, dl_unit];
+        n1_ambr.extend_from_slice(&dl_val.to_be_bytes());
+        n1_ambr.push(ul_unit);
+        n1_ambr.extend_from_slice(&ul_val.to_be_bytes());
+        let accept = n1_accept.expect("n1SmMsg");
+        assert!(
+            accept
+                .windows(n1_ambr.len())
+                .any(|w| w == n1_ambr.as_slice()),
+            "the N1 Session-AMBR is the same: {accept:02x?}"
+        );
+    }
+
     /// A well-formed `SmContextCreateData` request with its N1 container as a
     /// multipart 5gnas part — the shape the AMF sends (#289).
     ///
@@ -20321,6 +20427,77 @@ mod path_switch_ack_tests {
         if let Some(sess) = ctx.sess_find_by_sm_context_ref(&r) {
             ctx.sess_remove(sess.id);
         }
+    }
+
+    /// #1147 review M2, m1: how the session's bearers become QoS flows.
+    /// - the session's own bearer for the default flow (an EPS→5GS default bearer,
+    ///   QFI = the binding's) is not set up twice; it lends the default flow its
+    ///   EBI and its (inverted) ARP pre-emption flags;
+    /// - a bearer with no QFI of its own takes its EBI as QFI;
+    /// - ARP PCI/PVI ("disable" flags) invert;
+    /// - a GBR 5QI carries GBR QoS Flow Information even with zero rates;
+    /// - the Session-AMBR goes only with a non-GBR flow, and not when it is 0/0.
+    ///
+    /// REVERT-VERIFIED: without the duplicate-QFI check the default flow is set up
+    /// twice; without the EBI fallback the QFI-0 bearer is dropped.
+    #[tokio::test]
+    async fn bearers_map_onto_setup_flows() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let r = crate::tests::seed_registered_session("imsi-001010000011471", 7, "internet");
+        let mut binding = context::PolicyBinding::snapshot_default();
+        binding.qfi = 5;
+        binding.five_qi = 9;
+        binding.arp_priority_level = 8;
+        binding.mapped_eps_bearer_id = None;
+        {
+            let ctx = smf_self();
+            let ctx = ctx.read().expect("ctx");
+            let sess = ctx.sess_find_by_sm_context_ref(&r).expect("sess");
+            // The default bearer of an EPS→5GS session: QFI = EBI 5, PCI set.
+            let mut default = ctx.bearer_add(sess.id).expect("bearer");
+            default.ebi = 5;
+            default.qos.index = 9;
+            default.qos.arp_preempt_cap = true;
+            default.qos.arp_preempt_vuln = false;
+            ctx.bearer_update(&default);
+            // A dedicated GBR bearer with no QFI of its own and zero rates.
+            let mut dedicated = ctx.bearer_add(sess.id).expect("bearer");
+            dedicated.ebi = 6;
+            dedicated.qos.index = 1;
+            dedicated.qos.arp_priority_level = 2;
+            ctx.bearer_update(&dedicated);
+        }
+        let flows = session_setup_flows(&r, &binding);
+        {
+            let ctx = smf_self();
+            let ctx = ctx.read().expect("ctx");
+            if let Some(sess) = ctx.sess_find_by_sm_context_ref(&r) {
+                ctx.sess_remove(sess.id);
+            }
+        }
+        let shape: Vec<(u8, Option<u8>, bool, bool, bool)> = flows
+            .iter()
+            .map(|f| {
+                (
+                    f.qfi,
+                    f.e_rab_id,
+                    f.arp.may_trigger_pre_emption,
+                    f.arp.pre_emptable,
+                    f.gbr.is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (5, Some(5), false, true, false),
+                (6, Some(6), true, true, true)
+            ],
+            "default once, with its bearer's EBI and inverted ARP; the dedicated by EBI, GBR"
+        );
+        assert_eq!(session_ambr_for(&flows, 1, 2), Some((1, 2)));
+        assert_eq!(session_ambr_for(&flows[1..], 1, 2), None, "every flow GBR");
+        assert_eq!(session_ambr_for(&flows, 0, 0), None, "nothing authorised");
     }
 
     /// #518: `upCnxState: ACTIVATING` is answered with the session's setup transfer
