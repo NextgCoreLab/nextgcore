@@ -1224,6 +1224,7 @@ mod tests {
     #[test]
     fn the_assigned_ebi_reaches_smf_bearer_without_the_gtpv2_path() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.blocking_lock();
+        let _seeded = crate::context::SeededState::track();
         use crate::context::{smf_context_init, smf_self};
 
         smf_context_init(64, 256, 512);
