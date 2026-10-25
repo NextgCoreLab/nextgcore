@@ -33,10 +33,17 @@
 //!     the Service Accept with a UE Configuration Update (TS 24.501 §5.4.4). The backup
 //!     AMF "shall not use old GUAMI to allocate 5G-GUTI".
 //!
-//! Peers holding subscriptions of the old AMF (the UDM's SDM subscription, the PCF's AM
-//! policy association) re-address their notifications themselves: "the CP NF shall
-//! exchange the old AMF information embedded in the Notification Address with the new
-//! AMF information" (§5.21.2.3).
+//!   - (#1210) subscribes to the UE's SDM data under its own `callbackReference`
+//!     (Nudm_SDM_Subscribe, TS 23.502 §4.2.2.2.2 step 14c), since an
+//!     `SdmSubsModification` cannot change it (TS 29.503 §6.1.6.2.31), and then removes
+//!     the old AMF's subscription, which the failed AMF cannot do (§5.2.2.4.2). With
+//!     `implicitUnsubscribe` the UDM may already have dropped it, so a 404 is fine.
+//!   - (#1210) points the PCF's AM and UE policy associations at itself:
+//!     `notificationUri` and `guami` (TS 29.507 §4.2.3.1), and `notificationUri`,
+//!     `guami` and `servingNfId` (TS 29.525 §4.2.3.1). Both clauses let "an AMF [that]
+//!     knows by implementation specific means that the UE context has been transferred
+//!     to an AMF with another GUAMI within the AMF set" update them, and §5.21.2.3 has
+//!     "the new AMF update[] the peer NFs ... with the new AMF information".
 
 use super::ue_context_store::{STmsi, StoredUeContext};
 use super::*;
@@ -57,6 +64,9 @@ pub(crate) struct TakeoverUecmAnswer {
     /// The `deregCallbackUri` token registered, kept only if the UDM accepted it (#753).
     pub(crate) token: String,
     pub(crate) accepted: bool,
+    /// #1210: the SDM subscription this AMF made after the registration, if the UDM
+    /// accepted it.
+    pub(crate) sdm_subscription_id: Option<String>,
 }
 
 /// Whether another AMF instance's record holds a UE this AMF was told to deregister
@@ -319,6 +329,7 @@ impl NgapServer {
             guami_mnc.clone(),
             amf_id_hex.clone(),
         );
+        let old_sdm_subscription = state.sdm_subscription_id.clone();
         self.sbi_offload.spawn(async move {
             let (host, port) = match udm {
                 Some(udm) => udm,
@@ -342,11 +353,26 @@ impl NgapServer {
             if let Err(e) = &result {
                 log::warn!("[{uecm_supi}] takeover UECM registration failed: {e}");
             }
+            // #1210: the SDM subscription, after the registration: with
+            // `implicitUnsubscribe` the UDM ends the old AMF's when this AMF registers.
+            let sdm_subscription_id = if result.is_ok() {
+                takeover_sdm_resubscribe(
+                    &host,
+                    port,
+                    &uecm_supi,
+                    &uecm_instance,
+                    old_sdm_subscription.as_deref(),
+                )
+                .await
+            } else {
+                None
+            };
             Some(crate::sbi_offload::SbiOutcome::TakeoverUecm(
                 TakeoverUecmAnswer {
                     supi: uecm_supi,
                     token,
                     accepted: result.is_ok(),
+                    sdm_subscription_id,
                 },
             ))
         });
@@ -377,6 +403,60 @@ impl NgapServer {
                     None
                 });
         }
+
+        // #1210: the PCF's policy associations now notify this AMF.
+        let guami = serde_json::json!({
+            "plmnId": { "mcc": guami_mcc, "mnc": guami_mnc },
+            "amfId": amf_id_hex,
+        });
+        let pcf = self.pcf_for_takeover();
+        if let Some(pol_asso_id) = state.policy_association_id.clone() {
+            let (uri, guami, pcf) = (
+                crate::sbi_path::am_policy_notification_uri(&supi),
+                guami.clone(),
+                pcf.clone(),
+            );
+            self.sbi_offload.spawn(async move {
+                let (host, port) = takeover_pcf(pcf).await;
+                if let Err(e) = crate::sbi_path::call_pcf_am_policy_update_serving_amf(
+                    &host,
+                    port,
+                    &pol_asso_id,
+                    &uri,
+                    &guami,
+                )
+                .await
+                {
+                    log::warn!(
+                        "UE {amf_ue_ngap_id}: AM policy association {pol_asso_id} not pointed \
+                         at the new serving AMF: {e}"
+                    );
+                }
+                None
+            });
+        }
+        if let Some(pol_asso_id) = state.ue_policy_association_id.clone() {
+            let uri = crate::sbi_path::ue_policy_notification_uri(&supi);
+            self.sbi_offload.spawn(async move {
+                let (host, port) = takeover_pcf(pcf).await;
+                if let Err(e) = crate::sbi_path::call_pcf_ue_policy_update_serving_amf(
+                    &host,
+                    port,
+                    &pol_asso_id,
+                    &uri,
+                    &guami,
+                    &instance,
+                )
+                .await
+                {
+                    log::warn!(
+                        "UE {amf_ue_ngap_id}: UE policy association {pol_asso_id} not pointed \
+                         at the new serving AMF: {e}"
+                    );
+                }
+                None
+            });
+        }
     }
 
     /// Record the UDM's answer to a takeover's UECM registration: the new
@@ -388,8 +468,22 @@ impl NgapServer {
         if let Some((id, _)) = self.ue_auth_state.find_by_supi(&answer.supi) {
             self.ue_auth_state.with_mut(id, |s| {
                 s.amf_ue.uecm_dereg_token = Some(answer.token.clone());
+                // #1210: this AMF's own SDM subscription replaces the old AMF's.
+                if let Some(sub) = &answer.sdm_subscription_id {
+                    s.sdm_subscription_id = Some(sub.clone());
+                }
             });
         }
+    }
+
+    /// The PCF a takeover re-points the policy associations at: `None` resolves it as
+    /// their termination does. Tests pin a stand-in with `pcf_override`.
+    fn pcf_for_takeover(&self) -> Option<(String, u16)> {
+        #[cfg(test)]
+        if let Some(pcf) = &self.pcf_override {
+            return Some(pcf.clone());
+        }
+        None
     }
 
     /// The UDM a takeover registers with: `None` resolves it as registration does. Tests
@@ -513,4 +607,48 @@ impl NgapServer {
             }
         }
     }
+}
+
+/// #1210: the PCF of a taken-over UE's policy associations, `pinned` or resolved as
+/// [`NgapServer::terminate_policy_associations`] resolves it.
+async fn takeover_pcf(pinned: Option<(String, u16)>) -> (String, u16) {
+    match pinned {
+        Some(pcf) => pcf,
+        None => crate::sbi_path::resolve_nf_endpoint_async(
+            crate::sbi_path::SbiServiceType::NpcfAmPolicyControl,
+        )
+        .await
+        .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777)),
+    }
+}
+
+/// #1210: subscribe to a taken-over UE's SDM data under this AMF's callback, then remove
+/// the old AMF's subscription `old` (TS 29.503 §5.2.2.3.2, §5.2.2.4.2). Returns the new
+/// subscription's id, or `None` when the UDM refused it. The old one is then left
+/// alone, so the UE keeps the notifications it has.
+async fn takeover_sdm_resubscribe(
+    udm_host: &str,
+    udm_port: u16,
+    supi: &str,
+    amf_instance_id: &str,
+    old: Option<&str>,
+) -> Option<String> {
+    let new =
+        match crate::sbi_path::call_udm_sdm_subscribe(udm_host, udm_port, supi, amf_instance_id)
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                log::warn!("[{supi}] takeover SDM subscription failed: {e}");
+                return None;
+            }
+        };
+    if let Some(old) = old.filter(|old| *old != new) {
+        if let Err(e) =
+            crate::sbi_path::call_udm_sdm_unsubscribe(udm_host, udm_port, supi, old).await
+        {
+            log::warn!("[{supi}] the old AMF's SDM subscription {old} not removed: {e}");
+        }
+    }
+    Some(new)
 }
