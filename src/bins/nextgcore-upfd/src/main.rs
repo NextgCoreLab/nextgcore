@@ -395,6 +395,9 @@ async fn main() -> Result<()> {
     let pfcp_server = PfcpServer::new(pfcp_addr, shutdown.clone(), pfcp_session_tx)
         .await
         .context("Failed to create PFCP server")?;
+    // #985: a local F-TEID may carry the IPv6 N3 address only once the IPv6 GTP-U
+    // socket is bound, so uplink from an IPv6 gNB has somewhere to arrive.
+    pfcp_server.set_n3_ipv6(*data_plane.local_gtpu_addr6.read().unwrap());
     let allowed_peers = allowed_peers_setting(
         &args.pfcp_allowed_peers,
         std::env::var("UPF_PFCP_ALLOWED_PEERS").ok(),
@@ -479,10 +482,10 @@ async fn main() -> Result<()> {
                     upf_seid,
                     smf_seid,
                     remote_teid,
-                    peer_ipv4,
+                    peer,
                 } => {
                     if let Err(e) = pfcp_for_reports
-                        .send_error_indication_report(upf_seid, smf_seid, remote_teid, peer_ipv4)
+                        .send_error_indication_report(upf_seid, smf_seid, remote_teid, peer)
                         .await
                     {
                         log::error!("Failed to send Error Indication Report: {e}");

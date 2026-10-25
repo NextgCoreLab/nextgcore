@@ -159,6 +159,33 @@ pub struct ForwardRelocationBearerResult {
 /// response's Sender's F-TEID is for. TS 29.274 §5.5.1 makes a request to an unknown peer
 /// context carry TEID 0, which is also how every Create Session Request starts.
 #[allow(clippy::too_many_arguments)]
+/// Build a **Relocation Cancel Request** (TS 29.274 §7.3.16, type 139) for a 5GS→EPS
+/// handover the source gNB cancelled (TS 23.502 §4.11.1.2.3 step 2, #963).
+///
+/// - Header TEID: the target MME's control-plane TEID once its Forward Relocation Response
+///   gave one, else 0 (§5.5.2).
+/// - IMSI (C): included for every UE that has one (Table 7.3.16-1). This AMF serves no
+///   UICC-less emergency UE over N26, so neither the MEI nor the Indication flags apply.
+pub fn build_relocation_cancel_request(
+    sequence_number: u32,
+    mme_teid: Option<u32>,
+    imsi_digits: Option<&str>,
+) -> Gtp2Message {
+    let mut msg = Gtp2Message::new(Gtp2Header::new(
+        Gtp2MessageType::RelocationCancelRequest as u8,
+        mme_teid.unwrap_or(0),
+        sequence_number,
+    ));
+    if let Some(digits) = imsi_digits.filter(|d| !d.is_empty()) {
+        msg.add_ie(Gtp2Ie::from_slice(
+            Gtp2IeType::Imsi as u8,
+            0,
+            &crate::n26_path::string_to_bcd(digits),
+        ));
+    }
+    msg
+}
+
 pub fn build_forward_relocation_request(
     sequence_number: u32,
     imsi_digits: Option<&str>,

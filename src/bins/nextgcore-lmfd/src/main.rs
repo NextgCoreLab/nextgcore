@@ -2832,6 +2832,7 @@ async fn handle_nrppa_report(request: &SbiRequest) -> SbiResponse {
         .map(|arr| {
             arr.iter()
                 .map(|c| CellMeasurement {
+                    nr_ecid: None,
                     nr_cgi: c
                         .get("nrCgi")
                         .and_then(|v| v.as_str())
@@ -4420,6 +4421,7 @@ mod tests {
             guard.measurement_report(
                 req.request_id,
                 vec![CellMeasurement {
+                    nr_ecid: None,
                     nr_cgi: "001-01-424242-01".to_string(),
                     rsrp: Some(-70),
                     rsrq: Some(-9),
@@ -5313,6 +5315,7 @@ lmf:
             .measurement_report(
                 request_id,
                 vec![context::CellMeasurement {
+                    nr_ecid: None,
                     nr_cgi: "pci-501".to_string(),
                     rsrp: Some(-80),
                     rsrq: None,

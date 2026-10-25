@@ -1000,6 +1000,7 @@ fn measured_results_element_to_cell(elem: &lpp::MeasuredResultsElement) -> CellM
         })
     });
     CellMeasurement {
+        nr_ecid: None,
         nr_cgi: format!("pci-{}", elem.phys_cell_id.0),
         rsrp: elem.rsrp_result.as_ref().map(|v| i16::from(v.0) - 140),
         rsrq: elem.rsrq_result.as_ref().map(|v| i16::from(v.0)),
@@ -1092,6 +1093,7 @@ fn nr_measured_results_element_to_cell(
         .as_ref()
         .or(elem.results_csi_rs_cell_r16.as_ref());
     CellMeasurement {
+        nr_ecid: None,
         nr_cgi: format!("pci-{}", elem.nr_phys_cell_id_r16.0),
         rsrp: cell
             .and_then(|c| c.nr_rsrp_r16.as_ref())
@@ -1179,6 +1181,7 @@ pub fn lpp_multi_rtt_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<Cell
                 .as_ref()
                 .map(|v| i16::from(v.0) - 140);
             CellMeasurement {
+                nr_ecid: None,
                 nr_cgi,
                 rsrp,
                 rsrq: None,
@@ -1272,6 +1275,7 @@ pub fn lpp_dl_tdoa_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<CellMe
     let reference = sig.dl_prs_reference_info_r16.dl_prs_id_r16.0;
     // Reference TRP: RSTD ≡ 0 by definition.
     out.push(CellMeasurement {
+        nr_ecid: None,
         nr_cgi: format!("prs-{}", sig.dl_prs_reference_info_r16.dl_prs_id_r16.0),
         rsrp: None,
         rsrq: None,
@@ -1298,6 +1302,7 @@ pub fn lpp_dl_tdoa_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<CellMe
             .as_ref()
             .map(|v| i16::from(v.0) - 140);
         out.push(CellMeasurement {
+            nr_ecid: None,
             nr_cgi,
             rsrp,
             rsrq: None,
