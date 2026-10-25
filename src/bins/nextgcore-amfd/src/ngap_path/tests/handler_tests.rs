@@ -1027,6 +1027,16 @@ async fn an_establishment_while_the_smf_restarts_is_retried_and_succeeds() {
         "nothing to the UE yet: no 5GSM reject, no DL NAS Transport"
     );
     assert!(server.pending_establishments.contains_key(&(ue, 5)));
+    // #922: the first attempt runs off the NGAP task. Let it fail and its outcome
+    // be applied before the SMF comes back (#1095). A failure outcome applied
+    // after `make_establishments_due` re-arms `next_attempt` a retry interval
+    // out, so the settle loop below would end with no retry sent.
+    settle_establishments(&mut server).await;
+    assert!(
+        take_sent_ngap(&mut server).is_empty(),
+        "still nothing to the UE: the failed attempt waits for a retry"
+    );
+    assert!(server.pending_establishments.contains_key(&(ue, 5)));
 
     // The SMF comes back on the same address: the reserved socket starts listening.
     let listener = down.listen();
