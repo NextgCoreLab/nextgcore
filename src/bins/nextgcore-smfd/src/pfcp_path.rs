@@ -1711,6 +1711,17 @@ impl PfcpClient {
         assert_teardown_is_serialised();
         #[cfg(test)]
         TEARDOWNS_FOR_TEST.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(test)]
+        {
+            let hold = TEARDOWN_HOLD_FOR_TEST
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some((reached, proceed)) = hold {
+                reached.notify_one();
+                proceed.notified().await;
+            }
+        }
         // #720: only the sessions on THIS UPF. A pool member's restart, release or
         // heartbeat loss says nothing about the sessions on the other members, which
         // are alive; releasing them sent every UE in the pool a #39 and orphaned
@@ -1978,6 +1989,15 @@ pub async fn drain_restart_fanouts(budget: Duration) {
 #[cfg(test)]
 pub(crate) static TEARDOWNS_FOR_TEST: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+/// #1229: when set, a teardown signals the first `Notify` once it has counted itself,
+/// then waits on the second before it clears the association and its stamp. A test
+/// can then run a second detector in that window deterministically. Guarded, like
+/// every teardown, by [`N4_TEST_LOCK`].
+#[cfg(test)]
+pub(crate) static TEARDOWN_HOLD_FOR_TEST: std::sync::Mutex<
+    Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+> = std::sync::Mutex::new(None);
 
 /// Where a peer Recovery Time Stamp came from (#928 round 2, B1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2442,6 +2462,9 @@ pub(crate) mod stand_in {
         /// How long the stand-in waits before answering a Session Modification
         /// (#750): a slow UPF, so a test can interleave another request.
         modification_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+        /// How long the stand-in waits before answering a Session Deletion (#1198
+        /// review MAJOR): a slow PGW-U. The other messages are answered meanwhile.
+        deletion_delay_ms: Arc<std::sync::atomic::AtomicU64>,
         /// Answer Session Modifications with no Created PDR (#751): an incomplete
         /// answer to a request that created PDRs with CHOOSE.
         omit_created_pdrs: Arc<std::sync::atomic::AtomicBool>,
@@ -2519,6 +2542,13 @@ pub(crate) mod stand_in {
         /// Answer every Session Modification after `ms` milliseconds (#750).
         pub(crate) fn delay_modifications(&self, ms: u64) {
             self.modification_delay_ms
+                .store(ms, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// Answer every Session Deletion after `ms` milliseconds, serving the other
+        /// messages meanwhile (#1198 review MAJOR).
+        pub(crate) fn delay_deletions(&self, ms: u64) {
+            self.deletion_delay_ms
                 .store(ms, std::sync::atomic::Ordering::SeqCst);
         }
 
@@ -2702,6 +2732,9 @@ pub(crate) mod stand_in {
         let modification_delay_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let omit_created_pdrs = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let delay_ms = modification_delay_ms.clone();
+        let deletion_delay_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let deletion_delay = deletion_delay_ms.clone();
+        let upf_sock = Arc::new(upf_sock);
         let omit = omit_created_pdrs.clone();
         let ignore_choose_id = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ignore_chid = ignore_choose_id.clone();
@@ -2856,15 +2889,28 @@ pub(crate) mod stand_in {
                             &body,
                         ))
                     }
-                    pfcp_message_type::SESSION_DELETION_REQUEST => Some(encode_wire_message(
-                        pfcp_message_type::SESSION_DELETION_RESPONSE,
-                        Some(h.seid),
-                        h.sequence_number,
-                        &tlv(
-                            19,
-                            &[answered_cause.load(std::sync::atomic::Ordering::SeqCst)],
-                        ),
-                    )),
+                    pfcp_message_type::SESSION_DELETION_REQUEST => {
+                        let pkt = encode_wire_message(
+                            pfcp_message_type::SESSION_DELETION_RESPONSE,
+                            Some(h.seid),
+                            h.sequence_number,
+                            &tlv(
+                                19,
+                                &[answered_cause.load(std::sync::atomic::Ordering::SeqCst)],
+                            ),
+                        );
+                        let delay = deletion_delay.load(std::sync::atomic::Ordering::SeqCst);
+                        if delay > 0 {
+                            let sock = upf_sock.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                                let _ = sock.send_to(&pkt, from).await;
+                            });
+                            None
+                        } else {
+                            Some(pkt)
+                        }
+                    }
                     _ => None,
                 };
                 if let Some(pkt) = reply {
@@ -2885,6 +2931,7 @@ pub(crate) mod stand_in {
             upf_ip,
             session_cause,
             modification_delay_ms,
+            deletion_delay_ms,
             omit_created_pdrs,
             ignore_choose_id,
             reject_modification,
