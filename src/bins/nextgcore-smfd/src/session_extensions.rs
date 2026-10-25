@@ -244,10 +244,9 @@ impl Ipv4Pool {
     /// of which addresses are held, and rebuilding it empty is what lets the pool
     /// hand a live UE's address to a second UE after a restart.
     pub fn allocated_addrs(&self) -> Vec<Ipv4Addr> {
-        let bm = match self.bitmap.lock() {
-            Ok(bm) => bm,
-            Err(_) => return Vec::new(),
-        };
+        // #1178: through a poison. An empty list here is a durable snapshot with no
+        // allocation, and after a restart the pool hands out addresses live UEs hold.
+        let bm = self.bitmap.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::new();
         for (word_idx, word) in bm.iter().enumerate() {
             if *word == 0 {
@@ -629,6 +628,20 @@ impl EthernetSessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1178: a poisoned bitmap still reports what is allocated, so the durable
+    /// snapshot does not record an empty pool.
+    #[test]
+    fn a_poisoned_pool_still_reports_its_allocations() {
+        let pool = Ipv4Pool::new(10, 45);
+        let addr = pool.allocate().expect("an address");
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = pool.bitmap.lock().unwrap();
+            panic!("poison the bitmap");
+        }));
+        assert!(pool.bitmap.is_poisoned());
+        assert!(pool.allocated_addrs().contains(&addr));
+    }
 
     // -- IPv6 Dual-Stack tests --
 

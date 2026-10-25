@@ -212,6 +212,13 @@ pub enum S11Continuation {
     /// but the local session goes only once the SGW-U has deleted its own, as for
     /// a Delete Session.
     ReleasePdn { sess_id: u64 },
+    /// A PGW Create Bearer Request's dedicated bearers, installed at the SGW-U before
+    /// the request goes on to the MME (#607, TS 23.401 §5.4.1 step 2). `join` names
+    /// the request in `dedicated_bearer`.
+    CreateBearer { join: u64 },
+    /// The downlink switch of the bearers the MME accepted, before the PGW is answered
+    /// (#607, TS 23.401 §5.4.1 step 8).
+    CreateBearerAnswer { join: u64 },
     /// A session established again on a restarted SGW-U (#1010 review): no MME
     /// waits, but a refused or unanswered restoration is counted and logged
     /// ([`RESTORATIONS_FAILED`]).
