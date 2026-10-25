@@ -23146,6 +23146,8 @@ mod path_switch_ack_tests {
     #[tokio::test]
     async fn the_amf_reads_the_handover_preparation_refusal_of_this_smf() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        // #1200's census: the seeded UE goes with the test (main was red on it).
+        let _seeded = crate::context::SeededState::track();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let r = crate::tests::seed_registered_session("imsi-001010000001171", 5, "internet");
         let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
