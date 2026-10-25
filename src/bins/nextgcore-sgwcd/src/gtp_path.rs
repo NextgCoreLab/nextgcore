@@ -5252,6 +5252,36 @@ mod tests {
             1,
             "nothing created"
         );
+
+        // #1146 review: an ACCEPTED answer is not relayed: its Bearer Context
+        // is the MME/eNB side, not this SGW's S5/S8-U side (the #607 CB half).
+        let mut cbr2 = pgw_request(
+            Gtp2MessageType::CreateBearerRequest,
+            sess.sgw_s5c_teid,
+            0x0642,
+            &[(Gtp2IeType::Ebi as u8, 0, &[5])],
+        );
+        let mut bc0 = Gtp2BearerContextIe::new();
+        bc0.set_ebi(0);
+        cbr2.add_bearer_context(0, &bc0);
+        pgw.sock
+            .send_to(&cbr2.encode(), server.local_addr())
+            .await
+            .unwrap();
+        let at_mme = recv_s11(&mme).await.expect("relayed to the MME");
+        let mut ok = Gtp2Message::new(nextgcore_gtp::v2::header::Gtp2Header::new(
+            Gtp2MessageType::CreateBearerResponse as u8,
+            sgw_s11_teid,
+            at_mme.header.sequence_number,
+        ));
+        ok.add_ie(Gtp2CauseIe::new(gtp_cause::REQUEST_ACCEPTED).to_ie(0));
+        mme.send_to(&ok.encode(), server.local_addr()).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            pgw_got(&pgw, Gtp2MessageType::CreateBearerResponse).len(),
+            1,
+            "the accepted answer is not relayed"
+        );
         ctx.ue_remove(ue.id);
         sgwc_self().set_pgw_s5c_peer(None);
         server.close();
@@ -5316,6 +5346,70 @@ mod tests {
             crate::sxa_response::PDN_RELEASES_UNCONFIRMED.load(Ordering::Relaxed) > unconfirmed,
             "counted as unconfirmed"
         );
+        sgwc_self().set_pgw_s5c_peer(None);
+        server.close();
+    }
+
+    /// #1146 review: a PDN release whose session is already gone locally (here
+    /// removed while the SGW-U decides, as a same-APN Create Session would) but
+    /// that the SGW-U accepts is confirmed, not counted as unconfirmed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_accepted_pdn_release_of_a_replaced_session_is_not_unconfirmed() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::from_millis(300),
+        )
+        .await;
+        let pgw = with_stand_in_pgw().await;
+        let server = test_server(&ambient, 2000, 1);
+        set_s11_server(server.clone());
+        let mme = client();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x46, 0xf3];
+        let sgw_s11_teid = created_session(&server, &mme, &imsi, 0x1463).await;
+        let ctx = sgwc_self();
+        let ue = ctx.ue_find_by_imsi(&imsi).unwrap();
+        let sess = ctx.sess_list_for_ue(ue.id).remove(0);
+        let unconfirmed = crate::sxa_response::PDN_RELEASES_UNCONFIRMED.load(Ordering::Relaxed);
+        let deletions = sgwu.received(54);
+
+        let dbr = pgw_request(
+            Gtp2MessageType::DeleteBearerRequest,
+            sess.sgw_s5c_teid,
+            0x1148,
+            &[(Gtp2IeType::Ebi as u8, 0, &[5])],
+        );
+        pgw.sock
+            .send_to(&dbr.encode(), server.local_addr())
+            .await
+            .unwrap();
+        let at_mme = recv_s11(&mme).await.expect("relayed to the MME");
+        let mut rsp = Gtp2Message::new(nextgcore_gtp::v2::header::Gtp2Header::new(
+            Gtp2MessageType::DeleteBearerResponse as u8,
+            sgw_s11_teid,
+            at_mme.header.sequence_number,
+        ));
+        rsp.add_ie(Gtp2CauseIe::new(gtp_cause::REQUEST_ACCEPTED).to_ie(0));
+        rsp.add_ie(nextgcore_gtp::v2::ie::Gtp2EbiIe::new(5).to_ie(0));
+        mme.send_to(&rsp.encode(), server.local_addr()).unwrap();
+        pgw_wait(&pgw, Gtp2MessageType::DeleteBearerResponse, 1).await;
+        // The SGW-U's answer is 300 ms away: the session goes locally first.
+        for _ in 0..300 {
+            if sgwu.received(54) > deletions {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        ctx.sess_remove(sess.id);
+        // Then the SGW-U accepts.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            crate::sxa_response::PDN_RELEASES_UNCONFIRMED.load(Ordering::Relaxed),
+            unconfirmed,
+            "an accepted deletion is confirmed, whatever happened locally"
+        );
+        ctx.ue_remove(ue.id);
         sgwc_self().set_pgw_s5c_peer(None);
         server.close();
     }

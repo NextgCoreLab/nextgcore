@@ -557,10 +557,13 @@ fn deletion_response(sess_id: u64, continuation: S11Continuation, body: &[u8]) {
     let result = sxa_handler::handle_session_deletion_response(sess.as_ref(), 0, pfcp_cause);
 
     if let S11Continuation::ReleasePdn { sess_id } = continuation {
+        // #1146 review: refused means the SGW-U said no. A session already gone
+        // locally (a same-APN Create Session replaced it) makes the handler
+        // answer Context not found, but the SGW-U's deletion still succeeded.
         release_pdn_done(
             sess_id,
             sess.as_ref().map(|s| s.sgwc_ue_id),
-            matches!(result, HandlerResult::Error(_)),
+            pfcp_cause != sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
         );
         return;
     }
@@ -611,8 +614,9 @@ fn deletion_response(sess_id: u64, continuation: S11Continuation, body: &[u8]) {
 
 /// The SGW-U answered the deletion of a PDN connection a Delete Bearer Response
 /// released (#710). Accepted: the session goes, and the UE context with it when it
-/// has no other. Refused: it is kept, like a refused Delete Session, so it can still
-/// be deleted.
+/// has no other. Refused: it goes all the same, logged and counted as unconfirmed
+/// ([`release_pdn_unconfirmed`]): the PGW and the MME have both released it, so
+/// nobody would ever ask to delete it again (#1146 review).
 fn release_pdn_done(sess_id: u64, ue_id: Option<u64>, refused: bool) {
     if refused {
         release_pdn_unconfirmed(sess_id, ue_id, "the SGW-U refused the deletion");
