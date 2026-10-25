@@ -367,6 +367,49 @@ pub struct TrackingAreaUpdateRequest {
     pub old_guti: EpsMobileIdentity,
     /// Presence mask
     pub presencemask: u64,
+    // Optional IEs (TS 24.301 Table 8.2.29.1, #931). The ones the MME acts on
+    // are modelled; the others are skipped by their type (§7.6.1).
+    /// Non-current native NAS key set identifier (IEI B-, TV 1): the KSI value.
+    pub non_current_native_nas_ksi: Option<u8>,
+    /// Old P-TMSI signature (IEI 19, TV 4)
+    pub old_p_tmsi_signature: Option<[u8; 3]>,
+    /// Additional GUTI (IEI 50, TLV)
+    pub additional_guti: Option<EpsMobileIdentity>,
+    /// Nonce_UE (IEI 55, TV 5)
+    pub nonce_ue: Option<[u8; 4]>,
+    /// UE network capability (IEI 58, TLV)
+    pub ue_network_capability: Option<UeNetworkCapability>,
+    /// Last visited registered TAI (IEI 52, TV 6)
+    pub last_visited_tai: Option<EpsTai>,
+    /// DRX parameter (IEI 5C, TV 3)
+    pub drx_parameter: Option<[u8; 2]>,
+    /// UE radio capability information update needed (IEI A-, TV 1): the value.
+    pub ue_radio_capability_update_needed: Option<u8>,
+    /// EPS bearer context status (IEI 57, TLV 4), bit n for EBI n: octet 3 is
+    /// EBI(7)..EBI(0) (§9.9.2.1).
+    pub eps_bearer_context_status: Option<u16>,
+    /// MS network capability (IEI 31, TLV): the value.
+    pub ms_network_capability: Option<Vec<u8>>,
+    /// TMSI status (IEI 9-, TV 1): the value.
+    pub tmsi_status: Option<u8>,
+    /// Additional update type (IEI F-, TV 1): the value.
+    pub additional_update_type: Option<u8>,
+    /// Voice domain preference and UE's usage setting (IEI 5D, TLV): the value.
+    pub voice_domain_preference: Option<Vec<u8>>,
+    /// Old GUTI type (IEI E-, TV 1): the value (bit 1: 1 = mapped GUTI).
+    pub old_guti_type: Option<u8>,
+    /// Device properties (IEI D-, TV 1): the value.
+    pub device_properties: Option<u8>,
+    /// T3324 value (IEI 6A, TLV): the value.
+    pub t3324_value: Option<Vec<u8>>,
+    /// T3412 extended value (IEI 5E, TLV): the value.
+    pub t3412_extended_value: Option<Vec<u8>>,
+    /// Extended DRX parameters (IEI 6E, TLV): the value.
+    pub extended_drx_parameters: Option<Vec<u8>>,
+    /// UE additional security capability (IEI 6F, TLV): the value.
+    pub ue_additional_security_capability: Option<Vec<u8>>,
+    /// UE status (IEI 6D, TLV): the value.
+    pub ue_status: Option<Vec<u8>>,
 }
 
 /// Tracking Area Update Accept message
@@ -563,6 +606,13 @@ impl DetachRequest {
         let detach_type = first_byte & 0x0F;
         let nas_key_set_identifier = KeySetIdentifier::decode((first_byte >> 4) & 0x0F);
         let eps_mobile_identity = EpsMobileIdentity::decode(buf)?;
+        // #931: TS 24.301 Table 8.2.11.1.1 (UE originating detach) defines no
+        // optional IE in this release; whatever follows is skipped per §7.6.1,
+        // not left unread.
+        while buf.remaining() > 0 {
+            let iei = buf.peek_u8()?;
+            skip_unknown_ie(buf, iei)?;
+        }
         Ok(Self {
             detach_type,
             nas_key_set_identifier,
@@ -571,11 +621,71 @@ impl DetachRequest {
     }
 }
 
+/// Put a TLV IE `iei` with `value`, if present.
+fn put_tlv(buf: &mut BytesMut, iei: u8, value: &Option<Vec<u8>>) {
+    if let Some(v) = value {
+        buf.put_u8(iei);
+        buf.put_u8(v.len() as u8);
+        buf.put_slice(v);
+    }
+}
+
+/// Put a type 1 IE `iei` (high nibble) with the 4-bit `value`, if present.
+fn put_type1(buf: &mut BytesMut, iei: u8, value: Option<u8>) {
+    if let Some(v) = value {
+        buf.put_u8(iei | (v & 0x0F));
+    }
+}
+
 impl TrackingAreaUpdateRequest {
     /// Encode to bytes
     pub fn encode(&self, buf: &mut BytesMut) {
         buf.put_u8((self.nas_key_set_identifier.encode() << 4) | (self.eps_update_type & 0x0F));
         self.old_guti.encode(buf);
+        // Optional IEs, in Table 8.2.29.1 order.
+        put_type1(buf, 0xB0, self.non_current_native_nas_ksi);
+        if let Some(sig) = &self.old_p_tmsi_signature {
+            buf.put_u8(0x19);
+            buf.put_slice(sig);
+        }
+        if let Some(guti) = &self.additional_guti {
+            buf.put_u8(0x50);
+            guti.encode(buf);
+        }
+        if let Some(nonce) = &self.nonce_ue {
+            buf.put_u8(0x55);
+            buf.put_slice(nonce);
+        }
+        if let Some(cap) = &self.ue_network_capability {
+            buf.put_u8(0x58);
+            cap.encode(buf);
+        }
+        if let Some(tai) = &self.last_visited_tai {
+            buf.put_u8(0x52);
+            tai.encode(buf);
+        }
+        if let Some(drx) = &self.drx_parameter {
+            buf.put_u8(0x5C);
+            buf.put_slice(drx);
+        }
+        put_type1(buf, 0xA0, self.ue_radio_capability_update_needed);
+        if let Some(status) = self.eps_bearer_context_status {
+            buf.put_u8(0x57);
+            buf.put_u8(2);
+            buf.put_u8((status & 0xFF) as u8);
+            buf.put_u8((status >> 8) as u8);
+        }
+        put_tlv(buf, 0x31, &self.ms_network_capability);
+        put_type1(buf, 0x90, self.tmsi_status);
+        put_type1(buf, 0xF0, self.additional_update_type);
+        put_tlv(buf, 0x5D, &self.voice_domain_preference);
+        put_type1(buf, 0xE0, self.old_guti_type);
+        put_type1(buf, 0xD0, self.device_properties);
+        put_tlv(buf, 0x6A, &self.t3324_value);
+        put_tlv(buf, 0x5E, &self.t3412_extended_value);
+        put_tlv(buf, 0x6E, &self.extended_drx_parameters);
+        put_tlv(buf, 0x6F, &self.ue_additional_security_capability);
+        put_tlv(buf, 0x6D, &self.ue_status);
     }
 
     /// Decode from bytes
@@ -590,12 +700,107 @@ impl TrackingAreaUpdateRequest {
         let eps_update_type = first_byte & 0x0F;
         let nas_key_set_identifier = KeySetIdentifier::decode((first_byte >> 4) & 0x0F);
         let old_guti = EpsMobileIdentity::decode(buf)?;
-        Ok(Self {
+        let mut msg = Self {
             eps_update_type,
             nas_key_set_identifier,
             old_guti,
             ..Default::default()
-        })
+        };
+        // Optional IEs (TS 24.301 Table 8.2.29.1, #931). Type 1 IEs carry their
+        // value in the IEI octet; the type 3 (TV) ones have fixed lengths and
+        // must be skipped by them, not read as TLV (#784).
+        while buf.remaining() > 0 {
+            let iei = buf.peek_u8()?;
+            match iei {
+                0xB0..=0xBF => msg.non_current_native_nas_ksi = Some(buf.read_u8()? & 0x0F),
+                0xA0..=0xAF => msg.ue_radio_capability_update_needed = Some(buf.read_u8()? & 0x0F),
+                0x90..=0x9F => msg.tmsi_status = Some(buf.read_u8()? & 0x0F),
+                0xF0..=0xFF => msg.additional_update_type = Some(buf.read_u8()? & 0x0F),
+                0xE0..=0xEF => msg.old_guti_type = Some(buf.read_u8()? & 0x0F),
+                0xD0..=0xDF => msg.device_properties = Some(buf.read_u8()? & 0x0F),
+                0x19 => {
+                    buf.skip(1)?;
+                    let mut sig = [0u8; 3];
+                    buf.read_into(&mut sig)?;
+                    msg.old_p_tmsi_signature = Some(sig);
+                }
+                0x50 => {
+                    buf.skip(1)?;
+                    set_first(
+                        &mut msg.additional_guti,
+                        optional_tlv(buf, EpsMobileIdentity::decode)?,
+                    );
+                }
+                0x55 => {
+                    buf.skip(1)?;
+                    let mut nonce = [0u8; 4];
+                    buf.read_into(&mut nonce)?;
+                    msg.nonce_ue = Some(nonce);
+                }
+                0x58 => {
+                    buf.skip(1)?;
+                    set_first(
+                        &mut msg.ue_network_capability,
+                        optional_tlv(buf, UeNetworkCapability::decode)?,
+                    );
+                }
+                0x52 => {
+                    buf.skip(1)?;
+                    msg.last_visited_tai = Some(EpsTai::decode(buf)?);
+                }
+                0x5C => {
+                    buf.skip(1)?;
+                    let mut drx = [0u8; 2];
+                    buf.read_into(&mut drx)?;
+                    msg.drx_parameter = Some(drx);
+                }
+                0x57 => {
+                    buf.skip(1)?;
+                    let v = opaque_tlv(buf)?;
+                    // §9.9.2.1: two contents octets; a shorter one is not legal
+                    // and is ignored rather than guessed at.
+                    if v.len() >= 2 {
+                        msg.eps_bearer_context_status =
+                            Some(u16::from(v[0]) | (u16::from(v[1]) << 8));
+                    }
+                }
+                0x31 => {
+                    buf.skip(1)?;
+                    msg.ms_network_capability = Some(opaque_tlv(buf)?);
+                }
+                0x5D => {
+                    buf.skip(1)?;
+                    msg.voice_domain_preference = Some(opaque_tlv(buf)?);
+                }
+                0x6A => {
+                    buf.skip(1)?;
+                    msg.t3324_value = Some(opaque_tlv(buf)?);
+                }
+                0x5E => {
+                    buf.skip(1)?;
+                    msg.t3412_extended_value = Some(opaque_tlv(buf)?);
+                }
+                0x6E => {
+                    buf.skip(1)?;
+                    msg.extended_drx_parameters = Some(opaque_tlv(buf)?);
+                }
+                0x6F => {
+                    buf.skip(1)?;
+                    msg.ue_additional_security_capability = Some(opaque_tlv(buf)?);
+                }
+                0x6D => {
+                    buf.skip(1)?;
+                    msg.ue_status = Some(opaque_tlv(buf)?);
+                }
+                // Old location area identification (TV 6) and Additional
+                // information requested (TV 2): not modelled, skipped by their
+                // fixed lengths.
+                0x13 => buf.skip(6)?,
+                0x17 => buf.skip(2)?,
+                _ => skip_unknown_ie(buf, iei)?,
+            }
+        }
+        Ok(msg)
     }
 }
 
@@ -1336,11 +1541,30 @@ impl EpsUplinkNasTransport {
 pub struct CsServiceNotification {
     /// Paging identity
     pub paging_identity: u8,
+    // Optional IEs (TS 24.301 Table 8.2.9.1, #931)
+    /// CLI (IEI 60, TLV): the calling party BCD number contents.
+    pub cli: Option<Vec<u8>>,
+    /// SS Code (IEI 61, TV 2)
+    pub ss_code: Option<u8>,
+    /// LCS indicator (IEI 62, TV 2)
+    pub lcs_indicator: Option<u8>,
+    /// LCS client identity (IEI 63, TLV): the value.
+    pub lcs_client_identity: Option<Vec<u8>>,
 }
 
 impl CsServiceNotification {
     pub fn encode(&self, buf: &mut BytesMut) {
         buf.put_u8(self.paging_identity);
+        put_tlv(buf, 0x60, &self.cli);
+        if let Some(code) = self.ss_code {
+            buf.put_u8(0x61);
+            buf.put_u8(code);
+        }
+        if let Some(lcs) = self.lcs_indicator {
+            buf.put_u8(0x62);
+            buf.put_u8(lcs);
+        }
+        put_tlv(buf, 0x63, &self.lcs_client_identity);
     }
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
@@ -1350,9 +1574,34 @@ impl CsServiceNotification {
                 actual: buf.remaining(),
             });
         }
-        Ok(Self {
+        let mut msg = Self {
             paging_identity: buf.read_u8()?,
-        })
+            ..Default::default()
+        };
+        while buf.remaining() > 0 {
+            let iei = buf.peek_u8()?;
+            match iei {
+                0x60 => {
+                    buf.skip(1)?;
+                    msg.cli = Some(opaque_tlv(buf)?);
+                }
+                // SS Code and LCS indicator are type 3 (TV 2), not TLV.
+                0x61 => {
+                    buf.skip(1)?;
+                    msg.ss_code = Some(buf.read_u8()?);
+                }
+                0x62 => {
+                    buf.skip(1)?;
+                    msg.lcs_indicator = Some(buf.read_u8()?);
+                }
+                0x63 => {
+                    buf.skip(1)?;
+                    msg.lcs_client_identity = Some(opaque_tlv(buf)?);
+                }
+                _ => skip_unknown_ie(buf, iei)?,
+            }
+        }
+        Ok(msg)
     }
 }
 
@@ -1476,6 +1725,23 @@ pub struct BearerResourceModificationRequest {
     pub traffic_flow_aggregate: Vec<u8>,
     /// Procedure transaction identity
     pub pti: u8,
+    // Optional IEs (TS 24.301 Table 8.3.10.1, #931)
+    /// Required traffic flow QoS (IEI 5B, TLV): the EPS QoS contents.
+    pub required_traffic_flow_qos: Option<Vec<u8>>,
+    /// ESM cause (IEI 58, TV 2)
+    pub esm_cause: Option<u8>,
+    /// Protocol configuration options (IEI 27, TLV): the value.
+    pub protocol_configuration_options: Option<Vec<u8>>,
+    /// Device properties (IEI C-, TV 1): the value.
+    pub device_properties: Option<u8>,
+    /// NBIFOM container (IEI 33, TLV): the value.
+    pub nbifom_container: Option<Vec<u8>>,
+    /// Header compression configuration (IEI 66, TLV): the value.
+    pub header_compression_configuration: Option<Vec<u8>>,
+    /// Extended protocol configuration options (IEI 7B, TLV-E): the value.
+    pub extended_protocol_configuration_options: Option<Vec<u8>>,
+    /// Extended EPS QoS (IEI 5C, TLV): the value.
+    pub extended_eps_qos: Option<Vec<u8>>,
 }
 
 /// Bearer Resource Modification Reject message
@@ -1744,6 +2010,21 @@ impl BearerResourceModificationRequest {
         buf.put_u8(self.eps_bearer_identity & 0x0F);
         buf.put_u8(self.traffic_flow_aggregate.len() as u8);
         buf.put_slice(&self.traffic_flow_aggregate);
+        put_tlv(buf, 0x5B, &self.required_traffic_flow_qos);
+        if let Some(cause) = self.esm_cause {
+            buf.put_u8(0x58);
+            buf.put_u8(cause);
+        }
+        put_tlv(buf, 0x27, &self.protocol_configuration_options);
+        put_type1(buf, 0xC0, self.device_properties);
+        put_tlv(buf, 0x33, &self.nbifom_container);
+        put_tlv(buf, 0x66, &self.header_compression_configuration);
+        if let Some(epco) = &self.extended_protocol_configuration_options {
+            buf.put_u8(0x7B);
+            buf.put_u16(epco.len() as u16);
+            buf.put_slice(epco);
+        }
+        put_tlv(buf, 0x5C, &self.extended_eps_qos);
     }
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
@@ -1768,11 +2049,49 @@ impl BearerResourceModificationRequest {
             });
         }
         let tfa = buf.read_bytes(tfa_len)?.to_vec();
-        Ok(Self {
+        let mut msg = Self {
             eps_bearer_identity: ebi,
             traffic_flow_aggregate: tfa,
             ..Default::default()
-        })
+        };
+        while buf.remaining() > 0 {
+            let iei = buf.peek_u8()?;
+            match iei {
+                0x5B => {
+                    buf.skip(1)?;
+                    msg.required_traffic_flow_qos = Some(opaque_tlv(buf)?);
+                }
+                // ESM cause is type 3 (TV 2), not TLV.
+                0x58 => {
+                    buf.skip(1)?;
+                    msg.esm_cause = Some(buf.read_u8()?);
+                }
+                0x27 => {
+                    buf.skip(1)?;
+                    msg.protocol_configuration_options = Some(opaque_tlv(buf)?);
+                }
+                0xC0..=0xCF => msg.device_properties = Some(buf.read_u8()? & 0x0F),
+                0x33 => {
+                    buf.skip(1)?;
+                    msg.nbifom_container = Some(opaque_tlv(buf)?);
+                }
+                0x66 => {
+                    buf.skip(1)?;
+                    msg.header_compression_configuration = Some(opaque_tlv(buf)?);
+                }
+                0x7B => {
+                    buf.skip(1)?;
+                    msg.extended_protocol_configuration_options =
+                        Some(crate::buf::opaque_tlv_e(buf)?);
+                }
+                0x5C => {
+                    buf.skip(1)?;
+                    msg.extended_eps_qos = Some(opaque_tlv(buf)?);
+                }
+                _ => skip_unknown_ie(buf, iei)?,
+            }
+        }
+        Ok(msg)
     }
 }
 

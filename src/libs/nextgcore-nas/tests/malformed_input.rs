@@ -95,6 +95,9 @@ const DECODERS: &[Decoder] = &[
     |b| eps::AttachRequest::decode(b).is_ok(),
     |b| eps::AttachAccept::decode(b).is_ok(),
     |b| eps::TrackingAreaUpdateRequest::decode(b).is_ok(),
+    |b| eps::DetachRequest::decode(b).is_ok(),
+    |b| eps::BearerResourceModificationRequest::decode(b).is_ok(),
+    |b| eps::CsServiceNotification::decode(b).is_ok(),
     |b| eps::EpsAuthenticationRequest::decode(b).is_ok(),
     |b| eps::PdnConnectivityRequest::decode(b).is_ok(),
 ];
@@ -124,4 +127,21 @@ fn short_inputs_never_panic() {
             let _ = decode(&mut b(input));
         }
     }
+}
+
+/// #931: a fixed-length (TV) optional IE cut short is an error, not a read past
+/// the end or a guess.
+#[test]
+fn truncated_tv_optional_ies_are_err() {
+    // TAU REQUEST: update type, GUTI (LV 11), then a Nonce_UE (TV 5) with 2 octets.
+    let mut tau = vec![
+        0x00, 0x0b, 0xf6, 0x00, 0xf1, 0x10, 0x00, 0x01, 0x02, 0x98, 0x76, 0x54, 0x32,
+    ];
+    tau.extend_from_slice(&[0x55, 0x01, 0x02]);
+    assert!(eps::TrackingAreaUpdateRequest::decode(&mut b(&tau)).is_err());
+    // BEARER RESOURCE MODIFICATION REQUEST: EBI, TFA (LV), then an ESM cause
+    // (TV 2) with no value octet.
+    assert!(
+        eps::BearerResourceModificationRequest::decode(&mut b(&[0x05, 0x01, 0x21, 0x58])).is_err()
+    );
 }
