@@ -1342,6 +1342,27 @@ fn tau_request_skips_unmodelled_ies_and_reads_on() {
     assert_eq!(decoded.eps_bearer_context_status, Some(1 << 5));
 }
 
+/// #1173 review: Additional information requested (0x17) is TV 2. Read as a
+/// TLV, its value octet (here 0x02) would be taken as a length and swallow the
+/// UE status IE that follows.
+#[test]
+fn tau_request_additional_information_requested_is_tv2() {
+    let mut wire = BytesMut::new();
+    TrackingAreaUpdateRequest {
+        old_guti: EpsMobileIdentity::Guti(test_eps_guti()),
+        ..Default::default()
+    }
+    .encode(&mut wire);
+    wire.extend_from_slice(&[0x17, 0x02]);
+    wire.extend_from_slice(&[0x6D, 0x01, 0x01]);
+    let decoded = TrackingAreaUpdateRequest::decode(&mut wire.freeze()).unwrap();
+    assert_eq!(
+        decoded.ue_status,
+        Some(vec![0x01]),
+        "the IE after 0x17 is read"
+    );
+}
+
 #[test]
 fn emm_tracking_area_update_accept() {
     roundtrip_emm(EmmMessage::TrackingAreaUpdateAccept(
