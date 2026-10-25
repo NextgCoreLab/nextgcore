@@ -25794,6 +25794,11 @@ mod tests {
     ///
     /// REVERT-VERIFIED: awaiting the SMF work before the Ack makes the handler take
     /// longer than the bound.
+    ///
+    /// #1205: only this test's own requests are counted. The stand-in sits at the
+    /// process-wide `SMF_SBI_*` address for the whole test, so a request another test
+    /// addresses there also arrives (a CI run saw 81). Each of the 80 sessions is still
+    /// required to be deactivated exactly once.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_ng_reset_is_acknowledged_before_the_smf_answers() {
         let (_nf, port, seen) = slow_recording_nf(Duration::from_millis(1000)).await;
@@ -25842,20 +25847,39 @@ mod tests {
             "every permit taken: {} in flight",
             ngap.sbi_offload.in_flight()
         );
+        // #1205: this test's deactivations, in arrival order; anything else is ignored.
+        let ours = || -> Vec<String> {
+            seen.lock()
+                .expect("seen")
+                .iter()
+                .filter(|r| r.contains("/sm-contexts/smctx-754-slow-"))
+                .cloned()
+                .collect()
+        };
         let deadline = Instant::now() + Duration::from_secs(10);
-        while seen.lock().expect("seen").is_empty() && Instant::now() < deadline {
+        while ours().is_empty() && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let in_first_wave = seen.lock().expect("seen").len();
+        let in_first_wave = ours().len();
         assert!(
             (1..=MAX_OFFLOADED_SBI).contains(&in_first_wave),
             "{in_first_wave} calls in flight at once"
         );
         ngap.sbi_offload.settle().await;
+        let mut deactivated = ours();
+        deactivated.sort();
+        let mut expected: Vec<String> = ues
+            .iter()
+            .flat_map(|ue| {
+                [5u8, 6].map(|psi| {
+                    format!("POST /nsmf-pdusession/v1/sm-contexts/smctx-754-slow-{ue}-{psi}/modify")
+                })
+            })
+            .collect();
+        expected.sort();
         assert_eq!(
-            seen.lock().expect("seen").len(),
-            80,
-            "every session deactivated"
+            deactivated, expected,
+            "every session deactivated, each exactly once"
         );
         for &ue in &ues {
             ngap.ue_auth_state.remove(ue);

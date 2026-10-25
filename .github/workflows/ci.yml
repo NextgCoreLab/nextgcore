@@ -124,13 +124,16 @@ jobs:
           cd src && cargo test --workspace
 
       - name: cargo test smfd, one test thread (test-isolation guards)
-        # #723: smfd's `require_test_lock` guards (teardown_association, the 5GSM
-        # timer map) can name a test that forgot PROCESS_STATE_TEST_LOCK /
-        # N4_TEST_LOCK only when no sibling holds the lock, i.e. in a serial run.
-        # The parallel run above cannot see such a test until it flakes a
-        # sibling. `--workspace --bin` keeps the workspace's feature unification,
-        # so this reuses the build above instead of rebuilding smfd's dependency
-        # graph with `-p`'s features; about 20 s.
+        # #723, #979: smfd's `require_test_lock` guards (teardown_association, the
+        # 5GSM timer map) check that the CALLER's test holds PROCESS_STATE_TEST_LOCK
+        # / N4_TEST_LOCK, by the holder's thread. On a runtime worker thread (a
+        # multi_thread test's spawned task) no holder can be named, and the check
+        # is only "someone holds it", exact in a serial run. #1092: releasing
+        # PROCESS_STATE_TEST_LOCK fails a test that left UEs, sessions or policy
+        # bindings behind ("TEST STATE LEAK"); this run names it. `--workspace
+        # --bin` keeps the workspace's feature unification, so this reuses the
+        # build above instead of rebuilding smfd's dependency graph with `-p`'s
+        # features; about 20 s.
         run: cd src && cargo test --workspace --bin nextgcore-smfd -- --test-threads=1
 
       - name: cargo test (non-default features)
@@ -171,6 +174,45 @@ jobs:
           echo "peak used RAM (MB): $(sort -n -k1 "$RUNNER_TEMP/mem.log" | tail -1 | cut -d' ' -f1)"
           echo "peak used swap (MB): $(sort -n -k2 "$RUNNER_TEMP/mem.log" | tail -1 | cut -d' ' -f2)"
           df -h /
+
+  smfd-parallel-loop:
+    name: smfd 20 parallel runs (nightly)
+    # #979 option C: the interleavings a serial run cannot produce. Nightly and on
+    # demand only. Its own job, not a step of `test` (#1200 review M1): one smfd
+    # parallel run takes about 3.5 min on CI, so 20 of them after the ~21 min
+    # workspace test overran that job's 60 min timeout every night. Here the
+    # build is smfd's alone (about 10 min) and the loop about 70 min; 150 min
+    # leaves headroom while still turning a hang into a timeout. `bash -e` stops
+    # at the first red run, which is the one to read.
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 150
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Add swap headroom
+        # ngap-gen compiles as part of smfd's graph; same headroom as `test`.
+        run: |
+          set -eu
+          sudo fallocate -l 12G /mnt/ci-swapfile
+          sudo chmod 600 /mnt/ci-swapfile
+          sudo mkswap /mnt/ci-swapfile
+          sudo swapon /mnt/ci-swapfile
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src
+      - name: build the smfd test binary
+        run: cd src && cargo test -p nextgcore-smfd --no-run
+      - name: cargo test smfd, 20 parallel runs
+        run: |
+          cd src
+          for i in $(seq 1 20); do
+            echo "smfd parallel run $i/20"
+            cargo test -p nextgcore-smfd
+          done
 
   clippy:
     name: Clippy
