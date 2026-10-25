@@ -208,6 +208,10 @@ pub enum S11Continuation {
     /// steps 3-4: the SGW answers after switching the downlink path). `join`
     /// names the pending answer in `sxa_response`.
     ModifyBearer { join: u64, sess_id: u64 },
+    /// The PDN connection a Delete Bearer Response released (#710): no MME waits,
+    /// but the local session goes only once the SGW-U has deleted its own, as for
+    /// a Delete Session.
+    ReleasePdn { sess_id: u64 },
     /// A session established again on a restarted SGW-U (#1010 review): no MME
     /// waits, but a refused or unanswered restoration is counted and logged
     /// ([`RESTORATIONS_FAILED`]).
