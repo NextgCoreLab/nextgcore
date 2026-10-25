@@ -1980,6 +1980,27 @@ pub fn handle_esm_message(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue: &MmeUe, esm:
     let message_type = esm[2];
     let body = &esm[3..];
 
+    // TS 24.301 §7.3.2 g): an ACTIVATE DEDICATED EPS BEARER CONTEXT ACCEPT or
+    // REJECT naming no existing EPS bearer context is ignored; it must not fall
+    // through to the PDN connection's default bearer below. A late ACCEPT for
+    // an activation already refused gets the bearer deactivated (#641 follow-up).
+    if matches!(
+        message_type,
+        esm_type::ACTIVATE_DEDICATED_BEARER_ACCEPT | esm_type::ACTIVATE_DEDICATED_BEARER_REJECT
+    ) && ctx.bearer_find_by_ebi(mme_ue.id, ebi).is_none()
+    {
+        if message_type == esm_type::ACTIVATE_DEDICATED_BEARER_ACCEPT {
+            crate::bearer_activation::on_unknown_accept(ctx, mme_ue.id, ebi);
+        } else {
+            log::warn!(
+                "[{}] ACTIVATE DEDICATED EPS BEARER CONTEXT REJECT for EBI {ebi}, which has no \
+                 bearer; ignored (TS 24.301 §7.3.2 g)",
+                mme_ue.imsi_bcd
+            );
+        }
+        return;
+    }
+
     // The ESM handlers all want a session and a bearer. A PDN CONNECTIVITY
     // REQUEST creates them (keyed by its procedure transaction identity);
     // anything else refers to what that request left behind.
@@ -2263,11 +2284,21 @@ pub fn handle_esm_message(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue: &MmeUe, esm:
         }
         esm_type::PDN_DISCONNECT_REQUEST => {
             match esm_handler::handle_pdn_disconnect_request(enb_ue, mme_ue, &sess, body) {
-                Ok(linked_ebi) => log::info!(
-                    "[{}] PDN Disconnect Request (linked ebi={linked_ebi}); the S11 Delete \
-                     Session Request to the SGW is not implemented (#51)",
-                    mme_ue.imsi_bcd
-                ),
+                Ok(linked_ebi) => {
+                    // TS 24.301 §6.4.2.6 b): a dedicated bearer activation on this
+                    // PDN connection is terminated locally.
+                    crate::bearer_activation::settle_for_pdn(
+                        ctx,
+                        mme_ue.id,
+                        linked_ebi,
+                        crate::s11_build::GtpCause::UeRefuses,
+                    );
+                    log::info!(
+                        "[{}] PDN Disconnect Request (linked ebi={linked_ebi}); the S11 Delete \
+                         Session Request to the SGW is not implemented (#51)",
+                        mme_ue.imsi_bcd
+                    )
+                }
                 Err(e) => log::warn!("[{}] PDN Disconnect Request rejected: {e}", mme_ue.imsi_bcd),
             }
         }

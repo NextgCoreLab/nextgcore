@@ -5831,3 +5831,182 @@ async fn a_second_downlink_data_transfer_while_paging_gets_409_with_retry_after(
     assert_eq!(paged.pdu_session_id, Some(2));
     server.forget_ue(ue);
 }
+
+/// A protected UL NAS TRANSPORT carrying `sm` for PSI `sm[1]`, with the Request type
+/// value `request_type` (TS 24.501 §8.2.10, §9.11.3.47).
+fn ul_nas_transport_with_request_type(sm: &[u8], request_type: u8, count: u8) -> Vec<u8> {
+    let mut inner = vec![0x7E, 0x00, 0x67, 0x01];
+    inner.extend_from_slice(&(sm.len() as u16).to_be_bytes());
+    inner.extend_from_slice(sm);
+    inner.extend_from_slice(&[0x12, sm[1], 0x80 | request_type]);
+    ue_protect(&inner, count)
+}
+
+/// A stand-in SMF that records each CreateSMContext's `requestType` and
+/// `3gpp-Sbi-Message-Priority`, and answers it with an SM context.
+async fn create_recording_smf() -> (
+    nextgcore_sbi::server::SbiServer,
+    u16,
+    Arc<std::sync::Mutex<Vec<(Option<String>, Option<String>)>>>,
+) {
+    use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    let seen: Arc<std::sync::Mutex<Vec<(Option<String>, Option<String>)>>> = Arc::default();
+    let sink = Arc::clone(&seen);
+    let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+    let server = nextgcore_sbi::server::SbiServer::on_listener(
+        nextgcore_sbi::server::SbiServerConfig::new(addr),
+        listener,
+    );
+    server
+        .start(move |req: SReq| {
+            let sink = Arc::clone(&sink);
+            async move {
+                if !req.header.uri.ends_with("/nsmf-pdusession/v1/sm-contexts") {
+                    return SResp::no_content();
+                }
+                let body: serde_json::Value = req
+                    .http
+                    .content
+                    .as_deref()
+                    .and_then(|c| serde_json::from_str(c).ok())
+                    .unwrap_or_default();
+                sink.lock().expect("sink").push((
+                    body["requestType"].as_str().map(String::from),
+                    req.http
+                        .get_header(nextgcore_sbi::constants::custom_header::MESSAGE_PRIORITY)
+                        .cloned(),
+                ));
+                let body = serde_json::json!({
+                    "smContextRef": "est-1222",
+                    "n1SmMsg": base64::engine::general_purpose::STANDARD
+                        .encode([0x2E, 0x05, 0x01, 0xC2]),
+                    "n2SmInfo": base64::engine::general_purpose::STANDARD
+                        .encode(transfer_for("est-1222")),
+                });
+                SResp::with_status(201).with_body(body.to_string(), "application/json")
+            }
+        })
+        .await
+        .expect("stand-in SMF starts");
+    (server, addr.port(), seen)
+}
+
+/// #1222, TS 29.502 Table 6.1.6.2.2-1 and TS 23.502 §4.3.2.2.1 step 3.
+///
+/// The CreateSMContext carries what the SMF needs to apply TS 24.501 §6.4.1.4.1, where
+/// no Back-off timer goes to an emergency request or to a UE configured for high
+/// priority access (#1188):
+/// - `requestType` from the UE's Request type IE: 3 is INITIAL_EMERGENCY_REQUEST, 1 is
+///   INITIAL_REQUEST;
+/// - `3gpp-Sbi-Message-Priority` only for a UE that connected with a priority
+///   establishment cause. An ordinary UE's request has no header, i.e. the default
+///   priority 24.
+///
+/// REVERT-VERIFIED: with the `requestType` member not emitted, the emergency request
+/// arrives without it; with no header, the priority UE's request arrives without one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn the_create_carries_the_request_type_and_a_priority_ues_message_priority() {
+    let (_smf, port, seen) = create_recording_smf().await;
+    let _env = super::SmfEnvGuard::acquire(port).await;
+    let mut server = capturing_ngap_server().await;
+    let (ordinary, priority) = ((7_122_201u64, 201u32), (7_122_202u64, 202u32));
+    ue_ready_for_sessions(&mut server, ordinary.0, ordinary.1);
+    ue_ready_for_sessions(&mut server, priority.0, priority.1);
+    server.note_establishment_cause(
+        priority.0,
+        nextgcore_ngap::types::RrcEstablishmentCause::MpsPriorityAccess as u8,
+    );
+
+    let request = [0x2E, 0x05, 0x01, 0xC1, 0xFF, 0xFF];
+    for ((ue, ran), request_type) in [(ordinary, 3u8), (priority, 1)] {
+        server
+            .handle_uplink_nas_transport(
+                ASSOC,
+                &uplink_nas_transport(
+                    ue,
+                    ran,
+                    &ul_nas_transport_with_request_type(&request, request_type, 0),
+                ),
+            )
+            .await
+            .expect("handled");
+        settle_establishments(&mut server).await;
+    }
+
+    assert_eq!(
+        *seen.lock().expect("seen"),
+        vec![
+            (Some("INITIAL_EMERGENCY_REQUEST".to_string()), None),
+            (
+                Some("INITIAL_REQUEST".to_string()),
+                Some(crate::sbi_path::DEFAULT_PRIORITY_MESSAGE_PRIORITY.to_string())
+            ),
+        ],
+        "(requestType, 3gpp-Sbi-Message-Priority) of each CreateSMContext"
+    );
+    assert!(
+        server.ul_request_types.is_empty(),
+        "the Request type is held only around its dispatch"
+    );
+    server.forget_ue(ordinary.0);
+    server.forget_ue(priority.0);
+}
+
+/// #1222: the INITIAL UE MESSAGE's RRC Establishment Cause decides the UE's priority
+/// access (TS 24.501 Table 4.5.6.1: access identities 1, 2 and 11-15 use
+/// mps-PriorityAccess, mcs-PriorityAccess and highPriorityAccess), and so does every
+/// later connection.
+///
+/// REVERT-VERIFIED: without `note_establishment_cause` in the Initial UE Message
+/// handler, the mps-PriorityAccess UE is not marked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_establishment_cause_marks_a_high_priority_access_ue() {
+    use nextgcore_ngap::types::RrcEstablishmentCause as C;
+    let mut server = capturing_ngap_server().await;
+    const ASSOC_1222: u64 = 1_222_001;
+    for (n, (cause, expected)) in [
+        (C::MpsPriorityAccess, true),
+        (C::McsPriorityAccess, true),
+        (C::HighPriorityAccess, true),
+        (C::MoSignalling, false),
+        (C::Emergency, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ran_ue_ngap_id = 1_222_100 + n as u32;
+        let pdu = nextgcore_ngap::builder::build_initial_ue_message(
+            &nextgcore_ngap::types::InitialUeMessage {
+                ran_ue_ngap_id,
+                nas_pdu: vec![
+                    0x7E,
+                    security_header::PLAIN_NAS_MESSAGE,
+                    message_type::REGISTRATION_REQUEST,
+                    0x09,
+                    0x00,
+                ],
+                user_location_info: super::test_user_location(1, 0x10),
+                rrc_establishment_cause: cause,
+                ue_context_request: Some(true),
+                allowed_nssai: Vec::new(),
+            },
+        )
+        .expect("encode an InitialUEMessage");
+        let _ = server.handle_initial_ue_message(ASSOC_1222, &pdu).await;
+        let (key, state) = server
+            .ue_auth_state
+            .snapshot()
+            .into_iter()
+            .find(|(_, s)| s.ran_ue_ngap_id == ran_ue_ngap_id && s.association_id == ASSOC_1222)
+            .expect("the Initial UE Message creates a UE context");
+        assert_eq!(state.amf_ue.priority_access_cause, expected, "{cause:?}");
+        assert_eq!(
+            crate::sbi_path::priority_message_priority(&state.amf_ue).is_some(),
+            expected,
+            "{cause:?}"
+        );
+        server.forget_ue(key);
+    }
+}
