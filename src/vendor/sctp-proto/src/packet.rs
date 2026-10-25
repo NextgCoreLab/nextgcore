@@ -64,11 +64,22 @@ pub struct PartialDecode {
     pub(crate) common_header: CommonHeader,
     pub(crate) remaining: Bytes,
     pub(crate) first_chunk_type: ChunkType,
+    /// nextgcore #1142: the first chunk's flags, for the T bit of an ABORT or a
+    /// SHUTDOWN COMPLETE (RFC 9260 §8.5.1 B).
+    pub(crate) first_chunk_flags: u8,
     pub(crate) initiate_tag: Option<u32>,
     pub(crate) cookie: Option<Bytes>,
 }
 
 impl PartialDecode {
+    /// nextgcore #1142, RFC 9260 §8.5.1 B: an ABORT or SHUTDOWN COMPLETE with the T bit
+    /// set carries the PEER's Verification Tag, reflected (it answers an out-of-the-blue
+    /// packet of ours, §8.4), not ours.
+    pub(crate) fn is_reflected_end(&self) -> bool {
+        matches!(self.first_chunk_type, CT_ABORT | CT_SHUTDOWN_COMPLETE)
+            && self.first_chunk_flags & 0x01 != 0
+    }
+
     pub(crate) fn unmarshal(raw: &Bytes) -> Result<Self> {
         if raw.len() < PACKET_HEADER_SIZE {
             return Err(Error::ErrPacketRawTooSmall);
@@ -116,6 +127,7 @@ impl PartialDecode {
             },
             remaining: raw.slice(PACKET_HEADER_SIZE..),
             first_chunk_type: header.typ,
+            first_chunk_flags: header.flags,
             initiate_tag,
             cookie,
         })

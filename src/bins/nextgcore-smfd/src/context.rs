@@ -1071,6 +1071,16 @@ pub struct SmfSess {
     pub sgw_s5c_teid: u32,
     /// SGW S5C IP
     pub sgw_s5c_ip: IpAddr,
+    /// #1194: the interface type of the SGW-C's (sender) F-TEID for control plane,
+    /// part of what identifies a PDN connection at the PGW (TS 29.274 §7.2.1).
+    pub sgw_s5c_interface_type: u8,
+    /// #1198 review B1: the SGW-C Restart counter this PDN connection was set up under
+    /// (the Create Session Request's Recovery IE), `None` when it carried none.
+    pub sgw_restart_counter: Option<u8>,
+    /// #1198 review B1: when the PDN connection was set up through, or moved to, its
+    /// current SGW-C. With no counter, it is the old incarnation's only if this is no
+    /// later than that incarnation's last proof of life.
+    pub sgw_attached_at: Option<std::time::Instant>,
     /// SMF N4 SEID
     pub smf_n4_seid: u64,
     /// UPF N4 SEID
@@ -1234,6 +1244,9 @@ impl SmfSess {
             smf_n4_teid: 0,
             sgw_s5c_teid: 0,
             sgw_s5c_ip: IpAddr::default(),
+            sgw_s5c_interface_type: 0,
+            sgw_restart_counter: None,
+            sgw_attached_at: None,
             smf_n4_seid: 0,
             upf_n4_seid: 0,
             local_dl_teid: 0,
@@ -4058,6 +4071,28 @@ pub(crate) fn require_test_lock(lock: &TestLock, lock_name: &str, what: &str) {
     }
 }
 
+/// Read `lock` for the durable snapshot, through a poison (#1178): the data the
+/// panicking writer left is what is written. Falling back to an empty map wrote that
+/// over the last good snapshot.
+///
+/// #1178 follow-up: the poison is then cleared. Every writer of these maps skips on
+/// `Err` (`if let Ok(..) = .write()`), so a map left poisoned froze at the panic:
+/// sessions created after it were never recorded, released ones stayed in every later
+/// snapshot. Cleared, they resume and the snapshot follows the process again. A
+/// `HashMap` a panic interrupted is still a valid map. That also logs once per
+/// poisoning, not at every `persist()`.
+fn read_through<'a, T>(lock: &'a RwLock<T>, what: &str) -> std::sync::RwLockReadGuard<'a, T> {
+    lock.read().unwrap_or_else(|poisoned| {
+        log::error!(
+            "SMF state: the {what} lock was poisoned (a panic while it was held); the \
+             snapshot is taken through the poison, and the poison is cleared so its \
+             writers resume"
+        );
+        lock.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
 /// Finalize the global SMF context
 pub fn smf_context_final() {
     let ctx = smf_self();
@@ -4078,19 +4113,6 @@ pub fn smf_instance_get_load() -> i32 {
 // ============================================================================
 // Tests
 // ============================================================================
-
-/// Read `lock` for the durable snapshot, through a poison (#1178): logged, and the
-/// data the panicking writer left is what is written. Falling back to an empty map
-/// wrote that over the last good snapshot.
-fn read_through<'a, T>(lock: &'a RwLock<T>, what: &str) -> std::sync::RwLockReadGuard<'a, T> {
-    lock.read().unwrap_or_else(|poisoned| {
-        log::error!(
-            "SMF state: the {what} lock is poisoned (a panic while it was held); the \
-             snapshot is taken through the poison"
-        );
-        poisoned.into_inner()
-    })
-}
 
 #[cfg(test)]
 mod tests {
@@ -4959,6 +4981,40 @@ mod tests {
         );
         assert!(restored_binding, "and its binding");
         assert!(restored_addr, "and its address");
+    }
+
+    /// #1178 follow-up: the snapshot clears the poison it read through, so the map's
+    /// writers (which skip a poisoned lock) resume: a session created after the panic
+    /// is recorded, one released after it leaves the next snapshot. Left poisoned, the
+    /// map froze at the panic and every later snapshot carried the released session.
+    #[test]
+    fn a_poisoned_map_resumes_after_the_snapshot() {
+        let path = temp_state_path("1178-resume");
+        let ctx = ctx_with_state(&path);
+        ctx.pfcp_sessions
+            .write()
+            .unwrap()
+            .insert("11781".to_string(), 0x1181);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ctx.pfcp_sessions.write().unwrap();
+            panic!("poison pfcp_sessions");
+        }));
+        ctx.persist();
+        // What every production writer does: skip on Err.
+        if let Ok(mut m) = ctx.pfcp_sessions.write() {
+            m.remove("11781");
+            m.insert("11782".to_string(), 0x1182);
+        }
+        ctx.persist();
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(!ctx.pfcp_sessions.is_poisoned(), "the poison is cleared");
+        assert_eq!(written["pfcpSessions"]["11782"], serde_json::json!(0x1182));
+        assert!(
+            written["pfcpSessions"]["11781"].is_null(),
+            "the released session left the snapshot"
+        );
     }
 
     /// The whole point of #191: a session created before a restart, and the
