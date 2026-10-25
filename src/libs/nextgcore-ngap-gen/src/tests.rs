@@ -376,3 +376,40 @@ fn packet_loss_rate_matches_hand_derived_octets() {
         );
     }
 }
+
+/// #1163: [`bit_rate`] sends a rate past BitRate's root (TS 38.413 §9.3.1.4)
+/// as 4000000000000. Encoded raw, 4000000000001 is an extension value and
+/// `u64::MAX` one this codec cannot decode; through [`bit_rate`] each is the
+/// root's bytes for the maximum, and decodes as it.
+#[test]
+fn a_bit_rate_past_the_root_round_trips_as_the_maximum() {
+    let ambr = |dl: generated::BitRate| generated::PDUSessionAggregateMaximumBitRate {
+        pdu_session_aggregate_maximum_bit_rate_dl: dl,
+        pdu_session_aggregate_maximum_bit_rate_ul: bit_rate(1),
+        ie_extensions: None,
+    };
+    let max = encode_contained(&ambr(bit_rate(BIT_RATE_MAX))).expect("encode");
+    let raw = encode_contained(&ambr(generated::BitRate(BIT_RATE_MAX + 1))).expect("encode");
+    assert_ne!(raw, max, "raw, 4000000000001 is an extension value");
+    let raw = encode_contained(&ambr(generated::BitRate(u64::MAX))).expect("encode");
+    assert!(
+        decode_contained::<generated::PDUSessionAggregateMaximumBitRate>(&raw).is_err(),
+        "raw, u64::MAX does not decode"
+    );
+    for rate in [
+        BIT_RATE_MAX,
+        BIT_RATE_MAX + 1,
+        i64::MAX as u64 + 1,
+        u64::MAX,
+    ] {
+        let bytes = encode_contained(&ambr(bit_rate(rate))).expect("encode");
+        assert_eq!(bytes, max, "{rate}");
+        let back = decode_contained::<generated::PDUSessionAggregateMaximumBitRate>(&bytes)
+            .expect("decode");
+        assert_eq!(
+            back.pdu_session_aggregate_maximum_bit_rate_dl.0, BIT_RATE_MAX,
+            "{rate}"
+        );
+    }
+    assert_eq!(bit_rate(7).0, 7);
+}

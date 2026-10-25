@@ -2895,6 +2895,7 @@ version = "0.1.0"
 dependencies = [
  "bitvec",
  "bytes",
+ "log",
  "nextgcore-asn1c",
  "nextgcore-core",
  "nextgcore-ngap-gen",

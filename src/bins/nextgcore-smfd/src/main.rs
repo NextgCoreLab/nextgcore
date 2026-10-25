@@ -22857,6 +22857,86 @@ mod path_switch_ack_tests {
         }
     }
 
+    /// #1163: a Session-AMBR or a flow bit rate past TS 38.413 §9.3.1.4's
+    /// 4000000000000 used to go out as an extension value of BitRate, and past
+    /// `i64::MAX` neither decoder could read it back ("Invalid unconstrained
+    /// integer length: 9"). It is now sent as 4000000000000, a root value
+    /// every receiver decodes, here through both codecs.
+    #[tokio::test]
+    async fn a_bit_rate_past_the_ngap_root_is_sent_as_its_maximum() {
+        const MAX: u64 = 4_000_000_000_000;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let r = crate::tests::seed_registered_session("imsi-001010000001163", 6, "internet");
+        {
+            let ctx = smf_self();
+            let ctx = ctx.read().expect("ctx");
+            ctx.upf_ul_endpoints
+                .write()
+                .expect("w")
+                .insert(r.clone(), (0x0011_6300, [10, 45, 1, 163]));
+            let mut b = context::PolicyBinding::snapshot_default();
+            b.qfi = 1;
+            b.five_qi = 9;
+            b.arp_priority_level = 8;
+            b.ambr_dl_bps = u64::MAX;
+            b.ambr_ul_bps = MAX + 1;
+            ctx.policy_bindings.write().expect("w").insert(r.clone(), b);
+            let sess = ctx.sess_find_by_sm_context_ref(&r).expect("sess");
+            let mut dedicated = ctx.bearer_add(sess.id).expect("bearer");
+            dedicated.qfi = 2;
+            dedicated.qos.index = 1;
+            dedicated.qos.arp_priority_level = 2;
+            dedicated.qos.gbr_downlink = MAX;
+            dedicated.qos.gbr_uplink = MAX + 1;
+            dedicated.qos.mbr_downlink = u64::MAX;
+            dedicated.qos.mbr_uplink = MAX - 1;
+            ctx.bearer_update(&dedicated);
+        }
+
+        for (what, response) in [
+            ("ACTIVATING", activation_response(&r)),
+            ("HANDOVER_REQUIRED", handover_preparing_response(&r, None)),
+        ] {
+            assert_eq!(response.status, 200, "{what}: {:?}", response.http.content);
+            let t = setup_transfer_of(&response);
+            let ambr = t.pdu_session_aggregate_maximum_bit_rate.expect("AMBR");
+            assert_eq!((ambr.dl, ambr.ul), (MAX, MAX), "{what}: the Session-AMBR");
+            let gbr = t.qos_flow_setup_request_list[1]
+                .qos_flow_level_qos_parameters
+                .gbr_qos_information
+                .clone()
+                .expect("GBR");
+            assert_eq!(
+                (
+                    gbr.maximum_flow_bit_rate_dl,
+                    gbr.maximum_flow_bit_rate_ul,
+                    gbr.guaranteed_flow_bit_rate_dl,
+                    gbr.guaranteed_flow_bit_rate_ul,
+                ),
+                (MAX, MAX - 1, MAX, MAX),
+                "{what}: the GBR flow"
+            );
+            let n2 = response
+                .http
+                .parts
+                .iter()
+                .find(|p| p.content_id.as_deref() == Some("n2SmInfo"))
+                .expect("n2SmInfo part");
+            let g = nextgcore_ngap_gen::decode_contained::<
+                nextgcore_ngap_gen::generated::PDUSessionResourceSetupRequestTransfer,
+            >(&n2.data);
+            assert!(g.is_ok(), "{what}: the generated codec reads it: {g:?}");
+        }
+
+        let ctx = smf_self();
+        let ctx = ctx.read().expect("ctx");
+        ctx.policy_bindings.write().expect("w").remove(&r);
+        ctx.upf_ul_endpoints.write().expect("w").remove(&r);
+        if let Some(sess) = ctx.sess_find_by_sm_context_ref(&r) {
+            ctx.sess_remove(sess.id);
+        }
+    }
+
     /// #1147 review M2, m1: how the session's bearers become QoS flows.
     /// - the session's own bearer for the default flow (an EPS→5GS default bearer,
     ///   QFI = the binding's) is not set up twice; it lends the default flow its
