@@ -6,7 +6,7 @@
 //! transaction layer (sequence binding, T3-RESPONSE/N3-REQUESTS
 //! retransmission, duplicate-request absorption).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,7 +16,7 @@ use bytes::Bytes;
 
 use nextgcore_gtp::v2::header::Gtp2MessageType;
 use nextgcore_gtp::v2::ie::{
-    Gtp2BearerContextIe, Gtp2FTeidIe, Gtp2IeType, Gtp2PaaIe, Gtp2RecoveryIe,
+    Gtp2BearerContextIe, Gtp2FTeidIe, Gtp2Ie, Gtp2IeType, Gtp2PaaIe, Gtp2RecoveryIe,
 };
 use nextgcore_gtp::v2::message::Gtp2Message;
 use nextgcore_gtp::v2::xact::{Gtp2XactConfig, Gtp2XactMgr};
@@ -84,6 +84,12 @@ struct GtpcInner {
     xact: Mutex<Gtp2XactMgr>,
     /// Last Recovery (restart counter) seen per peer IP (TS 23.007)
     peer_restart: Mutex<HashMap<IpAddr, u8>>,
+    /// Peers this node's restart counter has been indicated to since it started
+    /// or since they restarted (TS 29.274 §7.2.0, #1220). Keyed by address and
+    /// port, so two nodes sharing an IP each get it; a peer seen on two ports
+    /// gets it twice, which is harmless (the receiver handles it as an Echo
+    /// Response would be, §7.2.0).
+    recovery_indicated: Mutex<HashSet<SocketAddr>>,
     /// Path state per peer
     peer_state: Mutex<HashMap<SocketAddr, GtpPathState>>,
     /// Commands relayed MME -> PGW and awaiting their triggered message, keyed by
@@ -156,6 +162,7 @@ impl GtpcServer {
             restart_counter,
             xact: Mutex::new(Gtp2XactMgr::new(config)),
             peer_restart: Mutex::new(HashMap::new()),
+            recovery_indicated: Mutex::new(HashSet::new()),
             peer_state: Mutex::new(HashMap::new()),
             command_relays: Mutex::new(HashMap::new()),
             pgw_requests: Mutex::new(HashMap::new()),
@@ -467,6 +474,7 @@ impl GtpcServer {
         msg: &Gtp2Message,
         data: u64,
     ) -> Result<u32, String> {
+        let msg = &self.with_own_recovery(peer, msg);
         let encoded = Bytes::from(msg.encode().to_vec());
         let seq = msg.header.sequence_number;
         {
@@ -490,6 +498,7 @@ impl GtpcServer {
     /// Send a triggered (response) message bound to the request's sequence
     /// number, caching it so retransmitted requests are answered identically.
     pub fn send_response(&self, peer: SocketAddr, msg: &Gtp2Message) -> Result<(), String> {
+        let msg = &self.with_own_recovery(peer, msg);
         let encoded = Bytes::from(msg.encode().to_vec());
         if let Ok(mut xact) = self.inner.xact.lock() {
             xact.cache_response(peer, msg.header.sequence_number, encoded.clone());
@@ -511,6 +520,46 @@ impl GtpcServer {
             encoded.len()
         );
         Ok(())
+    }
+
+    /// `msg` as it goes to `peer`, with the Recovery IE this node owns (#1220).
+    ///
+    /// - Echo Request/Response carry it always (M, TS 29.274 §7.1.1, §7.1.2) and
+    ///   indicate the counter to the peer.
+    /// - Every other message loses any Recovery it carries: one relayed from the
+    ///   MME or the PGW names that node's restart counter, not this one's (TS
+    ///   23.007 §18).
+    /// - A message whose table has Recovery as C / CO ([`recovery_conditional`])
+    ///   gets this node's when it is the first contact with the peer since this
+    ///   node started or the peer restarted (§7.2.0: "if it is in contact with the
+    ///   node's peer for the first time, or if the node or the node's peer has
+    ///   restarted recently and the new Restart Counter value has not yet been
+    ///   indicated to the peer"). Its T3 retransmissions carry the same bytes.
+    fn with_own_recovery(&self, peer: SocketAddr, msg: &Gtp2Message) -> Gtp2Message {
+        let t = msg.header.message_type;
+        let mut out = msg.clone();
+        if t == Gtp2MessageType::EchoRequest as u8 || t == Gtp2MessageType::EchoResponse as u8 {
+            if let Ok(mut set) = self.inner.recovery_indicated.lock() {
+                set.insert(peer);
+            }
+            return out;
+        }
+        out.ies
+            .retain(|ie| ie.ie_type != Gtp2IeType::Recovery as u8);
+        let first = recovery_conditional(t)
+            && self
+                .inner
+                .recovery_indicated
+                .lock()
+                .is_ok_and(|mut set| set.insert(peer));
+        if first {
+            out.add_ie(Gtp2Ie::from_slice(
+                Gtp2IeType::Recovery as u8,
+                0,
+                &[self.inner.restart_counter],
+            ));
+        }
+        out
     }
 
     /// Send an Echo Request (path management, TS 29.274 Section 7.1.1)
@@ -1334,6 +1383,40 @@ fn delete_pdn_connections_for_pgw(pgw_ip: std::net::IpAddr) -> usize {
     removed
 }
 
+/// The messages an SGW-C sends whose IE table carries Recovery as C or CO,
+/// "included if contacting the peer for the first time" (TS 29.274 §7.2.0):
+/// - S5/S8 to the PGW: Create Session Request (Table 7.2.1-1), Modify Bearer
+///   Request (7.2.7-1), Create / Update / Delete Bearer Response (7.2.4-1,
+///   7.2.16-1, 7.2.10.2-1);
+/// - S11 to the MME: Create Session Response (7.2.2-1), Modify Bearer Response
+///   (7.2.8-1), Delete Session Response (7.2.10.1-1), Modify / Delete Bearer
+///   Failure Indication (7.2.14.2-1, 7.2.17.2-1), Create / Delete Indirect Data
+///   Forwarding Tunnel Response (7.2.19-1, 7.2.13-1), Modify Access Bearers
+///   Response (7.2.25-1).
+///
+/// Delete Session Request, Create/Update/Delete Bearer Request and Downlink
+/// Data Notification have no Recovery IE.
+fn recovery_conditional(msg_type: u8) -> bool {
+    use Gtp2MessageType as T;
+    [
+        T::CreateSessionRequest,
+        T::CreateSessionResponse,
+        T::ModifyBearerRequest,
+        T::ModifyBearerResponse,
+        T::DeleteSessionResponse,
+        T::CreateBearerResponse,
+        T::UpdateBearerResponse,
+        T::DeleteBearerResponse,
+        T::ModifyBearerFailureIndication,
+        T::DeleteBearerFailureIndication,
+        T::CreateIndirectDataForwardingTunnelResponse,
+        T::DeleteIndirectDataForwardingTunnelResponse,
+        T::ModifyAccessBearersResponse,
+    ]
+    .iter()
+    .any(|t| *t as u8 == msg_type)
+}
+
 /// Track the peer's restart counter and act on a confirmed restart
 /// (TS 23.007 Section 18 / Section 16.1A.1.1).
 fn note_peer_recovery(inner: &Arc<GtpcInner>, peer: SocketAddr, restart_counter: u8) {
@@ -1383,6 +1466,10 @@ fn note_peer_recovery(inner: &Arc<GtpcInner>, peer: SocketAddr, restart_counter:
             );
             if let Ok(mut states) = inner.peer_state.lock() {
                 states.insert(peer, GtpPathState::Idle);
+            }
+            // The restarted peer no longer knows this node's counter (#1220).
+            if let Ok(mut set) = inner.recovery_indicated.lock() {
+                set.retain(|p| p.ip() != peer.ip());
             }
             if restart_deletion_enabled() {
                 delete_contexts_for_peer(peer.ip());
@@ -1819,9 +1906,34 @@ fn push_abandoned_s5c(
     list.retain(|(_, _, at)| now.duration_since(*at) < ABANDONED_S5C_HOLD);
     if list.len() >= ABANDONED_S5C_CAP {
         // Entries are pushed in time order, so the front is the oldest.
-        list.drain(..=list.len() - ABANDONED_S5C_CAP);
+        let evicted = list.drain(..=list.len() - ABANDONED_S5C_CAP).count() as u64;
+        let total = ABANDONED_S5C_EVICTED_TOTAL.fetch_add(evicted, Ordering::Relaxed) + evicted;
+        warn_abandoned_s5c_eviction(now, total);
     }
     list.push(entry);
+}
+
+/// Abandoned Creates forgotten at [`ABANDONED_S5C_CAP`]: a late PGW answer to
+/// one of them is dropped and its PDN connection stays at the PGW (#1218 review).
+pub static ABANDONED_S5C_EVICTED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// At most one warning per this interval, however fast entries are evicted.
+const ABANDONED_S5C_WARN_EVERY: Duration = Duration::from_secs(10);
+
+static ABANDONED_S5C_LAST_WARN: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+fn warn_abandoned_s5c_eviction(now: Instant, total: u64) {
+    let mut last = ABANDONED_S5C_LAST_WARN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if last.is_some_and(|at| now.saturating_duration_since(at) < ABANDONED_S5C_WARN_EVERY) {
+        return;
+    }
+    *last = Some(now);
+    log::warn!(
+        "{ABANDONED_S5C_CAP} S5/S8 Create Session Requests abandoned after N3 are remembered;          the oldest are forgotten ({total} so far), so a late PGW answer to them leaves its PDN          connection at the PGW (sgwc_s5_abandoned_create_evicted_total)"
+    );
 }
 
 fn take_abandoned_s5c(pgw: SocketAddr, seq: u32) -> bool {
@@ -2438,6 +2550,14 @@ pub(crate) fn render_s5_delete_metrics(out: &mut String) {
          Request accepted\n# TYPE sgwc_s5_delete_session_accepted_total counter\n\
          sgwc_s5_delete_session_accepted_total {}",
         S5_DELETES_ACCEPTED_TOTAL.load(Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        out,
+        "# HELP sgwc_s5_abandoned_create_evicted_total Abandoned S5/S8 Create Session \
+         Requests forgotten at the cap, whose late answer is no longer deleted at the PGW\n\
+         # TYPE sgwc_s5_abandoned_create_evicted_total counter\n\
+         sgwc_s5_abandoned_create_evicted_total {}",
+        ABANDONED_S5C_EVICTED_TOTAL.load(Ordering::Relaxed)
     );
 }
 
@@ -5247,9 +5367,14 @@ mod tests {
         let pgw: SocketAddr = "192.0.2.1:2123".parse().unwrap();
         let now = Instant::now();
         let mut list = Vec::new();
+        let before = ABANDONED_S5C_EVICTED_TOTAL.load(Ordering::Relaxed);
         for seq in 0..(ABANDONED_S5C_CAP as u32 + 10) {
             push_abandoned_s5c(&mut list, (pgw, seq, now));
         }
+        // #1218 review: the evictions are counted (and logged, rate-limited).
+        assert!(ABANDONED_S5C_EVICTED_TOTAL.load(Ordering::Relaxed) - before >= 10);
+        assert!(crate::main_render_metrics_for_test()
+            .contains("# TYPE sgwc_s5_abandoned_create_evicted_total counter"));
         assert_eq!(list.len(), ABANDONED_S5C_CAP);
         assert_eq!(list.first().map(|e| e.1), Some(10), "the oldest went");
         assert_eq!(
@@ -5962,6 +6087,105 @@ mod tests {
         Gtp2FTeidIe::decode(&csrsp.get_ie(Gtp2IeType::FTeid as u8, 0).unwrap().value)
             .unwrap()
             .teid
+    }
+
+    /// #1220, TS 29.274 §7.2.0 / Table 7.2.1-1: the S5/S8 Create Session Request
+    /// carries this SGW's Recovery on its first contact with the PGW, and the S11
+    /// Create Session Response on the first contact with the MME; not again
+    /// afterwards, and again once the PGW is seen to have restarted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_first_contact_with_a_pgw_carries_this_sgws_recovery() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let _sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let pgw = with_stand_in_pgw().await;
+        let server = test_server(&ambient, 1000, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let own = server.restart_counter();
+        let recovery = |m: &Gtp2Message| {
+            m.get_ie(Gtp2IeType::Recovery as u8, 0)
+                .map(|ie| ie.value.to_vec())
+        };
+
+        let mut at_mme = Vec::new();
+        for (n, last) in [(0u32, 0x51u8), (1, 0x52)] {
+            let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x20, last];
+            sock.send_to(&csr(0x1220 + n, &imsi).encode(), server.local_addr())
+                .unwrap();
+            at_mme.push(recv_s11(&sock).await.expect("create session response"));
+        }
+        let at_pgw = pgw_wait(&pgw, Gtp2MessageType::CreateSessionRequest, 2).await;
+        assert_eq!(recovery(&at_pgw[0]), Some(vec![own]), "first contact: ours");
+        assert_eq!(recovery(&at_pgw[1]), None, "already indicated");
+        assert_eq!(
+            recovery(&at_mme[0]),
+            Some(vec![own]),
+            "first S11 answer: ours"
+        );
+        assert_eq!(recovery(&at_mme[1]), None);
+
+        // The PGW restarts: its new counter is seen, and the next contact
+        // indicates this node's counter again.
+        let ip = pgw.addr.ip();
+        let prev = server.inner.peer_restart.lock().unwrap().get(&ip).copied();
+        let prev = match prev {
+            Some(p) => p,
+            None => {
+                note_peer_recovery(&server.inner, pgw.addr, 7);
+                7
+            }
+        };
+        note_peer_recovery(&server.inner, pgw.addr, prev.wrapping_add(1).max(1));
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x20, 0x53];
+        sock.send_to(&csr(0x1222, &imsi).encode(), server.local_addr())
+            .unwrap();
+        recv_s11(&sock).await.expect("create session response");
+        let at_pgw = pgw_wait(&pgw, Gtp2MessageType::CreateSessionRequest, 3).await;
+        assert_eq!(
+            recovery(&at_pgw[2]),
+            Some(vec![own]),
+            "re-indicated after the PGW's restart"
+        );
+        sgwc_self().set_pgw_s5c_peer(None);
+        server.close();
+    }
+
+    /// #1220, TS 23.007 §18: a relayed message keeps no other node's Recovery;
+    /// an Echo keeps its own.
+    #[test]
+    fn a_foreign_recovery_is_replaced_and_echo_is_left_alone() {
+        let ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let server = test_server(&ambient, 1000, 1);
+        let peer: SocketAddr = "192.0.2.7:2123".parse().unwrap();
+        let mut fi = Gtp2Message::new(nextgcore_gtp::v2::header::Gtp2Header::new(
+            Gtp2MessageType::DeleteBearerFailureIndication as u8,
+            1,
+            1,
+        ));
+        fi.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Recovery as u8, 0, &[0xee]));
+        let own = server.restart_counter();
+        let first = server.with_own_recovery(peer, &fi);
+        let recs: Vec<_> = first
+            .ies
+            .iter()
+            .filter(|ie| ie.ie_type == Gtp2IeType::Recovery as u8)
+            .map(|ie| ie.value.to_vec())
+            .collect();
+        assert_eq!(recs, vec![vec![own]], "the PGW's is replaced by ours");
+        let again = server.with_own_recovery(peer, &fi);
+        assert!(again.get_ie(Gtp2IeType::Recovery as u8, 0).is_none());
+        let echo = Gtp2Message::echo_response(9, own);
+        assert_eq!(
+            server.with_own_recovery(peer, &echo).ies.len(),
+            echo.ies.len()
+        );
+        server.close();
     }
 
     /// A Delete Session Request for EBI 5 with Indication flags `oi` / `si`.
