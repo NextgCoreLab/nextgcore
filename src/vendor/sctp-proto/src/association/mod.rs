@@ -491,6 +491,21 @@ impl Association {
                 }*/
 
                 if let Payload::PartialDecode(partial_decode) = transmit.payload {
+                    // nextgcore #1142, RFC 9260 §8.5.1 B: a packet under another tag
+                    // than ours is accepted only as an ABORT or SHUTDOWN COMPLETE with
+                    // the T bit and OUR PEER's tag (the endpoint routes those by the
+                    // remote address). An INIT carries tag 0.
+                    let tag = partial_decode.common_header.verification_tag;
+                    if tag != 0
+                        && tag != self.my_verification_tag
+                        && !(partial_decode.is_reflected_end() && tag == self.peer_verification_tag)
+                    {
+                        trace!(
+                            "[{}] dropping a packet under foreign tag {tag:#x}",
+                            self.side
+                        );
+                        return;
+                    }
                     trace!(
                         "[{}] receiving {} bytes",
                         self.side,

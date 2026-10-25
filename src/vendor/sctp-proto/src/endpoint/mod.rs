@@ -158,6 +158,24 @@ impl Endpoint {
             }
         };
 
+        // nextgcore #1142, RFC 9260 §8.5.1 B: an ABORT or SHUTDOWN COMPLETE with the T
+        // bit carries the peer's tag, which this endpoint does not index. It belongs to
+        // the one association with that remote; the association checks the tag.
+        let known_ch = known_ch.or_else(|| {
+            if !partial_decode.is_reflected_end() {
+                return None;
+            }
+            let mut matching = self
+                .associations
+                .iter()
+                .filter(|(_, meta)| meta.initial_remote == remote)
+                .map(|(i, _)| AssociationHandle(i));
+            match (matching.next(), matching.next()) {
+                (Some(ch), None) => Some(ch),
+                _ => None,
+            }
+        });
+
         if let Some(ch) = known_ch {
             return Some((
                 ch,
