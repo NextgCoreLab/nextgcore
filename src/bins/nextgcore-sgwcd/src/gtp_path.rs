@@ -1852,7 +1852,10 @@ fn dispatch_modify_bearer_request(server: &GtpcServer, msg: &Gtp2Message, peer: 
             continue;
         };
         if let Some(mut dl_tunnel) = ctx.dl_tunnel_in_bearer(bearer.id) {
+            // #936, TS 29.274 §8.22: the F-TEID carries IPv4, IPv6 or both;
+            // whichever families it carries are the eNB's.
             dl_tunnel.remote_ip.ipv4 = enb_fteid.ipv4_addr.map(Ipv4Addr::from);
+            dl_tunnel.remote_ip.ipv6 = enb_fteid.ipv6_addr.map(std::net::Ipv6Addr::from);
             // Every Modify Bearer write is a new generation, even one that
             // writes the endpoint the tunnel already holds (#991 review): its
             // refusal must not undo a later writer that wrote the same value.
@@ -5054,6 +5057,107 @@ mod tests {
             "one modification per session"
         );
         ctx.ue_remove(ue_id);
+        server.close();
+    }
+
+    /// #936, TS 29.274 §8.22, TS 29.244 §8.2.56: an S1-U eNodeB F-TEID carrying
+    /// only IPv6 switches the downlink to that address. The Update FAR's Outer
+    /// Header Creation is GTP-U/UDP/IPv6 with it. Before, the tunnel kept the TEID
+    /// with no address and the FAR had no Outer Header Creation. A dual-stack
+    /// F-TEID keeps both families and forwards over IPv4.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_ipv6_enb_fteid_is_the_downlink_outer_header() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let server = test_server(&ambient, 1000, 1);
+        set_s11_server(server.clone());
+        let mme = client();
+        let v6: std::net::Ipv6Addr = "2001:db8::936".parse().unwrap();
+        let v4 = Ipv4Addr::new(10, 0, 9, 36);
+        for (n, fteid) in [
+            Gtp2FTeidIe::new_ipv6(0, 0x9361, v6.octets()),
+            Gtp2FTeidIe::new_dual(0, 0x9362, v4.octets(), v6.octets()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let imsi = format!("00101093600000{n}");
+            let (ue_id, s11_teid, _) =
+                ue_with_pgw_session(mme.local_addr().unwrap(), imsi.as_bytes());
+            let ctx = sgwc_self();
+            let bearer = ctx.bearer_find_by_ue_ebi(ue_id, 5).unwrap();
+            let mut dl = ctx.dl_tunnel_in_bearer(bearer.id).unwrap();
+            dl.far_id = Some(0x0936 + n as u32);
+            dl.remote_teid = 0x1111;
+            dl.remote_ip.ipv4 = Some(Ipv4Addr::new(10, 0, 0, 1));
+            ctx.tunnel_update(&dl);
+            let before = sgwu.received(52);
+
+            let mut mbr = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+                Gtp2MessageType::ModifyBearerRequest as u8,
+                s11_teid,
+                0x0009_3600 + n as u32,
+            ));
+            let mut bc = Gtp2BearerContextIe::new();
+            bc.set_ebi(5);
+            bc.set_fteid(0, &fteid);
+            mbr.add_bearer_context(0, &bc);
+            mme.send_to(&mbr.encode(), server.local_addr()).unwrap();
+            let rsp = recv_s11(&mme).await.expect("a Modify Bearer Response");
+            assert_eq!(
+                Gtp2CauseIe::decode(&rsp.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value)
+                    .unwrap()
+                    .cause,
+                gtp_cause::REQUEST_ACCEPTED
+            );
+
+            let dl = ctx.dl_tunnel_in_bearer(bearer.id).unwrap();
+            assert_eq!(
+                dl.remote_ip.ipv6,
+                Some(v6),
+                "the eNB's IPv6 address is kept"
+            );
+            let expect_v4 = (n == 1).then_some(v4);
+            assert_eq!(dl.remote_ip.ipv4, expect_v4);
+
+            let body = sgwu
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(t, _, _)| *t == 52)
+                .nth(before)
+                .map(|(_, _, b)| b.clone())
+                .expect("the Session Modification reached the SGW-U");
+            let req =
+                nextgcore_pfcp::message::SessionModificationRequest::decode(&mut Bytes::from(body))
+                    .unwrap();
+            let far = req
+                .update_fars
+                .iter()
+                .find(|f| f.far_id == 0x0936 + n as u32)
+                .expect("the downlink FAR is updated");
+            let ohc = far
+                .forwarding_parameters
+                .as_ref()
+                .and_then(|fp| fp.outer_header_creation.as_ref())
+                .expect("with an Outer Header Creation");
+            if n == 0 {
+                assert!(ohc.description.gtpu_udp_ipv6, "{ohc:?}");
+                assert_eq!(ohc.ipv6_addr, Some(v6.octets()));
+                assert_eq!(ohc.teid, Some(0x9361));
+            } else {
+                assert!(ohc.description.gtpu_udp_ipv4, "{ohc:?}");
+                assert_eq!(ohc.ipv4_addr, Some(v4.octets()));
+                assert_eq!(ohc.teid, Some(0x9362));
+            }
+            ctx.ue_remove(ue_id);
+        }
         server.close();
     }
 
