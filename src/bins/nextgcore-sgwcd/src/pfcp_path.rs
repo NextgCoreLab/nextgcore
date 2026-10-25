@@ -1504,6 +1504,17 @@ pub fn send_session_deletion_request(
     enqueue(&msg, sess.id, continuation)
 }
 
+/// Delete the SGW-U session `up_seid` that no local session holds any more: one
+/// whose Establishment Response arrived after its session was removed. No MME
+/// waits for it.
+pub fn send_session_deletion_for_seid(up_seid: u64, sess_id: u64) -> Result<(), String> {
+    let mut msg = PfcpMessage::new(sxa_build::pfcp_type::SESSION_DELETION_REQUEST, up_seid);
+    let mut body = bytes::BytesMut::new();
+    nextgcore_pfcp::message::SessionDeletionRequest::new().encode(&mut body);
+    msg.data = body.to_vec();
+    enqueue(&msg, sess_id, S11Continuation::None)
+}
+
 /// Send Session Report Response to SGW-U
 /// Port of sgwc_pfcp_send_session_report_response
 ///

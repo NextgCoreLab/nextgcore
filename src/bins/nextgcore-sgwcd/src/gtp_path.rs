@@ -414,6 +414,9 @@ impl GtpcServer {
     /// Send a triggered (response) message bound to the request's sequence
     /// number, caching it so retransmitted requests are answered identically.
     pub fn send_response(&self, peer: SocketAddr, msg: &Gtp2Message) -> Result<(), String> {
+        if msg.header.message_type == Gtp2MessageType::CreateSessionResponse as u8 {
+            end_create_session(peer, msg.header.sequence_number);
+        }
         let encoded = Bytes::from(msg.encode().to_vec());
         if let Ok(mut xact) = self.inner.xact.lock() {
             xact.cache_response(peer, msg.header.sequence_number, encoded.clone());
@@ -1250,6 +1253,44 @@ fn send_cause_response(
 // Per-procedure dispatch
 // ============================================================================
 
+/// Create Session Requests being processed, by (MME, sequence number), with when
+/// each began. An entry ends when its Create Session Response is sent
+/// ([`GtpcServer::send_response`]); one older than [`CREATE_SESSION_IN_FLIGHT_MAX`]
+/// is dropped, so a request whose answer never went out does not block its
+/// sequence number for good.
+static CREATE_SESSIONS_IN_FLIGHT: Mutex<Option<HashMap<(SocketAddr, u32), Instant>>> =
+    Mutex::new(None);
+
+/// Longer than any Create Session can take: the PGW's and the SGW-U's T3 x N3.
+const CREATE_SESSION_IN_FLIGHT_MAX: Duration = Duration::from_secs(60);
+
+/// Record that the Create Session Request `seq` from `peer` is being processed.
+/// `false` when it already is: the caller drops the retransmission.
+fn begin_create_session(peer: SocketAddr, seq: u32) -> bool {
+    let mut map = CREATE_SESSIONS_IN_FLIGHT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(HashMap::new);
+    let now = Instant::now();
+    map.retain(|_, began| now.duration_since(*began) < CREATE_SESSION_IN_FLIGHT_MAX);
+    if map.contains_key(&(peer, seq)) {
+        return false;
+    }
+    map.insert((peer, seq), now);
+    true
+}
+
+/// The Create Session Request `seq` from `peer` has been answered.
+fn end_create_session(peer: SocketAddr, seq: u32) {
+    if let Some(map) = CREATE_SESSIONS_IN_FLIGHT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+    {
+        map.remove(&(peer, seq));
+    }
+}
+
 fn dispatch_create_session_request(server: &GtpcServer, msg: &Gtp2Message, peer: SocketAddr) {
     let seq = msg.header.sequence_number;
     let parsed = match s11_parse::parse_create_session_request(msg) {
@@ -1292,8 +1333,25 @@ fn dispatch_create_session_request(server: &GtpcServer, msg: &Gtp2Message, peer:
         return;
     }
 
+    // TS 29.274 §7.6: a retransmission of a request still being processed is not
+    // processed again; its answer is the first one's, which the response cache then
+    // repeats. Without this, a retransmission while the PGW or the SGW-U had not yet
+    // answered created a second session and the MME got two different answers.
+    if !begin_create_session(peer, seq) {
+        log::debug!("Create Session Request seq={seq} from {peer} is already in progress");
+        return;
+    }
+
     let ctx = sgwc_self();
     let existing_ue = ctx.ue_find_by_imsi(&parsed.imsi);
+    if let Some(ue) = existing_ue.as_ref() {
+        resolve_create_session_collision(
+            ue,
+            parsed.bearer.ebi,
+            msg.header.teid.unwrap_or(0),
+            ctx.pgw_s5c_peer(),
+        );
+    }
     let result = s11_handler::handle_create_session_request(
         existing_ue.as_ref(),
         seq as u64,
@@ -1336,7 +1394,12 @@ fn dispatch_create_session_request(server: &GtpcServer, msg: &Gtp2Message, peer:
     ue.rat_type = parsed.rat_type;
     ctx.ue_update(&ue);
 
-    let Some(mut sess) = ctx.sess_find_by_apn(ue.id, &parsed.apn) else {
+    // The new session, by its default bearer's EBI: unique once the collision is
+    // resolved, where the APN is not (two PDN connections may share one).
+    let Some(mut sess) = ctx
+        .bearer_find_by_ue_ebi(ue.id, parsed.bearer.ebi)
+        .and_then(|b| ctx.sess_find_by_id(b.sess_id))
+    else {
         send_cause_response(
             server,
             peer,
@@ -2221,7 +2284,16 @@ fn continue_delete_session_after_pgw(s5c_seq: u32, pgw_cause: Option<u8>) {
 /// while the PGW's answer was in flight. Without this the PGW keeps the session
 /// and the UE's address. Nobody waits for the answer.
 fn abandon_pgw_session(pgw_s5c_teid: u32, lbi: u8, why: &str) {
-    let (Some(server), Some(pgw)) = (s11_server(), sgwc_self().pgw_s5c_peer()) else {
+    let Some(pgw) = sgwc_self().pgw_s5c_peer() else {
+        log::error!("Cannot delete the abandoned PGW session ({why}): no S5/S8 path");
+        return;
+    };
+    abandon_pgw_session_at(pgw, pgw_s5c_teid, lbi, why);
+}
+
+/// [`abandon_pgw_session`] toward the PGW at `pgw`.
+fn abandon_pgw_session_at(pgw: SocketAddr, pgw_s5c_teid: u32, lbi: u8, why: &str) {
+    let Some(server) = s11_server() else {
         log::error!("Cannot delete the abandoned PGW session ({why}): no S5/S8 path");
         return;
     };
@@ -2253,20 +2325,67 @@ fn abandon_pgw_session(pgw_s5c_teid: u32, lbi: u8, why: &str) {
     }
 }
 
-/// Delete on the SGW-U and at the PGW a PDN connection that a new Create Session
-/// Request for the same IMSI and APN replaces, before its local context is removed
-/// (TS 29.274 §7.2.1: a Create Session Request colliding with an existing PDN
-/// connection is a request for a new one, and the existing one is deleted first,
-/// at the PGW too). Nobody waits for either answer: the MME is answered for the NEW
-/// session. Without this only the local records went, and the SGW-U and PGW
-/// sessions leaked with nothing left to address them by.
-pub(crate) fn release_replaced_session(old: &crate::context::SgwcSess) {
+/// Resolve a Create Session Request's collision with a PDN connection this SGW-C
+/// still holds, before the new one is created (TS 29.274 §7.2.1).
+///
+/// The existing context is identified by the IMSI and the EPS Bearer ID the request
+/// names. When the request has TEID 0 in its header, or names the default bearer of
+/// an existing PDN connection, that PDN connection is deleted locally -- on the SGW-U
+/// as well, since its user plane is this SGW's -- and, only when the new request
+/// goes to a different PGW, at the old PGW too: a PGW that receives the new request
+/// resolves the collision itself. A dedicated bearer named with a non-zero TEID is
+/// deleted alone.
+///
+/// Before, the collision was found by IMSI and APN and only removed from the local
+/// context: the old SGW-U PFCP session leaked, a second PDN connection to the same
+/// APN was taken for a collision, and one with the same EBI to another APN was not.
+fn resolve_create_session_collision(
+    ue: &crate::context::SgwcUe,
+    ebi: u8,
+    header_teid: u32,
+    new_pgw: Option<SocketAddr>,
+) {
+    let ctx = sgwc_self();
+    let Some(bearer) = ctx.bearer_find_by_ue_ebi(ue.id, ebi) else {
+        return;
+    };
+    let Some(old) = ctx.sess_find_by_id(bearer.sess_id) else {
+        return;
+    };
+    let is_default = ctx
+        .default_bearer_in_sess(old.id)
+        .is_some_and(|b| b.id == bearer.id);
+    if header_teid != 0 && !is_default {
+        log::info!(
+            "Create Session Request for IMSI[{}] EBI {ebi} collides with a dedicated bearer \
+             of session {}: that bearer is deleted",
+            ue.imsi_bcd,
+            old.id
+        );
+        ctx.bearer_remove(bearer.id);
+        return;
+    }
+    log::info!(
+        "Create Session Request for IMSI[{}] EBI {ebi} collides with session {} (APN {:?}): \
+         the existing PDN connection is deleted first (TS 29.274 §7.2.1)",
+        ue.imsi_bcd,
+        old.id,
+        old.apn()
+    );
+    release_replaced_session(&old, new_pgw);
+    ctx.sess_remove(old.id);
+}
+
+/// Delete `old` on the SGW-U, and at its PGW when the new request goes elsewhere.
+/// Nobody waits for either answer: the MME is answered for the NEW session.
+fn release_replaced_session(old: &crate::context::SgwcSess, new_pgw: Option<SocketAddr>) {
     let ctx = sgwc_self();
     let lbi = ctx
         .default_bearer_in_sess(old.id)
         .map(|b| b.ebi)
         .unwrap_or(5);
-    // A session the SGW-U never confirmed has no SGW-U SEID and nothing to delete.
+    // A session whose Sxa establishment is still in flight has no SGW-U SEID yet; the
+    // late response deletes what it created (`sxa_response`).
     if old.sgwu_sxa_seid != 0 {
         match pfcp_path::send_session_deletion_request(
             old,
@@ -2286,11 +2405,17 @@ pub(crate) fn release_replaced_session(old: &crate::context::SgwcSess) {
             ),
         }
     }
-    if old.pgw_s5c_teid != 0 {
-        abandon_pgw_session(
+    let Some(old_pgw) = old.pgw_addr else {
+        return;
+    };
+    let same_pgw = new_pgw.is_some_and(|p| p.ip() == std::net::IpAddr::V4(old_pgw));
+    if old.pgw_s5c_teid != 0 && !same_pgw {
+        let port = new_pgw.map(|p| p.port()).unwrap_or(2123);
+        abandon_pgw_session_at(
+            SocketAddr::new(std::net::IpAddr::V4(old_pgw), port),
             old.pgw_s5c_teid,
             lbi,
-            "a new Create Session Request for the same APN replaces it",
+            "a new Create Session Request replaces it and goes to another PGW",
         );
     }
 }
@@ -3086,6 +3211,7 @@ mod tests {
         tokio::spawn(async move {
             let up = handle;
             let mut script = std::collections::VecDeque::from(script);
+            let mut established: u64 = 0;
             let mut buf = vec![0u8; 8192];
             loop {
                 let Ok((len, from)) = up.recv_from(&mut buf).await else {
@@ -3136,8 +3262,13 @@ mod tests {
                         // Conditional-mandatory on acceptance (TS 29.244 §7.5.3): the
                         // UP F-SEID the SGW-C stores and addresses the session by.
                         if pfcp_cause == PfcpCause::RequestAccepted {
-                            rsp.up_f_seid =
-                                Some(FSeid::new_ipv4(0x0000_0000_5555_0001, [127, 0, 0, 9]));
+                            // A distinct UP SEID per session, from 0x5555_0001, so a
+                            // test can tell which one a deletion names.
+                            rsp.up_f_seid = Some(FSeid::new_ipv4(
+                                0x0000_0000_5555_0001 + established,
+                                [127, 0, 0, 9],
+                            ));
+                            established += 1;
                         }
                         rsp.encode(&mut body);
                         51u8
@@ -3255,6 +3386,7 @@ mod tests {
             gtp_cause::REQUEST_ACCEPTED,
         ));
         let create_delay_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let creates_seen = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let (dels, answer_dels) = (deletes.clone(), answer_deletes.clone());
         let (del_cause, create_delay) = (delete_cause.clone(), create_delay_ms.clone());
         let handle = sock.clone();
@@ -3329,7 +3461,11 @@ mod tests {
                 if let Ok(ie) = nextgcore_gtp::v2::ie::Gtp2Ie::decode(&mut c) {
                     resp.add_ie(ie);
                 }
-                resp.add_ie(Gtp2FTeidIe::new_ipv4(7, 0x0BEE_F001, [127, 0, 0, 1]).to_ie(1));
+                // A distinct control TEID per Create, from 0x0BEE_F001: a test that
+                // creates twice can tell the two sessions apart.
+                let teid =
+                    0x0BEE_F001 + creates_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                resp.add_ie(Gtp2FTeidIe::new_ipv4(7, teid, [127, 0, 0, 1]).to_ie(1));
                 resp.add_ie(Gtp2PaaIe::ipv4(PGW_ALLOCATED_ADDR).to_ie(0));
                 let mut bc = Gtp2BearerContextIe::new();
                 bc.set_ebi(5);
@@ -3421,15 +3557,63 @@ mod tests {
         );
     }
 
-    /// A Create Session Request for an IMSI and APN whose PDN connection the SGW-C
-    /// still holds -- an MME re-attaching a UE whose old session it never deleted,
-    /// as after a PGW restart -- replaces the old connection, and the old one is
-    /// deleted on the SGW-U and at the PGW, not just dropped from the local context.
+    /// [`csr`] for `ebi` and `apn` (one label), with `teid` in the header.
+    fn csr_for(seq: u32, imsi: &[u8], ebi: u8, apn: &str, teid: u32) -> Gtp2Message {
+        let mut msg = csr(seq, imsi);
+        msg.header.teid = Some(teid);
+        let mut label = vec![apn.len() as u8];
+        label.extend(apn.as_bytes());
+        for ie in msg.ies.iter_mut() {
+            if ie.ie_type == Gtp2IeType::Apn as u8 {
+                ie.value = Bytes::from(label.clone());
+            }
+        }
+        msg.ies
+            .retain(|ie| ie.ie_type != Gtp2IeType::BearerContext as u8);
+        let mut bc = Gtp2BearerContextIe::new();
+        bc.set_ebi(ebi);
+        bc.set_bearer_qos(&Gtp2BearerQosIe::new(9, 1000, 2000, 0, 0));
+        msg.add_bearer_context(0, &bc);
+        msg
+    }
+
+    /// The SEIDs of the Session Deletion Requests the stand-in SGW-U received.
+    fn sgwu_deletions(sgwu: &StandInSgwu) -> Vec<u64> {
+        sgwu.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(t, _, _)| *t == 54)
+            .filter_map(|(_, seid, _)| *seid)
+            .collect()
+    }
+
+    /// Wait (bounded) for `done`, polling: the deletions are fire-and-forget.
+    async fn eventually(done: impl Fn() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !done() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        done()
+    }
+
+    fn accepted(r: &Gtp2Message) -> bool {
+        r.get_ie(Gtp2IeType::Cause as u8, 0)
+            .and_then(|ie| ie.value.first().copied())
+            == Some(gtp_cause::REQUEST_ACCEPTED)
+    }
+
+    /// TS 29.274 §7.2.1: a Create Session Request naming the EBI of a PDN connection
+    /// the SGW-C still holds -- an MME re-attaching a UE whose old session it never
+    /// deleted, as after a PGW restart -- collides with it, and the existing PDN
+    /// connection is deleted first: on the SGW-U, since its user plane is this SGW's,
+    /// but NOT at the PGW the new request goes to, which resolves the collision
+    /// itself. The new session is kept.
     ///
-    /// REVERT-VERIFIED: with only the local removal, the SGW-U sees no Session
-    /// Deletion and the PGW no Delete Session (sgwu_pfcp_sessions 2, upf 1).
+    /// REVERT-VERIFIED: with only the local removal, the SGW-U deletes nothing
+    /// (sgwu_pfcp_sessions 2 against upf_pfcp_sessions 1 on devtest1).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_replaced_pdn_connection_is_deleted_on_the_sgwu_and_the_pgw() {
+    async fn a_colliding_create_deletes_the_old_pdn_connection_on_the_sgwu() {
         let ambient = crate::pfcp_path::process_state_test_guard().await;
         let sgwu = stand_in_sgwu(
             &ambient,
@@ -3442,56 +3626,311 @@ mod tests {
         set_s11_server(server.clone());
         let sock = client();
         let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x77];
-        let accepted = |r: &Gtp2Message| {
-            r.get_ie(Gtp2IeType::Cause as u8, 0)
-                .and_then(|ie| ie.value.first().copied())
-                == Some(gtp_cause::REQUEST_ACCEPTED)
-        };
 
         sock.send_to(&csr(0x7701, &imsi).encode(), server.local_addr())
             .unwrap();
-        let first = recv_s11(&sock).await.expect("the first response");
-        assert!(accepted(&first), "the fixture's first session is created");
-        let old_id = {
-            let ctx = sgwc_self();
-            let ue = ctx.ue_find_by_imsi(&imsi).expect("the UE");
-            ctx.sess_find_by_apn(ue.id, "internet")
-                .expect("the session")
-                .id
-        };
-        let deletions = || {
-            sgwu.seen
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .iter()
-                .filter(|(t, _, _)| *t == 54)
-                .count()
-        };
-        assert_eq!(deletions(), 0);
+        assert!(accepted(&recv_s11(&sock).await.expect("first")));
+        let ctx = sgwc_self();
+        let ue = ctx.ue_find_by_imsi(&imsi).expect("the UE");
+        let old = ctx
+            .sess_find_by_apn(ue.id, "internet")
+            .expect("the session");
+        assert_ne!(old.sgwu_sxa_seid, 0);
 
-        // The same IMSI and APN again, with no Delete Session in between.
+        // The same IMSI and EBI again, with no Delete Session in between.
         sock.send_to(&csr(0x7702, &imsi).encode(), server.local_addr())
             .unwrap();
-        let second = recv_s11(&sock).await.expect("the second response");
-        assert!(accepted(&second), "the new session is created");
+        assert!(accepted(&recv_s11(&sock).await.expect("second")));
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        let pgw_deleted = || {
+        assert!(
+            eventually(|| sgwu_deletions(&sgwu) == vec![old.sgwu_sxa_seid]).await,
+            "the OLD SGW-U session is deleted, and only it: {:?}",
+            sgwu_deletions(&sgwu)
+        );
+        let sessions = ctx.sess_list_for_ue(ue.id);
+        assert_eq!(sessions.len(), 1, "one PDN connection");
+        assert_ne!(sessions[0].id, old.id, "the new one");
+        assert_ne!(sessions[0].sgwu_sxa_seid, old.sgwu_sxa_seid);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
             pgw.deletes
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .contains(&(Some(0x0BEE_F001), Some(5), true))
-        };
-        while (deletions() == 0 || !pgw_deleted()) && std::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert_eq!(deletions(), 1, "the old SGW-U PFCP session is deleted");
-        assert!(pgw_deleted(), "and the old PGW session");
+                .is_empty(),
+            "the same PGW resolves the collision itself: no Delete Session"
+        );
+        ctx.ue_remove(ue.id);
+    }
 
+    /// TS 29.274 §7.2.1: when the colliding request goes to another PGW, the old PGW
+    /// is told, at its own address and for its own session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_colliding_create_toward_another_pgw_deletes_the_old_pgw_session() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let _sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::from_millis(0),
+        )
+        .await;
+        let old_pgw = with_stand_in_pgw().await;
+        let server = test_server(&ambient, 1000, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x78];
+
+        sock.send_to(&csr(0x7801, &imsi).encode(), server.local_addr())
+            .unwrap();
+        assert!(accepted(&recv_s11(&sock).await.expect("first")));
+
+        // The PGW the SGW-C selects is another one now (the stand-ins share 127.0.0.1,
+        // so the old one's address is moved to tell them apart).
         let ctx = sgwc_self();
         let ue = ctx.ue_find_by_imsi(&imsi).expect("the UE");
-        assert!(ctx.sess_find_by_id(old_id).is_none());
-        assert_eq!(ctx.sess_list_for_ue(ue.id).len(), 1, "one PDN connection");
+        let mut old = ctx
+            .sess_find_by_apn(ue.id, "internet")
+            .expect("the session");
+        old.pgw_addr = Some(Ipv4Addr::new(127, 0, 0, 2));
+        ctx.sess_update(&old);
+        let new_pgw = with_stand_in_pgw().await;
+        // The old PGW listens at its own address on the S5/S8 port in use (2123 in a
+        // deployment; the new stand-in's here).
+        let relocated = tokio::net::UdpSocket::bind(SocketAddr::new(
+            std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
+            new_pgw.addr.port(),
+        ))
+        .await
+        .expect("bind the old PGW's address");
+        let _ = old_pgw;
+
+        sock.send_to(&csr(0x7802, &imsi).encode(), server.local_addr())
+            .unwrap();
+        assert!(accepted(&recv_s11(&sock).await.expect("second")));
+
+        let mut buf = vec![0u8; 4096];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(3), relocated.recv_from(&mut buf))
+            .await
+            .expect("the old PGW is sent a Delete Session Request")
+            .unwrap();
+        let mut bytes = Bytes::copy_from_slice(&buf[..len]);
+        let dsr = Gtp2Message::decode(&mut bytes).unwrap();
+        assert_eq!(
+            dsr.header.message_type,
+            Gtp2MessageType::DeleteSessionRequest as u8
+        );
+        assert_eq!(dsr.header.teid, Some(old.pgw_s5c_teid));
+        ctx.ue_remove(ue.id);
+    }
+
+    /// Two PDN connections to the same APN are legal: a Create Session Request with a
+    /// new EBI does not collide with the first, whatever its APN. And one with the same
+    /// EBI to ANOTHER APN does collide.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_collision_is_by_ebi_not_by_apn() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::from_millis(0),
+        )
+        .await;
+        let _pgw = with_stand_in_pgw().await;
+        let server = test_server(&ambient, 1000, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x79];
+
+        sock.send_to(&csr(0x7901, &imsi).encode(), server.local_addr())
+            .unwrap();
+        assert!(accepted(&recv_s11(&sock).await.expect("PDN 1")));
+        let ctx = sgwc_self();
+        let ue = ctx.ue_find_by_imsi(&imsi).expect("the UE");
+        // A second PDN connection to the same APN, EBI 6.
+        sock.send_to(
+            &csr_for(0x7902, &imsi, 6, "internet", ue.sgw_s11_teid).encode(),
+            server.local_addr(),
+        )
+        .unwrap();
+        assert!(accepted(&recv_s11(&sock).await.expect("PDN 2")));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            sgwu_deletions(&sgwu).is_empty(),
+            "no collision: nothing deleted"
+        );
+        assert_eq!(ctx.sess_list_for_ue(ue.id).len(), 2);
+
+        // EBI 6 again, to another APN: it collides with PDN 2, and only PDN 2 goes.
+        let pdn2 = ctx
+            .bearer_find_by_ue_ebi(ue.id, 6)
+            .and_then(|b| ctx.sess_find_by_id(b.sess_id))
+            .expect("PDN 2");
+        sock.send_to(
+            &csr_for(0x7903, &imsi, 6, "ims", ue.sgw_s11_teid).encode(),
+            server.local_addr(),
+        )
+        .unwrap();
+        assert!(accepted(&recv_s11(&sock).await.expect("PDN 3")));
+        assert!(eventually(|| sgwu_deletions(&sgwu) == vec![pdn2.sgwu_sxa_seid]).await);
+        let apns: Vec<String> = ctx
+            .sess_list_for_ue(ue.id)
+            .iter()
+            .filter_map(|s| s.apn().map(str::to_string))
+            .collect();
+        assert_eq!(apns.len(), 2, "{apns:?}");
+        assert!(apns.contains(&"internet".to_string()) && apns.contains(&"ims".to_string()));
+        ctx.ue_remove(ue.id);
+    }
+
+    /// TS 29.274 §7.2.1: a non-zero-TEID request naming a DEDICATED bearer's EBI
+    /// deletes only that bearer; its PDN connection stays.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_collision_with_a_dedicated_bearer_deletes_only_that_bearer() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::from_millis(0),
+        )
+        .await;
+        let _pgw = with_stand_in_pgw().await;
+        let server = test_server(&ambient, 1000, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x7a];
+
+        sock.send_to(&csr(0x7a01, &imsi).encode(), server.local_addr())
+            .unwrap();
+        assert!(accepted(&recv_s11(&sock).await.expect("PDN 1")));
+        let ctx = sgwc_self();
+        let ue = ctx.ue_find_by_imsi(&imsi).expect("the UE");
+        let pdn1 = ctx.sess_find_by_apn(ue.id, "internet").expect("PDN 1");
+        let dedicated = ctx.bearer_add(pdn1.id).unwrap();
+        let mut dedicated = ctx.bearer_find_by_id(dedicated.id).unwrap();
+        dedicated.ebi = 7;
+        ctx.bearer_update(&dedicated);
+
+        sock.send_to(
+            &csr_for(0x7a02, &imsi, 7, "ims", ue.sgw_s11_teid).encode(),
+            server.local_addr(),
+        )
+        .unwrap();
+        assert!(accepted(&recv_s11(&sock).await.expect("PDN 2")));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(ctx.sess_find_by_id(pdn1.id).is_some(), "PDN 1 stays");
+        assert!(sgwu_deletions(&sgwu).is_empty());
+        assert!(
+            ctx.bearer_find_by_sess_ebi(pdn1.id, 7).is_none(),
+            "its bearer 7 went"
+        );
+        assert_eq!(ctx.sess_list_for_ue(ue.id).len(), 2);
+        ctx.ue_remove(ue.id);
+    }
+
+    /// TS 29.274 §7.6: a Create Session Request retransmitted while the first is
+    /// still being processed is not processed again. The PGW sees one Create, and the
+    /// MME one answer (then the cached one, for later retransmissions).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_create_session_retransmitted_in_flight_is_not_processed_again() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let _sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::from_millis(0),
+        )
+        .await;
+        let pgw = with_stand_in_pgw().await;
+        pgw.create_delay_ms
+            .store(800, std::sync::atomic::Ordering::SeqCst);
+        let server = test_server(&ambient, 1000, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x7b];
+        let request = csr(0x7b01, &imsi).encode();
+
+        sock.send_to(&request, server.local_addr()).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        sock.send_to(&request, server.local_addr()).unwrap();
+        let first = recv_s11(&sock).await.expect("the answer");
+        assert!(accepted(&first));
+        // A later retransmission gets the cached answer, the same one.
+        sock.send_to(&request, server.local_addr()).unwrap();
+        let again = recv_s11(&sock).await.expect("the cached answer");
+        assert_eq!(again.encode(), first.encode());
+        sock.set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        assert!(
+            recv_s11(&sock).await.is_none(),
+            "no second, different answer"
+        );
+        let creates = pgw
+            .seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|t| **t == Gtp2MessageType::CreateSessionRequest as u8)
+            .count();
+        assert_eq!(creates, 1, "the PGW is asked once");
+        let ctx = sgwc_self();
+        let ue = ctx.ue_find_by_imsi(&imsi).expect("the UE");
+        assert_eq!(ctx.sess_list_for_ue(ue.id).len(), 1);
+        ctx.ue_remove(ue.id);
+    }
+
+    /// A session replaced while the SGW-U was still establishing it has no SGW-U SEID
+    /// to delete; the late Establishment Response, finding no session, deletes the
+    /// SGW-U session it created instead of leaving it to leak.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_session_removed_mid_establishment_is_deleted_on_the_sgwu() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::from_millis(600),
+        )
+        .await;
+        let _pgw = with_stand_in_pgw().await;
+        let server = test_server(&ambient, 1000, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x7c];
+
+        sock.send_to(&csr(0x7c01, &imsi).encode(), server.local_addr())
+            .unwrap();
+        // The PGW has answered and the establishment is waiting at the SGW-U.
+        let ctx = sgwc_self();
+        assert!(
+            eventually(|| {
+                sgwu.seen
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .any(|(t, _, _)| *t == 50)
+            })
+            .await
+        );
+        let ue = ctx.ue_find_by_imsi(&imsi).expect("the UE");
+        let first = ctx
+            .sess_find_by_apn(ue.id, "internet")
+            .expect("the session");
+        assert_eq!(first.sgwu_sxa_seid, 0, "not established yet");
+        sock.send_to(&csr(0x7c02, &imsi).encode(), server.local_addr())
+            .unwrap();
+
+        // Both answers come back; the first session's late response deletes the
+        // SGW-U session it created (the stand-in's first SEID).
+        let _ = recv_s11(&sock).await;
+        let _ = recv_s11(&sock).await;
+        assert!(
+            eventually(|| sgwu_deletions(&sgwu).contains(&0x5555_0001)).await,
+            "{:?}",
+            sgwu_deletions(&sgwu)
+        );
+        let sessions = ctx.sess_list_for_ue(ue.id);
+        assert_eq!(sessions.len(), 1);
+        assert_ne!(
+            sessions[0].sgwu_sxa_seid, 0x5555_0001,
+            "the survivor is the second"
+        );
         ctx.ue_remove(ue.id);
     }
 
@@ -4181,7 +4620,9 @@ mod tests {
         let server = test_server(&ambient, 1000, 1);
         set_s11_server(server.clone());
         let sock = client();
-        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x59];
+        // Its own IMSI: the uplink-FAR test above used 0x59 too, and its UE outlives it,
+        // so this create collided with it (TS 29.274 §7.2.1) once collisions are resolved.
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x5f];
 
         sock.send_to(&csr(0x5407, &imsi).encode(), server.local_addr())
             .unwrap();
