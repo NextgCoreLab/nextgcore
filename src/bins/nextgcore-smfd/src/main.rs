@@ -3271,11 +3271,7 @@ fn session_setup_flows(
         qfi: binding.qfi,
         five_qi: u16::from(binding.five_qi),
         arp: default_bearer.map_or(
-            n2_transfer::Arp {
-                priority_level: binding.arp_priority_level,
-                may_trigger_pre_emption: false,
-                pre_emptable: false,
-            },
+            n2_transfer::Arp::default_flow(binding.arp_priority_level),
             |b| n2_transfer::Arp {
                 priority_level: binding.arp_priority_level,
                 ..bearer_arp(b)
@@ -3378,11 +3374,7 @@ fn default_flow(qfi: u8, five_qi: u16, arp_priority_level: u8) -> Vec<n2_transfe
     vec![n2_transfer::QosFlowSetup {
         qfi,
         five_qi,
-        arp: n2_transfer::Arp {
-            priority_level: arp_priority_level,
-            may_trigger_pre_emption: false,
-            pre_emptable: false,
-        },
+        arp: n2_transfer::Arp::default_flow(arp_priority_level),
         gbr: None,
         e_rab_id: None,
     }]
