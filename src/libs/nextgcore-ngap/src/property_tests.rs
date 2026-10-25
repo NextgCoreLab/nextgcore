@@ -114,14 +114,14 @@ proptest! {
     fn prop_global_ng_enb_id_index_width(ng_enb_id in 0u32..(1u32 << 20)) {
         let id = GlobalRanNodeId::GlobalNgEnbId {
             plmn_identity: SAMPLE_PLMN,
-            ng_enb_id,
+            ng_enb_id: crate::types::NgEnbId::Macro(ng_enb_id),
         };
         let mut container = ProtocolIeContainer::new();
         encode_global_ran_node_id(&mut container, &id, nextgcore_asn1c::ngap::Criticality::Reject).unwrap();
         prop_assert_eq!(container.ies[0].value[0] >> 6, 1u8);
         match decode_global_ran_node_id(&container.ies[0]).unwrap() {
             GlobalRanNodeId::GlobalNgEnbId { ng_enb_id: decoded, .. } => {
-                prop_assert_eq!(decoded, ng_enb_id);
+                prop_assert_eq!(decoded, crate::types::NgEnbId::Macro(ng_enb_id));
             }
             other => prop_assert!(false, "expected GlobalNgEnbId, got {:?}", other),
         }

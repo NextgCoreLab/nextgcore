@@ -155,6 +155,19 @@ impl KernelSctpServer {
         Ok(false)
     }
 
+    /// Mirror of [`crate::server::SctpServer::recv_or_wake`] (#981): the pacing sleep
+    /// ends early when `wake` completes. Nothing is read here, so nothing can be lost.
+    pub async fn recv_or_wake(
+        &mut self,
+        recv_timeout: Duration,
+        wake: impl std::future::Future<Output = ()>,
+    ) -> Result<crate::server::RecvOutcome> {
+        tokio::select! {
+            () = tokio::time::sleep(recv_timeout) => Ok(crate::server::RecvOutcome::Timeout),
+            () = wake => Ok(crate::server::RecvOutcome::Woken),
+        }
+    }
+
     /// Send `data` to `association_id` on `stream_id` with the configured PPID
     /// ([`SctpServerConfig::ppid`]; NGAP 60 by default, S1AP 18 for S1-MME).
     pub async fn send(&mut self, association_id: u64, stream_id: u16, data: &[u8]) -> Result<()> {
