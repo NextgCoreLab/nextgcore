@@ -5807,6 +5807,8 @@ static SM_POLICY_DELETE_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// left to its own supervision, and the metric above says so.
 const SM_POLICY_DELETE_ATTEMPTS: u32 = 2;
 const SM_POLICY_DELETE_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
+/// The longest Retry-After an overloaded PCF can make a termination wait (#874).
+const SM_POLICY_DELETE_MAX_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Take the SM policy id out of `sm_context_ref`'s binding, so whichever release
 /// step reaches the termination first is the only one that sends it (#719).
@@ -5828,8 +5830,8 @@ fn take_sm_policy_id(sm_context_ref: &str) -> Option<String> {
 
 /// Npcf_SMPolicyControl_Delete for `pol_id` (TS 29.512 §4.2.5.2), at most
 /// [`SM_POLICY_DELETE_ATTEMPTS`] times. A 4xx is final: the PCF has answered, and
-/// a 404 means the association is already gone. A transport error or a 5xx is
-/// tried again once.
+/// a 404 means the association is already gone. A transport error, a 5xx, or an
+/// overload answer (429, or 503 with Retry-After; #874) is tried again once.
 ///
 /// The body is an empty SmPolicyDeleteData. Every attribute is optional, and the
 /// ones that would describe this release (`ranNasRelCauses`, §4.2.5.4) belong to
@@ -5845,6 +5847,21 @@ async fn delete_sm_policy(pol_id: &str) {
             Ok(()) => {
                 log::info!("SM policy association {pol_id} deleted at PCF");
                 return;
+            }
+            Err(policy::PolicyError::Overloaded {
+                status,
+                retry_after,
+            }) if attempt < SM_POLICY_DELETE_ATTEMPTS => {
+                // #874: an overload answer is retried like a 5xx, after the PCF's
+                // Retry-After, capped.
+                let pause = retry_after
+                    .unwrap_or(SM_POLICY_DELETE_RETRY_PAUSE)
+                    .min(SM_POLICY_DELETE_MAX_RETRY_AFTER);
+                log::warn!(
+                    "SM policy delete for {pol_id}: the PCF is overloaded ({status}); \
+                     retrying in {pause:?} (attempt {attempt}/{SM_POLICY_DELETE_ATTEMPTS})"
+                );
+                tokio::time::sleep(pause).await;
             }
             Err(policy::PolicyError::Rejected { status, detail }) if status < 500 => {
                 log::warn!(
@@ -5882,7 +5899,77 @@ async fn delete_sm_policy(pol_id: &str) {
 /// shutdown check, so N sessions times a blackholed PCF stalled all of them. The
 /// handle is for tests; production drops it.
 fn spawn_sm_policy_delete(pol_id: String) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move { delete_sm_policy(&pol_id).await })
+    // #874: bounded, and tracked, so a graceful shutdown drains what is in flight.
+    // The guard moves into the task, so the count drops however the task ends:
+    // finished, aborted, or dropped unpolled with its runtime.
+    struct Running;
+    impl Drop for Running {
+        fn drop(&mut self) {
+            SM_POLICY_DELETES_RUNNING.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    SM_POLICY_DELETES_RUNNING.fetch_add(1, Ordering::SeqCst);
+    let running = Running;
+    let task = tokio::spawn(async move {
+        let _running = running;
+        let Ok(_permit) = sm_policy_delete_permits().clone().acquire_owned().await else {
+            return;
+        };
+        delete_sm_policy(&pol_id).await
+    });
+    if let Ok(mut tasks) = sm_policy_delete_tasks().lock() {
+        tasks.retain(|t| !t.is_finished());
+        tasks.push(task.abort_handle());
+    }
+    task
+}
+
+/// How many SM Policy Association terminations run at once (#874): a UPF restart
+/// or a T3592 storm otherwise opens one PCF connection per session at the same
+/// instant.
+const SM_POLICY_DELETE_FANOUT: usize = 16;
+
+fn sm_policy_delete_permits() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static PERMITS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    PERMITS
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(SM_POLICY_DELETE_FANOUT)))
+}
+
+/// SM Policy Association terminations still running (#874).
+static SM_POLICY_DELETES_RUNNING: AtomicU64 = AtomicU64::new(0);
+
+fn sm_policy_delete_tasks() -> &'static std::sync::Mutex<Vec<tokio::task::AbortHandle>> {
+    static TASKS: std::sync::OnceLock<std::sync::Mutex<Vec<tokio::task::AbortHandle>>> =
+        std::sync::OnceLock::new();
+    TASKS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Wait, at most `budget`, for the SM Policy Association terminations in flight
+/// (#874): a SIGTERM right after an AMF-driven release used to drop its DELETE with
+/// the runtime. What is left at the end is aborted and counted in
+/// `smf_sm_policy_delete_failures_total`. Returns how many were abandoned.
+async fn drain_sm_policy_deletes(budget: std::time::Duration) -> u64 {
+    let deadline = tokio::time::Instant::now() + budget;
+    while SM_POLICY_DELETES_RUNNING.load(Ordering::SeqCst) > 0
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let left = SM_POLICY_DELETES_RUNNING.load(Ordering::SeqCst);
+    if left > 0 {
+        if let Ok(mut tasks) = sm_policy_delete_tasks().lock() {
+            for t in tasks.drain(..) {
+                t.abort();
+            }
+        }
+        SM_POLICY_DELETE_FAILURES.fetch_add(left, Ordering::Relaxed);
+        log::warn!(
+            "Shutdown: {left} SM Policy Association termination(s) still running after \
+             {budget:?}; abandoned, their associations stay at the PCF"
+        );
+    }
+    left
 }
 
 /// SM Policy Association Termination for `sm_context_ref`: takes the id (so one
@@ -6934,14 +7021,22 @@ async fn run_gsm_timer_tick() {
                      command (attempt {attempt})",
                     entry.timer_id.name()
                 );
-                send_n1_n2_message_transfer(
-                    entry.amf_uri.as_deref(),
-                    &entry.supi,
-                    entry.psi,
-                    &entry.command,
-                    &sm_context_ref,
-                )
-                .await;
+                // #874: off the tick, like the abandon. A UPF restart arms T3592 for
+                // every session at one instant, so they all retransmit on one tick, and
+                // with a blackholed AMF each transfer waits its connect and request
+                // timeouts; awaited here, they held the tick, and every other timer and
+                // the shutdown check, for that long times N.
+                let sm_ref = sm_context_ref.clone();
+                spawn_gsm_expiry(async move {
+                    send_n1_n2_message_transfer(
+                        entry.amf_uri.as_deref(),
+                        &entry.supi,
+                        entry.psi,
+                        &entry.command,
+                        &sm_ref,
+                    )
+                    .await;
+                });
             }
             GsmTimerExpiry::Exhausted => {
                 // TS 24.501 §6.3.2.2/§6.3.3: on the final expiry the network
@@ -6957,12 +7052,32 @@ async fn run_gsm_timer_tick() {
                 // the tick owns every other T3591/T3592 and the shutdown check, so
                 // a slow AMF (or, before the delete moved to its own task, a slow
                 // PCF) times N exhausted sessions stalled all of them.
-                tokio::spawn(async move {
+                spawn_gsm_expiry(async move {
                     abandon_gsm_procedure(&sm_context_ref, entry.timer_id).await;
                 });
             }
         }
     }
+}
+
+/// How many 5GSM timer expiries (retransmissions and abandons) run at once (#874).
+const GSM_EXPIRY_FANOUT: usize = 16;
+
+fn gsm_expiry_permits() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static PERMITS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(GSM_EXPIRY_FANOUT)))
+}
+
+/// Run one 5GSM expiry's AMF work in its own task, at most [`GSM_EXPIRY_FANOUT`] at
+/// once (#874): 2N simultaneous AMF and PCF connections otherwise.
+fn spawn_gsm_expiry(work: impl std::future::Future<Output = ()> + Send + 'static) {
+    tokio::spawn(async move {
+        let Ok(_permit) = gsm_expiry_permits().clone().acquire_owned().await else {
+            return;
+        };
+        work.await;
+    });
 }
 
 /// Drive the Network Triggered Service Request for a buffered downlink packet
@@ -7432,6 +7547,10 @@ async fn graceful_shutdown(
         }
     };
     tokio::join!(fanouts, n4, nsac);
+    // #874: the SM Policy Association terminations still in flight, including the
+    // ones this shutdown's releases started, are given a bounded time to land,
+    // within what is left of the shutdown's deadline.
+    drain_sm_policy_deletes(std::time::Duration::from_secs(3).min(left())).await;
     pfcp_listener.abort();
     log::info!("SMF N4 PFCP listener stopped");
     // #718 review m2: the Delete Bearer Requests sent above, on either path, are
@@ -17107,6 +17226,201 @@ mod tests {
         assert!(
             dropped,
             "both contexts dropped within 2 s, well inside one PCF timeout"
+        );
+    }
+
+    /// Insert `n` 5GSM timers due now, at `attempts`, toward `amf_uri`.
+    fn due_gsm_timers(prefix: &str, n: usize, attempts: u32, amf_uri: &str) -> Vec<String> {
+        let refs: Vec<String> = (0..n).map(|i| format!("{prefix}-{i}")).collect();
+        if let Ok(mut timers) = gsm_procedure_timers().lock() {
+            for (i, r) in refs.iter().enumerate() {
+                timers.insert(
+                    r.clone(),
+                    GsmProcedureTimer {
+                        timer_id: timer::SmfTimerId::T3592,
+                        command: vec![0x2e, 5, 0, 0xd3, 36],
+                        supi: format!("imsi-0010100000874{i:02}"),
+                        psi: 5,
+                        amf_uri: Some(amf_uri.to_string()),
+                        attempts,
+                        deadline: std::time::Instant::now() - std::time::Duration::from_millis(1),
+                    },
+                );
+            }
+        }
+        refs
+    }
+
+    /// #874 item 1: a retransmission is off the tick. Twenty T3592s retransmit on
+    /// one tick toward an AMF that accepts and never answers; the tick returns at
+    /// once. Before, it awaited each transfer's connect and request timeouts.
+    #[tokio::test]
+    async fn a_blackholed_amf_does_not_stall_the_5gsm_retransmissions() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let blackhole = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = blackhole.local_addr().unwrap().port();
+        let held = tokio::spawn(async move {
+            let mut conns = Vec::new();
+            while let Ok((c, _)) = blackhole.accept().await {
+                conns.push(c);
+            }
+        });
+        let refs = due_gsm_timers("n874-rtx", 20, 0, &format!("http://127.0.0.1:{port}"));
+
+        let started = std::time::Instant::now();
+        run_gsm_timer_tick().await;
+        let tick = started.elapsed();
+        if let Ok(mut timers) = gsm_procedure_timers().lock() {
+            for r in &refs {
+                timers.remove(r);
+            }
+        }
+        held.abort();
+
+        assert!(
+            tick < std::time::Duration::from_millis(200),
+            "the tick returned at once: {tick:?}"
+        );
+    }
+
+    /// #874 item 2: the expiry fan-out is bounded. Forty retransmissions toward an
+    /// AMF that takes 300 ms each all arrive, never more than 16 at once.
+    #[tokio::test]
+    async fn the_5gsm_expiry_fanout_is_bounded() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let now = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (n, p, d) = (now.clone(), peak.clone(), done.clone());
+        let (amf, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |_req: SbiRequest| {
+                let (n, p, d) = (n.clone(), p.clone(), d.clone());
+                async move {
+                    let in_flight = n.fetch_add(1, Ordering::SeqCst) + 1;
+                    p.fetch_max(in_flight, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    n.fetch_sub(1, Ordering::SeqCst);
+                    d.fetch_add(1, Ordering::SeqCst);
+                    SbiResponse::with_status(200)
+                }
+            })
+            .await;
+        let refs = due_gsm_timers(
+            "n874-fan",
+            40,
+            0,
+            &format!("http://127.0.0.1:{}", addr.port()),
+        );
+
+        run_gsm_timer_tick().await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while done.load(Ordering::SeqCst) < 40 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        if let Ok(mut timers) = gsm_procedure_timers().lock() {
+            for r in &refs {
+                timers.remove(r);
+            }
+        }
+        amf.stop().await.ok();
+
+        assert_eq!(
+            done.load(Ordering::SeqCst),
+            40,
+            "every retransmission arrived"
+        );
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(peak <= GSM_EXPIRY_FANOUT, "at most 16 at once: {peak}");
+        assert!(peak > 1, "and they do run in parallel: {peak}");
+    }
+
+    /// #874 item 3, TS 29.500 §5.2.7.2: a 429 from the PCF is an overload the SMF
+    /// retries, after the Retry-After it carries; the retry succeeds and nothing is
+    /// counted as failed.
+    #[tokio::test]
+    async fn an_overloaded_pcf_delete_is_retried_after_retry_after() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::<std::time::Instant>::new()));
+        let sink = hits.clone();
+        let (pcf, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |_req: SbiRequest| {
+                let sink = sink.clone();
+                async move {
+                    let first = {
+                        let mut h = sink.lock().unwrap();
+                        h.push(std::time::Instant::now());
+                        h.len() == 1
+                    };
+                    if first {
+                        SbiResponse::with_status(429).with_header("Retry-After", "1")
+                    } else {
+                        SbiResponse::with_status(204)
+                    }
+                }
+            })
+            .await;
+        std::env::set_var("PCF_URI", format!("http://127.0.0.1:{}", addr.port()));
+        let failures = SM_POLICY_DELETE_FAILURES.load(Ordering::SeqCst);
+
+        delete_sm_policy("pol-874-429").await;
+        let hits = hits.lock().unwrap().clone();
+        std::env::remove_var("PCF_URI");
+        pcf.stop().await.ok();
+
+        assert_eq!(hits.len(), 2, "the 429 is retried");
+        assert!(
+            hits[1].duration_since(hits[0]) >= std::time::Duration::from_millis(950),
+            "after the Retry-After: {:?}",
+            hits[1].duration_since(hits[0])
+        );
+        assert_eq!(SM_POLICY_DELETE_FAILURES.load(Ordering::SeqCst), failures);
+    }
+
+    /// #874 item 4: a graceful shutdown waits for the SM Policy Association
+    /// terminations in flight, and counts the ones it has to abandon.
+    #[tokio::test]
+    async fn the_shutdown_drains_policy_deletes_and_counts_the_abandoned() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let answered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let a = answered.clone();
+        let (pcf, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let a = a.clone();
+                async move {
+                    if req.header.uri.contains("pol-874-slow") {
+                        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                        a.fetch_add(1, Ordering::SeqCst);
+                        SbiResponse::with_status(204)
+                    } else {
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        SbiResponse::with_status(204)
+                    }
+                }
+            })
+            .await;
+        std::env::set_var("PCF_URI", format!("http://127.0.0.1:{}", addr.port()));
+
+        drop(spawn_sm_policy_delete("pol-874-slow".to_string()));
+        let waited = drain_sm_policy_deletes(std::time::Duration::from_secs(5)).await;
+        let landed = answered.load(Ordering::SeqCst);
+        let failures = SM_POLICY_DELETE_FAILURES.load(Ordering::SeqCst);
+        drop(spawn_sm_policy_delete("pol-874-stuck".to_string()));
+        let abandoned = drain_sm_policy_deletes(std::time::Duration::from_millis(200)).await;
+        let counted = SM_POLICY_DELETE_FAILURES.load(Ordering::SeqCst) - failures;
+        std::env::remove_var("PCF_URI");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), pcf.stop()).await;
+
+        assert_eq!((waited, landed), (0, 1), "the slow DELETE was waited for");
+        assert_eq!(
+            (abandoned, counted),
+            (1, 1),
+            "the stuck one is abandoned and counted"
         );
     }
 
