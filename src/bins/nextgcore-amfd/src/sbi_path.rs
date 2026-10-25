@@ -2552,16 +2552,13 @@ impl LmfSelectionInput {
     }
 }
 
-/// The RAT of the NG-RAN node serving `ue`, from its RAN UE's node in the AMF
-/// context (NR when it is not known).
+/// The RAT of the NG-RAN node serving `ue`: the RAT its live record's association
+/// set up with (NR when unknown, #997 review m2).
 fn serving_rat_type(ue: &AmfUe) -> crate::context::RatType {
-    let ctx = crate::context::amf_self();
-    let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
-    guard
-        .ran_ue_find_by_id(ue.ran_ue_id)
-        .and_then(|r| guard.gnb_find_by_id(r.gnb_id))
-        .map(|g| g.rat_type)
-        .unwrap_or_default()
+    crate::context::amf_self()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .serving_rat_of_ue(ue.id)
 }
 
 /// Does `plmn` (a `PlmnId` JSON) name the UE's PLMN?
@@ -6214,6 +6211,36 @@ mod lmf_selection_tests {
 
     /// `LmfInfo` members: access type, AN node / RAT type, client types, TAI ranges
     /// (start/end and the TS 29.510 example pattern), PLMN.
+    /// #997 review m2: the RAT comes from the association the UE's live record is
+    /// bound to, as that association's NG Setup recorded it; NR once it is gone.
+    #[tokio::test]
+    async fn a_ue_on_an_eutra_association_is_served_by_e_utra() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::test_support::init_context();
+        let (ue_id, assoc) = (9_970_101u64, 9_970_102u64);
+        let ctx = crate::context::amf_self();
+        let store = ctx.read().unwrap().ue_store();
+        store.insert(
+            ue_id,
+            crate::ngap_path::UeNasContext::new(ue_id, 1, assoc, false),
+        );
+        let ue = AmfUe::new(ue_id, 1);
+        assert_eq!(
+            serving_rat_type(&ue),
+            crate::context::RatType::Nr,
+            "unknown: NR"
+        );
+        ctx.read()
+            .unwrap()
+            .association_rat_set(assoc, crate::context::RatType::Eutra);
+        assert_eq!(serving_rat_type(&ue), crate::context::RatType::Eutra);
+        let sel = LmfSelectionInput::for_ue(&ue, serving_rat_type(&ue), None);
+        assert_eq!((sel.an_node_type, sel.rat_type), ("NG_ENB", "EUTRA"));
+        ctx.read().unwrap().association_rat_remove(assoc);
+        assert_eq!(serving_rat_type(&ue), crate::context::RatType::Nr);
+        store.remove(ue_id);
+    }
+
     /// `for_ue` takes the AN node and RAT types from the serving node's RAT.
     #[test]
     fn the_serving_node_decides_an_node_and_rat_type() {
