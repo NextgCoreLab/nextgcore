@@ -1127,6 +1127,112 @@ async fn a_retried_establishment_carries_its_first_origination_timestamp() {
     server.forget_ue(ue);
 }
 
+/// A stand-in SMF answering every CreateSMContext 201 for `sm_ref`, recording
+/// the `3gpp-Sbi-Origination-Timestamp` of each.
+async fn stamp_recording_smf(
+    sm_ref: &'static str,
+) -> (
+    nextgcore_sbi::server::SbiServer,
+    u16,
+    Arc<std::sync::Mutex<Vec<Option<String>>>>,
+) {
+    use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
+    let stamps: Arc<std::sync::Mutex<Vec<Option<String>>>> = Arc::default();
+    let sink = Arc::clone(&stamps);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let smf = nextgcore_sbi::server::SbiServer::on_listener(
+        nextgcore_sbi::server::SbiServerConfig::new(addr),
+        listener,
+    );
+    smf.start(move |req: SReq| {
+        let sink = Arc::clone(&sink);
+        async move {
+            sink.lock().expect("sink").push(
+                req.http
+                    .get_header(crate::sbi_path::ORIGINATION_TIMESTAMP_HEADER)
+                    .cloned(),
+            );
+            let body = serde_json::json!({
+                "smContextRef": sm_ref,
+                "n1SmMsg": base64::engine::general_purpose::STANDARD
+                    .encode([0x2E, 0x05, 0x01, 0xC2]),
+                "n2SmInfo": base64::engine::general_purpose::STANDARD
+                    .encode(transfer_for(sm_ref)),
+            });
+            SResp::with_status(201).with_body(body.to_string(), "application/json")
+        }
+    })
+    .await
+    .expect("stand-in SMF starts");
+    (smf, addr.port(), stamps)
+}
+
+/// #1036: the UE retransmits its PDU SESSION ESTABLISHMENT REQUEST (same PSI,
+/// same PTI) after the AMF's CreateSMContext for it already succeeded, e.g.
+/// because the Accept was lost on the radio. The retransmission's create
+/// carries the first create's `3gpp-Sbi-Origination-Timestamp`, so the PCF
+/// sees the same request again and keeps the SM policy association and its AF
+/// sessions (TS 29.512 §4.2.7). A new request for the PSI (another PTI) is a
+/// new establishment and gets a fresh stamp.
+///
+/// Revert-verified: stamping the retransmission afresh fails this test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn a_retransmission_after_a_successful_create_carries_the_first_stamp() {
+    let (_smf, port, stamps) = stamp_recording_smf("est-1036").await;
+    let _env = super::SmfEnvGuard::acquire(port).await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_103_601u64, 99);
+    ue_ready_for_sessions(&mut server, ue, ran);
+
+    let request = [0x2E, 0x05, 0x01, 0xC1, 0xFF, 0xFF];
+    server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &request))
+        .await
+        .expect("handled");
+    settle_establishments(&mut server).await;
+    assert_eq!(
+        server.sm_context_refs.get(&(ue, 5)).map(String::as_str),
+        Some("est-1036"),
+        "the first create succeeded"
+    );
+    let first = stamps.lock().expect("stamps")[0].clone().expect("stamped");
+
+    // T3580 expires at the UE: the same request again, a little later.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &request))
+        .await
+        .expect("handled");
+    settle_establishments(&mut server).await;
+
+    // A new request for the PSI, with another PTI, is not a retransmission.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let another = [0x2E, 0x05, 0x02, 0xC1, 0xFF, 0xFF];
+    server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &another))
+        .await
+        .expect("handled");
+    settle_establishments(&mut server).await;
+
+    let seen = stamps.lock().expect("stamps").clone();
+    assert_eq!(seen.len(), 3, "{seen:?}");
+    assert_eq!(
+        seen[1].as_deref(),
+        Some(first.as_str()),
+        "the retransmission carries the first create's stamp"
+    );
+    let third = seen[2].clone().expect("stamped");
+    assert!(
+        nextgcore_sbi::datetime::origination_timestamp_to_epoch_ms(&third)
+            > nextgcore_sbi::datetime::origination_timestamp_to_epoch_ms(&first),
+        "a new establishment is stamped afresh: {first} then {third}"
+    );
+    server.forget_ue(ue);
+    assert!(server.created_establishments.is_empty());
+}
+
 /// When no SMF comes back within the window, the UE is answered as TS 24.501
 /// prescribes for a routing failure (§5.4.5.2.5 a) 1), §5.4.5.3.1 e)): a DL NAS
 /// TRANSPORT carrying its own 5GSM message back, with 5GMM #90. The AMF does
