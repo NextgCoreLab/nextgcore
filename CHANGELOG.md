@@ -179,6 +179,22 @@ before the tag. The validation line is filled from the release run, not carried 
   - upfd holds a Setup from an address its host-named PFCP allowlist does not list, while the
     names are re-resolved off the receive task, and judges it against the fresh answer. Still
     fail-closed (#1112).
+- **Deploy together (GTPv2-C S5/S8):** smfd (PGW-C) and sgwcd (SGW-C) now put every
+  F-TEID at the IE instance TS 29.274 gives it (#1113):
+  - smfd's Create Session Response carries the PGW S5/S8-C F-TEID at instance 1 (Table
+    7.2.2-1). It was at 0, so sgwcd stored PGW TEID 0 and relayed no Delete Session on
+    detach, and the PGW session, its PGW-U PFCP session and the UE address leaked;
+  - smfd's F-TEIDs are well-formed for IPv6-only S5/S8 addresses (no V4 flag without an
+    IPv4 address) and carry the S2b interface types 32/33 untruncated;
+  - smfd's Create Bearer Request carries the S5/S8-U PGW F-TEID at instance 1 (Table
+    7.2.3-2), with its mandatory TFT and Charging Id;
+  - sgwcd builds the S5/S8 Modify Bearer Request with the S5/S8-U SGW F-TEID at instance 1
+    (Table 7.2.7-2). It has no production caller yet; smfd also accepts the old instance 2
+    when its interface type is S5/S8 SGW GTP-U.
+
+  The detach leak ends when smfd is upgraded. An upgraded sgwcd also reads an old smfd's
+  instance-0 F-TEID when its interface type names the PGW, so a rolling upgrade in either
+  order does not leak. Upgrade both in the same rollout all the same.
 - smfd answers PFCP Node Reports and acts on user plane path failure and recovery; a
   path still down after `SMF_UP_PATH_FAILURE_HOLD_SECS` (default 120 s) releases its
   sessions with #39 (#994, #1028).

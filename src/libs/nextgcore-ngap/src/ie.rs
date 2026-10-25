@@ -774,13 +774,8 @@ fn encode_global_ran_node_id_into(
             encoder.write_bit(false); // extension marker
             encoder.write_bit(false); // no iE-Extensions
             encoder.encode_octet_string(plmn_identity, Some(3), Some(3))?;
-            // NgENB-ID CHOICE { macroNgENB-ID(20), shortMacroNgENB-ID(18),
-            // longMacroNgENB-ID(21), choice-Extensions }: 4 alts, NON-extensible
-            // -> 2-bit index. macroNgENB-ID = index 0.
-            encoder.encode_choice_index(0, 4, false)?;
-            // macroNgENB-ID BIT STRING(20): octet-align before content (>16).
-            encoder.align();
-            encoder.write_bits(*ng_enb_id as u64, 20);
+            // #876: the NgENB-ID alternative the id names, not always macro.
+            encode_ng_enb_id_into(encoder, ng_enb_id)?;
         }
     }
     Ok(())
@@ -823,10 +818,9 @@ fn decode_global_ran_node_id_into(decoder: &mut AperDecoder) -> NgapResult<Globa
             let plmn_bytes = decoder.decode_octet_string(Some(3), Some(3))?;
             let mut plmn_identity = [0u8; 3];
             plmn_identity.copy_from_slice(&plmn_bytes);
-            // NgENB-ID CHOICE: 4 alternatives, non-extensible (2-bit index)
-            let _enb_choice = decoder.decode_choice_index(4, false)?;
-            decoder.align();
-            let ng_enb_id = decoder.read_bits(20)? as u32;
+            // #876: the alternative is kept, so a short or long macro id is not
+            // read as 20 bits.
+            let ng_enb_id = decode_ng_enb_id_into(decoder)?;
             Ok(GlobalRanNodeId::GlobalNgEnbId {
                 plmn_identity,
                 ng_enb_id,
@@ -3075,7 +3069,7 @@ mod global_ran_node_id_tests {
     fn test_global_ng_enb_id_choice_index_no_extension_bit() {
         let id = GlobalRanNodeId::GlobalNgEnbId {
             plmn_identity: [0x00, 0xf1, 0x10],
-            ng_enb_id: 0x0ABCD, // 20-bit macroNgENB-ID
+            ng_enb_id: crate::types::NgEnbId::Macro(0x0ABCD), // 20-bit macroNgENB-ID
         };
         let mut container = ProtocolIeContainer::new();
         encode_global_ran_node_id(&mut container, &id, Criticality::Reject).unwrap();
@@ -3089,10 +3083,93 @@ mod global_ran_node_id_tests {
                 ng_enb_id,
             } => {
                 assert_eq!(plmn_identity, [0x00, 0xf1, 0x10]);
-                assert_eq!(ng_enb_id, 0x0ABCD);
+                assert_eq!(ng_enb_id, crate::types::NgEnbId::Macro(0x0ABCD));
             }
             other => panic!("expected GlobalNgEnbId, got {other:?}"),
         }
+    }
+
+    /// #876, TS 38.413 §9.3.1.8: every ngENB-ID alternative of a GlobalRANNodeID
+    /// keeps its length through the hand-written encoder and decoder, and the bytes
+    /// are the generated codec's, both ways. Before #876 a short or long macro id was
+    /// encoded as a macro one and decoded as 20 bits.
+    #[test]
+    fn a_global_ng_enb_id_keeps_its_ng_enb_id_length_against_the_generated_codec() {
+        use crate::types::NgEnbId;
+        use bitvec::prelude::*;
+        use nextgcore_ngap_gen::generated as gen;
+        let plmn = [0x00, 0xf1, 0x10];
+        let bits = |v: u32, len: usize| {
+            let mut b: BitVec<u8, Msb0> = BitVec::with_capacity(len);
+            for i in (0..len).rev() {
+                b.push((v >> i) & 1 == 1);
+            }
+            b
+        };
+        for id in [
+            NgEnbId::Macro(0xABCDE),
+            NgEnbId::ShortMacro(0x34B89),
+            NgEnbId::LongMacro(0x1ABCDE),
+        ] {
+            let ours = GlobalRanNodeId::GlobalNgEnbId {
+                plmn_identity: plmn,
+                ng_enb_id: id,
+            };
+            let mut container = ProtocolIeContainer::new();
+            encode_global_ran_node_id(&mut container, &ours, Criticality::Reject).unwrap();
+            let bytes = container.ies[0].value.clone();
+
+            let generated_id = match id {
+                NgEnbId::Macro(v) => {
+                    gen::NgENB_ID::MacroNgENB_ID(gen::NgENB_ID_macroNgENB_ID(bits(v, 20)))
+                }
+                NgEnbId::ShortMacro(v) => {
+                    gen::NgENB_ID::ShortMacroNgENB_ID(gen::NgENB_ID_shortMacroNgENB_ID(bits(v, 18)))
+                }
+                NgEnbId::LongMacro(v) => {
+                    gen::NgENB_ID::LongMacroNgENB_ID(gen::NgENB_ID_longMacroNgENB_ID(bits(v, 21)))
+                }
+            };
+            let theirs = gen::GlobalRANNodeID::GlobalNgENB_ID(gen::GlobalNgENB_ID {
+                plmn_identity: gen::PLMNIdentity(plmn.to_vec()),
+                ng_enb_id: generated_id,
+                ie_extensions: None,
+            });
+            assert_eq!(
+                nextgcore_ngap_gen::encode_contained(&theirs).unwrap(),
+                bytes,
+                "{id:?}: the generated codec's bytes"
+            );
+            match nextgcore_ngap_gen::decode_contained::<gen::GlobalRANNodeID>(&bytes).unwrap() {
+                gen::GlobalRANNodeID::GlobalNgENB_ID(enb) => {
+                    let (alt, len) = match &enb.ng_enb_id {
+                        gen::NgENB_ID::MacroNgENB_ID(b) => (0, b.0.len()),
+                        gen::NgENB_ID::ShortMacroNgENB_ID(b) => (1, b.0.len()),
+                        gen::NgENB_ID::LongMacroNgENB_ID(b) => (2, b.0.len()),
+                        #[allow(unreachable_patterns)]
+                        _ => panic!("choice-Extensions"),
+                    };
+                    assert_eq!((alt, len), (id.choice_index(), id.bit_len()), "{id:?}");
+                }
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(
+                decode_global_ran_node_id(&container.ies[0]).unwrap(),
+                ours,
+                "{id:?}: decoded with its length"
+            );
+        }
+        // A value that does not fit its alternative is refused, not truncated.
+        let mut container = ProtocolIeContainer::new();
+        assert!(encode_global_ran_node_id(
+            &mut container,
+            &GlobalRanNodeId::GlobalNgEnbId {
+                plmn_identity: plmn,
+                ng_enb_id: NgEnbId::ShortMacro(1 << 18),
+            },
+            Criticality::Reject,
+        )
+        .is_err());
     }
 
     /// NGAP-02b: the handover TargetID path must encode its inner

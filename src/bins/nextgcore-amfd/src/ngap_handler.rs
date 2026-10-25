@@ -119,6 +119,9 @@ pub struct NgSetupRequest {
     pub gnb_id_len: u8,
     /// PLMN ID
     pub plmn_id: PlmnId,
+    /// The ngENB-ID, with its length, when the node is an ng-eNB (#876); `None` for
+    /// a gNB.
+    pub ng_enb_id: Option<nextgcore_ngap::types::NgEnbId>,
     /// RAN Node Name
     pub ran_node_name: Option<String>,
     /// Supported TA List
@@ -354,6 +357,8 @@ pub fn handle_ng_setup_request(
     // `NgSetupRequest.gnb_id_len`; this handler used to discard it.
     gnb.gnb_id_len = request.gnb_id_len;
     gnb.plmn_id = request.plmn_id.clone();
+    // #876: an ng-eNB is identified by its ngENB-ID CHOICE, not by `gnb_id`.
+    gnb.ng_enb_id = request.ng_enb_id;
 
     // Validate Supported TA List
     if request.supported_ta_list.is_empty() {
@@ -630,6 +635,7 @@ mod tests {
             gnb_id: 12345,
             gnb_id_len: 22,
             plmn_id: PlmnId::new("001", "01"),
+            ng_enb_id: None,
             ran_node_name: Some("gNB-Test".to_string()),
             supported_ta_list: vec![SupportedTa {
                 tac: 1,
