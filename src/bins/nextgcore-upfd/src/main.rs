@@ -1002,6 +1002,15 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                         *session.pdrs.write().unwrap() = dp_pdrs;
                     }
 
+                    // #619 review: the FARs with a tunnel of their own, by the PFCP
+                    // layer's rule for an establishment.
+                    *session.own_tunnel_fars.write().unwrap() =
+                        crate::pfcp_path::own_tunnel_fars_established(
+                            &pdrs,
+                            &fars,
+                            (dl_teid, gnb_addr),
+                        );
+
                     // Install FARs from PFCP (replace defaults if provided)
                     if !fars.is_empty() {
                         let mut dp_fars = std::collections::HashMap::new();
@@ -1333,6 +1342,20 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                         dp_fars.insert(f.far_id, data_plane_far_from_parsed(f));
                     }
                     log::info!("Installed {} FARs for SEID={upf_seid:#x}", far_writes.len());
+                }
+                // #619: which FARs have a tunnel of their own, by the PFCP layer's rule,
+                // so a later move of the session's tunnel leaves them where they point.
+                if !removed_far_ids.is_empty() || !created_fars.is_empty() {
+                    let own =
+                        crate::pfcp_path::own_tunnel_fars_created(&created_pdrs, &created_fars);
+                    let mut set = session.own_tunnel_fars.write().unwrap();
+                    for id in removed_far_ids
+                        .iter()
+                        .chain(created_fars.iter().map(|f| &f.far_id))
+                    {
+                        set.remove(id);
+                    }
+                    set.extend(own);
                 }
 
                 let qer_writes: Vec<&crate::n4_build::ParsedCreateQer> =
