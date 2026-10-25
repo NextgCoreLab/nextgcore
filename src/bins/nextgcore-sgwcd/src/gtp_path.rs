@@ -5071,7 +5071,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_refusal_does_not_undo_a_later_write_of_the_same_endpoint() {
         let ambient = crate::pfcp_path::process_state_test_guard().await;
-        let _sgwu = stand_in_sgwu_scripted(
+        let sgwu = stand_in_sgwu_scripted(
             &ambient,
             crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
             Duration::ZERO,
@@ -5111,8 +5111,26 @@ mod tests {
             m.add_bearer_context(0, &bc);
             m.encode()
         };
+        // #1111: MBR2 goes out only once MBR1's Session Modification has reached
+        // the SGW-U, so MBR1 is the one the script refuses whatever the load.
+        let modifications = || {
+            sgwu.seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|(t, _, _)| *t == 52)
+                .count()
+        };
+        let before = modifications();
         mme.send_to(&mbr(0x0991), server.local_addr()).unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while modifications() == before {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "MBR1's modification reached the SGW-U"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         mme.send_to(&mbr(0x0992), server.local_addr()).unwrap();
 
         let cause_of = |rsp: &Gtp2Message| {
@@ -5120,14 +5138,20 @@ mod tests {
                 .unwrap()
                 .cause
         };
-        let first = recv_s11(&mme).await.expect("MBR1's response");
-        assert_eq!(first.header.sequence_number, 0x0991);
-        assert_eq!(cause_of(&first), gtp_cause::SYSTEM_FAILURE, "MBR1 refused");
-        let second = recv_s11(&mme).await.expect("MBR2's response");
-        assert_eq!(second.header.sequence_number, 0x0992);
+        // Matched by sequence number, not by arrival order (#1111).
+        let mut answers = std::collections::HashMap::new();
+        for _ in 0..2 {
+            let rsp = recv_s11(&mme).await.expect("a Modify Bearer Response");
+            answers.insert(rsp.header.sequence_number, cause_of(&rsp));
+        }
         assert_eq!(
-            cause_of(&second),
-            gtp_cause::REQUEST_ACCEPTED,
+            answers.get(&0x0991),
+            Some(&gtp_cause::SYSTEM_FAILURE),
+            "MBR1 refused"
+        );
+        assert_eq!(
+            answers.get(&0x0992),
+            Some(&gtp_cause::REQUEST_ACCEPTED),
             "MBR2 accepted"
         );
         let dl = ctx.dl_tunnel_in_bearer(bearer.id).unwrap();
