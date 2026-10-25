@@ -123,6 +123,7 @@ pub mod pfcp_ie {
     pub const REPORTING_TRIGGERS: u16 = 37;
     pub const REPORT_TYPE: u16 = 39;
     pub const OFFENDING_IE: u16 = 40;
+    pub const FAILED_RULE_ID: u16 = 114;
     pub const DESTINATION_INTERFACE: u16 = 42;
     pub const UP_FUNCTION_FEATURES: u16 = 43;
     pub const APPLY_ACTION: u16 = 44;
@@ -2070,6 +2071,59 @@ pub fn build_association_release_response(node_id: &NodeId, cause: PfcpCause) ->
     let mut builder = PfcpMessageBuilder::new();
     builder.add_node_id(node_id);
     builder.add_cause(cause);
+    builder.build()
+}
+
+/// The rule a Session Establishment or Modification could not create or modify: the
+/// Failed Rule ID IE (TS 29.244 §8.2.80, Table 8.2.80-1), #1154.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailedRule {
+    Pdr(u16),
+    Far(u32),
+    Qer(u32),
+    Urr(u32),
+    Bar(u8),
+}
+
+impl FailedRule {
+    /// The IE value: the Rule ID Type in the low 5 bits of octet 5, then the Rule ID
+    /// value coded as the PDR ID (2 octets), FAR/QER/URR ID (4) or BAR ID (1) is.
+    pub fn encode_value(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(5);
+        match *self {
+            Self::Pdr(id) => {
+                v.push(0);
+                v.extend_from_slice(&id.to_be_bytes());
+            }
+            Self::Far(id) => {
+                v.push(1);
+                v.extend_from_slice(&id.to_be_bytes());
+            }
+            Self::Qer(id) => {
+                v.push(2);
+                v.extend_from_slice(&id.to_be_bytes());
+            }
+            Self::Urr(id) => {
+                v.push(3);
+                v.extend_from_slice(&id.to_be_bytes());
+            }
+            Self::Bar(id) => {
+                v.push(4);
+                v.push(id);
+            }
+        }
+        v
+    }
+}
+
+/// Build the body of a Session Establishment or Modification Response refusing with
+/// "Rule creation/modification Failure" (#1154): Cause 73 and the Failed Rule ID, which
+/// TS 29.244 Tables 7.5.3.1-1 and 7.5.5.1-1 make conditional on that cause. No Offending
+/// IE: those tables include it only when an IE is missing or faulty.
+pub fn build_rule_failure_response(rule: FailedRule) -> Vec<u8> {
+    let mut builder = PfcpMessageBuilder::new();
+    builder.add_cause(PfcpCause::RuleCreationModificationFailure);
+    builder.add_tlv(pfcp_ie::FAILED_RULE_ID, &rule.encode_value());
     builder.build()
 }
 
