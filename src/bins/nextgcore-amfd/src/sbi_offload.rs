@@ -80,6 +80,12 @@ pub(crate) enum SbiOutcome {
     /// #922 part 2: an SMF answer an NGAP step waits for (a modification, a
     /// re-activation, an EPS→5GS PREPARED).
     Smf(crate::ngap_path::SmfAnswer),
+    /// #686 PR 2: an AMF Set takeover's store lookup, and the Initial UE Message it held.
+    Takeover(crate::ngap_path::ue_context_takeover::TakeoverAnswer),
+    /// #686 PR 2: the UDM's answer to a takeover's UECM registration.
+    TakeoverUecm(crate::ngap_path::ue_context_takeover::TakeoverUecmAnswer),
+    /// #1185 review M1: whose a UE's stored record is, before a local deregistration.
+    DeregOwner(crate::ngap_path::ue_context_takeover::DeregOwnerAnswer),
 }
 
 /// What keyed work is serialised on: (AMF UE NGAP ID, PDU session ID).

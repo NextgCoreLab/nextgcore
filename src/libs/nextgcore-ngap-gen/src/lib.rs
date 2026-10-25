@@ -53,6 +53,33 @@ pub mod generated {
 
 pub use generated::NGAP_PDU;
 
+/// The largest Bit Rate (bit/s) TS 38.413 §9.3.1.4 defines:
+/// `BitRate ::= INTEGER (0..4000000000000, ...)`, and no release defines a
+/// value past the root.
+pub const BIT_RATE_MAX: u64 = 4_000_000_000_000;
+
+/// The [`generated::BitRate`] a sender puts on the wire for `value` bit/s
+/// (#1163): `value`, or [`BIT_RATE_MAX`] for anything past it.
+///
+/// The codec would encode a value past the root as an extension value (X.691
+/// §12.1), which no release of TS 38.413 defines: a receiver treats it as an
+/// Abstract Syntax Error and acts on the IE's criticality (§10.3.1 case 2),
+/// `reject` for the PDU Session AMBR and the QoS flow lists, so the session fails.
+/// Past `i64::MAX` it does not even decode, here or in `nextgcore-ngap`. 4
+/// Tbit/s is the largest rate NGAP expresses and nothing reaches it, so the
+/// clamped rate limits nothing the requested one would not. `nextgcore-ngap`'s
+/// hand-written encoder applies the same rule (`transfer::clamp_bit_rate`).
+pub fn bit_rate(value: u64) -> generated::BitRate {
+    if value > BIT_RATE_MAX {
+        log::warn!(
+            "Bit Rate {value} bit/s is past TS 38.413 §9.3.1.4's {BIT_RATE_MAX}; sent as {BIT_RATE_MAX}"
+        );
+        generated::BitRate(BIT_RATE_MAX)
+    } else {
+        generated::BitRate(value)
+    }
+}
+
 /// Decode one APER-encoded NGAP PDU.
 pub fn decode(bytes: &[u8]) -> Result<NGAP_PDU, asn1_codecs::PerCodecError> {
     use asn1_codecs::aper::AperCodec;

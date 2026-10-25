@@ -67,6 +67,7 @@ done
 | `mongodb.enabled` / `mongodb.externalUri` | `true` / `""` | Point at an existing MongoDB. The seed Job still runs against it. |
 | `global.siteId` | `""` | Set it, always (see Install). Salts derived NF instance ids. The empty fallback (`lookup` of the kube-system UID) needs cluster-wide RBAC and is empty under `helm template` / ArgoCD. |
 | `amf.nfInstanceId` | `""` | Pin the AMF's id outright, e.g. when an NRF trust store keys on it. `amf.replicas` must stay 1: every pod would share the id, and the render fails on purpose. |
+| `amf.ueContextStore.enabled`, `amf.ueContextStore.dbUri` | `false`, `""` | #686: the AMF stores every registered UE's context in MongoDB and restores it after a restart, so a returning UE keeps its 5G-GUTI, security context and PDU sessions. `dbUri` empty means the chart's MongoDB. The records hold NAS keys in clear, so MongoDB needs the same access control as the UDR's subscriber keys. |
 | `global.plmn` | 999-70 | Must match the simulator's PLMN. |
 | `subscriber.*` | test IMSI | Must match the UE's USIM config. |
 | `amf.service.headless`, `upf.service.headless` | `true` | Leave alone. NGAP and GTP-U are UDP; kube-proxy's per-flow balancing plus a conntrack timeout breaks both. |
