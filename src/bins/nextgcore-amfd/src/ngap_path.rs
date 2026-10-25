@@ -35200,8 +35200,9 @@ mod tests {
     /// [`RELEASE_COMPLETE_GUARD`] each release is completed locally (CM-IDLE, mobile
     /// reachable timer). A UE whose matching Complete came is not touched again.
     ///
-    /// REVERT-VERIFIED: without `process_release_guards` both UEs stay
-    /// CM-CONNECTED.
+    /// REVERT-VERIFIED: without `process_release_guards` in `poll` both UEs stay
+    /// CM-CONNECTED; without the cleanup in `forget_ue` the forgotten UE keeps its
+    /// entry.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_release_command_with_no_usable_complete_is_completed_at_the_guard() {
         crate::context::amf_context_init(64, 1024, 4096);
@@ -35237,13 +35238,26 @@ mod tests {
             );
         }
         // Before the guard, nothing either.
-        ngap.process_release_guards().await;
+        let _ = ngap.poll().await;
         assert_eq!(ngap.outstanding_releases.len(), 2);
 
+        // A UE forgotten meanwhile (e.g. de-registered) takes its entry with it.
+        let gone = 7_923_104u64;
+        let mut state = UeNasContext::new(gone, 44, assoc, false);
+        state.registered = true;
+        ngap.ue_auth_state.insert(gone, state);
+        ngap.handle_ue_context_release(assoc, &release_request_pdu(gone, 44))
+            .await
+            .expect("handled");
+        assert!(ngap.outstanding_releases.contains_key(&(assoc, gone)));
+        ngap.forget_ue(gone);
+        assert!(!ngap.outstanding_releases.contains_key(&(assoc, gone)));
+
+        // The NGAP task's poll runs the guard.
         for r in ngap.outstanding_releases.values_mut() {
             r.deadline = Instant::now();
         }
-        ngap.process_release_guards().await;
+        let _ = ngap.poll().await;
         for (ue, _) in &ues[..2] {
             let s = ngap.ue_auth_state.get(*ue).expect("UE kept");
             assert!(s.is_cm_idle(), "UE {ue}: completed locally");
