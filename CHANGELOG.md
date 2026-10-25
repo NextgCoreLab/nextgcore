@@ -18,6 +18,11 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   INITIAL_EMERGENCY_REQUEST or EXISTING_EMERGENCY_PDU_SESSION). It also leaves it out for #26,
   #27 and #69 when the AMF reports the UE as a priority user (`priorityUserInd`), so the UE can
   retry at once (TS 24.501 §6.4.1.4.1). amfd does not send either attribute yet (#1188).
+- smfd discovers the NSACF per S-NSSAI. NRF discovery carries the session's `snssais` (TS 29.510
+  §6.2.3.2.3.1), and the instance taken is one whose `sNssais` or `perPlmnSnssaiList` serves it.
+  A profile with neither serves any slice (§6.1.6.2.2). The discovery cache is keyed by the
+  S-NSSAI too. Before, the first NSACF was used for every slice (TS 23.501 §5.15.11). `NSACF_URI`
+  still names one NSACF for all slices (#1164).
 - smfd ignores the Recovery Time Stamp in a PFCP Association Setup Response, and keeps a UPF's
   Recovery Time Stamp in memory only (TS 23.007 §19A; TS 29.244 Table 7.4.4.2-1 NOTE). A new
   association starts with no stored stamp, and its first Heartbeat stamp is the baseline. Whether
