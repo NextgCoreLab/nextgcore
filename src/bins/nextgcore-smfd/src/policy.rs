@@ -43,10 +43,13 @@ pub mod gsm_cause {
     /// anchored it restarted and holds none of its state (#667, TS 23.527 §4.2).
     pub const REACTIVATION_REQUESTED: u8 = 39;
     pub const PDU_SESSION_TYPE_IPV4_ONLY_ALLOWED: u8 = 50;
-    /// #67 Insufficient resources for specific slice (TS 24.501 §9.11.4.2).
+    /// #69 Insufficient resources for specific slice (TS 24.501 §9.11.4.2).
     /// Used when the NSACF declines a PDU-session admission for the S-NSSAI
-    /// (slice PDU-session quota exhausted: NSACF 403, or 200 acuFailureList).
-    pub const INSUFFICIENT_RESOURCES_FOR_SPECIFIC_SLICE: u8 = 67;
+    /// (slice PDU-session quota exhausted: NSACF 403, or 200 acuFailureList):
+    /// TS 24.501 §4.6.3.1 rejects it with S-NSSAI based congestion control
+    /// (§6.2.8, §6.4.1.4.2), which is #69. It was 67, "insufficient resources for
+    /// specific slice and DNN", the S-NSSAI+DNN cause (#1144 review round 4).
+    pub const INSUFFICIENT_RESOURCES_FOR_SPECIFIC_SLICE: u8 = 69;
     /// #68 Not supported SSC mode (TS 24.501 §9.11.4.2). Paired with the Allowed
     /// SSC mode IE so the UE knows what to request instead.
     pub const NOT_SUPPORTED_SSC_MODE: u8 = 68;
@@ -607,7 +610,7 @@ pub enum NsacAdmission {
     /// PDU session admitted (HTTP 204) — proceed with establishment.
     Admitted,
     /// PDU session rejected (HTTP 403, or 200 with this SUPI in acuFailureList)
-    /// — reject with 5GSM cause #67.
+    /// — reject with 5GSM cause #69.
     Rejected,
     /// NSACF returned an unexpected status, or the request provably never left
     /// (no connection). The caller decides the fail-open vs fail-closed policy.
@@ -681,7 +684,7 @@ pub async fn nsac_pdu_session_admit(
     match resp.status {
         // All requested S-NSSAIs for this PDU session admitted.
         204 => NsacAdmission::Admitted,
-        // Total failure (ProblemDetails) -> reject with 5GSM cause #67.
+        // Total failure (ProblemDetails) -> reject with 5GSM cause #69.
         403 => {
             log::info!(
                 "NSACF rejected PDU session for S-NSSAI[SST:{sst} SD:{sd:?}] (403 total failure)"
@@ -1604,7 +1607,7 @@ const DEFAULT_BACK_OFF_MINUTES: u8 = 10;
 /// (TS 24.501 §8.3.3 Table 8.3.3.1.1).
 ///
 /// For congestion-related causes (#26 insufficient resources, #27 missing/
-/// unknown DNN, #67 insufficient resources for the slice) a Back-off timer
+/// unknown DNN, #69 insufficient resources for specific slice) a Back-off timer
 /// value (T3396, GPRS timer 3, IEI 0x37) is appended so the UE applies the
 /// mandated back-off (TS 24.501 §6.2.8). smfd-08.
 pub fn build_establishment_reject(psi: u8, pti: u8, cause_5gsm: u8) -> Vec<u8> {
@@ -2683,8 +2686,8 @@ mod tests {
 
     #[test]
     fn nsac_reject_uses_slice_specific_5gsm_cause() {
-        // TS 24.501 §9.11.4.2 cause #67 (insufficient resources for slice).
-        assert_eq!(gsm_cause::INSUFFICIENT_RESOURCES_FOR_SPECIFIC_SLICE, 67);
+        // TS 24.501 §9.11.4.2 cause #69 (insufficient resources for specific slice).
+        assert_eq!(gsm_cause::INSUFFICIENT_RESOURCES_FOR_SPECIFIC_SLICE, 69);
     }
 
     /// Wave-6 H8 Phase A: OAuth2 consumer enforcement is OFF by default, so the

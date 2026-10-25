@@ -1857,8 +1857,10 @@ async fn smf_nrf_register(sbi_addr: &str, sbi_port: u16) -> std::result::Result<
 enum DefaultDnnError {
     /// No UDM address could be determined (no NRF, no discovery hit, no env).
     NoUdmEndpoint,
-    /// The Nudm_SDM_Get failed at the transport or returned a non-2xx.
+    /// The Nudm_SDM_Get got no answer: the UDM did not respond.
     SdmRequestFailed(String),
+    /// The UDM answered, but with an error or a body that is not smf-select-data.
+    SdmAnswerUnusable(String),
     /// The subscription carries no DNN at all for this S-NSSAI.
     NoSubscribedDnn,
     /// Several DNNs are subscribed for this S-NSSAI and none carries
@@ -1874,8 +1876,23 @@ impl DefaultDnnError {
             // The consumer's request is incomplete for THIS network: it named no
             // DNN and the subscription does not supply one either.
             Self::NoSubscribedDnn | Self::AmbiguousDefault(_) => "MANDATORY_IE_MISSING",
-            // Not the consumer's fault — the SMF could not reach the data it needs.
-            Self::NoUdmEndpoint | Self::SdmRequestFailed(_) => "SUBSCRIPTION_DATA_NOT_AVAILABLE",
+            // Not the consumer's fault -- the SMF could not reach the data it needs
+            // (#1097 review m2: TS 29.500 Table 5.2.7.2-1 causes, at 500 / 504).
+            // #1144 round 2 A: NETWORK_FAILURE is a 504 cause (TS 29.502 Table
+            // 6.1.7.3-1) and PEER_NOT_RESPONDING means no answer at all.
+            Self::NoUdmEndpoint | Self::SdmAnswerUnusable(_) => "SYSTEM_FAILURE",
+            Self::SdmRequestFailed(_) => "PEER_NOT_RESPONDING",
+        }
+    }
+
+    /// The HTTP status that goes with [`Self::cause`]: 400 for the consumer's
+    /// incomplete request; 500 with no UDM to ask; 504 when the UDM did not answer
+    /// (#1097 review m2).
+    fn status(&self) -> u16 {
+        match self {
+            Self::NoSubscribedDnn | Self::AmbiguousDefault(_) => 400,
+            Self::NoUdmEndpoint | Self::SdmAnswerUnusable(_) => 500,
+            Self::SdmRequestFailed(_) => 504,
         }
     }
 
@@ -1884,7 +1901,7 @@ impl DefaultDnnError {
             Self::NoUdmEndpoint => "no dnn in SmContextCreateData and no UDM endpoint is known \
                  (set UDM_SBI_ADDR or register a UDM with the NRF)"
                 .to_string(),
-            Self::SdmRequestFailed(e) => format!(
+            Self::SdmRequestFailed(e) | Self::SdmAnswerUnusable(e) => format!(
                 "no dnn in SmContextCreateData and the subscribed default could not be \
                  retrieved: {e}"
             ),
@@ -2141,16 +2158,16 @@ async fn fetch_subscribed_default_dnn(
         DefaultDnnError::SdmRequestFailed(format!("Nudm_SDM_Get smf-select-data failed: {e}"))
     })?;
     if !response.is_success() {
-        return Err(DefaultDnnError::SdmRequestFailed(format!(
+        return Err(DefaultDnnError::SdmAnswerUnusable(format!(
             "Nudm_SDM_Get smf-select-data returned status {}",
             response.status
         )));
     }
     let body = response.http.content.as_deref().ok_or_else(|| {
-        DefaultDnnError::SdmRequestFailed("empty smf-select-data body".to_string())
+        DefaultDnnError::SdmAnswerUnusable("empty smf-select-data body".to_string())
     })?;
     let json: serde_json::Value = serde_json::from_str(body).map_err(|e| {
-        DefaultDnnError::SdmRequestFailed(format!("smf-select-data is not valid JSON: {e}"))
+        DefaultDnnError::SdmAnswerUnusable(format!("smf-select-data is not valid JSON: {e}"))
     })?;
     select_default_dnn(&json, sst, sd)
 }
@@ -3798,7 +3815,7 @@ fn sm_context_create_ssc_error(psi: u8, pti: u8, allowed_ssc_bitmap: u8) -> SbiR
         Some(allowed_ssc_bitmap),
     );
     let body = serde_json::json!({
-        "error": { "status": 403, "cause": "SSC_MODE_NOT_SUPPORTED" },
+        "error": { "status": 403, "cause": "SSC_NOT_SUPPORTED" },
         "n1SmMsg": { "contentId": "n1SmMsg" },
     });
     SbiResponse::with_status(403)
@@ -3858,8 +3875,10 @@ fn validate_sm_context_create_data(body: &serde_json::Value) -> Option<&'static 
     // n1SmMsg (C — required at establishment): present either as a
     // RefToBinaryData pointer ({contentId}) or as a legacy base64 string.
     let n1 = &body["n1SmMsg"];
+    // #1097 review m1: a missing mandatory IE is a 400 MANDATORY_IE_MISSING
+    // (TS 29.500 Table 5.2.7.2-1); N1_SM_ERROR is a 403 cause, for an erroneous one.
     if n1["contentId"].as_str().is_none() && n1.as_str().is_none() {
-        return Some("N1_SM_ERROR");
+        return Some("MANDATORY_IE_MISSING");
     }
     None
 }
@@ -3883,10 +3902,20 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
             Ok(v) => v,
             Err(e) => {
                 log::error!("Failed to parse SM Context Create request: {e}");
-                return problem_400("INVALID_MSG_FORMAT", "request body is not valid JSON");
+                return eps_to_5gs::sm_context_error(
+                    400,
+                    "INVALID_MSG_FORMAT",
+                    "request body is not valid JSON",
+                );
             }
         },
-        None => return problem_400("MANDATORY_IE_MISSING", "SmContextCreateData body required"),
+        None => {
+            return eps_to_5gs::sm_context_error(
+                400,
+                "MANDATORY_IE_MISSING",
+                "SmContextCreateData body required",
+            )
+        }
     };
 
     // ---- #475: EPS→5GS handover preparation using N26 (TS 29.502 §5.2.2.2.3) ----
@@ -3905,7 +3934,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     // matched-sim AMF omits).
     if let Some(cause) = validate_sm_context_create_data(&req_body) {
         log::warn!("SmContextCreateData rejected: {cause}");
-        return problem_400(cause, "mandatory IE missing or incorrect");
+        return eps_to_5gs::sm_context_error(400, cause, "mandatory IE missing or incorrect");
     }
 
     // ---- SmContextCreateData attributes (TS 29.502 Table 6.1.6.2.2-1) ----
@@ -3914,10 +3943,14 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
         .filter(|p| (1..=15).contains(p))
         .map(|p| p as u8)
     else {
-        return problem_400("MANDATORY_IE_INCORRECT", "pduSessionId (1..15) is required");
+        return eps_to_5gs::sm_context_error(
+            400,
+            "MANDATORY_IE_INCORRECT",
+            "pduSessionId (1..15) is required",
+        );
     };
     let Some(sst) = req_body["sNssai"]["sst"].as_u64().map(|v| v as u8) else {
-        return problem_400("MANDATORY_IE_MISSING", "sNssai.sst is required");
+        return eps_to_5gs::sm_context_error(400, "MANDATORY_IE_MISSING", "sNssai.sst is required");
     };
     let snssai_sd = req_body["sNssai"]["sd"].as_str().map(str::to_string);
     // Issue #73: `supi` is conditional-mandatory for a non-emergency session
@@ -3934,7 +3967,8 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     // Rejecting is the honest failure: a session the SMF cannot attribute is a
     // session it cannot charge, police or admit.
     let Some(supi) = req_body["supi"].as_str().filter(|s| !s.is_empty()) else {
-        return problem_400(
+        return eps_to_5gs::sm_context_error(
+            400,
             "MANDATORY_IE_MISSING",
             "supi is required for a non-emergency SmContextCreateData (TS 29.502 6.1.6.2.2)",
         );
@@ -3964,7 +3998,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                 Ok(d) => d,
                 Err(e) => {
                     log::warn!("[{supi}] no DNN for this session: {}", e.detail());
-                    return problem_400(e.cause(), &e.detail());
+                    return eps_to_5gs::sm_context_error(e.status(), e.cause(), &e.detail());
                 }
             }
         }
@@ -4024,7 +4058,8 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     )
                 }
                 None => {
-                    return problem_400(
+                    return eps_to_5gs::sm_context_error(
+                        403,
                         "N1_SM_ERROR",
                         "n1SmMsg is not a PDU Session Establishment Request",
                     )
@@ -4034,7 +4069,11 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                 // The n1SmMsg attribute passed validation but its referenced
                 // binary part is absent / not decodable — reject (smfd-06).
                 log::error!("SmContextCreateData n1SmMsg present but binary part missing/invalid");
-                return problem_400("N1_SM_ERROR", "n1SmMsg binary part missing or invalid");
+                return eps_to_5gs::sm_context_error(
+                    403,
+                    "N1_SM_ERROR",
+                    "n1SmMsg binary part missing or invalid",
+                );
             }
         };
 
@@ -4048,7 +4087,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
             log::warn!("Unsupported requested PDU session type {other} — rejecting (cause 50)");
             return sm_context_create_error(
                 403,
-                "PDU_SESSION_TYPE_NOT_SUPPORTED",
+                "PDUTYPE_NOT_SUPPORTED",
                 pdu_session_id,
                 pti,
                 policy::gsm_cause::PDU_SESSION_TYPE_IPV4_ONLY_ALLOWED,
@@ -4140,7 +4179,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
             }
         }
     } else {
-        return SbiResponse::with_status(500);
+        return eps_to_5gs::sm_context_error(500, "SYSTEM_FAILURE", "SMF context unavailable");
     }
 
     log::info!(
@@ -4180,7 +4219,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     // Before committing PCF/PFCP resources, ask the NSACF (if deployed) whether
     // a new PDU session may be admitted for this S-NSSAI. A rejection
     // (admittedFlag=false) is a slice-quota exhaustion → reject the session
-    // with 5GSM cause #67 (insufficient resources for specific slice). The
+    // with 5GSM cause #69 (insufficient resources for specific slice). The
     // NSACF is optional: when none is configured/discoverable we skip the check
     // (fail-open), and a transport/HTTP failure also fails open so a missing
     // NSACF never blocks the basic data path.
@@ -4215,12 +4254,15 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                 policy::NsacAdmission::Rejected => {
                     log::warn!(
                         "NSACF rejected PDU session for S-NSSAI[SST:{sst}] — \
-                         rejecting (5GSM cause 67)"
+                         rejecting (5GSM cause 69)"
                     );
                     rollback();
+                    // #1144 round 3: TS 29.502 Table 6.1.3.2.3.1-3 answers an NSAC
+                    // rejection of a new session 500 INSUFFICIENT_RESOURCES_SLICE (5GSM
+                    // #69 in the N1); S_NSSAI_UNAVAILABLE_DUE_TO_NSAC is for a move.
                     return sm_context_create_error(
-                        403,
-                        "NSAC_PDU_SESSION_REJECTED",
+                        500,
+                        "INSUFFICIENT_RESOURCES_SLICE",
                         pdu_session_id,
                         pti,
                         policy::gsm_cause::INSUFFICIENT_RESOURCES_FOR_SPECIFIC_SLICE,
@@ -4490,7 +4532,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     .await;
                     return sm_context_create_error(
                         403,
-                        "POLICY_REJECTED",
+                        "SUBSCRIPTION_DENIED",
                         pdu_session_id,
                         pti,
                         policy::gsm_cause::USER_AUTHENTICATION_OR_AUTHORIZATION_FAILED,
@@ -4514,7 +4556,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     .await;
                     return sm_context_create_error(
                         504,
-                        "PCF_NOT_RESPONDING",
+                        "PEER_NOT_RESPONDING",
                         pdu_session_id,
                         pti,
                         policy::gsm_cause::NETWORK_FAILURE,
@@ -5041,7 +5083,13 @@ fn activation_response(sm_context_ref: &str) -> SbiResponse {
         lookup_policy_binding(sm_context_ref),
     ) else {
         log::warn!("UP activation for ref={sm_context_ref}: no recorded UPF endpoint or binding");
-        return problem_response(500, "SYSTEM_FAILURE", "No user plane recorded to activate");
+        return eps_to_5gs::sm_context_update_error_with(
+            500,
+            "SYSTEM_FAILURE",
+            "No user plane recorded to activate",
+            serde_json::json!({ "upCnxState": "DEACTIVATED" }),
+            None,
+        );
     };
     let n2 = match build_setup_request_transfer(
         upf_teid,
@@ -5053,7 +5101,13 @@ fn activation_response(sm_context_ref: &str) -> SbiResponse {
         Ok(bytes) => bytes,
         Err(e) => {
             log::error!("UP activation for ref={sm_context_ref}: transfer encode failed: {e:?}");
-            return problem_response(500, "SYSTEM_FAILURE", "N2 SM information encode failed");
+            return eps_to_5gs::sm_context_update_error_with(
+                500,
+                "SYSTEM_FAILURE",
+                "N2 SM information encode failed",
+                serde_json::json!({ "upCnxState": "DEACTIVATED" }),
+                None,
+            );
         }
     };
     log::info!(
@@ -5086,6 +5140,33 @@ fn activation_response(sm_context_ref: &str) -> SbiResponse {
 ///
 /// 500 SYSTEM_FAILURE when establishment recorded no UPF endpoint or binding: the AMF
 /// then leaves the session out of the handover.
+/// The answer to an SM Context Update whose `ie` (n1SmMsg or n2SmInfo) could not be
+/// read (#1144 review round 2 C): 400 MANDATORY_IE_MISSING when the request names
+/// none, 403 `cause` (N1_SM_ERROR / N2_SM_ERROR, TS 29.502 Table 6.1.7.3-1) when it
+/// names one that does not resolve or decode.
+fn missing_or_erroneous(value: &serde_json::Value, ie: &str, cause: &str) -> SbiResponse {
+    if value.is_null() {
+        eps_to_5gs::sm_context_error(400, "MANDATORY_IE_MISSING", &format!("{ie} is missing"))
+    } else {
+        eps_to_5gs::sm_context_error(403, cause, &format!("{ie} is not valid"))
+    }
+}
+
+/// The SmContextUpdateError of a HANDOVER_REQUIRED the SMF cannot prepare (#1097
+/// review M3, TS 29.502 §5.2.2.3.4.2 step 2b): `hoState: NONE`, and the N2 SM
+/// information a Handover Preparation Unsuccessful Transfer (TS 38.413 §9.3.4.18)
+/// for the AMF to put in the Handover Preparation Failure.
+fn handover_preparation_failed(status: u16, cause: &str, detail: &str) -> SbiResponse {
+    let n2 = n2_transfer::handover_preparation_unsuccessful_transfer(&[]).ok();
+    eps_to_5gs::sm_context_update_error_with(
+        status,
+        cause,
+        detail,
+        serde_json::json!({ "hoState": "NONE" }),
+        n2.map(|bytes| ("HANDOVER_PREP_FAIL", bytes)),
+    )
+}
+
 fn handover_preparing_response(sm_context_ref: &str, required: Option<&[u8]>) -> SbiResponse {
     use nextgcore_sbi::constants::content_type;
     use nextgcore_sbi::message::SbiPart;
@@ -5094,7 +5175,7 @@ fn handover_preparing_response(sm_context_ref: &str, required: Option<&[u8]>) ->
         .ok()
         .and_then(|ctx| ctx.sess_find_by_sm_context_ref(sm_context_ref))
     else {
-        return problem_response(
+        return eps_to_5gs::sm_context_error(
             404,
             "CONTEXT_NOT_FOUND",
             "No SM context for this smContextRef",
@@ -5108,7 +5189,11 @@ fn handover_preparing_response(sm_context_ref: &str, required: Option<&[u8]>) ->
             "SM Context Update (HANDOVER_REQUIRED) for ref={sm_context_ref}: no recorded UPF \
              endpoint or binding, so the session cannot be handed over"
         );
-        return problem_response(500, "SYSTEM_FAILURE", "No user plane recorded to hand over");
+        return handover_preparation_failed(
+            500,
+            "SYSTEM_FAILURE",
+            "No user plane recorded to hand over",
+        );
     };
     let direct = match required.map(n2_transfer::parse_handover_required_transfer) {
         Some(Ok(direct)) => direct,
@@ -5117,7 +5202,12 @@ fn handover_preparing_response(sm_context_ref: &str, required: Option<&[u8]>) ->
                 "SM Context Update (HANDOVER_REQUIRED) for ref={sm_context_ref}: undecodable \
                  HandoverRequiredTransfer: {e:?}"
             );
-            return problem_400("N2_SM_ERROR", "n2SmInfo is not a HandoverRequiredTransfer");
+            // #1097 review m1: N2_SM_ERROR is a 403 cause (TS 29.502 Table 6.1.7.3-1).
+            return handover_preparation_failed(
+                403,
+                "N2_SM_ERROR",
+                "n2SmInfo is not a HandoverRequiredTransfer",
+            );
         }
         None => false,
     };
@@ -5135,7 +5225,11 @@ fn handover_preparing_response(sm_context_ref: &str, required: Option<&[u8]>) ->
             log::error!(
                 "HANDOVER_REQUIRED for ref={sm_context_ref}: transfer encode failed: {e:?}"
             );
-            return problem_response(500, "SYSTEM_FAILURE", "N2 SM information encode failed");
+            return handover_preparation_failed(
+                500,
+                "SYSTEM_FAILURE",
+                "N2 SM information encode failed",
+            );
         }
     };
     // A new preparation starts from nothing: what an earlier, abandoned one learned
@@ -5181,7 +5275,7 @@ fn handover_allocation_failed_response(sm_context_ref: &str, alloc_fail: &[u8]) 
         .ok()
         .and_then(|ctx| ctx.sess_find_by_sm_context_ref(sm_context_ref))
     else {
-        return problem_response(
+        return eps_to_5gs::sm_context_error(
             404,
             "CONTEXT_NOT_FOUND",
             "No SM context for this smContextRef",
@@ -5193,7 +5287,11 @@ fn handover_allocation_failed_response(sm_context_ref: &str, alloc_fail: &[u8]) 
             log::error!(
                 "HANDOVER_RES_ALLOC_FAIL for ref={sm_context_ref}: transfer encode failed: {e:?}"
             );
-            return problem_response(500, "SYSTEM_FAILURE", "N2 SM information encode failed");
+            return eps_to_5gs::sm_context_error(
+                500,
+                "SYSTEM_FAILURE",
+                "N2 SM information encode failed",
+            );
         }
     };
     sess.handover = context::HandoverInfo::default();
@@ -5456,7 +5554,11 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
         Some(content) => match serde_json::from_str(content) {
             Ok(v) => v,
             Err(e) => {
-                return problem_400("INVALID_MSG_FORMAT", &format!("invalid JSON: {e}"));
+                return eps_to_5gs::sm_context_error(
+                    400,
+                    "INVALID_MSG_FORMAT",
+                    &format!("invalid JSON: {e}"),
+                );
             }
         },
         None => serde_json::json!({}),
@@ -5469,7 +5571,7 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
     // was masked. Checked HERE, before any branch, so no arm can skip it.
     if !sm_context_exists(sm_context_ref) {
         log::warn!("SM Context Update for unknown ref={sm_context_ref}: answering 404");
-        return problem_response(
+        return eps_to_5gs::sm_context_error(
             404,
             "CONTEXT_NOT_FOUND",
             "No SM context for this smContextRef",
@@ -5520,7 +5622,9 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
             // N2 SM transfer: multipart ngap part (RefToBinaryData) or legacy
             // base64 string — `resolve_binary_ref` accepts both.
             let Some(n2_bytes) = resolve_binary_ref(request, &req_body["n2SmInfo"]) else {
-                return problem_400("N2_SM_ERROR", "n2SmInfo missing or not valid base64");
+                // #1144 round 2 C: absent is a missing IE (400); present but
+                // unreadable is erroneous SM information (403).
+                return missing_or_erroneous(&req_body["n2SmInfo"], "n2SmInfo", "N2_SM_ERROR");
             };
 
             // Real-APER decode of the gNB DL N3 endpoint via the nextgcore-ngap
@@ -5531,7 +5635,8 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                 decode_setup_response_dl_endpoint(&n2_bytes)
             };
             let Some((gnb_teid, gnb_addr, qfi)) = endpoint else {
-                return problem_400(
+                return eps_to_5gs::sm_context_error(
+                    403,
                     "N2_SM_ERROR",
                     "could not decode gNB DL F-TEID from N2 SM transfer",
                 );
@@ -5552,7 +5657,15 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                 // No N4 session exists for this context — fabricating a SEID
                 // would target an unrelated session
                 log::error!("No stored UPF SEID for ref={sm_context_ref}");
-                return SbiResponse::with_status(404);
+                // #1144 round 2 B: the context exists, its N4 session is what is
+                // missing -- not a 404, which would tell the AMF the session is gone.
+                return eps_to_5gs::sm_context_update_error_with(
+                    500,
+                    "SYSTEM_FAILURE",
+                    "no N4 session for this SM context",
+                    serde_json::json!({ "upCnxState": "DEACTIVATED" }),
+                    None,
+                );
             };
             match pfcp_session_modify(
                 smf_n4_seid_for(sm_context_ref),
@@ -5569,7 +5682,14 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                 }
                 Err(e) => {
                     log::error!("PFCP Session Modification failed: {e}");
-                    return SbiResponse::with_status(504);
+                    // #1097 review M2: the activation failed (TS 29.502 §5.2.2.3.2.2).
+                    return eps_to_5gs::sm_context_update_error_with(
+                        504,
+                        "UPF_NOT_RESPONDING",
+                        "the UPF did not activate the downlink",
+                        serde_json::json!({ "upCnxState": "DEACTIVATED" }),
+                        None,
+                    );
                 }
             }
 
@@ -5661,10 +5781,16 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
             // N1 SM container: multipart 5gnas part (RefToBinaryData) or legacy
             // base64 string — `resolve_binary_ref` accepts both.
             let Some(n1_sm_msg) = resolve_binary_ref(request, &req_body["n1SmMsg"]) else {
-                return problem_400("N1_SM_ERROR", "n1SmMsg missing or not valid base64");
+                // #1144 round 2 C: absent is a missing IE (400); present but
+                // unreadable is erroneous SM information (403).
+                return missing_or_erroneous(&req_body["n1SmMsg"], "n1SmMsg", "N1_SM_ERROR");
             };
             let Some(hdr) = policy::parse_n1_sm_header(&n1_sm_msg) else {
-                return problem_400("N1_SM_ERROR", "n1SmMsg is not a 5GSM message");
+                return eps_to_5gs::sm_context_error(
+                    403,
+                    "N1_SM_ERROR",
+                    "n1SmMsg is not a 5GSM message",
+                );
             };
             let binding = lookup_policy_binding(sm_context_ref);
             let psi = binding
@@ -5709,7 +5835,7 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                                         );
                                         return sm_context_create_error(
                                             403,
-                                            "POLICY_REJECTED",
+                                            "SUBSCRIPTION_DENIED",
                                             psi,
                                             pti,
                                             policy::gsm_cause::USER_AUTHENTICATION_OR_AUTHORIZATION_FAILED,
@@ -5748,7 +5874,11 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                 .await
                 {
                     log::error!("{e}");
-                    return SbiResponse::with_status(504);
+                    return eps_to_5gs::sm_context_error(
+                        504,
+                        "UPF_NOT_RESPONDING",
+                        "the UPF did not apply the modification",
+                    );
                 }
                 // Persist the new authorized AMBR in the binding
                 if let Ok(ctx) = smf_self().read() {
@@ -5776,7 +5906,11 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                 Ok(bytes) => bytes,
                 Err(e) => {
                     log::error!("Failed to encode PDUSessionResourceModifyRequestTransfer: {e:?}");
-                    return SbiResponse::with_status(500);
+                    return eps_to_5gs::sm_context_error(
+                        500,
+                        "SYSTEM_FAILURE",
+                        "N2 SM information encode failed",
+                    );
                 }
             };
 
@@ -5808,7 +5942,15 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                         pfcp_deactivate_dl_far(smf_n4_seid_for(sm_context_ref), upf_seid).await
                     {
                         log::warn!("DL FAR deactivation failed: {e}");
-                        return SbiResponse::with_status(504);
+                        // #1144 round 2: upCnxState is required whenever the user plane
+                        // was to be activated or deactivated (Table 6.1.6.2.36-1).
+                        return eps_to_5gs::sm_context_update_error_with(
+                            504,
+                            "UPF_NOT_RESPONDING",
+                            "the UPF did not deactivate the downlink",
+                            serde_json::json!({ "upCnxState": "DEACTIVATED" }),
+                            None,
+                        );
                     }
                 }
                 // #540: record it. The Downlink Data Report handler pages only for a
@@ -5900,7 +6042,9 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
         // indication labelled PDU_RES_SETUP_RSP.
         "PDU_RES_MOD_IND" => {
             let Some(n2_bytes) = resolve_binary_ref(request, &req_body["n2SmInfo"]) else {
-                return problem_400("N2_SM_ERROR", "n2SmInfo missing or not valid base64");
+                // #1144 round 2 C: absent is a missing IE (400); present but
+                // unreadable is erroneous SM information (403).
+                return missing_or_erroneous(&req_body["n2SmInfo"], "n2SmInfo", "N2_SM_ERROR");
             };
             an_initiated_modification(sm_context_ref, &n2_bytes).await
         }
@@ -5936,7 +6080,11 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
 
         other => {
             log::warn!("SM Context Update: unsupported n2SmInfoType '{other}'");
-            problem_400("N2_SM_ERROR", &format!("unsupported n2SmInfoType {other}"))
+            eps_to_5gs::sm_context_error(
+                403,
+                "N2_SM_ERROR",
+                &format!("unsupported n2SmInfoType {other}"),
+            )
         }
     }
 }
@@ -8343,7 +8491,8 @@ fn classify_n1_sm_message(n1: &[u8]) -> Option<N1SmIntent> {
 /// gNB's N2 resources stayed allocated indefinitely.
 async fn handle_n1_sm_message(sm_context_ref: &str, n1: &[u8]) -> SbiResponse {
     let Some(intent) = classify_n1_sm_message(n1) else {
-        return problem_400(
+        return eps_to_5gs::sm_context_error(
+            403,
             "N1_SM_ERROR",
             "n1SmMsg is not a 5GSM message (EPD is not 0x2E, or it is too short)",
         );
@@ -8352,7 +8501,7 @@ async fn handle_n1_sm_message(sm_context_ref: &str, n1: &[u8]) -> SbiResponse {
     let binding = lookup_policy_binding(sm_context_ref);
     let Some(binding) = binding else {
         log::warn!("N1 5GSM message for unknown SM context ref={sm_context_ref}");
-        return problem_404("CONTEXT_NOT_FOUND", "no such SM context");
+        return eps_to_5gs::sm_context_error(404, "CONTEXT_NOT_FOUND", "no such SM context");
     };
     let amf_uri = binding.sm_context_status_uri.clone();
 
@@ -8443,7 +8592,8 @@ async fn handle_n1_sm_message(sm_context_ref: &str, n1: &[u8]) -> SbiResponse {
                 "5GSM message type {message_type:#04x} in n1SmMsg for ref={sm_context_ref} \
                  is not handled on /modify"
             );
-            problem_400(
+            eps_to_5gs::sm_context_error(
+                403,
                 "N1_SM_ERROR",
                 &format!("unhandled 5GSM message type {message_type:#04x}"),
             )
@@ -8472,7 +8622,7 @@ async fn ran_released_session(sm_context_ref: &str, n2: Option<&[u8]>) -> SbiRes
     };
     let Some(binding) = lookup_policy_binding(sm_context_ref) else {
         log::warn!("PDU_RES_NTY_REL for unknown SM context ref={sm_context_ref}");
-        return problem_404("CONTEXT_NOT_FOUND", "no such SM context");
+        return eps_to_5gs::sm_context_error(404, "CONTEXT_NOT_FOUND", "no such SM context");
     };
     log::warn!(
         "SM Context Update (PDU_RES_NTY_REL): the NG-RAN released ref={sm_context_ref} \
@@ -13184,7 +13334,7 @@ mod tests {
     /// Establishment Reject as a 5gnas binary part referenced by RefToBinaryData.
     #[test]
     fn sm_context_create_error_carries_n1_reject_part() {
-        let resp = sm_context_create_error(403, "PDU_SESSION_TYPE_NOT_SUPPORTED", 5, 2, 50);
+        let resp = sm_context_create_error(403, "PDUTYPE_NOT_SUPPORTED", 5, 2, 50);
         assert_eq!(resp.status, 403);
         let root: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
@@ -13311,9 +13461,17 @@ mod tests {
             resp.status, 400,
             "a session the SMF cannot attribute must be refused"
         );
-        let problem: serde_json::Value =
+        // #1097, TS 29.502 Table 6.1.3.2.3.1-3: an SmContextCreateError, with the
+        // ProblemDetails in "error", as application/json.
+        assert_eq!(
+            resp.http.get_header("Content-Type").map(String::as_str),
+            Some(nextgcore_sbi::constants::content_type::APPLICATION_JSON)
+        );
+        let body: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let problem = &body["error"];
         assert_eq!(problem["cause"], "MANDATORY_IE_MISSING");
+        assert_eq!(problem["status"], 400);
         assert!(
             problem["detail"]
                 .as_str()
@@ -13390,7 +13548,10 @@ mod tests {
 
         let mut no_n1 = matched_sim.clone();
         no_n1["n1SmMsg"] = serde_json::Value::Null;
-        assert_eq!(validate_sm_context_create_data(&no_n1), Some("N1_SM_ERROR"));
+        assert_eq!(
+            validate_sm_context_create_data(&no_n1),
+            Some("MANDATORY_IE_MISSING")
+        );
     }
 
     // ------------------------------- #204 -------------------------------
@@ -13503,13 +13664,20 @@ mod tests {
             "MANDATORY_IE_MISSING"
         );
         assert_eq!(
-            DefaultDnnError::NoUdmEndpoint.cause(),
-            "SUBSCRIPTION_DATA_NOT_AVAILABLE"
+            (
+                DefaultDnnError::NoUdmEndpoint.cause(),
+                DefaultDnnError::NoUdmEndpoint.status()
+            ),
+            ("SYSTEM_FAILURE", 500)
         );
+        let failed = DefaultDnnError::SdmRequestFailed("boom".into());
         assert_eq!(
-            DefaultDnnError::SdmRequestFailed("boom".into()).cause(),
-            "SUBSCRIPTION_DATA_NOT_AVAILABLE"
+            (failed.cause(), failed.status()),
+            ("PEER_NOT_RESPONDING", 504)
         );
+        let refused = DefaultDnnError::SdmAnswerUnusable("status 503".into());
+        assert_eq!((refused.cause(), refused.status()), ("SYSTEM_FAILURE", 500));
+        assert_eq!(DefaultDnnError::NoSubscribedDnn.status(), 400);
 
         // Every detail says which failure it was, and none of them says "internet".
         for e in [
@@ -13953,10 +14121,11 @@ mod tests {
             .with_body(body.to_string(), "application/json");
         let resp = handle_sm_context_create(&request).await;
 
-        assert_eq!(resp.status, 400, "an unresolvable DNN refuses the session");
+        // #1097 review m2: no UDM to ask is the SMF's failure, not a bad request.
+        assert_eq!(resp.status, 500, "an unresolvable DNN refuses the session");
         let content = resp.http.content.as_deref().unwrap_or("");
         assert!(
-            content.contains("SUBSCRIPTION_DATA_NOT_AVAILABLE"),
+            content.contains("SYSTEM_FAILURE"),
             "the cause must name the real problem, got {content}"
         );
         assert!(
@@ -19527,7 +19696,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn n1_message_for_an_unknown_context_is_404_and_a_malformed_one_400() {
+    async fn n1_message_for_an_unknown_context_is_404_and_a_malformed_one_403() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         smf_context_init(64, 256, 512);
         let resp = handle_n1_sm_message(
@@ -19547,7 +19716,8 @@ mod tests {
         // Not a 5GSM container at all: refused as malformed rather than silently
         // ignored, which is what the old handler did to every N1 message.
         let resp = handle_n1_sm_message(reference, &[0x7E, 0x00, 0x41, 0x09]).await;
-        assert_eq!(resp.status, 400);
+        // #1097 review m1: N1_SM_ERROR is a 403 cause (TS 29.502 Table 6.1.7.3-1).
+        assert_eq!(resp.status, 403);
     }
 
     // ---- criterion 4: T3591/T3592 retransmit and exhaust ----
@@ -20899,6 +21069,343 @@ mod tests {
         );
     }
 
+    /// The error body of an SM Context Create/Update answer, checked for the
+    /// SmContextCreateError / SmContextUpdateError shape (#1097): the ProblemDetails
+    /// in "error", as application/json, no top-level cause.
+    fn sm_context_error_of(resp: &SbiResponse) -> serde_json::Value {
+        assert_eq!(
+            resp.http.get_header("Content-Type").map(String::as_str),
+            Some(nextgcore_sbi::constants::content_type::APPLICATION_JSON),
+            "status {}",
+            resp.status
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("a body")).expect("json");
+        assert!(
+            body.get("cause").is_none(),
+            "not a bare ProblemDetails: {body}"
+        );
+        assert_eq!(
+            body["error"]["status"],
+            serde_json::json!(resp.status),
+            "{body}"
+        );
+        body
+    }
+
+    /// #1097 review M4: the SMF's own SM Context Create and Update errors, a row per
+    /// kind, are each an SmContextCreateError / SmContextUpdateError with the right
+    /// status and cause -- with `upCnxState: DEACTIVATED` on a failed activation and
+    /// `hoState: NONE` plus a Handover Preparation Unsuccessful Transfer on a failed
+    /// handover preparation (TS 29.502 §5.2.2.3.2.2, §5.2.2.3.4.2).
+    #[tokio::test]
+    async fn sm_context_errors_are_create_and_update_errors() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        smf_context_init(64, 256, 512);
+        let post = |path: &str, body: &str| {
+            SbiRequest::post(path).with_body(body.to_string(), "application/json")
+        };
+        let create = "/nsmf-pdusession/v1/sm-contexts";
+        let rows: Vec<(&str, SbiResponse, u16, &str)> = vec![
+            (
+                "create: not JSON",
+                handle_sm_context_create(&post(create, "{")).await,
+                400,
+                "INVALID_MSG_FORMAT",
+            ),
+            (
+                "create: no pduSessionId",
+                handle_sm_context_create(&post(
+                    create,
+                    &serde_json::json!({ "sNssai": { "sst": 1 }, "n1SmMsg": { "contentId": "n1SmMsg" } }).to_string(),
+                ))
+                .await,
+                400,
+                "MANDATORY_IE_INCORRECT",
+            ),
+            (
+                "create: no n1SmMsg",
+                handle_sm_context_create(&post(
+                    create,
+                    &serde_json::json!({ "pduSessionId": 5, "sNssai": { "sst": 1 } }).to_string(),
+                ))
+                .await,
+                400,
+                "MANDATORY_IE_MISSING",
+            ),
+            (
+                "update: not JSON",
+                handle_sm_context_update("no-such-1097", &post("/x/modify", "{")).await,
+                400,
+                "INVALID_MSG_FORMAT",
+            ),
+            (
+                "update: unknown ref",
+                handle_sm_context_update("no-such-1097", &post("/x/modify", "{}")).await,
+                404,
+                "CONTEXT_NOT_FOUND",
+            ),
+        ];
+        let known = seed_registered_session("imsi-001010000010970", 9, "internet");
+        let rows2: Vec<(&str, SbiResponse, u16, &str)> = vec![
+            (
+                "update: unsupported n2SmInfoType",
+                handle_sm_context_update(
+                    &known,
+                    &post(
+                        "/x/modify",
+                        r#"{"n2SmInfoType":"NO_SUCH_TYPE","n2SmInfo":{"contentId":"n2SmInfo"}}"#,
+                    ),
+                )
+                .await,
+                403,
+                "N2_SM_ERROR",
+            ),
+            (
+                "update: PDU_RES_MOD_REQ without its N1",
+                handle_sm_context_update(
+                    &known,
+                    &post("/x/modify", r#"{"n2SmInfoType":"PDU_RES_MOD_REQ"}"#),
+                )
+                .await,
+                400,
+                "MANDATORY_IE_MISSING",
+            ),
+            (
+                "update: PDU_RES_MOD_REQ naming an N1 part that is not there",
+                handle_sm_context_update(
+                    &known,
+                    &post(
+                        "/x/modify",
+                        r#"{"n2SmInfoType":"PDU_RES_MOD_REQ","n1SmMsg":{"contentId":"absent"}}"#,
+                    ),
+                )
+                .await,
+                403,
+                "N1_SM_ERROR",
+            ),
+        ];
+        for (what, resp, status, cause) in rows.iter().chain(rows2.iter()) {
+            assert_eq!(resp.status, *status, "{what}: {:?}", resp.http.content);
+            let body = sm_context_error_of(resp);
+            assert_eq!(body["error"]["cause"], *cause, "{what}");
+        }
+
+        // A failed activation says the user plane is DEACTIVATED.
+        let activation = activation_response(&known);
+        assert_eq!(activation.status, 500);
+        let body = sm_context_error_of(&activation);
+        assert_eq!(body["upCnxState"], "DEACTIVATED");
+
+        // A failed handover preparation: hoState NONE and the N2 Handover Preparation
+        // Unsuccessful Transfer.
+        let handover = handover_preparing_response(&known, None);
+        assert_eq!(handover.status, 500);
+        let body = sm_context_error_of(&handover);
+        assert_eq!(body["hoState"], "NONE");
+        assert_eq!(body["n2SmInfoType"], "HANDOVER_PREP_FAIL");
+        assert!(handover
+            .http
+            .parts
+            .iter()
+            .any(|p| p.content_id.as_deref() == Some("n2SmInfo") && !p.data.is_empty()));
+
+        if let Ok(ctx) = smf_self().read() {
+            if let Some(sess) = ctx.sess_find_by_sm_context_ref(&known) {
+                ctx.sess_remove(sess.id);
+            }
+        }
+    }
+
+    /// #1144 round 2: a user-plane activation that fails says the user plane is
+    /// DEACTIVATED (TS 29.502 Table 6.1.6.2.36-1): when the UPF refuses the
+    /// downlink (504 UPF_NOT_RESPONDING), and when the context has no N4 session
+    /// (500 SYSTEM_FAILURE, not a 404 -- the context exists).
+    ///
+    /// REVERT-VERIFIED: without upCnxState on the UPF-refusal 504 of the activation,
+    /// or of the deactivation, this fails.
+    #[tokio::test]
+    async fn a_failed_activation_answers_deactivated() {
+        use base64::Engine as _;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        smf_context_init(64, 256, 512);
+        let setup_rsp = serde_json::json!({
+            "n2SmInfoType": "PDU_RES_SETUP_RSP",
+            "n2SmInfo": base64::engine::general_purpose::STANDARD.encode(GNB_SETUP_RESPONSE_TRANSFER),
+        })
+        .to_string();
+        let post =
+            || SbiRequest::post("/x/modify").with_body(setup_rsp.clone(), "application/json");
+
+        // The UPF refuses the downlink.
+        let refused = seed_established_session(
+            "imsi-001010000011441",
+            5,
+            std::net::Ipv4Addr::new(10, 45, 11, 41),
+        );
+        upf.answer_sessions_with(69);
+        let resp = handle_sm_context_update(&refused, &post()).await;
+        // #1144 round 3: and a deactivation the UPF refuses (the UE went idle).
+        let deactivation = handle_sm_context_update(
+            &refused,
+            &SbiRequest::post("/x/modify")
+                .with_body(r#"{"upCnxState":"DEACTIVATED"}"#, "application/json"),
+        )
+        .await;
+        upf.answer_sessions_with(1);
+        assert_eq!(resp.status, 504, "{:?}", resp.http.content);
+        let body = sm_context_error_of(&resp);
+        assert_eq!(body["error"]["cause"], "UPF_NOT_RESPONDING");
+        assert_eq!(body["upCnxState"], "DEACTIVATED");
+        assert_eq!(deactivation.status, 504, "{:?}", deactivation.http.content);
+        let body = sm_context_error_of(&deactivation);
+        assert_eq!(body["error"]["cause"], "UPF_NOT_RESPONDING");
+        assert_eq!(body["upCnxState"], "DEACTIVATED");
+
+        // No N4 session for the context.
+        let no_n4 = seed_registered_session("imsi-001010000011442", 6, "internet");
+        let resp = handle_sm_context_update(&no_n4, &post()).await;
+        assert_eq!(resp.status, 500, "{:?}", resp.http.content);
+        let body = sm_context_error_of(&resp);
+        assert_eq!(body["error"]["cause"], "SYSTEM_FAILURE");
+        assert_eq!(body["upCnxState"], "DEACTIVATED");
+
+        if let Ok(ctx) = smf_self().read() {
+            for r in [&refused, &no_n4] {
+                if let Some(sess) = ctx.sess_find_by_sm_context_ref(r) {
+                    ctx.sess_remove(sess.id);
+                }
+                ctx.policy_bindings.write().unwrap().remove(r);
+                ctx.pfcp_sessions.write().unwrap().remove(r);
+            }
+            ctx.ipv4_pool
+                .release(std::net::Ipv4Addr::new(10, 45, 11, 41));
+        }
+    }
+
+    /// #1144 review round 4: an NSACF that refuses the new session's slice admission
+    /// gets the create answered 500 INSUFFICIENT_RESOURCES_SLICE (TS 29.502 Table
+    /// 6.1.3.2.3.1-3), with a PDU SESSION ESTABLISHMENT REJECT #69 "insufficient
+    /// resources for specific slice" (TS 24.501 §4.6.3.1, §6.2.8) in its N1, and no
+    /// SM context left behind.
+    #[tokio::test]
+    async fn an_nsacf_refusal_is_insufficient_resources_slice() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let (nsacf, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(|_req: SbiRequest| async {
+                SbiResponse::with_status(403)
+            })
+            .await;
+        std::env::set_var("NSACF_URI", format!("http://127.0.0.1:{}", addr.port()));
+        let supi = "imsi-001010000011443";
+        let resp = handle_sm_context_create(&create_request(
+            supi,
+            7,
+            &n1(
+                7,
+                3,
+                gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+                &[0x91, 0x00],
+            ),
+        ))
+        .await;
+        std::env::remove_var("NSACF_URI");
+        nsacf.stop().await.ok();
+        let left = smf_self()
+            .read()
+            .unwrap()
+            .policy_bindings
+            .read()
+            .unwrap()
+            .values()
+            .any(|b| b.supi == supi && b.psi == 7);
+
+        assert_eq!(resp.status, 500, "{:?}", resp.http.content);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["error"]["cause"], "INSUFFICIENT_RESOURCES_SLICE");
+        let reject = resp
+            .http
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some("n1SmMsg"))
+            .expect("the N1 reject")
+            .data
+            .to_vec();
+        assert_eq!(
+            &reject[..5],
+            &[0x2E, 7, 3, 0xC3, 69],
+            "REJECT #69: {reject:02x?}"
+        );
+        assert!(!left, "no SM context left after the rollback");
+    }
+
+    /// #1097 review M4, the guard over every site: no SM Context Create or Update
+    /// path answers an error any other way than through `eps_to_5gs::sm_context_*`
+    /// (or the N1-bearing `sm_context_create_error`). A bare ProblemDetails or an
+    /// empty error body reintroduced at any of them fails this.
+    #[test]
+    fn no_create_or_update_path_answers_a_bare_problem_details() {
+        // An error status not followed by a body (`.with_body`/`.with_part`): a bare
+        // `with_status(4xx|5xx)` in any of its forms.
+        fn empty_error_answers(body: &str) -> Vec<String> {
+            let mut found = Vec::new();
+            for (at, _) in body.match_indices("with_status(") {
+                let rest = &body[at + "with_status(".len()..];
+                let Some(close) = rest.find(')') else {
+                    continue;
+                };
+                let Ok(status) = rest[..close].trim().parse::<u16>() else {
+                    continue;
+                };
+                let after = rest[close + 1..].trim_start();
+                if (400..600).contains(&status) && !after.starts_with('.') {
+                    found.push(format!("with_status({status})"));
+                }
+            }
+            found
+        }
+        let main_rs: &[&str] = &[
+            "async fn handle_sm_context_create(",
+            "async fn handle_sm_context_update(",
+            "fn activation_response(",
+            "fn handover_preparing_response(",
+            "fn handover_allocation_failed_response(",
+            "async fn handle_n1_sm_message(",
+            "async fn ran_released_session(",
+        ];
+        let eps_to_5gs_rs: &[&str] = &[
+            "async fn handle_create_inner(",
+            "async fn handle_prepared_inner(",
+            "async fn handle_completed_inner(",
+            "async fn handle_cancelled_inner(",
+        ];
+        for (source, functions) in [
+            (include_str!("main.rs"), main_rs),
+            (include_str!("eps_to_5gs.rs"), eps_to_5gs_rs),
+        ] {
+            for function in functions {
+                let start = source
+                    .find(function)
+                    .unwrap_or_else(|| panic!("{function} exists"));
+                let end = start + source[start..].find("\n}\n").expect("its end");
+                let body = &source[start..end];
+                for bare in ["problem_400(", "problem_404(", "problem_response("] {
+                    assert!(!body.contains(bare), "{function} answers through {bare}");
+                }
+                assert!(
+                    empty_error_answers(body).is_empty(),
+                    "{function} answers with no body: {:?}",
+                    empty_error_answers(body)
+                );
+            }
+        }
+    }
+
     /// #78 criterion 3: Update on an unknown ref is 404 + ProblemDetails, and on a
     /// KNOWN ref still succeeds. Both halves matter — a version that 404s
     /// everything would satisfy the first alone.
@@ -20916,9 +21423,20 @@ mod tests {
             resp.status, 404,
             "an Update that blindly returns 200 masks lost state"
         );
+        // #1097, TS 29.502 Table 6.1.3.3.4.2.2-2: an SmContextUpdateError, the
+        // ProblemDetails in "error", as application/json.
+        assert_eq!(
+            resp.http.get_header("Content-Type").map(String::as_str),
+            Some(nextgcore_sbi::constants::content_type::APPLICATION_JSON)
+        );
         let body: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("json");
-        assert_eq!(body["cause"], serde_json::json!("CONTEXT_NOT_FOUND"));
+        assert_eq!(
+            body["error"]["cause"],
+            serde_json::json!("CONTEXT_NOT_FOUND")
+        );
+        assert_eq!(body["error"]["status"], serde_json::json!(404));
+        assert!(body.get("cause").is_none(), "not a bare ProblemDetails");
 
         let known = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts/x/modify").with_body(
             serde_json::json!({ "upCnxState": "ACTIVATED" }).to_string(),

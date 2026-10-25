@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-3d04d415.js";
+            window.path_to_searchindex_js = "../searchindex-c642a377.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -280,6 +280,8 @@ smf:
 <tr><td><code>SMF_PFCP_ADVERTISE_ADDR</code></td><td>the bind address when specified, else an IPv4 Node ID, else the local address routed toward the first UPF</td><td>The IPv4 address in every CP F-SEID (TS 29.244 §8.2.37), which the UPF sends Session Report Requests to. On k8s, the pod IP. The SMF refuses to start when it can find no routable address rather than signal <code>0.0.0.0</code>.</td></tr>
 <tr><td><code>UPF_PFCP_ADDR</code> / <code>UPF_PFCP_PORT</code></td><td><code>127.0.0.1</code> / <code>8805</code></td><td>UPF N4 peer(s), comma-separated. Each entry is an IP, <code>IP:port</code>, or a hostname (<code>host</code> or <code>host:port</code>); a hostname is re-resolved on every Association Setup attempt, so a UPF that moves to a new IP is re-associated.</td></tr>
 <tr><td><code>SMF_PFCP_RELEASE_ON_SHUTDOWN</code></td><td>unset</td><td>Whether a graceful shutdown sends PFCP Association Release. Unset: released unless durable state (<code>--state-file</code> / <code>NEXTGCORE_SMF_STATE_FILE</code>) is armed. Without durable state the next SMF knows none of the sessions, so the UPF deletes them rather than keep them orphaned (#718). With durable state the association is kept, and the next SMF asks the UPF to retain the restored sessions (PFCP Session Retention Information, TS 29.244 §6.2.6.2); EPC PDN connections are not durable, so they are deleted at the PGW-U and toward the SGW first. <code>true</code> or <code>false</code> overrides either way. Without durable state an SMF that is killed (SIGKILL, OOM, node loss) cannot tell any UE: the next SMF knows none of the sessions, and the UPF deletes them when it associates. Only durable state, or TS 23.527 SMF restoration, avoids that. A graceful shutdown deregisters from the NRF and refuses new SM contexts (500 <code>NF_FAILOVER</code>) before it releases anything.</td></tr>
+<tr><td><code>SMF_SHUTDOWN_BUDGET_SECS</code></td><td><code>43</code></td><td>The one deadline a graceful shutdown runs against, from the signal: NFDeregister, the releases, the S5/S8 drain and the SBI server stop all fit inside it. Clamped to 30-3600 s with a warning. Keep it 2 s under the termination grace period; the shipped manifests do, and the Helm chart derives it from <code>smf.terminationGracePeriodSeconds</code> and refuses a grace period under 32 s. See “Termination grace period” below.</td></tr>
+<tr><td><code>SMF_UP_PATH_FAILURE_HOLD_SECS</code></td><td><code>120</code></td><td>How long sessions toward a GTP-U peer that a UPF reported failed are kept (deactivated, downlink buffered) before they are released: the operator maximum path failure duration of TS 23.007 §20.3.1. <code>0</code> releases them at once; at most 3600. See <a href="#user-plane-path-failure-994">User plane path failure</a>.</td></tr>
 </tbody>
 </table>
 </div>
@@ -293,10 +295,10 @@ smf:
 <p>A UPF may report only on its own sessions. A Session Report for a SEID this SMF does not hold, or for a session served by another UPF, gets cause 65. A session restored from durable state belongs to the default UPF.</p>
 <p>Every refused datagram increments <code>smf_pfcp_unauthorized_messages_total</code>. This is one unlabelled counter, so it adds no series per sender. Each one is logged at DEBUG, with at most one WARN summary every 10 s, so a forged-sender flood does not fill the log. An on-path attacker that spoofs a UPF’s source address is that UPF as far as PFCP can tell: protect N4 at the transport (a private network, or IPsec, TS 33.501 §9.9).</p>
 <p><strong>One SMF instance at a time.</strong> Every SMF pod signals the same PFCP Node ID, and a UPF keeps one association per Node ID (TS 29.244 §6.2.6.2.2). A second instance replaces the first one’s association and deletes its sessions. The k8s and Helm Deployments therefore use <code>strategy: Recreate</code>, and the chart refuses <code>smf.replicas &gt; 1</code>. <code>Recreate</code> covers rollouts only. <code>kubectl delete pod</code> and a node drain create the replacement while the old pod is still terminating, so the two overlap for the termination grace period. Without durable state that is harmless: the old pod is releasing, and its UEs get #39. With durable state on a volume, both pods would open the same state file. Run a durable SMF as a StatefulSet, which never starts a replacement before the old pod has terminated.</p>
-<p><strong>Termination grace period.</strong> A graceful shutdown first tells every UE (#39) and every SGW (Delete Bearer, retransmitted for up to 12 s), then releases each UPF association (up to T1 x N1 when a UPF is gone). The shipped SMF and PGW-C manifests set <code>terminationGracePeriodSeconds: 45</code>. A shorter period cuts the retransmissions off.</p>
+<p><strong>Termination grace period.</strong> A graceful shutdown runs against ONE deadline, taken when the signal arrives: 43 s by default. <code>SMF_SHUTDOWN_BUDGET_SECS</code> overrides it, clamped to 30-3600 s with a warning; the shipped manifests set it to the grace period less 2 s, and the Helm chart derives it from <code>smf.terminationGracePeriodSeconds</code>. NFDeregister gets at most 3 s. Every SGW is told first (Delete Bearer, which does not wait for an answer). Then each UPF association is released: the #39 releases to the UEs get whatever is left after reserving 12 s for the Association Release (T1 x (N1+1)) and 12 s for the S5/S8 retransmissions. The UEs not reached by then are counted in the log, and the UPF deletes their sessions on the release. On the durable path (association kept), the EPC PFCP deletions are bounded by the same deadline. The shipped SMF and PGW-C manifests set <code>terminationGracePeriodSeconds: 45</code>, and docker compose sets <code>stop_grace_period: 45s</code>.</p>
 <p><strong>Durable state is a one-way upgrade.</strong> The snapshot format is versioned. This release writes version 2 (5G CP SEIDs <code>1&lt;&lt;48 | ref</code>; a version-1 session keeps its legacy <code>ref | 0x1000</code> SEID). An older binary refuses a newer snapshot rather than misread it, so rolling smfd back across this change with a state file fails to start. Remove the file (the sessions are then released) or roll forward.
 | <code>SMF_SBI_ADVERTISE_URI</code> | derived from SBI server address/port | Externally reachable base URI used in PCF callback (<code>notificationUri</code>) URIs. |
-| <code>UDM_SBI_ADDR</code> / <code>UDM_SBI_PORT</code> | unset / <code>7777</code> | UDM address for <code>Nudm_SDM_Get(smf-select-data)</code>, used only to resolve the <strong>subscribed default DNN</strong> (#204). Tried <strong>after</strong> NRF discovery, so it is the fallback for a deployment with no NRF. With neither available, a <code>SmContextCreateData</code> carrying no <code>dnn</code> is refused with <code>SUBSCRIPTION_DATA_NOT_AVAILABLE</code>. |
+| <code>UDM_SBI_ADDR</code> / <code>UDM_SBI_PORT</code> | unset / <code>7777</code> | UDM address for <code>Nudm_SDM_Get(smf-select-data)</code>, used only to resolve the <strong>subscribed default DNN</strong> (#204). Tried <strong>after</strong> NRF discovery, so it is the fallback for a deployment with no NRF. With neither available, a <code>SmContextCreateData</code> carrying no <code>dnn</code> is refused with <code>500 SYSTEM_FAILURE</code> (<code>504 PEER_NOT_RESPONDING</code> when the UDM does not answer). |
 | <code>NRF_URI</code> | unset | NRF URI, used when the YAML names none. |
 | <code>PCF_URI</code> / <code>NSACF_URI</code> | unset | PCF / NSACF endpoint, tried before NRF discovery. With no NSACF configured or discoverable, slice admission control is skipped. |
 | <code>SMF_METRICS_PORT</code> | <code>9090</code> | Prometheus endpoint port. |
@@ -358,7 +360,17 @@ in. An unchanged stamp means they are genuinely still valid. A UPF named by
 hostname has its stamp kept under the configured <code>host:port</code>, lower-cased and
 without a trailing dot, so it is found again after the UPF moves (#722). A stamp
 a pre-#722 snapshot kept under the UPF’s address is read once, moved to the name,
-and the address entry removed. A UPF hostname must name exactly one UPF.</p>
+and the address entry removed. When both entries exist, the address entry wins:
+an older binary wrote it after this one retired it (an upgrade, a rollback, then
+a re-upgrade), so it is the newer record. After the seed, every address-keyed
+stamp that no literal UPF of this SMF owns is dropped, so an orphan cannot win
+over a correct name key later (#930). Nothing is dropped while a hostname UPF
+has not resolved at boot, since its stamp may still be under its old address; the
+next boot prunes. A UPF hostname must name exactly one UPF.
+The snapshot also records which UPF each session was established on, by the
+same key, so in a UPF pool a restored session keeps signalling the UPF that
+holds it, and that UPF can still report on it (#1031). A session whose UPF is no
+longer configured goes to the default UPF, and a warning at boot says how many.</p>
 <p><strong>Limits worth knowing:</strong></p>
 <ul>
 <li>The flush is process-wide, not per-peer — <code>clear_pfcp_sessions</code> empties the
@@ -367,6 +379,42 @@ session bookkeeping for all of them. The map has no peer column to do better.</l
 <li>Not enabled in the shipped Docker compose (unlike <code>udrd</code>), so the default E2E
 path is unchanged.</li>
 </ul>
+<h2 id="user-plane-path-failure-994"><a class="header" href="#user-plane-path-failure-994">User plane path failure (#994)</a></h2>
+<p>A UPF reports a GTP-U path to a gNB, eNB, SGW-U or another UPF failing or recovering in a PFCP Node Report Request (TS 29.244 §5.10A, §7.4.5.1). The SMF answers each one with a Node Report Response:</p>
+<ul>
+<li>cause 1 when it is from the association’s own UPF;</li>
+<li>cause 72 from any other host;</li>
+<li>cause 66 or 67, with the Offending IE, when the Node ID, the Node Report Type or a report the type announces is missing.</li>
+</ul>
+<p>The SMF learns which sessions use which peer from its own accepted Session Establishment and Modification Requests: the Outer Header Creation address of each FAR. The durable snapshot carries this (<code>farPeers</code>), so a restored session is still found.</p>
+<ul>
+<li><strong>Path failure:</strong> the UP connection of every session with a forwarding FAR toward the peer is deactivated (TS 23.502 §4.3.7, steps 4 and 5). Those FARs are set to BUFF|NOCP, so downlink data is buffered and reported and the UE is paged. For an N3 FAR, the NG-RAN gets an N2-only PDU Session Resource Release Command (cause transport-resource-unavailable) through the AMF.</li>
+<li><strong>Still down after <code>SMF_UP_PATH_FAILURE_HOLD_SECS</code></strong> (TS 23.007 §20.3.1):
+<ul>
+<li>a session whose tunnel still points at the peer (no Service Request moved it) is released: its N4 session is deleted, and the UE gets a PDU Session Release Command #39 so it re-establishes the session;</li>
+<li>an EPC PDN connection is deleted at the PGW-U and toward the SGW.</li>
+</ul>
+</li>
+<li><strong>Recovery:</strong> the failed state is cleared, and the pending hold does nothing. Sessions stay deactivated until their next Service Request or paging.</li>
+<li><strong>A peer GTP-U restart</strong> (Peer UP Restart Report) and a session-level <strong>Error Indication Report</strong> deactivate the user plane in the same way, with no hold.</li>
+</ul>
+<p>A repeated failure report for a peer that is already failed starts no second hold. The failed paths are durable (<code>failedUpPaths</code> in the snapshot). A graceful shutdown stops the pending holds first, and the next process re-arms each one once its UPF is associated again, for what is left of it and at least 10 s. A path whose UPF is no longer configured is forgotten.</p>
+<p>A recovery the UPF reported while the SMF was down is lost, because the UPF stops retransmitting after N1. Such a path still counts as failed, so its sessions are released with #39 when the hold runs out, and the UEs re-establish them. That is the safe direction.</p>
+<p>Metrics:</p>
+<ul>
+<li><code>smf_up_path_failures_total</code> and <code>smf_up_path_recoveries_total</code>;</li>
+<li><code>smf_up_paths_failed</code> (gauge);</li>
+<li><code>smf_up_path_sessions_deactivated_total</code> and <code>smf_up_path_sessions_released_total</code>.</li>
+</ul>
+<h2 id="network-slice-admission-control-959-1072"><a class="header" href="#network-slice-admission-control-959-1072">Network slice admission control (#959, #1072)</a></h2>
+<p>With an NSACF configured (<code>NSACF_URI</code>) or discoverable, every PDU session is counted in and out of its S-NSSAI’s PDU-session quota with Nnsacf_NSAC_NumOfPDUsUpdate (TS 23.502 §4.2.11.4, TS 29.536). The NSACF keeps one entry per UE ID and PDU session ID on each S-NSSAI.</p>
+<ul>
+<li><strong>Count-in.</strong> SM Context Create sends an INCREASE before it commits PCF and PFCP resources. A rejection fails the create with 5GSM cause #67. An NSACF that is absent or refuses with another status fails open: the session is not counted. If an INCREASE gets no answer at all (a timeout, a broken stream), the NSACF may have applied it, so the session fails open and a precautionary DECREASE follows. That DECREASE is a no-op at the NSACF when the INCREASE was never applied.</li>
+<li><strong>EPC to 5GC.</strong> This SMF+PGW-C does no EPS counting, so a PDN connection is counted in when it moves to 5GS (TS 23.501 §5.15.11.5). One the NSACF does not admit is not transferred: the EPS→5GS SM Context Create fails with <code>INSUFFICIENT_RESOURCES_SLICE</code>, and the PDN connection stays on EPS. A cancelled move counts the session out again.</li>
+<li><strong>Count-out.</strong> Every release sends the DECREASE, alongside the UDM cleanup. A same-PSI re-establishment on the same S-NSSAI waits for the old session’s DECREASE if it is already sent, and takes the admission over if it is not (then neither a DECREASE nor a new INCREASE is sent). A re-establishment on another S-NSSAI waits for neither.</li>
+<li><strong>Shutdown and boot.</strong> A shutdown that releases the association counts out every session still admitted, alongside the #39 fan-out and the Association Release, within the shutdown deadline. A durable shutdown counts nothing out: the sessions continue. At boot, a snapshot session that cannot be restored is counted out.</li>
+</ul>
+<p><code>smf_nsac_decrease_failures_total</code> counts the DECREASEs the NSACF refused or did not answer. Each such session stays counted at the NSACF. Precautionary DECREASEs are not counted.</p>
 <h2 id="restoration-signalling-193"><a class="header" href="#restoration-signalling-193">Restoration signalling (#193)</a></h2>
 <p>The interlock above decides what the SMF <em>believes</em>. This decides what it
 <strong>tells the AMF</strong>, which before #193 was nothing: the SMF flushed N sessions,
@@ -438,7 +486,7 @@ on the release path, which this does not drive.</li>
 <li>If exactly <strong>one</strong> DNN is subscribed for the S-NSSAI and none is flagged, that one is used — unambiguous.</li>
 <li>Otherwise the session is <strong>refused</strong> with <code>400 MANDATORY_IE_MISSING</code>, listing the candidate DNNs. Choosing among several unflagged DNNs would invent an answer the subscription does not give.</li>
 </ol>
-<p>Failure causes are distinct so an operator can tell a provisioning gap from an unreachable UDM: <code>MANDATORY_IE_MISSING</code> for “the subscription supplies no usable default”, <code>SUBSCRIPTION_DATA_NOT_AVAILABLE</code> for “no UDM endpoint” or “the Nudm_SDM_Get failed”.</p>
+<p>Failure causes are distinct so an operator can tell a provisioning gap from an unreachable UDM: <code>MANDATORY_IE_MISSING</code> for “the subscription supplies no usable default”, <code>500 SYSTEM_FAILURE</code> for “no UDM endpoint” or “the UDM answered with an error or an unusable body”, and <code>504 PEER_NOT_RESPONDING</code> for “the UDM did not answer” (#1097).</p>
 <p><strong>Limit worth knowing:</strong> nothing in this tree emits <code>defaultDnnIndicator</code> — the subscription DB has no such field and <code>udrd</code>’s <code>build_smf_selection_data</code> writes only the DNN name. So against this tree’s own UDM/UDR, rule 3 is what makes it work, and a subscriber with <strong>two or more DNNs on one S-NSSAI cannot establish a DNN-less PDU session</strong> (it is refused, with the candidates named). Tracked as issue #264 (<code>decision</code>).</p>
 <p>No <code>single-nssai</code> query parameter is sent, even though TS 29.503 §5.2.2.2.1 allows scoping: the value is JSON and must be percent-encoded, but the shared SBI server stores query values verbatim without decoding them (issue #65), so a scoped query cannot round-trip to the in-tree UDM. The S-NSSAI’s entry is selected locally by key instead.</p>
 <h2 id="sm-context-lifecycle-78"><a class="header" href="#sm-context-lifecycle-78">SM context lifecycle (#78)</a></h2>

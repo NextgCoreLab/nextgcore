@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-3d04d415.js";
+            window.path_to_searchindex_js = "../searchindex-c642a377.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -245,6 +245,7 @@ upf:
 <tr><td><code>--pfcp-allowed-peers</code></td><td>list</td><td>empty</td><td>SMF/PGW-C hosts allowed to set up the PFCP association: IPs, CIDR prefixes or host names (re-resolved every 10 s, and at once – at most once a second – when a Setup comes from an unresolved address; a failed lookup keeps the last good addresses), comma-separated; <code>UPF_PFCP_ALLOWED_PEERS</code> when the flag is not given. Only the source IP is compared. A listed host may move a live association only as the same CP function (one of its hosts, or the same Node ID); a different CP function is refused until the association is released or times out. The Node ID is sender-written, so a broad entry (a pod CIDR, <code>0.0.0.0/0</code>) lets any host in range that knows the SMF’s Node ID take the association over: prefer the SMF’s own address or headless Service name. <strong>Fail closed:</strong> empty refuses every Association Setup (logged as an error at startup); <code>0.0.0.0/0</code> / <code>::/0</code> admit any host (labs only). The shipped compose, Helm, k8s and EKS deployments set it. Every PFCP message other than Heartbeat and Association Setup is accepted only from the associated SMF’s hosts (its Setup source, its IPv4/IPv6 Node ID, or the addresses its FQDN Node ID resolves to); refusals count in <code>upf_pfcp_unauthorized_messages_total</code>.</td></tr>
 <tr><td><code>--gtpu-addr</code></td><td>string</td><td><code>127.0.0.4</code></td><td>N3 GTP-U bind address.</td></tr>
 <tr><td><code>--gtpu-port</code></td><td>u16</td><td><code>2152</code></td><td>N3 GTP-U port.</td></tr>
+<tr><td><code>--gtpu-addr6</code></td><td>IPv6</td><td>unset</td><td>IPv6 N3 GTP-U address. When set, a second GTP-U socket is bound on it (same port), and N3 runs over IPv6 in both directions. Downlink to an IPv6 gNB uses it. A local F-TEID the SMF asks for with CH+V6 carries this address. An Error Indication for a G-PDU that arrived over IPv6 names it as the GTP-U Peer Address. Outer DSCP is marked through IPV6_TCLASS. The address is advertised, so it must be a unicast address of this host: <code>::</code> and multicast addresses are refused at startup. Unset: downlink to an IPv6 gNB is dropped and counted, and a PDR asking for CH+V6 alone is refused with Rule creation/modification failure (CH+V4+V6 gets the IPv4 address).</td></tr>
 <tr><td><code>--tun-ifname</code></td><td>string</td><td><code>ogstun</code></td><td>TUN interface name for the user-plane subnet.</td></tr>
 <tr><td><code>--tun-ip</code></td><td>IPv4</td><td><code>10.45.0.1</code></td><td>TUN interface IP address (UE subnet gateway).</td></tr>
 <tr><td><code>--tun-prefix</code></td><td>u8</td><td><code>16</code></td><td>TUN interface prefix length.</td></tr>
