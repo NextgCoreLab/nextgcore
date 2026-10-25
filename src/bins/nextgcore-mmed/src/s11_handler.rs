@@ -1071,10 +1071,80 @@ pub fn dispatch_initial(raw: &[u8], msg_type: u8, sequence_number: u32, peer: So
             Err(e) => log::error!("S11 Downlink Data Notification from {peer} unparsable: {e:?}"),
         },
         mt::DELETE_BEARER_REQUEST => handle_delete_bearer_request(raw, sequence_number, peer),
+        mt::CREATE_BEARER_REQUEST => refuse_create_bearer_request(raw, sequence_number, peer),
         other => log::info!(
             "S11 initial message type={other} seq={sequence_number} from {peer} not handled: this \
              MME originates no procedure for it"
         ),
+    }
+}
+
+/// #641 stop-gap: this MME cannot activate a dedicated bearer yet (TS 23.401
+/// §5.4.1 is not wired: no E-RAB SETUP / ACTIVATE DEDICATED EPS BEARER
+/// CONTEXT REQUEST path). A Create Bearer Request (initial, or triggered by a
+/// Bearer Resource Command) is therefore refused at once with "Service not
+/// supported" (TS 29.274 §8.4: "a message which corresponds to a feature or a
+/// service which is not supported by the node"), instead of being dropped and
+/// left to run out the Serving GW's and the PGW's N3. "Context not found" when
+/// the TEID names no UE. Every bearer of the request is listed, with its EBI.
+fn refuse_create_bearer_request(raw: &[u8], sequence_number: u32, peer: SocketAddr) {
+    use crate::s11_build::GtpCause;
+    let ctx = crate::context::mme_self();
+    let local_teid = parse_gtp_header(raw)
+        .map(|(_, teid, _, _)| teid)
+        .unwrap_or(0);
+    let sgw_teid = ctx
+        .mme_ue_find_by_s11_local_teid(local_teid)
+        .and_then(|id| ctx.mme_ue_find_by_id(id))
+        .map(|ue| {
+            ctx.sgw_ue_find_by_id(ue.sgw_ue_id)
+                .map(|s| s.sgw_s11_teid)
+                .unwrap_or(0)
+        });
+    let cause = if sgw_teid.is_some() {
+        GtpCause::ServiceNotSupported
+    } else {
+        GtpCause::ContextNotFound
+    };
+    let mut ebis: Vec<u8> = {
+        let mut bytes = bytes::Bytes::copy_from_slice(raw);
+        nextgcore_gtp::v2::Gtp2Message::decode(&mut bytes)
+            .map(|msg| {
+                msg.get_ies(nextgcore_gtp::v2::Gtp2IeType::BearerContext as u8)
+                    .into_iter()
+                    .filter(|ie| ie.instance == 0)
+                    .filter_map(|ie| {
+                        nextgcore_gtp::v2::Gtp2BearerContextIe::decode(&ie.value)
+                            .ok()?
+                            .ebi()
+                            .ok()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    if ebis.is_empty() {
+        // Bearer Contexts are mandatory in the answer: one, EBI 0 as the request
+        // had it before the MME would have assigned one.
+        ebis.push(0);
+    }
+    log::warn!(
+        "S11 Create Bearer Request seq={sequence_number} from {peer}: dedicated bearer \
+         activation is not supported by this MME (#641); refused with cause {}",
+        cause as u8
+    );
+    match crate::s11_build::build_create_bearer_refusal(
+        sgw_teid.unwrap_or(0),
+        &ebis,
+        cause,
+        sequence_number,
+    ) {
+        Ok(rsp) => {
+            if let Err(e) = crate::gtp_path::send_response_to_sgwc(peer, &rsp) {
+                log::error!("S11 Create Bearer Response to {peer} failed: {e}");
+            }
+        }
+        Err(e) => log::error!("Create Bearer Response build failed: {e}"),
     }
 }
 
