@@ -5937,7 +5937,27 @@ fn sm_policy_delete_permits() -> &'static std::sync::Arc<tokio::sync::Semaphore>
 }
 
 /// SM Policy Association terminations still running (#874).
+///
+/// Process-global, with the task list and the semaphores beside it: a test that
+/// starts terminations, or drains them, holds `PROCESS_STATE_TEST_LOCK` and lets
+/// its own settle (`settle_sm_policy_deletes_for_test`) before releasing it, so no
+/// sibling's drain counts or aborts them (#1145 review E).
 static SM_POLICY_DELETES_RUNNING: AtomicU64 = AtomicU64::new(0);
+
+/// Wait (bounded) until no SM Policy Association termination is running: a test's
+/// own, before it releases `PROCESS_STATE_TEST_LOCK` or before it measures.
+#[cfg(test)]
+pub(crate) async fn settle_sm_policy_deletes_for_test() {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while SM_POLICY_DELETES_RUNNING.load(Ordering::SeqCst) > 0
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    if let Ok(mut tasks) = sm_policy_delete_tasks().lock() {
+        tasks.retain(|t| !t.is_finished());
+    }
+}
 
 fn sm_policy_delete_tasks() -> &'static std::sync::Mutex<Vec<tokio::task::AbortHandle>> {
     static TASKS: std::sync::OnceLock<std::sync::Mutex<Vec<tokio::task::AbortHandle>>> =
@@ -7027,7 +7047,21 @@ async fn run_gsm_timer_tick() {
                 // timeouts; awaited here, they held the tick, and every other timer and
                 // the shutdown check, for that long times N.
                 let sm_ref = sm_context_ref.clone();
+                let timer_id = entry.timer_id;
                 spawn_gsm_expiry(async move {
+                    // #1145 review: decided at the expiry, sent once a slot is free.
+                    // By then the procedure may have ended -- the UE's COMPLETE, or
+                    // the abandon -- and the UE re-established the same PSI, which a
+                    // stale RELEASE COMMAND (PTI 0) would release. So the timer must
+                    // still be this one, at this attempt.
+                    if !gsm_timer_still_at(&sm_ref, timer_id, attempt) {
+                        log::info!(
+                            "{} attempt {attempt} for ref={sm_ref} not sent: the procedure \
+                             ended while it waited for a slot",
+                            timer_id.name()
+                        );
+                        return;
+                    }
                     send_n1_n2_message_transfer(
                         entry.amf_uri.as_deref(),
                         &entry.supi,
@@ -7067,6 +7101,20 @@ fn gsm_expiry_permits() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
     static PERMITS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
         std::sync::OnceLock::new();
     PERMITS.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(GSM_EXPIRY_FANOUT)))
+}
+
+/// Whether `sm_context_ref`'s armed 5GSM timer is still `timer_id` at `attempts`:
+/// the expiry a queued retransmission was decided at (#1145 review).
+fn gsm_timer_still_at(sm_context_ref: &str, timer_id: timer::SmfTimerId, attempts: u32) -> bool {
+    gsm_procedure_timers()
+        .lock()
+        .ok()
+        .and_then(|timers| {
+            timers
+                .get(sm_context_ref)
+                .map(|t| t.timer_id == timer_id && t.attempts == attempts)
+        })
+        .unwrap_or(false)
 }
 
 /// Run one 5GSM expiry's AMF work in its own task, at most [`GSM_EXPIRY_FANOUT`] at
@@ -7547,19 +7595,51 @@ async fn graceful_shutdown(
         }
     };
     tokio::join!(fanouts, n4, nsac);
-    // #874: the SM Policy Association terminations still in flight, including the
-    // ones this shutdown's releases started, are given a bounded time to land,
-    // within what is left of the shutdown's deadline.
-    drain_sm_policy_deletes(std::time::Duration::from_secs(3).min(left())).await;
     pfcp_listener.abort();
     log::info!("SMF N4 PFCP listener stopped");
+    // #874, #1145 review A/B: last, so it covers every SM Policy Association this
+    // shutdown leaves. The releases still waiting for the UE's COMPLETE or for T3592
+    // (this shutdown's #39 fan-out, a UPF-restart release, an AMF /release) would
+    // start their DELETE only then, after the process is gone, so they start it now;
+    // then the DELETEs in flight get what is left, ALONGSIDE the S5/S8 drain rather
+    // than out of its reserve, and what does not land is counted.
+    let started = terminate_policies_of_pending_releases();
+    if started > 0 {
+        log::info!(
+            "Shutdown: {started} SM Policy Association termination(s) started for \
+             releases still waiting on the UE"
+        );
+    }
     // #718 review m2: the Delete Bearer Requests sent above, on either path, are
     // retransmitted until answered or N3 is exhausted.
-    drain_s5s8_requests(
-        gtp_path::s5s8_server().map(|s| s.as_ref()),
-        left().min(SHUTDOWN_GTP_DRAIN),
-    )
-    .await;
+    tokio::join!(
+        drain_s5s8_requests(
+            gtp_path::s5s8_server().map(|s| s.as_ref()),
+            left().min(SHUTDOWN_GTP_DRAIN),
+        ),
+        drain_sm_policy_deletes(left().min(SHUTDOWN_GTP_DRAIN)),
+    );
+}
+
+/// Start the SM Policy Association termination of every session whose network-
+/// initiated release still waits on the UE (an armed T3592), at shutdown (#1145
+/// review A): its DELETE would otherwise start only on the COMPLETE or the final
+/// expiry, after the process. Returns how many were started.
+fn terminate_policies_of_pending_releases() -> usize {
+    let pending: Vec<String> = gsm_procedure_timers()
+        .lock()
+        .map(|timers| {
+            timers
+                .iter()
+                .filter(|(_, t)| t.timer_id == timer::SmfTimerId::T3592)
+                .map(|(r, _)| r.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    pending
+        .iter()
+        .filter_map(|r| terminate_sm_policy_association(r))
+        .count()
 }
 
 /// Whether a graceful shutdown releases the PFCP association (#677, #718).
@@ -17334,7 +17414,7 @@ mod tests {
             "every retransmission arrived"
         );
         let peak = peak.load(Ordering::SeqCst);
-        assert!(peak <= GSM_EXPIRY_FANOUT, "at most 16 at once: {peak}");
+        assert!(peak <= 16, "at most 16 at once: {peak}");
         assert!(peak > 1, "and they do run in parallel: {peak}");
     }
 
@@ -17386,6 +17466,9 @@ mod tests {
     #[tokio::test]
     async fn the_shutdown_drains_policy_deletes_and_counts_the_abandoned() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        // #1145 review E: a sibling's terminations, if any are still running, are not
+        // this test's to drain or count.
+        settle_sm_policy_deletes_for_test().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let answered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let a = answered.clone();
@@ -17422,6 +17505,134 @@ mod tests {
             (1, 1),
             "the stuck one is abandoned and counted"
         );
+    }
+
+    /// #1145 review MAJOR: a retransmission decided at an expiry but still waiting
+    /// for one of the 16 slots is not sent once its procedure has ended -- the UE's
+    /// COMPLETE, or the abandon -- or a stale RELEASE COMMAND (PTI 0) would release
+    /// the session the UE has since re-established on the same PSI.
+    ///
+    /// REVERT-VERIFIED: without the re-check under the timer lock, the AMF still
+    /// receives the retransmission.
+    #[tokio::test]
+    async fn a_queued_retransmission_is_not_sent_once_its_procedure_ended() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let received = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r = received.clone();
+        let (amf, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |_req: SbiRequest| {
+                let r = r.clone();
+                async move {
+                    r.fetch_add(1, Ordering::SeqCst);
+                    SbiResponse::with_status(200)
+                }
+            })
+            .await;
+        // Every slot taken, as by sixteen sends to a slow AMF.
+        let slots = gsm_expiry_permits()
+            .clone()
+            .acquire_many_owned(16)
+            .await
+            .expect("the slots");
+        let refs = due_gsm_timers(
+            "n1145-stale",
+            1,
+            0,
+            &format!("http://127.0.0.1:{}", addr.port()),
+        );
+        run_gsm_timer_tick().await;
+        // The UE answered while the retransmission waited: the procedure is over.
+        assert!(cancel_gsm_timer(&refs[0], timer::SmfTimerId::T3592));
+        drop(slots);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        amf.stop().await.ok();
+        assert_eq!(
+            received.load(Ordering::SeqCst),
+            0,
+            "the stale retransmission is not sent"
+        );
+    }
+
+    /// #1145 review A, B, D: the graceful shutdown, last, starts the SM Policy
+    /// Association termination of a release still waiting on the UE (an armed T3592,
+    /// whose DELETE would otherwise start after the process), and counts a DELETE
+    /// that does not land within what is left.
+    ///
+    /// REVERT-VERIFIED: without the shutdown's pending-release terminations the PCF
+    /// sees no DELETE; without its drain nothing is counted.
+    #[tokio::test]
+    async fn the_shutdown_terminates_pending_release_policies_and_counts_the_unlanded() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        settle_sm_policy_deletes_for_test().await;
+        let deletes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let d = deletes.clone();
+        let (pcf, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let d = d.clone();
+                async move {
+                    d.lock().unwrap().push(req.header.uri.clone());
+                    // Never in time: the shutdown must count it.
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await;
+        std::env::set_var("PCF_URI", format!("http://127.0.0.1:{}", addr.port()));
+        // A release waiting on the UE: its T3592 armed, its policy association held.
+        let reference = seed_established_session(
+            "imsi-001010000011451",
+            5,
+            std::net::Ipv4Addr::new(10, 45, 11, 45),
+        );
+        if let Some(b) = smf_self()
+            .read()
+            .unwrap()
+            .policy_bindings
+            .write()
+            .unwrap()
+            .get_mut(&reference)
+        {
+            b.sm_policy_id = Some("pol-1145-pending".to_string());
+        }
+        if let Ok(mut timers) = gsm_procedure_timers().lock() {
+            timers.insert(
+                reference.clone(),
+                GsmProcedureTimer {
+                    timer_id: timer::SmfTimerId::T3592,
+                    command: vec![0x2e, 5, 0, 0xd3, 36],
+                    supi: "imsi-001010000011451".to_string(),
+                    psi: 5,
+                    amf_uri: None,
+                    attempts: 0,
+                    deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
+                },
+            );
+        }
+        let failures = SM_POLICY_DELETE_FAILURES.load(Ordering::SeqCst);
+        let listener = tokio::spawn(async {});
+        graceful_shutdown(
+            async {},
+            &[],
+            false,
+            listener,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+        )
+        .await;
+        let counted = SM_POLICY_DELETE_FAILURES.load(Ordering::SeqCst) - failures;
+        let seen = deletes.lock().unwrap().clone();
+        cancel_gsm_timer(&reference, timer::SmfTimerId::T3592);
+        std::env::remove_var("PCF_URI");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), pcf.stop()).await;
+        assert!(
+            seen.iter().any(|u| u.contains("pol-1145-pending")),
+            "the pending release's association is terminated: {seen:?}"
+        );
+        assert_eq!(counted, 1, "the DELETE that did not land is counted");
     }
 
     /// A loopback PCF that records every `/update` body and answers with the
