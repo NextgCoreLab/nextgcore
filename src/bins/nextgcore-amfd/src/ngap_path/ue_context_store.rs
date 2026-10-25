@@ -165,6 +165,11 @@ pub struct StoredUeContext {
     pub ue_security_capability: UeSecurityCapability,
     pub ue_network_capability: UeNetworkCapability,
     pub redcap_indication: bool,
+    /// #1222: the UDM marks the subscriber for MPS or MCX. Defaulted, so a record an
+    /// AMF without the field wrote still reads (it is then re-learnt from the next
+    /// am-data).
+    #[serde(default)]
+    pub priority_subscription: bool,
     pub slice_admission_granted: bool,
     pub racs_supported: bool,
     pub ue_radio_capability_id: Option<Vec<u8>>,
@@ -711,6 +716,7 @@ impl NgapServer {
             ue_security_capability: ue.ue_security_capability.clone(),
             ue_network_capability: ue.ue_network_capability.clone(),
             redcap_indication: ue.redcap_indication,
+            priority_subscription: ue.priority_subscription,
             slice_admission_granted: ue.slice_admission_granted,
             racs_supported: ue.racs_supported,
             ue_radio_capability_id: ue.ue_radio_capability_id.clone(),
@@ -1048,6 +1054,7 @@ fn restored_ue(amf_ue_ngap_id: u64, rec: &StoredUeContext) -> Option<UeNasContex
     ue.ue_security_capability = rec.ue_security_capability.clone();
     ue.ue_network_capability = rec.ue_network_capability.clone();
     ue.redcap_indication = rec.redcap_indication;
+    ue.priority_subscription = rec.priority_subscription;
     ue.slice_admission_granted = rec.slice_admission_granted;
     ue.racs_supported = rec.racs_supported;
     ue.ue_radio_capability_id = rec.ue_radio_capability_id.clone();

@@ -3810,6 +3810,15 @@ pub struct AmfUe {
     // ========================================================================
     /// RedCap (Reduced Capability) UE indication (TS 38.101)
     pub redcap_indication: bool,
+    /// #1222: the RRC Establishment Cause of the UE's current NAS signalling connection
+    /// is associated with priority services: `mps-PriorityAccess`, `mcs-PriorityAccess`
+    /// or `highPriorityAccess` (TS 38.413 §9.3.1.111). TS 24.501 Table 4.5.6.1 has a UE
+    /// with access identity 1, 2 or 11-15 use exactly these, i.e. a "UE configured for
+    /// high priority access". Rewritten by every INITIAL UE MESSAGE.
+    pub priority_access_cause: bool,
+    /// #1222: the UDM's AM data marks the subscriber for MPS (`mpsPriority`) or MCX
+    /// (`mcsPriority`) (TS 29.503 §6.1.6.2.4).
+    pub priority_subscription: bool,
     /// SNPN NID if UE is registering via SNPN
     pub snpn_nid: Option<String>,
     /// CAG (Closed Access Group) ID for SNPN
@@ -3956,6 +3965,8 @@ impl std::fmt::Debug for AmfUe {
         d.field("autn", &"<redacted>");
         d.field("unauthenticated_emergency", &self.unauthenticated_emergency);
         d.field("redcap_indication", &self.redcap_indication);
+        d.field("priority_access_cause", &self.priority_access_cause);
+        d.field("priority_subscription", &self.priority_subscription);
         d.field("snpn_nid", &self.snpn_nid);
         d.field("cag_id", &self.cag_id);
         d.field("slice_admission_granted", &self.slice_admission_granted);
@@ -4490,6 +4501,8 @@ impl AmfUe {
             // unauthenticated emergency one only where the AUSF-failure arm says so (#361).
             unauthenticated_emergency: false,
             redcap_indication: false,
+            priority_access_cause: false,
+            priority_subscription: false,
             snpn_nid: None,
             cag_id: None,
             // Default deny: slice admission is granted only by an explicit
