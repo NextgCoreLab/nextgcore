@@ -29003,7 +29003,15 @@ mod tests {
             )),
             "the SMF's cause, not ho-failure-in-target"
         );
+        assert_eq!(
+            server.handover_refused_transfers.get(&ue),
+            Some(&vec![(3, smf_refusal_transfer_for("refuse-3"))])
+        );
         server.forget_handover_preparation(ue);
+        assert!(
+            !server.handover_refused_transfers.contains_key(&ue),
+            "a preparation that ends forgets its refusals"
+        );
     }
 
     /// **#1171.** When the SMFs refuse every listed session, the HANDOVER PREPARATION
