@@ -2293,3 +2293,204 @@ fn an_s1_release_procedure_sends_one_release_access_bearers_request() {
     assert_eq!(again, 0, "no second Release Access Bearers Request");
     release(&ue);
 }
+
+/// An Update Bearer Request on S11 (TS 29.274 Table 7.2.15-1) for EBI `ebi`: the
+/// APN-AMBR `ambr_kbps` (UL, DL), and a Bearer Context with the TFT and, when `gbr`
+/// is given, a Bearer QoS of QCI 1 at that GBR (kbit/s, MBR twice it).
+fn ubr(teid: u32, seq: u32, ebi: u8, ambr_kbps: (u32, u32), gbr: Option<u64>) -> Vec<u8> {
+    use nextgcore_gtp::v2::{Gtp2BearerQosIe, Gtp2Ie};
+    let mut m = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(97, teid, seq));
+    let mut ambr = ambr_kbps.0.to_be_bytes().to_vec();
+    ambr.extend_from_slice(&ambr_kbps.1.to_be_bytes());
+    m.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Ambr as u8, 0, &ambr));
+    let mut bc = Gtp2BearerContextIe::new();
+    bc.set_ebi(ebi);
+    bc.add_ie(Gtp2Ie::from_slice(
+        Gtp2IeType::BearerTft as u8,
+        0,
+        &[0x61, 0x33, 0x00, 0x02, 0x30, 0x06],
+    ));
+    if let Some(g) = gbr {
+        let mut qos = Gtp2BearerQosIe::new(1, g * 2, g * 2, g, g);
+        qos.pl = 2;
+        bc.set_bearer_qos(&qos);
+    }
+    m.add_bearer_context(0, &bc);
+    m.encode().to_vec()
+}
+
+/// (E-RAB ID, NAS-PDU, UE-AMBR present) of each item of an E-RAB MODIFY REQUEST.
+fn erab_modify(pdu: &g::S1AP_PDU) -> Option<(Vec<(u8, Vec<u8>)>, bool)> {
+    let g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+        value: g::InitiatingMessageValue::Id_E_RABModify(req),
+        ..
+    }) = pdu
+    else {
+        return None;
+    };
+    use g::E_RABModifyRequestProtocolIEs_EntryValue as V;
+    let mut items = Vec::new();
+    let mut ambr = false;
+    for ie in &req.protocol_i_es.0 {
+        match &ie.value {
+            V::Id_E_RABToBeModifiedListBearerModReq(l) => {
+                for e in &l.0 {
+                    let g::E_RABToBeModifiedListBearerModReq_EntryValue::Id_E_RABToBeModifiedItemBearerModReq(
+                        item,
+                    ) = &e.value;
+                    items.push((item.e_rab_id.0, item.nas_pdu.0.clone()));
+                }
+            }
+            V::Id_uEaggregateMaximumBitrate(_) => ambr = true,
+            _ => {}
+        }
+    }
+    Some((items, ambr))
+}
+
+/// The NAS-PDU of a DOWNLINK NAS TRANSPORT.
+fn downlink_nas(pdu: &g::S1AP_PDU) -> Option<Vec<u8>> {
+    let g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+        value: g::InitiatingMessageValue::Id_downlinkNASTransport(dl),
+        ..
+    }) = pdu
+    else {
+        return None;
+    };
+    dl.protocol_i_es.0.iter().find_map(|ie| match &ie.value {
+        g::DownlinkNASTransportProtocolIEs_EntryValue::Id_NAS_PDU(nas) => Some(nas.0.clone()),
+        _ => None,
+    })
+}
+
+/// (Cause, [(EBI, cause)]) of an Update Bearer Response.
+fn update_bearer_response(sgw: &UdpSocket, seq: u32) -> (u8, Vec<(u8, u8)>) {
+    let (rsp, _) = recv(sgw, 98);
+    assert_eq!(rsp.header.sequence_number, seq);
+    assert_eq!(rsp.header.teid, Some(SGW_S11_TEID));
+    let cause = Gtp2CauseIe::decode(&rsp.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value)
+        .unwrap()
+        .cause;
+    let bcs = rsp
+        .get_ies(Gtp2IeType::BearerContext as u8)
+        .into_iter()
+        .map(|ie| {
+            let bc = Gtp2BearerContextIe::decode(&ie.value).unwrap();
+            (bc.ebi().unwrap(), bc.cause().unwrap().unwrap().cause)
+        })
+        .collect();
+    (cause, bcs)
+}
+
+/// #641 Update Bearer half, TS 23.401 §5.4.2.1 / TS 24.301 §6.4.3: a new Bearer QoS,
+/// TFT and APN-AMBR for dedicated bearer 6 go to the eNB as an E-RAB MODIFY REQUEST
+/// carrying MODIFY EPS BEARER CONTEXT REQUEST (New EPS QoS, TFT, APN-AMBR) and the new
+/// UE-AMBR (the #869 review). The answer waits for both the E-RAB MODIFY RESPONSE and
+/// the UE's ACCEPT; then the bearer, and the PDN connection's APN-AMBR, are updated.
+#[test]
+fn an_update_bearer_request_modifies_the_bearer_at_the_enb_and_the_ue() {
+    let _guard = lock_s11();
+    crate::bearer_modification::clear_for_test();
+    let (sgw, route) = sgw(Gtp2XactConfig::default());
+    let ue = seed(0x0651, &[5, 6]);
+    let ctx = mme_self();
+    {
+        let mut pool = ctx.sess_pool.write().unwrap();
+        let s = pool.get_mut(&ue.sess_id).unwrap();
+        s.ambr.uplink = 10_000_000;
+        s.ambr.downlink = 10_000_000;
+    }
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    sgw.send_to(
+        &ubr(ue.local_teid, 0x0651, 6, (20_000, 30_000), Some(96)),
+        route.server.local_addr(),
+    )
+    .unwrap();
+    let (items, ue_ambr) = wait_pdu(ue.enb_id, erab_modify);
+    assert!(
+        ue_ambr,
+        "the UE-AMBR moves with the APN-AMBR (TS 23.401 §4.7.3)"
+    );
+    assert_eq!(items.len(), 1);
+    let (erab, nas) = &items[0];
+    assert_eq!(*erab, 6);
+    // Protected: 6 octets of security header, then EBI 6 | PD, PTI 0, 0xC9.
+    assert_eq!(&nas[6..9], &[0x62, 0x00, 0xc9]);
+    let esm = &nas[9..];
+    // New EPS QoS (IEI 0x5B): QCI 1, MBR 192 kbit/s (0x50), GBR 96 kbit/s (0x44).
+    assert!(esm
+        .windows(7)
+        .any(|w| w == [0x5b, 5, 1, 0x50, 0x50, 0x44, 0x44]));
+    assert!(esm.windows(3).any(|w| w == [0x36, 6, 0x61]), "the TFT");
+    assert!(esm.contains(&0x5e), "the APN-AMBR");
+    assert!(quiet(&sgw), "no answer before the eNB and the UE");
+
+    // The UE's ACCEPT first: the answer still waits for the eNB.
+    ue_esm(&ue, 6, &[0xca]);
+    assert!(quiet(&sgw), "still waiting for the E-RAB MODIFY RESPONSE");
+    let enb_ue = ctx.enb_ue_find_by_id(ue.enb_ue_id).unwrap();
+    crate::s1ap_handler::handle_erab_modify_response(
+        ctx,
+        ue.enb_id,
+        &nextgcore_s1ap::ErabModifyResponse {
+            mme_ue_s1ap_id: enb_ue.mme_ue_s1ap_id,
+            enb_ue_s1ap_id: enb_ue.enb_ue_s1ap_id,
+            erab_modify_list: vec![6],
+            erab_failed_list: vec![],
+        },
+    );
+    let (cause, bcs) = update_bearer_response(&sgw, 0x0651);
+    assert_eq!((cause, bcs), (16, vec![(6, 16)]));
+    let b6 = ctx
+        .bearer_find_by_ebi(ue.mme_ue_id, 6)
+        .and_then(|id| ctx.bearer_find_by_id(id))
+        .unwrap();
+    assert_eq!((b6.qos.qci, b6.qos.gbr.downlink), (1, 96_000));
+    assert_eq!(b6.tft, vec![0x61, 0x33, 0x00, 0x02, 0x30, 0x06]);
+    let s = ctx.sess_find_by_id(ue.sess_id).unwrap();
+    assert_eq!((s.ambr.uplink, s.ambr.downlink), (20_000_000, 30_000_000));
+    assert_eq!(crate::bearer_modification::pending_count(), 0);
+    release(&ue);
+}
+
+/// #641: a TFT-only change goes in DOWNLINK NAS TRANSPORT (no E-RAB MODIFY: the radio
+/// bearer's QoS is unchanged). The UE refuses: "UE refuses", and the bearer keeps its
+/// TFT. An EBI the UE does not hold is "Context not found".
+#[test]
+fn an_update_bearer_request_the_ue_rejects_changes_nothing() {
+    let _guard = lock_s11();
+    crate::bearer_modification::clear_for_test();
+    let (sgw, route) = sgw(Gtp2XactConfig::default());
+    let ue = seed(0x0652, &[5, 6]);
+    let ctx = mme_self();
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    sgw.send_to(
+        &ubr(ue.local_teid, 0x0652, 6, (20_000, 20_000), None),
+        route.server.local_addr(),
+    )
+    .unwrap();
+    let nas = wait_pdu(ue.enb_id, downlink_nas);
+    assert_eq!(&nas[6..9], &[0x62, 0x00, 0xc9]);
+    ue_esm(&ue, 6, &[0xcb, 44]);
+    let (cause, bcs) = update_bearer_response(&sgw, 0x0652);
+    assert_eq!((cause, bcs), (88, vec![(6, 88)]));
+    let b6 = ctx
+        .bearer_find_by_ebi(ue.mme_ue_id, 6)
+        .and_then(|id| ctx.bearer_find_by_id(id))
+        .unwrap();
+    assert!(b6.tft.is_empty(), "unchanged");
+    assert_eq!(
+        ctx.sess_find_by_id(ue.sess_id).unwrap().ambr.uplink,
+        0,
+        "nor the APN-AMBR"
+    );
+
+    sgw.send_to(
+        &ubr(ue.local_teid, 0x0653, 9, (0, 0), None),
+        route.server.local_addr(),
+    )
+    .unwrap();
+    let (cause, bcs) = update_bearer_response(&sgw, 0x0653);
+    assert_eq!((cause, bcs), (64, vec![(9, 64)]));
+    release(&ue);
+}

@@ -552,8 +552,10 @@ fn handle_s1ap_message_inner(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<
             crate::s1ap_gen::PROC_E_RAB_MODIFY => {
                 match crate::s1ap_gen::decode_erab_modify_response(data) {
                     ResponseDecode::Decoded { msg, notify } => {
+                        let out = report(msg.mme_ue_s1ap_id, msg.enb_ue_s1ap_id, &notify);
+                        handle_erab_modify_response(ctx, enb_id, &msg);
                         log_erab_failures(enb_id, &msg.erab_failed_list);
-                        return report(msg.mme_ue_s1ap_id, msg.enb_ue_s1ap_id, &notify);
+                        return out;
                     }
                     ResponseDecode::Failed(ies) => return failed(ies),
                     ResponseDecode::Undecodable => {}
@@ -1283,6 +1285,7 @@ fn handle_s1ap_message_inner(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<
             Vec::new()
         }
         S1apMessage::ErabModifyResponse(msg) => {
+            handle_erab_modify_response(ctx, enb_id, &msg);
             log_erab_failures(enb_id, &msg.erab_failed_list);
             Vec::new()
         }
@@ -5118,6 +5121,7 @@ fn service_request_context_set_up(
     crate::bearer_deactivation::on_connected(ctx, mme_ue_id);
     // #641: activations parked while the UE was ECM-IDLE are signalled now.
     crate::bearer_activation::on_connected(ctx, mme_ue_id);
+    crate::bearer_modification::on_connected(ctx, mme_ue_id);
 }
 
 pub(crate) fn handle_erab_setup_response(
@@ -5149,6 +5153,29 @@ pub(crate) fn handle_erab_setup_response(
     let set_up: Vec<u8> = erab_setup_list.iter().map(|i| i.erab_id).collect();
     let failed: Vec<u8> = erab_failed_list.iter().map(|i| i.erab_id).collect();
     crate::bearer_activation::on_erab_setup(ctx, enb_ue.mme_ue_id, &set_up, &failed);
+}
+
+/// #641, TS 23.401 §5.4.2.1 step 5: the E-RAB half of a bearer modification.
+pub(crate) fn handle_erab_modify_response(
+    ctx: &MmeContext,
+    enb_id: u64,
+    msg: &nextgcore_s1ap::ErabModifyResponse,
+) {
+    let Some(enb_ue_id) =
+        ue_associated_target_or_answer(ctx, enb_id, msg.mme_ue_s1ap_id, msg.enb_ue_s1ap_id)
+    else {
+        return;
+    };
+    let Some(enb_ue) = ctx.enb_ue_find_by_id(enb_ue_id) else {
+        return;
+    };
+    let failed: Vec<u8> = msg.erab_failed_list.iter().map(|i| i.erab_id).collect();
+    crate::bearer_modification::on_erab_modify(
+        ctx,
+        enb_ue.mme_ue_id,
+        &msg.erab_modify_list,
+        &failed,
+    );
 }
 
 fn log_erab_failures(enb_id: u64, failures: &[nextgcore_s1ap::ErabFailedItem]) {

@@ -1075,6 +1075,10 @@ pub fn dispatch_initial(raw: &[u8], msg_type: u8, sequence_number: u32, peer: So
         mt::CREATE_BEARER_REQUEST => {
             crate::bearer_activation::handle_create_bearer_request(raw, sequence_number, peer)
         }
+        // #641: TS 23.401 §5.4.2.1, PDN GW initiated bearer modification.
+        mt::UPDATE_BEARER_REQUEST => {
+            crate::bearer_modification::handle_update_bearer_request(raw, sequence_number, peer)
+        }
         other => log::info!(
             "S11 initial message type={other} seq={sequence_number} from {peer} not handled: this \
              MME originates no procedure for it"
@@ -1327,6 +1331,7 @@ fn handle_delete_bearer_request(raw: &[u8], sequence_number: u32, peer: SocketAd
                 // its PDN connection is deleted locally and its request answered.
                 crate::bearer_deactivation::settle_all_for_ue(ctx, mme_ue_id, "the UE is detached");
                 crate::bearer_activation::settle_all_for_ue(ctx, mme_ue_id);
+                crate::bearer_modification::settle_all_for_ue(ctx, mme_ue_id);
                 crate::network_detach::mme_initiated_detach(
                     ctx,
                     mme_ue_id,

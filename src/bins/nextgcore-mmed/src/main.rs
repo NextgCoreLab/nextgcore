@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 pub mod bearer_activation;
 pub mod bearer_deactivation;
+pub mod bearer_modification;
 pub mod config;
 pub mod context;
 pub mod emm_build;

@@ -697,6 +697,26 @@ pub fn build_modify_bearer_context_request_with_params(
     buf.into_vec()
 }
 
+/// MODIFY EPS BEARER CONTEXT REQUEST (TS 24.301 §8.3.18) with the New EPS QoS, the TFT
+/// and the APN-AMBR (`(downlink, uplink)` kbit/s, IEI 0x5E) as they change (#641).
+pub fn build_modify_bearer_context_request_full(
+    bearer: &MmeBearer,
+    pti: u8,
+    qos_presence: bool,
+    tft_presence: bool,
+    apn_ambr_kbps: Option<(u64, u64)>,
+) -> Vec<u8> {
+    let mut msg =
+        build_modify_bearer_context_request_with_params(bearer, pti, qos_presence, tft_presence);
+    if let Some((dl, ul)) = apn_ambr_kbps {
+        msg.push(0x5e);
+        let ambr = apn_ambr_build(dl, ul);
+        msg.push(ambr.len() as u8);
+        msg.extend_from_slice(&ambr);
+    }
+    msg
+}
+
 /// Build modify bearer context request (simplified - for nas_path.rs)
 pub fn build_modify_bearer_context_request(
     bearer: &MmeBearer,
