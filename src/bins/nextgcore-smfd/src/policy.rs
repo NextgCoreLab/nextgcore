@@ -460,8 +460,9 @@ pub(crate) fn split_host_port(uri: &str) -> Option<(String, u16)> {
 // Nnsacf_NSAC PDU-session admission (TS 29.536 §5.3 / §6.1.3.2)
 // ---------------------------------------------------------------------------
 
-/// Resolved NSACF endpoint.
-#[derive(Debug, Clone)]
+/// Resolved NSACF endpoint. Serialisable: the NSACF that admitted a PDU session is
+/// recorded on its policy binding, and the durable snapshot (#1164 follow-up).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NsacfEndpoint {
     pub host: String,
     pub port: u16,
@@ -493,7 +494,25 @@ impl NsacfEndpoint {
 /// one whose profile serves it. TS 29.510 §6.1.6.2.2 NFProfile `sNssais`: "If not
 /// provided, the NF can serve any S-NSSAI". The first instance was taken before,
 /// whatever slice the INCREASE or DECREASE was for.
-pub async fn resolve_nsacf_endpoint(sst: u8, sd: Option<&str>) -> Option<NsacfEndpoint> {
+///
+/// #1164 follow-up:
+/// - `plmn` is the serving PLMN `(mcc, mnc)`: a profile's `perPlmnSnssaiList` counts
+///   only that PLMN's entry (TS 29.510 §6.1.6.2.2). `None` (not known) reads every one.
+/// - The `nnsacf-nsac` service's own `sNssais` / `perPlmnSnssaiList` narrow the
+///   profile's (TS 29.510 §6.1.6.2.3 NFService).
+/// - An instance whose endpoint cannot be read is skipped for the next one, rather
+///   than ending the resolution.
+/// - An SD that is not 6 hex digits (TS 29.571 §5.4.4.2 Snssai `sd`) is neither asked
+///   for nor cached.
+pub async fn resolve_nsacf_endpoint(
+    sst: u8,
+    sd: Option<&str>,
+    plmn: Option<(&str, &str)>,
+) -> Option<NsacfEndpoint> {
+    if let Some(sd) = sd.filter(|sd| !valid_sd(sd)) {
+        log::warn!("NSACF resolution: S-NSSAI SD {sd:?} is not 6 hex digits; not resolved");
+        return None;
+    }
     if let Ok(uri) = std::env::var("NSACF_URI") {
         if let Some((host, port)) = split_host_port(&uri) {
             return Some(NsacfEndpoint { host, port });
@@ -507,7 +526,7 @@ pub async fn resolve_nsacf_endpoint(sst: u8, sd: Option<&str>) -> Option<NsacfEn
     let nrf_uri = nextgcore_sbi::context::global_context()
         .get_nrf_uri()
         .await?;
-    let key = nsacf_cache_key(&nrf_uri, sst, sd);
+    let key = nsacf_cache_key(&nrf_uri, sst, sd, plmn);
     if let Some(cached) = cached_nsacf(&key) {
         return Some(cached);
     }
@@ -533,39 +552,18 @@ pub async fn resolve_nsacf_endpoint(sst: u8, sd: Option<&str>) -> Option<NsacfEn
         return None;
     }
     let body: serde_json::Value = serde_json::from_str(resp.http.content.as_deref()?).ok()?;
-    let Some(inst) = body
+    let Some(endpoint) = body
         .get("nfInstances")?
         .as_array()?
         .iter()
-        .find(|inst| profile_serves_snssai(inst, sst, sd))
+        .find_map(|inst| nsacf_serving(inst, plmn, sst, sd))
     else {
         log::warn!(
-            "NRF named no NSACF serving S-NSSAI[SST:{sst} SD:{sd:?}]; slice admission \
-             control is skipped for it"
+            "NRF named no reachable NSACF serving S-NSSAI[SST:{sst} SD:{sd:?}]; slice \
+             admission control is skipped for it"
         );
         return None;
     };
-    let host = inst
-        .get("ipv4Addresses")
-        .and_then(|a| a.as_array())
-        .and_then(|a| a.first())
-        .and_then(|v| v.as_str())?
-        .to_string();
-    let port = inst
-        .get("nfServices")
-        .and_then(|s| s.as_array())
-        .and_then(|svcs| {
-            svcs.iter()
-                .find(|s| s.get("serviceName").and_then(|n| n.as_str()) == Some("nnsacf-nsac"))
-        })
-        .and_then(|s| s.get("ipEndPoints"))
-        .and_then(|e| e.as_array())
-        .and_then(|e| e.first())
-        .and_then(|e| e.get("port"))
-        .and_then(|p| p.as_u64())
-        .map(|p| p as u16)
-        .unwrap_or(7813);
-    let endpoint = NsacfEndpoint { host, port };
     // TS 29.510 §6.2.6.2.2 SearchResult.validityPeriod, in seconds; without one, a
     // short default rather than for ever.
     let validity = body
@@ -578,26 +576,105 @@ pub async fn resolve_nsacf_endpoint(sst: u8, sd: Option<&str>) -> Option<NsacfEn
     Some(endpoint)
 }
 
-/// The discovery cache key (#1164): the NRF and the S-NSSAI, SD lower-cased.
-fn nsacf_cache_key(nrf_uri: &str, sst: u8, sd: Option<&str>) -> String {
+/// The discovery cache key (#1164): the NRF, the S-NSSAI (SD lower-cased, and
+/// validated before it gets here) and the serving PLMN.
+fn nsacf_cache_key(nrf_uri: &str, sst: u8, sd: Option<&str>, plmn: Option<(&str, &str)>) -> String {
     format!(
-        "{nrf_uri}|{sst}|{}",
-        sd.map(str::to_ascii_lowercase).unwrap_or_default()
+        "{nrf_uri}|{sst}|{}|{}",
+        sd.map(str::to_ascii_lowercase).unwrap_or_default(),
+        plmn.map(|(mcc, mnc)| format!("{mcc}-{mnc}"))
+            .unwrap_or_default()
     )
 }
 
-/// Whether an NF profile serves S-NSSAI `(sst, sd)` (TS 29.510 §6.1.6.2.2). Its
-/// `perPlmnSnssaiList`, when present, overrides `sNssais` (any of its PLMNs counts
-/// here); with neither, "the NF can serve any S-NSSAI". An ExtSnssai entry (TS
+/// TS 29.571 §5.4.4.2 Snssai `sd`: `^[A-Fa-f0-9]{6}$` (#1164 follow-up).
+pub fn valid_sd(sd: &str) -> bool {
+    sd.len() == 6 && sd.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The endpoint of an NSACF instance from the NRF, when it serves S-NSSAI `(sst, sd)`
+/// in `plmn` and its endpoint can be read (#1164 follow-up): its profile serves the
+/// slice, and so does its `nnsacf-nsac` service when that lists slices of its own (TS
+/// 29.510 §6.1.6.2.3). The host is the service's `ipEndPoints` IPv4 address, then the
+/// profile's `ipv4Addresses`, then the service's or the profile's `fqdn`; the port the
+/// service's, 7813 by default.
+fn nsacf_serving(
+    inst: &serde_json::Value,
+    plmn: Option<(&str, &str)>,
+    sst: u8,
+    sd: Option<&str>,
+) -> Option<NsacfEndpoint> {
+    if !profile_serves_snssai(inst, plmn, sst, sd) {
+        return None;
+    }
+    let service = inst
+        .get("nfServices")
+        .and_then(|s| s.as_array())
+        .and_then(|svcs| {
+            svcs.iter()
+                .find(|s| s.get("serviceName").and_then(|n| n.as_str()) == Some("nnsacf-nsac"))
+        });
+    if service.is_some_and(|svc| !profile_serves_snssai(svc, plmn, sst, sd)) {
+        return None;
+    }
+    let ip_endpoint = service
+        .and_then(|s| s.get("ipEndPoints"))
+        .and_then(|e| e.as_array())
+        .and_then(|e| e.first());
+    let str_of = |v: Option<&serde_json::Value>| {
+        v.and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let host = str_of(ip_endpoint.and_then(|e| e.get("ipv4Address")))
+        .or_else(|| {
+            str_of(
+                inst.get("ipv4Addresses")
+                    .and_then(|a| a.as_array())
+                    .and_then(|a| a.first()),
+            )
+        })
+        .or_else(|| str_of(service.and_then(|s| s.get("fqdn"))))
+        .or_else(|| str_of(inst.get("fqdn")));
+    let Some(host) = host else {
+        log::debug!(
+            "NSACF instance {:?} names no IPv4 address or FQDN; trying the next",
+            inst.get("nfInstanceId")
+        );
+        return None;
+    };
+    let port = ip_endpoint
+        .and_then(|e| e.get("port"))
+        .and_then(|p| p.as_u64())
+        .and_then(|p| u16::try_from(p).ok())
+        .unwrap_or(7813);
+    Some(NsacfEndpoint { host, port })
+}
+
+/// Whether an NF profile, or an NF service (TS 29.510 §6.1.6.2.2, §6.1.6.2.3), serves
+/// S-NSSAI `(sst, sd)`. Its `perPlmnSnssaiList`, when present, overrides `sNssais`:
+/// only the serving PLMN's entry counts (#1164 follow-up), every one when `plmn` is
+/// not known. With neither, "the NF can serve any S-NSSAI". An ExtSnssai entry (TS
 /// 29.571 §5.4.5.1) serves it with the same SST and the same SD (none with none), or
 /// any SD when `wildcardSd` is set, or an SD inside one of its `sdRanges`.
-fn profile_serves_snssai(profile: &serde_json::Value, sst: u8, sd: Option<&str>) -> bool {
+fn profile_serves_snssai(
+    profile: &serde_json::Value,
+    plmn: Option<(&str, &str)>,
+    sst: u8,
+    sd: Option<&str>,
+) -> bool {
+    let in_plmn = |p: &serde_json::Value| {
+        plmn.is_none_or(|(mcc, mnc)| {
+            p["plmnId"]["mcc"].as_str() == Some(mcc) && p["plmnId"]["mnc"].as_str() == Some(mnc)
+        })
+    };
     let per_plmn: Option<Vec<&serde_json::Value>> = profile
         .get("perPlmnSnssaiList")
         .and_then(|v| v.as_array())
         .map(|plmns| {
             plmns
                 .iter()
+                .filter(|p| in_plmn(p))
                 .filter_map(|p| p.get("sNssaiList").and_then(|l| l.as_array()))
                 .flatten()
                 .collect()
@@ -1782,28 +1859,28 @@ mod tests {
         use serde_json::json;
         let any = json!({});
         assert!(
-            profile_serves_snssai(&any, 7, Some("abcdef")),
+            profile_serves_snssai(&any, None, 7, Some("abcdef")),
             "no list: any S-NSSAI"
         );
         let listed = json!({ "sNssais": [{ "sst": 1 }, { "sst": 2, "sd": "00000A" }] });
-        assert!(profile_serves_snssai(&listed, 1, None));
+        assert!(profile_serves_snssai(&listed, None, 1, None));
         assert!(
-            !profile_serves_snssai(&listed, 1, Some("000001")),
+            !profile_serves_snssai(&listed, None, 1, Some("000001")),
             "SD differs"
         );
         assert!(
-            profile_serves_snssai(&listed, 2, Some("00000a")),
+            profile_serves_snssai(&listed, None, 2, Some("00000a")),
             "SD case-insensitive"
         );
-        assert!(!profile_serves_snssai(&listed, 3, None));
+        assert!(!profile_serves_snssai(&listed, None, 3, None));
         let wildcard = json!({ "sNssais": [{ "sst": 1, "sd": "000001", "wildcardSd": true }] });
-        assert!(profile_serves_snssai(&wildcard, 1, Some("123456")));
+        assert!(profile_serves_snssai(&wildcard, None, 1, Some("123456")));
         let ranged = json!({ "sNssais": [{
             "sst": 1, "sd": "000010",
             "sdRanges": [{ "start": "000010", "end": "00001f" }],
         }] });
-        assert!(profile_serves_snssai(&ranged, 1, Some("00001A")));
-        assert!(!profile_serves_snssai(&ranged, 1, Some("000020")));
+        assert!(profile_serves_snssai(&ranged, None, 1, Some("00001A")));
+        assert!(!profile_serves_snssai(&ranged, None, 1, Some("000020")));
         let per_plmn = json!({
             "sNssais": [{ "sst": 1 }],
             "perPlmnSnssaiList": [{
@@ -1812,10 +1889,81 @@ mod tests {
             }],
         });
         assert!(
-            profile_serves_snssai(&per_plmn, 2, None),
+            profile_serves_snssai(&per_plmn, None, 2, None),
             "perPlmnSnssaiList overrides"
         );
-        assert!(!profile_serves_snssai(&per_plmn, 1, None));
+        assert!(!profile_serves_snssai(&per_plmn, None, 1, None));
+    }
+
+    /// #1164 follow-up, TS 29.510 §6.1.6.2.2: a `perPlmnSnssaiList` counts only the
+    /// serving PLMN's entry. Another PLMN's slice is not served here.
+    #[test]
+    fn a_per_plmn_list_counts_only_the_serving_plmn() {
+        let profile = serde_json::json!({
+            "perPlmnSnssaiList": [
+                { "plmnId": { "mcc": "001", "mnc": "01" }, "sNssaiList": [{ "sst": 1 }] },
+                { "plmnId": { "mcc": "999", "mnc": "70" }, "sNssaiList": [{ "sst": 2 }] },
+            ],
+        });
+        let home = Some(("001", "01"));
+        assert!(profile_serves_snssai(&profile, home, 1, None));
+        assert!(
+            !profile_serves_snssai(&profile, home, 2, None),
+            "served only in 999-70"
+        );
+        assert!(profile_serves_snssai(
+            &profile,
+            Some(("999", "70")),
+            2,
+            None
+        ));
+    }
+
+    /// #1164 follow-up, TS 29.510 §6.1.6.2.3: the `nnsacf-nsac` service's own slice list
+    /// narrows the profile's; an instance whose endpoint cannot be read is skipped,
+    /// and an FQDN-only one is reached by its FQDN.
+    #[test]
+    fn an_nsacf_instance_is_taken_by_its_service_slices_and_a_readable_endpoint() {
+        use serde_json::json;
+        let svc = |snssais: serde_json::Value| {
+            json!([{ "serviceName": "nnsacf-nsac", "sNssais": snssais,
+                     "ipEndPoints": [{ "ipv4Address": "10.0.0.5", "port": 8805 }] }])
+        };
+        let narrowed = json!({ "sNssais": [{ "sst": 1 }, { "sst": 2 }],
+                               "nfServices": svc(json!([{ "sst": 2 }])) });
+        assert!(
+            nsacf_serving(&narrowed, None, 1, None).is_none(),
+            "the service serves 2 only"
+        );
+        assert_eq!(
+            nsacf_serving(&narrowed, None, 2, None),
+            Some(NsacfEndpoint {
+                host: "10.0.0.5".into(),
+                port: 8805
+            })
+        );
+        let nameless = json!({ "nfInstanceId": "a" });
+        assert!(nsacf_serving(&nameless, None, 1, None).is_none());
+        let fqdn =
+            json!({ "fqdn": "nsacf.example", "nfServices": [{ "serviceName": "nnsacf-nsac" }] });
+        assert_eq!(
+            nsacf_serving(&fqdn, None, 1, None),
+            Some(NsacfEndpoint {
+                host: "nsacf.example".into(),
+                port: 7813
+            })
+        );
+        let found = [nameless, fqdn]
+            .iter()
+            .find_map(|i| nsacf_serving(i, None, 1, None));
+        assert_eq!(found.map(|e| e.host), Some("nsacf.example".to_string()));
+    }
+
+    /// #1164 follow-up, TS 29.571 §5.4.4.2: an SD is 6 hex digits.
+    #[test]
+    fn an_sd_is_six_hex_digits() {
+        assert!(valid_sd("00000a") && valid_sd("ABCDEF"));
+        assert!(!valid_sd("") && !valid_sd("00000") && !valid_sd("0000000") && !valid_sd("00000g"));
     }
 
     // ------------------------- N1 SM codec ------------------------------
