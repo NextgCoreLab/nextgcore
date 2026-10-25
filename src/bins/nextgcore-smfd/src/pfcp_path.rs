@@ -2019,6 +2019,52 @@ pub(crate) static TEARDOWN_HOLD_FOR_TEST: std::sync::Mutex<
     Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 > = std::sync::Mutex::new(None);
 
+/// An armed [`TEARDOWN_HOLD_FOR_TEST`] (#1239 review). Dropping it, on any exit path
+/// and a failed assertion included, disarms the hold and releases a teardown that
+/// waits in it. A leaked hold would otherwise block every later teardown in the
+/// process, so the suite would hang instead of failing.
+#[cfg(test)]
+pub(crate) struct TeardownHold {
+    pub(crate) reached: Arc<tokio::sync::Notify>,
+    proceed: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+impl TeardownHold {
+    /// Arm the hold: the next teardown signals `reached` and waits for [`Self::release`].
+    pub(crate) fn arm() -> Self {
+        let hold = Self {
+            reached: Arc::new(tokio::sync::Notify::new()),
+            proceed: Arc::new(tokio::sync::Notify::new()),
+        };
+        *TEARDOWN_HOLD_FOR_TEST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) =
+            Some((hold.reached.clone(), hold.proceed.clone()));
+        hold
+    }
+
+    /// Stop holding later teardowns; one already waiting stays held.
+    pub(crate) fn disarm(&self) {
+        *TEARDOWN_HOLD_FOR_TEST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Let the held teardown go on.
+    pub(crate) fn release(&self) {
+        self.proceed.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for TeardownHold {
+    fn drop(&mut self) {
+        self.disarm();
+        self.release();
+    }
+}
+
 /// Where a peer Recovery Time Stamp came from (#928 round 2, B1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StampSource {

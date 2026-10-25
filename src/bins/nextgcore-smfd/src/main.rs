@@ -11966,25 +11966,23 @@ mod tests {
 
         // Inside the teardown, before the clear: the stored stamp is the new one.
         rebaseline().await;
-        let (reached, proceed) = (
-            Arc::new(tokio::sync::Notify::new()),
-            Arc::new(tokio::sync::Notify::new()),
-        );
-        *pfcp_path::TEARDOWN_HOLD_FOR_TEST.lock().unwrap() =
-            Some((reached.clone(), proceed.clone()));
+        // #1239 review: released on every exit path, a failed assertion included.
+        let hold = pfcp_path::TeardownHold::arm();
         let before = teardowns();
         let first = {
             let a = fx.a.clone();
             tokio::spawn(async move { a.check_peer_restart(900).await })
         };
-        tokio::time::timeout(Duration::from_secs(5), reached.notified())
+        let reached = tokio::time::timeout(Duration::from_secs(5), hold.reached.notified())
             .await
-            .expect("the first detector tears down");
-        *pfcp_path::TEARDOWN_HOLD_FOR_TEST.lock().unwrap() = None;
+            .is_ok();
+        hold.disarm();
+        assert!(reached, "the first detector reaches its teardown");
         fx.a.check_peer_restart(900).await;
         let inside = teardowns() - before;
-        proceed.notify_one();
+        hold.release();
         first.await.unwrap();
+        drop(hold);
         assert_eq!(
             inside, 1,
             "the second detector, inside the teardown, does not tear down"
