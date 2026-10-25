@@ -13,6 +13,12 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 ## [Unreleased]
 
 ### Changed
+- smfd (PGW-C) codes EPS bearer rates in kbit/s on S5/S8 and holds them in bit/s, as N4 and N2
+  read them (TS 29.274 §8.15, §8.16). The Create Session Request's Bearer QoS and a Bearer
+  Resource Command's Flow QoS on an existing bearer were stored unconverted, so their MBR/GBR
+  reached the PGW-U QER and the EPS→5GS mapping 1000 times too low. The Create Session Response
+  and the Update Bearer Request sent the stored bit/s values as kbit/s, so the values seen on
+  the wire change. A rate is rounded up to whole kbit/s and capped at the 5-octet field (#1165).
 - smfd's N1N2MessageTransfer for a network-triggered Service Request (buffered downlink data)
   now carries the session's PDUSessionResourceSetupRequestTransfer, as an
   `application/vnd.3gpp.ngap` part that `ngapData` references. It includes the UPF N3 tunnel,
