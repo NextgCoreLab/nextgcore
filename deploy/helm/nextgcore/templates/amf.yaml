@@ -37,6 +37,9 @@ spec:
     spec:
       initContainers:
         {{- include "nextgcore.waitForNrf" . | nindent 8 }}
+        {{- if .Values.amf.ueContextStore.enabled }}
+        {{- include "nextgcore.waitForMongo" . | nindent 8 }}
+        {{- end }}
       containers:
         - name: amf
           image: {{ include "nextgcore.image" (dict "global" .Values.global "nf" .Values.amf) }}
@@ -107,6 +110,11 @@ spec:
               value: {{ .Release.Name }}-ausf.{{ .Release.Namespace }}.svc.cluster.local
             - name: AUSF_SBI_PORT
               value: "{{ .Values.ausf.service.port }}"
+            {{- if .Values.amf.ueContextStore.enabled }}
+            # #686: the UE context store; see amf.ueContextStore in values.yaml.
+            - name: AMF_UE_CONTEXT_DB_URI
+              value: {{ .Values.amf.ueContextStore.dbUri | default (include "nextgcore.dbUri" .) | quote }}
+            {{- end }}
       volumes:
         {{- include "nextgcore.configVolumes" . | nindent 8 }}
 ---
