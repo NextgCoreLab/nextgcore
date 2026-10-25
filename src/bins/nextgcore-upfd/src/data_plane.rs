@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::AsRawFd;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -560,17 +560,26 @@ pub fn encapsulate_dl_gpdu_marked(
 ///
 /// Mandatory IEs: Tunnel Endpoint Identifier Data I (TV type 16) carrying
 /// the TEID of the offending G-PDU, and GTP-U Peer Address (TLV type 133)
-/// carrying the source address of this node. Header TEID is 0 and the S
-/// flag is set per 5.1.
-pub fn build_gtpu_error_indication(offending_teid: u32, local_addr: Ipv4Addr) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(12);
+/// carrying the destination address of that G-PDU, i.e. this node's address
+/// on the path it arrived on: 4 octets for IPv4, 16 for IPv6 (§8.4, #985).
+/// Header TEID is 0 and the S flag is set per 5.1.
+pub fn build_gtpu_error_indication(offending_teid: u32, local_addr: IpAddr) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(24);
     // Tunnel Endpoint Identifier Data I: TV format, type 16 + 4-octet TEID
     payload.push(16);
     payload.extend_from_slice(&offending_teid.to_be_bytes());
-    // GTP-U Peer Address: TLV format, type 133 + length + IPv4 address
+    // GTP-U Peer Address: TLV format, type 133 + length + address
     payload.push(133);
-    payload.extend_from_slice(&4u16.to_be_bytes());
-    payload.extend_from_slice(&local_addr.octets());
+    match local_addr {
+        IpAddr::V4(a) => {
+            payload.extend_from_slice(&4u16.to_be_bytes());
+            payload.extend_from_slice(&a.octets());
+        }
+        IpAddr::V6(a) => {
+            payload.extend_from_slice(&16u16.to_be_bytes());
+            payload.extend_from_slice(&a.octets());
+        }
+    }
 
     let mut pkt = Vec::with_capacity(12 + payload.len());
     pkt.push(0x32); // Version=1, PT=1, S=1
@@ -588,9 +597,9 @@ pub fn build_gtpu_error_indication(offending_teid: u32, local_addr: Ipv4Addr) ->
 /// Parse a GTP-U Error Indication payload, returning the TEID from the
 /// Tunnel Endpoint Identifier Data I IE and the peer address from the
 /// GTP-U Peer Address IE (TS 29.281 7.3.1).
-pub fn parse_gtpu_error_indication(payload: &[u8]) -> Option<(u32, Option<Ipv4Addr>)> {
+pub fn parse_gtpu_error_indication(payload: &[u8]) -> Option<(u32, Option<IpAddr>)> {
     let mut teid: Option<u32> = None;
-    let mut peer: Option<Ipv4Addr> = None;
+    let mut peer: Option<IpAddr> = None;
     let mut off = 0usize;
     while off < payload.len() {
         match payload[off] {
@@ -616,13 +625,18 @@ pub fn parse_gtpu_error_indication(payload: &[u8]) -> Option<(u32, Option<Ipv4Ad
                 if off + 3 + len > payload.len() {
                     return None;
                 }
+                // §8.4: 4 octets for IPv4, 16 for IPv6 (#985).
                 if len == 4 {
-                    peer = Some(Ipv4Addr::new(
+                    peer = Some(IpAddr::V4(Ipv4Addr::new(
                         payload[off + 3],
                         payload[off + 4],
                         payload[off + 5],
                         payload[off + 6],
-                    ));
+                    )));
+                } else if len == 16 {
+                    let mut o = [0u8; 16];
+                    o.copy_from_slice(&payload[off + 3..off + 19]);
+                    peer = Some(IpAddr::V6(Ipv6Addr::from(o)));
                 }
                 off += 3 + len;
             }
@@ -2944,7 +2958,8 @@ pub enum UpfReportEvent {
         upf_seid: u64,
         smf_seid: u64,
         remote_teid: u32,
-        peer_ipv4: Option<Ipv4Addr>,
+        /// The GTP-U Peer Address of the Error Indication: IPv4 or IPv6 (#985).
+        peer: Option<IpAddr>,
     },
     /// A provisioned Volume/Time Quota was exhausted → Usage Report carrying the
     /// VOLQU/TIMQU trigger (#80, TS 29.244 §5.2.2.2.2, §8.2.19).
@@ -2987,10 +3002,16 @@ pub struct DataPlane {
     pub report_tx: RwLock<Option<mpsc::Sender<UpfReportEvent>>>,
     /// Local GTP-U address (used as GTP-U Peer Address in Error Indications)
     pub local_gtpu_addr: RwLock<Ipv4Addr>,
+    /// Local IPv6 GTP-U address, once the IPv6 socket is bound: the GTP-U Peer
+    /// Address of an Error Indication for a G-PDU that arrived over IPv6 (#985).
+    pub local_gtpu_addr6: RwLock<Option<Ipv6Addr>>,
     /// Last IP_TOS value applied to the GTP-U socket for outer-header DSCP
     /// marking (TS 23.501 §5.7.4). Cached so we only issue setsockopt when the
     /// per-flow DSCP actually changes between consecutive downlink sends.
     pub gtpu_tos: AtomicU64,
+    /// The same for the IPv6 GTP-U socket, whose outer marking is IPV6_TCLASS
+    /// (RFC 3542 §6.5; #985).
+    pub gtpu_tclass: AtomicU64,
     /// GTP-U N3 path management state: per-gNB Echo/Recovery tracking.
     /// Access is infrequent (once per 60 s tick), never on the forwarding path.
     pub path_table: RwLock<GtpuPathTable>,
@@ -3118,6 +3139,8 @@ impl DataPlane {
             report_tx: RwLock::new(None),
             local_gtpu_addr: RwLock::new(Ipv4Addr::UNSPECIFIED),
             gtpu_tos: AtomicU64::new(GTPU_TOS_UNSET),
+            gtpu_tclass: AtomicU64::new(GTPU_TOS_UNSET),
+            local_gtpu_addr6: RwLock::new(None),
             path_table: RwLock::new(GtpuPathTable::default()),
         }
     }
@@ -3150,12 +3173,34 @@ impl DataPlane {
     /// repeated sends at the same DSCP do not re-issue setsockopt. Returns
     /// false if the socket option could not be set (non-fatal; the packet is
     /// still sent, just without outer marking).
-    fn set_gtpu_outer_tos(&self, dscp: u8) -> bool {
+    ///
+    /// `ipv6` selects the socket the G-PDU goes out on: an IPv6 gNB's outer header
+    /// is IPv6, marked through IPV6_TCLASS on the IPv6 GTP-U socket (the Traffic
+    /// Class octet carries the DSCP in the same bits as the IPv4 ToS, RFC 2474 §3).
+    /// Before #985 only the IPv4 socket was marked.
+    fn set_gtpu_outer_tos(&self, dscp: u8, ipv6: bool) -> bool {
         let tos = ((dscp & 0x3F) << 2) as u64; // ECN bits = 0
-        if self.gtpu_tos.load(Ordering::Relaxed) == tos {
+        let (cache, sock, level, opt, name) = if ipv6 {
+            (
+                &self.gtpu_tclass,
+                &self.gtpu_socket6,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_TCLASS,
+                "IPV6_TCLASS",
+            )
+        } else {
+            (
+                &self.gtpu_tos,
+                &self.gtpu_socket,
+                libc::IPPROTO_IP,
+                libc::IP_TOS,
+                "IP_TOS",
+            )
+        };
+        if cache.load(Ordering::Relaxed) == tos {
             return true; // already applied
         }
-        let sock = match &self.gtpu_socket {
+        let sock = match sock {
             Some(s) => s,
             None => return false,
         };
@@ -3164,20 +3209,20 @@ impl DataPlane {
         let ret = unsafe {
             libc::setsockopt(
                 fd,
-                libc::IPPROTO_IP,
-                libc::IP_TOS,
+                level,
+                opt,
                 tos_c.as_ptr() as *const libc::c_void,
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             )
         };
         if ret != 0 {
             log::debug!(
-                "setsockopt(IP_TOS={tos}) failed: {} — outer DSCP not marked",
+                "setsockopt({name}={tos}) failed: {} — outer DSCP not marked",
                 io::Error::last_os_error()
             );
             return false;
         }
-        self.gtpu_tos.store(tos, Ordering::Relaxed);
+        cache.store(tos, Ordering::Relaxed);
         true
     }
 
@@ -3250,7 +3295,11 @@ impl DataPlane {
     /// Bind the IPv6 GTP-U socket (#918).
     pub async fn bind_gtpu6(&mut self, addr: SocketAddr) -> io::Result<()> {
         log::info!("Binding IPv6 GTP-U socket on {addr}");
-        self.gtpu_socket6 = Some(Arc::new(TokioUdpSocket::bind(addr).await?));
+        let sock = TokioUdpSocket::bind(addr).await?;
+        if let IpAddr::V6(ip) = sock.local_addr()?.ip() {
+            *self.local_gtpu_addr6.write().unwrap() = Some(ip);
+        }
+        self.gtpu_socket6 = Some(Arc::new(sock));
         Ok(())
     }
 
@@ -3443,7 +3492,7 @@ impl DataPlane {
                                 upf_seid: sess.upf_seid,
                                 smf_seid: sess.smf_seid,
                                 remote_teid: teid,
-                                peer_ipv4: peer,
+                                peer,
                             });
                         }
                     } else {
@@ -3539,7 +3588,18 @@ impl DataPlane {
                         "G-PDU for unknown TEID 0x{:x} from {from} — sending Error Indication",
                         header.teid
                     );
-                    let local = *self.local_gtpu_addr.read().unwrap();
+                    // §7.3.1: the destination address of the offending G-PDU, so
+                    // the address of the socket it arrived on (#985).
+                    let local = if from.is_ipv6() {
+                        IpAddr::V6(
+                            self.local_gtpu_addr6
+                                .read()
+                                .unwrap()
+                                .unwrap_or(Ipv6Addr::UNSPECIFIED),
+                        )
+                    } else {
+                        IpAddr::V4(*self.local_gtpu_addr.read().unwrap())
+                    };
                     let err_ind = build_gtpu_error_indication(header.teid, local);
                     if let Some(sock) = self.socket_for(&from) {
                         let _ = sock.send_to(&err_ind, from).await;
@@ -3941,11 +4001,11 @@ impl DataPlane {
         // GTP-U socket so the kernel stamps the outer IPv4 ToS byte.
         match dscp_to_apply {
             Some(dscp) => {
-                self.set_gtpu_outer_tos(dscp);
+                self.set_gtpu_outer_tos(dscp, gnb_addr.is_ipv6());
             }
             None => {
                 // No per-flow DSCP: clear any previously applied outer marking.
-                self.set_gtpu_outer_tos(0);
+                self.set_gtpu_outer_tos(0, gnb_addr.is_ipv6());
             }
         }
 
@@ -5658,14 +5718,14 @@ mod tests {
 
     #[test]
     fn test_error_indication_roundtrip() {
-        let pkt = build_gtpu_error_indication(0x12345678, Ipv4Addr::new(10, 0, 0, 4));
+        let pkt = build_gtpu_error_indication(0x12345678, Ipv4Addr::new(10, 0, 0, 4).into());
         assert_eq!(pkt[0], 0x32, "S flag must be set");
         assert_eq!(pkt[1], 26, "Error Indication message type");
         assert_eq!(u32::from_be_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]), 0);
         // Parse back the payload (after the 12-byte header)
         let (teid, peer) = parse_gtpu_error_indication(&pkt[12..]).unwrap();
         assert_eq!(teid, 0x12345678);
-        assert_eq!(peer, Some(Ipv4Addr::new(10, 0, 0, 4)));
+        assert_eq!(peer, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 4))));
     }
 
     #[test]
@@ -7229,6 +7289,171 @@ mod tests {
         };
         dp.gtpu_socket6 = Some(Arc::new(sock6));
         assert_eq!(dp.probeable_paths(in_use.clone()), in_use);
+    }
+
+    /// #985: a G-PDU from an IPv6 gNB on an unknown TEID gets an Error Indication whose
+    /// GTP-U Peer Address is the UPF's IPv6 address, 16 octets (TS 29.281 §7.3.1: the
+    /// destination address of the offending G-PDU; §8.4). An IPv4 gNB still gets the
+    /// 4-octet IPv4 one.
+    #[tokio::test]
+    async fn an_error_indication_carries_the_address_family_the_g_pdu_arrived_on() {
+        let Some(gnb6) = ipv6_loopback_socket().await else {
+            return;
+        };
+        let gnb4 = TokioUdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        dp.gtpu_socket = Some(Arc::new(TokioUdpSocket::bind("127.0.0.1:0").await.unwrap()));
+        *dp.local_gtpu_addr.write().unwrap() = Ipv4Addr::LOCALHOST;
+        dp.bind_gtpu6("[::1]:0".parse().unwrap()).await.unwrap();
+
+        let inner = make_ipv4_udp_packet([10, 45, 0, 9], [8, 8, 8, 8], 1234, 53);
+        let gpdu = encapsulate_dl_gpdu(&inner, 0xDEAD, None);
+        let mut buf = [0u8; 256];
+
+        dp.handle_uplink_packet(&gpdu, gnb6.local_addr().unwrap(), -1)
+            .await;
+        let (len, from) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), gnb6.recv_from(&mut buf))
+                .await
+                .expect("Error Indication to the IPv6 gNB")
+                .unwrap();
+        assert!(from.is_ipv6(), "sent from the IPv6 GTP-U socket");
+        // TEID Data I (5 octets), then GTP-U Peer Address: type 133, length 16, ::1.
+        assert_eq!(&buf[17..20], &[133, 0, 16]);
+        assert_eq!(
+            parse_gtpu_error_indication(&buf[12..len]).unwrap(),
+            (0xDEAD, Some(IpAddr::V6(Ipv6Addr::LOCALHOST)))
+        );
+
+        dp.handle_uplink_packet(&gpdu, gnb4.local_addr().unwrap(), -1)
+            .await;
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), gnb4.recv_from(&mut buf))
+                .await
+                .expect("Error Indication to the IPv4 gNB")
+                .unwrap();
+        assert_eq!(&buf[17..20], &[133, 0, 4], "IPv4 unchanged: 4 octets");
+        assert_eq!(
+            parse_gtpu_error_indication(&buf[12..len]).unwrap(),
+            (0xDEAD, Some(IpAddr::V4(Ipv4Addr::LOCALHOST)))
+        );
+    }
+
+    /// #985: an Error Indication FROM an IPv6 gNB, whose GTP-U Peer Address is IPv6, is
+    /// reported to the SMF with that IPv6 address (it was parsed as no address at all).
+    #[tokio::test]
+    async fn an_error_indication_from_an_ipv6_gnb_is_reported_with_its_ipv6_address() {
+        let dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        let (tx, mut rx) = mpsc::channel(4);
+        dp.set_report_channel(tx);
+        let gnb: SocketAddr = "[2001:db8::5]:2152".parse().unwrap();
+        dp.add_session_from_pfcp(
+            0x985,
+            0x1985,
+            Ipv4Addr::new(10, 45, 9, 85),
+            0x9851,
+            0x9852,
+            gnb,
+            Some(1),
+            Some(9),
+        );
+        let gnb_ip: Ipv6Addr = "2001:db8::5".parse().unwrap();
+        let mut ei = vec![0x32, 26, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        ei.extend_from_slice(&[16, 0x00, 0x00, 0x98, 0x52]); // TEID Data I = DL TEID
+        ei.extend_from_slice(&[133, 0, 16]);
+        ei.extend_from_slice(&gnb_ip.octets());
+        let total = (ei.len() - 8) as u16;
+        ei[2..4].copy_from_slice(&total.to_be_bytes());
+
+        dp.handle_uplink_packet(&ei, gnb, -1).await;
+        match rx.try_recv() {
+            Ok(UpfReportEvent::ErrorIndicationReport {
+                upf_seid,
+                remote_teid,
+                peer,
+                ..
+            }) => {
+                assert_eq!(upf_seid, 0x985);
+                assert_eq!(remote_teid, 0x9852);
+                assert_eq!(peer, Some(IpAddr::V6(gnb_ip)));
+            }
+            other => panic!("expected an Error Indication Report, got {other:?}"),
+        }
+    }
+
+    /// The outer marking actually applied to a socket, read back from the kernel.
+    fn socket_int_opt(sock: &TokioUdpSocket, level: libc::c_int, opt: libc::c_int) -> i32 {
+        let mut v: libc::c_int = -1;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let ret = unsafe {
+            libc::getsockopt(
+                sock.as_raw_fd(),
+                level,
+                opt,
+                &mut v as *mut libc::c_int as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        assert_eq!(ret, 0, "getsockopt: {}", io::Error::last_os_error());
+        v
+    }
+
+    /// #985: downlink DSCP to an IPv6 gNB marks the IPv6 GTP-U socket's Traffic Class
+    /// (IPV6_TCLASS), and leaves the IPv4 socket's IP_TOS alone. Before, only IP_TOS on
+    /// the IPv4 socket was set, so an IPv6 N3 path went out unmarked.
+    #[tokio::test]
+    async fn downlink_dscp_to_an_ipv6_gnb_marks_the_ipv6_traffic_class() {
+        let Some(gnb) = ipv6_loopback_socket().await else {
+            return;
+        };
+        let ue_ip = Ipv4Addr::new(10, 45, 9, 86);
+        let v4 = Arc::new(TokioUdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mut dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        dp.gtpu_socket = Some(Arc::clone(&v4));
+        dp.bind_gtpu6("[::1]:0".parse().unwrap()).await.unwrap();
+        dp.add_session_from_pfcp(
+            0x986,
+            0x1986,
+            ue_ip,
+            0x9861,
+            0x9862,
+            gnb.local_addr().unwrap(),
+            Some(1),
+            Some(9),
+        );
+        let session = dp.sessions.find_by_seid(0x986).unwrap();
+        let mut qer = DataPlaneQer::new(5);
+        qer.set_qfi(9);
+        qer.dscp = 46; // EF
+        session.qers.write().unwrap().insert(5, qer);
+        for far in session.fars.write().unwrap().values_mut() {
+            far.ohc_addr = None;
+        }
+        for p in session.pdrs.write().unwrap().iter_mut() {
+            if p.source_interface == SRC_INTF_CORE {
+                p.qer_id = Some(5);
+            }
+        }
+        let mut pkt = make_ipv4_udp_packet([8, 8, 8, 8], ue_ip.octets(), 53, 1234);
+        finalize_ipv4(&mut pkt);
+        dp.handle_downlink_packet(&pkt, &v4).await;
+
+        let mut buf = [0u8; 2048];
+        tokio::time::timeout(std::time::Duration::from_secs(2), gnb.recv_from(&mut buf))
+            .await
+            .expect("the G-PDU reaches the IPv6 gNB")
+            .unwrap();
+        let sock6 = dp.gtpu_socket6.as_ref().unwrap();
+        assert_eq!(
+            socket_int_opt(sock6, libc::IPPROTO_IPV6, libc::IPV6_TCLASS),
+            46 << 2,
+            "the IPv6 outer Traffic Class carries DSCP EF"
+        );
+        assert_eq!(
+            socket_int_opt(&v4, libc::IPPROTO_IP, libc::IP_TOS),
+            0,
+            "the IPv4 socket is not touched by an IPv6 send"
+        );
     }
 
     #[tokio::test]
