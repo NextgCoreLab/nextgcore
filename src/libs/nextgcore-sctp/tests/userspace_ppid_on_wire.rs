@@ -211,6 +211,20 @@ impl TestClient {
         }
     }
 
+    /// Queue a message on `stream_id` without flushing it, so several writes go out
+    /// together and reach the server in one batch.
+    fn write(&mut self, stream_id: u16, data: &[u8], ppid: u32) {
+        let ppi = PayloadProtocolIdentifier::from(ppid);
+        let mut stream = match self.association.stream(stream_id) {
+            Ok(s) => s,
+            Err(_) => self
+                .association
+                .open_stream(stream_id, ppi)
+                .expect("open stream"),
+        };
+        stream.write_with_ppi(data, ppi).expect("write");
+    }
+
     async fn send(&mut self, stream_id: u16, data: &[u8], ppid: u32) {
         let ppi = PayloadProtocolIdentifier::from(ppid);
         let mut stream = match self.association.stream(stream_id) {
@@ -479,8 +493,57 @@ async fn every_message_on_every_inbound_stream_is_delivered() {
         client.pump(Duration::from_millis(20)).await;
     }
 
-    let mut got = received.lock().expect("server log").clone();
-    got.sort();
-    expected.sort();
-    assert_eq!(got, expected, "two messages on each of streams 0..=3");
+    // Per stream, in the order sent (streams are ordered, RFC 9260 §6.6).
+    let got = received.lock().expect("server log").clone();
+    for stream in 0..4u16 {
+        let on = |v: &[(u16, Vec<u8>)]| {
+            v.iter()
+                .filter(|(s, _)| *s == stream)
+                .map(|(_, d)| d.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(on(&got), on(&expected), "stream {stream}, in order");
+    }
+    assert_eq!(
+        got.len(),
+        expected.len(),
+        "two messages on each of streams 0..=3"
+    );
+}
+
+/// #864 review: several messages on one stream that reach the server in ONE batch are
+/// all delivered, in order. The stream is drained, not read once per event batch.
+#[tokio::test]
+async fn a_burst_on_one_stream_is_drained_in_order() {
+    let config = SctpServerConfig {
+        max_inbound_streams: 4,
+        max_outbound_streams: 4,
+        ..SctpServerConfig::default()
+    };
+    let (server_addr, received) = spawn_recording_server(config).await;
+    let mut client = TestClient::connect(server_addr).await;
+
+    client.send(2, b"first", NGAP_PPID).await;
+    for m in [&b"second"[..], b"third", b"fourth"] {
+        client.write(2, m, NGAP_PPID);
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while received.lock().expect("server log").len() < 4 {
+        assert!(
+            Instant::now() < deadline,
+            "all four messages within 5 s; got {:?}",
+            received.lock().expect("server log")
+        );
+        client.pump(Duration::from_millis(20)).await;
+    }
+    let got: Vec<(u16, Vec<u8>)> = received.lock().expect("server log").clone();
+    assert_eq!(
+        got,
+        vec![
+            (2, b"first".to_vec()),
+            (2, b"second".to_vec()),
+            (2, b"third".to_vec()),
+            (2, b"fourth".to_vec()),
+        ]
+    );
 }

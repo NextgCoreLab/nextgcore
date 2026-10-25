@@ -434,7 +434,11 @@ impl SctpServer {
                     continue;
                 }
                 let mut buf = vec![0u8; total_len];
-                if chunks.read(&mut buf).is_err() {
+                if let Err(e) = chunks.read(&mut buf) {
+                    warn!(
+                        "Dropped a {total_len}-byte message on stream {stream_id} of {handle:?}: \
+                         reading its chunks failed: {e}"
+                    );
                     continue;
                 }
                 let message = ReceivedMessage {
