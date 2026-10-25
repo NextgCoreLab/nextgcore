@@ -166,8 +166,11 @@ fn protected_idle_service_request(ue: &AmfUe, tmsi: u32, count: u32) -> Vec<u8> 
 /// stored one, so the UE's next COUNT verifies.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restored_ue_s_service_request_reactivates_its_stored_session() {
+    // The SMF holding the SM context, and another one SMF selection would find: the
+    // stored owner (#669) is what the re-activation must use.
     let (_smf, port, seen) = fake_activating_smf().await;
-    let _env = SmfEnvGuard::acquire(port).await;
+    let (_selected, selected_port, selected_seen) = fake_activating_smf().await;
+    let _env = SmfEnvGuard::acquire(selected_port).await;
     crate::context::amf_context_init(64, 1024, 4096);
     let backend = Arc::new(MemoryBackend::default());
     let (old_id, sr_id, tmsi) = (6_860_101u64, 6_860_103u64, 0x0686_0101u32);
@@ -196,6 +199,11 @@ async fn a_restored_ue_s_service_request_reactivates_its_stored_session() {
         Arc::clone(&backend) as Arc<dyn UeContextBackend>,
     )
     .await;
+    assert_eq!(
+        backend.get(supi).expect("stored").security.dl_count,
+        0x0102 + DL_COUNT_RESTORE_MARGIN,
+        "#1176 review m2: the moved-on downlink COUNT is stored before any association"
+    );
     let (new_id, restored) = after
         .ue_auth_state
         .find_by_supi(supi)
@@ -252,6 +260,10 @@ async fn a_restored_ue_s_service_request_reactivates_its_stored_session() {
     assert!(
         !calls.iter().any(|(uri, _)| uri.contains("/release")),
         "nothing is released: {calls:?}"
+    );
+    assert!(
+        selected_seen.lock().unwrap().is_empty(),
+        "nothing goes to another SMF"
     );
     let resumed = after.ue_auth_state.get(sr_id).expect("resumed");
     assert_eq!(resumed.amf_ue.supi.as_deref(), Some(supi));
@@ -404,7 +416,8 @@ async fn the_sweep_writes_changes_only_and_deletes_ues_no_longer_held() {
     assert!(backend.inner.get(supi).is_none(), "deleted");
 }
 
-/// **#686.** Only this AMF instance's records of the current format are restored. A record
+/// **#686.** Only this AMF instance's records of the current format, whose 5G-GUTI this
+/// AMF serves and whose SUPI it does not already hold, are restored. A record
 /// written by another AMF instance waits for the AMF Set takeover (TS 23.501 §5.21.2.3),
 /// which updates the UDM first. Skipped records stay in the store.
 #[tokio::test]
@@ -430,15 +443,42 @@ async fn records_of_another_amf_instance_or_version_are_not_restored() {
     let mut old = rec.clone();
     old.supi = "imsi-001010000686403".to_string();
     old.version = RECORD_VERSION + 1;
+    let mut unserved = rec.clone();
+    unserved.supi = "imsi-001010000686405".to_string();
+    unserved.guti.amf_pointer = 0x2B;
+    let mut held = rec.clone();
+    held.supi = "imsi-001010000686406".to_string();
     rec.supi = "imsi-001010000686404".to_string();
     rec.guti.tmsi = 0x0686_0404;
 
     let mut after = restoring_server().await;
+    // A UE this AMF already holds (it registered again before the record was read).
+    let mut live = idle_ue_with_security(6_860_406, 0x0686_0406);
+    live.amf_ue.supi = Some(held.supi.clone());
+    after.ue_auth_state.insert(6_860_406, live);
     let summary = after
-        .restore_ue_contexts(vec![other, old, rec.clone()])
+        .restore_ue_contexts(vec![other, old, unserved, held, rec.clone()])
         .await;
     assert_eq!(summary.restored.len(), 1, "{summary:?}");
-    assert_eq!(summary.skipped, 2);
+    assert_eq!(summary.skipped, 4);
+    assert!(
+        after
+            .ue_auth_state
+            .find_by_supi("imsi-001010000686405")
+            .is_none(),
+        "a GUTI of an AMF this one is not"
+    );
+    assert_eq!(
+        after
+            .ue_auth_state
+            .snapshot()
+            .iter()
+            .filter(|(_, s)| s.amf_ue.supi.as_deref() == Some("imsi-001010000686406"))
+            .count(),
+        1,
+        "a SUPI already held is not restored a second time"
+    );
+    after.ue_auth_state.remove(6_860_406);
     assert!(after
         .ue_auth_state
         .find_by_supi("imsi-001010000686402")
@@ -587,4 +627,135 @@ fn a_guti_is_served_only_under_a_served_guami() {
     guti.amf_set_id = 0x155;
     guti.plmn_id = crate::context::PlmnId::new("001", "02");
     assert!(!guti_served(&served, &guti), "another PLMN");
+}
+
+/// A backend refusing the first `fail` writes and deletes, then storing.
+struct FlakyBackend {
+    inner: MemoryBackend,
+    fail: std::sync::atomic::AtomicUsize,
+}
+
+impl FlakyBackend {
+    fn refusing(fail: usize) -> Self {
+        Self {
+            inner: MemoryBackend::default(),
+            fail: std::sync::atomic::AtomicUsize::new(fail),
+        }
+    }
+
+    fn refuse(&self) -> Result<(), String> {
+        let left = self.fail.load(std::sync::atomic::Ordering::SeqCst);
+        if left > 0 {
+            self.fail
+                .store(left - 1, std::sync::atomic::Ordering::SeqCst);
+            return Err("store unavailable".to_string());
+        }
+        Ok(())
+    }
+}
+
+impl UeContextBackend for FlakyBackend {
+    fn put(&self, rec: &StoredUeContext) -> Result<(), String> {
+        if rec.supi == FLAKY_SUPI {
+            self.refuse()?;
+        }
+        self.inner.put(rec)
+    }
+    fn delete(&self, supi: &str) -> Result<(), String> {
+        if supi == FLAKY_SUPI {
+            self.refuse()?;
+        }
+        self.inner.delete(supi)
+    }
+    fn load(&self, amf_instance_id: &str) -> Result<Vec<StoredUeContext>, String> {
+        self.inner.load(amf_instance_id)
+    }
+}
+
+const FLAKY_SUPI: &str = "imsi-001010000686701";
+
+/// **#1176 review m1.** A write or delete the store refused is retried by the next sweep.
+/// Without that, an unchanged UE would stay unstored after a store blip, and a refused
+/// delete would leave a record that a restart restores as a registered UE.
+#[tokio::test]
+async fn a_refused_write_or_delete_is_retried_by_the_next_sweep() {
+    crate::context::amf_context_init(64, 1024, 4096);
+    let backend = Arc::new(FlakyBackend::refusing(1));
+    let id = 6_860_701u64;
+    let mut server = restoring_server().await;
+    server.attach_ue_context_store(UeContextWriter::spawn(
+        Arc::clone(&backend) as Arc<dyn UeContextBackend>
+    ));
+    seed_registered_ue(
+        &mut server,
+        id,
+        0x0686_0701,
+        FLAKY_SUPI,
+        "ref-686-g",
+        7777,
+        false,
+    );
+
+    store_now(&mut server).await;
+    assert!(
+        backend.inner.get(FLAKY_SUPI).is_none(),
+        "the first write was refused"
+    );
+    store_now(&mut server).await;
+    assert!(
+        backend.inner.get(FLAKY_SUPI).is_some(),
+        "the unchanged UE is written by the next sweep"
+    );
+
+    backend.fail.store(1, std::sync::atomic::Ordering::SeqCst);
+    crash(&mut server, id);
+    store_now(&mut server).await;
+    assert!(
+        backend.inner.get(FLAKY_SUPI).is_some(),
+        "the delete was refused"
+    );
+    store_now(&mut server).await;
+    assert!(
+        backend.inner.get(FLAKY_SUPI).is_none(),
+        "the delete is sent again by the next sweep"
+    );
+}
+
+/// **#1176 review m3.** A registered UE is stored only in a state worth restoring. These
+/// are not:
+/// - an unauthenticated emergency registration, which has no key hierarchy (TS 33.501
+///   §10.2.2);
+/// - a registration update being answered;
+/// - a UE without a NAS security context.
+///
+/// A restore marks the security context available, so storing either of those would
+/// restore one that does not exist.
+#[tokio::test]
+async fn ues_in_a_state_not_worth_restoring_are_not_written() {
+    crate::context::amf_context_init(64, 1024, 4096);
+    let backend = Arc::new(RecordingBackend::default());
+    let mut server = restoring_server().await;
+    server.attach_ue_context_store(UeContextWriter::spawn(
+        Arc::clone(&backend) as Arc<dyn UeContextBackend>
+    ));
+    let cases: [(u64, &str, fn(&mut UeNasContext)); 3] = [
+        (6_860_801, "imsi-001010000686801", |s| {
+            s.amf_ue.unauthenticated_emergency = true
+        }),
+        (6_860_802, "imsi-001010000686802", |s| {
+            s.registration_session_ies = Some(ServiceRequestSessionIes::default())
+        }),
+        (6_860_803, "imsi-001010000686803", |s| {
+            s.amf_ue.security_context_available = false
+        }),
+    ];
+    for (id, supi, unworthy) in cases {
+        seed_registered_ue(&mut server, id, id as u32, supi, "ref-686-h", 7777, false);
+        server.ue_auth_state.with_mut(id, unworthy);
+    }
+    store_now(&mut server).await;
+    for (id, supi, _) in cases {
+        assert!(backend.ops_for(supi).is_empty(), "{supi} is not stored");
+        crash(&mut server, id);
+    }
 }

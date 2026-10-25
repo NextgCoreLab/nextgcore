@@ -63,6 +63,12 @@
 //! has to update the UDM and the peers first. It is left in the store.
 //!
 //! Off unless [`DB_URI_ENV`] names a MongoDB. Without it nothing is written or restored.
+//!
+//! # Key material
+//!
+//! A record holds K_AMF, KNASint/enc, K_gNB and NH in clear. That is the same database
+//! and trust domain as the UDR's subscriber K/OPc, so it needs the same access control
+//! (authentication, network policy). No key or COUNT is logged (#861).
 
 use super::{NgapServer, UeNasContext};
 use crate::context::{
@@ -88,6 +94,10 @@ pub const PERSIST_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How far the downlink NAS COUNT moves on restore (see the module docs).
 pub const DL_COUNT_RESTORE_MARGIN: u32 = 255;
+
+/// How long the store's server selection may take at startup, unless the URI's
+/// `serverSelectionTimeoutMS` says otherwise.
+pub const SERVER_SELECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long the shutdown waits for the final flush to reach the store.
 pub const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(3);
@@ -200,7 +210,14 @@ impl MongoBackend {
     /// Connect to `uri`. The database is the URI's (`mongodb://host/<db>`), else
     /// `nextgcore`, the UDR's. Blocking: run it off the async runtime.
     pub fn connect(uri: &str) -> Result<Self, String> {
-        let client = mongodb::sync::Client::with_uri_str(uri).map_err(|e| e.to_string())?;
+        let mut options = mongodb::options::ClientOptions::parse(uri).map_err(|e| e.to_string())?;
+        // An unreachable store must not hold the AMF's startup (it runs before the first
+        // NG association is accepted) for the driver's 30 s default; a URI's own
+        // `serverSelectionTimeoutMS` still wins.
+        options
+            .server_selection_timeout
+            .get_or_insert(SERVER_SELECTION_TIMEOUT);
+        let client = mongodb::sync::Client::with_options(options).map_err(|e| e.to_string())?;
         let db = client
             .default_database()
             .unwrap_or_else(|| client.database("nextgcore"));
@@ -320,28 +337,38 @@ enum WriterOp {
 
 /// The writer: a thread of its own doing the blocking store calls in order, so the
 /// NGAP task only ever enqueues.
+///
+/// A write or delete the store refused is reported in `failed` (#1176 review m1), by
+/// SUPI, until a later operation for that SUPI succeeds. The next sweep retries it.
 pub struct UeContextWriter {
     tx: std::sync::mpsc::Sender<WriterOp>,
+    failed: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
 impl UeContextWriter {
     pub fn spawn(backend: Arc<dyn UeContextBackend>) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<WriterOp>();
+        let failed: Arc<std::sync::Mutex<HashSet<String>>> = Arc::default();
+        let report = Arc::clone(&failed);
         let spawned = std::thread::Builder::new()
             .name("amf-ue-store".into())
             .spawn(move || {
+                let outcome = |supi: &str, result: Result<(), String>, what: &str| {
+                    let mut failed = report.lock().unwrap_or_else(|e| e.into_inner());
+                    match result {
+                        Ok(()) => {
+                            failed.remove(supi);
+                        }
+                        Err(e) => {
+                            log::warn!("UE context of {supi} not {what} (retried): {e}");
+                            failed.insert(supi.to_string());
+                        }
+                    }
+                };
                 for op in rx {
                     match op {
-                        WriterOp::Put(rec) => {
-                            if let Err(e) = backend.put(&rec) {
-                                log::warn!("UE context of {} not stored: {e}", rec.supi);
-                            }
-                        }
-                        WriterOp::Delete(supi) => {
-                            if let Err(e) = backend.delete(&supi) {
-                                log::warn!("Stored UE context of {supi} not deleted: {e}");
-                            }
-                        }
+                        WriterOp::Put(rec) => outcome(&rec.supi, backend.put(&rec), "stored"),
+                        WriterOp::Delete(supi) => outcome(&supi, backend.delete(&supi), "deleted"),
                         WriterOp::Flush(done) => {
                             let _ = done.send(());
                         }
@@ -351,7 +378,12 @@ impl UeContextWriter {
         if let Err(e) = spawned {
             log::error!("The UE context writer thread did not start: {e}");
         }
-        Self { tx }
+        Self { tx, failed }
+    }
+
+    /// The SUPIs whose last write or delete failed, taken.
+    fn take_failed(&self) -> HashSet<String> {
+        std::mem::take(&mut *self.failed.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     fn put(&self, rec: StoredUeContext) {
@@ -410,21 +442,40 @@ fn key<const N: usize>(bytes: &[u8]) -> Option<[u8; N]> {
 }
 
 impl NgapServer {
-    /// Arm the UE context storage (#686): records are written from now on. `persisted`
-    /// is what the store already holds for the UEs being restored, so they are not
-    /// written again until they change.
+    /// Arm the UE context storage (#686): records are written from now on.
     pub(super) fn attach_ue_context_store(&mut self, writer: UeContextWriter) {
         self.ue_context_store = Some(UeContextStore::new(writer));
     }
 
-    /// The record of the UE `amf_ue_ngap_id` holds, if it is in a stable state worth
-    /// storing: registered, with a SUPI and a NAS security context, no NAS procedure
-    /// waiting on the UE, and not an unauthenticated emergency registration (TS 33.501
-    /// §10.2.2, which has no key hierarchy to restore).
+    /// Every UE's stored PDU sessions, by AMF UE NGAP ID: one pass over the SM context
+    /// refs and one lock of the session list per sweep (#1176 review m4).
+    fn stored_sessions_by_ue(&self) -> HashMap<u64, Vec<StoredSession>> {
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+        let mut by_ue: HashMap<u64, Vec<StoredSession>> = HashMap::new();
+        for ((ue_id, psi), sm_ref) in &self.sm_context_refs {
+            let sess = guard.sess_find_by_psi(*ue_id, *psi);
+            by_ue.entry(*ue_id).or_default().push(StoredSession {
+                psi: *psi,
+                sm_context_ref: sm_ref.clone(),
+                smf: self.sm_context_smfs.get(&(*ue_id, *psi)).cloned(),
+                s_nssai: sess.as_ref().map(|s| s.s_nssai.clone()).unwrap_or_default(),
+                dnn: sess.and_then(|s| s.dnn),
+            });
+        }
+        for sessions in by_ue.values_mut() {
+            sessions.sort_by_key(|s| s.psi);
+        }
+        by_ue
+    }
+
+    /// The record of a UE in a stable state worth storing: registered, with a SUPI and a
+    /// NAS security context, no NAS procedure waiting on the UE, and not an
+    /// unauthenticated emergency registration (TS 33.501 §10.2.2, which has no key
+    /// hierarchy to restore). `sessions` are its PDU sessions.
     fn stored_ue_context(
-        &self,
-        amf_ue_ngap_id: u64,
         state: &UeNasContext,
+        sessions: Vec<StoredSession>,
         amf_instance_id: &str,
     ) -> Option<StoredUeContext> {
         let ue = &state.amf_ue;
@@ -437,27 +488,6 @@ impl NgapServer {
             return None;
         }
         let supi = ue.supi.clone()?;
-        let sessions = {
-            let ctx = crate::context::amf_self();
-            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
-            let mut sessions: Vec<StoredSession> = self
-                .sm_context_refs
-                .iter()
-                .filter(|((ue_id, _), _)| *ue_id == amf_ue_ngap_id)
-                .map(|((_, psi), sm_ref)| {
-                    let sess = guard.sess_find_by_psi(amf_ue_ngap_id, *psi);
-                    StoredSession {
-                        psi: *psi,
-                        sm_context_ref: sm_ref.clone(),
-                        smf: self.sm_context_smfs.get(&(amf_ue_ngap_id, *psi)).cloned(),
-                        s_nssai: sess.as_ref().map(|s| s.s_nssai.clone()).unwrap_or_default(),
-                        dnn: sess.and_then(|s| s.dnn),
-                    }
-                })
-                .collect();
-            sessions.sort_by_key(|s| s.psi);
-            sessions
-        };
         Some(StoredUeContext {
             version: RECORD_VERSION,
             amf_instance_id: amf_instance_id.to_string(),
@@ -512,10 +542,13 @@ impl NgapServer {
         })
     }
 
-    /// Write what changed since the last sweep (#686): every stable UE whose record
-    /// differs from the one last written, and a delete for every stored SUPI no UE is
-    /// held under any more. A UE in the middle of a procedure keeps its last stable
-    /// record. Runs at most every [`PERSIST_INTERVAL`] unless `force`.
+    /// Write what changed since the last sweep (#686).
+    /// - Every stable UE whose record differs from the one last written is written.
+    /// - Every stored SUPI no UE is held under any more is deleted.
+    /// - A UE in the middle of a procedure keeps its last stable record.
+    /// - What the store refused since the last sweep is retried (#1176 review m1).
+    ///
+    /// Runs at most every [`PERSIST_INTERVAL`] unless `force`.
     pub(super) fn persist_ue_contexts(&mut self, force: bool) -> PersistSummary {
         let mut summary = PersistSummary::default();
         let due = self
@@ -527,10 +560,12 @@ impl NgapServer {
         }
         let instance =
             nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf);
+        let mut sessions = self.stored_sessions_by_ue();
         let mut current: HashMap<String, StoredUeContext> = HashMap::new();
         let mut held: HashSet<String> = HashSet::new();
         for (id, state) in self.ue_auth_state.snapshot() {
-            if let Some(rec) = self.stored_ue_context(id, &state, instance) {
+            let ue_sessions = sessions.remove(&id).unwrap_or_default();
+            if let Some(rec) = Self::stored_ue_context(&state, ue_sessions, instance) {
                 held.insert(rec.supi.clone());
                 current.insert(rec.supi.clone(), rec);
             } else if state.registered {
@@ -544,6 +579,15 @@ impl NgapServer {
             return summary;
         };
         store.last_sweep = std::time::Instant::now();
+        // A refused write is written again below (its record no longer matches), and a
+        // refused delete of a UE still gone is sent again.
+        for supi in store.writer.take_failed() {
+            store.persisted.remove(&supi);
+            if !held.contains(&supi) {
+                store.writer.delete(&supi);
+                summary.deleted += 1;
+            }
+        }
         for (supi, rec) in current {
             if store.persisted.get(&supi) != Some(&rec) {
                 store.writer.put(rec.clone());
@@ -572,18 +616,22 @@ impl NgapServer {
         summary
     }
 
+    /// Wait (bounded) until everything enqueued reached the store.
+    async fn await_ue_context_writes(&self, timeout: Duration) -> bool {
+        let Some(store) = self.ue_context_store.as_ref() else {
+            return true;
+        };
+        tokio::time::timeout(timeout, store.writer.flush())
+            .await
+            .is_ok()
+    }
+
     /// A last sweep, then wait (bounded) until the writer has stored it: the shutdown's
     /// flush (#686).
     pub(super) async fn flush_ue_contexts(&mut self, timeout: Duration) {
         self.persist_ue_contexts(true);
-        let Some(store) = self.ue_context_store.as_ref() else {
-            return;
-        };
-        let wait = store.writer.flush();
-        if tokio::time::timeout(timeout, wait).await.is_err() {
-            log::warn!("UE contexts: the shutdown flush did not complete within {timeout:?}");
-        } else {
-            log::info!("UE contexts: {} stored at shutdown", store.persisted.len());
+        if !self.await_ue_context_writes(timeout).await {
+            log::warn!("UE contexts: the flush did not complete within {timeout:?}");
         }
     }
 
@@ -668,9 +716,6 @@ impl NgapServer {
                     "IDLE"
                 }
             );
-            if let Some(store) = self.ue_context_store.as_mut() {
-                store.persisted.insert(rec.supi.clone(), rec.clone());
-            }
             if rec.cm_connected {
                 connected.push(id);
             } else {
@@ -685,6 +730,10 @@ impl NgapServer {
                 self.offload_ng_reset_smf_call(call);
             }
         }
+        // #1176 review m2: the restored contexts, with the downlink COUNT moved on, are
+        // written at once. A second crash before the first sweep would otherwise restore
+        // the old COUNT again and reuse the downlink COUNTs used meanwhile.
+        self.persist_ue_contexts(true);
         summary
     }
 }
@@ -847,6 +896,14 @@ pub(super) async fn open_with(server: &mut NgapServer, backend: Arc<dyn UeContex
         Ok(records) => {
             let found = records.len();
             let summary = server.restore_ue_contexts(records).await;
+            // The bumped downlink COUNTs reach the store before the first NG
+            // association is accepted (#1176 review m2).
+            if !server.await_ue_context_writes(SHUTDOWN_FLUSH_TIMEOUT).await {
+                log::warn!(
+                    "UE contexts: the restored contexts were not all stored within \
+                     {SHUTDOWN_FLUSH_TIMEOUT:?}"
+                );
+            }
             log::info!(
                 "UE context storage armed: {} of {found} stored UE context(s) restored \
                  ({} released from CM-CONNECTED, {} skipped)",
