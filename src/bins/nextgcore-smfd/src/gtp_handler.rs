@@ -2955,12 +2955,12 @@ mod tests {
         // kbit/s: MBR 128 / 256, GBR 64 / 96.
         let qos = nextgcore_gtp::v2::Gtp2BearerQosIe::new(9, 128, 256, 64, 96);
         let mut csr = s5c_csr_with_qos(0x79, 0x1165_0001, [10, 99, 99, 99], &qos);
-        // IMSI ...0x65 is this test's alone (see `establish_over_the_wire`).
+        // IMSI ...0x7a is this test's alone (see `establish_over_the_wire`).
         let imsi_pos = csr
             .windows(8)
             .position(|w| w == [0x09, 0x91, 0x07, 0x00, 0x00, 0x00, 0x00, 0x01])
             .expect("fixture IMSI");
-        csr[imsi_pos + 7] = 0x65;
+        csr[imsi_pos + 7] = 0x7a;
         sgw.send_to(&csr, server.local_addr())
             .await
             .expect("send csr");
