@@ -160,14 +160,16 @@ impl NgapTransport {
         }
     }
 
-    async fn recv(
+    /// Receive for up to `timeout`, ended early by `wake` (#981).
+    async fn recv_or_wake(
         &mut self,
         timeout: Duration,
-    ) -> std::result::Result<bool, nextgcore_sctp::ServerError> {
+        wake: impl std::future::Future<Output = ()>,
+    ) -> std::result::Result<nextgcore_sctp::RecvOutcome, nextgcore_sctp::ServerError> {
         match self {
-            Self::Userspace(s) => s.recv(timeout).await,
+            Self::Userspace(s) => s.recv_or_wake(timeout, wake).await,
             #[cfg(feature = "kernel-sctp")]
-            Self::Kernel(s) => s.recv(timeout).await,
+            Self::Kernel(s) => s.recv_or_wake(timeout, wake).await,
         }
     }
 
@@ -1631,16 +1633,28 @@ impl NgapServer {
             self.handle_server_event(event).await?;
         }
 
-        // Poll SCTP server for incoming data
-        match self.transport.recv(SCTP_RECV_TIMEOUT).await {
-            Ok(true) => {
+        self.receive_n2_or_sbi_report().await
+    }
+
+    /// Poll the SCTP server for incoming data, for up to [`SCTP_RECV_TIMEOUT`]. An
+    /// off-task SBI report ends the wait (#981): `Ok(true)` makes the caller poll
+    /// again at once, and the top of that poll applies it, rather than up to
+    /// `SCTP_RECV_TIMEOUT` later. `Ok(false)` is a quiet timeout.
+    async fn receive_n2_or_sbi_report(&mut self) -> Result<bool> {
+        match self
+            .transport
+            .recv_or_wake(SCTP_RECV_TIMEOUT, self.sbi_offload.report_arrived())
+            .await
+        {
+            Ok(nextgcore_sctp::RecvOutcome::Data) => {
                 // Data was received, process any new events
                 while let Ok(event) = self.server_event_rx.try_recv() {
                     self.handle_server_event(event).await?;
                 }
                 Ok(true)
             }
-            Ok(false) => Ok(false), // Timeout, no data
+            Ok(nextgcore_sctp::RecvOutcome::Woken) => Ok(true),
+            Ok(nextgcore_sctp::RecvOutcome::Timeout) => Ok(false), // Timeout, no data
             Err(e) => Err(anyhow::anyhow!("SCTP receive error: {e}")),
         }
     }
@@ -20331,6 +20345,7 @@ mod tests {
     mod handler_tests;
     mod initial_registration_tests;
     mod off_task_smf_tests;
+    mod poll_wake_tests;
     mod positioning_reach_tests;
     mod racs_handler_tests;
     mod racs_mapping_tests;

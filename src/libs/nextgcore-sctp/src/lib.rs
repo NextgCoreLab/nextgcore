@@ -52,7 +52,7 @@ pub use kernel_server::KernelSctpServer;
 pub mod server;
 
 #[cfg(feature = "sctp-proto")]
-pub use server::{SctpServer, SctpServerConfig, ServerError, ServerEvent};
+pub use server::{RecvOutcome, SctpServer, SctpServerConfig, ServerError, ServerEvent};
 
 // QUIC transport option (B13.3 - 6G forward-looking)
 pub mod quic;
