@@ -1451,6 +1451,12 @@ fn smf_unreachable(e: &crate::sbi_path::SbiError) -> bool {
 /// answers NF_FAILOVER from the moment it starts shutting down (#718 review M3).
 /// Re-selected for in the #796 window, like an unreachable SMF; any other answer
 /// is a refusal.
+///
+/// #1112: so is 504 UPF_NOT_RESPONDING (TS 29.502 §6.1.7.3). An SMF that has just
+/// started takes creates before its first N4 association is up, and a UPF that
+/// does not answer this SMF is a fault of the SMF's path, not of the request:
+/// another SMF, or this one a second later, can serve it. It was a refusal, so a
+/// start-up race became a #26 the UE sat out until T3512.
 fn smf_failing_over(e: &crate::sbi_path::SbiError) -> bool {
     match e {
         crate::sbi_path::SbiError::SmfRefused { status: 503, .. } => true,
@@ -1458,6 +1464,10 @@ fn smf_failing_over(e: &crate::sbi_path::SbiError) -> bool {
             status: 500,
             cause: Some(c),
         } => c == "NF_FAILOVER",
+        crate::sbi_path::SbiError::SmfRefused {
+            status: 504,
+            cause: Some(c),
+        } => c == "UPF_NOT_RESPONDING",
         _ => false,
     }
 }

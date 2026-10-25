@@ -138,12 +138,11 @@ fn handle_create_session_continue(imsi: &[u8], apn: &str, ebi: u8) -> HandlerRes
         None => return HandlerResult::Error(gtp_cause::CONTEXT_NOT_FOUND),
     };
 
-    // Check if session already exists
-    if let Some(existing_sess) = ctx.sess_find_by_apn(ue.id, apn) {
-        log::info!("OLD Session Release [IMSI:{},APN:{}]", ue.imsi_bcd, apn);
-        ctx.sess_remove(existing_sess.id);
-    }
-
+    // A collision with a PDN connection this SGW-C still holds (same IMSI and EPS
+    // Bearer ID, TS 29.274 §7.2.1) is resolved by the dispatcher before this runs
+    // (`gtp_path::resolve_create_session_collision`): the session added here never
+    // replaces another by APN, because a second PDN connection to the same APN is
+    // legal.
     // Add new session
     let sess = match ctx.sess_add(ue.id, apn) {
         Some(s) => s,

@@ -587,6 +587,10 @@ fn take_security_context_into_use(mme_ue: &mut MmeUe) {
 /// length 3.
 pub const IEI_UE_STATUS: u8 = 0x6D;
 
+/// EPS bearer context status IEI in a TRACKING AREA UPDATE REQUEST (TS 24.301
+/// Table 8.2.29.1, §9.9.2.1) (#993).
+pub const IEI_EPS_BEARER_CONTEXT_STATUS: u8 = 0x57;
+
 /// `5GMM registration status` (`N1 mode reg`) — octet 3, **bit 2** of the UE status IE.
 ///
 /// TS 24.501 Table 9.11.3.56.1
@@ -620,6 +624,10 @@ pub struct TauRequestData {
     pub ue_network_capability: Option<UeNetworkCapability>,
     /// Last visited TAI (optional)
     pub last_visited_tai: Option<EpsTai>,
+    /// EPS bearer context status (IEI 0x57, TS 24.301 §9.9.2.1), as a bitmap
+    /// with bit n for EBI n: octet 3 is EBI(7)..EBI(0), octet 4 EBI(15)..EBI(8)
+    /// (#993). `None` when the UE did not include it.
+    pub eps_bearer_context_status: Option<u16>,
     /// Did the UE say it is still registered in 5GMM? (`UE status` IE, `N1 mode reg`).
     ///
     /// # This, and NOT the GUTI type, is how the MME knows the TAU came from 5GS
@@ -690,6 +698,7 @@ pub fn handle_tau_request(
     let mut last_visited_tai = None;
     let mut five_gmm_registered = false;
     let mut old_guti_type_mapped = None;
+    let mut eps_bearer_context_status = None;
 
     while offset < data.len() {
         let iei = data[offset];
@@ -713,6 +722,19 @@ pub fn handle_tau_request(
                 if offset + 5 <= data.len() {
                     last_visited_tai = Some(parse_tai(&data[offset..offset + 5]));
                     offset += 5;
+                }
+            }
+            IEI_EPS_BEARER_CONTEXT_STATUS => {
+                // TLV, length 2 (TS 24.301 §9.9.2.1). Octet 3 holds EBI(7)..EBI(0),
+                // so it is the LOW byte of the bitmap (#961's convention).
+                if offset < data.len() {
+                    let len = data[offset] as usize;
+                    offset += 1;
+                    if len >= 2 && offset + len <= data.len() {
+                        eps_bearer_context_status =
+                            Some(u16::from(data[offset]) | (u16::from(data[offset + 1]) << 8));
+                    }
+                    offset += len;
                 }
             }
             IEI_UE_STATUS => {
@@ -773,6 +795,7 @@ pub fn handle_tau_request(
         old_guti,
         ue_network_capability,
         last_visited_tai,
+        eps_bearer_context_status,
         five_gmm_registered,
         old_guti_type_mapped,
     })

@@ -934,6 +934,19 @@ pub async fn select_upf() -> Option<Arc<PfcpClient>> {
     }
 }
 
+/// Whether a NEW session has a UPF to go to: the N4 association [`select_upf`] would
+/// use is up (#1112). The same choice as `select_upf`: the default client unless the
+/// `compute-aware-upf` feature picks from a pool of several, where any associated
+/// peer serves. Synchronous, off the association gauges, so the NRF status watcher
+/// can poll it cheaply.
+pub fn session_upf_associated() -> bool {
+    let pool = global_pool();
+    if !cfg!(feature = "compute-aware-upf") || pool.len() <= 1 {
+        return global_client().is_some_and(|c| c.is_associated_sync());
+    }
+    pool.iter().any(|c| c.is_associated_sync())
+}
+
 /// Least-loaded-associated selection over an explicit candidate slice.
 /// Deliberately NOT feature-gated so the default CI build compiles and
 /// tests the full selection path; [`select_upf`] gates whether session

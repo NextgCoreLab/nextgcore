@@ -2509,6 +2509,35 @@ fn release_s1_connection(ctx: &MmeContext, enb_ue_id: u64) {
     let Some(mme_ue_id) = idle_ue else {
         return;
     };
+    // #891, TS 23.401 §5.3.5 step 2: the UE is ECM-IDLE, so the Serving GW must
+    // stop forwarding downlink to the released eNB endpoints and buffer it (and
+    // notify, so the UE is paged). A release that went through the S1 release
+    // procedure sent its Release Access Bearers Request already and cleared the
+    // endpoints; a local one (§10.6, RESET, ERROR INDICATION, a reused eNB UE
+    // S1AP ID) did not.
+    let s1u_at_sgw = ctx
+        .bearer_pool
+        .read()
+        .unwrap()
+        .values()
+        .any(|b| b.mme_ue_id == mme_ue_id && b.enb_s1u_teid != 0 && b.sgw_s1u_teid != 0);
+    if s1u_at_sgw {
+        match crate::gtp_path::send_release_access_bearers_request(
+            ctx,
+            enb_ue_id,
+            mme_ue_id,
+            crate::s11_build::GtpReleaseAction::S1ContextRemove,
+        ) {
+            Ok(_) => log::info!(
+                "UE {mme_ue_id}: local S1 release; Release Access Bearers Request sent (TS \
+                 23.401 §5.3.5)"
+            ),
+            Err(e) => log::error!(
+                "UE {mme_ue_id}: local S1 release; Release Access Bearers Request not sent: {e}"
+            ),
+        }
+        crate::gtp_path::clear_enb_endpoints(ctx, mme_ue_id);
+    }
     // #961 review: the UE is ECM-IDLE now. An Initial Context Setup of a
     // SERVICE REQUEST that was still outstanding is void, and a Downlink Data
     // Notification that arrived during the release pages the UE now.
