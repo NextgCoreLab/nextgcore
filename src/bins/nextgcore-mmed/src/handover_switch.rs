@@ -1498,7 +1498,17 @@ mod tests {
         assert!(is_transport_resource_unavailable(&cause), "{cause:?}");
         let (dsr, _) = recv(&sgw, 36);
         assert_eq!(dsr.header.teid, Some(SGW_S11_TEID));
-        assert!(detach_pending(ue));
+        // #954: the S11 thread sends the Delete Session Request before it starts
+        // the detach (`detach_after_failed_handover`), so the DSR's arrival does
+        // not mean the DETACH REQUEST is out yet: wait for the state.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !detach_pending(ue) {
+            assert!(
+                Instant::now() < deadline,
+                "the UE was not detached explicitly (DETACH REQUEST, TS 23.401 §5.3.8.3)"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert!(bearer(ue, 5).is_none_or(|b| b.enb_s1u_teid != 0x9005));
     }
 

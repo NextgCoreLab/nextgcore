@@ -633,6 +633,21 @@ pub(crate) fn cached_peer_nf_type(nf_type_str: &str) -> Option<nextgcore_sbi::ty
 ///
 /// Queries GET /nnrf-disc/v1/nf-instances?target-nf-type={type}&service-names={svc}
 pub async fn amf_nrf_discover(target_nf_type: &str, service_name: &str) -> Result<(), String> {
+    amf_nrf_discover_qualified(target_nf_type, service_name, &[]).await
+}
+
+/// [`amf_nrf_discover`] with extra discovery query parameters `extra` (already
+/// percent-encoded values), e.g. `tai` (TS 29.510 §6.2.3.2.3.1).
+///
+/// With no extra parameter the answer REPLACES the cache's profiles of the target
+/// type (#664). A qualified answer is only the part of the type that matches the
+/// query (the LMFs serving one TAI, #997), so it is MERGED: replacing would drop
+/// every LMF serving another area.
+async fn amf_nrf_discover_qualified(
+    target_nf_type: &str,
+    service_name: &str,
+    extra: &[(&str, String)],
+) -> Result<(), String> {
     let sbi_ctx = global_context();
 
     let nrf_uri = sbi_ctx.get_nrf_uri().await;
@@ -644,9 +659,12 @@ pub async fn amf_nrf_discover(target_nf_type: &str, service_name: &str) -> Resul
     let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
     let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
 
-    let path = format!(
+    let mut path = format!(
         "/nnrf-disc/v1/nf-instances?target-nf-type={target_nf_type}&requester-nf-type=AMF&service-names={service_name}"
     );
+    for (name, value) in extra {
+        path.push_str(&format!("&{name}={value}"));
+    }
 
     let response = client
         .get(&path)
@@ -697,6 +715,23 @@ pub async fn amf_nrf_discover(target_nf_type: &str, service_name: &str) -> Resul
                     .filter_map(|v| v.as_str().map(String::from))
                     .collect();
             }
+            // NFProfile `priority` and `capacity` (TS 29.510 §6.1.6.2.2, 0..65535): the
+            // selection inputs of #997. Absent, the instance keeps its defaults.
+            if let Some(p) = nf_json
+                .get("priority")
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u16::try_from(v).ok())
+            {
+                instance.priority = p;
+            }
+            if let Some(c) = nf_json
+                .get("capacity")
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u16::try_from(v).ok())
+            {
+                instance.capacity = c;
+            }
+            instance.lmf_info = nf_json.get("lmfInfo").cloned();
 
             if let Some(services) = nf_json.get("nfServices").and_then(|v| v.as_array()) {
                 for svc_json in services {
@@ -732,7 +767,12 @@ pub async fn amf_nrf_discover(target_nf_type: &str, service_name: &str) -> Resul
             fresh.push(instance);
         }
     }
-    if let Some(target) = nextgcore_sbi::types::NfType::from_name(target_nf_type) {
+    let replace_target = if extra.is_empty() {
+        nextgcore_sbi::types::NfType::from_name(target_nf_type)
+    } else {
+        None
+    };
+    if let Some(target) = replace_target {
         let (mine, other): (Vec<_>, Vec<_>) = fresh.into_iter().partition(|i| i.nf_type == target);
         sbi_ctx.replace_nf_instances(target, mine, validity).await;
         for instance in other {
@@ -2451,25 +2491,299 @@ fn namf_loc_lmf_enabled_value(value: Option<&str>) -> bool {
 /// stand-in NRF (#938); nothing outside this crate calls it in production.
 #[doc(hidden)]
 pub async fn resolve_lmf_endpoint() -> Option<(String, u16)> {
+    resolve_lmf_endpoint_for(None).await
+}
+
+/// What the AMF knows of the target UE that an LMF's served area is matched
+/// against (TS 23.273 §5.1, #997): its TAI, its access type, and the LCS client type
+/// of the request.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct LmfSelectionInput {
+    pub mcc: String,
+    pub mnc: String,
+    /// The TAC, 24 bits.
+    pub tac: u32,
+    /// `3GPP_ACCESS` or `NON_3GPP_ACCESS` (TS 29.571 `AccessType`).
+    pub access_type: &'static str,
+    /// The serving AN node type, `GNB` or `NG_ENB` (TS 29.510 `AnNodeType`).
+    pub an_node_type: &'static str,
+    /// The RAT type, `NR` or `EUTRA` (TS 29.571 `RatType`).
+    pub rat_type: &'static str,
+    /// The request's `ExternalClientType`, when it named one.
+    pub client_type: Option<String>,
+}
+
+impl LmfSelectionInput {
+    /// The UE's current TAI and access type, the RAT of the node serving it
+    /// (`serving_rat`: an ng-eNB is E-UTRA, TS 38.300 §4.1), and `client_type` from
+    /// the request.
+    pub fn for_ue(
+        ue: &AmfUe,
+        serving_rat: crate::context::RatType,
+        client_type: Option<String>,
+    ) -> Self {
+        let (an_node_type, rat_type) = match serving_rat {
+            crate::context::RatType::Eutra => ("NG_ENB", "EUTRA"),
+            _ => ("GNB", "NR"),
+        };
+        Self {
+            an_node_type,
+            rat_type,
+            mcc: ue.nr_tai.plmn_id.mcc(),
+            mnc: ue.nr_tai.plmn_id.mnc(),
+            tac: ue.nr_tai.tac & 0x00FF_FFFF,
+            // 0 is the unset default, which this AMF treats as 3GPP access throughout.
+            access_type: if ue.access_type == 2 {
+                "NON_3GPP_ACCESS"
+            } else {
+                "3GPP_ACCESS"
+            },
+            client_type,
+        }
+    }
+
+    /// The `Tai` JSON (TS 29.571 §5.4.4.4): the `tai` discovery parameter.
+    fn tai_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "plmnId": { "mcc": self.mcc, "mnc": self.mnc },
+            "tac": format!("{:06X}", self.tac),
+        })
+    }
+}
+
+/// The RAT of the NG-RAN node serving `ue`: the RAT its live record's association
+/// set up with (NR when unknown, #997 review m2).
+fn serving_rat_type(ue: &AmfUe) -> crate::context::RatType {
+    crate::context::amf_self()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .serving_rat_of_ue(ue.id)
+}
+
+/// Does `plmn` (a `PlmnId` JSON) name the UE's PLMN?
+fn lmf_plmn_matches(plmn: Option<&serde_json::Value>, sel: &LmfSelectionInput) -> bool {
+    plmn.is_some_and(|p| {
+        p.get("mcc").and_then(|v| v.as_str()) == Some(sel.mcc.as_str())
+            && p.get("mnc").and_then(|v| v.as_str()) == Some(sel.mnc.as_str())
+    })
+}
+
+/// A 2- or 3-octet TAC string (TS 29.571 `Tac`) as a number.
+fn parse_tac(tac: Option<&serde_json::Value>) -> Option<u32> {
+    let t = tac?.as_str()?;
+    if !(t.len() == 4 || t.len() == 6) {
+        return None;
+    }
+    u32::from_str_radix(t, 16).ok()
+}
+
+/// Does a `TacRange` (TS 29.510 §6.1.6.2.28) contain `tac`? `start`/`end` compare as
+/// numbers. A `pattern` (an ECMA-262 expression) is understood in the shape TS
+/// 29.510's own example uses, `^<hex prefix>[0-9a-fA-F]{n}$`; any other pattern
+/// matches nothing here, and the NRF, which evaluates it when asked with `tai`, still
+/// lists the LMF.
+fn tac_range_contains(range: &serde_json::Value, tac: u32) -> bool {
+    if let (Some(start), Some(end)) = (parse_tac(range.get("start")), parse_tac(range.get("end"))) {
+        return (start..=end).contains(&tac);
+    }
+    let Some(pattern) = range.get("pattern").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let Some(body) = pattern.strip_prefix('^').and_then(|p| p.strip_suffix('$')) else {
+        return false;
+    };
+    let split = body
+        .find(|c: char| !c.is_ascii_hexdigit())
+        .unwrap_or(body.len());
+    let (prefix, rest) = body.split_at(split);
+    let wild = if rest.is_empty() {
+        0
+    } else {
+        match rest
+            .strip_prefix("[0-9a-fA-F]")
+            .or_else(|| rest.strip_prefix("[0-9A-Fa-f]"))
+            .and_then(|r| r.strip_prefix('{'))
+            .and_then(|r| r.strip_suffix('}'))
+            .and_then(|n| n.parse::<usize>().ok())
+        {
+            Some(n) => n,
+            None => return false,
+        }
+    };
+    let digits = prefix.len() + wild;
+    if digits != 4 && digits != 6 {
+        return false;
+    }
+    let tac_str = format!("{tac:0digits$X}");
+    tac_str.len() == digits && tac_str[..prefix.len()].eq_ignore_ascii_case(prefix)
+}
+
+/// Does this LMF profile serve the UE (TS 29.510 §6.1.6.2.46 `LmfInfo`)? An absent
+/// `lmfInfo`, and each absent member of it, means "no restriction". A `Tai` /
+/// `TaiRange` `nid` (an SNPN, TS 29.571) is not compared: this AMF serves PLMNs only.
+fn lmf_serves(instance: &NfInstance, sel: &LmfSelectionInput) -> bool {
+    let Some(info) = instance.lmf_info.as_ref() else {
+        return true;
+    };
+    let lists = |name: &str, want: &str| {
+        info.get(name)
+            .and_then(|v| v.as_array())
+            .is_none_or(|a| a.iter().any(|v| v.as_str() == Some(want)))
+    };
+    if !lists("servingAccessTypes", sel.access_type)
+        || !lists("servingAnNodeTypes", sel.an_node_type)
+        || !lists("servingRatTypes", sel.rat_type)
+    {
+        return false;
+    }
+    // An LMF dedicated to some client types (e.g. emergency) serves only those.
+    if let Some(types) = info.get("servingClientTypes").and_then(|v| v.as_array()) {
+        let Some(want) = sel.client_type.as_deref() else {
+            return false;
+        };
+        if !types.iter().any(|v| v.as_str() == Some(want)) {
+            return false;
+        }
+    }
+    let tai_list = info.get("taiList").and_then(|v| v.as_array());
+    let range_list = info.get("taiRangeList").and_then(|v| v.as_array());
+    if tai_list.is_none() && range_list.is_none() {
+        // "the LMF can be selected for any TAI in the serving network".
+        return true;
+    }
+    let in_list = tai_list.is_some_and(|l| {
+        l.iter().any(|t| {
+            lmf_plmn_matches(t.get("plmnId"), sel) && parse_tac(t.get("tac")) == Some(sel.tac)
+        })
+    });
+    let in_range = range_list.is_some_and(|l| {
+        l.iter().any(|r| {
+            lmf_plmn_matches(r.get("plmnId"), sel)
+                && r.get("tacRangeList")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|ranges| ranges.iter().any(|x| tac_range_contains(x, sel.tac)))
+        })
+    });
+    in_list || in_range
+}
+
+/// The `nlmf-loc` endpoint of a cached LMF profile.
+fn lmf_endpoint(inst: &NfInstance) -> Option<(String, u16)> {
+    let svc = inst.find_service(nextgcore_sbi::types::SbiServiceType::NlmfLoc)?;
+    let host = svc
+        .ip_addresses
+        .first()
+        .or(inst.ipv4_addresses.first())
+        .or(svc.fqdn.as_ref())
+        .or(inst.fqdn.as_ref())?;
+    Some((host.clone(), svc.port))
+}
+
+/// Pick an LMF among `instances` (TS 23.273 §5.1, #997):
+/// - with `sel`, only those whose `lmfInfo` serves the UE; when none does, `None`
+///   unless `fallback`, which picks among all of them;
+/// - a held-down endpoint (#664) only when nothing else is left;
+/// - the lowest `priority` (TS 29.510 §6.1.6.2.2: "lower values indicate a higher
+///   priority");
+/// - among those, weighted by `capacity` ("weight relative to other NF instances of
+///   the same type"), `draw` choosing the point. A zero total takes the first.
+fn select_lmf(
+    instances: &[NfInstance],
+    sel: Option<&LmfSelectionInput>,
+    fallback: bool,
+    held_down: impl Fn(&str, u16) -> bool,
+    draw: u64,
+) -> Option<(String, u16)> {
+    let usable: Vec<(&NfInstance, (String, u16))> = instances
+        .iter()
+        .filter_map(|i| lmf_endpoint(i).map(|ep| (i, ep)))
+        .collect();
+    let serving: Vec<_> = match sel {
+        Some(sel) => usable
+            .iter()
+            .filter(|(i, _)| lmf_serves(i, sel))
+            .cloned()
+            .collect(),
+        None => usable.clone(),
+    };
+    let pool = if !serving.is_empty() {
+        serving
+    } else if fallback && !usable.is_empty() {
+        if let Some(sel) = sel {
+            log::warn!(
+                "No cached LMF serves TAI {}-{}/{:06X} ({}); selecting among all {}",
+                sel.mcc,
+                sel.mnc,
+                sel.tac,
+                sel.access_type,
+                usable.len()
+            );
+        }
+        usable
+    } else {
+        return None;
+    };
+    let (up, down): (Vec<_>, Vec<_>) = pool.into_iter().partition(|(_, (h, p))| !held_down(h, *p));
+    let pool = if up.is_empty() { down } else { up };
+    let best = pool.iter().map(|(i, _)| i.priority).min()?;
+    let tied: Vec<_> = pool
+        .into_iter()
+        .filter(|(i, _)| i.priority == best)
+        .collect();
+    let total: u64 = tied.iter().map(|(i, _)| u64::from(i.capacity)).sum();
+    if total == 0 {
+        return tied.into_iter().next().map(|(_, ep)| ep);
+    }
+    let mut point = draw % total;
+    for (i, ep) in &tied {
+        let w = u64::from(i.capacity);
+        if point < w {
+            return Some(ep.clone());
+        }
+        point -= w;
+    }
+    None
+}
+
+/// Resolve an LMF for `sel` (TS 23.273 §5.1, #997): a cached LMF serving the UE's
+/// TAI and access type; else NRF discovery qualified with the UE's `tai` (TS 29.510
+/// §6.2.3.2.3.1), merged into the cache; else any cached LMF; else the configured
+/// fallback. Without `sel` (no UE in hand, e.g. a cancellation), any cached LMF.
+#[doc(hidden)]
+pub async fn resolve_lmf_endpoint_for(sel: Option<&LmfSelectionInput>) -> Option<(String, u16)> {
     let sbi_ctx = global_context();
     let service = nextgcore_sbi::types::SbiServiceType::NlmfLoc;
-    let endpoint_from_cache = |instances: Vec<NfInstance>| {
-        let inst = instances.first()?;
-        let svc = inst.find_service(service)?;
-        let host = svc
-            .ip_addresses
-            .first()
-            .or(inst.ipv4_addresses.first())
-            .or(svc.fqdn.as_ref())
-            .or(inst.fqdn.as_ref())?;
-        Some((host.clone(), svc.port))
-    };
+    let draw = u64::from_le_bytes(
+        uuid::Uuid::new_v4().as_bytes()[..8]
+            .try_into()
+            .expect("8 bytes"),
+    );
+    let held = |h: &str, p: u16| sbi_ctx.endpoint_held_down(h, p);
 
-    if let Some(ep) = endpoint_from_cache(sbi_ctx.find_nf_instances_by_service(service).await) {
+    let cached = sbi_ctx.find_nf_instances_by_service(service).await;
+    if let Some(ep) = select_lmf(&cached, sel, sel.is_none(), held, draw) {
         return Some(ep);
     }
-    if amf_nrf_discover("LMF", "nlmf-loc").await.is_ok() {
-        if let Some(ep) = endpoint_from_cache(sbi_ctx.find_nf_instances_by_service(service).await) {
+    let mut extra: Vec<(&str, String)> = Vec::new();
+    if let Some(sel) = sel {
+        extra.push((
+            "tai",
+            nextgcore_sbi::uri_encode::encode_query_value(&sel.tai_json().to_string()),
+        ));
+        if let Some(ct) = &sel.client_type {
+            extra.push((
+                "client-type",
+                nextgcore_sbi::uri_encode::encode_query_value(ct),
+            ));
+        }
+    }
+    if amf_nrf_discover_qualified("LMF", "nlmf-loc", &extra)
+        .await
+        .is_ok()
+    {
+        let cached = sbi_ctx.find_nf_instances_by_service(service).await;
+        if let Some(ep) = select_lmf(&cached, sel, true, held, draw) {
             return Some(ep);
         }
     }
@@ -2513,7 +2827,17 @@ pub async fn call_lmf_determine_location(
         // answer rather than sending a request that cannot be served.
         return Err("the UE context carries no SUPI to position".to_string());
     };
-    let (lmf_host, lmf_port) = resolve_lmf_endpoint().await.ok_or_else(|| {
+    // TS 23.273 §5.1 (#997): an LMF serving the UE's TAI and access type, for the
+    // client type the GMLC named.
+    let sel = LmfSelectionInput::for_ue(
+        ue,
+        serving_rat_type(ue),
+        request_pos_info
+            .get("lcsClientType")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+    );
+    let (lmf_host, lmf_port) = resolve_lmf_endpoint_for(Some(&sel)).await.ok_or_else(|| {
         "no LMF endpoint (NRF discovery found none, LMF_SBI_ADDR unset)".to_string()
     })?;
 
@@ -5788,5 +6112,209 @@ mod eps_handover_sbi_tests {
             content_type::APPLICATION_JSON,
         );
         assert!(parse_eps_handover_created(&no_psi).is_err());
+    }
+}
+
+/// #997: LMF selection by served area, priority and capacity (TS 23.273 §5.1,
+/// TS 29.510 §6.1.6.2.2 / §6.1.6.2.46). Pure: no cache, no NRF.
+#[cfg(test)]
+mod lmf_selection_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn lmf(
+        id: &str,
+        port: u16,
+        priority: u16,
+        capacity: u16,
+        info: Option<serde_json::Value>,
+    ) -> NfInstance {
+        let mut i = NfInstance::new(id, nextgcore_sbi::types::NfType::Lmf);
+        let mut svc = NfService::new("nlmf-loc", nextgcore_sbi::types::SbiServiceType::NlmfLoc);
+        svc.ip_addresses = vec!["127.0.0.1".into()];
+        svc.port = port;
+        i.add_service(svc);
+        i.priority = priority;
+        i.capacity = capacity;
+        i.lmf_info = info;
+        i
+    }
+
+    fn serving_tac(tac: &str) -> Option<serde_json::Value> {
+        Some(json!({ "taiList": [{ "plmnId": { "mcc": "001", "mnc": "01" }, "tac": tac }] }))
+    }
+
+    fn ue_at(tac: u32) -> LmfSelectionInput {
+        LmfSelectionInput {
+            mcc: "001".into(),
+            mnc: "01".into(),
+            tac,
+            access_type: "3GPP_ACCESS",
+            an_node_type: "GNB",
+            rat_type: "NR",
+            client_type: None,
+        }
+    }
+
+    fn pick(instances: &[NfInstance], sel: &LmfSelectionInput, draw: u64) -> Option<u16> {
+        select_lmf(instances, Some(sel), false, |_, _| false, draw).map(|(_, p)| p)
+    }
+
+    /// Two LMFs serving different TAIs: the UE's TAI decides, in either cache order.
+    #[test]
+    fn the_lmf_serving_the_ues_tai_is_selected() {
+        let a = lmf("a", 1, 0, 100, serving_tac("000001"));
+        let b = lmf("b", 2, 0, 100, serving_tac("000002"));
+        for order in [vec![a.clone(), b.clone()], vec![b, a]] {
+            for draw in 0..4 {
+                assert_eq!(pick(&order, &ue_at(2), draw), Some(2));
+                assert_eq!(pick(&order, &ue_at(1), draw), Some(1));
+            }
+            assert_eq!(pick(&order, &ue_at(3), 0), None, "none serves TAC 3");
+            assert!(
+                select_lmf(&order, Some(&ue_at(3)), true, |_, _| false, 0).is_some(),
+                "the fallback takes any LMF"
+            );
+        }
+    }
+
+    /// The lowest priority value wins; capacity weights the draw among equals.
+    #[test]
+    fn priority_then_capacity_orders_the_serving_lmfs() {
+        let low = lmf("low", 1, 5, 1000, None);
+        let high = lmf("high", 2, 1, 100, None);
+        let high2 = lmf("high2", 3, 1, 300, None);
+        let all = [low, high, high2];
+        let mut hits = [0usize; 4];
+        for draw in 0..400 {
+            hits[pick(&all, &ue_at(1), draw).unwrap() as usize] += 1;
+        }
+        assert_eq!(hits[1], 0, "priority 5 loses to priority 1");
+        assert_eq!((hits[2], hits[3]), (100, 300), "weighted 100:300");
+    }
+
+    /// A held-down endpoint (#664) is taken only when nothing else serves.
+    #[test]
+    fn a_held_down_lmf_is_the_last_resort() {
+        let all = [lmf("a", 1, 0, 100, None), lmf("b", 2, 9, 100, None)];
+        let down1 = |_: &str, p: u16| p == 1;
+        assert_eq!(
+            select_lmf(&all, Some(&ue_at(1)), false, down1, 0).map(|e| e.1),
+            Some(2)
+        );
+        let all_down = |_: &str, _: u16| true;
+        assert_eq!(
+            select_lmf(&all, Some(&ue_at(1)), false, all_down, 0).map(|e| e.1),
+            Some(1)
+        );
+    }
+
+    /// `LmfInfo` members: access type, AN node / RAT type, client types, TAI ranges
+    /// (start/end and the TS 29.510 example pattern), PLMN.
+    /// #997 review m2: the RAT comes from the association the UE's live record is
+    /// bound to, as that association's NG Setup recorded it; NR once it is gone.
+    #[tokio::test]
+    async fn a_ue_on_an_eutra_association_is_served_by_e_utra() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::test_support::init_context();
+        let (ue_id, assoc) = (9_970_101u64, 9_970_102u64);
+        let ctx = crate::context::amf_self();
+        let store = ctx.read().unwrap().ue_store();
+        store.insert(
+            ue_id,
+            crate::ngap_path::UeNasContext::new(ue_id, 1, assoc, false),
+        );
+        let ue = AmfUe::new(ue_id, 1);
+        assert_eq!(
+            serving_rat_type(&ue),
+            crate::context::RatType::Nr,
+            "unknown: NR"
+        );
+        ctx.read()
+            .unwrap()
+            .association_rat_set(assoc, crate::context::RatType::Eutra);
+        assert_eq!(serving_rat_type(&ue), crate::context::RatType::Eutra);
+        let sel = LmfSelectionInput::for_ue(&ue, serving_rat_type(&ue), None);
+        assert_eq!((sel.an_node_type, sel.rat_type), ("NG_ENB", "EUTRA"));
+        ctx.read().unwrap().association_rat_remove(assoc);
+        assert_eq!(serving_rat_type(&ue), crate::context::RatType::Nr);
+        store.remove(ue_id);
+    }
+
+    /// `for_ue` takes the AN node and RAT types from the serving node's RAT.
+    #[test]
+    fn the_serving_node_decides_an_node_and_rat_type() {
+        let ue = AmfUe::new(1, 1);
+        let nr = LmfSelectionInput::for_ue(&ue, crate::context::RatType::Nr, None);
+        assert_eq!((nr.an_node_type, nr.rat_type), ("GNB", "NR"));
+        let lte = LmfSelectionInput::for_ue(&ue, crate::context::RatType::Eutra, None);
+        assert_eq!((lte.an_node_type, lte.rat_type), ("NG_ENB", "EUTRA"));
+    }
+
+    #[test]
+    fn lmf_info_restrictions_are_honoured() {
+        let i = |info| lmf("x", 1, 0, 100, Some(info));
+        let ue = ue_at(0x54E123);
+        assert!(lmf_serves(&i(json!({})), &ue), "no restriction");
+        assert!(!lmf_serves(
+            &i(json!({ "servingAccessTypes": ["NON_3GPP_ACCESS"] })),
+            &ue
+        ));
+        assert!(!lmf_serves(
+            &i(json!({ "servingAnNodeTypes": ["NG_ENB"] })),
+            &ue
+        ));
+        assert!(!lmf_serves(
+            &i(json!({ "servingRatTypes": ["EUTRA"] })),
+            &ue
+        ));
+        // A UE on an ng-eNB: NG_ENB / EUTRA, from the node serving it.
+        let mut on_ng_enb = ue.clone();
+        on_ng_enb.an_node_type = "NG_ENB";
+        on_ng_enb.rat_type = "EUTRA";
+        let ng_enb_only = json!({ "servingAnNodeTypes": ["NG_ENB"], "servingRatTypes": ["EUTRA"] });
+        assert!(lmf_serves(&i(ng_enb_only), &on_ng_enb));
+        assert!(!lmf_serves(
+            &i(json!({ "servingAnNodeTypes": ["GNB"] })),
+            &on_ng_enb
+        ));
+        assert!(!lmf_serves(
+            &i(json!({ "servingRatTypes": ["NR"] })),
+            &on_ng_enb
+        ));
+        let emergency = json!({ "servingClientTypes": ["EMERGENCY_SERVICES"] });
+        assert!(!lmf_serves(&i(emergency.clone()), &ue));
+        let mut em_ue = ue.clone();
+        em_ue.client_type = Some("EMERGENCY_SERVICES".into());
+        assert!(lmf_serves(&i(emergency), &em_ue));
+        let range = |r: serde_json::Value, mnc: &str| {
+            i(json!({ "taiRangeList": [{
+                "plmnId": { "mcc": "001", "mnc": mnc }, "tacRangeList": [r]
+            }]}))
+        };
+        assert!(lmf_serves(
+            &range(json!({ "start": "54E000", "end": "54EFFF" }), "01"),
+            &ue
+        ));
+        assert!(!lmf_serves(
+            &range(json!({ "start": "543000", "end": "5433E7" }), "01"),
+            &ue
+        ));
+        assert!(!lmf_serves(
+            &range(json!({ "start": "54E000", "end": "54EFFF" }), "02"),
+            &ue
+        ));
+        assert!(lmf_serves(
+            &range(json!({ "pattern": "^54E[0-9a-fA-F]{3}$" }), "01"),
+            &ue
+        ));
+        assert!(!lmf_serves(
+            &range(json!({ "pattern": "^54F[0-9a-fA-F]{3}$" }), "01"),
+            &ue
+        ));
+        assert!(
+            !lmf_serves(&range(json!({ "pattern": "^(54E|54F).*$" }), "01"), &ue),
+            "unparsed: no match"
+        );
     }
 }

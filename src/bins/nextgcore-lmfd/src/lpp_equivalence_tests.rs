@@ -106,7 +106,7 @@ fn without_new_fields(
     what: &str,
 ) -> Vec<std::collections::BTreeMap<String, String>> {
     for c in &mut new {
-        for k in ["ue_rx_tx_ns", "gnb_rx_tx_ns", "meas_time"] {
+        for k in ["ue_rx_tx_ns", "gnb_rx_tx_ns", "meas_time", "nr_ecid"] {
             assert_eq!(c.remove(k).as_deref(), Some("None"), "{what}: {k}");
         }
         check_dl_prs_id(c, what);
@@ -247,6 +247,7 @@ fn every_report_adapts_as_the_old_adapters_did() {
                 .is_some_and(|t| t.starts_with("Some(SlotTime")));
             check_dl_prs_id(&mut new, "Multi-RTT");
             check_eutra(&mut new, "Multi-RTT");
+            assert_eq!(new.remove("nr_ecid").as_deref(), Some("None"), "Multi-RTT");
             assert_eq!(new.remove("ecid_rtt_ns").as_deref(), Some("None"));
             assert_eq!(new.remove("ecid_rtt_width_ns").as_deref(), Some("None"));
             check_rstd_reference(&mut new, "Multi-RTT");

@@ -836,6 +836,34 @@ pub fn build_delete_bearer_response_for_ebis(
     Ok(msg)
 }
 
+/// Create Bearer Response refusing every bearer of the request (#641 stop-gap,
+/// TS 29.274 §7.2.4, Table 7.2.4-1): the message Cause, and one Bearer Context
+/// per bearer of the request (Bearer Contexts are mandatory and "all the bearer
+/// contexts included in the corresponding Create Bearer Request shall be
+/// included"), each with its EBI and the same Cause.
+pub fn build_create_bearer_refusal(
+    sgw_s11_teid: u32,
+    ebis: &[u8],
+    cause_value: GtpCause,
+    sequence_number: u32,
+) -> S11BuildResult<Gtp2Message> {
+    let mut msg = new_message(
+        message_type::CREATE_BEARER_RESPONSE,
+        sgw_s11_teid,
+        sequence_number,
+    );
+    msg.add_ie(typed_ie(|buf| {
+        Gtp2CauseIe::new(cause_value as u8).encode(buf, 0)
+    })?);
+    for ebi in ebis {
+        let mut bc = Gtp2BearerContextIe::new();
+        bc.set_ebi(*ebi);
+        bc.set_cause(&Gtp2CauseIe::new(cause_value as u8));
+        msg.add_bearer_context(0, &bc);
+    }
+    Ok(msg)
+}
+
 /// Delete Bearer Response for a request that named a PDN connection by its
 /// Linked EPS Bearer ID (TS 29.274 Table 7.2.10.2-1: the LBI is included "if
 /// the request contained" it, and Bearer Contexts only for EBIs it named) (#688).
