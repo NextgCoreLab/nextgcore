@@ -44,6 +44,34 @@ pub const T3485_DURATION: Duration = Duration::from_secs(8);
 /// Retransmissions before the fifth expiry aborts the procedure (§6.4.2.6).
 const T3485_RETRANSMISSIONS: u32 = 4;
 
+/// How long before the Serving GW's own deadline the answer must be out: the
+/// S11 one-way delay and the SGW's poll granularity, with room to spare.
+const ANSWER_MARGIN: Duration = Duration::from_secs(2);
+
+/// How long the MME may take to answer a Create Bearer Request (#1216 review M5).
+///
+/// The Serving GW relays the request under its S11 transaction, T3 x (N3 + 1)
+/// (TS 29.274 §7.6; nextgcore-sgwcd uses the GTP library default, 3 s x 4 =
+/// 12 s), and gives up after it: it removes the bearer at the SGW-U and answers
+/// the PDN GW "Remote peer not responding" (sgwcd `dedicated_bearer::mme_silent`).
+/// An answer after that would set the bearer up in the MME, the eNB and the UE
+/// only. So the MME answers within that window less [`ANSWER_MARGIN`] (10 s):
+/// whatever is unsettled by then fails, paging "Unable to page UE", anything
+/// else "UE not responding". T3485 x 5 (40 s, TS 24.301 §6.4.2.6) and paging
+/// are cut short by it; a per-procedure T3/N3 on the SGW/PGW legs is tracked
+/// separately.
+pub fn answer_budget() -> Duration {
+    let sgw = nextgcore_gtp::v2::xact::Gtp2XactConfig::default();
+    (sgw.t3_response * (sgw.n3_requests + 1)).saturating_sub(ANSWER_MARGIN)
+}
+
+/// Whether `ue` is in an Attach that has not completed (Annex F NOTE 2). A UE
+/// that registered by TAU, or arrived by an N26 handover, never had an Attach
+/// in this MME and is not waited on.
+fn attach_in_progress(ue: &crate::context::MmeUe) -> bool {
+    !ue.attach_completed && ue.nas_eps.type_ == crate::context::MmeEpsType::AttachRequest
+}
+
 /// One bearer of a Create Bearer Request.
 #[derive(Debug, Clone)]
 struct Item {
@@ -99,6 +127,8 @@ struct PendingActivation {
     pti: u8,
     items: Vec<Item>,
     parked: Parked,
+    /// When the request arrived: the answer is due by [`answer_budget`] after it.
+    received: Instant,
 }
 
 /// The activations in progress. Process-global like `bearer_deactivation`'s;
@@ -120,18 +150,12 @@ pub fn in_flight(peer: SocketAddr, seq: u32) -> bool {
     pending().iter().any(|p| p.peer == peer && p.seq == seq)
 }
 
-/// Whether `ebi` of `mme_ue_id` is a bearer this module is activating.
-pub fn activating(mme_ue_id: u64, ebi: u8) -> bool {
-    pending()
-        .iter()
-        .filter(|p| p.mme_ue_id == mme_ue_id)
-        .any(|p| p.items.iter().any(|i| i.ebi == ebi && i.bearer_id != 0))
-}
-
 /// A Bearer Context of the request.
 struct Requested {
     tft: Option<Vec<u8>>,
     qos: Option<(u8, u8, u8, u8, u64, u64, u64, u64)>,
+    /// A Bearer QoS IE is present (it may still not parse).
+    qos_present: bool,
     sgw_s1u: Option<Gtp2FTeidIe>,
     pgw_s5u: Option<Gtp2FTeidIe>,
 }
@@ -150,6 +174,9 @@ fn free_ebi(ctx: &MmeContext, mme_ue_id: u64, taken: &[u8]) -> Option<u8> {
 }
 
 /// Carry out the Serving GW's Create Bearer Request (`raw`, `seq` from `peer`).
+///
+/// `in_flight` and the later `pending().push` are not one critical section; that
+/// is safe because S11 requests are dispatched on one thread.
 pub fn handle_create_bearer_request(raw: &[u8], seq: u32, peer: SocketAddr) {
     if in_flight(peer, seq) {
         log::debug!(
@@ -181,6 +208,7 @@ pub fn handle_create_bearer_request(raw: &[u8], seq: u32, peer: SocketAddr) {
             qos: bc
                 .get_ie(Gtp2IeType::BearerQos as u8, 0)
                 .and_then(|ie| crate::s11_handler::parse_bearer_qos(&ie.value)),
+            qos_present: bc.get_ie(Gtp2IeType::BearerQos as u8, 0).is_some(),
             sgw_s1u: bc
                 .fteid(0)
                 .ok()
@@ -209,10 +237,35 @@ pub fn handle_create_bearer_request(raw: &[u8], seq: u32, peer: SocketAddr) {
         .sgw_ue_find_by_id(ue.sgw_ue_id)
         .map(|s| s.sgw_s11_teid)
         .unwrap_or(0);
-    let linked_ebi = msg
+    let Some(linked_ebi) = msg
         .get_ie(Gtp2IeType::Ebi as u8, 0)
         .and_then(|ie| ie.value.first().map(|v| v & 0x0f))
-        .unwrap_or(0);
+    else {
+        // #1216 review: the Linked EBI is M (Table 7.2.3-1): 70 Mandatory IE
+        // missing, naming it as the Offending IE (§8.4: type, length 0, instance).
+        log::warn!("S11 Create Bearer Request seq={seq}: no Linked EBI");
+        let mut rsp = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+            crate::s11_build::message_type::CREATE_BEARER_RESPONSE,
+            sgw_teid,
+            seq,
+        ));
+        rsp.add_ie(nextgcore_gtp::v2::Gtp2Ie::from_slice(
+            Gtp2IeType::Cause as u8,
+            0,
+            &[
+                GtpCause::MandatoryIeMissing as u8,
+                0,
+                Gtp2IeType::Ebi as u8,
+                0,
+                0,
+                0,
+            ],
+        ));
+        if let Err(e) = crate::gtp_path::send_response_to_sgwc(peer, &rsp) {
+            log::error!("S11 Create Bearer Response to {peer} failed: {e}");
+        }
+        return;
+    };
     // The PDN connection: the one whose default bearer is the Linked EBI.
     let sess = ue
         .sess_list
@@ -257,7 +310,14 @@ pub fn handle_create_bearer_request(raw: &[u8], seq: u32, peer: SocketAddr) {
             refused: Some(c),
         };
         let (Some(tft), Some(qos)) = (r.tft, r.qos) else {
-            items.push(refused(GtpCause::MandatoryIeMissing));
+            // #1216 review: a Bearer QoS that is there but does not parse (under
+            // 22 octets) is "Mandatory IE incorrect", not "missing".
+            let cause = if r.qos_present && r.qos.is_none() {
+                GtpCause::MandatoryIeIncorrect
+            } else {
+                GtpCause::MandatoryIeMissing
+            };
+            items.push(refused(cause));
             continue;
         };
         let Some(sgw_s1u) = r.sgw_s1u else {
@@ -289,9 +349,11 @@ pub fn handle_create_bearer_request(raw: &[u8], seq: u32, peer: SocketAddr) {
                 b.pgw_s5u_ip = ip_of(p);
             }
         }
-        if let Some(s) = ctx.sess_pool.write().unwrap().get_mut(&sess.id) {
-            s.bearer_list.push(bearer_id);
-        }
+        // #1216 review B1: the bearer joins the session's bearer list only once
+        // it is set up (`answer`). Until then no other procedure (a Service
+        // Request's or TAU's Initial Context Setup, a Modify Bearer Request, a
+        // handover's E-RAB lists, a TAU ACCEPT's EPS bearer context status)
+        // carries it; only this module's E-RAB SETUP does.
         items.push(Item {
             bearer_id,
             ebi,
@@ -312,6 +374,7 @@ pub fn handle_create_bearer_request(raw: &[u8], seq: u32, peer: SocketAddr) {
         pti,
         items,
         parked: Parked::No,
+        received: Instant::now(),
     };
     if p.items.iter().all(|i| i.refused.is_some()) {
         answer(ctx, &p);
@@ -345,7 +408,7 @@ pub fn handle_create_bearer_request(raw: &[u8], seq: u32, peer: SocketAddr) {
         pending().push(p);
         return;
     }
-    if !ue.attach_completed {
+    if attach_in_progress(&ue) {
         // Annex F NOTE 2: no separate Bearer Setup before the Attach completes.
         log::info!(
             "[{}] Create Bearer Request for EBIs {:?} during the Attach: held until ATTACH \
@@ -628,17 +691,27 @@ fn answer(ctx: &MmeContext, p: &PendingActivation) {
                 set_up += 1;
                 bc.set_cause(&Gtp2CauseIe::new(GtpCause::RequestAccepted as u8));
                 if let Some(bearer) = ctx.bearer_find_by_id(item.bearer_id) {
-                    if let Some(v4) = bearer.enb_s1u_ip.ipv4 {
-                        bc.set_fteid(
-                            0,
-                            &Gtp2FTeidIe::new_ipv4(iface::S1U_ENB_GTP_U, bearer.enb_s1u_teid, v4),
-                        );
+                    // #1216 review M4: v4, v6 or dual, as the bearer's addresses are.
+                    let fteid = crate::s11_build::fteid_of;
+                    if let Some(f) = fteid(
+                        iface::S1U_ENB_GTP_U,
+                        bearer.enb_s1u_teid,
+                        &bearer.enb_s1u_ip,
+                    ) {
+                        bc.set_fteid(0, &f);
                     }
-                    if let Some(v4) = bearer.sgw_s1u_ip.ipv4 {
-                        bc.set_fteid(
-                            1,
-                            &Gtp2FTeidIe::new_ipv4(iface::S1U_SGW_GTP_U, bearer.sgw_s1u_teid, v4),
-                        );
+                    if let Some(f) = fteid(
+                        iface::S1U_SGW_GTP_U,
+                        bearer.sgw_s1u_teid,
+                        &bearer.sgw_s1u_ip,
+                    ) {
+                        bc.set_fteid(1, &f);
+                    }
+                    // B1: set up, so it is now one of the session's bearers.
+                    if let Some(s) = ctx.sess_pool.write().unwrap().get_mut(&bearer.sess_id) {
+                        if !s.bearer_list.contains(&item.bearer_id) {
+                            s.bearer_list.push(item.bearer_id);
+                        }
                     }
                     // #1015: the Serving GW now holds this eNB tunnel.
                     if let Some(b) = ctx.bearer_pool.write().unwrap().get_mut(&item.bearer_id) {
@@ -691,8 +764,37 @@ pub fn sweep(ctx: &MmeContext, now: Instant) {
     }
     let mut resend: Vec<(u64, Vec<u8>)> = Vec::new();
     let mut done = Vec::new();
+    let mut to_signal = Vec::new();
+    let budget = answer_budget();
     {
         let mut list = pending();
+        // #1216 review M3/M5: a parked request is settled when its UE is gone,
+        // when the Attach it waited for ended without completing, or when the
+        // answer budget runs out; signalled ones are cut short by the budget too.
+        let mut i = 0;
+        while i < list.len() {
+            let p = &mut list[i];
+            let ue = ctx.mme_ue_find_by_id(p.mme_ue_id);
+            let late = now.saturating_duration_since(p.received) >= budget;
+            let cause = match (&ue, p.parked) {
+                (None, _) => Some(GtpCause::ContextNotFound),
+                (Some(_), Parked::Paging) if late => Some(GtpCause::UnableToPageUe),
+                (Some(_), _) if late => Some(GtpCause::UeNotResponding),
+                _ => None,
+            };
+            if let Some(cause) = cause {
+                fail_unsignalled(p, cause);
+                done.push(list.remove(i));
+                continue;
+            }
+            if p.parked == Parked::Attach && ue.as_ref().is_some_and(|u| !attach_in_progress(u)) {
+                // The Attach is over (completed without the hook, or replaced):
+                // signal now; `signal` refuses it if the UE has no S1 connection.
+                to_signal.push(list.remove(i));
+                continue;
+            }
+            i += 1;
+        }
         for p in list.iter_mut().filter(|p| p.parked == Parked::No) {
             let connected = ctx.mme_ue_find_by_id(p.mme_ue_id).is_some_and(|ue| {
                 ctx.enb_ue_find_by_id(ue.enb_ue_id)
@@ -739,6 +841,10 @@ pub fn sweep(ctx: &MmeContext, now: Instant) {
     for p in done {
         answer(ctx, &p);
     }
+    for mut p in to_signal {
+        signal(ctx, &mut p);
+        finish_or_keep(ctx, p);
+    }
 }
 
 /// Force every T3485 of `mme_ue_id` to have expired. Test-only.
@@ -748,6 +854,14 @@ pub(crate) fn expire_for_test(mme_ue_id: u64) {
         for i in p.items.iter_mut() {
             i.deadline = Instant::now() - Duration::from_millis(1);
         }
+    }
+}
+
+/// Make every activation of `mme_ue_id` `by` older. Test-only.
+#[cfg(test)]
+pub(crate) fn age_for_test(mme_ue_id: u64, by: Duration) {
+    for p in pending().iter_mut().filter(|p| p.mme_ue_id == mme_ue_id) {
+        p.received -= by;
     }
 }
 

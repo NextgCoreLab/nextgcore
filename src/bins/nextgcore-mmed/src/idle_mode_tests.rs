@@ -1935,8 +1935,20 @@ fn attached(tac: u16) -> Ue {
 /// The eNB's E-RAB SETUP RESPONSE for `set_up` (at 10.0.0.9, TEID 0x9900 + E-RAB) and
 /// `failed`.
 fn erab_setup_response(ue: &Ue, set_up: &[u8], failed: &[u8]) {
+    erab_setup_response_at(ue, &[10, 0, 0, 9], set_up, failed);
+}
+
+/// The UE's current S1 connection (a paged UE has a new one).
+fn current_enb_ue(ue: &Ue) -> crate::context::EnbUe {
     let ctx = mme_self();
-    let enb_ue = ctx.enb_ue_find_by_id(ue.enb_ue_id).unwrap();
+    let mme_ue = ctx.mme_ue_find_by_id(ue.mme_ue_id).unwrap();
+    ctx.enb_ue_find_by_id(mme_ue.enb_ue_id).unwrap()
+}
+
+/// As [`erab_setup_response`], from the eNB transport address `addr`.
+fn erab_setup_response_at(ue: &Ue, addr: &[u8], set_up: &[u8], failed: &[u8]) {
+    let ctx = mme_self();
+    let enb_ue = current_enb_ue(ue);
     crate::s1ap_handler::handle_erab_setup_response(
         ctx,
         ue.enb_id,
@@ -1946,7 +1958,7 @@ fn erab_setup_response(ue: &Ue, set_up: &[u8], failed: &[u8]) {
             .iter()
             .map(|e| nextgcore_s1ap::ErabSetupItem {
                 erab_id: *e,
-                transport_layer_address: vec![10, 0, 0, 9],
+                transport_layer_address: addr.to_vec(),
                 gtp_teid: 0x9900 + u32::from(*e),
             })
             .collect::<Vec<_>>(),
@@ -1965,7 +1977,7 @@ fn erab_setup_response(ue: &Ue, set_up: &[u8], failed: &[u8]) {
 /// The UE's plain ESM message `esm_type` (0xC6 accept, 0xC7 reject) for EBI `ebi`.
 fn ue_esm(ue: &Ue, ebi: u8, esm: &[u8]) {
     let ctx = mme_self();
-    let enb_ue = ctx.enb_ue_find_by_id(ue.enb_ue_id).unwrap();
+    let enb_ue = current_enb_ue(ue);
     let mme_ue = ctx.mme_ue_find_by_id(ue.mme_ue_id).unwrap();
     let mut msg = vec![(ebi << 4) | 0x02, 0x00];
     msg.extend_from_slice(esm);
@@ -2175,6 +2187,397 @@ fn a_dedicated_bearer_the_ue_never_answers_fails_after_five_t3485_expiries() {
     release(&ue);
 }
 
+/// Park the Create Bearer Request `seq` behind the paging of `ue`, made ECM-IDLE.
+fn paged_cbr(ue: &Ue, seq: u32, sgw: &UdpSocket, mme: std::net::SocketAddr) {
+    let ctx = mme_self();
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    let complete = release_to_command(ue, sgw);
+    crate::s1ap_handler::handle_ue_context_release_complete(ctx, ue.enb_id, &complete);
+    let _ = crate::s1ap_path::take_tapped_for_test(ue.enb_id);
+    sgw.send_to(&cbr(ue.local_teid, seq), mme).unwrap();
+    wait_pdu(ue.enb_id, is_paging);
+    assert_eq!(crate::bearer_activation::pending_count(), 1, "parked");
+}
+
+/// The EBIs of a GTPv2-C message's Bearer Contexts.
+fn bearer_ebis(m: &Gtp2Message) -> Vec<u8> {
+    m.get_ies(Gtp2IeType::BearerContext as u8)
+        .into_iter()
+        .filter_map(|ie| Gtp2BearerContextIe::decode(&ie.value).ok())
+        .filter_map(|bc| bc.ebi().ok())
+        .collect()
+}
+
+/// After the paged UE's Initial Context Setup (`erabs`, which must be only the
+/// established bearer 5): its response, the Modify Bearer Request (bearer 5
+/// only), then the E-RAB SETUP for 6, the eNB's and the UE's answers, and the
+/// Create Bearer Response `seq`.
+fn paged_activation_completes(
+    ue: &Ue,
+    erabs: Vec<u8>,
+    sgw: &UdpSocket,
+    mme: std::net::SocketAddr,
+    seq: u32,
+) {
+    let ctx = mme_self();
+    assert_eq!(
+        erabs,
+        vec![5],
+        "the bearer being activated is not in the ICS"
+    );
+    let new = current_enb_ue(ue);
+    crate::s1ap_handler::handle_initial_context_setup_response(
+        ctx,
+        ue.enb_id,
+        &nextgcore_s1ap::InitialContextSetupResponse {
+            mme_ue_s1ap_id: new.mme_ue_s1ap_id,
+            enb_ue_s1ap_id: new.enb_ue_s1ap_id,
+            erab_setup_list: vec![nextgcore_s1ap::ErabSetupItem {
+                erab_id: 5,
+                transport_layer_address: vec![10, 0, 0, 9],
+                gtp_teid: 0x9905,
+            }],
+            erab_failed_list: vec![],
+        },
+    );
+    let (mbr, _) = recv(sgw, 34);
+    assert_eq!(
+        bearer_ebis(&mbr),
+        vec![5],
+        "nor in the Modify Bearer Request"
+    );
+    answer_modify_bearer(sgw, mme, ue, &mbr, 16, &[(5, 16)]);
+    let items = wait_pdu(ue.enb_id, erab_setup);
+    assert_eq!(
+        items.iter().map(|i| i.0).collect::<Vec<_>>(),
+        vec![6],
+        "one E-RAB SETUP, for 6"
+    );
+    erab_setup_response(ue, &[6], &[]);
+    ue_esm(ue, 6, &[0xc6]);
+    let (cause, bcs) = create_bearer_response(sgw, seq);
+    assert_eq!(cause, 16);
+    assert_eq!(
+        bcs,
+        vec![(
+            6,
+            16,
+            Some((0x9906, [10, 0, 0, 9])),
+            Some(DEDICATED_SGW_S1U)
+        )]
+    );
+    let b6 = ctx.bearer_find_by_ebi(ue.mme_ue_id, 6).unwrap();
+    assert!(
+        ctx.sess_find_by_id(ue.sess_id)
+            .unwrap()
+            .bearer_list
+            .contains(&b6),
+        "set up: now one of the session's bearers"
+    );
+    assert_eq!(crate::bearer_activation::pending_count(), 0);
+}
+
+/// #1216 review B1, TS 23.401 §5.4.1 step 3: an ECM-IDLE UE paged for a
+/// dedicated bearer answers with a SERVICE REQUEST. The Initial Context Setup
+/// and the Modify Bearer Request carry only the established bearer, and the new
+/// one is set up once, by its own E-RAB SETUP (a second setup of an active E-RAB
+/// is "Multiple E-RAB ID instances" at a real eNB, TS 36.413 §8.2.1.4).
+#[test]
+fn a_paged_activation_sets_the_bearer_up_once_after_the_service_request() {
+    let _guard = lock_s11();
+    crate::bearer_activation::clear_for_test();
+    let (sgw, route) = sgw(Gtp2XactConfig::default());
+    let mme = route.server.local_addr();
+    let ctx = mme_self();
+    let ue = attached(0x1216);
+    paged_cbr(&ue, 0x1216, &sgw, mme);
+
+    let new_enb_ue = ctx.enb_ue_add(ue.enb_id, 12160);
+    ctx.enb_ue_associate_mme_ue(new_enb_ue, ue.mme_ue_id);
+    crate::nas_dispatch::nas_eps_handle_uplink(
+        ctx,
+        crate::nas_dispatch::UplinkNas {
+            enb_ue_id: new_enb_ue,
+            nas_pdu: &service_request(1, 1),
+            s_tmsi: None,
+        },
+    );
+    let (erabs, _, _) = wait_pdu(ue.enb_id, ics);
+    paged_activation_completes(&ue, erabs, &sgw, mme, 0x1216);
+    ctx.enb_ue_remove(new_enb_ue);
+    release(&ue);
+}
+
+/// The EPS bearer context status of the TAU ACCEPT in an INITIAL CONTEXT SETUP
+/// REQUEST (EEA0, so readable).
+fn ics_tau_accept_status(pdu: &g::S1AP_PDU) -> Option<Option<u16>> {
+    let nas = ics_nas_pdu(pdu)?;
+    (nas.get(7) == Some(&0x49)).then(|| {
+        nas[8..]
+            .windows(4)
+            .find(|w| w[0] == 0x57 && w[1] == 0x02)
+            .map(|w| u16::from(w[2]) | (u16::from(w[3]) << 8))
+    })
+}
+
+/// #1216 review M2 (and B1 on the TAU path): the UE answers the CreateBearer
+/// paging with an integrity-protected TAU (TS 24.301 §5.6.2.2.1). Paging stops,
+/// the TAU ACCEPT goes in an Initial Context Setup whose EPS bearer context
+/// status lists only bearer 5, and the parked activation runs on its response.
+#[test]
+fn a_tau_answering_an_activation_paging_runs_the_activation() {
+    let _guard = lock_s11();
+    crate::bearer_activation::clear_for_test();
+    let (sgw, route) = sgw(Gtp2XactConfig::default());
+    let mme = route.server.local_addr();
+    let ctx = mme_self();
+    let ue = attached(0x1217);
+    paged_cbr(&ue, 0x1217, &sgw, mme);
+
+    let new_enb_ue = ctx.enb_ue_add(ue.enb_id, 12170);
+    ctx.enb_ue_associate_mme_ue(new_enb_ue, ue.mme_ue_id);
+    if let Some(e) = ctx.enb_ue_pool.write().unwrap().get_mut(&new_enb_ue) {
+        e.saved.tai = ue.tai.clone();
+    }
+    crate::nas_dispatch::nas_eps_handle_uplink(
+        ctx,
+        crate::nas_dispatch::UplinkNas {
+            enb_ue_id: new_enb_ue,
+            nas_pdu: &tau_request(0, 0),
+            s_tmsi: None,
+        },
+    );
+    let mut status = None;
+    let (erabs, _, nas) = wait_pdu(ue.enb_id, |pdu| {
+        status = ics_tau_accept_status(pdu);
+        ics(pdu)
+    });
+    assert!(nas, "the TAU ACCEPT in an Initial Context Setup");
+    assert_eq!(
+        status,
+        Some(Some(1 << 5)),
+        "the TAU ACCEPT reports only bearer 5 active"
+    );
+    assert!(
+        !ctx.mme_ue_find_by_id(ue.mme_ue_id)
+            .unwrap()
+            .t3413
+            .is_running(),
+        "paging stopped"
+    );
+    paged_activation_completes(&ue, erabs, &sgw, mme, 0x1217);
+    ctx.enb_ue_remove(new_enb_ue);
+    release(&ue);
+}
+
+/// #1216 review M3 (b): a UE that registered by TAU (or arrived by an N26
+/// handover) never had an Attach in this MME; its activation is signalled at
+/// once, not held for an ATTACH COMPLETE that will never come.
+#[test]
+fn an_activation_for_a_ue_registered_by_tau_is_not_held() {
+    let _guard = lock_s11();
+    crate::bearer_activation::clear_for_test();
+    let (sgw, route) = sgw(Gtp2XactConfig::default());
+    let ue = seed(0x1218, &[5]);
+    let ctx = mme_self();
+    ctx.mme_ue_pool
+        .write()
+        .unwrap()
+        .get_mut(&ue.mme_ue_id)
+        .unwrap()
+        .nas_eps
+        .type_ = crate::context::MmeEpsType::TauRequest;
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    sgw.send_to(&cbr(ue.local_teid, 0x1218), route.server.local_addr())
+        .unwrap();
+    let items = wait_pdu(ue.enb_id, erab_setup);
+    assert_eq!(items[0].0, 6, "signalled, attach_completed notwithstanding");
+    crate::bearer_activation::clear_for_test();
+    release(&ue);
+}
+
+/// #1216 review M3 (c): the UE context goes (a detach, an implicit detach)
+/// while its activation is parked behind paging. The Serving GW is answered
+/// "Context not found" and nothing stays pending or stored.
+#[test]
+fn an_activation_whose_ue_goes_away_is_answered() {
+    let _guard = lock_s11();
+    crate::bearer_activation::clear_for_test();
+    let (sgw, route) = sgw(Gtp2XactConfig::default());
+    let mme = route.server.local_addr();
+    let ctx = mme_self();
+    let ue = attached(0x1219);
+    paged_cbr(&ue, 0x1219, &sgw, mme);
+    let b6 = ctx
+        .bearer_find_by_ebi(ue.mme_ue_id, 6)
+        .expect("EBI 6 reserved");
+    ctx.mme_ue_remove(ue.mme_ue_id);
+    crate::bearer_activation::sweep(ctx, Instant::now());
+    let (cause, bcs) = create_bearer_response(&sgw, 0x1219);
+    assert_eq!(cause, 64, "Context not found");
+    assert_eq!(bcs, vec![(6, 64, None, None)]);
+    assert_eq!(crate::bearer_activation::pending_count(), 0);
+    assert!(ctx.bearer_find_by_id(b6).is_none(), "the bearer is gone");
+    release(&ue);
+}
+
+/// #1216 review M5: the MME answers inside the Serving GW's S11 transaction,
+/// T3 x (N3 + 1) (TS 29.274 §7.6), whatever T3485 or paging still have to run.
+/// A request still held for an Attach that never completes (M3 (a)), and a
+/// signalled one the UE has not answered, are refused "UE not responding" at
+/// the budget; the E-RAB the eNB set up is released.
+#[test]
+fn an_activation_is_answered_within_the_serving_gws_transaction() {
+    let sgw_window = {
+        let c = Gtp2XactConfig::default();
+        c.t3_response * (c.n3_requests + 1)
+    };
+    assert!(crate::bearer_activation::answer_budget() < sgw_window);
+    assert_eq!(
+        crate::bearer_activation::answer_budget(),
+        Duration::from_secs(10)
+    );
+
+    let _guard = lock_s11();
+    crate::bearer_activation::clear_for_test();
+    let (sgw, route) = sgw(Gtp2XactConfig::default());
+    let mme = route.server.local_addr();
+    let ctx = mme_self();
+
+    // Signalled, the E-RAB up, the UE silent.
+    let ue = attached(0x121a);
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    sgw.send_to(&cbr(ue.local_teid, 0x121a), mme).unwrap();
+    let _ = wait_pdu(ue.enb_id, erab_setup);
+    erab_setup_response(&ue, &[6], &[]);
+    let just_under = crate::bearer_activation::answer_budget() - Duration::from_millis(500);
+    crate::bearer_activation::age_for_test(ue.mme_ue_id, just_under);
+    crate::bearer_activation::sweep(ctx, Instant::now());
+    assert!(quiet(&sgw), "not before the budget");
+    crate::bearer_activation::age_for_test(ue.mme_ue_id, Duration::from_secs(1));
+    crate::bearer_activation::sweep(ctx, Instant::now());
+    let (cause, bcs) = create_bearer_response(&sgw, 0x121a);
+    assert_eq!(cause, 87, "UE not responding");
+    assert_eq!(bcs, vec![(6, 87, None, None)]);
+    wait_pdu(ue.enb_id, is_erab_release_command);
+    release(&ue);
+
+    // Held for an Attach that never completes.
+    let ue = seed(0x121b, &[5]);
+    ctx.mme_ue_pool
+        .write()
+        .unwrap()
+        .get_mut(&ue.mme_ue_id)
+        .unwrap()
+        .nas_eps
+        .type_ = crate::context::MmeEpsType::AttachRequest;
+    sgw.send_to(&cbr(ue.local_teid, 0x121b), mme).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while crate::bearer_activation::pending_count() == 0 {
+        assert!(Instant::now() < deadline, "the request is held");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    crate::bearer_activation::age_for_test(ue.mme_ue_id, crate::bearer_activation::answer_budget());
+    crate::bearer_activation::sweep(ctx, Instant::now());
+    let (cause, _) = create_bearer_response(&sgw, 0x121b);
+    assert_eq!(cause, 87);
+    assert!(ctx.bearer_find_by_ebi(ue.mme_ue_id, 6).is_none());
+    assert_eq!(crate::bearer_activation::pending_count(), 0);
+    release(&ue);
+}
+
+/// #1216 review: a Create Bearer Request without its Linked EBI (M, TS 29.274
+/// Table 7.2.3-1) is answered 70 Mandatory IE missing naming the EBI as the
+/// Offending IE (§8.4); a Bearer QoS too short to parse is 69 Mandatory IE
+/// incorrect, not "missing".
+#[test]
+fn a_create_bearer_request_with_a_bad_ie_names_the_fault() {
+    use nextgcore_gtp::v2::{Gtp2FTeidIe, Gtp2Ie};
+    let _guard = lock_s11();
+    crate::bearer_activation::clear_for_test();
+    let (sgw, route) = sgw(Gtp2XactConfig::default());
+    let mme = route.server.local_addr();
+    let ue = attached(0x121d);
+
+    let mut no_lbi =
+        Gtp2Message::decode(&mut bytes::Bytes::from(cbr(ue.local_teid, 0x121d))).unwrap();
+    no_lbi.ies.retain(|ie| ie.ie_type != Gtp2IeType::Ebi as u8);
+    sgw.send_to(&no_lbi.encode(), mme).unwrap();
+    let (rsp, _) = recv(&sgw, 96);
+    assert_eq!(
+        rsp.get_ie(Gtp2IeType::Cause as u8, 0)
+            .unwrap()
+            .value
+            .to_vec(),
+        vec![70, 0, Gtp2IeType::Ebi as u8, 0, 0, 0]
+    );
+
+    let mut short = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+        95,
+        ue.local_teid,
+        0x121e,
+    ));
+    short.add_ie(nextgcore_gtp::v2::Gtp2EbiIe::new(5).to_ie(0));
+    let mut bc = Gtp2BearerContextIe::new();
+    bc.set_ebi(0);
+    bc.add_ie(Gtp2Ie::from_slice(
+        Gtp2IeType::BearerTft as u8,
+        0,
+        &[0x21, 0x31, 0x00, 0x02, 0x30, 0x11],
+    ));
+    bc.set_fteid(
+        0,
+        &Gtp2FTeidIe::new_ipv4(1, DEDICATED_SGW_S1U, [10, 0, 0, 2]),
+    );
+    bc.add_ie(Gtp2Ie::from_slice(
+        Gtp2IeType::BearerQos as u8,
+        0,
+        &[0x08, 1, 0, 0],
+    ));
+    short.add_bearer_context(0, &bc);
+    sgw.send_to(&short.encode(), mme).unwrap();
+    let (cause, bcs) = create_bearer_response(&sgw, 0x121e);
+    assert_eq!(cause, 69);
+    assert_eq!(bcs, vec![(0, 69, None, None)]);
+    release(&ue);
+}
+
+/// #1216 review M4: an IPv6-only eNB S1-U. The accepted bearer's Create Bearer
+/// Response carries the S1-U eNodeB F-TEID with the IPv6 address (TS 29.274
+/// Table 7.2.4-2), not cause 16 without it.
+#[test]
+fn an_ipv6_enb_s1u_is_answered_in_the_create_bearer_response() {
+    let _guard = lock_s11();
+    crate::bearer_activation::clear_for_test();
+    let (sgw, route) = sgw(Gtp2XactConfig::default());
+    let ue = attached(0x121c);
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    sgw.send_to(&cbr(ue.local_teid, 0x121c), route.server.local_addr())
+        .unwrap();
+    let _ = wait_pdu(ue.enb_id, erab_setup);
+    let v6: [u8; 16] = [
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x09,
+    ];
+    erab_setup_response_at(&ue, &v6, &[6], &[]);
+    ue_esm(&ue, 6, &[0xc6]);
+    let (rsp, _) = recv(&sgw, 96);
+    let bc = Gtp2BearerContextIe::decode(
+        &rsp.get_ie(Gtp2IeType::BearerContext as u8, 0)
+            .unwrap()
+            .value,
+    )
+    .unwrap();
+    assert_eq!(bc.cause().unwrap().unwrap().cause, 16);
+    let enb = bc.fteid(0).unwrap().expect("the S1-U eNodeB F-TEID");
+    assert_eq!(
+        (enb.teid, enb.ipv6_addr, enb.ipv4_addr),
+        (0x9906, Some(v6), None)
+    );
+    let sgw_f = bc.fteid(1).unwrap().expect("the S1-U SGW F-TEID");
+    assert_eq!(sgw_f.ipv4_addr, Some([10, 0, 0, 2]));
+    release(&ue);
+}
+
 /// #641, TS 23.401 §5.4.1 step 3: an ECM-IDLE UE is paged; when it cannot be reached
 /// the request is refused "Unable to page UE". During an Attach the request waits for
 /// ATTACH COMPLETE (Annex F NOTE 2). A TEID naming no UE is "Context not found".
@@ -2203,6 +2606,13 @@ fn a_create_bearer_request_waits_for_paging_and_for_the_attach() {
 
     // During the Attach: nothing is signalled until ATTACH COMPLETE.
     let ue = seed(0x0645, &[5]);
+    ctx.mme_ue_pool
+        .write()
+        .unwrap()
+        .get_mut(&ue.mme_ue_id)
+        .unwrap()
+        .nas_eps
+        .type_ = crate::context::MmeEpsType::AttachRequest;
     crate::s1ap_path::tap_enb_for_test(ue.enb_id);
     sgw.send_to(&cbr(ue.local_teid, 0x0645), mme).unwrap();
     std::thread::sleep(Duration::from_millis(300));

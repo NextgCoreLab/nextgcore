@@ -1190,10 +1190,13 @@ fn emm_tau_request(
         mme_ue.paging.type_ = crate::context::PagingType::None;
         // #984 review: a paging for a deactivation parked behind it (#862)
         // needs the user plane too: its steps 4c-8 run on the ICS response.
+        // #1216 review M2: so does an activation parked behind it (#641): its
+        // E-RAB SETUP follows the ICS response (`bearer_activation::on_connected`).
         matches!(
             was,
             crate::context::PagingType::DownlinkDataNotification
                 | crate::context::PagingType::DeleteBearer
+                | crate::context::PagingType::CreateBearer
         )
     } else {
         false
