@@ -705,7 +705,9 @@ pub fn handle_tau_request(
         offset += 1;
 
         match iei {
-            0x31 => {
+            // #1172, TS 24.301 Table 8.2.29.1: the UE network capability is IEI
+            // 0x58; 0x31 is the MS network capability, skipped as a TLV below.
+            0x58 => {
                 // UE network capability
                 if offset < data.len() {
                     let len = data[offset] as usize;
@@ -768,6 +770,18 @@ pub fn handle_tau_request(
                 // harmless but loses the value.
                 old_guti_type_mapped = Some(iei & 0x01 != 0);
             }
+            // #1172: the type 3 (TV) IEs of Table 8.2.29.1 have fixed lengths and
+            // no length octet. Skipped as TLV, their first value octet was read
+            // as a length and the walk lost every IE after them (a DRX parameter
+            // before the EPS bearer context status, #993, is the common case).
+            // Old P-TMSI signature (TV 4), Nonce_UE (TV 5), DRX parameter (TV
+            // 3), Old location area identification (TV 6), Additional
+            // information requested (TV 2): the value octets after the IEI.
+            0x19 => offset += 3,
+            0x55 => offset += 4,
+            0x5C => offset += 2,
+            0x13 => offset += 5,
+            0x17 => offset += 1,
             _ => {
                 // Skip unknown IE
                 if iei & 0x80 != 0 {
@@ -1285,6 +1299,37 @@ mod tests {
         ]);
         body.extend_from_slice(trailing);
         body
+    }
+
+    /// #1172, TS 24.301 Table 8.2.29.1: the UE network capability is IEI 0x58;
+    /// 0x31 (the MS network capability) is not taken for it. The fixed-length TV
+    /// IEs (here a DRX parameter, TV 3, and an old P-TMSI signature, TV 4) are
+    /// skipped by their lengths, so the EPS bearer context status after them is
+    /// still read.
+    #[test]
+    fn tau_request_ue_network_capability_and_tv_ies() {
+        let (enb_ue, mut ue) = (EnbUe::default(), MmeUe::default());
+        let parsed = handle_tau_request(
+            &enb_ue,
+            &mut ue,
+            &tau_body(&[
+                0x31, 0x02, 0xE5, 0xE0, // MS network capability: not the UE's
+                0x19, 0xAA, 0xBB, 0xCC, // Old P-TMSI signature (TV 4)
+                0x58, 0x02, 0xF0, 0x70, // UE network capability: EEA0-3, EIA1-3
+                0x5C, 0x0A, 0x00, // DRX parameter (TV 3)
+                0x57, 0x02, 0x20, 0x00, // EPS bearer context status: EBI 5
+            ]),
+        )
+        .unwrap();
+        let cap = parsed
+            .ue_network_capability
+            .expect("the UE network capability");
+        assert_eq!((cap.eea, cap.eia), (0xF0, 0x70));
+        assert_eq!(
+            parsed.eps_bearer_context_status,
+            Some(1 << 5),
+            "the IE after the TV IEs is read"
+        );
     }
 
     /// **#347**: a TAU from 5GS is recognised by the UE status IE's `N1 mode reg` bit —
