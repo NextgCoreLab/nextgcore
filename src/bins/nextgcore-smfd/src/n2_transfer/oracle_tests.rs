@@ -148,12 +148,16 @@ fn tunnel() -> impl Strategy<Value = (u32, [u8; 4])> {
     (any::<u32>(), any::<[u8; 4]>())
 }
 
-/// BitRate ::= INTEGER (0..4000000000000, ...)
+/// BitRate ::= INTEGER (0..4000000000000, ...), and past it (#1163): both
+/// codecs send a rate past the root as 4000000000000.
 fn bit_rate() -> impl Strategy<Value = u64> {
     prop_oneof![
         Just(0u64),
         0u64..=4_000_000_000_000,
-        Just(4_000_000_000_000)
+        Just(4_000_000_000_000),
+        Just(4_000_000_000_001),
+        4_000_000_000_001u64..,
+        Just(u64::MAX)
     ]
 }
 
