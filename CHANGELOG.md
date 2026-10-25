@@ -28,7 +28,9 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   ignored on load and dropped at the next write. The stored stamp is forgotten when the
   association goes down. A session request answered with cause 72 "No established PFCP
   Association" (a UPF that restarted after the Association Setup) tears the association down and
-  releases that UPF's sessions, so it is set up again (#966).
+  releases that UPF's sessions, so it is set up again (#966). Only the association the request
+  was sent on: a late cause 72 answering a request sent before a re-association leaves the
+  association set up since, and its sessions, in place.
 - smfd takes its durable snapshot through a poisoned lock: the maps and the IPv4 pool are read
   as the panicking writer left them, and the poison is logged. Before, a poisoned map was written
   as empty over the last good snapshot, and the next restart restored nothing (#1178).

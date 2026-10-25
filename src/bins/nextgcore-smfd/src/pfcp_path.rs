@@ -455,6 +455,10 @@ pub struct AssociationState {
     /// (lower) sequence number must not overwrite a newer metric
     /// (TS 29.244 §8.2.52).
     pub peer_load_seq: Option<u32>,
+    /// Which association this is: bumped at every successful Association Setup
+    /// (#966 follow-up). A session request remembers the one it was sent on, so a late
+    /// cause 72 answering it cannot tear down the association set up since.
+    pub generation: u64,
 }
 
 // ============================================================================
@@ -1366,6 +1370,7 @@ impl PfcpClient {
         upf_seid: Option<u64>,
         body: &[u8],
     ) -> Result<(u8, Vec<u8>), PfcpRequestError> {
+        let generation = self.assoc.read().await.generation;
         let result = self.request(msg_type, upf_seid, body).await;
         if let Ok((_, response)) = &result {
             crate::up_path::note_session_request(smf_seid, msg_type, body, response);
@@ -1378,18 +1383,32 @@ impl PfcpClient {
             if find_ie(response, 19).and_then(|v| v.first().copied())
                 == Some(nextgcore_pfcp::types::PfcpCause::NoEstablishedPfcpAssociation as u8)
             {
-                self.association_lost("the UPF answered cause 72, No established PFCP Association")
-                    .await;
+                self.association_lost(
+                    generation,
+                    "the UPF answered cause 72, No established PFCP Association",
+                )
+                .await;
             }
         }
         result
     }
 
-    /// The UPF no longer has this association (#966 review M1): tear it down once,
-    /// releasing this UPF's sessions, so the association loop sets it up again.
-    async fn association_lost(&self, reason: &str) {
+    /// The UPF no longer has the association `generation` (#966 review M1): tear it
+    /// down once, releasing this UPF's sessions, so the association loop sets it up
+    /// again. #966 follow-up: only that association. A cause 72 answering a request sent
+    /// before a re-association (a retransmission's late answer, or one the old
+    /// incarnation sent as it went) says nothing about the association set up since.
+    async fn association_lost(&self, generation: u64, reason: &str) {
         let was_associated = {
             let mut assoc = self.assoc.write().await;
+            if assoc.generation != generation {
+                log::info!(
+                    "PFCP: {} answered a request of an earlier association ({reason}); the \
+                     current one is kept",
+                    self.peer()
+                );
+                return;
+            }
             std::mem::replace(&mut assoc.associated, false)
         };
         if was_associated {
@@ -1816,6 +1835,7 @@ impl PfcpClient {
         {
             let mut assoc = self.assoc.write().await;
             assoc.associated = true;
+            assoc.generation = assoc.generation.wrapping_add(1);
             assoc.peer_recovery_time_stamp = None;
             assoc.up_function_features = resp.up_function_features;
             self.publish_associated(&assoc);
@@ -3877,6 +3897,73 @@ mod tests {
             "the association is torn down"
         );
         assert!(!kept, "and the sessions the UPF no longer has are flushed");
+    }
+
+    /// #966 follow-up: a cause 72 that answers a request sent on an EARLIER association
+    /// does not tear down the one set up since. Here the request goes out, the
+    /// association is replaced (a new Association Setup bumps its generation) while it
+    /// is in flight, and its late answer is cause 72: the current association and its
+    /// sessions are kept.
+    #[tokio::test]
+    async fn a_late_cause_72_does_not_tear_down_the_next_association() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _map_guard = N4_TEST_LOCK.lock().await;
+        let (client, upf) = make_client_with_peer().await;
+        let upf = Arc::new(upf);
+        let fake = upf.clone();
+        let answered =
+            tokio::spawn(async move { answer_association_setup_on(&fake, 200, false).await });
+        client.associate().await.expect("association");
+        let _ = answered.await;
+        seed_pfcp_session("96605", 0x966e);
+        let seid = crate::context::derive_cp_n4_seid("96605");
+        record_session_peer(seid, client.peer());
+
+        let (received_tx, received_rx) = tokio::sync::oneshot::channel::<()>();
+        let (answer_tx, answer_rx) = tokio::sync::oneshot::channel::<()>();
+        let fake = upf.clone();
+        let answered = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let (len, from) = fake.recv_from(&mut buf).await.unwrap();
+            let h = parse_wire_header(&buf[..len]).unwrap();
+            let _ = received_tx.send(());
+            let _ = answer_rx.await;
+            let pkt = encode_wire_message(
+                pfcp_message_type::SESSION_MODIFICATION_RESPONSE,
+                Some(0),
+                h.sequence_number,
+                &[0x00, 0x13, 0x00, 0x01, 72],
+            );
+            fake.send_to(&pkt, from).await.unwrap();
+        });
+        let reassociate = async {
+            let _ = received_rx.await;
+            // What a successful Association Setup does meanwhile.
+            client.assoc.write().await.generation += 1;
+            let _ = answer_tx.send(());
+        };
+        let (result, ()) = tokio::join!(
+            client.session_request(
+                pfcp_message_type::SESSION_MODIFICATION_REQUEST,
+                seid,
+                Some(0x966e),
+                &[],
+            ),
+            reassociate
+        );
+        let _ = answered.await;
+        drain_restart_fanouts(Duration::from_secs(5)).await;
+        let kept = pfcp_session_present("96605");
+        forget_pfcp_session("96605");
+        forget_session_peer(seid);
+
+        assert!(result.is_ok());
+        assert!(
+            client.is_associated().await,
+            "the association set up since is kept"
+        );
+        assert!(kept, "and its sessions");
     }
 
     /// #966 review m3: the stored stamp goes when the association does (TS 23.007 §19A,
