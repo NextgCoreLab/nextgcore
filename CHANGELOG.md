@@ -13,6 +13,14 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 ## [Unreleased]
 
 ### Changed
+- smfd (PGW-C): a Create Session Request for the [IMSI, EBI, interface type] of an existing PDN
+  connection deletes that connection first, at the PGW-U too, and frees its PDN address (TS
+  29.274 §7.2.1). If the EBI belongs to a dedicated bearer, only that bearer and its PGW-U rules
+  are deleted. Before, every MME or SGW-C restart left one more PGW-U session and address for
+  the same UE. An SGW-C whose Restart counter moves ahead has its PDN connections deleted (TS
+  23.007 §18, §17.1A.1). The counter is read from the Recovery IE of a Create Session Request
+  or an Echo. A retransmitted Create Session Request is answered with the response already sent
+  (TS 29.274 §7.6) and is not served again (#1194).
 - smfd answers its own SM Context Create and Update errors as SmContextCreateError /
   SmContextUpdateError (TS 29.502 Tables 6.1.3.2.3.1-3, 6.1.3.3.4.2.2-2): the ProblemDetails is
   under `error`, at `application/json`. A failed activation adds `upCnxState: DEACTIVATED`, and a

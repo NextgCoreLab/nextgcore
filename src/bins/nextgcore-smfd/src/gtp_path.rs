@@ -832,6 +832,16 @@ pub struct S5S8Server {
     /// #619: the locally configured PCC rules (`smf.pcc_rules`) this PGW-C activates as
     /// dedicated bearers when a PDN connection is established.
     local_pcc_rules: std::sync::RwLock<Vec<crate::eps_bearer::LocalPccRule>>,
+    /// #1194, TS 23.007 §18: the remote Restart counter of each SGW-C, by the GTP-C
+    /// entity's address (the sender F-TEID's, or an Echo's source). Volatile, as §18
+    /// requires.
+    peer_restart: std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, u8>>,
+    /// #1194, TS 29.274 §7.6: the response sent to a request tracked by
+    /// [`Self::begin_command`], by (peer, sequence number), kept for the hold; a
+    /// retransmission of the request is answered with it rather than served again.
+    responses: std::sync::Mutex<
+        std::collections::HashMap<(SocketAddr, u32), (std::time::Instant, Vec<u8>)>,
+    >,
 }
 
 /// The process-wide S5/S8 server.
@@ -863,6 +873,8 @@ impl S5S8Server {
             commands_seen: std::sync::Mutex::new(std::collections::HashMap::new()),
             command_hold: Gtp2XactConfig::default().response_hold,
             local_pcc_rules: std::sync::RwLock::new(Vec::new()),
+            peer_restart: std::sync::Mutex::new(std::collections::HashMap::new()),
+            responses: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
 
         // Receive loop.
@@ -945,9 +957,71 @@ impl S5S8Server {
     }
 
     /// Send a triggered (response) message, echoing the request's sequence number.
+    ///
+    /// #1194: the response to a request being served under [`Self::begin_command`] is
+    /// kept, so a retransmission of that request gets the same answer (TS 29.274 §7.6).
     pub async fn send_response_public(&self, peer: SocketAddr, encoded: &[u8]) {
+        if let Some(seq) = gtp2_sequence_number(encoded) {
+            let tracked = self
+                .commands_seen
+                .lock()
+                .is_ok_and(|seen| matches!(seen.get(&(peer, seq)), Some(None)));
+            if tracked {
+                if let Ok(mut responses) = self.responses.lock() {
+                    let now = std::time::Instant::now();
+                    responses.retain(|_, (at, _)| now.duration_since(*at) < self.command_hold);
+                    responses.insert((peer, seq), (now, encoded.to_vec()));
+                }
+            }
+        }
         if let Err(e) = self.socket.send_to(encoded, peer).await {
             log::error!("S5/S8 response to {peer} failed: {e}");
+        }
+    }
+
+    /// The response kept for the request `(peer, seq)`, if it was answered within the
+    /// hold (#1194).
+    pub(crate) fn cached_response(&self, peer: SocketAddr, seq: u32) -> Option<Vec<u8>> {
+        let now = std::time::Instant::now();
+        let responses = self.responses.lock().ok()?;
+        responses
+            .get(&(peer, seq))
+            .filter(|(at, _)| now.duration_since(*at) < self.command_hold)
+            .map(|(_, r)| r.clone())
+    }
+
+    /// Note an SGW-C's Restart counter (TS 23.007 §18), for the GTP-C entity at `entity`.
+    /// `true` when it says the SGW-C restarted since the stored one: its PDN connections
+    /// are then stale (§17.1A.1). The first value is stored; a value behind the stored
+    /// one is a reordered datagram, discarded.
+    pub(crate) fn note_sgw_restart_counter(&self, entity: std::net::IpAddr, counter: u8) -> bool {
+        use nextgcore_gtp::v2::RestartOrder;
+        let Ok(mut seen) = self.peer_restart.lock() else {
+            return false;
+        };
+        let mut stored = seen.get(&entity).copied();
+        let previous = stored;
+        let order = nextgcore_gtp::v2::note_restart_counter(&mut stored, counter);
+        if let Some(value) = stored {
+            seen.insert(entity, value);
+        }
+        drop(seen);
+        match (order, previous) {
+            (RestartOrder::Restarted, Some(previous)) => {
+                log::warn!(
+                    "S5/S8: SGW-C {entity} restarted (Restart counter {previous} -> {counter}); \
+                     its PDN connections are stale (TS 23.007 §18, §17.1A.1)"
+                );
+                true
+            }
+            (RestartOrder::Stale, Some(previous)) => {
+                log::warn!(
+                    "S5/S8: SGW-C {entity} Restart counter {counter} is behind the stored \
+                     {previous}: discarded as a reordered message (TS 23.007 §18)"
+                );
+                false
+            }
+            _ => false,
         }
     }
 
@@ -1097,6 +1171,21 @@ impl S5S8Server {
         self.xact.lock().await.outstanding()
     }
 
+    /// #1194: an Echo's Recovery is the SGW-C's at the message's source address (TS
+    /// 23.007 §18); a restart deletes the PDN connections it held (§17.1A.1).
+    async fn note_echo_recovery(&self, msg: &nextgcore_gtp::v2::Gtp2Message, peer: SocketAddr) {
+        let Some(counter) = msg
+            .get_ie(nextgcore_gtp::v2::Gtp2IeType::Recovery as u8, 0)
+            .and_then(|ie| ie.value.first().copied())
+        else {
+            return;
+        };
+        if self.note_sgw_restart_counter(peer.ip(), counter) {
+            crate::gtp_handler::delete_pdn_connections_of_sgw(peer.ip(), "the SGW-C restarted")
+                .await;
+        }
+    }
+
     async fn handle_datagram(&self, data: &[u8], peer: SocketAddr) {
         let mut bytes = bytes::Bytes::copy_from_slice(data);
         let msg = match nextgcore_gtp::v2::Gtp2Message::decode(&mut bytes) {
@@ -1116,10 +1205,12 @@ impl S5S8Server {
                 nextgcore_gtp::v2::Gtp2Message::echo_response(seq, self.restart_counter);
             reply.header.sequence_number = seq;
             self.send_response_public(peer, &reply.encode()).await;
+            self.note_echo_recovery(&msg, peer).await;
             return;
         }
         if msg_type == gtp2_message_type::ECHO_RESPONSE {
             log::debug!("S5/S8 Echo Response from {peer}");
+            self.note_echo_recovery(&msg, peer).await;
             return;
         }
 
@@ -1145,6 +1236,14 @@ impl S5S8Server {
         // An initial message from the SGW-C.
         crate::gtp_handler::dispatch_s5s8_request(self, msg_type, seq, data, peer).await;
     }
+}
+
+/// The sequence number of an encoded GTPv2-C message (TS 29.274 §5.5.1): octets 9-11
+/// with a TEID, 5-7 without.
+fn gtp2_sequence_number(encoded: &[u8]) -> Option<u32> {
+    let off = if encoded.first()? & 0x08 != 0 { 8 } else { 4 };
+    let b = encoded.get(off..off + 3)?;
+    Some(u32::from_be_bytes([0, b[0], b[1], b[2]]))
 }
 
 /// Bind the S5/S8 socket from configuration and install it process-wide (#52).

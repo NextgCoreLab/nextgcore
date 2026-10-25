@@ -1071,6 +1071,9 @@ pub struct SmfSess {
     pub sgw_s5c_teid: u32,
     /// SGW S5C IP
     pub sgw_s5c_ip: IpAddr,
+    /// #1194: the interface type of the SGW-C's (sender) F-TEID for control plane,
+    /// part of what identifies a PDN connection at the PGW (TS 29.274 §7.2.1).
+    pub sgw_s5c_interface_type: u8,
     /// SMF N4 SEID
     pub smf_n4_seid: u64,
     /// UPF N4 SEID
@@ -1234,6 +1237,7 @@ impl SmfSess {
             smf_n4_teid: 0,
             sgw_s5c_teid: 0,
             sgw_s5c_ip: IpAddr::default(),
+            sgw_s5c_interface_type: 0,
             smf_n4_seid: 0,
             upf_n4_seid: 0,
             local_dl_teid: 0,

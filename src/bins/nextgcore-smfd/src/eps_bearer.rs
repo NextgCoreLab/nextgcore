@@ -282,6 +282,19 @@ async fn roll_back(sess: &SmfSess, bearer: &SmfBearer, with_dl: bool) {
     }
 }
 
+/// Delete a dedicated bearer here and its PGW-U rules, sending nothing over S5/S8
+/// (#1194, a Create Session Request collided with it, TS 29.274 §7.2.1). `false` for a
+/// bearer this module did not install (`eps_rule_index` 0, e.g. one that came over N26):
+/// its rules are not this module's to remove.
+pub(crate) async fn delete_dedicated_bearer_locally(sess: &SmfSess, bearer: &SmfBearer) -> bool {
+    if bearer.eps_rule_index == 0 {
+        return false;
+    }
+    let with_dl = !downlink_descriptions(&stored_filters(bearer)).is_empty();
+    roll_back(sess, bearer, with_dl).await;
+    true
+}
+
 /// Decode a Create Bearer Response (TS 29.274 §7.2.4) into the handler's struct.
 ///
 /// The SGW's S5/S8-U F-TEID is instance 2 of the Bearer Context (Table 7.2.4-2), the
