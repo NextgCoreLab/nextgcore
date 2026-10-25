@@ -827,6 +827,34 @@ impl UeNasContext {
     }
 }
 
+impl UeNasContext {
+    /// #1247: forget the AM policy association `pol_asso_id` after the PCF terminated it
+    /// (TS 29.507 §4.2.4.3), in both places it is held. False when the UE holds another
+    /// association, or none.
+    pub(crate) fn forget_am_policy_association(&mut self, pol_asso_id: &str) -> bool {
+        if self.policy_association_id.as_deref() != Some(pol_asso_id)
+            && self.amf_ue.policy_association.id.as_deref() != Some(pol_asso_id)
+        {
+            return false;
+        }
+        self.policy_association_id = None;
+        self.amf_ue.pcf_am_policy_clear();
+        true
+    }
+
+    /// #1247: the same for the UE policy association (TS 29.525 §4.2.4.3).
+    pub(crate) fn forget_ue_policy_association(&mut self, pol_asso_id: &str) -> bool {
+        if self.ue_policy_association_id.as_deref() != Some(pol_asso_id)
+            && self.amf_ue.ue_policy_association.id.as_deref() != Some(pol_asso_id)
+        {
+            return false;
+        }
+        self.ue_policy_association_id = None;
+        self.amf_ue.pcf_ue_policy_clear();
+        true
+    }
+}
+
 impl crate::ue_store::UeIdentity for UeNasContext {
     fn amf_ue(&self) -> &AmfUe {
         &self.amf_ue
@@ -25732,6 +25760,109 @@ mod tests {
     fn clear_pcf_env() {
         std::env::remove_var("PCF_SBI_ADDR");
         std::env::remove_var("PCF_SBI_PORT");
+    }
+
+    /// **#1247, TS 29.507 §4.2.4.** The AMF serves the `notificationUri` it gives the
+    /// PCF for the AM policy association:
+    /// - `update` (§4.2.4.2) is acknowledged with 204;
+    /// - `terminate` (§4.2.4.3) is acknowledged with 204, then the association is
+    ///   forgotten and Npcf_AMPolicyControl_Delete'd;
+    /// - a termination naming an association the UE does not hold deletes nothing;
+    /// - an unknown UE gets 404.
+    ///
+    /// TS 29.525 §4.2.4.3 likewise: a UE policy termination is followed by
+    /// Npcf_UEPolicyControl_Delete.
+    ///
+    /// REVERT-VERIFIED: without the route, `update` is 404. Without the Deletes, the
+    /// PCF sees neither DELETE.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_pcfs_policy_notifications_are_served_and_a_termination_deletes() {
+        let (_pcf, port, seen) = recording_nf().await;
+        let _env = SmfEnvGuard::acquire(port).await;
+        set_pcf_env(port);
+        let ngap = test_ngap_server().await;
+        let (id, supi) = (12_470_001u64, "imsi-001010001247001");
+        let mut ue = ue_with_policy_associations(id, "am-pol-1247", "ue-pol-1247");
+        ue.amf_ue.supi = Some(supi.to_string());
+        ue.amf_ue.policy_association.id = Some("am-pol-1247".to_string());
+        ue.amf_ue.ue_policy_association.id = Some("ue-pol-1247".to_string());
+        ngap.ue_auth_state.insert(id, ue);
+        let notify = |path: String, body: serde_json::Value| {
+            crate::namf_server::namf_request_handler(
+                nextgcore_sbi::message::SbiRequest::post(path)
+                    .with_json_body(&body)
+                    .expect("json"),
+            )
+        };
+        let base = format!("/namf-callback/v1/{supi}");
+
+        let update = notify(
+            format!("{base}/am-policy-notify/update"),
+            serde_json::json!({ "resourceUri": "x/policies/am-pol-1247", "rfsp": 3 }),
+        )
+        .await;
+        assert_eq!(update.status, 204, "§4.2.4.2: acknowledged");
+        let unknown = notify(
+            "/namf-callback/v1/imsi-001010001247999/am-policy-notify/update".to_string(),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(unknown.status, 404, "no such UE");
+        let foreign = notify(
+            format!("{base}/am-policy-notify/terminate"),
+            serde_json::json!({
+                "resourceUri": "http://pcf/npcf-am-policy-control/v1/policies/someone-else",
+                "cause": "UNSPECIFIED",
+            }),
+        )
+        .await;
+        assert_eq!(foreign.status, 204);
+
+        for (op, path, kind) in [
+            (
+                "am-policy-notify",
+                "npcf-am-policy-control/v1/policies/am-pol-1247",
+                "AM",
+            ),
+            (
+                "ue-policy-notify",
+                "npcf-ue-policy-control/v1/policies/ue-pol-1247",
+                "UE",
+            ),
+        ] {
+            let terminate = notify(
+                format!("{base}/{op}/terminate"),
+                serde_json::json!({
+                    "resourceUri": format!("http://pcf/{path}"),
+                    "cause": "UNSPECIFIED",
+                }),
+            )
+            .await;
+            assert_eq!(terminate.status, 204, "{kind}: acknowledged");
+            assert!(
+                nf_saw(&seen, &format!("DELETE /{path}")).await,
+                "{kind}: the AMF deletes the terminated association; saw {:?}",
+                seen.lock().expect("seen")
+            );
+        }
+        let state = ngap.ue_auth_state.get(id).expect("the UE stays");
+        assert!(
+            state.policy_association_id.is_none()
+                && state.amf_ue.policy_association.id.is_none()
+                && state.ue_policy_association_id.is_none()
+                && state.amf_ue.ue_policy_association.id.is_none(),
+            "both associations are forgotten, NGAP side and AmfUe alike"
+        );
+        assert!(
+            !seen
+                .lock()
+                .expect("seen")
+                .iter()
+                .any(|r| r.contains("someone-else")),
+            "an association the UE does not hold is not deleted"
+        );
+        clear_pcf_env();
+        ngap.ue_auth_state.remove(id);
     }
 
     /// #622, UE-initiated and network-initiated deregistration: both end in

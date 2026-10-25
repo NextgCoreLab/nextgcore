@@ -1171,12 +1171,11 @@ pub async fn handle_am_policy_update(pol_asso_id: &str, request: &SbiRequest) ->
         updated.triggers
     );
 
-    // TS 29.507 §4.2.4.2: a policy change is pushed to the AMF as well as
-    // returned. The notify helper had NO caller before #89, so a change never
-    // reached the consumer that did not ask for it.
-    if !changed.is_empty() {
-        pcf_sbi_send_am_policy_control_notify(updated.id);
-    }
+    // #1247: no UpdateNotify here. This is the AMF's own Npcf_AMPolicyControl_Update
+    // (TS 29.507 §4.2.3), and its answer is the 200 PolicyUpdate below, which carries
+    // any re-evaluated policy. UpdateNotify (§4.2.4.1) is for a change "the PCF may
+    // decide" on its own. Notifying here duplicated the response and, since the AMF's
+    // notificationUri became absolute (#1237), POSTed to the AMF on every takeover.
 
     // TS 29.523 `PLMN_CH`: report the serving-PLMN change to every
     // Npcf_EventExposure subscriber that asked for it. Reported with no DNN,
@@ -6537,11 +6536,13 @@ mod tests {
         udr.stop().await.ok();
     }
 
-    /// AM policy Update applies the request, answers a `PolicyUpdate` carrying
-    /// `resourceUri`, and pushes the change to the AMF's `{notificationUri}/update`.
+    /// AM policy Update applies the request and answers a `PolicyUpdate` carrying
+    /// `resourceUri` and the applied triggers. #1247: the answer IS the delivery
+    /// (TS 29.507 §4.2.3); the AMF's `{notificationUri}/update` gets no UpdateNotify
+    /// for its own update (§4.2.4.1 makes that the PCF's own operation).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global NRF URI / PCF context
-    async fn am_policy_update_applies_request_and_notifies_the_amf() {
+    async fn am_policy_update_applies_request_and_answers_in_the_response() {
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
         use std::sync::Mutex as StdMutex;
 
@@ -6646,32 +6647,13 @@ mod tests {
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
         assert_eq!(got["triggers"], serde_json::json!(["LOC_CH", "PRA_CH"]));
 
-        // The change was pushed to the AMF at {notificationUri}/update.
-        let notifs = {
-            let mut out = Vec::new();
-            for _ in 0..200 {
-                out = seen.lock().expect("sink").clone();
-                if out.iter().any(|(uri, _)| uri.ends_with("/update")) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            out
-        };
-        let (uri, body) = notifs
-            .iter()
-            .find(|(uri, _)| uri.ends_with("/update"))
-            .cloned()
-            .unwrap_or_else(|| panic!("no AM policy notification delivered: {notifs:?}"));
-        assert!(uri.ends_with("/am-policy/update"), "delivered to {uri}");
-        assert_eq!(
-            body["resourceUri"],
-            format!("/npcf-am-policy-control/v1/policies/{pol_id}")
-        );
-        assert_eq!(
-            body["triggers"],
-            serde_json::json!(["LOC_CH", "PRA_CH"]),
-            "the notification must carry the real triggers, not [] : {body}"
+        // #1247: no UpdateNotify for the AMF's own update. Absence needs a bounded
+        // wait, well above a loopback POST's latency.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let notifs = seen.lock().expect("sink").clone();
+        assert!(
+            notifs.is_empty(),
+            "no AM policy notification for an AMF-initiated update: {notifs:?}"
         );
 
         amf.stop().await.ok();
@@ -8029,6 +8011,76 @@ mod tests {
     /// mean the port is listening. Both are the recorded stub-harness rules — a
     /// helper that drops the server or races the accept loop reports zero
     /// deliveries while the producer is correct.
+    /// #1247, TS 29.507 §4.2.3: the AMF's own update is answered in its response, with
+    /// no UpdateNotify to the AMF. That holds even when the update changes the
+    /// notificationUri and the GUAMI, as a takeover's does (#1237).
+    ///
+    /// REVERT-VERIFIED: with the notify call back in the update handler, the stand-in
+    /// AMF receives a PolicyUpdate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn an_amf_initiated_update_sends_no_update_notify() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let (_amf, amf_uri, recorded) = start_stub_event_consumer().await;
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-am-policy-control/v1/policies",
+            Some(serde_json::json!({
+                "supi": "imsi-001010000124701",
+                "notificationUri": format!("{amf_uri}/old-amf"),
+                "suppFeat": "0",
+                "guami": { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": "02552a" }
+            })),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+        let pol_asso_id = resp
+            .http
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("location"))
+            .and_then(|(_, v)| v.rsplit('/').next().map(str::to_string))
+            .or_else(|| {
+                serde_json::from_str::<serde_json::Value>(resp.http.content.as_deref()?)
+                    .ok()?
+                    .get("polAssoId")?
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .expect("association id");
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            &format!("/npcf-am-policy-control/v1/policies/{pol_asso_id}/update"),
+            Some(serde_json::json!({
+                "notificationUri": format!("{amf_uri}/new-amf"),
+                "guami": { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": "02552b" }
+            })),
+        ))
+        .await;
+        assert_eq!(resp.status, 200, "the update is answered in its response");
+        // A notify is spawned, so absence needs a bounded wait: well above a loopback
+        // POST's latency.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            recorded
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "no UpdateNotify to the AMF for its own update: {:?}",
+            recorded.lock().unwrap_or_else(|e| e.into_inner())
+        );
+        let _ = pcf_sbi_request_handler(make_request(
+            "DELETE",
+            &format!("/npcf-am-policy-control/v1/policies/{pol_asso_id}"),
+            None,
+        ))
+        .await;
+    }
+
     async fn start_stub_event_consumer() -> (
         nextgcore_sbi::server::SbiServer,
         String,
