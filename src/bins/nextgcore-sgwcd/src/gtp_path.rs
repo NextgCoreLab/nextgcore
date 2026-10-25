@@ -1884,12 +1884,31 @@ static ABANDONED_S5C: std::sync::Mutex<Vec<(SocketAddr, u32, Instant)>> =
 /// PGW's own T3 x N3.
 const ABANDONED_S5C_HOLD: Duration = Duration::from_secs(60);
 
+/// At most this many abandoned Creates are remembered. A PGW that stops
+/// answering under load abandons Creates as fast as the MMEs send them; past
+/// the cap the oldest is forgotten (its late answer, if any, is then dropped as
+/// before #1190), so the list cannot grow without limit within the hold.
+const ABANDONED_S5C_CAP: usize = 4096;
+
 fn remember_abandoned_s5c(pgw: SocketAddr, seq: u32) {
-    let now = Instant::now();
     if let Ok(mut list) = ABANDONED_S5C.lock() {
-        list.retain(|(_, _, at)| now.duration_since(*at) < ABANDONED_S5C_HOLD);
-        list.push((pgw, seq, now));
+        push_abandoned_s5c(&mut list, (pgw, seq, Instant::now()));
     }
+}
+
+/// Adds `entry` after dropping the expired ones and, at
+/// [`ABANDONED_S5C_CAP`], the oldest (#1190 review).
+fn push_abandoned_s5c(
+    list: &mut Vec<(SocketAddr, u32, Instant)>,
+    entry: (SocketAddr, u32, Instant),
+) {
+    let now = entry.2;
+    list.retain(|(_, _, at)| now.duration_since(*at) < ABANDONED_S5C_HOLD);
+    if list.len() >= ABANDONED_S5C_CAP {
+        // Entries are pushed in time order, so the front is the oldest.
+        list.drain(..=list.len() - ABANDONED_S5C_CAP);
+    }
+    list.push(entry);
 }
 
 fn take_abandoned_s5c(pgw: SocketAddr, seq: u32) -> bool {
@@ -5306,6 +5325,25 @@ mod tests {
         );
         sgwc_self().set_pgw_s5c_peer(None);
         server.close();
+    }
+
+    /// #1190 review: the abandoned-Create list is bounded; past the cap the
+    /// oldest entry goes and the newest is kept.
+    #[test]
+    fn the_abandoned_create_list_is_capped_and_evicts_the_oldest() {
+        let pgw: SocketAddr = "192.0.2.1:2123".parse().unwrap();
+        let now = Instant::now();
+        let mut list = Vec::new();
+        for seq in 0..(ABANDONED_S5C_CAP as u32 + 10) {
+            push_abandoned_s5c(&mut list, (pgw, seq, now));
+        }
+        assert_eq!(list.len(), ABANDONED_S5C_CAP);
+        assert_eq!(list.first().map(|e| e.1), Some(10), "the oldest went");
+        assert_eq!(
+            list.last().map(|e| e.1),
+            Some(ABANDONED_S5C_CAP as u32 + 9),
+            "the newest is kept"
+        );
     }
 
     /// #1190 review: the PGW accepts the Create only after N3 ran out. The MME was
@@ -9291,6 +9329,7 @@ mod tests {
             sgwu.received(54) > deletions,
             "the SGW-U session is deleted"
         );
+        wait_ue_removed(ue_id).await;
         let ctx = sgwc_self();
         assert!(
             ctx.sess_find_by_id(sess_id).is_none(),
@@ -9303,6 +9342,18 @@ mod tests {
         );
         ctx.ue_remove(other_ue);
         server.close();
+    }
+
+    /// #1213: `delete_pdn_connections_for_pgw` tells the MME and the SGW-U before
+    /// it removes the session and UE, so neither arrival proves they are gone:
+    /// wait for the removal itself.
+    async fn wait_ue_removed(ue_id: u64) {
+        for _ in 0..300 {
+            if sgwc_self().ue_find_by_id(ue_id).is_none() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// #1137, TS 23.007 §16.1A.2 / §20: an S5/S8 path failure (N3 exhausted on a
@@ -9333,6 +9384,7 @@ mod tests {
         let (_, lbi, cause) = mme_dbr(&mme).await;
         assert_eq!(lbi, Some(5));
         assert_eq!(cause, Some(gtp_cause::REACTIVATION_REQUESTED));
+        wait_ue_removed(ue_id).await;
         let ctx = sgwc_self();
         assert!(
             ctx.sess_find_by_id(sess_id).is_none(),
