@@ -116,6 +116,8 @@ const ALL_TIMERS: [NasTimer; 5] = [
 pub fn expire_nas_timers(ctx: &MmeContext, now: Instant) {
     // #734: T3495 of the PDN GW initiated bearer deactivations.
     crate::bearer_deactivation::sweep(ctx, now);
+    // #641: T3485 of the network-initiated dedicated bearer activations.
+    crate::bearer_activation::sweep(ctx, now);
     let expired: Vec<(u64, NasTimer)> = {
         let pool = ctx.mme_ue_pool.read().unwrap();
         pool.iter()
@@ -336,6 +338,8 @@ fn paging_expiry(ctx: &MmeContext, mme_ue_id: u64) {
             }
             // #862: deactivations waiting for this paging complete locally.
             crate::bearer_deactivation::on_paging_failed(ctx, mme_ue_id);
+            // #641: activations waiting for this paging are refused.
+            crate::bearer_activation::on_paging_failed(ctx, mme_ue_id);
         }
     }
 }

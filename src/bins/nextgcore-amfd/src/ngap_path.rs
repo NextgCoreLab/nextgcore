@@ -115,6 +115,23 @@ enum NgapTransport {
 }
 
 impl NgapTransport {
+    /// End every NG association before the AMF stops (#1142, RFC 9260 §9.2), so the
+    /// gNBs set NG up again at once rather than discovering it after
+    /// Association.Max.Retrans. Userspace: a SHUTDOWN per association, waiting at
+    /// most `wait` for the answers. Kernel: closing the sockets has the kernel SCTP
+    /// stack send the SHUTDOWN (and it answers out-of-the-blue packets itself, §8.4).
+    async fn shutdown(&mut self, wait: Duration) {
+        match self {
+            Self::Userspace(s) => {
+                if let Err(e) = s.shutdown_gracefully(wait).await {
+                    log::warn!("NG associations not shut down: {e}");
+                }
+            }
+            #[cfg(feature = "kernel-sctp")]
+            Self::Kernel(s) => s.stop(),
+        }
+    }
+
     async fn bind(
         backend: SctpBackend,
         addr: SocketAddr,
@@ -21097,10 +21114,15 @@ pub async fn amf_ngap_flush_ue_contexts() {
 
 /// Close NGAP path
 pub async fn amf_ngap_close() {
-    if let Some(_server) = NGAP_SERVER.get() {
+    if let Some(handle) = NGAP_SERVER.get() {
+        let mut server = handle.inner.lock().await;
+        server.transport.shutdown(NG_SHUTDOWN_WAIT).await;
         log::info!("NGAP path closed");
     }
 }
+
+/// How long the AMF's shutdown waits for the gNBs' SHUTDOWN ACKs (#1142).
+const NG_SHUTDOWN_WAIT: Duration = Duration::from_secs(1);
 
 /// Get the NGAP server (if initialized)
 pub fn get_ngap_server() -> Option<&'static NgapServerHandle> {
@@ -25794,6 +25816,11 @@ mod tests {
     ///
     /// REVERT-VERIFIED: awaiting the SMF work before the Ack makes the handler take
     /// longer than the bound.
+    ///
+    /// #1205: only this test's own requests are counted. The stand-in sits at the
+    /// process-wide `SMF_SBI_*` address for the whole test, so a request another test
+    /// addresses there also arrives (a CI run saw 81). Each of the 80 sessions is still
+    /// required to be deactivated exactly once.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_ng_reset_is_acknowledged_before_the_smf_answers() {
         let (_nf, port, seen) = slow_recording_nf(Duration::from_millis(1000)).await;
@@ -25842,20 +25869,39 @@ mod tests {
             "every permit taken: {} in flight",
             ngap.sbi_offload.in_flight()
         );
+        // #1205: this test's deactivations, in arrival order; anything else is ignored.
+        let ours = || -> Vec<String> {
+            seen.lock()
+                .expect("seen")
+                .iter()
+                .filter(|r| r.contains("/sm-contexts/smctx-754-slow-"))
+                .cloned()
+                .collect()
+        };
         let deadline = Instant::now() + Duration::from_secs(10);
-        while seen.lock().expect("seen").is_empty() && Instant::now() < deadline {
+        while ours().is_empty() && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let in_first_wave = seen.lock().expect("seen").len();
+        let in_first_wave = ours().len();
         assert!(
             (1..=MAX_OFFLOADED_SBI).contains(&in_first_wave),
             "{in_first_wave} calls in flight at once"
         );
         ngap.sbi_offload.settle().await;
+        let mut deactivated = ours();
+        deactivated.sort();
+        let mut expected: Vec<String> = ues
+            .iter()
+            .flat_map(|ue| {
+                [5u8, 6].map(|psi| {
+                    format!("POST /nsmf-pdusession/v1/sm-contexts/smctx-754-slow-{ue}-{psi}/modify")
+                })
+            })
+            .collect();
+        expected.sort();
         assert_eq!(
-            seen.lock().expect("seen").len(),
-            80,
-            "every session deactivated"
+            deactivated, expected,
+            "every session deactivated, each exactly once"
         );
         for &ue in &ues {
             ngap.ue_auth_state.remove(ue);
