@@ -22857,6 +22857,64 @@ mod path_switch_ack_tests {
         }
     }
 
+    /// #1171 strict peer: the AMF reads the N2 SM information of this SMF's
+    /// SmContextUpdateError for a HANDOVER_REQUIRED it cannot prepare (TS 29.502
+    /// §5.2.2.3.4.2 step 2b). The real SM Context Update handler is served over
+    /// HTTP/2. amfd's `call_smf_n2_handover_step` gets the refusal, with the
+    /// multipart `n2SmInfo` decoding as a Handover Preparation Unsuccessful Transfer
+    /// (TS 38.413 §9.3.4.18) and its cause. The session has no UPF endpoint
+    /// recorded, so it cannot be handed over.
+    #[tokio::test]
+    async fn the_amf_reads_the_handover_preparation_refusal_of_this_smf() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let r = crate::tests::seed_registered_session("imsi-001010000001171", 5, "internet");
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        server
+            .start(smf_sbi_request_handler)
+            .await
+            .expect("the SMF serves");
+
+        let answer = nextgcore_amfd::sbi_path::call_smf_n2_handover_step(
+            "127.0.0.1",
+            addr.port(),
+            &r,
+            "PREPARING",
+            Some(("HANDOVER_REQUIRED", &[0x00])),
+            Some(&serde_json::json!({
+                "ranNodeId": {
+                    "plmnId": { "mcc": "001", "mnc": "01" },
+                    "gNbId": { "bitLength": 22, "gNBValue": "000001" },
+                },
+                "tai": { "plmnId": { "mcc": "001", "mnc": "01" }, "tac": "000001" },
+            })),
+            None,
+        )
+        .await;
+        let refusal = answer.expect_err("the SMF cannot prepare the session");
+        assert!(refusal.reason.contains("500"), "{refusal:?}");
+        let transfer = refusal
+            .preparation_unsuccessful_transfer()
+            .expect("HANDOVER_PREP_FAIL n2SmInfo");
+        assert_eq!(
+            nextgcore_amfd::ngap_asn1::handover_preparation_unsuccessful_cause(transfer),
+            Some(nextgcore_ngap::types::Cause::RadioNetwork(
+                nextgcore_ngap::types::CauseRadioNetwork::HoFailureInTarget5gcNgranNodeOrTargetSystem
+            ))
+        );
+
+        let _ = server.stop().await;
+        let ctx = smf_self();
+        let ctx = ctx.read().expect("ctx");
+        if let Some(sess) = ctx.sess_find_by_sm_context_ref(&r) {
+            ctx.sess_remove(sess.id);
+        }
+    }
+
     /// #1147 review M2, m1: how the session's bearers become QoS flows.
     /// - the session's own bearer for the default flow (an EPS→5GS default bearer,
     ///   QFI = the binding's) is not set up twice; it lends the default flow its

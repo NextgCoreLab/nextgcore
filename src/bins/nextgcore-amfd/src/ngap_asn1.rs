@@ -5140,6 +5140,18 @@ pub fn handover_preparation_unsuccessful_transfer(cause: Cause) -> Option<Vec<u8
     .ok()
 }
 
+/// The Cause of a HandoverPreparationUnsuccessfulTransfer (TS 38.413 §9.3.4.18), the
+/// N2 SM information an SMF refuses a handover step with (#1171). `None` when it does not
+/// decode, or for a Cause choice extension, which has no hand-written group.
+pub fn handover_preparation_unsuccessful_cause(transfer: &[u8]) -> Option<Cause> {
+    let t =
+        nextgcore_ngap_gen::decode_contained::<ngap_gen::HandoverPreparationUnsuccessfulTransfer>(
+            transfer,
+        )
+        .ok()?;
+    cause_pair(&t.cause).map(|(group, value)| build_cause(group, value))
+}
+
 /// Build a PATH SWITCH REQUEST ACKNOWLEDGE (TS 38.413 §9.2.3.9) with the
 /// GENERATED codec (#417), in `PathSwitchRequestAcknowledgeIEs` object-set
 /// order, reporting `notify` -- the request's "ignore IE and notify sender"

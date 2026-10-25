@@ -4373,6 +4373,50 @@ pub async fn call_smf_n2_handover(
     target_id: Option<&serde_json::Value>,
     cause: Option<&str>,
 ) -> Result<Option<(String, Vec<u8>)>, String> {
+    call_smf_n2_handover_step(
+        smf_host,
+        smf_port,
+        sm_context_ref,
+        ho_state,
+        n2,
+        target_id,
+        cause,
+    )
+    .await
+    .map_err(|refusal| refusal.reason)
+}
+
+/// An N2 handover step the SMF did not carry out (#1171): why, and the N2 SM
+/// information its SmContextUpdateError carried, if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct N2HandoverRefusal {
+    pub reason: String,
+    /// `(n2SmInfoType, n2SmInfo)` of the error body: for a refused PREPARING or
+    /// PREPARED, `HANDOVER_PREP_FAIL` with the Handover Preparation Unsuccessful
+    /// Transfer (TS 29.502 §5.2.2.3.4.2 steps 2b and 4b, TS 38.413 §9.3.4.18).
+    pub n2: Option<(String, Vec<u8>)>,
+}
+
+impl N2HandoverRefusal {
+    /// The Handover Preparation Unsuccessful Transfer the SMF answered with, if any.
+    pub fn preparation_unsuccessful_transfer(&self) -> Option<&[u8]> {
+        match &self.n2 {
+            Some((t, b)) if t == "HANDOVER_PREP_FAIL" => Some(b),
+            _ => None,
+        }
+    }
+}
+
+/// [`call_smf_n2_handover`], keeping the N2 SM information of an error answer.
+pub async fn call_smf_n2_handover_step(
+    smf_host: &str,
+    smf_port: u16,
+    sm_context_ref: &str,
+    ho_state: &str,
+    n2: Option<(&str, &[u8])>,
+    target_id: Option<&serde_json::Value>,
+    cause: Option<&str>,
+) -> Result<Option<(String, Vec<u8>)>, N2HandoverRefusal> {
     let client = crate::attach_oauth2(
         SbiClient::for_peer(smf_host, smf_port),
         nextgcore_sbi::types::NfType::Smf,
@@ -4402,13 +4446,22 @@ pub async fn call_smf_n2_handover(
     let response = client
         .send_request(request)
         .await
-        .map_err(|e| format!("UpdateSMContext ({ho_state}) failed: {e}"))?;
-    if !response.is_success() {
-        return Err(format!(
-            "UpdateSMContext ({ho_state}) answered {}",
-            response.status
-        ));
-    }
+        .map_err(|e| N2HandoverRefusal {
+            reason: format!("UpdateSMContext ({ho_state}) failed: {e}"),
+            n2: None,
+        })?;
+    n2_handover_answer(ho_state, &response)
+}
+
+/// The SMF's answer to an N2 handover step (TS 29.502 §5.2.2.3.4): on 200, the
+/// SmContextUpdatedData's N2 SM information; otherwise a refusal with the
+/// SmContextUpdateError's (§6.1.6.2.4: `n2SmInfo`, a RefToBinaryData to the
+/// multipart part, and `n2SmInfoType`), which steps 2b and 4b of §5.2.2.3.4.2
+/// make a Handover Preparation Unsuccessful Transfer (#1171).
+pub fn n2_handover_answer(
+    ho_state: &str,
+    response: &SbiResponse,
+) -> Result<Option<(String, Vec<u8>)>, N2HandoverRefusal> {
     let root: serde_json::Value = response
         .http
         .content
@@ -4416,11 +4469,22 @@ pub async fn call_smf_n2_handover(
         .and_then(|c| serde_json::from_str(c).ok())
         .unwrap_or(serde_json::Value::Null);
     let n2_type = root["n2SmInfoType"].as_str().map(str::to_owned);
-    let n2 = extract_binary_ref(&response, &root, "n2SmInfo").filter(|b| !b.is_empty());
-    Ok(match (n2_type, n2) {
+    let n2 = extract_binary_ref(response, &root, "n2SmInfo").filter(|b| !b.is_empty());
+    let n2 = match (n2_type, n2) {
         (Some(t), Some(b)) => Some((t, b)),
         _ => None,
-    })
+    };
+    if !response.is_success() {
+        let cause = root["error"]["cause"].as_str().unwrap_or("no cause");
+        return Err(N2HandoverRefusal {
+            reason: format!(
+                "UpdateSMContext ({ho_state}) answered {} ({cause})",
+                response.status
+            ),
+            n2,
+        });
+    }
+    Ok(n2)
 }
 
 async fn update_sm_context_ho_state(
