@@ -350,10 +350,10 @@ impl FTeid {
         // Flags byte: V4 | V6 | Interface Type (6 bits, TS 29.274 §8.22). It was masked
         // to 5, which sent the S2b PGW GTP-C (32) and S2b-U PGW GTP-U (33) types as 0
         // and 1, the S1-U eNodeB and S1-U SGW (#1113 audit).
+        // There is no "TEID present" flag: the TEID is always there. Bit 8 is V4 alone;
+        // it was also set for a TEID, so an IPv6-only F-TEID claimed an IPv4 address it
+        // did not carry and failed to decode (#1113 review).
         let mut flags = self.interface_type & 0x3f;
-        if self.teid_present {
-            flags |= 0x80; // TEID present
-        }
         if self.ipv4_present {
             flags |= 0x80; // V4 flag
         }
@@ -1173,7 +1173,7 @@ pub fn build_create_bearer_request(
     sess: &SmfSess,
     bearer: &SmfBearer,
     linked_ebi: u8,
-    tft: Option<&[u8]>,
+    tft: &[u8],
 ) -> Vec<u8> {
     let mut builder = Gtp2MessageBuilder::new(gtp2_message_type::CREATE_BEARER_REQUEST)
         .teid(sess.sgw_s5c_teid)
@@ -1197,10 +1197,12 @@ pub fn build_create_bearer_request(
         dl_gbr: bearer.qos.gbr_downlink,
     };
 
+    // Table 7.2.3-2: the TFT is mandatory, and so is the Charging Id on S5/S8 ("shall
+    // be sent on the S5/S8 interface"); neither was (#1113 review).
     let mut bc_builder = builder
         .start_bearer_context(0)
         .add_ebi(bearer.ebi)
-        .add_bearer_qos(&bearer_qos);
+        .add_tft(tft);
 
     // The PGW user-plane F-TEID, at its Table 7.2.3-2 instance: 1 for S5/S8-U and 4
     // for S2b-U. It was written at instance 0, the S1-U SGW F-TEID's slot (#1113).
@@ -1216,10 +1218,9 @@ pub fn build_create_bearer_request(
         bc_builder = bc_builder.add_f_teid(&f_teid, pgw_u_instance);
     }
 
-    // TFT
-    if let Some(tft_data) = tft {
-        bc_builder = bc_builder.add_tft(tft_data);
-    }
+    bc_builder = bc_builder
+        .add_bearer_qos(&bearer_qos)
+        .add_charging_id(sess.charging.id);
 
     builder = bc_builder.end();
     builder.build()
@@ -1606,34 +1607,94 @@ mod tests {
         );
     }
 
-    /// #1113 audit, TS 29.274 Table 7.2.3-2: the PGW's user-plane F-TEID in a Create
-    /// Bearer Request's Bearer Context is instance 1 (S5/S8-U PGW) -- instance 0 is the
-    /// S1-U SGW F-TEID, which only the SGW writes. Golden bytes from the bearer context on.
+    /// #1113 audit, TS 29.274 Table 7.2.3-2: the Bearer Context of a Create Bearer
+    /// Request carries the mandatory TFT, the PGW's user-plane F-TEID at instance 1
+    /// (S5/S8-U PGW) -- instance 0 is the S1-U SGW F-TEID, which only the SGW writes --
+    /// the Bearer QoS, and the Charging Id that "shall be sent on the S5/S8 interface".
+    /// Golden bytes.
     #[test]
     fn create_bearer_request_carries_the_pgw_s5u_fteid_at_instance_1() {
         let (sess, mut bearer) = golden_session(gtp2_rat_type::EUTRAN);
         bearer.ebi = 0;
         bearer.qos.index = 9;
         bearer.qos.arp_priority_level = 1;
-        let msg = build_create_bearer_request(&sess, &bearer, 5, None);
+        // Create new TFT, one bidirectional filter (id 1, precedence 16): UDP
+        // (TS 24.008 §10.5.6.12).
+        let tft = [0x21, 0x31, 0x10, 0x02, 0x30, 0x11];
+        let msg = build_create_bearer_request(&sess, &bearer, 5, &tft);
         #[rustfmt::skip]
         let expected: &[u8] = &[
-            // Header: type 95; length 61; SGW S5-C TEID 3.
-            0x48, 0x5f, 0x00, 0x3d, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00,
+            // Header: type 95; length 79; SGW S5-C TEID 3.
+            0x48, 0x5f, 0x00, 0x4f, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00,
             // Linked EBI (73), instance 0: 5.
             0x49, 0x00, 0x01, 0x00, 0x05,
-            // Bearer Context (93), instance 0, 44 octets:
-            0x5d, 0x00, 0x2c, 0x00,
+            // Bearer Context (93), instance 0, 62 octets:
+            0x5d, 0x00, 0x3e, 0x00,
             //   EBI: 0 (the MME assigns it).
             0x49, 0x00, 0x01, 0x00, 0x00,
+            //   Bearer TFT (84).
+            0x54, 0x00, 0x06, 0x00, 0x21, 0x31, 0x10, 0x02, 0x30, 0x11,
+            //   F-TEID, INSTANCE 1: interface 5 (S5/S8 PGW GTP-U), TEID 0x99, 10.10.0.67.
+            0x57, 0x00, 0x09, 0x01, 0x85, 0x00, 0x00, 0x00, 0x99, 0x0a, 0x0a, 0x00, 0x43,
             //   Bearer QoS (80): PL 1, QCI 9, rates 0.
             0x50, 0x00, 0x16, 0x00, 0x04, 0x09,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            //   F-TEID, INSTANCE 1: interface 5 (S5/S8 PGW GTP-U), TEID 0x99, 10.10.0.67.
-            0x57, 0x00, 0x09, 0x01, 0x85, 0x00, 0x00, 0x00, 0x99, 0x0a, 0x0a, 0x00, 0x43,
+            //   Charging ID (94): 7.
+            0x5e, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x07,
         ];
         assert_eq!(msg, expected);
+    }
+
+    /// #1113 review, TS 29.274 §8.22: octet 5 is V4 (bit 8), V6 (bit 7) and the
+    /// interface type; there is no TEID flag. An IPv6-only F-TEID set V4 as well, and
+    /// went out claiming an IPv4 address it did not carry.
+    #[test]
+    fn ipv6_only_and_dual_stack_fteids_are_section_8_22_on_the_wire() {
+        let v6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x66);
+        let mut expected = vec![0x47, 0x00, 0x00, 0x00, 0x42];
+        expected.extend(v6.octets());
+        assert_eq!(
+            FTeid::new_ipv6(gtp2_f_teid_interface::S5_S8_PGW_GTP_C, 0x42, v6).encode(),
+            expected,
+            "V6 only: flags 0x47, 21 octets"
+        );
+        let v4 = Ipv4Addr::new(10, 10, 0, 66);
+        let mut expected = vec![0xc5, 0x00, 0x00, 0x00, 0x99, 0x0a, 0x0a, 0x00, 0x42];
+        expected.extend(v6.octets());
+        assert_eq!(
+            FTeid::new_dual(gtp2_f_teid_interface::S5_S8_PGW_GTP_U, 0x99, v4, v6).encode(),
+            expected,
+            "V4 and V6: flags 0xc5, IPv4 before IPv6"
+        );
+
+        // The Create Session Response of a PGW-C on an IPv6 S5/S8 decodes, and its
+        // control F-TEID is the instance-1 one.
+        let (sess, bearer) = golden_session(gtp2_rat_type::EUTRAN);
+        let msg = build_create_session_response(
+            &sess,
+            &[bearer],
+            None,
+            Some(v6),
+            None,
+            None,
+            None,
+            false,
+            false,
+        );
+        let mut bytes = bytes::Bytes::from(msg);
+        let decoded = nextgcore_gtp::v2::Gtp2Message::decode(&mut bytes).expect("decode");
+        let ft = nextgcore_gtp::v2::Gtp2FTeidIe::decode(
+            &decoded
+                .get_ie(nextgcore_gtp::v2::Gtp2IeType::FTeid as u8, 1)
+                .expect("instance 1")
+                .value,
+        )
+        .expect("an IPv6-only F-TEID decodes");
+        assert_eq!(
+            (ft.teid, ft.ipv4_addr, ft.ipv6_addr),
+            (0x42, None, Some(v6.octets()))
+        );
     }
 
     /// #1113 audit, TS 29.274 Table 7.2.8-2: each "Bearer Context modified" of a

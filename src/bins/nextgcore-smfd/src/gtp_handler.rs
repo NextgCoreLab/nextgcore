@@ -1125,13 +1125,26 @@ fn parse_modify_bearer_request(msg: &Gtp2Message) -> ModifyBearerRequest {
             if let Ok(ebi) = bc.ebi() {
                 req.bearer_contexts.push(BearerContextToModify {
                     ebi,
-                    s4u_sgsn_f_teid: bc.fteid(1).ok().flatten().map(|ft| {
-                        FTeid::new_ipv4(
-                            ft.interface_type,
-                            ft.teid,
-                            std::net::Ipv4Addr::from(ft.ipv4_addr.unwrap_or([0, 0, 0, 0])),
-                        )
-                    }),
+                    // An SGW-C from before #1113 sent it at instance 2; its interface
+                    // type (S5/S8 SGW GTP-U) still names it, so a rolling upgrade keeps
+                    // working. Instance 0 is never read.
+                    s4u_sgsn_f_teid: bc
+                        .fteid(1)
+                        .ok()
+                        .flatten()
+                        .or_else(|| {
+                            bc.fteid(2).ok().flatten().filter(|ft| {
+                                ft.interface_type
+                                    == crate::gtp_build::gtp2_f_teid_interface::S5_S8_SGW_GTP_U
+                            })
+                        })
+                        .map(|ft| {
+                            FTeid::new_ipv4(
+                                ft.interface_type,
+                                ft.teid,
+                                std::net::Ipv4Addr::from(ft.ipv4_addr.unwrap_or([0, 0, 0, 0])),
+                            )
+                        }),
                 });
             }
         }
@@ -2353,6 +2366,69 @@ mod tests {
 
         sgwc.ue_remove(ue.id);
         sgwc.set_s5c_address(None);
+    }
+
+    /// #1113 review: over S2b the ePDG's S2b-U F-TEID is instance 5 of the Create
+    /// Session Request's Bearer Context (TS 29.274 Table 7.2.1-2). It was never read,
+    /// so every S2b establishment off the wire lacked it.
+    #[test]
+    fn the_s2b_u_epdg_fteid_is_read_at_instance_5() {
+        use nextgcore_gtp::v2::{Gtp2BearerContextIe, Gtp2BearerQosIe, Gtp2FTeidIe};
+        let mut msg = decode_gtp(&s5c_csr(1, 0x0101, [0; 4]));
+        msg.ies
+            .retain(|ie| ie.ie_type != Gtp2IeType::BearerContext as u8);
+        let mut bc = Gtp2BearerContextIe::new();
+        bc.set_ebi(5);
+        bc.set_bearer_qos(&Gtp2BearerQosIe::new(9, 0, 0, 0, 0));
+        bc.set_fteid(5, &Gtp2FTeidIe::new_ipv4(31, 0x0e0d_0005, [10, 20, 0, 5]));
+        msg.add_bearer_context(0, &bc);
+        let req = parse_create_session_request(&msg).expect("parsed");
+        let bc = &req.bearer_contexts[0];
+        let epdg = bc.s2b_u_epdg_f_teid.as_ref().expect("instance 5 is read");
+        assert_eq!(
+            (epdg.teid, epdg.ipv4_addr),
+            (0x0e0d_0005, Some(Ipv4Addr::new(10, 20, 0, 5)))
+        );
+        assert!(bc.s5u_sgw_f_teid.is_none(), "nothing at instance 2");
+    }
+
+    /// #1113 review, TS 29.274 Table 7.2.7-2: the S5/S8-U SGW F-TEID of a Modify
+    /// Bearer Request is instance 1. Instance 0 is the S1-U eNodeB F-TEID, an S11 IE,
+    /// and is never taken for the SGW's endpoint (it used to be, as a fallback). An
+    /// SGW-C from before #1113 put it at instance 2, recognised by its interface type.
+    #[test]
+    fn the_modify_bearer_sgw_u_fteid_is_instance_1_never_the_enodebs_0() {
+        use nextgcore_gtp::v2::{Gtp2BearerContextIe, Gtp2FTeidIe, Gtp2Header};
+        let mbr = |instance: u8, iface: u8| {
+            let mut msg = Gtp2Message::new(Gtp2Header::new(
+                gtp2_message_type::MODIFY_BEARER_REQUEST,
+                0x42,
+                1,
+            ));
+            let mut bc = Gtp2BearerContextIe::new();
+            bc.set_ebi(5);
+            bc.set_fteid(
+                instance,
+                &Gtp2FTeidIe::new_ipv4(iface, 0x0505, [10, 0, 0, 5]),
+            );
+            msg.add_bearer_context(0, &bc);
+            parse_modify_bearer_request(&msg).bearer_contexts[0]
+                .s4u_sgsn_f_teid
+                .as_ref()
+                .map(|f| f.teid)
+        };
+        assert_eq!(mbr(1, 4), Some(0x0505), "instance 1");
+        assert_eq!(
+            mbr(0, 0),
+            None,
+            "the eNodeB's instance 0 is not the SGW's endpoint"
+        );
+        assert_eq!(mbr(2, 4), Some(0x0505), "a pre-#1113 SGW-C's instance 2");
+        assert_eq!(
+            mbr(2, 0),
+            None,
+            "instance 2 only with the S5/S8 SGW GTP-U type"
+        );
     }
 
     // ================================================================
