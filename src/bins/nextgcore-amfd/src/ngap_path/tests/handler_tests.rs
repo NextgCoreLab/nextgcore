@@ -551,7 +551,12 @@ async fn two_activated_sessions_carry_the_accept_exactly_once() {
 
     let sent = connected_service_request(&mut server, ue, ran, Some((1 << 1) | (1 << 2))).await;
 
-    assert_eq!(calls.lock().expect("calls").len(), 2, "{:?}", calls.lock().expect("calls"));
+    assert_eq!(
+        calls.lock().expect("calls").len(),
+        2,
+        "{:?}",
+        calls.lock().expect("calls")
+    );
     let mut psis = Vec::new();
     let mut accepts = 0;
     for (_, s) in &sent {

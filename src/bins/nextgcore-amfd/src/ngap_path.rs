@@ -1293,6 +1293,9 @@ enum JoinThen {
 struct RegistrationUpdateRest {
     association_id: u64,
     ran_ue_ngap_id: u32,
+    /// The REGISTRATION REQUEST's session IEs, to tell a repeated request from a new
+    /// one (TS 24.501 §5.5.1.3.8 e)).
+    requested_ies: Option<ServiceRequestSessionIes>,
     /// The REGISTRATION REQUEST's uplink NAS COUNT, for a new connection's K_gNB.
     ul_count: u32,
     /// The page the request answered (#1102).
@@ -6107,12 +6110,17 @@ impl NgapServer {
             association_id,
             ran_ue_ngap_id,
             ul_count,
+            requested_ies: _,
             page,
             mut outcome,
             activate,
         } = rest;
+        // CM-IDLE too: an AN release keeps the association and RAN UE NGAP ID, but the
+        // connection the Accept was for is gone (#1138 review M1).
         let still_there = self.ue_auth_state.get(amf_ue_ngap_id).is_some_and(|s| {
-            s.association_id == association_id && s.ran_ue_ngap_id == ran_ue_ngap_id
+            !s.is_cm_idle()
+                && s.association_id == association_id
+                && s.ran_ue_ngap_id == ran_ue_ngap_id
         });
         for (psi, sm_ref, s_nssai) in activate {
             let answer = answers.remove(&psi);
@@ -6316,6 +6324,50 @@ impl NgapServer {
         // status releases what the UE no longer has, and its Uplink data status
         // re-activates user planes. Both outcomes are reported in the Accept.
         let update = state.registered && state.amf_ue.security_context_available;
+        // #922 part 3, TS 24.501 §5.5.1.3.8 e): a REGISTRATION REQUEST while an earlier
+        // one's Accept still waits for its SMF answers. The same IEs on the same NG
+        // connection: the earlier procedure goes on and this request is not treated
+        // further. Otherwise the earlier one is aborted (its activations rolled back) and
+        // this one is progressed.
+        if update {
+            let pending = self.smf_joins.iter().find_map(|(id, j)| match &j.then {
+                JoinThen::RegistrationUpdate(r) if j.amf_ue_ngap_id == amf_ue_ngap_id => {
+                    Some((*id, r.requested_ies, r.association_id, r.ran_ue_ngap_id))
+                }
+                _ => None,
+            });
+            if let Some((join, requested_ies, assoc, ran)) = pending {
+                if requested_ies == state.registration_session_ies
+                    && (assoc, ran) == (association_id, ran_ue_ngap_id)
+                {
+                    log::info!(
+                        "UE {amf_ue_ngap_id}: REGISTRATION REQUEST repeated while the previous \
+                         one waits for its SMF answers; continuing the previous procedure \
+                         (TS 24.501 §5.5.1.3.8 e) 2))"
+                    );
+                    state.registration_session_ies = None;
+                    self.ue_auth_state.insert(amf_ue_ngap_id, state);
+                    return Ok(());
+                }
+                if let Some(j) = self.smf_joins.remove(&join) {
+                    if let JoinThen::RegistrationUpdate(rest) = j.then {
+                        for (psi, sm_ref, _) in rest.activate {
+                            self.roll_back_activation(
+                                amf_ue_ngap_id,
+                                psi,
+                                sm_ref,
+                                "registration update superseded",
+                            );
+                        }
+                    }
+                }
+                log::info!(
+                    "UE {amf_ue_ngap_id}: a REGISTRATION REQUEST with different IEs aborts the \
+                     previous one still waiting for its SMF answers (TS 24.501 §5.5.1.3.8 e) 1))"
+                );
+            }
+        }
+        let requested_ies = state.registration_session_ies;
         // #1102: the page this request answered, if any. Its session rides the
         // Accept's Initial Context Setup, and its N1 or N2 release / modify follows it.
         let page = if update {
@@ -6379,6 +6431,7 @@ impl NgapServer {
             JoinThen::RegistrationUpdate(Box::new(RegistrationUpdateRest {
                 association_id,
                 ran_ue_ngap_id,
+                requested_ies,
                 ul_count,
                 page,
                 outcome: plan.outcome,

@@ -879,3 +879,174 @@ async fn n2_sm_relays_to_a_blackholed_smf_do_not_hold_the_ngap_task() {
     forget_amf_sessions(ue);
     server.forget_ue(ue);
 }
+
+/// #1138 review M1/M2: a UE whose NG connection is released (CM-IDLE) while its
+/// registration update waits for the SMFs gets no Accept on the released connection
+/// at the deadline, and the session its SMF did activate is rolled back (DEACTIVATED).
+///
+/// REVERT-VERIFIED: without the CM-IDLE check in `finish_registration_update`, the
+/// Accept goes out in a setup request on the released connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_registration_update_released_during_its_join_sends_no_accept() {
+    let (_smf, port, calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_923_051u64, 81u32);
+    registered_ue_with_guti(&mut server, ue, ran);
+    hold_session(&mut server, ue, 1, "ru922-live-1", port);
+    hold_blackholed(&mut server, ue, 2, "ru922-dead-2");
+    let rr = ue_protect(
+        &update_registration_request(
+            crate::gmm_build::registration_type::PERIODIC_UPDATING,
+            Some((1 << 1) | (1 << 2)),
+            None,
+        ),
+        0,
+    );
+    let _ = server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &rr))
+        .await;
+    until_called(&calls, "/sm-contexts/ru922-live-1/modify").await;
+    until_join_waits_only_for(&mut server, 2).await;
+
+    // AN release: the UE is CM-IDLE, on the same association and RAN UE NGAP ID.
+    server.ue_auth_state.with_mut(ue, |s| s.cm_idle = true);
+    joins_due(&mut server);
+    server.process_smf_join_deadlines().await;
+    assert!(
+        take_sent_ngap(&mut server).is_empty(),
+        "no Accept on the released connection"
+    );
+    // PSI 2's calls hang at the blackhole, so wait for PSI 1's roll-back itself.
+    let states = || -> Vec<String> {
+        calls
+            .lock()
+            .expect("calls")
+            .iter()
+            .filter(|(u, _)| u.ends_with("/sm-contexts/ru922-live-1/modify"))
+            .map(|(_, b)| b["upCnxState"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+    for _ in 0..300 {
+        if states().len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(states(), vec!["ACTIVATING", "DEACTIVATED"], "rolled back");
+    forget_amf_sessions(ue);
+    server.forget_ue(ue);
+}
+
+/// #1138 review M2: a UE that goes CM-IDLE while its PATH SWITCH REQUEST waits for the
+/// SMFs is not moved to the target: at the deadline the target gets a PATH SWITCH
+/// REQUEST FAILURE, even though one session was switched.
+///
+/// REVERT-VERIFIED: without the CM-IDLE filter in `finish_path_switch`, an Acknowledge
+/// goes out and the UE is relocated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_path_switch_whose_ue_goes_idle_during_its_join_is_failed() {
+    crate::context::amf_context_init(64, 1024, 4096);
+    let (_smf, port, calls) = path_switch_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (source, target) = (97_923_011u64, 97_923_012u64);
+    seed_gnb_session(&server, source).await;
+    seed_gnb_session(&server, target).await;
+    let ue = 7_923_061u64;
+    let mut state = UeNasContext::new(ue, 33, source, false);
+    state.registered = true;
+    server.ue_auth_state.insert(ue, state);
+    hold_session(&mut server, ue, 5, "ps922-idle-5", port);
+    hold_blackholed(&mut server, ue, 6, "ps922-idle-6");
+    server
+        .handle_path_switch_request(target, &path_switch_request_pdu(ue, 43, &[5, 6]))
+        .await
+        .expect("handled");
+    for _ in 0..300 {
+        if !calls.lock().expect("calls").is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    until_join_waits_only_for(&mut server, 6).await;
+
+    server.ue_auth_state.with_mut(ue, |s| s.cm_idle = true);
+    joins_due(&mut server);
+    server.process_smf_join_deadlines().await;
+    let sent = take_sent_ngap(&mut server);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(
+        decoded_path_switch_failure(&sent[0].1).is_some(),
+        "a PATH SWITCH REQUEST FAILURE, not an Acknowledge"
+    );
+    assert_eq!(
+        server.ue_auth_state.get(ue).expect("UE").association_id,
+        source
+    );
+    forget_amf_sessions(ue);
+    server.forget_ue(ue);
+}
+
+/// #1138 review m1, TS 24.501 §5.5.1.3.8 e): a REGISTRATION REQUEST repeated with the
+/// same IEs while the first one's Accept waits for the SMF is not treated further (the
+/// first procedure goes on, one join); one with different IEs aborts the first and is
+/// progressed (a new join, the old one gone).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repeated_registration_request_during_the_join_follows_5_5_1_3_8_e() {
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_923_071u64, 91u32);
+    registered_ue_with_guti(&mut server, ue, ran);
+    hold_blackholed(&mut server, ue, 1, "ru922-rep-1");
+    hold_blackholed(&mut server, ue, 2, "ru922-rep-2");
+    let request = |uds: u16, pss: Option<u16>, count: u8| {
+        ue_protect(
+            &update_registration_request(
+                crate::gmm_build::registration_type::PERIODIC_UPDATING,
+                Some(uds),
+                pss,
+            ),
+            count,
+        )
+    };
+    let joins = |server: &NgapServer| -> Vec<u64> {
+        let mut ids: Vec<u64> = server
+            .smf_joins
+            .iter()
+            .filter(|(_, j)| j.amf_ue_ngap_id == ue)
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    };
+
+    let _ = server
+        .handle_uplink_nas_transport(
+            ASSOC,
+            &uplink_nas_transport(ue, ran, &request(1 << 1, None, 0)),
+        )
+        .await;
+    let first = joins(&server);
+    assert_eq!(first.len(), 1, "the first request waits for its SMF");
+
+    // The same IEs again: the first procedure goes on.
+    let _ = server
+        .handle_uplink_nas_transport(
+            ASSOC,
+            &uplink_nas_transport(ue, ran, &request(1 << 1, None, 1)),
+        )
+        .await;
+    assert_eq!(joins(&server), first, "not treated further");
+
+    // Different IEs: the first is aborted, this one progressed.
+    let _ = server
+        .handle_uplink_nas_transport(
+            ASSOC,
+            &uplink_nas_transport(ue, ran, &request((1 << 1) | (1 << 2), None, 2)),
+        )
+        .await;
+    let second = joins(&server);
+    assert_eq!(second.len(), 1, "{second:?}");
+    assert_ne!(second, first, "the first join is gone, a new one waits");
+    assert!(take_sent_ngap(&mut server).is_empty(), "no Accept yet");
+    forget_amf_sessions(ue);
+    server.forget_ue(ue);
+}
