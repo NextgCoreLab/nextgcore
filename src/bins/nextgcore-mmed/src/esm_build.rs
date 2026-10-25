@@ -959,6 +959,17 @@ mod tests {
             1024,
             "1000 rounded up"
         );
+        // #1187 review: an uplink-only need sizes the IE too. UL 10 Mbit/s over
+        // a 1 Mbit/s DL: octets 3-6 (4 contents octets).
+        let ambr = apn_ambr_build(1_000_000, 10_000_000);
+        assert_eq!(ambr.len(), 4, "the uplink needs octet 6");
+        assert_eq!(apn_ambr_kbps(ambr[0], ambr[2], 0), 1024);
+        assert_eq!(apn_ambr_kbps(ambr[1], ambr[3], 0), 10_000);
+        // UL 300 Mbit/s over a 100 Mbit/s DL: octets 3-8 (6 contents octets).
+        let ambr = apn_ambr_build(100_000_000, 300_000_000);
+        assert_eq!(ambr.len(), 6, "the uplink needs octet 8");
+        assert_eq!(apn_ambr_kbps(ambr[0], ambr[2], ambr[4]), 100_000);
+        assert_eq!(apn_ambr_kbps(ambr[1], ambr[3], ambr[5]), 300_000);
     }
 
     /// #1181, TS 24.301 §8.3.6: a 10 / 5 Mbit/s session (bit/s, as the HSS
