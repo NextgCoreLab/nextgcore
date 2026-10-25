@@ -308,6 +308,13 @@ pub fn record_mapped_eps_bearer(
             flow.qfi = qfi;
             flow.qos.index = five_qi;
             flow.qos.arp_priority_level = arp_priority_level;
+            // The default flow's ARP is "shall not trigger pre-emption, not
+            // pre-emptable" (the establishment's), which the Bearer QoS codes as PCI
+            // and PVI set: they are *disable* flags (TS 29.274 §8.15). Left clear, a
+            // rebuilt transfer inverted them into may-trigger and pre-emptable, and
+            // the gNB's ARP changed on the first Service Request (#1147 review N1).
+            flow.qos.arp_preempt_cap = true;
+            flow.qos.arp_preempt_vuln = true;
             let id = flow.id;
             context.bearer_update(&flow);
             log::info!(
