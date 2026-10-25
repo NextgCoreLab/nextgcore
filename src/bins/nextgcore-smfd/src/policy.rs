@@ -478,10 +478,15 @@ pub async fn resolve_nsacf_endpoint() -> Option<NsacfEndpoint> {
         log::warn!("NSACF_URI '{uri}' is not a valid URI — ignoring");
     }
 
-    // NRF discovery
+    // NRF discovery, answered from the cache while the last result is valid (#1075,
+    // #1072 round 2 m5): a releasing shutdown sends N DECREASEs, and each one used
+    // to run its own discovery.
     let nrf_uri = nextgcore_sbi::context::global_context()
         .get_nrf_uri()
         .await?;
+    if let Some(cached) = cached_nsacf(&nrf_uri) {
+        return Some(cached);
+    }
     let (nrf_host, nrf_port) = split_host_port(&nrf_uri)?;
     let client = SbiClient::new(
         nextgcore_sbi::security::sbi_peer_client_config(&nrf_host, nrf_port)
@@ -518,7 +523,54 @@ pub async fn resolve_nsacf_endpoint() -> Option<NsacfEndpoint> {
         .and_then(|p| p.as_u64())
         .map(|p| p as u16)
         .unwrap_or(7813);
-    Some(NsacfEndpoint { host, port })
+    let endpoint = NsacfEndpoint { host, port };
+    // TS 29.510 §6.2.6.2.2 SearchResult.validityPeriod, in seconds; without one, a
+    // short default rather than for ever.
+    let validity = body
+        .get("validityPeriod")
+        .and_then(|v| v.as_u64())
+        .map(Duration::from_secs)
+        .unwrap_or(NSACF_DISCOVERY_DEFAULT_VALIDITY)
+        .min(NSACF_DISCOVERY_MAX_VALIDITY);
+    cache_nsacf(&nrf_uri, &endpoint, validity);
+    Some(endpoint)
+}
+
+/// The NSACF discovered through each NRF, until its result's validity ends
+/// (#1075). Keyed by the NRF URI, so a different NRF is asked afresh.
+static NSACF_DISCOVERY_CACHE: std::sync::Mutex<
+    Option<std::collections::HashMap<String, (NsacfEndpoint, std::time::Instant)>>,
+> = std::sync::Mutex::new(None);
+
+/// How long a discovery result without a `validityPeriod` is reused.
+const NSACF_DISCOVERY_DEFAULT_VALIDITY: Duration = Duration::from_secs(60);
+/// The longest a discovered NSACF is reused, whatever the NRF says.
+const NSACF_DISCOVERY_MAX_VALIDITY: Duration = Duration::from_secs(3600);
+
+fn cached_nsacf(nrf_uri: &str) -> Option<NsacfEndpoint> {
+    let mut cache = NSACF_DISCOVERY_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let map = cache.as_mut()?;
+    match map.get(nrf_uri) {
+        Some((endpoint, until)) if std::time::Instant::now() < *until => Some(endpoint.clone()),
+        Some(_) => {
+            map.remove(nrf_uri);
+            None
+        }
+        None => None,
+    }
+}
+
+fn cache_nsacf(nrf_uri: &str, endpoint: &NsacfEndpoint, validity: Duration) {
+    NSACF_DISCOVERY_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(
+            nrf_uri.to_string(),
+            (endpoint.clone(), std::time::Instant::now() + validity),
+        );
 }
 
 /// Outcome of an Nnsacf_NSAC PDU-session admission query (TS 29.536).
