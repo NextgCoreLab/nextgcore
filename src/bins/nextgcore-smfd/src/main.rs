@@ -15707,6 +15707,48 @@ mod tests {
         assert_eq!(after, 2, "the failed NSACF is discovered again");
     }
 
+    /// A durable state file armed on the global context, with one durable session,
+    /// for a test (#1150 review round 3 m1): disarmed and removed on drop, whether
+    /// the test passes or fails -- left armed, every later test would write
+    /// snapshots.
+    struct ArmedStateFile {
+        path: std::path::PathBuf,
+        reference: String,
+        seid: u64,
+    }
+
+    impl ArmedStateFile {
+        fn arm(path: &std::path::Path, reference: &str, seid: u64, upf_seid: u64) -> Self {
+            let handle = smf_self();
+            let mut ctx = handle.write().unwrap();
+            ctx.set_state_file(path.to_path_buf()).expect("state file");
+            ctx.pfcp_sessions
+                .write()
+                .unwrap()
+                .insert(reference.to_string(), upf_seid);
+            Self {
+                path: path.to_path_buf(),
+                reference: reference.to_string(),
+                seid,
+            }
+        }
+    }
+
+    impl Drop for ArmedStateFile {
+        fn drop(&mut self) {
+            let handle = smf_self();
+            let mut ctx = handle.write().unwrap_or_else(|e| e.into_inner());
+            if let Ok(mut m) = ctx.pfcp_sessions.write() {
+                m.remove(&self.reference);
+            }
+            if let Ok(mut m) = ctx.far_peers.write() {
+                m.remove(&self.seid);
+            }
+            ctx.clear_state_file_for_test();
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
     /// #1150 review round 2 N1: an NSACF that answers an INCREASE or a DECREASE with
     /// a 5xx is dropped from the discovery cache too, not only one that does not
     /// answer.
@@ -15805,14 +15847,7 @@ mod tests {
         let reference = "11501".to_string();
         let seid = context::derive_cp_n4_seid(&reference);
         let handle = smf_self();
-        {
-            let mut ctx = handle.write().unwrap();
-            ctx.set_state_file(path.clone()).expect("state file");
-            ctx.pfcp_sessions
-                .write()
-                .unwrap()
-                .insert(reference.clone(), 0x1150);
-        }
+        let _armed = ArmedStateFile::arm(&path, &reference, seid, 0x1150);
         let accepted = [0u8, 19, 0, 1, 1];
         let far = crate::n4_build::build_create_far(&crate::n4_build::FarParams {
             far_id: 2,
@@ -15862,13 +15897,6 @@ mod tests {
             .load(Ordering::Relaxed)
             - before;
         let took = started.elapsed();
-        {
-            let mut ctx = handle.write().unwrap();
-            ctx.pfcp_sessions.write().unwrap().remove(&reference);
-            ctx.far_peers.write().unwrap().remove(&seid);
-            ctx.clear_state_file_for_test();
-        }
-        let _ = std::fs::remove_file(&path);
         assert!(
             took < context::PERSIST_COALESCE,
             "measured before the writer's own delay: {took:?}"
@@ -15896,15 +15924,7 @@ mod tests {
         ));
         let reference = "10751".to_string();
         let seid = context::derive_cp_n4_seid(&reference);
-        {
-            let handle = smf_self();
-            let mut ctx = handle.write().unwrap();
-            ctx.set_state_file(path.clone()).expect("state file");
-            ctx.pfcp_sessions
-                .write()
-                .unwrap()
-                .insert(reference.clone(), 0x1075);
-        }
+        let _armed = ArmedStateFile::arm(&path, &reference, seid, 0x1075);
         let accepted = [0u8, 19, 0, 1, 1];
         let handle = smf_self();
         let before = handle
@@ -15959,13 +15979,6 @@ mod tests {
             .persist_writes
             .load(Ordering::Relaxed)
             - before;
-        {
-            let mut ctx = handle.write().unwrap();
-            ctx.pfcp_sessions.write().unwrap().remove(&reference);
-            ctx.far_peers.write().unwrap().remove(&seid);
-            ctx.clear_state_file_for_test();
-        }
-        let _ = std::fs::remove_file(&path);
         assert_eq!(during, 0, "nothing written while the changes come");
         assert_eq!(after, 1, "one write for the establishment and the burst");
     }
