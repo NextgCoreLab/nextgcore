@@ -2056,6 +2056,29 @@ impl PfcpServer {
             }
         }
 
+        // #619 (#1170 review): the session's downlink tunnel is the one its catch-all
+        // downlink takes -- the FAR of the Core-source PDR with no SDF filter (the
+        // default bearer's / flow's). A dedicated bearer's Core PDR carries its TFT's
+        // filters and a FAR toward its own tunnel; taking the last OHC on the wire
+        // made that FAR the session's whenever it came after the default one. With no
+        // such PDR the last OHC stands, as before.
+        if let Some((teid, addr)) = parsed_pdrs
+            .iter()
+            .filter(|p| p.pdi.source_interface == 1 && p.pdi.sdf_flow_description.is_none())
+            .filter_map(|p| p.far_id)
+            .find_map(|id| {
+                parsed_fars
+                    .iter()
+                    .find(|f| f.far_id == id)
+                    .and_then(|f| f.forwarding_parameters.as_ref())
+                    .and_then(|fp| fp.outer_header_creation.as_ref())
+                    .map(|ohc| (ohc.teid, ohc.ipv4))
+            })
+        {
+            dl_teid = teid;
+            gnb_addr = addr;
+        }
+
         // Parse Create QERs
         let mut parsed_qers = Vec::new();
         for qer_ie in ParsedIe::find_all_ies(&ies, pfcp_ie::CREATE_QER) {
@@ -4315,9 +4338,19 @@ mod tests {
 
     /// A Core-source PDR and a FAR forwarding to the access side toward `ohc`
     /// (`(teid, addr)`); `None` for a buffering FAR.
+    ///
+    /// A dedicated bearer's PDR (any id but 2) carries its TFT's downlink filter as an
+    /// SDF Filter; PDR 2 is the catch-all default downlink.
     fn downlink_rule(pdr_id: u16, far_id: u32, ohc: Option<(u32, [u8; 4])>) -> Vec<u8> {
         let mut pdi = crate::n4_build::PfcpMessageBuilder::new();
         pdi.add_u8(pfcp_ie::SOURCE_INTERFACE, 1); // Core
+        if pdr_id != 2 {
+            let fd = b"permit out 17 from 198.51.100.7 5004 to assigned";
+            let mut sdf = vec![0x01, 0x00];
+            sdf.extend_from_slice(&(fd.len() as u16).to_be_bytes());
+            sdf.extend_from_slice(fd);
+            pdi.add_tlv(pfcp_ie::SDF_FILTER, &sdf);
+        }
         let mut pdr = crate::n4_build::PfcpMessageBuilder::new();
         pdr.add_pdr_id(pdr_id);
         pdr.add_u32(pfcp_ie::PRECEDENCE, 50);
@@ -4471,6 +4504,14 @@ mod tests {
     /// does.
     #[tokio::test]
     async fn a_second_downlink_tunnel_in_the_establishment_keeps_its_endpoint() {
+        // Either order on the wire (#1170 review: the dedicated FAR after FAR 2 used to
+        // become the session's tunnel).
+        for dedicated_first in [true, false] {
+            establishment_with_a_second_downlink_tunnel(dedicated_first).await;
+        }
+    }
+
+    async fn establishment_with_a_second_downlink_tunnel(dedicated_first: bool) {
         const DEFAULT: (u32, [u8; 4]) = (0x0000_0A0A, [127, 58, 4, 1]);
         const DEDICATED: (u32, [u8; 4]) = (0x0606_0606, [127, 58, 4, 6]);
         const MOVED: (u32, [u8; 4]) = (0x0000_0C0C, [127, 58, 4, 12]);
@@ -4492,8 +4533,13 @@ mod tests {
         b.add_tlv(pfcp_ie::CREATE_FAR, &far_body(1, 0x02));
         b.add_tlv(pfcp_ie::CREATE_QER, &qer_body(1, 5));
         let mut body = b.build();
-        body.extend(downlink_rule(0x81, 0x81, Some(DEDICATED)));
-        body.extend(downlink_rule(2, 2, Some(DEFAULT)));
+        if dedicated_first {
+            body.extend(downlink_rule(0x81, 0x81, Some(DEDICATED)));
+            body.extend(downlink_rule(2, 2, Some(DEFAULT)));
+        } else {
+            body.extend(downlink_rule(2, 2, Some(DEFAULT)));
+            body.extend(downlink_rule(0x81, 0x81, Some(DEDICATED)));
+        }
         let resp = exchange(&smf, addr, &encode_pfcp(50, Some(0), 2, &body)).await;
         assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
         let upf_seid = server
@@ -4513,6 +4559,11 @@ mod tests {
         };
         let at = |t: (u32, [u8; 4])| Some((Some(t.0), Some(Ipv4Addr::from(t.1).to_string())));
         assert_eq!(far(0x81), at(DEDICATED));
+        assert_eq!(
+            server.sessions.read().await[&upf_seid].dl_teid,
+            DEFAULT.0,
+            "the session's tunnel is the catch-all downlink's (dedicated first: {dedicated_first})"
+        );
 
         let mut m = crate::n4_build::PfcpMessageBuilder::new();
         m.add_tlv(pfcp_ie::UPDATE_FAR, &forwarding_far(2, Some(MOVED), true));
@@ -4524,6 +4575,11 @@ mod tests {
             far(0x81),
             at(DEDICATED),
             "the move must not overwrite the established dedicated tunnel"
+        );
+        assert_eq!(
+            server.sessions.read().await[&upf_seid].dl_teid,
+            MOVED.0,
+            "the session's tunnel moved (dedicated first: {dedicated_first})"
         );
     }
 
