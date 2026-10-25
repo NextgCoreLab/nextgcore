@@ -243,6 +243,15 @@ pub fn transport_address_to_ip(addr: &[u8]) -> IpAddr {
         let mut v6 = [0u8; 16];
         v6.copy_from_slice(addr);
         ip.ipv6 = Some(v6);
+    } else if addr.len() == 20 {
+        // #948, TS 36.413 §9.2.2.1: 160 bits, the IPv4 address then the IPv6
+        // one (a dual-stack endpoint).
+        let mut v4 = [0u8; 4];
+        v4.copy_from_slice(&addr[..4]);
+        let mut v6 = [0u8; 16];
+        v6.copy_from_slice(&addr[4..]);
+        ip.ipv4 = Some(v4);
+        ip.ipv6 = Some(v6);
     }
     ip
 }

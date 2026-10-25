@@ -317,14 +317,20 @@ pub(crate) fn bearer_qos(bearer: &MmeBearer) -> Gtp2BearerQosIe {
     qos
 }
 
+/// An F-TEID carrying whichever address families `ip` has (#948, TS 29.274
+/// §8.22: IPv4, IPv6 or both), or `None` without an address.
+fn fteid_of(interface_type: u8, teid: u32, ip: &crate::context::IpAddr) -> Option<Gtp2FTeidIe> {
+    match (ip.ipv4, ip.ipv6) {
+        (Some(v4), Some(v6)) => Some(Gtp2FTeidIe::new_dual(interface_type, teid, v4, v6)),
+        (Some(v4), None) => Some(Gtp2FTeidIe::new_ipv4(interface_type, teid, v4)),
+        (None, Some(v6)) => Some(Gtp2FTeidIe::new_ipv6(interface_type, teid, v6)),
+        (None, None) => None,
+    }
+}
+
 /// The eNB's S1-U F-TEID for a bearer, or `None` when none has been saved yet.
 fn enb_s1u_fteid(bearer: &MmeBearer, interface_type: u8) -> Option<Gtp2FTeidIe> {
-    let ipv4 = bearer.enb_s1u_ip.ipv4?;
-    Some(Gtp2FTeidIe::new_ipv4(
-        interface_type,
-        bearer.enb_s1u_teid,
-        ipv4,
-    ))
+    fteid_of(interface_type, bearer.enb_s1u_teid, &bearer.enb_s1u_ip)
 }
 
 /// An F-TEID from an explicit TEID and context address, for the data-forwarding
@@ -337,8 +343,7 @@ fn forwarding_fteid(
     if teid == 0 {
         return None;
     }
-    let ipv4 = ip.ipv4?;
-    Some(Gtp2FTeidIe::new_ipv4(interface_type, teid, ipv4))
+    fteid_of(interface_type, teid, ip)
 }
 
 /// Build Create Session Request (TS 29.274 §7.2.1)

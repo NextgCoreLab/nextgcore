@@ -1872,6 +1872,72 @@ mod tests {
         assert!(n >= 1);
     }
 
+    /// #948, TS 36.413 §9.2.2.1, TS 29.274 §8.22: an E-RAB MODIFICATION
+    /// INDICATION whose new eNB transport address is IPv6-only (128 bits) or
+    /// dual-stack (160 bits) is switched, not failed. The Modify Bearer Request
+    /// carries an S1-U eNodeB F-TEID with the IPv6 address, and with both for
+    /// the dual-stack one.
+    #[test]
+    fn an_ipv6_or_dual_stack_erab_modification_reaches_the_serving_gw() {
+        let _guard = lock_s11();
+        let (sgw, _route) = sgw(Gtp2XactConfig::default());
+        let ue = seed(&[5, 6]);
+        let ctx = crate::context::mme_self();
+        crate::s1ap_path::tap_enb_for_test(ue.source_enb_id);
+        let v6: [u8; 16] = [
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x09, 0x48,
+        ];
+        let mut dual = vec![10, 0, 9, 48];
+        dual.extend_from_slice(&v6);
+        let indication = crate::s1ap_gen::ErabModificationIndication {
+            mme_ue_s1ap_id: ue.mme_ue_s1ap_id,
+            enb_ue_s1ap_id: 100,
+            to_be_modified: vec![
+                ErabSwitchedItem {
+                    erab_id: 5,
+                    transport_layer_address: v6.to_vec(),
+                    gtp_teid: 0x9485,
+                },
+                ErabSwitchedItem {
+                    erab_id: 6,
+                    transport_layer_address: dual,
+                    gtp_teid: 0x9486,
+                },
+            ],
+            not_to_be_modified: vec![],
+            location: None,
+        };
+        let out = crate::s1ap_handler::handle_erab_modification_indication(
+            ctx,
+            ue.source_enb_id,
+            &indication,
+            &[],
+        );
+        assert!(
+            out.is_empty(),
+            "nothing failed at once; the confirm waits for the SGW"
+        );
+        let (mbr, _) = recv(&sgw, 34);
+        let fteids: Vec<(u8, u32, Option<[u8; 4]>, Option<[u8; 16]>)> = mbr
+            .get_ies(Gtp2IeType::BearerContext as u8)
+            .into_iter()
+            .filter(|ie| ie.instance == 0)
+            .map(|ie| {
+                let bc = Gtp2BearerContextIe::decode(&ie.value).unwrap();
+                let ft = bc.fteid(0).unwrap().expect("an S1-U eNB F-TEID");
+                (bc.ebi().unwrap(), ft.teid, ft.ipv4_addr, ft.ipv6_addr)
+            })
+            .collect();
+        assert_eq!(
+            fteids,
+            vec![
+                (5, 0x9485, None, Some(v6)),
+                (6, 0x9486, Some([10, 0, 9, 48]), Some(v6)),
+            ]
+        );
+        release(&ue);
+    }
+
     /// #736, TS 36.413 §8.2.4 / TS 29.274 §7.6: an E-RAB MODIFICATION
     /// INDICATION whose Modify Bearer Request the Serving GW never answers still
     /// gets its E-RAB MODIFICATION CONFIRM, with every E-RAB failed, once N3 is
