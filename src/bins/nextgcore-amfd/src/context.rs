@@ -2995,6 +2995,47 @@ impl AmfContext {
         None
     }
 
+    /// Every consumer to forward a node-raised PWS indication to (#686, TS 23.527 §7.3:
+    /// "If the AMF interfaces with multiple CBCs, the AMF shall forward the PWS Restart
+    /// Indication to all CBCs").
+    ///
+    /// One subscription per consumer:
+    /// - a consumer that named its `nfId` gets its `PWS-RF` subscription, else its
+    ///   `PWS` one, the latest of either, as
+    ///   [`Self::non_ue_n2_subscription_find_by_class`] picks for one consumer;
+    /// - an anonymous subscription cannot be told apart from another consumer's, so
+    ///   each is a recipient of its own.
+    ///
+    /// Sorted by subscription id.
+    pub fn non_ue_n2_indication_recipients(&self) -> Vec<NonUeN2InfoSubscription> {
+        let Ok(subs) = self.non_ue_n2_subscriptions.read() else {
+            return Vec::new();
+        };
+        let mut named: std::collections::BTreeMap<String, NonUeN2InfoSubscription> =
+            std::collections::BTreeMap::new();
+        let mut anonymous = Vec::new();
+        let rank = |s: &NonUeN2InfoSubscription| u8::from(s.n2_information_class == "PWS-RF");
+        for s in subs.values() {
+            if !matches!(s.n2_information_class.as_str(), "PWS-RF" | "PWS") {
+                continue;
+            }
+            match &s.nf_id {
+                None => anonymous.push(s.clone()),
+                Some(nf) => {
+                    let better = named.get(nf).is_none_or(|cur| {
+                        (rank(s), &s.subscription_id) > (rank(cur), &cur.subscription_id)
+                    });
+                    if better {
+                        named.insert(nf.clone(), s.clone());
+                    }
+                }
+            }
+        }
+        let mut all: Vec<_> = named.into_values().chain(anonymous).collect();
+        all.sort_by(|a, b| a.subscription_id.cmp(&b.subscription_id));
+        all
+    }
+
     /// Find a subscription for EXACTLY this class and `nf_id`, with no `"PWS"`
     /// fallback and no "a subscription without an nfId matches anybody"
     /// relaxation.
