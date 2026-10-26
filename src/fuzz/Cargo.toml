@@ -26,6 +26,8 @@ nextgcore-gtp = { path = "../libs/nextgcore-gtp" }
 nextgcore-nas = { path = "../libs/nextgcore-nas" }
 nextgcore-ngap-gen = { path = "../libs/nextgcore-ngap-gen" }
 nextgcore-s1ap-gen = { path = "../libs/nextgcore-s1ap-gen" }
+# #1071: the SBc-AP codec mmed decodes CBC messages with (`fuzz_sbcap_message`).
+nextgcore-sbcap-gen = { path = "../libs/nextgcore-sbcap-gen" }
 nextgcore-nrppa-gen = { path = "../libs/nextgcore-nrppa-gen" }
 nextgcore-lpp-gen = { path = "../libs/nextgcore-lpp-gen" }
 nextgcore-diameter = { path = "../libs/nextgcore-diameter" }
@@ -101,6 +103,13 @@ bench = false
 [[bin]]
 name = "fuzz_ucmf_capability"
 path = "fuzz_targets/fuzz_ucmf_capability.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_sbcap_message"
+path = "fuzz_targets/fuzz_sbcap_message.rs"
 test = false
 doc = false
 bench = false

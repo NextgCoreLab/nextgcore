@@ -1510,12 +1510,11 @@ pub static PWS_RESTART_INDICATIONS: std::sync::atomic::AtomicU64 =
 /// A PWS RESTART INDICATION from the eNB `enb_id` (TS 36.413 §8.12.3, #1068).
 ///
 /// The indication tells the CBC that the restarted cells' warnings are lost and
-/// may be reloaded *from the CBC* (TS 23.007 §15A.1.2): the MME's job is to
-/// propagate it over SBc-AP (TS 29.168), and to forward the CBC's reload, which
-/// names the restarted cells and the broadcasts still owed. mmed has no SBc-AP
-/// transport yet (#1071), so the indication is validated, counted and logged; the
-/// MME does not replay its own copy of the warnings (that would re-broadcast with
-/// the original area and repetition count, #1069 review).
+/// may be reloaded *from the CBC* (TS 23.007 §15A.1.2): the MME relays it over
+/// SBc-AP as PWS-Restart-Indication (TS 29.168 §4.3.3E, #1071), and forwards the
+/// CBC's reload, which names this eNB's Global eNB ID, only to this eNB. The MME
+/// does not replay its own copy of the warnings (that would re-broadcast with the
+/// original area and repetition count, #1069 review).
 ///
 /// The Global eNB ID must be the sending association's own. mmed connects eNBs
 /// directly and does not serve a HeNB GW (TS 36.300 §4.6.2), behind which the
@@ -1536,15 +1535,20 @@ pub fn handle_pws_restart(
         return false;
     }
     PWS_RESTART_INDICATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    log::warn!(
+    log::info!(
         "PWS RESTART INDICATION from eNB {enb_id} ({:?}): {} cell(s), {} TAI(s), {} \
-         emergency area(s) lost their warnings; the CBC reloads them (TS 23.007 §15A.1.2), \
-         and this MME has no SBc-AP association to tell it (#1071)",
+         emergency area(s) lost their warnings; relayed to the CBC, which reloads them \
+         (TS 29.168 §4.3.3E, TS 23.007 §15A.1.2)",
         msg.global_enb_id,
         msg.ecgi_list.len(),
         msg.tai_list.len(),
         msg.emergency_area_ids.len()
     );
+    // #1071 stage 3: the CBC's reload names this eNB's Global eNB ID, and
+    // `sbc_handler` forwards it only there (TS 29.168 §4.3.3.2).
+    if let Some(pdu) = crate::sbcap_handler::pws_restart_indication(msg) {
+        crate::sbcap_path::indicate_to_cbc(pdu, "PWS RESTART INDICATION");
+    }
     true
 }
 
@@ -1553,10 +1557,9 @@ pub static PWS_FAILURE_INDICATIONS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// A PWS FAILURE INDICATION from the eNB `enb_id` (TS 36.413 §8.12.4): ongoing
-/// PWS operation failed in the listed cells. The MME is to act as TS 23.041
-/// defines (the failure is reported on to the CBC over SBc-AP); with no SBc-AP
-/// transport (#1071) it is validated against the sender's own Global eNB ID,
-/// counted and logged, as [`handle_pws_restart`] does. Returns whether it was
+/// PWS operation failed in the listed cells. Validated against the sender's own
+/// Global eNB ID, as [`handle_pws_restart`] does, counted, and relayed to the CBC
+/// as PWS-Failure-Indication (TS 29.168 §4.3.3F, #1071). Returns whether it was
 /// accepted.
 pub fn handle_pws_failure(
     ctx: &MmeContext,
@@ -1575,10 +1578,13 @@ pub fn handle_pws_failure(
     PWS_FAILURE_INDICATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     log::warn!(
         "PWS FAILURE INDICATION from eNB {enb_id} ({:?}): PWS operation failed in {} cell(s); \
-         this MME has no SBc-AP association to tell the CBC (#1071)",
+         relayed to the CBC (TS 29.168 §4.3.3F)",
         msg.global_enb_id,
         msg.failed_ecgi_list.len()
     );
+    if let Some(pdu) = crate::sbcap_handler::pws_failure_indication(msg) {
+        crate::sbcap_path::indicate_to_cbc(pdu, "PWS FAILURE INDICATION");
+    }
     log::debug!(
         "PWS FAILURE INDICATION from eNB {enb_id}: failed cells {:?}",
         msg.failed_ecgi_list

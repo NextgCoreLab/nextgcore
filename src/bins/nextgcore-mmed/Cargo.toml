@@ -26,6 +26,7 @@ nextgcore-crypt = { workspace = true }
 nextgcore-nas = { workspace = true }
 nextgcore-s1ap = { workspace = true }
 nextgcore-s1ap-gen = { workspace = true }
+nextgcore-sbcap-gen = { workspace = true }
 asn1-codecs.workspace = true
 bitvec.workspace = true
 nextgcore-sctp = { workspace = true }
