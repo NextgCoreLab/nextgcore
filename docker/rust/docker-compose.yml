@@ -84,7 +84,10 @@ services:
       TLS_CERT: /etc/nextgcore/certs/nrf.crt
       TLS_KEY: /etc/nextgcore/certs/nrf.key
       TLS_CA: /etc/nextgcore/certs/ca.crt
-    command: ["-c", "/etc/nextgcore/nrf.yaml"]
+    # nrfd takes its SBI bind from --sbi-addr only, and that defaults to loopback
+    # (#1308). Every container interface, inside this private network; the host
+    # publish below stays 127.0.0.1.
+    command: ["-c", "/etc/nextgcore/nrf.yaml", "--sbi-addr", "0.0.0.0"]
     volumes:
       - ./configs/5gc/nrf.yaml:/etc/nextgcore/nrf.yaml:ro
       - ./certs:/etc/nextgcore/certs:ro
@@ -265,7 +268,11 @@ services:
       TLS_CERT: /etc/nextgcore/certs/amf.crt
       TLS_KEY: /etc/nextgcore/certs/amf.key
       TLS_CA: /etc/nextgcore/certs/ca.crt
-    command: ["-c", "/etc/nextgcore/amf.yaml"]
+    # The NGAP bind is --ngap-addr, loopback by default (#1308); amf.ngap.server
+    # in amf.yaml does not set it. Every container interface, inside this private
+    # network; the host publish below stays 127.0.0.1 unless the operator names
+    # NEXTGCORE_RAN_PUBLISH_ADDR.
+    command: ["-c", "/etc/nextgcore/amf.yaml", "--ngap-addr", "0.0.0.0:38412"]
     volumes:
       - ./configs/5gc/amf.yaml:/etc/nextgcore/amf.yaml:ro
       - ./certs:/etc/nextgcore/certs:ro

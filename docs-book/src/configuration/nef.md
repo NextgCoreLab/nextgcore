@@ -30,7 +30,7 @@ Everything else is configured by flags.
 | `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-l, --log-file` | path | unset | Log file path. |
 | `-m, --no-color` | flag | off | Disable colored output. |
-| `--sbi-addr` / `--sbi-port` | string / u16 | `0.0.0.0` / `7817` | SBI bind address and port. |
+| `--sbi-addr` / `--sbi-port` | string / u16 | `127.0.0.1` (loopback, #1308) / `7817` | SBI bind address and port. |
 | `--tls`, `--tls-cert`, `--tls-key` | flag, path, path | off | TLS on the SBI listener. |
 | `--verify-client` | flag | off | Require and verify a client certificate (needs `--tls`; without it startup fails). The certificate's URI SAN becomes the caller identity that subscription ownership is keyed to. |
 | `--verify-client-cacert` | path | SBI layer default | CA bundle for `--verify-client`. |

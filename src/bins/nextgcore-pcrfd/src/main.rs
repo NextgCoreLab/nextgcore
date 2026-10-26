@@ -61,7 +61,9 @@ struct Args {
     #[arg(long)]
     diameter_realm: Option<String>,
 
-    /// Diameter listen address, Gx and Rx share one listener [default: 0.0.0.0:3868]
+    /// Diameter listen address, Gx and Rx share one listener [default: 127.0.0.1:3868,
+    /// loopback (#1308); a PCEF or AF on another host needs this, or
+    /// `pcrf.diameter.addr`, set]
     #[arg(long)]
     diameter_addr: Option<String>,
 
@@ -97,7 +99,9 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 /// started with no config and no flags behaves exactly as before.
 const DEFAULT_DIAMETER_ID: &str = "pcrf.localdomain";
 const DEFAULT_DIAMETER_REALM: &str = "localdomain";
-const DEFAULT_DIAMETER_ADDR: &str = "0.0.0.0:3868";
+/// Loopback (#1308): a PCRF started without an address is reachable from its own
+/// host only.
+const DEFAULT_DIAMETER_ADDR: &str = "127.0.0.1:3868";
 
 /// Resolve the Diameter identity, realm and listen address by precedence:
 /// **CLI flag > YAML config > built-in default**.
@@ -259,6 +263,11 @@ fn main() -> Result<()> {
     let listen_addr: std::net::SocketAddr = diam_addr
         .parse()
         .with_context(|| format!("Invalid Diameter listen address: {diam_addr}"))?;
+    nextgcore_core::sockaddr::warn_if_loopback_listener(
+        "Gx/Rx Diameter",
+        &listen_addr,
+        "--diameter-addr (or pcrf.diameter.addr in the config file)",
+    );
     std::thread::Builder::new()
         .name("pcrf-diameter".to_string())
         .spawn(move || {
@@ -459,9 +468,9 @@ mod tests {
     // Diameter identity precedence: CLI > YAML > built-in default (issue #58)
     // -----------------------------------------------------------------------
 
-    /// With neither a flag nor a config value, the built-in defaults apply —
-    /// byte-identical to the clap `default_value`s these flags used to carry, so
-    /// a daemon started bare behaves exactly as before this change.
+    /// With neither a flag nor a config value, the built-in defaults apply: the
+    /// identity the clap `default_value`s used to carry, and since #1308 a
+    /// loopback listen address rather than every interface.
     #[test]
     fn identity_falls_back_to_builtin_defaults() {
         let args = Args::parse_from(["nextgcore-pcrfd"]);
@@ -469,7 +478,8 @@ mod tests {
         let (id, realm, addr) = resolve_diameter_identity(&args, &cfg);
         assert_eq!(id, "pcrf.localdomain");
         assert_eq!(realm, "localdomain");
-        assert_eq!(addr, "0.0.0.0:3868");
+        // #1308: loopback, not every interface.
+        assert_eq!(addr, "127.0.0.1:3868");
     }
 
     /// With no flags, the YAML values win over the built-in defaults — the whole
@@ -576,7 +586,7 @@ mod tests {
             ..Default::default()
         };
         let (_, _, addr) = resolve_diameter_identity(&args, &port_only);
-        assert_eq!(addr, "0.0.0.0:3999", "default host kept");
+        assert_eq!(addr, "127.0.0.1:3999", "default host kept");
     }
 
     /// The shipped `docker/rust/configs/epc/pcrf.yaml` has a `pcrf:` section with

@@ -1259,6 +1259,17 @@ impl SxaNode {
 // PFCP Path Functions
 // ============================================================================
 
+/// The Sxa bind address: `SGWC_PFCP_BIND_ADDR`, else loopback on the PFCP port
+/// (#1308). An SGW-C whose SGW-U is on another host sets `SGWC_PFCP_BIND_ADDR`.
+fn sxa_bind(env: Option<String>) -> String {
+    env.filter(|v| !v.trim().is_empty()).unwrap_or_else(|| {
+        format!(
+            "{}:{PFCP_PORT}",
+            nextgcore_core::sockaddr::DEFAULT_LISTEN_HOST
+        )
+    })
+}
+
 /// Open the Sxa PFCP socket and associate with the configured SGW-U (#54).
 ///
 /// `SGWC_PFCP_BIND_ADDR` / `SGWC_PFCP_NODE_IP` / `SGWC_SGWU_ADDR` override the defaults
@@ -1273,10 +1284,10 @@ impl SxaNode {
 /// for a single-host test rig and refusing to start would be worse than a warned-about
 /// default — `config::apply` logs that warning when nothing is configured.
 pub async fn pfcp_open() -> Result<Arc<SxaNode>, String> {
-    let bind: SocketAddr = std::env::var("SGWC_PFCP_BIND_ADDR")
-        .unwrap_or_else(|_| format!("0.0.0.0:{PFCP_PORT}"))
+    let bind: SocketAddr = sxa_bind(std::env::var("SGWC_PFCP_BIND_ADDR").ok())
         .parse()
         .map_err(|e| format!("SGWC_PFCP_BIND_ADDR is not a socket address: {e}"))?;
+    nextgcore_core::sockaddr::warn_if_loopback_listener("Sxa PFCP", &bind, "SGWC_PFCP_BIND_ADDR");
     let local_ip = configured_node_ip()?;
     SxaNode::open(bind, local_ip)
         .await
@@ -2830,5 +2841,19 @@ mod tests {
         ctx.ue_remove(ue);
         std::env::remove_var("SGWC_SGWU_ADDR");
         let _ = stop.send(true);
+    }
+}
+
+#[cfg(test)]
+mod default_bind_tests_1308 {
+    use super::sxa_bind;
+
+    /// #1308: with SGWC_PFCP_BIND_ADDR unset (or empty) Sxa binds loopback, not
+    /// every interface; a set value is kept, the wildcard included.
+    #[test]
+    fn sxa_listener_defaults_to_loopback() {
+        assert_eq!(sxa_bind(None), "127.0.0.1:8805");
+        assert_eq!(sxa_bind(Some(" ".into())), "127.0.0.1:8805");
+        assert_eq!(sxa_bind(Some("0.0.0.0:8805".into())), "0.0.0.0:8805");
     }
 }

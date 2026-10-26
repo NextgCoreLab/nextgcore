@@ -54,7 +54,7 @@ These are the fields actually deserialized by the daemon (`#[derive(Deserialize)
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `pcf.sbi.server[].address` | string | absent → CLI `--sbi-addr` (`0.0.0.0`) | Overrides the SBI bind **and** advertised address so the NRF NFProfile carries a routable endpoint (not 0.0.0.0). Only the **first** list entry is read. |
+| `pcf.sbi.server[].address` | string | absent → CLI `--sbi-addr` (`127.0.0.1`, #1308) | Overrides the SBI bind **and** advertised address so the NRF NFProfile carries a routable endpoint (not 0.0.0.0). Only the **first** list entry is read. |
 | `pcf.sbi.server[].port` | u16 | absent → CLI `--sbi-port` (`7777`) | Overrides the SBI bind/advertised port. First entry only. |
 | `pcf.sbi.server[].fqdn` | string | absent (no FQDN) | Optional advertised FQDN, emitted as `pcfFqdn` in TS 29.521 PcfBinding registrations towards the BSF (per code comment); never invented when absent — `pcfIpEndPoints` alone satisfies the spec NOTE. |
 | `pcf.sbi.client.nrf[].uri` | string | absent → no NRF (unless CLI `--nrf-uri`) | NRF base URI seeded into the shared SBI context for NF registration, discovery, heartbeat, and (when OAuth2 is on) token/JWKS. Only the **first** list entry is used. |
@@ -81,7 +81,7 @@ Runtime knobs with real defaults from the clap `Args` struct in `src/bins/nextgc
 | `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-m, --no-color` | flag | off | Disable color output. |
 | `-k, --kill` | flag | off | Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor. |
-| `--sbi-addr` | string | `0.0.0.0` | SBI bind address; overridden by `pcf.sbi.server[0].address` when the YAML sets one. |
+| `--sbi-addr` | string | `127.0.0.1` (loopback, #1308) | SBI bind address; overridden by `pcf.sbi.server[0].address` when the YAML sets one. |
 | `--sbi-port` | u16 | `7777` | SBI port; overridden by `pcf.sbi.server[0].port`. |
 | `--tls` | flag | off | Sets the advertised scheme to `https` in the legacy NF-instance builder only; does **not** enable TLS on the live listener. |
 | `--tls-cert` | path | unset | TLS certificate path (stored in the legacy config; not wired to the listener). |

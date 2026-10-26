@@ -57,7 +57,7 @@ From the clap `Args` struct in `src/bins/nextgcore-dccfd/src/main.rs`:
 | `-l, --log-file` | path | unset | **Parsed but unused** — declared in `Args` yet never referenced by the binary; logging goes to stderr via `env_logger`. |
 | `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-m, --no-color` | flag | off | **Parsed but unused** — declared in `Args` yet never referenced by the binary. |
-| `--sbi-addr` | string | `0.0.0.0` | SBI server bind address; also advertised as the NF's `ipv4Addresses` in the NRF registration. |
+| `--sbi-addr` | string | `127.0.0.1` (loopback, #1308) | SBI server bind address; also advertised as the NF's `ipv4Addresses` in the NRF registration. |
 | `--sbi-port` | u16 | `7816` | SBI server port ("TS 29.574 default: 7816" per code comment); docker deployments pass `7777`. |
 | `--tls` | flag | off | Enable TLS on the SBI server. Takes effect only if **both** `--tls-cert` and `--tls-key` are also given; otherwise it is silently ignored. |
 | `--tls-cert` | path | unset | TLS certificate file (no built-in default path). |

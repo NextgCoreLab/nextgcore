@@ -4366,6 +4366,43 @@ mod tests_ecid_timing_units {
         assert_eq!((fix.latitude, fix.longitude), (40.0, -74.0));
     }
 
+    /// #1269: two ng-eNBs' E-UTRA AoA reports (NRPPa bytes) solve to the UE. The
+    /// report values are TS 36.133 Table 10.2.1-1 bins of the counter-clockwise
+    /// angle from North (TS 36.214 §5.2.7). Read as raw degrees, as before, the
+    /// bearings were wrong in both scale and sense.
+    #[test]
+    fn eutra_aoa_reports_solve_to_the_ue() {
+        use crate::nrppa_uplink::test_support::{aoa, eutra_cgi};
+        use crate::positioning::{enu_to_geodetic, geodetic_to_enu, EnuPoint};
+        let origin = TrpCoord::new(48.0, 11.0, 0.0);
+        let at = |e: f64, n: f64| enu_to_geodetic(EnuPoint { e, n, u: 0.0 }, origin);
+        let ue: (f64, f64) = (400.0, 700.0);
+        let mut cells = Vec::new();
+        let mut entries = Vec::new();
+        for (id, e, n) in [(1u32, 0.0f64, 0.0f64), (2, 1000.0, 0.0)] {
+            let cw = (ue.0 - e).atan2(ue.1 - n).to_degrees().rem_euclid(360.0);
+            let ccw = (360.0 - cw).rem_euclid(360.0);
+            let v = (ccw / 0.5).floor() as u16;
+            let bytes = ecid_report(
+                1,
+                42,
+                7,
+                eutra_cgi([0x02, 0xF8, 0x39], id),
+                [0, 0x12, 0x34],
+                Some(vec![aoa(v)]),
+            );
+            let (_, c) = crate::codec_glue::decode_nrppa_ecid_report(&bytes).unwrap();
+            entries.push((c[0].nr_cgi.clone(), at(e, n)));
+            cells.extend(c);
+        }
+        let reg = TrpRegistry::from_entries(entries);
+        let fix = try_real_solve(&cells, &reg).expect("an AoA fix");
+        let got = geodetic_to_enu(TrpCoord::new(fix.latitude, fix.longitude, 0.0), origin);
+        let err = (got.e - ue.0).hypot(got.n - ue.1);
+        // A 0.5 degree bin at about 1 km is about 9 m.
+        assert!(err < 15.0, "fix {got:?}, {err} m from the UE");
+    }
+
     #[test]
     fn an_open_ended_tadv_gives_no_timing_term() {
         let bytes = ecid_report(

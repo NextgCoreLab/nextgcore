@@ -66,7 +66,8 @@ struct Args {
     #[arg(long)]
     diameter_realm: Option<String>,
 
-    /// Diameter listen address for S6a [default: 0.0.0.0]
+    /// Diameter listen address for S6a [default: 127.0.0.1, loopback (#1308); an
+    /// MME on another host needs this, or `hss.diameter.addr`, set]
     #[arg(long)]
     diameter_addr: Option<String>,
 
@@ -89,6 +90,13 @@ struct Args {
 
 /// Global shutdown flag
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// The S6a Diameter listen host by precedence: `--diameter-addr`, then
+/// `hss.diameter.addr`, then loopback (#1308).
+fn diameter_listen_host(cli: Option<String>, config: Option<String>) -> String {
+    cli.or(config)
+        .unwrap_or_else(|| nextgcore_core::sockaddr::DEFAULT_LISTEN_HOST.to_string())
+}
 
 fn main() -> Result<()> {
     let args = Args::parse();
@@ -204,10 +212,7 @@ fn main() -> Result<()> {
                     .clone()
                     .or_else(|| diam.cnf_diamrlm.clone())
                     .unwrap_or_else(|| "epc.mnc001.mcc001.3gppnetwork.org".to_string()),
-                args.diameter_addr
-                    .clone()
-                    .or_else(|| diam.cnf_addr.clone())
-                    .unwrap_or_else(|| "0.0.0.0".to_string()),
+                diameter_listen_host(args.diameter_addr.clone(), diam.cnf_addr.clone()),
                 args.diameter_port
                     .or(if diam.cnf_port == 0 {
                         None
@@ -244,9 +249,15 @@ fn main() -> Result<()> {
             applications,
             ..Default::default()
         };
-        let listen_addr: std::net::SocketAddr = format!("{diam_addr}:{diam_port}")
-            .parse()
-            .unwrap_or_else(|_| ([0, 0, 0, 0], diam_port).into());
+        // A value that is not an IP address fails startup (#1308). It used to fall
+        // back to 0.0.0.0, so a typo silently listened on every interface.
+        let listen_addr = nextgcore_core::sockaddr::parse_listen_addr(&diam_addr, diam_port)
+            .context("Invalid S6a Diameter listen address")?;
+        nextgcore_core::sockaddr::warn_if_loopback_listener(
+            "S6a Diameter",
+            &listen_addr,
+            "--diameter-addr (or hss.diameter.addr in the config file)",
+        );
 
         std::thread::Builder::new()
             .name("hss-s6a-diameter".to_string())
@@ -546,6 +557,21 @@ fn cleanup(hss_sm: &mut HssSmContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1308: with neither `--diameter-addr` nor `hss.diameter.addr`, S6a listens
+    /// on loopback, not every interface; the flag wins over the file.
+    #[test]
+    fn s6a_listener_defaults_to_loopback() {
+        assert_eq!(diameter_listen_host(None, None), "127.0.0.1");
+        assert_eq!(
+            diameter_listen_host(None, Some("10.0.0.8".into())),
+            "10.0.0.8"
+        );
+        assert_eq!(
+            diameter_listen_host(Some("0.0.0.0".into()), Some("10.0.0.8".into())),
+            "0.0.0.0"
+        );
+    }
 
     /// A config file unique to the calling test, removed when the guard drops.
     struct TempConfig(std::path::PathBuf);
