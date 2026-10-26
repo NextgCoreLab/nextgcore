@@ -189,3 +189,62 @@ async fn a_message_larger_than_the_receive_buffer_is_reassembled() {
         other => panic!("expected DataReceived, got {other:?}"),
     }
 }
+
+/// #1297: a peer's ABORT reaches the server first as an `SCTP_ASSOC_CHANGE` /
+/// `SCTP_COMM_LOST` notification. The notification types are
+/// `SCTP_SN_TYPE_BASE + n` in `<linux/sctp.h>` (`SCTP_ASSOC_CHANGE` is 0x8001), so
+/// the association is reported closed by that notification ("SCTP association
+/// down"), not only later through the read error that follows it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_abort_is_recognised_by_its_notification() {
+    let bind = "127.0.0.1:0".parse().unwrap();
+    let mut server = KernelSctpServer::bind(bind, SctpServerConfig::default())
+        .await
+        .expect("kernel SCTP server bind");
+    let server_addr = server.local_addr();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    server.set_event_sender(tx);
+    let client = tokio::task::spawn_blocking(move || {
+        KernelSctpSocket::client(server_addr, None).expect("kernel SCTP client connect")
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        next_event(&mut rx).await,
+        ServerEvent::NewAssociation { .. }
+    ));
+    // Close with SO_LINGER 0: an SCTP ABORT (RFC 6458 §8.1.4).
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    let rc = unsafe {
+        libc::setsockopt(
+            client.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            &linger as *const libc::linger as *const libc::c_void,
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0);
+    drop(client);
+    match next_event(&mut rx).await {
+        ServerEvent::AssociationClosed { reason, .. } => {
+            assert_eq!(
+                reason, "SCTP association down",
+                "closed by the COMM_LOST notification"
+            )
+        }
+        other => panic!("expected AssociationClosed, got {other:?}"),
+    }
+}
+
+/// #1297: the notification constants are `<linux/sctp.h>`'s.
+#[test]
+fn the_notification_types_are_the_kernels() {
+    use nextgcore_sctp::kernel::{SCTP_ASSOC_CHANGE, SCTP_PEER_ADDR_CHANGE, SCTP_SHUTDOWN_EVENT};
+    assert_eq!(SCTP_ASSOC_CHANGE, 0x8001);
+    assert_eq!(SCTP_PEER_ADDR_CHANGE, 0x8002);
+    assert_eq!(SCTP_SHUTDOWN_EVENT, 0x8005);
+}

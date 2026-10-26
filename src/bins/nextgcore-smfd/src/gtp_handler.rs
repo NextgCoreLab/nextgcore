@@ -4499,6 +4499,57 @@ mod tests {
         server.close();
     }
 
+    /// #1293, TS 24.301 §6.4.2.4 d) 2): two local rules of two flows each on one PDN
+    /// connection give two Create Bearer Requests whose TFTs share no packet filter
+    /// precedence. Before, both were numbered 0, 1, and the UE deleted the first
+    /// bearer's filters (and so the bearer) when the second arrived.
+    #[tokio::test]
+    async fn two_local_rules_get_filter_precedences_unique_on_the_pdn_connection() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _upf = crate::pfcp_path::stand_in::associated_upf().await;
+        let (server, sgw, _port, sess, pgw_c_teid) =
+            pdn_with_local_rules(0x6d, vec![voice_rule(), video_rule()]).await;
+        let mut per_bearer: Vec<Vec<u8>> = Vec::new();
+        for ebi in [6u8, 7] {
+            let (cbr, _) = recv_type(&sgw, gtp2_message_type::CREATE_BEARER_REQUEST).await;
+            let bc = cbr.bearer_context(0).unwrap().unwrap();
+            let tft = crate::eps_tft::decode(
+                &bc.get_ie(Gtp2IeType::BearerTft as u8, 0)
+                    .expect("Bearer TFT")
+                    .value,
+            )
+            .expect("a TFT the UE can decode");
+            per_bearer.push(tft.filters.iter().map(|f| f.precedence).collect());
+            let pgw_u = bc.fteid(1).unwrap();
+            sgw.send_to(
+                &s5c_create_bearer_response(cbr.header.sequence_number, pgw_c_teid, ebi, 16, pgw_u),
+                server.local_addr(),
+            )
+            .await
+            .expect("send");
+            stored_bearer(sess.id, ebi).await.expect("stored");
+        }
+        // The first rule keeps its 0, 1; the second, asking for 0, 1 as well, gets
+        // the next free ones in the same order.
+        assert_eq!(per_bearer, vec![vec![0, 1], vec![2, 3]]);
+        // And they are what the PGW-C holds for the bearers.
+        let stored: Vec<u8> = {
+            let handle = crate::context::smf_self();
+            let ctx = handle.read().unwrap();
+            let mut p: Vec<u8> = [6u8, 7]
+                .iter()
+                .flat_map(|e| ctx.bearer_find_by_ebi(sess.id, *e).unwrap().pf_ids)
+                .filter_map(|id| ctx.pf_find_by_id(id))
+                .map(|pf| pf.precedence)
+                .collect();
+            p.sort_unstable();
+            p
+        };
+        assert_eq!(stored, vec![0, 1, 2, 3]);
+        server.close();
+    }
+
     /// #1182 review, TS 23.401 §5.4.4.1: a bearer the SGW-C accepted but the PGW-U could
     /// not carry (its downlink install refused) is deleted at the SGW-C too.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4669,6 +4720,67 @@ mod tests {
             .len();
         assert_eq!(held, 1, "only the default bearer is left");
         assert_eq!(server.outstanding().await, 0);
+        server.close();
+    }
+
+    /// #619 follow-up (#1293 PR): a second Delete Bearer Command, under its own sequence
+    /// number, for a bearer whose Delete Bearer Request is still in flight is answered,
+    /// with a Delete Bearer Failure Indication cause #101 "Collision with network
+    /// initiated request" (TS 29.274 §7.2.17.2, Table 8.4-1). Before, it got nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_delete_bearer_command_for_a_bearer_being_deleted_is_answered() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _upf = crate::pfcp_path::stand_in::associated_upf().await;
+        let (server, sgw, _port, sess, pgw_c_teid) =
+            pdn_with_local_rules(0x6e, vec![voice_rule()]).await;
+        let (cbr, _) = recv_type(&sgw, gtp2_message_type::CREATE_BEARER_REQUEST).await;
+        sgw.send_to(
+            &s5c_create_bearer_response(cbr.header.sequence_number, pgw_c_teid, 6, 16, None),
+            server.local_addr(),
+        )
+        .await
+        .expect("send");
+        stored_bearer(sess.id, 6).await.expect("EBI 6 active");
+        let dbc = |seq: u32, ebi: u8| {
+            use nextgcore_gtp::v2::{Gtp2BearerContextIe, Gtp2Header, Gtp2Message};
+            let mut m = Gtp2Message::new(Gtp2Header::new(
+                gtp2_message_type::DELETE_BEARER_COMMAND,
+                pgw_c_teid,
+                seq,
+            ));
+            let mut bc = Gtp2BearerContextIe::new();
+            bc.set_ebi(ebi);
+            m.add_bearer_context(0, &bc);
+            m.encode()
+        };
+        sgw.send_to(&dbc(0x8016, 6), server.local_addr())
+            .await
+            .expect("send");
+        let (dbr, _) = recv_type(&sgw, gtp2_message_type::DELETE_BEARER_REQUEST).await;
+        assert_eq!(dbr.header.sequence_number, 0x8016);
+        // Not answered yet: the bearer is being deleted. A second Command for it.
+        sgw.send_to(&dbc(0x8017, 6), server.local_addr())
+            .await
+            .expect("send");
+        let (fi, _) = recv_type(&sgw, gtp2_message_type::DELETE_BEARER_FAILURE_INDICATION).await;
+        assert_eq!(
+            fi.header.sequence_number, 0x8017,
+            "under the second Command's"
+        );
+        assert_eq!(fi.header.teid, Some(0x6e00_0001));
+        assert_eq!(
+            fi.get_ie(Gtp2IeType::Cause as u8, 0).map(|ie| ie.value[0]),
+            Some(101),
+            "Collision with network initiated request"
+        );
+        let bc = fi.bearer_context(0).unwrap().expect("Bearer Context");
+        assert_eq!(bc.ebi().ok(), Some(6));
+        assert_eq!(
+            bc.get_ie(Gtp2IeType::Cause as u8, 0).map(|ie| ie.value[0]),
+            Some(101)
+        );
+        assert!(stored_bearer(sess.id, 6).await.is_some(), "still held");
         server.close();
     }
 

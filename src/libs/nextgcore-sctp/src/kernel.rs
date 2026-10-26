@@ -70,10 +70,14 @@ pub const SOL_SCTP: c_int = 132;
 /// in nextgsim): one definition, the one `<linux/sctp.h>` is checked against.
 pub use libc::{SCTP_EVENTS, SCTP_INITMSG, SCTP_NODELAY, SCTP_PEER_ADDR_PARAMS, SCTP_RTOINFO};
 
-/// SCTP notification types (`enum sctp_sn_type`). Not in `libc`.
-pub const SCTP_ASSOC_CHANGE: u16 = 1;
-pub const SCTP_PEER_ADDR_CHANGE: u16 = 2;
-pub const SCTP_SHUTDOWN_EVENT: u16 = 5;
+/// SCTP notification types (`enum sctp_sn_type` in `<linux/sctp.h>`). Not in `libc`.
+/// They count up from `SCTP_SN_TYPE_BASE` (1 << 15), the first being
+/// `SCTP_DATA_IO_EVENT`; RFC 6458 §6.1 leaves the values to the implementation.
+/// They were 1, 2 and 5 until #1297, which no notification ever matched.
+const SCTP_SN_TYPE_BASE: u16 = 1 << 15;
+pub const SCTP_ASSOC_CHANGE: u16 = SCTP_SN_TYPE_BASE + 1;
+pub const SCTP_PEER_ADDR_CHANGE: u16 = SCTP_SN_TYPE_BASE + 2;
+pub const SCTP_SHUTDOWN_EVENT: u16 = SCTP_SN_TYPE_BASE + 5;
 
 /// SCTP association change states (`enum sctp_sac_state`). Not in `libc`.
 pub const SCTP_COMM_UP: u16 = 0;
