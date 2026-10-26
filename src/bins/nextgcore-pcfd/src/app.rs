@@ -437,8 +437,9 @@ pub async fn run() -> Result<()> {
     );
     let sbi_config = SbiServerConfig {
         // The NF instance pcf_sbi_open builds from this is what the NRF is told:
-        // the advertised host, never the bind wildcard (#1312).
-        addr: sbi.advertise_or_bind().to_string(),
+        // the advertised host, never the bind wildcard. With none, the instance
+        // carries no address, and the NF does not register (#1312).
+        addr: sbi.advertise.clone().unwrap_or_default(),
         port: sbi.port,
         tls_enabled: args.tls,
         tls_cert: args.tls_cert.clone(),
@@ -505,12 +506,21 @@ pub async fn run() -> Result<()> {
             String::new()
         }
     };
-    sbi_path::pcf_self_info_set(sbi_path::PcfSelfInfo {
-        sbi_addr: sbi.advertise_or_bind().to_string(),
-        sbi_port: sbi.port,
-        fqdn: sbi_fqdn.clone(),
-        nf_instance_id: nf_instance_id.clone(),
-    });
+    // #1312: only an advertised host is published. With a wildcard bind and
+    // nothing to advertise there is no self info, so every callback URI,
+    // resourceUri and PcfBinding builder skips (each returns None) rather than
+    // put 0.0.0.0 in front of a peer.
+    match sbi_path::pcf_self_info_for(&sbi, sbi_fqdn.clone(), nf_instance_id.clone()) {
+        Some(info) => {
+            sbi_path::pcf_self_info_set(info);
+        }
+        None => log::error!(
+            "SBI binds the wildcard {} with nothing to advertise: no callback URI, \
+             resourceUri or BSF PcfBinding is built; set --sbi-advertise, \
+             NEXTGCORE_SBI_ADVERTISE or pcf.sbi.server[0].advertise",
+            sbi.host
+        ),
+    }
 
     // Register with NRF and start heartbeat worker. ONE registration, through the
     // single profile builder in sbi_path, so the advertised service set cannot

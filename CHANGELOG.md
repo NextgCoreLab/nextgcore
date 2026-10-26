@@ -47,7 +47,8 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   (#1312): `--sbi-advertise`, else `NEXTGCORE_SBI_ADVERTISE`, else `<nf>.sbi.server[0].advertise`,
   else the bind address when it is not a wildcard. A wildcard is never advertised: an NF that
   binds `0.0.0.0` or `::` with nothing to advertise does not register with the NRF, and logs
-  why. Applies to ausfd, bsfd, nssfd, pcfd, udmd, udrd, dccfd, lmfd, mbsmfd, nsacfd and nwdafd,
+  why. pcfd then also publishes no self identity, so it builds no callback URI, absolute
+  resourceUri or BSF PcfBinding endpoint on the wildcard (each is skipped). Applies to ausfd, bsfd, nssfd, pcfd, udmd, udrd, dccfd, lmfd, mbsmfd, nsacfd and nwdafd,
   and to eesd's ECS registration. The k8s manifests, the EKS profiles (which build on them)
   and the Helm chart set `NEXTGCORE_SBI_ADVERTISE` to the pod IP for the first six.
 - The inert `metrics.server` blocks are gone from the shipped configs and both ConfigMaps: no

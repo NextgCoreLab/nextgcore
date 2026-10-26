@@ -737,13 +737,6 @@ impl SbiEndpoint {
             )
         })
     }
-
-    /// The advertised host, or the bind host when there is none (log text and
-    /// URIs that are built either way; the NRF registration uses
-    /// [`registration_host`](Self::registration_host)).
-    pub fn advertise_or_bind(&self) -> &str {
-        self.advertise.as_deref().unwrap_or(&self.host)
-    }
 }
 
 /// A YAML `server[0]` entry.

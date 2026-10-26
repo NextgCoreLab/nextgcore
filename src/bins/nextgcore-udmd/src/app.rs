@@ -563,9 +563,10 @@ pub async fn run() -> Result<()> {
     log::info!("SBI HTTP/2 server listening on {sbi_addr}");
 
     // Register with NRF and start heartbeat worker
-    match match sbi.registration_host() {
+    let registration_host = sbi.registration_host();
+    match match registration_host {
         Ok(host) => register_with_nrf(host, sbi.port).await,
-        Err(e) => Err(e),
+        Err(ref e) => Err(e.clone()),
     } {
         Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
             // Issue #22 NES (off by default): idle->drain->suspend runtime.
@@ -575,7 +576,7 @@ pub async fn run() -> Result<()> {
                     .as_ref()
                     .map(crate::nes_driver::NesSettings::from_yaml),
                 nf_instance_id.clone(),
-                sbi.advertise_or_bind().to_string(),
+                host.to_string(),
                 sbi.port,
             );
             // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
