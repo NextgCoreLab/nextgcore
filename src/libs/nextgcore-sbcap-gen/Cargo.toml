@@ -1,0 +1,21 @@
+[package]
+name = "nextgcore-sbcap-gen"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NextGCore SBc-AP APER codec generated from the TS 29.168 ASN.1 (#1071)"
+
+[dependencies]
+asn1-codecs.workspace = true
+asn1_codecs_derive.workspace = true
+bitvec.workspace = true
+# Direct, not transitive: the AperCodec derive expands to `log::` paths inside
+# the generated code (as nextgcore-s1ap-gen).
+log.workspace = true
+
+[build-dependencies]
+asn1-compiler.workspace = true
+
+[lints]
+workspace = true
