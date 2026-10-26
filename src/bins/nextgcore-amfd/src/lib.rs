@@ -1087,7 +1087,7 @@ pub async fn run() -> Result<()> {
                 .ok()
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(2124);
-            match format!("{addr}:{port}").parse() {
+            match nextgcore_core::sockaddr::parse_listen_addr(&addr, port) {
                 Ok(sock) => Some(sock),
                 Err(e) => {
                     log::warn!("Invalid AMF_N26_ADDR '{addr}:{port}': {e}; N26 is not bound");
@@ -1139,8 +1139,7 @@ pub async fn run() -> Result<()> {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(7777);
-    let sbi_sock: SocketAddr = format!("{sbi_addr}:{sbi_port}")
-        .parse()
+    let sbi_sock: SocketAddr = nextgcore_core::sockaddr::parse_listen_addr(&sbi_addr, sbi_port)
         .map_err(|e| anyhow::anyhow!("Invalid SBI address '{sbi_addr}:{sbi_port}': {e}"))?;
     let mut sbi_server_config = nextgcore_sbi::server::SbiServerConfig::new(sbi_sock);
     // Issue #63: resolve the SBI security profile, PRODUCTION by default. The

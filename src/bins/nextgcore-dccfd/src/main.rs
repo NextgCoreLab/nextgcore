@@ -284,9 +284,9 @@ async fn main() -> Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     setup_signal_handlers(shutdown.clone());
 
-    let bind_addr: SocketAddr = format!("{}:{}", args.sbi_addr, args.sbi_port)
-        .parse()
-        .context("Invalid SBI bind address")?;
+    let bind_addr: SocketAddr =
+        nextgcore_core::sockaddr::parse_listen_addr(&args.sbi_addr, args.sbi_port)
+            .context("Invalid SBI bind address")?;
     log::info!("DCCF SBI listening on {bind_addr}");
 
     let mut sbi_config = SbiServerConfig::new(bind_addr);
