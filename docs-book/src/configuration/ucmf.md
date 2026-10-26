@@ -53,6 +53,7 @@ The log level is `-e/--log-level` when given, else this file's `logger.level`, e
 | `-c, --config` | path | `/etc/nextgcore/ucmf.yaml` | Configuration file path. |
 | `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `--sbi-addr` / `--sbi-port` | string / u16 | `127.0.0.1` (loopback, #1308) / `7777` | SBI bind address and port. |
+| `--sbi-advertise` | string | unset | The host in the apiRoot (`Location` headers, resource URIs) and the NRF NFProfile (#1322). Then `NEXTGCORE_SBI_ADVERTISE`, then `--sbi-addr` when it is not a wildcard. A wildcard is never advertised: with a wildcard bind and nothing to advertise, ucmfd refuses to start. |
 | `--tls`, `--tls-cert`, `--tls-key` | flag, path, path | off | TLS on the SBI listener. |
 | `--nrf-uri` | string | `http://127.0.0.1:7777` | NRF base URI, used when the YAML names none. |
 | `--version-id` | string | from YAML | Overrides `ucmf.version_id`. |

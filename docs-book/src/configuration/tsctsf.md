@@ -110,6 +110,7 @@ From the clap `Args` struct in `src/bins/nextgcore-tsctsf/src/main.rs`:
 | `-e, --log-level` | `info` | Log level. |
 | `-m, --no-color` | off | Disable colour output. |
 | `--sbi-addr` | `127.0.0.1` (loopback, #1308) | SBI bind address. |
+| `--sbi-advertise` | unset | The host registered with the NRF (#1322). Then `NEXTGCORE_SBI_ADVERTISE`, then `--sbi-addr` when it is not a wildcard; with neither, NRF registration is skipped and logged. |
 | `--sbi-port` | `7819` | SBI port. |
 | `--tls`, `--tls-cert`, `--tls-key` | off / unset | TLS for the SBI server. |
 | `--nrf-uri` | `http://127.0.0.1:7777` | NRF location for registration and the OAuth2 JWKS. |

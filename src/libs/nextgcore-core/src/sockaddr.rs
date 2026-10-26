@@ -623,6 +623,51 @@ pub fn is_wildcard_host(host: &str) -> bool {
     parse_listen_addr(host, 0).is_ok_and(|a| a.ip().is_unspecified())
 }
 
+/// The host of an absolute `scheme://host[:port][/path]` URI an operator gives as
+/// an advertised base, or `None` when it names no host or a wildcard one (#1322):
+/// such a URI must never be handed to a peer.
+pub fn advertised_uri_host(uri: &str) -> Option<&str> {
+    let (_, rest) = uri.trim().split_once("://")?;
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = match authority.rsplit_once(':') {
+        Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => h,
+        _ => authority,
+    };
+    (!host.is_empty() && !is_wildcard_host(host)).then_some(host)
+}
+
+#[cfg(test)]
+mod tests_advertised_uri_host {
+    use super::advertised_uri_host;
+
+    #[test]
+    fn a_uri_with_no_host_or_a_wildcard_one_is_refused() {
+        assert_eq!(
+            advertised_uri_host("http://10.0.0.4:7777"),
+            Some("10.0.0.4")
+        );
+        assert_eq!(
+            advertised_uri_host("https://nef.example/x"),
+            Some("nef.example")
+        );
+        assert_eq!(
+            advertised_uri_host("http://[fd00::1]:80/"),
+            Some("[fd00::1]")
+        );
+        assert_eq!(advertised_uri_host("http://[fd00::1]"), Some("[fd00::1]"));
+        for bad in [
+            "http://0.0.0.0:7777",
+            "http://[::]:7777",
+            "http://",
+            "http:",
+            "",
+            "10.0.0.4",
+        ] {
+            assert_eq!(advertised_uri_host(bad), None, "{bad}");
+        }
+    }
+}
+
 /// An SBI listener and what it advertises (#1312).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SbiEndpoint {

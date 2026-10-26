@@ -51,6 +51,18 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   resourceUri or BSF PcfBinding endpoint on the wildcard (each is skipped). Applies to ausfd, bsfd, nssfd, pcfd, udmd, udrd, dccfd, lmfd, mbsmfd, nsacfd and nwdafd,
   and to eesd's ECS registration. The k8s manifests, the EKS profiles (which build on them)
   and the Helm chart set `NEXTGCORE_SBI_ADVERTISE` to the pod IP for the first six.
+- **amfd, smfd, nefd and ucmfd refuse to start on a wildcard SBI bind with nothing to
+  advertise**, where they put `0.0.0.0` (amfd, nefd, ucmfd), `127.0.0.1` or `::` (smfd) in
+  the callback URIs, `Location` / resource URIs and NFProfiles they hand peers (#1322). The
+  advertised host is `NEXTGCORE_SBI_ADVERTISE` (and `--sbi-advertise` for nefd and ucmfd),
+  else `<nf>.sbi.server[0].advertise` (amfd, smfd), else the bind when it is not a wildcard.
+  `SMF_SBI_ADVERTISE_URI` and nefd's `--notify-base` still win, and are refused when they name
+  no host or a wildcard. amfd's callback URIs now follow `amf.sbi.server[0]` too; they used
+  `AMF_SBI_ADDR` or `127.0.0.1` even when the YAML set the bind. easdfd and tsctsf take
+  `--sbi-advertise` and skip NRF registration rather than register a wildcard. pcfd no longer
+  sends a BSF PcfBinding when it has no advertised host (logged once). The k8s, EKS and Helm
+  manifests set `NEXTGCORE_SBI_ADVERTISE` to the pod IP for amf and smf as well. No shipped
+  deployment binds these NFs to a wildcard with nothing to advertise.
 - The inert `metrics.server` blocks are gone from the shipped configs and both ConfigMaps: no
   daemon read them. The metrics listeners are set by environment variables, listed in
   `docs-book/src/observability.md` (#1312).

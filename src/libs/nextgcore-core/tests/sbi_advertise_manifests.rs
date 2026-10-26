@@ -1,10 +1,10 @@
-//! #1312: the six NFs that take `NEXTGCORE_SBI_ADVERTISE` get it, set to the pod
+//! #1312, #1322: the NFs that take `NEXTGCORE_SBI_ADVERTISE` get it, set to the pod
 //! IP, in the k8s manifests (which the EKS profiles build on) and the Helm chart,
 //! so what they register with the NRF is set apart from what they bind.
 
 use std::path::Path;
 
-const NFS: [&str; 6] = ["ausf", "bsf", "nssf", "pcf", "udm", "udr"];
+const NFS: [&str; 8] = ["ausf", "bsf", "nssf", "pcf", "udm", "udr", "amf", "smf"];
 
 fn sets_the_pod_ip(text: &str) -> bool {
     let Some(at) = text.find("- name: NEXTGCORE_SBI_ADVERTISE") else {

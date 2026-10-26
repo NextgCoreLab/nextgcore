@@ -293,6 +293,46 @@ async fn apply_oauth2_enforcement(mut cfg: NextgcoreSbiServerConfig) -> Nextgcor
     cfg
 }
 
+/// #1322: the SBI endpoint of `config`; its bind is the resolved `smf.sbi.server`.
+fn sbi_endpoint(config: &SmfConfig) -> nextgcore_core::sockaddr::SbiEndpoint {
+    nextgcore_core::sockaddr::SbiEndpoint::resolve(
+        Some(&config.sbi_addr),
+        Some(config.sbi_port),
+        None,
+        None,
+        None,
+        config.sbi_advertise.as_deref(),
+        7777,
+    )
+}
+
+/// #1322: the callback base URI: `SMF_SBI_ADVERTISE_URI` when set (an empty or
+/// wildcard one is refused), else `http://<advertised host>:<port>`. `Err` when
+/// there is nothing reachable to advertise: the SMF must not start.
+fn smf_advertise_uri(
+    env_uri: Option<String>,
+    sbi: &nextgcore_core::sockaddr::SbiEndpoint,
+) -> std::result::Result<String, String> {
+    if let Some(uri) = env_uri.map(|u| u.trim().trim_end_matches('/').to_string()) {
+        if nextgcore_core::sockaddr::advertised_uri_host(&uri).is_none() {
+            return Err(format!(
+                "refusing to start: SMF_SBI_ADVERTISE_URI '{uri}' names no reachable host"
+            ));
+        }
+        return Ok(uri);
+    }
+    let host = sbi.registration_host().map_err(|why| {
+        format!(
+            "refusing to start: {why}, or SMF_SBI_ADVERTISE_URI; every callback URI the \
+             SMF hands a peer would be unreachable"
+        )
+    })?;
+    Ok(format!(
+        "http://{}",
+        nextgcore_sbi::uri_encode::uri_authority(host, sbi.port)
+    ))
+}
+
 /// Base URI for callbacks (e.g. `http://10.0.0.5:7777`).
 fn self_sbi_uri() -> String {
     SELF_SBI_URI
@@ -558,6 +598,8 @@ struct AddrEntry {
     address: Option<String>,
     port: Option<u16>,
     uri: Option<String>,
+    /// `smf.sbi.server[0].advertise` (#1322).
+    advertise: Option<String>,
 }
 
 /// SBI client NRF list
@@ -612,6 +654,8 @@ struct SmfYaml {
 struct SmfConfig {
     sbi_addr: String,
     sbi_port: u16,
+    /// `smf.sbi.server[0].advertise`: the SBI host peers are told (#1322).
+    sbi_advertise: Option<String>,
     max_ue: usize,
     max_sess: usize,
     max_bearer: usize,
@@ -636,6 +680,7 @@ impl Default for SmfConfig {
             // #1308: loopback unless `smf.sbi.server[0].address` names the address.
             sbi_addr: nextgcore_core::sockaddr::DEFAULT_LISTEN_HOST.to_string(),
             sbi_port: 7777,
+            sbi_advertise: None,
             max_ue: 1024,
             max_sess: 4096,
             max_bearer: 8192,
@@ -685,6 +730,7 @@ fn load_config(path: &str) -> anyhow::Result<SmfConfig> {
                     if let Some(port) = first.port {
                         config.sbi_port = port;
                     }
+                    config.sbi_advertise = first.advertise;
                 }
             }
             // Extract the NRF URI here so main() doesn't re-read and re-parse
@@ -836,20 +882,15 @@ async fn main() -> Result<()> {
         global_context().set_nrf_uri(uri).await;
     }
 
-    // Advertised SBI base URI used for PCF callbacks (notificationUri).
-    // 0.0.0.0 is not reachable by peers, so fall back to loopback unless
-    // overridden with SMF_SBI_ADVERTISE_URI.
-    let advertise_uri = std::env::var("SMF_SBI_ADVERTISE_URI").unwrap_or_else(|_| {
-        let host = if config.sbi_addr == "0.0.0.0" {
-            "127.0.0.1"
-        } else {
-            config.sbi_addr.as_str()
-        };
-        format!(
-            "http://{}",
-            nextgcore_sbi::uri_encode::uri_authority(host, config.sbi_port)
-        )
-    });
+    // #1322: the SBI host peers are told: NEXTGCORE_SBI_ADVERTISE, else
+    // smf.sbi.server[0].advertise, else the bind when it is not a wildcard.
+    let sbi = sbi_endpoint(&config);
+    // Advertised SBI base URI used for every callback URI (PCF notificationUri,
+    // AMF/UDM/EASDF callbacks): SMF_SBI_ADVERTISE_URI, else the advertised host.
+    // With a wildcard bind and nothing to advertise, the SMF refuses to start
+    // rather than hand peers 0.0.0.0 (or a loopback URI they cannot reach).
+    let advertise_uri = smf_advertise_uri(std::env::var("SMF_SBI_ADVERTISE_URI").ok(), &sbi)
+        .map_err(|why| anyhow::anyhow!(why))?;
     log::info!("SBI advertise URI for callbacks: {advertise_uri}");
     let _ = SELF_SBI_URI.set(advertise_uri.clone());
 
@@ -1041,7 +1082,10 @@ async fn main() -> Result<()> {
     log::info!("SBI HTTP/2 server listening on {sbi_addr}");
 
     // Register with NRF (if configured)
-    match smf_nrf_register(&config.sbi_addr, config.sbi_port).await {
+    match match sbi.registration_host() {
+        Ok(host) => smf_nrf_register(host, sbi.port).await,
+        Err(why) => Err(why),
+    } {
         Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
             // #79: the UDM must record the SAME instance id the NRF knows, or its
             // serving-SMF record points at an instance nothing else can resolve.
@@ -25202,5 +25246,66 @@ mod shipped_config_tests {
         if let Some(text) = nextgcore_core::helm_render::helm_rendered_config(&root, "smf.yaml") {
             serde_yaml::from_str::<super::SmfYaml>(&text).expect("Helm smf.yaml");
         }
+    }
+}
+
+/// #1322: no wildcard reaches the callback base URI.
+#[cfg(test)]
+mod tests_advertise_uri_1322 {
+    use super::{smf_advertise_uri, SmfConfig};
+    use nextgcore_core::sockaddr::SbiEndpoint;
+
+    fn ep(host: &str, advertise: Option<&str>) -> SbiEndpoint {
+        SbiEndpoint {
+            host: host.into(),
+            port: 7777,
+            advertise: advertise.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn the_callback_base_is_the_advertised_host_never_a_wildcard() {
+        assert_eq!(
+            smf_advertise_uri(None, &ep("0.0.0.0", Some("10.0.0.4"))).unwrap(),
+            "http://10.0.0.4:7777"
+        );
+        assert_eq!(
+            smf_advertise_uri(None, &ep("fd00::4", Some("fd00::4"))).unwrap(),
+            "http://[fd00::4]:7777"
+        );
+        for wildcard in ["0.0.0.0", "::"] {
+            let e = smf_advertise_uri(None, &ep(wildcard, None)).unwrap_err();
+            assert!(e.starts_with("refusing to start"), "{e}");
+        }
+        assert_eq!(
+            smf_advertise_uri(
+                Some("http://smf.example:7777/".into()),
+                &ep("0.0.0.0", None)
+            )
+            .unwrap(),
+            "http://smf.example:7777",
+            "SMF_SBI_ADVERTISE_URI wins"
+        );
+        for bad in ["http://0.0.0.0:7777", "http://[::]:7777", "http://", ""] {
+            assert!(
+                smf_advertise_uri(Some(bad.into()), &ep("10.0.0.4", Some("10.0.0.4"))).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_yaml_advertise_is_read() {
+        let config = SmfConfig {
+            sbi_addr: "0.0.0.0".into(),
+            sbi_advertise: Some("10.0.0.9".into()),
+            ..SmfConfig::default()
+        };
+        // NEXTGCORE_SBI_ADVERTISE, when the test environment sets it, wins; it
+        // is never a wildcard either way.
+        let sbi = super::sbi_endpoint(&config);
+        assert_eq!(sbi.host, "0.0.0.0");
+        let adv = sbi.advertise.expect("an advertised host");
+        assert!(!nextgcore_core::sockaddr::is_wildcard_host(&adv));
     }
 }

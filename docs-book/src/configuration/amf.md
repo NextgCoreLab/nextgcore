@@ -100,7 +100,8 @@ Cargo features: `kernel-sctp` (enables `--sctp-backend kernel`; the Docker build
 | `AMF_NAS_SECURITY` | Overrides `amf.nas.use_nextgcore_security` (truthy: `1`/`true`/`yes`). |
 | `NEXTGCORE_SBI_OAUTH2_REQUIRE` | Overrides `sbi.oauth2.require` (truthy: `1`/`true`/`TRUE`/`yes`); useful for docker overlays without editing the YAML. |
 | `AMF_EMERGENCY_ALLOW_UNAUTHENTICATED` | Overrides `amf.emergency.allow_unauthenticated` (truthy: `1`/`true`/`yes`/`on`). Any other value — including an empty one — reads as **disabled** rather than falling back to the YAML or the default, so a typo in a regulatory setting fails visibly instead of silently reverting. |
-| `AMF_SBI_ADDR` / `AMF_SBI_PORT` | Namf SBI bind and advertised address. Default `127.0.0.1:7777`; the YAML has no SBI server key. |
+| `AMF_SBI_ADDR` / `AMF_SBI_PORT` | Namf SBI bind address, else `amf.sbi.server[0]`, else `127.0.0.1:7777` (#1311). |
+| `NEXTGCORE_SBI_ADVERTISE` | The host in the NRF NFProfile and every callback URI (#1322). Else `amf.sbi.server[0].advertise`, else the bind when it is not a wildcard. Before, the callbacks used `AMF_SBI_ADDR` or `127.0.0.1` even when the YAML set the bind. A wildcard is never advertised: with a wildcard bind and nothing to advertise, amfd refuses to start. |
 | `NRF_URI` | NRF URI; when set it is written into the SBI context when the SBI opens, overriding `sbi.client.nrf`. |
 | `AMF_N26_ADDR` / `AMF_N26_PORT` | Opens the N26 GTPv2-C endpoint for EPS↔5GS interworking (idle-mode context transfer, connected-mode handover). Unset = no N26. Port default `2124`. A bind failure is logged and N26 stays off; the AMF still serves 5GC. |
 | `AMF_N26_MME_ADDR` | Comma-separated target MME N26 endpoints for 5GS→EPS Forward Relocation; a bare address gets port `2123`. Malformed entries are skipped with a log. |
