@@ -1,0 +1,199 @@
+{
+  "_comment": [
+    "The images a release publishes to Docker Hub (#420). release.yml builds and pushes",
+    "exactly this list, as <namespace>/<image>:<version> and :latest. ci.yml's release-images job",
+    "(docker/check-release-images.sh) fails when a daemon under src/bins/, a Dockerfile, or an",
+    "image a compose file or the Helm chart references is neither here nor in `excluded`."
+  ],
+  "images": [
+    {
+      "image": "nextgcore-core",
+      "dockerfile": "docker/rust/Dockerfile.core",
+      "context": "docker/rust",
+      "base": true
+    },
+    {
+      "image": "nextgcore-amf",
+      "dockerfile": "docker/rust/Dockerfile.nf",
+      "context": "docker/rust",
+      "nf_name": "nextgcore-amfd"
+    },
+    {
+      "image": "nextgcore-ausf",
+      "dockerfile": "docker/rust/Dockerfile.nf",
+      "context": "docker/rust",
+      "nf_name": "nextgcore-ausfd"
+    },
+    {
+      "image": "nextgcore-bsf",
+      "dockerfile": "docker/rust/Dockerfile.nf",
+      "context": "docker/rust",
+      "nf_name": "nextgcore-bsfd"
+    },
+    {
+      "image": "nextgcore-dccf",
+      "dockerfile": "docker/rust/Dockerfile.nf",
+      "context": "docker/rust",
+      "nf_name": "nextgcore-dccfd"
+    },
+    {
+      "image": "nextgcore-easdf",
+      "dockerfile": "docker/rust/Dockerfile.nf",
+      "context": "docker/rust",
+      "nf_name": "nextgcore-easdfd"
+    },
+    {
+      "image": "nextgcore-ees",
+      "dockerfile": "docker/rust/Dockerfile.nf",
+      "context": "docker/rust",
+      "nf_name": "nextgcore-eesd"
+    },
+    {
+      "image": "nextgcore-hss",
+      "dockerfile": "docker/rust/Dockerfile.nf",
+      "context": "docker/rust",
+      "nf_name": "nextgcore-hssd"
+    },
+    {
+      "image": "nextgcore-lmf",
+      "dockerfile": "docker/rust/Dockerfile.nf",
+      "context": "docker/rust",
+      "nf_name": "nextgcore-lmfd"
+    },
+    {
+      "image": "nextgcore-mbsmf",
+      "dockerfile": "docker/rust/Dockerfile.nf",
+      "context": "docker/rust",
+      "nf_name": "nextgcore-mbsmfd"
+    },
+    {
+      "image": "nextgcore-mme",
+      "dockerfile": "docker/rust/Dockerfile.nf",
+      "context": "docker/rust",
+      "nf_name": "nextgcore-mmed"
+    },
+    {
+      "image": "nextgcore-nef",
+      "dockerfile": "docker/rust/Dockerfile.nf",
+      "context": "docker/rust",
+      "nf_name": "nextgcore-nefd"
+    },
+    {
+      "image": "nextgcore-nrf",
+      "dockerfile": "docker/rust/Dockerfile.nf",
+      "context": "docker/rust",
+      "nf_name": "nextgcore-nrfd"
+    },
+    {
+      "image": "nextgcore-nsacf",
+      "dockerfile": "docker/rust/Dockerfile.nf",
+      "context": "docker/rust",
+      "nf_name": "nextgcore-nsacfd"
+    },
+    {
+      "image": "nextgcore-nssf",
+      "dockerfile": "docker/rust/Dockerfile.nf",
+      "context": "docker/rust",
+      "nf_name": "nextgcore-nssfd"
+    },
+    {
+      "image": "nextgcore-nwdaf",
+      "dockerfile": "docker/rust/Dockerfile.nf",
+      "context": "docker/rust",
+      "nf_name": "nextgcore-nwdafd"
+    },
+    {
+      "image": "nextgcore-pcf",
+      "dockerfile": "docker/rust/Dockerfile.nf",
+      "context": "docker/rust",
+      "nf_name": "nextgcore-pcfd"
+    },
+    {
+      "image": "nextgcore-pcrf",
+      "dockerfile": "docker/rust/Dockerfile.nf",
+      "context": "docker/rust",
+      "nf_name": "nextgcore-pcrfd"
+    },
+    {
+      "image": "nextgcore-pin",
+      "dockerfile": "docker/rust/Dockerfile.nf",
+      "context": "docker/rust",
+      "nf_name": "nextgcore-pind"
+    },
+    {
+      "image": "nextgcore-scp",
+      "dockerfile": "docker/rust/Dockerfile.nf",
+      "context": "docker/rust",
+      "nf_name": "nextgcore-scpd"
+    },
+    {
+      "image": "nextgcore-sepp",
+      "dockerfile": "docker/rust/Dockerfile.nf",
+      "context": "docker/rust",
+      "nf_name": "nextgcore-seppd"
+    },
+    {
+      "image": "nextgcore-sgwc",
+      "dockerfile": "docker/rust/Dockerfile.nf",
+      "context": "docker/rust",
+      "nf_name": "nextgcore-sgwcd"
+    },
+    {
+      "image": "nextgcore-sgwu",
+      "dockerfile": "docker/rust/Dockerfile.nf",
+      "context": "docker/rust",
+      "nf_name": "nextgcore-sgwud"
+    },
+    {
+      "image": "nextgcore-smf",
+      "dockerfile": "docker/rust/Dockerfile.nf",
+      "context": "docker/rust",
+      "nf_name": "nextgcore-smfd"
+    },
+    {
+      "image": "nextgcore-tsctsf",
+      "dockerfile": "docker/rust/Dockerfile.nf",
+      "context": "docker/rust",
+      "nf_name": "nextgcore-tsctsf"
+    },
+    {
+      "image": "nextgcore-ucmf",
+      "dockerfile": "docker/rust/Dockerfile.nf",
+      "context": "docker/rust",
+      "nf_name": "nextgcore-ucmfd"
+    },
+    {
+      "image": "nextgcore-udm",
+      "dockerfile": "docker/rust/Dockerfile.nf",
+      "context": "docker/rust",
+      "nf_name": "nextgcore-udmd"
+    },
+    {
+      "image": "nextgcore-udr",
+      "dockerfile": "docker/rust/Dockerfile.nf",
+      "context": "docker/rust",
+      "nf_name": "nextgcore-udrd"
+    },
+    {
+      "image": "nextgcore-upf",
+      "dockerfile": "docker/rust/Dockerfile.nf",
+      "context": "docker/rust",
+      "nf_name": "nextgcore-upfd"
+    },
+    {
+      "image": "nextgcore-webui",
+      "dockerfile": "docker/webui/Dockerfile",
+      "context": "."
+    }
+  ],
+  "excluded": [
+    {
+      "path": "docker/rust/Dockerfile.builder",
+      "reason": "build stage: compiles the binaries the images COPY; not a runtime image"
+    },
+    {
+      "path": "src/bins/nextgcore-webui",
+      "reason": "no image is defined for the Rust WebUI (Dockerfile.nf's `-c nf.yaml` CMD does not fit it); the published nextgcore-webui image is the Node.js UI in docker/webui"
+    }
+  ]
+}

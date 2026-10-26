@@ -360,6 +360,18 @@ jobs:
           echo "$out" | grep -q 'amf.replicas > 1 is not supported' \
             || { echo "failed for another reason: $out"; exit 1; }
 
+  release-images:
+    # #420: release.yml publishes exactly docker/release-images.json. A new NF
+    # daemon, Dockerfile or deployed image that is not in that list (or in its
+    # `excluded` list, with a reason) fails here, on the PR that adds it, rather
+    # than shipping a release without it.
+    name: Release image list
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Every image the repo defines is published
+        run: docker/check-release-images.sh
+
   manifests:
     # #1098: the #968 squash committed git conflict markers into
     # k8s/manifests/upf.yaml, which broke every kustomize render (k8s/ and both

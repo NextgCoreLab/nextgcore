@@ -16,6 +16,7 @@ a nightly `schedule` (`cron: "0 4 * * *"`, 04:00 UTC), and manual `workflow_disp
 | **Clippy** | `cargo clippy --workspace`, plus `-p nextgcore-easdfd --features dns-udp --all-targets` | every push/PR (errors gate; warnings are shown) |
 | **Test** | `cargo test --workspace`, plus `cargo test -p nextgcore-easdfd --features dns-udp`. No retry: a red run is a real failure. The job adds swap and disables test debuginfo because the generated RRC codec crates need a lot of rustc memory | every push/PR |
 | **Fuzz targets build** | `src/fuzz` is its own workspace: `cargo fmt -- --check` and `cargo clippy --locked --bins -- -D warnings` there | every push/PR |
+| **Release image list** | `docker/check-release-images.sh`: every daemon, Dockerfile and deployed image is in the Docker Hub publish list, `docker/release-images.json` (#420) | every push/PR |
 | **Docker Build** | checks out the sibling `nextgsim`, records the (nextgcore, nextgsim) commit pair, builds `Dockerfile.builder` → binaries → `Dockerfile.core` + per-NF `Dockerfile.nf` images, and fails if any expected image is missing | nightly + dispatch |
 | **Docker E2E** | brings up the 5GC (mongodb, nrf, ausf/udm/udr/pcf/nssf/bsf, amf/smf/upf), registers a real nextgsim UE over N2, asserts the Namf event notifications, drives a CM-IDLE → Service Request cycle and a gNB-initiated UE Context Release, then runs the **0.2.0 UE-flow gate** (`docker/rust/ue-flow-check.sh`): downlink paging of an idle UE, uplink from CM-IDLE, a page after a Service Request, UE-initiated de-registration + re-registration, and UDM `REREGISTRATION_REQUIRED` re-registration, each ending in a 0%-loss ping. A second stage brings up the OAuth2 overlay and asserts authenticated token exchange | nightly + dispatch |
 | **Docker E2E (EPC)** | brings up `docker-compose-epc.yml` (hss, pcrf, sgwc, sgwu, pgwc, pgwu, mme), waits for the Sxa and Sxb PFCP associations, then attaches a real LTE UE through nextgsim's eNB (`docker/rust/epc-attach-check.sh`) and pings through the default bearer with 0% loss. Dedicated bearers, handover, idle mode/paging and IPv6 PDN are not asserted | nightly + dispatch |
@@ -46,6 +47,61 @@ The workflow validates the manifest, refuses to re-release an existing tag, gene
 notes from `git log <previous-tag>..<validated sha>`, bumps `[workspace.package] version` in
 `src/Cargo.toml`, commits, tags the bump commit, and creates the GitHub release. nextgsim has a
 sibling workflow that tags itself from the same manifest.
+
+After a non-dry-run release, and on any pushed version tag, the `publish-*` jobs push the
+release's images to Docker Hub; see [Docker Hub images](#docker-hub-images).
+
+### Docker Hub images
+
+`release.yml` publishes every image in `docker/release-images.json` to Docker Hub (#420).
+
+**Trigger: a version tag only.** Publishing runs for:
+- a pushed tag `X.Y.Z` or `X.Y.Z-<pre>`;
+- the tag a dispatched `release.yml` run with `dry_run=false` has just created. That tag is
+  pushed with `GITHUB_TOKEN`, which starts no workflow, so the same run publishes it.
+
+Nothing is pushed from a PR, a branch, the nightly or a dry run.
+
+**Setup.** Repository settings, Secrets and variables, Actions:
+
+| Name | Kind | Value |
+|------|------|-------|
+| `DOCKERHUB_USERNAME` | secret | the Docker Hub account that pushes |
+| `DOCKERHUB_TOKEN` | secret | a Docker Hub access token with Read & Write scope, not the password |
+| `DOCKERHUB_NAMESPACE` | variable (optional) | the Docker Hub organisation. Without it, images go under `DOCKERHUB_USERNAME` |
+
+Credentials live only in these secrets, never in a file. If either secret is missing, the
+`publish-gate` job prints a "Docker Hub publish skipped" notice and the publish jobs are
+skipped. The release itself still succeeds. To publish a release made before the secrets
+existed, add them and re-run that run's `Docker Hub publish gate` job. GitHub re-runs its
+dependent jobs with it.
+
+**What is pushed.** Each image is `<namespace>/<image>:<version>`, built from the tagged commit.
+After every versioned push has succeeded, `<namespace>/<image>:latest` is moved to it. A
+pre-release (`X.Y.Z-<pre>`) never moves `latest`. The image names replace the local-only
+`nextgcore-rust/<nf>` names that compose and Helm use:
+
+| Image | Built from |
+|-------|------------|
+| `nextgcore-core` | `docker/rust/Dockerfile.core`, the base every NF image is built FROM |
+| `nextgcore-<nf>`, one per daemon under `src/bins/` (`amf`, `ausf`, `bsf`, `dccf`, `easdf`, `ees`, `hss`, `lmf`, `mbsmf`, `mme`, `nef`, `nrf`, `nsacf`, `nssf`, `nwdaf`, `pcf`, `pcrf`, `pin`, `scp`, `sepp`, `sgwc`, `sgwu`, `smf`, `tsctsf`, `ucmf`, `udm`, `udr`, `upf`) | `docker/rust/Dockerfile.nf` with `NF_NAME=nextgcore-<nf>d` (`nextgcore-tsctsf` for TSCTSF). Binaries come from `Dockerfile.builder`, as in `ci.yml`'s Docker Build |
+| `nextgcore-webui` | `docker/webui/Dockerfile` (the Node.js WebUI) |
+
+**First publish.** A pushed image name is public and cannot be cleanly withdrawn, so prove the
+setup first. Point `DOCKERHUB_NAMESPACE` at a private namespace and push a pre-release tag such
+as `0.2.0-rc.1`. Check the images, then set the variable to the public organisation.
+
+nextgsim publishes `nextgsim-nr-gnb`, `nextgsim-nr-ue`, `nextgsim-lte-enb` and
+`nextgsim-lte-ue` from its own `release.yml`, with the same secrets in that repository.
+
+**The list cannot silently go stale.** `ci.yml`'s `Release image list` job runs
+`docker/check-release-images.sh` on every push and PR. It fails when any of these is in neither
+the manifest's `images` nor its `excluded` list (which gives a reason for each entry):
+- a crate under `src/bins/`;
+- a tracked `Dockerfile*`;
+- a `nextgcore-rust/<nf>` image referenced in `docker/`, `deploy/` or `k8s/`.
+
+A new NF therefore needs a manifest line in the PR that adds it.
 
 ### `pages.yml` — documentation site
 
@@ -81,6 +137,8 @@ Optionally the data-plane E2E: `cd docker/rust && ./e2e.sh`.
    the CHANGELOG).
 3. Run `release.yml` with `version`, `validated_run_id`, `paired_version` and `dry_run=true`;
    read the notes in the job summary. Re-run with `dry_run=false` to tag and publish.
+   With the Docker Hub secrets set, the same run then pushes the images
+   ([Docker Hub images](#docker-hub-images)).
 4. Do the same in nextgsim with the same run id.
 5. Run `pages.yml` by hand to publish the docs site for the release.
 
