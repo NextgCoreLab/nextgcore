@@ -30,7 +30,10 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   address without a port (`[fd00::5]`) was dropped as unparsable, and the IPv6 server list
   `s1ap_list6` was never filled or read, so such a config fell back to `127.0.0.1:36412`. IPv6
   entries now go in `s1ap_list6`, and the bind takes the first IPv4 entry, else the first IPv6
-  one. Loopback remains the default only when nothing is configured (#1299 follow-up).
+  one. Loopback remains the default only when nothing is configured (#1299 follow-up). The
+  shared address parser behind it also accepts a bracketed IPv6 literal without a port in the
+  other mmed address lists (S11 GTP-C, N26, SBc-AP and the peer lists), which used to drop it
+  as unparsable.
 - **mmed: S1-MME binds `127.0.0.1:36412` when `mme.s1ap.server` is unset**, where it bound the
   wildcard `0.0.0.0` (#1299). Break risk: a deployment that relied on the implicit wildcard
   (no `mme.s1ap.server`) no longer accepts eNBs from other hosts; it logs a warning and needs

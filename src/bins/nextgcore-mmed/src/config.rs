@@ -382,14 +382,10 @@ fn apply(ctx: &mut MmeContext, mme: MmeSection) {
             }
         }
         let configured = ctx.s1ap_list.len() + ctx.s1ap_list6.len();
-        if configured > 1 {
-            log::warn!(
-                "{configured} S1AP server addresses configured; only {} is bound",
-                ctx.s1ap_list
-                    .first()
-                    .or(ctx.s1ap_list6.first())
-                    .expect("configured > 1")
-            );
+        if let Some(bound) = ctx.s1ap_list.first().or(ctx.s1ap_list6.first()) {
+            if configured > 1 {
+                log::warn!("{configured} S1AP server addresses configured; only {bound} is bound");
+            }
         }
     }
 
