@@ -569,6 +569,78 @@ mod tests {
 /// private interface of the host).
 pub const DEFAULT_LISTEN_HOST: &str = "127.0.0.1";
 
+/// The first `<section>.<iface>.server[]` entry of the YAML config `text`:
+/// its `address` and `port`, each `None` when absent (#1312). An unreadable or
+/// unparsable file is `(None, None)`.
+pub fn yaml_listen_server(text: &str, section: &str, iface: &str) -> (Option<String>, Option<u16>) {
+    let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(text) else {
+        return (None, None);
+    };
+    let entry = &doc[section][iface]["server"][0];
+    let address = entry["address"].as_str().map(str::to_string);
+    let port = entry["port"].as_u64().and_then(|p| u16::try_from(p).ok());
+    (address, port)
+}
+
+/// A listener's host and port (#1312, as #1311): the command line, else the
+/// config file's `<section>.<iface>.server[0]`, else [`DEFAULT_LISTEN_HOST`] and
+/// `default_port` (#1308: no default is widened). Each field on its own.
+pub fn resolve_listen(
+    cli_host: Option<&str>,
+    cli_port: Option<u16>,
+    config_path: &str,
+    section: &str,
+    iface: &str,
+    default_port: u16,
+) -> (String, u16) {
+    let (yaml_host, yaml_port) = std::fs::read_to_string(config_path)
+        .map(|t| yaml_listen_server(&t, section, iface))
+        .unwrap_or((None, None));
+    let host = cli_host
+        .map(str::to_string)
+        .or(yaml_host)
+        .unwrap_or_else(|| DEFAULT_LISTEN_HOST.to_string());
+    (host, cli_port.or(yaml_port).unwrap_or(default_port))
+}
+
+#[cfg(test)]
+mod tests_resolve_listen {
+    use super::{resolve_listen, yaml_listen_server};
+
+    #[test]
+    fn the_command_line_then_the_yaml_then_loopback() {
+        let dir = std::env::temp_dir().join(format!("resolve-listen-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nf.yaml");
+        std::fs::write(
+            &path,
+            "lmf:\n  sbi:\n    server:\n      - address: fd00::16\n        port: 7900\n",
+        )
+        .unwrap();
+        let p = path.to_str().unwrap();
+        assert_eq!(
+            resolve_listen(None, None, p, "lmf", "sbi", 7816),
+            ("fd00::16".into(), 7900)
+        );
+        assert_eq!(
+            resolve_listen(Some("0.0.0.0"), None, p, "lmf", "sbi", 7816),
+            ("0.0.0.0".into(), 7900),
+            "field by field"
+        );
+        assert_eq!(resolve_listen(None, Some(1), p, "lmf", "sbi", 7816).1, 1);
+        assert_eq!(
+            resolve_listen(None, None, p, "nwdaf", "sbi", 7815),
+            ("127.0.0.1".into(), 7815),
+            "another section"
+        );
+        assert_eq!(
+            resolve_listen(None, None, "/nonexistent.yaml", "lmf", "sbi", 7816),
+            ("127.0.0.1".into(), 7816)
+        );
+        assert_eq!(yaml_listen_server("not: [yaml", "lmf", "sbi"), (None, None));
+    }
+}
+
 /// The startup warning for a listener bound to a loopback address (#1308), naming
 /// `setting`, the option that opens it to peers on other hosts. `None` when `addr`
 /// is not loopback.

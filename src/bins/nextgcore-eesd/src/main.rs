@@ -186,12 +186,14 @@ struct Args {
     no_color: bool,
 
     /// SBI server address
-    #[arg(long, default_value = nextgcore_core::sockaddr::DEFAULT_LISTEN_HOST)]
-    sbi_addr: String,
+    /// Without it, `ees.sbi.server[0].address` from the config file, else
+    /// 127.0.0.1 (#1308, #1312). The port likewise defaults to the file, else 7814.
+    #[arg(long)]
+    sbi_addr: Option<String>,
 
     /// SBI server port
-    #[arg(long, default_value = "7814")]
-    sbi_port: u16,
+    #[arg(long)]
+    sbi_port: Option<u16>,
 
     /// Enable TLS
     #[arg(long)]
@@ -270,6 +272,16 @@ fn load_oauth2_jwks(path: &str) {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    // #1312: the command line, else `ees.sbi.server[0]` in the config file,
+    // else loopback.
+    let (sbi_addr, sbi_port) = nextgcore_core::sockaddr::resolve_listen(
+        args.sbi_addr.as_deref(),
+        args.sbi_port,
+        &args.config,
+        "ees",
+        "sbi",
+        7814,
+    );
 
     init_logging(&nextgcore_core::log::nf_log_level(
         args.log_level.as_deref(),
@@ -328,9 +340,8 @@ async fn main() -> Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     setup_signal_handlers(shutdown.clone());
 
-    let addr: SocketAddr =
-        nextgcore_core::sockaddr::parse_listen_addr(&args.sbi_addr, args.sbi_port)
-            .context("Invalid SBI address")?;
+    let addr: SocketAddr = nextgcore_core::sockaddr::parse_listen_addr(&sbi_addr, sbi_port)
+        .context("Invalid SBI address")?;
     // #1308: loopback by default; say which setting opens it to remote peers.
     nextgcore_core::sockaddr::warn_if_loopback_listener("SBI", &addr, "--sbi-addr");
 
@@ -360,13 +371,8 @@ async fn main() -> Result<()> {
     // request is answered under a different setting from the next.
     ecs_role::init_from_env();
 
-    ecs_registration::start_ecs_registration(
-        args.ecs_uri.as_deref(),
-        &ees_id,
-        &args.sbi_addr,
-        args.sbi_port,
-    )
-    .await;
+    ecs_registration::start_ecs_registration(args.ecs_uri.as_deref(), &ees_id, &sbi_addr, sbi_port)
+        .await;
 
     // eesd-12: drop lapsed EAS/EEC registrations on a periodic schedule.
     spawn_lifecycle_sweep();
@@ -2966,14 +2972,14 @@ mod tests {
     #[test]
     fn sbi_listener_defaults_to_loopback_1308() {
         let args = Args::parse_from(["nextgcore-eesd"]);
-        assert_eq!(args.sbi_addr, "127.0.0.1");
+        assert_eq!(args.sbi_addr, None);
     }
 
     #[test]
     fn test_args_default() {
         let args = Args::parse_from(["nextgcore-eesd"]);
         assert_eq!(args.config, "/etc/nextgcore/ees.yaml");
-        assert_eq!(args.sbi_port, 7814);
+        assert_eq!(args.sbi_port, None);
         assert_eq!(args.max_eas, 512);
         // eesd-01: NRF removed in favour of an optional ECS apiRoot.
         assert!(args.ecs_uri.is_none());
