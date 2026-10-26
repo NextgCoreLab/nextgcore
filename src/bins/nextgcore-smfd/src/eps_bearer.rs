@@ -780,6 +780,8 @@ pub async fn deactivate_on_command(
     peer: std::net::SocketAddr,
     seq: u32,
 ) {
+    // #619 follow-up: not while a Bearer Resource Command's procedure runs on them.
+    let _procedures = BearerProcedures::lock(sess_id, ebis).await;
     let handle = context::smf_self();
     let Some((sess, linked_ebi, bearers, refused)) = handle.read().ok().and_then(|ctx| {
         let sess = ctx.sess_find_by_id(sess_id)?;
@@ -1219,6 +1221,68 @@ pub(crate) fn parse_update_bearer_response(
     })
 }
 
+/// The dedicated bearers a Command-triggered procedure is running on, by (session id,
+/// EBI) (#619 follow-up).
+///
+/// Two Bearer Resource Commands for one bearer (the UE may run two ESM procedures, each
+/// with its own PTI) each read the bearer's packet filters and QoS before their Update
+/// Bearer Request and store their result after it: the second's store overwrote the
+/// first's, so a TFT change was lost while the UE and the MME held both. TS 23.401
+/// §5.4.5 has the PGW handle a Command by one bearer procedure, and the procedures on a
+/// bearer are run one at a time; the second waits here for the first to end, then reads
+/// what the first stored. The Delete Bearer Command takes the same locks.
+static BEARER_PROCEDURES: std::sync::Mutex<
+    Option<std::collections::HashMap<(u64, u8), std::sync::Arc<tokio::sync::Mutex<()>>>>,
+> = std::sync::Mutex::new(None);
+
+/// Holds the procedure locks of some bearers; each leaves the map once nobody waits.
+pub(crate) struct BearerProcedures {
+    held: Vec<(
+        (u64, u8),
+        std::sync::Arc<tokio::sync::Mutex<()>>,
+        tokio::sync::OwnedMutexGuard<()>,
+    )>,
+}
+
+impl BearerProcedures {
+    /// Wait for, then hold, the procedure locks of `ebis` of session `sess_id`, in EBI
+    /// order so two procedures over overlapping bearers cannot deadlock.
+    pub(crate) async fn lock(sess_id: u64, ebis: &[u8]) -> Self {
+        let mut ebis = ebis.to_vec();
+        ebis.sort_unstable();
+        ebis.dedup();
+        let mut held = Vec::with_capacity(ebis.len());
+        for ebi in ebis {
+            let key = (sess_id, ebi);
+            let lock = BEARER_PROCEDURES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_or_insert_with(std::collections::HashMap::new)
+                .entry(key)
+                .or_default()
+                .clone();
+            let guard = lock.clone().lock_owned().await;
+            held.push((key, lock, guard));
+        }
+        Self { held }
+    }
+}
+
+impl Drop for BearerProcedures {
+    fn drop(&mut self) {
+        let mut map = BEARER_PROCEDURES.lock().unwrap_or_else(|e| e.into_inner());
+        for (key, lock, guard) in self.held.drain(..) {
+            drop(guard);
+            // The map's reference and this one: nobody else waits.
+            if std::sync::Arc::strong_count(&lock) == 2 {
+                if let Some(m) = map.as_mut() {
+                    m.remove(&key);
+                }
+            }
+        }
+    }
+}
+
 /// The UE's Bearer Resource Command for an existing dedicated bearer, relayed by the
 /// SGW-C from `peer` under `seq` (TS 23.401 §5.4.5, TS 29.274 §7.2.5).
 ///
@@ -1250,6 +1314,9 @@ pub async fn modify_on_command(
             "no EPS Bearer ID names the bearer".into(),
         )
     })?;
+    // #619 follow-up: from the read of the bearer to the store of the result, one
+    // procedure on it at a time.
+    let _procedure = BearerProcedures::lock(sess_id, &[ebi]).await;
     let handle = context::smf_self();
     let (sess, linked_ebi, bearer, taken) = {
         let ctx = handle

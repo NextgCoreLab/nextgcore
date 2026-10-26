@@ -5178,6 +5178,101 @@ mod tests {
         server.close();
     }
 
+    /// #619 follow-up: two Bearer Resource Commands for one dedicated bearer (two ESM
+    /// procedures of the UE, each with its own PTI) are run one after the other. The
+    /// second's Update Bearer Request goes out only once the first is answered, and is
+    /// computed from what the first stored, so both filters are kept. Run at once, each
+    /// read the same two filters and the second's store dropped the first's addition,
+    /// while the UE and the MME held both.
+    #[tokio::test]
+    async fn two_bearer_resource_commands_on_one_bearer_are_run_one_after_the_other() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        let (server, sgw, _port, sess, pgw_c_teid) = pdn_with_voice_bearer(0x7a, &upf).await;
+        const VIDEO_DL: &str = "permit out 17 from 198.51.100.7 5008 to assigned";
+        const GAME_DL: &str = "permit out 17 from 198.51.100.9 7000 to assigned";
+        let add = |precedence: u8, flow: &str| {
+            crate::eps_tft::encode(
+                crate::eps_tft::op::ADD_PACKET_FILTERS,
+                &[crate::eps_tft::PacketFilter {
+                    direction: crate::context::FlowDirection::Bidirectional,
+                    identifier: 0,
+                    precedence,
+                    flow_description: flow.into(),
+                }],
+            )
+            .unwrap()
+        };
+        let first = s5c_bearer_resource_command(0x807a, pgw_c_teid, 6, 4, &add(7, VIDEO_DL), None);
+        let second = s5c_bearer_resource_command(0x807b, pgw_c_teid, 6, 5, &add(8, GAME_DL), None);
+        sgw.send_to(&first, server.local_addr())
+            .await
+            .expect("send");
+        sgw.send_to(&second, server.local_addr())
+            .await
+            .expect("send");
+
+        let (ubr1, _) = recv_type(&sgw, gtp2_message_type::UPDATE_BEARER_REQUEST).await;
+        // While the first is unanswered, no second Update Bearer Request.
+        let mut buf = vec![0u8; 4096];
+        let early = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            sgw.recv_from(&mut buf),
+        )
+        .await
+        .is_ok();
+        sgw.send_to(
+            &s5c_bearer_answer(
+                gtp2_message_type::UPDATE_BEARER_RESPONSE,
+                ubr1.header.sequence_number,
+                pgw_c_teid,
+                6,
+                16,
+            ),
+            server.local_addr(),
+        )
+        .await
+        .expect("send");
+        let (ubr2, _) = recv_type(&sgw, gtp2_message_type::UPDATE_BEARER_REQUEST).await;
+        sgw.send_to(
+            &s5c_bearer_answer(
+                gtp2_message_type::UPDATE_BEARER_RESPONSE,
+                ubr2.header.sequence_number,
+                pgw_c_teid,
+                6,
+                16,
+            ),
+            server.local_addr(),
+        )
+        .await
+        .expect("send");
+        let sgw_addr = sgw.local_addr().unwrap();
+        for _ in 0..400 {
+            if server.command_ended(sgw_addr, ubr2.header.sequence_number) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let flows: Vec<String> = stored_filters_of(sess.id, 6)
+            .into_iter()
+            .map(|(_, _, f)| f)
+            .collect();
+        let ids: Vec<u8> = stored_filters_of(sess.id, 6)
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+        server.close();
+
+        assert!(!early, "the second waits for the first");
+        assert_ne!(ubr1.header.sequence_number, ubr2.header.sequence_number);
+        assert!(
+            flows.iter().any(|f| f == VIDEO_DL) && flows.iter().any(|f| f == GAME_DL),
+            "both additions are kept: {flows:?}"
+        );
+        assert_eq!(ids, vec![1, 2, 3, 4], "each with its own identifier");
+    }
+
     /// #619: an Update Bearer Request the SGW-C refuses (the MME or the UE did), or one
     /// it never answers, leaves the bearer as it was: its QoS, its filters, and no
     /// PGW-U change.

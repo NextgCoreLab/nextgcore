@@ -201,7 +201,7 @@ pub struct IpAddr {
 }
 
 /// Bitrate
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Bitrate {
     /// Downlink bitrate (bps)
     pub downlink: u64,
@@ -210,7 +210,7 @@ pub struct Bitrate {
 }
 
 /// QoS parameters
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Qos {
     /// QCI (QoS Class Identifier)
     pub qci: u8,
@@ -223,7 +223,7 @@ pub struct Qos {
 }
 
 /// ARP (Allocation and Retention Priority)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Arp {
     /// Priority level (1-15)
     pub priority_level: u8,
