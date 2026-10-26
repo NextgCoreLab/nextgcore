@@ -288,3 +288,79 @@ fn reseal(mut packet: Vec<u8>) -> Vec<u8> {
     packet[8..12].copy_from_slice(&(!crc).to_le_bytes());
     packet
 }
+
+/// **#1142 review: the out-of-the-blue answers are rate-limited.** A flood of DATA for
+/// associations the server does not hold, as a spoofed-source attack would send, gets
+/// at most the burst plus the refill in ABORTs, not one ABORT per packet. The rest is
+/// counted as suppressed.
+///
+/// The ABORTs are read off the flooding socket as they come, after every packet, so
+/// they never queue in its receive buffer: a buffer that overflowed would drop some
+/// and break `received == answered` on a loaded machine (#1246 review).
+///
+/// REVERT-VERIFIED: with no limit, every one of the 300 packets is answered.
+#[tokio::test]
+async fn a_flood_of_out_of_the_blue_packets_is_answered_at_the_bounded_rate() {
+    use nextgcore_sctp::ootb::{set_checksum, OOTB_ANSWERS_PER_SEC, OOTB_ANSWER_BURST};
+    let mut server = SctpServer::bind("127.0.0.1:0".parse().unwrap(), SctpServerConfig::default())
+        .await
+        .expect("bind");
+    let addr = server.local_addr();
+    let flood = UdpSocket::bind("127.0.0.1:0").await.expect("bind flooder");
+    const PACKETS: u32 = 300;
+    let started = Instant::now();
+    let mut aborts = 0u64;
+    let mut buf = [0u8; 64];
+    let mut count_aborts = |flood: &UdpSocket, aborts: &mut u64| {
+        while let Ok((n, _)) = flood.try_recv_from(&mut buf) {
+            if n >= 16 && buf[12] == 6 {
+                *aborts += 1;
+            }
+        }
+    };
+    for vtag in 0..PACKETS {
+        // A DATA chunk (type 0) under a tag no association has.
+        let mut p = vec![0x13, 0x88, 0x96, 0x2C];
+        p.extend_from_slice(&(0x1142_0000 + vtag).to_be_bytes());
+        p.extend_from_slice(&[0; 4]);
+        p.extend_from_slice(&[0, 0x03, 0, 20, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 60]);
+        p.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        set_checksum(&mut p);
+        flood.send_to(&p, addr).await.expect("send");
+        let _ = server.recv(Duration::from_millis(5)).await;
+        count_aborts(&flood, &mut aborts);
+    }
+    while server
+        .recv(Duration::from_millis(20))
+        .await
+        .unwrap_or(false)
+    {}
+    let elapsed = started.elapsed().as_secs_f64();
+
+    // The last answers: wait for the socket, then read what it holds.
+    while timeout(Duration::from_millis(200), flood.readable())
+        .await
+        .is_ok_and(|r| r.is_ok())
+    {
+        let before = aborts;
+        count_aborts(&flood, &mut aborts);
+        if aborts == before {
+            break;
+        }
+    }
+    let (answered, suppressed) = server.ootb_answer_counts();
+    let bound = u64::from(OOTB_ANSWER_BURST)
+        + (elapsed * f64::from(OOTB_ANSWERS_PER_SEC)).ceil() as u64
+        + 1;
+    assert!(aborts >= 1, "the first ones are answered");
+    assert_eq!(aborts, answered, "every answer counted went out");
+    assert!(
+        answered <= bound && answered < u64::from(PACKETS),
+        "{answered} answers for {PACKETS} packets in {elapsed:.2} s, bound {bound}"
+    );
+    assert_eq!(
+        answered + suppressed,
+        u64::from(PACKETS),
+        "the rest are counted"
+    );
+}

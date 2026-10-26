@@ -827,6 +827,34 @@ impl UeNasContext {
     }
 }
 
+impl UeNasContext {
+    /// #1247: forget the AM policy association `pol_asso_id` after the PCF terminated it
+    /// (TS 29.507 §4.2.4.3), in both places it is held. False when the UE holds another
+    /// association, or none.
+    pub(crate) fn forget_am_policy_association(&mut self, pol_asso_id: &str) -> bool {
+        if self.policy_association_id.as_deref() != Some(pol_asso_id)
+            && self.amf_ue.policy_association.id.as_deref() != Some(pol_asso_id)
+        {
+            return false;
+        }
+        self.policy_association_id = None;
+        self.amf_ue.pcf_am_policy_clear();
+        true
+    }
+
+    /// #1247: the same for the UE policy association (TS 29.525 §4.2.4.3).
+    pub(crate) fn forget_ue_policy_association(&mut self, pol_asso_id: &str) -> bool {
+        if self.ue_policy_association_id.as_deref() != Some(pol_asso_id)
+            && self.amf_ue.ue_policy_association.id.as_deref() != Some(pol_asso_id)
+        {
+            return false;
+        }
+        self.ue_policy_association_id = None;
+        self.amf_ue.pcf_ue_policy_clear();
+        true
+    }
+}
+
 impl crate::ue_store::UeIdentity for UeNasContext {
     fn amf_ue(&self) -> &AmfUe {
         &self.amf_ue
@@ -1151,6 +1179,11 @@ pub struct NgapServer {
     /// [`ESTABLISHMENT_RETRY_WINDOW`] has passed. See
     /// [`NgapServer::process_pending_establishments`].
     pending_establishments: HashMap<(u64, u8), PendingEstablishment>,
+    /// #1222: the Request type (TS 24.501 §9.11.3.47) of the UL NAS TRANSPORT whose
+    /// 5GSM message is being handled, keyed (AMF UE NGAP ID, PSI). Set around the
+    /// dispatch only, so the 5GSM layer reads the transport's IE without every 5GSM
+    /// entry point taking it as a parameter.
+    ul_request_types: HashMap<(u64, u8), u8>,
     /// #923: the UE Context Release Commands sent for a UE the AMF keeps
     /// (registered, to go CM-IDLE), keyed by (association, AMF UE NGAP ID), until
     /// their Release Complete. See [`NgapServer::process_release_guards`].
@@ -1229,6 +1262,9 @@ struct PendingEstablishment {
     /// first CreateSMContext went out and sent unchanged on every retry (#980
     /// review, TS 29.502 §6.1.2.3.2).
     origination_timestamp: String,
+    /// #1222: the UE's Request type for it (TS 24.501 §9.11.3.47), sent to the SMF as
+    /// `requestType` on every attempt.
+    request_type: Option<u8>,
 }
 
 /// #774 review M1: the earlier registration's sessions are being released at
@@ -1246,7 +1282,7 @@ struct SupersedeBarrier {
     deadline: std::time::Instant,
     /// Waiting establishments by PSI, as `(5GSM PDU, DNN)`. A UE retransmission
     /// (T3580) replaces its PSI's entry.
-    parked: std::collections::BTreeMap<u8, (Vec<u8>, Option<String>)>,
+    parked: std::collections::BTreeMap<u8, (Vec<u8>, Option<String>, Option<u8>)>,
 }
 
 /// Source of [`SupersedeBarrier::id`].
@@ -1686,6 +1722,7 @@ impl NgapServer {
             #[cfg(test)]
             instance_override: None,
             pending_establishments: HashMap::new(),
+            ul_request_types: HashMap::new(),
             outstanding_releases: HashMap::new(),
             racs_assigns: HashMap::new(),
             supersede_barriers: HashMap::new(),
@@ -3227,7 +3264,7 @@ impl NgapServer {
         // protected (TS 24.501 §4.4.6), so its message type is inside the security
         // header, not at octet 3; recognised here before the plain dispatch.
         if let Some(plain_sr) = initial_service_request_plain(&nas) {
-            return self
+            let handled = self
                 .handle_idle_service_request(
                     association_id,
                     amf_ue_ngap_id,
@@ -3236,6 +3273,9 @@ impl NgapServer {
                     &plain_sr,
                 )
                 .await;
+            // #1222: the UE's context is now on this connection's id.
+            self.note_establishment_cause(amf_ue_ngap_id, initial_ue.rrc_establishment_cause);
+            return handled;
         }
 
         // A REGISTRATION REQUEST from 5GMM-IDLE over a NAS security context is sent
@@ -3309,6 +3349,9 @@ impl NgapServer {
                     state.amf_ue.access_type = 1; // 3GPP access
                     self.ue_auth_state.insert(amf_ue_ngap_id, state);
                 }
+                // #1222: fresh or moved onto this id, the context takes this
+                // connection's establishment cause.
+                self.note_establishment_cause(amf_ue_ngap_id, initial_ue.rrc_establishment_cause);
 
                 self.handle_registration_request_nas(
                     association_id,
@@ -3359,6 +3402,31 @@ impl NgapServer {
         }
 
         Ok(())
+    }
+
+    /// #1222: record whether the RRC Establishment Cause of the INITIAL UE MESSAGE that
+    /// opened UE `amf_ue_ngap_id`'s NAS signalling connection is associated with
+    /// priority services.
+    ///
+    /// The causes are `highPriorityAccess`, `mps-PriorityAccess` and
+    /// `mcs-PriorityAccess` (TS 38.413 §9.3.1.111). TS 24.501 Table 4.5.6.1 has a UE use
+    /// them for access identity 11-15, 1 and 2, any access category, i.e. exactly a UE
+    /// configured for high priority access (§4.5.2). Each connection rewrites the flag:
+    /// the cause describes this access attempt.
+    ///
+    /// TS 23.502 §4.3.2.2.1 step 3 and TS 29.500 §6.8.4 then have the AMF mark the
+    /// UE's CreateSMContext with a Message Priority header.
+    fn note_establishment_cause(&mut self, amf_ue_ngap_id: u64, rrc_establishment_cause: u8) {
+        use nextgcore_ngap::types::RrcEstablishmentCause as C;
+        let priority = [
+            C::HighPriorityAccess as u8,
+            C::MpsPriorityAccess as u8,
+            C::McsPriorityAccess as u8,
+        ]
+        .contains(&rrc_establishment_cause);
+        self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
+            state.amf_ue.priority_access_cause = priority;
+        });
     }
 
     /// Handle Uplink NAS Transport: decode security (if any) and dispatch
@@ -6149,6 +6217,8 @@ impl NgapServer {
         // parser has already dropped any entry that is not a well-formed
         // TS 29.571 `Gpsi`, so this is never a placeholder.
         state.amf_ue.gpsi = am_data.gpsi.clone();
+        // #1222: likewise for an MPS/MCX subscription that is withdrawn.
+        state.amf_ue.priority_subscription = am_data.priority_subscription;
 
         // New 5G-GUTI: GUAMI of this AMF + CSPRNG 5G-TMSI (TS 23.003 2.10.1)
         state.amf_ue.generate_new_guti();
@@ -9377,8 +9447,11 @@ impl NgapServer {
                 // Gone or idle: nothing to deliver an answer on. The UE asks again.
                 continue;
             };
-            for (psi, (sm_pdu, dnn)) in b.parked {
-                if let Err(e) = self
+            for (psi, (sm_pdu, dnn, request_type)) in b.parked {
+                if let Some(request_type) = request_type {
+                    self.ul_request_types.insert((ue, psi), request_type);
+                }
+                let handled = self
                     .handle_5gsm_message(
                         association_id,
                         ue,
@@ -9386,8 +9459,9 @@ impl NgapServer {
                         &sm_pdu,
                         dnn.as_deref(),
                     )
-                    .await
-                {
+                    .await;
+                self.ul_request_types.remove(&(ue, psi));
+                if let Err(e) = handled {
                     log::warn!("UE {ue}: held PDU session establishment PSI={psi} failed: {e}");
                 }
             }
@@ -9593,14 +9667,24 @@ impl NgapServer {
                         .await?;
                     }
                 }
-                self.handle_5gsm_message(
-                    association_id,
-                    amf_ue_ngap_id,
-                    ran_ue_ngap_id,
-                    &container,
-                    dnn_value.as_deref(),
-                )
-                .await?;
+                // #1222: the transport's Request type, for the CreateSMContext.
+                let key = container.get(1).map(|&sm_psi| (amf_ue_ngap_id, sm_psi));
+                if let (Some(key), Some(request_type)) = (key, request_type) {
+                    self.ul_request_types.insert(key, request_type);
+                }
+                let handled = self
+                    .handle_5gsm_message(
+                        association_id,
+                        amf_ue_ngap_id,
+                        ran_ue_ngap_id,
+                        &container,
+                        dnn_value.as_deref(),
+                    )
+                    .await;
+                if let Some(key) = key {
+                    self.ul_request_types.remove(&key);
+                }
+                handled?;
             }
             Ok(crate::gmm_handler::UlTransportAction::PayloadNotForwarded) => {
                 // DL NAS TRANSPORT with the original payload + cause #90
@@ -9867,8 +9951,15 @@ impl NgapServer {
                 // its sessions released at their SMFs. The new establishment waits for
                 // them (bounded), and goes out from `process_supersede_barriers`.
                 if let Some(b) = self.supersede_barriers.get_mut(&amf_ue_ngap_id) {
-                    b.parked
-                        .insert(psi, (sm_pdu.to_vec(), dnn_override.map(str::to_string)));
+                    let request_type = self.ul_request_types.get(&(amf_ue_ngap_id, psi)).copied();
+                    b.parked.insert(
+                        psi,
+                        (
+                            sm_pdu.to_vec(),
+                            dnn_override.map(str::to_string),
+                            request_type,
+                        ),
+                    );
                     log::info!(
                         "UE {amf_ue_ngap_id}: PDU session establishment PSI={psi} waits for \
                          the release of its earlier registration's {} session(s)",
@@ -10016,6 +10107,7 @@ impl NgapServer {
                     generation: ESTABLISHMENT_GENERATION
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                     origination_timestamp: origination,
+                    request_type: self.ul_request_types.get(&(amf_ue_ngap_id, psi)).copied(),
                 };
                 self.spawn_establishment_attempt(amf_ue_ngap_id, &pending, &state);
                 self.pending_establishments
@@ -10910,13 +11002,14 @@ impl NgapServer {
         let key = (amf_ue_ngap_id, psi);
         // A UE retransmission of the same request keeps the original window, and
         // the original origination timestamp (#980 review).
-        let (first_failure, generation, origination_timestamp) =
+        let (first_failure, generation, origination_timestamp, request_type) =
             self.pending_establishments.get(&key).map_or_else(
                 || {
                     (
                         arrived,
                         ESTABLISHMENT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                         origination_timestamp.to_string(),
+                        self.ul_request_types.get(&key).copied(),
                     )
                 },
                 |p| {
@@ -10924,6 +11017,7 @@ impl NgapServer {
                         p.first_failure,
                         p.generation,
                         p.origination_timestamp.clone(),
+                        p.request_type,
                     )
                 },
             );
@@ -10965,6 +11059,7 @@ impl NgapServer {
                 in_flight: false,
                 generation,
                 origination_timestamp,
+                request_type,
             },
         );
         Ok(())
@@ -11091,6 +11186,9 @@ impl NgapServer {
                 // The establishment's own stamp, not a new one: a retry is the
                 // same request (#980 review).
                 origination_timestamp: Some(p.origination_timestamp.clone()),
+                request_type: p
+                    .request_type
+                    .and_then(crate::sbi_path::request_type_for_smf),
                 ..build_sm_context_identity(
                     Some(state),
                     guard.as_ref().and_then(|c| c.served_guami.first()),
@@ -12058,19 +12156,20 @@ impl NgapServer {
         // No `nfId` filter: there is no originating transfer to have named one, so
         // any PWS-RF/PWS subscriber is a legitimate recipient of a node-raised
         // indication.
-        let subscription = {
+        // #686, TS 23.527 §7.3: every CBC, not one of them.
+        let recipients = {
             let ctx = crate::context::amf_self();
             let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
-            guard.non_ue_n2_subscription_find_by_class("PWS-RF", None)
+            guard.non_ue_n2_indication_recipients()
         };
-        let Some(sub) = subscription else {
+        if recipients.is_empty() {
             log::warn!(
                 "PWS indication (procedure {procedure_code:?}) from association \
                  {association_id} has no PWS-RF/PWS subscription; dropped (no ErrorIndication \
                  sent -- the indication is a class-2 procedure the AMF never answers)"
             );
             return Ok(());
-        };
+        }
 
         let ran_node_id = match &global_ran_node_id {
             nextgcore_ngap::types::GlobalRanNodeId::GlobalGnbId {
@@ -12100,28 +12199,30 @@ impl NgapServer {
         // `29518-k00.txt:19119-19121`: "The Message Type shall be present and
         // encoded as the first N2 PWS Indication IE ... to enable the receiver to
         // decode the N2 PWS IEs" — and the Message Type is in the container.
-        log::info!(
-            "PWS: forwarding a procedure-{} indication to consumer (sub={}, class={})",
-            procedure_code.unwrap_or(0),
-            sub.subscription_id,
-            sub.n2_information_class,
-        );
-        crate::namf_server::send_non_ue_n2_info_notify(
-            sub.n2_notify_callback_uri,
-            sub.subscription_id,
-            sub.n2_information_class,
-            0,
-            0,
-            ran_node_id,
-            // `bcEmptyAreaList` is about a RESPONSE that omitted its area list
-            // (§5.2.2.4.4.3 item 1). An indication has no area list to omit, so
-            // setting it here would assert something the spec never scopes to
-            // this event.
-            false,
-            None,
-            sub.notif_correlation_id,
-            data.to_vec(),
-        );
+        for sub in recipients {
+            log::info!(
+                "PWS: forwarding a procedure-{} indication to consumer (sub={}, class={})",
+                procedure_code.unwrap_or(0),
+                sub.subscription_id,
+                sub.n2_information_class,
+            );
+            crate::namf_server::send_non_ue_n2_info_notify(
+                sub.n2_notify_callback_uri,
+                sub.subscription_id,
+                sub.n2_information_class,
+                0,
+                0,
+                ran_node_id.clone(),
+                // `bcEmptyAreaList` is about a RESPONSE that omitted its area list
+                // (§5.2.2.4.4.3 item 1). An indication has no area list to omit, so
+                // setting it here would assert something the spec never scopes to
+                // this event.
+                false,
+                None,
+                sub.notif_correlation_id,
+                data.to_vec(),
+            );
+        }
         Ok(())
     }
 
@@ -19627,6 +19728,10 @@ fn build_sm_context_identity(
         gpsi: state.and_then(|s| s.amf_ue.gpsi.clone()),
         // Set by the establishment that sends it (#980 review).
         origination_timestamp: None,
+        // #1222: set by the establishment, from the UE's UL NAS TRANSPORT.
+        request_type: None,
+        // #1222: TS 23.502 §4.3.2.2.1 step 3.
+        message_priority: state.and_then(|s| crate::sbi_path::priority_message_priority(&s.amf_ue)),
     }
 }
 
@@ -23812,12 +23917,20 @@ mod tests {
     }
 
     fn service_request_initial_ue(nas: Vec<u8>) -> Vec<u8> {
+        service_request_initial_ue_with(nas, nextgcore_ngap::types::RrcEstablishmentCause::MtAccess)
+    }
+
+    /// [`service_request_initial_ue`] with the RRC Establishment Cause `cause` (#1222).
+    fn service_request_initial_ue_with(
+        nas: Vec<u8>,
+        cause: nextgcore_ngap::types::RrcEstablishmentCause,
+    ) -> Vec<u8> {
         nextgcore_ngap::builder::build_initial_ue_message(
             &nextgcore_ngap::types::InitialUeMessage {
                 ran_ue_ngap_id: 512,
                 nas_pdu: nas,
                 user_location_info: test_user_location(0x74, 0x0005_1200),
-                rrc_establishment_cause: nextgcore_ngap::types::RrcEstablishmentCause::MtAccess,
+                rrc_establishment_cause: cause,
                 ue_context_request: None,
                 allowed_nssai: Vec::new(),
             },
@@ -23884,6 +23997,67 @@ mod tests {
             "#518: the session moved with the UE to its new NGAP ID"
         );
         assert!(!guard.sess_find_by_psi(new_id, 5).unwrap().paging.ongoing);
+    }
+
+    /// #1222: an idle UE's SERVICE REQUEST brings the RRC Establishment Cause of its new
+    /// connection. With mps-PriorityAccess (access identity 1, TS 24.501 Table 4.5.6.1)
+    /// the UE's CreateSMContext carries `3gpp-Sbi-Message-Priority` (TS 23.502
+    /// §4.3.2.2.1 step 3). The UE's next connection, with mo-Data, clears the flag:
+    /// the cause describes each access attempt, so its next CreateSMContext carries no
+    /// header. The header is read off the request the create path builds, from the
+    /// moved UE's own state.
+    ///
+    /// REVERT-VERIFIED: without the call on the Service Request path, the first
+    /// assertion fails. With the flag set only, never cleared (`|=`), the second fails.
+    #[tokio::test]
+    async fn an_idle_service_request_sets_and_clears_the_priority_access() {
+        use nextgcore_ngap::types::RrcEstablishmentCause as C;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let (old_id, first, second) = (12_220_101u64, 12_220_102u64, 12_220_103u64);
+        ngap.ue_auth_state
+            .insert(old_id, idle_registered_ue(old_id));
+        let header = |ngap: &NgapServer, id: u64| {
+            let state = ngap.ue_auth_state.get(id).expect("the UE is held");
+            crate::sbi_path::build_create_sm_context_request_for_test(&build_sm_context_identity(
+                Some(&state),
+                None,
+            ))
+            .http
+            .get_header(nextgcore_sbi::constants::custom_header::MESSAGE_PRIORITY)
+            .cloned()
+        };
+
+        for (id, cause, expected) in [
+            (
+                first,
+                C::MpsPriorityAccess,
+                Some(crate::sbi_path::DEFAULT_PRIORITY_MESSAGE_PRIORITY.to_string()),
+            ),
+            (second, C::MoData, None),
+        ] {
+            ngap.forced_amf_ue_ngap_id = Some(id);
+            let pdu = service_request_initial_ue_with(
+                protected_service_request([0; 4], old_id as u32),
+                cause,
+            );
+            let _ = ngap.handle_initial_ue_message(1, &pdu).await;
+            let moved = ngap
+                .ue_auth_state
+                .get(id)
+                .unwrap_or_else(|| panic!("{cause:?}: the UE moved to its new NGAP ID"));
+            assert!(!moved.is_cm_idle(), "{cause:?}: connected");
+            assert_eq!(header(&ngap, id), expected, "{cause:?}");
+            // The connection ends; the UE is CM-IDLE again for its next access.
+            ngap.ue_auth_state.with_mut(id, |s| {
+                s.cm_idle = true;
+                s.reachability = Some(Reachability {
+                    phase: ReachabilityPhase::MobileReachable,
+                    deadline: Instant::now() + Duration::from_secs(3600),
+                });
+            });
+        }
+        ngap.ue_auth_state.remove(second);
     }
 
     /// #648: after a Service Request from CM-IDLE moves the UE to its new AMF UE NGAP
@@ -24957,6 +25131,82 @@ mod tests {
         );
     }
 
+    /// **#686, TS 23.527 §7.3:** "If the AMF interfaces with multiple CBCs, the AMF shall
+    /// forward the PWS Restart Indication to all CBCs". Two CBCs subscribed; each gets
+    /// the indication once. CBC A also holds a `PWS` subscription beside its `PWS-RF`
+    /// one, and still gets a single copy, on `PWS-RF`.
+    ///
+    /// REVERT-VERIFIED: with the single-subscription lookup, CBC B never receives it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_pws_restart_indication_reaches_every_cbc() {
+        let _ctx_guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let (_a, uri_a, mut rx_a) = start_pws_notify_sink().await;
+        let (_b, uri_b, mut rx_b) = start_pws_notify_sink().await;
+        let subs = [
+            add_pws_subscription("PWS", &uri_a, Some("cbc-686-a"), "sub-686-a-pws"),
+            add_pws_subscription("PWS-RF", &uri_a, Some("cbc-686-a"), "sub-686-a-rf"),
+            add_pws_subscription("PWS-RF", &uri_b, Some("cbc-686-b"), "sub-686-b-rf"),
+        ];
+        let association_id = 6_864u64;
+        insert_pws_test_gnb(
+            &ngap,
+            association_id,
+            0x686,
+            crate::context::RatType::Nr,
+            &[("001", "01", 0x74)],
+        )
+        .await;
+        let restart = nextgcore_ngap::builder::build_pws_restart_indication(
+            &nextgcore_ngap::types::PwsRestartIndication {
+                cell_list: nextgcore_ngap::types::PwsCellList::Nr(vec![
+                    nextgcore_ngap::types::NrCgi {
+                        plmn_identity: [0x00, 0xF1, 0x10],
+                        nr_cell_identity: 0x686,
+                    },
+                ]),
+                global_ran_node_id: nextgcore_ngap::types::GlobalRanNodeId::GlobalGnbId {
+                    plmn_identity: [0x00, 0xF1, 0x10],
+                    gnb_id: 0x686,
+                    gnb_id_len: 32,
+                },
+                tai_list_for_restart: vec![nextgcore_ngap::types::TaiListItem {
+                    tai_plmn: [0x00, 0xF1, 0x10],
+                    tai_tac: [0x00, 0x00, 0x74],
+                }],
+                emergency_area_id_list_for_restart: Vec::new(),
+            },
+        )
+        .expect("build PWS RESTART INDICATION");
+        ngap.process_ngap_message(association_id, &restart)
+            .await
+            .expect("dispatch");
+
+        for (cbc, rx) in [("A", &mut rx_a), ("B", &mut rx_b)] {
+            let (_uri, body) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("CBC {cbc} gets the restart indication"))
+                .expect("channel");
+            let json: serde_json::Value = serde_json::from_str(&body).expect("json");
+            assert_eq!(
+                json["n2InfoContainer"]["n2InformationClass"].as_str(),
+                Some("PWS-RF"),
+                "CBC {cbc}"
+            );
+        }
+        // A second copy would arrive at once; the bound is well above loopback latency.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(400), rx_a.recv())
+                .await
+                .is_err(),
+            "CBC A gets one copy, not one per subscription"
+        );
+        for sub in subs {
+            drop_pws_subscription(&sub);
+        }
+    }
+
     /// The two INDICATIONS (procedures 34 and 33) notify on `PWS-RF`, unconditionally
     /// on any prior request — §5.2.2.4.4.3 item 2 is a "shall" with nothing to
     /// correlate to (`29518-k00.txt:4490-4493`) — and take `ranNodeId` from the
@@ -25589,6 +25839,138 @@ mod tests {
     fn clear_pcf_env() {
         std::env::remove_var("PCF_SBI_ADDR");
         std::env::remove_var("PCF_SBI_PORT");
+    }
+
+    /// **#1247, TS 29.507 §4.2.4.** The AMF serves the `notificationUri` it gives the
+    /// PCF for the AM policy association:
+    /// - `update` (§4.2.4.2) is acknowledged with 204;
+    /// - `terminate` (§4.2.4.3) is acknowledged with 204, then the association is
+    ///   forgotten and Npcf_AMPolicyControl_Delete'd;
+    /// - a termination naming an association the UE does not hold is refused with
+    ///   404 and changes nothing, AM and UE policy alike (#1247 review); one without a
+    ///   `resourceUri` is 400;
+    /// - an unknown UE gets 404.
+    ///
+    /// TS 29.525 §4.2.4.3 likewise: a UE policy termination is followed by
+    /// Npcf_UEPolicyControl_Delete.
+    ///
+    /// REVERT-VERIFIED: without the route, `update` is 404. Without the Deletes, the
+    /// PCF sees neither DELETE.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_pcfs_policy_notifications_are_served_and_a_termination_deletes() {
+        let (_pcf, port, seen) = recording_nf().await;
+        let _env = SmfEnvGuard::acquire(port).await;
+        set_pcf_env(port);
+        let ngap = test_ngap_server().await;
+        let (id, supi) = (12_470_001u64, "imsi-001010001247001");
+        let mut ue = ue_with_policy_associations(id, "am-pol-1247", "ue-pol-1247");
+        ue.amf_ue.supi = Some(supi.to_string());
+        ue.amf_ue.policy_association.id = Some("am-pol-1247".to_string());
+        ue.amf_ue.ue_policy_association.id = Some("ue-pol-1247".to_string());
+        ngap.ue_auth_state.insert(id, ue);
+        let notify = |path: String, body: serde_json::Value| {
+            crate::namf_server::namf_request_handler(
+                nextgcore_sbi::message::SbiRequest::post(path)
+                    .with_json_body(&body)
+                    .expect("json"),
+            )
+        };
+        let base = format!("/namf-callback/v1/{supi}");
+
+        let update = notify(
+            format!("{base}/am-policy-notify/update"),
+            serde_json::json!({ "resourceUri": "x/policies/am-pol-1247", "rfsp": 3 }),
+        )
+        .await;
+        assert_eq!(update.status, 204, "§4.2.4.2: acknowledged");
+        let unknown = notify(
+            "/namf-callback/v1/imsi-001010001247999/am-policy-notify/update".to_string(),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(unknown.status, 404, "no such UE");
+        let foreign = notify(
+            format!("{base}/am-policy-notify/terminate"),
+            serde_json::json!({
+                "resourceUri": "http://pcf/npcf-am-policy-control/v1/policies/someone-else",
+                "cause": "UNSPECIFIED",
+            }),
+        )
+        .await;
+        assert_eq!(
+            foreign.status, 404,
+            "#1247 review: a termination naming another association is refused"
+        );
+        // The same for the UE policy: refused, and the UE's real association stays.
+        let foreign_ue = notify(
+            format!("{base}/ue-policy-notify/terminate"),
+            serde_json::json!({
+                "resourceUri": "http://pcf/npcf-ue-policy-control/v1/policies/someone-else",
+                "cause": "UNSPECIFIED",
+            }),
+        )
+        .await;
+        assert_eq!(foreign_ue.status, 404);
+        let missing = notify(
+            format!("{base}/am-policy-notify/terminate"),
+            serde_json::json!({ "cause": "UNSPECIFIED" }),
+        )
+        .await;
+        assert_eq!(missing.status, 400, "resourceUri is mandatory");
+        let kept = ngap.ue_auth_state.get(id).expect("the UE stays");
+        assert!(
+            kept.policy_association_id.as_deref() == Some("am-pol-1247")
+                && kept.amf_ue.policy_association.id.as_deref() == Some("am-pol-1247")
+                && kept.ue_policy_association_id.as_deref() == Some("ue-pol-1247")
+                && kept.amf_ue.ue_policy_association.id.as_deref() == Some("ue-pol-1247"),
+            "a refused termination changes nothing"
+        );
+
+        for (op, path, kind) in [
+            (
+                "am-policy-notify",
+                "npcf-am-policy-control/v1/policies/am-pol-1247",
+                "AM",
+            ),
+            (
+                "ue-policy-notify",
+                "npcf-ue-policy-control/v1/policies/ue-pol-1247",
+                "UE",
+            ),
+        ] {
+            let terminate = notify(
+                format!("{base}/{op}/terminate"),
+                serde_json::json!({
+                    "resourceUri": format!("http://pcf/{path}"),
+                    "cause": "UNSPECIFIED",
+                }),
+            )
+            .await;
+            assert_eq!(terminate.status, 204, "{kind}: acknowledged");
+            assert!(
+                nf_saw(&seen, &format!("DELETE /{path}")).await,
+                "{kind}: the AMF deletes the terminated association; saw {:?}",
+                seen.lock().expect("seen")
+            );
+        }
+        let state = ngap.ue_auth_state.get(id).expect("the UE stays");
+        assert!(
+            state.policy_association_id.is_none()
+                && state.amf_ue.policy_association.id.is_none()
+                && state.ue_policy_association_id.is_none()
+                && state.amf_ue.ue_policy_association.id.is_none(),
+            "both associations are forgotten, NGAP side and AmfUe alike"
+        );
+        assert!(
+            !seen
+                .lock()
+                .expect("seen")
+                .iter()
+                .any(|r| r.contains("someone-else")),
+            "an association the UE does not hold is not deleted"
+        );
+        clear_pcf_env();
+        ngap.ue_auth_state.remove(id);
     }
 
     /// #622, UE-initiated and network-initiated deregistration: both end in

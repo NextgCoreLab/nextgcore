@@ -170,6 +170,20 @@ pub fn encode(operation: u8, filters: &[PacketFilter]) -> Result<Vec<u8>, String
     Ok(out)
 }
 
+/// Encode a "Delete packet filters from existing TFT" TFT (TS 24.008 §10.5.6.12): the
+/// packet filter identifiers only, one octet each (#619).
+pub fn encode_delete(identifiers: &[u8]) -> Result<Vec<u8>, String> {
+    if identifiers.is_empty() || identifiers.len() > 15 {
+        return Err(format!(
+            "{} packet filter identifiers; a delete names 1 to 15",
+            identifiers.len()
+        ));
+    }
+    let mut out = vec![(op::DELETE_PACKET_FILTERS << 5) | identifiers.len() as u8];
+    out.extend(identifiers.iter().map(|i| i & 0x0f));
+    Ok(out)
+}
+
 /// Decode a TFT or Traffic Aggregate Description.
 ///
 /// A packet filter with a component this SMF cannot express as a flow description

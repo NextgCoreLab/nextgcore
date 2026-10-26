@@ -23,6 +23,7 @@ members = [
     "libs/nextgcore-nrppa-gen",
     "libs/nextgcore-s1ap",
     "libs/nextgcore-s1ap-gen",
+    "libs/nextgcore-sbcap-gen",
     "libs/nextgcore-dbi",
     "libs/nextgcore-app",
     "libs/nextgcore-metrics",
@@ -209,6 +210,7 @@ nextgcore-lte-rrc-gen = { path = "libs/nextgcore-lte-rrc-gen" }
 nextgcore-nrppa-gen = { path = "libs/nextgcore-nrppa-gen" }
 nextgcore-s1ap = { path = "libs/nextgcore-s1ap" }
 nextgcore-s1ap-gen = { path = "libs/nextgcore-s1ap-gen" }
+nextgcore-sbcap-gen = { path = "libs/nextgcore-sbcap-gen" }
 nextgcore-dbi = { path = "libs/nextgcore-dbi" }
 nextgcore-app = { path = "libs/nextgcore-app" }
 nextgcore-metrics = { path = "libs/nextgcore-metrics" }

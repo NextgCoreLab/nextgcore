@@ -110,6 +110,7 @@ Cargo features: `kernel-sctp` (enables `--sctp-backend kernel`; the Docker build
 | `UCMF_SBI_ADDR` / `UCMF_SBI_PORT` | Fallback UCMF for RACS (UE Radio Capability ID resolution) when none is discoverable via the NRF. Port default `7777`. |
 | `AMF_NAMF_LOC_LMF` | `off`/`0`/`false` makes Namf_Location answer from the stored NGAP cell identity with no LMF round trip. Default on. |
 | `AMF_UE_POLICY_ASSOC` | `off`/`0`/`false` disables the Npcf_UEPolicyControl association at registration. Default on. |
+| `AMF_PRIORITY_MESSAGE_PRIORITY` | The `3gpp-Sbi-Message-Priority` (0-31, 0 highest; TS 29.500 §6.8.4) put on the CreateSMContext of a UE that connected with RRC cause mps-PriorityAccess, mcs-PriorityAccess or highPriorityAccess, or holds an MPS/MCX subscription (TS 23.502 §4.3.2.2.1 step 3). Default `8`. Read once; an invalid value is logged and the default used. |
 | `AMF_GUTI_REALLOCATION` | Truthy (`1`/`true`/`yes`/`on`) enables NAS 5G-GUTI reallocation (UE Configuration Update). Default off. |
 | `AMF_T3513_SECS` | Paging timer T3513, default `5` s. |
 | `AMF_MOBILE_REACHABLE_SECS` / `AMF_IMPLICIT_DEREG_SECS` | Override the mobile-reachable timer (default T3512 + 240 s) and implicit-deregistration timer (default 240 s). |

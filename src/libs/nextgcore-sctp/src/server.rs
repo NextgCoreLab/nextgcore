@@ -160,6 +160,8 @@ pub struct SctpServer {
     event_tx: Option<mpsc::UnboundedSender<ServerEvent>>,
     /// Running flag
     running: bool,
+    /// #1142 review: the bound on out-of-the-blue answers (RFC 9260 §8.4).
+    ootb_limiter: crate::ootb::OotbLimiter,
 }
 
 impl SctpServer {
@@ -200,12 +202,22 @@ impl SctpServer {
             config,
             event_tx: None,
             running: true,
+            ootb_limiter: crate::ootb::OotbLimiter::new(
+                crate::ootb::OOTB_ANSWER_BURST,
+                crate::ootb::OOTB_ANSWERS_PER_SEC,
+                std::time::Instant::now(),
+            ),
         })
     }
 
     /// Get the local address
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Out-of-the-blue answers sent and suppressed by the rate limit (#1142 review).
+    pub fn ootb_answer_counts(&self) -> (u64, u64) {
+        (self.ootb_limiter.answered, self.ootb_limiter.suppressed)
     }
 
     /// Get number of active associations
@@ -304,9 +316,21 @@ impl SctpServer {
             // talking on an association this endpoint no longer has (it restarted)
             // is told with an ABORT, so it sets up a new one at once.
             if let Some(answer) = crate::ootb::ootb_response(&raw) {
-                debug!("Out-of-the-blue packet from {from}: answered (RFC 9260 §8.4)");
-                if let Err(e) = self.socket.send_to(&answer, from).await {
-                    warn!("Out-of-the-blue answer to {from} not sent: {e}");
+                if self.ootb_limiter.allow(std::time::Instant::now()) {
+                    debug!("Out-of-the-blue packet from {from}: answered (RFC 9260 §8.4)");
+                    if let Err(e) = self.socket.send_to(&answer, from).await {
+                        warn!("Out-of-the-blue answer to {from} not sent: {e}");
+                    }
+                } else if self.ootb_limiter.suppressed.is_power_of_two() {
+                    // Logged at 1, 2, 4, 8, ... suppressions, so a flood is visible
+                    // without the log becoming the flood.
+                    warn!(
+                        "Out-of-the-blue answers over the limit ({} per s, burst {}): {} \
+                         suppressed so far, the latest to {from}",
+                        crate::ootb::OOTB_ANSWERS_PER_SEC,
+                        crate::ootb::OOTB_ANSWER_BURST,
+                        self.ootb_limiter.suppressed
+                    );
                 }
             }
             self.flush_all_transmits().await?;
