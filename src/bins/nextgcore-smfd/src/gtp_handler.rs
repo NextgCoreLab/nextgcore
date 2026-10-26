@@ -5152,6 +5152,72 @@ mod tests {
         server.close();
     }
 
+    /// #1307 review: lock order. A Bearer Resource Command on EBI 6 reaches the precedence
+    /// allocator; while it holds it, a second thread takes the SMF context's write lock
+    /// and then wants the allocator, as any path in the documented order (context, then
+    /// allocator) does. The write lock stands in for the reader an activation holds
+    /// behind a queued writer, and makes the interleaving deterministic. With the
+    /// Command taking the context only inside the allocator, the two deadlocked: the
+    /// writer got the context at once, the Command waited for it, and the writer waited
+    /// for the allocator until its timeout. Taking the context first, the writer waits
+    /// for the Command, then gets both.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_command_takes_the_context_before_the_precedence_allocator() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        let (server, sgw, _port, sess, pgw_c_teid) = pdn_with_voice_bearer(0x70, &upf).await;
+
+        let (result_tx, result_rx) = std::sync::mpsc::channel::<bool>();
+        let probe = move || {
+            let (writing_tx, writing_rx) = std::sync::mpsc::channel::<()>();
+            std::thread::spawn(move || {
+                let handle = crate::context::smf_self();
+                let _writer = handle.write().unwrap();
+                let _ = writing_tx.send(());
+                let took = crate::eps_bearer::reservations_lockable_within(
+                    std::time::Duration::from_secs(2),
+                );
+                let _ = result_tx.send(took);
+            });
+            // In the old order the writer has the context at once; let it take it before
+            // the Command reads it. In the new one it is queued behind the Command.
+            let _ = writing_rx.recv_timeout(std::time::Duration::from_millis(300));
+        };
+        *crate::eps_bearer::ALLOCATION_PROBE.lock().unwrap() = Some((sess.id, Box::new(probe)));
+
+        let add = crate::eps_tft::encode(
+            crate::eps_tft::op::ADD_PACKET_FILTERS,
+            &[crate::eps_tft::PacketFilter {
+                direction: crate::context::FlowDirection::Bidirectional,
+                identifier: 1,
+                precedence: 2,
+                flow_description: "permit out 17 from 198.51.100.7 5030 to assigned".into(),
+            }],
+        )
+        .unwrap();
+        sgw.send_to(
+            &s5c_bearer_resource_command(0x5201, pgw_c_teid, 6, 11, &add, None),
+            server.local_addr(),
+        )
+        .await
+        .expect("send");
+        let took = tokio::task::spawn_blocking(move || {
+            result_rx.recv_timeout(std::time::Duration::from_secs(10))
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            took,
+            Ok(true),
+            "a path in the documented order (context, then allocator) deadlocked against \
+             the Command"
+        );
+        let (ubr, _) = recv_type(&sgw, gtp2_message_type::UPDATE_BEARER_REQUEST).await;
+        assert_eq!(ubr.header.sequence_number, 0x5201);
+        server.close();
+    }
+
     /// A Bearer Resource Command from the stand-in SGW-C on the PDN connection whose PGW
     /// S5/S8-C TEID is `pgw_c_teid`: LBI 5, the bearer `ebi` at instance 1 (none when
     /// 0), PTI `pti`, the TAD and, when given, a Flow QoS (QCI, MBR UL/DL, GBR UL/DL in
