@@ -5477,6 +5477,15 @@ mod tests {
         );
         assert_eq!(rsp.header.sequence_number, 0x1152);
         assert_eq!(cause_of(&rsp), gtp_cause::REMOTE_PEER_NOT_RESPONDING);
+        // #1272: `abandon_create_session_without_pgw` answers the MME, then removes
+        // the session and the UE, on the T3 thread; the answer's arrival is no
+        // proof the removal has run yet. Wait for it.
+        for _ in 0..300 {
+            if sgwc_self().ue_find_by_imsi(&imsi).is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert!(
             sgwc_self().ue_find_by_imsi(&imsi).is_none(),
             "the session and the UE are removed"
@@ -6558,6 +6567,7 @@ mod tests {
         let sock = client();
         let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x32, 0xf1];
         let sgw_teid = created_session(&server, &sock, &imsi, 0x3201).await;
+        let seid = sgwu_seid_of(&imsi);
         sock.send_to(
             &delete_session(sgw_teid, 0x3202, false, false).encode(),
             server.local_addr(),
@@ -6565,12 +6575,14 @@ mod tests {
         .unwrap();
         let dsrsp = recv_s11(&sock).await.expect("delete session response");
         assert_eq!(cause_of(&dsrsp), gtp_cause::REQUEST_ACCEPTED);
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // #1272: wait for the stand-in SGW-U's record of this session's
+        // deletion (by its SEID; another test's late cleanup may reach it too).
+        wait_until(|| deleted_at_sgwu(&sgwu, seid)).await;
         assert!(
             pgw.deletes.lock().unwrap().is_empty(),
             "not relayed without OI"
         );
-        assert_eq!(sgwu.received(54), 1, "deleted locally");
+        assert!(deleted_at_sgwu(&sgwu, seid), "deleted locally");
         sgwc_self().set_pgw_s5c_peer(None);
         server.close();
     }
@@ -6760,6 +6772,7 @@ mod tests {
         let sock = client();
         let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x25, 0xf1];
         let sgw_teid = created_session(&server, &sock, &imsi, 0x2501).await;
+        let seid = sgwu_seid_of(&imsi);
 
         sock.send_to(
             &delete_session(sgw_teid, 0x2502, true, false).encode(),
@@ -6783,7 +6796,13 @@ mod tests {
         assert!(metrics.contains("# TYPE sgwc_s5_delete_session_relayed_total counter"));
         assert!(S5_DELETES_RELAYED_TOTAL.load(Ordering::Relaxed) >= 1);
         assert!(S5_DELETES_ACCEPTED_TOTAL.load(Ordering::Relaxed) >= 1);
-        assert_eq!(sgwu.received(54), 1, "the SGW-U's session is deleted");
+        // #1272: this session's deletion (by its SGW-U SEID): another test's
+        // late cleanup may reach the shared stand-in too.
+        wait_until(|| deleted_at_sgwu(&sgwu, seid)).await;
+        assert!(
+            deleted_at_sgwu(&sgwu, seid),
+            "the SGW-U's session is deleted"
+        );
         let ue = sgwc_self().ue_find_by_imsi(&imsi).unwrap();
         assert!(ue.sess_ids.is_empty(), "the session is gone");
         sgwc_self().set_pgw_s5c_peer(None);
@@ -7110,9 +7129,14 @@ mod tests {
             1,
             "the refused bearer is removed"
         );
+        let removal = |m: &nextgcore_pfcp::message::SessionModificationRequest| {
+            m.remove_pdrs.len() == 2 && m.remove_fars.len() == 2
+        };
+        // #1272: the stand-in SGW-U records on its own task.
+        wait_until(|| sgwu_modifications(&sgwu).iter().any(removal)).await;
         let removals = sgwu_modifications(&sgwu)
             .iter()
-            .filter(|m| m.remove_pdrs.len() == 2 && m.remove_fars.len() == 2)
+            .filter(|m| removal(m))
             .count();
         assert_eq!(removals, 1, "and its rules at the SGW-U");
         assert_eq!(crate::dedicated_bearer::pending_count(), 0);
@@ -9878,6 +9902,36 @@ mod tests {
         assert_eq!(ctx.ue_ids_for_mme_ip(mapped([192, 0, 2, 31])), vec![ue_id]);
         ctx.ue_remove(ue_id);
         drop(ambient);
+    }
+
+    /// The SGW-U SEID of the (first) session of the UE `imsi`.
+    fn sgwu_seid_of(imsi: &[u8]) -> u64 {
+        let ctx = sgwc_self();
+        let ue = ctx.ue_find_by_imsi(imsi).expect("the UE");
+        ctx.sess_list_for_ue(ue.id)
+            .first()
+            .map(|s| s.sgwu_sxa_seid)
+            .expect("its session")
+    }
+
+    /// Whether the stand-in SGW-U received a Session Deletion Request for `seid`.
+    fn deleted_at_sgwu(sgwu: &StandInSgwu, seid: u64) -> bool {
+        sgwu.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|(t, s, _)| *t == 54 && *s == Some(seid))
+    }
+
+    /// Wait up to 3 s for `done` (#1272): a stand-in records on its own task, so
+    /// an answer's arrival is no proof its effect has been recorded.
+    async fn wait_until(done: impl Fn() -> bool) {
+        for _ in 0..300 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// #1213: `delete_pdn_connections_for_pgw` tells the MME and the SGW-U before
