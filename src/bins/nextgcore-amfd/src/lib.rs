@@ -1268,7 +1268,8 @@ pub async fn run() -> Result<()> {
     }
 
     // Start the Namf SBI HTTP/2 server (TS 29.518: namf-comm, namf-evts,
-    // namf-mt, namf-loc) on the advertised SBI endpoint
+    // namf-mt, namf-loc) on the bind address. Peers are told the advertised host
+    // instead, which `init` resolved apart from it (#1322).
     let (sbi_addr, sbi_port) = (app.sbi.host.clone(), app.sbi.port);
     let sbi_sock: SocketAddr = nextgcore_core::sockaddr::parse_listen_addr(&sbi_addr, sbi_port)
         .map_err(|e| anyhow::anyhow!("Invalid SBI address '{sbi_addr}:{sbi_port}': {e}"))?;

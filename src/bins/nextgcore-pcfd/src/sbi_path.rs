@@ -2379,18 +2379,46 @@ fn bsf_binding_has_self_info(
     self_info: Option<&PcfSelfInfo>,
     logged: &std::sync::atomic::AtomicBool,
 ) -> bool {
+    match bsf_binding_decision(self_info, logged) {
+        BsfBindingDecision::Send => true,
+        BsfBindingDecision::SkipAndLog => {
+            log_bsf_binding_skip();
+            false
+        }
+        BsfBindingDecision::SkipQuietly => false,
+    }
+}
+
+/// What [`bsf_binding_has_self_info`] does with a binding (#1322).
+#[derive(Debug, PartialEq, Eq)]
+enum BsfBindingDecision {
+    Send,
+    /// The first skip: logged.
+    SkipAndLog,
+    /// Every later one: not logged again.
+    SkipQuietly,
+}
+
+fn bsf_binding_decision(
+    self_info: Option<&PcfSelfInfo>,
+    logged: &std::sync::atomic::AtomicBool,
+) -> BsfBindingDecision {
     if self_info.is_some() {
-        return true;
+        BsfBindingDecision::Send
+    } else if !logged.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        BsfBindingDecision::SkipAndLog
+    } else {
+        BsfBindingDecision::SkipQuietly
     }
-    if !logged.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        log::error!(
-            "not registering PCF bindings with the BSF: no advertised SBI host (a \
-             wildcard bind with nothing to advertise), so a binding would carry no \
-             pcfIpEndPoints and the BSF rejects it (TS 29.521 §5.3.2); set \
-             --sbi-advertise, NEXTGCORE_SBI_ADVERTISE or pcf.sbi.server[0].advertise"
-        );
-    }
-    false
+}
+
+fn log_bsf_binding_skip() {
+    log::error!(
+        "not registering PCF bindings with the BSF: no advertised SBI host (a \
+         wildcard bind with nothing to advertise), so a binding would carry no \
+         pcfIpEndPoints and the BSF rejects it (TS 29.521 §5.3.2); set \
+         --sbi-advertise, NEXTGCORE_SBI_ADVERTISE or pcf.sbi.server[0].advertise"
+    );
 }
 
 /// Register this PDU session's PCF binding with the BSF (TS 23.503 §6.1.1.2,
@@ -3082,12 +3110,26 @@ mod tests_api_root {
     /// #1322 (#1321 review): no self identity, no BSF binding, logged once.
     #[test]
     fn no_bsf_binding_without_a_self_identity_and_it_is_said_once() {
-        use super::bsf_binding_has_self_info;
+        use super::{bsf_binding_decision, bsf_binding_has_self_info, BsfBindingDecision};
         use std::sync::atomic::{AtomicBool, Ordering};
         let logged = AtomicBool::new(false);
-        assert!(!bsf_binding_has_self_info(None, &logged));
-        assert!(logged.load(Ordering::Relaxed), "the first skip is logged");
-        assert!(!bsf_binding_has_self_info(None, &logged));
+        assert_eq!(
+            bsf_binding_decision(None, &logged),
+            BsfBindingDecision::SkipAndLog,
+            "the first skip is logged"
+        );
+        assert!(logged.load(Ordering::Relaxed));
+        for _ in 0..3 {
+            assert_eq!(
+                bsf_binding_decision(None, &logged),
+                BsfBindingDecision::SkipQuietly,
+                "a later skip stays quiet"
+            );
+        }
+        assert!(
+            !bsf_binding_has_self_info(None, &logged),
+            "and is still a skip"
+        );
         let info = PcfSelfInfo {
             sbi_addr: "10.1.2.3".into(),
             sbi_port: 7777,
@@ -3095,6 +3137,10 @@ mod tests_api_root {
             nf_instance_id: "id".into(),
         };
         assert!(bsf_binding_has_self_info(Some(&info), &logged));
+        assert_eq!(
+            bsf_binding_decision(Some(&info), &logged),
+            BsfBindingDecision::Send
+        );
     }
 
     /// #1312 review: a wildcard bind with nothing to advertise publishes no self
