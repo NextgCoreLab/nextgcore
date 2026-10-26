@@ -74,9 +74,9 @@ From the clap `Args` struct in `src/bins/nextgcore-sgwcd/src/main.rs`:
     a path that only blinked would make a conformant SGW-U drop every session (TS 29.244
     §6.2.6.2.2).
   - A newer Recovery Time Stamp means the SGW-U restarted. The stamp is carried in its
-    Heartbeat Response and in its own Heartbeat Request. It is normalised to NTP seconds
-    (#995), so a pre-#995 SGW-U's Unix seconds do not read as a restart, and an older stamp
-    from a reordered message is ignored. After a restart:
+    Heartbeat Response and in its own Heartbeat Request. It is NTP-era seconds
+    (TS 29.244 §8.2.65), compared as sent (#1033), and an older stamp from a reordered
+    message is ignored. After a restart:
     - the association is set up again;
     - every established PFCP session is established again with the same CP F-SEID, F-TEIDs,
       PDRs and FARs. The SGW-C allocates them all, so the MME and the PGW keep their

@@ -590,10 +590,8 @@ impl SxaNode {
         let peer_record = SxaPeer {
             addr: peer,
             state: PfcpNodeState::Associated,
-            // #995: kept in the NTP reading (a pre-#995 SGW-U sends Unix seconds).
-            recovery_time_stamp: Some(nextgcore_pfcp::recovery_time::normalize_received(
-                rsp.recovery_time_stamp,
-            )),
+            // TS 29.244 §8.2.65: NTP-era seconds, kept as sent (#1033).
+            recovery_time_stamp: Some(rsp.recovery_time_stamp),
             up_function_features: UpFunctionFeatures {
                 ftup: features.map(|f| f.ftup).unwrap_or(false),
                 empu: features.map(|f| f.empu).unwrap_or(false),
@@ -656,19 +654,17 @@ impl SxaNode {
             .map_err(|e| format!("malformed Heartbeat Response from {peer}: {e}"))
     }
 
-    /// A Recovery Time Stamp `peer` reported (TS 29.244 §8.2.65). Normalised to
-    /// the NTP reading as the stored one is (#995), so a pre-#995 SGW-U's Unix
-    /// seconds do not read as a restart on every heartbeat. Only a stamp NEWER
+    /// A Recovery Time Stamp `peer` reported (TS 29.244 §8.2.65, NTP-era seconds,
+    /// compared as sent: #1033). Only a stamp NEWER
     /// than the stored one (RFC 1982, wrap-aware) is a restart: the SGW-U lost
     /// the association and every session (TS 29.244 §6.2.2, TS 23.007 §19A), so
     /// the association is set up again and its sessions restored. An older one
     /// (a reordered message from before a restart already seen) is ignored.
     async fn check_peer_recovery(&self, peer: SocketAddr, reported: u32) {
-        use nextgcore_pfcp::recovery_time::{is_newer, normalize_received};
+        use nextgcore_pfcp::recovery_time::is_newer;
         if reported == 0 {
             return;
         }
-        let reported = normalize_received(reported);
         let stored = self
             .peers
             .read()
@@ -749,7 +745,7 @@ impl SxaNode {
         body: &[u8],
         from: SocketAddr,
     ) {
-        use nextgcore_pfcp::recovery_time::{is_newer, normalize_received};
+        use nextgcore_pfcp::recovery_time::is_newer;
         let configured = configured_sgwu_addr();
         let decoded = AssociationSetupRequest::decode(&mut Bytes::copy_from_slice(body));
         let cause = if from.ip() != configured.ip() {
@@ -774,7 +770,7 @@ impl SxaNode {
         // (TS 29.244 §6.2.6.2.1). Session restoration still follows the response.
         let restarted = match (cause, &decoded) {
             (PfcpCause::RequestAccepted, Ok(req)) => {
-                let reported = normalize_received(req.recovery_time_stamp);
+                let reported = req.recovery_time_stamp;
                 let features = req.up_function_features.as_ref();
                 let restarted = {
                     let mut peers = self.peers.write().await;
@@ -1977,11 +1973,12 @@ mod tests {
         let _ = stop.send(true);
     }
 
-    /// #1010 review: a pre-#995 SGW-U reports its Recovery Time Stamp in Unix
-    /// seconds. Normalised as the stored stamp is, it compares equal on every
-    /// heartbeat: the association does not flap.
+    /// #1033: the SGW-U's Recovery Time Stamp is NTP-era seconds (TS 29.244
+    /// §8.2.65), stored as sent. A Unix-seconds stamp (a 0.1.x SGW-U) is no longer
+    /// re-read as NTP: it is stored as sent, and since it does not change, it
+    /// compares equal on every heartbeat and the association does not flap.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_unix_seconds_recovery_time_stamp_is_not_a_restart() {
+    async fn a_unix_seconds_recovery_time_stamp_is_stored_as_sent() {
         let guard = process_state_test_guard().await;
         let sgwu = assoc_sgwu(Vec::new()).await;
         let unix = std::time::SystemTime::now()
@@ -2002,10 +1999,8 @@ mod tests {
         assert_eq!(sgwu.setups.load(Ordering::SeqCst), 1, "no re-Setup");
         assert_eq!(
             node.peers().await[0].recovery_time_stamp,
-            Some(nextgcore_pfcp::recovery_time::from_unix_secs(u64::from(
-                unix
-            ))),
-            "kept in the NTP reading"
+            Some(unix),
+            "as sent, not normalised"
         );
         let _ = stop.send(true);
     }

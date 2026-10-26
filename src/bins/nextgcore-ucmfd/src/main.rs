@@ -402,7 +402,10 @@ async fn main() -> Result<()> {
         .parse()
         .context("Invalid SBI address")?;
     let scheme = if args.tls { "https" } else { "http" };
-    let _ = API_ROOT.set(format!("{scheme}://{}:{}", args.sbi_addr, args.sbi_port));
+    let _ = API_ROOT.set(format!(
+        "{scheme}://{}",
+        nextgcore_sbi::uri_encode::uri_authority(&args.sbi_addr, args.sbi_port)
+    ));
 
     let mut sbi_config = NextgcoreSbiServerConfig::new(addr);
     if args.tls {

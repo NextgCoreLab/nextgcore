@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-d0d8730f.js";
+            window.path_to_searchindex_js = "../searchindex-e91a4036.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -257,9 +257,9 @@ its sessions are kept, and heartbeating continues. Setting the association up ag
 a path that only blinked would make a conformant SGW-U drop every session (TS 29.244
 §6.2.6.2.2).</li>
 <li>A newer Recovery Time Stamp means the SGW-U restarted. The stamp is carried in its
-Heartbeat Response and in its own Heartbeat Request. It is normalised to NTP seconds
-(#995), so a pre-#995 SGW-U’s Unix seconds do not read as a restart, and an older stamp
-from a reordered message is ignored. After a restart:
+Heartbeat Response and in its own Heartbeat Request. It is NTP-era seconds
+(TS 29.244 §8.2.65), compared as sent (#1033), and an older stamp from a reordered
+message is ignored. After a restart:
 <ul>
 <li>the association is set up again;</li>
 <li>every established PFCP session is established again with the same CP F-SEID, F-TEIDs,

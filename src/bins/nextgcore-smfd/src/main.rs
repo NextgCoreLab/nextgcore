@@ -837,7 +837,10 @@ async fn main() -> Result<()> {
         } else {
             config.sbi_addr.as_str()
         };
-        format!("http://{host}:{}", config.sbi_port)
+        format!(
+            "http://{}",
+            nextgcore_sbi::uri_encode::uri_authority(host, config.sbi_port)
+        )
     });
     log::info!("SBI advertise URI for callbacks: {advertise_uri}");
     let _ = SELF_SBI_URI.set(advertise_uri.clone());
@@ -12345,8 +12348,7 @@ mod tests {
             per_round.push(teardowns() - before);
             let left = fx.a.peer_recovery_time_stamp_for_test().await;
             assert!(
-                left.is_none()
-                    || left == Some(nextgcore_pfcp::recovery_time::normalize_received(stamp)),
+                left.is_none() || left == Some(stamp),
                 "round {i}: the teardown's clear, or the new stamp as a baseline: {left:?}"
             );
         }

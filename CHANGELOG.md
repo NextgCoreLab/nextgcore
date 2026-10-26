@@ -21,6 +21,16 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 - mmed serves SBc-AP toward a CBC when `mme.sbcap` is configured (TS 29.168: Write-Replace and
   Stop Warning, and the PWS Restart / Failure Indication relay of TS 23.007 §15A.1.2), off by
   default, CBC allowlist (#1071).
+- An IPv6 SBI address goes in square brackets in every URI a daemon builds from it
+  (RFC 3986 §3.2.2). That covers pcfd's apiRoot and callback URIs, the apiRoot or self/callback
+  base of amfd, ausfd, lmfd, nefd, nrfd, nwdafd, smfd, ucmfd, udmd and udrd, seppd's N32f
+  forward URI, and the SBI client's and SCP's base URI and connect address. Before, an IPv6
+  address gave `http://fd00::1:7777/...`, which is not a valid URI (Refs #1277). One shared
+  helper, `nextgcore_sbi::uri_encode::uri_authority`, does it. The bind-address parse has
+  the same defect and is tracked in #1298.
+- lmfd reads the LPP NR PRS-RSRP of a Multi-RTT or DL-TDOA measurement (`nr-DL-PRS-RSRP-Result`)
+  as `v − 157` dBm, the lower edge of TS 38.133 Table 10.1.24.3.1-1. It read `v − 140`, the
+  E-UTRA RSRP offset, which put every PRS-RSRP 16-17 dB too high (#1278).
 - pcfd's `resourceUri`, in AM and UE PolicyUpdates (notifications and Update responses) and in
   SM policy notifications, is now the complete resource URI `{apiRoot}/<apiName>/...` (TS 29.501
   §4.4.1), with the configured FQDN as host when there is one. Before, it was the bare path. The
@@ -181,16 +191,30 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   config replaces the AMF's list instead of being appended to it (#1070).
 
 ### Upgrade notes
-- **PFCP Recovery Time Stamp, 0.1.0 peers (#1033).** TS 29.244 §8.2.65 defines the Recovery
-  Time Stamp only as NTP-era seconds (since 1900-01-01). 0.1.0 sent Unix seconds; 0.2.0 sends
-  NTP seconds (#995). 0.2.0 still accepts a 0.1.0 peer's Unix-seconds stamp: smfd, sgwcd,
-  sgwud and upfd read a received or stored stamp in whichever era is closer to the local clock
-  (`nextgcore_pfcp::recovery_time::normalize_received`), so a 0.1.0 to 0.2.0 rolling upgrade
-  detects peer restarts correctly (TS 23.007 §19A). smfd no longer persists peer stamps
-  (#966), so a 0.1.0 snapshot's `upfRecoveryTimeStamps` is ignored. The shim will be removed in a later release, announced in that
-  release's upgrade notes. From then on a peer's Unix-seconds stamp reads as a time ~70 years
-  off, so its restarts are missed or falsely detected. Every PFCP function must run 0.2.0 or
-  later before any of them moves past that release.
+- **PFCP Recovery Time Stamp: upgrade the user plane and the control plane together
+  (#1033).** TS 29.244 §8.2.65 defines the Recovery Time Stamp only as NTP-era seconds (since
+  1900-01-01). 0.1.x sent Unix seconds; 0.2.0 sends NTP seconds (#995) and reads a received
+  stamp as sent. The transition shim that also read a stamp as Unix seconds
+  (`nextgcore_pfcp::recovery_time::normalize_received`, in smfd, sgwcd, sgwud and upfd) is
+  removed and never shipped in a release. So a 0.1.x peer's stamp now reads as a time about 70
+  years off, and restart detection against it (TS 23.007 §19A) is unreliable in a mixed
+  0.1.x / 0.2.0 deployment:
+  - a changed stamp can be read as a restart, which releases that peer's sessions;
+  - a real restart can be missed. A 0.2.0 SGW-C holding a 0.1.x SGW-U's stamp reads the
+    upgraded SGW-U's NTP stamp as older (RFC 1982) and does not re-establish its sessions.
+    smfd logs that a 0.1.x UPF's stored stamp "is in the future".
+
+  A rolling upgrade from 0.1.x is not supported. Upgrade every PFCP function in one
+  maintenance window, in this order:
+  1. the user plane: upfd and sgwud;
+  2. the control plane straight after: smfd, sgwcd and mbsmfd.
+
+  The 0.1.x control plane takes any changed stamp as a restart, so it sees each upgraded user
+  plane function as restarted, which it is. The 0.2.0 user plane then sees each upgraded control
+  plane function as restarted, which it also is. Do not upgrade the control plane first. Each
+  upgrade restarts its function, so expect PDU sessions and bearers through it to be released
+  and set up again. smfd keeps no peer stamps (#966), so a 0.1.x snapshot's
+  `upfRecoveryTimeStamps` is ignored.
 
 ## [0.2.0] — Unreleased (draft for operator review)
 
@@ -368,9 +392,9 @@ before the tag. The validation line is filled from the release run, not carried 
   clock reads before 2020-01-01, because their PFCP Recovery Time Stamp, now NTP-era seconds per
   TS 29.244 §8.2.65 (#995, #1004), would be wrong. On RTC-less hosts, start them after
   `time-sync.target`, give the pod an NTP-wait init container, or rely on the restart policy
-  (#1040). See the configuration overview, "A set clock is required". 0.2.0 still reads a
-  0.1.0 peer's Unix-seconds stamp; see "Upgrade notes" under [Unreleased] for when that ends
-  (#1033).
+  (#1040). See the configuration overview, "A set clock is required". 0.2.0 does not read a
+  0.1.x peer's Unix-seconds stamp: upgrade the user plane, then the control plane, in one
+  window. See "Upgrade notes" under [Unreleased] (#1033).
 - EKS overlay for the matched-pair E2E on a shared cluster (#127), image tags by git SHA (#146,
   #431), rollout reporting (#439).
 - `deploy/eks` script interface `PROFILE=5g|epc|6g` (#656), `e2e-internet.sh` UE-to-internet

@@ -200,7 +200,11 @@ impl ConnectTarget {
     /// the same spelling [`SbiClientConfig::base_uri`] produces for the primary,
     /// so an alternate and a primary naming the same producer share one entry.
     fn base_uri(&self) -> String {
-        format!("{}://{}:{}", self.scheme, self.host, self.port)
+        format!(
+            "{}://{}",
+            self.scheme,
+            crate::uri_encode::uri_authority(&self.host, self.port)
+        )
     }
 }
 
@@ -288,7 +292,11 @@ impl SbiClientConfig {
 
     /// Build the base URI
     pub fn base_uri(&self) -> String {
-        format!("{}://{}:{}", self.scheme, self.host, self.port)
+        format!(
+            "{}://{}",
+            self.scheme,
+            crate::uri_encode::uri_authority(&self.host, self.port)
+        )
     }
 }
 
@@ -536,7 +544,8 @@ impl SbiClient {
         host: &str,
         port: u16,
     ) -> SbiResult<SendRequest<Full<Bytes>>> {
-        let addr = format!("{host}:{port}");
+        // An IPv6 literal is bracketed, or `fd00::1:7777` is no socket address.
+        let addr = crate::uri_encode::uri_authority(host, port);
 
         // #664: a connect-phase timeout is a CONNECTION error, not
         // `SbiError::Timeout`. Nothing was sent, so the request may be resent
