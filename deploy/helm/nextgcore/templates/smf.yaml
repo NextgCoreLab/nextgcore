@@ -76,6 +76,13 @@ spec:
               value: {{ .Values.global.sbiProfile | default "dev" | quote }}
             - name: RUST_LOG
               value: {{ .Values.global.logLevel }}
+            - name: NEXTGCORE_SBI_ADVERTISE
+              # #1312, #1322: the host registered with the NRF and put in every
+              # callback URI, set apart from the bind so a wildcard bind can
+              # never be advertised. The pod IP.
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
             - name: RUST_BACKTRACE
               value: "1"
             # The shutdown's own deadline, derived from the grace period (#941).

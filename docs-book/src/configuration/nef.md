@@ -31,6 +31,7 @@ Everything else is configured by flags.
 | `-l, --log-file` | path | unset | Log file path. |
 | `-m, --no-color` | flag | off | Disable colored output. |
 | `--sbi-addr` / `--sbi-port` | string / u16 | `127.0.0.1` (loopback, #1308) / `7817` | SBI bind address and port. |
+| `--sbi-advertise` | string | unset | The host in the NRF NFProfile and the default `--notify-base` (#1322). Then `NEXTGCORE_SBI_ADVERTISE`, then `--sbi-addr` when it is not a wildcard. A wildcard is never advertised. |
 | `--tls`, `--tls-cert`, `--tls-key` | flag, path, path | off | TLS on the SBI listener. |
 | `--verify-client` | flag | off | Require and verify a client certificate (needs `--tls`; without it startup fails). The certificate's URI SAN becomes the caller identity that subscription ownership is keyed to. |
 | `--verify-client-cacert` | path | SBI layer default | CA bundle for `--verify-client`. |
@@ -39,7 +40,7 @@ Everything else is configured by flags.
 | `--amf-uri` | string | unset | AMF base URI for southbound `Namf_EventExposure`. Unset: AMF-routed monitoring types are stored northbound-only and the southbound leg is deferred. |
 | `--udm-uri` | string | unset | UDM base URI for southbound `Nudm_EE`. Same deferral when unset. |
 | `--udm-sdm-uri` | string | `--udm-uri` | UDM used to resolve an AF-supplied GPSI (`msisdn`/`externalId`) to a SUPI via `id-translation-result`. With neither set, GPSI-targeted requests are refused. |
-| `--notify-base` | string | `http://{sbi-addr}:{sbi-port}` | Externally routable base of the notification callback handed to AMF/UDM. Set it when `--sbi-addr` is a wildcard. |
+| `--notify-base` | string | `http://{advertised host}:{sbi-port}` | Externally routable base of the notification callback handed to AMF/UDM. One naming no host or a wildcard host is refused. With a wildcard `--sbi-addr`, nothing to advertise and no `--notify-base`, nefd refuses to start (#1322). |
 | `--max-subscriptions` | usize | `4096` | Maximum stored northbound monitoring subscriptions. |
 | `--max-transactions` | usize | `4096` | Maximum stored device-triggering transactions. |
 | `--state-file` | path | unset | JSON snapshot of monitoring subscriptions and device-triggering transactions. Falls back to `NEXTGCORE_NEF_STATE_FILE`; an empty value is unset. An unreadable snapshot fails startup. |

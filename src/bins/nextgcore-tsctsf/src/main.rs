@@ -99,6 +99,12 @@ struct Args {
     #[arg(long, default_value = "7819")]
     sbi_port: u16,
 
+    /// The SBI host advertised in the NRF NFProfile (#1322). Without it,
+    /// `NEXTGCORE_SBI_ADVERTISE`, else the bind address when it is not a wildcard.
+    /// A wildcard is never registered: the NF then skips NRF registration.
+    #[arg(long)]
+    sbi_advertise: Option<String>,
+
     #[arg(long)]
     tls: bool,
 
@@ -256,8 +262,21 @@ async fn main() -> Result<()> {
     // ntsctsf-time-synchronization (non-fatal on failure, nwdafd pattern).
     let sbi_ctx = nextgcore_sbi::context::global_context();
     sbi_ctx.set_nrf_uri(&args.nrf_uri).await;
-    if let Err(e) = register_with_nrf(sbi_ctx, &args.sbi_addr, args.sbi_port, &nf_instance_id).await
+    // #1322: the advertised host, never a wildcard.
+    if let Err(e) = match nextgcore_core::sockaddr::SbiEndpoint::resolve(
+        Some(&args.sbi_addr),
+        Some(args.sbi_port),
+        args.sbi_advertise.as_deref(),
+        None,
+        None,
+        None,
+        args.sbi_port,
+    )
+    .registration_host()
     {
+        Ok(host) => register_with_nrf(sbi_ctx, host, args.sbi_port, &nf_instance_id).await,
+        Err(why) => Err(why),
+    } {
         log::warn!("NRF registration failed (will operate without NRF): {e}");
     } else {
         // PATCH a real NFProfile "/load" gauge each heartbeat: stored

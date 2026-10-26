@@ -2369,11 +2369,41 @@ pub fn build_pcf_binding_body_with(
     b
 }
 
+/// Whether the BSF binding is logged as skipped already (#1322): once per process.
+static BSF_BINDING_SKIP_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// #1322: a PcfBinding is only sent with a self identity to put in it. Without
+/// one, `false`, and the first such call (per `logged`) logs why.
+fn bsf_binding_has_self_info(
+    self_info: Option<&PcfSelfInfo>,
+    logged: &std::sync::atomic::AtomicBool,
+) -> bool {
+    if self_info.is_some() {
+        return true;
+    }
+    if !logged.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        log::error!(
+            "not registering PCF bindings with the BSF: no advertised SBI host (a \
+             wildcard bind with nothing to advertise), so a binding would carry no \
+             pcfIpEndPoints and the BSF rejects it (TS 29.521 §5.3.2); set \
+             --sbi-advertise, NEXTGCORE_SBI_ADVERTISE or pcf.sbi.server[0].advertise"
+        );
+    }
+    false
+}
+
 /// Register this PDU session's PCF binding with the BSF (TS 23.503 §6.1.1.2,
 /// TS 29.521). Best-effort, spawned fire-and-forget; the returned bindingId is
 /// stored on the session so delete can deregister it. No-op when no BSF is
 /// reachable (Ok(None)).
 pub fn pcf_sess_register_bsf_binding(sess_id: u64) {
+    // #1322 (#1321 review): without a published self identity (a wildcard bind
+    // with nothing to advertise) the binding would carry no pcfIpEndPoints and a
+    // conformant BSF rejects it (TS 29.521 §5.3.2), so it is not sent; said once.
+    if !bsf_binding_has_self_info(pcf_self_info(), &BSF_BINDING_SKIP_LOGGED) {
+        return;
+    }
     let snap = crate::context::pcf_self().read().ok().and_then(|ctx| {
         let sess = ctx.sess_find_by_id(sess_id)?;
         let supi = ctx
@@ -3048,6 +3078,24 @@ mod tests {
 #[cfg(test)]
 mod tests_api_root {
     use super::{build_pcf_binding_body_with, pcf_api_root_for, pcf_self_info_for, PcfSelfInfo};
+
+    /// #1322 (#1321 review): no self identity, no BSF binding, logged once.
+    #[test]
+    fn no_bsf_binding_without_a_self_identity_and_it_is_said_once() {
+        use super::bsf_binding_has_self_info;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let logged = AtomicBool::new(false);
+        assert!(!bsf_binding_has_self_info(None, &logged));
+        assert!(logged.load(Ordering::Relaxed), "the first skip is logged");
+        assert!(!bsf_binding_has_self_info(None, &logged));
+        let info = PcfSelfInfo {
+            sbi_addr: "10.1.2.3".into(),
+            sbi_port: 7777,
+            fqdn: None,
+            nf_instance_id: "id".into(),
+        };
+        assert!(bsf_binding_has_self_info(Some(&info), &logged));
+    }
 
     /// #1312 review: a wildcard bind with nothing to advertise publishes no self
     /// identity, so no URI or PcfBinding is built on it; with an advertised host,

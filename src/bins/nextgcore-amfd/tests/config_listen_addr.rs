@@ -38,6 +38,7 @@ fn start(config: &std::path::Path, extra: &[&str]) -> Killed {
             .args(extra)
             .env_remove("AMF_SBI_ADDR")
             .env_remove("AMF_SBI_PORT")
+            .env_remove("NEXTGCORE_SBI_ADVERTISE")
             .env("NEXTGCORE_SBI_PROFILE", "dev")
             .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
             .stdout(Stdio::null())
@@ -99,4 +100,52 @@ fn amfd_binds_its_yaml_ngap_and_sbi_addresses_unless_overridden() {
         wait(|| udp_taken(cli_addr), Duration::from_secs(20)),
         "--ngap-addr wins"
     );
+}
+
+/// #1322: a wildcard SBI bind with nothing reachable to advertise refuses to start
+/// (before any socket is bound), rather than hand 0.0.0.0 to peers in its callback
+/// URIs and NFProfile.
+#[test]
+fn amfd_refuses_a_wildcard_sbi_bind_with_nothing_to_advertise() {
+    let dir = std::env::temp_dir().join(format!("amfd-1322-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("amf.yaml");
+    std::fs::write(
+        &config,
+        // Port 1: were the check gone, the bind would fail (unprivileged), so no
+        // wildcard is ever bound; the stderr says which check refused it.
+        "amf:\n  sbi:\n    server:\n      - address: 0.0.0.0\n        port: 1\n",
+    )
+    .unwrap();
+    let mut amfd = Killed(
+        Command::new(env!("CARGO_BIN_EXE_nextgcore-amfd"))
+            .arg("-c")
+            .arg(&config)
+            .env_remove("AMF_SBI_ADDR")
+            .env_remove("AMF_SBI_PORT")
+            .env_remove("NEXTGCORE_SBI_ADVERTISE")
+            .env("NEXTGCORE_SBI_PROFILE", "dev")
+            .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn amfd"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = amfd.0.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let status = status.expect("amfd exits instead of advertising 0.0.0.0");
+    assert!(!status.success());
+    let mut stderr = String::new();
+    if let Some(mut pipe) = amfd.0.stderr.take() {
+        let _ = std::io::Read::read_to_string(&mut pipe, &mut stderr);
+    }
+    assert!(stderr.contains("refusing to start"), "{stderr}");
 }

@@ -470,11 +470,7 @@ pub fn amf_sbi_open() -> SbiResult<()> {
     let nf_instance_id =
         nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf)
             .to_string();
-    let sbi_addr = std::env::var("AMF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let sbi_port: u16 = std::env::var("AMF_SBI_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(7777);
+    let (sbi_addr, sbi_port) = advertised_sbi_host_port();
 
     // From the SHARED table, so the self instance advertises exactly what the
     // NRF profile does (#392).
@@ -3292,16 +3288,47 @@ fn split_absolute_uri(uri: &str) -> Option<(String, u16, String)> {
 /// Shared helper for every amfd inbound SBI callback (dereg-notify, and the
 /// still-unserved am-policy-notify / sdmsubscription-notify — WS-A reuses this).
 pub fn advertised_sbi_base() -> String {
-    let addr = std::env::var("AMF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let port: u16 = std::env::var("AMF_SBI_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(7777);
+    let (addr, port) = advertised_sbi_host_port();
     format!(
         "{}://{}",
         advertised_sbi_scheme(),
         nextgcore_sbi::uri_encode::uri_authority(&addr, port)
     )
+}
+
+/// The advertised SBI host and port, set once by `AmfApp::init` (#1322), which
+/// refuses to start rather than set a wildcard.
+static ADVERTISED_SBI: std::sync::OnceLock<(String, u16)> = std::sync::OnceLock::new();
+
+/// Record the advertised SBI host and port. A wildcard is refused (and the call
+/// ignored): it is unreachable, and must never reach a URI (#1322).
+pub fn set_advertised_sbi(host: String, port: u16) {
+    if nextgcore_core::sockaddr::is_wildcard_host(&host) {
+        log::error!("not advertising the wildcard SBI host {host} (#1322)");
+        return;
+    }
+    let _ = ADVERTISED_SBI.set((host, port));
+}
+
+/// The SBI host and port every callback URI, the self instance and the NRF
+/// NFProfile carry. Before `AmfApp::init` (unit tests), the environment's
+/// `AMF_SBI_ADDR` / `AMF_SBI_PORT`, else `127.0.0.1:7777`.
+pub fn advertised_sbi_host_port() -> (String, u16) {
+    ADVERTISED_SBI.get().cloned().unwrap_or_else(|| {
+        unset_advertised_sbi(
+            std::env::var("AMF_SBI_ADDR").ok(),
+            std::env::var("AMF_SBI_PORT").ok(),
+        )
+    })
+}
+
+/// [`advertised_sbi_host_port`] before `init` has set it: a wildcard (or empty)
+/// `AMF_SBI_ADDR` is never used, loopback is (#1322).
+fn unset_advertised_sbi(addr: Option<String>, port: Option<String>) -> (String, u16) {
+    let addr = addr
+        .filter(|a| !a.trim().is_empty() && !nextgcore_core::sockaddr::is_wildcard_host(a))
+        .unwrap_or_else(|| nextgcore_core::sockaddr::DEFAULT_LISTEN_HOST.to_string());
+    (addr, port.and_then(|p| p.parse().ok()).unwrap_or(7777))
 }
 
 /// Whether the SBI listener this AMF started is TLS-protected (issue #63).
@@ -6838,5 +6865,60 @@ mod lmf_selection_tests {
             !lmf_serves(&range(json!({ "pattern": "^(54E|54F).*$" }), "01"), &ue),
             "unparsed: no match"
         );
+    }
+}
+
+/// #1322: no wildcard ever reaches an outgoing URI or the self instance.
+#[cfg(test)]
+mod tests_no_wildcard_uri_1322 {
+    use super::*;
+
+    #[test]
+    fn a_wildcard_amf_sbi_addr_is_never_advertised() {
+        for wildcard in ["0.0.0.0", "::", "[::]", " "] {
+            assert_eq!(
+                unset_advertised_sbi(Some(wildcard.into()), Some("7790".into())),
+                ("127.0.0.1".to_string(), 7790),
+                "{wildcard:?}"
+            );
+        }
+        assert_eq!(
+            unset_advertised_sbi(Some("10.0.0.5".into()), None),
+            ("10.0.0.5".to_string(), 7777)
+        );
+    }
+
+    #[test]
+    fn every_callback_uri_and_the_self_instance_carry_the_advertised_host() {
+        let (host, port) = advertised_sbi_host_port();
+        assert!(!nextgcore_core::sockaddr::is_wildcard_host(&host), "{host}");
+        let authority = nextgcore_sbi::uri_encode::uri_authority(&host, port);
+        let uris = [
+            advertised_sbi_base(),
+            sm_context_status_uri("imsi-001010000000001", 5),
+            dereg_callback_uri("imsi-001010000000001", "t"),
+            ue_policy_notification_uri("imsi-001010000000001"),
+            sdm_callback_reference("imsi-001010000000001"),
+            am_policy_notification_uri("imsi-001010000000001"),
+            crate::racs::notification_uri(),
+            crate::nrf_subscription::notification_uri(),
+        ];
+        for uri in &uris {
+            assert!(uri.contains(&authority), "{uri}");
+            assert!(!uri.contains("0.0.0.0") && !uri.contains("[::]"), "{uri}");
+        }
+        let instance = build_amf_nf_instance("id", &host, port);
+        assert!(instance
+            .ipv4_addresses
+            .iter()
+            .all(|a| !nextgcore_core::sockaddr::is_wildcard_host(a)));
+    }
+
+    #[test]
+    fn set_advertised_sbi_refuses_a_wildcard() {
+        // A wildcard is ignored, so whatever was (or was not) set stays.
+        let before = advertised_sbi_host_port();
+        set_advertised_sbi("0.0.0.0".into(), 7777);
+        assert_eq!(advertised_sbi_host_port(), before);
     }
 }

@@ -64,7 +64,7 @@ easdf:
 | Key | Default | Effect |
 |---|---|---|
 | `easdf.enabled` | `false` | Start the NF. Also settable with `--enabled`. |
-| `easdf.sbi.server[0].address` / `.port` | `127.0.0.1` (loopback, #1308) / `7818` | SBI bind. Overrides `--sbi-addr` / `--sbi-port`. |
+| `easdf.sbi.server[0].address` / `.port` | `127.0.0.1` (loopback, #1308) / `7818` | SBI bind. Overrides `--sbi-addr` / `--sbi-port`. The NRF NFProfile gets `--sbi-advertise`, else `NEXTGCORE_SBI_ADVERTISE`, else this address when it is not a wildcard; with none, NRF registration is skipped and logged (#1322). |
 | `easdf.sbi.client.nrf[0].uri` | `http://127.0.0.1:7777` | NRF for registration and heartbeat. Overrides `--nrf-uri`. |
 | `easdf.eas_map[].fqdn` / `.addresses` | *(empty)* | Static edge FQDN → EAS address map. |
 | `easdf.dns.miss_action` | `nxdomain` | `forward` or `nxdomain`. `forward` without `upstream` warns and falls back to `nxdomain`. |

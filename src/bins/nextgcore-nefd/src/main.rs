@@ -120,6 +120,12 @@ struct Args {
     #[arg(long, default_value = "7817")]
     sbi_port: u16,
 
+    /// The SBI host advertised in the NRF NFProfile and the default notify base
+    /// (#1322). Without it, `NEXTGCORE_SBI_ADVERTISE`, else `--sbi-addr` when it
+    /// is not a wildcard. A wildcard is never advertised.
+    #[arg(long)]
+    sbi_advertise: Option<String>,
+
     #[arg(long)]
     tls: bool,
 
@@ -174,8 +180,8 @@ struct Args {
 
     /// Externally routable base URI of this NEF's SBI server, used as the
     /// prefix of the notification callback handed to AMF/UDM. Defaults to
-    /// http://{sbi-addr}:{sbi-port}; set explicitly when --sbi-addr is a
-    /// wildcard bind address.
+    /// http://{advertised host}:{sbi-port} (#1322); with a wildcard --sbi-addr and
+    /// nothing to advertise, the NEF refuses to start without it.
     #[arg(long)]
     notify_base: Option<String>,
 
@@ -414,12 +420,18 @@ async fn main() -> Result<()> {
         nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Nef)
             .to_string();
 
-    let notify_base = args.notify_base.clone().unwrap_or_else(|| {
-        format!(
-            "http://{}",
-            nextgcore_sbi::uri_encode::uri_authority(&args.sbi_addr, args.sbi_port)
-        )
-    });
+    // #1322: the advertised host, apart from the bind; never a wildcard.
+    let sbi = nextgcore_core::sockaddr::SbiEndpoint::resolve(
+        Some(&args.sbi_addr),
+        Some(args.sbi_port),
+        args.sbi_advertise.as_deref(),
+        None,
+        None,
+        None,
+        7817,
+    );
+    let notify_base =
+        nef_notify_base(args.notify_base.as_deref(), &sbi).map_err(|why| anyhow::anyhow!(why))?;
     {
         let ctx = nef_self();
         if let Ok(mut context) = ctx.write() {
@@ -525,8 +537,10 @@ async fn main() -> Result<()> {
     // (registration failure is non-fatal, mirroring nwdafd).
     let sbi_ctx = nextgcore_sbi::context::global_context();
     sbi_ctx.set_nrf_uri(&args.nrf_uri).await;
-    if let Err(e) = register_with_nrf(sbi_ctx, &args.sbi_addr, args.sbi_port, &nf_instance_id).await
-    {
+    if let Err(e) = match sbi.registration_host() {
+        Ok(host) => register_with_nrf(sbi_ctx, host, sbi.port, &nf_instance_id).await,
+        Err(why) => Err(why),
+    } {
         log::warn!("NRF registration failed (will operate without NRF): {e}");
     } else {
         // PATCH a real NFProfile "/load" gauge to NRF each heartbeat: active
@@ -1859,6 +1873,32 @@ fn bounded_client(host: &str, port: u16) -> SbiClient {
 
 /// Build the NFProfile registered with the NRF (TS 29.510): nfType NEF
 /// advertising the nnef-eventexposure service (TS 29.591).
+/// #1322: the base of every notification callback the NEF hands the AMF and UDM:
+/// `--notify-base` (refused when it names no host or a wildcard one), else
+/// `http://<advertised host>:<port>`. `Err` when there is nothing reachable to
+/// advertise: the NEF must not start, since every southbound subscribe needs it.
+fn nef_notify_base(
+    notify_base: Option<&str>,
+    sbi: &nextgcore_core::sockaddr::SbiEndpoint,
+) -> Result<String, String> {
+    if let Some(base) = notify_base {
+        let base = base.trim().trim_end_matches('/');
+        return match nextgcore_core::sockaddr::advertised_uri_host(base) {
+            Some(_) => Ok(base.to_string()),
+            None => Err(format!(
+                "refusing to start: --notify-base '{base}' names no reachable host"
+            )),
+        };
+    }
+    let host = sbi
+        .registration_host()
+        .map_err(|why| format!("refusing to start: {why}, or --notify-base"))?;
+    Ok(format!(
+        "http://{}",
+        nextgcore_sbi::uri_encode::uri_authority(host, sbi.port)
+    ))
+}
+
 fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
     serde_json::json!({
         "nfInstanceId": nf_instance_id,
@@ -3532,5 +3572,39 @@ mod northbound_auth_tests {
             .expect("response");
         assert_eq!(resp.status, 401, "wrong-audience token must be 401");
         server.stop().await.expect("stop");
+    }
+}
+
+/// #1322: no wildcard reaches the notify base.
+#[cfg(test)]
+mod tests_notify_base_1322 {
+    use super::nef_notify_base;
+    use nextgcore_core::sockaddr::SbiEndpoint;
+
+    fn ep(host: &str, advertise: Option<&str>) -> SbiEndpoint {
+        SbiEndpoint {
+            host: host.into(),
+            port: 7817,
+            advertise: advertise.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn the_notify_base_is_never_a_wildcard() {
+        assert_eq!(
+            nef_notify_base(None, &ep("0.0.0.0", Some("10.0.0.7"))).unwrap(),
+            "http://10.0.0.7:7817"
+        );
+        assert_eq!(
+            nef_notify_base(Some("http://nef.example:80/"), &ep("0.0.0.0", None)).unwrap(),
+            "http://nef.example:80"
+        );
+        for wildcard in ["0.0.0.0", "::"] {
+            let e = nef_notify_base(None, &ep(wildcard, None)).unwrap_err();
+            assert!(e.starts_with("refusing to start"), "{e}");
+        }
+        for bad in ["http://0.0.0.0:7817", "http://[::]:7817", "nef.example"] {
+            assert!(nef_notify_base(Some(bad), &ep("10.0.0.7", Some("10.0.0.7"))).is_err());
+        }
     }
 }

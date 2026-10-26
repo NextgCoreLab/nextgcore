@@ -401,6 +401,9 @@ struct Args {
 struct ListenServerYaml {
     address: Option<String>,
     port: Option<u16>,
+    /// `amf.sbi.server[0].advertise` (#1322): the host peers are told, when it is
+    /// not the bind address.
+    advertise: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -414,6 +417,7 @@ struct ListenIfYaml {
 struct ConfigListen {
     ngap: Option<(String, Option<u16>)>,
     sbi: Option<(String, Option<u16>)>,
+    sbi_advertise: Option<String>,
 }
 
 fn first_server(servers: Option<&Vec<ListenServerYaml>>) -> Option<(String, Option<u16>)> {
@@ -426,6 +430,12 @@ impl ConfigListen {
         Self {
             ngap: first_server(section.ngap.as_ref().and_then(|n| n.server.as_ref())),
             sbi: first_server(section.sbi.as_ref().and_then(|s| s.server.as_ref())),
+            sbi_advertise: section
+                .sbi
+                .as_ref()
+                .and_then(|s| s.server.as_ref())
+                .and_then(|s| s.first())
+                .and_then(|e| e.advertise.clone()),
         }
     }
 }
@@ -447,21 +457,38 @@ fn resolve_ngap_addr(cli: Option<&str>, config: &ConfigListen) -> Result<SocketA
     }
 }
 
-/// #1311: the SBI listen host and port. `AMF_SBI_ADDR` / `AMF_SBI_PORT`, else
-/// `amf.sbi.server[0]`, else `127.0.0.1:7777` (#1308).
-fn resolve_sbi_listen(
+/// #1311, #1322: the SBI endpoint. The bind is `AMF_SBI_ADDR` / `AMF_SBI_PORT`,
+/// else `amf.sbi.server[0]`, else `127.0.0.1:7777`. The host peers are told (the
+/// NRF NFProfile and every callback URI) is `NEXTGCORE_SBI_ADVERTISE`, else
+/// `amf.sbi.server[0].advertise`, else the bind when it is not a wildcard.
+fn resolve_sbi(
     env_addr: Option<String>,
     env_port: Option<u16>,
     config: &ConfigListen,
-) -> (String, u16) {
+) -> nextgcore_core::sockaddr::SbiEndpoint {
     let yaml = config.sbi.clone();
-    let addr = env_addr
-        .or_else(|| yaml.as_ref().map(|(a, _)| a.clone()))
-        .unwrap_or_else(|| "127.0.0.1".to_string());
-    let port = env_port
-        .or_else(|| yaml.as_ref().and_then(|(_, p)| *p))
-        .unwrap_or(7777);
-    (addr, port)
+    nextgcore_core::sockaddr::SbiEndpoint::resolve(
+        env_addr.as_deref(),
+        env_port,
+        None,
+        yaml.as_ref().map(|(a, _)| a.as_str()),
+        yaml.as_ref().and_then(|(_, p)| *p),
+        config.sbi_advertise.as_deref(),
+        7777,
+    )
+}
+
+/// #1322: the advertised SBI host and port, or why the AMF must not start. Every
+/// callback URI the AMF hands a peer is mandatory in its request (TS 29.502
+/// `smContextStatusUri`, TS 29.503 `deregCallbackUri`, TS 29.507
+/// `notificationUri`, ...), so with a wildcard bind and nothing reachable to
+/// advertise there is no URI to omit them for: the AMF refuses to start.
+fn advertised_endpoint(
+    sbi: &nextgcore_core::sockaddr::SbiEndpoint,
+) -> Result<(String, u16), String> {
+    sbi.registration_host()
+        .map(|host| (host.to_string(), sbi.port))
+        .map_err(|why| format!("refusing to start: {why}"))
 }
 
 /// AMF application state
@@ -478,6 +505,8 @@ pub struct AmfApp {
     ngap_event_rx: Option<mpsc::Receiver<event::AmfEvent>>,
     /// The listen addresses the config file names, read with the rest of it.
     config_listen: ConfigListen,
+    /// The SBI bind and advertised host (#1322), resolved in `init`.
+    sbi: nextgcore_core::sockaddr::SbiEndpoint,
 }
 
 impl AmfApp {
@@ -491,6 +520,11 @@ impl AmfApp {
             ngap_event_tx: Some(tx),
             ngap_event_rx: Some(rx),
             config_listen: ConfigListen::default(),
+            sbi: nextgcore_core::sockaddr::SbiEndpoint {
+                host: nextgcore_core::sockaddr::DEFAULT_LISTEN_HOST.to_string(),
+                port: 7777,
+                advertise: Some(nextgcore_core::sockaddr::DEFAULT_LISTEN_HOST.to_string()),
+            },
         }
     }
 
@@ -503,6 +537,23 @@ impl AmfApp {
 
         // Load configuration from YAML file
         self.load_config(config_path).await?;
+
+        // #1322: resolve the SBI endpoint before anything can build a URI on it,
+        // and refuse to start when there is nothing reachable to advertise.
+        self.sbi = resolve_sbi(
+            std::env::var("AMF_SBI_ADDR").ok(),
+            std::env::var("AMF_SBI_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok()),
+            &self.config_listen,
+        );
+        let (host, port) = advertised_endpoint(&self.sbi).map_err(|why| {
+            anyhow::anyhow!(
+                "{why}. Set NEXTGCORE_SBI_ADVERTISE or amf.sbi.server[0].advertise, or bind \
+                 AMF_SBI_ADDR to a reachable address"
+            )
+        })?;
+        sbi_path::set_advertised_sbi(host, port);
 
         // Initialize SBI
         sbi_path::amf_sbi_open()?;
@@ -1218,13 +1269,7 @@ pub async fn run() -> Result<()> {
 
     // Start the Namf SBI HTTP/2 server (TS 29.518: namf-comm, namf-evts,
     // namf-mt, namf-loc) on the advertised SBI endpoint
-    let (sbi_addr, sbi_port) = resolve_sbi_listen(
-        std::env::var("AMF_SBI_ADDR").ok(),
-        std::env::var("AMF_SBI_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok()),
-        &config_listen,
-    );
+    let (sbi_addr, sbi_port) = (app.sbi.host.clone(), app.sbi.port);
     let sbi_sock: SocketAddr = nextgcore_core::sockaddr::parse_listen_addr(&sbi_addr, sbi_port)
         .map_err(|e| anyhow::anyhow!("Invalid SBI address '{sbi_addr}:{sbi_port}': {e}"))?;
     nextgcore_core::sockaddr::warn_if_loopback_listener(
@@ -1270,7 +1315,8 @@ pub async fn run() -> Result<()> {
 
     // Register with NRF (if configured)
     let mut amf_nf_instance_id = String::new();
-    match sbi_path::amf_nrf_register(&sbi_addr, sbi_port).await {
+    let (advertised_host, advertised_port) = sbi_path::advertised_sbi_host_port();
+    match sbi_path::amf_nrf_register(&advertised_host, advertised_port).await {
         Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
             amf_nf_instance_id = nf_instance_id.clone();
             // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
@@ -1367,6 +1413,43 @@ mod tests {
     /// #1311: `amf.ngap.server` and `amf.sbi.server` are the listen addresses when
     /// the command line / environment name none, and those override them. An IPv6
     /// address is taken as is (#1306). No YAML: loopback.
+    /// #1322: the advertised host is the YAML `advertise`, else the bind when it is
+    /// not a wildcard; a wildcard bind with nothing to advertise refuses to start.
+    #[test]
+    fn a_wildcard_bind_with_nothing_to_advertise_refuses_to_start_1322() {
+        let listen = |yaml: &str| {
+            let y: AmfYaml = serde_yaml::from_str(yaml).unwrap();
+            ConfigListen::of(&y.amf.unwrap())
+        };
+        let adv = listen(
+            "amf:\n  sbi:\n    server:\n      - address: 0.0.0.0\n        port: 7778\n        advertise: 10.0.0.5\n",
+        );
+        let ep = nextgcore_core::sockaddr::SbiEndpoint {
+            advertise: adv.sbi_advertise.clone(),
+            ..resolve_sbi(None, None, &adv)
+        };
+        assert_eq!(ep.host, "0.0.0.0");
+        assert_eq!(advertised_endpoint(&ep), Ok(("10.0.0.5".to_string(), 7778)));
+        for wildcard in ["0.0.0.0", "::", "[::]"] {
+            let ep = nextgcore_core::sockaddr::SbiEndpoint {
+                host: wildcard.into(),
+                port: 7777,
+                advertise: None,
+            };
+            let why = advertised_endpoint(&ep).unwrap_err();
+            assert!(why.starts_with("refusing to start"), "{why}");
+        }
+        let bound = nextgcore_core::sockaddr::SbiEndpoint {
+            host: "10.0.0.6".into(),
+            port: 7777,
+            advertise: Some("10.0.0.6".into()),
+        };
+        assert_eq!(
+            advertised_endpoint(&bound),
+            Ok(("10.0.0.6".to_string(), 7777))
+        );
+    }
+
     #[test]
     fn the_yaml_listen_addresses_are_bound_unless_overridden_1311() {
         let listen = |yaml: &str| {
@@ -1385,19 +1468,20 @@ mod tests {
             "0.0.0.0:38412".parse::<SocketAddr>().unwrap(),
             "the command line wins"
         );
+        let sbi = |e: nextgcore_core::sockaddr::SbiEndpoint| (e.host, e.port);
         assert_eq!(
-            resolve_sbi_listen(None, None, &cfg),
+            sbi(resolve_sbi(None, None, &cfg)),
             ("fd00::5".to_string(), 7778)
         );
         assert_eq!(
-            resolve_sbi_listen(Some("0.0.0.0".into()), None, &cfg),
+            sbi(resolve_sbi(Some("0.0.0.0".into()), None, &cfg)),
             ("0.0.0.0".to_string(), 7778),
             "the environment wins, field by field"
         );
         let no_port = listen("amf:\n  ngap:\n    server:\n      - address: 10.0.0.5\n");
         assert_eq!(resolve_ngap_addr(None, &no_port).unwrap().port(), 38412);
         assert_eq!(
-            resolve_sbi_listen(None, None, &ConfigListen::default()),
+            sbi(resolve_sbi(None, None, &ConfigListen::default())),
             ("127.0.0.1".to_string(), 7777)
         );
         let bogus = listen("amf:\n  ngap:\n    server:\n      - address: bogus\n");

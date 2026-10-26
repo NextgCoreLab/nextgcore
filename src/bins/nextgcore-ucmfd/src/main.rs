@@ -142,6 +142,12 @@ struct Args {
     sbi_addr: String,
     #[arg(long, default_value = "7777")]
     sbi_port: u16,
+
+    /// The SBI host advertised in the NRF NFProfile and the `Location` / resource
+    /// URIs (#1322). Without it, `NEXTGCORE_SBI_ADVERTISE`, else `--sbi-addr` when
+    /// it is not a wildcard. A wildcard is never advertised.
+    #[arg(long)]
+    sbi_advertise: Option<String>,
     #[arg(long)]
     tls: bool,
     #[arg(long)]
@@ -326,6 +332,21 @@ fn metrics_addr(value: Option<&str>) -> SocketAddr {
     }
 }
 
+/// #1322: `{scheme}://<advertised host>:<port>`, or why the UCMF must not start
+/// (a wildcard bind with nothing reachable to advertise).
+fn ucmf_api_root(
+    scheme: &str,
+    sbi: &nextgcore_core::sockaddr::SbiEndpoint,
+) -> Result<String, String> {
+    let host = sbi
+        .registration_host()
+        .map_err(|why| format!("refusing to start: {why}"))?;
+    Ok(format!(
+        "{scheme}://{}",
+        nextgcore_sbi::uri_encode::uri_authority(host, sbi.port)
+    ))
+}
+
 fn api_root() -> &'static str {
     API_ROOT.get().map(String::as_str).unwrap_or("http://ucmf")
 }
@@ -398,16 +419,25 @@ async fn main() -> Result<()> {
         .context("installing the signal handler")?;
     }
 
+    let scheme = if args.tls { "https" } else { "http" };
+    // #1322: the advertised host, apart from the bind; never a wildcard. Checked
+    // before the listener starts: the UCMF refuses to start rather than hand
+    // 0.0.0.0 to a peer in a Location or resource URI.
+    let sbi = nextgcore_core::sockaddr::SbiEndpoint::resolve(
+        Some(&args.sbi_addr),
+        Some(args.sbi_port),
+        args.sbi_advertise.as_deref(),
+        None,
+        None,
+        None,
+        args.sbi_port,
+    );
+    let _ = API_ROOT.set(ucmf_api_root(scheme, &sbi).map_err(|why| anyhow::anyhow!(why))?);
     let addr: SocketAddr =
         nextgcore_core::sockaddr::parse_listen_addr(&args.sbi_addr, args.sbi_port)
             .context("Invalid SBI address")?;
     // #1308: loopback by default; say which setting opens it to remote peers.
     nextgcore_core::sockaddr::warn_if_loopback_listener("SBI", &addr, "--sbi-addr");
-    let scheme = if args.tls { "https" } else { "http" };
-    let _ = API_ROOT.set(format!(
-        "{scheme}://{}",
-        nextgcore_sbi::uri_encode::uri_authority(&args.sbi_addr, args.sbi_port)
-    ));
 
     let mut sbi_config = NextgcoreSbiServerConfig::new(addr);
     if args.tls {
@@ -453,7 +483,10 @@ async fn main() -> Result<()> {
     }
 
     global_context().set_nrf_uri(&settings.nrf_uri).await;
-    match register_with_nrf(&args.sbi_addr, args.sbi_port, scheme, &nf_instance_id).await {
+    match match sbi.registration_host() {
+        Ok(host) => register_with_nrf(host, sbi.port, scheme, &nf_instance_id).await,
+        Err(why) => Err(why),
+    } {
         Ok(()) => nextgcore_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id.clone(), 5),
         Err(e) => log::warn!("NRF registration failed (will operate without NRF): {e}"),
     }
@@ -2153,5 +2186,29 @@ mod tests {
             None
         )
         .is_err());
+    }
+}
+
+/// #1322: no wildcard reaches the apiRoot (Location headers, resource URIs).
+#[cfg(test)]
+mod tests_api_root_1322 {
+    use super::ucmf_api_root;
+    use nextgcore_core::sockaddr::SbiEndpoint;
+
+    #[test]
+    fn the_api_root_is_the_advertised_host_never_a_wildcard() {
+        let ep = |host: &str, advertise: Option<&str>| SbiEndpoint {
+            host: host.into(),
+            port: 7777,
+            advertise: advertise.map(str::to_string),
+        };
+        assert_eq!(
+            ucmf_api_root("https", &ep("0.0.0.0", Some("10.0.0.39"))).unwrap(),
+            "https://10.0.0.39:7777"
+        );
+        for wildcard in ["0.0.0.0", "::"] {
+            let e = ucmf_api_root("http", &ep(wildcard, None)).unwrap_err();
+            assert!(e.starts_with("refusing to start"), "{e}");
+        }
     }
 }
