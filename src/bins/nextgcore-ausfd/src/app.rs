@@ -1611,6 +1611,7 @@ async fn send_udm_generate_auth_data(
             .or(udm_instance.fqdn.clone())
             .or(udm_service.ip_addresses.first().cloned())
             .or(udm_instance.ipv4_addresses.first().cloned())
+            .or(udm_instance.ipv6_addresses.first().cloned())
             .ok_or("No UDM endpoint address available")?;
         port = udm_service.port;
     } else {
@@ -1776,6 +1777,7 @@ async fn send_udm_auth_result(
         .or(udm_instance.fqdn.as_deref())
         .or(udm_service.ip_addresses.first().map(|s| s.as_str()))
         .or(udm_instance.ipv4_addresses.first().map(|s| s.as_str()))
+        .or(udm_instance.ipv6_addresses.first().map(|s| s.as_str()))
         .ok_or("No UDM endpoint address available")?;
     let port = udm_service.port;
 
@@ -1855,12 +1857,12 @@ fn build_ausf_nf_instance(
 ) -> nextgcore_sbi::context::NfInstance {
     let mut self_instance =
         nextgcore_sbi::context::NfInstance::new(nf_instance_id, nextgcore_sbi::types::NfType::Ausf);
-    self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
+    nextgcore_sbi::nf_addressing::set_instance_host(&mut self_instance, sbi_addr);
     self_instance.heartbeat_interval = 10;
     for (service_type, _allowed) in AUSF_SERVICES {
         let mut svc = nextgcore_sbi::context::NfService::new(service_type.to_name(), *service_type);
         svc.port = sbi_port;
-        svc.ip_addresses = vec![sbi_addr.to_string()];
+        nextgcore_sbi::nf_addressing::set_service_host(&mut svc, sbi_addr);
         self_instance.add_service(svc);
     }
     self_instance
@@ -1904,15 +1906,18 @@ fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serd
         }
     }
 
-    serde_json::json!({
-        "nfInstanceId": nf_instance_id,
-        "nfType": "AUSF",
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [sbi_addr],
-        "nfServices": services,
-        "allowedNfTypes": nf_allowed,
-        "heartBeatTimer": 10
-    })
+    nextgcore_sbi::nf_addressing::classify_profile_host(
+        serde_json::json!({
+            "nfInstanceId": nf_instance_id,
+            "nfType": "AUSF",
+            "nfStatus": "REGISTERED",
+            "ipv4Addresses": [sbi_addr],
+            "nfServices": services,
+            "allowedNfTypes": nf_allowed,
+            "heartBeatTimer": 10
+        }),
+        sbi_addr,
+    )
 }
 
 /// Register AUSF with NRF (B23.4)
@@ -2044,15 +2049,8 @@ async fn discover_nf_from_nrf(target_nf_type: &str, service_name: &str) -> Resul
 
             let mut instance = nextgcore_sbi::context::NfInstance::new(nf_id, nf_type);
 
-            if let Some(fqdn) = nf_json.get("fqdn").and_then(|v| v.as_str()) {
-                instance.fqdn = Some(fqdn.to_string());
-            }
-            if let Some(addrs) = nf_json.get("ipv4Addresses").and_then(|v| v.as_array()) {
-                instance.ipv4_addresses = addrs
-                    .iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect();
-            }
+            // #1324: IPv4, IPv6 and FQDN alike.
+            nextgcore_sbi::nf_addressing::read_instance_addresses(&mut instance, nf_json);
 
             // Parse services
             if let Some(services) = nf_json.get("nfServices").and_then(|v| v.as_array()) {
@@ -2065,18 +2063,7 @@ async fn discover_nf_from_nrf(target_nf_type: &str, service_name: &str) -> Resul
                         nextgcore_sbi::types::SbiServiceType::from_name(svc_name)
                     {
                         let mut svc = nextgcore_sbi::context::NfService::new(svc_name, svc_type);
-                        if let Some(endpoints) =
-                            svc_json.get("ipEndPoints").and_then(|v| v.as_array())
-                        {
-                            if let Some(ep) = endpoints.first() {
-                                if let Some(addr) = ep.get("ipv4Address").and_then(|v| v.as_str()) {
-                                    svc.ip_addresses.push(addr.to_string());
-                                }
-                                if let Some(port) = ep.get("port").and_then(|v| v.as_u64()) {
-                                    svc.port = port as u16;
-                                }
-                            }
-                        }
+                        nextgcore_sbi::nf_addressing::read_service_addresses(&mut svc, svc_json);
                         instance.add_service(svc);
                     }
                 }
@@ -4124,6 +4111,24 @@ mod shipped_config_tests {
         // and sets NEXTGCORE_HELM_REQUIRED, so this is never skipped there).
         if let Some(text) = nextgcore_core::helm_render::helm_rendered_config(&root, "ausf.yaml") {
             serde_yaml::from_str::<super::AusfYaml>(&text).expect("Helm ausf.yaml");
+        }
+    }
+}
+
+/// #1324: the NFProfile carries its host where its type belongs (TS 29.510
+/// §6.1.6.2.2): IPv4 in ipv4Addresses, IPv6 in ipv6Addresses, an FQDN as fqdn, and
+/// the service ipEndPoints likewise.
+#[cfg(test)]
+mod tests_nf_profile_host_kind_1324 {
+    use super::*;
+
+    #[test]
+    fn the_nf_profile_carries_its_host_by_type() {
+        for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
+            let profile = build_nf_profile("id", host, 7777);
+            let problems =
+                nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
+            assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
         }
     }
 }

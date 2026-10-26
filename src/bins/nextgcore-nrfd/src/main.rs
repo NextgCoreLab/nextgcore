@@ -707,7 +707,11 @@ fn nrf_self_uri() -> &'static str {
 /// `authorize_access_token` and the discovery filters read them, and a profile
 /// that omitted them would be a differently-shaped entry from every other NF's.
 fn nrf_self_profile() -> serde_json::Value {
-    let uri = nrf_self_uri();
+    nrf_self_profile_for(nrf_self_uri())
+}
+
+/// [`nrf_self_profile`] for the NRF reached at `uri` (#1324: testable by host type).
+fn nrf_self_profile_for(uri: &str) -> serde_json::Value {
     let (scheme, host_port) = match uri.split_once("://") {
         Some((s, rest)) => (s, rest),
         None => ("http", uri),
@@ -716,20 +720,23 @@ fn nrf_self_profile() -> serde_json::Value {
         Some((h, p)) => (h, p.parse::<u16>().unwrap_or(7777)),
         None => (host_port, 7777),
     };
-    serde_json::json!({
-        "nfInstanceId": nrf_instance_id(),
-        "nfType": NfType::Nrf.to_str(),
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [host],
-        "nfServices": [{
-            "serviceInstanceId": "nnrf-oauth2",
-            "serviceName": "nnrf-oauth2",
-            "versions": [{ "apiVersionInUri": "v1", "apiFullVersion": "1.0.0" }],
-            "scheme": scheme,
-            "nfServiceStatus": "REGISTERED",
-            "ipEndPoints": [{ "ipv4Address": host, "port": port, "transport": "TCP" }],
-        }],
-    })
+    nextgcore_sbi::nf_addressing::classify_profile_host(
+        serde_json::json!({
+            "nfInstanceId": nrf_instance_id(),
+            "nfType": NfType::Nrf.to_str(),
+            "nfStatus": "REGISTERED",
+            "ipv4Addresses": [host],
+            "nfServices": [{
+                "serviceInstanceId": "nnrf-oauth2",
+                "serviceName": "nnrf-oauth2",
+                "versions": [{ "apiVersionInUri": "v1", "apiFullVersion": "1.0.0" }],
+                "scheme": scheme,
+                "nfServiceStatus": "REGISTERED",
+                "ipEndPoints": [{ "ipv4Address": host, "port": port, "transport": "TCP" }],
+            }],
+        }),
+        host,
+    )
 }
 
 /// Register the NRF in its own registry (issue #187, criterion 5).
@@ -8250,6 +8257,23 @@ mod tests {
             }
             let resp = subscribe(body.clone()).await;
             assert_eq!(resp.status, 400, "{body} must be refused");
+        }
+    }
+}
+
+/// #1324: the NRF's own profile carries its host by type.
+#[cfg(test)]
+mod tests_nrf_self_profile_host_kind_1324 {
+    use super::nrf_self_profile_for;
+
+    #[test]
+    fn the_nrf_profile_carries_its_host_by_type() {
+        for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
+            let authority = nextgcore_sbi::uri_encode::uri_authority(host, 7777);
+            let profile = nrf_self_profile_for(&format!("http://{authority}"));
+            let problems =
+                nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
+            assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
         }
     }
 }

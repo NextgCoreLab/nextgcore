@@ -539,15 +539,18 @@ fn nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16, scheme: &str)
         PROVISIONING_API_FULL_VERSION,
         &["NEF", "SCP"],
     );
-    json!({
-        "nfInstanceId": nf_instance_id,
-        "nfType": "UCMF",
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [sbi_addr],
-        "nfServices": [uecm, provisioning],
-        "allowedNfTypes": ["AMF", "MME", "NEF", "SCP"],
-        "heartBeatTimer": 10,
-    })
+    nextgcore_sbi::nf_addressing::classify_profile_host(
+        json!({
+            "nfInstanceId": nf_instance_id,
+            "nfType": "UCMF",
+            "nfStatus": "REGISTERED",
+            "ipv4Addresses": [sbi_addr],
+            "nfServices": [uecm, provisioning],
+            "allowedNfTypes": ["AMF", "MME", "NEF", "SCP"],
+            "heartBeatTimer": 10,
+        }),
+        sbi_addr,
+    )
 }
 
 async fn register_with_nrf(
@@ -2209,6 +2212,24 @@ mod tests_api_root_1322 {
         for wildcard in ["0.0.0.0", "::"] {
             let e = ucmf_api_root("http", &ep(wildcard, None)).unwrap_err();
             assert!(e.starts_with("refusing to start"), "{e}");
+        }
+    }
+}
+
+/// #1324: the NFProfile carries its host where its type belongs (TS 29.510
+/// §6.1.6.2.2): IPv4 in ipv4Addresses, IPv6 in ipv6Addresses, an FQDN as fqdn, and
+/// the service ipEndPoints likewise.
+#[cfg(test)]
+mod tests_nf_profile_host_kind_1324 {
+    use super::*;
+
+    #[test]
+    fn the_nf_profile_carries_its_host_by_type() {
+        for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
+            let profile = nf_profile("id", host, 7777, "http");
+            let problems =
+                nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
+            assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
         }
     }
 }

@@ -4052,15 +4052,18 @@ fn build_udr_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> 
         }
     }
 
-    serde_json::json!({
-        "nfInstanceId": nf_instance_id,
-        "nfType": "UDR",
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [sbi_addr],
-        "nfServices": services,
-        "allowedNfTypes": nf_allowed,
-        "heartBeatTimer": 10
-    })
+    nextgcore_sbi::nf_addressing::classify_profile_host(
+        serde_json::json!({
+            "nfInstanceId": nf_instance_id,
+            "nfType": "UDR",
+            "nfStatus": "REGISTERED",
+            "ipv4Addresses": [sbi_addr],
+            "nfServices": services,
+            "allowedNfTypes": nf_allowed,
+            "heartBeatTimer": 10
+        }),
+        sbi_addr,
+    )
 }
 
 /// Register UDR with NRF.
@@ -7063,6 +7066,24 @@ mod shipped_config_tests {
         // and sets NEXTGCORE_HELM_REQUIRED, so this is never skipped there).
         if let Some(text) = nextgcore_core::helm_render::helm_rendered_config(&root, "udr.yaml") {
             serde_yaml::from_str::<super::UdrYaml>(&text).expect("Helm udr.yaml");
+        }
+    }
+}
+
+/// #1324: the NFProfile carries its host where its type belongs (TS 29.510
+/// §6.1.6.2.2): IPv4 in ipv4Addresses, IPv6 in ipv6Addresses, an FQDN as fqdn, and
+/// the service ipEndPoints likewise.
+#[cfg(test)]
+mod tests_nf_profile_host_kind_1324 {
+    use super::*;
+
+    #[test]
+    fn the_nf_profile_carries_its_host_by_type() {
+        for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
+            let profile = build_udr_nf_profile("id", host, 7777);
+            let problems =
+                nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
+            assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
         }
     }
 }

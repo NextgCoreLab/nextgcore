@@ -257,25 +257,17 @@ fn event_exposure_endpoint(profile: &serde_json::Value) -> Option<(String, Strin
         .get("scheme")
         .and_then(|s| s.as_str())
         .unwrap_or("http");
-    if let Some(ep) = service
-        .get("ipEndPoints")
-        .and_then(|v| v.as_array())
-        .and_then(|a| a.first())
-    {
-        let addr = ep
-            .get("ipv4Address")
-            .and_then(|v| v.as_str())
-            .or_else(|| ep.get("fqdn").and_then(|v| v.as_str()))?;
-        let port = ep.get("port").and_then(|v| v.as_u64()).unwrap_or(80);
-        return Some((format!("{scheme}://{addr}:{port}"), service_name));
-    }
-    let addr = profile
-        .get("ipv4Addresses")
-        .and_then(|v| v.as_array())
-        .and_then(|a| a.first())
-        .and_then(|v| v.as_str())
-        .or_else(|| profile.get("fqdn").and_then(|v| v.as_str()))?;
-    Some((format!("{scheme}://{addr}:80"), service_name))
+    // #1324: the endpoint's IPv4 or IPv6 address, else the service's or the NF's
+    // (IPv4, IPv6, FQDN); an IPv6 host is bracketed in the URI.
+    let addr = nextgcore_sbi::nf_addressing::service_host(profile, Some(service))?;
+    let port = nextgcore_sbi::nf_addressing::service_port(Some(service)).unwrap_or(80);
+    Some((
+        format!(
+            "{scheme}://{}",
+            nextgcore_sbi::uri_encode::uri_authority(&addr, port)
+        ),
+        service_name,
+    ))
 }
 
 /// POST the subscription to the producer's event-exposure service. Returns the
@@ -412,5 +404,26 @@ mod tests {
         )
         .await;
         assert_eq!(outcome, CoordinationOutcome::Disabled);
+    }
+}
+
+/// #1324 review: producer to consumer. A peer profile built with an IPv4, IPv6 or
+/// FQDN host (as this codebase's producers build them) resolves to that host.
+#[cfg(test)]
+mod tests_peer_host_kind_1324 {
+    use super::*;
+    use nextgcore_sbi::nf_addressing::{dialled_host, sample_search_result, SAMPLE_HOSTS};
+
+    #[test]
+    fn a_peer_at_any_host_type_is_resolved() {
+        for host in SAMPLE_HOSTS {
+            let r = sample_search_result("NWDAF", "nnwdaf-eventssubscription", host, 7799);
+            let (uri, _) = event_exposure_endpoint(&r["nfInstances"][0]).expect("an endpoint");
+            let want = format!(
+                "http://{}",
+                nextgcore_sbi::uri_encode::uri_authority(&dialled_host(host), 7799)
+            );
+            assert_eq!(uri, want);
+        }
     }
 }
