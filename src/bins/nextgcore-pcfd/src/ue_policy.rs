@@ -49,7 +49,7 @@ pub enum TrafficDescriptorComponent {
 }
 
 /// Traffic Descriptor: a set of components (AND-logic within, OR across TDs per URSP rule)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TrafficDescriptor {
     pub components: Vec<TrafficDescriptorComponent>,
 }
@@ -81,7 +81,7 @@ pub enum RouteSelectionPduType {
 }
 
 /// Route Selection Descriptor (RSD) — specifies which PDU session to use
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RouteSelectionDescriptor {
     /// Route selection descriptor precedence (lower = higher priority)
     pub precedence: u8,
@@ -131,7 +131,7 @@ impl RouteSelectionDescriptor {
 }
 
 /// URSP Rule: maps traffic descriptors to route selection descriptors
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct UrspRule {
     /// Rule precedence (lower = higher priority, evaluated first)
     pub precedence: u8,
@@ -431,6 +431,14 @@ pub fn ue_policy_add(supi: &str, notification_uri: &str, supp_feat: &str) -> UeP
         m.insert(assoc.pol_asso_id.clone(), assoc.clone());
     }
     assoc
+}
+/// Every UE-policy association of `supi` (#1261): a PCF-initiated change of the
+/// UE's policy data re-evaluates each of them (TS 29.513 §5.6.2.2.2 step 1).
+pub fn ue_policy_find_by_supi(supi: &str) -> Vec<UePolicyAssociation> {
+    ue_policy_store()
+        .lock()
+        .map(|m| m.values().filter(|a| a.supi == supi).cloned().collect())
+        .unwrap_or_default()
 }
 pub fn ue_policy_find(pol_asso_id: &str) -> Option<UePolicyAssociation> {
     ue_policy_store().lock().ok()?.get(pol_asso_id).cloned()

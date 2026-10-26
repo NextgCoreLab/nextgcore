@@ -13,6 +13,14 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 ## [Unreleased]
 
 ### Changed
+- pcfd now acts on a change of the UE's policy data at the UDR (the policy-data notification
+  it already subscribes to) for the UE's AM and UE policy associations, not only its SM
+  sessions (TS 29.513 §5.1.2.2, §5.6.2.2.2). A changed AM policy is pushed to the AMF with
+  Npcf_AMPolicyControl_UpdateNotify, `POST {notificationUri}/update`, whose PolicyUpdate carries
+  only the changed `rfsp`/`servAreaRes` (TS 29.507 §4.2.4.2, §4.2.3.3). `ueAmbr` is not sent:
+  this PCF does not negotiate UE-AMBR_Authorization. A changed URSP is delivered to the UE as a
+  new MANAGE UE POLICY COMMAND over N1N2. Nothing is sent when nothing changed, or when the UDR
+  read fails. Before, nothing in pcfd sent a PCF-initiated AM or UE policy change (#1261).
 - smfd's EBI assignment request (`Namf_Communication_EBIAssignment`) now gives the default flow's
   ARP as NOT_PREEMPT / NOT_PREEMPTABLE, the same ARP the N2 default QoS flow carries. Before, it
   said PREEMPTABLE, so the AMF could revoke the EBI for a higher-priority request that the RAN
