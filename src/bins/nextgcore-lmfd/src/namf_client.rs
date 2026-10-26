@@ -274,31 +274,13 @@ fn instance_endpoint(nf: &Value) -> Option<DiscoveredAmf> {
             .and_then(Value::as_str)
             .unwrap_or("http")
             .to_string();
-        // Prefer the service ipEndPoints; fall back to instance ipv4Addresses.
-        if let Some(ep) = svc
-            .get("ipEndPoints")
-            .and_then(Value::as_array)
-            .and_then(|a| a.first())
-        {
-            if let Some(host) = ep.get("ipv4Address").and_then(Value::as_str) {
-                let port = ep.get("port").and_then(Value::as_u64).unwrap_or(80) as u16;
-                return Some(DiscoveredAmf {
-                    host: host.to_string(),
-                    port,
-                    scheme,
-                    nf_instance_id,
-                });
-            }
-        }
-        if let Some(host) = nf
-            .get("ipv4Addresses")
-            .and_then(Value::as_array)
-            .and_then(|a| a.first())
-            .and_then(Value::as_str)
-        {
+        // #1324: the endpoint's IPv4 or IPv6 address, else the service's or the
+        // AMF's (IPv4, IPv6, FQDN).
+        if let Some(host) = nextgcore_sbi::nf_addressing::service_host(nf, Some(svc)) {
+            let port = nextgcore_sbi::nf_addressing::service_port(Some(svc)).unwrap_or(80);
             return Some(DiscoveredAmf {
-                host: host.to_string(),
-                port: 80,
+                host,
+                port,
                 scheme,
                 nf_instance_id,
             });
@@ -896,5 +878,22 @@ mod tests {
             send_n2_nrppa_transfer(&amf, "imsi-001010010870102", "c", "lmf", vec![0x00]).await,
             TransferOutcome::UeNotReachable
         ));
+    }
+}
+
+/// #1324 review: producer to consumer. A peer profile built with an IPv4, IPv6 or
+/// FQDN host (as this codebase's producers build them) resolves to that host.
+#[cfg(test)]
+mod tests_peer_host_kind_1324 {
+    use super::*;
+    use nextgcore_sbi::nf_addressing::{dialled_host, sample_search_result, SAMPLE_HOSTS};
+
+    #[test]
+    fn a_peer_at_any_host_type_is_resolved() {
+        for host in SAMPLE_HOSTS {
+            let r = sample_search_result("AMF", "namf-comm", host, 7796);
+            let amf = instance_endpoint(&r["nfInstances"][0]).expect("an AMF");
+            assert_eq!((amf.host, amf.port), (dialled_host(host), 7796));
+        }
     }
 }

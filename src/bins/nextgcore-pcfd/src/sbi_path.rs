@@ -86,10 +86,12 @@ fn build_pcf_nf_instance(config: &SbiServerConfig) -> NfInstance {
         .filter(|a| !a.is_empty())
         .into_iter()
         .collect();
-    // #1324: in the address of its type (IPv4, IPv6 or FQDN).
-    for a in &addrs {
-        nextgcore_sbi::nf_addressing::set_instance_host(&mut nf_instance, a);
-    }
+    // #1324: each in the address of its type (IPv4, IPv6 or FQDN), the lists set
+    // once from all of them.
+    nextgcore_sbi::nf_addressing::set_instance_hosts(
+        &mut nf_instance,
+        addrs.iter().map(String::as_str),
+    );
     nf_instance.heartbeat_interval = 10;
 
     let scheme = if config.tls_enabled {
@@ -101,9 +103,7 @@ fn build_pcf_nf_instance(config: &SbiServerConfig) -> NfInstance {
     for (service_type, _allowed) in PCF_SERVICES {
         let mut svc = NfService::new(service_type.to_name(), *service_type);
         svc.scheme = scheme;
-        for a in &addrs {
-            nextgcore_sbi::nf_addressing::set_service_host(&mut svc, a);
-        }
+        nextgcore_sbi::nf_addressing::set_service_hosts(&mut svc, addrs.iter().map(String::as_str));
         svc.port = config.port;
         nf_instance.add_service(svc);
     }
@@ -1124,33 +1124,11 @@ fn parse_instance_endpoint(
             .and_then(|v| v.as_str())
             .unwrap_or("http")
             .to_string();
-        // Prefer the service ipEndPoints; only when the matching service
-        // carries no endpoint fall back to the instance-level ipv4Addresses.
-        if let Some(ep) = svc
-            .get("ipEndPoints")
-            .and_then(|v| v.as_array())
-            .and_then(|a| a.first())
-        {
-            if let Some(host) = ep.get("ipv4Address").and_then(|v| v.as_str()) {
-                let port = ep.get("port").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
-                return Some(DiscoveredEndpoint {
-                    host: host.to_string(),
-                    port,
-                    scheme,
-                });
-            }
-        }
-        if let Some(host) = nf
-            .get("ipv4Addresses")
-            .and_then(|v| v.as_array())
-            .and_then(|a| a.first())
-            .and_then(|v| v.as_str())
-        {
-            return Some(DiscoveredEndpoint {
-                host: host.to_string(),
-                port: 80,
-                scheme,
-            });
+        // #1324: the service's endpoint address (IPv4 or IPv6), else the service's
+        // or the NF's (IPv4, IPv6, FQDN), on the endpoint port.
+        if let Some(host) = nextgcore_sbi::nf_addressing::service_host(nf, Some(svc)) {
+            let port = nextgcore_sbi::nf_addressing::service_port(Some(svc)).unwrap_or(80);
+            return Some(DiscoveredEndpoint { host, port, scheme });
         }
     }
     None
@@ -2371,12 +2349,18 @@ pub fn build_pcf_binding_body_with(
     }
     match self_info {
         Some(info) => {
-            // TS 29.510 IpEndPoint: ipv4Address + transport + port.
-            b["pcfIpEndPoints"] = serde_json::json!([{
-                "ipv4Address": info.sbi_addr,
-                "transport": "TCP",
-                "port": info.sbi_port,
-            }]);
+            // TS 29.510 IpEndPoint: ipv4Address or ipv6Address + transport + port
+            // (#1324). An FQDN advertise host is no IP: it goes in pcfFqdn, which
+            // TS 29.521 §5.3.2 accepts in place of pcfIpEndPoints.
+            match nextgcore_sbi::nf_addressing::tcp_ip_end_point(&info.sbi_addr, info.sbi_port) {
+                Some(ep) => b["pcfIpEndPoints"] = serde_json::json!([ep]),
+                None if info.fqdn.is_none() => {
+                    b["pcfFqdn"] = serde_json::json!(nextgcore_sbi::nf_addressing::dialled_host(
+                        &info.sbi_addr
+                    ))
+                }
+                None => {}
+            }
             if let Some(fqdn) = &info.fqdn {
                 b["pcfFqdn"] = serde_json::json!(fqdn);
             }
@@ -3188,6 +3172,23 @@ mod tests_nf_profile_host_kind_1324 {
             let problems =
                 nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
             assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
+        }
+    }
+}
+
+/// #1324 review: producer to consumer. A peer profile built with an IPv4, IPv6 or
+/// FQDN host (as this codebase's producers build them) resolves to that host.
+#[cfg(test)]
+mod tests_peer_host_kind_1324 {
+    use super::*;
+    use nextgcore_sbi::nf_addressing::{dialled_host, sample_search_result, SAMPLE_HOSTS};
+
+    #[test]
+    fn a_peer_at_any_host_type_is_resolved() {
+        for host in SAMPLE_HOSTS {
+            let r = sample_search_result("AMF", "namf-comm", host, 7798);
+            let ep = parse_instance_endpoint(&r["nfInstances"][0], "namf-comm").expect("an AMF");
+            assert_eq!((ep.host, ep.port), (dialled_host(host), 7798));
         }
     }
 }

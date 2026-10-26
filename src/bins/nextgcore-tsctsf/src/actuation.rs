@@ -454,12 +454,19 @@ pub async fn resolve_pcf_endpoint() -> Option<PcfEndpoint> {
     }
     let body: serde_json::Value = serde_json::from_str(resp.http.content.as_deref()?).ok()?;
     let inst = body.get("nfInstances")?.as_array()?.first()?;
-    let host = inst
-        .get("ipv4Addresses")
-        .and_then(|a| a.as_array())
-        .and_then(|a| a.first())
-        .and_then(|v| v.as_str())?
-        .to_string();
+    // #1324: the policyauthorization endpoint's address (IPv4 or IPv6), else the
+    // PCF's (IPv4, IPv6, FQDN).
+    let host = nextgcore_sbi::nf_addressing::service_host(
+        inst,
+        inst.get("nfServices")
+            .and_then(|s| s.as_array())
+            .and_then(|svcs| {
+                svcs.iter().find(|s| {
+                    s.get("serviceName").and_then(|n| n.as_str())
+                        == Some("npcf-policyauthorization")
+                })
+            }),
+    )?;
     let port = inst
         .get("nfServices")
         .and_then(|s| s.as_array())

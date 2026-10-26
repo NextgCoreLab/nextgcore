@@ -2155,34 +2155,10 @@ fn udm_service_endpoint_from_search_result(
             if svc.get("serviceName").and_then(|v| v.as_str()) != Some(service) {
                 continue;
             }
-            let endpoint = svc.get("ipEndPoints").and_then(|v| v.as_array());
-            let (host, port) = match endpoint.and_then(|eps| eps.first()) {
-                Some(ep) => {
-                    let host = ep
-                        .get("ipv4Address")
-                        .and_then(|v| v.as_str())
-                        .map(String::from)
-                        .or_else(|| {
-                            instance
-                                .get("ipv4Addresses")?
-                                .as_array()?
-                                .first()?
-                                .as_str()
-                                .map(String::from)
-                        })?;
-                    let port = ep.get("port").and_then(|v| v.as_u64()).unwrap_or(7777) as u16;
-                    (host, port)
-                }
-                None => {
-                    let host = instance
-                        .get("ipv4Addresses")?
-                        .as_array()?
-                        .first()?
-                        .as_str()?
-                        .to_string();
-                    (host, 7777)
-                }
-            };
+            // #1324: the endpoint's IPv4 or IPv6 address, else the service's or
+            // the UDM's (IPv4, IPv6, FQDN).
+            let host = nextgcore_sbi::nf_addressing::service_host(instance, Some(svc))?;
+            let port = nextgcore_sbi::nf_addressing::service_port(Some(svc)).unwrap_or(7777);
             return Some((host, port));
         }
     }
@@ -25327,6 +25303,25 @@ mod tests_nf_profile_host_kind_1324 {
             let problems =
                 nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
             assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
+        }
+    }
+}
+
+/// #1324 review: producer to consumer. A peer profile built with an IPv4, IPv6 or
+/// FQDN host (as this codebase's producers build them) resolves to that host.
+#[cfg(test)]
+mod tests_peer_host_kind_1324 {
+    use super::*;
+    use nextgcore_sbi::nf_addressing::{dialled_host, sample_search_result, SAMPLE_HOSTS};
+
+    #[test]
+    fn a_peer_at_any_host_type_is_resolved() {
+        for host in SAMPLE_HOSTS {
+            let r = sample_search_result("UDM", "nudm-sdm", host, 7793);
+            assert_eq!(
+                udm_service_endpoint_from_search_result(&r, "nudm-sdm"),
+                Some((dialled_host(host), 7793))
+            );
         }
     }
 }

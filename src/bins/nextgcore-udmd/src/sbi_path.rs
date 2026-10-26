@@ -278,13 +278,8 @@ pub async fn udm_nrf_discover(
                 .to_string();
             let mut instance = NfInstance::new(&id, target_nf_type);
 
-            if let Some(addrs) = nf_json.get("ipv4Addresses").and_then(|v| v.as_array()) {
-                for addr in addrs {
-                    if let Some(s) = addr.as_str() {
-                        instance.ipv4_addresses.push(s.to_string());
-                    }
-                }
-            }
+            // #1324: IPv4, IPv6 and FQDN alike.
+            nextgcore_sbi::nf_addressing::read_instance_addresses(&mut instance, nf_json);
 
             // Cache discovered instance in SBI context, bounded by validityPeriod
             sbi_ctx
@@ -348,9 +343,8 @@ pub async fn udm_sbi_send_request(
         .ok_or_else(|| format!("NF instance not found: {nf_instance_id}"))?;
 
     let host = nf_instance
-        .ipv4_addresses
-        .first()
-        .ok_or_else(|| format!("NF instance {nf_instance_id} has no IPv4 address"))?;
+        .host()
+        .ok_or_else(|| format!("NF instance {nf_instance_id} has no address"))?;
 
     // Determine port from first service or default
     let port = nf_instance.services.first().map(|s| s.port).unwrap_or(80);
@@ -418,11 +412,7 @@ pub async fn udm_sbi_discover_and_send_nudr_dr(
     let (host_str, port);
     if let Some(udr) = udr_instances.first() {
         selected_instance_id = Some(udr.id.clone());
-        host_str = udr
-            .ipv4_addresses
-            .first()
-            .ok_or("UDR has no IPv4 address")?
-            .clone();
+        host_str = udr.host().ok_or("UDR has no address")?.clone();
         port = udr
             .find_service(SbiServiceType::NudrDr)
             .map(|s| s.port)
@@ -700,10 +690,7 @@ pub async fn udm_amf_send_mt_ue_context_info(
     let sbi_ctx = global_context();
     let amf_instances = sbi_ctx.find_nf_instances_by_type(NfType::Amf).await;
     if let Some(amf) = amf_instances.first() {
-        let host = amf
-            .ipv4_addresses
-            .first()
-            .ok_or("AMF instance has no IPv4 address")?;
+        let host = amf.host().ok_or("AMF instance has no address")?;
         let port = amf.services.first().map(|s| s.port).unwrap_or(80);
         let client = sbi_ctx.get_client(host, port).await;
         return client
@@ -839,10 +826,7 @@ pub async fn udm_ausf_send_sor_protect(
     // 2. Any cached AUSF instance discovered via NRF.
     let ausf_instances = sbi_ctx.find_nf_instances_by_type(NfType::Ausf).await;
     if let Some(ausf) = ausf_instances.first() {
-        let host = ausf
-            .ipv4_addresses
-            .first()
-            .ok_or("AUSF instance has no IPv4 address")?;
+        let host = ausf.host().ok_or("AUSF instance has no address")?;
         let port = ausf.services.first().map(|s| s.port).unwrap_or(80);
         let client = sbi_ctx.get_client(host, port).await;
         return client
@@ -901,10 +885,7 @@ pub async fn udm_ausf_send_upu_protect(
     // 2. Any cached AUSF instance discovered via NRF.
     let ausf_instances = sbi_ctx.find_nf_instances_by_type(NfType::Ausf).await;
     if let Some(ausf) = ausf_instances.first() {
-        let host = ausf
-            .ipv4_addresses
-            .first()
-            .ok_or("AUSF instance has no IPv4 address")?;
+        let host = ausf.host().ok_or("AUSF instance has no address")?;
         let port = ausf.services.first().map(|s| s.port).unwrap_or(80);
         let client = sbi_ctx.get_client(host, port).await;
         return client

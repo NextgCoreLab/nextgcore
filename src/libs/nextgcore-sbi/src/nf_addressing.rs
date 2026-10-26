@@ -134,6 +134,205 @@ pub fn set_service_host(service: &mut NfService, host: &str) {
     }
 }
 
+/// The address of one IpEndPoint (TS 29.510 §6.1.6.2.6): its `ipv4Address`, else its
+/// `ipv6Address` (unbracketed). `None` for a port-only endpoint.
+pub fn endpoint_host(ep: &Value) -> Option<String> {
+    ep.get("ipv4Address")
+        .and_then(Value::as_str)
+        .or_else(|| ep.get("ipv6Address").and_then(Value::as_str))
+        .filter(|h| !h.is_empty())
+        .map(str::to_string)
+}
+
+/// A peer NFProfile's own host (TS 29.510 §6.1.6.2.2): `ipv4Addresses[0]`, else
+/// `ipv6Addresses[0]`, else `fqdn`.
+pub fn profile_host(profile: &Value) -> Option<String> {
+    let first = |key: &str| {
+        profile
+            .get(key)
+            .and_then(Value::as_array)
+            .and_then(|a| a.iter().find_map(Value::as_str))
+            .filter(|h| !h.is_empty())
+            .map(str::to_string)
+    };
+    first("ipv4Addresses")
+        .or_else(|| first("ipv6Addresses"))
+        .or_else(|| {
+            profile
+                .get("fqdn")
+                .and_then(Value::as_str)
+                .filter(|h| !h.is_empty())
+                .map(str::to_string)
+        })
+}
+
+/// The host to dial for `service` of the peer `profile` (TS 29.510 §6.1.6.2.3:
+/// the service's endpoints, then its FQDN, then the NF's): the first `ipEndPoints`
+/// entry with an address, else the service `fqdn`, else [`profile_host`].
+pub fn service_host(profile: &Value, service: Option<&Value>) -> Option<String> {
+    service
+        .and_then(|s| s.get("ipEndPoints"))
+        .and_then(Value::as_array)
+        .and_then(|eps| eps.iter().find_map(endpoint_host))
+        .or_else(|| {
+            service
+                .and_then(|s| s.get("fqdn"))
+                .and_then(Value::as_str)
+                .filter(|h| !h.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| profile_host(profile))
+}
+
+/// The port of `service`'s first `ipEndPoints` entry that has one.
+pub fn service_port(service: Option<&Value>) -> Option<u16> {
+    service
+        .and_then(|s| s.get("ipEndPoints"))
+        .and_then(Value::as_array)
+        .and_then(|eps| {
+            eps.iter()
+                .find_map(|e| e.get("port").and_then(Value::as_u64))
+        })
+        .and_then(|p| u16::try_from(p).ok())
+}
+
+/// Copy a peer profile's `fqdn`, `ipv4Addresses` and `ipv6Addresses` into `instance`.
+pub fn read_instance_addresses(instance: &mut NfInstance, profile: &Value) {
+    let list = |key: &str| -> Vec<String> {
+        profile
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    instance.ipv4_addresses = list("ipv4Addresses");
+    instance.ipv6_addresses = list("ipv6Addresses");
+    if let Some(fqdn) = profile.get("fqdn").and_then(Value::as_str) {
+        instance.fqdn = Some(fqdn.to_string());
+    }
+}
+
+/// Copy a peer NFService's first endpoint (its address of either type, and port)
+/// and its `fqdn` into `service`.
+pub fn read_service_addresses(service: &mut NfService, json: &Value) {
+    if let Some(host) = json
+        .get("ipEndPoints")
+        .and_then(Value::as_array)
+        .and_then(|eps| eps.iter().find_map(endpoint_host))
+    {
+        service.ip_addresses.push(host);
+    }
+    if let Some(port) = service_port(Some(json)) {
+        service.port = port;
+    }
+    if let Some(fqdn) = json.get("fqdn").and_then(Value::as_str) {
+        service.fqdn = Some(fqdn.to_string());
+    }
+}
+
+/// Put every one of `hosts` in the self instance's address of its type, the
+/// lists set once (#1324 review: not one host clearing another).
+pub fn set_instance_hosts<'a>(instance: &mut NfInstance, hosts: impl IntoIterator<Item = &'a str>) {
+    instance.ipv4_addresses.clear();
+    instance.ipv6_addresses.clear();
+    for host in hosts {
+        match classify_host(host) {
+            HostKind::Ipv4(a) => instance.ipv4_addresses.push(a.to_string()),
+            HostKind::Ipv6(a) => instance.ipv6_addresses.push(a.to_string()),
+            HostKind::Fqdn(name) => {
+                instance.fqdn.get_or_insert(name);
+            }
+        }
+    }
+}
+
+/// Put every one of `hosts` in a self service's addresses, set once.
+pub fn set_service_hosts<'a>(service: &mut NfService, hosts: impl IntoIterator<Item = &'a str>) {
+    service.ip_addresses.clear();
+    for host in hosts {
+        match classify_host(host) {
+            HostKind::Ipv4(a) => service.ip_addresses.push(a.to_string()),
+            HostKind::Ipv6(a) => service.ip_addresses.push(a.to_string()),
+            HostKind::Fqdn(name) => {
+                service.fqdn.get_or_insert(name);
+            }
+        }
+    }
+}
+
+/// An IpEndPoint (TS 29.510 §6.1.6.2.6) for `host`:`port` over TCP, or `None` for
+/// an FQDN host, whose address is not an IP (a consumer reaches it by the FQDN).
+pub fn tcp_ip_end_point(host: &str, port: u16) -> Option<Value> {
+    let mut ep = ip_end_point(host, port);
+    ep.get("ipv4Address").or_else(|| ep.get("ipv6Address"))?;
+    ep["transport"] = Value::String("TCP".into());
+    Some(ep)
+}
+
+/// The InterfaceUpfInfoItem endpoint members (TS 29.510 §6.1.6.2.12) for `addr`:
+/// `ipv4EndpointAddresses`, `ipv6EndpointAddresses` (unbracketed) or `endpointFqdn`.
+pub fn interface_upf_endpoint(addr: &str) -> serde_json::Map<String, Value> {
+    let mut m = serde_json::Map::new();
+    match classify_host(addr) {
+        HostKind::Ipv4(a) => {
+            m.insert(
+                "ipv4EndpointAddresses".into(),
+                serde_json::json!([a.to_string()]),
+            );
+        }
+        HostKind::Ipv6(a) => {
+            m.insert(
+                "ipv6EndpointAddresses".into(),
+                serde_json::json!([a.to_string()]),
+            );
+        }
+        HostKind::Fqdn(name) => {
+            m.insert("endpointFqdn".into(), Value::String(name));
+        }
+    }
+    m
+}
+
+/// A sample NRF discovery result (TS 29.510 §6.2.3.2.3.1 SearchResult) holding one
+/// `nf_type` instance at `host` with `service_name` on `port`, built the way this
+/// codebase's producers build profiles. For the consumers' round-trip tests (#1324).
+pub fn sample_search_result(nf_type: &str, service_name: &str, host: &str, port: u16) -> Value {
+    serde_json::json!({
+        "nfInstances": [classify_profile_host(
+            serde_json::json!({
+                "nfInstanceId": format!("{}-1324", nf_type.to_ascii_lowercase()),
+                "nfType": nf_type,
+                "nfStatus": "REGISTERED",
+                "ipv4Addresses": [host],
+                "nfServices": [{
+                    "serviceInstanceId": service_name,
+                    "serviceName": service_name,
+                    "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+                    "scheme": "http",
+                    "nfServiceStatus": "REGISTERED",
+                    "ipEndPoints": [{"ipv4Address": host, "port": port}]
+                }]
+            }),
+            host,
+        )]
+    })
+}
+
+/// The host a consumer is expected to dial for `host` once it went through a
+/// profile: the literal without brackets, or the FQDN as classified.
+pub fn dialled_host(host: &str) -> String {
+    match classify_host(host) {
+        HostKind::Ipv4(a) => a.to_string(),
+        HostKind::Ipv6(a) => a.to_string(),
+        HostKind::Fqdn(name) => name,
+    }
+}
+
 /// Hosts of each type, for the NF crates' profile tests (#1324).
 pub const SAMPLE_HOSTS: [&str; 4] = ["10.0.0.1", "fd00::1", "[fd00::2]", "nf.example.org"];
 
@@ -170,8 +369,12 @@ fn scan(v: &Value, path: &str, problems: &mut Vec<String>) {
             for (k, child) in map {
                 let here = format!("{path}/{k}");
                 let check = |s: &str| match k.as_str() {
-                    "ipv4Address" | "ipv4Addresses" => s.parse::<Ipv4Addr>().is_ok(),
-                    "ipv6Address" | "ipv6Addresses" => s.parse::<Ipv6Addr>().is_ok(),
+                    "ipv4Address" | "ipv4Addresses" | "ipv4EndpointAddresses" => {
+                        s.parse::<Ipv4Addr>().is_ok()
+                    }
+                    "ipv6Address" | "ipv6Addresses" | "ipv6EndpointAddresses" => {
+                        s.parse::<Ipv6Addr>().is_ok()
+                    }
                     _ => true,
                 };
                 let bad: Vec<&str> = match child {
@@ -225,6 +428,67 @@ mod tests {
                 "{host}"
             );
         }
+    }
+
+    /// Producer to consumer: what a profile is built with is what a consumer dials.
+    #[test]
+    fn a_classified_profile_reads_back_to_its_host() {
+        for host in SAMPLE_HOSTS {
+            let result = sample_search_result("UDM", "nudm-sdm", host, 7790);
+            let p = &result["nfInstances"][0];
+            let svc = &p["nfServices"][0];
+            let want = dialled_host(host);
+            assert_eq!(
+                service_host(p, Some(svc)).as_deref(),
+                Some(want.as_str()),
+                "{host}"
+            );
+            assert_eq!(service_port(Some(svc)), Some(7790));
+            assert_eq!(profile_host(p).as_deref(), Some(want.as_str()), "{host}");
+            let mut i = NfInstance::new("x", crate::types::NfType::Udm);
+            read_instance_addresses(&mut i, p);
+            let mut s = NfService::new("nudm-sdm", crate::types::SbiServiceType::NudmSdm);
+            read_service_addresses(&mut s, svc);
+            i.add_service(s);
+            assert_eq!(
+                i.endpoint_for(crate::types::SbiServiceType::NudmSdm),
+                Some((want.clone(), 7790)),
+                "{host}"
+            );
+        }
+    }
+
+    #[test]
+    fn upf_interface_and_tcp_endpoints_by_type() {
+        assert_eq!(
+            Value::Object(interface_upf_endpoint("10.0.0.6")),
+            json!({"ipv4EndpointAddresses": ["10.0.0.6"]})
+        );
+        assert_eq!(
+            Value::Object(interface_upf_endpoint("[fd00::6]")),
+            json!({"ipv6EndpointAddresses": ["fd00::6"]})
+        );
+        assert_eq!(
+            Value::Object(interface_upf_endpoint("upf.example")),
+            json!({"endpointFqdn": "upf.example"})
+        );
+        assert_eq!(
+            tcp_ip_end_point("fd00::7", 7777),
+            Some(json!({"ipv6Address": "fd00::7", "port": 7777, "transport": "TCP"}))
+        );
+        assert_eq!(tcp_ip_end_point("pcf.example", 7777), None);
+        let mut s = NfService::new("n", crate::types::SbiServiceType::NpcfSmpolicycontrol);
+        set_service_hosts(&mut s, ["10.0.0.1", "fd00::1"]);
+        assert_eq!(s.ip_addresses, vec!["10.0.0.1", "fd00::1"]);
+    }
+
+    #[test]
+    fn set_instance_hosts_keeps_every_host() {
+        let mut i = NfInstance::new("x", crate::types::NfType::Pcf);
+        set_instance_hosts(&mut i, ["10.0.0.1", "fd00::1", "10.0.0.2", "pcf.example"]);
+        assert_eq!(i.ipv4_addresses, vec!["10.0.0.1", "10.0.0.2"]);
+        assert_eq!(i.ipv6_addresses, vec!["fd00::1"]);
+        assert_eq!(i.fqdn.as_deref(), Some("pcf.example"));
     }
 
     #[test]

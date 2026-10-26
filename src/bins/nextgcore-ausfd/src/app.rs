@@ -1611,6 +1611,7 @@ async fn send_udm_generate_auth_data(
             .or(udm_instance.fqdn.clone())
             .or(udm_service.ip_addresses.first().cloned())
             .or(udm_instance.ipv4_addresses.first().cloned())
+            .or(udm_instance.ipv6_addresses.first().cloned())
             .ok_or("No UDM endpoint address available")?;
         port = udm_service.port;
     } else {
@@ -1776,6 +1777,7 @@ async fn send_udm_auth_result(
         .or(udm_instance.fqdn.as_deref())
         .or(udm_service.ip_addresses.first().map(|s| s.as_str()))
         .or(udm_instance.ipv4_addresses.first().map(|s| s.as_str()))
+        .or(udm_instance.ipv6_addresses.first().map(|s| s.as_str()))
         .ok_or("No UDM endpoint address available")?;
     let port = udm_service.port;
 
@@ -2047,15 +2049,8 @@ async fn discover_nf_from_nrf(target_nf_type: &str, service_name: &str) -> Resul
 
             let mut instance = nextgcore_sbi::context::NfInstance::new(nf_id, nf_type);
 
-            if let Some(fqdn) = nf_json.get("fqdn").and_then(|v| v.as_str()) {
-                instance.fqdn = Some(fqdn.to_string());
-            }
-            if let Some(addrs) = nf_json.get("ipv4Addresses").and_then(|v| v.as_array()) {
-                instance.ipv4_addresses = addrs
-                    .iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect();
-            }
+            // #1324: IPv4, IPv6 and FQDN alike.
+            nextgcore_sbi::nf_addressing::read_instance_addresses(&mut instance, nf_json);
 
             // Parse services
             if let Some(services) = nf_json.get("nfServices").and_then(|v| v.as_array()) {
@@ -2068,18 +2063,7 @@ async fn discover_nf_from_nrf(target_nf_type: &str, service_name: &str) -> Resul
                         nextgcore_sbi::types::SbiServiceType::from_name(svc_name)
                     {
                         let mut svc = nextgcore_sbi::context::NfService::new(svc_name, svc_type);
-                        if let Some(endpoints) =
-                            svc_json.get("ipEndPoints").and_then(|v| v.as_array())
-                        {
-                            if let Some(ep) = endpoints.first() {
-                                if let Some(addr) = ep.get("ipv4Address").and_then(|v| v.as_str()) {
-                                    svc.ip_addresses.push(addr.to_string());
-                                }
-                                if let Some(port) = ep.get("port").and_then(|v| v.as_u64()) {
-                                    svc.port = port as u16;
-                                }
-                            }
-                        }
+                        nextgcore_sbi::nf_addressing::read_service_addresses(&mut svc, svc_json);
                         instance.add_service(svc);
                     }
                 }

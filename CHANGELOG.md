@@ -58,7 +58,13 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   `ipv4Addresses` and gave the NRF an invalid profile. One helper,
   `nextgcore_sbi::nf_addressing`, serves amfd, ausfd, bsfd, dccfd, easdfd, lmfd, mbsmfd,
   nefd, nrfd, nsacfd, nssfd, nwdafd, pcfd, smfd, tsctsf, ucmfd, udmd, udrd and upfd, and their
-  self NF instances. IPv4 profiles are unchanged.
+  self NF instances. IPv4 profiles are unchanged. The consumers read a peer's address the same
+  way: an endpoint's `ipv4Address` or `ipv6Address`, else the service's or the NF's `fqdn`,
+  `ipv4Addresses` or `ipv6Addresses`. Before, almost all of them read only IPv4, so an IPv6 or
+  FQDN peer could not be resolved (amfd, ausfd, dccfd, lmfd, mbsmfd, nssfd, pcfd, smfd, tsctsf,
+  udmd, and `NfInstance::endpoint_for`). upfd's N3 `interfaceUpfInfoList` entry carries
+  `ipv4EndpointAddresses`, `ipv6EndpointAddresses` or `endpointFqdn` by type, and pcfd's
+  PcfBinding `pcfIpEndPoints` uses `ipv6Address` for an IPv6 host and `pcfFqdn` for an FQDN.
 - **amfd, smfd, nefd and ucmfd refuse to start on a wildcard SBI bind with nothing to
   advertise**, where they put `0.0.0.0` (amfd, nefd, ucmfd), `127.0.0.1` or `::` (smfd) in
   the callback URIs, `Location` / resource URIs and NFProfiles they hand peers (#1322). The

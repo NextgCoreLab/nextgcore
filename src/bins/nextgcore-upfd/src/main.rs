@@ -680,6 +680,13 @@ async fn main() -> Result<()> {
 /// (TS 29.510 §6.1.6.2.10) advertises the N3 (GTP-U) interface endpoint. The
 /// `load` field carries the initial PFCP-session occupancy gauge; it is
 /// refreshed by the heartbeat PATCH (`build_load_patch`, `/load` 0..=100).
+/// The N3 InterfaceUpfInfoItem for `gtpu_addr`, its address by type (#1324).
+fn n3_interface(gtpu_addr: &str) -> serde_json::Value {
+    let mut item = nextgcore_sbi::nf_addressing::interface_upf_endpoint(gtpu_addr);
+    item.insert("interfaceType".into(), "N3".into());
+    serde_json::Value::Object(item)
+}
+
 fn build_upf_nf_profile(
     nf_instance_id: &str,
     pfcp_addr: &str,
@@ -698,10 +705,8 @@ fn build_upf_nf_profile(
                     "sNssai": { "sst": 1 },
                     "dnnUpfInfoList": [{ "dnn": "internet" }]
                 }],
-                "interfaceUpfInfoList": [{
-                    "interfaceType": "N3",
-                    "ipv4EndpointAddresses": [gtpu_addr]
-                }]
+                // #1324: the N3 address by type (TS 29.510 §6.1.6.2.12).
+                "interfaceUpfInfoList": [n3_interface(gtpu_addr)]
             },
             "heartBeatTimer": 10
         }),
@@ -1874,7 +1879,8 @@ mod tests_nf_profile_host_kind_1324 {
     #[test]
     fn the_nf_profile_carries_its_host_by_type() {
         for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
-            let profile = build_upf_nf_profile("id", host, "10.0.0.9", 0);
+            // The N3 address varies too: it is typed the same way.
+            let profile = build_upf_nf_profile("id", host, host, 0);
             let problems =
                 nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
             assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
