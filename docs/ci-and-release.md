@@ -60,7 +60,10 @@ release's images to Docker Hub; see [Docker Hub images](#docker-hub-images).
 - the tag a dispatched `release.yml` run with `dry_run=false` has just created. That tag is
   pushed with `GITHUB_TOKEN`, which starts no workflow, so the same run publishes it.
 
-Nothing is pushed from a PR, a branch, the nightly or a dry run.
+Nothing is pushed from a PR, a branch, the nightly or a dry run. The tagged commit must also be on
+`main` (`publish-gate` checks its ancestry and fails otherwise), so only reviewed code is
+published. Recommended: a tag ruleset (Settings, Rules, Rulesets) that restricts who may create
+or move `[0-9]*` tags, since any writer can otherwise push one.
 
 **Setup.** Repository settings, Secrets and variables, Actions:
 
@@ -90,6 +93,17 @@ pre-release (`X.Y.Z-<pre>`) never moves `latest`. The image names replace the lo
 **First publish.** A pushed image name is public and cannot be cleanly withdrawn, so prove the
 setup first. Point `DOCKERHUB_NAMESPACE` at a private namespace and push a pre-release tag such
 as `0.2.0-rc.1`. Check the images, then set the variable to the public organisation.
+
+No published image carries a credential:
+- The NF images hold only their binary, plus the runtime directories from `Dockerfile.core`.
+  Configs, the home-network keys under `docker/rust/configs/` and TLS material are mounted at
+  run time.
+- The WebUI image refuses to start without a `JWT_SECRET_KEY` of at least 32 characters, and has
+  no default account (`create-admin.js`).
+
+The base images (`debian:bookworm-slim`, `rust:1.95.0-bookworm`, `node:19`) and every action in
+`release.yml` are pinned by digest or commit SHA, with the tag in a comment. To bump a base
+image, run `docker buildx imagetools inspect <tag>` and replace the digest.
 
 nextgsim publishes `nextgsim-nr-gnb`, `nextgsim-nr-ue`, `nextgsim-lte-enb` and
 `nextgsim-lte-ue` from its own `release.yml`, with the same secrets in that repository.

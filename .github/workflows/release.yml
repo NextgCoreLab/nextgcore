@@ -61,7 +61,7 @@ jobs:
       # Full history: the notes are generated from `git log <prev-tag>..<sha>`,
       # and the ancestry check needs the graph. A shallow clone has neither.
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
@@ -69,7 +69,7 @@ jobs:
       # evidence the commit it is about to tag was ever tested against a
       # nextgsim commit, which is the entire premise of a paired release.
       - name: Download the validated-pair manifest
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: validated-pair
           run-id: ${{ inputs.validated_run_id }}
@@ -327,9 +327,11 @@ jobs:
       images: ${{ steps.gate.outputs.images }}
     steps:
       - name: Checkout the version tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: refs/tags/${{ github.event_name == 'push' && github.ref_name || inputs.version }}
+          # The ancestry check below needs main's history.
+          fetch-depth: 0
 
       - name: Decide whether to publish, and what
         id: gate
@@ -349,6 +351,14 @@ jobs:
           fi
           if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
             echo "::error::${VERSION} is not a version tag (x.y.z or x.y.z-pre); refusing to publish."
+            exit 1
+          fi
+          # Only reviewed code is published (#420 review): any writer can push a
+          # tag, so the tagged commit must be reachable from main, which only
+          # reviewed merges reach. A dispatched release's bump commit is on main.
+          git fetch --quiet origin main
+          if ! git merge-base --is-ancestor HEAD FETCH_HEAD; then
+            echo "::error::tag ${VERSION} ($(git rev-parse HEAD)) is not on main; refusing to publish an unreviewed commit."
             exit 1
           fi
           # A pre-release is published under its version only.
@@ -382,13 +392,13 @@ jobs:
       contents: read
     steps:
       - name: Checkout nextgcore at the version tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: refs/tags/${{ needs.publish-gate.outputs.version }}
           path: nextgcore
 
       - name: Checkout nextgsim (sibling tree Dockerfile.builder COPYs)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: NextgCoreLab/nextgsim
           ref: ${{ needs.publish-gate.outputs.nextgsim_sha }}
@@ -427,7 +437,7 @@ jobs:
           ls -la /tmp/release-binaries
 
       - name: Upload the NF binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-binaries
           path: /tmp/release-binaries/
@@ -445,7 +455,7 @@ jobs:
       NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE || secrets.DOCKERHUB_USERNAME }}
       VERSION: ${{ needs.publish-gate.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: refs/tags/${{ needs.publish-gate.outputs.version }}
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -482,12 +492,12 @@ jobs:
       NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE || secrets.DOCKERHUB_USERNAME }}
       VERSION: ${{ needs.publish-gate.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: refs/tags/${{ needs.publish-gate.outputs.version }}
       - name: Download the NF binaries
         if: ${{ matrix.nf_name }}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release-binaries
           path: docker/rust/binaries
