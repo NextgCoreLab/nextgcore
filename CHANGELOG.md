@@ -12,6 +12,19 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 
 ## [Unreleased]
 
+### Added
+- Releases publish their container images to Docker Hub (#420). On a version tag, `release.yml`
+  pushes every image in `docker/release-images.json` as `<namespace>/<image>:<version>`, then
+  moves `latest` once every versioned push has succeeded. The images are `nextgcore-core`, one
+  `nextgcore-<nf>` per daemon (28) and `nextgcore-webui`. nextgsim publishes its gNB, UE, eNB
+  and LTE UE images the same way. Publishing needs the `DOCKERHUB_USERNAME` and
+  `DOCKERHUB_TOKEN` repository secrets, and is skipped with a notice without them. A CI check
+  fails when a daemon, Dockerfile or deployed image is missing from the list. See
+  `docs/ci-and-release.md`, "Docker Hub images".
+- The `docker/webui` image runs on Node 22 LTS (was the end-of-life Node 19) as the `node` user,
+  and no longer downloads the docker-compose-wait binary at build time. Order its start after
+  MongoDB with compose `depends_on` health conditions (#420).
+
 ### Changed
 - mmed binds a configured IPv6 S1-MME address. Before, a bracketed IPv6 `mme.s1ap.server`
   address without a port (`[fd00::5]`) was dropped as unparsable, and the IPv6 server list

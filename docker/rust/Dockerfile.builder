@@ -25,7 +25,7 @@
 # Pin matches the `channel` in nextgcore/src/rust-toolchain.toml and
 # nextgsim/rust-toolchain.toml -- if they diverge, rustup silently downloads
 # the pinned toolchain on every build and this base image's rustc is unused.
-FROM --platform=$BUILDPLATFORM rust:1.95.0-bookworm AS builder
+FROM --platform=$BUILDPLATFORM rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS builder
 
 ARG TARGETPLATFORM
 ARG BUILDPLATFORM
@@ -213,6 +213,6 @@ RUN CARGO_TARGET=$(cat /tmp/cargo_target) && \
     fi
 
 # Final stage: tiny image with only binaries
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
 COPY --from=builder /out/ /out/
 CMD ["/bin/true"]
