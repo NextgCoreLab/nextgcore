@@ -316,9 +316,9 @@ async fn main() -> Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     setup_signal_handlers(shutdown.clone());
 
-    let addr: SocketAddr = format!("{}:{}", args.sbi_addr, args.sbi_port)
-        .parse()
-        .context("Invalid SBI address")?;
+    let addr: SocketAddr =
+        nextgcore_core::sockaddr::parse_listen_addr(&args.sbi_addr, args.sbi_port)
+            .context("Invalid SBI address")?;
 
     let mut sbi_server_config = NextgcoreSbiServerConfig::new(addr);
     if args.tls {
@@ -379,8 +379,8 @@ async fn main() -> Result<()> {
             guard.set_nrf_collector_config(NrfCollectorConfig {
                 nrf_uri: args.nrf_uri.clone(),
                 callback_uri: format!(
-                    "http://{}:{}/nnwdaf-nfstatus-notify/v1/notify",
-                    args.sbi_addr, args.sbi_port
+                    "http://{}/nnwdaf-nfstatus-notify/v1/notify",
+                    nextgcore_sbi::uri_encode::uri_authority(&args.sbi_addr, args.sbi_port)
                 ),
             });
         }
