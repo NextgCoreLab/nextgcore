@@ -244,8 +244,9 @@ pub fn forward_n32f_request(
 
     let scheme = if client.tls_enabled { "https" } else { "http" };
     let forward_uri = format!(
-        "{}://{}:{}/n32f-forward/v1/n32f-process",
-        scheme, client.host, client.port
+        "{}://{}/n32f-forward/v1/n32f-process",
+        scheme,
+        nextgcore_sbi::uri_encode::uri_authority(&client.host, client.port)
     );
 
     // Build the N32f message envelope per TS 29.573

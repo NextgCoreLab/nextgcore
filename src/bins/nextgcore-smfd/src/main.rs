@@ -985,9 +985,9 @@ async fn main() -> Result<()> {
     log::info!("SMF state machine initialized");
 
     // Start SBI HTTP/2 server
-    let sbi_addr: SocketAddr = format!("{}:{}", config.sbi_addr, config.sbi_port)
-        .parse()
-        .context("Invalid SBI address")?;
+    let sbi_addr: SocketAddr =
+        nextgcore_core::sockaddr::parse_listen_addr(&config.sbi_addr, config.sbi_port)
+            .context("Invalid SBI address")?;
     let mut sbi_server_config = NextgcoreSbiServerConfig::new(sbi_addr);
     // Issue #63: resolve the SBI security profile, PRODUCTION by default. The
     // production profile requires OAuth2, so the outbound token client is
@@ -1058,8 +1058,7 @@ async fn main() -> Result<()> {
             .ok()
             .and_then(|p| p.parse().ok())
             .unwrap_or(8805);
-        format!("{addr}:{port}")
-            .parse()
+        nextgcore_core::sockaddr::parse_listen_addr(&addr, port)
             .context("Invalid SMF PFCP listen address")?
     };
     // Issue #20: UPF_PFCP_ADDR accepts a comma-separated peer list

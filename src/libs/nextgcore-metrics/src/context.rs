@@ -229,8 +229,13 @@ impl MetricsContext {
 
             // Create server configs for each address
             for addr in addresses {
-                if let Ok(socket_addr) = format!("{addr}:{port}").parse() {
-                    self.add_server(ServerConfig::new(socket_addr));
+                // #1298: an IPv6 address parses too; a value that is no IP literal is
+                // reported and skipped, as before, never replaced by a wildcard.
+                match nextgcore_core::sockaddr::parse_listen_addr(&addr, port) {
+                    Ok(socket_addr) => {
+                        self.add_server(ServerConfig::new(socket_addr));
+                    }
+                    Err(e) => log::error!("metrics server not started: {e}"),
                 }
             }
         }
