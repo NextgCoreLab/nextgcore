@@ -1286,6 +1286,32 @@ impl PfcpClient {
         seid: Option<u64>,
         body: &[u8],
     ) -> Result<(u8, Vec<u8>), PfcpRequestError> {
+        self.request_on(msg_type, seid, body).await.0
+    }
+
+    /// [`Self::request`], and the association generation the request was last sent on
+    /// (#966 follow-up 2): read as each (re)transmission leaves, so an association set
+    /// up between the caller's decision and the send is the one the answer is about.
+    async fn request_on(
+        &self,
+        msg_type: u8,
+        seid: Option<u64>,
+        body: &[u8],
+    ) -> (Result<(u8, Vec<u8>), PfcpRequestError>, u64) {
+        let mut sent_on = self.assoc.read().await.generation;
+        let result = self
+            .request_sent_on(msg_type, seid, body, &mut sent_on)
+            .await;
+        (result, sent_on)
+    }
+
+    async fn request_sent_on(
+        &self,
+        msg_type: u8,
+        seid: Option<u64>,
+        body: &[u8],
+        sent_on: &mut u64,
+    ) -> Result<(u8, Vec<u8>), PfcpRequestError> {
         let seq = crate::PFCP_SEQ.fetch_add(1, Ordering::Relaxed) & 0x00FF_FFFF;
         let pkt = encode_wire_message(msg_type, seid, seq, body);
         let (t1, n1) = self.retransmit_params(msg_type);
@@ -1309,6 +1335,7 @@ impl PfcpClient {
             let (tx, rx) = oneshot::channel();
             self.pending.lock().await.insert(seq, tx);
 
+            *sent_on = self.assoc.read().await.generation;
             if let Err(e) = self.socket.send_to(&pkt, peer).await {
                 self.pending.lock().await.remove(&seq);
                 break Err(PfcpRequestError::Local(format!("send failed: {e}")));
@@ -1370,8 +1397,8 @@ impl PfcpClient {
         upf_seid: Option<u64>,
         body: &[u8],
     ) -> Result<(u8, Vec<u8>), PfcpRequestError> {
-        let generation = self.assoc.read().await.generation;
-        let result = self.request(msg_type, upf_seid, body).await;
+        // #966 follow-up 2: the generation as the request left, not as this was called.
+        let (result, generation) = self.request_on(msg_type, upf_seid, body).await;
         if let Ok((_, response)) = &result {
             crate::up_path::note_session_request(smf_seid, msg_type, body, response);
             // #966 review M1, TS 29.244 §8.2.1 cause 72 "No established PFCP
@@ -2018,6 +2045,52 @@ pub(crate) static TEARDOWNS_FOR_TEST: std::sync::atomic::AtomicUsize =
 pub(crate) static TEARDOWN_HOLD_FOR_TEST: std::sync::Mutex<
     Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 > = std::sync::Mutex::new(None);
+
+/// An armed [`TEARDOWN_HOLD_FOR_TEST`] (#1239 review). Dropping it, on any exit path
+/// and a failed assertion included, disarms the hold and releases a teardown that
+/// waits in it. A leaked hold would otherwise block every later teardown in the
+/// process, so the suite would hang instead of failing.
+#[cfg(test)]
+pub(crate) struct TeardownHold {
+    pub(crate) reached: Arc<tokio::sync::Notify>,
+    proceed: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+impl TeardownHold {
+    /// Arm the hold: the next teardown signals `reached` and waits for [`Self::release`].
+    pub(crate) fn arm() -> Self {
+        let hold = Self {
+            reached: Arc::new(tokio::sync::Notify::new()),
+            proceed: Arc::new(tokio::sync::Notify::new()),
+        };
+        *TEARDOWN_HOLD_FOR_TEST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) =
+            Some((hold.reached.clone(), hold.proceed.clone()));
+        hold
+    }
+
+    /// Stop holding later teardowns; one already waiting stays held.
+    pub(crate) fn disarm(&self) {
+        *TEARDOWN_HOLD_FOR_TEST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Let the held teardown go on.
+    pub(crate) fn release(&self) {
+        self.proceed.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for TeardownHold {
+    fn drop(&mut self) {
+        self.disarm();
+        self.release();
+    }
+}
 
 /// Where a peer Recovery Time Stamp came from (#928 round 2, B1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4011,6 +4084,70 @@ mod tests {
             "the association set up since is kept"
         );
         assert!(kept, "and its sessions");
+    }
+
+    /// #966 follow-up 2: the generation is the one the request is SENT on. Here the
+    /// association is replaced after `session_request` is called and before its datagram
+    /// leaves; the cause 72 that answers it is about the association set up since, which
+    /// is torn down. Read when `session_request` was called, the generation was the old
+    /// one, and that detection was missed.
+    #[tokio::test]
+    async fn a_cause_72_to_a_request_sent_on_the_new_association_tears_it_down() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _map_guard = N4_TEST_LOCK.lock().await;
+        let (client, upf) = make_client_with_peer().await;
+        let upf = Arc::new(upf);
+        let fake = upf.clone();
+        let answered =
+            tokio::spawn(async move { answer_association_setup_on(&fake, 200, false).await });
+        client.associate().await.expect("association");
+        let _ = answered.await;
+        seed_pfcp_session("96606", 0x966f);
+        let seid = crate::context::derive_cp_n4_seid("96606");
+        record_session_peer(seid, client.peer());
+
+        let fake = upf.clone();
+        let answered = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let (len, from) = fake.recv_from(&mut buf).await.unwrap();
+            let h = parse_wire_header(&buf[..len]).unwrap();
+            let pkt = encode_wire_message(
+                pfcp_message_type::SESSION_MODIFICATION_RESPONSE,
+                Some(0),
+                h.sequence_number,
+                &[0x00, 0x13, 0x00, 0x01, 72],
+            );
+            fake.send_to(&pkt, from).await.unwrap();
+        });
+        // Held so the request is called but cannot leave until the association is
+        // replaced.
+        let pending = client.pending.lock().await;
+        let reassociate = async {
+            client.assoc.write().await.generation += 1;
+            drop(pending);
+        };
+        let (result, ()) = tokio::join!(
+            client.session_request(
+                pfcp_message_type::SESSION_MODIFICATION_REQUEST,
+                seid,
+                Some(0x966f),
+                &[],
+            ),
+            reassociate
+        );
+        let _ = answered.await;
+        drain_restart_fanouts(Duration::from_secs(5)).await;
+        let kept = pfcp_session_present("96606");
+        forget_pfcp_session("96606");
+        forget_session_peer(seid);
+
+        assert!(result.is_ok());
+        assert!(
+            !client.is_associated().await,
+            "the association the request was sent on is torn down"
+        );
+        assert!(!kept, "and its sessions flushed");
     }
 
     /// #966 review m3: the stored stamp goes when the association does (TS 23.007 §19A,

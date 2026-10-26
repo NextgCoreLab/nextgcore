@@ -391,6 +391,30 @@ mod tests {
         assert_eq!(fsm.state, sm::SgwcState::Operational);
     }
 
+    /// #1228: the process's S11 server gives the paging-dependent bearer
+    /// Requests their own T3 (54 s at the default N3); others keep the default.
+    #[test]
+    fn the_s11_server_gives_bearer_requests_their_own_t3() {
+        use nextgcore_gtp::v2::header::Gtp2MessageType as T;
+        let server = gtp_path::open_s11_server("127.0.0.1:0", 1).unwrap();
+        for t in [
+            T::CreateBearerRequest,
+            T::UpdateBearerRequest,
+            T::DeleteBearerRequest,
+        ] {
+            assert_eq!(
+                server.t3_for(t as u8),
+                std::time::Duration::from_millis(13_500),
+                "{t:?}"
+            );
+        }
+        assert_eq!(
+            server.t3_for(T::DownlinkDataNotification as u8),
+            std::time::Duration::from_secs(3)
+        );
+        server.close();
+    }
+
     #[test]
     fn test_sgwc_paths() {
         // Bind an ephemeral loopback port directly (mutating process env in

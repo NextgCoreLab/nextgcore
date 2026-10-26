@@ -3153,6 +3153,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nextgcore-sbcap-gen"
+version = "0.1.0"
+dependencies = [
+ "asn1-codecs",
+ "asn1-compiler",
+ "asn1_codecs_derive",
+ "bitvec",
+ "log",
+]
+
+[[package]]
 name = "nextgcore-sbi"
 version = "0.1.0"
 dependencies = [

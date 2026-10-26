@@ -187,6 +187,7 @@ fn nr_measured_results_decode_from_hand_derived_octets() {
                 ss_rsrp: vec![NrCellResult {
                     pci: 7,
                     arfcn: 620_000,
+                    cgi: None,
                     value: Some(80),
                 }],
                 ..NrEcidReport::default()
@@ -208,11 +209,202 @@ fn nr_measured_results_decode_from_hand_derived_octets() {
         let (_, cells, ei) = accepted(&hand);
         assert!(ei.is_none());
         assert_eq!(cells[0].nr_ecid.as_ref(), Some(want));
+        // The NR-TADV case alone has a timing term: 1234 is [157952, 158080) T_c
+        // (TS 38.133 Table 13.5.1-1), a round trip of 158016 T_c.
+        let tc = crate::positioning::TC_NS;
         assert_eq!(
-            cells[0].ecid_rtt_ns, None,
-            "no timing term: the NR-TADV mapping (TS 38.133) is not implemented"
+            cells[0].ecid_rtt_ns,
+            want.nr_tadv.map(|_| 158_016.0 * tc),
+            "{want:?}"
         );
     }
+}
+
+/// #859: an SS-RSRP item that names its cell (NR CGI, TS 38.455 §9.2.9), from
+/// hand-derived X.691 octets.
+///
+/// ```text
+/// 02 80 00 20 40 12          as above; id-ResultSS-RSRP (32), ignore, length 18:
+///  06 00     SIZE(1..9) 0 (4 bits); item ext 0, opts 1 1 0 0 (nR-CGI and
+///            valueSS-RSRP-Cell); pad
+///  00 07     nR-PCI 7
+///  80 09 75 e0               nR-ARFCN 620000
+///  00        NR-CGI ext 0, opt 0 (iE-Extensions); pad (SIZE(3) octets align)
+///  02 f8 39  pLMN-Identity
+///  00 00 00 00 1x            nRCellIdentifier 36 bits = 1: four zero octets, then
+///                            the nibble 0001
+///  x(a) 00   valueSS-RSRP-Cell 80 in 7 bits after that nibble: 0001 1010 000,
+///            i.e. 1a, then 000 and pad
+/// ```
+#[test]
+fn a_named_nr_result_item_decodes_from_hand_derived_octets() {
+    let octets = [
+        0x02, 0x80, 0x00, 0x20, 0x40, 0x12, 0x06, 0x00, 0x00, 0x07, 0x80, 0x09, 0x75, 0xe0, 0x00,
+        0x02, 0xf8, 0x39, 0x00, 0x00, 0x00, 0x00, 0x1a, 0x00,
+    ];
+    let hand = ecid_report_with_measured(&octets);
+    assert_eq!(
+        ecid_report(
+            9,
+            3,
+            5,
+            nr_cgi(PLMN, 1),
+            TAC,
+            Some(vec![ss_rsrp_named(&[(7, 620_000, Some(1), Some(80))])])
+        ),
+        hand
+    );
+    let (_, cells, _) = accepted(&hand);
+    let nr = cells[0].nr_ecid.as_ref().expect("NR part");
+    assert_eq!(nr.ss_rsrp[0].cgi.as_deref(), Some("02f839-000000001"));
+    assert_eq!(nr.ss_rsrp[0].cgi.as_deref(), Some(cells[0].nr_cgi.as_str()));
+    assert_eq!(cells[0].rsrp, Some(80 - 156));
+}
+
+/// A one-cell report on an NR serving cell (NR cell 1 in [`PLMN`]).
+fn nr_cell(measured: Vec<nrppa::MeasuredResultsValue>) -> CellMeasurement {
+    let (_, cells, _) = accepted(&ecid_report(1, 15, 7, nr_cgi(PLMN, 1), TAC, Some(measured)));
+    cells.into_iter().next().expect("one serving-cell entry")
+}
+
+/// #859: Value Timing Advance NR is the round trip of TS 38.133 §13.5.1 Table
+/// 13.5.1-1, at the bin midpoint: 128 T_c bins below 262144 T_c, 512 T_c bins
+/// from there to 3150848 T_c, and TIME_ADVANCE_7690 open-ended. Nothing is
+/// subtracted: the gNB's report already includes N_TA,offset (the table's NOTE).
+#[test]
+fn nr_tadv_is_ranged_per_ts_38_133_table_13_5_1_1() {
+    let tc = crate::positioning::TC_NS;
+    let rtt = |v| {
+        let c = nr_cell(vec![nr_tadv(v)]);
+        assert_eq!(c.timing_advance, None);
+        c.ecid_rtt_ns.zip(c.ecid_rtt_width_ns)
+    };
+    assert_eq!(rtt(0), Some((64.0 * tc, 128.0 * tc)), "TADV < 128 T_c");
+    assert_eq!(rtt(1), Some((192.0 * tc, 128.0 * tc)));
+    assert_eq!(rtt(2047), Some((262_080.0 * tc, 128.0 * tc)));
+    assert_eq!(rtt(2048), Some((262_400.0 * tc, 512.0 * tc)));
+    assert_eq!(rtt(2049), Some((262_912.0 * tc, 512.0 * tc)));
+    assert_eq!(rtt(7689), Some((3_150_592.0 * tc, 512.0 * tc)));
+    assert_eq!(rtt(7690), None, "TIME_ADVANCE_7690 is TADV ≥ 3150848 T_c");
+}
+
+/// #859: the serving cell's own RAT decides which timing term, RSRP, RSRQ and
+/// AoA are used; the other RAT's stands in only when its own is absent.
+#[test]
+fn the_serving_cells_rat_picks_the_quantities() {
+    let tc = crate::positioning::TC_NS;
+    let ts = crate::positioning::TS_NS;
+    let c = nr_cell(vec![ta1(500), nr_tadv(10)]);
+    assert_eq!(c.ecid_rtt_ns, Some(1_344.0 * tc), "NR cell: NR-TADV first");
+    let c = nr_cell(vec![ta1(500)]);
+    assert_eq!(c.ecid_rtt_ns, Some(1001.0 * ts), "E-UTRA TADV stands in");
+    let c = nr_cell(vec![rsrp(&[60]), ss_rsrp(&[(7, 1, Some(100))])]);
+    assert_eq!(c.rsrp, Some(100 - 156), "NR cell: SS-RSRP first");
+
+    let (_, cells, _) = accepted(&ecid_report(
+        1,
+        15,
+        7,
+        eutra_cgi(PLMN, 1),
+        TAC,
+        Some(vec![
+            nr_tadv(10),
+            ta1(500),
+            ss_rsrp(&[(7, 1, Some(100))]),
+            rsrp(&[60]),
+        ]),
+    ));
+    let c = &cells[0];
+    assert_eq!(c.ecid_rtt_ns, Some(1001.0 * ts), "E-UTRA cell: TADV Type 1");
+    assert_eq!(c.rsrp, Some(60 - 140), "E-UTRA cell: E-UTRA RSRP");
+    let (_, cells, _) = accepted(&ecid_report(
+        1,
+        15,
+        7,
+        eutra_cgi(PLMN, 1),
+        TAC,
+        Some(vec![nr_tadv(10)]),
+    ));
+    assert_eq!(
+        cells[0].ecid_rtt_ns,
+        Some(1_344.0 * tc),
+        "NR-TADV stands in"
+    );
+}
+
+/// #859: the serving cell's RSRP and RSRQ (TS 38.133 §10.1.6.1, §10.1.11.1):
+/// the item that names the serving cell, else the strongest unnamed one; a
+/// named neighbour never stands in; SS before CSI; RSRP_127 is not a report.
+#[test]
+fn the_serving_cells_nr_rsrp_and_rsrq_are_used() {
+    // Named serving cell (NR cell 1) beats a stronger named neighbour.
+    let c = nr_cell(vec![ss_rsrp_named(&[
+        (8, 1, Some(2), Some(120)),
+        (7, 1, Some(1), Some(70)),
+    ])]);
+    assert_eq!(c.rsrp, Some(70 - 156));
+    // Only neighbours named: no serving value; the CSI-RSRP stands in.
+    let c = nr_cell(vec![
+        ss_rsrp_named(&[(8, 1, Some(2), Some(120))]),
+        csi_rsrp(&[(7, 1, Some(90))]),
+    ]);
+    assert_eq!(c.rsrp, Some(90 - 156));
+    let c = nr_cell(vec![ss_rsrp_named(&[(8, 1, Some(2), Some(120))])]);
+    assert_eq!(c.rsrp, None);
+    // Unnamed: the strongest; RSRP_127 ("Infinity") is not a measurement.
+    let c = nr_cell(vec![ss_rsrp(&[
+        (7, 1, Some(127)),
+        (8, 1, Some(40)),
+        (9, 1, Some(126)),
+    ])]);
+    assert_eq!(c.rsrp, Some(126 - 156));
+    let c = nr_cell(vec![ss_rsrp(&[(7, 1, Some(127)), (8, 1, None)])]);
+    assert_eq!(c.rsrp, None);
+    // RSRQ: the raw index of TS 38.133 Table 10.1.11.1-1 (as the LPP NR adapter).
+    let c = nr_cell(vec![
+        ss_rsrq(&[(7, 1, Some(127))]),
+        csi_rsrq(&[(7, 1, Some(3))]),
+    ]);
+    assert_eq!(c.rsrq, Some(127));
+    let c = nr_cell(vec![csi_rsrq(&[(7, 1, Some(3))])]);
+    assert_eq!(c.rsrq, Some(3));
+}
+
+/// #859: AoA NR in the GCS is TS 38.133 Table 13.4.1-1 (−180 + 0.1·v degrees,
+/// counter-clockwise from North, TS 38.215 §5.2.4), turned into the solver's
+/// clockwise bearing; in an LCS it is not a bearing and is not used.
+#[test]
+fn a_gcs_nr_aoa_is_a_bearing_and_an_lcs_one_is_not() {
+    let bearing = |v| nr_cell(vec![aoa_nr(v, None)]).aoa.expect("a bearing");
+    let close = |got: f64, want: f64| assert!((got - want).abs() < 1e-9, "{got} vs {want}");
+    close(bearing(1800), 359.95); // A-AoA [0, 0.1): just west of North
+    close(bearing(1799), 0.05); // [-0.1, 0): just east
+    close(bearing(900), 89.95); // [-90, -89.9): east, clockwise about 90
+    close(bearing(2700), 269.95); // [90, 90.1): west
+    close(bearing(0), 179.95); // [-180, -179.9)
+    close(bearing(3599), 180.05); // [179.9, 180)
+    let c = nr_cell(vec![aoa_nr_lcs(900)]);
+    assert_eq!(c.aoa, None);
+    assert!(c.nr_ecid.as_ref().unwrap().aoa_nr_lcs);
+}
+
+/// #859: the UE Rx-Tx Time Difference is the k = 5 table of TS 38.133
+/// §10.1.25.3.1 (Table 10.1.25.3.1-6), at the bin midpoint, signed. It is not
+/// put in `ue_rx_tx_ns`: an E-CID report has no gNB half to pair it with.
+#[test]
+fn the_nr_ue_rx_tx_is_the_k5_absolute_mapping() {
+    let tc = crate::positioning::TC_NS;
+    let ns = |v| {
+        let c = nr_cell(vec![ue_rx_tx(v)]);
+        assert_eq!((c.ue_rx_tx_ns, c.ecid_rtt_ns), (None, None));
+        c.nr_ecid.unwrap().ue_rx_tx_ns()
+    };
+    assert_eq!(ns(30_783), Some(16.0 * tc), "[0, 32) T_c");
+    assert_eq!(ns(30_782), Some(-16.0 * tc), "[-32, 0) T_c");
+    assert_eq!(ns(1), Some(-985_008.0 * tc));
+    assert_eq!(ns(61_564), Some(985_008.0 * tc));
+    assert_eq!(ns(0), None, "< -985024 T_c");
+    assert_eq!(ns(61_565), None, "≥ 985024 T_c");
 }
 
 /// #859: every NR quantity in one report is kept, the first of each wins, and a
@@ -250,38 +442,44 @@ fn every_nr_measured_result_is_kept_as_reported() {
                 NrCellResult {
                     pci: 0,
                     arfcn: 0,
+                    cgi: None,
                     value: Some(0)
                 },
                 NrCellResult {
                     pci: 1007,
                     arfcn: 3_279_165,
+                    cgi: None,
                     value: Some(127)
                 },
             ],
             ss_rsrq: vec![NrCellResult {
                 pci: 5,
                 arfcn: 1000,
+                cgi: None,
                 value: None
             }],
             csi_rsrp: vec![NrCellResult {
                 pci: 6,
                 arfcn: 2000,
+                cgi: None,
                 value: Some(64)
             }],
             csi_rsrq: vec![NrCellResult {
                 pci: 7,
                 arfcn: 3000,
+                cgi: None,
                 value: Some(1)
             }],
             aoa_nr: Some((3599, Some(1799))),
+            aoa_nr_lcs: false,
         })
     );
-    assert_eq!(c.rsrp, Some(-80), "the E-UTRA arm is still read");
-    assert_eq!(
-        (c.ecid_rtt_ns, c.aoa),
-        (None, None),
-        "no NR value is mapped"
-    );
+    // #859: the NR serving cell's own quantities are used: NR-TADV 0, the
+    // strongest unnamed SS-RSRP that is a report (0; 127 is not), AoA NR 3599.
+    let tc = crate::positioning::TC_NS;
+    assert_eq!(c.ecid_rtt_ns, Some(64.0 * tc));
+    assert_eq!(c.rsrp, Some(-156));
+    assert!((c.aoa.unwrap() - 180.05).abs() < 1e-9);
     assert_eq!(cell(vec![rsrp(&[60]), ta1(10)]).nr_ecid, None);
 }
 

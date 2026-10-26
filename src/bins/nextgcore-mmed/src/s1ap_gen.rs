@@ -1000,13 +1000,7 @@ fn erab_qos(q: &nextgcore_s1ap::ErabLevelQosParameters) -> g::E_RABLevelQoSParam
             )),
             ie_extensions: None,
         },
-        gbr_qos_information: q.gbr_qos_info.as_ref().map(|gbr| g::GBR_QosInformation {
-            e_rab_maximum_bitrate_dl: erab_bit_rate(gbr.erab_max_bitrate_dl),
-            e_rab_maximum_bitrate_ul: erab_bit_rate(gbr.erab_max_bitrate_ul),
-            e_rab_guaranteed_bitrate_dl: erab_bit_rate(gbr.erab_guaranteed_bitrate_dl),
-            e_rab_guaranteed_bitrate_ul: erab_bit_rate(gbr.erab_guaranteed_bitrate_ul),
-            ie_extensions: None,
-        }),
+        gbr_qos_information: q.gbr_qos_info.as_ref().map(gbr_qos),
         ie_extensions: None,
     }
 }
@@ -1574,19 +1568,63 @@ const ID_ERAB_ITEM: u16 = 35;
 /// (0..10000000000)).
 const MAX_BIT_RATE: u64 = 10_000_000_000;
 
-/// An E-RAB GBR QoS Information bit rate (TS 36.413 §9.2.1.18/§9.2.1.19,
-/// `BitRate ::= INTEGER (0..10000000000)`, not extensible) for `value` bit/s:
-/// `value`, or [`MAX_BIT_RATE`] past it, with a warning (#1204, as #1192 does
-/// for NGAP). Encoded raw, a value past the range failed the whole message.
-fn erab_bit_rate(value: u64) -> g::BitRate {
-    if value > MAX_BIT_RATE {
-        log::warn!(
-            "E-RAB Bit Rate {value} bit/s is past TS 36.413 §9.2.1.19's {MAX_BIT_RATE}; sent as \
-             {MAX_BIT_RATE}"
-        );
-        g::BitRate(MAX_BIT_RATE)
-    } else {
-        g::BitRate(value)
+/// The largest Extended Bit Rate (TS 36.413 §9.2.1.126, `ExtendedBitRate ::=
+/// INTEGER (10000000001..4000000000000, ...)`).
+const MAX_EXTENDED_BIT_RATE: u64 = 4_000_000_000_000;
+
+/// The GBR QoS Information IE (TS 36.413 §9.2.1.18) for `gbr` (bit/s).
+///
+/// `BitRate ::= INTEGER (0..10000000000)` is not extensible, so a direction
+/// above 10 Gbit/s puts the legacy IE at its maximum and adds the Rel-15
+/// Extended E-RAB Maximum / Guaranteed Bit Rate for that direction (ids
+/// 255-258, criticality ignore): "If the Extended E-RAB ... Bit Rate ... IE is
+/// included, the E-RAB ... Bit Rate ... IE shall be ignored". A legacy eNB reads
+/// the maximum, a Rel-15 one the real value (#1250; #1204 clamped it).
+fn gbr_qos(gbr: &nextgcore_s1ap::GbrQosInformation) -> g::GBR_QosInformation {
+    use g::GBR_QosInformationIE_Extensions_EntryExtensionValue as X;
+    let mut ext = Vec::new();
+    for (v, id, value) in [
+        (
+            gbr.erab_max_bitrate_dl,
+            255,
+            X::Id_extended_e_RAB_MaximumBitrateDL as fn(_) -> X,
+        ),
+        (
+            gbr.erab_max_bitrate_ul,
+            256,
+            X::Id_extended_e_RAB_MaximumBitrateUL,
+        ),
+        (
+            gbr.erab_guaranteed_bitrate_dl,
+            257,
+            X::Id_extended_e_RAB_GuaranteedBitrateDL,
+        ),
+        (
+            gbr.erab_guaranteed_bitrate_ul,
+            258,
+            X::Id_extended_e_RAB_GuaranteedBitrateUL,
+        ),
+    ] {
+        if v > MAX_BIT_RATE {
+            if v > MAX_EXTENDED_BIT_RATE {
+                log::warn!(
+                    "E-RAB Bit Rate {v} bit/s is past TS 36.413 §9.2.1.126's \
+                     {MAX_EXTENDED_BIT_RATE}; sent as {MAX_EXTENDED_BIT_RATE}"
+                );
+            }
+            ext.push(g::GBR_QosInformationIE_Extensions_Entry {
+                id: g::ProtocolExtensionID(id),
+                criticality: g::Criticality(IGNORE),
+                extension_value: value(g::ExtendedBitRate(v.min(MAX_EXTENDED_BIT_RATE))),
+            });
+        }
+    }
+    g::GBR_QosInformation {
+        e_rab_maximum_bitrate_dl: g::BitRate(gbr.erab_max_bitrate_dl.min(MAX_BIT_RATE)),
+        e_rab_maximum_bitrate_ul: g::BitRate(gbr.erab_max_bitrate_ul.min(MAX_BIT_RATE)),
+        e_rab_guaranteed_bitrate_dl: g::BitRate(gbr.erab_guaranteed_bitrate_dl.min(MAX_BIT_RATE)),
+        e_rab_guaranteed_bitrate_ul: g::BitRate(gbr.erab_guaranteed_bitrate_ul.min(MAX_BIT_RATE)),
+        ie_extensions: (!ext.is_empty()).then_some(g::GBR_QosInformationIE_Extensions(ext)),
     }
 }
 

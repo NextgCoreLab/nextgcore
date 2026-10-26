@@ -1075,6 +1075,11 @@ pub fn dispatch_initial(raw: &[u8], msg_type: u8, sequence_number: u32, peer: So
         mt::CREATE_BEARER_REQUEST => {
             crate::bearer_activation::handle_create_bearer_request(raw, sequence_number, peer)
         }
+        // #641's Update half: TS 23.401 §5.4.2 / §5.4.3, network-initiated bearer
+        // modification. It was "not handled" and never answered.
+        mt::UPDATE_BEARER_REQUEST => {
+            crate::bearer_activation::handle_update_bearer_request(raw, sequence_number, peer)
+        }
         other => log::info!(
             "S11 initial message type={other} seq={sequence_number} from {peer} not handled: this \
              MME originates no procedure for it"
@@ -1348,6 +1353,16 @@ fn handle_delete_bearer_request(raw: &[u8], sequence_number: u32, peer: SocketAd
                 ebis: to_deactivate,
                 reactivation,
             } => {
+                // #641 follow-up, TS 24.301 §6.4.2.6 b): the PDN GW deletes the whole
+                // PDN connection; a dedicated bearer activation on it ends locally.
+                if let crate::bearer_deactivation::DeleteBearerAnswer::Lbi(lbi) = &answer {
+                    crate::bearer_activation::settle_for_pdn(
+                        ctx,
+                        mme_ue_id,
+                        *lbi,
+                        GtpCause::ContextNotFound,
+                    );
+                }
                 // #863 review: bearers already being deactivated (by an earlier
                 // request, or with their PDN connection) are not deactivated a
                 // second time; a request naming only such bearers is answered

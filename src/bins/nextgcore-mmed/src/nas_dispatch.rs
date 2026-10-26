@@ -1197,6 +1197,7 @@ fn emm_tau_request(
             crate::context::PagingType::DownlinkDataNotification
                 | crate::context::PagingType::DeleteBearer
                 | crate::context::PagingType::CreateBearer
+                | crate::context::PagingType::UpdateBearer
         )
     } else {
         false
@@ -1204,7 +1205,18 @@ fn emm_tau_request(
     let restore_user_plane = verified && (parsed.active_flag || paged_for_data);
     // TS 24.301 §5.5.3.2.4: the TAU accept may reallocate the GUTI, and rotating it
     // on mobility is what keeps the temporary identity temporary (#46).
+    //
+    // #1249: `allocate_guti` takes the UE pool's lock itself (the M-TMSI
+    // uniqueness scan reads it, the staging writes it). Called under this
+    // function's write guard it deadlocked the thread on every accepted TAU
+    // once a GUMMEI is served: no TAU ACCEPT, and the S1 path stalled. The
+    // unit tests ran with no served GUMMEI, where it returns before locking.
+    drop(pool);
     ctx.allocate_guti(mme_ue_id);
+    let mut pool = ctx.mme_ue_pool.write().unwrap();
+    let Some(mme_ue) = pool.get_mut(&mme_ue_id) else {
+        return;
+    };
     // The UE's active bearers, so the accept can carry a real EPS bearer context
     // status (#46). An empty slice was passed while S11 could establish nothing;
     // #51 gave the MME a real S11 endpoint, so a UE that has completed an attach
@@ -1980,6 +1992,27 @@ pub fn handle_esm_message(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue: &MmeUe, esm:
     let message_type = esm[2];
     let body = &esm[3..];
 
+    // TS 24.301 §7.3.2 g): an ACTIVATE DEDICATED EPS BEARER CONTEXT ACCEPT or
+    // REJECT naming no existing EPS bearer context is ignored; it must not fall
+    // through to the PDN connection's default bearer below. A late ACCEPT for
+    // an activation already refused gets the bearer deactivated (#641 follow-up).
+    if matches!(
+        message_type,
+        esm_type::ACTIVATE_DEDICATED_BEARER_ACCEPT | esm_type::ACTIVATE_DEDICATED_BEARER_REJECT
+    ) && ctx.bearer_find_by_ebi(mme_ue.id, ebi).is_none()
+    {
+        if message_type == esm_type::ACTIVATE_DEDICATED_BEARER_ACCEPT {
+            crate::bearer_activation::on_unknown_accept(ctx, mme_ue.id, ebi);
+        } else {
+            log::warn!(
+                "[{}] ACTIVATE DEDICATED EPS BEARER CONTEXT REJECT for EBI {ebi}, which has no \
+                 bearer; ignored (TS 24.301 §7.3.2 g)",
+                mme_ue.imsi_bcd
+            );
+        }
+        return;
+    }
+
     // The ESM handlers all want a session and a bearer. A PDN CONNECTIVITY
     // REQUEST creates them (keyed by its procedure transaction identity);
     // anything else refers to what that request left behind.
@@ -2224,11 +2257,15 @@ pub fn handle_esm_message(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue: &MmeUe, esm:
             match esm_handler::handle_modify_bearer_context_accept(
                 enb_ue, mme_ue, &sess, &bearer, body,
             ) {
-                Ok(()) => log::info!(
-                    "[{}] EPS bearer (ebi={}) modification accepted by the UE",
-                    mme_ue.imsi_bcd,
-                    bearer.ebi
-                ),
+                Ok(()) => {
+                    log::info!(
+                        "[{}] EPS bearer (ebi={}) modification accepted by the UE",
+                        mme_ue.imsi_bcd,
+                        bearer.ebi
+                    );
+                    // #641 Update half, TS 24.301 §6.4.3.3.
+                    crate::bearer_activation::on_modify_accept(ctx, mme_ue.id, bearer.ebi);
+                }
                 Err(e) => log::warn!("[{}] Modify accept rejected: {e}", mme_ue.imsi_bcd),
             }
         }
@@ -2236,10 +2273,14 @@ pub fn handle_esm_message(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue: &MmeUe, esm:
             match esm_handler::handle_modify_bearer_context_reject(
                 enb_ue, mme_ue, &sess, &bearer, body,
             ) {
-                Ok(cause) => log::warn!(
-                    "[{}] EPS bearer modification rejected by the UE: {cause:?}",
-                    mme_ue.imsi_bcd
-                ),
+                Ok(cause) => {
+                    log::warn!(
+                        "[{}] EPS bearer modification rejected by the UE: {cause:?}",
+                        mme_ue.imsi_bcd
+                    );
+                    // #641 Update half, TS 24.301 §6.4.3.4.
+                    crate::bearer_activation::on_modify_reject(ctx, mme_ue.id, bearer.ebi);
+                }
                 Err(e) => log::warn!("[{}] Modify reject malformed: {e}", mme_ue.imsi_bcd),
             }
         }
@@ -2263,11 +2304,21 @@ pub fn handle_esm_message(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue: &MmeUe, esm:
         }
         esm_type::PDN_DISCONNECT_REQUEST => {
             match esm_handler::handle_pdn_disconnect_request(enb_ue, mme_ue, &sess, body) {
-                Ok(linked_ebi) => log::info!(
-                    "[{}] PDN Disconnect Request (linked ebi={linked_ebi}); the S11 Delete \
-                     Session Request to the SGW is not implemented (#51)",
-                    mme_ue.imsi_bcd
-                ),
+                Ok(linked_ebi) => {
+                    // TS 24.301 §6.4.2.6 b): a dedicated bearer activation on this
+                    // PDN connection is terminated locally.
+                    crate::bearer_activation::settle_for_pdn(
+                        ctx,
+                        mme_ue.id,
+                        linked_ebi,
+                        crate::s11_build::GtpCause::UeRefuses,
+                    );
+                    log::info!(
+                        "[{}] PDN Disconnect Request (linked ebi={linked_ebi}); the S11 Delete \
+                         Session Request to the SGW is not implemented (#51)",
+                        mme_ue.imsi_bcd
+                    )
+                }
                 Err(e) => log::warn!("[{}] PDN Disconnect Request rejected: {e}", mme_ue.imsi_bcd),
             }
         }
@@ -3079,6 +3130,56 @@ mod tests {
     /// #732, §5.5.2.3.5 e and f: a TAU REQUEST and a SERVICE REQUEST during the
     /// detach are ignored and the detach progresses: T3422 keeps running and a
     /// later DETACH ACCEPT still completes it.
+    /// #1249, TS 24.301 §5.5.3.2.4: an accepted periodic TAU REQUEST with a
+    /// served GUMMEI gets its TRACKING AREA UPDATE ACCEPT, with a reallocated
+    /// GUTI. `allocate_guti` used to run under the UE pool's write guard and
+    /// deadlocked there, so nothing was sent.
+    #[test]
+    fn an_accepted_tau_with_a_served_gummei_is_answered() {
+        let mut ctx = MmeContext::new();
+        ctx.init();
+        ctx.served_gummei = vec![crate::context::ServedGummei {
+            num_of_plmn_id: 1,
+            plmn_id: vec![crate::context::PlmnId::new("999", "70")],
+            num_of_mme_gid: 1,
+            mme_gid: vec![2],
+            num_of_mme_code: 1,
+            mme_code: vec![1],
+        }];
+        ctx.num_of_served_gummei = 1;
+        let ctx = std::sync::Arc::new(ctx);
+        let enb_ue_id = enb_with_connection(&ctx);
+        let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
+        ctx.enb_ue_associate_mme_ue(enb_ue_id, mme_ue_id);
+        if let Some(ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&mme_ue_id) {
+            ue.imsi_bcd = "999700000000001".to_string();
+            ue.security_context_available = true;
+        }
+        let enb_ue = ctx.enb_ue_find_by_id(enb_ue_id).unwrap();
+        // Periodic updating (EPS update type 3), the Old GUTI.
+        let body = [
+            0x03, 0x0b, 0xf6, 0x99, 0xf9, 0x07, 0x00, 0x02, 0x01, 0x00, 0x00, 0x09, 0x61,
+        ];
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = ctx.clone();
+        std::thread::spawn(move || {
+            emm_tau_request(&worker, &enb_ue, mme_ue_id, &body, &[], true);
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok(),
+            "the TAU REQUEST must be handled, not deadlock on the UE pool"
+        );
+        let ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert!(ue.next.m_tmsi.is_some(), "a GUTI is reallocated");
+        assert!(
+            ue.t3450.pkbuf.is_some() && ue.t3450.is_running(),
+            "the TAU ACCEPT went out and T3450 guards it"
+        );
+    }
+
     #[test]
     fn a_tau_or_service_request_during_a_detach_is_ignored() {
         let ctx = test_ctx();

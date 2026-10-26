@@ -6720,6 +6720,81 @@ lmf:
         );
     }
 
+    // -- #859: a real NR gNB's E-CID answer (NR-TADV, SS-RSRP) arrives over
+    // N2InfoNotify, and with the UE's LPP leg in, the session ends in an NR_ECID
+    // fix ranged from the NR-TADV (TS 38.133 §13.5.1). Before #859 it ended in
+    // SolverFailed (500 POSITIONING_FAILED).
+    #[tokio::test]
+    async fn test_n2_info_notify_nr_tadv_gives_an_nr_ecid_fix() {
+        use crate::nrppa_uplink::test_support::{ecid_report, nr_cgi, nr_tadv, ss_rsrp};
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        lmf_context_init(1024);
+        let supi = "imsi-001010000000859";
+        let ctx = lmf_self();
+        let (corr, rx, request_id) = {
+            let guard = ctx.read().unwrap();
+            guard.set_cell_coord(
+                "02f839-000000859",
+                crate::positioning::TrpCoord::new(40.0, -74.0, 0.0),
+            );
+            let req = guard
+                .measurement_request(
+                    0,
+                    PositioningMethod::Ecid,
+                    None,
+                    None,
+                    PositioningQos::BestEffort,
+                )
+                .expect("measurement request");
+            let (corr, rx) =
+                guard.positioning_session_register(Some(supi.to_string()), 189, req.request_id);
+            guard.positioning_session_expect_leg(&corr, crate::context::MeasurementLeg::NrppaEcid);
+            (corr, rx, req.request_id)
+        };
+        let nrppa = ecid_report(
+            1,
+            42,
+            7,
+            nr_cgi([0x02, 0xF8, 0x39], 0x859),
+            [0x00, 0x12, 0x34],
+            Some(vec![nr_tadv(1000), ss_rsrp(&[(7, 620_000, Some(80))])]),
+        );
+        let json = format!(
+            "{{\"n2NotifySubscriptionId\":\"sub-9\",\
+             \"n2InfoContainer\":{{\"n2InformationClass\":\"NRPPa\",\
+             \"nrppaInfo\":{{\"nrppaPdu\":{{\"ngapIeType\":\"NRPPA_PDU\",\
+             \"ngapData\":{{\"contentId\":\"nrppa\"}}}}}}}},\
+             \"lcsCorrelationId\":\"{corr}\"}}"
+        );
+        let req = notify_request(
+            "/nlmf-loc/v1/notify/n2",
+            &json,
+            "nrppa",
+            "application/vnd.3gpp.ngap",
+            nrppa,
+        );
+        assert_eq!(handle_n2_info_notify(&req).await.status, 204);
+        lmf_self().read().unwrap().measurement_leg_report(
+            request_id,
+            crate::context::MeasurementLeg::Lpp,
+            Vec::new(),
+        );
+        let outcome = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("session completed within budget")
+            .expect("completion sender was not dropped");
+        let crate::context::PositioningOutcome::Fix(fix) = outcome else {
+            panic!("an NR-TADV must give a fix, got {outcome:?}");
+        };
+        assert_eq!(fix.method_used.as_deref(), Some("NR_ECID"));
+        assert_eq!((fix.latitude, fix.longitude), (40.0, -74.0));
+        // 1000 -> a 128064 T_c round trip: about 9.8 km, plus a quarter bin.
+        let tc = 1.0 / (480_000.0 * 4_096.0);
+        let c = crate::positioning::SPEED_OF_LIGHT_M_S;
+        let want = c * 128_064.0 * tc / 2.0 + c * 128.0 * tc / 4.0;
+        assert!((fix.horizontal_accuracy - want).abs() < 0.01, "{fix:?}");
+    }
+
     // -- A4: N2InfoNotify with an unknown lcsCorrelationId → 404.
     #[tokio::test]
     async fn test_n2_info_notify_unknown_correlation_404() {

@@ -323,6 +323,22 @@ impl GtpcServer {
         self.inner.local_addr
     }
 
+    /// Use `n3` for requests of `message_types` (TS 29.274 §7.6, #1228).
+    pub fn set_t3_for(&self, message_types: &[u8], t3: Duration) {
+        if let Ok(mut xact) = self.inner.xact.lock() {
+            xact.set_t3_for(message_types, t3);
+        }
+    }
+
+    /// The N3 a request of `message_type` gets.
+    pub fn t3_for(&self, message_type: u8) -> Duration {
+        self.inner
+            .xact
+            .lock()
+            .map(|x| x.t3_for(message_type))
+            .unwrap_or_default()
+    }
+
     /// Local restart counter advertised in Recovery IEs
     pub fn restart_counter(&self) -> u8 {
         self.inner.restart_counter
@@ -539,20 +555,30 @@ impl GtpcServer {
         let t = msg.header.message_type;
         let mut out = msg.clone();
         if t == Gtp2MessageType::EchoRequest as u8 || t == Gtp2MessageType::EchoResponse as u8 {
-            if let Ok(mut set) = self.inner.recovery_indicated.lock() {
-                set.insert(peer);
+            // An Echo Response is a response: it is resent from the cache for a
+            // retransmitted Echo Request. An Echo Request counts only once its
+            // Response arrives (`note_recovery_received`).
+            if t == Gtp2MessageType::EchoResponse as u8 {
+                self.mark_recovery_indicated(peer);
             }
             return out;
         }
         out.ies
             .retain(|ie| ie.ie_type != Gtp2IeType::Recovery as u8);
-        let first = recovery_conditional(t)
+        let include = recovery_conditional(t)
             && self
                 .inner
                 .recovery_indicated
                 .lock()
-                .is_ok_and(|mut set| set.insert(peer));
-        if first {
+                .is_ok_and(|set| !set.contains(&peer));
+        // #1223 review: a request (S5/S8 Create Session / Modify Bearer) may run
+        // out N3 unanswered, and then the peer never got the counter. It keeps
+        // carrying Recovery until the peer has answered one; a response is
+        // retransmitted from the cache, so it counts at once.
+        if include && !is_recovery_request(t) {
+            self.mark_recovery_indicated(peer);
+        }
+        if include {
             out.add_ie(Gtp2Ie::from_slice(
                 Gtp2IeType::Recovery as u8,
                 0,
@@ -560,6 +586,21 @@ impl GtpcServer {
             ));
         }
         out
+    }
+
+    fn mark_recovery_indicated(&self, peer: SocketAddr) {
+        if let Ok(mut set) = self.inner.recovery_indicated.lock() {
+            set.insert(peer);
+        }
+    }
+
+    /// Whether this node's Recovery has reached `peer` (it answered a request
+    /// carrying it, or was sent a response with it). Test/diagnostic.
+    pub fn recovery_indicated_to(&self, peer: SocketAddr) -> bool {
+        self.inner
+            .recovery_indicated
+            .lock()
+            .is_ok_and(|set| set.contains(&peer))
     }
 
     /// Send an Echo Request (path management, TS 29.274 Section 7.1.1)
@@ -663,6 +704,18 @@ fn advertised_addresses(
 
 /// Open the S11 GTP-C server socket
 /// Port of sgwc_gtp_open
+/// The S11/S5 GTP-C server as the process runs it: default T3/N3, except the
+/// paging-dependent bearer Requests relayed to the MME, whose transaction lasts
+/// T3 x (N3 + 1) = 54 s (#1228, TS 29.274 §7.6), beyond the MME's answer budget
+/// and inside the PGW's S5/S8 one (`nextgcore_gtp::v2::xact` documents the
+/// three).
+pub fn open_s11_server(bind: &str, restart_counter: u8) -> Result<GtpcServer, String> {
+    use nextgcore_gtp::v2::xact::{BEARER_PROCEDURE_REQUESTS, SGW_BEARER_PROCEDURE_T3};
+    let server = GtpcServer::open(bind, Gtp2XactConfig::default(), restart_counter)?;
+    server.set_t3_for(&BEARER_PROCEDURE_REQUESTS, SGW_BEARER_PROCEDURE_T3);
+    Ok(server)
+}
+
 pub fn gtp_open() -> Result<(), String> {
     if s11_server().is_some() {
         return Ok(());
@@ -686,7 +739,7 @@ pub fn gtp_open() -> Result<(), String> {
         None => advance_persistent_restart_counter(&restart_counter_path()),
     };
 
-    let server = GtpcServer::open(&bind, Gtp2XactConfig::default(), restart_counter)?;
+    let server = open_s11_server(&bind, restart_counter)?;
 
     let ctx = sgwc_self();
     // Advertised control-plane address: the bound address unless wildcard,
@@ -909,6 +962,10 @@ fn handle_datagram(inner: &Arc<GtpcInner>, data: &[u8], peer: SocketAddr) {
     };
 
     // Restart-counter staleness detection on any message carrying Recovery
+    // #1248 review: the answer marks the peer as told first, so a restart that
+    // this same answer reveals then clears the mark, and the next request to
+    // the restarted peer carries this node's Recovery again.
+    note_recovery_received(inner, peer, msg.header.message_type);
     if let Some(rec_ie) = msg.get_ie_by_type(Gtp2IeType::Recovery as u8) {
         if let Ok(rec) = Gtp2RecoveryIe::decode(&rec_ie.value) {
             note_peer_recovery(inner, peer, rec.restart_counter);
@@ -1412,9 +1469,38 @@ fn recovery_conditional(msg_type: u8) -> bool {
         T::CreateIndirectDataForwardingTunnelResponse,
         T::DeleteIndirectDataForwardingTunnelResponse,
         T::ModifyAccessBearersResponse,
+        // O in their tables (7.2.22-1, 7.2.6-1), carried under the same
+        // first-contact rule (#1223 review).
+        T::ReleaseAccessBearersResponse,
+        T::BearerResourceFailureIndication,
     ]
     .iter()
     .any(|t| *t as u8 == msg_type)
+}
+
+/// The [`recovery_conditional`] messages this node sends as requests: they
+/// count as indicated only once the peer answers one (#1223 review).
+fn is_recovery_request(msg_type: u8) -> bool {
+    msg_type == Gtp2MessageType::CreateSessionRequest as u8
+        || msg_type == Gtp2MessageType::ModifyBearerRequest as u8
+}
+
+/// The answers that prove `peer` received a request of this node's that carried
+/// its Recovery (#1223 review): until one arrives, those requests keep carrying it.
+fn note_recovery_received(inner: &Arc<GtpcInner>, peer: SocketAddr, msg_type: u8) {
+    use Gtp2MessageType as T;
+    if [
+        T::CreateSessionResponse,
+        T::ModifyBearerResponse,
+        T::EchoResponse,
+    ]
+    .iter()
+    .any(|t| *t as u8 == msg_type)
+    {
+        if let Ok(mut set) = inner.recovery_indicated.lock() {
+            set.insert(peer);
+        }
+    }
 }
 
 /// Track the peer's restart counter and act on a confirmed restart
@@ -1438,15 +1524,18 @@ fn note_peer_recovery(inner: &Arc<GtpcInner>, peer: SocketAddr, restart_counter:
         // Only overwrite when the value is not stale, so a racing datagram
         // cannot rewrite the stored counter backwards and make the NEXT genuine
         // message look like a restart.
-        match peer_restart.get(&peer.ip()).copied() {
+        // #1208 review: an IPv4 peer reached over a dual-stack [::] socket shows
+        // as ::ffff:a.b.c.d; it is the same node as a.b.c.d.
+        let ip = peer.ip().to_canonical();
+        match peer_restart.get(&ip).copied() {
             Some(prev) => {
                 if restart_counter_order(prev, restart_counter) == RestartOrder::Restarted {
-                    peer_restart.insert(peer.ip(), restart_counter);
+                    peer_restart.insert(ip, restart_counter);
                 }
                 Some(prev)
             }
             None => {
-                peer_restart.insert(peer.ip(), restart_counter);
+                peer_restart.insert(ip, restart_counter);
                 None
             }
         }
@@ -1479,10 +1568,10 @@ fn note_peer_recovery(inner: &Arc<GtpcInner>, peer: SocketAddr, restart_counter:
             }
             // The restarted peer no longer knows this node's counter (#1220).
             if let Ok(mut set) = inner.recovery_indicated.lock() {
-                set.retain(|p| p.ip() != peer.ip());
+                set.retain(|p| p.ip().to_canonical() != peer.ip().to_canonical());
             }
             if restart_deletion_enabled() {
-                delete_contexts_for_peer(peer.ip());
+                delete_contexts_for_peer(peer.ip().to_canonical());
             } else {
                 log::warn!(
                     "Peer {} restart detected but SGWC_RESTART_DELETE_CONTEXTS is off: \
@@ -1942,7 +2031,9 @@ fn warn_abandoned_s5c_eviction(now: Instant, total: u64) {
     }
     *last = Some(now);
     log::warn!(
-        "{ABANDONED_S5C_CAP} S5/S8 Create Session Requests abandoned after N3 are remembered;          the oldest are forgotten ({total} so far), so a late PGW answer to them leaves its PDN          connection at the PGW (sgwc_s5_abandoned_create_evicted_total)"
+        "{ABANDONED_S5C_CAP} S5/S8 Create Session Requests abandoned after N3 are remembered; \
+         the oldest are forgotten ({total} so far), so a late PGW answer to them leaves its PDN \
+         connection at the PGW (sgwc_s5_abandoned_create_evicted_total)"
     );
 }
 
@@ -2094,17 +2185,23 @@ fn dispatch_s5c_create_session_response(msg: &Gtp2Message, peer: SocketAddr) {
     // builds the S11 Create Session Response from. Before #52 the PAA was COPIED from
     // the MME's request (`parsed.paa` into `sess.paa`), so the UE was handed back the
     // address it had asked about with no node having allocated anything.
+    // #1208 review: the PGW's control address is the session's anchor for
+    // restart and path-failure cleanup (TS 23.007 §16.1A.2), whatever the PAA:
+    // a response without one (a partial or new-PDN-type acceptance, a Non-IP
+    // PDN) still anchors the PDN connection at that PGW. Both families, so an
+    // IPv6 (or dual-stack) PGW is matched too.
+    if let Some(ft) = pgw_c.as_ref() {
+        if let Some(mut sess) = ctx.sess_find_by_id(sess_id) {
+            sess.pgw_addr = ft.ipv4_addr.map(std::net::Ipv4Addr::from);
+            sess.pgw_addr6 = ft.ipv6_addr.map(std::net::Ipv6Addr::from);
+            ctx.sess_update(&sess);
+        }
+    }
     if let Some(paa) = paa {
         if let Some(mut sess) = ctx.sess_find_by_id(sess_id) {
             sess.paa.pdn_type = paa.pdn_type;
             sess.paa.ipv4_addr = paa.ipv4_addr.map(std::net::Ipv4Addr::from);
             sess.paa.ipv6_addr = paa.ipv6_addr.map(std::net::Ipv6Addr::from);
-            if let Some(ft) = pgw_c.as_ref() {
-                sess.pgw_addr = ft.ipv4_addr.map(std::net::Ipv4Addr::from);
-                // #1208: an IPv6 (or dual-stack) PGW is matched on restart and
-                // path failure too.
-                sess.pgw_addr6 = ft.ipv6_addr.map(std::net::Ipv6Addr::from);
-            }
             ctx.sess_update(&sess);
             log::info!(
                 "S5/S8 Create Session Response from {peer}: PGW allocated PAA {:?} (pdn_type={})",
@@ -4303,6 +4400,8 @@ mod tests {
         s5u_ipv6: std::sync::Arc<std::sync::Mutex<Option<[u8; 16]>>>,
         /// Every message received, decoded (#607).
         msgs: std::sync::Arc<std::sync::Mutex<Vec<Gtp2Message>>>,
+        /// When set, the Create Session Response carries no PAA (#1208 review).
+        omit_paa: std::sync::Arc<std::sync::atomic::AtomicBool>,
         /// The stand-in's socket, so a test can send PGW-initiated Requests (#607).
         sock: std::sync::Arc<tokio::net::UdpSocket>,
     }
@@ -4334,6 +4433,8 @@ mod tests {
         let created_cause = create_cause.clone();
         let s5u_ipv6 = std::sync::Arc::new(std::sync::Mutex::new(None::<[u8; 16]>));
         let s5u_v6 = s5u_ipv6.clone();
+        let omit_paa = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let no_paa = omit_paa.clone();
         let creates_seen = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let (dels, answer_dels) = (deletes.clone(), answer_deletes.clone());
         let (del_cause, create_delay) = (delete_cause.clone(), create_delay_ms.clone());
@@ -4419,7 +4520,9 @@ mod tests {
                 let teid =
                     0x0BEE_F001 + creates_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 resp.add_ie(Gtp2FTeidIe::new_ipv4(7, teid, [127, 0, 0, 1]).to_ie(1));
-                resp.add_ie(Gtp2PaaIe::ipv4(PGW_ALLOCATED_ADDR).to_ie(0));
+                if !no_paa.load(std::sync::atomic::Ordering::SeqCst) {
+                    resp.add_ie(Gtp2PaaIe::ipv4(PGW_ALLOCATED_ADDR).to_ie(0));
+                }
                 let mut bc = Gtp2BearerContextIe::new();
                 bc.set_ebi(5);
                 let s5u = match *s5u_v6.lock().unwrap_or_else(|e| e.into_inner()) {
@@ -4442,6 +4545,7 @@ mod tests {
             create_cause,
             s5u_ipv6,
             msgs,
+            omit_paa,
             sock,
         }
     }
@@ -6110,6 +6214,89 @@ mod tests {
             .teid
     }
 
+    /// #1223 review, TS 29.274 §7.2.0: a PGW that drops the first Create Session
+    /// Request (and its retransmission: N3 runs out) never got this SGW's
+    /// Recovery, so the next Create carries it again; once the PGW has answered
+    /// one, the following Create carries none.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recovery_is_carried_until_the_pgw_answers_a_request() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let _sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let pgw = UdpSocket::bind("127.0.0.1:0").unwrap();
+        pgw.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let pgw_addr = pgw.local_addr().unwrap();
+        sgwc_self().set_pgw_s5c_peer(Some(pgw_addr));
+        let server = test_server(&ambient, 100, 1);
+        set_s11_server(server.clone());
+        let mme = client();
+        mme.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let own = server.restart_counter();
+        let next_csr = |pgw: &UdpSocket| loop {
+            let mut buf = [0u8; 4096];
+            let (len, from) = pgw.recv_from(&mut buf).expect("a request at the PGW");
+            let m = Gtp2Message::decode(&mut Bytes::copy_from_slice(&buf[..len])).unwrap();
+            if m.header.message_type == Gtp2MessageType::CreateSessionRequest as u8 {
+                return (m, from);
+            }
+        };
+        let recovery = |m: &Gtp2Message| {
+            m.get_ie(Gtp2IeType::Recovery as u8, 0)
+                .map(|ie| ie.value.to_vec())
+        };
+
+        // 1. Dropped: the request and its one retransmission go unanswered.
+        mme.send_to(
+            &csr(0x1251, &[0x31, 0x31, 0x31, 0x31, 0x31, 0x25, 0x51]).encode(),
+            server.local_addr(),
+        )
+        .unwrap();
+        let (first, _) = next_csr(&pgw);
+        assert_eq!(recovery(&first), Some(vec![own]));
+        let (again, _) = next_csr(&pgw);
+        assert_eq!(again.header.sequence_number, first.header.sequence_number);
+        let rsp = recv_s11(&mme).await.expect("the MME is answered after N3");
+        assert_eq!(cause_of(&rsp), gtp_cause::REMOTE_PEER_NOT_RESPONDING);
+        assert!(
+            !server.recovery_indicated_to(pgw_addr),
+            "not indicated: never answered"
+        );
+
+        // 2. Carried again; this time the PGW answers (a refusal still proves
+        // the request, and its Recovery, arrived).
+        mme.send_to(
+            &csr(0x1252, &[0x31, 0x31, 0x31, 0x31, 0x31, 0x25, 0x52]).encode(),
+            server.local_addr(),
+        )
+        .unwrap();
+        let (second, from) = next_csr(&pgw);
+        assert_eq!(recovery(&second), Some(vec![own]), "carried until answered");
+        let mut answer = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+            Gtp2MessageType::CreateSessionResponse as u8,
+            0,
+            second.header.sequence_number,
+        ));
+        answer.add_ie(Gtp2CauseIe::new(gtp_cause::NO_RESOURCES_AVAILABLE).to_ie(0));
+        pgw.send_to(&answer.encode(), from).unwrap();
+        let _ = recv_s11(&mme).await.expect("the MME is answered");
+        assert!(server.recovery_indicated_to(pgw_addr));
+
+        // 3. Indicated: no Recovery any more.
+        mme.send_to(
+            &csr(0x1253, &[0x31, 0x31, 0x31, 0x31, 0x31, 0x25, 0x53]).encode(),
+            server.local_addr(),
+        )
+        .unwrap();
+        let (third, _) = next_csr(&pgw);
+        assert_eq!(recovery(&third), None, "the PGW has it");
+        sgwc_self().set_pgw_s5c_peer(None);
+        server.close();
+    }
+
     /// #1220, TS 29.274 §7.2.0 / Table 7.2.1-1: the S5/S8 Create Session Request
     /// carries this SGW's Recovery on its first contact with the PGW, and the S11
     /// Create Session Response on the first contact with the MME; not again
@@ -6174,6 +6361,114 @@ mod tests {
             "re-indicated after the PGW's restart"
         );
         sgwc_self().set_pgw_s5c_peer(None);
+        server.close();
+    }
+
+    /// #1248 review: a PGW's Create Session Response revealing its restart (a
+    /// changed Recovery) clears the "told" mark that the answer itself set, so
+    /// the next Create Session Request to it carries this SGW's Recovery again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restart_seen_in_an_answer_resends_recovery() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let _sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let pgw = UdpSocket::bind("127.0.0.1:0").unwrap();
+        pgw.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let pgw_addr = pgw.local_addr().unwrap();
+        sgwc_self().set_pgw_s5c_peer(Some(pgw_addr));
+        let server = test_server(&ambient, 1000, 1);
+        set_s11_server(server.clone());
+        let mme = client();
+        mme.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let own = server.restart_counter();
+        let next_csr = |pgw: &UdpSocket| loop {
+            let mut buf = [0u8; 4096];
+            let (len, from) = pgw.recv_from(&mut buf).expect("a request at the PGW");
+            let m = Gtp2Message::decode(&mut Bytes::copy_from_slice(&buf[..len])).unwrap();
+            if m.header.message_type == Gtp2MessageType::CreateSessionRequest as u8 {
+                return (m, from);
+            }
+        };
+        let refuse = |pgw: &UdpSocket, req: &Gtp2Message, to: SocketAddr, recovery: u8| {
+            let mut answer = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+                Gtp2MessageType::CreateSessionResponse as u8,
+                0,
+                req.header.sequence_number,
+            ));
+            answer.add_ie(Gtp2CauseIe::new(gtp_cause::NO_RESOURCES_AVAILABLE).to_ie(0));
+            answer.add_ie(Gtp2Ie::from_slice(
+                Gtp2IeType::Recovery as u8,
+                0,
+                &[recovery],
+            ));
+            pgw.send_to(&answer.encode(), to).unwrap();
+        };
+        let recovery = |m: &Gtp2Message| {
+            m.get_ie(Gtp2IeType::Recovery as u8, 0)
+                .map(|ie| ie.value.to_vec())
+        };
+        let imsi = |n: u8| [0x31, 0x31, 0x31, 0x31, 0x31, 0x26, n];
+
+        // The PGW answers with counter 4: told, and its counter known.
+        mme.send_to(&csr(0x1261, &imsi(0x01)).encode(), server.local_addr())
+            .unwrap();
+        let (first, from) = next_csr(&pgw);
+        assert_eq!(recovery(&first), Some(vec![own]));
+        refuse(&pgw, &first, from, 4);
+        let _ = recv_s11(&mme).await.expect("answered");
+        // Already told; this answer carries counter 5: the PGW restarted.
+        mme.send_to(&csr(0x1262, &imsi(0x02)).encode(), server.local_addr())
+            .unwrap();
+        let (second, from) = next_csr(&pgw);
+        assert_eq!(recovery(&second), None, "told");
+        refuse(&pgw, &second, from, 5);
+        let _ = recv_s11(&mme).await.expect("answered");
+        // The restarted PGW is told again.
+        mme.send_to(&csr(0x1263, &imsi(0x03)).encode(), server.local_addr())
+            .unwrap();
+        let (third, _) = next_csr(&pgw);
+        assert_eq!(
+            recovery(&third),
+            Some(vec![own]),
+            "the restarted PGW gets this SGW's Recovery again"
+        );
+        sgwc_self().set_pgw_s5c_peer(None);
+        server.close();
+    }
+
+    /// #1223 review: the two responses whose Recovery row is O (Release Access
+    /// Bearers Response, Table 7.2.22-1; Bearer Resource Failure Indication,
+    /// 7.2.6-1) carry it on first contact too.
+    #[test]
+    fn the_optional_recovery_responses_carry_it_on_first_contact() {
+        let ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let server = test_server(&ambient, 1000, 1);
+        let own = server.restart_counter();
+        for (n, t) in [
+            Gtp2MessageType::ReleaseAccessBearersResponse,
+            Gtp2MessageType::BearerResourceFailureIndication,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let peer: SocketAddr = format!("192.0.2.{}:2123", 20 + n).parse().unwrap();
+            let m = Gtp2Message::new(nextgcore_gtp::v2::header::Gtp2Header::new(t as u8, 1, 1));
+            let out = server.with_own_recovery(peer, &m);
+            assert_eq!(
+                out.get_ie(Gtp2IeType::Recovery as u8, 0)
+                    .map(|ie| ie.value.to_vec()),
+                Some(vec![own]),
+                "{t:?}"
+            );
+            assert!(
+                server.recovery_indicated_to(peer),
+                "a response counts at once"
+            );
+        }
         server.close();
     }
 
@@ -9444,10 +9739,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_ipv6_pgw_restart_deletes_its_pdn_connections() {
         let ambient = crate::pfcp_path::process_state_test_guard().await;
-        let Ok(pgw) = UdpSocket::bind("[::1]:0") else {
-            eprintln!("no IPv6 loopback here; skipped");
-            return;
-        };
+        // #1208 review: no silent skip. The test needs the IPv6 loopback (the
+        // CI runners and the dev hosts have it); without it, it fails and says so.
+        let pgw = UdpSocket::bind("[::1]:0")
+            .expect("this test needs the IPv6 loopback [::1] (TS 23.007 §16.1A.2 over IPv6)");
         let sgwu = stand_in_sgwu(
             &ambient,
             crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
@@ -9512,6 +9807,77 @@ mod tests {
         );
         ctx.ue_remove(other_ue);
         server.close();
+    }
+
+    /// #1208 review: a PGW answer without a PAA (here an acceptance with a new
+    /// PDN type, cause 19) still anchors the PDN connection at that PGW: its
+    /// control address is stored, so its restart or path failure finds it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_pgw_address_is_kept_when_its_answer_has_no_paa() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let _sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let pgw = with_stand_in_pgw().await;
+        pgw.omit_paa
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        pgw.create_cause.store(
+            gtp_cause::NEW_PDN_TYPE_DUE_TO_SINGLE_ADDRESS_BEARER_ONLY,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        let server = test_server(&ambient, 1000, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x12, 0x08];
+        sock.send_to(&csr(0x1208, &imsi).encode(), server.local_addr())
+            .unwrap();
+        let _ = recv_s11(&sock).await.expect("the MME is answered");
+        let ctx = sgwc_self();
+        let ue = ctx.ue_find_by_imsi(&imsi).expect("the UE");
+        let sess = ctx.sess_list_for_ue(ue.id).remove(0);
+        assert_eq!(
+            sess.pgw_addr,
+            Some(Ipv4Addr::LOCALHOST),
+            "the PGW's S5/S8-C address, without a PAA"
+        );
+        // Other tests' sessions at the stand-ins' 127.0.0.1 may be in the shared
+        // store too: this one must be among them.
+        assert!(
+            ctx.sess_list_for_pgw_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
+                .iter()
+                .any(|s| s.id == sess.id),
+            "found by the PGW cleanup"
+        );
+        ctx.ue_remove(ue.id);
+        sgwc_self().set_pgw_s5c_peer(None);
+        server.close();
+    }
+
+    /// #1208 review: an IPv4 peer reached over a dual-stack `[::]` socket shows
+    /// as `::ffff:a.b.c.d`. It is the same node: its PDN connections and its
+    /// MME's UEs are matched by the cleanup.
+    #[test]
+    fn an_ipv4_mapped_peer_address_matches_its_ipv4_contexts() {
+        let ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let mme: SocketAddr = "192.0.2.31:2123".parse().unwrap();
+        let (ue_id, sess_id) =
+            ue_with_session_at_pgw(mme, Ipv4Addr::new(192, 0, 2, 32), b"001011208000003");
+        let ctx = sgwc_self();
+        let mapped = |a: [u8; 4]| IpAddr::V6(Ipv4Addr::from(a).to_ipv6_mapped());
+        assert_eq!(
+            ctx.sess_list_for_pgw_ip(mapped([192, 0, 2, 32]))
+                .iter()
+                .map(|s| s.id)
+                .collect::<Vec<_>>(),
+            vec![sess_id]
+        );
+        assert_eq!(ctx.ue_ids_for_mme_ip(mapped([192, 0, 2, 31])), vec![ue_id]);
+        ctx.ue_remove(ue_id);
+        drop(ambient);
     }
 
     /// #1213: `delete_pdn_connections_for_pgw` tells the MME and the SGW-U before

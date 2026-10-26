@@ -552,8 +552,17 @@ fn handle_s1ap_message_inner(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<
             crate::s1ap_gen::PROC_E_RAB_MODIFY => {
                 match crate::s1ap_gen::decode_erab_modify_response(data) {
                     ResponseDecode::Decoded { msg, notify } => {
+                        let out = report(msg.mme_ue_s1ap_id, msg.enb_ue_s1ap_id, &notify);
+                        handle_erab_modify_response(
+                            ctx,
+                            enb_id,
+                            msg.mme_ue_s1ap_id,
+                            msg.enb_ue_s1ap_id,
+                            &msg.erab_modify_list,
+                            &msg.erab_failed_list,
+                        );
                         log_erab_failures(enb_id, &msg.erab_failed_list);
-                        return report(msg.mme_ue_s1ap_id, msg.enb_ue_s1ap_id, &notify);
+                        return out;
                     }
                     ResponseDecode::Failed(ies) => return failed(ies),
                     ResponseDecode::Undecodable => {}
@@ -1283,6 +1292,14 @@ fn handle_s1ap_message_inner(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<
             Vec::new()
         }
         S1apMessage::ErabModifyResponse(msg) => {
+            handle_erab_modify_response(
+                ctx,
+                enb_id,
+                msg.mme_ue_s1ap_id,
+                msg.enb_ue_s1ap_id,
+                &msg.erab_modify_list,
+                &msg.erab_failed_list,
+            );
             log_erab_failures(enb_id, &msg.erab_failed_list);
             Vec::new()
         }
@@ -5147,8 +5164,57 @@ pub(crate) fn handle_erab_setup_response(
     }
     // #641, TS 23.401 §5.4.1 step 5: the E-RAB half of a dedicated bearer activation.
     let set_up: Vec<u8> = erab_setup_list.iter().map(|i| i.erab_id).collect();
-    let failed: Vec<u8> = erab_failed_list.iter().map(|i| i.erab_id).collect();
-    crate::bearer_activation::on_erab_setup(ctx, enb_ue.mme_ue_id, &set_up, &failed);
+    crate::bearer_activation::on_erab_setup(
+        ctx,
+        enb_ue.mme_ue_id,
+        &set_up,
+        &handover_flagged(erab_failed_list),
+    );
+}
+
+/// #641 follow-up: the failed E-RABs, each with whether its cause is a handover
+/// being triggered (TS 36.413 §9.2.1.3), which is re-attempted after the handover
+/// (TS 23.401 §5.5.1.1.2) rather than reported.
+fn handover_flagged(failed: &[nextgcore_s1ap::ErabFailedItem]) -> Vec<(u8, bool)> {
+    failed
+        .iter()
+        .map(|i| {
+            use nextgcore_s1ap::CauseRadioNetwork as R;
+            let handover = matches!(
+                i.cause,
+                nextgcore_s1ap::Cause::RadioNetwork(
+                    R::S1IntraSystemHandoverTriggered
+                        | R::S1InterSystemHandoverTriggered
+                        | R::X2HandoverTriggered
+                )
+            );
+            (i.erab_id, handover)
+        })
+        .collect()
+}
+
+/// The E-RAB MODIFY RESPONSE (TS 36.413 §8.2.2.2): the eNB half of a bearer
+/// modification (#641 Update half, TS 23.401 §5.4.2.1 step 5).
+pub(crate) fn handle_erab_modify_response(
+    ctx: &MmeContext,
+    enb_id: u64,
+    mme_ue_s1ap_id: u32,
+    enb_ue_s1ap_id: u32,
+    modified: &[u8],
+    erab_failed_list: &[nextgcore_s1ap::ErabFailedItem],
+) {
+    // #846: the sending eNB's pair, else ERROR INDICATION (TS 36.413 §10.6).
+    let Some(enb_ue) = ue_associated_target_or_answer(ctx, enb_id, mme_ue_s1ap_id, enb_ue_s1ap_id)
+        .and_then(|id| ctx.enb_ue_find_by_id(id))
+    else {
+        return;
+    };
+    crate::bearer_activation::on_erab_modify(
+        ctx,
+        enb_ue.mme_ue_id,
+        modified,
+        &handover_flagged(erab_failed_list),
+    );
 }
 
 fn log_erab_failures(enb_id: u64, failures: &[nextgcore_s1ap::ErabFailedItem]) {

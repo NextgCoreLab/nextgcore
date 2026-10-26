@@ -27,6 +27,15 @@
 //!
 //!    A failed bearer is removed in the MME.
 //!
+//! **Modification** (#641's Update half, TS 23.401 §5.4.2 / §5.4.3, TS 24.301 §6.4.3)
+//! rides the same machinery ([`Op::Update`]): the Serving GW's Update Bearer Request
+//! (TS 29.274 §7.2.15) names existing bearers by EBI; each gets a MODIFY EPS BEARER
+//! CONTEXT REQUEST (T3486), in an E-RAB MODIFY REQUEST when its QoS (or the
+//! APN-AMBR, hence the UE-AMBR) changes, else in a DOWNLINK NAS TRANSPORT (a TFT-only
+//! change, §5.4.3). The Update Bearer Response (§7.2.16) follows the eNB's and the
+//! UE's answers; a bearer that failed keeps its old QoS and TFT. Paging, the Attach
+//! hold, the handover pause, the answer budget and the PDN-gone check are shared.
+//!
 //! Lock order: [`PENDING`] is never taken while a context pool lock is held, and pool
 //! locks taken under it are taken one at a time (as in `bearer_deactivation`).
 
@@ -44,25 +53,21 @@ pub const T3485_DURATION: Duration = Duration::from_secs(8);
 /// Retransmissions before the fifth expiry aborts the procedure (§6.4.2.6).
 const T3485_RETRANSMISSIONS: u32 = 4;
 
-/// How long before the Serving GW's own deadline the answer must be out: the
-/// S11 one-way delay and the SGW's poll granularity, with room to spare.
-const ANSWER_MARGIN: Duration = Duration::from_secs(2);
-
-/// How long the MME may take to answer a Create Bearer Request (#1216 review M5).
+/// How long the MME may take to answer a Create Bearer Request (#1216 review M5,
+/// #1228).
 ///
-/// The Serving GW relays the request under its S11 transaction, T3 x (N3 + 1)
-/// (TS 29.274 §7.6; nextgcore-sgwcd uses the GTP library default, 3 s x 4 =
-/// 12 s), and gives up after it: it removes the bearer at the SGW-U and answers
-/// the PDN GW "Remote peer not responding" (sgwcd `dedicated_bearer::mme_silent`).
-/// An answer after that would set the bearer up in the MME, the eNB and the UE
-/// only. So the MME answers within that window less [`ANSWER_MARGIN`] (10 s):
-/// whatever is unsettled by then fails, paging "Unable to page UE", anything
-/// else "UE not responding". T3485 x 5 (40 s, TS 24.301 §6.4.2.6) and paging
-/// are cut short by it; a per-procedure T3/N3 on the SGW/PGW legs is tracked
-/// separately.
+/// The Serving GW relays the request under its S11 transaction and gives up
+/// after it: it removes the bearer at the SGW-U and answers the PDN GW "Remote
+/// peer not responding" (sgwcd `dedicated_bearer::mme_silent`). An answer after
+/// that would set the bearer up in the MME, the eNB and the UE only. sgwcd runs
+/// the paging-dependent bearer Requests with their own T3 (TS 29.274 §7.6),
+/// 13.5 s x (3 + 1) = 54 s, and the PGW its S5/S8 one for 60 s; the MME answers
+/// within `nextgcore_gtp::v2::xact::MME_BEARER_PROCEDURE_BUDGET` (50 s), which
+/// covers T3485 x 5 (40 s, TS 24.301 §6.4.2.6) and about 10 s of paging.
+/// Whatever is unsettled by then fails, paging "Unable to page UE", anything
+/// else "UE not responding".
 pub fn answer_budget() -> Duration {
-    let sgw = nextgcore_gtp::v2::xact::Gtp2XactConfig::default();
-    (sgw.t3_response * (sgw.n3_requests + 1)).saturating_sub(ANSWER_MARGIN)
+    nextgcore_gtp::v2::xact::MME_BEARER_PROCEDURE_BUDGET
 }
 
 /// Whether `ue` is in an Attach that has not completed (Annex F NOTE 2). A UE
@@ -72,7 +77,34 @@ fn attach_in_progress(ue: &crate::context::MmeUe) -> bool {
     !ue.attach_completed && ue.nas_eps.type_ == crate::context::MmeEpsType::AttachRequest
 }
 
-/// One bearer of a Create Bearer Request.
+/// Which Serving GW request a pending entry carries out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Op {
+    /// Create Bearer Request (TS 23.401 §5.4.1).
+    Create,
+    /// Update Bearer Request (TS 23.401 §5.4.2, §5.4.3).
+    Update,
+}
+
+/// What a modification sends for one bearer (Op::Update).
+#[derive(Debug, Clone)]
+struct Modify {
+    /// The bearer as it was, restored when the modification fails.
+    prior: crate::context::MmeBearer,
+    /// New EPS QoS in the NAS request (the Bearer QoS changed).
+    qos: bool,
+    /// TFT in the NAS request (the TFT changed).
+    tft: bool,
+    /// APN-AMBR in the NAS request, bit/s (dl, ul), when it changed.
+    apn_ambr: Option<(u64, u64)>,
+    /// The E-RAB MODIFY REQUEST carries it (QoS or UE-AMBR change), else the NAS
+    /// request goes in a DOWNLINK NAS TRANSPORT.
+    erab: bool,
+    /// The QoS change is the ARP alone (TS 23.401 §5.4.2.1 step 3).
+    arp_only: bool,
+}
+
+/// One bearer of a Create (or Update) Bearer Request.
 #[derive(Debug, Clone)]
 struct Item {
     /// The bearer in the pool; 0 for a Bearer Context refused before one was created.
@@ -88,6 +120,8 @@ struct Item {
     nas: Option<Result<(), GtpCause>>,
     /// Settled before signalling (no EBI, a missing IE, ...).
     refused: Option<GtpCause>,
+    /// For a modification: what it changes, and the bearer before it.
+    modify: Option<Modify>,
 }
 
 impl Item {
@@ -112,11 +146,16 @@ enum Parked {
     Paging,
     /// The Attach has not completed (Annex F NOTE 2).
     Attach,
+    /// A handover is running (TS 23.401 §5.5.1.1.2, §5.5.1.2.2): the E-RAB SETUP
+    /// is paused, or the eNB refused it as "handover triggered" (TS 36.413
+    /// §9.2.1.3), and is re-attempted when the handover is over.
+    Handover,
 }
 
 /// A Create Bearer Request whose answer waits for the eNB and the UE.
 #[derive(Debug, Clone)]
 struct PendingActivation {
+    op: Op,
     mme_ue_id: u64,
     peer: SocketAddr,
     seq: u32,
@@ -129,6 +168,14 @@ struct PendingActivation {
     parked: Parked,
     /// When the request arrived: the answer is due by [`answer_budget`] after it.
     received: Instant,
+    /// For [`Parked::Handover`]: the S1 connection the request was parked on, and
+    /// when to re-attempt anyway (an X2 handover the MME only sees at its Path
+    /// Switch, or one that failed: "known by expiry of the timer guarding the NAS
+    /// procedure", §5.5.1.1.2).
+    handover_park: Option<(u64, Instant)>,
+    /// For a modification that changed the APN-AMBR: the PDN connection and its
+    /// APN-AMBR before, restored when every bearer failed.
+    prior_apn_ambr: Option<(u64, crate::context::Bitrate)>,
 }
 
 /// The activations in progress. Process-global like `bearer_deactivation`'s;
@@ -148,6 +195,93 @@ pub fn pending_count() -> usize {
 /// out: a retransmission is not acted on twice (TS 29.274 §7.6).
 pub fn in_flight(peer: SocketAddr, seq: u32) -> bool {
     pending().iter().any(|p| p.peer == peer && p.seq == seq)
+        || deferred().iter().any(|d| d.peer == peer && d.seq == seq)
+}
+
+/// An Update Bearer Request held because a procedure of this module is still
+/// running on one of its bearers (#1265 review): an activation not yet settled,
+/// or an earlier modification. TS 24.301 §6.4.3.2 lets the MME run one EPS
+/// bearer context modification per bearer at a time, and applying a second
+/// over the first would clobber its rollback; so the second waits, and runs
+/// when the bearer is free. Its answer budget runs from its arrival.
+struct Deferred {
+    mme_ue_id: u64,
+    peer: SocketAddr,
+    seq: u32,
+    raw: Vec<u8>,
+    received: Instant,
+}
+
+static DEFERRED: Mutex<Vec<Deferred>> = Mutex::new(Vec::new());
+
+fn deferred() -> std::sync::MutexGuard<'static, Vec<Deferred>> {
+    DEFERRED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether a procedure of this module holds `ebi` of `mme_ue_id`.
+fn ebi_busy(mme_ue_id: u64, ebi: u8) -> bool {
+    pending()
+        .iter()
+        .filter(|p| p.mme_ue_id == mme_ue_id)
+        .any(|p| p.items.iter().any(|i| i.ebi == ebi && i.bearer_id != 0))
+}
+
+/// Run the deferred Update Bearer Requests of `mme_ue_id` whose bearers are now
+/// free; refuse those past the answer budget (94).
+fn replay_deferred(mme_ue_id: u64) {
+    let budget = answer_budget();
+    let ready: Vec<Deferred> = {
+        let mut list = deferred();
+        let mut taken = Vec::new();
+        let mut i = 0;
+        while i < list.len() {
+            let d = &list[i];
+            let free = d.mme_ue_id == mme_ue_id
+                && !update_ebis(&d.raw).iter().any(|e| ebi_busy(mme_ue_id, *e));
+            let late = d.received.elapsed() >= budget;
+            if (d.mme_ue_id == mme_ue_id && free) || late {
+                taken.push(list.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        taken
+    };
+    for d in ready {
+        if d.received.elapsed() >= budget {
+            refuse_deferred(&d, GtpCause::RequestRejectedReasonNotSpecified);
+        } else {
+            handle_update_at(&d.raw, d.seq, d.peer, d.received);
+        }
+    }
+}
+
+fn refuse_deferred(d: &Deferred, cause: GtpCause) {
+    let ctx = crate::context::mme_self();
+    let sgw_teid = ctx
+        .mme_ue_find_by_id(d.mme_ue_id)
+        .and_then(|u| ctx.sgw_ue_find_by_id(u.sgw_ue_id))
+        .map(|s| s.sgw_s11_teid)
+        .unwrap_or(0);
+    let rsp = update_refusal(sgw_teid, &update_ebis(&d.raw), cause, None, d.seq);
+    if let Err(e) = crate::gtp_path::send_response_to_sgwc(d.peer, &rsp) {
+        log::error!("S11 Update Bearer Response to {} failed: {e}", d.peer);
+    }
+}
+
+/// The EBIs an Update Bearer Request names.
+fn update_ebis(raw: &[u8]) -> Vec<u8> {
+    let mut bytes = bytes::Bytes::copy_from_slice(raw);
+    Gtp2Message::decode(&mut bytes)
+        .map(|msg| {
+            msg.get_ies(Gtp2IeType::BearerContext as u8)
+                .into_iter()
+                .filter(|ie| ie.instance == 0)
+                .filter_map(|ie| Gtp2BearerContextIe::decode(&ie.value).ok())
+                .filter_map(|bc| bc.ebi().ok())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// A Bearer Context of the request.
@@ -169,8 +303,14 @@ fn ip_of(f: &Gtp2FTeidIe) -> IpAddr {
 
 /// The lowest EPS bearer identity in 5..=15 that `mme_ue_id` does not use.
 fn free_ebi(ctx: &MmeContext, mme_ue_id: u64, taken: &[u8]) -> Option<u8> {
-    (crate::context::MIN_EPS_BEARER_ID..=crate::context::MAX_EPS_BEARER_ID)
-        .find(|e| !taken.contains(e) && ctx.bearer_find_by_ebi(mme_ue_id, *e).is_none())
+    (crate::context::MIN_EPS_BEARER_ID..=crate::context::MAX_EPS_BEARER_ID).find(|e| {
+        !taken.contains(e)
+                && ctx.bearer_find_by_ebi(mme_ue_id, *e).is_none()
+                // #1245 review: an EBI refused while the UE may still answer for
+                // it (a late ACCEPT, or an E-RAB the eNB still holds) is not
+                // handed to a new bearer within REFUSED_HOLD.
+                && !refused_held(mme_ue_id, *e)
+    })
 }
 
 /// Carry out the Serving GW's Create Bearer Request (`raw`, `seq` from `peer`).
@@ -308,6 +448,7 @@ pub fn handle_create_bearer_request(raw: &[u8], seq: u32, peer: SocketAddr) {
             erab: None,
             nas: None,
             refused: Some(c),
+            modify: None,
         };
         let (Some(tft), Some(qos)) = (r.tft, r.qos) else {
             // #1216 review: a Bearer QoS that is there but does not parse (under
@@ -363,9 +504,11 @@ pub fn handle_create_bearer_request(raw: &[u8], seq: u32, peer: SocketAddr) {
             erab: None,
             nas: None,
             refused: None,
+            modify: None,
         });
     }
-    let mut p = PendingActivation {
+    let p = PendingActivation {
+        op: Op::Create,
         mme_ue_id: ue.id,
         peer,
         seq,
@@ -375,32 +518,43 @@ pub fn handle_create_bearer_request(raw: &[u8], seq: u32, peer: SocketAddr) {
         items,
         parked: Parked::No,
         received: Instant::now(),
+        handover_park: None,
+        prior_apn_ambr: None,
     };
     if p.items.iter().all(|i| i.refused.is_some()) {
         answer(ctx, &p);
         return;
     }
+    park_or_signal(ctx, &ue, p, crate::context::PagingType::CreateBearer);
+}
 
+/// A request ready to signal: page an ECM-IDLE UE (step 3), hold it during an
+/// Attach (Annex F NOTE 2) or an S1 handover (§5.5.1.2.2), else signal it now.
+fn park_or_signal(
+    ctx: &MmeContext,
+    ue: &crate::context::MmeUe,
+    mut p: PendingActivation,
+    paging: crate::context::PagingType,
+) {
+    let what = match p.op {
+        Op::Create => "Create Bearer Request",
+        Op::Update => "Update Bearer Request",
+    };
     let connected = ctx
         .enb_ue_find_by_id(ue.enb_ue_id)
         .is_some_and(|e| e.mme_ue_id == ue.id);
     if !connected {
         // Step 3: page the ECM-IDLE UE; the request is signalled once it answers.
-        let paging = ue.t3413.is_running();
-        if !paging
-            && crate::paging::page_ue(ctx, ue.id, crate::context::PagingType::CreateBearer) == 0
-        {
-            log::warn!(
-                "[{}] Create Bearer Request: the ECM-IDLE UE cannot be paged",
-                ue.imsi_bcd
-            );
+        let paging_now = ue.t3413.is_running();
+        if !paging_now && crate::paging::page_ue(ctx, ue.id, paging) == 0 {
+            log::warn!("[{}] {what}: the ECM-IDLE UE cannot be paged", ue.imsi_bcd);
             fail_unsignalled(&mut p, GtpCause::UnableToPageUe);
             answer(ctx, &p);
             return;
         }
         log::info!(
-            "[{}] Create Bearer Request for EBIs {:?}: the UE is ECM-IDLE and paged (TS 23.401 \
-             §5.4.1 step 3)",
+            "[{}] {what} for EBIs {:?}: the UE is ECM-IDLE and paged (TS 23.401 §5.4.1 step 3, \
+             §5.4.2.1)",
             ue.imsi_bcd,
             ebis_of(&p)
         );
@@ -408,11 +562,11 @@ pub fn handle_create_bearer_request(raw: &[u8], seq: u32, peer: SocketAddr) {
         pending().push(p);
         return;
     }
-    if attach_in_progress(&ue) {
+    if attach_in_progress(ue) {
         // Annex F NOTE 2: no separate Bearer Setup before the Attach completes.
         log::info!(
-            "[{}] Create Bearer Request for EBIs {:?} during the Attach: held until ATTACH \
-             COMPLETE (TS 23.401 Annex F)",
+            "[{}] {what} for EBIs {:?} during the Attach: held until ATTACH COMPLETE (TS \
+             23.401 Annex F)",
             ue.imsi_bcd,
             ebis_of(&p)
         );
@@ -420,8 +574,459 @@ pub fn handle_create_bearer_request(raw: &[u8], seq: u32, peer: SocketAddr) {
         pending().push(p);
         return;
     }
+    if s1_handover_in_progress(ctx, ue) {
+        // TS 23.401 §5.5.1.2.2: "the MME should pause non-handover related S1
+        // interface procedures (e.g. ... E-RAB Setup ...) while a handover is
+        // ongoing ... and continue them once the Handover procedure has
+        // completed".
+        log::info!(
+            "[{}] {what} for EBIs {:?} during an S1 handover: E-RAB procedure paused",
+            ue.imsi_bcd,
+            ebis_of(&p)
+        );
+        p.parked = Parked::Handover;
+        p.handover_park = Some((ue.enb_ue_id, Instant::now()));
+        pending().push(p);
+        return;
+    }
     signal(ctx, &mut p);
     finish_or_keep(ctx, p);
+}
+
+/// An Update Bearer Response (TS 29.274 §7.2.16) refusing every Bearer Context
+/// of the request with `cause`; `offending` names the IE when it is missing.
+fn update_refusal(
+    sgw_teid: u32,
+    ebis: &[u8],
+    cause: GtpCause,
+    offending: Option<u8>,
+    seq: u32,
+) -> Gtp2Message {
+    let mut rsp = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+        crate::s11_build::message_type::UPDATE_BEARER_RESPONSE,
+        sgw_teid,
+        seq,
+    ));
+    match offending {
+        Some(ie) => rsp.add_ie(nextgcore_gtp::v2::Gtp2Ie::from_slice(
+            Gtp2IeType::Cause as u8,
+            0,
+            &[cause as u8, 0, ie, 0, 0, 0],
+        )),
+        None => rsp.add_ie(Gtp2CauseIe::new(cause as u8).to_ie(0)),
+    }
+    for ebi in ebis {
+        let mut bc = Gtp2BearerContextIe::new();
+        bc.set_ebi(*ebi);
+        bc.set_cause(&Gtp2CauseIe::new(cause as u8));
+        rsp.add_bearer_context(0, &bc);
+    }
+    rsp
+}
+
+/// Carry out the Serving GW's Update Bearer Request (TS 23.401 §5.4.2.1 steps
+/// 3-8, §5.4.3; TS 29.274 §7.2.15), `raw` at `seq` from `peer`: the bearers it
+/// names by EBI get their new QoS / TFT (and the PDN connection its APN-AMBR),
+/// the UE a MODIFY EPS BEARER CONTEXT REQUEST (TS 24.301 §6.4.3.2) in an E-RAB
+/// MODIFY REQUEST when the QoS or the UE-AMBR changes, else in a DOWNLINK NAS
+/// TRANSPORT; the answer waits for the eNB and the UE.
+pub fn handle_update_bearer_request(raw: &[u8], seq: u32, peer: SocketAddr) {
+    if in_flight(peer, seq) {
+        log::debug!(
+            "S11 Update Bearer Request seq={seq} from {peer} is being carried out; \
+             retransmission ignored"
+        );
+        return;
+    }
+    handle_update_at(raw, seq, peer, Instant::now());
+}
+
+/// [`handle_update_bearer_request`] for a request that arrived at `received`.
+fn handle_update_at(raw: &[u8], seq: u32, peer: SocketAddr, received: Instant) {
+    let ctx = crate::context::mme_self();
+    let mut bytes = bytes::Bytes::copy_from_slice(raw);
+    let Ok(msg) = Gtp2Message::decode(&mut bytes) else {
+        log::warn!("S11 Update Bearer Request seq={seq} from {peer} undecodable; dropped");
+        return;
+    };
+    let send = |rsp: &Gtp2Message| {
+        if let Err(e) = crate::gtp_path::send_response_to_sgwc(peer, rsp) {
+            log::error!("S11 Update Bearer Response to {peer} failed: {e}");
+        }
+    };
+    let contexts: Vec<Gtp2BearerContextIe> = msg
+        .get_ies(Gtp2IeType::BearerContext as u8)
+        .into_iter()
+        .filter(|ie| ie.instance == 0)
+        .filter_map(|ie| Gtp2BearerContextIe::decode(&ie.value).ok())
+        .collect();
+    let ebis: Vec<u8> = contexts.iter().map(|bc| bc.ebi().unwrap_or(0)).collect();
+    let local_teid = msg.header.teid.unwrap_or(0);
+    let Some(ue) = ctx
+        .mme_ue_find_by_s11_local_teid(local_teid)
+        .and_then(|id| ctx.mme_ue_find_by_id(id))
+    else {
+        log::warn!("S11 Update Bearer Request seq={seq}: TEID {local_teid:#x} names no UE");
+        send(&update_refusal(
+            0,
+            &ebis,
+            GtpCause::ContextNotFound,
+            None,
+            seq,
+        ));
+        return;
+    };
+    let sgw_teid = ctx
+        .sgw_ue_find_by_id(ue.sgw_ue_id)
+        .map(|s| s.sgw_s11_teid)
+        .unwrap_or(0);
+    if contexts.is_empty() {
+        send(&update_refusal(
+            sgw_teid,
+            &[],
+            GtpCause::MandatoryIeMissing,
+            Some(Gtp2IeType::BearerContext as u8),
+            seq,
+        ));
+        return;
+    }
+    // APN-AMBR is M (Table 7.2.15-1).
+    let Some((ambr_ul, ambr_dl)) = msg
+        .get_ie(Gtp2IeType::Ambr as u8, 0)
+        .and_then(|ie| crate::s11_handler::parse_ambr(&ie.value))
+    else {
+        log::warn!("S11 Update Bearer Request seq={seq}: no APN-AMBR");
+        send(&update_refusal(
+            sgw_teid,
+            &ebis,
+            GtpCause::MandatoryIeMissing,
+            Some(Gtp2IeType::Ambr as u8),
+            seq,
+        ));
+        return;
+    };
+    let pti = msg
+        .get_ie(Gtp2IeType::Pti as u8, 0)
+        .and_then(|ie| ie.value.first().copied())
+        .unwrap_or(crate::esm_build::PTI_UNASSIGNED);
+    // #1265 review: a bearer still being activated, or modified by an earlier
+    // request, is not modified over it; this request waits for it.
+    if ebis.iter().any(|e| ebi_busy(ue.id, *e)) {
+        log::info!(
+            "[{}] S11 Update Bearer Request seq={seq}: EBIs {ebis:?} are busy with an earlier \
+             procedure; held until it settles",
+            ue.imsi_bcd
+        );
+        deferred().push(Deferred {
+            mme_ue_id: ue.id,
+            peer,
+            seq,
+            raw: raw.to_vec(),
+            received,
+        });
+        return;
+    }
+
+    let mut items = Vec::new();
+    let mut pdn: Option<u64> = None;
+    for bc in &contexts {
+        let ebi = bc.ebi().unwrap_or(0);
+        let refused = |c: GtpCause| Item {
+            bearer_id: 0,
+            ebi,
+            pkbuf: Vec::new(),
+            retries: 0,
+            deadline: Instant::now(),
+            erab: None,
+            nas: None,
+            refused: Some(c),
+            modify: None,
+        };
+        let Some(bearer) = ctx
+            .bearer_find_by_ebi(ue.id, ebi)
+            .and_then(|id| ctx.bearer_find_by_id(id))
+            .filter(|_| ebi != 0)
+        else {
+            items.push(refused(GtpCause::ContextNotFound));
+            continue;
+        };
+        // One PDN connection per request: the APN-AMBR is that connection's.
+        if pdn.is_some_and(|s| s != bearer.sess_id) {
+            items.push(refused(GtpCause::ContextNotFound));
+            continue;
+        }
+        pdn = Some(bearer.sess_id);
+        let qos_ie = bc.get_ie(Gtp2IeType::BearerQos as u8, 0);
+        let qos = qos_ie.and_then(|ie| crate::s11_handler::parse_bearer_qos(&ie.value));
+        if qos_ie.is_some() && qos.is_none() {
+            items.push(refused(GtpCause::MandatoryIeIncorrect));
+            continue;
+        }
+        let tft = bc
+            .get_ie(Gtp2IeType::BearerTft as u8, 0)
+            .map(|ie| ie.value.to_vec())
+            .filter(|t| !t.is_empty());
+        let mut next = bearer.clone();
+        if let Some((qci, pl, pci, pvi, mbr_ul, mbr_dl, gbr_ul, gbr_dl)) = qos {
+            next.qos.qci = qci;
+            next.qos.arp.priority_level = pl;
+            next.qos.arp.pre_emption_capability = pci;
+            next.qos.arp.pre_emption_vulnerability = pvi;
+            next.qos.mbr.uplink = mbr_ul;
+            next.qos.mbr.downlink = mbr_dl;
+            next.qos.gbr.uplink = gbr_ul;
+            next.qos.gbr.downlink = gbr_dl;
+        }
+        if let Some(t) = tft.as_ref() {
+            next.tft = t.clone();
+        }
+        let qos_change = qos.is_some() && next.qos != bearer.qos;
+        // TS 23.401 §5.4.2.1 step 3: only the ARP changed.
+        let arp_only = qos_change
+            && next.qos.qci == bearer.qos.qci
+            && next.qos.mbr == bearer.qos.mbr
+            && next.qos.gbr == bearer.qos.gbr;
+        let tft_change = tft.is_some_and(|t| t != bearer.tft);
+        if let Some(b) = ctx.bearer_pool.write().unwrap().get_mut(&bearer.id) {
+            b.qos = next.qos.clone();
+            b.tft = next.tft.clone();
+        }
+        items.push(Item {
+            bearer_id: bearer.id,
+            ebi,
+            pkbuf: Vec::new(),
+            retries: 0,
+            deadline: Instant::now(),
+            erab: None,
+            nas: None,
+            refused: None,
+            modify: Some(Modify {
+                prior: bearer,
+                qos: qos_change,
+                tft: tft_change,
+                apn_ambr: None,
+                erab: qos_change,
+                arp_only,
+            }),
+        });
+    }
+    // The PDN connection's APN-AMBR: carried in the first bearer's NAS request,
+    // and the UE-AMBR it changes in its E-RAB MODIFY REQUEST (§5.4.2.1 step 4).
+    let mut prior_apn_ambr = None;
+    let mut linked_ebi = 0;
+    if let Some(sess) = pdn.and_then(|id| ctx.sess_find_by_id(id)) {
+        linked_ebi = sess
+            .bearer_list
+            .first()
+            .and_then(|b| ctx.bearer_find_by_id(*b))
+            .map(|b| b.ebi)
+            .unwrap_or(0);
+        if sess.ambr.downlink != ambr_dl || sess.ambr.uplink != ambr_ul {
+            prior_apn_ambr = Some((sess.id, sess.ambr.clone()));
+            if let Some(s) = ctx.sess_pool.write().unwrap().get_mut(&sess.id) {
+                s.ambr.downlink = ambr_dl;
+                s.ambr.uplink = ambr_ul;
+            }
+            if let Some(m) = items
+                .iter_mut()
+                .find_map(|i| i.modify.as_mut().filter(|_| i.refused.is_none()))
+            {
+                m.apn_ambr = Some((ambr_dl, ambr_ul));
+                m.erab = true;
+            }
+        }
+    }
+    // A bearer the request changes nothing on is accepted as it is; the rest are
+    // signalled. One with no E-RAB part (a TFT-only change, §5.4.3) waits only
+    // for the UE.
+    // TS 23.401 §5.4.2.1 step 3: "If only the QoS parameter ARP is modified and if
+    // the UE is in ECM IDLE state the MME shall skip the Network Triggered
+    // Service Request. In that case the following steps 4-9 are also skipped
+    // and the MME sends an Update Bearer Response": the new ARP is kept and the
+    // bearer answered at once; the eNB gets it with the next context setup.
+    let idle = ctx
+        .enb_ue_find_by_id(ue.enb_ue_id)
+        .is_none_or(|e| e.mme_ue_id != ue.id);
+    for i in items.iter_mut() {
+        if let Some(m) = i.modify.as_ref() {
+            let arp_only_idle = idle && m.arp_only && !m.tft && m.apn_ambr.is_none();
+            if (!m.qos && !m.tft && m.apn_ambr.is_none()) || arp_only_idle {
+                i.erab = Some(Ok(()));
+                i.nas = Some(Ok(()));
+            } else if !m.erab {
+                i.erab = Some(Ok(()));
+            }
+        }
+    }
+    let p = PendingActivation {
+        op: Op::Update,
+        mme_ue_id: ue.id,
+        peer,
+        seq,
+        sgw_teid,
+        linked_ebi,
+        pti,
+        items,
+        parked: Parked::No,
+        received,
+        handover_park: None,
+        prior_apn_ambr,
+    };
+    if p.items.iter().all(|i| i.outcome().is_some()) {
+        answer(ctx, &p);
+        return;
+    }
+    park_or_signal(ctx, &ue, p, crate::context::PagingType::UpdateBearer);
+}
+
+/// TS 23.401 §5.4.2.1 step 4 / §5.4.3 step 4: per bearer, the MODIFY EPS BEARER
+/// CONTEXT REQUEST, in an E-RAB MODIFY REQUEST or a DOWNLINK NAS TRANSPORT; T3486
+/// armed (TS 24.301 §6.4.3.2, 8 s like T3485).
+fn signal_modify(ctx: &MmeContext, p: &mut PendingActivation) {
+    p.parked = Parked::No;
+    let Some(mme_ue) = ctx.mme_ue_find_by_id(p.mme_ue_id) else {
+        fail_unsignalled(p, GtpCause::ContextNotFound);
+        return;
+    };
+    let Some(enb_ue) = ctx
+        .enb_ue_find_by_id(mme_ue.enb_ue_id)
+        .filter(|e| e.mme_ue_id == p.mme_ue_id)
+    else {
+        fail_unsignalled(p, GtpCause::UeNotResponding);
+        return;
+    };
+    for item in p
+        .items
+        .iter_mut()
+        .filter(|i| i.outcome().is_none() && i.pkbuf.is_empty())
+    {
+        let (Some(bearer), Some(m)) = (ctx.bearer_find_by_id(item.bearer_id), item.modify.as_ref())
+        else {
+            item.refused = Some(GtpCause::SystemFailure);
+            continue;
+        };
+        let plain = crate::esm_build::build_modify_bearer_context_request_with_ambr(
+            &bearer, p.pti, m.qos, m.tft, m.apn_ambr,
+        );
+        let erab = m.erab;
+        let ue_ambr = m
+            .apn_ambr
+            .map(|_| crate::s1ap_build::ue_ambr_of(ctx, &mme_ue));
+        let sent = crate::nas_path::protect_esm(ctx, p.mme_ue_id, &plain)
+            .map_err(|e| format!("not protected: {e:?}"))
+            .and_then(|esm| {
+                if erab {
+                    crate::s1ap_build::build_e_rab_modify_request_with_ambr(
+                        &enb_ue, &bearer, &esm, ue_ambr,
+                    )
+                    .map_err(|e| format!("E-RAB Modify Request not built: {e:?}"))
+                    .and_then(|pdu| {
+                        crate::nas_path::nas_eps_send_to_enb(&mme_ue, &enb_ue, pdu)
+                            .map_err(|e| format!("not sent: {e:?}"))
+                    })
+                    .map(|_| esm)
+                } else {
+                    crate::nas_path::nas_eps_send_to_downlink_nas_transport(&enb_ue, esm.clone())
+                        .map_err(|e| format!("not sent: {e:?}"))
+                        .map(|_| esm)
+                }
+            });
+        match sent {
+            Ok(esm) => {
+                item.pkbuf = esm;
+                item.retries = 0;
+                item.deadline = Instant::now() + T3485_DURATION;
+            }
+            Err(e) => {
+                log::error!(
+                    "[{}] MODIFY EPS BEARER CONTEXT REQUEST for EBI {}: {e}",
+                    mme_ue.imsi_bcd,
+                    item.ebi
+                );
+                item.refused = Some(GtpCause::SystemFailure);
+            }
+        }
+    }
+    log::info!(
+        "[{}] MODIFY EPS BEARER CONTEXT REQUEST for EBIs {:?}, T3486 armed (TS 23.401 §5.4.2.1 \
+         step 4, §5.4.3)",
+        mme_ue.imsi_bcd,
+        ebis_of(p)
+    );
+}
+
+/// TS 23.401 §5.4.2.1 step 8: the Update Bearer Response (TS 29.274 §7.2.16), each
+/// Bearer Context with its EBI and cause. A bearer that failed gets its QoS and TFT
+/// back; when none succeeded, the APN-AMBR too.
+fn answer_modify(ctx: &MmeContext, p: &PendingActivation) {
+    let mut rsp = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+        crate::s11_build::message_type::UPDATE_BEARER_RESPONSE,
+        p.sgw_teid,
+        p.seq,
+    ));
+    let mut done = 0usize;
+    let mut first_failure = None;
+    let mut contexts = Vec::new();
+    for item in &p.items {
+        let outcome = item.outcome().unwrap_or(Err(GtpCause::UeNotResponding));
+        let mut bc = Gtp2BearerContextIe::new();
+        bc.set_ebi(item.ebi);
+        match outcome {
+            Ok(()) => {
+                done += 1;
+                bc.set_cause(&Gtp2CauseIe::new(GtpCause::RequestAccepted as u8));
+            }
+            Err(cause) => {
+                first_failure.get_or_insert(cause);
+                bc.set_cause(&Gtp2CauseIe::new(cause as u8));
+                if let Some(m) = item.modify.as_ref() {
+                    if let Some(b) = ctx.bearer_pool.write().unwrap().get_mut(&item.bearer_id) {
+                        b.qos = m.prior.qos.clone();
+                        b.tft = m.prior.tft.clone();
+                    }
+                }
+            }
+        }
+        contexts.push(bc);
+    }
+    if done == 0 {
+        if let Some((sess_id, ambr)) = p.prior_apn_ambr.as_ref() {
+            if let Some(s) = ctx.sess_pool.write().unwrap().get_mut(sess_id) {
+                s.ambr = ambr.clone();
+            }
+        }
+    }
+    let cause = match (done, first_failure) {
+        (0, Some(c)) => c,
+        (_, Some(_)) => GtpCause::RequestAcceptedPartially,
+        _ => GtpCause::RequestAccepted,
+    };
+    rsp.add_ie(Gtp2CauseIe::new(cause as u8).to_ie(0));
+    for bc in &contexts {
+        rsp.add_bearer_context(0, bc);
+    }
+    log::info!(
+        "S11 Update Bearer Response to {} (seq {}): cause {}, {done} of {} bearer(s) modified \
+         (TS 23.401 §5.4.2.1 step 8)",
+        p.peer,
+        p.seq,
+        cause as u8,
+        p.items.len()
+    );
+    if let Err(e) = crate::gtp_path::send_response_to_sgwc(p.peer, &rsp) {
+        log::error!("S11 Update Bearer Response to {} failed: {e}", p.peer);
+    }
+}
+
+/// Whether `ue`'s S1 connection is the source of an S1 handover in preparation
+/// or execution (a target context is allocated, TS 36.413 §8.4.1-§8.4.3).
+fn s1_handover_in_progress(ctx: &MmeContext, ue: &crate::context::MmeUe) -> bool {
+    ctx.enb_ue_find_by_id(ue.enb_ue_id)
+        .filter(|e| e.mme_ue_id == ue.id)
+        .is_some_and(|e| {
+            e.target_ue_id != crate::context::NEXTGCORE_INVALID_POOL_ID
+                && ctx.enb_ue_find_by_id(e.target_ue_id).is_some()
+        })
 }
 
 fn ebis_of(p: &PendingActivation) -> Vec<u8> {
@@ -444,6 +1049,10 @@ fn fail_unsignalled(p: &mut PendingActivation, cause: GtpCause) {
 /// Step 4: one E-RAB SETUP REQUEST per bearer, carrying its ACTIVATE DEDICATED EPS
 /// BEARER CONTEXT REQUEST; T3485 armed.
 fn signal(ctx: &MmeContext, p: &mut PendingActivation) {
+    if p.op == Op::Update {
+        signal_modify(ctx, p);
+        return;
+    }
     p.parked = Parked::No;
     let Some(mme_ue) = ctx.mme_ue_find_by_id(p.mme_ue_id) else {
         fail_unsignalled(p, GtpCause::ContextNotFound);
@@ -456,7 +1065,13 @@ fn signal(ctx: &MmeContext, p: &mut PendingActivation) {
         fail_unsignalled(p, GtpCause::UeNotResponding);
         return;
     };
-    for item in p.items.iter_mut().filter(|i| i.outcome().is_none()) {
+    // Only the bearers not signalled yet: after a handover pause some of a
+    // request's bearers may already be out (#641 follow-up).
+    for item in p
+        .items
+        .iter_mut()
+        .filter(|i| i.outcome().is_none() && i.pkbuf.is_empty())
+    {
         let Some(bearer) = ctx.bearer_find_by_id(item.bearer_id) else {
             item.refused = Some(GtpCause::SystemFailure);
             continue;
@@ -514,12 +1129,13 @@ fn finish_or_keep(ctx: &MmeContext, p: PendingActivation) {
 
 /// Settle what `f` changes on the activation of `mme_ue_id` holding `ebi`, then answer it
 /// if that was its last bearer.
-fn update(ctx: &MmeContext, mme_ue_id: u64, ebi: u8, f: impl FnOnce(&mut Item)) -> bool {
+fn update(ctx: &MmeContext, op: Op, mme_ue_id: u64, ebi: u8, f: impl FnOnce(&mut Item)) -> bool {
     let done = {
         let mut list = pending();
         let Some(i) = list.iter().position(|p| {
-            p.mme_ue_id == mme_ue_id
-                && p.parked == Parked::No
+            p.op == op
+                && p.mme_ue_id == mme_ue_id
+                && matches!(p.parked, Parked::No | Parked::Handover)
                 && p.items.iter().any(|it| it.ebi == ebi && it.bearer_id != 0)
         }) else {
             return false;
@@ -545,29 +1161,100 @@ fn update(ctx: &MmeContext, mme_ue_id: u64, ebi: u8, f: impl FnOnce(&mut Item)) 
 
 /// Step 5: the E-RAB SETUP RESPONSE of `mme_ue_id`: `set_up` E-RAB ids (the eNB's
 /// F-TEIDs are already stored by `s1ap_handler`) and `failed` ones.
-pub fn on_erab_setup(ctx: &MmeContext, mme_ue_id: u64, set_up: &[u8], failed: &[u8]) {
-    for &ebi in set_up {
-        update(ctx, mme_ue_id, ebi, |i| i.erab = Some(Ok(())));
+///
+/// `failed` carries, per E-RAB, whether the eNB's cause was a handover being
+/// triggered (TS 36.413 §9.2.1.3: S1 intra/inter-system or X2 handover
+/// triggered). Such a refusal is re-attempted once the handover is over (TS 23.401
+/// §5.5.1.1.2, §5.5.1.2.2: "the MME shall reattempt the same ... procedure
+/// either when the handover is complete or the handover is deemed to have
+/// failed"), not reported as a failure.
+pub fn on_erab_setup(ctx: &MmeContext, mme_ue_id: u64, set_up: &[u8], failed: &[(u8, bool)]) {
+    on_erab_answer(ctx, Op::Create, mme_ue_id, set_up, failed);
+}
+
+/// The E-RAB SETUP / MODIFY RESPONSE half of `op`.
+fn on_erab_answer(ctx: &MmeContext, op: Op, mme_ue_id: u64, done: &[u8], failed: &[(u8, bool)]) {
+    for &ebi in done {
+        update(ctx, op, mme_ue_id, ebi, |i| i.erab = Some(Ok(())));
     }
-    for &ebi in failed {
-        // The eNB could not set the radio bearer up; the NAS request it carried may
-        // never reach the UE, so the bearer is not waited for any further.
-        update(ctx, mme_ue_id, ebi, |i| {
+    for &(ebi, handover) in failed {
+        if handover && requeue_for_handover(ctx, op, mme_ue_id, ebi) {
+            continue;
+        }
+        // The eNB could not set the radio bearer up (or modify it); the NAS request
+        // it carried may never reach the UE, so the bearer is not waited for any
+        // further.
+        update(ctx, op, mme_ue_id, ebi, |i| {
             i.erab = Some(Err(GtpCause::RequestRejectedReasonNotSpecified))
         });
     }
 }
 
+/// TS 23.401 §5.4.2.1 step 5: the E-RAB MODIFY RESPONSE of `mme_ue_id`, with the
+/// handover rule of [`on_erab_setup`].
+pub fn on_erab_modify(ctx: &MmeContext, mme_ue_id: u64, modified: &[u8], failed: &[(u8, bool)]) {
+    on_erab_answer(ctx, Op::Update, mme_ue_id, modified, failed);
+}
+
+/// MODIFY EPS BEARER CONTEXT ACCEPT for `ebi` (TS 24.301 §6.4.3.3). Returns whether
+/// it answered a modification this module started.
+pub fn on_modify_accept(ctx: &MmeContext, mme_ue_id: u64, ebi: u8) -> bool {
+    update(ctx, Op::Update, mme_ue_id, ebi, |i| i.nas = Some(Ok(())))
+}
+
+/// MODIFY EPS BEARER CONTEXT REJECT for `ebi` (TS 24.301 §6.4.3.4): the bearer keeps
+/// its QoS and TFT, "UE refuses" (TS 29.274 §7.2.16).
+pub fn on_modify_reject(ctx: &MmeContext, mme_ue_id: u64, ebi: u8) -> bool {
+    update(ctx, Op::Update, mme_ue_id, ebi, |i| {
+        i.nas = Some(Err(GtpCause::UeRefuses))
+    })
+}
+
+/// The eNB refused `ebi`'s E-RAB SETUP because a handover is triggered: the
+/// bearer goes back to "not signalled" and its request waits for the handover.
+fn requeue_for_handover(ctx: &MmeContext, op: Op, mme_ue_id: u64, ebi: u8) -> bool {
+    let enb_ue_id = ctx
+        .mme_ue_find_by_id(mme_ue_id)
+        .map(|u| u.enb_ue_id)
+        .unwrap_or(0);
+    let mut list = pending();
+    let Some(p) = list.iter_mut().find(|p| {
+        p.op == op
+            && p.mme_ue_id == mme_ue_id
+            && matches!(p.parked, Parked::No | Parked::Handover)
+            && p.items.iter().any(|it| it.ebi == ebi && it.bearer_id != 0)
+    }) else {
+        return false;
+    };
+    if let Some(item) = p
+        .items
+        .iter_mut()
+        .find(|it| it.ebi == ebi && it.bearer_id != 0 && it.outcome().is_none())
+    {
+        item.pkbuf.clear();
+        item.retries = 0;
+        item.erab = None;
+        item.nas = None;
+    }
+    p.parked = Parked::Handover;
+    p.handover_park = Some((enb_ue_id, Instant::now() + T3485_DURATION));
+    log::info!(
+        "UE {mme_ue_id}: E-RAB SETUP for EBI {ebi} refused as handover triggered; re-attempted \
+         after the handover (TS 23.401 §5.5.1.1.2)"
+    );
+    true
+}
+
 /// Step 7: ACTIVATE DEDICATED EPS BEARER CONTEXT ACCEPT for `ebi`. Returns whether it
 /// answered an activation this module started.
 pub fn on_accept(ctx: &MmeContext, mme_ue_id: u64, ebi: u8) -> bool {
-    update(ctx, mme_ue_id, ebi, |i| i.nas = Some(Ok(())))
+    update(ctx, Op::Create, mme_ue_id, ebi, |i| i.nas = Some(Ok(())))
 }
 
 /// ACTIVATE DEDICATED EPS BEARER CONTEXT REJECT for `ebi` (TS 24.301 §6.4.2.5): the
 /// bearer is not created, "UE refuses" (TS 29.274 §7.2.4).
 pub fn on_reject(ctx: &MmeContext, mme_ue_id: u64, ebi: u8) -> bool {
-    update(ctx, mme_ue_id, ebi, |i| {
+    update(ctx, Op::Create, mme_ue_id, ebi, |i| {
         i.nas = Some(Err(GtpCause::UeRefuses))
     })
 }
@@ -673,6 +1360,16 @@ fn release_erabs(ctx: &MmeContext, mme_ue_id: u64, erabs: &[u8]) {
 
 /// Step 8: the Create Bearer Response, and the failed bearers removed.
 fn answer(ctx: &MmeContext, p: &PendingActivation) {
+    answer_op(ctx, p);
+    // #1265 review: an Update Bearer Request held behind this one may run now.
+    replay_deferred(p.mme_ue_id);
+}
+
+fn answer_op(ctx: &MmeContext, p: &PendingActivation) {
+    if p.op == Op::Update {
+        answer_modify(ctx, p);
+        return;
+    }
     let mut rsp = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
         crate::s11_build::message_type::CREATE_BEARER_RESPONSE,
         p.sgw_teid,
@@ -727,6 +1424,11 @@ fn answer(ctx: &MmeContext, p: &PendingActivation) {
                         release.push(item.ebi);
                     }
                     remove_bearer(ctx, item.bearer_id);
+                    // The UE got the ACTIVATE request and has not answered: a late
+                    // ACCEPT may still come (#641 follow-up).
+                    if !item.pkbuf.is_empty() && item.nas.is_none() {
+                        remember_refused(p.mme_ue_id, item.ebi);
+                    }
                 }
             }
         }
@@ -776,8 +1478,14 @@ pub fn sweep(ctx: &MmeContext, now: Instant) {
             let p = &mut list[i];
             let ue = ctx.mme_ue_find_by_id(p.mme_ue_id);
             let late = now.saturating_duration_since(p.received) >= budget;
+            // #641 follow-up: the PDN connection went (a PDN GW initiated
+            // deactivation of the whole PDN, a detach) while this waited.
+            let pdn_gone = ue
+                .as_ref()
+                .is_some_and(|u| !pdn_exists(ctx, u, p.linked_ebi));
             let cause = match (&ue, p.parked) {
                 (None, _) => Some(GtpCause::ContextNotFound),
+                (Some(_), _) if pdn_gone => Some(GtpCause::ContextNotFound),
                 (Some(_), Parked::Paging) if late => Some(GtpCause::UnableToPageUe),
                 (Some(_), _) if late => Some(GtpCause::UeNotResponding),
                 _ => None,
@@ -785,6 +1493,18 @@ pub fn sweep(ctx: &MmeContext, now: Instant) {
             if let Some(cause) = cause {
                 fail_unsignalled(p, cause);
                 done.push(list.remove(i));
+                continue;
+            }
+            if p.parked == Parked::Handover
+                && ue.as_ref().is_some_and(|u| {
+                    let (parked_on, retry_at) = p.handover_park.unwrap_or((u.enb_ue_id, now));
+                    !s1_handover_in_progress(ctx, u)
+                        && (u.enb_ue_id != parked_on || now >= retry_at)
+                })
+            {
+                // The handover is over: completed (a new S1 connection), failed or
+                // cancelled (none in progress), or deemed failed at the guard.
+                to_signal.push(list.remove(i));
                 continue;
             }
             if p.parked == Parked::Attach && ue.as_ref().is_some_and(|u| !attach_in_progress(u)) {
@@ -832,7 +1552,8 @@ pub fn sweep(ctx: &MmeContext, now: Instant) {
             continue;
         };
         log::info!(
-            "UE {mme_ue_id}: T3485 expired; ACTIVATE DEDICATED EPS BEARER CONTEXT REQUEST resent"
+            "UE {mme_ue_id}: T3485/T3486 expired; ACTIVATE DEDICATED / MODIFY EPS BEARER \
+             CONTEXT REQUEST resent"
         );
         if let Err(e) = crate::nas_path::nas_eps_send_to_downlink_nas_transport(&enb_ue, pkbuf) {
             log::error!("UE {mme_ue_id}: T3485 retransmission failed: {e}");
@@ -845,6 +1566,8 @@ pub fn sweep(ctx: &MmeContext, now: Instant) {
         signal(ctx, &mut p);
         finish_or_keep(ctx, p);
     }
+    // Deferred Update Bearer Requests past the budget are refused.
+    replay_deferred(0);
 }
 
 /// Force every T3485 of `mme_ue_id` to have expired. Test-only.
@@ -853,6 +1576,144 @@ pub(crate) fn expire_for_test(mme_ue_id: u64) {
     for p in pending().iter_mut().filter(|p| p.mme_ue_id == mme_ue_id) {
         for i in p.items.iter_mut() {
             i.deadline = Instant::now() - Duration::from_millis(1);
+        }
+        if let Some((_, at)) = p.handover_park.as_mut() {
+            *at = Instant::now() - Duration::from_millis(1);
+        }
+    }
+}
+
+/// Whether `ue` still has the PDN connection whose default bearer is `linked_ebi`.
+fn pdn_exists(ctx: &MmeContext, ue: &crate::context::MmeUe, linked_ebi: u8) -> bool {
+    ue.sess_list
+        .iter()
+        .filter_map(|id| ctx.sess_find_by_id(*id))
+        .any(|s| {
+            s.bearer_list
+                .first()
+                .and_then(|b| ctx.bearer_find_by_id(*b))
+                .is_some_and(|b| b.ebi == linked_ebi)
+        })
+}
+
+/// TS 24.301 §6.4.2.6 b): a PDN disconnection collides with the activation of a
+/// bearer of that PDN connection. The activation is terminated locally: its
+/// bearers are removed and the Serving GW is answered `cause`.
+pub fn settle_for_pdn(ctx: &MmeContext, mme_ue_id: u64, linked_ebi: u8, cause: GtpCause) {
+    let taken: Vec<PendingActivation> = {
+        let mut list = pending();
+        let (taken, kept): (Vec<_>, Vec<_>) = list
+            .drain(..)
+            .partition(|p| p.mme_ue_id == mme_ue_id && p.linked_ebi == linked_ebi);
+        *list = kept;
+        taken
+    };
+    for mut p in taken {
+        log::info!(
+            "UE {mme_ue_id}: the PDN connection of LBI {linked_ebi} is going; its dedicated \
+             bearer activation (EBIs {:?}) ends (TS 24.301 §6.4.2.6 b)",
+            ebis_of(&p)
+        );
+        fail_unsignalled(&mut p, cause);
+        answer(ctx, &p);
+    }
+}
+
+/// Bearers whose activation failed after the UE was sent the request, by (UE,
+/// EBI), with when: a late ACTIVATE DEDICATED EPS BEARER CONTEXT ACCEPT for one of
+/// them is answered with a deactivation (#641 follow-up). Process-global, like
+/// [`PENDING`].
+static REFUSED: Mutex<Vec<(u64, u8, Instant)>> = Mutex::new(Vec::new());
+
+/// How long a refused bearer is remembered: past T3485 x 5.
+const REFUSED_HOLD: Duration = Duration::from_secs(60);
+
+/// Whether `ebi` of `mme_ue_id` was refused within [`REFUSED_HOLD`].
+fn refused_held(mme_ue_id: u64, ebi: u8) -> bool {
+    let now = Instant::now();
+    REFUSED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|(u, e, at)| {
+            *u == mme_ue_id && *e == ebi && now.saturating_duration_since(*at) < REFUSED_HOLD
+        })
+}
+
+fn remember_refused(mme_ue_id: u64, ebi: u8) {
+    let now = Instant::now();
+    let mut list = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+    list.retain(|(_, _, at)| now.saturating_duration_since(*at) < REFUSED_HOLD);
+    list.retain(|(u, e, _)| !(*u == mme_ue_id && *e == ebi));
+    list.push((mme_ue_id, ebi, now));
+}
+
+/// An ACTIVATE DEDICATED EPS BEARER CONTEXT ACCEPT for `ebi`, which no bearer of
+/// `mme_ue_id` has.
+///
+/// TS 24.301 §7.3.2 g): an ESM message naming no existing EPS bearer context is
+/// ignored by the network. When it answers an activation this MME already
+/// refused to the Serving GW (T3485 or the answer budget ran out, the eNB
+/// failed the E-RAB), the UE now holds a context the network does not, so it is
+/// sent DEACTIVATE EPS BEARER CONTEXT REQUEST, cause #36 "regular deactivation"
+/// (§6.4.4.2), once. Its ACCEPT names no context either and is ignored. Returns
+/// whether a deactivation was sent.
+pub fn on_unknown_accept(ctx: &MmeContext, mme_ue_id: u64, ebi: u8) -> bool {
+    let now = Instant::now();
+    let known = {
+        let mut list = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+        list.retain(|(_, _, at)| now.saturating_duration_since(*at) < REFUSED_HOLD);
+        match list
+            .iter()
+            .position(|(u, e, _)| *u == mme_ue_id && *e == ebi)
+        {
+            Some(i) => {
+                list.remove(i);
+                true
+            }
+            None => false,
+        }
+    };
+    if !known {
+        log::warn!(
+            "UE {mme_ue_id}: ACTIVATE DEDICATED EPS BEARER CONTEXT ACCEPT for EBI {ebi}, which \
+             has no bearer; ignored (TS 24.301 §7.3.2 g)"
+        );
+        return false;
+    }
+    let Some((mme_ue, enb_ue)) = ctx.mme_ue_find_by_id(mme_ue_id).and_then(|u| {
+        ctx.enb_ue_find_by_id(u.enb_ue_id)
+            .filter(|e| e.mme_ue_id == mme_ue_id)
+            .map(|e| (u, e))
+    }) else {
+        return false;
+    };
+    let plain = crate::esm_build::build_deactivate_bearer_context_request_with_params(
+        ebi,
+        crate::esm_build::PTI_UNASSIGNED,
+        crate::esm_build::EsmCause::RegularDeactivation,
+    );
+    let sent = crate::nas_path::protect_esm(ctx, mme_ue_id, &plain)
+        .map_err(|e| format!("{e:?}"))
+        .and_then(|esm| {
+            crate::nas_path::nas_eps_send_to_downlink_nas_transport(&enb_ue, esm)
+                .map_err(|e| format!("{e:?}"))
+        });
+    match sent {
+        Ok(_) => {
+            log::warn!(
+                "[{}] late ACTIVATE DEDICATED EPS BEARER CONTEXT ACCEPT for EBI {ebi}, whose \
+                 activation was already refused: DEACTIVATE EPS BEARER CONTEXT REQUEST sent",
+                mme_ue.imsi_bcd
+            );
+            true
+        }
+        Err(e) => {
+            log::error!(
+                "[{}] DEACTIVATE EPS BEARER CONTEXT REQUEST for EBI {ebi} not sent: {e}",
+                mme_ue.imsi_bcd
+            );
+            false
         }
     }
 }
@@ -869,4 +1730,6 @@ pub(crate) fn age_for_test(mme_ue_id: u64, by: Duration) {
 #[cfg(test)]
 pub(crate) fn clear_for_test() {
     pending().clear();
+    deferred().clear();
+    REFUSED.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }

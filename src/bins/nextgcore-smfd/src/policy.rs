@@ -1785,18 +1785,63 @@ const DEFAULT_BACK_OFF_MINUTES: u8 = 10;
 /// value (T3396, GPRS timer 3, IEI 0x37) is appended so the UE applies the
 /// mandated back-off (TS 24.501 §6.2.8). smfd-08.
 pub fn build_establishment_reject(psi: u8, pti: u8, cause_5gsm: u8) -> Vec<u8> {
-    build_establishment_reject_ext(psi, pti, cause_5gsm, None)
+    build_establishment_reject_ext(psi, pti, cause_5gsm, None, RejectTo::default())
+}
+
+/// Who a PDU SESSION ESTABLISHMENT REJECT goes to, as far as the Back-off timer is
+/// concerned (#1188, TS 24.501 §6.4.1.4.1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RejectTo {
+    /// The request type was "initial emergency request" or "existing emergency PDU
+    /// session" (TS 29.502 `requestType` INITIAL_EMERGENCY_REQUEST /
+    /// EXISTING_EMERGENCY_PDU_SESSION).
+    pub emergency: bool,
+    /// The UE is configured for high priority access in the selected PLMN, as the AMF
+    /// reports it (TS 29.502 `priorityUserInd`).
+    pub high_priority_access: bool,
+}
+
+impl RejectTo {
+    /// From an SmContextCreateData (TS 29.502 §6.1.6.2.2).
+    pub fn from_create_data(body: &serde_json::Value) -> Self {
+        Self {
+            emergency: matches!(
+                body["requestType"].as_str(),
+                Some("INITIAL_EMERGENCY_REQUEST" | "EXISTING_EMERGENCY_PDU_SESSION")
+            ),
+            high_priority_access: body["priorityUserInd"].as_bool() == Some(true),
+        }
+    }
+}
+
+/// Whether the reject may carry a Back-off timer value IE (TS 24.501 §6.4.1.4.1):
+/// - not for #26, #67 or #69 to a UE configured for high priority access, or for an
+///   emergency request: "the network shall not include a Back-off timer value IE";
+/// - not, to a UE configured for high priority access, for a cause outside #26, #28,
+///   #33, #39, #46, #50, #51, #54, #57, #58, #61, #67, #68, #69 and #86.
+fn back_off_allowed(cause_5gsm: u8, to: RejectTo) -> bool {
+    let congestion = matches!(cause_5gsm, 26 | 67 | 69);
+    if congestion && (to.high_priority_access || to.emergency) {
+        return false;
+    }
+    let hpa_exempt = matches!(
+        cause_5gsm,
+        26 | 28 | 33 | 39 | 46 | 50 | 51 | 54 | 57 | 58 | 61 | 67 | 68 | 69 | 86
+    );
+    !to.high_priority_access || hpa_exempt
 }
 
 /// Build a PDU Session Establishment Reject, optionally carrying the Allowed
 /// SSC mode IE (IEI 0xF, type-1 TV; bits 1-3 = SSC mode 1/2/3 allowed) used on
 /// SSC-mode-related rejections (TS 24.501 §8.3.3.1, §9.11.4.5). The Back-off
-/// timer (IEI 0x37) is still appended for congestion causes. smfd-08.
+/// timer (IEI 0x37) is still appended for congestion causes, unless the reject goes to
+/// a UE it may not (#1188, [`back_off_allowed`]). smfd-08.
 pub fn build_establishment_reject_ext(
     psi: u8,
     pti: u8,
     cause_5gsm: u8,
     allowed_ssc_mode: Option<u8>,
+    to: RejectTo,
 ) -> Vec<u8> {
     let mut msg = vec![
         0x2E,
@@ -1812,7 +1857,8 @@ pub fn build_establishment_reject_ext(
         gsm_cause::INSUFFICIENT_RESOURCES
             | gsm_cause::MISSING_OR_UNKNOWN_DNN
             | gsm_cause::INSUFFICIENT_RESOURCES_FOR_SPECIFIC_SLICE
-    ) {
+    ) && back_off_allowed(cause_5gsm, to)
+    {
         msg.push(0x37); // IEI: Back-off timer value (GPRS timer 3, TLV)
         msg.push(0x01); // length
         msg.push(gprs_timer3_minutes(DEFAULT_BACK_OFF_MINUTES));
@@ -1856,6 +1902,44 @@ pub fn build_release_command(psi: u8, pti: u8, cause_5gsm: u8) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1188, TS 24.501 §6.4.1.4.1: when the reject carries a Back-off timer.
+    #[test]
+    fn the_back_off_timer_is_left_out_where_the_spec_forbids_it() {
+        let hpa = RejectTo {
+            high_priority_access: true,
+            ..Default::default()
+        };
+        let emergency = RejectTo {
+            emergency: true,
+            ..Default::default()
+        };
+        let has_back_off =
+            |cause, to| build_establishment_reject_ext(5, 2, cause, None, to).len() > 5;
+        for cause in [26, 27, 69] {
+            assert!(
+                has_back_off(cause, RejectTo::default()),
+                "#{cause}, ordinary UE"
+            );
+            assert!(!has_back_off(cause, hpa), "#{cause}, high priority access");
+        }
+        assert!(!has_back_off(26, emergency) && !has_back_off(69, emergency));
+        // #27 is outside the emergency rule (it names #26, #67, #69 only).
+        assert!(has_back_off(27, emergency));
+        assert_eq!(
+            RejectTo::from_create_data(&serde_json::json!({
+                "requestType": "EXISTING_EMERGENCY_PDU_SESSION", "priorityUserInd": true
+            })),
+            RejectTo {
+                emergency: true,
+                high_priority_access: true
+            }
+        );
+        assert_eq!(
+            RejectTo::from_create_data(&serde_json::json!({ "requestType": "INITIAL_REQUEST" })),
+            RejectTo::default()
+        );
+    }
 
     /// #1164, TS 29.510 §6.1.6.2.2 and TS 29.571 §5.4.5.1: which slices a profile
     /// serves.
@@ -2349,6 +2433,7 @@ mod tests {
             2,
             gsm_cause::REQUEST_REJECTED_UNSPECIFIED,
             Some(0b001),
+            RejectTo::default(),
         );
         let last = *msg.last().unwrap();
         assert_eq!(last >> 4, 0x0F); // IEI nibble

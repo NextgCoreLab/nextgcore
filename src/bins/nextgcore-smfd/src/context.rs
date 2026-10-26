@@ -1929,6 +1929,9 @@ pub struct SmfContext {
     /// restore, not durable state, and re-notifying on every subsequent boot would
     /// tell an AMF about a context it released long ago.
     pub unrestorable_sessions: RwLock<Vec<UnrestorableSession>>,
+    /// #1230: restored SM contexts to release with #39 at boot: EPS→5GS-migrated ones
+    /// the snapshot kept no uplink endpoint for. Not persisted, like the list above.
+    pub reactivate_at_boot: RwLock<Vec<String>>,
 
     /// Durable snapshot of the PFCP session map, the policy bindings and the
     /// IPv4 pool's allocations (issue #191). Disabled unless a state file is
@@ -2044,6 +2047,7 @@ impl SmfContext {
             persist_lock: std::sync::Mutex::new(()),
             is_global: false,
             unrestorable_sessions: RwLock::new(Vec::new()),
+            reactivate_at_boot: RwLock::new(Vec::new()),
             policy_bindings: RwLock::new(HashMap::new()),
             state: nextgcore_core::state_store::StateStore::disabled(),
         }
@@ -2097,6 +2101,12 @@ impl SmfContext {
     /// - 2 (#718 review M2): it is [`derive_cp_n4_seid`]. A version-1 session is
     ///   restored under its legacy SEID, recorded in `cp_n4_seids`, because that is
     ///   the SEID the UPF holds it under.
+    ///
+    /// #1230 adds `upfUlEndpoints` (each SM context's UPF N3 uplink F-TEID) as an
+    /// optional field, not a new version. A 0.1.x build ignores it and can still read
+    /// the file after a rollback. A snapshot without it (from 0.1.x, or rewritten by
+    /// one) has its endpoints recovered on first need; see
+    /// [`restore_from`](Self::restore_from).
     pub const SNAPSHOT_VERSION: u64 = 2;
 
     /// Point this context at a snapshot file and restore any prior state,
@@ -2243,6 +2253,24 @@ impl SmfContext {
                 .filter_map(|(r, seid)| m.get(&seid).map(|k| (r, k.clone())))
                 .collect()
         };
+        // #1230: per SM context, keyed by the reference like `cpN4Seids`: the UPF's N3
+        // uplink F-TEID, which the UP activation, the network-triggered Service
+        // Request, a handover and a path switch all have to name, and which the UPF
+        // gave only at establishment.
+        let upf_ul_endpoints: std::collections::BTreeMap<String, serde_json::Value> =
+            read_through(&self.upf_ul_endpoints, "upf_ul_endpoints")
+                .iter()
+                .filter(|(r, _)| pfcp_sessions.contains_key(*r))
+                .map(|(r, (teid, addr))| {
+                    (
+                        r.clone(),
+                        serde_json::json!({
+                            "teid": teid,
+                            "addr": Ipv4Addr::from(*addr).to_string(),
+                        }),
+                    )
+                })
+                .collect();
         // Ascending already (see `Ipv4Pool::allocated_addrs`), and as strings so
         // the file is readable by an operator diagnosing a double assignment.
         let ipv4_allocations: Vec<String> = self
@@ -2263,6 +2291,7 @@ impl SmfContext {
             "cpN4Seids": cp_n4_seids,
             "farPeers": far_peers,
             "sessionUpfs": session_upfs,
+            "upfUlEndpoints": upf_ul_endpoints,
             "failedUpPaths": read_through(&self.failed_up_paths, "failed_up_paths")
                 .iter()
                 .map(|(k, v)| (k.clone(), *v))
@@ -2409,6 +2438,17 @@ impl SmfContext {
         // #718 review M2: a version-1 session was established under the legacy
         // derivation. The UPF holds it under that SEID, so it keeps it, recorded
         // explicitly; only new sessions use the collision-free derivation.
+        // #1230: the SM contexts that inherited their CP SEID from an EPS PDN connection
+        // (an EPS→5GS handover), as the snapshot recorded them, before the version-1
+        // fill below adds the legacy ones.
+        // A legacy SEID (`legacy_cp_n4_seid`), whether filled below for a version-1
+        // snapshot or recorded by a later write of one, is a native 5G context's (#1230
+        // review 2).
+        let inherited_refs: std::collections::HashSet<String> = cp_n4_seids
+            .iter()
+            .filter(|(r, seid)| **seid != legacy_cp_n4_seid(r))
+            .map(|(r, _)| r.clone())
+            .collect();
         if found < 2 {
             for r in pfcp_sessions.keys() {
                 cp_n4_seids
@@ -2479,6 +2519,7 @@ impl SmfContext {
                 (seid, key)
             })
             .collect();
+        let restored_refs: Vec<String> = pfcp_sessions.keys().cloned().collect();
         // One lock at a time, as in `snapshot`.
         if let Ok(mut map) = self.pfcp_sessions.write() {
             map.extend(pfcp_sessions);
@@ -2502,6 +2543,58 @@ impl SmfContext {
         }
         if let Ok(mut map) = self.session_upfs.write() {
             map.extend(session_upfs);
+        }
+        // #1230: the UPF N3 uplink endpoint of each restored SM context. A record that
+        // does not read is skipped, and its session is then handled like one from an
+        // older snapshot, below.
+        let upf_ul_endpoints: HashMap<String, (u32, [u8; 4])> = doc
+            .get("upfUlEndpoints")
+            .and_then(|v| v.as_object().cloned())
+            .map(|obj| {
+                obj.into_iter()
+                    .filter(|(r, _)| restored_refs.contains(r))
+                    .filter_map(|(r, v)| {
+                        let teid = u32::try_from(v.get("teid")?.as_u64()?).ok()?;
+                        let addr: Ipv4Addr = v.get("addr")?.as_str()?.parse().ok()?;
+                        Some((r, (teid, addr.octets())))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // No endpoint: a snapshot written before #1230 (or by a rolled-back 0.1.x), or
+        // a record that does not read. A native 5G SM context keeps everything else,
+        // and its endpoint is recovered the first time one is needed: the UPF chooses
+        // a new uplink F-TEID for PDR 1 (`recover_upf_ul_endpoint` in main). An
+        // EPS→5GS-migrated one (an inherited CP SEID) has its uplink on other PDRs
+        // (the N3 PDR and one per dedicated bearer). It is released at boot with #39
+        // "reactivation requested" (TS 24.501 §6.3.3), so its UE re-establishes it.
+        let reactivate: Vec<String> = restored_refs
+            .iter()
+            .filter(|r| !upf_ul_endpoints.contains_key(*r) && inherited_refs.contains(*r))
+            .cloned()
+            .collect();
+        let n_recover = restored_refs
+            .iter()
+            .filter(|r| !upf_ul_endpoints.contains_key(*r) && !inherited_refs.contains(*r))
+            .count();
+        if n_recover > 0 {
+            log::warn!(
+                "{n_recover} restored SM context(s) have no UPF N3 uplink endpoint in the \
+                 snapshot; each is recovered from the UPF on first need"
+            );
+        }
+        if !reactivate.is_empty() {
+            log::warn!(
+                "{} restored EPS→5GS SM context(s) have no UPF N3 uplink endpoint; they are \
+                 released for reactivation at boot",
+                reactivate.len()
+            );
+            if let Ok(mut pending) = self.reactivate_at_boot.write() {
+                pending.extend(reactivate);
+            }
+        }
+        if let Ok(mut map) = self.upf_ul_endpoints.write() {
+            map.extend(upf_ul_endpoints);
         }
         let mut n_addrs = 0usize;
         for addr in &ipv4_allocations {
@@ -2675,6 +2768,9 @@ impl SmfContext {
     /// `policy_bindings.write()` deadlocks the calling thread. Every call site
     /// closes its `if let Ok(mut …) = ….write()` block first.
     pub fn persist(&self) {
+        // #1178 follow-up: whatever the durable state setting (off by default), so a
+        // map a panic poisoned does not stay frozen for every writer that skips on `Err`.
+        self.heal_poisoned_maps();
         if !self.state.is_enabled() {
             return;
         }
@@ -2690,6 +2786,45 @@ impl SmfContext {
             // answered and will not survive a restart.
             log::error!("SMF state was NOT persisted: {e}");
         }
+    }
+
+    /// Clear the poison of every context map a panic left poisoned (#1178 follow-up),
+    /// logged once per poisoning. Their writers skip a poisoned lock (`if let
+    /// Ok(..) = .write()`, `.write().ok()?`), so a poisoned map froze at the panic:
+    /// sessions created after it were never recorded, removals were dropped, and with
+    /// the durable state off (the default) nothing else ever cleared it. A `HashMap` a
+    /// panic interrupted is still a valid map. Takes no lock, so it is safe wherever
+    /// `persist` is called.
+    pub fn heal_poisoned_maps(&self) {
+        fn heal<T>(lock: &RwLock<T>, what: &str) {
+            if lock.is_poisoned() {
+                log::error!(
+                    "SMF state: the {what} lock was poisoned (a panic while it was held); \
+                     the poison is cleared so its writers resume"
+                );
+                lock.clear_poison();
+            }
+        }
+        heal(&self.smf_ue_list, "smf_ue_list");
+        heal(&self.sess_list, "sess_list");
+        heal(&self.bearer_list, "bearer_list");
+        heal(&self.pf_list, "pf_list");
+        heal(&self.mbs_sess_list, "mbs_sess_list");
+        heal(&self.supi_hash, "supi_hash");
+        heal(&self.imsi_hash, "imsi_hash");
+        heal(&self.ipv4_hash, "ipv4_hash");
+        heal(&self.ipv6_hash, "ipv6_hash");
+        heal(&self.smf_n4_seid_hash, "smf_n4_seid_hash");
+        heal(&self.n1n2message_hash, "n1n2message_hash");
+        heal(&self.tmgi_hash, "tmgi_hash");
+        heal(&self.pfcp_sessions, "pfcp_sessions");
+        heal(&self.upf_ul_endpoints, "upf_ul_endpoints");
+        heal(&self.cp_n4_seids, "cp_n4_seids");
+        heal(&self.far_peers, "far_peers");
+        heal(&self.failed_up_paths, "failed_up_paths");
+        heal(&self.session_upfs, "session_upfs");
+        heal(&self.policy_bindings, "policy_bindings");
+        heal(&self.unrestorable_sessions, "unrestorable_sessions");
     }
 
     /// Check if context is initialized
@@ -4620,6 +4755,107 @@ mod tests {
         );
     }
 
+    /// #1230: an SM context's UPF N3 uplink endpoint is in the snapshot and comes back
+    /// on restore, so a restored session can still name the uplink tunnel (UP
+    /// activation, network-triggered Service Request, handover). One of a session
+    /// that is gone is not written.
+    #[test]
+    fn the_upf_uplink_endpoint_survives_a_restart() {
+        let path = temp_state_path("ul-endpoint");
+        {
+            let ctx = ctx_with_state(&path);
+            ctx.pfcp_sessions.write().unwrap().insert("12".into(), 0x0C);
+            {
+                let mut m = ctx.upf_ul_endpoints.write().unwrap();
+                m.insert("12".into(), (0x1230_0012, [10, 45, 12, 30]));
+                m.insert("gone".into(), (0x0BAD, [10, 0, 0, 1]));
+            }
+            ctx.persist();
+            let written: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(
+                written["version"], 2,
+                "no new version: 0.1.x can read it back"
+            );
+            assert_eq!(
+                written["upfUlEndpoints"],
+                serde_json::json!({ "12": { "teid": 0x1230_0012u32, "addr": "10.45.12.30" } })
+            );
+        }
+        let restored = ctx_with_state(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            restored.upf_ul_endpoints.read().unwrap().get("12").copied(),
+            Some((0x1230_0012, [10, 45, 12, 30]))
+        );
+        assert!(restored.unrestorable_sessions.read().unwrap().is_empty());
+    }
+
+    /// #1230: a snapshot written before #1230 (or by a rolled-back 0.1.x) has no
+    /// uplink endpoints. A native 5G SM context is kept whole, its endpoint left to
+    /// be recovered on first need: nothing is released. An EPS→5GS-migrated one (an
+    /// inherited CP SEID) is listed for release with #39 at boot.
+    #[test]
+    fn a_snapshot_without_endpoints_keeps_its_sessions() {
+        let path = temp_state_path("ul-endpoint-absent");
+        let b = binding(
+            "imsi-001010000001230",
+            5,
+            [10, 45, 12, 31],
+            crate::gsm_sm::GsmState::Operational,
+        );
+        // "9" carries the legacy SEID a version-1 snapshot's session was migrated to
+        // and a later write recorded (#1230 review 2): a native context, not EPS→5GS.
+        let doc = serde_json::json!({
+            "version": 2,
+            "pfcpSessions": { "7": 0x07u64, "8": 0x08u64, "9": 0x09u64 },
+            "policyBindings": { "7": b.clone(), "8": b.clone(), "9": b },
+            "cpN4Seids": { "8": 0x0123_0008u64, "9": legacy_cp_n4_seid("9") },
+            "ipv4Allocations": ["10.45.12.31"],
+        });
+        std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
+        let ctx = ctx_with_state(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(ctx.unrestorable_sessions.read().unwrap().is_empty());
+        assert_eq!(
+            *ctx.reactivate_at_boot.read().unwrap(),
+            vec!["8".to_string()]
+        );
+        assert!(ctx.pfcp_sessions.read().unwrap().contains_key("7"), "kept");
+        assert!(
+            ctx.policy_bindings.read().unwrap().contains_key("7"),
+            "kept"
+        );
+        assert!(ctx.upf_ul_endpoints.read().unwrap().get("7").is_none());
+    }
+
+    /// #1230 review 2: a version-1 snapshot's sessions get legacy SEIDs filled in on
+    /// load. They are native 5G contexts, kept for recovery, not released.
+    #[test]
+    fn a_version_1_snapshots_sessions_are_not_taken_for_eps_ones() {
+        let path = temp_state_path("ul-endpoint-v1");
+        let b = binding(
+            "imsi-001010000001231",
+            5,
+            [10, 45, 12, 32],
+            crate::gsm_sm::GsmState::Operational,
+        );
+        let doc = serde_json::json!({
+            "version": 1,
+            "pfcpSessions": { "5": 0x05u64 },
+            "policyBindings": { "5": b },
+        });
+        std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
+        let ctx = ctx_with_state(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            ctx.cp_n4_seids.read().unwrap().get("5"),
+            Some(&legacy_cp_n4_seid("5"))
+        );
+        assert!(ctx.reactivate_at_boot.read().unwrap().is_empty());
+        assert!(ctx.unrestorable_sessions.read().unwrap().is_empty());
+    }
+
     /// A version-1 snapshot's sessions keep the legacy CP SEID (`ref | 0x1000`): the
     /// UPF holds them under it. Only new sessions use the new derivation.
     #[test]
@@ -5050,6 +5286,33 @@ mod tests {
             written["pfcpSessions"]["11781"].is_null(),
             "the released session left the snapshot"
         );
+    }
+
+    /// #1178 follow-up, with the durable state OFF (the default): a map a panic
+    /// poisoned is healed at the next `persist()` (called after every mutation), so its
+    /// writers resume. Before, only the snapshot cleared it, and with no state file no
+    /// snapshot is ever taken: the map stayed frozen.
+    #[test]
+    fn a_poisoned_map_resumes_with_the_durable_state_off() {
+        let ctx = SmfContext::new();
+        assert!(!ctx.state.is_enabled(), "no state file");
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ctx.sess_list.write().unwrap();
+            panic!("poison sess_list");
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ctx.pfcp_sessions.write().unwrap();
+            panic!("poison pfcp_sessions");
+        }));
+        ctx.persist();
+        let recorded = if let Ok(mut m) = ctx.pfcp_sessions.write() {
+            m.insert("11783".to_string(), 0x1183);
+            true
+        } else {
+            false
+        };
+        assert!(!ctx.sess_list.is_poisoned() && !ctx.pfcp_sessions.is_poisoned());
+        assert!(recorded, "the writer that skips on Err resumes");
     }
 
     /// The whole point of #191: a session created before a restart, and the

@@ -567,6 +567,7 @@ fn the_mongodb_backend_stores_loads_and_deletes() {
         ue_security_capability: Default::default(),
         ue_network_capability: Default::default(),
         redcap_indication: false,
+        priority_subscription: false,
         slice_admission_granted: false,
         racs_supported: false,
         ue_radio_capability_id: None,
