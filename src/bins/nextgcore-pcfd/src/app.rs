@@ -6537,7 +6537,9 @@ mod tests {
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         // An NRF that advertises a UDR on a port with nothing listening: discovery
         // succeeds, every nudr-dr GET fails.
-        let dead_udr_port = nextgcore_sbi::test_support::free_port();
+        // #1316: refused_port, not free_port: a free port can be handed to a sibling
+        // test's `bind(:0)`, and then the "dead" UDR answers.
+        let dead_udr_port = nextgcore_sbi::test_support::refused_port();
         let (nrf_listener, nrf_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let nrf_port = nrf_addr.port();
         let nrf = SbiServer::on_listener(SbiServerConfig::new(nrf_addr), nrf_listener);
@@ -7912,11 +7914,9 @@ mod tests {
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         pcf_context_init(64, 64);
         provision_session_with_ipv4("imsi-001010000000769", 9, "10.45.0.169").await;
-        // A port with nothing listening: bind, read the port, close.
-        let dead_port = {
-            let (_listener, local) = nextgcore_sbi::test_support::bound_listener().into_parts();
-            local.port()
-        };
+        // A port with nothing listening that no `bind(:0)` can be handed (#1316); a
+        // bound-then-dropped port could be.
+        let dead_port = nextgcore_sbi::test_support::refused_port();
         let app_session_id = create_app_session(
             &format!("http://127.0.0.1:{dead_port}/af-769"),
             "10.45.0.169",
