@@ -13,6 +13,10 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 ## [Unreleased]
 
 ### Changed
+- lmfd reads an NRPPa E-UTRA AoA (`valueAngleOfArrival-EUTRA`, 0..719) per TS 36.133 Table
+  10.2.1-1: 0.5 degree bins, counter-clockwise from North (TS 36.214 §5.2.7). It is turned into
+  the AoA solver's clockwise bearing, at the bin midpoint. Before, it took the report value as
+  the angle, which was both twice too large and the wrong way round (#1269).
 - smfd (PGW-C) picks packet filter precedences under one allocator per PDN connection, and
   counts the precedences of procedures still in flight. A Bearer Resource Command's added
   filters are only stored once the SGW-C accepts them. Before, an activation or a Command

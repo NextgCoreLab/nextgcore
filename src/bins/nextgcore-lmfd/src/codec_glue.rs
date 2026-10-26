@@ -1639,7 +1639,8 @@ mod tests {
         let c = &cells[0];
         assert_eq!(c.nr_cgi, "02f839-000000001");
         assert_eq!(c.ecid_rtt_ns, Some(1001.0 * crate::positioning::TS_NS));
-        assert_eq!(c.aoa, Some(90.0));
+        // AOA_ANGLE_090 is [45, 45.5) degrees counter-clockwise (#1269).
+        assert_eq!(c.aoa, Some(314.75));
         // Best RSRP item = 60 → 60 − 140 = −80 dBm.
         assert_eq!(c.rsrp, Some(-80));
     }
