@@ -320,8 +320,7 @@ async fn main() -> Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     setup_signal_handlers(shutdown.clone());
 
-    let addr: SocketAddr = format!("{sbi_addr}:{sbi_port}")
-        .parse()
+    let addr: SocketAddr = nextgcore_core::sockaddr::parse_listen_addr(&sbi_addr, sbi_port)
         .context("Invalid SBI address")?;
 
     let mut sbi_server_config = SbiServerConfig::new(addr);
@@ -383,8 +382,7 @@ async fn main() -> Result<()> {
             .and_then(|d| d.udp_address.clone())
             .unwrap_or_else(|| args.dns_udp_addr.clone());
         let port = dns.and_then(|d| d.udp_port).unwrap_or(args.dns_udp_port);
-        let bind: SocketAddr = format!("{addr}:{port}")
-            .parse()
+        let bind: SocketAddr = nextgcore_core::sockaddr::parse_listen_addr(&addr, port)
             .context("Invalid DNS/UDP bind address")?;
         let upstream = dns
             .and_then(|d| d.upstream.as_deref())

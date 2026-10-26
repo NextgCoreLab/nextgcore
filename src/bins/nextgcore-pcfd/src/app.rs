@@ -429,9 +429,9 @@ pub async fn run() -> Result<()> {
     pcf_sbi_open(Some(sbi_config)).map_err(|e| anyhow::anyhow!(e))?;
 
     // Start actual HTTP/2 SBI server using nextgcore-sbi
-    let sbi_addr: SocketAddr = format!("{}:{}", args.sbi_addr, args.sbi_port)
-        .parse()
-        .context("Invalid SBI address")?;
+    let sbi_addr: SocketAddr =
+        nextgcore_core::sockaddr::parse_listen_addr(&args.sbi_addr, args.sbi_port)
+            .context("Invalid SBI address")?;
     let mut sbi_server_config = NextgcoreSbiServerConfig::new(sbi_addr);
     if oauth2_required(&args.config) {
         sbi_server_config = apply_oauth2_enforcement(sbi_server_config).await;

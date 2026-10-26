@@ -246,9 +246,130 @@ fn default_ebi(ctx: &context::SmfContext, sess: &SmfSess) -> Option<u8> {
         .find_map(|b| b.assigned_ebi())
 }
 
+// Lock order (#1307 review). Three locks guard a dedicated bearer's allocations, and
+// every path takes them in this order, skipping the ones it does not need:
+//
+//   1. the SMF context guard (`context::smf_self().read()`),
+//   2. [`RULE_INDEX_CLAIM`],
+//   3. [`PRECEDENCE_RESERVATIONS`].
+//
+// [`claim_rule_index`] and [`allocate_precedences`] take a `&SmfContext`, so a caller
+// already holds 1 when it takes 2 or 3, and the closure of `allocate_precedences` gets
+// the context rather than reading it again. Nothing is locked while 3 is held: it is the
+// leaf (a [`PrecedenceReservation`]'s drop takes only it). The reverse order is the
+// #636/#645 ABBA class: a procedure holding 3 and waiting to read the context, behind a
+// queued writer that waits for a reader holding the context and waiting for 3.
+
 /// Held while a bearer's rule index is chosen and claimed (#1182 review), so two
-/// activations on one session cannot take the same one.
+/// activations on one session cannot take the same one. Lock order: after the context
+/// guard, before [`PRECEDENCE_RESERVATIONS`] (see above); take it with
+/// [`claim_rule_index`].
 static RULE_INDEX_CLAIM: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The packet filter precedences each PDN connection's in-flight procedures hold, by
+/// session id (#1296 review). A Bearer Resource Command's added filters are stored only
+/// once the SGW-C accepts the Update Bearer Request, so until then the store does not
+/// show them. An activation (or a second Command on another bearer) choosing meanwhile
+/// would take the same value, and the UE would delete one of the two (TS 24.301
+/// §6.4.2.4 d) 2)). Every allocation runs under this lock and sees the reservations.
+/// Lock order: last, after the context guard and [`RULE_INDEX_CLAIM`] (see above);
+/// allocate with [`allocate_precedences`].
+static PRECEDENCE_RESERVATIONS: std::sync::Mutex<
+    std::collections::BTreeMap<u64, Vec<(u64, Vec<u8>)>>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// A test's probe of the lock order (#1307 review): run by [`allocate_precedences`] for
+/// this session id, once, with [`PRECEDENCE_RESERVATIONS`] held and before `choose`.
+#[cfg(test)]
+pub(crate) static ALLOCATION_PROBE: std::sync::Mutex<Option<(u64, Box<dyn FnOnce() + Send>)>> =
+    std::sync::Mutex::new(None);
+
+/// Whether [`PRECEDENCE_RESERVATIONS`] can be locked within `wait` (#1307 review test).
+#[cfg(test)]
+pub(crate) fn reservations_lockable_within(wait: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match PRECEDENCE_RESERVATIONS.try_lock() {
+            Ok(_) | Err(std::sync::TryLockError::Poisoned(_)) => return true,
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// Take [`RULE_INDEX_CLAIM`]. `_ctx` is the context the caller holds the guard of: lock
+/// order 1 before 2.
+fn claim_rule_index(_ctx: &context::SmfContext) -> std::sync::MutexGuard<'static, ()> {
+    RULE_INDEX_CLAIM.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+static NEXT_RESERVATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Precedences one procedure holds on a PDN connection; released when dropped, i.e.
+/// once its filters are stored or it gave up.
+struct PrecedenceReservation {
+    sess_id: u64,
+    token: u64,
+}
+
+impl Drop for PrecedenceReservation {
+    fn drop(&mut self) {
+        let mut map = PRECEDENCE_RESERVATIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(list) = map.get_mut(&self.sess_id) {
+            list.retain(|(t, _)| *t != self.token);
+            if list.is_empty() {
+                map.remove(&self.sess_id);
+            }
+        }
+    }
+}
+
+/// Choose precedences on PDN connection `sess_id` under its allocator (#1296 review).
+/// `choose` gets the context and the precedences other procedures hold, and returns its
+/// result and the precedences it now holds, which stay reserved until the returned guard
+/// drops. `ctx` is the context the caller holds the guard of (lock order, #1307 review):
+/// `choose` reads the store through it, so the store and the reservations are seen
+/// together, and never locks the context again.
+fn allocate_precedences<R, E>(
+    ctx: &context::SmfContext,
+    sess_id: u64,
+    choose: impl FnOnce(&context::SmfContext, &[u8]) -> Result<(R, Vec<u8>), E>,
+) -> Result<(R, PrecedenceReservation), E> {
+    let mut map = PRECEDENCE_RESERVATIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    #[cfg(test)]
+    {
+        let probe = {
+            let mut slot = ALLOCATION_PROBE.lock().unwrap_or_else(|e| e.into_inner());
+            match slot.take() {
+                Some((id, probe)) if id == sess_id => Some(probe),
+                other => {
+                    *slot = other;
+                    None
+                }
+            }
+        };
+        if let Some(probe) = probe {
+            probe();
+        }
+    }
+    let held: Vec<u8> = map
+        .get(&sess_id)
+        .into_iter()
+        .flatten()
+        .flat_map(|(_, p)| p.iter().copied())
+        .collect();
+    let (result, reserve) = choose(ctx, &held)?;
+    let token = NEXT_RESERVATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    map.entry(sess_id).or_default().push((token, reserve));
+    Ok((result, PrecedenceReservation { sess_id, token }))
+}
 
 /// The lowest rule index no other bearer of the session uses.
 fn free_rule_index(ctx: &context::SmfContext, sess: &SmfSess) -> Option<u8> {
@@ -490,7 +611,7 @@ pub async fn activate(
         let ctx = handle
             .read()
             .map_err(|_| NotSent(Gtp2Cause::SystemFailure, "context poisoned".into()))?;
-        let _claim = RULE_INDEX_CLAIM.lock().unwrap_or_else(|e| e.into_inner());
+        let _claim = claim_rule_index(&ctx);
         let fresh = ctx
             .sess_find_by_id(sess.id)
             .ok_or_else(|| NotSent(Gtp2Cause::ContextNotFound, format!("no session {sess_id}")))?;
@@ -498,14 +619,21 @@ pub async fn activate(
         // across those TFTs: a UE that is handed a duplicate deletes the older filter
         // (TS 24.301 §6.4.2.4 d) 2)), so a second local rule would have taken traffic,
         // or the whole bearer, away from the first.
-        let taken = pdn_precedences(&ctx, &fresh);
-        assign_precedences(&mut req.filters, &taken)
-            .map_err(|e| NotSent(Gtp2Cause::NoResourcesAvailable, e))?;
-        // TS 23.401 §5.4.5 step 5, TS 24.301 §6.4.2.4 c) 2): a dedicated bearer's TFT
-        // holds an uplink filter; a downlink-only one gets the PGW's disallowing filter.
-        ensure_uplink_filter(&mut req.filters, &taken);
-        let tft = eps_tft::encode(eps_tft::op::CREATE_NEW_TFT, &req.filters)
-            .map_err(|e| NotSent(Gtp2Cause::SemanticErrorInTheTadOperation, e))?;
+        // #1296 review: and the ones in-flight procedures hold. The reservation is
+        // dropped at the end of this section, once the filters are stored below.
+        let (tft, _precedences) = allocate_precedences(&ctx, sess.id, |ctx, held| {
+            let mut taken = pdn_precedences(ctx, &fresh);
+            taken.extend_from_slice(held);
+            assign_precedences(&mut req.filters, &taken)
+                .map_err(|e| NotSent(Gtp2Cause::NoResourcesAvailable, e))?;
+            // TS 23.401 §5.4.5 step 5, TS 24.301 §6.4.2.4 c) 2): a dedicated bearer's
+            // TFT holds an uplink filter; a downlink-only one gets the PGW's disallowing
+            // filter.
+            ensure_uplink_filter(&mut req.filters, &taken);
+            let tft = eps_tft::encode(eps_tft::op::CREATE_NEW_TFT, &req.filters)
+                .map_err(|e| NotSent(Gtp2Cause::SemanticErrorInTheTadOperation, e))?;
+            Ok((tft, req.filters.iter().map(|f| f.precedence).collect()))
+        })?;
         let rule_index = free_rule_index(&ctx, &fresh).ok_or_else(|| {
             NotSent(
                 Gtp2Cause::NoResourcesAvailable,
@@ -1498,7 +1626,7 @@ pub async fn modify_on_command(
         ));
     }
     let handle = context::smf_self();
-    let (sess, linked_ebi, bearer, taken) = {
+    let (sess, linked_ebi, bearer) = {
         let ctx = handle
             .read()
             .map_err(|_| Refused(Gtp2Cause::SystemFailure, "context poisoned".into()))?;
@@ -1540,16 +1668,7 @@ pub async fn modify_on_command(
                 format!("bearer EBI {ebi} was not set up by this PGW-C"),
             ));
         }
-        let taken: Vec<u8> = sess
-            .bearer_ids
-            .iter()
-            .filter(|&&id| id != bearer.id)
-            .filter_map(|&id| ctx.bearer_find_by_id(id))
-            .flat_map(|b| b.pf_ids)
-            .filter_map(|id| ctx.pf_find_by_id(id))
-            .map(|pf| pf.precedence)
-            .collect();
-        (sess, linked, bearer, taken)
+        (sess, linked, bearer)
     };
     let current = stored_filters(&bearer);
 
@@ -1560,7 +1679,37 @@ pub async fn modify_on_command(
         )
     })?)
     .map_err(|e| Refused(Gtp2Cause::SyntacticErrorInTheTadOperation, e))?;
-    let change = apply_tad(&current, &tad, &taken).map_err(|(c, why)| Refused(c, why))?;
+    // #1296 review: the precedences of the PDN connection's other bearers, and those
+    // in-flight procedures hold, read under the allocator. This bearer's new filters
+    // stay reserved until they are stored (or the Command fails), so an activation or
+    // a Command on another bearer meanwhile cannot take them. #1307 review: the
+    // context guard first, then the allocator, as in `activate`.
+    let (change, _precedences) = {
+        let ctx = handle
+            .read()
+            .map_err(|_| Refused(Gtp2Cause::SystemFailure, "context poisoned".into()))?;
+        allocate_precedences(&ctx, sess.id, |ctx, held| {
+            let fresh = ctx.sess_find_by_id(sess.id).ok_or_else(|| {
+                Refused(Gtp2Cause::ContextNotFound, format!("no session {sess_id}"))
+            })?;
+            let mut taken: Vec<u8> = fresh
+                .bearer_ids
+                .iter()
+                .filter(|&&id| id != bearer.id)
+                .filter_map(|&id| ctx.bearer_find_by_id(id))
+                .flat_map(|b| b.pf_ids)
+                .filter_map(|id| ctx.pf_find_by_id(id))
+                .map(|pf| pf.precedence)
+                .collect();
+            taken.extend_from_slice(held);
+            let change = apply_tad(&current, &tad, &taken).map_err(|(c, why)| Refused(c, why))?;
+            let holds = match &change {
+                TftChange::Filters(filters, _) => filters.iter().map(|f| f.precedence).collect(),
+                _ => Vec::new(),
+            };
+            Ok((change, holds))
+        })?
+    };
 
     // The QoS the UE asked for, with the bearer's ARP (Flow QoS carries none).
     let new_qos = cmd.flow_qos.as_ref().map(|f| context::Qos {

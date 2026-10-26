@@ -242,9 +242,18 @@ impl ApiRoot {
     /// Canonical `scheme://host:port[/prefix]` form (used as client-cache and
     /// binding-cache value).
     pub fn to_uri(&self) -> String {
+        format!("{}{}", self.authority_key(), self.prefix)
+    }
+
+    /// `scheme://host:port`, the client-cache and circuit-breaker key. An IPv6 host
+    /// is bracketed whether or not it was given so (RFC 3986 §3.2.2, #1298): an
+    /// unbracketed `fd00::1` made `http://fd00::1:8080`, no valid URI, and gave the
+    /// same producer a second key.
+    pub fn authority_key(&self) -> String {
         format!(
-            "{}://{}:{}{}",
-            self.scheme, self.host, self.port, self.prefix
+            "{}://{}",
+            self.scheme,
+            nextgcore_sbi::uri_encode::uri_authority(&self.host, self.port)
         )
     }
 }
@@ -1093,7 +1102,7 @@ impl ScpProxy {
 
     /// Get or create a pooled HTTP/2 client for a target authority.
     fn client_for(&self, target: &ApiRoot) -> Arc<SbiClient> {
-        let key = format!("{}://{}:{}", target.scheme, target.host, target.port);
+        let key = target.authority_key();
         if let Some(client) = self.clients.get(&key) {
             return client;
         }
@@ -1118,13 +1127,7 @@ impl ScpProxy {
     /// Model D path strips the consumer's opaque Authorization first.
     fn oauth_client_for(&self, target: &ApiRoot, target_nf_type: NfType) -> Option<Arc<SbiClient>> {
         let oauth2 = self.oauth2.clone()?;
-        let key = format!(
-            "{}://{}:{}|{}",
-            target.scheme,
-            target.host,
-            target.port,
-            target_nf_type.to_str()
-        );
+        let key = format!("{}|{}", target.authority_key(), target_nf_type.to_str());
         if let Some(client) = self.oauth_clients.get(&key) {
             return Some(client);
         }
@@ -1724,7 +1727,7 @@ impl ScpProxy {
         // gap #209 names: the breaker stopped us hammering a dead producer but did
         // not send us to a live one, so the first request after the circuit opened
         // still failed.
-        let target_key = format!("{}://{}:{}", target.scheme, target.host, target.port);
+        let target_key = target.authority_key();
         if !self.circuit_allows(&target_key) {
             return ForwardOutcome::Undeliverable(Undeliverable {
                 target: target.to_uri(),
@@ -5791,6 +5794,63 @@ mod tests {
             Some(producer_apiroot.as_str())
         );
 
+        scp.stop().await.expect("scp stop");
+        producer.stop().await.expect("producer stop");
+    }
+
+    /// #1298: an IPv6 producer behind the SCP. The forward target's URI and its
+    /// client / circuit-breaker key bracket the address however it was spelled
+    /// (RFC 3986 §3.2.2), and a Model C request with a bracketed IPv6
+    /// `3gpp-Sbi-Target-apiRoot` reaches a producer listening on `[::1]`.
+    #[tokio::test]
+    async fn an_ipv6_producer_is_forwarded_to() {
+        for host in ["fd00::9", "[fd00::9]"] {
+            let t = ApiRoot {
+                scheme: UriScheme::Http,
+                host: host.into(),
+                port: 8080,
+                prefix: "/p".into(),
+            };
+            assert_eq!(t.to_uri(), "http://[fd00::9]:8080/p");
+            assert_eq!(t.authority_key(), "http://[fd00::9]:8080");
+        }
+
+        let listener = std::net::TcpListener::bind("[::1]:0").expect("an IPv6 loopback");
+        let producer_addr = listener.local_addr().unwrap();
+        let producer = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(producer_addr),
+            listener,
+        );
+        producer
+            .start(|request: SbiRequest| async move {
+                SbiResponse::ok().with_body(
+                    serde_json::json!({ "uri": request.header.uri }).to_string(),
+                    "application/json",
+                )
+            })
+            .await
+            .expect("producer start");
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
+        let scp = start_scp(
+            scp_listener,
+            ScpProxyConfig {
+                next_hop_scp: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        let request = SbiRequest::post("/nudm-uecm/v1/registrations").with_header(
+            "3gpp-Sbi-Target-apiRoot",
+            format!("http://[::1]:{}", producer_addr.port()),
+        );
+        let response = fast_client(scp_port)
+            .send_request(request)
+            .await
+            .expect("roundtrip");
+        assert_eq!(response.status, 200);
+        let echoed: serde_json::Value = response.json_body().unwrap();
+        assert_eq!(echoed["uri"], "/nudm-uecm/v1/registrations");
         scp.stop().await.expect("scp stop");
         producer.stop().await.expect("producer stop");
     }

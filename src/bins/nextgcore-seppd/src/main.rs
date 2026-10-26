@@ -338,10 +338,9 @@ async fn main() -> Result<()> {
         };
         let local_api_root = match (&args.n32_addr, args.n32_port) {
             (Some(addr), Some(port)) => Some(format!(
-                "{}://{}:{}",
+                "{}://{}",
                 if args.tls { "https" } else { "http" },
-                addr,
-                port
+                nextgcore_sbi::uri_encode::uri_authority(addr, port)
             )),
             _ => None,
         };
