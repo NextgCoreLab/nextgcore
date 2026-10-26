@@ -60,7 +60,7 @@ Defaults below are the real values from `NrfPolicy::default()` and its constants
 
 ## Parsed-but-inert / non-YAML settings
 
-- `logger`, `global.max.{ue,peer}`, `nrf.serving[].plmn_id`, and `nrf.sbi.server[]` (address, advertise, port, tls block) are present in the example YAML but ignored by nrfd's config structs. Equivalent runtime behavior comes from CLI flags: `--sbi-addr` (default `0.0.0.0`), `--sbi-port` (default `7777`), `--max-ue` (default `1024`), `--log-level` (default `info`), `--log-file`, and the TLS/mTLS flags.
+- `logger`, `global.max.{ue,peer}`, `nrf.serving[].plmn_id`, and `nrf.sbi.server[]` (address, advertise, port, tls block) are present in the example YAML but ignored by nrfd's config structs. Equivalent runtime behavior comes from CLI flags: `--sbi-addr` (default `127.0.0.1`, loopback since #1308; the YAML address does not set it), `--sbi-port` (default `7777`), `--max-ue` (default `1024`), `--log-level` (default `info`), `--log-file`, and the TLS/mTLS flags.
 - `--signing-key-file <path>` holds the ES256 access-token signing key: generated on first start if absent, then reused. Mount the same file into every NRF replica, or restarts and scale-out invalidate outstanding tokens (#64). `--token-expires-in` sets the access-token lifetime in seconds (default `3600`).
 - `-k/--kill` is not supported and exits with an error; stop the NRF through its supervisor. `-m/--no-color` disables colored logs.
 - `--nf-instance-id` sets the NRF's NF Instance ID (OAuth2 `iss` per TS 29.510 §6.3.5.2.4, per code comments); auto-generated UUID otherwise.

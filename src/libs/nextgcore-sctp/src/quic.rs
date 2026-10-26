@@ -167,7 +167,9 @@ pub struct QuicConfig {
 impl Default for QuicConfig {
     fn default() -> Self {
         Self {
-            bind_address: "0.0.0.0:0".parse().expect("value expected"),
+            // #1308: loopback by default; a caller that serves remote peers names
+            // the address.
+            bind_address: "127.0.0.1:0".parse().expect("value expected"),
             tls: TlsConfig::default(),
             max_streams_bidi: 100,
             max_streams_uni: 100,
@@ -508,6 +510,11 @@ mod tests {
         assert_eq!(config.max_streams_bidi, 100);
         assert!(config.enable_migration);
         assert_eq!(config.congestion_controller, CongestionController::Cubic);
+        assert_eq!(
+            config.bind_address.to_string(),
+            "127.0.0.1:0",
+            "#1308: loopback by default"
+        );
     }
 
     #[test]

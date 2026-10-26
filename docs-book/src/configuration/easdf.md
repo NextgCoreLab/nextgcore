@@ -64,12 +64,12 @@ easdf:
 | Key | Default | Effect |
 |---|---|---|
 | `easdf.enabled` | `false` | Start the NF. Also settable with `--enabled`. |
-| `easdf.sbi.server[0].address` / `.port` | `0.0.0.0` / `7818` | SBI bind. Overrides `--sbi-addr` / `--sbi-port`. |
+| `easdf.sbi.server[0].address` / `.port` | `127.0.0.1` (loopback, #1308) / `7818` | SBI bind. Overrides `--sbi-addr` / `--sbi-port`. |
 | `easdf.sbi.client.nrf[0].uri` | `http://127.0.0.1:7777` | NRF for registration and heartbeat. Overrides `--nrf-uri`. |
 | `easdf.eas_map[].fqdn` / `.addresses` | *(empty)* | Static edge FQDN → EAS address map. |
 | `easdf.dns.miss_action` | `nxdomain` | `forward` or `nxdomain`. `forward` without `upstream` warns and falls back to `nxdomain`. |
 | `easdf.dns.upstream` | *(none)* | Upstream DNS server. Reported as `FORWARD` to SBI callers, and **dialled** by the UDP plane. |
-| `easdf.dns.udp_address` | `0.0.0.0` | UDP listener bind address. `dns-udp` only; overrides `--dns-udp-addr`. |
+| `easdf.dns.udp_address` | `127.0.0.1` (loopback, #1308) | UDP listener bind address. `dns-udp` only; overrides `--dns-udp-addr`. |
 | `easdf.dns.udp_port` | `53` | UDP listener port. `dns-udp` only; overrides `--dns-udp-port`. |
 
 `upstream` accepts a bare IP address (port 53 assumed) or `address:port`. A **hostname is

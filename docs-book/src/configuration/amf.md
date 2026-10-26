@@ -86,7 +86,7 @@ The binary also takes flags that are not part of the YAML file:
 |---|---|---|
 | `-c, --config` | `/etc/nextgcore/amf.yaml` | Configuration file path. |
 | `-l, --log-level` | `info` | `trace`, `debug`, `info`, `warn`, `error`. |
-| `--ngap-addr` | `0.0.0.0:38412` | NGAP (N2) bind address. |
+| `--ngap-addr` | `127.0.0.1:38412` | NGAP (N2) bind address. Loopback by default (#1308): a gNB on another host needs it set; `amf.ngap.server` does not set it. |
 | `--sctp-backend` | `userspace` | `userspace` (sctp-proto over UDP, matched nextgsim gNB) or `kernel` (Linux kernel SCTP for an external RAN; requires the `kernel-sctp` build feature and libsctp). |
 
 Cargo features: `kernel-sctp` (enables `--sctp-backend kernel`; the Docker builder compiles amfd with it) and `ntn` (non-normative NTN timer extension, see `AMF_NTN_TIMING_ADVANCE_US`).

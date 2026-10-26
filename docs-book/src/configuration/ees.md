@@ -51,7 +51,7 @@ From the clap `Args` struct in `src/bins/nextgcore-eesd/src/main.rs`:
 | `-l, --log-file` | path | unset | Log file path. **Parsed but never consumed** — logging goes through `env_logger` regardless. |
 | `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-m, --no-color` | flag | off | Disable color output. **Parsed but never consumed.** |
-| `--sbi-addr` | string | `0.0.0.0` | SBI server bind address; also placed in the `EESRegistration` endpoint sent to the ECS. |
+| `--sbi-addr` | string | `127.0.0.1` (loopback, #1308) | SBI server bind address; also placed in the `EESRegistration` endpoint sent to the ECS. |
 | `--sbi-port` | u16 | `7814` | SBI server port (docker deployments pass `7777`). |
 | `--tls` | flag | off | Enable TLS on the SBI server. |
 | `--tls-cert` | path | `/etc/nextgcore/tls/server.crt` (when `--tls`) | TLS certificate file. |

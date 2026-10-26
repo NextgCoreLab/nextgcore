@@ -72,7 +72,7 @@ struct Args {
     kill: bool,
 
     /// SBI server address
-    #[arg(long, default_value = "0.0.0.0")]
+    #[arg(long, default_value = nextgcore_core::sockaddr::DEFAULT_LISTEN_HOST)]
     sbi_addr: String,
 
     /// SBI server port
@@ -270,6 +270,12 @@ pub async fn run() -> Result<()> {
     let sbi_addr: SocketAddr =
         nextgcore_core::sockaddr::parse_listen_addr(&args.sbi_addr, args.sbi_port)
             .context("Invalid SBI address")?;
+    // #1308: loopback by default; say which setting opens it to remote peers.
+    nextgcore_core::sockaddr::warn_if_loopback_listener(
+        "SBI",
+        &sbi_addr,
+        "--sbi-addr (or bsf.sbi.server[0].address in the config file)",
+    );
     let mut sbi_server_config = NextgcoreSbiServerConfig::new(sbi_addr);
     if require_oauth2 {
         // Server side (TS 33.501 §13.4.1): verify incoming Bearer tokens
@@ -2876,12 +2882,19 @@ mod tests {
         assert!(crate::sbi_path::allowed_nf_types_for("npcf-smpolicycontrol").is_empty());
     }
 
+    /// #1308: with no flag the SBI listener binds loopback, not every interface.
+    #[test]
+    fn sbi_listener_defaults_to_loopback_1308() {
+        let args = Args::parse_from(["nextgcore-bsfd"]);
+        assert_eq!(args.sbi_addr, "127.0.0.1");
+    }
+
     #[test]
     fn test_args_default() {
         let args = Args::parse_from(["nextgcore-bsfd"]);
         assert_eq!(args.config, "/etc/nextgcore/bsf.yaml");
         assert_eq!(args.log_level, None);
-        assert_eq!(args.sbi_addr, "0.0.0.0");
+        assert_eq!(args.sbi_addr, "127.0.0.1");
         assert_eq!(args.sbi_port, 7777);
         assert!(!args.tls);
         assert_eq!(args.max_sess, 1024);

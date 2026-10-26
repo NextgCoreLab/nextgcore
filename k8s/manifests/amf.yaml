@@ -58,7 +58,9 @@ spec:
         - name: amf
           image: nextgcore-rust/amf:latest
           imagePullPolicy: IfNotPresent
-          args: ["-c", "/etc/nextgcore/amf.yaml"]
+          # NGAP binds --ngap-addr, loopback by default (#1308): every pod
+          # interface, so the gNB reaches it through the Service.
+          args: ["-c", "/etc/nextgcore/amf.yaml", "--ngap-addr", "0.0.0.0:38412"]
           ports:
             - containerPort: 38412
               name: ngap

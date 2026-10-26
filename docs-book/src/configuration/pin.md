@@ -49,7 +49,7 @@ From the clap `Args` struct in `src/bins/nextgcore-pind/src/main.rs`:
 | `-l, --log-file` | path | unset | Declared but not applied — the field is never read after parsing; logging goes to env_logger's default output. |
 | `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-m, --no-color` | flag | off | Declared but not applied — the field is never read after parsing. |
-| `--sbi-addr` | string | `0.0.0.0` | Server bind address (docker passes `172.23.0.35`). |
+| `--sbi-addr` | string | `127.0.0.1` (loopback, #1308) | Server bind address (docker passes `172.23.0.35`). |
 | `--sbi-port` | u16 | `7815` | Server port. The docker deployment also uses `7815` (not `7777` like most NFs). |
 | `--tls` | flag | off | Enable TLS on the server. |
 | `--tls-cert` | path | `/etc/nextgcore/tls/server.crt` (when `--tls`) | TLS certificate file. |

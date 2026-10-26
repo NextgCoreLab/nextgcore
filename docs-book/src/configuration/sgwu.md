@@ -60,9 +60,9 @@ A non-IPv4 address is logged and ignored. Not read: `logger.file`, `global.max.*
 
 | Variable | Default | Description |
 |---|---|---|
-| `SGWU_GTPU_BIND` | `0.0.0.0:2152` | GTP-U bind address:port. |
+| `SGWU_GTPU_BIND` | `127.0.0.1:2152` (loopback, #1308) | GTP-U bind address:port. |
 | `SGWU_GTPU_ADVERTISE` | unset | IPv4 advertised in UP-allocated F-TEIDs; consulted only when the bound address is a wildcard. |
-| `PFCP_BIND_ADDR` | `0.0.0.0:8805` | Sxa PFCP bind address:port. |
+| `PFCP_BIND_ADDR` | `127.0.0.1:8805` (loopback, #1308) | Sxa PFCP bind address:port. |
 | `PFCP_NODE_IP` | `sgwu.pfcp.server[0].address`, then loopback | PFCP Node ID. |
 | `SGWU_GTPU_ECHO_INTERVAL_SECS` | `60` | GTP-U Echo interval toward peers; `0` disables path probing. |
 | `SGWU_GTPU_N3_REQUESTS` | `3` | Unanswered Echoes tolerated before the path is declared down. |

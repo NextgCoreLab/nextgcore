@@ -228,8 +228,9 @@ impl NgapTransport {
     }
 }
 
-/// Default NGAP bind address
-pub const DEFAULT_NGAP_ADDR: &str = "0.0.0.0";
+/// Default NGAP bind host: loopback (#1308), so an AMF started without an NGAP
+/// address is reachable from its own host only.
+pub const DEFAULT_NGAP_ADDR: &str = nextgcore_core::sockaddr::DEFAULT_LISTEN_HOST;
 
 /// Maximum NGAP message size
 pub const MAX_NGAP_MSG_SIZE: usize = 65535;

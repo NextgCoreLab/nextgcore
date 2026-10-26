@@ -27,8 +27,16 @@ use crate::s11_handler::{self, gtp_cause, HandlerResult};
 use crate::s11_parse::{self, IeError};
 use crate::{pfcp_path, sxa_handler};
 
-/// Default S11 bind address (GTPv2-C well-known port, TS 29.274 Section 4.2)
-const DEFAULT_S11_BIND: &str = "0.0.0.0:2123";
+/// Default S11 bind address (GTPv2-C well-known port, TS 29.274 Section 4.2):
+/// loopback (#1308). An SGW-C whose MME or PGW-C is on another host sets
+/// `SGWC_S11_BIND`.
+const DEFAULT_S11_BIND: &str = "127.0.0.1:2123";
+
+/// The S11/S5-C bind address: `SGWC_S11_BIND`, else [`DEFAULT_S11_BIND`].
+fn s11_bind(env: Option<String>) -> String {
+    env.filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_S11_BIND.to_string())
+}
 
 /// Default Echo probe interval (TS 23.007 Section 20.3.1). Override with
 /// `SGWC_ECHO_INTERVAL_SECS`; 0 disables probing.
@@ -724,7 +732,7 @@ pub fn gtp_open() -> Result<(), String> {
         return Ok(());
     }
 
-    let bind = std::env::var("SGWC_S11_BIND").unwrap_or_else(|_| DEFAULT_S11_BIND.to_string());
+    let bind = s11_bind(std::env::var("SGWC_S11_BIND").ok());
     // SGWC_RESTART_COUNTER is a TEST OVERRIDE only; production reads and
     // advances the persisted counter so peers can detect an SGW-C restart
     // (TS 23.007 Section 18).
@@ -743,6 +751,11 @@ pub fn gtp_open() -> Result<(), String> {
     };
 
     let server = open_s11_server(&bind, restart_counter)?;
+    nextgcore_core::sockaddr::warn_if_loopback_listener(
+        "S11/S5-C GTP-C",
+        &server.local_addr(),
+        "SGWC_S11_BIND",
+    );
 
     let ctx = sgwc_self();
     // Advertised control-plane address: the bound address unless wildcard,
@@ -10239,5 +10252,19 @@ mod tests {
         );
 
         ctx.ue_remove(b.id);
+    }
+}
+
+#[cfg(test)]
+mod default_bind_tests_1308 {
+    use super::s11_bind;
+
+    /// #1308: with SGWC_S11_BIND unset (or empty) S11/S5-C binds loopback, not
+    /// every interface; a set value is kept, the wildcard included.
+    #[test]
+    fn s11_listener_defaults_to_loopback() {
+        assert_eq!(s11_bind(None), "127.0.0.1:2123");
+        assert_eq!(s11_bind(Some(String::new())), "127.0.0.1:2123");
+        assert_eq!(s11_bind(Some("0.0.0.0:2123".into())), "0.0.0.0:2123");
     }
 }

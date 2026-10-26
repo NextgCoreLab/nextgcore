@@ -21,7 +21,8 @@
 services:
   amf:
     # Select the native kernel-SCTP NGAP backend at launch.
-    command: ["-c", "/etc/nextgcore/amf.yaml", "--sctp-backend", "kernel"]
+    # This replaces the base command, so the explicit NGAP bind is repeated (#1308).
+    command: ["-c", "/etc/nextgcore/amf.yaml", "--ngap-addr", "0.0.0.0:38412", "--sctp-backend", "kernel"]
   gnb:
     # Point the gNB at the kernel-SCTP variant config (sctp_backend: kernel).
     command: ["-c", "/etc/nextgsim/gnb-kernel.yaml"]
