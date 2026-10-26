@@ -1146,6 +1146,92 @@ pub struct SmContextIdentity {
     /// retried create as the same request and reuses its association (#980
     /// review). `None` omits the header.
     pub origination_timestamp: Option<String>,
+    /// #1222: `requestType` (TS 29.502 Table 6.1.6.2.2-1), from the Request type the UE
+    /// sent in the UL NAS TRANSPORT ([`request_type_for_smf`]). `None` omits it.
+    pub request_type: Option<&'static str>,
+    /// #1222: `3gpp-Sbi-Message-Priority` (TS 29.500 §5.2.3.2.2) for a UE with a
+    /// priority establishment cause or subscription ([`priority_message_priority`]).
+    /// `None` omits the header: the SMF then applies the default priority 24.
+    pub message_priority: Option<u8>,
+}
+
+/// #1222: the `RequestType` of SmContextCreateData (TS 29.502 §6.1.6.3.5) for the
+/// value of the UE's Request type IE (TS 24.501 §9.11.3.47).
+///
+/// - Values 1-4 map one to one.
+/// - "modification request" (5) and "MA PDU request" (6) have no counterpart, and the
+///   IE "shall not be included for a MA-PDU session establishment request". They map
+///   to `None`.
+/// - Every other value "shall be interpreted as 'initial request'" (§9.11.3.47).
+///
+/// Table 6.1.6.2.2-1 makes the IE mandatory for an existing (emergency) PDU session
+/// and optional otherwise. It is sent whenever the UE gave one. The SMF reads an
+/// emergency request from it: TS 24.501 §6.4.1.4.1 exempts such a request from the
+/// Back-off timer (#1188).
+pub fn request_type_for_smf(nas_request_type: u8) -> Option<&'static str> {
+    match nas_request_type {
+        2 => Some("EXISTING_PDU_SESSION"),
+        3 => Some("INITIAL_EMERGENCY_REQUEST"),
+        4 => Some("EXISTING_EMERGENCY_PDU_SESSION"),
+        5 | 6 => None,
+        _ => Some("INITIAL_REQUEST"),
+    }
+}
+
+/// #1222: the SBI Message Priority this AMF gives a priority UE's requests by default.
+///
+/// TS 29.500 §6.8.4 has an AMF that received an RRC Establishment Cause associated
+/// with priority service, or found an MPS/MCX subscription in the UDM, "select an SMP
+/// value appropriate for the priority service". Values run from 0 (highest) to 31,
+/// and a request without the header has the default 24. MPS and MCX "should have
+/// higher priorities than Emergency calls". The ranking itself is regulatory and
+/// operator policy, so `AMF_PRIORITY_MESSAGE_PRIORITY` (0-31) overrides this default.
+pub const DEFAULT_PRIORITY_MESSAGE_PRIORITY: u8 = 8;
+
+/// #1222: the `3gpp-Sbi-Message-Priority` for a UE's requests. `None` for a UE that
+/// neither connected with a priority establishment cause nor holds an MPS/MCX
+/// subscription.
+///
+/// TS 23.502 §4.3.2.2.1 step 3: the AMF includes a Message Priority header, and "the
+/// SMF uses the Message Priority header to determine if the UE request is subject to
+/// exemption from NAS level congestion control".
+pub fn priority_message_priority(ue: &crate::context::AmfUe) -> Option<u8> {
+    if !(ue.priority_access_cause || ue.priority_subscription) {
+        return None;
+    }
+    static CONFIGURED: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    Some(*CONFIGURED.get_or_init(|| {
+        message_priority_from(
+            std::env::var("AMF_PRIORITY_MESSAGE_PRIORITY")
+                .ok()
+                .as_deref(),
+        )
+    }))
+}
+
+/// The value of `AMF_PRIORITY_MESSAGE_PRIORITY`: 0-31, else the default, with a warning
+/// for a value that is set but unusable (#1222 review).
+fn message_priority_from(value: Option<&str>) -> u8 {
+    let Some(value) = value else {
+        return DEFAULT_PRIORITY_MESSAGE_PRIORITY;
+    };
+    match value.trim().parse::<u8>() {
+        Ok(v) if v <= 31 => v,
+        _ => {
+            log::warn!(
+                "AMF_PRIORITY_MESSAGE_PRIORITY={value:?} is not an SBI message priority \
+                 (0-31, TS 29.500 §6.8.4); using {DEFAULT_PRIORITY_MESSAGE_PRIORITY}"
+            );
+            DEFAULT_PRIORITY_MESSAGE_PRIORITY
+        }
+    }
+}
+
+/// Tests (#1222): the CreateSMContext request the create path sends for `identity`, with
+/// fixed session parameters.
+#[cfg(test)]
+pub(crate) fn build_create_sm_context_request_for_test(identity: &SmContextIdentity) -> SbiRequest {
+    build_create_sm_context_request(5, 1, None, None, &[0x2E], false, identity)
 }
 
 /// TS 29.502 §6.1.2.3.2 custom header.
@@ -1229,6 +1315,9 @@ fn build_create_sm_context_request(
     if let Some(gpsi) = &identity.gpsi {
         obj.insert("gpsi".to_string(), serde_json::json!(gpsi));
     }
+    if let Some(request_type) = identity.request_type {
+        obj.insert("requestType".to_string(), serde_json::json!(request_type));
+    }
     let request = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts")
         .with_body(body.to_string(), content_type::APPLICATION_JSON)
         .with_part(SbiPart::with_content(
@@ -1236,6 +1325,13 @@ fn build_create_sm_context_request(
             content_type::APPLICATION_5GNAS,
             bytes::Bytes::copy_from_slice(n1_sm_msg_from_ue),
         ));
+    let request = match &identity.message_priority {
+        Some(priority) => request.with_header(
+            nextgcore_sbi::constants::custom_header::MESSAGE_PRIORITY,
+            priority.to_string(),
+        ),
+        None => request,
+    };
     match &identity.origination_timestamp {
         Some(ts) => request.with_header(ORIGINATION_TIMESTAMP_HEADER, ts.as_str()),
         None => request,
@@ -3389,6 +3485,9 @@ pub struct AmDataResponse {
     /// GPSI — first well-formed entry of the `gpsis` array
     /// (TS 29.503 §5.2.2.2.1), or `None` when the subscription carries none.
     pub gpsi: Option<String>,
+    /// #1222: `mpsPriority` or `mcsPriority` is true (TS 29.503 §6.1.6.2.4): the
+    /// subscriber has an MPS or MCX priority subscription.
+    pub priority_subscription: bool,
 }
 
 /// Accept a TS 29.571 `Gpsi` only in one of its two NAMED forms —
@@ -3506,6 +3605,11 @@ fn parse_am_data(json: &serde_json::Value, supi: &str) -> AmDataResponse {
     // several external identities; the N11 `gpsi` member is singular, so the
     // first well-formed entry is taken. Entries that are not one of the two
     // named `Gpsi` forms are skipped rather than stored -- see `validated_gpsi`.
+    // #1222: TS 23.502 §4.3.2.2.1 step 3 has the AMF signal a UE with a "priority
+    // subscription (e.g. MPS, MCX) in the UDM" to the SMF, as one with a priority
+    // establishment cause.
+    out.priority_subscription =
+        json["mpsPriority"].as_bool() == Some(true) || json["mcsPriority"].as_bool() == Some(true);
     if let Some(list) = json["gpsis"].as_array() {
         out.gpsi = list
             .iter()
@@ -3539,7 +3643,7 @@ pub async fn call_udm_sdm_subscribe(
 
     let body = serde_json::json!({
         "nfInstanceId": amf_instance_id,
-        "callbackReference": format!("/namf-callback/v1/{supi}/sdmsubscription-notify"),
+        "callbackReference": sdm_callback_reference(supi),
         "monitoredResourceUris": [format!("/nudm-sdm/v2/{supi}/am-data")],
         "implicitUnsubscribe": true
     });
@@ -3590,7 +3694,7 @@ pub async fn call_pcf_am_policy_create(
     );
 
     let body = serde_json::json!({
-        "notificationUri": format!("/namf-callback/v1/{supi}/am-policy-notify"),
+        "notificationUri": am_policy_notification_uri(supi),
         "supi": supi,
         "servingPlmn": { "mcc": serving_plmn_mcc, "mnc": serving_plmn_mnc },
         "suppFeat": ""
@@ -3762,6 +3866,130 @@ pub async fn call_pcf_ue_policy_delete(
     }
 
     log::info!("Npcf_UEPolicyControl_Delete OK (polAssoId={pol_asso_id})");
+    Ok(())
+}
+
+/// The absolute `callbackReference` of this AMF's SDM subscription for `supi`
+/// (TS 29.503 §6.1.6.2.3 `SdmSubscription`), built from [`advertised_sbi_base`] as
+/// [`ue_policy_notification_uri`] is (#1210). It used to be a relative path, which a UDM
+/// cannot POST to.
+pub fn sdm_callback_reference(supi: &str) -> String {
+    format!(
+        "{}/namf-callback/v1/{supi}/sdmsubscription-notify",
+        advertised_sbi_base()
+    )
+}
+
+/// The absolute AM policy `notificationUri` for `supi` (TS 29.507 §5.6.2.3), as
+/// [`sdm_callback_reference`] (#1210).
+pub fn am_policy_notification_uri(supi: &str) -> String {
+    format!(
+        "{}/namf-callback/v1/{supi}/am-policy-notify",
+        advertised_sbi_base()
+    )
+}
+
+/// Npcf_AMPolicyControl_Update toward a new serving AMF (#1210): POST
+/// `/npcf-am-policy-control/v1/policies/{polAssoId}/update` with the new
+/// `notificationUri` and `guami` (TS 29.507 §4.2.3.1: an AMF that "knows by
+/// implementation specific means that the UE context has been transferred to an AMF
+/// with another GUAMI within the AMF set ... may also invoke this procedure to update
+/// the Notification URI and the GUAMI"; items 1 and 13).
+pub async fn call_pcf_am_policy_update_serving_amf(
+    pcf_host: &str,
+    pcf_port: u16,
+    pol_asso_id: &str,
+    notification_uri: &str,
+    guami: &serde_json::Value,
+) -> SbiResult<()> {
+    let client = crate::attach_oauth2(
+        SbiClient::for_peer(pcf_host, pcf_port),
+        nextgcore_sbi::types::NfType::Pcf,
+    );
+    let body = serde_json::json!({ "notificationUri": notification_uri, "guami": guami });
+    let response = client
+        .post_json(
+            &format!("/npcf-am-policy-control/v1/policies/{pol_asso_id}/update"),
+            &body,
+        )
+        .await
+        .map_err(|e| SbiError::RequestFailed(format!("AM policy update failed: {e}")))?;
+    if !response.is_success() {
+        return Err(SbiError::RequestFailed(format!(
+            "AM policy update returned status {}",
+            response.status
+        )));
+    }
+    log::info!("Npcf_AMPolicyControl_Update OK (polAssoId={pol_asso_id}): new serving AMF");
+    Ok(())
+}
+
+/// Npcf_UEPolicyControl_Update toward a new serving AMF (#1210): POST
+/// `/npcf-ue-policy-control/v1/policies/{polAssoId}/update` with the new
+/// `notificationUri`, and the `guami` and `servingNfId` that identify this AMF
+/// (TS 29.525 §4.2.3.1: the AMF that knows the UE context moved within the AMF set
+/// "may also invoke this procedure to update the Notification URI";
+/// PolicyAssociationUpdateRequest, §5.6.2.4).
+pub async fn call_pcf_ue_policy_update_serving_amf(
+    pcf_host: &str,
+    pcf_port: u16,
+    pol_asso_id: &str,
+    notification_uri: &str,
+    guami: &serde_json::Value,
+    serving_nf_id: &str,
+) -> SbiResult<()> {
+    let client = crate::attach_oauth2(
+        SbiClient::for_peer(pcf_host, pcf_port),
+        nextgcore_sbi::types::NfType::Pcf,
+    );
+    let body = serde_json::json!({
+        "notificationUri": notification_uri,
+        "guami": guami,
+        "servingNfId": serving_nf_id,
+    });
+    let response = client
+        .post_json(
+            &format!("/npcf-ue-policy-control/v1/policies/{pol_asso_id}/update"),
+            &body,
+        )
+        .await
+        .map_err(|e| SbiError::RequestFailed(format!("UE policy update failed: {e}")))?;
+    if !response.is_success() {
+        return Err(SbiError::RequestFailed(format!(
+            "UE policy update returned status {}",
+            response.status
+        )));
+    }
+    log::info!("Npcf_UEPolicyControl_Update OK (polAssoId={pol_asso_id}): new serving AMF");
+    Ok(())
+}
+
+/// Nudm_SDM_Unsubscribe: DELETE `/nudm-sdm/v2/{supi}/sdm-subscriptions/{subscriptionId}`
+/// (TS 29.503 §5.2.2.4.2). A 404 counts as done: the UDM may already have removed the
+/// subscription itself (`implicitUnsubscribe`, §6.1.6.2.3).
+pub async fn call_udm_sdm_unsubscribe(
+    udm_host: &str,
+    udm_port: u16,
+    supi: &str,
+    subscription_id: &str,
+) -> SbiResult<()> {
+    let client = crate::attach_oauth2(
+        SbiClient::for_peer(udm_host, udm_port),
+        nextgcore_sbi::types::NfType::Udm,
+    );
+    let response = client
+        .delete(&format!(
+            "/nudm-sdm/v2/{supi}/sdm-subscriptions/{subscription_id}"
+        ))
+        .await
+        .map_err(|e| SbiError::RequestFailed(format!("SDM unsubscribe failed: {e}")))?;
+    if !response.is_success() && response.status != 404 {
+        return Err(SbiError::RequestFailed(format!(
+            "SDM unsubscribe returned status {}",
+            response.status
+        )));
+    }
+    log::info!("[{supi}] Nudm_SDM_Unsubscribe OK (subscriptionId={subscription_id})");
     Ok(())
 }
 
@@ -4405,6 +4633,50 @@ pub async fn call_smf_n2_handover(
     target_id: Option<&serde_json::Value>,
     cause: Option<&str>,
 ) -> Result<Option<(String, Vec<u8>)>, String> {
+    call_smf_n2_handover_step(
+        smf_host,
+        smf_port,
+        sm_context_ref,
+        ho_state,
+        n2,
+        target_id,
+        cause,
+    )
+    .await
+    .map_err(|refusal| refusal.reason)
+}
+
+/// An N2 handover step the SMF did not carry out (#1171): why, and the N2 SM
+/// information its SmContextUpdateError carried, if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct N2HandoverRefusal {
+    pub reason: String,
+    /// `(n2SmInfoType, n2SmInfo)` of the error body: for a refused PREPARING or
+    /// PREPARED, `HANDOVER_PREP_FAIL` with the Handover Preparation Unsuccessful
+    /// Transfer (TS 29.502 §5.2.2.3.4.2 steps 2b and 4b, TS 38.413 §9.3.4.18).
+    pub n2: Option<(String, Vec<u8>)>,
+}
+
+impl N2HandoverRefusal {
+    /// The Handover Preparation Unsuccessful Transfer the SMF answered with, if any.
+    pub fn preparation_unsuccessful_transfer(&self) -> Option<&[u8]> {
+        match &self.n2 {
+            Some((t, b)) if t == "HANDOVER_PREP_FAIL" => Some(b),
+            _ => None,
+        }
+    }
+}
+
+/// [`call_smf_n2_handover`], keeping the N2 SM information of an error answer.
+pub async fn call_smf_n2_handover_step(
+    smf_host: &str,
+    smf_port: u16,
+    sm_context_ref: &str,
+    ho_state: &str,
+    n2: Option<(&str, &[u8])>,
+    target_id: Option<&serde_json::Value>,
+    cause: Option<&str>,
+) -> Result<Option<(String, Vec<u8>)>, N2HandoverRefusal> {
     let client = crate::attach_oauth2(
         SbiClient::for_peer(smf_host, smf_port),
         nextgcore_sbi::types::NfType::Smf,
@@ -4434,13 +4706,22 @@ pub async fn call_smf_n2_handover(
     let response = client
         .send_request(request)
         .await
-        .map_err(|e| format!("UpdateSMContext ({ho_state}) failed: {e}"))?;
-    if !response.is_success() {
-        return Err(format!(
-            "UpdateSMContext ({ho_state}) answered {}",
-            response.status
-        ));
-    }
+        .map_err(|e| N2HandoverRefusal {
+            reason: format!("UpdateSMContext ({ho_state}) failed: {e}"),
+            n2: None,
+        })?;
+    n2_handover_answer(ho_state, &response)
+}
+
+/// The SMF's answer to an N2 handover step (TS 29.502 §5.2.2.3.4): on 200, the
+/// SmContextUpdatedData's N2 SM information; otherwise a refusal with the
+/// SmContextUpdateError's (§6.1.6.2.4: `n2SmInfo`, a RefToBinaryData to the
+/// multipart part, and `n2SmInfoType`), which steps 2b and 4b of §5.2.2.3.4.2
+/// make a Handover Preparation Unsuccessful Transfer (#1171).
+pub fn n2_handover_answer(
+    ho_state: &str,
+    response: &SbiResponse,
+) -> Result<Option<(String, Vec<u8>)>, N2HandoverRefusal> {
     let root: serde_json::Value = response
         .http
         .content
@@ -4448,11 +4729,22 @@ pub async fn call_smf_n2_handover(
         .and_then(|c| serde_json::from_str(c).ok())
         .unwrap_or(serde_json::Value::Null);
     let n2_type = root["n2SmInfoType"].as_str().map(str::to_owned);
-    let n2 = extract_binary_ref(&response, &root, "n2SmInfo").filter(|b| !b.is_empty());
-    Ok(match (n2_type, n2) {
+    let n2 = extract_binary_ref(response, &root, "n2SmInfo").filter(|b| !b.is_empty());
+    let n2 = match (n2_type, n2) {
         (Some(t), Some(b)) => Some((t, b)),
         _ => None,
-    })
+    };
+    if !response.is_success() {
+        let cause = root["error"]["cause"].as_str().unwrap_or("no cause");
+        return Err(N2HandoverRefusal {
+            reason: format!(
+                "UpdateSMContext ({ho_state}) answered {} ({cause})",
+                response.status
+            ),
+            n2,
+        });
+    }
+    Ok(n2)
 }
 
 async fn update_sm_context_ho_state(
@@ -5246,6 +5538,141 @@ mod tests {
             .is_none());
     }
 
+    /// #1222: TS 24.501 §9.11.3.47 onto TS 29.502 §6.1.6.3.5. Unused and reserved
+    /// values read as "initial request"; modification and MA PDU requests carry none.
+    #[test]
+    fn the_nas_request_type_maps_onto_the_smf_request_type() {
+        let expected = [
+            (0, Some("INITIAL_REQUEST")),
+            (1, Some("INITIAL_REQUEST")),
+            (2, Some("EXISTING_PDU_SESSION")),
+            (3, Some("INITIAL_EMERGENCY_REQUEST")),
+            (4, Some("EXISTING_EMERGENCY_PDU_SESSION")),
+            (5, None),
+            (6, None),
+            (7, Some("INITIAL_REQUEST")),
+        ];
+        for (nas, smf) in expected {
+            assert_eq!(request_type_for_smf(nas), smf, "Request type {nas}");
+        }
+    }
+
+    /// #1222: `requestType` and `3gpp-Sbi-Message-Priority` go out when set and are
+    /// absent otherwise.
+    #[test]
+    fn the_create_carries_the_request_type_and_the_message_priority_when_set() {
+        let header = nextgcore_sbi::constants::custom_header::MESSAGE_PRIORITY;
+        let with = build_create_sm_context_request(
+            5,
+            1,
+            None,
+            None,
+            &[0x2E],
+            false,
+            &SmContextIdentity {
+                request_type: Some("INITIAL_EMERGENCY_REQUEST"),
+                message_priority: Some(8),
+                ..test_identity()
+            },
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(with.http.content.as_deref().expect("body")).expect("json");
+        assert_eq!(body["requestType"], "INITIAL_EMERGENCY_REQUEST");
+        assert_eq!(with.http.get_header(header).map(String::as_str), Some("8"));
+        assert_eq!(with.http.message_priority(), Some(8));
+
+        let without =
+            build_create_sm_context_request(5, 1, None, None, &[0x2E], false, &test_identity());
+        let body: serde_json::Value =
+            serde_json::from_str(without.http.content.as_deref().expect("body")).expect("json");
+        assert!(body.get("requestType").is_none(), "{body}");
+        assert!(without.http.get_header(header).is_none());
+    }
+
+    /// #1222: an MPS or MCX priority subscription in the AM data (TS 29.503
+    /// §6.1.6.2.4) is kept; `false` or absent is not one.
+    #[test]
+    fn an_mps_or_mcx_subscription_is_read_from_the_am_data() {
+        for (body, expected) in [
+            (serde_json::json!({ "mpsPriority": true }), true),
+            (serde_json::json!({ "mcsPriority": true }), true),
+            (
+                serde_json::json!({ "mpsPriority": false, "mcsPriority": false }),
+                false,
+            ),
+            (serde_json::json!({}), false),
+        ] {
+            assert_eq!(
+                parse_am_data(&body, "imsi-001010000122201").priority_subscription,
+                expected,
+                "{body}"
+            );
+        }
+    }
+
+    /// #1210: an SDM subscription the UDM already removed (404, e.g. through
+    /// `implicitUnsubscribe`) is unsubscribed; any other refusal is an error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_sdm_unsubscribe_takes_a_404_as_done() {
+        use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let udm = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        udm.start(|req: SReq| async move {
+            match req.header.uri.rsplit('/').next() {
+                Some("gone") => SResp::with_status(404),
+                Some("kept") => SResp::no_content(),
+                _ => SResp::with_status(500),
+            }
+        })
+        .await
+        .expect("stand-in UDM starts");
+        let supi = "imsi-001010001210902";
+        for (id, ok) in [("gone", true), ("kept", true), ("broken", false)] {
+            assert_eq!(
+                call_udm_sdm_unsubscribe("127.0.0.1", addr.port(), supi, id)
+                    .await
+                    .is_ok(),
+                ok,
+                "{id}"
+            );
+        }
+    }
+
+    /// #1222 review: `AMF_PRIORITY_MESSAGE_PRIORITY` takes 0-31 (TS 29.500 §6.8.4);
+    /// anything else is the default.
+    #[test]
+    fn the_configured_message_priority_is_0_to_31_or_the_default() {
+        let d = DEFAULT_PRIORITY_MESSAGE_PRIORITY;
+        for (value, expected) in [
+            (None, d),
+            (Some("0"), 0),
+            (Some(" 31 "), 31),
+            (Some("32"), d),
+            (Some("-1"), d),
+            (Some("high"), d),
+        ] {
+            assert_eq!(message_priority_from(value), expected, "{value:?}");
+        }
+    }
+
+    /// #1222: a UE with a priority subscription but an ordinary connection still gets
+    /// the Message Priority (TS 23.502 §4.3.2.2.1 step 3: "or when the AMF determines
+    /// the UE has priority subscription (e.g. MPS, MCX) in the UDM").
+    #[test]
+    fn a_priority_subscription_alone_sets_the_message_priority() {
+        let mut ue = crate::context::AmfUe::new(1, 1);
+        assert_eq!(priority_message_priority(&ue), None);
+        ue.priority_subscription = true;
+        assert_eq!(
+            priority_message_priority(&ue),
+            Some(DEFAULT_PRIORITY_MESSAGE_PRIORITY)
+        );
+    }
+
     fn test_identity() -> SmContextIdentity {
         SmContextIdentity {
             supi: Some("imsi-262011234567890".to_string()),
@@ -5263,6 +5690,8 @@ mod tests {
             })),
             gpsi: Some("msisdn-491234567890".to_string()),
             origination_timestamp: Some("Fri, 23 Oct 2026 10:00:00.980 GMT".to_string()),
+            request_type: None,
+            message_priority: None,
         }
     }
 
