@@ -303,7 +303,10 @@ async fn main() -> Result<()> {
         };
         if let Ok(context) = lmf_self().read() {
             context.set_nf_instance_id(nf_instance_id.clone());
-            context.set_callback_base(format!("http://{advertised_host}:{}", args.sbi_port));
+            context.set_callback_base(format!(
+                "http://{}",
+                nextgcore_sbi::uri_encode::uri_authority(advertised_host, args.sbi_port)
+            ));
         }
     }
 

@@ -837,7 +837,10 @@ async fn main() -> Result<()> {
         } else {
             config.sbi_addr.as_str()
         };
-        format!("http://{host}:{}", config.sbi_port)
+        format!(
+            "http://{}",
+            nextgcore_sbi::uri_encode::uri_authority(host, config.sbi_port)
+        )
     });
     log::info!("SBI advertise URI for callbacks: {advertise_uri}");
     let _ = SELF_SBI_URI.set(advertise_uri.clone());

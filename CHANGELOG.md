@@ -13,6 +13,13 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 ## [Unreleased]
 
 ### Changed
+- An IPv6 SBI address goes in square brackets in every URI a daemon builds from it
+  (RFC 3986 §3.2.2). That covers pcfd's apiRoot and callback URIs, the apiRoot or self/callback
+  base of amfd, ausfd, lmfd, nefd, nrfd, nwdafd, smfd, ucmfd, udmd and udrd, seppd's N32f
+  forward URI, and the SBI client's and SCP's base URI and connect address. Before, an IPv6
+  address gave `http://fd00::1:7777/...`, which is not a valid URI (Refs #1277). One shared
+  helper, `nextgcore_sbi::uri_encode::uri_authority`, does it. The bind-address parse has
+  the same defect and is tracked in #1298.
 - pcfd's `resourceUri`, in AM and UE PolicyUpdates (notifications and Update responses) and in
   SM policy notifications, is now the complete resource URI `{apiRoot}/<apiName>/...` (TS 29.501
   §4.4.1), with the configured FQDN as host when there is one. Before, it was the bare path. The

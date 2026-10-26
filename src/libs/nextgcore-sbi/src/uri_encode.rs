@@ -161,6 +161,23 @@ fn encode_with(s: &str, space: SpaceAs) -> String {
     out
 }
 
+/// `host` as the host of a URI authority (RFC 3986 §3.2.2): an IPv6 literal goes in
+/// square brackets (`IP-literal = "[" IPv6address "]"`), anything else (a name, an
+/// IPv4 address, an already bracketed literal) as it is. Without the brackets
+/// `http://fd00::1:7777/...` names no valid authority (#1277 follow-up).
+pub fn uri_host(host: &str) -> std::borrow::Cow<'_, str> {
+    if !host.starts_with('[') && host.parse::<std::net::Ipv6Addr>().is_ok() {
+        std::borrow::Cow::Owned(format!("[{host}]"))
+    } else {
+        std::borrow::Cow::Borrowed(host)
+    }
+}
+
+/// `host:port` as a URI authority, the host per [`uri_host`].
+pub fn uri_authority(host: &str, port: u16) -> String {
+    format!("{}:{port}", uri_host(host))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,5 +338,44 @@ mod tests {
         // Lowercase hex decodes too (RFC 3986 §2.1: producers SHOULD uppercase,
         // recipients MUST accept both).
         assert_eq!(decode_query_value("%c3%a9"), "é");
+    }
+}
+
+#[cfg(test)]
+mod tests_uri_authority {
+    use super::{uri_authority, uri_host};
+
+    #[test]
+    fn an_ipv6_literal_is_bracketed_and_nothing_else_is() {
+        assert_eq!(uri_authority("fd00::1", 7777), "[fd00::1]:7777");
+        assert_eq!(uri_authority("::1", 80), "[::1]:80");
+        assert_eq!(
+            uri_authority("[fd00::1]", 7777),
+            "[fd00::1]:7777",
+            "not twice"
+        );
+        assert_eq!(uri_authority("10.0.0.7", 7777), "10.0.0.7:7777");
+        assert_eq!(
+            uri_authority("pcf.example.org", 7777),
+            "pcf.example.org:7777"
+        );
+        assert_eq!(
+            uri_host("fe80::1%eth0"),
+            "fe80::1%eth0",
+            "a zone id is no Ipv6Addr; left"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests_client_authority {
+    /// The SBI client's base URI, the key its overload state is held under and what
+    /// requests are built on, brackets an IPv6 producer address.
+    #[test]
+    fn the_client_base_uri_brackets_an_ipv6_host() {
+        let c = crate::client::SbiClientConfig::new("fd00::9", 8080);
+        assert_eq!(c.base_uri(), "http://[fd00::9]:8080");
+        let c = crate::client::SbiClientConfig::new("10.0.0.9", 8080);
+        assert_eq!(c.base_uri(), "http://10.0.0.9:8080");
     }
 }

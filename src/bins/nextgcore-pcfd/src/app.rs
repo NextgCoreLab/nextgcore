@@ -1679,10 +1679,9 @@ async fn retry_parked_ue_policy_delivery(pol_asso_id: &str, why: &str) -> bool {
 fn ue_policy_notify_callback_uri(pol_asso_id: &str) -> Option<String> {
     let info = sbi_path::pcf_self_info()?;
     Some(format!(
-        "{}://{}:{}/npcf-ue-policy-control/v1/notify/{}/n1-message-notify",
+        "{}://{}/npcf-ue-policy-control/v1/notify/{}/n1-message-notify",
         sbi_path::advertised_sbi_scheme(),
-        info.sbi_addr,
-        info.sbi_port,
+        nextgcore_sbi::uri_encode::uri_authority(&info.sbi_addr, info.sbi_port),
         pol_asso_id
     ))
 }
@@ -1697,10 +1696,9 @@ fn ue_policy_notify_callback_uri(pol_asso_id: &str) -> Option<String> {
 fn ue_policy_connectivity_callback_uri(pol_asso_id: &str) -> Option<String> {
     let info = sbi_path::pcf_self_info()?;
     Some(format!(
-        "{}://{}:{}{}/{pol_asso_id}/{}",
+        "{}://{}{}/{pol_asso_id}/{}",
         sbi_path::advertised_sbi_scheme(),
-        info.sbi_addr,
-        info.sbi_port,
+        nextgcore_sbi::uri_encode::uri_authority(&info.sbi_addr, info.sbi_port),
         sbi_path::UE_POLICY_N1N2_FAILURE_PATH_PREFIX,
         UE_POLICY_CONNECTIVITY_NOTIFY_SEGMENT,
     ))
