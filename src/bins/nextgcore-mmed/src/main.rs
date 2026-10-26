@@ -94,6 +94,24 @@ pub struct MmeApp {
     s6a_requests: Option<tokio::sync::mpsc::UnboundedReceiver<fd_path::PendingS6aRequest>>,
 }
 
+/// Where S1-MME binds: `mme.s1ap.server`, or loopback when unset (#1299). Never
+/// the wildcard by default: an unconfigured MME is not reachable from other hosts,
+/// and says so.
+fn s1ap_bind_addr(ctx: &context::MmeContext) -> std::net::SocketAddr {
+    match ctx.s1ap_list.first().copied() {
+        Some(addr) => addr,
+        None => {
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], ctx.s1ap_port));
+            log::warn!(
+                "mme.s1ap.server is not set: S1-MME listens on {addr} only, so no eNB on \
+                 another host can associate. Set mme.s1ap.server to the MME's address on the \
+                 eNB network"
+            );
+            addr
+        }
+    }
+}
+
 /// One step of the SBc-AP transport, or never when it is not configured (so a
 /// `select!` arm on it stays idle).
 async fn poll_sbcap(sbcap: Option<&mut sbcap_path::SbcapServer>) {
@@ -188,13 +206,10 @@ impl MmeApp {
         // Without this nothing can reach the S1AP layer, so no eNB can
         // associate and no EPS procedure can run (issue #42).
         let ctx = context::mme_self();
-        // Bind where the configuration says, falling back to the wildcard so an
-        // unconfigured deployment behaves exactly as it did before #157.
-        let s1ap_bind = ctx
-            .s1ap_list
-            .first()
-            .copied()
-            .unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], ctx.s1ap_port)));
+        // Bind where the configuration says. Unset, it is loopback, not the
+        // wildcard it was until #1299 (builder-security: a listener is private by
+        // default); an eNB cannot reach it until `mme.s1ap.server` is set.
+        let s1ap_bind = s1ap_bind_addr(ctx);
         let send_rx = s1ap_path::install_send_queue().ok_or_else(|| {
             anyhow::anyhow!("S1AP send queue already installed (MmeApp::init called twice)")
         })?;
@@ -552,6 +567,22 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// #1299: unset, S1-MME binds loopback, never the wildcard; set, the
+    /// configured address.
+    #[test]
+    fn s1_mme_binds_loopback_unless_configured() {
+        let mut ctx = crate::context::MmeContext::new();
+        assert_eq!(
+            super::s1ap_bind_addr(&ctx),
+            "127.0.0.1:36412".parse::<std::net::SocketAddr>().unwrap()
+        );
+        ctx.s1ap_list.push("10.0.0.5:36412".parse().unwrap());
+        assert_eq!(
+            super::s1ap_bind_addr(&ctx),
+            "10.0.0.5:36412".parse::<std::net::SocketAddr>().unwrap()
+        );
+    }
+
     use super::*;
 
     /// The metrics endpoint is loopback unless configured otherwise.

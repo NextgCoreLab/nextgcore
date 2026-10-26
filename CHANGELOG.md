@@ -13,6 +13,14 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 ## [Unreleased]
 
 ### Changed
+- **mmed: S1-MME binds `127.0.0.1:36412` when `mme.s1ap.server` is unset**, where it bound the
+  wildcard `0.0.0.0` (#1299). Break risk: a deployment that relied on the implicit wildcard
+  (no `mme.s1ap.server`) no longer accepts eNBs from other hosts; it logs a warning and needs
+  `mme.s1ap.server` set. Every shipped config (`docker/rust/configs/epc/mme.yaml`, which the
+  EKS EPC profile also uses) sets it.
+- mmed serves SBc-AP toward a CBC when `mme.sbcap` is configured (TS 29.168: Write-Replace and
+  Stop Warning, and the PWS Restart / Failure Indication relay of TS 23.007 §15A.1.2), off by
+  default, CBC allowlist (#1071).
 - pcfd's `resourceUri`, in AM and UE PolicyUpdates (notifications and Update responses) and in
   SM policy notifications, is now the complete resource URI `{apiRoot}/<apiName>/...` (TS 29.501
   §4.4.1), with the configured FQDN as host when there is one. Before, it was the bare path. The
