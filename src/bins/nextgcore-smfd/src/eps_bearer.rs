@@ -470,18 +470,9 @@ pub async fn activate(
                 "the session has no PDN address".into(),
             )
         })?;
-        // The precedences the PDN connection's TFTs already use (TS 24.301 §6.4.2.4 d)).
-        let taken: Vec<u8> = sess
-            .bearer_ids
-            .iter()
-            .filter_map(|&id| ctx.bearer_find_by_id(id))
-            .flat_map(|b| b.pf_ids)
-            .filter_map(|id| ctx.pf_find_by_id(id))
-            .map(|pf| pf.precedence)
-            .collect();
-        (sess, peer, linked_ebi, ue_ipv4, taken)
+        (sess, peer, linked_ebi, ue_ipv4)
     };
-    let (sess, peer, linked_ebi, ue_ipv4, taken) = prepared;
+    let (sess, peer, linked_ebi, ue_ipv4) = prepared;
 
     if req.filters.is_empty() {
         return Err(NotSent(
@@ -489,17 +480,13 @@ pub async fn activate(
             "a dedicated bearer needs at least one packet filter".into(),
         ));
     }
-    // TS 23.401 §5.4.5 step 5, TS 24.301 §6.4.2.4 c) 2): a dedicated bearer's TFT holds
-    // an uplink filter; a downlink-only one gets the PGW's disallowing filter.
-    ensure_uplink_filter(&mut req.filters, &taken);
-    let tft = eps_tft::encode(eps_tft::op::CREATE_NEW_TFT, &req.filters)
-        .map_err(|e| NotSent(Gtp2Cause::SemanticErrorInTheTadOperation, e))?;
 
     // Step 1: the bearer and its packet filters, stored with EBI 0. Its rule index is
     // chosen and claimed in one critical section (#1182 review): two activations on
     // one session (a local rule and a Bearer Resource Command) run on different tasks,
-    // and must not both take k, or their PGW-U rules would collide.
-    let (mut bearer, rule_index) = {
+    // and must not both take k, or their PGW-U rules would collide. Its filter
+    // precedences are chosen in the same one (#1293), for the same reason.
+    let (mut bearer, rule_index, tft) = {
         let ctx = handle
             .read()
             .map_err(|_| NotSent(Gtp2Cause::SystemFailure, "context poisoned".into()))?;
@@ -507,6 +494,18 @@ pub async fn activate(
         let fresh = ctx
             .sess_find_by_id(sess.id)
             .ok_or_else(|| NotSent(Gtp2Cause::ContextNotFound, format!("no session {sess_id}")))?;
+        // #1293: the precedences the PDN connection's TFTs already use. They are unique
+        // across those TFTs: a UE that is handed a duplicate deletes the older filter
+        // (TS 24.301 §6.4.2.4 d) 2)), so a second local rule would have taken traffic,
+        // or the whole bearer, away from the first.
+        let taken = pdn_precedences(&ctx, &fresh);
+        assign_precedences(&mut req.filters, &taken)
+            .map_err(|e| NotSent(Gtp2Cause::NoResourcesAvailable, e))?;
+        // TS 23.401 §5.4.5 step 5, TS 24.301 §6.4.2.4 c) 2): a dedicated bearer's TFT
+        // holds an uplink filter; a downlink-only one gets the PGW's disallowing filter.
+        ensure_uplink_filter(&mut req.filters, &taken);
+        let tft = eps_tft::encode(eps_tft::op::CREATE_NEW_TFT, &req.filters)
+            .map_err(|e| NotSent(Gtp2Cause::SemanticErrorInTheTadOperation, e))?;
         let rule_index = free_rule_index(&ctx, &fresh).ok_or_else(|| {
             NotSent(
                 Gtp2Cause::NoResourcesAvailable,
@@ -537,6 +536,7 @@ pub async fn activate(
         (
             ctx.bearer_find_by_id(bearer.id).unwrap_or(bearer),
             rule_index,
+            tft,
         )
     };
 
@@ -810,30 +810,42 @@ pub async fn deactivate_on_command(
         return;
     };
     if bearers.is_empty() {
-        let cause = refused
-            .first()
-            .map(|r| r.1)
-            .unwrap_or(Gtp2Cause::MandatoryIeMissing);
-        let mut b = crate::gtp_build::Gtp2MessageBuilder::new(
-            gtp2_message_type::DELETE_BEARER_FAILURE_INDICATION,
-        )
-        .teid(sess.sgw_s5c_teid)
-        .add_cause(cause);
-        for (ebi, c) in &refused {
-            b = b.start_bearer_context(0).add_ebi(*ebi).add_cause(*c).end();
-        }
-        let fi = crate::gtp_handler::with_sequence_number(b.build(), seq);
         log::warn!(
             "S5/S8 Delete Bearer Command seq={seq} from {peer}: no dedicated bearer to delete \
              ({refused:?}); Delete Bearer Failure Indication"
         );
-        server.send_response_public(peer, &fi).await;
+        send_delete_bearer_failure(server, &sess, peer, seq, &refused).await;
         return;
     }
     let Some(serving) = server.begin_command_guard(peer, seq) else {
         log::debug!("S5/S8 Delete Bearer Command seq={seq} from {peer} is a retransmission");
         return;
     };
+    // A Delete Bearer Request this PGW-C started is already in flight for every bearer
+    // the Command names (a second Command, or one crossing a PGW-initiated deletion).
+    // `delete_bearers` would send nothing, and the Command would go unanswered. None of
+    // its bearers can be deleted by it, so TS 29.274 §7.2.17.2 has it answered with a
+    // Delete Bearer Failure Indication, cause #101 "Collision with network initiated
+    // request" (Table 8.4-1).
+    if bearers.iter().all(|b| being_deleted(sess.id, b.ebi)) {
+        let mut all = refused.clone();
+        all.extend(
+            bearers
+                .iter()
+                .map(|b| (b.ebi, Gtp2Cause::CollisionWithNetworkInitiatedRequest)),
+        );
+        // The collisions first, so the message cause is #101: the bearers this Command
+        // could have deleted are the ones a collision holds (a stable sort keeps the
+        // EBI order within each group).
+        all.sort_by_key(|(_, c)| *c != Gtp2Cause::CollisionWithNetworkInitiatedRequest);
+        log::warn!(
+            "S5/S8 Delete Bearer Command seq={seq} from {peer}: every bearer is already being \
+             deleted ({all:?}); Delete Bearer Failure Indication"
+        );
+        send_delete_bearer_failure(server, &sess, peer, seq, &all).await;
+        drop(serving);
+        return;
+    }
     log::info!(
         "S5/S8 Delete Bearer Command seq={seq} from {peer}: Delete Bearer Request for EBIs {:?} \
          (LBI {linked_ebi})",
@@ -841,6 +853,32 @@ pub async fn deactivate_on_command(
     );
     let _ = delete_bearers(server, &sess, linked_ebi, &bearers, peer, Some(seq), None).await;
     drop(serving);
+}
+
+/// Answer a Delete Bearer Command under `seq` with a Delete Bearer Failure Indication
+/// (TS 29.274 §7.2.17.2), one Bearer Context per EBI with its cause. The message cause
+/// is the first EBI's.
+async fn send_delete_bearer_failure(
+    server: &S5S8Server,
+    sess: &SmfSess,
+    peer: std::net::SocketAddr,
+    seq: u32,
+    refused: &[(u8, Gtp2Cause)],
+) {
+    let cause = refused
+        .first()
+        .map(|r| r.1)
+        .unwrap_or(Gtp2Cause::MandatoryIeMissing);
+    let mut b = crate::gtp_build::Gtp2MessageBuilder::new(
+        gtp2_message_type::DELETE_BEARER_FAILURE_INDICATION,
+    )
+    .teid(sess.sgw_s5c_teid)
+    .add_cause(cause);
+    for (ebi, c) in refused {
+        b = b.start_bearer_context(0).add_ebi(*ebi).add_cause(*c).end();
+    }
+    let fi = crate::gtp_handler::with_sequence_number(b.build(), seq);
+    server.send_response_public(peer, &fi).await;
 }
 
 /// The SGW-C's S5/S8-C endpoint for an Initial message of this PGW-C (TS 29.274
@@ -1081,6 +1119,45 @@ fn ensure_uplink_filter(filters: &mut Vec<PacketFilter>, taken: &[u8]) -> Option
     Some(f)
 }
 
+/// The packet filter precedences every TFT of PDN connection `sess` uses, the default
+/// bearer's included (TS 24.301 §6.4.2.4 d) 2): unique "among all TFTs associated with
+/// this PDN connection").
+fn pdn_precedences(ctx: &context::SmfContext, sess: &SmfSess) -> Vec<u8> {
+    sess.bearer_ids
+        .iter()
+        .filter_map(|&id| ctx.bearer_find_by_id(id))
+        .flat_map(|b| b.pf_ids)
+        .filter_map(|id| ctx.pf_find_by_id(id))
+        .map(|pf| pf.precedence)
+        .collect()
+}
+
+/// Give a new TFT's filters precedences no filter of the PDN connection uses (`taken`),
+/// keeping their relative order (#1293). TS 23.401 §4.7.2.1 has the P-GW signal the
+/// evaluation order to the UE, so the PGW chooses it.
+///
+/// In order of the requested precedence (ties in list order), each filter keeps its
+/// requested value when that is free and above the previous filter's; otherwise it gets
+/// the lowest free value above the previous one. So a first rule's `0, 1` stays `0, 1`,
+/// and a second rule asking for `0, 1` gets `2, 3`. `Err` when the 256 values run out.
+fn assign_precedences(filters: &mut [PacketFilter], taken: &[u8]) -> Result<(), String> {
+    let mut order: Vec<usize> = (0..filters.len()).collect();
+    order.sort_by_key(|&i| filters[i].precedence);
+    let mut floor: u16 = 0;
+    for i in order {
+        let mut p = u16::from(filters[i].precedence).max(floor);
+        while p <= 255 && taken.contains(&(p as u8)) {
+            p += 1;
+        }
+        if p > 255 {
+            return Err("no free packet filter precedence on the PDN connection".into());
+        }
+        filters[i].precedence = p as u8;
+        floor = p + 1;
+    }
+    Ok(())
+}
+
 /// The lowest packet filter identifier (4 bits) a TFT does not use.
 fn free_filter_identifier(filters: &[PacketFilter]) -> Option<u8> {
     (1..=15u8)
@@ -1165,7 +1242,14 @@ fn apply_tad(
             }
             let mut result = current.to_vec();
             let mut sent = Vec::new();
-            for f in &tad.filters {
+            // #1293: the added filters' precedences are unique across the PDN
+            // connection's TFTs, this bearer's included (TS 24.301 §6.4.2.4 d) 2)).
+            let mut used = taken.to_vec();
+            used.extend(current.iter().map(|c| c.precedence));
+            let mut adding = tad.filters.clone();
+            assign_precedences(&mut adding, &used)
+                .map_err(|e| (Gtp2Cause::NoResourcesAvailable, e))?;
+            for f in &adding {
                 let identifier = free_filter_identifier(&result).ok_or((
                     Gtp2Cause::SemanticErrorsInPacketFilter,
                     "the TFT already holds 16 packet filters".to_string(),
@@ -1187,7 +1271,19 @@ fn apply_tad(
                 return Err(semantic("a replace operation with no packet filter"));
             }
             let mut result = current.to_vec();
-            for f in &tad.filters {
+            // #1293: a replacement's precedence is unique across the PDN connection's
+            // TFTs, as an added filter's is; the filters it replaces free theirs.
+            let mut used = taken.to_vec();
+            used.extend(
+                current
+                    .iter()
+                    .filter(|c| !tad.filters.iter().any(|f| f.identifier == c.identifier))
+                    .map(|c| c.precedence),
+            );
+            let mut replacing = tad.filters.clone();
+            assign_precedences(&mut replacing, &used)
+                .map_err(|e| (Gtp2Cause::NoResourcesAvailable, e))?;
+            for f in &replacing {
                 let slot = result
                     .iter_mut()
                     .find(|c| c.identifier == f.identifier)
@@ -1197,7 +1293,7 @@ fn apply_tad(
                     ))?;
                 *slot = f.clone();
             }
-            let mut sent = tad.filters.clone();
+            let mut sent = replacing;
             sent.extend(ensure_uplink_filter(&mut result, taken));
             let tft = eps_tft::encode(op::REPLACE_PACKET_FILTERS, &sent)
                 .map_err(|e| (Gtp2Cause::SemanticErrorsInPacketFilter, e))?;
@@ -1676,6 +1772,44 @@ mod tests {
     use super::*;
     use crate::eps_tft::{op, Tft};
 
+    /// #1293: precedences unique across the PDN connection, relative order kept.
+    #[test]
+    fn precedences_avoid_the_pdn_connections_and_keep_their_order() {
+        let p = |prec: &[u8]| -> Vec<PacketFilter> {
+            prec.iter()
+                .enumerate()
+                .map(|(i, &x)| pf(i as u8 + 1, FlowDirection::Bidirectional, x, "f"))
+                .collect()
+        };
+        let got = |mut f: Vec<PacketFilter>, taken: &[u8]| {
+            assign_precedences(&mut f, taken)
+                .map(|_| f.iter().map(|x| x.precedence).collect::<Vec<_>>())
+        };
+        assert_eq!(got(p(&[0, 1]), &[]), Ok(vec![0, 1]), "free: kept");
+        assert_eq!(got(p(&[0, 1]), &[0, 1]), Ok(vec![2, 3]));
+        assert_eq!(
+            got(p(&[0, 1]), &[0, 2]),
+            Ok(vec![1, 3]),
+            "order kept: 1 < 3"
+        );
+        assert_eq!(
+            got(p(&[5, 3]), &[3]),
+            Ok(vec![5, 4]),
+            "list order differs from precedence order"
+        );
+        assert_eq!(
+            got(p(&[7, 7]), &[]),
+            Ok(vec![7, 8]),
+            "a duplicate in the request"
+        );
+        assert!(
+            got(p(&[254, 0]), &[254, 255]).is_err(),
+            "254 must stay above 0, and 254 and 255 are taken"
+        );
+        let all: Vec<u8> = (0..=255).collect();
+        assert!(got(p(&[0]), &all).is_err(), "no free precedence");
+    }
+
     fn pf(id: u8, direction: FlowDirection, precedence: u8, flow: &str) -> PacketFilter {
         PacketFilter {
             direction,
@@ -1735,6 +1869,62 @@ mod tests {
                 "{t:?}"
             );
         }
+    }
+
+    /// #1293: a Bearer Resource Command's added or replacing filter gets a precedence
+    /// no filter of the PDN connection uses, this bearer's and the others' (`taken`):
+    /// the UE would otherwise delete the older filter (TS 24.301 §6.4.2.4 d) 2)).
+    #[test]
+    fn tad_filters_get_precedences_unique_on_the_pdn_connection() {
+        let other_ul = "permit out 17 from 198.51.100.7 5020 to assigned 6020";
+        // current() uses 0 and 1; another bearer uses 2.
+        let TftChange::Filters(result, tft) = apply_tad(
+            &current(),
+            &Tft {
+                operation: op::ADD_PACKET_FILTERS,
+                filters: vec![pf(0, FlowDirection::UplinkOnly, 1, other_ul)],
+            },
+            &[2],
+        )
+        .unwrap() else {
+            panic!("a change");
+        };
+        let added = pf(3, FlowDirection::UplinkOnly, 3, other_ul);
+        assert_eq!(result.last(), Some(&added), "identifier 3, precedence 3");
+        assert_eq!(
+            tft,
+            eps_tft::encode(op::ADD_PACKET_FILTERS, &[added]).unwrap()
+        );
+
+        // A replacement asking for the precedence its sibling holds.
+        let TftChange::Filters(result, _) = apply_tad(
+            &current(),
+            &Tft {
+                operation: op::REPLACE_PACKET_FILTERS,
+                filters: vec![pf(1, FlowDirection::DownlinkOnly, 1, DL)],
+            },
+            &[2],
+        )
+        .unwrap() else {
+            panic!("a change");
+        };
+        assert_eq!(
+            result[0].precedence, 3,
+            "1 is filter 2's, 2 another bearer's"
+        );
+        // The precedence the replaced filter held itself is free for it.
+        let TftChange::Filters(result, _) = apply_tad(
+            &current(),
+            &Tft {
+                operation: op::REPLACE_PACKET_FILTERS,
+                filters: vec![pf(1, FlowDirection::DownlinkOnly, 0, DL)],
+            },
+            &[2],
+        )
+        .unwrap() else {
+            panic!("a change");
+        };
+        assert_eq!(result[0].precedence, 0);
     }
 
     /// #619: a replace keeps the identifiers and sends the replaced filters; a delete
