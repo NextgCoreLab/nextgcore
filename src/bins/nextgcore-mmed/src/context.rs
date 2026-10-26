@@ -2784,7 +2784,27 @@ static MME_CONTEXT: OnceLock<MmeContext> = OnceLock::new();
 
 /// Get the global MME context
 pub fn mme_self() -> &'static MmeContext {
-    MME_CONTEXT.get_or_init(MmeContext::new)
+    MME_CONTEXT.get_or_init(|| {
+        #[allow(unused_mut)]
+        let mut ctx = MmeContext::new();
+        // #1249: the process context of the unit tests serves a GUMMEI, as every
+        // deployment does. Without one `allocate_guti` returned before taking
+        // any lock, and a TAU that called it under the UE pool's guard
+        // deadlocked only in production.
+        #[cfg(test)]
+        {
+            ctx.served_gummei = vec![ServedGummei {
+                num_of_plmn_id: 1,
+                plmn_id: vec![PlmnId::new("999", "70")],
+                num_of_mme_gid: 1,
+                mme_gid: vec![2],
+                num_of_mme_code: 1,
+                mme_code: vec![1],
+            }];
+            ctx.num_of_served_gummei = 1;
+        }
+        ctx
+    })
 }
 
 /// Initialize the global MME context

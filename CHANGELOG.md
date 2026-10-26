@@ -13,6 +13,31 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 ## [Unreleased]
 
 ### Changed
+- smfd's PDU SESSION ESTABLISHMENT REJECT leaves out the Back-off timer value IE for #26 and #69
+  when the request is for emergency services (SmContextCreateData `requestType`
+  INITIAL_EMERGENCY_REQUEST or EXISTING_EMERGENCY_PDU_SESSION). It also leaves it out for #26,
+  #27 and #69 when the AMF reports the UE as a priority user (`priorityUserInd`), so the UE can
+  retry at once (TS 24.501 §6.4.1.4.1). amfd does not send either attribute yet (#1188).
+- smfd's EBI assignment request (`Namf_Communication_EBIAssignment`) now gives the default flow's
+  ARP as NOT_PREEMPT / NOT_PREEMPTABLE, the same ARP the N2 default QoS flow carries. Before, it
+  said PREEMPTABLE, so the AMF could revoke the EBI for a higher-priority request that the RAN
+  would never pre-empt (TS 23.502 §4.11.1.4.1). Both now come from one source,
+  `n2_transfer::Arp::default_flow` (#1179).
+- smfd (PGW-C) codes EPS bearer rates in kbit/s on S5/S8 and holds them in bit/s, as N4 and N2
+  read them (TS 29.274 §8.15, §8.16). The Create Session Request's Bearer QoS and a Bearer
+  Resource Command's Flow QoS on an existing bearer were stored unconverted, so their MBR/GBR
+  reached the PGW-U QER and the EPS→5GS mapping 1000 times too low. The Create Session Response
+  and the Update Bearer Request sent the stored bit/s values as kbit/s, so the values seen on
+  the wire change. A rate is rounded up to whole kbit/s and capped at the 5-octet field (#1165).
+- smfd's N1N2MessageTransfer for a network-triggered Service Request (buffered downlink data)
+  now carries the session's PDUSessionResourceSetupRequestTransfer, as an
+  `application/vnd.3gpp.ngap` part that `ngapData` references. It includes the UPF N3 tunnel,
+  every QoS flow and the Session-AMBR (TS 23.502 §4.2.3.3 step 3a, TS 29.518 §6.1.6.2.27). It
+  also carries the paged flow's `5qi` and `arp` (§6.1.6.2.18). The non-conformant JSON
+  `ngapData: {qfi}` is gone. With no recorded user plane, no policy binding, or a transfer that
+  fails to encode, no N1N2MessageTransfer is sent: paging a UE for a session that cannot be
+  activated only drains its battery, and an `n2InfoContent` without `ngapData` (M) is malformed.
+  The data stays buffered and the error names the session (#1162).
 - smfd (PGW-C): a Create Session Request for the [IMSI, EBI, interface type] of an existing PDN
   connection deletes that connection first, at the PGW-U too, and frees its PDN address (TS
   29.274 §7.2.1). If the EBI belongs to a dedicated bearer, only that bearer and its PGW-U rules

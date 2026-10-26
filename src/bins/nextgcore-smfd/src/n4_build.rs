@@ -1115,6 +1115,10 @@ pub struct SessionModificationParams {
     pub create_pdrs: Vec<PdrParams>,
     /// PDRs to update (pdr_id, outer_header_removal)
     pub update_pdrs: Vec<(u16, Option<u8>)>,
+    /// PDRs to update with a whole new body: the Update PDR carries the PDR's full IE
+    /// set, its PDI included (TS 29.244 Table 7.5.4.2-1), so a dedicated EPS bearer's
+    /// downlink SDF filters can change in place (#619).
+    pub replace_pdrs: Vec<PdrParams>,
     /// PDRs to remove
     pub remove_pdr_ids: Vec<u16>,
     /// FARs to create
@@ -1176,6 +1180,10 @@ pub fn build_session_modification_request(params: &SessionModificationParams) ->
     for (pdr_id, ohr) in &params.update_pdrs {
         let pdr_bytes = build_update_pdr(*pdr_id, *ohr);
         builder.add_tlv(pfcp_ie::UPDATE_PDR, &pdr_bytes);
+    }
+
+    for pdr in &params.replace_pdrs {
+        builder.add_tlv(pfcp_ie::UPDATE_PDR, &build_create_pdr(pdr));
     }
 
     // Remove PDRs

@@ -1951,7 +1951,7 @@ fn erab_setup_response_at(ue: &Ue, addr: &[u8], set_up: &[u8], failed: &[u8]) {
     let enb_ue = current_enb_ue(ue);
     crate::s1ap_handler::handle_erab_setup_response(
         ctx,
-        ue.enb_id,
+        enb_ue.enb_id,
         enb_ue.mme_ue_s1ap_id,
         enb_ue.enb_ue_s1ap_id,
         &set_up
@@ -2428,14 +2428,18 @@ fn an_activation_whose_ue_goes_away_is_answered() {
 /// the budget; the E-RAB the eNB set up is released.
 #[test]
 fn an_activation_is_answered_within_the_serving_gws_transaction() {
-    let sgw_window = {
-        let c = Gtp2XactConfig::default();
-        c.t3_response * (c.n3_requests + 1)
-    };
+    // #1228: sgwcd's S11 window for these Requests.
+    let sgw_window = nextgcore_gtp::v2::xact::default_n3_window(
+        nextgcore_gtp::v2::xact::SGW_BEARER_PROCEDURE_T3,
+    );
     assert!(crate::bearer_activation::answer_budget() < sgw_window);
     assert_eq!(
         crate::bearer_activation::answer_budget(),
-        Duration::from_secs(10)
+        Duration::from_secs(50)
+    );
+    assert!(
+        crate::bearer_activation::T3485_DURATION * 5 < crate::bearer_activation::answer_budget(),
+        "T3485 x 5 runs out before the budget"
     );
 
     let _guard = lock_s11();
@@ -2481,6 +2485,267 @@ fn an_activation_is_answered_within_the_serving_gws_transaction() {
     crate::bearer_activation::sweep(ctx, Instant::now());
     let (cause, _) = create_bearer_response(&sgw, 0x121b);
     assert_eq!(cause, 87);
+    assert!(ctx.bearer_find_by_ebi(ue.mme_ue_id, 6).is_none());
+    assert_eq!(crate::bearer_activation::pending_count(), 0);
+    release(&ue);
+}
+
+/// The plain NAS message of a DOWNLINK NAS TRANSPORT (after its 6-octet
+/// security header; EEA0, so readable).
+fn dl_nas(pdu: &g::S1AP_PDU) -> Option<Vec<u8>> {
+    let g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+        value: g::InitiatingMessageValue::Id_downlinkNASTransport(dl),
+        ..
+    }) = pdu
+    else {
+        return None;
+    };
+    dl.protocol_i_es.0.iter().find_map(|ie| match &ie.value {
+        g::DownlinkNASTransportProtocolIEs_EntryValue::Id_NAS_PDU(nas) => {
+            nas.0.get(6..).map(|p| p.to_vec())
+        }
+        _ => None,
+    })
+}
+
+/// #641 follow-up, TS 24.301 §7.3.2 g): the UE accepts the dedicated bearer only
+/// after the MME refused it to the Serving GW (here the answer budget ran out).
+/// The ACCEPT names no bearer: it does not touch the default bearer, and the UE
+/// is sent DEACTIVATE EPS BEARER CONTEXT REQUEST for EBI 6, cause #36, once.
+#[test]
+fn a_late_accept_for_a_refused_bearer_deactivates_it_at_the_ue() {
+    let _guard = lock_s11();
+    crate::bearer_activation::clear_for_test();
+    let (sgw, route) = sgw(Gtp2XactConfig::default());
+    let ue = attached(0x1241);
+    let ctx = mme_self();
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    sgw.send_to(&cbr(ue.local_teid, 0x1241), route.server.local_addr())
+        .unwrap();
+    let _ = wait_pdu(ue.enb_id, erab_setup);
+    erab_setup_response(&ue, &[6], &[]);
+    crate::bearer_activation::age_for_test(ue.mme_ue_id, crate::bearer_activation::answer_budget());
+    crate::bearer_activation::sweep(ctx, Instant::now());
+    let (cause, _) = create_bearer_response(&sgw, 0x1241);
+    assert_eq!(cause, 87);
+    wait_pdu(ue.enb_id, is_erab_release_command);
+    let default_bearer = ctx.bearer_find_by_ebi(ue.mme_ue_id, 5).unwrap();
+    let before = ctx.bearer_find_by_id(default_bearer).unwrap();
+
+    ue_esm(&ue, 6, &[0xc6]);
+    let nas = wait_pdu(ue.enb_id, |p| dl_nas(p).filter(|n| n.get(2) == Some(&0xcd)));
+    assert_eq!(
+        nas,
+        vec![0x62, 0x00, 0xcd, 36],
+        "DEACTIVATE EBI 6, regular deactivation"
+    );
+    let after = ctx.bearer_find_by_id(default_bearer).unwrap();
+    assert_eq!(
+        (after.ebi, after.enb_s1u_teid, after.sgw_s1u_teid),
+        (before.ebi, before.enb_s1u_teid, before.sgw_s1u_teid),
+        "the default bearer is not touched"
+    );
+    // Once: a second late ACCEPT is ignored (TS 24.301 §7.3.2 g).
+    assert!(!crate::bearer_activation::on_unknown_accept(
+        ctx,
+        ue.mme_ue_id,
+        6
+    ));
+    release(&ue);
+}
+
+/// #1245 review: an EBI refused while the UE may still answer for it is not
+/// handed to the next activation within the hold: the next bearer gets 7.
+#[test]
+fn a_refused_ebi_is_not_reused_while_held() {
+    let _guard = lock_s11();
+    crate::bearer_activation::clear_for_test();
+    let (sgw, route) = sgw(Gtp2XactConfig::default());
+    let ue = attached(0x1261);
+    let ctx = mme_self();
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    let mme = route.server.local_addr();
+    sgw.send_to(&cbr(ue.local_teid, 0x1261), mme).unwrap();
+    let items = wait_pdu(ue.enb_id, erab_setup);
+    assert_eq!(items[0].0, 6);
+    crate::bearer_activation::age_for_test(ue.mme_ue_id, crate::bearer_activation::answer_budget());
+    crate::bearer_activation::sweep(ctx, Instant::now());
+    let (cause, _) = create_bearer_response(&sgw, 0x1261);
+    assert_eq!(cause, 87, "refused after the UE was signalled");
+    sgw.send_to(&cbr(ue.local_teid, 0x1262), mme).unwrap();
+    let items = wait_pdu(ue.enb_id, erab_setup);
+    assert_eq!(items[0].0, 7, "EBI 6 is held for the UE's late answer");
+    crate::bearer_activation::clear_for_test();
+    release(&ue);
+}
+
+/// Put `ue`'s S1 connection in an S1 handover toward a target context on
+/// another eNB; returns the target's id.
+fn start_s1_handover(ue: &Ue) -> u64 {
+    let ctx = mme_self();
+    let target_enb = ctx.enb_add(enb_addr());
+    let target = ctx.enb_ue_add(target_enb, 4242);
+    ctx.enb_ue_pool
+        .write()
+        .unwrap()
+        .get_mut(&ue.enb_ue_id)
+        .unwrap()
+        .target_ue_id = target;
+    target
+}
+
+/// #641 follow-up, TS 23.401 §5.5.1.2.2: a Create Bearer Request during an S1
+/// handover pauses its E-RAB SETUP; when the handover is over (here it
+/// failed: no target any more) the E-RAB SETUP goes out and the activation
+/// completes.
+#[test]
+fn an_activation_during_an_s1_handover_waits_for_it() {
+    let _guard = lock_s11();
+    crate::bearer_activation::clear_for_test();
+    let (sgw, route) = sgw(Gtp2XactConfig::default());
+    let ue = attached(0x1242);
+    let ctx = mme_self();
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    let target = start_s1_handover(&ue);
+    sgw.send_to(&cbr(ue.local_teid, 0x1242), route.server.local_addr())
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while crate::bearer_activation::pending_count() == 0 {
+        assert!(Instant::now() < deadline, "the request is held");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    crate::bearer_activation::sweep(ctx, Instant::now());
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        crate::s1ap_path::take_tapped_for_test(ue.enb_id)
+            .iter()
+            .filter_map(|p| nextgcore_s1ap_gen::decode(p).ok())
+            .all(|p| erab_setup(&p).is_none()),
+        "no E-RAB SETUP while the handover runs"
+    );
+    // The handover fails: the source keeps the UE.
+    ctx.enb_ue_pool
+        .write()
+        .unwrap()
+        .get_mut(&ue.enb_ue_id)
+        .unwrap()
+        .target_ue_id = crate::context::NEXTGCORE_INVALID_POOL_ID;
+    ctx.enb_ue_remove(target);
+    crate::bearer_activation::sweep(ctx, Instant::now());
+    let items = wait_pdu(ue.enb_id, erab_setup);
+    assert_eq!(items[0].0, 6);
+    erab_setup_response(&ue, &[6], &[]);
+    ue_esm(&ue, 6, &[0xc6]);
+    let (cause, _) = create_bearer_response(&sgw, 0x1242);
+    assert_eq!(cause, 16);
+    release(&ue);
+}
+
+/// #641 follow-up, TS 23.401 §5.5.1.1.2: the eNB refuses the E-RAB SETUP as "X2
+/// handover triggered" (TS 36.413 §9.2.1.3). That is no failure: the request is
+/// re-attempted once the handover is over, toward the UE's new S1 connection
+/// after its Path Switch, and completes.
+#[test]
+fn an_erab_refused_for_a_handover_is_reattempted_after_it() {
+    let _guard = lock_s11();
+    crate::bearer_activation::clear_for_test();
+    let (sgw, route) = sgw(Gtp2XactConfig::default());
+    let ue = attached(0x1243);
+    let ctx = mme_self();
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    sgw.send_to(&cbr(ue.local_teid, 0x1243), route.server.local_addr())
+        .unwrap();
+    let _ = wait_pdu(ue.enb_id, erab_setup);
+    let enb_ue = ctx.enb_ue_find_by_id(ue.enb_ue_id).unwrap();
+    crate::s1ap_handler::handle_erab_setup_response(
+        ctx,
+        ue.enb_id,
+        enb_ue.mme_ue_s1ap_id,
+        enb_ue.enb_ue_s1ap_id,
+        &[],
+        &[nextgcore_s1ap::ErabFailedItem {
+            erab_id: 6,
+            cause: nextgcore_s1ap::Cause::RadioNetwork(
+                nextgcore_s1ap::CauseRadioNetwork::X2HandoverTriggered,
+            ),
+        }],
+    );
+    assert!(quiet(&sgw), "not refused to the Serving GW");
+    assert_eq!(crate::bearer_activation::pending_count(), 1);
+    crate::bearer_activation::sweep(ctx, Instant::now());
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        crate::s1ap_path::take_tapped_for_test(ue.enb_id)
+            .iter()
+            .filter_map(|p| nextgcore_s1ap_gen::decode(p).ok())
+            .all(|p| erab_setup(&p).is_none()),
+        "not re-sent to the source while the handover runs"
+    );
+    // The Path Switch moved the UE to a new S1 connection on another eNB.
+    let new_enb = ctx.enb_add(enb_addr());
+    {
+        let mut pool = ctx.enb_pool.write().unwrap();
+        pool.get_mut(&new_enb).unwrap().state.s1_setup_success = true;
+    }
+    let new_enb_ue = ctx.enb_ue_add(new_enb, 12430);
+    ctx.enb_ue_associate_mme_ue(new_enb_ue, ue.mme_ue_id);
+    crate::s1ap_path::tap_enb_for_test(new_enb);
+    crate::bearer_activation::sweep(ctx, Instant::now());
+    let items = wait_pdu(new_enb, erab_setup);
+    assert_eq!(items[0].0, 6, "re-attempted toward the target");
+    erab_setup_response(&ue, &[6], &[]);
+    ue_esm(&ue, 6, &[0xc6]);
+    let (cause, _) = create_bearer_response(&sgw, 0x1243);
+    assert_eq!(cause, 16);
+    ctx.enb_ue_remove(new_enb_ue);
+    release(&ue);
+}
+
+/// #641 follow-up, TS 24.301 §6.4.2.6 b): the PDN connection the dedicated
+/// bearer belongs to goes while it is being activated. A PDN GW initiated
+/// deactivation of the whole PDN (Delete Bearer Request with its LBI) ends the
+/// activation with "Context not found"; a UE's PDN DISCONNECT REQUEST ends it
+/// with "UE refuses". Neither leaves a bearer or a pending request.
+#[test]
+fn an_activation_whose_pdn_goes_ends_locally() {
+    let _guard = lock_s11();
+    crate::bearer_activation::clear_for_test();
+    crate::bearer_deactivation::clear_for_test();
+    let (sgw, route) = sgw(Gtp2XactConfig::default());
+    let mme = route.server.local_addr();
+    let ctx = mme_self();
+    let ue = attached(0x1244);
+    let _sess6 = add_pdn(&ue, 6);
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+
+    // The PGW deletes the PDN of LBI 5 while EBI 7 is being activated on it.
+    sgw.send_to(&cbr(ue.local_teid, 0x1244), mme).unwrap();
+    let items = wait_pdu(ue.enb_id, erab_setup);
+    assert_eq!(items[0].0, 7);
+    crate::s11_handler::dispatch_initial(
+        &dbr_reactivation(ue.local_teid, 5, 0x1245),
+        99,
+        0x1245,
+        sgw.local_addr().unwrap(),
+    );
+    let (cause, bcs) = create_bearer_response(&sgw, 0x1244);
+    assert_eq!(cause, 64);
+    assert_eq!(bcs, vec![(7, 64, None, None)]);
+    assert!(ctx.bearer_find_by_ebi(ue.mme_ue_id, 7).is_none());
+    assert_eq!(crate::bearer_activation::pending_count(), 0);
+    crate::bearer_deactivation::clear_for_test();
+    release(&ue);
+
+    // The UE disconnects the PDN.
+    let ue = attached(0x1246);
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    sgw.send_to(&cbr(ue.local_teid, 0x1246), mme).unwrap();
+    let _ = wait_pdu(ue.enb_id, erab_setup);
+    let enb_ue = current_enb_ue(&ue);
+    let mme_ue = ctx.mme_ue_find_by_id(ue.mme_ue_id).unwrap();
+    crate::nas_dispatch::handle_esm_message(ctx, &enb_ue, &mme_ue, &[0x02, 0x01, 0xd2, 0x05]);
+    let (cause, _) = create_bearer_response(&sgw, 0x1246);
+    assert_eq!(cause, 88, "UE refuses");
     assert!(ctx.bearer_find_by_ebi(ue.mme_ue_id, 6).is_none());
     assert_eq!(crate::bearer_activation::pending_count(), 0);
     release(&ue);

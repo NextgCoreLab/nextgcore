@@ -205,13 +205,13 @@ pub struct BearerResourceCommand {
 pub struct FlowQos {
     /// QCI
     pub qci: u8,
-    /// Maximum Bit Rate Uplink
+    /// Maximum Bit Rate Uplink (kbit/s: TS 29.274 §8.16)
     pub ul_mbr: u64,
-    /// Maximum Bit Rate Downlink
+    /// Maximum Bit Rate Downlink (kbit/s)
     pub dl_mbr: u64,
-    /// Guaranteed Bit Rate Uplink
+    /// Guaranteed Bit Rate Uplink (kbit/s)
     pub ul_gbr: u64,
-    /// Guaranteed Bit Rate Downlink
+    /// Guaranteed Bit Rate Downlink (kbit/s)
     pub dl_gbr: u64,
 }
 
@@ -283,21 +283,6 @@ pub enum DeleteBearerResponseResult {
     DedicatedBearerDeleted { bearer_id: u64 },
     /// Response rejected
     Rejected,
-}
-
-/// Result of handling a Bearer Resource Command
-#[derive(Debug)]
-pub enum BearerResourceResult {
-    /// TFT update needed
-    TftUpdate { bearer_id: u64, pti: u8 },
-    /// QoS update needed
-    QosUpdate { bearer_id: u64, pti: u8 },
-    /// TFT and QoS update needed
-    TftAndQosUpdate { bearer_id: u64, pti: u8 },
-    /// TFT delete (deactivate bearer)
-    TftDelete { bearer_id: u64, pti: u8 },
-    /// Request rejected with cause
-    Rejected(Gtp2Cause),
 }
 
 // ============================================================================
@@ -804,73 +789,6 @@ pub mod tft_code {
     pub const ADD_PACKET_FILTERS_TO_EXISTING_TFT: u8 = 3;
     pub const REPLACE_PACKET_FILTERS_IN_EXISTING: u8 = 4;
     pub const DELETE_PACKET_FILTERS_FROM_EXISTING: u8 = 5;
-}
-
-/// Handle Bearer Resource Command
-/// Port of smf_s5c_handle_bearer_resource_command
-pub fn handle_bearer_resource_command(
-    sess: &SmfSess,
-    bearer: &mut SmfBearer,
-    cmd: &BearerResourceCommand,
-    has_packet_filters: bool,
-) -> BearerResourceResult {
-    log::debug!("Bearer Resource Command");
-
-    // Validate mandatory IEs
-    if cmd.tad.is_none() {
-        log::error!("No Traffic aggregate description(TAD)");
-        return BearerResourceResult::Rejected(Gtp2Cause::MandatoryIeMissing);
-    }
-
-    log::debug!(
-        "    SGW_S5C_TEID[0x{:x}] PGW_S5C_TEID[0x{:x}]",
-        sess.sgw_s5c_teid,
-        sess.smf_n4_teid
-    );
-
-    // Parse TAD to determine operation
-    // For now, we'll use a simplified approach
-    let tft_update = cmd.tad.is_some();
-    let qos_update = cmd.flow_qos.is_some();
-
-    // Update bearer QoS if flow QoS present
-    if let Some(ref flow_qos) = cmd.flow_qos {
-        bearer.qos.mbr_uplink = flow_qos.ul_mbr;
-        bearer.qos.mbr_downlink = flow_qos.dl_mbr;
-        bearer.qos.gbr_uplink = flow_qos.ul_gbr;
-        bearer.qos.gbr_downlink = flow_qos.dl_gbr;
-    }
-
-    // Determine result based on operations
-    if !tft_update && !qos_update {
-        return BearerResourceResult::Rejected(Gtp2Cause::ServiceNotSupported);
-    }
-
-    // Check if this is a TFT delete operation
-    // (would need to parse TAD to determine this properly)
-    let is_tft_delete = !has_packet_filters && tft_update;
-
-    if is_tft_delete {
-        BearerResourceResult::TftDelete {
-            bearer_id: bearer.id,
-            pti: cmd.pti,
-        }
-    } else if tft_update && qos_update {
-        BearerResourceResult::TftAndQosUpdate {
-            bearer_id: bearer.id,
-            pti: cmd.pti,
-        }
-    } else if tft_update {
-        BearerResourceResult::TftUpdate {
-            bearer_id: bearer.id,
-            pti: cmd.pti,
-        }
-    } else {
-        BearerResourceResult::QosUpdate {
-            bearer_id: bearer.id,
-            pti: cmd.pti,
-        }
-    }
 }
 
 // ============================================================================
@@ -1752,16 +1670,8 @@ async fn create_session(
     let qos = bc.bearer_qos.as_ref().expect("checked by the parser");
     let mut bearer = crate::context::SmfBearer {
         ebi: bc.ebi,
-        qos: crate::context::Qos {
-            index: qos.qci,
-            arp_priority_level: qos.priority_level,
-            arp_preempt_cap: qos.pre_emption_capability,
-            arp_preempt_vuln: qos.pre_emption_vulnerability,
-            mbr_uplink: qos.ul_mbr,
-            mbr_downlink: qos.dl_mbr,
-            gbr_uplink: qos.ul_gbr,
-            gbr_downlink: qos.dl_gbr,
-        },
+        // #1165: the Bearer QoS's kbit/s (TS 29.274 §8.15) as the bit/s N4 and N2 read.
+        qos: qos.to_qos(),
         ..Default::default()
     };
     if let Some(ref s5u) = bc.s5u_sgw_f_teid {
@@ -2408,20 +2318,16 @@ async fn modify_bearer(
     );
 }
 
-/// Terminate a Bearer Resource Command: the UE-requested bearer resource modification (#223).
+/// Terminate a Bearer Resource Command: the UE-requested bearer resource modification
+/// (#223, #619; TS 29.274 §7.2.5, TS 23.401 §5.4.5).
 ///
-/// TS 29.274 §7.2.5 / TS 23.401 §5.4.5. The UE asks, via the MME and SGW, for a TFT or QoS
-/// change on a bearer; the PGW decides and would normally answer by *initiating* an Update or
-/// Create Bearer Request under the command's PTI.
-///
-/// **What this does and does not do.** The command is parsed, the bearer is found, the
-/// decision is taken by `handle_bearer_resource_command` and written back to the stored
-/// bearer, and a refusal is answered with a Bearer Resource Failure Indication. It does
-/// **not** initiate the follow-on Update Bearer Request: that is a PGW-initiated transaction
-/// with its own T3/N3 budget and a Create/Update Bearer Response to correlate, and
-/// `dispatch_s5s8_response` currently only logs. Accepting the command and silently running
-/// no procedure would be the "correct but inert" shape this issue is about, so the accepted
-/// case logs the decision it reached and says it is not yet transmitted.
+/// The PGW-C answers with the Command's Triggered message, under its sequence number
+/// and with the UE's PTI:
+/// - a Create Bearer Request for a new dedicated bearer (§5.4.1, `eps_bearer::activate`);
+/// - an Update Bearer Request for a TFT or QoS change of an existing one (§5.4.2.1), or a
+///   Delete Bearer Request when the change leaves it no packet filter (§5.4.4.1),
+///   both by `eps_bearer::modify_on_command`;
+/// - a Bearer Resource Failure Indication when it refuses (§7.2.6).
 async fn bearer_resource(
     server: &crate::gtp_path::S5S8Server,
     sequence_number: u32,
@@ -2501,15 +2407,7 @@ async fn bearer_resource(
                     "S5/S8 Bearer Resource Command for TEID {teid_str}, PTI {}: refused, {why}",
                     cmd.pti
                 );
-                reject(
-                    server,
-                    gtp2_message_type::BEARER_RESOURCE_FAILURE_INDICATION,
-                    sess.sgw_s5c_teid,
-                    sequence_number,
-                    peer,
-                    cause,
-                )
-                .await;
+                bearer_resource_failure(server, &sess, sequence_number, peer, &cmd, cause).await;
             }
             // The Create Bearer Request went out under the Command's number, so it closed
             // the Command at the SGW-C; a Failure Indication now would answer nothing.
@@ -2522,63 +2420,78 @@ async fn bearer_resource(
         return;
     }
 
-    // The bearer the command names: the dedicated one when an EBI at instance 1 is present,
-    // the PDN connection's default bearer otherwise (TS 23.401 §5.4.5).
-    let target_ebi = cmd.ebi.filter(|&e| e != 0).unwrap_or(cmd.linked_ebi);
-    let Some(mut bearer) = crate::context::smf_self()
-        .read()
-        .ok()
-        .and_then(|ctx| ctx.bearer_find_by_ebi(sess.id, target_ebi))
-    else {
+    // #619: a Command naming an existing bearer (an EPS Bearer ID at instance 1) modifies
+    // its TFT or QoS (TS 23.401 §5.4.2.1), or deactivates it when no packet filter is
+    // left (§5.4.4.1): an Update or a Delete Bearer Request, the Command's Triggered
+    // message. A Command naming no bearer that is not a request for a new one (above)
+    // has nothing to act on.
+    if cmd.ebi.filter(|&e| e != 0).is_none() {
+        let cause = match cmd.tad.as_deref().map(crate::eps_tft::decode) {
+            Some(Ok(_)) => Gtp2Cause::SemanticErrorInTheTadOperation,
+            _ => Gtp2Cause::SyntacticErrorInTheTadOperation,
+        };
         log::warn!(
-            "S5/S8 Bearer Resource Command for TEID {teid_str}: the session holds no bearer with \
-             EBI {target_ebi}"
+            "S5/S8 Bearer Resource Command for TEID {teid_str}, PTI {}: names no bearer and \
+             asks for no new one ({cause:?})",
+            cmd.pti
         );
-        reject(
-            server,
-            gtp2_message_type::BEARER_RESOURCE_FAILURE_INDICATION,
-            sess.sgw_s5c_teid,
-            sequence_number,
-            peer,
-            Gtp2Cause::ContextNotFound,
-        )
-        .await;
+        bearer_resource_failure(server, &sess, sequence_number, peer, &cmd, cause).await;
         return;
-    };
-
-    // `has_packet_filters` is taken from the presence of a Flow QoS IE, NOT from decoded
-    // TAD contents: the handler's own comment records that distinguishing the TFT operations
-    // properly needs a TAD decoder, and this change deliberately adds none. So a command
-    // carrying only a TAD is treated as a TFT delete, which is what the handler's
-    // `!has_packet_filters && tft_update` branch means.
-    let has_packet_filters = cmd.flow_qos.is_some();
-    match handle_bearer_resource_command(&sess, &mut bearer, &cmd, has_packet_filters) {
-        BearerResourceResult::Rejected(cause) => {
-            log::warn!("S5/S8 Bearer Resource Command from {peer} rejected: {cause:?}");
-            reject(
-                server,
-                gtp2_message_type::BEARER_RESOURCE_FAILURE_INDICATION,
-                sess.sgw_s5c_teid,
-                sequence_number,
-                peer,
-                cause,
-            )
-            .await;
-        }
-        accepted => {
-            // The handler updated the bearer's QoS from the Flow QoS IE; persist it, so the
-            // decision is observable rather than applied to a temporary.
-            if let Ok(ctx) = crate::context::smf_self().read() {
-                ctx.bearer_update(&bearer);
-            }
-            log::info!(
-                "S5/S8 Bearer Resource Command for TEID {teid_str}, EBI {target_ebi}, PTI {}: \
-                 decided {accepted:?}. The bearer's authorized QoS is updated; the follow-on \
-                 PGW-initiated Update Bearer Request is NOT transmitted (see #223).",
+    }
+    if !server.begin_command(peer, sequence_number) {
+        log::debug!(
+            "S5/S8 Bearer Resource Command seq={sequence_number} from {peer} is a \
+             retransmission of one being served"
+        );
+        return;
+    }
+    let outcome =
+        crate::eps_bearer::modify_on_command(server, sess.id, &cmd, peer, sequence_number).await;
+    server.end_command(peer, sequence_number);
+    match outcome {
+        Ok(done) => log::info!(
+            "S5/S8 Bearer Resource Command for TEID {teid_str}, PTI {}: {done:?}",
+            cmd.pti
+        ),
+        Err(crate::eps_bearer::CommandError::Refused(cause, why)) => {
+            log::warn!(
+                "S5/S8 Bearer Resource Command for TEID {teid_str}, PTI {}: refused, {why}",
                 cmd.pti
             );
+            bearer_resource_failure(server, &sess, sequence_number, peer, &cmd, cause).await;
         }
+        // The Update or Delete Bearer Request went out under the Command's number and
+        // closed it at the SGW-C; its outcome reaches the UE through the MME.
+        Err(crate::eps_bearer::CommandError::Failed(why)) => log::warn!(
+            "S5/S8 Bearer Resource Command for TEID {teid_str}, PTI {}: {why}",
+            cmd.pti
+        ),
     }
+}
+
+/// Answer a Bearer Resource Command with a Bearer Resource Failure Indication (TS 29.274
+/// §7.2.6): under the Command's sequence number, with the Cause, the Linked EPS Bearer ID
+/// and the PTI, all three mandatory (Table 7.2.6-1), so the MME can tell the UE which
+/// request failed (TS 23.401 §5.4.5 step 5).
+async fn bearer_resource_failure(
+    server: &crate::gtp_path::S5S8Server,
+    sess: &SmfSess,
+    sequence_number: u32,
+    peer: std::net::SocketAddr,
+    cmd: &BearerResourceCommand,
+    cause: Gtp2Cause,
+) {
+    let fi = crate::gtp_build::Gtp2MessageBuilder::new(
+        gtp2_message_type::BEARER_RESOURCE_FAILURE_INDICATION,
+    )
+    .teid(sess.sgw_s5c_teid)
+    .add_cause(cause)
+    .add_ebi(cmd.linked_ebi, 0)
+    .add_pti(cmd.pti)
+    .build();
+    server
+        .send_response_public(peer, &with_sequence_number(fi, sequence_number))
+        .await;
 }
 
 /// The dedicated bearer a Bearer Resource Command asks for, when it asks for one (#619).
@@ -2620,10 +2533,10 @@ fn new_bearer_request(
             arp_priority_level: pl,
             arp_preempt_cap: cap,
             arp_preempt_vuln: vuln,
-            mbr_uplink: flow_qos.ul_mbr * 1000,
-            mbr_downlink: flow_qos.dl_mbr * 1000,
-            gbr_uplink: flow_qos.ul_gbr * 1000,
-            gbr_downlink: flow_qos.dl_gbr * 1000,
+            mbr_uplink: crate::gtp_build::gtp2_kbps_to_bps(flow_qos.ul_mbr),
+            mbr_downlink: crate::gtp_build::gtp2_kbps_to_bps(flow_qos.dl_mbr),
+            gbr_uplink: crate::gtp_build::gtp2_kbps_to_bps(flow_qos.ul_gbr),
+            gbr_downlink: crate::gtp_build::gtp2_kbps_to_bps(flow_qos.dl_gbr),
         },
         filters: tad.filters,
         pcc_rule_name: None,
@@ -2925,9 +2838,38 @@ mod tests {
         ebi: u8,
         recovery: Option<u8>,
     ) -> bytes::BytesMut {
+        s5c_csr_full(
+            seq,
+            sgw_c_teid,
+            requested_paa,
+            ebi,
+            recovery,
+            &nextgcore_gtp::v2::Gtp2BearerQosIe::new(9, 0, 0, 0, 0),
+        )
+    }
+
+    /// [`s5c_csr`] with the default bearer's Bearer QoS given (#1165).
+    fn s5c_csr_with_qos(
+        seq: u32,
+        sgw_c_teid: u32,
+        requested_paa: [u8; 4],
+        bearer_qos: &nextgcore_gtp::v2::Gtp2BearerQosIe,
+    ) -> bytes::BytesMut {
+        s5c_csr_full(seq, sgw_c_teid, requested_paa, 5, None, bearer_qos)
+    }
+
+    /// The Create Session Request of [`s5c_csr_with`] and [`s5c_csr_with_qos`].
+    fn s5c_csr_full(
+        seq: u32,
+        sgw_c_teid: u32,
+        requested_paa: [u8; 4],
+        ebi: u8,
+        recovery: Option<u8>,
+        bearer_qos: &nextgcore_gtp::v2::Gtp2BearerQosIe,
+    ) -> bytes::BytesMut {
         use nextgcore_gtp::v2::{
-            Gtp2ApnIe, Gtp2BearerContextIe, Gtp2BearerQosIe, Gtp2FTeidIe, Gtp2Header, Gtp2Message,
-            Gtp2PaaIe, Gtp2RatTypeIe,
+            Gtp2ApnIe, Gtp2BearerContextIe, Gtp2FTeidIe, Gtp2Header, Gtp2Message, Gtp2PaaIe,
+            Gtp2RatTypeIe,
         };
         let mut msg = Gtp2Message::new(Gtp2Header::new(
             gtp2_message_type::CREATE_SESSION_REQUEST,
@@ -2969,7 +2911,7 @@ mod tests {
         msg.add_ie(Gtp2PaaIe::ipv4(requested_paa).to_ie(0));
         let mut bc = Gtp2BearerContextIe::new();
         bc.set_ebi(ebi);
-        bc.set_bearer_qos(&Gtp2BearerQosIe::new(9, 0, 0, 0, 0));
+        bc.set_bearer_qos(bearer_qos);
         bc.set_fteid(2, &Gtp2FTeidIe::new_ipv4(4, 0x0505_0505, [127, 0, 0, 1]));
         msg.add_bearer_context(0, &bc);
         if let Some(counter) = recovery {
@@ -3257,6 +3199,118 @@ mod tests {
         server.close();
     }
 
+    /// #1165: the Create Session Request's Bearer QoS rates are kbit/s (TS 29.274 §8.15)
+    /// and are stored in the bit/s `context::Qos` holds for N4 and N2; the Create Session
+    /// Response codes them back in kbit/s. They were stored unconverted, so N4 and the
+    /// EPS→5GS mapping read them 1000 times too low. A default bearer is non-GBR (TS
+    /// 23.401 §4.7.2.1) and a conformant SGW sends zero rates for it; non-zero ones here
+    /// are what make the unit observable at the boundary.
+    #[tokio::test]
+    async fn the_bearer_qos_rates_are_kbps_on_s5s8_and_bps_in_the_store() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        upf.clear_seen();
+        crate::context::smf_context_init(64, 256, 512);
+        let server = crate::gtp_path::S5S8Server::open("127.0.0.1:0".parse().unwrap(), 3)
+            .await
+            .expect("bind");
+        let sgw = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind sgw");
+        // kbit/s: MBR 128 / 256, GBR 64 / 96.
+        let qos = nextgcore_gtp::v2::Gtp2BearerQosIe::new(9, 128, 256, 64, 96);
+        let csr = s5c_csr_with_qos(0x79, 0x1165_0001, [10, 99, 99, 99], &qos);
+        // #1221 review: and an APN-AMBR of 1000 / 2000 kbit/s (TS 29.274 §8.7), which
+        // the session's QER enforces at the PGW-U.
+        let mut csr = {
+            let mut b = csr.freeze();
+            let mut msg = nextgcore_gtp::v2::Gtp2Message::decode(&mut b).expect("fixture");
+            let mut ambr = 1000u32.to_be_bytes().to_vec();
+            ambr.extend_from_slice(&2000u32.to_be_bytes());
+            msg.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::from_slice(
+                Gtp2IeType::Ambr as u8,
+                0,
+                &ambr,
+            ));
+            msg.encode()
+        };
+        // IMSI ...0x7a is this test's alone (see `establish_over_the_wire`).
+        let imsi_pos = csr
+            .windows(8)
+            .position(|w| w == [0x09, 0x91, 0x07, 0x00, 0x00, 0x00, 0x00, 0x01])
+            .expect("fixture IMSI");
+        csr[imsi_pos + 7] = 0x7a;
+        sgw.send_to(&csr, server.local_addr())
+            .await
+            .expect("send csr");
+        let mut buf = vec![0u8; 4096];
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), sgw.recv_from(&mut buf))
+                .await
+                .expect("the PGW-C must answer")
+                .expect("recv");
+        let mut bytes = bytes::Bytes::copy_from_slice(&buf[..len]);
+        let resp = nextgcore_gtp::v2::Gtp2Message::decode(&mut bytes).expect("decode");
+        assert_eq!(
+            resp.get_ie(Gtp2IeType::Cause as u8, 0)
+                .and_then(|ie| ie.value.first().copied()),
+            Some(16)
+        );
+        let sent = resp
+            .bearer_context(0)
+            .expect("bearer context decodes")
+            .expect("Bearer Context Created present")
+            .bearer_qos()
+            .expect("Bearer QoS decodes")
+            .expect("the response carries the bearer's QoS");
+        assert_eq!(
+            (sent.mbr_ul, sent.mbr_dl, sent.gbr_ul, sent.gbr_dl),
+            (128, 256, 64, 96),
+            "kbit/s on the wire, as received"
+        );
+
+        let advertised = resp
+            .get_ie(Gtp2IeType::FTeid as u8, 1)
+            .and_then(|ie| nextgcore_gtp::v2::Gtp2FTeidIe::decode(&ie.value).ok())
+            .expect("the PGW's control F-TEID")
+            .teid;
+        let sess = session_for_teid(Some(advertised)).expect("the stored session");
+        let bearer = crate::context::smf_self()
+            .read()
+            .expect("context")
+            .bearer_find_by_ebi(sess.id, 5)
+            .expect("the default bearer");
+        assert_eq!(
+            (
+                bearer.qos.mbr_uplink,
+                bearer.qos.mbr_downlink,
+                bearer.qos.gbr_uplink,
+                bearer.qos.gbr_downlink
+            ),
+            (128_000, 256_000, 64_000, 96_000),
+            "bit/s in the store"
+        );
+        // #1221 review: the QER the PGW-U enforces. The session's QER carries the APN-AMBR
+        // in kbit/s (TS 29.244 §8.2.8), converted from the bit/s the session holds. A
+        // default bearer is Non-GBR (TS 23.401 §4.7.2.1), so its own MBR/GBR make no QER.
+        assert_eq!(
+            (sess.session_ambr.uplink, sess.session_ambr.downlink),
+            (1_000_000, 2_000_000),
+            "the APN-AMBR in bit/s in the store"
+        );
+        let mbr_ie = [
+            0x00, 0x1a, 0x00, 0x0a, 0, 0, 0, 0x03, 0xe8, 0, 0, 0, 0x07, 0xd0,
+        ];
+        assert!(
+            upf.establishment_bodies()
+                .iter()
+                .any(|b| b.windows(mbr_ie.len()).any(|w| w == mbr_ie)),
+            "the session QER's MBR is 1000 / 2000 kbit/s"
+        );
+        server.close();
+    }
+
     /// #223 criterion 2, the release half: `gsm_handler::handle_pdu_session_release_request`
     /// runs over a session the CONTEXT holds, and its mutation is observable there.
     ///
@@ -3517,91 +3571,51 @@ mod tests {
         server.close();
     }
 
-    /// #223: a Bearer Resource Command is routed, and the authorized QoS it grants reaches
-    /// the stored bearer (TS 29.274 §7.2.5, TS 23.401 §5.4.5).
-    ///
-    /// The positive assertion is the bearer's MBR read back from the context — a value only
-    /// `handle_bearer_resource_command` writes, from the Flow QoS IE. The command is NOT
-    /// answered with a message on the accept path (the follow-on Update Bearer Request is not
-    /// transmitted; see the function's doc comment and the spec's ceilings), so asserting on
-    /// a response would be asserting on something this change deliberately does not do.
+    /// #223, #619: a Bearer Resource Command is routed (TS 29.274 §7.2.5). This one
+    /// names no bearer, and its TAD does not decode (a create-new-TFT announcing a
+    /// packet filter it does not carry), so it asks for nothing the PGW-C can do. It is
+    /// answered with a Bearer Resource Failure Indication, cause 98 "Syntactic error in
+    /// the TAD operation", carrying the LBI and the PTI (Table 7.2.6-1). The default
+    /// bearer is untouched. Before #619 the Flow QoS was written to the default bearer
+    /// and nothing was answered, so the SGW-C's Command ran out its N3.
     #[tokio::test]
-    async fn a_bearer_resource_command_updates_the_stored_bearers_authorized_qos() {
+    async fn a_bearer_resource_command_asking_for_nothing_is_refused() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _seeded = crate::context::SeededState::track();
         let _upf = crate::pfcp_path::stand_in::associated_upf().await;
         // IMSI ...0x34, SGW TEID 0x3400_0004: distinct from every other #223 test's.
         let (server, sgw, sess) = establish_over_the_wire(6, 0x34, 0x3400_0004).await;
-
-        // The establishment's Bearer QoS carried all-zero rates, so a non-zero MBR here can
-        // only have come from this command.
-        const GRANTED_UL_MBR: u64 = 3_000;
-        const GRANTED_DL_MBR: u64 = 7_000;
-
-        let brc = {
-            use nextgcore_gtp::v2::{Gtp2Header, Gtp2Message};
-            let mut msg = Gtp2Message::new(Gtp2Header::new(
-                gtp2_message_type::BEARER_RESOURCE_COMMAND,
-                sess.smf_n4_teid,
-                0x24,
-            ));
-            // Linked EPS Bearer ID and PTI are mandatory (TS 23.401 §5.4.5).
-            msg.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::from_slice(
-                Gtp2IeType::Ebi as u8,
-                0,
-                &[5],
-            ));
-            msg.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::from_slice(
-                Gtp2IeType::Pti as u8,
-                0,
-                &[9],
-            ));
-            // Traffic Aggregate Description. Carried, not decoded — see `decode_flow_qos`'s
-            // caller and the spec's ceilings.
-            msg.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::from_slice(
-                Gtp2IeType::Tad as u8,
-                0,
-                &[0x21, 0x01, 0x01],
-            ));
-            // Flow QoS (§8.16): QCI then four 5-octet rates, and NO ARP octet — which is what
-            // makes it a different IE from Bearer QoS (§8.15).
-            let mut flow_qos = vec![9u8];
-            for rate in [GRANTED_UL_MBR, GRANTED_DL_MBR, 0u64, 0u64] {
-                flow_qos.extend_from_slice(&rate.to_be_bytes()[3..8]);
-            }
-            msg.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::from_slice(
-                Gtp2IeType::FlowQos as u8,
-                0,
-                &flow_qos,
-            ));
-            msg.encode()
-        };
+        let brc = s5c_bearer_resource_command(
+            0x8024,
+            sess.smf_n4_teid,
+            0,
+            9,
+            &[0x21, 0x01, 0x01],
+            Some((9, [3_000, 7_000, 0, 0])),
+        );
         sgw.send_to(&brc, server.local_addr()).await.expect("send");
-
-        // The command is handled without a reply on the accept path, so the observable is the
-        // stored bearer rather than a datagram.
-        let mut granted = None;
-        for _ in 0..600 {
-            let found = crate::context::smf_self()
-                .read()
-                .ok()
-                .and_then(|c| c.bearer_find_by_ebi(sess.id, 5))
-                .filter(|b| b.qos.mbr_uplink == GRANTED_UL_MBR);
-            if let Some(b) = found {
-                granted = Some(b);
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        let granted = granted.expect(
-            "handle_bearer_resource_command must write the granted Flow QoS to the STORED \
-             bearer — before #223 this command was answered Service not supported and no \
-             handler ran at all",
+        let (fi, _) = recv_type(&sgw, gtp2_message_type::BEARER_RESOURCE_FAILURE_INDICATION).await;
+        assert_eq!(fi.header.sequence_number, 0x8024);
+        assert_eq!(
+            fi.get_ie(Gtp2IeType::Cause as u8, 0).map(|ie| ie.value[0]),
+            Some(98)
         );
         assert_eq!(
-            granted.qos.mbr_downlink, GRANTED_DL_MBR,
-            "the downlink rate must be the one the command granted, not the uplink one — \
-             which is what decoding Flow QoS as Bearer QoS would produce"
+            fi.get_ie(Gtp2IeType::Ebi as u8, 0).map(|ie| ie.value[0]),
+            Some(5)
+        );
+        assert_eq!(
+            fi.get_ie(Gtp2IeType::Pti as u8, 0).map(|ie| ie.value[0]),
+            Some(9)
+        );
+        let default = crate::context::smf_self()
+            .read()
+            .unwrap()
+            .bearer_find_by_ebi(sess.id, 5)
+            .unwrap();
+        assert_eq!(
+            default.qos.mbr_uplink, 0,
+            "the default bearer's QoS is untouched"
         );
         server.close();
     }
@@ -3957,26 +3971,6 @@ mod tests {
                 assert_eq!(bearer_id, 1);
             }
             _ => panic!("Expected dedicated bearer deleted"),
-        }
-    }
-
-    #[test]
-    fn test_bearer_resource_command_no_tad() {
-        let sess = SmfSess::default();
-        let mut bearer = SmfBearer::new(1, 1);
-        let cmd = BearerResourceCommand {
-            linked_ebi: 5,
-            pti: 1,
-            ..Default::default()
-        };
-
-        let result = handle_bearer_resource_command(&sess, &mut bearer, &cmd, false);
-
-        match result {
-            BearerResourceResult::Rejected(cause) => {
-                assert_eq!(cause, Gtp2Cause::MandatoryIeMissing);
-            }
-            _ => panic!("Expected rejection"),
         }
     }
 
@@ -4798,6 +4792,7 @@ mod tests {
         let _seeded = crate::context::SeededState::track();
         let _upf = crate::pfcp_path::stand_in::associated_upf().await;
         let (server, sgw, sess) = establish_over_the_wire(7, 0x63, 0x6300_0001).await;
+        let upf = _upf;
 
         const CMD_SEQ: u32 = 0x4242;
         let brc = {
@@ -4853,6 +4848,23 @@ mod tests {
             cbr.get_ie(Gtp2IeType::Pti as u8, 0).map(|ie| ie.value[0]),
             Some(7),
             "and the UE's PTI"
+        );
+        // #1165: kbit/s on S5/S8 both ways, and in the QER's GBR (TS 29.244 §8.2.9),
+        // from the bit/s the bearer holds.
+        let q = cbr
+            .bearer_context(0)
+            .expect("decodes")
+            .expect("a bearer context")
+            .bearer_qos()
+            .expect("decodes")
+            .expect("a Bearer QoS");
+        assert_eq!((q.mbr_ul, q.mbr_dl, q.gbr_ul, q.gbr_dl), (96, 96, 32, 48));
+        let gbr_ie = [0x00, 0x1b, 0x00, 0x0a, 0, 0, 0, 0, 32, 0, 0, 0, 0, 48];
+        assert!(
+            upf.modification_bodies()
+                .iter()
+                .any(|b| b.windows(gbr_ie.len()).any(|w| w == gbr_ie)),
+            "the bearer's QER carries GBR 32/48 kbit/s"
         );
 
         // A retransmission of the Command must not be served again.
@@ -4910,6 +4922,553 @@ mod tests {
             "a late retransmission of the Command started a second bearer"
         );
         assert_eq!(server.outstanding().await, 0);
+        server.close();
+    }
+
+    /// A Bearer Resource Command from the stand-in SGW-C on the PDN connection whose PGW
+    /// S5/S8-C TEID is `pgw_c_teid`: LBI 5, the bearer `ebi` at instance 1 (none when
+    /// 0), PTI `pti`, the TAD and, when given, a Flow QoS (QCI, MBR UL/DL, GBR UL/DL in
+    /// kbit/s).
+    fn s5c_bearer_resource_command(
+        seq: u32,
+        pgw_c_teid: u32,
+        ebi: u8,
+        pti: u8,
+        tad: &[u8],
+        flow_qos: Option<(u8, [u64; 4])>,
+    ) -> bytes::BytesMut {
+        use nextgcore_gtp::v2::{ie::Gtp2Ie, Gtp2Header, Gtp2Message};
+        let mut msg = Gtp2Message::new(Gtp2Header::new(
+            gtp2_message_type::BEARER_RESOURCE_COMMAND,
+            pgw_c_teid,
+            seq,
+        ));
+        msg.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Ebi as u8, 0, &[5]));
+        if ebi != 0 {
+            msg.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Ebi as u8, 1, &[ebi]));
+        }
+        msg.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Pti as u8, 0, &[pti]));
+        msg.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Tad as u8, 0, tad));
+        if let Some((qci, rates)) = flow_qos {
+            let mut v = vec![qci];
+            for r in rates {
+                v.extend_from_slice(&r.to_be_bytes()[3..8]);
+            }
+            msg.add_ie(Gtp2Ie::from_slice(Gtp2IeType::FlowQos as u8, 0, &v));
+        }
+        msg.encode()
+    }
+
+    /// An Update or Delete Bearer Response (TS 29.274 §7.2.16, §7.2.10.2) from the
+    /// stand-in SGW-C: `cause`, and one Bearer Context for `ebi` with `cause`.
+    fn s5c_bearer_answer(
+        msg_type: u8,
+        seq: u32,
+        pgw_c_teid: u32,
+        ebi: u8,
+        cause: u8,
+    ) -> bytes::BytesMut {
+        use nextgcore_gtp::v2::{Gtp2BearerContextIe, Gtp2CauseIe, Gtp2Header, Gtp2Message};
+        let mut m = Gtp2Message::new(Gtp2Header::new(msg_type, pgw_c_teid, seq));
+        m.add_ie(Gtp2CauseIe::new(cause).to_ie(0));
+        let mut bc = Gtp2BearerContextIe::new();
+        bc.set_ebi(ebi);
+        bc.set_cause(&Gtp2CauseIe::new(cause));
+        m.add_bearer_context(0, &bc);
+        m.encode()
+    }
+
+    /// A PDN connection with the voice rule's dedicated bearer active as EBI 6: packet
+    /// filters 1 (downlink, `VOICE_DL`) and 2 (uplink, `VOICE_UL`), QCI 1, GBR 64 kbit/s.
+    async fn pdn_with_voice_bearer(
+        tag: u8,
+        upf: &crate::pfcp_path::stand_in::StandInUpf,
+    ) -> (
+        std::sync::Arc<crate::gtp_path::S5S8Server>,
+        tokio::net::UdpSocket,
+        SgwPortGuard,
+        crate::context::SmfSess,
+        u32,
+    ) {
+        let (server, sgw, port, sess, pgw_c_teid) =
+            pdn_with_local_rules(tag, vec![voice_rule()]).await;
+        let (cbr, _) = recv_type(&sgw, gtp2_message_type::CREATE_BEARER_REQUEST).await;
+        sgw.send_to(
+            &s5c_create_bearer_response(cbr.header.sequence_number, pgw_c_teid, 6, 16, None),
+            server.local_addr(),
+        )
+        .await
+        .expect("send");
+        stored_bearer(sess.id, 6).await.expect("EBI 6 active");
+        assert!(upf_until(upf, |m| sent(m, &far_id_ie(0x81))).await);
+        upf.clear_seen();
+        (server, sgw, port, sess, pgw_c_teid)
+    }
+
+    /// The stored packet filters of EBI 6 on `sess_id`: (identifier, direction, flow).
+    fn stored_filters_of(
+        sess_id: u64,
+        ebi: u8,
+    ) -> Vec<(u8, crate::context::FlowDirection, String)> {
+        let ctx = crate::context::smf_self();
+        let ctx = ctx.read().unwrap();
+        let Some(b) = ctx.bearer_find_by_ebi(sess_id, ebi) else {
+            return Vec::new();
+        };
+        let mut v: Vec<_> = b
+            .pf_ids
+            .iter()
+            .filter_map(|id| ctx.pf_find_by_id(*id))
+            .map(|pf| {
+                (
+                    pf.identifier,
+                    pf.direction,
+                    pf.flow_description.unwrap_or_default(),
+                )
+            })
+            .collect();
+        v.sort_by_key(|f| f.0);
+        v
+    }
+
+    /// #619, TS 23.401 §5.4.5 then §5.4.2.1: the UE asks to add a packet filter to its
+    /// dedicated bearer and raise its GBR. The PGW-C answers with an Update Bearer
+    /// Request as the Command's Triggered message: the Command's sequence number, the
+    /// UE's PTI, the bearer's EBI, the Bearer QoS in kbit/s, and the TFT "add packet
+    /// filters" with the new filter under an identifier the PGW assigned (3: 1 and 2 are
+    /// taken). Nothing changes until the SGW-C accepts. Then the store holds the three
+    /// filters and the new QoS, and the PGW-U gets an Update QER with the new GBR and an
+    /// Update PDR 0x81 whose SDF filters include the new downlink flow (TS 29.244 Table
+    /// 7.5.4.2-1).
+    #[tokio::test]
+    async fn a_bearer_resource_command_on_a_dedicated_bearer_is_an_update_bearer_request() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        let (server, sgw, _port, sess, pgw_c_teid) = pdn_with_voice_bearer(0x71, &upf).await;
+
+        const SEQ: u32 = 0x8071;
+        const VIDEO_DL: &str = "permit out 17 from 198.51.100.7 5008 to assigned";
+        let tad = crate::eps_tft::encode(
+            crate::eps_tft::op::ADD_PACKET_FILTERS,
+            &[crate::eps_tft::PacketFilter {
+                direction: crate::context::FlowDirection::Bidirectional,
+                identifier: 0,
+                precedence: 7,
+                flow_description: VIDEO_DL.into(),
+            }],
+        )
+        .unwrap();
+        let brc = s5c_bearer_resource_command(
+            SEQ,
+            pgw_c_teid,
+            6,
+            9,
+            &tad,
+            Some((1, [256, 256, 128, 96])),
+        );
+        sgw.send_to(&brc, server.local_addr()).await.expect("send");
+        let (ubr, _) = recv_type(&sgw, gtp2_message_type::UPDATE_BEARER_REQUEST).await;
+        assert_eq!(
+            ubr.header.sequence_number, SEQ,
+            "the Command's Triggered message"
+        );
+        assert_eq!(
+            ubr.header.teid,
+            Some(0x7100_0001),
+            "the SGW-C's S5/S8-C TEID"
+        );
+        assert_eq!(
+            ubr.get_ie(Gtp2IeType::Pti as u8, 0).map(|ie| ie.value[0]),
+            Some(9)
+        );
+        let bc = ubr.bearer_context(0).unwrap().expect("a Bearer Context");
+        assert_eq!(bc.ebi().unwrap(), 6);
+        let q = bc
+            .bearer_qos()
+            .unwrap()
+            .expect("the Bearer QoS: it changed");
+        assert_eq!(
+            (q.qci, q.mbr_ul, q.mbr_dl, q.gbr_ul, q.gbr_dl),
+            (1, 256, 256, 128, 96)
+        );
+        let tft = crate::eps_tft::decode(
+            &bc.get_ie(nextgcore_gtp::v2::Gtp2IeType::BearerTft as u8, 0)
+                .expect("the TFT")
+                .value,
+        )
+        .unwrap();
+        assert_eq!(tft.operation, crate::eps_tft::op::ADD_PACKET_FILTERS);
+        assert_eq!(
+            tft.filters
+                .iter()
+                .map(|f| (f.identifier, f.precedence, f.flow_description.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(3, 7, VIDEO_DL)]
+        );
+        // Not applied before the answer.
+        let before = stored_bearer(sess.id, 6).await.unwrap();
+        assert_eq!(before.qos.gbr_uplink, 64_000);
+        assert_eq!(stored_filters_of(sess.id, 6).len(), 2);
+        assert!(upf.modification_bodies().is_empty());
+
+        sgw.send_to(
+            &s5c_bearer_answer(
+                gtp2_message_type::UPDATE_BEARER_RESPONSE,
+                SEQ,
+                pgw_c_teid,
+                6,
+                16,
+            ),
+            server.local_addr(),
+        )
+        .await
+        .expect("send");
+        // TS 29.244 §8.2.9: kbit/s.
+        let gbr_ie = [0x00, 0x1b, 0x00, 0x0a, 0, 0, 0, 0, 0x80, 0, 0, 0, 0, 0x60];
+        assert!(
+            upf_until(&upf, |m| sent(m, &gbr_ie)).await,
+            "Update QER with GBR 128000/96000 bit/s (128/96 kbit/s): {:02x?}",
+            upf.modification_bodies()
+        );
+        let mods = upf.modification_bodies();
+        assert!(sent(&mods, &[0x00, 0x0e]), "an Update QER");
+        let update_pdr_81 = mods.iter().any(|b| {
+            b.windows(2).any(|w| w == [0x00, 0x09])
+                && b.windows(6).any(|w| w == pdr_id_ie(0x81).as_slice())
+                && b.windows(VIDEO_DL.len()).any(|w| w == VIDEO_DL.as_bytes())
+                && b.windows(VOICE_DL.len()).any(|w| w == VOICE_DL.as_bytes())
+        });
+        assert!(
+            update_pdr_81,
+            "Update PDR 0x81 with both downlink SDF filters"
+        );
+        let after = stored_bearer(sess.id, 6).await.unwrap();
+        assert_eq!(
+            (
+                after.qos.index,
+                after.qos.mbr_uplink,
+                after.qos.gbr_uplink,
+                after.qos.gbr_downlink
+            ),
+            (1, 256_000, 128_000, 96_000)
+        );
+        assert_eq!(after.qos.arp_priority_level, 2, "the ARP is the bearer's");
+        assert_eq!(
+            stored_filters_of(sess.id, 6),
+            vec![
+                (
+                    1,
+                    crate::context::FlowDirection::DownlinkOnly,
+                    VOICE_DL.to_string()
+                ),
+                (
+                    2,
+                    crate::context::FlowDirection::UplinkOnly,
+                    VOICE_UL.to_string()
+                ),
+                (
+                    3,
+                    crate::context::FlowDirection::Bidirectional,
+                    VIDEO_DL.to_string()
+                ),
+            ]
+        );
+        assert_eq!(server.outstanding().await, 0);
+        server.close();
+    }
+
+    /// #619: an Update Bearer Request the SGW-C refuses (the MME or the UE did), or one
+    /// it never answers, leaves the bearer as it was: its QoS, its filters, and no
+    /// PGW-U change.
+    #[tokio::test]
+    async fn a_refused_or_unanswered_update_bearer_leaves_the_bearer_as_it_was() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        let (server, sgw, _port, sess, pgw_c_teid) = pdn_with_voice_bearer(0x72, &upf).await;
+        let tad = crate::eps_tft::encode(crate::eps_tft::op::NO_TFT_OPERATION, &[]).unwrap();
+        let brc = |seq| {
+            s5c_bearer_resource_command(
+                seq,
+                pgw_c_teid,
+                6,
+                3,
+                &tad,
+                Some((1, [256, 256, 128, 128])),
+            )
+        };
+
+        sgw.send_to(&brc(0x8072), server.local_addr())
+            .await
+            .expect("send");
+        let (ubr, _) = recv_type(&sgw, gtp2_message_type::UPDATE_BEARER_REQUEST).await;
+        let bc = ubr.bearer_context(0).unwrap().unwrap();
+        assert!(
+            bc.get_ie(nextgcore_gtp::v2::Gtp2IeType::BearerTft as u8, 0)
+                .is_none(),
+            "no TFT operation: no TFT"
+        );
+        // Cause 88, "UE refuses" (TS 29.274 Table 8.4-1).
+        sgw.send_to(
+            &s5c_bearer_answer(
+                gtp2_message_type::UPDATE_BEARER_RESPONSE,
+                0x8072,
+                pgw_c_teid,
+                6,
+                88,
+            ),
+            server.local_addr(),
+        )
+        .await
+        .expect("send");
+        let sgw_addr = sgw.local_addr().unwrap();
+        for _ in 0..400 {
+            if server.command_ended(sgw_addr, 0x8072) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(server.command_ended(sgw_addr, 0x8072));
+        let b = stored_bearer(sess.id, 6).await.unwrap();
+        assert_eq!((b.qos.gbr_uplink, b.qos.mbr_uplink), (64_000, 128_000));
+
+        // Unanswered: the request's T3 x (N3 + 1) runs out, with T3 shortened here.
+        server
+            .set_bearer_t3_for_test(std::time::Duration::from_millis(300))
+            .await;
+        sgw.send_to(&brc(0x8073), server.local_addr())
+            .await
+            .expect("send");
+        recv_type(&sgw, gtp2_message_type::UPDATE_BEARER_REQUEST).await;
+        for _ in 0..1200 {
+            if server.command_ended(sgw_addr, 0x8073) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(server.command_ended(sgw_addr, 0x8073), "N3 ran out");
+        let b = stored_bearer(sess.id, 6).await.unwrap();
+        assert_eq!(b.qos.gbr_uplink, 64_000);
+        assert_eq!(stored_filters_of(sess.id, 6).len(), 2);
+        assert!(upf.modification_bodies().is_empty(), "nothing at the PGW-U");
+        server.close();
+    }
+
+    /// #619, TS 23.401 §5.4.5 step 5 then §5.4.4.1: a Command deleting every packet
+    /// filter of the dedicated bearer deactivates it. The Delete Bearer Request is
+    /// the Command's Triggered message and carries the PTI and the EBI at instance 1.
+    /// On the answer, the bearer and its PGW-U rules go.
+    #[tokio::test]
+    async fn a_bearer_resource_command_deleting_every_filter_deletes_the_bearer() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        let (server, sgw, _port, sess, pgw_c_teid) = pdn_with_voice_bearer(0x73, &upf).await;
+        let tad = crate::eps_tft::encode_delete(&[1, 2]).unwrap();
+        sgw.send_to(
+            &s5c_bearer_resource_command(0x8074, pgw_c_teid, 6, 4, &tad, None),
+            server.local_addr(),
+        )
+        .await
+        .expect("send");
+        let (dbr, _) = recv_type(&sgw, gtp2_message_type::DELETE_BEARER_REQUEST).await;
+        assert_eq!(dbr.header.sequence_number, 0x8074);
+        assert_eq!(
+            dbr.get_ie(Gtp2IeType::Pti as u8, 0).map(|ie| ie.value[0]),
+            Some(4)
+        );
+        assert_eq!(
+            dbr.get_ie(Gtp2IeType::Ebi as u8, 1).map(|ie| ie.value[0]),
+            Some(6)
+        );
+        sgw.send_to(
+            &s5c_bearer_answer(
+                gtp2_message_type::DELETE_BEARER_RESPONSE,
+                0x8074,
+                pgw_c_teid,
+                6,
+                16,
+            ),
+            server.local_addr(),
+        )
+        .await
+        .expect("send");
+        let mut remove_far = vec![0x00, 0x10, 0x00, 0x08];
+        remove_far.extend_from_slice(&far_id_ie(0x81));
+        assert!(
+            upf_until(&upf, |m| sent(m, &remove_far)).await,
+            "Remove FAR 0x81"
+        );
+        assert!(
+            crate::context::smf_self()
+                .read()
+                .unwrap()
+                .bearer_find_by_ebi(sess.id, 6)
+                .is_none(),
+            "the bearer is gone"
+        );
+        server.close();
+    }
+
+    /// #619, TS 23.401 §5.4.5 step 5 and TS 24.301 §6.4.3.4 c) 2): deleting the
+    /// bearer's only uplink filter would leave a downlink-only TFT, which the UE
+    /// refuses. The PGW-C adds the disallowing uplink filter instead, and sends the
+    /// whole TFT as a new one, because a delete operation cannot also add.
+    #[tokio::test]
+    async fn deleting_the_uplink_filter_leaves_the_pgws_disallowing_one() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        let (server, sgw, _port, sess, pgw_c_teid) = pdn_with_voice_bearer(0x74, &upf).await;
+        let tad = crate::eps_tft::encode_delete(&[2]).unwrap();
+        sgw.send_to(
+            &s5c_bearer_resource_command(0x8075, pgw_c_teid, 6, 5, &tad, None),
+            server.local_addr(),
+        )
+        .await
+        .expect("send");
+        let (ubr, _) = recv_type(&sgw, gtp2_message_type::UPDATE_BEARER_REQUEST).await;
+        let bc = ubr.bearer_context(0).unwrap().unwrap();
+        assert!(bc.bearer_qos().unwrap().is_none(), "the QoS did not change");
+        let tft = crate::eps_tft::decode(
+            &bc.get_ie(nextgcore_gtp::v2::Gtp2IeType::BearerTft as u8, 0)
+                .unwrap()
+                .value,
+        )
+        .unwrap();
+        assert_eq!(tft.operation, crate::eps_tft::op::CREATE_NEW_TFT);
+        let got: Vec<_> = tft
+            .filters
+            .iter()
+            .map(|f| (f.identifier, f.direction, f.flow_description.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (1, crate::context::FlowDirection::DownlinkOnly, VOICE_DL),
+                (
+                    2,
+                    crate::context::FlowDirection::UplinkOnly,
+                    crate::eps_bearer::DISALLOW_UPLINK
+                ),
+            ]
+        );
+        sgw.send_to(
+            &s5c_bearer_answer(
+                gtp2_message_type::UPDATE_BEARER_RESPONSE,
+                0x8075,
+                pgw_c_teid,
+                6,
+                16,
+            ),
+            server.local_addr(),
+        )
+        .await
+        .expect("send");
+        let sgw_addr = sgw.local_addr().unwrap();
+        for _ in 0..400 {
+            if server.command_ended(sgw_addr, 0x8075) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            stored_filters_of(sess.id, 6),
+            vec![
+                (
+                    1,
+                    crate::context::FlowDirection::DownlinkOnly,
+                    VOICE_DL.to_string()
+                ),
+                (
+                    2,
+                    crate::context::FlowDirection::UplinkOnly,
+                    crate::eps_bearer::DISALLOW_UPLINK.to_string()
+                ),
+            ]
+        );
+        assert!(
+            upf.modification_bodies().is_empty(),
+            "the downlink filters did not change, nor the QoS: nothing at the PGW-U"
+        );
+        server.close();
+    }
+
+    /// #619, TS 24.301 §6.4.2.4 c) 2): a dedicated bearer whose rule has downlink flows
+    /// only goes out with the PGW's disallowing uplink filter in its TFT, which the UE
+    /// would otherwise refuse with cause #44.
+    #[tokio::test]
+    async fn a_downlink_only_bearer_gets_the_disallowing_uplink_filter() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _upf = crate::pfcp_path::stand_in::associated_upf().await;
+        let mut rule = voice_rule();
+        rule.flows.truncate(1);
+        let (server, sgw, _port, _sess, _pgw_c_teid) = pdn_with_local_rules(0x76, vec![rule]).await;
+        let (cbr, _) = recv_type(&sgw, gtp2_message_type::CREATE_BEARER_REQUEST).await;
+        let bc = cbr.bearer_context(0).unwrap().unwrap();
+        let tft = crate::eps_tft::decode(
+            &bc.get_ie(nextgcore_gtp::v2::Gtp2IeType::BearerTft as u8, 0)
+                .unwrap()
+                .value,
+        )
+        .unwrap();
+        let got: Vec<_> = tft
+            .filters
+            .iter()
+            .map(|f| (f.identifier, f.direction, f.flow_description.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (1, crate::context::FlowDirection::DownlinkOnly, VOICE_DL),
+                (
+                    2,
+                    crate::context::FlowDirection::UplinkOnly,
+                    crate::eps_bearer::DISALLOW_UPLINK
+                ),
+            ]
+        );
+        server.close();
+    }
+
+    /// #619: a Bearer Resource Command for the default bearer, or for a bearer the PDN
+    /// connection does not hold, is answered with a Bearer Resource Failure Indication
+    /// carrying the Cause, the LBI and the PTI (TS 29.274 Table 7.2.6-1), under the
+    /// Command's sequence number.
+    #[tokio::test]
+    async fn a_bearer_resource_command_it_refuses_gets_a_failure_indication() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        let (server, sgw, _port, _sess, pgw_c_teid) = pdn_with_voice_bearer(0x75, &upf).await;
+        let tad = crate::eps_tft::encode(crate::eps_tft::op::NO_TFT_OPERATION, &[]).unwrap();
+        for (seq, ebi, cause) in [(0x8076u32, 5u8, 68u8), (0x8077, 9, 64)] {
+            sgw.send_to(
+                &s5c_bearer_resource_command(seq, pgw_c_teid, ebi, 6, &tad, Some((9, [0; 4]))),
+                server.local_addr(),
+            )
+            .await
+            .expect("send");
+            let (fi, _) =
+                recv_type(&sgw, gtp2_message_type::BEARER_RESOURCE_FAILURE_INDICATION).await;
+            assert_eq!(fi.header.sequence_number, seq);
+            assert_eq!(fi.header.teid, Some(0x7500_0001));
+            assert_eq!(
+                fi.get_ie(Gtp2IeType::Cause as u8, 0).map(|ie| ie.value[0]),
+                Some(cause),
+                "EBI {ebi}"
+            );
+            assert_eq!(
+                fi.get_ie(Gtp2IeType::Ebi as u8, 0).map(|ie| ie.value[0]),
+                Some(5)
+            );
+            assert_eq!(
+                fi.get_ie(Gtp2IeType::Pti as u8, 0).map(|ie| ie.value[0]),
+                Some(6)
+            );
+        }
         server.close();
     }
 
