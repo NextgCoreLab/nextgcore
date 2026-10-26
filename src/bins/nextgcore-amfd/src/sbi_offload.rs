@@ -181,6 +181,30 @@ pub(crate) struct SbiOffload {
     /// only tasks really parked on the permit.
     #[cfg(test)]
     at_the_gate: Arc<std::sync::atomic::AtomicUsize>,
+    /// Tests (#1238): every task this offload spawned, aborted when it is dropped. A
+    /// test's `NgapServer` is dropped before its `SmfEnvGuard`, so its exchanges stop
+    /// before the guard hands the `SMF_SBI_*` environment, and the loopback ports, to
+    /// the next test. Unkeyed work keeps no handle otherwise, and its task would run
+    /// until the test's runtime shuts down: long enough to resolve the next test's
+    /// stand-in and send it a request (#1205). The production server is never
+    /// dropped.
+    #[cfg(test)]
+    spawned_tasks: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
+}
+
+#[cfg(test)]
+impl Drop for SbiOffload {
+    fn drop(&mut self) {
+        let tasks = std::mem::take(
+            &mut *self
+                .spawned_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for task in tasks {
+            task.abort();
+        }
+    }
 }
 
 impl std::fmt::Debug for SbiOffload {
@@ -208,6 +232,8 @@ impl SbiOffload {
             spawned: Arc::default(),
             #[cfg(test)]
             at_the_gate: Arc::default(),
+            #[cfg(test)]
+            spawned_tasks: std::sync::Mutex::default(),
         }
     }
 
@@ -535,7 +561,7 @@ impl SbiOffload {
         let done = Done(spawned);
         #[cfg(test)]
         let at_the_gate = Arc::clone(&self.at_the_gate);
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let _done = done;
             #[cfg(test)]
             at_the_gate.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -567,7 +593,17 @@ impl SbiOffload {
             if let Some((job, _)) = keyed {
                 let _ = tx.send(Report::KeyDone { job });
             }
-        })
+        });
+        #[cfg(test)]
+        {
+            let mut tasks = self
+                .spawned_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            tasks.retain(|t| !t.is_finished());
+            tasks.push(handle.abort_handle());
+        }
+        handle
     }
 }
 
@@ -575,6 +611,37 @@ impl SbiOffload {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// #1238: work an offload spawned does not outlive it in a test. A test's server
+    /// (and with it its `SbiOffload`) is dropped before its `SmfEnvGuard`, so nothing it
+    /// left running can resolve the next test's stand-in, or reach a port the OS gave
+    /// that stand-in (#1205). Unkeyed and keyed durable work alike.
+    ///
+    /// REVERT-VERIFIED: without the `Drop` the work still runs after the drop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_the_offload_aborts_the_work_it_spawned() {
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut offload = SbiOffload::new(4);
+        let unkeyed = Arc::clone(&ran);
+        offload.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            unkeyed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        });
+        let durable = Arc::clone(&ran);
+        offload.spawn_keyed_durable((1_238_001, 5), move || async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            durable.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        });
+        drop(offload);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "nothing the dropped offload spawned ran on"
+        );
+    }
 
     /// A flag the WORK sets as its first action, so a test can wait for a job to
     /// have really started its exchange.

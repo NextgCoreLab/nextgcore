@@ -416,14 +416,31 @@ pub struct BearerQos {
     pub pre_emption_vulnerability: bool,
     /// QCI (QoS Class Identifier)
     pub qci: u8,
-    /// Maximum Bit Rate Uplink (5 bytes)
+    /// Maximum Bit Rate Uplink (5 bytes, kbit/s: TS 29.274 §8.15)
     pub ul_mbr: u64,
-    /// Maximum Bit Rate Downlink (5 bytes)
+    /// Maximum Bit Rate Downlink (5 bytes, kbit/s)
     pub dl_mbr: u64,
-    /// Guaranteed Bit Rate Uplink (5 bytes)
+    /// Guaranteed Bit Rate Uplink (5 bytes, kbit/s)
     pub ul_gbr: u64,
-    /// Guaranteed Bit Rate Downlink (5 bytes)
+    /// Guaranteed Bit Rate Downlink (5 bytes, kbit/s)
     pub dl_gbr: u64,
+}
+
+/// The largest rate a 5-octet GTPv2 Bearer or Flow QoS field holds, in kbit/s.
+const GTP2_MAX_KBPS: u64 = 0xFF_FFFF_FFFF;
+
+/// A GTPv2 Bearer/Flow QoS rate (kbit/s, TS 29.274 §8.15, §8.16) in the bit/s that
+/// `context::Qos` holds everywhere else: on N4 (QER MBR/GBR), on N2 and in the
+/// EPS→5GS mapping (#1165).
+pub(crate) fn gtp2_kbps_to_bps(kbps: u64) -> u64 {
+    kbps.saturating_mul(1000)
+}
+
+/// A `context::Qos` rate (bit/s) as a GTPv2 Bearer QoS field (kbit/s), rounded up so
+/// that a non-zero rate never goes out as 0, and capped at the field's 5 octets
+/// (#1165).
+pub(crate) fn gtp2_bps_to_kbps(bps: u64) -> u64 {
+    bps.div_ceil(1000).min(GTP2_MAX_KBPS)
 }
 
 /// Bearer QoS encoded length
@@ -441,6 +458,34 @@ impl BearerQos {
             dl_mbr: 0,
             ul_gbr: 0,
             dl_gbr: 0,
+        }
+    }
+
+    /// The Bearer QoS IE of a bearer whose QoS this node holds in bit/s (#1165).
+    pub(crate) fn from_qos(qos: &Qos) -> Self {
+        Self {
+            qci: qos.index,
+            priority_level: qos.arp_priority_level,
+            pre_emption_capability: qos.arp_preempt_cap,
+            pre_emption_vulnerability: qos.arp_preempt_vuln,
+            ul_mbr: gtp2_bps_to_kbps(qos.mbr_uplink),
+            dl_mbr: gtp2_bps_to_kbps(qos.mbr_downlink),
+            ul_gbr: gtp2_bps_to_kbps(qos.gbr_uplink),
+            dl_gbr: gtp2_bps_to_kbps(qos.gbr_downlink),
+        }
+    }
+
+    /// This Bearer QoS IE as the bit/s `context::Qos` the bearer stores (#1165).
+    pub(crate) fn to_qos(&self) -> Qos {
+        Qos {
+            index: self.qci,
+            arp_priority_level: self.priority_level,
+            arp_preempt_cap: self.pre_emption_capability,
+            arp_preempt_vuln: self.pre_emption_vulnerability,
+            mbr_uplink: gtp2_kbps_to_bps(self.ul_mbr),
+            mbr_downlink: gtp2_kbps_to_bps(self.dl_mbr),
+            gbr_uplink: gtp2_kbps_to_bps(self.ul_gbr),
+            gbr_downlink: gtp2_kbps_to_bps(self.dl_gbr),
         }
     }
 
@@ -1071,17 +1116,8 @@ pub fn build_create_session_response(
 
         // Bearer QoS
         if include_bearer_qos {
-            let bearer_qos = BearerQos {
-                qci: bearer.qos.index,
-                priority_level: bearer.qos.arp_priority_level,
-                pre_emption_capability: bearer.qos.arp_preempt_cap,
-                pre_emption_vulnerability: bearer.qos.arp_preempt_vuln,
-                ul_mbr: bearer.qos.mbr_uplink,
-                dl_mbr: bearer.qos.mbr_downlink,
-                ul_gbr: bearer.qos.gbr_uplink,
-                dl_gbr: bearer.qos.gbr_downlink,
-            };
-            bc_builder = bc_builder.add_bearer_qos(&bearer_qos);
+            // #1165: held in bit/s, coded in kbit/s (TS 29.274 §8.15).
+            bc_builder = bc_builder.add_bearer_qos(&BearerQos::from_qos(&bearer.qos));
         }
 
         // Charging ID
@@ -1194,17 +1230,7 @@ pub fn build_create_bearer_request(
     };
     // #619: the bearer's rates are held in bit/s, as the 5GC flows' are and as N4 and
     // the EPS→5GS mapping (#583) read them; TS 29.274 §8.15 codes them in kbit/s.
-    let kbps = |bps: u64| bps.div_ceil(1000);
-    let bearer_qos = BearerQos {
-        qci: bearer.qos.index,
-        priority_level: bearer.qos.arp_priority_level,
-        pre_emption_capability: bearer.qos.arp_preempt_cap,
-        pre_emption_vulnerability: bearer.qos.arp_preempt_vuln,
-        ul_mbr: kbps(bearer.qos.mbr_uplink),
-        dl_mbr: kbps(bearer.qos.mbr_downlink),
-        ul_gbr: kbps(bearer.qos.gbr_uplink),
-        dl_gbr: kbps(bearer.qos.gbr_downlink),
-    };
+    let bearer_qos = BearerQos::from_qos(&bearer.qos);
 
     // TS 29.274 §7.2.3: the EBI of a bearer to be created is set to 0 by the PGW. The
     // MME assigns it and returns it in the Create Bearer Response. Table 7.2.3-2: the
@@ -1265,17 +1291,8 @@ pub fn build_update_bearer_request(
 
     // Bearer QoS
     if include_qos {
-        let bearer_qos = BearerQos {
-            qci: bearer.qos.index,
-            priority_level: bearer.qos.arp_priority_level,
-            pre_emption_capability: bearer.qos.arp_preempt_cap,
-            pre_emption_vulnerability: bearer.qos.arp_preempt_vuln,
-            ul_mbr: bearer.qos.mbr_uplink,
-            dl_mbr: bearer.qos.mbr_downlink,
-            ul_gbr: bearer.qos.gbr_uplink,
-            dl_gbr: bearer.qos.gbr_downlink,
-        };
-        bc_builder = bc_builder.add_bearer_qos(&bearer_qos);
+        // #1165: held in bit/s, coded in kbit/s (TS 29.274 §8.15).
+        bc_builder = bc_builder.add_bearer_qos(&BearerQos::from_qos(&bearer.qos));
     }
 
     // TFT
@@ -1655,6 +1672,77 @@ mod tests {
             0x5e, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x07,
         ];
         assert_eq!(msg, expected);
+    }
+
+    /// #1165, TS 29.274 §8.15: every Bearer QoS this PGW-C sends codes the bearer's
+    /// bit/s rates in kbit/s: the Create Session Response, the Create Bearer Request and
+    /// the Update Bearer Request. Two of the three sent the bit/s values unconverted. A
+    /// rate that is not a whole kbit/s rounds up, so a non-zero rate never becomes 0, and
+    /// one past the 5-octet field is capped.
+    #[test]
+    fn every_bearer_qos_sent_is_in_kbps() {
+        let (sess, mut bearer) = golden_session(gtp2_rat_type::EUTRAN);
+        bearer.qos.index = 1;
+        bearer.qos.mbr_uplink = 128_000;
+        bearer.qos.mbr_downlink = 256_000;
+        bearer.qos.gbr_uplink = 64_000;
+        bearer.qos.gbr_downlink = 1;
+        let sent = |msg: Vec<u8>| {
+            let mut bytes = bytes::Bytes::from(msg);
+            let decoded = nextgcore_gtp::v2::Gtp2Message::decode(&mut bytes).expect("decode");
+            let q = decoded
+                .bearer_context(0)
+                .expect("decodes")
+                .expect("a bearer context")
+                .bearer_qos()
+                .expect("decodes")
+                .expect("a Bearer QoS");
+            (q.mbr_ul, q.mbr_dl, q.gbr_ul, q.gbr_dl)
+        };
+        let expected = (128, 256, 64, 1);
+        assert_eq!(
+            sent(build_create_session_response(
+                &sess,
+                std::slice::from_ref(&bearer),
+                Some(Ipv4Addr::new(10, 10, 0, 66)),
+                None,
+                None,
+                None,
+                None,
+                false,
+                true,
+            )),
+            expected,
+            "Create Session Response"
+        );
+        let tft = [0x21, 0x31, 0x10, 0x02, 0x30, 0x11];
+        assert_eq!(
+            sent(build_create_bearer_request(&sess, &bearer, 5, &tft, None)),
+            expected,
+            "Create Bearer Request"
+        );
+        assert_eq!(
+            sent(build_update_bearer_request(
+                &sess, &bearer, None, None, true
+            )),
+            expected,
+            "Update Bearer Request"
+        );
+
+        bearer.qos.mbr_downlink = u64::MAX;
+        let q = BearerQos::from_qos(&bearer.qos);
+        assert_eq!(q.dl_mbr, 0xFF_FFFF_FFFF, "capped at the 5-octet field");
+        assert_eq!(
+            BearerQos::new(9, 1).to_qos().mbr_uplink,
+            0,
+            "zero stays zero"
+        );
+        let back = BearerQos {
+            ul_gbr: 64,
+            ..BearerQos::new(1, 1)
+        }
+        .to_qos();
+        assert_eq!(back.gbr_uplink, 64_000, "kbit/s received, bit/s stored");
     }
 
     /// #1113 review, TS 29.274 §8.22: octet 5 is V4 (bit 8), V6 (bit 7) and the

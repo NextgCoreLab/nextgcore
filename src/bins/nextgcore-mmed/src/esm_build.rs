@@ -265,86 +265,57 @@ pub enum CreateAction {
 // EPS QoS Building
 // ============================================================================
 
-/// Build EPS QoS IE
+/// Build the EPS quality of service IE value (TS 24.301 §9.9.4.3).
+///
+/// The rates are the bearer's, in **bit/s**, as `MmeBearer::qos` holds them (the S11
+/// Bearer QoS is parsed into bit/s). The IE codes kbit/s (TS 24.008 Table 10.5.156), so
+/// they are converted here; before #641 the bit/s values were coded as if they were
+/// kbit/s, so a 64 kbit/s GBR went out as the 8640 kbit/s ceiling. The rate octets are
+/// present for a GBR QCI only (TS 23.203 Table 6.1.7), with the extended octets when a
+/// rate exceeds 8640 kbit/s.
 pub fn eps_qos_build(qci: u8, mbr_dl: u64, mbr_ul: u64, gbr_dl: u64, gbr_ul: u64) -> Vec<u8> {
     let mut buf = NasBuffer::new();
-
-    // QCI
     buf.write_u8(qci);
-
-    // Check if GBR bearer (QCI 1-4)
-    let is_gbr = (1..=4).contains(&qci);
-
+    let is_gbr = matches!(qci, 1..=4 | 65..=67 | 71..=76);
     if is_gbr {
-        // MBR for uplink
-        buf.write_u8(encode_bitrate(mbr_ul));
-        // MBR for downlink
-        buf.write_u8(encode_bitrate(mbr_dl));
-        // GBR for uplink
-        buf.write_u8(encode_bitrate(gbr_ul));
-        // GBR for downlink
-        buf.write_u8(encode_bitrate(gbr_dl));
+        let kbps = |bps: u64| bps.div_ceil(1000);
+        let rates = [kbps(mbr_ul), kbps(mbr_dl), kbps(gbr_ul), kbps(gbr_dl)];
+        for r in rates {
+            buf.write_u8(encode_bitrate(r));
+        }
+        if rates.iter().any(|&r| r > 8640) {
+            for r in rates {
+                buf.write_u8(encode_bitrate_ext(r));
+            }
+        }
     }
-
-    // Extended values if needed
-    if (mbr_ul > 8640000 || mbr_dl > 8640000 || gbr_ul > 8640000 || gbr_dl > 8640000) && is_gbr {
-        buf.write_u8(encode_bitrate_ext(mbr_ul));
-        buf.write_u8(encode_bitrate_ext(mbr_dl));
-        buf.write_u8(encode_bitrate_ext(gbr_ul));
-        buf.write_u8(encode_bitrate_ext(gbr_dl));
-    }
-
     buf.into_vec()
 }
 
-/// Encode bitrate value (3GPP TS 24.301 9.9.4.3)
+/// A bit rate octet (TS 24.008 Table 10.5.156): 1-63 kbit/s in 1 kbit/s steps,
+/// 64-568 in 8, 576-8640 in 64, rounded up; 0 kbit/s is 0xFF, and anything above 8640
+/// is 0xFE with the rest in the extended octet.
 fn encode_bitrate(kbps: u64) -> u8 {
-    if kbps == 0 {
-        return 0xff; // 0 kbps
+    match kbps {
+        0 => 0xff,
+        1..=63 => kbps as u8,
+        64..=568 => (0x40 + (kbps - 64).div_ceil(8)) as u8,
+        569..=8640 => (0x80 + kbps.saturating_sub(576).div_ceil(64)) as u8,
+        _ => 0xfe,
     }
-
-    // 1-63: value * 1 kbps
-    if kbps <= 63 {
-        return kbps as u8;
-    }
-
-    // 64-127: 64 + (value - 64) * 8 kbps
-    if kbps <= 568 {
-        return (64 + (kbps - 64) / 8) as u8;
-    }
-
-    // 128-254: 576 + (value - 128) * 64 kbps
-    if kbps <= 8640 {
-        return (128 + (kbps - 576) / 64) as u8;
-    }
-
-    // Maximum value
-    0xfe
 }
 
-/// Encode extended bitrate value (3GPP TS 24.301 9.9.4.3)
+/// An extended bit rate octet (TS 24.008 Table 10.5.156): 0 when the base octet says
+/// it all; 8700-16000 kbit/s in 100 kbit/s steps, 17-128 Mbit/s in 1, 130-256 Mbit/s
+/// in 2, rounded up and capped at 256 Mbit/s.
 fn encode_bitrate_ext(kbps: u64) -> u8 {
-    if kbps <= 8640 {
-        return 0;
+    match kbps {
+        0..=8640 => 0,
+        8641..=16000 => kbps.saturating_sub(8600).div_ceil(100) as u8,
+        16001..=128_000 => (0x4a + (kbps - 16000).div_ceil(1000)) as u8,
+        128_001..=256_000 => (0xba + (kbps - 128_000).div_ceil(2000)) as u8,
+        _ => 0xfa,
     }
-
-    // 1-74: 8600 + value * 100 kbps
-    if kbps <= 16000 {
-        return ((kbps - 8600) / 100) as u8;
-    }
-
-    // 75-186: 16000 + (value - 74) * 1000 kbps
-    if kbps <= 128000 {
-        return (74 + (kbps - 16000) / 1000) as u8;
-    }
-
-    // 187-250: 128000 + (value - 186) * 2000 kbps
-    if kbps <= 256000 {
-        return (186 + (kbps - 128000) / 2000) as u8;
-    }
-
-    // Maximum
-    0xfa
 }
 
 // ============================================================================
@@ -647,15 +618,19 @@ fn get_pdn_type_restriction_cause(sess: &MmeSess) -> Option<EsmCause> {
 }
 
 /// Build activate dedicated EPS bearer context request message (with full parameters)
+///
+/// `pti` is the UE's PTI when the activation answers its BEARER RESOURCE ALLOCATION
+/// REQUEST (TS 24.301 §6.4.2.2), else [`PTI_UNASSIGNED`] (network-initiated).
 pub fn build_activate_dedicated_bearer_context_request_with_params(
     bearer: &MmeBearer,
     linked_ebi: u8,
+    pti: u8,
 ) -> Vec<u8> {
     let mut buf = NasBuffer::new();
 
     // ESM header
     buf.write_u8(esm_header_octet(bearer.ebi)); // octet 1: EBI | PD (TS 24.301 §9.3.1)
-    buf.write_u8(PTI_UNASSIGNED); // PTI is unassigned for dedicated bearer
+    buf.write_u8(pti);
     buf.write_u8(EsmMessageType::ActivateDedicatedEpsBearerContextRequest as u8);
 
     // Linked EPS bearer identity (4 bits) + spare (4 bits)
@@ -684,7 +659,7 @@ pub fn build_activate_dedicated_bearer_context_request_with_params(
 /// Build activate dedicated bearer context request (simplified - for nas_path.rs)
 pub fn build_activate_dedicated_bearer_context_request(bearer: &MmeBearer) -> Vec<u8> {
     // Use default linked EBI (5 for default bearer)
-    build_activate_dedicated_bearer_context_request_with_params(bearer, 5)
+    build_activate_dedicated_bearer_context_request_with_params(bearer, 5, PTI_UNASSIGNED)
 }
 
 /// Build modify EPS bearer context request message (with full parameters)
@@ -1003,10 +978,31 @@ mod tests {
         assert_eq!(qos.len(), 1);
         assert_eq!(qos[0], 9);
 
-        // GBR bearer (QCI 1)
-        let qos = eps_qos_build(1, 64, 64, 32, 32);
-        assert_eq!(qos.len(), 5);
-        assert_eq!(qos[0], 1); // QCI
+        // GBR bearer (QCI 1), rates in bit/s: 64 kbit/s MBR, 32 kbit/s GBR.
+        let qos = eps_qos_build(1, 64_000, 64_000, 32_000, 32_000);
+        assert_eq!(qos, vec![1, 0x40, 0x40, 0x20, 0x20]);
+    }
+
+    /// #641: the TS 24.008 Table 10.5.156 boundaries, rounded up, and the 569-575 kbit/s
+    /// range that underflowed.
+    #[test]
+    fn eps_qos_bit_rates_follow_ts_24_008_table_10_5_156() {
+        assert_eq!(encode_bitrate(0), 0xff);
+        assert_eq!(encode_bitrate(63), 63);
+        assert_eq!(encode_bitrate(64), 0x40);
+        assert_eq!(encode_bitrate(568), 0x7f);
+        assert_eq!(encode_bitrate(570), 0x80, "rounded up to 576");
+        assert_eq!(encode_bitrate(576), 0x80);
+        assert_eq!(encode_bitrate(8640), 0xfe);
+        assert_eq!(encode_bitrate_ext(8640), 0);
+        assert_eq!(encode_bitrate_ext(8700), 0x01);
+        assert_eq!(encode_bitrate_ext(16000), 0x4a);
+        assert_eq!(encode_bitrate_ext(17000), 0x4b);
+        assert_eq!(encode_bitrate_ext(128_000), 0xba);
+        assert_eq!(encode_bitrate_ext(256_000), 0xfa);
+        // 10 Mbit/s MBR on a GBR bearer: base octets 0xFE, extended 8600 + 14 * 100.
+        let qos = eps_qos_build(1, 10_000_000, 10_000_000, 64_000, 64_000);
+        assert_eq!(qos, vec![1, 0xfe, 0xfe, 0x40, 0x40, 14, 14, 0, 0]);
     }
 
     #[test]
