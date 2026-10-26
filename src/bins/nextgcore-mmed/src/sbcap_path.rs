@@ -629,9 +629,11 @@ mod tests {
                 let before = counter.load(Ordering::Relaxed);
                 let mut clients = Vec::new();
                 for _ in 0..n {
+                    // The refused one may see its ABORT before `connect` returns
+                    // (ECONNREFUSED on a slow host): that is the refusal too.
                     clients.push(
                         tokio::task::spawn_blocking(move || {
-                            nextgcore_sctp::KernelSctpSocket::client(bound, None).unwrap()
+                            nextgcore_sctp::KernelSctpSocket::client(bound, None).ok()
                         })
                         .await
                         .unwrap(),
@@ -639,11 +641,16 @@ mod tests {
                     drive(&mut server, |_| false).await;
                 }
                 assert_eq!(counter.load(Ordering::Relaxed), before + 1, "{cbc}");
-                let refused = clients.pop().unwrap();
-                let got = tokio::task::spawn_blocking(move || recv(&refused))
-                    .await
-                    .unwrap();
-                assert!(got.is_none(), "the refused association is gone ({cbc})");
+                if let Some(refused) = clients.pop().unwrap() {
+                    let got = tokio::task::spawn_blocking(move || recv(&refused))
+                        .await
+                        .unwrap();
+                    assert!(got.is_none(), "the refused association is gone ({cbc})");
+                }
+                assert!(
+                    clients.iter().all(Option::is_some),
+                    "the admitted ones connected"
+                );
                 assert_eq!(server.num_associations(), clients.len());
                 server.stop();
             }
