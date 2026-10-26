@@ -36,6 +36,8 @@ pub mod s1ap_path;
 pub mod s6a_handler;
 pub mod sbc_handler;
 pub mod sbc_message;
+pub mod sbcap_handler;
+pub mod sbcap_path;
 pub mod sgsap_build;
 pub mod sgsap_handler;
 pub mod sm;
@@ -82,9 +84,20 @@ pub struct MmeApp {
     mme_fsm: sm::MmeFsm,
     /// S1-MME transport (issue #42). `None` until [`MmeApp::init`] binds it.
     s1ap: Option<s1ap_path::S1apServer>,
+    /// SBc-AP toward the CBC (#1071); `None` unless `mme.sbcap` is configured.
+    sbcap: Option<sbcap_path::SbcapServer>,
     /// Queued S6a requests from the synchronous NAS dispatch. `None` until
     /// [`MmeApp::init`] installs the queue.
     s6a_requests: Option<tokio::sync::mpsc::UnboundedReceiver<fd_path::PendingS6aRequest>>,
+}
+
+/// One step of the SBc-AP transport, or never when it is not configured (so a
+/// `select!` arm on it stays idle).
+async fn poll_sbcap(sbcap: Option<&mut sbcap_path::SbcapServer>) {
+    match sbcap {
+        Some(s) => s.poll_once().await,
+        None => std::future::pending().await,
+    }
 }
 
 impl MmeApp {
@@ -95,6 +108,7 @@ impl MmeApp {
             gtp_state: gtp_path::GtpPathState::default(),
             mme_fsm: sm::MmeFsm::new(),
             s1ap: None,
+            sbcap: None,
             s6a_requests: None,
         }
     }
@@ -188,6 +202,18 @@ impl MmeApp {
             log::info!("S1-MME interface ready on {addr}");
         }
         self.s1ap = Some(s1ap);
+
+        // SBc-AP (#1071): only when configured. No default address exists, so an
+        // unconfigured MME opens no socket for it.
+        if let Some(config) = ctx.sbcap.clone() {
+            let sbcap = sbcap_path::SbcapServer::bind(config, ctx)
+                .await
+                .map_err(|e| anyhow::anyhow!("SBc-AP transport initialization failed: {e}"))?;
+            if let Some(addr) = sbcap.local_addr() {
+                log::info!("SBc-AP interface ready on {addr}");
+            }
+            self.sbcap = Some(sbcap);
+        }
 
         log::info!("MME initialized successfully");
         Ok(())
@@ -286,6 +312,7 @@ impl MmeApp {
                     // cancel-safe, so losing this race consumes no message.
                     tokio::select! {
                         () = s1ap.poll_once() => {}
+                        () = poll_sbcap(self.sbcap.as_mut()) => {}
                         () = tokio::time::sleep(SHUTDOWN_CHECK) => {}
                     }
                 }
@@ -339,6 +366,10 @@ impl MmeApp {
         if let Some(mut s1ap) = self.s1ap.take() {
             s1ap.stop();
             log::debug!("S1-MME transport closed");
+        }
+        if let Some(mut sbcap) = self.sbcap.take() {
+            sbcap.stop();
+            log::debug!("SBc-AP transport closed");
         }
 
         // Close Diameter S6a interface
@@ -487,6 +518,7 @@ async fn main() -> Result<()> {
                 handover_switch::render_metrics()
                     + &s1ap_handler::render_metrics()
                     + &n26_path::render_metrics()
+                    + &sbcap_path::render_metrics()
                     + &s11_handler::render_metrics(),
                 nextgcore_diameter::session::reopen_discards()
             )

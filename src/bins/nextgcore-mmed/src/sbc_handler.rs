@@ -9,7 +9,6 @@
 //! Reference: 3GPP TS 29.168 (SBc-AP), 3GPP TS 23.041 (CBS)
 
 use log::{debug, error, info, warn};
-use std::sync::Arc;
 
 use crate::context::{EpsTai, MmeContext, MmeEnb};
 use crate::s1ap_build;
@@ -35,10 +34,10 @@ use crate::sbc_message::{SbcCause, SbcPwsData, StopWarningResponse, WriteReplace
 /// order tests run in decides who gets it. This is a safety-critical path
 /// (see #167), so it is worth one parameter to be able to assert that the CBC is
 /// told success exactly when a real PDU went to a real eNB.
-type PduSender<'a> = &'a mut dyn FnMut(u64, Vec<u8>) -> bool;
+pub(crate) type PduSender<'a> = &'a mut dyn FnMut(u64, Vec<u8>) -> bool;
 
 /// The production sender: hand the PDU to the S1AP transport for that eNB.
-fn transport_sender(enb_id: u64, pdu: Vec<u8>) -> bool {
+pub(crate) fn transport_sender(enb_id: u64, pdu: Vec<u8>) -> bool {
     s1ap_path::s1ap_send_pdu(enb_id, pdu)
 }
 
@@ -55,14 +54,14 @@ fn transport_sender(enb_id: u64, pdu: Vec<u8>) -> bool {
 /// * `Ok(WriteReplaceWarningResponse)` - Response to send back to CBC
 /// * `Err(SbcCause)` - Error cause if processing failed
 pub fn handle_write_replace_warning_request(
-    mme_ctx: &Arc<MmeContext>,
+    mme_ctx: &MmeContext,
     sbc_pws: &SbcPwsData,
 ) -> Result<WriteReplaceWarningResponse, SbcCause> {
     handle_write_replace_warning_request_with(mme_ctx, sbc_pws, &mut transport_sender)
 }
 
-fn handle_write_replace_warning_request_with(
-    mme_ctx: &Arc<MmeContext>,
+pub(crate) fn handle_write_replace_warning_request_with(
+    mme_ctx: &MmeContext,
     sbc_pws: &SbcPwsData,
     send: PduSender,
 ) -> Result<WriteReplaceWarningResponse, SbcCause> {
@@ -85,7 +84,11 @@ fn handle_write_replace_warning_request_with(
 
     // Iterate through all eNBs
     for enb in enb_pool.values() {
-        let should_send = if sbc_pws.no_of_tai > 0 {
+        let should_send = if let Some((plmn, id)) = &sbc_pws.global_enb {
+            // TS 29.168 §4.3.3.2: "only towards the eNB identified by the Global
+            // eNB ID" (the PWS reload of TS 23.007 §15A.1.2, #1071).
+            is_named_enb(enb, plmn, *id)
+        } else if sbc_pws.no_of_tai > 0 {
             // Check if any of the eNB's supported TAs match the warning area
             check_tai_match(enb, &sbc_pws.tai)
         } else {
@@ -153,14 +156,14 @@ fn handle_write_replace_warning_request_with(
 /// * `Ok(StopWarningResponse)` - Response to send back to CBC
 /// * `Err(SbcCause)` - Error cause if processing failed
 pub fn handle_stop_warning_request(
-    mme_ctx: &Arc<MmeContext>,
+    mme_ctx: &MmeContext,
     sbc_pws: &SbcPwsData,
 ) -> Result<StopWarningResponse, SbcCause> {
     handle_stop_warning_request_with(mme_ctx, sbc_pws, &mut transport_sender)
 }
 
-fn handle_stop_warning_request_with(
-    mme_ctx: &Arc<MmeContext>,
+pub(crate) fn handle_stop_warning_request_with(
+    mme_ctx: &MmeContext,
     sbc_pws: &SbcPwsData,
     send: PduSender,
 ) -> Result<StopWarningResponse, SbcCause> {
@@ -304,6 +307,15 @@ fn handle_pws_restart_indication_with(
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+/// Whether `enb` is the eNB a Global eNB ID names: its PLMN, its ENB-ID
+/// alternative and its value (as `MmeContext::enb_find_by_global_enb_id`).
+fn is_named_enb(enb: &MmeEnb, plmn: &crate::context::PlmnId, id: nextgcore_s1ap::EnbId) -> bool {
+    enb.enb_id_presence
+        && enb.enb_id_bits == id.bit_len()
+        && enb.enb_id == id.value()
+        && enb.plmn_id == *plmn
+}
 
 /// Check if an eNB's served TAIs match any TAI in the warning area
 fn check_tai_match(enb: &MmeEnb, tai_list: &[EpsTai]) -> bool {
@@ -474,6 +486,7 @@ mod tests {
     use super::*;
     use crate::context::PlmnId;
     use crate::sbc_message::{EtwsWarningType, DCS_GSM7, MSG_ID_ETWS_EARTHQUAKE};
+    use std::sync::Arc;
 
     #[test]
     fn test_broadcast_cause_only_claims_success_when_an_enb_took_it() {

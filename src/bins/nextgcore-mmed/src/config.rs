@@ -75,6 +75,25 @@ struct S1apYaml {
     server: Option<Vec<ServerYaml>>,
 }
 
+/// `mme.sbcap`: SBc-AP toward the CBC (#1071, TS 29.168 §4.1.3).
+///
+/// ```yaml
+/// mme:
+///   sbcap:
+///     server:
+///       - address: 10.10.0.5     # required: no default, never a wildcard default
+///         port: 29168            # the default
+///     cbc:
+///       - address: 10.10.0.9     # the CBCs allowed to associate
+///     max_associations: 4        # the default
+/// ```
+#[derive(Debug, Default, Deserialize)]
+struct SbcapYaml {
+    server: Option<Vec<ServerYaml>>,
+    cbc: Option<Vec<ServerYaml>>,
+    max_associations: Option<usize>,
+}
+
 /// `mme.gtpc`: the S11 interface (#51).
 ///
 /// `server` is what the MME binds; `client.sgwc` is the Serving GW it sends a
@@ -147,6 +166,7 @@ struct MmeSection {
     #[serde(rename = "freeDiameter")]
     free_diameter: Option<String>,
     s1ap: Option<S1apYaml>,
+    sbcap: Option<SbcapYaml>,
     gtpc: Option<GtpcYaml>,
     n26: Option<N26Yaml>,
     gummei: Option<Vec<GummeiYaml>>,
@@ -364,6 +384,10 @@ fn apply(ctx: &mut MmeContext, mme: MmeSection) {
         }
     }
 
+    if let Some(sbcap) = mme.sbcap {
+        ctx.sbcap = sbcap_config(sbcap);
+    }
+
     // Served GUMMEI. Without at least one of these the MME rejects every S1
     // Setup (TS 36.413 §8.7.3.4), which is the headline defect in #157.
     for entry in mme.gummei.unwrap_or_default() {
@@ -516,6 +540,63 @@ fn scalar_digits(value: &serde_yaml::Value) -> Option<String> {
 }
 
 /// `<host>` or `<host>:<port>` to a socket address, defaulting the port.
+/// Resolve `mme.sbcap` (#1071). `None` (no listener) unless one server address
+/// and at least one CBC parse: an SBc-AP listener nobody may use is not bound.
+fn sbcap_config(y: SbcapYaml) -> Option<crate::sbcap_path::SbcapConfig> {
+    let servers: Vec<std::net::SocketAddr> = y
+        .server
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|s| {
+            let address = s.address?;
+            let parsed =
+                parse_socket_addr(&address, s.port.unwrap_or(crate::sbcap_path::SBCAP_PORT));
+            if parsed.is_none() {
+                log::warn!("Ignoring unparsable SBc-AP server address '{address}'");
+            }
+            parsed
+        })
+        .collect();
+    let Some(server) = servers.first().copied() else {
+        log::error!("mme.sbcap has no server address: SBc-AP is NOT bound (there is no default)");
+        return None;
+    };
+    if servers.len() > 1 {
+        log::warn!(
+            "{} SBc-AP server addresses configured; only the first ({server}) is bound",
+            servers.len()
+        );
+    }
+    let cbc: Vec<std::net::IpAddr> = y
+        .cbc
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|c| {
+            let address = c.address?;
+            let parsed = address.parse::<std::net::IpAddr>().ok();
+            if parsed.is_none() {
+                log::warn!("Ignoring unparsable CBC address '{address}'");
+            }
+            parsed
+        })
+        .collect();
+    if cbc.is_empty() {
+        log::error!(
+            "mme.sbcap names no CBC (mme.sbcap.cbc): every association would be aborted, so              SBc-AP is NOT bound"
+        );
+        return None;
+    }
+    let max_associations = y
+        .max_associations
+        .unwrap_or(crate::sbcap_path::DEFAULT_MAX_ASSOCIATIONS)
+        .max(1);
+    Some(crate::sbcap_path::SbcapConfig {
+        server,
+        cbc,
+        max_associations,
+    })
+}
+
 fn parse_socket_addr(address: &str, port: u16) -> Option<std::net::SocketAddr> {
     if let Ok(addr) = address.parse::<std::net::SocketAddr>() {
         return Some(addr);
@@ -724,6 +805,53 @@ mod tests {
         );
         assert!(load_config(&mut quoted, path.to_str().unwrap()));
         assert_eq!(quoted.served_gummei[0].plmn_id[0].to_bcd(), "001010");
+    }
+
+    /// #1071: SBc-AP is off unless configured, binds only the configured address
+    /// (port 29168 by default), and is not bound without a CBC to allow.
+    #[test]
+    fn sbcap_is_off_by_default_and_needs_a_server_and_a_cbc() {
+        let load = |name: &str, yaml: &str| {
+            let mut ctx = MmeContext::new();
+            let path = write_temp(name, yaml);
+            assert!(load_config(&mut ctx, path.to_str().unwrap()));
+            ctx.sbcap
+        };
+        assert_eq!(
+            load("nextgcore-mmed-no-sbcap.yaml", "mme:\n  mme_name: m\n"),
+            None
+        );
+        assert_eq!(
+            load(
+                "nextgcore-mmed-sbcap-no-cbc.yaml",
+                "mme:\n  sbcap:\n    server:\n      - address: 10.10.0.5\n"
+            ),
+            None,
+            "nobody may associate: not bound"
+        );
+        assert_eq!(
+            load(
+                "nextgcore-mmed-sbcap-no-server.yaml",
+                "mme:\n  sbcap:\n    cbc:\n      - address: 10.10.0.9\n"
+            ),
+            None,
+            "no default address"
+        );
+        let c = load(
+            "nextgcore-mmed-sbcap.yaml",
+            "mme:\n  sbcap:\n    server:\n      - address: 10.10.0.5\n    cbc:\n      - \
+             address: 10.10.0.9\n      - address: bogus\n",
+        )
+        .expect("configured");
+        assert_eq!(c.server, "10.10.0.5:29168".parse().unwrap());
+        assert_eq!(
+            c.cbc,
+            vec!["10.10.0.9".parse::<std::net::IpAddr>().unwrap()]
+        );
+        assert_eq!(
+            c.max_associations,
+            crate::sbcap_path::DEFAULT_MAX_ASSOCIATIONS
+        );
     }
 
     #[test]

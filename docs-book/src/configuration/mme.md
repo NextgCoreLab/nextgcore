@@ -1,6 +1,6 @@
 # MME Configuration
 
-The MME (Mobility Management Entity, `nextgcore-mmed`) is the 4G/EPS control-plane anchor of the dual 5G+4G core. It serves S1-MME toward eNBs (S1AP encoded and decoded by `nextgcore-s1ap-gen`, the codec generated from the TS 36.413 ASN.1; the hand-written S1AP codec was removed, #514), NAS EMM/ESM toward UEs (TS 24.301), S11 GTPv2-C toward the SGW-C, S6a Diameter toward the HSS, and optionally N26 GTPv2-C toward an AMF for EPS↔5GS interworking. The crate also carries SGsAP message handling and the SBc-AP warning data structures and handlers; it has no SBc-AP transport (see [Not supported](#not-supported)).
+The MME (Mobility Management Entity, `nextgcore-mmed`) is the 4G/EPS control-plane anchor of the dual 5G+4G core. It serves S1-MME toward eNBs (S1AP encoded and decoded by `nextgcore-s1ap-gen`, the codec generated from the TS 36.413 ASN.1; the hand-written S1AP codec was removed, #514), NAS EMM/ESM toward UEs (TS 24.301), S11 GTPv2-C toward the SGW-C, S6a Diameter toward the HSS, and optionally N26 GTPv2-C toward an AMF for EPS↔5GS interworking. The crate also carries SGsAP message handling, and SBc-AP toward a Cell Broadcast Centre when configured (see [SBc-AP](#sbc-ap-cbc-interface)).
 
 Configuration comes from a YAML file (default `/etc/nextgcore/mme.yaml`, `-c/--config`), the freeDiameter `.conf` that file names, a few environment variables, and four CLI flags. A missing or malformed file, or one with no `mme:` section, logs a warning and leaves the built-in defaults in place (`src/bins/nextgcore-mmed/src/config.rs`).
 
@@ -116,10 +116,42 @@ S1-MME runs **only** over native Linux kernel SCTP: mmed offers no userspace (sc
 
 `RUST_LOG` overrides `-l/--log-level` when set (the `RUST_LOG: info` in `docker-compose-epc.yml` applies).
 
+## SBc-AP (CBC interface)
+
+SBc-AP (TS 29.168) carries ETWS/CMAS warnings from a Cell Broadcast Centre. The CBC establishes the SCTP association (TS 29.168 §4.1.3: port 29168, PPID 24), so the MME listens. The listener needs the `kernel-sctp` build.
+
+**Off by default.** Without an `mme.sbcap` block no socket is opened. There is no default bind address, so you must configure the MME's own address on the CBC network:
+
+```yaml
+mme:
+  sbcap:
+    server:
+      - address: 10.10.0.5   # required; only this address is bound
+        port: 29168          # the default
+    cbc:
+      - address: 10.10.0.9   # the CBCs allowed to associate
+    max_associations: 4      # the default
+```
+
+- Only the first `server` address is bound. A wildcard (`0.0.0.0`, `::`) is accepted but logged as a warning.
+- A block without a parsable `server` or without any `cbc` binds nothing, and logs an error.
+- Any association from an address not in `cbc`, or beyond `max_associations`, is answered with an SCTP ABORT at accept. It is counted in `mme_sbcap_refused_associations_total{reason="peer"|"limit"}` and logged, with the log rate-limited.
+- A message longer than 64 KiB is dropped before decode and counted in `mme_sbcap_oversized_messages_total`. `mme_sbcap_received_total` counts the PDUs handled.
+
+**Procedures:**
+- **Write-Replace Warning** is sent to the eNBs that serve the List of TAIs, to all eNBs if the list is absent, or only to the eNB named by a Global eNB ID. The CBC's Warning Area List (cells, TAIs or emergency areas) is forwarded as the eNB's Warning Area List.
+- **Stop Warning** works the same way. Stop-All maps to Kill-all-Warning-Messages.
+- Both are answered at once:
+  - "Message accepted", with the Unknown Tracking Area List, when an eNB took the request;
+  - "Tracking area not valid" when every TAI is unknown;
+  - otherwise the failure cause.
+- An undecodable PDU, a request without its identifiers, or a message only the MME sends gets an ERROR INDICATION.
+
+**Security.** SBc-AP has no application-layer authentication. Run it on a private network, or under TS 33.210 network domain security (NDS/IP, IPsec), as for S1-MME. The `cbc` allowlist keeps unconfigured peers off; it is not authentication. The Helm chart, the k8s manifests and the compose files publish no port for it (no `ports:` or NodePort for 29168).
+
 ## Not supported
 
-- **SBc-AP: no CBC interface (#1071).** mmed does not listen for, or connect to, a Cell Broadcast Centre. TS 29.168 SBc-AP runs over SCTP on port 29168 (PPID 24), and mmed has neither that transport nor an SBc-AP codec. As a result:
-  - ETWS and CMAS warnings (TS 23.041) cannot be delivered. No Write-Replace Warning or Stop Warning arrives from a CBC, so no WRITE-REPLACE WARNING REQUEST or KILL REQUEST is sent to an eNB. The `sbc_handler` procedures exist, but nothing calls them in production.
-  - An eNB's **PWS RESTART INDICATION** (TS 36.413 §8.12.3) is decoded and validated against the sender's own Global eNB ID. It is counted in `mme_s1ap_pws_restart_indications_total` and logged, but not propagated to a CBC. TS 23.007 §15A.1.2 has the CBC reload the restarted cells' warnings; mmed does not replay its own copy.
-  - An eNB's **PWS FAILURE INDICATION** (TS 36.413 §8.12.4) is handled in the same way. It is decoded, validated against the sender, counted in `mme_s1ap_pws_failure_indications_total`, and logged with its count of failed cells; the cell list itself is logged at debug level. TS 36.413 has the MME act on it as TS 23.041 defines, which means reporting it on to the CBC. mmed does not do that.
-  - Toward a CBC, mmed sends no SBc-AP PWS Restart Indication, PWS Failure Indication, Write-Replace Warning Indication or Stop Warning Indication.
+- **SBc-AP toward the CBC is partial (#1071).** Write-Replace Warning and Stop Warning are served (see [SBc-AP](#sbc-ap-cbc-interface)). Still missing:
+  - An eNB's **PWS RESTART INDICATION** (TS 36.413 §8.12.3) and **PWS FAILURE INDICATION** (§8.12.4) are decoded, validated against the sender's Global eNB ID, counted (`mme_s1ap_pws_restart_indications_total`, `mme_s1ap_pws_failure_indications_total`) and logged, but not yet relayed to the CBC (TS 29.168 §4.3.3E / §4.3.3F, TS 23.007 §15A.1.2).
+  - Write-Replace Warning Indication and Stop Warning Indication (TS 29.168 §4.3.3C / §4.3.3D) are not sent; the CBC's "send indication" flags are accepted and not acted on.
+  - The Extended Repetition Period is clamped to the S1AP Repetition Period range (4095 s).

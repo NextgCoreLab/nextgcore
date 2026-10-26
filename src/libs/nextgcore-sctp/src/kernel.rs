@@ -306,6 +306,31 @@ impl KernelSctpSocket {
         Ok((status.sstat_instrms, status.sstat_outstrms))
     }
 
+    /// Make closing this socket abort its association (#1071): `SO_LINGER` on with a
+    /// zero linger time, so `close(2)` sends an SCTP ABORT rather than starting the
+    /// SHUTDOWN exchange (RFC 6458 §8.1.4; RFC 9260 §9.1). `SCTP_ABORT` in
+    /// `sctp_sendmsg` is refused on a one-to-one socket (EINVAL), so this is the
+    /// way to abort one.
+    pub fn set_abort_on_close(&self) -> Result<()> {
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let result = unsafe {
+            libc::setsockopt(
+                self.fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                &linger as *const libc::linger as *const c_void,
+                mem::size_of::<libc::linger>() as socklen_t,
+            )
+        };
+        if result < 0 {
+            return Err(SctpError::SockoptFailed(io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
     /// Shut the association down gracefully (`shutdown(2)` with `SHUT_RDWR`: on a
     /// one-to-one SCTP socket this starts the SHUTDOWN exchange, RFC 9260 §9.2,
     /// RFC 6458 §4.1.7). The read loop then sees end-of-file and reports the

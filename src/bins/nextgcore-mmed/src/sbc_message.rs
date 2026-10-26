@@ -157,6 +157,22 @@ pub struct SbcPwsData {
 
     /// ETWS specific: Warning Type (only for ETWS)
     pub warning_type: Option<EtwsWarningType>,
+
+    /// The CBC's Warning Area List (TS 29.168 Table 4.3.4.2.1-1): cells, TAIs or
+    /// Emergency Area IDs. Forwarded to the eNB as its Warning Area List (TS 36.413
+    /// §9.2.1.46); when absent, the List of TAIs decides the eNB's area (#1071).
+    pub warning_area: Option<nextgcore_s1ap::WarningAreaList>,
+
+    /// Warning Security Information (ETWS, 50 octets), forwarded to the eNB.
+    pub warning_security_info: Option<[u8; 50]>,
+
+    /// The CBC's Global eNB ID (TS 29.168 §4.3.3.2, TS 23.007 §15A.1.2): the
+    /// request goes only to that eNB.
+    pub global_enb: Option<(crate::context::PlmnId, nextgcore_s1ap::EnbId)>,
+
+    /// Stop-All Indicator (TS 29.168 §4.3.4.3.8): the KILL REQUEST says
+    /// Kill-all-Warning-Messages.
+    pub stop_all: bool,
 }
 
 impl SbcPwsData {
@@ -177,6 +193,10 @@ impl SbcPwsData {
             extended_repetition_period: None,
             send_write_replace_warning_indication: false,
             warning_type: None,
+            warning_area: None,
+            warning_security_info: None,
+            global_enb: None,
+            stop_all: false,
         }
     }
 

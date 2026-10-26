@@ -57,6 +57,7 @@ fn protocol_name(ppid: u32) -> &'static str {
     match ppid {
         crate::NGAP_PPID => "NGAP",
         crate::NEXTGCORE_SCTP_S1AP_PPID => "S1AP",
+        crate::NEXTGCORE_SCTP_SBCAP_PPID => "SBc-AP",
         _ => "SCTP",
     }
 }
@@ -81,6 +82,57 @@ struct Assoc {
     remote: SocketAddr,
 }
 
+/// Why [`Admission`] refused an association.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// The peer is not in `allowed_peers`.
+    Peer,
+    /// `max_associations` are up.
+    Limit,
+}
+
+/// Which associations the server accepts (#1071: SBc-AP takes only its configured
+/// CBCs). A refused association is aborted at once (SCTP ABORT, `SO_LINGER` 0) and
+/// never reported as a [`ServerEvent::NewAssociation`]; `on_refused` hears of it.
+#[derive(Clone)]
+pub struct Admission {
+    /// The remote addresses allowed; an IPv4-mapped IPv6 peer is its IPv4 address.
+    pub allowed_peers: Vec<std::net::IpAddr>,
+    /// The most simultaneous associations.
+    pub max_associations: usize,
+    /// Told of each refusal (counters, a rate-limited log).
+    pub on_refused: Arc<dyn Fn(SocketAddr, Refusal) + Send + Sync>,
+}
+
+impl std::fmt::Debug for Admission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Admission")
+            .field("allowed_peers", &self.allowed_peers)
+            .field("max_associations", &self.max_associations)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Admission {
+    /// The decision for `peer` with `live` associations up.
+    pub fn check(&self, peer: std::net::IpAddr, live: usize) -> Option<Refusal> {
+        let peer = match peer {
+            std::net::IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map(std::net::IpAddr::V4)
+                .unwrap_or(std::net::IpAddr::V6(v6)),
+            v4 => v4,
+        };
+        if !self.allowed_peers.contains(&peer) {
+            Some(Refusal::Peer)
+        } else if live >= self.max_associations {
+            Some(Refusal::Limit)
+        } else {
+            None
+        }
+    }
+}
+
 /// Native kernel-SCTP server, used for NGAP (amfd) and S1AP (mmed S1-MME);
 /// the protocol is selected by [`SctpServerConfig::ppid`].
 pub struct KernelSctpServer {
@@ -91,6 +143,7 @@ pub struct KernelSctpServer {
     next_id: Arc<AtomicU64>,
     accept_task: Option<JoinHandle<()>>,
     running: bool,
+    admission: Option<Arc<Admission>>,
 }
 
 impl KernelSctpServer {
@@ -114,6 +167,7 @@ impl KernelSctpServer {
             next_id: Arc::new(AtomicU64::new(1)),
             accept_task: None,
             running: true,
+            admission: None,
         })
     }
 
@@ -127,6 +181,12 @@ impl KernelSctpServer {
         self.associations.lock().unwrap().len()
     }
 
+    /// Accept only what `admission` allows (#1071). Call before
+    /// [`Self::set_event_sender`], which starts accepting.
+    pub fn set_admission(&mut self, admission: Admission) {
+        self.admission = Some(Arc::new(admission));
+    }
+
     /// Install the event sink and start accepting. Associations and their data
     /// are delivered asynchronously through `tx`; the AMF NGAP path drains that
     /// channel on each poll iteration (see [`Self::recv`]).
@@ -136,9 +196,19 @@ impl KernelSctpServer {
         let next_id = Arc::clone(&self.next_id);
         let recv_cap = (self.config.max_message_size as usize).max(NEXTGCORE_MAX_SDU_LEN);
         let ppid = self.config.ppid;
+        let admission = self.admission.clone();
 
         let handle = tokio::spawn(async move {
-            accept_loop(listener, associations, next_id, tx, recv_cap, ppid).await;
+            accept_loop(
+                listener,
+                associations,
+                next_id,
+                tx,
+                recv_cap,
+                ppid,
+                admission,
+            )
+            .await;
         });
         self.accept_task = Some(handle);
     }
@@ -258,6 +328,7 @@ async fn accept_loop(
     tx: mpsc::UnboundedSender<ServerEvent>,
     recv_cap: usize,
     ppid: u32,
+    admission: Option<Arc<Admission>>,
 ) {
     let afd = match AsyncFd::new(FdRef(listener.as_raw_fd())) {
         Ok(afd) => afd,
@@ -284,6 +355,19 @@ async fn accept_loop(
 
         match accepted {
             Ok(Ok((sock, remote))) => {
+                if let Some(adm) = admission.as_deref() {
+                    let live = associations.lock().unwrap().len();
+                    if let Some(refusal) = adm.check(remote.ip(), live) {
+                        // Closed with SO_LINGER 0 right here: an SCTP ABORT, and the
+                        // association never reaches the application.
+                        if let Err(e) = sock.set_abort_on_close() {
+                            log::warn!("Kernel-SCTP: SO_LINGER on a refused association: {e}");
+                        }
+                        drop(sock);
+                        (adm.on_refused)(remote, refusal);
+                        continue;
+                    }
+                }
                 if let Err(e) = sock.set_nonblocking(true) {
                     log::warn!("Kernel-SCTP: failed to set accepted socket non-blocking: {e}");
                 }

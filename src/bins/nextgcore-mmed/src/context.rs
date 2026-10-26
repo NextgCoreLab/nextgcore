@@ -1687,6 +1687,10 @@ pub struct MmeContext {
     /// S1AP IPv6 server addresses
     pub s1ap_list6: Vec<std::net::SocketAddr>,
 
+    /// SBc-AP toward the CBC (#1071, `mme.sbcap`). `None`, the default, binds no
+    /// socket.
+    pub sbcap: Option<crate::sbcap_path::SbcapConfig>,
+
     /// S11 GTP-C bind port (TS 29.274 §4.1: GTPv2-C uses UDP 2123).
     pub gtpc_port: u16,
     /// S11 GTP-C addresses to bind, from `mme.gtpc.server` (#51).
@@ -1916,6 +1920,17 @@ impl MmeContext {
 
     /// Generate a new pool ID
     pub fn next_pool_id(&self) -> u64 {
+        // #1295: a test process holds many contexts (`mme_self()` and the tests'
+        // own), and `s1ap_path`'s test tap is keyed by eNB pool id. Ids drawn from
+        // one process-global counter keep their PDUs apart. One context in
+        // production, so this is test-only.
+        #[cfg(test)]
+        {
+            static TEST_POOL_IDS: AtomicU64 = AtomicU64::new(NEXTGCORE_MIN_POOL_ID);
+            let _ = &self.pool_id_counter;
+            TEST_POOL_IDS.fetch_add(1, Ordering::SeqCst)
+        }
+        #[cfg(not(test))]
         self.pool_id_counter.fetch_add(1, Ordering::SeqCst)
     }
 
