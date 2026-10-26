@@ -13,13 +13,23 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 ## [Unreleased]
 
 ### Changed
-- An IPv6 SBI address goes in square brackets in every URI a daemon builds from it
-  (RFC 3986 §3.2.2). That covers pcfd's apiRoot and callback URIs, the apiRoot or self/callback
-  base of amfd, ausfd, lmfd, nefd, nrfd, nwdafd, smfd, ucmfd, udmd and udrd, seppd's N32f
-  forward URI, and the SBI client's and SCP's base URI and connect address. Before, an IPv6
-  address gave `http://fd00::1:7777/...`, which is not a valid URI (Refs #1277). One shared
-  helper, `nextgcore_sbi::uri_encode::uri_authority`, does it. The bind-address parse has
-  the same defect and is tracked in #1298.
+- An IPv6 SBI address goes in square brackets in the URIs built from it (RFC 3986 §3.2.2):
+  pcfd's apiRoot and callback URIs; the apiRoot or self/callback base of amfd, ausfd, lmfd, nefd,
+  nrfd, nwdafd, smfd, ucmfd, udmd and udrd; seppd's N32f forward URI; and the SBI client's and
+  SCP's base URI and connect address. Before, an IPv6 address gave `http://fd00::1:7777/...`,
+  which is not a valid URI (Refs #1277). The shared helper
+  `nextgcore_sbi::uri_encode::uri_authority` does the bracketing. Its first change missed some
+  URIs; those are covered by the #1298 entry.
+- Every daemon's listen addresses accept an IPv6 address, bracketed or not:
+  - the SBI bind of amfd, ausfd, bsfd, dccfd, easdfd, eesd, lmfd, mbsmfd, nefd, nrfd, nsacfd, nssfd,
+    nwdafd, pcfd, pind, smfd, tsctsf, ucmfd, udmd and udrd;
+  - smfd's PFCP bind, easdfd's DNS/UDP bind, amfd's N26 bind and the metrics servers.
+  Before, `format!("{addr}:{port}")` made `fd00::1:7777`, which is not a socket address, and the
+  daemon failed at startup. Something that is not an IP literal is still refused at startup with
+  an error naming the value, and never replaced by a wildcard. The defaults are unchanged.
+  The remaining unbracketed URIs are bracketed as well: nwdafd's NRF callback, seppd's N32f
+  client URI and local apiRoot, and scpd's forward target URI and its client, OAuth2-client and
+  circuit-breaker keys. An IPv6 producer behind the SCP is now reached (#1298).
 - lmfd reads the LPP NR PRS-RSRP of a Multi-RTT or DL-TDOA measurement (`nr-DL-PRS-RSRP-Result`)
   as `v − 157` dBm, the lower edge of TS 38.133 Table 10.1.24.3.1-1. It read `v − 140`, the
   E-UTRA RSRP offset, which put every PRS-RSRP 16-17 dB too high (#1278).

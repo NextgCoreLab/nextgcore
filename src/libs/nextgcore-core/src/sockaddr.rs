@@ -559,3 +559,84 @@ mod tests {
         assert_eq!(ipsub.family, libc::AF_INET);
     }
 }
+
+/// A listen address given as a host and a port, which is not an IP literal (#1298).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenAddrError(String);
+
+impl std::fmt::Display for ListenAddrError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ListenAddrError {}
+
+/// The socket address to listen on for a configured `host` and `port` (#1298).
+///
+/// `host` must be an IP literal: an IPv4 address, or an IPv6 address with or without
+/// square brackets (`fd00::1` and `[fd00::1]` are the same). Anything else is an error
+/// for the caller to fail on: no name is resolved, and there is no fallback to a
+/// wildcard address, so a bad value never widens what a daemon listens on.
+///
+/// Before, every daemon built `format!("{host}:{port}")` and parsed that, which works
+/// for IPv4 only: `fd00::1:7777` is not a socket address, so an IPv6 address failed
+/// at startup.
+pub fn parse_listen_addr(host: &str, port: u16) -> Result<std::net::SocketAddr, ListenAddrError> {
+    let literal = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    literal
+        .parse::<std::net::IpAddr>()
+        .map(|ip| std::net::SocketAddr::new(ip, port))
+        .map_err(|_| {
+            ListenAddrError(format!(
+                "listen address '{host}' is not an IPv4 or IPv6 address (port {port})"
+            ))
+        })
+}
+
+#[cfg(test)]
+mod tests_parse_listen_addr {
+    use super::parse_listen_addr;
+
+    #[test]
+    fn ipv4_ipv6_and_a_bad_value() {
+        assert_eq!(
+            parse_listen_addr("127.0.0.1", 7777).unwrap().to_string(),
+            "127.0.0.1:7777"
+        );
+        assert_eq!(
+            parse_listen_addr("0.0.0.0", 7777).unwrap().to_string(),
+            "0.0.0.0:7777",
+            "a configured wildcard is kept as it is, not changed"
+        );
+        assert_eq!(
+            parse_listen_addr("fd00::1", 7777).unwrap().to_string(),
+            "[fd00::1]:7777"
+        );
+        assert_eq!(
+            parse_listen_addr("[fd00::1]", 7777).unwrap().to_string(),
+            "[fd00::1]:7777"
+        );
+        assert_eq!(
+            parse_listen_addr("::1", 80).unwrap().to_string(),
+            "[::1]:80"
+        );
+        for bad in [
+            "amf.example.org",
+            "",
+            "300.1.1.1",
+            "10.0.0.1:7777",
+            "[fd00::1",
+            "[10.0.0.1]x",
+        ] {
+            let e = parse_listen_addr(bad, 7777).unwrap_err();
+            assert!(
+                e.to_string().contains("is not an IPv4 or IPv6 address"),
+                "{bad}: {e}"
+            );
+        }
+    }
+}
