@@ -589,9 +589,9 @@ pub fn build_am_policy_update(
     let mut body = serde_json::Map::new();
     body.insert(
         "resourceUri".to_string(),
-        serde_json::json!(format!(
+        serde_json::json!(pcf_resource_uri(&format!(
             "/npcf-am-policy-control/v1/policies/{association_id}"
-        )),
+        ))),
     );
     if !triggers.is_empty() {
         body.insert("triggers".to_string(), serde_json::json!(triggers));
@@ -619,7 +619,9 @@ pub fn build_ue_policy_update(pol_asso_id: &str, triggers: &[String]) -> serde_j
     let mut body = serde_json::Map::new();
     body.insert(
         "resourceUri".to_string(),
-        serde_json::json!(format!("/npcf-ue-policy-control/v1/policies/{pol_asso_id}")),
+        serde_json::json!(pcf_resource_uri(&format!(
+            "/npcf-ue-policy-control/v1/policies/{pol_asso_id}"
+        ))),
     );
     if !triggers.is_empty() {
         body.insert("triggers".to_string(), serde_json::json!(triggers));
@@ -716,7 +718,7 @@ fn build_sm_policy_notification(sess: &crate::context::PcfSess) -> serde_json::V
         .unwrap_or_else(|| serde_json::json!({}));
 
     serde_json::json!({
-        "resourceUri": format!("/npcf-smpolicycontrol/v1/sm-policies/{}", sess.sm_policy_id),
+        "resourceUri": pcf_resource_uri(&format!("/npcf-smpolicycontrol/v1/sm-policies/{}", sess.sm_policy_id)),
         "smPolicyDecision": decision,
     })
 }
@@ -815,7 +817,7 @@ pub fn pcf_sbi_send_smpolicycontrol_delete_notify(sess_id: u64, app_session_id: 
     };
     let rule_id = format!("PccRule-app-{app_session_id}");
     let body = serde_json::json!({
-        "resourceUri": format!("/npcf-smpolicycontrol/v1/sm-policies/{}", sess.sm_policy_id),
+        "resourceUri": pcf_resource_uri(&format!("/npcf-smpolicycontrol/v1/sm-policies/{}", sess.sm_policy_id)),
         "smPolicyDecision": { "pccRules": { rule_id: null } },
     });
     spawn_notification(uri, "/update", body, "SM policy delete")
@@ -895,7 +897,7 @@ fn notify_unrestorable_associations(
                 // causes describes "the producer lost its own record" -- inventing a
                 // closer-sounding one would misreport what happened.
                 let body = serde_json::json!({
-                    "resourceUri": format!("/npcf-smpolicycontrol/v1/sm-policies/{id}"),
+                    "resourceUri": pcf_resource_uri(&format!("/npcf-smpolicycontrol/v1/sm-policies/{id}")),
                     "cause": "UNSPECIFIED",
                 });
                 if spawn_notification(
@@ -2254,6 +2256,32 @@ pub fn pcf_self_info() -> Option<&'static PcfSelfInfo> {
     PCF_SELF_INFO.get()
 }
 
+/// This PCF's `{apiRoot}` (TS 29.501 §4.4.1): scheme, "://", and the authority,
+/// whose host "should be represented by the operator specific FQDN". So it is the
+/// configured FQDN when there is one, else the advertised address, with the
+/// port.
+pub fn pcf_api_root_for(info: &PcfSelfInfo) -> String {
+    let host = info.fqdn.as_deref().unwrap_or(&info.sbi_addr);
+    format!("{}://{host}:{}", advertised_sbi_scheme(), info.sbi_port)
+}
+
+/// The resource URI of a resource this PCF serves at `path`
+/// (`/<apiName>/<apiVersion>/...`), as the `resourceUri` of a notification or a
+/// PolicyUpdate carries it (#1277).
+///
+/// TS 29.501 §4.4.1 makes an absolute resource URI `{apiRoot}/<apiName>/...`, and
+/// the TS 29.507 / TS 29.512 / TS 29.525 notes say a consumer may use "either the
+/// complete resource URI included in the resourceUri attribute or the
+/// apiSpecificResourceUriPart component" of it, so the attribute is the complete
+/// URI. Before, it was the bare path. Without a published identity (a unit test
+/// that never ran `main`) there is no apiRoot to give, and the path is returned.
+pub fn pcf_resource_uri(path: &str) -> String {
+    match pcf_self_info() {
+        Some(info) => format!("{}{path}", pcf_api_root_for(info)),
+        None => path.to_string(),
+    }
+}
+
 /// Build the TS 29.521 PcfBinding body for a PDU session. `dnn` and `snssai`
 /// are the mandatory members; supi and ipv4Addr are included when known.
 ///
@@ -2989,5 +3017,25 @@ mod tests {
         assert_eq!(d["offline"], false);
         assert_eq!(d["dnn"], "internet");
         assert!(extract_sm_policy_dnn_data(&body, "ims").is_none());
+    }
+}
+
+/// #1277: the apiRoot of TS 29.501 §4.4.1.
+#[cfg(test)]
+mod tests_api_root {
+    use super::{pcf_api_root_for, PcfSelfInfo};
+
+    #[test]
+    fn the_api_root_prefers_the_fqdn_and_carries_the_port() {
+        let mut info = PcfSelfInfo {
+            sbi_addr: "10.0.0.7".into(),
+            sbi_port: 7777,
+            fqdn: Some("pcf.example.org".into()),
+            nf_instance_id: "x".into(),
+        };
+        // The scheme is the advertised one; no listener has set TLS in a unit test.
+        assert_eq!(pcf_api_root_for(&info), "http://pcf.example.org:7777");
+        info.fqdn = None;
+        assert_eq!(pcf_api_root_for(&info), "http://10.0.0.7:7777");
     }
 }

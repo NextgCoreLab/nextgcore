@@ -512,7 +512,7 @@ pub fn build_af_sm_policy_notification(sess: &PcfSess) -> serde_json::Value {
     decision.insert("qosDecs".to_string(), qos_decs);
     decision.extend(sess.tsc_containers.to_decision_fragment());
     serde_json::json!({
-        "resourceUri": format!("/npcf-smpolicycontrol/v1/sm-policies/{}", sess.sm_policy_id),
+        "resourceUri": crate::sbi_path::pcf_resource_uri(&format!("/npcf-smpolicycontrol/v1/sm-policies/{}", sess.sm_policy_id)),
         "smPolicyDecision": serde_json::Value::Object(decision),
     })
 }

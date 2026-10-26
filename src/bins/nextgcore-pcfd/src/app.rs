@@ -2158,7 +2158,7 @@ pub async fn handle_ue_policy_update(pol_asso_id: &str, request: &SbiRequest) ->
     }
 
     let resp = serde_json::json!({
-        "resourceUri": format!("/npcf-ue-policy-control/v1/policies/{pol_asso_id}"),
+        "resourceUri": sbi_path::pcf_resource_uri(&format!("/npcf-ue-policy-control/v1/policies/{pol_asso_id}")),
         "triggers": triggers,
         // Non-3GPP diagnostics, deliberately additive: the spec body for a 200 here is
         // `PolicyUpdate`, whose members are all optional, and reporting what the update
