@@ -587,6 +587,11 @@ fn nsacf_cache_key(nrf_uri: &str, sst: u8, sd: Option<&str>, plmn: Option<(&str,
     )
 }
 
+/// An owned `(mcc, mnc)` as the borrowed pair the NSACF resolution takes.
+pub fn plmn_ref(plmn: &Option<(String, String)>) -> Option<(&str, &str)> {
+    plmn.as_ref().map(|(mcc, mnc)| (mcc.as_str(), mnc.as_str()))
+}
+
 /// TS 29.571 §5.4.4.2 Snssai `sd`: `^[A-Fa-f0-9]{6}$` (#1164 follow-up).
 pub fn valid_sd(sd: &str) -> bool {
     sd.len() == 6 && sd.bytes().all(|b| b.is_ascii_hexdigit())
@@ -1791,20 +1796,45 @@ pub struct RejectTo {
     /// session" (TS 29.502 `requestType` INITIAL_EMERGENCY_REQUEST /
     /// EXISTING_EMERGENCY_PDU_SESSION).
     pub emergency: bool,
-    /// The UE is configured for high priority access in the selected PLMN, as the AMF
-    /// reports it (TS 29.502 `priorityUserInd`).
+    /// The UE is configured for high priority access in the selected PLMN (access
+    /// identities 1, 2, 11-15): the AMF's request carries a `3gpp-Sbi-Message-Priority`
+    /// of higher priority than the default (#1188 follow-up, #1222).
     pub high_priority_access: bool,
 }
 
+/// TS 29.500 §6.8.4: "Requests without the "3gpp-Sbi-Message-Priority" header shall be
+/// assigned the default priority value of "24"". 0 is the highest (§5.2.3.2.2).
+pub const DEFAULT_SBI_MESSAGE_PRIORITY: u8 = 24;
+
 impl RejectTo {
-    /// From an SmContextCreateData (TS 29.502 §6.1.6.2.2).
-    pub fn from_create_data(body: &serde_json::Value) -> Self {
+    /// From an SM Context Create: its `3gpp-Sbi-Message-Priority` (`message_priority`,
+    /// `None` when absent or malformed) and its SmContextCreateData (TS 29.502
+    /// §6.1.6.2.2).
+    ///
+    /// #1188 follow-up, #1222. High priority access is the Message Priority header: TS
+    /// 23.502 §4.3.2.2.1 step 3, "the AMF includes a Message Priority header to indicate
+    /// priority information. The SMF uses the Message Priority header to determine if the
+    /// UE request is subject to exemption from NAS level congestion control" (TS 29.500
+    /// §6.8.4). The AMF sets it from an RRC establishment cause of mps-PriorityAccess,
+    /// mcs-PriorityAccess or highPriorityAccess, or an MPS/MCX subscription. A value of
+    /// higher priority (lower) than the default 24 exempts the UE.
+    ///
+    /// `priorityUserInd` is a secondary signal only: TS 29.502 has the AMF set it when it
+    /// "determines that the subscriber is a priority user" (an MPS/MCX subscription, access
+    /// identities 1 and 2), in the home-routed and V-SMF insertion cases, where it is the
+    /// only indication the H-SMF receives.
+    ///
+    /// Emergency is the `requestType` (INITIAL_EMERGENCY_REQUEST,
+    /// EXISTING_EMERGENCY_PDU_SESSION).
+    pub fn from_create(message_priority: Option<u8>, body: &serde_json::Value) -> Self {
         Self {
             emergency: matches!(
                 body["requestType"].as_str(),
                 Some("INITIAL_EMERGENCY_REQUEST" | "EXISTING_EMERGENCY_PDU_SESSION")
             ),
-            high_priority_access: body["priorityUserInd"].as_bool() == Some(true),
+            high_priority_access: message_priority
+                .is_some_and(|p| p < DEFAULT_SBI_MESSAGE_PRIORITY)
+                || body["priorityUserInd"].as_bool() == Some(true),
         }
     }
 }
@@ -1922,18 +1952,28 @@ mod tests {
         // #27 is outside the emergency rule (it names #26, #67, #69 only).
         assert!(has_back_off(27, emergency));
         assert_eq!(
-            RejectTo::from_create_data(&serde_json::json!({
-                "requestType": "EXISTING_EMERGENCY_PDU_SESSION", "priorityUserInd": true
-            })),
+            RejectTo::from_create(
+                None,
+                &serde_json::json!({
+                    "requestType": "EXISTING_EMERGENCY_PDU_SESSION", "priorityUserInd": true
+                })
+            ),
             RejectTo {
                 emergency: true,
                 high_priority_access: true
             }
         );
         assert_eq!(
-            RejectTo::from_create_data(&serde_json::json!({ "requestType": "INITIAL_REQUEST" })),
+            RejectTo::from_create(
+                None,
+                &serde_json::json!({ "requestType": "INITIAL_REQUEST" })
+            ),
             RejectTo::default()
         );
+        // #1188 follow-up, TS 29.500 §6.8.4: priority 0..23 is above the default 24.
+        let hpa_by = |p| RejectTo::from_create(p, &serde_json::json!({})).high_priority_access;
+        assert!(hpa_by(Some(0)) && hpa_by(Some(23)));
+        assert!(!hpa_by(Some(24)) && !hpa_by(Some(31)) && !hpa_by(None));
     }
 
     /// #1164, TS 29.510 §6.1.6.2.2 and TS 29.571 §5.4.5.1: which slices a profile

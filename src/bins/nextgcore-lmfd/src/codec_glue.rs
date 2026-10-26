@@ -832,7 +832,7 @@ fn pow2(k: i8) -> f64 {
 /// The UE Rx–Tx time difference (TS 38.215 §5.1.30) is `T_UE-RX − T_UE-TX`, a
 /// signed quantity. Its report mapping is the one NR-RSTD uses: the k0 range
 /// `0..1970049` puts `RX-TX_TIME_DIFF_0000` at `T ≤ −985024·T_c` and steps by
-/// `2^k·T_c`, so the value is `(v·2^k − 985024)·T_c` and a UE whose Rx–Tx
+/// `2^k·T_c`, so the value is the bin midpoint of [`nrrstd_to_signed_ns`], and a UE whose Rx–Tx
 /// difference is about zero reports `v ≈ 985024/2^k`. Reading `v` as an unsigned
 /// magnitude instead (as this LMF did before #713) turns that zero into about
 /// 501 µs, a range of about 75 km.
@@ -870,13 +870,16 @@ fn is_open_ended(r: TimeReport) -> bool {
 ///
 /// NR-RSTD is a *signed* reference-signal time difference relative to the DL-PRS
 /// reference TRP, but is encoded as an unsigned `INTEGER(0..maxK)` whose sign is
-/// carried by a per-arm midpoint offset. The signed value is
-/// `(v × 2^k − 985024) × T_c`: the offset 985024 is the LTE RSTD span
-/// (15391·Ts) scaled to `T_c = Ts/64`, so `v = 985024/2^k` decodes to exactly 0 ns
-/// (the reference TRP) and the range spans ≈ ±501 µs. The Rel-18 kMinus arms keep
-/// the same midpoint at their finer step.
+/// carried by an offset of 985024 T_c (the LTE RSTD span, 15391·Ts, scaled to
+/// `T_c = Ts/64`); the range spans ≈ ±501 µs. TS 38.133 Tables 10.1.23.3.1-x (RSTD),
+/// 10.1.25.3.1-x (UE Rx–Tx) and 13.2.1-x (gNB Rx–Tx) all make report value `v` the
+/// bin `[−985024 + 2^k·(v − 1), −985024 + 2^k·v)` T_c, e.g. k = 0: v = 985025 is
+/// `0 ≤ T < 1`. The value returned is the bin MIDPOINT,
+/// `(v·2^k − 2^(k−1) − 985024)·T_c` (#1270): before, it was `(v·2^k − 985024)·T_c`,
+/// the upper edge, a bias of half a step (8 ns at k = 5). The Rel-18 kMinus arms
+/// have the same bins at their finer step.
 pub(crate) fn nrrstd_to_signed_ns(r: TimeReport) -> f64 {
-    (f64::from(r.v) * pow2(r.k) - 985_024.0) * TC_NS
+    (f64::from(r.v) * pow2(r.k) - pow2(r.k - 1) - 985_024.0) * TC_NS
 }
 
 /// Widen a k-arm's reported integer: the arms are `u16` or `u32` depending on
@@ -1065,14 +1068,15 @@ pub fn decode_lpp_ecid_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasurement>
 // LPP NR E-CID adapter (#715)
 // ---------------------------------------------------------------------------
 
-/// TS 38.133 §10.1.6.1 SS-RSRP report mapping, read as `v − 156` dBm: the upper
-/// edge of the bin, the same convention as the E-UTRA `v − 140`. The lowest and
-/// highest report values are open-ended bins, so they are reported at their
-/// inner edge. RSRP only ranks cells here (the serving-cell choice) and never
-/// enters a range, so an open-ended value is kept rather than dropped (#834
-/// review: the old comment's "127 is −31 and above" disagreed with this formula).
+/// TS 38.133 §10.1.6.1 SS-RSRP report mapping, Table 10.1.6.1-1: RSRP_v is
+/// `[−157 + v, −156 + v)` dBm (RSRP_1 is `−156 ≤ RSRP < −155`), so `v − 157` dBm is
+/// the bin's lower edge, the whole dBm the measurement is at least (#1270; it was
+/// `v − 156`, the upper edge, a level the UE did not reach). The midpoint is not a
+/// whole dBm. The open-ended RSRP_0 (`< −156`) reads as −157 and RSRP_126
+/// (`≥ −31`) as −31. RSRP only ranks cells here (the serving-cell choice) and
+/// never enters a range, so an open-ended value is kept rather than dropped.
 pub(crate) fn nr_rsrp_dbm(v: u8) -> i16 {
-    i16::from(v) - 156
+    i16::from(v) - 157
 }
 
 /// Map one LPP `NR-MeasuredResultsElement-r16` (TS 37.355 Rel-16
@@ -1081,7 +1085,7 @@ pub(crate) fn nr_rsrp_dbm(v: u8) -> i16 {
 /// | PDU field | `CellMeasurement` | scaling |
 /// |---|---|---|
 /// | `nr-PhysCellID-r16` (0..1007) | `nr_cgi` | `"pci-<n>"`, as the other LPP adapters |
-/// | `resultsSSB-Cell-r16.nr-RSRP-r16` (0..127), else the CSI-RS cell result | `rsrp` | `v − 156` dBm ([`nr_rsrp_dbm`]) |
+/// | `resultsSSB-Cell-r16.nr-RSRP-r16` (0..127), else the CSI-RS cell result | `rsrp` | `v − 157` dBm, the bin's lower edge ([`nr_rsrp_dbm`]) |
 /// | `…nr-RSRQ-r16` (0..127) | `rsrq` | raw index (TS 38.133 §10.1.11.1), like the E-UTRA adapter's raw index |
 ///
 /// NR E-CID carries no UE timing quantity, so `ecid_rtt_ns` stays empty. The
@@ -1152,7 +1156,7 @@ pub fn lpp_nr_ecid_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<CellMe
 /// | PDU field                       | `CellMeasurement` field | Notes                            |
 /// |---------------------------------|-------------------------|----------------------------------|
 /// | `nr-PhysCellID` (NR PCI)        | `nr_cgi`                | `"pci-<n>"`; `"prs-<id>"` fallback |
-/// | `nr-UE-RxTxTimeDiff` k-arm      | `ue_rx_tx_ns`           | (v·2^k − 985024)·T_c ns, signed (TS 38.133 §10.1.25.3) |
+/// | `nr-UE-RxTxTimeDiff` k-arm      | `ue_rx_tx_ns`           | bin midpoint (v·2^k − 2^(k−1) − 985024)·T_c ns, signed (TS 38.133 §10.1.25.3) |
 /// | `nr-DL-PRS-RSRP-Result`         | `rsrp`                  | 0..126 → −140..−14 dBm           |
 ///
 /// Returns an empty `Vec` when the message is not a `ProvideLocationInformation`,
@@ -1556,22 +1560,29 @@ mod tests {
     }
 
     /// #713: `nr-UE-RxTxTimeDiff-r16` is signed, with the TS 38.133 §10.1.25.3
-    /// midpoint. A UE whose Rx–Tx difference is about zero reports v ≈ 985024/2^k,
-    /// which is ≈ 0 ns, not the ≈ 501 µs an unsigned reading gives.
+    /// offset. A UE whose Rx–Tx difference is about zero reports v ≈ 985024/2^k,
+    /// which is ≈ 0 ns, not the ≈ 501 µs an unsigned reading gives. #1270: the
+    /// value is the bin midpoint, Table 10.1.25.3.1-x: v = 985024/2^k is
+    /// `[−2^k, 0)` T_c and v + 1 is `[0, 2^k)` T_c.
     #[test]
     fn ue_rx_tx_decodes_signed_around_the_midpoint() {
         let at = |v: u32, k: i8| ue_rx_tx_to_signed_ns(TimeReport { v, k });
         for k in 0..=5i8 {
             let zero = 985_024u32 >> k;
-            assert_eq!(at(zero, k), Some(0.0), "k{k}");
-            // One step either side is ±2^k·T_c.
             let step = f64::from(1u32 << k) * TC_NS;
-            assert!((at(zero + 1, k).unwrap() - step).abs() < 1e-9);
-            assert!((at(zero - 1, k).unwrap() + step).abs() < 1e-9);
+            let close = |got: Option<f64>, want: f64| {
+                assert!(
+                    (got.unwrap() - want).abs() < 1e-9,
+                    "k{k}: {got:?} vs {want}"
+                )
+            };
+            close(at(zero, k), -step / 2.0);
+            close(at(zero + 1, k), step / 2.0);
+            close(at(zero - 1, k), -1.5 * step);
         }
-        // The issue's value: v = 985024 + δ is δ·T_c, a few ns, not 501 µs.
+        // The issue's value: v = 985024 + δ is [δ − 1, δ) T_c, a few ns, not 501 µs.
         let near_zero = at(985_024 + 7, 0).unwrap();
-        assert!((near_zero - 7.0 * TC_NS).abs() < 1e-9, "{near_zero}");
+        assert!((near_zero - 6.5 * TC_NS).abs() < 1e-9, "{near_zero}");
         // The first and last values are open-ended bins (TS 38.133 §10.1.25.3),
         // not measurements: not decoded. The values just inside are ≈ ±501 µs.
         for k in [0i8, 1, 2, 3, 4, 5, -1, -6] {
@@ -1593,7 +1604,8 @@ mod tests {
             ],
             "the TS 37.355 nr-UE-RxTxTimeDiff-r16 ranges"
         );
-        assert!((at(1, 0).unwrap() + 985_023.0 * TC_NS).abs() < 1e-6);
+        // RX-TX_TIME_DIFFERENCE_0000001 is [−985024, −985023) T_c.
+        assert!((at(1, 0).unwrap() + 985_023.5 * TC_NS).abs() < 1e-6);
     }
 
     /// NRPPa E-CID: generated encode → `decode_nrppa_ecid_report` → adapt.
@@ -1642,38 +1654,48 @@ mod tests {
         let cells = lpp_multi_rtt_provide_to_measurements(&decoded);
         assert_eq!(cells.len(), 2);
 
-        // Cell 0: PCI present → "pci-123"; K2(300_000) → (1_200_000 − 985_024)·T_c
-        // = 214_976·T_c ≈ 109_342 ns of UE Rx–Tx (#713: signed, and not an RTT).
+        // Cell 0: PCI present → "pci-123"; K2(300_000) is [214_972, 214_976) T_c
+        // (#1270: the midpoint 214_974·T_c ≈ 109_341 ns) of UE Rx–Tx (#713: signed,
+        // and not an RTT).
         let c0 = &cells[0];
         assert_eq!(c0.nr_cgi, "pci-123");
         // nr_dl_prs_rsrp_result=80 → 80 − 140 = −60 dBm.
         assert_eq!(c0.rsrp, Some(-60));
         assert_eq!(c0.rtt_ns, None, "the UE half is not an RTT");
         let rx_tx0 = c0.ue_rx_tx_ns.expect("ue_rx_tx_ns cell 0");
-        assert!((rx_tx0 - 214_976.0 * TC_NS).abs() < 1e-6, "{rx_tx0}");
+        assert!((rx_tx0 - 214_974.0 * TC_NS).abs() < 1e-6, "{rx_tx0}");
 
-        // Cell 1: PCI absent → "prs-6"; K1(200_000) → (400_000 − 985_024)·T_c, negative.
+        // Cell 1: PCI absent → "prs-6"; K1(200_000) is [−585_026, −585_024) T_c,
+        // negative; midpoint −585_025·T_c.
         let c1 = &cells[1];
         assert_eq!(c1.nr_cgi, "prs-6");
         assert_eq!(c1.rsrp, None);
         assert_eq!(c1.rtt_ns, None);
         let rx_tx1 = c1.ue_rx_tx_ns.expect("ue_rx_tx_ns cell 1");
-        assert!((rx_tx1 + 585_024.0 * TC_NS).abs() < 1e-6, "{rx_tx1}");
+        assert!((rx_tx1 + 585_025.0 * TC_NS).abs() < 1e-6, "{rx_tx1}");
     }
 
-    /// `nrrstd_to_signed_ns`: NR-RSTD is a SIGNED time difference; verify the
-    /// midpoint-offset mapping ns = (v·2^k − 985024)·T_c at the spec endpoints.
+    /// `nrrstd_to_signed_ns`: NR-RSTD is a SIGNED time difference. #1270: report
+    /// value v is the bin `[−985024 + 2^k(v − 1), −985024 + 2^k·v)` T_c of TS 38.133
+    /// Table 10.1.23.3.1-x, decoded to its midpoint.
     #[test]
     fn nrrstd_signed_endpoints() {
-        // Per-arm zero point 985024/2^k decodes to exactly 0 ns (reference TRP).
-        assert_eq!(nrrstd_to_signed_ns(TimeReport { v: 985_024, k: 0 }), 0.0);
-        assert_eq!(nrrstd_to_signed_ns(TimeReport { v: 246_256, k: 2 }), 0.0); // 985024/4
-        assert_eq!(nrrstd_to_signed_ns(TimeReport { v: 30_782, k: 5 }), 0.0); // 985024/32
-                                                                              // One k0 code = ±T_c around the midpoint (sign carried by the offset).
-        assert!((nrrstd_to_signed_ns(TimeReport { v: 985_025, k: 0 }) - TC_NS).abs() < 1e-9);
-        assert!((nrrstd_to_signed_ns(TimeReport { v: 985_023, k: 0 }) + TC_NS).abs() < 1e-9);
-        // Endpoints span ≈ ±501 µs.
-        assert!((nrrstd_to_signed_ns(TimeReport { v: 0, k: 0 }) + 985_024.0 * TC_NS).abs() < 1e-6);
+        let at = |v: u32, k: i8| nrrstd_to_signed_ns(TimeReport { v, k });
+        let close = |got: f64, want_tc: f64| {
+            assert!(
+                (got - want_tc * TC_NS).abs() < 1e-6,
+                "{got} vs {want_tc} T_c"
+            )
+        };
+        // Per-arm v = 985024/2^k is the bin just below zero, [−2^k, 0) T_c.
+        close(at(985_024, 0), -0.5); // RSTD_0985024: −1 ≤ RSTD < 0
+        close(at(246_256, 2), -2.0); // 985024/4
+        close(at(30_782, 5), -16.0); // 985024/32
+        close(at(985_025, 0), 0.5); // RSTD_0985025: 0 ≤ RSTD < 1
+        close(at(985_023, 0), -1.5);
+        close(at(1, 0), -985_023.5); // RSTD_0000001: −985024 ≤ RSTD < −985023
+                                     // Endpoints span ≈ ±501 µs.
+        assert!(at(0, 0) < -500_000.0);
         assert!(nrrstd_to_signed_ns(TimeReport { v: 1_970_049, k: 0 }) > 500_000.0);
     }
 
@@ -1695,11 +1717,12 @@ mod tests {
         // Reference TRP first, RSTD 0.
         assert_eq!(cells[0].nr_cgi, "prs-3");
         assert_eq!(cells[0].rstd_ns, Some(0.0));
-        // Element: PCI present → "pci-123"; K0(985_124) → (985124−985024)·T_c = 100·T_c.
+        // Element: PCI present → "pci-123"; K0(985_124) is [99, 100) T_c (#1270: the
+        // midpoint 99.5·T_c).
         assert_eq!(cells[1].nr_cgi, "pci-123");
         assert_eq!(cells[1].rsrp, Some(-40)); // 100 − 140
         let rstd = cells[1].rstd_ns.expect("rstd_ns");
-        assert!((rstd - 100.0 * TC_NS).abs() < 1e-6, "rstd_ns={rstd}");
+        assert!((rstd - 99.5 * TC_NS).abs() < 1e-6, "rstd_ns={rstd}");
     }
 
     /// A5 golden vector: `decode_lpp_provide_report` decodes a UE-provided LPP
@@ -1722,11 +1745,12 @@ mod tests {
         assert_eq!(cells[0].nr_cgi, "pci-321");
         // nr_dl_prs_rsrp_result=80 -> 80 - 140 = -60 dBm.
         assert_eq!(cells[0].rsrp, Some(-60));
-        // K1(200_000): (400_000 − 985_024)·T_c of UE Rx–Tx, signed (#713).
+        // K1(200_000): [−585_026, −585_024) T_c of UE Rx–Tx, signed (#713), at its
+        // midpoint (#1270).
         assert_eq!(cells[0].rtt_ns, None);
         let rx_tx = cells[0].ue_rx_tx_ns.expect("ue_rx_tx_ns");
         assert!(
-            (rx_tx + 585_024.0 * TC_NS).abs() < 1e-6,
+            (rx_tx + 585_025.0 * TC_NS).abs() < 1e-6,
             "ue_rx_tx_ns={rx_tx}"
         );
     }
@@ -1770,7 +1794,7 @@ mod tests {
     }
 
     /// #715: an NR E-CID report adapts to NR cells: `pci-<n>`, SS-RSRP mapped
-    /// per TS 38.133 §10.1.6.1 (`v − 156` dBm), RSRQ raw, and no timing term,
+    /// per TS 38.133 §10.1.6.1 (`v − 157` dBm), RSRQ raw, and no timing term,
     /// because NR E-CID over LPP has no UE timing quantity.
     #[test]
     fn an_nr_ecid_report_adapts_to_nr_cells_without_a_timing_term() {
@@ -1784,9 +1808,10 @@ mod tests {
         assert_eq!(
             got,
             [
-                ("pci-77", Some(-76), Some(60), None, false),
-                ("pci-12", Some(-106), None, None, false),
-                ("pci-13", Some(-156), None, None, false),
+                // RSRP_80 is [−77, −76) dBm, RSRP_50 [−107, −106), RSRP_0 < −156.
+                ("pci-77", Some(-77), Some(60), None, false),
+                ("pci-12", Some(-107), None, None, false),
+                ("pci-13", Some(-157), None, None, false),
             ]
         );
         // The E-UTRA adapter does not mistake it for its own body.

@@ -196,7 +196,7 @@ impl FakeNgRan {
                         let t = propagation_ns(*e, *n) - UE_CLOCK_OFFSET_NS + SRS_AFTER_PRS_NS;
                         (
                             *id,
-                            ((t / TC_NS + 985_024.0) / 2.0).round() as u32,
+                            ((t / TC_NS + 985_024.0) / 2.0).floor() as u32 + 1,
                             700,
                             self.gnb_slot,
                         )

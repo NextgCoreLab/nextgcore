@@ -780,8 +780,9 @@ pub async fn deactivate_on_command(
     peer: std::net::SocketAddr,
     seq: u32,
 ) {
-    // #619 follow-up: not while a Bearer Resource Command's procedure runs on them.
-    let _procedures = BearerProcedures::lock(sess_id, ebis).await;
+    // #619 follow-up 2: held, so a Bearer Resource Command arriving meanwhile collides;
+    // not waited for, since the deactivation supersedes a running modification.
+    let (_procedures, _) = BearerProcedures::try_take(sess_id, ebis);
     let handle = context::smf_self();
     let Some((sess, linked_ebi, bearers, refused)) = handle.read().ok().and_then(|ctx| {
         let sess = ctx.sess_find_by_id(sess_id)?;
@@ -1226,11 +1227,21 @@ pub(crate) fn parse_update_bearer_response(
 ///
 /// Two Bearer Resource Commands for one bearer (the UE may run two ESM procedures, each
 /// with its own PTI) each read the bearer's packet filters and QoS before their Update
-/// Bearer Request and store their result after it: the second's store overwrote the
-/// first's, so a TFT change was lost while the UE and the MME held both. TS 23.401
-/// §5.4.5 has the PGW handle a Command by one bearer procedure, and the procedures on a
-/// bearer are run one at a time; the second waits here for the first to end, then reads
-/// what the first stored. The Delete Bearer Command takes the same locks.
+/// Bearer Request and stored their result after it: the second's store overwrote the
+/// first's, so a TFT change was lost while the UE and the MME held both.
+///
+/// #619 follow-up 2: a Command for a bearer whose procedure is running is REJECTED at
+/// once, not queued. The running procedure is the PGW's network-initiated bearer
+/// modification (or deactivation) of that bearer, and TS 29.274 §7.2.6 / §8.4 has the
+/// PGW answer exactly this with a Bearer Resource Failure Indication, cause #101
+/// "Collision with network initiated request" (the MME gives the UE ESM #56, TS 29.274
+/// Table B.2-1); TS 24.301 §6.4.3.6 c) has the MME ignore such a request too. A queued
+/// Command waited up to the first's Update Bearer window (T3 x (N3 + 1) = 60 s), well
+/// past the UE's T3481 (8 s x 5) and the MME's own window, so the UE retransmitted into
+/// the queue or gave up on a procedure the PGW then ran. A Delete Bearer Command does
+/// not wait either: deactivation supersedes a modification of the bearer (TS 24.301
+/// §6.5.4.5 c), and the modification finds the bearer gone after its answer and stores
+/// nothing.
 static BEARER_PROCEDURES: std::sync::Mutex<
     Option<std::collections::HashMap<(u64, u8), std::sync::Arc<tokio::sync::Mutex<()>>>>,
 > = std::sync::Mutex::new(None);
@@ -1245,26 +1256,29 @@ pub(crate) struct BearerProcedures {
 }
 
 impl BearerProcedures {
-    /// Wait for, then hold, the procedure locks of `ebis` of session `sess_id`, in EBI
-    /// order so two procedures over overlapping bearers cannot deadlock.
-    pub(crate) async fn lock(sess_id: u64, ebis: &[u8]) -> Self {
+    /// Take the procedure locks of `ebis` of session `sess_id` that are free, without
+    /// waiting. The second value says whether every one was: `false` when a procedure
+    /// is already running on one of them (#619 follow-up 2).
+    pub(crate) fn try_take(sess_id: u64, ebis: &[u8]) -> (Self, bool) {
         let mut ebis = ebis.to_vec();
         ebis.sort_unstable();
         ebis.dedup();
         let mut held = Vec::with_capacity(ebis.len());
+        let mut all = true;
+        let mut map = BEARER_PROCEDURES.lock().unwrap_or_else(|e| e.into_inner());
         for ebi in ebis {
             let key = (sess_id, ebi);
-            let lock = BEARER_PROCEDURES
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            let lock = map
                 .get_or_insert_with(std::collections::HashMap::new)
                 .entry(key)
                 .or_default()
                 .clone();
-            let guard = lock.clone().lock_owned().await;
-            held.push((key, lock, guard));
+            match lock.clone().try_lock_owned() {
+                Ok(guard) => held.push((key, lock, guard)),
+                Err(_) => all = false,
+            }
         }
-        Self { held }
+        (Self { held }, all)
     }
 }
 
@@ -1315,8 +1329,15 @@ pub async fn modify_on_command(
         )
     })?;
     // #619 follow-up: from the read of the bearer to the store of the result, one
-    // procedure on it at a time.
-    let _procedure = BearerProcedures::lock(sess_id, &[ebi]).await;
+    // procedure on it at a time. #619 follow-up 2: a second is refused at once, cause
+    // #101 (TS 29.274 §7.2.6), rather than queued past the UE's T3481.
+    let (_procedure, free) = BearerProcedures::try_take(sess_id, &[ebi]);
+    if !free {
+        return Err(Refused(
+            Gtp2Cause::CollisionWithNetworkInitiatedRequest,
+            format!("a bearer procedure is already running on EBI {ebi}"),
+        ));
+    }
     let handle = context::smf_self();
     let (sess, linked_ebi, bearer, taken) = {
         let ctx = handle

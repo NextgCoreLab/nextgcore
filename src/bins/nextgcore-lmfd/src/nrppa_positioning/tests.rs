@@ -5,7 +5,9 @@ use super::*;
 
 const TC_NS: f64 = 1e9 / (480_000.0 * 4_096.0);
 
-/// TS 38.455 §9.2.40 / TS 38.133: a k1 gNB Rx-Tx report v is (2v − 985024)·T_c.
+/// TS 38.455 §9.2.40 / TS 38.133 Table 13.2.1-2: a k1 gNB Rx-Tx report v is the
+/// bin `[2(v − 1) − 985024, 2v − 985024)` T_c, decoded to its midpoint
+/// `(2v − 1 − 985024)·T_c` (#1270).
 #[test]
 fn a_gnb_rx_tx_report_decodes_signed_like_the_ue_half() {
     let bytes = measurement_response(
@@ -16,8 +18,8 @@ fn a_gnb_rx_tx_report_decodes_signed_like_the_ue_half() {
     let halves = decode_measurement_response(&bytes, 77).expect("decodes");
     assert_eq!(halves.len(), 2);
     assert_eq!(halves[0].trp_id, 1);
-    assert!((halves[0].rx_tx_ns.unwrap() - 1000.0 * TC_NS).abs() < 1e-9);
-    assert!((halves[1].rx_tx_ns.unwrap() + 20.0 * TC_NS).abs() < 1e-9);
+    assert!((halves[0].rx_tx_ns.unwrap() - 999.0 * TC_NS).abs() < 1e-9);
+    assert!((halves[1].rx_tx_ns.unwrap() + 21.0 * TC_NS).abs() < 1e-9);
     assert_eq!(
         halves[0].time,
         Some(SlotTime {

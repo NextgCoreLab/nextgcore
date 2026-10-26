@@ -18,6 +18,16 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   §4.4.1), with the configured FQDN as host when there is one. Before, it was the bare path. The
   TS 29.507 / 29.512 / 29.525 notes let a consumer use either the complete URI or its
   apiSpecificResourceUriPart (#1277).
+- lmfd decodes the NR E-CID quantities of an NRPPa E-CID report into physical values, so NR
+  E-CID against a real NR gNB gives a fix where it gave 500 `POSITIONING_FAILED`. NR-TADV is the
+  round trip of TS 38.133 §13.5.1 Table 13.5.1-1, used as the E-CID timing term (bin
+  midpoint). The serving cell's SS/CSI-RSRP and RSRQ rank the cell (§10.1.6.1, §10.1.11.1), a
+  GCS AoA NR becomes a bearing (§13.4.1), and the UE Rx-Tx (§10.1.25.3.1, k = 5) is decoded but
+  ranges nothing (#859).
+- lmfd decodes NR-RSTD, UE Rx-Tx and gNB Rx-Tx reports (LPP and NRPPa) to the bin midpoint of
+  TS 38.133 Tables 10.1.23.3.1-x, 10.1.25.3.1-x and 13.2.1-x. Before, it took the upper edge,
+  a bias of half a reporting step (8 ns, about 2.4 m, at k = 5). NR SS/CSI-RSRP reads as the
+  bin's lower edge, `v − 157` dBm (Table 10.1.6.1-1), where it read the upper edge (#1270).
 - pcfd now acts on a change of the UE's policy data at the UDR (the policy-data notification
   it already subscribes to) for the UE's AM and UE policy associations, not only its SM
   sessions (TS 29.513 §5.1.2.2, §5.6.2.2.2). A changed AM policy is pushed to the AMF with
@@ -52,9 +62,11 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   session and waited for each AMF in turn, all before the SMF served anything.
 - smfd's PDU SESSION ESTABLISHMENT REJECT leaves out the Back-off timer value IE for #26 and #69
   when the request is for emergency services (SmContextCreateData `requestType`
-  INITIAL_EMERGENCY_REQUEST or EXISTING_EMERGENCY_PDU_SESSION). It also leaves it out for #26,
-  #27 and #69 when the AMF reports the UE as a priority user (`priorityUserInd`), so the UE can
-  retry at once (TS 24.501 §6.4.1.4.1). amfd does not send either attribute yet (#1188).
+  INITIAL_EMERGENCY_REQUEST or EXISTING_EMERGENCY_PDU_SESSION), and for #26, #27 and #69 when the
+  UE is configured for high priority access, so the UE can retry at once (TS 24.501 §6.4.1.4.1).
+  High priority access is the AMF's `3gpp-Sbi-Message-Priority` header with a value above the
+  default 24 (TS 23.502 §4.3.2.2.1 step 3, TS 29.500 §6.8.4), which amfd sets for a priority UE
+  (#1222), or `priorityUserInd` (TS 29.502, home-routed and V-SMF insertion) (#1188).
 - smfd's EBI assignment request (`Namf_Communication_EBIAssignment`) now gives the default flow's
   ARP as NOT_PREEMPT / NOT_PREEMPTABLE, the same ARP the N2 default QoS flow carries. Before, it
   said PREEMPTABLE, so the AMF could revoke the EBI for a higher-priority request that the RAN
@@ -105,7 +117,11 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   §6.1.6.2.3), reads a `perPlmnSnssaiList` for the serving PLMN only, skips an instance whose
   endpoint cannot be read (and reaches an FQDN-only one by its FQDN) rather than giving up, and
   an SM Context Create whose S-NSSAI SD is not 6 hex digits (TS 29.571 §5.4.4.2) is answered 400
-  INVALID_MSG_FORMAT (#1164).
+  INVALID_MSG_FORMAT (#1164). That answer is an SmContextCreateError carrying the N1 PDU SESSION
+  ESTABLISHMENT REJECT (5GSM cause #31) when the request carried an N1 SM message (TS 29.502
+  §5.2.2.2.1), so the UE is answered at once rather than running out T3580. A DECREASE that has to
+  resolve its NSACF again (no NSACF recorded) resolves it for the serving PLMN the session was
+  admitted in, which the policy binding now records (#1164).
 - smfd ignores the Recovery Time Stamp in a PFCP Association Setup Response, and keeps a UPF's
   Recovery Time Stamp in memory only (TS 23.007 §19A; TS 29.244 Table 7.4.4.2-1 NOTE). A new
   association starts with no stored stamp, and its first Heartbeat stamp is the baseline. Whether

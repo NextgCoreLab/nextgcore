@@ -1144,6 +1144,7 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
                     nsac_admitted,
                     nsac_nf_id.as_deref(),
                     nsac_nsacf.as_ref(),
+                    crate::policy::plmn_ref(&nsac_plmn),
                     supi,
                     psi,
                     nsac_sst,
@@ -1186,6 +1187,7 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
                 nsac_admitted,
                 nsac_nf_id.as_deref(),
                 nsac_nsacf.as_ref(),
+                crate::policy::plmn_ref(&nsac_plmn),
                 supi,
                 psi,
                 nsac_sst,
@@ -1215,6 +1217,7 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
                     nsac_admitted,
                     nsac_nf_id.as_deref(),
                     nsac_nsacf.as_ref(),
+                    crate::policy::plmn_ref(&nsac_plmn),
                     supi,
                     psi,
                     nsac_sst,
@@ -1305,6 +1308,7 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
                         nsac_admitted,
                         nsac_nf_id: nsac_nf_id.clone(),
                         nsac_nsacf: nsac_nsacf.clone(),
+                        nsac_plmn: nsac_plmn.clone(),
                     },
                 );
             }
@@ -1969,7 +1973,17 @@ async fn handle_cancelled_inner(sm_context_ref: &str) -> SbiResponse {
                     counted = m
                         .remove(sm_context_ref)
                         .filter(|b| b.nsac_admitted)
-                        .map(|b| (b.supi, b.psi, b.sst, b.sd, b.nsac_nf_id, b.nsac_nsacf));
+                        .map(|b| {
+                            (
+                                b.supi,
+                                b.psi,
+                                b.sst,
+                                b.sd,
+                                b.nsac_nf_id,
+                                b.nsac_nsacf,
+                                b.nsac_plmn,
+                            )
+                        });
                 }
                 sess.psi = 0;
                 sess.sm_context_ref = None;
@@ -1978,11 +1992,12 @@ async fn handle_cancelled_inner(sm_context_ref: &str) -> SbiResponse {
             }
             // #1072 round 2 m8: and the 5G count the preparation took is given back,
             // under the handover lock, so a retried preparation counts in after it.
-            if let Some((supi, psi, sst, sd, nf_id, nsacf)) = counted {
+            if let Some((supi, psi, sst, sd, nf_id, nsacf, plmn)) = counted {
                 crate::rollback_nsac_as(
                     true,
                     nf_id.as_deref(),
                     nsacf.as_ref(),
+                    crate::policy::plmn_ref(&plmn),
                     &supi,
                     psi,
                     sst,
