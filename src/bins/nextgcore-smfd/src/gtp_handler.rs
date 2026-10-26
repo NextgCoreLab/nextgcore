@@ -5178,14 +5178,14 @@ mod tests {
         server.close();
     }
 
-    /// #619 follow-up: two Bearer Resource Commands for one dedicated bearer (two ESM
-    /// procedures of the UE, each with its own PTI) are run one after the other. The
-    /// second's Update Bearer Request goes out only once the first is answered, and is
-    /// computed from what the first stored, so both filters are kept. Run at once, each
-    /// read the same two filters and the second's store dropped the first's addition,
-    /// while the UE and the MME held both.
+    /// #619 follow-up 2: a Bearer Resource Command for a dedicated bearer whose
+    /// Command-triggered procedure is still running is refused at once with a Bearer
+    /// Resource Failure Indication, cause #101 "Collision with network initiated
+    /// request" (TS 29.274 §7.2.6, §8.4), carrying its own PTI. It is not queued past
+    /// the UE's T3481, and it does not overwrite the first's result: once the first is
+    /// answered, the bearer has the first's filter only.
     #[tokio::test]
-    async fn two_bearer_resource_commands_on_one_bearer_are_run_one_after_the_other() {
+    async fn a_second_bearer_resource_command_on_a_busy_bearer_collides() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _seeded = crate::context::SeededState::track();
         let upf = crate::pfcp_path::stand_in::associated_upf().await;
@@ -5209,19 +5209,14 @@ mod tests {
         sgw.send_to(&first, server.local_addr())
             .await
             .expect("send");
+        let (ubr1, _) = recv_type(&sgw, gtp2_message_type::UPDATE_BEARER_REQUEST).await;
         sgw.send_to(&second, server.local_addr())
             .await
             .expect("send");
-
-        let (ubr1, _) = recv_type(&sgw, gtp2_message_type::UPDATE_BEARER_REQUEST).await;
-        // While the first is unanswered, no second Update Bearer Request.
-        let mut buf = vec![0u8; 4096];
-        let early = tokio::time::timeout(
-            std::time::Duration::from_millis(300),
-            sgw.recv_from(&mut buf),
-        )
-        .await
-        .is_ok();
+        let started = std::time::Instant::now();
+        let (brfi, _) =
+            recv_type(&sgw, gtp2_message_type::BEARER_RESOURCE_FAILURE_INDICATION).await;
+        let answered_in = started.elapsed();
         sgw.send_to(
             &s5c_bearer_answer(
                 gtp2_message_type::UPDATE_BEARER_RESPONSE,
@@ -5234,11 +5229,86 @@ mod tests {
         )
         .await
         .expect("send");
-        let (ubr2, _) = recv_type(&sgw, gtp2_message_type::UPDATE_BEARER_REQUEST).await;
+        let sgw_addr = sgw.local_addr().unwrap();
+        for _ in 0..400 {
+            if server.command_ended(sgw_addr, 0x807a) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let flows: Vec<String> = stored_filters_of(sess.id, 6)
+            .into_iter()
+            .map(|(_, _, f)| f)
+            .collect();
+        server.close();
+
+        assert!(
+            answered_in < std::time::Duration::from_secs(1),
+            "refused at once: {answered_in:?}"
+        );
+        assert_eq!(brfi.header.sequence_number, 0x807b, "the second Command's");
+        assert_eq!(
+            brfi.get_ie(Gtp2IeType::Cause as u8, 0)
+                .and_then(|ie| ie.value.first().copied()),
+            Some(101),
+            "Collision with network initiated request"
+        );
+        assert_eq!(
+            brfi.get_ie(Gtp2IeType::Pti as u8, 0).map(|ie| ie.value[0]),
+            Some(5),
+            "its own PTI"
+        );
+        assert!(
+            flows.iter().any(|f| f == VIDEO_DL),
+            "the first's change: {flows:?}"
+        );
+        assert!(!flows.iter().any(|f| f == GAME_DL), "not the refused one's");
+    }
+
+    /// #619 follow-up 2: a Delete Bearer Command for a bearer whose modification is
+    /// running does not wait for it: deactivation supersedes the modification (TS 24.301
+    /// §6.5.4.5 c). Its Delete Bearer Request goes out while the Update Bearer Request
+    /// is still unanswered, and the modification's late answer stores nothing for the
+    /// deleted bearer.
+    #[tokio::test]
+    async fn a_delete_bearer_command_does_not_wait_for_a_running_modification() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        let (server, sgw, _port, sess, pgw_c_teid) = pdn_with_voice_bearer(0x7b, &upf).await;
+        let tad = crate::eps_tft::encode(
+            crate::eps_tft::op::ADD_PACKET_FILTERS,
+            &[crate::eps_tft::PacketFilter {
+                direction: crate::context::FlowDirection::Bidirectional,
+                identifier: 0,
+                precedence: 7,
+                flow_description: "permit out 17 from 198.51.100.7 5008 to assigned".into(),
+            }],
+        )
+        .unwrap();
+        let brc = s5c_bearer_resource_command(0x807c, pgw_c_teid, 6, 4, &tad, None);
+        sgw.send_to(&brc, server.local_addr()).await.expect("send");
+        let (ubr, _) = recv_type(&sgw, gtp2_message_type::UPDATE_BEARER_REQUEST).await;
+        let dbc = {
+            use nextgcore_gtp::v2::{Gtp2BearerContextIe, Gtp2Header, Gtp2Message};
+            let mut m = Gtp2Message::new(Gtp2Header::new(
+                gtp2_message_type::DELETE_BEARER_COMMAND,
+                pgw_c_teid,
+                0x807d,
+            ));
+            let mut bc = Gtp2BearerContextIe::new();
+            bc.set_ebi(6);
+            m.add_bearer_context(0, &bc);
+            m.encode()
+        };
+        sgw.send_to(&dbc, server.local_addr()).await.expect("send");
+        let started = std::time::Instant::now();
+        let (dbr, _) = recv_type(&sgw, gtp2_message_type::DELETE_BEARER_REQUEST).await;
+        let sent_in = started.elapsed();
         sgw.send_to(
             &s5c_bearer_answer(
-                gtp2_message_type::UPDATE_BEARER_RESPONSE,
-                ubr2.header.sequence_number,
+                gtp2_message_type::DELETE_BEARER_RESPONSE,
+                dbr.header.sequence_number,
                 pgw_c_teid,
                 6,
                 16,
@@ -5249,28 +5319,40 @@ mod tests {
         .expect("send");
         let sgw_addr = sgw.local_addr().unwrap();
         for _ in 0..400 {
-            if server.command_ended(sgw_addr, ubr2.header.sequence_number) {
+            if server.command_ended(sgw_addr, 0x807d) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        let flows: Vec<String> = stored_filters_of(sess.id, 6)
-            .into_iter()
-            .map(|(_, _, f)| f)
-            .collect();
-        let ids: Vec<u8> = stored_filters_of(sess.id, 6)
-            .into_iter()
-            .map(|(id, _, _)| id)
-            .collect();
+        // The modification's answer comes after the deletion.
+        sgw.send_to(
+            &s5c_bearer_answer(
+                gtp2_message_type::UPDATE_BEARER_RESPONSE,
+                ubr.header.sequence_number,
+                pgw_c_teid,
+                6,
+                16,
+            ),
+            server.local_addr(),
+        )
+        .await
+        .expect("send");
+        for _ in 0..400 {
+            if server.command_ended(sgw_addr, 0x807c) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let gone = stored_bearer(sess.id, 6).await.is_none();
         server.close();
-
-        assert!(!early, "the second waits for the first");
-        assert_ne!(ubr1.header.sequence_number, ubr2.header.sequence_number);
         assert!(
-            flows.iter().any(|f| f == VIDEO_DL) && flows.iter().any(|f| f == GAME_DL),
-            "both additions are kept: {flows:?}"
+            sent_in < std::time::Duration::from_secs(1),
+            "the deletion did not wait for the modification: {sent_in:?}"
         );
-        assert_eq!(ids, vec![1, 2, 3, 4], "each with its own identifier");
+        assert!(
+            gone,
+            "the bearer is deleted, and the late modification stores nothing"
+        );
     }
 
     /// #619: an Update Bearer Request the SGW-C refuses (the MME or the UE did), or one
