@@ -963,6 +963,12 @@ impl SxaNode {
                                 // The MME is waiting: a transaction that never completes
                                 // must not leave the procedure hanging until its own
                                 // GTP-C timer fires (TS 29.274 §7.6).
+                                // #1285 review: a Create Bearer Request held for this
+                                // establishment cannot be carried out either.
+                                if matches!(req.continuation, S11Continuation::CreateSession { .. })
+                                {
+                                    crate::dedicated_bearer::on_session_failed(req.sess_id);
+                                }
                                 crate::sxa_response::fail(req.continuation, &e.to_string());
                             }
                         }

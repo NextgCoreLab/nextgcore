@@ -537,6 +537,8 @@ fn establishment_response(sess_id: u64, continuation: S11Continuation, body: &[u
             "Create Session Response to {peer} carries cause={cause}: the SGW-U refused the \
              user plane (pfcp_cause={pfcp_cause})"
         );
+        // #1283: nothing held for this session can be carried out.
+        crate::dedicated_bearer::on_session_failed(sess_id);
         answer(
             peer,
             Gtp2MessageType::CreateSessionResponse,
@@ -550,6 +552,7 @@ fn establishment_response(sess_id: u64, continuation: S11Continuation, body: &[u
     // Re-read: `handle_session_establishment_response` stored the SGW-U's SEID.
     let Some(sess) = ctx.sess_find_by_id(sess_id) else {
         log::error!("Session {sess_id} vanished before its Create Session Response");
+        crate::dedicated_bearer::on_session_failed(sess_id);
         answer(
             peer,
             Gtp2MessageType::CreateSessionResponse,
@@ -573,6 +576,8 @@ fn establishment_response(sess_id: u64, continuation: S11Continuation, body: &[u
                      (up_seid=0x{up_f_seid:x})"
                 );
             }
+            // #1283: a Create Bearer Request the PGW sent meanwhile goes on now.
+            crate::dedicated_bearer::on_session_established(sess_id);
         }
         Err(e) => {
             log::error!("Failed to build Create Session Response: {e}");
