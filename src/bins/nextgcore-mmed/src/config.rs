@@ -371,15 +371,24 @@ fn apply(ctx: &mut MmeContext, mme: MmeSection) {
             match parse_socket_addr(&address, port) {
                 Some(addr) => {
                     log::info!("S1AP server address: {addr}");
-                    ctx.s1ap_list.push(addr);
+                    // IPv4 in `s1ap_list`, IPv6 in `s1ap_list6`, as the fields say.
+                    if addr.is_ipv4() {
+                        ctx.s1ap_list.push(addr);
+                    } else {
+                        ctx.s1ap_list6.push(addr);
+                    }
                 }
                 None => log::warn!("Ignoring unparsable S1AP server address '{address}'"),
             }
         }
-        if ctx.s1ap_list.len() > 1 {
+        let configured = ctx.s1ap_list.len() + ctx.s1ap_list6.len();
+        if configured > 1 {
             log::warn!(
-                "{} S1AP server addresses configured; only the first is bound",
-                ctx.s1ap_list.len()
+                "{configured} S1AP server addresses configured; only {} is bound",
+                ctx.s1ap_list
+                    .first()
+                    .or(ctx.s1ap_list6.first())
+                    .expect("configured > 1")
             );
         }
     }
@@ -597,14 +606,14 @@ fn sbcap_config(y: SbcapYaml) -> Option<crate::sbcap_path::SbcapConfig> {
     })
 }
 
+/// `address` as `ip:port` (`[v6]:port` for IPv6), or as an IP literal with `port`. An
+/// IPv6 literal may be bare or bracketed (`fd00::5`, `[fd00::5]`); before, a bracketed
+/// one without a port was dropped as unparsable.
 fn parse_socket_addr(address: &str, port: u16) -> Option<std::net::SocketAddr> {
     if let Ok(addr) = address.parse::<std::net::SocketAddr>() {
         return Some(addr);
     }
-    address
-        .parse::<std::net::IpAddr>()
-        .ok()
-        .map(|ip| std::net::SocketAddr::new(ip, port))
+    nextgcore_core::sockaddr::parse_listen_addr(address, port).ok()
 }
 
 /// EPS integrity algorithm name to identity (TS 33.401 Annex B).
@@ -852,6 +861,30 @@ mod tests {
             c.max_associations,
             crate::sbcap_path::DEFAULT_MAX_ASSOCIATIONS
         );
+    }
+
+    /// An IPv6 S1-MME address, bare, bracketed or with a port, is kept in
+    /// `s1ap_list6`, never dropped; IPv4 stays in `s1ap_list`.
+    #[test]
+    fn test_ipv6_s1ap_server_addresses_are_kept() {
+        for (address, want) in [
+            ("fd00::5", "[fd00::5]:36412"),
+            ("'[fd00::5]'", "[fd00::5]:36412"),
+            ("'[fd00::5]:36999'", "[fd00::5]:36999"),
+        ] {
+            let mut ctx = MmeContext::new();
+            let path = write_temp(
+                "nextgcore-mmed-s1ap-v6.yaml",
+                &format!("mme:\n  s1ap:\n    server:\n      - address: {address}\n"),
+            );
+            assert!(load_config(&mut ctx, path.to_str().unwrap()));
+            assert!(ctx.s1ap_list.is_empty(), "{address}");
+            assert_eq!(
+                ctx.s1ap_list6,
+                vec![want.parse::<std::net::SocketAddr>().unwrap()],
+                "{address}"
+            );
+        }
     }
 
     #[test]
