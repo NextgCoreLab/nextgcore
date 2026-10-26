@@ -3547,7 +3547,8 @@ mod tests_multi_rtt_two_sided {
 
     /// T_c in ns (TS 38.211 §4.1), written out independently of codec_glue.
     const TC_NS: f64 = 1e9 / (480_000.0 * 4_096.0);
-    /// TS 38.133 §10.1.25.3: the k0 report value of a zero Rx–Tx difference.
+    /// TS 38.133 §10.1.25.3: the k0 report value `v` is the bin
+    /// `[v − 985025, v − 985024)` T_c, so T lies in bin `floor(T) + 985025` (#1270).
     const MIDPOINT: f64 = 985_024.0;
     const ORIGIN: (f64, f64) = (51.4778, -0.0015);
 
@@ -3599,7 +3600,7 @@ mod tests_multi_rtt_two_sided {
             .iter()
             .map(|(pci, e, n)| {
                 let ue_rx_tx = propagation_ns(*e, *n) + UE_CLOCK_OFFSET_NS - SRS_AFTER_PRS_NS;
-                (*pci, (ue_rx_tx / TC_NS + MIDPOINT).round() as u32)
+                (*pci, ((ue_rx_tx / TC_NS).floor() + MIDPOINT + 1.0) as u32)
             })
             .collect();
         let bytes = crate::lpp_fixtures::multi_rtt_lpp(&cells, 3);
@@ -3792,7 +3793,11 @@ mod tests_dl_tdoa_reference {
             .iter()
             .map(|(prs, pci, e, n)| {
                 let rstd = (range(*e, *n) - d_ref) / SPEED_OF_LIGHT_M_S * 1e9;
-                (*prs, Some(*pci), (rstd / TC_NS + MIDPOINT).round() as u32)
+                (
+                    *prs,
+                    Some(*pci),
+                    ((rstd / TC_NS).floor() + MIDPOINT + 1.0) as u32,
+                )
             })
             .collect();
         let bytes = crate::lpp_fixtures::dl_tdoa_lpp(TRPS[0].0, &neighbours, 9);
@@ -3891,7 +3896,11 @@ mod tests_dl_tdoa_reference {
             .map(|&t| {
                 let (prs, pci, e, n) = TRPS[t];
                 let rstd = (range(e, n) - d_ref) / SPEED_OF_LIGHT_M_S * 1e9;
-                (prs, Some(pci), (rstd / TC_NS + MIDPOINT).round() as u32)
+                (
+                    prs,
+                    Some(pci),
+                    ((rstd / TC_NS).floor() + MIDPOINT + 1.0) as u32,
+                )
             })
             .collect();
         let bytes = crate::lpp_fixtures::dl_tdoa_lpp(rp, &list, txn);
@@ -3913,7 +3922,11 @@ mod tests_dl_tdoa_reference {
             .iter()
             .map(|&(prs, pci, e, n)| {
                 let rstd = (range(e, n) - d_ref) / SPEED_OF_LIGHT_M_S * 1e9;
-                (prs, Some(pci), (rstd / TC_NS + MIDPOINT).round() as u32)
+                (
+                    prs,
+                    Some(pci),
+                    ((rstd / TC_NS).floor() + MIDPOINT + 1.0) as u32,
+                )
             })
             .collect();
         let bytes = crate::lpp_fixtures::dl_tdoa_lpp(ref_prs, &list, txn);
@@ -4146,7 +4159,9 @@ mod tests_dl_tdoa_reference {
         );
         let (_, cells) = crate::codec_glue::decode_lpp_provide_report(&bytes).unwrap();
         let rstd: Vec<Option<f64>> = cells.iter().map(|c| c.rstd_ns).collect();
-        assert_eq!(rstd, [Some(0.0), None, None, Some(0.0)]);
+        // RSTD_0985024 is [−1, 0) T_c: its midpoint (#1270).
+        let tc = 1e9 / (480_000.0 * 4_096.0);
+        assert_eq!(rstd, [Some(0.0), None, None, Some(-0.5 * tc)]);
     }
 
     /// Two entries for one TRP (once by PCI, once by DL-PRS ID) count once.

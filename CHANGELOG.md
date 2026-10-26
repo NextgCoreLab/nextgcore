@@ -13,6 +13,16 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 ## [Unreleased]
 
 ### Changed
+- lmfd decodes the NR E-CID quantities of an NRPPa E-CID report into physical values, so NR
+  E-CID against a real NR gNB gives a fix where it gave 500 `POSITIONING_FAILED`. NR-TADV is the
+  round trip of TS 38.133 §13.5.1 Table 13.5.1-1, used as the E-CID timing term (bin
+  midpoint). The serving cell's SS/CSI-RSRP and RSRQ rank the cell (§10.1.6.1, §10.1.11.1), a
+  GCS AoA NR becomes a bearing (§13.4.1), and the UE Rx-Tx (§10.1.25.3.1, k = 5) is decoded but
+  ranges nothing (#859).
+- lmfd decodes NR-RSTD, UE Rx-Tx and gNB Rx-Tx reports (LPP and NRPPa) to the bin midpoint of
+  TS 38.133 Tables 10.1.23.3.1-x, 10.1.25.3.1-x and 13.2.1-x. Before, it took the upper edge,
+  a bias of half a reporting step (8 ns, about 2.4 m, at k = 5). NR SS/CSI-RSRP reads as the
+  bin's lower edge, `v − 157` dBm (Table 10.1.6.1-1), where it read the upper edge (#1270).
 - pcfd now acts on a change of the UE's policy data at the UDR (the policy-data notification
   it already subscribes to) for the UE's AM and UE policy associations, not only its SM
   sessions (TS 29.513 §5.1.2.2, §5.6.2.2.2). A changed AM policy is pushed to the AMF with

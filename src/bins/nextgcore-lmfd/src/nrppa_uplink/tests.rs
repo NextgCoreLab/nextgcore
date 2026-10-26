@@ -258,7 +258,7 @@ fn a_named_nr_result_item_decodes_from_hand_derived_octets() {
     let nr = cells[0].nr_ecid.as_ref().expect("NR part");
     assert_eq!(nr.ss_rsrp[0].cgi.as_deref(), Some("02f839-000000001"));
     assert_eq!(nr.ss_rsrp[0].cgi.as_deref(), Some(cells[0].nr_cgi.as_str()));
-    assert_eq!(cells[0].rsrp, Some(80 - 156));
+    assert_eq!(cells[0].rsrp, Some(80 - 157));
 }
 
 /// A one-cell report on an NR serving cell (NR cell 1 in [`PLMN`]).
@@ -299,7 +299,7 @@ fn the_serving_cells_rat_picks_the_quantities() {
     let c = nr_cell(vec![ta1(500)]);
     assert_eq!(c.ecid_rtt_ns, Some(1001.0 * ts), "E-UTRA TADV stands in");
     let c = nr_cell(vec![rsrp(&[60]), ss_rsrp(&[(7, 1, Some(100))])]);
-    assert_eq!(c.rsrp, Some(100 - 156), "NR cell: SS-RSRP first");
+    assert_eq!(c.rsrp, Some(100 - 157), "NR cell: SS-RSRP first");
 
     let (_, cells, _) = accepted(&ecid_report(
         1,
@@ -342,13 +342,13 @@ fn the_serving_cells_nr_rsrp_and_rsrq_are_used() {
         (8, 1, Some(2), Some(120)),
         (7, 1, Some(1), Some(70)),
     ])]);
-    assert_eq!(c.rsrp, Some(70 - 156));
+    assert_eq!(c.rsrp, Some(70 - 157));
     // Only neighbours named: no serving value; the CSI-RSRP stands in.
     let c = nr_cell(vec![
         ss_rsrp_named(&[(8, 1, Some(2), Some(120))]),
         csi_rsrp(&[(7, 1, Some(90))]),
     ]);
-    assert_eq!(c.rsrp, Some(90 - 156));
+    assert_eq!(c.rsrp, Some(90 - 157));
     let c = nr_cell(vec![ss_rsrp_named(&[(8, 1, Some(2), Some(120))])]);
     assert_eq!(c.rsrp, None);
     // Unnamed: the strongest; RSRP_127 ("Infinity") is not a measurement.
@@ -357,7 +357,7 @@ fn the_serving_cells_nr_rsrp_and_rsrq_are_used() {
         (8, 1, Some(40)),
         (9, 1, Some(126)),
     ])]);
-    assert_eq!(c.rsrp, Some(126 - 156));
+    assert_eq!(c.rsrp, Some(126 - 157));
     let c = nr_cell(vec![ss_rsrp(&[(7, 1, Some(127)), (8, 1, None)])]);
     assert_eq!(c.rsrp, None);
     // RSRQ: the raw index of TS 38.133 Table 10.1.11.1-1 (as the LPP NR adapter).
@@ -478,7 +478,7 @@ fn every_nr_measured_result_is_kept_as_reported() {
     // strongest unnamed SS-RSRP that is a report (0; 127 is not), AoA NR 3599.
     let tc = crate::positioning::TC_NS;
     assert_eq!(c.ecid_rtt_ns, Some(64.0 * tc));
-    assert_eq!(c.rsrp, Some(-156));
+    assert_eq!(c.rsrp, Some(-157));
     assert!((c.aoa.unwrap() - 180.05).abs() < 1e-9);
     assert_eq!(cell(vec![rsrp(&[60]), ta1(10)]).nr_ecid, None);
 }
