@@ -30,6 +30,21 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   The remaining unbracketed URIs are bracketed as well: nwdafd's NRF callback, seppd's N32f
   client URI and local apiRoot, and scpd's forward target URI and its client, OAuth2-client and
   circuit-breaker keys. An IPv6 producer behind the SCP is now reached (#1298).
+- smfd (PGW-C) gives the packet filters of a dedicated bearer precedences that no filter of the
+  PDN connection uses, keeping their relative order. This applies to local PCC rules and to the
+  filters a Bearer Resource Command adds or replaces. Before, every local rule numbered its
+  filters 0, 1, …. A second rule on the same PDN connection then duplicated the first rule's
+  precedences, and the UE deleted the older filters, or the whole bearer (TS 24.301 §6.4.2.4 d) 2))
+  (#1293). A Delete Bearer Command whose bearers all have a Delete Bearer Request in flight is now
+  answered with a Delete Bearer Failure Indication, cause #101 "Collision with network
+  initiated request" (TS 29.274 §7.2.17.2). Before, it got no answer (#619).
+- An IPv6 SBI address goes in square brackets in every URI a daemon builds from it
+  (RFC 3986 §3.2.2). That covers pcfd's apiRoot and callback URIs, the apiRoot or self/callback
+  base of amfd, ausfd, lmfd, nefd, nrfd, nwdafd, smfd, ucmfd, udmd and udrd, seppd's N32f
+  forward URI, and the SBI client's and SCP's base URI and connect address. Before, an IPv6
+  address gave `http://fd00::1:7777/...`, which is not a valid URI (Refs #1277). One shared
+  helper, `nextgcore_sbi::uri_encode::uri_authority`, does it. The bind-address parse has
+  the same defect and is tracked in #1298.
 - lmfd reads the LPP NR PRS-RSRP of a Multi-RTT or DL-TDOA measurement (`nr-DL-PRS-RSRP-Result`)
   as `v − 157` dBm, the lower edge of TS 38.133 Table 10.1.24.3.1-1. It read `v − 140`, the
   E-UTRA RSRP offset, which put every PRS-RSRP 16-17 dB too high (#1278).
