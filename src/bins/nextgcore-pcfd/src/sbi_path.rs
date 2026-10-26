@@ -1463,10 +1463,9 @@ pub fn advertised_sbi_scheme() -> &'static str {
 pub fn policy_data_notify_uri() -> Option<String> {
     let info = pcf_self_info()?;
     Some(format!(
-        "{}://{}:{}{POLICY_DATA_NOTIFY_PATH}",
+        "{}://{}{POLICY_DATA_NOTIFY_PATH}",
         advertised_sbi_scheme(),
-        info.sbi_addr,
-        info.sbi_port
+        nextgcore_sbi::uri_encode::uri_authority(&info.sbi_addr, info.sbi_port)
     ))
 }
 
@@ -2012,10 +2011,9 @@ pub async fn pcf_deliver_ue_policy(
 pub fn ue_policy_n1n2_failure_uri(pol_asso_id: &str) -> Option<String> {
     let info = pcf_self_info()?;
     Some(format!(
-        "{}://{}:{}{UE_POLICY_N1N2_FAILURE_PATH_PREFIX}/{pol_asso_id}/{UE_POLICY_N1N2_FAILURE_PATH_SUFFIX}",
+        "{}://{}{UE_POLICY_N1N2_FAILURE_PATH_PREFIX}/{pol_asso_id}/{UE_POLICY_N1N2_FAILURE_PATH_SUFFIX}",
         advertised_sbi_scheme(),
-        info.sbi_addr,
-        info.sbi_port
+        nextgcore_sbi::uri_encode::uri_authority(&info.sbi_addr, info.sbi_port)
     ))
 }
 
@@ -2262,7 +2260,12 @@ pub fn pcf_self_info() -> Option<&'static PcfSelfInfo> {
 /// port.
 pub fn pcf_api_root_for(info: &PcfSelfInfo) -> String {
     let host = info.fqdn.as_deref().unwrap_or(&info.sbi_addr);
-    format!("{}://{host}:{}", advertised_sbi_scheme(), info.sbi_port)
+    // An IPv6 address is bracketed (RFC 3986 §3.2.2).
+    format!(
+        "{}://{}",
+        advertised_sbi_scheme(),
+        nextgcore_sbi::uri_encode::uri_authority(host, info.sbi_port)
+    )
 }
 
 /// The resource URI of a resource this PCF serves at `path`
@@ -3037,5 +3040,8 @@ mod tests_api_root {
         assert_eq!(pcf_api_root_for(&info), "http://pcf.example.org:7777");
         info.fqdn = None;
         assert_eq!(pcf_api_root_for(&info), "http://10.0.0.7:7777");
+        // RFC 3986 §3.2.2: an IPv6 address is an IP-literal, in brackets.
+        info.sbi_addr = "fd00::7".into();
+        assert_eq!(pcf_api_root_for(&info), "http://[fd00::7]:7777");
     }
 }

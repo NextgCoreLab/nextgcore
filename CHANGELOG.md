@@ -17,6 +17,13 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   10.2.1-1: 0.5 degree bins, counter-clockwise from North (TS 36.214 §5.2.7). It is turned into
   the AoA solver's clockwise bearing, at the bin midpoint. Before, it took the report value as
   the angle, which was both twice too large and the wrong way round (#1269).
+- An IPv6 SBI address goes in square brackets in every URI a daemon builds from it
+  (RFC 3986 §3.2.2). That covers pcfd's apiRoot and callback URIs, the apiRoot or self/callback
+  base of amfd, ausfd, lmfd, nefd, nrfd, nwdafd, smfd, ucmfd, udmd and udrd, seppd's N32f
+  forward URI, and the SBI client's and SCP's base URI and connect address. Before, an IPv6
+  address gave `http://fd00::1:7777/...`, which is not a valid URI (Refs #1277). One shared
+  helper, `nextgcore_sbi::uri_encode::uri_authority`, does it. The bind-address parse has
+  the same defect and is tracked in #1298.
 - lmfd reads the LPP NR PRS-RSRP of a Multi-RTT or DL-TDOA measurement (`nr-DL-PRS-RSRP-Result`)
   as `v − 157` dBm, the lower edge of TS 38.133 Table 10.1.24.3.1-1. It read `v − 140`, the
   E-UTRA RSRP offset, which put every PRS-RSRP 16-17 dB too high (#1278).

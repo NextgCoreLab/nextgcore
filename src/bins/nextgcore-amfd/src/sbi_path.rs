@@ -3297,7 +3297,11 @@ pub fn advertised_sbi_base() -> String {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(7777);
-    format!("{}://{addr}:{port}", advertised_sbi_scheme())
+    format!(
+        "{}://{}",
+        advertised_sbi_scheme(),
+        nextgcore_sbi::uri_encode::uri_authority(&addr, port)
+    )
 }
 
 /// Whether the SBI listener this AMF started is TLS-protected (issue #63).

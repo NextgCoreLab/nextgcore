@@ -373,7 +373,10 @@ pub async fn forward_n32f_request_async(
 
     // Build the SBI request for the peer SEPP's N32f endpoint
     let scheme = if tls_enabled { "https" } else { "http" };
-    let forward_uri = format!("{scheme}://{host}:{port}/n32f-forward/v1/n32f-process");
+    let forward_uri = format!(
+        "{scheme}://{}/n32f-forward/v1/n32f-process",
+        nextgcore_sbi::uri_encode::uri_authority(&host, port)
+    );
 
     let sbi_config = nextgcore_sbi::client::SbiClientConfig::new(&host, port);
     let sbi_client = nextgcore_sbi::client::SbiClient::new(sbi_config);

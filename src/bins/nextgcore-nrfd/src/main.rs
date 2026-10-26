@@ -999,7 +999,11 @@ async fn main() -> Result<()> {
 
     // Store the NRF's own SBI URI so notification handlers can use it
     let scheme = if args.tls { "https" } else { "http" };
-    let self_uri = format!("{}://{}:{}", scheme, args.sbi_addr, args.sbi_port);
+    let self_uri = format!(
+        "{}://{}",
+        scheme,
+        nextgcore_sbi::uri_encode::uri_authority(&args.sbi_addr, args.sbi_port)
+    );
     NRF_SELF_URI.set(self_uri).ok();
 
     // The NRF's NF Instance ID is the OAuth2 token issuer (TS 29.510
