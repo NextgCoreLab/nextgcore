@@ -1290,20 +1290,21 @@ pub async fn handle_ue_policy_create(request: &SbiRequest) -> SbiResponse {
 }
 
 /// Extract the source PLMN (mcc, mnc) for the D.6.2 sublist from the
-/// PolicyAssociationRequest (`servingPlmn`, else `guami.plmnId`); default to
-/// the test PLMN 001-01 when neither is present.
-fn ue_policy_source_plmn(data: &serde_json::Value) -> (String, String) {
+/// PolicyAssociationRequest (`servingPlmn`, else `guami.plmnId`). `None` when
+/// neither is present (#1261 review): the PLMN goes into the UE policy section
+/// the UE installs (TS 24.501 D.6.2), so a made-up one is not used.
+fn ue_policy_source_plmn(data: &serde_json::Value) -> Option<(String, String)> {
     for ptr in ["/servingPlmn", "/guami/plmnId"] {
         if let Some(plmn) = data.pointer(ptr) {
             if let (Some(mcc), Some(mnc)) = (
                 plmn.get("mcc").and_then(|v| v.as_str()),
                 plmn.get("mnc").and_then(|v| v.as_str()),
             ) {
-                return (mcc.to_string(), mnc.to_string());
+                return Some((mcc.to_string(), mnc.to_string()));
             }
         }
     }
-    ("001".to_string(), "01".to_string())
+    None
 }
 
 /// Build the URSP MANAGE UE POLICY COMMAND for a new association, record the
@@ -1325,7 +1326,20 @@ fn spawn_ue_policy_redelivery(pol_asso_id: &str, supi: &str, data: &serde_json::
 }
 
 fn spawn_ue_policy_delivery(pol_asso_id: &str, supi: &str, data: &serde_json::Value) {
-    let (mcc, mnc) = ue_policy_source_plmn(data);
+    // An update that omits both members keeps the PLMN the association has.
+    let plmn = ue_policy_source_plmn(data)
+        .or_else(|| ue_policy::ue_policy_find(pol_asso_id).and_then(|a| a.plmn));
+    let Some((mcc, mnc)) = plmn else {
+        log::warn!(
+            "[{pol_asso_id}] UE policy: the request names no serving PLMN (servingPlmn or \
+             guami), so no UE policy section can be built (TS 24.501 D.6.2); not delivering"
+        );
+        ue_policy::ue_policy_update_delivery_state(
+            pol_asso_id,
+            ue_policy::DeliveryState::Failed("no serving PLMN to build the section for".into()),
+        );
+        return;
+    };
     let pti = ue_policy::alloc_pti();
     let upsc: u16 = 1; // first (only) UE policy section of this association
 
@@ -1356,40 +1370,75 @@ fn spawn_ue_policy_delivery(pol_asso_id: &str, supi: &str, data: &serde_json::Va
         // E3: provision the resolved rules into the per-SUPI UE-policy context
         // (the mapping target; E6 reads it to correlate the COMPLETE/REJECT).
         ue_policy::provision_context_ursp(&supi, rules.clone());
-        // Re-record the resolved rules (no-op if identical to the default, or if
-        // the association was deleted meanwhile).
-        ue_policy::ue_policy_set_delivery(
+        // Re-record the resolved rules (no-op if the association was deleted
+        // meanwhile). It starts the delivery generation this task sends for.
+        let Some(generation) = ue_policy::ue_policy_set_delivery(
             &id,
             pti,
             upsc,
             Some((mcc.clone(), mnc.clone())),
             rules.clone(),
-        );
+        ) else {
+            return;
+        };
 
         // #91: only the sections the UE does not already have. `installed` comes from
         // the UE STATE INDICATION in `uePolReq` (or a later uplink one); empty means a
         // full delivery, which is the pre-#91 behaviour and the correct one when the UE
         // reported nothing.
         let installed = ue_policy::installed_upscs_for_plmn(&id, &mcc, &mnc);
-        deliver_ue_policy_rules(id, supi, pti, upsc, mcc, mnc, rules, installed).await;
+        deliver_ue_policy_rules(DeliveryJob {
+            id,
+            supi,
+            generation,
+            pti,
+            upsc,
+            mcc,
+            mnc,
+            rules,
+            installed,
+        })
+        .await;
     });
 }
 
-/// Encode `rules` as a MANAGE UE POLICY COMMAND (only the sections not in
-/// `installed`), subscribe to the AMF's UPDP notifications, and transfer it over
-/// Namf N1N2 with T3501 running (TS 29.513 §5.6.1.2 steps 12-15). Shared by the
-/// consumer-driven delivery above and the PCF-initiated one (#1261).
-#[allow(clippy::too_many_arguments)]
-async fn deliver_ue_policy_rules(
+/// One UE policy delivery for [`deliver_ue_policy_rules`]: the association, the
+/// delivery generation it belongs to (`ue_policy_set_delivery`), and the command's
+/// parameters.
+struct DeliveryJob {
     id: String,
     supi: String,
+    generation: u64,
     pti: u8,
     upsc: u16,
     mcc: String,
     mnc: String,
     rules: Vec<ue_policy::UrspRule>,
     installed: Vec<u16>,
-) {
+}
+
+/// Encode `rules` as a MANAGE UE POLICY COMMAND (only the sections not in
+/// `installed`), subscribe to the AMF's UPDP notifications, and transfer it over
+/// Namf N1N2 with T3501 running (TS 29.513 §5.6.1.2 steps 12-15). Shared by the
+/// consumer-driven delivery above and the PCF-initiated one (#1261).
+async fn deliver_ue_policy_rules(job: DeliveryJob) {
+    let DeliveryJob {
+        id,
+        supi,
+        generation,
+        pti,
+        upsc,
+        mcc,
+        mnc,
+        rules,
+        installed,
+    } = job;
+    // #1261 review: a newer delivery (a re-evaluation, an update) may have started
+    // while this one read the UDR. Its command is the one to send.
+    if !ue_policy::ue_policy_delivery_is_current(&id, generation) {
+        log::info!("[{supi}] UE policy: delivery superseded before it was sent; dropped");
+        return;
+    }
     let built = ue_policy::build_manage_ue_policy_delta(
         pti,
         upsc,
@@ -1465,7 +1514,7 @@ async fn deliver_ue_policy_rules(
             let supi_retx = supi.clone();
             let pdu_retx = pdu.clone();
             let id_retx = id.clone();
-            ue_policy::run_t3501(&id, dur, move || {
+            ue_policy::run_t3501(&id, generation, dur, move || {
                 let supi = supi_retx.clone();
                 let pdu = pdu_retx.clone();
                 let id = id_retx.clone();
@@ -3245,31 +3294,38 @@ async fn reevaluate_ue_policy(
         return false;
     }
     log::info!("[{id}] UE policy re-evaluation: the URSP changed; delivering it to the UE");
-    let (mcc, mnc) = assoc
-        .plmn
-        .clone()
-        .unwrap_or_else(|| ("001".to_string(), "01".to_string()));
+    // The PLMN the association's section was built for (TS 24.501 D.6.2). None
+    // means the AMF named no serving PLMN, so there is no section to replace.
+    let Some((mcc, mnc)) = assoc.plmn.clone() else {
+        log::warn!("[{id}] UE policy re-evaluation: no serving PLMN known; not delivering");
+        return false;
+    };
     let upsc = assoc.upsc.max(1);
     // A fresh PTI: a new UE policy delivery procedure (TS 24.501 D.1.2).
     let pti = ue_policy::alloc_pti();
     ue_policy::provision_context_ursp(&supi, rules.clone());
-    ue_policy::ue_policy_set_delivery(
+    // A new delivery generation: the T3501 loop of the delivery this replaces
+    // stops at its next expiry instead of retransmitting the old URSP.
+    let Some(generation) = ue_policy::ue_policy_set_delivery(
         &id,
         pti,
         upsc,
         Some((mcc.clone(), mnc.clone())),
         rules.clone(),
-    );
-    tokio::spawn(deliver_ue_policy_rules(
+    ) else {
+        return false;
+    };
+    tokio::spawn(deliver_ue_policy_rules(DeliveryJob {
         id,
         supi,
+        generation,
         pti,
         upsc,
         mcc,
         mnc,
         rules,
-        Vec::new(),
-    ));
+        installed: Vec::new(),
+    }));
     true
 }
 
@@ -5694,6 +5750,43 @@ mod tests {
         assert!(dec.triggers.contains(&"QOS_NOTIF".to_string()));
     }
 
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn a_ue_policy_create_naming_no_plmn_delivers_nothing() {
+        // #1261 review: the PLMN goes into the section the UE installs (TS 24.501
+        // D.6.2). With neither servingPlmn nor guami there is none to use, and the
+        // test PLMN 001-01 is no longer made up for it.
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _delivery = crate::test_support::ue_policy_delivery(true);
+        pcf_context_init(64, 64);
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-ue-policy-control/v1/policies",
+            Some(serde_json::json!({
+                "notificationUri": "http://127.0.0.1:9/namf-callback/v1/ue-policy/1",
+                "supi": "imsi-001010000012611",
+                "suppFeat": "0"
+            })),
+        ))
+        .await;
+        assert_eq!(resp.status, 201, "the association is still created");
+        let loc = resp.http.get_header("location").expect("Location").clone();
+        let id = loc.rsplit('/').next().unwrap();
+        let assoc = ue_policy::ue_policy_find(id).expect("association");
+        assert_eq!(
+            (assoc.pti, assoc.plmn),
+            (0, None),
+            "no delivery was configured"
+        );
+        assert!(matches!(
+            assoc.delivery_state,
+            ue_policy::DeliveryState::Failed(_)
+        ));
+        ue_policy::ue_policy_remove(id);
+    }
+
     /// pcfd#0: full Npcf_UEPolicyControl lifecycle (TS 29.525).
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
@@ -5721,10 +5814,12 @@ mod tests {
         assert_eq!(resp.status, 400);
 
         // Create -> 201 + Location + PolicyAssociation (suppFeat mandatory, triggers minItems1)
+        // #1261 review: the AMF names the serving PLMN the UE policy section is for.
         let ok = serde_json::json!({
             "notificationUri": "http://127.0.0.1:9/namf-callback/v1/ue-policy/1",
             "supi": "imsi-001010000000070",
-            "suppFeat": "0"
+            "suppFeat": "0",
+            "servingPlmn": { "mcc": "001", "mnc": "01" }
         });
         let resp = pcf_sbi_request_handler(make_request(
             "POST",

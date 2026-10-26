@@ -222,6 +222,9 @@ async fn a_policy_data_change_is_pushed_to_the_amf_and_the_ue() {
     let _delivery = nextgcore_pcfd::test_support::ue_policy_delivery(true);
     nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
     std::env::remove_var("PCF_URSP_RULES");
+    // A short T3501 (this test binary is its own process), so the first delivery's
+    // timer expires while the test still watches (#1261 review).
+    std::env::set_var("PCF_T3501_SECS", "1");
     nextgcore_pcfd::test_support::init_context();
     seed_amf_ue(SUPI);
 
@@ -323,6 +326,21 @@ async fn a_policy_data_change_is_pushed_to_the_amf_and_the_ue() {
     assert!(
         relayed(&log, |r| r.path.contains("/ue-policy-notify/")).is_empty(),
         "no Npcf_UEPolicyControl_UpdateNotify: the triggers did not change"
+    );
+
+    // #1261 review: the create's T3501 was still running when the re-evaluation
+    // started a new delivery. Once it expires it must not retransmit the OLD
+    // command after the new one, which would put the old URSP back.
+    let old_cmd = distinct_n1n2(&log)[0].clone();
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    let bodies: Vec<String> = relayed(&log, is_n1n2)
+        .into_iter()
+        .map(|r| r.body.unwrap_or_default())
+        .collect();
+    let first_new = bodies.iter().position(|b| *b != old_cmd).unwrap();
+    assert!(
+        bodies[first_new..].iter().all(|b| *b != old_cmd),
+        "the superseded command was retransmitted after the new one"
     );
 
     // And again unchanged: nothing more.
