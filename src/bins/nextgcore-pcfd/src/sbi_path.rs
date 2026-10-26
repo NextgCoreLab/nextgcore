@@ -86,7 +86,10 @@ fn build_pcf_nf_instance(config: &SbiServerConfig) -> NfInstance {
         .filter(|a| !a.is_empty())
         .into_iter()
         .collect();
-    nf_instance.ipv4_addresses.extend(addrs.iter().cloned());
+    // #1324: in the address of its type (IPv4, IPv6 or FQDN).
+    for a in &addrs {
+        nextgcore_sbi::nf_addressing::set_instance_host(&mut nf_instance, a);
+    }
     nf_instance.heartbeat_interval = 10;
 
     let scheme = if config.tls_enabled {
@@ -98,7 +101,9 @@ fn build_pcf_nf_instance(config: &SbiServerConfig) -> NfInstance {
     for (service_type, _allowed) in PCF_SERVICES {
         let mut svc = NfService::new(service_type.to_name(), *service_type);
         svc.scheme = scheme;
-        svc.ip_addresses.extend(addrs.iter().cloned());
+        for a in &addrs {
+            nextgcore_sbi::nf_addressing::set_service_host(&mut svc, a);
+        }
         svc.port = config.port;
         nf_instance.add_service(svc);
     }
@@ -136,9 +141,15 @@ pub fn pcf_nf_profile_json(nf_instance: &NfInstance) -> serde_json::Value {
                 }).collect::<Vec<_>>(),
                 "scheme": s.scheme.as_str(),
                 "nfServiceStatus": "REGISTERED",
-                "ipEndPoints": s.ip_addresses.iter().map(|a| {
-                    serde_json::json!({"ipv4Address": a, "port": s.port})
-                }).collect::<Vec<_>>(),
+                // #1324: by address type; an FQDN service gives a port-only endpoint.
+                "ipEndPoints": if s.ip_addresses.is_empty() && s.fqdn.is_some() {
+                    vec![serde_json::json!({"port": s.port})]
+                } else {
+                    s.ip_addresses
+                        .iter()
+                        .map(|a| nextgcore_sbi::nf_addressing::ip_end_point(a, s.port))
+                        .collect::<Vec<_>>()
+                },
                 "allowedNfTypes": allowed_nf_types_for(&s.name),
             })
         })
@@ -155,7 +166,7 @@ pub fn pcf_nf_profile_json(nf_instance: &NfInstance) -> serde_json::Value {
         }
     }
 
-    serde_json::json!({
+    let mut profile = serde_json::json!({
         "nfInstanceId": nf_instance.id,
         "nfType": "PCF",
         "nfStatus": "REGISTERED",
@@ -163,7 +174,19 @@ pub fn pcf_nf_profile_json(nf_instance: &NfInstance) -> serde_json::Value {
         "ipv4Addresses": nf_instance.ipv4_addresses,
         "nfServices": services,
         "allowedNfTypes": allowed,
-    })
+    });
+    // #1324: each address list only when it has one (TS 29.510 minItems 1), and
+    // an FQDN host as the profile fqdn.
+    if nf_instance.ipv4_addresses.is_empty() {
+        profile.as_object_mut().map(|o| o.remove("ipv4Addresses"));
+    }
+    if !nf_instance.ipv6_addresses.is_empty() {
+        profile["ipv6Addresses"] = serde_json::json!(nf_instance.ipv6_addresses);
+    }
+    if let Some(fqdn) = &nf_instance.fqdn {
+        profile["fqdn"] = serde_json::json!(fqdn);
+    }
+    profile
 }
 
 /// Parse host and port from a URI string (e.g., "http://127.0.0.1:7777")
@@ -3145,5 +3168,26 @@ mod tests_api_root {
         // RFC 3986 §3.2.2: an IPv6 address is an IP-literal, in brackets.
         info.sbi_addr = "fd00::7".into();
         assert_eq!(pcf_api_root_for(&info), "http://[fd00::7]:7777");
+    }
+}
+
+/// #1324: the NFProfile carries its host where its type belongs (TS 29.510
+/// §6.1.6.2.2): IPv4 in ipv4Addresses, IPv6 in ipv6Addresses, an FQDN as fqdn, and
+/// the service ipEndPoints likewise.
+#[cfg(test)]
+mod tests_nf_profile_host_kind_1324 {
+    use super::*;
+
+    #[test]
+    fn the_nf_profile_carries_its_host_by_type() {
+        for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
+            let profile = pcf_nf_profile_json(&build_pcf_nf_instance(&SbiServerConfig {
+                addr: host.to_string(),
+                ..SbiServerConfig::default()
+            }));
+            let problems =
+                nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
+            assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
+        }
     }
 }

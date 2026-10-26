@@ -716,20 +716,23 @@ fn nrf_self_profile() -> serde_json::Value {
         Some((h, p)) => (h, p.parse::<u16>().unwrap_or(7777)),
         None => (host_port, 7777),
     };
-    serde_json::json!({
-        "nfInstanceId": nrf_instance_id(),
-        "nfType": NfType::Nrf.to_str(),
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [host],
-        "nfServices": [{
-            "serviceInstanceId": "nnrf-oauth2",
-            "serviceName": "nnrf-oauth2",
-            "versions": [{ "apiVersionInUri": "v1", "apiFullVersion": "1.0.0" }],
-            "scheme": scheme,
-            "nfServiceStatus": "REGISTERED",
-            "ipEndPoints": [{ "ipv4Address": host, "port": port, "transport": "TCP" }],
-        }],
-    })
+    nextgcore_sbi::nf_addressing::classify_profile_host(
+        serde_json::json!({
+            "nfInstanceId": nrf_instance_id(),
+            "nfType": NfType::Nrf.to_str(),
+            "nfStatus": "REGISTERED",
+            "ipv4Addresses": [host],
+            "nfServices": [{
+                "serviceInstanceId": "nnrf-oauth2",
+                "serviceName": "nnrf-oauth2",
+                "versions": [{ "apiVersionInUri": "v1", "apiFullVersion": "1.0.0" }],
+                "scheme": scheme,
+                "nfServiceStatus": "REGISTERED",
+                "ipEndPoints": [{ "ipv4Address": host, "port": port, "transport": "TCP" }],
+            }],
+        }),
+        host,
+    )
 }
 
 /// Register the NRF in its own registry (issue #187, criterion 5).

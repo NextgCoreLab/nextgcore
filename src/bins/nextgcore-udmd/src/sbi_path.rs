@@ -105,15 +105,18 @@ pub fn build_udm_nf_profile(
             })
         })
         .collect();
-    serde_json::json!({
-        "nfInstanceId": nf_instance_id,
-        "nfType": "UDM",
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [sbi_addr],
-        "nfServices": services,
-        "allowedNfTypes": config.allowed_nf_types,
-        "heartBeatTimer": config.heart_beat_timer,
-    })
+    nextgcore_sbi::nf_addressing::classify_profile_host(
+        serde_json::json!({
+            "nfInstanceId": nf_instance_id,
+            "nfType": "UDM",
+            "nfStatus": "REGISTERED",
+            "ipv4Addresses": [sbi_addr],
+            "nfServices": services,
+            "allowedNfTypes": config.allowed_nf_types,
+            "heartBeatTimer": config.heart_beat_timer,
+        }),
+        sbi_addr,
+    )
 }
 
 /// Open SBI server and register with NRF
@@ -127,7 +130,7 @@ pub fn udm_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
     // Build self NF instance for UDM
     let nf_instance_id = nextgcore_sbi::nf_instance_id::nf_instance_id(NfType::Udm).to_string();
     let mut nf_instance = NfInstance::new(&nf_instance_id, NfType::Udm);
-    nf_instance.ipv4_addresses.push(config.addr.clone());
+    nextgcore_sbi::nf_addressing::set_instance_host(&mut nf_instance, &config.addr);
 
     // Register every Nudm service this UDM serves, from the shared table so the
     // self instance and the NRF profile cannot disagree (#85).
@@ -1287,5 +1290,28 @@ mod tests {
             parse_callback_uri("/namf-callback/v1/imsi-001010000000001/dereg-notify"),
             None
         );
+    }
+}
+
+/// #1324: the NFProfile carries its host where its type belongs (TS 29.510
+/// §6.1.6.2.2): IPv4 in ipv4Addresses, IPv6 in ipv6Addresses, an FQDN as fqdn, and
+/// the service ipEndPoints likewise.
+#[cfg(test)]
+mod tests_nf_profile_host_kind_1324 {
+    use super::*;
+
+    #[test]
+    fn the_nf_profile_carries_its_host_by_type() {
+        for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
+            let profile = build_udm_nf_profile(
+                "id",
+                host,
+                7777,
+                &crate::context::NfProfileConfig::default(),
+            );
+            let problems =
+                nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
+            assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
+        }
     }
 }

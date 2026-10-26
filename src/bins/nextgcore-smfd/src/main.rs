@@ -1725,12 +1725,12 @@ const SMF_SERVICES: &[(nextgcore_sbi::types::SbiServiceType, &[&str])] = &[
 /// Build this SMF's typed self NF instance from [`SMF_SERVICES`].
 fn build_smf_nf_instance(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> NfInstance {
     let mut self_instance = NfInstance::new(nf_instance_id, nextgcore_sbi::types::NfType::Smf);
-    self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
+    nextgcore_sbi::nf_addressing::set_instance_host(&mut self_instance, sbi_addr);
     self_instance.heartbeat_interval = 10;
     for (service_type, _allowed) in SMF_SERVICES {
         let mut svc = NfService::new(service_type.to_name(), *service_type);
         svc.port = sbi_port;
-        svc.ip_addresses = vec![sbi_addr.to_string()];
+        nextgcore_sbi::nf_addressing::set_service_host(&mut svc, sbi_addr);
         self_instance.add_service(svc);
     }
     self_instance
@@ -1769,15 +1769,18 @@ fn build_smf_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> 
         }
     }
 
-    let mut profile = serde_json::json!({
-        "nfInstanceId": nf_instance_id,
-        "nfType": "SMF",
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [sbi_addr],
-        "nfServices": services,
-        "allowedNfTypes": nf_allowed,
-        "heartBeatTimer": 10
-    });
+    let mut profile = nextgcore_sbi::nf_addressing::classify_profile_host(
+        serde_json::json!({
+            "nfInstanceId": nf_instance_id,
+            "nfType": "SMF",
+            "nfStatus": "REGISTERED",
+            "ipv4Addresses": [sbi_addr],
+            "nfServices": services,
+            "allowedNfTypes": nf_allowed,
+            "heartBeatTimer": 10
+        }),
+        sbi_addr,
+    );
     // #475: a PGW-C+SMF advertises its S5/S8 FQDN, because an initial AMF in an EPS→5GS
     // handover discovers it by exactly that (TS 23.502 §4.11.1.2.2.2 step 3: *"the
     // Nnrf_NFDiscovery_Request including the FQDN for the S5/S8 interface of the
@@ -25307,5 +25310,23 @@ mod tests_advertise_uri_1322 {
         assert_eq!(sbi.host, "0.0.0.0");
         let adv = sbi.advertise.expect("an advertised host");
         assert!(!nextgcore_core::sockaddr::is_wildcard_host(&adv));
+    }
+}
+
+/// #1324: the NFProfile carries its host where its type belongs (TS 29.510
+/// §6.1.6.2.2): IPv4 in ipv4Addresses, IPv6 in ipv6Addresses, an FQDN as fqdn, and
+/// the service ipEndPoints likewise.
+#[cfg(test)]
+mod tests_nf_profile_host_kind_1324 {
+    use super::*;
+
+    #[test]
+    fn the_nf_profile_carries_its_host_by_type() {
+        for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
+            let profile = build_smf_nf_profile("id", host, 7777);
+            let problems =
+                nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
+            assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
+        }
     }
 }

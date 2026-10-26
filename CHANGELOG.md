@@ -51,6 +51,14 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   resourceUri or BSF PcfBinding endpoint on the wildcard (each is skipped). Applies to ausfd, bsfd, nssfd, pcfd, udmd, udrd, dccfd, lmfd, mbsmfd, nsacfd and nwdafd,
   and to eesd's ECS registration. The k8s manifests, the EKS profiles (which build on them)
   and the Helm chart set `NEXTGCORE_SBI_ADVERTISE` to the pod IP for the first six.
+- Every NF's NFProfile puts its advertised host where its type belongs (TS 29.510
+  §6.1.6.2.2, #1324): an IPv4 literal in `ipv4Addresses`, an IPv6 literal (unbracketed) in
+  `ipv6Addresses`, an FQDN as `fqdn`, and each NFService `ipEndPoints` entry as `ipv4Address`,
+  `ipv6Address`, or port only for an FQDN. Before, an IPv6 or FQDN advertise host went into
+  `ipv4Addresses` and gave the NRF an invalid profile. One helper,
+  `nextgcore_sbi::nf_addressing`, serves amfd, ausfd, bsfd, dccfd, easdfd, lmfd, mbsmfd,
+  nefd, nrfd, nsacfd, nssfd, nwdafd, pcfd, smfd, tsctsf, ucmfd, udmd, udrd and upfd, and their
+  self NF instances. IPv4 profiles are unchanged.
 - **amfd, smfd, nefd and ucmfd refuse to start on a wildcard SBI bind with nothing to
   advertise**, where they put `0.0.0.0` (amfd, nefd, ucmfd), `127.0.0.1` or `::` (smfd) in
   the callback URIs, `Location` / resource URIs and NFProfiles they hand peers (#1322). The

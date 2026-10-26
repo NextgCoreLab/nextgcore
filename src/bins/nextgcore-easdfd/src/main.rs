@@ -921,35 +921,38 @@ async fn handle_baseline_pattern_delete(id: &str) -> SbiResponse {
 /// Build the NFProfile registered with the NRF (TS 29.510): nfType EASDF
 /// advertising the neasdf-dnscontext service (TS 29.556).
 fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
-    serde_json::json!({
-        "nfInstanceId": nf_instance_id,
-        "nfType": "EASDF",
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [sbi_addr],
-        "nfServices": [
-            {
-                "serviceInstanceId": format!("{nf_instance_id}-neasdf-dnscontext"),
-                "serviceName": "neasdf-dnscontext",
-                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-                "scheme": "http",
-                "nfServiceStatus": "REGISTERED",
-                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
-            },
-            // #114: TS 23.501 Table 7.2.25-1 lists BOTH EASDF services. Only the
-            // first was advertised, so an SMF discovering this EASDF was told it
-            // offers half of what an EASDF offers.
-            {
-                "serviceInstanceId": format!("{nf_instance_id}-neasdf-baselinednspattern"),
-                "serviceName": "neasdf-baselinednspattern",
-                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-                "scheme": "http",
-                "nfServiceStatus": "REGISTERED",
-                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
-            }
-        ],
-        "allowedNfTypes": ["SMF", "AMF", "SCP"],
-        "heartBeatTimer": 10
-    })
+    nextgcore_sbi::nf_addressing::classify_profile_host(
+        serde_json::json!({
+            "nfInstanceId": nf_instance_id,
+            "nfType": "EASDF",
+            "nfStatus": "REGISTERED",
+            "ipv4Addresses": [sbi_addr],
+            "nfServices": [
+                {
+                    "serviceInstanceId": format!("{nf_instance_id}-neasdf-dnscontext"),
+                    "serviceName": "neasdf-dnscontext",
+                    "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+                    "scheme": "http",
+                    "nfServiceStatus": "REGISTERED",
+                    "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
+                },
+                // #114: TS 23.501 Table 7.2.25-1 lists BOTH EASDF services. Only the
+                // first was advertised, so an SMF discovering this EASDF was told it
+                // offers half of what an EASDF offers.
+                {
+                    "serviceInstanceId": format!("{nf_instance_id}-neasdf-baselinednspattern"),
+                    "serviceName": "neasdf-baselinednspattern",
+                    "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+                    "scheme": "http",
+                    "nfServiceStatus": "REGISTERED",
+                    "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
+                }
+            ],
+            "allowedNfTypes": ["SMF", "AMF", "SCP"],
+            "heartBeatTimer": 10
+        }),
+        sbi_addr,
+    )
 }
 
 /// Register EASDF with NRF (PUT /nnrf-nfm/v1/nf-instances/{id}, nwdafd
@@ -994,13 +997,13 @@ async fn register_with_nrf(
                 nf_instance_id,
                 nextgcore_sbi::types::NfType::Easdf,
             );
-            self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
+            nextgcore_sbi::nf_addressing::set_instance_host(&mut self_instance, sbi_addr);
             let mut svc = nextgcore_sbi::context::NfService::new(
                 "neasdf-dnscontext",
                 nextgcore_sbi::types::SbiServiceType::NeasdfDnscontext,
             );
             svc.port = sbi_port;
-            svc.ip_addresses = vec![sbi_addr.to_string()];
+            nextgcore_sbi::nf_addressing::set_service_host(&mut svc, sbi_addr);
             self_instance.add_service(svc);
             sbi_ctx.set_self_instance(self_instance).await;
 
@@ -1707,5 +1710,23 @@ easdf:
             names.contains(&"neasdf-baselinednspattern"),
             "the second EASDF service must be advertised, got {names:?}"
         );
+    }
+}
+
+/// #1324: the NFProfile carries its host where its type belongs (TS 29.510
+/// §6.1.6.2.2): IPv4 in ipv4Addresses, IPv6 in ipv6Addresses, an FQDN as fqdn, and
+/// the service ipEndPoints likewise.
+#[cfg(test)]
+mod tests_nf_profile_host_kind_1324 {
+    use super::*;
+
+    #[test]
+    fn the_nf_profile_carries_its_host_by_type() {
+        for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
+            let profile = build_nf_profile("id", host, 7777);
+            let problems =
+                nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
+            assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
+        }
     }
 }

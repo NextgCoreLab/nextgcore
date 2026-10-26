@@ -686,24 +686,27 @@ fn build_upf_nf_profile(
     gtpu_addr: &str,
     load: u8,
 ) -> serde_json::Value {
-    serde_json::json!({
-        "nfInstanceId": nf_instance_id,
-        "nfType": "UPF",
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [pfcp_addr],
-        "load": load,
-        "upfInfo": {
-            "sNssaiUpfInfoList": [{
-                "sNssai": { "sst": 1 },
-                "dnnUpfInfoList": [{ "dnn": "internet" }]
-            }],
-            "interfaceUpfInfoList": [{
-                "interfaceType": "N3",
-                "ipv4EndpointAddresses": [gtpu_addr]
-            }]
-        },
-        "heartBeatTimer": 10
-    })
+    nextgcore_sbi::nf_addressing::classify_profile_host(
+        serde_json::json!({
+            "nfInstanceId": nf_instance_id,
+            "nfType": "UPF",
+            "nfStatus": "REGISTERED",
+            "ipv4Addresses": [pfcp_addr],
+            "load": load,
+            "upfInfo": {
+                "sNssaiUpfInfoList": [{
+                    "sNssai": { "sst": 1 },
+                    "dnnUpfInfoList": [{ "dnn": "internet" }]
+                }],
+                "interfaceUpfInfoList": [{
+                    "interfaceType": "N3",
+                    "ipv4EndpointAddresses": [gtpu_addr]
+                }]
+            },
+            "heartBeatTimer": 10
+        }),
+        pfcp_addr,
+    )
 }
 
 /// Register the UPF with the NRF via `PUT /nnrf-nfm/v1/nf-instances/{id}`
@@ -1858,5 +1861,23 @@ mod tests {
             parse_host_port("http://nrf.local"),
             Some(("nrf.local".to_string(), 80))
         );
+    }
+}
+
+/// #1324: the NFProfile carries its host where its type belongs (TS 29.510
+/// §6.1.6.2.2): IPv4 in ipv4Addresses, IPv6 in ipv6Addresses, an FQDN as fqdn, and
+/// the service ipEndPoints likewise.
+#[cfg(test)]
+mod tests_nf_profile_host_kind_1324 {
+    use super::*;
+
+    #[test]
+    fn the_nf_profile_carries_its_host_by_type() {
+        for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
+            let profile = build_upf_nf_profile("id", host, "10.0.0.9", 0);
+            let problems =
+                nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
+            assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
+        }
     }
 }

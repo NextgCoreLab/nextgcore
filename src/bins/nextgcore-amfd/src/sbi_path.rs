@@ -361,14 +361,14 @@ fn allowed_nf_types_for(service_name: &str) -> &'static [&'static str] {
 /// Build this AMF's typed self NF instance from [`AMF_SERVICES`].
 fn build_amf_nf_instance(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> NfInstance {
     let mut nf_instance = NfInstance::new(nf_instance_id, nextgcore_sbi::types::NfType::Amf);
-    nf_instance.ipv4_addresses.push(sbi_addr.to_string());
+    nextgcore_sbi::nf_addressing::set_instance_host(&mut nf_instance, sbi_addr);
     nf_instance.heartbeat_interval = 10;
 
     for (service_type, _allowed) in AMF_SERVICES {
         let mut svc = NfService::new(service_type.to_name(), *service_type);
         svc.versions = vec![api_version::V1.to_string()];
         svc.port = sbi_port;
-        svc.ip_addresses.push(sbi_addr.to_string());
+        nextgcore_sbi::nf_addressing::set_service_host(&mut svc, sbi_addr);
         nf_instance.add_service(svc);
     }
 
@@ -421,15 +421,18 @@ pub fn amf_nf_profile_json(
         }
     }
 
-    let mut nf_profile = serde_json::json!({
-        "nfInstanceId": nf_instance_id,
-        "nfType": "AMF",
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [sbi_addr],
-        "nfServices": services,
-        "allowedNfTypes": nf_allowed,
-        "heartBeatTimer": 10
-    });
+    let mut nf_profile = nextgcore_sbi::nf_addressing::classify_profile_host(
+        serde_json::json!({
+            "nfInstanceId": nf_instance_id,
+            "nfType": "AMF",
+            "nfStatus": "REGISTERED",
+            "ipv4Addresses": [sbi_addr],
+            "nfServices": services,
+            "allowedNfTypes": nf_allowed,
+            "heartBeatTimer": 10
+        }),
+        sbi_addr,
+    );
 
     // #92: publish `amfInfo.guamiList` (TS 29.510 §6.1.6.2.4 `AmfInfo`), the GUAMIs
     // this AMF serves. Without it there is nothing in the AMF's registered profile
@@ -6920,5 +6923,23 @@ mod tests_no_wildcard_uri_1322 {
         let before = advertised_sbi_host_port();
         set_advertised_sbi("0.0.0.0".into(), 7777);
         assert_eq!(advertised_sbi_host_port(), before);
+    }
+}
+
+/// #1324: the NFProfile carries its host where its type belongs (TS 29.510
+/// §6.1.6.2.2): IPv4 in ipv4Addresses, IPv6 in ipv6Addresses, an FQDN as fqdn, and
+/// the service ipEndPoints likewise.
+#[cfg(test)]
+mod tests_nf_profile_host_kind_1324 {
+    use super::*;
+
+    #[test]
+    fn the_nf_profile_carries_its_host_by_type() {
+        for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
+            let profile = amf_nf_profile_json("id", host, 7777);
+            let problems =
+                nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
+            assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
+        }
     }
 }
