@@ -698,6 +698,28 @@ pub fn build_modify_bearer_context_request_with_params(
     buf.into_vec()
 }
 
+/// MODIFY EPS BEARER CONTEXT REQUEST (TS 24.301 §8.3.18) with the New EPS QoS
+/// (`qos_presence`), the TFT (`tft_presence`) and, when the PDN connection's
+/// APN-AMBR changed, the APN-AMBR (`apn_ambr`, bit/s (dl, ul); IEI 0x5E, after
+/// the TFT in the message's IE order) (#641 Update half).
+pub fn build_modify_bearer_context_request_with_ambr(
+    bearer: &MmeBearer,
+    pti: u8,
+    qos_presence: bool,
+    tft_presence: bool,
+    apn_ambr: Option<(u64, u64)>,
+) -> Vec<u8> {
+    let mut msg =
+        build_modify_bearer_context_request_with_params(bearer, pti, qos_presence, tft_presence);
+    if let Some((dl, ul)) = apn_ambr {
+        let mut buf = NasBuffer::new();
+        buf.write_u8(0x5e); // APN-AMBR IEI
+        buf.write_lv(&apn_ambr_build(dl, ul));
+        msg.extend_from_slice(&buf.into_vec());
+    }
+    msg
+}
+
 /// Build modify bearer context request (simplified - for nas_path.rs)
 pub fn build_modify_bearer_context_request(
     bearer: &MmeBearer,

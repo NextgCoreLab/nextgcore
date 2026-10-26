@@ -2843,6 +2843,309 @@ fn an_ipv6_enb_s1u_is_answered_in_the_create_bearer_response() {
     release(&ue);
 }
 
+/// An established dedicated bearer `ebi` on `ue`'s PDN connection (QCI 1, MBR
+/// 128 kbit/s, GBR 64 kbit/s, a TFT), and that PDN's APN-AMBR at 1 Mbit/s.
+fn with_dedicated(ue: &Ue, ebi: u8) -> u64 {
+    let ctx = mme_self();
+    let id = ctx.bearer_add(ue.sess_id, ue.mme_ue_id);
+    if let Some(b) = ctx.bearer_pool.write().unwrap().get_mut(&id) {
+        b.ebi = ebi;
+        b.qos.qci = 1;
+        b.qos.arp.priority_level = 2;
+        b.qos.mbr.uplink = 128_000;
+        b.qos.mbr.downlink = 128_000;
+        b.qos.gbr.uplink = 64_000;
+        b.qos.gbr.downlink = 64_000;
+        b.tft = vec![0x21, 0x31, 0x00, 0x02, 0x30, 0x11];
+        b.sgw_s1u_teid = DEDICATED_SGW_S1U;
+        b.sgw_s1u_ip.ipv4 = Some([10, 0, 0, 2]);
+        b.enb_s1u_teid = 0x9906;
+        b.enb_s1u_ip.ipv4 = Some([10, 0, 0, 9]);
+    }
+    if let Some(s) = ctx.sess_pool.write().unwrap().get_mut(&ue.sess_id) {
+        s.bearer_list.push(id);
+        s.ambr.downlink = 1_000_000;
+        s.ambr.uplink = 1_000_000;
+    }
+    id
+}
+
+/// An Update Bearer Request (TS 29.274 §7.2.15) to `teid` for EBI `ebi`, with a new
+/// Bearer QoS (MBR 256 kbit/s) if `qos`, a new TFT if `tft`, and the APN-AMBR
+/// `ambr_kbps` (M).
+fn ubr(teid: u32, seq: u32, ebi: u8, qos: bool, tft: bool, ambr_kbps: Option<u32>) -> Vec<u8> {
+    use nextgcore_gtp::v2::{Gtp2BearerQosIe, Gtp2EbiIe, Gtp2Ie};
+    let mut m = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(97, teid, seq));
+    let mut bc = Gtp2BearerContextIe::new();
+    bc.set_ebi(ebi);
+    if tft {
+        bc.add_ie(Gtp2Ie::from_slice(
+            Gtp2IeType::BearerTft as u8,
+            0,
+            &[0x21, 0x31, 0x00, 0x02, 0x30, 0x22],
+        ));
+    }
+    if qos {
+        let mut q = Gtp2BearerQosIe::new(1, 256, 256, 64, 64);
+        q.pl = 2;
+        bc.set_bearer_qos(&q);
+    }
+    m.add_bearer_context(0, &bc);
+    let _ = Gtp2EbiIe::new(0);
+    if let Some(k) = ambr_kbps {
+        let mut v = k.to_be_bytes().to_vec();
+        v.extend_from_slice(&k.to_be_bytes());
+        m.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Ambr as u8, 0, &v));
+    }
+    m.encode().to_vec()
+}
+
+/// (E-RAB IDs and NAS-PDUs, UE-AMBR present) of an E-RAB MODIFY REQUEST.
+fn erab_modify(pdu: &g::S1AP_PDU) -> Option<(Vec<(u8, Vec<u8>)>, bool)> {
+    let g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+        value: g::InitiatingMessageValue::Id_E_RABModify(req),
+        ..
+    }) = pdu
+    else {
+        return None;
+    };
+    use g::E_RABModifyRequestProtocolIEs_EntryValue as V;
+    let (mut items, mut ambr) = (Vec::new(), false);
+    for ie in &req.protocol_i_es.0 {
+        match &ie.value {
+            V::Id_E_RABToBeModifiedListBearerModReq(l) => {
+                for e in &l.0 {
+                    let g::E_RABToBeModifiedListBearerModReq_EntryValue::Id_E_RABToBeModifiedItemBearerModReq(
+                        i,
+                    ) = &e.value;
+                    items.push((i.e_rab_id.0, i.nas_pdu.0.clone()));
+                }
+            }
+            V::Id_uEaggregateMaximumBitrate(_) => ambr = true,
+            _ => {}
+        }
+    }
+    Some((items, ambr))
+}
+
+/// (Cause, [(EBI, cause)]) of an Update Bearer Response.
+fn update_bearer_response(sgw: &UdpSocket, seq: u32) -> (u8, Vec<(u8, u8)>) {
+    let (rsp, _) = recv(sgw, 98);
+    assert_eq!(rsp.header.sequence_number, seq, "the request's number");
+    let cause = rsp.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value[0];
+    let bcs = rsp
+        .get_ies(Gtp2IeType::BearerContext as u8)
+        .into_iter()
+        .map(|ie| {
+            let bc = Gtp2BearerContextIe::decode(&ie.value).unwrap();
+            (bc.ebi().unwrap(), bc.cause().unwrap().unwrap().cause)
+        })
+        .collect();
+    (cause, bcs)
+}
+
+fn erab_modify_response(ue: &Ue, modified: &[u8]) {
+    let enb_ue = current_enb_ue(ue);
+    crate::s1ap_handler::handle_erab_modify_response(
+        mme_self(),
+        enb_ue.enb_id,
+        enb_ue.mme_ue_s1ap_id,
+        enb_ue.enb_ue_s1ap_id,
+        modified,
+        &[],
+    );
+}
+
+/// #641 Update half, TS 23.401 §5.4.2.1, TS 24.301 §6.4.3: an Update Bearer
+/// Request changing a dedicated bearer's QoS. The eNB gets an E-RAB MODIFY
+/// REQUEST carrying MODIFY EPS BEARER CONTEXT REQUEST with the New EPS QoS; the
+/// Update Bearer Response (cause 16) waits for both the E-RAB MODIFY RESPONSE and
+/// the UE's ACCEPT, and the bearer has its new QoS.
+#[test]
+fn an_update_bearer_request_modifies_the_bearer_qos() {
+    let _guard = lock_s11();
+    crate::bearer_activation::clear_for_test();
+    let (sgw, route) = sgw(Gtp2XactConfig::default());
+    let ue = attached(0x1271);
+    let b6 = with_dedicated(&ue, 6);
+    let ctx = mme_self();
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    sgw.send_to(
+        &ubr(ue.local_teid, 0x1271, 6, true, false, Some(1000)),
+        route.server.local_addr(),
+    )
+    .unwrap();
+    let (items, ambr) = wait_pdu(ue.enb_id, erab_modify);
+    assert_eq!(items.len(), 1);
+    assert!(!ambr, "the APN-AMBR did not change");
+    let (erab, nas) = &items[0];
+    assert_eq!(*erab, 6);
+    // Security header, then EBI 6 | PD, PTI 0, MODIFY EPS BEARER CONTEXT REQUEST,
+    // New EPS QoS (0x5B, QCI 1, MBR 256 kbit/s = 0x58, GBR 64 = 0x40), no TFT.
+    assert_eq!(&nas[6..9], &[0x62, 0x00, 0xc9]);
+    assert_eq!(&nas[9..11], &[0x5b, 5]);
+    assert_eq!(&nas[11..16], &[1, 0x58, 0x58, 0x40, 0x40]);
+    assert_eq!(nas.len(), 16, "no TFT, no APN-AMBR");
+    erab_modify_response(&ue, &[6]);
+    assert!(quiet(&sgw), "the answer waits for the UE");
+    ue_esm(&ue, 6, &[0xca]);
+    assert_eq!(update_bearer_response(&sgw, 0x1271), (16, vec![(6, 16)]));
+    assert_eq!(ctx.bearer_find_by_id(b6).unwrap().qos.mbr.downlink, 256_000);
+    assert_eq!(crate::bearer_activation::pending_count(), 0);
+    release(&ue);
+}
+
+/// #641 Update half, TS 23.401 §5.4.3: a TFT-only Update Bearer Request (no
+/// Bearer QoS). The MODIFY EPS BEARER CONTEXT REQUEST, with the TFT and no New
+/// EPS QoS, goes in a DOWNLINK NAS TRANSPORT (no E-RAB MODIFY); the UE's ACCEPT
+/// alone settles it.
+#[test]
+fn a_tft_only_update_goes_in_downlink_nas_transport() {
+    let _guard = lock_s11();
+    crate::bearer_activation::clear_for_test();
+    let (sgw, route) = sgw(Gtp2XactConfig::default());
+    let ue = attached(0x1272);
+    let b6 = with_dedicated(&ue, 6);
+    let ctx = mme_self();
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    sgw.send_to(
+        &ubr(ue.local_teid, 0x1272, 6, false, true, Some(1000)),
+        route.server.local_addr(),
+    )
+    .unwrap();
+    let nas = wait_pdu(ue.enb_id, |p| dl_nas(p).filter(|n| n.get(2) == Some(&0xc9)));
+    assert_eq!(&nas[..3], &[0x62, 0x00, 0xc9]);
+    assert_eq!(
+        &nas[3..],
+        &[0x36, 6, 0x21, 0x31, 0x00, 0x02, 0x30, 0x22],
+        "the TFT only"
+    );
+    assert!(
+        crate::s1ap_path::take_tapped_for_test(ue.enb_id)
+            .iter()
+            .filter_map(|p| nextgcore_s1ap_gen::decode(p).ok())
+            .all(|p| erab_modify(&p).is_none()),
+        "no E-RAB MODIFY for a TFT change"
+    );
+    ue_esm(&ue, 6, &[0xca]);
+    assert_eq!(update_bearer_response(&sgw, 0x1272), (16, vec![(6, 16)]));
+    assert_eq!(
+        ctx.bearer_find_by_id(b6).unwrap().tft,
+        vec![0x21, 0x31, 0x00, 0x02, 0x30, 0x22]
+    );
+    release(&ue);
+}
+
+/// #641 Update half, TS 24.301 §6.4.3.4: the UE rejects the modification. The
+/// Update Bearer Response says "UE refuses" (88) and the bearer keeps its QoS.
+/// An APN-AMBR change rides the request: E-RAB MODIFY with the UE-AMBR, the NAS
+/// request with the APN-AMBR, and it is undone with the refusal.
+#[test]
+fn a_rejected_update_keeps_the_bearer_as_it_was() {
+    let _guard = lock_s11();
+    crate::bearer_activation::clear_for_test();
+    let (sgw, route) = sgw(Gtp2XactConfig::default());
+    let ue = attached(0x1273);
+    let b6 = with_dedicated(&ue, 6);
+    let ctx = mme_self();
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    sgw.send_to(
+        &ubr(ue.local_teid, 0x1273, 6, true, false, Some(2000)),
+        route.server.local_addr(),
+    )
+    .unwrap();
+    let (items, ambr) = wait_pdu(ue.enb_id, erab_modify);
+    assert!(ambr, "the APN-AMBR change updates the UE-AMBR");
+    assert!(
+        items[0]
+            .1
+            .windows(2)
+            .any(|w| w == [0x5e, 0x02] || w == [0x5e, 0x04] || w == [0x5e, 0x06]),
+        "the APN-AMBR in the NAS request"
+    );
+    erab_modify_response(&ue, &[6]);
+    ue_esm(&ue, 6, &[0xcb, 31]);
+    assert_eq!(update_bearer_response(&sgw, 0x1273), (88, vec![(6, 88)]));
+    assert_eq!(
+        ctx.bearer_find_by_id(b6).unwrap().qos.mbr.downlink,
+        128_000,
+        "kept"
+    );
+    assert_eq!(
+        ctx.sess_find_by_id(ue.sess_id).unwrap().ambr.downlink,
+        1_000_000,
+        "kept"
+    );
+    release(&ue);
+}
+
+/// #641 Update half, TS 23.401 §5.4.2.1 step 3: an ECM-IDLE UE is paged. Here
+/// the paging fails: "Unable to page UE" (90). A second request is signalled once
+/// the UE is ECM-CONNECTED again.
+#[test]
+fn an_update_for_an_idle_ue_pages_it() {
+    let _guard = lock_s11();
+    crate::bearer_activation::clear_for_test();
+    let (sgw, route) = sgw(Gtp2XactConfig::default());
+    let mme = route.server.local_addr();
+    let ctx = mme_self();
+    let ue = attached(0x1274);
+    let _b6 = with_dedicated(&ue, 6);
+    crate::s1ap_path::tap_enb_for_test(ue.enb_id);
+    let complete = release_to_command(&ue, &sgw);
+    crate::s1ap_handler::handle_ue_context_release_complete(ctx, ue.enb_id, &complete);
+    let _ = crate::s1ap_path::take_tapped_for_test(ue.enb_id);
+    sgw.send_to(&ubr(ue.local_teid, 0x1274, 6, false, true, Some(1000)), mme)
+        .unwrap();
+    wait_pdu(ue.enb_id, is_paging);
+    assert!(quiet(&sgw), "the answer waits for the paging");
+    crate::bearer_activation::on_paging_failed(ctx, ue.mme_ue_id);
+    assert_eq!(update_bearer_response(&sgw, 0x1274), (90, vec![(6, 90)]));
+
+    sgw.send_to(&ubr(ue.local_teid, 0x1275, 6, false, true, Some(1000)), mme)
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while crate::bearer_activation::pending_count() == 0 {
+        assert!(Instant::now() < deadline, "parked behind paging");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let new_enb_ue = ctx.enb_ue_add(ue.enb_id, 12740);
+    ctx.enb_ue_associate_mme_ue(new_enb_ue, ue.mme_ue_id);
+    crate::bearer_activation::on_connected(ctx, ue.mme_ue_id);
+    let _ = wait_pdu(ue.enb_id, |p| dl_nas(p).filter(|n| n.get(2) == Some(&0xc9)));
+    ue_esm(&ue, 6, &[0xca]);
+    assert_eq!(update_bearer_response(&sgw, 0x1275), (16, vec![(6, 16)]));
+    ctx.enb_ue_remove(new_enb_ue);
+    release(&ue);
+}
+
+/// #641 Update half, TS 29.274 §7.2.16: an EBI the UE has no bearer for is
+/// "Context not found" (64); a request without its APN-AMBR (M, Table 7.2.15-1)
+/// is 70 naming it as the Offending IE.
+#[test]
+fn an_update_bearer_request_with_a_fault_is_refused() {
+    let _guard = lock_s11();
+    crate::bearer_activation::clear_for_test();
+    let (sgw, route) = sgw(Gtp2XactConfig::default());
+    let mme = route.server.local_addr();
+    let ue = attached(0x1276);
+    sgw.send_to(&ubr(ue.local_teid, 0x1276, 9, true, false, Some(1000)), mme)
+        .unwrap();
+    assert_eq!(update_bearer_response(&sgw, 0x1276), (64, vec![(9, 64)]));
+    sgw.send_to(&ubr(ue.local_teid, 0x1277, 5, true, false, None), mme)
+        .unwrap();
+    let (rsp, _) = recv(&sgw, 98);
+    assert_eq!(
+        rsp.get_ie(Gtp2IeType::Cause as u8, 0)
+            .unwrap()
+            .value
+            .to_vec(),
+        vec![70, 0, Gtp2IeType::Ambr as u8, 0, 0, 0]
+    );
+    assert_eq!(crate::bearer_activation::pending_count(), 0);
+    release(&ue);
+}
+
 /// #641, TS 23.401 §5.4.1 step 3: an ECM-IDLE UE is paged; when it cannot be reached
 /// the request is refused "Unable to page UE". During an Attach the request waits for
 /// ATTACH COMPLETE (Annex F NOTE 2). A TEID naming no UE is "Context not found".

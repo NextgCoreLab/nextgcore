@@ -1197,6 +1197,7 @@ fn emm_tau_request(
             crate::context::PagingType::DownlinkDataNotification
                 | crate::context::PagingType::DeleteBearer
                 | crate::context::PagingType::CreateBearer
+                | crate::context::PagingType::UpdateBearer
         )
     } else {
         false
@@ -2245,11 +2246,15 @@ pub fn handle_esm_message(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue: &MmeUe, esm:
             match esm_handler::handle_modify_bearer_context_accept(
                 enb_ue, mme_ue, &sess, &bearer, body,
             ) {
-                Ok(()) => log::info!(
-                    "[{}] EPS bearer (ebi={}) modification accepted by the UE",
-                    mme_ue.imsi_bcd,
-                    bearer.ebi
-                ),
+                Ok(()) => {
+                    log::info!(
+                        "[{}] EPS bearer (ebi={}) modification accepted by the UE",
+                        mme_ue.imsi_bcd,
+                        bearer.ebi
+                    );
+                    // #641 Update half, TS 24.301 §6.4.3.3.
+                    crate::bearer_activation::on_modify_accept(ctx, mme_ue.id, bearer.ebi);
+                }
                 Err(e) => log::warn!("[{}] Modify accept rejected: {e}", mme_ue.imsi_bcd),
             }
         }
@@ -2257,10 +2262,14 @@ pub fn handle_esm_message(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue: &MmeUe, esm:
             match esm_handler::handle_modify_bearer_context_reject(
                 enb_ue, mme_ue, &sess, &bearer, body,
             ) {
-                Ok(cause) => log::warn!(
-                    "[{}] EPS bearer modification rejected by the UE: {cause:?}",
-                    mme_ue.imsi_bcd
-                ),
+                Ok(cause) => {
+                    log::warn!(
+                        "[{}] EPS bearer modification rejected by the UE: {cause:?}",
+                        mme_ue.imsi_bcd
+                    );
+                    // #641 Update half, TS 24.301 §6.4.3.4.
+                    crate::bearer_activation::on_modify_reject(ctx, mme_ue.id, bearer.ebi);
+                }
                 Err(e) => log::warn!("[{}] Modify reject malformed: {e}", mme_ue.imsi_bcd),
             }
         }
