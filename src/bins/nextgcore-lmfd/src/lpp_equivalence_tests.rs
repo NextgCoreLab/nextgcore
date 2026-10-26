@@ -154,6 +154,15 @@ fn check_rstd_reference(c: &mut std::collections::BTreeMap<String, String>, what
     }
 }
 
+/// #1278: the captured adapters read an NR PRS-RSRP as `v − 140` dBm; TS 38.133
+/// Table 10.1.24.3.1-1 makes it `v − 157` (lower edge), 17 dB lower.
+fn prs_rsrp_as_now(cell: &mut std::collections::BTreeMap<String, String>) {
+    if let Some(r) = cell.get("rsrp").and_then(|r| r.strip_prefix("Some(")) {
+        let old: i16 = r.trim_end_matches(')').parse().expect("captured rsrp");
+        cell.insert("rsrp".into(), format!("Some({})", old - 17));
+    }
+}
+
 fn some_f64(v: &str) -> f64 {
     v.strip_prefix("Some(")
         .and_then(|v| v.strip_suffix(')'))
@@ -256,6 +265,7 @@ fn every_report_adapts_as_the_old_adapters_did() {
             check_rstd_reference(&mut new, "Multi-RTT");
             let mut old = old;
             old.remove("rtt_ns");
+            prs_rsrp_as_now(&mut old);
             assert_eq!(new, old, "Multi-RTT {}", f[0]);
         }
 
@@ -267,6 +277,7 @@ fn every_report_adapts_as_the_old_adapters_did() {
         // decoded: where the new adapter gives None, the captured value must be
         // a first or last bin, ≈ ±501009 ns.
         let mut captured = cells_of(f[3]);
+        captured.iter_mut().for_each(prs_rsrp_as_now);
         let new = without_new_fields(tdoa, "DL-TDOA");
         for (n_cell, c_cell) in new.iter().zip(captured.iter_mut()) {
             if n_cell["rstd_ns"] == "None" && c_cell["rstd_ns"] != "None" {

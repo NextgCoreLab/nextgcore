@@ -21,6 +21,9 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   (#1293). A Delete Bearer Command whose bearers all have a Delete Bearer Request in flight is now
   answered with a Delete Bearer Failure Indication, cause #101 "Collision with network
   initiated request" (TS 29.274 §7.2.17.2). Before, it got no answer (#619).
+- lmfd reads the LPP NR PRS-RSRP of a Multi-RTT or DL-TDOA measurement (`nr-DL-PRS-RSRP-Result`)
+  as `v − 157` dBm, the lower edge of TS 38.133 Table 10.1.24.3.1-1. It read `v − 140`, the
+  E-UTRA RSRP offset, which put every PRS-RSRP 16-17 dB too high (#1278).
 - pcfd's `resourceUri`, in AM and UE PolicyUpdates (notifications and Update responses) and in
   SM policy notifications, is now the complete resource URI `{apiRoot}/<apiName>/...` (TS 29.501
   §4.4.1), with the configured FQDN as host when there is one. Before, it was the bare path. The
