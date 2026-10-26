@@ -567,6 +567,74 @@ pub const EUTRA_TADV_MAX: u32 = 7690;
 /// TS 36.133 §9.1.9.3: E-UTRA UE Rx–Tx report values 0..4095.
 pub const EUTRA_UE_RX_TX_MAX: u32 = 4095;
 
+/// NR basic time unit T_c = 1/(480000·4096) s, in ns (TS 38.211 §4.1).
+pub const TC_NS: f64 = 1e9 / (480_000.0 * 4_096.0);
+
+/// TS 38.455 §9.2.5: `NR-TADV ::= INTEGER (0..7690)`, whose top value is the
+/// open-ended bin of TS 38.133 Table 13.5.1-1.
+pub const NR_TADV_MAX: u16 = 7690;
+
+/// The NR timing advance report of an NRPPa E-CID result (Value Timing Advance NR,
+/// TS 38.455 §9.2.5) as a round trip in ns, (bin midpoint, bin width) (#859).
+///
+/// TS 38.133 §13.5.1, Table 13.5.1-1: TIME_ADVANCE_00 is `TADV < 128` T_c, then
+/// 128 T_c steps up to 262144 T_c (values 0..2047) and 512 T_c steps from there
+/// (values 2048..7689, the last ending at 3150848 T_c). TIME_ADVANCE_7690 is the
+/// open-ended `TADV ≥ 3150848` T_c and gives `None`.
+///
+/// The quantity is the round trip. TS 38.215 §5.2.7 defines TADV as
+/// `T_gNB-RX − T_gNB-TX` on the UE's PRACH, and the NOTE under Table 13.5.1-1
+/// has the gNB report `(gNB Rx – Tx time difference) + N_TA,offset`: the PRACH
+/// is sent with N_TA = 0 but N_TA,offset early (TS 38.211 §4.3.1), and adding
+/// N_TA,offset back leaves the round trip. So nothing is removed here, unlike on
+/// the E-UTRA UE Rx–Tx path, where the LMF removes N_TA,offset itself.
+pub fn nr_tadv_report_to_ns(v: u16) -> Option<(f64, f64)> {
+    if v >= NR_TADV_MAX {
+        return None;
+    }
+    let (lower, width) = if v < 2048 {
+        (128.0 * f64::from(v), 128.0)
+    } else {
+        (262_144.0 + 512.0 * f64::from(v - 2048), 512.0)
+    };
+    Some(((lower + width / 2.0) * TC_NS, width * TC_NS))
+}
+
+/// TS 38.455 §9.2.5: `UE-Rx-Tx-Time-Diff ::= INTEGER (0..61565)`.
+pub const NR_UE_RX_TX_K5_MAX: u16 = 61565;
+
+/// The UE Rx–Tx Time Difference of an NRPPa E-CID result (TS 38.455 §9.2.5,
+/// "as defined in TS 38.215", §5.1.30) as signed ns, (bin midpoint, bin width)
+/// (#859).
+///
+/// Its range 0..61565 is the k = 5 absolute mapping, TS 38.133 §10.1.25.3.1
+/// Table 10.1.25.3.1-6, the table TS 38.331 `RxTxTimeDiff-r17.result-k5` also
+/// points to: RX-TX_TIME_DIFFERENCE_00001 is [−985024, −984992) T_c, in 32 T_c
+/// steps, so value `v` starts at `−985024 + 32·(v − 1)` T_c. Values 0
+/// (`< −985024`) and 61565 (`≥ 985024`) are open-ended and give `None`.
+pub fn nr_ue_rx_tx_k5_report_to_ns(v: u16) -> Option<(f64, f64)> {
+    if v == 0 || v >= NR_UE_RX_TX_K5_MAX {
+        return None;
+    }
+    let lower = -985_024.0 + 32.0 * f64::from(v - 1);
+    Some(((lower + 16.0) * TC_NS, 32.0 * TC_NS))
+}
+
+/// An NR UL azimuth angle of arrival report (`UL-AoA.azimuthAoA`, 0..3599, TS
+/// 38.455 §9.2.38) given in the global coordinate system, as the clockwise bearing
+/// from North in degrees that [`solve_aoa`] takes (#859).
+///
+/// TS 38.133 §13.4.1, Table 13.4.1-1: A-AoA_v is [−180 + 0.1·v, −180 + 0.1·(v+1))
+/// degrees; the bin midpoint is used. TS 38.215 §5.2.4 measures the GCS azimuth
+/// from geographical North, positive counter-clockwise, so its sign is flipped.
+pub fn nr_azimuth_aoa_to_bearing_deg(v: u16) -> Option<f64> {
+    if v > 3599 {
+        return None;
+    }
+    let ccw = -180.0 + 0.1 * f64::from(v) + 0.05;
+    Some((-ccw).rem_euclid(360.0))
+}
+
 /// E-CID from a round-trip time (#832): the fix is at the serving cell, and the
 /// uncertainty radius is the one-way range `c·rtt/2` plus half the one-way
 /// width of the report bin.

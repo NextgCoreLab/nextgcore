@@ -125,6 +125,7 @@ pub struct CellMeasurement {
     /// own report mapping, where the old code passed the raw report value on as
     /// an NR TA command:
     /// - E-UTRA TADV Type 1 or Type 2 (NRPPa, TS 36.133 §10.3);
+    /// - the NR TADV (NRPPa `NR-TADV`, TS 38.133 §13.5.1, #859);
     /// - the E-UTRA UE Rx–Tx (LPP, TS 36.133 §9.1.9.3).
     ///
     /// It is the serving cell's round trip only, never a Multi-RTT range.
@@ -167,16 +168,21 @@ pub struct CellMeasurement {
     pub eutra: bool,
     /// The NR E-CID report values of an NRPPa E-CID report (NR-TADV, UE Rx-Tx Time
     /// Difference, SS/CSI RSRP and RSRQ, AoA NR; TS 38.455 §9.2.5), as reported
-    /// (#859). Their mappings to physical quantities (TS 38.133, TS 38.215) are not
-    /// implemented, so the solver does not read them. `None` when none was reported.
+    /// (#859). The adapter has already mapped them into `ecid_rtt_ns`, `rsrp`,
+    /// `rsrq` and `aoa` (TS 38.133); the solver reads those, not this. `None` when
+    /// none was reported.
     pub nr_ecid: Option<crate::nrppa_uplink::NrEcidReport>,
 }
 
-/// #859: the Value Timing Advance NR a gNB reported among `cells`, which has no
-/// mapping yet (TS 38.133). The NRPPa cell can be anywhere in a joint session's
-/// measurements (the LPP leg often comes first), so every cell is looked at.
-fn unmapped_nr_tadv(cells: &[CellMeasurement]) -> Option<u16> {
-    cells.iter().find_map(|c| c.nr_ecid.as_ref()?.nr_tadv)
+/// #859: a Value Timing Advance NR among `cells` that gave no timing term: the
+/// open-ended TIME_ADVANCE_7690 (`TADV ≥ 3150848 T_c`, TS 38.133 Table
+/// 13.5.1-1). The NRPPa cell can be anywhere in a joint session's measurements
+/// (the LPP leg often comes first), so every cell is looked at.
+fn unranged_nr_tadv(cells: &[CellMeasurement]) -> Option<u16> {
+    cells.iter().find_map(|c| {
+        let v = c.nr_ecid.as_ref()?.nr_tadv?;
+        c.ecid_rtt_ns.is_none().then_some(v)
+    })
 }
 
 /// Positioning QoS requirements
@@ -807,7 +813,7 @@ impl LmfContext {
         // Build the registry snapshot while holding only the cell_registry read
         // lock; drop it before acquiring the write locks below to avoid deadlock.
         let registry = self.build_trp_registry();
-        let unmapped_nr_tadv = unmapped_nr_tadv(&cell_measurements);
+        let unranged_nr_tadv = unranged_nr_tadv(&cell_measurements);
 
         // Scope the store locks so the session completion below runs lock-free.
         let strict_fix = {
@@ -848,11 +854,11 @@ impl LmfContext {
                     "Measurement report processed: id={request_id} — no location fix solvable \
                      (empty TRP registry or no solvable measurement set); reporting no fix"
                 );
-                if let Some(v) = unmapped_nr_tadv {
+                if let Some(v) = unranged_nr_tadv {
                     log::warn!(
                         "Measurement report {request_id}: the gNB reported Value Timing Advance \
-                         NR {v} (TS 38.455 §9.2.5), but its report mapping (TS 38.133) is not \
-                         implemented, so it gives no E-CID timing term (#859)"
+                         NR {v}, the open-ended TADV ≥ 3150848 T_c (TS 38.133 §13.5.1), so it \
+                         gives no E-CID timing term (#859)"
                     );
                 }
             }
@@ -4313,6 +4319,38 @@ mod tests_ecid_timing_units {
         );
     }
 
+    /// #859: a gNB on NR reports its timing term as NR-TADV. Value 1000 is
+    /// [128000, 128128) T_c (TS 38.133 Table 13.5.1-1), a round trip of 128064
+    /// T_c, so the ring is c·128064·T_c/2 ≈ 9767 m plus a quarter of the bin
+    /// (c·128·T_c/4), and the fix is NR_ECID. Before #859 it gave no fix.
+    #[test]
+    fn an_nr_tadv_gives_an_nr_ecid_fix() {
+        use crate::nrppa_uplink::test_support::{nr_tadv, ss_rsrp};
+        let bytes = ecid_report(
+            1,
+            42,
+            7,
+            nr_cgi([0x02, 0xF8, 0x39], 1),
+            [0, 0x12, 0x34],
+            Some(vec![nr_tadv(1000), ss_rsrp(&[(7, 620_000, Some(80))])]),
+        );
+        let (_, cells) = crate::codec_glue::decode_nrppa_ecid_report(&bytes).unwrap();
+        let reg =
+            TrpRegistry::from_entries([(cells[0].nr_cgi.clone(), TrpCoord::new(40.0, -74.0, 0.0))]);
+        let fix = try_real_solve(&cells, &reg).expect("an NR E-CID fix");
+        // By hand: T_c = 1/(480000·4096) s.
+        let tc = 1.0 / (480_000.0 * 4_096.0);
+        let want =
+            SPEED_OF_LIGHT_M_S * 128_064.0 * tc / 2.0 + SPEED_OF_LIGHT_M_S * 128.0 * tc / 4.0;
+        assert!(
+            (fix.horizontal_accuracy - want).abs() < 0.01,
+            "{} vs {want}",
+            fix.horizontal_accuracy
+        );
+        assert_eq!(fix.method_used.as_deref(), Some("NR_ECID"));
+        assert_eq!((fix.latitude, fix.longitude), (40.0, -74.0));
+    }
+
     #[test]
     fn an_open_ended_tadv_gives_no_timing_term() {
         let bytes = ecid_report(
@@ -4772,10 +4810,11 @@ mod tests_session_bounds {
         assert_eq!(held, Some(MAX_SESSION_MEASUREMENTS));
     }
 
-    /// #859 review: the unmapped NR-TADV is found wherever the NRPPa cell sits; in a
-    /// joint session the LPP NR E-CID cell, which has no `nr_ecid`, comes first.
+    /// #859 review: an NR-TADV that gave no timing term (the open-ended 7690) is
+    /// found wherever the NRPPa cell sits; in a joint session the LPP NR E-CID
+    /// cell, which has no `nr_ecid`, comes first.
     #[test]
-    fn the_unmapped_nr_tadv_is_found_behind_an_lpp_cell() {
+    fn an_unranged_nr_tadv_is_found_behind_an_lpp_cell() {
         let cell = |nr_ecid: Option<crate::nrppa_uplink::NrEcidReport>| CellMeasurement {
             nr_ecid,
             nr_cgi: "pci-7".into(),
@@ -4795,12 +4834,16 @@ mod tests_session_bounds {
             eutra: false,
         };
         let nrppa = cell(Some(crate::nrppa_uplink::NrEcidReport {
-            nr_tadv: Some(321),
+            nr_tadv: Some(7690),
             ..Default::default()
         }));
-        assert_eq!(unmapped_nr_tadv(&[cell(None), nrppa.clone()]), Some(321));
-        assert_eq!(unmapped_nr_tadv(&[nrppa]), Some(321));
-        assert_eq!(unmapped_nr_tadv(&[cell(None)]), None);
+        assert_eq!(unranged_nr_tadv(&[cell(None), nrppa.clone()]), Some(7690));
+        assert_eq!(unranged_nr_tadv(std::slice::from_ref(&nrppa)), Some(7690));
+        assert_eq!(unranged_nr_tadv(&[cell(None)]), None);
+        // A ranged NR-TADV is not reported as unranged.
+        let mut ranged = nrppa;
+        ranged.ecid_rtt_ns = Some(1.0);
+        assert_eq!(unranged_nr_tadv(&[cell(None), ranged]), None);
     }
 
     /// A session older than the reap age goes, with its measurement-store entry;
