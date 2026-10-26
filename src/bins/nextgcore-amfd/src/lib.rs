@@ -377,16 +377,85 @@ struct Args {
     #[arg(short, long)]
     daemon: bool,
 
-    /// NGAP bind address, `ip:port`. Loopback by default (#1308): a gNB on another
-    /// host needs this set to an address of the AMF it can reach.
-    #[arg(long, default_value = "127.0.0.1:38412")]
-    ngap_addr: String,
+    /// NGAP bind address, `ip:port`. Without it, `amf.ngap.server[0]` from the
+    /// config file (#1311), else loopback (#1308): a gNB on another host needs one
+    /// of the two set to an address of the AMF it can reach.
+    #[arg(long)]
+    ngap_addr: Option<String>,
 
     /// SCTP transport backend: "userspace" (sctp-proto over UDP, matched
     /// nextgsim gNB) or "kernel" (native Linux kernel SCTP for a standard
     /// external RAN; needs the `kernel-sctp` build feature + libsctp).
     #[arg(long, default_value = "userspace")]
     sctp_backend: String,
+}
+
+/// `<section>.<if>.server[]` entries, for the listen addresses (#1311).
+#[derive(Debug, Default, Deserialize)]
+struct ListenServerYaml {
+    address: Option<String>,
+    port: Option<u16>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ListenIfYaml {
+    server: Option<Vec<ListenServerYaml>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ListenSectionYaml {
+    ngap: Option<ListenIfYaml>,
+    sbi: Option<ListenIfYaml>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ListenYaml {
+    amf: Option<ListenSectionYaml>,
+}
+
+/// The first `server` entry of `amf.<if>` in `config`: (address, port).
+fn config_server(config: Option<&str>, ngap: bool) -> Option<(String, Option<u16>)> {
+    let yaml: ListenYaml = serde_yaml::from_str(config?).ok()?;
+    let section = yaml.amf?;
+    let entry = if ngap { section.ngap } else { section.sbi }?
+        .server?
+        .into_iter()
+        .next()?;
+    Some((entry.address?, entry.port))
+}
+
+/// #1311: the NGAP listen address. `--ngap-addr`, else `amf.ngap.server[0]`, else
+/// `127.0.0.1:38412` (#1308: never a wider default).
+fn resolve_ngap_addr(cli: Option<&str>, config: Option<&str>) -> Result<SocketAddr> {
+    if let Some(cli) = cli {
+        return cli
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Invalid NGAP address '{cli}': {e}"));
+    }
+    match config_server(config, true) {
+        Some((address, port)) => {
+            nextgcore_core::sockaddr::parse_listen_addr(&address, port.unwrap_or(38412))
+                .map_err(|e| anyhow::anyhow!("Invalid amf.ngap.server address '{address}': {e}"))
+        }
+        None => Ok(SocketAddr::from(([127, 0, 0, 1], 38412))),
+    }
+}
+
+/// #1311: the SBI listen host and port. `AMF_SBI_ADDR` / `AMF_SBI_PORT`, else
+/// `amf.sbi.server[0]`, else `127.0.0.1:7777` (#1308).
+fn resolve_sbi_listen(
+    env_addr: Option<String>,
+    env_port: Option<u16>,
+    config: Option<&str>,
+) -> (String, u16) {
+    let yaml = config_server(config, false);
+    let addr = env_addr
+        .or_else(|| yaml.as_ref().map(|(a, _)| a.clone()))
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let port = env_port
+        .or_else(|| yaml.as_ref().and_then(|(_, p)| *p))
+        .unwrap_or(7777);
+    (addr, port)
 }
 
 /// AMF application state
@@ -1057,11 +1126,15 @@ pub async fn run() -> Result<()> {
     app.init(&args.config).await?;
 
     // Parse NGAP address + SCTP backend and initialize NGAP server
-    let ngap_addr: SocketAddr = args
-        .ngap_addr
-        .parse()
-        .map_err(|e| anyhow::anyhow!("Invalid NGAP address '{}': {}", args.ngap_addr, e))?;
-    nextgcore_core::sockaddr::warn_if_loopback_listener("NGAP", &ngap_addr, "--ngap-addr");
+    // #1311: the listen addresses in the config file are honoured; the command line
+    // and the environment override them.
+    let config_text = std::fs::read_to_string(&args.config).ok();
+    let ngap_addr = resolve_ngap_addr(args.ngap_addr.as_deref(), config_text.as_deref())?;
+    nextgcore_core::sockaddr::warn_if_loopback_listener(
+        "NGAP",
+        &ngap_addr,
+        "--ngap-addr or amf.ngap.server",
+    );
     let sctp_backend = ngap_path::SctpBackend::parse(&args.sctp_backend)?;
     app.init_ngap(ngap_addr, sctp_backend).await?;
 
@@ -1136,14 +1209,20 @@ pub async fn run() -> Result<()> {
 
     // Start the Namf SBI HTTP/2 server (TS 29.518: namf-comm, namf-evts,
     // namf-mt, namf-loc) on the advertised SBI endpoint
-    let sbi_addr = std::env::var("AMF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let sbi_port: u16 = std::env::var("AMF_SBI_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(7777);
+    let (sbi_addr, sbi_port) = resolve_sbi_listen(
+        std::env::var("AMF_SBI_ADDR").ok(),
+        std::env::var("AMF_SBI_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok()),
+        config_text.as_deref(),
+    );
     let sbi_sock: SocketAddr = nextgcore_core::sockaddr::parse_listen_addr(&sbi_addr, sbi_port)
         .map_err(|e| anyhow::anyhow!("Invalid SBI address '{sbi_addr}:{sbi_port}': {e}"))?;
-    nextgcore_core::sockaddr::warn_if_loopback_listener("SBI", &sbi_sock, "AMF_SBI_ADDR");
+    nextgcore_core::sockaddr::warn_if_loopback_listener(
+        "SBI",
+        &sbi_sock,
+        "AMF_SBI_ADDR or amf.sbi.server",
+    );
     let mut sbi_server_config = nextgcore_sbi::server::SbiServerConfig::new(sbi_sock);
     // Issue #63: resolve the SBI security profile, PRODUCTION by default. The
     // production profile requires OAuth2, so the outbound token client is
@@ -1268,12 +1347,55 @@ mod tests {
     #[test]
     fn ngap_listener_defaults_to_loopback() {
         let args = Args::parse_from(["nextgcore-amfd"]);
-        assert_eq!(args.ngap_addr, "127.0.0.1:38412");
-        let addr: SocketAddr = args.ngap_addr.parse().unwrap();
-        assert!(addr.ip().is_loopback());
+        assert_eq!(args.ngap_addr, None);
+        let addr = resolve_ngap_addr(None, None).unwrap();
+        assert_eq!(addr, "127.0.0.1:38412".parse::<SocketAddr>().unwrap());
         assert_eq!(ngap_path::DEFAULT_NGAP_ADDR, "127.0.0.1");
         let explicit = Args::parse_from(["nextgcore-amfd", "--ngap-addr", "0.0.0.0:38412"]);
-        assert_eq!(explicit.ngap_addr, "0.0.0.0:38412");
+        assert_eq!(explicit.ngap_addr.as_deref(), Some("0.0.0.0:38412"));
+    }
+
+    /// #1311: `amf.ngap.server` and `amf.sbi.server` are the listen addresses when
+    /// the command line / environment name none, and those override them. An IPv6
+    /// address is taken as is (#1306). No YAML: loopback.
+    #[test]
+    fn the_yaml_listen_addresses_are_bound_unless_overridden_1311() {
+        let yaml = "amf:\n  ngap:\n    server:\n      - address: 10.0.0.5\n        port: 38413\n  sbi:\n    server:\n      - address: fd00::5\n        port: 7778\n";
+        assert_eq!(
+            resolve_ngap_addr(None, Some(yaml)).unwrap(),
+            "10.0.0.5:38413".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            resolve_ngap_addr(Some("0.0.0.0:38412"), Some(yaml)).unwrap(),
+            "0.0.0.0:38412".parse::<SocketAddr>().unwrap(),
+            "the command line wins"
+        );
+        assert_eq!(
+            resolve_sbi_listen(None, None, Some(yaml)),
+            ("fd00::5".to_string(), 7778)
+        );
+        assert_eq!(
+            resolve_sbi_listen(Some("0.0.0.0".into()), None, Some(yaml)),
+            ("0.0.0.0".to_string(), 7778),
+            "the environment wins, field by field"
+        );
+        let no_port = "amf:\n  ngap:\n    server:\n      - address: 10.0.0.5\n";
+        assert_eq!(
+            resolve_ngap_addr(None, Some(no_port)).unwrap().port(),
+            38412
+        );
+        assert_eq!(
+            resolve_sbi_listen(None, None, Some("amf:\n  guami: []\n")),
+            ("127.0.0.1".to_string(), 7777)
+        );
+        assert!(
+            resolve_ngap_addr(
+                None,
+                Some("amf:\n  ngap:\n    server:\n      - address: bogus\n")
+            )
+            .is_err(),
+            "an unparsable address is refused, never widened"
+        );
     }
 
     /// **#920 follow-up.** A configured S-NSSAI with SST 0 -- not a slice, TS 23.501
