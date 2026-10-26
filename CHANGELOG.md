@@ -13,6 +13,14 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 ## [Unreleased]
 
 ### Changed
+- smfd (PGW-C) gives the packet filters of a dedicated bearer precedences that no filter of the
+  PDN connection uses, keeping their relative order. This applies to local PCC rules and to the
+  filters a Bearer Resource Command adds or replaces. Before, every local rule numbered its
+  filters 0, 1, …. A second rule on the same PDN connection then duplicated the first rule's
+  precedences, and the UE deleted the older filters, or the whole bearer (TS 24.301 §6.4.2.4 d) 2))
+  (#1293). A Delete Bearer Command whose bearers all have a Delete Bearer Request in flight is now
+  answered with a Delete Bearer Failure Indication, cause #101 "Collision with network
+  initiated request" (TS 29.274 §7.2.17.2). Before, it got no answer (#619).
 - An IPv6 SBI address goes in square brackets in every URI a daemon builds from it
   (RFC 3986 §3.2.2). That covers pcfd's apiRoot and callback URIs, the apiRoot or self/callback
   base of amfd, ausfd, lmfd, nefd, nrfd, nwdafd, smfd, ucmfd, udmd and udrd, seppd's N32f
