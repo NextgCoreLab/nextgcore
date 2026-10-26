@@ -79,6 +79,16 @@ skipped. The release itself still succeeds. To publish a release made before the
 existed, add them and re-run that run's `Docker Hub publish gate` job. GitHub re-runs its
 dependent jobs with it.
 
+**Which nextgsim tree builds the binaries.** A release tag (`X.Y.Z`) must be on the version-bump
+commit `release.yml` creates. Its message names the paired nextgsim commit, which
+`Dockerfile.builder` is given. A hand-pushed release tag on any other commit fails the gate. A
+pre-release tag may be hand-pushed, as a rehearsal, and builds against nextgsim `main` with a
+warning. The images hold only nextgcore binaries either way.
+
+If moving `latest` fails part-way, the job names the images already moved, marks `latest` as
+PARTIAL in the summary, and fails. Re-running the job completes it; the versioned tags are
+already pushed.
+
 **What is pushed.** Each image is `<namespace>/<image>:<version>`, built from the tagged commit.
 After every versioned push has succeeded, `<namespace>/<image>:latest` is moved to it. A
 pre-release (`X.Y.Z-<pre>`) never moves `latest`. The image names replace the local-only
@@ -98,10 +108,18 @@ No published image carries a credential:
 - The NF images hold only their binary, plus the runtime directories from `Dockerfile.core`.
   Configs, the home-network keys under `docker/rust/configs/` and TLS material are mounted at
   run time.
-- The WebUI image refuses to start without a `JWT_SECRET_KEY` of at least 32 characters, and has
-  no default account (`create-admin.js`).
+- The WebUI image (Node 22 LTS, runs as `node`) has no default account, and refuses to start
+  without its secrets. To run it, set:
+  - `SECRET_KEY` and `JWT_SECRET_KEY`, random values of at least 32 characters each;
+  - `DB_URI`, for example `mongodb://mongodb/nextgcore`;
+  - `WEBUI_BIND_ADDR=0.0.0.0` if it should be reachable through a published port. The default
+    is `127.0.0.1`. Publish to loopback, for example `-p 127.0.0.1:9999:9999`.
 
-The base images (`debian:bookworm-slim`, `rust:1.95.0-bookworm`, `node:19`) and every action in
+  Then create the first admin with `docker exec -it <container> node server/bin/create-admin.js
+  <username>`. Start it after MongoDB is healthy, for example with compose `depends_on:
+  condition: service_healthy`; the image no longer carries a wait binary.
+
+The base images (`debian:bookworm-slim`, `rust:1.95.0-bookworm`, `node:22-bookworm-slim`) and every action in
 `release.yml` are pinned by digest or commit SHA, with the tag in a comment. To bump a base
 image, run `docker buildx imagetools inspect <tag>` and replace the digest.
 

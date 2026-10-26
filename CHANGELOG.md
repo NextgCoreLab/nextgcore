@@ -21,6 +21,9 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   `DOCKERHUB_TOKEN` repository secrets, and is skipped with a notice without them. A CI check
   fails when a daemon, Dockerfile or deployed image is missing from the list. See
   `docs/ci-and-release.md`, "Docker Hub images".
+- The `docker/webui` image runs on Node 22 LTS (was the end-of-life Node 19) as the `node` user,
+  and no longer downloads the docker-compose-wait binary at build time. Order its start after
+  MongoDB with compose `depends_on` health conditions (#420).
 
 ### Changed
 - **mmed: S1-MME binds `127.0.0.1:36412` when `mme.s1ap.server` is unset**, where it bound the

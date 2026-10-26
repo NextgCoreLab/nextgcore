@@ -5,7 +5,7 @@
 # Build: docker buildx build --platform linux/amd64,linux/arm64 \
 #          -f Dockerfile.core -t nextgcore-core:latest .
 
-# Base images are pinned by digest so a release is reproducible (#420). To bump: 
+# Base images are pinned by digest so a release is reproducible (#420). To bump:
 # `docker buildx imagetools inspect <tag>` and replace the digest.
 FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
 

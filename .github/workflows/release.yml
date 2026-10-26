@@ -369,7 +369,15 @@ jobs:
           # code goes into these images (nextgsim publishes its own).
           sim=$(git log -1 --format=%B HEAD | grep -oE 'nextgsim [0-9a-f]{40}' | head -n 1 | cut -d' ' -f2 || true)
           if [ -z "$sim" ]; then
-            echo "::warning::the tagged commit names no nextgsim sha (not a release.yml bump commit); building with nextgsim main. The published images hold only nextgcore binaries."
+            # A release (X.Y.Z) must come from release.yml's bump commit, which
+            # names the paired nextgsim commit. Only a pre-release (a rehearsal
+            # tag) may build against nextgsim main; the images hold only
+            # nextgcore binaries, nextgsim is just the tree Dockerfile.builder needs.
+            if [ "$latest" = true ]; then
+              echo "::error::release tag ${VERSION} is not on a release.yml bump commit (its message names no nextgsim sha), so the paired nextgsim commit is unknown. Cut releases with release.yml; hand-push only pre-release tags."
+              exit 1
+            fi
+            echo "::warning::pre-release ${VERSION} names no nextgsim sha; Dockerfile.builder uses nextgsim main. The published images hold only nextgcore binaries."
             sim=main
           fi
           {
@@ -542,9 +550,23 @@ jobs:
       - name: Tag every image latest
         run: |
           set -euo pipefail
+          # Each retag is one registry call, so a failure part-way leaves some
+          # images on the new latest and some on the old: say which, loudly.
+          # The versioned tags are all pushed already; re-running this job
+          # completes latest.
+          done_list=""
           for image in $IMAGES; do
-            docker buildx imagetools create \
-              -t "${NAMESPACE}/${image}:latest" "${NAMESPACE}/${image}:${VERSION}"
+            if ! docker buildx imagetools create \
+                -t "${NAMESPACE}/${image}:latest" "${NAMESPACE}/${image}:${VERSION}"; then
+              echo "::error title=latest is PARTIAL::${image}:latest failed. Moved to ${VERSION}:${done_list:- none}. Still on the previous latest: every other image. Re-run this job."
+              {
+                echo "### latest is PARTIAL: re-run this job"
+                echo "Moved to ${VERSION}:${done_list:- none}"
+                echo "Failed at: ${image}"
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            done_list="${done_list} ${image}"
           done
           {
             echo "### Published to Docker Hub as ${VERSION} and latest"
