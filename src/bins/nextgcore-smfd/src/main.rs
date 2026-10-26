@@ -321,6 +321,7 @@ type NsacTaken = (
     Option<String>,
     Option<String>,
     Option<policy::NsacfEndpoint>,
+    Option<(String, String)>,
 );
 
 /// Count out at the NSACF every session still admitted there (#959), at most
@@ -347,6 +348,7 @@ async fn nsac_count_out_unreleased(budget: std::time::Duration) -> usize {
                             b.sd.clone(),
                             b.nsac_nf_id.clone(),
                             b.nsac_nsacf.clone(),
+                            b.nsac_plmn.clone(),
                         )
                     })
                     .collect()
@@ -363,7 +365,7 @@ async fn nsac_count_out_unreleased(budget: std::time::Duration) -> usize {
     let total = admitted.len();
     let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
     let mut sends = tokio::task::JoinSet::new();
-    for (supi, psi, sst, sd, nf_id, nsacf) in admitted {
+    for (supi, psi, sst, sd, nf_id, nsacf, plmn) in admitted {
         let Ok(Ok(permit)) =
             tokio::time::timeout_at(deadline, permits.clone().acquire_owned()).await
         else {
@@ -375,6 +377,7 @@ async fn nsac_count_out_unreleased(budget: std::time::Duration) -> usize {
                 true,
                 nf_id.as_deref(),
                 nsacf.as_ref(),
+                policy::plmn_ref(&plmn),
                 &supi,
                 psi,
                 sst,
@@ -454,11 +457,12 @@ pub(crate) async fn rollback_nsac(
     sst: u8,
     sd: Option<&str>,
 ) -> bool {
-    let (recorded, recorded_nsacf) = recorded_nsac(supi, psi);
+    let (recorded, recorded_nsacf, recorded_plmn) = recorded_nsac(supi, psi);
     rollback_nsac_as(
         admitted,
         recorded.as_deref(),
         recorded_nsacf.as_ref(),
+        policy::plmn_ref(&recorded_plmn),
         supi,
         psi,
         sst,
@@ -467,9 +471,10 @@ pub(crate) async fn rollback_nsac(
     .await
 }
 
-/// The `nfId` the INCREASE of `supi`'s PDU session `psi` carried (#1075), and the
-/// NSACF it went to (#1164 follow-up), from its live binding.
-fn recorded_nsac(supi: &str, psi: u8) -> (Option<String>, Option<policy::NsacfEndpoint>) {
+/// The `nfId` the INCREASE of `supi`'s PDU session `psi` carried (#1075), the NSACF it
+/// went to (#1164 follow-up) and the serving PLMN it was admitted in, from its live
+/// binding.
+fn recorded_nsac(supi: &str, psi: u8) -> RecordedNsac {
     smf_self()
         .read()
         .ok()
@@ -477,11 +482,25 @@ fn recorded_nsac(supi: &str, psi: u8) -> (Option<String>, Option<policy::NsacfEn
             ctx.policy_bindings.read().ok().and_then(|m| {
                 m.values()
                     .find(|b| b.supi == supi && b.psi == psi)
-                    .map(|b| (b.nsac_nf_id.clone(), b.nsac_nsacf.clone()))
+                    .map(|b| {
+                        (
+                            b.nsac_nf_id.clone(),
+                            b.nsac_nsacf.clone(),
+                            b.nsac_plmn.clone(),
+                        )
+                    })
             })
         })
         .unwrap_or_default()
 }
+
+/// What a binding records of its NSAC admission: the INCREASE's nfId, its NSACF and the
+/// serving PLMN.
+type RecordedNsac = (
+    Option<String>,
+    Option<policy::NsacfEndpoint>,
+    Option<(String, String)>,
+);
 
 /// [`rollback_nsac`] naming `nf_id` in the DECREASE: the one the INCREASE carried
 /// (#1075, #1072 round 2 m3), so both name the same SMF instance (TS 23.502
@@ -489,11 +508,14 @@ fn recorded_nsac(supi: &str, psi: u8) -> (Option<String>, Option<policy::NsacfEn
 ///
 /// #1164 follow-up: to `nsacf`, the NSACF the INCREASE went to, when known; a fresh
 /// discovery could name another NSACF of the same slice, and the count would leak on
-/// the first.
+/// the first. #1164 follow-up 2: a fresh discovery is for `plmn`, the serving PLMN the
+/// INCREASE was resolved for, so a `perPlmnSnssaiList` reads the same entry.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn rollback_nsac_as(
     admitted: bool,
     nf_id: Option<&str>,
     nsacf: Option<&policy::NsacfEndpoint>,
+    plmn: Option<(&str, &str)>,
     supi: &str,
     psi: u8,
     sst: u8,
@@ -505,7 +527,7 @@ pub(crate) async fn rollback_nsac_as(
     let pinned = nsacf.cloned();
     let resolved = match pinned {
         Some(nsacf) => Some(nsacf),
-        None => policy::resolve_nsacf_endpoint(sst, sd, None).await,
+        None => policy::resolve_nsacf_endpoint(sst, sd, plmn).await,
     };
     match resolved {
         Some(nsacf) => {
@@ -4015,13 +4037,32 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     };
     let snssai_sd = req_body["sNssai"]["sd"].as_str().map(str::to_string);
     // #1164 follow-up, TS 29.571 §5.4.4.2: an SD is 6 hex digits. A malformed one would
-    // reach the NRF query and the NSACF discovery cache's key.
+    // reach the UDM and NRF queries and the NSACF discovery cache's key.
+    //
+    // #1164 follow-up 2, TS 29.502 §5.2.2.2.1: the SmContextCreateError carries the N1
+    // PDU SESSION ESTABLISHMENT REJECT when the request carried an N1 SM message, so the
+    // UE is answered at once instead of running out T3580 (TS 24.501 §6.4.1.6). The
+    // fault is the AMF's, not the UE's: 5GSM cause #31 "request rejected, unspecified",
+    // which asks for no back-off. The PTI is the request's (octet 3).
     if snssai_sd.as_deref().is_some_and(|sd| !policy::valid_sd(sd)) {
-        return eps_to_5gs::sm_context_error(
-            400,
-            "INVALID_MSG_FORMAT",
-            "sNssai.sd is not 6 hexadecimal digits",
-        );
+        let pti = resolve_binary_ref(request, &req_body["n1SmMsg"])
+            .filter(|n1| n1.len() >= 4 && n1[0] == 0x2E)
+            .map(|n1| n1[2]);
+        return match pti {
+            Some(pti) => sm_context_create_error(
+                400,
+                "INVALID_MSG_FORMAT",
+                pdu_session_id,
+                pti,
+                policy::gsm_cause::REQUEST_REJECTED_UNSPECIFIED,
+                reject_to,
+            ),
+            None => eps_to_5gs::sm_context_error(
+                400,
+                "INVALID_MSG_FORMAT",
+                "sNssai.sd is not 6 hexadecimal digits",
+            ),
+        };
     }
     // Issue #73: `supi` is conditional-mandatory for a non-emergency session
     // (TS 29.502 §6.1.6.2.2), and it is now REJECTED when absent.
@@ -4622,6 +4663,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                         nsac_admitted,
                         nsac_nf_id.as_deref(),
                         nsac_nsacf.as_ref(),
+                        policy::plmn_ref(&nsac_plmn),
                         &supi,
                         pdu_session_id,
                         sst,
@@ -4648,6 +4690,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                         nsac_admitted,
                         nsac_nf_id.as_deref(),
                         nsac_nsacf.as_ref(),
+                        policy::plmn_ref(&nsac_plmn),
                         &supi,
                         pdu_session_id,
                         sst,
@@ -4811,6 +4854,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     nsac_admitted,
                     nsac_nf_id.as_deref(),
                     nsac_nsacf.as_ref(),
+                    policy::plmn_ref(&nsac_plmn),
                     &supi,
                     pdu_session_id,
                     sst,
@@ -5017,6 +5061,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     nsac_admitted,
                     nsac_nf_id: nsac_nf_id.clone(),
                     nsac_nsacf: nsac_nsacf.clone(),
+                    nsac_plmn: nsac_plmn.clone(),
                 },
             );
         }
@@ -7421,6 +7466,7 @@ async fn release_nsac_admission(binding: &context::PolicyBinding, entry: Option<
                 true,
                 binding.nsac_nf_id.as_deref(),
                 binding.nsac_nsacf.as_ref(),
+                policy::plmn_ref(&binding.nsac_plmn),
                 &binding.supi,
                 binding.psi,
                 binding.sst,
@@ -14786,6 +14832,7 @@ mod tests {
                         nsac_admitted: false,
                         nsac_nf_id: None,
                         nsac_nsacf: None,
+                        nsac_plmn: None,
                     },
                 );
             }
@@ -18302,6 +18349,7 @@ mod tests {
             .iter()
             .find(|(_, b)| b.supi == supi && b.psi == 9)
             .map(|(r, b)| (r.clone(), b.nsac_nsacf.clone()));
+        let recorded_plmn = lookup_policy_binding_by(supi, 9).and_then(|b| b.nsac_plmn);
         if let Some((r, _)) = &reference {
             let _ = handle_sm_context_release(r, None).await;
         }
@@ -18326,7 +18374,109 @@ mod tests {
             "the binding records the admitting NSACF"
         );
         assert_eq!(at_a, (1, 1), "counted in and out at A");
+        assert_eq!(
+            recorded_plmn,
+            Some(("001".to_string(), "01".to_string())),
+            "#1164 follow-up 2: the serving PLMN it was admitted in"
+        );
         assert_eq!(at_b, (0, 0), "B never counted this session");
+    }
+
+    /// The live binding of `supi`'s PDU session `psi`.
+    fn lookup_policy_binding_by(supi: &str, psi: u8) -> Option<context::PolicyBinding> {
+        smf_self().read().ok().and_then(|ctx| {
+            ctx.policy_bindings
+                .read()
+                .ok()
+                .and_then(|m| m.values().find(|b| b.supi == supi && b.psi == psi).cloned())
+        })
+    }
+
+    /// #1164 follow-up 2: a DECREASE with no recorded NSACF (a snapshot from before it
+    /// was recorded) resolves the NSACF for the serving PLMN the admission was made in,
+    /// so a multi-PLMN NSACF's `perPlmnSnssaiList` reads the same entry. Here A serves the
+    /// slice in 001-01 only and B in 999-70; the session was admitted in 999-70, and its
+    /// DECREASE goes to B. Without the PLMN every entry counted and A, listed first,
+    /// was taken.
+    #[tokio::test]
+    async fn an_unpinned_decrease_resolves_for_the_admitting_plmn() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        std::env::remove_var("NSACF_URI");
+        type Bodies = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+        let nsacf = || async {
+            let seen: Bodies = Default::default();
+            let sink = seen.clone();
+            let (srv, addr) =
+                nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                    let sink = sink.clone();
+                    async move {
+                        sink.lock()
+                            .unwrap()
+                            .push(req.http.content.clone().unwrap_or_default());
+                        SbiResponse::with_status(204)
+                    }
+                })
+                .await;
+            (srv, addr.port(), seen)
+        };
+        let (a, a_port, a_seen) = nsacf().await;
+        let (b, b_port, b_seen) = nsacf().await;
+        let (nrf, nrf_addr) = nextgcore_sbi::test_support::sbi_server_on_free_port(
+            move |_req: SbiRequest| async move {
+                let instance = |id: &str, port: u16, mcc: &str, mnc: &str| {
+                    serde_json::json!({
+                        "nfInstanceId": id, "nfType": "NSACF", "ipv4Addresses": ["127.0.0.1"],
+                        "perPlmnSnssaiList": [{
+                            "plmnId": { "mcc": mcc, "mnc": mnc },
+                            "sNssaiList": [{ "sst": 1, "sd": "010203" }],
+                        }],
+                        "nfServices": [{ "serviceName": "nnsacf-nsac",
+                                         "ipEndPoints": [{ "port": port }] }],
+                    })
+                };
+                SbiResponse::with_status(200)
+                    .with_json_body(&serde_json::json!({
+                        "validityPeriod": 0,
+                        "nfInstances": [
+                            instance("nsacf-a", a_port, "001", "01"),
+                            instance("nsacf-b", b_port, "999", "70"),
+                        ],
+                    }))
+                    .unwrap()
+            },
+        )
+        .await;
+        global_context()
+            .set_nrf_uri(format!("http://127.0.0.1:{}", nrf_addr.port()))
+            .await;
+        let supi = "imsi-999700000011647";
+        let reference = seed_registered_session(supi, 4, "internet");
+        {
+            let ctx = smf_self();
+            let ctx = ctx.read().unwrap();
+            let mut binding = context::PolicyBinding::snapshot_default();
+            binding.supi = supi.to_string();
+            binding.psi = 4;
+            binding.sst = 1;
+            binding.sd = Some("010203".to_string());
+            binding.nsac_admitted = true;
+            binding.nsac_plmn = Some(("999".to_string(), "70".to_string()));
+            ctx.policy_bindings
+                .write()
+                .unwrap()
+                .insert(reference.clone(), binding);
+        }
+        let accepted = rollback_nsac(true, supi, 4, 1, Some("010203")).await;
+        global_context().clear_nrf_uri().await;
+        let (to_a, to_b) = (a_seen.lock().unwrap().len(), b_seen.lock().unwrap().len());
+        for srv in [a, b, nrf] {
+            srv.stop().await.ok();
+        }
+        assert!(accepted);
+        assert_eq!((to_a, to_b), (0, 1), "the DECREASE goes to 999-70's NSACF");
     }
 
     /// #1164 follow-up, TS 29.571 §5.4.4.2: an SM Context Create whose S-NSSAI SD is
@@ -18358,6 +18508,17 @@ mod tests {
             .content
             .as_deref()
             .is_some_and(|c| c.contains("INVALID_MSG_FORMAT")));
+        // #1164 follow-up 2: with the N1 PDU SESSION ESTABLISHMENT REJECT (TS 29.502
+        // §5.2.2.2.1), PSI 9, the request's PTI 1, 5GSM cause #31.
+        let n1 = resp
+            .http
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some("n1SmMsg"))
+            .expect("the N1 reject")
+            .data
+            .to_vec();
+        assert_eq!(n1, vec![0x2E, 9, 1, 0xC3, 31]);
     }
 
     // ---- #994: PFCP Node Report: user plane path failure and recovery ----
