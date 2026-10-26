@@ -4051,6 +4051,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                 pdu_session_id,
                 pti,
                 policy::gsm_cause::REQUEST_REJECTED_UNSPECIFIED,
+                reject_to,
             ),
             None => eps_to_5gs::sm_context_error(
                 400,
