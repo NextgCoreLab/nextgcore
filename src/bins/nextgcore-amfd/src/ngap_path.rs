@@ -25767,7 +25767,9 @@ mod tests {
     /// - `update` (§4.2.4.2) is acknowledged with 204;
     /// - `terminate` (§4.2.4.3) is acknowledged with 204, then the association is
     ///   forgotten and Npcf_AMPolicyControl_Delete'd;
-    /// - a termination naming an association the UE does not hold deletes nothing;
+    /// - a termination naming an association the UE does not hold is refused with
+    ///   404 and changes nothing, AM and UE policy alike (#1247 review); one without a
+    ///   `resourceUri` is 400;
     /// - an unknown UE gets 404.
     ///
     /// TS 29.525 §4.2.4.3 likewise: a UE policy termination is followed by
@@ -25816,7 +25818,34 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(foreign.status, 204);
+        assert_eq!(
+            foreign.status, 404,
+            "#1247 review: a termination naming another association is refused"
+        );
+        // The same for the UE policy: refused, and the UE's real association stays.
+        let foreign_ue = notify(
+            format!("{base}/ue-policy-notify/terminate"),
+            serde_json::json!({
+                "resourceUri": "http://pcf/npcf-ue-policy-control/v1/policies/someone-else",
+                "cause": "UNSPECIFIED",
+            }),
+        )
+        .await;
+        assert_eq!(foreign_ue.status, 404);
+        let missing = notify(
+            format!("{base}/am-policy-notify/terminate"),
+            serde_json::json!({ "cause": "UNSPECIFIED" }),
+        )
+        .await;
+        assert_eq!(missing.status, 400, "resourceUri is mandatory");
+        let kept = ngap.ue_auth_state.get(id).expect("the UE stays");
+        assert!(
+            kept.policy_association_id.as_deref() == Some("am-pol-1247")
+                && kept.amf_ue.policy_association.id.as_deref() == Some("am-pol-1247")
+                && kept.ue_policy_association_id.as_deref() == Some("ue-pol-1247")
+                && kept.amf_ue.ue_policy_association.id.as_deref() == Some("ue-pol-1247"),
+            "a refused termination changes nothing"
+        );
 
         for (op, path, kind) in [
             (
