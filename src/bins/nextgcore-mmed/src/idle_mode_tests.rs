@@ -1429,7 +1429,7 @@ fn dbr_reactivation(teid: u32, lbi: u8, seq: u32) -> Vec<u8> {
     m.encode().to_vec()
 }
 
-fn is_erab_release_command(pdu: &g::S1AP_PDU) -> Option<()> {
+pub(crate) fn is_erab_release_command(pdu: &g::S1AP_PDU) -> Option<()> {
     matches!(
         pdu,
         g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
@@ -1865,7 +1865,7 @@ fn a_tau_bearer_status_keeps_the_last_pdn_connection() {
 }
 
 /// The Serving GW's S1-U F-TEID for the dedicated bearer, in [`cbr`].
-const DEDICATED_SGW_S1U: u32 = 0x0956_5106;
+pub(crate) const DEDICATED_SGW_S1U: u32 = 0x0956_5106;
 
 /// A Create Bearer Request on S11 (TS 29.274 Table 7.2.3-2 at the MME): LBI 5, one
 /// Bearer Context with EBI 0, a TFT, the S1-U SGW F-TEID (instance 0), the PGW's
@@ -1894,7 +1894,7 @@ fn cbr(teid: u32, seq: u32) -> Vec<u8> {
 }
 
 /// (E-RAB ID, SGW S1-U TEID, NAS-PDU) of each item of an E-RAB SETUP REQUEST.
-fn erab_setup(pdu: &g::S1AP_PDU) -> Option<Vec<(u8, u32, Vec<u8>)>> {
+pub(crate) fn erab_setup(pdu: &g::S1AP_PDU) -> Option<Vec<(u8, u32, Vec<u8>)>> {
     let g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         value: g::InitiatingMessageValue::Id_E_RABSetup(req),
         ..
@@ -1920,7 +1920,7 @@ fn erab_setup(pdu: &g::S1AP_PDU) -> Option<Vec<(u8, u32, Vec<u8>)>> {
 }
 
 /// The ECM-CONNECTED, attached UE of a dedicated bearer test.
-fn attached(tac: u16) -> Ue {
+pub(crate) fn attached(tac: u16) -> Ue {
     let ue = seed(tac, &[5]);
     mme_self()
         .mme_ue_pool
@@ -2014,7 +2014,7 @@ fn create_bearer_response(
     (cause, bcs)
 }
 
-fn quiet(sgw: &UdpSocket) -> bool {
+pub(crate) fn quiet(sgw: &UdpSocket) -> bool {
     sgw.set_read_timeout(Some(Duration::from_millis(300)))
         .unwrap();
     let mut buf = [0u8; 4096];
@@ -2492,7 +2492,7 @@ fn an_activation_is_answered_within_the_serving_gws_transaction() {
 
 /// The plain NAS message of a DOWNLINK NAS TRANSPORT (after its 6-octet
 /// security header; EEA0, so readable).
-fn dl_nas(pdu: &g::S1AP_PDU) -> Option<Vec<u8>> {
+pub(crate) fn dl_nas(pdu: &g::S1AP_PDU) -> Option<Vec<u8>> {
     let g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
         value: g::InitiatingMessageValue::Id_downlinkNASTransport(dl),
         ..
@@ -2845,7 +2845,7 @@ fn an_ipv6_enb_s1u_is_answered_in_the_create_bearer_response() {
 
 /// An established dedicated bearer `ebi` on `ue`'s PDN connection (QCI 1, MBR
 /// 128 kbit/s, GBR 64 kbit/s, a TFT), and that PDN's APN-AMBR at 1 Mbit/s.
-fn with_dedicated(ue: &Ue, ebi: u8) -> u64 {
+pub(crate) fn with_dedicated(ue: &Ue, ebi: u8) -> u64 {
     let ctx = mme_self();
     let id = ctx.bearer_add(ue.sess_id, ue.mme_ue_id);
     if let Some(b) = ctx.bearer_pool.write().unwrap().get_mut(&id) {

@@ -85,6 +85,9 @@ pub struct PendingDeactivation {
     /// The UE went ECM-IDLE during this deactivation and was paged again for
     /// it (once).
     repaged: bool,
+    /// #1282: the UE's PTI when the Delete Bearer Request answers its BEARER
+    /// RESOURCE MODIFICATION REQUEST (TS 29.274 Table 7.2.9.2-1), else unassigned.
+    pti: u8,
 }
 
 /// The deactivations waiting for the UE. Process-global like the S11 pending
@@ -108,7 +111,10 @@ pub fn in_flight(peer: SocketAddr, seq: u32) -> bool {
 
 /// Start deactivating `ebis` of `mme_ue_id` towards the eNB and the UE.
 /// `sess_id` is set when the whole PDN connection goes (then `ebis` is its
-/// default bearer). `reactivation` selects ESM cause #39 instead of #36.
+/// default bearer). `reactivation` selects ESM cause #39 instead of #36. `pti` is
+/// the Delete Bearer Request's PTI (#1282): the DEACTIVATE EPS BEARER CONTEXT
+/// REQUEST carries it, so a UE-requested release stops the UE's T3481 (TS 24.301
+/// §6.5.4.3).
 /// Returns `false` when nothing could be sent (no S1 connection, or every
 /// send failed): the caller then deletes locally and answers at once.
 #[allow(clippy::too_many_arguments)]
@@ -122,6 +128,7 @@ pub fn start(
     sess_id: Option<u64>,
     ebis: &[u8],
     reactivation: bool,
+    pti: u8,
 ) -> bool {
     let Some(mme_ue) = ctx.mme_ue_find_by_id(mme_ue_id) else {
         return false;
@@ -140,7 +147,9 @@ pub fn start(
         if !reactivation {
             return false;
         }
-        return park_and_page(ctx, mme_ue_id, peer, seq, sgw_teid, answer, sess_id, ebis);
+        return park_and_page(
+            ctx, mme_ue_id, peer, seq, sgw_teid, answer, sess_id, ebis, pti,
+        );
     };
     let cause = if reactivation {
         crate::esm_build::EsmCause::ReactivationRequested
@@ -176,11 +185,8 @@ pub fn start(
     });
     let mut waiting = Vec::new();
     for ebi in ebis {
-        let plain = crate::esm_build::build_deactivate_bearer_context_request_with_params(
-            *ebi,
-            crate::esm_build::PTI_UNASSIGNED,
-            cause,
-        );
+        let plain =
+            crate::esm_build::build_deactivate_bearer_context_request_with_params(*ebi, pti, cause);
         let Ok(esm) = crate::nas_path::protect_esm(ctx, mme_ue_id, &plain) else {
             log::error!(
                 "[{}] DEACTIVATE EPS BEARER CONTEXT REQUEST for EBI {ebi} not protected; the \
@@ -254,6 +260,7 @@ pub fn start(
         parked: Vec::new(),
         reactivation,
         repaged: false,
+        pti,
     });
     true
 }
@@ -272,6 +279,7 @@ fn park_and_page(
     answer: DeleteBearerAnswer,
     sess_id: Option<u64>,
     ebis: &[u8],
+    pti: u8,
 ) -> bool {
     let paging = ctx
         .mme_ue_find_by_id(mme_ue_id)
@@ -296,6 +304,7 @@ fn park_and_page(
         parked: ebis.to_vec(),
         reactivation: true,
         repaged: false,
+        pti,
     });
     true
 }
@@ -326,6 +335,7 @@ pub fn on_connected(ctx: &MmeContext, mme_ue_id: u64) {
             p.sess_id,
             &p.parked,
             true,
+            p.pti,
         ) {
             delete_now(ctx, mme_ue_id, &p.parked, p.sess_id);
             answer(&p);
