@@ -59,7 +59,12 @@ case "${PROFILE}" in
     UE_CONTAINER="${UE_CONTAINER:-ue}"
     UPF_SELECTOR="${UPF_SELECTOR:-app.kubernetes.io/name=upf}"
     UPF_CONTAINER="${UPF_CONTAINER:-upf}"
-    TUN="${TUN:-uesimtun}"
+    # nextgsim's UE names each PDU session's interface <tun_name><N> (nextgsim
+    # #427), so the name depends on its config and on how many sessions it
+    # has. Found below as the first uesimtun* interface with an IPv4 address,
+    # as docker/rust/ue-flow-check.sh does; TUN=<name> pins one (#1326).
+    TUN="${TUN:-}"
+    TUN_PREFIX="${TUN_PREFIX:-uesimtun}"
     ;;
   epc)
     # The LTE UE puts the default bearer's PDN address on lteuetun<EBI>; the
@@ -158,9 +163,14 @@ done
 [[ -n "${state:-}" ]] || die "debug container ${DBG} never started"
 dbg() { "${KUBECTL[@]}" exec "${UE_POD}" -c "${DBG}" -- "$@"; }
 
+if [[ -z "${TUN}" ]]; then
+  TUN="$(dbg sh -c "ip -4 -o addr show | awk '\$2 ~ /^${TUN_PREFIX}/ { print \$2; exit }'")"
+  [[ -n "${TUN}" ]] \
+    || die "no ${TUN_PREFIX}* interface with an IPv4 address in ${UE_POD} (interfaces: $(dbg sh -c "ip -o link show | awk -F': ' '{print \$2}' | tr '\n' ' '")): is the PDU session up?"
+fi
 UE_IP="$(dbg sh -c "ip -4 -o addr show dev ${TUN} | awk '{print \$4}' | cut -d/ -f1 | head -n1")"
 [[ "${UE_IP}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] \
-  || die "no IPv4 address on ${TUN} in ${UE_POD}: is the PDU session up?"
+  || die "no IPv4 address on ${TUN} in ${UE_POD} (interfaces: $(dbg sh -c "ip -o link show | awk -F': ' '{print \$2}' | tr '\n' ' '")): is the PDU session up?"
 echo "UE IP on ${TUN}: ${UE_IP}"
 
 # shellcheck disable=SC2317  # invoked by the EXIT trap
